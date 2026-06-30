@@ -368,6 +368,11 @@ pub struct SoccerMatch {
     pub(crate) home_mpc_latent_objective: SoccerMpcLatentObjective,
     pub(crate) away_mpc_latent_objective: SoccerMpcLatentObjective,
     pub(crate) possession_progress_tracker: Option<PossessionProgressTracker>,
+    /// The current ball-carrier's continuous forward dribble, for the progressive-carry MARL
+    /// rewards (gated by `DD_SOCCER_ENABLE_PROGRESSIVE_CARRY_REWARD`). One carrier at a time, so a
+    /// single tracker; reset when the holder changes or possession is lost. See
+    /// [`ForwardCarryTracker`].
+    pub(crate) forward_carry_tracker: Option<ForwardCarryTracker>,
     /// The most recent player to touch the ball — a simple "who last touched it"
     /// reference used to enforce the no-double-touch rule on restarts.
     pub(crate) last_touch_player: Option<usize>,
@@ -2800,6 +2805,7 @@ impl SoccerMatch {
             pass_chain_meter: PassChainMeter::default(),
             home_mpc_latent_objective: SoccerMpcLatentObjective::default(),
             away_mpc_latent_objective: SoccerMpcLatentObjective::default(),
+            forward_carry_tracker: None,
             last_touch_player: None,
             ball_stationary_ticks: 0,
             ball_stuck_anchor: Vec2::new(0.0, 0.0),
@@ -8244,6 +8250,11 @@ impl SoccerMatch {
             &next_snapshot,
             self.config.learning_enabled || self.config.learning_logging_enabled,
         );
+        // Progressive-carry: accumulate the carrier's forward dribble and pay the sustained-dribble
+        // segments (no-op + byte-identical unless `DD_SOCCER_ENABLE_PROGRESSIVE_CARRY_REWARD`).
+        self.update_forward_carry_reward(
+            self.config.learning_enabled || self.config.learning_logging_enabled,
+        );
         self.update_offside_lingering_rewards(
             &next_snapshot,
             self.config.learning_enabled || self.config.learning_logging_enabled,
@@ -9922,8 +9933,35 @@ impl SoccerMatch {
         }
     }
 
+    /// Reward the last `BUILDUP_CHAIN_CREDIT_DEPTH` teammates who built the move to this shot,
+    /// recency-discounted (the finisher most, each earlier contributor geometrically less).
+    /// `base_points` sets the tier (any shot < on frame < goal). Additive MAPPO buildup credit;
+    /// gated (default-on) by `DD_SOCCER_ENABLE_BUILDUP_CHAIN_CREDIT`, OFF ⇒ no-op (byte-identical).
+    fn record_buildup_chain_credit(&mut self, team: Team, shooter: Option<usize>, base_points: f64) {
+        if !buildup_chain_credit_enabled() || base_points <= 0.0 {
+            return;
+        }
+        let sequence =
+            self.recent_possession_reward_sequence(team, shooter, BUILDUP_CHAIN_CREDIT_DEPTH);
+        for (recency_index, player_id) in sequence.into_iter().enumerate() {
+            let amount = buildup_chain_credit_points(base_points, recency_index);
+            if amount > 0.0 {
+                self.record_reward_event_with_kind(
+                    player_id,
+                    amount,
+                    SoccerRewardEventKind::BuildupChainCredit,
+                );
+            }
+        }
+    }
+
     pub(crate) fn record_shot_on_target_rewards(&mut self, shooting_team: Team, shooter: usize) {
         self.record_possession_touch(shooter);
+        self.record_buildup_chain_credit(
+            shooting_team,
+            Some(shooter),
+            BUILDUP_CHAIN_CREDIT_SHOT_ON_FRAME_BASE_POINTS,
+        );
         debug_assert!(
             (SHOT_ON_TARGET_REWARD_PATTERN.iter().sum::<f64>() - SHOT_ON_TARGET_REWARD_POINTS)
                 .abs()
@@ -10099,6 +10137,11 @@ impl SoccerMatch {
     /// 40), distance-tapered the same way.
     fn record_shot_off_target_rewards(&mut self, shooting_team: Team, shooter: usize) {
         self.record_possession_touch(shooter);
+        self.record_buildup_chain_credit(
+            shooting_team,
+            Some(shooter),
+            BUILDUP_CHAIN_CREDIT_SHOT_BASE_POINTS,
+        );
         let scale = self.shot_reward_distance_scale(shooting_team, shooter)
             * (SHOT_OFF_TARGET_REWARD_POINTS / SHOT_ON_TARGET_REWARD_POINTS);
         let scaled: Vec<f64> = SHOT_ON_TARGET_REWARD_PATTERN
@@ -10408,6 +10451,14 @@ impl SoccerMatch {
         if let Some(shooter) = shooter {
             self.record_possession_touch(shooter);
         }
+        // Buildup credit (goal tier): the whole move that led to the goal is rewarded, recency-
+        // discounted. A goal is also on target, so its finisher additionally collected the on-frame
+        // tier from `record_shot_on_target_rewards` — "especially a goal".
+        self.record_buildup_chain_credit(
+            scoring_team,
+            shooter,
+            BUILDUP_CHAIN_CREDIT_GOAL_BASE_POINTS,
+        );
         if let Some(reward_points) =
             self.direct_turnover_goal_reward_points(scoring_team, shooter, previous_touch_team)
         {
@@ -10965,6 +11016,100 @@ impl SoccerMatch {
         }
         if let Some(signal) = defensive_relaxation_signal(before, after, possession_team) {
             self.apply_defensive_relaxation_signal(before.tick, signal, record_rewards);
+        }
+    }
+
+    /// Per-tick maintenance of the forward-carry tracker + the SUSTAINED-dribble reward (Reward B):
+    /// while one player keeps driving the ball forward, each 2-yard forward segment PAST THE FIRST
+    /// ("2 yards followed by 2 more") emits a [`SoccerRewardEventKind::SustainedForwardDribble`].
+    /// The tracker it maintains is also what the pass/shot release cash-out reads for the PRODUCTIVE
+    /// carry reward (Reward A). Gated (default-on) by `DD_SOCCER_ENABLE_PROGRESSIVE_CARRY_REWARD`;
+    /// OFF ⇒ pure no-op (the tracker stays `None`, byte-identical parity). "Forward" is Δy·attack
+    /// toward the opponent goal — lateral x movement is free.
+    pub(crate) fn update_forward_carry_reward(&mut self, record_rewards: bool) {
+        if !progressive_carry_reward_enabled() {
+            return;
+        }
+        // A loose / in-flight ball ends the carry: a pass or shot has already cashed out, and a
+        // re-receive must start a fresh run (no stale forward delta bridged across the gap).
+        let Some(holder_id) = self.ball.holder else {
+            self.forward_carry_tracker = None;
+            return;
+        };
+        let Some(holder) = self.players.iter().find(|player| player.id == holder_id) else {
+            self.forward_carry_tracker = None;
+            return;
+        };
+        // Keepers carry the ball in-hand (distribution), not at their feet — that is not dribbling,
+        // so it earns no progressive-carry reward. A dead-ball / set-play walk-up is likewise not
+        // open-play dribbling. End any run and stop tracking in both cases.
+        if holder.role == PlayerRole::Goalkeeper || self.active_set_play.is_some() {
+            self.forward_carry_tracker = None;
+            return;
+        }
+        let team = holder.team;
+        let ball_y = self.ball.position.y;
+        let attack = team.attack_dir();
+        let sustained_points = match self.forward_carry_tracker.as_mut() {
+            Some(tracker) if tracker.carrier_id == holder_id => {
+                let forward_delta = (ball_y - tracker.last_ball_y) * attack;
+                tracker.last_ball_y = ball_y;
+                // Pays both the 1-yard and 2-yard sustained cadences.
+                tracker.sustained_reward_points(forward_delta)
+            }
+            _ => {
+                // New carrier (first touch / a teammate received): start a fresh run.
+                self.forward_carry_tracker =
+                    Some(ForwardCarryTracker::new_at(holder_id, team, ball_y));
+                0.0
+            }
+        };
+        if record_rewards && sustained_points > 0.0 {
+            self.record_reward_event_with_kind(
+                holder_id,
+                sustained_points,
+                SoccerRewardEventKind::SustainedForwardDribble,
+            );
+        }
+    }
+
+    /// Cash out the PRODUCTIVE forward-carry reward (Reward A) when the current carrier's run ends
+    /// in a forward pass or a shot: pays [`SoccerRewardEventKind::ProductiveForwardCarry`] in 2-yard
+    /// segments of accumulated forward carry, then clears the tracker. A carry that ends any other
+    /// way (turnover, backward/square pass) is NOT paid — `clear_forward_carry_on_unproductive_end`
+    /// just drops it. Gated (default-on); OFF ⇒ no-op. Returns the points emitted (0 if none).
+    pub(crate) fn cash_out_productive_forward_carry(&mut self, carrier_id: usize) {
+        if !progressive_carry_reward_enabled() {
+            return;
+        }
+        let Some(tracker) = self.forward_carry_tracker else {
+            return;
+        };
+        if tracker.carrier_id != carrier_id {
+            return;
+        }
+        let points = tracker.productive_carry_reward_points();
+        self.forward_carry_tracker = None;
+        if points > 0.0 {
+            self.record_reward_event_with_kind(
+                carrier_id,
+                points,
+                SoccerRewardEventKind::ProductiveForwardCarry,
+            );
+        }
+    }
+
+    /// Drop the forward-carry tracker without paying it (the run ended unproductively — a backward
+    /// pass or a turnover). Gated; OFF ⇒ no-op.
+    pub(crate) fn clear_forward_carry_tracker(&mut self, carrier_id: usize) {
+        if !progressive_carry_reward_enabled() {
+            return;
+        }
+        if self
+            .forward_carry_tracker
+            .is_some_and(|tracker| tracker.carrier_id == carrier_id)
+        {
+            self.forward_carry_tracker = None;
         }
     }
 
@@ -12748,6 +12893,16 @@ impl SoccerMatch {
                             mpc_pass_speed = None;
                         }
                     }
+                    // MPC pass-WEIGHT refinement: when the full MPC-aim path didn't already set a
+                    // launch speed (it is default-off / declined), still PRICE THE WEIGHT off the
+                    // receiver's predicted arrival so a ground pass isn't struck too fast or too slow
+                    // by the heuristic curve. Aim is unchanged; only the weight is solved. Gated
+                    // (default-on); off ⇒ None ⇒ the analytic speed is used (byte-identical).
+                    if mpc_pass_speed.is_none() && !flight.is_aerial() && !is_one_two_give {
+                        if let Some(id) = target_id {
+                            mpc_pass_speed = snapshot.mpc_refined_pass_weight(player_id, id, led_target);
+                        }
+                    }
                     let is_cross = pass_would_be_cross(
                         player_pos,
                         led_target,
@@ -13271,19 +13426,58 @@ impl SoccerMatch {
                     self.stat_pass_attempt_half(attempt_own_half);
                     // PENALTY: an isolated attacking carrier who panicked a backward/square ball
                     // instead of driving at goal or holding it up. Trains the policy off the bug.
-                    if isolated_carrier_drive_enabled()
+                    let emitted_isolated_panic = isolated_carrier_drive_enabled()
                         && self.isolated_carrier_panic_back_pass(
                             player_id,
                             player_pos,
                             release_target,
                             attempt_own_half,
-                        )
-                    {
+                        );
+                    if emitted_isolated_panic {
                         self.record_reward_event_with_kind(
                             player_id,
                             -ISOLATED_CARRIER_PANIC_BACK_PASS_PENALTY_POINTS,
                             SoccerRewardEventKind::IsolatedCarrierPanicBackPass,
                         );
+                    }
+                    // PRODUCTIVE forward carry (Reward A): a dribble that ends in a FORWARD pass is
+                    // cashed out in 2-yard segments; a backward/square pass drops the carry unpaid.
+                    let pass_forward_yards =
+                        (release_target.y - player_pos.y) * player_team.attack_dir();
+                    if pass_forward_yards >= FORWARD_CARRY_FORWARD_PASS_MIN_YARDS {
+                        self.cash_out_productive_forward_carry(player_id);
+                    } else {
+                        self.clear_forward_carry_tracker(player_id);
+                    }
+                    // BACKWARD-PASS DISCIPLINE (penalty): a pass played backward (toward our own
+                    // goal) is only justified under genuine high pressure — an opponent within
+                    // BACKWARD_PASS_HIGH_PRESSURE_RADIUS of the passer (the case near the
+                    // touchlines/corners too, where options shrink). Played with no close opponent
+                    // it is penalized, scaled by how far back it goes. Skipped when the isolated
+                    // panic penalty already fired for this pass (no double counting), and during a
+                    // set-play restart (a backward ball to retain a free-kick/throw-in is normal,
+                    // not an open-play recycle blunder).
+                    if backward_pass_discipline_enabled()
+                        && !emitted_isolated_panic
+                        && self.active_set_play.is_none()
+                    {
+                        let nearest_opp = self
+                            .players
+                            .iter()
+                            .filter(|other| other.team == player_team.other())
+                            .map(|other| other.position.distance(player_pos))
+                            .fold(f64::INFINITY, f64::min);
+                        let penalty = unpressured_backward_pass_penalty_points(
+                            -pass_forward_yards,
+                            nearest_opp,
+                        );
+                        if penalty > 0.0 {
+                            self.record_reward_event_with_kind(
+                                player_id,
+                                -penalty,
+                                SoccerRewardEventKind::UnpressuredBackwardPass,
+                            );
+                        }
                     }
                     self.register_flank_crash_box_cross(
                         player_team,
@@ -13315,6 +13509,9 @@ impl SoccerMatch {
             SoccerAction::Shoot { power } => {
                 let mut release_facing = action_facing;
                 if self.ball.holder == Some(player_id) {
+                    // PRODUCTIVE forward carry (Reward A): a dribble that ends in a SHOT is always a
+                    // productive finish to the carry — cash it out in 2-yard segments.
+                    self.cash_out_productive_forward_carry(player_id);
                     // The ball altitude before this contact overwrites it: a finish struck while
                     // the ball is up in the heading band is an aerial (headed) finish — the signal
                     // the flank crash-the-box bonus keys off.
@@ -23131,6 +23328,41 @@ impl WorldSnapshot {
         Some((holder_id, holder_pos))
     }
 
+    /// The unifying **advance-upfield-in-possession** cue: our team is in *controlled* possession
+    /// through an outfield carrier who has room to take the ball forward — either a clear open lane
+    /// to dribble into (`forward_dribble_space_yards >= TEAM_ADVANCE_FORWARD_SPACE_YARDS`, the
+    /// "received a pass with a lot of space forward" case) or simply no committed presser
+    /// (`nearest_opponent >= UNCONTESTED_CARRIER_SPACE_YARDS`). When it holds the whole team should
+    /// advance as a unit: off-ball runners push forward in support (wired into
+    /// [`Self::attacking_support_sprint_active`] / [`Self::apply_attacking_forward_intent_floor`]),
+    /// the back four steps up to stay compact behind the attack (wired into
+    /// [`Self::back_four_line_v2_centre_fwd`]), and the MARL/MAPPO policy is rewarded for the
+    /// territorial gain (`dense_soccer_transition_reward`). Returns `(carrier_id, carrier_pos,
+    /// forward_space_yards)`. Gated (default-on) by `DD_SOCCER_ENABLE_TEAM_ADVANCE_UPFIELD`.
+    pub(crate) fn team_advance_upfield_active(&self, team: Team) -> Option<(usize, Vec2, f64)> {
+        if !team_advance_upfield_enabled() {
+            return None;
+        }
+        // A genuinely loose / in-flight ball doesn't qualify — we want a teammate actually in
+        // control so the advance is committed, not speculative.
+        if self.controlled_possession_team() != Some(team) {
+            return None;
+        }
+        let holder_id = self.ball.holder?;
+        let holder = self.players.iter().find(|player| player.id == holder_id)?;
+        if holder.team != team || holder.role == PlayerRole::Goalkeeper {
+            return None;
+        }
+        let holder_pos = self.player_snapshot_position(holder);
+        let forward_space = self.forward_dribble_space_yards(holder_id);
+        let nearest_opponent = self.nearest_opponent_distance_at(team, holder_pos);
+        if team_advance_upfield_space_qualifies(forward_space, nearest_opponent) {
+            Some((holder_id, holder_pos, forward_space))
+        } else {
+            None
+        }
+    }
+
     /// The team's ball-carrier is at the FRONT LINE — at most
     /// `FRONT_LINE_CARRIER_SUPPORT_MAX_TEAMMATES_AHEAD` outfield teammates are ahead of it. The cue
     /// for everyone else to push/sprint forward in support so the carrier is not left isolated up
@@ -23197,6 +23429,7 @@ impl WorldSnapshot {
             || self.front_line_carrier_support_cue(team).is_some()
             || self.uncontested_carrier_advancing(team).is_some()
             || self.carrier_is_foremost_teammate(team).is_some()
+            || self.team_advance_upfield_active(team).is_some()
     }
 
     pub(crate) fn defensive_tracking_sprint_active(&self, team: Team) -> bool {
@@ -44285,7 +44518,7 @@ impl WorldSnapshot {
     /// short of the distance. This is the ball half of the MPC pass rendezvous — "when, if ever,
     /// does the ball get there?" — using the SAME `ball_resistance_after` the physics step uses, so
     /// the plan predicts the real flight.
-    fn ball_ground_travel_time(&self, distance: f64, launch_speed: f64) -> Option<f64> {
+    pub(crate) fn ball_ground_travel_time(&self, distance: f64, launch_speed: f64) -> Option<f64> {
         if !distance.is_finite() || !launch_speed.is_finite() {
             return None;
         }
@@ -44321,6 +44554,88 @@ impl WorldSnapshot {
             }
         }
         None
+    }
+
+    /// Invert [`Self::ball_ground_travel_time`]: the launch speed (yps) that makes a decelerating
+    /// ground ball cover `distance` in `target_time` seconds, bounded to the MPC pass-weight
+    /// envelope. Binary search on the monotonic time↔speed relation (a firmer strike ⇒ a shorter
+    /// travel time). `None` when even the envelope max can't arrive that soon. This is the MPC
+    /// "solve for the weight that times the ball to the receiver" — the exact pace, not a guess.
+    pub(crate) fn ball_ground_launch_speed_for_travel(
+        &self,
+        distance: f64,
+        target_time: f64,
+    ) -> Option<f64> {
+        if !distance.is_finite()
+            || !target_time.is_finite()
+            || distance <= 0.05
+            || target_time <= 1e-3
+        {
+            return None;
+        }
+        let lo_speed = mph_to_yps(MPC_PASS_WEIGHT_MIN_SPEED_MPH);
+        let hi_speed = mph_to_yps(MPC_PASS_WEIGHT_MAX_SPEED_MPH);
+        // The hardest strike gives the shortest travel time; if even that arrives late, give up.
+        let fastest_time = self.ball_ground_travel_time(distance, hi_speed)?;
+        if fastest_time > target_time {
+            return None;
+        }
+        let mut lo = lo_speed;
+        let mut hi = hi_speed;
+        for _ in 0..28 {
+            let mid = 0.5 * (lo + hi);
+            match self.ball_ground_travel_time(distance, mid) {
+                // Arrives LATE (or stalls short ⇒ None) ⇒ needs more pace.
+                Some(t) if t > target_time => lo = mid,
+                None => lo = mid,
+                // Arrives in time / early ⇒ can ease off.
+                Some(_) => hi = mid,
+            }
+        }
+        Some(hi.clamp(lo_speed, hi_speed))
+    }
+
+    /// MPC pass-WEIGHT refinement (gate `DD_SOCCER_ENABLE_MPC_PASS_WEIGHT`): for a ground pass aimed
+    /// at `aim`, solve the launch speed that lands the decelerating ball there exactly as the
+    /// receiver's predicted run reaches it — so the pass is weighted to the receiver instead of a
+    /// heuristic pace (the "too fast / too slow" fix). Unlike [`Self::mpc_pass_execution`] it does
+    /// NOT move the aim point and does NOT require the full MPC-aim gate; it only prices the weight,
+    /// so it improves pass weight even with plain heuristic aiming. `None` (fall back to the
+    /// analytic speed) when the gate is off, the receiver can't reach the aim within the horizon, or
+    /// the solve is infeasible.
+    fn mpc_refined_pass_weight(&self, passer_id: usize, receiver_id: usize, aim: Vec2) -> Option<f64> {
+        if !mpc_pass_weight_enabled() {
+            return None;
+        }
+        let passer = self.players.iter().find(|p| p.id == passer_id)?;
+        let receiver = self.players.iter().find(|p| p.id == receiver_id)?;
+        if receiver.team != passer.team || receiver.role == PlayerRole::Goalkeeper {
+            return None;
+        }
+        let from = self.player_snapshot_position(passer);
+        let dist = from.distance(aim);
+        if dist < 3.0 {
+            return None;
+        }
+        let dt = self.dt_seconds.max(1e-3);
+        let path = self.mpc_predicted_receiver_path(receiver, aim, MPC_PASS_HORIZON_STEPS, dt)?;
+        // The receiver's arrival time at the aim = the horizon step of closest approach to it;
+        // reject when the predicted run never gets within reach (it can't meet the ball there).
+        let mut best_k = None;
+        let mut best_d = f64::INFINITY;
+        for (k, point) in path.iter().enumerate() {
+            let d = point.distance(aim);
+            if d < best_d {
+                best_d = d;
+                best_k = Some(k);
+            }
+        }
+        let k = best_k?;
+        if best_d > MPC_PASS_WEIGHT_MAX_REACH_YARDS {
+            return None;
+        }
+        let arrival_time = (k as f64 * dt).max(dt);
+        self.ball_ground_launch_speed_for_travel(dist, arrival_time)
     }
 
     /// The receiver's dynamically-feasible predicted run over the horizon, via the point-mass MPC
@@ -44444,7 +44759,19 @@ impl WorldSnapshot {
             if refine_off > MPC_PASS_MAX_REFINE_YARDS {
                 continue;
             }
-            for &v in speeds.iter() {
+            // Exact weight: solve the single launch speed that times the decelerating ball to this
+            // rendezvous (rendezvous_err ≈ 0 by construction), instead of snapping to one of a few
+            // coarse speed multipliers (the "too fast / too slow" quantization). Gate off ⇒ the
+            // original coarse sweep, byte-identical.
+            let candidate_speeds: Vec<f64> = if mpc_pass_weight_enabled() {
+                match self.ball_ground_launch_speed_for_travel(dist, t_k) {
+                    Some(v) => vec![v],
+                    None => continue,
+                }
+            } else {
+                speeds.to_vec()
+            };
+            for &v in candidate_speeds.iter() {
                 if !v.is_finite() || v <= 1.0 {
                     continue;
                 }
@@ -44973,7 +45300,11 @@ impl WorldSnapshot {
         // carrier should be supported forward in numbers, not left to dribble alone.
         let uncontested_support = self.uncontested_carrier_advancing(me.team).is_some();
         let front_line_support = self.front_line_carrier_support_cue(me.team).is_some();
-        let forward_support_cue = uncontested_support || front_line_support;
+        // The team is advancing upfield in possession (carrier has space to take the ball on) —
+        // runners must push up with the ball, not hold shape or drop, so the whole team moves
+        // forward as a unit.
+        let team_advance_support = self.team_advance_upfield_active(me.team).is_some();
+        let forward_support_cue = uncontested_support || front_line_support || team_advance_support;
         // In our own half a drop to receive is still valid — unless a teammate is carrying
         // unpressured OR the holder is the front line, which means runners must supply depth.
         if !forward_support_cue
@@ -45082,10 +45413,20 @@ impl WorldSnapshot {
         let ball_depth = (predicted_fwd - own_goal_fwd).clamp(0.0, self.field_length);
         let desired_gap = self.back_four_desired_gap_yards(team);
         let six = self.back_four_six_yard_line_target_depth(team);
-        let max_depth = self.field_length * 0.5
+        let mut max_depth = self.field_length * 0.5
             + tunables()
                 .defensive_shape
                 .defensive_line_max_into_opp_half_yards;
+        // Team upfield advance: while WE control the ball and are advancing as a unit in the
+        // opponent half, let the back four step up beyond its normal into-opp-half cap so the team
+        // stays compact and connected behind the attack instead of leaving a stretched gap. Bounded
+        // by `TEAM_ADVANCE_LINE_PUSH_YARDS`; the flat offside trap is already lifted while we hold
+        // (see `back_four_line_depth_v2_adjusted_y`), and this reverts the instant possession ends.
+        if ball_depth > self.field_length * 0.5
+            && self.team_advance_upfield_active(team).is_some()
+        {
+            max_depth += TEAM_ADVANCE_LINE_PUSH_YARDS;
+        }
         let centre_depth = back_four_line_target_depth_v2(
             ball_depth,
             desired_gap,

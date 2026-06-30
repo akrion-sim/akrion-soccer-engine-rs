@@ -87599,6 +87599,193 @@ fn isolated_carrier_solo_drive_bias_floors_forward_over_backward() {
 }
 
 #[test]
+fn team_advance_upfield_space_qualifies_truth_table() {
+    // The cue fires when the carrier has an open forward lane to dribble into (the "received a
+    // pass with a lot of space forward" case)...
+    assert!(
+        team_advance_upfield_space_qualifies(TEAM_ADVANCE_FORWARD_SPACE_YARDS, 0.0),
+        "an open forward lane at the threshold should qualify even under pressure"
+    );
+    assert!(
+        team_advance_upfield_space_qualifies(20.0, 1.0),
+        "lots of forward grass qualifies regardless of a trailing presser"
+    );
+    // ...OR when the carrier simply has no committed presser (free to advance the ball)...
+    assert!(
+        team_advance_upfield_space_qualifies(0.0, UNCONTESTED_CARRIER_SPACE_YARDS),
+        "an unpressured carrier qualifies even with no clear straight lane"
+    );
+    // ...but NOT when boxed in: no forward lane AND a presser committed.
+    assert!(
+        !team_advance_upfield_space_qualifies(
+            TEAM_ADVANCE_FORWARD_SPACE_YARDS - 0.1,
+            UNCONTESTED_CARRIER_SPACE_YARDS - 0.1
+        ),
+        "a pressed carrier with no forward lane must not trigger a team advance"
+    );
+    assert!(
+        !team_advance_upfield_space_qualifies(0.0, 0.0),
+        "a fully boxed-in carrier must not trigger a team advance"
+    );
+}
+
+#[test]
+fn forward_carry_tracker_sustained_segments_and_productive_payout() {
+    let seg = |fine, coarse| SustainedDribbleSegments { fine, coarse };
+    let mut t = ForwardCarryTracker::new_at(7, Team::Home, 60.0);
+    // 2yd carried: the FIRST 1yd segment earns nothing, the 2nd 1yd segment pays (fine cadence);
+    // the first 2yd segment earns nothing (coarse cadence needs "2 more").
+    assert_eq!(t.fold_tick(2.0), seg(1, 0));
+    // 4yd total: two more 1yd segments + the first rewardable 2yd segment.
+    assert_eq!(t.fold_tick(2.0), seg(2, 1));
+    // 6yd total: two more 1yd + one more 2yd.
+    assert_eq!(t.fold_tick(2.0), seg(2, 1));
+    // 7yd: one more 1yd segment, no new 2yd boundary crossed.
+    assert_eq!(t.fold_tick(1.0), seg(1, 0));
+    // 8yd: one more 1yd + the next 2yd boundary.
+    assert_eq!(t.fold_tick(1.0), seg(1, 1));
+    // Productive cash-out after 8yd carried ⇒ 4 whole 2yd segments × per-segment points.
+    let pts = t.productive_carry_reward_points();
+    assert!(
+        (pts - 4.0 * PRODUCTIVE_FORWARD_CARRY_PER_SEGMENT_REWARD_POINTS).abs() < 1e-9,
+        "productive payout {pts} should be 4 segments"
+    );
+    // A meaningful backward move breaks the run: accumulation AND both segment counters reset.
+    assert_eq!(t.fold_tick(-FORWARD_CARRY_BACKWARD_RESET_YARDS), seg(0, 0));
+    assert_eq!(t.productive_carry_reward_points(), 0.0);
+    // Rebuild from zero: fine pays from the 2nd yard, coarse from 4yd again.
+    assert_eq!(t.fold_tick(2.0), seg(1, 0));
+    assert_eq!(t.fold_tick(2.0), seg(2, 1));
+}
+
+#[test]
+fn forward_carry_tracker_caps_long_runs_and_ignores_noise() {
+    let seg = |fine, coarse| SustainedDribbleSegments { fine, coarse };
+    let mut t = ForwardCarryTracker::new_at(3, Team::Away, 50.0);
+    // One huge forward drive: rewardable sustained segments are capped at BOTH cadences.
+    assert_eq!(
+        t.fold_tick(100.0),
+        seg(
+            FORWARD_CARRY_MAX_REWARDED_FINE_SEGMENTS,
+            FORWARD_CARRY_MAX_REWARDED_SEGMENTS
+        )
+    );
+    // Productive payout is likewise capped (2yd cadence).
+    let pts = t.productive_carry_reward_points();
+    assert!(
+        (pts - FORWARD_CARRY_MAX_REWARDED_SEGMENTS as f64
+            * PRODUCTIVE_FORWARD_CARRY_PER_SEGMENT_REWARD_POINTS)
+            .abs()
+            < 1e-9
+    );
+    // Beyond the cap pays nothing more.
+    assert_eq!(t.fold_tick(10.0), seg(0, 0));
+    // Non-finite deltas are ignored (no panic, no reward).
+    assert_eq!(t.fold_tick(f64::NAN), seg(0, 0));
+    // Tiny backward jitter below the reset threshold does NOT break the run.
+    let mut u = ForwardCarryTracker::new_at(5, Team::Home, 40.0);
+    assert_eq!(u.fold_tick(2.0), seg(1, 0)); // carry 2
+    assert_eq!(u.fold_tick(2.0), seg(2, 1)); // carry 4
+    assert_eq!(u.fold_tick(-(FORWARD_CARRY_BACKWARD_RESET_YARDS * 0.5)), seg(0, 0)); // dip to 3.5
+    assert_eq!(u.fold_tick(1.5), seg(1, 0)); // back to 5.0 — one new 1yd segment, 2yd already paid
+    // Crossing the NEXT 2yd boundary pays again — proving the run was NOT reset by the jitter.
+    assert_eq!(u.fold_tick(2.0), seg(2, 1)); // carry 7.0
+}
+
+#[test]
+fn mpc_ground_pass_weight_solver_times_ball_to_target() {
+    let sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let snapshot = WorldSnapshot::from_match(&sim);
+    // The solved launch speed must reproduce the requested travel time (ball lands as the receiver
+    // arrives) — i.e. the solver correctly inverts the decelerating-ball physics.
+    for &(dist, t) in &[(12.0, 0.9_f64), (24.0, 1.4), (8.0, 0.7)] {
+        let v = snapshot
+            .ball_ground_launch_speed_for_travel(dist, t)
+            .unwrap_or_else(|| panic!("solver should find a weight for {dist}yd in {t}s"));
+        let achieved = snapshot
+            .ball_ground_travel_time(dist, v)
+            .unwrap_or_else(|| panic!("solved speed {v} should reach {dist}yd"));
+        assert!(
+            (achieved - t).abs() < 0.05,
+            "solved weight {v}yps should land {dist}yd in ~{t}s, got {achieved}s"
+        );
+    }
+    // Monotonic: a SHORTER required time (same distance) demands a FIRMER pass — the deterministic
+    // "weight to the receiver" relation, not a random pick.
+    let v_slow = snapshot
+        .ball_ground_launch_speed_for_travel(16.0, 1.6)
+        .unwrap();
+    let v_fast = snapshot
+        .ball_ground_launch_speed_for_travel(16.0, 1.0)
+        .unwrap();
+    assert!(
+        v_fast > v_slow,
+        "a quicker rendezvous needs more weight: {v_fast} vs {v_slow}"
+    );
+    // Infeasible: no launch within the envelope covers a huge distance in a tiny time.
+    assert!(snapshot
+        .ball_ground_launch_speed_for_travel(80.0, 0.2)
+        .is_none());
+}
+
+#[test]
+fn buildup_chain_credit_recency_discount() {
+    let base = BUILDUP_CHAIN_CREDIT_GOAL_BASE_POINTS;
+    // The finisher (index 0) gets the full base.
+    assert!((buildup_chain_credit_points(base, 0) - base).abs() < 1e-9);
+    // Each earlier contributor gets the geometric discount — strictly less, recency wins.
+    let c0 = buildup_chain_credit_points(base, 0);
+    let c1 = buildup_chain_credit_points(base, 1);
+    let c2 = buildup_chain_credit_points(base, 2);
+    assert!(c0 > c1 && c1 > c2, "more recent contributors earn more: {c0} {c1} {c2}");
+    assert!(
+        (c1 - base * BUILDUP_CHAIN_CREDIT_RECENCY_DISCOUNT).abs() < 1e-9,
+        "step-back credit should be base×discount"
+    );
+    // Outcome tiers escalate: any shot < shot on frame < goal (at the same recency).
+    assert!(
+        buildup_chain_credit_points(BUILDUP_CHAIN_CREDIT_SHOT_BASE_POINTS, 0)
+            < buildup_chain_credit_points(BUILDUP_CHAIN_CREDIT_SHOT_ON_FRAME_BASE_POINTS, 0)
+            && buildup_chain_credit_points(BUILDUP_CHAIN_CREDIT_SHOT_ON_FRAME_BASE_POINTS, 0)
+                < buildup_chain_credit_points(BUILDUP_CHAIN_CREDIT_GOAL_BASE_POINTS, 0)
+    );
+    // The negligible tail of a long chain is dropped to 0, and a non-positive base is always 0.
+    assert_eq!(buildup_chain_credit_points(base, 100), 0.0);
+    assert_eq!(buildup_chain_credit_points(0.0, 0), 0.0);
+}
+
+#[test]
+fn unpressured_backward_pass_penalty_truth_table() {
+    let pressed = BACKWARD_PASS_HIGH_PRESSURE_RADIUS_YARDS - 0.1; // opponent within 3yd ⇒ justified
+    let free = BACKWARD_PASS_HIGH_PRESSURE_RADIUS_YARDS + 5.0; // no close opponent ⇒ penalized
+    // Under genuine high pressure a backward pass is NOT penalized, however deep.
+    assert_eq!(unpressured_backward_pass_penalty_points(20.0, pressed), 0.0);
+    // A forward / square ball (non-positive backward component) is never penalized.
+    assert_eq!(unpressured_backward_pass_penalty_points(-5.0, free), 0.0);
+    assert_eq!(unpressured_backward_pass_penalty_points(0.0, free), 0.0);
+    // A short backward nudge below the threshold is neutral even when unpressured.
+    assert_eq!(
+        unpressured_backward_pass_penalty_points(BACKWARD_PASS_MIN_PENALIZED_YARDS - 0.1, free),
+        0.0
+    );
+    // An unpressured backward pass at the threshold is penalized (base + per-yard).
+    let p_min = unpressured_backward_pass_penalty_points(BACKWARD_PASS_MIN_PENALIZED_YARDS, free);
+    assert!(p_min > 0.0);
+    // The DEEPER the backward pass, the BIGGER the penalty (monotonic) until the cap.
+    let p_short = unpressured_backward_pass_penalty_points(5.0, free);
+    let p_long = unpressured_backward_pass_penalty_points(10.0, free);
+    assert!(
+        p_long > p_short && p_short > p_min,
+        "penalty must grow with backward distance: {p_min} < {p_short} < {p_long}"
+    );
+    // Very deep recycles are capped.
+    assert_eq!(
+        unpressured_backward_pass_penalty_points(1000.0, free),
+        BACKWARD_PASS_MAX_PENALTY_POINTS
+    );
+}
+
+#[test]
 fn slip_break_seam_and_runner_opportunity_are_recognised() {
     // Geometry/sign-convention coverage for the slip-and-break-the-offside-trap recognition
     // (the ungated seam + opportunity readers; the run-target and bias are env-gated and tested

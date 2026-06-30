@@ -1929,6 +1929,98 @@ const PASS_CHAIN_THREE_NET_FORWARD_EVENT_REWARD_POINTS: f64 = 10.0;
 /// forward-pass-chain link so it meaningfully discourages the blunder without swamping the
 /// sparse match-outcome signal.
 const ISOLATED_CARRIER_PANIC_BACK_PASS_PENALTY_POINTS: f64 = 6.0;
+/// Clear straight-ahead dribble lane (yards) that counts as "lots of space forward to advance
+/// into" for the team-upfield-advance cue — a player receiving a pass with this much open grass
+/// in front should take it on while the team pushes up behind him. Mirrors the hold-for-support
+/// drive-into-space threshold so the carrier's "decline to wait, drive instead" and the team's
+/// "advance as a unit" recognizers agree on what "open forward grass" means. See
+/// [`WorldSnapshot::team_advance_upfield_active`].
+const TEAM_ADVANCE_FORWARD_SPACE_YARDS: f64 = 6.0;
+/// Extra depth (yards) the back four is allowed to push ABOVE its normal into-opp-half cap while
+/// the team is advancing upfield in controlled possession — the line steps up to keep the team
+/// compact and connected behind the attack instead of leaving a stretched gap. Only applied while
+/// WE hold the ball (the flat offside trap is already lifted in that case) and reverts the instant
+/// possession is lost. See [`WorldSnapshot::back_four_line_v2_centre_fwd`].
+const TEAM_ADVANCE_LINE_PUSH_YARDS: f64 = 12.0;
+/// Forward progress (yards, in one decision transition) that earns the full team-advance dense
+/// shaping reward; progress is clamped to this reference so a single burst can't farm reward.
+const TEAM_ADVANCE_REWARD_REFERENCE_YARDS: f64 = 4.0;
+/// Dense shaping reward for the CARRIER driving the ball forward into space while the team advances
+/// as a unit — the "take the space" signal. Comparable in magnitude to the other in-possession
+/// spacing shaping terms so it nudges without swamping the sparse goal/possession signal.
+const TEAM_ADVANCE_CARRIER_DRIVE_REWARD: f64 = 0.30;
+/// Dense shaping reward for an OFF-BALL teammate making a forward supporting run while the team
+/// advances upfield — the "whole team moves forward" signal that pulls runners up with the ball.
+const TEAM_ADVANCE_SUPPORT_RUN_REWARD: f64 = 0.22;
+/// One progressive-carry "segment": every this-many yards the carrier advances the ball FORWARD
+/// (Δy·attack toward the opponent goal; lateral x movement is allowed, only the forward component
+/// counts). Both progressive-carry rewards are denominated in these 2-yard segments. See
+/// [`ForwardCarryTracker`].
+const FORWARD_CARRY_SEGMENT_YARDS: f64 = 2.0;
+/// A single-tick BACKWARD ball movement (yards, Δy·attack negative) larger than this breaks the
+/// sustained-dribble chain: the carrier turned back, so the consecutive-forward-segments counter
+/// and accumulated carry reset. Small jitter below this is tolerated so a near-straight dribble
+/// isn't reset by physics noise.
+const FORWARD_CARRY_BACKWARD_RESET_YARDS: f64 = 1.0;
+/// Minimum forward component (yards, Δy·attack) a released pass must have to count as "a pass
+/// forward" for the productive-carry cash-out — matches the segment size so "carried it forward
+/// then played it forward" is judged on the same 2-yard forward standard.
+const FORWARD_CARRY_FORWARD_PASS_MIN_YARDS: f64 = 2.0;
+/// Reward points per completed 2-yard segment for SUSTAINED forward dribbling — i.e. "2 yards of
+/// forward dribbling followed by 2 more yards". Only segments PAST THE FIRST are paid (a lone
+/// 2-yard nudge earns nothing; the 2nd, 3rd… consecutive segment each earn this), so the signal
+/// rewards a carrier who keeps driving the ball forward, escalating with the length of the run.
+/// Deliberately small: this is UNCONDITIONAL shaping (paid even if possession is then lost), so a
+/// full-length run must stay well below an outcome reward (shot on target 40, goal 100).
+const SUSTAINED_FORWARD_DRIBBLE_SEGMENT_REWARD_POINTS: f64 = 0.5;
+/// FINE (1-yard) cadence of the sustained-dribble reward: "a yard of forward dribbling followed by
+/// another yard". Paid PER 1-yard segment past the first, in ADDITION to the 2-yard cadence above,
+/// so a continuous forward carry is rewarded at both granularities. Smaller per-segment (there are
+/// twice as many) so the two cadences stay balanced.
+const FORWARD_CARRY_FINE_SEGMENT_YARDS: f64 = 1.0;
+const SUSTAINED_FORWARD_DRIBBLE_FINE_SEGMENT_REWARD_POINTS: f64 = 0.25;
+/// Cap (1-yard segments) on the fine-cadence sustained-dribble payout — same 20-yard ceiling as the
+/// 2-yard cadence, expressed in 1-yard units.
+const FORWARD_CARRY_MAX_REWARDED_FINE_SEGMENTS: u32 = 20;
+/// Reward points per 2-yard segment of forward carry that CULMINATES in a forward pass or a shot —
+/// the "productive dribble" signal: a carry is only paid off when it leads to a forward pass or a
+/// shot (a carry that ends in a turnover or a backward/square ball earns nothing here). Comparable
+/// per-segment to a forward-pass-chain link so a 6-yard drive into a forward pass rivals the
+/// pass-chain reward it sets up.
+const PRODUCTIVE_FORWARD_CARRY_PER_SEGMENT_REWARD_POINTS: f64 = 1.5;
+/// Cap (segments) on a single productive-carry / sustained-dribble payout so one very long run
+/// can't dominate the sparse goal/possession signal (20 yards of forward carry).
+const FORWARD_CARRY_MAX_REWARDED_SEGMENTS: u32 = 10;
+/// A pass with at least this much BACKWARD component (yards toward our OWN goal, i.e. -Δy·attack)
+/// is subject to backward-pass discipline. Below this a square/short ball is treated as neutral.
+const BACKWARD_PASS_MIN_PENALIZED_YARDS: f64 = 2.0;
+/// "High pressure" radius for backward-pass discipline: a backward pass is only JUSTIFIED when an
+/// opponent is within this many yards of the passer at release. This is the genuine-pressure test
+/// the user asked for — it also covers the touchline/corner case (where passing/dribbling options
+/// shrink) but still requires a close opponent; mere positional urgency is not enough.
+const BACKWARD_PASS_HIGH_PRESSURE_RADIUS_YARDS: f64 = 3.0;
+/// Base penalty points for an UNPRESSURED backward pass, before the distance term.
+const BACKWARD_PASS_BASE_PENALTY_POINTS: f64 = 2.0;
+/// Extra penalty points per yard of backward distance — the deeper the ball is played back the
+/// worse it is, so a long recycle toward our own goal is punished far more than a short drop.
+const BACKWARD_PASS_PENALTY_PER_YARD_POINTS: f64 = 0.5;
+/// Cap on the total unpressured-backward-pass penalty so one very deep ball can't swamp the signal.
+const BACKWARD_PASS_MAX_PENALTY_POINTS: f64 = 12.0;
+/// How many of the most-recent teammates in a buildup chain are credited for a shot (the user's
+/// "last 10 teammates involved in the plays that led to the goal").
+const BUILDUP_CHAIN_CREDIT_DEPTH: usize = 10;
+/// Geometric recency discount per step back down the buildup chain — the finisher gets the full
+/// base, each earlier contributor `discount×` the one after it (higher reward for recency).
+const BUILDUP_CHAIN_CREDIT_RECENCY_DISCOUNT: f64 = 0.72;
+/// Below this the discounted buildup credit is dropped (negligible tail of a long chain).
+const BUILDUP_CHAIN_CREDIT_MIN_POINTS: f64 = 0.05;
+/// Base buildup-credit points (for the finisher; earlier contributors are discounted) by outcome:
+/// ANY shot (incl. off target) < shot ON FRAME (on target) < GOAL. A goal also fires the on-frame
+/// tier (it is on target), so the finisher of a goal collects on-frame + goal credit — "especially
+/// a goal".
+const BUILDUP_CHAIN_CREDIT_SHOT_BASE_POINTS: f64 = 2.0;
+const BUILDUP_CHAIN_CREDIT_SHOT_ON_FRAME_BASE_POINTS: f64 = 5.0;
+const BUILDUP_CHAIN_CREDIT_GOAL_BASE_POINTS: f64 = 14.0;
 const PASS_CHAIN_THREE_NET_FORWARD_MIN_YARDS: f64 = 4.0;
 const PASS_CHAIN_EVENT_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(12.0);
 const PASS_AND_MOVE_FORWARD_MIN_YARDS: f64 = 4.0;
@@ -3223,6 +3315,14 @@ const MPC_PASS_MIN_STEP: usize = 3;
 // A candidate rendezvous is only accepted when the ball's predicted arrival time and the receiver's
 // predicted arrival time agree within this tolerance (seconds) — i.e. the ball actually meets the run.
 const MPC_PASS_RENDEZVOUS_TOLERANCE_SECONDS: f64 = 0.22;
+/// Envelope (mph) for the EXACT MPC pass-weight solve: the binary search for the launch speed that
+/// times a decelerating ground ball to the receiver's predicted arrival is bounded to this band so
+/// it stays a real, controllable pass (never a crawl, never an uncontrollable rocket).
+const MPC_PASS_WEIGHT_MIN_SPEED_MPH: f64 = 6.0;
+const MPC_PASS_WEIGHT_MAX_SPEED_MPH: f64 = 60.0;
+/// The receiver's predicted run must pass within this many yards of the aim point for the MPC
+/// weight solve to trust that arrival time (else the receiver never actually meets the ball there).
+const MPC_PASS_WEIGHT_MAX_REACH_YARDS: f64 = 4.0;
 // Half-width (yards) of the pass-lane corridor the MPC tests for a defender cutting the ball out.
 const MPC_PASS_LANE_RADIUS_YARDS: f64 = 1.4;
 // The MPC only REFINES the proven analytic lead — its chosen aim must stay within this far of it.
@@ -17378,6 +17478,125 @@ impl PossessionProgressTracker {
     }
 }
 
+/// Tracks the CURRENT ball-carrier's continuous forward dribble so two progressive-carry MARL
+/// rewards can be paid (gated by `DD_SOCCER_ENABLE_PROGRESSIVE_CARRY_REWARD`):
+/// 1. SUSTAINED dribbling — each 2-yard forward segment past the first in one continuous carry
+///    (`fold_tick`, emitted per tick while the player keeps driving forward).
+/// 2. PRODUCTIVE carry — the accumulated forward yards, paid in 2-yard segments, cashed out at the
+///    moment the carry ends in a forward pass or a shot (`productive_carry_reward_points`).
+/// "Forward" is Δy·attack toward the opponent goal; lateral (x) movement is free — only the forward
+/// component is accumulated. A single carrier holds the ball at a time, so the match keeps one
+/// `Option<ForwardCarryTracker>`, reset when the holder changes / possession is lost. The segment
+/// accounting is pure (no env, no world access) so it is unit-tested directly.
+/// New sustained-dribble segments completed this tick, at BOTH cadences: `fine` = 1-yard segments
+/// ("a yard followed by another yard"), `coarse` = 2-yard segments ("2 yards followed by 2 more").
+/// Both are rewarded (the user asked for both); the coarse cadence is an extra bonus that escalates
+/// with a longer continuous run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SustainedDribbleSegments {
+    pub(crate) fine: u32,
+    pub(crate) coarse: u32,
+}
+
+impl SustainedDribbleSegments {
+    fn is_empty(self) -> bool {
+        self.fine == 0 && self.coarse == 0
+    }
+}
+
+/// Number of NEW sustained segments to reward this tick at `segment_yards` granularity: whole
+/// segments completed PAST THE FIRST (so "one segment followed by another"), capped, minus those
+/// already rewarded (advanced in place). Pure.
+fn advance_sustained_segments(
+    carry_yards: f64,
+    segment_yards: f64,
+    cap: u32,
+    already_rewarded: &mut u32,
+) -> u32 {
+    let total = (carry_yards / segment_yards).floor() as u32;
+    let rewardable = total.saturating_sub(1).min(cap);
+    if rewardable > *already_rewarded {
+        let new = rewardable - *already_rewarded;
+        *already_rewarded = rewardable;
+        new
+    } else {
+        0
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ForwardCarryTracker {
+    pub(crate) carrier_id: usize,
+    pub(crate) team: Team,
+    pub(crate) last_ball_y: f64,
+    forward_carry_yards: f64,
+    fine_rewarded_segments: u32,
+    coarse_rewarded_segments: u32,
+}
+
+impl ForwardCarryTracker {
+    fn new_at(carrier_id: usize, team: Team, ball_y: f64) -> Self {
+        Self {
+            carrier_id,
+            team,
+            last_ball_y: ball_y,
+            forward_carry_yards: 0.0,
+            fine_rewarded_segments: 0,
+            coarse_rewarded_segments: 0,
+        }
+    }
+
+    /// Fold one tick of carry into the run. `forward_delta` is this tick's Δy·attack (positive =
+    /// toward the opponent goal). A meaningful backward move breaks the run (resets the accumulated
+    /// carry and BOTH rewarded-segment counters). Returns the NEW sustained segments to reward this
+    /// tick at both the 1-yard (`fine`) and 2-yard (`coarse`) cadences — segments PAST THE FIRST in
+    /// the continuous run ("a yard followed by another yard" / "2 yards followed by 2 more"), each
+    /// capped. Pure.
+    fn fold_tick(&mut self, forward_delta: f64) -> SustainedDribbleSegments {
+        if !forward_delta.is_finite() {
+            return SustainedDribbleSegments::default();
+        }
+        if forward_delta <= -FORWARD_CARRY_BACKWARD_RESET_YARDS {
+            self.forward_carry_yards = 0.0;
+            self.fine_rewarded_segments = 0;
+            self.coarse_rewarded_segments = 0;
+            return SustainedDribbleSegments::default();
+        }
+        self.forward_carry_yards = (self.forward_carry_yards + forward_delta).max(0.0);
+        let fine = advance_sustained_segments(
+            self.forward_carry_yards,
+            FORWARD_CARRY_FINE_SEGMENT_YARDS,
+            FORWARD_CARRY_MAX_REWARDED_FINE_SEGMENTS,
+            &mut self.fine_rewarded_segments,
+        );
+        let coarse = advance_sustained_segments(
+            self.forward_carry_yards,
+            FORWARD_CARRY_SEGMENT_YARDS,
+            FORWARD_CARRY_MAX_REWARDED_SEGMENTS,
+            &mut self.coarse_rewarded_segments,
+        );
+        SustainedDribbleSegments { fine, coarse }
+    }
+
+    /// Reward points to emit this tick for the sustained-dribble segments (both cadences), summed.
+    fn sustained_reward_points(&mut self, forward_delta: f64) -> f64 {
+        let seg = self.fold_tick(forward_delta);
+        if seg.is_empty() {
+            return 0.0;
+        }
+        seg.fine as f64 * SUSTAINED_FORWARD_DRIBBLE_FINE_SEGMENT_REWARD_POINTS
+            + seg.coarse as f64 * SUSTAINED_FORWARD_DRIBBLE_SEGMENT_REWARD_POINTS
+    }
+
+    /// Points for a productive cash-out (the carry ended in a forward pass or a shot): one reward
+    /// unit per completed 2-yard forward segment, capped. Zero below one full segment. Pure.
+    fn productive_carry_reward_points(&self) -> f64 {
+        let segments = ((self.forward_carry_yards / FORWARD_CARRY_SEGMENT_YARDS).floor() as u32)
+            .min(FORWARD_CARRY_MAX_REWARDED_SEGMENTS);
+        segments as f64 * PRODUCTIVE_FORWARD_CARRY_PER_SEGMENT_REWARD_POINTS
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingPassSnapshot {
@@ -17599,6 +17818,30 @@ pub(crate) enum SoccerRewardEventKind {
     /// `DD_SOCCER_ENABLE_ISOLATED_CARRIER_DRIVE` is on. See
     /// `isolated_attacking_carrier_drive_mode` in the `player` module.
     IsolatedCarrierPanicBackPass,
+    /// Positive: SUSTAINED forward dribbling — the carrier completed another 2-yard forward
+    /// segment in a continuous carry ("2 yards followed by 2 more"). Emitted per qualifying
+    /// segment past the first. The direct learning signal that the policy should keep driving the
+    /// ball forward at feet, not stall. Emitted only when
+    /// `DD_SOCCER_ENABLE_PROGRESSIVE_CARRY_REWARD` is on. See [`ForwardCarryTracker`].
+    SustainedForwardDribble,
+    /// Positive: PRODUCTIVE forward carry — a forward dribble (in 2-yard segments) that CULMINATED
+    /// in a forward pass or a shot, cashed out at the release. Trains the policy that carrying the
+    /// ball forward and then playing it forward / shooting is rewarded, whereas a carry that ends
+    /// in a turnover or a backward ball earns nothing. Emitted only when
+    /// `DD_SOCCER_ENABLE_PROGRESSIVE_CARRY_REWARD` is on. See [`ForwardCarryTracker`].
+    ProductiveForwardCarry,
+    /// PENALTY (negative): a pass played BACKWARD (toward our own goal) by a passer who was NOT
+    /// under genuine high pressure (no opponent within the high-pressure radius), scaled by how far
+    /// back it went. The direct learning signal that a backward recycle should be a high-pressure
+    /// escape, not a default outlet. Emitted only when `DD_SOCCER_ENABLE_BACKWARD_PASS_DISCIPLINE`
+    /// is on. See [`backward_pass_discipline_enabled`].
+    UnpressuredBackwardPass,
+    /// Positive: BUILDUP credit — the last few teammates whose touches built the move that led to a
+    /// shot are rewarded, recency-discounted (the shooter/most-recent most, each earlier contributor
+    /// geometrically less). Scaled by outcome: any shot < shot on frame < goal. The MAPPO signal
+    /// that the WHOLE buildup, not just the finisher, gets credit for creating the chance. Emitted
+    /// only when `DD_SOCCER_ENABLE_BUILDUP_CHAIN_CREDIT` is on. See `record_buildup_chain_credit`.
+    BuildupChainCredit,
     MatchResult,
 }
 
@@ -17617,6 +17860,10 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::HeaderGoalFromCross
                 | SoccerRewardEventKind::CrashBoxArrival
                 | SoccerRewardEventKind::IsolatedCarrierPanicBackPass
+                | SoccerRewardEventKind::SustainedForwardDribble
+                | SoccerRewardEventKind::ProductiveForwardCarry
+                | SoccerRewardEventKind::UnpressuredBackwardPass
+                | SoccerRewardEventKind::BuildupChainCredit
                 | SoccerRewardEventKind::MatchResult
         )
     }
@@ -17637,6 +17884,9 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::Goal
                 | SoccerRewardEventKind::HeaderGoalFromCross
                 | SoccerRewardEventKind::CrashBoxArrival
+                | SoccerRewardEventKind::SustainedForwardDribble
+                | SoccerRewardEventKind::ProductiveForwardCarry
+                | SoccerRewardEventKind::BuildupChainCredit
         )
     }
 }
@@ -18324,6 +18574,155 @@ pub(crate) fn gate_default_on(name: &str) -> bool {
             "0" | "false" | "no" | "off"
         ),
         Err(_) => true,
+    }
+}
+
+/// Pure space/pressure test for the team-upfield-advance cue: a controlled-possession outfield
+/// carrier is "advancing into space" when he either has an open forward lane to dribble into
+/// (`forward_dribble_space_yards >= TEAM_ADVANCE_FORWARD_SPACE_YARDS` — the "received a pass with a
+/// lot of space forward" case) OR simply has no committed presser
+/// (`nearest_opponent_distance_yards >= UNCONTESTED_CARRIER_SPACE_YARDS`). Extracted as a pure free
+/// function so the threshold logic is unit-tested directly, WITHOUT toggling the process-global
+/// `DD_SOCCER_ENABLE_TEAM_ADVANCE_UPFIELD` gate env (which would race the parallel suite). See
+/// [`WorldSnapshot::team_advance_upfield_active`].
+pub(crate) fn team_advance_upfield_space_qualifies(
+    forward_dribble_space_yards: f64,
+    nearest_opponent_distance_yards: f64,
+) -> bool {
+    forward_dribble_space_yards >= TEAM_ADVANCE_FORWARD_SPACE_YARDS
+        || nearest_opponent_distance_yards >= UNCONTESTED_CARRIER_SPACE_YARDS
+}
+
+/// Whether the **team upfield advance in possession** strategy is active this process. When a team
+/// is in controlled possession through a carrier who has space to advance into, the whole team
+/// pushes forward as a unit: off-ball runners make forward supporting runs, the back four steps up
+/// to stay compact behind the attack, and the MARL/MAPPO policy is rewarded for the coordinated
+/// territorial gain. Default-ON in production (env `DD_SOCCER_ENABLE_TEAM_ADVANCE_UPFIELD=0/false`
+/// is the kill switch); default-OFF under test so the option-scoring parity suite stays
+/// byte-identical. See [`WorldSnapshot::team_advance_upfield_active`].
+pub(crate) fn team_advance_upfield_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_TEAM_ADVANCE_UPFIELD").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_TEAM_ADVANCE_UPFIELD"))
+    }
+}
+
+/// Whether the **progressive-carry reward** is active this process. Adds two MARL/MAPPO learning
+/// signals that the prior reward set was missing: (1) SUSTAINED forward dribbling — every 2-yard
+/// forward segment past the first in a continuous carry; and (2) PRODUCTIVE forward carry — a carry
+/// paid off in 2-yard segments when it culminates in a forward pass or a shot. Default-ON in
+/// production (env `DD_SOCCER_ENABLE_PROGRESSIVE_CARRY_REWARD=0/false` is the kill switch);
+/// default-OFF under test so the reward-parity suite stays byte-identical. See
+/// [`ForwardCarryTracker`].
+pub(crate) fn progressive_carry_reward_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_PROGRESSIVE_CARRY_REWARD").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_PROGRESSIVE_CARRY_REWARD"))
+    }
+}
+
+/// Penalty points (>= 0) for an unpressured backward pass. Zero unless the ball is played at least
+/// `BACKWARD_PASS_MIN_PENALIZED_YARDS` backward AND the nearest opponent is beyond the high-pressure
+/// radius (i.e. NOT genuinely pressed); otherwise `base + per-yard·backward`, capped — so a deeper
+/// recycle is punished harder. Pure (env-free) so the scaling is unit-tested directly. See
+/// [`backward_pass_discipline_enabled`].
+pub(crate) fn unpressured_backward_pass_penalty_points(
+    backward_yards: f64,
+    nearest_opponent_distance_yards: f64,
+) -> f64 {
+    if !backward_yards.is_finite()
+        || backward_yards < BACKWARD_PASS_MIN_PENALIZED_YARDS
+        || nearest_opponent_distance_yards <= BACKWARD_PASS_HIGH_PRESSURE_RADIUS_YARDS
+    {
+        return 0.0;
+    }
+    (BACKWARD_PASS_BASE_PENALTY_POINTS + backward_yards * BACKWARD_PASS_PENALTY_PER_YARD_POINTS)
+        .min(BACKWARD_PASS_MAX_PENALTY_POINTS)
+}
+
+/// Whether the **MPC pass-weight solver** is active this process. For a ground pass to a receiver
+/// it solves the EXACT launch speed that lands the decelerating ball on the aim point as the
+/// receiver's predicted run arrives there — so pass weight is physically timed to the receiver, not
+/// left to the heuristic curve (which sometimes hits the ball too fast or too slow). Works even when
+/// the full MPC pass-aim path (`DD_SOCCER_ENABLE_MPC_PASS`) is off: it only refines the WEIGHT for
+/// the already-chosen lead point. Default-ON in production (env
+/// `DD_SOCCER_ENABLE_MPC_PASS_WEIGHT=0/false` is the kill switch); default-OFF under test so the
+/// pass-physics parity suite stays byte-identical. See `WorldSnapshot::mpc_refined_pass_weight`.
+pub(crate) fn mpc_pass_weight_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_MPC_PASS_WEIGHT").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_MPC_PASS_WEIGHT"))
+    }
+}
+
+/// Whether **buildup chain credit** is active this process. On a shot it rewards the last
+/// `BUILDUP_CHAIN_CREDIT_DEPTH` teammates whose touches built the move, recency-discounted (the
+/// finisher/most-recent most, each earlier contributor geometrically less), with the base scaled by
+/// outcome (any shot < shot on frame < goal). Additive MAPPO buildup credit on top of the existing
+/// shot/goal patterns. Default-ON in production (env `DD_SOCCER_ENABLE_BUILDUP_CHAIN_CREDIT=0/false`
+/// is the kill switch); default-OFF under test so the reward-parity suite stays byte-identical.
+pub(crate) fn buildup_chain_credit_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_BUILDUP_CHAIN_CREDIT").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_BUILDUP_CHAIN_CREDIT"))
+    }
+}
+
+/// Recency-discounted credit (points) for the k-th most-recent contributor in a buildup chain
+/// (k=0 = the finisher / most recent): `base · discount^k`, floored to 0 below the min payout. Pure
+/// so the discount curve is unit-tested directly. See [`buildup_chain_credit_enabled`].
+pub(crate) fn buildup_chain_credit_points(base_points: f64, recency_index: usize) -> f64 {
+    if base_points <= 0.0 {
+        return 0.0;
+    }
+    let amount = base_points * BUILDUP_CHAIN_CREDIT_RECENCY_DISCOUNT.powi(recency_index as i32);
+    if amount >= BUILDUP_CHAIN_CREDIT_MIN_POINTS {
+        amount
+    } else {
+        0.0
+    }
+}
+
+/// Whether **backward-pass discipline** is active this process. Emits a training PENALTY for a
+/// pass played backward (toward our own goal) when the passer is NOT under genuine high pressure —
+/// no opponent within `BACKWARD_PASS_HIGH_PRESSURE_RADIUS_YARDS` — scaled by how far back the ball
+/// goes. Trains the policy that a backward recycle is a high-pressure escape, not a default outlet.
+/// Default-ON in production (env `DD_SOCCER_ENABLE_BACKWARD_PASS_DISCIPLINE=0/false` is the kill
+/// switch); default-OFF under test so the reward-parity suite stays byte-identical.
+pub(crate) fn backward_pass_discipline_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_BACKWARD_PASS_DISCIPLINE").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_BACKWARD_PASS_DISCIPLINE"))
     }
 }
 
@@ -22138,6 +22537,27 @@ fn dense_soccer_transition_reward(
         let before_fit = attacking_support_shape_fit(before_obs);
         let after_fit = attacking_support_shape_fit(&after_obs);
         reward += (after_fit - before_fit).clamp(-1.0, 1.0) * ATTACK_SUPPORT_SPACING_SHAPE_REWARD;
+    }
+    // TEAM UPFIELD ADVANCE (MARL / MAPPO): when we control the ball and the carrier has space to
+    // advance into, reward the WHOLE team for pushing forward as a unit — the carrier for driving
+    // the ball on into the space ("take the space"), and every off-ball teammate for making a
+    // forward supporting run ("whole team moves forward"). The cue is evaluated on the BEFORE
+    // snapshot so the reward credits the action that advanced the team, and progress is clamped to
+    // a reference distance so a single burst can't farm reward. Gated (default-on) by
+    // `DD_SOCCER_ENABLE_TEAM_ADVANCE_UPFIELD`; OFF ⇒ this term vanishes (byte-identical parity).
+    if team_advance_upfield_enabled()
+        && before_possession == Some(player.team)
+        && before.team_advance_upfield_active(player.team).is_some()
+    {
+        if before.ball.holder == Some(player.id) {
+            if ball_forward > 0.0 {
+                reward += (ball_forward / TEAM_ADVANCE_REWARD_REFERENCE_YARDS).clamp(0.0, 1.0)
+                    * TEAM_ADVANCE_CARRIER_DRIVE_REWARD;
+            }
+        } else if player.role != PlayerRole::Goalkeeper && player_forward > 0.0 {
+            reward += (player_forward / TEAM_ADVANCE_REWARD_REFERENCE_YARDS).clamp(0.0, 1.0)
+                * TEAM_ADVANCE_SUPPORT_RUN_REWARD;
+        }
     }
     if player.role == PlayerRole::Midfielder
         && (before.ball.holder == Some(player.id) || after.ball.holder == Some(player.id))
@@ -31992,6 +32412,11 @@ fn soccer_requested_tactical_feature_gate_names() -> Vec<String> {
         "DD_SOCCER_ENABLE_FORWARD_OPTION_RECOGNITION",
         "DD_SOCCER_ENABLE_FORWARD_PASS_FIRST",
         "DD_SOCCER_ENABLE_ISOLATED_CARRIER_DRIVE",
+        "DD_SOCCER_ENABLE_TEAM_ADVANCE_UPFIELD",
+        "DD_SOCCER_ENABLE_PROGRESSIVE_CARRY_REWARD",
+        "DD_SOCCER_ENABLE_BACKWARD_PASS_DISCIPLINE",
+        "DD_SOCCER_ENABLE_MPC_PASS_WEIGHT",
+        "DD_SOCCER_ENABLE_BUILDUP_CHAIN_CREDIT",
         "DD_SOCCER_ENABLE_BLINDSIDE_STEAL",
         crash_box::FLANK_CRASH_BOX_ENABLE_ENV,
         "DD_SOCCER_ENABLE_SLIP_BREAK_OFFSIDE",
