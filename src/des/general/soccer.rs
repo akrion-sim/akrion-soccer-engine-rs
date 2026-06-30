@@ -17924,6 +17924,7 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::UnpressuredBackwardPass
                 | SoccerRewardEventKind::BuildupChainCredit
                 | SoccerRewardEventKind::ReleaseLongInsideOwnHalf
+                | SoccerRewardEventKind::OverdribbleDispossession
                 | SoccerRewardEventKind::MatchResult
         )
     }
