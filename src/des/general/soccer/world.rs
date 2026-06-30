@@ -10974,6 +10974,93 @@ impl SoccerMatch {
         }
     }
 
+    /// Per-tick maintenance of the forward-carry tracker + the SUSTAINED-dribble reward (Reward B):
+    /// while one player keeps driving the ball forward, each 2-yard forward segment PAST THE FIRST
+    /// ("2 yards followed by 2 more") emits a [`SoccerRewardEventKind::SustainedForwardDribble`].
+    /// The tracker it maintains is also what the pass/shot release cash-out reads for the PRODUCTIVE
+    /// carry reward (Reward A). Gated (default-on) by `DD_SOCCER_ENABLE_PROGRESSIVE_CARRY_REWARD`;
+    /// OFF ⇒ pure no-op (the tracker stays `None`, byte-identical parity). "Forward" is Δy·attack
+    /// toward the opponent goal — lateral x movement is free.
+    pub(crate) fn update_forward_carry_reward(&mut self, record_rewards: bool) {
+        if !progressive_carry_reward_enabled() {
+            return;
+        }
+        // A loose / in-flight ball ends the carry: a pass or shot has already cashed out, and a
+        // re-receive must start a fresh run (no stale forward delta bridged across the gap).
+        let Some(holder_id) = self.ball.holder else {
+            self.forward_carry_tracker = None;
+            return;
+        };
+        let Some(holder) = self.players.iter().find(|player| player.id == holder_id) else {
+            self.forward_carry_tracker = None;
+            return;
+        };
+        let team = holder.team;
+        let ball_y = self.ball.position.y;
+        let attack = team.attack_dir();
+        let new_segments = match self.forward_carry_tracker.as_mut() {
+            Some(tracker) if tracker.carrier_id == holder_id => {
+                let forward_delta = (ball_y - tracker.last_ball_y) * attack;
+                tracker.last_ball_y = ball_y;
+                tracker.fold_tick(forward_delta)
+            }
+            _ => {
+                // New carrier (first touch / a teammate received): start a fresh run.
+                self.forward_carry_tracker =
+                    Some(ForwardCarryTracker::new_at(holder_id, team, ball_y));
+                0
+            }
+        };
+        if record_rewards && new_segments > 0 {
+            let amount = new_segments as f64 * SUSTAINED_FORWARD_DRIBBLE_SEGMENT_REWARD_POINTS;
+            self.record_reward_event_with_kind(
+                holder_id,
+                amount,
+                SoccerRewardEventKind::SustainedForwardDribble,
+            );
+        }
+    }
+
+    /// Cash out the PRODUCTIVE forward-carry reward (Reward A) when the current carrier's run ends
+    /// in a forward pass or a shot: pays [`SoccerRewardEventKind::ProductiveForwardCarry`] in 2-yard
+    /// segments of accumulated forward carry, then clears the tracker. A carry that ends any other
+    /// way (turnover, backward/square pass) is NOT paid — `clear_forward_carry_on_unproductive_end`
+    /// just drops it. Gated (default-on); OFF ⇒ no-op. Returns the points emitted (0 if none).
+    pub(crate) fn cash_out_productive_forward_carry(&mut self, carrier_id: usize) {
+        if !progressive_carry_reward_enabled() {
+            return;
+        }
+        let Some(tracker) = self.forward_carry_tracker else {
+            return;
+        };
+        if tracker.carrier_id != carrier_id {
+            return;
+        }
+        let points = tracker.productive_carry_reward_points();
+        self.forward_carry_tracker = None;
+        if points > 0.0 {
+            self.record_reward_event_with_kind(
+                carrier_id,
+                points,
+                SoccerRewardEventKind::ProductiveForwardCarry,
+            );
+        }
+    }
+
+    /// Drop the forward-carry tracker without paying it (the run ended unproductively — a backward
+    /// pass or a turnover). Gated; OFF ⇒ no-op.
+    pub(crate) fn clear_forward_carry_tracker(&mut self, carrier_id: usize) {
+        if !progressive_carry_reward_enabled() {
+            return;
+        }
+        if self
+            .forward_carry_tracker
+            .is_some_and(|tracker| tracker.carrier_id == carrier_id)
+        {
+            self.forward_carry_tracker = None;
+        }
+    }
+
     pub(crate) fn update_pass_chain_continuation_rewards(
         &mut self,
         before: &WorldSnapshot,
