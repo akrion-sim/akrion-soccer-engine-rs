@@ -10137,6 +10137,11 @@ impl SoccerMatch {
     /// 40), distance-tapered the same way.
     fn record_shot_off_target_rewards(&mut self, shooting_team: Team, shooter: usize) {
         self.record_possession_touch(shooter);
+        self.record_buildup_chain_credit(
+            shooting_team,
+            Some(shooter),
+            BUILDUP_CHAIN_CREDIT_SHOT_BASE_POINTS,
+        );
         let scale = self.shot_reward_distance_scale(shooting_team, shooter)
             * (SHOT_OFF_TARGET_REWARD_POINTS / SHOT_ON_TARGET_REWARD_POINTS);
         let scaled: Vec<f64> = SHOT_ON_TARGET_REWARD_PATTERN
