@@ -44693,7 +44693,19 @@ impl WorldSnapshot {
             if refine_off > MPC_PASS_MAX_REFINE_YARDS {
                 continue;
             }
-            for &v in speeds.iter() {
+            // Exact weight: solve the single launch speed that times the decelerating ball to this
+            // rendezvous (rendezvous_err ≈ 0 by construction), instead of snapping to one of a few
+            // coarse speed multipliers (the "too fast / too slow" quantization). Gate off ⇒ the
+            // original coarse sweep, byte-identical.
+            let candidate_speeds: Vec<f64> = if mpc_pass_weight_enabled() {
+                match self.ball_ground_launch_speed_for_travel(dist, t_k) {
+                    Some(v) => vec![v],
+                    None => continue,
+                }
+            } else {
+                speeds.to_vec()
+            };
+            for &v in candidate_speeds.iter() {
                 if !v.is_finite() || v <= 1.0 {
                     continue;
                 }
