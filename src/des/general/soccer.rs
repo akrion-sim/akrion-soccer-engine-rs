@@ -18844,15 +18844,18 @@ pub(crate) fn overdribble_dispossession_penalty_points(
             .clamp(0.0, 1.0);
         points *= 1.0 + proximity;
     }
-    // Danger-zone scaling: never reduces the penalty (a non-finite factor ⇒ neutral 1.0 because
-    // `f64::max` ignores NaN). The absolute cap rises with the danger mult so the deep-giveaway
-    // signal is not flattened by the neutral-zone cap.
+    // Cap the raw "blameworthiness" at the neutral-zone max FIRST, so the danger multiplier scales a
+    // bounded base (a midfield over-dribble can never exceed the base cap). Then apply the danger
+    // factor — never below 1.0 (a non-finite factor ⇒ neutral, since `f64::max` ignores NaN) — and a
+    // final absolute safety cap that rises with the danger mult so a deep own-half giveaway is
+    // punished harder without being flattened by the neutral cap.
+    let blameworthiness = points.min(OVERDRIBBLE_MAX_PENALTY_POINTS);
     let danger = if danger_severity.is_finite() {
         danger_severity.max(1.0)
     } else {
         1.0
     };
-    (points * danger).min(OVERDRIBBLE_MAX_PENALTY_POINTS * OVERDRIBBLE_DANGER_MAX_MULT)
+    (blameworthiness * danger).min(OVERDRIBBLE_MAX_PENALTY_POINTS * OVERDRIBBLE_DANGER_MAX_MULT)
 }
 
 /// Whether the **over-dribble dispossession penalty** is active this process. Adds a sharp,
