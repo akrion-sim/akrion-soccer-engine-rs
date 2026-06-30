@@ -43900,13 +43900,16 @@ impl WorldSnapshot {
         } else {
             0.0
         };
-        let mut distance = 0.78
-            + control * 0.86
-            + open_grass * 1.05
+        // Tunable touch LENGTH terms (how far the ball rolls per touch): base + per-skill +
+        // per-open-grass + per-intent. Tunable from config/MPC and the learned policy overlay both.
+        let length_tuning = &tunables().dribble;
+        let mut distance = length_tuning.touch_length_base_yards
+            + control * length_tuning.touch_length_control_scale
+            + open_grass * length_tuning.touch_length_open_grass_scale
             + forward_bonus
             + kind_bonus
             + beat_defender_bonus
-            + touch_intent_fit.clamp(0.0, 1.0) * 0.52
+            + touch_intent_fit.clamp(0.0, 1.0) * length_tuning.touch_length_intent_scale
             - backward_penalty;
         if forward_component < -0.20 {
             distance *= 0.70;
