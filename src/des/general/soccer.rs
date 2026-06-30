@@ -18656,6 +18656,40 @@ pub(crate) fn mpc_pass_weight_enabled() -> bool {
     }
 }
 
+/// Whether **buildup chain credit** is active this process. On a shot it rewards the last
+/// `BUILDUP_CHAIN_CREDIT_DEPTH` teammates whose touches built the move, recency-discounted (the
+/// finisher/most-recent most, each earlier contributor geometrically less), with the base scaled by
+/// outcome (any shot < shot on frame < goal). Additive MAPPO buildup credit on top of the existing
+/// shot/goal patterns. Default-ON in production (env `DD_SOCCER_ENABLE_BUILDUP_CHAIN_CREDIT=0/false`
+/// is the kill switch); default-OFF under test so the reward-parity suite stays byte-identical.
+pub(crate) fn buildup_chain_credit_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_BUILDUP_CHAIN_CREDIT").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_BUILDUP_CHAIN_CREDIT"))
+    }
+}
+
+/// Recency-discounted credit (points) for the k-th most-recent contributor in a buildup chain
+/// (k=0 = the finisher / most recent): `base · discount^k`, floored to 0 below the min payout. Pure
+/// so the discount curve is unit-tested directly. See [`buildup_chain_credit_enabled`].
+pub(crate) fn buildup_chain_credit_points(base_points: f64, recency_index: usize) -> f64 {
+    if base_points <= 0.0 {
+        return 0.0;
+    }
+    let amount = base_points * BUILDUP_CHAIN_CREDIT_RECENCY_DISCOUNT.powi(recency_index as i32);
+    if amount >= BUILDUP_CHAIN_CREDIT_MIN_POINTS {
+        amount
+    } else {
+        0.0
+    }
+}
+
 /// Whether **backward-pass discipline** is active this process. Emits a training PENALTY for a
 /// pass played backward (toward our own goal) when the passer is NOT under genuine high pressure —
 /// no opponent within `BACKWARD_PASS_HIGH_PRESSURE_RADIUS_YARDS` — scaled by how far back the ball
