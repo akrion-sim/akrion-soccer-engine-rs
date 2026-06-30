@@ -44509,7 +44509,11 @@ impl WorldSnapshot {
     /// envelope. Binary search on the monotonic time↔speed relation (a firmer strike ⇒ a shorter
     /// travel time). `None` when even the envelope max can't arrive that soon. This is the MPC
     /// "solve for the weight that times the ball to the receiver" — the exact pace, not a guess.
-    fn ball_ground_launch_speed_for_travel(&self, distance: f64, target_time: f64) -> Option<f64> {
+    pub(crate) fn ball_ground_launch_speed_for_travel(
+        &self,
+        distance: f64,
+        target_time: f64,
+    ) -> Option<f64> {
         if !distance.is_finite()
             || !target_time.is_finite()
             || distance <= 0.05
