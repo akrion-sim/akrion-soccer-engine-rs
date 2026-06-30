@@ -18744,6 +18744,31 @@ pub(crate) fn defensive_numbers_up_press_enabled() -> bool {
     }
 }
 
+/// Backward distance (yards toward our own goal) at/above which a pass is a candidate "terrible
+/// back-pass" giveaway — vetoed at release when aerial or played under pressure.
+const LONG_BACKWARD_PASS_VETO_YARDS: f64 = 10.0;
+/// Pressure at/above which a long backward GROUND pass also counts as a giveaway (an aerial long
+/// backward ball is always a giveaway regardless of pressure).
+const TERRIBLE_BACKWARD_PASS_PRESSURE: f64 = 0.35;
+
+/// Whether the **terrible-pass veto** is active this process: at release, a pass with no safe aim
+/// (it would be conceded/occluded to an opponent) or a long backward giveaway (10+ yds back, aerial
+/// or under pressure) is ABORTED — the carrier keeps the ball and faces up instead of gifting it.
+/// Default-ON in production (env `DD_SOCCER_ENABLE_TERRIBLE_PASS_VETO=0/false` is the kill switch);
+/// default-OFF under test so the pass parity suite stays byte-identical.
+pub(crate) fn terrible_pass_veto_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_TERRIBLE_PASS_VETO").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_TERRIBLE_PASS_VETO"))
+    }
+}
+
 /// Whether the **ground-pass speed floor** is active this process. A released ground pass is
 /// `intended_speed · power_factor · momentum_f` — when the body can't drive it (struck while
 /// sprinting against your own momentum, or twisted side-on) that product collapses the pass to a
