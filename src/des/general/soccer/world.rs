@@ -42839,6 +42839,101 @@ impl WorldSnapshot {
         Some(onside.clamp_to_pitch(self.field_width, self.field_length))
     }
 
+    /// Winger "stay wide vs pinch in" off-ball decision (see `winger_pinch.rs`). As the attack
+    /// reaches the opponent's final third, each wide attacker decides whether to hold his width
+    /// (deliver / overlap / switch outlet) or pinch infield to get on the end of a cross — into
+    /// the half-space (cut-back) or all the way to the back post. Returns the pinch target, or
+    /// `None` when the winger should keep his normal wide-outlet target (`StayWide`, or the
+    /// recogniser does not apply). Gated by [`winger_pinch_in_enabled`] (default-OFF under test
+    /// ⇒ byte-identical). Applied as an off-ball-target override *before* the late, committed
+    /// box-flood ([`Self::crash_the_box_target_for`]), which still takes precedence once the
+    /// cross is imminent.
+    pub(crate) fn winger_pinch_target_for(&self, player: &PlayerSnapshot) -> Option<Vec2> {
+        if !winger_pinch_in_enabled() || self.active_set_play.is_some() {
+            return None;
+        }
+        if self.possession_team() != Some(player.team)
+            || self.ball.holder == Some(player.id)
+            || player.controller_slot.is_some()
+            || !self.is_wide_attacker(player)
+        {
+            return None;
+        }
+        let attacked_goal_y = player.team.goal_y(self.field_length);
+        // Only a decision once the attack is in the opponent's final third.
+        if !ball_in_attacking_final_third(self.ball.position.y, attacked_goal_y, self.field_length) {
+            return None;
+        }
+        let dir = player.team.attack_dir();
+        let center_x = self.field_width * 0.5;
+        // The crossing position = where the delivery would come from: our carrier if we hold the
+        // ball, else the (in-flight) ball itself.
+        let crosser = self
+            .ball
+            .holder
+            .and_then(|h| self.players.iter().find(|p| p.id == h))
+            .filter(|p| p.team == player.team)
+            .map(|p| self.player_snapshot_position(p))
+            .unwrap_or(self.ball.position);
+        let my_side = (player.home_position.x - center_x).signum();
+        let ball_side = (crosser.x - center_x).signum();
+        let ball_on_my_flank = my_side != 0.0 && my_side == ball_side;
+        let crossing_position_on = flank_final_third_crash_box_geometry(
+            crosser,
+            attacked_goal_y,
+            self.field_width,
+            self.field_length,
+        );
+        let depth_frac =
+            final_third_depth_frac(self.ball.position.y, attacked_goal_y, self.field_length);
+        // Own attackers already inside the opponent box (excluding this winger and the carrier).
+        let box_congestion = self
+            .players
+            .iter()
+            .filter(|p| {
+                p.team == player.team
+                    && p.id != player.id
+                    && self.ball.holder != Some(p.id)
+                    && matches!(p.role, PlayerRole::Forward | PlayerRole::Midfielder)
+                    && self
+                        .point_in_own_penalty_area(player.team.other(), self.player_snapshot_position(p))
+            })
+            .count();
+        // Mask the back-post bucket when its arrival point would be offside.
+        let back_post_probe = winger_pinch_target(
+            WingerPinchChoice::PinchBackPost,
+            player.home_position.x,
+            attacked_goal_y,
+            dir,
+            self.field_width,
+            self.field_length,
+        );
+        let back_post_offside = back_post_probe
+            .map(|probe| self.position_would_be_offside(player.team, probe))
+            .unwrap_or(true);
+        let choice = decide_winger_pinch(
+            ball_on_my_flank,
+            crossing_position_on,
+            depth_frac,
+            box_congestion,
+            back_post_offside,
+        );
+        let target = winger_pinch_target(
+            choice,
+            player.home_position.x,
+            attacked_goal_y,
+            dir,
+            self.field_width,
+            self.field_length,
+        )?;
+        // Keep the pinch onside and refine for shape; drop it if it cannot be made legal.
+        let onside = self.clamp_forward_onside_support(player, target);
+        if self.position_would_be_offside(player.team, onside) {
+            return None;
+        }
+        Some(onside.clamp_to_pitch(self.field_width, self.field_length))
+    }
+
     pub(crate) fn flank_cross_arrival_target_for(
         &self,
         player_id: usize,
