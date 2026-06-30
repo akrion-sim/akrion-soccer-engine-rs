@@ -1444,7 +1444,7 @@ const PASS_RECEPTION_LOSES_RECEIVER_MARGIN_YARDS: f64 = 1.5;
 // interception. Set well below the ~0.69 median of completed passes so only the clearly-doomed
 // ball (a covered receiver / blocked lane the model rates <25%) is vetoed, leaving brave threaded
 // passes alone. Tune via A/B against giveaway-rate vs completion-rate.
-const HOPELESS_PASS_COMPLETION_FLOOR: f64 = 0.25;
+const HOPELESS_PASS_COMPLETION_FLOOR: f64 = 0.15;
 // Selection-time counterpart to the release guard: a led floor-pass point that is
 // materially nearer an opponent than the teammate is a likely direct giveaway.
 const PASS_DIRECT_OPPONENT_AIM_HARD_VETO_MARGIN_YARDS: f64 = 2.0;
