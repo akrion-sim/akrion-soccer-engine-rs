@@ -26439,6 +26439,17 @@ impl WorldSnapshot {
         if nearest.map(|p| p.id) != Some(me.id) {
             return 1.0;
         }
+        // Numbers-up press: when our defence has a clear overload BEHIND THE BALL (>= 7 outfielders
+        // goalside of it), the nearest defender can afford to commit and should PRESS the carrier
+        // hard — step onto him (urgency > 1 triggers the positional step-up) and tackle readily —
+        // rather than merely contain, even if the carrier isn't advancing. We have ample cover.
+        let numbers_up_floor = if defensive_numbers_up_press_enabled()
+            && self.defensive_numbers_up_behind_ball(me.team)
+        {
+            NUMBERS_UP_PRESS_URGENCY_FLOOR
+        } else {
+            1.0
+        };
         let surprise = self.surprise_behind_steal_profile_for(me.id);
         if surprise.available {
             return (1.0 + CARRIER_ADVANCE_STEAL_BOOST * (0.42 + surprise.score * 0.74))
