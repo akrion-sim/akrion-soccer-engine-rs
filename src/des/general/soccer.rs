@@ -3553,6 +3553,20 @@ const WALL_PASS_RUN_TTL_SECONDS: f64 = 3.6;
 /// goal proximity, and the active maneuver). A give-and-go is genuinely tried, not rare — the
 /// one-two is a primary attacking route, so when a clean combination is on it is taken often.
 const WALL_PASS_BASE_APPETITE: f64 = 0.46;
+/// Moderate, default-ON live-frequency bump applied under [`give_and_go_ambition_enabled`]: how
+/// much further to widen the man-to-beat trigger zone (so a one-two is *available* more often —
+/// every quality/onside/lane check still applies, this only widens availability) and how much to
+/// multiply the carrier's raw wall-pass appetite (so an available good one-two competes with
+/// carries/through-balls instead of being out-scored). Off (kill switch
+/// `DD_SOCCER_ENABLE_GIVE_AND_GO_AMBITION=0`) ⇒ none of this applies.
+const GIVE_AND_GO_AMBITION_AHEAD_WIDEN_YARDS: f64 = 3.0;
+const GIVE_AND_GO_AMBITION_LATERAL_WIDEN_YARDS: f64 = 1.5;
+const GIVE_AND_GO_AMBITION_RANGE_WIDEN_YARDS: f64 = 2.0;
+const GIVE_AND_GO_AMBITION_PARTNER_SPACE_EASE_YARDS: f64 = 0.5;
+const GIVE_AND_GO_AMBITION_APPETITE_MULTIPLIER: f64 = 1.4;
+/// Lifted appetite clamp ceiling under the ambition bump (vs. the baseline 0.92), so a strong
+/// available one-two is not capped below decisive options.
+const GIVE_AND_GO_AMBITION_APPETITE_CEILING: f64 = 0.95;
 /// When the team's active attacking maneuver IS a give-and-go / one-two, the carrier is
 /// looking to combine — lift the appetite hard.
 const WALL_PASS_STRATEGY_APPETITE_BOOST: f64 = 2.1;
