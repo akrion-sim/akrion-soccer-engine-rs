@@ -1737,6 +1737,22 @@ const DEFENSIVE_POSITIONING_FOCUS_LP_REWARD_MULTIPLIER: f64 = 2.25;
 // "keep the ball" over "gamble it forward".
 const LOST_POSSESSION_CHAIN_PENALTY_POINTS: f64 = 10.0;
 const LOST_POSSESSION_CHAIN_PENALTY_WEIGHTS: [f64; 3] = [0.55, 0.30, 0.15];
+// --- Discounted turnover-chain blame (gated DD_SOCCER_ENABLE_TURNOVER_CHAIN_BLAME) ---
+// A bad pass that is intercepted (`record_interception_reward`) penalizes the player who lost
+// the ball in full, but the previous one/two passers who built the doomed move escape untouched.
+// This blame term spreads a STEEPLY discounted share of the loser's OWN penalty back over those
+// prior passers — so the build-up gets a small corrective gradient too, not just the final
+// (often forced) touch. The discount is a fraction of the ball-loser's penalty by recency:
+// index 0 is the ball-loser (100% — applied in full by the interception handler, so this array
+// only documents it and the blame loop SKIPS it), index 1 the immediately-preceding passer
+// (20%), index 2 the one before that (5%). Steeper than `LOST_POSSESSION_CHAIN_PENALTY_WEIGHTS`
+// on purpose: blame should concentrate hard on the player who actually gave it away. Targeted
+// per-player credit assignment, complementary to the net-Φ PBRS danger asymmetry and
+// MARL/MAPPO's global team-reward share; off by default under test so the parity suite is
+// byte-identical.
+const TURNOVER_CHAIN_BLAME_DISCOUNTS: [f64; 3] = [1.0, 0.20, 0.05];
+// Below this the discounted blame is dropped (negligible tail / sub-noise nudge).
+const TURNOVER_CHAIN_BLAME_MIN_POINTS: f64 = 0.05;
 // Beyond the immediate possession-chain penalty above, a turnover also retroactively
 // penalizes the LOSING team's actions over the last ~5 seconds: every learning transition
 // for that team in the window is re-queued with a recency-scaled negative reward (full at
