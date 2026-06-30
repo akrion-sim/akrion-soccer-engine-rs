@@ -46349,16 +46349,7 @@ impl WorldSnapshot {
             if !cur_fwd.is_finite() {
                 return target_fwd;
             }
-            if let Some(cap) = cap {
-                if cur_fwd > cap + 1e-6 {
-                    return target_fwd;
-                }
-            }
-            if (target_fwd - cur_fwd).abs() < BACK_FOUR_LINE_HOLD_DEADBAND_YARDS {
-                cur_fwd
-            } else {
-                target_fwd
-            }
+            back_four_line_hold_target_fwd(cur_fwd, target_fwd, cap, BACK_FOUR_LINE_HOLD_DEADBAND_YARDS)
         };
         // The flat trap is lifted while WE control (centre-backs split / full-backs
         // overlap), while a pass is in flight (offside already judged; lane-cutters
