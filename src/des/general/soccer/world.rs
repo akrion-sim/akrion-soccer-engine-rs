@@ -47423,7 +47423,28 @@ impl WorldSnapshot {
     /// foremost four attackers has become too stretched. Shared by both live
     /// line chokepoints so they agree on the centre.
     /// Leads the ball by the standard lookahead so a fast carrier pulls it early.
+    ///
+    /// **Sticky line anchor**: when [`back_four_line_sticky_anchor_enabled`] and a per-team latch is
+    /// present, this returns the LATCHED centre (held on the sim-tick loop for ~3s) rather than the
+    /// freshly recomputed one — that is what stops the four oscillating tick-to-tick (the "sine-wave").
+    /// The latch is maintained once per tick by [`Self::update_back_four_line_latch`] and re-picked on
+    /// the tick window / possession flip / a material deeper drop; off ⇒ the fresh per-tick centre.
     pub(crate) fn back_four_line_v2_centre_fwd(&self, team: Team) -> f64 {
+        if back_four_line_sticky_anchor_enabled() {
+            if let Some(centre_depth) = self.back_four_line_latch_centre_depth[team_index(team)] {
+                let attack = team.attack_dir();
+                let own_goal_fwd = self.own_goal_y_for(team) * attack;
+                return own_goal_fwd + centre_depth;
+            }
+        }
+        self.back_four_line_v2_centre_fwd_fresh(team)
+    }
+
+    /// The freshly recomputed v2 line-CENTRE forward-coordinate (attack frame), ignoring the sticky
+    /// latch. This is the per-tick "where the line should be right now" value: the sticky-anchor
+    /// updater samples it to decide whether to re-anchor, and it is the live centre when the sticky
+    /// anchor is gated off. See [`Self::back_four_line_v2_centre_fwd`] for the latched read.
+    pub(crate) fn back_four_line_v2_centre_fwd_fresh(&self, team: Team) -> f64 {
         let attack = team.attack_dir();
         let own_goal_fwd = self.own_goal_y_for(team) * attack;
         let predicted_fwd = self
