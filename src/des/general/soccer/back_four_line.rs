@@ -113,6 +113,39 @@ pub const BACK_FOUR_LINE_DESIRED_GAP_MAX_YARDS: f64 = 40.0;
 /// the middle of the 20-40 band rather than an arbitrary literal.
 pub const BACK_FOUR_LINE_NEUTRAL_GAP_FRACTION: f64 = 0.5;
 
+/// Minimum trailing gap (yd behind the ball) the back four holds **while WE control the ball**.
+/// In possession the line may step right up to support the attack, so the floor drops from the
+/// out-of-possession [`BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS`] (20) to this (5). "Dispossession" —
+/// the opponent controlling OR a loose/contested ball with NO controller — keeps the deeper 20yd
+/// floor. So the dynamic trailing gap is **5..40 in possession, 20..40 out of possession**. The
+/// 15yd anchor non-linearity ([`BACK_FOUR_LINE_ANCHOR_DEPTH_YARDS`]) still governs the deep-ball
+/// regime in both cases.
+pub const BACK_FOUR_LINE_DESIRED_GAP_IN_POSSESSION_MIN_YARDS: f64 = 5.0;
+
+/// MARL/MAPPO seed for the **optimal distance** (yd) the back four sits goal-side of the opponent's
+/// foremost-attacker line while in possession or dispossession: the line presses UP to fill the
+/// space between the four and the opponent's most advanced attackers rather than leaving a large
+/// hole for a pass into feet. Only ever raises a too-deep centre toward the attackers — never steps
+/// the line AHEAD of them (that plays them onside). The learned line-depth head refines the live
+/// depth via the attacker-compactness reward term; this is the analytic seed / fallback.
+pub const BACK_FOUR_OPTIMAL_GAP_TO_ATTACKERS_YARDS: f64 = 12.0;
+/// How many of the opponent's most-advanced outfielders define the "foremost attackers" line the
+/// back four compresses the space toward (the user's "foremost 4 opponent attackers").
+pub const BACK_FOUR_FOREMOST_ATTACKERS_COUNT: usize = 4;
+
+/// Energy-conservation **hold deadband** (yd) on the back-four line target: a line-bound defender
+/// already within this distance of its (legal) line target HOLDS rather than re-chasing a target
+/// that jitters a yard or two each tick with the predicted ball — the "sine-wave" walk-stop-walk.
+/// Always overridden (the defender is corrected) when it sits illegally AHEAD of the offside cap,
+/// so the deadband only ever leaves a defender a touch DEEPER than ideal (never plays a runner
+/// onside). Damps the cosmetic oscillation and saves the effort the wasted-energy penalty docks.
+pub const BACK_FOUR_LINE_HOLD_DEADBAND_YARDS: f64 = 2.0;
+/// Per-yard weight of the attacker-compactness term folded into the line-depth RL reward when the
+/// attacker-press is on: each yard the back four sits behind the optimal gap to the foremost
+/// attackers docks the reward by this much, so the learned head prefers ball-gap fractions that
+/// keep the four compact with the attackers. Small relative to the territorial-advantage delta.
+pub const BACK_FOUR_ATTACKER_COMPACTNESS_REWARD_PER_YARD: f64 = 0.02;
+
 fn env_flag_enabled(name: &str) -> bool {
     std::env::var(name)
         .map(|raw| {
