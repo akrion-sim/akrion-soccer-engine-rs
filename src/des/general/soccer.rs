@@ -1734,6 +1734,9 @@ const DEFENSIVE_POSITIONING_FOCUS_LP_REWARD_MULTIPLIER: f64 = 2.25;
 // "keep the ball" over "gamble it forward".
 const LOST_POSSESSION_CHAIN_PENALTY_POINTS: f64 = 10.0;
 const LOST_POSSESSION_CHAIN_PENALTY_WEIGHTS: [f64; 3] = [0.55, 0.30, 0.15];
+// Bad-pass turnover blame is not a normalized pool: the passer gets the full
+// chain penalty, then the prior two teammates get discounted echoes.
+const BAD_PASS_CHAIN_PENALTY_MULTIPLIERS: [f64; 3] = [1.0, 0.20, 0.05];
 // Beyond the immediate possession-chain penalty above, a turnover also retroactively
 // penalizes the LOSING team's actions over the last ~5 seconds: every learning transition
 // for that team in the window is re-queued with a recency-scaled negative reward (full at
@@ -18138,6 +18141,10 @@ pub(crate) enum SoccerRewardEventKind {
     /// that the WHOLE buildup, not just the finisher, gets credit for creating the chance. Emitted
     /// only when `DD_SOCCER_ENABLE_BUILDUP_CHAIN_CREDIT` is on. See `record_buildup_chain_credit`.
     BuildupChainCredit,
+    /// PENALTY (negative): a bad pass turnover blames the passer at full strength and the
+    /// previous two possession-chain contributors at discounted strength. This is the MDP/POMDP
+    /// back-propagation signal that teaches the buildup chain, not just the final passer.
+    BadPassChainPenalty,
     /// Positive: a completed one-two / wall-pass return. The event wakes learning immediately and
     /// the world reward path also replays recent runner+wall transitions with the pattern bonus.
     WallPassCombination,
@@ -18170,6 +18177,7 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::SustainedForwardDribble
                 | SoccerRewardEventKind::UnpressuredBackwardPass
                 | SoccerRewardEventKind::BuildupChainCredit
+                | SoccerRewardEventKind::BadPassChainPenalty
                 | SoccerRewardEventKind::WallPassCombination
                 | SoccerRewardEventKind::ReleaseLongInsideOwnHalf
                 | SoccerRewardEventKind::MatchResult
@@ -55685,6 +55693,115 @@ struct PassMpcReceiptEstimate {
     qp_accel_fit: f64,
 }
 
+const PASS_PERCEPTION_OPPONENT_LANE_RADIUS_YARDS: f64 = 8.0;
+const PASS_PERCEPTION_OPPONENT_TARGET_RADIUS_YARDS: f64 = 12.0;
+const PASS_PERCEPTION_DISTANCE_FULL_DEGRADE_YARDS: f64 = 62.0;
+const PASS_PERCEPTION_LATENCY_FULL_DEGRADE_SECONDS: f64 = 0.28;
+
+#[derive(Clone, Copy, Debug)]
+struct PassPerceptionExecutionContext {
+    receiver_confidence: f64,
+    opponent_uncertainty: f64,
+    occlusion_score: f64,
+    noise_yards: f64,
+    latency_seconds: f64,
+    distance_yards: f64,
+}
+
+fn pass_perception_execution_context(
+    snapshot: &WorldSnapshot,
+    passer: &PlayerSnapshot,
+    passer_position: Vec2,
+    target: &PlayerSnapshot,
+    target_position: Vec2,
+    target_point: Vec2,
+) -> PassPerceptionExecutionContext {
+    let receiver_entry = snapshot.player_position_confidence_entry(passer.id, target);
+    let receiver_confidence = receiver_entry
+        .as_ref()
+        .map(|entry| entry.confidence)
+        .or_else(|| snapshot.player_position_confidence_for_point(passer.id, target_position))
+        .unwrap_or(1.0)
+        .clamp(0.0, 1.0);
+    let mut occlusion_score = receiver_entry
+        .as_ref()
+        .map(|entry| entry.occlusion_score)
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0);
+    let mut noise_yards = receiver_entry
+        .as_ref()
+        .map(|entry| entry.noise_yards)
+        .unwrap_or(0.0)
+        .max(0.0);
+    let mut latency_seconds = receiver_entry
+        .as_ref()
+        .map(|entry| entry.latency_seconds)
+        .unwrap_or(PERCEPTION_LATENCY_BASE_SECONDS)
+        .max(PERCEPTION_LATENCY_BASE_SECONDS);
+    let mut opponent_uncertainty = 0.0_f64;
+
+    for opponent in snapshot
+        .players
+        .iter()
+        .filter(|player| player.team == passer.team.other())
+    {
+        let position = snapshot
+            .player_position(opponent.id)
+            .unwrap_or(opponent.position);
+        let along = segment_projection_factor(passer_position, target_point, position);
+        let lane_gap = segment_distance_to_point(passer_position, target_point, position);
+        let lane_weight = if (0.0..=1.0).contains(&along) {
+            (1.0 - lane_gap / PASS_PERCEPTION_OPPONENT_LANE_RADIUS_YARDS).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let target_weight = (1.0
+            - position.distance(target_point) / PASS_PERCEPTION_OPPONENT_TARGET_RADIUS_YARDS)
+            .clamp(0.0, 1.0)
+            * 0.85;
+        let proximity = lane_weight.max(target_weight);
+        if proximity <= 1e-9 {
+            continue;
+        }
+        if let Some(entry) = snapshot.player_position_confidence_entry(passer.id, opponent) {
+            let uncertainty = (1.0 - entry.confidence.clamp(0.0, 1.0)) * proximity;
+            opponent_uncertainty = opponent_uncertainty.max(uncertainty);
+            occlusion_score = occlusion_score.max(entry.occlusion_score.clamp(0.0, 1.0) * proximity);
+            noise_yards = noise_yards.max(entry.noise_yards.max(0.0) * proximity);
+            latency_seconds = latency_seconds.max(entry.latency_seconds.max(0.0) * proximity);
+        }
+    }
+
+    PassPerceptionExecutionContext {
+        receiver_confidence,
+        opponent_uncertainty: opponent_uncertainty.clamp(0.0, 1.0),
+        occlusion_score,
+        noise_yards,
+        latency_seconds,
+        distance_yards: passer_position.distance(target_point).max(0.0),
+    }
+}
+
+fn pass_perception_execution_gate(context: &PassPerceptionExecutionContext) -> f64 {
+    let receiver_uncertainty = (1.0 - context.receiver_confidence.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+    let distance = (context.distance_yards / PASS_PERCEPTION_DISTANCE_FULL_DEGRADE_YARDS)
+        .clamp(0.0, 1.0);
+    let noise = (context.noise_yards / PERCEPTION_NOISE_MAX_YARDS).clamp(0.0, 1.0);
+    let latency = ((context.latency_seconds - PERCEPTION_LATENCY_BASE_SECONDS)
+        / PASS_PERCEPTION_LATENCY_FULL_DEGRADE_SECONDS)
+        .clamp(0.0, 1.0);
+    let degradation = receiver_uncertainty * (0.24 + distance * 0.18)
+        + context.opponent_uncertainty.clamp(0.0, 1.0) * 0.24
+        + context.occlusion_score.clamp(0.0, 1.0) * 0.12
+        + noise * 0.16
+        + latency * 0.12;
+    (1.0 - degradation).clamp(0.42, 1.0)
+}
+
+fn pass_perception_completion_gate(context: &PassPerceptionExecutionContext) -> f64 {
+    (0.55 + pass_perception_execution_gate(context) * 0.45).clamp(0.55, 1.0)
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct DribbleMpcControlEstimate {
     control_probability: f64,
@@ -56145,14 +56262,28 @@ fn pass_mpc_receipt_estimate_for_snapshot(
         )
     };
     let opponent_control_gate = (1.0 - direct_opponent_control_risk * 0.58).clamp(0.34, 1.0);
+    let perception_context = pass_perception_execution_context(
+        snapshot,
+        passer,
+        passer_position,
+        target,
+        target_position,
+        target_point,
+    );
+    let perception_execution_gate = pass_perception_execution_gate(&perception_context);
     let probability =
         (0.06 + qp_accel_fit * 0.38 + meet_fit * 0.22 + race_fit * 0.24 + aerial_control)
             .clamp(0.0, 0.99)
-            * opponent_control_gate;
+            * opponent_control_gate
+            * perception_execution_gate;
     PassMpcReceiptEstimate {
         probability: probability.clamp(0.0, 0.99),
-        race_advantage_seconds: finite_metric(race_advantage_seconds),
-        qp_accel_fit,
+        race_advantage_seconds: finite_metric(
+            race_advantage_seconds
+                - perception_context.latency_seconds * 0.35
+                - perception_context.noise_yards * 0.025,
+        ),
+        qp_accel_fit: (qp_accel_fit * perception_execution_gate).clamp(0.0, 1.0),
     }
 }
 
@@ -56561,6 +56692,14 @@ fn pass_target_quality_for_snapshot_inner(
             effective_pass_speed,
         )
     };
+    let perception_context = pass_perception_execution_context(
+        snapshot,
+        passer,
+        passer_position,
+        target,
+        target_position,
+        anticipated_target,
+    );
     let position_confidence = snapshot
         .player_position_confidence_for_point(passer.id, target_position)
         .unwrap_or(0.0);
@@ -56699,7 +56838,8 @@ fn pass_target_quality_for_snapshot_inner(
         * pass_precision
         * pressure_adjustment
         * mpc_receipt_gate
-        * tight_mark_completion_gate;
+        * tight_mark_completion_gate
+        * pass_perception_completion_gate(&perception_context);
     // Learned pass-completion head (#4): blend the trained P(complete) into the analytic
     // estimate when the gate is on and the carried head has trained enough. The head is
     // conditioned on the 22+ball config along this pass's lane, so it captures completion

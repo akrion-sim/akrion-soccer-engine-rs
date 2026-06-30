@@ -1436,6 +1436,168 @@ fn pass_velocity_plan_can_soften_short_open_pass() {
     );
 }
 
+fn perception_screened_pass_fixture(screen_receiver: bool) -> SoccerMatch {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 4_248,
+        ..Default::default()
+    });
+    let passer = 7usize;
+    let receiver = 9usize;
+    let screen = 6usize;
+    park_players_except(&mut sim, &[passer, receiver, screen]);
+    sim.players[passer].team = Team::Home;
+    sim.players[passer].role = PlayerRole::Midfielder;
+    sim.players[passer].position = Vec2::new(40.0, 50.0);
+    sim.players[passer].velocity = Vec2::zero();
+    sim.players[passer].action_facing = FacingBucket::South;
+    sim.players[passer].skills.passing_completion_rate = 8.5;
+    sim.players[passer].skills.passing = 8.5;
+    sim.players[passer].skills.vision = 6.0;
+    sim.players[receiver].team = Team::Home;
+    sim.players[receiver].role = PlayerRole::Forward;
+    sim.players[receiver].position = Vec2::new(40.0, 72.0);
+    sim.players[receiver].velocity = Vec2::zero();
+    sim.players[receiver].skills.acceleration = 8.0;
+    sim.players[receiver].skills.first_touch = 8.0;
+    sim.players[screen].team = Team::Home;
+    sim.players[screen].role = PlayerRole::Midfielder;
+    sim.players[screen].position = if screen_receiver {
+        Vec2::new(40.0, 61.0)
+    } else {
+        Vec2::new(50.0, 61.0)
+    };
+    sim.players[screen].velocity = Vec2::zero();
+    sim.ball.holder = Some(passer);
+    sim.ball.position = sim.players[passer].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim
+}
+
+#[test]
+fn pass_mpc_receipt_probability_degrades_with_occluded_receiver_belief() {
+    let passer = 7usize;
+    let receiver = 9usize;
+    let clear_sim = perception_screened_pass_fixture(false);
+    let blocked_sim = perception_screened_pass_fixture(true);
+    let clear_snapshot = WorldSnapshot::from_match(&clear_sim);
+    let blocked_snapshot = WorldSnapshot::from_match(&blocked_sim);
+    let clear_passer = clear_snapshot
+        .players
+        .iter()
+        .find(|p| p.id == passer)
+        .expect("clear passer");
+    let clear_receiver = clear_snapshot
+        .players
+        .iter()
+        .find(|p| p.id == receiver)
+        .expect("clear receiver");
+    let blocked_passer = blocked_snapshot
+        .players
+        .iter()
+        .find(|p| p.id == passer)
+        .expect("blocked passer");
+    let blocked_receiver = blocked_snapshot
+        .players
+        .iter()
+        .find(|p| p.id == receiver)
+        .expect("blocked receiver");
+    let clear_confidence = clear_snapshot
+        .player_position_confidence_entry(passer, clear_receiver)
+        .expect("clear receiver confidence");
+    let blocked_confidence = blocked_snapshot
+        .player_position_confidence_entry(passer, blocked_receiver)
+        .expect("blocked receiver confidence");
+    let clear_speed =
+        pass_speed_yps_from_power(1.0, PassFlight::Floor, false, &clear_passer.skills);
+    let blocked_speed =
+        pass_speed_yps_from_power(1.0, PassFlight::Floor, false, &blocked_passer.skills);
+    let clear_estimate = pass_mpc_receipt_estimate_for_snapshot(
+        &clear_snapshot,
+        clear_passer,
+        clear_passer.position,
+        clear_receiver,
+        clear_receiver.position,
+        PassFlight::Floor,
+        clear_speed,
+        clear_receiver.position,
+    );
+    let blocked_estimate = pass_mpc_receipt_estimate_for_snapshot(
+        &blocked_snapshot,
+        blocked_passer,
+        blocked_passer.position,
+        blocked_receiver,
+        blocked_receiver.position,
+        PassFlight::Floor,
+        blocked_speed,
+        blocked_receiver.position,
+    );
+
+    assert!(
+        blocked_confidence.confidence + 0.10 < clear_confidence.confidence,
+        "screened receiver should have lower field-vector confidence: clear={clear_confidence:?} blocked={blocked_confidence:?}"
+    );
+    assert!(
+        blocked_estimate.probability + 0.04 < clear_estimate.probability,
+        "MPC receipt should price receiver occlusion/confidence: clear={clear_estimate:?} blocked={blocked_estimate:?}"
+    );
+    assert!(
+        blocked_estimate.qp_accel_fit < clear_estimate.qp_accel_fit,
+        "execution fit should degrade when the receiver belief is screened: clear={clear_estimate:?} blocked={blocked_estimate:?}"
+    );
+}
+
+#[test]
+fn pass_target_quality_damps_expected_completion_for_occluded_receiver() {
+    let passer = 7usize;
+    let receiver = 9usize;
+    let clear_sim = perception_screened_pass_fixture(false);
+    let blocked_sim = perception_screened_pass_fixture(true);
+    let clear_snapshot = WorldSnapshot::from_match(&clear_sim);
+    let blocked_snapshot = WorldSnapshot::from_match(&blocked_sim);
+    let clear_passer = clear_snapshot
+        .players
+        .iter()
+        .find(|p| p.id == passer)
+        .expect("clear passer");
+    let clear_receiver = clear_snapshot
+        .players
+        .iter()
+        .find(|p| p.id == receiver)
+        .expect("clear receiver");
+    let blocked_passer = blocked_snapshot
+        .players
+        .iter()
+        .find(|p| p.id == passer)
+        .expect("blocked passer");
+    let blocked_receiver = blocked_snapshot
+        .players
+        .iter()
+        .find(|p| p.id == receiver)
+        .expect("blocked receiver");
+    let clear_quality = pass_target_quality_for_snapshot(
+        &clear_snapshot,
+        clear_passer,
+        clear_passer.position,
+        clear_receiver,
+        clear_receiver.position,
+        PassFlight::Floor,
+    );
+    let blocked_quality = pass_target_quality_for_snapshot(
+        &blocked_snapshot,
+        blocked_passer,
+        blocked_passer.position,
+        blocked_receiver,
+        blocked_receiver.position,
+        PassFlight::Floor,
+    );
+
+    assert!(
+        blocked_quality.expected_completion + 0.04 < clear_quality.expected_completion,
+        "pass target scoring should carry occlusion/confidence into expected completion: clear={clear_quality:?} blocked={blocked_quality:?}"
+    );
+}
+
 #[test]
 fn mpc_receipt_probability_drops_when_ground_ball_stops_short() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {

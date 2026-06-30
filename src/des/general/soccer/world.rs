@@ -1239,6 +1239,49 @@ mod tests {
     }
 
     #[test]
+    fn bad_pass_chain_penalty_discounts_prior_possession_contributors() {
+        fn amount_for(events: &[SoccerRewardEvent], player_id: usize) -> f64 {
+            events
+                .iter()
+                .find(|event| event.player_id == player_id)
+                .map(|event| event.amount)
+                .unwrap_or_else(|| panic!("missing reward event for player {player_id}"))
+        }
+
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let home_ids = sim
+            .players
+            .iter()
+            .filter(|player| player.team == Team::Home)
+            .map(|player| player.id)
+            .take(3)
+            .collect::<Vec<_>>();
+        assert_eq!(home_ids.len(), 3);
+
+        let prior = home_ids[0];
+        let second = home_ids[1];
+        let passer = home_ids[2];
+        sim.reward_events.clear();
+        sim.possession_chain.clear();
+        sim.possession_chain.push_back(prior);
+        sim.possession_chain.push_back(second);
+        sim.possession_chain.push_back(passer);
+
+        sim.record_bad_pass_chain_penalty_at(37, Team::Home, passer, 10.0);
+
+        assert_eq!(sim.reward_events.len(), 3);
+        assert!((amount_for(&sim.reward_events, passer) + 10.0).abs() < 1e-9);
+        assert!((amount_for(&sim.reward_events, second) + 2.0).abs() < 1e-9);
+        assert!((amount_for(&sim.reward_events, prior) + 0.5).abs() < 1e-9);
+        assert!(sim
+            .reward_events
+            .iter()
+            .all(|event| event.tick == 37
+                && event.kind == SoccerRewardEventKind::BadPassChainPenalty));
+        assert!(SoccerMatch::has_significant_learning_event(&sim.reward_events));
+    }
+
+    #[test]
     fn pass_role_risk_penalizes_defenders_more_than_forwards() {
         let risky = pass_role_risk_test_quality(0.35, 0.70, 0.35, 0.55, 0.40);
         let origin = Vec2::new(34.0, 58.0);
@@ -9070,6 +9113,46 @@ impl SoccerMatch {
         }
     }
 
+    fn record_bad_pass_chain_penalty(&mut self, pass: &PendingPass) {
+        self.record_bad_pass_chain_penalty_at(
+            self.tick,
+            pass.team,
+            pass.from,
+            LOST_POSSESSION_CHAIN_PENALTY_POINTS,
+        );
+    }
+
+    fn record_bad_pass_chain_penalty_at(
+        &mut self,
+        tick: u64,
+        team: Team,
+        passer: usize,
+        base_penalty: f64,
+    ) {
+        if !base_penalty.is_finite() || base_penalty <= 1e-9 {
+            return;
+        }
+        let recipients = self.possession_chain_reward_sequence(
+            team,
+            Some(passer),
+            BAD_PASS_CHAIN_PENALTY_MULTIPLIERS.len(),
+        );
+        for (player_id, multiplier) in recipients
+            .into_iter()
+            .zip(BAD_PASS_CHAIN_PENALTY_MULTIPLIERS.iter().copied())
+        {
+            if !multiplier.is_finite() || multiplier <= 1e-9 {
+                continue;
+            }
+            self.record_reward_event_at_with_kind(
+                tick,
+                player_id,
+                -base_penalty * multiplier,
+                SoccerRewardEventKind::BadPassChainPenalty,
+            );
+        }
+    }
+
     pub(crate) fn finish_possession_progress_chain(&mut self, ended_with_goal: bool) {
         self.finish_possession_progress_chain_at(self.tick, ended_with_goal);
     }
@@ -16883,6 +16966,19 @@ impl SoccerMatch {
                 if self.enforce_goal_kick_clearance_on_control(control_position) {
                     return;
                 }
+                if let Some(pass) = pending_pass_for_reward.as_ref() {
+                    match possession_result {
+                        BallPossessionResult::Interception(_) => {
+                            self.record_bad_pass_chain_penalty(pass);
+                        }
+                        BallPossessionResult::LooseBallRecovery(_)
+                            if untargeted_long_ball.is_none() && holder_team != pass.team =>
+                        {
+                            self.record_bad_pass_chain_penalty(pass);
+                        }
+                        _ => {}
+                    }
+                }
                 self.mark_ball_received(holder);
                 self.record_possession_touch(holder);
                 self.record_duel_rewards(holder);
@@ -17182,6 +17278,7 @@ impl SoccerMatch {
                     if restart.awarded_team != pass.team {
                         let own_half = self.pass_from_own_half(pass.team, pass.origin);
                         self.record_pass_outcome_sample(pass, false, own_half);
+                        self.record_bad_pass_chain_penalty(pass);
                     }
                 }
                 self.pending_shot = None;
