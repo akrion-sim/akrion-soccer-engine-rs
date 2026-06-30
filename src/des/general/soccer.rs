@@ -17873,7 +17873,6 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::CrashBoxArrival
                 | SoccerRewardEventKind::IsolatedCarrierPanicBackPass
                 | SoccerRewardEventKind::SustainedForwardDribble
-                | SoccerRewardEventKind::ProductiveForwardCarry
                 | SoccerRewardEventKind::UnpressuredBackwardPass
                 | SoccerRewardEventKind::BuildupChainCredit
                 | SoccerRewardEventKind::MatchResult
@@ -17900,7 +17899,6 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::HeaderGoalFromCross
                 | SoccerRewardEventKind::CrashBoxArrival
                 | SoccerRewardEventKind::SustainedForwardDribble
-                | SoccerRewardEventKind::ProductiveForwardCarry
                 | SoccerRewardEventKind::BuildupChainCredit
         )
     }

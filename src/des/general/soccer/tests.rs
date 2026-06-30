@@ -88827,15 +88827,8 @@ fn forward_carry_tracker_sustained_segments_and_productive_payout() {
     assert_eq!(t.fold_tick(1.0), seg(1, 0));
     // 8yd: one more 1yd + the next 2yd boundary.
     assert_eq!(t.fold_tick(1.0), seg(1, 1));
-    // Productive cash-out after 8yd carried ⇒ 4 whole 2yd segments × per-segment points.
-    let pts = t.productive_carry_reward_points();
-    assert!(
-        (pts - 4.0 * PRODUCTIVE_FORWARD_CARRY_PER_SEGMENT_REWARD_POINTS).abs() < 1e-9,
-        "productive payout {pts} should be 4 segments"
-    );
     // A meaningful backward move breaks the run: accumulation AND both segment counters reset.
     assert_eq!(t.fold_tick(-FORWARD_CARRY_BACKWARD_RESET_YARDS), seg(0, 0));
-    assert_eq!(t.productive_carry_reward_points(), 0.0);
     // Rebuild from zero: fine pays from the 2nd yard, coarse from 4yd again.
     assert_eq!(t.fold_tick(2.0), seg(1, 0));
     assert_eq!(t.fold_tick(2.0), seg(2, 1));
