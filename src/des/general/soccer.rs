@@ -17613,14 +17613,6 @@ impl ForwardCarryTracker {
         seg.fine as f64 * SUSTAINED_FORWARD_DRIBBLE_FINE_SEGMENT_REWARD_POINTS
             + seg.coarse as f64 * SUSTAINED_FORWARD_DRIBBLE_SEGMENT_REWARD_POINTS
     }
-
-    /// Points for a productive cash-out (the carry ended in a forward pass or a shot): one reward
-    /// unit per completed 2-yard forward segment, capped. Zero below one full segment. Pure.
-    fn productive_carry_reward_points(&self) -> f64 {
-        let segments = ((self.forward_carry_yards / FORWARD_CARRY_SEGMENT_YARDS).floor() as u32)
-            .min(FORWARD_CARRY_MAX_REWARDED_SEGMENTS);
-        segments as f64 * PRODUCTIVE_FORWARD_CARRY_PER_SEGMENT_REWARD_POINTS
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
