@@ -23058,8 +23058,15 @@ fn dense_soccer_transition_reward(
     // snapshot so the reward credits the action that advanced the team, and progress is clamped to
     // a reference distance so a single burst can't farm reward. Gated (default-on) by
     // `DD_SOCCER_ENABLE_TEAM_ADVANCE_UPFIELD`; OFF ⇒ this term vanishes (byte-identical parity).
+    // Hardened: only credit the advance when it does NOT coincide with a turnover (the opponent
+    // winning the ball) — a forward charge that gifts possession is not a good advance. The carrier
+    // is credited for driving the ball on; off-ball credit is restricted to ATTACKERS (Forward /
+    // Midfielder) making an ONSIDE supporting run — a defender's forward movement is the back-line
+    // push's job (a positioning mechanic), not an individual reward that would teach it to break
+    // shape, and a run into an offside position is a wasted run, not support.
     if team_advance_upfield_enabled()
         && before_possession == Some(player.team)
+        && after_possession != Some(player.team.other())
         && before.team_advance_upfield_active(player.team).is_some()
     {
         if before.ball.holder == Some(player.id) {
@@ -23067,7 +23074,10 @@ fn dense_soccer_transition_reward(
                 reward += (ball_forward / TEAM_ADVANCE_REWARD_REFERENCE_YARDS).clamp(0.0, 1.0)
                     * TEAM_ADVANCE_CARRIER_DRIVE_REWARD;
             }
-        } else if player.role != PlayerRole::Goalkeeper && player_forward > 0.0 {
+        } else if matches!(player.role, PlayerRole::Forward | PlayerRole::Midfielder)
+            && player_forward > 0.0
+            && !after.position_would_be_offside_for_player(player.id, player.team, after_pos)
+        {
             reward += (player_forward / TEAM_ADVANCE_REWARD_REFERENCE_YARDS).clamp(0.0, 1.0)
                 * TEAM_ADVANCE_SUPPORT_RUN_REWARD;
         }
