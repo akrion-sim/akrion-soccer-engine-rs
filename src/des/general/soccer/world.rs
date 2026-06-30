@@ -49063,6 +49063,10 @@ impl WorldSnapshot {
         } else {
             proposed
         };
+        // Winger stay-wide vs pinch-in: in the final third the weak-side winger tucks toward the
+        // back post / half-space to get on the end of a cross (the ball-side winger holds width).
+        // Applied before the committed box-flood so the late crash-the-box still wins when it fires.
+        let chosen = self.winger_pinch_target_for(player).unwrap_or(chosen);
         // Crash the box: an attacker arriving for a wide team-mate's cross is pulled into its
         // assigned box zone, ahead of the generic shape target. Spacing/lane guards below
         // still refine it so the runners don't overlap.
