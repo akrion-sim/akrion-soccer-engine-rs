@@ -26499,9 +26499,20 @@ impl WorldSnapshot {
         let advance_min_speed =
             CARRIER_ADVANCE_MIN_SPEED_YPS * (1.0 - press_urgency * OWN_GOAL_PRESS_SPEED_RELAX);
         if goalward < advance_min_speed {
-            // Not advancing: contain as normal (1.0) — UNLESS we are numbers-up behind the ball, in
-            // which case we still press the carrier (we can afford to commit a presser).
-            return 1.0_f64.max(numbers_up_floor);
+            // Not advancing: contain as normal (1.0) — UNLESS we are numbers-up behind the ball
+            // (commit a presser), OR the carrier has STOPPED on the ball with nobody challenging:
+            // a holder who stalls must be pressed by the nearest defender (step up to engage)
+            // rather than stood off, so the ball doesn't just sit uncontested.
+            let stationary_press_floor = if stationary_holder_press_enabled()
+                && carrier_velocity.len() <= STATIONARY_HOLDER_PRESS_MAX_SPEED_YPS
+                && self.player_snapshot_position(me).distance(carrier_position)
+                    > STATIONARY_HOLDER_PRESS_RADIUS_YARDS
+            {
+                STATIONARY_HOLDER_PRESS_URGENCY_FLOOR
+            } else {
+                0.0
+            };
+            return 1.0_f64.max(numbers_up_floor).max(stationary_press_floor);
         }
         let advance01 = ((goalward - CARRIER_ADVANCE_MIN_SPEED_YPS)
             / (CARRIER_ADVANCE_FULL_SPEED_YPS - CARRIER_ADVANCE_MIN_SPEED_YPS).max(1e-6))
