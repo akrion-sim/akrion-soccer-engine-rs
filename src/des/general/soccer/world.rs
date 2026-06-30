@@ -35177,13 +35177,28 @@ impl WorldSnapshot {
         // Attacking ambition: widen the trigger zone for the man-to-beat (and ease the
         // wall's first-touch space below) so a one-two is genuinely available more often.
         // The lay-off lane, return lane, onside and quality checks all still apply.
+        // The give-and-go ambition bump (default-ON, kill-switch
+        // `DD_SOCCER_ENABLE_GIVE_AND_GO_AMBITION=0`) layers a further *moderate* widening on top,
+        // so the user sees more one-twos live; it only ever widens availability — every quality /
+        // onside / lane check below is unchanged.
         let ambition = attack_ambition_enabled();
-        let man_ahead_max = WALL_PASS_MAN_TO_BEAT_AHEAD_YARDS + if ambition { 3.0 } else { 0.0 };
-        let man_lateral_max =
-            WALL_PASS_MAN_TO_BEAT_LATERAL_YARDS + if ambition { 2.0 } else { 0.0 };
-        let man_range_max = WALL_PASS_MAN_TO_BEAT_RANGE_YARDS + if ambition { 3.0 } else { 0.0 };
-        let partner_min_space =
-            WALL_PASS_PARTNER_MIN_SPACE_YARDS - if ambition { 0.5 } else { 0.0 };
+        let gg_ambition = give_and_go_ambition_enabled();
+        let ahead_widen = GIVE_AND_GO_AMBITION_AHEAD_WIDEN_YARDS;
+        let lateral_widen = GIVE_AND_GO_AMBITION_LATERAL_WIDEN_YARDS;
+        let range_widen = GIVE_AND_GO_AMBITION_RANGE_WIDEN_YARDS;
+        let partner_ease = GIVE_AND_GO_AMBITION_PARTNER_SPACE_EASE_YARDS;
+        let man_ahead_max = WALL_PASS_MAN_TO_BEAT_AHEAD_YARDS
+            + if ambition { 3.0 } else { 0.0 }
+            + if gg_ambition { ahead_widen } else { 0.0 };
+        let man_lateral_max = WALL_PASS_MAN_TO_BEAT_LATERAL_YARDS
+            + if ambition { 2.0 } else { 0.0 }
+            + if gg_ambition { lateral_widen } else { 0.0 };
+        let man_range_max = WALL_PASS_MAN_TO_BEAT_RANGE_YARDS
+            + if ambition { 3.0 } else { 0.0 }
+            + if gg_ambition { range_widen } else { 0.0 };
+        let partner_min_space = WALL_PASS_PARTNER_MIN_SPACE_YARDS
+            - if ambition { 0.5 } else { 0.0 }
+            - if gg_ambition { partner_ease } else { 0.0 };
         // The man to beat: the nearest goalside opponent sitting in front of the carrier,
         // close enough that running a teammate's return around them actually beats someone.
         let (_, man_pos, man_dist) = self.nearest_opponent_at(carrier.team, carrier_pos)?;
