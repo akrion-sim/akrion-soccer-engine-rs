@@ -21047,6 +21047,11 @@ pub struct WorldSnapshot {
     /// serde (an internal decision aid; Default = None).
     #[serde(skip)]
     pub(crate) long_pass_run_head: Option<std::sync::Arc<LongPassRunHead>>,
+    /// The trained give-and-go appetite head, carried from the match for live consumption in
+    /// the carrier's wall-pass appetite. `None` ⇒ analytic seed (parity). Skipped by serde
+    /// (an internal decision aid; Default = None).
+    #[serde(skip)]
+    pub(crate) give_and_go_head: Option<std::sync::Arc<GiveAndGoHead>>,
     /// The trained attacking-spacing head, carried from the match for live
     /// consumption by the off-ball target scorer and formation-LP spacing floor.
     /// `None` ⇒ analytic seed (parity). Skipped by serde (internal decision aid;
