@@ -45595,18 +45595,17 @@ impl WorldSnapshot {
         // carrier should be supported forward in numbers, not left to dribble alone.
         let uncontested_support = self.uncontested_carrier_advancing(me.team).is_some();
         let front_line_support = self.front_line_carrier_support_cue(me.team).is_some();
-<<<<<<< HEAD
-        // The team is advancing upfield in possession (carrier has space to take the ball on) —
-        // runners must push up with the ball, not hold shape or drop, so the whole team moves
-        // forward as a unit.
+        // Two complementary "push the whole team up" triggers, both honoured:
+        //  - team_advance_support: the moment-to-moment cue (our carrier has space to advance now);
+        //  - advance_upfield_strategy: the team-level tactical directive to advance upfield.
+        // Runners push up with the ball under either, not hold shape or drop.
         let team_advance_support = self.team_advance_upfield_active(me.team).is_some();
-        let forward_support_cue = uncontested_support || front_line_support || team_advance_support;
-=======
         let advance_upfield_strategy = dd_soccer_advance_upfield_strategy_enabled()
             && self.tactical_directive(me.team).attack_strategy == TeamAttackStrategy::AdvanceUpfield;
-        let forward_support_cue =
-            uncontested_support || front_line_support || advance_upfield_strategy;
->>>>>>> 8641c67ff7cac2b04e1992840a0a56dc09d425a9
+        let forward_support_cue = uncontested_support
+            || front_line_support
+            || team_advance_support
+            || advance_upfield_strategy;
         // In our own half a drop to receive is still valid — unless a teammate is carrying
         // unpressured OR the holder is the front line, which means runners must supply depth.
         if !forward_support_cue
