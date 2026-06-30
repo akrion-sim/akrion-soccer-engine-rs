@@ -46155,11 +46155,7 @@ impl WorldSnapshot {
         // the line holds the deeper 20yd cushion (band 20..40). The 15yd anchor non-linearity in
         // `back_four_line_target_depth_v2` still governs the deep-ball regime in both cases.
         let we_control = self.controlled_possession_team() == Some(team);
-        let gap_min = if we_control {
-            BACK_FOUR_LINE_DESIRED_GAP_IN_POSSESSION_MIN_YARDS
-        } else {
-            BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS
-        };
+        let gap_min = back_four_desired_gap_min_yards(we_control);
         let base_gap = gap_min + (BACK_FOUR_LINE_DESIRED_GAP_MAX_YARDS - gap_min) * frac;
         if !back_four_push_into_dead_space_enabled() {
             return base_gap;
