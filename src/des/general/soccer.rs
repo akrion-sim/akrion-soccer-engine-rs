@@ -18720,6 +18720,27 @@ pub(crate) fn buildup_chain_credit_points(base_points: f64, recency_index: usize
     }
 }
 
+/// Whether the **ground-pass speed floor** is active this process. A released ground pass is
+/// `intended_speed · power_factor · momentum_f` — when the body can't drive it (struck while
+/// sprinting against your own momentum, or twisted side-on) that product collapses the pass to a
+/// near-stationary "ghost ball" the passer then runs away from (the dribble-leaves-the-ball-behind
+/// bug). This floors the released pace so the body penalty can SOFTEN a pass but never kill it
+/// (deliberate backheel/perpendicular-prod caps are still respected). Default-ON in production (env
+/// `DD_SOCCER_ENABLE_GROUND_PASS_SPEED_FLOOR=0/false` is the kill switch); default-OFF under test so
+/// the pass-physics parity suite stays byte-identical. See [`floored_ground_pass_launch_speed`].
+pub(crate) fn ground_pass_speed_floor_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_GROUND_PASS_SPEED_FLOOR").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_GROUND_PASS_SPEED_FLOOR"))
+    }
+}
+
 /// Whether **backward-pass discipline** is active this process. Emits a training PENALTY for a
 /// pass played backward (toward our own goal) when the passer is NOT under genuine high pressure —
 /// no opponent within `BACKWARD_PASS_HIGH_PRESSURE_RADIUS_YARDS` — scaled by how far back the ball
@@ -20414,6 +20435,36 @@ fn pass_facing_outcome(facing_yaw: f64, kick_dir: Vec2, in_own_half: bool) -> Pa
         must_turn: true,
         forbidden: false,
     }
+}
+
+/// Absolute minimum speed (mph) a released GROUND pass must leave the foot at, so the
+/// body-momentum/facing power penalty can soften a pass but never collapse it into a dead "ghost
+/// ball". ~12mph (≈5.9yps) is below any genuine pass pace (a crisp 5yd ball is already ~17mph) so
+/// this only lifts the collapsed ghosts, not normal play.
+const GROUND_PASS_MIN_RELEASE_MPH: f64 = 12.0;
+/// The body-momentum/facing penalty may reduce a pass to at most this FRACTION of its intended
+/// (MPC/analytic) speed — so a long ball driven against the run still leaves the foot near its
+/// intended pace instead of dribbling out. Keeps execution close to the *intended* weight (the
+/// user's "intentional passing, not a collapsed speed").
+const GROUND_PASS_MIN_RELEASE_FRACTION: f64 = 0.55;
+
+/// Floor a released GROUND pass's launch speed (yps) so the momentum/facing power penalty cannot
+/// collapse it into a near-stationary ball the passer runs away from. The floor is the larger of an
+/// absolute viable pace and a fraction of the `intended_speed` (so a firm intended pass stays firm),
+/// itself capped by any explicit weak-touch `speed_cap_yps` (a backheel / perpendicular prod still
+/// travels only at its cap, not faster) — a deliberate soft touch is preserved while a true ghost
+/// pass is lifted to a real, travelling pace. Pure.
+pub(crate) fn floored_ground_pass_launch_speed(
+    launch_speed: f64,
+    intended_speed: f64,
+    speed_cap_yps: Option<f64>,
+) -> f64 {
+    let mut floor =
+        mph_to_yps(GROUND_PASS_MIN_RELEASE_MPH).max(intended_speed.max(0.0) * GROUND_PASS_MIN_RELEASE_FRACTION);
+    if let Some(cap) = speed_cap_yps {
+        floor = floor.min(cap.max(0.0));
+    }
+    launch_speed.max(floor)
 }
 
 /// Preference bonus for controlled forward passes. The ideal is 8yd exactly:

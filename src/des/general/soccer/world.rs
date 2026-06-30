@@ -13382,6 +13382,17 @@ impl SoccerMatch {
                         // Off-centre strikes lose power; near-perpendicular prods and backheels
                         // are additionally hard-capped (10mph / 20mph) by the body-facing model.
                         let mut launch_speed = speed * facing_outcome.power_factor * momentum_f;
+                        // Floor a GROUND pass so the momentum/facing penalty can soften it but never
+                        // collapse it into a dead "ghost ball" the passer runs away from (the
+                        // dribble-leaves-the-ball-behind bug). Aerials keep their gravity-fixed
+                        // calibration; the floor itself respects any explicit backheel/prod cap.
+                        if ground_pass_speed_floor_enabled() && !flight.is_aerial() {
+                            launch_speed = floored_ground_pass_launch_speed(
+                                launch_speed,
+                                speed,
+                                facing_outcome.speed_cap_yps,
+                            );
+                        }
                         if let Some(cap) = facing_outcome.speed_cap_yps {
                             launch_speed = launch_speed.min(cap);
                         }

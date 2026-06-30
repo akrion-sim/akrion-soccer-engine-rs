@@ -88923,6 +88923,25 @@ fn buildup_chain_credit_recency_discount() {
 }
 
 #[test]
+fn ground_pass_speed_floor_lifts_ghost_passes_but_respects_caps() {
+    let floor_yps = mph_to_yps(GROUND_PASS_MIN_RELEASE_MPH);
+    // A short-pass ghost (~1yps, low intended) is lifted to the absolute viable pace.
+    let short_intended = mph_to_yps(14.0);
+    assert!((floored_ground_pass_launch_speed(1.0, short_intended, None) - floor_yps).abs() < 1e-9);
+    // A collapsed LONG pass is lifted to a fraction of its intended pace (stays near intended).
+    let long_intended = mph_to_yps(50.0);
+    let expected = long_intended * GROUND_PASS_MIN_RELEASE_FRACTION;
+    assert!((floored_ground_pass_launch_speed(2.0, long_intended, None) - expected).abs() < 1e-9);
+    assert!(expected > floor_yps, "the fractional floor should dominate for a firm intended pass");
+    // A normal firm pass is untouched (already above the floor).
+    let firm = mph_to_yps(40.0);
+    assert!((floored_ground_pass_launch_speed(firm, firm, None) - firm).abs() < 1e-9);
+    // A deliberate weak-touch cap (backheel/prod) is respected: the floor cannot exceed the cap.
+    let cap = mph_to_yps(10.0);
+    assert!((floored_ground_pass_launch_speed(0.5, long_intended, Some(cap)) - cap).abs() < 1e-9);
+}
+
+#[test]
 fn unpressured_backward_pass_penalty_truth_table() {
     let pressed = BACKWARD_PASS_HIGH_PRESSURE_RADIUS_YARDS - 0.1; // opponent within 3yd ⇒ justified
     let free = BACKWARD_PASS_HIGH_PRESSURE_RADIUS_YARDS + 5.0; // no close opponent ⇒ penalized
