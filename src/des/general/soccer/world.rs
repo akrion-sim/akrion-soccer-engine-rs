@@ -13614,10 +13614,10 @@ impl SoccerMatch {
                             // or the aim clearly favouring an opponent); `concedes` is HEAD's shadow-aware
                             // reception concede. For either danger, first try to RE-AIM to a safe release
                             // (the receiver's own feet, else the led point). If a safe release exists, use
-                            // it. If none does, only ABORT on the STRONG danger — turn to look up the led
-                            // channel and keep the ball rather than gift it; a mere shadow-concede with no
-                            // safe alternative keeps the deliberately-chosen pass (so a human/AI pass is
-                            // never silently swallowed on a soft read).
+                            // it. If none does, abort on the STRONG danger or the explicit terrible-pass
+                            // veto; with that veto off, a mere shadow-concede with no safe alternative
+                            // keeps the deliberately-chosen pass, so a soft read does not silently swallow
+                            // a human/AI pass.
                             let favours_opponent = |point: Vec2| {
                                 snapshot.pass_point_direct_opponent_control_risk(
                                     player_team,
@@ -21398,6 +21398,8 @@ pub struct WorldSnapshot {
     #[serde(default)]
     pub active_set_play: Option<SoccerSetPlayCall>,
     pub players: Vec<PlayerSnapshot>,
+    #[serde(default)]
+    pub(crate) offside_clocks: HashMap<usize, f64>,
     pub shared_positions: SharedPlayerPositionSnapshot,
     #[serde(default)]
     pub agent_schedule: Vec<AgentScheduleEntry>,
@@ -23608,6 +23610,15 @@ struct OffsidePositionAssessment {
     yards_beyond_line: f64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct OffsideRecoveryObservation {
+    offside_position: bool,
+    yards_beyond_line: f64,
+    clock_seconds: f64,
+    recovery_pressure: f64,
+    target_distance_yards: f64,
+}
+
 const OFFSIDE_RECOVERY_COMPLETION_TARGET_SECONDS: f64 = 4.5;
 const OFFSIDE_RECOVERY_JOG_REFERENCE_YPS: f64 = 3.0;
 const OFFSIDE_RECOVERY_URGENT_DISTANCE_YARDS: f64 = 4.0;
@@ -23904,6 +23915,7 @@ impl WorldSnapshot {
             pending_rebound: m.pending_rebound.clone(),
             active_set_play: m.active_set_play.clone(),
             players,
+            offside_clocks: m.offside_clocks.clone(),
             shared_positions,
             agent_schedule: m.last_agent_schedule.clone(),
             schedule_index_lookup,
@@ -26502,25 +26514,40 @@ impl WorldSnapshot {
         };
         let goal_side_depth = (ball_depth - cushion).max(0.0);
         target_depth = target_depth.min(goal_side_depth).max(min_depth);
-<<<<<<< HEAD
+        self.goal_side_defensive_target_for_depth(player, target, target_depth)
+    }
 
-        let mut guarded = target;
-        guarded.y = self.y_from_own_goal_depth(player.team, target_depth);
-        // True goal-side (MPC bias): legacy depth-guarding only fixed how deep the player sits,
-        // leaving them stranded on their own `x` — a wide full-back was "goal-side" merely by
-        // being deeper than the ball. Shade the target laterally onto the ball→own-goal line at
-        // the guarded depth by a bounded fraction (a bias, not a snap, so the back-line keeps its
-        // width under the other shape forces). Inert ⇒ byte-identical when the gate is off.
-        if goal_side::defensive_goal_side_enabled() {
-            let own_goal = Vec2::new(self.field_width * 0.5, self.own_goal_y_for(player.team));
-            if let Some(line_x) =
-                goal_side::ball_goal_line_x_at_y(self.ball.position, own_goal, guarded.y)
-            {
-                guarded.x += (line_x - guarded.x) * goal_side::GOAL_SIDE_LATERAL_PULL_FRACTION;
+    fn goal_side_defensive_target_for_depth(
+        &self,
+        player: &PlayerSnapshot,
+        target: Vec2,
+        target_depth: f64,
+    ) -> Vec2 {
+        if player.role == PlayerRole::Defender {
+            // Depth-guarded baseline: keep the defender's own `x` so the back four keeps its width,
+            // fixing only how deep he sits.
+            let mut guarded =
+                Vec2::new(target.x, self.y_from_own_goal_depth(player.team, target_depth));
+            // True goal-side (gated MPC bias): plain depth-guarding leaves a wide full-back
+            // "goal-side" merely by being deeper than the ball, stranded on his own `x`. When the
+            // gate is on, shade his `x` toward the ball→own-goal line (the on-line point from the
+            // shared `defensive_goal_side_line_target_for_depth` helper at the guarded depth) by a
+            // bounded fraction — a BIAS, not a snap, so the back line keeps its width under the
+            // other shape forces. Off ⇒ byte-identical to the plain keep-`x` guard.
+            if goal_side::defensive_goal_side_enabled() {
+                let line_target = defensive_goal_side_line_target_for_depth(
+                    player.team,
+                    self.ball.position,
+                    self.field_width,
+                    self.field_length,
+                    target_depth,
+                );
+                guarded.x +=
+                    (line_target.x - guarded.x) * goal_side::GOAL_SIDE_LATERAL_PULL_FRACTION;
             }
+            return guarded.clamp_to_pitch(self.field_width, self.field_length);
         }
-        guarded.clamp_to_pitch(self.field_width, self.field_length)
-=======
+        // Non-defenders that reach here (midfielders) sit ON the goal-side line.
         defensive_goal_side_line_target_for_depth(
             player.team,
             self.ball.position,
@@ -26528,7 +26555,6 @@ impl WorldSnapshot {
             self.field_length,
             target_depth,
         )
->>>>>>> 11dca1d66329f12a47244e88b121a81b7cfc5fd5
     }
 
     pub(crate) fn goal_side_defensive_target_for(&self, player_id: usize, target: Vec2) -> Vec2 {
@@ -28537,6 +28563,11 @@ impl WorldSnapshot {
                 pass_curl_probability: 0.0,
                 shot_outside_foot_curve_probability: 0.0,
                 pass_outside_foot_curve_probability: 0.0,
+                offside_position: false,
+                offside_yards_beyond_line: 0.0,
+                offside_clock_seconds: 0.0,
+                offside_recovery_pressure: 0.0,
+                offside_recovery_target_distance_yards: 0.0,
                 immediate_dispossession_risk: 0.0,
                 yards_to_goal: 0.0,
                 yards_to_own_goal: 0.0,
@@ -29262,6 +29293,7 @@ impl WorldSnapshot {
         } else {
             0.0
         };
+        let offside_recovery = self.offside_recovery_observation_for(me, me_position);
         let nearest_defender = opponents
             .iter()
             .filter_map(|p| {
@@ -30143,6 +30175,11 @@ impl WorldSnapshot {
             pass_curl_probability,
             shot_outside_foot_curve_probability,
             pass_outside_foot_curve_probability,
+            offside_position: offside_recovery.offside_position,
+            offside_yards_beyond_line: offside_recovery.yards_beyond_line,
+            offside_clock_seconds: offside_recovery.clock_seconds,
+            offside_recovery_pressure: offside_recovery.recovery_pressure,
+            offside_recovery_target_distance_yards: offside_recovery.target_distance_yards,
             immediate_dispossession_risk,
             yards_to_goal,
             yards_to_own_goal: (own_goal.y - me_position.y).abs(),
@@ -46849,7 +46886,6 @@ impl WorldSnapshot {
             })
             .unwrap_or(BACK_FOUR_LINE_NEUTRAL_GAP_FRACTION)
             .clamp(0.0, 1.0);
-<<<<<<< HEAD
         // Possession-aware trailing-gap band: WHILE WE CONTROL the ball the line may step right up
         // to support the attack, so the floor drops to 5yd (band 5..40). Out of possession — the
         // opponent controlling OR a loose/contested ball with no controller ("dispossession") —
@@ -46858,14 +46894,6 @@ impl WorldSnapshot {
         let we_control = self.controlled_possession_team() == Some(team);
         let gap_min = back_four_desired_gap_min_yards(we_control);
         let base_gap = gap_min + (BACK_FOUR_LINE_DESIRED_GAP_MAX_YARDS - gap_min) * frac;
-=======
-        let min_gap = if self.controlled_possession_team() == Some(team) {
-            BACK_FOUR_LINE_POSSESSION_GAP_MIN_YARDS
-        } else {
-            BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS
-        };
-        let base_gap = min_gap + (BACK_FOUR_LINE_DESIRED_GAP_MAX_YARDS - min_gap) * frac;
->>>>>>> 11dca1d66329f12a47244e88b121a81b7cfc5fd5
         if !back_four_push_into_dead_space_enabled() {
             return base_gap;
         }
@@ -46882,17 +46910,17 @@ impl WorldSnapshot {
                 f > approx_line_fwd + BACK_FOUR_DEAD_SPACE_OCCUPANT_MARGIN_YARDS && f < ball_fwd
             }
         });
+<<<<<<< HEAD
         if space_occupied {
             base_gap
         } else {
-<<<<<<< HEAD
             // Compress toward the possession-aware floor (`gap_min`), so a dead zone in front
             // collapses the gap to 5yd in possession / 20yd out of it rather than a fixed 20.
             gap_min + (base_gap - gap_min) * (1.0 - BACK_FOUR_DEAD_SPACE_PUSH_FRACTION)
-=======
-            min_gap + (base_gap - min_gap) * (1.0 - BACK_FOUR_DEAD_SPACE_PUSH_FRACTION)
->>>>>>> 11dca1d66329f12a47244e88b121a81b7cfc5fd5
         }
+=======
+        back_four_dead_space_adjusted_gap_yards(base_gap, min_gap, space_occupied)
+>>>>>>> 40b9d439e6e2d44947860d6f5fc1c22813740697
     }
 
     fn back_four_foremost_four_opponent_attack_fwd(&self, team: Team) -> Option<f64> {
@@ -46986,15 +47014,16 @@ impl WorldSnapshot {
             six,
             max_depth,
         );
-<<<<<<< HEAD
-        // Press UP to fill the space between the back four and the opponent's foremost attackers
-        // (gated, MARL/MAPPO optimal distance). Only ever raises a too-deep centre toward them.
-        let centre_depth = self.back_four_attacker_compacted_depth(team, centre_depth, six, max_depth);
-        own_goal_fwd + centre_depth
-=======
+        // Press UP to fill the space between the back four and the opponent's foremost attackers:
+        // theirs' possession-aware gap adjustment (in-possession / dispossession / defending
+        // regimes), kept behind ours' `back_four_press_to_attackers_enabled` gate so it stays
+        // toggleable + byte-identical when off. Only ever raises a too-deep centre toward them.
         let centre_fwd = own_goal_fwd + centre_depth;
-        self.back_four_attacker_gap_adjusted_centre_fwd(team, centre_fwd, own_goal_fwd, max_depth)
->>>>>>> 11dca1d66329f12a47244e88b121a81b7cfc5fd5
+        if back_four_press_to_attackers_enabled() {
+            self.back_four_attacker_gap_adjusted_centre_fwd(team, centre_fwd, own_goal_fwd, max_depth)
+        } else {
+            centre_fwd
+        }
     }
 
     /// Mean depth (yd from `team`'s own goal, in `team`'s attacking frame) of the opponent's
@@ -47887,7 +47916,15 @@ impl WorldSnapshot {
         {
             let cross_blend =
                 (cross_mark * 0.5 + zone * 0.5).clamp_to_pitch(self.field_width, self.field_length);
-            let cross_candidate = self.clamp_to_role_position(player_id, cross_blend, home, roam);
+            let cross_candidate = if me.role == PlayerRole::Defender
+                && !roam
+                && self.possession_team() == Some(me.team.other())
+            {
+                let bounded = self.clamp_defensive_goal_line_and_ball_gap(me.team, cross_blend);
+                self.goal_side_defensive_target_for_player(me, bounded)
+            } else {
+                self.clamp_to_role_position(player_id, cross_blend, home, roam)
+            };
             let cross_relief =
                 self.positional_shape_exception_relief_for_player_target(me, cross_candidate);
             let cross_teammate_pressure =
@@ -48340,13 +48377,7 @@ impl WorldSnapshot {
         if target_depth <= desired_depth + 0.35 && line_profile.fit >= 0.72 {
             return target;
         }
-        defensive_goal_side_line_target_for_depth(
-            player.team,
-            ball,
-            self.field_width,
-            self.field_length,
-            desired_depth,
-        )
+        self.goal_side_defensive_target_for_depth(player, target, desired_depth)
     }
 
     fn teammate_spacing_band_for_pair(&self, a: Vec2, b: Vec2) -> (f64, f64) {
@@ -49471,6 +49502,63 @@ impl WorldSnapshot {
             second_last_defender_y,
             self.field_length,
         )
+    }
+
+    fn offside_recovery_observation_for(
+        &self,
+        player: &PlayerSnapshot,
+        position: Vec2,
+    ) -> OffsideRecoveryObservation {
+        if player.role == PlayerRole::Goalkeeper {
+            return OffsideRecoveryObservation::default();
+        }
+        let attacking_team = self.controlled_possession_team().or_else(|| self.possession_team());
+        if attacking_team != Some(player.team)
+            || self.player_has_legal_self_touch_claim(player.id, player.team)
+        {
+            return OffsideRecoveryObservation::default();
+        }
+        let Some(assessment) = self.offside_position_for(player.team, position) else {
+            return OffsideRecoveryObservation::default();
+        };
+        let attack_dir = player.team.attack_dir();
+        let target = Vec2::new(
+            position.x,
+            assessment.active_line_y - STRIKER_ONSIDE_BUFFER_YARDS * attack_dir,
+        )
+        .clamp_to_pitch(self.field_width, self.field_length);
+        let target_distance_yards = position.distance(target).max(0.0);
+        let clock_seconds = self
+            .offside_clocks
+            .get(&player.id)
+            .copied()
+            .filter(|clock| clock.is_finite())
+            .unwrap_or(0.0)
+            .max(0.0);
+        let distance_aware_start = (OFFSIDE_RECOVERY_COMPLETION_TARGET_SECONDS
+            - target_distance_yards / OFFSIDE_RECOVERY_JOG_REFERENCE_YPS)
+            .clamp(DEEP_OFFSIDE_RECOVERY_GRACE_SECONDS, OFFSIDE_GRACE_SECONDS);
+        let recovery_grace = if assessment.yards_beyond_line >= DEEP_OFFSIDE_RECOVERY_MARGIN_YARDS {
+            DEEP_OFFSIDE_RECOVERY_GRACE_SECONDS
+        } else {
+            distance_aware_start
+        };
+        let time_pressure = if clock_seconds > recovery_grace {
+            ((clock_seconds - recovery_grace)
+                / (OFFSIDE_GRACE_SECONDS - recovery_grace).abs().max(1.0))
+                .clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let distance_pressure =
+            (assessment.yards_beyond_line / DEEP_OFFSIDE_RECOVERY_MARGIN_YARDS).clamp(0.0, 1.0);
+        OffsideRecoveryObservation {
+            offside_position: true,
+            yards_beyond_line: assessment.yards_beyond_line,
+            clock_seconds,
+            recovery_pressure: (time_pressure * 0.65 + distance_pressure * 0.35).clamp(0.0, 1.0),
+            target_distance_yards,
+        }
     }
 
     pub(crate) fn position_would_be_offside(&self, team: Team, position: Vec2) -> bool {
