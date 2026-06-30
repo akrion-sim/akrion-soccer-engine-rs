@@ -9853,7 +9853,7 @@ impl PlayerAgent {
                 ));
                 if scoop_strategy_requested {
                     ensure_min_legal_option_probability(&mut action_options, "scoop-pass", 0.64);
-                } else if snapshot.dd_soccer_enable_scoop_lane_blocked() {
+                } else if dd_soccer_enable_scoop_lane_blocked() {
                     // Live-frequency bias: a scoop is only ever offered into a genuinely blocked
                     // lane to an open man (every geometry check in `scoop_pass_target_for` passed),
                     // so floor its propensity enough to compete with a carry / square ball instead
