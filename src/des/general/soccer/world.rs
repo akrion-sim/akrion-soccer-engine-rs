@@ -13454,8 +13454,13 @@ impl SoccerMatch {
                     // BACKWARD_PASS_HIGH_PRESSURE_RADIUS of the passer (the case near the
                     // touchlines/corners too, where options shrink). Played with no close opponent
                     // it is penalized, scaled by how far back it goes. Skipped when the isolated
-                    // panic penalty already fired for this pass (no double counting).
-                    if backward_pass_discipline_enabled() && !emitted_isolated_panic {
+                    // panic penalty already fired for this pass (no double counting), and during a
+                    // set-play restart (a backward ball to retain a free-kick/throw-in is normal,
+                    // not an open-play recycle blunder).
+                    if backward_pass_discipline_enabled()
+                        && !emitted_isolated_panic
+                        && self.active_set_play.is_none()
+                    {
                         let nearest_opp = self
                             .players
                             .iter()
