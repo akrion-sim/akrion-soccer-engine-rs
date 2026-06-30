@@ -12846,6 +12846,16 @@ impl SoccerMatch {
                             mpc_pass_speed = None;
                         }
                     }
+                    // MPC pass-WEIGHT refinement: when the full MPC-aim path didn't already set a
+                    // launch speed (it is default-off / declined), still PRICE THE WEIGHT off the
+                    // receiver's predicted arrival so a ground pass isn't struck too fast or too slow
+                    // by the heuristic curve. Aim is unchanged; only the weight is solved. Gated
+                    // (default-on); off ⇒ None ⇒ the analytic speed is used (byte-identical).
+                    if mpc_pass_speed.is_none() && !flight.is_aerial() && !is_one_two_give {
+                        if let Some(id) = target_id {
+                            mpc_pass_speed = snapshot.mpc_refined_pass_weight(player_id, id, led_target);
+                        }
+                    }
                     let is_cross = pass_would_be_cross(
                         player_pos,
                         led_target,
