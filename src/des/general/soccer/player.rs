@@ -9461,23 +9461,8 @@ impl PlayerAgent {
                         .clamp(0.0, 1.0))
                 .clamp(0.0, 1.0);
                 let ambition_appetite = if attack_ambition_enabled() { 1.45 } else { 1.0 };
-                // Moderate default-ON live-frequency bump: lift the propensity to combine so an
-                // available good one-two competes with carries/through-balls (kill switch
-                // `DD_SOCCER_ENABLE_GIVE_AND_GO_AMBITION=0`). Off ⇒ 1.0 (byte-identical).
-                let gg_ambition = give_and_go_ambition_enabled();
-                let gg_ambition_appetite = if gg_ambition {
-                    GIVE_AND_GO_AMBITION_APPETITE_MULTIPLIER
-                } else {
-                    1.0
-                };
-                // Learned MARL/MAPPO lift: when the trained give-and-go head ranks THIS one-two
-                // above its analytic seed, raise the appetite (never suppress it). 1.0 when the
-                // head is off/untrained, so the gate-off path is byte-identical.
-                let learned_lift = snapshot.give_and_go_learned_appetite_lift(self.id);
                 let raw_wall_appetite = WALL_PASS_BASE_APPETITE
                     * ambition_appetite
-                    * gg_ambition_appetite
-                    * learned_lift
                     * self.preferences.pass_bias.clamp(0.4, 1.0)
                     * (0.55 + passing_skill * 0.45 + ability01(self.skills.vision) * 0.25)
                     * (0.5 + plan.quality)
@@ -9493,18 +9478,9 @@ impl PlayerAgent {
                 } else {
                     0.0
                 };
-                // Lift the non-strategy ceiling modestly under the ambition bump so a strong
-                // available one-two is not capped below decisive options.
-                let appetite_ceiling = if give_and_go_strategy {
-                    0.97
-                } else if gg_ambition {
-                    GIVE_AND_GO_AMBITION_APPETITE_CEILING
-                } else {
-                    0.92
-                };
                 let wall_appetite = raw_wall_appetite
                     .max(strategy_commitment_floor)
-                    .clamp(0.0, appetite_ceiling);
+                    .clamp(0.0, if give_and_go_strategy { 0.97 } else { 0.92 });
                 let strategy_commits =
                     give_and_go_strategy && plan.quality >= WALL_PASS_STRATEGY_COMMIT_MIN_QUALITY;
                 (plan, wall_appetite, strategy_commits)

@@ -70,11 +70,9 @@ const MIDFIELD_LINE_MODEL_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_MIDFIELD_LINE_MOD
 /// CENTRE is anchored on the [`BACK_FOUR_LINE_ANCHOR_DEPTH_YARDS`] line while the
 /// ball is upfield of it, tracks the ball to parity between the keeper's 6 and the
 /// anchor, sticks at the 6 inside it, and trails a dynamic
-/// possession-aware gap (5..40 in possession, 20..40 out) behind a deep ball, pressed up to fill
-/// the space in front of the foremost attackers, never past the halfway+cap. **Default-ON** in
-/// production (this is the geometry-anchored centre that removes the self-referential "sine-wave");
-/// `DD_SOCCER_ENABLE_BACK_FOUR_LINE_DEPTH_V2=0` is the kill switch back to the legacy ball-relative
-/// 20-40yd average band. Default-OFF under test so the line-depth parity suite stays byte-identical.
+/// [`BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS`]..[`BACK_FOUR_LINE_DESIRED_GAP_MAX_YARDS`]
+/// behind a deep ball (never past the halfway+cap). Off (unset) ⇒ byte-identical to
+/// the existing ball-relative 20-40yd band + halfway+5 cap.
 const BACK_FOUR_LINE_DEPTH_V2_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_LINE_DEPTH_V2";
 /// Env gate enabling **wingback-first forward priority** on the back-four line band.
 /// Without this, the 20-40yd ball cushion / flat offside line is enforced on the AVERAGE
@@ -89,10 +87,6 @@ const BACK_FOUR_LINE_DEPTH_V2_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_LIN
 /// symmetric all-four-average line stands (byte-identical).
 const DEFENSIVE_LINE_WINGBACK_FORWARD_PRIORITY_ENABLE_ENV: &str =
     "DD_SOCCER_ENABLE_WINGBACK_FORWARD_PRIORITY";
-/// Env gate (default-ON) for the press-to-attackers compaction of the v2 line centre.
-const BACK_FOUR_ATTACKER_PRESS_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_ATTACKER_PRESS";
-/// Env gate (default-ON) for the energy-conservation hold deadband on the v2 line target.
-const BACK_FOUR_LINE_HOLD_DEADBAND_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_LINE_HOLD_DEADBAND";
 
 /// Comfortable resting gap (yd behind the ball) the CENTRAL defenders hold while defending
 /// under wingback-first priority. Decoupling the wingbacks from the line average removed the
@@ -118,39 +112,6 @@ pub const BACK_FOUR_LINE_DESIRED_GAP_MAX_YARDS: f64 = 40.0;
 /// (a roster with no defenders/opponents/keeper) so the desired gap falls back to
 /// the middle of the 20-40 band rather than an arbitrary literal.
 pub const BACK_FOUR_LINE_NEUTRAL_GAP_FRACTION: f64 = 0.5;
-
-/// Minimum trailing gap (yd behind the ball) the back four holds **while WE control the ball**.
-/// In possession the line may step right up to support the attack, so the floor drops from the
-/// out-of-possession [`BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS`] (20) to this (5). "Dispossession" —
-/// the opponent controlling OR a loose/contested ball with NO controller — keeps the deeper 20yd
-/// floor. So the dynamic trailing gap is **5..40 in possession, 20..40 out of possession**. The
-/// 15yd anchor non-linearity ([`BACK_FOUR_LINE_ANCHOR_DEPTH_YARDS`]) still governs the deep-ball
-/// regime in both cases.
-pub const BACK_FOUR_LINE_DESIRED_GAP_IN_POSSESSION_MIN_YARDS: f64 = 5.0;
-
-/// MARL/MAPPO seed for the **optimal distance** (yd) the back four sits goal-side of the opponent's
-/// foremost-attacker line while in possession or dispossession: the line presses UP to fill the
-/// space between the four and the opponent's most advanced attackers rather than leaving a large
-/// hole for a pass into feet. Only ever raises a too-deep centre toward the attackers — never steps
-/// the line AHEAD of them (that plays them onside). The learned line-depth head refines the live
-/// depth via the attacker-compactness reward term; this is the analytic seed / fallback.
-pub const BACK_FOUR_OPTIMAL_GAP_TO_ATTACKERS_YARDS: f64 = 12.0;
-/// How many of the opponent's most-advanced outfielders define the "foremost attackers" line the
-/// back four compresses the space toward (the user's "foremost 4 opponent attackers").
-pub const BACK_FOUR_FOREMOST_ATTACKERS_COUNT: usize = 4;
-
-/// Energy-conservation **hold deadband** (yd) on the back-four line target: a line-bound defender
-/// already within this distance of its (legal) line target HOLDS rather than re-chasing a target
-/// that jitters a yard or two each tick with the predicted ball — the "sine-wave" walk-stop-walk.
-/// Always overridden (the defender is corrected) when it sits illegally AHEAD of the offside cap,
-/// so the deadband only ever leaves a defender a touch DEEPER than ideal (never plays a runner
-/// onside). Damps the cosmetic oscillation and saves the effort the wasted-energy penalty docks.
-pub const BACK_FOUR_LINE_HOLD_DEADBAND_YARDS: f64 = 2.0;
-/// Per-yard weight of the attacker-compactness term folded into the line-depth RL reward when the
-/// attacker-press is on: each yard the back four sits behind the optimal gap to the foremost
-/// attackers docks the reward by this much, so the learned head prefers ball-gap fractions that
-/// keep the four compact with the attackers. Small relative to the territorial-advantage delta.
-pub const BACK_FOUR_ATTACKER_COMPACTNESS_REWARD_PER_YARD: f64 = 0.02;
 
 fn env_flag_enabled(name: &str) -> bool {
     std::env::var(name)
@@ -192,15 +153,7 @@ pub fn midfield_line_model_enabled() -> bool {
 }
 
 /// Whether the v2 field-anchored back-four line depth is used at the live line
-/// chokepoint this process. The v2 centre is a function of **field geometry + the
-/// ball** (15yd anchor, dynamic possession-aware trailing gap, attacker compaction)
-/// rather than the AVERAGE of where the four currently are — so the four no longer
-/// chase a self-referential, jittering line average (the cosmetic "sine-wave"). It
-/// is the home of the 15yd non-linearity, the 5..40/20..40 possession band, the
-/// press-to-attackers compaction, and the hold deadband, so it is promoted to
-/// **default-ON** in production (env `DD_SOCCER_ENABLE_BACK_FOUR_LINE_DEPTH_V2=0`
-/// is the kill switch, reverting to the legacy ball-relative average band).
-/// Default-OFF under test so the line-depth parity suite stays byte-identical.
+/// chokepoint this process. Off ⇒ the existing ball-relative band stands (parity).
 pub fn back_four_line_depth_v2_enabled() -> bool {
     #[cfg(test)]
     {
@@ -210,43 +163,7 @@ pub fn back_four_line_depth_v2_enabled() -> bool {
     {
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| gate_default_on(BACK_FOUR_LINE_DEPTH_V2_ENABLE_ENV))
-    }
-}
-
-/// Whether the **press-to-attackers compaction** is applied to the v2 line centre this process:
-/// while in possession or dispossession (NOT while the opponent drives at our goal) the back four
-/// presses UP to sit at most [`BACK_FOUR_OPTIMAL_GAP_TO_ATTACKERS_YARDS`] goal-side of the
-/// opponent's foremost-attacker line, filling the space rather than leaving a hole. MARL/MAPPO:
-/// the optimal distance is refined by the line-depth head via the attacker-compactness reward.
-/// Default-ON (kill switch `DD_SOCCER_ENABLE_BACK_FOUR_ATTACKER_PRESS=0`); default-OFF under test.
-pub fn back_four_press_to_attackers_enabled() -> bool {
-    #[cfg(test)]
-    {
-        env_flag_enabled(BACK_FOUR_ATTACKER_PRESS_ENABLE_ENV)
-    }
-    #[cfg(not(test))]
-    {
-        use std::sync::OnceLock;
-        static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| gate_default_on(BACK_FOUR_ATTACKER_PRESS_ENABLE_ENV))
-    }
-}
-
-/// Whether the **energy-conservation hold deadband** damps the v2 line target this process: a
-/// line-bound defender already within [`BACK_FOUR_LINE_HOLD_DEADBAND_YARDS`] of its legal target
-/// holds rather than re-chasing a jittering line (the "sine-wave"). Default-ON (kill switch
-/// `DD_SOCCER_ENABLE_BACK_FOUR_LINE_HOLD_DEADBAND=0`); default-OFF under test for parity.
-pub fn back_four_line_hold_deadband_enabled() -> bool {
-    #[cfg(test)]
-    {
-        env_flag_enabled(BACK_FOUR_LINE_HOLD_DEADBAND_ENABLE_ENV)
-    }
-    #[cfg(not(test))]
-    {
-        use std::sync::OnceLock;
-        static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| gate_default_on(BACK_FOUR_LINE_HOLD_DEADBAND_ENABLE_ENV))
+        *ENABLED.get_or_init(|| env_flag_enabled(BACK_FOUR_LINE_DEPTH_V2_ENABLE_ENV))
     }
 }
 
@@ -301,60 +218,6 @@ pub fn back_four_line_target_depth_v2(
     // Keep the band valid if a degenerate roster pushes `six`/anchor past the cap.
     let lo = min_depth.min(max_depth);
     raw.clamp(lo, max_depth)
-}
-
-/// Pure trailing-gap **floor** (yd behind the ball) for the dynamic band: the in-possession floor
-/// (5) when WE control the ball, else the deeper out-of-possession floor (20) — which covers both
-/// the opponent controlling AND a loose/contested ball ("dispossession"). The band top is always
-/// [`BACK_FOUR_LINE_DESIRED_GAP_MAX_YARDS`] (40). Extracted pure so the possession band is unit-
-/// tested without toggling a process-global gate (which would race the parallel suite).
-pub fn back_four_desired_gap_min_yards(we_control: bool) -> f64 {
-    if we_control {
-        BACK_FOUR_LINE_DESIRED_GAP_IN_POSSESSION_MIN_YARDS
-    } else {
-        BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS
-    }
-}
-
-/// Pure **press-to-attackers compaction** of the line-CENTRE depth (yd from own goal). Raises a
-/// too-deep `centre_depth` UP toward the foremost-attacker line so the four sit at most
-/// `optimal_gap` goal-side of `attacker_depth` — never AHEAD of the attackers (no playing runners
-/// onside), never below the incoming `centre_depth` (push up only), never past `max_depth` / below
-/// `six`. Monotonic non-decreasing in `attacker_depth`.
-pub fn back_four_attacker_pressed_depth(
-    centre_depth: f64,
-    attacker_depth: f64,
-    optimal_gap: f64,
-    six: f64,
-    max_depth: f64,
-) -> f64 {
-    let press_floor = (attacker_depth - optimal_gap)
-        .min(attacker_depth)
-        .clamp(six.min(max_depth), max_depth);
-    centre_depth.max(press_floor)
-}
-
-/// Pure **hold-deadband** decision (energy conservation). Returns the forward target the defender
-/// should actually aim at: `cur_fwd` (HOLD) when it is within `deadband` of `target_fwd` and not
-/// illegally ahead of `cap`; otherwise `target_fwd`. `cap = None` ⇒ no offside concern (trap
-/// lifted), so a within-deadband target always holds. Holding only ever leaves a defender DEEPER
-/// than ideal (it never steps it ahead of the cap), so it cannot play a runner onside.
-pub fn back_four_line_hold_target_fwd(
-    cur_fwd: f64,
-    target_fwd: f64,
-    cap: Option<f64>,
-    deadband: f64,
-) -> f64 {
-    if let Some(cap) = cap {
-        if cur_fwd > cap + 1e-6 {
-            return target_fwd;
-        }
-    }
-    if (target_fwd - cur_fwd).abs() < deadband {
-        cur_fwd
-    } else {
-        target_fwd
-    }
 }
 
 /// Raw (un-normalized) state the line model is a function of, captured in the
@@ -996,22 +859,10 @@ impl SoccerMatch {
                 let decision = self.pending_line_depth.swap_remove(i);
                 let now_territorial = territorial_advantage(snapshot, decision.team);
                 if now_territorial.is_finite() && decision.decision_territorial.is_finite() {
-                    // MARL/MAPPO attacker-compactness shaping: dock the reward by how far the back
-                    // four sits behind the optimal gap to the opponent's foremost attackers over the
-                    // window, so the learned head prefers depths that keep the four compact with the
-                    // attackers (fills the space) rather than leaving a hole. Gated with the press.
-                    let mut reward = now_territorial - decision.decision_territorial;
-                    if back_four_press_to_attackers_enabled() {
-                        if let Some(excess) =
-                            snapshot.back_four_attacker_gap_excess_yards(decision.team)
-                        {
-                            reward -= BACK_FOUR_ATTACKER_COMPACTNESS_REWARD_PER_YARD * excess;
-                        }
-                    }
                     self.line_depth_samples.push(LineDepthSample {
                         inputs: decision.inputs,
                         action_gap_fraction: decision.action_gap_fraction,
-                        reward,
+                        reward: now_territorial - decision.decision_territorial,
                     });
                     if self.line_depth_samples.len() > LINE_DEPTH_SAMPLE_CAP {
                         let overflow = self.line_depth_samples.len() - LINE_DEPTH_SAMPLE_CAP;
@@ -1308,71 +1159,6 @@ mod back_four_line_tests {
             prev = cur;
             ball += 0.5;
         }
-    }
-
-    #[test]
-    fn desired_gap_floor_is_possession_aware() {
-        // In possession the line may step right up to 5yd; out of possession (incl. a loose ball)
-        // it holds the deeper 20yd floor. Band top is always 40 either way.
-        assert!(
-            (back_four_desired_gap_min_yards(true)
-                - BACK_FOUR_LINE_DESIRED_GAP_IN_POSSESSION_MIN_YARDS)
-                .abs()
-                < 1e-9
-        );
-        assert!(
-            (back_four_desired_gap_min_yards(false) - BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS).abs()
-                < 1e-9
-        );
-        assert!(back_four_desired_gap_min_yards(true) < back_four_desired_gap_min_yards(false));
-    }
-
-    #[test]
-    fn attacker_press_raises_a_deep_centre_but_never_steps_ahead() {
-        // anchor/six 6, cap 65, optimal gap 12. Attackers' foremost line at depth 40.
-        let pressed = |centre: f64| back_four_attacker_pressed_depth(centre, 40.0, 12.0, 6.0, 65.0);
-        // A too-deep centre (15) is raised toward the attackers: 40 - 12 = 28.
-        assert!((pressed(15.0) - 28.0).abs() < 1e-9, "deep centre -> {}", pressed(15.0));
-        // A centre already higher than the press floor is left alone (push up only).
-        assert!((pressed(35.0) - 35.0).abs() < 1e-9, "high centre -> {}", pressed(35.0));
-        // Never sits AHEAD of the attacker line even with a tiny optimal gap.
-        let ahead = back_four_attacker_pressed_depth(10.0, 40.0, 0.0, 6.0, 65.0);
-        assert!(ahead <= 40.0 + 1e-9, "must not step ahead of attackers: {ahead}");
-    }
-
-    #[test]
-    fn attacker_press_is_monotonic_and_respects_six_and_cap() {
-        let pressed = |att: f64| back_four_attacker_pressed_depth(0.0, att, 12.0, 6.0, 65.0);
-        // A higher attacker line ⇒ a higher (or equal) pressed centre.
-        assert!(pressed(50.0) >= pressed(30.0));
-        // Never below the keeper's six even when attackers are very deep / centre is 0.
-        assert!(pressed(10.0) >= 6.0 - 1e-9, "floored at six: {}", pressed(10.0));
-        // Never past the high-line cap.
-        assert!(pressed(200.0) <= 65.0 + 1e-9, "capped: {}", pressed(200.0));
-    }
-
-    #[test]
-    fn hold_deadband_holds_within_band_and_corrects_outside_or_ahead_of_cap() {
-        let db = BACK_FOUR_LINE_HOLD_DEADBAND_YARDS;
-        // Within the deadband, no cap ⇒ HOLD current position (ignore the jittering target).
-        assert!(
-            (back_four_line_hold_target_fwd(30.0, 30.0 + db * 0.5, None, db) - 30.0).abs() < 1e-9
-        );
-        // Outside the deadband ⇒ move to the target.
-        let far = 30.0 + db * 2.0;
-        assert!((back_four_line_hold_target_fwd(30.0, far, None, db) - far).abs() < 1e-9);
-        // Illegally AHEAD of the cap ⇒ always corrected to the target, deadband notwithstanding.
-        let cap = 29.0;
-        let target = 28.5;
-        assert!(
-            (back_four_line_hold_target_fwd(30.0, target, Some(cap), db) - target).abs() < 1e-9,
-            "ahead of cap must be corrected"
-        );
-        // Behind the cap and within the band ⇒ HOLD.
-        assert!(
-            (back_four_line_hold_target_fwd(27.0, 27.0 + db * 0.5, Some(40.0), db) - 27.0).abs()
-                < 1e-9
-        );
     }
 
     #[test]

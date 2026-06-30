@@ -74,11 +74,6 @@ pub struct Tunables {
     pub defensive_shape: DefensiveShapeTunables,
     /// Ball-carrier anti-stutter / keep-rolling thresholds.
     pub carrier_keep_rolling: CarrierKeepRollingTunables,
-    /// Good-dribbling knobs: touch DIRECTION weighting, touch LENGTH (how far the ball rolls per
-    /// touch), and carry SPEED (the forward-drive gait floor). Read by both the deterministic/MPC
-    /// touch-decision path and tunable from the learning store's policy overlay (the POMDP tuning
-    /// row), so dribbling can be tuned via MPC and POMDP both. See [`DribbleTuning`].
-    pub dribble: DribbleTuning,
     /// Freshly-won possession escape burst thresholds.
     pub fresh_possession_escape: FreshPossessionEscapeTunables,
     /// Goalkeeper positioning shaping (resting line, alignment score, buildup
@@ -111,7 +106,6 @@ impl Default for Tunables {
             shooting: ShootingTunables::default(),
             defensive_shape: DefensiveShapeTunables::default(),
             carrier_keep_rolling: CarrierKeepRollingTunables::default(),
-            dribble: DribbleTuning::default(),
             fresh_possession_escape: FreshPossessionEscapeTunables::default(),
             goalkeeper: GoalkeeperTunables::default(),
             killer_pass_over_top: KillerPassOverTopTunables::default(),
@@ -505,25 +499,6 @@ pub struct RewardTunables {
     /// Penalty for a forced pass played under low pressure (no need to rush). Was
     /// `LOW_PRESSURE_FORCED_PASS_PENALTY_POINTS`.
     pub low_pressure_forced_pass_penalty_points: f64,
-    /// Flat penalty for giving the ball straight to the opponent (a turnover with
-    /// no intentional-long-ball exemption) from a hold in the actor's OWN half —
-    /// the most expensive giveaway, as it exposes the goal. The danger-scaled
-    /// follow-on cost (the opponent then advancing) is priced separately and
-    /// continuously by the net-Φ pitch-value term; this is the flat decision-step
-    /// price of the giveaway itself. Was the inline `3.5`.
-    pub giveaway_to_opponent_own_half_penalty: f64,
-    /// Flat penalty for giving the ball straight to the opponent from a hold in
-    /// the OPPONENT's half (less exposed than an own-half giveaway). Was the inline
-    /// `2.2`.
-    pub giveaway_to_opponent_opp_half_penalty: f64,
-    /// Flat penalty for losing the ball into a loose/contested state (no team in
-    /// settled possession after the touch) from the actor's OWN half — softer than
-    /// a clean giveaway because the ball is still up for grabs. Was the inline
-    /// `0.85`.
-    pub giveaway_to_loose_own_half_penalty: f64,
-    /// Flat penalty for losing the ball into a loose/contested state from the
-    /// OPPONENT's half. Was the inline `0.55`.
-    pub giveaway_to_loose_opp_half_penalty: f64,
     /// Scale on the dense **territorial pitch-control × expected-threat** delta
     /// reward (see [`crate::des::general::soccer::pitch_value`]). Multiplies the
     /// net change in the acting team's controlled threat between the before/after
@@ -551,10 +526,6 @@ impl Default for RewardTunables {
             center_back_ahead_of_wingback_penalty_per_yard: 0.11,
             blocked_lane_floor_pass_penalty_points: 6.0,
             low_pressure_forced_pass_penalty_points: 1.75,
-            giveaway_to_opponent_own_half_penalty: 3.5,
-            giveaway_to_opponent_opp_half_penalty: 2.2,
-            giveaway_to_loose_own_half_penalty: 0.85,
-            giveaway_to_loose_opp_half_penalty: 0.55,
             pitch_value_threat_delta_points: 12.0,
             dense_shaping_budget_points: 12.0,
         }
@@ -683,74 +654,6 @@ impl Default for CarrierKeepRollingTunables {
             carry_target_yards: 4.2,
             carry_min_step_yards: 2.25,
             momentum_yps: 0.6,
-        }
-    }
-}
-
-/// Good-dribbling knobs grouped along the three axes the carrier controls: which DIRECTION the ball
-/// is knocked (touch angle), how far it rolls per touch (touch LENGTH), and how fast the carrier
-/// drives with it (carry SPEED / gait floor). The deterministic touch-decision path and the MPC
-/// control estimate read these, and the learning store can override them through the policy tuning
-/// overlay — so dribbling is tunable from MPC and POMDP/learned both. Defaults reproduce the prior
-/// hard-coded literals exactly (an unconfigured process is byte-identical).
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
-pub struct DribbleTuning {
-    // --- DIRECTION: touch-angle bucket scoring in `agentic_dribble_touch_bucket_for`. ---
-    /// Weight on the MPC ball-control probability when scoring a touch direction (how much MPC
-    /// execution feasibility steers which way the ball is knocked).
-    pub direction_mpc_control_weight: f64,
-    /// Weight on the MPC QP acceleration fit in the direction score.
-    pub direction_mpc_accel_weight: f64,
-    /// Weight on the kind-appropriate angle prior in the direction score.
-    pub direction_angle_fit_weight: f64,
-    /// Open-grass scale on the forward-component reward in the direction score (a clearer lane ahead
-    /// pulls the touch more forward).
-    pub direction_forward_open_grass_scale: f64,
-    // --- LENGTH: touch distance in `dribble_touch_distance_for` (how far the ball rolls). ---
-    /// Base touch length in yards before skill/space/intent terms.
-    pub touch_length_base_yards: f64,
-    /// Yards of touch length added per unit of ball-control skill.
-    pub touch_length_control_scale: f64,
-    /// Yards of touch length added per unit of open grass ahead.
-    pub touch_length_open_grass_scale: f64,
-    /// Yards of touch length added per unit of touch intent.
-    pub touch_length_intent_scale: f64,
-    // --- SPEED: carrier forward-drive gait floor (see `carrier_forward_drive_gait_floor`). ---
-    /// An opponent at/inside this radius keeps the carrier on close control (no speed floor).
-    pub carry_tight_pressure_yards: f64,
-    /// Open forward space (yards) at/above which the carrier is floored to at least a jog.
-    pub carry_jog_space_yards: f64,
-    /// Open forward space (yards) at/above which the carrier is floored to a run.
-    pub carry_run_space_yards: f64,
-    /// Open forward space (yards) at/above which the carrier is floored to a sprint.
-    pub carry_sprint_space_yards: f64,
-    /// Above this fatigue the open-field carry floor caps at a run rather than a sprint.
-    pub carry_sprint_max_fatigue: f64,
-    /// Minimum forward component (yards) of the intended move for the carry floor to engage.
-    pub carry_min_forward_yards: f64,
-    /// Half-width (yards) of the carry lane used to measure open forward space.
-    pub carry_lane_half_width_yards: f64,
-}
-
-impl Default for DribbleTuning {
-    fn default() -> Self {
-        DribbleTuning {
-            direction_mpc_control_weight: 0.48,
-            direction_mpc_accel_weight: 0.30,
-            direction_angle_fit_weight: 1.18,
-            direction_forward_open_grass_scale: 0.68,
-            touch_length_base_yards: 0.78,
-            touch_length_control_scale: 0.86,
-            touch_length_open_grass_scale: 1.05,
-            touch_length_intent_scale: 0.52,
-            carry_tight_pressure_yards: 2.5,
-            carry_jog_space_yards: 3.0,
-            carry_run_space_yards: 9.0,
-            carry_sprint_space_yards: 18.0,
-            carry_sprint_max_fatigue: 0.80,
-            carry_min_forward_yards: 1.0,
-            carry_lane_half_width_yards: 4.0,
         }
     }
 }
@@ -2992,42 +2895,6 @@ impl RewardTunables {
             25.0,
         );
         sanitize_f64(
-            "reward.giveaway_to_opponent_own_half_penalty",
-            &mut self.giveaway_to_opponent_own_half_penalty,
-            default.giveaway_to_opponent_own_half_penalty,
-            0.0,
-            200.0,
-            0.0,
-            25.0,
-        );
-        sanitize_f64(
-            "reward.giveaway_to_opponent_opp_half_penalty",
-            &mut self.giveaway_to_opponent_opp_half_penalty,
-            default.giveaway_to_opponent_opp_half_penalty,
-            0.0,
-            200.0,
-            0.0,
-            25.0,
-        );
-        sanitize_f64(
-            "reward.giveaway_to_loose_own_half_penalty",
-            &mut self.giveaway_to_loose_own_half_penalty,
-            default.giveaway_to_loose_own_half_penalty,
-            0.0,
-            200.0,
-            0.0,
-            25.0,
-        );
-        sanitize_f64(
-            "reward.giveaway_to_loose_opp_half_penalty",
-            &mut self.giveaway_to_loose_opp_half_penalty,
-            default.giveaway_to_loose_opp_half_penalty,
-            0.0,
-            200.0,
-            0.0,
-            25.0,
-        );
-        sanitize_f64(
             "reward.pitch_value_threat_delta_points",
             &mut self.pitch_value_threat_delta_points,
             default.pitch_value_threat_delta_points,
@@ -3108,38 +2975,6 @@ impl RewardTunables {
             prefix,
             "low_pressure_forced_pass_penalty_points",
             self.low_pressure_forced_pass_penalty_points,
-            0.0,
-            200.0,
-            errors,
-        );
-        validate_f64(
-            prefix,
-            "giveaway_to_opponent_own_half_penalty",
-            self.giveaway_to_opponent_own_half_penalty,
-            0.0,
-            200.0,
-            errors,
-        );
-        validate_f64(
-            prefix,
-            "giveaway_to_opponent_opp_half_penalty",
-            self.giveaway_to_opponent_opp_half_penalty,
-            0.0,
-            200.0,
-            errors,
-        );
-        validate_f64(
-            prefix,
-            "giveaway_to_loose_own_half_penalty",
-            self.giveaway_to_loose_own_half_penalty,
-            0.0,
-            200.0,
-            errors,
-        );
-        validate_f64(
-            prefix,
-            "giveaway_to_loose_opp_half_penalty",
-            self.giveaway_to_loose_opp_half_penalty,
             0.0,
             200.0,
             errors,
@@ -4175,50 +4010,6 @@ pub fn init_tunables_with_overrides<I: IntoIterator<Item = Value>>(pg_overlays: 
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn reward_giveaway_penalty_defaults_match_historical_literals() {
-        // The four flat turnover-penalty magnitudes were bare literals in
-        // `dense_soccer_transition_reward` before extraction; defaults must
-        // reproduce them exactly so the training baseline stays byte-identical.
-        let r = RewardTunables::default();
-        assert_eq!(r.giveaway_to_opponent_own_half_penalty, 3.5);
-        assert_eq!(r.giveaway_to_opponent_opp_half_penalty, 2.2);
-        assert_eq!(r.giveaway_to_loose_own_half_penalty, 0.85);
-        assert_eq!(r.giveaway_to_loose_opp_half_penalty, 0.55);
-        // The ordering the turnover model encodes: an own-half giveaway straight to
-        // the opponent is the most expensive; a loose ball lost in the opponent's
-        // half the least. Locking it in stops a future retune from inverting it.
-        assert!(
-            r.giveaway_to_opponent_own_half_penalty > r.giveaway_to_opponent_opp_half_penalty
-        );
-        assert!(
-            r.giveaway_to_opponent_opp_half_penalty > r.giveaway_to_loose_own_half_penalty
-        );
-        assert!(r.giveaway_to_loose_own_half_penalty > r.giveaway_to_loose_opp_half_penalty);
-    }
-
-    #[test]
-    fn reward_giveaway_penalties_are_sanitized_and_validated() {
-        // Defaults pass through sanitize untouched and validate cleanly.
-        let mut r = RewardTunables::default();
-        r.sanitize();
-        assert_eq!(r.giveaway_to_opponent_own_half_penalty, 3.5);
-        assert_eq!(r.giveaway_to_loose_opp_half_penalty, 0.55);
-        let mut errors = Vec::new();
-        r.validate_strict("reward", &mut errors);
-        assert!(errors.is_empty(), "default reward tunables must validate: {errors:?}");
-
-        // A degenerate config can never inject a non-finite or wild penalty into a
-        // gradient: non-finite is repaired to the default, out-of-range is clamped
-        // to the hard bound.
-        let mut bad = RewardTunables::default();
-        bad.giveaway_to_opponent_own_half_penalty = f64::NAN;
-        bad.giveaway_to_loose_opp_half_penalty = 10_000.0;
-        bad.sanitize();
-        assert_eq!(bad.giveaway_to_opponent_own_half_penalty, 3.5, "NaN -> default");
-        assert_eq!(bad.giveaway_to_loose_opp_half_penalty, 200.0, "out-of-range -> hard cap");
-    }
 
     #[test]
     fn defaults_match_historical_literals() {

@@ -24,8 +24,7 @@ use soccer_engine::des::general::soccer::{
     SoccerTacticalLearningWeights, SoccerTeamPolicyArtifact, SoccerTeamQPolicies,
     DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE, DEFAULT_SOCCER_PASS_COMPLETION_LEARNING_RATE,
     LOOSE_BALL_COMMIT_HEAD_MIN_TRAINING_STEPS, LongPassRunHead,
-    LONG_PASS_RUN_HEAD_MIN_TRAINING_STEPS, GiveAndGoHead, GIVE_AND_GO_HEAD_MIN_TRAINING_STEPS,
-    ShotTriggerHead, SHOT_TRIGGER_HEAD_MIN_TRAINING_STEPS,
+    LONG_PASS_RUN_HEAD_MIN_TRAINING_STEPS, ShotTriggerHead, SHOT_TRIGGER_HEAD_MIN_TRAINING_STEPS,
     ReceiveApproachHead, RECEIVE_APPROACH_HEAD_MIN_TRAINING_STEPS,
 };
 use soccer_engine::des::soccer_learning::{
@@ -1895,13 +1894,6 @@ static CARRIED_LOOSE_BALL_COMMIT_HEAD: std::sync::Mutex<Option<LooseBallCommitHe
 static CARRIED_LONG_PASS_RUN_HEAD: std::sync::Mutex<Option<LongPassRunHead>> =
     std::sync::Mutex::new(None);
 
-/// In-memory give-and-go / wall-pass appetite head (which one-two to commit to and when),
-/// carried + trained across games WITHIN a learner process, mirroring
-/// `CARRIED_LONG_PASS_RUN_HEAD`. Resets on pod restart; untouched unless the model is enabled
-/// (DD_SOCCER_ENABLE_LEARNED_GIVE_AND_GO).
-static CARRIED_GIVE_AND_GO_HEAD: std::sync::Mutex<Option<GiveAndGoHead>> =
-    std::sync::Mutex::new(None);
-
 /// In-memory receive-approach head (how far a receiver steps toward/away from an incoming
 /// ball), carried + trained across games WITHIN a learner process, mirroring
 /// `CARRIED_LOOSE_BALL_COMMIT_HEAD`. Resets on pod restart; untouched unless the model is
@@ -1993,11 +1985,6 @@ fn run_game(
     // it live once trained. No-op unless DD_SOCCER_ENABLE_LEARNED_LONG_PASS_RUN is set.
     if let Some(head) = CARRIED_LONG_PASS_RUN_HEAD.lock().unwrap().as_ref() {
         sim.set_long_pass_run_head(head.clone());
-    }
-    // Install the carried give-and-go head so the carrier's wall-pass appetite consumes it live
-    // once trained. No-op unless DD_SOCCER_ENABLE_LEARNED_GIVE_AND_GO is set.
-    if let Some(head) = CARRIED_GIVE_AND_GO_HEAD.lock().unwrap().as_ref() {
-        sim.set_give_and_go_head(head.clone());
     }
     // Install the carried pass-completion head so the pass-quality assessor consumes it live
     // once trained. No-op on completion scoring unless DD_SOCCER_ENABLE_LEARNED_PASS_COMPLETION
@@ -2116,26 +2103,6 @@ fn run_game(
             long_pass_run_samples.len(),
             head.training_steps(),
             head.training_steps() >= LONG_PASS_RUN_HEAD_MIN_TRAINING_STEPS,
-            final_loss
-        );
-    }
-    // Train the CARRIED give-and-go head on this game's reward-weighted RL corpus (reward = the
-    // attacking team's windowed territorial gain when the carrier committed the one-two) and
-    // install it into the next game. Empty + skipped unless DD_SOCCER_ENABLE_LEARNED_GIVE_AND_GO
-    // is set.
-    let give_and_go_samples = sim.drain_give_and_go_samples();
-    if !give_and_go_samples.is_empty() {
-        let mut guard = CARRIED_GIVE_AND_GO_HEAD.lock().unwrap();
-        let head = guard.get_or_insert_with(|| GiveAndGoHead::new(episode_seed as u32));
-        let mut final_loss = 0.0;
-        for _ in 0..4 {
-            final_loss = head.train_reward_weighted(&give_and_go_samples, 0.02);
-        }
-        eprintln!(
-            "give_and_go_training samples={} training_steps={} consumed={} final_loss={:.5}",
-            give_and_go_samples.len(),
-            head.training_steps(),
-            head.training_steps() >= GIVE_AND_GO_HEAD_MIN_TRAINING_STEPS,
             final_loss
         );
     }
