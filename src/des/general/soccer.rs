@@ -50263,6 +50263,7 @@ fn tracking_frame_to_world_snapshot(
         loose_ball_commit_head: None,
         receive_approach_head: None,
         long_pass_run_head: None,
+        give_and_go_head: None,
         attack_spacing_head: None,
         aerial_reception_head: None,
         shot_trigger_head: None,
