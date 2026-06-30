@@ -8274,6 +8274,10 @@ impl SoccerMatch {
         if self.config.learning_enabled || self.config.learning_logging_enabled {
             let phase_started = Instant::now();
             self.update_defensive_reward_trackers(&tick_start_snapshot, &next_snapshot);
+            // True goal-side recovery shaping (no-op + byte-identical unless
+            // `DD_SOCCER_ENABLE_DEFENSIVE_GOAL_SIDE` is on): reward off-ball defenders/midfielders
+            // for sitting on the ball→own-goal line, mild penalty for being caught upfield.
+            self.update_defensive_goal_side_rewards(&next_snapshot);
             self.detect_and_penalize_open_play_turnover(&next_snapshot);
             self.update_defensive_clear_and_hold_reward_tracker(
                 &tick_start_snapshot,
