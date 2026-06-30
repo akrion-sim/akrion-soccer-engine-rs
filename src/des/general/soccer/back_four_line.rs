@@ -161,6 +161,65 @@ pub const BACK_FOUR_LINE_HOLD_DEADBAND_YARDS: f64 = 2.0;
 /// keep the four compact with the attackers. Small relative to the territorial-advantage delta.
 pub const BACK_FOUR_ATTACKER_COMPACTNESS_REWARD_PER_YARD: f64 = 0.02;
 
+/// Env kill switch for the state-adaptive back-four block width (see
+/// [`back_four_adaptive_width_enabled`]).
+const BACK_FOUR_ADAPTIVE_WIDTH_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_ADAPTIVE_WIDTH";
+/// Shoulder margin (yd) the state-adaptive back-four width adds beyond the widest foremost attacker
+/// on each side, so the line COVERS the man rather than sitting level with him. See
+/// [`back_four_adaptive_width_yards`].
+pub const BACK_FOUR_ADAPTIVE_WIDTH_SHOULDER_MARGIN_YARDS: f64 = 6.0;
+/// Floor (yd) on the state-adaptive back-four width — even against a bunched central attack the
+/// four keep this much spread, so they never collapse onto the centre (the old fixed 22yd block
+/// that left both flanks open). Comfortably wider than that legacy block.
+pub const BACK_FOUR_ADAPTIVE_WIDTH_MIN_YARDS: f64 = 34.0;
+/// Ceiling on the state-adaptive back-four width as a fraction of pitch width, so even against a
+/// touchline-to-touchline attack the four keep some central compactness rather than splitting fully
+/// to the flanks and gifting the middle.
+pub const BACK_FOUR_ADAPTIVE_WIDTH_MAX_FIELD_FRACTION: f64 = 0.74;
+
+/// Whether the back four spans a STATE-ADAPTIVE block width — sized to cover the opponent's
+/// foremost-attacker lateral spread (+ a shoulder each side), floored and capped — instead of the
+/// fixed narrow `defensive_shape.back_four_block_width_yards` (22yd) block that left the flanks
+/// open. The width RESPONDS to the attack (wide vs a stretched front, tucked vs a central one)
+/// rather than being a forced constant — the same shape the line DEPTH already takes from an
+/// adaptive analytic seed live. Legacy fixed block is the off-state. Default-ON in production (kill
+/// switch `DD_SOCCER_ENABLE_BACK_FOUR_ADAPTIVE_WIDTH=0`); default-OFF under test so the
+/// defensive-shape parity suite stays byte-identical.
+pub fn back_four_adaptive_width_enabled() -> bool {
+    #[cfg(test)]
+    {
+        env_flag_enabled(BACK_FOUR_ADAPTIVE_WIDTH_ENABLE_ENV)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| gate_default_on(BACK_FOUR_ADAPTIVE_WIDTH_ENABLE_ENV))
+    }
+}
+
+/// State-adaptive back-four block width (yd): cover the opponent's foremost-attacker lateral
+/// `attackers_x_span` plus a [`BACK_FOUR_ADAPTIVE_WIDTH_SHOULDER_MARGIN_YARDS`] shoulder each side,
+/// floored at [`BACK_FOUR_ADAPTIVE_WIDTH_MIN_YARDS`] and capped at
+/// [`BACK_FOUR_ADAPTIVE_WIDTH_MAX_FIELD_FRACTION`] of the pitch. Pure + unit-tested so the band is
+/// verifiable independent of the world wiring; non-finite inputs fall back to safe defaults.
+pub fn back_four_adaptive_width_yards(attackers_x_span: f64, field_width: f64) -> f64 {
+    let span = if attackers_x_span.is_finite() {
+        attackers_x_span.max(0.0)
+    } else {
+        0.0
+    };
+    let field = if field_width.is_finite() && field_width > 0.0 {
+        field_width
+    } else {
+        80.0
+    };
+    let ceiling = (field * BACK_FOUR_ADAPTIVE_WIDTH_MAX_FIELD_FRACTION)
+        .max(BACK_FOUR_ADAPTIVE_WIDTH_MIN_YARDS);
+    (span + 2.0 * BACK_FOUR_ADAPTIVE_WIDTH_SHOULDER_MARGIN_YARDS)
+        .clamp(BACK_FOUR_ADAPTIVE_WIDTH_MIN_YARDS, ceiling)
+}
+
 fn env_flag_enabled(name: &str) -> bool {
     std::env::var(name)
         .map(|raw| {
