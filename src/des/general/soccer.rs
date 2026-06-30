@@ -2066,9 +2066,18 @@ const OVERDRIBBLE_PER_EXCESS_SECOND_POINTS: f64 = 2.0;
 const OVERDRIBBLE_PER_IGNORED_OUTLET_POINTS: f64 = 1.5;
 /// How many ranked forward-outlet candidates to probe when counting ignored passing options.
 const OVERDRIBBLE_OUTLET_PROBE_LIMIT: usize = 3;
-/// Cap on the total over-dribble penalty so one very long hold can't swamp the goal/possession
-/// signal — kept below shot-on-target(40)/goal(100), in line with the turnover penalties.
+/// Cap on the NEUTRAL-ZONE over-dribble penalty so one very long hold can't swamp the
+/// goal/possession signal — kept below shot-on-target(40)/goal(100), in line with the turnover
+/// penalties. The absolute cap is this times [`OVERDRIBBLE_DANGER_MAX_MULT`] for a deep own-half
+/// giveaway.
 const OVERDRIBBLE_MAX_PENALTY_POINTS: f64 = 16.0;
+/// How much the danger-zone severity can raise the over-dribble penalty (and its absolute cap) for
+/// a loss deep in our own half, where over-dribbling into a tackle can become a goal. Mirrors the
+/// turnover-window danger model ([`KEEPER_GIVEAWAY_DANGER_ZONE_MAX_MULT`]); the deepest giveaway is
+/// punished this many times harder than the same loss at midfield (absolute cap ⇒ 32, still < a
+/// shot-on-target reward at 40). The severity factor passed in is never allowed to REDUCE the
+/// penalty.
+const OVERDRIBBLE_DANGER_MAX_MULT: f64 = KEEPER_GIVEAWAY_DANGER_ZONE_MAX_MULT;
 /// How many of the most-recent teammates in a buildup chain are credited for a shot (the user's
 /// "last 10 teammates involved in the plays that led to the goal").
 const BUILDUP_CHAIN_CREDIT_DEPTH: usize = 10;
