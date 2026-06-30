@@ -17846,6 +17846,7 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::SustainedForwardDribble
                 | SoccerRewardEventKind::ProductiveForwardCarry
                 | SoccerRewardEventKind::UnpressuredBackwardPass
+                | SoccerRewardEventKind::BuildupChainCredit
                 | SoccerRewardEventKind::MatchResult
         )
     }
