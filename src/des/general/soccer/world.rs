@@ -26407,6 +26407,21 @@ impl WorldSnapshot {
             .unwrap_or_default()
     }
 
+    /// True when `team` has a NUMBERS-UP overload behind the ball — at least
+    /// `DEFENSIVE_NUMBERS_UP_BEHIND_BALL_COUNT` of its players are goalside of the ball (between the
+    /// ball and their own goal). In that picture the defence can afford to commit a presser to the
+    /// carrier, because there is ample cover behind. See [`Self::advancing_carrier_steal_urgency`].
+    pub(crate) fn defensive_numbers_up_behind_ball(&self, team: Team) -> bool {
+        let attack = team.attack_dir();
+        let ball_fwd = self.ball.position.y * attack;
+        let behind = self
+            .players
+            .iter()
+            .filter(|p| p.team == team && self.player_snapshot_position(p).y * attack < ball_fwd)
+            .count();
+        behind >= DEFENSIVE_NUMBERS_UP_BEHIND_BALL_COUNT
+    }
+
     pub(crate) fn advancing_carrier_steal_urgency(&self, defender_id: usize) -> f64 {
         let Some(me) = self.players.iter().find(|p| p.id == defender_id) else {
             return 1.0;
