@@ -19401,6 +19401,27 @@ pub(crate) fn terrible_pass_veto_enabled() -> bool {
     }
 }
 
+/// Gate for the hopeless-completion pass veto (`pass_reception_loses_to_opponent`). When a pass is
+/// effectively played straight to the other team — the nearest opponent reaches the reception point
+/// clearly before the intended receiver — the release is re-aimed to a safe receiver/lead, or, if
+/// none exists, ABORTED (the carrier keeps the ball and faces up). This closes the gap the
+/// mid-lane risk and marked-receiver concede vetoes both leave for a low-completion ball whose
+/// interceptor sits just outside their triggers. Default-ON in production (env
+/// `DD_SOCCER_ENABLE_HOPELESS_PASS_VETO=0/false` is the kill switch); default-OFF under test so the
+/// pass parity suite stays byte-identical.
+pub(crate) fn hopeless_pass_veto_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_HOPELESS_PASS_VETO").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_HOPELESS_PASS_VETO"))
+    }
+}
+
 /// Min speed (yps) for the passer to "continue the run" after a pass rather than fall back to shape.
 const CONTINUE_RUN_AFTER_PASS_MIN_SPEED_YPS: f64 = 2.0;
 /// How far ahead (yds, along the passer's current heading) to aim the continue-the-run move.
