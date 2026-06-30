@@ -17886,6 +17886,11 @@ pub(crate) enum SoccerRewardEventKind {
     /// that the WHOLE buildup, not just the finisher, gets credit for creating the chance. Emitted
     /// only when `DD_SOCCER_ENABLE_BUILDUP_CHAIN_CREDIT` is on. See `record_buildup_chain_credit`.
     BuildupChainCredit,
+    /// Positive: a long ball was released to a teammate who had broken beyond the opponent's last
+    /// outfield defender but was ONSIDE in our own half (the "release long inside own half"
+    /// strategy — you cannot be offside in your own half). Trains the line-breaking ball that
+    /// punishes a high press. Emitted only when `DD_SOCCER_ENABLE_RELEASE_LONG_OWN_HALF` is on.
+    ReleaseLongInsideOwnHalf,
     MatchResult,
 }
 
