@@ -17746,6 +17746,12 @@ pub(crate) enum SoccerRewardEventKind {
     /// in a turnover or a backward ball earns nothing. Emitted only when
     /// `DD_SOCCER_ENABLE_PROGRESSIVE_CARRY_REWARD` is on. See [`ForwardCarryTracker`].
     ProductiveForwardCarry,
+    /// PENALTY (negative): a pass played BACKWARD (toward our own goal) by a passer who was NOT
+    /// under genuine high pressure (no opponent within the high-pressure radius), scaled by how far
+    /// back it went. The direct learning signal that a backward recycle should be a high-pressure
+    /// escape, not a default outlet. Emitted only when `DD_SOCCER_ENABLE_BACKWARD_PASS_DISCIPLINE`
+    /// is on. See [`backward_pass_discipline_enabled`].
+    UnpressuredBackwardPass,
     MatchResult,
 }
 
