@@ -6,6 +6,9 @@
 
 use super::*;
 
+const ADVANCE_UPFIELD_STRATEGY_MIN_CUE: f64 = 0.58;
+const ADVANCE_UPFIELD_STRATEGY_INTERRUPT_CUE: f64 = 0.74;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum FlankAttackPolicy {
@@ -115,6 +118,9 @@ pub enum TeamAttackStrategy {
     /// Identify the biggest receivable pocket either in front of or behind the defensive line,
     /// then send off-ball attackers sprinting into it so the carrier has a progressive pass.
     ExploitSpace,
+    /// When the receiver/carrier has a runway, take the grass: the ball-holder carries upfield
+    /// and the whole team steps forward so the attack arrives in numbers instead of recycling.
+    AdvanceUpfield,
     CounterTransitionVertical,
     HalfSpaceComboLeft,
     HalfSpaceComboRight,
@@ -165,7 +171,7 @@ pub enum TeamAttackStrategy {
 }
 
 impl TeamAttackStrategy {
-    pub const ALL: [TeamAttackStrategy; 42] = [
+    pub const ALL: [TeamAttackStrategy; 43] = [
         TeamAttackStrategy::PullWideLeftThenCenter,
         TeamAttackStrategy::PullWideRightThenCenter,
         TeamAttackStrategy::PullWideLeftSwitchRight,
@@ -196,6 +202,7 @@ impl TeamAttackStrategy {
         TeamAttackStrategy::DirectLongDiagonalRight,
         TeamAttackStrategy::PatientPossessionProbe,
         TeamAttackStrategy::ExploitSpace,
+        TeamAttackStrategy::AdvanceUpfield,
         TeamAttackStrategy::CounterTransitionVertical,
         TeamAttackStrategy::HalfSpaceComboLeft,
         TeamAttackStrategy::HalfSpaceComboRight,
@@ -242,6 +249,7 @@ impl TeamAttackStrategy {
             TeamAttackStrategy::DirectLongDiagonalRight => "direct-long-diagonal-right",
             TeamAttackStrategy::PatientPossessionProbe => "patient-possession-probe",
             TeamAttackStrategy::ExploitSpace => "exploit-space",
+            TeamAttackStrategy::AdvanceUpfield => "advance-upfield",
             TeamAttackStrategy::CounterTransitionVertical => "counter-transition-vertical",
             TeamAttackStrategy::HalfSpaceComboLeft => "half-space-combo-left",
             TeamAttackStrategy::HalfSpaceComboRight => "half-space-combo-right",
@@ -300,6 +308,7 @@ impl TeamAttackStrategy {
             TeamAttackStrategy::DirectLongDiagonalRight => s(Center, Right, 1, 0.90),
             TeamAttackStrategy::PatientPossessionProbe => s(Center, Center, 6, 0.18),
             TeamAttackStrategy::ExploitSpace => s(Center, Center, 2, 0.72),
+            TeamAttackStrategy::AdvanceUpfield => s(Center, Center, 2, 0.78),
             TeamAttackStrategy::CounterTransitionVertical => s(Center, Center, 2, 0.85),
             TeamAttackStrategy::HalfSpaceComboLeft => s(Left, Center, 3, 0.52),
             TeamAttackStrategy::HalfSpaceComboRight => s(Right, Center, 3, 0.52),
@@ -3457,6 +3466,13 @@ fn soccer_formation_lp_apply_strategy_profile(
                 weights.expected_goal *= 1.10;
                 weights.retention *= 1.04;
             }
+            AdvanceUpfield => {
+                weights.progression *= 1.34;
+                weights.space_occupation *= 1.28;
+                weights.expected_goal *= 1.12;
+                weights.retention *= 0.92;
+                weights.transition_risk *= 1.08;
+            }
             WingOverlapLeftCross
             | WingOverlapRightCross
             | UnderlapLeftCutback
@@ -5011,6 +5027,7 @@ impl CentralBrain {
             0
         };
         let ctx: u8 = ((has_ball as u8) << 3) | (third << 1) | u8::from(opp_press > 0.6);
+        let advance_upfield_cue = advance_upfield_strategy_cue(snapshot, team);
         let (directive, commitment, value) = match team {
             Team::Home => (
                 &mut self.home_directive,
@@ -5035,10 +5052,15 @@ impl CentralBrain {
                     | TeamDefenseStrategy::DoubleTeamBallCarrier
                     | TeamDefenseStrategy::ContainAndDelayCounter
             );
+        let advance_upfield_window_interrupt = has_ball
+            && commitment.set
+            && commitment.attack != TeamAttackStrategy::AdvanceUpfield
+            && advance_upfield_cue >= ADVANCE_UPFIELD_STRATEGY_INTERRUPT_CUE;
         if !commitment.set
             || tick >= commitment.review_tick
             || possession_flip
             || defense_window_interrupt
+            || advance_upfield_window_interrupt
         {
             // Learn: credit the just-finished commitment with the field advantage it
             // gained while running (only while we held the ball — attacking value).
@@ -5054,11 +5076,21 @@ impl CentralBrain {
             // proven held one (continuity bonus), each lifted by its learned value. A
             // held strategy with high learned value resists switching (the ensemble of
             // heuristic prior + learning + hysteresis), but we never interpolate.
-            let rule_candidate = directive.attack_strategy;
+            let rule_candidate =
+                if has_ball && advance_upfield_cue >= ADVANCE_UPFIELD_STRATEGY_MIN_CUE {
+                    TeamAttackStrategy::AdvanceUpfield
+                } else {
+                    directive.attack_strategy
+                };
             let held = commitment.attack;
             let v_rule = value.get(&(ctx, rule_candidate)).copied().unwrap_or(0.0);
             let mut chosen = rule_candidate;
-            let mut chosen_score = STRATEGY_RULE_PRIOR + STRATEGY_VALUE_WEIGHT * v_rule;
+            let rule_prior = if rule_candidate == TeamAttackStrategy::AdvanceUpfield {
+                STRATEGY_RULE_PRIOR + advance_upfield_cue * 0.46
+            } else {
+                STRATEGY_RULE_PRIOR
+            };
+            let mut chosen_score = rule_prior + STRATEGY_VALUE_WEIGHT * v_rule;
             if commitment.set && rule_candidate != held {
                 let v_held = value.get(&(ctx, held)).copied().unwrap_or(0.0);
                 let held_score = STRATEGY_HELD_HYSTERESIS + STRATEGY_VALUE_WEIGHT * v_held;
@@ -5158,6 +5190,23 @@ impl CentralBrain {
                         (directive.support_depth_yards + 4.0).clamp(6.0, 25.0);
                     directive.risk_tolerance = (directive.risk_tolerance + 0.10).clamp(0.2, 0.96);
                     directive.pass_priority = (directive.pass_priority * 1.1).clamp(0.5, 1.6);
+                }
+                AdvanceUpfield => {
+                    // The carrier has grass: bias the ball-holder to carry, then pull the whole
+                    // team up behind and ahead of the ball so the attack arrives in numbers.
+                    directive.carry_priority = (directive.carry_priority * 1.30).clamp(0.55, 1.70);
+                    directive.pass_priority = (directive.pass_priority * 0.92).clamp(0.50, 1.60);
+                    directive.risk_tolerance = (directive.risk_tolerance + 0.07).clamp(0.20, 0.96);
+                    directive.support_depth_yards =
+                        (directive.support_depth_yards + 5.5).clamp(8.0, 26.0);
+                    directive.width_yards = (directive.width_yards * 1.02).min(width * 0.98);
+                    let target_line_y = snapshot.ball.position.y - team.attack_dir() * 14.0;
+                    directive.defensive_line_y = if team.attack_dir() > 0.0 {
+                        directive.defensive_line_y.max(target_line_y)
+                    } else {
+                        directive.defensive_line_y.min(target_line_y)
+                    }
+                    .clamp(length * 0.08, length * 0.92);
                 }
                 WingOverlapLeftCross | WingOverlapRightCross => {
                     directive.flank_attack_policy = FlankAttackPolicy::PlayDownFlankHighCross;
@@ -5282,6 +5331,54 @@ pub(crate) fn select_nested_sub_maneuver(
         GiveAndGoCentral
     };
     strategy_layers_can_coexist(primary.layer(), sub.layer()).then_some(sub)
+}
+
+fn advance_upfield_strategy_cue(snapshot: &WorldSnapshot, team: Team) -> f64 {
+    if !dd_soccer_advance_upfield_strategy_enabled() {
+        return 0.0;
+    }
+    let has_ball = snapshot
+        .controlled_possession_team()
+        .or_else(|| snapshot.possession_team())
+        == Some(team);
+    if !has_ball {
+        return 0.0;
+    }
+    let Some(holder_id) = snapshot.ball.holder else {
+        return 0.0;
+    };
+    let Some(holder) = snapshot
+        .players
+        .iter()
+        .find(|player| player.id == holder_id && player.team == team)
+    else {
+        return 0.0;
+    };
+
+    let holder_pos = snapshot.player_snapshot_position(holder);
+    let forward_space = snapshot.forward_dribble_space_yards(holder_id);
+    let nearest_opponent = snapshot.nearest_opponent_distance_at(team, holder_pos);
+    let pace_fit = (holder.velocity.y * team.attack_dir() / 5.5).clamp(0.0, 1.0);
+    let space_fit = ((forward_space - 6.0) / 18.0).clamp(0.0, 1.0);
+    let pressure_fit = ((nearest_opponent - 3.0) / 9.0).clamp(0.0, 1.0);
+
+    let length = snapshot.field_length.max(1.0);
+    let ball_grid_y = ((snapshot.ball.position.y / length) * 24.0)
+        .floor()
+        .clamp(0.0, 23.0);
+    let upfield_row = if team.attack_dir() > 0.0 {
+        ball_grid_y
+    } else {
+        23.0 - ball_grid_y
+    };
+    let grid_progress_fit = (upfield_row / 23.0).clamp(0.0, 1.0);
+
+    let cue = space_fit * 0.54 + pressure_fit * 0.18 + grid_progress_fit * 0.18 + pace_fit * 0.10;
+    if forward_space >= 16.0 && nearest_opponent >= 5.5 {
+        cue.max(0.76)
+    } else {
+        cue.clamp(0.0, 1.0)
+    }
 }
 
 fn central_brain_team_advantage(snapshot: &WorldSnapshot, team: Team) -> f64 {

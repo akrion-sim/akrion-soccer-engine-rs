@@ -1585,6 +1585,13 @@ const BACKWARD_PASS_DISTANCE_RISK_REFERENCE_YARDS: f64 = 10.0;
 const BACKWARD_PASS_DISTANCE_RISK_EXPONENT: f64 = 2.321_928_094_887_362; // log2(5)
 const LONG_BACKWARD_PASS_PENALTY_PER_RISK_UNIT: f64 = 7.6;
 const BACKWARD_PASS_COMPLETION_RISK_PER_UNIT: f64 = 0.13;
+const BACKWARD_PASS_HIGH_PRESSURE_MIN: f64 = 0.72;
+const BACKWARD_PASS_HIGH_PRESSURE_FULL: f64 = 0.88;
+const BACKWARD_PASS_CONSTRAINED_TOUCHLINE_MARGIN_YARDS: f64 = 5.0;
+const BACKWARD_PASS_CONSTRAINED_CORNER_DEPTH_YARDS: f64 = 12.0;
+const BACKWARD_PASS_BOUNDARY_PRESSURE_OPP_RADIUS_YARDS: f64 = 3.0;
+const BACKWARD_PASS_LOW_PRESSURE_BASE_PENALTY: f64 = 10.5;
+const BACKWARD_PASS_LOW_PRESSURE_RISK_PENALTY_PER_UNIT: f64 = 8.8;
 // Opponents standing in the path of a backward pass make that retreat progressively riskier.
 // Traffic count stays linear, while backward distance uses the compounding risk curve; short
 // 3-5yd resets stay free from corridor-traffic pricing.
@@ -1887,6 +1894,15 @@ const POSSESSION_PROGRESS_REWARD_WEIGHTS: [f64; 5] = [0.38, 0.27, 0.18, 0.11, 0.
 const POSSESSION_STALL_PENALTY_WEIGHTS: [f64; 5] = [0.34, 0.27, 0.20, 0.13, 0.06];
 const DENSE_FORWARD_PASS_PROGRESS_REWARD_PER_YARD: f64 = 0.12;
 const DENSE_FORWARD_CARRY_PROGRESS_REWARD_PER_YARD: f64 = 0.145;
+const PROGRESSIVE_CARRY_OUTCOME_MIN_YARDS: f64 = 2.0;
+const PROGRESSIVE_CARRY_OUTCOME_REWARD_PER_TWO_YARDS: f64 = 1.35;
+const PROGRESSIVE_CARRY_OUTCOME_MAX_REWARD_POINTS: f64 = 9.0;
+const PROGRESSIVE_CARRY_OUTCOME_WINDOW_TICKS: u64 = secs_to_ticks(5.0);
+const PROGRESSIVE_CARRY_FORWARD_PASS_MIN_YARDS: f64 = 1.25;
+const PROGRESSIVE_CARRY_CONTINUATION_REWARD_PER_PAIR: f64 = 0.95;
+const PROGRESSIVE_CARRY_CONTINUATION_ONE_YARD_STEP: f64 = 1.0;
+const PROGRESSIVE_CARRY_CONTINUATION_ONE_YARD_REWARD_PER_PAIR: f64 = 0.34;
+const PROGRESSIVE_CARRY_CONTINUATION_MAX_REWARD_POINTS: f64 = 3.8;
 const NOT_FACING_BALL_INTERCEPTION_MULTIPLIER: f64 = 0.40;
 const FACING_BALL_MIN_DOT: f64 = 0.12;
 /// Graded "control cone" for ball control (biomechanics first-touch model): how cleanly a
@@ -1917,8 +1933,10 @@ const FAST_AWAY_FACING_MIN_SPEED_YPS: f64 = 0.35;
 const FAST_AWAY_FACING_BALL_DOT: f64 = -0.55;
 const STRIKER_HOLD_UP_SIDEWAYS_YARDS: f64 = 7.5;
 const STRIKER_HOLD_UP_FORWARD_YARDS: f64 = 2.8;
-const GOAL_CHAIN_REWARD_PATTERN: [f64; 5] = [30.0, 30.0, 20.0, 15.0, 5.0];
-const SHOT_ON_TARGET_REWARD_PATTERN: [f64; 5] = [12.0, 12.0, 8.0, 6.0, 2.0];
+const GOAL_CHAIN_REWARD_PATTERN: [f64; 10] =
+    [30.0, 22.0, 15.0, 10.0, 7.0, 5.0, 4.0, 3.0, 2.0, 2.0];
+const SHOT_ON_TARGET_REWARD_PATTERN: [f64; 10] =
+    [12.0, 9.0, 6.0, 4.0, 3.0, 2.0, 1.5, 1.0, 0.8, 0.7];
 const PASS_CHAIN_HISTORY_LIMIT: usize = 8;
 const PASS_CHAIN_MAX_CONTINUATION_SECONDS: f64 = 12.0;
 const PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS: f64 = 7.5;
@@ -1962,10 +1980,6 @@ const FORWARD_CARRY_SEGMENT_YARDS: f64 = 2.0;
 /// and accumulated carry reset. Small jitter below this is tolerated so a near-straight dribble
 /// isn't reset by physics noise.
 const FORWARD_CARRY_BACKWARD_RESET_YARDS: f64 = 1.0;
-/// Minimum forward component (yards, Δy·attack) a released pass must have to count as "a pass
-/// forward" for the productive-carry cash-out — matches the segment size so "carried it forward
-/// then played it forward" is judged on the same 2-yard forward standard.
-const FORWARD_CARRY_FORWARD_PASS_MIN_YARDS: f64 = 2.0;
 /// Reward points per completed 2-yard segment for SUSTAINED forward dribbling — i.e. "2 yards of
 /// forward dribbling followed by 2 more yards". Only segments PAST THE FIRST are paid (a lone
 /// 2-yard nudge earns nothing; the 2nd, 3rd… consecutive segment each earn this), so the signal
@@ -1982,14 +1996,8 @@ const SUSTAINED_FORWARD_DRIBBLE_FINE_SEGMENT_REWARD_POINTS: f64 = 0.25;
 /// Cap (1-yard segments) on the fine-cadence sustained-dribble payout — same 20-yard ceiling as the
 /// 2-yard cadence, expressed in 1-yard units.
 const FORWARD_CARRY_MAX_REWARDED_FINE_SEGMENTS: u32 = 20;
-/// Reward points per 2-yard segment of forward carry that CULMINATES in a forward pass or a shot —
-/// the "productive dribble" signal: a carry is only paid off when it leads to a forward pass or a
-/// shot (a carry that ends in a turnover or a backward/square ball earns nothing here). Comparable
-/// per-segment to a forward-pass-chain link so a 6-yard drive into a forward pass rivals the
-/// pass-chain reward it sets up.
-const PRODUCTIVE_FORWARD_CARRY_PER_SEGMENT_REWARD_POINTS: f64 = 1.5;
-/// Cap (segments) on a single productive-carry / sustained-dribble payout so one very long run
-/// can't dominate the sparse goal/possession signal (20 yards of forward carry).
+/// Cap (segments) on the 2-yard-cadence sustained-dribble payout so one very long run can't
+/// dominate the sparse goal/possession signal (20 yards of forward carry).
 const FORWARD_CARRY_MAX_REWARDED_SEGMENTS: u32 = 10;
 /// A pass with at least this much BACKWARD component (yards toward our OWN goal, i.e. -Δy·attack)
 /// is subject to backward-pass discipline. Below this a square/short ball is treated as neutral.
@@ -7179,6 +7187,14 @@ pub struct SoccerDecisionContext {
     pub target_forward_yards: f64,
     #[serde(default)]
     pub target_lateral_yards: f64,
+    /// Actual one-tick ball progress, signed by this actor's attacking direction. Progressive
+    /// carry outcome credit uses the realized value rather than planned dribble intent.
+    #[serde(default)]
+    pub realized_ball_forward_yards: f64,
+    /// Actual one-tick player progress, signed by this actor's attacking direction, used with
+    /// ball progress to recognize controlled carries robustly.
+    #[serde(default)]
+    pub realized_player_forward_yards: f64,
     #[serde(default)]
     pub target_angle_degrees: f64,
     #[serde(default)]
@@ -17478,16 +17494,16 @@ impl PossessionProgressTracker {
     }
 }
 
-/// Tracks the CURRENT ball-carrier's continuous forward dribble so two progressive-carry MARL
-/// rewards can be paid (gated by `DD_SOCCER_ENABLE_PROGRESSIVE_CARRY_REWARD`):
-/// 1. SUSTAINED dribbling — each 2-yard forward segment past the first in one continuous carry
-///    (`fold_tick`, emitted per tick while the player keeps driving forward).
-/// 2. PRODUCTIVE carry — the accumulated forward yards, paid in 2-yard segments, cashed out at the
-///    moment the carry ends in a forward pass or a shot (`productive_carry_reward_points`).
-/// "Forward" is Δy·attack toward the opponent goal; lateral (x) movement is free — only the forward
-/// component is accumulated. A single carrier holds the ball at a time, so the match keeps one
-/// `Option<ForwardCarryTracker>`, reset when the holder changes / possession is lost. The segment
-/// accounting is pure (no env, no world access) so it is unit-tested directly.
+/// Tracks the CURRENT ball-carrier's continuous forward dribble to pay the SUSTAINED-dribble MARL
+/// reward (gated by `DD_SOCCER_ENABLE_PROGRESSIVE_CARRY_REWARD`): each forward segment past the
+/// first in one continuous carry, at both a 1-yard ("a yard followed by another yard") and a 2-yard
+/// ("2 yards followed by 2 more") cadence (`fold_tick`/`sustained_reward_points`, emitted per tick
+/// while the player keeps driving forward). The complementary PRODUCTIVE carry-into-pass/shot reward
+/// is handled separately by `record_progressive_carry_outcome_reward`. "Forward" is Δy·attack toward
+/// the opponent goal; lateral (x) movement is free — only the forward component is accumulated. A
+/// single carrier holds the ball at a time, so the match keeps one `Option<ForwardCarryTracker>`,
+/// reset when the holder changes / possession is lost. The segment accounting is pure (no env, no
+/// world access) so it is unit-tested directly.
 /// New sustained-dribble segments completed this tick, at BOTH cadences: `fine` = 1-yard segments
 /// ("a yard followed by another yard"), `coarse` = 2-yard segments ("2 yards followed by 2 more").
 /// Both are rewarded (the user asked for both); the coarse cadence is an extra bonus that escalates
@@ -17586,14 +17602,6 @@ impl ForwardCarryTracker {
         }
         seg.fine as f64 * SUSTAINED_FORWARD_DRIBBLE_FINE_SEGMENT_REWARD_POINTS
             + seg.coarse as f64 * SUSTAINED_FORWARD_DRIBBLE_SEGMENT_REWARD_POINTS
-    }
-
-    /// Points for a productive cash-out (the carry ended in a forward pass or a shot): one reward
-    /// unit per completed 2-yard forward segment, capped. Zero below one full segment. Pure.
-    fn productive_carry_reward_points(&self) -> f64 {
-        let segments = ((self.forward_carry_yards / FORWARD_CARRY_SEGMENT_YARDS).floor() as u32)
-            .min(FORWARD_CARRY_MAX_REWARDED_SEGMENTS);
-        segments as f64 * PRODUCTIVE_FORWARD_CARRY_PER_SEGMENT_REWARD_POINTS
     }
 }
 
@@ -17797,7 +17805,14 @@ pub(crate) enum SoccerRewardEventKind {
     DefensiveDispossession,
     TwoForwardPasses,
     ThreePassForwardNetGain,
+    ShotAttempt,
     ShotOnTarget,
+    /// A ball carrier moved forward in useful 2-yard chunks and converted that carry into a
+    /// completed forward pass or shot-on-target, so the carry transitions get outcome credit.
+    ProgressiveCarryIntoAttack,
+    /// A 2-yard forward carry was followed by another 2-yard forward carry by the same carrier.
+    /// This rewards sustained dribble progression before any pass/shot cash-out exists.
+    ProgressiveCarryContinuation,
     /// A goalkeeper stopped a shot (save/parry/claim/smother). Positive credit scaled by
     /// the danger of the effort denied (an xG-prevented proxy) — the keeper's direct
     /// learning signal, complementing the retrospective concede penalty.
@@ -17824,12 +17839,6 @@ pub(crate) enum SoccerRewardEventKind {
     /// ball forward at feet, not stall. Emitted only when
     /// `DD_SOCCER_ENABLE_PROGRESSIVE_CARRY_REWARD` is on. See [`ForwardCarryTracker`].
     SustainedForwardDribble,
-    /// Positive: PRODUCTIVE forward carry — a forward dribble (in 2-yard segments) that CULMINATED
-    /// in a forward pass or a shot, cashed out at the release. Trains the policy that carrying the
-    /// ball forward and then playing it forward / shooting is rewarded, whereas a carry that ends
-    /// in a turnover or a backward ball earns nothing. Emitted only when
-    /// `DD_SOCCER_ENABLE_PROGRESSIVE_CARRY_REWARD` is on. See [`ForwardCarryTracker`].
-    ProductiveForwardCarry,
     /// PENALTY (negative): a pass played BACKWARD (toward our own goal) by a passer who was NOT
     /// under genuine high pressure (no opponent within the high-pressure radius), scaled by how far
     /// back it went. The direct learning signal that a backward recycle should be a high-pressure
@@ -17854,14 +17863,16 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::DefensiveDispossession
                 | SoccerRewardEventKind::TwoForwardPasses
                 | SoccerRewardEventKind::ThreePassForwardNetGain
+                | SoccerRewardEventKind::ShotAttempt
                 | SoccerRewardEventKind::ShotOnTarget
+                | SoccerRewardEventKind::ProgressiveCarryIntoAttack
+                | SoccerRewardEventKind::ProgressiveCarryContinuation
                 | SoccerRewardEventKind::KeeperSave
                 | SoccerRewardEventKind::Goal
                 | SoccerRewardEventKind::HeaderGoalFromCross
                 | SoccerRewardEventKind::CrashBoxArrival
                 | SoccerRewardEventKind::IsolatedCarrierPanicBackPass
                 | SoccerRewardEventKind::SustainedForwardDribble
-                | SoccerRewardEventKind::ProductiveForwardCarry
                 | SoccerRewardEventKind::UnpressuredBackwardPass
                 | SoccerRewardEventKind::BuildupChainCredit
                 | SoccerRewardEventKind::MatchResult
@@ -17880,12 +17891,14 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::DefensiveDispossession
                 | SoccerRewardEventKind::TwoForwardPasses
                 | SoccerRewardEventKind::ThreePassForwardNetGain
+                | SoccerRewardEventKind::ShotAttempt
                 | SoccerRewardEventKind::ShotOnTarget
+                | SoccerRewardEventKind::ProgressiveCarryIntoAttack
+                | SoccerRewardEventKind::ProgressiveCarryContinuation
                 | SoccerRewardEventKind::Goal
                 | SoccerRewardEventKind::HeaderGoalFromCross
                 | SoccerRewardEventKind::CrashBoxArrival
                 | SoccerRewardEventKind::SustainedForwardDribble
-                | SoccerRewardEventKind::ProductiveForwardCarry
                 | SoccerRewardEventKind::BuildupChainCredit
         )
     }
@@ -18747,6 +18760,15 @@ pub(crate) fn dd_soccer_enable_outside_mid_attack_defender() -> bool {
     }
 }
 
+/// Advance-upfield team strategy. ON by default: when a carrier/receiver has open grass in
+/// possession, the team may commit to carrying into it while the rest of the XI moves forward in
+/// support. Set `DD_SOCCER_DISABLE_ADVANCE_UPFIELD_STRATEGY=1` for A/B / parity.
+pub(crate) fn dd_soccer_advance_upfield_strategy_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_ADVANCE_UPFIELD_STRATEGY").is_err())
+}
+
 /// Gate for aerial-pass-out-of-bounds discipline. OFF (the default) ⇒ no extra penalty event,
 /// the decision-time aerial pass score ignores `aerial_pass_landing_safety`, and the MPC
 /// launch-speed cap is skipped, so play and rewards are byte-identical to baseline. ON wires
@@ -19305,6 +19327,16 @@ fn tactical_directive_for_team(
                             + attack_progress.max(0.0) * 0.24
                             + risk_tolerance * 0.10,
                     ),
+                    (
+                        TeamAttackStrategy::AdvanceUpfield,
+                        if dd_soccer_advance_upfield_strategy_enabled() {
+                            0.34 + outside_own_half_fit * 0.18
+                                + attack_progress.max(0.0) * 0.24
+                                + risk_tolerance * 0.12
+                        } else {
+                            0.0
+                        },
+                    ),
                 ],
                 strategy_draw,
             ),
@@ -19606,7 +19638,12 @@ fn tactical_directive_for_team(
             StrategyLane::Center if strategy_draw < 0.72 => {
                 TeamAttackStrategy::DirectLongDiagonalLeft
             }
-            StrategyLane::Center if strategy_draw < 0.82 => TeamAttackStrategy::ExploitSpace,
+            StrategyLane::Center
+                if dd_soccer_advance_upfield_strategy_enabled() && strategy_draw < 0.80 =>
+            {
+                TeamAttackStrategy::AdvanceUpfield
+            }
+            StrategyLane::Center if strategy_draw < 0.86 => TeamAttackStrategy::ExploitSpace,
             StrategyLane::Center if strategy_draw < 0.90 => {
                 TeamAttackStrategy::DirectLongDiagonalRight
             }
@@ -21103,6 +21140,9 @@ fn soccer_decision_context_for(
         .map(|delta| delta.y * attack_dir)
         .unwrap_or(0.0);
     let target_lateral_yards = target_delta.map(|delta| delta.x).unwrap_or(0.0);
+    let after_actor_position = after.player_position(player_id).unwrap_or(actor_position);
+    let realized_player_forward_yards = (after_actor_position.y - actor_position.y) * attack_dir;
+    let realized_ball_forward_yards = (after.ball.position.y - before.ball.position.y) * attack_dir;
     let target_angle_degrees = target_delta
         .map(|delta| angle_between_vectors_degrees(Vec2::new(0.0, attack_dir), delta))
         .unwrap_or(0.0);
@@ -21380,6 +21420,8 @@ fn soccer_decision_context_for(
         target_distance_yards,
         target_forward_yards,
         target_lateral_yards,
+        realized_ball_forward_yards: finite_metric(realized_ball_forward_yards),
+        realized_player_forward_yards: finite_metric(realized_player_forward_yards),
         target_angle_degrees,
         action_ball_speed_yps,
         pass_target_expected_completion,
@@ -55108,7 +55150,18 @@ fn pass_mpc_receipt_estimate_for_snapshot(
     target_point: Vec2,
 ) -> PassMpcReceiptEstimate {
     let distance = passer_position.distance(target_point);
-    let ball_time_seconds = distance / pass_speed_yps.max(1.0);
+    let ball_time_seconds = if flight.is_aerial() {
+        Some(distance / pass_speed_yps.max(1.0))
+    } else {
+        snapshot.ball_ground_travel_time(distance, pass_speed_yps)
+    };
+    let Some(ball_time_seconds) = ball_time_seconds else {
+        return PassMpcReceiptEstimate {
+            probability: 0.0,
+            race_advantage_seconds: -2.0,
+            qp_accel_fit: 0.0,
+        };
+    };
     let receiver_velocity = snapshot
         .player_velocity(target.id)
         .unwrap_or(target.velocity);
@@ -55206,7 +55259,7 @@ fn dd_soccer_disable_pass_turnover_safety_hardening() -> bool {
 /// The value trade-off in [`pass_velocity_plan_for_snapshot`] is what the MDP/POMDP value
 /// head then learns to weight per situation — the engine never *forbids* a ball through an
 /// occupied lane, it prices the speed needed to thread it.
-const PASS_VELOCITY_POWER_BUCKETS: [f64; 4] = [0.50, 0.68, 0.84, 1.0];
+const PASS_VELOCITY_POWER_BUCKETS: [f64; 6] = [0.38, 0.50, 0.62, 0.74, 0.86, 1.0];
 /// Below this lane-interception risk a pass is treated as uncontested: the weighted-ball
 /// fast path is taken and no speed sweep runs. Small enough that any genuinely threatened
 /// lane still sweeps and can be driven.
@@ -55246,7 +55299,7 @@ fn pass_velocity_plan_for_snapshot(
     receiver: Option<(&PlayerSnapshot, Vec2)>,
 ) -> PassVelocityPlan {
     let nominal = pass_speed_yps_from_power(0.68, flight, is_cross, &passer.skills);
-    let receipt_at = |speed: f64| -> f64 {
+    let receipt_estimate_at = |speed: f64| -> PassMpcReceiptEstimate {
         receiver
             .map(|(target, target_position)| {
                 pass_mpc_receipt_estimate_for_snapshot(
@@ -55259,7 +55312,25 @@ fn pass_velocity_plan_for_snapshot(
                     speed,
                     aim_point,
                 )
-                .probability
+            })
+            .unwrap_or(PassMpcReceiptEstimate {
+                probability: 0.62,
+                race_advantage_seconds: 0.0,
+                qp_accel_fit: 0.62,
+            })
+    };
+    let stride_fit_at = |speed: f64| -> f64 {
+        receiver
+            .map(|(target, target_position)| {
+                let target_velocity = snapshot.player_velocity(target.id).unwrap_or(target.velocity);
+                pass_into_stride_fit(
+                    passer_position,
+                    target_position,
+                    target_velocity,
+                    aim_point,
+                    speed,
+                    passer.team,
+                )
             })
             .unwrap_or(0.62)
     };
@@ -55279,7 +55350,7 @@ fn pass_velocity_plan_for_snapshot(
             power: 0.68,
             lane_interception_risk: risk,
             min_clearing_speed_yps: nominal,
-            mpc_receipt_probability: receipt_at(nominal),
+            mpc_receipt_probability: receipt_estimate_at(nominal).probability,
         };
     }
     // Fast path for the common wide-open pass: if even the SLOWEST (most interceptable)
@@ -55304,13 +55375,13 @@ fn pass_velocity_plan_for_snapshot(
             PASS_LANE_DECISION_LOOKAHEAD_SECONDS,
         )
         .risk;
-    if slowest_risk < PASS_VELOCITY_OPEN_LANE_RISK_EPSILON {
+    if slowest_risk < PASS_VELOCITY_OPEN_LANE_RISK_EPSILON && receiver.is_none() {
         return PassVelocityPlan {
             speed_yps: slowest_speed,
             power: PASS_VELOCITY_POWER_BUCKETS[0],
             lane_interception_risk: slowest_risk,
             min_clearing_speed_yps: slowest_speed,
-            mpc_receipt_probability: receipt_at(slowest_speed),
+            mpc_receipt_probability: receipt_estimate_at(slowest_speed).probability,
         };
     }
     let hardest_speed = pass_speed_yps_from_power(
@@ -55340,13 +55411,39 @@ fn pass_velocity_plan_for_snapshot(
             min_clearing = speed;
             any_clears = true;
         }
-        let receipt = receipt_at(speed);
-        // Value trade-off: thread the lane (low risk) while keeping the ball receivable
-        // (high receipt). A small overhit penalty keeps a weighted ball preferred when the
-        // lane is already open. The MDP/POMDP value head learns to reweight these from the
-        // captured chosen-speed completion + lane-risk features.
-        let overhit_penalty = (power - 0.68).max(0.0) * 0.06;
-        let score = (1.0 - risk).clamp(0.0, 1.0) * receipt - overhit_penalty;
+        let receipt_estimate = receipt_estimate_at(speed);
+        let receipt = receipt_estimate.probability;
+        let reaches_target_fit = if receiver.is_some()
+            && receipt <= 1e-9
+            && receipt_estimate.qp_accel_fit <= 1e-9
+        {
+            0.0
+        } else {
+            1.0
+        };
+        let stride_fit = stride_fit_at(speed) * reaches_target_fit;
+        // Value trade-off: thread the lane (low risk) while timing the receiver's run. The
+        // stride/MPC receipt terms penalize BOTH under-hit balls the runner overruns and
+        // over-hit balls that arrive before the receiver can control them.
+        let speed_mph = speed / mph_to_yps(1.0);
+        let distance = passer_position.distance(aim_point);
+        let first_touch = receiver
+            .map(|(target, _)| ability01(target.skills.first_touch))
+            .unwrap_or(0.60);
+        let comfort_ceiling_mph = (17.0 + distance * 0.92 + first_touch * 8.0).clamp(18.0, 43.0);
+        let overhit_penalty =
+            ((speed_mph - comfort_ceiling_mph) / 22.0).max(0.0) * 0.20
+                + (power - 0.74).max(0.0) * 0.045;
+        let lane_fit = (1.0 - risk.clamp(0.0, 1.0) * 0.92).clamp(0.0, 1.0);
+        let control_fit =
+            (receipt * 0.50 + stride_fit * 0.34 + receipt_estimate.qp_accel_fit * 0.16)
+                .clamp(0.0, 1.0);
+        let stop_short_penalty = if reaches_target_fit <= 0.0 {
+            0.12 + (1.0 - power).max(0.0) * 0.24
+        } else {
+            0.0
+        };
+        let score = lane_fit * control_fit - overhit_penalty - stop_short_penalty;
         if best
             .as_ref()
             .map_or(true, |(best_score, _)| score > *best_score)
@@ -55368,7 +55465,7 @@ fn pass_velocity_plan_for_snapshot(
         power: 0.68,
         lane_interception_risk: 0.0,
         min_clearing_speed_yps: nominal,
-        mpc_receipt_probability: receipt_at(nominal),
+        mpc_receipt_probability: receipt_estimate_at(nominal).probability,
     });
     plan.min_clearing_speed_yps = min_clearing;
     plan
@@ -59059,6 +59156,70 @@ fn long_backward_pass_penalty(forward_yards: f64) -> f64 {
         return 0.0;
     }
     backward_pass_distance_risk_units(forward_yards) * LONG_BACKWARD_PASS_PENALTY_PER_RISK_UNIT
+}
+
+fn dd_soccer_disable_backward_pass_pressure_release_gate() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_BACKWARD_PASS_PRESSURE_RELEASE_GATE").is_ok())
+}
+
+fn backward_pass_pressure_release_score(
+    forward_yards: f64,
+    passer_pressure: f64,
+    nearest_opponent_distance: f64,
+    passer_position: Vec2,
+    field_width: f64,
+    field_length: f64,
+) -> f64 {
+    if dd_soccer_disable_backward_pass_pressure_release_gate()
+        || !forward_yards.is_finite()
+        || forward_yards >= -BACKWARD_PASS_MIN_FORWARD_YARDS
+    {
+        return 1.0;
+    }
+    let direct_pressure = ((passer_pressure.clamp(0.0, 1.0) - BACKWARD_PASS_HIGH_PRESSURE_MIN)
+        / (BACKWARD_PASS_HIGH_PRESSURE_FULL - BACKWARD_PASS_HIGH_PRESSURE_MIN).max(1e-6))
+    .clamp(0.0, 1.0);
+    let direct_pressure = smoothstep_unit(direct_pressure);
+    let (width, length) = sane_pitch_dimensions(field_width, field_length);
+    let fallback = Vec2::new(width * 0.5, length * 0.5);
+    let position = finite_pitch_point(passer_position, width, length, fallback);
+    let touchline_gap = position.x.min(width - position.x);
+    let byline_gap = position.y.min(length - position.y);
+    let constrained_by_boundary =
+        touchline_gap <= BACKWARD_PASS_CONSTRAINED_TOUCHLINE_MARGIN_YARDS
+            || (touchline_gap <= BACKWARD_PASS_CONSTRAINED_TOUCHLINE_MARGIN_YARDS * 1.4
+                && byline_gap <= BACKWARD_PASS_CONSTRAINED_CORNER_DEPTH_YARDS);
+    let boundary_pressure = if constrained_by_boundary
+        && nearest_opponent_distance.is_finite()
+        && nearest_opponent_distance <= BACKWARD_PASS_BOUNDARY_PRESSURE_OPP_RADIUS_YARDS
+    {
+        1.0
+    } else {
+        0.0
+    };
+    direct_pressure.max(boundary_pressure)
+}
+
+fn backward_pass_pressure_release_penalty(
+    forward_yards: f64,
+    pressure_release_score: f64,
+) -> f64 {
+    if dd_soccer_disable_backward_pass_pressure_release_gate()
+        || !forward_yards.is_finite()
+        || forward_yards >= -BACKWARD_PASS_MIN_FORWARD_YARDS
+    {
+        return 0.0;
+    }
+    let missing_pressure = (1.0 - pressure_release_score.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+    if missing_pressure <= f64::EPSILON {
+        return 0.0;
+    }
+    missing_pressure
+        * (BACKWARD_PASS_LOW_PRESSURE_BASE_PENALTY
+            + backward_pass_distance_risk_units(forward_yards)
+                * BACKWARD_PASS_LOW_PRESSURE_RISK_PENALTY_PER_UNIT)
 }
 
 /// Extra demerit for playing the ball BACKWARD past opponents standing in the pass
