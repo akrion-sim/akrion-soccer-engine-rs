@@ -2119,6 +2119,26 @@ fn run_game(
             final_loss
         );
     }
+    // Train the CARRIED give-and-go head on this game's reward-weighted RL corpus (reward = the
+    // attacking team's windowed territorial gain when the carrier committed the one-two) and
+    // install it into the next game. Empty + skipped unless DD_SOCCER_ENABLE_LEARNED_GIVE_AND_GO
+    // is set.
+    let give_and_go_samples = sim.drain_give_and_go_samples();
+    if !give_and_go_samples.is_empty() {
+        let mut guard = CARRIED_GIVE_AND_GO_HEAD.lock().unwrap();
+        let head = guard.get_or_insert_with(|| GiveAndGoHead::new(episode_seed as u32));
+        let mut final_loss = 0.0;
+        for _ in 0..4 {
+            final_loss = head.train_reward_weighted(&give_and_go_samples, 0.02);
+        }
+        eprintln!(
+            "give_and_go_training samples={} training_steps={} consumed={} final_loss={:.5}",
+            give_and_go_samples.len(),
+            head.training_steps(),
+            head.training_steps() >= GIVE_AND_GO_HEAD_MIN_TRAINING_STEPS,
+            final_loss
+        );
+    }
     // Train the CARRIED attacking-spacing head on this game's reward-weighted RL
     // corpus and install it into the next game, so the learner actually changes the
     // served off-ball/LP spacing band once warm. Empty + skipped unless
