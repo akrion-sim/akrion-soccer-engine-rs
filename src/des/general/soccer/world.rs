@@ -26484,11 +26484,12 @@ impl WorldSnapshot {
             }
         });
         if has_cover {
-            1.0 + advance01 * CARRIER_ADVANCE_STEAL_BOOST
+            (1.0 + advance01 * CARRIER_ADVANCE_STEAL_BOOST).max(numbers_up_floor)
         } else if press_urgency <= 0.0 {
             // Outside our third: a lone last defender contains rather than lunging —
-            // a failed steal with no cover lets the carrier clean through.
-            CARRIER_NO_COVER_CONTAIN_FACTOR
+            // a failed steal with no cover lets the carrier clean through. With a numbers-up
+            // overload behind the ball there IS cover, so press regardless.
+            CARRIER_NO_COVER_CONTAIN_FACTOR.max(numbers_up_floor)
         } else {
             // But the closer the carrier dribbles to our own goal, the less that
             // caution is affordable: ramp the lone defender from the timid contain
