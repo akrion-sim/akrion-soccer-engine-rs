@@ -18809,14 +18809,20 @@ pub(crate) fn unpressured_backward_pass_penalty_points(
 /// unlucky strip on a fresh touch in open space is NOT punished. Otherwise it is
 /// `base + excess_seconds·per-second + ignored_outlets·per-outlet`, then multiplied by a pressure
 /// factor that grows as the nearest opponent gets right on top of the carrier (1× at the pressure
-/// radius up to ~2× point-blank), capped. This is the field-vector context the user asked for:
-/// the magnitude reflects how long the carrier held, how much pressure was on them, and how many
-/// passing options they ignored. Pure (env-free) so the scaling is unit-tested directly. See
-/// [`overdribble_penalty_enabled`].
+/// radius up to ~2× point-blank), and finally by `danger_severity` — the keeper-giveaway danger
+/// factor (`>= 1.0`; see [`keeper_giveaway_severity_factor`]) that punishes a loss DEEP IN OUR OWN
+/// HALF (where over-dribbling into a tackle can become a goal) far harder than a failed take-on up
+/// the pitch. The result is capped (`OVERDRIBBLE_MAX_PENALTY_POINTS`, raised by the danger mult in
+/// the danger zone). This is the field-vector context the user asked for: the magnitude reflects how
+/// long the carrier held, how much pressure was on them, how many passing options they ignored, and
+/// HOW DANGEROUS the area was. `danger_severity` is clamped to `>= 1.0`, so it can only raise the
+/// penalty (a non-finite value falls back to neutral). Pure (env-free) so the scaling is unit-tested
+/// directly. See [`overdribble_penalty_enabled`].
 pub(crate) fn overdribble_dispossession_penalty_points(
     hold_seconds: f64,
     nearest_opponent_distance_yards: f64,
     open_forward_outlets: usize,
+    danger_severity: f64,
 ) -> f64 {
     if !hold_seconds.is_finite() || !nearest_opponent_distance_yards.is_finite() {
         return 0.0;
@@ -18838,7 +18844,15 @@ pub(crate) fn overdribble_dispossession_penalty_points(
             .clamp(0.0, 1.0);
         points *= 1.0 + proximity;
     }
-    points.min(OVERDRIBBLE_MAX_PENALTY_POINTS)
+    // Danger-zone scaling: never reduces the penalty (a non-finite factor ⇒ neutral 1.0 because
+    // `f64::max` ignores NaN). The absolute cap rises with the danger mult so the deep-giveaway
+    // signal is not flattened by the neutral-zone cap.
+    let danger = if danger_severity.is_finite() {
+        danger_severity.max(1.0)
+    } else {
+        1.0
+    };
+    (points * danger).min(OVERDRIBBLE_MAX_PENALTY_POINTS * OVERDRIBBLE_DANGER_MAX_MULT)
 }
 
 /// Whether the **over-dribble dispossession penalty** is active this process. Adds a sharp,
