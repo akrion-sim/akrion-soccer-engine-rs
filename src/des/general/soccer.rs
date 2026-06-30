@@ -89,6 +89,8 @@ mod reward_shaping;
 pub use reward_shaping::*;
 mod crash_box;
 pub(crate) use crash_box::*;
+mod winger_pinch;
+pub(crate) use winger_pinch::*;
 mod field_numbers;
 pub use field_numbers::*;
 mod goal_side;
