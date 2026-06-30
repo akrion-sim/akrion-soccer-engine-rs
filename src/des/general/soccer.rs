@@ -23365,6 +23365,7 @@ fn dense_soccer_transition_reward(
         if after_possession == Some(player.team) {
             reward += 0.09;
         } else if after_possession == Some(player.team.other()) {
+            let reward_cfg = &tunables().reward;
             reward -= intentional_long_ball_loss_penalty(
                 action,
                 own_half_holder,
@@ -23372,8 +23373,13 @@ fn dense_soccer_transition_reward(
                 own_goal_relief,
                 false,
             )
-            .unwrap_or(if own_half_holder { 3.5 } else { 2.2 });
+            .unwrap_or(if own_half_holder {
+                reward_cfg.giveaway_to_opponent_own_half_penalty
+            } else {
+                reward_cfg.giveaway_to_opponent_opp_half_penalty
+            });
         } else {
+            let reward_cfg = &tunables().reward;
             reward -= intentional_long_ball_loss_penalty(
                 action,
                 own_half_holder,
@@ -23381,7 +23387,11 @@ fn dense_soccer_transition_reward(
                 own_goal_relief,
                 true,
             )
-            .unwrap_or(if own_half_holder { 0.85 } else { 0.55 });
+            .unwrap_or(if own_half_holder {
+                reward_cfg.giveaway_to_loose_own_half_penalty
+            } else {
+                reward_cfg.giveaway_to_loose_opp_half_penalty
+            });
         }
         reward += ball_forward.clamp(-8.0, 14.0) * 0.15;
         if own_half_holder {
