@@ -11847,6 +11847,36 @@ impl SoccerMatch {
         // Spread the turnover penalty back across the attacking team's recent
         // possession chain while it is still intact (taking the ball clears it).
         let attacker_team = self.players[attacker_id].team;
+        // OVER-DRIBBLE PENALTY (gated, default-ON): the steal marks a negative event — the carrier
+        // held / dribbled the ball too long instead of releasing it. Attribute a sharp, carrier-
+        // specific learning signal scaled by the field-vector context at the moment of loss: how
+        // long they held, how much pressure was on them, and how many open forward outlets they
+        // ignored. The neural state already encodes the full 22-player+ball field at this tick, so
+        // this teaches the policy that holding too long in THIS position was the mistake. The
+        // holder is still `attacker_id` here (the swap happens below), so the hold-time and outlet
+        // probe read the carrier's pre-steal situation.
+        if overdribble_penalty_enabled() {
+            let hold_seconds = self.holder_possession_seconds(attacker_id);
+            let carrier_pos = self.players[attacker_id].position;
+            let nearest_opp = self
+                .players
+                .iter()
+                .filter(|other| other.team == attacker_team.other())
+                .map(|other| other.position.distance(carrier_pos))
+                .fold(f64::INFINITY, f64::min);
+            let open_outlets = WorldSnapshot::from_match(self)
+                .ranked_threaded_pass_candidates(attacker_id, OVERDRIBBLE_OUTLET_PROBE_LIMIT)
+                .len();
+            let penalty =
+                overdribble_dispossession_penalty_points(hold_seconds, nearest_opp, open_outlets);
+            if penalty > 0.0 {
+                self.record_reward_event_with_kind(
+                    attacker_id,
+                    -penalty,
+                    SoccerRewardEventKind::OverdribbleDispossession,
+                );
+            }
+        }
         self.record_weighted_possession_chain_reward_at(
             self.tick,
             attacker_team,
