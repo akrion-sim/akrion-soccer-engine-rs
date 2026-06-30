@@ -57770,10 +57770,10 @@ pub(crate) fn pending_pass_snapshot_apex_yards(pass: &PendingPassSnapshot) -> f6
 fn pass_loft_apex_yards(pass: &PendingPass) -> f64 {
     if pass.flight.is_scoop() {
         // A scoop pops over a close foot and drops onto the receiver, not into a
-        // hanging balloon arc. Keep it in the requested 7-12ft band with stable variation.
-        let seed = pass.launch_tick.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-            ^ (pass.from as u64).wrapping_shl(17);
-        let unit = ((seed >> 40) & 0xFFFF) as f64 / 65535.0;
+        // hanging balloon arc. The apex MUST match the one the launch speed was paced from
+        // (see `scoop_apex_unit` / `scoop_land_at_target_enabled`) or the ball flies a different
+        // hang time than it was struck for and floats; with the fix on, the unit is 0.5.
+        let unit = scoop_apex_unit(pass.launch_tick, pass.from);
         scoop_loft_apex_yards(pass.distance_yards, unit)
     } else if pass.flight.is_over_top() {
         tunables().killer_pass_over_top.height_yards
