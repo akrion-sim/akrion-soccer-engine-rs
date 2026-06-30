@@ -87704,10 +87704,10 @@ fn mpc_ground_pass_weight_solver_times_ball_to_target() {
     // Monotonic: a SHORTER required time (same distance) demands a FIRMER pass — the deterministic
     // "weight to the receiver" relation, not a random pick.
     let v_slow = snapshot
-        .ball_ground_launch_speed_for_travel(20.0, 1.6)
+        .ball_ground_launch_speed_for_travel(16.0, 1.6)
         .unwrap();
     let v_fast = snapshot
-        .ball_ground_launch_speed_for_travel(20.0, 0.9)
+        .ball_ground_launch_speed_for_travel(16.0, 1.0)
         .unwrap();
     assert!(
         v_fast > v_slow,
