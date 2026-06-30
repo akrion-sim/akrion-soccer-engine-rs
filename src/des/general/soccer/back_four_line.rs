@@ -1234,6 +1234,28 @@ mod back_four_line_tests {
     }
 
     #[test]
+    fn adaptive_width_covers_attack_span_within_floor_and_cap() {
+        let fw = 80.0;
+        // A central, bunched attack still gets the floor width — never the old narrow block.
+        let bunched = back_four_adaptive_width_yards(8.0, fw);
+        assert_eq!(bunched, BACK_FOUR_ADAPTIVE_WIDTH_MIN_YARDS);
+        // A moderately spread attack is covered: span + two shoulders.
+        let mid = back_four_adaptive_width_yards(30.0, fw);
+        assert!(
+            (mid - (30.0 + 2.0 * BACK_FOUR_ADAPTIVE_WIDTH_SHOULDER_MARGIN_YARDS)).abs() < 1e-9
+        );
+        // ...and materially wider than the legacy fixed 22yd block.
+        assert!(mid > 22.0);
+        // A touchline-to-touchline attack is capped below full pitch width (keep central compactness).
+        let wide = back_four_adaptive_width_yards(78.0, fw);
+        assert!(wide <= fw * BACK_FOUR_ADAPTIVE_WIDTH_MAX_FIELD_FRACTION + 1e-9);
+        assert!(wide < fw);
+        // Non-finite inputs fall back safely to an in-band width.
+        let degenerate = back_four_adaptive_width_yards(f64::NAN, f64::NAN);
+        assert!(degenerate.is_finite() && degenerate >= BACK_FOUR_ADAPTIVE_WIDTH_MIN_YARDS);
+    }
+
+    #[test]
     fn deep_ball_pushes_line_deeper_than_high_ball() {
         let mut deep = baseline_inputs();
         deep.ball_fwd_from_own_goal = 15.0; // ball near our own goal
