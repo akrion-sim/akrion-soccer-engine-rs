@@ -35331,6 +35331,150 @@ impl WorldSnapshot {
             })
     }
 
+    /// Build the per-decision [`GiveAndGoInputs`] for the ball-carrier's best available one-two,
+    /// or `None` when no wall pass is on (every case [`Self::wall_pass_option_for`] returns
+    /// `None`). The five analytic determinants are recomputed for the CHOSEN wall exactly as
+    /// `wall_pass_option_for` derives them, so the analytic seed (== `plan.quality`) is identical;
+    /// the remainder is extra context the learned head uses (raw geometry, the carrier's forward
+    /// stride into the burst, and the centralized coordination counts). Only ever called on the
+    /// gated RL-sampling / live-consume paths, so the gate-off process never runs it.
+    pub(crate) fn build_give_and_go_inputs(&self, carrier_id: usize) -> Option<GiveAndGoInputs> {
+        let plan = self.wall_pass_option_for(carrier_id)?;
+        let carrier = self.players.iter().find(|p| p.id == carrier_id)?;
+        let attack_dir = carrier.team.attack_dir();
+        let carrier_pos = self.player_snapshot_position(carrier);
+        let (_, _man_pos, man_dist) = self.nearest_opponent_at(carrier.team, carrier_pos)?;
+        let partner = self.players.iter().find(|p| p.id == plan.wall_partner)?;
+        let partner_pos = self.player_snapshot_position(partner);
+        let give = partner_pos - carrier_pos;
+        let give_dist = give.len();
+        // The five determinants `wall_pass_option_for` blends into `quality`, recomputed for the
+        // chosen wall with the SAME arithmetic (so `analytic_give_and_go_invite` == plan.quality).
+        let run_space = (self.space_score_at(plan.return_target, carrier.team) / 12.0).clamp(0.0, 1.0);
+        let man_beatable =
+            (1.0 - (man_dist / WALL_PASS_MAN_TO_BEAT_RANGE_YARDS)).clamp(0.0, 1.0);
+        let partner_space = self.nearest_opponent_distance_at(partner.team, partner_pos);
+        let partner_open =
+            ((partner_space - WALL_PASS_PARTNER_MIN_SPACE_YARDS) / 4.0).clamp(0.0, 1.0);
+        let give_backward_risk = wall_pass_leg_backward_risk(
+            give.y * attack_dir,
+            self.opponents_on_pass_path(
+                carrier_pos,
+                partner_pos,
+                carrier.team.other(),
+                BACKWARD_PASS_PATH_TRAFFIC_RADIUS_YARDS,
+            ),
+        );
+        let return_backward_risk = wall_pass_leg_backward_risk(
+            (plan.return_target.y - partner_pos.y) * attack_dir,
+            self.opponents_on_pass_path(
+                partner_pos,
+                plan.return_target,
+                carrier.team.other(),
+                BACKWARD_PASS_PATH_TRAFFIC_RADIUS_YARDS,
+            ),
+        );
+        let run_forward_gain = (plan.return_target.y - carrier_pos.y) * attack_dir;
+        // Goal proximity: how far up the pitch the carrier is (forward distance to the attacking
+        // goal line, normalized by the same reference the appetite uses).
+        let goal_line_y = if attack_dir >= 0.0 {
+            self.field_length
+        } else {
+            0.0
+        };
+        let dist_to_goal = ((goal_line_y - carrier_pos.y) * attack_dir).max(0.0);
+        let goal_proximity =
+            (1.0 - (dist_to_goal / WALL_PASS_GOAL_PROXIMITY_REFERENCE_YARDS)).clamp(0.0, 1.0);
+        let carrier_pressure = (1.0 - (man_dist / 8.0)).clamp(0.0, 1.0);
+        // The carrier becomes the runner — its forward stride this tick is the "go" cue.
+        let runner_forward_speed = carrier.velocity.y * attack_dir;
+        // Centralized (CTDE) coordination: how many OTHER viable walls the carrier could combine
+        // with (a give band, forward of the carrier, with a clear lay-off lane), and how many
+        // teammates are already breaking forward.
+        let competing_walls = self
+            .players
+            .iter()
+            .filter(|p| {
+                p.team == carrier.team
+                    && p.id != carrier_id
+                    && p.id != plan.wall_partner
+                    && p.role != PlayerRole::Goalkeeper
+            })
+            .filter(|p| {
+                let p_pos = self.player_snapshot_position(p);
+                let g = p_pos - carrier_pos;
+                let d = g.len();
+                d >= WALL_PASS_GIVE_MIN_YARDS
+                    && d <= WALL_PASS_GIVE_MAX_YARDS
+                    && g.y * attack_dir >= WALL_PASS_GIVE_MIN_FORWARD_YARDS
+                    && self.clear_line(
+                        carrier_pos,
+                        p_pos,
+                        carrier.team.other(),
+                        WALL_PASS_LANE_RADIUS_YARDS,
+                    )
+            })
+            .count() as f64;
+        let competing_runners = self
+            .players
+            .iter()
+            .filter(|p| {
+                p.id != carrier_id
+                    && p.team == carrier.team
+                    && (p.role == PlayerRole::Forward
+                        || (p.role == PlayerRole::Midfielder
+                            && p.preferences.offensive_mindedness
+                                >= p.preferences.defensive_mindedness))
+                    && (self.player_snapshot_position(p).y - carrier_pos.y) * attack_dir
+                        >= WALL_PASS_MIN_RUN_GAIN_YARDS
+            })
+            .count() as f64;
+        Some(GiveAndGoInputs {
+            run_space,
+            man_beatable,
+            partner_open,
+            give_backward_risk,
+            return_backward_risk,
+            give_dist,
+            run_forward_gain,
+            man_dist,
+            goal_proximity,
+            carrier_pressure,
+            runner_forward_speed,
+            competing_walls,
+            competing_runners,
+            analytic_seed: plan.quality,
+        })
+    }
+
+    /// Learned give-and-go appetite multiplier in `[1, ~1.6]` for a carrier with a wall-pass
+    /// available, or `1.0` when the head is off / untrained / no option — so the learned head can
+    /// only ever *lift* the propensity for a one-two it has learned pays off, never suppress the
+    /// analytic appetite (additive recognition, like the forward-option-recognition fix). The
+    /// lift scales the head's prediction relative to the analytic seed it bootstrapped from.
+    pub(crate) fn give_and_go_learned_appetite_lift(&self, carrier_id: usize) -> f64 {
+        if !give_and_go_model_enabled() {
+            return 1.0;
+        }
+        let Some(head) = self
+            .give_and_go_head
+            .as_ref()
+            .filter(|h| h.training_steps() >= GIVE_AND_GO_HEAD_MIN_TRAINING_STEPS)
+        else {
+            return 1.0;
+        };
+        let Some(inputs) = self.build_give_and_go_inputs(carrier_id) else {
+            return 1.0;
+        };
+        let analytic = analytic_give_and_go_invite(&inputs).clamp(0.0, 1.0);
+        let Some(learned) = head.predict(&inputs).map(|p| p.clamp(0.0, 1.0)) else {
+            return 1.0;
+        };
+        // Lift only when the head ranks this one-two ABOVE its analytic seed; map the positive
+        // gap to a bounded multiplicative bonus.
+        (1.0 + (learned - analytic).max(0.0)).clamp(1.0, 1.6)
+    }
+
     /// Decide whether a calm carrier with no good forward outlet should DELAY the release and
     /// summon support — keep the ball (shield/slow) and signal teammates to either push forward
     /// into space ([`SupportSummonKind::MoveForward`]) or step into an open lane / their slot
