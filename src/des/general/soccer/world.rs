@@ -18773,6 +18773,8 @@ impl SoccerMatch {
         let half = goal_side::GOAL_SIDE_CHANNEL_HALF_WIDTH_YARDS;
         let sat = goal_side::GOAL_SIDE_DEPTH_SATURATION_YARDS;
         let ball = after.ball.position;
+        let width = self.config.field_width_yards;
+        let length = self.config.field_length_yards;
         let mut events: Vec<(usize, f64)> = Vec::new();
         for player in after.players.iter() {
             if matches!(player.role, PlayerRole::Goalkeeper | PlayerRole::Forward) {
@@ -18783,7 +18785,7 @@ impl SoccerMatch {
                 continue;
             }
             let position = after.player_position(player.id).unwrap_or(player.position);
-            let own_goal = Vec2::new(self.field_width * 0.5, self.own_goal_y_for(player.team));
+            let own_goal = Vec2::new(width * 0.5, player.team.other().goal_y(length));
             let quality = goal_side::goal_side_quality(position, ball, own_goal, half, sat);
             let shaped =
                 apply_dense_shaping_budget(goal_side::goal_side_shaping_points(quality), budget);
