@@ -1978,7 +1978,7 @@ const SUSTAINED_FORWARD_DRIBBLE_SEGMENT_REWARD_POINTS: f64 = 0.5;
 /// so a continuous forward carry is rewarded at both granularities. Smaller per-segment (there are
 /// twice as many) so the two cadences stay balanced.
 const FORWARD_CARRY_FINE_SEGMENT_YARDS: f64 = 1.0;
-const SUSTAINED_FORWARD_DRIBBLE_FINE_SEGMENT_REWARD_POINTS: f64 = 0.5;
+const SUSTAINED_FORWARD_DRIBBLE_FINE_SEGMENT_REWARD_POINTS: f64 = 0.25;
 /// Cap (1-yard segments) on the fine-cadence sustained-dribble payout — same 20-yard ceiling as the
 /// 2-yard cadence, expressed in 1-yard units.
 const FORWARD_CARRY_MAX_REWARDED_FINE_SEGMENTS: u32 = 20;
