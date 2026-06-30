@@ -44494,6 +44494,84 @@ impl WorldSnapshot {
         None
     }
 
+    /// Invert [`Self::ball_ground_travel_time`]: the launch speed (yps) that makes a decelerating
+    /// ground ball cover `distance` in `target_time` seconds, bounded to the MPC pass-weight
+    /// envelope. Binary search on the monotonic time↔speed relation (a firmer strike ⇒ a shorter
+    /// travel time). `None` when even the envelope max can't arrive that soon. This is the MPC
+    /// "solve for the weight that times the ball to the receiver" — the exact pace, not a guess.
+    fn ball_ground_launch_speed_for_travel(&self, distance: f64, target_time: f64) -> Option<f64> {
+        if !distance.is_finite()
+            || !target_time.is_finite()
+            || distance <= 0.05
+            || target_time <= 1e-3
+        {
+            return None;
+        }
+        let lo_speed = mph_to_yps(MPC_PASS_WEIGHT_MIN_SPEED_MPH);
+        let hi_speed = mph_to_yps(MPC_PASS_WEIGHT_MAX_SPEED_MPH);
+        // The hardest strike gives the shortest travel time; if even that arrives late, give up.
+        let fastest_time = self.ball_ground_travel_time(distance, hi_speed)?;
+        if fastest_time > target_time {
+            return None;
+        }
+        let mut lo = lo_speed;
+        let mut hi = hi_speed;
+        for _ in 0..28 {
+            let mid = 0.5 * (lo + hi);
+            match self.ball_ground_travel_time(distance, mid) {
+                // Arrives LATE (or stalls short ⇒ None) ⇒ needs more pace.
+                Some(t) if t > target_time => lo = mid,
+                None => lo = mid,
+                // Arrives in time / early ⇒ can ease off.
+                Some(_) => hi = mid,
+            }
+        }
+        Some(hi.clamp(lo_speed, hi_speed))
+    }
+
+    /// MPC pass-WEIGHT refinement (gate `DD_SOCCER_ENABLE_MPC_PASS_WEIGHT`): for a ground pass aimed
+    /// at `aim`, solve the launch speed that lands the decelerating ball there exactly as the
+    /// receiver's predicted run reaches it — so the pass is weighted to the receiver instead of a
+    /// heuristic pace (the "too fast / too slow" fix). Unlike [`Self::mpc_pass_execution`] it does
+    /// NOT move the aim point and does NOT require the full MPC-aim gate; it only prices the weight,
+    /// so it improves pass weight even with plain heuristic aiming. `None` (fall back to the
+    /// analytic speed) when the gate is off, the receiver can't reach the aim within the horizon, or
+    /// the solve is infeasible.
+    fn mpc_refined_pass_weight(&self, passer_id: usize, receiver_id: usize, aim: Vec2) -> Option<f64> {
+        if !mpc_pass_weight_enabled() {
+            return None;
+        }
+        let passer = self.players.iter().find(|p| p.id == passer_id)?;
+        let receiver = self.players.iter().find(|p| p.id == receiver_id)?;
+        if receiver.team != passer.team || receiver.role == PlayerRole::Goalkeeper {
+            return None;
+        }
+        let from = self.player_snapshot_position(passer);
+        let dist = from.distance(aim);
+        if dist < 3.0 {
+            return None;
+        }
+        let dt = self.dt_seconds.max(1e-3);
+        let path = self.mpc_predicted_receiver_path(receiver, aim, MPC_PASS_HORIZON_STEPS, dt)?;
+        // The receiver's arrival time at the aim = the horizon step of closest approach to it;
+        // reject when the predicted run never gets within reach (it can't meet the ball there).
+        let mut best_k = None;
+        let mut best_d = f64::INFINITY;
+        for (k, point) in path.iter().enumerate() {
+            let d = point.distance(aim);
+            if d < best_d {
+                best_d = d;
+                best_k = Some(k);
+            }
+        }
+        let k = best_k?;
+        if best_d > MPC_PASS_WEIGHT_MAX_REACH_YARDS {
+            return None;
+        }
+        let arrival_time = (k as f64 * dt).max(dt);
+        self.ball_ground_launch_speed_for_travel(dist, arrival_time)
+    }
+
     /// The receiver's dynamically-feasible predicted run over the horizon, via the point-mass MPC
     /// (it bends around opponents as soft obstacles). Returns `horizon + 1` positions at `dt`
     /// spacing starting at the receiver — the trajectory the pass is led onto.
