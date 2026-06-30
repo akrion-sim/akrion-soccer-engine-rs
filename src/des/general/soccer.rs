@@ -13445,6 +13445,29 @@ pub(crate) fn attack_ambition_enabled() -> bool {
     !*V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_ATTACK_AMBITION").is_ok())
 }
 
+/// Whether the **raised scoop apex** is active this process: a blocked-lane scoop chips ~10-13ft
+/// (`SCOOP_LOFT_APEX_HIGH_*`) instead of 6-9ft so it clears an upright/jumping defender stood in
+/// the lane, not just a standing foot. **Default-ON in production**
+/// (`DD_SOCCER_ENABLE_SCOOP_HIGHER_APEX=0/false/no/off` is the kill switch), read once. **Default-OFF
+/// under test** so the loft-arc / interception parity suites stay byte-identical unless a test opts in.
+pub(crate) fn scoop_higher_apex_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_SCOOP_HIGHER_APEX")
+            .map(|raw| {
+                let v = raw.trim().to_ascii_lowercase();
+                matches!(v.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_SCOOP_HIGHER_APEX"))
+    }
+}
+
 /// Whether the **moderate give-and-go live-frequency bump** is active this process: a modest
 /// extra widening of the wall-pass trigger zone and a lift on the carrier's appetite to combine,
 /// so more one-twos actually appear in live play. **Default-ON in production**
