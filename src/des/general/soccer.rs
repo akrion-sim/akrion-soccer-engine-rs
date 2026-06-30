@@ -1996,14 +1996,8 @@ const SUSTAINED_FORWARD_DRIBBLE_FINE_SEGMENT_REWARD_POINTS: f64 = 0.25;
 /// Cap (1-yard segments) on the fine-cadence sustained-dribble payout — same 20-yard ceiling as the
 /// 2-yard cadence, expressed in 1-yard units.
 const FORWARD_CARRY_MAX_REWARDED_FINE_SEGMENTS: u32 = 20;
-/// Reward points per 2-yard segment of forward carry that CULMINATES in a forward pass or a shot —
-/// the "productive dribble" signal: a carry is only paid off when it leads to a forward pass or a
-/// shot (a carry that ends in a turnover or a backward/square ball earns nothing here). Comparable
-/// per-segment to a forward-pass-chain link so a 6-yard drive into a forward pass rivals the
-/// pass-chain reward it sets up.
-const PRODUCTIVE_FORWARD_CARRY_PER_SEGMENT_REWARD_POINTS: f64 = 1.5;
-/// Cap (segments) on a single productive-carry / sustained-dribble payout so one very long run
-/// can't dominate the sparse goal/possession signal (20 yards of forward carry).
+/// Cap (segments) on the 2-yard-cadence sustained-dribble payout so one very long run can't
+/// dominate the sparse goal/possession signal (20 yards of forward carry).
 const FORWARD_CARRY_MAX_REWARDED_SEGMENTS: u32 = 10;
 /// A pass with at least this much BACKWARD component (yards toward our OWN goal, i.e. -Δy·attack)
 /// is subject to backward-pass discipline. Below this a square/short ball is treated as neutral.
