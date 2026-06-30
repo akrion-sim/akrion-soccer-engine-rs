@@ -89859,45 +89859,47 @@ fn overdribble_dispossession_penalty_truth_table() {
 
 #[test]
 fn carrier_forward_drive_gait_floor_grades_by_space_and_pressure() {
-    let open = CARRIER_DRIVE_TIGHT_PRESSURE_YARDS + 5.0; // not under tight pressure
+    let t = DribbleTuning::default();
+    let open = t.carry_tight_pressure_yards + 5.0; // not under tight pressure
     let fresh = 0.0;
     // Under tight pressure there is NO floor — close control wins, the carrier may walk.
     assert_eq!(
-        carrier_forward_drive_gait_floor(30.0, CARRIER_DRIVE_TIGHT_PRESSURE_YARDS - 0.1, fresh),
+        carrier_forward_drive_gait_floor(30.0, t.carry_tight_pressure_yards - 0.1, fresh, &t),
         None
     );
     // Too little room ahead ⇒ no floor.
     assert_eq!(
-        carrier_forward_drive_gait_floor(CARRIER_DRIVE_JOG_SPACE_YARDS - 0.1, open, fresh),
+        carrier_forward_drive_gait_floor(t.carry_jog_space_yards - 0.1, open, fresh, &t),
         None
     );
     // A couple of clear yards ⇒ at least a jog.
     assert_eq!(
-        carrier_forward_drive_gait_floor(CARRIER_DRIVE_JOG_SPACE_YARDS, open, fresh),
+        carrier_forward_drive_gait_floor(t.carry_jog_space_yards, open, fresh, &t),
         Some(MovementGait::Jog)
     );
     // A clear lane ⇒ a run.
     assert_eq!(
-        carrier_forward_drive_gait_floor(CARRIER_DRIVE_RUN_SPACE_YARDS, open, fresh),
+        carrier_forward_drive_gait_floor(t.carry_run_space_yards, open, fresh, &t),
         Some(MovementGait::Run)
     );
     // Open field ⇒ a sprint (when fresh enough).
     assert_eq!(
-        carrier_forward_drive_gait_floor(CARRIER_DRIVE_SPRINT_SPACE_YARDS, open, fresh),
+        carrier_forward_drive_gait_floor(t.carry_sprint_space_yards, open, fresh, &t),
         Some(MovementGait::Sprint)
     );
     // Open field but gassed ⇒ capped at a run, not a sprint.
     assert_eq!(
         carrier_forward_drive_gait_floor(
-            CARRIER_DRIVE_SPRINT_SPACE_YARDS,
+            t.carry_sprint_space_yards,
             open,
-            CARRIER_DRIVE_SPRINT_MAX_FATIGUE + 0.05
+            t.carry_sprint_max_fatigue + 0.05,
+            &t
         ),
         Some(MovementGait::Run)
     );
     // Non-finite inputs are inert.
-    assert_eq!(carrier_forward_drive_gait_floor(f64::NAN, open, fresh), None);
-    assert_eq!(carrier_forward_drive_gait_floor(30.0, f64::NAN, fresh), None);
+    assert_eq!(carrier_forward_drive_gait_floor(f64::NAN, open, fresh, &t), None);
+    assert_eq!(carrier_forward_drive_gait_floor(30.0, f64::NAN, fresh, &t), None);
 }
 
 #[test]
