@@ -18735,6 +18735,23 @@ const STATIONARY_HOLDER_PRESS_URGENCY_FLOOR: f64 = 1.4;
 /// carrier, so a covered defence presses the ball-holder instead of containing.
 const NUMBERS_UP_PRESS_URGENCY_FLOOR: f64 = 1.5;
 
+/// Whether the **stationary-holder press** is active this process: when an opponent stops on the
+/// ball and nobody is challenging, the nearest defender steps up to engage rather than standing
+/// off. Default-ON in production (env `DD_SOCCER_ENABLE_STATIONARY_HOLDER_PRESS=0/false` is the kill
+/// switch); default-OFF under test so the parity suite stays byte-identical.
+pub(crate) fn stationary_holder_press_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_STATIONARY_HOLDER_PRESS").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_STATIONARY_HOLDER_PRESS"))
+    }
+}
+
 /// Whether **numbers-up defensive pressing** is active this process: when the defending team has
 /// `DEFENSIVE_NUMBERS_UP_BEHIND_BALL_COUNT`+ players behind the ball, the nearest defender presses
 /// the carrier harder. Default-ON in production (env `DD_SOCCER_ENABLE_NUMBERS_UP_PRESS=0/false` is
