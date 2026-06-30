@@ -17771,6 +17771,8 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::Goal
                 | SoccerRewardEventKind::HeaderGoalFromCross
                 | SoccerRewardEventKind::CrashBoxArrival
+                | SoccerRewardEventKind::SustainedForwardDribble
+                | SoccerRewardEventKind::ProductiveForwardCarry
         )
     }
 }
