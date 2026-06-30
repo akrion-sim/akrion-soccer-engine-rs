@@ -5686,6 +5686,27 @@ pub struct IncomingBallContext {
     pub is_aerial: bool,
 }
 
+/// Carrier forward-drive gait floor (the "drive into forward space at pace, don't walk the ball"
+/// rule). An opponent at or inside this radius means close control matters more than speed, so no
+/// floor is applied and the carrier keeps its natural (possibly walking) gait.
+const CARRIER_DRIVE_TIGHT_PRESSURE_YARDS: f64 = 2.5;
+/// Minimum open forward space (yards ahead, clear of opponents in the carry lane) for the carrier to
+/// be floored to at least a jog. Below this there isn't room to open up, so leave the gait alone.
+const CARRIER_DRIVE_JOG_SPACE_YARDS: f64 = 3.0;
+/// Open forward space at/above which the carrier should be running (a clear lane to drive into).
+const CARRIER_DRIVE_RUN_SPACE_YARDS: f64 = 9.0;
+/// Open forward space at/above which the carrier should be sprinting (open field ahead).
+const CARRIER_DRIVE_SPRINT_SPACE_YARDS: f64 = 18.0;
+/// Above this fatigue a carrier with open field is floored to a run rather than a full sprint — too
+/// gassed to safely flat-out sprint with the ball.
+const CARRIER_DRIVE_SPRINT_MAX_FATIGUE: f64 = 0.80;
+/// Minimum forward component (yards toward the opponent goal) of the intended move for the carrier
+/// forward-drive floor to engage — a shield/lateral/backward touch is left untouched.
+const CARRIER_DRIVE_MIN_FORWARD_YARDS: f64 = 1.0;
+/// Half-width (yards) of the carry lane used to measure open forward space directly on the live
+/// player positions — mirrors [`WorldSnapshot::forward_dribble_space_yards`].
+const CARRIER_DRIVE_LANE_HALF_WIDTH_YARDS: f64 = 4.0;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum MovementGait {
