@@ -26149,6 +26149,19 @@ impl WorldSnapshot {
 
         let mut guarded = target;
         guarded.y = self.y_from_own_goal_depth(player.team, target_depth);
+        // True goal-side (MPC bias): legacy depth-guarding only fixed how deep the player sits,
+        // leaving them stranded on their own `x` — a wide full-back was "goal-side" merely by
+        // being deeper than the ball. Shade the target laterally onto the ball→own-goal line at
+        // the guarded depth by a bounded fraction (a bias, not a snap, so the back-line keeps its
+        // width under the other shape forces). Inert ⇒ byte-identical when the gate is off.
+        if goal_side::defensive_goal_side_enabled() {
+            let own_goal = Vec2::new(self.field_width * 0.5, self.own_goal_y_for(player.team));
+            if let Some(line_x) =
+                goal_side::ball_goal_line_x_at_y(self.ball.position, own_goal, guarded.y)
+            {
+                guarded.x += (line_x - guarded.x) * goal_side::GOAL_SIDE_LATERAL_PULL_FRACTION;
+            }
+        }
         guarded.clamp_to_pitch(self.field_width, self.field_length)
     }
 
