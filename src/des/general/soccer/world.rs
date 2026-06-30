@@ -29289,6 +29289,15 @@ impl WorldSnapshot {
                     + defensive_press_contain.contain_risk * 0.28)
                     * defensive_role_urgency,
             )
+            // Off the line / caught upfield ⇒ a bounded lift to recover into the goal-side
+            // channel. Zero when perfectly goal-side, and inert unless the feature applies.
+            .max(if defensive_goal_side_applies {
+                goal_side::goal_side_recovery_urgency(defensive_goal_side_quality)
+                    * goal_side::GOAL_SIDE_URGENCY_WEIGHT
+                    * defensive_role_urgency
+            } else {
+                0.0
+            })
             .clamp(0.0, 1.0);
         let pressure_urgency = if has_ball {
             (perceived_pressure * 0.58
