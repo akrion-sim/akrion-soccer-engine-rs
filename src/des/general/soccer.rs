@@ -1952,6 +1952,34 @@ const TEAM_ADVANCE_CARRIER_DRIVE_REWARD: f64 = 0.30;
 /// Dense shaping reward for an OFF-BALL teammate making a forward supporting run while the team
 /// advances upfield — the "whole team moves forward" signal that pulls runners up with the ball.
 const TEAM_ADVANCE_SUPPORT_RUN_REWARD: f64 = 0.22;
+/// One progressive-carry "segment": every this-many yards the carrier advances the ball FORWARD
+/// (Δy·attack toward the opponent goal; lateral x movement is allowed, only the forward component
+/// counts). Both progressive-carry rewards are denominated in these 2-yard segments. See
+/// [`ForwardCarryTracker`].
+const FORWARD_CARRY_SEGMENT_YARDS: f64 = 2.0;
+/// A single-tick BACKWARD ball movement (yards, Δy·attack negative) larger than this breaks the
+/// sustained-dribble chain: the carrier turned back, so the consecutive-forward-segments counter
+/// and accumulated carry reset. Small jitter below this is tolerated so a near-straight dribble
+/// isn't reset by physics noise.
+const FORWARD_CARRY_BACKWARD_RESET_YARDS: f64 = 1.0;
+/// Minimum forward component (yards, Δy·attack) a released pass must have to count as "a pass
+/// forward" for the productive-carry cash-out — matches the segment size so "carried it forward
+/// then played it forward" is judged on the same 2-yard forward standard.
+const FORWARD_CARRY_FORWARD_PASS_MIN_YARDS: f64 = 2.0;
+/// Reward points per completed 2-yard segment for SUSTAINED forward dribbling — i.e. "2 yards of
+/// forward dribbling followed by 2 more yards". Only segments PAST THE FIRST are paid (a lone
+/// 2-yard nudge earns nothing; the 2nd, 3rd… consecutive segment each earn this), so the signal
+/// rewards a carrier who keeps driving the ball forward, escalating with the length of the run.
+const SUSTAINED_FORWARD_DRIBBLE_SEGMENT_REWARD_POINTS: f64 = 1.0;
+/// Reward points per 2-yard segment of forward carry that CULMINATES in a forward pass or a shot —
+/// the "productive dribble" signal: a carry is only paid off when it leads to a forward pass or a
+/// shot (a carry that ends in a turnover or a backward/square ball earns nothing here). Comparable
+/// per-segment to a forward-pass-chain link so a 6-yard drive into a forward pass rivals the
+/// pass-chain reward it sets up.
+const PRODUCTIVE_FORWARD_CARRY_PER_SEGMENT_REWARD_POINTS: f64 = 1.5;
+/// Cap (segments) on a single productive-carry / sustained-dribble payout so one very long run
+/// can't dominate the sparse goal/possession signal (20 yards of forward carry).
+const FORWARD_CARRY_MAX_REWARDED_SEGMENTS: u32 = 10;
 const PASS_CHAIN_THREE_NET_FORWARD_MIN_YARDS: f64 = 4.0;
 const PASS_CHAIN_EVENT_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(12.0);
 const PASS_AND_MOVE_FORWARD_MIN_YARDS: f64 = 4.0;
