@@ -13799,14 +13799,17 @@ impl SoccerMatch {
                                         || flight.is_aerial())
                             };
                             let unsafe_release = |point: Vec2| {
-                                concedes(point) || favours_opponent(point) || terrible_backward(point)
+                                concedes(point)
+                                    || favours_opponent(point)
+                                    || terrible_backward(point)
+                                    || loses_to_opponent(point)
                             };
                             if unsafe_release(aimed_target) {
                                 if !unsafe_release(receiver_position) {
                                     aimed_target = receiver_position;
                                 } else if !unsafe_release(led_target) {
                                     aimed_target = led_target;
-                                } else if favours_opponent(aimed_target) || veto_on {
+                                } else if favours_opponent(aimed_target) || veto_on || hopeless_on {
                                     // No safe release exists. Keep possession and face the intended
                                     // run instead of forcing the ball to an opponent / hoofing it
                                     // backward. With the veto on, abort on any residual danger; with
