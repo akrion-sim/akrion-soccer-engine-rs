@@ -91520,6 +91520,105 @@ fn buildup_chain_credit_recency_discount() {
     assert_eq!(buildup_chain_credit_points(0.0, 0), 0.0);
 }
 
+/// Serialise the turnover-chain-blame tests that toggle `DD_SOCCER_ENABLE_TURNOVER_CHAIN_BLAME`:
+/// the gate re-reads the env each call under `cfg(test)`, so two of these running concurrently
+/// would see each other's `set_var`.
+fn turnover_chain_blame_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[test]
+fn turnover_chain_blame_discount_curve() {
+    let base = 10.0;
+    // Index 0 is the ball-loser — penalized in full elsewhere, so the chain share is 0.
+    assert_eq!(turnover_chain_blame_points(base, 0), 0.0);
+    let p1 = turnover_chain_blame_points(base, 1);
+    let p2 = turnover_chain_blame_points(base, 2);
+    // 2nd passer = 20% of the loser's penalty, 3rd = 5%; steeply decreasing toward the loser.
+    assert!((p1 - base * 0.20).abs() < 1e-9, "2nd player = 20%: {p1}");
+    assert!((p2 - base * 0.05).abs() < 1e-9, "3rd player = 5%: {p2}");
+    assert!(p1 > p2 && p2 > 0.0, "more-recent passer blamed more: {p1} {p2}");
+    // Beyond the 3-deep chain there is no blame, and a non-positive base is always 0.
+    assert_eq!(turnover_chain_blame_points(base, 3), 0.0);
+    assert_eq!(turnover_chain_blame_points(0.0, 1), 0.0);
+    // A sub-noise share (below the min payout) is dropped to 0: 0.1 × 0.05 = 0.005 < 0.05.
+    assert_eq!(turnover_chain_blame_points(0.1, 2), 0.0);
+}
+
+#[test]
+fn intercepted_pass_spreads_discounted_blame_over_prior_passers() {
+    let _env = turnover_chain_blame_env_lock();
+    std::env::set_var("DD_SOCCER_ENABLE_TURNOVER_CHAIN_BLAME", "1");
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    // Build a Home possession chain 3 → 4 → 5 → 6 (most-recent passer = 6, the ball-loser).
+    for id in [3usize, 4, 5, 6] {
+        sim.record_possession_touch(id);
+    }
+    let mut pass =
+        test_pending_pass(Team::Home, 6, 9, Vec2::new(40.0, 60.0), Vec2::new(48.0, 70.0));
+    pass.receiver_openness = 0.5;
+    let base = intercepted_pass_passer_penalty(&pass, sim.config.field_length_yards);
+
+    let start = sim.reward_events.len();
+    sim.record_interception_reward(12, Some(&pass)); // 12 = Away interceptor.
+    let blame_for = |pid: usize| {
+        sim.reward_events[start..]
+            .iter()
+            .filter(|e| {
+                e.kind == SoccerRewardEventKind::TurnoverChainBlame && e.player_id == pid
+            })
+            .map(|e| e.amount)
+            .sum::<f64>()
+    };
+    let blame_count = sim.reward_events[start..]
+        .iter()
+        .filter(|e| e.kind == SoccerRewardEventKind::TurnoverChainBlame)
+        .count();
+    // Only the two PRIOR passers are blamed (5 then 4); the ball-loser (6) keeps the full penalty
+    // separately and the 4th-back toucher (3) is outside the 3-deep window.
+    assert_eq!(blame_count, 2, "exactly the previous two passers are blamed");
+    assert!(
+        (blame_for(5) + base * 0.20).abs() < 1e-9,
+        "immediately-preceding passer = 20% of the loser's penalty: {}",
+        blame_for(5)
+    );
+    assert!(
+        (blame_for(4) + base * 0.05).abs() < 1e-9,
+        "the passer before that = 5% of the loser's penalty: {}",
+        blame_for(4)
+    );
+    assert_eq!(blame_for(6), 0.0, "ball-loser gets no discounted blame share");
+    assert_eq!(blame_for(3), 0.0, "4th-back toucher is outside the blame window");
+    // The ball-loser still carries the full (100%) penalty via the normal interception path.
+    let loser_penalty = sim.reward_events[start..]
+        .iter()
+        .filter(|e| {
+            e.player_id == 6 && e.kind != SoccerRewardEventKind::TurnoverChainBlame
+        })
+        .map(|e| e.amount)
+        .sum::<f64>();
+    assert!(
+        (loser_penalty + base).abs() < 1e-9,
+        "ball-loser keeps the full penalty: {loser_penalty} vs -{base}"
+    );
+
+    // Gate OFF ⇒ no blame events at all (byte-identical to the prior behaviour). Under
+    // `cfg(test)` the gate is keyed on the var being SET (any value), so disabling = remove it.
+    std::env::remove_var("DD_SOCCER_ENABLE_TURNOVER_CHAIN_BLAME");
+    for id in [3usize, 4, 5, 6] {
+        sim.record_possession_touch(id);
+    }
+    let off_start = sim.reward_events.len();
+    sim.record_interception_reward(12, Some(&pass));
+    assert!(
+        sim.reward_events[off_start..]
+            .iter()
+            .all(|e| e.kind != SoccerRewardEventKind::TurnoverChainBlame),
+        "gate off ⇒ no chain-blame events"
+    );
+}
+
 #[test]
 fn release_long_inside_own_half_qualifies_truth_table() {
     let halfway = 60.0; // field_length/2 in adv units

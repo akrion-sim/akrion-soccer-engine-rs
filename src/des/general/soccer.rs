@@ -1737,6 +1737,22 @@ const DEFENSIVE_POSITIONING_FOCUS_LP_REWARD_MULTIPLIER: f64 = 2.25;
 // "keep the ball" over "gamble it forward".
 const LOST_POSSESSION_CHAIN_PENALTY_POINTS: f64 = 10.0;
 const LOST_POSSESSION_CHAIN_PENALTY_WEIGHTS: [f64; 3] = [0.55, 0.30, 0.15];
+// --- Discounted turnover-chain blame (gated DD_SOCCER_ENABLE_TURNOVER_CHAIN_BLAME) ---
+// A bad pass that is intercepted (`record_interception_reward`) penalizes the player who lost
+// the ball in full, but the previous one/two passers who built the doomed move escape untouched.
+// This blame term spreads a STEEPLY discounted share of the loser's OWN penalty back over those
+// prior passers — so the build-up gets a small corrective gradient too, not just the final
+// (often forced) touch. The discount is a fraction of the ball-loser's penalty by recency:
+// index 0 is the ball-loser (100% — applied in full by the interception handler, so this array
+// only documents it and the blame loop SKIPS it), index 1 the immediately-preceding passer
+// (20%), index 2 the one before that (5%). Steeper than `LOST_POSSESSION_CHAIN_PENALTY_WEIGHTS`
+// on purpose: blame should concentrate hard on the player who actually gave it away. Targeted
+// per-player credit assignment, complementary to the net-Φ PBRS danger asymmetry and
+// MARL/MAPPO's global team-reward share; off by default under test so the parity suite is
+// byte-identical.
+const TURNOVER_CHAIN_BLAME_DISCOUNTS: [f64; 3] = [1.0, 0.20, 0.05];
+// Below this the discounted blame is dropped (negligible tail / sub-noise nudge).
+const TURNOVER_CHAIN_BLAME_MIN_POINTS: f64 = 0.05;
 // Beyond the immediate possession-chain penalty above, a turnover also retroactively
 // penalizes the LOSING team's actions over the last ~5 seconds: every learning transition
 // for that team in the window is re-queued with a recency-scaled negative reward (full at
@@ -18243,6 +18259,14 @@ pub(crate) enum SoccerRewardEventKind {
     /// position was the mistake. Emitted only when `DD_SOCCER_ENABLE_OVERDRIBBLE_PENALTY` is on. See
     /// [`overdribble_dispossession_penalty_points`].
     OverdribbleDispossession,
+    /// PENALTY (negative): DISCOUNTED turnover-chain blame — when a pass is intercepted, a steeply
+    /// discounted share of the ball-loser's penalty is spread back over the one or two PREVIOUS
+    /// passers who built the lost move (20% to the immediately-preceding passer, 5% to the one
+    /// before). The ball-loser keeps the full penalty separately; this term only hits the prior
+    /// build-up, so the policy learns that feeding a doomed move carries a small cost too — not
+    /// just the final touch. The negative mirror of `BuildupChainCredit`. Emitted only when
+    /// `DD_SOCCER_ENABLE_TURNOVER_CHAIN_BLAME` is on. See `record_turnover_chain_blame`.
+    TurnoverChainBlame,
     MatchResult,
 }
 
@@ -18270,6 +18294,7 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::WallPassCombination
                 | SoccerRewardEventKind::ReleaseLongInsideOwnHalf
                 | SoccerRewardEventKind::OverdribbleDispossession
+                | SoccerRewardEventKind::TurnoverChainBlame
                 | SoccerRewardEventKind::MatchResult
         )
     }
@@ -19242,6 +19267,48 @@ pub(crate) fn buildup_chain_credit_points(base_points: f64, recency_index: usize
     }
     let amount = base_points * BUILDUP_CHAIN_CREDIT_RECENCY_DISCOUNT.powi(recency_index as i32);
     if amount >= BUILDUP_CHAIN_CREDIT_MIN_POINTS {
+        amount
+    } else {
+        0.0
+    }
+}
+
+/// Whether **discounted turnover-chain blame** is active this process. When a pass is intercepted,
+/// the player who lost the ball already carries the full penalty; this spreads a steeply
+/// discounted share of that same penalty back over the one or two passers who built the lost
+/// move (`TURNOVER_CHAIN_BLAME_DISCOUNTS`: 20% to the immediately-preceding passer, 5% to the one
+/// before), so the build-up that fed a doomed move gets a small corrective gradient too. The
+/// negative mirror of `buildup_chain_credit_enabled`; complementary to the net-Φ PBRS danger
+/// asymmetry and MARL/MAPPO's global team-reward share. Default-ON in production (env
+/// `DD_SOCCER_ENABLE_TURNOVER_CHAIN_BLAME=0/false` is the kill switch); default-OFF under test so
+/// the reward-parity suite stays byte-identical. See `record_turnover_chain_blame`.
+pub(crate) fn turnover_chain_blame_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_TURNOVER_CHAIN_BLAME").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_TURNOVER_CHAIN_BLAME"))
+    }
+}
+
+/// Discounted blame (points, POSITIVE magnitude) for the k-th most-recent passer in a turnover
+/// chain: `base_penalty · TURNOVER_CHAIN_BLAME_DISCOUNTS[k]`, floored to 0 below the min payout.
+/// `recency_index` 0 is the ball-loser, who is penalized in full by the interception handler, so
+/// this returns 0 there — the blame loop applies indices 1.. only. Pure so the discount curve is
+/// unit-tested directly. See [`turnover_chain_blame_enabled`].
+pub(crate) fn turnover_chain_blame_points(base_penalty: f64, recency_index: usize) -> f64 {
+    if base_penalty <= 0.0 || recency_index == 0 {
+        return 0.0;
+    }
+    let Some(discount) = TURNOVER_CHAIN_BLAME_DISCOUNTS.get(recency_index).copied() else {
+        return 0.0;
+    };
+    let amount = base_penalty * discount;
+    if amount >= TURNOVER_CHAIN_BLAME_MIN_POINTS {
         amount
     } else {
         0.0
@@ -33396,6 +33463,7 @@ fn soccer_requested_tactical_feature_gate_names() -> Vec<String> {
         "DD_SOCCER_ENABLE_BACKWARD_PASS_DISCIPLINE",
         "DD_SOCCER_ENABLE_MPC_PASS_WEIGHT",
         "DD_SOCCER_ENABLE_BUILDUP_CHAIN_CREDIT",
+        "DD_SOCCER_ENABLE_TURNOVER_CHAIN_BLAME",
         "DD_SOCCER_ENABLE_GROUND_PASS_SPEED_FLOOR",
         "DD_SOCCER_ENABLE_NUMBERS_UP_PRESS",
         "DD_SOCCER_ENABLE_STATIONARY_HOLDER_PRESS",
