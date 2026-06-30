@@ -8096,7 +8096,16 @@ impl PlayerAgent {
                         >= LOOSE_BALL_POUNCE_CLOSING_YPS
             };
             let fifty_fifty_duel = loose_ball_fifty_fifty_duel_for(snapshot, self.id);
-            if (ball_gap <= LOOSE_BALL_POUNCE_RADIUS_YARDS || approaching || fifty_fifty_duel)
+            // A loose ball that has sat UNCONTESTED (nobody closing) for a moment must be gone
+            // after from any distance — otherwise a motionless ball in a gap just sits there while
+            // both teams hold shape (last-touch team thinks it still "has" it, the other defends).
+            // The committed-chaser election still limits this to the closest retriever(s) per team,
+            // so it is a contest, not a swarm.
+            let stalled_loose = snapshot.loose_ball_urgency_active();
+            if (ball_gap <= LOOSE_BALL_POUNCE_RADIUS_YARDS
+                || approaching
+                || fifty_fifty_duel
+                || stalled_loose)
                 && snapshot.is_committed_loose_ball_chaser(self.id)
             {
                 let (intercept, _trap_now, _ball_speed) =
