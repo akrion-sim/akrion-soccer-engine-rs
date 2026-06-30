@@ -13625,9 +13625,8 @@ impl SoccerMatch {
             SoccerAction::Shoot { power } => {
                 let mut release_facing = action_facing;
                 if self.ball.holder == Some(player_id) {
-                    // PRODUCTIVE forward carry (Reward A): a dribble that ends in a SHOT is always a
-                    // productive finish to the carry — cash it out in 2-yard segments.
-                    self.cash_out_productive_forward_carry(player_id);
+                    // (Productive carry-into-shot is rewarded by `record_progressive_carry_outcome_reward`
+                    // at shot resolution; the live carry tracker resets itself once the ball is struck.)
                     // The ball altitude before this contact overwrites it: a finish struck while
                     // the ball is up in the heading band is an aerial (headed) finish — the signal
                     // the flank crash-the-box bonus keys off.
