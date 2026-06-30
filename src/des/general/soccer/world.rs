@@ -43764,13 +43764,13 @@ impl WorldSnapshot {
                 0.0
             };
             let angle_fit = (1.0 + dribble_touch_angle_weight(kind, bucket)).ln();
-            let score = angle_fit * 1.18
+            let score = angle_fit * dribble_tuning.direction_angle_fit_weight
                 + forward_score
                 + defender_score
                 + lateral_room_score
                 + protect_score
-                + mpc_control.control_probability * 0.48
-                + mpc_control.qp_accel_fit * 0.30
+                + mpc_control.control_probability * dribble_tuning.direction_mpc_control_weight
+                + mpc_control.qp_accel_fit * dribble_tuning.direction_mpc_accel_weight
                 + (mpc_control.space_margin_yards / 5.0).clamp(-0.35, 0.45) * 0.24
                 + occupancy.open_space_score * 0.12
                 - occupancy.teammate_occupied_space_penalty(0.0) * 0.18
