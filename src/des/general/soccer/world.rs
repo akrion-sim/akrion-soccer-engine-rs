@@ -13675,6 +13675,26 @@ impl SoccerMatch {
                             );
                         }
                     }
+                    // MARL/MAPPO "release long inside own half": reward a forward LONG ball played to
+                    // a teammate who broke beyond the opponent's last outfield defender but is ONSIDE
+                    // in our own half (you cannot be offside in your own half) — the line-breaking
+                    // ball that punishes a high press.
+                    if release_long_own_half_enabled()
+                        && release_distance >= RELEASE_LONG_MIN_DISTANCE_YARDS
+                        && pass_forward_yards >= RELEASE_LONG_MIN_AHEAD_OF_BALL_YARDS
+                    {
+                        if let Some((rid, _)) =
+                            snapshot.release_long_inside_own_half_target(player_team)
+                        {
+                            if target_id == Some(rid) {
+                                self.record_reward_event_with_kind(
+                                    player_id,
+                                    RELEASE_LONG_INSIDE_OWN_HALF_REWARD_POINTS,
+                                    SoccerRewardEventKind::ReleaseLongInsideOwnHalf,
+                                );
+                            }
+                        }
+                    }
                     self.register_flank_crash_box_cross(
                         player_team,
                         player_id,
