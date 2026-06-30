@@ -14808,6 +14808,30 @@ impl SoccerMatch {
         } else {
             gait
         };
+        // CARRIER FORWARD-DRIVE GAIT FLOOR (gated, default-ON): a player ON THE BALL driving into
+        // open forward space should jog/run/sprint into it as the first inclination — not knock the
+        // ball forward and walk after it. Graded by the room ahead (more clear space ⇒ a higher
+        // gear) and only ever applied as an UPSHIFT, so close control under pressure and any
+        // lateral/backward touch are left exactly as before. Placed before `commit_gait` so the
+        // upshift is free (the momentum model only holds DOWNshifts for a dwell).
+        let gait = if carrier_forward_drive_enabled()
+            && self.ball.holder == Some(player_id)
+            && !gait.is_backward()
+            && to_target.y * attack_dir > CARRIER_DRIVE_MIN_FORWARD_YARDS
+        {
+            let (forward_space, nearest_opp) =
+                self.carrier_forward_space_and_pressure(me_pos, my_team);
+            match carrier_forward_drive_gait_floor(
+                forward_space,
+                nearest_opp,
+                self.players[player_id].fatigue,
+            ) {
+                Some(floor) if floor.effort_tier() > gait.effort_tier() => floor,
+                _ => gait,
+            }
+        } else {
+            gait
+        };
         // Locomotion momentum: a decision is instant, but the body carries the effort
         // it has committed to — it can't oscillate sprint↔run tick-to-tick. Once an
         // effort tier is entered it is held for the dwell before changing, EXCEPT a
