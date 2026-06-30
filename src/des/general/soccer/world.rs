@@ -13558,15 +13558,13 @@ impl SoccerMatch {
                             SoccerRewardEventKind::IsolatedCarrierPanicBackPass,
                         );
                     }
-                    // PRODUCTIVE forward carry (Reward A): a dribble that ends in a FORWARD pass is
-                    // cashed out in 2-yard segments; a backward/square pass drops the carry unpaid.
+                    // Forward component of this pass (used by the backward-pass penalty below). The
+                    // productive-carry-into-pass reward is handled by
+                    // `record_progressive_carry_outcome_reward` (on pass completion); the live carry
+                    // tracker here only feeds the per-tick SUSTAINED-dribble reward and resets itself
+                    // when the ball leaves the carrier.
                     let pass_forward_yards =
                         (release_target.y - player_pos.y) * player_team.attack_dir();
-                    if pass_forward_yards >= FORWARD_CARRY_FORWARD_PASS_MIN_YARDS {
-                        self.cash_out_productive_forward_carry(player_id);
-                    } else {
-                        self.clear_forward_carry_tracker(player_id);
-                    }
                     // BACKWARD-PASS DISCIPLINE (penalty): a pass played backward (toward our own
                     // goal) is only justified under genuine high pressure — an opponent within
                     // BACKWARD_PASS_HIGH_PRESSURE_RADIUS of the passer (the case near the
