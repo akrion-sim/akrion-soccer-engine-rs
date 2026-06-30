@@ -18534,6 +18534,25 @@ pub(crate) fn progressive_carry_reward_enabled() -> bool {
     }
 }
 
+/// Whether **backward-pass discipline** is active this process. Emits a training PENALTY for a
+/// pass played backward (toward our own goal) when the passer is NOT under genuine high pressure —
+/// no opponent within `BACKWARD_PASS_HIGH_PRESSURE_RADIUS_YARDS` — scaled by how far back the ball
+/// goes. Trains the policy that a backward recycle is a high-pressure escape, not a default outlet.
+/// Default-ON in production (env `DD_SOCCER_ENABLE_BACKWARD_PASS_DISCIPLINE=0/false` is the kill
+/// switch); default-OFF under test so the reward-parity suite stays byte-identical.
+pub(crate) fn backward_pass_discipline_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_BACKWARD_PASS_DISCIPLINE").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_BACKWARD_PASS_DISCIPLINE"))
+    }
+}
+
 /// Master gate for the "outside mid attack defender" attacking play. When set, the team-strategy
 /// heuristic proposes [`TeamAttackStrategy::OutsideMidAttackDefenderLeft`]/`Right` for a wide
 /// carrier driving the flank in the opponent half. Unset (default) the strategy is never proposed,
