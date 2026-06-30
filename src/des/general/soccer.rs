@@ -18722,10 +18722,35 @@ pub(crate) fn buildup_chain_credit_points(base_points: f64, recency_index: usize
 
 /// Number of a team's players that must be goalside of the ball for a defensive NUMBERS-UP press.
 const DEFENSIVE_NUMBERS_UP_BEHIND_BALL_COUNT: usize = 7;
+/// Max carrier speed (yps) to count as a STOPPED holder for the stationary-holder press.
+const STATIONARY_HOLDER_PRESS_MAX_SPEED_YPS: f64 = 2.0;
+/// The nearest defender presses a stopped holder only when standing off by more than this (yds) —
+/// i.e. nobody is currently challenging — so an already-engaged defender isn't double-counted.
+const STATIONARY_HOLDER_PRESS_RADIUS_YARDS: f64 = 3.5;
+/// Press-urgency floor for the nearest defender against a stopped, unchallenged holder (> 1 fires
+/// the positional step-up onto the carrier).
+const STATIONARY_HOLDER_PRESS_URGENCY_FLOOR: f64 = 1.4;
 /// Press-urgency floor applied to the nearest defender when the defence is numbers-up behind the
 /// ball: `> 1.0` both firms the tackle commitment AND triggers the positional step-up onto the
 /// carrier, so a covered defence presses the ball-holder instead of containing.
 const NUMBERS_UP_PRESS_URGENCY_FLOOR: f64 = 1.5;
+
+/// Whether the **stationary-holder press** is active this process: when an opponent stops on the
+/// ball and nobody is challenging, the nearest defender steps up to engage rather than standing
+/// off. Default-ON in production (env `DD_SOCCER_ENABLE_STATIONARY_HOLDER_PRESS=0/false` is the kill
+/// switch); default-OFF under test so the parity suite stays byte-identical.
+pub(crate) fn stationary_holder_press_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_STATIONARY_HOLDER_PRESS").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_STATIONARY_HOLDER_PRESS"))
+    }
+}
 
 /// Whether **numbers-up defensive pressing** is active this process: when the defending team has
 /// `DEFENSIVE_NUMBERS_UP_BEHIND_BALL_COUNT`+ players behind the ball, the nearest defender presses
@@ -18741,6 +18766,31 @@ pub(crate) fn defensive_numbers_up_press_enabled() -> bool {
         use std::sync::OnceLock;
         static V: OnceLock<bool> = OnceLock::new();
         *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_NUMBERS_UP_PRESS"))
+    }
+}
+
+/// Backward distance (yards toward our own goal) at/above which a pass is a candidate "terrible
+/// back-pass" giveaway — vetoed at release when aerial or played under pressure.
+const LONG_BACKWARD_PASS_VETO_YARDS: f64 = 10.0;
+/// Pressure at/above which a long backward GROUND pass also counts as a giveaway (an aerial long
+/// backward ball is always a giveaway regardless of pressure).
+const TERRIBLE_BACKWARD_PASS_PRESSURE: f64 = 0.35;
+
+/// Whether the **terrible-pass veto** is active this process: at release, a pass with no safe aim
+/// (it would be conceded/occluded to an opponent) or a long backward giveaway (10+ yds back, aerial
+/// or under pressure) is ABORTED — the carrier keeps the ball and faces up instead of gifting it.
+/// Default-ON in production (env `DD_SOCCER_ENABLE_TERRIBLE_PASS_VETO=0/false` is the kill switch);
+/// default-OFF under test so the pass parity suite stays byte-identical.
+pub(crate) fn terrible_pass_veto_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_TERRIBLE_PASS_VETO").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_TERRIBLE_PASS_VETO"))
     }
 }
 
@@ -32536,6 +32586,8 @@ fn soccer_requested_tactical_feature_gate_names() -> Vec<String> {
         "DD_SOCCER_ENABLE_BUILDUP_CHAIN_CREDIT",
         "DD_SOCCER_ENABLE_GROUND_PASS_SPEED_FLOOR",
         "DD_SOCCER_ENABLE_NUMBERS_UP_PRESS",
+        "DD_SOCCER_ENABLE_STATIONARY_HOLDER_PRESS",
+        "DD_SOCCER_ENABLE_TERRIBLE_PASS_VETO",
         "DD_SOCCER_ENABLE_BLINDSIDE_STEAL",
         crash_box::FLANK_CRASH_BOX_ENABLE_ENV,
         "DD_SOCCER_ENABLE_SLIP_BREAK_OFFSIDE",
