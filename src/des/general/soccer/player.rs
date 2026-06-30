@@ -23,6 +23,8 @@ const PINNED_SHIELD_FLOOR_LIFT: f64 = 1.20;
 // (observation `pressured_escape_lane_yards`, not pitch-edge room) should break contact with the
 // dedicated evade rather than dwell on a static shield. A full lane is this many yards.
 const FIRST_TOUCH_ESCAPE_LANE_MIN_YARDS: f64 = 4.0;
+const FIRST_TIME_PASS_MIN_FIELD_FEASIBILITY: f64 = 0.26;
+const FIRST_TIME_PASS_LOW_FIT_CONTROL_LIFT: f64 = 0.18;
 // Floor lift for the side-step escape (analogue of PINNED_SHIELD_FLOOR_LIFT): sized so a strong
 // fresh-receipt-escape signal floors the evade above the pinned no-outlet shield.
 const FIRST_TOUCH_ESCAPE_SIDE_STEP_FLOOR_LIFT: f64 = 2.7;
@@ -3696,6 +3698,9 @@ impl PlayerAgent {
             && flank_lane_fit >= BYLINE_DRIVE_MIN_WIDTH_FROM_CENTER
             && directive.attack_strategy == TeamAttackStrategy::CrashTheBox
             && directive.flank_attack_policy.is_flank();
+        let advance_upfield_strategy_active = dd_soccer_advance_upfield_strategy_enabled()
+            && directive.attack_strategy == TeamAttackStrategy::AdvanceUpfield
+            && self.role != PlayerRole::Goalkeeper;
         // A ball-carrying keeper under proximate pressure should strongly prefer a
         // release, but it is no longer illegal to carry with the feet. The risk is
         // modeled as a score damp on carry/dribble options plus a lift to release
@@ -3935,6 +3940,12 @@ impl PlayerAgent {
         let mut hold_release_multiplier = release_after_hold_multiplier(observation, dribbling);
         let poor_floor_pass = (1.0 - floor_pass_quality).clamp(0.0, 1.0);
         let forward_space_fit = (observation.forward_dribble_space_yards / 18.0).clamp(0.0, 1.0);
+        let advance_upfield_carry_multiplier = if advance_upfield_strategy_active {
+            (1.06 + forward_space_fit * 0.34 + (1.0 - pressure).clamp(0.0, 1.0) * 0.10)
+                .clamp(1.06, 1.50)
+        } else {
+            1.0
+        };
         let patient_dribble_lift = (1.0
             + patience_factor * poor_floor_pass * (0.42 + forward_space_fit * 0.50))
             .clamp(1.0, 1.38);
@@ -4141,6 +4152,7 @@ impl PlayerAgent {
             * (1.0 - pressure * 0.24).clamp(0.70, 1.0)
             * (1.0 - pressured_good_outlet * 0.44).clamp(0.50, 1.0)
             * (1.0 + solo_goal_drive_fit * 0.58)
+            * advance_upfield_carry_multiplier
             // Carrying forward INTO pressure is the worst option for a deep player — damp it
             // hard for anyone outside the three most-forward when there's real risk ahead.
             * (1.0 - dribble_risk * (1.0 - advanced_dribbler_fit) * 0.40).clamp(0.45, 1.0)
@@ -4168,6 +4180,7 @@ impl PlayerAgent {
                 + forward_space_fit * 0.30
                 + solo_goal_drive_fit * 0.42
                 + self.preferences.offensive_mindedness.clamp(0.0, 1.0) * 0.18)
+            * advance_upfield_carry_multiplier
             * (1.0 - pressure * 0.16).clamp(0.76, 1.0))
         .clamp(0.01, 1.54)
         .max(if solo_goal_drive_fit > 0.0 {
@@ -5632,6 +5645,22 @@ impl PlayerAgent {
             }
             ensure_min_legal_option_probability(&mut options, "carry-forward", accel_floor);
         }
+        if advance_upfield_strategy_active
+            && carry_forward_legal
+            && !goal_attack_shot_blocks_alternatives
+        {
+            let runway_lift =
+                (1.0 + forward_space_fit * 0.28 + (1.0 - pressure).clamp(0.0, 1.0) * 0.08)
+                    .clamp(1.08, 1.42);
+            scale_legal_option_score(&mut options, "carry-forward", runway_lift);
+            scale_legal_option_score(&mut options, "vertical-attack", runway_lift);
+            let runway_floor = (0.34 + forward_space_fit * 0.20).clamp(0.34, 0.58);
+            ensure_min_legal_option_family_probability(
+                &mut options,
+                &["carry-forward", "vertical-attack"],
+                runway_floor,
+            );
+        }
         let mut options = normalize_action_options(options);
         annotate_tick_probabilities_from_scores(&mut options, dt_seconds);
         options
@@ -5658,7 +5687,7 @@ impl PlayerAgent {
             "control-touch"
         };
         let shot_legal = first_time_shot_decision_is_qualified_for_role(observation, self.role);
-        let pass_legal = pass_target_count > 0;
+        let pass_has_target = pass_target_count > 0;
         let flick_on_legal = is_aerial && aerial_pass_target_count > 0;
         let quick_pressure_bonus = 1.0
             + observation.perceived_pressure.clamp(0.0, 1.0) * 0.24
@@ -5711,6 +5740,17 @@ impl PlayerAgent {
             && observation.yards_to_goal <= KILLER_PASS_MAX_YARDS_TO_GOAL
             && !clean_twenty_yard_shot_is_qualified(observation, self.role)
             && killer_pressure >= 0.32;
+        let quick_forward_release = observation.quick_forward_pass_value > 0.0
+            && observation.quick_forward_pass_target.is_some();
+        let pass_legal = pass_has_target
+            && (pass_field_fit >= FIRST_TIME_PASS_MIN_FIELD_FEASIBILITY
+                || quick_forward_release
+                || killer_pass_legal);
+        let low_fit_control_lift = if pass_has_target && !pass_legal {
+            FIRST_TIME_PASS_LOW_FIT_CONTROL_LIFT
+        } else {
+            0.0
+        };
         let killer_pass_score = (observation.first_time_pass_score
             * quick_pressure_bonus
             * pass_field_multiplier
@@ -5767,6 +5807,7 @@ impl PlayerAgent {
                 control_label,
                 (observation.control_touch_score
                     * control_field_multiplier
+                    * (1.0 + low_fit_control_lift)
                     * (1.12 - observation.perceived_pressure * 0.18))
                     .clamp(0.02, 0.95),
                 true,
@@ -5851,6 +5892,8 @@ impl PlayerAgent {
         let directive = snapshot.tactical_directive(self.team);
         let exploit_space_strategy_active =
             matches!(directive.attack_strategy, TeamAttackStrategy::ExploitSpace);
+        let advance_upfield_strategy_active = dd_soccer_advance_upfield_strategy_enabled()
+            && matches!(directive.attack_strategy, TeamAttackStrategy::AdvanceUpfield);
         let crash_box_strategy_active =
             matches!(directive.attack_strategy, TeamAttackStrategy::CrashTheBox);
         let possession_team = snapshot.controlled_possession_team();
@@ -5876,7 +5919,8 @@ impl PlayerAgent {
                 .attacking_carrier_driving_at_goal(self.team)
                 .is_some()
             || backfield_long_pass_run >= BACKFIELD_LONG_PASS_RUN_MIN_INVITE
-            || snapshot.forward_attacking_momentum(self.team);
+            || snapshot.forward_attacking_momentum(self.team)
+            || advance_upfield_strategy_active;
         let shape_support_urgency = attacking_shape_support_urgency(snapshot, self.team);
         let holder_pressure_urgency = holder_pressure_support_urgency(snapshot, self.team);
         let support_urgency =
@@ -5898,6 +5942,18 @@ impl PlayerAgent {
         if flank_policy_active {
             roam_weight =
                 (roam_weight + directive.flank_overlap_run_probability * 0.18).clamp(0.10, 0.72);
+        }
+        if possession_team == Some(self.team) && advance_upfield_strategy_active {
+            let advance_roam_bonus = if self.role == PlayerRole::Forward {
+                0.18
+            } else if wide_midfielder {
+                0.22
+            } else if attacking_midfielder {
+                0.16
+            } else {
+                0.08
+            };
+            roam_weight = (roam_weight + advance_roam_bonus).clamp(0.10, 0.82);
         }
         if holder_pressure_urgency >= 0.22 {
             roam_weight = (roam_weight + holder_pressure_urgency * 0.22).clamp(0.10, 0.76);
@@ -6028,6 +6084,7 @@ impl PlayerAgent {
                     0.68 + shape_support_urgency * 0.10
                         + holder_pressure_urgency * 0.18
                         + backfield_long_pass_run * 0.46
+                        + if advance_upfield_strategy_active { 0.24 } else { 0.0 }
                         + run_prediction.weight_for_label("run-in-behind") * 0.58
                         + run_prediction.off_ball_pitch_value_score_lift(),
                 ),
@@ -6042,6 +6099,7 @@ impl PlayerAgent {
                     target,
                     0.66 + shape_support_urgency * 0.16
                         + holder_pressure_urgency * 0.14
+                        + if advance_upfield_strategy_active { 0.26 } else { 0.0 }
                         + run_prediction.weight_for_label("exploit-space-run") * 0.54
                         + run_prediction.off_ball_pitch_value_score_lift(),
                 ),
@@ -8448,7 +8506,10 @@ impl PlayerAgent {
                         }
                     }
                     "first-time-pass" if !pass_targets.is_empty() => {
-                        let target = pass_targets[0];
+                        let target = observation
+                            .quick_forward_pass_target
+                            .filter(|id| pass_targets.contains(id))
+                            .unwrap_or(pass_targets[0]);
                         let candidate_label = "first-time-pass".to_string();
                         let candidate_action = SoccerAction::Pass {
                             target_player: Some(target),
