@@ -14388,8 +14388,17 @@ impl SoccerMatch {
         // The faster you move, the harder it is to drive the ball against that momentum — a
         // sprint can't reverse-blast (it forces a settling touch first), a jog keeps most power.
         let penalty = KICK_AGAINST_MOMENTUM_PENALTY * (0.5 + speed_frac);
-        let floor = KICK_POWER_FACTOR_FLOOR
-            - speed_frac * (KICK_POWER_FACTOR_FLOOR - KICK_REVERSE_AT_SPRINT_FLOOR);
+        // No artificial bias against passing in stride: kicking against your momentum is harder by a
+        // MARGIN, not nearly impossible. The softer floor keeps a running/sprinting pass viable
+        // (the physics still costs power, and the facing/accuracy model + MPC pass-weight price the
+        // rest), instead of collapsing it so hard that the player is forced to stop to pass. Gate
+        // off ⇒ the original (harsher) floors, byte-identical.
+        let (base_floor, sprint_floor) = if in_stride_pass_margin_enabled() {
+            (IN_STRIDE_KICK_POWER_FLOOR, IN_STRIDE_KICK_SPRINT_POWER_FLOOR)
+        } else {
+            (KICK_POWER_FACTOR_FLOOR, KICK_REVERSE_AT_SPRINT_FLOOR)
+        };
+        let floor = base_floor - speed_frac * (base_floor - sprint_floor);
         return (1.0 - against * penalty).clamp(floor, 1.0);
     }
 
