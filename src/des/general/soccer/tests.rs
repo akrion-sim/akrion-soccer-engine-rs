@@ -89745,6 +89745,24 @@ fn buildup_chain_credit_recency_discount() {
 }
 
 #[test]
+fn release_long_inside_own_half_qualifies_truth_table() {
+    let halfway = 60.0; // field_length/2 in adv units
+    // Opponent pressing high: their offside line (last outfield defender) is at adv 30 — in our
+    // own half. A teammate at adv 45 is BEYOND the line yet still in our half (onside), well ahead
+    // of a ball at adv 20 ⇒ a valid release-long target.
+    assert!(release_long_inside_own_half_qualifies(45.0, 30.0, 20.0, halfway));
+    // Same teammate but PAST halfway (adv 62) ⇒ now in the opponent half ⇒ genuinely offside, reject.
+    assert!(!release_long_inside_own_half_qualifies(62.0, 30.0, 20.0, halfway));
+    // Not beyond the line (adv 31 vs line 30, below the min-beyond margin) ⇒ reject.
+    assert!(!release_long_inside_own_half_qualifies(31.0, 30.0, 20.0, halfway));
+    // Not meaningfully ahead of the ball (ball at adv 44) ⇒ not a forward long ball ⇒ reject.
+    assert!(!release_long_inside_own_half_qualifies(45.0, 30.0, 44.0, halfway));
+    // A normal deep line (offside line at adv 50, opponent half) ⇒ a teammate beyond it is past
+    // halfway, so this strategy never fires against a deep block (correct).
+    assert!(!release_long_inside_own_half_qualifies(55.0, 50.0, 20.0, halfway));
+}
+
+#[test]
 fn ground_pass_speed_floor_lifts_ghost_passes_but_respects_caps() {
     let floor_yps = mph_to_yps(GROUND_PASS_MIN_RELEASE_MPH);
     // A short-pass ghost (~1yps, low intended) is lifted to the absolute viable pace.
