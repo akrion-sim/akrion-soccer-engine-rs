@@ -10241,20 +10241,13 @@ impl SoccerMatch {
         shooter: usize,
     ) {
         self.record_possession_touch(shooter);
-<<<<<<< HEAD
+        // My additive buildup credit (last 10, recency-discounted) on top of the incoming
+        // weighted possession-chain shot-attempt reward (which replaced the old fixed pattern).
         self.record_buildup_chain_credit(
             shooting_team,
             Some(shooter),
             BUILDUP_CHAIN_CREDIT_SHOT_BASE_POINTS,
         );
-        let scale = self.shot_reward_distance_scale(shooting_team, shooter)
-            * (SHOT_OFF_TARGET_REWARD_POINTS / SHOT_ON_TARGET_REWARD_POINTS);
-        let scaled: Vec<f64> = SHOT_ON_TARGET_REWARD_PATTERN
-            .iter()
-            .map(|w| w * scale)
-            .collect();
-        self.record_possession_reward_pattern(shooting_team, Some(shooter), &scaled);
-=======
         let reward_pool = SHOT_OFF_TARGET_REWARD_POINTS
             * self.shot_reward_distance_scale(shooting_team, shooter);
         self.record_weighted_possession_chain_reward_at_with_kind(
@@ -10265,7 +10258,6 @@ impl SoccerMatch {
             &SHOT_ON_TARGET_REWARD_PATTERN,
             SoccerRewardEventKind::ShotAttempt,
         );
->>>>>>> 8641c67ff7cac2b04e1992840a0a56dc09d425a9
     }
 
     fn current_goal_credit_transition(&self, player_id: usize) -> Option<SoccerLearningTransition> {
