@@ -3289,6 +3289,14 @@ const MPC_PASS_MIN_STEP: usize = 3;
 // A candidate rendezvous is only accepted when the ball's predicted arrival time and the receiver's
 // predicted arrival time agree within this tolerance (seconds) — i.e. the ball actually meets the run.
 const MPC_PASS_RENDEZVOUS_TOLERANCE_SECONDS: f64 = 0.22;
+/// Envelope (mph) for the EXACT MPC pass-weight solve: the binary search for the launch speed that
+/// times a decelerating ground ball to the receiver's predicted arrival is bounded to this band so
+/// it stays a real, controllable pass (never a crawl, never an uncontrollable rocket).
+const MPC_PASS_WEIGHT_MIN_SPEED_MPH: f64 = 6.0;
+const MPC_PASS_WEIGHT_MAX_SPEED_MPH: f64 = 60.0;
+/// The receiver's predicted run must pass within this many yards of the aim point for the MPC
+/// weight solve to trust that arrival time (else the receiver never actually meets the ball there).
+const MPC_PASS_WEIGHT_MAX_REACH_YARDS: f64 = 4.0;
 // Half-width (yards) of the pass-lane corridor the MPC tests for a defender cutting the ball out.
 const MPC_PASS_LANE_RADIUS_YARDS: f64 = 1.4;
 // The MPC only REFINES the proven analytic lead — its chosen aim must stay within this far of it.
