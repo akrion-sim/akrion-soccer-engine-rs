@@ -44809,15 +44809,11 @@ impl WorldSnapshot {
     /// short of the distance. This is the ball half of the MPC pass rendezvous — "when, if ever,
     /// does the ball get there?" — using the SAME `ball_resistance_after` the physics step uses, so
     /// the plan predicts the real flight.
-<<<<<<< HEAD
-    pub(crate) fn ball_ground_travel_time(&self, distance: f64, launch_speed: f64) -> Option<f64> {
-=======
     pub(crate) fn ball_ground_travel_time(
         &self,
         distance: f64,
         launch_speed: f64,
     ) -> Option<f64> {
->>>>>>> 8641c67ff7cac2b04e1992840a0a56dc09d425a9
         if !distance.is_finite() || !launch_speed.is_finite() {
             return None;
         }
