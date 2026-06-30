@@ -57758,9 +57758,7 @@ fn lofted_pass_apex_yards(distance_yards: f64) -> f64 {
 /// aerial-reception descent geometry sees the same arc the ball physics fly.
 pub(crate) fn pending_pass_snapshot_apex_yards(pass: &PendingPassSnapshot) -> f64 {
     if pass.flight.is_scoop() {
-        let seed = pass.launch_tick.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-            ^ (pass.from as u64).wrapping_shl(17);
-        let unit = ((seed >> 40) & 0xFFFF) as f64 / 65535.0;
+        let unit = scoop_apex_unit(pass.launch_tick, pass.from);
         scoop_loft_apex_yards(pass.distance_yards, unit)
     } else if pass.flight.is_over_top() {
         tunables().killer_pass_over_top.height_yards
