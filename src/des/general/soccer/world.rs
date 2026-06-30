@@ -46309,6 +46309,32 @@ impl WorldSnapshot {
         let shallowest_fwd = centre_fwd + level_half_band;
         let deepest_fwd = own_goal_fwd;
         let clamped_fwd = (compact_y * attack).clamp(deepest_fwd, shallowest_fwd);
+        // Energy-conservation hold deadband: a defender already within
+        // `BACK_FOUR_LINE_HOLD_DEADBAND_YARDS` of its (legal) line target holds rather than
+        // re-chasing a target that jitters a yard or two each tick with the predicted ball — the
+        // cosmetic "sine-wave" walk-stop-walk. Overridden (the defender is corrected toward the
+        // line) when it sits illegally AHEAD of the offside `cap`, so holding only ever leaves it a
+        // touch DEEPER than ideal — never plays a runner onside. `cap = None` ⇒ no offside concern
+        // (trap lifted), so a within-deadband target always holds.
+        let hold = |target_fwd: f64, cap: Option<f64>| -> f64 {
+            if !back_four_line_hold_deadband_enabled() {
+                return target_fwd;
+            }
+            let cur_fwd = self.player_snapshot_position(me).y * attack;
+            if !cur_fwd.is_finite() {
+                return target_fwd;
+            }
+            if let Some(cap) = cap {
+                if cur_fwd > cap + 1e-6 {
+                    return target_fwd;
+                }
+            }
+            if (target_fwd - cur_fwd).abs() < BACK_FOUR_LINE_HOLD_DEADBAND_YARDS {
+                cur_fwd
+            } else {
+                target_fwd
+            }
+        };
         // The flat trap is lifted while WE control (centre-backs split / full-backs
         // overlap), while a pass is in flight (offside already judged; lane-cutters
         // must be free to step), and when the offside law is suspended (a restart in
@@ -46316,7 +46342,7 @@ impl WorldSnapshot {
         // off deep in our own third: holding the flat 15yd line there is the point.
         let controls_ball = self.controlled_possession_team() == Some(me.team);
         if controls_ball || self.pending_pass.is_some() || self.offside_currently_suspended() {
-            return clamped_fwd * attack;
+            return hold(clamped_fwd, None) * attack;
         }
         let ahead_cap = centre_fwd + level_half_band;
         // While a carrier breaks through, the line must be free to DROP and cover, so
@@ -46326,7 +46352,7 @@ impl WorldSnapshot {
         } else {
             clamped_fwd.clamp(centre_fwd - level_half_band, ahead_cap)
         };
-        leveled_fwd * attack
+        hold(leveled_fwd, Some(ahead_cap)) * attack
     }
 
     /// Clamp a defender's target forward-position to the hard back-four line band so the four stay
