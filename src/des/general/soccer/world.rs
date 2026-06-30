@@ -11870,8 +11870,12 @@ impl SoccerMatch {
         // ignored. The neural state already encodes the full 22-player+ball field at this tick, so
         // this teaches the policy that holding too long in THIS position was the mistake. The
         // holder is still `attacker_id` here (the swap happens below), so the hold-time and outlet
-        // probe read the carrier's pre-steal situation.
-        if overdribble_penalty_enabled() {
+        // probe read the carrier's pre-steal situation. Skipped for a GOALKEEPER (a keeper losing
+        // the ball is its own problem, not an over-dribble we want to train against) and during an
+        // active SET PLAY (a dead-ball walk-up isn't open-play dribbling) — mirroring the
+        // excessive-hold and backward-pass discipline guards.
+        let carrier_is_keeper = self.players[attacker_id].role == PlayerRole::Goalkeeper;
+        if overdribble_penalty_enabled() && !carrier_is_keeper && self.active_set_play.is_none() {
             let hold_seconds = self.holder_possession_seconds(attacker_id);
             let carrier_pos = self.players[attacker_id].position;
             let nearest_opp = self
@@ -11883,8 +11887,23 @@ impl SoccerMatch {
             let open_outlets = WorldSnapshot::from_match(self)
                 .ranked_threaded_pass_candidates(attacker_id, OVERDRIBBLE_OUTLET_PROBE_LIMIT)
                 .len();
-            let penalty =
-                overdribble_dispossession_penalty_points(hold_seconds, nearest_opp, open_outlets);
+            // Danger-zone severity: losing it by over-dribbling deep in our own half is far worse
+            // than a failed take-on up the pitch. Reuse the turnover/keeper-giveaway danger model
+            // (own goal is the team's defensive end = the OPPONENT's `goal_y`). The carrier is
+            // outfield here (keepers are skipped above), so this is purely the position factor.
+            let yards_to_own_goal =
+                (attacker_team.other().goal_y(self.config.field_length_yards) - carrier_pos.y).abs();
+            let danger_severity = keeper_giveaway_severity_factor(
+                self.players[attacker_id].role,
+                yards_to_own_goal,
+                self.config.field_length_yards,
+            );
+            let penalty = overdribble_dispossession_penalty_points(
+                hold_seconds,
+                nearest_opp,
+                open_outlets,
+                danger_severity,
+            );
             if penalty > 0.0 {
                 self.record_reward_event_with_kind(
                     attacker_id,
