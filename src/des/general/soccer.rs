@@ -1980,10 +1980,6 @@ const FORWARD_CARRY_SEGMENT_YARDS: f64 = 2.0;
 /// and accumulated carry reset. Small jitter below this is tolerated so a near-straight dribble
 /// isn't reset by physics noise.
 const FORWARD_CARRY_BACKWARD_RESET_YARDS: f64 = 1.0;
-/// Minimum forward component (yards, Δy·attack) a released pass must have to count as "a pass
-/// forward" for the productive-carry cash-out — matches the segment size so "carried it forward
-/// then played it forward" is judged on the same 2-yard forward standard.
-const FORWARD_CARRY_FORWARD_PASS_MIN_YARDS: f64 = 2.0;
 /// Reward points per completed 2-yard segment for SUSTAINED forward dribbling — i.e. "2 yards of
 /// forward dribbling followed by 2 more yards". Only segments PAST THE FIRST are paid (a lone
 /// 2-yard nudge earns nothing; the 2nd, 3rd… consecutive segment each earn this), so the signal
