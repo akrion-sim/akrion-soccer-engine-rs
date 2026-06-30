@@ -176,6 +176,38 @@ pub const BACK_FOUR_LINE_STICKY_ANCHOR_SECONDS: f64 = 3.0;
 /// possession flip, so the four never ratchet up-and-back every tick (that asymmetry is the
 /// sine-wave cure); smaller fluctuations either way are simply held.
 pub const BACK_FOUR_LINE_STICKY_REANCHOR_DROP_YARDS: f64 = 3.0;
+
+/// Latched back-four line centre, held on the sim-tick loop for ~[`BACK_FOUR_LINE_STICKY_ANCHOR_SECONDS`]
+/// so the line stops oscillating. `centre_depth` is yards from the team's OWN goal (mirror-invariant),
+/// so it reads the same regardless of which way the team attacks. Re-picked by
+/// [`back_four_line_sticky_should_repick`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BackFourLineLatch {
+    /// Held line-centre depth (yd from own goal).
+    pub centre_depth: f64,
+    /// Sim tick the latch was (re)set — expiry is measured in elapsed ticks, never wall-clock.
+    pub set_tick: u64,
+    /// Which team controlled the ball when the latch was set; a change re-picks immediately.
+    pub possession_at_set: Option<Team>,
+}
+
+/// Pure, RNG-free re-pick decision for the sticky line anchor. Re-evaluate the held centre when:
+/// possession has flipped (we won/lost the ball), OR the latch's tick window has elapsed
+/// (`ticks_held >= latch_ticks`), OR the fresh ideal line has dropped at least
+/// [`BACK_FOUR_LINE_STICKY_REANCHOR_DROP_YARDS`] DEEPER than the held centre (a growing threat drops
+/// the line promptly). Otherwise HOLD — and that hold is exactly what removes the sine-wave.
+/// `held_depth`/`fresh_depth` are yards-from-own-goal, so a DEEPER line is a SMALLER depth.
+pub fn back_four_line_sticky_should_repick(
+    held_depth: f64,
+    fresh_depth: f64,
+    ticks_held: u64,
+    latch_ticks: u64,
+    possession_flipped: bool,
+) -> bool {
+    possession_flipped
+        || ticks_held >= latch_ticks
+        || fresh_depth + BACK_FOUR_LINE_STICKY_REANCHOR_DROP_YARDS < held_depth
+}
 /// Per-yard weight of the attacker-compactness term folded into the line-depth RL reward when the
 /// attacker-press is on: each yard the back four sits behind the optimal gap to the foremost
 /// attackers docks the reward by this much, so the learned head prefers ball-gap fractions that
