@@ -221,12 +221,13 @@ mod tests {
     }
 
     #[test]
-    fn reward_is_positive_goalside_mild_penalty_upfield() {
-        assert!(goal_side_shaping_points(1.0) > 0.0);
-        assert!(goal_side_shaping_points(-1.0) < 0.0);
-        // The failure penalty is the milder of the two extremes.
-        assert!(goal_side_shaping_points(-1.0).abs() < goal_side_shaping_points(1.0).abs());
-        assert_eq!(goal_side_shaping_points(f64::NAN), 0.0);
+    fn reward_is_positive_goalside_penalty_upfield() {
+        assert!(defensive_goal_side_role_reward(1.0) > 0.0);
+        assert!(defensive_goal_side_role_reward(-1.0) < 0.0);
+        // Matches the legacy y-axis ladder's best/worst magnitudes.
+        assert!((defensive_goal_side_role_reward(1.0) - 0.24).abs() < 1e-9);
+        assert!((defensive_goal_side_role_reward(-1.0) + 0.42).abs() < 1e-9);
+        assert_eq!(defensive_goal_side_role_reward(f64::NAN), 0.0);
     }
 
     #[test]
