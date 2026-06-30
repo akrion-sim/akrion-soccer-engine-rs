@@ -87674,11 +87674,13 @@ fn forward_carry_tracker_caps_long_runs_and_ignores_noise() {
     assert_eq!(t.fold_tick(f64::NAN), 0);
     // Tiny backward jitter below the reset threshold does NOT break the run.
     let mut u = ForwardCarryTracker::new_at(5, Team::Home, 40.0);
-    assert_eq!(u.fold_tick(2.0), 0);
-    assert_eq!(u.fold_tick(2.0), 1);
-    assert_eq!(u.fold_tick(-(FORWARD_CARRY_BACKWARD_RESET_YARDS * 0.5)), 0);
-    // Still accumulated (not reset): a forward nudge past the next boundary pays again.
-    assert_eq!(u.fold_tick(1.5), 1);
+    assert_eq!(u.fold_tick(2.0), 0); // carry 4 → segment #2 paid
+    assert_eq!(u.fold_tick(2.0), 1); // carry 4, paid 1
+    assert_eq!(u.fold_tick(-(FORWARD_CARRY_BACKWARD_RESET_YARDS * 0.5)), 0); // dip to 3.5, no reset
+    assert_eq!(u.fold_tick(1.5), 0); // back to 5.0 — segment already paid, no double-pay
+    // Crossing the NEXT boundary pays again — proving the run was NOT reset by the jitter (a reset
+    // would have rebuilt from zero and paid nothing here).
+    assert_eq!(u.fold_tick(2.0), 1); // carry 7.0 → segment #3
 }
 
 #[test]
