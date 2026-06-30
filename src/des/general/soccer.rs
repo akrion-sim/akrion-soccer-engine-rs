@@ -18259,6 +18259,14 @@ pub(crate) enum SoccerRewardEventKind {
     /// position was the mistake. Emitted only when `DD_SOCCER_ENABLE_OVERDRIBBLE_PENALTY` is on. See
     /// [`overdribble_dispossession_penalty_points`].
     OverdribbleDispossession,
+    /// PENALTY (negative): DISCOUNTED turnover-chain blame — when a pass is intercepted, a steeply
+    /// discounted share of the ball-loser's penalty is spread back over the one or two PREVIOUS
+    /// passers who built the lost move (20% to the immediately-preceding passer, 5% to the one
+    /// before). The ball-loser keeps the full penalty separately; this term only hits the prior
+    /// build-up, so the policy learns that feeding a doomed move carries a small cost too — not
+    /// just the final touch. The negative mirror of `BuildupChainCredit`. Emitted only when
+    /// `DD_SOCCER_ENABLE_TURNOVER_CHAIN_BLAME` is on. See `record_turnover_chain_blame`.
+    TurnoverChainBlame,
     MatchResult,
 }
 
