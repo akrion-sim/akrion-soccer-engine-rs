@@ -18745,6 +18745,58 @@ impl SoccerMatch {
         }
     }
 
+    /// MARL/MAPPO reward for **true goal-side recovery**. When our team is out of possession
+    /// (an opponent controls the ball), every off-ball defending outfielder *except the strikers*
+    /// earns a small, budget-bounded per-tick shaped reward for sitting on the ball→own-goal line
+    /// and goal-side of the ball, and a *milder* penalty for being caught upfield of it (failing
+    /// to recover). The keeper is exempt. Each player's event is folded into its transition and
+    /// team-shared downstream by the cooperative MAPPO reward machinery like every other event.
+    ///
+    /// A no-op (no events ⇒ byte-identical) unless `DD_SOCCER_ENABLE_DEFENSIVE_GOAL_SIDE` is on.
+    /// Reads the settled post-tick state in `after`, so the reward reflects where each defender
+    /// ended the tick. See the [`goal_side`] module.
+    pub(crate) fn update_defensive_goal_side_rewards(&mut self, after: &WorldSnapshot) {
+        if !goal_side::defensive_goal_side_enabled() {
+            return;
+        }
+        let controlling = after
+            .controlled_possession_team()
+            .or_else(|| after.possession_team());
+        let Some(controlling) = controlling else {
+            return;
+        };
+        let budget = tunables().reward.dense_shaping_budget_points;
+        let half = goal_side::GOAL_SIDE_CHANNEL_HALF_WIDTH_YARDS;
+        let sat = goal_side::GOAL_SIDE_DEPTH_SATURATION_YARDS;
+        let ball = after.ball.position;
+        let mut events: Vec<(usize, f64)> = Vec::new();
+        for player in after.players.iter() {
+            if matches!(player.role, PlayerRole::Goalkeeper | PlayerRole::Forward) {
+                continue;
+            }
+            // Only the defending team: the side whose opponent is the controller.
+            if controlling != player.team.other() {
+                continue;
+            }
+            let position = after.player_position(player.id).unwrap_or(player.position);
+            let own_goal = Vec2::new(self.field_width * 0.5, self.own_goal_y_for(player.team));
+            let quality = goal_side::goal_side_quality(position, ball, own_goal, half, sat);
+            let shaped =
+                apply_dense_shaping_budget(goal_side::goal_side_shaping_points(quality), budget);
+            if shaped.is_finite() && shaped.abs() > 1e-9 {
+                events.push((player.id, shaped));
+            }
+        }
+        for (player_id, amount) in events {
+            self.record_reward_event_at_with_kind(
+                after.tick,
+                player_id,
+                amount,
+                SoccerRewardEventKind::DefensiveGoalSide,
+            );
+        }
+    }
+
     pub(crate) fn score_goal(&mut self, scoring_team: Team) {
         self.finish_possession_progress_chain(true);
         // Assist: the goal came directly off the scoring team's most recent completed pass
