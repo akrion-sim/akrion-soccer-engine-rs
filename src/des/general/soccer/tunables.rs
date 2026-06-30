@@ -664,6 +664,74 @@ impl Default for CarrierKeepRollingTunables {
     }
 }
 
+/// Good-dribbling knobs grouped along the three axes the carrier controls: which DIRECTION the ball
+/// is knocked (touch angle), how far it rolls per touch (touch LENGTH), and how fast the carrier
+/// drives with it (carry SPEED / gait floor). The deterministic touch-decision path and the MPC
+/// control estimate read these, and the learning store can override them through the policy tuning
+/// overlay — so dribbling is tunable from MPC and POMDP/learned both. Defaults reproduce the prior
+/// hard-coded literals exactly (an unconfigured process is byte-identical).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DribbleTuning {
+    // --- DIRECTION: touch-angle bucket scoring in `agentic_dribble_touch_bucket_for`. ---
+    /// Weight on the MPC ball-control probability when scoring a touch direction (how much MPC
+    /// execution feasibility steers which way the ball is knocked).
+    pub direction_mpc_control_weight: f64,
+    /// Weight on the MPC QP acceleration fit in the direction score.
+    pub direction_mpc_accel_weight: f64,
+    /// Weight on the kind-appropriate angle prior in the direction score.
+    pub direction_angle_fit_weight: f64,
+    /// Open-grass scale on the forward-component reward in the direction score (a clearer lane ahead
+    /// pulls the touch more forward).
+    pub direction_forward_open_grass_scale: f64,
+    // --- LENGTH: touch distance in `dribble_touch_distance_for` (how far the ball rolls). ---
+    /// Base touch length in yards before skill/space/intent terms.
+    pub touch_length_base_yards: f64,
+    /// Yards of touch length added per unit of ball-control skill.
+    pub touch_length_control_scale: f64,
+    /// Yards of touch length added per unit of open grass ahead.
+    pub touch_length_open_grass_scale: f64,
+    /// Yards of touch length added per unit of touch intent.
+    pub touch_length_intent_scale: f64,
+    // --- SPEED: carrier forward-drive gait floor (see `carrier_forward_drive_gait_floor`). ---
+    /// An opponent at/inside this radius keeps the carrier on close control (no speed floor).
+    pub carry_tight_pressure_yards: f64,
+    /// Open forward space (yards) at/above which the carrier is floored to at least a jog.
+    pub carry_jog_space_yards: f64,
+    /// Open forward space (yards) at/above which the carrier is floored to a run.
+    pub carry_run_space_yards: f64,
+    /// Open forward space (yards) at/above which the carrier is floored to a sprint.
+    pub carry_sprint_space_yards: f64,
+    /// Above this fatigue the open-field carry floor caps at a run rather than a sprint.
+    pub carry_sprint_max_fatigue: f64,
+    /// Minimum forward component (yards) of the intended move for the carry floor to engage.
+    pub carry_min_forward_yards: f64,
+    /// Half-width (yards) of the carry lane used to measure open forward space.
+    pub carry_lane_half_width_yards: f64,
+}
+
+impl Default for DribbleTuning {
+    fn default() -> Self {
+        DribbleTuning {
+            direction_mpc_control_weight: 0.48,
+            direction_mpc_accel_weight: 0.30,
+            direction_angle_fit_weight: 1.18,
+            direction_forward_open_grass_scale: 0.68,
+            touch_length_base_yards: 0.78,
+            touch_length_control_scale: 0.86,
+            touch_length_open_grass_scale: 1.05,
+            touch_length_intent_scale: 0.52,
+            carry_tight_pressure_yards: 2.5,
+            carry_jog_space_yards: 3.0,
+            carry_run_space_yards: 9.0,
+            carry_sprint_space_yards: 18.0,
+            carry_sprint_max_fatigue: 0.80,
+            carry_min_forward_yards: 1.0,
+            carry_lane_half_width_yards: 4.0,
+        }
+    }
+}
+
 /// Fresh ball-winner pressure escape knobs. These govern the transition touch
 /// after an outfield player wins possession in a crowd: accelerate away from
 /// the nearest pressure into a landing point that gains cushion and stays clear.
