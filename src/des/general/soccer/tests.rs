@@ -89946,6 +89946,115 @@ fn carrier_forward_drive_gait_floor_grades_by_space_and_pressure() {
 }
 
 #[test]
+fn carrier_forward_drive_floor_lifts_a_walking_carrier_into_open_space() {
+    // End-to-end: a ball carrier driving into wide-open forward space should be lifted to a higher
+    // gear by the gait floor when the feature is enabled. Self-adapts to the ambient gate so it is
+    // correct whether the suite runs with DD_SOCCER_ENABLE_CARRIER_FORWARD_DRIVE on or off.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 1.0,
+        seed: 24_601,
+        ..MatchConfig::default()
+    });
+    let carrier = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role != PlayerRole::Goalkeeper)
+        .expect("home field player")
+        .id;
+    let attack_dir = sim.players[carrier].team.attack_dir();
+    // Park every opponent far behind the carrier so the forward lane is wide open and there is no
+    // pressure — exactly the "drive into space" case.
+    for p in sim.players.iter_mut() {
+        if p.team == Team::Away {
+            p.position = Vec2::new(-60.0, -60.0);
+        }
+    }
+    let start = Vec2::new(sim.config.field_width_yards * 0.5, sim.config.field_length_yards * 0.5);
+    sim.players[carrier].position = start;
+    sim.players[carrier].velocity = Vec2::zero();
+    sim.players[carrier].movement_gait = MovementGait::Stand;
+    sim.ball.holder = Some(carrier);
+    sim.ball.position = start;
+    // A forward target ~20yd ahead. With sprint=false the natural gait for that distance is a Run.
+    let target = start + Vec2::new(0.0, 20.0 * attack_dir);
+    sim.move_player_towards(carrier, target, false);
+    let gait = sim.players[carrier].movement_gait;
+    if carrier_forward_drive_enabled() {
+        assert_eq!(
+            gait,
+            MovementGait::Sprint,
+            "open-field carry should be floored up to a sprint when the feature is enabled"
+        );
+    } else {
+        assert_eq!(
+            gait,
+            MovementGait::Run,
+            "without the floor a 20yd forward carry at sprint=false is a run"
+        );
+    }
+}
+
+#[test]
+fn overdribble_penalty_fires_when_a_long_hold_is_dispossessed() {
+    // End-to-end: a carrier who held the ball well past the overdue threshold, under pressure, and
+    // is then tackled should receive an OverdribbleDispossession penalty when the feature is on.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 1.0,
+        seed: 13_337,
+        ..MatchConfig::default()
+    });
+    let attacker = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role != PlayerRole::Goalkeeper)
+        .expect("home field player")
+        .id;
+    let defender = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+        .expect("away field player")
+        .id;
+    let spot = Vec2::new(sim.config.field_width_yards * 0.5, sim.config.field_length_yards * 0.5);
+    sim.players[attacker].position = spot;
+    // Defender right on top of the carrier ⇒ genuine pressure at the moment of loss.
+    sim.players[defender].position = spot + Vec2::new(1.0, 0.0);
+    sim.ball.holder = Some(attacker);
+    sim.ball.position = spot;
+    // Fabricate a continuous ~2.0s hold (> the 1.6s overdue threshold) in the ball history.
+    sim.clock_seconds = 5.0;
+    sim.ball.position_history.clear();
+    for i in 0..40_u64 {
+        sim.ball.position_history.push_back(BallPositionSample {
+            tick: i,
+            clock_seconds: 3.0 + i as f64 * 0.05,
+            position: spot,
+            velocity: Vec2::zero(),
+            acceleration: Vec2::zero(),
+            jerk: Vec2::zero(),
+            curl_acceleration: Vec2::zero(),
+            altitude_yards: 0.0,
+            resistance: BallResistanceFrame::default(),
+        });
+    }
+    let before = sim.reward_events.len();
+    sim.complete_defensive_dispossession(defender, attacker, "tackle");
+    let fired = sim.reward_events[before..].iter().any(|e| {
+        e.kind == SoccerRewardEventKind::OverdribbleDispossession
+            && e.player_id == attacker
+            && e.amount < 0.0
+    });
+    if overdribble_penalty_enabled() {
+        assert!(
+            fired,
+            "an over-dribble dispossession should emit a negative penalty to the carrier when enabled"
+        );
+    } else {
+        assert!(!fired, "no over-dribble event should fire when the feature is disabled");
+    }
+}
+
+#[test]
 fn slip_break_seam_and_runner_opportunity_are_recognised() {
     // Geometry/sign-convention coverage for the slip-and-break-the-offside-trap recognition
     // (the ungated seam + opportunity readers; the run-target and bias are env-gated and tested
