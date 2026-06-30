@@ -87,6 +87,10 @@ const BACK_FOUR_LINE_DEPTH_V2_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_LIN
 /// symmetric all-four-average line stands (byte-identical).
 const DEFENSIVE_LINE_WINGBACK_FORWARD_PRIORITY_ENABLE_ENV: &str =
     "DD_SOCCER_ENABLE_WINGBACK_FORWARD_PRIORITY";
+/// Env gate (default-ON) for the press-to-attackers compaction of the v2 line centre.
+const BACK_FOUR_ATTACKER_PRESS_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_ATTACKER_PRESS";
+/// Env gate (default-ON) for the energy-conservation hold deadband on the v2 line target.
+const BACK_FOUR_LINE_HOLD_DEADBAND_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_LINE_HOLD_DEADBAND";
 
 /// Comfortable resting gap (yd behind the ball) the CENTRAL defenders hold while defending
 /// under wingback-first priority. Decoupling the wingbacks from the line average removed the
