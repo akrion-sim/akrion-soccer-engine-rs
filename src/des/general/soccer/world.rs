@@ -26498,8 +26498,9 @@ impl WorldSnapshot {
             // fires against a slow dribbler walking the ball in.
             let covered_commit =
                 (1.0 + advance01 * CARRIER_ADVANCE_STEAL_BOOST).max(1.0 + OWN_GOAL_PRESS_MIN_BOOST);
-            CARRIER_NO_COVER_CONTAIN_FACTOR
-                + press_urgency * (covered_commit - CARRIER_NO_COVER_CONTAIN_FACTOR)
+            (CARRIER_NO_COVER_CONTAIN_FACTOR
+                + press_urgency * (covered_commit - CARRIER_NO_COVER_CONTAIN_FACTOR))
+            .max(numbers_up_floor)
         }
     }
 
