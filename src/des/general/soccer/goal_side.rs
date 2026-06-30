@@ -116,7 +116,7 @@ pub(crate) fn goal_side_quality(
     }
     let unit = axis / len; // unit vector pointing from the ball toward our own goal
     let rel = player - ball;
-    let along = dot(rel, unit); // > 0 ⇒ goal-side of the ball, < 0 ⇒ caught upfield
+    let along = rel.dot(unit); // > 0 ⇒ goal-side of the ball, < 0 ⇒ caught upfield
     let perp = (rel - unit * along).len(); // lateral distance from the ball→goal line
     if !along.is_finite() || !perp.is_finite() {
         return 0.0;
