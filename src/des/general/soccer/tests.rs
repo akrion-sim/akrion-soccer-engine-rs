@@ -87631,28 +87631,31 @@ fn team_advance_upfield_space_qualifies_truth_table() {
 
 #[test]
 fn forward_carry_tracker_sustained_segments_and_productive_payout() {
+    let seg = |fine, coarse| SustainedDribbleSegments { fine, coarse };
     let mut t = ForwardCarryTracker::new_at(7, Team::Home, 60.0);
-    // First 2yd forward segment earns nothing — it must be "followed by 2 more".
-    assert_eq!(t.fold_tick(2.0), 0);
-    // Reaching 4yd total ⇒ the 2nd segment is the first rewardable one.
-    assert_eq!(t.fold_tick(2.0), 1);
-    // Each further completed 2yd segment pays one more.
-    assert_eq!(t.fold_tick(2.0), 1);
-    // Sub-segment forward increments accumulate; only crossing the next 2yd boundary pays.
-    assert_eq!(t.fold_tick(1.0), 0);
-    assert_eq!(t.fold_tick(1.0), 1);
-    // Productive cash-out after 8yd carried ⇒ 4 whole segments × per-segment points.
+    // 2yd carried: the FIRST 1yd segment earns nothing, the 2nd 1yd segment pays (fine cadence);
+    // the first 2yd segment earns nothing (coarse cadence needs "2 more").
+    assert_eq!(t.fold_tick(2.0), seg(1, 0));
+    // 4yd total: two more 1yd segments + the first rewardable 2yd segment.
+    assert_eq!(t.fold_tick(2.0), seg(2, 1));
+    // 6yd total: two more 1yd + one more 2yd.
+    assert_eq!(t.fold_tick(2.0), seg(2, 1));
+    // 7yd: one more 1yd segment, no new 2yd boundary crossed.
+    assert_eq!(t.fold_tick(1.0), seg(1, 0));
+    // 8yd: one more 1yd + the next 2yd boundary.
+    assert_eq!(t.fold_tick(1.0), seg(1, 1));
+    // Productive cash-out after 8yd carried ⇒ 4 whole 2yd segments × per-segment points.
     let pts = t.productive_carry_reward_points();
     assert!(
         (pts - 4.0 * PRODUCTIVE_FORWARD_CARRY_PER_SEGMENT_REWARD_POINTS).abs() < 1e-9,
         "productive payout {pts} should be 4 segments"
     );
-    // A meaningful backward move breaks the run: accumulation AND rewarded-segment count reset.
-    assert_eq!(t.fold_tick(-FORWARD_CARRY_BACKWARD_RESET_YARDS), 0);
+    // A meaningful backward move breaks the run: accumulation AND both segment counters reset.
+    assert_eq!(t.fold_tick(-FORWARD_CARRY_BACKWARD_RESET_YARDS), seg(0, 0));
     assert_eq!(t.productive_carry_reward_points(), 0.0);
-    // Rebuild from zero: first new segment again unpaid, second paid.
-    assert_eq!(t.fold_tick(2.0), 0);
-    assert_eq!(t.fold_tick(2.0), 1);
+    // Rebuild from zero: fine pays from the 2nd yard, coarse from 4yd again.
+    assert_eq!(t.fold_tick(2.0), seg(1, 0));
+    assert_eq!(t.fold_tick(2.0), seg(2, 1));
 }
 
 #[test]
