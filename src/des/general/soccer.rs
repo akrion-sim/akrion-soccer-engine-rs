@@ -17494,16 +17494,16 @@ impl PossessionProgressTracker {
     }
 }
 
-/// Tracks the CURRENT ball-carrier's continuous forward dribble so two progressive-carry MARL
-/// rewards can be paid (gated by `DD_SOCCER_ENABLE_PROGRESSIVE_CARRY_REWARD`):
-/// 1. SUSTAINED dribbling — each 2-yard forward segment past the first in one continuous carry
-///    (`fold_tick`, emitted per tick while the player keeps driving forward).
-/// 2. PRODUCTIVE carry — the accumulated forward yards, paid in 2-yard segments, cashed out at the
-///    moment the carry ends in a forward pass or a shot (`productive_carry_reward_points`).
-/// "Forward" is Δy·attack toward the opponent goal; lateral (x) movement is free — only the forward
-/// component is accumulated. A single carrier holds the ball at a time, so the match keeps one
-/// `Option<ForwardCarryTracker>`, reset when the holder changes / possession is lost. The segment
-/// accounting is pure (no env, no world access) so it is unit-tested directly.
+/// Tracks the CURRENT ball-carrier's continuous forward dribble to pay the SUSTAINED-dribble MARL
+/// reward (gated by `DD_SOCCER_ENABLE_PROGRESSIVE_CARRY_REWARD`): each forward segment past the
+/// first in one continuous carry, at both a 1-yard ("a yard followed by another yard") and a 2-yard
+/// ("2 yards followed by 2 more") cadence (`fold_tick`/`sustained_reward_points`, emitted per tick
+/// while the player keeps driving forward). The complementary PRODUCTIVE carry-into-pass/shot reward
+/// is handled separately by `record_progressive_carry_outcome_reward`. "Forward" is Δy·attack toward
+/// the opponent goal; lateral (x) movement is free — only the forward component is accumulated. A
+/// single carrier holds the ball at a time, so the match keeps one `Option<ForwardCarryTracker>`,
+/// reset when the holder changes / possession is lost. The segment accounting is pure (no env, no
+/// world access) so it is unit-tested directly.
 /// New sustained-dribble segments completed this tick, at BOTH cadences: `fine` = 1-yard segments
 /// ("a yard followed by another yard"), `coarse` = 2-yard segments ("2 yards followed by 2 more").
 /// Both are rewarded (the user asked for both); the coarse cadence is an extra bonus that escalates
