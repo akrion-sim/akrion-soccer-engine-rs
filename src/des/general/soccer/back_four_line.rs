@@ -91,6 +91,14 @@ const DEFENSIVE_LINE_WINGBACK_FORWARD_PRIORITY_ENABLE_ENV: &str =
 const BACK_FOUR_ATTACKER_PRESS_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_ATTACKER_PRESS";
 /// Env gate (default-ON) for the energy-conservation hold deadband on the v2 line target.
 const BACK_FOUR_LINE_HOLD_DEADBAND_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_LINE_HOLD_DEADBAND";
+/// Env kill switch (default-ON) for the **sticky line anchor**: the back-four line CENTRE is latched
+/// on the sim-tick loop and HELD for [`BACK_FOUR_LINE_STICKY_ANCHOR_SECONDS`] (re-picked only when
+/// that window of ticks elapses, possession flips, or the fresh ideal line drops materially deeper)
+/// instead of being recomputed every tick. Holding the centre steady is what removes the unrealistic
+/// "sine-wave" walk-stop-walk: defenders already on the latched line ARE the anchors and HOLD (stand
+/// / walk, conserve energy) while only the off-line defenders adapt to them. `=0` reverts to the
+/// per-tick recompute (byte-identical), and it is default-OFF under test so the parity suite holds.
+const BACK_FOUR_LINE_STICKY_ANCHOR_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_LINE_STICKY_ANCHOR";
 
 /// Comfortable resting gap (yd behind the ball) the CENTRAL defenders hold while defending
 /// under wingback-first priority. Decoupling the wingbacks from the line average removed the
