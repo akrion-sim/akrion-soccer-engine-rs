@@ -29238,6 +29238,29 @@ impl WorldSnapshot {
         } else {
             0.0
         };
+        // True goal-side recovery (POMDP perception): when our team is out of possession, how far
+        // an off-ball defending outfielder sits along — and how close to — the ball→own-goal line
+        // (not merely deeper than the ball on the y-axis). Strikers and the keeper are exempt; the
+        // quality stays 0 (so `defensive_urgency` is byte-identical) when the team has the ball or
+        // the gate is off. Its recovery urgency lifts the off-ball defensive urgency below. See
+        // the `goal_side` module.
+        let defensive_goal_side_applies = goal_side::defensive_goal_side_enabled()
+            && !matches!(me.role, PlayerRole::Goalkeeper | PlayerRole::Forward)
+            && self
+                .controlled_possession_team()
+                .or_else(|| self.possession_team())
+                == Some(me.team.other());
+        let defensive_goal_side_quality = if defensive_goal_side_applies {
+            goal_side::goal_side_quality(
+                me_position,
+                self.ball.position,
+                own_goal,
+                goal_side::GOAL_SIDE_CHANNEL_HALF_WIDTH_YARDS,
+                goal_side::GOAL_SIDE_DEPTH_SATURATION_YARDS,
+            )
+        } else {
+            0.0
+        };
         let defensive_role_urgency = match me.role {
             PlayerRole::Goalkeeper => 1.10,
             PlayerRole::Defender => 1.0,
