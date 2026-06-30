@@ -463,6 +463,16 @@ pub struct SoccerMatch {
     pub(crate) long_pass_run_samples: Vec<LongPassRunSample>,
     /// Open long-pass run decisions awaiting their windowed reward.
     pub(crate) pending_long_pass_run: Vec<PendingLongPassRunDecision>,
+    /// The trained give-and-go / wall-pass appetite head (which one-two to commit to and when),
+    /// when present. Carried + trained across games by the learner; `None` ⇒ the analytic
+    /// `quality`-derived appetite. Shared into each [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) give_and_go_head: Option<std::sync::Arc<GiveAndGoHead>>,
+    /// Rolling RL corpus for the give-and-go head: per-decision state + the commit action + the
+    /// windowed territorial reward. Collected only while the model is enabled
+    /// (`collect_give_and_go_rl_samples`); empty + untouched in the default process.
+    pub(crate) give_and_go_samples: Vec<GiveAndGoSample>,
+    /// Open give-and-go decisions awaiting their windowed reward.
+    pub(crate) pending_give_and_go: Vec<PendingGiveAndGoDecision>,
     /// The trained aerial-reception control head (how high to attack a dropping lofted
     /// ball), when present. Carried + trained across games by the learner; `None` ⇒ the
     /// analytic seed. Shared into each [`WorldSnapshot`] via an `Arc` clone.
