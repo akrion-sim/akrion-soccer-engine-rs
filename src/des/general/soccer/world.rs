@@ -2805,6 +2805,7 @@ impl SoccerMatch {
             pass_chain_meter: PassChainMeter::default(),
             home_mpc_latent_objective: SoccerMpcLatentObjective::default(),
             away_mpc_latent_objective: SoccerMpcLatentObjective::default(),
+            forward_carry_tracker: None,
             last_touch_player: None,
             ball_stationary_ticks: 0,
             ball_stuck_anchor: Vec2::new(0.0, 0.0),
