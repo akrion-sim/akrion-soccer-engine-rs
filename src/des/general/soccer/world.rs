@@ -11773,6 +11773,50 @@ impl SoccerMatch {
         );
     }
 
+    /// Seconds the current ball holder has been in continuous possession, read off the ball's
+    /// position history (the run of trailing samples held by the same player). Used by the
+    /// over-dribble penalty to know how long the carrier had held before being dispossessed.
+    pub(crate) fn holder_possession_seconds(&self, holder_id: usize) -> f64 {
+        let mut start_clock = self.clock_seconds;
+        for sample in self.ball.position_history.iter().rev() {
+            if sample.holder == Some(holder_id) {
+                start_clock = sample.clock_seconds;
+            } else {
+                break;
+            }
+        }
+        (self.clock_seconds - start_clock).max(0.0)
+    }
+
+    /// Open forward space (yards clear of opponents in the carry lane) and nearest-opponent distance
+    /// for a carrier at `start`, computed directly on the live player positions — a cheap
+    /// snapshot-free mirror of [`WorldSnapshot::forward_dribble_space_yards`] so it can run on the
+    /// carrier every movement tick. Returns `(forward_space_yards, nearest_opponent_yards)`.
+    fn carrier_forward_space_and_pressure(&self, start: Vec2, team: Team) -> (f64, f64) {
+        let dir = Vec2::new(0.0, team.attack_dir());
+        let max_space = 30.0_f64
+            .min(match team {
+                Team::Home => self.config.field_length_yards - start.y,
+                Team::Away => start.y,
+            })
+            .max(0.0);
+        let mut forward_space = max_space;
+        let mut nearest_opp = f64::INFINITY;
+        for opponent in self.players.iter().filter(|p| p.team == team.other()) {
+            let to_opp = opponent.position - start;
+            nearest_opp = nearest_opp.min(to_opp.len());
+            let forward = to_opp.dot(dir);
+            if forward <= 0.0 || forward > max_space {
+                continue;
+            }
+            let lateral = (to_opp - dir * forward).len();
+            if lateral <= CARRIER_DRIVE_LANE_HALF_WIDTH_YARDS {
+                forward_space = forward_space.min((forward - PLAYER_CONTROL_RADIUS_YARDS).max(0.0));
+            }
+        }
+        (forward_space, nearest_opp)
+    }
+
     pub(crate) fn complete_defensive_dispossession(
         &mut self,
         defender_id: usize,
