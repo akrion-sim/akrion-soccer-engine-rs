@@ -13383,6 +13383,15 @@ impl SoccerMatch {
                             SoccerRewardEventKind::IsolatedCarrierPanicBackPass,
                         );
                     }
+                    // PRODUCTIVE forward carry (Reward A): a dribble that ends in a FORWARD pass is
+                    // cashed out in 2-yard segments; a backward/square pass drops the carry unpaid.
+                    let pass_forward_yards =
+                        (release_target.y - player_pos.y) * player_team.attack_dir();
+                    if pass_forward_yards >= FORWARD_CARRY_FORWARD_PASS_MIN_YARDS {
+                        self.cash_out_productive_forward_carry(player_id);
+                    } else {
+                        self.clear_forward_carry_tracker(player_id);
+                    }
                     self.register_flank_crash_box_cross(
                         player_team,
                         player_id,
