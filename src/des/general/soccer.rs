@@ -1014,6 +1014,14 @@ const AERIAL_LAND_AT_TARGET_DRAG_COMP: f64 = 1.08;
 // down promptly instead of looping (the user's "scoop goes too high / hangs too long" report).
 const SCOOP_LOFT_APEX_MIN_YARDS: f64 = 2.0; // 6ft — clears a standing foot
 const SCOOP_LOFT_APEX_MAX_YARDS: f64 = 3.0; // 9ft — drops back down promptly, no balloon
+// Raised scoop apex window (gate `DD_SOCCER_ENABLE_SCOOP_HIGHER_APEX`, default-ON in prod /
+// OFF under test). A 6-9ft dink clips a standing foot but can be HEADED/blocked by an upright or
+// jumping defender stood in the lane — the user's "scoop should go ~10-13ft OVER the opponent".
+// Hang time grows with apex (T = 2·√(2·apex/g)), but across the short 5-12yd scoop range the
+// horizontal speed needed to land on the receiver stays well under `SCOOP_MAX_SPEED_MPH`, so the
+// ball lifts cleanly over the blocker and drops promptly rather than ballooning into a hang.
+const SCOOP_LOFT_APEX_HIGH_MIN_YARDS: f64 = 3.05; // ~10ft — clears an upright/jumping defender
+const SCOOP_LOFT_APEX_HIGH_MAX_YARDS: f64 = 4.30; // ~13ft — still drops promptly over a 5-12yd chip
 const SCOOP_LAND_AT_TARGET_DRAG_COMP: f64 = 1.20;
 const SCOOP_MIN_SPEED_MPH: f64 = 16.0;
 const SCOOP_MAX_SPEED_MPH: f64 = 38.0;
