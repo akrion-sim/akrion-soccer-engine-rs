@@ -1980,6 +1980,21 @@ const PRODUCTIVE_FORWARD_CARRY_PER_SEGMENT_REWARD_POINTS: f64 = 1.5;
 /// Cap (segments) on a single productive-carry / sustained-dribble payout so one very long run
 /// can't dominate the sparse goal/possession signal (20 yards of forward carry).
 const FORWARD_CARRY_MAX_REWARDED_SEGMENTS: u32 = 10;
+/// A pass with at least this much BACKWARD component (yards toward our OWN goal, i.e. -Δy·attack)
+/// is subject to backward-pass discipline. Below this a square/short ball is treated as neutral.
+const BACKWARD_PASS_MIN_PENALIZED_YARDS: f64 = 2.0;
+/// "High pressure" radius for backward-pass discipline: a backward pass is only JUSTIFIED when an
+/// opponent is within this many yards of the passer at release. This is the genuine-pressure test
+/// the user asked for — it also covers the touchline/corner case (where passing/dribbling options
+/// shrink) but still requires a close opponent; mere positional urgency is not enough.
+const BACKWARD_PASS_HIGH_PRESSURE_RADIUS_YARDS: f64 = 3.0;
+/// Base penalty points for an UNPRESSURED backward pass, before the distance term.
+const BACKWARD_PASS_BASE_PENALTY_POINTS: f64 = 2.0;
+/// Extra penalty points per yard of backward distance — the deeper the ball is played back the
+/// worse it is, so a long recycle toward our own goal is punished far more than a short drop.
+const BACKWARD_PASS_PENALTY_PER_YARD_POINTS: f64 = 0.5;
+/// Cap on the total unpressured-backward-pass penalty so one very deep ball can't swamp the signal.
+const BACKWARD_PASS_MAX_PENALTY_POINTS: f64 = 12.0;
 const PASS_CHAIN_THREE_NET_FORWARD_MIN_YARDS: f64 = 4.0;
 const PASS_CHAIN_EVENT_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(12.0);
 const PASS_AND_MOVE_FORWARD_MIN_YARDS: f64 = 4.0;
