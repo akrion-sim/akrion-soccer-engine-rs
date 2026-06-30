@@ -43709,6 +43709,9 @@ impl WorldSnapshot {
         let pressure = nearest_defender
             .map(|(_, _, distance)| pressure_from_nearest_distance(distance))
             .unwrap_or(0.0);
+        // Tunable DIRECTION weights (MPC control/accel influence, angle prior, forward-open-grass
+        // pull) — read once; tunable from config/MPC and the learned policy overlay both.
+        let dribble_tuning = &tunables().dribble;
         let mut best = (0_u8, f64::NEG_INFINITY);
         for bucket in 0..DRIBBLE_TOUCH_ANGLE_BUCKETS {
             let touch = DribbleTouchDecision::new(bucket, 2.25);
