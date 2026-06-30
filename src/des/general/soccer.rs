@@ -2972,6 +2972,13 @@ const SHOT_MIN_KICK_POWER_FACTOR: f64 = 0.90;
 // settling/shielding touch first, then play it. The floor scales from the at-rest floor down to
 // this with speed, so a jog keeps most power but a sprint cannot reverse-blast.
 const KICK_REVERSE_AT_SPRINT_FLOOR: f64 = 0.12;
+/// In-stride margin floors (used when `DD_SOCCER_ENABLE_IN_STRIDE_PASS_MARGIN` is on): kicking
+/// against your own momentum is harder by a MARGIN, not nearly impossible — a running/sprinting pass
+/// stays viable (≈62% power at a jog-reverse, ≈50% at a full sprint-reverse) so the player is not
+/// forced to stop to pass. The realistic difficulty is carried by these power margins plus the
+/// facing-accuracy model and the MPC pass-weight, rather than a hard near-veto.
+const IN_STRIDE_KICK_POWER_FLOOR: f64 = 0.62;
+const IN_STRIDE_KICK_SPRINT_POWER_FLOOR: f64 = 0.50;
 // Body-facing kick model: you can only strike the ball with the slice of your range the body
 // is turned toward, so the angle between your CURRENT body facing and the line you want to play
 // decides how much power and accuracy you can put on it. You cannot pass one way while facing the
