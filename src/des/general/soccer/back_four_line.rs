@@ -1161,6 +1161,54 @@ impl WorldSnapshot {
 }
 
 impl SoccerMatch {
+    /// Maintain the per-team **sticky back-four line-centre latch** on the sim-tick loop (never
+    /// wall-clock): hold the line centre for ~[`BACK_FOUR_LINE_STICKY_ANCHOR_SECONDS`], re-picking
+    /// when that window of ticks elapses, possession flips, or the fresh ideal line drops materially
+    /// deeper (a growing threat — [`back_four_line_sticky_should_repick`]). Holding the centre steady
+    /// is what removes the "sine-wave": defenders already on the latched line hold (conserve energy)
+    /// and only off-line defenders adapt. Called once per tick off the tick-start `snapshot`. Clears
+    /// the latch (⇒ fresh per-tick recompute, byte-identical) when the sticky anchor or the v2 line
+    /// is gated off, so an unconfigured / test process is unaffected.
+    pub(crate) fn update_back_four_line_latch(&mut self, snapshot: &WorldSnapshot) {
+        if !back_four_line_sticky_anchor_enabled() || !back_four_line_depth_v2_enabled() {
+            self.back_four_line_latch = [None, None];
+            return;
+        }
+        // Convert the hold window from sim seconds to ticks via the sim dt (framerate-independent).
+        let latch_ticks = (BACK_FOUR_LINE_STICKY_ANCHOR_SECONDS
+            / self.config.dt_seconds.max(1e-6))
+        .round()
+        .max(1.0) as u64;
+        let controlled = snapshot.controlled_possession_team();
+        let tick = self.tick;
+        for team in [Team::Home, Team::Away] {
+            let idx = team_index(team);
+            let attack = team.attack_dir();
+            let own_goal_fwd = snapshot.own_goal_y_for(team) * attack;
+            let fresh_depth = snapshot.back_four_line_v2_centre_fwd_fresh(team) - own_goal_fwd;
+            if !fresh_depth.is_finite() {
+                continue;
+            }
+            let repick = match self.back_four_line_latch[idx] {
+                None => true,
+                Some(latch) => back_four_line_sticky_should_repick(
+                    latch.centre_depth,
+                    fresh_depth,
+                    tick.saturating_sub(latch.set_tick),
+                    latch_ticks,
+                    controlled != latch.possession_at_set,
+                ),
+            };
+            if repick {
+                self.back_four_line_latch[idx] = Some(BackFourLineLatch {
+                    centre_depth: fresh_depth,
+                    set_tick: tick,
+                    possession_at_set: controlled,
+                });
+            }
+        }
+    }
+
     /// Gated per-tick RL sample collection for the line-depth heads (Gap 5), driven
     /// off the already-built per-tick learning `snapshot`. A **no-op** (zero cost,
     /// byte-identical) unless a line-depth model is enabled, so the default learner
