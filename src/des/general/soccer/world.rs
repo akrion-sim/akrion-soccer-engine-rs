@@ -9933,8 +9933,35 @@ impl SoccerMatch {
         }
     }
 
+    /// Reward the last `BUILDUP_CHAIN_CREDIT_DEPTH` teammates who built the move to this shot,
+    /// recency-discounted (the finisher most, each earlier contributor geometrically less).
+    /// `base_points` sets the tier (any shot < on frame < goal). Additive MAPPO buildup credit;
+    /// gated (default-on) by `DD_SOCCER_ENABLE_BUILDUP_CHAIN_CREDIT`, OFF ⇒ no-op (byte-identical).
+    fn record_buildup_chain_credit(&mut self, team: Team, shooter: Option<usize>, base_points: f64) {
+        if !buildup_chain_credit_enabled() || base_points <= 0.0 {
+            return;
+        }
+        let sequence =
+            self.recent_possession_reward_sequence(team, shooter, BUILDUP_CHAIN_CREDIT_DEPTH);
+        for (recency_index, player_id) in sequence.into_iter().enumerate() {
+            let amount = buildup_chain_credit_points(base_points, recency_index);
+            if amount > 0.0 {
+                self.record_reward_event_with_kind(
+                    player_id,
+                    amount,
+                    SoccerRewardEventKind::BuildupChainCredit,
+                );
+            }
+        }
+    }
+
     pub(crate) fn record_shot_on_target_rewards(&mut self, shooting_team: Team, shooter: usize) {
         self.record_possession_touch(shooter);
+        self.record_buildup_chain_credit(
+            shooting_team,
+            Some(shooter),
+            BUILDUP_CHAIN_CREDIT_SHOT_ON_FRAME_BASE_POINTS,
+        );
         debug_assert!(
             (SHOT_ON_TARGET_REWARD_PATTERN.iter().sum::<f64>() - SHOT_ON_TARGET_REWARD_POINTS)
                 .abs()
