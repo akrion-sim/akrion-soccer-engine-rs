@@ -46256,6 +46256,34 @@ impl WorldSnapshot {
         Some(depths[..n].iter().sum::<f64>() / n as f64)
     }
 
+    /// How many yards the back four sits BEHIND the optimal gap to the opponent's foremost-attacker
+    /// line (the excess hole in front of it), `0` if already at/inside the optimal gap or if a
+    /// roster is degenerate. Fed into the line-depth RL reward so the learned head is steered toward
+    /// keeping the four compact with the attackers (MARL/MAPPO). Pure / RNG-free.
+    pub(crate) fn back_four_attacker_gap_excess_yards(&self, team: Team) -> Option<f64> {
+        let attacker_depth = self
+            .opponent_foremost_attackers_line_depth(team, BACK_FOUR_FOREMOST_ATTACKERS_COUNT)?;
+        let attack = team.attack_dir();
+        let own_goal_fwd = self.own_goal_y_for(team) * attack;
+        let mut sum = 0.0;
+        let mut n = 0.0;
+        for p in &self.players {
+            if p.team == team && p.role == PlayerRole::Defender {
+                let d = self.player_snapshot_position(p).y * attack - own_goal_fwd;
+                if d.is_finite() {
+                    sum += d;
+                    n += 1.0;
+                }
+            }
+        }
+        if n < 1.0 {
+            return None;
+        }
+        let back_four_depth = sum / n;
+        let gap = attacker_depth - back_four_depth;
+        Some((gap - BACK_FOUR_OPTIMAL_GAP_TO_ATTACKERS_YARDS).max(0.0))
+    }
+
     /// Raise `centre_depth` toward the opponent's foremost-attacker line so the back four fills the
     /// space in front of it (MARL/MAPPO press-to-attackers compaction). Applied only while WE
     /// control the ball or the ball is loose ("dispossession") — NOT while the opponent drives at
