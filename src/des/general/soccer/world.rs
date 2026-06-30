@@ -463,6 +463,12 @@ pub struct SoccerMatch {
     pub(crate) line_depth_samples: Vec<LineDepthSample>,
     /// Open line-depth decisions awaiting their windowed reward.
     pub(crate) pending_line_depth: Vec<PendingLineDepthDecision>,
+    /// Sticky back-four line-centre latch per team (Home=0, Away=1): the line centre held on the
+    /// sim-tick loop for ~[`BACK_FOUR_LINE_STICKY_ANCHOR_SECONDS`] so the four stop oscillating (the
+    /// "sine-wave"). `None` until first set / whenever the sticky anchor (or the v2 line) is gated
+    /// off. Maintained once per tick by [`Self::update_back_four_line_latch`]; read through the v2
+    /// line centre so both live line chokepoints target the same held line.
+    pub(crate) back_four_line_latch: [Option<BackFourLineLatch>; 2],
     /// The trained loose-ball commit head (which player attacks a loose ball), when
     /// present. Carried + trained across games by the learner; `None` ⇒ analytic
     /// seed. Shared into each [`WorldSnapshot`] via an `Arc` clone.
