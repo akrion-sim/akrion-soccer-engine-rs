@@ -8040,6 +8040,10 @@ impl SoccerMatch {
         };
         let phase_started = Instant::now();
         let tick_start_snapshot = WorldSnapshot::from_match_for_learning(self);
+        // Sticky back-four line anchor: latch/hold the line centre on the sim-tick loop (re-pick on
+        // the ~3s tick window / possession flip / a deeper drop) BEFORE this tick's decisions read
+        // it, so the four stop oscillating. No-op + clears the latch when gated off (byte-identical).
+        self.update_back_four_line_latch(&tick_start_snapshot);
         pre_field_snapshot_elapsed += phase_started.elapsed();
         let ball_velocity_before = self.ball.velocity;
         let ball_acceleration_before = self.ball.acceleration;
