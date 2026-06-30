@@ -13784,6 +13784,45 @@ impl SoccerMatch {
                                         speed,
                                     )
                             };
+                            // The decisive signal: the engine's OWN expected-completion for the
+                            // chosen pass — the same `pass_target_quality_for_snapshot` model the
+                            // option scorer and decision-trace use. The geometric vetoes only read
+                            // lane/marker geometry and miss a covered receiver / congested lane the
+                            // model rates a near-certain loss (observed live: passes released at
+                            // 2-5% completion straight to the opponent). Recompute it here at release
+                            // and abort the hopeless ball — re-aiming can't rescue a marked man, so
+                            // the carrier keeps possession and faces the intended run.
+                            let hopeless_completion = hopeless_on
+                                && match (
+                                    snapshot.players.iter().find(|p| p.id == player_id),
+                                    target_id.and_then(|tid| {
+                                        snapshot.players.iter().find(|p| p.id == tid)
+                                    }),
+                                ) {
+                                    (Some(passer), Some(target)) => {
+                                        pass_target_quality_for_snapshot(
+                                            &snapshot,
+                                            passer,
+                                            player_pos,
+                                            target,
+                                            receiver_position,
+                                            flight,
+                                        )
+                                        .expected_completion
+                                            < HOPELESS_PASS_COMPLETION_FLOOR
+                                    }
+                                    _ => false,
+                                };
+                            if hopeless_completion {
+                                let look = led_target - player_pos;
+                                if look.len() > 1e-6 {
+                                    let face = facing_bucket_from_vector(look);
+                                    if face != FacingBucket::Unknown {
+                                        self.players[player_id].action_facing = face;
+                                    }
+                                }
+                                return;
+                            }
                             let own_attack_dir = player_team.attack_dir();
                             // A long backward ball — especially an aerial hoof or one played under
                             // pressure — is a giveaway (10+ yds toward our own goal, often to nobody
