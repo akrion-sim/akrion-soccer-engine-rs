@@ -13389,6 +13389,7 @@ impl SoccerMatch {
                         if ground_pass_speed_floor_enabled() && !flight.is_aerial() {
                             launch_speed = floored_ground_pass_launch_speed(
                                 launch_speed,
+                                speed,
                                 facing_outcome.speed_cap_yps,
                             );
                         }
