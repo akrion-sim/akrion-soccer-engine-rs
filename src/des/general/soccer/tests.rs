@@ -89813,6 +89813,94 @@ fn unpressured_backward_pass_penalty_truth_table() {
 }
 
 #[test]
+fn overdribble_dispossession_penalty_truth_table() {
+    let pressed = OVERDRIBBLE_PRESSURE_RADIUS_YARDS - 1.0; // an opponent right on top of the carrier
+    let free = OVERDRIBBLE_PRESSURE_RADIUS_YARDS + 8.0; // no close opponent
+    let long_hold = OVERDRIBBLE_MIN_HOLD_SECONDS + 2.0;
+    // A short hold (under the overdue threshold) is never penalized — an unlucky strip on a fresh
+    // touch is not an over-dribble, however much pressure or however many outlets there were.
+    assert_eq!(
+        overdribble_dispossession_penalty_points(OVERDRIBBLE_MIN_HOLD_SECONDS - 0.1, pressed, 3),
+        0.0
+    );
+    // A long hold lost in OPEN space with NO outlets ignored is not punished (a clean tackle, not a
+    // blunder) — the penalty needs either pressure or an ignored pass.
+    assert_eq!(
+        overdribble_dispossession_penalty_points(long_hold, free, 0),
+        0.0
+    );
+    // A long hold under pressure IS penalized even with no outlets.
+    let under_pressure = overdribble_dispossession_penalty_points(long_hold, pressed, 0);
+    assert!(under_pressure > 0.0);
+    // A long hold in open space but with an ignored open outlet IS penalized.
+    let ignored_outlet = overdribble_dispossession_penalty_points(long_hold, free, 1);
+    assert!(ignored_outlet > 0.0);
+    // The longer the overdue hold, the bigger the penalty (monotonic in hold time).
+    let shorter = overdribble_dispossession_penalty_points(long_hold, pressed, 0);
+    let longer = overdribble_dispossession_penalty_points(long_hold + 3.0, pressed, 0);
+    assert!(longer > shorter, "penalty must grow with hold time: {shorter} < {longer}");
+    // More ignored outlets ⇒ bigger penalty.
+    let one_outlet = overdribble_dispossession_penalty_points(long_hold, free, 1);
+    let three_outlets = overdribble_dispossession_penalty_points(long_hold, free, 3);
+    assert!(three_outlets > one_outlet);
+    // Closer pressure ⇒ bigger penalty (the proximity multiplier).
+    let edge = overdribble_dispossession_penalty_points(long_hold, OVERDRIBBLE_PRESSURE_RADIUS_YARDS, 0);
+    let point_blank = overdribble_dispossession_penalty_points(long_hold, 0.2, 0);
+    assert!(point_blank > edge);
+    // Everything is capped.
+    assert_eq!(
+        overdribble_dispossession_penalty_points(10_000.0, 0.1, 100),
+        OVERDRIBBLE_MAX_PENALTY_POINTS
+    );
+    // Non-finite inputs are inert.
+    assert_eq!(overdribble_dispossession_penalty_points(f64::NAN, pressed, 3), 0.0);
+    assert_eq!(overdribble_dispossession_penalty_points(long_hold, f64::NAN, 3), 0.0);
+}
+
+#[test]
+fn carrier_forward_drive_gait_floor_grades_by_space_and_pressure() {
+    let open = CARRIER_DRIVE_TIGHT_PRESSURE_YARDS + 5.0; // not under tight pressure
+    let fresh = 0.0;
+    // Under tight pressure there is NO floor — close control wins, the carrier may walk.
+    assert_eq!(
+        carrier_forward_drive_gait_floor(30.0, CARRIER_DRIVE_TIGHT_PRESSURE_YARDS - 0.1, fresh),
+        None
+    );
+    // Too little room ahead ⇒ no floor.
+    assert_eq!(
+        carrier_forward_drive_gait_floor(CARRIER_DRIVE_JOG_SPACE_YARDS - 0.1, open, fresh),
+        None
+    );
+    // A couple of clear yards ⇒ at least a jog.
+    assert_eq!(
+        carrier_forward_drive_gait_floor(CARRIER_DRIVE_JOG_SPACE_YARDS, open, fresh),
+        Some(MovementGait::Jog)
+    );
+    // A clear lane ⇒ a run.
+    assert_eq!(
+        carrier_forward_drive_gait_floor(CARRIER_DRIVE_RUN_SPACE_YARDS, open, fresh),
+        Some(MovementGait::Run)
+    );
+    // Open field ⇒ a sprint (when fresh enough).
+    assert_eq!(
+        carrier_forward_drive_gait_floor(CARRIER_DRIVE_SPRINT_SPACE_YARDS, open, fresh),
+        Some(MovementGait::Sprint)
+    );
+    // Open field but gassed ⇒ capped at a run, not a sprint.
+    assert_eq!(
+        carrier_forward_drive_gait_floor(
+            CARRIER_DRIVE_SPRINT_SPACE_YARDS,
+            open,
+            CARRIER_DRIVE_SPRINT_MAX_FATIGUE + 0.05
+        ),
+        Some(MovementGait::Run)
+    );
+    // Non-finite inputs are inert.
+    assert_eq!(carrier_forward_drive_gait_floor(f64::NAN, open, fresh), None);
+    assert_eq!(carrier_forward_drive_gait_floor(30.0, f64::NAN, fresh), None);
+}
+
+#[test]
 fn slip_break_seam_and_runner_opportunity_are_recognised() {
     // Geometry/sign-convention coverage for the slip-and-break-the-offside-trap recognition
     // (the ungated seam + opportunity readers; the run-target and bias are env-gated and tested
