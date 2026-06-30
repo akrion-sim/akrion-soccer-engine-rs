@@ -135,17 +135,18 @@ pub(crate) fn goal_side_quality(
     }
 }
 
-/// Per-tick shaped reward (points) for a defending outfielder's goal-side quality `q ∈ [-1, 1]`:
-/// the positive reward scaled by `q` when goal-side, the *milder* failure penalty scaled by `q`
-/// when caught upfield. Caller applies the dense-shaping budget.
-pub(crate) fn goal_side_shaping_points(quality: f64) -> f64 {
+/// Per-player defensive learning reward for a true goal-side quality `q ∈ [-1, 1]`: the positive
+/// reward scaled by `q` when goal-side (on the ball→goal line), the failure penalty scaled by `q`
+/// when caught upfield. Replaces the legacy y-axis-only `{+0.24 / -0.12 / -0.42}` ladder with a
+/// continuous signal over the *true* goal-side definition, at matching magnitude.
+pub(crate) fn defensive_goal_side_role_reward(quality: f64) -> f64 {
     if !quality.is_finite() {
         return 0.0;
     }
     if quality >= 0.0 {
-        GOAL_SIDE_REWARD_POINTS * quality
+        GOAL_SIDE_REWARD_BEST_POINTS * quality
     } else {
-        GOAL_SIDE_FAIL_PENALTY_POINTS * quality
+        GOAL_SIDE_FAIL_WORST_POINTS * quality
     }
 }
 
