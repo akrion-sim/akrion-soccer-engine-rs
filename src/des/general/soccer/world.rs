@@ -9994,13 +9994,20 @@ impl SoccerMatch {
         intercepted_pass: Option<&PendingPass>,
     ) {
         self.record_reward_event(interceptor, 10.0);
-        self.record_possession_touch(interceptor);
         if let Some(pass) = intercepted_pass {
             let penalty = intercepted_pass_passer_penalty(pass, self.config.field_length_yards);
+            // Spread discounted blame over the PREVIOUS passers BEFORE the interceptor's touch
+            // clears the giving team's possession chain (`record_possession_touch` wipes it on a
+            // change of possession). The bad-pass player keeps the full penalty below; the prior
+            // one/two passers get 20% / 5% of it. No-op (byte-identical) when the gate is off.
+            self.record_turnover_chain_blame(pass.team, pass.from, penalty);
+            self.record_possession_touch(interceptor);
             self.record_reward_event(pass.from, -penalty);
             // The intercepted team just turned the ball over — penalize its last ~5s.
             let gaining_team = self.players.get(interceptor).map(|player| player.team);
             self.penalize_turnover_window_with_context(pass.team, gaining_team, self.ball.position);
+        } else {
+            self.record_possession_touch(interceptor);
         }
     }
 
