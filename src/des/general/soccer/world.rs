@@ -8249,6 +8249,9 @@ impl SoccerMatch {
         // `DD_SOCCER_ENABLE_RECEIVE_APPROACH_MODEL` is set).
         self.collect_receive_approach_rl_samples(&next_snapshot);
         self.collect_long_pass_run_rl_samples(&next_snapshot);
+        // Learnable give-and-go / wall-pass appetite RL samples (no-op + byte-identical unless
+        // `DD_SOCCER_ENABLE_LEARNED_GIVE_AND_GO` is set).
+        self.collect_give_and_go_rl_samples(&next_snapshot);
         // Learnable attacking-spacing target RL samples (no-op + byte-identical unless
         // `DD_SOCCER_ENABLE_LEARNED_SPACING_TARGET` is set).
         self.collect_attack_spacing_rl_samples(&next_snapshot);
