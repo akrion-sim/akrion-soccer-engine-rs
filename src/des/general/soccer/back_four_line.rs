@@ -1309,6 +1309,71 @@ mod back_four_line_tests {
     }
 
     #[test]
+    fn desired_gap_floor_is_possession_aware() {
+        // In possession the line may step right up to 5yd; out of possession (incl. a loose ball)
+        // it holds the deeper 20yd floor. Band top is always 40 either way.
+        assert!(
+            (back_four_desired_gap_min_yards(true)
+                - BACK_FOUR_LINE_DESIRED_GAP_IN_POSSESSION_MIN_YARDS)
+                .abs()
+                < 1e-9
+        );
+        assert!(
+            (back_four_desired_gap_min_yards(false) - BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS).abs()
+                < 1e-9
+        );
+        assert!(back_four_desired_gap_min_yards(true) < back_four_desired_gap_min_yards(false));
+    }
+
+    #[test]
+    fn attacker_press_raises_a_deep_centre_but_never_steps_ahead() {
+        // anchor/six 6, cap 65, optimal gap 12. Attackers' foremost line at depth 40.
+        let pressed = |centre: f64| back_four_attacker_pressed_depth(centre, 40.0, 12.0, 6.0, 65.0);
+        // A too-deep centre (15) is raised toward the attackers: 40 - 12 = 28.
+        assert!((pressed(15.0) - 28.0).abs() < 1e-9, "deep centre -> {}", pressed(15.0));
+        // A centre already higher than the press floor is left alone (push up only).
+        assert!((pressed(35.0) - 35.0).abs() < 1e-9, "high centre -> {}", pressed(35.0));
+        // Never sits AHEAD of the attacker line even with a tiny optimal gap.
+        let ahead = back_four_attacker_pressed_depth(10.0, 40.0, 0.0, 6.0, 65.0);
+        assert!(ahead <= 40.0 + 1e-9, "must not step ahead of attackers: {ahead}");
+    }
+
+    #[test]
+    fn attacker_press_is_monotonic_and_respects_six_and_cap() {
+        let pressed = |att: f64| back_four_attacker_pressed_depth(0.0, att, 12.0, 6.0, 65.0);
+        // A higher attacker line ⇒ a higher (or equal) pressed centre.
+        assert!(pressed(50.0) >= pressed(30.0));
+        // Never below the keeper's six even when attackers are very deep / centre is 0.
+        assert!(pressed(10.0) >= 6.0 - 1e-9, "floored at six: {}", pressed(10.0));
+        // Never past the high-line cap.
+        assert!(pressed(200.0) <= 65.0 + 1e-9, "capped: {}", pressed(200.0));
+    }
+
+    #[test]
+    fn hold_deadband_holds_within_band_and_corrects_outside_or_ahead_of_cap() {
+        let db = BACK_FOUR_LINE_HOLD_DEADBAND_YARDS;
+        // Within the deadband, no cap ⇒ HOLD current position (ignore the jittering target).
+        assert!(
+            (back_four_line_hold_target_fwd(30.0, 30.0 + db * 0.5, None, db) - 30.0).abs() < 1e-9
+        );
+        // Outside the deadband ⇒ move to the target.
+        let far = 30.0 + db * 2.0;
+        assert!((back_four_line_hold_target_fwd(30.0, far, None, db) - far).abs() < 1e-9);
+        // Illegally AHEAD of the cap ⇒ always corrected to the target, deadband notwithstanding.
+        let cap = 29.0;
+        let target = 28.5;
+        assert!(
+            (back_four_line_hold_target_fwd(30.0, target, Some(cap), db) - target).abs() < 1e-9,
+            "ahead of cap must be corrected"
+        );
+        // Behind the cap and within the band ⇒ HOLD.
+        assert!(
+            (back_four_line_hold_target_fwd(27.0, 27.0 + db * 0.5, Some(40.0), db) - 27.0).abs()
+                < 1e-9
+        );
+    }
+
+    #[test]
     fn reward_weighted_training_is_a_noop_on_empty_or_nonfinite() {
         let mut head = BackFourLineHead::new(5);
         assert_eq!(head.train_reward_weighted(&[], 0.05), 0.0);
