@@ -1438,6 +1438,13 @@ const PASS_RELEASE_OPPONENT_AIM_BUFFER_YARDS: f64 = 0.35;
 // intended receiver to the reception point by at least this margin for the release to count as a
 // straight giveaway. Keeps a 50/50 ball the receiver can contest from tripping the veto.
 const PASS_RECEPTION_LOSES_RECEIVER_MARGIN_YARDS: f64 = 1.5;
+// Hopeless-pass veto (completion model): at release, a chosen pass whose `expected_completion`
+// (the same `pass_target_quality_for_snapshot` model the option scorer / decision-trace uses) is
+// below this floor is aborted — the carrier keeps the ball rather than gift a near-certain
+// interception. Set well below the ~0.69 median of completed passes so only the clearly-doomed
+// ball (a covered receiver / blocked lane the model rates <25%) is vetoed, leaving brave threaded
+// passes alone. Tune via A/B against giveaway-rate vs completion-rate.
+const HOPELESS_PASS_COMPLETION_FLOOR: f64 = 0.25;
 // Selection-time counterpart to the release guard: a led floor-pass point that is
 // materially nearer an opponent than the teammate is a likely direct giveaway.
 const PASS_DIRECT_OPPONENT_AIM_HARD_VETO_MARGIN_YARDS: f64 = 2.0;
