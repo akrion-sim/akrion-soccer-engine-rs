@@ -1971,6 +1971,15 @@ const FORWARD_CARRY_FORWARD_PASS_MIN_YARDS: f64 = 2.0;
 /// 2-yard nudge earns nothing; the 2nd, 3rd… consecutive segment each earn this), so the signal
 /// rewards a carrier who keeps driving the ball forward, escalating with the length of the run.
 const SUSTAINED_FORWARD_DRIBBLE_SEGMENT_REWARD_POINTS: f64 = 1.0;
+/// FINE (1-yard) cadence of the sustained-dribble reward: "a yard of forward dribbling followed by
+/// another yard". Paid PER 1-yard segment past the first, in ADDITION to the 2-yard cadence above,
+/// so a continuous forward carry is rewarded at both granularities. Smaller per-segment (there are
+/// twice as many) so the two cadences stay balanced.
+const FORWARD_CARRY_FINE_SEGMENT_YARDS: f64 = 1.0;
+const SUSTAINED_FORWARD_DRIBBLE_FINE_SEGMENT_REWARD_POINTS: f64 = 0.5;
+/// Cap (1-yard segments) on the fine-cadence sustained-dribble payout — same 20-yard ceiling as the
+/// 2-yard cadence, expressed in 1-yard units.
+const FORWARD_CARRY_MAX_REWARDED_FINE_SEGMENTS: u32 = 20;
 /// Reward points per 2-yard segment of forward carry that CULMINATES in a forward pass or a shot —
 /// the "productive dribble" signal: a carry is only paid off when it leads to a forward pass or a
 /// shot (a carry that ends in a turnover or a backward/square ball earns nothing here). Comparable
