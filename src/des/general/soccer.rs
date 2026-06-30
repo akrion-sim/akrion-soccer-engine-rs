@@ -17915,6 +17915,7 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::SustainedForwardDribble
                 | SoccerRewardEventKind::UnpressuredBackwardPass
                 | SoccerRewardEventKind::BuildupChainCredit
+                | SoccerRewardEventKind::ReleaseLongInsideOwnHalf
                 | SoccerRewardEventKind::MatchResult
         )
     }
@@ -17940,6 +17941,7 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::CrashBoxArrival
                 | SoccerRewardEventKind::SustainedForwardDribble
                 | SoccerRewardEventKind::BuildupChainCredit
+        | SoccerRewardEventKind::ReleaseLongInsideOwnHalf
         )
     }
 }
@@ -32710,6 +32712,7 @@ fn soccer_requested_tactical_feature_gate_names() -> Vec<String> {
         "DD_SOCCER_ENABLE_IN_STRIDE_PASS_MARGIN",
         "DD_SOCCER_ENABLE_CONTINUE_RUN_AFTER_PASS",
         "DD_SOCCER_ENABLE_STRATEGY_PERSIST",
+        "DD_SOCCER_ENABLE_RELEASE_LONG_OWN_HALF",
         "DD_SOCCER_ENABLE_BLINDSIDE_STEAL",
         crash_box::FLANK_CRASH_BOX_ENABLE_ENV,
         "DD_SOCCER_ENABLE_SLIP_BREAK_OFFSIDE",
