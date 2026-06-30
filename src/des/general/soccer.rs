@@ -18801,6 +18801,29 @@ pub(crate) fn terrible_pass_veto_enabled() -> bool {
     }
 }
 
+/// Min speed (yps) for the passer to "continue the run" after a pass rather than fall back to shape.
+const CONTINUE_RUN_AFTER_PASS_MIN_SPEED_YPS: f64 = 2.0;
+/// How far ahead (yds, along the passer's current heading) to aim the continue-the-run move.
+const CONTINUE_RUN_AFTER_PASS_LOOKAHEAD_YARDS: f64 = 8.0;
+
+/// Whether the **continue-the-run-after-pass** behaviour is active this process: after playing a
+/// pass the passer keeps its momentum (overlap / give-and-go / support the ball forward) instead of
+/// turning back toward its home position on the release tick. Default-ON in production (env
+/// `DD_SOCCER_ENABLE_CONTINUE_RUN_AFTER_PASS=0/false` is the kill switch); default-OFF under test so
+/// the parity suite stays byte-identical.
+pub(crate) fn continue_run_after_pass_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_CONTINUE_RUN_AFTER_PASS").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_CONTINUE_RUN_AFTER_PASS"))
+    }
+}
+
 /// Whether the **in-stride pass margin** is active this process: kicking against your own momentum
 /// is softened from a near-veto (12% power at sprint-reverse) to a realistic MARGIN (≈50–62%), so a
 /// player can pass while running/sprinting instead of being forced to stop — the difficulty is a
