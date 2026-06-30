@@ -46043,8 +46043,32 @@ impl WorldSnapshot {
             })
             .unwrap_or(BACK_FOUR_LINE_NEUTRAL_GAP_FRACTION)
             .clamp(0.0, 1.0);
-        BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS
-            + (BACK_FOUR_LINE_DESIRED_GAP_MAX_YARDS - BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS) * frac
+        let base_gap = BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS
+            + (BACK_FOUR_LINE_DESIRED_GAP_MAX_YARDS - BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS) * frac;
+        if !back_four_push_into_dead_space_enabled() {
+            return base_gap;
+        }
+        // Push up to FILL DEAD SPACE: the line should not sit ~40yd off the ball when the zone in
+        // front of it is empty. If NO opponent (outfield) occupies the band between our back line
+        // and the ball, compress the gap toward the minimum (step up and squeeze) rather than
+        // holding a deep line off nobody. An opponent IN that band (a runner to mark / hold onside)
+        // keeps the deeper gap.
+        let attack = team.attack_dir();
+        let ball_fwd = self.ball.position.y * attack;
+        let approx_line_fwd = ball_fwd - base_gap;
+        let space_occupied = self.players.iter().any(|p| {
+            p.team == team.other() && p.role != PlayerRole::Goalkeeper && {
+                let f = self.player_snapshot_position(p).y * attack;
+                f > approx_line_fwd + BACK_FOUR_DEAD_SPACE_OCCUPANT_MARGIN_YARDS && f < ball_fwd
+            }
+        });
+        if space_occupied {
+            base_gap
+        } else {
+            BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS
+                + (base_gap - BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS)
+                    * (1.0 - BACK_FOUR_DEAD_SPACE_PUSH_FRACTION)
+        }
     }
 
     /// The v2 line-CENTRE forward-coordinate (attack frame) for `team`'s back four:
