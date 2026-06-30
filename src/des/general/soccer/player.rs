@@ -1502,6 +1502,7 @@ struct MpcExecutionEstimate {
     recommended_curve_bend_yards: f64,
     recommended_spin_rps: f64,
     recommended_curve: &'static str,
+    recommended_curve_technique: &'static str,
     horizon_seconds: f64,
     reselect_reason: &'static str,
     /// MPC shot foot choice: which foot the strike is taken with ("right"/"left"), and
@@ -1929,11 +1930,23 @@ fn mpc_execution_estimate_for_action(
             DiscretizedKickCurve::Right => "right",
             DiscretizedKickCurve::None => "none",
         };
+        let curve_technique = if curve == DiscretizedKickCurve::None {
+            DiscretizedKickTechnique::None
+        } else {
+            pass_curve_technique_for_player(
+                &player.skills,
+                flight,
+                is_cross,
+                distance,
+                1.0 - lane_margin_fit,
+                curl_probability,
+            )
+        };
+        estimate.recommended_curve_technique = curve_technique.as_str();
         estimate.recommended_curve_bend_yards = if curve == DiscretizedKickCurve::None {
             0.0
         } else {
-            (0.55 + distance / 24.0).clamp(0.55, 2.8)
-                * (0.72 + ability01(player.skills.flair_passing) * 0.56)
+            pass_curve_bend_yards_for_player(&player.skills, flight, distance, curve_technique)
         };
         estimate.recommended_spin_rps =
             (estimate.recommended_curve_bend_yards / distance.max(1.0) * speed.max(1.0) * 0.42)
@@ -2065,10 +2078,22 @@ fn mpc_execution_estimate_for_action(
         } else {
             "none"
         };
+        let curve_technique = shot_curve_technique_for_player(
+            &player.skills,
+            observation.perceived_pressure,
+            observation.yards_to_goal,
+            observation.opponent_goal_angle_degrees,
+            observation.shot_curl_probability,
+        );
+        estimate.recommended_curve_technique = curve_technique.as_str();
         estimate.recommended_curve_bend_yards = if estimate.recommended_curve == "none" {
             0.0
         } else {
-            (0.45 + observation.yards_to_goal / 28.0).clamp(0.45, 2.2)
+            shot_curve_bend_yards_for_player(
+                &player.skills,
+                observation.yards_to_goal,
+                curve_technique,
+            )
         };
         estimate.recommended_spin_rps = (estimate.recommended_curve_bend_yards
             / observation.yards_to_goal.max(1.0)
@@ -2615,6 +2640,9 @@ pub(crate) fn player_mdp_mpc_comparison_trace(
         ),
         mpc_recommended_spin_rps: finite_metric(execution_estimate.recommended_spin_rps),
         mpc_recommended_curve: execution_estimate.recommended_curve.to_string(),
+        mpc_recommended_curve_technique: execution_estimate
+            .recommended_curve_technique
+            .to_string(),
         mpc_execution_horizon_seconds: finite_metric(execution_estimate.horizon_seconds),
         mpc_reselect_reason: execution_estimate.reselect_reason.to_string(),
         mpc_guidance_present: true,

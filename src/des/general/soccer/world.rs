@@ -12478,13 +12478,13 @@ impl SoccerMatch {
         }
     }
 
-    /// Rule B helper: if a midfielder/forward has lingered in a genuine offside position beyond the
-    /// recovery grace window, return the spot to move back to to get onside; otherwise
-    /// `None`. Marginal offside runs keep the normal [`OFFSIDE_GRACE_SECONDS`] timing,
-    /// while clearly deep offside positions are recovered sooner. "Offside" is the real
-    /// thing — in the opponents' half, beyond the 2nd-last opponent (the keeper counts as a
-    /// defender) AND beyond the ball, with our team the last to touch it. An attacker through
-    /// on goal WITH the ball, or the intended receiver of an in-flight pass, is exempt and
+    /// Rule B helper: if a midfielder/forward is lingering in a genuine offside position, return
+    /// the spot to move back to to get onside; otherwise `None`. The start time is distance-aware:
+    /// marginal offside runs keep the normal [`OFFSIDE_GRACE_SECONDS`] timing, while deeper
+    /// positions start earlier so the player can actually clear the line within the 3-5s recovery
+    /// window. "Offside" is the real thing — in the opponents' half, beyond the active offside
+    /// line (the more goalward of the ball and second-last opponent, keeper included). An attacker
+    /// through on goal WITH the ball, or the intended receiver of an in-flight pass, is exempt and
     /// keeps its run.
     pub(crate) fn attacker_offside_recovery_target(&self, player_id: usize) -> Option<Vec2> {
         let me = self.players.iter().find(|p| p.id == player_id)?;
@@ -12524,14 +12524,8 @@ impl SoccerMatch {
                 return None;
             }
         }
-        // Confirm STILL offside now (guards a stale clock from a prior possession): in the
-        // opponents' half, beyond the 2nd-last opponent (keeper included), beyond the ball.
+        // Confirm STILL offside now (guards a stale clock from a prior possession).
         let pos = me.position;
-        let attack_dir = me.team.attack_dir();
-        let half_line = self.config.field_length_yards * 0.5;
-        if (pos.y - half_line) * attack_dir <= 0.0 {
-            return None;
-        }
         let mut opp_ys: Vec<f64> = self
             .players
             .iter()
@@ -12551,26 +12545,33 @@ impl SoccerMatch {
             }
         }
         let line_y = opp_ys[1];
-        let offside_yards = (pos.y - line_y) * attack_dir;
-        let beyond_line = offside_yards > 0.0;
-        let beyond_ball = (pos.y - self.ball.position.y) * attack_dir > 0.0;
-        if !beyond_line || !beyond_ball {
-            return None;
-        }
-        let recovery_grace = if offside_yards >= DEEP_OFFSIDE_RECOVERY_MARGIN_YARDS {
+        let assessment = offside_position_assessment(
+            me.team,
+            pos,
+            self.ball.position.y,
+            line_y,
+            self.config.field_length_yards,
+        )?;
+        // Move back to just onside of the active offside line, holding lateral position.
+        let attack_dir = me.team.attack_dir();
+        let onside_y = assessment.active_line_y - STRIKER_ONSIDE_BUFFER_YARDS * attack_dir;
+        let target = Vec2::new(pos.x, onside_y).clamp_to_pitch(
+            self.config.field_width_yards,
+            self.config.field_length_yards,
+        );
+        let distance_to_onside = pos.distance(target);
+        let distance_aware_start = (OFFSIDE_RECOVERY_COMPLETION_TARGET_SECONDS
+            - distance_to_onside / OFFSIDE_RECOVERY_JOG_REFERENCE_YPS)
+            .clamp(DEEP_OFFSIDE_RECOVERY_GRACE_SECONDS, OFFSIDE_GRACE_SECONDS);
+        let recovery_grace = if assessment.yards_beyond_line >= DEEP_OFFSIDE_RECOVERY_MARGIN_YARDS {
             DEEP_OFFSIDE_RECOVERY_GRACE_SECONDS
         } else {
-            OFFSIDE_GRACE_SECONDS
+            distance_aware_start
         };
         if self.offside_clocks.get(&player_id).copied().unwrap_or(0.0) <= recovery_grace {
             return None;
         }
-        // Move back to just onside of the 2nd-last line, holding lateral position.
-        let onside_y = line_y - STRIKER_ONSIDE_BUFFER_YARDS * attack_dir;
-        Some(Vec2::new(pos.x, onside_y).clamp_to_pitch(
-            self.config.field_width_yards,
-            self.config.field_length_yards,
-        ))
+        Some(target)
     }
 
     pub(crate) fn apply_player_intent(&mut self, intent: PlayerIntent) {
@@ -12720,9 +12721,9 @@ impl SoccerMatch {
             return;
         }
         // Rule B (attacker onside discipline): a mid/forward that has loitered in an offside
-        // position beyond the 3s grace is pulled back onside — at a jog, no forced sprint
-        // (soft, eventual consistency). Offside here is the real thing (opponents' half,
-        // beyond the 2nd-last opponent incl. the keeper, beyond the ball, our ball last).
+        // position is pulled back onside. Marginal corrections stay calm; material corrections
+        // run so the player actually clears the line inside the recovery window.
+        // Offside here is the real thing (opponents' half, beyond the active offside line).
         // An attacker through ON GOAL WITH THE BALL, or the target of an in-flight pass, is
         // exempt and keeps its run. Overrides off-ball movement only.
         if matches!(
@@ -12735,7 +12736,7 @@ impl SoccerMatch {
         ) {
             if let Some(onside) = self.attacker_offside_recovery_target(player_id) {
                 let urgent = self.players[player_id].position.distance(onside)
-                    >= DEEP_OFFSIDE_RECOVERY_MARGIN_YARDS;
+                    >= OFFSIDE_RECOVERY_URGENT_DISTANCE_YARDS;
                 self.move_player_towards(player_id, onside, urgent);
                 return;
             }
@@ -13616,6 +13617,7 @@ impl SoccerMatch {
                         pressure,
                     );
                     let mut curve = DiscretizedKickCurve::None;
+                    let mut curve_technique = DiscretizedKickTechnique::None;
                     let mut curve_bend_yards = 0.0;
                     if pass_curl_probability >= 0.46 && !slip_break_profile.available {
                         let path = aimed_target - player_pos;
@@ -13630,10 +13632,24 @@ impl SoccerMatch {
                             } else {
                                 DiscretizedKickCurve::Right
                             };
-                            curve_bend_yards = (0.55 + distance / 24.0).clamp(0.55, 2.8)
-                                * (0.72
-                                    + ability01(self.players[player_id].skills.flair_passing)
-                                        * 0.56);
+                            curve_technique = pass_curve_technique_for_player(
+                                &self.players[player_id].skills,
+                                flight,
+                                is_cross,
+                                distance,
+                                pressure,
+                                pass_curl_probability,
+                            );
+                            if curve_technique == DiscretizedKickTechnique::None {
+                                curve = DiscretizedKickCurve::None;
+                            } else {
+                                curve_bend_yards = pass_curve_bend_yards_for_player(
+                                    &self.players[player_id].skills,
+                                    flight,
+                                    distance,
+                                    curve_technique,
+                                );
+                            }
                         }
                     }
                     let elevation = DiscretizedKickElevation::from_pass_flight(flight);
@@ -13650,6 +13666,7 @@ impl SoccerMatch {
                             discretized_kick_power_for_speed(speed, envelope_min, envelope_max),
                             aimed_target - player_pos,
                             curve,
+                            curve_technique,
                             elevation,
                         );
                         discretized_kick_release_clamped_to_pitch(
@@ -13670,6 +13687,7 @@ impl SoccerMatch {
                                 intended_target: aimed_target,
                                 speed_yps: speed,
                                 curve,
+                                technique: curve_technique,
                                 curve_bend_yards,
                                 elevation,
                             },
@@ -14082,6 +14100,7 @@ impl SoccerMatch {
                     );
                     let speed = shot_speed_yps_from_power(power, &self.players[player_id].skills);
                     let mut curve = DiscretizedKickCurve::None;
+                    let mut curve_technique = DiscretizedKickTechnique::None;
                     let mut curve_bend_yards = 0.0;
                     if use_curl {
                         let path = goal - player_pos;
@@ -14092,11 +14111,22 @@ impl SoccerMatch {
                             } else {
                                 DiscretizedKickCurve::Right
                             };
-                            curve_bend_yards = (0.75
-                                + observation.yards_to_goal.clamp(0.0, 34.0) / 18.0)
-                                .clamp(0.75, 3.6)
-                                * (0.78
-                                    + ability01(self.players[player_id].skills.shooting) * 0.46);
+                            curve_technique = shot_curve_technique_for_player(
+                                &self.players[player_id].skills,
+                                pressure,
+                                observation.yards_to_goal,
+                                observation.opponent_goal_angle_degrees,
+                                curl_probability,
+                            );
+                            if curve_technique == DiscretizedKickTechnique::None {
+                                curve = DiscretizedKickCurve::None;
+                            } else {
+                                curve_bend_yards = shot_curve_bend_yards_for_player(
+                                    &self.players[player_id].skills,
+                                    observation.yards_to_goal,
+                                    curve_technique,
+                                );
+                            }
                         }
                     }
                     let release = kick_release_clamped_to_pitch(
@@ -14105,6 +14135,7 @@ impl SoccerMatch {
                             intended_target: goal,
                             speed_yps: speed,
                             curve,
+                            technique: curve_technique,
                             curve_bend_yards,
                             elevation: DiscretizedKickElevation::Floor,
                         },
@@ -18626,26 +18657,32 @@ impl SoccerMatch {
             return;
         };
         let ball_y = after.ball.position.y;
-        let attack_dir = attacking_team.attack_dir();
-        let half_line = after.field_length * 0.5;
         let dt = sane_dt_seconds(self.config.dt_seconds, DEFAULT_DT_SECONDS).max(1e-3);
-        // An attacker is in an offside position when they are, IN THE OPPONENTS' HALF,
-        // beyond both the second-last defender line and the ball in the attacking
-        // direction. (You cannot be offside in your own half — Law 11.)
+        // An attacker is in an offside position when they are in the opponents' half and beyond
+        // the active offside line (the more goalward of the second-last defender and the ball).
+        // Reuse the same geometry helper as pass officiating so MARL/MAPPO rewards cannot drift
+        // from the live Law 11 definition.
         let states: Vec<(usize, bool, f64)> = self
             .players
             .iter()
             .filter(|p| p.team == attacking_team && p.role != PlayerRole::Goalkeeper)
             .map(|p| {
-                let pos_y = after.player_position(p.id).unwrap_or(p.position).y;
-                let beyond_line = (pos_y - line_y) * attack_dir;
-                let in_opp_half = (pos_y - half_line) * attack_dir > 0.0;
-                let offside = after.ball.holder != Some(p.id)
-                    && in_opp_half
-                    && beyond_line > 0.0
-                    && (pos_y - ball_y) * attack_dir > 0.0;
-                // Yards past the last-defender line — the distance dimension.
-                (p.id, offside, beyond_line.max(0.0))
+                let position = after.player_position(p.id).unwrap_or(p.position);
+                let offside = if after.ball.holder == Some(p.id) {
+                    None
+                } else {
+                    offside_position_assessment(
+                        attacking_team,
+                        position,
+                        ball_y,
+                        line_y,
+                        after.field_length,
+                    )
+                };
+                let offside_yards = offside
+                    .map(|assessment| assessment.yards_beyond_line)
+                    .unwrap_or(0.0);
+                (p.id, offside.is_some(), offside_yards)
             })
             .collect();
         let mut events: Vec<(usize, f64)> = Vec::new();
@@ -23423,6 +23460,58 @@ pub(crate) fn player_sample_forward_progress_over_seconds(
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct OffsidePositionAssessment {
+    ball_y: f64,
+    second_last_defender_y: f64,
+    active_line_y: f64,
+    yards_beyond_line: f64,
+}
+
+const OFFSIDE_RECOVERY_COMPLETION_TARGET_SECONDS: f64 = 4.5;
+const OFFSIDE_RECOVERY_JOG_REFERENCE_YPS: f64 = 3.0;
+const OFFSIDE_RECOVERY_URGENT_DISTANCE_YARDS: f64 = 4.0;
+
+fn active_offside_line_y(team: Team, ball_y: f64, second_last_defender_y: f64) -> f64 {
+    match team {
+        Team::Home => ball_y.max(second_last_defender_y),
+        Team::Away => ball_y.min(second_last_defender_y),
+    }
+}
+
+fn offside_position_assessment(
+    team: Team,
+    position: Vec2,
+    ball_y: f64,
+    second_last_defender_y: f64,
+    field_length: f64,
+) -> Option<OffsidePositionAssessment> {
+    if !position.x.is_finite()
+        || !position.y.is_finite()
+        || !ball_y.is_finite()
+        || !second_last_defender_y.is_finite()
+        || !field_length.is_finite()
+    {
+        return None;
+    }
+    let attack_dir = team.attack_dir();
+    let half_line = field_length * 0.5;
+    if (position.y - half_line) * attack_dir <= 0.0 {
+        return None;
+    }
+    let active_line_y = active_offside_line_y(team, ball_y, second_last_defender_y);
+    let yards_beyond_line = (position.y - active_line_y) * attack_dir;
+    if yards_beyond_line <= 0.0 {
+        return None;
+    }
+    Some(OffsidePositionAssessment {
+        ball_y,
+        second_last_defender_y,
+        active_line_y,
+        yards_beyond_line,
+    })
+}
+
 impl WorldSnapshot {
     pub(crate) fn from_match(m: &SoccerMatch) -> Self {
         Self::from_match_with_options(m, WorldSnapshotOptions::FULL)
@@ -28011,10 +28100,11 @@ impl WorldSnapshot {
         // in-behind run (excluded above) may stretch beyond it. The legacy behaviour
         // parked them OPEN_SPACE_RUN_OFFSIDE_TOLERANCE_YARDS past the line — a standing
         // offside position — so any ball that reached them was flagged.
+        let active_line_y = active_offside_line_y(player.team, self.ball.position.y, line_y);
         let cap_y = if dd_soccer_disable_onside_support_hold() {
-            self.open_space_support_line_y(player.team, line_y)
+            self.open_space_support_line_y(player.team, active_line_y)
         } else {
-            line_y
+            active_line_y
         };
         let beyond_line = (target.y - cap_y) * attack > 0.0;
         let in_attacking_half = (target.y - half_line) * attack > 0.0;
@@ -28283,6 +28373,8 @@ impl WorldSnapshot {
                 shot_beat_goalkeeper_probability: 0.0,
                 shot_curl_probability: 0.0,
                 pass_curl_probability: 0.0,
+                shot_outside_foot_curve_probability: 0.0,
+                pass_outside_foot_curve_probability: 0.0,
                 immediate_dispossession_risk: 0.0,
                 yards_to_goal: 0.0,
                 yards_to_own_goal: 0.0,
@@ -28975,6 +29067,29 @@ impl WorldSnapshot {
         };
         let pass_curl_probability = if has_ball {
             pass_curl_probability_for_snapshot(
+                self,
+                me,
+                me_position,
+                &visible_pass_targets,
+                &visible_aerial_pass_targets,
+                perceived_pressure,
+            )
+        } else {
+            0.0
+        };
+        let shot_outside_foot_curve_probability = if has_ball {
+            shot_outside_foot_curve_probability_for_player(
+                &me.skills,
+                perceived_pressure,
+                (goal.y - me_position.y).abs(),
+                self.goal_angle_degrees(me_position, me.team),
+                shot_curl_probability,
+            )
+        } else {
+            0.0
+        };
+        let pass_outside_foot_curve_probability = if has_ball {
+            pass_outside_foot_curve_probability_for_snapshot(
                 self,
                 me,
                 me_position,
@@ -29832,6 +29947,8 @@ impl WorldSnapshot {
             shot_beat_goalkeeper_probability,
             shot_curl_probability,
             pass_curl_probability,
+            shot_outside_foot_curve_probability,
+            pass_outside_foot_curve_probability,
             immediate_dispossession_risk,
             yards_to_goal,
             yards_to_own_goal: (own_goal.y - me_position.y).abs(),
@@ -33461,38 +33578,29 @@ impl WorldSnapshot {
         if defender_ys.len() < 2 {
             return None;
         }
-
-        let is_offside = match passer.team {
+        match passer.team {
             Team::Home => {
                 defender_ys.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-                let second_last_defender_y = defender_ys[1];
-                (target_position.y > self.ball.position.y)
-                    && (target_position.y > second_last_defender_y)
-                    && (target_position.y > half_line)
             }
             Team::Away => {
                 defender_ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                let second_last_defender_y = defender_ys[1];
-                (target_position.y < self.ball.position.y)
-                    && (target_position.y < second_last_defender_y)
-                    && (target_position.y < half_line)
             }
-        };
-        if !is_offside {
-            return None;
         }
+        let assessment = offside_position_assessment(
+            passer.team,
+            target_position,
+            self.ball.position.y,
+            defender_ys[1],
+            self.field_length,
+        )?;
 
-        let second_last_defender_y = match passer.team {
-            Team::Home => defender_ys[1],
-            Team::Away => defender_ys[1],
-        };
         Some(PendingOffside {
             team: passer.team,
             passer: passer.id,
             target: target.id,
             position: target_position,
-            ball_y: self.ball.position.y,
-            second_last_defender_y,
+            ball_y: assessment.ball_y,
+            second_last_defender_y: assessment.second_last_defender_y,
         })
     }
 
@@ -34019,14 +34127,9 @@ impl WorldSnapshot {
     }
 
     fn open_space_offside_excess_yards(&self, team: Team, position: Vec2) -> f64 {
-        if !self.position_would_be_offside(team, position) {
-            return 0.0;
-        }
-        self.second_last_defender_line_for(team)
-            .map_or(0.0, |line_y| {
-                ((position.y - line_y) * team.attack_dir() - OPEN_SPACE_RUN_OFFSIDE_TOLERANCE_YARDS)
-                    .max(0.0)
-            })
+        self.offside_position_for(team, position).map_or(0.0, |assessment| {
+            (assessment.yards_beyond_line - OPEN_SPACE_RUN_OFFSIDE_TOLERANCE_YARDS).max(0.0)
+        })
     }
 
     fn open_space_offside_excess_yards_for_player(
@@ -39411,9 +39514,15 @@ impl WorldSnapshot {
     fn predicted_ball_position(&self, lookahead_seconds: f64) -> Vec2 {
         let t = lookahead_seconds.clamp(0.0, 5.0);
         let p = self.ball.position;
+        let curve_acceleration = if self.ball.velocity.len() > 1e-6 {
+            let dir = self.ball.velocity.normalized();
+            self.ball.curl_acceleration - dir * self.ball.curl_acceleration.dot(dir)
+        } else {
+            Vec2::zero()
+        };
         let raw = p
             + self.ball.velocity * t
-            + self.ball.acceleration * (0.5 * t * t)
+            + (self.ball.acceleration + curve_acceleration) * (0.5 * t * t)
             + self.ball.jerk * (t * t * t / 6.0);
         let mut disp = raw - p;
         if !disp.x.is_finite() || !disp.y.is_finite() {
@@ -48859,34 +48968,23 @@ impl WorldSnapshot {
             .unwrap_or(true)
     }
 
+    fn offside_position_for(
+        &self,
+        team: Team,
+        position: Vec2,
+    ) -> Option<OffsidePositionAssessment> {
+        let second_last_defender_y = self.second_last_defender_line_for(team)?;
+        offside_position_assessment(
+            team,
+            position,
+            self.ball.position.y,
+            second_last_defender_y,
+            self.field_length,
+        )
+    }
+
     pub(crate) fn position_would_be_offside(&self, team: Team, position: Vec2) -> bool {
-        let half_line = self.field_length * 0.5;
-        match team {
-            Team::Home if position.y <= half_line => return false,
-            Team::Away if position.y >= half_line => return false,
-            _ => {}
-        }
-
-        let mut defender_ys = self
-            .players
-            .iter()
-            .filter(|p| p.team == team.other())
-            .filter_map(|p| self.player_position(p.id).map(|position| position.y))
-            .collect::<Vec<_>>();
-        if defender_ys.len() < 2 {
-            return false;
-        }
-
-        match team {
-            Team::Home => {
-                defender_ys.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-                position.y > self.ball.position.y && position.y > defender_ys[1]
-            }
-            Team::Away => {
-                defender_ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                position.y < self.ball.position.y && position.y < defender_ys[1]
-            }
-        }
+        self.offside_position_for(team, position).is_some()
     }
 
     pub(crate) fn position_would_be_offside_for_player(

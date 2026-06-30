@@ -4129,8 +4129,12 @@ const SOCCER_NEURAL_PRE_STALE_DRIBBLE_STEAL_FEATURE_DIM: usize =
 const SOCCER_NEURAL_PRE_DEFENSIVE_GOAL_SIDE_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_STALE_DRIBBLE_STEAL_FEATURE_DIM
         + SOCCER_NEURAL_STALE_DRIBBLE_STEAL_FEATURE_DIM;
-const SOCCER_NEURAL_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_DEFENSIVE_GOAL_SIDE_FEATURE_DIM
-    + SOCCER_NEURAL_DEFENSIVE_GOAL_SIDE_FEATURE_DIM;
+const SOCCER_NEURAL_PRE_CURVE_TECHNIQUE_FEATURE_DIM: usize =
+    SOCCER_NEURAL_PRE_DEFENSIVE_GOAL_SIDE_FEATURE_DIM
+        + SOCCER_NEURAL_DEFENSIVE_GOAL_SIDE_FEATURE_DIM;
+const SOCCER_NEURAL_CURVE_TECHNIQUE_FEATURE_DIM: usize = 2;
+const SOCCER_NEURAL_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_CURVE_TECHNIQUE_FEATURE_DIM
+    + SOCCER_NEURAL_CURVE_TECHNIQUE_FEATURE_DIM;
 /// Fixed dimensionality of a persisted **moment embedding** (the vector stored
 /// in pgvector for similarity retrieval). Deliberately decoupled from — and
 /// larger than — `SOCCER_NEURAL_FEATURE_DIM`, which grows as features are added:
@@ -4596,6 +4600,10 @@ const SOCCER_NEURAL_FEATURE_DEFENSIVE_GOAL_SIDE_LATERAL_MISS: usize =
     SOCCER_NEURAL_FEATURE_DEFENSIVE_GOAL_SIDE_LINE_FIT + 1;
 const SOCCER_NEURAL_FEATURE_DEFENSIVE_GOAL_SIDE_RECOVERY_PRESSURE: usize =
     SOCCER_NEURAL_FEATURE_DEFENSIVE_GOAL_SIDE_LATERAL_MISS + 1;
+const SOCCER_NEURAL_FEATURE_PASS_OUTSIDE_FOOT_CURVE: usize =
+    SOCCER_NEURAL_PRE_CURVE_TECHNIQUE_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_SHOT_OUTSIDE_FOOT_CURVE: usize =
+    SOCCER_NEURAL_FEATURE_PASS_OUTSIDE_FOOT_CURVE + 1;
 const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     61,
     62,
@@ -4732,6 +4740,8 @@ const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     SOCCER_NEURAL_PRE_STALE_DRIBBLE_STEAL_FEATURE_DIM,
     // Same schema with stale-dribble steal-risk, before defensive goal-side line channels.
     SOCCER_NEURAL_PRE_DEFENSIVE_GOAL_SIDE_FEATURE_DIM,
+    // Same schema with defensive goal-side line channels, before curve-technique channels.
+    SOCCER_NEURAL_PRE_CURVE_TECHNIQUE_FEATURE_DIM,
 ];
 const TEAM_SHAPE_NEAR_BALL_RADIUS_YARDS: f64 = 18.0;
 // Tight same-team congestion rings reported in the brain trace so a human can see
@@ -6769,6 +6779,10 @@ pub struct SoccerPomdpObservation {
     #[serde(default)]
     pub pass_curl_probability: f64,
     #[serde(default)]
+    pub shot_outside_foot_curve_probability: f64,
+    #[serde(default)]
+    pub pass_outside_foot_curve_probability: f64,
+    #[serde(default)]
     pub immediate_dispossession_risk: f64,
     pub yards_to_goal: f64,
     #[serde(default)]
@@ -7188,6 +7202,8 @@ pub struct SoccerMdpMpcComparisonTrace {
     pub mpc_recommended_spin_rps: f64,
     #[serde(default)]
     pub mpc_recommended_curve: String,
+    #[serde(default)]
+    pub mpc_recommended_curve_technique: String,
     #[serde(default)]
     pub mpc_execution_horizon_seconds: f64,
     #[serde(default)]
@@ -9178,6 +9194,10 @@ pub struct SoccerQStateKey {
     #[serde(default)]
     pub pass_curl_probability_bin: u8,
     #[serde(default)]
+    pub shot_outside_foot_curve_probability_bin: u8,
+    #[serde(default)]
+    pub pass_outside_foot_curve_probability_bin: u8,
+    #[serde(default)]
     pub immediate_dispossession_risk_bin: u8,
     pub visible_pass_options_bin: u8,
     #[serde(default)]
@@ -9872,6 +9892,14 @@ impl SoccerQStateKey {
             pass_curl_probability_bin: distance_bucket(
                 observation.pass_curl_probability,
                 &[0.10, 0.24, 0.42, 0.62],
+            ),
+            shot_outside_foot_curve_probability_bin: distance_bucket(
+                observation.shot_outside_foot_curve_probability,
+                &[0.12, 0.28, 0.46, 0.64],
+            ),
+            pass_outside_foot_curve_probability_bin: distance_bucket(
+                observation.pass_outside_foot_curve_probability,
+                &[0.12, 0.28, 0.46, 0.64],
             ),
             immediate_dispossession_risk_bin: distance_bucket(
                 observation.immediate_dispossession_risk,
@@ -10581,6 +10609,10 @@ impl SoccerQStateKey {
             && self.shot_blocker_distance_bin == other.shot_blocker_distance_bin
             && self.shot_curl_probability_bin == other.shot_curl_probability_bin
             && self.pass_curl_probability_bin == other.pass_curl_probability_bin
+            && self.shot_outside_foot_curve_probability_bin
+                == other.shot_outside_foot_curve_probability_bin
+            && self.pass_outside_foot_curve_probability_bin
+                == other.pass_outside_foot_curve_probability_bin
             && self.immediate_dispossession_risk_bin == other.immediate_dispossession_risk_bin
             && self.visible_pass_options_bin == other.visible_pass_options_bin
             && self.visible_aerial_pass_options_bin == other.visible_aerial_pass_options_bin
@@ -40611,6 +40643,10 @@ fn soccer_neural_transition_features_with_action(
         soccer_neural_scaled(obs.defensive_goal_side_lateral_miss_yards, 12.0);
     features[SOCCER_NEURAL_FEATURE_DEFENSIVE_GOAL_SIDE_RECOVERY_PRESSURE] =
         soccer_neural_unit(obs.defensive_goal_side_recovery_pressure);
+    features[SOCCER_NEURAL_FEATURE_PASS_OUTSIDE_FOOT_CURVE] =
+        soccer_neural_unit(obs.pass_outside_foot_curve_probability);
+    features[SOCCER_NEURAL_FEATURE_SHOT_OUTSIDE_FOOT_CURVE] =
+        soccer_neural_unit(obs.shot_outside_foot_curve_probability);
     debug_assert_eq!(features.len(), SOCCER_NEURAL_FEATURE_DIM);
     features
 }
@@ -57299,6 +57335,40 @@ impl DiscretizedKickCurve {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+pub enum DiscretizedKickTechnique {
+    #[default]
+    None,
+    InsideFoot,
+    OutsideFoot,
+}
+
+impl DiscretizedKickTechnique {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            DiscretizedKickTechnique::None => "none",
+            DiscretizedKickTechnique::InsideFoot => "inside-foot",
+            DiscretizedKickTechnique::OutsideFoot => "outside-foot",
+        }
+    }
+
+    pub(crate) fn curl_multiplier(self) -> f64 {
+        match self {
+            DiscretizedKickTechnique::None => 1.0,
+            DiscretizedKickTechnique::InsideFoot => 1.0,
+            DiscretizedKickTechnique::OutsideFoot => 1.28,
+        }
+    }
+
+    fn effective_for_curve(self) -> Self {
+        match self {
+            DiscretizedKickTechnique::None => DiscretizedKickTechnique::InsideFoot,
+            other => other,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum DiscretizedKickElevation {
     #[default]
     Floor,
@@ -57324,6 +57394,10 @@ impl DiscretizedKickElevation {
             | DiscretizedKickElevation::Scoop => BALL_ROLLING_ALTITUDE_YARDS + 0.04,
         }
     }
+
+    fn is_airborne(self) -> bool {
+        !matches!(self, DiscretizedKickElevation::Floor)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -57334,6 +57408,8 @@ pub struct DiscretizedKickAction {
     #[serde(default)]
     pub curve: DiscretizedKickCurve,
     #[serde(default)]
+    pub technique: DiscretizedKickTechnique,
+    #[serde(default)]
     pub elevation: DiscretizedKickElevation,
 }
 
@@ -57342,12 +57418,14 @@ impl DiscretizedKickAction {
         speed_bucket: u8,
         direction_bucket: u8,
         curve: DiscretizedKickCurve,
+        technique: DiscretizedKickTechnique,
         elevation: DiscretizedKickElevation,
     ) -> Self {
         DiscretizedKickAction {
             speed_bucket: speed_bucket.min(DISCRETIZED_KICK_SPEED_BUCKETS - 1),
             direction_bucket: direction_bucket % DISCRETIZED_KICK_DIRECTION_BUCKETS,
             curve,
+            technique,
             elevation,
         }
     }
@@ -57356,12 +57434,14 @@ impl DiscretizedKickAction {
         power: f64,
         direction: Vec2,
         curve: DiscretizedKickCurve,
+        technique: DiscretizedKickTechnique,
         elevation: DiscretizedKickElevation,
     ) -> Self {
         Self::new(
             discretized_kick_speed_bucket_for_power(power),
             discretized_kick_direction_bucket_for_vector(direction),
             curve,
+            technique,
             elevation,
         )
     }
@@ -57428,6 +57508,7 @@ pub(crate) struct KickReleaseSpec {
     intended_target: Vec2,
     speed_yps: f64,
     curve: DiscretizedKickCurve,
+    technique: DiscretizedKickTechnique,
     curve_bend_yards: f64,
     elevation: DiscretizedKickElevation,
 }
@@ -57438,6 +57519,7 @@ pub(crate) struct LoweredKickRelease {
     intended_target: Vec2,
     velocity: Vec2,
     curl_acceleration: Vec2,
+    technique: DiscretizedKickTechnique,
     altitude_yards: f64,
     speed_yps: f64,
 }
@@ -57520,6 +57602,33 @@ fn masked_discretized_kick_curve(
     }
 }
 
+fn kick_curve_flight_distance_multiplier(
+    elevation: DiscretizedKickElevation,
+    distance_yards: f64,
+) -> f64 {
+    let long_fit = ((distance_yards - 18.0) / 42.0).clamp(0.0, 1.0);
+    if elevation.is_airborne() {
+        1.0 + long_fit * 0.42
+    } else {
+        1.0 + long_fit * 0.16
+    }
+}
+
+pub(crate) fn kick_curve_bend_yards_for_technique(
+    base_bend_yards: f64,
+    technique: DiscretizedKickTechnique,
+    elevation: DiscretizedKickElevation,
+    distance_yards: f64,
+) -> f64 {
+    if !base_bend_yards.is_finite() {
+        return 0.0;
+    }
+    (base_bend_yards.abs()
+        * technique.curl_multiplier()
+        * kick_curve_flight_distance_multiplier(elevation, distance_yards))
+    .clamp(0.0, 9.5)
+}
+
 fn kick_release(spec: KickReleaseSpec) -> LoweredKickRelease {
     kick_release_with_pitch_bounds(spec, None)
 }
@@ -57550,12 +57659,18 @@ fn kick_release_with_pitch_bounds(
         0.0
     };
     let intended_dir = (intended_target - origin).normalized();
-    let bend_yards = if spec.curve_bend_yards.is_finite() {
-        spec.curve_bend_yards.abs().clamp(0.0, 8.0)
-    } else {
-        0.0
-    };
     let curve_sign = spec.curve.lateral_sign();
+    let technique = if curve_sign.abs() > 0.0 {
+        spec.technique.effective_for_curve()
+    } else {
+        DiscretizedKickTechnique::None
+    };
+    let bend_yards = kick_curve_bend_yards_for_technique(
+        spec.curve_bend_yards,
+        technique,
+        spec.elevation,
+        origin.distance(intended_target),
+    );
     let lateral = Vec2::new(-intended_dir.y, intended_dir.x);
     let launch_target = if curve_sign.abs() > 0.0 && bend_yards > 1e-9 {
         intended_target + lateral * curve_sign * bend_yards
@@ -57585,6 +57700,7 @@ fn kick_release_with_pitch_bounds(
         intended_target,
         velocity,
         curl_acceleration,
+        technique,
         altitude_yards: spec.elevation.release_altitude_yards(),
         speed_yps,
     }
@@ -57674,6 +57790,11 @@ fn lower_discretized_kick_release_bounded(
             intended_target: origin + direction * distance,
             speed_yps,
             curve,
+            technique: if curve == DiscretizedKickCurve::None {
+                DiscretizedKickTechnique::None
+            } else {
+                action.technique
+            },
             curve_bend_yards,
             elevation: action.elevation,
         },
@@ -57838,6 +57959,74 @@ fn shot_curl_probability_for_player(
         .clamp(0.02, 0.74)
 }
 
+pub(crate) fn shot_outside_foot_curve_probability_for_player(
+    skills: &SkillProfile,
+    pressure: f64,
+    yards_to_goal: f64,
+    goal_angle_degrees: f64,
+    curl_probability: f64,
+) -> f64 {
+    let shooting = ability01(skills.shooting);
+    let foot_power = ability01(
+        skills
+            .right_foot_shot_power
+            .max(skills.left_foot_shot_power),
+    );
+    let flair = ability01(skills.flair_passing);
+    let range_fit = (1.0 - (yards_to_goal - 22.0).abs() / 38.0).clamp(0.0, 1.0);
+    let narrow_angle_need = (1.0 - goal_angle_degrees / 38.0).clamp(0.0, 1.0);
+    (curl_probability.clamp(0.0, 1.0) * 0.34
+        + flair * 0.34
+        + shooting * 0.16
+        + foot_power * 0.08
+        + range_fit * 0.06
+        + narrow_angle_need * 0.09
+        - pressure.clamp(0.0, 1.0) * 0.18)
+        .clamp(0.0, 0.82)
+}
+
+pub(crate) fn shot_curve_technique_for_player(
+    skills: &SkillProfile,
+    pressure: f64,
+    yards_to_goal: f64,
+    goal_angle_degrees: f64,
+    curl_probability: f64,
+) -> DiscretizedKickTechnique {
+    if curl_probability < 0.36 {
+        return DiscretizedKickTechnique::None;
+    }
+    let outside = shot_outside_foot_curve_probability_for_player(
+        skills,
+        pressure,
+        yards_to_goal,
+        goal_angle_degrees,
+        curl_probability,
+    );
+    if outside >= 0.48 {
+        DiscretizedKickTechnique::OutsideFoot
+    } else {
+        DiscretizedKickTechnique::InsideFoot
+    }
+}
+
+pub(crate) fn shot_curve_bend_yards_for_player(
+    skills: &SkillProfile,
+    yards_to_goal: f64,
+    technique: DiscretizedKickTechnique,
+) -> f64 {
+    if technique == DiscretizedKickTechnique::None {
+        return 0.0;
+    }
+    let shooting = ability01(skills.shooting);
+    let base = (0.75 + yards_to_goal / 18.0).clamp(0.75, 3.6) * (0.78 + shooting * 0.46);
+    kick_curve_bend_yards_for_technique(
+        base,
+        technique,
+        DiscretizedKickElevation::Floor,
+        yards_to_goal,
+    )
+}
+
 fn pass_curl_probability_for_player(
     skills: &SkillProfile,
     flight: PassFlight,
@@ -57859,6 +58048,80 @@ fn pass_curl_probability_for_player(
     (0.025 + technique * 0.46 + distance_fit * 0.10 + aerial_bonus
         - pressure.clamp(0.0, 1.0) * 0.18)
         .clamp(0.01, 0.72)
+}
+
+pub(crate) fn pass_outside_foot_curve_probability_for_player(
+    skills: &SkillProfile,
+    flight: PassFlight,
+    is_cross: bool,
+    distance: f64,
+    pressure: f64,
+    curl_probability: f64,
+) -> f64 {
+    let passing = ability01(skills.passing_completion_rate);
+    let crossing = ability01(skills.crossing_left.max(skills.crossing_right));
+    let flair = ability01(skills.flair_passing);
+    let technique = if is_cross {
+        crossing * 0.40 + passing * 0.20
+    } else {
+        passing * 0.42 + ability01(skills.passing) * 0.16
+    };
+    let long_fit = ((distance - 16.0) / 42.0).clamp(0.0, 1.0);
+    let aerial_fit = if flight.is_aerial() { 0.14 } else { 0.0 };
+    let cross_fit = if is_cross { 0.07 } else { 0.0 };
+    (curl_probability.clamp(0.0, 1.0) * 0.28
+        + flair * 0.34
+        + technique
+        + long_fit * 0.13
+        + aerial_fit
+        + cross_fit
+        - pressure.clamp(0.0, 1.0) * 0.20)
+        .clamp(0.0, 0.84)
+}
+
+pub(crate) fn pass_curve_technique_for_player(
+    skills: &SkillProfile,
+    flight: PassFlight,
+    is_cross: bool,
+    distance: f64,
+    pressure: f64,
+    curl_probability: f64,
+) -> DiscretizedKickTechnique {
+    if curl_probability < 0.38 {
+        return DiscretizedKickTechnique::None;
+    }
+    let outside = pass_outside_foot_curve_probability_for_player(
+        skills,
+        flight,
+        is_cross,
+        distance,
+        pressure,
+        curl_probability,
+    );
+    if outside >= 0.52 {
+        DiscretizedKickTechnique::OutsideFoot
+    } else {
+        DiscretizedKickTechnique::InsideFoot
+    }
+}
+
+pub(crate) fn pass_curve_bend_yards_for_player(
+    skills: &SkillProfile,
+    flight: PassFlight,
+    distance: f64,
+    technique: DiscretizedKickTechnique,
+) -> f64 {
+    if technique == DiscretizedKickTechnique::None {
+        return 0.0;
+    }
+    let flair = ability01(skills.flair_passing);
+    let base = (0.55 + distance / 24.0).clamp(0.55, 2.8) * (0.72 + flair * 0.56);
+    kick_curve_bend_yards_for_technique(
+        base,
+        technique,
+        DiscretizedKickElevation::from_pass_flight(flight),
+        distance,
+    )
 }
 
 fn pass_curl_probability_for_snapshot(
@@ -57894,6 +58157,54 @@ fn pass_curl_probability_for_snapshot(
                 is_cross,
                 player_position.distance(target_position),
                 pressure,
+            ));
+        }
+    }
+    best.clamp(0.0, 1.0)
+}
+
+pub(crate) fn pass_outside_foot_curve_probability_for_snapshot(
+    snapshot: &WorldSnapshot,
+    player: &PlayerSnapshot,
+    player_position: Vec2,
+    floor_targets: &[usize],
+    aerial_targets: &[usize],
+    pressure: f64,
+) -> f64 {
+    let mut best: f64 = 0.0;
+    for (targets, flight) in [
+        (floor_targets, PassFlight::Floor),
+        (aerial_targets, PassFlight::Aerial),
+    ] {
+        for target_id in targets.iter().take(3) {
+            let Some(target) = snapshot.players.iter().find(|p| p.id == *target_id) else {
+                continue;
+            };
+            let target_position = snapshot
+                .player_position(target.id)
+                .unwrap_or(target.position);
+            let is_cross = pass_would_be_cross(
+                player_position,
+                target_position,
+                player.team,
+                snapshot.field_width,
+                snapshot.field_length,
+            );
+            let distance = player_position.distance(target_position);
+            let curl_probability = pass_curl_probability_for_player(
+                &player.skills,
+                flight,
+                is_cross,
+                distance,
+                pressure,
+            );
+            best = best.max(pass_outside_foot_curve_probability_for_player(
+                &player.skills,
+                flight,
+                is_cross,
+                distance,
+                pressure,
+                curl_probability,
             ));
         }
     }
@@ -60566,6 +60877,14 @@ fn classify_movement_gait(team: Team, to_target: Vec2, sprint: bool, chased: boo
         } else {
             MovementGait::BackWalk
         }
+    } else if retreating && sprint && distance > 4.0 {
+        // Urgent retreat means turn and run. A deliberate recovery sprint back toward our own
+        // goal should not be reduced to a back-pedal just because the player is not being chased.
+        if distance > 8.0 {
+            MovementGait::Sprint
+        } else {
+            MovementGait::Run
+        }
     } else if retreating {
         if distance <= 2.4 {
             MovementGait::BackWalk
@@ -62007,11 +62326,13 @@ mod discretized_kick_scaffold_tests {
             0.56,
             west,
             DiscretizedKickCurve::Right,
+            DiscretizedKickTechnique::OutsideFoot,
             DiscretizedKickElevation::Floor,
         );
         assert_eq!(action.speed_bucket, 5);
         assert_eq!(action.direction_bucket, 18);
         assert_eq!(action.curve, DiscretizedKickCurve::Right);
+        assert_eq!(action.technique, DiscretizedKickTechnique::OutsideFoot);
         assert_eq!(action.direction_degrees_center(), 180.0);
     }
 
@@ -62041,6 +62362,7 @@ mod discretized_kick_scaffold_tests {
             0,
             9,
             DiscretizedKickCurve::Left,
+            DiscretizedKickTechnique::InsideFoot,
             DiscretizedKickElevation::Floor,
         );
         let release = lower_discretized_kick_release(
@@ -62055,6 +62377,7 @@ mod discretized_kick_scaffold_tests {
 
         assert_eq!(release.launch_target, release.intended_target);
         assert_eq!(release.curl_acceleration, Vec2::zero());
+        assert_eq!(release.technique, DiscretizedKickTechnique::None);
         assert_eq!(release.altitude_yards, 0.0);
     }
 
@@ -62064,6 +62387,7 @@ mod discretized_kick_scaffold_tests {
             9,
             9,
             DiscretizedKickCurve::Left,
+            DiscretizedKickTechnique::InsideFoot,
             DiscretizedKickElevation::Aerial,
         );
         let origin = Vec2::new(50.0, 40.0);
@@ -62078,10 +62402,50 @@ mod discretized_kick_scaffold_tests {
         );
 
         assert!(release.altitude_yards > BALL_ROLLING_ALTITUDE_YARDS);
+        assert_eq!(release.technique, DiscretizedKickTechnique::InsideFoot);
         assert!(release.curl_acceleration.len() > 0.0);
         assert!(release.launch_target.x < release.intended_target.x);
         assert_close(release.launch_target.y, origin.y + 30.0, 1e-9);
         assert_close(release.velocity.len(), release.speed_yps, 1e-9);
+    }
+
+    #[test]
+    fn outside_foot_long_aerial_kick_gets_more_magnus_bend_than_inside_floor() {
+        let origin = Vec2::new(50.0, 40.0);
+        let inside_floor = kick_release(KickReleaseSpec {
+            origin,
+            intended_target: Vec2::new(50.0, 72.0),
+            speed_yps: mph_to_yps(36.0),
+            curve: DiscretizedKickCurve::Left,
+            technique: DiscretizedKickTechnique::InsideFoot,
+            curve_bend_yards: 2.0,
+            elevation: DiscretizedKickElevation::Floor,
+        });
+        let outside_aerial = kick_release(KickReleaseSpec {
+            origin,
+            intended_target: Vec2::new(50.0, 72.0),
+            speed_yps: mph_to_yps(36.0),
+            curve: DiscretizedKickCurve::Left,
+            technique: DiscretizedKickTechnique::OutsideFoot,
+            curve_bend_yards: 2.0,
+            elevation: DiscretizedKickElevation::Aerial,
+        });
+
+        assert_eq!(inside_floor.technique, DiscretizedKickTechnique::InsideFoot);
+        assert_eq!(
+            outside_aerial.technique,
+            DiscretizedKickTechnique::OutsideFoot
+        );
+        assert!(outside_aerial.altitude_yards > BALL_ROLLING_ALTITUDE_YARDS);
+        assert!(
+            outside_aerial.launch_target.distance(outside_aerial.intended_target)
+                > inside_floor.launch_target.distance(inside_floor.intended_target) * 1.25,
+            "outside/aerial bend should exceed inside/floor bend"
+        );
+        assert!(
+            outside_aerial.curl_acceleration.len() > inside_floor.curl_acceleration.len(),
+            "outside/aerial curl acceleration should be stronger"
+        );
     }
 
     #[test]
@@ -62108,6 +62472,7 @@ mod discretized_kick_scaffold_tests {
                 discretized_kick_power_for_speed(speed, min_yps, max_yps),
                 dir,
                 DiscretizedKickCurve::None,
+                DiscretizedKickTechnique::None,
                 DiscretizedKickElevation::Floor,
             );
             let release = discretized_kick_release_clamped_to_pitch(
@@ -62145,6 +62510,7 @@ mod discretized_kick_scaffold_tests {
             intended_target: Vec2::new(10.0, 0.0),
             speed_yps: 5.0,
             curve: DiscretizedKickCurve::None,
+            technique: DiscretizedKickTechnique::None,
             curve_bend_yards: 3.0,
             elevation: DiscretizedKickElevation::from_pass_flight(PassFlight::Scoop),
         });
@@ -62164,6 +62530,7 @@ mod discretized_kick_scaffold_tests {
                 intended_target: Vec2::new(1.0, 30.0),
                 speed_yps: mph_to_yps(35.0),
                 curve: DiscretizedKickCurve::Left,
+                technique: DiscretizedKickTechnique::InsideFoot,
                 curve_bend_yards: 4.0,
                 elevation: DiscretizedKickElevation::Floor,
             },

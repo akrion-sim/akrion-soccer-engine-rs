@@ -2987,6 +2987,124 @@ fn attacker_offside_beyond_grace_is_recovered_onside_with_exemptions() {
 }
 
 #[test]
+fn active_ball_line_defines_offside_and_recovery_target() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 79,
+        ..Default::default()
+    });
+    let holder = 5;
+    let runner = 9;
+    park_players_except(&mut sim, &[holder, runner]);
+    sim.players[holder].team = Team::Home;
+    sim.players[holder].role = PlayerRole::Midfielder;
+    sim.players[holder].position = Vec2::new(40.0, 100.0);
+    sim.players[runner].team = Team::Home;
+    sim.players[runner].role = PlayerRole::Forward;
+    sim.players[runner].position = Vec2::new(40.0, 102.0);
+    for away in 11..22 {
+        sim.players[away].team = Team::Away;
+        sim.players[away].position = Vec2::new(40.0, 45.0);
+    }
+    sim.players[11].position = Vec2::new(40.0, 118.0);
+    sim.players[12].position = Vec2::new(40.0, 82.0);
+    sim.ball.holder = Some(holder);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.offside_clocks
+        .insert(runner, OFFSIDE_GRACE_SECONDS + 0.2);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert!(
+        snapshot.pending_offside_for_pass(holder, runner).is_some(),
+        "runner beyond both the ball and second-last defender is offside"
+    );
+    assert!(
+        !snapshot.position_would_be_offside(Team::Home, Vec2::new(40.0, 99.0)),
+        "a teammate behind the ball is onside even when ahead of the second-last defender"
+    );
+    let capped = snapshot.clamp_forward_onside_support(
+        snapshot
+            .players
+            .iter()
+            .find(|player| player.id == runner)
+            .expect("runner snapshot"),
+        Vec2::new(40.0, 106.0),
+    );
+    assert!(
+        (capped.y - 100.0).abs() <= 1e-9,
+        "support cap should use the active ball line: {capped:?}"
+    );
+
+    let target = sim
+        .attacker_offside_recovery_target(runner)
+        .expect("runner beyond the active ball line should recover");
+    assert!(
+        (target.y - (100.0 - STRIKER_ONSIDE_BUFFER_YARDS)).abs() <= 1e-9,
+        "recovery target should clear the active ball line: {target:?}"
+    );
+    assert!(
+        target.y > 90.0,
+        "recovery should clear the active ball line, not retreat all the way to the defender line: {target:?}"
+    );
+}
+
+#[test]
+fn material_offside_recovery_starts_before_full_grace_and_turns_to_run() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 80,
+        ..Default::default()
+    });
+    let holder = 5;
+    let runner = 9;
+    park_players_except(&mut sim, &[holder, runner]);
+    sim.players[holder].team = Team::Home;
+    sim.players[holder].role = PlayerRole::Midfielder;
+    sim.players[holder].position = Vec2::new(35.0, 70.0);
+    sim.players[runner].team = Team::Home;
+    sim.players[runner].role = PlayerRole::Forward;
+    sim.players[runner].position = Vec2::new(40.0, 89.0);
+    for away in 11..22 {
+        sim.players[away].team = Team::Away;
+        sim.players[away].position = Vec2::new(40.0, 45.0);
+    }
+    sim.players[11].position = Vec2::new(40.0, 118.0);
+    sim.players[12].position = Vec2::new(40.0, 82.0);
+    sim.ball.holder = Some(holder);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.acceleration = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.offside_clocks.insert(runner, OFFSIDE_GRACE_SECONDS - 1.0);
+
+    assert!(
+        sim.attacker_offside_recovery_target(runner).is_some(),
+        "materially offside runners should begin recovering before the full penalty grace expires"
+    );
+    let before_y = sim.players[runner].position.y;
+    sim.apply_player_intent(PlayerIntent {
+        player_id: runner,
+        action: SoccerAction::HoldShape,
+        sprint: false,
+    });
+
+    assert!(
+        sim.players[runner].position.y < before_y,
+        "runner should immediately move back toward onside: before={before_y} after={}",
+        sim.players[runner].position.y
+    );
+    assert!(
+        matches!(
+            sim.players[runner].movement_gait,
+            MovementGait::Run | MovementGait::Sprint
+        ),
+        "material recovery should turn and run, not linger as {:?}",
+        sim.players[runner].movement_gait
+    );
+}
+
+#[test]
 fn offside_clocks_tick_in_live_mode_when_learning_is_disabled() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.2,
@@ -15376,8 +15494,8 @@ fn pomdp_q_state_and_player_decision_use_front_behind_field_context() {
         SOCCER_NEURAL_PRE_FORWARD_OPTION_FEATURE_DIM
     );
     assert_eq!(
-        SOCCER_NEURAL_PRE_DEFENSIVE_GOAL_SIDE_FEATURE_DIM
-            + SOCCER_NEURAL_DEFENSIVE_GOAL_SIDE_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_CURVE_TECHNIQUE_FEATURE_DIM
+            + SOCCER_NEURAL_CURVE_TECHNIQUE_FEATURE_DIM,
         SOCCER_NEURAL_FEATURE_DIM
     );
 
@@ -51866,8 +51984,8 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
     );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_DIM,
-        SOCCER_NEURAL_PRE_DEFENSIVE_GOAL_SIDE_FEATURE_DIM
-            + SOCCER_NEURAL_DEFENSIVE_GOAL_SIDE_FEATURE_DIM
+        SOCCER_NEURAL_PRE_CURVE_TECHNIQUE_FEATURE_DIM
+            + SOCCER_NEURAL_CURVE_TECHNIQUE_FEATURE_DIM
     );
     assert_eq!(SOCCER_NEURAL_TEAM_CENTER_FEATURE_DIM, 18);
     assert_eq!(SOCCER_NEURAL_RELATIONAL_ATTENTION_FEATURE_DIM, 8);
@@ -52057,8 +52175,8 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
         SOCCER_NEURAL_PRE_FORWARD_OPTION_FEATURE_DIM
     );
     assert_eq!(
-        SOCCER_NEURAL_PRE_DEFENSIVE_GOAL_SIDE_FEATURE_DIM
-            + SOCCER_NEURAL_DEFENSIVE_GOAL_SIDE_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_CURVE_TECHNIQUE_FEATURE_DIM
+            + SOCCER_NEURAL_CURVE_TECHNIQUE_FEATURE_DIM,
         SOCCER_NEURAL_FEATURE_DIM
     );
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&170));
@@ -61246,6 +61364,70 @@ fn ball_curl_acceleration_bends_free_ball_trajectory() {
     assert!(sim.ball.position.y > 60.0);
     assert!(sim.ball.velocity.y > 0.0);
     assert!(sim.ball.curl_acceleration.len() < 4.0);
+}
+
+#[test]
+fn outside_foot_curve_availability_reaches_learning_surfaces() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 304,
+        ..Default::default()
+    });
+    let passer = 7usize;
+    let receiver = 9usize;
+    park_players_except(&mut sim, &[passer, receiver]);
+    sim.players[passer].role = PlayerRole::Midfielder;
+    sim.players[passer].position = Vec2::new(18.0, 84.0);
+    sim.players[passer].home_position = sim.players[passer].position;
+    sim.players[passer].skills.passing_completion_rate = 9.4;
+    sim.players[passer].skills.passing = 9.2;
+    sim.players[passer].skills.crossing_left = 9.2;
+    sim.players[passer].skills.crossing_right = 9.2;
+    sim.players[passer].skills.flair_passing = 9.8;
+    sim.players[passer].skills.shooting = 9.0;
+    sim.players[passer].skills.right_foot_shot_power = 9.1;
+    sim.players[passer].skills.left_foot_shot_power = 8.8;
+    sim.players[receiver].role = PlayerRole::Forward;
+    sim.players[receiver].position = Vec2::new(66.0, 105.0);
+    sim.players[receiver].home_position = sim.players[receiver].position;
+    sim.players[receiver].team = Team::Home;
+    sim.ball.holder = Some(passer);
+    sim.ball.position = sim.players[passer].position;
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let observation = snapshot.observation_for(passer);
+    assert!(
+        observation.pass_outside_foot_curve_probability > 0.45,
+        "POMDP should expose outside-foot pass curl availability: {}",
+        observation.pass_outside_foot_curve_probability
+    );
+    assert!(
+        observation.shot_outside_foot_curve_probability > 0.35,
+        "POMDP should expose outside-foot shot curl availability: {}",
+        observation.shot_outside_foot_curve_probability
+    );
+
+    let q_key = SoccerQStateKey::from_parts(
+        &snapshot.mdp_state_for_player(passer),
+        &observation,
+        Team::Home,
+        sim.players[passer].role,
+    );
+    assert!(q_key.pass_outside_foot_curve_probability_bin > 0);
+    assert!(q_key.shot_outside_foot_curve_probability_bin > 0);
+
+    let transition = test_learning_transition(&sim, sim.tick, passer, Team::Home, "pass");
+    let features = soccer_neural_transition_features(&transition);
+    assert!(
+        features[SOCCER_NEURAL_FEATURE_PASS_OUTSIDE_FOOT_CURVE] > 0.45,
+        "neural learner should see outside-foot pass curl availability"
+    );
+    assert!(
+        features[SOCCER_NEURAL_FEATURE_SHOT_OUTSIDE_FOOT_CURVE] > 0.35,
+        "neural learner should see outside-foot shot curl availability"
+    );
 }
 
 #[test]
@@ -70801,8 +70983,8 @@ fn first_touch_escape_lateral_neural_block_is_appended_and_migration_safe() {
     );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_DIM,
-        SOCCER_NEURAL_PRE_DEFENSIVE_GOAL_SIDE_FEATURE_DIM
-            + SOCCER_NEURAL_DEFENSIVE_GOAL_SIDE_FEATURE_DIM
+        SOCCER_NEURAL_PRE_CURVE_TECHNIQUE_FEATURE_DIM
+            + SOCCER_NEURAL_CURVE_TECHNIQUE_FEATURE_DIM
     );
     assert_eq!(SOCCER_NEURAL_RELATIONAL_ATTENTION_FEATURE_DIM, 8);
     assert_eq!(SOCCER_NEURAL_SOLO_CARRIER_FEATURE_DIM, 4);
@@ -70924,6 +71106,10 @@ fn first_touch_escape_lateral_neural_block_is_appended_and_migration_safe() {
     );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_DEFENSIVE_GOAL_SIDE_RECOVERY_PRESSURE + 1,
+        SOCCER_NEURAL_PRE_CURVE_TECHNIQUE_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_SHOT_OUTSIDE_FOOT_CURVE + 1,
         SOCCER_NEURAL_FEATURE_DIM
     );
     assert!(SOCCER_NEURAL_FEATURE_DEFENSIVE_PRESS_ACTION < SOCCER_NEURAL_FEATURE_DIM);
@@ -70933,6 +71119,8 @@ fn first_touch_escape_lateral_neural_block_is_appended_and_migration_safe() {
     assert!(
         SOCCER_NEURAL_FEATURE_DEFENSIVE_GOAL_SIDE_RECOVERY_PRESSURE < SOCCER_NEURAL_FEATURE_DIM
     );
+    assert!(SOCCER_NEURAL_FEATURE_PASS_OUTSIDE_FOOT_CURVE < SOCCER_NEURAL_FEATURE_DIM);
+    assert!(SOCCER_NEURAL_FEATURE_SHOT_OUTSIDE_FOOT_CURVE < SOCCER_NEURAL_FEATURE_DIM);
     assert!(SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_LANE_OPEN < SOCCER_NEURAL_FEATURE_DIM);
     assert!(SOCCER_NEURAL_FEATURE_FIRST_TOUCH_FREEZE_RISK < SOCCER_NEURAL_FEATURE_DIM);
     assert!(SOCCER_NEURAL_FEATURE_DRIBBLE_DEFENDER_OVERCOMMIT < SOCCER_NEURAL_FEATURE_DIM);
@@ -72173,9 +72361,10 @@ fn through_ball_strategy_fires_offside_breaking_runs_off_cadence() {
         .find(|p| p.team == Team::Home && p.role == PlayerRole::Midfielder)
         .unwrap()
         .id;
-    // Calm holder at midfield with the ball; no opponents crowding it.
+    // Calm holder just beyond the backfield-long-pass band, still in the neutral in-behind
+    // window, with no opponents crowding it. That isolates the cadence/through-ball strategy gate.
     sim.ball.holder = Some(holder);
-    sim.players[holder].position = Vec2::new(40.0, sim.config.field_length_yards * 0.5);
+    sim.players[holder].position = Vec2::new(40.0, sim.config.field_length_yards * 0.5 + 10.0);
     sim.ball.position = sim.players[holder].position;
     sim.ball.last_touch_team = Some(Team::Home);
 
@@ -72186,7 +72375,7 @@ fn through_ball_strategy_fires_offside_breaking_runs_off_cadence() {
     let staging_y = line_y - Team::Home.attack_dir() * 20.0;
     sim.players[runner].position = Vec2::new(40.0, staging_y);
     for t in 0..41u64 {
-        if (t + runner as u64 * 17) % 41 > 5 {
+        if (t + runner as u64 * 17) % 41 > 18 {
             sim.tick = t;
             break;
         }
