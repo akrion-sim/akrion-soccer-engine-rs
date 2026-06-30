@@ -1434,6 +1434,10 @@ const PASS_RECEPTION_OPPONENT_TIME_MARGIN: f64 = 0.95;
 // Release-time safety net: if endpoint noise/MPC lead would aim a floor pass this much
 // closer to an opponent than the intended teammate, pull it back toward the teammate/lead.
 const PASS_RELEASE_OPPONENT_AIM_BUFFER_YARDS: f64 = 0.35;
+// Hopeless-pass veto (`pass_reception_loses_to_opponent`): the nearest opponent must beat the
+// intended receiver to the reception point by at least this margin for the release to count as a
+// straight giveaway. Keeps a 50/50 ball the receiver can contest from tripping the veto.
+const PASS_RECEPTION_LOSES_RECEIVER_MARGIN_YARDS: f64 = 1.5;
 // Selection-time counterpart to the release guard: a led floor-pass point that is
 // materially nearer an opponent than the teammate is a likely direct giveaway.
 const PASS_DIRECT_OPPONENT_AIM_HARD_VETO_MARGIN_YARDS: f64 = 2.0;
