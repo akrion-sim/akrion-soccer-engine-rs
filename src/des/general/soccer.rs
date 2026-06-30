@@ -1970,6 +1970,34 @@ const TEAM_ADVANCE_CARRIER_DRIVE_REWARD: f64 = 0.30;
 /// Dense shaping reward for an OFF-BALL teammate making a forward supporting run while the team
 /// advances upfield — the "whole team moves forward" signal that pulls runners up with the ball.
 const TEAM_ADVANCE_SUPPORT_RUN_REWARD: f64 = 0.22;
+/// A teammate must be at least this far BEYOND the opponent's last outfield defender (the offside
+/// line) to count as a "release long inside own half" target — a genuine break of the line.
+const RELEASE_LONG_MIN_BEYOND_YARDS: f64 = 3.0;
+/// …and at least this far ahead of the ball, so it is a real forward long ball (not a square one).
+const RELEASE_LONG_MIN_AHEAD_OF_BALL_YARDS: f64 = 8.0;
+/// Minimum carrier→receiver distance for the long release.
+const RELEASE_LONG_MIN_DISTANCE_YARDS: f64 = 16.0;
+/// The receiver must be this open (nearest opponent ≥) for the long ball to be worth releasing.
+const RELEASE_LONG_RECEIVER_OPEN_YARDS: f64 = 5.0;
+/// MARL/MAPPO reward (points) for releasing a long ball to a teammate who is beyond the opponent's
+/// last outfield defender but ONSIDE in our own half — the "release long inside own half" strategy
+/// (you cannot be offside in your own half). Big enough to teach the line-breaking ball.
+const RELEASE_LONG_INSIDE_OWN_HALF_REWARD_POINTS: f64 = 9.0;
+
+/// Whether `receiver_adv` (advancement toward the opponent goal, 0 at our own goal) is a valid
+/// "release long inside own half" target: BEYOND the opponent's last outfield defender / offside
+/// line (so they'd be offside in the opponent half) BUT still in our OWN half (so they are ONSIDE
+/// by the own-half rule), and genuinely ahead of the ball. `halfway_adv` = field_length/2. Pure.
+pub(crate) fn release_long_inside_own_half_qualifies(
+    receiver_adv: f64,
+    offside_line_adv: f64,
+    ball_adv: f64,
+    halfway_adv: f64,
+) -> bool {
+    receiver_adv < halfway_adv
+        && receiver_adv > offside_line_adv + RELEASE_LONG_MIN_BEYOND_YARDS
+        && receiver_adv > ball_adv + RELEASE_LONG_MIN_AHEAD_OF_BALL_YARDS
+}
 /// One progressive-carry "segment": every this-many yards the carrier advances the ball FORWARD
 /// (Δy·attack toward the opponent goal; lateral x movement is allowed, only the forward component
 /// counts). Both progressive-carry rewards are denominated in these 2-yard segments. See
@@ -17858,6 +17886,11 @@ pub(crate) enum SoccerRewardEventKind {
     /// that the WHOLE buildup, not just the finisher, gets credit for creating the chance. Emitted
     /// only when `DD_SOCCER_ENABLE_BUILDUP_CHAIN_CREDIT` is on. See `record_buildup_chain_credit`.
     BuildupChainCredit,
+    /// Positive: a long ball was released to a teammate who had broken beyond the opponent's last
+    /// outfield defender but was ONSIDE in our own half (the "release long inside own half"
+    /// strategy — you cannot be offside in your own half). Trains the line-breaking ball that
+    /// punishes a high press. Emitted only when `DD_SOCCER_ENABLE_RELEASE_LONG_OWN_HALF` is on.
+    ReleaseLongInsideOwnHalf,
     MatchResult,
 }
 
@@ -17882,6 +17915,7 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::SustainedForwardDribble
                 | SoccerRewardEventKind::UnpressuredBackwardPass
                 | SoccerRewardEventKind::BuildupChainCredit
+                | SoccerRewardEventKind::ReleaseLongInsideOwnHalf
                 | SoccerRewardEventKind::MatchResult
         )
     }
@@ -17907,6 +17941,7 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::CrashBoxArrival
                 | SoccerRewardEventKind::SustainedForwardDribble
                 | SoccerRewardEventKind::BuildupChainCredit
+        | SoccerRewardEventKind::ReleaseLongInsideOwnHalf
         )
     }
 }
@@ -18858,6 +18893,50 @@ pub(crate) fn in_stride_pass_margin_enabled() -> bool {
         use std::sync::OnceLock;
         static V: OnceLock<bool> = OnceLock::new();
         *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_IN_STRIDE_PASS_MARGIN"))
+    }
+}
+
+/// An opponent must be this far ahead of the back line (yds) to count as "occupying the space in
+/// front" — closer than this they are effectively part of the line, so the space is still dead.
+const BACK_FOUR_DEAD_SPACE_OCCUPANT_MARGIN_YARDS: f64 = 3.0;
+/// How strongly the back four compresses its trailing gap toward the minimum when the space in
+/// front of it is dead (no opponent in the band): 0 = no push-up, 1 = collapse fully to the min.
+const BACK_FOUR_DEAD_SPACE_PUSH_FRACTION: f64 = 0.7;
+
+/// Whether the **back-four push-up into dead space** is active this process: when no opponent
+/// occupies the band between the back line and the ball, the line compresses its trailing gap
+/// toward the minimum (steps up to fill the space) instead of holding a deep ~40yd line off nobody.
+/// Default-ON in production (env `DD_SOCCER_ENABLE_BACK_FOUR_DEAD_SPACE_PUSH=0/false` is the kill
+/// switch); default-OFF under test so the line-depth parity suite stays byte-identical.
+pub(crate) fn back_four_push_into_dead_space_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_BACK_FOUR_DEAD_SPACE_PUSH").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_BACK_FOUR_DEAD_SPACE_PUSH"))
+    }
+}
+
+/// Whether the **release-long-inside-own-half** MARL/MAPPO strategy is active this process: when a
+/// teammate has broken beyond the opponent's last outfield defender but is ONSIDE in our own half
+/// (you cannot be offside in your own half), prefer + reward a long ball that springs them. Trains
+/// the team to punish a high press with the line-breaking ball. Default-ON in production (env
+/// `DD_SOCCER_ENABLE_RELEASE_LONG_OWN_HALF=0/false` is the kill switch); default-OFF under test so
+/// the parity suite stays byte-identical. See `WorldSnapshot::release_long_inside_own_half_target`.
+pub(crate) fn release_long_own_half_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_RELEASE_LONG_OWN_HALF").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_RELEASE_LONG_OWN_HALF"))
     }
 }
 
@@ -32658,6 +32737,8 @@ fn soccer_requested_tactical_feature_gate_names() -> Vec<String> {
         "DD_SOCCER_ENABLE_IN_STRIDE_PASS_MARGIN",
         "DD_SOCCER_ENABLE_CONTINUE_RUN_AFTER_PASS",
         "DD_SOCCER_ENABLE_STRATEGY_PERSIST",
+        "DD_SOCCER_ENABLE_RELEASE_LONG_OWN_HALF",
+        "DD_SOCCER_ENABLE_BACK_FOUR_DEAD_SPACE_PUSH",
         "DD_SOCCER_ENABLE_BLINDSIDE_STEAL",
         crash_box::FLANK_CRASH_BOX_ENABLE_ENV,
         "DD_SOCCER_ENABLE_SLIP_BREAK_OFFSIDE",
