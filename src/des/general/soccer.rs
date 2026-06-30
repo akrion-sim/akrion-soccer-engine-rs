@@ -2004,6 +2004,21 @@ const BACKWARD_PASS_BASE_PENALTY_POINTS: f64 = 2.0;
 const BACKWARD_PASS_PENALTY_PER_YARD_POINTS: f64 = 0.5;
 /// Cap on the total unpressured-backward-pass penalty so one very deep ball can't swamp the signal.
 const BACKWARD_PASS_MAX_PENALTY_POINTS: f64 = 12.0;
+/// How many of the most-recent teammates in a buildup chain are credited for a shot (the user's
+/// "last 10 teammates involved in the plays that led to the goal").
+const BUILDUP_CHAIN_CREDIT_DEPTH: usize = 10;
+/// Geometric recency discount per step back down the buildup chain — the finisher gets the full
+/// base, each earlier contributor `discount×` the one after it (higher reward for recency).
+const BUILDUP_CHAIN_CREDIT_RECENCY_DISCOUNT: f64 = 0.72;
+/// Below this the discounted buildup credit is dropped (negligible tail of a long chain).
+const BUILDUP_CHAIN_CREDIT_MIN_POINTS: f64 = 0.05;
+/// Base buildup-credit points (for the finisher; earlier contributors are discounted) by outcome:
+/// ANY shot (incl. off target) < shot ON FRAME (on target) < GOAL. A goal also fires the on-frame
+/// tier (it is on target), so the finisher of a goal collects on-frame + goal credit — "especially
+/// a goal".
+const BUILDUP_CHAIN_CREDIT_SHOT_BASE_POINTS: f64 = 2.0;
+const BUILDUP_CHAIN_CREDIT_SHOT_ON_FRAME_BASE_POINTS: f64 = 5.0;
+const BUILDUP_CHAIN_CREDIT_GOAL_BASE_POINTS: f64 = 14.0;
 const PASS_CHAIN_THREE_NET_FORWARD_MIN_YARDS: f64 = 4.0;
 const PASS_CHAIN_EVENT_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(12.0);
 const PASS_AND_MOVE_FORWARD_MIN_YARDS: f64 = 4.0;
