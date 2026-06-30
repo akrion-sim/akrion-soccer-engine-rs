@@ -90076,6 +90076,90 @@ fn overdribble_penalty_fires_when_a_long_hold_is_dispossessed() {
 }
 
 #[test]
+fn overdribble_penalty_is_danger_scaled_and_skips_keepers() {
+    // Hardening: the over-dribble penalty is heavier for a loss DEEP IN OUR OWN HALF than the same
+    // loss at midfield, and never fires for a goalkeeper. Self-adapts to the ambient gate.
+    if !overdribble_penalty_enabled() {
+        return; // with the feature off there is nothing to scale; covered by the other tests.
+    }
+    // Runs one fabricated long-hold dispossession at `spot` (everyone else cleared away so the only
+    // varying factor is the carrier's field position), returning the total over-dribble penalty.
+    fn penalty_at(spot: Vec2, use_keeper: bool) -> f64 {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            duration_seconds: 1.0,
+            seed: 99,
+            ..MatchConfig::default()
+        });
+        let want_keeper = use_keeper;
+        let carrier = sim
+            .players
+            .iter()
+            .find(|p| {
+                p.team == Team::Home && (p.role == PlayerRole::Goalkeeper) == want_keeper
+            })
+            .expect("home carrier")
+            .id;
+        let defender = sim
+            .players
+            .iter()
+            .find(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+            .expect("away field player")
+            .id;
+        // Park everyone except carrier + defender far off so outlet counts/pressure are identical.
+        for p in sim.players.iter_mut() {
+            if p.id != carrier && p.id != defender {
+                p.position = Vec2::new(-80.0, -80.0);
+            }
+        }
+        sim.players[carrier].position = spot;
+        sim.players[defender].position = spot + Vec2::new(1.0, 0.0);
+        sim.ball.holder = Some(carrier);
+        sim.ball.position = spot;
+        sim.clock_seconds = 5.0;
+        sim.ball.position_history.clear();
+        for i in 0..40_u64 {
+            sim.ball.position_history.push_back(BallPositionSample {
+                tick: i,
+                clock_seconds: 3.0 + i as f64 * 0.05,
+                position: spot,
+                velocity: Vec2::zero(),
+                acceleration: Vec2::zero(),
+                jerk: Vec2::zero(),
+                curl_acceleration: Vec2::zero(),
+                altitude_yards: 0.0,
+                resistance: BallResistanceFrame::default(),
+            });
+        }
+        let before = sim.reward_events.len();
+        sim.complete_defensive_dispossession(defender, carrier, "tackle");
+        sim.reward_events[before..]
+            .iter()
+            .filter(|e| {
+                e.kind == SoccerRewardEventKind::OverdribbleDispossession && e.player_id == carrier
+            })
+            .map(|e| -e.amount)
+            .sum()
+    }
+    let attack_dir = Team::Home.attack_dir();
+    let width = SoccerMatch::default_11v11(MatchConfig::default()).config.field_width_yards;
+    let length = SoccerMatch::default_11v11(MatchConfig::default()).config.field_length_yards;
+    let own_goal_y = Team::Home.other().goal_y(length);
+    // 5yd in front of our own goal (deep in the danger zone) vs the centre circle (neutral zone).
+    let deep_spot = Vec2::new(width * 0.5, own_goal_y + 5.0 * attack_dir);
+    let mid_spot = Vec2::new(width * 0.5, length * 0.5);
+    let deep = penalty_at(deep_spot, false);
+    let mid = penalty_at(mid_spot, false);
+    assert!(mid > 0.0, "a midfield over-dribble loss should still be penalized");
+    assert!(
+        deep > mid,
+        "a deep own-half over-dribble loss must be punished harder: mid={mid} deep={deep}"
+    );
+    // A goalkeeper losing the ball is not trained as an over-dribbler.
+    let keeper = penalty_at(mid_spot, true);
+    assert_eq!(keeper, 0.0, "a goalkeeper over-dribble must not be penalized");
+}
+
+#[test]
 fn slip_break_seam_and_runner_opportunity_are_recognised() {
     // Geometry/sign-convention coverage for the slip-and-break-the-offside-trap recognition
     // (the ungated seam + opportunity readers; the run-target and bias are env-gated and tested
