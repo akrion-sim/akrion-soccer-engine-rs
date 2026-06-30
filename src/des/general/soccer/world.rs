@@ -18277,7 +18277,28 @@ impl SoccerMatch {
                     .kickoff_own_half_position(team, Vec2::new(position.x + jx, position.y + jy));
             }
             if team != kickoff_team && position.distance(center) < radius + 0.5 {
-                position.y = half_line - team.attack_dir() * (radius + 1.0);
+                // Push the encroaching player RADIALLY out to the circle edge, preserving its
+                // bearing from the centre spot — instead of slamming every encroacher onto the
+                // SAME y-line (`half_line - attack_dir*(radius+1)`), which collapsed the midfield
+                // and forward lines onto one depth and stacked players who share an x-column
+                // (e.g. Away #6/#9 and #8/#10 ended up 0.4yd apart). Radial push keeps their
+                // distinct angular positions, so the lines stay separated; own-half clamp last.
+                let mut dx = position.x - center.x;
+                let mut dy = position.y - center.y;
+                let len = (dx * dx + dy * dy).sqrt();
+                if len < 1e-3 {
+                    // Degenerate: sitting exactly on the spot — push straight back into own half.
+                    dx = 0.0;
+                    dy = -team.attack_dir();
+                } else {
+                    dx /= len;
+                    dy /= len;
+                }
+                let edge = radius + 1.0;
+                position = self.kickoff_own_half_position(
+                    team,
+                    Vec2::new(center.x + dx * edge, center.y + dy * edge),
+                );
             }
             self.set_dead_ball_player_position(player_id, position);
         }
