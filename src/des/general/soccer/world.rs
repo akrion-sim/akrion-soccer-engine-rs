@@ -47238,6 +47238,36 @@ impl WorldSnapshot {
         Some(opponent_fwd_from_own_goal.iter().take(count).sum::<f64>() / count as f64)
     }
 
+    /// Lateral span (yd) of the opponent's foremost 4 attackers — the width the back four must
+    /// cover. Uses the SAME foremost-attacker selection (most-advanced toward our goal) as the line
+    /// DEPTH; feeds the state-adaptive back-four block width so the line widens to a stretched
+    /// attack and tucks against a central one rather than holding a fixed narrow block.
+    fn back_four_foremost_attackers_x_span(&self, team: Team) -> f64 {
+        let attack = team.attack_dir();
+        let mut opponents: Vec<(f64, f64)> = self
+            .players
+            .iter()
+            .filter(|player| player.team == team.other() && player.role != PlayerRole::Goalkeeper)
+            .map(|player| {
+                let position = self.player_snapshot_position(player);
+                (position.y * attack, position.x)
+            })
+            .filter(|(fwd, x)| fwd.is_finite() && x.is_finite())
+            .collect();
+        if opponents.len() < 2 {
+            return 0.0;
+        }
+        opponents.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let count = opponents.len().min(4);
+        let mut min_x = f64::INFINITY;
+        let mut max_x = f64::NEG_INFINITY;
+        for (_, x) in opponents.iter().take(count) {
+            min_x = min_x.min(*x);
+            max_x = max_x.max(*x);
+        }
+        (max_x - min_x).clamp(0.0, self.field_width.max(0.0))
+    }
+
     fn back_four_attacker_gap_adjusted_centre_fwd(
         &self,
         team: Team,
