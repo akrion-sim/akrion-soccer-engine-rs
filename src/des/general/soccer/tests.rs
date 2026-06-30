@@ -87729,6 +87729,32 @@ fn mpc_ground_pass_weight_solver_times_ball_to_target() {
 }
 
 #[test]
+fn buildup_chain_credit_recency_discount() {
+    let base = BUILDUP_CHAIN_CREDIT_GOAL_BASE_POINTS;
+    // The finisher (index 0) gets the full base.
+    assert!((buildup_chain_credit_points(base, 0) - base).abs() < 1e-9);
+    // Each earlier contributor gets the geometric discount — strictly less, recency wins.
+    let c0 = buildup_chain_credit_points(base, 0);
+    let c1 = buildup_chain_credit_points(base, 1);
+    let c2 = buildup_chain_credit_points(base, 2);
+    assert!(c0 > c1 && c1 > c2, "more recent contributors earn more: {c0} {c1} {c2}");
+    assert!(
+        (c1 - base * BUILDUP_CHAIN_CREDIT_RECENCY_DISCOUNT).abs() < 1e-9,
+        "step-back credit should be base×discount"
+    );
+    // Outcome tiers escalate: any shot < shot on frame < goal (at the same recency).
+    assert!(
+        buildup_chain_credit_points(BUILDUP_CHAIN_CREDIT_SHOT_BASE_POINTS, 0)
+            < buildup_chain_credit_points(BUILDUP_CHAIN_CREDIT_SHOT_ON_FRAME_BASE_POINTS, 0)
+            && buildup_chain_credit_points(BUILDUP_CHAIN_CREDIT_SHOT_ON_FRAME_BASE_POINTS, 0)
+                < buildup_chain_credit_points(BUILDUP_CHAIN_CREDIT_GOAL_BASE_POINTS, 0)
+    );
+    // The negligible tail of a long chain is dropped to 0, and a non-positive base is always 0.
+    assert_eq!(buildup_chain_credit_points(base, 100), 0.0);
+    assert_eq!(buildup_chain_credit_points(0.0, 0), 0.0);
+}
+
+#[test]
 fn unpressured_backward_pass_penalty_truth_table() {
     let pressed = BACKWARD_PASS_HIGH_PRESSURE_RADIUS_YARDS - 0.1; // opponent within 3yd ⇒ justified
     let free = BACKWARD_PASS_HIGH_PRESSURE_RADIUS_YARDS + 5.0; // no close opponent ⇒ penalized
