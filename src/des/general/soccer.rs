@@ -6771,6 +6771,15 @@ pub struct SoccerPomdpObservation {
     /// is set, so decisions are then byte-identical. See [`SoccerFieldNumbersVector`].
     #[serde(default)]
     pub field_numbers: SoccerFieldNumbersVector,
+    /// **Signed true goal-side quality** in `[-1, 1]` when this player's team is defending: how
+    /// far the player sits along, and how close to, the ball→own-goal line (`+1` perfectly
+    /// goal-side on the line, `0` level/off-channel, `-ve` caught upfield of the ball). `0` for
+    /// strikers, the keeper, and whenever the player's team has possession. Its recovery urgency
+    /// folds into `defensive_urgency` when the default-ON gate is enabled; stays `0` (decisions
+    /// byte-identical) when `DD_SOCCER_ENABLE_DEFENSIVE_GOAL_SIDE` is off. See the [`goal_side`]
+    /// module.
+    #[serde(default)]
+    pub defensive_goal_side_quality: f64,
     #[serde(default)]
     pub goal_attack_window_score: f64,
     #[serde(default)]
