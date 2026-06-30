@@ -14817,7 +14817,7 @@ impl SoccerMatch {
         let gait = if carrier_forward_drive_enabled()
             && self.ball.holder == Some(player_id)
             && !gait.is_backward()
-            && to_target.y * attack_dir > CARRIER_DRIVE_MIN_FORWARD_YARDS
+            && to_target.y * attack_dir > tunables().dribble.carry_min_forward_yards
         {
             let (forward_space, nearest_opp) =
                 self.carrier_forward_space_and_pressure(me_pos, my_team);
@@ -14825,6 +14825,7 @@ impl SoccerMatch {
                 forward_space,
                 nearest_opp,
                 self.players[player_id].fatigue,
+                &tunables().dribble,
             ) {
                 Some(floor) if floor.effort_tier() > gait.effort_tier() => floor,
                 _ => gait,
