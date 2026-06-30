@@ -40996,6 +40996,49 @@ fn defensive_reward_prefers_goal_side_of_ball_and_attacker() {
 }
 
 #[test]
+fn defensive_goal_side_gate_rewards_the_true_line_not_just_y_depth() {
+    // Away holds the ball centrally at (40, 48); Home defends the y = 0 goal (centre x = 40), so
+    // the protective line runs straight up x = 40. Two Home defenders are at the SAME depth (y =
+    // 42, i.e. goal-side of the ball in y) — one ON the ball→goal line (x = 40), one stranded WIDE
+    // on the touchline (x = 8). Under the legacy y-axis definition both are "goal-side" and score
+    // identically. Under the true-line definition (the fix) the on-line defender must score higher.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 1510,
+        ..Default::default()
+    });
+    let attacker = 11;
+    sim.ball.holder = Some(attacker);
+    sim.players[attacker].position = Vec2::new(40.0, 48.0);
+    sim.ball.position = sim.players[attacker].position;
+    sim.ball.velocity = Vec2::zero();
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let on_line = Vec2::new(40.0, 42.0);
+    let wide = Vec2::new(8.0, 42.0);
+
+    // Gate OFF (default in cfg(test)): legacy y-axis ⇒ on-line and wide score identically.
+    std::env::remove_var("DD_SOCCER_ENABLE_DEFENSIVE_GOAL_SIDE");
+    let legacy_on = defensive_goal_side_reward_for_role(Team::Home, PlayerRole::Defender, on_line, &snapshot);
+    let legacy_wide = defensive_goal_side_reward_for_role(Team::Home, PlayerRole::Defender, wide, &snapshot);
+    assert!(
+        (legacy_on - legacy_wide).abs() < 1e-9,
+        "legacy y-axis definition can't tell on-line from wide: {legacy_on} vs {legacy_wide}"
+    );
+
+    // Gate ON: true-line definition ⇒ the on-line defender is rewarded well above the wide one.
+    std::env::set_var("DD_SOCCER_ENABLE_DEFENSIVE_GOAL_SIDE", "1");
+    let line_on = defensive_goal_side_reward_for_role(Team::Home, PlayerRole::Defender, on_line, &snapshot);
+    let line_wide = defensive_goal_side_reward_for_role(Team::Home, PlayerRole::Defender, wide, &snapshot);
+    let line_fwd = defensive_goal_side_reward_for_role(Team::Home, PlayerRole::Forward, on_line, &snapshot);
+    std::env::remove_var("DD_SOCCER_ENABLE_DEFENSIVE_GOAL_SIDE");
+    assert!(
+        line_on > line_wide + 0.1,
+        "true-line definition must reward the on-line defender over the stranded-wide one: {line_on} vs {line_wide}"
+    );
+    assert_eq!(line_fwd, 0.0, "strikers stay exempt under the true-line definition");
+}
+
+#[test]
 fn learned_policy_cannot_make_hold_the_runtime_optimum() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
