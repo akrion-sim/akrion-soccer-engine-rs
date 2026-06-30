@@ -3114,6 +3114,38 @@ impl RewardTunables {
         );
         validate_f64(
             prefix,
+            "giveaway_to_opponent_own_half_penalty",
+            self.giveaway_to_opponent_own_half_penalty,
+            0.0,
+            200.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "giveaway_to_opponent_opp_half_penalty",
+            self.giveaway_to_opponent_opp_half_penalty,
+            0.0,
+            200.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "giveaway_to_loose_own_half_penalty",
+            self.giveaway_to_loose_own_half_penalty,
+            0.0,
+            200.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "giveaway_to_loose_opp_half_penalty",
+            self.giveaway_to_loose_opp_half_penalty,
+            0.0,
+            200.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
             "pitch_value_threat_delta_points",
             self.pitch_value_threat_delta_points,
             0.0,
