@@ -30674,7 +30674,11 @@ impl WorldSnapshot {
             return None;
         }
         let me_pos = self.player_snapshot_position(me);
-        // The carrier must be relatively surrounded — a scoop is an escape from pressure.
+        // Originally the carrier had to be surrounded — a scoop was treated purely as an escape
+        // from pressure. With `DD_SOCCER_ENABLE_SCOOP_LANE_BLOCKED` (default-ON) the canonical case
+        // is also allowed: an IDEAL lane to an open teammate with one defender stood in it, even
+        // when the carrier himself has space. The per-target `defender_in_lane` + receiver-open
+        // checks below still gate every candidate, so the crowd test becomes advisory, not required.
         let crowd = self
             .players
             .iter()
@@ -30684,7 +30688,7 @@ impl WorldSnapshot {
                     <= SCOOP_PASS_PASSER_CROWD_RADIUS_YARDS
             })
             .count();
-        if crowd < SCOOP_PASS_PASSER_MIN_CROWD {
+        if crowd < SCOOP_PASS_PASSER_MIN_CROWD && !dd_soccer_enable_scoop_lane_blocked() {
             return None;
         }
         let facing = self
