@@ -70,9 +70,11 @@ const MIDFIELD_LINE_MODEL_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_MIDFIELD_LINE_MOD
 /// CENTRE is anchored on the [`BACK_FOUR_LINE_ANCHOR_DEPTH_YARDS`] line while the
 /// ball is upfield of it, tracks the ball to parity between the keeper's 6 and the
 /// anchor, sticks at the 6 inside it, and trails a dynamic
-/// [`BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS`]..[`BACK_FOUR_LINE_DESIRED_GAP_MAX_YARDS`]
-/// behind a deep ball (never past the halfway+cap). Off (unset) ⇒ byte-identical to
-/// the existing ball-relative 20-40yd band + halfway+5 cap.
+/// possession-aware gap (5..40 in possession, 20..40 out) behind a deep ball, pressed up to fill
+/// the space in front of the foremost attackers, never past the halfway+cap. **Default-ON** in
+/// production (this is the geometry-anchored centre that removes the self-referential "sine-wave");
+/// `DD_SOCCER_ENABLE_BACK_FOUR_LINE_DEPTH_V2=0` is the kill switch back to the legacy ball-relative
+/// 20-40yd average band. Default-OFF under test so the line-depth parity suite stays byte-identical.
 const BACK_FOUR_LINE_DEPTH_V2_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_LINE_DEPTH_V2";
 /// Env gate enabling **wingback-first forward priority** on the back-four line band.
 /// Without this, the 20-40yd ball cushion / flat offside line is enforced on the AVERAGE
