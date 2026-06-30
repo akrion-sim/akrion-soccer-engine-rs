@@ -43746,7 +43746,8 @@ impl WorldSnapshot {
                         - (-gap_delta).max(0.0) * 0.28
                 })
                 .unwrap_or(0.0);
-            let forward_score = forward_component.max(0.0) * (0.34 + open_grass * 0.68)
+            let forward_score = forward_component.max(0.0)
+                * (0.34 + open_grass * dribble_tuning.direction_forward_open_grass_scale)
                 - (-forward_component).max(0.0) * (0.18 + open_grass * 0.22);
             let lateral_room_score = if lateral_component < -0.20 {
                 (position.x / 12.0).clamp(0.0, 1.0) * lateral_component.abs() * 0.24
