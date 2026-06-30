@@ -18568,6 +18568,27 @@ pub(crate) fn unpressured_backward_pass_penalty_points(
         .min(BACKWARD_PASS_MAX_PENALTY_POINTS)
 }
 
+/// Whether the **MPC pass-weight solver** is active this process. For a ground pass to a receiver
+/// it solves the EXACT launch speed that lands the decelerating ball on the aim point as the
+/// receiver's predicted run arrives there — so pass weight is physically timed to the receiver, not
+/// left to the heuristic curve (which sometimes hits the ball too fast or too slow). Works even when
+/// the full MPC pass-aim path (`DD_SOCCER_ENABLE_MPC_PASS`) is off: it only refines the WEIGHT for
+/// the already-chosen lead point. Default-ON in production (env
+/// `DD_SOCCER_ENABLE_MPC_PASS_WEIGHT=0/false` is the kill switch); default-OFF under test so the
+/// pass-physics parity suite stays byte-identical. See `WorldSnapshot::mpc_refined_pass_weight`.
+pub(crate) fn mpc_pass_weight_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_MPC_PASS_WEIGHT").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_MPC_PASS_WEIGHT"))
+    }
+}
+
 /// Whether **backward-pass discipline** is active this process. Emits a training PENALTY for a
 /// pass played backward (toward our own goal) when the passer is NOT under genuine high pressure —
 /// no opponent within `BACKWARD_PASS_HIGH_PRESSURE_RADIUS_YARDS` — scaled by how far back the ball
