@@ -371,6 +371,23 @@ pub fn back_four_line_hold_deadband_enabled() -> bool {
     }
 }
 
+/// Whether the **sticky line anchor** holds the back-four line centre latched on the sim-tick loop
+/// this process (see [`BackFourLineLatch`]). Default-ON in production (kill switch
+/// `DD_SOCCER_ENABLE_BACK_FOUR_LINE_STICKY_ANCHOR=0` reverts to per-tick recompute); default-OFF
+/// under test so the line-depth parity suite stays byte-identical.
+pub fn back_four_line_sticky_anchor_enabled() -> bool {
+    #[cfg(test)]
+    {
+        env_flag_enabled(BACK_FOUR_LINE_STICKY_ANCHOR_ENABLE_ENV)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| gate_default_on(BACK_FOUR_LINE_STICKY_ANCHOR_ENABLE_ENV))
+    }
+}
+
 /// Whether wingback-first forward priority is applied at the back-four line band this
 /// process. Off ⇒ the symmetric (equal-share) correction stands (parity).
 pub fn defensive_line_wingback_forward_priority_enabled() -> bool {
