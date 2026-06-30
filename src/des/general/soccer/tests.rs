@@ -89860,44 +89860,63 @@ fn overdribble_dispossession_penalty_truth_table() {
     let pressed = OVERDRIBBLE_PRESSURE_RADIUS_YARDS - 1.0; // an opponent right on top of the carrier
     let free = OVERDRIBBLE_PRESSURE_RADIUS_YARDS + 8.0; // no close opponent
     let long_hold = OVERDRIBBLE_MIN_HOLD_SECONDS + 2.0;
+    let flat = 1.0; // neutral-zone danger severity (midfield / opponent half)
     // A short hold (under the overdue threshold) is never penalized — an unlucky strip on a fresh
     // touch is not an over-dribble, however much pressure or however many outlets there were.
     assert_eq!(
-        overdribble_dispossession_penalty_points(OVERDRIBBLE_MIN_HOLD_SECONDS - 0.1, pressed, 3),
+        overdribble_dispossession_penalty_points(OVERDRIBBLE_MIN_HOLD_SECONDS - 0.1, pressed, 3, flat),
         0.0
     );
     // A long hold lost in OPEN space with NO outlets ignored is not punished (a clean tackle, not a
     // blunder) — the penalty needs either pressure or an ignored pass.
     assert_eq!(
-        overdribble_dispossession_penalty_points(long_hold, free, 0),
+        overdribble_dispossession_penalty_points(long_hold, free, 0, flat),
         0.0
     );
     // A long hold under pressure IS penalized even with no outlets.
-    let under_pressure = overdribble_dispossession_penalty_points(long_hold, pressed, 0);
+    let under_pressure = overdribble_dispossession_penalty_points(long_hold, pressed, 0, flat);
     assert!(under_pressure > 0.0);
     // A long hold in open space but with an ignored open outlet IS penalized.
-    let ignored_outlet = overdribble_dispossession_penalty_points(long_hold, free, 1);
+    let ignored_outlet = overdribble_dispossession_penalty_points(long_hold, free, 1, flat);
     assert!(ignored_outlet > 0.0);
     // The longer the overdue hold, the bigger the penalty (monotonic in hold time).
-    let shorter = overdribble_dispossession_penalty_points(long_hold, pressed, 0);
-    let longer = overdribble_dispossession_penalty_points(long_hold + 3.0, pressed, 0);
+    let shorter = overdribble_dispossession_penalty_points(long_hold, pressed, 0, flat);
+    let longer = overdribble_dispossession_penalty_points(long_hold + 3.0, pressed, 0, flat);
     assert!(longer > shorter, "penalty must grow with hold time: {shorter} < {longer}");
     // More ignored outlets ⇒ bigger penalty.
-    let one_outlet = overdribble_dispossession_penalty_points(long_hold, free, 1);
-    let three_outlets = overdribble_dispossession_penalty_points(long_hold, free, 3);
+    let one_outlet = overdribble_dispossession_penalty_points(long_hold, free, 1, flat);
+    let three_outlets = overdribble_dispossession_penalty_points(long_hold, free, 3, flat);
     assert!(three_outlets > one_outlet);
     // Closer pressure ⇒ bigger penalty (the proximity multiplier).
-    let edge = overdribble_dispossession_penalty_points(long_hold, OVERDRIBBLE_PRESSURE_RADIUS_YARDS, 0);
-    let point_blank = overdribble_dispossession_penalty_points(long_hold, 0.2, 0);
+    let edge = overdribble_dispossession_penalty_points(long_hold, OVERDRIBBLE_PRESSURE_RADIUS_YARDS, 0, flat);
+    let point_blank = overdribble_dispossession_penalty_points(long_hold, 0.2, 0, flat);
     assert!(point_blank > edge);
-    // Everything is capped.
+    // DANGER-ZONE severity raises the penalty for a deep own-half giveaway and never reduces it.
+    let neutral = overdribble_dispossession_penalty_points(long_hold, pressed, 1, flat);
+    let dangerous = overdribble_dispossession_penalty_points(long_hold, pressed, 1, OVERDRIBBLE_DANGER_MAX_MULT);
+    assert!(dangerous > neutral, "a deep giveaway should be punished harder: {neutral} < {dangerous}");
+    // A below-1 severity cannot soften the penalty (clamped up to neutral).
     assert_eq!(
-        overdribble_dispossession_penalty_points(10_000.0, 0.1, 100),
+        overdribble_dispossession_penalty_points(long_hold, pressed, 1, 0.3),
+        neutral
+    );
+    // A non-finite severity falls back to neutral, not NaN.
+    assert_eq!(
+        overdribble_dispossession_penalty_points(long_hold, pressed, 1, f64::NAN),
+        neutral
+    );
+    // Capping: neutral zone caps at the base max; the danger zone raises the absolute cap.
+    assert_eq!(
+        overdribble_dispossession_penalty_points(10_000.0, 0.1, 100, flat),
         OVERDRIBBLE_MAX_PENALTY_POINTS
     );
-    // Non-finite inputs are inert.
-    assert_eq!(overdribble_dispossession_penalty_points(f64::NAN, pressed, 3), 0.0);
-    assert_eq!(overdribble_dispossession_penalty_points(long_hold, f64::NAN, 3), 0.0);
+    assert_eq!(
+        overdribble_dispossession_penalty_points(10_000.0, 0.1, 100, OVERDRIBBLE_DANGER_MAX_MULT),
+        OVERDRIBBLE_MAX_PENALTY_POINTS * OVERDRIBBLE_DANGER_MAX_MULT
+    );
+    // Non-finite hold / pressure inputs are inert.
+    assert_eq!(overdribble_dispossession_penalty_points(f64::NAN, pressed, 3, flat), 0.0);
+    assert_eq!(overdribble_dispossession_penalty_points(long_hold, f64::NAN, 3, flat), 0.0);
 }
 
 #[test]
