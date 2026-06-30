@@ -46224,7 +46224,69 @@ impl WorldSnapshot {
             six,
             max_depth,
         );
+        // Press UP to fill the space between the back four and the opponent's foremost attackers
+        // (gated, MARL/MAPPO optimal distance). Only ever raises a too-deep centre toward them.
+        let centre_depth = self.back_four_attacker_compacted_depth(team, centre_depth, six, max_depth);
         own_goal_fwd + centre_depth
+    }
+
+    /// Mean depth (yd from `team`'s own goal, in `team`'s attacking frame) of the opponent's
+    /// `count` most-advanced outfielders — the "foremost attackers" line. The most advanced =
+    /// deepest into our territory = the smallest forward-from-our-goal. `None` if the opponent has
+    /// no outfielders on the pitch. Pure / RNG-free.
+    pub(crate) fn opponent_foremost_attackers_line_depth(
+        &self,
+        team: Team,
+        count: usize,
+    ) -> Option<f64> {
+        let attack = team.attack_dir();
+        let own_goal_fwd = self.own_goal_y_for(team) * attack;
+        let mut depths: Vec<f64> = self
+            .players
+            .iter()
+            .filter(|p| p.team == team.other() && p.role != PlayerRole::Goalkeeper)
+            .map(|p| self.player_snapshot_position(p).y * attack - own_goal_fwd)
+            .filter(|d| d.is_finite())
+            .collect();
+        if depths.is_empty() {
+            return None;
+        }
+        depths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let n = count.min(depths.len()).max(1);
+        Some(depths[..n].iter().sum::<f64>() / n as f64)
+    }
+
+    /// Raise `centre_depth` toward the opponent's foremost-attacker line so the back four fills the
+    /// space in front of it (MARL/MAPPO press-to-attackers compaction). Applied only while WE
+    /// control the ball or the ball is loose ("dispossession") — NOT while the opponent drives at
+    /// our goal (then the cushion is held). Sits at most [`BACK_FOUR_OPTIMAL_GAP_TO_ATTACKERS_YARDS`]
+    /// goal-side of the attacker line, never AHEAD of it (no playing runners onside), never below the
+    /// current centre (push up only), and never past the high-line cap. Off ⇒ `centre_depth`.
+    fn back_four_attacker_compacted_depth(
+        &self,
+        team: Team,
+        centre_depth: f64,
+        six: f64,
+        max_depth: f64,
+    ) -> f64 {
+        if !back_four_press_to_attackers_enabled() {
+            return centre_depth;
+        }
+        // Hold the cushion (no press-up) when the opponent is in clear control and driving at us.
+        if self.controlled_possession_team() == Some(team.other()) {
+            return centre_depth;
+        }
+        let Some(attacker_depth) =
+            self.opponent_foremost_attackers_line_depth(team, BACK_FOUR_FOREMOST_ATTACKERS_COUNT)
+        else {
+            return centre_depth;
+        };
+        let optimal_gap = BACK_FOUR_OPTIMAL_GAP_TO_ATTACKERS_YARDS;
+        let press_floor = (attacker_depth - optimal_gap)
+            .min(attacker_depth)
+            .clamp(six.min(max_depth), max_depth);
+        // Push UP only: raise a too-deep centre toward the attackers; never drop it deeper.
+        centre_depth.max(press_floor)
     }
 
     /// v2 field-anchored back-four line target for `me` (gated by
