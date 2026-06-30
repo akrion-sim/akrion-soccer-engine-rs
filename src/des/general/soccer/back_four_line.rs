@@ -163,6 +163,19 @@ pub const BACK_FOUR_FOREMOST_ATTACKERS_COUNT: usize = 4;
 /// so the deadband only ever leaves a defender a touch DEEPER than ideal (never plays a runner
 /// onside). Damps the cosmetic oscillation and saves the effort the wasted-energy penalty docks.
 pub const BACK_FOUR_LINE_HOLD_DEADBAND_YARDS: f64 = 2.0;
+
+/// How long (in SIM SECONDS — measured on the single-threaded sim-tick loop, never wall-clock) the
+/// back-four line centre is held latched before it is re-evaluated. ~3s: long enough that the line
+/// stops oscillating tick-to-tick (the "sine-wave"), short enough that it re-reads the game often.
+/// The caller converts this to a tick count via the sim `dt`, so it is framerate-independent.
+pub const BACK_FOUR_LINE_STICKY_ANCHOR_SECONDS: f64 = 3.0;
+/// The latched line re-anchors EARLY (before the [`BACK_FOUR_LINE_STICKY_ANCHOR_SECONDS`] window
+/// elapses) only when the freshly-computed ideal line has dropped at least this many yards DEEPER
+/// (toward our own goal) than the held centre — i.e. the threat grew, so the line drops promptly for
+/// safety rather than holding a too-high line. Stepping the line UP always waits for the window /
+/// possession flip, so the four never ratchet up-and-back every tick (that asymmetry is the
+/// sine-wave cure); smaller fluctuations either way are simply held.
+pub const BACK_FOUR_LINE_STICKY_REANCHOR_DROP_YARDS: f64 = 3.0;
 /// Per-yard weight of the attacker-compactness term folded into the line-depth RL reward when the
 /// attacker-press is on: each yard the back four sits behind the optimal gap to the foremost
 /// attackers docks the reward by this much, so the learned head prefers ball-gap fractions that
