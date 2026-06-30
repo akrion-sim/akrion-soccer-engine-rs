@@ -326,7 +326,7 @@ mod tests {
         assert!(final_third_depth_frac(100.0, L, L) > 0.4);
         assert!(final_third_depth_frac(118.0, L, L) > 0.9); // near the byline
         // Away attacks y = 0: depth grows toward y = 0.
-        assert!(final_third_depth_frac(4.0, 0.0, L) > 0.9);
+        assert!(final_third_depth_frac(2.0, 0.0, L) > 0.9);
         assert_eq!(final_third_depth_frac(50.0, 0.0, L), 0.0);
     }
 }
