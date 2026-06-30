@@ -1971,6 +1971,34 @@ const TEAM_ADVANCE_CARRIER_DRIVE_REWARD: f64 = 0.30;
 /// Dense shaping reward for an OFF-BALL teammate making a forward supporting run while the team
 /// advances upfield — the "whole team moves forward" signal that pulls runners up with the ball.
 const TEAM_ADVANCE_SUPPORT_RUN_REWARD: f64 = 0.22;
+/// A teammate must be at least this far BEYOND the opponent's last outfield defender (the offside
+/// line) to count as a "release long inside own half" target — a genuine break of the line.
+const RELEASE_LONG_MIN_BEYOND_YARDS: f64 = 3.0;
+/// …and at least this far ahead of the ball, so it is a real forward long ball (not a square one).
+const RELEASE_LONG_MIN_AHEAD_OF_BALL_YARDS: f64 = 8.0;
+/// Minimum carrier→receiver distance for the long release.
+const RELEASE_LONG_MIN_DISTANCE_YARDS: f64 = 16.0;
+/// The receiver must be this open (nearest opponent ≥) for the long ball to be worth releasing.
+const RELEASE_LONG_RECEIVER_OPEN_YARDS: f64 = 5.0;
+/// MARL/MAPPO reward (points) for releasing a long ball to a teammate who is beyond the opponent's
+/// last outfield defender but ONSIDE in our own half — the "release long inside own half" strategy
+/// (you cannot be offside in your own half). Big enough to teach the line-breaking ball.
+const RELEASE_LONG_INSIDE_OWN_HALF_REWARD_POINTS: f64 = 9.0;
+
+/// Whether `receiver_adv` (advancement toward the opponent goal, 0 at our own goal) is a valid
+/// "release long inside own half" target: BEYOND the opponent's last outfield defender / offside
+/// line (so they'd be offside in the opponent half) BUT still in our OWN half (so they are ONSIDE
+/// by the own-half rule), and genuinely ahead of the ball. `halfway_adv` = field_length/2. Pure.
+pub(crate) fn release_long_inside_own_half_qualifies(
+    receiver_adv: f64,
+    offside_line_adv: f64,
+    ball_adv: f64,
+    halfway_adv: f64,
+) -> bool {
+    receiver_adv < halfway_adv
+        && receiver_adv > offside_line_adv + RELEASE_LONG_MIN_BEYOND_YARDS
+        && receiver_adv > ball_adv + RELEASE_LONG_MIN_AHEAD_OF_BALL_YARDS
+}
 /// One progressive-carry "segment": every this-many yards the carrier advances the ball FORWARD
 /// (Δy·attack toward the opponent goal; lateral x movement is allowed, only the forward component
 /// counts). Both progressive-carry rewards are denominated in these 2-yard segments. See
@@ -2975,6 +3003,13 @@ const SHOT_MIN_KICK_POWER_FACTOR: f64 = 0.90;
 // settling/shielding touch first, then play it. The floor scales from the at-rest floor down to
 // this with speed, so a jog keeps most power but a sprint cannot reverse-blast.
 const KICK_REVERSE_AT_SPRINT_FLOOR: f64 = 0.12;
+/// In-stride margin floors (used when `DD_SOCCER_ENABLE_IN_STRIDE_PASS_MARGIN` is on): kicking
+/// against your own momentum is harder by a MARGIN, not nearly impossible — a running/sprinting pass
+/// stays viable (≈62% power at a jog-reverse, ≈50% at a full sprint-reverse) so the player is not
+/// forced to stop to pass. The realistic difficulty is carried by these power margins plus the
+/// facing-accuracy model and the MPC pass-weight, rather than a hard near-veto.
+const IN_STRIDE_KICK_POWER_FLOOR: f64 = 0.62;
+const IN_STRIDE_KICK_SPRINT_POWER_FLOOR: f64 = 0.50;
 // Body-facing kick model: you can only strike the ball with the slice of your range the body
 // is turned toward, so the angle between your CURRENT body facing and the line you want to play
 // decides how much power and accuracy you can put on it. You cannot pass one way while facing the
@@ -17979,6 +18014,11 @@ pub(crate) enum SoccerRewardEventKind {
     /// Positive: a completed one-two / wall-pass return. The event wakes learning immediately and
     /// the world reward path also replays recent runner+wall transitions with the pattern bonus.
     WallPassCombination,
+    /// Positive: a long ball was released to a teammate who had broken beyond the opponent's last
+    /// outfield defender but was ONSIDE in our own half (the "release long inside own half"
+    /// strategy — you cannot be offside in your own half). Trains the line-breaking ball that
+    /// punishes a high press. Emitted only when `DD_SOCCER_ENABLE_RELEASE_LONG_OWN_HALF` is on.
+    ReleaseLongInsideOwnHalf,
     MatchResult,
 }
 
@@ -18004,6 +18044,7 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::UnpressuredBackwardPass
                 | SoccerRewardEventKind::BuildupChainCredit
                 | SoccerRewardEventKind::WallPassCombination
+                | SoccerRewardEventKind::ReleaseLongInsideOwnHalf
                 | SoccerRewardEventKind::MatchResult
         )
     }
@@ -18030,6 +18071,7 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::SustainedForwardDribble
                 | SoccerRewardEventKind::BuildupChainCredit
                 | SoccerRewardEventKind::WallPassCombination
+                | SoccerRewardEventKind::ReleaseLongInsideOwnHalf
         )
     }
 }
@@ -18847,6 +18889,184 @@ pub(crate) fn buildup_chain_credit_points(base_points: f64, recency_index: usize
         amount
     } else {
         0.0
+    }
+}
+
+/// Number of a team's players that must be goalside of the ball for a defensive NUMBERS-UP press.
+const DEFENSIVE_NUMBERS_UP_BEHIND_BALL_COUNT: usize = 7;
+/// Max carrier speed (yps) to count as a STOPPED holder for the stationary-holder press.
+const STATIONARY_HOLDER_PRESS_MAX_SPEED_YPS: f64 = 2.0;
+/// The nearest defender presses a stopped holder only when standing off by more than this (yds) —
+/// i.e. nobody is currently challenging — so an already-engaged defender isn't double-counted.
+const STATIONARY_HOLDER_PRESS_RADIUS_YARDS: f64 = 3.5;
+/// Press-urgency floor for the nearest defender against a stopped, unchallenged holder (> 1 fires
+/// the positional step-up onto the carrier).
+const STATIONARY_HOLDER_PRESS_URGENCY_FLOOR: f64 = 1.4;
+/// Press-urgency floor applied to the nearest defender when the defence is numbers-up behind the
+/// ball: `> 1.0` both firms the tackle commitment AND triggers the positional step-up onto the
+/// carrier, so a covered defence presses the ball-holder instead of containing.
+const NUMBERS_UP_PRESS_URGENCY_FLOOR: f64 = 1.5;
+
+/// Whether the **stationary-holder press** is active this process: when an opponent stops on the
+/// ball and nobody is challenging, the nearest defender steps up to engage rather than standing
+/// off. Default-ON in production (env `DD_SOCCER_ENABLE_STATIONARY_HOLDER_PRESS=0/false` is the kill
+/// switch); default-OFF under test so the parity suite stays byte-identical.
+pub(crate) fn stationary_holder_press_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_STATIONARY_HOLDER_PRESS").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_STATIONARY_HOLDER_PRESS"))
+    }
+}
+
+/// Whether **numbers-up defensive pressing** is active this process: when the defending team has
+/// `DEFENSIVE_NUMBERS_UP_BEHIND_BALL_COUNT`+ players behind the ball, the nearest defender presses
+/// the carrier harder. Default-ON in production (env `DD_SOCCER_ENABLE_NUMBERS_UP_PRESS=0/false` is
+/// the kill switch); default-OFF under test so the parity suite stays byte-identical.
+pub(crate) fn defensive_numbers_up_press_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_NUMBERS_UP_PRESS").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_NUMBERS_UP_PRESS"))
+    }
+}
+
+/// Backward distance (yards toward our own goal) at/above which a pass is a candidate "terrible
+/// back-pass" giveaway — vetoed at release when aerial or played under pressure.
+const LONG_BACKWARD_PASS_VETO_YARDS: f64 = 10.0;
+/// Pressure at/above which a long backward GROUND pass also counts as a giveaway (an aerial long
+/// backward ball is always a giveaway regardless of pressure).
+const TERRIBLE_BACKWARD_PASS_PRESSURE: f64 = 0.35;
+
+/// Whether the **terrible-pass veto** is active this process: at release, a pass with no safe aim
+/// (it would be conceded/occluded to an opponent) or a long backward giveaway (10+ yds back, aerial
+/// or under pressure) is ABORTED — the carrier keeps the ball and faces up instead of gifting it.
+/// Default-ON in production (env `DD_SOCCER_ENABLE_TERRIBLE_PASS_VETO=0/false` is the kill switch);
+/// default-OFF under test so the pass parity suite stays byte-identical.
+pub(crate) fn terrible_pass_veto_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_TERRIBLE_PASS_VETO").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_TERRIBLE_PASS_VETO"))
+    }
+}
+
+/// Min speed (yps) for the passer to "continue the run" after a pass rather than fall back to shape.
+const CONTINUE_RUN_AFTER_PASS_MIN_SPEED_YPS: f64 = 2.0;
+/// How far ahead (yds, along the passer's current heading) to aim the continue-the-run move.
+const CONTINUE_RUN_AFTER_PASS_LOOKAHEAD_YARDS: f64 = 8.0;
+
+/// Whether **strategy-persist-until-change** is active this process: the team's elected attack
+/// strategy CONTINUES until a turnover, a meaningful change of situation (possession phase / ball
+/// third / opponent press), or a strong interrupt cue — instead of being re-elected on a fixed tick
+/// cadence. Default-ON in production (env `DD_SOCCER_ENABLE_STRATEGY_PERSIST=0/false` is the kill
+/// switch); default-OFF under test so the strategy-commitment parity suite stays byte-identical.
+pub(crate) fn strategy_persist_until_change_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_STRATEGY_PERSIST").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_STRATEGY_PERSIST"))
+    }
+}
+
+/// Whether the **continue-the-run-after-pass** behaviour is active this process: after playing a
+/// pass the passer keeps its momentum (overlap / give-and-go / support the ball forward) instead of
+/// turning back toward its home position on the release tick. Default-ON in production (env
+/// `DD_SOCCER_ENABLE_CONTINUE_RUN_AFTER_PASS=0/false` is the kill switch); default-OFF under test so
+/// the parity suite stays byte-identical.
+pub(crate) fn continue_run_after_pass_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_CONTINUE_RUN_AFTER_PASS").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_CONTINUE_RUN_AFTER_PASS"))
+    }
+}
+
+/// Whether the **in-stride pass margin** is active this process: kicking against your own momentum
+/// is softened from a near-veto (12% power at sprint-reverse) to a realistic MARGIN (≈50–62%), so a
+/// player can pass while running/sprinting instead of being forced to stop — the difficulty is a
+/// physics margin, not a hard bias. Default-ON in production (env
+/// `DD_SOCCER_ENABLE_IN_STRIDE_PASS_MARGIN=0/false` is the kill switch); default-OFF under test so
+/// the kick-physics parity suite stays byte-identical.
+pub(crate) fn in_stride_pass_margin_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_IN_STRIDE_PASS_MARGIN").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_IN_STRIDE_PASS_MARGIN"))
+    }
+}
+
+/// An opponent must be this far ahead of the back line (yds) to count as "occupying the space in
+/// front" — closer than this they are effectively part of the line, so the space is still dead.
+const BACK_FOUR_DEAD_SPACE_OCCUPANT_MARGIN_YARDS: f64 = 3.0;
+/// How strongly the back four compresses its trailing gap toward the minimum when the space in
+/// front of it is dead (no opponent in the band): 0 = no push-up, 1 = collapse fully to the min.
+const BACK_FOUR_DEAD_SPACE_PUSH_FRACTION: f64 = 0.7;
+
+/// Whether the **back-four push-up into dead space** is active this process: when no opponent
+/// occupies the band between the back line and the ball, the line compresses its trailing gap
+/// toward the minimum (steps up to fill the space) instead of holding a deep ~40yd line off nobody.
+/// Default-ON in production (env `DD_SOCCER_ENABLE_BACK_FOUR_DEAD_SPACE_PUSH=0/false` is the kill
+/// switch); default-OFF under test so the line-depth parity suite stays byte-identical.
+pub(crate) fn back_four_push_into_dead_space_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_BACK_FOUR_DEAD_SPACE_PUSH").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_BACK_FOUR_DEAD_SPACE_PUSH"))
+    }
+}
+
+/// Whether the **release-long-inside-own-half** MARL/MAPPO strategy is active this process: when a
+/// teammate has broken beyond the opponent's last outfield defender but is ONSIDE in our own half
+/// (you cannot be offside in your own half), prefer + reward a long ball that springs them. Trains
+/// the team to punish a high press with the line-breaking ball. Default-ON in production (env
+/// `DD_SOCCER_ENABLE_RELEASE_LONG_OWN_HALF=0/false` is the kill switch); default-OFF under test so
+/// the parity suite stays byte-identical. See `WorldSnapshot::release_long_inside_own_half_target`.
+pub(crate) fn release_long_own_half_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_RELEASE_LONG_OWN_HALF").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_RELEASE_LONG_OWN_HALF"))
     }
 }
 
@@ -32735,6 +32955,15 @@ fn soccer_requested_tactical_feature_gate_names() -> Vec<String> {
         "DD_SOCCER_ENABLE_BACKWARD_PASS_DISCIPLINE",
         "DD_SOCCER_ENABLE_MPC_PASS_WEIGHT",
         "DD_SOCCER_ENABLE_BUILDUP_CHAIN_CREDIT",
+        "DD_SOCCER_ENABLE_GROUND_PASS_SPEED_FLOOR",
+        "DD_SOCCER_ENABLE_NUMBERS_UP_PRESS",
+        "DD_SOCCER_ENABLE_STATIONARY_HOLDER_PRESS",
+        "DD_SOCCER_ENABLE_TERRIBLE_PASS_VETO",
+        "DD_SOCCER_ENABLE_IN_STRIDE_PASS_MARGIN",
+        "DD_SOCCER_ENABLE_CONTINUE_RUN_AFTER_PASS",
+        "DD_SOCCER_ENABLE_STRATEGY_PERSIST",
+        "DD_SOCCER_ENABLE_RELEASE_LONG_OWN_HALF",
+        "DD_SOCCER_ENABLE_BACK_FOUR_DEAD_SPACE_PUSH",
         "DD_SOCCER_ENABLE_BLINDSIDE_STEAL",
         crash_box::FLANK_CRASH_BOX_ENABLE_ENV,
         "DD_SOCCER_ENABLE_SLIP_BREAK_OFFSIDE",

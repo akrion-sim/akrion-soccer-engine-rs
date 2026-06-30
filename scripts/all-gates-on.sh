@@ -85,4 +85,19 @@ export DD_SOCCER_ENABLE_DECISION_REFRACTORY=true
 export DD_SOCCER_ENABLE_OBSTACLE_AWARE_INTERCEPT=true
 export DD_SOCCER_ENABLE_MPC_PASS=true
 
+# Jun 2026 offense/defense + reward + pass-physics batch (these are gate_default_on, i.e. already
+# ON in a release build; set explicitly so the training lineage is unambiguous).
+export DD_SOCCER_ENABLE_TEAM_ADVANCE_UPFIELD=true
+export DD_SOCCER_ENABLE_PROGRESSIVE_CARRY_REWARD=true
+export DD_SOCCER_ENABLE_BACKWARD_PASS_DISCIPLINE=true
+export DD_SOCCER_ENABLE_MPC_PASS_WEIGHT=true
+export DD_SOCCER_ENABLE_BUILDUP_CHAIN_CREDIT=true
+export DD_SOCCER_ENABLE_NUMBERS_UP_PRESS=true
+export DD_SOCCER_ENABLE_STATIONARY_HOLDER_PRESS=true
+export DD_SOCCER_ENABLE_TERRIBLE_PASS_VETO=true
+export DD_SOCCER_ENABLE_GROUND_PASS_SPEED_FLOOR=true
+export DD_SOCCER_ENABLE_IN_STRIDE_PASS_MARGIN=true
+export DD_SOCCER_ENABLE_CONTINUE_RUN_AFTER_PASS=true
+export DD_SOCCER_ENABLE_STRATEGY_PERSIST=true
+
 echo "all-gates-on: exported $(env | grep -cE '^DD_SOCCER_(ENABLE_|OPPONENT_BELIEF|OUTCOME_CREDIT)') soccer feature gates = on" >&2

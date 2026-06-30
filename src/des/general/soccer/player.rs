@@ -2874,7 +2874,7 @@ pub(crate) fn apply_isolated_carrier_drive_bias(
 /// Forward-receiver openness at/above which a forward pass is "sufficiently open" to be
 /// released early instead of dwelt on (the user's "if that option is forward and sufficiently
 /// open"). Below this the carrier keeps his normal patience.
-const FORWARD_PASS_FIRST_OPEN_THRESHOLD: f64 = 0.45;
+const FORWARD_PASS_FIRST_OPEN_THRESHOLD: f64 = 0.40;
 /// Seconds of dwell on the ball at which the forward-release urgency saturates: a carrier
 /// sitting this long on an open forward option is pushed fully toward releasing it ("passing
 /// sooner rather than later"). The bias already applies (weaker) the instant he has the ball.
@@ -2896,9 +2896,13 @@ pub(crate) fn forward_pass_first_release_strength(
     let open_strength = ((fwd - FORWARD_PASS_FIRST_OPEN_THRESHOLD)
         / (1.0 - FORWARD_PASS_FIRST_OPEN_THRESHOLD))
         .clamp(0.0, 1.0);
+    // A clean forward option is played PROMPTLY — real players don't dwell a full second when a
+    // man is open ahead. The dwell still adds a little urgency, but a fresh carrier with an open
+    // forward man already strongly prefers the ball (high dwell FLOOR), so the early release wins
+    // over a sideways carry / shield / hoof instead of converting only after a long deliberation.
     let dwell =
         (time_on_ball_seconds.max(0.0) / FORWARD_PASS_FIRST_DWELL_FULL_SECONDS).clamp(0.0, 1.0);
-    ((0.45 + 0.55 * dwell) * (0.55 + 0.45 * open_strength)).clamp(0.0, 1.0)
+    ((0.74 + 0.26 * dwell) * (0.58 + 0.42 * open_strength)).clamp(0.0, 1.0)
 }
 
 /// True when the refractory forbids committing a changed decision at tick `now`, given the ticks
@@ -6006,12 +6010,30 @@ impl PlayerAgent {
                 observation.perceived_time_on_ball_seconds,
             );
             if strength > 0.0 {
-                let floor = (0.42 + 0.50 * strength).clamp(0.40, 0.95);
+                // Floor the forward ball high enough to clearly beat a sideways carry / shield /
+                // hoof (those score ~0.7), so a recognised open man ahead is actually played.
+                let floor = (0.52 + 0.45 * strength).clamp(0.50, 0.98);
                 ensure_min_legal_option_probability(&mut options, "pass1", floor);
-                let dwell_damp = (1.0 - 0.50 * strength).clamp(0.45, 1.0);
-                for label in ["dribble", "protect-ball", "hold-up-flank", "side-step"] {
-                    scale_legal_option_score(&mut options, label, dwell_damp);
+                // Damp the STALL / sideways / hoof family hard (shielding and stopping with an open
+                // man ahead is the bug); leave forward DRIVING (carry-forward / vertical-attack)
+                // alone so taking the space on the dribble is still on when the pass isn't.
+                let stall_damp = (1.0 - 0.70 * strength).clamp(0.25, 1.0);
+                for label in [
+                    "protect-ball",
+                    "hold-up-flank",
+                    "side-step",
+                    "carry-out-left",
+                    "carry-out-right",
+                    "route-one",
+                    "recycle-reset",
+                    "switch-play",
+                ] {
+                    scale_legal_option_score(&mut options, label, stall_damp);
                 }
+                // The straight dribble is only mildly damped — a forward pass is preferred, but
+                // driving into space remains a valid alternative.
+                let dribble_damp = (1.0 - 0.30 * strength).clamp(0.55, 1.0);
+                scale_legal_option_score(&mut options, "dribble", dribble_damp);
             }
         }
         // Isolated attacking carrier (gated `DD_SOCCER_ENABLE_ISOLATED_CARRIER_DRIVE`; OFF ⇒
@@ -8532,7 +8554,16 @@ impl PlayerAgent {
                         >= LOOSE_BALL_POUNCE_CLOSING_YPS
             };
             let fifty_fifty_duel = loose_ball_fifty_fifty_duel_for(snapshot, self.id);
-            if (ball_gap <= LOOSE_BALL_POUNCE_RADIUS_YARDS || approaching || fifty_fifty_duel)
+            // A loose ball that has sat UNCONTESTED (nobody closing) for a moment must be gone
+            // after from any distance — otherwise a motionless ball in a gap just sits there while
+            // both teams hold shape (last-touch team thinks it still "has" it, the other defends).
+            // The committed-chaser election still limits this to the closest retriever(s) per team,
+            // so it is a contest, not a swarm.
+            let stalled_loose = snapshot.loose_ball_urgency_active();
+            if (ball_gap <= LOOSE_BALL_POUNCE_RADIUS_YARDS
+                || approaching
+                || fifty_fifty_duel
+                || stalled_loose)
                 && snapshot.is_committed_loose_ball_chaser(self.id)
             {
                 let (intercept, _trap_now, _ball_speed) =

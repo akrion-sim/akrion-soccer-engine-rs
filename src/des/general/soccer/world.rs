@@ -13532,16 +13532,34 @@ impl SoccerMatch {
                                     pressure,
                                 )
                             };
-                            let unsafe_release =
-                                |point: Vec2| concedes(point) || favours_opponent(point);
+                            let veto_on = terrible_pass_veto_enabled();
+                            let own_attack_dir = player_team.attack_dir();
+                            // A long backward ball — especially an aerial hoof or one played under
+                            // pressure — is a giveaway (10+ yds toward our own goal, often to nobody
+                            // or the opponent). Merge it into the same release-safety path as
+                            // shadow-aware concession and direct opponent-favouring aim: re-aim to a
+                            // safe receiver/lead point first; if no safe release exists, keep the
+                            // ball when the danger is strong or the explicit veto is enabled.
+                            let terrible_backward = |point: Vec2| {
+                                veto_on
+                                    && (point.y - player_pos.y) * own_attack_dir
+                                        < -LONG_BACKWARD_PASS_VETO_YARDS
+                                    && (pressure >= TERRIBLE_BACKWARD_PASS_PRESSURE
+                                        || flight.is_aerial())
+                            };
+                            let unsafe_release = |point: Vec2| {
+                                concedes(point) || favours_opponent(point) || terrible_backward(point)
+                            };
                             if unsafe_release(aimed_target) {
                                 if !unsafe_release(receiver_position) {
                                     aimed_target = receiver_position;
                                 } else if !unsafe_release(led_target) {
                                     aimed_target = led_target;
-                                } else if favours_opponent(aimed_target) {
-                                    // Every correction remains a strong turnover risk. Keep possession
-                                    // and face the intended run instead of forcing the ball to an opponent.
+                                } else if favours_opponent(aimed_target) || veto_on {
+                                    // No safe release exists. Keep possession and face the intended
+                                    // run instead of forcing the ball to an opponent / hoofing it
+                                    // backward. With the veto on, abort on any residual danger; with
+                                    // it off, preserve HEAD's softer behavior for a mere shadow read.
                                     let look = led_target - player_pos;
                                     if look.len() > 1e-6 {
                                         let face = facing_bucket_from_vector(look);
@@ -13915,6 +13933,26 @@ impl SoccerMatch {
                             );
                         }
                     }
+                    // MARL/MAPPO "release long inside own half": reward a forward LONG ball played to
+                    // a teammate who broke beyond the opponent's last outfield defender but is ONSIDE
+                    // in our own half (you cannot be offside in your own half) — the line-breaking
+                    // ball that punishes a high press.
+                    if release_long_own_half_enabled()
+                        && release_distance >= RELEASE_LONG_MIN_DISTANCE_YARDS
+                        && pass_forward_yards >= RELEASE_LONG_MIN_AHEAD_OF_BALL_YARDS
+                    {
+                        if let Some((rid, _)) =
+                            snapshot.release_long_inside_own_half_target(player_team)
+                        {
+                            if target_id == Some(rid) {
+                                self.record_reward_event_with_kind(
+                                    player_id,
+                                    RELEASE_LONG_INSIDE_OWN_HALF_REWARD_POINTS,
+                                    SoccerRewardEventKind::ReleaseLongInsideOwnHalf,
+                                );
+                            }
+                        }
+                    }
                     self.register_flank_crash_box_cross(
                         player_team,
                         player_id,
@@ -13923,7 +13961,32 @@ impl SoccerMatch {
                         flight,
                     );
                 }
-                self.move_player_towards(player_id, self.players[player_id].home_position, false);
+                // After playing the pass, CONTINUE THE RUN / overlap — keep the momentum in stride
+                // (a give-and-go, an overlapping run, supporting the ball forward) instead of
+                // turning back toward home and killing the run on the release tick. Genuinely
+                // stationary ⇒ fall back to holding shape. Gate off ⇒ original (home) behaviour.
+                if continue_run_after_pass_enabled() {
+                    let me = &self.players[player_id];
+                    let vel = me.velocity;
+                    let was_running =
+                        matches!(me.movement_gait, MovementGait::Run | MovementGait::Sprint);
+                    let target = if vel.len() >= CONTINUE_RUN_AFTER_PASS_MIN_SPEED_YPS {
+                        (me.position + vel.normalized() * CONTINUE_RUN_AFTER_PASS_LOOKAHEAD_YARDS)
+                            .clamp_to_pitch(
+                                self.config.field_width_yards,
+                                self.config.field_length_yards,
+                            )
+                    } else {
+                        me.home_position
+                    };
+                    self.move_player_towards(player_id, target, was_running);
+                } else {
+                    self.move_player_towards(
+                        player_id,
+                        self.players[player_id].home_position,
+                        false,
+                    );
+                }
                 if release_facing != FacingBucket::Unknown {
                     self.players[player_id].action_facing = release_facing;
                 }
@@ -14628,8 +14691,17 @@ impl SoccerMatch {
         // The faster you move, the harder it is to drive the ball against that momentum — a
         // sprint can't reverse-blast (it forces a settling touch first), a jog keeps most power.
         let penalty = KICK_AGAINST_MOMENTUM_PENALTY * (0.5 + speed_frac);
-        let floor = KICK_POWER_FACTOR_FLOOR
-            - speed_frac * (KICK_POWER_FACTOR_FLOOR - KICK_REVERSE_AT_SPRINT_FLOOR);
+        // No artificial bias against passing in stride: kicking against your momentum is harder by a
+        // MARGIN, not nearly impossible. The softer floor keeps a running/sprinting pass viable
+        // (the physics still costs power, and the facing/accuracy model + MPC pass-weight price the
+        // rest), instead of collapsing it so hard that the player is forced to stop to pass. Gate
+        // off ⇒ the original (harsher) floors, byte-identical.
+        let (base_floor, sprint_floor) = if in_stride_pass_margin_enabled() {
+            (IN_STRIDE_KICK_POWER_FLOOR, IN_STRIDE_KICK_SPRINT_POWER_FLOOR)
+        } else {
+            (KICK_POWER_FACTOR_FLOOR, KICK_REVERSE_AT_SPRINT_FLOOR)
+        };
+        let floor = base_floor - speed_frac * (base_floor - sprint_floor);
         return (1.0 - against * penalty).clamp(floor, 1.0);
     }
 
@@ -23916,6 +23988,62 @@ impl WorldSnapshot {
     /// [`Self::back_four_line_v2_centre_fwd`]), and the MARL/MAPPO policy is rewarded for the
     /// territorial gain (`dense_soccer_transition_reward`). Returns `(carrier_id, carrier_pos,
     /// forward_space_yards)`. Gated (default-on) by `DD_SOCCER_ENABLE_TEAM_ADVANCE_UPFIELD`.
+    /// "Release long inside own half" target (gate `DD_SOCCER_ENABLE_RELEASE_LONG_OWN_HALF`): a
+    /// teammate of `team` who has broken BEYOND the opponent's last outfield defender (the offside
+    /// line) but is still ONSIDE in our own half (you cannot be offside in your own half), ahead of
+    /// the ball, and open — the line-breaking long ball that punishes a high press. Returns the
+    /// most-advanced such `(receiver_id, position)`. `None` when the gate is off or none qualifies.
+    pub(crate) fn release_long_inside_own_half_target(&self, team: Team) -> Option<(usize, Vec2)> {
+        if !release_long_own_half_enabled() {
+            return None;
+        }
+        let attack = team.attack_dir();
+        let own_goal_fwd = self.own_goal_y_for(team) * attack;
+        let adv = |y: f64| y * attack - own_goal_fwd;
+        let halfway_adv = self.field_length * 0.5;
+        let ball_adv = adv(self.ball.position.y);
+        // Opponent offside line = the 2nd-most-advanced opponent toward THEIR goal (the last
+        // outfield defender; the keeper is usually the deepest). That is the 2nd-highest adv.
+        let mut opp_advs: Vec<f64> = self
+            .players
+            .iter()
+            .filter(|p| p.team == team.other())
+            .map(|p| adv(self.player_snapshot_position(p).y))
+            .collect();
+        if opp_advs.len() < 2 {
+            return None;
+        }
+        opp_advs.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        let offside_line_adv = opp_advs[1];
+        let mut best: Option<(usize, Vec2, f64)> = None;
+        for mate in self
+            .players
+            .iter()
+            .filter(|p| p.team == team && p.role != PlayerRole::Goalkeeper)
+        {
+            if self.ball.holder == Some(mate.id) {
+                continue;
+            }
+            let pos = self.player_snapshot_position(mate);
+            let mate_adv = adv(pos.y);
+            if !release_long_inside_own_half_qualifies(
+                mate_adv,
+                offside_line_adv,
+                ball_adv,
+                halfway_adv,
+            ) {
+                continue;
+            }
+            if self.nearest_opponent_distance_at(team, pos) < RELEASE_LONG_RECEIVER_OPEN_YARDS {
+                continue;
+            }
+            if best.is_none_or(|(_, _, a)| mate_adv > a) {
+                best = Some((mate.id, pos, mate_adv));
+            }
+        }
+        best.map(|(id, pos, _)| (id, pos))
+    }
+
     pub(crate) fn team_advance_upfield_active(&self, team: Team) -> Option<(usize, Vec2, f64)> {
         if !team_advance_upfield_enabled() {
             return None;
@@ -26740,6 +26868,21 @@ impl WorldSnapshot {
             .unwrap_or_default()
     }
 
+    /// True when `team` has a NUMBERS-UP overload behind the ball — at least
+    /// `DEFENSIVE_NUMBERS_UP_BEHIND_BALL_COUNT` of its players are goalside of the ball (between the
+    /// ball and their own goal). In that picture the defence can afford to commit a presser to the
+    /// carrier, because there is ample cover behind. See [`Self::advancing_carrier_steal_urgency`].
+    pub(crate) fn defensive_numbers_up_behind_ball(&self, team: Team) -> bool {
+        let attack = team.attack_dir();
+        let ball_fwd = self.ball.position.y * attack;
+        let behind = self
+            .players
+            .iter()
+            .filter(|p| p.team == team && self.player_snapshot_position(p).y * attack < ball_fwd)
+            .count();
+        behind >= DEFENSIVE_NUMBERS_UP_BEHIND_BALL_COUNT
+    }
+
     pub(crate) fn advancing_carrier_steal_urgency(&self, defender_id: usize) -> f64 {
         let Some(me) = self.players.iter().find(|p| p.id == defender_id) else {
             return 1.0;
@@ -26772,6 +26915,19 @@ impl WorldSnapshot {
         if nearest.map(|p| p.id) != Some(me.id) {
             return 1.0;
         }
+        // Numbers-up press: when our defence has a clear overload BEHIND THE BALL (>= 7 outfielders
+        // goalside of it), the nearest defender can afford to commit and should PRESS the carrier
+        // hard — step onto him (urgency > 1 triggers the positional step-up) and tackle readily —
+        // rather than merely contain, even if the carrier isn't advancing. We have ample cover.
+        // 0.0 when not numbers-up so every `.max(numbers_up_floor)` below is a true no-op (the
+        // press values are all positive) — byte-identical with the gate off.
+        let numbers_up_floor = if defensive_numbers_up_press_enabled()
+            && self.defensive_numbers_up_behind_ball(me.team)
+        {
+            NUMBERS_UP_PRESS_URGENCY_FLOOR
+        } else {
+            0.0
+        };
         let surprise = self.surprise_behind_steal_profile_for(me.id);
         if surprise.available {
             return (1.0 + CARRIER_ADVANCE_STEAL_BOOST * (0.42 + surprise.score * 0.74))
@@ -26788,7 +26944,20 @@ impl WorldSnapshot {
         let advance_min_speed =
             CARRIER_ADVANCE_MIN_SPEED_YPS * (1.0 - press_urgency * OWN_GOAL_PRESS_SPEED_RELAX);
         if goalward < advance_min_speed {
-            return 1.0; // not advancing: contain as normal.
+            // Not advancing: contain as normal (1.0) — UNLESS we are numbers-up behind the ball
+            // (commit a presser), OR the carrier has STOPPED on the ball with nobody challenging:
+            // a holder who stalls must be pressed by the nearest defender (step up to engage)
+            // rather than stood off, so the ball doesn't just sit uncontested.
+            let stationary_press_floor = if stationary_holder_press_enabled()
+                && carrier_velocity.len() <= STATIONARY_HOLDER_PRESS_MAX_SPEED_YPS
+                && self.player_snapshot_position(me).distance(carrier_position)
+                    > STATIONARY_HOLDER_PRESS_RADIUS_YARDS
+            {
+                STATIONARY_HOLDER_PRESS_URGENCY_FLOOR
+            } else {
+                0.0
+            };
+            return 1.0_f64.max(numbers_up_floor).max(stationary_press_floor);
         }
         let advance01 = ((goalward - CARRIER_ADVANCE_MIN_SPEED_YPS)
             / (CARRIER_ADVANCE_FULL_SPEED_YPS - CARRIER_ADVANCE_MIN_SPEED_YPS).max(1e-6))
@@ -26804,11 +26973,12 @@ impl WorldSnapshot {
             }
         });
         if has_cover {
-            1.0 + advance01 * CARRIER_ADVANCE_STEAL_BOOST
+            (1.0 + advance01 * CARRIER_ADVANCE_STEAL_BOOST).max(numbers_up_floor)
         } else if press_urgency <= 0.0 {
             // Outside our third: a lone last defender contains rather than lunging —
-            // a failed steal with no cover lets the carrier clean through.
-            CARRIER_NO_COVER_CONTAIN_FACTOR
+            // a failed steal with no cover lets the carrier clean through. With a numbers-up
+            // overload behind the ball there IS cover, so press regardless.
+            CARRIER_NO_COVER_CONTAIN_FACTOR.max(numbers_up_floor)
         } else {
             // But the closer the carrier dribbles to our own goal, the less that
             // caution is affordable: ramp the lone defender from the timid contain
@@ -26817,8 +26987,9 @@ impl WorldSnapshot {
             // fires against a slow dribbler walking the ball in.
             let covered_commit =
                 (1.0 + advance01 * CARRIER_ADVANCE_STEAL_BOOST).max(1.0 + OWN_GOAL_PRESS_MIN_BOOST);
-            CARRIER_NO_COVER_CONTAIN_FACTOR
-                + press_urgency * (covered_commit - CARRIER_NO_COVER_CONTAIN_FACTOR)
+            (CARRIER_NO_COVER_CONTAIN_FACTOR
+                + press_urgency * (covered_commit - CARRIER_NO_COVER_CONTAIN_FACTOR))
+            .max(numbers_up_floor)
         }
     }
 
@@ -46213,7 +46384,28 @@ impl WorldSnapshot {
         } else {
             BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS
         };
-        min_gap + (BACK_FOUR_LINE_DESIRED_GAP_MAX_YARDS - min_gap) * frac
+        let base_gap = min_gap + (BACK_FOUR_LINE_DESIRED_GAP_MAX_YARDS - min_gap) * frac;
+        if !back_four_push_into_dead_space_enabled() {
+            return base_gap;
+        }
+        // Push up to FILL DEAD SPACE: the line should not sit ~40yd off the ball when the zone in
+        // front of it is empty. Merge this with the possession-aware minimum gap: in possession the
+        // compression target is the possession min, and out of possession it is the defensive min.
+        // An opponent IN that band (a runner to mark / hold onside) keeps the deeper gap.
+        let attack = team.attack_dir();
+        let ball_fwd = self.ball.position.y * attack;
+        let approx_line_fwd = ball_fwd - base_gap;
+        let space_occupied = self.players.iter().any(|p| {
+            p.team == team.other() && p.role != PlayerRole::Goalkeeper && {
+                let f = self.player_snapshot_position(p).y * attack;
+                f > approx_line_fwd + BACK_FOUR_DEAD_SPACE_OCCUPANT_MARGIN_YARDS && f < ball_fwd
+            }
+        });
+        if space_occupied {
+            base_gap
+        } else {
+            min_gap + (base_gap - min_gap) * (1.0 - BACK_FOUR_DEAD_SPACE_PUSH_FRACTION)
+        }
     }
 
     fn back_four_foremost_four_opponent_attack_fwd(&self, team: Team) -> Option<f64> {
