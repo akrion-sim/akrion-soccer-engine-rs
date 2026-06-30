@@ -551,6 +551,10 @@ impl Default for RewardTunables {
             center_back_ahead_of_wingback_penalty_per_yard: 0.11,
             blocked_lane_floor_pass_penalty_points: 6.0,
             low_pressure_forced_pass_penalty_points: 1.75,
+            giveaway_to_opponent_own_half_penalty: 3.5,
+            giveaway_to_opponent_opp_half_penalty: 2.2,
+            giveaway_to_loose_own_half_penalty: 0.85,
+            giveaway_to_loose_opp_half_penalty: 0.55,
             pitch_value_threat_delta_points: 12.0,
             dense_shaping_budget_points: 12.0,
         }
