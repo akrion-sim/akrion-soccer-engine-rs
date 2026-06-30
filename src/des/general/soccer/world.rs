@@ -26458,12 +26458,14 @@ impl WorldSnapshot {
         // goalside of it), the nearest defender can afford to commit and should PRESS the carrier
         // hard — step onto him (urgency > 1 triggers the positional step-up) and tackle readily —
         // rather than merely contain, even if the carrier isn't advancing. We have ample cover.
+        // 0.0 when not numbers-up so every `.max(numbers_up_floor)` below is a true no-op (the
+        // press values are all positive) — byte-identical with the gate off.
         let numbers_up_floor = if defensive_numbers_up_press_enabled()
             && self.defensive_numbers_up_behind_ball(me.team)
         {
             NUMBERS_UP_PRESS_URGENCY_FLOOR
         } else {
-            1.0
+            0.0
         };
         let surprise = self.surprise_behind_steal_profile_for(me.id);
         if surprise.available {
