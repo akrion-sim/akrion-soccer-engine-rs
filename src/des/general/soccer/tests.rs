@@ -88813,7 +88813,7 @@ fn team_advance_upfield_space_qualifies_truth_table() {
 }
 
 #[test]
-fn forward_carry_tracker_sustained_segments_and_productive_payout() {
+fn forward_carry_tracker_sustained_segments_both_cadences() {
     let seg = |fine, coarse| SustainedDribbleSegments { fine, coarse };
     let mut t = ForwardCarryTracker::new_at(7, Team::Home, 60.0);
     // 2yd carried: the FIRST 1yd segment earns nothing, the 2nd 1yd segment pays (fine cadence);

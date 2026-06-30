@@ -18720,6 +18720,27 @@ pub(crate) fn buildup_chain_credit_points(base_points: f64, recency_index: usize
     }
 }
 
+/// Whether the **ground-pass speed floor** is active this process. A released ground pass is
+/// `intended_speed · power_factor · momentum_f` — when the body can't drive it (struck while
+/// sprinting against your own momentum, or twisted side-on) that product collapses the pass to a
+/// near-stationary "ghost ball" the passer then runs away from (the dribble-leaves-the-ball-behind
+/// bug). This floors the released pace so the body penalty can SOFTEN a pass but never kill it
+/// (deliberate backheel/perpendicular-prod caps are still respected). Default-ON in production (env
+/// `DD_SOCCER_ENABLE_GROUND_PASS_SPEED_FLOOR=0/false` is the kill switch); default-OFF under test so
+/// the pass-physics parity suite stays byte-identical. See [`floored_ground_pass_launch_speed`].
+pub(crate) fn ground_pass_speed_floor_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_GROUND_PASS_SPEED_FLOOR").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_GROUND_PASS_SPEED_FLOOR"))
+    }
+}
+
 /// Whether **backward-pass discipline** is active this process. Emits a training PENALTY for a
 /// pass played backward (toward our own goal) when the passer is NOT under genuine high pressure —
 /// no opponent within `BACKWARD_PASS_HIGH_PRESSURE_RADIUS_YARDS` — scaled by how far back the ball
