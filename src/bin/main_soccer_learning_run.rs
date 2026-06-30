@@ -24,7 +24,8 @@ use soccer_engine::des::general::soccer::{
     SoccerTacticalLearningWeights, SoccerTeamPolicyArtifact, SoccerTeamQPolicies,
     DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE, DEFAULT_SOCCER_PASS_COMPLETION_LEARNING_RATE,
     LOOSE_BALL_COMMIT_HEAD_MIN_TRAINING_STEPS, LongPassRunHead,
-    LONG_PASS_RUN_HEAD_MIN_TRAINING_STEPS, ShotTriggerHead, SHOT_TRIGGER_HEAD_MIN_TRAINING_STEPS,
+    LONG_PASS_RUN_HEAD_MIN_TRAINING_STEPS, GiveAndGoHead, GIVE_AND_GO_HEAD_MIN_TRAINING_STEPS,
+    ShotTriggerHead, SHOT_TRIGGER_HEAD_MIN_TRAINING_STEPS,
     ReceiveApproachHead, RECEIVE_APPROACH_HEAD_MIN_TRAINING_STEPS,
 };
 use soccer_engine::des::soccer_learning::{
