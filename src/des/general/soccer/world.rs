@@ -46181,9 +46181,9 @@ impl WorldSnapshot {
         if space_occupied {
             base_gap
         } else {
-            BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS
-                + (base_gap - BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS)
-                    * (1.0 - BACK_FOUR_DEAD_SPACE_PUSH_FRACTION)
+            // Compress toward the possession-aware floor (`gap_min`), so a dead zone in front
+            // collapses the gap to 5yd in possession / 20yd out of it rather than a fixed 20.
+            gap_min + (base_gap - gap_min) * (1.0 - BACK_FOUR_DEAD_SPACE_PUSH_FRACTION)
         }
     }
 
