@@ -17925,6 +17925,12 @@ pub(crate) enum SoccerRewardEventKind {
     /// position was the mistake. Emitted only when `DD_SOCCER_ENABLE_OVERDRIBBLE_PENALTY` is on. See
     /// [`overdribble_dispossession_penalty_points`].
     OverdribbleDispossession,
+    /// Small, budget-bounded per-tick shaped reward (or *mild* penalty) for an off-ball
+    /// defending outfielder's **true goal-side** position: positive for sitting on the
+    /// ball→own-goal line and goal-side of the ball, mildly negative for being caught upfield
+    /// of the ball (failing to recover). Excludes strikers and the keeper. Emitted only when
+    /// `DD_SOCCER_ENABLE_DEFENSIVE_GOAL_SIDE` is on. See the [`goal_side`] module.
+    DefensiveGoalSide,
     MatchResult,
 }
 
