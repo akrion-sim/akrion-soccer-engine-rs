@@ -10201,6 +10201,38 @@ impl SoccerMatch {
         }
     }
 
+    /// The negative mirror of [`Self::record_buildup_chain_credit`]: when a pass is intercepted,
+    /// spread a STEEPLY discounted share of the ball-loser's penalty back over the one or two
+    /// PREVIOUS passers in the lost possession spell (`TURNOVER_CHAIN_BLAME_DISCOUNTS`: 20% to the
+    /// immediately-preceding passer, 5% to the one before). `ball_loser` keeps the full (100%)
+    /// penalty applied by the caller and is forced to recency index 0, which the blame loop SKIPS
+    /// — so the loser is never double-charged here. `base_penalty` is the (positive) magnitude of
+    /// the ball-loser's own penalty, so the prior passers feel a true fraction of what the loser
+    /// felt. MUST be called while the giving team's `possession_chain` is still intact — i.e.
+    /// BEFORE the ball-winner's `record_possession_touch` clears it. Gated (default-on) by
+    /// `DD_SOCCER_ENABLE_TURNOVER_CHAIN_BLAME`; OFF ⇒ no-op (byte-identical).
+    fn record_turnover_chain_blame(&mut self, team: Team, ball_loser: usize, base_penalty: f64) {
+        if !turnover_chain_blame_enabled() || !base_penalty.is_finite() || base_penalty <= 0.0 {
+            return;
+        }
+        let sequence = self.recent_possession_reward_sequence(
+            team,
+            Some(ball_loser),
+            TURNOVER_CHAIN_BLAME_DISCOUNTS.len(),
+        );
+        for (recency_index, player_id) in sequence.into_iter().enumerate() {
+            // Index 0 is the ball-loser (full penalty applied by the caller) ⇒ points = 0.
+            let amount = turnover_chain_blame_points(base_penalty, recency_index);
+            if amount > 0.0 {
+                self.record_reward_event_with_kind(
+                    player_id,
+                    -amount,
+                    SoccerRewardEventKind::TurnoverChainBlame,
+                );
+            }
+        }
+    }
+
     pub(crate) fn record_shot_on_target_rewards(&mut self, shooting_team: Team, shooter: usize) {
         self.record_possession_touch(shooter);
         self.settle_turnover_outcome_if_danger(shooting_team, TurnoverOutcomeDanger::ShotOnGoal);
