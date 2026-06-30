@@ -18800,30 +18800,33 @@ pub(crate) fn overdribble_penalty_enabled() -> bool {
 
 /// Minimum gait a ball carrier should drive at when carrying the ball forward into open space — the
 /// "first inclination is to jog/run/sprint forward, not walk the ball" rule. Returns `None` when no
-/// floor applies: under tight pressure (`<= CARRIER_DRIVE_TIGHT_PRESSURE_YARDS`, where close control
-/// beats pace) or with too little room ahead (`< CARRIER_DRIVE_JOG_SPACE_YARDS`). Otherwise the
-/// floor is graded by open forward space — a couple of clear yards ⇒ at least a jog, a clear lane ⇒
-/// a run, open field ⇒ a sprint (capped to a run when too fatigued to flat-out sprint). The caller
-/// applies it as an UPSHIFT only, so it never slows a carrier already moving faster. Pure (env-free)
-/// so the thresholds are unit-tested directly. See [`carrier_forward_drive_enabled`].
+/// floor applies: under tight pressure (`<= carry_tight_pressure_yards`, where close control beats
+/// pace) or with too little room ahead (`< carry_jog_space_yards`). Otherwise the floor is graded by
+/// open forward space — a couple of clear yards ⇒ at least a jog, a clear lane ⇒ a run, open field ⇒
+/// a sprint (capped to a run when too fatigued to flat-out sprint). The caller applies it as an
+/// UPSHIFT only, so it never slows a carrier already moving faster. The thresholds come from
+/// [`DribbleTuning`] (the carry-SPEED axis), so they are tunable from MPC/config and the learned
+/// policy overlay both. Pure (env-free) so it is unit-tested directly. See
+/// [`carrier_forward_drive_enabled`].
 pub(crate) fn carrier_forward_drive_gait_floor(
     forward_space_yards: f64,
     nearest_opponent_distance_yards: f64,
     fatigue: f64,
+    tuning: &DribbleTuning,
 ) -> Option<MovementGait> {
     if !forward_space_yards.is_finite() || !nearest_opponent_distance_yards.is_finite() {
         return None;
     }
-    if nearest_opponent_distance_yards <= CARRIER_DRIVE_TIGHT_PRESSURE_YARDS
-        || forward_space_yards < CARRIER_DRIVE_JOG_SPACE_YARDS
+    if nearest_opponent_distance_yards <= tuning.carry_tight_pressure_yards
+        || forward_space_yards < tuning.carry_jog_space_yards
     {
         return None;
     }
-    let floor = if forward_space_yards >= CARRIER_DRIVE_SPRINT_SPACE_YARDS
-        && fatigue < CARRIER_DRIVE_SPRINT_MAX_FATIGUE
+    let floor = if forward_space_yards >= tuning.carry_sprint_space_yards
+        && fatigue < tuning.carry_sprint_max_fatigue
     {
         MovementGait::Sprint
-    } else if forward_space_yards >= CARRIER_DRIVE_RUN_SPACE_YARDS {
+    } else if forward_space_yards >= tuning.carry_run_space_yards {
         MovementGait::Run
     } else {
         MovementGait::Jog
