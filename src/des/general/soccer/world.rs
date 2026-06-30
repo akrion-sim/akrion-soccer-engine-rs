@@ -25107,6 +25107,69 @@ impl WorldSnapshot {
         (directness * control_fit * fast_bypass_relief).clamp(0.0, 1.0)
     }
 
+    /// True when a pass to `pass_point` is, in effect, played straight to the other team: the
+    /// nearest opponent reaches the reception point — within its sprint+lunge reach by the time
+    /// the ball arrives — AND is *clearly closer* to it than the intended receiver. This is the
+    /// tightly-marked-receiver giveaway the user reports ("passes going straight to the other
+    /// team") that the two predicates above both leave a gap for:
+    /// [`Self::pass_point_direct_opponent_control_risk`] returns 0 unless an opponent is strictly
+    /// closer to the aim than the receiver on the MID-LANE; [`Self::pass_reception_conceded_to_opponent`]
+    /// needs the marker inside the concede radius *and* real passer pressure. A low-completion
+    /// ball whose interceptor sits just outside either trigger slips through — this margin-based
+    /// reception race closes it. Deliberately strict (the marker must beat the receiver to the
+    /// ball by `PASS_RECEPTION_LOSES_RECEIVER_MARGIN_YARDS`) so a brave pass to a half-open man,
+    /// or a 50/50 the receiver can contest, is left to the softer congestion penalty.
+    pub(crate) fn pass_reception_loses_to_opponent(
+        &self,
+        team: Team,
+        receiver_position: Vec2,
+        pass_origin: Vec2,
+        pass_point: Vec2,
+        ball_speed_yps: f64,
+    ) -> bool {
+        let Some((opponent_id, opponent_position, opponent_distance)) =
+            self.nearest_opponent_at(team, pass_point)
+        else {
+            return false;
+        };
+        if !opponent_distance.is_finite()
+            || opponent_distance > PASS_RECEPTION_CONGESTION_RADIUS_YARDS
+        {
+            return false;
+        }
+        let receiver_distance = receiver_position.distance(pass_point);
+        // The marker must beat the intended receiver to the reception point by a clear margin —
+        // a man level with his marker is a contestable ball, not a giveaway, and is left alone.
+        if !receiver_distance.is_finite()
+            || opponent_distance + PASS_RECEPTION_LOSES_RECEIVER_MARGIN_YARDS >= receiver_distance
+        {
+            return false;
+        }
+        // Reception race: can the opponent reach the arriving ball at the point? Reuse the shared
+        // lane-arrival + sprint-reach model so a slow/distant marker, or a ball driven past too
+        // fast to be cut out, does not trip it.
+        let speed = ball_speed_yps.max(REACTIVE_GROUND_PASS_MIN_SPEED_YPS);
+        let lane = pass_point - pass_origin;
+        let lane_len = lane.len();
+        let ball_arrival = if lane_len < 1e-3 {
+            0.0
+        } else {
+            let dir = lane * (1.0 / lane_len);
+            let along = (opponent_position - pass_origin).dot(dir).clamp(0.0, lane_len);
+            along / speed
+        };
+        let Some(opponent) = self.players.iter().find(|p| p.id == opponent_id) else {
+            return false;
+        };
+        let sprint_speed = (player_top_speed_yps(opponent.role, &opponent.skills)
+            * fatigue_speed_factor(opponent.skills.stamina, opponent.fatigue)
+            * MovementGait::Sprint.speed_multiplier())
+        .max(0.85);
+        let reaction_window = (ball_arrival - PASS_LANE_INTERCEPT_REACTION_SECONDS)
+            .clamp(0.0, PASS_LANE_INTERCEPT_MAX_WINDOW_SECONDS);
+        opponent_distance <= INTERCEPT_LUNGE_REACH_YARDS + sprint_speed * reaction_window
+    }
+
     /// True when a ground/low pass to `pass_point` concedes the reception to an opponent:
     /// the nearest opponent to the reception point is on/near it and can REACH the arriving
     /// ball. This is the ball-to-an-opponent's-feet / man-marked-receiver case that
