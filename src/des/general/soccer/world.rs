@@ -22574,6 +22574,27 @@ pub(crate) fn dd_soccer_enable_quick_forward_pass() -> bool {
     }
 }
 
+/// Whether the scoop pass may fire on a **blocked-but-ideal lane** even when the carrier is NOT
+/// personally crowded (gate `DD_SOCCER_ENABLE_SCOOP_LANE_BLOCKED`, default-ON in prod / OFF under
+/// test). Originally `scoop_pass_target_for` only offered a scoop as an ESCAPE — it required ≥2
+/// opponents within 7yd of the passer. But the canonical case is "the lane to an open teammate is
+/// ideal yet ONE defender stands in it": the carrier has space, so the crowd gate suppressed it.
+/// When ON, the passer-crowd requirement becomes a *boost condition* rather than a hard gate — the
+/// per-target `defender_in_lane` + receiver-open checks still fully apply, so a scoop is only ever
+/// offered into a genuinely blocked lane to a genuinely open man. OFF ⇒ byte-identical (crowd-gated).
+pub(crate) fn dd_soccer_enable_scoop_lane_blocked() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_SCOOP_LANE_BLOCKED").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_SCOOP_LANE_BLOCKED"))
+    }
+}
+
 /// Seed each of the 11 players' `home_position` — their field-position affinity
 /// anchor, which the lane-discipline band, support scorer, and shape cohesion all
 /// pull toward — from the team's evolved genome anchors on the 12×24 pitch grid,
