@@ -32914,6 +32914,8 @@ fn soccer_requested_tactical_feature_gate_names() -> Vec<String> {
         "DD_SOCCER_DISABLE_HOLD_FOR_SUPPORT",
         "DD_SOCCER_DISABLE_HOLD_DRIVE_INTO_SPACE",
         "DD_SOCCER_ENABLE_QUICK_FORWARD_PASS",
+        "DD_SOCCER_ENABLE_OVERDRIBBLE_PENALTY",
+        "DD_SOCCER_ENABLE_CARRIER_FORWARD_DRIVE",
     ]
     .into_iter()
     .map(str::to_string)
