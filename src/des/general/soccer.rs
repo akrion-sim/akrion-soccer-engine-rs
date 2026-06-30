@@ -58653,7 +58653,19 @@ fn modulated_pass_speed_yps(
         let desired_speed = land_at_target * pressure_firm;
         let skill = passing_skill.clamp(0.0, 1.0);
         let fit = (0.86 + skill * 0.08 + openness * 0.04).clamp(0.84, 0.98);
-        return (raw_speed_yps + (desired_speed - raw_speed_yps) * fit).clamp(
+        let blended = raw_speed_yps + (desired_speed - raw_speed_yps) * fit;
+        if scoop_land_at_target_enabled() {
+            // The ball's altitude is on a fixed gravity clock T (hang time from the apex), and with
+            // the fix the apex it flies == this `apex_yards`. To DROP on the receiver it must cross
+            // the horizontal distance in ~T, i.e. at ~`desired_speed`. The flat 16mph min-speed
+            // floor over-paced short chips so they reached the spot in a fraction of T and hung in
+            // the air (the balloon). Cap the floor at the land-at-target pace and the ceiling just
+            // above it, so the chip arrives in ~one hang time and obeys gravity onto the man.
+            let floor = desired_speed.min(mph_to_yps(SCOOP_MIN_SPEED_MPH));
+            let ceil = (desired_speed * 1.06).clamp(floor, mph_to_yps(SCOOP_MAX_SPEED_MPH));
+            return blended.clamp(floor, ceil);
+        }
+        return blended.clamp(
             mph_to_yps(SCOOP_MIN_SPEED_MPH),
             mph_to_yps(SCOOP_MAX_SPEED_MPH),
         );
