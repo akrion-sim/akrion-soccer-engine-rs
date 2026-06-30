@@ -940,10 +940,22 @@ impl SoccerMatch {
                 let decision = self.pending_line_depth.swap_remove(i);
                 let now_territorial = territorial_advantage(snapshot, decision.team);
                 if now_territorial.is_finite() && decision.decision_territorial.is_finite() {
+                    // MARL/MAPPO attacker-compactness shaping: dock the reward by how far the back
+                    // four sits behind the optimal gap to the opponent's foremost attackers over the
+                    // window, so the learned head prefers depths that keep the four compact with the
+                    // attackers (fills the space) rather than leaving a hole. Gated with the press.
+                    let mut reward = now_territorial - decision.decision_territorial;
+                    if back_four_press_to_attackers_enabled() {
+                        if let Some(excess) =
+                            snapshot.back_four_attacker_gap_excess_yards(decision.team)
+                        {
+                            reward -= BACK_FOUR_ATTACKER_COMPACTNESS_REWARD_PER_YARD * excess;
+                        }
+                    }
                     self.line_depth_samples.push(LineDepthSample {
                         inputs: decision.inputs,
                         action_gap_fraction: decision.action_gap_fraction,
-                        reward: now_territorial - decision.decision_territorial,
+                        reward,
                     });
                     if self.line_depth_samples.len() > LINE_DEPTH_SAMPLE_CAP {
                         let overflow = self.line_depth_samples.len() - LINE_DEPTH_SAMPLE_CAP;
