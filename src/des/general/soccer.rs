@@ -19273,6 +19273,48 @@ pub(crate) fn buildup_chain_credit_points(base_points: f64, recency_index: usize
     }
 }
 
+/// Whether **discounted turnover-chain blame** is active this process. When a pass is intercepted,
+/// the player who lost the ball already carries the full penalty; this spreads a steeply
+/// discounted share of that same penalty back over the one or two passers who built the lost
+/// move (`TURNOVER_CHAIN_BLAME_DISCOUNTS`: 20% to the immediately-preceding passer, 5% to the one
+/// before), so the build-up that fed a doomed move gets a small corrective gradient too. The
+/// negative mirror of `buildup_chain_credit_enabled`; complementary to the net-Φ PBRS danger
+/// asymmetry and MARL/MAPPO's global team-reward share. Default-ON in production (env
+/// `DD_SOCCER_ENABLE_TURNOVER_CHAIN_BLAME=0/false` is the kill switch); default-OFF under test so
+/// the reward-parity suite stays byte-identical. See `record_turnover_chain_blame`.
+pub(crate) fn turnover_chain_blame_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_TURNOVER_CHAIN_BLAME").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_TURNOVER_CHAIN_BLAME"))
+    }
+}
+
+/// Discounted blame (points, POSITIVE magnitude) for the k-th most-recent passer in a turnover
+/// chain: `base_penalty · TURNOVER_CHAIN_BLAME_DISCOUNTS[k]`, floored to 0 below the min payout.
+/// `recency_index` 0 is the ball-loser, who is penalized in full by the interception handler, so
+/// this returns 0 there — the blame loop applies indices 1.. only. Pure so the discount curve is
+/// unit-tested directly. See [`turnover_chain_blame_enabled`].
+pub(crate) fn turnover_chain_blame_points(base_penalty: f64, recency_index: usize) -> f64 {
+    if base_penalty <= 0.0 || recency_index == 0 {
+        return 0.0;
+    }
+    let Some(discount) = TURNOVER_CHAIN_BLAME_DISCOUNTS.get(recency_index).copied() else {
+        return 0.0;
+    };
+    let amount = base_penalty * discount;
+    if amount >= TURNOVER_CHAIN_BLAME_MIN_POINTS {
+        amount
+    } else {
+        0.0
+    }
+}
+
 /// Number of a team's players that must be goalside of the ball for a defensive NUMBERS-UP press.
 const DEFENSIVE_NUMBERS_UP_BEHIND_BALL_COUNT: usize = 7;
 /// Max carrier speed (yps) to count as a STOPPED holder for the stationary-holder press.
