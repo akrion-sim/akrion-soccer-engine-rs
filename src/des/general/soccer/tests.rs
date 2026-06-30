@@ -87684,6 +87684,42 @@ fn forward_carry_tracker_caps_long_runs_and_ignores_noise() {
 }
 
 #[test]
+fn mpc_ground_pass_weight_solver_times_ball_to_target() {
+    let sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let snapshot = WorldSnapshot::from_match(&sim);
+    // The solved launch speed must reproduce the requested travel time (ball lands as the receiver
+    // arrives) — i.e. the solver correctly inverts the decelerating-ball physics.
+    for &(dist, t) in &[(12.0, 0.9_f64), (24.0, 1.4), (8.0, 0.7)] {
+        let v = snapshot
+            .ball_ground_launch_speed_for_travel(dist, t)
+            .unwrap_or_else(|| panic!("solver should find a weight for {dist}yd in {t}s"));
+        let achieved = snapshot
+            .ball_ground_travel_time(dist, v)
+            .unwrap_or_else(|| panic!("solved speed {v} should reach {dist}yd"));
+        assert!(
+            (achieved - t).abs() < 0.05,
+            "solved weight {v}yps should land {dist}yd in ~{t}s, got {achieved}s"
+        );
+    }
+    // Monotonic: a SHORTER required time (same distance) demands a FIRMER pass — the deterministic
+    // "weight to the receiver" relation, not a random pick.
+    let v_slow = snapshot
+        .ball_ground_launch_speed_for_travel(20.0, 1.6)
+        .unwrap();
+    let v_fast = snapshot
+        .ball_ground_launch_speed_for_travel(20.0, 0.9)
+        .unwrap();
+    assert!(
+        v_fast > v_slow,
+        "a quicker rendezvous needs more weight: {v_fast} vs {v_slow}"
+    );
+    // Infeasible: no launch within the envelope covers a huge distance in a tiny time.
+    assert!(snapshot
+        .ball_ground_launch_speed_for_travel(80.0, 0.2)
+        .is_none());
+}
+
+#[test]
 fn unpressured_backward_pass_penalty_truth_table() {
     let pressed = BACKWARD_PASS_HIGH_PRESSURE_RADIUS_YARDS - 0.1; // opponent within 3yd ⇒ justified
     let free = BACKWARD_PASS_HIGH_PRESSURE_RADIUS_YARDS + 5.0; // no close opponent ⇒ penalized
