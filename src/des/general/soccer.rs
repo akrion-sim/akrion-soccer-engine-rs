@@ -17891,6 +17891,14 @@ pub(crate) enum SoccerRewardEventKind {
     /// strategy — you cannot be offside in your own half). Trains the line-breaking ball that
     /// punishes a high press. Emitted only when `DD_SOCCER_ENABLE_RELEASE_LONG_OWN_HALF` is on.
     ReleaseLongInsideOwnHalf,
+    /// PENALTY (negative): the carrier held / dribbled the ball too long and was DISPOSSESSED for it
+    /// — the steal is the marker of a negative event (the absence of a pass that should have been
+    /// played). Attributed to the over-dribbling carrier and scaled by the field-vector context at
+    /// the moment of loss: how long they held, how much pressure was on them, and how many open
+    /// forward outlets they ignored. The direct learning signal that holding too long in that
+    /// position was the mistake. Emitted only when `DD_SOCCER_ENABLE_OVERDRIBBLE_PENALTY` is on. See
+    /// [`overdribble_dispossession_penalty_points`].
+    OverdribbleDispossession,
     MatchResult,
 }
 
