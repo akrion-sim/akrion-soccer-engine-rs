@@ -89757,9 +89757,9 @@ fn release_long_inside_own_half_qualifies_truth_table() {
     assert!(!release_long_inside_own_half_qualifies(31.0, 30.0, 20.0, halfway));
     // Not meaningfully ahead of the ball (ball at adv 44) ⇒ not a forward long ball ⇒ reject.
     assert!(!release_long_inside_own_half_qualifies(45.0, 30.0, 44.0, halfway));
-    // A normal deep line (offside line at adv 50, opponent half) ⇒ a teammate beyond it is past
-    // halfway, so this strategy never fires against a deep block (correct).
-    assert!(!release_long_inside_own_half_qualifies(55.0, 50.0, 20.0, halfway));
+    // A normal DEEP line (offside line at adv 70, past halfway in the opponent half) ⇒ any teammate
+    // beyond it is also past halfway, so this strategy never fires against a deep block (correct).
+    assert!(!release_long_inside_own_half_qualifies(72.0, 70.0, 20.0, halfway));
 }
 
 #[test]
