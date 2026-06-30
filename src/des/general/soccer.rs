@@ -18002,7 +18002,6 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::BuildupChainCredit
                 | SoccerRewardEventKind::ReleaseLongInsideOwnHalf
                 | SoccerRewardEventKind::OverdribbleDispossession
-                | SoccerRewardEventKind::DefensiveGoalSide
                 | SoccerRewardEventKind::MatchResult
         )
     }
