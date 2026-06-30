@@ -17462,13 +17462,50 @@ impl PossessionProgressTracker {
 /// component is accumulated. A single carrier holds the ball at a time, so the match keeps one
 /// `Option<ForwardCarryTracker>`, reset when the holder changes / possession is lost. The segment
 /// accounting is pure (no env, no world access) so it is unit-tested directly.
+/// New sustained-dribble segments completed this tick, at BOTH cadences: `fine` = 1-yard segments
+/// ("a yard followed by another yard"), `coarse` = 2-yard segments ("2 yards followed by 2 more").
+/// Both are rewarded (the user asked for both); the coarse cadence is an extra bonus that escalates
+/// with a longer continuous run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SustainedDribbleSegments {
+    pub(crate) fine: u32,
+    pub(crate) coarse: u32,
+}
+
+impl SustainedDribbleSegments {
+    fn is_empty(self) -> bool {
+        self.fine == 0 && self.coarse == 0
+    }
+}
+
+/// Number of NEW sustained segments to reward this tick at `segment_yards` granularity: whole
+/// segments completed PAST THE FIRST (so "one segment followed by another"), capped, minus those
+/// already rewarded (advanced in place). Pure.
+fn advance_sustained_segments(
+    carry_yards: f64,
+    segment_yards: f64,
+    cap: u32,
+    already_rewarded: &mut u32,
+) -> u32 {
+    let total = (carry_yards / segment_yards).floor() as u32;
+    let rewardable = total.saturating_sub(1).min(cap);
+    if rewardable > *already_rewarded {
+        let new = rewardable - *already_rewarded;
+        *already_rewarded = rewardable;
+        new
+    } else {
+        0
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ForwardCarryTracker {
     pub(crate) carrier_id: usize,
     pub(crate) team: Team,
     pub(crate) last_ball_y: f64,
     forward_carry_yards: f64,
-    sustained_rewarded_segments: u32,
+    fine_rewarded_segments: u32,
+    coarse_rewarded_segments: u32,
 }
 
 impl ForwardCarryTracker {
@@ -17478,38 +17515,51 @@ impl ForwardCarryTracker {
             team,
             last_ball_y: ball_y,
             forward_carry_yards: 0.0,
-            sustained_rewarded_segments: 0,
+            fine_rewarded_segments: 0,
+            coarse_rewarded_segments: 0,
         }
     }
 
     /// Fold one tick of carry into the run. `forward_delta` is this tick's Δy·attack (positive =
     /// toward the opponent goal). A meaningful backward move breaks the run (resets the accumulated
-    /// carry and the rewarded-segment counter). Returns the number of NEW sustained 2-yard segments
-    /// to reward this tick — segments PAST THE FIRST in the continuous run ("2 yards followed by 2
-    /// more"), capped. Pure.
-    fn fold_tick(&mut self, forward_delta: f64) -> u32 {
+    /// carry and BOTH rewarded-segment counters). Returns the NEW sustained segments to reward this
+    /// tick at both the 1-yard (`fine`) and 2-yard (`coarse`) cadences — segments PAST THE FIRST in
+    /// the continuous run ("a yard followed by another yard" / "2 yards followed by 2 more"), each
+    /// capped. Pure.
+    fn fold_tick(&mut self, forward_delta: f64) -> SustainedDribbleSegments {
         if !forward_delta.is_finite() {
-            return 0;
+            return SustainedDribbleSegments::default();
         }
         if forward_delta <= -FORWARD_CARRY_BACKWARD_RESET_YARDS {
             self.forward_carry_yards = 0.0;
-            self.sustained_rewarded_segments = 0;
-            return 0;
+            self.fine_rewarded_segments = 0;
+            self.coarse_rewarded_segments = 0;
+            return SustainedDribbleSegments::default();
         }
         self.forward_carry_yards = (self.forward_carry_yards + forward_delta).max(0.0);
-        let total_segments =
-            (self.forward_carry_yards / FORWARD_CARRY_SEGMENT_YARDS).floor() as u32;
-        // Only segments past the first are rewardable, capped to bound the payout.
-        let rewardable = total_segments
-            .saturating_sub(1)
-            .min(FORWARD_CARRY_MAX_REWARDED_SEGMENTS);
-        if rewardable > self.sustained_rewarded_segments {
-            let new_segments = rewardable - self.sustained_rewarded_segments;
-            self.sustained_rewarded_segments = rewardable;
-            new_segments
-        } else {
-            0
+        let fine = advance_sustained_segments(
+            self.forward_carry_yards,
+            FORWARD_CARRY_FINE_SEGMENT_YARDS,
+            FORWARD_CARRY_MAX_REWARDED_FINE_SEGMENTS,
+            &mut self.fine_rewarded_segments,
+        );
+        let coarse = advance_sustained_segments(
+            self.forward_carry_yards,
+            FORWARD_CARRY_SEGMENT_YARDS,
+            FORWARD_CARRY_MAX_REWARDED_SEGMENTS,
+            &mut self.coarse_rewarded_segments,
+        );
+        SustainedDribbleSegments { fine, coarse }
+    }
+
+    /// Reward points to emit this tick for the sustained-dribble segments (both cadences), summed.
+    fn sustained_reward_points(&mut self, forward_delta: f64) -> f64 {
+        let seg = self.fold_tick(forward_delta);
+        if seg.is_empty() {
+            return 0.0;
         }
+        seg.fine as f64 * SUSTAINED_FORWARD_DRIBBLE_FINE_SEGMENT_REWARD_POINTS
+            + seg.coarse as f64 * SUSTAINED_FORWARD_DRIBBLE_SEGMENT_REWARD_POINTS
     }
 
     /// Points for a productive cash-out (the carry ended in a forward pass or a shot): one reward
