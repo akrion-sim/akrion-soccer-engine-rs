@@ -61557,6 +61557,32 @@ fn approach_velocity(current: Vec2, desired: Vec2, accel: f64, dt: f64) -> Vec2 
     }
 }
 
+/// The concrete gait at effort tier `target_tier` to use as an intermediate step while
+/// walking a multi-gear change through one tier at a time, taking the forward/backward
+/// character from `desired` (which the step is heading toward). Backward travel never
+/// reaches a forward run/sprint, so tiers 3-4 are the forward Run/Sprint.
+fn gait_at_tier_toward(target_tier: u8, desired: MovementGait) -> MovementGait {
+    match target_tier {
+        0 => MovementGait::Stand,
+        1 => {
+            if desired.is_backward() {
+                MovementGait::BackWalk
+            } else {
+                MovementGait::Walk
+            }
+        }
+        2 => {
+            if desired.is_backward() {
+                MovementGait::BackJog
+            } else {
+                MovementGait::Jog
+            }
+        }
+        3 => MovementGait::Run,
+        _ => MovementGait::Sprint,
+    }
+}
+
 /// Apply the gait-commitment dwell to a freshly-decided gait, modelling locomotor
 /// momentum. Once an effort tier is entered it is held for [`GAIT_COMMIT_SECONDS`]
 /// before changing in EITHER direction, so effort cannot oscillate tick-to-tick (the
@@ -61565,11 +61591,21 @@ fn approach_velocity(current: Vec2, desired: Vec2, accel: f64, dt: f64) -> Vec2 
 /// `emergency` (an explosive reaction to a threat / flat-out recovery). The dwell thus
 /// governs only oscillation *between moving gaits*, and only bites within the window
 /// after a change: a gait held a while already satisfies it and switches immediately.
+///
+/// When `step_limited` is set, a change between moving gaits is additionally taken ONE
+/// effort tier at a time: a body cannot teleport across gears (sprint→walk, run→walk) in
+/// a single tick, so a multi-gear change is walked through its intermediate gaits, one
+/// per dwell. Because the committed gait is what drives the body's target speed, both
+/// the displayed gait and the acceleration-limited legs then shed (or build) speed
+/// together across several ticks rather than the label snapping ahead of the legs.
+/// Same-tier swaps (e.g. jog→side-step) and adjacent single-tier changes pass straight
+/// through, so this only ever intermediates a genuine multi-gear jump.
 fn commit_gait(
     prev: MovementGait,
     desired: MovementGait,
     held_seconds: f64,
     emergency: bool,
+    step_limited: bool,
 ) -> MovementGait {
     if desired == prev {
         return desired;
@@ -61581,11 +61617,33 @@ fn commit_gait(
     if prev.effort_tier() == 0 || desired.effort_tier() == 0 || emergency {
         return desired;
     }
-    // Otherwise hold the committed moving tier until it has been carried for the dwell.
-    if held_seconds >= GAIT_COMMIT_SECONDS {
+    // Hold the committed moving tier until it has been carried for the dwell.
+    if held_seconds < GAIT_COMMIT_SECONDS {
+        return prev;
+    }
+    // Dwell satisfied — the tier may change now. Legacy path: adopt the decision in one
+    // go. Step-limited path: advance at most one effort tier toward it, so a multi-gear
+    // change rolls through its intermediate gaits over successive dwells instead of
+    // jumping (the per-tier dwell is the locomotor analogue of a bounded acceleration:
+    // ~one gait band of speed change per ~0.2 s, close to a human accel/decel through a
+    // gear). Same-tier swaps and single-tier changes are already byte-identical.
+    if !step_limited {
+        return desired;
+    }
+    let prev_tier = prev.effort_tier();
+    let desired_tier = desired.effort_tier();
+    if desired_tier == prev_tier {
+        return desired;
+    }
+    let step_tier = if desired_tier > prev_tier {
+        prev_tier + 1
+    } else {
+        prev_tier - 1
+    };
+    if step_tier == desired_tier {
         desired
     } else {
-        prev
+        gait_at_tier_toward(step_tier, desired)
     }
 }
 
