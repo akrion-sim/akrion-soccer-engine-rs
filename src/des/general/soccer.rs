@@ -13141,6 +13141,26 @@ pub(crate) fn attack_ambition_enabled() -> bool {
     !*V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_ATTACK_AMBITION").is_ok())
 }
 
+/// Whether the **moderate give-and-go live-frequency bump** is active this process: a modest
+/// extra widening of the wall-pass trigger zone and a lift on the carrier's appetite to combine,
+/// so more one-twos actually appear in live play. **Default-ON in production**
+/// (`DD_SOCCER_ENABLE_GIVE_AND_GO_AMBITION=0/false/no/off` is the kill switch), read once.
+/// **Default-OFF under test** so the option-scoring parity suite stays byte-identical (the bump
+/// only ever *widens availability* / lifts a propensity — every quality/onside/lane check still
+/// applies, so a poor combination is still demoted, never forced).
+pub(crate) fn give_and_go_ambition_enabled() -> bool {
+    #[cfg(test)]
+    {
+        gate_default_on_is_set_truthy("DD_SOCCER_ENABLE_GIVE_AND_GO_AMBITION")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_GIVE_AND_GO_AMBITION"))
+    }
+}
+
 fn pass_like_action_flight(action: &str) -> Option<PassFlight> {
     use SoccerActionLabel::*;
     match SoccerActionLabel::classify(action)? {
