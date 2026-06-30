@@ -124,8 +124,7 @@ where
     cfg.match_config.mpc.player_horizon = LIVE_MPC_DEFAULT_PLAYER_HORIZON;
     cfg.match_config.mpc.active_radius_yards = LIVE_MPC_DEFAULT_ACTIVE_RADIUS_YARDS;
     cfg.match_config.local_mpc_enabled = LIVE_LOCAL_MPC_DEFAULT_ENABLED;
-    cfg.match_config.local_mpc_max_players_per_team =
-        LIVE_LOCAL_MPC_DEFAULT_MAX_PLAYERS_PER_TEAM;
+    cfg.match_config.local_mpc_max_players_per_team = LIVE_LOCAL_MPC_DEFAULT_MAX_PLAYERS_PER_TEAM;
     if let Some(host) = env_text(&lookup, "SOCCER_LIVE_HOST", "SOCCER_HOST") {
         cfg.host = host;
     }
@@ -243,11 +242,7 @@ where
             );
         }
     }
-    if let Some(local_mpc) = env_bool(
-        &lookup,
-        "SOCCER_LIVE_LOCAL_MPC",
-        "SOCCER_LOCAL_MPC",
-    ) {
+    if let Some(local_mpc) = env_bool(&lookup, "SOCCER_LIVE_LOCAL_MPC", "SOCCER_LOCAL_MPC") {
         cfg.match_config.local_mpc_enabled = local_mpc;
     }
     if let Some(max_players) = env_nonnegative_usize(
@@ -283,7 +278,9 @@ where
         "SOCCER_MPC_ACTIVE_RADIUS",
     ) {
         cfg.match_config.mpc.active_radius_yards = radius;
-        println!("# soccer-live: MPC active radius set to {radius:.0}yd (all players within run the QP)");
+        println!(
+            "# soccer-live: MPC active radius set to {radius:.0}yd (all players within run the QP)"
+        );
     }
     if let Some(max_bytes) = env_nonnegative_u64(
         &lookup,
@@ -432,12 +429,10 @@ mod tests {
         );
 
         // SOCCER_LIVE_MPC=0 turns the whole stack off (analytic path).
-        let off_vars = BTreeMap::from([
-            ("SOCCER_LIVE_MPC", "0"),
-            ("SOCCER_LIVE_LOCAL_MPC", "1"),
-        ]);
-        let off =
-            live_server_config_from_lookup(|name| off_vars.get(name).map(|value| value.to_string()));
+        let off_vars = BTreeMap::from([("SOCCER_LIVE_MPC", "0"), ("SOCCER_LIVE_LOCAL_MPC", "1")]);
+        let off = live_server_config_from_lookup(|name| {
+            off_vars.get(name).map(|value| value.to_string())
+        });
         assert!(!off.match_config.mpc.tier2_player_enabled);
         assert!(!off.match_config.mpc.field_aware_enabled);
         assert!(!off.match_config.mpc.reconcile_enabled);
@@ -537,5 +532,18 @@ mod tests {
             Some(SOCCER_LIVE_REVIVAL_PORT),
         );
         assert_eq!(env_cfg.port, 6060);
+    }
+
+    #[test]
+    fn live_server_env_allows_ephemeral_port_zero() {
+        let cfg = live_server_config_from_lookup(|name| {
+            if name == "SOCCER_LIVE_PORT" {
+                Some("0".to_string())
+            } else {
+                None
+            }
+        });
+
+        assert_eq!(cfg.port, 0);
     }
 }

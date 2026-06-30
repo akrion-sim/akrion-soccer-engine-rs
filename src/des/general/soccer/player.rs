@@ -1262,21 +1262,33 @@ fn mpc_execution_skill_for_label(player: &PlayerAgent, label: &str) -> f64 {
 const SHORT_UPFIELD_GROUND_PASS_MIN_YARDS: f64 = 5.0;
 const SHORT_UPFIELD_GROUND_PASS_IDEAL_MAX_YARDS: f64 = 15.0;
 const SHORT_UPFIELD_GROUND_PASS_TAPER_YARDS: f64 = 5.0;
+const SHORT_FORWARD_PASS_URGENCY_MIN_PLAYERS_AHEAD: usize = 3;
+const SHORT_FORWARD_PASS_URGENCY_MIN_OPTION_QUALITY: f64 = 0.38;
+const SHORT_FORWARD_PASS_URGENCY_MIN_RELEASE_FIT: f64 = 0.42;
+
+fn nearest_short_upfield_forward_yards(observation: &SoccerPomdpObservation) -> f64 {
+    let forward_yards = observation.nearest_forward_teammate_forward_yards;
+    if forward_yards.is_finite() && forward_yards > 0.0 {
+        forward_yards
+    } else {
+        observation.nearest_forward_teammate_distance_yards
+    }
+}
 
 fn short_upfield_ground_pass_fit(observation: &SoccerPomdpObservation) -> f64 {
     if observation.visible_forward_pass_options == 0 {
         return 0.0;
     }
-    let distance = observation.nearest_forward_teammate_distance_yards;
-    if !distance.is_finite() || distance <= 0.0 {
+    let forward_yards = nearest_short_upfield_forward_yards(observation);
+    if !forward_yards.is_finite() || forward_yards <= 0.0 {
         return 0.0;
     }
-    let distance_fit = if distance < SHORT_UPFIELD_GROUND_PASS_MIN_YARDS {
-        (distance / SHORT_UPFIELD_GROUND_PASS_MIN_YARDS).clamp(0.0, 1.0) * 0.82
-    } else if distance <= SHORT_UPFIELD_GROUND_PASS_IDEAL_MAX_YARDS {
+    let distance_fit = if forward_yards < SHORT_UPFIELD_GROUND_PASS_MIN_YARDS {
+        (forward_yards / SHORT_UPFIELD_GROUND_PASS_MIN_YARDS).clamp(0.0, 1.0) * 0.82
+    } else if forward_yards <= SHORT_UPFIELD_GROUND_PASS_IDEAL_MAX_YARDS {
         1.0
     } else {
-        (1.0 - (distance - SHORT_UPFIELD_GROUND_PASS_IDEAL_MAX_YARDS)
+        (1.0 - (forward_yards - SHORT_UPFIELD_GROUND_PASS_IDEAL_MAX_YARDS)
             / SHORT_UPFIELD_GROUND_PASS_TAPER_YARDS)
             .clamp(0.0, 1.0)
     };
@@ -1288,6 +1300,191 @@ fn short_upfield_ground_pass_fit(observation: &SoccerPomdpObservation) -> f64 {
         + observation.floor_pass_lane_score.clamp(0.0, 1.0) * 0.32)
         .clamp(0.0, 1.0);
     (distance_fit * (0.42 + outlet_fit * 0.58)).clamp(0.0, 1.0)
+}
+
+pub(crate) fn short_forward_pass_release_urgency(observation: &SoccerPomdpObservation) -> f64 {
+    if !observation.has_ball || observation.visible_forward_pass_options == 0 {
+        return 0.0;
+    }
+    let players_ahead = observation
+        .field_players_ahead
+        .max(observation.field_teammates_ahead)
+        .max(observation.teammates_ahead);
+    if players_ahead < SHORT_FORWARD_PASS_URGENCY_MIN_PLAYERS_AHEAD {
+        return 0.0;
+    }
+    let forward_yards = nearest_short_upfield_forward_yards(observation);
+    if !forward_yards.is_finite()
+        || forward_yards < SHORT_UPFIELD_GROUND_PASS_MIN_YARDS
+        || forward_yards > SHORT_UPFIELD_GROUND_PASS_IDEAL_MAX_YARDS
+    {
+        return 0.0;
+    }
+    let option_quality = observation
+        .best_forward_pass_option_quality
+        .max(observation.best_forward_pass_receiver_openness)
+        .max(observation.expected_pass_completion.clamp(0.0, 1.0) * 0.90)
+        .max(observation.floor_pass_lane_score.clamp(0.0, 1.0) * 0.84)
+        .clamp(0.0, 1.0);
+    if option_quality < SHORT_FORWARD_PASS_URGENCY_MIN_OPTION_QUALITY {
+        return 0.0;
+    }
+    let release_fit = short_upfield_ground_pass_fit(observation)
+        .max(observation.quick_forward_pass_value.clamp(0.0, 1.0))
+        .max(option_quality * 0.80)
+        .clamp(0.0, 1.0);
+    if release_fit < SHORT_FORWARD_PASS_URGENCY_MIN_RELEASE_FIT {
+        return 0.0;
+    }
+    let support_fit =
+        ((players_ahead as f64 - SHORT_FORWARD_PASS_URGENCY_MIN_PLAYERS_AHEAD as f64 + 1.0) / 4.0)
+            .clamp(0.0, 1.0);
+    let dwell_fit = (observation.perceived_time_on_ball_seconds / 1.0).clamp(0.0, 1.0);
+    let pressure_fit = observation
+        .decision_urgency
+        .max(observation.pressure_urgency)
+        .max(observation.immediate_dispossession_risk)
+        .clamp(0.0, 1.0);
+    (0.40
+        + release_fit * 0.34
+        + option_quality * 0.18
+        + support_fit * 0.14
+        + dwell_fit * 0.08
+        + pressure_fit * 0.06)
+        .clamp(0.0, 1.0)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PressureUrgencyActionProfile {
+    pressure: f64,
+    good_release: f64,
+    bad_outlet_pressure: f64,
+    pass_multiplier: f64,
+    panic_pass_multiplier: f64,
+    dribble_multiplier: f64,
+    carry_forward_multiplier: f64,
+    shot_multiplier: f64,
+    escape_floor: f64,
+    shot_release: f64,
+}
+
+fn pressure_urgency_action_profile(
+    observation: &SoccerPomdpObservation,
+    role: PlayerRole,
+    dribbling: f64,
+    shooting: f64,
+    floor_pass_quality: f64,
+    aerial_pass_quality: f64,
+    advanced_dribbler_fit: f64,
+    good_escape_outlet_fit: f64,
+) -> PressureUrgencyActionProfile {
+    let pressure = observation
+        .perceived_pressure
+        .max(observation.pressure_urgency)
+        .max(observation.decision_urgency * 0.82)
+        .max(observation.immediate_dispossession_risk)
+        .max(observation.excessive_hold_pressure)
+        .max(excessive_hold_pressure(observation, dribbling))
+        .max(observation.stale_dribble_steal_risk * 0.82)
+        .max(
+            observation
+                .neural_extended
+                .surprise_behind_steal_threat
+                .clamp(0.0, 1.0)
+                * 0.88,
+        )
+        .clamp(0.0, 1.0);
+    let floor_release_quality = floor_pass_quality
+        .max(observation.expected_pass_completion.clamp(0.0, 1.0) * 0.84)
+        .max(observation.best_pass_receiver_openness.clamp(0.0, 1.0) * 0.80)
+        .max(observation.floor_pass_lane_score.clamp(0.0, 1.0) * 0.78)
+        .max(observation.best_forward_pass_option_quality.clamp(0.0, 1.0) * 0.84)
+        .max(short_upfield_ground_pass_fit(observation) * 0.88);
+    let aerial_release_quality = aerial_pass_quality
+        .max(observation.expected_aerial_pass_completion.clamp(0.0, 1.0) * 0.72)
+        .max(
+            observation
+                .best_aerial_pass_receiver_openness
+                .clamp(0.0, 1.0)
+                * 0.68,
+        )
+        .max(observation.aerial_pass_bypass_score.clamp(0.0, 1.0) * 0.56);
+    let outlet_quality = good_escape_outlet_fit
+        .max(floor_release_quality)
+        .max(aerial_release_quality * 0.92)
+        .max(open_support_outlet_fit(observation) * 0.70)
+        .clamp(0.0, 1.0);
+    let release_signal = pressure_release_signal(observation).clamp(0.0, 1.0);
+    let good_release = (pressure * release_signal.max(0.42) * outlet_quality).clamp(0.0, 1.0);
+    let bad_outlet_pressure = (pressure * (1.0 - outlet_quality).powi(2)).clamp(0.0, 1.0);
+    let pass_multiplier = (1.0 + good_release * 0.34).clamp(1.0, 1.38);
+    let panic_pass_multiplier = (1.0 / (1.0 + bad_outlet_pressure * 1.46)).clamp(0.40, 1.0);
+    let forward_blocked = (1.0 - observation.forward_dribble_space_yards / 6.0).clamp(0.0, 1.0);
+    let role_take_on_relief = match role {
+        PlayerRole::Forward => 0.14,
+        PlayerRole::Midfielder => 0.06,
+        PlayerRole::Defender | PlayerRole::Goalkeeper => 0.0,
+    };
+    let dribble_confidence =
+        (advanced_dribbler_fit * 0.58 + dribbling * 0.30 + role_take_on_relief).clamp(0.0, 0.92);
+    let dribble_multiplier = (1.0
+        - pressure
+            * (1.0 - dribble_confidence)
+            * (0.26 + forward_blocked * 0.24 + outlet_quality * 0.12))
+        .clamp(0.34, 1.0);
+    let carry_forward_multiplier = (1.0
+        - pressure
+            * (1.0 - dribble_confidence * 0.88)
+            * (0.20 + forward_blocked * 0.34 + outlet_quality * 0.16))
+        .clamp(0.32, 1.0);
+    let shot_lane_quality = (observation.shot_on_frame_probability.clamp(0.0, 1.0) * 0.38
+        + observation.shot_beat_goalkeeper_probability.clamp(0.0, 1.0) * 0.34
+        + (1.0 - observation.shot_block_probability.clamp(0.0, 1.0)) * 0.28)
+        .clamp(0.0, 1.0);
+    let close_shot_fit = (1.0 - observation.yards_to_goal / 24.0).clamp(0.0, 1.0);
+    let long_shot_fit = ((observation.yards_to_goal - 18.0) / 14.0).clamp(0.0, 1.0);
+    let bad_shot_fit = (1.0 - shot_lane_quality)
+        .max(observation.shot_block_probability.clamp(0.0, 1.0) * 0.76)
+        .max(long_shot_fit * (1.0 - shot_lane_quality * 0.58))
+        .clamp(0.0, 1.0);
+    let shot_release = (pressure
+        * shot_lane_quality
+        * close_shot_fit
+        * (0.66 + shooting * 0.34)
+        * if observation.shot_lane_open {
+            1.0
+        } else {
+            0.42
+        })
+    .clamp(0.0, 1.0);
+    let shot_multiplier = ((1.0 + shot_release * 0.24)
+        * (1.0 - pressure * bad_shot_fit * 0.42).clamp(0.48, 1.0))
+    .clamp(0.42, 1.22);
+    let no_good_release =
+        (1.0 - outlet_quality.max(shot_lane_quality * close_shot_fit)).clamp(0.0, 1.0);
+    let escape_floor = if no_good_release >= 0.42 {
+        (0.10
+            + pressure * 0.30
+            + bad_outlet_pressure * 0.30
+            + forward_blocked * 0.14
+            + observation.immediate_dispossession_risk.clamp(0.0, 1.0) * 0.10)
+            .clamp(0.0, 0.66)
+    } else {
+        0.0
+    };
+
+    PressureUrgencyActionProfile {
+        pressure,
+        good_release,
+        bad_outlet_pressure,
+        pass_multiplier,
+        panic_pass_multiplier,
+        dribble_multiplier,
+        carry_forward_multiplier,
+        shot_multiplier,
+        escape_floor,
+        shot_release,
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1305,6 +1502,7 @@ struct MpcExecutionEstimate {
     recommended_curve_bend_yards: f64,
     recommended_spin_rps: f64,
     recommended_curve: &'static str,
+    recommended_curve_technique: &'static str,
     horizon_seconds: f64,
     reselect_reason: &'static str,
     /// MPC shot foot choice: which foot the strike is taken with ("right"/"left"), and
@@ -1732,11 +1930,23 @@ fn mpc_execution_estimate_for_action(
             DiscretizedKickCurve::Right => "right",
             DiscretizedKickCurve::None => "none",
         };
+        let curve_technique = if curve == DiscretizedKickCurve::None {
+            DiscretizedKickTechnique::None
+        } else {
+            pass_curve_technique_for_player(
+                &player.skills,
+                flight,
+                is_cross,
+                distance,
+                1.0 - lane_margin_fit,
+                curl_probability,
+            )
+        };
+        estimate.recommended_curve_technique = curve_technique.as_str();
         estimate.recommended_curve_bend_yards = if curve == DiscretizedKickCurve::None {
             0.0
         } else {
-            (0.55 + distance / 24.0).clamp(0.55, 2.8)
-                * (0.72 + ability01(player.skills.flair_passing) * 0.56)
+            pass_curve_bend_yards_for_player(&player.skills, flight, distance, curve_technique)
         };
         estimate.recommended_spin_rps =
             (estimate.recommended_curve_bend_yards / distance.max(1.0) * speed.max(1.0) * 0.42)
@@ -1868,10 +2078,22 @@ fn mpc_execution_estimate_for_action(
         } else {
             "none"
         };
+        let curve_technique = shot_curve_technique_for_player(
+            &player.skills,
+            observation.perceived_pressure,
+            observation.yards_to_goal,
+            observation.opponent_goal_angle_degrees,
+            observation.shot_curl_probability,
+        );
+        estimate.recommended_curve_technique = curve_technique.as_str();
         estimate.recommended_curve_bend_yards = if estimate.recommended_curve == "none" {
             0.0
         } else {
-            (0.45 + observation.yards_to_goal / 28.0).clamp(0.45, 2.2)
+            shot_curve_bend_yards_for_player(
+                &player.skills,
+                observation.yards_to_goal,
+                curve_technique,
+            )
         };
         estimate.recommended_spin_rps = (estimate.recommended_curve_bend_yards
             / observation.yards_to_goal.max(1.0)
@@ -2418,6 +2640,9 @@ pub(crate) fn player_mdp_mpc_comparison_trace(
         ),
         mpc_recommended_spin_rps: finite_metric(execution_estimate.recommended_spin_rps),
         mpc_recommended_curve: execution_estimate.recommended_curve.to_string(),
+        mpc_recommended_curve_technique: execution_estimate
+            .recommended_curve_technique
+            .to_string(),
         mpc_execution_horizon_seconds: finite_metric(execution_estimate.horizon_seconds),
         mpc_reselect_reason: execution_estimate.reselect_reason.to_string(),
         mpc_guidance_present: true,
@@ -2623,8 +2848,7 @@ pub(crate) fn isolated_attacking_carrier_drive_mode(
 /// `outside_midfielder` test used inside [`possession_action_options`], factored out so the gait
 /// resolver can reuse it for [`isolated_attacking_carrier_drive_mode`].
 pub(crate) fn is_outside_midfielder_role(role: PlayerRole, home_x: f64, field_width: f64) -> bool {
-    role == PlayerRole::Midfielder
-        && (home_x < field_width * 0.30 || home_x > field_width * 0.70)
+    role == PlayerRole::Midfielder && (home_x < field_width * 0.30 || home_x > field_width * 0.70)
 }
 
 /// Re-weight the carrier's possession options for the isolated-carrier `mode` so a forward DRIVE
@@ -3743,7 +3967,8 @@ impl PlayerAgent {
             || contested_final_third_shot;
         let no_teammate_in_front =
             observation.teammates_ahead == 0 && observation.visible_forward_pass_options == 0;
-        let attacking_ball_carrier = observation.yards_to_goal <= observation.yards_to_own_goal + 6.0
+        let attacking_ball_carrier = observation.yards_to_goal
+            <= observation.yards_to_own_goal + 6.0
             && matches!(self.role, PlayerRole::Forward | PlayerRole::Midfielder);
         let goal_side_defenders = observation.field_opponents_ahead;
         let thin_goal_side_cover_fit = if goal_side_defenders < 4 {
@@ -3755,7 +3980,9 @@ impl PlayerAgent {
             ((observation.forward_dribble_space_yards - 6.0) / 18.0).clamp(0.0, 1.0);
         let solo_speed_fit = (((observation.perceived_fatigue_advantage + 0.08) / 0.46)
             .clamp(0.0, 1.0)
-            * observation.nearest_defender_fatigue_confidence.clamp(0.35, 1.0))
+            * observation
+                .nearest_defender_fatigue_confidence
+                .clamp(0.35, 1.0))
         .clamp(0.0, 1.0);
         let space_speed_break_fit = if solo_space_fit >= 0.45 && solo_speed_fit >= 0.24 {
             (solo_space_fit * 0.66 + solo_speed_fit * 0.34).clamp(0.0, 1.0)
@@ -3767,14 +3994,12 @@ impl PlayerAgent {
         } else {
             0.0
         };
-        let solo_hold_up_need = if no_teammate_in_front
-            && attacking_ball_carrier
-            && solo_goal_drive_fit < 0.55
-        {
-            (1.0 - solo_goal_drive_fit).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
+        let solo_hold_up_need =
+            if no_teammate_in_front && attacking_ball_carrier && solo_goal_drive_fit < 0.55 {
+                (1.0 - solo_goal_drive_fit).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
         let emergency_backward_release_relief = (pressure_urgency
             .max(pressure)
             .max(observation.immediate_dispossession_risk)
@@ -3801,6 +4026,8 @@ impl PlayerAgent {
         let striker_shot_bonus = striker_legal_shot_attempt_bonus(observation, self.role);
         let goal_proximity_shot_pressure =
             goal_proximity_shot_pressure_score(observation, self.role, shooting);
+        let pressured_shot_release =
+            pressured_shot_release_urgency(observation, self.role, shooting);
         let decisive_goal_pressure = observation
             .decisive_goal_action_pressure
             .max(near_goal_decisive_action_pressure_score(
@@ -3830,6 +4057,7 @@ impl PlayerAgent {
             * (1.0 + striker_shot_bonus * 1.35)
             * (1.0 + decisive_goal_pressure * 1.18)
             * (1.0 + final_ball_goal_decision_fit * 0.42)
+            * (1.0 + pressured_shot_release * 0.54)
             * shot_choice_learning
             * 0.042)
             .clamp(
@@ -3840,10 +4068,12 @@ impl PlayerAgent {
                     + goal_attack * 0.22
                     + goal_proximity_shot_pressure * 0.36
                     + goal_entry_pressure * 0.20
-                    + decisive_goal_pressure * 0.30)
+                    + decisive_goal_pressure * 0.30
+                    + pressured_shot_release * 0.22)
                     * shot_choice_learning.clamp(0.82, 1.24),
             )
             .max(close_shot_attempt * shot_choice_learning.clamp(0.88, 1.16))
+            .max(pressured_shot_release * shot_choice_learning.clamp(0.88, 1.16))
             .max(
                 goal_proximity_shot_pressure_floor(observation, self.role, shooting)
                     * shot_choice_learning.clamp(0.88, 1.16),
@@ -3921,8 +4151,16 @@ impl PlayerAgent {
             && shot_legal
             && !shot_trigger_long_range_veto
         {
+            shot_score = shot_score
+                .max((0.80 + solo_goal_drive_fit * 0.18) * shot_choice_learning.clamp(0.90, 1.12));
+        }
+        if pressured_shot_release > 0.0
+            && shot_legal
+            && !shot_trigger_long_range_veto
+            && !threaded_goal_pass_overrides_shot
+        {
             shot_score = shot_score.max(
-                (0.80 + solo_goal_drive_fit * 0.18)
+                (0.50 + pressured_shot_release * 0.38 + decision_urgency * 0.08).clamp(0.50, 0.94)
                     * shot_choice_learning.clamp(0.90, 1.12),
             );
         }
@@ -3958,8 +4196,8 @@ impl PlayerAgent {
                     .max(observation.immediate_dispossession_risk)
                     .clamp(0.0, 1.0))
             .clamp(0.0, 1.0);
-            let space_fit = ((observation.forward_dribble_space_yards - 4.0) / 10.0)
-                .clamp(0.0, 1.0);
+            let space_fit =
+                ((observation.forward_dribble_space_yards - 4.0) / 10.0).clamp(0.0, 1.0);
             let movement_fit = (observation.actor_speed_yps / 2.6)
                 .clamp(0.0, 1.0)
                 .max((observation.perceived_time_on_ball_seconds / 1.2).clamp(0.0, 0.45));
@@ -3968,8 +4206,7 @@ impl PlayerAgent {
             0.0
         };
         let rolling_space_carry_lift = (1.0 + rolling_open_space_fit * 0.34).clamp(1.0, 1.34);
-        let static_hold_open_space_damp =
-            (1.0 - rolling_open_space_fit * 0.72).clamp(0.22, 1.0);
+        let static_hold_open_space_damp = (1.0 - rolling_open_space_fit * 0.72).clamp(0.22, 1.0);
         let patient_dribble_lift = (1.0
             + patience_factor * poor_floor_pass * (0.42 + forward_space_fit * 0.50))
             .clamp(1.0, 1.38);
@@ -3987,10 +4224,8 @@ impl PlayerAgent {
         let goalmouth_carry_forced = goal_approach_forces_goalmouth_carry(observation, self.role);
         let patient_carry_multiplier = low_pressure_patient_carry_multiplier(observation);
         let attacking_carry_boost = if no_teammate_in_front && attacking_ball_carrier {
-            (1.30
-                + solo_goal_drive_fit * 0.42
-                + if pass_target_count == 0 { 0.18 } else { 0.0 })
-            .clamp(1.30, 1.90)
+            (1.30 + solo_goal_drive_fit * 0.42 + if pass_target_count == 0 { 0.18 } else { 0.0 })
+                .clamp(1.30, 1.90)
         } else if self.role == PlayerRole::Forward {
             1.24
         } else if outside_midfielder && pass_target_count == 0 {
@@ -4020,6 +4255,7 @@ impl PlayerAgent {
             0.0
         };
         let short_upfield_ground_pass_fit = short_upfield_ground_pass_fit(observation);
+        let short_forward_release_urgency = short_forward_pass_release_urgency(observation);
         let attacking_numbers_up_fit = (observation.attacking_numbers_advantage as f64 / 4.0)
             .clamp(0.0, 1.0)
             .max(observation.pass_and_move_numbers_advantage.clamp(0.0, 1.0))
@@ -4030,10 +4266,12 @@ impl PlayerAgent {
                     + decision_urgency * 0.14
                     + pressured_release_signal * 0.18
                     + open_forward_outlet * 0.18
-                    + attacking_numbers_up_fit * 0.12))
+                    + attacking_numbers_up_fit * 0.12
+                    + short_forward_release_urgency * 0.16))
             .clamp(1.0, 1.62);
         let direct_forward_release_fit = short_upfield_ground_pass_fit
             .max(observation.quick_forward_pass_value.clamp(0.0, 1.0))
+            .max(short_forward_release_urgency * 0.92)
             .max(
                 (open_forward_outlet
                     * observation.expected_pass_completion.clamp(0.0, 1.0)
@@ -4133,6 +4371,17 @@ impl PlayerAgent {
         // risk for the most-advanced players — the three furthest forward. See
         // `advanced_dribbler_fit_from_rank` for the rank→appetite curve.
         let advanced_dribbler_fit = advanced_dribbler_fit_from_rank(observation.teammates_ahead);
+        let pressure_action_profile = pressure_urgency_action_profile(
+            observation,
+            self.role,
+            dribbling,
+            shooting,
+            floor_pass_quality,
+            aerial_pass_quality,
+            advanced_dribbler_fit,
+            good_escape_outlet_fit,
+        );
+        shot_score = (shot_score * pressure_action_profile.shot_multiplier).clamp(0.0, 1.25);
         // How risky a dribble is right now: real pressure, a defender on top of the ball, or
         // a live chance of being dispossessed.
         let dribble_risk = steal_pressure
@@ -4169,8 +4418,10 @@ impl PlayerAgent {
             * (1.0 - pressured_good_outlet * 0.30).clamp(0.62, 1.0)
             * (1.0 - (open_forward_outlet * 0.34 + short_upfield_ground_pass_fit * 0.18))
                 .clamp(0.44, 1.0)
+            * (1.0 - short_forward_release_urgency * 0.28).clamp(0.36, 1.0)
             * dribble_into_opponent_penalty
             * deep_pressure_dribble_damp
+            * pressure_action_profile.dribble_multiplier
             * crowded_dribble_damp)
             .clamp(0.02, 1.36);
         let dribble_score = (pre_fatigue_dribble_score
@@ -4217,6 +4468,7 @@ impl PlayerAgent {
             // Carrying forward INTO pressure is the worst option for a deep player — damp it
             // hard for anyone outside the three most-forward when there's real risk ahead.
             * (1.0 - dribble_risk * (1.0 - advanced_dribbler_fit) * 0.40).clamp(0.45, 1.0)
+            * pressure_action_profile.carry_forward_multiplier
             // Own-half retention: risky forward dribbling is de-emphasised in our own
             // half (more so when pressured) in favour of keeping the ball.
             * if own_half { (1.0 - 0.24 - pressure * 0.18).clamp(0.55, 1.0) } else { 1.0 }
@@ -4242,6 +4494,7 @@ impl PlayerAgent {
                 + solo_goal_drive_fit * 0.42
                 + self.preferences.offensive_mindedness.clamp(0.0, 1.0) * 0.18)
             * advance_upfield_carry_multiplier
+            * pressure_action_profile.carry_forward_multiplier
             * (1.0 - pressure * 0.16).clamp(0.76, 1.0))
         .clamp(0.01, 1.54)
         .max(if solo_goal_drive_fit > 0.0 {
@@ -5130,7 +5383,9 @@ impl PlayerAgent {
                 * pass_and_move_forward_lift
                 * crowded_pass_lift
                 * pressured_release_multiplier
+                * pressure_action_profile.pass_multiplier
                 * panic_pass_damp
+                * pressure_action_profile.panic_pass_multiplier
                 * isolated_backward_release_multiplier
                 * slip_break_pass_multiplier
                 * rank_weight)
@@ -5192,6 +5447,8 @@ impl PlayerAgent {
                 * hold_release_multiplier
                 * high_cross_multiplier
                 * pressured_release_multiplier
+                * pressure_action_profile.pass_multiplier
+                * pressure_action_profile.panic_pass_multiplier
                 * aerial_flick_strategy_multiplier
                 * isolated_backward_release_multiplier
                 * rank_weight)
@@ -5321,6 +5578,23 @@ impl PlayerAgent {
                 .clamp(0.34, 0.74);
             ensure_min_legal_option_probability(&mut options, "pass1", pass_and_move_floor);
         }
+        if pass_target_count > 0
+            && pressure_action_profile.good_release >= 0.24
+            && good_escape_outlet_fit >= 0.30
+            && !goal_attack_shot_blocks_alternatives
+            && !(no_teammate_in_front
+                && attacking_ball_carrier
+                && hold_up_flank_available
+                && pressure_action_profile.pressure < 0.62)
+        {
+            let pressure_release_floor = (0.22
+                + pressure_action_profile.good_release * 0.42
+                + pressure_action_profile.pressure * 0.08
+                + observation.best_pass_receiver_openness.clamp(0.0, 1.0) * 0.08
+                + observation.expected_pass_completion.clamp(0.0, 1.0) * 0.08)
+                .clamp(0.34, 0.80);
+            ensure_min_legal_option_probability(&mut options, "pass1", pressure_release_floor);
+        }
         if clearance_legal && hold_pressure >= 0.16 && release_pressure >= 0.42 {
             let danger_clearance_floor =
                 (0.30 + hold_pressure * 0.22 + release_pressure * 0.10).clamp(0.34, 0.72);
@@ -5358,6 +5632,46 @@ impl PlayerAgent {
                 &mut options,
                 "shoot",
                 (0.80 + solo_goal_drive_fit * 0.18).clamp(0.80, 0.98),
+            );
+        }
+        if pressure_action_profile.shot_release >= 0.18
+            && shot_legal
+            && !shot_trigger_long_range_veto
+            && !threaded_goal_pass_overrides_shot
+        {
+            let pressured_shot_floor =
+                (0.14 + pressure_action_profile.shot_release * 0.44).clamp(0.20, 0.70);
+            ensure_min_legal_option_probability(&mut options, "shoot", pressured_shot_floor);
+        }
+        if pressure_action_profile.escape_floor >= 0.20
+            && !goal_attack_shot_blocks_alternatives
+            && !goalmouth_carry_forced
+            && !must_shoot_near_goal(observation, self.role)
+        {
+            let panic_choice_damp =
+                (1.0 - pressure_action_profile.bad_outlet_pressure * 0.38).clamp(0.42, 1.0);
+            for label in [
+                "pass1",
+                "aerial-pass1",
+                "shoot",
+                "dribble",
+                "carry-forward",
+                "vertical-attack",
+                "turnover-burst",
+            ] {
+                scale_legal_option_score(&mut options, label, panic_choice_damp);
+            }
+            ensure_min_legal_option_family_probability(
+                &mut options,
+                &[
+                    "protect-ball",
+                    "side-step",
+                    "carry-out-left",
+                    "carry-out-right",
+                    "left-cut",
+                    "right-cut",
+                ],
+                pressure_action_profile.escape_floor,
             );
         }
         if killer_pass_legal && killer_pass_goal_pressure >= 0.24 {
@@ -5413,12 +5727,10 @@ impl PlayerAgent {
                 * pressure_escape_progression_lift.clamp(0.0, 0.54);
             ensure_min_legal_option_probability(&mut options, "carry-forward", progression_floor);
         }
-        if solo_goal_drive_fit > 0.0
-            && carry_forward_legal
-            && !goal_attack_shot_blocks_alternatives
+        if solo_goal_drive_fit > 0.0 && carry_forward_legal && !goal_attack_shot_blocks_alternatives
         {
-            let solo_drive_floor = (0.58 + solo_goal_drive_fit * 0.28 + forward_space_fit * 0.10)
-                .clamp(0.58, 0.92);
+            let solo_drive_floor =
+                (0.58 + solo_goal_drive_fit * 0.28 + forward_space_fit * 0.10).clamp(0.58, 0.92);
             ensure_min_legal_option_family_probability(
                 &mut options,
                 &["carry-forward", "vertical-attack", "turnover-burst"],
@@ -5628,6 +5940,71 @@ impl PlayerAgent {
             let dwell_damp = (1.0 - quick_value * 0.34).clamp(0.62, 1.0);
             for label in ["dribble", "protect-ball", "hold-up-flank", "side-step"] {
                 scale_legal_option_score(&mut options, label, dwell_damp);
+            }
+        }
+        // Short-forward release urgency: when the field is telling the carrier "there are
+        // bodies ahead and a clean 5-15yd forward outlet is on", he should pass forward now
+        // instead of walking the ball into another dribble touch. This is default-on coaching
+        // behavior; the POMDP/MPC still price the pass quality and execution, but the option
+        // sampler no longer lets dribble/carry/hold dominate that obvious release.
+        if pass_target_count > 0
+            && short_forward_release_urgency > 0.0
+            && !goal_attack_shot_blocks_alternatives
+            && !observation.threaded_goal_pass_available
+            && !must_shoot_near_goal(observation, self.role)
+        {
+            let forward_floor =
+                (0.48 + short_forward_release_urgency * 0.42 + decision_urgency * 0.08)
+                    .clamp(0.54, 0.94);
+            ensure_min_legal_option_probability(&mut options, "pass1", forward_floor);
+            let dwell_damp = (1.0 - short_forward_release_urgency * 0.58).clamp(0.34, 1.0);
+            for label in [
+                "dribble",
+                "carry-forward",
+                "vertical-attack",
+                "protect-ball",
+                "hold-up-flank",
+                "side-step",
+                "fake-left-cut-right",
+                "fake-right-cut-left",
+                "nutmeg",
+            ] {
+                scale_legal_option_score(&mut options, label, dwell_damp);
+            }
+            let sideways_damp = (1.0 - short_forward_release_urgency * 0.28).clamp(0.62, 1.0);
+            for label in ["recycle-reset", "switch-play"] {
+                scale_legal_option_score(&mut options, label, sideways_damp);
+            }
+        }
+        // Pressure-to-shot release: if the carrier has a clean close shooting lane while pressure
+        // is arriving, the urgent release is the shot itself. This deliberately stays below the
+        // threaded-goal-pass override and below hard blocked-lane legality, so pressure cannot
+        // manufacture a panic shot through a defender.
+        if pressured_shot_release > 0.0
+            && shot_legal
+            && !shot_trigger_long_range_veto
+            && !threaded_goal_pass_overrides_shot
+        {
+            let shot_floor =
+                (0.46 + pressured_shot_release * 0.42 + decision_urgency * 0.08).clamp(0.52, 0.93);
+            ensure_min_legal_option_probability(&mut options, "shoot", shot_floor);
+            let dwell_damp = (1.0 - pressured_shot_release * 0.48).clamp(0.42, 1.0);
+            for label in [
+                "dribble",
+                "carry-forward",
+                "vertical-attack",
+                "protect-ball",
+                "hold-up-flank",
+                "side-step",
+                "fake-left-cut-right",
+                "fake-right-cut-left",
+                "nutmeg",
+            ] {
+                scale_legal_option_score(&mut options, label, dwell_damp);
+            }
+            let recycle_damp = (1.0 - pressured_shot_release * 0.34).clamp(0.56, 1.0);
+            for label in ["pass1", "pass2", "recycle-reset", "switch-play"] {
+                scale_legal_option_score(&mut options, label, recycle_damp);
             }
         }
         // Forward-pass-first release: when a forward teammate is sufficiently open, prioritise
@@ -5983,7 +6360,10 @@ impl PlayerAgent {
         let exploit_space_strategy_active =
             matches!(directive.attack_strategy, TeamAttackStrategy::ExploitSpace);
         let advance_upfield_strategy_active = dd_soccer_advance_upfield_strategy_enabled()
-            && matches!(directive.attack_strategy, TeamAttackStrategy::AdvanceUpfield);
+            && matches!(
+                directive.attack_strategy,
+                TeamAttackStrategy::AdvanceUpfield
+            );
         let crash_box_strategy_active =
             matches!(directive.attack_strategy, TeamAttackStrategy::CrashTheBox);
         let possession_team = snapshot.controlled_possession_team();
@@ -6174,7 +6554,11 @@ impl PlayerAgent {
                     0.68 + shape_support_urgency * 0.10
                         + holder_pressure_urgency * 0.18
                         + backfield_long_pass_run * 0.46
-                        + if advance_upfield_strategy_active { 0.24 } else { 0.0 }
+                        + if advance_upfield_strategy_active {
+                            0.24
+                        } else {
+                            0.0
+                        }
                         + run_prediction.weight_for_label("run-in-behind") * 0.58
                         + run_prediction.off_ball_pitch_value_score_lift(),
                 ),
@@ -6189,7 +6573,11 @@ impl PlayerAgent {
                     target,
                     0.66 + shape_support_urgency * 0.16
                         + holder_pressure_urgency * 0.14
-                        + if advance_upfield_strategy_active { 0.26 } else { 0.0 }
+                        + if advance_upfield_strategy_active {
+                            0.26
+                        } else {
+                            0.0
+                        }
                         + run_prediction.weight_for_label("exploit-space-run") * 0.54
                         + run_prediction.off_ball_pitch_value_score_lift(),
                 ),
@@ -6644,7 +7032,7 @@ impl PlayerAgent {
         let defensive_mindedness = self.preferences.defensive_mindedness.clamp(0.0, 1.0);
         let offensive_mindedness = self.preferences.offensive_mindedness.clamp(0.0, 1.0);
         let press = directive.press_intensity.clamp(0.0, 1.0);
-        let (mut shape_score, roam_score) = if self.role == PlayerRole::Goalkeeper {
+        let (mut shape_score, mut roam_score) = if self.role == PlayerRole::Goalkeeper {
             let ball_distance = self.position.distance(snapshot.ball.position);
             let close_ball = (1.0 - ball_distance / 12.0).clamp(0.0, 1.0);
             let line_recovery = snapshot.goalkeeper_line_recovery_sprint_active(self.id);
@@ -6666,6 +7054,19 @@ impl PlayerAgent {
         };
         let press_profile = (self.role != PlayerRole::Goalkeeper)
             .then(|| snapshot.defensive_press_contain_profile_for(self.id));
+        if !matches!(self.role, PlayerRole::Goalkeeper | PlayerRole::Forward) {
+            let goal_side_line = defensive_goal_side_line_profile_for_role(
+                self.team,
+                self.role,
+                self.position,
+                snapshot,
+            );
+            let recovery = goal_side_line.recovery_pressure.clamp(0.0, 1.0);
+            if recovery > 0.0 {
+                shape_score = (shape_score * (1.0 + recovery * 0.38)).clamp(0.10, 1.48);
+                roam_score *= (1.0 - recovery * 0.30).clamp(0.58, 1.0);
+            }
+        }
         let press_model_score = press_profile
             .map(|profile| profile.press_score)
             .unwrap_or(0.0)
@@ -9461,11 +9862,40 @@ impl PlayerAgent {
                         .clamp(0.0, 1.0))
                 .clamp(0.0, 1.0);
                 let ambition_appetite = if attack_ambition_enabled() { 1.45 } else { 1.0 };
+                // Moderate default-ON live-frequency bump: lift the propensity to combine so an
+                // available good one-two competes with carries/through-balls (kill switch
+                // `DD_SOCCER_ENABLE_GIVE_AND_GO_AMBITION=0`). Off ⇒ 1.0 (byte-identical).
+                let gg_ambition = give_and_go_ambition_enabled();
+                let gg_ambition_appetite = if gg_ambition {
+                    GIVE_AND_GO_AMBITION_APPETITE_MULTIPLIER
+                } else {
+                    1.0
+                };
+                // Learned MARL/MAPPO lift: when the trained give-and-go head ranks THIS one-two
+                // above its analytic seed, raise the appetite (never suppress it). 1.0 when the
+                // head is off/untrained, so the gate-off path is byte-identical.
+                let learned_lift = snapshot.give_and_go_learned_appetite_lift(self.id);
+                // Pass-and-move context lift (independent of the give-and-go ambition/learned lifts
+                // above): raise the one-two appetite when the move opens forward opportunity / a
+                // numbers advantage / a run lane. 1.0 at neutral context, so it only ADDS. Stacks
+                // with `gg_ambition_appetite` and `learned_lift` in `raw_wall_appetite` below.
+                let pass_and_move_context = (observation
+                    .pass_and_move_forward_opportunity
+                    .clamp(0.0, 1.0)
+                    * 0.46
+                    + observation.pass_and_move_numbers_advantage.clamp(0.0, 1.0) * 0.26
+                    + observation.pass_and_move_run_lane_score.clamp(0.0, 1.0) * 0.28)
+                    .clamp(0.0, 1.0);
+                let one_two_context_lift =
+                    1.0 + pass_and_move_context * WALL_PASS_PASS_AND_MOVE_CONTEXT_APPETITE_BOOST;
                 let raw_wall_appetite = WALL_PASS_BASE_APPETITE
                     * ambition_appetite
+                    * gg_ambition_appetite
+                    * learned_lift
                     * self.preferences.pass_bias.clamp(0.4, 1.0)
                     * (0.55 + passing_skill * 0.45 + ability01(self.skills.vision) * 0.25)
                     * (0.5 + plan.quality)
+                    * one_two_context_lift
                     * (1.0 + observation.perceived_pressure.clamp(0.0, 1.0) * 0.9)
                     * (1.0 + goal_proximity * 0.8)
                     * if give_and_go_strategy {
@@ -9478,9 +9908,18 @@ impl PlayerAgent {
                 } else {
                     0.0
                 };
+                // Lift the non-strategy ceiling modestly under the ambition bump so a strong
+                // available one-two is not capped below decisive options.
+                let appetite_ceiling = if give_and_go_strategy {
+                    0.97
+                } else if gg_ambition {
+                    GIVE_AND_GO_AMBITION_APPETITE_CEILING
+                } else {
+                    0.92
+                };
                 let wall_appetite = raw_wall_appetite
                     .max(strategy_commitment_floor)
-                    .clamp(0.0, if give_and_go_strategy { 0.97 } else { 0.92 });
+                    .clamp(0.0, appetite_ceiling);
                 let strategy_commits =
                     give_and_go_strategy && plan.quality >= WALL_PASS_STRATEGY_COMMIT_MIN_QUALITY;
                 (plan, wall_appetite, strategy_commits)
@@ -11187,7 +11626,11 @@ impl PlayerAgent {
                 isolated_attacking_carrier_drive_mode(
                     &observation,
                     self.role,
-                    is_outside_midfielder_role(self.role, self.home_position.x, snapshot.field_width),
+                    is_outside_midfielder_role(
+                        self.role,
+                        self.home_position.x,
+                        snapshot.field_width,
+                    ),
                 )
             } else {
                 None
@@ -13278,7 +13721,10 @@ mod forward_option_recognition_tests {
         for &open in &[0.0, 0.2, 0.45, 0.7, 1.0] {
             for &completion in &[0.0, 0.3, 0.6, 1.0] {
                 let q = forward_pass_option_quality(open, completion);
-                assert!(q >= open - 1e-9, "open={open} completion={completion} q={q}");
+                assert!(
+                    q >= open - 1e-9,
+                    "open={open} completion={completion} q={q}"
+                );
                 assert!((0.0..=1.0).contains(&q), "q out of range: {q}");
             }
         }
@@ -13291,7 +13737,10 @@ mod forward_option_recognition_tests {
         // whereas raw openness alone (0.30) would have it dismissed.
         let raw_open = 0.30;
         let recognised = forward_pass_option_quality(raw_open, 0.95);
-        assert!(raw_open < 0.45, "precondition: raw openness is below the release threshold");
+        assert!(
+            raw_open < 0.45,
+            "precondition: raw openness is below the release threshold"
+        );
         assert!(
             recognised >= 0.5,
             "a clear lane to an advanced runner is recognised: {recognised}"
@@ -13304,7 +13753,10 @@ mod forward_option_recognition_tests {
         // inflated into a good option beyond what their own openness already implies.
         let open = 0.40;
         let q = forward_pass_option_quality(open, 0.05);
-        assert!((q - open).abs() < 1e-9, "blocked lane keeps the raw openness: {q}");
+        assert!(
+            (q - open).abs() < 1e-9,
+            "blocked lane keeps the raw openness: {q}"
+        );
     }
 
     #[test]
@@ -13313,7 +13765,10 @@ mod forward_option_recognition_tests {
         let low = forward_pass_option_quality(open, 0.2);
         let mid = forward_pass_option_quality(open, 0.6);
         let high = forward_pass_option_quality(open, 0.95);
-        assert!(low <= mid && mid <= high, "more completable ⇒ better: {low} {mid} {high}");
+        assert!(
+            low <= mid && mid <= high,
+            "more completable ⇒ better: {low} {mid} {high}"
+        );
     }
 }
 

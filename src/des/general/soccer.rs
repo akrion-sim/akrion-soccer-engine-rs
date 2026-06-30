@@ -67,6 +67,8 @@ mod receive_approach;
 pub use receive_approach::*;
 mod long_pass_run;
 pub use long_pass_run::*;
+mod give_and_go;
+pub use give_and_go::*;
 mod beat_defender;
 pub use beat_defender::*;
 mod support_scorer;
@@ -89,6 +91,7 @@ mod crash_box;
 pub(crate) use crash_box::*;
 mod field_numbers;
 pub use field_numbers::*;
+mod goal_side;
 mod policy_select;
 pub use policy_select::*;
 mod pass_lane_yield;
@@ -1228,10 +1231,11 @@ const COMPLETED_KILLER_PASS_MAX_BONUS_POINTS: f64 = 7.0;
 // so the policy learns to PREFER the give->burst->return pattern rather than seeing it as two
 // ordinary short passes. The runner (who laid it off and burst past the man) gets full credit; the
 // "wall" who returned it first-time gets a share. Scaled by how far forward the return is played.
-const COMPLETED_WALL_PASS_BASE_BONUS_POINTS: f64 = 4.0;
+const COMPLETED_WALL_PASS_BASE_BONUS_POINTS: f64 = 4.8;
 const COMPLETED_WALL_PASS_FORWARD_REWARD_PER_YARD: f64 = 0.25;
-const COMPLETED_WALL_PASS_MAX_BONUS_POINTS: f64 = 7.0;
+const COMPLETED_WALL_PASS_MAX_BONUS_POINTS: f64 = 8.0;
 const COMPLETED_WALL_PASS_WALL_CREDIT_SHARE: f64 = 0.7;
+const WALL_PASS_LEARNING_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(5.0);
 // Distinct credit to a RECEIVER who completes a combination via an off-ball forward RUN — a
 // third-man run (a prior pass fed the passer; this player is the running third man) or an overlap
 // (the runner arrived wider + beyond the passer on the same flank). Tightly gated on the receiver
@@ -1312,6 +1316,7 @@ const OFFSIDE_RECOVERY_REWARD: f64 = 1.0;
 // (center-back-ahead-of-wingback penalty/yard folded into tunables().reward — env/PG-overridable)
 const NEAR_GOAL_NO_SHOT_PENALTY_POINTS: f64 = 3.0;
 const EXCESSIVE_HOLD_PENALTY_POINTS: f64 = 2.10;
+const STALE_DRIBBLE_STEAL_EXTRA_PENALTY_POINTS: f64 = 5.25;
 const NON_ELITE_DRIBBLE_HOLD_SKILL_CUTOFF: f64 = 0.90;
 const NON_ELITE_DRIBBLE_HOLD_BASE_SECONDS: f64 = 2.35;
 const ELITE_DRIBBLE_HOLD_BASE_SECONDS: f64 = 4.8;
@@ -1933,8 +1938,7 @@ const FAST_AWAY_FACING_MIN_SPEED_YPS: f64 = 0.35;
 const FAST_AWAY_FACING_BALL_DOT: f64 = -0.55;
 const STRIKER_HOLD_UP_SIDEWAYS_YARDS: f64 = 7.5;
 const STRIKER_HOLD_UP_FORWARD_YARDS: f64 = 2.8;
-const GOAL_CHAIN_REWARD_PATTERN: [f64; 10] =
-    [30.0, 22.0, 15.0, 10.0, 7.0, 5.0, 4.0, 3.0, 2.0, 2.0];
+const GOAL_CHAIN_REWARD_PATTERN: [f64; 10] = [30.0, 22.0, 15.0, 10.0, 7.0, 5.0, 4.0, 3.0, 2.0, 2.0];
 const SHOT_ON_TARGET_REWARD_PATTERN: [f64; 10] =
     [12.0, 9.0, 6.0, 4.0, 3.0, 2.0, 1.5, 1.0, 0.8, 0.7];
 const PASS_CHAIN_HISTORY_LIMIT: usize = 8;
@@ -2042,6 +2046,39 @@ const BACKWARD_PASS_BASE_PENALTY_POINTS: f64 = 2.0;
 const BACKWARD_PASS_PENALTY_PER_YARD_POINTS: f64 = 0.5;
 /// Cap on the total unpressured-backward-pass penalty so one very deep ball can't swamp the signal.
 const BACKWARD_PASS_MAX_PENALTY_POINTS: f64 = 12.0;
+/// Over-dribble dispossession penalty (the carrier held the ball too long and was tackled for it).
+/// Hold time (seconds) past which staying on the ball is "overdue" — a pass or a forward drive
+/// should have happened by now. Below this a tackle on a fresh touch is just an unlucky duel, not an
+/// over-dribble, so no penalty.
+const OVERDRIBBLE_MIN_HOLD_SECONDS: f64 = 1.6;
+/// An opponent within this radius of the carrier at the moment of loss is "genuine pressure" — a
+/// signal the carrier was being closed down and should have released. Either pressure OR an ignored
+/// open outlet is required for the penalty to fire (a clean unlucky strip in open space isn't an
+/// over-dribble blunder).
+const OVERDRIBBLE_PRESSURE_RADIUS_YARDS: f64 = 4.0;
+/// Base penalty points for an over-dribble dispossession, before the excess-hold and ignored-outlet
+/// terms and the pressure multiplier.
+const OVERDRIBBLE_BASE_PENALTY_POINTS: f64 = 4.0;
+/// Extra penalty points per second held beyond `OVERDRIBBLE_MIN_HOLD_SECONDS` — the longer the
+/// overdue hold ran before the steal, the worse the decision to keep the ball.
+const OVERDRIBBLE_PER_EXCESS_SECOND_POINTS: f64 = 2.0;
+/// Extra penalty points per open forward outlet the carrier had (and ignored) at the moment of loss
+/// — the more passing options that were on, the more egregious it was to dribble into a tackle.
+const OVERDRIBBLE_PER_IGNORED_OUTLET_POINTS: f64 = 1.5;
+/// How many ranked forward-outlet candidates to probe when counting ignored passing options.
+const OVERDRIBBLE_OUTLET_PROBE_LIMIT: usize = 3;
+/// Cap on the NEUTRAL-ZONE over-dribble penalty so one very long hold can't swamp the
+/// goal/possession signal — kept below shot-on-target(40)/goal(100), in line with the turnover
+/// penalties. The absolute cap is this times [`OVERDRIBBLE_DANGER_MAX_MULT`] for a deep own-half
+/// giveaway.
+const OVERDRIBBLE_MAX_PENALTY_POINTS: f64 = 16.0;
+/// How much the danger-zone severity can raise the over-dribble penalty (and its absolute cap) for
+/// a loss deep in our own half, where over-dribbling into a tackle can become a goal. Mirrors the
+/// turnover-window danger model ([`KEEPER_GIVEAWAY_DANGER_ZONE_MAX_MULT`]); the deepest giveaway is
+/// punished this many times harder than the same loss at midfield (absolute cap ⇒ 32, still < a
+/// shot-on-target reward at 40). The severity factor passed in is never allowed to REDUCE the
+/// penalty.
+const OVERDRIBBLE_DANGER_MAX_MULT: f64 = KEEPER_GIVEAWAY_DANGER_ZONE_MAX_MULT;
 /// How many of the most-recent teammates in a buildup chain are credited for a shot (the user's
 /// "last 10 teammates involved in the plays that led to the goal").
 const BUILDUP_CHAIN_CREDIT_DEPTH: usize = 10;
@@ -2901,6 +2938,8 @@ pub(crate) struct BlindsideStealAssessment {
     pub gap_yards: f64,
 }
 const DEFENSIVE_GOAL_SIDE_CUSHION_YARDS: f64 = 2.75;
+const DEFENSIVE_GOAL_SIDE_LINE_WIDTH_YARDS: f64 = 7.5;
+const DEFENSIVE_GOAL_SIDE_PROJECTION_TAPER: f64 = 0.18;
 const MIDFIELDER_DEEP_RETREAT_LINE_YARDS: f64 = 10.0;
 const MIDFIELDER_STANDARD_RETREAT_LINE_YARDS: f64 = 15.0;
 const DEFENSIVE_LINE_BREAK_MIN_ADVANCEMENT_FROM_GOAL_YARDS: f64 = 6.0;
@@ -3525,15 +3564,36 @@ const WALL_PASS_RUN_TTL_SECONDS: f64 = 3.6;
 /// Base appetite to attempt an available wall pass (scaled by quality, pressure, skill,
 /// goal proximity, and the active maneuver). A give-and-go is genuinely tried, not rare — the
 /// one-two is a primary attacking route, so when a clean combination is on it is taken often.
+<<<<<<< HEAD
 const WALL_PASS_BASE_APPETITE: f64 = 0.46;
+/// Moderate, default-ON live-frequency bump applied under [`give_and_go_ambition_enabled`]: how
+/// much further to widen the man-to-beat trigger zone (so a one-two is *available* more often —
+/// every quality/onside/lane check still applies, this only widens availability) and how much to
+/// multiply the carrier's raw wall-pass appetite (so an available good one-two competes with
+/// carries/through-balls instead of being out-scored). Off (kill switch
+/// `DD_SOCCER_ENABLE_GIVE_AND_GO_AMBITION=0`) ⇒ none of this applies.
+const GIVE_AND_GO_AMBITION_AHEAD_WIDEN_YARDS: f64 = 3.0;
+const GIVE_AND_GO_AMBITION_LATERAL_WIDEN_YARDS: f64 = 1.5;
+const GIVE_AND_GO_AMBITION_RANGE_WIDEN_YARDS: f64 = 2.0;
+const GIVE_AND_GO_AMBITION_PARTNER_SPACE_EASE_YARDS: f64 = 0.5;
+const GIVE_AND_GO_AMBITION_APPETITE_MULTIPLIER: f64 = 1.4;
+/// Lifted appetite clamp ceiling under the ambition bump (vs. the baseline 0.92), so a strong
+/// available one-two is not capped below decisive options.
+const GIVE_AND_GO_AMBITION_APPETITE_CEILING: f64 = 0.95;
+=======
+const WALL_PASS_BASE_APPETITE: f64 = 0.54;
+>>>>>>> 11dca1d66329f12a47244e88b121a81b7cfc5fd5
 /// When the team's active attacking maneuver IS a give-and-go / one-two, the carrier is
 /// looking to combine — lift the appetite hard.
-const WALL_PASS_STRATEGY_APPETITE_BOOST: f64 = 2.1;
+const WALL_PASS_STRATEGY_APPETITE_BOOST: f64 = 2.35;
 /// And make that strategy a real commitment once the geometry exists, not just a
 /// background nudge that loses most ticks to generic pass/dribble rolls.
-const WALL_PASS_STRATEGY_MIN_APPETITE: f64 = 0.78;
+const WALL_PASS_STRATEGY_MIN_APPETITE: f64 = 0.86;
 /// Minimum quality for a named one-two strategy to commit immediately.
-const WALL_PASS_STRATEGY_COMMIT_MIN_QUALITY: f64 = 0.25;
+const WALL_PASS_STRATEGY_COMMIT_MIN_QUALITY: f64 = 0.18;
+/// Live option-score lift from the existing pass-and-move POMDP features when
+/// a real one-two plan is available.
+const WALL_PASS_PASS_AND_MOVE_CONTEXT_APPETITE_BOOST: f64 = 0.42;
 /// Goal-proximity reference: appetite to combine ramps up inside this distance to goal.
 const WALL_PASS_GOAL_PROXIMITY_REFERENCE_YARDS: f64 = 40.0;
 /// Firm-but-controlled power for the lay-off give (skill adds a little).
@@ -3935,7 +3995,8 @@ const SOCCER_NEURAL_HUMAN_INTENT_FEATURE_DIM: usize = 4;
 /// already carries every player and the ball; this aggregate makes the dynamic
 /// average defensive-line `y` state explicit for the value, actor, and world-model
 /// heads while preserving old snapshots by zero-padding these newest channels.
-const SOCCER_NEURAL_BACK_FOUR_LINE_FEATURE_DIM: usize = 14;
+const SOCCER_NEURAL_BACK_FOUR_LINE_FEATURE_DIM_V1: usize = 14;
+const SOCCER_NEURAL_BACK_FOUR_LINE_FEATURE_DIM: usize = 16;
 /// Append-only carrier line-break block: legal self-dribble progress beyond the
 /// second-last defender line, plus the distance to that break while carrying.
 const SOCCER_NEURAL_CARRIER_LINE_BREAK_FEATURE_DIM: usize = 2;
@@ -3993,6 +4054,8 @@ const SOCCER_NEURAL_PRE_BACK_FOUR_LINE_FEATURE_DIM: usize =
         + SOCCER_NEURAL_HUMAN_INTENT_FEATURE_DIM;
 const SOCCER_NEURAL_PRE_CARRIER_LINE_BREAK_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_BACK_FOUR_LINE_FEATURE_DIM + SOCCER_NEURAL_BACK_FOUR_LINE_FEATURE_DIM;
+const SOCCER_NEURAL_PRE_CARRIER_LINE_BREAK_FEATURE_DIM_V1: usize =
+    SOCCER_NEURAL_PRE_BACK_FOUR_LINE_FEATURE_DIM + SOCCER_NEURAL_BACK_FOUR_LINE_FEATURE_DIM_V1;
 const SOCCER_NEURAL_PRE_MIDFIELD_FOUR_BAND_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_CARRIER_LINE_BREAK_FEATURE_DIM + SOCCER_NEURAL_CARRIER_LINE_BREAK_FEATURE_DIM;
 const SOCCER_NEURAL_PRE_SUPPORT_SPACING_FEATURE_DIM: usize =
@@ -4056,6 +4119,12 @@ const SOCCER_NEURAL_FORWARD_OPTION_FEATURE_DIM: usize = 1;
 /// Append-only defender press/contain block: exposes the POMDP action value to
 /// step to the carrier and the risk that doing so opens a dribble/run behind.
 const SOCCER_NEURAL_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM: usize = 2;
+/// Append-only stale-dribble steal-risk block: overheld carry risk, available
+/// release quality, and pressure/urgency context for turnover attribution.
+const SOCCER_NEURAL_STALE_DRIBBLE_STEAL_FEATURE_DIM: usize = 3;
+/// Append-only out-of-possession goal-side block: true ball-to-own-goal line fit,
+/// lateral miss, and recovery pressure for every non-striker defensive learner.
+const SOCCER_NEURAL_DEFENSIVE_GOAL_SIDE_FEATURE_DIM: usize = 3;
 const SOCCER_NEURAL_PRE_FIRST_TOUCH_ESCAPE_LANE_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_LONG_AERIAL_BOUNDS_FEATURE_DIM + SOCCER_NEURAL_LONG_AERIAL_BOUNDS_FEATURE_DIM;
 const SOCCER_NEURAL_PRE_DRIBBLE_BEAT_FEATURE_DIM: usize =
@@ -4108,9 +4177,18 @@ const SOCCER_NEURAL_PRE_FORWARD_OPTION_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM + SOCCER_NEURAL_GRAPH_TEMPORAL_FEATURE_DIM;
 const SOCCER_NEURAL_PRE_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_FORWARD_OPTION_FEATURE_DIM + SOCCER_NEURAL_FORWARD_OPTION_FEATURE_DIM;
-const SOCCER_NEURAL_FEATURE_DIM: usize =
+const SOCCER_NEURAL_PRE_STALE_DRIBBLE_STEAL_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM
         + SOCCER_NEURAL_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM;
+const SOCCER_NEURAL_PRE_DEFENSIVE_GOAL_SIDE_FEATURE_DIM: usize =
+    SOCCER_NEURAL_PRE_STALE_DRIBBLE_STEAL_FEATURE_DIM
+        + SOCCER_NEURAL_STALE_DRIBBLE_STEAL_FEATURE_DIM;
+const SOCCER_NEURAL_PRE_CURVE_TECHNIQUE_FEATURE_DIM: usize =
+    SOCCER_NEURAL_PRE_DEFENSIVE_GOAL_SIDE_FEATURE_DIM
+        + SOCCER_NEURAL_DEFENSIVE_GOAL_SIDE_FEATURE_DIM;
+const SOCCER_NEURAL_CURVE_TECHNIQUE_FEATURE_DIM: usize = 2;
+const SOCCER_NEURAL_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_CURVE_TECHNIQUE_FEATURE_DIM
+    + SOCCER_NEURAL_CURVE_TECHNIQUE_FEATURE_DIM;
 /// Fixed dimensionality of a persisted **moment embedding** (the vector stored
 /// in pgvector for similarity retrieval). Deliberately decoupled from — and
 /// larger than — `SOCCER_NEURAL_FEATURE_DIM`, which grows as features are added:
@@ -4297,8 +4375,12 @@ const SOCCER_NEURAL_FEATURE_BACK_FOUR_OFFSIDE_TRAP_NOW: usize =
     SOCCER_NEURAL_FEATURE_BACK_FOUR_POSSESSION_STATE + 1;
 const SOCCER_NEURAL_FEATURE_BACK_FOUR_OFFSIDE_TRAP_NEXT: usize =
     SOCCER_NEURAL_FEATURE_BACK_FOUR_OFFSIDE_TRAP_NOW + 1;
-const SOCCER_NEURAL_FEATURE_CARRIER_OFFSIDE_LINE_BREAK: usize =
+const SOCCER_NEURAL_FEATURE_BACK_FOUR_FOREMOST_FOUR_ATTACKER_GAP: usize =
     SOCCER_NEURAL_FEATURE_BACK_FOUR_OFFSIDE_TRAP_NEXT + 1;
+const SOCCER_NEURAL_FEATURE_BACK_FOUR_FOREMOST_FOUR_ATTACKER_GAP_PRESSURE: usize =
+    SOCCER_NEURAL_FEATURE_BACK_FOUR_FOREMOST_FOUR_ATTACKER_GAP + 1;
+const SOCCER_NEURAL_FEATURE_CARRIER_OFFSIDE_LINE_BREAK: usize =
+    SOCCER_NEURAL_FEATURE_BACK_FOUR_FOREMOST_FOUR_ATTACKER_GAP_PRESSURE + 1;
 const SOCCER_NEURAL_FEATURE_CARRIER_OFFSIDE_LINE_BREAK_WINDOW: usize =
     SOCCER_NEURAL_FEATURE_CARRIER_OFFSIDE_LINE_BREAK + 1;
 const SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_BAND_Y: usize =
@@ -4536,8 +4618,7 @@ const SOCCER_NEURAL_FEATURE_SOLO_NO_FORWARD_SUPPORT: usize =
     SOCCER_NEURAL_FEATURE_SOLO_GOAL_SIDE_DEFENDER_GAP + 1;
 const SOCCER_NEURAL_FEATURE_SOLO_FORWARD_SPACE: usize =
     SOCCER_NEURAL_FEATURE_SOLO_NO_FORWARD_SUPPORT + 1;
-const SOCCER_NEURAL_FEATURE_SOLO_SPEED_EDGE: usize =
-    SOCCER_NEURAL_FEATURE_SOLO_FORWARD_SPACE + 1;
+const SOCCER_NEURAL_FEATURE_SOLO_SPEED_EDGE: usize = SOCCER_NEURAL_FEATURE_SOLO_FORWARD_SPACE + 1;
 const DD_SOCCER_RELATIONAL_ATTENTION_ENV: &str = "DD_SOCCER_ENABLE_RELATIONAL_ATTENTION";
 const SOCCER_NEURAL_FEATURE_GRAPH_FORWARD_SUPPORT_EDGE: usize =
     SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM;
@@ -4561,6 +4642,22 @@ const SOCCER_NEURAL_FEATURE_DEFENSIVE_PRESS_ACTION: usize =
     SOCCER_NEURAL_PRE_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM;
 const SOCCER_NEURAL_FEATURE_DEFENSIVE_CONTAIN_RISK: usize =
     SOCCER_NEURAL_FEATURE_DEFENSIVE_PRESS_ACTION + 1;
+const SOCCER_NEURAL_FEATURE_STALE_DRIBBLE_STEAL_RISK: usize =
+    SOCCER_NEURAL_PRE_STALE_DRIBBLE_STEAL_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_STALE_DRIBBLE_RELEASE_QUALITY: usize =
+    SOCCER_NEURAL_FEATURE_STALE_DRIBBLE_STEAL_RISK + 1;
+const SOCCER_NEURAL_FEATURE_STALE_DRIBBLE_PRESSURE_CONTEXT: usize =
+    SOCCER_NEURAL_FEATURE_STALE_DRIBBLE_RELEASE_QUALITY + 1;
+const SOCCER_NEURAL_FEATURE_DEFENSIVE_GOAL_SIDE_LINE_FIT: usize =
+    SOCCER_NEURAL_PRE_DEFENSIVE_GOAL_SIDE_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_DEFENSIVE_GOAL_SIDE_LATERAL_MISS: usize =
+    SOCCER_NEURAL_FEATURE_DEFENSIVE_GOAL_SIDE_LINE_FIT + 1;
+const SOCCER_NEURAL_FEATURE_DEFENSIVE_GOAL_SIDE_RECOVERY_PRESSURE: usize =
+    SOCCER_NEURAL_FEATURE_DEFENSIVE_GOAL_SIDE_LATERAL_MISS + 1;
+const SOCCER_NEURAL_FEATURE_PASS_OUTSIDE_FOOT_CURVE: usize =
+    SOCCER_NEURAL_PRE_CURVE_TECHNIQUE_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_SHOT_OUTSIDE_FOOT_CURVE: usize =
+    SOCCER_NEURAL_FEATURE_PASS_OUTSIDE_FOOT_CURVE + 1;
 const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     61,
     62,
@@ -4639,6 +4736,8 @@ const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     // Current base + motion + belief + opponent belief + learned-MPC +
     // option-control + human-intent, before the back-four line model tail.
     SOCCER_NEURAL_PRE_BACK_FOUR_LINE_FEATURE_DIM,
+    // Old back-four model tail before the foremost-four attacker gap channels.
+    SOCCER_NEURAL_PRE_CARRIER_LINE_BREAK_FEATURE_DIM_V1,
     // Same schema with the back-four model tail, before legal carrier line-break features.
     SOCCER_NEURAL_PRE_CARRIER_LINE_BREAK_FEATURE_DIM,
     // Same schema with carrier line-break features, before the midfield-four band tail.
@@ -4691,6 +4790,12 @@ const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     SOCCER_NEURAL_PRE_FORWARD_OPTION_FEATURE_DIM,
     // Same schema with forward-option quality, before defender press/contain channels.
     SOCCER_NEURAL_PRE_DEFENSIVE_PRESS_CONTAIN_FEATURE_DIM,
+    // Same schema with defender press/contain, before stale-dribble steal-risk channels.
+    SOCCER_NEURAL_PRE_STALE_DRIBBLE_STEAL_FEATURE_DIM,
+    // Same schema with stale-dribble steal-risk, before defensive goal-side line channels.
+    SOCCER_NEURAL_PRE_DEFENSIVE_GOAL_SIDE_FEATURE_DIM,
+    // Same schema with defensive goal-side line channels, before curve-technique channels.
+    SOCCER_NEURAL_PRE_CURVE_TECHNIQUE_FEATURE_DIM,
 ];
 const TEAM_SHAPE_NEAR_BALL_RADIUS_YARDS: f64 = 18.0;
 // Tight same-team congestion rings reported in the brain trace so a human can see
@@ -6079,6 +6184,13 @@ pub struct SoccerNeuralExtendedObservation {
     /// Whether the next three seconds project to a usable offside-trap shape.
     #[serde(default)]
     pub back_four_offside_trap_next_three_seconds: f64,
+    /// Forward gap from the back four to the average of the opponent's foremost
+    /// four outfield attackers in the defending team's attacking frame.
+    #[serde(default)]
+    pub back_four_opponent_foremost_four_forward_gap_yards: f64,
+    /// Unit pressure from the same gap: 0 means connected, 1 means too stretched.
+    #[serde(default)]
+    pub back_four_opponent_foremost_four_gap_pressure: f64,
     // --- Midfield-four average-y band model (team aggregate, attack-direction frame) ---
     /// Raw average `y` position of the team's midfielders, in yards.
     #[serde(default)]
@@ -6328,6 +6440,11 @@ pub struct SoccerPomdpObservation {
     pub slip_break_release_now: f64,
     #[serde(default)]
     pub nearest_forward_teammate_distance_yards: f64,
+    /// Forward-axis separation (yards) to the nearest visible forward pass option. Unlike
+    /// [`nearest_forward_teammate_distance_yards`], this is the y-component in the attack
+    /// direction, so a receiver 10 yards ahead but wide still counts as a short forward outlet.
+    #[serde(default)]
+    pub nearest_forward_teammate_forward_yards: f64,
     #[serde(default)]
     pub floor_pass_lane_score: f64,
     #[serde(default)]
@@ -6612,6 +6729,16 @@ pub struct SoccerPomdpObservation {
     /// entering valued space in behind, so contain/back-off/cover is safer.
     #[serde(default)]
     pub defensive_contain_risk_score: f64,
+    /// True out-of-possession goal-side fit [0,1] for non-strikers: high only when the actor
+    /// is close to the direct ball-to-own-goal segment, not merely deeper than the ball on y.
+    #[serde(default)]
+    pub defensive_goal_side_line_fit: f64,
+    /// Lateral miss (yards) from the direct ball-to-own-goal segment while defending.
+    #[serde(default)]
+    pub defensive_goal_side_lateral_miss_yards: f64,
+    /// Urgency [0,1] to recover onto that ball-goal line when the opponent has possession.
+    #[serde(default)]
+    pub defensive_goal_side_recovery_pressure: f64,
     #[serde(default)]
     pub defensive_carrier_channel_pressure: f64,
     #[serde(default)]
@@ -6706,6 +6833,10 @@ pub struct SoccerPomdpObservation {
     #[serde(default)]
     pub pass_curl_probability: f64,
     #[serde(default)]
+    pub shot_outside_foot_curve_probability: f64,
+    #[serde(default)]
+    pub pass_outside_foot_curve_probability: f64,
+    #[serde(default)]
     pub immediate_dispossession_risk: f64,
     pub yards_to_goal: f64,
     #[serde(default)]
@@ -6745,6 +6876,15 @@ pub struct SoccerPomdpObservation {
     /// is set, so decisions are then byte-identical. See [`SoccerFieldNumbersVector`].
     #[serde(default)]
     pub field_numbers: SoccerFieldNumbersVector,
+    /// **Signed true goal-side quality** in `[-1, 1]` when this player's team is defending: how
+    /// far the player sits along, and how close to, the ball→own-goal line (`+1` perfectly
+    /// goal-side on the line, `0` level/off-channel, `-ve` caught upfield of the ball). `0` for
+    /// strikers, the keeper, and whenever the player's team has possession. Its recovery urgency
+    /// folds into `defensive_urgency` when the default-ON gate is enabled; stays `0` (decisions
+    /// byte-identical) when `DD_SOCCER_ENABLE_DEFENSIVE_GOAL_SIDE` is off. See the [`goal_side`]
+    /// module.
+    #[serde(default)]
+    pub defensive_goal_side_quality: f64,
     #[serde(default)]
     pub goal_attack_window_score: f64,
     #[serde(default)]
@@ -6761,6 +6901,15 @@ pub struct SoccerPomdpObservation {
     pub actual_time_on_ball_seconds: f64,
     #[serde(default)]
     pub excessive_hold_pressure: f64,
+    /// Composite risk that a carrier is overholding a dribble under steal pressure.
+    #[serde(default)]
+    pub stale_dribble_steal_risk: f64,
+    /// Quality of the best release option available while that stale carry risk exists.
+    #[serde(default)]
+    pub stale_dribble_release_quality: f64,
+    /// Pressure/urgency component of the stale-dribble steal attribution.
+    #[serde(default)]
+    pub stale_dribble_pressure_context: f64,
     #[serde(default)]
     pub fatigue: f64,
     #[serde(default)]
@@ -7116,6 +7265,8 @@ pub struct SoccerMdpMpcComparisonTrace {
     pub mpc_recommended_spin_rps: f64,
     #[serde(default)]
     pub mpc_recommended_curve: String,
+    #[serde(default)]
+    pub mpc_recommended_curve_technique: String,
     #[serde(default)]
     pub mpc_execution_horizon_seconds: f64,
     #[serde(default)]
@@ -9026,9 +9177,17 @@ pub struct SoccerQStateKey {
     #[serde(default)]
     pub defensive_line_break_threat_bin: u8,
     #[serde(default)]
+    pub back_four_foremost_four_gap_bin: u8,
+    #[serde(default)]
+    pub back_four_foremost_four_gap_pressure_bin: u8,
+    #[serde(default)]
     pub defensive_press_action_bin: u8,
     #[serde(default)]
     pub defensive_contain_risk_bin: u8,
+    #[serde(default)]
+    pub defensive_goal_side_line_fit_bin: u8,
+    #[serde(default)]
+    pub defensive_goal_side_recovery_bin: u8,
     #[serde(default)]
     pub defensive_carrier_channel_pressure_bin: u8,
     #[serde(default)]
@@ -9097,6 +9256,10 @@ pub struct SoccerQStateKey {
     pub shot_curl_probability_bin: u8,
     #[serde(default)]
     pub pass_curl_probability_bin: u8,
+    #[serde(default)]
+    pub shot_outside_foot_curve_probability_bin: u8,
+    #[serde(default)]
+    pub pass_outside_foot_curve_probability_bin: u8,
     #[serde(default)]
     pub immediate_dispossession_risk_bin: u8,
     pub visible_pass_options_bin: u8,
@@ -9321,6 +9484,12 @@ pub struct SoccerQStateKey {
     pub perceived_time_on_ball_bin: u8,
     #[serde(default)]
     pub excessive_hold_pressure_bin: u8,
+    #[serde(default)]
+    pub stale_dribble_steal_risk_bin: u8,
+    #[serde(default)]
+    pub stale_dribble_release_quality_bin: u8,
+    #[serde(default)]
+    pub stale_dribble_pressure_context_bin: u8,
     #[serde(default)]
     pub fatigue_bin: u8,
     #[serde(default)]
@@ -9649,12 +9818,32 @@ impl SoccerQStateKey {
                 observation.defensive_line_break_threat,
                 &[0.15, 0.35, 0.60, 0.82],
             ),
+            back_four_foremost_four_gap_bin: distance_bucket(
+                observation
+                    .neural_extended
+                    .back_four_opponent_foremost_four_forward_gap_yards,
+                &[10.0, 15.0, 20.0, 30.0, 40.0, 55.0],
+            ),
+            back_four_foremost_four_gap_pressure_bin: distance_bucket(
+                observation
+                    .neural_extended
+                    .back_four_opponent_foremost_four_gap_pressure,
+                &[0.15, 0.35, 0.60, 0.82],
+            ),
             defensive_press_action_bin: distance_bucket(
                 observation.defensive_press_action_score,
                 &[0.15, 0.35, 0.60, 0.82],
             ),
             defensive_contain_risk_bin: distance_bucket(
                 observation.defensive_contain_risk_score,
+                &[0.15, 0.35, 0.60, 0.82],
+            ),
+            defensive_goal_side_line_fit_bin: distance_bucket(
+                observation.defensive_goal_side_line_fit,
+                &[0.20, 0.45, 0.70, 0.90],
+            ),
+            defensive_goal_side_recovery_bin: distance_bucket(
+                observation.defensive_goal_side_recovery_pressure,
                 &[0.15, 0.35, 0.60, 0.82],
             ),
             defensive_carrier_channel_pressure_bin: distance_bucket(
@@ -9766,6 +9955,14 @@ impl SoccerQStateKey {
             pass_curl_probability_bin: distance_bucket(
                 observation.pass_curl_probability,
                 &[0.10, 0.24, 0.42, 0.62],
+            ),
+            shot_outside_foot_curve_probability_bin: distance_bucket(
+                observation.shot_outside_foot_curve_probability,
+                &[0.12, 0.28, 0.46, 0.64],
+            ),
+            pass_outside_foot_curve_probability_bin: distance_bucket(
+                observation.pass_outside_foot_curve_probability,
+                &[0.12, 0.28, 0.46, 0.64],
             ),
             immediate_dispossession_risk_bin: distance_bucket(
                 observation.immediate_dispossession_risk,
@@ -10169,6 +10366,18 @@ impl SoccerQStateKey {
                 observation.excessive_hold_pressure,
                 &[0.15, 0.35, 0.60, 0.82],
             ),
+            stale_dribble_steal_risk_bin: distance_bucket(
+                observation.stale_dribble_steal_risk,
+                &[0.15, 0.35, 0.60, 0.82],
+            ),
+            stale_dribble_release_quality_bin: distance_bucket(
+                observation.stale_dribble_release_quality,
+                &[0.15, 0.35, 0.60, 0.82],
+            ),
+            stale_dribble_pressure_context_bin: distance_bucket(
+                observation.stale_dribble_pressure_context,
+                &[0.15, 0.35, 0.60, 0.82],
+            ),
             fatigue_bin: distance_bucket(observation.fatigue, &[0.15, 0.35, 0.60, 0.82]),
             nearest_defender_fatigue_bin: distance_bucket(
                 observation.perceived_nearest_defender_fatigue,
@@ -10415,8 +10624,13 @@ impl SoccerQStateKey {
             && self.goalkeeper_ball_goal_line_alignment_bin
                 == other.goalkeeper_ball_goal_line_alignment_bin
             && self.defensive_line_break_threat_bin == other.defensive_line_break_threat_bin
+            && self.back_four_foremost_four_gap_bin == other.back_four_foremost_four_gap_bin
+            && self.back_four_foremost_four_gap_pressure_bin
+                == other.back_four_foremost_four_gap_pressure_bin
             && self.defensive_press_action_bin == other.defensive_press_action_bin
             && self.defensive_contain_risk_bin == other.defensive_contain_risk_bin
+            && self.defensive_goal_side_line_fit_bin == other.defensive_goal_side_line_fit_bin
+            && self.defensive_goal_side_recovery_bin == other.defensive_goal_side_recovery_bin
             && self.defensive_carrier_channel_pressure_bin
                 == other.defensive_carrier_channel_pressure_bin
             && self.defensive_carrier_channel_side_bin == other.defensive_carrier_channel_side_bin
@@ -10458,6 +10672,10 @@ impl SoccerQStateKey {
             && self.shot_blocker_distance_bin == other.shot_blocker_distance_bin
             && self.shot_curl_probability_bin == other.shot_curl_probability_bin
             && self.pass_curl_probability_bin == other.pass_curl_probability_bin
+            && self.shot_outside_foot_curve_probability_bin
+                == other.shot_outside_foot_curve_probability_bin
+            && self.pass_outside_foot_curve_probability_bin
+                == other.pass_outside_foot_curve_probability_bin
             && self.immediate_dispossession_risk_bin == other.immediate_dispossession_risk_bin
             && self.visible_pass_options_bin == other.visible_pass_options_bin
             && self.visible_aerial_pass_options_bin == other.visible_aerial_pass_options_bin
@@ -10500,8 +10718,7 @@ impl SoccerQStateKey {
             && self.slip_break_runner_back_line_speed_edge_bin
                 == other.slip_break_runner_back_line_speed_edge_bin
             && self.slip_break_line_break_depth_bin == other.slip_break_line_break_depth_bin
-            && self.slip_break_goalkeeper_avoidance_bin
-                == other.slip_break_goalkeeper_avoidance_bin
+            && self.slip_break_goalkeeper_avoidance_bin == other.slip_break_goalkeeper_avoidance_bin
             && self.slip_break_angled_away_from_goalkeeper
                 == other.slip_break_angled_away_from_goalkeeper
             && self.best_forward_pass_receiver_openness_bin
@@ -10586,6 +10803,9 @@ impl SoccerQStateKey {
             && self.side_glance_control_cost_bin == other.side_glance_control_cost_bin
             && self.perceived_time_on_ball_bin == other.perceived_time_on_ball_bin
             && self.excessive_hold_pressure_bin == other.excessive_hold_pressure_bin
+            && self.stale_dribble_steal_risk_bin == other.stale_dribble_steal_risk_bin
+            && self.stale_dribble_release_quality_bin == other.stale_dribble_release_quality_bin
+            && self.stale_dribble_pressure_context_bin == other.stale_dribble_pressure_context_bin
             && self.fatigue_bin == other.fatigue_bin
             && self.nearest_defender_fatigue_bin == other.nearest_defender_fatigue_bin
             && self.nearest_defender_fatigue_confidence_bin
@@ -13089,6 +13309,33 @@ pub(crate) fn attack_ambition_enabled() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     !*V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_ATTACK_AMBITION").is_ok())
+}
+
+/// Whether the **moderate give-and-go live-frequency bump** is active this process: a modest
+/// extra widening of the wall-pass trigger zone and a lift on the carrier's appetite to combine,
+/// so more one-twos actually appear in live play. **Default-ON in production**
+/// (`DD_SOCCER_ENABLE_GIVE_AND_GO_AMBITION=0/false/no/off` is the kill switch), read once.
+/// **Default-OFF under test** so the option-scoring parity suite stays byte-identical (the bump
+/// only ever *widens availability* / lifts a propensity — every quality/onside/lane check still
+/// applies, so a poor combination is still demoted, never forced).
+pub(crate) fn give_and_go_ambition_enabled() -> bool {
+    #[cfg(test)]
+    {
+        // Default-OFF + env-driven under test (re-read each call) so the parity suite stays
+        // byte-identical and a test can toggle it explicitly.
+        std::env::var("DD_SOCCER_ENABLE_GIVE_AND_GO_AMBITION")
+            .map(|raw| {
+                let v = raw.trim().to_ascii_lowercase();
+                matches!(v.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_GIVE_AND_GO_AMBITION"))
+    }
 }
 
 fn pass_like_action_flight(action: &str) -> Option<PassFlight> {
@@ -17886,11 +18133,22 @@ pub(crate) enum SoccerRewardEventKind {
     /// that the WHOLE buildup, not just the finisher, gets credit for creating the chance. Emitted
     /// only when `DD_SOCCER_ENABLE_BUILDUP_CHAIN_CREDIT` is on. See `record_buildup_chain_credit`.
     BuildupChainCredit,
+    /// Positive: a completed one-two / wall-pass return. The event wakes learning immediately and
+    /// the world reward path also replays recent runner+wall transitions with the pattern bonus.
+    WallPassCombination,
     /// Positive: a long ball was released to a teammate who had broken beyond the opponent's last
     /// outfield defender but was ONSIDE in our own half (the "release long inside own half"
     /// strategy — you cannot be offside in your own half). Trains the line-breaking ball that
     /// punishes a high press. Emitted only when `DD_SOCCER_ENABLE_RELEASE_LONG_OWN_HALF` is on.
     ReleaseLongInsideOwnHalf,
+    /// PENALTY (negative): the carrier held / dribbled the ball too long and was DISPOSSESSED for it
+    /// — the steal is the marker of a negative event (the absence of a pass that should have been
+    /// played). Attributed to the over-dribbling carrier and scaled by the field-vector context at
+    /// the moment of loss: how long they held, how much pressure was on them, and how many open
+    /// forward outlets they ignored. The direct learning signal that holding too long in that
+    /// position was the mistake. Emitted only when `DD_SOCCER_ENABLE_OVERDRIBBLE_PENALTY` is on. See
+    /// [`overdribble_dispossession_penalty_points`].
+    OverdribbleDispossession,
     MatchResult,
 }
 
@@ -17915,7 +18173,9 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::SustainedForwardDribble
                 | SoccerRewardEventKind::UnpressuredBackwardPass
                 | SoccerRewardEventKind::BuildupChainCredit
+                | SoccerRewardEventKind::WallPassCombination
                 | SoccerRewardEventKind::ReleaseLongInsideOwnHalf
+                | SoccerRewardEventKind::OverdribbleDispossession
                 | SoccerRewardEventKind::MatchResult
         )
     }
@@ -17941,7 +18201,8 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::CrashBoxArrival
                 | SoccerRewardEventKind::SustainedForwardDribble
                 | SoccerRewardEventKind::BuildupChainCredit
-        | SoccerRewardEventKind::ReleaseLongInsideOwnHalf
+                | SoccerRewardEventKind::WallPassCombination
+                | SoccerRewardEventKind::ReleaseLongInsideOwnHalf
         )
     }
 }
@@ -18705,6 +18966,137 @@ pub(crate) fn unpressured_backward_pass_penalty_points(
     }
     (BACKWARD_PASS_BASE_PENALTY_POINTS + backward_yards * BACKWARD_PASS_PENALTY_PER_YARD_POINTS)
         .min(BACKWARD_PASS_MAX_PENALTY_POINTS)
+}
+
+/// Penalty points (>= 0) for an OVER-DRIBBLE dispossession — the carrier held / dribbled the ball
+/// too long and lost it to a tackle. Zero unless the carrier had held the ball longer than
+/// `OVERDRIBBLE_MIN_HOLD_SECONDS` AND was either under genuine pressure (an opponent within
+/// `OVERDRIBBLE_PRESSURE_RADIUS_YARDS`) or had at least one open forward outlet to pass to — a clean
+/// unlucky strip on a fresh touch in open space is NOT punished. Otherwise it is
+/// `base + excess_seconds·per-second + ignored_outlets·per-outlet`, then multiplied by a pressure
+/// factor that grows as the nearest opponent gets right on top of the carrier (1× at the pressure
+/// radius up to ~2× point-blank), and finally by `danger_severity` — the keeper-giveaway danger
+/// factor (`>= 1.0`; see [`keeper_giveaway_severity_factor`]) that punishes a loss DEEP IN OUR OWN
+/// HALF (where over-dribbling into a tackle can become a goal) far harder than a failed take-on up
+/// the pitch. The result is capped (`OVERDRIBBLE_MAX_PENALTY_POINTS`, raised by the danger mult in
+/// the danger zone). This is the field-vector context the user asked for: the magnitude reflects how
+/// long the carrier held, how much pressure was on them, how many passing options they ignored, and
+/// HOW DANGEROUS the area was. `danger_severity` is clamped to `>= 1.0`, so it can only raise the
+/// penalty (a non-finite value falls back to neutral). Pure (env-free) so the scaling is unit-tested
+/// directly. See [`overdribble_penalty_enabled`].
+pub(crate) fn overdribble_dispossession_penalty_points(
+    hold_seconds: f64,
+    nearest_opponent_distance_yards: f64,
+    open_forward_outlets: usize,
+    danger_severity: f64,
+) -> f64 {
+    if !hold_seconds.is_finite() || !nearest_opponent_distance_yards.is_finite() {
+        return 0.0;
+    }
+    let excess = hold_seconds - OVERDRIBBLE_MIN_HOLD_SECONDS;
+    if excess <= 0.0 {
+        return 0.0;
+    }
+    let under_pressure = nearest_opponent_distance_yards <= OVERDRIBBLE_PRESSURE_RADIUS_YARDS;
+    if !under_pressure && open_forward_outlets == 0 {
+        return 0.0;
+    }
+    let mut points = OVERDRIBBLE_BASE_PENALTY_POINTS
+        + excess * OVERDRIBBLE_PER_EXCESS_SECOND_POINTS
+        + open_forward_outlets as f64 * OVERDRIBBLE_PER_IGNORED_OUTLET_POINTS;
+    if under_pressure {
+        let proximity = ((OVERDRIBBLE_PRESSURE_RADIUS_YARDS - nearest_opponent_distance_yards)
+            / OVERDRIBBLE_PRESSURE_RADIUS_YARDS)
+            .clamp(0.0, 1.0);
+        points *= 1.0 + proximity;
+    }
+    // Cap the raw "blameworthiness" at the neutral-zone max FIRST, so the danger multiplier scales a
+    // bounded base (a midfield over-dribble can never exceed the base cap). Then apply the danger
+    // factor — never below 1.0 (a non-finite factor ⇒ neutral, since `f64::max` ignores NaN) — and a
+    // final absolute safety cap that rises with the danger mult so a deep own-half giveaway is
+    // punished harder without being flattened by the neutral cap.
+    let blameworthiness = points.min(OVERDRIBBLE_MAX_PENALTY_POINTS);
+    let danger = if danger_severity.is_finite() {
+        danger_severity.max(1.0)
+    } else {
+        1.0
+    };
+    (blameworthiness * danger).min(OVERDRIBBLE_MAX_PENALTY_POINTS * OVERDRIBBLE_DANGER_MAX_MULT)
+}
+
+/// Whether the **over-dribble dispossession penalty** is active this process. Adds a sharp,
+/// carrier-attributed MARL/MAPPO learning signal at the moment the ball is stolen off a carrier who
+/// dribbled too long — scaled by hold time, pressure, and ignored passing options. Default-ON in
+/// production (env `DD_SOCCER_ENABLE_OVERDRIBBLE_PENALTY=0/false` is the kill switch); default-OFF
+/// under test so the reward-parity suite stays byte-identical. See
+/// [`overdribble_dispossession_penalty_points`].
+pub(crate) fn overdribble_penalty_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_OVERDRIBBLE_PENALTY").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_OVERDRIBBLE_PENALTY"))
+    }
+}
+
+/// Minimum gait a ball carrier should drive at when carrying the ball forward into open space — the
+/// "first inclination is to jog/run/sprint forward, not walk the ball" rule. Returns `None` when no
+/// floor applies: under tight pressure (`<= carry_tight_pressure_yards`, where close control beats
+/// pace) or with too little room ahead (`< carry_jog_space_yards`). Otherwise the floor is graded by
+/// open forward space — a couple of clear yards ⇒ at least a jog, a clear lane ⇒ a run, open field ⇒
+/// a sprint (capped to a run when too fatigued to flat-out sprint). The caller applies it as an
+/// UPSHIFT only, so it never slows a carrier already moving faster. The thresholds come from
+/// [`DribbleTuning`] (the carry-SPEED axis), so they are tunable from MPC/config and the learned
+/// policy overlay both. Pure (env-free) so it is unit-tested directly. See
+/// [`carrier_forward_drive_enabled`].
+pub(crate) fn carrier_forward_drive_gait_floor(
+    forward_space_yards: f64,
+    nearest_opponent_distance_yards: f64,
+    fatigue: f64,
+    tuning: &DribbleTuning,
+) -> Option<MovementGait> {
+    if !forward_space_yards.is_finite() || !nearest_opponent_distance_yards.is_finite() {
+        return None;
+    }
+    if nearest_opponent_distance_yards <= tuning.carry_tight_pressure_yards
+        || forward_space_yards < tuning.carry_jog_space_yards
+    {
+        return None;
+    }
+    let floor = if forward_space_yards >= tuning.carry_sprint_space_yards
+        && fatigue < tuning.carry_sprint_max_fatigue
+    {
+        MovementGait::Sprint
+    } else if forward_space_yards >= tuning.carry_run_space_yards {
+        MovementGait::Run
+    } else {
+        MovementGait::Jog
+    };
+    Some(floor)
+}
+
+/// Whether the **carrier forward-drive gait floor** is active this process. Makes a ball carrier
+/// driving into open forward space jog/run/sprint into it (graded by the room ahead) as the first
+/// inclination, rather than knocking the ball forward and walking after it. Applied as an upshift
+/// only and suppressed under tight pressure, so close control is never compromised. Default-ON in
+/// production (env `DD_SOCCER_ENABLE_CARRIER_FORWARD_DRIVE=0/false` is the kill switch); default-OFF
+/// under test so the movement-parity suite stays byte-identical. See
+/// [`carrier_forward_drive_gait_floor`].
+pub(crate) fn carrier_forward_drive_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_CARRIER_FORWARD_DRIVE").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_CARRIER_FORWARD_DRIVE"))
+    }
 }
 
 /// Whether the **MPC pass-weight solver** is active this process. For a ground pass to a receiver
@@ -20679,8 +21071,8 @@ pub(crate) fn floored_ground_pass_launch_speed(
     intended_speed: f64,
     speed_cap_yps: Option<f64>,
 ) -> f64 {
-    let mut floor =
-        mph_to_yps(GROUND_PASS_MIN_RELEASE_MPH).max(intended_speed.max(0.0) * GROUND_PASS_MIN_RELEASE_FRACTION);
+    let mut floor = mph_to_yps(GROUND_PASS_MIN_RELEASE_MPH)
+        .max(intended_speed.max(0.0) * GROUND_PASS_MIN_RELEASE_FRACTION);
     if let Some(cap) = speed_cap_yps {
         floor = floor.min(cap.max(0.0));
     }
@@ -22858,8 +23250,15 @@ fn dense_soccer_transition_reward(
     // snapshot so the reward credits the action that advanced the team, and progress is clamped to
     // a reference distance so a single burst can't farm reward. Gated (default-on) by
     // `DD_SOCCER_ENABLE_TEAM_ADVANCE_UPFIELD`; OFF ⇒ this term vanishes (byte-identical parity).
+    // Hardened: only credit the advance when it does NOT coincide with a turnover (the opponent
+    // winning the ball) — a forward charge that gifts possession is not a good advance. The carrier
+    // is credited for driving the ball on; off-ball credit is restricted to ATTACKERS (Forward /
+    // Midfielder) making an ONSIDE supporting run — a defender's forward movement is the back-line
+    // push's job (a positioning mechanic), not an individual reward that would teach it to break
+    // shape, and a run into an offside position is a wasted run, not support.
     if team_advance_upfield_enabled()
         && before_possession == Some(player.team)
+        && after_possession != Some(player.team.other())
         && before.team_advance_upfield_active(player.team).is_some()
     {
         if before.ball.holder == Some(player.id) {
@@ -22867,7 +23266,10 @@ fn dense_soccer_transition_reward(
                 reward += (ball_forward / TEAM_ADVANCE_REWARD_REFERENCE_YARDS).clamp(0.0, 1.0)
                     * TEAM_ADVANCE_CARRIER_DRIVE_REWARD;
             }
-        } else if player.role != PlayerRole::Goalkeeper && player_forward > 0.0 {
+        } else if matches!(player.role, PlayerRole::Forward | PlayerRole::Midfielder)
+            && player_forward > 0.0
+            && !after.position_would_be_offside_for_player(player.id, player.team, after_pos)
+        {
             reward += (player_forward / TEAM_ADVANCE_REWARD_REFERENCE_YARDS).clamp(0.0, 1.0)
                 * TEAM_ADVANCE_SUPPORT_RUN_REWARD;
         }
@@ -23155,6 +23557,7 @@ fn dense_soccer_transition_reward(
         if after_possession == Some(player.team) {
             reward += 0.09;
         } else if after_possession == Some(player.team.other()) {
+            let reward_cfg = &tunables().reward;
             reward -= intentional_long_ball_loss_penalty(
                 action,
                 own_half_holder,
@@ -23162,8 +23565,13 @@ fn dense_soccer_transition_reward(
                 own_goal_relief,
                 false,
             )
-            .unwrap_or(if own_half_holder { 3.5 } else { 2.2 });
+            .unwrap_or(if own_half_holder {
+                reward_cfg.giveaway_to_opponent_own_half_penalty
+            } else {
+                reward_cfg.giveaway_to_opponent_opp_half_penalty
+            });
         } else {
+            let reward_cfg = &tunables().reward;
             reward -= intentional_long_ball_loss_penalty(
                 action,
                 own_half_holder,
@@ -23171,7 +23579,11 @@ fn dense_soccer_transition_reward(
                 own_goal_relief,
                 true,
             )
-            .unwrap_or(if own_half_holder { 0.85 } else { 0.55 });
+            .unwrap_or(if own_half_holder {
+                reward_cfg.giveaway_to_loose_own_half_penalty
+            } else {
+                reward_cfg.giveaway_to_loose_opp_half_penalty
+            });
         }
         reward += ball_forward.clamp(-8.0, 14.0) * 0.15;
         if own_half_holder {
@@ -24831,39 +25243,177 @@ fn defensive_role_press_signal(
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DefensiveGoalSideLineProfile {
+    pub fit: f64,
+    pub lateral_miss_yards: f64,
+    pub projection: f64,
+    pub recovery_pressure: f64,
+    pub target_on_line: Vec2,
+}
+
+fn segment_projection_factor_unclamped(a: Vec2, b: Vec2, p: Vec2) -> f64 {
+    let ab = b - a;
+    let denom = ab.x * ab.x + ab.y * ab.y;
+    if !denom.is_finite() || denom <= 1e-12 {
+        return 0.0;
+    }
+    let ap = p - a;
+    let projection = (ap.x * ab.x + ap.y * ab.y) / denom;
+    if projection.is_finite() {
+        projection
+    } else {
+        0.0
+    }
+}
+
+pub(crate) fn defensive_goal_side_line_target_for_depth(
+    team: Team,
+    ball: Vec2,
+    field_width: f64,
+    field_length: f64,
+    depth_from_own_goal_yards: f64,
+) -> Vec2 {
+    let (field_width, field_length) = sane_pitch_dimensions(field_width, field_length);
+    let own_goal = Vec2::new(field_width * 0.5, team.other().goal_y(field_length));
+    let ball = finite_pitch_point(ball, field_width, field_length, own_goal);
+    let ball_depth = (ball.y - own_goal.y).abs();
+    if ball_depth <= 1e-6 {
+        return own_goal.clamp_to_pitch(field_width, field_length);
+    }
+    let t = (depth_from_own_goal_yards / ball_depth).max(0.0);
+    (own_goal + (ball - own_goal) * t).clamp_to_pitch(field_width, field_length)
+}
+
+pub(crate) fn defensive_goal_side_line_profile_for_point(
+    team: Team,
+    player_position: Vec2,
+    snapshot: &WorldSnapshot,
+) -> DefensiveGoalSideLineProfile {
+    let (field_width, field_length) =
+        sane_pitch_dimensions(snapshot.field_width, snapshot.field_length);
+    let own_goal = Vec2::new(field_width * 0.5, team.other().goal_y(field_length));
+    let ball = finite_pitch_point(snapshot.ball.position, field_width, field_length, own_goal);
+    let player_position = finite_pitch_point(player_position, field_width, field_length, own_goal);
+    let ball_goal_distance = own_goal.distance(ball);
+    if !ball_goal_distance.is_finite() || ball_goal_distance <= 1e-9 {
+        return DefensiveGoalSideLineProfile {
+            fit: 1.0,
+            lateral_miss_yards: 0.0,
+            projection: 0.0,
+            recovery_pressure: 0.0,
+            target_on_line: own_goal.clamp_to_pitch(field_width, field_length),
+        };
+    }
+    let projection = segment_projection_factor_unclamped(own_goal, ball, player_position);
+    let clamped_projection = projection.clamp(0.0, 1.0);
+    let target_on_line = (own_goal + (ball - own_goal) * clamped_projection)
+        .clamp_to_pitch(field_width, field_length);
+    let lateral_miss_yards = player_position.distance(target_on_line);
+    let line_fit =
+        (1.0 - lateral_miss_yards / DEFENSIVE_GOAL_SIDE_LINE_WIDTH_YARDS).clamp(0.0, 1.0);
+    let projection_excess = if projection < 0.0 {
+        -projection
+    } else if projection > 1.0 {
+        projection - 1.0
+    } else {
+        0.0
+    };
+    let projection_fit =
+        (1.0 - projection_excess / DEFENSIVE_GOAL_SIDE_PROJECTION_TAPER).clamp(0.0, 1.0);
+    let fit = (line_fit * projection_fit).clamp(0.0, 1.0);
+    let ball_depth = (ball.y - own_goal.y).abs();
+    let own_goal_urgency = (1.0 - ball_depth / (field_length * 0.45).max(1.0)).clamp(0.0, 1.0);
+    let recovery_pressure = ((1.0 - fit) * (0.45 + own_goal_urgency * 0.55)).clamp(0.0, 1.0);
+    DefensiveGoalSideLineProfile {
+        fit,
+        lateral_miss_yards,
+        projection,
+        recovery_pressure,
+        target_on_line,
+    }
+}
+
+pub(crate) fn defensive_goal_side_line_profile_for_role(
+    team: Team,
+    role: PlayerRole,
+    player_position: Vec2,
+    snapshot: &WorldSnapshot,
+) -> DefensiveGoalSideLineProfile {
+    if role == PlayerRole::Forward {
+        return DefensiveGoalSideLineProfile::default();
+    }
+    // Engage whenever the opponent has possession — including while their pass is in
+    // flight (no holder), which is exactly the transition window where recovering
+    // goal-side matters most. `possession_team` falls back to `last_touch_team`.
+    if snapshot.possession_team() != Some(team.other()) {
+        return DefensiveGoalSideLineProfile::default();
+    }
+    defensive_goal_side_line_profile_for_point(team, player_position, snapshot)
+}
+
 fn defensive_goal_side_reward_for_role(
     team: Team,
     role: PlayerRole,
     player_position: Vec2,
     snapshot: &WorldSnapshot,
 ) -> f64 {
-    if role == PlayerRole::Forward {
+    let profile = defensive_goal_side_line_profile_for_role(team, role, player_position, snapshot);
+    if role == PlayerRole::Forward || profile.fit == 0.0 && profile.recovery_pressure == 0.0 {
         return 0.0;
     }
+<<<<<<< HEAD
     // Engage whenever the opponent has possession — including while their pass is in
     // flight (no holder), which is exactly the transition window where recovering
     // goal-side matters most. `possession_team` falls back to `last_touch_team`.
     if snapshot.possession_team() != Some(team.other()) {
         return 0.0;
     }
-    // Threat reference along the goal axis: the carrier if there is one, else the ball.
-    let attacker_y = snapshot
+    // Threat reference: the carrier if there is one, else the ball. The protective line runs from
+    // this threat to the centre of our own goal.
+    let threat = snapshot
         .ball
         .holder
         .and_then(|holder| snapshot.players.iter().find(|p| p.id == holder))
         .filter(|holder| holder.team == team.other())
         .and_then(|holder| snapshot.player_position(holder.id))
-        .map(|pos| pos.y)
-        .unwrap_or(snapshot.ball.position.y);
+        .unwrap_or(snapshot.ball.position);
     let own_goal_y = team.other().goal_y(snapshot.field_length);
+    if goal_side::defensive_goal_side_enabled() {
+        // TRUE goal-side: reward sitting *on the line between the threat and our goal*, goal-side of
+        // the threat — not merely deeper than it on the y-axis (a wide full-back a yard behind the
+        // ball but stranded on the touchline screens nothing). Continuous over the line geometry,
+        // at the same magnitude as the legacy ladder's best/worst. See the `goal_side` module.
+        let own_goal = Vec2::new(snapshot.field_width * 0.5, own_goal_y);
+        let quality = goal_side::goal_side_quality(
+            player_position,
+            threat,
+            own_goal,
+            goal_side::GOAL_SIDE_CHANNEL_HALF_WIDTH_YARDS,
+            goal_side::GOAL_SIDE_DEPTH_SATURATION_YARDS,
+        );
+        return goal_side::defensive_goal_side_role_reward(quality);
+    }
+    // Legacy y-axis-only definition (byte-identical when the gate is off).
     let goal_side_of_ball =
         goal_side_between_y(player_position.y, snapshot.ball.position.y, own_goal_y);
-    let goal_side_of_attacker = goal_side_between_y(player_position.y, attacker_y, own_goal_y);
+    let goal_side_of_attacker = goal_side_between_y(player_position.y, threat.y, own_goal_y);
     match (goal_side_of_ball, goal_side_of_attacker) {
         (true, true) => 0.24,
         (true, false) | (false, true) => -0.12,
         (false, false) => -0.42,
     }
+=======
+    let (bonus, miss_penalty) = match role {
+        PlayerRole::Defender => (0.58, 0.24),
+        PlayerRole::Midfielder => (0.48, 0.20),
+        PlayerRole::Goalkeeper => (0.28, 0.12),
+        PlayerRole::Forward => (0.0, 0.0),
+    };
+    let reward = profile.fit * bonus
+        - (1.0 - profile.fit).powi(2) * miss_penalty * (0.70 + profile.recovery_pressure * 0.30);
+    reward.clamp(-miss_penalty, bonus)
+>>>>>>> 11dca1d66329f12a47244e88b121a81b7cfc5fd5
 }
 
 fn defensive_goal_line_spacing_score(
@@ -32749,6 +33299,8 @@ fn soccer_requested_tactical_feature_gate_names() -> Vec<String> {
         "DD_SOCCER_DISABLE_HOLD_FOR_SUPPORT",
         "DD_SOCCER_DISABLE_HOLD_DRIVE_INTO_SPACE",
         "DD_SOCCER_ENABLE_QUICK_FORWARD_PASS",
+        "DD_SOCCER_ENABLE_OVERDRIBBLE_PENALTY",
+        "DD_SOCCER_ENABLE_CARRIER_FORWARD_DRIVE",
     ]
     .into_iter()
     .map(str::to_string)
@@ -32785,10 +33337,8 @@ fn soccer_decision_model_contract() -> SoccerDecisionModelContract {
         killer_pass_over_top_binned_in_mdp_state: true,
         killer_pass_over_top_in_neural_features: true,
         slip_break_offside_trap_ground_pass_enabled: true,
-        slip_break_offside_trap_start_min_gap_yards:
-            SLIP_BREAK_OFFSIDE_TRAP_START_MIN_GAP_YARDS,
-        slip_break_offside_trap_start_max_gap_yards:
-            SLIP_BREAK_OFFSIDE_TRAP_START_MAX_GAP_YARDS,
+        slip_break_offside_trap_start_min_gap_yards: SLIP_BREAK_OFFSIDE_TRAP_START_MIN_GAP_YARDS,
+        slip_break_offside_trap_start_max_gap_yards: SLIP_BREAK_OFFSIDE_TRAP_START_MAX_GAP_YARDS,
         slip_break_offside_trap_release_min_gap_yards:
             SLIP_BREAK_OFFSIDE_TRAP_RELEASE_MIN_GAP_YARDS,
         slip_break_offside_trap_release_max_gap_yards:
@@ -38225,6 +38775,8 @@ struct BackFourLineLearningSignal {
     possession_state: f64,
     offside_trap_now: f64,
     offside_trap_next_three_seconds: f64,
+    opponent_foremost_four_forward_gap_yards: f64,
+    opponent_foremost_four_gap_pressure: f64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -38297,6 +38849,7 @@ fn back_four_line_learning_signal(
     let mut opponent_velocity_y_total = 0.0;
     let mut opponent_acceleration_y_total = 0.0;
     let mut opponent_count = 0usize;
+    let mut opponent_forward_values = Vec::new();
     let mut projects_runner_into_trap = false;
     let projected_line_y = line_y
         + line_velocity_y * OFFSIDE_TRAP_HORIZON_SECONDS
@@ -38312,6 +38865,9 @@ fn back_four_line_learning_signal(
         opponent_velocity_y_total += opponent.velocity.y;
         opponent_acceleration_y_total += opponent.acceleration.y;
         opponent_count += 1;
+        if opponent.role != PlayerRole::Goalkeeper {
+            opponent_forward_values.push(position.y * attack_dir);
+        }
         if matches!(opponent.role, PlayerRole::Forward | PlayerRole::Midfielder) {
             let goalward_speed = (opponent.velocity.y * opponent_attack_dir).max(0.0);
             let goalward_accel = (opponent.acceleration.y * opponent_attack_dir).max(0.0);
@@ -38338,6 +38894,19 @@ fn back_four_line_learning_signal(
         Some(_) => -1.0,
         None => 0.0,
     };
+    opponent_forward_values.sort_by(|a, b| a.total_cmp(b));
+    let opponent_foremost_four_fwd = if opponent_forward_values.is_empty() {
+        line_y * attack_dir
+    } else {
+        let count = opponent_forward_values.len().min(4);
+        opponent_forward_values.iter().take(count).sum::<f64>() / count as f64
+    };
+    let opponent_foremost_four_forward_gap_yards =
+        finite_metric(opponent_foremost_four_fwd - line_y * attack_dir);
+    let opponent_foremost_four_gap_pressure = back_four_foremost_four_gap_pressure(
+        opponent_foremost_four_forward_gap_yards,
+        possession_state,
+    );
     let offside_available = possession != Some(team) && !snapshot.offside_currently_suspended();
     let offside_trap_now =
         if offside_available && line_spread_yards <= BACK_FOUR_OFFSIDE_LEVEL_BAND_YARDS {
@@ -38435,7 +39004,22 @@ fn back_four_line_learning_signal(
         possession_state,
         offside_trap_now,
         offside_trap_next_three_seconds,
+        opponent_foremost_four_forward_gap_yards,
+        opponent_foremost_four_gap_pressure,
     }
+}
+
+fn back_four_foremost_four_gap_pressure(gap_yards: f64, possession_state: f64) -> f64 {
+    let ideal_gap = if possession_state > 0.5 {
+        BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_IN_POSSESSION_YARDS
+    } else if possession_state < -0.5 {
+        BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_DEFENDING_YARDS
+    } else {
+        BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_DISPOSSESSION_YARDS
+    };
+    ((finite_metric(gap_yards) - ideal_gap)
+        / (BACK_FOUR_FOREMOST_FOUR_ATTACKER_MAX_PUSH_YARDS * 2.0))
+        .clamp(0.0, 1.0)
 }
 
 fn midfield_four_band_learning_signal(
@@ -38802,8 +39386,7 @@ fn soccer_neural_extended_observation(
             let forward_edge =
                 (distance_fit * (forward_offset / 18.0).clamp(0.0, 1.0)).clamp(0.0, 1.0);
             let reset_depth_fit = if (-18.0..=3.0).contains(&forward_offset) {
-                (1.0
-                    - (forward_offset + 5.0).abs() / GRAPH_RESET_SUPPORT_REFERENCE_YARDS)
+                (1.0 - (forward_offset + 5.0).abs() / GRAPH_RESET_SUPPORT_REFERENCE_YARDS)
                     .clamp(0.0, 1.0)
             } else {
                 0.0
@@ -39004,10 +39587,9 @@ fn soccer_neural_extended_observation(
         Team::Home => &snapshot.away_directive,
         Team::Away => &snapshot.home_directive,
     };
-    let temporal_possession_memory_score =
-        (0.7 * (own_possession_seconds / 8.0).clamp(0.0, 1.0)
-            + 0.3 * (snapshot.ball_holder_possession_seconds / 4.0).clamp(0.0, 1.0))
-        .clamp(0.0, 1.0);
+    let temporal_possession_memory_score = (0.7 * (own_possession_seconds / 8.0).clamp(0.0, 1.0)
+        + 0.3 * (snapshot.ball_holder_possession_seconds / 4.0).clamp(0.0, 1.0))
+    .clamp(0.0, 1.0);
     let temporal_actor_run_memory_score =
         (own_recent_forward_progress_yards / 18.0).clamp(-1.0, 1.0);
     let temporal_opponent_press_memory_score = (opponent_directive.press_intensity * 0.45
@@ -39082,6 +39664,10 @@ fn soccer_neural_extended_observation(
         back_four_possession_state: back_four_line.possession_state,
         back_four_offside_trap_now: back_four_line.offside_trap_now,
         back_four_offside_trap_next_three_seconds: back_four_line.offside_trap_next_three_seconds,
+        back_four_opponent_foremost_four_forward_gap_yards: back_four_line
+            .opponent_foremost_four_forward_gap_yards,
+        back_four_opponent_foremost_four_gap_pressure: back_four_line
+            .opponent_foremost_four_gap_pressure,
         midfield_four_band_y: midfield_four_band.band_y,
         midfield_four_band_target_delta_yards: midfield_four_band.target_delta_yards,
         midfield_four_band_forward_velocity_yps: midfield_four_band.band_forward_velocity_yps,
@@ -39959,6 +40545,12 @@ fn soccer_neural_transition_features_with_action(
         soccer_neural_unit(line_model.back_four_offside_trap_now);
     features[SOCCER_NEURAL_FEATURE_BACK_FOUR_OFFSIDE_TRAP_NEXT] =
         soccer_neural_unit(line_model.back_four_offside_trap_next_three_seconds);
+    features[SOCCER_NEURAL_FEATURE_BACK_FOUR_FOREMOST_FOUR_ATTACKER_GAP] = soccer_neural_scaled(
+        line_model.back_four_opponent_foremost_four_forward_gap_yards,
+        60.0,
+    );
+    features[SOCCER_NEURAL_FEATURE_BACK_FOUR_FOREMOST_FOUR_ATTACKER_GAP_PRESSURE] =
+        soccer_neural_unit(line_model.back_four_opponent_foremost_four_gap_pressure);
     features[SOCCER_NEURAL_FEATURE_CARRIER_OFFSIDE_LINE_BREAK] =
         soccer_neural_scaled(line_model.carrier_offside_line_break_yards, 18.0);
     features[SOCCER_NEURAL_FEATURE_CARRIER_OFFSIDE_LINE_BREAK_WINDOW] =
@@ -40272,11 +40864,10 @@ fn soccer_neural_transition_features_with_action(
         obs.slip_break_pass_speed_yps,
         mph_to_yps(SLIP_BREAK_OFFSIDE_TRAP_MAX_PASS_MPH),
     );
-    features[SOCCER_NEURAL_FEATURE_SLIP_BREAK_RUNNER_BACK_LINE_SPEED_EDGE] =
-        soccer_neural_scaled(
-            obs.slip_break_runner_back_line_speed_edge_yps.max(0.0),
-            SLIP_BREAK_OFFSIDE_TRAP_SPEED_EDGE_REFERENCE_YPS,
-        );
+    features[SOCCER_NEURAL_FEATURE_SLIP_BREAK_RUNNER_BACK_LINE_SPEED_EDGE] = soccer_neural_scaled(
+        obs.slip_break_runner_back_line_speed_edge_yps.max(0.0),
+        SLIP_BREAK_OFFSIDE_TRAP_SPEED_EDGE_REFERENCE_YPS,
+    );
     features[SOCCER_NEURAL_FEATURE_SLIP_BREAK_LINE_BREAK_DEPTH] =
         soccer_neural_scaled(obs.slip_break_line_break_depth_yards, 10.0);
     features[SOCCER_NEURAL_FEATURE_SLIP_BREAK_GOALKEEPER_AVOIDANCE] =
@@ -40335,6 +40926,22 @@ fn soccer_neural_transition_features_with_action(
         soccer_neural_unit(obs.defensive_press_action_score);
     features[SOCCER_NEURAL_FEATURE_DEFENSIVE_CONTAIN_RISK] =
         soccer_neural_unit(obs.defensive_contain_risk_score);
+    features[SOCCER_NEURAL_FEATURE_STALE_DRIBBLE_STEAL_RISK] =
+        soccer_neural_unit(obs.stale_dribble_steal_risk);
+    features[SOCCER_NEURAL_FEATURE_STALE_DRIBBLE_RELEASE_QUALITY] =
+        soccer_neural_unit(obs.stale_dribble_release_quality);
+    features[SOCCER_NEURAL_FEATURE_STALE_DRIBBLE_PRESSURE_CONTEXT] =
+        soccer_neural_unit(obs.stale_dribble_pressure_context);
+    features[SOCCER_NEURAL_FEATURE_DEFENSIVE_GOAL_SIDE_LINE_FIT] =
+        soccer_neural_unit(obs.defensive_goal_side_line_fit);
+    features[SOCCER_NEURAL_FEATURE_DEFENSIVE_GOAL_SIDE_LATERAL_MISS] =
+        soccer_neural_scaled(obs.defensive_goal_side_lateral_miss_yards, 12.0);
+    features[SOCCER_NEURAL_FEATURE_DEFENSIVE_GOAL_SIDE_RECOVERY_PRESSURE] =
+        soccer_neural_unit(obs.defensive_goal_side_recovery_pressure);
+    features[SOCCER_NEURAL_FEATURE_PASS_OUTSIDE_FOOT_CURVE] =
+        soccer_neural_unit(obs.pass_outside_foot_curve_probability);
+    features[SOCCER_NEURAL_FEATURE_SHOT_OUTSIDE_FOOT_CURVE] =
+        soccer_neural_unit(obs.shot_outside_foot_curve_probability);
     debug_assert_eq!(features.len(), SOCCER_NEURAL_FEATURE_DIM);
     features
 }
@@ -43059,12 +43666,17 @@ impl SoccerLiveServer {
     }
 
     pub fn local_url(&self) -> String {
-        format!("http://{}:{}/", self.config.host, self.config.port)
+        self.local_url_for_port(self.config.port)
+    }
+
+    fn local_url_for_port(&self, port: u16) -> String {
+        format!("http://{}:{port}/", self.config.host)
     }
 
     pub fn run(self) -> std::io::Result<()> {
         let listener = TcpListener::bind((self.config.host.as_str(), self.config.port))?;
-        println!("# Live soccer UI: {}", self.local_url());
+        let bound_port = listener.local_addr()?.port();
+        println!("# Live soccer UI: {}", self.local_url_for_port(bound_port));
         // Keep the live policy in lock-step with the cluster learner: a background thread polls
         // Postgres and hot-swaps the policy whenever a newer ACTIVE version is published. The
         // policy is queried per-decision, so swapping it between ticks is safe.
@@ -50095,6 +50707,7 @@ fn tracking_frame_to_world_snapshot(
         loose_ball_commit_head: None,
         receive_approach_head: None,
         long_pass_run_head: None,
+        give_and_go_head: None,
         attack_spacing_head: None,
         aerial_reception_head: None,
         shot_trigger_head: None,
@@ -52456,6 +53069,87 @@ fn excessive_hold_pressure(observation: &SoccerPomdpObservation, dribbling: f64)
     )
 }
 
+fn stale_dribble_release_option_quality(observation: &SoccerPomdpObservation) -> f64 {
+    let floor_quality = observation
+        .best_forward_pass_option_quality
+        .max(observation.best_forward_pass_receiver_openness)
+        .max(observation.best_pass_receiver_openness)
+        .max(observation.expected_pass_completion * 0.88);
+    let aerial_quality = observation
+        .best_aerial_pass_receiver_openness
+        .max(observation.expected_aerial_pass_completion * 0.72)
+        .max(observation.aerial_pass_bypass_score * 0.66);
+    let support_quality = (observation.open_support_outlets as f64 / 3.0)
+        .clamp(0.0, 1.0)
+        .max((observation.visible_pass_options as f64 / 4.0).clamp(0.0, 1.0) * 0.72);
+    floor_quality
+        .max(aerial_quality)
+        .max(support_quality)
+        .clamp(0.0, 1.0)
+}
+
+fn stale_dribble_pressure_context(observation: &SoccerPomdpObservation) -> f64 {
+    observation
+        .pressure_urgency
+        .max(observation.perceived_pressure)
+        .max(observation.immediate_dispossession_risk)
+        .max(
+            observation
+                .neural_extended
+                .surprise_behind_steal_escape_pressure,
+        )
+        .clamp(0.0, 1.0)
+}
+
+fn stale_dribble_steal_risk(observation: &SoccerPomdpObservation, dribbling: f64) -> f64 {
+    if !observation.has_ball {
+        return 0.0;
+    }
+    let hold_pressure = observation
+        .excessive_hold_pressure
+        .max(excessive_hold_pressure(observation, dribbling))
+        .clamp(0.0, 1.0);
+    if hold_pressure <= 0.0 {
+        return 0.0;
+    }
+    let danger_pressure = stale_dribble_pressure_context(observation);
+    let release_quality = stale_dribble_release_option_quality(observation);
+    let outlet_blame = 0.58 + release_quality * 0.42;
+    (hold_pressure * (0.36 + danger_pressure * 0.64) * outlet_blame).clamp(0.0, 1.0)
+}
+
+fn stale_dribble_steal_turnover_penalty_points(transition: &SoccerLearningTransition) -> f64 {
+    if !is_dribble_action_label(normalize_soccer_action_label(&transition.action)) {
+        return 0.0;
+    }
+    let observation = &transition.observation;
+    let risk = observation
+        .stale_dribble_steal_risk
+        .max(stale_dribble_steal_risk(
+            observation,
+            ability01(observation.skill_dribbling),
+        ));
+    if risk < 0.08 {
+        return 0.0;
+    }
+    let release_quality = observation
+        .stale_dribble_release_quality
+        .max(stale_dribble_release_option_quality(observation));
+    let pressure_context = observation
+        .stale_dribble_pressure_context
+        .max(stale_dribble_pressure_context(observation));
+    let position_multiplier = match observation.teammates_ahead {
+        0 | 1 => 0.90,
+        2 => 1.05,
+        _ => 1.24,
+    };
+    STALE_DRIBBLE_STEAL_EXTRA_PENALTY_POINTS
+        * risk.clamp(0.0, 1.0)
+        * (0.72 + pressure_context.clamp(0.0, 1.0) * 0.28)
+        * (0.82 + release_quality.clamp(0.0, 1.0) * 0.34)
+        * position_multiplier
+}
+
 fn dribble_hold_score_multiplier(observation: &SoccerPomdpObservation, dribbling: f64) -> f64 {
     let hold_pressure = excessive_hold_pressure(observation, dribbling);
     if hold_pressure <= 0.0 {
@@ -53022,6 +53716,61 @@ fn goal_proximity_shot_pressure_floor(
         + observation.goal_attack_window_score.clamp(0.0, 1.0) * 0.08
         + observation.offensive_urgency.clamp(0.0, 1.0) * 0.04)
         .clamp(0.0, 0.56)
+}
+
+fn pressured_shot_release_urgency(
+    observation: &SoccerPomdpObservation,
+    role: PlayerRole,
+    shooting_skill: f64,
+) -> f64 {
+    if role == PlayerRole::Goalkeeper
+        || !observation.shot_lane_open
+        || !shot_decision_is_qualified_for_role(observation, role)
+    {
+        return 0.0;
+    }
+    let pressure_context = observation
+        .pressure_urgency
+        .max(observation.decision_urgency)
+        .max(observation.immediate_dispossession_risk)
+        .max(observation.perceived_pressure)
+        .clamp(0.0, 1.0);
+    if pressure_context < 0.32 {
+        return 0.0;
+    }
+    let block_risk = observation.shot_block_probability.clamp(0.0, 1.0);
+    let max_block_risk = CLEAN_SHOT_MAX_BLOCK_PROBABILITY
+        .max(tunables().shooting.shot_block_bailout_max_probability);
+    if block_risk > max_block_risk {
+        return 0.0;
+    }
+    let pressure_shot_window =
+        (CLEAN_SHOT_MUST_SHOOT_YARDS + 4.0).min(SPECULATIVE_LONG_SHOT_MAX_YARDS);
+    if observation.yards_to_goal > pressure_shot_window {
+        return 0.0;
+    }
+    let range_fit = ((pressure_shot_window - observation.yards_to_goal)
+        / (pressure_shot_window - TEAMMATE_MUST_SHOOT_YARDS).max(1.0))
+    .clamp(0.0, 1.0);
+    let lane_fit = (1.0 - block_risk / max_block_risk.max(1e-6)).clamp(0.0, 1.0);
+    let quality_fit = (observation.shot_on_frame_probability.clamp(0.0, 1.0) * 0.48
+        + observation.shot_beat_goalkeeper_probability.clamp(0.0, 1.0) * 0.30
+        + (observation.opponent_goal_angle_degrees / 42.0).clamp(0.0, 1.0) * 0.14
+        + lane_fit * 0.18)
+        .clamp(0.0, 1.0);
+    let role_fit = match role {
+        PlayerRole::Forward => 1.10,
+        PlayerRole::Midfielder => 0.94,
+        PlayerRole::Defender => 0.64,
+        PlayerRole::Goalkeeper => 0.0,
+    };
+    (pressure_context * 0.34
+        + range_fit * 0.24
+        + quality_fit * 0.26
+        + lane_fit * 0.12
+        + shooting_skill.clamp(0.0, 1.0) * 0.10)
+        .mul_add(role_fit, 0.0)
+        .clamp(0.0, 1.0)
 }
 
 fn clean_twenty_yard_shot_is_qualified(
@@ -55030,8 +55779,7 @@ fn backward_pass_path_traffic_for_snapshot(
     let scaled = opponent_count as f64 * priced_risk_units;
     BackwardPassPathTraffic {
         opponent_count,
-        risk: (scaled * BACKWARD_PASS_PATH_TRAFFIC_RISK_PER_OPPONENT_RISK_UNIT)
-            .clamp(0.0, 0.95),
+        risk: (scaled * BACKWARD_PASS_PATH_TRAFFIC_RISK_PER_OPPONENT_RISK_UNIT).clamp(0.0, 0.95),
         score_penalty: scaled * BACKWARD_PASS_PATH_TRAFFIC_SCORE_PENALTY_PER_OPPONENT_RISK_UNIT,
     }
 }
@@ -55602,7 +56350,9 @@ fn pass_velocity_plan_for_snapshot(
     let stride_fit_at = |speed: f64| -> f64 {
         receiver
             .map(|(target, target_position)| {
-                let target_velocity = snapshot.player_velocity(target.id).unwrap_or(target.velocity);
+                let target_velocity = snapshot
+                    .player_velocity(target.id)
+                    .unwrap_or(target.velocity);
                 pass_into_stride_fit(
                     passer_position,
                     target_position,
@@ -55693,14 +56443,12 @@ fn pass_velocity_plan_for_snapshot(
         }
         let receipt_estimate = receipt_estimate_at(speed);
         let receipt = receipt_estimate.probability;
-        let reaches_target_fit = if receiver.is_some()
-            && receipt <= 1e-9
-            && receipt_estimate.qp_accel_fit <= 1e-9
-        {
-            0.0
-        } else {
-            1.0
-        };
+        let reaches_target_fit =
+            if receiver.is_some() && receipt <= 1e-9 && receipt_estimate.qp_accel_fit <= 1e-9 {
+                0.0
+            } else {
+                1.0
+            };
         let stride_fit = stride_fit_at(speed) * reaches_target_fit;
         // Value trade-off: thread the lane (low risk) while timing the receiver's run. The
         // stride/MPC receipt terms penalize BOTH under-hit balls the runner overruns and
@@ -55711,9 +56459,8 @@ fn pass_velocity_plan_for_snapshot(
             .map(|(target, _)| ability01(target.skills.first_touch))
             .unwrap_or(0.60);
         let comfort_ceiling_mph = (17.0 + distance * 0.92 + first_touch * 8.0).clamp(18.0, 43.0);
-        let overhit_penalty =
-            ((speed_mph - comfort_ceiling_mph) / 22.0).max(0.0) * 0.20
-                + (power - 0.74).max(0.0) * 0.045;
+        let overhit_penalty = ((speed_mph - comfort_ceiling_mph) / 22.0).max(0.0) * 0.20
+            + (power - 0.74).max(0.0) * 0.045;
         let lane_fit = (1.0 - risk.clamp(0.0, 1.0) * 0.92).clamp(0.0, 1.0);
         let control_fit =
             (receipt * 0.50 + stride_fit * 0.34 + receipt_estimate.qp_accel_fit * 0.16)
@@ -56104,14 +56851,14 @@ fn pass_target_quality_for_snapshot_inner(
         let lane_gift_risk = ((lane_interception_risk - lane_risk_floor)
             / (1.0 - lane_risk_floor).max(1e-6))
         .clamp(0.0, 1.0);
-        let direct_gift_risk =
-            ((direct_opponent_control_risk - PASS_TURNOVER_SAFETY_DIRECT_RISK_FLOOR)
-                / (1.0 - PASS_TURNOVER_SAFETY_DIRECT_RISK_FLOOR).max(1e-6))
-            .clamp(0.0, 1.0);
+        let direct_gift_risk = ((direct_opponent_control_risk
+            - PASS_TURNOVER_SAFETY_DIRECT_RISK_FLOOR)
+            / (1.0 - PASS_TURNOVER_SAFETY_DIRECT_RISK_FLOOR).max(1e-6))
+        .clamp(0.0, 1.0);
         let path_gift_risk = lane_gift_risk.max(direct_gift_risk);
         let receipt_gift_risk = ((PASS_TURNOVER_SAFETY_RECEIPT_FLOOR - mpc_receipt.probability)
             / PASS_TURNOVER_SAFETY_RECEIPT_FLOOR.max(1e-6))
-            .clamp(0.0, 1.0)
+        .clamp(0.0, 1.0)
             * path_gift_risk
             * 0.72;
         let gift_risk = path_gift_risk.max(receipt_gift_risk);
@@ -56884,6 +57631,40 @@ impl DiscretizedKickCurve {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+pub enum DiscretizedKickTechnique {
+    #[default]
+    None,
+    InsideFoot,
+    OutsideFoot,
+}
+
+impl DiscretizedKickTechnique {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            DiscretizedKickTechnique::None => "none",
+            DiscretizedKickTechnique::InsideFoot => "inside-foot",
+            DiscretizedKickTechnique::OutsideFoot => "outside-foot",
+        }
+    }
+
+    pub(crate) fn curl_multiplier(self) -> f64 {
+        match self {
+            DiscretizedKickTechnique::None => 1.0,
+            DiscretizedKickTechnique::InsideFoot => 1.0,
+            DiscretizedKickTechnique::OutsideFoot => 1.28,
+        }
+    }
+
+    fn effective_for_curve(self) -> Self {
+        match self {
+            DiscretizedKickTechnique::None => DiscretizedKickTechnique::InsideFoot,
+            other => other,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum DiscretizedKickElevation {
     #[default]
     Floor,
@@ -56909,6 +57690,10 @@ impl DiscretizedKickElevation {
             | DiscretizedKickElevation::Scoop => BALL_ROLLING_ALTITUDE_YARDS + 0.04,
         }
     }
+
+    fn is_airborne(self) -> bool {
+        !matches!(self, DiscretizedKickElevation::Floor)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -56919,6 +57704,8 @@ pub struct DiscretizedKickAction {
     #[serde(default)]
     pub curve: DiscretizedKickCurve,
     #[serde(default)]
+    pub technique: DiscretizedKickTechnique,
+    #[serde(default)]
     pub elevation: DiscretizedKickElevation,
 }
 
@@ -56927,12 +57714,14 @@ impl DiscretizedKickAction {
         speed_bucket: u8,
         direction_bucket: u8,
         curve: DiscretizedKickCurve,
+        technique: DiscretizedKickTechnique,
         elevation: DiscretizedKickElevation,
     ) -> Self {
         DiscretizedKickAction {
             speed_bucket: speed_bucket.min(DISCRETIZED_KICK_SPEED_BUCKETS - 1),
             direction_bucket: direction_bucket % DISCRETIZED_KICK_DIRECTION_BUCKETS,
             curve,
+            technique,
             elevation,
         }
     }
@@ -56941,12 +57730,14 @@ impl DiscretizedKickAction {
         power: f64,
         direction: Vec2,
         curve: DiscretizedKickCurve,
+        technique: DiscretizedKickTechnique,
         elevation: DiscretizedKickElevation,
     ) -> Self {
         Self::new(
             discretized_kick_speed_bucket_for_power(power),
             discretized_kick_direction_bucket_for_vector(direction),
             curve,
+            technique,
             elevation,
         )
     }
@@ -57013,6 +57804,7 @@ pub(crate) struct KickReleaseSpec {
     intended_target: Vec2,
     speed_yps: f64,
     curve: DiscretizedKickCurve,
+    technique: DiscretizedKickTechnique,
     curve_bend_yards: f64,
     elevation: DiscretizedKickElevation,
 }
@@ -57023,6 +57815,7 @@ pub(crate) struct LoweredKickRelease {
     intended_target: Vec2,
     velocity: Vec2,
     curl_acceleration: Vec2,
+    technique: DiscretizedKickTechnique,
     altitude_yards: f64,
     speed_yps: f64,
 }
@@ -57105,6 +57898,33 @@ fn masked_discretized_kick_curve(
     }
 }
 
+fn kick_curve_flight_distance_multiplier(
+    elevation: DiscretizedKickElevation,
+    distance_yards: f64,
+) -> f64 {
+    let long_fit = ((distance_yards - 18.0) / 42.0).clamp(0.0, 1.0);
+    if elevation.is_airborne() {
+        1.0 + long_fit * 0.42
+    } else {
+        1.0 + long_fit * 0.16
+    }
+}
+
+pub(crate) fn kick_curve_bend_yards_for_technique(
+    base_bend_yards: f64,
+    technique: DiscretizedKickTechnique,
+    elevation: DiscretizedKickElevation,
+    distance_yards: f64,
+) -> f64 {
+    if !base_bend_yards.is_finite() {
+        return 0.0;
+    }
+    (base_bend_yards.abs()
+        * technique.curl_multiplier()
+        * kick_curve_flight_distance_multiplier(elevation, distance_yards))
+    .clamp(0.0, 9.5)
+}
+
 fn kick_release(spec: KickReleaseSpec) -> LoweredKickRelease {
     kick_release_with_pitch_bounds(spec, None)
 }
@@ -57135,12 +57955,18 @@ fn kick_release_with_pitch_bounds(
         0.0
     };
     let intended_dir = (intended_target - origin).normalized();
-    let bend_yards = if spec.curve_bend_yards.is_finite() {
-        spec.curve_bend_yards.abs().clamp(0.0, 8.0)
-    } else {
-        0.0
-    };
     let curve_sign = spec.curve.lateral_sign();
+    let technique = if curve_sign.abs() > 0.0 {
+        spec.technique.effective_for_curve()
+    } else {
+        DiscretizedKickTechnique::None
+    };
+    let bend_yards = kick_curve_bend_yards_for_technique(
+        spec.curve_bend_yards,
+        technique,
+        spec.elevation,
+        origin.distance(intended_target),
+    );
     let lateral = Vec2::new(-intended_dir.y, intended_dir.x);
     let launch_target = if curve_sign.abs() > 0.0 && bend_yards > 1e-9 {
         intended_target + lateral * curve_sign * bend_yards
@@ -57170,6 +57996,7 @@ fn kick_release_with_pitch_bounds(
         intended_target,
         velocity,
         curl_acceleration,
+        technique,
         altitude_yards: spec.elevation.release_altitude_yards(),
         speed_yps,
     }
@@ -57259,6 +58086,11 @@ fn lower_discretized_kick_release_bounded(
             intended_target: origin + direction * distance,
             speed_yps,
             curve,
+            technique: if curve == DiscretizedKickCurve::None {
+                DiscretizedKickTechnique::None
+            } else {
+                action.technique
+            },
             curve_bend_yards,
             elevation: action.elevation,
         },
@@ -57423,6 +58255,74 @@ fn shot_curl_probability_for_player(
         .clamp(0.02, 0.74)
 }
 
+pub(crate) fn shot_outside_foot_curve_probability_for_player(
+    skills: &SkillProfile,
+    pressure: f64,
+    yards_to_goal: f64,
+    goal_angle_degrees: f64,
+    curl_probability: f64,
+) -> f64 {
+    let shooting = ability01(skills.shooting);
+    let foot_power = ability01(
+        skills
+            .right_foot_shot_power
+            .max(skills.left_foot_shot_power),
+    );
+    let flair = ability01(skills.flair_passing);
+    let range_fit = (1.0 - (yards_to_goal - 22.0).abs() / 38.0).clamp(0.0, 1.0);
+    let narrow_angle_need = (1.0 - goal_angle_degrees / 38.0).clamp(0.0, 1.0);
+    (curl_probability.clamp(0.0, 1.0) * 0.34
+        + flair * 0.34
+        + shooting * 0.16
+        + foot_power * 0.08
+        + range_fit * 0.06
+        + narrow_angle_need * 0.09
+        - pressure.clamp(0.0, 1.0) * 0.18)
+        .clamp(0.0, 0.82)
+}
+
+pub(crate) fn shot_curve_technique_for_player(
+    skills: &SkillProfile,
+    pressure: f64,
+    yards_to_goal: f64,
+    goal_angle_degrees: f64,
+    curl_probability: f64,
+) -> DiscretizedKickTechnique {
+    if curl_probability < 0.36 {
+        return DiscretizedKickTechnique::None;
+    }
+    let outside = shot_outside_foot_curve_probability_for_player(
+        skills,
+        pressure,
+        yards_to_goal,
+        goal_angle_degrees,
+        curl_probability,
+    );
+    if outside >= 0.48 {
+        DiscretizedKickTechnique::OutsideFoot
+    } else {
+        DiscretizedKickTechnique::InsideFoot
+    }
+}
+
+pub(crate) fn shot_curve_bend_yards_for_player(
+    skills: &SkillProfile,
+    yards_to_goal: f64,
+    technique: DiscretizedKickTechnique,
+) -> f64 {
+    if technique == DiscretizedKickTechnique::None {
+        return 0.0;
+    }
+    let shooting = ability01(skills.shooting);
+    let base = (0.75 + yards_to_goal / 18.0).clamp(0.75, 3.6) * (0.78 + shooting * 0.46);
+    kick_curve_bend_yards_for_technique(
+        base,
+        technique,
+        DiscretizedKickElevation::Floor,
+        yards_to_goal,
+    )
+}
+
 fn pass_curl_probability_for_player(
     skills: &SkillProfile,
     flight: PassFlight,
@@ -57444,6 +58344,80 @@ fn pass_curl_probability_for_player(
     (0.025 + technique * 0.46 + distance_fit * 0.10 + aerial_bonus
         - pressure.clamp(0.0, 1.0) * 0.18)
         .clamp(0.01, 0.72)
+}
+
+pub(crate) fn pass_outside_foot_curve_probability_for_player(
+    skills: &SkillProfile,
+    flight: PassFlight,
+    is_cross: bool,
+    distance: f64,
+    pressure: f64,
+    curl_probability: f64,
+) -> f64 {
+    let passing = ability01(skills.passing_completion_rate);
+    let crossing = ability01(skills.crossing_left.max(skills.crossing_right));
+    let flair = ability01(skills.flair_passing);
+    let technique = if is_cross {
+        crossing * 0.40 + passing * 0.20
+    } else {
+        passing * 0.42 + ability01(skills.passing) * 0.16
+    };
+    let long_fit = ((distance - 16.0) / 42.0).clamp(0.0, 1.0);
+    let aerial_fit = if flight.is_aerial() { 0.14 } else { 0.0 };
+    let cross_fit = if is_cross { 0.07 } else { 0.0 };
+    (curl_probability.clamp(0.0, 1.0) * 0.28
+        + flair * 0.34
+        + technique
+        + long_fit * 0.13
+        + aerial_fit
+        + cross_fit
+        - pressure.clamp(0.0, 1.0) * 0.20)
+        .clamp(0.0, 0.84)
+}
+
+pub(crate) fn pass_curve_technique_for_player(
+    skills: &SkillProfile,
+    flight: PassFlight,
+    is_cross: bool,
+    distance: f64,
+    pressure: f64,
+    curl_probability: f64,
+) -> DiscretizedKickTechnique {
+    if curl_probability < 0.38 {
+        return DiscretizedKickTechnique::None;
+    }
+    let outside = pass_outside_foot_curve_probability_for_player(
+        skills,
+        flight,
+        is_cross,
+        distance,
+        pressure,
+        curl_probability,
+    );
+    if outside >= 0.52 {
+        DiscretizedKickTechnique::OutsideFoot
+    } else {
+        DiscretizedKickTechnique::InsideFoot
+    }
+}
+
+pub(crate) fn pass_curve_bend_yards_for_player(
+    skills: &SkillProfile,
+    flight: PassFlight,
+    distance: f64,
+    technique: DiscretizedKickTechnique,
+) -> f64 {
+    if technique == DiscretizedKickTechnique::None {
+        return 0.0;
+    }
+    let flair = ability01(skills.flair_passing);
+    let base = (0.55 + distance / 24.0).clamp(0.55, 2.8) * (0.72 + flair * 0.56);
+    kick_curve_bend_yards_for_technique(
+        base,
+        technique,
+        DiscretizedKickElevation::from_pass_flight(flight),
+        distance,
+    )
 }
 
 fn pass_curl_probability_for_snapshot(
@@ -57479,6 +58453,54 @@ fn pass_curl_probability_for_snapshot(
                 is_cross,
                 player_position.distance(target_position),
                 pressure,
+            ));
+        }
+    }
+    best.clamp(0.0, 1.0)
+}
+
+pub(crate) fn pass_outside_foot_curve_probability_for_snapshot(
+    snapshot: &WorldSnapshot,
+    player: &PlayerSnapshot,
+    player_position: Vec2,
+    floor_targets: &[usize],
+    aerial_targets: &[usize],
+    pressure: f64,
+) -> f64 {
+    let mut best: f64 = 0.0;
+    for (targets, flight) in [
+        (floor_targets, PassFlight::Floor),
+        (aerial_targets, PassFlight::Aerial),
+    ] {
+        for target_id in targets.iter().take(3) {
+            let Some(target) = snapshot.players.iter().find(|p| p.id == *target_id) else {
+                continue;
+            };
+            let target_position = snapshot
+                .player_position(target.id)
+                .unwrap_or(target.position);
+            let is_cross = pass_would_be_cross(
+                player_position,
+                target_position,
+                player.team,
+                snapshot.field_width,
+                snapshot.field_length,
+            );
+            let distance = player_position.distance(target_position);
+            let curl_probability = pass_curl_probability_for_player(
+                &player.skills,
+                flight,
+                is_cross,
+                distance,
+                pressure,
+            );
+            best = best.max(pass_outside_foot_curve_probability_for_player(
+                &player.skills,
+                flight,
+                is_cross,
+                distance,
+                pressure,
+                curl_probability,
             ));
         }
     }
@@ -59331,7 +60353,10 @@ impl PassRiskAppetite {
 /// [`dd_soccer_enable_role_pass_risk_appetite`] is enabled. Defenders/keeper lean SAFE; forwards
 /// lean BRAVE on the FORWARD ball, escalating in the attacking third; midfielders are roughly
 /// neutral with a small final-third nudge.
-fn pass_risk_appetite_for_passer(role: PlayerRole, passer_in_attacking_third: bool) -> PassRiskAppetite {
+fn pass_risk_appetite_for_passer(
+    role: PlayerRole,
+    passer_in_attacking_third: bool,
+) -> PassRiskAppetite {
     if !dd_soccer_enable_role_pass_risk_appetite() {
         return PassRiskAppetite::NEUTRAL;
     }
@@ -59441,7 +60466,9 @@ fn long_backward_pass_penalty(forward_yards: f64) -> f64 {
 fn dd_soccer_disable_backward_pass_pressure_release_gate() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_BACKWARD_PASS_PRESSURE_RELEASE_GATE").is_ok())
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_DISABLE_BACKWARD_PASS_PRESSURE_RELEASE_GATE").is_ok()
+    })
 }
 
 fn backward_pass_pressure_release_score(
@@ -59467,10 +60494,9 @@ fn backward_pass_pressure_release_score(
     let position = finite_pitch_point(passer_position, width, length, fallback);
     let touchline_gap = position.x.min(width - position.x);
     let byline_gap = position.y.min(length - position.y);
-    let constrained_by_boundary =
-        touchline_gap <= BACKWARD_PASS_CONSTRAINED_TOUCHLINE_MARGIN_YARDS
-            || (touchline_gap <= BACKWARD_PASS_CONSTRAINED_TOUCHLINE_MARGIN_YARDS * 1.4
-                && byline_gap <= BACKWARD_PASS_CONSTRAINED_CORNER_DEPTH_YARDS);
+    let constrained_by_boundary = touchline_gap <= BACKWARD_PASS_CONSTRAINED_TOUCHLINE_MARGIN_YARDS
+        || (touchline_gap <= BACKWARD_PASS_CONSTRAINED_TOUCHLINE_MARGIN_YARDS * 1.4
+            && byline_gap <= BACKWARD_PASS_CONSTRAINED_CORNER_DEPTH_YARDS);
     let boundary_pressure = if constrained_by_boundary
         && nearest_opponent_distance.is_finite()
         && nearest_opponent_distance <= BACKWARD_PASS_BOUNDARY_PRESSURE_OPP_RADIUS_YARDS
@@ -59482,10 +60508,7 @@ fn backward_pass_pressure_release_score(
     direct_pressure.max(boundary_pressure)
 }
 
-fn backward_pass_pressure_release_penalty(
-    forward_yards: f64,
-    pressure_release_score: f64,
-) -> f64 {
+fn backward_pass_pressure_release_penalty(forward_yards: f64, pressure_release_score: f64) -> f64 {
     if dd_soccer_disable_backward_pass_pressure_release_gate()
         || !forward_yards.is_finite()
         || forward_yards >= -BACKWARD_PASS_MIN_FORWARD_YARDS
@@ -60149,6 +61172,14 @@ fn classify_movement_gait(team: Team, to_target: Vec2, sprint: bool, chased: boo
             MovementGait::Run
         } else {
             MovementGait::BackWalk
+        }
+    } else if retreating && sprint && distance > 4.0 {
+        // Urgent retreat means turn and run. A deliberate recovery sprint back toward our own
+        // goal should not be reduced to a back-pedal just because the player is not being chased.
+        if distance > 8.0 {
+            MovementGait::Sprint
+        } else {
+            MovementGait::Run
         }
     } else if retreating {
         if distance <= 2.4 {
@@ -61591,11 +62622,13 @@ mod discretized_kick_scaffold_tests {
             0.56,
             west,
             DiscretizedKickCurve::Right,
+            DiscretizedKickTechnique::OutsideFoot,
             DiscretizedKickElevation::Floor,
         );
         assert_eq!(action.speed_bucket, 5);
         assert_eq!(action.direction_bucket, 18);
         assert_eq!(action.curve, DiscretizedKickCurve::Right);
+        assert_eq!(action.technique, DiscretizedKickTechnique::OutsideFoot);
         assert_eq!(action.direction_degrees_center(), 180.0);
     }
 
@@ -61625,6 +62658,7 @@ mod discretized_kick_scaffold_tests {
             0,
             9,
             DiscretizedKickCurve::Left,
+            DiscretizedKickTechnique::InsideFoot,
             DiscretizedKickElevation::Floor,
         );
         let release = lower_discretized_kick_release(
@@ -61639,6 +62673,7 @@ mod discretized_kick_scaffold_tests {
 
         assert_eq!(release.launch_target, release.intended_target);
         assert_eq!(release.curl_acceleration, Vec2::zero());
+        assert_eq!(release.technique, DiscretizedKickTechnique::None);
         assert_eq!(release.altitude_yards, 0.0);
     }
 
@@ -61648,6 +62683,7 @@ mod discretized_kick_scaffold_tests {
             9,
             9,
             DiscretizedKickCurve::Left,
+            DiscretizedKickTechnique::InsideFoot,
             DiscretizedKickElevation::Aerial,
         );
         let origin = Vec2::new(50.0, 40.0);
@@ -61662,10 +62698,50 @@ mod discretized_kick_scaffold_tests {
         );
 
         assert!(release.altitude_yards > BALL_ROLLING_ALTITUDE_YARDS);
+        assert_eq!(release.technique, DiscretizedKickTechnique::InsideFoot);
         assert!(release.curl_acceleration.len() > 0.0);
         assert!(release.launch_target.x < release.intended_target.x);
         assert_close(release.launch_target.y, origin.y + 30.0, 1e-9);
         assert_close(release.velocity.len(), release.speed_yps, 1e-9);
+    }
+
+    #[test]
+    fn outside_foot_long_aerial_kick_gets_more_magnus_bend_than_inside_floor() {
+        let origin = Vec2::new(50.0, 40.0);
+        let inside_floor = kick_release(KickReleaseSpec {
+            origin,
+            intended_target: Vec2::new(50.0, 72.0),
+            speed_yps: mph_to_yps(36.0),
+            curve: DiscretizedKickCurve::Left,
+            technique: DiscretizedKickTechnique::InsideFoot,
+            curve_bend_yards: 2.0,
+            elevation: DiscretizedKickElevation::Floor,
+        });
+        let outside_aerial = kick_release(KickReleaseSpec {
+            origin,
+            intended_target: Vec2::new(50.0, 72.0),
+            speed_yps: mph_to_yps(36.0),
+            curve: DiscretizedKickCurve::Left,
+            technique: DiscretizedKickTechnique::OutsideFoot,
+            curve_bend_yards: 2.0,
+            elevation: DiscretizedKickElevation::Aerial,
+        });
+
+        assert_eq!(inside_floor.technique, DiscretizedKickTechnique::InsideFoot);
+        assert_eq!(
+            outside_aerial.technique,
+            DiscretizedKickTechnique::OutsideFoot
+        );
+        assert!(outside_aerial.altitude_yards > BALL_ROLLING_ALTITUDE_YARDS);
+        assert!(
+            outside_aerial.launch_target.distance(outside_aerial.intended_target)
+                > inside_floor.launch_target.distance(inside_floor.intended_target) * 1.25,
+            "outside/aerial bend should exceed inside/floor bend"
+        );
+        assert!(
+            outside_aerial.curl_acceleration.len() > inside_floor.curl_acceleration.len(),
+            "outside/aerial curl acceleration should be stronger"
+        );
     }
 
     #[test]
@@ -61692,6 +62768,7 @@ mod discretized_kick_scaffold_tests {
                 discretized_kick_power_for_speed(speed, min_yps, max_yps),
                 dir,
                 DiscretizedKickCurve::None,
+                DiscretizedKickTechnique::None,
                 DiscretizedKickElevation::Floor,
             );
             let release = discretized_kick_release_clamped_to_pitch(
@@ -61729,6 +62806,7 @@ mod discretized_kick_scaffold_tests {
             intended_target: Vec2::new(10.0, 0.0),
             speed_yps: 5.0,
             curve: DiscretizedKickCurve::None,
+            technique: DiscretizedKickTechnique::None,
             curve_bend_yards: 3.0,
             elevation: DiscretizedKickElevation::from_pass_flight(PassFlight::Scoop),
         });
@@ -61748,6 +62826,7 @@ mod discretized_kick_scaffold_tests {
                 intended_target: Vec2::new(1.0, 30.0),
                 speed_yps: mph_to_yps(35.0),
                 curve: DiscretizedKickCurve::Left,
+                technique: DiscretizedKickTechnique::InsideFoot,
                 curve_bend_yards: 4.0,
                 elevation: DiscretizedKickElevation::Floor,
             },
