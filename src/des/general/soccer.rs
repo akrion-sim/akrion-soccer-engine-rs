@@ -57647,9 +57647,13 @@ fn aerial_interception_multiplier(pass: &PendingPass, ball_position: Vec2) -> f6
 const GRAVITY_YPS2: f64 = 9.81 / METERS_PER_YARD;
 
 fn scoop_loft_apex_yards(distance_yards: f64, unit: f64) -> f64 {
+    let (apex_min, apex_max) = if scoop_higher_apex_enabled() {
+        (SCOOP_LOFT_APEX_HIGH_MIN_YARDS, SCOOP_LOFT_APEX_HIGH_MAX_YARDS)
+    } else {
+        (SCOOP_LOFT_APEX_MIN_YARDS, SCOOP_LOFT_APEX_MAX_YARDS)
+    };
     let distance_fit = ((distance_yards.max(0.0) - 4.0) / 10.0).clamp(0.0, 1.0);
-    (SCOOP_LOFT_APEX_MIN_YARDS + distance_fit * 0.84 + unit.clamp(0.0, 1.0) * 0.82)
-        .clamp(SCOOP_LOFT_APEX_MIN_YARDS, SCOOP_LOFT_APEX_MAX_YARDS)
+    (apex_min + distance_fit * 0.84 + unit.clamp(0.0, 1.0) * 0.82).clamp(apex_min, apex_max)
 }
 
 /// Apex (peak height, yards) of a lofted NON-scoop pass as a function of its horizontal distance.
