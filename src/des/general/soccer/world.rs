@@ -41147,10 +41147,24 @@ impl WorldSnapshot {
         };
         let center_seed = raw_center * 0.55 + lp_center * 0.45;
         let defensive_shape = &tunables().defensive_shape;
-        let desired_width = defensive_shape
-            .back_four_block_width_yards
-            .min(defensive_shape.back_four_horizontal_max_gap_yards * (n - 1.0))
-            .max(defensive_shape.back_four_horizontal_min_gap_yards * (n - 1.0));
+        let adaptive_width = back_four_adaptive_width_enabled();
+        let desired_width = if adaptive_width {
+            // STATE-ADAPTIVE width: span to cover the opponent's foremost-attacker lateral spread
+            // (+ shoulder), so the four widen against a stretched attack and tuck against a central
+            // one — never the flat 22yd block that left the flanks open. Keep only the min-gap floor
+            // (defenders never on top of each other); the legacy narrow max-gap ceiling does NOT
+            // apply (we WANT gaps wider than 8yd). The helper carries its own floor/cap.
+            back_four_adaptive_width_yards(
+                self.back_four_foremost_attackers_x_span(me.team),
+                self.field_width,
+            )
+            .max(defensive_shape.back_four_horizontal_min_gap_yards * (n - 1.0))
+        } else {
+            defensive_shape
+                .back_four_block_width_yards
+                .min(defensive_shape.back_four_horizontal_max_gap_yards * (n - 1.0))
+                .max(defensive_shape.back_four_horizontal_min_gap_yards * (n - 1.0))
+        };
         let half = desired_width * 0.5;
         let center = center_seed.clamp(half, self.field_width - half);
         let slot_step = desired_width / (n - 1.0).max(1.0);
