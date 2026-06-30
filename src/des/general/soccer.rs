@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{BufWriter, ErrorKind, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
@@ -4133,8 +4133,16 @@ const SOCCER_NEURAL_PRE_CURVE_TECHNIQUE_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_DEFENSIVE_GOAL_SIDE_FEATURE_DIM
         + SOCCER_NEURAL_DEFENSIVE_GOAL_SIDE_FEATURE_DIM;
 const SOCCER_NEURAL_CURVE_TECHNIQUE_FEATURE_DIM: usize = 2;
-const SOCCER_NEURAL_FEATURE_DIM: usize = SOCCER_NEURAL_PRE_CURVE_TECHNIQUE_FEATURE_DIM
-    + SOCCER_NEURAL_CURVE_TECHNIQUE_FEATURE_DIM;
+const SOCCER_NEURAL_PRE_OFFSIDE_RECOVERY_FEATURE_DIM: usize =
+    SOCCER_NEURAL_PRE_CURVE_TECHNIQUE_FEATURE_DIM + SOCCER_NEURAL_CURVE_TECHNIQUE_FEATURE_DIM;
+const SOCCER_NEURAL_OFFSIDE_RECOVERY_FEATURE_DIM: usize = 5;
+const SOCCER_NEURAL_PRE_CURVE_ACTION_FEATURE_DIM: usize =
+    SOCCER_NEURAL_PRE_OFFSIDE_RECOVERY_FEATURE_DIM + SOCCER_NEURAL_OFFSIDE_RECOVERY_FEATURE_DIM;
+/// Append-only curve execution block: the actual MPC-selected bend/spin/technique
+/// for this coarse action, so value/world models can learn when curl pays.
+const SOCCER_NEURAL_CURVE_ACTION_FEATURE_DIM: usize = 5;
+const SOCCER_NEURAL_FEATURE_DIM: usize =
+    SOCCER_NEURAL_PRE_CURVE_ACTION_FEATURE_DIM + SOCCER_NEURAL_CURVE_ACTION_FEATURE_DIM;
 /// Fixed dimensionality of a persisted **moment embedding** (the vector stored
 /// in pgvector for similarity retrieval). Deliberately decoupled from — and
 /// larger than — `SOCCER_NEURAL_FEATURE_DIM`, which grows as features are added:
@@ -4604,6 +4612,25 @@ const SOCCER_NEURAL_FEATURE_PASS_OUTSIDE_FOOT_CURVE: usize =
     SOCCER_NEURAL_PRE_CURVE_TECHNIQUE_FEATURE_DIM;
 const SOCCER_NEURAL_FEATURE_SHOT_OUTSIDE_FOOT_CURVE: usize =
     SOCCER_NEURAL_FEATURE_PASS_OUTSIDE_FOOT_CURVE + 1;
+const SOCCER_NEURAL_FEATURE_OFFSIDE_POSITION: usize =
+    SOCCER_NEURAL_PRE_OFFSIDE_RECOVERY_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_OFFSIDE_YARDS_BEYOND_LINE: usize =
+    SOCCER_NEURAL_FEATURE_OFFSIDE_POSITION + 1;
+const SOCCER_NEURAL_FEATURE_OFFSIDE_CLOCK: usize =
+    SOCCER_NEURAL_FEATURE_OFFSIDE_YARDS_BEYOND_LINE + 1;
+const SOCCER_NEURAL_FEATURE_OFFSIDE_RECOVERY_PRESSURE: usize =
+    SOCCER_NEURAL_FEATURE_OFFSIDE_CLOCK + 1;
+const SOCCER_NEURAL_FEATURE_OFFSIDE_RECOVERY_TARGET_DISTANCE: usize =
+    SOCCER_NEURAL_FEATURE_OFFSIDE_RECOVERY_PRESSURE + 1;
+const SOCCER_NEURAL_FEATURE_ACTION_CURVE_BEND: usize = SOCCER_NEURAL_PRE_CURVE_ACTION_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_ACTION_CURVE_SPIN: usize =
+    SOCCER_NEURAL_FEATURE_ACTION_CURVE_BEND + 1;
+const SOCCER_NEURAL_FEATURE_ACTION_CURVE_INSIDE_FOOT: usize =
+    SOCCER_NEURAL_FEATURE_ACTION_CURVE_SPIN + 1;
+const SOCCER_NEURAL_FEATURE_ACTION_CURVE_OUTSIDE_FOOT: usize =
+    SOCCER_NEURAL_FEATURE_ACTION_CURVE_INSIDE_FOOT + 1;
+const SOCCER_NEURAL_FEATURE_ACTION_CURVE_DIRECTION: usize =
+    SOCCER_NEURAL_FEATURE_ACTION_CURVE_OUTSIDE_FOOT + 1;
 const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     61,
     62,
@@ -4742,6 +4769,10 @@ const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     SOCCER_NEURAL_PRE_DEFENSIVE_GOAL_SIDE_FEATURE_DIM,
     // Same schema with defensive goal-side line channels, before curve-technique channels.
     SOCCER_NEURAL_PRE_CURVE_TECHNIQUE_FEATURE_DIM,
+    // Same schema with curve-technique channels, before offside-recovery channels.
+    SOCCER_NEURAL_PRE_OFFSIDE_RECOVERY_FEATURE_DIM,
+    // Same schema with offside-recovery channels, before curve-action execution channels.
+    SOCCER_NEURAL_PRE_CURVE_ACTION_FEATURE_DIM,
 ];
 const TEAM_SHAPE_NEAR_BALL_RADIUS_YARDS: f64 = 18.0;
 // Tight same-team congestion rings reported in the brain trace so a human can see
@@ -6783,6 +6814,16 @@ pub struct SoccerPomdpObservation {
     #[serde(default)]
     pub pass_outside_foot_curve_probability: f64,
     #[serde(default)]
+    pub offside_position: bool,
+    #[serde(default)]
+    pub offside_yards_beyond_line: f64,
+    #[serde(default)]
+    pub offside_clock_seconds: f64,
+    #[serde(default)]
+    pub offside_recovery_pressure: f64,
+    #[serde(default)]
+    pub offside_recovery_target_distance_yards: f64,
+    #[serde(default)]
     pub immediate_dispossession_risk: f64,
     pub yards_to_goal: f64,
     #[serde(default)]
@@ -7322,6 +7363,19 @@ pub struct SoccerDecisionContext {
     pub target_angle_degrees: f64,
     #[serde(default)]
     pub action_ball_speed_yps: f64,
+    /// MPC-selected curve execution for this coarse pass/shot action. Availability
+    /// lives in the POMDP observation; these fields say what was actually chosen.
+    #[serde(default)]
+    pub action_curve_bend_yards: f64,
+    #[serde(default)]
+    pub action_curve_spin_rps: f64,
+    #[serde(default)]
+    pub action_curve_inside_foot: bool,
+    #[serde(default)]
+    pub action_curve_outside_foot: bool,
+    /// Signed curve side from the shooter's point of view: left = +1, right = -1.
+    #[serde(default)]
+    pub action_curve_direction: f64,
     /// Chosen pass target's decision-time completion estimate. Zero for non-pass
     /// actions or passes without a resolved receiver. With the learnable-velocity layer
     /// ON this is the completion at the speed the value trade-off picked (a contested lane
@@ -9198,6 +9252,16 @@ pub struct SoccerQStateKey {
     #[serde(default)]
     pub pass_outside_foot_curve_probability_bin: u8,
     #[serde(default)]
+    pub offside_position_bin: u8,
+    #[serde(default)]
+    pub offside_yards_beyond_line_bin: u8,
+    #[serde(default)]
+    pub offside_clock_seconds_bin: u8,
+    #[serde(default)]
+    pub offside_recovery_pressure_bin: u8,
+    #[serde(default)]
+    pub offside_recovery_target_distance_bin: u8,
+    #[serde(default)]
     pub immediate_dispossession_risk_bin: u8,
     pub visible_pass_options_bin: u8,
     #[serde(default)]
@@ -9900,6 +9964,23 @@ impl SoccerQStateKey {
             pass_outside_foot_curve_probability_bin: distance_bucket(
                 observation.pass_outside_foot_curve_probability,
                 &[0.12, 0.28, 0.46, 0.64],
+            ),
+            offside_position_bin: u8::from(observation.offside_position),
+            offside_yards_beyond_line_bin: distance_bucket(
+                observation.offside_yards_beyond_line,
+                &[0.5, 2.0, 5.0, 8.0],
+            ),
+            offside_clock_seconds_bin: distance_bucket(
+                observation.offside_clock_seconds,
+                &[0.5, 1.5, 3.0, 5.0],
+            ),
+            offside_recovery_pressure_bin: distance_bucket(
+                observation.offside_recovery_pressure,
+                &[0.10, 0.35, 0.65, 0.85],
+            ),
+            offside_recovery_target_distance_bin: distance_bucket(
+                observation.offside_recovery_target_distance_yards,
+                &[1.0, 3.0, 6.0, 10.0],
             ),
             immediate_dispossession_risk_bin: distance_bucket(
                 observation.immediate_dispossession_risk,
@@ -10613,6 +10694,12 @@ impl SoccerQStateKey {
                 == other.shot_outside_foot_curve_probability_bin
             && self.pass_outside_foot_curve_probability_bin
                 == other.pass_outside_foot_curve_probability_bin
+            && self.offside_position_bin == other.offside_position_bin
+            && self.offside_yards_beyond_line_bin == other.offside_yards_beyond_line_bin
+            && self.offside_clock_seconds_bin == other.offside_clock_seconds_bin
+            && self.offside_recovery_pressure_bin == other.offside_recovery_pressure_bin
+            && self.offside_recovery_target_distance_bin
+                == other.offside_recovery_target_distance_bin
             && self.immediate_dispossession_risk_bin == other.immediate_dispossession_risk_bin
             && self.visible_pass_options_bin == other.visible_pass_options_bin
             && self.visible_aerial_pass_options_bin == other.visible_aerial_pass_options_bin
@@ -10817,6 +10904,8 @@ impl SoccerQStateKey {
             && self.threaded_goal_pass_over_top_available
                 == other.threaded_goal_pass_over_top_available
             && self.slip_break_offside_trap_available == other.slip_break_offside_trap_available
+            && self.offside_position_bin == other.offside_position_bin
+            && self.offside_recovery_pressure_bin == other.offside_recovery_pressure_bin
             && self.first_touch_kind == other.first_touch_kind
             && self.receiving_pending_pass == other.receiving_pending_pass
             && facing_bucket_matches(self.receive_facing, other.receive_facing)
@@ -10835,13 +10924,17 @@ pub struct SoccerQActionKey {
 // the Q-key there is no multi-resolution spatial backoff left; lookups try the
 // exact context (the full state key, via `action_exact_index`) and then this one
 // relaxed bucket — role/possession/ball-availability/facing only — so a sample
-// can still generalize across the ~120 remaining noisy fields.
+// can still generalize across the ~120 remaining noisy fields. Offside-recovery context stays in
+// this relaxed key so sparse data cannot smear stranded-offside decisions into normal attacking
+// runs.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct SoccerQRelaxedIndexKey {
     role: PlayerRole,
     possession_relative: i8,
     has_ball: bool,
     visible_ball: bool,
+    offside_position_bin: u8,
+    offside_recovery_pressure_bin: u8,
     first_touch_kind: IncomingBallKind,
     receiving_pending_pass: bool,
     receive_facing: FacingBucket,
@@ -11211,6 +11304,8 @@ impl SoccerQPolicy {
             possession_relative: state.possession_relative,
             has_ball: state.has_ball,
             visible_ball: state.visible_ball,
+            offside_position_bin: state.offside_position_bin,
+            offside_recovery_pressure_bin: state.offside_recovery_pressure_bin,
             first_touch_kind: state.first_touch_kind,
             receiving_pending_pass: state.receiving_pending_pass,
             receive_facing: state.receive_facing,
@@ -19083,6 +19178,18 @@ pub(crate) fn back_four_push_into_dead_space_enabled() -> bool {
     }
 }
 
+pub(crate) fn back_four_dead_space_adjusted_gap_yards(
+    base_gap: f64,
+    min_gap: f64,
+    space_occupied: bool,
+) -> f64 {
+    if space_occupied || !base_gap.is_finite() || !min_gap.is_finite() {
+        return base_gap;
+    }
+    let compression = BACK_FOUR_DEAD_SPACE_PUSH_FRACTION.clamp(0.0, 1.0);
+    min_gap + (base_gap - min_gap) * (1.0 - compression)
+}
+
 /// Whether the **release-long-inside-own-half** MARL/MAPPO strategy is active this process: when a
 /// teammate has broken beyond the opponent's last outfield defender but is ONSIDE in our own half
 /// (you cannot be offside in your own half), prefer + reward a long ball that springs them. Trains
@@ -21857,6 +21964,11 @@ fn soccer_decision_context_for(
         realized_player_forward_yards: finite_metric(realized_player_forward_yards),
         target_angle_degrees,
         action_ball_speed_yps,
+        action_curve_bend_yards: 0.0,
+        action_curve_spin_rps: 0.0,
+        action_curve_inside_foot: false,
+        action_curve_outside_foot: false,
+        action_curve_direction: 0.0,
         pass_target_expected_completion,
         pass_lane_interception_risk,
         pass_min_clearing_speed_yps,
@@ -21956,6 +22068,25 @@ fn soccer_decision_context_with_trace(
         context.chosen_action_control_cost = context
             .chosen_action_control_cost
             .max(comparison_cost.clamp(0.0, 1.0));
+        let curve_direction = match comparison.mpc_recommended_curve.trim() {
+            "left" => 1.0,
+            "right" => -1.0,
+            _ => 0.0,
+        };
+        let curve_bend_yards = finite_metric(comparison.mpc_recommended_curve_bend_yards).abs();
+        let curve_spin_rps = finite_metric(comparison.mpc_recommended_spin_rps).abs();
+        let curve_selected =
+            curve_direction != 0.0 || curve_bend_yards > 1e-6 || curve_spin_rps > 1e-6;
+        if curve_selected {
+            context.action_curve_bend_yards = curve_bend_yards;
+            context.action_curve_spin_rps = curve_spin_rps;
+            context.action_curve_direction = curve_direction;
+            match comparison.mpc_recommended_curve_technique.trim() {
+                "inside-foot" => context.action_curve_inside_foot = true,
+                "outside-foot" => context.action_curve_outside_foot = true,
+                _ => {}
+            }
+        }
     }
     context
 }
@@ -40647,6 +40778,25 @@ fn soccer_neural_transition_features_with_action(
         soccer_neural_unit(obs.pass_outside_foot_curve_probability);
     features[SOCCER_NEURAL_FEATURE_SHOT_OUTSIDE_FOOT_CURVE] =
         soccer_neural_unit(obs.shot_outside_foot_curve_probability);
+    features[SOCCER_NEURAL_FEATURE_OFFSIDE_POSITION] = soccer_neural_bool(obs.offside_position);
+    features[SOCCER_NEURAL_FEATURE_OFFSIDE_YARDS_BEYOND_LINE] =
+        soccer_neural_scaled(obs.offside_yards_beyond_line, 12.0);
+    features[SOCCER_NEURAL_FEATURE_OFFSIDE_CLOCK] =
+        soccer_neural_scaled(obs.offside_clock_seconds, 6.0);
+    features[SOCCER_NEURAL_FEATURE_OFFSIDE_RECOVERY_PRESSURE] =
+        soccer_neural_unit(obs.offside_recovery_pressure);
+    features[SOCCER_NEURAL_FEATURE_OFFSIDE_RECOVERY_TARGET_DISTANCE] =
+        soccer_neural_scaled(obs.offside_recovery_target_distance_yards, 12.0);
+    features[SOCCER_NEURAL_FEATURE_ACTION_CURVE_BEND] =
+        soccer_neural_scaled(context.action_curve_bend_yards, 8.0);
+    features[SOCCER_NEURAL_FEATURE_ACTION_CURVE_SPIN] =
+        soccer_neural_scaled(context.action_curve_spin_rps, 10.0);
+    features[SOCCER_NEURAL_FEATURE_ACTION_CURVE_INSIDE_FOOT] =
+        soccer_neural_bool(context.action_curve_inside_foot);
+    features[SOCCER_NEURAL_FEATURE_ACTION_CURVE_OUTSIDE_FOOT] =
+        soccer_neural_bool(context.action_curve_outside_foot);
+    features[SOCCER_NEURAL_FEATURE_ACTION_CURVE_DIRECTION] =
+        context.action_curve_direction.clamp(-1.0, 1.0);
     debug_assert_eq!(features.len(), SOCCER_NEURAL_FEATURE_DIM);
     features
 }
@@ -42902,6 +43052,46 @@ fn nearest_tracking_opponent_distance(
         .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
 }
 
+fn live_http_url_host(host: &str) -> String {
+    let host = host.trim();
+    if host.is_empty() {
+        "127.0.0.1".to_string()
+    } else if host.starts_with('[') && host.ends_with(']') {
+        host.to_string()
+    } else if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
+}
+
+fn live_http_url_for_host_port(host: &str, port: u16) -> String {
+    format!("http://{}:{port}/", live_http_url_host(host))
+}
+
+fn live_http_url_host_for_unspecified_bind(host_hint: &str, loopback: &str) -> String {
+    let host = host_hint.trim();
+    if host.is_empty() || matches!(host, "0.0.0.0" | "::" | "[::]") {
+        loopback.to_string()
+    } else {
+        live_http_url_host(host)
+    }
+}
+
+fn live_http_url_for_bound_addr(host_hint: &str, addr: SocketAddr) -> String {
+    let host = match addr.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => {
+            live_http_url_host_for_unspecified_bind(host_hint, "127.0.0.1")
+        }
+        IpAddr::V6(ip) if ip.is_unspecified() => {
+            live_http_url_host_for_unspecified_bind(host_hint, "[::1]")
+        }
+        IpAddr::V4(ip) => ip.to_string(),
+        IpAddr::V6(ip) => format!("[{ip}]"),
+    };
+    format!("http://{host}:{}/", addr.port())
+}
+
 pub struct SoccerLiveServer {
     config: SoccerLiveServerConfig,
     session: Arc<Mutex<SoccerRealtimeSession>>,
@@ -43371,17 +43561,16 @@ impl SoccerLiveServer {
     }
 
     pub fn local_url(&self) -> String {
-        self.local_url_for_port(self.config.port)
+        live_http_url_for_host_port(&self.config.host, self.config.port)
     }
 
-    fn local_url_for_port(&self, port: u16) -> String {
-        format!("http://{}:{port}/", self.config.host)
+    fn local_url_for_bound_addr(&self, addr: SocketAddr) -> String {
+        live_http_url_for_bound_addr(&self.config.host, addr)
     }
 
     pub fn run(self) -> std::io::Result<()> {
         let listener = TcpListener::bind((self.config.host.as_str(), self.config.port))?;
-        let bound_port = listener.local_addr()?.port();
-        println!("# Live soccer UI: {}", self.local_url_for_port(bound_port));
+        println!("# Live soccer UI: {}", self.local_url_for_bound_addr(listener.local_addr()?));
         // Keep the live policy in lock-step with the cluster learner: a background thread polls
         // Postgres and hot-swaps the policy whenever a newer ACTIVE version is published. The
         // policy is queried per-decision, so swapping it between ticks is safe.
@@ -50486,6 +50675,7 @@ fn tracking_frame_to_world_snapshot(
         pending_rebound: None,
         active_set_play: None,
         players,
+        offside_clocks: HashMap::new(),
         shared_positions,
         agent_schedule: Vec::new(),
         schedule_index_lookup: AgentScheduleIndexLookup::default(),

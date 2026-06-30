@@ -3105,6 +3105,81 @@ fn material_offside_recovery_starts_before_full_grace_and_turns_to_run() {
 }
 
 #[test]
+fn offside_recovery_state_reaches_pomdp_q_state_and_neural_features() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 81,
+        ..Default::default()
+    });
+    let holder = 5;
+    let runner = 9;
+    park_players_except(&mut sim, &[holder, runner]);
+    sim.players[holder].team = Team::Home;
+    sim.players[holder].role = PlayerRole::Midfielder;
+    sim.players[holder].position = Vec2::new(35.0, 70.0);
+    sim.players[runner].team = Team::Home;
+    sim.players[runner].role = PlayerRole::Forward;
+    sim.players[runner].position = Vec2::new(40.0, 89.0);
+    for away in 11..22 {
+        sim.players[away].team = Team::Away;
+        sim.players[away].position = Vec2::new(40.0, 45.0);
+    }
+    sim.players[11].position = Vec2::new(40.0, 118.0);
+    sim.players[12].position = Vec2::new(40.0, 82.0);
+    sim.ball.holder = Some(holder);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.acceleration = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+    let offside_clock_seconds = OFFSIDE_GRACE_SECONDS.max(5.2);
+    sim.offside_clocks.insert(runner, offside_clock_seconds);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let observation = snapshot.observation_for(runner);
+    assert!(observation.offside_position);
+    assert!(
+        observation.offside_yards_beyond_line > 6.0,
+        "POMDP should expose yards beyond the active offside line: {}",
+        observation.offside_yards_beyond_line
+    );
+    assert!(
+        observation.offside_clock_seconds >= offside_clock_seconds,
+        "POMDP should expose the live offside clock: {}",
+        observation.offside_clock_seconds
+    );
+    assert!(
+        observation.offside_recovery_pressure > 0.25,
+        "POMDP should expose recovery pressure: {}",
+        observation.offside_recovery_pressure
+    );
+    assert!(
+        observation.offside_recovery_target_distance_yards > 6.0,
+        "POMDP should expose distance back to an onside target: {}",
+        observation.offside_recovery_target_distance_yards
+    );
+
+    let q_key = SoccerQStateKey::from_parts(
+        &snapshot.mdp_state_for_player(runner),
+        &observation,
+        Team::Home,
+        sim.players[runner].role,
+    );
+    assert_eq!(q_key.offside_position_bin, 1);
+    assert!(q_key.offside_yards_beyond_line_bin > 0);
+    assert!(q_key.offside_clock_seconds_bin > 0);
+    assert!(q_key.offside_recovery_pressure_bin > 0);
+    assert!(q_key.offside_recovery_target_distance_bin > 0);
+
+    let transition = test_learning_transition(&sim, sim.tick, runner, Team::Home, "hold-shape");
+    let features = soccer_neural_transition_features(&transition);
+    assert_eq!(features[SOCCER_NEURAL_FEATURE_OFFSIDE_POSITION], 1.0);
+    assert!(features[SOCCER_NEURAL_FEATURE_OFFSIDE_YARDS_BEYOND_LINE] > 0.45);
+    assert!(features[SOCCER_NEURAL_FEATURE_OFFSIDE_CLOCK] > 0.80);
+    assert!(features[SOCCER_NEURAL_FEATURE_OFFSIDE_RECOVERY_PRESSURE] > 0.25);
+    assert!(features[SOCCER_NEURAL_FEATURE_OFFSIDE_RECOVERY_TARGET_DISTANCE] > 0.45);
+}
+
+#[test]
 fn offside_clocks_tick_in_live_mode_when_learning_is_disabled() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.2,
@@ -15494,8 +15569,11 @@ fn pomdp_q_state_and_player_decision_use_front_behind_field_context() {
         SOCCER_NEURAL_PRE_FORWARD_OPTION_FEATURE_DIM
     );
     assert_eq!(
-        SOCCER_NEURAL_PRE_CURVE_TECHNIQUE_FEATURE_DIM
-            + SOCCER_NEURAL_CURVE_TECHNIQUE_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_CURVE_ACTION_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_OFFSIDE_RECOVERY_FEATURE_DIM + SOCCER_NEURAL_OFFSIDE_RECOVERY_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_PRE_CURVE_ACTION_FEATURE_DIM + SOCCER_NEURAL_CURVE_ACTION_FEATURE_DIM,
         SOCCER_NEURAL_FEATURE_DIM
     );
 
@@ -20717,6 +20795,42 @@ fn back_four_v2_centre_presses_up_when_foremost_four_attackers_are_too_far() {
     assert!(
         stretched_centre > connected_centre + 3.0,
         "a loose/dispossession line should press up to close an excessive attacker gap: connected={connected_centre} stretched={stretched_centre}"
+    );
+}
+
+#[test]
+fn back_four_dead_space_push_preserves_possession_gap_floor() {
+    let base_gap = 30.0;
+    let occupied_gap = back_four_dead_space_adjusted_gap_yards(
+        base_gap,
+        BACK_FOUR_LINE_POSSESSION_GAP_MIN_YARDS,
+        true,
+    );
+    assert_eq!(
+        occupied_gap, base_gap,
+        "an occupied runner band should keep the learned/base trailing gap"
+    );
+
+    let possession_gap = back_four_dead_space_adjusted_gap_yards(
+        base_gap,
+        BACK_FOUR_LINE_POSSESSION_GAP_MIN_YARDS,
+        false,
+    );
+    let defensive_gap = back_four_dead_space_adjusted_gap_yards(
+        base_gap,
+        BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS,
+        false,
+    );
+    let expected_possession_gap = BACK_FOUR_LINE_POSSESSION_GAP_MIN_YARDS
+        + (base_gap - BACK_FOUR_LINE_POSSESSION_GAP_MIN_YARDS)
+            * (1.0 - BACK_FOUR_DEAD_SPACE_PUSH_FRACTION);
+    assert!(
+        (possession_gap - expected_possession_gap).abs() < 1e-9,
+        "dead-space push must compress toward the possession min gap, not the defensive min: {possession_gap}"
+    );
+    assert!(
+        possession_gap < defensive_gap,
+        "in possession, the back four may squeeze higher than the out-of-possession defensive gap floor: possession={possession_gap} defensive={defensive_gap}"
     );
 }
 
@@ -51984,8 +52098,7 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
     );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_DIM,
-        SOCCER_NEURAL_PRE_CURVE_TECHNIQUE_FEATURE_DIM
-            + SOCCER_NEURAL_CURVE_TECHNIQUE_FEATURE_DIM
+        SOCCER_NEURAL_PRE_CURVE_ACTION_FEATURE_DIM + SOCCER_NEURAL_CURVE_ACTION_FEATURE_DIM
     );
     assert_eq!(SOCCER_NEURAL_TEAM_CENTER_FEATURE_DIM, 18);
     assert_eq!(SOCCER_NEURAL_RELATIONAL_ATTENTION_FEATURE_DIM, 8);
@@ -52175,8 +52288,11 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
         SOCCER_NEURAL_PRE_FORWARD_OPTION_FEATURE_DIM
     );
     assert_eq!(
-        SOCCER_NEURAL_PRE_CURVE_TECHNIQUE_FEATURE_DIM
-            + SOCCER_NEURAL_CURVE_TECHNIQUE_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_CURVE_ACTION_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_OFFSIDE_RECOVERY_FEATURE_DIM + SOCCER_NEURAL_OFFSIDE_RECOVERY_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_PRE_CURVE_ACTION_FEATURE_DIM + SOCCER_NEURAL_CURVE_ACTION_FEATURE_DIM,
         SOCCER_NEURAL_FEATURE_DIM
     );
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&170));
@@ -52229,6 +52345,9 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
     );
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS
         .contains(&SOCCER_NEURAL_PRE_DEFENSIVE_GOAL_SIDE_FEATURE_DIM));
+    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS
+        .contains(&SOCCER_NEURAL_PRE_OFFSIDE_RECOVERY_FEATURE_DIM));
+    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_CURVE_ACTION_FEATURE_DIM));
 
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let (a, b) = (2usize, 3usize);
@@ -61427,6 +61546,74 @@ fn outside_foot_curve_availability_reaches_learning_surfaces() {
     assert!(
         features[SOCCER_NEURAL_FEATURE_SHOT_OUTSIDE_FOOT_CURVE] > 0.35,
         "neural learner should see outside-foot shot curl availability"
+    );
+}
+
+#[test]
+fn curve_action_execution_features_distinguish_inside_and_outside_foot() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 305,
+        ..Default::default()
+    });
+    let passer = 7usize;
+    sim.players[passer].role = PlayerRole::Midfielder;
+    sim.ball.holder = Some(passer);
+    sim.ball.position = sim.players[passer].position;
+
+    let mut inside = test_learning_transition(&sim, sim.tick, passer, Team::Home, "pass");
+    inside.decision_context.action_curve_bend_yards = 2.4;
+    inside.decision_context.action_curve_spin_rps = 4.0;
+    inside.decision_context.action_curve_inside_foot = true;
+    inside.decision_context.action_curve_direction = 1.0;
+
+    let mut outside = inside.clone();
+    outside.decision_context.action_curve_bend_yards = 3.6;
+    outside.decision_context.action_curve_spin_rps = 5.2;
+    outside.decision_context.action_curve_inside_foot = false;
+    outside.decision_context.action_curve_outside_foot = true;
+    outside.decision_context.action_curve_direction = -1.0;
+
+    let inside_features = soccer_neural_transition_features(&inside);
+    let outside_features = soccer_neural_transition_features(&outside);
+
+    assert_eq!(
+        inside_features[SOCCER_NEURAL_FEATURE_ACTION_CURVE_INSIDE_FOOT],
+        1.0
+    );
+    assert_eq!(
+        inside_features[SOCCER_NEURAL_FEATURE_ACTION_CURVE_OUTSIDE_FOOT],
+        0.0
+    );
+    assert_eq!(
+        outside_features[SOCCER_NEURAL_FEATURE_ACTION_CURVE_INSIDE_FOOT],
+        0.0
+    );
+    assert_eq!(
+        outside_features[SOCCER_NEURAL_FEATURE_ACTION_CURVE_OUTSIDE_FOOT],
+        1.0
+    );
+    assert!(
+        outside_features[SOCCER_NEURAL_FEATURE_ACTION_CURVE_BEND]
+            > inside_features[SOCCER_NEURAL_FEATURE_ACTION_CURVE_BEND],
+        "outside-foot trivela execution should expose stronger selected bend"
+    );
+    assert!(
+        outside_features[SOCCER_NEURAL_FEATURE_ACTION_CURVE_SPIN]
+            > inside_features[SOCCER_NEURAL_FEATURE_ACTION_CURVE_SPIN],
+        "outside-foot trivela execution should expose stronger selected spin"
+    );
+    assert_eq!(
+        inside_features[SOCCER_NEURAL_FEATURE_ACTION_CURVE_DIRECTION],
+        1.0
+    );
+    assert_eq!(
+        outside_features[SOCCER_NEURAL_FEATURE_ACTION_CURVE_DIRECTION],
+        -1.0
+    );
+    assert_ne!(
+        inside_features, outside_features,
+        "same pass action must present distinct neural inputs for inside vs outside curl"
     );
 }
 
@@ -70983,8 +71170,7 @@ fn first_touch_escape_lateral_neural_block_is_appended_and_migration_safe() {
     );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_DIM,
-        SOCCER_NEURAL_PRE_CURVE_TECHNIQUE_FEATURE_DIM
-            + SOCCER_NEURAL_CURVE_TECHNIQUE_FEATURE_DIM
+        SOCCER_NEURAL_PRE_CURVE_ACTION_FEATURE_DIM + SOCCER_NEURAL_CURVE_ACTION_FEATURE_DIM
     );
     assert_eq!(SOCCER_NEURAL_RELATIONAL_ATTENTION_FEATURE_DIM, 8);
     assert_eq!(SOCCER_NEURAL_SOLO_CARRIER_FEATURE_DIM, 4);
@@ -71110,6 +71296,14 @@ fn first_touch_escape_lateral_neural_block_is_appended_and_migration_safe() {
     );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_SHOT_OUTSIDE_FOOT_CURVE + 1,
+        SOCCER_NEURAL_PRE_OFFSIDE_RECOVERY_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_OFFSIDE_RECOVERY_TARGET_DISTANCE + 1,
+        SOCCER_NEURAL_PRE_CURVE_ACTION_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_ACTION_CURVE_DIRECTION + 1,
         SOCCER_NEURAL_FEATURE_DIM
     );
     assert!(SOCCER_NEURAL_FEATURE_DEFENSIVE_PRESS_ACTION < SOCCER_NEURAL_FEATURE_DIM);
@@ -71121,6 +71315,16 @@ fn first_touch_escape_lateral_neural_block_is_appended_and_migration_safe() {
     );
     assert!(SOCCER_NEURAL_FEATURE_PASS_OUTSIDE_FOOT_CURVE < SOCCER_NEURAL_FEATURE_DIM);
     assert!(SOCCER_NEURAL_FEATURE_SHOT_OUTSIDE_FOOT_CURVE < SOCCER_NEURAL_FEATURE_DIM);
+    assert!(SOCCER_NEURAL_FEATURE_OFFSIDE_POSITION < SOCCER_NEURAL_FEATURE_DIM);
+    assert!(SOCCER_NEURAL_FEATURE_OFFSIDE_YARDS_BEYOND_LINE < SOCCER_NEURAL_FEATURE_DIM);
+    assert!(SOCCER_NEURAL_FEATURE_OFFSIDE_CLOCK < SOCCER_NEURAL_FEATURE_DIM);
+    assert!(SOCCER_NEURAL_FEATURE_OFFSIDE_RECOVERY_PRESSURE < SOCCER_NEURAL_FEATURE_DIM);
+    assert!(SOCCER_NEURAL_FEATURE_OFFSIDE_RECOVERY_TARGET_DISTANCE < SOCCER_NEURAL_FEATURE_DIM);
+    assert!(SOCCER_NEURAL_FEATURE_ACTION_CURVE_BEND < SOCCER_NEURAL_FEATURE_DIM);
+    assert!(SOCCER_NEURAL_FEATURE_ACTION_CURVE_SPIN < SOCCER_NEURAL_FEATURE_DIM);
+    assert!(SOCCER_NEURAL_FEATURE_ACTION_CURVE_INSIDE_FOOT < SOCCER_NEURAL_FEATURE_DIM);
+    assert!(SOCCER_NEURAL_FEATURE_ACTION_CURVE_OUTSIDE_FOOT < SOCCER_NEURAL_FEATURE_DIM);
+    assert!(SOCCER_NEURAL_FEATURE_ACTION_CURVE_DIRECTION < SOCCER_NEURAL_FEATURE_DIM);
     assert!(SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_LANE_OPEN < SOCCER_NEURAL_FEATURE_DIM);
     assert!(SOCCER_NEURAL_FEATURE_FIRST_TOUCH_FREEZE_RISK < SOCCER_NEURAL_FEATURE_DIM);
     assert!(SOCCER_NEURAL_FEATURE_DRIBBLE_DEFENDER_OVERCOMMIT < SOCCER_NEURAL_FEATURE_DIM);
@@ -77271,6 +77475,45 @@ fn live_server_autoloads_team_policy_from_configured_json_path() {
     assert!(state.live_http.batches_step_ticks);
 
     let _ = std::fs::remove_file(policy_path);
+}
+
+#[test]
+fn live_server_bound_url_uses_actual_ephemeral_port_and_loopback_host() {
+    let ipv4 = std::net::SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+        42123,
+    );
+    assert_eq!(
+        live_http_url_for_bound_addr("127.0.0.1", ipv4),
+        "http://127.0.0.1:42123/"
+    );
+
+    let ipv4_any = std::net::SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        42124,
+    );
+    assert_eq!(
+        live_http_url_for_bound_addr("0.0.0.0", ipv4_any),
+        "http://127.0.0.1:42124/"
+    );
+
+    let ipv6 = std::net::SocketAddr::new(
+        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        42125,
+    );
+    assert_eq!(
+        live_http_url_for_bound_addr("::1", ipv6),
+        "http://[::1]:42125/"
+    );
+
+    let ipv6_any = std::net::SocketAddr::new(
+        std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+        42126,
+    );
+    assert_eq!(
+        live_http_url_for_bound_addr("::", ipv6_any),
+        "http://[::1]:42126/"
+    );
 }
 
 #[test]
