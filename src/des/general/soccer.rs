@@ -18722,6 +18722,14 @@ pub(crate) fn buildup_chain_credit_points(base_points: f64, recency_index: usize
 
 /// Number of a team's players that must be goalside of the ball for a defensive NUMBERS-UP press.
 const DEFENSIVE_NUMBERS_UP_BEHIND_BALL_COUNT: usize = 7;
+/// Max carrier speed (yps) to count as a STOPPED holder for the stationary-holder press.
+const STATIONARY_HOLDER_PRESS_MAX_SPEED_YPS: f64 = 2.0;
+/// The nearest defender presses a stopped holder only when standing off by more than this (yds) —
+/// i.e. nobody is currently challenging — so an already-engaged defender isn't double-counted.
+const STATIONARY_HOLDER_PRESS_RADIUS_YARDS: f64 = 3.5;
+/// Press-urgency floor for the nearest defender against a stopped, unchallenged holder (> 1 fires
+/// the positional step-up onto the carrier).
+const STATIONARY_HOLDER_PRESS_URGENCY_FLOOR: f64 = 1.4;
 /// Press-urgency floor applied to the nearest defender when the defence is numbers-up behind the
 /// ball: `> 1.0` both firms the tackle commitment AND triggers the positional step-up onto the
 /// carrier, so a covered defence presses the ball-holder instead of containing.
