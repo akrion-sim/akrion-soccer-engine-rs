@@ -13151,7 +13151,14 @@ pub(crate) fn attack_ambition_enabled() -> bool {
 pub(crate) fn give_and_go_ambition_enabled() -> bool {
     #[cfg(test)]
     {
-        gate_default_on_is_set_truthy("DD_SOCCER_ENABLE_GIVE_AND_GO_AMBITION")
+        // Default-OFF + env-driven under test (re-read each call) so the parity suite stays
+        // byte-identical and a test can toggle it explicitly.
+        std::env::var("DD_SOCCER_ENABLE_GIVE_AND_GO_AMBITION")
+            .map(|raw| {
+                let v = raw.trim().to_ascii_lowercase();
+                matches!(v.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(false)
     }
     #[cfg(not(test))]
     {
