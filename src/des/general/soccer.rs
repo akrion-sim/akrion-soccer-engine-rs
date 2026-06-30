@@ -2042,6 +2042,30 @@ const BACKWARD_PASS_BASE_PENALTY_POINTS: f64 = 2.0;
 const BACKWARD_PASS_PENALTY_PER_YARD_POINTS: f64 = 0.5;
 /// Cap on the total unpressured-backward-pass penalty so one very deep ball can't swamp the signal.
 const BACKWARD_PASS_MAX_PENALTY_POINTS: f64 = 12.0;
+/// Over-dribble dispossession penalty (the carrier held the ball too long and was tackled for it).
+/// Hold time (seconds) past which staying on the ball is "overdue" — a pass or a forward drive
+/// should have happened by now. Below this a tackle on a fresh touch is just an unlucky duel, not an
+/// over-dribble, so no penalty.
+const OVERDRIBBLE_MIN_HOLD_SECONDS: f64 = 1.6;
+/// An opponent within this radius of the carrier at the moment of loss is "genuine pressure" — a
+/// signal the carrier was being closed down and should have released. Either pressure OR an ignored
+/// open outlet is required for the penalty to fire (a clean unlucky strip in open space isn't an
+/// over-dribble blunder).
+const OVERDRIBBLE_PRESSURE_RADIUS_YARDS: f64 = 4.0;
+/// Base penalty points for an over-dribble dispossession, before the excess-hold and ignored-outlet
+/// terms and the pressure multiplier.
+const OVERDRIBBLE_BASE_PENALTY_POINTS: f64 = 4.0;
+/// Extra penalty points per second held beyond `OVERDRIBBLE_MIN_HOLD_SECONDS` — the longer the
+/// overdue hold ran before the steal, the worse the decision to keep the ball.
+const OVERDRIBBLE_PER_EXCESS_SECOND_POINTS: f64 = 2.0;
+/// Extra penalty points per open forward outlet the carrier had (and ignored) at the moment of loss
+/// — the more passing options that were on, the more egregious it was to dribble into a tackle.
+const OVERDRIBBLE_PER_IGNORED_OUTLET_POINTS: f64 = 1.5;
+/// How many ranked forward-outlet candidates to probe when counting ignored passing options.
+const OVERDRIBBLE_OUTLET_PROBE_LIMIT: usize = 3;
+/// Cap on the total over-dribble penalty so one very long hold can't swamp the goal/possession
+/// signal — kept below shot-on-target(40)/goal(100), in line with the turnover penalties.
+const OVERDRIBBLE_MAX_PENALTY_POINTS: f64 = 16.0;
 /// How many of the most-recent teammates in a buildup chain are credited for a shot (the user's
 /// "last 10 teammates involved in the plays that led to the goal").
 const BUILDUP_CHAIN_CREDIT_DEPTH: usize = 10;
