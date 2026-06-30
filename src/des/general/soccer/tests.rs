@@ -87660,10 +87660,17 @@ fn forward_carry_tracker_sustained_segments_and_productive_payout() {
 
 #[test]
 fn forward_carry_tracker_caps_long_runs_and_ignores_noise() {
+    let seg = |fine, coarse| SustainedDribbleSegments { fine, coarse };
     let mut t = ForwardCarryTracker::new_at(3, Team::Away, 50.0);
-    // One huge forward drive: rewardable sustained segments are capped.
-    assert_eq!(t.fold_tick(100.0), FORWARD_CARRY_MAX_REWARDED_SEGMENTS);
-    // Productive payout is likewise capped.
+    // One huge forward drive: rewardable sustained segments are capped at BOTH cadences.
+    assert_eq!(
+        t.fold_tick(100.0),
+        seg(
+            FORWARD_CARRY_MAX_REWARDED_FINE_SEGMENTS,
+            FORWARD_CARRY_MAX_REWARDED_SEGMENTS
+        )
+    );
+    // Productive payout is likewise capped (2yd cadence).
     let pts = t.productive_carry_reward_points();
     assert!(
         (pts - FORWARD_CARRY_MAX_REWARDED_SEGMENTS as f64
@@ -87672,18 +87679,17 @@ fn forward_carry_tracker_caps_long_runs_and_ignores_noise() {
             < 1e-9
     );
     // Beyond the cap pays nothing more.
-    assert_eq!(t.fold_tick(10.0), 0);
+    assert_eq!(t.fold_tick(10.0), seg(0, 0));
     // Non-finite deltas are ignored (no panic, no reward).
-    assert_eq!(t.fold_tick(f64::NAN), 0);
+    assert_eq!(t.fold_tick(f64::NAN), seg(0, 0));
     // Tiny backward jitter below the reset threshold does NOT break the run.
     let mut u = ForwardCarryTracker::new_at(5, Team::Home, 40.0);
-    assert_eq!(u.fold_tick(2.0), 0); // carry 4 → segment #2 paid
-    assert_eq!(u.fold_tick(2.0), 1); // carry 4, paid 1
-    assert_eq!(u.fold_tick(-(FORWARD_CARRY_BACKWARD_RESET_YARDS * 0.5)), 0); // dip to 3.5, no reset
-    assert_eq!(u.fold_tick(1.5), 0); // back to 5.0 — segment already paid, no double-pay
-    // Crossing the NEXT boundary pays again — proving the run was NOT reset by the jitter (a reset
-    // would have rebuilt from zero and paid nothing here).
-    assert_eq!(u.fold_tick(2.0), 1); // carry 7.0 → segment #3
+    assert_eq!(u.fold_tick(2.0), seg(1, 0)); // carry 2
+    assert_eq!(u.fold_tick(2.0), seg(2, 1)); // carry 4
+    assert_eq!(u.fold_tick(-(FORWARD_CARRY_BACKWARD_RESET_YARDS * 0.5)), seg(0, 0)); // dip to 3.5
+    assert_eq!(u.fold_tick(1.5), seg(1, 0)); // back to 5.0 — one new 1yd segment, 2yd already paid
+    // Crossing the NEXT 2yd boundary pays again — proving the run was NOT reset by the jitter.
+    assert_eq!(u.fold_tick(2.0), seg(2, 1)); // carry 7.0
 }
 
 #[test]
