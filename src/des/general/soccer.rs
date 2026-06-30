@@ -19270,6 +19270,29 @@ pub(crate) fn carrier_forward_drive_enabled() -> bool {
     }
 }
 
+/// Whether the **gait step-limit** is active this process. A body has inertia: it cannot
+/// teleport across locomotor gears in a single tick (sprint→walk, run→walk). With this
+/// on, once the gait-commitment dwell is satisfied an effort-tier change is taken ONE
+/// step at a time — a multi-gear change walks through its intermediate gaits, one per
+/// dwell — so the displayed gait and the acceleration-limited body shed (or build) speed
+/// together across several ticks instead of the label snapping ahead of the legs. The
+/// emergency / standing-start / pull-up-to-a-stop bypasses in [`commit_gait`] are
+/// unaffected (those are decisive single acts, not the mid-gear oscillation this damps).
+/// Default-ON in production (env `DD_SOCCER_ENABLE_GAIT_STEP_LIMIT=0/false` is the kill
+/// switch); default-OFF under test so the movement-parity suite stays byte-identical.
+pub(crate) fn gait_step_limit_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_GAIT_STEP_LIMIT").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_GAIT_STEP_LIMIT"))
+    }
+}
+
 /// Whether the **MPC pass-weight solver** is active this process. For a ground pass to a receiver
 /// it solves the EXACT launch speed that lands the decelerating ball on the aim point as the
 /// receiver's predicted run arrives there — so pass weight is physically timed to the receiver, not
