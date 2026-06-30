@@ -11003,24 +11003,24 @@ impl SoccerMatch {
         let team = holder.team;
         let ball_y = self.ball.position.y;
         let attack = team.attack_dir();
-        let new_segments = match self.forward_carry_tracker.as_mut() {
+        let sustained_points = match self.forward_carry_tracker.as_mut() {
             Some(tracker) if tracker.carrier_id == holder_id => {
                 let forward_delta = (ball_y - tracker.last_ball_y) * attack;
                 tracker.last_ball_y = ball_y;
-                tracker.fold_tick(forward_delta)
+                // Pays both the 1-yard and 2-yard sustained cadences.
+                tracker.sustained_reward_points(forward_delta)
             }
             _ => {
                 // New carrier (first touch / a teammate received): start a fresh run.
                 self.forward_carry_tracker =
                     Some(ForwardCarryTracker::new_at(holder_id, team, ball_y));
-                0
+                0.0
             }
         };
-        if record_rewards && new_segments > 0 {
-            let amount = new_segments as f64 * SUSTAINED_FORWARD_DRIBBLE_SEGMENT_REWARD_POINTS;
+        if record_rewards && sustained_points > 0.0 {
             self.record_reward_event_with_kind(
                 holder_id,
-                amount,
+                sustained_points,
                 SoccerRewardEventKind::SustainedForwardDribble,
             );
         }
