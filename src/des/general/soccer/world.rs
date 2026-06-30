@@ -46305,12 +46305,13 @@ impl WorldSnapshot {
         else {
             return centre_depth;
         };
-        let optimal_gap = BACK_FOUR_OPTIMAL_GAP_TO_ATTACKERS_YARDS;
-        let press_floor = (attacker_depth - optimal_gap)
-            .min(attacker_depth)
-            .clamp(six.min(max_depth), max_depth);
-        // Push UP only: raise a too-deep centre toward the attackers; never drop it deeper.
-        centre_depth.max(press_floor)
+        back_four_attacker_pressed_depth(
+            centre_depth,
+            attacker_depth,
+            BACK_FOUR_OPTIMAL_GAP_TO_ATTACKERS_YARDS,
+            six,
+            max_depth,
+        )
     }
 
     /// v2 field-anchored back-four line target for `me` (gated by
