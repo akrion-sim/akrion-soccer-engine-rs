@@ -18889,6 +18889,25 @@ pub(crate) fn in_stride_pass_margin_enabled() -> bool {
     }
 }
 
+/// Whether the **release-long-inside-own-half** MARL/MAPPO strategy is active this process: when a
+/// teammate has broken beyond the opponent's last outfield defender but is ONSIDE in our own half
+/// (you cannot be offside in your own half), prefer + reward a long ball that springs them. Trains
+/// the team to punish a high press with the line-breaking ball. Default-ON in production (env
+/// `DD_SOCCER_ENABLE_RELEASE_LONG_OWN_HALF=0/false` is the kill switch); default-OFF under test so
+/// the parity suite stays byte-identical. See `WorldSnapshot::release_long_inside_own_half_target`.
+pub(crate) fn release_long_own_half_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_RELEASE_LONG_OWN_HALF").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_RELEASE_LONG_OWN_HALF"))
+    }
+}
+
 /// Whether the **ground-pass speed floor** is active this process. A released ground pass is
 /// `intended_speed · power_factor · momentum_f` — when the body can't drive it (struck while
 /// sprinting against your own momentum, or twisted side-on) that product collapses the pass to a
