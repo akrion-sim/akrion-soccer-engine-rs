@@ -14828,8 +14828,9 @@ impl SoccerMatch {
         // open forward space should jog/run/sprint into it as the first inclination — not knock the
         // ball forward and walk after it. Graded by the room ahead (more clear space ⇒ a higher
         // gear) and only ever applied as an UPSHIFT, so close control under pressure and any
-        // lateral/backward touch are left exactly as before. Placed before `commit_gait` so the
-        // upshift is free (the momentum model only holds DOWNshifts for a dwell).
+        // lateral/backward touch are left exactly as before. Placed before `commit_gait`, which then
+        // governs how quickly the upshift is actually adopted: immediate when setting off from a
+        // standstill, otherwise after the short gait dwell that damps moving-tier oscillation.
         let gait = if carrier_forward_drive_enabled()
             && self.ball.holder == Some(player_id)
             && !gait.is_backward()
