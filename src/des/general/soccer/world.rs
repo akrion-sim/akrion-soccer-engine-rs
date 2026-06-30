@@ -2935,6 +2935,7 @@ impl SoccerMatch {
             line_depth_head: None,
             line_depth_samples: Vec::new(),
             pending_line_depth: Vec::new(),
+            back_four_line_latch: [None, None],
             loose_ball_commit_head: None,
             attack_spacing_head: None,
             loose_ball_commit_samples: Vec::new(),
