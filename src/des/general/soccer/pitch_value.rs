@@ -601,6 +601,114 @@ mod tests {
     }
 
     #[test]
+    fn bad_pass_punished_more_when_turnover_leads_to_opponent_advance() {
+        // The MDP/POMDP modelling claim, made concrete: because the dense reward is
+        // potential-based shaping on the NET (zero-sum) territorial threat Φ =
+        // team_xt(you) − team_xt(opponent), a giveaway is punished in proportion to
+        // how much the opponent then does with it — and forgiven when it is won
+        // straight back — WITHOUT any hand-coded "two forward passes / 30 yards /
+        // shot" trigger. The severity emerges from Φ; the trigger list is just
+        // eval metrics.
+        let _lock = PITCH_VALUE_ENV_LOCK.lock().expect("pitch value env lock");
+        std::env::set_var(PITCH_VALUE_REWARD_ENABLE_ENV, "1");
+
+        let mid = W * 0.5;
+        // Home attacks +y, Away attacks toward y = 0. A balanced 3-v-3 block so
+        // neither side is "vacating its half" (the degenerate case the zero-sum
+        // model intentionally punishes); the only thing that moves between states
+        // is WHO controls the dangerous advanced space.
+        let state = |ball: Vec2, home: [Vec2; 3], away: [Vec2; 3]| {
+            snapshot_with(
+                vec![
+                    player_at(0, Team::Home, home[0], Vec2::zero()),
+                    player_at(1, Team::Home, home[1], Vec2::zero()),
+                    player_at(2, Team::Home, home[2], Vec2::zero()),
+                    player_at(3, Team::Away, away[0], Vec2::zero()),
+                    player_at(4, Team::Away, away[1], Vec2::zero()),
+                    player_at(5, Team::Away, away[2], Vec2::zero()),
+                ],
+                ball,
+            )
+        };
+
+        // s0: Home in settled possession in the Away half — controls the ball and
+        // the dangerous advanced space.
+        let s0 = state(
+            Vec2::new(mid, L * 0.70),
+            [
+                Vec2::new(mid, L * 0.70),
+                Vec2::new(mid - 8.0, L * 0.58),
+                Vec2::new(mid + 8.0, L * 0.55),
+            ],
+            [
+                Vec2::new(mid, L * 0.80),
+                Vec2::new(mid - 10.0, L * 0.88),
+                Vec2::new(mid + 10.0, L * 0.88),
+            ],
+        );
+        // s1: the bad pass is intercepted — Away now controls the ball at halfway,
+        // Home caught upfield.
+        let s1 = state(
+            Vec2::new(mid, L * 0.50),
+            [
+                Vec2::new(mid, L * 0.62),
+                Vec2::new(mid - 8.0, L * 0.58),
+                Vec2::new(mid + 8.0, L * 0.55),
+            ],
+            [
+                Vec2::new(mid, L * 0.50),
+                Vec2::new(mid - 10.0, L * 0.70),
+                Vec2::new(mid + 10.0, L * 0.70),
+            ],
+        );
+        // s2_damage: Away breaks 30+ yds the other way — ball and Away runners deep
+        // in Home's half, threatening Home's goal.
+        let s2_damage = state(
+            Vec2::new(mid, L * 0.18),
+            [
+                Vec2::new(mid, L * 0.40),
+                Vec2::new(mid - 8.0, L * 0.45),
+                Vec2::new(mid + 8.0, L * 0.42),
+            ],
+            [
+                Vec2::new(mid, L * 0.18),
+                Vec2::new(mid - 10.0, L * 0.30),
+                Vec2::new(mid + 10.0, L * 0.30),
+            ],
+        );
+        // s2_recover: Home wins it straight back — field position restored to s0.
+        let s2_recover = s0.clone();
+
+        // Home's accumulated PBRS reward along each two-step trajectory.
+        let damage = pitch_value_reward_delta(&s0, &s1, Team::Home)
+            + pitch_value_reward_delta(&s1, &s2_damage, Team::Home);
+        let recover = pitch_value_reward_delta(&s0, &s1, Team::Home)
+            + pitch_value_reward_delta(&s1, &s2_recover, Team::Home);
+        std::env::remove_var(PITCH_VALUE_REWARD_ENABLE_ENV);
+
+        // 1. The giveaway that lets the opponent advance is punished MORE (strictly
+        //    more negative team reward) than the one immediately won back.
+        assert!(
+            damage < recover,
+            "opponent advance must cost more than a quick win-back: damage={damage} recover={recover}"
+        );
+        // 2. The quick win-back telescopes back to zero: PBRS over a trajectory that
+        //    returns to its starting potential nets nothing — the giveaway is
+        //    forgiven once possession AND field position are restored. This is the
+        //    exact "penalised more ... than ..." asymmetry the request describes.
+        assert!(
+            recover.abs() < 1e-9,
+            "win-back must telescope to ~0 (PBRS invariance): {recover}"
+        );
+        // 3. Conceding the counter is net-negative for Home (a real penalty, not
+        //    merely a smaller reward).
+        assert!(
+            damage < 0.0,
+            "a bad pass that concedes a counter must be net-negative for Home: {damage}"
+        );
+    }
+
+    #[test]
     fn territorial_advantage_is_zero_sum_between_teams() {
         let snap = snapshot_with(
             vec![
