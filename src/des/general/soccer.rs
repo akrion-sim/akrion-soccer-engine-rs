@@ -25053,19 +25053,35 @@ fn defensive_goal_side_reward_for_role(
     if snapshot.possession_team() != Some(team.other()) {
         return 0.0;
     }
-    // Threat reference along the goal axis: the carrier if there is one, else the ball.
-    let attacker_y = snapshot
+    // Threat reference: the carrier if there is one, else the ball. The protective line runs from
+    // this threat to the centre of our own goal.
+    let threat = snapshot
         .ball
         .holder
         .and_then(|holder| snapshot.players.iter().find(|p| p.id == holder))
         .filter(|holder| holder.team == team.other())
         .and_then(|holder| snapshot.player_position(holder.id))
-        .map(|pos| pos.y)
-        .unwrap_or(snapshot.ball.position.y);
+        .unwrap_or(snapshot.ball.position);
     let own_goal_y = team.other().goal_y(snapshot.field_length);
+    if goal_side::defensive_goal_side_enabled() {
+        // TRUE goal-side: reward sitting *on the line between the threat and our goal*, goal-side of
+        // the threat — not merely deeper than it on the y-axis (a wide full-back a yard behind the
+        // ball but stranded on the touchline screens nothing). Continuous over the line geometry,
+        // at the same magnitude as the legacy ladder's best/worst. See the `goal_side` module.
+        let own_goal = Vec2::new(snapshot.field_width * 0.5, own_goal_y);
+        let quality = goal_side::goal_side_quality(
+            player_position,
+            threat,
+            own_goal,
+            goal_side::GOAL_SIDE_CHANNEL_HALF_WIDTH_YARDS,
+            goal_side::GOAL_SIDE_DEPTH_SATURATION_YARDS,
+        );
+        return goal_side::defensive_goal_side_role_reward(quality);
+    }
+    // Legacy y-axis-only definition (byte-identical when the gate is off).
     let goal_side_of_ball =
         goal_side_between_y(player_position.y, snapshot.ball.position.y, own_goal_y);
-    let goal_side_of_attacker = goal_side_between_y(player_position.y, attacker_y, own_goal_y);
+    let goal_side_of_attacker = goal_side_between_y(player_position.y, threat.y, own_goal_y);
     match (goal_side_of_ball, goal_side_of_attacker) {
         (true, true) => 0.24,
         (true, false) | (false, true) => -0.12,
