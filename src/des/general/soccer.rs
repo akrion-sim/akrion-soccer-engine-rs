@@ -20437,24 +20437,34 @@ fn pass_facing_outcome(facing_yaw: f64, kick_dir: Vec2, in_own_half: bool) -> Pa
     }
 }
 
-/// Minimum speed (mph) a released GROUND pass must leave the foot at, so the body-momentum/facing
-/// power penalty can soften a pass but never collapse it into a dead "ghost ball". ~12mph (≈5.9yps)
-/// is below any genuine pass pace (a crisp 5yd ball is already ~17mph) so this only lifts the
-/// collapsed ghosts, not normal play.
+/// Absolute minimum speed (mph) a released GROUND pass must leave the foot at, so the
+/// body-momentum/facing power penalty can soften a pass but never collapse it into a dead "ghost
+/// ball". ~12mph (≈5.9yps) is below any genuine pass pace (a crisp 5yd ball is already ~17mph) so
+/// this only lifts the collapsed ghosts, not normal play.
 const GROUND_PASS_MIN_RELEASE_MPH: f64 = 12.0;
+/// The body-momentum/facing penalty may reduce a pass to at most this FRACTION of its intended
+/// (MPC/analytic) speed — so a long ball driven against the run still leaves the foot near its
+/// intended pace instead of dribbling out. Keeps execution close to the *intended* weight (the
+/// user's "intentional passing, not a collapsed speed").
+const GROUND_PASS_MIN_RELEASE_FRACTION: f64 = 0.55;
 
 /// Floor a released GROUND pass's launch speed (yps) so the momentum/facing power penalty cannot
-/// collapse it into a near-stationary ball the passer runs away from. The floor is itself capped by
-/// any explicit weak-touch `speed_cap_yps` (a backheel / perpendicular prod still travels only at
-/// its cap, not faster) — so a deliberate soft touch is preserved while a true ghost pass is lifted
-/// to a real, travelling pace. Pure.
-pub(crate) fn floored_ground_pass_launch_speed(launch_speed: f64, speed_cap_yps: Option<f64>) -> f64 {
-    let viable_floor = mph_to_yps(GROUND_PASS_MIN_RELEASE_MPH);
-    let effective_floor = match speed_cap_yps {
-        Some(cap) => viable_floor.min(cap.max(0.0)),
-        None => viable_floor,
-    };
-    launch_speed.max(effective_floor)
+/// collapse it into a near-stationary ball the passer runs away from. The floor is the larger of an
+/// absolute viable pace and a fraction of the `intended_speed` (so a firm intended pass stays firm),
+/// itself capped by any explicit weak-touch `speed_cap_yps` (a backheel / perpendicular prod still
+/// travels only at its cap, not faster) — a deliberate soft touch is preserved while a true ghost
+/// pass is lifted to a real, travelling pace. Pure.
+pub(crate) fn floored_ground_pass_launch_speed(
+    launch_speed: f64,
+    intended_speed: f64,
+    speed_cap_yps: Option<f64>,
+) -> f64 {
+    let mut floor =
+        mph_to_yps(GROUND_PASS_MIN_RELEASE_MPH).max(intended_speed.max(0.0) * GROUND_PASS_MIN_RELEASE_FRACTION);
+    if let Some(cap) = speed_cap_yps {
+        floor = floor.min(cap.max(0.0));
+    }
+    launch_speed.max(floor)
 }
 
 /// Preference bonus for controlled forward passes. The ideal is 8yd exactly:
