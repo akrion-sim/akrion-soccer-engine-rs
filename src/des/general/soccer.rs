@@ -1737,7 +1737,6 @@ const DEFENSIVE_POSITIONING_FOCUS_LP_REWARD_MULTIPLIER: f64 = 2.25;
 // "keep the ball" over "gamble it forward".
 const LOST_POSSESSION_CHAIN_PENALTY_POINTS: f64 = 10.0;
 const LOST_POSSESSION_CHAIN_PENALTY_WEIGHTS: [f64; 3] = [0.55, 0.30, 0.15];
-<<<<<<< HEAD
 // --- Discounted turnover-chain blame (gated DD_SOCCER_ENABLE_TURNOVER_CHAIN_BLAME) ---
 // A bad pass that is intercepted (`record_interception_reward`) penalizes the player who lost
 // the ball in full, but the previous one/two passers who built the doomed move escape untouched.
@@ -1754,11 +1753,9 @@ const LOST_POSSESSION_CHAIN_PENALTY_WEIGHTS: [f64; 3] = [0.55, 0.30, 0.15];
 const TURNOVER_CHAIN_BLAME_DISCOUNTS: [f64; 3] = [1.0, 0.20, 0.05];
 // Below this the discounted blame is dropped (negligible tail / sub-noise nudge).
 const TURNOVER_CHAIN_BLAME_MIN_POINTS: f64 = 0.05;
-=======
 // Bad-pass turnover blame is not a normalized pool: the passer gets the full
 // chain penalty, then the prior two teammates get discounted echoes.
 const BAD_PASS_CHAIN_PENALTY_MULTIPLIERS: [f64; 3] = [1.0, 0.20, 0.05];
->>>>>>> 5726ba88e2f88de2f7ffda3fb2f4d844a09ae34e
 // Beyond the immediate possession-chain penalty above, a turnover also retroactively
 // penalizes the LOSING team's actions over the last ~5 seconds: every learning transition
 // for that team in the window is re-queued with a recency-scaled negative reward (full at
