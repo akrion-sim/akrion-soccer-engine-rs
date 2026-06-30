@@ -63024,7 +63024,7 @@ mod locomotion_commitment_tests {
     #[test]
     fn gait_holding_same_tier_is_a_no_op() {
         assert_eq!(
-            commit_gait(MovementGait::Sprint, MovementGait::Sprint, 0.0, false),
+            commit_gait(MovementGait::Sprint, MovementGait::Sprint, 0.0, false, false),
             MovementGait::Sprint
         );
     }
@@ -63034,14 +63034,14 @@ mod locomotion_commitment_tests {
         // The exact "sprint, run, sprint, run" case: a downshift before the dwell is
         // refused — the player stays sprinting.
         assert_eq!(
-            commit_gait(MovementGait::Sprint, MovementGait::Run, 0.05, false),
+            commit_gait(MovementGait::Sprint, MovementGait::Run, 0.05, false, false),
             MovementGait::Sprint
         );
         // And the symmetric half: bouncing straight back UP to a sprint before the
         // dwell is refused too — this is what stops the half-rate oscillation that a
         // downshift-only lock leaves behind.
         assert_eq!(
-            commit_gait(MovementGait::Run, MovementGait::Sprint, 0.05, false),
+            commit_gait(MovementGait::Run, MovementGait::Sprint, 0.05, false, false),
             MovementGait::Run
         );
         // Once the gait has been carried for the dwell, the change is allowed.
@@ -63050,6 +63050,7 @@ mod locomotion_commitment_tests {
                 MovementGait::Sprint,
                 MovementGait::Run,
                 GAIT_COMMIT_SECONDS + 0.01,
+                false,
                 false
             ),
             MovementGait::Run
@@ -63060,7 +63061,18 @@ mod locomotion_commitment_tests {
     fn pulling_up_to_a_stop_is_always_allowed() {
         // Coming to a halt is never locked, even straight from a flat-out sprint.
         assert_eq!(
-            commit_gait(MovementGait::Sprint, MovementGait::Stand, 0.0, false),
+            commit_gait(MovementGait::Sprint, MovementGait::Stand, 0.0, false, false),
+            MovementGait::Stand
+        );
+        // ...nor under the step-limit (braking to a halt is a decisive single act).
+        assert_eq!(
+            commit_gait(
+                MovementGait::Sprint,
+                MovementGait::Stand,
+                GAIT_COMMIT_SECONDS + 0.01,
+                false,
+                true
+            ),
             MovementGait::Stand
         );
     }
@@ -63069,7 +63081,12 @@ mod locomotion_commitment_tests {
     fn emergency_bypasses_the_gait_lock() {
         // An explosive reaction to a threat can spike effort instantly, dwell or not.
         assert_eq!(
-            commit_gait(MovementGait::Jog, MovementGait::Sprint, 0.0, true),
+            commit_gait(MovementGait::Jog, MovementGait::Sprint, 0.0, true, false),
+            MovementGait::Sprint
+        );
+        // The step-limit also yields to an emergency: a flat-out burst is never staged.
+        assert_eq!(
+            commit_gait(MovementGait::Walk, MovementGait::Sprint, 1.0, true, true),
             MovementGait::Sprint
         );
     }
@@ -63078,8 +63095,74 @@ mod locomotion_commitment_tests {
     fn setting_off_from_a_standstill_is_immediate() {
         // Starting to move is decisive, not jitter — no dwell from rest.
         assert_eq!(
-            commit_gait(MovementGait::Stand, MovementGait::Sprint, 0.0, false),
+            commit_gait(MovementGait::Stand, MovementGait::Sprint, 0.0, false, false),
             MovementGait::Sprint
+        );
+    }
+
+    #[test]
+    fn step_limit_walks_a_multi_gear_change_through_one_tier_at_a_time() {
+        let held = GAIT_COMMIT_SECONDS + 0.01;
+        // A run cannot drop straight to a walk: it sheds one tier to a jog first.
+        assert_eq!(
+            commit_gait(MovementGait::Run, MovementGait::Walk, held, false, true),
+            MovementGait::Jog
+        );
+        // Continuing down from that jog, the next dwell reaches the walk.
+        assert_eq!(
+            commit_gait(MovementGait::Jog, MovementGait::Walk, held, false, true),
+            MovementGait::Walk
+        );
+        // A flat-out sprint sheds to a run on the way down to a jog — never jog in one
+        // tick.
+        assert_eq!(
+            commit_gait(MovementGait::Sprint, MovementGait::Jog, held, false, true),
+            MovementGait::Run
+        );
+        // Sprint→walk likewise steps one gear: sprint→run.
+        assert_eq!(
+            commit_gait(MovementGait::Sprint, MovementGait::Walk, held, false, true),
+            MovementGait::Run
+        );
+    }
+
+    #[test]
+    fn step_limit_builds_speed_one_gear_at_a_time_too() {
+        let held = GAIT_COMMIT_SECONDS + 0.01;
+        // A non-emergency upshift ramps: walk → jog, not straight to a sprint.
+        assert_eq!(
+            commit_gait(MovementGait::Walk, MovementGait::Sprint, held, false, true),
+            MovementGait::Jog
+        );
+        assert_eq!(
+            commit_gait(MovementGait::Jog, MovementGait::Sprint, held, false, true),
+            MovementGait::Run
+        );
+    }
+
+    #[test]
+    fn step_limit_leaves_single_tier_and_same_tier_changes_untouched() {
+        let held = GAIT_COMMIT_SECONDS + 0.01;
+        // Adjacent single-tier change passes straight through (byte-identical).
+        assert_eq!(
+            commit_gait(MovementGait::Run, MovementGait::Jog, held, false, true),
+            MovementGait::Jog
+        );
+        // Same effort tier, different gait (jog ↔ side-step): a free swap.
+        assert_eq!(
+            commit_gait(MovementGait::Jog, MovementGait::SideStep, held, false, true),
+            MovementGait::SideStep
+        );
+    }
+
+    #[test]
+    fn step_limit_preserves_backward_character_on_the_way_down() {
+        let held = GAIT_COMMIT_SECONDS + 0.01;
+        // Dropping toward a back-walk from a forward run keeps the intermediate
+        // backward: run → back-jog (tier 2, backward), not a forward jog.
+        assert_eq!(
+            commit_gait(MovementGait::Run, MovementGait::BackWalk, held, false, true),
+            MovementGait::BackJog
         );
     }
 
