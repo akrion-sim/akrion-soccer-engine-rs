@@ -46149,8 +46149,18 @@ impl WorldSnapshot {
             })
             .unwrap_or(BACK_FOUR_LINE_NEUTRAL_GAP_FRACTION)
             .clamp(0.0, 1.0);
-        let base_gap = BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS
-            + (BACK_FOUR_LINE_DESIRED_GAP_MAX_YARDS - BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS) * frac;
+        // Possession-aware trailing-gap band: WHILE WE CONTROL the ball the line may step right up
+        // to support the attack, so the floor drops to 5yd (band 5..40). Out of possession — the
+        // opponent controlling OR a loose/contested ball with no controller ("dispossession") —
+        // the line holds the deeper 20yd cushion (band 20..40). The 15yd anchor non-linearity in
+        // `back_four_line_target_depth_v2` still governs the deep-ball regime in both cases.
+        let we_control = self.controlled_possession_team() == Some(team);
+        let gap_min = if we_control {
+            BACK_FOUR_LINE_DESIRED_GAP_IN_POSSESSION_MIN_YARDS
+        } else {
+            BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS
+        };
+        let base_gap = gap_min + (BACK_FOUR_LINE_DESIRED_GAP_MAX_YARDS - gap_min) * frac;
         if !back_four_push_into_dead_space_enabled() {
             return base_gap;
         }
