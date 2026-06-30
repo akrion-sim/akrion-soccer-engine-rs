@@ -1970,6 +1970,34 @@ const TEAM_ADVANCE_CARRIER_DRIVE_REWARD: f64 = 0.30;
 /// Dense shaping reward for an OFF-BALL teammate making a forward supporting run while the team
 /// advances upfield — the "whole team moves forward" signal that pulls runners up with the ball.
 const TEAM_ADVANCE_SUPPORT_RUN_REWARD: f64 = 0.22;
+/// A teammate must be at least this far BEYOND the opponent's last outfield defender (the offside
+/// line) to count as a "release long inside own half" target — a genuine break of the line.
+const RELEASE_LONG_MIN_BEYOND_YARDS: f64 = 3.0;
+/// …and at least this far ahead of the ball, so it is a real forward long ball (not a square one).
+const RELEASE_LONG_MIN_AHEAD_OF_BALL_YARDS: f64 = 8.0;
+/// Minimum carrier→receiver distance for the long release.
+const RELEASE_LONG_MIN_DISTANCE_YARDS: f64 = 16.0;
+/// The receiver must be this open (nearest opponent ≥) for the long ball to be worth releasing.
+const RELEASE_LONG_RECEIVER_OPEN_YARDS: f64 = 5.0;
+/// MARL/MAPPO reward (points) for releasing a long ball to a teammate who is beyond the opponent's
+/// last outfield defender but ONSIDE in our own half — the "release long inside own half" strategy
+/// (you cannot be offside in your own half). Big enough to teach the line-breaking ball.
+const RELEASE_LONG_INSIDE_OWN_HALF_REWARD_POINTS: f64 = 9.0;
+
+/// Whether `receiver_adv` (advancement toward the opponent goal, 0 at our own goal) is a valid
+/// "release long inside own half" target: BEYOND the opponent's last outfield defender / offside
+/// line (so they'd be offside in the opponent half) BUT still in our OWN half (so they are ONSIDE
+/// by the own-half rule), and genuinely ahead of the ball. `halfway_adv` = field_length/2. Pure.
+pub(crate) fn release_long_inside_own_half_qualifies(
+    receiver_adv: f64,
+    offside_line_adv: f64,
+    ball_adv: f64,
+    halfway_adv: f64,
+) -> bool {
+    receiver_adv < halfway_adv
+        && receiver_adv > offside_line_adv + RELEASE_LONG_MIN_BEYOND_YARDS
+        && receiver_adv > ball_adv + RELEASE_LONG_MIN_AHEAD_OF_BALL_YARDS
+}
 /// One progressive-carry "segment": every this-many yards the carrier advances the ball FORWARD
 /// (Δy·attack toward the opponent goal; lateral x movement is allowed, only the forward component
 /// counts). Both progressive-carry rewards are denominated in these 2-yard segments. See
