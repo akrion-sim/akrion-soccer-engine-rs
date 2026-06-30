@@ -157,26 +157,24 @@ pub(crate) fn decide_winger_pinch(
     let mut half = 0.0;
     let mut back = 0.0;
 
+    // Only the **weak-side** winger with a genuine crossing position on pinches infield: the
+    // ball-side winger is the deliverer / overlap and the team needs his width, and with no
+    // cross threat yet width keeps the team stretched and offers the switch outlet.
+    let pinch_in_play = !ball_on_my_flank && crossing_position_on;
     if ball_on_my_flank {
-        // On the ball-side flank the winger is the deliverer / overlap — hold width.
         stay += SAME_FLANK_STAY_BONUS;
-    } else {
-        // Weak-side winger: lean infield, with the deeper back-post run weighted a touch higher.
-        back += FAR_FLANK_PINCH_BONUS;
-        half += FAR_FLANK_PINCH_BONUS * 0.6;
-    }
-
-    if crossing_position_on {
-        back += CROSS_ON_BACKPOST_BONUS;
-        half += CROSS_ON_HALFSPACE_BONUS;
-    } else {
-        // No cross threat yet — width keeps the team stretched and offers the switch.
+    } else if !crossing_position_on {
         stay += NO_CROSS_STAY_BONUS;
     }
 
-    back += depth * DEPTH_BACKPOST_WEIGHT;
-    half += congestion * CONGESTION_HALFSPACE_WEIGHT;
-    back -= congestion * CONGESTION_BACKPOST_PENALTY;
+    if pinch_in_play {
+        // Weak-side arriver: lean infield, the deeper back-post run weighted higher with depth,
+        // a congested box pulling toward the cut-back / half-space instead.
+        back += FAR_FLANK_PINCH_BONUS + CROSS_ON_BACKPOST_BONUS + depth * DEPTH_BACKPOST_WEIGHT;
+        half += FAR_FLANK_PINCH_BONUS * 0.6 + CROSS_ON_HALFSPACE_BONUS;
+        half += congestion * CONGESTION_HALFSPACE_WEIGHT;
+        back -= congestion * CONGESTION_BACKPOST_PENALTY;
+    }
 
     // Legality mask: an offside back-post arrival is illegal — prune that bucket.
     if back_post_offside {
