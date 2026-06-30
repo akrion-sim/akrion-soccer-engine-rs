@@ -17839,12 +17839,6 @@ pub(crate) enum SoccerRewardEventKind {
     /// ball forward at feet, not stall. Emitted only when
     /// `DD_SOCCER_ENABLE_PROGRESSIVE_CARRY_REWARD` is on. See [`ForwardCarryTracker`].
     SustainedForwardDribble,
-    /// Positive: PRODUCTIVE forward carry — a forward dribble (in 2-yard segments) that CULMINATED
-    /// in a forward pass or a shot, cashed out at the release. Trains the policy that carrying the
-    /// ball forward and then playing it forward / shooting is rewarded, whereas a carry that ends
-    /// in a turnover or a backward ball earns nothing. Emitted only when
-    /// `DD_SOCCER_ENABLE_PROGRESSIVE_CARRY_REWARD` is on. See [`ForwardCarryTracker`].
-    ProductiveForwardCarry,
     /// PENALTY (negative): a pass played BACKWARD (toward our own goal) by a passer who was NOT
     /// under genuine high pressure (no opponent within the high-pressure radius), scaled by how far
     /// back it went. The direct learning signal that a backward recycle should be a high-pressure
