@@ -2992,6 +2992,42 @@ impl RewardTunables {
             25.0,
         );
         sanitize_f64(
+            "reward.giveaway_to_opponent_own_half_penalty",
+            &mut self.giveaway_to_opponent_own_half_penalty,
+            default.giveaway_to_opponent_own_half_penalty,
+            0.0,
+            200.0,
+            0.0,
+            25.0,
+        );
+        sanitize_f64(
+            "reward.giveaway_to_opponent_opp_half_penalty",
+            &mut self.giveaway_to_opponent_opp_half_penalty,
+            default.giveaway_to_opponent_opp_half_penalty,
+            0.0,
+            200.0,
+            0.0,
+            25.0,
+        );
+        sanitize_f64(
+            "reward.giveaway_to_loose_own_half_penalty",
+            &mut self.giveaway_to_loose_own_half_penalty,
+            default.giveaway_to_loose_own_half_penalty,
+            0.0,
+            200.0,
+            0.0,
+            25.0,
+        );
+        sanitize_f64(
+            "reward.giveaway_to_loose_opp_half_penalty",
+            &mut self.giveaway_to_loose_opp_half_penalty,
+            default.giveaway_to_loose_opp_half_penalty,
+            0.0,
+            200.0,
+            0.0,
+            25.0,
+        );
+        sanitize_f64(
             "reward.pitch_value_threat_delta_points",
             &mut self.pitch_value_threat_delta_points,
             default.pitch_value_threat_delta_points,
