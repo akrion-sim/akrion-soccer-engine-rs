@@ -88923,6 +88923,23 @@ fn buildup_chain_credit_recency_discount() {
 }
 
 #[test]
+fn ground_pass_speed_floor_lifts_ghost_passes_but_respects_caps() {
+    let floor_yps = mph_to_yps(GROUND_PASS_MIN_RELEASE_MPH);
+    // A collapsed "ghost" pass (~1yps from a momentum/facing penalty) is lifted to a travelling pace.
+    assert!((floored_ground_pass_launch_speed(1.0, None) - floor_yps).abs() < 1e-9);
+    // A normal firm pass is untouched (already above the floor).
+    let firm = mph_to_yps(40.0);
+    assert!((floored_ground_pass_launch_speed(firm, None) - firm).abs() < 1e-9);
+    // A deliberate weak-touch cap (backheel/prod) is respected: the floor cannot exceed the cap,
+    // so a capped touch still travels only at its cap, not faster.
+    let cap = mph_to_yps(10.0); // below the 12mph viable floor
+    assert!((floored_ground_pass_launch_speed(0.5, Some(cap)) - cap).abs() < 1e-9);
+    // A pass already faster than a (higher) cap is left alone by the floor.
+    let high_cap = mph_to_yps(30.0);
+    assert!((floored_ground_pass_launch_speed(firm, Some(high_cap)) - firm).abs() < 1e-9);
+}
+
+#[test]
 fn unpressured_backward_pass_penalty_truth_table() {
     let pressed = BACKWARD_PASS_HIGH_PRESSURE_RADIUS_YARDS - 0.1; // opponent within 3yd ⇒ justified
     let free = BACKWARD_PASS_HIGH_PRESSURE_RADIUS_YARDS + 5.0; // no close opponent ⇒ penalized
