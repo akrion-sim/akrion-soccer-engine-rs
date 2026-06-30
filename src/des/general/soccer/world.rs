@@ -368,6 +368,11 @@ pub struct SoccerMatch {
     pub(crate) home_mpc_latent_objective: SoccerMpcLatentObjective,
     pub(crate) away_mpc_latent_objective: SoccerMpcLatentObjective,
     pub(crate) possession_progress_tracker: Option<PossessionProgressTracker>,
+    /// The current ball-carrier's continuous forward dribble, for the progressive-carry MARL
+    /// rewards (gated by `DD_SOCCER_ENABLE_PROGRESSIVE_CARRY_REWARD`). One carrier at a time, so a
+    /// single tracker; reset when the holder changes or possession is lost. See
+    /// [`ForwardCarryTracker`].
+    pub(crate) forward_carry_tracker: Option<ForwardCarryTracker>,
     /// The most recent player to touch the ball — a simple "who last touched it"
     /// reference used to enforce the no-double-touch rule on restarts.
     pub(crate) last_touch_player: Option<usize>,
