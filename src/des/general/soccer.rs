@@ -18761,6 +18761,117 @@ pub(crate) fn unpressured_backward_pass_penalty_points(
         .min(BACKWARD_PASS_MAX_PENALTY_POINTS)
 }
 
+/// Penalty points (>= 0) for an OVER-DRIBBLE dispossession — the carrier held / dribbled the ball
+/// too long and lost it to a tackle. Zero unless the carrier had held the ball longer than
+/// `OVERDRIBBLE_MIN_HOLD_SECONDS` AND was either under genuine pressure (an opponent within
+/// `OVERDRIBBLE_PRESSURE_RADIUS_YARDS`) or had at least one open forward outlet to pass to — a clean
+/// unlucky strip on a fresh touch in open space is NOT punished. Otherwise it is
+/// `base + excess_seconds·per-second + ignored_outlets·per-outlet`, then multiplied by a pressure
+/// factor that grows as the nearest opponent gets right on top of the carrier (1× at the pressure
+/// radius up to ~2× point-blank), capped. This is the field-vector context the user asked for:
+/// the magnitude reflects how long the carrier held, how much pressure was on them, and how many
+/// passing options they ignored. Pure (env-free) so the scaling is unit-tested directly. See
+/// [`overdribble_penalty_enabled`].
+pub(crate) fn overdribble_dispossession_penalty_points(
+    hold_seconds: f64,
+    nearest_opponent_distance_yards: f64,
+    open_forward_outlets: usize,
+) -> f64 {
+    if !hold_seconds.is_finite() || !nearest_opponent_distance_yards.is_finite() {
+        return 0.0;
+    }
+    let excess = hold_seconds - OVERDRIBBLE_MIN_HOLD_SECONDS;
+    if excess <= 0.0 {
+        return 0.0;
+    }
+    let under_pressure = nearest_opponent_distance_yards <= OVERDRIBBLE_PRESSURE_RADIUS_YARDS;
+    if !under_pressure && open_forward_outlets == 0 {
+        return 0.0;
+    }
+    let mut points = OVERDRIBBLE_BASE_PENALTY_POINTS
+        + excess * OVERDRIBBLE_PER_EXCESS_SECOND_POINTS
+        + open_forward_outlets as f64 * OVERDRIBBLE_PER_IGNORED_OUTLET_POINTS;
+    if under_pressure {
+        let proximity = ((OVERDRIBBLE_PRESSURE_RADIUS_YARDS - nearest_opponent_distance_yards)
+            / OVERDRIBBLE_PRESSURE_RADIUS_YARDS)
+            .clamp(0.0, 1.0);
+        points *= 1.0 + proximity;
+    }
+    points.min(OVERDRIBBLE_MAX_PENALTY_POINTS)
+}
+
+/// Whether the **over-dribble dispossession penalty** is active this process. Adds a sharp,
+/// carrier-attributed MARL/MAPPO learning signal at the moment the ball is stolen off a carrier who
+/// dribbled too long — scaled by hold time, pressure, and ignored passing options. Default-ON in
+/// production (env `DD_SOCCER_ENABLE_OVERDRIBBLE_PENALTY=0/false` is the kill switch); default-OFF
+/// under test so the reward-parity suite stays byte-identical. See
+/// [`overdribble_dispossession_penalty_points`].
+pub(crate) fn overdribble_penalty_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_OVERDRIBBLE_PENALTY").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_OVERDRIBBLE_PENALTY"))
+    }
+}
+
+/// Minimum gait a ball carrier should drive at when carrying the ball forward into open space — the
+/// "first inclination is to jog/run/sprint forward, not walk the ball" rule. Returns `None` when no
+/// floor applies: under tight pressure (`<= CARRIER_DRIVE_TIGHT_PRESSURE_YARDS`, where close control
+/// beats pace) or with too little room ahead (`< CARRIER_DRIVE_JOG_SPACE_YARDS`). Otherwise the
+/// floor is graded by open forward space — a couple of clear yards ⇒ at least a jog, a clear lane ⇒
+/// a run, open field ⇒ a sprint (capped to a run when too fatigued to flat-out sprint). The caller
+/// applies it as an UPSHIFT only, so it never slows a carrier already moving faster. Pure (env-free)
+/// so the thresholds are unit-tested directly. See [`carrier_forward_drive_enabled`].
+pub(crate) fn carrier_forward_drive_gait_floor(
+    forward_space_yards: f64,
+    nearest_opponent_distance_yards: f64,
+    fatigue: f64,
+) -> Option<MovementGait> {
+    if !forward_space_yards.is_finite() || !nearest_opponent_distance_yards.is_finite() {
+        return None;
+    }
+    if nearest_opponent_distance_yards <= CARRIER_DRIVE_TIGHT_PRESSURE_YARDS
+        || forward_space_yards < CARRIER_DRIVE_JOG_SPACE_YARDS
+    {
+        return None;
+    }
+    let floor = if forward_space_yards >= CARRIER_DRIVE_SPRINT_SPACE_YARDS
+        && fatigue < CARRIER_DRIVE_SPRINT_MAX_FATIGUE
+    {
+        MovementGait::Sprint
+    } else if forward_space_yards >= CARRIER_DRIVE_RUN_SPACE_YARDS {
+        MovementGait::Run
+    } else {
+        MovementGait::Jog
+    };
+    Some(floor)
+}
+
+/// Whether the **carrier forward-drive gait floor** is active this process. Makes a ball carrier
+/// driving into open forward space jog/run/sprint into it (graded by the room ahead) as the first
+/// inclination, rather than knocking the ball forward and walking after it. Applied as an upshift
+/// only and suppressed under tight pressure, so close control is never compromised. Default-ON in
+/// production (env `DD_SOCCER_ENABLE_CARRIER_FORWARD_DRIVE=0/false` is the kill switch); default-OFF
+/// under test so the movement-parity suite stays byte-identical. See
+/// [`carrier_forward_drive_gait_floor`].
+pub(crate) fn carrier_forward_drive_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_CARRIER_FORWARD_DRIVE").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_CARRIER_FORWARD_DRIVE"))
+    }
+}
+
 /// Whether the **MPC pass-weight solver** is active this process. For a ground pass to a receiver
 /// it solves the EXACT launch speed that lands the decelerating ball on the aim point as the
 /// receiver's predicted run arrives there — so pass weight is physically timed to the receiver, not
