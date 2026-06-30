@@ -1994,6 +1994,11 @@ fn run_game(
     if let Some(head) = CARRIED_LONG_PASS_RUN_HEAD.lock().unwrap().as_ref() {
         sim.set_long_pass_run_head(head.clone());
     }
+    // Install the carried give-and-go head so the carrier's wall-pass appetite consumes it live
+    // once trained. No-op unless DD_SOCCER_ENABLE_LEARNED_GIVE_AND_GO is set.
+    if let Some(head) = CARRIED_GIVE_AND_GO_HEAD.lock().unwrap().as_ref() {
+        sim.set_give_and_go_head(head.clone());
+    }
     // Install the carried pass-completion head so the pass-quality assessor consumes it live
     // once trained. No-op on completion scoring unless DD_SOCCER_ENABLE_LEARNED_PASS_COMPLETION
     // is on; the head still trains regardless so it is warm when the gate is flipped.
