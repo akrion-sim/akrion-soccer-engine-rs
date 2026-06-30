@@ -17869,6 +17869,7 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::CrashBoxArrival
                 | SoccerRewardEventKind::SustainedForwardDribble
                 | SoccerRewardEventKind::ProductiveForwardCarry
+                | SoccerRewardEventKind::BuildupChainCredit
         )
     }
 }
