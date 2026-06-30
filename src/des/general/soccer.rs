@@ -18414,6 +18414,26 @@ pub(crate) fn team_advance_upfield_enabled() -> bool {
     }
 }
 
+/// Whether the **progressive-carry reward** is active this process. Adds two MARL/MAPPO learning
+/// signals that the prior reward set was missing: (1) SUSTAINED forward dribbling — every 2-yard
+/// forward segment past the first in a continuous carry; and (2) PRODUCTIVE forward carry — a carry
+/// paid off in 2-yard segments when it culminates in a forward pass or a shot. Default-ON in
+/// production (env `DD_SOCCER_ENABLE_PROGRESSIVE_CARRY_REWARD=0/false` is the kill switch);
+/// default-OFF under test so the reward-parity suite stays byte-identical. See
+/// [`ForwardCarryTracker`].
+pub(crate) fn progressive_carry_reward_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_PROGRESSIVE_CARRY_REWARD").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_PROGRESSIVE_CARRY_REWARD"))
+    }
+}
+
 /// Master gate for the "outside mid attack defender" attacking play. When set, the team-strategy
 /// heuristic proposes [`TeamAttackStrategy::OutsideMidAttackDefenderLeft`]/`Right` for a wide
 /// carrier driving the flank in the opponent half. Unset (default) the strategy is never proposed,
