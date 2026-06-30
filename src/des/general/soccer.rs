@@ -13468,6 +13468,47 @@ pub(crate) fn scoop_higher_apex_enabled() -> bool {
     }
 }
 
+/// Whether the **scoop land-on-the-receiver physics fix** is active (gate
+/// `DD_SOCCER_ENABLE_SCOOP_LAND_AT_TARGET`, default-ON prod / OFF test). Fixes the "hot-air-balloon"
+/// float — a scoop that reaches the receiver's spot then HANGS in the air descending instead of
+/// obeying gravity. Two decouplings caused it: (1) the launch speed was paced from a FIXED apex
+/// (unit 0.5) while the in-flight altitude clock flew a RANDOM apex, so the gravity hang time the
+/// ball actually flew differed from the one its pace was calibrated for; (2) the fixed 16mph
+/// min-speed floor over-paced SHORT scoops, landing them at the receiver's spot in a fraction of
+/// the hang time. When ON, the scoop apex is deterministic (unit 0.5 — pace and flight agree) and
+/// the speed floor is capped at the land-at-target pace, so the chip arrives in ~one hang time and
+/// DROPS onto the man. OFF ⇒ byte-identical (random apex + fixed floor).
+pub(crate) fn scoop_land_at_target_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_SCOOP_LAND_AT_TARGET")
+            .map(|raw| {
+                let v = raw.trim().to_ascii_lowercase();
+                matches!(v.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_SCOOP_LAND_AT_TARGET"))
+    }
+}
+
+/// The per-pass apex "unit" (0..1) for a scoop's loft, given its launch seed. Without the
+/// land-at-target fix this is hashed off `launch_tick`/`from` for cosmetic variation; WITH the fix
+/// it collapses to a deterministic 0.5 so the apex the ball flies matches the apex its launch speed
+/// was paced from (see `scoop_land_at_target_enabled`). Shared by the live-flight and snapshot apex
+/// readers so they never disagree.
+fn scoop_apex_unit(launch_tick: u64, from_id: usize) -> f64 {
+    if scoop_land_at_target_enabled() {
+        return 0.5;
+    }
+    let seed = launch_tick.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (from_id as u64).wrapping_shl(17);
+    ((seed >> 40) & 0xFFFF) as f64 / 65535.0
+}
+
 /// Whether the **moderate give-and-go live-frequency bump** is active this process: a modest
 /// extra widening of the wall-pass trigger zone and a lift on the carrier's appetite to combine,
 /// so more one-twos actually appear in live play. **Default-ON in production**
