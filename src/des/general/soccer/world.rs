@@ -10451,6 +10451,14 @@ impl SoccerMatch {
         if let Some(shooter) = shooter {
             self.record_possession_touch(shooter);
         }
+        // Buildup credit (goal tier): the whole move that led to the goal is rewarded, recency-
+        // discounted. A goal is also on target, so its finisher additionally collected the on-frame
+        // tier from `record_shot_on_target_rewards` — "especially a goal".
+        self.record_buildup_chain_credit(
+            scoring_team,
+            shooter,
+            BUILDUP_CHAIN_CREDIT_GOAL_BASE_POINTS,
+        );
         if let Some(reward_points) =
             self.direct_turnover_goal_reward_points(scoring_team, shooter, previous_touch_team)
         {
