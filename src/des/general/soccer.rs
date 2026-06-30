@@ -18294,6 +18294,7 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::WallPassCombination
                 | SoccerRewardEventKind::ReleaseLongInsideOwnHalf
                 | SoccerRewardEventKind::OverdribbleDispossession
+                | SoccerRewardEventKind::TurnoverChainBlame
                 | SoccerRewardEventKind::MatchResult
         )
     }
