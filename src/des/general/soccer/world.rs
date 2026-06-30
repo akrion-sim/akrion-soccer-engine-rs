@@ -8961,6 +8961,25 @@ impl SoccerMatch {
         total_amount: f64,
         weights: &[f64],
     ) {
+        self.record_weighted_possession_chain_reward_at_with_kind(
+            tick,
+            team,
+            primary_player,
+            total_amount,
+            weights,
+            SoccerRewardEventKind::Routine,
+        );
+    }
+
+    fn record_weighted_possession_chain_reward_at_with_kind(
+        &mut self,
+        tick: u64,
+        team: Team,
+        primary_player: Option<usize>,
+        total_amount: f64,
+        weights: &[f64],
+        kind: SoccerRewardEventKind,
+    ) {
         if total_amount.abs() <= 1e-9 || weights.is_empty() {
             return;
         }
@@ -8973,7 +8992,12 @@ impl SoccerMatch {
             return;
         }
         for (player_id, weight) in recipients.into_iter().zip(weights.iter().copied()) {
-            self.record_reward_event_at(tick, player_id, total_amount * weight / weight_total);
+            self.record_reward_event_at_with_kind(
+                tick,
+                player_id,
+                total_amount * weight / weight_total,
+                kind,
+            );
         }
     }
 
@@ -9205,6 +9229,10 @@ impl SoccerMatch {
             + progressive_pass_escape_reward(pass, self.ball.position)
             + self.overload_forward_pass_progression_bonus(pass, self.ball.position);
         self.record_reward_event(pass.from, amount);
+        let completed_forward_yards = (self.ball.position.y - pass.origin.y) * pass.team.attack_dir();
+        if completed_forward_yards >= PROGRESSIVE_CARRY_FORWARD_PASS_MIN_YARDS {
+            self.record_progressive_carry_outcome_reward(pass.from, pass.team, completed_forward_yards);
+        }
         if pass.is_cross {
             match pass.team {
                 Team::Home => self.stats.crosses_completed_home += 1,
@@ -9231,6 +9259,76 @@ impl SoccerMatch {
                 if is_wall { 1.0 } else { 0.0 },
                 if killer_pass_reward > 0.0 { 1.0 } else { 0.0 },
             );
+        }
+    }
+
+    fn record_progressive_carry_outcome_reward(
+        &mut self,
+        carrier_id: usize,
+        team: Team,
+        outcome_forward_yards: f64,
+    ) {
+        if dd_soccer_disable_progressive_carry_outcome_reward()
+            || carrier_id >= self.players.len()
+            || self.players[carrier_id].team != team
+        {
+            return;
+        }
+        let outcome_forward_yards = soccer_finite_nonnegative_metric(outcome_forward_yards);
+        let cutoff = self.tick.saturating_sub(PROGRESSIVE_CARRY_OUTCOME_WINDOW_TICKS);
+        let mut carried: Vec<(SoccerLearningTransition, f64)> = Vec::new();
+        for transition in self.recent_learning_history.iter().rev() {
+            if transition.tick < cutoff {
+                break;
+            }
+            if transition.player_id != carrier_id || transition.team != team {
+                continue;
+            }
+            let action = normalize_soccer_action_label(&transition.action);
+            if !is_dribble_action_label(action) {
+                if is_pass_like_action(action)
+                    || matches!(action, "shoot" | "first-time-shot" | "first-time-header")
+                {
+                    break;
+                }
+                continue;
+            }
+            if let Some(carry_yards) = Self::progressive_carry_yards_for_transition(transition) {
+                carried.push((transition.clone(), carry_yards));
+            }
+        }
+        let total_yards = carried.iter().map(|(_, yards)| *yards).sum::<f64>();
+        if total_yards < PROGRESSIVE_CARRY_OUTCOME_MIN_YARDS {
+            return;
+        }
+        let two_yard_steps = (total_yards / PROGRESSIVE_CARRY_OUTCOME_MIN_YARDS).floor();
+        if two_yard_steps < 1.0 {
+            return;
+        }
+        let outcome_multiplier = (0.80 + (outcome_forward_yards / 18.0).clamp(0.0, 0.70))
+            .clamp(0.80, 1.50);
+        let total_reward = (two_yard_steps * PROGRESSIVE_CARRY_OUTCOME_REWARD_PER_TWO_YARDS
+            * outcome_multiplier)
+            .min(PROGRESSIVE_CARRY_OUTCOME_MAX_REWARD_POINTS);
+        if total_reward <= 1e-9 || !total_reward.is_finite() {
+            return;
+        }
+        for (mut transition, yards) in carried {
+            let amount = total_reward * yards / total_yards;
+            if amount <= 1e-9 || !amount.is_finite() {
+                continue;
+            }
+            self.record_reward_event_at_with_kind(
+                transition.tick,
+                carrier_id,
+                amount,
+                SoccerRewardEventKind::ProgressiveCarryIntoAttack,
+            );
+            if self.config.learning_enabled {
+                transition.reward = amount;
+                transition.done = false;
+                self.deferred_reward_transitions.push(transition);
+            }
         }
     }
 
@@ -9916,6 +10014,7 @@ impl SoccerMatch {
 
     pub(crate) fn record_shot_on_target_rewards(&mut self, shooting_team: Team, shooter: usize) {
         self.record_possession_touch(shooter);
+        self.record_progressive_carry_outcome_reward(shooter, shooting_team, 18.0);
         debug_assert!(
             (SHOT_ON_TARGET_REWARD_PATTERN.iter().sum::<f64>() - SHOT_ON_TARGET_REWARD_POINTS)
                 .abs()
@@ -9923,6 +10022,14 @@ impl SoccerMatch {
         );
         let scale = self.shot_reward_distance_scale(shooting_team, shooter);
         let contextual_pool = SHOT_ON_TARGET_REWARD_POINTS * scale;
+        self.record_weighted_possession_chain_reward_at_with_kind(
+            self.tick,
+            shooting_team,
+            Some(shooter),
+            contextual_pool,
+            &SHOT_ON_TARGET_REWARD_PATTERN,
+            SoccerRewardEventKind::ShotOnTarget,
+        );
         if self.record_contextual_attacking_rewards(
             shooting_team,
             Some(shooter),
@@ -9932,16 +10039,6 @@ impl SoccerMatch {
             self.update_mpc_latent_objective(shooting_team, None, Some(scale), None);
             return;
         }
-        let scaled: Vec<f64> = SHOT_ON_TARGET_REWARD_PATTERN
-            .iter()
-            .map(|w| w * scale)
-            .collect();
-        self.record_possession_reward_pattern_with_kind(
-            shooting_team,
-            Some(shooter),
-            &scaled,
-            SoccerRewardEventKind::ShotOnTarget,
-        );
         self.update_mpc_latent_objective(shooting_team, None, Some(scale), None);
     }
 
@@ -10089,15 +10186,22 @@ impl SoccerMatch {
 
     /// A shot OFF the frame still earns a small attempt reward (10 vs the on-frame
     /// 40), distance-tapered the same way.
-    fn record_shot_off_target_rewards(&mut self, shooting_team: Team, shooter: usize) {
+    pub(crate) fn record_shot_off_target_rewards(
+        &mut self,
+        shooting_team: Team,
+        shooter: usize,
+    ) {
         self.record_possession_touch(shooter);
-        let scale = self.shot_reward_distance_scale(shooting_team, shooter)
-            * (SHOT_OFF_TARGET_REWARD_POINTS / SHOT_ON_TARGET_REWARD_POINTS);
-        let scaled: Vec<f64> = SHOT_ON_TARGET_REWARD_PATTERN
-            .iter()
-            .map(|w| w * scale)
-            .collect();
-        self.record_possession_reward_pattern(shooting_team, Some(shooter), &scaled);
+        let reward_pool = SHOT_OFF_TARGET_REWARD_POINTS
+            * self.shot_reward_distance_scale(shooting_team, shooter);
+        self.record_weighted_possession_chain_reward_at_with_kind(
+            self.tick,
+            shooting_team,
+            Some(shooter),
+            reward_pool,
+            &SHOT_ON_TARGET_REWARD_PATTERN,
+            SoccerRewardEventKind::ShotAttempt,
+        );
     }
 
     fn current_goal_credit_transition(&self, player_id: usize) -> Option<SoccerLearningTransition> {
@@ -10409,15 +10513,23 @@ impl SoccerMatch {
                 &[reward_points],
                 SoccerRewardEventKind::Goal,
             );
-        } else if !self.record_contextual_goal_rewards(scoring_team, shooter, GOAL_REWARD_POINTS) {
+        } else {
             debug_assert!(
-                (GOAL_CHAIN_REWARD_PATTERN.iter().sum::<f64>() - GOAL_REWARD_POINTS).abs() < 1e-9
+                (GOAL_CHAIN_REWARD_PATTERN.iter().sum::<f64>() - GOAL_REWARD_POINTS).abs()
+                    < 1e-9
             );
-            self.record_possession_reward_pattern_with_kind(
+            self.record_weighted_possession_chain_reward_at_with_kind(
+                self.tick,
                 scoring_team,
                 shooter,
+                GOAL_REWARD_POINTS,
                 &GOAL_CHAIN_REWARD_PATTERN,
                 SoccerRewardEventKind::Goal,
+            );
+            self.record_contextual_goal_rewards(
+                scoring_team,
+                shooter,
+                GOAL_REWARD_POINTS,
             );
         }
         self.update_mpc_latent_objective(scoring_team, None, Some(1.0), Some(1.0));
@@ -12829,28 +12941,24 @@ impl SoccerMatch {
                         }
                         None => modulated_speed,
                     };
-                    // Learnable pass velocity (execution side): honor the speed the decision
-                    // priced. The value trade-off (receipt-aware) elects a power bucket; when
-                    // it chose to DRIVE the ball (above the 0.68 nominal) the lane was
-                    // contested and a firmer pass beats the defender to the corridor, so firm
-                    // the struck ball UP to that chosen pace. When it kept a weighted ball (an
-                    // open lane) the executed speed is left untouched — an uncontested pass is
-                    // never firmed or slowed. Firming to the CHOSEN speed (not the raw
-                    // `min_clearing` floor) keeps a contested ball receivable: the chosen speed
-                    // already balances threading the lane against the receiver controlling it,
-                    // so it can't over-drive into an uncontrollable rocket. Ground only;
-                    // aerials keep their gravity-fixed calibration. Disabled ⇒ unchanged.
+                    // Learnable pass velocity (execution side): honor the MPC speed the
+                    // decision priced in BOTH directions. The old release gate only firmed
+                    // a ball up when the plan picked a driven bucket; if the analytic pace was
+                    // too hot for a short/open receiver, the plan could not soften it, and if
+                    // it was too weak for a runner the target/launch timing could diverge. Pull
+                    // the struck speed toward the receipt-aware bucket so weight is a state
+                    // decision, not a random or one-way correction.
                     let speed =
                         if !flight.is_aerial() && !dd_soccer_disable_learnable_pass_velocity() {
                             if let Some(passer_snap) =
                                 snapshot.players.iter().find(|p| p.id == player_id)
                             {
                                 let receiver = target_id.and_then(|id| {
-                                    snapshot
-                                        .players
-                                        .iter()
-                                        .find(|p| p.id == id)
-                                        .map(|p| (p, p.position))
+                                    snapshot.players.iter().find(|p| p.id == id).map(|p| {
+                                        let position =
+                                            snapshot.player_position(id).unwrap_or(p.position);
+                                        (p, position)
+                                    })
                                 });
                                 let plan = pass_velocity_plan_for_snapshot(
                                     &snapshot,
@@ -12861,13 +12969,18 @@ impl SoccerMatch {
                                     is_cross,
                                     receiver,
                                 );
-                                if plan.power > 0.68 {
-                                    speed.max(plan.speed_yps).min(mph_to_yps(
-                                        GROUND_PASS_CEILING_MPH + PASS_SPEED_CEILING_OVERSHOOT_MPH,
-                                    ))
-                                } else {
-                                    speed
-                                }
+                                let ceiling =
+                                    mph_to_yps(GROUND_PASS_CEILING_MPH + PASS_SPEED_CEILING_OVERSHOOT_MPH);
+                                let plan_speed = plan.speed_yps.clamp(mph_to_yps(4.0), ceiling);
+                                let mpc_trust = (0.42
+                                    + plan.mpc_receipt_probability.clamp(0.0, 1.0) * 0.34
+                                    + (1.0 - plan.lane_interception_risk.clamp(0.0, 1.0)) * 0.18)
+                                    .clamp(0.45, 0.88);
+                                let blended = speed * (1.0 - mpc_trust) + plan_speed * mpc_trust;
+                                blended.clamp(
+                                    speed.min(plan_speed) * 0.92,
+                                    speed.max(plan_speed) * 1.08,
+                                )
                             } else {
                                 speed
                             }
@@ -18726,7 +18839,11 @@ impl SoccerMatch {
         self.learning_transitions.extend(transitions);
     }
 
-    fn remember_recent_learning_transitions(&mut self, transitions: &[SoccerLearningTransition]) {
+    pub(crate) fn remember_recent_learning_transitions(
+        &mut self,
+        transitions: &[SoccerLearningTransition],
+    ) {
+        self.record_progressive_carry_continuation_rewards(transitions);
         for transition in transitions {
             self.recent_learning_history.push_back(transition.clone());
         }
@@ -18779,6 +18896,107 @@ impl SoccerMatch {
                 self.wasted_energy_history.pop_front();
             }
             self.finalize_wasted_energy_window();
+        }
+    }
+
+    fn progressive_carry_yards_for_transition(transition: &SoccerLearningTransition) -> Option<f64> {
+        let action = normalize_soccer_action_label(&transition.action);
+        if !is_dribble_action_label(action) {
+            return None;
+        }
+        let carry_yards = transition
+            .decision_context
+            .realized_ball_forward_yards
+            .max(transition.decision_context.realized_player_forward_yards)
+            .max(0.0);
+        (carry_yards.is_finite() && carry_yards >= 0.25).then_some(carry_yards)
+    }
+
+    fn prior_progressive_carry_chain_yards(
+        &self,
+        carrier_id: usize,
+        team: Team,
+        before_tick: u64,
+    ) -> f64 {
+        let cutoff = before_tick.saturating_sub(PROGRESSIVE_CARRY_OUTCOME_WINDOW_TICKS);
+        let mut total = 0.0;
+        for transition in self.recent_learning_history.iter().rev() {
+            if transition.tick < cutoff {
+                break;
+            }
+            if transition.tick >= before_tick {
+                continue;
+            }
+            if transition.player_id != carrier_id || transition.team != team {
+                continue;
+            }
+            let Some(carry_yards) = Self::progressive_carry_yards_for_transition(transition) else {
+                break;
+            };
+            total += carry_yards;
+        }
+        total
+    }
+
+    fn record_progressive_carry_continuation_rewards(
+        &mut self,
+        transitions: &[SoccerLearningTransition],
+    ) {
+        if dd_soccer_disable_progressive_carry_continuation_reward() {
+            return;
+        }
+        for transition in transitions {
+            let Some(current_yards) = Self::progressive_carry_yards_for_transition(transition) else {
+                continue;
+            };
+            if transition.player_id >= self.players.len()
+                || self.players[transition.player_id].team != transition.team
+            {
+                continue;
+            }
+            let prior_yards = self.prior_progressive_carry_chain_yards(
+                transition.player_id,
+                transition.team,
+                transition.tick,
+            );
+            let before_two_yard_steps =
+                (prior_yards / PROGRESSIVE_CARRY_OUTCOME_MIN_YARDS).floor() as usize;
+            let after_two_yard_steps =
+                ((prior_yards + current_yards) / PROGRESSIVE_CARRY_OUTCOME_MIN_YARDS).floor()
+                    as usize;
+            let new_two_yard_pairs = after_two_yard_steps
+                .saturating_sub(1)
+                .saturating_sub(before_two_yard_steps.saturating_sub(1));
+            let before_one_yard_steps =
+                (prior_yards / PROGRESSIVE_CARRY_CONTINUATION_ONE_YARD_STEP).floor() as usize;
+            let after_one_yard_steps = ((prior_yards + current_yards)
+                / PROGRESSIVE_CARRY_CONTINUATION_ONE_YARD_STEP)
+                .floor() as usize;
+            let new_one_yard_pairs = after_one_yard_steps
+                .saturating_sub(1)
+                .saturating_sub(before_one_yard_steps.saturating_sub(1));
+            if new_two_yard_pairs == 0 && new_one_yard_pairs == 0 {
+                continue;
+            }
+            let amount = (new_two_yard_pairs as f64 * PROGRESSIVE_CARRY_CONTINUATION_REWARD_PER_PAIR
+                + new_one_yard_pairs as f64
+                    * PROGRESSIVE_CARRY_CONTINUATION_ONE_YARD_REWARD_PER_PAIR)
+                .min(PROGRESSIVE_CARRY_CONTINUATION_MAX_REWARD_POINTS);
+            if amount <= 1e-9 || !amount.is_finite() {
+                continue;
+            }
+            self.record_reward_event_at_with_kind(
+                transition.tick,
+                transition.player_id,
+                amount,
+                SoccerRewardEventKind::ProgressiveCarryContinuation,
+            );
+            if self.config.learning_enabled {
+                let mut rewarded = transition.clone();
+                rewarded.reward = amount;
+                rewarded.done = false;
+                self.deferred_reward_transitions.push(rewarded);
+            }
         }
     }
 
@@ -21996,6 +22214,18 @@ fn dd_soccer_disable_combination_run_reward() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_COMBINATION_RUN_REWARD").is_ok())
 }
+fn dd_soccer_disable_progressive_carry_outcome_reward() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_PROGRESSIVE_CARRY_OUTCOME_REWARD").is_ok())
+}
+fn dd_soccer_disable_progressive_carry_continuation_reward() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_DISABLE_PROGRESSIVE_CARRY_CONTINUATION_REWARD").is_ok()
+    })
+}
 fn dd_soccer_disable_runaround_dribble() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
@@ -23088,7 +23318,7 @@ impl WorldSnapshot {
     pub(crate) fn attacking_support_sprint_active(&self, team: Team) -> bool {
         matches!(
             self.tactical_directive(team).attack_strategy,
-            TeamAttackStrategy::ExploitSpace
+            TeamAttackStrategy::ExploitSpace | TeamAttackStrategy::AdvanceUpfield
         ) || self.striker_holder_in_opponent_half(team).is_some()
             || self.attacking_carrier_driving_at_goal(team).is_some()
             || self.team_speed_surge_active(team)
@@ -30446,8 +30676,9 @@ impl WorldSnapshot {
             tactical_learning_multiplier(directive.pass_target_ranking_learning_weight, 0.30);
         let goal_entry_pass_learning =
             tactical_learning_multiplier(directive.goal_entry_pass_learning_weight, 0.24);
-        let passer_pressure =
-            pressure_from_nearest_distance(self.nearest_opponent_distance_at(me.team, me_position));
+        let passer_nearest_opponent_distance =
+            self.nearest_opponent_distance_at(me.team, me_position);
+        let passer_pressure = pressure_from_nearest_distance(passer_nearest_opponent_distance);
         let no_pressure = self.no_pressure_at(me.team, me_position);
         let keeper_pressure = if me.role == PlayerRole::Goalkeeper {
             passer_pressure
@@ -31247,6 +31478,18 @@ impl WorldSnapshot {
                     .score
                     * SLIP_BREAK_OFFSIDE_TRAP_RANK_BONUS_WEIGHT;
                 let long_backward_penalty = long_backward_pass_penalty(forward);
+                let backward_pressure_release_score = backward_pass_pressure_release_score(
+                    forward,
+                    passer_pressure,
+                    passer_nearest_opponent_distance,
+                    me_position,
+                    self.field_width,
+                    self.field_length,
+                );
+                let backward_pressure_release_penalty = backward_pass_pressure_release_penalty(
+                    forward,
+                    backward_pressure_release_score,
+                );
                 // A backward ball played through opponents is doubly dangerous. The path
                 // traffic is already counted in `pass_quality` and scaled by backward depth
                 // for both floor and aerial candidates, so use that single source of truth.
@@ -31296,6 +31539,7 @@ impl WorldSnapshot {
                 let score = score + low_cross_policy_bonus
                     - blind_backward_penalty
                     - long_backward_penalty
+                    - backward_pressure_release_penalty
                     - backward_when_forward_available_penalty
                     - backward_path_traffic_penalty
                     - lateral_penalty
@@ -31366,8 +31610,9 @@ impl WorldSnapshot {
             tactical_learning_multiplier(directive.pass_target_ranking_learning_weight, 0.24);
         let goal_entry_pass_learning =
             tactical_learning_multiplier(directive.goal_entry_pass_learning_weight, 0.28);
-        let passer_pressure =
-            pressure_from_nearest_distance(self.nearest_opponent_distance_at(me.team, me_position));
+        let passer_nearest_opponent_distance =
+            self.nearest_opponent_distance_at(me.team, me_position);
+        let passer_pressure = pressure_from_nearest_distance(passer_nearest_opponent_distance);
         let no_pressure = self.no_pressure_at(me.team, me_position);
         let keeper_pressure = if me.role == PlayerRole::Goalkeeper {
             passer_pressure
@@ -31752,6 +31997,18 @@ impl WorldSnapshot {
                     &pass_quality,
                     directive.risk_tolerance,
                 );
+                let backward_pressure_release_score = backward_pass_pressure_release_score(
+                    forward,
+                    passer_pressure,
+                    passer_nearest_opponent_distance,
+                    me_position,
+                    self.field_width,
+                    self.field_length,
+                );
+                let backward_pressure_release_penalty = backward_pass_pressure_release_penalty(
+                    forward,
+                    backward_pressure_release_score,
+                );
                 let score = directional_progress_score
                     + self.space_score_at(pass_point, me.team) * 0.65
                     - dist * 0.018
@@ -31774,6 +32031,7 @@ impl WorldSnapshot {
                     + role_risk.forward_risk_bonus * pass_target_learning
                     - blind_backward_penalty
                     - long_backward_pass_penalty(forward)
+                    - backward_pressure_release_penalty
                     // A backward loft still has to clear opponents on the path; this
                     // traffic penalty is computed inside `pass_quality` for aerial passes too.
                     - pass_quality.backward_path_traffic_penalty
@@ -41571,6 +41829,9 @@ impl WorldSnapshot {
             .clamp(1.05, 2.05);
         let depth_scale = (directive.support_depth_yards / 11.0).clamp(0.65, 1.65);
         let possession = self.possession_team() == Some(me.team);
+        let advance_upfield_strategy = possession
+            && dd_soccer_advance_upfield_strategy_enabled()
+            && directive.attack_strategy == TeamAttackStrategy::AdvanceUpfield;
         let own_half_possession =
             possession && pass_origin_in_own_half(me.team, self.ball.position, self.field_length);
         let wingback_flank_release_fit = if possession && self.is_wide_defender(me) {
@@ -41587,15 +41848,23 @@ impl WorldSnapshot {
             && me.role != PlayerRole::Goalkeeper
             && self.opponents_ahead_of(me_position, me.team)
                 < COUNTERATTACK_DEFENDERS_AHEAD_THRESHOLD;
+        let advance_depth_bonus = if advance_upfield_strategy { 5.0 } else { 0.0 };
         let role_depth = match me.role {
             PlayerRole::Goalkeeper => -8.0,
-            PlayerRole::Defender => self.defender_open_space_depth_yards(me, own_half_possession),
-            PlayerRole::Midfielder if own_half_possession => {
-                directive.support_depth_yards + 7.0 + tendency * 8.0
+            PlayerRole::Defender => {
+                self.defender_open_space_depth_yards(me, own_half_possession)
+                    + advance_depth_bonus * 0.35
             }
-            PlayerRole::Midfielder => directive.support_depth_yards + 3.0 + tendency * 10.0,
-            PlayerRole::Forward if own_half_possession => directive.support_depth_yards + 12.0,
-            PlayerRole::Forward => directive.support_depth_yards + 9.0,
+            PlayerRole::Midfielder if own_half_possession => {
+                directive.support_depth_yards + 7.0 + tendency * 8.0 + advance_depth_bonus
+            }
+            PlayerRole::Midfielder => {
+                directive.support_depth_yards + 3.0 + tendency * 10.0 + advance_depth_bonus
+            }
+            PlayerRole::Forward if own_half_possession => {
+                directive.support_depth_yards + 12.0 + advance_depth_bonus + 2.0
+            }
+            PlayerRole::Forward => directive.support_depth_yards + 9.0 + advance_depth_bonus + 2.0,
         };
         let base = if possession {
             let possession_width_fit =
@@ -41879,6 +42148,22 @@ impl WorldSnapshot {
                 } else {
                     0.0
                 };
+                let advance_upfield_bonus = if advance_upfield_strategy
+                    && self.ball.holder != Some(player_id)
+                    && me.role != PlayerRole::Goalkeeper
+                {
+                    let lane_fit =
+                        if self.clear_line(self.ball.position, p, me.team.other(), 1.8) {
+                            1.0
+                        } else {
+                            0.45
+                        };
+                    (forward_from_ball.clamp(0.0, 32.0) * 0.16
+                        + forward.max(0.0).min(24.0) * 0.08)
+                        * lane_fit
+                } else {
+                    0.0
+                };
                 // Final-third directness: reward goalward progress this candidate
                 // buys, but only for a genuinely receivable channel (forward of
                 // the ball, clear passing lane). Additive, so it complements —
@@ -41920,6 +42205,7 @@ impl WorldSnapshot {
                 );
                 let score = occupancy.open_space_score
                     + counterattack_bonus
+                    + advance_upfield_bonus
                     + goal_directness_bonus
                     + vacuum_run_bonus
                     + attacking_spacing_bonus
@@ -44161,7 +44447,11 @@ impl WorldSnapshot {
     /// short of the distance. This is the ball half of the MPC pass rendezvous — "when, if ever,
     /// does the ball get there?" — using the SAME `ball_resistance_after` the physics step uses, so
     /// the plan predicts the real flight.
-    fn ball_ground_travel_time(&self, distance: f64, launch_speed: f64) -> Option<f64> {
+    pub(crate) fn ball_ground_travel_time(
+        &self,
+        distance: f64,
+        launch_speed: f64,
+    ) -> Option<f64> {
         if !distance.is_finite() || !launch_speed.is_finite() {
             return None;
         }
@@ -44849,7 +45139,10 @@ impl WorldSnapshot {
         // carrier should be supported forward in numbers, not left to dribble alone.
         let uncontested_support = self.uncontested_carrier_advancing(me.team).is_some();
         let front_line_support = self.front_line_carrier_support_cue(me.team).is_some();
-        let forward_support_cue = uncontested_support || front_line_support;
+        let advance_upfield_strategy = dd_soccer_advance_upfield_strategy_enabled()
+            && self.tactical_directive(me.team).attack_strategy == TeamAttackStrategy::AdvanceUpfield;
+        let forward_support_cue =
+            uncontested_support || front_line_support || advance_upfield_strategy;
         // In our own half a drop to receive is still valid — unless a teammate is carrying
         // unpressured OR the holder is the front line, which means runners must supply depth.
         if !forward_support_cue
@@ -44868,7 +45161,7 @@ impl WorldSnapshot {
                 UNCONTESTED_SUPPORT_PUSH_YARDS + 3.0
             } else {
                 UNCONTESTED_SUPPORT_PUSH_YARDS
-            };
+            } + if advance_upfield_strategy { 2.0 } else { 0.0 };
             let pushed_y = current.y + attack * push_yards;
             let mut forward_y = if (pushed_y - point.y) * attack > 0.0 {
                 pushed_y
