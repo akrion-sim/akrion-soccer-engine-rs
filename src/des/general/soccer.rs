@@ -19416,6 +19416,13 @@ pub(crate) fn terrible_pass_veto_enabled() -> bool {
 /// interceptor sits just outside their triggers. Default-ON in production (env
 /// `DD_SOCCER_ENABLE_HOPELESS_PASS_VETO=0/false` is the kill switch); default-OFF under test so the
 /// pass parity suite stays byte-identical.
+///
+/// DEFAULT-OFF: live A/B on :5055 (gen 364) showed this execution-time veto does NOT improve
+/// possession — it cut completed passes ~35% and total possession losses rose, because the on-ball
+/// choice is the (curriculum-limited) neural policy: suppressing a bad pass release just makes the
+/// carrier hold and get tackled instead of creating a good option. Kept as an opt-in experiment
+/// (`DD_SOCCER_ENABLE_HOPELESS_PASS_VETO=1`) pending a retrain that fixes the root cause. See the
+/// turnover/passing memories.
 pub(crate) fn hopeless_pass_veto_enabled() -> bool {
     #[cfg(test)]
     {
@@ -19425,7 +19432,15 @@ pub(crate) fn hopeless_pass_veto_enabled() -> bool {
     {
         use std::sync::OnceLock;
         static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_HOPELESS_PASS_VETO"))
+        *V.get_or_init(|| {
+            matches!(
+                std::env::var("DD_SOCCER_ENABLE_HOPELESS_PASS_VETO")
+                    .ok()
+                    .as_deref()
+                    .map(str::trim),
+                Some("1" | "true" | "yes" | "on")
+            )
+        })
     }
 }
 
