@@ -13765,6 +13765,25 @@ impl SoccerMatch {
                                 )
                             };
                             let veto_on = terrible_pass_veto_enabled();
+                            // The reception race the two predicates above leave a gap for: a pass
+                            // to a tightly-marked receiver whose marker reaches the reception point
+                            // FIRST. `favours_opponent` only fires for a strictly-closer-than-
+                            // receiver mid-lane interceptor; `concedes` needs the marker inside the
+                            // concede radius AND real passer pressure. Neither catches a low-
+                            // completion ball whose interceptor sits just outside their triggers —
+                            // the "pass straight to the other team" the engine itself rates near-
+                            // zero completion yet still releases. Gated default-on; off ⇒ identical.
+                            let hopeless_on = hopeless_pass_veto_enabled();
+                            let loses_to_opponent = |point: Vec2| {
+                                hopeless_on
+                                    && snapshot.pass_reception_loses_to_opponent(
+                                        player_team,
+                                        receiver_position,
+                                        player_pos,
+                                        point,
+                                        speed,
+                                    )
+                            };
                             let own_attack_dir = player_team.attack_dir();
                             // A long backward ball — especially an aerial hoof or one played under
                             // pressure — is a giveaway (10+ yds toward our own goal, often to nobody
