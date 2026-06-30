@@ -505,6 +505,25 @@ pub struct RewardTunables {
     /// Penalty for a forced pass played under low pressure (no need to rush). Was
     /// `LOW_PRESSURE_FORCED_PASS_PENALTY_POINTS`.
     pub low_pressure_forced_pass_penalty_points: f64,
+    /// Flat penalty for giving the ball straight to the opponent (a turnover with
+    /// no intentional-long-ball exemption) from a hold in the actor's OWN half —
+    /// the most expensive giveaway, as it exposes the goal. The danger-scaled
+    /// follow-on cost (the opponent then advancing) is priced separately and
+    /// continuously by the net-Φ pitch-value term; this is the flat decision-step
+    /// price of the giveaway itself. Was the inline `3.5`.
+    pub giveaway_to_opponent_own_half_penalty: f64,
+    /// Flat penalty for giving the ball straight to the opponent from a hold in
+    /// the OPPONENT's half (less exposed than an own-half giveaway). Was the inline
+    /// `2.2`.
+    pub giveaway_to_opponent_opp_half_penalty: f64,
+    /// Flat penalty for losing the ball into a loose/contested state (no team in
+    /// settled possession after the touch) from the actor's OWN half — softer than
+    /// a clean giveaway because the ball is still up for grabs. Was the inline
+    /// `0.85`.
+    pub giveaway_to_loose_own_half_penalty: f64,
+    /// Flat penalty for losing the ball into a loose/contested state from the
+    /// OPPONENT's half. Was the inline `0.55`.
+    pub giveaway_to_loose_opp_half_penalty: f64,
     /// Scale on the dense **territorial pitch-control × expected-threat** delta
     /// reward (see [`crate::des::general::soccer::pitch_value`]). Multiplies the
     /// net change in the acting team's controlled threat between the before/after
