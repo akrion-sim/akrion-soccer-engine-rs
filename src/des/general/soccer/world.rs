@@ -11040,6 +11040,13 @@ impl SoccerMatch {
             self.forward_carry_tracker = None;
             return;
         };
+        // Keepers carry the ball in-hand (distribution), not at their feet — that is not dribbling,
+        // so it earns no progressive-carry reward. A dead-ball / set-play walk-up is likewise not
+        // open-play dribbling. End any run and stop tracking in both cases.
+        if holder.role == PlayerRole::Goalkeeper || self.active_set_play.is_some() {
+            self.forward_carry_tracker = None;
+            return;
+        }
         let team = holder.team;
         let ball_y = self.ball.position.y;
         let attack = team.attack_dir();
