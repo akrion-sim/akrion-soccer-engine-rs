@@ -11190,46 +11190,6 @@ impl SoccerMatch {
         }
     }
 
-    /// Cash out the PRODUCTIVE forward-carry reward (Reward A) when the current carrier's run ends
-    /// in a forward pass or a shot: pays [`SoccerRewardEventKind::ProductiveForwardCarry`] in 2-yard
-    /// segments of accumulated forward carry, then clears the tracker. A carry that ends any other
-    /// way (turnover, backward/square pass) is NOT paid — `clear_forward_carry_on_unproductive_end`
-    /// just drops it. Gated (default-on); OFF ⇒ no-op. Returns the points emitted (0 if none).
-    pub(crate) fn cash_out_productive_forward_carry(&mut self, carrier_id: usize) {
-        if !progressive_carry_reward_enabled() {
-            return;
-        }
-        let Some(tracker) = self.forward_carry_tracker else {
-            return;
-        };
-        if tracker.carrier_id != carrier_id {
-            return;
-        }
-        let points = tracker.productive_carry_reward_points();
-        self.forward_carry_tracker = None;
-        if points > 0.0 {
-            self.record_reward_event_with_kind(
-                carrier_id,
-                points,
-                SoccerRewardEventKind::ProductiveForwardCarry,
-            );
-        }
-    }
-
-    /// Drop the forward-carry tracker without paying it (the run ended unproductively — a backward
-    /// pass or a turnover). Gated; OFF ⇒ no-op.
-    pub(crate) fn clear_forward_carry_tracker(&mut self, carrier_id: usize) {
-        if !progressive_carry_reward_enabled() {
-            return;
-        }
-        if self
-            .forward_carry_tracker
-            .is_some_and(|tracker| tracker.carrier_id == carrier_id)
-        {
-            self.forward_carry_tracker = None;
-        }
-    }
-
     pub(crate) fn update_pass_chain_continuation_rewards(
         &mut self,
         before: &WorldSnapshot,
