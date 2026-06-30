@@ -17429,6 +17429,75 @@ impl PossessionProgressTracker {
     }
 }
 
+/// Tracks the CURRENT ball-carrier's continuous forward dribble so two progressive-carry MARL
+/// rewards can be paid (gated by `DD_SOCCER_ENABLE_PROGRESSIVE_CARRY_REWARD`):
+/// 1. SUSTAINED dribbling — each 2-yard forward segment past the first in one continuous carry
+///    (`fold_tick`, emitted per tick while the player keeps driving forward).
+/// 2. PRODUCTIVE carry — the accumulated forward yards, paid in 2-yard segments, cashed out at the
+///    moment the carry ends in a forward pass or a shot (`productive_carry_reward_points`).
+/// "Forward" is Δy·attack toward the opponent goal; lateral (x) movement is free — only the forward
+/// component is accumulated. A single carrier holds the ball at a time, so the match keeps one
+/// `Option<ForwardCarryTracker>`, reset when the holder changes / possession is lost. The segment
+/// accounting is pure (no env, no world access) so it is unit-tested directly.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ForwardCarryTracker {
+    pub(crate) carrier_id: usize,
+    pub(crate) team: Team,
+    pub(crate) last_ball_y: f64,
+    forward_carry_yards: f64,
+    sustained_rewarded_segments: u32,
+}
+
+impl ForwardCarryTracker {
+    fn new_at(carrier_id: usize, team: Team, ball_y: f64) -> Self {
+        Self {
+            carrier_id,
+            team,
+            last_ball_y: ball_y,
+            forward_carry_yards: 0.0,
+            sustained_rewarded_segments: 0,
+        }
+    }
+
+    /// Fold one tick of carry into the run. `forward_delta` is this tick's Δy·attack (positive =
+    /// toward the opponent goal). A meaningful backward move breaks the run (resets the accumulated
+    /// carry and the rewarded-segment counter). Returns the number of NEW sustained 2-yard segments
+    /// to reward this tick — segments PAST THE FIRST in the continuous run ("2 yards followed by 2
+    /// more"), capped. Pure.
+    fn fold_tick(&mut self, forward_delta: f64) -> u32 {
+        if !forward_delta.is_finite() {
+            return 0;
+        }
+        if forward_delta <= -FORWARD_CARRY_BACKWARD_RESET_YARDS {
+            self.forward_carry_yards = 0.0;
+            self.sustained_rewarded_segments = 0;
+            return 0;
+        }
+        self.forward_carry_yards = (self.forward_carry_yards + forward_delta).max(0.0);
+        let total_segments =
+            (self.forward_carry_yards / FORWARD_CARRY_SEGMENT_YARDS).floor() as u32;
+        // Only segments past the first are rewardable, capped to bound the payout.
+        let rewardable = total_segments
+            .saturating_sub(1)
+            .min(FORWARD_CARRY_MAX_REWARDED_SEGMENTS);
+        if rewardable > self.sustained_rewarded_segments {
+            let new_segments = rewardable - self.sustained_rewarded_segments;
+            self.sustained_rewarded_segments = rewardable;
+            new_segments
+        } else {
+            0
+        }
+    }
+
+    /// Points for a productive cash-out (the carry ended in a forward pass or a shot): one reward
+    /// unit per completed 2-yard forward segment, capped. Zero below one full segment. Pure.
+    fn productive_carry_reward_points(&self) -> f64 {
+        let segments = ((self.forward_carry_yards / FORWARD_CARRY_SEGMENT_YARDS).floor() as u32)
+            .min(FORWARD_CARRY_MAX_REWARDED_SEGMENTS);
+        segments as f64 * PRODUCTIVE_FORWARD_CARRY_PER_SEGMENT_REWARD_POINTS
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingPassSnapshot {
