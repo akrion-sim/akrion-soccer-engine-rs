@@ -1259,9 +1259,9 @@ fn mpc_execution_skill_for_label(player: &PlayerAgent, label: &str) -> f64 {
     .clamp(0.0, 1.0)
 }
 
-const SHORT_UPFIELD_GROUND_PASS_MIN_YARDS: f64 = 5.47;
-const SHORT_UPFIELD_GROUND_PASS_IDEAL_MAX_YARDS: f64 = 8.75;
-const SHORT_UPFIELD_GROUND_PASS_TAPER_YARDS: f64 = 8.0;
+const SHORT_UPFIELD_GROUND_PASS_MIN_YARDS: f64 = 5.0;
+const SHORT_UPFIELD_GROUND_PASS_IDEAL_MAX_YARDS: f64 = 15.0;
+const SHORT_UPFIELD_GROUND_PASS_TAPER_YARDS: f64 = 5.0;
 
 fn short_upfield_ground_pass_fit(observation: &SoccerPomdpObservation) -> f64 {
     if observation.visible_forward_pass_options == 0 {
@@ -3950,6 +3950,26 @@ impl PlayerAgent {
         } else {
             1.0
         };
+        let rolling_open_space_fit = if observation.has_ball && self.role != PlayerRole::Goalkeeper
+        {
+            let calm_fit = (1.0
+                - pressure
+                    .max(pressure_urgency)
+                    .max(observation.immediate_dispossession_risk)
+                    .clamp(0.0, 1.0))
+            .clamp(0.0, 1.0);
+            let space_fit = ((observation.forward_dribble_space_yards - 4.0) / 10.0)
+                .clamp(0.0, 1.0);
+            let movement_fit = (observation.actor_speed_yps / 2.6)
+                .clamp(0.0, 1.0)
+                .max((observation.perceived_time_on_ball_seconds / 1.2).clamp(0.0, 0.45));
+            (calm_fit * space_fit * movement_fit).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let rolling_space_carry_lift = (1.0 + rolling_open_space_fit * 0.34).clamp(1.0, 1.34);
+        let static_hold_open_space_damp =
+            (1.0 - rolling_open_space_fit * 0.72).clamp(0.22, 1.0);
         let patient_dribble_lift = (1.0
             + patience_factor * poor_floor_pass * (0.42 + forward_space_fit * 0.50))
             .clamp(1.0, 1.38);
@@ -4000,13 +4020,48 @@ impl PlayerAgent {
             0.0
         };
         let short_upfield_ground_pass_fit = short_upfield_ground_pass_fit(observation);
+        let attacking_numbers_up_fit = (observation.attacking_numbers_advantage as f64 / 4.0)
+            .clamp(0.0, 1.0)
+            .max(observation.pass_and_move_numbers_advantage.clamp(0.0, 1.0))
+            .max(observation.attacking_overload_score.clamp(0.0, 1.0) * 0.72);
         let short_upfield_ground_pass_multiplier = (1.0
             + short_upfield_ground_pass_fit
                 * (0.22
                     + decision_urgency * 0.14
                     + pressured_release_signal * 0.18
-                    + open_forward_outlet * 0.18))
+                    + open_forward_outlet * 0.18
+                    + attacking_numbers_up_fit * 0.12))
             .clamp(1.0, 1.62);
+        let direct_forward_release_fit = short_upfield_ground_pass_fit
+            .max(observation.quick_forward_pass_value.clamp(0.0, 1.0))
+            .max(
+                (open_forward_outlet
+                    * observation.expected_pass_completion.clamp(0.0, 1.0)
+                    * observation.floor_pass_lane_score.clamp(0.0, 1.0))
+                .clamp(0.0, 1.0),
+            );
+        let offensive_phase = observation.yards_to_goal <= observation.yards_to_own_goal + 6.0;
+        let backward_escape_pressure = pressure
+            .max(pressure_urgency)
+            .max(observation.immediate_dispossession_risk)
+            .max(excessive_hold_pressure(observation, dribbling))
+            .clamp(0.0, 1.0);
+        let forward_outlet_should_force_forward = offensive_phase
+            && observation.visible_forward_pass_options > 0
+            && direct_forward_release_fit >= 0.42
+            && backward_escape_pressure < 0.50;
+        let recycle_against_forward_outlet_multiplier = if offensive_phase {
+            (1.0 - direct_forward_release_fit * 0.48 - attacking_numbers_up_fit * 0.20)
+                .clamp(0.26, 1.0)
+        } else {
+            1.0
+        };
+        let switch_against_forward_outlet_multiplier = if offensive_phase {
+            (1.0 - direct_forward_release_fit * 0.26 - attacking_numbers_up_fit * 0.10)
+                .clamp(0.58, 1.0)
+        } else {
+            1.0
+        };
         // Critical spacing: most carriers react inside the 2-yard floor; everyone
         // wants 3yd in their own half, and defenders keep the wider 3-4yd cushion.
         // Moving-away opponents are less urgent. The response stays soft: dribbling
@@ -4121,6 +4176,7 @@ impl PlayerAgent {
         let dribble_score = (pre_fatigue_dribble_score
             * fatigue_dribble
             * patient_dribble_lift
+            * rolling_space_carry_lift
             * hold_penalty_multiplier
             * keeper_carry_under_pressure_damp
             * (1.0 - observation.side_glance_control_cost * 0.74).clamp(0.90, 1.0))
@@ -4156,6 +4212,7 @@ impl PlayerAgent {
             * (1.0 - pressure * 0.24).clamp(0.70, 1.0)
             * (1.0 - pressured_good_outlet * 0.44).clamp(0.50, 1.0)
             * (1.0 + solo_goal_drive_fit * 0.58)
+            * rolling_space_carry_lift
             * advance_upfield_carry_multiplier
             // Carrying forward INTO pressure is the worst option for a deep player — damp it
             // hard for anyone outside the three most-forward when there's real risk ahead.
@@ -4406,6 +4463,7 @@ impl PlayerAgent {
                 + pressure_rising * 0.80
                 + (1.0 - observation.perceived_time_on_ball_seconds / 2.8).clamp(0.0, 1.0) * 0.24)
             * protect_ball_escape_damp
+            * static_hold_open_space_damp
             * keeper_carry_under_pressure_damp)
             .clamp(0.01, protect_ball_ceiling)
             .max(pinned_shield_floor);
@@ -4581,6 +4639,11 @@ impl PlayerAgent {
             * (1.0 + solo_hold_up_need * 0.56 + if no_teammate_in_front { 0.18 } else { 0.0 }))
             * hold_penalty_multiplier
             * (1.0 - pressured_good_outlet * 0.26).clamp(0.62, 1.0)
+            * if solo_hold_up_need > 0.0 {
+                (1.0 - rolling_open_space_fit * 0.28).clamp(0.72, 1.0)
+            } else {
+                static_hold_open_space_damp
+            }
             * keeper_carry_under_pressure_damp)
             .clamp(0.03, hold_up_flank_ceiling);
         let mut options = vec![
@@ -4737,7 +4800,8 @@ impl PlayerAgent {
             * hold_release_multiplier
             * crowded_pass_lift
             * pressured_release_multiplier
-            * isolated_backward_release_multiplier)
+            * isolated_backward_release_multiplier
+            * recycle_against_forward_outlet_multiplier)
             .clamp(0.004, hold_release_score_cap);
         options.push(AgentActionOptionTrace::new(
             "recycle-reset",
@@ -4749,7 +4813,8 @@ impl PlayerAgent {
                 // killer ball to goal is on or a shot is on — it must not drain the final
                 // ball or produce a backward outlet in the shooting window.
                 && !observation.threaded_goal_pass_available
-                && !must_shoot_near_goal(observation, self.role),
+                && !must_shoot_near_goal(observation, self.role)
+                && !forward_outlet_should_force_forward,
         ));
         let switch_context = (flank_lane_fit * 0.36
             + observation.attacking_overload_score.clamp(0.0, 1.0) * 0.18
@@ -4768,7 +4833,8 @@ impl PlayerAgent {
             * hold_release_multiplier
             * crowded_pass_lift
             * pressured_release_multiplier
-            * isolated_backward_release_multiplier)
+            * isolated_backward_release_multiplier
+            * switch_against_forward_outlet_multiplier)
             .clamp(0.004, 0.98 * hold_release_multiplier.clamp(1.0, 1.28));
         options.push(AgentActionOptionTrace::new(
             "switch-play",
@@ -4779,7 +4845,8 @@ impl PlayerAgent {
                 // Don't switch the play when a killer ball to goal is on or a shot is on —
                 // take the goal threat, don't drain it across the pitch.
                 && !observation.threaded_goal_pass_available
-                && !must_shoot_near_goal(observation, self.role),
+                && !must_shoot_near_goal(observation, self.role)
+                && (!forward_outlet_should_force_forward || switch_context >= 0.62),
         ));
         let flank_cross_context =
             flank_cross_context_score(observation, self.position, field_width);
@@ -4995,9 +5062,10 @@ impl PlayerAgent {
                 .pass_and_move_forward_opportunity
                 .clamp(0.0, 1.0)
                 * 0.24
-            + observation.pass_and_move_numbers_advantage.clamp(0.0, 1.0) * 0.16
+            + observation.pass_and_move_numbers_advantage.clamp(0.0, 1.0) * 0.30
+            + attacking_numbers_up_fit * 0.12
             + observation.pass_and_move_run_lane_score.clamp(0.0, 1.0) * 0.10)
-            .clamp(1.0, 1.50);
+            .clamp(1.0, 1.68);
         for rank in 0..pass_target_count.min(3) {
             let rank_weight = match rank {
                 0 => 1.00,
@@ -5541,7 +5609,7 @@ impl PlayerAgent {
                 decisive_family_floor,
             );
         }
-        // Quick forward ground-pass priority: a short progressive ball (≈5–8 m) to an OPEN,
+        // Quick forward ground-pass priority: a short progressive ball (5-15 yd) to an OPEN,
         // advanced teammate should be RELEASED quickly, not dwelt on. Floor the primary pass
         // option and trim the dwell options (carry/dribble/shield/hold) in proportion to its
         // value so the carrier knocks it forward and keeps the ball moving — "passing sooner."
@@ -5567,7 +5635,7 @@ impl PlayerAgent {
         // he plays the open forward man instead of deliberating into a late, pressured square/back
         // pass (the reported "held forever then passed backward to the opponent" blunder). Floors
         // the best (forward-biased ranking) pass above the hold/dribble family and damps that dwell
-        // family in proportion to openness × dwell. Broader than the narrow ~5-8m quick-forward
+        // family in proportion to openness × dwell. Broader than the short quick-forward
         // band above (any open forward option qualifies). Deferred to real shot/killer logic. Gate
         // OFF (default under test) ⇒ strength clamps to 0 ⇒ byte-identical no-op.
         if forward_pass_first_enabled()
@@ -5889,7 +5957,7 @@ impl PlayerAgent {
             }
         }
         // Quick forward ground-pass priority on the first touch: when a short progressive ball
-        // (≈5–8 m) to an OPEN, advanced teammate is available AND the one-touch is physically on,
+        // (5-15 yd) to an OPEN, advanced teammate is available AND the one-touch is physically on,
         // play it FIRST-TIME rather than settling — floor the first-time-pass and trim the
         // controlling touch in proportion to the value. The chosen pass is delivered through the
         // MPC pass path. Gate OFF ⇒ value is 0 ⇒ byte-identical no-op.
@@ -6576,7 +6644,7 @@ impl PlayerAgent {
         let defensive_mindedness = self.preferences.defensive_mindedness.clamp(0.0, 1.0);
         let offensive_mindedness = self.preferences.offensive_mindedness.clamp(0.0, 1.0);
         let press = directive.press_intensity.clamp(0.0, 1.0);
-        let (shape_score, roam_score) = if self.role == PlayerRole::Goalkeeper {
+        let (mut shape_score, roam_score) = if self.role == PlayerRole::Goalkeeper {
             let ball_distance = self.position.distance(snapshot.ball.position);
             let close_ball = (1.0 - ball_distance / 12.0).clamp(0.0, 1.0);
             let line_recovery = snapshot.goalkeeper_line_recovery_sprint_active(self.id);
@@ -6596,14 +6664,31 @@ impl PlayerAgent {
                     .clamp(0.04, 0.82),
             )
         };
+        let press_profile = (self.role != PlayerRole::Goalkeeper)
+            .then(|| snapshot.defensive_press_contain_profile_for(self.id));
+        let press_model_score = press_profile
+            .map(|profile| profile.press_score)
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+        let press_model_contain = press_profile
+            .map(|profile| profile.contain_risk)
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+        let press_model_target = press_profile.is_some_and(|profile| profile.target.is_some());
+        if press_model_target {
+            shape_score *= (1.0 - press_model_score * 0.28).clamp(0.68, 1.0);
+        }
         let press_cover_legal = self.role != PlayerRole::Goalkeeper && holder_context.is_some();
         let press_cover_score = ((0.10
             + press * 0.32
             + defending * 0.18
             + aggression * 0.12
-            + tackle_contact_fit * 0.18)
+            + tackle_contact_fit * 0.18
+            + press_model_score * 0.44
+            + if press_model_target { 0.22 } else { 0.0 }
+            - press_model_contain * 0.12)
             * (0.70 + defensive_mindedness * 0.30))
-            .clamp(0.02, 0.92);
+            .clamp(0.02, 1.24);
         let mut options = vec![
             AgentActionOptionTrace::new("tackle", tackle_score, tackle_legal),
             AgentActionOptionTrace::new("defend-shape", shape_score, true),
@@ -10502,7 +10587,7 @@ impl PlayerAgent {
                             &observation,
                             self.role,
                         ) {
-                            // The primary pass adopts the quick forward (≈5–8 m, open, advanced)
+                            // The primary pass adopts the quick forward (5-15 yd, open, advanced)
                             // teammate when one qualifies, so the floored "pass sooner" release
                             // actually goes forward to feet. None when the gate is off ⇒ the
                             // ranked target is used unchanged.
@@ -12149,7 +12234,7 @@ impl PlayerAgent {
             }
             "first-time-pass" if observation.has_ball && observation.first_touch_available => {
                 let visible = snapshot.ranked_visible_pass_targets(self.id, 11);
-                // Prefer the quick forward (≈5–8 m, open, advanced) teammate when one is on —
+                // Prefer the quick forward (5-15 yd, open, advanced) teammate when one is on —
                 // played first-time and delivered through the MPC pass path. None when the gate
                 // is off ⇒ falls back to the top-ranked visible target (unchanged).
                 let target = observation
