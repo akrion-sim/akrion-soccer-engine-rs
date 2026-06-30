@@ -4177,6 +4177,50 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn reward_giveaway_penalty_defaults_match_historical_literals() {
+        // The four flat turnover-penalty magnitudes were bare literals in
+        // `dense_soccer_transition_reward` before extraction; defaults must
+        // reproduce them exactly so the training baseline stays byte-identical.
+        let r = RewardTunables::default();
+        assert_eq!(r.giveaway_to_opponent_own_half_penalty, 3.5);
+        assert_eq!(r.giveaway_to_opponent_opp_half_penalty, 2.2);
+        assert_eq!(r.giveaway_to_loose_own_half_penalty, 0.85);
+        assert_eq!(r.giveaway_to_loose_opp_half_penalty, 0.55);
+        // The ordering the turnover model encodes: an own-half giveaway straight to
+        // the opponent is the most expensive; a loose ball lost in the opponent's
+        // half the least. Locking it in stops a future retune from inverting it.
+        assert!(
+            r.giveaway_to_opponent_own_half_penalty > r.giveaway_to_opponent_opp_half_penalty
+        );
+        assert!(
+            r.giveaway_to_opponent_opp_half_penalty > r.giveaway_to_loose_own_half_penalty
+        );
+        assert!(r.giveaway_to_loose_own_half_penalty > r.giveaway_to_loose_opp_half_penalty);
+    }
+
+    #[test]
+    fn reward_giveaway_penalties_are_sanitized_and_validated() {
+        // Defaults pass through sanitize untouched and validate cleanly.
+        let mut r = RewardTunables::default();
+        r.sanitize();
+        assert_eq!(r.giveaway_to_opponent_own_half_penalty, 3.5);
+        assert_eq!(r.giveaway_to_loose_opp_half_penalty, 0.55);
+        let mut errors = Vec::new();
+        r.validate_strict("reward", &mut errors);
+        assert!(errors.is_empty(), "default reward tunables must validate: {errors:?}");
+
+        // A degenerate config can never inject a non-finite or wild penalty into a
+        // gradient: non-finite is repaired to the default, out-of-range is clamped
+        // to the hard bound.
+        let mut bad = RewardTunables::default();
+        bad.giveaway_to_opponent_own_half_penalty = f64::NAN;
+        bad.giveaway_to_loose_opp_half_penalty = 10_000.0;
+        bad.sanitize();
+        assert_eq!(bad.giveaway_to_opponent_own_half_penalty, 3.5, "NaN -> default");
+        assert_eq!(bad.giveaway_to_loose_opp_half_penalty, 200.0, "out-of-range -> hard cap");
+    }
+
+    #[test]
     fn defaults_match_historical_literals() {
         let t = Tunables::default();
         assert_eq!(t.tracking.moved_dt_multiplier, 1.2);
