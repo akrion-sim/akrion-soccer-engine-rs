@@ -27909,6 +27909,7 @@ impl WorldSnapshot {
                 field_opponents_behind: 0,
                 field_ahead_teammate_ratio: 0.5,
                 field_behind_teammate_ratio: 0.5,
+                defensive_goal_side_quality: 0.0,
                 field_player_motion: Vec::new(),
                 visible_forward_pass_options: 0,
                 threaded_goal_pass_available: false,
