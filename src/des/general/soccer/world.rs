@@ -8250,6 +8250,11 @@ impl SoccerMatch {
             &next_snapshot,
             self.config.learning_enabled || self.config.learning_logging_enabled,
         );
+        // Progressive-carry: accumulate the carrier's forward dribble and pay the sustained-dribble
+        // segments (no-op + byte-identical unless `DD_SOCCER_ENABLE_PROGRESSIVE_CARRY_REWARD`).
+        self.update_forward_carry_reward(
+            self.config.learning_enabled || self.config.learning_logging_enabled,
+        );
         self.update_offside_lingering_rewards(
             &next_snapshot,
             self.config.learning_enabled || self.config.learning_logging_enabled,
