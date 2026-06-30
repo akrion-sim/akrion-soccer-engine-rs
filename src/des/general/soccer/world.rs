@@ -23685,6 +23685,62 @@ impl WorldSnapshot {
     /// [`Self::back_four_line_v2_centre_fwd`]), and the MARL/MAPPO policy is rewarded for the
     /// territorial gain (`dense_soccer_transition_reward`). Returns `(carrier_id, carrier_pos,
     /// forward_space_yards)`. Gated (default-on) by `DD_SOCCER_ENABLE_TEAM_ADVANCE_UPFIELD`.
+    /// "Release long inside own half" target (gate `DD_SOCCER_ENABLE_RELEASE_LONG_OWN_HALF`): a
+    /// teammate of `team` who has broken BEYOND the opponent's last outfield defender (the offside
+    /// line) but is still ONSIDE in our own half (you cannot be offside in your own half), ahead of
+    /// the ball, and open — the line-breaking long ball that punishes a high press. Returns the
+    /// most-advanced such `(receiver_id, position)`. `None` when the gate is off or none qualifies.
+    pub(crate) fn release_long_inside_own_half_target(&self, team: Team) -> Option<(usize, Vec2)> {
+        if !release_long_own_half_enabled() {
+            return None;
+        }
+        let attack = team.attack_dir();
+        let own_goal_fwd = self.own_goal_y_for(team) * attack;
+        let adv = |y: f64| y * attack - own_goal_fwd;
+        let halfway_adv = self.field_length * 0.5;
+        let ball_adv = adv(self.ball.position.y);
+        // Opponent offside line = the 2nd-most-advanced opponent toward THEIR goal (the last
+        // outfield defender; the keeper is usually the deepest). That is the 2nd-highest adv.
+        let mut opp_advs: Vec<f64> = self
+            .players
+            .iter()
+            .filter(|p| p.team == team.other())
+            .map(|p| adv(self.player_snapshot_position(p).y))
+            .collect();
+        if opp_advs.len() < 2 {
+            return None;
+        }
+        opp_advs.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        let offside_line_adv = opp_advs[1];
+        let mut best: Option<(usize, Vec2, f64)> = None;
+        for mate in self
+            .players
+            .iter()
+            .filter(|p| p.team == team && p.role != PlayerRole::Goalkeeper)
+        {
+            if self.ball.holder == Some(mate.id) {
+                continue;
+            }
+            let pos = self.player_snapshot_position(mate);
+            let mate_adv = adv(pos.y);
+            if !release_long_inside_own_half_qualifies(
+                mate_adv,
+                offside_line_adv,
+                ball_adv,
+                halfway_adv,
+            ) {
+                continue;
+            }
+            if self.nearest_opponent_distance_at(team, pos) < RELEASE_LONG_RECEIVER_OPEN_YARDS {
+                continue;
+            }
+            if best.is_none_or(|(_, _, a)| mate_adv > a) {
+                best = Some((mate.id, pos, mate_adv));
+            }
+        }
+        best.map(|(id, pos, _)| (id, pos))
+    }
+
     pub(crate) fn team_advance_upfield_active(&self, team: Team) -> Option<(usize, Vec2, f64)> {
         if !team_advance_upfield_enabled() {
             return None;
