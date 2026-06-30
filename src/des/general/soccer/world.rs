@@ -37,6 +37,17 @@ const DEFENSIVE_PRESS_CONTAIN_PRIMARY_MARGIN: f64 = 0.06;
 const DEFENSIVE_PRESS_CONTAIN_PASS_LANE_RADIUS_YARDS: f64 = 6.0;
 const DEFENSIVE_PRESS_CONTAIN_RUNNER_HORIZON_SECONDS: f64 = 2.0;
 const DEFENSIVE_PRESS_CONTAIN_RUNNER_THREAT_BAND_YARDS: f64 = 18.0;
+const DEFENSIVE_PRESS_NUMBERS_UP_BEHIND_BALL: usize = 7;
+const DEFENSIVE_PRESS_STATIONARY_HOLDER_MAX_SPEED_YPS: f64 = 1.35;
+const DEFENSIVE_PRESS_STATIONARY_HOLDER_SECONDS: f64 = 0.75;
+const DEFENSIVE_PRESS_STATIONARY_HOLDER_SCORE_BONUS: f64 = 0.34;
+const DEFENSIVE_PRESS_STATIONARY_HOLDER_RISK_RELIEF: f64 = 0.15;
+const LONG_BACKWARD_EMERGENCY_MIN_YARDS: f64 = 10.0;
+const LONG_BACKWARD_EMERGENCY_MIN_PRESSURE_RELEASE: f64 = 0.72;
+const LONG_BACKWARD_EMERGENCY_MAX_LANE_RISK: f64 = 0.42;
+const LONG_BACKWARD_EMERGENCY_MAX_ENDPOINT_RISK: f64 = 0.24;
+const PASS_LANE_OCCLUDED_GIFT_RISK: f64 = 0.82;
+const PASS_LANE_OCCLUDED_GIFT_SCORE_PENALTY: f64 = 12.0;
 const OWN_HALF_TINY_PASS_MAX_YARDS: f64 = 3.0;
 const OWN_HALF_TINY_PASS_FORWARD_RELIEF_YARDS: f64 = 4.0;
 const PROGRESSIVE_FLOOR_OUTLET_MIN_FORWARD_YARDS: f64 = 4.0;
@@ -11086,7 +11097,7 @@ impl SoccerMatch {
     /// forces the designated retriever to attack it (see `loose_ball_control_plan_for`).
     pub(crate) fn update_loose_ball_urgency(&mut self, snapshot: &WorldSnapshot) {
         if snapshot.ball.holder.is_some()
-            || snapshot.pending_pass.is_some()
+            || snapshot.pending_pass_keeps_ball_in_transit()
             || self.active_set_play.is_some()
         {
             self.loose_ball_uncontested_since_tick = None;
@@ -20990,7 +21001,7 @@ struct ForwardSupportContext {
     best_forward_pass_option_quality: f64,
     nearest_forward_teammate_distance_yards: f64,
     /// Value [0,1] of the best QUICK FORWARD ground pass available — a short progressive
-    /// ball (≈5–8 m, see [`QUICK_FORWARD_PASS_MIN_YARDS`]/[`QUICK_FORWARD_PASS_MAX_YARDS`])
+    /// ball (5-15 yd, see [`QUICK_FORWARD_PASS_MIN_YARDS`]/[`QUICK_FORWARD_PASS_MAX_YARDS`])
     /// to an OPEN, advanced teammate. Blends the receiver's openness, the in-band distance
     /// fit and the upfield gain. Drives "knock it forward to feet and keep it moving" — the
     /// carrier/first-toucher should release this SOONER than settling or dwelling. Only
@@ -21063,18 +21074,18 @@ struct FieldTeamCenterContext {
 }
 
 /// A quick, progressive GROUND pass into an advanced, open teammate is most valuable in a
-/// short band — roughly 5–8 m (≈5.5–8.7 yards). This is the "knock it forward to feet, keep
-/// the ball moving" distance: long enough to break a line, short enough to be a high-percentage
-/// one/two-touch ball. The forward-open value peaks across this band and tapers outside it.
-const QUICK_FORWARD_PASS_MIN_YARDS: f64 = 5.47; // ≈5 m
-const QUICK_FORWARD_PASS_IDEAL_YARDS: f64 = 7.10; // ≈6.5 m
-const QUICK_FORWARD_PASS_MAX_YARDS: f64 = 8.75; // ≈8 m
-/// Soft taper (yards) applied to distances outside the [min, max] band so a 4 m or 11 m
+/// short band of 5-15 yards. This is the "knock it forward to feet, keep the ball moving"
+/// distance: long enough to break a line, short enough to be a high-percentage one/two-touch ball.
+/// The forward-open value peaks across this band and tapers outside it.
+const QUICK_FORWARD_PASS_MIN_YARDS: f64 = 5.0;
+const QUICK_FORWARD_PASS_IDEAL_YARDS: f64 = 10.0;
+const QUICK_FORWARD_PASS_MAX_YARDS: f64 = 15.0;
+/// Soft taper (yards) applied to distances outside the [min, max] band so a 3 yd or 18 yd
 /// forward ball still carries some value rather than dropping to a hard zero.
-const QUICK_FORWARD_PASS_BAND_FALLOFF_YARDS: f64 = 4.0;
+const QUICK_FORWARD_PASS_BAND_FALLOFF_YARDS: f64 = 5.0;
 
 /// In-band distance fit [0,1] for the quick forward ground-pass value: 1.0 across the
-/// ≈5–8 m sweet spot, tapering linearly to 0 over [`QUICK_FORWARD_PASS_BAND_FALLOFF_YARDS`]
+/// 5-15 yd sweet spot, tapering linearly to 0 over [`QUICK_FORWARD_PASS_BAND_FALLOFF_YARDS`]
 /// on either side. A pass shorter than the band or much longer is worth progressively less.
 pub(crate) fn quick_forward_pass_band_fit(distance_yards: f64) -> f64 {
     if distance_yards >= QUICK_FORWARD_PASS_MIN_YARDS
@@ -21772,7 +21783,7 @@ pub(crate) fn dd_soccer_disable_onside_support_hold() -> bool {
 }
 
 /// Quick forward ground-pass priority (OFF by default = byte-identical). When set, players
-/// place much more value on a short progressive GROUND pass (≈5–8 m) into an OPEN, advanced
+/// place much more value on a short progressive GROUND pass (5-15 yd) into an OPEN, advanced
 /// teammate and release it SOONER — as a first-time ball off the carry or a one-touch off
 /// the first touch — rather than settling or dwelling on the ball. The forward-open value is
 /// folded into the LEARNABLE first-time-pass field feasibility (so the neural policy adapts
@@ -26083,6 +26094,17 @@ impl WorldSnapshot {
             })
             .count();
         let cover_fit = (cover_count as f64 / 2.0).clamp(0.0, 1.0);
+        let defenders_behind_ball = self
+            .players
+            .iter()
+            .filter(|player| player.team == me.team && player.role != PlayerRole::Goalkeeper)
+            .filter(|player| {
+                let position = self.player_snapshot_position(player);
+                (position.y - carrier.y) * me.team.attack_dir() < -0.5
+            })
+            .count();
+        let defense_numbers_up_behind_ball =
+            (defenders_behind_ball >= DEFENSIVE_PRESS_NUMBERS_UP_BEHIND_BALL) as u8 as f64;
         let speed_edge = ((carrier_goalward_speed - defender_speed * 0.72) / 4.5).clamp(0.0, 1.0);
         let dribble_past_risk = (speed_edge * 0.42
             + (1.0 - distance_fit) * 0.22
@@ -26136,10 +26158,32 @@ impl WorldSnapshot {
             PlayerRole::Goalkeeper => 0.0,
         };
         let primary_weight = if primary_presser { 1.0 } else { 0.42 };
-        let press_score = ((ball_win * 0.34
-            + delay_value * 0.22
-            + redirect_value * 0.20
-            + pass_lane_cut * 0.24)
+        let ball_win_confidence = ((ball_win - 0.50) / 0.34).clamp(0.0, 1.0);
+        let turnover_goal_chance = ((1.0
+            - (me.team.goal_y(self.field_length) - carrier.y).abs() / own_half_depth)
+            .clamp(0.0, 1.0)
+            * (0.40 + ball_win * 0.60))
+            .clamp(0.0, 1.0);
+        let stationary_holder_fit = if distance <= HOLDER_PRESS_MAX_DISTANCE_YARDS {
+            let holder_speed_fit = ((DEFENSIVE_PRESS_STATIONARY_HOLDER_MAX_SPEED_YPS
+                - holder_velocity.len())
+                / DEFENSIVE_PRESS_STATIONARY_HOLDER_MAX_SPEED_YPS.max(1e-6))
+            .clamp(0.0, 1.0);
+            let hold_time_fit = (self.ball_holder_possession_seconds.max(0.0)
+                / DEFENSIVE_PRESS_STATIONARY_HOLDER_SECONDS.max(1e-6))
+            .clamp(0.0, 1.0);
+            holder_speed_fit * hold_time_fit * (0.35 + distance_fit * 0.65)
+        } else {
+            0.0
+        };
+        let press_score = ((ball_win * 0.30
+            + delay_value * 0.18
+            + redirect_value * 0.18
+            + pass_lane_cut * 0.20
+            + ball_win_confidence * 0.12
+            + defense_numbers_up_behind_ball * 0.15
+            + turnover_goal_chance * 0.15
+            + stationary_holder_fit * DEFENSIVE_PRESS_STATIONARY_HOLDER_SCORE_BONUS)
             * role_press_weight
             * primary_weight)
             .clamp(0.0, 1.0);
@@ -26150,12 +26194,21 @@ impl WorldSnapshot {
                 in_behind_risk * 0.08
             } else {
                 0.0
-            })
+            }
+            - defense_numbers_up_behind_ball * 0.12
+            - ball_win_confidence * 0.05
+            - turnover_goal_chance * 0.06
+            - stationary_holder_fit * DEFENSIVE_PRESS_STATIONARY_HOLDER_RISK_RELIEF)
         .clamp(0.0, 1.0);
+        let press_margin_relief = defense_numbers_up_behind_ball * 0.08
+            + ball_win_confidence * 0.05
+            + turnover_goal_chance * 0.05
+            + stationary_holder_fit * 0.08;
         let press_decision = primary_presser
             && distance <= HOLDER_PRESS_MAX_DISTANCE_YARDS
             && press_score >= DEFENSIVE_PRESS_CONTAIN_MIN_PRESS_SCORE
             && press_score + self.own_goal_press_urgency(me.team, carrier) * 0.10
+                + press_margin_relief
                 >= contain_risk + DEFENSIVE_PRESS_CONTAIN_PRIMARY_MARGIN;
         let target = if press_decision {
             let to_own_goal = own_goal - carrier;
@@ -28233,7 +28286,7 @@ impl WorldSnapshot {
         let field_team_center_context = self.field_team_center_context_for(player_id);
         let field_player_motion = soccer_field_player_motion_block(self, player_id, me.team);
         // Quick forward ground-pass priority (gated OFF = inert). Surfaces the best short
-        // progressive ball (≈5–8 m) to an open, advanced teammate so the decision paths can
+        // progressive ball (5-15 yd) to an open, advanced teammate so the decision paths can
         // release it sooner and the execution can target that runner through the MPC pass path.
         let quick_forward_pass_enabled = dd_soccer_enable_quick_forward_pass();
         let quick_forward_pass_value = if quick_forward_pass_enabled {
@@ -31490,6 +31543,43 @@ impl WorldSnapshot {
                                 position,
                                 *aim_point,
                             );
+                        let receiver_forward =
+                            (position.y - me_position.y) * me.team.attack_dir();
+                        let backward_depth_forward = forward.min(receiver_forward);
+                        let long_backward_emergency_release = if backward_depth_forward
+                            <= -LONG_BACKWARD_EMERGENCY_MIN_YARDS
+                        {
+                            let release_score = backward_pass_pressure_release_score(
+                                backward_depth_forward,
+                                passer_pressure,
+                                passer_nearest_opponent_distance,
+                                me_position,
+                                self.field_width,
+                                self.field_length,
+                            );
+                            let lane_risk = self
+                                .pass_lane_interception_risk(
+                                    me_position,
+                                    *aim_point,
+                                    me.team.other(),
+                                    2.5,
+                                    threading_speed,
+                                    PASS_LANE_DECISION_LOOKAHEAD_SECONDS,
+                                )
+                                .risk;
+                            let endpoint_risk = self.pass_point_direct_opponent_control_risk(
+                                me.team,
+                                position,
+                                me_position,
+                                *aim_point,
+                                threading_speed,
+                            );
+                            release_score >= LONG_BACKWARD_EMERGENCY_MIN_PRESSURE_RELEASE
+                                && lane_risk <= LONG_BACKWARD_EMERGENCY_MAX_LANE_RISK
+                                && endpoint_risk <= LONG_BACKWARD_EMERGENCY_MAX_ENDPOINT_RISK
+                        } else {
+                            true
+                        };
                         // `race_won` already includes the qualified half-open forward exception:
                         // skilled passers keep those options visible. Direct-opponent endpoints
                         // are priced in the score/learned features below instead of hard-hidden.
@@ -31508,6 +31598,7 @@ impl WorldSnapshot {
                             && (!require_reception_won || !marked_under_pressure)
                             && !committed_cutout
                             && !backward_into_coverage
+                            && long_backward_emergency_release
                             && (!unavoidable_set_interceptor
                                 || patient_carry_can_price_lane_risk)
                             && self.pending_offside_for_pass(me.id, p.id).is_none()
@@ -31538,6 +31629,8 @@ impl WorldSnapshot {
                 // merely nudging away from them. Bumped 2.4->3.4 to cut intercepted/misplaced balls.
                 let anticipation_penalty = if anticipation_clear { 0.0 } else { 3.4 };
                 let forward = (pass_point.y - me_position.y) * me.team.attack_dir();
+                let receiver_forward = (position.y - me_position.y) * me.team.attack_dir();
+                let backward_depth_forward = forward.min(receiver_forward);
                 let dist = receiver_distance;
                 let support_fit = (dist - directive.support_depth_yards).abs();
                 let confidence = self
@@ -31646,7 +31739,8 @@ impl WorldSnapshot {
                     .unwrap_or(0.0);
                 let directional_progress_score =
                     directional_pass_progress_score(forward, forward_weight);
-                let backward_depth_adjustment = backward_pass_depth_adjustment(forward);
+                let backward_depth_adjustment =
+                    backward_pass_depth_adjustment(backward_depth_forward);
                 let corner_affinity = self.long_pass_attacking_corner_affinity(
                     me.team,
                     me_position,
@@ -31866,9 +31960,9 @@ impl WorldSnapshot {
                     .slip_break_offside_trap_profile_for(player_id, p.id)
                     .score
                     * SLIP_BREAK_OFFSIDE_TRAP_RANK_BONUS_WEIGHT;
-                let long_backward_penalty = long_backward_pass_penalty(forward);
+                let long_backward_penalty = long_backward_pass_penalty(backward_depth_forward);
                 let backward_pressure_release_score = backward_pass_pressure_release_score(
-                    forward,
+                    backward_depth_forward,
                     passer_pressure,
                     passer_nearest_opponent_distance,
                     me_position,
@@ -31876,7 +31970,7 @@ impl WorldSnapshot {
                     self.field_length,
                 );
                 let backward_pressure_release_penalty = backward_pass_pressure_release_penalty(
-                    forward,
+                    backward_depth_forward,
                     backward_pressure_release_score,
                 );
                 // A backward ball played through opponents is doubly dangerous. The path
@@ -31902,6 +31996,22 @@ impl WorldSnapshot {
                 } else {
                     0.0
                 };
+                let occluded_lane_gift_penalty = if require_reception_won
+                    && pass_quality.lane_interception_risk >= PASS_LANE_OCCLUDED_GIFT_RISK
+                {
+                    let yards_to_goal = (me.team.goal_y(self.field_length) - pass_point.y).abs();
+                    let final_third_forward =
+                        forward > 1.25 && yards_to_goal <= self.field_length / 3.0;
+                    let final_third_relief = if final_third_forward { 0.55 } else { 1.0 };
+                    ((pass_quality.lane_interception_risk - PASS_LANE_OCCLUDED_GIFT_RISK)
+                        / (1.0 - PASS_LANE_OCCLUDED_GIFT_RISK).max(1e-6))
+                    .clamp(0.0, 1.0)
+                        * PASS_LANE_OCCLUDED_GIFT_SCORE_PENALTY
+                        * appetite_risk_penalty_mult
+                        * final_third_relief
+                } else {
+                    0.0
+                };
                 let role_risk = active_pass_role_risk_score_adjustment(
                     me.role,
                     me.team,
@@ -31916,7 +32026,7 @@ impl WorldSnapshot {
                 // demote a backward/square target so the carrier plays the open forward man
                 // instead of recycling backward (the reported blunder). Gated; the precomputed
                 // `best_forward_option_quality` is 0 when off, so this stays inert.
-                let backward_when_forward_available_penalty = if forward
+                let backward_when_forward_available_penalty = if backward_depth_forward
                     < -BACKWARD_PASS_MIN_FORWARD_YARDS
                     && best_forward_option_quality >= FORWARD_OPTION_RECOGNITION_RANK_THRESHOLD
                 {
@@ -31945,6 +32055,7 @@ impl WorldSnapshot {
                         * PASS_LANE_DYNAMIC_RISK_SCORE_PENALTY
                         * appetite_risk_penalty_mult
                     - safe_pass_overrisk_penalty
+                    - occluded_lane_gift_penalty
                     - role_risk.penalty
                     + over_the_top_invite_bonus * goal_entry_pass_learning
                     + own_box_play_out_adjustment
@@ -35694,6 +35805,9 @@ impl WorldSnapshot {
     ) -> Option<(Vec2, bool)> {
         let me = self.players.iter().find(|p| p.id == player_id)?;
         let pass = self.pending_pass.as_ref()?;
+        if !self.pending_pass_keeps_ball_in_transit() {
+            return None;
+        }
         if self.ball.holder.is_some() || pass.team != me.team || pass.from == player_id {
             return None;
         }
@@ -36943,6 +37057,9 @@ impl WorldSnapshot {
         player_id: usize,
     ) -> Option<(Vec2, bool)> {
         let pass = self.pending_pass.as_ref()?;
+        if !self.pending_pass_keeps_ball_in_transit() {
+            return None;
+        }
         let me = self.players.iter().find(|p| p.id == player_id)?;
         let (target, projection, gap, claim) = self.reactive_ground_pass_claim_for(me, pass)?;
         let elected = self.players.iter().all(|p| {
@@ -37033,6 +37150,9 @@ impl WorldSnapshot {
             return None;
         }
         let pass = self.pending_pass.as_ref()?;
+        if !self.pending_pass_keeps_ball_in_transit() {
+            return None;
+        }
         let me = self.players.iter().find(|p| p.id == player_id)?;
         if me.role == PlayerRole::Goalkeeper {
             return None;
@@ -37161,7 +37281,7 @@ impl WorldSnapshot {
         if dd_soccer_disable_loose_ball_urgency() {
             return false;
         }
-        if self.ball.holder.is_some() || self.pending_pass.is_some() {
+        if self.ball.holder.is_some() || self.pending_pass_keeps_ball_in_transit() {
             return false;
         }
         let Some(since) = self.loose_ball_uncontested_since_tick else {
@@ -37179,10 +37299,17 @@ impl WorldSnapshot {
         self.loose_ball_urgency_active() || self.loose_ball_team_stalled_for(team)
     }
 
+    fn pending_pass_keeps_ball_in_transit(&self) -> bool {
+        self.pending_pass.is_some()
+            && self.ball.holder.is_none()
+            && (self.ball.altitude_yards > BALL_ROLLING_ALTITUDE_YARDS
+                || self.ball.velocity.len() >= LOOSE_BALL_PROJECTION_MIN_SPEED_YPS)
+    }
+
     pub(crate) fn loose_ball_team_stalled_for(&self, team: Team) -> bool {
         if dd_soccer_disable_loose_ball_urgency()
             || self.ball.holder.is_some()
-            || self.pending_pass.is_some()
+            || self.pending_pass_keeps_ball_in_transit()
             || self.active_set_play.is_some()
         {
             return false;
@@ -37259,7 +37386,7 @@ impl WorldSnapshot {
     }
 
     pub(crate) fn projected_loose_ball_target(&self) -> Option<Vec2> {
-        if self.ball.holder.is_some() || self.pending_pass.is_some() {
+        if self.ball.holder.is_some() || self.pending_pass_keeps_ball_in_transit() {
             return None;
         }
         let speed = self.ball.velocity.len();
@@ -37302,7 +37429,7 @@ impl WorldSnapshot {
     }
 
     pub(crate) fn loose_untargeted_long_ball_team(&self) -> Option<Team> {
-        if self.ball.holder.is_some() || self.pending_pass.is_some() {
+        if self.ball.holder.is_some() || self.pending_pass_keeps_ball_in_transit() {
             return None;
         }
         let action = self.ball.last_decision.as_ref()?.action.as_str();
@@ -37689,6 +37816,9 @@ impl WorldSnapshot {
     /// goalside just because a team-mate scored marginally closer to that same lane point.
     pub(crate) fn pending_pass_lane_cut_target_for(&self, player_id: usize) -> Option<Vec2> {
         let pass = self.pending_pass.as_ref()?;
+        if !self.pending_pass_keeps_ball_in_transit() {
+            return None;
+        }
         if self.ball.holder.is_some() || pass.flight.is_aerial() {
             return None;
         }
@@ -37742,7 +37872,7 @@ impl WorldSnapshot {
     pub(crate) fn loose_ball_path_cut_target_for(&self, player_id: usize) -> Option<Vec2> {
         if self.ball.holder.is_some()
             || self.active_set_play.is_some()
-            || self.pending_pass.is_some()
+            || self.pending_pass_keeps_ball_in_transit()
         {
             return None;
         }
@@ -42942,7 +43072,7 @@ impl WorldSnapshot {
                         quality.expected_completion,
                     ),
                 );
-                // Quick FORWARD ground-pass value: a short progressive ball (≈5–8 m) to an OPEN,
+                // Quick FORWARD ground-pass value: a short progressive ball (5-15 yd) to an OPEN,
                 // advanced teammate. The lane-aware `quality_fit` already blends openness,
                 // completion, stride and upfield gain; weight it by the in-band distance fit.
                 if outlet.distance_fit > 0.0 {
@@ -47943,7 +48073,7 @@ impl WorldSnapshot {
                         earliest_arrival_margin_seconds: 0.0,
                     };
                 }
-                risk = risk.max(0.72);
+                risk = risk.max(0.90);
             }
 
             let ball_arrival = along / speed;
