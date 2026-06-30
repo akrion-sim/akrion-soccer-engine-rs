@@ -24113,6 +24113,10 @@ impl WorldSnapshot {
             ranked_floor_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             ranked_aerial_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             line_depth_head: m.line_depth_head.clone(),
+            back_four_line_latch_centre_depth: [
+                m.back_four_line_latch[0].map(|l| l.centre_depth),
+                m.back_four_line_latch[1].map(|l| l.centre_depth),
+            ],
             pass_completion_head: m.pass_completion_head.clone(),
             loose_ball_commit_head: m.loose_ball_commit_head.clone(),
             receive_approach_head: m.receive_approach_head.clone(),
