@@ -18541,6 +18541,25 @@ pub(crate) fn progressive_carry_reward_enabled() -> bool {
     }
 }
 
+/// Penalty points (>= 0) for an unpressured backward pass. Zero unless the ball is played at least
+/// `BACKWARD_PASS_MIN_PENALIZED_YARDS` backward AND the nearest opponent is beyond the high-pressure
+/// radius (i.e. NOT genuinely pressed); otherwise `base + per-yard·backward`, capped — so a deeper
+/// recycle is punished harder. Pure (env-free) so the scaling is unit-tested directly. See
+/// [`backward_pass_discipline_enabled`].
+pub(crate) fn unpressured_backward_pass_penalty_points(
+    backward_yards: f64,
+    nearest_opponent_distance_yards: f64,
+) -> f64 {
+    if !backward_yards.is_finite()
+        || backward_yards < BACKWARD_PASS_MIN_PENALIZED_YARDS
+        || nearest_opponent_distance_yards <= BACKWARD_PASS_HIGH_PRESSURE_RADIUS_YARDS
+    {
+        return 0.0;
+    }
+    (BACKWARD_PASS_BASE_PENALTY_POINTS + backward_yards * BACKWARD_PASS_PENALTY_PER_YARD_POINTS)
+        .min(BACKWARD_PASS_MAX_PENALTY_POINTS)
+}
+
 /// Whether **backward-pass discipline** is active this process. Emits a training PENALTY for a
 /// pass played backward (toward our own goal) when the passer is NOT under genuine high pressure —
 /// no opponent within `BACKWARD_PASS_HIGH_PRESSURE_RADIUS_YARDS` — scaled by how far back the ball
