@@ -67,6 +67,8 @@ mod receive_approach;
 pub use receive_approach::*;
 mod long_pass_run;
 pub use long_pass_run::*;
+mod give_and_go;
+pub use give_and_go::*;
 mod beat_defender;
 pub use beat_defender::*;
 mod support_scorer;
@@ -89,6 +91,7 @@ mod crash_box;
 pub(crate) use crash_box::*;
 mod field_numbers;
 pub use field_numbers::*;
+mod goal_side;
 mod policy_select;
 pub use policy_select::*;
 mod pass_lane_yield;
@@ -2042,6 +2045,39 @@ const BACKWARD_PASS_BASE_PENALTY_POINTS: f64 = 2.0;
 const BACKWARD_PASS_PENALTY_PER_YARD_POINTS: f64 = 0.5;
 /// Cap on the total unpressured-backward-pass penalty so one very deep ball can't swamp the signal.
 const BACKWARD_PASS_MAX_PENALTY_POINTS: f64 = 12.0;
+/// Over-dribble dispossession penalty (the carrier held the ball too long and was tackled for it).
+/// Hold time (seconds) past which staying on the ball is "overdue" — a pass or a forward drive
+/// should have happened by now. Below this a tackle on a fresh touch is just an unlucky duel, not an
+/// over-dribble, so no penalty.
+const OVERDRIBBLE_MIN_HOLD_SECONDS: f64 = 1.6;
+/// An opponent within this radius of the carrier at the moment of loss is "genuine pressure" — a
+/// signal the carrier was being closed down and should have released. Either pressure OR an ignored
+/// open outlet is required for the penalty to fire (a clean unlucky strip in open space isn't an
+/// over-dribble blunder).
+const OVERDRIBBLE_PRESSURE_RADIUS_YARDS: f64 = 4.0;
+/// Base penalty points for an over-dribble dispossession, before the excess-hold and ignored-outlet
+/// terms and the pressure multiplier.
+const OVERDRIBBLE_BASE_PENALTY_POINTS: f64 = 4.0;
+/// Extra penalty points per second held beyond `OVERDRIBBLE_MIN_HOLD_SECONDS` — the longer the
+/// overdue hold ran before the steal, the worse the decision to keep the ball.
+const OVERDRIBBLE_PER_EXCESS_SECOND_POINTS: f64 = 2.0;
+/// Extra penalty points per open forward outlet the carrier had (and ignored) at the moment of loss
+/// — the more passing options that were on, the more egregious it was to dribble into a tackle.
+const OVERDRIBBLE_PER_IGNORED_OUTLET_POINTS: f64 = 1.5;
+/// How many ranked forward-outlet candidates to probe when counting ignored passing options.
+const OVERDRIBBLE_OUTLET_PROBE_LIMIT: usize = 3;
+/// Cap on the NEUTRAL-ZONE over-dribble penalty so one very long hold can't swamp the
+/// goal/possession signal — kept below shot-on-target(40)/goal(100), in line with the turnover
+/// penalties. The absolute cap is this times [`OVERDRIBBLE_DANGER_MAX_MULT`] for a deep own-half
+/// giveaway.
+const OVERDRIBBLE_MAX_PENALTY_POINTS: f64 = 16.0;
+/// How much the danger-zone severity can raise the over-dribble penalty (and its absolute cap) for
+/// a loss deep in our own half, where over-dribbling into a tackle can become a goal. Mirrors the
+/// turnover-window danger model ([`KEEPER_GIVEAWAY_DANGER_ZONE_MAX_MULT`]); the deepest giveaway is
+/// punished this many times harder than the same loss at midfield (absolute cap ⇒ 32, still < a
+/// shot-on-target reward at 40). The severity factor passed in is never allowed to REDUCE the
+/// penalty.
+const OVERDRIBBLE_DANGER_MAX_MULT: f64 = KEEPER_GIVEAWAY_DANGER_ZONE_MAX_MULT;
 /// How many of the most-recent teammates in a buildup chain are credited for a shot (the user's
 /// "last 10 teammates involved in the plays that led to the goal").
 const BUILDUP_CHAIN_CREDIT_DEPTH: usize = 10;
@@ -3526,6 +3562,20 @@ const WALL_PASS_RUN_TTL_SECONDS: f64 = 3.6;
 /// goal proximity, and the active maneuver). A give-and-go is genuinely tried, not rare — the
 /// one-two is a primary attacking route, so when a clean combination is on it is taken often.
 const WALL_PASS_BASE_APPETITE: f64 = 0.46;
+/// Moderate, default-ON live-frequency bump applied under [`give_and_go_ambition_enabled`]: how
+/// much further to widen the man-to-beat trigger zone (so a one-two is *available* more often —
+/// every quality/onside/lane check still applies, this only widens availability) and how much to
+/// multiply the carrier's raw wall-pass appetite (so an available good one-two competes with
+/// carries/through-balls instead of being out-scored). Off (kill switch
+/// `DD_SOCCER_ENABLE_GIVE_AND_GO_AMBITION=0`) ⇒ none of this applies.
+const GIVE_AND_GO_AMBITION_AHEAD_WIDEN_YARDS: f64 = 3.0;
+const GIVE_AND_GO_AMBITION_LATERAL_WIDEN_YARDS: f64 = 1.5;
+const GIVE_AND_GO_AMBITION_RANGE_WIDEN_YARDS: f64 = 2.0;
+const GIVE_AND_GO_AMBITION_PARTNER_SPACE_EASE_YARDS: f64 = 0.5;
+const GIVE_AND_GO_AMBITION_APPETITE_MULTIPLIER: f64 = 1.4;
+/// Lifted appetite clamp ceiling under the ambition bump (vs. the baseline 0.92), so a strong
+/// available one-two is not capped below decisive options.
+const GIVE_AND_GO_AMBITION_APPETITE_CEILING: f64 = 0.95;
 /// When the team's active attacking maneuver IS a give-and-go / one-two, the carrier is
 /// looking to combine — lift the appetite hard.
 const WALL_PASS_STRATEGY_APPETITE_BOOST: f64 = 2.1;
@@ -6745,6 +6795,15 @@ pub struct SoccerPomdpObservation {
     /// is set, so decisions are then byte-identical. See [`SoccerFieldNumbersVector`].
     #[serde(default)]
     pub field_numbers: SoccerFieldNumbersVector,
+    /// **Signed true goal-side quality** in `[-1, 1]` when this player's team is defending: how
+    /// far the player sits along, and how close to, the ball→own-goal line (`+1` perfectly
+    /// goal-side on the line, `0` level/off-channel, `-ve` caught upfield of the ball). `0` for
+    /// strikers, the keeper, and whenever the player's team has possession. Its recovery urgency
+    /// folds into `defensive_urgency` when the default-ON gate is enabled; stays `0` (decisions
+    /// byte-identical) when `DD_SOCCER_ENABLE_DEFENSIVE_GOAL_SIDE` is off. See the [`goal_side`]
+    /// module.
+    #[serde(default)]
+    pub defensive_goal_side_quality: f64,
     #[serde(default)]
     pub goal_attack_window_score: f64,
     #[serde(default)]
@@ -13091,6 +13150,33 @@ pub(crate) fn attack_ambition_enabled() -> bool {
     !*V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_ATTACK_AMBITION").is_ok())
 }
 
+/// Whether the **moderate give-and-go live-frequency bump** is active this process: a modest
+/// extra widening of the wall-pass trigger zone and a lift on the carrier's appetite to combine,
+/// so more one-twos actually appear in live play. **Default-ON in production**
+/// (`DD_SOCCER_ENABLE_GIVE_AND_GO_AMBITION=0/false/no/off` is the kill switch), read once.
+/// **Default-OFF under test** so the option-scoring parity suite stays byte-identical (the bump
+/// only ever *widens availability* / lifts a propensity — every quality/onside/lane check still
+/// applies, so a poor combination is still demoted, never forced).
+pub(crate) fn give_and_go_ambition_enabled() -> bool {
+    #[cfg(test)]
+    {
+        // Default-OFF + env-driven under test (re-read each call) so the parity suite stays
+        // byte-identical and a test can toggle it explicitly.
+        std::env::var("DD_SOCCER_ENABLE_GIVE_AND_GO_AMBITION")
+            .map(|raw| {
+                let v = raw.trim().to_ascii_lowercase();
+                matches!(v.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_GIVE_AND_GO_AMBITION"))
+    }
+}
+
 fn pass_like_action_flight(action: &str) -> Option<PassFlight> {
     use SoccerActionLabel::*;
     match SoccerActionLabel::classify(action)? {
@@ -17891,6 +17977,14 @@ pub(crate) enum SoccerRewardEventKind {
     /// strategy — you cannot be offside in your own half). Trains the line-breaking ball that
     /// punishes a high press. Emitted only when `DD_SOCCER_ENABLE_RELEASE_LONG_OWN_HALF` is on.
     ReleaseLongInsideOwnHalf,
+    /// PENALTY (negative): the carrier held / dribbled the ball too long and was DISPOSSESSED for it
+    /// — the steal is the marker of a negative event (the absence of a pass that should have been
+    /// played). Attributed to the over-dribbling carrier and scaled by the field-vector context at
+    /// the moment of loss: how long they held, how much pressure was on them, and how many open
+    /// forward outlets they ignored. The direct learning signal that holding too long in that
+    /// position was the mistake. Emitted only when `DD_SOCCER_ENABLE_OVERDRIBBLE_PENALTY` is on. See
+    /// [`overdribble_dispossession_penalty_points`].
+    OverdribbleDispossession,
     MatchResult,
 }
 
@@ -17916,6 +18010,7 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::UnpressuredBackwardPass
                 | SoccerRewardEventKind::BuildupChainCredit
                 | SoccerRewardEventKind::ReleaseLongInsideOwnHalf
+                | SoccerRewardEventKind::OverdribbleDispossession
                 | SoccerRewardEventKind::MatchResult
         )
     }
@@ -18705,6 +18800,137 @@ pub(crate) fn unpressured_backward_pass_penalty_points(
     }
     (BACKWARD_PASS_BASE_PENALTY_POINTS + backward_yards * BACKWARD_PASS_PENALTY_PER_YARD_POINTS)
         .min(BACKWARD_PASS_MAX_PENALTY_POINTS)
+}
+
+/// Penalty points (>= 0) for an OVER-DRIBBLE dispossession — the carrier held / dribbled the ball
+/// too long and lost it to a tackle. Zero unless the carrier had held the ball longer than
+/// `OVERDRIBBLE_MIN_HOLD_SECONDS` AND was either under genuine pressure (an opponent within
+/// `OVERDRIBBLE_PRESSURE_RADIUS_YARDS`) or had at least one open forward outlet to pass to — a clean
+/// unlucky strip on a fresh touch in open space is NOT punished. Otherwise it is
+/// `base + excess_seconds·per-second + ignored_outlets·per-outlet`, then multiplied by a pressure
+/// factor that grows as the nearest opponent gets right on top of the carrier (1× at the pressure
+/// radius up to ~2× point-blank), and finally by `danger_severity` — the keeper-giveaway danger
+/// factor (`>= 1.0`; see [`keeper_giveaway_severity_factor`]) that punishes a loss DEEP IN OUR OWN
+/// HALF (where over-dribbling into a tackle can become a goal) far harder than a failed take-on up
+/// the pitch. The result is capped (`OVERDRIBBLE_MAX_PENALTY_POINTS`, raised by the danger mult in
+/// the danger zone). This is the field-vector context the user asked for: the magnitude reflects how
+/// long the carrier held, how much pressure was on them, how many passing options they ignored, and
+/// HOW DANGEROUS the area was. `danger_severity` is clamped to `>= 1.0`, so it can only raise the
+/// penalty (a non-finite value falls back to neutral). Pure (env-free) so the scaling is unit-tested
+/// directly. See [`overdribble_penalty_enabled`].
+pub(crate) fn overdribble_dispossession_penalty_points(
+    hold_seconds: f64,
+    nearest_opponent_distance_yards: f64,
+    open_forward_outlets: usize,
+    danger_severity: f64,
+) -> f64 {
+    if !hold_seconds.is_finite() || !nearest_opponent_distance_yards.is_finite() {
+        return 0.0;
+    }
+    let excess = hold_seconds - OVERDRIBBLE_MIN_HOLD_SECONDS;
+    if excess <= 0.0 {
+        return 0.0;
+    }
+    let under_pressure = nearest_opponent_distance_yards <= OVERDRIBBLE_PRESSURE_RADIUS_YARDS;
+    if !under_pressure && open_forward_outlets == 0 {
+        return 0.0;
+    }
+    let mut points = OVERDRIBBLE_BASE_PENALTY_POINTS
+        + excess * OVERDRIBBLE_PER_EXCESS_SECOND_POINTS
+        + open_forward_outlets as f64 * OVERDRIBBLE_PER_IGNORED_OUTLET_POINTS;
+    if under_pressure {
+        let proximity = ((OVERDRIBBLE_PRESSURE_RADIUS_YARDS - nearest_opponent_distance_yards)
+            / OVERDRIBBLE_PRESSURE_RADIUS_YARDS)
+            .clamp(0.0, 1.0);
+        points *= 1.0 + proximity;
+    }
+    // Cap the raw "blameworthiness" at the neutral-zone max FIRST, so the danger multiplier scales a
+    // bounded base (a midfield over-dribble can never exceed the base cap). Then apply the danger
+    // factor — never below 1.0 (a non-finite factor ⇒ neutral, since `f64::max` ignores NaN) — and a
+    // final absolute safety cap that rises with the danger mult so a deep own-half giveaway is
+    // punished harder without being flattened by the neutral cap.
+    let blameworthiness = points.min(OVERDRIBBLE_MAX_PENALTY_POINTS);
+    let danger = if danger_severity.is_finite() {
+        danger_severity.max(1.0)
+    } else {
+        1.0
+    };
+    (blameworthiness * danger).min(OVERDRIBBLE_MAX_PENALTY_POINTS * OVERDRIBBLE_DANGER_MAX_MULT)
+}
+
+/// Whether the **over-dribble dispossession penalty** is active this process. Adds a sharp,
+/// carrier-attributed MARL/MAPPO learning signal at the moment the ball is stolen off a carrier who
+/// dribbled too long — scaled by hold time, pressure, and ignored passing options. Default-ON in
+/// production (env `DD_SOCCER_ENABLE_OVERDRIBBLE_PENALTY=0/false` is the kill switch); default-OFF
+/// under test so the reward-parity suite stays byte-identical. See
+/// [`overdribble_dispossession_penalty_points`].
+pub(crate) fn overdribble_penalty_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_OVERDRIBBLE_PENALTY").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_OVERDRIBBLE_PENALTY"))
+    }
+}
+
+/// Minimum gait a ball carrier should drive at when carrying the ball forward into open space — the
+/// "first inclination is to jog/run/sprint forward, not walk the ball" rule. Returns `None` when no
+/// floor applies: under tight pressure (`<= carry_tight_pressure_yards`, where close control beats
+/// pace) or with too little room ahead (`< carry_jog_space_yards`). Otherwise the floor is graded by
+/// open forward space — a couple of clear yards ⇒ at least a jog, a clear lane ⇒ a run, open field ⇒
+/// a sprint (capped to a run when too fatigued to flat-out sprint). The caller applies it as an
+/// UPSHIFT only, so it never slows a carrier already moving faster. The thresholds come from
+/// [`DribbleTuning`] (the carry-SPEED axis), so they are tunable from MPC/config and the learned
+/// policy overlay both. Pure (env-free) so it is unit-tested directly. See
+/// [`carrier_forward_drive_enabled`].
+pub(crate) fn carrier_forward_drive_gait_floor(
+    forward_space_yards: f64,
+    nearest_opponent_distance_yards: f64,
+    fatigue: f64,
+    tuning: &DribbleTuning,
+) -> Option<MovementGait> {
+    if !forward_space_yards.is_finite() || !nearest_opponent_distance_yards.is_finite() {
+        return None;
+    }
+    if nearest_opponent_distance_yards <= tuning.carry_tight_pressure_yards
+        || forward_space_yards < tuning.carry_jog_space_yards
+    {
+        return None;
+    }
+    let floor = if forward_space_yards >= tuning.carry_sprint_space_yards
+        && fatigue < tuning.carry_sprint_max_fatigue
+    {
+        MovementGait::Sprint
+    } else if forward_space_yards >= tuning.carry_run_space_yards {
+        MovementGait::Run
+    } else {
+        MovementGait::Jog
+    };
+    Some(floor)
+}
+
+/// Whether the **carrier forward-drive gait floor** is active this process. Makes a ball carrier
+/// driving into open forward space jog/run/sprint into it (graded by the room ahead) as the first
+/// inclination, rather than knocking the ball forward and walking after it. Applied as an upshift
+/// only and suppressed under tight pressure, so close control is never compromised. Default-ON in
+/// production (env `DD_SOCCER_ENABLE_CARRIER_FORWARD_DRIVE=0/false` is the kill switch); default-OFF
+/// under test so the movement-parity suite stays byte-identical. See
+/// [`carrier_forward_drive_gait_floor`].
+pub(crate) fn carrier_forward_drive_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_CARRIER_FORWARD_DRIVE").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_CARRIER_FORWARD_DRIVE"))
+    }
 }
 
 /// Whether the **MPC pass-weight solver** is active this process. For a ground pass to a receiver
@@ -22858,8 +23084,15 @@ fn dense_soccer_transition_reward(
     // snapshot so the reward credits the action that advanced the team, and progress is clamped to
     // a reference distance so a single burst can't farm reward. Gated (default-on) by
     // `DD_SOCCER_ENABLE_TEAM_ADVANCE_UPFIELD`; OFF ⇒ this term vanishes (byte-identical parity).
+    // Hardened: only credit the advance when it does NOT coincide with a turnover (the opponent
+    // winning the ball) — a forward charge that gifts possession is not a good advance. The carrier
+    // is credited for driving the ball on; off-ball credit is restricted to ATTACKERS (Forward /
+    // Midfielder) making an ONSIDE supporting run — a defender's forward movement is the back-line
+    // push's job (a positioning mechanic), not an individual reward that would teach it to break
+    // shape, and a run into an offside position is a wasted run, not support.
     if team_advance_upfield_enabled()
         && before_possession == Some(player.team)
+        && after_possession != Some(player.team.other())
         && before.team_advance_upfield_active(player.team).is_some()
     {
         if before.ball.holder == Some(player.id) {
@@ -22867,7 +23100,10 @@ fn dense_soccer_transition_reward(
                 reward += (ball_forward / TEAM_ADVANCE_REWARD_REFERENCE_YARDS).clamp(0.0, 1.0)
                     * TEAM_ADVANCE_CARRIER_DRIVE_REWARD;
             }
-        } else if player.role != PlayerRole::Goalkeeper && player_forward > 0.0 {
+        } else if matches!(player.role, PlayerRole::Forward | PlayerRole::Midfielder)
+            && player_forward > 0.0
+            && !after.position_would_be_offside_for_player(player.id, player.team, after_pos)
+        {
             reward += (player_forward / TEAM_ADVANCE_REWARD_REFERENCE_YARDS).clamp(0.0, 1.0)
                 * TEAM_ADVANCE_SUPPORT_RUN_REWARD;
         }
@@ -23155,6 +23391,7 @@ fn dense_soccer_transition_reward(
         if after_possession == Some(player.team) {
             reward += 0.09;
         } else if after_possession == Some(player.team.other()) {
+            let reward_cfg = &tunables().reward;
             reward -= intentional_long_ball_loss_penalty(
                 action,
                 own_half_holder,
@@ -23162,8 +23399,13 @@ fn dense_soccer_transition_reward(
                 own_goal_relief,
                 false,
             )
-            .unwrap_or(if own_half_holder { 3.5 } else { 2.2 });
+            .unwrap_or(if own_half_holder {
+                reward_cfg.giveaway_to_opponent_own_half_penalty
+            } else {
+                reward_cfg.giveaway_to_opponent_opp_half_penalty
+            });
         } else {
+            let reward_cfg = &tunables().reward;
             reward -= intentional_long_ball_loss_penalty(
                 action,
                 own_half_holder,
@@ -23171,7 +23413,11 @@ fn dense_soccer_transition_reward(
                 own_goal_relief,
                 true,
             )
-            .unwrap_or(if own_half_holder { 0.85 } else { 0.55 });
+            .unwrap_or(if own_half_holder {
+                reward_cfg.giveaway_to_loose_own_half_penalty
+            } else {
+                reward_cfg.giveaway_to_loose_opp_half_penalty
+            });
         }
         reward += ball_forward.clamp(-8.0, 14.0) * 0.15;
         if own_half_holder {
@@ -24846,19 +25092,35 @@ fn defensive_goal_side_reward_for_role(
     if snapshot.possession_team() != Some(team.other()) {
         return 0.0;
     }
-    // Threat reference along the goal axis: the carrier if there is one, else the ball.
-    let attacker_y = snapshot
+    // Threat reference: the carrier if there is one, else the ball. The protective line runs from
+    // this threat to the centre of our own goal.
+    let threat = snapshot
         .ball
         .holder
         .and_then(|holder| snapshot.players.iter().find(|p| p.id == holder))
         .filter(|holder| holder.team == team.other())
         .and_then(|holder| snapshot.player_position(holder.id))
-        .map(|pos| pos.y)
-        .unwrap_or(snapshot.ball.position.y);
+        .unwrap_or(snapshot.ball.position);
     let own_goal_y = team.other().goal_y(snapshot.field_length);
+    if goal_side::defensive_goal_side_enabled() {
+        // TRUE goal-side: reward sitting *on the line between the threat and our goal*, goal-side of
+        // the threat — not merely deeper than it on the y-axis (a wide full-back a yard behind the
+        // ball but stranded on the touchline screens nothing). Continuous over the line geometry,
+        // at the same magnitude as the legacy ladder's best/worst. See the `goal_side` module.
+        let own_goal = Vec2::new(snapshot.field_width * 0.5, own_goal_y);
+        let quality = goal_side::goal_side_quality(
+            player_position,
+            threat,
+            own_goal,
+            goal_side::GOAL_SIDE_CHANNEL_HALF_WIDTH_YARDS,
+            goal_side::GOAL_SIDE_DEPTH_SATURATION_YARDS,
+        );
+        return goal_side::defensive_goal_side_role_reward(quality);
+    }
+    // Legacy y-axis-only definition (byte-identical when the gate is off).
     let goal_side_of_ball =
         goal_side_between_y(player_position.y, snapshot.ball.position.y, own_goal_y);
-    let goal_side_of_attacker = goal_side_between_y(player_position.y, attacker_y, own_goal_y);
+    let goal_side_of_attacker = goal_side_between_y(player_position.y, threat.y, own_goal_y);
     match (goal_side_of_ball, goal_side_of_attacker) {
         (true, true) => 0.24,
         (true, false) | (false, true) => -0.12,
@@ -32749,6 +33011,8 @@ fn soccer_requested_tactical_feature_gate_names() -> Vec<String> {
         "DD_SOCCER_DISABLE_HOLD_FOR_SUPPORT",
         "DD_SOCCER_DISABLE_HOLD_DRIVE_INTO_SPACE",
         "DD_SOCCER_ENABLE_QUICK_FORWARD_PASS",
+        "DD_SOCCER_ENABLE_OVERDRIBBLE_PENALTY",
+        "DD_SOCCER_ENABLE_CARRIER_FORWARD_DRIVE",
     ]
     .into_iter()
     .map(str::to_string)
@@ -50095,6 +50359,7 @@ fn tracking_frame_to_world_snapshot(
         loose_ball_commit_head: None,
         receive_approach_head: None,
         long_pass_run_head: None,
+        give_and_go_head: None,
         attack_spacing_head: None,
         aerial_reception_head: None,
         shot_trigger_head: None,
