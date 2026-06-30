@@ -90128,6 +90128,8 @@ fn overdribble_penalty_is_danger_scaled_and_skips_keepers() {
                 curl_acceleration: Vec2::zero(),
                 altitude_yards: 0.0,
                 resistance: BallResistanceFrame::default(),
+                holder: Some(carrier),
+                last_touch_team: Some(Team::Home),
             });
         }
         let before = sim.reward_events.len();
