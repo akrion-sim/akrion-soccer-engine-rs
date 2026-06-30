@@ -12273,6 +12273,45 @@ impl SoccerMatch {
         }
         let player_pos = self.players[player_id].position;
         let player_team = self.players[player_id].team;
+        let movement_or_carry_action = matches!(
+            intent.action,
+            SoccerAction::MoveTo(_)
+                | SoccerAction::Dribble(_)
+                | SoccerAction::DribbleMove { .. }
+                | SoccerAction::ControlTouch { .. }
+        );
+        let on_ball_carry_action = matches!(
+            intent.action,
+            SoccerAction::Dribble(_) | SoccerAction::DribbleMove { .. } | SoccerAction::ControlTouch { .. }
+        );
+        // A stale on-ball continuation can outlive the touch that made the ball loose
+        // (decision-cadence gap ticks / refractory decisions). Once possession is gone,
+        // do not keep running the body upfield under a dribble label; recover the live ball.
+        if on_ball_carry_action && self.ball.holder.is_none() {
+            let recovery = WorldSnapshot::from_match(self).loose_ball_recovery_target_for(player_id);
+            let sprint = self.players[player_id].position.distance(self.ball.position)
+                <= LOOSE_BALL_FIFTY_FIFTY_CONTEST_RADIUS_YARDS
+                || self.ball.velocity.len() > 0.75;
+            self.move_player_towards(player_id, recovery, sprint);
+            return;
+        }
+        // Conversely, if the engine still credits this player as the holder but the
+        // ball is visibly outside playable reach, step onto the ball before carrying
+        // away. This preserves first-touch settling without the "ghost dribble" where
+        // the player runs forward and the ball trails behind unattended.
+        if self.ball.holder == Some(player_id)
+            && movement_or_carry_action
+            && player_pos.distance(self.ball.position) > CONTROLLED_STRIKE_REACH_YARDS
+        {
+            let ball_pos = self.ball.position;
+            self.move_player_towards(player_id, ball_pos, false);
+            let settle_facing =
+                facing_bucket_from_vector(ball_pos - self.players[player_id].position);
+            if settle_facing != FacingBucket::Unknown {
+                self.players[player_id].action_facing = settle_facing;
+            }
+            return;
+        }
         // First-touch settle gate: a holder is the ball's owner (`has_ball`) the
         // instant control is won, but a ball won from a stretched trap is still 1.4–2.8yd
         // out being drawn to the feet over ~2 ticks (see CONTROL_FIRST_TOUCH_SETTLE_*).
@@ -12941,6 +12980,13 @@ impl SoccerMatch {
                         }
                         None => modulated_speed,
                     };
+                    let mut mpc_release_floor_yps = mpc_pass_speed
+                        .filter(|_| {
+                            !flight.is_aerial()
+                                && target_id.is_some()
+                                && !slip_break_profile.available
+                        })
+                        .map(|v| v * 0.88);
                     // Learnable pass velocity (execution side): honor the MPC speed the
                     // decision priced in BOTH directions. The old release gate only firmed
                     // a ball up when the plan picked a driven bucket; if the analytic pace was
@@ -12972,6 +13018,9 @@ impl SoccerMatch {
                                 let ceiling =
                                     mph_to_yps(GROUND_PASS_CEILING_MPH + PASS_SPEED_CEILING_OVERSHOOT_MPH);
                                 let plan_speed = plan.speed_yps.clamp(mph_to_yps(4.0), ceiling);
+                                if receiver.is_some() {
+                                    mpc_release_floor_yps = Some(plan_speed * 0.88);
+                                }
                                 let mpc_trust = (0.42
                                     + plan.mpc_receipt_probability.clamp(0.0, 1.0) * 0.34
                                     + (1.0 - plan.lane_interception_risk.clamp(0.0, 1.0)) * 0.18)
@@ -13235,6 +13284,36 @@ impl SoccerMatch {
                         }
                         return;
                     }
+                    let release_dir = release.velocity.normalized();
+                    let momentum_power_factor = self.kick_power_factor_for(player_id, release_dir);
+                    if let Some(floor) = mpc_release_floor_yps {
+                        let physical_launch_speed =
+                            speed * facing_outcome.power_factor * momentum_power_factor;
+                        if physical_launch_speed + 1e-6 < floor * 0.72 {
+                            let look = release_target - player_pos;
+                            if look.len() > 1e-6 {
+                                let face = facing_bucket_from_vector(look);
+                                if face != FacingBucket::Unknown {
+                                    self.players[player_id].action_facing = face;
+                                }
+                            }
+                            return;
+                        }
+                    }
+                    if let (Some(floor), Some(cap)) =
+                        (mpc_release_floor_yps, facing_outcome.speed_cap_yps)
+                    {
+                        if cap + 1e-6 < floor {
+                            let look = release_target - player_pos;
+                            if look.len() > 1e-6 {
+                                let face = facing_bucket_from_vector(look);
+                                if face != FacingBucket::Unknown {
+                                    self.players[player_id].action_facing = face;
+                                }
+                            }
+                            return;
+                        }
+                    }
                     let launch_target = release.launch_target;
                     let resolved_facing = facing_bucket_from_vector(launch_target - player_pos);
                     if resolved_facing != FacingBucket::Unknown {
@@ -13249,13 +13328,16 @@ impl SoccerMatch {
                         // trying to blast it upfield) loses power — you can't plant and
                         // generate force. Forces a controlling touch + turn before a
                         // hard upfield play, rather than an impossible instant clearance.
-                        let kd = release.velocity.normalized();
-                        let momentum_f = self.kick_power_factor_for(player_id, kd);
+                        let kd = release_dir;
+                        let momentum_f = momentum_power_factor;
                         // Off-centre strikes lose power; near-perpendicular prods and backheels
                         // are additionally hard-capped (10mph / 20mph) by the body-facing model.
                         let mut launch_speed = speed * facing_outcome.power_factor * momentum_f;
                         if let Some(cap) = facing_outcome.speed_cap_yps {
                             launch_speed = launch_speed.min(cap);
+                        }
+                        if let Some(floor) = mpc_release_floor_yps {
+                            launch_speed = launch_speed.max(floor);
                         }
                         if slip_break_profile.available {
                             launch_speed = launch_speed.clamp(
