@@ -8741,6 +8741,8 @@ impl SoccerMatch {
         self.collect_run_prediction_rl_samples(&next_snapshot);
         // Learnable slip-break commit RL samples (no-op under test / when disabled).
         self.collect_slip_break_rl_samples(&next_snapshot);
+        // Learnable onside-support push (gamble the shoulder vs hold) RL samples (no-op under test).
+        self.collect_onside_support_rl_samples(&next_snapshot);
         self.collect_long_pass_run_rl_samples(&next_snapshot);
         // Learnable give-and-go / wall-pass appetite RL samples (no-op + byte-identical unless
         // `DD_SOCCER_ENABLE_LEARNED_GIVE_AND_GO` is set).
