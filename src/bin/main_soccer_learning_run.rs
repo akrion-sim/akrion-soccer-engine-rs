@@ -1998,6 +1998,11 @@ fn run_game(
     if let Some(head) = CARRIED_RECEIVE_APPROACH_HEAD.lock().unwrap().as_ref() {
         sim.set_receive_approach_head(head.clone());
     }
+    // Install the carried lane-affinity head so the lane clamp seam consumes it live once
+    // trained. No-op unless the lane-affinity model is enabled (on by default in prod).
+    if let Some(head) = CARRIED_LANE_AFFINITY_HEAD.lock().unwrap().as_ref() {
+        sim.set_lane_affinity_head(head.clone());
+    }
     // Install the carried long-pass run head so `backfield_long_pass_run_invite_for` consumes
     // it live once trained. No-op unless DD_SOCCER_ENABLE_LEARNED_LONG_PASS_RUN is set.
     if let Some(head) = CARRIED_LONG_PASS_RUN_HEAD.lock().unwrap().as_ref() {
