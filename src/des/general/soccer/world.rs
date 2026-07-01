@@ -24953,6 +24953,7 @@ impl WorldSnapshot {
             separation_floor_head: m.separation_floor_head.clone(),
             pass_lane_yield_head: m.pass_lane_yield_head.clone(),
             head_scan_head: m.head_scan_head.clone(),
+            crash_box_head: m.crash_box_head.clone(),
             long_pass_run_head: m.long_pass_run_head.clone(),
             give_and_go_head: m.give_and_go_head.clone(),
             attack_spacing_head: m.attack_spacing_head.clone(),
