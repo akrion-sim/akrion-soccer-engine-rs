@@ -13463,6 +13463,27 @@ pub(crate) fn attack_ambition_enabled() -> bool {
     !*V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_ATTACK_AMBITION").is_ok())
 }
 
+/// Whether the **loose-ball opponent-pace match** is active this process: an elected
+/// 1–2 chaser sprints for a loose ball when the nearest opponent has committed a
+/// run/sprint at the contest point, keeping the 50/50 a real race rather than jogging
+/// and conceding it. **Default-ON in production**
+/// (`DD_SOCCER_ENABLE_LOOSE_BALL_OPPONENT_PACE_MATCH=0/false/no/off` is the kill
+/// switch), read once. **Default-OFF under test** so the loose-ball gait/parity suites
+/// stay byte-identical unless a test opts in. Only the chase gait is affected — who is
+/// elected to chase, and where they run, is unchanged.
+pub(crate) fn loose_ball_opponent_pace_match_enabled() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_LOOSE_BALL_OPPONENT_PACE_MATCH")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_LOOSE_BALL_OPPONENT_PACE_MATCH"))
+    }
+}
+
 /// Whether the **raised scoop apex** is active this process: a blocked-lane scoop chips ~10-13ft
 /// (`SCOOP_LOFT_APEX_HIGH_*`) instead of 6-9ft so it clears an upright/jumping defender stood in
 /// the lane, not just a standing foot. **Default-ON in production**
