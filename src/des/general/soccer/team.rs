@@ -4031,6 +4031,20 @@ fn soccer_formation_lp_anchor(
     let possession = snapshot
         .controlled_possession_team()
         .or_else(|| snapshot.possession_team());
+    // Formation spread: the legacy anchor width (`width*0.62` ≈ 50yd) collapsed the block so the
+    // eleven's home lanes mapped to only ~32yd of span — the team never held the pitch wide. Floor
+    // the anchor width near the full pitch (wider in possession) so the LP nudges players onto a
+    // genuinely spread formation; the dynamic directive can still make it wider, and the player
+    // POMDP still decides whether to take the slot.
+    if spread {
+        let floor = if possession == Some(team) {
+            width * 0.92
+        } else {
+            width * 0.80
+        };
+        let effective_width = directive_width.max(floor);
+        x = width * 0.5 + home_lane * effective_width * 0.5;
+    }
     let y = match possession {
         Some(possessing) if possessing == team => match player.role {
             PlayerRole::Goalkeeper => own_goal_y + attack_dir * 7.0,
