@@ -35236,13 +35236,73 @@ impl WorldSnapshot {
         let lane_open = self.clear_line(passer_pos, seam_target, attacking_team.other(), 2.0);
         let lane_openness = if lane_open { 1.0 } else { 0.35 };
         let timing = slip_break_release_timing(yards_to_line, onside, runner_forward_yps);
-        let opportunity =
+        let base_opportunity =
             slip_break_opportunity_quality(seam_quality, timing, lane_openness, speed_advantage);
+        // Learnable slip-break commit (MDP/POMDP): scale the opportunity by a learned appetite so
+        // the cooperative break is backed more/less readily per situation. Unchanged when the
+        // model is off ⇒ byte-identical.
+        let inputs = SlipBreakInputs {
+            seam_quality,
+            timing,
+            lane_openness,
+            speed_advantage,
+            onside_margin: (yards_to_line / 10.0).clamp(0.0, 1.0),
+            role_forward: (runner.role == PlayerRole::Forward) as i32 as f64,
+        };
+        let opportunity = self.slip_break_effective_opportunity(&inputs, base_opportunity);
         Some(SlipBreakOpportunity {
             timing,
             lane_openness,
             opportunity,
         })
+    }
+
+    /// The [`SlipBreakInputs`] (POMDP obs) + base (un-modulated) opportunity quality for a slip-break
+    /// from `passer_id` to `runner_id`. Shares the geometry of [`Self::slip_break_runner_opportunity`];
+    /// used by the RL collector. `None` when no slip-break applies to the pair.
+    pub(crate) fn slip_break_decision_inputs(
+        &self,
+        attacking_team: Team,
+        passer_id: usize,
+        passer_pos: Vec2,
+        runner_id: usize,
+    ) -> Option<(SlipBreakInputs, f64)> {
+        if runner_id == passer_id {
+            return None;
+        }
+        let runner = self.players.iter().find(|p| p.id == runner_id)?;
+        if runner.team != attacking_team
+            || !matches!(runner.role, PlayerRole::Forward | PlayerRole::Midfielder)
+        {
+            return None;
+        }
+        let line_y = self.second_last_defender_line_for(attacking_team)?;
+        let attack_dir = attacking_team.attack_dir();
+        let runner_pos = self.player_snapshot_position(runner);
+        let yards_to_line = (line_y - runner_pos.y) * attack_dir;
+        if !slip_break_runner_in_staging_band(yards_to_line) {
+            return None;
+        }
+        let onside = yards_to_line > 0.0;
+        let runner_vel = self.player_velocity(runner_id).unwrap_or_else(|| Vec2::new(0.0, 0.0));
+        let runner_forward_yps = runner_vel.y * attack_dir;
+        let (seam_target, seam_quality) = self.slip_break_seam_for(attacking_team, runner_pos)?;
+        let line_forward_yps = self.slip_break_line_forward_velocity(attacking_team, line_y);
+        let speed_advantage = slip_break_speed_advantage(runner_forward_yps, line_forward_yps);
+        let lane_open = self.clear_line(passer_pos, seam_target, attacking_team.other(), 2.0);
+        let lane_openness = if lane_open { 1.0 } else { 0.35 };
+        let timing = slip_break_release_timing(yards_to_line, onside, runner_forward_yps);
+        let base_opportunity =
+            slip_break_opportunity_quality(seam_quality, timing, lane_openness, speed_advantage);
+        let inputs = SlipBreakInputs {
+            seam_quality,
+            timing,
+            lane_openness,
+            speed_advantage,
+            onside_margin: (yards_to_line / 10.0).clamp(0.0, 1.0),
+            role_forward: (runner.role == PlayerRole::Forward) as i32 as f64,
+        };
+        Some((inputs, base_opportunity))
     }
 
     /// Mean forward velocity (yd/s, attacking frame) of the opponent defenders forming the line —
