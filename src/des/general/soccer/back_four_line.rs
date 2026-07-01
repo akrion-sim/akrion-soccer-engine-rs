@@ -136,6 +136,28 @@ pub const BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_DEFENDING_YARDS: f64 = 30.0
 pub const BACK_FOUR_FOREMOST_FOUR_ATTACKER_MIN_GAP_YARDS: f64 = 14.0;
 pub const BACK_FOUR_FOREMOST_FOUR_ATTACKER_MAX_PUSH_YARDS: f64 = 12.0;
 
+// ---- Tighter line (default-ON): sit CLOSER to the opponents' foremost four and push up harder ----
+// The legacy ideal gaps (24/26/30) left the back four sitting ~24-30yd behind the opponents' front
+// line — far too much space to play a pass into feet, and visually "backing off". These tighter
+// gaps + a higher push cap + firmer gains make the line step up to stay connected to the foremost
+// four, per the coaching cue "there shouldn't be so much space between the back 4 and the
+// forward-most opponents". Still never steps AHEAD of the attackers (no runner played onside).
+pub const BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_IN_POSSESSION_TIGHT_YARDS: f64 = 12.0;
+pub const BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_DISPOSSESSION_TIGHT_YARDS: f64 = 15.0;
+pub const BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_DEFENDING_TIGHT_YARDS: f64 = 20.0;
+pub const BACK_FOUR_FOREMOST_FOUR_ATTACKER_MAX_PUSH_TIGHT_YARDS: f64 = 26.0;
+
+// ---- Ball-far offside-trap push-up (default-ON) ----
+// "The defense can push up to play an offside trap when the ball is far away and the back four is
+// more than 5 yards inside its own half." When the (predicted) ball is upfield in the opponent
+// half by this margin AND the line still sits deeper than [own half − OWN_HALF_MARGIN], the line
+// steps up to a high trap line: a small gap GOALSIDE of the opponents' SINGLE most-advanced
+// attacker (so nobody is left in behind), capped at the high-line ceiling. Held off while the
+// opponent is in clear control (no pushing into a live counter).
+pub const BACK_FOUR_BALL_FAR_PUSH_UP_BALL_MARGIN_YARDS: f64 = 6.0;
+pub const BACK_FOUR_BALL_FAR_PUSH_UP_OWN_HALF_MARGIN_YARDS: f64 = 5.0;
+pub const BACK_FOUR_BALL_FAR_PUSH_UP_TRAP_GAP_YARDS: f64 = 4.0;
+
 /// Minimum trailing gap (yd behind the ball) the back four holds **while WE control the ball**.
 /// In possession the line may step right up to support the attack, so the floor drops from the
 /// out-of-possession [`BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS`] (20) to this (5). "Dispossession" —
