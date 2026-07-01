@@ -23844,7 +23844,8 @@ fn dd_soccer_disable_show_for_ball_boost() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_SHOW_FOR_BALL_BOOST").is_ok())
 }
-/// Off-ball spacing discipline (gated, default OFF = byte-identical for clean A/B). When ON,
+/// Off-ball spacing discipline. Default-ON in prod (kill switch
+/// `DD_SOCCER_ENABLE_OFF_BALL_SPACE_DISCIPLINE=0`); default-OFF under test = byte-identical for clean A/B. When ON,
 /// `open_space_for` rewards off-ball teammates for *improving* the passing picture rather than
 /// merely closing on the ball: the "show for the ball" / ball-arrival proximity pulls are
 /// cancelled for a player who is ALREADY a clean, in-range outlet, and candidates that collapse
