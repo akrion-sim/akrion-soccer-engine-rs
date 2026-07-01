@@ -94233,8 +94233,8 @@ fn separation_floor_mpc_reward_and_grace_work_in_unison() {
         "gate off: teammate keep-out should be the small default, got {radius_off}"
     );
 
-    // Gate ON ⇒ the SAME live-movement MPC path inflates the teammate keep-out to the 4yd floor,
-    // so the executed plan routes around the teammate — in unison with the reward + barrier.
+    // Gate ON ⇒ the SAME live-movement MPC path inflates the teammate keep-out to the influence
+    // radius, so the executed plan routes around the teammate — in unison with the reward + grace.
     std::env::set_var("DD_SOCCER_ENABLE_SAME_TEAM_SEPARATION_FLOOR", "1");
     assert!(dd_soccer_enable_same_team_separation_floor());
     let radius_on = radius_of_mate(&sim);
