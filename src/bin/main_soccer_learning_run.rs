@@ -27,6 +27,7 @@ use soccer_engine::des::general::soccer::{
     LONG_PASS_RUN_HEAD_MIN_TRAINING_STEPS, GiveAndGoHead, GIVE_AND_GO_HEAD_MIN_TRAINING_STEPS,
     ShotTriggerHead, SHOT_TRIGGER_HEAD_MIN_TRAINING_STEPS,
     ReceiveApproachHead, RECEIVE_APPROACH_HEAD_MIN_TRAINING_STEPS,
+    LaneAffinityHead, LANE_AFFINITY_HEAD_MIN_TRAINING_STEPS,
 };
 use soccer_engine::des::soccer_learning::{
     evaluate_soccer_policy_promotion_gate, evolve_soccer_tactical_learning_weights_from_genomes,
