@@ -12,7 +12,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use soccer_engine::des::general::soccer::{
     soccer_moment_records_from_jsonl, soccer_moment_records_to_learning_dataset,
-    train_soccer_pass_completion_head, AttackSpacingHead, BackFourLineHead, GiveAndGoHead,
+    train_soccer_pass_completion_head, AttackSpacingHead, BackFourLineHead, DefenderLinePolicyHead,
+    GiveAndGoHead,
     CrashBoxHead, GoalSideRecoveryHead, HeadScanHead, LaneAffinityHead, LongPassRunHead,
     LooseBallCommitHead, MatchConfig, MatchSummary, OnsideSupportHead, PassLaneYieldHead,
     RunPredictionHead, SeparationFloorHead, SlipBreakHead, WingerPinchHead,
