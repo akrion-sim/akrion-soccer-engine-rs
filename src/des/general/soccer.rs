@@ -2754,10 +2754,10 @@ const SAME_TEAM_MIN_SEPARATION_YARDS: f64 = 4.0;
 // influence band is `[4, 4 + this]`, i.e. 4yd → 8yd. Above it there is no effect at all.
 const SAME_TEAM_SEPARATION_INFLUENCE_YARDS: f64 = 4.0;
 // Base points of the graduated proximity reward penalty at the 4-yard peak (rises further as the
-// gap collapses, quadratically decays to 0 by 8yd). Deliberately large — the biggest of the dense
-// shaping terms so crowding a teammate is a genuinely "huge" cost — but still inside
+// gap collapses, linearly decays to 0 by 8yd). Deliberately large — the biggest of the dense
+// shaping terms so crowding a teammate is a genuinely "huge" cost — while a total overlap caps at
 // `reward.dense_shaping_budget_points` (12.0). This is the primary dial for how hard it bites.
-const SAME_TEAM_PROXIMITY_PENALTY_POINTS: f64 = 1.5;
+const SAME_TEAM_PROXIMITY_PENALTY_POINTS: f64 = 6.0;
 // Multiplier applied to a same-team MPC obstacle's avoidance weight when the floor is in
 // force, so the planner treats an imminent teammate crossing as a strong route cost.
 const SAME_TEAM_MPC_OBSTACLE_WEIGHT_GAIN: f64 = 1.6;
@@ -2799,7 +2799,7 @@ pub(crate) fn dd_soccer_enable_same_team_separation_floor() -> bool {
 
 /// Graduated same-team proximity penalty as a fraction of
 /// [`SAME_TEAM_PROXIMITY_PENALTY_POINTS`] for a realized nearest-teammate distance
-/// (yards). Zero at/beyond the influence radius (8yd), quadratically rising to 1.0 at the
+/// (yards). Zero at/beyond the influence radius (8yd), linearly rising to 1.0 at the
 /// 4yd floor ("small at 7, medium at 6, big at 5"), and rising further (up to 2.0) below
 /// the floor ("huge inside 4"). Pure / RNG-free.
 pub(crate) fn same_team_proximity_penalty_unit(distance_yards: f64) -> f64 {
@@ -2817,7 +2817,7 @@ pub(crate) fn same_team_proximity_penalty_unit(distance_yards: f64) -> f64 {
         return (1.0 + (floor - distance_yards).max(0.0) / floor).min(2.0);
     }
     let t = (influence - distance_yards) / (influence - floor); // 0 at influence, 1 at floor
-    (t * t).clamp(0.0, 1.0)
+    t.clamp(0.0, 1.0)
 }
 
 /// Advance the three nested same-team proximity dwell timers by `dt` for the current

@@ -36744,6 +36744,10 @@ impl WorldSnapshot {
         if (return_target.y - carrier_pos.y) * attack_dir < WALL_PASS_MIN_RUN_GAIN_YARDS {
             return None;
         }
+        let visible_floor_targets = self.ranked_visible_pass_targets(carrier_id, 11);
+        if visible_floor_targets.is_empty() {
+            return None;
+        }
         // Pick the best wall: a side-on teammate with a clean give lane, free enough to lay
         // it off first-time, and from whom the return into the run is open.
         self.players
@@ -36755,6 +36759,9 @@ impl WorldSnapshot {
                 let partner_pos = self.player_snapshot_position(partner);
                 let give = partner_pos - carrier_pos;
                 let give_dist = give.len();
+                if !visible_floor_targets.contains(&partner.id) {
+                    return None;
+                }
                 if give_dist < WALL_PASS_GIVE_MIN_YARDS || give_dist > WALL_PASS_GIVE_MAX_YARDS {
                     return None;
                 }
@@ -39779,13 +39786,10 @@ impl WorldSnapshot {
     /// close AND an opponent is right on it — warrants a SECOND challenger so we
     /// fight to win it instead of conceding by all retreating to support outlets.
     pub(crate) fn loose_ball_contester_count(&self, me: &PlayerSnapshot, target: Vec2) -> usize {
-        let my_dist = self.player_snapshot_position(me).distance(target);
-        if my_dist > LOOSE_BALL_FIFTY_FIFTY_CONTEST_RADIUS_YARDS {
-            return 1;
-        }
         if self.loose_ball_team_stalled_for(me.team) {
             return 1;
         }
+        let my_dist = self.player_snapshot_position(me).distance(target);
         // Nearest opponent (the team that played the ball) to the drop, and how fast it is
         // closing onto it. A second defender joins ONLY to shield against genuine pressure:
         // an opponent right on the ball (high pressure), or one inside the 50/50 radius and
@@ -39821,6 +39825,13 @@ impl WorldSnapshot {
         // opponent is genuinely fleeing it is left to a single calm claimer (rest hold shape).
         let contested_fifty_fifty = nearest_dist <= LOOSE_BALL_FIFTY_FIFTY_CONTEST_RADIUS_YARDS
             && nearest_closing >= -LOOSE_BALL_SHIELD_CLOSING_YPS;
+        let outside_radius_needs_help =
+            self.ball.velocity.len() >= LOOSE_BALL_PROJECTION_MIN_SPEED_YPS || nearest_closing > 0.5;
+        if my_dist > LOOSE_BALL_FIFTY_FIFTY_CONTEST_RADIUS_YARDS
+            && !(outside_radius_needs_help && (high_pressure || contested_fifty_fifty))
+        {
+            return 1;
+        }
         if high_pressure || contested_fifty_fifty {
             2
         } else {

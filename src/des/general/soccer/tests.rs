@@ -19832,6 +19832,53 @@ fn lone_loose_ball_is_claimed_by_one_retriever_two_only_under_pressure() {
 }
 
 #[test]
+fn outside_radius_loose_ball_pressure_still_adds_second_chaser() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 42,
+        ..Default::default()
+    });
+    let r1 = 4usize;
+    let r2 = 5usize;
+    let opp = 16usize;
+    park_players_except(&mut sim, &[r1, r2, opp]);
+    sim.players[r1].role = PlayerRole::Midfielder;
+    sim.players[r2].role = PlayerRole::Midfielder;
+    sim.players[opp].role = PlayerRole::Forward;
+    let ball = Vec2::new(40.0, 60.0);
+    sim.ball.holder = None;
+    sim.ball.position = ball;
+    sim.ball.velocity = Vec2::zero();
+    sim.players[r1].position = Vec2::new(40.0, 51.0);
+    sim.players[r2].position = Vec2::new(49.0, 60.0);
+    sim.players[opp].position = Vec2::new(40.0, 66.0);
+    sim.players[opp].velocity = Vec2::new(0.0, -5.0);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    for player_id in [r1, r2] {
+        let me = snapshot
+            .players
+            .iter()
+            .find(|player| player.id == player_id)
+            .unwrap();
+        assert!(
+            snapshot.player_snapshot_position(me).distance(ball)
+                > LOOSE_BALL_FIFTY_FIFTY_CONTEST_RADIUS_YARDS,
+            "fixture should start just outside the normal 50/50 radius"
+        );
+        assert_eq!(
+            snapshot.loose_ball_contester_count(me, ball),
+            2,
+            "a closing opponent should pull two chasers even just outside the nominal radius"
+        );
+        assert!(
+            snapshot.is_committed_loose_ball_chaser(player_id),
+            "player {player_id} should attack the pressured loose ball"
+        );
+    }
+}
+
+#[test]
 fn contested_loose_ball_is_cut_off_earlier_on_its_path() {
     let setup = || {
         let mut sim = SoccerMatch::default_11v11(MatchConfig {
@@ -89812,6 +89859,44 @@ fn wall_pass_available_with_beatable_man_and_free_wall() {
 }
 
 #[test]
+fn wall_pass_requires_visible_safe_floor_pass_to_the_wall() {
+    let mut sim = wall_pass_scenario();
+    let carrier = 6usize;
+    let wall = 7usize;
+    sim.players[carrier].skills.passing_completion_rate = 8.4;
+    sim.players[carrier].skills.passing = 8.4;
+    sim.players[carrier].skills.vision = 1.5;
+    sim.players[carrier].facing_yaw = 0.0;
+    sim.players[carrier].action_facing = FacingBucket::East;
+    sim.players[carrier].receive_facing = FacingBucket::East;
+
+    let mut snapshot = WorldSnapshot::from_match(&sim);
+    snapshot.players[carrier].vision_range_yards = 8.0;
+    assert!(
+        !snapshot.player_can_see_player(carrier, wall),
+        "fixture should put the wall target outside the holder's field of view"
+    );
+    assert!(
+        snapshot.clear_line(
+            sim.players[carrier].position,
+            sim.players[wall].position,
+            Team::Away,
+            WALL_PASS_LANE_RADIUS_YARDS,
+        ),
+        "geometric wall-pass lane should still look clear"
+    );
+    let visible_targets = snapshot.ranked_visible_pass_targets(carrier, 11);
+    assert!(
+        !visible_targets.contains(&wall),
+        "ordinary pass ranking must hide a wall target the holder cannot see: {visible_targets:?}"
+    );
+    assert!(
+        snapshot.wall_pass_option_for(carrier).is_none(),
+        "wall-pass must not bypass the ordinary visible/safe floor-pass target gate"
+    );
+}
+
+#[test]
 fn open_wall_pass_is_competitive_in_live_option_set() {
     let mut sim = wall_pass_scenario();
     sim.config.dt_seconds = PROBABILITY_REFERENCE_DT_SECONDS;
@@ -94253,6 +94338,15 @@ fn same_team_proximity_penalty_curve_is_graduated_huge_to_small() {
         "penalty must decrease with distance across 4<5<6<7: {at_4} {at_5} {at_6} {at_7}"
     );
     assert!((at_4 - 1.0).abs() < 1e-9, "unit penalty is 1.0 exactly at the floor: {at_4}");
+    assert!((at_5 - 0.75).abs() < 1e-9, "5yd should still bite hard: {at_5}");
+    assert!((at_6 - 0.50).abs() < 1e-9, "6yd should be a medium penalty: {at_6}");
+    assert!((at_7 - 0.25).abs() < 1e-9, "7yd should remain a meaningful warning: {at_7}");
+    assert!(
+        (same_team_proximity_penalty_unit(0.0) * SAME_TEAM_PROXIMITY_PENALTY_POINTS - 12.0)
+            .abs()
+            < 1e-9,
+        "complete overlap should cap at the dense shaping budget"
+    );
     assert_eq!(at_8, 0.0, "no penalty at/beyond the influence radius");
     assert_eq!(same_team_proximity_penalty_unit(20.0), 0.0);
     // Inside the floor the penalty is "huge" (> the at-floor value) and capped.
