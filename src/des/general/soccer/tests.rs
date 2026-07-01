@@ -94196,12 +94196,12 @@ fn separation_floor_env_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// MPC, POMDP-reward and barrier must act in UNISON: all three key off the one gate. Here we
-/// prove the live-movement MPC keep-out flips with the gate (routes around teammates), that the
-/// graduated reward penalty the policy sees is live for the same crowded gap, and that the
-/// smooth barrier actually holds the 4yd floor across real ticks of the full step loop.
+/// MPC keep-out, the graduated reward penalty and its grace timers act in UNISON off the one gate.
+/// There is deliberately NO hard barrier — the 4yd line is a strong penalty, not a wall. Proves the
+/// live-movement MPC keep-out flips with the gate (routes around teammates), the reward penalty
+/// curve is live for the crowded gap, and the nested grace timers accrue across real ticks.
 #[test]
-fn separation_floor_mpc_reward_and_barrier_work_in_unison() {
+fn separation_floor_mpc_reward_and_grace_work_in_unison() {
     let _env = separation_floor_env_lock();
     let dt = DEFAULT_DT_SECONDS;
 
