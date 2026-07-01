@@ -115,6 +115,11 @@ pub const LANE_AFFINITY_SAMPLE_CAP: usize = 8192;
 /// Minimum training steps before a trained head is consumed live; below this the
 /// regression net is too raw, so the seam falls back to the analytic seed.
 pub const LANE_AFFINITY_HEAD_MIN_TRAINING_STEPS: usize = 200;
+/// Weight on the dense territorial-advantage delta added to the windowed real-reward sum.
+/// Kept modest so the actual reward pipeline (passes/shots/goals/turnovers) dominates,
+/// with pitch-control change as the tiebreaker for a purely-positional off-ball break
+/// that fires no discrete on-ball event inside the window.
+pub const LANE_AFFINITY_TERRITORIAL_SHAPING_WEIGHT: f64 = 1.0;
 
 /// Raw (un-normalized) per-player lane state the break/hold choice is a function of,
 /// captured mirror-invariantly (all lateral quantities are magnitudes or signed by the
