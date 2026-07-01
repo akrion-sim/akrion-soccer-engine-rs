@@ -24266,8 +24266,20 @@ fn soccer_transition_reward_with_tactics(
     let reward_cfg = &tunables().reward;
     reward += (after_for as f64 - before_for as f64) * reward_cfg.goal_scored_points;
     if after_against > before_against {
+        // The concede STICK, mirror of the goal CARROT above. By default it is deliberately
+        // light (8/2 vs a +100 goal). The concede-symmetry rebalance (gated, default-OFF) swaps
+        // in the heavier `*_symmetric` values so conceding becomes a real counterweight to
+        // scoring — a full-parity hit for the back line, a role-graded share for outfielders —
+        // rather than a token cost. OFF ⇒ the original 8/2 values, byte-identical baseline / A/B.
+        let symmetric = dd_soccer_enable_concede_symmetry();
         reward -= if matches!(player.role, PlayerRole::Goalkeeper | PlayerRole::Defender) {
-            reward_cfg.concede_keeper_defender_penalty
+            if symmetric {
+                reward_cfg.concede_keeper_defender_penalty_symmetric
+            } else {
+                reward_cfg.concede_keeper_defender_penalty
+            }
+        } else if symmetric {
+            reward_cfg.concede_outfield_penalty_symmetric
         } else {
             reward_cfg.concede_outfield_penalty
         };
