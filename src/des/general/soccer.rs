@@ -112,6 +112,8 @@ mod run_prediction_decision;
 pub use run_prediction_decision::*;
 mod slip_break_decision;
 pub use slip_break_decision::*;
+mod onside_support_decision;
+pub use onside_support_decision::*;
 mod policy_select;
 pub use policy_select::*;
 mod pass_lane_yield;
@@ -51990,6 +51992,7 @@ fn tracking_frame_to_world_snapshot(
         crash_box_head: None,
         run_prediction_head: None,
         slip_break_head: None,
+        onside_support_head: None,
         long_pass_run_head: None,
         give_and_go_head: None,
         attack_spacing_head: None,

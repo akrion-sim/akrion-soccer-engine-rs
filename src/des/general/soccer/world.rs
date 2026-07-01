@@ -638,6 +638,13 @@ pub struct SoccerMatch {
     pub(crate) slip_break_samples: Vec<SlipBreakSample>,
     /// Open slip-break decisions awaiting their windowed reward.
     pub(crate) pending_slip_break: Vec<PendingSlipBreakDecision>,
+    /// The trained onside-support push head, when present. `None` ⇒ analytic seed. Shared into each
+    /// [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) onside_support_head: Option<std::sync::Arc<OnsideSupportHead>>,
+    /// Rolling RL corpus for the onside-support head. Collected only while the model is enabled.
+    pub(crate) onside_support_samples: Vec<OnsideSupportSample>,
+    /// Open onside-support decisions awaiting their windowed reward.
+    pub(crate) pending_onside_support: Vec<PendingOnsideSupportDecision>,
     /// The trained long-pass run head (which attacker should break forward so a deep carrier
     /// can pick them out), when present. Carried + trained across games by the learner; `None`
     /// ⇒ the analytic `backfield_long_pass_run_invite_for` seed. Shared into each
@@ -3213,6 +3220,9 @@ impl SoccerMatch {
             slip_break_head: None,
             slip_break_samples: Vec::new(),
             pending_slip_break: Vec::new(),
+            onside_support_head: None,
+            onside_support_samples: Vec::new(),
+            pending_onside_support: Vec::new(),
             long_pass_run_head: None,
             long_pass_run_samples: Vec::new(),
             pending_long_pass_run: Vec::new(),
@@ -8731,6 +8741,8 @@ impl SoccerMatch {
         self.collect_run_prediction_rl_samples(&next_snapshot);
         // Learnable slip-break commit RL samples (no-op under test / when disabled).
         self.collect_slip_break_rl_samples(&next_snapshot);
+        // Learnable onside-support push (gamble the shoulder vs hold) RL samples (no-op under test).
+        self.collect_onside_support_rl_samples(&next_snapshot);
         self.collect_long_pass_run_rl_samples(&next_snapshot);
         // Learnable give-and-go / wall-pass appetite RL samples (no-op + byte-identical unless
         // `DD_SOCCER_ENABLE_LEARNED_GIVE_AND_GO` is set).
@@ -22307,6 +22319,10 @@ pub struct WorldSnapshot {
     /// slip-break opportunity seam. `None` ⇒ analytic seed (parity). Skipped by serde.
     #[serde(skip)]
     pub(crate) slip_break_head: Option<std::sync::Arc<SlipBreakHead>>,
+    /// The trained onside-support push head, carried from the match for live consumption in the
+    /// onside-support clamp seam. `None` ⇒ analytic seed (parity). Skipped by serde.
+    #[serde(skip)]
+    pub(crate) onside_support_head: Option<std::sync::Arc<OnsideSupportHead>>,
     /// The trained long-pass run head, carried from the match for live consumption in
     /// `backfield_long_pass_run_invite_for`. `None` ⇒ analytic seed (parity). Skipped by
     /// serde (an internal decision aid; Default = None).
@@ -24990,6 +25006,7 @@ impl WorldSnapshot {
             crash_box_head: m.crash_box_head.clone(),
             run_prediction_head: m.run_prediction_head.clone(),
             slip_break_head: m.slip_break_head.clone(),
+            onside_support_head: m.onside_support_head.clone(),
             long_pass_run_head: m.long_pass_run_head.clone(),
             give_and_go_head: m.give_and_go_head.clone(),
             attack_spacing_head: m.attack_spacing_head.clone(),
@@ -29484,10 +29501,14 @@ impl WorldSnapshot {
         } else {
             active_line_y
         };
-        let beyond_line = (target.y - cap_y) * attack > 0.0;
+        // Learnable onside-support gamble (MDP/POMDP): the cap-at-the-line is a predilection — the
+        // attacker may push onto / a yard beyond the shoulder (time a break) or tuck deeper. Push is
+        // 0 when the model is off ⇒ cap stays exactly at the line (byte-identical).
+        let effective_cap_y = cap_y + self.onside_support_push_yards(player) * attack;
+        let beyond_line = (target.y - effective_cap_y) * attack > 0.0;
         let in_attacking_half = (target.y - half_line) * attack > 0.0;
         if in_attacking_half && beyond_line {
-            target.y = cap_y;
+            target.y = effective_cap_y;
         }
         target.clamp_to_pitch(self.field_width, self.field_length)
     }
@@ -35325,7 +35346,7 @@ impl WorldSnapshot {
     /// Mean forward velocity (yd/s, attacking frame) of the opponent defenders forming the line —
     /// negative when the line is stepping up to spring the offside trap. Zero if the line cannot
     /// be sampled.
-    fn slip_break_line_forward_velocity(&self, attacking_team: Team, line_y: f64) -> f64 {
+    pub(crate) fn slip_break_line_forward_velocity(&self, attacking_team: Team, line_y: f64) -> f64 {
         let attack_dir = attacking_team.attack_dir();
         let mut total = 0.0;
         let mut count = 0.0;
