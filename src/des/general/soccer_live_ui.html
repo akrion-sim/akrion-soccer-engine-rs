@@ -5917,7 +5917,17 @@ async function pauseAndAnalyze() {
   }
   const resp = await fetchLive("/api/decision-trace");
   if (!resp.ok) throw new Error("HTTP " + resp.status);
-  const payload = await resp.json();
+  let payload = await resp.json();
+  if (!payload?.captureEnabled) {
+    const enableResp = await fetchLive("/api/decision-trace", { method: "POST" });
+    if (!enableResp.ok) throw new Error("HTTP " + enableResp.status);
+    const enabledPayload = await enableResp.json();
+    payload = {
+      ...(payload || {}),
+      captureEnabled: enabledPayload?.captureEnabled ?? true,
+      entries: payload?.entries || []
+    };
+  }
   // Only overwrite the view if the refetch actually captured something, OR we had
   // nothing before — otherwise keep the prior capture (and its Copy-JSON payload).
   if ((payload?.entries?.length || 0) > 0 || !hadCapture) {

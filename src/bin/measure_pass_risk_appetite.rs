@@ -94,6 +94,15 @@ fn role_label(role: PlayerRole) -> &'static str {
     }
 }
 
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|raw| {
+            let value = raw.trim().to_ascii_lowercase();
+            matches!(value.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
 fn main() {
     // The deterministic simplex makes a given seed byte-reproducible but is ~10x slower than the
     // default Clarabel solve. With `SOCCER_SEED_VARIED_SKILLS` providing the cross-seed variance,
@@ -114,7 +123,7 @@ fn main() {
         .and_then(|s| u32::from_str_radix(s, 16).ok())
         .unwrap_or(0x5EED_0000);
 
-    let gate_on = std::env::var("DD_SOCCER_ENABLE_ROLE_PASS_RISK_APPETITE").is_ok();
+    let gate_on = env_flag_enabled("DD_SOCCER_ENABLE_ROLE_PASS_RISK_APPETITE");
 
     // key = "Role | zone"
     let mut buckets: BTreeMap<String, Bucket> = BTreeMap::new();
