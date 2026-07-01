@@ -265,6 +265,24 @@ pub fn back_four_adaptive_width_enabled() -> bool {
     }
 }
 
+/// Whether the back-four block width is floored at the four's own FORMATION span
+/// ([`BACK_FOUR_FORMATION_WIDTH_FLOOR_FRACTION`] × the home-lane span), so the fullbacks hold their
+/// wide lanes instead of tucking infield behind the narrower adaptive-width floor. Default-ON in
+/// production (kill switch `DD_SOCCER_ENABLE_BACK_FOUR_FORMATION_WIDTH_FLOOR=0`); default-OFF under
+/// test so the defensive-shape parity suite stays byte-identical.
+pub fn back_four_formation_width_floor_enabled() -> bool {
+    #[cfg(test)]
+    {
+        env_flag_enabled(BACK_FOUR_FORMATION_WIDTH_FLOOR_ENABLE_ENV)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| gate_default_on(BACK_FOUR_FORMATION_WIDTH_FLOOR_ENABLE_ENV))
+    }
+}
+
 /// State-adaptive back-four block width (yd): cover the opponent's foremost-attacker lateral
 /// `attackers_x_span` plus a [`BACK_FOUR_ADAPTIVE_WIDTH_SHOULDER_MARGIN_YARDS`] shoulder each side,
 /// floored at [`BACK_FOUR_ADAPTIVE_WIDTH_MIN_YARDS`] and capped at
