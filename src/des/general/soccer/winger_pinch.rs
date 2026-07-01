@@ -164,6 +164,28 @@ pub(crate) fn winger_pinch_decision_profile(
     box_congestion: usize,
     back_post_offside: bool,
 ) -> WingerPinchDecisionProfile {
+    winger_pinch_decision_profile_with_bias(
+        ball_on_my_flank,
+        crossing_position_on,
+        ball_final_third_depth_frac,
+        box_congestion,
+        back_post_offside,
+        0.0,
+    )
+}
+
+/// As [`winger_pinch_decision_profile`], but with a learned **pinch bias** in `[-1, 1]`
+/// folded into the two pinch buckets' scores (positive ⇒ lean toward pinching infield, negative
+/// ⇒ hold width). See [`super::winger_pinch_decision`]. `pinch_bias == 0.0` is byte-identical to
+/// [`winger_pinch_decision_profile`].
+pub(crate) fn winger_pinch_decision_profile_with_bias(
+    ball_on_my_flank: bool,
+    crossing_position_on: bool,
+    ball_final_third_depth_frac: f64,
+    box_congestion: usize,
+    back_post_offside: bool,
+    pinch_bias: f64,
+) -> WingerPinchDecisionProfile {
     let depth = ball_final_third_depth_frac.clamp(0.0, 1.0);
     let congestion = box_congestion as f64;
 
@@ -189,6 +211,15 @@ pub(crate) fn winger_pinch_decision_profile(
         half += congestion * CONGESTION_HALFSPACE_WEIGHT;
         back -= congestion * CONGESTION_BACKPOST_PENALTY;
     }
+
+    // Learned pinch appetite: a signed bias (default 0) shifts BOTH pinch buckets relative to
+    // holding width — the head's contribution to the stay-vs-pinch choice. Bounded by
+    // `super::winger_pinch_decision::WINGER_PINCH_APPETITE_WEIGHT` so it nudges without
+    // overriding the same-flank "hold width" rule.
+    let pinch_shift = pinch_bias.clamp(-1.0, 1.0)
+        * super::winger_pinch_decision::WINGER_PINCH_APPETITE_WEIGHT;
+    half += pinch_shift;
+    back += pinch_shift;
 
     // Legality mask: an offside back-post arrival is illegal — prune that bucket.
     let mut masked_back = back;
@@ -236,6 +267,29 @@ pub(crate) fn decide_winger_pinch(
         ball_final_third_depth_frac,
         box_congestion,
         back_post_offside,
+    )
+    .choice
+}
+
+/// As [`decide_winger_pinch`], but with a learned **pinch bias** in `[-1, 1]` folded into the two
+/// pinch buckets' scores. This is a thin compatibility wrapper around
+/// [`winger_pinch_decision_profile_with_bias`] so live action selection and learner-visible bucket
+/// scores stay conceptually identical.
+pub(crate) fn decide_winger_pinch_with_bias(
+    ball_on_my_flank: bool,
+    crossing_position_on: bool,
+    ball_final_third_depth_frac: f64,
+    box_congestion: usize,
+    back_post_offside: bool,
+    pinch_bias: f64,
+) -> WingerPinchChoice {
+    winger_pinch_decision_profile_with_bias(
+        ball_on_my_flank,
+        crossing_position_on,
+        ball_final_third_depth_frac,
+        box_congestion,
+        back_post_offside,
+        pinch_bias,
     )
     .choice
 }

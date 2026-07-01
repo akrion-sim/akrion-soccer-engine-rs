@@ -96,6 +96,14 @@ pub(crate) use winger_pinch::*;
 mod field_numbers;
 pub use field_numbers::*;
 mod goal_side;
+mod goal_side_recovery_decision;
+pub use goal_side_recovery_decision::*;
+mod winger_pinch_decision;
+pub use winger_pinch_decision::*;
+mod separation_floor_decision;
+pub use separation_floor_decision::*;
+mod pass_lane_yield_decision;
+pub use pass_lane_yield_decision::*;
 mod policy_select;
 pub use policy_select::*;
 mod pass_lane_yield;
@@ -2123,7 +2131,8 @@ const BACKWARD_PASS_BASE_PENALTY_POINTS: f64 = 5.0;
 /// Raised so the depth term bites harder.
 const BACKWARD_PASS_PENALTY_PER_YARD_POINTS: f64 = 1.4;
 /// Cap on the total unpressured-backward-pass penalty so one very deep ball can't swamp the signal.
-/// Kept below shot-on-target reward, but high enough that long unpressured retreats matter.
+/// Kept below shot-on-target reward, with headroom for the heavier base/per-yard terms so long
+/// unpressured retreats remain materially worse than short emergency drops.
 const BACKWARD_PASS_MAX_PENALTY_POINTS: f64 = 28.0;
 /// Over-dribble dispossession penalty (the carrier held the ball too long and was tackled for it).
 /// Hold time (seconds) past which staying on the ball is "overdue" — a pass or a forward drive
@@ -52444,6 +52453,10 @@ fn tracking_frame_to_world_snapshot(
         loose_ball_commit_head: None,
         receive_approach_head: None,
         lane_affinity_head: None,
+        goal_side_recovery_head: None,
+        winger_pinch_head: None,
+        separation_floor_head: None,
+        pass_lane_yield_head: None,
         long_pass_run_head: None,
         give_and_go_head: None,
         attack_spacing_head: None,

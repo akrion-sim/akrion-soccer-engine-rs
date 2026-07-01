@@ -586,6 +586,35 @@ pub struct SoccerMatch {
     pub(crate) lane_affinity_samples: Vec<LaneAffinitySample>,
     /// Open lane-affinity decisions awaiting their windowed reward.
     pub(crate) pending_lane_affinity: Vec<PendingLaneAffinityDecision>,
+    /// The trained goal-side recovery head (how hard a recovering defender collapses onto the
+    /// ball→goal line vs. holds width), when present. `None` ⇒ analytic seed. Shared into each
+    /// [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) goal_side_recovery_head: Option<std::sync::Arc<GoalSideRecoveryHead>>,
+    /// Rolling RL corpus for the goal-side recovery head. Collected only while the model is enabled.
+    pub(crate) goal_side_recovery_samples: Vec<GoalSideRecoverySample>,
+    /// Open goal-side recovery decisions awaiting their windowed reward.
+    pub(crate) pending_goal_side_recovery: Vec<PendingGoalSideRecoveryDecision>,
+    /// The trained winger pinch-appetite head (stay wide vs pinch infield), when present.
+    /// `None` ⇒ analytic seed. Shared into each [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) winger_pinch_head: Option<std::sync::Arc<WingerPinchHead>>,
+    /// Rolling RL corpus for the winger-pinch head. Collected only while the model is enabled.
+    pub(crate) winger_pinch_samples: Vec<WingerPinchSample>,
+    /// Open winger-pinch decisions awaiting their windowed reward.
+    pub(crate) pending_winger_pinch: Vec<PendingWingerPinchDecision>,
+    /// The trained same-team separation head (desired keep-out radius), when present. `None` ⇒
+    /// analytic seed. Shared into each [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) separation_floor_head: Option<std::sync::Arc<SeparationFloorHead>>,
+    /// Rolling RL corpus for the separation head. Collected only while the model is enabled.
+    pub(crate) separation_floor_samples: Vec<SeparationFloorSample>,
+    /// Open separation decisions awaiting their windowed reward.
+    pub(crate) pending_separation_floor: Vec<PendingSeparationFloorDecision>,
+    /// The trained pass-lane yield head (step out of the lane vs hold), when present. `None` ⇒
+    /// analytic seed. Shared into each [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) pass_lane_yield_head: Option<std::sync::Arc<PassLaneYieldHead>>,
+    /// Rolling RL corpus for the pass-lane yield head. Collected only while the model is enabled.
+    pub(crate) pass_lane_yield_samples: Vec<PassLaneYieldSample>,
+    /// Open pass-lane yield decisions awaiting their windowed reward.
+    pub(crate) pending_pass_lane_yield: Vec<PendingPassLaneYieldDecision>,
     /// The trained long-pass run head (which attacker should break forward so a deep carrier
     /// can pick them out), when present. Carried + trained across games by the learner; `None`
     /// ⇒ the analytic `backfield_long_pass_run_invite_for` seed. Shared into each
@@ -3144,6 +3173,18 @@ impl SoccerMatch {
             lane_affinity_head: None,
             lane_affinity_samples: Vec::new(),
             pending_lane_affinity: Vec::new(),
+            goal_side_recovery_head: None,
+            goal_side_recovery_samples: Vec::new(),
+            pending_goal_side_recovery: Vec::new(),
+            winger_pinch_head: None,
+            winger_pinch_samples: Vec::new(),
+            pending_winger_pinch: Vec::new(),
+            separation_floor_head: None,
+            separation_floor_samples: Vec::new(),
+            pending_separation_floor: Vec::new(),
+            pass_lane_yield_head: None,
+            pass_lane_yield_samples: Vec::new(),
+            pending_pass_lane_yield: Vec::new(),
             long_pass_run_head: None,
             long_pass_run_samples: Vec::new(),
             pending_long_pass_run: Vec::new(),
@@ -8711,6 +8752,18 @@ impl SoccerMatch {
         // Learnable lane-affinity (break-out vs hold) RL samples (no-op under test /
         // when disabled; live in prod, seeded by the ≈0 analytic prior).
         self.collect_lane_affinity_rl_samples(&next_snapshot);
+        // Learnable goal-side recovery (collapse-onto-line vs hold-width) RL samples (no-op
+        // under test / when disabled; live in prod, seeded by the ≈0 analytic prior).
+        self.collect_goal_side_recovery_rl_samples(&next_snapshot);
+        // Learnable winger pinch-appetite (stay-wide vs pinch-in) RL samples (no-op under test /
+        // when disabled; live in prod, seeded by the analytic prior).
+        self.collect_winger_pinch_rl_samples(&next_snapshot);
+        // Learnable same-team separation (spread vs combine) RL samples (no-op under test / when
+        // disabled; live in prod, seeded by the ≈0 analytic prior).
+        self.collect_separation_floor_rl_samples(&next_snapshot);
+        // Learnable pass-lane yield (step out vs hold) RL samples (no-op under test / when
+        // disabled; live in prod when pass-lane-yield is on).
+        self.collect_pass_lane_yield_rl_samples(&next_snapshot);
         self.collect_long_pass_run_rl_samples(&next_snapshot);
         // Learnable give-and-go / wall-pass appetite RL samples (no-op + byte-identical unless
         // `DD_SOCCER_ENABLE_LEARNED_GIVE_AND_GO` is set).
@@ -16236,8 +16289,15 @@ impl SoccerMatch {
                 let both_in_box =
                     me_in_box && self.point_in_either_penalty_area(other.position);
                 if !both_in_box {
+                    // Learnable desired separation (MDP/POMDP): the 8yd keep-out influence is a
+                    // predilection — the player may learn to spread WIDER (stretch build-up) or
+                    // combine TIGHTER (link in the box) per situation. `separation_floor_on` is
+                    // off under test, and the modulation is 0 unless its own model gate is on ⇒
+                    // byte-identical fallback to the fixed 8yd radius.
+                    let base_influence =
+                        SAME_TEAM_MIN_SEPARATION_YARDS + SAME_TEAM_SEPARATION_INFLUENCE_YARDS;
                     radius = radius
-                        .max(SAME_TEAM_MIN_SEPARATION_YARDS + SAME_TEAM_SEPARATION_INFLUENCE_YARDS);
+                        .max(self.separation_floor_influence_radius(player_id, base_influence));
                     weight *= SAME_TEAM_MPC_OBSTACLE_WEIGHT_GAIN;
                 }
             }
@@ -22268,6 +22328,22 @@ pub struct WorldSnapshot {
     /// (parity). Skipped by serde (an internal decision aid; Default = None).
     #[serde(skip)]
     pub(crate) lane_affinity_head: Option<std::sync::Arc<LaneAffinityHead>>,
+    /// The trained goal-side recovery head, carried from the match for live consumption in the
+    /// goal-side lateral-pull seam. `None` ⇒ analytic seed (parity). Skipped by serde.
+    #[serde(skip)]
+    pub(crate) goal_side_recovery_head: Option<std::sync::Arc<GoalSideRecoveryHead>>,
+    /// The trained winger pinch-appetite head, carried from the match for live consumption in the
+    /// winger-pinch bucket scoring. `None` ⇒ analytic seed (parity). Skipped by serde.
+    #[serde(skip)]
+    pub(crate) winger_pinch_head: Option<std::sync::Arc<WingerPinchHead>>,
+    /// The trained same-team separation head, carried from the match for live consumption in the
+    /// MPC keep-out. `None` ⇒ analytic seed (parity). Skipped by serde.
+    #[serde(skip)]
+    pub(crate) separation_floor_head: Option<std::sync::Arc<SeparationFloorHead>>,
+    /// The trained pass-lane yield head, carried from the match for live consumption in the
+    /// pass-lane yield seam. `None` ⇒ analytic seed (parity). Skipped by serde.
+    #[serde(skip)]
+    pub(crate) pass_lane_yield_head: Option<std::sync::Arc<PassLaneYieldHead>>,
     /// The trained long-pass run head, carried from the match for live consumption in
     /// `backfield_long_pass_run_invite_for`. `None` ⇒ analytic seed (parity). Skipped by
     /// serde (an internal decision aid; Default = None).
@@ -24990,6 +25066,10 @@ impl WorldSnapshot {
             loose_ball_commit_head: m.loose_ball_commit_head.clone(),
             receive_approach_head: m.receive_approach_head.clone(),
             lane_affinity_head: m.lane_affinity_head.clone(),
+            goal_side_recovery_head: m.goal_side_recovery_head.clone(),
+            winger_pinch_head: m.winger_pinch_head.clone(),
+            separation_floor_head: m.separation_floor_head.clone(),
+            pass_lane_yield_head: m.pass_lane_yield_head.clone(),
             long_pass_run_head: m.long_pass_run_head.clone(),
             give_and_go_head: m.give_and_go_head.clone(),
             attack_spacing_head: m.attack_spacing_head.clone(),
@@ -27725,8 +27805,17 @@ impl WorldSnapshot {
                     self.field_length,
                     target_depth,
                 );
-                guarded.x +=
-                    (line_target.x - guarded.x) * goal_side::GOAL_SIDE_LATERAL_PULL_FRACTION;
+                // Learnable goal-side recovery (MDP/POMDP): the 0.35 shade is a predilection,
+                // not a fixed rule — the defender may collapse HARDER onto the central screening
+                // line or HOLD width for a wide man. Gated ON in prod (seeded by the ≈0 analytic
+                // prior ⇒ near-identical), OFF under test ⇒ base fraction unchanged (parity).
+                let pull_fraction = self.goal_side_effective_lateral_pull_fraction(
+                    player,
+                    guarded,
+                    line_target.x,
+                    goal_side::GOAL_SIDE_LATERAL_PULL_FRACTION,
+                );
+                guarded.x += (line_target.x - guarded.x) * pull_fraction;
             }
             return guarded.clamp_to_pitch(self.field_width, self.field_length);
         }
@@ -29545,12 +29634,17 @@ impl WorldSnapshot {
         let back_post_offside = back_post_probe
             .map(|probe| self.position_would_be_offside(player.team, probe))
             .unwrap_or(true);
-        let profile = winger_pinch_decision_profile(
+        let pinch_bias = self
+            .build_winger_pinch_inputs(player)
+            .map(|inputs| self.winger_pinch_effective_bias(&inputs))
+            .unwrap_or(0.0);
+        let profile = winger_pinch_decision_profile_with_bias(
             ball_on_my_flank,
             crossing_position_on,
             depth_frac,
             box_congestion,
             back_post_offside,
+            pinch_bias,
         );
         let choice_code = match profile.choice {
             WingerPinchChoice::StayWide => 0.0,
@@ -44281,7 +44375,7 @@ impl WorldSnapshot {
 
     /// A wide attacking player — a wide midfielder OR a wide forward (a "winger"). These are the
     /// players who should be making runs to open flank space when their team has the ball.
-    fn is_wide_attacker(&self, player: &PlayerSnapshot) -> bool {
+    pub(crate) fn is_wide_attacker(&self, player: &PlayerSnapshot) -> bool {
         let is_wide = player.home_position.x < self.field_width * 0.30
             || player.home_position.x > self.field_width * 0.70;
         let is_attacker =
@@ -44914,12 +45008,20 @@ impl WorldSnapshot {
         let back_post_offside = back_post_probe
             .map(|probe| self.position_would_be_offside(player.team, probe))
             .unwrap_or(true);
-        let choice = decide_winger_pinch(
+        // Learnable pinch appetite (MDP/POMDP): fold a learned stay-vs-pinch bias into the bucket
+        // scoring. Gated ON in prod (analytic prior ≈ 0 ⇒ near-identical argmax), OFF under test
+        // ⇒ bias 0 ⇒ byte-identical to `decide_winger_pinch`.
+        let pinch_bias = self
+            .build_winger_pinch_inputs(player)
+            .map(|inputs| self.winger_pinch_effective_bias(&inputs))
+            .unwrap_or(0.0);
+        let choice = decide_winger_pinch_with_bias(
             ball_on_my_flank,
             crossing_position_on,
             depth_frac,
             box_congestion,
             back_post_offside,
+            pinch_bias,
         );
         let target = winger_pinch_target(
             choice,
