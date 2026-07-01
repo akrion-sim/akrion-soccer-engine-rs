@@ -23255,8 +23255,8 @@ pub(crate) fn soccer_mappo_epochs() -> usize {
 /// Whether to standardize (zero-mean / unit-variance) the MAPPO actor's GAE advantages
 /// across each episode's policy batch before the policy-gradient step. This is the
 /// standard PPO/MAPPO variance-reduction normalization, but it changes the effective
-/// gradient scale, so it is OFF by default (set `DD_SOCCER_ENABLE_ADVANTAGE_NORMALIZATION=1`
-/// to opt in) — leaving the default training run byte-identical. Read once per process.
+/// gradient scale. Default-ON in prod (kill switch `DD_SOCCER_ENABLE_ADVANTAGE_NORMALIZATION=0`);
+/// default-OFF under test so the parity training run stays byte-identical. Read once per process.
 pub(crate) fn dd_soccer_enable_advantage_normalization() -> bool {
     #[cfg(test)]
     {
