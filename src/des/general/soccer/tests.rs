@@ -10494,6 +10494,23 @@ fn completed_killer_pass_reward_values_threaded_goal_channel_delivery() {
 }
 
 #[test]
+fn threaded_goal_channel_fit_handles_small_curriculum_fields() {
+    let fit = threaded_goal_channel_fit_for_reception(
+        Team::Home,
+        Vec2::new(15.0, 50.0),
+        30.0,
+        54.0,
+        8.0,
+    );
+
+    assert!(fit.is_finite());
+    assert!(
+        (0.0..=1.0).contains(&fit),
+        "threaded goal channel fit should stay normalized on tiny curriculum fields: {fit}"
+    );
+}
+
+#[test]
 fn completed_killer_pass_reward_ramps_as_goal_thread_gets_closer() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let passer = 6;
@@ -19812,6 +19829,53 @@ fn lone_loose_ball_is_claimed_by_one_retriever_two_only_under_pressure() {
         (outlet.x - target.x).abs() > 3.0,
         "peeled player opens up laterally into space: outlet={outlet:?}"
     );
+}
+
+#[test]
+fn outside_radius_loose_ball_pressure_still_adds_second_chaser() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 42,
+        ..Default::default()
+    });
+    let r1 = 4usize;
+    let r2 = 5usize;
+    let opp = 16usize;
+    park_players_except(&mut sim, &[r1, r2, opp]);
+    sim.players[r1].role = PlayerRole::Midfielder;
+    sim.players[r2].role = PlayerRole::Midfielder;
+    sim.players[opp].role = PlayerRole::Forward;
+    let ball = Vec2::new(40.0, 60.0);
+    sim.ball.holder = None;
+    sim.ball.position = ball;
+    sim.ball.velocity = Vec2::zero();
+    sim.players[r1].position = Vec2::new(40.0, 51.0);
+    sim.players[r2].position = Vec2::new(49.0, 60.0);
+    sim.players[opp].position = Vec2::new(40.0, 66.0);
+    sim.players[opp].velocity = Vec2::new(0.0, -5.0);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    for player_id in [r1, r2] {
+        let me = snapshot
+            .players
+            .iter()
+            .find(|player| player.id == player_id)
+            .unwrap();
+        assert!(
+            snapshot.player_snapshot_position(me).distance(ball)
+                > LOOSE_BALL_FIFTY_FIFTY_CONTEST_RADIUS_YARDS,
+            "fixture should start just outside the normal 50/50 radius"
+        );
+        assert_eq!(
+            snapshot.loose_ball_contester_count(me, ball),
+            2,
+            "a closing opponent should pull two chasers even just outside the nominal radius"
+        );
+        assert!(
+            snapshot.is_committed_loose_ball_chaser(player_id),
+            "player {player_id} should attack the pressured loose ball"
+        );
+    }
 }
 
 #[test]
@@ -42039,6 +42103,64 @@ fn neural_learning_pads_previous_full_snapshot_belief_tail_without_shifting_moti
             [SOCCER_NEURAL_FEATURE_BELIEF_BALL_POSITION_CONFIDENCE],
         0.0,
         "new belief-tail input should start neutral for a legacy six-channel-motion snapshot"
+    );
+}
+
+#[test]
+fn neural_learning_pads_persisted_queue_generation_38_snapshot() {
+    let config = MatchConfig {
+        duration_seconds: 0.2,
+        max_human_players: 0,
+        neural_learning: SoccerNeuralLearningConfig {
+            enabled: true,
+            backend: SoccerNeuralLearningBackend::Inline,
+            hidden_units: 8,
+            ..SoccerNeuralLearningConfig::default()
+        },
+        seed: 15094,
+        ..Default::default()
+    };
+    let mut previous_snapshot = SoccerMatch::default_11v11(config.clone())
+        .learning_snapshot()
+        .neural_network
+        .expect("initial neural snapshot");
+    let previous_dim = 498;
+    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&previous_dim));
+    let removed_weights = previous_snapshot
+        .layers
+        .first()
+        .map(|layer| layer.weights.len())
+        .unwrap_or(0)
+        .saturating_mul(SOCCER_NEURAL_FEATURE_DIM - previous_dim);
+    previous_snapshot.input_dim = previous_dim;
+    previous_snapshot.parameter_count = previous_snapshot
+        .parameter_count
+        .saturating_sub(removed_weights);
+    for row in &mut previous_snapshot.layers[0].weights {
+        row.truncate(previous_dim);
+    }
+    previous_snapshot.layers[0].weights[0][previous_dim - 1] = 0.498_38;
+
+    let resumed = SoccerMatch::default_11v11(config)
+        .with_neural_network_snapshot(previous_snapshot)
+        .expect("resume persisted queue generation 38 neural snapshot");
+    let resumed_snapshot = resumed
+        .learning_snapshot()
+        .neural_network
+        .expect("resumed neural snapshot");
+
+    assert_eq!(resumed_snapshot.input_dim, SOCCER_NEURAL_FEATURE_DIM);
+    assert_eq!(
+        resumed_snapshot.layers[0].weights[0].len(),
+        SOCCER_NEURAL_FEATURE_DIM
+    );
+    assert_eq!(
+        resumed_snapshot.layers[0].weights[0][previous_dim - 1],
+        0.498_38
+    );
+    assert_eq!(
+        resumed_snapshot.layers[0].weights[0][previous_dim], 0.0,
+        "new Akrion tail input should start neutral for 498-input snapshots"
     );
 }
 
@@ -75273,7 +75395,7 @@ fn defensive_shepherd_end_to_end_shifts_assignment_inside_when_enabled() {
     // assignment is biased to the carrier's inside shoulder; with it OFF it squares up on the
     // goal-side line (byte-identical baseline). Run the ON case in isolation with
     // `DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD=1` so the process-global gate reads true.
-    let enabled = std::env::var("DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD").is_ok();
+    let enabled = soccer_env_flag_enabled("DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD");
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     for id in 0..=10 {
         sim.players[id].position = Vec2::new(5.0, 5.0);
@@ -89737,6 +89859,44 @@ fn wall_pass_available_with_beatable_man_and_free_wall() {
 }
 
 #[test]
+fn wall_pass_requires_visible_safe_floor_pass_to_the_wall() {
+    let mut sim = wall_pass_scenario();
+    let carrier = 6usize;
+    let wall = 7usize;
+    sim.players[carrier].skills.passing_completion_rate = 8.4;
+    sim.players[carrier].skills.passing = 8.4;
+    sim.players[carrier].skills.vision = 1.5;
+    sim.players[carrier].facing_yaw = 0.0;
+    sim.players[carrier].action_facing = FacingBucket::East;
+    sim.players[carrier].receive_facing = FacingBucket::East;
+
+    let mut snapshot = WorldSnapshot::from_match(&sim);
+    snapshot.players[carrier].vision_range_yards = 8.0;
+    assert!(
+        !snapshot.player_can_see_player(carrier, wall),
+        "fixture should put the wall target outside the holder's field of view"
+    );
+    assert!(
+        snapshot.clear_line(
+            sim.players[carrier].position,
+            sim.players[wall].position,
+            Team::Away,
+            WALL_PASS_LANE_RADIUS_YARDS,
+        ),
+        "geometric wall-pass lane should still look clear"
+    );
+    let visible_targets = snapshot.ranked_visible_pass_targets(carrier, 11);
+    assert!(
+        !visible_targets.contains(&wall),
+        "ordinary pass ranking must hide a wall target the holder cannot see: {visible_targets:?}"
+    );
+    assert!(
+        snapshot.wall_pass_option_for(carrier).is_none(),
+        "wall-pass must not bypass the ordinary visible/safe floor-pass target gate"
+    );
+}
+
+#[test]
 fn open_wall_pass_is_competitive_in_live_option_set() {
     let mut sim = wall_pass_scenario();
     sim.config.dt_seconds = PROBABILITY_REFERENCE_DT_SECONDS;
@@ -94178,6 +94338,15 @@ fn same_team_proximity_penalty_curve_is_graduated_huge_to_small() {
         "penalty must decrease with distance across 4<5<6<7: {at_4} {at_5} {at_6} {at_7}"
     );
     assert!((at_4 - 1.0).abs() < 1e-9, "unit penalty is 1.0 exactly at the floor: {at_4}");
+    assert!((at_5 - 0.75).abs() < 1e-9, "5yd should still bite hard: {at_5}");
+    assert!((at_6 - 0.50).abs() < 1e-9, "6yd should be a medium penalty: {at_6}");
+    assert!((at_7 - 0.25).abs() < 1e-9, "7yd should remain a meaningful warning: {at_7}");
+    assert!(
+        (same_team_proximity_penalty_unit(0.0) * SAME_TEAM_PROXIMITY_PENALTY_POINTS - 12.0)
+            .abs()
+            < 1e-9,
+        "complete overlap should cap at the dense shaping budget"
+    );
     assert_eq!(at_8, 0.0, "no penalty at/beyond the influence radius");
     assert_eq!(same_team_proximity_penalty_unit(20.0), 0.0);
     // Inside the floor the penalty is "huge" (> the at-floor value) and capped.

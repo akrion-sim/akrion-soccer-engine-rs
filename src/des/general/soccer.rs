@@ -2754,10 +2754,10 @@ const SAME_TEAM_MIN_SEPARATION_YARDS: f64 = 4.0;
 // influence band is `[4, 4 + this]`, i.e. 4yd → 8yd. Above it there is no effect at all.
 const SAME_TEAM_SEPARATION_INFLUENCE_YARDS: f64 = 4.0;
 // Base points of the graduated proximity reward penalty at the 4-yard peak (rises further as the
-// gap collapses, quadratically decays to 0 by 8yd). Deliberately large — the biggest of the dense
-// shaping terms so crowding a teammate is a genuinely "huge" cost — but still inside
+// gap collapses, linearly decays to 0 by 8yd). Deliberately large — the biggest of the dense
+// shaping terms so crowding a teammate is a genuinely "huge" cost — while a total overlap caps at
 // `reward.dense_shaping_budget_points` (12.0). This is the primary dial for how hard it bites.
-const SAME_TEAM_PROXIMITY_PENALTY_POINTS: f64 = 1.5;
+const SAME_TEAM_PROXIMITY_PENALTY_POINTS: f64 = 6.0;
 // Multiplier applied to a same-team MPC obstacle's avoidance weight when the floor is in
 // force, so the planner treats an imminent teammate crossing as a strong route cost.
 const SAME_TEAM_MPC_OBSTACLE_WEIGHT_GAIN: f64 = 1.6;
@@ -2787,7 +2787,7 @@ pub(crate) fn dd_soccer_enable_same_team_separation_floor() -> bool {
     #[cfg(test)]
     {
         // Read fresh under test so a single process can A/B the gate per test.
-        std::env::var("DD_SOCCER_ENABLE_SAME_TEAM_SEPARATION_FLOOR").is_ok()
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_SAME_TEAM_SEPARATION_FLOOR")
     }
     #[cfg(not(test))]
     {
@@ -2799,7 +2799,7 @@ pub(crate) fn dd_soccer_enable_same_team_separation_floor() -> bool {
 
 /// Graduated same-team proximity penalty as a fraction of
 /// [`SAME_TEAM_PROXIMITY_PENALTY_POINTS`] for a realized nearest-teammate distance
-/// (yards). Zero at/beyond the influence radius (8yd), quadratically rising to 1.0 at the
+/// (yards). Zero at/beyond the influence radius (8yd), linearly rising to 1.0 at the
 /// 4yd floor ("small at 7, medium at 6, big at 5"), and rising further (up to 2.0) below
 /// the floor ("huge inside 4"). Pure / RNG-free.
 pub(crate) fn same_team_proximity_penalty_unit(distance_yards: f64) -> f64 {
@@ -2817,7 +2817,7 @@ pub(crate) fn same_team_proximity_penalty_unit(distance_yards: f64) -> f64 {
         return (1.0 + (floor - distance_yards).max(0.0) / floor).min(2.0);
     }
     let t = (influence - distance_yards) / (influence - floor); // 0 at influence, 1 at floor
-    (t * t).clamp(0.0, 1.0)
+    t.clamp(0.0, 1.0)
 }
 
 /// Advance the three nested same-team proximity dwell timers by `dt` for the current
@@ -5112,6 +5112,8 @@ const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     SOCCER_NEURAL_PRE_OFFSIDE_RECOVERY_FEATURE_DIM,
     // Same schema with offside-recovery channels, before curve-action execution channels.
     SOCCER_NEURAL_PRE_CURVE_ACTION_FEATURE_DIM,
+    // Persisted queue generation 38 was trained before the remaining Akrion feature tail.
+    498,
     // Same schema with curve-action execution channels, before idea/execution attribution.
     SOCCER_NEURAL_PRE_IDEA_EXECUTION_FEATURE_DIM,
 ];
@@ -19543,7 +19545,7 @@ pub(crate) fn team_advance_upfield_space_qualifies(
 pub(crate) fn team_advance_upfield_enabled() -> bool {
     #[cfg(test)]
     {
-        std::env::var("DD_SOCCER_ENABLE_TEAM_ADVANCE_UPFIELD").is_ok()
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_TEAM_ADVANCE_UPFIELD")
     }
     #[cfg(not(test))]
     {
@@ -19563,7 +19565,7 @@ pub(crate) fn team_advance_upfield_enabled() -> bool {
 pub(crate) fn progressive_carry_reward_enabled() -> bool {
     #[cfg(test)]
     {
-        std::env::var("DD_SOCCER_ENABLE_PROGRESSIVE_CARRY_REWARD").is_ok()
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_PROGRESSIVE_CARRY_REWARD")
     }
     #[cfg(not(test))]
     {
@@ -19657,7 +19659,7 @@ pub(crate) fn overdribble_dispossession_penalty_points(
 pub(crate) fn overdribble_penalty_enabled() -> bool {
     #[cfg(test)]
     {
-        std::env::var("DD_SOCCER_ENABLE_OVERDRIBBLE_PENALTY").is_ok()
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_OVERDRIBBLE_PENALTY")
     }
     #[cfg(not(test))]
     {
@@ -19713,7 +19715,7 @@ pub(crate) fn carrier_forward_drive_gait_floor(
 pub(crate) fn carrier_forward_drive_enabled() -> bool {
     #[cfg(test)]
     {
-        std::env::var("DD_SOCCER_ENABLE_CARRIER_FORWARD_DRIVE").is_ok()
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_CARRIER_FORWARD_DRIVE")
     }
     #[cfg(not(test))]
     {
@@ -19756,7 +19758,7 @@ fn stationary_hold_penalty_multiplier(carrier_forward_speed_yps: f64) -> f64 {
 pub(crate) fn stationary_hold_penalty_enabled() -> bool {
     #[cfg(test)]
     {
-        std::env::var("DD_SOCCER_ENABLE_STATIONARY_HOLD_PENALTY").is_ok()
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_STATIONARY_HOLD_PENALTY")
     }
     #[cfg(not(test))]
     {
@@ -19775,7 +19777,7 @@ pub(crate) fn stationary_hold_penalty_enabled() -> bool {
 pub(crate) fn ideal_pass_length_15yd_enabled() -> bool {
     #[cfg(test)]
     {
-        std::env::var("DD_SOCCER_ENABLE_IDEAL_PASS_LENGTH_15YD").is_ok()
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_IDEAL_PASS_LENGTH_15YD")
     }
     #[cfg(not(test))]
     {
@@ -19798,7 +19800,7 @@ pub(crate) fn ideal_pass_length_15yd_enabled() -> bool {
 pub(crate) fn gait_step_limit_enabled() -> bool {
     #[cfg(test)]
     {
-        std::env::var("DD_SOCCER_ENABLE_GAIT_STEP_LIMIT").is_ok()
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_GAIT_STEP_LIMIT")
     }
     #[cfg(not(test))]
     {
@@ -19819,7 +19821,7 @@ pub(crate) fn gait_step_limit_enabled() -> bool {
 pub(crate) fn mpc_pass_weight_enabled() -> bool {
     #[cfg(test)]
     {
-        std::env::var("DD_SOCCER_ENABLE_MPC_PASS_WEIGHT").is_ok()
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_MPC_PASS_WEIGHT")
     }
     #[cfg(not(test))]
     {
@@ -19838,7 +19840,7 @@ pub(crate) fn mpc_pass_weight_enabled() -> bool {
 pub(crate) fn buildup_chain_credit_enabled() -> bool {
     #[cfg(test)]
     {
-        std::env::var("DD_SOCCER_ENABLE_BUILDUP_CHAIN_CREDIT").is_ok()
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_BUILDUP_CHAIN_CREDIT")
     }
     #[cfg(not(test))]
     {
@@ -19875,7 +19877,7 @@ pub(crate) fn buildup_chain_credit_points(base_points: f64, recency_index: usize
 pub(crate) fn turnover_chain_blame_enabled() -> bool {
     #[cfg(test)]
     {
-        std::env::var("DD_SOCCER_ENABLE_TURNOVER_CHAIN_BLAME").is_ok()
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_TURNOVER_CHAIN_BLAME")
     }
     #[cfg(not(test))]
     {
@@ -19927,7 +19929,7 @@ const NUMBERS_UP_PRESS_URGENCY_FLOOR: f64 = 1.5;
 pub(crate) fn stationary_holder_press_enabled() -> bool {
     #[cfg(test)]
     {
-        std::env::var("DD_SOCCER_ENABLE_STATIONARY_HOLDER_PRESS").is_ok()
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_STATIONARY_HOLDER_PRESS")
     }
     #[cfg(not(test))]
     {
@@ -19944,7 +19946,7 @@ pub(crate) fn stationary_holder_press_enabled() -> bool {
 pub(crate) fn defensive_numbers_up_press_enabled() -> bool {
     #[cfg(test)]
     {
-        std::env::var("DD_SOCCER_ENABLE_NUMBERS_UP_PRESS").is_ok()
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_NUMBERS_UP_PRESS")
     }
     #[cfg(not(test))]
     {
@@ -19969,7 +19971,7 @@ const TERRIBLE_BACKWARD_PASS_PRESSURE: f64 = 0.35;
 pub(crate) fn terrible_pass_veto_enabled() -> bool {
     #[cfg(test)]
     {
-        std::env::var("DD_SOCCER_ENABLE_TERRIBLE_PASS_VETO").is_ok()
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_TERRIBLE_PASS_VETO")
     }
     #[cfg(not(test))]
     {
@@ -19997,7 +19999,7 @@ pub(crate) fn terrible_pass_veto_enabled() -> bool {
 pub(crate) fn hopeless_pass_veto_enabled() -> bool {
     #[cfg(test)]
     {
-        std::env::var("DD_SOCCER_ENABLE_HOPELESS_PASS_VETO").is_ok()
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_HOPELESS_PASS_VETO")
     }
     #[cfg(not(test))]
     {
@@ -20028,7 +20030,7 @@ const CONTINUE_RUN_AFTER_PASS_LOOKAHEAD_YARDS: f64 = 8.0;
 pub(crate) fn strategy_persist_until_change_enabled() -> bool {
     #[cfg(test)]
     {
-        std::env::var("DD_SOCCER_ENABLE_STRATEGY_PERSIST").is_ok()
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_STRATEGY_PERSIST")
     }
     #[cfg(not(test))]
     {
@@ -20046,7 +20048,7 @@ pub(crate) fn strategy_persist_until_change_enabled() -> bool {
 pub(crate) fn continue_run_after_pass_enabled() -> bool {
     #[cfg(test)]
     {
-        std::env::var("DD_SOCCER_ENABLE_CONTINUE_RUN_AFTER_PASS").is_ok()
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_CONTINUE_RUN_AFTER_PASS")
     }
     #[cfg(not(test))]
     {
@@ -20065,7 +20067,7 @@ pub(crate) fn continue_run_after_pass_enabled() -> bool {
 pub(crate) fn in_stride_pass_margin_enabled() -> bool {
     #[cfg(test)]
     {
-        std::env::var("DD_SOCCER_ENABLE_IN_STRIDE_PASS_MARGIN").is_ok()
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_IN_STRIDE_PASS_MARGIN")
     }
     #[cfg(not(test))]
     {
@@ -20090,7 +20092,7 @@ const BACK_FOUR_DEAD_SPACE_PUSH_FRACTION: f64 = 0.7;
 pub(crate) fn back_four_push_into_dead_space_enabled() -> bool {
     #[cfg(test)]
     {
-        std::env::var("DD_SOCCER_ENABLE_BACK_FOUR_DEAD_SPACE_PUSH").is_ok()
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_BACK_FOUR_DEAD_SPACE_PUSH")
     }
     #[cfg(not(test))]
     {
@@ -20121,7 +20123,7 @@ pub(crate) fn back_four_dead_space_adjusted_gap_yards(
 pub(crate) fn release_long_own_half_enabled() -> bool {
     #[cfg(test)]
     {
-        std::env::var("DD_SOCCER_ENABLE_RELEASE_LONG_OWN_HALF").is_ok()
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_RELEASE_LONG_OWN_HALF")
     }
     #[cfg(not(test))]
     {
@@ -20142,7 +20144,7 @@ pub(crate) fn release_long_own_half_enabled() -> bool {
 pub(crate) fn ground_pass_speed_floor_enabled() -> bool {
     #[cfg(test)]
     {
-        std::env::var("DD_SOCCER_ENABLE_GROUND_PASS_SPEED_FLOOR").is_ok()
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_GROUND_PASS_SPEED_FLOOR")
     }
     #[cfg(not(test))]
     {
@@ -20161,7 +20163,7 @@ pub(crate) fn ground_pass_speed_floor_enabled() -> bool {
 pub(crate) fn backward_pass_discipline_enabled() -> bool {
     #[cfg(test)]
     {
-        std::env::var("DD_SOCCER_ENABLE_BACKWARD_PASS_DISCIPLINE").is_ok()
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_BACKWARD_PASS_DISCIPLINE")
     }
     #[cfg(not(test))]
     {
@@ -20182,7 +20184,7 @@ pub(crate) fn dd_soccer_enable_outside_mid_attack_defender() -> bool {
     {
         use std::sync::OnceLock;
         static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_OUTSIDE_MID_ATTACK_DEFENDER").is_ok())
+        *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_OUTSIDE_MID_ATTACK_DEFENDER"))
     }
     #[cfg(not(test))]
     {
@@ -20211,7 +20213,7 @@ pub(crate) fn dd_soccer_enable_aerial_pass_oob_discipline() -> bool {
     {
         use std::sync::OnceLock;
         static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_AERIAL_PASS_OOB_DISCIPLINE").is_ok())
+        *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_AERIAL_PASS_OOB_DISCIPLINE"))
     }
     #[cfg(not(test))]
     {
@@ -20226,7 +20228,7 @@ pub(crate) fn dd_soccer_enable_aerial_pass_oob_discipline() -> bool {
 pub(crate) fn dd_soccer_enable_overload_weighted_progression() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_OVERLOAD_WEIGHTED_PROGRESSION").is_ok())
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_OVERLOAD_WEIGHTED_PROGRESSION"))
 }
 
 /// Per-yard reward for forward progress carried into a numbers advantage, scaled by the attacking
@@ -53397,7 +53399,7 @@ fn dd_soccer_enable_blindside_steal() -> bool {
     #[cfg(test)]
     {
         // Read fresh under test so a single process can A/B the gate per test.
-        std::env::var("DD_SOCCER_ENABLE_BLINDSIDE_STEAL").is_ok()
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_BLINDSIDE_STEAL")
     }
     #[cfg(not(test))]
     {
@@ -53417,7 +53419,7 @@ fn dd_soccer_enable_blindside_steal() -> bool {
 fn dd_soccer_enable_assigned_position_embedding() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_ASSIGNED_POSITION_EMBEDDING").is_ok())
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_ASSIGNED_POSITION_EMBEDDING"))
 }
 
 /// Set `DD_SOCCER_ENABLE_SKILL_POLICY_HEADS=1` to train independent pass/dribble/shot specialist
@@ -53427,7 +53429,7 @@ fn dd_soccer_enable_assigned_position_embedding() -> bool {
 fn dd_soccer_enable_skill_policy_heads() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_SKILL_POLICY_HEADS").is_ok())
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_SKILL_POLICY_HEADS"))
 }
 
 /// Set `DD_SOCCER_ENABLE_KEEPER_POLICY_HEAD=1` to train a dedicated goalkeeper actor
@@ -53437,7 +53439,7 @@ fn dd_soccer_enable_skill_policy_heads() -> bool {
 fn dd_soccer_enable_keeper_policy_head() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_KEEPER_POLICY_HEAD").is_ok())
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_KEEPER_POLICY_HEAD"))
 }
 
 /// Set `DD_SOCCER_ENABLE_SPECIALIST_CURRICULUM=1` to run the specialist heads through focused
@@ -53447,7 +53449,7 @@ fn dd_soccer_enable_keeper_policy_head() -> bool {
 fn dd_soccer_enable_specialist_curriculum() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_SPECIALIST_CURRICULUM").is_ok())
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_SPECIALIST_CURRICULUM"))
 }
 
 fn dd_soccer_disable_xavi_turn() -> bool {
@@ -53551,7 +53553,7 @@ fn dd_soccer_enable_obstacle_aware_intercept() -> bool {
     {
         use std::sync::OnceLock;
         static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_OBSTACLE_AWARE_INTERCEPT").is_ok())
+        *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_OBSTACLE_AWARE_INTERCEPT"))
     }
     #[cfg(not(test))]
     {
@@ -53593,7 +53595,7 @@ fn slide_tackle_enabled(config: &MatchConfig) -> bool {
 fn dd_soccer_opponent_belief_enabled() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_OPPONENT_BELIEF").is_ok())
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_OPPONENT_BELIEF"))
 }
 
 /// Operational escape hatch for the Bayesian/Kalman perception-confidence filter
@@ -55195,7 +55197,10 @@ fn threaded_goal_channel_fit_for_reception(
     let center_x = field_width * 0.5;
     let goal_y = team.goal_y(field_length);
     let yards_to_goal = (goal_y - reception.y).abs();
-    let channel_half_width = (goal_width * 2.25).clamp(10.0, field_width * 0.32);
+    let max_channel_half_width = (field_width * 0.32).max(1.0);
+    let min_channel_half_width = 10.0_f64.min(max_channel_half_width);
+    let channel_half_width =
+        (goal_width * 2.25).clamp(min_channel_half_width, max_channel_half_width);
     let central_fit = (1.0 - (reception.x - center_x).abs() / channel_half_width).clamp(0.0, 1.0);
     let range_fit = ((KILLER_PASS_MAX_YARDS_TO_GOAL - yards_to_goal)
         / KILLER_PASS_MAX_YARDS_TO_GOAL)
@@ -58638,7 +58643,7 @@ pub(crate) fn forward_pass_option_quality(receiver_openness: f64, expected_compl
 pub(crate) fn dd_soccer_enable_forward_option_recognition() -> bool {
     #[cfg(test)]
     {
-        std::env::var("DD_SOCCER_ENABLE_FORWARD_OPTION_RECOGNITION").is_ok()
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_FORWARD_OPTION_RECOGNITION")
     }
     #[cfg(not(test))]
     {
@@ -58661,7 +58666,7 @@ pub(crate) fn dd_soccer_enable_forward_option_recognition() -> bool {
 pub(crate) fn dd_soccer_enable_role_pass_risk_appetite() -> bool {
     #[cfg(test)]
     {
-        std::env::var("DD_SOCCER_ENABLE_ROLE_PASS_RISK_APPETITE").is_ok()
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_ROLE_PASS_RISK_APPETITE")
     }
     #[cfg(not(test))]
     {
@@ -63236,7 +63241,7 @@ fn loose_ball_time_advantage_bucket(value: f64) -> u8 {
 pub(crate) fn dd_soccer_enable_aerobic_anaerobic_speed_split() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_AEROBIC_ANAEROBIC_SPEED_SPLIT").is_ok())
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_AEROBIC_ANAEROBIC_SPEED_SPLIT"))
 }
 
 fn player_pomdp_reaction_delay_seconds(read_skill: f64, fatigue: f64) -> f64 {

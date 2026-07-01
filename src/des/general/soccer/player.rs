@@ -2716,7 +2716,7 @@ pub(crate) fn decision_refractory_enabled() -> bool {
     {
         use std::sync::OnceLock;
         static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_DECISION_REFRACTORY").is_ok())
+        *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_DECISION_REFRACTORY"))
     }
     #[cfg(not(test))]
     {
@@ -2732,7 +2732,7 @@ pub(crate) fn decision_refractory_enabled() -> bool {
 pub(crate) fn forward_pass_first_enabled() -> bool {
     #[cfg(test)]
     {
-        std::env::var("DD_SOCCER_ENABLE_FORWARD_PASS_FIRST").is_ok()
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_FORWARD_PASS_FIRST")
     }
     #[cfg(not(test))]
     {
@@ -2752,7 +2752,7 @@ pub(crate) fn forward_pass_first_enabled() -> bool {
 pub(crate) fn isolated_carrier_drive_enabled() -> bool {
     #[cfg(test)]
     {
-        std::env::var("DD_SOCCER_ENABLE_ISOLATED_CARRIER_DRIVE").is_ok()
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_ISOLATED_CARRIER_DRIVE")
     }
     #[cfg(not(test))]
     {
