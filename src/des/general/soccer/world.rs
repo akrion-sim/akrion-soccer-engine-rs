@@ -43929,7 +43929,7 @@ impl WorldSnapshot {
 
     /// A wide attacking player — a wide midfielder OR a wide forward (a "winger"). These are the
     /// players who should be making runs to open flank space when their team has the ball.
-    fn is_wide_attacker(&self, player: &PlayerSnapshot) -> bool {
+    pub(crate) fn is_wide_attacker(&self, player: &PlayerSnapshot) -> bool {
         let is_wide = player.home_position.x < self.field_width * 0.30
             || player.home_position.x > self.field_width * 0.70;
         let is_attacker =
