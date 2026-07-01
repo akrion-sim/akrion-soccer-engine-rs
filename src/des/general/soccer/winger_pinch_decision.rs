@@ -325,7 +325,11 @@ impl WorldSnapshot {
             return None;
         }
         let attacked_goal_y = player.team.goal_y(self.field_length);
-        if !ball_in_attacking_final_third(self.ball.position.y, attacked_goal_y, self.field_length) {
+        if !crash_box::ball_in_attacking_final_third(
+            self.ball.position.y,
+            attacked_goal_y,
+            self.field_length,
+        ) {
             return None;
         }
         let dir = player.team.attack_dir();
