@@ -1372,7 +1372,7 @@ impl SoccerLearningPgStore {
                   coalesce((extract(epoch from updated_at) * 1000000)::bigint, 0)
                 from des_soccer_learning_policy_versions
                 where experiment_id = $1::text::uuid and fitness_micros is not null
-                order by fitness_micros desc, generation desc, updated_at desc, id desc
+                order by generation desc, fitness_micros desc, updated_at desc, id desc
                 limit 1
                 "#
         } else {
