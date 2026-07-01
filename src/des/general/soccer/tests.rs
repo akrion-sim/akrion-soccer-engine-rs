@@ -92316,17 +92316,22 @@ fn stationary_hold_penalty_multiplier_ramps_from_walk_to_ten_x() {
 }
 
 #[test]
-fn ideal_pass_length_preference_peaks_at_fifteen_when_gated_on() {
-    // With the gate ON the peak is 15yd and a 15yd ball is preferred over a short 5yd square.
-    std::env::set_var("DD_SOCCER_ENABLE_IDEAL_PASS_LENGTH_15YD", "1");
-    assert!((pass_length_preference(IDEAL_PASS_LENGTH_OPTIMAL_YARDS) - 1.0).abs() < 1e-9);
-    assert!(pass_length_preference(15.0) > pass_length_preference(5.0));
-    // A 15yd pass is well within a good player's vision range (28-56yd).
-    assert!(vision_range_yards(1.0) >= 15.0 && vision_range_yards(0.0) >= 15.0);
-    std::env::remove_var("DD_SOCCER_ENABLE_IDEAL_PASS_LENGTH_15YD");
-    // With the gate OFF the historical 8yd peak is restored (parity).
-    assert!((pass_length_preference(PASS_LENGTH_OPTIMAL_YARDS) - 1.0).abs() < 1e-9);
-    assert!(pass_length_preference(8.0) > pass_length_preference(15.0));
+fn ideal_pass_length_curve_peaks_at_fifteen_yards() {
+    // The 15yd ideal curve peaks at 15yd and prefers a meaningful 15yd ball over a short square.
+    // Tested on the pure curve directly (no env toggling) so it never races the default-8yd
+    // parity test in a parallel run.
+    let ideal =
+        |d: f64| pass_length_preference_curve(d, IDEAL_PASS_LENGTH_OPTIMAL_YARDS, IDEAL_PASS_LENGTH_FADEOUT_YARDS);
+    assert!((ideal(IDEAL_PASS_LENGTH_OPTIMAL_YARDS) - 1.0).abs() < 1e-9);
+    assert!(ideal(15.0) > ideal(5.0), "15yd preferred over a 5yd square");
+    assert!(ideal(15.0) > ideal(8.0), "15yd preferred over the old 8yd optimum");
+    assert!(ideal(15.0) > ideal(25.0), "peak beats an over-long ball");
+    // A 15yd pass is well within a good player's vision range (already 28-56yd).
+    assert!(vision_range_yards(0.0) >= 15.0 && vision_range_yards(1.0) >= 15.0);
+    // The default 8yd curve is unchanged (parity): still peaks at 8yd.
+    let base = |d: f64| pass_length_preference_curve(d, PASS_LENGTH_OPTIMAL_YARDS, PASS_LENGTH_FADEOUT_YARDS);
+    assert!((base(8.0) - 1.0).abs() < 1e-9);
+    assert!(base(8.0) > base(15.0));
 }
 
 #[test]
