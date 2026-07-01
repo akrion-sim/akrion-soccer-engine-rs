@@ -414,6 +414,40 @@ pub fn back_four_press_to_attackers_enabled() -> bool {
     }
 }
 
+/// Whether the back four uses the TIGHTER foremost-four ideal gaps + higher push cap (sit closer to
+/// the opponents' front line, step up harder). Default-ON in production (kill switch
+/// `DD_SOCCER_ENABLE_BACK_FOUR_TIGHTER_LINE=0` reverts to the legacy 24/26/30 gaps); default-OFF
+/// under test so the line-depth parity suite stays byte-identical.
+pub fn back_four_tighter_line_enabled() -> bool {
+    #[cfg(test)]
+    {
+        env_flag_enabled(BACK_FOUR_TIGHTER_LINE_ENABLE_ENV)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| gate_default_on(BACK_FOUR_TIGHTER_LINE_ENABLE_ENV))
+    }
+}
+
+/// Whether the **ball-far offside-trap push-up** is applied: when the ball is far upfield and the
+/// line is still >5yd inside our own half (and we are not being driven at), step the line up to a
+/// small gap goalside of the opponents' most-advanced attacker. Default-ON in production (kill
+/// switch `DD_SOCCER_ENABLE_BACK_FOUR_BALL_FAR_PUSH_UP=0`); default-OFF under test.
+pub fn back_four_ball_far_push_up_enabled() -> bool {
+    #[cfg(test)]
+    {
+        env_flag_enabled(BACK_FOUR_BALL_FAR_PUSH_UP_ENABLE_ENV)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| gate_default_on(BACK_FOUR_BALL_FAR_PUSH_UP_ENABLE_ENV))
+    }
+}
+
 /// Whether the **energy-conservation hold deadband** damps the v2 line target this process: a
 /// line-bound defender already within [`BACK_FOUR_LINE_HOLD_DEADBAND_YARDS`] of its legal target
 /// holds rather than re-chasing a jittering line (the "sine-wave"). Default-ON (kill switch
