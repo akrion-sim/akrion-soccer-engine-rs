@@ -217,6 +217,20 @@ pub const BACK_FOUR_ATTACKER_COMPACTNESS_REWARD_PER_YARD: f64 = 0.02;
 /// Env kill switch for the state-adaptive back-four block width (see
 /// [`back_four_adaptive_width_enabled`]).
 const BACK_FOUR_ADAPTIVE_WIDTH_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_ADAPTIVE_WIDTH";
+/// Env kill switch for flooring the back-four block width at the four's own FORMATION span (see
+/// [`back_four_formation_width_floor_enabled`]).
+const BACK_FOUR_FORMATION_WIDTH_FLOOR_ENABLE_ENV: &str =
+    "DD_SOCCER_ENABLE_BACK_FOUR_FORMATION_WIDTH_FLOOR";
+/// Fraction of the back four's home-lane span (the max minus min of the four defenders' home x)
+/// that the block width may never fall below. The adaptive-width floor
+/// ([`BACK_FOUR_ADAPTIVE_WIDTH_MIN_YARDS`] = 34yd) is far narrower than a standard back-four home
+/// span (~52yd on an 80yd pitch: home x 14/31/49/66), so against a central attack the block tucked
+/// the fullbacks a full lane infield off their channels (lanes 2/9 → 3/8) and GIFTED the flanks —
+/// the "back four ignore their lane" bug. Flooring the width at ~the formation span keeps each
+/// defender in its lane; kept just under 1.0 so a small justified tuck is still allowed and the
+/// ball-side centre shift never forces the ball-far fullback off the pitch. The floor only ever
+/// WIDENS the block, so it cannot worsen flank coverage.
+pub const BACK_FOUR_FORMATION_WIDTH_FLOOR_FRACTION: f64 = 0.94;
 /// Shoulder margin (yd) the state-adaptive back-four width adds beyond the widest foremost attacker
 /// on each side, so the line COVERS the man rather than sitting level with him. See
 /// [`back_four_adaptive_width_yards`].
