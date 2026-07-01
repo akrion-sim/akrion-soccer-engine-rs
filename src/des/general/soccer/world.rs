@@ -43932,7 +43932,11 @@ impl WorldSnapshot {
     /// bias so a backward drop is only vetoed when forward space really is available (the
     /// principle's "can run forward into space" precondition) — never when everything ahead is
     /// covered and a drop to offer an outlet is legitimate.
-    fn forward_open_space_available(&self, me: &PlayerSnapshot, me_position: Vec2) -> bool {
+    pub(crate) fn forward_open_space_available(
+        &self,
+        me: &PlayerSnapshot,
+        me_position: Vec2,
+    ) -> bool {
         let attack = me.team.attack_dir();
         for depth in [8.0_f64, 15.0, 23.0] {
             for lat in [-8.0_f64, 0.0, 8.0] {
