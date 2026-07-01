@@ -2761,6 +2761,23 @@ const SAME_TEAM_PROXIMITY_PENALTY_POINTS: f64 = 0.8;
 // Multiplier applied to a same-team MPC obstacle's avoidance weight when the floor is in
 // force, so the planner treats an imminent teammate crossing as a strong route cost.
 const SAME_TEAM_MPC_OBSTACLE_WEIGHT_GAIN: f64 = 1.6;
+// GRACE windows before the graduated same-team penalty (negative reward) begins to accrue — so a
+// brief, legitimate overlap (a handoff, a run past, crossing paths) is not punished, only a
+// SUSTAINED one. Nested by how close the pair is (the user's spec): a pair easing in gently is
+// caught by the widest 7yd/3s timer; a pair diving straight inside 5yd by the tightest 5yd/1s
+// timer. The dwell timers accumulate continuously while inside the named radius and do NOT reset
+// when crossing into a tighter band — they reset only when the pair moves farther than that band.
+// Worked example (user's): 2.5s at 6.5yd then 0.25s at 5.5yd then into 3.5yd ⇒ the 7yd timer is at
+// 2.75s on entering 3.5yd and trips its 3s grace 0.25s later, so the penalty starts 0.25s in.
+// The barrier + MPC keep-out have NO grace — the hard 4yd floor is always enforced; only the
+// learning penalty is graced. The 18-yard-box pair exception applies here too (nearest NON-EXEMPT
+// teammate only). All inert when the separation floor gate is off (timers stay 0).
+const SAME_TEAM_PROXIMITY_GRACE_LT7_SECONDS: f64 = 3.0;
+const SAME_TEAM_PROXIMITY_GRACE_LT6_SECONDS: f64 = 2.0;
+const SAME_TEAM_PROXIMITY_GRACE_LT5_SECONDS: f64 = 1.0;
+const SAME_TEAM_PROXIMITY_BAND_LT7_YARDS: f64 = 7.0;
+const SAME_TEAM_PROXIMITY_BAND_LT6_YARDS: f64 = 6.0;
+const SAME_TEAM_PROXIMITY_BAND_LT5_YARDS: f64 = 5.0;
 
 /// Whether the hard same-team 4-yard separation floor (barrier + graduated penalty + MPC
 /// keep-out) is active this process. Default-ON in production; opt-in under `#[cfg(test)]`
