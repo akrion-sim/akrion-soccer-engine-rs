@@ -1295,8 +1295,30 @@ impl SoccerLearningPgStore {
         away_options: SoccerQPolicyOptions,
         min_visits: i32,
     ) -> Result<Option<SoccerLearningPgPolicyVersion>, String> {
+        self.load_latest_policy_with_min_visits(
+            experiment_id,
+            home_options,
+            away_options,
+            min_visits,
+            false,
+        )
+    }
+
+    /// Like [`Self::load_latest_active_policy_with_min_visits`], but `include_unpromoted`
+    /// selects the best-fitness candidate regardless of promotion status (see
+    /// [`Self::load_latest_policy_metadata`]). Default paths pass `false`.
+    pub fn load_latest_policy_with_min_visits(
+        &mut self,
+        experiment_id: &str,
+        home_options: SoccerQPolicyOptions,
+        away_options: SoccerQPolicyOptions,
+        min_visits: i32,
+        include_unpromoted: bool,
+    ) -> Result<Option<SoccerLearningPgPolicyVersion>, String> {
         self.ensure_connected()?;
-        let Some(metadata) = self.load_latest_active_policy_metadata(experiment_id)? else {
+        let Some(metadata) =
+            self.load_latest_policy_metadata(experiment_id, include_unpromoted)?
+        else {
             return Ok(None);
         };
         let policies =
