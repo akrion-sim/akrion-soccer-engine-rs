@@ -15724,11 +15724,11 @@ impl SoccerMatch {
         if p.velocity.len() > SOCCER_PHYSICS_PLAYER_MAX_SPEED_YPS {
             p.velocity = p.velocity.normalized() * SOCCER_PHYSICS_PLAYER_MAX_SPEED_YPS;
         }
-<<<<<<< HEAD
         // HARD same-team separation floor: smoothly damp the finalized velocity's inward
         // component toward any non-exempt teammate so this step can never close the gap below
         // 4yd — a gentle deceleration approaching the floor, not a hard stop. No-op when the
-        // gate is off (the obstacle list is empty).
+        // gate is off (the obstacle list is empty). Runs BEFORE the physical-gait derivation
+        // below so the visible gait reflects the actual (damped) speed the player travels at.
         if !same_team_separation_obstacles.is_empty() {
             p.velocity = apply_same_team_separation_barrier(
                 p.position,
@@ -15737,14 +15737,12 @@ impl SoccerMatch {
                 dt,
             );
         }
-=======
         let physical_gait = movement_gait_for_physical_speed(
             gait,
             previous_visible_gait,
             p.velocity.len(),
             physical_gait_reference_speed,
         );
->>>>>>> ec46e0b57efb29b0ac82e7b758ec4e34b74343a5
         let movement_facing = movement_action_facing_bucket(
             p.team,
             p.position,
