@@ -24773,6 +24773,7 @@ impl WorldSnapshot {
             pass_completion_head: m.pass_completion_head.clone(),
             loose_ball_commit_head: m.loose_ball_commit_head.clone(),
             receive_approach_head: m.receive_approach_head.clone(),
+            lane_affinity_head: m.lane_affinity_head.clone(),
             long_pass_run_head: m.long_pass_run_head.clone(),
             give_and_go_head: m.give_and_go_head.clone(),
             attack_spacing_head: m.attack_spacing_head.clone(),
