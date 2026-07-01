@@ -44430,8 +44430,11 @@ fn soccer_live_fetch_latest_pg_policy(
     experiment_id: &str,
 ) -> Result<Option<crate::des::soccer_learning_pg::SoccerLearningPgPolicyVersion>, String> {
     let options = SoccerQPolicyOptions::default();
+    let include_unpromoted = soccer_live_pg_include_unpromoted();
     if soccer_live_pg_neural_tactical_only() {
-        let Some(metadata) = store.load_latest_active_policy_metadata(experiment_id)? else {
+        let Some(metadata) =
+            store.load_latest_policy_metadata(experiment_id, include_unpromoted)?
+        else {
             return Ok(None);
         };
         return Ok(Some(
