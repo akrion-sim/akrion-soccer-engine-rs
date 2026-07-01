@@ -44599,6 +44599,7 @@ fn start_soccer_live_pg_policy_refresh(
                 }
             }
         });
+    });
 }
 
 /// Process-wide cache of the live learned policy (trimmed tabular Q + neural snapshot). The FIRST
