@@ -651,6 +651,7 @@ impl SoccerMatch {
                     inputs,
                     action_bias,
                     decision_territorial: territorial,
+                    reward_accum: 0.0,
                     due_tick: tick + LANE_AFFINITY_REWARD_WINDOW_TICKS,
                 });
             }
