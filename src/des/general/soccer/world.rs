@@ -22269,6 +22269,10 @@ pub struct WorldSnapshot {
     /// head-scan visibility seam. `None` ⇒ analytic seed (parity). Skipped by serde.
     #[serde(skip)]
     pub(crate) head_scan_head: Option<std::sync::Arc<HeadScanHead>>,
+    /// The trained crash-box commit head, carried from the match for live consumption in the
+    /// crash-the-box seam. `None` ⇒ analytic seed (parity). Skipped by serde.
+    #[serde(skip)]
+    pub(crate) crash_box_head: Option<std::sync::Arc<CrashBoxHead>>,
     /// The trained long-pass run head, carried from the match for live consumption in
     /// `backfield_long_pass_run_invite_for`. `None` ⇒ analytic seed (parity). Skipped by
     /// serde (an internal decision aid; Default = None).
