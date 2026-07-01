@@ -110,6 +110,8 @@ mod crash_box_decision;
 pub use crash_box_decision::*;
 mod run_prediction_decision;
 pub use run_prediction_decision::*;
+mod slip_break_decision;
+pub use slip_break_decision::*;
 mod policy_select;
 pub use policy_select::*;
 mod pass_lane_yield;
