@@ -2089,6 +2089,10 @@ fn run_game(
     if let Some(head) = CARRIED_SLIP_BREAK_HEAD.lock().unwrap().as_ref() {
         sim.set_slip_break_head(head.clone());
     }
+    // Install the carried onside-support push head so the onside-support clamp consumes it live.
+    if let Some(head) = CARRIED_ONSIDE_SUPPORT_HEAD.lock().unwrap().as_ref() {
+        sim.set_onside_support_head(head.clone());
+    }
     // Install the carried long-pass run head so `backfield_long_pass_run_invite_for` consumes
     // it live once trained. No-op unless DD_SOCCER_ENABLE_LEARNED_LONG_PASS_RUN is set.
     if let Some(head) = CARRIED_LONG_PASS_RUN_HEAD.lock().unwrap().as_ref() {
