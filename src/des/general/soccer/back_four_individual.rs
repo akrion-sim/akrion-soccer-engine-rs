@@ -202,7 +202,7 @@ impl DefenderAgentInputs {
 
         let mut f = [0.0; DEFENDER_AGENT_FEATURE_DIM];
         let mut i = 0;
-        let mut push = |slot: &mut usize, buf: &mut [f64; DEFENDER_AGENT_FEATURE_DIM], v: f64| {
+        let push = |slot: &mut usize, buf: &mut [f64; DEFENDER_AGENT_FEATURE_DIM], v: f64| {
             buf[*slot] = v;
             *slot += 1;
         };
