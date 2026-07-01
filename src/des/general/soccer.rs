@@ -1696,6 +1696,13 @@ const FINAL_THIRD_FORWARD_RACE_RELAX_BAND_YARDS: f64 = 14.0;
 const PASS_LENGTH_PREFERENCE_WEIGHT: f64 = 0.5;
 const PASS_LENGTH_OPTIMAL_YARDS: f64 = 8.0;
 const PASS_LENGTH_FADEOUT_YARDS: f64 = 24.0;
+// Ideal-pass-length target: a ~15yd ball is the ideal length (progresses the play, still
+// reliably completed and within a good player's field of vision, which already extends to
+// 28-56yd). When `DD_SOCCER_ENABLE_IDEAL_PASS_LENGTH_15YD` is on, the optimal-length peak
+// shifts from 8yd to 15yd (fade-out stretched proportionally) so the engine prefers a
+// meaningful 15yd progression over a short square pass.
+const IDEAL_PASS_LENGTH_OPTIMAL_YARDS: f64 = 15.0;
+const IDEAL_PASS_LENGTH_FADEOUT_YARDS: f64 = 32.0;
 const GROUND_LATERAL_PASS_PENALTY: f64 = 1.85;
 const AERIAL_LATERAL_PASS_PENALTY: f64 = 1.20;
 // Build-up short-pass discouragement. OUTSIDE the final attacking third, sub-4yd passes are
