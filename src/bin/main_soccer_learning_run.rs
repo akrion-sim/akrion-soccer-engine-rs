@@ -2149,6 +2149,25 @@ fn run_game(
             final_loss
         );
     }
+    // Train the CARRIED goal-side recovery head on this game's reward-weighted RL corpus
+    // (whether collapsing onto the line / holding width best protected the goal). Empty +
+    // skipped unless the model is enabled (on by default in prod).
+    let goal_side_recovery_samples = sim.drain_goal_side_recovery_samples();
+    if !goal_side_recovery_samples.is_empty() {
+        let mut guard = CARRIED_GOAL_SIDE_RECOVERY_HEAD.lock().unwrap();
+        let head = guard.get_or_insert_with(|| GoalSideRecoveryHead::new(episode_seed as u32));
+        let mut final_loss = 0.0;
+        for _ in 0..4 {
+            final_loss = head.train_reward_weighted(&goal_side_recovery_samples, 0.02);
+        }
+        eprintln!(
+            "goal_side_recovery_training samples={} training_steps={} consumed={} final_loss={:.5}",
+            goal_side_recovery_samples.len(),
+            head.training_steps(),
+            head.training_steps() >= GOAL_SIDE_RECOVERY_HEAD_MIN_TRAINING_STEPS,
+            final_loss
+        );
+    }
     // Train the CARRIED long-pass run head on this game's reward-weighted RL corpus (which
     // attacker breaking forward led to the team advancing the ball). Empty + skipped unless
     // DD_SOCCER_ENABLE_LEARNED_LONG_PASS_RUN is set.
