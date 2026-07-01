@@ -2036,6 +2036,11 @@ fn run_game(
     if let Some(head) = CARRIED_WINGER_PINCH_HEAD.lock().unwrap().as_ref() {
         sim.set_winger_pinch_head(head.clone());
     }
+    // Install the carried same-team separation head so the MPC keep-out consumes it live once
+    // trained. No-op unless the model is enabled (on by default in prod).
+    if let Some(head) = CARRIED_SEPARATION_FLOOR_HEAD.lock().unwrap().as_ref() {
+        sim.set_separation_floor_head(head.clone());
+    }
     // Install the carried long-pass run head so `backfield_long_pass_run_invite_for` consumes
     // it live once trained. No-op unless DD_SOCCER_ENABLE_LEARNED_LONG_PASS_RUN is set.
     if let Some(head) = CARRIED_LONG_PASS_RUN_HEAD.lock().unwrap().as_ref() {
