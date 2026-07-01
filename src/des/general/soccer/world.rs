@@ -540,6 +540,18 @@ pub struct SoccerMatch {
     pub(crate) line_depth_samples: Vec<LineDepthSample>,
     /// Open line-depth decisions awaiting their windowed reward.
     pub(crate) pending_line_depth: Vec<PendingLineDepthDecision>,
+    /// The trained **per-defender** individual line head (the MAPPO layer on top of the
+    /// group line centre), when present. Set by the learner (carried + trained across
+    /// games) so the per-defender push/drop decision consumes it live; `None` ⇒ the
+    /// analytic seed. Shared into each [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) defender_line_head: Option<std::sync::Arc<DefenderLinePolicyHead>>,
+    /// Rolling RL training corpus for the per-defender head: an egocentric state + the
+    /// push delta used + the windowed shared-team territorial reward. Collected only
+    /// while the individual model is enabled (`collect_defender_line_rl_samples`);
+    /// drained by the cluster learner. Empty + untouched in the default process.
+    pub(crate) defender_line_samples: Vec<DefenderLineSample>,
+    /// Open per-defender decisions awaiting their windowed reward.
+    pub(crate) pending_defender_line: Vec<PendingDefenderLineDecision>,
     /// Sticky back-four line-centre latch per team (Home=0, Away=1): the line centre held on the
     /// sim-tick loop for ~[`BACK_FOUR_LINE_STICKY_ANCHOR_SECONDS`] so the four stop oscillating (the
     /// "sine-wave"). `None` until first set / whenever the sticky anchor (or the v2 line) is gated
