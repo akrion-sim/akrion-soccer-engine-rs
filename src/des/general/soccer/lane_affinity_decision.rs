@@ -235,6 +235,13 @@ pub struct PendingLaneAffinityDecision {
     pub inputs: LaneAffinityInputs,
     pub action_bias: f64,
     pub decision_territorial: f64,
+    /// Running sum of the team's **real reward-pipeline events** (forward-pass rewards,
+    /// pass→shot / pass→goal, shot/goal back-prop, turnover / interception penalties,
+    /// duel / loose-ball wins, dribble-progress rewards, hold/no-progress penalties)
+    /// accrued each tick over the decision's window. This is the primary reward — it is
+    /// exactly the reward the rest of the engine optimizes — with the territorial delta
+    /// added as dense off-ball credit at resolution.
+    pub reward_accum: f64,
     pub due_tick: u64,
 }
 
