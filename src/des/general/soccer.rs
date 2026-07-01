@@ -2820,6 +2820,43 @@ pub(crate) fn same_team_proximity_penalty_unit(distance_yards: f64) -> f64 {
     (t * t).clamp(0.0, 1.0)
 }
 
+/// Advance the three nested same-team proximity dwell timers by `dt` for the current
+/// nearest-NON-EXEMPT teammate `distance` (yards). Each band accumulates while the pair is inside
+/// its radius and resets to 0 the instant they are farther than it — so elapsed time carries
+/// across tighter bands (never reset on the way in) but is forgiven once the pair genuinely
+/// separates past that band. Pass `f64::INFINITY` when there is no eligible teammate (all reset).
+/// Pure / RNG-free; the single source of truth for the grace-timer update so the live loop and
+/// tests agree.
+fn advance_same_team_proximity_dwell(
+    dwell_lt7: &mut f64,
+    dwell_lt6: &mut f64,
+    dwell_lt5: &mut f64,
+    distance: f64,
+    dt: f64,
+) {
+    let step = |timer: &mut f64, band: f64| {
+        if distance < band {
+            *timer += dt;
+        } else {
+            *timer = 0.0;
+        }
+    };
+    step(dwell_lt7, SAME_TEAM_PROXIMITY_BAND_LT7_YARDS);
+    step(dwell_lt6, SAME_TEAM_PROXIMITY_BAND_LT6_YARDS);
+    step(dwell_lt5, SAME_TEAM_PROXIMITY_BAND_LT5_YARDS);
+}
+
+/// True when the graduated same-team proximity penalty has passed its GRACE window and should
+/// begin to accrue, given the player's three nested proximity dwell timers (seconds). The penalty
+/// starts the instant ANY band's timer reaches that band's grace: 7yd/3s, 6yd/2s, 5yd/1s. Because
+/// the bands nest (`lt5 ≤ lt6 ≤ lt7`), a slow drift-in trips the 7yd/3s timer while a fast dive
+/// inside 5yd trips the 5yd/1s timer first — exactly the user's graduated-grace intent.
+fn same_team_proximity_penalty_past_grace(dwell_lt7: f64, dwell_lt6: f64, dwell_lt5: f64) -> bool {
+    dwell_lt7 >= SAME_TEAM_PROXIMITY_GRACE_LT7_SECONDS
+        || dwell_lt6 >= SAME_TEAM_PROXIMITY_GRACE_LT6_SECONDS
+        || dwell_lt5 >= SAME_TEAM_PROXIMITY_GRACE_LT5_SECONDS
+}
+
 /// Distance (yards) from the player `player_id` to its nearest same-team teammate in
 /// `snapshot`, EXCLUDING any teammate for which the floor is waived because BOTH are inside
 /// an 18-yard box. `None` when the player is missing / off-pitch or has no eligible
