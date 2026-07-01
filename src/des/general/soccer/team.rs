@@ -4012,6 +4012,7 @@ fn soccer_formation_lp_anchor(
     let own_goal_y = team.other().goal_y(length);
     let home_position = finite_pitch_point(player.home_position, width, length, center);
     let home_lane = ((home_position.x - width * 0.5) / (width * 0.5)).clamp(-1.0, 1.0);
+    let spread = formation_hold_tighten_enabled();
     let directive_width = soccer_lp_clamped(directive.width_yards, 14.0, width, width * 0.62);
     let defensive_line_y = soccer_lp_clamped(
         directive.defensive_line_y,
