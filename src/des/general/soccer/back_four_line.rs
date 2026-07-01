@@ -89,6 +89,12 @@ const DEFENSIVE_LINE_WINGBACK_FORWARD_PRIORITY_ENABLE_ENV: &str =
     "DD_SOCCER_ENABLE_WINGBACK_FORWARD_PRIORITY";
 /// Env gate (default-ON) for the press-to-attackers compaction of the v2 line centre.
 const BACK_FOUR_ATTACKER_PRESS_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_ATTACKER_PRESS";
+/// Env kill switch (default-ON) for the TIGHTER foremost-four gaps + harder push (sit closer to the
+/// opponents' front line). See [`back_four_tighter_line_enabled`].
+const BACK_FOUR_TIGHTER_LINE_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_TIGHTER_LINE";
+/// Env kill switch (default-ON) for the ball-far offside-trap push-up. See
+/// [`back_four_ball_far_push_up_enabled`].
+const BACK_FOUR_BALL_FAR_PUSH_UP_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_BALL_FAR_PUSH_UP";
 /// Env gate (default-ON) for the energy-conservation hold deadband on the v2 line target.
 const BACK_FOUR_LINE_HOLD_DEADBAND_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_LINE_HOLD_DEADBAND";
 /// Env kill switch (default-ON) for the **sticky line anchor**: the back-four line CENTRE is latched
