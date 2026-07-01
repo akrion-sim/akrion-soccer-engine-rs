@@ -198,6 +198,15 @@ pub(crate) fn decide_winger_pinch_with_bias(
         back -= congestion * CONGESTION_BACKPOST_PENALTY;
     }
 
+    // Learned pinch appetite: a signed bias (default 0) shifts BOTH pinch buckets relative to
+    // holding width — the head's contribution to the stay-vs-pinch choice. Bounded by
+    // `super::winger_pinch_decision::WINGER_PINCH_APPETITE_WEIGHT` so it nudges without
+    // overriding the same-flank "hold width" rule.
+    let pinch_shift = pinch_bias.clamp(-1.0, 1.0)
+        * super::winger_pinch_decision::WINGER_PINCH_APPETITE_WEIGHT;
+    half += pinch_shift;
+    back += pinch_shift;
+
     // Legality mask: an offside back-post arrival is illegal — prune that bucket.
     if back_post_offside {
         back = f64::NEG_INFINITY;
