@@ -196,11 +196,11 @@ impl WorldSnapshot {
                 Some(carrier_id),
             );
             let value = forward_gain.max(0.0) * 0.5 + openness * 6.0 + (lane_len * 0.12);
-            if best.as_ref().is_none_or(|(_, _, best_value)| value > *best_value) {
-                best = Some((far.id, far_pos, value));
+            if best.as_ref().is_none_or(|(_, _, best_value, ..)| value > *best_value) {
+                best = Some((far.id, far_pos, value, forward_gain, openness, lane_len));
             }
         }
-        let (_, far_pos, raw_value) = best?;
+        let (_, far_pos, raw_value, best_forward_gain, best_openness, best_lane_len) = best?;
 
         // Step out of the corridor "to space": forward when attacking, backward for a deep
         // defender holding the back line. Try both sides at growing step sizes and keep the
