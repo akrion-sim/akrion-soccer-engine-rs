@@ -397,15 +397,13 @@ impl SoccerMatch {
             let Some(player) = snapshot.players.iter().find(|p| p.id == id) else {
                 continue;
             };
-            let Some((inputs, realised_pinch)) = snapshot.build_winger_pinch_inputs(player) else {
+            let Some(inputs) = snapshot.build_winger_pinch_inputs(player) else {
                 continue;
             };
-            let bias = snapshot
+            // The pinch-appetite action taken this tick (head once trained, else analytic seed).
+            let action_bias = snapshot
                 .winger_pinch_bias(&inputs)
                 .unwrap_or_else(|| analytic_winger_pinch_bias(&inputs));
-            // The action recorded blends the realised bucket (did he actually pinch?) with the
-            // bias used, so RWR imitates the pinch/stay that earned reward.
-            let action_bias = if realised_pinch { bias.max(0.15) } else { bias.min(-0.15) };
             let territorial = territorial_advantage(snapshot, player.team);
             if territorial.is_finite() {
                 self.pending_winger_pinch.push(PendingWingerPinchDecision {
