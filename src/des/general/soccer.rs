@@ -96,6 +96,8 @@ pub(crate) use winger_pinch::*;
 mod field_numbers;
 pub use field_numbers::*;
 mod goal_side;
+mod goal_side_recovery_decision;
+pub use goal_side_recovery_decision::*;
 mod policy_select;
 pub use policy_select::*;
 mod pass_lane_yield;
