@@ -2758,9 +2758,8 @@ const SAME_TEAM_MPC_OBSTACLE_WEIGHT_GAIN: f64 = 1.6;
 pub(crate) fn dd_soccer_enable_same_team_separation_floor() -> bool {
     #[cfg(test)]
     {
-        use std::sync::OnceLock;
-        static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_SAME_TEAM_SEPARATION_FLOOR").is_ok())
+        // Read fresh under test so a single process can A/B the gate per test.
+        std::env::var("DD_SOCCER_ENABLE_SAME_TEAM_SEPARATION_FLOOR").is_ok()
     }
     #[cfg(not(test))]
     {
