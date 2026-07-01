@@ -60990,16 +60990,24 @@ fn clamp_dir_to_cone(target: Vec2, axis: Vec2, max_angle: f64) -> Vec2 {
     return Vec2::new(a.x * c - a.y * s, a.x * s + a.y * c);
 }
 
-/// Preference (0..1) for a pass of length `dist`: 8yd is the sole optimum.
+/// Preference (0..1) for a pass of length `dist`: a single optimum length scores 1.0, with a
+/// linear ramp up to it and a linear fade beyond. The optimum is 8yd by default, or 15yd when
+/// the ideal-pass-length gate is on (see [`ideal_pass_length_15yd_enabled`]) so the engine
+/// favours a meaningful ~15yd progression over a short square pass.
 fn pass_length_preference(dist: f64) -> f64 {
     if !dist.is_finite() || dist <= 0.0 {
         return 0.0;
     }
-    if dist <= PASS_LENGTH_OPTIMAL_YARDS {
-        return (dist / PASS_LENGTH_OPTIMAL_YARDS).clamp(0.0, 1.0);
+    let (optimal, fadeout) = if ideal_pass_length_15yd_enabled() {
+        (IDEAL_PASS_LENGTH_OPTIMAL_YARDS, IDEAL_PASS_LENGTH_FADEOUT_YARDS)
+    } else {
+        (PASS_LENGTH_OPTIMAL_YARDS, PASS_LENGTH_FADEOUT_YARDS)
+    };
+    if dist <= optimal {
+        return (dist / optimal).clamp(0.0, 1.0);
     }
-    let fade_band = (PASS_LENGTH_FADEOUT_YARDS - PASS_LENGTH_OPTIMAL_YARDS).max(1.0);
-    (1.0 - (dist - PASS_LENGTH_OPTIMAL_YARDS) / fade_band).clamp(0.0, 1.0)
+    let fade_band = (fadeout - optimal).max(1.0);
+    (1.0 - (dist - optimal) / fade_band).clamp(0.0, 1.0)
 }
 
 /// Length preference for a BACKWARD pass. Unlike the forward/lateral curve (which peaks at
