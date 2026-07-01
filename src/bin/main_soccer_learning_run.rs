@@ -3383,6 +3383,12 @@ fn run() -> Result<(), Box<dyn Error>> {
     let actor_critic_default = config.neural_learning.marl_algorithm != SoccerMarlAlgorithm::Off;
     config.neural_blend.actor_critic =
         env_bool("SOCCER_ENABLE_ACTOR_CRITIC", actor_critic_default)?;
+    // Train the learned dynamics model P̂(s'|s,a) on each episode's replay so MCTS look-ahead can
+    // plan inside the model (model-based / "imagined-rollout" learning — more updates per real
+    // game). Mirrors the set-play learner's `SOCCER_NEURAL_WORLD_MODEL` hook; default preserves
+    // `MatchConfig::default()` (off), so an unset env is byte-identical to before.
+    config.neural_blend.world_model =
+        env_bool("SOCCER_NEURAL_WORLD_MODEL", config.neural_blend.world_model)?;
     let run_id = env_value("SOCCER_RUN_ID").unwrap_or_else(default_run_id);
     let run_dir = PathBuf::from(
         env_value("SOCCER_RUN_DIR").unwrap_or_else(|| format!("out/soccer-learning-runs/{run_id}")),
