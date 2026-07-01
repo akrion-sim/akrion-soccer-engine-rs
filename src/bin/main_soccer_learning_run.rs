@@ -1928,6 +1928,12 @@ static CARRIED_LANE_AFFINITY_HEAD: std::sync::Mutex<Option<LaneAffinityHead>> =
 static CARRIED_GOAL_SIDE_RECOVERY_HEAD: std::sync::Mutex<Option<GoalSideRecoveryHead>> =
     std::sync::Mutex::new(None);
 
+/// In-memory winger pinch-appetite head (stay wide vs pinch infield), carried + trained across
+/// games WITHIN a learner process. Consumed live once it crosses
+/// `WINGER_PINCH_HEAD_MIN_TRAINING_STEPS` (seam on by default in prod).
+static CARRIED_WINGER_PINCH_HEAD: std::sync::Mutex<Option<WingerPinchHead>> =
+    std::sync::Mutex::new(None);
+
 /// In-memory learned pass-completion head, carried + trained across games WITHIN a learner
 /// process (seeded once from the Postgres corpus at startup), mirroring
 /// `CARRIED_LINE_DEPTH_HEAD`. Installed on each game so the pass-quality assessor consumes it
