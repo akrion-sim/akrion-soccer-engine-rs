@@ -571,6 +571,16 @@ pub struct SoccerMatch {
     pub(crate) receive_approach_samples: Vec<ReceiveApproachSample>,
     /// Open receive-approach decisions awaiting their windowed reward.
     pub(crate) pending_receive_approach: Vec<PendingReceiveApproachDecision>,
+    /// The trained lane-affinity head (whether an out-of-lane player breaks out or is
+    /// held), when present. Carried + trained across games by the learner; `None` ⇒ the
+    /// analytic seed. Shared into each [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) lane_affinity_head: Option<std::sync::Arc<LaneAffinityHead>>,
+    /// Rolling RL corpus for the lane-affinity head: per-player lane state + the break/hold
+    /// action taken + the windowed territorial reward. Collected only while the model is
+    /// enabled.
+    pub(crate) lane_affinity_samples: Vec<LaneAffinitySample>,
+    /// Open lane-affinity decisions awaiting their windowed reward.
+    pub(crate) pending_lane_affinity: Vec<PendingLaneAffinityDecision>,
     /// The trained long-pass run head (which attacker should break forward so a deep carrier
     /// can pick them out), when present. Carried + trained across games by the learner; `None`
     /// ⇒ the analytic `backfield_long_pass_run_invite_for` seed. Shared into each
@@ -3108,6 +3118,9 @@ impl SoccerMatch {
             receive_approach_head: None,
             receive_approach_samples: Vec::new(),
             pending_receive_approach: Vec::new(),
+            lane_affinity_head: None,
+            lane_affinity_samples: Vec::new(),
+            pending_lane_affinity: Vec::new(),
             long_pass_run_head: None,
             long_pass_run_samples: Vec::new(),
             pending_long_pass_run: Vec::new(),
@@ -8549,6 +8562,9 @@ impl SoccerMatch {
         // Learnable receive-approach RL samples (no-op + byte-identical unless
         // `DD_SOCCER_ENABLE_RECEIVE_APPROACH_MODEL` is set).
         self.collect_receive_approach_rl_samples(&next_snapshot);
+        // Learnable lane-affinity (break-out vs hold) RL samples (no-op under test /
+        // when disabled; live in prod, seeded by the ≈0 analytic prior).
+        self.collect_lane_affinity_rl_samples(&next_snapshot);
         self.collect_long_pass_run_rl_samples(&next_snapshot);
         // Learnable give-and-go / wall-pass appetite RL samples (no-op + byte-identical unless
         // `DD_SOCCER_ENABLE_LEARNED_GIVE_AND_GO` is set).
@@ -22081,6 +22097,11 @@ pub struct WorldSnapshot {
     /// (parity). Skipped by serde (an internal decision aid; Default = None).
     #[serde(skip)]
     pub(crate) receive_approach_head: Option<std::sync::Arc<ReceiveApproachHead>>,
+    /// The trained lane-affinity head, carried from the match for live consumption in the
+    /// lane clamp seam (`lane_affinity_effective_clamp_blend`). `None` ⇒ analytic seed
+    /// (parity). Skipped by serde (an internal decision aid; Default = None).
+    #[serde(skip)]
+    pub(crate) lane_affinity_head: Option<std::sync::Arc<LaneAffinityHead>>,
     /// The trained long-pass run head, carried from the match for live consumption in
     /// `backfield_long_pass_run_invite_for`. `None` ⇒ analytic seed (parity). Skipped by
     /// serde (an internal decision aid; Default = None).
@@ -24755,6 +24776,7 @@ impl WorldSnapshot {
             pass_completion_head: m.pass_completion_head.clone(),
             loose_ball_commit_head: m.loose_ball_commit_head.clone(),
             receive_approach_head: m.receive_approach_head.clone(),
+            lane_affinity_head: m.lane_affinity_head.clone(),
             long_pass_run_head: m.long_pass_run_head.clone(),
             give_and_go_head: m.give_and_go_head.clone(),
             attack_spacing_head: m.attack_spacing_head.clone(),
@@ -50446,7 +50468,21 @@ impl WorldSnapshot {
                 // Smooth relief taper instead of the legacy cliff: a mild relief
                 // relaxes the lane, it doesn't abandon it (floored at the same soft
                 // blend the legacy else-branch used under full relief).
-                let blend = lane_discipline::lane_clamp_blend(fit.commitment, relief);
+                let base_blend = lane_discipline::lane_clamp_blend(fit.commitment, relief);
+                // Learnable lane-affinity decision (MDP/POMDP): the hard clamp is a
+                // predilection, not an order — the player may CHOOSE to break out of its
+                // lane into space it found (loosen the blend) or hold harder. Gated ON in
+                // prod (seeded by the ≈0 analytic prior ⇒ near-identical), OFF under test
+                // ⇒ `base_blend` unchanged (byte-identical).
+                let blend = self.lane_affinity_effective_clamp_blend(
+                    me,
+                    bounded,
+                    lane_x,
+                    &fit,
+                    relief,
+                    in_possession,
+                    base_blend,
+                );
                 bounded.x = bounded.x * (1.0 - blend) + lane_x * blend;
             } else if fit.commitment >= 0.65 && relief < 0.15 {
                 bounded.x = lane_x;
