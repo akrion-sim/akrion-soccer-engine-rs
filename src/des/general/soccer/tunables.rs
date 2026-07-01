@@ -574,6 +574,8 @@ impl Default for RewardTunables {
             goal_scored_points: 100.0,
             concede_keeper_defender_penalty: 8.0,
             concede_outfield_penalty: 2.0,
+            concede_keeper_defender_penalty_symmetric: 100.0,
+            concede_outfield_penalty_symmetric: 60.0,
             teammate_overlap_relief_reward: 0.06,
             teammate_overlap_camp_penalty: 0.03,
             center_back_ahead_of_wingback_penalty_per_yard: 0.11,
