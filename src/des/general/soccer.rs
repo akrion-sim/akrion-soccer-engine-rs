@@ -2122,9 +2122,9 @@ const BACKWARD_PASS_BASE_PENALTY_POINTS: f64 = 3.5;
 /// Raised 0.5 → 1.0 so the depth term bites harder.
 const BACKWARD_PASS_PENALTY_PER_YARD_POINTS: f64 = 1.0;
 /// Cap on the total unpressured-backward-pass penalty so one very deep ball can't swamp the signal.
-/// Raised 12.0 → 20.0 to keep headroom for the heavier base/per-yard terms (the cap now engages
-/// at ~16.5yd of backward distance).
-const BACKWARD_PASS_MAX_PENALTY_POINTS: f64 = 20.0;
+/// Raised 12.0 → 18.0 to keep headroom for the heavier base/per-yard terms (converged with the
+/// parallel backward-pass-discipline change; the cap engages at ~14.5yd of backward distance).
+const BACKWARD_PASS_MAX_PENALTY_POINTS: f64 = 18.0;
 /// Over-dribble dispossession penalty (the carrier held the ball too long and was tackled for it).
 /// Hold time (seconds) past which staying on the ball is "overdue" — a pass or a forward drive
 /// should have happened by now. Below this a tackle on a fresh touch is just an unlucky duel, not an
