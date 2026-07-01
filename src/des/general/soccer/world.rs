@@ -23435,7 +23435,6 @@ fn dd_soccer_disable_six_yard_line_floor() -> bool {
 /// defender). This is the real-soccer answer to "don't back off forever" — the carrier driving
 /// from ~40 to ~15yd is jockeyed wide into low-value space instead of being allowed straight down
 /// the middle. Affects only the lone presser's engage target; the rest of the block keeps shape.
-/// Enable via `DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD=1`.
 fn dd_soccer_enable_defensive_shepherd() -> bool {
     #[cfg(test)]
     {
