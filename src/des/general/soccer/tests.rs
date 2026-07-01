@@ -58867,12 +58867,20 @@ fn forward_open_space_available_true_when_lane_ahead_is_clear_else_false() {
 
     // Now wall the space directly ahead of the same teammate with opponents: no forward option, so
     // a drop is legitimate and the bias must stay inert.
-    let mut walled = open.clone();
+    let mut walled = SoccerMatch::default_11v11(MatchConfig::default());
+    park_players_except(&mut walled, &[holder, support]);
+    walled.ball.holder = Some(holder);
+    walled.ball.position = Vec2::new(40.0, 55.0);
+    walled.ball.velocity = Vec2::zero();
+    walled.ball.last_touch_team = Some(Team::Home);
+    walled.players[holder].position = walled.ball.position;
+    walled.players[support].position = Vec2::new(46.0, 58.0);
+    walled.players[support].home_position = walled.players[support].position;
     for (i, away) in (11..22).enumerate() {
         // Pack defenders across the channel just ahead of the support player.
         walled.players[away].position = Vec2::new(
             38.0 + (i as f64) * 2.0,
-            support_player.position.y + Team::Home.attack_dir() * 8.0,
+            walled.players[support].position.y + Team::Home.attack_dir() * 8.0,
         );
     }
     let walled_snapshot = WorldSnapshot::from_match(&walled);
