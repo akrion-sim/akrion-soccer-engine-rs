@@ -25502,6 +25502,95 @@ fn loose_ball_contest_pressure_reward(
     reward
 }
 
+#[cfg(test)]
+mod loose_ball_contest_pressure_tests {
+    use super::*;
+
+    // The gate reads a process-global env var; serialize the tests that toggle it.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn uncontested_penalty_grows_with_time_and_is_symmetric() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("DD_SOCCER_ENABLE_LOOSE_BALL_CONTEST_PRESSURE");
+        let grace = LOOSE_BALL_MAX_UNCONTESTED_SECONDS;
+        // Within grace ⇒ no penalty; beyond it ⇒ a penalty that escalates.
+        assert_eq!(
+            loose_ball_contest_pressure_reward(PlayerRole::Midfielder, grace, false, false),
+            0.0
+        );
+        let short = loose_ball_contest_pressure_reward(
+            PlayerRole::Midfielder,
+            grace + 0.5,
+            false,
+            false,
+        );
+        let long =
+            loose_ball_contest_pressure_reward(PlayerRole::Midfielder, grace + 2.0, false, false);
+        assert!(short < 0.0, "an uncontested ball must cost something: {short}");
+        assert!(long < short, "longer uncontested must cost more: {long} !< {short}");
+        // Symmetric: role/team-independent — a defender pays the same as a forward.
+        let def =
+            loose_ball_contest_pressure_reward(PlayerRole::Defender, grace + 0.5, false, false);
+        assert!((def - short).abs() < 1e-12, "penalty must be team/role-symmetric");
+    }
+
+    #[test]
+    fn uncontested_penalty_is_capped() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("DD_SOCCER_ENABLE_LOOSE_BALL_CONTEST_PRESSURE");
+        let huge =
+            loose_ball_contest_pressure_reward(PlayerRole::Forward, 1_000.0, false, false);
+        let cap = tunables().reward.loose_ball_uncontested_penalty_max;
+        assert!(huge >= -cap - 1e-9, "penalty {huge} exceeds cap -{cap}");
+    }
+
+    #[test]
+    fn goalkeeper_is_exempt() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("DD_SOCCER_ENABLE_LOOSE_BALL_CONTEST_PRESSURE");
+        assert_eq!(
+            loose_ball_contest_pressure_reward(PlayerRole::Goalkeeper, 5.0, false, false),
+            0.0,
+            "the keeper is kept goalside, not pressured off its line"
+        );
+    }
+
+    #[test]
+    fn winning_the_loose_ball_is_rewarded_holder_over_teammate() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("DD_SOCCER_ENABLE_LOOSE_BALL_CONTEST_PRESSURE");
+        let holder =
+            loose_ball_contest_pressure_reward(PlayerRole::Midfielder, 0.0, true, true);
+        let teammate =
+            loose_ball_contest_pressure_reward(PlayerRole::Midfielder, 0.0, true, false);
+        assert!(holder > 0.0, "winning the ball must be rewarded: {holder}");
+        assert!(
+            holder > teammate && teammate > 0.0,
+            "the player who secured it gets more than a teammate who forced it: {holder} vs {teammate}"
+        );
+        // A ball won after sitting longer uncontested is worth more (decisive).
+        let decisive = loose_ball_contest_pressure_reward(
+            PlayerRole::Midfielder,
+            LOOSE_BALL_MAX_UNCONTESTED_SECONDS + 2.0,
+            true,
+            true,
+        );
+        assert!(decisive > holder, "winning a longer-loose ball is more decisive");
+    }
+
+    #[test]
+    fn gate_off_restores_byte_identical_zero() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("DD_SOCCER_ENABLE_LOOSE_BALL_CONTEST_PRESSURE", "0");
+        assert_eq!(
+            loose_ball_contest_pressure_reward(PlayerRole::Midfielder, 5.0, true, true),
+            0.0
+        );
+        std::env::remove_var("DD_SOCCER_ENABLE_LOOSE_BALL_CONTEST_PRESSURE");
+    }
+}
+
 fn loose_ball_contest_learning_reward(
     player: &PlayerAgent,
     action: &str,
