@@ -40120,6 +40120,24 @@ impl WorldSnapshot {
         self.loose_ball_urgency_active() || self.loose_ball_team_stalled_for(team)
     }
 
+    /// Seconds the ball has sat **loose and uncontested** (no outfielder on it or
+    /// closing it down), read from the global clock the match maintains in
+    /// [`SoccerMatch::update_loose_ball_urgency`] and carried into this snapshot.
+    /// `0.0` when the ball is held, in controlled transit, or being contested this
+    /// tick. The clock is symmetric across teams (it resets the moment either side
+    /// challenges), so this drives the both-teams loose-ball contest-pressure
+    /// penalty in the learning reward.
+    pub(crate) fn loose_ball_uncontested_seconds(&self) -> f64 {
+        if self.ball.holder.is_some() || self.pending_pass_keeps_ball_in_transit() {
+            return 0.0;
+        }
+        let Some(since) = self.loose_ball_uncontested_since_tick else {
+            return 0.0;
+        };
+        let dt = sane_dt_seconds(self.dt_seconds, DEFAULT_DT_SECONDS).max(1e-6);
+        (self.tick.saturating_sub(since) as f64 * dt).max(0.0)
+    }
+
     fn pending_pass_keeps_ball_in_transit(&self) -> bool {
         self.pending_pass.is_some()
             && self.ball.holder.is_none()
