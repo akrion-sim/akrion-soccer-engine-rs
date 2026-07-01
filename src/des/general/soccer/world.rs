@@ -23129,7 +23129,8 @@ pub(crate) fn dd_soccer_disable_onside_support_hold() -> bool {
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_ONSIDE_SUPPORT_HOLD").is_ok())
 }
 
-/// Quick forward ground-pass priority (OFF by default = byte-identical). When set, players
+/// Quick forward ground-pass priority (default-ON in prod, kill switch
+/// `DD_SOCCER_ENABLE_QUICK_FORWARD_PASS=0`; default-OFF under test = byte-identical). When on, players
 /// place much more value on a short progressive GROUND pass (5-15 yd) into an OPEN, advanced
 /// teammate and release it SOONER — as a first-time ball off the carry or a one-touch off
 /// the first touch — rather than settling or dwelling on the ball. The forward-open value is
