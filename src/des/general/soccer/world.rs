@@ -15724,11 +15724,10 @@ impl SoccerMatch {
             * side_glance_speed_factor;
         let strength_to_weight_factor =
             strength_to_weight_acceleration_multiplier(&self.players[player_id].skills);
-        // HARD same-team separation floor — the smooth movement-barrier layer. Snapshot each
-        // teammate's CURRENT position (positions don't change until integration below) plus a
-        // per-pair "exempt" flag (both inside an 18-yard box) so the post-integration velocity
-        // can be radially damped to never cross within 4yd of a teammate. Empty (skips entirely)
-        // when the gate is off ⇒ byte-identical.
+        // Same-team proximity tracking (feeds the grace timers for the graduated crowding
+        // penalty). Snapshot each teammate's CURRENT position (positions don't change until
+        // integration below) plus a per-pair "exempt" flag (both inside an 18-yard box). Empty
+        // (skips entirely) when the gate is off ⇒ byte-identical.
         let same_team_separation_obstacles: Vec<(Vec2, bool)> =
             if dd_soccer_enable_same_team_separation_floor() {
                 let my_team = self.players[player_id].team;
@@ -15787,22 +15786,12 @@ impl SoccerMatch {
         if p.velocity.len() > SOCCER_PHYSICS_PLAYER_MAX_SPEED_YPS {
             p.velocity = p.velocity.normalized() * SOCCER_PHYSICS_PLAYER_MAX_SPEED_YPS;
         }
-        // HARD same-team separation floor: smoothly damp the finalized velocity's inward
-        // component toward any non-exempt teammate so this step can never close the gap below
-        // 4yd — a gentle deceleration approaching the floor, not a hard stop. No-op when the
-        // gate is off (the obstacle list is empty). Runs BEFORE the physical-gait derivation
-        // below so the visible gait reflects the actual (damped) speed the player travels at.
+        // Same-team proximity GRACE timers. Advance the nested dwell timers off the nearest
+        // NON-EXEMPT teammate so the graduated reward penalty only accrues on a SUSTAINED crowd.
+        // NOTE: there is deliberately NO hard movement barrier — a player MAY close inside 4yd,
+        // it just draws a strong/huge penalty (reward) plus an MPC route cost; it is not a
+        // physical wall. No-op when the gate is off (the list is empty ⇒ byte-identical).
         if !same_team_separation_obstacles.is_empty() {
-            p.velocity = apply_same_team_separation_barrier(
-                p.position,
-                p.velocity,
-                &same_team_separation_obstacles,
-                dt,
-            );
-            // Advance the nested proximity-dwell GRACE timers off the same obstacle set (nearest
-            // NON-EXEMPT teammate distance). Feeds the graduated reward penalty's grace gate so a
-            // brief overlap is forgiven and only a sustained crowd is punished. Uses the pre-
-            // integration position (matches how the obstacle set was snapshotted).
             let nearest_nonexempt_yards = same_team_separation_obstacles
                 .iter()
                 .filter(|(_, exempt)| !exempt)
@@ -49054,7 +49043,13 @@ impl WorldSnapshot {
         let we_control = self.controlled_possession_team() == Some(team);
         let gap_min = back_four_desired_gap_min_yards(we_control);
         let base_gap = gap_min + (BACK_FOUR_LINE_DESIRED_GAP_MAX_YARDS - gap_min) * frac;
-        if !back_four_push_into_dead_space_enabled() {
+        // Only step into dead space while WE CONTROL the ball (goal-fest fix, origin/learning
+        // 0d6b9c38): pushing the line up off the ball — out of possession, or on a loose/contested
+        // ball — just vacates the space BEHIND it for an opponent runner to be sprung into over the
+        // top (the `space_occupied` check sees only CURRENT positions, so a late run arrives after
+        // the line has stepped up). That high line gets burned both ways and collapses matches into
+        // goal-fests; out of possession we hold the deeper possession-aware line instead.
+        if !back_four_push_into_dead_space_enabled() || !we_control {
             return base_gap;
         }
         // Push up to FILL DEAD SPACE: the line should not sit ~40yd off the ball when the zone in
