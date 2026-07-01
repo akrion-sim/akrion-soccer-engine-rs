@@ -638,6 +638,13 @@ pub struct SoccerMatch {
     pub(crate) slip_break_samples: Vec<SlipBreakSample>,
     /// Open slip-break decisions awaiting their windowed reward.
     pub(crate) pending_slip_break: Vec<PendingSlipBreakDecision>,
+    /// The trained onside-support push head, when present. `None` ⇒ analytic seed. Shared into each
+    /// [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) onside_support_head: Option<std::sync::Arc<OnsideSupportHead>>,
+    /// Rolling RL corpus for the onside-support head. Collected only while the model is enabled.
+    pub(crate) onside_support_samples: Vec<OnsideSupportSample>,
+    /// Open onside-support decisions awaiting their windowed reward.
+    pub(crate) pending_onside_support: Vec<PendingOnsideSupportDecision>,
     /// The trained long-pass run head (which attacker should break forward so a deep carrier
     /// can pick them out), when present. Carried + trained across games by the learner; `None`
     /// ⇒ the analytic `backfield_long_pass_run_invite_for` seed. Shared into each
