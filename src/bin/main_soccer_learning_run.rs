@@ -2047,6 +2047,10 @@ fn run_game(
     if let Some(head) = CARRIED_SEPARATION_FLOOR_HEAD.lock().unwrap().as_ref() {
         sim.set_separation_floor_head(head.clone());
     }
+    // Install the carried pass-lane yield head so the yield seam consumes it live once trained.
+    if let Some(head) = CARRIED_PASS_LANE_YIELD_HEAD.lock().unwrap().as_ref() {
+        sim.set_pass_lane_yield_head(head.clone());
+    }
     // Install the carried long-pass run head so `backfield_long_pass_run_invite_for` consumes
     // it live once trained. No-op unless DD_SOCCER_ENABLE_LEARNED_LONG_PASS_RUN is set.
     if let Some(head) = CARRIED_LONG_PASS_RUN_HEAD.lock().unwrap().as_ref() {
