@@ -581,6 +581,14 @@ pub struct SoccerMatch {
     pub(crate) lane_affinity_samples: Vec<LaneAffinitySample>,
     /// Open lane-affinity decisions awaiting their windowed reward.
     pub(crate) pending_lane_affinity: Vec<PendingLaneAffinityDecision>,
+    /// The trained goal-side recovery head (how hard a recovering defender collapses onto the
+    /// ball→goal line vs. holds width), when present. `None` ⇒ analytic seed. Shared into each
+    /// [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) goal_side_recovery_head: Option<std::sync::Arc<GoalSideRecoveryHead>>,
+    /// Rolling RL corpus for the goal-side recovery head. Collected only while the model is enabled.
+    pub(crate) goal_side_recovery_samples: Vec<GoalSideRecoverySample>,
+    /// Open goal-side recovery decisions awaiting their windowed reward.
+    pub(crate) pending_goal_side_recovery: Vec<PendingGoalSideRecoveryDecision>,
     /// The trained long-pass run head (which attacker should break forward so a deep carrier
     /// can pick them out), when present. Carried + trained across games by the learner; `None`
     /// ⇒ the analytic `backfield_long_pass_run_invite_for` seed. Shared into each
