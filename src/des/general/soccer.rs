@@ -106,6 +106,8 @@ mod pass_lane_yield_decision;
 pub use pass_lane_yield_decision::*;
 mod head_scan_decision;
 pub use head_scan_decision::*;
+mod crash_box_decision;
+pub use crash_box_decision::*;
 mod policy_select;
 pub use policy_select::*;
 mod pass_lane_yield;
