@@ -15724,6 +15724,30 @@ impl SoccerMatch {
             * side_glance_speed_factor;
         let strength_to_weight_factor =
             strength_to_weight_acceleration_multiplier(&self.players[player_id].skills);
+        // HARD same-team separation floor — the smooth movement-barrier layer. Snapshot each
+        // teammate's CURRENT position (positions don't change until integration below) plus a
+        // per-pair "exempt" flag (both inside an 18-yard box) so the post-integration velocity
+        // can be radially damped to never cross within 4yd of a teammate. Empty (skips entirely)
+        // when the gate is off ⇒ byte-identical.
+        let same_team_separation_obstacles: Vec<(Vec2, bool)> =
+            if dd_soccer_enable_same_team_separation_floor() {
+                let my_team = self.players[player_id].team;
+                let me_pos = self.players[player_id].position;
+                let me_in_box = self.point_in_either_penalty_area(me_pos);
+                self.players
+                    .iter()
+                    .filter(|other| other.id != player_id && other.team == my_team)
+                    .filter(|other| other.position.x.is_finite() && other.position.y.is_finite())
+                    .map(|other| {
+                        (
+                            other.position,
+                            me_in_box && self.point_in_either_penalty_area(other.position),
+                        )
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
         let p = &mut self.players[player_id];
         // Accumulate time-in-tier: reset on an effort-tier change, otherwise add this
         // step's dt so the dwell measures how long the current gait has been carried.
@@ -15762,6 +15786,35 @@ impl SoccerMatch {
         p.velocity += limited_acceleration * dt;
         if p.velocity.len() > SOCCER_PHYSICS_PLAYER_MAX_SPEED_YPS {
             p.velocity = p.velocity.normalized() * SOCCER_PHYSICS_PLAYER_MAX_SPEED_YPS;
+        }
+        // HARD same-team separation floor: smoothly damp the finalized velocity's inward
+        // component toward any non-exempt teammate so this step can never close the gap below
+        // 4yd — a gentle deceleration approaching the floor, not a hard stop. No-op when the
+        // gate is off (the obstacle list is empty). Runs BEFORE the physical-gait derivation
+        // below so the visible gait reflects the actual (damped) speed the player travels at.
+        if !same_team_separation_obstacles.is_empty() {
+            p.velocity = apply_same_team_separation_barrier(
+                p.position,
+                p.velocity,
+                &same_team_separation_obstacles,
+                dt,
+            );
+            // Advance the nested proximity-dwell GRACE timers off the same obstacle set (nearest
+            // NON-EXEMPT teammate distance). Feeds the graduated reward penalty's grace gate so a
+            // brief overlap is forgiven and only a sustained crowd is punished. Uses the pre-
+            // integration position (matches how the obstacle set was snapshotted).
+            let nearest_nonexempt_yards = same_team_separation_obstacles
+                .iter()
+                .filter(|(_, exempt)| !exempt)
+                .map(|(pos, _)| p.position.distance(*pos))
+                .fold(f64::INFINITY, f64::min);
+            advance_same_team_proximity_dwell(
+                &mut p.same_team_proximity_dwell_lt7_seconds,
+                &mut p.same_team_proximity_dwell_lt6_seconds,
+                &mut p.same_team_proximity_dwell_lt5_seconds,
+                nearest_nonexempt_yards,
+                dt,
+            );
         }
         let physical_gait = movement_gait_for_physical_speed(
             gait,
@@ -15966,6 +16019,17 @@ impl SoccerMatch {
         let opponent_radius = self.config.mpc.opponent_keepout_yards.max(0.0);
         let teammate_radius = self.config.mpc.teammate_keepout_yards.max(0.0);
         let keepout_weight = self.config.mpc.keepout_weight.max(0.0);
+        // HARD same-team separation floor — the LIVE-movement MPC keep-out layer, kept in
+        // unison with the smooth barrier and the graduated POMDP penalty. When the gate is on
+        // this player's teammate obstacles are inflated to the 4yd floor so the point-mass plan
+        // that the policy actually executes routes AROUND teammates rather than into them.
+        // Waived per-pair when BOTH are inside an 18-yard box.
+        let separation_floor_on = dd_soccer_enable_same_team_separation_floor();
+        let me_in_box = separation_floor_on
+            && self
+                .players
+                .get(player_id)
+                .is_some_and(|me| self.point_in_either_penalty_area(me.position));
         let mut obstacles = Vec::with_capacity(self.players.len().saturating_add(1));
 
         for other in &self.players {
@@ -15998,19 +16062,35 @@ impl SoccerMatch {
             let kinematic_weight = 1.0
                 + velocity.len().clamp(0.0, 18.0) / 54.0
                 + acceleration.len().clamp(0.0, 14.0) / 56.0;
+            let mut radius = if opponent {
+                opponent_radius
+            } else {
+                teammate_radius
+            } + holder_bonus;
+            let mut weight = if opponent {
+                keepout_weight
+            } else {
+                keepout_weight * 0.25
+            } * kinematic_weight;
+            // Same-team floor: set the MPC keep-out to the full INFLUENCE radius (8yd) so the
+            // point-mass penalty `weight·(radius−d)²` is felt increasingly from 7→6→5→4yd (the
+            // same graduated shape as the reward), not just inside 4yd. The hard 4yd floor is the
+            // barrier's job; this makes the planned route bend away from a teammate ever more
+            // strongly as it closes in. Waived when both are in a box.
+            if !opponent && separation_floor_on {
+                let both_in_box =
+                    me_in_box && self.point_in_either_penalty_area(other.position);
+                if !both_in_box {
+                    radius = radius
+                        .max(SAME_TEAM_MIN_SEPARATION_YARDS + SAME_TEAM_SEPARATION_INFLUENCE_YARDS);
+                    weight *= SAME_TEAM_MPC_OBSTACLE_WEIGHT_GAIN;
+                }
+            }
             obstacles.push(PlanarObstacle {
                 center: [center.x, center.y],
                 velocity: [obstacle_velocity.x, obstacle_velocity.y],
-                radius: if opponent {
-                    opponent_radius
-                } else {
-                    teammate_radius
-                } + holder_bonus,
-                weight: if opponent {
-                    keepout_weight
-                } else {
-                    keepout_weight * 0.25
-                } * kinematic_weight,
+                radius,
+                weight,
             });
         }
 
@@ -22962,6 +23042,41 @@ pub(crate) fn off_ball_space_discipline_adjustment(
     adj
 }
 
+/// Pure forward-run-when-unmarked candidate bias (see [`dd_soccer_enable_forward_run_when_unmarked`]).
+///
+/// Encodes the principle "an OPEN, UNMARKED off-ball player in possession who CAN run forward into
+/// space must not elect a backward run — the team should move forward in possession":
+/// * `forward` — the candidate's forward offset (yards) from the player's current position in the
+///   attacking frame (`+` ahead, `-` behind);
+/// * `forward_space_available` — whether the (already-established) unmarked player has a genuine
+///   forward-into-space option; this is the ONLY enabling condition, so when it is false the bias is
+///   exactly `0.0` and play is byte-identical (a legitimate drop when everything ahead is covered is
+///   untouched, and the whole term is inert when the gate is off);
+/// * `candidate_into_open_space` — whether THIS candidate is itself a forward, unmarked, clear-lane
+///   destination (reinforced) rather than merely forward-but-covered.
+///
+/// Returns the additive score bias: a veto-strength penalty on a backward candidate that scales with
+/// how far back it is (so the least-backward option is the least bad if a drop is somehow forced), a
+/// bonus on a forward-into-space candidate, else `0.0`.
+pub(crate) fn forward_run_when_unmarked_bias(
+    forward: f64,
+    forward_space_available: bool,
+    candidate_into_open_space: bool,
+) -> f64 {
+    if !forward_space_available {
+        return 0.0;
+    }
+    if forward < -FORWARD_RUN_UNMARKED_DIR_EPS_YARDS {
+        -(FORWARD_RUN_UNMARKED_BACKWARD_PENALTY_BASE
+            + (-forward - FORWARD_RUN_UNMARKED_DIR_EPS_YARDS)
+                * FORWARD_RUN_UNMARKED_BACKWARD_PENALTY_PER_YARD)
+    } else if forward > FORWARD_RUN_UNMARKED_DIR_EPS_YARDS && candidate_into_open_space {
+        (forward / 12.0).clamp(0.0, 1.5) * FORWARD_RUN_UNMARKED_FORWARD_BONUS
+    } else {
+        0.0
+    }
+}
+
 fn open_space_score_from_distances_with_axis_pressure(
     opponent_distance: f64,
     teammate_crowding: f64,
@@ -23758,6 +23873,29 @@ fn dd_soccer_enable_off_ball_space_discipline() -> bool {
         use std::sync::OnceLock;
         static V: OnceLock<bool> = OnceLock::new();
         *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_OFF_BALL_SPACE_DISCIPLINE"))
+    }
+}
+/// Forward-run-when-unmarked (gated, default-ON = the desired behaviour; kill switch for A/B).
+/// Principle: when the team is in possession and this off-ball player is UNMARKED (no opponent
+/// within [`FORWARD_RUN_UNMARKED_MARK_RADIUS_YARDS`]) and CAN run forward into open space, he must
+/// not elect a BACKWARD run — the team should move forward in possession. When ON, `open_space_for`
+/// applies a veto-strength penalty to backward candidates (and a bonus to forward-into-space ones)
+/// for such a player, but ONLY when a forward-into-space option genuinely exists, so a legitimate
+/// drop to offer an outlet when everything ahead is covered is untouched. Set
+/// `DD_SOCCER_ENABLE_FORWARD_RUN_WHEN_UNMARKED=0` (or `false`/`no`/`off`) to restore the old
+/// weak-forward-bias scoring (byte-identical A/B).
+fn dd_soccer_enable_forward_run_when_unmarked() -> bool {
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_FORWARD_RUN_WHEN_UNMARKED").is_ok())
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_FORWARD_RUN_WHEN_UNMARKED"))
     }
 }
 /// One-two "give to feet" + bound wall-partner reception. ON by default: a one-two give is aimed
@@ -42483,6 +42621,18 @@ impl WorldSnapshot {
                 .min(legacy_max_width)
                 .max(min_width)
         };
+        // Never let the block tuck narrower than (≈) the four's own formation span — otherwise the
+        // fullbacks are pulled a full lane infield off their home channels and the flanks are gifted
+        // (the "back four ignore their lane" bug). `line` is sorted by home x, so first/last home x
+        // are the min/max of the line's formation span. This only ever WIDENS the block.
+        let desired_width = if back_four_formation_width_floor_enabled() {
+            let home_span = (line.last().map(|(_, _, h)| h.x).unwrap_or(0.0)
+                - line.first().map(|(_, _, h)| h.x).unwrap_or(0.0))
+            .max(0.0);
+            desired_width.max(home_span * BACK_FOUR_FORMATION_WIDTH_FLOOR_FRACTION)
+        } else {
+            desired_width
+        };
         let half = desired_width * 0.5;
         let center = center_seed.clamp(half, self.field_width - half);
         let slot_step = desired_width / (n - 1.0).max(1.0);
@@ -45183,6 +45333,44 @@ impl WorldSnapshot {
         resolve_attack_spacing_target(ctx, head)
     }
 
+    /// Does an OPEN forward-into-space option genuinely exist for this off-ball player? Probes
+    /// a few points ahead of the player (along its channel with a small lateral spread) and
+    /// returns true if any is a receivable, unmarked forward destination: forward of the
+    /// player, no opponent within [`FORWARD_RUN_UNMARKED_MARK_RADIUS_YARDS`] of the point, a
+    /// clear passing lane from the ball, and not offside. Gates the forward-run-when-unmarked
+    /// bias so a backward drop is only vetoed when forward space really is available (the
+    /// principle's "can run forward into space" precondition) — never when everything ahead is
+    /// covered and a drop to offer an outlet is legitimate.
+    pub(crate) fn forward_open_space_available(
+        &self,
+        me: &PlayerSnapshot,
+        me_position: Vec2,
+    ) -> bool {
+        let attack = me.team.attack_dir();
+        for depth in [8.0_f64, 15.0, 23.0] {
+            for lat in [-8.0_f64, 0.0, 8.0] {
+                let p = Vec2::new(me_position.x + lat, me_position.y + depth * attack)
+                    .clamp_to_pitch(self.field_width, self.field_length);
+                let forward = (p.y - me_position.y) * attack;
+                if forward < FORWARD_RUN_UNMARKED_DIR_EPS_YARDS {
+                    continue;
+                }
+                if self.nearest_opponent_distance_at(me.team, p)
+                    < FORWARD_RUN_UNMARKED_MARK_RADIUS_YARDS
+                {
+                    continue;
+                }
+                if self.open_space_offside_excess_yards_for_player(me.id, me.team, p) > 0.0 {
+                    continue;
+                }
+                if self.clear_line(self.ball.position, p, me.team.other(), 2.0) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub fn open_space_for(&self, player_id: usize, home: Vec2) -> Vec2 {
         let Some(me) = self.players.iter().find(|p| p.id == player_id) else {
             return home;
@@ -45343,6 +45531,20 @@ impl WorldSnapshot {
         // (byte-identical). Resolved once here — it depends on the player/team/ball state,
         // not the candidate point — so it is cheap.
         let attack_spacing_target = self.attack_spacing_target_for(me, me_position, width_shortage);
+        // Forward-run-when-unmarked (gated, default-on). If this off-ball player is UNMARKED
+        // (no opponent within the mark radius) AND a forward-into-space option genuinely
+        // exists, backward candidates are vetoed and forward-into-space ones rewarded below —
+        // the team should move forward in possession. Computed once here (depends on the
+        // player/ball, not the candidate). Gate off / marked / no forward space ⇒ the per-
+        // candidate bias is 0, byte-identical.
+        let me_unmarked_for_forward_run = possession
+            && self.ball.holder != Some(player_id)
+            && me.role != PlayerRole::Goalkeeper
+            && dd_soccer_enable_forward_run_when_unmarked()
+            && self.nearest_opponent_distance_at(me.team, me_position)
+                >= FORWARD_RUN_UNMARKED_MARK_RADIUS_YARDS;
+        let forward_run_space_available =
+            me_unmarked_for_forward_run && self.forward_open_space_available(me, me_position);
         for dx in [-22.0, -13.0, -6.0, 0.0, 6.0, 13.0, 22.0] {
             for dy in [-8.0, 0.0, 7.0, 14.0, 22.0, 30.0] {
                 let raw_p = Vec2::new(
@@ -45579,11 +45781,26 @@ impl WorldSnapshot {
                     carrier_position.distance(p),
                     current_to_carrier,
                 );
+                // Forward-run-when-unmarked bias (gated; 0.0 unless the player is unmarked and
+                // a forward-into-space option exists). An unmarked off-ball player who can go
+                // forward must not drift backward: veto backward candidates (scaled by how far
+                // back, so the least-backward is least bad), and reward a forward candidate that
+                // runs into open, receivable space. Pure scoring lives in
+                // `forward_run_when_unmarked_bias`.
+                let forward_run_bias = forward_run_when_unmarked_bias(
+                    forward,
+                    forward_run_space_available,
+                    forward > FORWARD_RUN_UNMARKED_DIR_EPS_YARDS
+                        && self.nearest_opponent_distance_at(me.team, p)
+                            >= FORWARD_RUN_UNMARKED_MARK_RADIUS_YARDS
+                        && self.clear_line(self.ball.position, p, me.team.other(), 2.0),
+                );
                 let score = occupancy.open_space_score
                     + counterattack_bonus
                     + advance_upfield_bonus
                     + goal_directness_bonus
                     + vacuum_run_bonus
+                    + forward_run_bias
                     + attacking_spacing_bonus
                     + forward.max(-4.0) * (0.04 + directive.risk_tolerance * 0.08)
                     + forward_from_ball.clamp(-6.0, 28.0)
@@ -48917,28 +49134,39 @@ impl WorldSnapshot {
             return centre_fwd;
         };
         let possession = self.controlled_possession_team();
+        let tighter = back_four_tighter_line_enabled();
         let (ideal_gap, push_gain) = if possession == Some(team) {
-            (
-                BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_IN_POSSESSION_YARDS,
-                0.50,
-            )
+            let gap = if tighter {
+                BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_IN_POSSESSION_TIGHT_YARDS
+            } else {
+                BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_IN_POSSESSION_YARDS
+            };
+            (gap, if tighter { 0.60 } else { 0.50 })
         } else if possession.is_none() {
-            (
-                BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_DISPOSSESSION_YARDS,
-                0.42,
-            )
+            let gap = if tighter {
+                BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_DISPOSSESSION_TIGHT_YARDS
+            } else {
+                BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_DISPOSSESSION_YARDS
+            };
+            (gap, if tighter { 0.50 } else { 0.42 })
         } else {
-            (
-                BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_DEFENDING_YARDS,
-                0.18,
-            )
+            let gap = if tighter {
+                BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_DEFENDING_TIGHT_YARDS
+            } else {
+                BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_DEFENDING_YARDS
+            };
+            (gap, if tighter { 0.24 } else { 0.18 })
+        };
+        let max_push = if tighter {
+            BACK_FOUR_FOREMOST_FOUR_ATTACKER_MAX_PUSH_TIGHT_YARDS
+        } else {
+            BACK_FOUR_FOREMOST_FOUR_ATTACKER_MAX_PUSH_YARDS
         };
         let attacker_gap = attackers_fwd - centre_fwd;
         if attacker_gap <= ideal_gap {
             return centre_fwd;
         }
-        let push = ((attacker_gap - ideal_gap) * push_gain)
-            .clamp(0.0, BACK_FOUR_FOREMOST_FOUR_ATTACKER_MAX_PUSH_YARDS);
+        let push = ((attacker_gap - ideal_gap) * push_gain).clamp(0.0, max_push);
         (centre_fwd + push).clamp(own_goal_fwd, own_goal_fwd + max_depth)
     }
 
@@ -49005,12 +49233,66 @@ impl WorldSnapshot {
         // theirs' possession-aware gap adjustment (in-possession / dispossession / defending
         // regimes), kept behind ours' `back_four_press_to_attackers_enabled` gate so it stays
         // toggleable + byte-identical when off. Only ever raises a too-deep centre toward them.
-        let centre_fwd = own_goal_fwd + centre_depth;
+        let mut centre_fwd = own_goal_fwd + centre_depth;
         if back_four_press_to_attackers_enabled() {
-            self.back_four_attacker_gap_adjusted_centre_fwd(team, centre_fwd, own_goal_fwd, max_depth)
-        } else {
-            centre_fwd
+            centre_fwd = self.back_four_attacker_gap_adjusted_centre_fwd(
+                team,
+                centre_fwd,
+                own_goal_fwd,
+                max_depth,
+            );
         }
+        // Ball-far offside-trap push-up: when the ball is far upfield and the line is still deep in
+        // our own half, step up to a high trap line (goalside of the deepest attacker). See
+        // `back_four_ball_far_push_up_centre_fwd`.
+        if back_four_ball_far_push_up_enabled() {
+            centre_fwd = self.back_four_ball_far_push_up_centre_fwd(
+                team, centre_fwd, own_goal_fwd, ball_depth, max_depth,
+            );
+        }
+        centre_fwd
+    }
+
+    /// Aggressive **ball-far offside-trap push-up** of the line centre (attack frame). When the
+    /// (predicted) ball is far upfield in the opponent half AND the current line centre still sits
+    /// more than [`BACK_FOUR_BALL_FAR_PUSH_UP_OWN_HALF_MARGIN_YARDS`] inside our own half, the four
+    /// step up to a high line: [`BACK_FOUR_BALL_FAR_PUSH_UP_TRAP_GAP_YARDS`] GOALSIDE of the
+    /// opponents' SINGLE most-advanced attacker (never ahead of him, so nobody is played in behind),
+    /// capped at the high-line ceiling and never below the incoming centre (push up only). Held off
+    /// while the opponent is in clear control — we do not push into a live counter. Off ⇒ unchanged.
+    fn back_four_ball_far_push_up_centre_fwd(
+        &self,
+        team: Team,
+        centre_fwd: f64,
+        own_goal_fwd: f64,
+        ball_depth: f64,
+        max_depth: f64,
+    ) -> f64 {
+        let half = self.field_length * 0.5;
+        // Ball must be far upfield (into the opponent half by a margin).
+        if ball_depth < half + BACK_FOUR_BALL_FAR_PUSH_UP_BALL_MARGIN_YARDS {
+            return centre_fwd;
+        }
+        // Do not push up into a counter we are already defending.
+        if self.controlled_possession_team() == Some(team.other()) {
+            return centre_fwd;
+        }
+        // Only when the line still sits more than 5yd inside our own half.
+        let centre_depth = centre_fwd - own_goal_fwd;
+        if centre_depth >= half - BACK_FOUR_BALL_FAR_PUSH_UP_OWN_HALF_MARGIN_YARDS {
+            return centre_fwd;
+        }
+        let ceiling = own_goal_fwd + max_depth;
+        // Reference the SINGLE most-advanced opponent (count 1), so the trap line stays goalside of
+        // the deepest attacker — never leaving anyone in behind. Fall back to (own half − margin).
+        let trap_fwd = match self.opponent_foremost_attackers_line_depth(team, 1) {
+            Some(deepest_depth) => {
+                own_goal_fwd + (deepest_depth - BACK_FOUR_BALL_FAR_PUSH_UP_TRAP_GAP_YARDS)
+            }
+            None => own_goal_fwd + (half - BACK_FOUR_BALL_FAR_PUSH_UP_OWN_HALF_MARGIN_YARDS),
+        };
+        // Push up only; never past the high-line ceiling.
+        centre_fwd.max(trap_fwd.min(ceiling))
     }
 
     /// Mean depth (yd from `team`'s own goal, in `team`'s attacking frame) of the opponent's
@@ -50075,19 +50357,65 @@ impl WorldSnapshot {
         let Some(me) = self.players.iter().find(|p| p.id == player_id) else {
             return home;
         };
-        if roam {
-            return target.clamp_to_pitch(self.field_width, self.field_length);
-        }
         let in_possession = self.possession_team() == Some(me.team);
+        let tighten = formation_hold_tighten_enabled();
+        if roam {
+            if !tighten {
+                return target.clamp_to_pitch(self.field_width, self.field_length);
+            }
+            // Formation-hold: even a roaming/support/press option is bounded to a generous role
+            // radius around home, so a player can range to press or support but never wanders to the
+            // far side of the pitch off the ball (the "nobody holds their position / everyone bunches"
+            // failure). Still far looser than the shape radius, so overlaps and runs stay free.
+            let roam_radius = match me.role {
+                PlayerRole::Goalkeeper => 12.0,
+                PlayerRole::Defender if self.is_wide_defender(me) => 30.0,
+                PlayerRole::Defender => 24.0,
+                PlayerRole::Midfielder => 30.0,
+                PlayerRole::Forward => 34.0,
+            };
+            let delta = target - home;
+            let bounded = if delta.len() <= roam_radius {
+                target
+            } else {
+                home + delta.normalized() * roam_radius
+            };
+            return bounded.clamp_to_pitch(self.field_width, self.field_length);
+        }
+        // Shape radii: how far a NON-roaming player may sit from its formation home. The
+        // in-possession values were loose enough (24yd ≈ 3.5 lanes) that the four/eleven drifted off
+        // formation and compressed; tightened so they hold their positions and keep the pitch spread.
         let radius = match me.role {
             PlayerRole::Goalkeeper => 7.0,
             PlayerRole::Defender if in_possession && self.is_wide_defender(me) => {
-                26.0 + self.wingback_extra_push_yards(me) * 0.38
+                if tighten {
+                    20.0 + self.wingback_extra_push_yards(me) * 0.30
+                } else {
+                    26.0 + self.wingback_extra_push_yards(me) * 0.38
+                }
             }
-            PlayerRole::Defender if in_possession => 24.0,
+            PlayerRole::Defender if in_possession => {
+                if tighten {
+                    18.0
+                } else {
+                    24.0
+                }
+            }
             PlayerRole::Defender => 13.0,
-            PlayerRole::Midfielder => 24.0,
-            PlayerRole::Forward => 20.0,
+            PlayerRole::Midfielder => {
+                if tighten {
+                    18.0
+                } else {
+                    24.0
+                }
+            }
+            PlayerRole::Forward => {
+                if tighten {
+                    18.0
+                } else {
+                    20.0
+                }
+            }
         };
         let delta = target - home;
         let mut bounded = if delta.len() <= radius {
