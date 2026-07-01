@@ -463,6 +463,12 @@ pub struct SoccerMatch {
     pub(crate) line_depth_samples: Vec<LineDepthSample>,
     /// Open line-depth decisions awaiting their windowed reward.
     pub(crate) pending_line_depth: Vec<PendingLineDepthDecision>,
+    /// Sticky back-four line-centre latch per team (Home=0, Away=1): the line centre held on the
+    /// sim-tick loop for ~[`BACK_FOUR_LINE_STICKY_ANCHOR_SECONDS`] so the four stop oscillating (the
+    /// "sine-wave"). `None` until first set / whenever the sticky anchor (or the v2 line) is gated
+    /// off. Maintained once per tick by [`Self::update_back_four_line_latch`]; read through the v2
+    /// line centre so both live line chokepoints target the same held line.
+    pub(crate) back_four_line_latch: [Option<BackFourLineLatch>; 2],
     /// The trained loose-ball commit head (which player attacks a loose ball), when
     /// present. Carried + trained across games by the learner; `None` ⇒ analytic
     /// seed. Shared into each [`WorldSnapshot`] via an `Arc` clone.
@@ -2929,6 +2935,7 @@ impl SoccerMatch {
             line_depth_head: None,
             line_depth_samples: Vec::new(),
             pending_line_depth: Vec::new(),
+            back_four_line_latch: [None, None],
             loose_ball_commit_head: None,
             attack_spacing_head: None,
             loose_ball_commit_samples: Vec::new(),
@@ -8033,6 +8040,10 @@ impl SoccerMatch {
         };
         let phase_started = Instant::now();
         let tick_start_snapshot = WorldSnapshot::from_match_for_learning(self);
+        // Sticky back-four line anchor: latch/hold the line centre on the sim-tick loop (re-pick on
+        // the ~3s tick window / possession flip / a deeper drop) BEFORE this tick's decisions read
+        // it, so the four stop oscillating. No-op + clears the latch when gated off (byte-identical).
+        self.update_back_four_line_latch(&tick_start_snapshot);
         pre_field_snapshot_elapsed += phase_started.elapsed();
         let ball_velocity_before = self.ball.velocity;
         let ball_acceleration_before = self.ball.acceleration;
@@ -13765,6 +13776,64 @@ impl SoccerMatch {
                                 )
                             };
                             let veto_on = terrible_pass_veto_enabled();
+                            // The reception race the two predicates above leave a gap for: a pass
+                            // to a tightly-marked receiver whose marker reaches the reception point
+                            // FIRST. `favours_opponent` only fires for a strictly-closer-than-
+                            // receiver mid-lane interceptor; `concedes` needs the marker inside the
+                            // concede radius AND real passer pressure. Neither catches a low-
+                            // completion ball whose interceptor sits just outside their triggers —
+                            // the "pass straight to the other team" the engine itself rates near-
+                            // zero completion yet still releases. Gated default-on; off ⇒ identical.
+                            let hopeless_on = hopeless_pass_veto_enabled();
+                            let loses_to_opponent = |point: Vec2| {
+                                hopeless_on
+                                    && snapshot.pass_reception_loses_to_opponent(
+                                        player_team,
+                                        receiver_position,
+                                        player_pos,
+                                        point,
+                                        speed,
+                                    )
+                            };
+                            // The decisive signal: the engine's OWN expected-completion for the
+                            // chosen pass — the same `pass_target_quality_for_snapshot` model the
+                            // option scorer and decision-trace use. The geometric vetoes only read
+                            // lane/marker geometry and miss a covered receiver / congested lane the
+                            // model rates a near-certain loss (observed live: passes released at
+                            // 2-5% completion straight to the opponent). Recompute it here at release
+                            // and abort the hopeless ball — re-aiming can't rescue a marked man, so
+                            // the carrier keeps possession and faces the intended run.
+                            let hopeless_completion = hopeless_on
+                                && match (
+                                    snapshot.players.iter().find(|p| p.id == player_id),
+                                    target_id.and_then(|tid| {
+                                        snapshot.players.iter().find(|p| p.id == tid)
+                                    }),
+                                ) {
+                                    (Some(passer), Some(target)) => {
+                                        pass_target_quality_for_snapshot(
+                                            &snapshot,
+                                            passer,
+                                            player_pos,
+                                            target,
+                                            receiver_position,
+                                            flight,
+                                        )
+                                        .expected_completion
+                                            < HOPELESS_PASS_COMPLETION_FLOOR
+                                    }
+                                    _ => false,
+                                };
+                            if hopeless_completion {
+                                let look = led_target - player_pos;
+                                if look.len() > 1e-6 {
+                                    let face = facing_bucket_from_vector(look);
+                                    if face != FacingBucket::Unknown {
+                                        self.players[player_id].action_facing = face;
+                                    }
+                                }
+                                return;
+                            }
                             let own_attack_dir = player_team.attack_dir();
                             // A long backward ball — especially an aerial hoof or one played under
                             // pressure — is a giveaway (10+ yds toward our own goal, often to nobody
@@ -13780,14 +13849,17 @@ impl SoccerMatch {
                                         || flight.is_aerial())
                             };
                             let unsafe_release = |point: Vec2| {
-                                concedes(point) || favours_opponent(point) || terrible_backward(point)
+                                concedes(point)
+                                    || favours_opponent(point)
+                                    || terrible_backward(point)
+                                    || loses_to_opponent(point)
                             };
                             if unsafe_release(aimed_target) {
                                 if !unsafe_release(receiver_position) {
                                     aimed_target = receiver_position;
                                 } else if !unsafe_release(led_target) {
                                     aimed_target = led_target;
-                                } else if favours_opponent(aimed_target) || veto_on {
+                                } else if favours_opponent(aimed_target) || veto_on || hopeless_on {
                                     // No safe release exists. Keep possession and face the intended
                                     // run instead of forcing the ball to an opponent / hoofing it
                                     // backward. With the veto on, abort on any residual danger; with
@@ -15297,7 +15369,13 @@ impl SoccerMatch {
             || recover_effort >= DEFENSIVE_RECOVERY_SPRINT_THRESHOLD;
         let previous_gait = self.players[player_id].movement_gait;
         let gait_held_seconds = self.players[player_id].locomotion.gait_held_seconds;
-        let gait = commit_gait(previous_gait, gait, gait_held_seconds, gait_emergency);
+        let gait = commit_gait(
+            previous_gait,
+            gait,
+            gait_held_seconds,
+            gait_emergency,
+            gait_step_limit_enabled(),
+        );
         // Cap the drop-back under a forward overhead ball to a walk: keep the back-pedal /
         // forward orientation but never exceed walking pace (effort tier 1).
         let gait = if forward_aerial_walk_back && gait.effort_tier() > 1 {
@@ -18216,7 +18294,28 @@ impl SoccerMatch {
                     .kickoff_own_half_position(team, Vec2::new(position.x + jx, position.y + jy));
             }
             if team != kickoff_team && position.distance(center) < radius + 0.5 {
-                position.y = half_line - team.attack_dir() * (radius + 1.0);
+                // Push the encroaching player RADIALLY out to the circle edge, preserving its
+                // bearing from the centre spot — instead of slamming every encroacher onto the
+                // SAME y-line (`half_line - attack_dir*(radius+1)`), which collapsed the midfield
+                // and forward lines onto one depth and stacked players who share an x-column
+                // (e.g. Away #6/#9 and #8/#10 ended up 0.4yd apart). Radial push keeps their
+                // distinct angular positions, so the lines stay separated; own-half clamp last.
+                let mut dx = position.x - center.x;
+                let mut dy = position.y - center.y;
+                let len = (dx * dx + dy * dy).sqrt();
+                if len < 1e-3 {
+                    // Degenerate: sitting exactly on the spot — push straight back into own half.
+                    dx = 0.0;
+                    dy = -team.attack_dir();
+                } else {
+                    dx /= len;
+                    dy /= len;
+                }
+                let edge = radius + 1.0;
+                position = self.kickoff_own_half_position(
+                    team,
+                    Vec2::new(center.x + dx * edge, center.y + dy * edge),
+                );
             }
             self.set_dead_ball_player_position(player_id, position);
         }
@@ -21451,6 +21550,11 @@ pub struct WorldSnapshot {
     /// decision aid; Default = None).
     #[serde(skip)]
     pub(crate) line_depth_head: Option<std::sync::Arc<BackFourLineHead>>,
+    /// Held back-four line-centre depth (yd from own goal) per team (Home=0, Away=1), copied from the
+    /// match's sticky latch so the live line chokepoint reads the LATCHED centre instead of
+    /// recomputing it every tick. `None` ⇒ compute fresh (sticky anchor off, or not yet set).
+    #[serde(skip)]
+    pub(crate) back_four_line_latch_centre_depth: [Option<f64>; 2],
     /// The trained pass-completion head, carried from the match for live consumption in
     /// `pass_target_quality_for_snapshot`. `None` ⇒ analytic completion estimate (parity).
     /// Skipped by serde (an internal decision aid; Default = None).
@@ -22473,6 +22577,27 @@ pub(crate) fn dd_soccer_enable_quick_forward_pass() -> bool {
         use std::sync::OnceLock;
         static V: OnceLock<bool> = OnceLock::new();
         *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_QUICK_FORWARD_PASS"))
+    }
+}
+
+/// Whether the scoop pass may fire on a **blocked-but-ideal lane** even when the carrier is NOT
+/// personally crowded (gate `DD_SOCCER_ENABLE_SCOOP_LANE_BLOCKED`, default-ON in prod / OFF under
+/// test). Originally `scoop_pass_target_for` only offered a scoop as an ESCAPE — it required ≥2
+/// opponents within 7yd of the passer. But the canonical case is "the lane to an open teammate is
+/// ideal yet ONE defender stands in it": the carrier has space, so the crowd gate suppressed it.
+/// When ON, the passer-crowd requirement becomes a *boost condition* rather than a hard gate — the
+/// per-target `defender_in_lane` + receiver-open checks still fully apply, so a scoop is only ever
+/// offered into a genuinely blocked lane to a genuinely open man. OFF ⇒ byte-identical (crowd-gated).
+pub(crate) fn dd_soccer_enable_scoop_lane_blocked() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_SCOOP_LANE_BLOCKED").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_SCOOP_LANE_BLOCKED"))
     }
 }
 
@@ -24019,6 +24144,10 @@ impl WorldSnapshot {
             ranked_floor_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             ranked_aerial_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             line_depth_head: m.line_depth_head.clone(),
+            back_four_line_latch_centre_depth: [
+                m.back_four_line_latch[0].map(|l| l.centre_depth),
+                m.back_four_line_latch[1].map(|l| l.centre_depth),
+            ],
             pass_completion_head: m.pass_completion_head.clone(),
             loose_ball_commit_head: m.loose_ball_commit_head.clone(),
             receive_approach_head: m.receive_approach_head.clone(),
@@ -25083,6 +25212,72 @@ impl WorldSnapshot {
             / (PASS_DIRECT_OPPONENT_AIM_HARD_VETO_MARGIN_YARDS * 2.0).max(1.0))
         .clamp(0.0, 1.0);
         (directness * control_fit * fast_bypass_relief).clamp(0.0, 1.0)
+    }
+
+    /// True when a pass to `pass_point` is, in effect, played straight to the other team: the
+    /// nearest opponent reaches the reception point — within its sprint+lunge reach by the time
+    /// the ball arrives — AND is *clearly closer* to it than the intended receiver. This is the
+    /// tightly-marked-receiver giveaway the user reports ("passes going straight to the other
+    /// team") that the two predicates above both leave a gap for:
+    /// [`Self::pass_point_direct_opponent_control_risk`] returns 0 unless an opponent is strictly
+    /// closer to the aim than the receiver on the MID-LANE; [`Self::pass_reception_conceded_to_opponent`]
+    /// needs the marker inside the concede radius *and* real passer pressure. A low-completion
+    /// ball whose interceptor sits just outside either trigger slips through — this margin-based
+    /// reception race closes it. Deliberately strict (the marker must beat the receiver to the
+    /// ball by `PASS_RECEPTION_LOSES_RECEIVER_MARGIN_YARDS`) so a brave pass to a half-open man,
+    /// or a 50/50 the receiver can contest, is left to the softer congestion penalty.
+    pub(crate) fn pass_reception_loses_to_opponent(
+        &self,
+        team: Team,
+        receiver_position: Vec2,
+        pass_origin: Vec2,
+        pass_point: Vec2,
+        ball_speed_yps: f64,
+    ) -> bool {
+        let Some((opponent_id, opponent_position, opponent_distance)) =
+            self.nearest_opponent_at(team, pass_point)
+        else {
+            return false;
+        };
+        if !opponent_distance.is_finite()
+            || opponent_distance > PASS_RECEPTION_CONGESTION_RADIUS_YARDS
+        {
+            return false;
+        }
+        let receiver_distance = receiver_position.distance(pass_point);
+        // Leave a genuinely open pass alone: only fire when the intended receiver does NOT clearly
+        // beat his marker to the reception point. If the receiver is materially nearer the point
+        // than the opponent (by the margin), he wins the ball — a brave pass to a half-open man,
+        // not a giveaway. The veto bites when the marker is level with, or nearer than, the
+        // receiver (including the ball-to-a-marked-man's-feet case, where receiver_distance ~ 0).
+        if !receiver_distance.is_finite()
+            || receiver_distance + PASS_RECEPTION_LOSES_RECEIVER_MARGIN_YARDS <= opponent_distance
+        {
+            return false;
+        }
+        // Reception race: can the opponent reach the arriving ball at the point? Reuse the shared
+        // lane-arrival + sprint-reach model so a slow/distant marker, or a ball driven past too
+        // fast to be cut out, does not trip it.
+        let speed = ball_speed_yps.max(REACTIVE_GROUND_PASS_MIN_SPEED_YPS);
+        let lane = pass_point - pass_origin;
+        let lane_len = lane.len();
+        let ball_arrival = if lane_len < 1e-3 {
+            0.0
+        } else {
+            let dir = lane * (1.0 / lane_len);
+            let along = (opponent_position - pass_origin).dot(dir).clamp(0.0, lane_len);
+            along / speed
+        };
+        let Some(opponent) = self.players.iter().find(|p| p.id == opponent_id) else {
+            return false;
+        };
+        let sprint_speed = (player_top_speed_yps(opponent.role, &opponent.skills)
+            * fatigue_speed_factor(opponent.skills.stamina, opponent.fatigue)
+            * MovementGait::Sprint.speed_multiplier())
+        .max(0.85);
+        let reaction_window = (ball_arrival - PASS_LANE_INTERCEPT_REACTION_SECONDS)
+            .clamp(0.0, PASS_LANE_INTERCEPT_MAX_WINDOW_SECONDS);
+        opponent_distance <= INTERCEPT_LUNGE_REACH_YARDS + sprint_speed * reaction_window
     }
 
     /// True when a ground/low pass to `pass_point` concedes the reception to an opponent:
@@ -30485,7 +30680,11 @@ impl WorldSnapshot {
             return None;
         }
         let me_pos = self.player_snapshot_position(me);
-        // The carrier must be relatively surrounded — a scoop is an escape from pressure.
+        // Originally the carrier had to be surrounded — a scoop was treated purely as an escape
+        // from pressure. With `DD_SOCCER_ENABLE_SCOOP_LANE_BLOCKED` (default-ON) the canonical case
+        // is also allowed: an IDEAL lane to an open teammate with one defender stood in it, even
+        // when the carrier himself has space. The per-target `defender_in_lane` + receiver-open
+        // checks below still gate every candidate, so the crowd test becomes advisory, not required.
         let crowd = self
             .players
             .iter()
@@ -30495,7 +30694,7 @@ impl WorldSnapshot {
                     <= SCOOP_PASS_PASSER_CROWD_RADIUS_YARDS
             })
             .count();
-        if crowd < SCOOP_PASS_PASSER_MIN_CROWD {
+        if crowd < SCOOP_PASS_PASSER_MIN_CROWD && !dd_soccer_enable_scoop_lane_blocked() {
             return None;
         }
         let facing = self
@@ -39353,6 +39552,72 @@ impl WorldSnapshot {
         self.is_among_closest_loose_ball_retrievers(player_id, target, contesters)
     }
 
+    /// True when `player_id` — one of our elected 1–2 loose-ball chasers — should
+    /// SPRINT to match the pace an opponent has committed to the same contest.
+    ///
+    /// The chase effort is "to a degree a function of how fast the nearest opponents
+    /// are moving": if an opponent is running/sprinting the loose ball down (its
+    /// closing speed onto the contest point clears
+    /// [`LOOSE_BALL_PACE_MATCH_OPPONENT_SPRINT_FRACTION`] of its own top speed and the
+    /// absolute [`LOOSE_BALL_PACE_MATCH_OPPONENT_MIN_CLOSING_YPS`] floor), the chaser
+    /// must sprint to keep up rather than jog and lose the 50/50. A strolling opponent
+    /// draws no forced sprint — distance still governs the gait then.
+    ///
+    /// Limited to committed chasers ([`Self::is_committed_loose_ball_chaser`]) so at
+    /// most the elected 1–2 keep up; the rest keep shape. `movement_target` is the
+    /// chaser's own recovery point (the caller has it in hand). Returns `false` without
+    /// scanning when the gate is off, keeping the default gait byte-identical.
+    pub(crate) fn loose_ball_opponent_pace_match_sprint(
+        &self,
+        player_id: usize,
+        movement_target: Vec2,
+    ) -> bool {
+        if !loose_ball_opponent_pace_match_enabled() {
+            return false;
+        }
+        if self.ball.holder.is_some() || self.active_set_play.is_some() {
+            return false;
+        }
+        let Some(me) = self.players.iter().find(|p| p.id == player_id) else {
+            return false;
+        };
+        if me.role == PlayerRole::Goalkeeper {
+            return false;
+        }
+        if self.player_snapshot_position(me).distance(movement_target)
+            <= LOOSE_BALL_PACE_MATCH_MIN_DISTANCE_YARDS
+        {
+            return false;
+        }
+        // Only our elected 1–2 chasers respond — the rest hold their support shape.
+        if !self.is_committed_loose_ball_chaser(player_id) {
+            return false;
+        }
+        // The contest point the opponents are racing toward (their lead point, not this
+        // chaser's own control-plan target).
+        let contest = self.loose_ball_contest_target_for(player_id);
+        self.players.iter().any(|opp| {
+            if opp.team == me.team || opp.role == PlayerRole::Goalkeeper {
+                return false;
+            }
+            let opp_pos = self.player_snapshot_position(opp);
+            let to_contest = contest - opp_pos;
+            let dist = to_contest.len();
+            if dist > LOOSE_BALL_PACE_MATCH_OPPONENT_RADIUS_YARDS || dist <= 1e-3 {
+                return false;
+            }
+            let closing = self
+                .player_velocity(opp.id)
+                .unwrap_or(opp.velocity)
+                .dot(to_contest * (1.0 / dist));
+            if closing < LOOSE_BALL_PACE_MATCH_OPPONENT_MIN_CLOSING_YPS {
+                return false;
+            }
+            let opp_top = player_top_speed_yps(opp.role, &opp.skills);
+            closing >= opp_top * LOOSE_BALL_PACE_MATCH_OPPONENT_SPRINT_FRACTION
+        })
+    }
+
     pub(crate) fn loose_ball_recovery_target_for(&self, player_id: usize) -> Vec2 {
         if self.active_rebound_for_player(player_id).is_some() {
             return self
@@ -40999,10 +41264,24 @@ impl WorldSnapshot {
         };
         let center_seed = raw_center * 0.55 + lp_center * 0.45;
         let defensive_shape = &tunables().defensive_shape;
-        let desired_width = defensive_shape
-            .back_four_block_width_yards
-            .min(defensive_shape.back_four_horizontal_max_gap_yards * (n - 1.0))
-            .max(defensive_shape.back_four_horizontal_min_gap_yards * (n - 1.0));
+        let adaptive_width = back_four_adaptive_width_enabled();
+        let desired_width = if adaptive_width {
+            // STATE-ADAPTIVE width: span to cover the opponent's foremost-attacker lateral spread
+            // (+ shoulder), so the four widen against a stretched attack and tuck against a central
+            // one — never the flat 22yd block that left the flanks open. Keep only the min-gap floor
+            // (defenders never on top of each other); the legacy narrow max-gap ceiling does NOT
+            // apply (we WANT gaps wider than 8yd). The helper carries its own floor/cap.
+            back_four_adaptive_width_yards(
+                self.back_four_foremost_attackers_x_span(me.team),
+                self.field_width,
+            )
+            .max(defensive_shape.back_four_horizontal_min_gap_yards * (n - 1.0))
+        } else {
+            defensive_shape
+                .back_four_block_width_yards
+                .min(defensive_shape.back_four_horizontal_max_gap_yards * (n - 1.0))
+                .max(defensive_shape.back_four_horizontal_min_gap_yards * (n - 1.0))
+        };
         let half = desired_width * 0.5;
         let center = center_seed.clamp(half, self.field_width - half);
         let slot_step = desired_width / (n - 1.0).max(1.0);
@@ -41020,10 +41299,17 @@ impl WorldSnapshot {
         let mpc_slot_x = current_x + (slot_x - current_x) * consistency_gain;
         let lateral_gain = (BACK_FOUR_LATERAL_GAIN * consistency_gain).clamp(0.25, 1.0);
         let proposed_x = target_x + (mpc_slot_x - target_x) * lateral_gain;
-        let legal_slack = ((slot_step - defensive_shape.back_four_horizontal_min_gap_yards)
-            .min(defensive_shape.back_four_horizontal_max_gap_yards - slot_step)
-            .max(0.0))
-            * 0.45;
+        let legal_slack = if adaptive_width {
+            // No narrow max-gap ceiling in adaptive mode (gaps are deliberately wider than the
+            // legacy 8yd cap); allow a lateral window proportional to the adaptive slot so a
+            // defender can still drift toward its man/zone instead of being pinned to an exact slot.
+            ((slot_step - defensive_shape.back_four_horizontal_min_gap_yards).max(0.0)) * 0.45
+        } else {
+            ((slot_step - defensive_shape.back_four_horizontal_min_gap_yards)
+                .min(defensive_shape.back_four_horizontal_max_gap_yards - slot_step)
+                .max(0.0))
+                * 0.45
+        };
         Some(
             proposed_x
                 .clamp(slot_x - legal_slack, slot_x + legal_slack)
@@ -42664,6 +42950,101 @@ impl WorldSnapshot {
         // Match the selected 2-3 runners to distinct zones left-to-right.
         let zone = zones[rank.min(zones.len() - 1)];
         let onside = self.clamp_forward_onside_support(player, zone);
+        if self.position_would_be_offside(player.team, onside) {
+            return None;
+        }
+        Some(onside.clamp_to_pitch(self.field_width, self.field_length))
+    }
+
+    /// Winger "stay wide vs pinch in" off-ball decision (see `winger_pinch.rs`). As the attack
+    /// reaches the opponent's final third, each wide attacker decides whether to hold his width
+    /// (deliver / overlap / switch outlet) or pinch infield to get on the end of a cross — into
+    /// the half-space (cut-back) or all the way to the back post. Returns the pinch target, or
+    /// `None` when the winger should keep his normal wide-outlet target (`StayWide`, or the
+    /// recogniser does not apply). Gated by [`winger_pinch_in_enabled`] (default-OFF under test
+    /// ⇒ byte-identical). Applied as an off-ball-target override *before* the late, committed
+    /// box-flood ([`Self::crash_the_box_target_for`]), which still takes precedence once the
+    /// cross is imminent.
+    pub(crate) fn winger_pinch_target_for(&self, player: &PlayerSnapshot) -> Option<Vec2> {
+        if !winger_pinch_in_enabled() || self.active_set_play.is_some() {
+            return None;
+        }
+        if self.possession_team() != Some(player.team)
+            || self.ball.holder == Some(player.id)
+            || player.controller_slot.is_some()
+            || !self.is_wide_attacker(player)
+        {
+            return None;
+        }
+        let attacked_goal_y = player.team.goal_y(self.field_length);
+        // Only a decision once the attack is in the opponent's final third.
+        if !ball_in_attacking_final_third(self.ball.position.y, attacked_goal_y, self.field_length) {
+            return None;
+        }
+        let dir = player.team.attack_dir();
+        let center_x = self.field_width * 0.5;
+        // The crossing position = where the delivery would come from: our carrier if we hold the
+        // ball, else the (in-flight) ball itself.
+        let crosser = self
+            .ball
+            .holder
+            .and_then(|h| self.players.iter().find(|p| p.id == h))
+            .filter(|p| p.team == player.team)
+            .map(|p| self.player_snapshot_position(p))
+            .unwrap_or(self.ball.position);
+        let my_side = (player.home_position.x - center_x).signum();
+        let ball_side = (crosser.x - center_x).signum();
+        let ball_on_my_flank = my_side != 0.0 && my_side == ball_side;
+        let crossing_position_on = flank_final_third_crash_box_geometry(
+            crosser,
+            attacked_goal_y,
+            self.field_width,
+            self.field_length,
+        );
+        let depth_frac =
+            final_third_depth_frac(self.ball.position.y, attacked_goal_y, self.field_length);
+        // Own attackers already inside the opponent box (excluding this winger and the carrier).
+        let box_congestion = self
+            .players
+            .iter()
+            .filter(|p| {
+                p.team == player.team
+                    && p.id != player.id
+                    && self.ball.holder != Some(p.id)
+                    && matches!(p.role, PlayerRole::Forward | PlayerRole::Midfielder)
+                    && self
+                        .point_in_own_penalty_area(player.team.other(), self.player_snapshot_position(p))
+            })
+            .count();
+        // Mask the back-post bucket when its arrival point would be offside.
+        let back_post_probe = winger_pinch_target(
+            WingerPinchChoice::PinchBackPost,
+            player.home_position.x,
+            attacked_goal_y,
+            dir,
+            self.field_width,
+            self.field_length,
+        );
+        let back_post_offside = back_post_probe
+            .map(|probe| self.position_would_be_offside(player.team, probe))
+            .unwrap_or(true);
+        let choice = decide_winger_pinch(
+            ball_on_my_flank,
+            crossing_position_on,
+            depth_frac,
+            box_congestion,
+            back_post_offside,
+        );
+        let target = winger_pinch_target(
+            choice,
+            player.home_position.x,
+            attacked_goal_y,
+            dir,
+            self.field_width,
+            self.field_length,
+        )?;
+        // Keep the pinch onside and refine for shape; drop it if it cannot be made legal.
+        let onside = self.clamp_forward_onside_support(player, target);
         if self.position_would_be_offside(player.team, onside) {
             return None;
         }
@@ -47069,6 +47450,36 @@ impl WorldSnapshot {
         Some(opponent_fwd_from_own_goal.iter().take(count).sum::<f64>() / count as f64)
     }
 
+    /// Lateral span (yd) of the opponent's foremost 4 attackers — the width the back four must
+    /// cover. Uses the SAME foremost-attacker selection (most-advanced toward our goal) as the line
+    /// DEPTH; feeds the state-adaptive back-four block width so the line widens to a stretched
+    /// attack and tucks against a central one rather than holding a fixed narrow block.
+    fn back_four_foremost_attackers_x_span(&self, team: Team) -> f64 {
+        let attack = team.attack_dir();
+        let mut opponents: Vec<(f64, f64)> = self
+            .players
+            .iter()
+            .filter(|player| player.team == team.other() && player.role != PlayerRole::Goalkeeper)
+            .map(|player| {
+                let position = self.player_snapshot_position(player);
+                (position.y * attack, position.x)
+            })
+            .filter(|(fwd, x)| fwd.is_finite() && x.is_finite())
+            .collect();
+        if opponents.len() < 2 {
+            return 0.0;
+        }
+        opponents.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let count = opponents.len().min(4);
+        let mut min_x = f64::INFINITY;
+        let mut max_x = f64::NEG_INFINITY;
+        for (_, x) in opponents.iter().take(count) {
+            min_x = min_x.min(*x);
+            max_x = max_x.max(*x);
+        }
+        (max_x - min_x).clamp(0.0, self.field_width.max(0.0))
+    }
+
     fn back_four_attacker_gap_adjusted_centre_fwd(
         &self,
         team: Team,
@@ -47113,7 +47524,28 @@ impl WorldSnapshot {
     /// foremost four attackers has become too stretched. Shared by both live
     /// line chokepoints so they agree on the centre.
     /// Leads the ball by the standard lookahead so a fast carrier pulls it early.
+    ///
+    /// **Sticky line anchor**: when [`back_four_line_sticky_anchor_enabled`] and a per-team latch is
+    /// present, this returns the LATCHED centre (held on the sim-tick loop for ~3s) rather than the
+    /// freshly recomputed one — that is what stops the four oscillating tick-to-tick (the "sine-wave").
+    /// The latch is maintained once per tick by [`Self::update_back_four_line_latch`] and re-picked on
+    /// the tick window / possession flip / a material deeper drop; off ⇒ the fresh per-tick centre.
     pub(crate) fn back_four_line_v2_centre_fwd(&self, team: Team) -> f64 {
+        if back_four_line_sticky_anchor_enabled() {
+            if let Some(centre_depth) = self.back_four_line_latch_centre_depth[team_index(team)] {
+                let attack = team.attack_dir();
+                let own_goal_fwd = self.own_goal_y_for(team) * attack;
+                return own_goal_fwd + centre_depth;
+            }
+        }
+        self.back_four_line_v2_centre_fwd_fresh(team)
+    }
+
+    /// The freshly recomputed v2 line-CENTRE forward-coordinate (attack frame), ignoring the sticky
+    /// latch. This is the per-tick "where the line should be right now" value: the sticky-anchor
+    /// updater samples it to decide whether to re-anchor, and it is the live centre when the sticky
+    /// anchor is gated off. See [`Self::back_four_line_v2_centre_fwd`] for the latched read.
+    pub(crate) fn back_four_line_v2_centre_fwd_fresh(&self, team: Team) -> f64 {
         let attack = team.attack_dir();
         let own_goal_fwd = self.own_goal_y_for(team) * attack;
         let predicted_fwd = self
@@ -48769,6 +49201,10 @@ impl WorldSnapshot {
         } else {
             proposed
         };
+        // Winger stay-wide vs pinch-in: in the final third the weak-side winger tucks toward the
+        // back post / half-space to get on the end of a cross (the ball-side winger holds width).
+        // Applied before the committed box-flood so the late crash-the-box still wins when it fires.
+        let chosen = self.winger_pinch_target_for(player).unwrap_or(chosen);
         // Crash the box: an attacker arriving for a wide team-mate's cross is pulled into its
         // assigned box zone, ahead of the generic shape target. Spacing/lane guards below
         // still refine it so the runners don't overlap.

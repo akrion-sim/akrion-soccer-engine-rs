@@ -9853,6 +9853,12 @@ impl PlayerAgent {
                 ));
                 if scoop_strategy_requested {
                     ensure_min_legal_option_probability(&mut action_options, "scoop-pass", 0.64);
+                } else if dd_soccer_enable_scoop_lane_blocked() {
+                    // Live-frequency bias: a scoop is only ever offered into a genuinely blocked
+                    // lane to an open man (every geometry check in `scoop_pass_target_for` passed),
+                    // so floor its propensity enough to compete with a carry / square ball instead
+                    // of being buried by the policy. Off ⇒ unchanged (technique-scored only).
+                    ensure_min_legal_option_probability(&mut action_options, "scoop-pass", 0.52);
                 }
             }
             let wall_pass_option = snapshot.wall_pass_option_for(self.id).map(|plan| {
@@ -12082,12 +12088,17 @@ impl PlayerAgent {
                     })
                     .map(|player| player.position.distance(movement_target))
                     .fold(f64::INFINITY, f64::min);
-                loose_ball_pressured_sprint = self.role != PlayerRole::Goalkeeper
+                loose_ball_pressured_sprint = (self.role != PlayerRole::Goalkeeper
                     && self.position.distance(movement_target)
                         > LOOSE_BALL_PRESSURED_SPRINT_MIN_DISTANCE_YARDS
                     && (fifty_fifty_duel
                         || nearest_opponent_to_ball
-                            <= LOOSE_BALL_PRESSURED_SPRINT_OPPONENT_RADIUS_YARDS);
+                            <= LOOSE_BALL_PRESSURED_SPRINT_OPPONENT_RADIUS_YARDS))
+                    // Match the opponent's committed pace: if a nearby opponent is
+                    // running/sprinting this ball down, our elected chaser sprints to
+                    // keep up even when the proximity gate above would not have fired.
+                    || snapshot
+                        .loose_ball_opponent_pace_match_sprint(self.id, movement_target);
                 (
                     SoccerAction::MoveTo(movement_target),
                     ACTION_LABEL_RECOVER.to_string(),

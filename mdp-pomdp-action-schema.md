@@ -152,6 +152,11 @@ feature encoder, so `FEATURE_DIM` is unchanged.
 | **shield level** | 1 light screen / 2 full shield / 3 back-to-goal hold-up | `ProtectBall` partial | graded retention |
 | body orientation | which side to screen / open up | facing exists | |
 
+> **Per-position decisions.** This document is the *shared* action space. For how it maps onto
+> the **eleven playing positions** — which decisions each position faces and where each lives in
+> code (e.g. the winger **stay-wide-vs-pinch-in** decision, `winger_pinch.rs`) — see
+> [`docs/position-decision-space.md`](docs/position-decision-space.md).
+
 ### 3.5–3.8 Remaining families — *proposed, pending sign-off*
 
 Same machinery (factored → mask → dither). Bucket counts tentative.

@@ -20012,6 +20012,137 @@ fn lane_cutter_steps_in_even_when_teammates_are_closer_to_the_lane_point() {
     }
 }
 
+/// Serialise the pace-match tests that toggle `DD_SOCCER_ENABLE_LOOSE_BALL_OPPONENT_PACE_MATCH`:
+/// the gate re-reads the env each call under `cfg(test)`, so two running concurrently would see
+/// each other's `set_var`. Holding this lock keeps each one's on/off window to itself.
+fn loose_ball_pace_match_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A loose ball sits 12yd from our lone (committed) chaser with NO opponent inside the
+/// old proximity sprint radius — so distance alone would have it jog. But an opponent is
+/// bearing down on the contest point at a genuine sprint: our chaser must match that pace
+/// and sprint. A still opponent, and the gate off, both leave it jogging (byte-identical).
+#[test]
+fn loose_ball_chaser_matches_a_sprinting_opponents_pace() {
+    let _env = loose_ball_pace_match_env_lock();
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 44,
+        ..Default::default()
+    });
+    let chaser = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .unwrap();
+    let opponent = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .unwrap();
+    park_players_except(&mut sim, &[chaser, opponent]);
+
+    // Loose, near-stationary ball; our chaser 12yd away is the strict-closest home man
+    // (all team-mates parked far away) ⇒ the committed retriever.
+    sim.ball.holder = None;
+    sim.ball.position = Vec2::new(40.0, 60.0);
+    sim.ball.velocity = Vec2::new(0.0, 1.0);
+    sim.ball.altitude_yards = 0.0;
+    sim.players[chaser].position = Vec2::new(40.0, 48.0);
+    sim.players[chaser].velocity = Vec2::zero();
+    // Opponent 14yd beyond the ball (outside the 10yd pressured-sprint radius) but
+    // sprinting straight back onto the contest point.
+    sim.players[opponent].position = Vec2::new(40.0, 74.0);
+    sim.players[opponent].velocity = Vec2::new(0.0, -9.5);
+
+    let snap = WorldSnapshot::from_match(&sim);
+    assert!(
+        snap.is_committed_loose_ball_chaser(chaser),
+        "the strict-closest home outfielder must be the committed chaser"
+    );
+    let target = snap.loose_ball_recovery_target_for(chaser);
+
+    // Gate ON ⇒ a sprinting opponent forces a pace-matched sprint.
+    std::env::set_var("DD_SOCCER_ENABLE_LOOSE_BALL_OPPONENT_PACE_MATCH", "1");
+    assert!(
+        snap.loose_ball_opponent_pace_match_sprint(chaser, target),
+        "our chaser must sprint to match an opponent sprinting the loose ball down"
+    );
+
+    // Gate OFF ⇒ byte-identical no-op even against the sprinting opponent.
+    std::env::set_var("DD_SOCCER_ENABLE_LOOSE_BALL_OPPONENT_PACE_MATCH", "0");
+    assert!(
+        !snap.loose_ball_opponent_pace_match_sprint(chaser, target),
+        "gate off must leave the chase gait untouched"
+    );
+    std::env::set_var("DD_SOCCER_ENABLE_LOOSE_BALL_OPPONENT_PACE_MATCH", "1");
+
+    // A still opponent draws no forced sprint — distance would govern the gait.
+    sim.players[opponent].velocity = Vec2::zero();
+    let still_snap = WorldSnapshot::from_match(&sim);
+    let still_target = still_snap.loose_ball_recovery_target_for(chaser);
+    assert!(
+        !still_snap.loose_ball_opponent_pace_match_sprint(chaser, still_target),
+        "a stationary opponent must not force a pace-matched sprint"
+    );
+    std::env::remove_var("DD_SOCCER_ENABLE_LOOSE_BALL_OPPONENT_PACE_MATCH");
+}
+
+/// Only the elected 1–2 chasers keep up: a team-mate who is NOT a committed chaser (a
+/// far team-mate holding shape) draws no pace-matched sprint even with a sprinting
+/// opponent on the ball, so the whole team does not collapse onto the 50/50.
+#[test]
+fn loose_ball_pace_match_is_limited_to_committed_chasers() {
+    let _env = loose_ball_pace_match_env_lock();
+    std::env::set_var("DD_SOCCER_ENABLE_LOOSE_BALL_OPPONENT_PACE_MATCH", "1");
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 45,
+        ..Default::default()
+    });
+    let home: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .collect();
+    let opponent = home[0];
+    let home: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .collect();
+    let (chaser, far_mate) = (home[0], home[1]);
+    park_players_except(&mut sim, &[chaser, far_mate, opponent]);
+
+    sim.ball.holder = None;
+    sim.ball.position = Vec2::new(40.0, 60.0);
+    sim.ball.velocity = Vec2::new(0.0, 1.0);
+    sim.ball.altitude_yards = 0.0;
+    sim.players[chaser].position = Vec2::new(40.0, 52.0);
+    // The other team-mate is far away — not among the closest chasers.
+    sim.players[far_mate].position = Vec2::new(10.0, 20.0);
+    sim.players[opponent].position = Vec2::new(40.0, 74.0);
+    sim.players[opponent].velocity = Vec2::new(0.0, -9.5);
+
+    let snap = WorldSnapshot::from_match(&sim);
+    let far_target = snap.loose_ball_recovery_target_for(far_mate);
+    assert!(
+        !snap.is_committed_loose_ball_chaser(far_mate),
+        "the far team-mate must not be a committed chaser (guards the test premise)"
+    );
+    assert!(
+        !snap.loose_ball_opponent_pace_match_sprint(far_mate, far_target),
+        "a team-mate holding shape must not be dragged into a pace-matched sprint"
+    );
+    std::env::remove_var("DD_SOCCER_ENABLE_LOOSE_BALL_OPPONENT_PACE_MATCH");
+}
+
 #[test]
 fn committed_loose_ball_chaser_attacks_ball_before_support_shape() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
@@ -89583,8 +89714,18 @@ fn weak_long_aerial_does_not_float_in_the_air() {
     }
 }
 
+/// Serialises the scoop tests that toggle `DD_SOCCER_ENABLE_SCOOP_LAND_AT_TARGET` against the
+/// ones that rely on its default (OFF under test), so their process-wide `set_var` windows never
+/// overlap and race.
+fn scoop_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[test]
 fn scoop_pass_is_low_and_snappy_not_a_balloon() {
+    let _env = scoop_env_lock();
+    std::env::remove_var("DD_SOCCER_ENABLE_SCOOP_LAND_AT_TARGET");
     let skills = SkillProfile {
         passing: 0.45,
         passing_completion_rate: 0.50,
@@ -89653,6 +89794,86 @@ fn scoop_pass_is_low_and_snappy_not_a_balloon() {
              covered {covered:.1}yd, end_speed {end_speed:.1} yps, launch {speed:.1} yps"
         );
     }
+}
+
+/// The "hot-air-balloon" fix: with `DD_SOCCER_ENABLE_SCOOP_LAND_AT_TARGET` on, a scoop is paced to
+/// LAND on the receiver in ~one gravity hang time instead of reaching the spot early and hovering.
+/// Two decouplings caused the float and both are asserted fixed here: (1) the apex the ball FLIES
+/// equals the apex its launch speed was PACED from (no random-vs-fixed mismatch); (2) short scoops
+/// are no longer force-floored to 16mph, so they don't cross the lane in a fraction of the hang time.
+#[test]
+fn scoop_land_at_target_kills_the_balloon_float() {
+    let _env = scoop_env_lock();
+    let skills = SkillProfile {
+        passing: 0.45,
+        passing_completion_rate: 0.50,
+        flair_passing: 0.55,
+        ..SkillProfile::default()
+    };
+    let from = Vec2::new(38.0, 48.0);
+    let skill = pass_execution_skill(&skills, PassFlight::Scoop, false);
+    for distance in [5.0_f64, 6.0, 7.0] {
+        let target = Vec2::new(38.0, 48.0 + distance);
+        let raw = pass_speed_yps_from_power(0.30, PassFlight::Scoop, false, &skills);
+
+        std::env::remove_var("DD_SOCCER_ENABLE_SCOOP_LAND_AT_TARGET");
+        let mut rng = SeededRandom::new(17);
+        let off_speed = modulated_pass_speed_yps(
+            raw, from, target, PassFlight::Scoop, false, skill, 0.70, &mut rng,
+        );
+
+        std::env::set_var("DD_SOCCER_ENABLE_SCOOP_LAND_AT_TARGET", "1");
+        let mut rng = SeededRandom::new(17);
+        let on_speed = modulated_pass_speed_yps(
+            raw, from, target, PassFlight::Scoop, false, skill, 0.70, &mut rng,
+        );
+
+        let pass = PendingPass {
+            team: Team::Home,
+            from: 4,
+            target: Some(9),
+            flight: PassFlight::Scoop,
+            is_cross: false,
+            launch_tick: 123,
+            origin: from,
+            intended_target: target,
+            distance_yards: distance,
+            receiver_openness: 0.70,
+            passer_skill: skill,
+            launch_speed_yps: on_speed,
+            receiver_position_at_launch: Some(target),
+            receiver_velocity_at_launch: Some(Vec2::zero()),
+            offside: None,
+            offside_candidates: Vec::new(),
+            learn_features: Vec::new(),
+        };
+
+        // (1) apex flown == apex the launch speed was paced from (unit 0.5, deterministic).
+        let flown_apex = pass_loft_apex_yards(&pass);
+        let paced_apex = scoop_loft_apex_yards(distance, 0.5);
+        assert!(
+            (flown_apex - paced_apex).abs() < 1e-9,
+            "flown apex {flown_apex:.3} must match paced apex {paced_apex:.3} for {distance:.0}yd"
+        );
+
+        // (2) the short scoop is no longer over-paced up to the fixed 16mph floor.
+        assert!(
+            on_speed < off_speed - 0.5,
+            "land-at-target should slow the over-paced short scoop: on {on_speed:.2} off {off_speed:.2} \
+             for {distance:.0}yd"
+        );
+
+        // (3) at that pace the ball spends most of its hang time getting there — it drops onto the
+        // man rather than arriving in a fraction of T and floating (the balloon).
+        let hang_time = 2.0 * (2.0 * flown_apex / GRAVITY_YPS2).sqrt();
+        let flight_time_const = distance / on_speed;
+        assert!(
+            flight_time_const >= hang_time * 0.55,
+            "scoop should not reach the spot in a fraction of its hang time (that is the float); \
+             got {flight_time_const:.2}s vs hang {hang_time:.2}s for {distance:.0}yd"
+        );
+    }
+    std::env::remove_var("DD_SOCCER_ENABLE_SCOOP_LAND_AT_TARGET");
 }
 
 #[test]

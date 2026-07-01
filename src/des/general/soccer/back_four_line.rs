@@ -91,6 +91,14 @@ const DEFENSIVE_LINE_WINGBACK_FORWARD_PRIORITY_ENABLE_ENV: &str =
 const BACK_FOUR_ATTACKER_PRESS_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_ATTACKER_PRESS";
 /// Env gate (default-ON) for the energy-conservation hold deadband on the v2 line target.
 const BACK_FOUR_LINE_HOLD_DEADBAND_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_LINE_HOLD_DEADBAND";
+/// Env kill switch (default-ON) for the **sticky line anchor**: the back-four line CENTRE is latched
+/// on the sim-tick loop and HELD for [`BACK_FOUR_LINE_STICKY_ANCHOR_SECONDS`] (re-picked only when
+/// that window of ticks elapses, possession flips, or the fresh ideal line drops materially deeper)
+/// instead of being recomputed every tick. Holding the centre steady is what removes the unrealistic
+/// "sine-wave" walk-stop-walk: defenders already on the latched line ARE the anchors and HOLD (stand
+/// / walk, conserve energy) while only the off-line defenders adapt to them. `=0` reverts to the
+/// per-tick recompute (byte-identical), and it is default-OFF under test so the parity suite holds.
+const BACK_FOUR_LINE_STICKY_ANCHOR_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_LINE_STICKY_ANCHOR";
 
 /// Comfortable resting gap (yd behind the ball) the CENTRAL defenders hold while defending
 /// under wingback-first priority. Decoupling the wingbacks from the line average removed the
@@ -155,11 +163,115 @@ pub const BACK_FOUR_FOREMOST_ATTACKERS_COUNT: usize = 4;
 /// so the deadband only ever leaves a defender a touch DEEPER than ideal (never plays a runner
 /// onside). Damps the cosmetic oscillation and saves the effort the wasted-energy penalty docks.
 pub const BACK_FOUR_LINE_HOLD_DEADBAND_YARDS: f64 = 2.0;
+
+/// How long (in SIM SECONDS — measured on the single-threaded sim-tick loop, never wall-clock) the
+/// back-four line centre is held latched before it is re-evaluated. ~3s: long enough that the line
+/// stops oscillating tick-to-tick (the "sine-wave"), short enough that it re-reads the game often.
+/// The caller converts this to a tick count via the sim `dt`, so it is framerate-independent.
+pub const BACK_FOUR_LINE_STICKY_ANCHOR_SECONDS: f64 = 3.0;
+/// The latched line re-anchors EARLY (before the [`BACK_FOUR_LINE_STICKY_ANCHOR_SECONDS`] window
+/// elapses) only when the freshly-computed ideal line has dropped at least this many yards DEEPER
+/// (toward our own goal) than the held centre — i.e. the threat grew, so the line drops promptly for
+/// safety rather than holding a too-high line. Stepping the line UP always waits for the window /
+/// possession flip, so the four never ratchet up-and-back every tick (that asymmetry is the
+/// sine-wave cure); smaller fluctuations either way are simply held.
+pub const BACK_FOUR_LINE_STICKY_REANCHOR_DROP_YARDS: f64 = 3.0;
+
+/// Latched back-four line centre, held on the sim-tick loop for ~[`BACK_FOUR_LINE_STICKY_ANCHOR_SECONDS`]
+/// so the line stops oscillating. `centre_depth` is yards from the team's OWN goal (mirror-invariant),
+/// so it reads the same regardless of which way the team attacks. Re-picked by
+/// [`back_four_line_sticky_should_repick`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BackFourLineLatch {
+    /// Held line-centre depth (yd from own goal).
+    pub centre_depth: f64,
+    /// Sim tick the latch was (re)set — expiry is measured in elapsed ticks, never wall-clock.
+    pub set_tick: u64,
+    /// Which team controlled the ball when the latch was set; a change re-picks immediately.
+    pub possession_at_set: Option<Team>,
+}
+
+/// Pure, RNG-free re-pick decision for the sticky line anchor. Re-evaluate the held centre when:
+/// possession has flipped (we won/lost the ball), OR the latch's tick window has elapsed
+/// (`ticks_held >= latch_ticks`), OR the fresh ideal line has dropped at least
+/// [`BACK_FOUR_LINE_STICKY_REANCHOR_DROP_YARDS`] DEEPER than the held centre (a growing threat drops
+/// the line promptly). Otherwise HOLD — and that hold is exactly what removes the sine-wave.
+/// `held_depth`/`fresh_depth` are yards-from-own-goal, so a DEEPER line is a SMALLER depth.
+pub fn back_four_line_sticky_should_repick(
+    held_depth: f64,
+    fresh_depth: f64,
+    ticks_held: u64,
+    latch_ticks: u64,
+    possession_flipped: bool,
+) -> bool {
+    possession_flipped
+        || ticks_held >= latch_ticks
+        || fresh_depth + BACK_FOUR_LINE_STICKY_REANCHOR_DROP_YARDS < held_depth
+}
 /// Per-yard weight of the attacker-compactness term folded into the line-depth RL reward when the
 /// attacker-press is on: each yard the back four sits behind the optimal gap to the foremost
 /// attackers docks the reward by this much, so the learned head prefers ball-gap fractions that
 /// keep the four compact with the attackers. Small relative to the territorial-advantage delta.
 pub const BACK_FOUR_ATTACKER_COMPACTNESS_REWARD_PER_YARD: f64 = 0.02;
+
+/// Env kill switch for the state-adaptive back-four block width (see
+/// [`back_four_adaptive_width_enabled`]).
+const BACK_FOUR_ADAPTIVE_WIDTH_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_ADAPTIVE_WIDTH";
+/// Shoulder margin (yd) the state-adaptive back-four width adds beyond the widest foremost attacker
+/// on each side, so the line COVERS the man rather than sitting level with him. See
+/// [`back_four_adaptive_width_yards`].
+pub const BACK_FOUR_ADAPTIVE_WIDTH_SHOULDER_MARGIN_YARDS: f64 = 6.0;
+/// Floor (yd) on the state-adaptive back-four width — even against a bunched central attack the
+/// four keep this much spread, so they never collapse onto the centre (the old fixed 22yd block
+/// that left both flanks open). Comfortably wider than that legacy block.
+pub const BACK_FOUR_ADAPTIVE_WIDTH_MIN_YARDS: f64 = 34.0;
+/// Ceiling on the state-adaptive back-four width as a fraction of pitch width, so even against a
+/// touchline-to-touchline attack the four keep some central compactness rather than splitting fully
+/// to the flanks and gifting the middle.
+pub const BACK_FOUR_ADAPTIVE_WIDTH_MAX_FIELD_FRACTION: f64 = 0.74;
+
+/// Whether the back four spans a STATE-ADAPTIVE block width — sized to cover the opponent's
+/// foremost-attacker lateral spread (+ a shoulder each side), floored and capped — instead of the
+/// fixed narrow `defensive_shape.back_four_block_width_yards` (22yd) block that left the flanks
+/// open. The width RESPONDS to the attack (wide vs a stretched front, tucked vs a central one)
+/// rather than being a forced constant — the same shape the line DEPTH already takes from an
+/// adaptive analytic seed live. Legacy fixed block is the off-state. Default-ON in production (kill
+/// switch `DD_SOCCER_ENABLE_BACK_FOUR_ADAPTIVE_WIDTH=0`); default-OFF under test so the
+/// defensive-shape parity suite stays byte-identical.
+pub fn back_four_adaptive_width_enabled() -> bool {
+    #[cfg(test)]
+    {
+        env_flag_enabled(BACK_FOUR_ADAPTIVE_WIDTH_ENABLE_ENV)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| gate_default_on(BACK_FOUR_ADAPTIVE_WIDTH_ENABLE_ENV))
+    }
+}
+
+/// State-adaptive back-four block width (yd): cover the opponent's foremost-attacker lateral
+/// `attackers_x_span` plus a [`BACK_FOUR_ADAPTIVE_WIDTH_SHOULDER_MARGIN_YARDS`] shoulder each side,
+/// floored at [`BACK_FOUR_ADAPTIVE_WIDTH_MIN_YARDS`] and capped at
+/// [`BACK_FOUR_ADAPTIVE_WIDTH_MAX_FIELD_FRACTION`] of the pitch. Pure + unit-tested so the band is
+/// verifiable independent of the world wiring; non-finite inputs fall back to safe defaults.
+pub fn back_four_adaptive_width_yards(attackers_x_span: f64, field_width: f64) -> f64 {
+    let span = if attackers_x_span.is_finite() {
+        attackers_x_span.max(0.0)
+    } else {
+        0.0
+    };
+    let field = if field_width.is_finite() && field_width > 0.0 {
+        field_width
+    } else {
+        80.0
+    };
+    let ceiling = (field * BACK_FOUR_ADAPTIVE_WIDTH_MAX_FIELD_FRACTION)
+        .max(BACK_FOUR_ADAPTIVE_WIDTH_MIN_YARDS);
+    (span + 2.0 * BACK_FOUR_ADAPTIVE_WIDTH_SHOULDER_MARGIN_YARDS)
+        .clamp(BACK_FOUR_ADAPTIVE_WIDTH_MIN_YARDS, ceiling)
+}
 
 fn env_flag_enabled(name: &str) -> bool {
     std::env::var(name)
@@ -256,6 +368,23 @@ pub fn back_four_line_hold_deadband_enabled() -> bool {
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| gate_default_on(BACK_FOUR_LINE_HOLD_DEADBAND_ENABLE_ENV))
+    }
+}
+
+/// Whether the **sticky line anchor** holds the back-four line centre latched on the sim-tick loop
+/// this process (see [`BackFourLineLatch`]). Default-ON in production (kill switch
+/// `DD_SOCCER_ENABLE_BACK_FOUR_LINE_STICKY_ANCHOR=0` reverts to per-tick recompute); default-OFF
+/// under test so the line-depth parity suite stays byte-identical.
+pub fn back_four_line_sticky_anchor_enabled() -> bool {
+    #[cfg(test)]
+    {
+        env_flag_enabled(BACK_FOUR_LINE_STICKY_ANCHOR_ENABLE_ENV)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| gate_default_on(BACK_FOUR_LINE_STICKY_ANCHOR_ENABLE_ENV))
     }
 }
 
@@ -1032,6 +1161,54 @@ impl WorldSnapshot {
 }
 
 impl SoccerMatch {
+    /// Maintain the per-team **sticky back-four line-centre latch** on the sim-tick loop (never
+    /// wall-clock): hold the line centre for ~[`BACK_FOUR_LINE_STICKY_ANCHOR_SECONDS`], re-picking
+    /// when that window of ticks elapses, possession flips, or the fresh ideal line drops materially
+    /// deeper (a growing threat — [`back_four_line_sticky_should_repick`]). Holding the centre steady
+    /// is what removes the "sine-wave": defenders already on the latched line hold (conserve energy)
+    /// and only off-line defenders adapt. Called once per tick off the tick-start `snapshot`. Clears
+    /// the latch (⇒ fresh per-tick recompute, byte-identical) when the sticky anchor or the v2 line
+    /// is gated off, so an unconfigured / test process is unaffected.
+    pub(crate) fn update_back_four_line_latch(&mut self, snapshot: &WorldSnapshot) {
+        if !back_four_line_sticky_anchor_enabled() || !back_four_line_depth_v2_enabled() {
+            self.back_four_line_latch = [None, None];
+            return;
+        }
+        // Convert the hold window from sim seconds to ticks via the sim dt (framerate-independent).
+        let latch_ticks = (BACK_FOUR_LINE_STICKY_ANCHOR_SECONDS
+            / self.config.dt_seconds.max(1e-6))
+        .round()
+        .max(1.0) as u64;
+        let controlled = snapshot.controlled_possession_team();
+        let tick = self.tick;
+        for team in [Team::Home, Team::Away] {
+            let idx = team_index(team);
+            let attack = team.attack_dir();
+            let own_goal_fwd = snapshot.own_goal_y_for(team) * attack;
+            let fresh_depth = snapshot.back_four_line_v2_centre_fwd_fresh(team) - own_goal_fwd;
+            if !fresh_depth.is_finite() {
+                continue;
+            }
+            let repick = match self.back_four_line_latch[idx] {
+                None => true,
+                Some(latch) => back_four_line_sticky_should_repick(
+                    latch.centre_depth,
+                    fresh_depth,
+                    tick.saturating_sub(latch.set_tick),
+                    latch_ticks,
+                    controlled != latch.possession_at_set,
+                ),
+            };
+            if repick {
+                self.back_four_line_latch[idx] = Some(BackFourLineLatch {
+                    centre_depth: fresh_depth,
+                    set_tick: tick,
+                    possession_at_set: controlled,
+                });
+            }
+        }
+    }
+
     /// Gated per-tick RL sample collection for the line-depth heads (Gap 5), driven
     /// off the already-built per-tick learning `snapshot`. A **no-op** (zero cost,
     /// byte-identical) unless a line-depth model is enabled, so the default learner
@@ -1172,6 +1349,28 @@ mod back_four_line_tests {
     fn analytic_fraction_is_a_valid_gap() {
         let g = analytic_line_centre_gap_fraction(&baseline_inputs());
         assert!((0.0..=1.0).contains(&g), "gap fraction {g} out of [0,1]");
+    }
+
+    #[test]
+    fn adaptive_width_covers_attack_span_within_floor_and_cap() {
+        let fw = 80.0;
+        // A central, bunched attack still gets the floor width — never the old narrow block.
+        let bunched = back_four_adaptive_width_yards(8.0, fw);
+        assert_eq!(bunched, BACK_FOUR_ADAPTIVE_WIDTH_MIN_YARDS);
+        // A moderately spread attack is covered: span + two shoulders.
+        let mid = back_four_adaptive_width_yards(30.0, fw);
+        assert!(
+            (mid - (30.0 + 2.0 * BACK_FOUR_ADAPTIVE_WIDTH_SHOULDER_MARGIN_YARDS)).abs() < 1e-9
+        );
+        // ...and materially wider than the legacy fixed 22yd block.
+        assert!(mid > 22.0);
+        // A touchline-to-touchline attack is capped below full pitch width (keep central compactness).
+        let wide = back_four_adaptive_width_yards(78.0, fw);
+        assert!(wide <= fw * BACK_FOUR_ADAPTIVE_WIDTH_MAX_FIELD_FRACTION + 1e-9);
+        assert!(wide < fw);
+        // Non-finite inputs fall back safely to an in-band width.
+        let degenerate = back_four_adaptive_width_yards(f64::NAN, f64::NAN);
+        assert!(degenerate.is_finite() && degenerate >= BACK_FOUR_ADAPTIVE_WIDTH_MIN_YARDS);
     }
 
     #[test]
@@ -1437,6 +1636,34 @@ mod back_four_line_tests {
             (back_four_line_hold_target_fwd(27.0, 27.0 + db * 0.5, Some(40.0), db) - 27.0).abs()
                 < 1e-9
         );
+    }
+
+    #[test]
+    fn sticky_anchor_holds_then_repicks_on_window_flip_or_deep_drop() {
+        let latch_ticks = 45; // ~3s at 15tps
+        // Held steady: small fluctuation, same possession, window not elapsed ⇒ HOLD.
+        assert!(!back_four_line_sticky_should_repick(20.0, 21.5, 10, latch_ticks, false));
+        // The ideal line stepping UP (larger depth-from-goal) is held, never re-picked early —
+        // this is the asymmetry that kills the sine-wave's up-and-back ratchet.
+        assert!(!back_four_line_sticky_should_repick(
+            20.0,
+            20.0 + BACK_FOUR_LINE_STICKY_REANCHOR_DROP_YARDS + 5.0,
+            10,
+            latch_ticks,
+            false
+        ));
+        // Window elapsed ⇒ re-pick.
+        assert!(back_four_line_sticky_should_repick(20.0, 20.0, latch_ticks, latch_ticks, false));
+        // Possession flipped ⇒ re-pick immediately.
+        assert!(back_four_line_sticky_should_repick(20.0, 20.0, 1, latch_ticks, true));
+        // Fresh line dropped materially DEEPER (smaller depth) ⇒ re-pick promptly for safety.
+        assert!(back_four_line_sticky_should_repick(
+            20.0,
+            20.0 - BACK_FOUR_LINE_STICKY_REANCHOR_DROP_YARDS - 0.5,
+            1,
+            latch_ticks,
+            false
+        ));
     }
 
     #[test]

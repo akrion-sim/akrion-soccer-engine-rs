@@ -89,6 +89,8 @@ mod reward_shaping;
 pub use reward_shaping::*;
 mod crash_box;
 pub(crate) use crash_box::*;
+mod winger_pinch;
+pub(crate) use winger_pinch::*;
 mod field_numbers;
 pub use field_numbers::*;
 mod goal_side;
@@ -1012,6 +1014,14 @@ const AERIAL_LAND_AT_TARGET_DRAG_COMP: f64 = 1.08;
 // down promptly instead of looping (the user's "scoop goes too high / hangs too long" report).
 const SCOOP_LOFT_APEX_MIN_YARDS: f64 = 2.0; // 6ft — clears a standing foot
 const SCOOP_LOFT_APEX_MAX_YARDS: f64 = 3.0; // 9ft — drops back down promptly, no balloon
+// Raised scoop apex window (gate `DD_SOCCER_ENABLE_SCOOP_HIGHER_APEX`, default-ON in prod /
+// OFF under test). A 6-9ft dink clips a standing foot but can be HEADED/blocked by an upright or
+// jumping defender stood in the lane — the user's "scoop should go ~10-13ft OVER the opponent".
+// Hang time grows with apex (T = 2·√(2·apex/g)), but across the short 5-12yd scoop range the
+// horizontal speed needed to land on the receiver stays well under `SCOOP_MAX_SPEED_MPH`, so the
+// ball lifts cleanly over the blocker and drops promptly rather than ballooning into a hang.
+const SCOOP_LOFT_APEX_HIGH_MIN_YARDS: f64 = 3.05; // ~10ft — clears an upright/jumping defender
+const SCOOP_LOFT_APEX_HIGH_MAX_YARDS: f64 = 4.30; // ~13ft — still drops promptly over a 5-12yd chip
 const SCOOP_LAND_AT_TARGET_DRAG_COMP: f64 = 1.20;
 const SCOOP_MIN_SPEED_MPH: f64 = 16.0;
 const SCOOP_MAX_SPEED_MPH: f64 = 38.0;
@@ -1434,6 +1444,17 @@ const PASS_RECEPTION_OPPONENT_TIME_MARGIN: f64 = 0.95;
 // Release-time safety net: if endpoint noise/MPC lead would aim a floor pass this much
 // closer to an opponent than the intended teammate, pull it back toward the teammate/lead.
 const PASS_RELEASE_OPPONENT_AIM_BUFFER_YARDS: f64 = 0.35;
+// Hopeless-pass veto (`pass_reception_loses_to_opponent`): the nearest opponent must beat the
+// intended receiver to the reception point by at least this margin for the release to count as a
+// straight giveaway. Keeps a 50/50 ball the receiver can contest from tripping the veto.
+const PASS_RECEPTION_LOSES_RECEIVER_MARGIN_YARDS: f64 = 1.5;
+// Hopeless-pass veto (completion model): at release, a chosen pass whose `expected_completion`
+// (the same `pass_target_quality_for_snapshot` model the option scorer / decision-trace uses) is
+// below this floor is aborted — the carrier keeps the ball rather than gift a near-certain
+// interception. Set well below the ~0.69 median of completed passes so only the clearly-doomed
+// ball (a covered receiver / blocked lane the model rates <25%) is vetoed, leaving brave threaded
+// passes alone. Tune via A/B against giveaway-rate vs completion-rate.
+const HOPELESS_PASS_COMPLETION_FLOOR: f64 = 0.15;
 // Selection-time counterpart to the release guard: a led floor-pass point that is
 // materially nearer an opponent than the teammate is a likely direct giveaway.
 const PASS_DIRECT_OPPONENT_AIM_HARD_VETO_MARGIN_YARDS: f64 = 2.0;
@@ -3458,6 +3479,24 @@ const LOOSE_BALL_PEEL_LATERAL_YARDS: f64 = 7.0;
 // it back rather than jogging. Only the chase gait changes — still a soft cue.
 const LOOSE_BALL_PRESSURED_SPRINT_MIN_DISTANCE_YARDS: f64 = 2.0;
 const LOOSE_BALL_PRESSURED_SPRINT_OPPONENT_RADIUS_YARDS: f64 = 10.0;
+// "Match the opponent's pace to a loose ball": the effort a chaser puts into a 50/50
+// is not just a function of distance — it responds to how hard the nearest OPPONENTS
+// are running the ball down. If an opponent has committed to a sprint at the contest
+// point, our elected 1–2 chasers must sprint to keep up rather than jog and lose the
+// race; a strolling opponent draws no such response (distance still governs then).
+// An opponent counts as "sprinting at it" when its closing speed toward the contest
+// point is at least this fraction of its own top speed (run pace ≈ 0.90×top, sprint
+// ≈ 1.12×top, so 0.80 captures a genuine run/sprint with a little angle tolerance
+// while excluding a jog ≈ 0.62×top)…
+const LOOSE_BALL_PACE_MATCH_OPPONENT_SPRINT_FRACTION: f64 = 0.80;
+// …AND its closing speed clears this absolute floor (yps), so a low-top-speed player
+// drifting onto the ball never trips the match.
+const LOOSE_BALL_PACE_MATCH_OPPONENT_MIN_CLOSING_YPS: f64 = 5.5;
+// Only opponents within this of the contest point are genuinely IN the race — a
+// sprinter 30yd away is not a reason to burn a chaser's reserve.
+const LOOSE_BALL_PACE_MATCH_OPPONENT_RADIUS_YARDS: f64 = 16.0;
+// No point matching pace when we are essentially already on the ball.
+const LOOSE_BALL_PACE_MATCH_MIN_DISTANCE_YARDS: f64 = 1.5;
 // Ball played IN BEHIND the back line (a through-ball goalside of our 2nd-to-last defender):
 // the back line must turn and recover. Counts as "in behind" once the ball is this far past
 // the 2nd-to-last defender, and only while it is within _MAX_FROM_GOAL of our own goal (a ball
@@ -13424,6 +13463,91 @@ pub(crate) fn attack_ambition_enabled() -> bool {
     !*V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_ATTACK_AMBITION").is_ok())
 }
 
+/// Whether the **loose-ball opponent-pace match** is active this process: an elected
+/// 1–2 chaser sprints for a loose ball when the nearest opponent has committed a
+/// run/sprint at the contest point, keeping the 50/50 a real race rather than jogging
+/// and conceding it. **Default-ON in production**
+/// (`DD_SOCCER_ENABLE_LOOSE_BALL_OPPONENT_PACE_MATCH=0/false/no/off` is the kill
+/// switch), read once. **Default-OFF under test** so the loose-ball gait/parity suites
+/// stay byte-identical unless a test opts in. Only the chase gait is affected — who is
+/// elected to chase, and where they run, is unchanged.
+pub(crate) fn loose_ball_opponent_pace_match_enabled() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_LOOSE_BALL_OPPONENT_PACE_MATCH")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_LOOSE_BALL_OPPONENT_PACE_MATCH"))
+    }
+}
+
+/// Whether the **raised scoop apex** is active this process: a blocked-lane scoop chips ~10-13ft
+/// (`SCOOP_LOFT_APEX_HIGH_*`) instead of 6-9ft so it clears an upright/jumping defender stood in
+/// the lane, not just a standing foot. **Default-ON in production**
+/// (`DD_SOCCER_ENABLE_SCOOP_HIGHER_APEX=0/false/no/off` is the kill switch), read once. **Default-OFF
+/// under test** so the loft-arc / interception parity suites stay byte-identical unless a test opts in.
+pub(crate) fn scoop_higher_apex_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_SCOOP_HIGHER_APEX")
+            .map(|raw| {
+                let v = raw.trim().to_ascii_lowercase();
+                matches!(v.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_SCOOP_HIGHER_APEX"))
+    }
+}
+
+/// Whether the **scoop land-on-the-receiver physics fix** is active (gate
+/// `DD_SOCCER_ENABLE_SCOOP_LAND_AT_TARGET`, default-ON prod / OFF test). Fixes the "hot-air-balloon"
+/// float — a scoop that reaches the receiver's spot then HANGS in the air descending instead of
+/// obeying gravity. Two decouplings caused it: (1) the launch speed was paced from a FIXED apex
+/// (unit 0.5) while the in-flight altitude clock flew a RANDOM apex, so the gravity hang time the
+/// ball actually flew differed from the one its pace was calibrated for; (2) the fixed 16mph
+/// min-speed floor over-paced SHORT scoops, landing them at the receiver's spot in a fraction of
+/// the hang time. When ON, the scoop apex is deterministic (unit 0.5 — pace and flight agree) and
+/// the speed floor is capped at the land-at-target pace, so the chip arrives in ~one hang time and
+/// DROPS onto the man. OFF ⇒ byte-identical (random apex + fixed floor).
+pub(crate) fn scoop_land_at_target_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_SCOOP_LAND_AT_TARGET")
+            .map(|raw| {
+                let v = raw.trim().to_ascii_lowercase();
+                matches!(v.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_SCOOP_LAND_AT_TARGET"))
+    }
+}
+
+/// The per-pass apex "unit" (0..1) for a scoop's loft, given its launch seed. Without the
+/// land-at-target fix this is hashed off `launch_tick`/`from` for cosmetic variation; WITH the fix
+/// it collapses to a deterministic 0.5 so the apex the ball flies matches the apex its launch speed
+/// was paced from (see `scoop_land_at_target_enabled`). Shared by the live-flight and snapshot apex
+/// readers so they never disagree.
+fn scoop_apex_unit(launch_tick: u64, from_id: usize) -> f64 {
+    if scoop_land_at_target_enabled() {
+        return 0.5;
+    }
+    let seed = launch_tick.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (from_id as u64).wrapping_shl(17);
+    ((seed >> 40) & 0xFFFF) as f64 / 65535.0
+}
+
 /// Whether the **moderate give-and-go live-frequency bump** is active this process: a modest
 /// extra widening of the wall-pass trigger zone and a lift on the carrier's appetite to combine,
 /// so more one-twos actually appear in live play. **Default-ON in production**
@@ -19226,6 +19350,29 @@ pub(crate) fn carrier_forward_drive_enabled() -> bool {
     }
 }
 
+/// Whether the **gait step-limit** is active this process. A body has inertia: it cannot
+/// teleport across locomotor gears in a single tick (sprint→walk, run→walk). With this
+/// on, once the gait-commitment dwell is satisfied an effort-tier change is taken ONE
+/// step at a time — a multi-gear change walks through its intermediate gaits, one per
+/// dwell — so the displayed gait and the acceleration-limited body shed (or build) speed
+/// together across several ticks instead of the label snapping ahead of the legs. The
+/// emergency / standing-start / pull-up-to-a-stop bypasses in [`commit_gait`] are
+/// unaffected (those are decisive single acts, not the mid-gear oscillation this damps).
+/// Default-ON in production (env `DD_SOCCER_ENABLE_GAIT_STEP_LIMIT=0/false` is the kill
+/// switch); default-OFF under test so the movement-parity suite stays byte-identical.
+pub(crate) fn gait_step_limit_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_GAIT_STEP_LIMIT").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_GAIT_STEP_LIMIT"))
+    }
+}
+
 /// Whether the **MPC pass-weight solver** is active this process. For a ground pass to a receiver
 /// it solves the EXACT launch speed that lands the decelerating ball on the aim point as the
 /// receiver's predicted run arrives there — so pass weight is physically timed to the receiver, not
@@ -19394,6 +19541,42 @@ pub(crate) fn terrible_pass_veto_enabled() -> bool {
         use std::sync::OnceLock;
         static V: OnceLock<bool> = OnceLock::new();
         *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_TERRIBLE_PASS_VETO"))
+    }
+}
+
+/// Gate for the hopeless-completion pass veto (`pass_reception_loses_to_opponent`). When a pass is
+/// effectively played straight to the other team — the nearest opponent reaches the reception point
+/// clearly before the intended receiver — the release is re-aimed to a safe receiver/lead, or, if
+/// none exists, ABORTED (the carrier keeps the ball and faces up). This closes the gap the
+/// mid-lane risk and marked-receiver concede vetoes both leave for a low-completion ball whose
+/// interceptor sits just outside their triggers. Default-ON in production (env
+/// `DD_SOCCER_ENABLE_HOPELESS_PASS_VETO=0/false` is the kill switch); default-OFF under test so the
+/// pass parity suite stays byte-identical.
+///
+/// DEFAULT-OFF: live A/B on :5055 (gen 364) showed this execution-time veto does NOT improve
+/// possession — it cut completed passes ~35% and total possession losses rose, because the on-ball
+/// choice is the (curriculum-limited) neural policy: suppressing a bad pass release just makes the
+/// carrier hold and get tackled instead of creating a good option. Kept as an opt-in experiment
+/// (`DD_SOCCER_ENABLE_HOPELESS_PASS_VETO=1`) pending a retrain that fixes the root cause. See the
+/// turnover/passing memories.
+pub(crate) fn hopeless_pass_veto_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_HOPELESS_PASS_VETO").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| {
+            matches!(
+                std::env::var("DD_SOCCER_ENABLE_HOPELESS_PASS_VETO")
+                    .ok()
+                    .as_deref()
+                    .map(str::trim),
+                Some("1" | "true" | "yes" | "on")
+            )
+        })
     }
 }
 
@@ -33476,11 +33659,13 @@ fn soccer_requested_tactical_feature_gate_names() -> Vec<String> {
         "DD_SOCCER_ENABLE_NUMBERS_UP_PRESS",
         "DD_SOCCER_ENABLE_STATIONARY_HOLDER_PRESS",
         "DD_SOCCER_ENABLE_TERRIBLE_PASS_VETO",
+        "DD_SOCCER_ENABLE_HOPELESS_PASS_VETO",
         "DD_SOCCER_ENABLE_IN_STRIDE_PASS_MARGIN",
         "DD_SOCCER_ENABLE_CONTINUE_RUN_AFTER_PASS",
         "DD_SOCCER_ENABLE_STRATEGY_PERSIST",
         "DD_SOCCER_ENABLE_RELEASE_LONG_OWN_HALF",
         "DD_SOCCER_ENABLE_BACK_FOUR_DEAD_SPACE_PUSH",
+        "DD_SOCCER_ENABLE_BACK_FOUR_ADAPTIVE_WIDTH",
         "DD_SOCCER_ENABLE_BLINDSIDE_STEAL",
         crash_box::FLANK_CRASH_BOX_ENABLE_ENV,
         "DD_SOCCER_ENABLE_SLIP_BREAK_OFFSIDE",
@@ -50953,6 +51138,7 @@ fn tracking_frame_to_world_snapshot(
         ranked_floor_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         ranked_aerial_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         line_depth_head: None,
+        back_four_line_latch_centre_depth: [None, None],
         pass_completion_head: None,
         loose_ball_commit_head: None,
         receive_approach_head: None,
@@ -57587,9 +57773,13 @@ fn aerial_interception_multiplier(pass: &PendingPass, ball_position: Vec2) -> f6
 const GRAVITY_YPS2: f64 = 9.81 / METERS_PER_YARD;
 
 fn scoop_loft_apex_yards(distance_yards: f64, unit: f64) -> f64 {
+    let (apex_min, apex_max) = if scoop_higher_apex_enabled() {
+        (SCOOP_LOFT_APEX_HIGH_MIN_YARDS, SCOOP_LOFT_APEX_HIGH_MAX_YARDS)
+    } else {
+        (SCOOP_LOFT_APEX_MIN_YARDS, SCOOP_LOFT_APEX_MAX_YARDS)
+    };
     let distance_fit = ((distance_yards.max(0.0) - 4.0) / 10.0).clamp(0.0, 1.0);
-    (SCOOP_LOFT_APEX_MIN_YARDS + distance_fit * 0.84 + unit.clamp(0.0, 1.0) * 0.82)
-        .clamp(SCOOP_LOFT_APEX_MIN_YARDS, SCOOP_LOFT_APEX_MAX_YARDS)
+    (apex_min + distance_fit * 0.84 + unit.clamp(0.0, 1.0) * 0.82).clamp(apex_min, apex_max)
 }
 
 /// Apex (peak height, yards) of a lofted NON-scoop pass as a function of its horizontal distance.
@@ -57607,9 +57797,7 @@ fn lofted_pass_apex_yards(distance_yards: f64) -> f64 {
 /// aerial-reception descent geometry sees the same arc the ball physics fly.
 pub(crate) fn pending_pass_snapshot_apex_yards(pass: &PendingPassSnapshot) -> f64 {
     if pass.flight.is_scoop() {
-        let seed = pass.launch_tick.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-            ^ (pass.from as u64).wrapping_shl(17);
-        let unit = ((seed >> 40) & 0xFFFF) as f64 / 65535.0;
+        let unit = scoop_apex_unit(pass.launch_tick, pass.from);
         scoop_loft_apex_yards(pass.distance_yards, unit)
     } else if pass.flight.is_over_top() {
         tunables().killer_pass_over_top.height_yards
@@ -57621,10 +57809,10 @@ pub(crate) fn pending_pass_snapshot_apex_yards(pass: &PendingPassSnapshot) -> f6
 fn pass_loft_apex_yards(pass: &PendingPass) -> f64 {
     if pass.flight.is_scoop() {
         // A scoop pops over a close foot and drops onto the receiver, not into a
-        // hanging balloon arc. Keep it in the requested 7-12ft band with stable variation.
-        let seed = pass.launch_tick.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-            ^ (pass.from as u64).wrapping_shl(17);
-        let unit = ((seed >> 40) & 0xFFFF) as f64 / 65535.0;
+        // hanging balloon arc. The apex MUST match the one the launch speed was paced from
+        // (see `scoop_apex_unit` / `scoop_land_at_target_enabled`) or the ball flies a different
+        // hang time than it was struck for and floats; with the fix on, the unit is 0.5.
+        let unit = scoop_apex_unit(pass.launch_tick, pass.from);
         scoop_loft_apex_yards(pass.distance_yards, unit)
     } else if pass.flight.is_over_top() {
         tunables().killer_pass_over_top.height_yards
@@ -58504,7 +58692,19 @@ fn modulated_pass_speed_yps(
         let desired_speed = land_at_target * pressure_firm;
         let skill = passing_skill.clamp(0.0, 1.0);
         let fit = (0.86 + skill * 0.08 + openness * 0.04).clamp(0.84, 0.98);
-        return (raw_speed_yps + (desired_speed - raw_speed_yps) * fit).clamp(
+        let blended = raw_speed_yps + (desired_speed - raw_speed_yps) * fit;
+        if scoop_land_at_target_enabled() {
+            // The ball's altitude is on a fixed gravity clock T (hang time from the apex), and with
+            // the fix the apex it flies == this `apex_yards`. To DROP on the receiver it must cross
+            // the horizontal distance in ~T, i.e. at ~`desired_speed`. The flat 16mph min-speed
+            // floor over-paced short chips so they reached the spot in a fraction of T and hung in
+            // the air (the balloon). Cap the floor at the land-at-target pace and the ceiling just
+            // above it, so the chip arrives in ~one hang time and obeys gravity onto the man.
+            let floor = desired_speed.min(mph_to_yps(SCOOP_MIN_SPEED_MPH));
+            let ceil = (desired_speed * 1.06).clamp(floor, mph_to_yps(SCOOP_MAX_SPEED_MPH));
+            return blended.clamp(floor, ceil);
+        }
+        return blended.clamp(
             mph_to_yps(SCOOP_MIN_SPEED_MPH),
             mph_to_yps(SCOOP_MAX_SPEED_MPH),
         );
@@ -61447,6 +61647,32 @@ fn approach_velocity(current: Vec2, desired: Vec2, accel: f64, dt: f64) -> Vec2 
     }
 }
 
+/// The concrete gait at effort tier `target_tier` to use as an intermediate step while
+/// walking a multi-gear change through one tier at a time, taking the forward/backward
+/// character from `desired` (which the step is heading toward). Backward travel never
+/// reaches a forward run/sprint, so tiers 3-4 are the forward Run/Sprint.
+fn gait_at_tier_toward(target_tier: u8, desired: MovementGait) -> MovementGait {
+    match target_tier {
+        0 => MovementGait::Stand,
+        1 => {
+            if desired.is_backward() {
+                MovementGait::BackWalk
+            } else {
+                MovementGait::Walk
+            }
+        }
+        2 => {
+            if desired.is_backward() {
+                MovementGait::BackJog
+            } else {
+                MovementGait::Jog
+            }
+        }
+        3 => MovementGait::Run,
+        _ => MovementGait::Sprint,
+    }
+}
+
 /// Apply the gait-commitment dwell to a freshly-decided gait, modelling locomotor
 /// momentum. Once an effort tier is entered it is held for [`GAIT_COMMIT_SECONDS`]
 /// before changing in EITHER direction, so effort cannot oscillate tick-to-tick (the
@@ -61455,11 +61681,21 @@ fn approach_velocity(current: Vec2, desired: Vec2, accel: f64, dt: f64) -> Vec2 
 /// `emergency` (an explosive reaction to a threat / flat-out recovery). The dwell thus
 /// governs only oscillation *between moving gaits*, and only bites within the window
 /// after a change: a gait held a while already satisfies it and switches immediately.
+///
+/// When `step_limited` is set, a change between moving gaits is additionally taken ONE
+/// effort tier at a time: a body cannot teleport across gears (sprint→walk, run→walk) in
+/// a single tick, so a multi-gear change is walked through its intermediate gaits, one
+/// per dwell. Because the committed gait is what drives the body's target speed, both
+/// the displayed gait and the acceleration-limited legs then shed (or build) speed
+/// together across several ticks rather than the label snapping ahead of the legs.
+/// Same-tier swaps (e.g. jog→side-step) and adjacent single-tier changes pass straight
+/// through, so this only ever intermediates a genuine multi-gear jump.
 fn commit_gait(
     prev: MovementGait,
     desired: MovementGait,
     held_seconds: f64,
     emergency: bool,
+    step_limited: bool,
 ) -> MovementGait {
     if desired == prev {
         return desired;
@@ -61471,11 +61707,33 @@ fn commit_gait(
     if prev.effort_tier() == 0 || desired.effort_tier() == 0 || emergency {
         return desired;
     }
-    // Otherwise hold the committed moving tier until it has been carried for the dwell.
-    if held_seconds >= GAIT_COMMIT_SECONDS {
+    // Hold the committed moving tier until it has been carried for the dwell.
+    if held_seconds < GAIT_COMMIT_SECONDS {
+        return prev;
+    }
+    // Dwell satisfied — the tier may change now. Legacy path: adopt the decision in one
+    // go. Step-limited path: advance at most one effort tier toward it, so a multi-gear
+    // change rolls through its intermediate gaits over successive dwells instead of
+    // jumping (the per-tier dwell is the locomotor analogue of a bounded acceleration:
+    // ~one gait band of speed change per ~0.2 s, close to a human accel/decel through a
+    // gear). Same-tier swaps and single-tier changes are already byte-identical.
+    if !step_limited {
+        return desired;
+    }
+    let prev_tier = prev.effort_tier();
+    let desired_tier = desired.effort_tier();
+    if desired_tier == prev_tier {
+        return desired;
+    }
+    let step_tier = if desired_tier > prev_tier {
+        prev_tier + 1
+    } else {
+        prev_tier - 1
+    };
+    if step_tier == desired_tier {
         desired
     } else {
-        prev
+        gait_at_tier_toward(step_tier, desired)
     }
 }
 
@@ -62856,7 +63114,7 @@ mod locomotion_commitment_tests {
     #[test]
     fn gait_holding_same_tier_is_a_no_op() {
         assert_eq!(
-            commit_gait(MovementGait::Sprint, MovementGait::Sprint, 0.0, false),
+            commit_gait(MovementGait::Sprint, MovementGait::Sprint, 0.0, false, false),
             MovementGait::Sprint
         );
     }
@@ -62866,14 +63124,14 @@ mod locomotion_commitment_tests {
         // The exact "sprint, run, sprint, run" case: a downshift before the dwell is
         // refused — the player stays sprinting.
         assert_eq!(
-            commit_gait(MovementGait::Sprint, MovementGait::Run, 0.05, false),
+            commit_gait(MovementGait::Sprint, MovementGait::Run, 0.05, false, false),
             MovementGait::Sprint
         );
         // And the symmetric half: bouncing straight back UP to a sprint before the
         // dwell is refused too — this is what stops the half-rate oscillation that a
         // downshift-only lock leaves behind.
         assert_eq!(
-            commit_gait(MovementGait::Run, MovementGait::Sprint, 0.05, false),
+            commit_gait(MovementGait::Run, MovementGait::Sprint, 0.05, false, false),
             MovementGait::Run
         );
         // Once the gait has been carried for the dwell, the change is allowed.
@@ -62882,6 +63140,7 @@ mod locomotion_commitment_tests {
                 MovementGait::Sprint,
                 MovementGait::Run,
                 GAIT_COMMIT_SECONDS + 0.01,
+                false,
                 false
             ),
             MovementGait::Run
@@ -62892,7 +63151,18 @@ mod locomotion_commitment_tests {
     fn pulling_up_to_a_stop_is_always_allowed() {
         // Coming to a halt is never locked, even straight from a flat-out sprint.
         assert_eq!(
-            commit_gait(MovementGait::Sprint, MovementGait::Stand, 0.0, false),
+            commit_gait(MovementGait::Sprint, MovementGait::Stand, 0.0, false, false),
+            MovementGait::Stand
+        );
+        // ...nor under the step-limit (braking to a halt is a decisive single act).
+        assert_eq!(
+            commit_gait(
+                MovementGait::Sprint,
+                MovementGait::Stand,
+                GAIT_COMMIT_SECONDS + 0.01,
+                false,
+                true
+            ),
             MovementGait::Stand
         );
     }
@@ -62901,7 +63171,12 @@ mod locomotion_commitment_tests {
     fn emergency_bypasses_the_gait_lock() {
         // An explosive reaction to a threat can spike effort instantly, dwell or not.
         assert_eq!(
-            commit_gait(MovementGait::Jog, MovementGait::Sprint, 0.0, true),
+            commit_gait(MovementGait::Jog, MovementGait::Sprint, 0.0, true, false),
+            MovementGait::Sprint
+        );
+        // The step-limit also yields to an emergency: a flat-out burst is never staged.
+        assert_eq!(
+            commit_gait(MovementGait::Walk, MovementGait::Sprint, 1.0, true, true),
             MovementGait::Sprint
         );
     }
@@ -62910,8 +63185,74 @@ mod locomotion_commitment_tests {
     fn setting_off_from_a_standstill_is_immediate() {
         // Starting to move is decisive, not jitter — no dwell from rest.
         assert_eq!(
-            commit_gait(MovementGait::Stand, MovementGait::Sprint, 0.0, false),
+            commit_gait(MovementGait::Stand, MovementGait::Sprint, 0.0, false, false),
             MovementGait::Sprint
+        );
+    }
+
+    #[test]
+    fn step_limit_walks_a_multi_gear_change_through_one_tier_at_a_time() {
+        let held = GAIT_COMMIT_SECONDS + 0.01;
+        // A run cannot drop straight to a walk: it sheds one tier to a jog first.
+        assert_eq!(
+            commit_gait(MovementGait::Run, MovementGait::Walk, held, false, true),
+            MovementGait::Jog
+        );
+        // Continuing down from that jog, the next dwell reaches the walk.
+        assert_eq!(
+            commit_gait(MovementGait::Jog, MovementGait::Walk, held, false, true),
+            MovementGait::Walk
+        );
+        // A flat-out sprint sheds to a run on the way down to a jog — never jog in one
+        // tick.
+        assert_eq!(
+            commit_gait(MovementGait::Sprint, MovementGait::Jog, held, false, true),
+            MovementGait::Run
+        );
+        // Sprint→walk likewise steps one gear: sprint→run.
+        assert_eq!(
+            commit_gait(MovementGait::Sprint, MovementGait::Walk, held, false, true),
+            MovementGait::Run
+        );
+    }
+
+    #[test]
+    fn step_limit_builds_speed_one_gear_at_a_time_too() {
+        let held = GAIT_COMMIT_SECONDS + 0.01;
+        // A non-emergency upshift ramps: walk → jog, not straight to a sprint.
+        assert_eq!(
+            commit_gait(MovementGait::Walk, MovementGait::Sprint, held, false, true),
+            MovementGait::Jog
+        );
+        assert_eq!(
+            commit_gait(MovementGait::Jog, MovementGait::Sprint, held, false, true),
+            MovementGait::Run
+        );
+    }
+
+    #[test]
+    fn step_limit_leaves_single_tier_and_same_tier_changes_untouched() {
+        let held = GAIT_COMMIT_SECONDS + 0.01;
+        // Adjacent single-tier change passes straight through (byte-identical).
+        assert_eq!(
+            commit_gait(MovementGait::Run, MovementGait::Jog, held, false, true),
+            MovementGait::Jog
+        );
+        // Same effort tier, different gait (jog ↔ side-step): a free swap.
+        assert_eq!(
+            commit_gait(MovementGait::Jog, MovementGait::SideStep, held, false, true),
+            MovementGait::SideStep
+        );
+    }
+
+    #[test]
+    fn step_limit_preserves_backward_character_on_the_way_down() {
+        let held = GAIT_COMMIT_SECONDS + 0.01;
+        // Dropping toward a back-walk from a forward run keeps the intermediate
+        // backward: run → back-jog (tier 2, backward), not a forward jog.
+        assert_eq!(
+            commit_gait(MovementGait::Run, MovementGait::BackWalk, held, false, true),
+            MovementGait::BackJog
         );
     }
 
