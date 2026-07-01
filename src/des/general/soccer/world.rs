@@ -22317,6 +22317,10 @@ pub struct WorldSnapshot {
     /// slip-break opportunity seam. `None` ⇒ analytic seed (parity). Skipped by serde.
     #[serde(skip)]
     pub(crate) slip_break_head: Option<std::sync::Arc<SlipBreakHead>>,
+    /// The trained onside-support push head, carried from the match for live consumption in the
+    /// onside-support clamp seam. `None` ⇒ analytic seed (parity). Skipped by serde.
+    #[serde(skip)]
+    pub(crate) onside_support_head: Option<std::sync::Arc<OnsideSupportHead>>,
     /// The trained long-pass run head, carried from the match for live consumption in
     /// `backfield_long_pass_run_invite_for`. `None` ⇒ analytic seed (parity). Skipped by
     /// serde (an internal decision aid; Default = None).
