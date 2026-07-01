@@ -23919,10 +23919,11 @@ fn dd_soccer_enable_scored_shot_placement() -> bool {
     *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_SCORED_SHOT_PLACEMENT").is_ok())
 }
 
-/// Set `DD_SOCCER_ENABLE_KEEPER_SAVE_REWARD=1` to give the goalkeeper a positive
-/// learning reward for stopping a shot (save/parry/claim/smother), scaled by the danger
-/// of the effort denied — an xG-prevented proxy. Default off ⇒ the keeper keeps only the
-/// retrospective concede penalty (byte-identical baseline / A/B). See
+/// Gives the goalkeeper a positive learning reward for stopping a shot
+/// (save/parry/claim/smother), scaled by the danger of the effort denied — an xG-prevented
+/// proxy. Default-ON in prod (kill switch `DD_SOCCER_ENABLE_KEEPER_SAVE_REWARD=0` reverts to
+/// the keeper keeping only the retrospective concede penalty); default-OFF under test for a
+/// byte-identical baseline / A/B. See
 /// [`SoccerSimulation::record_keeper_save_reward`].
 fn dd_soccer_enable_keeper_save_reward() -> bool {
     #[cfg(test)]
