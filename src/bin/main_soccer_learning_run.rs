@@ -2072,6 +2072,10 @@ fn run_game(
     if let Some(head) = CARRIED_CRASH_BOX_HEAD.lock().unwrap().as_ref() {
         sim.set_crash_box_head(head.clone());
     }
+    // Install the carried off-ball run-selection head so the open-space run seam consumes it live.
+    if let Some(head) = CARRIED_RUN_PREDICTION_HEAD.lock().unwrap().as_ref() {
+        sim.set_run_prediction_head(head.clone());
+    }
     // Install the carried long-pass run head so `backfield_long_pass_run_invite_for` consumes
     // it live once trained. No-op unless DD_SOCCER_ENABLE_LEARNED_LONG_PASS_RUN is set.
     if let Some(head) = CARRIED_LONG_PASS_RUN_HEAD.lock().unwrap().as_ref() {
