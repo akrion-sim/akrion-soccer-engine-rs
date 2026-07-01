@@ -13,18 +13,19 @@ use serde::Serialize;
 use soccer_engine::des::general::soccer::{
     soccer_moment_records_from_jsonl, soccer_moment_records_to_learning_dataset,
     train_soccer_pass_completion_head, AttackSpacingHead, BackFourLineHead, GiveAndGoHead,
-    LongPassRunHead, LooseBallCommitHead, MatchConfig, MatchSummary, ReceiveApproachHead,
-    ShotTriggerHead, SoccerConfigMomentInsert, SoccerMarlAlgorithm, SoccerMatch,
-    SoccerMomentWindow, SoccerNeuralLearningBackend, SoccerNeuralLearningConfig,
+    LaneAffinityHead, LongPassRunHead, LooseBallCommitHead, MatchConfig, MatchSummary,
+    ReceiveApproachHead, ShotTriggerHead, SoccerConfigMomentInsert, SoccerMarlAlgorithm,
+    SoccerMatch, SoccerMomentWindow, SoccerNeuralLearningBackend, SoccerNeuralLearningConfig,
     SoccerNeuralNetworkSnapshot, SoccerPassCompletionHead, SoccerPassLearningMetrics,
     SoccerPassOutcomeSample, SoccerQEntry, SoccerQPolicy, SoccerQPolicyOptions, SoccerQTargetEntry,
     SoccerSelfPlayEpisodeSummary, SoccerSelfPlayLearnedParams, SoccerSelfPlayTrainingArtifact,
     SoccerTacticalLearningSummary, SoccerTacticalLearningWeights, SoccerTeamPolicyArtifact,
     SoccerTeamQPolicies, ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS,
     DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE, DEFAULT_SOCCER_PASS_COMPLETION_LEARNING_RATE,
-    GIVE_AND_GO_HEAD_MIN_TRAINING_STEPS, LONG_PASS_RUN_HEAD_MIN_TRAINING_STEPS,
-    LOOSE_BALL_COMMIT_HEAD_MIN_TRAINING_STEPS, PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS,
-    RECEIVE_APPROACH_HEAD_MIN_TRAINING_STEPS, SHOT_TRIGGER_HEAD_MIN_TRAINING_STEPS,
+    GIVE_AND_GO_HEAD_MIN_TRAINING_STEPS, LANE_AFFINITY_HEAD_MIN_TRAINING_STEPS,
+    LONG_PASS_RUN_HEAD_MIN_TRAINING_STEPS, LOOSE_BALL_COMMIT_HEAD_MIN_TRAINING_STEPS,
+    PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS, RECEIVE_APPROACH_HEAD_MIN_TRAINING_STEPS,
+    SHOT_TRIGGER_HEAD_MIN_TRAINING_STEPS,
 };
 use soccer_engine::des::soccer_learning::{
     evaluate_soccer_policy_promotion_gate, evolve_soccer_tactical_learning_weights_from_genomes,
@@ -1910,6 +1911,14 @@ static CARRIED_GIVE_AND_GO_HEAD: std::sync::Mutex<Option<GiveAndGoHead>> =
 static CARRIED_RECEIVE_APPROACH_HEAD: std::sync::Mutex<Option<ReceiveApproachHead>> =
     std::sync::Mutex::new(None);
 
+/// In-memory lane-affinity head (whether an out-of-lane player breaks out or is held
+/// back into its channel), carried + trained across games WITHIN a learner process,
+/// mirroring `CARRIED_RECEIVE_APPROACH_HEAD`. Resets on pod restart; the seam is on by
+/// default in prod (seeded by the analytic prior) so the head is consumed live once it
+/// crosses `LANE_AFFINITY_HEAD_MIN_TRAINING_STEPS`.
+static CARRIED_LANE_AFFINITY_HEAD: std::sync::Mutex<Option<LaneAffinityHead>> =
+    std::sync::Mutex::new(None);
+
 /// In-memory learned pass-completion head, carried + trained across games WITHIN a learner
 /// process (seeded once from the Postgres corpus at startup), mirroring
 /// `CARRIED_LINE_DEPTH_HEAD`. Installed on each game so the pass-quality assessor consumes it
@@ -1989,6 +1998,11 @@ fn run_game(
     // is set.
     if let Some(head) = CARRIED_RECEIVE_APPROACH_HEAD.lock().unwrap().as_ref() {
         sim.set_receive_approach_head(head.clone());
+    }
+    // Install the carried lane-affinity head so the lane clamp seam consumes it live once
+    // trained. No-op unless the lane-affinity model is enabled (on by default in prod).
+    if let Some(head) = CARRIED_LANE_AFFINITY_HEAD.lock().unwrap().as_ref() {
+        sim.set_lane_affinity_head(head.clone());
     }
     // Install the carried long-pass run head so `backfield_long_pass_run_invite_for` consumes
     // it live once trained. No-op unless DD_SOCCER_ENABLE_LEARNED_LONG_PASS_RUN is set.
@@ -2099,6 +2113,25 @@ fn run_game(
             receive_approach_samples.len(),
             head.training_steps(),
             head.training_steps() >= RECEIVE_APPROACH_HEAD_MIN_TRAINING_STEPS,
+            final_loss
+        );
+    }
+    // Train the CARRIED lane-affinity head on this game's reward-weighted RL corpus
+    // (whether breaking out of / holding the lane improved territorial control). Empty +
+    // skipped unless the lane-affinity model is enabled (on by default in prod).
+    let lane_affinity_samples = sim.drain_lane_affinity_samples();
+    if !lane_affinity_samples.is_empty() {
+        let mut guard = CARRIED_LANE_AFFINITY_HEAD.lock().unwrap();
+        let head = guard.get_or_insert_with(|| LaneAffinityHead::new(episode_seed as u32));
+        let mut final_loss = 0.0;
+        for _ in 0..4 {
+            final_loss = head.train_reward_weighted(&lane_affinity_samples, 0.02);
+        }
+        eprintln!(
+            "lane_affinity_training samples={} training_steps={} consumed={} final_loss={:.5}",
+            lane_affinity_samples.len(),
+            head.training_steps(),
+            head.training_steps() >= LANE_AFFINITY_HEAD_MIN_TRAINING_STEPS,
             final_loss
         );
     }
