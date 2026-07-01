@@ -38,7 +38,8 @@ use soccer_engine::des::soccer_learning::{
     SoccerLearningCompletedGame, SoccerLearningCurriculumConfig, SoccerLearningQueueEvent,
     SoccerLearningQueueRunnerConfig, SoccerPolicyPromotionGateConfig,
     SoccerPolicyPromotionGateEvaluation, SoccerPostgresPolicyRefreshCheck,
-    SoccerTacticalLearningGenomeParent, SOCCER_POLICY_STATUS_ACTIVE, SOCCER_POLICY_STATUS_ARCHIVED,
+    SoccerTacticalLearningGenomeParent, SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION,
+    SOCCER_POLICY_STATUS_ACTIVE, SOCCER_POLICY_STATUS_ARCHIVED,
 };
 use soccer_engine::des::soccer_learning_pg::{
     soccer_learning_git_commit, SoccerLearningPgCompletedRunInsert, SoccerLearningPgStore,
@@ -269,7 +270,9 @@ fn env_marl_algorithm(default: SoccerMarlAlgorithm) -> Result<SoccerMarlAlgorith
     };
     match value.to_ascii_lowercase().as_str() {
         "off" | "disabled" | "none" => Ok(SoccerMarlAlgorithm::Off),
-        "independent" | "independent-actor-critic" | "independent_actor_critic"
+        "independent"
+        | "independent-actor-critic"
+        | "independent_actor_critic"
         | "independentactorcritic" => Ok(SoccerMarlAlgorithm::IndependentActorCritic),
         "mappo" | "ppo" => Ok(SoccerMarlAlgorithm::Mappo),
         _ => Err(invalid_data(format!(
@@ -896,12 +899,19 @@ fn flush_postgres_completed_runs(
             policy_version.status,
             policy_version.parent_policy_version_id.as_deref(),
             policy_version.generation,
+            policy_version.fitness,
             latest_active_metadata
                 .as_ref()
                 .map(|metadata| metadata.id.as_str()),
             latest_active_metadata
                 .as_ref()
                 .map(|metadata| metadata.generation),
+            latest_active_metadata.as_ref().map(|metadata| {
+                soccer_engine::des::soccer_learning::soccer_learning_from_micros(
+                    metadata.fitness_micros,
+                )
+            }),
+            SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION,
         );
         if insert_status != policy_version.status {
             println!(
@@ -1682,11 +1692,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         seed,
         ..default_config.clone()
     };
-    config.neural_blend.actor_critic = env_bool_alias(
-        "SOCCER_NEURAL_ACTOR_CRITIC",
-        "SOCCER_ACTOR_CRITIC",
-        true,
-    )?;
+    config.neural_blend.actor_critic =
+        env_bool_alias("SOCCER_NEURAL_ACTOR_CRITIC", "SOCCER_ACTOR_CRITIC", true)?;
     apply_env_mpc_config(&mut config, &default_config)?;
     let resume_artifact =
         env_value("SOCCER_RESUME_ARTIFACT").or_else(|| env_value("SOCCER_RESUME_ARTIFACT_PATH"));

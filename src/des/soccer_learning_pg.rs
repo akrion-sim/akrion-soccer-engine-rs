@@ -55,6 +55,7 @@ pub struct SoccerLearningPgPolicyVersion {
 pub struct SoccerLearningPgPolicyMetadata {
     pub id: String,
     pub generation: i32,
+    pub fitness_micros: i64,
     pub updated_at_micros: i64,
     pub policy_fingerprint: Option<u64>,
     pub policy_entry_count: Option<usize>,
@@ -1334,8 +1335,7 @@ impl SoccerLearningPgStore {
         include_unpromoted: bool,
     ) -> Result<Option<SoccerLearningPgPolicyVersion>, String> {
         self.ensure_connected()?;
-        let Some(metadata) =
-            self.load_latest_policy_metadata(experiment_id, include_unpromoted)?
+        let Some(metadata) = self.load_latest_policy_metadata(experiment_id, include_unpromoted)?
         else {
             return Ok(None);
         };
@@ -1386,6 +1386,7 @@ impl SoccerLearningPgStore {
                 select
                   id::text,
                   generation,
+                  fitness_micros,
                   metrics,
                   config,
                   coalesce((extract(epoch from updated_at) * 1000000)::bigint, 0)
@@ -1399,6 +1400,7 @@ impl SoccerLearningPgStore {
                 select
                   id::text,
                   generation,
+                  fitness_micros,
                   metrics,
                   config,
                   coalesce((extract(epoch from updated_at) * 1000000)::bigint, 0)
@@ -1417,9 +1419,10 @@ impl SoccerLearningPgStore {
         };
         let id: String = row.get(0);
         let generation: i32 = row.get(1);
-        let metrics: Value = row.get(2);
-        let config: Value = row.get(3);
-        let updated_at_micros: i64 = row.get(4);
+        let fitness_micros: i64 = row.get(2);
+        let metrics: Value = row.get(3);
+        let config: Value = row.get(4);
+        let updated_at_micros: i64 = row.get(5);
         let neural_network = soccer_policy_version_neural_network_from_metrics(&metrics)?;
         let tactical_learning =
             soccer_policy_version_tactical_learning_from_values(&config, &metrics)?;
@@ -1429,6 +1432,7 @@ impl SoccerLearningPgStore {
         Ok(Some(SoccerLearningPgPolicyMetadata {
             id,
             generation,
+            fitness_micros,
             updated_at_micros,
             policy_fingerprint,
             policy_entry_count,
@@ -5936,12 +5940,22 @@ mod tests {
     fn inline_policy_prune_is_opt_in_for_learning_jobs() {
         assert!(!soccer_policy_inline_prune_enabled_from_env_value(None));
         assert!(!soccer_policy_inline_prune_enabled_from_env_value(Some("")));
-        assert!(!soccer_policy_inline_prune_enabled_from_env_value(Some("0")));
-        assert!(!soccer_policy_inline_prune_enabled_from_env_value(Some("false")));
+        assert!(!soccer_policy_inline_prune_enabled_from_env_value(Some(
+            "0"
+        )));
+        assert!(!soccer_policy_inline_prune_enabled_from_env_value(Some(
+            "false"
+        )));
         assert!(soccer_policy_inline_prune_enabled_from_env_value(Some("1")));
-        assert!(soccer_policy_inline_prune_enabled_from_env_value(Some("true")));
-        assert!(soccer_policy_inline_prune_enabled_from_env_value(Some("YES")));
-        assert!(soccer_policy_inline_prune_enabled_from_env_value(Some(" on ")));
+        assert!(soccer_policy_inline_prune_enabled_from_env_value(Some(
+            "true"
+        )));
+        assert!(soccer_policy_inline_prune_enabled_from_env_value(Some(
+            "YES"
+        )));
+        assert!(soccer_policy_inline_prune_enabled_from_env_value(Some(
+            " on "
+        )));
     }
 
     #[test]

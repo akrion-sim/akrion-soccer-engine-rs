@@ -11,23 +11,21 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use soccer_engine::des::general::soccer::{
-    soccer_moment_records_from_jsonl,
-    soccer_moment_records_to_learning_dataset, AttackSpacingHead,
-    ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS, BackFourLineHead, LooseBallCommitHead, MatchConfig,
-    MatchSummary, SoccerConfigMomentInsert, SoccerMarlAlgorithm, SoccerMatch, SoccerMomentWindow,
-    train_soccer_pass_completion_head, SoccerPassCompletionHead,
-    PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS, SoccerNeuralLearningBackend,
-    SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot,
-    SoccerPassLearningMetrics, SoccerPassOutcomeSample, SoccerQEntry, SoccerQPolicy,
-    SoccerQPolicyOptions, SoccerQTargetEntry, SoccerSelfPlayEpisodeSummary,
-    SoccerSelfPlayLearnedParams, SoccerSelfPlayTrainingArtifact, SoccerTacticalLearningSummary,
-    SoccerTacticalLearningWeights, SoccerTeamPolicyArtifact, SoccerTeamQPolicies,
+    soccer_moment_records_from_jsonl, soccer_moment_records_to_learning_dataset,
+    train_soccer_pass_completion_head, AttackSpacingHead, BackFourLineHead, GiveAndGoHead,
+    LaneAffinityHead, LongPassRunHead, LooseBallCommitHead, MatchConfig, MatchSummary,
+    ReceiveApproachHead, ShotTriggerHead, SoccerConfigMomentInsert, SoccerMarlAlgorithm,
+    SoccerMatch, SoccerMomentWindow, SoccerNeuralLearningBackend, SoccerNeuralLearningConfig,
+    SoccerNeuralNetworkSnapshot, SoccerPassCompletionHead, SoccerPassLearningMetrics,
+    SoccerPassOutcomeSample, SoccerQEntry, SoccerQPolicy, SoccerQPolicyOptions, SoccerQTargetEntry,
+    SoccerSelfPlayEpisodeSummary, SoccerSelfPlayLearnedParams, SoccerSelfPlayTrainingArtifact,
+    SoccerTacticalLearningSummary, SoccerTacticalLearningWeights, SoccerTeamPolicyArtifact,
+    SoccerTeamQPolicies, ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS,
     DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE, DEFAULT_SOCCER_PASS_COMPLETION_LEARNING_RATE,
-    LOOSE_BALL_COMMIT_HEAD_MIN_TRAINING_STEPS, LongPassRunHead,
-    LONG_PASS_RUN_HEAD_MIN_TRAINING_STEPS, GiveAndGoHead, GIVE_AND_GO_HEAD_MIN_TRAINING_STEPS,
-    ShotTriggerHead, SHOT_TRIGGER_HEAD_MIN_TRAINING_STEPS,
-    ReceiveApproachHead, RECEIVE_APPROACH_HEAD_MIN_TRAINING_STEPS,
-    LaneAffinityHead, LANE_AFFINITY_HEAD_MIN_TRAINING_STEPS,
+    GIVE_AND_GO_HEAD_MIN_TRAINING_STEPS, LANE_AFFINITY_HEAD_MIN_TRAINING_STEPS,
+    LONG_PASS_RUN_HEAD_MIN_TRAINING_STEPS, LOOSE_BALL_COMMIT_HEAD_MIN_TRAINING_STEPS,
+    PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS, RECEIVE_APPROACH_HEAD_MIN_TRAINING_STEPS,
+    SHOT_TRIGGER_HEAD_MIN_TRAINING_STEPS,
 };
 use soccer_engine::des::soccer_learning::{
     evaluate_soccer_policy_promotion_gate, evolve_soccer_tactical_learning_weights_from_genomes,
@@ -45,7 +43,8 @@ use soccer_engine::des::soccer_learning::{
     validate_soccer_policy_promotion_gate_config_for_learning_run, SoccerEvolutionOptions,
     SoccerLearningCompletedGame, SoccerLearningCurriculumConfig, SoccerPolicyPromotionGateConfig,
     SoccerPolicyPromotionGateEvaluation, SoccerPostgresPolicyRefreshCheck,
-    SoccerTacticalLearningGenomeParent, SOCCER_POLICY_STATUS_ACTIVE, SOCCER_POLICY_STATUS_ARCHIVED,
+    SoccerTacticalLearningGenomeParent, SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION,
+    SOCCER_POLICY_STATUS_ACTIVE, SOCCER_POLICY_STATUS_ARCHIVED,
 };
 use soccer_engine::des::soccer_learning_pg::{
     soccer_learning_git_commit, SoccerLearningPgCompletedRunInsert, SoccerLearningPgStore,
@@ -259,7 +258,9 @@ fn env_marl_algorithm(default: SoccerMarlAlgorithm) -> Result<SoccerMarlAlgorith
     };
     match value.to_ascii_lowercase().as_str() {
         "off" | "disabled" | "none" => Ok(SoccerMarlAlgorithm::Off),
-        "independent" | "independent-actor-critic" | "independent_actor_critic"
+        "independent"
+        | "independent-actor-critic"
+        | "independent_actor_critic"
         | "independentactorcritic" => Ok(SoccerMarlAlgorithm::IndependentActorCritic),
         "mappo" | "ppo" => Ok(SoccerMarlAlgorithm::Mappo),
         _ => Err(invalid_data(format!(
@@ -2072,7 +2073,8 @@ fn run_game(
             "line_depth_training samples={} training_steps={} consumed={} final_loss={:.5}",
             line_depth_samples.len(),
             head.training_steps(),
-            head.training_steps() >= soccer_engine::des::general::soccer::LINE_DEPTH_HEAD_MIN_TRAINING_STEPS,
+            head.training_steps()
+                >= soccer_engine::des::general::soccer::LINE_DEPTH_HEAD_MIN_TRAINING_STEPS,
             final_loss
         );
     }
@@ -2403,12 +2405,19 @@ fn flush_postgres_completed_runs(
             policy_version.status,
             policy_version.parent_policy_version_id.as_deref(),
             policy_version.generation,
+            policy_version.fitness,
             latest_active_metadata
                 .as_ref()
                 .map(|metadata| metadata.id.as_str()),
             latest_active_metadata
                 .as_ref()
                 .map(|metadata| metadata.generation),
+            latest_active_metadata.as_ref().map(|metadata| {
+                soccer_engine::des::soccer_learning::soccer_learning_from_micros(
+                    metadata.fitness_micros,
+                )
+            }),
+            SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION,
         );
         if insert_status != policy_version.status {
             println!(
@@ -3085,11 +3094,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         seed: effective_seed,
         ..default_config.clone()
     };
-    config.neural_blend.actor_critic = env_bool_alias(
-        "SOCCER_NEURAL_ACTOR_CRITIC",
-        "SOCCER_ACTOR_CRITIC",
-        true,
-    )?;
+    config.neural_blend.actor_critic =
+        env_bool_alias("SOCCER_NEURAL_ACTOR_CRITIC", "SOCCER_ACTOR_CRITIC", true)?;
     apply_env_mpc_config(&mut config, &default_config)?;
     // The neural ACTOR (and MAPPO, which is itself gated on `actor_critic`) was previously left
     // disabled in standard learning runs: `neural_blend` came straight from `MatchConfig::default()`
@@ -3097,7 +3103,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     // trained the value head. Tie the actor to the requested MARL algorithm — on whenever an actor
     // is wanted (anything but `Off`) — with an explicit `SOCCER_ENABLE_ACTOR_CRITIC` override either way.
     let actor_critic_default = config.neural_learning.marl_algorithm != SoccerMarlAlgorithm::Off;
-    config.neural_blend.actor_critic = env_bool("SOCCER_ENABLE_ACTOR_CRITIC", actor_critic_default)?;
+    config.neural_blend.actor_critic =
+        env_bool("SOCCER_ENABLE_ACTOR_CRITIC", actor_critic_default)?;
     let run_id = env_value("SOCCER_RUN_ID").unwrap_or_else(default_run_id);
     let run_dir = PathBuf::from(
         env_value("SOCCER_RUN_DIR").unwrap_or_else(|| format!("out/soccer-learning-runs/{run_id}")),

@@ -1193,6 +1193,7 @@ fn mpc_reselect_candidate_label(label: &str) -> bool {
         label,
         "shoot"
             | "wall-pass"
+            | "wall-return"
             | "corner-flag-cross"
             | "vertical-attack"
             | "vacate-space"
@@ -1228,12 +1229,30 @@ fn mpc_reselect_candidate_label(label: &str) -> bool {
             | "protect-ball"
             | "side-step"
             | "hold-up-flank"
+            | "wait-for-support"
+            | "check-to-ball"
             | "run-in-behind"
+            | "one-two-run"
+            | "exploit-space-run"
+            | "wide-outlet"
             | "shot-creation-run"
+            | "pinch-cross-arrival"
             | "overlap-run"
+            | "support-screen"
             | "support-push-up"
             | "support-roam"
             | "support-shape"
+            | "dummy-clear-lane"
+            | "dummy-let-run"
+            | "lane-yield"
+            | "set-play-run"
+            | "buildup-receive"
+            | "defend-shape"
+            | "defend-roam"
+            | "press-cover"
+            | "slide-tackle"
+            | "blindside-steal"
+            | ACTION_LABEL_RECOVER
     )
 }
 
@@ -1254,8 +1273,8 @@ fn mpc_execution_skill_for_label(player: &PlayerAgent, label: &str) -> f64 {
                 + ability01(player.skills.first_touch) * 0.34
                 + ability01(player.skills.passing_completion_rate) * 0.24
         }
-        "wall-pass" | "pass" | "pass1" | "first-time-pass" | "killer-pass" | "switch-play"
-        | "recycle-reset" | "aerial-pass" | "aerial-pass1" => {
+        "wall-pass" | "wall-return" | "pass" | "pass1" | "first-time-pass" | "killer-pass"
+        | "switch-play" | "recycle-reset" | "aerial-pass" | "aerial-pass1" => {
             ability01(player.skills.passing_completion_rate) * 0.56
                 + ability01(player.skills.vision) * 0.28
                 + ability01(player.skills.first_touch) * 0.16
@@ -1269,6 +1288,13 @@ fn mpc_execution_skill_for_label(player: &PlayerAgent, label: &str) -> f64 {
                         .max(player.skills.left_foot_shot_power),
                 ) * 0.32
                 + ability01(player.skills.first_touch) * 0.26
+        }
+        "tackle" | "slide-tackle" | "blindside-steal" | "defend-shape" | "defend-roam"
+        | "press-cover" => {
+            ability01(player.skills.defending) * 0.48
+                + ability01(player.skills.acceleration) * 0.22
+                + ability01(player.skills.strength) * 0.18
+                + ability01(player.skills.aggression) * 0.12
         }
         _ => {
             ability01(player.skills.acceleration) * 0.42
@@ -3008,7 +3034,7 @@ fn decision_cadence_labels_match(committed_label: &str, candidate_label: &str) -
 fn decision_cadence_immediate_label(label: &str) -> bool {
     matches!(
         normalize_soccer_action_label(label),
-        "tackle" | "slide-tackle" | ACTION_LABEL_RECOVER
+        "tackle" | "slide-tackle" | "blindside-steal" | ACTION_LABEL_RECOVER
     )
 }
 
@@ -8553,7 +8579,7 @@ impl PlayerAgent {
                     } else {
                         (
                             vec!["ball-at-feet-reflex".to_string()],
-                            "control-ball-at-feet",
+                            "control-touch",
                         )
                     };
                     self.last_decision = Some(self.decision_trace(
@@ -9443,9 +9469,9 @@ impl PlayerAgent {
                         observation,
                         belief,
                         vec!["runaround-collect".to_string()],
-                        single_action_option("runaround-collect"),
+                        single_action_option("runaround-dribble"),
                         &action,
-                        "runaround-collect",
+                        "runaround-dribble",
                     ));
                     return PlayerIntent {
                         player_id: self.id,
@@ -11925,6 +11951,10 @@ impl PlayerAgent {
                     "press-cover".to_string(),
                     action_option_score(&action_options, "press-cover"),
                 ),
+                (
+                    "blindside-steal".to_string(),
+                    action_option_score(&action_options, "blindside-steal"),
+                ),
             ];
             let cadence_hold_label = decision_cadence_hold_label_from_weights(
                 &observation,
@@ -11985,6 +12015,18 @@ impl PlayerAgent {
                             }
                         }
                     }
+                    "blindside-steal" => {
+                        order_names.push("blindside-steal".to_string());
+                        if let Some(assessment) = snapshot.blindside_steal_assessment(self.id) {
+                            chosen = Some((
+                                SoccerAction::Tackle {
+                                    target_player: assessment.target,
+                                },
+                                "blindside-steal".to_string(),
+                            ));
+                            break;
+                        }
+                    }
                     "defend-shape" | "defend-roam" | "press-cover" => {
                         let press_cover = op.as_str() == "press-cover";
                         let roam = op.as_str() == "defend-roam" || press_cover;
@@ -12030,7 +12072,7 @@ impl PlayerAgent {
                         let (target, push_up) =
                             snapshot.defensive_push_up_adjustment(self.id, target);
                         push_up_sprint = push_up;
-                        let label = if press_cover { "press-cover" } else { "defend" };
+                        let label = if press_cover { "press-cover" } else { op.as_str() };
                         chosen = Some((SoccerAction::MoveTo(target), label.to_string()));
                         break;
                     }
@@ -12361,7 +12403,15 @@ impl PlayerAgent {
         let label = normalize_soccer_action_label(&plan.action);
         if !observation.has_ball
             && snapshot.controlled_possession_team() == Some(self.team.other())
-            && !matches!(label, "tackle" | "slide-tackle" | "press-cover")
+            && !matches!(
+                label,
+                "tackle"
+                    | "slide-tackle"
+                    | "blindside-steal"
+                    | "defend-shape"
+                    | "defend-roam"
+                    | "press-cover"
+            )
         {
             let assignment = snapshot.defensive_assignment_for(self.id, self.home_position, false);
             let target = plan
@@ -12371,6 +12421,61 @@ impl PlayerAgent {
             return Some((SoccerAction::MoveTo(target), "defend".to_string()));
         }
         match label {
+            "wait-for-support" if observation.has_ball => {
+                let kind = DribbleMoveKind::ProtectBall;
+                let touch = snapshot.deterministic_dribble_touch_decision_for(self.id, kind);
+                let target = plan.target_point.unwrap_or_else(|| {
+                    snapshot.dribble_move_target_for_touch(self.id, self.home_position, kind, touch)
+                });
+                Some((
+                    SoccerAction::DribbleMove {
+                        target,
+                        kind,
+                        touch,
+                    },
+                    "wait-for-support".to_string(),
+                ))
+            }
+            "open-passing-lane" if observation.has_ball => {
+                let current = snapshot
+                    .player_position(self.id)
+                    .unwrap_or(self.position)
+                    .clamp_to_pitch(snapshot.field_width, snapshot.field_length);
+                let learned_target = plan.target_point.and_then(|target| {
+                    let target = target.clamp_to_pitch(snapshot.field_width, snapshot.field_length);
+                    let touch = open_pass_lane_touch_for_target(self.team, current, target)?;
+                    let kind = open_pass_lane_kind_for_target(self.team, current, target);
+                    Some((target, kind, touch))
+                });
+                learned_target
+                    .or_else(|| {
+                        snapshot
+                            .dribble_to_open_passing_lane_for(self.id)
+                            .map(|(target, _, _)| {
+                                let kind = open_pass_lane_kind_for_target(self.team, current, target);
+                                let touch = open_pass_lane_touch_for_target(
+                                    self.team,
+                                    current,
+                                    target,
+                                )
+                                .unwrap_or_else(|| {
+                                    snapshot
+                                        .deterministic_dribble_touch_decision_for(self.id, kind)
+                                });
+                                (target, kind, touch)
+                            })
+                    })
+                    .map(|(target, kind, touch)| {
+                        (
+                            SoccerAction::DribbleMove {
+                                target,
+                                kind,
+                                touch,
+                            },
+                            "open-passing-lane".to_string(),
+                        )
+                    })
+            }
             "shoot"
                 if observation.has_ball
                     && (shot_decision_is_qualified_for_role(observation, self.role)
@@ -12397,6 +12502,18 @@ impl PlayerAgent {
                             flight: PassFlight::Floor,
                         },
                         "wall-pass".to_string(),
+                    )
+                })
+            }
+            "wall-return" if observation.has_ball => {
+                snapshot.wall_return_pass_target_for(self.id).map(|runner| {
+                    (
+                        SoccerAction::Pass {
+                            target_player: Some(runner),
+                            power: WALL_PASS_GIVE_POWER + 0.22 * ability01(self.skills.passing),
+                            flight: PassFlight::Floor,
+                        },
+                        "wall-return".to_string(),
                     )
                 })
             }
@@ -13017,6 +13134,22 @@ impl PlayerAgent {
                 )),
                 "defend".to_string(),
             )),
+            "defend-shape" if snapshot.controlled_possession_team() == Some(self.team.other()) => {
+                let target = snapshot
+                    .formation_lp_guidance_for(self.id)
+                    .map(|guidance| guidance.target)
+                    .unwrap_or_else(|| {
+                        snapshot.defensive_assignment_for(self.id, self.home_position, false)
+                    });
+                Some((SoccerAction::MoveTo(target), "defend-shape".to_string()))
+            }
+            "defend-roam" if snapshot.controlled_possession_team() == Some(self.team.other()) => {
+                let target = snapshot.goal_side_defensive_target_for(
+                    self.id,
+                    snapshot.defensive_assignment_for(self.id, self.home_position, true),
+                );
+                Some((SoccerAction::MoveTo(target), "defend-roam".to_string()))
+            }
             ACTION_LABEL_RECOVER if snapshot.controlled_possession_team().is_none() => Some((
                 SoccerAction::MoveTo(snapshot.loose_ball_recovery_target_for(self.id)),
                 ACTION_LABEL_RECOVER.to_string(),
@@ -13052,6 +13185,14 @@ impl PlayerAgent {
                     "slide-tackle".to_string(),
                 )
             }),
+            "blindside-steal" => snapshot.blindside_steal_assessment(self.id).map(|assessment| {
+                (
+                    SoccerAction::Tackle {
+                        target_player: assessment.target,
+                    },
+                    "blindside-steal".to_string(),
+                )
+            }),
             "press-cover" if snapshot.controlled_possession_team() == Some(self.team.other()) => {
                 let assignment =
                     snapshot.defensive_assignment_for(self.id, self.home_position, true);
@@ -13078,6 +13219,28 @@ impl PlayerAgent {
                         DUMMY_CLEAR_LANE_ACTION_LABEL.to_string(),
                     )
                 }),
+            "lane-yield" if !observation.has_ball => snapshot
+                .pass_lane_yield_target_for(self.id, self.home_position)
+                .map(|(target, _)| {
+                    (
+                        SoccerAction::MoveTo(snapshot.shape_guarded_support_point(
+                            self.id,
+                            target,
+                            &[self.home_position],
+                            self.home_position,
+                            false,
+                        )),
+                        "lane-yield".to_string(),
+                    )
+                }),
+            "buildup-receive" if !observation.has_ball => {
+                Some((
+                    SoccerAction::MoveTo(
+                        snapshot.goalkeeper_buildup_lane_target_for(self.id, self.home_position),
+                    ),
+                    "buildup-receive".to_string(),
+                ))
+            }
             "check-to-ball" if !observation.has_ball => snapshot
                 .check_to_ball_target_for(self.id, self.home_position)
                 .map(|target| {
@@ -13122,9 +13285,32 @@ impl PlayerAgent {
                         "wide-outlet".to_string(),
                     )
                 }),
+            "one-two-run" if !observation.has_ball => {
+                snapshot.one_two_run_target_for(self.id).map(|target| {
+                    (
+                        SoccerAction::MoveTo(target),
+                        "one-two-run".to_string(),
+                    )
+                })
+            }
+            "pinch-cross-arrival" if !observation.has_ball => snapshot
+                .flank_cross_arrival_target_for(self.id, self.home_position)
+                .map(|target| {
+                    let open = snapshot.open_space_for(self.id, self.home_position);
+                    (
+                        SoccerAction::MoveTo(snapshot.shape_guarded_support_point(
+                            self.id,
+                            target,
+                            &[open, self.home_position],
+                            self.home_position,
+                            false,
+                        )),
+                        "pinch-cross-arrival".to_string(),
+                    )
+                }),
             "exploit-space-run" | "shot-creation-run" | "overlap-run" | "support-push-up"
             | "support-screen" | "support-shape" | "support-roam" | "vacate-space"
-            | "vertical-attack"
+            | "set-play-run" | "vertical-attack"
                 if !observation.has_ball =>
             {
                 let roam = matches!(label, "support-roam" | "overlap-run" | "vacate-space");
