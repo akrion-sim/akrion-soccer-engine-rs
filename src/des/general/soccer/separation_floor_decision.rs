@@ -387,10 +387,15 @@ impl WorldSnapshot {
         bias.is_finite().then(|| bias.clamp(-1.0, 1.0))
     }
 
+}
+
+impl SoccerMatch {
     /// The effective same-team keep-out **influence radius** (yd) for `player_id`, given the base
     /// `base_influence` (the fixed 8yd floor+influence). Returns `base_influence` unchanged when
     /// the model is off ⇒ byte-identical. When on, shifts it by the learned separation bias,
-    /// clamped to `[SAME_TEAM_MIN_SEPARATION_YARDS, SEPARATION_FLOOR_MAX_RADIUS_YARDS]`.
+    /// clamped to `[SAME_TEAM_MIN_SEPARATION_YARDS, SEPARATION_FLOOR_MAX_RADIUS_YARDS]`. Builds the
+    /// inputs inline from live match state (the MPC obstacle builder is a `SoccerMatch` method with
+    /// no snapshot in hand).
     pub(crate) fn separation_floor_influence_radius(
         &self,
         player_id: usize,
@@ -402,13 +407,68 @@ impl WorldSnapshot {
         let Some(player) = self.players.get(player_id) else {
             return base_influence;
         };
-        let Some(inputs) = self.build_separation_floor_inputs(player) else {
-            return base_influence;
+        let pos = player.position;
+        let team = player.team;
+        // Possession from the ball holder's team (cheap; no snapshot needed).
+        let holder_team = self
+            .ball
+            .holder
+            .and_then(|h| self.players.get(h))
+            .map(|p| p.team);
+        let in_possession = holder_team == Some(team);
+        let defensive_phase = holder_team == Some(team.other());
+        let in_attacking_box = self.point_in_own_penalty_area(team.other(), pos);
+        let in_own_box = self.point_in_own_penalty_area(team, pos);
+        let mut nearest_teammate = f64::INFINITY;
+        let mut nearest_opp = f64::INFINITY;
+        let mut combine = 0usize;
+        for other in &self.players {
+            if other.id == player_id {
+                continue;
+            }
+            let d = other.position.distance(pos);
+            if other.team == team {
+                nearest_teammate = nearest_teammate.min(d);
+                if other.position.distance(self.ball.position) < 18.0 {
+                    combine += 1;
+                }
+            } else {
+                nearest_opp = nearest_opp.min(d);
+            }
+        }
+        let teammate_crowding = if nearest_teammate.is_finite() {
+            (1.0 - (nearest_teammate / 10.0).clamp(0.0, 1.0)).clamp(0.0, 1.0)
+        } else {
+            0.0
         };
-        let Some(bias) = self.separation_bias(&inputs) else {
-            return base_influence;
+        let space_around = if nearest_opp.is_finite() {
+            (nearest_opp / 12.0).clamp(0.0, 1.0)
+        } else {
+            1.0
         };
-        (base_influence + bias * SEPARATION_FLOOR_MAX_ADJUST_YARDS)
+        let near_ball =
+            (1.0 - (pos.distance(self.ball.position) / 20.0).clamp(0.0, 1.0)).clamp(0.0, 1.0);
+        let inputs = SeparationFloorInputs {
+            in_possession: in_possession as i32 as f64,
+            defensive_phase: defensive_phase as i32 as f64,
+            in_attacking_box: in_attacking_box as i32 as f64,
+            in_own_box: in_own_box as i32 as f64,
+            teammate_crowding,
+            space_around,
+            near_ball,
+            combine_support: (combine as f64 / 3.0).clamp(0.0, 1.0),
+            role_forward: (player.role == PlayerRole::Forward) as i32 as f64,
+        };
+        let bias = self
+            .separation_floor_head
+            .as_ref()
+            .filter(|head| head.training_steps() >= SEPARATION_FLOOR_HEAD_MIN_TRAINING_STEPS)
+            .and_then(|head| head.predict(&inputs))
+            .unwrap_or_else(|| analytic_separation_bias(&inputs));
+        if !bias.is_finite() {
+            return base_influence;
+        }
+        (base_influence + bias.clamp(-1.0, 1.0) * SEPARATION_FLOOR_MAX_ADJUST_YARDS)
             .clamp(SAME_TEAM_MIN_SEPARATION_YARDS, SEPARATION_FLOOR_MAX_RADIUS_YARDS)
     }
 }
