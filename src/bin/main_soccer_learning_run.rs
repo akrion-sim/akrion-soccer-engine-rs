@@ -1921,6 +1921,13 @@ static CARRIED_RECEIVE_APPROACH_HEAD: std::sync::Mutex<Option<ReceiveApproachHea
 static CARRIED_LANE_AFFINITY_HEAD: std::sync::Mutex<Option<LaneAffinityHead>> =
     std::sync::Mutex::new(None);
 
+/// In-memory goal-side recovery head (how hard a recovering defender collapses onto the
+/// ball→goal line vs. holds width), carried + trained across games WITHIN a learner process.
+/// Resets on pod restart; consumed live once it crosses
+/// `GOAL_SIDE_RECOVERY_HEAD_MIN_TRAINING_STEPS` (seam on by default in prod).
+static CARRIED_GOAL_SIDE_RECOVERY_HEAD: std::sync::Mutex<Option<GoalSideRecoveryHead>> =
+    std::sync::Mutex::new(None);
+
 /// In-memory learned pass-completion head, carried + trained across games WITHIN a learner
 /// process (seeded once from the Postgres corpus at startup), mirroring
 /// `CARRIED_LINE_DEPTH_HEAD`. Installed on each game so the pass-quality assessor consumes it
