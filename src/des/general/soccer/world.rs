@@ -50086,7 +50086,51 @@ impl WorldSnapshot {
                 team, centre_fwd, own_goal_fwd, ball_depth, max_depth,
             );
         }
+        // Learned GROUP line-depth head (promotion): the trained `BackFourLineHead` (or the
+        // analytic seed) refines WHERE inside the legal band the geometric v2 centre sits. It
+        // was previously reachable only from the legacy band path (bypassed while v2 is on),
+        // so enabling `DD_SOCCER_ENABLE_BACK_FOUR_LINE_MODEL` had no live effect; consulting it
+        // here makes the group MARL/MAPPO head actually drive the live (v2) line. Gated off by
+        // default ⇒ byte-identical; the blend keeps the well-tuned geometry dominant and the
+        // result is re-clamped to the legal `[own_goal, own_goal+max_depth]` band so the head
+        // can never set an illegal line.
+        if back_four_line_model_enabled() {
+            if let Some(model_centre_fwd) =
+                self.back_four_line_v2_model_centre_fwd(team, predicted_fwd, own_goal_fwd, max_depth)
+            {
+                let blend = BACK_FOUR_LINE_MODEL_BLEND.clamp(0.0, 1.0);
+                centre_fwd = (centre_fwd * (1.0 - blend) + model_centre_fwd * blend)
+                    .clamp(own_goal_fwd, own_goal_fwd + max_depth);
+            }
+        }
         centre_fwd
+    }
+
+    /// The GROUP line-depth head's preferred line CENTRE (attack frame) for the v2 path: build
+    /// the [`BackFourLineInputs`], take the trained head's gap fraction once it clears
+    /// [`LINE_DEPTH_HEAD_MIN_TRAINING_STEPS`] (else the analytic seed), and map the fraction to a
+    /// centre trailing the predicted ball by up to [`BACK_FOUR_LINE_DESIRED_GAP_MAX_YARDS`]
+    /// (`0` = level with the ball / high line, `1` = the full 40yd deep block). Clamped to the
+    /// legal band. `None` on a degenerate roster (the caller then keeps the geometric centre).
+    fn back_four_line_v2_model_centre_fwd(
+        &self,
+        team: Team,
+        predicted_fwd: f64,
+        own_goal_fwd: f64,
+        max_depth: f64,
+    ) -> Option<f64> {
+        let inputs = self.build_back_four_line_inputs(team)?;
+        let gap_fraction = self
+            .line_depth_head
+            .as_ref()
+            .filter(|head| head.training_steps() >= LINE_DEPTH_HEAD_MIN_TRAINING_STEPS)
+            .and_then(|head| head.predict(&inputs))
+            .unwrap_or_else(|| analytic_line_centre_gap_fraction(&inputs));
+        if !gap_fraction.is_finite() {
+            return None;
+        }
+        let model_centre_fwd = predicted_fwd - gap_fraction * BACK_FOUR_LINE_DESIRED_GAP_MAX_YARDS;
+        Some(model_centre_fwd.clamp(own_goal_fwd, own_goal_fwd + max_depth))
     }
 
     /// Aggressive **ball-far offside-trap push-up** of the line centre (attack frame). When the
