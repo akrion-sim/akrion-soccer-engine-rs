@@ -22507,6 +22507,41 @@ pub(crate) fn off_ball_space_discipline_adjustment(
     adj
 }
 
+/// Pure forward-run-when-unmarked candidate bias (see [`dd_soccer_enable_forward_run_when_unmarked`]).
+///
+/// Encodes the principle "an OPEN, UNMARKED off-ball player in possession who CAN run forward into
+/// space must not elect a backward run — the team should move forward in possession":
+/// * `forward` — the candidate's forward offset (yards) from the player's current position in the
+///   attacking frame (`+` ahead, `-` behind);
+/// * `forward_space_available` — whether the (already-established) unmarked player has a genuine
+///   forward-into-space option; this is the ONLY enabling condition, so when it is false the bias is
+///   exactly `0.0` and play is byte-identical (a legitimate drop when everything ahead is covered is
+///   untouched, and the whole term is inert when the gate is off);
+/// * `candidate_into_open_space` — whether THIS candidate is itself a forward, unmarked, clear-lane
+///   destination (reinforced) rather than merely forward-but-covered.
+///
+/// Returns the additive score bias: a veto-strength penalty on a backward candidate that scales with
+/// how far back it is (so the least-backward option is the least bad if a drop is somehow forced), a
+/// bonus on a forward-into-space candidate, else `0.0`.
+pub(crate) fn forward_run_when_unmarked_bias(
+    forward: f64,
+    forward_space_available: bool,
+    candidate_into_open_space: bool,
+) -> f64 {
+    if !forward_space_available {
+        return 0.0;
+    }
+    if forward < -FORWARD_RUN_UNMARKED_DIR_EPS_YARDS {
+        -(FORWARD_RUN_UNMARKED_BACKWARD_PENALTY_BASE
+            + (-forward - FORWARD_RUN_UNMARKED_DIR_EPS_YARDS)
+                * FORWARD_RUN_UNMARKED_BACKWARD_PENALTY_PER_YARD)
+    } else if forward > FORWARD_RUN_UNMARKED_DIR_EPS_YARDS && candidate_into_open_space {
+        (forward / 12.0).clamp(0.0, 1.5) * FORWARD_RUN_UNMARKED_FORWARD_BONUS
+    } else {
+        0.0
+    }
+}
+
 fn open_space_score_from_distances_with_axis_pressure(
     opponent_distance: f64,
     teammate_crowding: f64,
