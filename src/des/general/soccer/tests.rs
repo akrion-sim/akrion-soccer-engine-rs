@@ -20012,6 +20012,136 @@ fn lane_cutter_steps_in_even_when_teammates_are_closer_to_the_lane_point() {
     }
 }
 
+/// Serialise the pace-match tests that toggle `DD_SOCCER_ENABLE_LOOSE_BALL_OPPONENT_PACE_MATCH`:
+/// the gate re-reads the env each call under `cfg(test)`, so two running concurrently would see
+/// each other's `set_var`. Holding this lock keeps each one's on/off window to itself.
+fn loose_ball_pace_match_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A loose ball sits 12yd from our lone (committed) chaser with NO opponent inside the
+/// old proximity sprint radius — so distance alone would have it jog. But an opponent is
+/// bearing down on the contest point at a genuine sprint: our chaser must match that pace
+/// and sprint. A still opponent, and the gate off, both leave it jogging (byte-identical).
+#[test]
+fn loose_ball_chaser_matches_a_sprinting_opponents_pace() {
+    let _env = loose_ball_pace_match_env_lock();
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 44,
+        ..Default::default()
+    });
+    let chaser = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .unwrap();
+    let opponent = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .unwrap();
+    park_players_except(&mut sim, &[chaser, opponent]);
+
+    // Loose, near-stationary ball; our chaser 12yd away is the strict-closest home man
+    // (all team-mates parked far away) ⇒ the committed retriever.
+    sim.ball.holder = None;
+    sim.ball.position = Vec2::new(40.0, 60.0);
+    sim.ball.velocity = Vec2::new(0.0, 1.0);
+    sim.ball.altitude_yards = 0.0;
+    sim.players[chaser].position = Vec2::new(40.0, 48.0);
+    sim.players[chaser].velocity = Vec2::zero();
+    // Opponent 14yd beyond the ball (outside the 10yd pressured-sprint radius) but
+    // sprinting straight back onto the contest point.
+    sim.players[opponent].position = Vec2::new(40.0, 74.0);
+    sim.players[opponent].velocity = Vec2::new(0.0, -9.5);
+
+    let snap = WorldSnapshot::from_match(&sim);
+    assert!(
+        snap.is_committed_loose_ball_chaser(chaser),
+        "the strict-closest home outfielder must be the committed chaser"
+    );
+    let target = snap.loose_ball_recovery_target_for(chaser);
+
+    // Gate ON ⇒ a sprinting opponent forces a pace-matched sprint.
+    std::env::set_var("DD_SOCCER_ENABLE_LOOSE_BALL_OPPONENT_PACE_MATCH", "1");
+    assert!(
+        snap.loose_ball_opponent_pace_match_sprint(chaser, target),
+        "our chaser must sprint to match an opponent sprinting the loose ball down"
+    );
+
+    // A still opponent draws no forced sprint — distance would govern the gait.
+    let mut still = sim.clone();
+    still.players[opponent].velocity = Vec2::zero();
+    let still_snap = WorldSnapshot::from_match(&still);
+    assert!(
+        !still_snap.loose_ball_opponent_pace_match_sprint(chaser, target),
+        "a stationary opponent must not force a pace-matched sprint"
+    );
+
+    // Gate OFF ⇒ byte-identical no-op even against the sprinting opponent.
+    std::env::set_var("DD_SOCCER_ENABLE_LOOSE_BALL_OPPONENT_PACE_MATCH", "0");
+    assert!(
+        !snap.loose_ball_opponent_pace_match_sprint(chaser, target),
+        "gate off must leave the chase gait untouched"
+    );
+    std::env::remove_var("DD_SOCCER_ENABLE_LOOSE_BALL_OPPONENT_PACE_MATCH");
+}
+
+/// Only the elected 1–2 chasers keep up: a team-mate who is NOT a committed chaser (a
+/// far team-mate holding shape) draws no pace-matched sprint even with a sprinting
+/// opponent on the ball, so the whole team does not collapse onto the 50/50.
+#[test]
+fn loose_ball_pace_match_is_limited_to_committed_chasers() {
+    let _env = loose_ball_pace_match_env_lock();
+    std::env::set_var("DD_SOCCER_ENABLE_LOOSE_BALL_OPPONENT_PACE_MATCH", "1");
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 45,
+        ..Default::default()
+    });
+    let home: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .collect();
+    let opponent = home[0];
+    let home: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .collect();
+    let (chaser, far_mate) = (home[0], home[1]);
+    park_players_except(&mut sim, &[chaser, far_mate, opponent]);
+
+    sim.ball.holder = None;
+    sim.ball.position = Vec2::new(40.0, 60.0);
+    sim.ball.velocity = Vec2::new(0.0, 1.0);
+    sim.ball.altitude_yards = 0.0;
+    sim.players[chaser].position = Vec2::new(40.0, 52.0);
+    // The other team-mate is far away — not among the closest chasers.
+    sim.players[far_mate].position = Vec2::new(10.0, 20.0);
+    sim.players[opponent].position = Vec2::new(40.0, 74.0);
+    sim.players[opponent].velocity = Vec2::new(0.0, -9.5);
+
+    let snap = WorldSnapshot::from_match(&sim);
+    let far_target = snap.loose_ball_recovery_target_for(far_mate);
+    assert!(
+        !snap.is_committed_loose_ball_chaser(far_mate),
+        "the far team-mate must not be a committed chaser (guards the test premise)"
+    );
+    assert!(
+        !snap.loose_ball_opponent_pace_match_sprint(far_mate, far_target),
+        "a team-mate holding shape must not be dragged into a pace-matched sprint"
+    );
+    std::env::remove_var("DD_SOCCER_ENABLE_LOOSE_BALL_OPPONENT_PACE_MATCH");
+}
+
 #[test]
 fn committed_loose_ball_chaser_attacks_ball_before_support_shape() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
