@@ -59,10 +59,14 @@ pub use pitch_value::*;
 // re-export) — its public fns have deliberately generic names (`strength`,
 // `lane_match`) that read clearly as `lane_discipline::strength()`.
 mod back_four_line;
+// Per-defender individual line decision (the MAPPO layer on top of the back_four_line
+// group centre). Full-22 egocentric observation + analytic seed + shared policy head.
+mod back_four_individual;
 mod lane_discipline;
 mod lane_affinity_decision;
 pub use lane_affinity_decision::*;
 pub use back_four_line::*;
+pub use back_four_individual::*;
 mod loose_ball_commit;
 pub use loose_ball_commit::*;
 mod receive_approach;
