@@ -23601,8 +23601,8 @@ pub(crate) fn dd_soccer_enable_wasted_energy_penalty() -> bool {
 }
 /// Stricter, team-aware refinement of the wasted-energy penalty: only a genuine SUSTAINED
 /// flat-out sprint that bought NO positive team outcome (or personal touch) over the next 10s
-/// is docked. OFF by default; set `DD_SOCCER_ENABLE_SUSTAINED_EFFORT_NO_OUTCOME_PENALTY=1`.
-/// Off ⇒ byte-identical & zero-cost. See `SUSTAINED_EFFORT_*`.
+/// is docked. Default-ON in prod (kill switch `DD_SOCCER_ENABLE_SUSTAINED_EFFORT_NO_OUTCOME_PENALTY=0`);
+/// default-OFF under test ⇒ byte-identical & zero-cost. See `SUSTAINED_EFFORT_*`.
 pub(crate) fn dd_soccer_enable_sustained_effort_no_outcome_penalty() -> bool {
     #[cfg(test)]
     {
