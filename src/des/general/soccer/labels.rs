@@ -126,6 +126,7 @@ pub enum SoccerActionLabel {
     DummyLetRun,
     WideOutlet,
     ShotCreationRun,
+    PinchCrossArrival,
     OverlapRun,
     SetPlayRun,
     // --- defensive / utility ---
@@ -201,6 +202,7 @@ impl SoccerActionLabel {
             SoccerActionLabel::DummyLetRun => "dummy-let-run",
             SoccerActionLabel::WideOutlet => "wide-outlet",
             SoccerActionLabel::ShotCreationRun => "shot-creation-run",
+            SoccerActionLabel::PinchCrossArrival => "pinch-cross-arrival",
             SoccerActionLabel::OverlapRun => "overlap-run",
             SoccerActionLabel::SetPlayRun => "set-play-run",
             SoccerActionLabel::Defend => "defend",
@@ -272,6 +274,7 @@ impl SoccerActionLabel {
             "dummy-let-run" => SoccerActionLabel::DummyLetRun,
             "wide-outlet" => SoccerActionLabel::WideOutlet,
             "shot-creation-run" => SoccerActionLabel::ShotCreationRun,
+            "pinch-cross-arrival" => SoccerActionLabel::PinchCrossArrival,
             "overlap-run" => SoccerActionLabel::OverlapRun,
             "set-play-run" => SoccerActionLabel::SetPlayRun,
             "defend" => SoccerActionLabel::Defend,
