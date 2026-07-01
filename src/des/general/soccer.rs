@@ -102,6 +102,8 @@ mod winger_pinch_decision;
 pub use winger_pinch_decision::*;
 mod separation_floor_decision;
 pub use separation_floor_decision::*;
+mod pass_lane_yield_decision;
+pub use pass_lane_yield_decision::*;
 mod policy_select;
 pub use policy_select::*;
 mod pass_lane_yield;
@@ -51975,6 +51977,7 @@ fn tracking_frame_to_world_snapshot(
         goal_side_recovery_head: None,
         winger_pinch_head: None,
         separation_floor_head: None,
+        pass_lane_yield_head: None,
         long_pass_run_head: None,
         give_and_go_head: None,
         attack_spacing_head: None,

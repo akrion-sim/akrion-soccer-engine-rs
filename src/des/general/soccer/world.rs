@@ -603,6 +603,13 @@ pub struct SoccerMatch {
     pub(crate) separation_floor_samples: Vec<SeparationFloorSample>,
     /// Open separation decisions awaiting their windowed reward.
     pub(crate) pending_separation_floor: Vec<PendingSeparationFloorDecision>,
+    /// The trained pass-lane yield head (step out of the lane vs hold), when present. `None` ⇒
+    /// analytic seed. Shared into each [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) pass_lane_yield_head: Option<std::sync::Arc<PassLaneYieldHead>>,
+    /// Rolling RL corpus for the pass-lane yield head. Collected only while the model is enabled.
+    pub(crate) pass_lane_yield_samples: Vec<PassLaneYieldSample>,
+    /// Open pass-lane yield decisions awaiting their windowed reward.
+    pub(crate) pending_pass_lane_yield: Vec<PendingPassLaneYieldDecision>,
     /// The trained long-pass run head (which attacker should break forward so a deep carrier
     /// can pick them out), when present. Carried + trained across games by the learner; `None`
     /// ⇒ the analytic `backfield_long_pass_run_invite_for` seed. Shared into each
@@ -3163,6 +3170,9 @@ impl SoccerMatch {
             separation_floor_head: None,
             separation_floor_samples: Vec::new(),
             pending_separation_floor: Vec::new(),
+            pass_lane_yield_head: None,
+            pass_lane_yield_samples: Vec::new(),
+            pending_pass_lane_yield: Vec::new(),
             long_pass_run_head: None,
             long_pass_run_samples: Vec::new(),
             pending_long_pass_run: Vec::new(),
@@ -8670,6 +8680,9 @@ impl SoccerMatch {
         // Learnable same-team separation (spread vs combine) RL samples (no-op under test / when
         // disabled; live in prod, seeded by the ≈0 analytic prior).
         self.collect_separation_floor_rl_samples(&next_snapshot);
+        // Learnable pass-lane yield (step out vs hold) RL samples (no-op under test / when
+        // disabled; live in prod when pass-lane-yield is on).
+        self.collect_pass_lane_yield_rl_samples(&next_snapshot);
         self.collect_long_pass_run_rl_samples(&next_snapshot);
         // Learnable give-and-go / wall-pass appetite RL samples (no-op + byte-identical unless
         // `DD_SOCCER_ENABLE_LEARNED_GIVE_AND_GO` is set).
@@ -22226,6 +22239,10 @@ pub struct WorldSnapshot {
     /// MPC keep-out. `None` ⇒ analytic seed (parity). Skipped by serde.
     #[serde(skip)]
     pub(crate) separation_floor_head: Option<std::sync::Arc<SeparationFloorHead>>,
+    /// The trained pass-lane yield head, carried from the match for live consumption in the
+    /// pass-lane yield seam. `None` ⇒ analytic seed (parity). Skipped by serde.
+    #[serde(skip)]
+    pub(crate) pass_lane_yield_head: Option<std::sync::Arc<PassLaneYieldHead>>,
     /// The trained long-pass run head, carried from the match for live consumption in
     /// `backfield_long_pass_run_invite_for`. `None` ⇒ analytic seed (parity). Skipped by
     /// serde (an internal decision aid; Default = None).
@@ -24904,6 +24921,7 @@ impl WorldSnapshot {
             goal_side_recovery_head: m.goal_side_recovery_head.clone(),
             winger_pinch_head: m.winger_pinch_head.clone(),
             separation_floor_head: m.separation_floor_head.clone(),
+            pass_lane_yield_head: m.pass_lane_yield_head.clone(),
             long_pass_run_head: m.long_pass_run_head.clone(),
             give_and_go_head: m.give_and_go_head.clone(),
             attack_spacing_head: m.attack_spacing_head.clone(),
