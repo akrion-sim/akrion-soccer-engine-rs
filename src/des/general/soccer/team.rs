@@ -2744,16 +2744,30 @@ pub(crate) fn soccer_local_mpc_planar_obstacles(
             PlayerRole::Midfielder => 0.05,
             PlayerRole::Forward => 0.0,
         };
-        let radius = if same_team { 1.35 } else { 1.75 } + holder_bonus + role_radius_bonus;
+        let mut radius = if same_team { 1.35 } else { 1.75 } + holder_bonus + role_radius_bonus;
         let kinematic_pressure = 1.0
             + velocity.len().clamp(0.0, 16.0) / 48.0
             + acceleration.len().clamp(0.0, 14.0) / 56.0;
-        let weight = if same_team { 7.0 } else { 12.0 } * kinematic_pressure
+        let mut weight = if same_team { 7.0 } else { 12.0 } * kinematic_pressure
             + if snapshot.ball.holder == Some(other.id) {
                 4.0
             } else {
                 0.0
             };
+        // HARD same-team separation floor — the MPC keep-out layer. Inflate a teammate's
+        // avoidance radius to the 4yd floor (and strengthen its weight) so the point-mass
+        // planner routes a running trajectory AROUND teammates rather than through them,
+        // keeping the plan consistent with the movement barrier + graduated penalty. Waived
+        // when BOTH players are inside an 18-yard box (legitimate goalmouth congestion). No-op
+        // (byte-identical) when the gate is off.
+        if same_team && dd_soccer_enable_same_team_separation_floor() {
+            let both_in_box = soccer_point_in_either_penalty_area(player.position, width, length)
+                && soccer_point_in_either_penalty_area(other.position, width, length);
+            if !both_in_box {
+                radius = radius.max(SAME_TEAM_MIN_SEPARATION_YARDS);
+                weight *= SAME_TEAM_MPC_OBSTACLE_WEIGHT_GAIN;
+            }
+        }
         obstacles.push(PlanarObstacle {
             center: [center.x, center.y],
             velocity: [obstacle_velocity.x, obstacle_velocity.y],
