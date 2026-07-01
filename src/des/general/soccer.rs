@@ -5042,6 +5042,25 @@ static SOCCER_LAST_SITE_PLAYBACK_SEED: AtomicU32 = AtomicU32::new(0);
 const GOAL_URGENCY_MAX_YARDS: f64 = 30.0;
 const GOAL_URGENCY_KEEPER_CROWD_YARDS: f64 = 6.0;
 const SUPPORT_MIN_UPFIELD_PER_LATERAL_YARD: f64 = 0.10;
+// Forward-run-when-unmarked (gated `DD_SOCCER_ENABLE_FORWARD_RUN_WHEN_UNMARKED`, default-on).
+// Principle: in possession, an OPEN, UNMARKED off-ball player who CAN run forward into
+// space must not elect a backward run — the team should move forward in possession. These
+// tune the `open_space_for` bias that encodes it.
+/// "Unmarked" radius: no opponent within this many yards of the player / candidate point.
+const FORWARD_RUN_UNMARKED_MARK_RADIUS_YARDS: f64 = 6.0;
+/// Deadband (yards) before a candidate counts as genuinely forward / backward of the
+/// player's current position, so a square shuffle is neither vetoed nor rewarded.
+const FORWARD_RUN_UNMARKED_DIR_EPS_YARDS: f64 = 1.5;
+/// Veto-strength base penalty applied to a backward candidate when the player is unmarked
+/// and a forward-into-space option genuinely exists (comparable to the offside penalty, so
+/// it dominates the spacing/width pulls that would otherwise drag the runner backward).
+const FORWARD_RUN_UNMARKED_BACKWARD_PENALTY_BASE: f64 = 12.0;
+/// Additional per-yard penalty on how far backward the candidate is, so the least-backward
+/// option is the least bad if a drop is somehow still forced.
+const FORWARD_RUN_UNMARKED_BACKWARD_PENALTY_PER_YARD: f64 = 0.6;
+/// Reward scale for a forward candidate that runs into open, receivable space while the
+/// player is unmarked — reinforces the forward run the principle wants.
+const FORWARD_RUN_UNMARKED_FORWARD_BONUS: f64 = 2.2;
 const WIDE_OUTLET_TOUCHLINE_BUFFER_YARDS: f64 = 3.0;
 const WIDE_OUTLET_MIN_FORWARD_YARDS: f64 = 2.0;
 const WINGBACK_ATTACK_COVER_MIN_OTHER_PLAYERS_BEHIND_BALL: usize = 4;
