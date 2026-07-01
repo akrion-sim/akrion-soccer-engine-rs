@@ -41282,6 +41282,18 @@ impl WorldSnapshot {
                 .min(defensive_shape.back_four_horizontal_max_gap_yards * (n - 1.0))
                 .max(defensive_shape.back_four_horizontal_min_gap_yards * (n - 1.0))
         };
+        // Never let the block tuck narrower than (≈) the four's own formation span — otherwise the
+        // fullbacks are pulled a full lane infield off their home channels and the flanks are gifted
+        // (the "back four ignore their lane" bug). `line` is sorted by home x, so first/last home x
+        // are the min/max of the line's formation span. This only ever WIDENS the block.
+        let desired_width = if back_four_formation_width_floor_enabled() {
+            let home_span = (line.last().map(|(_, _, h)| h.x).unwrap_or(0.0)
+                - line.first().map(|(_, _, h)| h.x).unwrap_or(0.0))
+            .max(0.0);
+            desired_width.max(home_span * BACK_FOUR_FORMATION_WIDTH_FLOOR_FRACTION)
+        } else {
+            desired_width
+        };
         let half = desired_width * 0.5;
         let center = center_seed.clamp(half, self.field_width - half);
         let slot_step = desired_width / (n - 1.0).max(1.0);
