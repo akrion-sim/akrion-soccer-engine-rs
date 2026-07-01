@@ -44343,6 +44343,23 @@ fn soccer_live_pg_neural_tactical_only() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the live server shows the learner's best *candidate* rather than only the
+/// last promotion-gated `active` version. Default `false` (promoted-only). Set
+/// `SOCCER_LIVE_POLICY_INCLUDE_UNPROMOTED=1` so :5055 reflects the highest-fitness policy
+/// the learner has produced even when the promotion gate is holding it out of `active` —
+/// useful when the gate is strict and generations rarely promote. The refresh thread then
+/// hot-swaps to a new candidate only when a strictly higher-fitness one is published.
+#[cfg(feature = "postgres-persistence")]
+fn soccer_live_pg_include_unpromoted() -> bool {
+    std::env::var("SOCCER_LIVE_POLICY_INCLUDE_UNPROMOTED")
+        .ok()
+        .map(|raw| {
+            let raw = raw.trim().to_ascii_lowercase();
+            matches!(raw.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
 /// Whether the live server pays the (potentially minutes-long) initial Postgres policy load
 /// *before* binding the HTTP port. Default `false`: bind first and defer the first load to the
 /// background refresh thread (which does an immediate first pass), so `:5055` is never dead on
