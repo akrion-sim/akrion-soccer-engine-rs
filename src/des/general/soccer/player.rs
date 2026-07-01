@@ -1042,6 +1042,10 @@ pub struct WallPassPlan {
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocomotionCommitment {
+    /// Desired effort tier carried by the locomotion commitment. This is intentionally
+    /// separate from `PlayerAgent::movement_gait`, which is resolved from physical speed.
+    #[serde(default)]
+    pub committed_gait: MovementGait,
     /// Seconds the player has continuously held the current gait effort tier, summed
     /// per movement step from `dt`. Reset when the tier changes; gates downshifts.
     pub gait_held_seconds: f64,
@@ -1109,6 +1113,22 @@ pub struct PlayerAgent {
     /// `sustained_sprint_seconds` (reset together). See its note for the gating contract.
     #[serde(default)]
     pub sustained_sprint_distance_yards: f64,
+    /// Nested same-team-proximity dwell timers (seconds) for the GRACE window on the graduated
+    /// same-team separation penalty. Each accumulates while the nearest NON-EXEMPT teammate is
+    /// within the named radius and resets the instant the player is farther than that radius —
+    /// so they never reset when merely crossing into a TIGHTER band (the user's spec: time does
+    /// not reset moving inward). The graduated penalty only accrues once ANY timer passes its
+    /// band's grace: `< 7yd → 3s`, `< 6yd → 2s`, `< 5yd → 1s`. Because the bands nest
+    /// (`lt5 ≤ lt6 ≤ lt7`), a player who eases in slowly is caught by the 7yd/3s timer while one
+    /// who dives straight inside 5yd is caught by the 5yd/1s timer. Maintained only while the
+    /// separation floor is enabled; otherwise they stay 0 and are read by nothing, so the
+    /// simulation trajectory is byte-identical. Never gate a decision off these.
+    #[serde(default)]
+    pub same_team_proximity_dwell_lt7_seconds: f64,
+    #[serde(default)]
+    pub same_team_proximity_dwell_lt6_seconds: f64,
+    #[serde(default)]
+    pub same_team_proximity_dwell_lt5_seconds: f64,
     #[serde(default)]
     pub incoming_ball: Option<IncomingBallContext>,
     pub skills: SkillProfile,
@@ -2640,9 +2660,7 @@ pub(crate) fn player_mdp_mpc_comparison_trace(
         ),
         mpc_recommended_spin_rps: finite_metric(execution_estimate.recommended_spin_rps),
         mpc_recommended_curve: execution_estimate.recommended_curve.to_string(),
-        mpc_recommended_curve_technique: execution_estimate
-            .recommended_curve_technique
-            .to_string(),
+        mpc_recommended_curve_technique: execution_estimate.recommended_curve_technique.to_string(),
         mpc_execution_horizon_seconds: finite_metric(execution_estimate.horizon_seconds),
         mpc_reselect_reason: execution_estimate.reselect_reason.to_string(),
         mpc_guidance_present: true,
@@ -6435,6 +6453,7 @@ impl PlayerAgent {
             check_to_ball: snapshot.check_to_ball_target_for(self.id, self.home_position),
             in_behind: snapshot.in_behind_run_target_for(self.id),
             exploit_space: snapshot.exploit_space_run_target_for(self.id, self.home_position),
+            forward_receive: snapshot.open_forward_receive_run_target_for(self.id, self.home_position),
             wide_outlet: snapshot.wide_possession_outlet_target_for(self.id, self.home_position),
             flank_cross_arrival: snapshot
                 .flank_cross_arrival_target_for(self.id, self.home_position),
@@ -6565,13 +6584,26 @@ impl PlayerAgent {
                 true,
             ));
         }
-        if let Some(target) = special_targets.exploit_space {
-            let target = guarded_exploit_space_target(target);
+        if let Some(target) = special_targets
+            .forward_receive
+            .or(special_targets.exploit_space)
+        {
+            let target = if special_targets.forward_receive.is_some() {
+                target
+            } else {
+                guarded_exploit_space_target(target)
+            };
+            let forward_receive_lift = if special_targets.forward_receive.is_some() {
+                0.48 + holder_pressure_urgency * 0.10
+            } else {
+                0.0
+            };
             options.push(AgentActionOptionTrace::new(
                 "exploit-space-run",
                 special_score(
                     target,
-                    0.66 + shape_support_urgency * 0.16
+                    0.66 + forward_receive_lift
+                        + shape_support_urgency * 0.16
                         + holder_pressure_urgency * 0.14
                         + if advance_upfield_strategy_active {
                             0.26
@@ -6789,6 +6821,8 @@ impl PlayerAgent {
         {
             let strategy_floor = if exploit_space_strategy_active {
                 0.42
+            } else if special_targets.forward_receive.is_some() {
+                0.36
             } else {
                 0.0
             };
@@ -6805,6 +6839,9 @@ impl PlayerAgent {
                     },
                 );
             ensure_min_legal_option_probability(&mut options, "exploit-space-run", exploit_floor);
+            if special_targets.forward_receive.is_some() {
+                ensure_min_legal_option_probability(&mut options, "exploit-space-run", 0.58);
+            }
         }
         if options
             .iter()
@@ -8156,7 +8193,8 @@ impl PlayerAgent {
         let intent = snapshot.midfield_line_band_adjusted_intent(intent);
         let intent = snapshot.forward_line_band_adjusted_intent(intent);
         let intent = snapshot.wingback_width_adjusted_intent(intent);
-        snapshot.possession_wide_lane_floor_adjusted_intent(intent)
+        let intent = snapshot.possession_wide_lane_floor_adjusted_intent(intent);
+        snapshot.teammate_spacing_path_adjusted_intent(intent)
     }
 
     /// Per-tick decision entry. Thin wrapper over [`Self::run_time_step_with_context_inner`]
@@ -9836,13 +9874,13 @@ impl PlayerAgent {
                 let technique = ability01(self.skills.flair_passing) * 0.5
                     + ability01(self.skills.passing) * 0.3
                     + ability01(self.skills.vision) * 0.2;
-                let scoop_chance = (0.22 + technique * 0.56)
+                let scoop_chance = (1.24 + technique * 0.32)
                     .max(if scoop_strategy_requested {
-                        0.78 + technique * 0.10
+                        1.42 + technique * 0.24
                     } else {
                         0.0
                     })
-                    .clamp(0.0, if scoop_strategy_requested { 0.94 } else { 0.80 });
+                    .clamp(0.0, if scoop_strategy_requested { 1.72 } else { 1.60 });
                 (target, scoop_chance)
             });
             if let Some((_, scoop_chance)) = scoop_pass_option {
@@ -11773,12 +11811,19 @@ impl PlayerAgent {
                         }
                     }),
                     "exploit-space-run" => {
-                        support_context.special_targets.exploit_space.map(|point| {
+                        if let Some(point) = support_context.special_targets.forward_receive {
+                            Some(SupportMovementTarget {
+                                point,
+                                action_label: "exploit-space-run",
+                            })
+                        } else {
+                            support_context.special_targets.exploit_space.map(|point| {
                             SupportMovementTarget {
                                 point: guarded_support_special(point),
                                 action_label: "exploit-space-run",
                             }
                         })
+                        }
                     }
                     "wide-outlet" => support_context.special_targets.wide_outlet.map(|point| {
                         SupportMovementTarget {
