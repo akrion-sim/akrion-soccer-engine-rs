@@ -458,7 +458,10 @@ impl WorldSnapshot {
             cover_behind,
             is_primary_screener,
             width_hold_value,
-            is_wide_defender: self.is_wide_defender(player) as i32 as f64,
+            is_wide_defender: super::is_wide_defender_home_x(
+                player.home_position.x,
+                self.field_width,
+            ) as i32 as f64,
             ball_danger,
         })
     }
