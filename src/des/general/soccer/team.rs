@@ -2744,7 +2744,8 @@ pub(crate) fn soccer_local_mpc_planar_obstacles(
             PlayerRole::Midfielder => 0.05,
             PlayerRole::Forward => 0.0,
         };
-        let mut radius = if same_team { 1.35 } else { 1.75 } + holder_bonus + role_radius_bonus;
+        let mut radius: f64 =
+            if same_team { 1.35 } else { 1.75 } + holder_bonus + role_radius_bonus;
         let kinematic_pressure = 1.0
             + velocity.len().clamp(0.0, 16.0) / 48.0
             + acceleration.len().clamp(0.0, 14.0) / 56.0;
