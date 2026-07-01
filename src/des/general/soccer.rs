@@ -44515,6 +44515,12 @@ fn start_soccer_live_pg_policy_refresh(
     if refresh_seconds == 0 {
         return;
     }
+    // Exactly ONE refresh thread per process. Embedders like dd-soccer-rs build a fresh
+    // SoccerLiveHttpBridge per game session, so without this guard every game would spawn
+    // its own poller. The thread keeps the process-wide warm-policy cache current, and every
+    // new game session clones that cache on creation — so one refresher serves them all.
+    static REFRESH_STARTED: std::sync::Once = std::sync::Once::new();
+    REFRESH_STARTED.call_once(move || {
     // Promoted-only by default; `SOCCER_LIVE_POLICY_INCLUDE_UNPROMOTED=1` reflects the
     // learner's best candidate even while the promotion gate holds it out of `active`.
     let include_unpromoted = soccer_live_pg_include_unpromoted();
