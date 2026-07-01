@@ -2896,51 +2896,10 @@ pub(crate) fn nearest_same_team_distance_for_floor(
     nearest.is_finite().then_some(nearest)
 }
 
-/// Smoothly damp a player's velocity so it can never carry them across the 4-yard same-team
-/// separation floor: for each non-exempt teammate, the component of velocity directed TOWARD
-/// that teammate is scaled down (smoothstep) as the gap closes to the floor, reaching zero
-/// exactly at the floor — a smooth deceleration, not a hard stop. Tangential and outward
-/// motion is untouched, so a crowded player can still slide around or peel away freely.
-/// `obstacles` = `(teammate_position, exempt)` where `exempt` means both players are inside
-/// an 18-yard box.
-pub(crate) fn apply_same_team_separation_barrier(
-    me_pos: Vec2,
-    velocity: Vec2,
-    obstacles: &[(Vec2, bool)],
-    dt: f64,
-) -> Vec2 {
-    if dt <= 0.0 || !me_pos.x.is_finite() || !me_pos.y.is_finite() {
-        return velocity;
-    }
-    let floor = SAME_TEAM_MIN_SEPARATION_YARDS;
-    let influence = floor + SAME_TEAM_SEPARATION_INFLUENCE_YARDS;
-    let mut v = velocity;
-    for &(other_pos, exempt) in obstacles {
-        if exempt || !other_pos.x.is_finite() || !other_pos.y.is_finite() {
-            continue;
-        }
-        let delta = other_pos - me_pos; // points toward the teammate
-        let dist = delta.len();
-        if !dist.is_finite() || dist <= 1e-6 || dist >= influence {
-            continue;
-        }
-        let radial = delta * (1.0 / dist); // unit vector toward the teammate
-        let inward = v.dot(radial); // + = closing the gap
-        if inward <= 0.0 {
-            continue; // moving away / purely tangential: never constrained
-        }
-        // Smoothstep ramp: full inward speed allowed at/beyond the influence radius,
-        // tapering (C1-continuous) to zero at the floor — a gentle deceleration.
-        let x = ((dist - floor) / (influence - floor)).clamp(0.0, 1.0);
-        let ramp = x * x * (3.0 - 2.0 * x);
-        // Hard safety: also never close more than the remaining gap within this tick.
-        let physical_cap = ((dist - floor) / dt).max(0.0);
-        let allowed_inward = (inward * ramp).min(physical_cap);
-        // Rebuild the velocity with the reduced inward component (tangential preserved).
-        v = v + radial * (allowed_inward - inward);
-    }
-    v
-}
+// NOTE: an earlier design also damped a player's velocity to physically prevent crossing inside
+// 4yd (a "hard floor"). That was removed on purpose: per the directive it is NOT a hard floor —
+// closing inside 4yd is permitted, it just draws a strong/huge crowding penalty (the graduated
+// reward term below) plus an MPC route cost. The 4yd line lives on only as the penalty's peak.
 
 // The "hard" (tighter) overlap band of the legacy soft-spacing framework. Raised to 0.80 of the
 // minimum-spacing radius so it lands at 4yd outside the box (5 * 0.80) — deliberately aligned
