@@ -50253,6 +50253,14 @@ impl WorldSnapshot {
             }
             back_four_line_hold_target_fwd(cur_fwd, target_fwd, cap, BACK_FOUR_LINE_HOLD_DEADBAND_YARDS)
         };
+        // Per-defender MAPPO push/drop (the individual layer on top of the group centre):
+        // `+` steps THIS defender up toward the attackers, `−` drops it to cover a runner
+        // its collective centroid misses. It perturbs the target forward and is RE-CLAMPED
+        // to exactly the same legal band + offside cap as the group target, so it can only
+        // change where inside the legal line this defender eases to — never step it
+        // illegally ahead (playing a runner onside). `None` (model gated off / degenerate
+        // roster) ⇒ `0` ⇒ byte-identical to the group-only line.
+        let push = self.back_four_individual_push_delta(me).unwrap_or(0.0);
         // The flat trap is lifted while WE control (centre-backs split / full-backs
         // overlap), while a pass is in flight (offside already judged; lane-cutters
         // must be free to step), and when the offside law is suspended (a restart in
@@ -50260,7 +50268,9 @@ impl WorldSnapshot {
         // off deep in our own third: holding the flat 15yd line there is the point.
         let controls_ball = self.controlled_possession_team() == Some(me.team);
         if controls_ball || self.pending_pass.is_some() || self.offside_currently_suspended() {
-            return hold(clamped_fwd, None) * attack;
+            // No offside cap here (trap lifted) — the individual delta re-clamps to the band.
+            let adjusted = (clamped_fwd + push).clamp(deepest_fwd, shallowest_fwd);
+            return hold(adjusted, None) * attack;
         }
         let ahead_cap = centre_fwd + level_half_band;
         // While a carrier breaks through, the line must be free to DROP and cover, so
@@ -50270,7 +50280,10 @@ impl WorldSnapshot {
         } else {
             clamped_fwd.clamp(centre_fwd - level_half_band, ahead_cap)
         };
-        hold(leveled_fwd, Some(ahead_cap)) * attack
+        // Apply the individual delta, then re-clamp to the offside cap (never ahead) and no
+        // deeper than the own goal — a DROP always stays legal; a step-UP is capped flat.
+        let adjusted = (leveled_fwd + push).clamp(deepest_fwd, ahead_cap);
+        hold(adjusted, Some(ahead_cap)) * attack
     }
 
     /// Clamp a defender's target forward-position to the hard back-four line band so the four stay
