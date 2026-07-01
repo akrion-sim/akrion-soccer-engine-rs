@@ -22195,6 +22195,10 @@ pub struct WorldSnapshot {
     /// goal-side lateral-pull seam. `None` ⇒ analytic seed (parity). Skipped by serde.
     #[serde(skip)]
     pub(crate) goal_side_recovery_head: Option<std::sync::Arc<GoalSideRecoveryHead>>,
+    /// The trained winger pinch-appetite head, carried from the match for live consumption in the
+    /// winger-pinch bucket scoring. `None` ⇒ analytic seed (parity). Skipped by serde.
+    #[serde(skip)]
+    pub(crate) winger_pinch_head: Option<std::sync::Arc<WingerPinchHead>>,
     /// The trained long-pass run head, carried from the match for live consumption in
     /// `backfield_long_pass_run_invite_for`. `None` ⇒ analytic seed (parity). Skipped by
     /// serde (an internal decision aid; Default = None).
