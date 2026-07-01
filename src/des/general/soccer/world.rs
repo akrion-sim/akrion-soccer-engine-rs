@@ -15816,19 +15816,31 @@ impl SoccerMatch {
             let kinematic_weight = 1.0
                 + velocity.len().clamp(0.0, 18.0) / 54.0
                 + acceleration.len().clamp(0.0, 14.0) / 56.0;
+            let mut radius = if opponent {
+                opponent_radius
+            } else {
+                teammate_radius
+            } + holder_bonus;
+            let mut weight = if opponent {
+                keepout_weight
+            } else {
+                keepout_weight * 0.25
+            } * kinematic_weight;
+            // Same-team 4yd floor: inflate the keep-out to the floor + strengthen the route
+            // cost so the executed plan avoids crowding a teammate (unless both are in a box).
+            if !opponent && separation_floor_on {
+                let both_in_box =
+                    me_in_box && self.point_in_either_penalty_area(other.position);
+                if !both_in_box {
+                    radius = radius.max(SAME_TEAM_MIN_SEPARATION_YARDS);
+                    weight *= SAME_TEAM_MPC_OBSTACLE_WEIGHT_GAIN;
+                }
+            }
             obstacles.push(PlanarObstacle {
                 center: [center.x, center.y],
                 velocity: [obstacle_velocity.x, obstacle_velocity.y],
-                radius: if opponent {
-                    opponent_radius
-                } else {
-                    teammate_radius
-                } + holder_bonus,
-                weight: if opponent {
-                    keepout_weight
-                } else {
-                    keepout_weight * 0.25
-                } * kinematic_weight,
+                radius,
+                weight,
             });
         }
 
