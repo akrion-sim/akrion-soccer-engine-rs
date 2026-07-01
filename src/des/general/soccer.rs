@@ -2636,7 +2636,7 @@ fn default_spacing_params() -> SoccerSpacingParams {
 }
 
 const VERTICAL_LANE_COUNT: usize = PITCH_FINE_GRID_COLUMNS;
-const TEAMMATE_OCCUPIED_SPACE_RADIUS_YARDS: f64 = 8.0;
+const TEAMMATE_OCCUPIED_SPACE_RADIUS_YARDS: f64 = 7.0;
 const TEAMMATE_OCCUPIED_SPACE_HARD_RADIUS_YARDS: f64 = 4.0;
 const TEAMMATE_OCCUPIED_SPACE_MAX_PENALTY: f64 = 28.0;
 // Ball-carrier driving-lane keep-out. When a teammate is carrying the ball and
@@ -2714,10 +2714,11 @@ const TEAMMATE_MAX_SPACING_BOX_YARDS: f64 = 6.0;
 // both-in-box exception applies. Hard overlaps are policed sooner.
 const TEAMMATE_SPACING_HARD_FRACTION: f64 = 0.80;
 // Grace windows before a *sustained* overlap is flagged and one of the pair is
-// nudged to move. The target is two seconds to become consistent with the spacing
-// contract; legitimate handoffs still fit inside that window.
-const TEAMMATE_SPACING_SOFT_GRACE_SECONDS: f64 = 2.0;
-const TEAMMATE_SPACING_HARD_GRACE_SECONDS: f64 = 2.0;
+// nudged to move. Open-play bunching is tolerated longer at the edge of the
+// 7-yard floor, then the window shrinks as the pair gets tighter.
+const TEAMMATE_SPACING_GRACE_UNDER_SEVEN_SECONDS: f64 = 3.0;
+const TEAMMATE_SPACING_GRACE_UNDER_SIX_SECONDS: f64 = 2.0;
+const TEAMMATE_SPACING_GRACE_UNDER_FIVE_SECONDS: f64 = 1.0;
 // A separated pair cools its overlap clock back down at this multiple of real
 // time, so a single frame of separation does not instantly forgive a long camp,
 // but genuine dispersal clears the flag quickly.
@@ -23608,19 +23609,17 @@ fn soccer_decision_option_control_reward(decision: &AgentDecisionTrace) -> f64 {
 }
 
 pub(crate) fn teammate_spacing_warning_pressure_from_distance(distance_yards: f64) -> f64 {
-    if !distance_yards.is_finite()
-        || distance_yards <= TEAMMATE_OCCUPIED_SPACE_HARD_RADIUS_YARDS
-    {
+    if !distance_yards.is_finite() {
         return 1.0;
     }
     if distance_yards >= TEAMMATE_OCCUPIED_SPACE_RADIUS_YARDS {
         return 0.0;
     }
-    let t = ((distance_yards - TEAMMATE_OCCUPIED_SPACE_HARD_RADIUS_YARDS)
+    let t = ((TEAMMATE_OCCUPIED_SPACE_RADIUS_YARDS - distance_yards)
         / (TEAMMATE_OCCUPIED_SPACE_RADIUS_YARDS - TEAMMATE_OCCUPIED_SPACE_HARD_RADIUS_YARDS)
             .max(1e-6))
     .clamp(0.0, 1.0);
-    1.0 - smoothstep_unit(t)
+    smoothstep_unit(t)
 }
 
 fn clear_lane_support_spacing_fit(distance_yards: f64) -> f64 {

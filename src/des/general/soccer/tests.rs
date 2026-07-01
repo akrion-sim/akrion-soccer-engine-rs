@@ -52637,34 +52637,90 @@ fn camp_pair_for(sim: &mut SoccerMatch, a: usize, b: usize, pa: Vec2, pb: Vec2, 
 
 #[test]
 fn teammate_spacing_notice_fires_only_after_the_grace_window() {
-    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
-    let (a, b) = (2usize, 3usize);
-    park_players_except(&mut sim, &[a, b]);
-    sim.active_set_play = None;
-    sim.ball.holder = None;
-    // 1 yd apart at midfield: the tight "hard" band, tolerated for 2 s.
-    let (pa, pb) = (Vec2::new(40.0, 60.0), Vec2::new(41.0, 60.0));
+    fn assert_grace_band(distance: f64, before_seconds: f64, extra_seconds: f64, label: &str) {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let (a, b) = (2usize, 3usize);
+        park_players_except(&mut sim, &[a, b]);
+        sim.active_set_play = None;
+        sim.ball.holder = None;
+        let (pa, pb) = (
+            Vec2::new(40.0, 60.0),
+            Vec2::new(40.0 + distance, 60.0),
+        );
 
-    // Well inside the 2 s window — a brief overlap (a handoff/block) is fine.
-    camp_pair_for(&mut sim, a, b, pa, pb, 1.5);
+        camp_pair_for(&mut sim, a, b, pa, pb, before_seconds);
+        assert!(
+            pair_notice(&sim, a, b).is_none(),
+            "{label}: pair should still be inside its grace window at {before_seconds}s"
+        );
+
+        camp_pair_for(&mut sim, a, b, pa, pb, extra_seconds);
+        let notice = pair_notice(&sim, a, b)
+            .unwrap_or_else(|| panic!("{label}: sustained spacing penalty should be flagged"));
+        assert!(
+            notice.severity > 0.0,
+            "{label}: distance-weighted severity should be positive"
+        );
+        let other = if notice.player_id == a { b } else { a };
+        let before_gap = sim.players[notice.player_id]
+            .position
+            .distance(sim.players[other].position);
+        let after_gap = notice.suggested_point.distance(sim.players[other].position);
+        assert!(
+            after_gap > before_gap,
+            "{label}: the suggested move-off spot should open up space"
+        );
+    }
+
+    assert_grace_band(6.5, 2.8, 0.4, "under 7 yd gets 3 s grace");
+    assert_grace_band(5.5, 1.8, 0.4, "under 6 yd gets 2 s grace");
+    assert_grace_band(4.5, 0.8, 0.4, "under 5 yd gets 1 s grace");
+
+    let mut clear = SoccerMatch::default_11v11(MatchConfig::default());
+    let (a, b) = (2usize, 3usize);
+    park_players_except(&mut clear, &[a, b]);
+    clear.active_set_play = None;
+    clear.ball.holder = None;
+    camp_pair_for(
+        &mut clear,
+        a,
+        b,
+        Vec2::new(40.0, 60.0),
+        Vec2::new(47.0, 60.0),
+        4.2,
+    );
     assert!(
-        pair_notice(&sim, a, b).is_none(),
-        "an overlap inside the grace window must not be policed"
+        pair_notice(&clear, a, b).is_none(),
+        "exactly 7 yd apart should not start the less-than-7 penalty clock"
     );
 
-    // Past the window: one of the pair is now told to move, with a spot that
-    // genuinely adds space relative to the partner.
-    camp_pair_for(&mut sim, a, b, pa, pb, 0.8);
-    let notice = pair_notice(&sim, a, b).expect("a sustained 1-yd overlap should be flagged");
-    assert!(notice.severity > 0.0);
-    let other = if notice.player_id == a { b } else { a };
-    let before_gap = sim.players[notice.player_id]
-        .position
-        .distance(sim.players[other].position);
-    let after_gap = notice.suggested_point.distance(sim.players[other].position);
+    let mut sliding = SoccerMatch::default_11v11(MatchConfig {
+        dt_seconds: 0.05,
+        ..Default::default()
+    });
+    park_players_except(&mut sliding, &[a, b]);
+    sliding.active_set_play = None;
+    sliding.ball.holder = None;
+    let base = Vec2::new(40.0, 60.0);
+    camp_pair_for(&mut sliding, a, b, base, base + Vec2::new(6.5, 0.0), 2.5);
     assert!(
-        after_gap > before_gap,
-        "the suggested move-off spot should open up space"
+        pair_notice(&sliding, a, b).is_none(),
+        "2.5s at 6.5 yd should still be inside the 3s under-7 grace"
+    );
+    camp_pair_for(&mut sliding, a, b, base, base + Vec2::new(5.5, 0.0), 0.25);
+    assert!(
+        pair_notice(&sliding, a, b).is_none(),
+        "moving into the under-6 band must not reset or retroactively expire the under-7 grace"
+    );
+    camp_pair_for(&mut sliding, a, b, base, base + Vec2::new(3.5, 0.0), 0.20);
+    assert!(
+        pair_notice(&sliding, a, b).is_none(),
+        "after 2.95s total under 7 yd, the pair should still have about 0.05s left"
+    );
+    camp_pair_for(&mut sliding, a, b, base, base + Vec2::new(3.5, 0.0), 0.10);
+    assert!(
+        pair_notice(&sliding, a, b).is_some(),
+        "after crossing 3s total under 7 yd, the penalty should start even though under-5 time did not reset it"
     );
 }
 
@@ -52736,7 +52792,7 @@ fn committed_loose_ball_contesters_are_exempt_from_the_spacing_nudge() {
 #[test]
 fn teammate_spacing_minimum_tightens_inside_the_box() {
     let (a, b) = (2usize, 3usize);
-    // (a) 4.5 yd apart in open play violates the 5-yd spacing target -> flagged.
+    // (a) 4.5 yd apart in open play violates the 7-yd spacing penalty band -> flagged.
     let mut mid = SoccerMatch::default_11v11(MatchConfig::default());
     park_players_except(&mut mid, &[a, b]);
     mid.active_set_play = None;
@@ -52751,7 +52807,7 @@ fn teammate_spacing_minimum_tightens_inside_the_box() {
     );
     assert!(
         pair_notice(&mid, a, b).is_some(),
-        "4.5 yd apart in open play is inside the 5-yd spacing target and should be policed"
+        "4.5 yd apart in open play is inside the 7-yd spacing penalty band and should be policed"
     );
 
     // (b) a 3.5-yd gap inside a penalty box is fine (3-yd spacing target there).
@@ -59943,18 +59999,16 @@ fn spacing_scores_reward_the_in_band_separation() {
 }
 
 #[test]
-fn teammate_spacing_warning_pressure_tapers_from_four_to_eight_yards() {
+fn teammate_spacing_warning_pressure_ramps_from_seven_to_four_yards() {
     let p4 = teammate_occupied_space_pressure_from_distance(4.0);
     let p5 = teammate_occupied_space_pressure_from_distance(5.0);
     let p6 = teammate_occupied_space_pressure_from_distance(6.0);
     let p7 = teammate_occupied_space_pressure_from_distance(7.0);
-    let p8 = teammate_occupied_space_pressure_from_distance(8.0);
 
     assert!((p4 - 1.0).abs() < 1e-9, "4yd must be saturated pressure: {p4}");
-    assert!(p5 > 0.80, "5yd should still be a big penalty: {p5}");
-    assert!(p6 > 0.40 && p6 < p5, "6yd should be medium pressure: {p6}");
-    assert!(p7 > 0.05 && p7 < p6, "7yd should be small pressure: {p7}");
-    assert!(p8 <= 1e-9, "8yd should be clear of the warning band: {p8}");
+    assert!(p5 > 0.65, "5yd should be a steep penalty: {p5}");
+    assert!(p6 > 0.20 && p6 < p5, "6yd should be rising pressure: {p6}");
+    assert!(p7 <= 1e-9, "7yd should be clear of the warning band: {p7}");
 }
 
 #[test]
