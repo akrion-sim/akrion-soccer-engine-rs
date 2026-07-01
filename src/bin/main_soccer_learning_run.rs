@@ -2239,6 +2239,23 @@ fn run_game(
             final_loss
         );
     }
+    // Train the CARRIED pass-lane yield head on this game's reward-weighted RL corpus.
+    let pass_lane_yield_samples = sim.drain_pass_lane_yield_samples();
+    if !pass_lane_yield_samples.is_empty() {
+        let mut guard = CARRIED_PASS_LANE_YIELD_HEAD.lock().unwrap();
+        let head = guard.get_or_insert_with(|| PassLaneYieldHead::new(episode_seed as u32));
+        let mut final_loss = 0.0;
+        for _ in 0..4 {
+            final_loss = head.train_reward_weighted(&pass_lane_yield_samples, 0.02);
+        }
+        eprintln!(
+            "pass_lane_yield_training samples={} training_steps={} consumed={} final_loss={:.5}",
+            pass_lane_yield_samples.len(),
+            head.training_steps(),
+            head.training_steps() >= PASS_LANE_YIELD_HEAD_MIN_TRAINING_STEPS,
+            final_loss
+        );
+    }
     // Train the CARRIED long-pass run head on this game's reward-weighted RL corpus (which
     // attacker breaking forward led to the team advancing the ball). Empty + skipped unless
     // DD_SOCCER_ENABLE_LEARNED_LONG_PASS_RUN is set.
