@@ -2052,6 +2052,11 @@ fn run_game(
     if let Some(head) = CARRIED_LINE_DEPTH_HEAD.lock().unwrap().as_ref() {
         sim.set_line_depth_head(head.clone());
     }
+    // Install the carried per-defender individual line head so the per-defender push/drop
+    // seam consumes it live once trained. No-op unless the individual model is enabled.
+    if let Some(head) = CARRIED_DEFENDER_LINE_HEAD.lock().unwrap().as_ref() {
+        sim.set_defender_line_head(head.clone());
+    }
     // Install the carried loose-ball commit head so the retriever election consumes it
     // live once trained. No-op unless the commit model is enabled.
     if let Some(head) = CARRIED_LOOSE_BALL_COMMIT_HEAD.lock().unwrap().as_ref() {
