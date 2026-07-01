@@ -147,8 +147,7 @@ pub fn analytic_winger_pinch_bias(inputs: &WingerPinchInputs) -> f64 {
 #[derive(Clone, Debug, PartialEq)]
 pub struct WingerPinchSample {
     pub inputs: WingerPinchInputs,
-    /// The pinch action taken, in `[-1, 1]` (`+` = pinched infield). Derived from the realised
-    /// bucket (`StayWide` → negative, a pinch → positive), blended with the bias used.
+    /// The pinch-appetite action taken, in `[-1, 1]` (`+` = leaned toward pinching infield).
     pub action_bias: f64,
     pub reward: f64,
 }
