@@ -53,6 +53,7 @@ pub enum SoccerActionLabel {
     Pass,
     AerialPass,
     WallPass,
+    WallReturn,
     KillerPass,
     SurprisePass,
     ScoopPass,
@@ -124,11 +125,16 @@ pub enum SoccerActionLabel {
     /// Off-ball/in-flight: the same middle-player read, but expressed as a dummy
     /// through decision — do not trap the pass; let it continue to the outer runner.
     DummyLetRun,
+    /// Off-ball: step out of the carrier-to-runner lane so a longer teammate pass stays open.
+    LaneYield,
     WideOutlet,
     ShotCreationRun,
     PinchCrossArrival,
     OverlapRun,
+    SupportPushUp,
     SetPlayRun,
+    /// Off-ball: fan into a keeper build-up lane when the goalkeeper is safely collecting.
+    BuildupReceive,
     // --- defensive / utility ---
     Defend,
     DefendShape,
@@ -152,6 +158,7 @@ impl SoccerActionLabel {
             SoccerActionLabel::Pass => "pass",
             SoccerActionLabel::AerialPass => "aerial-pass",
             SoccerActionLabel::WallPass => "wall-pass",
+            SoccerActionLabel::WallReturn => "wall-return",
             SoccerActionLabel::KillerPass => "killer-pass",
             SoccerActionLabel::SurprisePass => "surprise-pass",
             SoccerActionLabel::ScoopPass => "scoop-pass",
@@ -200,11 +207,14 @@ impl SoccerActionLabel {
             SoccerActionLabel::VacateSpace => "vacate-space",
             SoccerActionLabel::DummyClearLane => "dummy-clear-lane",
             SoccerActionLabel::DummyLetRun => "dummy-let-run",
+            SoccerActionLabel::LaneYield => "lane-yield",
             SoccerActionLabel::WideOutlet => "wide-outlet",
             SoccerActionLabel::ShotCreationRun => "shot-creation-run",
             SoccerActionLabel::PinchCrossArrival => "pinch-cross-arrival",
             SoccerActionLabel::OverlapRun => "overlap-run",
+            SoccerActionLabel::SupportPushUp => "support-push-up",
             SoccerActionLabel::SetPlayRun => "set-play-run",
+            SoccerActionLabel::BuildupReceive => "buildup-receive",
             SoccerActionLabel::Defend => "defend",
             SoccerActionLabel::DefendShape => "defend-shape",
             SoccerActionLabel::DefendRoam => "defend-roam",
@@ -224,6 +234,7 @@ impl SoccerActionLabel {
             "pass" => SoccerActionLabel::Pass,
             "aerial-pass" => SoccerActionLabel::AerialPass,
             "wall-pass" => SoccerActionLabel::WallPass,
+            "wall-return" => SoccerActionLabel::WallReturn,
             "killer-pass" => SoccerActionLabel::KillerPass,
             "surprise-pass" => SoccerActionLabel::SurprisePass,
             "scoop-pass" => SoccerActionLabel::ScoopPass,
@@ -272,11 +283,14 @@ impl SoccerActionLabel {
             "vacate-space" => SoccerActionLabel::VacateSpace,
             "dummy-clear-lane" => SoccerActionLabel::DummyClearLane,
             "dummy-let-run" => SoccerActionLabel::DummyLetRun,
+            "lane-yield" => SoccerActionLabel::LaneYield,
             "wide-outlet" => SoccerActionLabel::WideOutlet,
             "shot-creation-run" => SoccerActionLabel::ShotCreationRun,
             "pinch-cross-arrival" => SoccerActionLabel::PinchCrossArrival,
             "overlap-run" => SoccerActionLabel::OverlapRun,
+            "support-push-up" => SoccerActionLabel::SupportPushUp,
             "set-play-run" => SoccerActionLabel::SetPlayRun,
+            "buildup-receive" => SoccerActionLabel::BuildupReceive,
             "defend" => SoccerActionLabel::Defend,
             "defend-shape" => SoccerActionLabel::DefendShape,
             "defend-roam" => SoccerActionLabel::DefendRoam,
@@ -304,6 +318,15 @@ impl SoccerActionLabel {
             "aerial-pass1" | "aerial-pass2" | "aerial-pass3" => "aerial-pass",
             "wall-pass" | "wall_pass" | "wallpass" | "give-and-go" | "give_and_go" | "giveandgo"
             | "one-two-pass" | "one_two_pass" | "onetwopass" => "wall-pass",
+            "wall-return"
+            | "wall_return"
+            | "wallreturn"
+            | "give-and-go-return"
+            | "give_and_go_return"
+            | "giveandgoreturn"
+            | "one-two-return"
+            | "one_two_return"
+            | "onetworeturn" => "wall-return",
             "corner-flag-cross"
             | "corner_flag_cross"
             | "cornerflagcross"
@@ -316,16 +339,17 @@ impl SoccerActionLabel {
             "vertical-attack"
             | "vertical_attack"
             | "verticalattack"
-            | "support-push-up"
-            | "supportpushup"
-            | "support_push_up"
-            | "pushup"
-            | "push-up"
             | "attack-vertical"
             | "attack_vertical"
             | "drive-forward"
             | "drive_forward"
             | "driveforward" => "vertical-attack",
+            "support-push-up"
+            | "support_push_up"
+            | "supportpushup"
+            | "push-up"
+            | "push_up"
+            | "pushup" => "support-push-up",
             "vacate-space"
             | "vacate_space"
             | "vacatespace"
@@ -542,11 +566,20 @@ impl SoccerActionLabel {
             | "space-run"
             | "space_run" => "exploit-space-run",
             "wideoutlet" | "wide_outlet" | "touchlineoutlet" | "touchline-outlet" => "wide-outlet",
+            "lane_yield" | "laneyield" | "yield-lane" | "yield_lane" => "lane-yield",
             "shotcreationrun" | "shot_creation_run" | "shootingrun" | "shooting-run" => {
                 "shot-creation-run"
             }
             "overlap" | "overlaprun" | "overlap_run" => "overlap-run",
             "supportscreen" | "support_screen" | "screenrun" | "screen-run" => "support-screen",
+            "buildup_receive"
+            | "buildupreceive"
+            | "build-up-receive"
+            | "build_up_receive"
+            | "buildup-lane-receive"
+            | "buildup_lane_receive"
+            | "keeper-buildup-receive"
+            | "keeper_buildup_receive" => "buildup-receive",
             _ => return None,
         };
         Some(canonical)
@@ -676,12 +709,16 @@ mod tests {
     fn canonical_round_trips_through_enum() {
         for canonical in [
             "pass",
+            "wall-return",
             "slide-tackle",
             "recycle-reset",
             "flank-high-cross",
             "exploit-space-run",
             "dummy-clear-lane",
             "dummy-let-run",
+            "lane-yield",
+            "buildup-receive",
+            "support-push-up",
             "hold",
             "defend",
             "space",

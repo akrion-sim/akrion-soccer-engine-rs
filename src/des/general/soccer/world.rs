@@ -1231,24 +1231,35 @@ fn learned_policy_action_has_mpc_definition(action: &str) -> bool {
                 | "clearance"
                 | "route-one"
                 | "hold"
+                | "wait-for-support"
                 | "space"
                 | "control-touch"
                 | "defend"
+                | "defend-shape"
+                | "defend-roam"
                 | "press-cover"
                 | "recover"
                 | "tackle"
+                | "slide-tackle"
                 | "blindside-steal"
                 | "vacate-space"
                 | "support-shape"
                 | "support-roam"
                 | "support-screen"
+                | "support-push-up"
                 | "check-to-ball"
                 | "run-in-behind"
+                | "one-two-run"
                 | "exploit-space-run"
                 | "wide-outlet"
                 | "shot-creation-run"
+                | "pinch-cross-arrival"
                 | "overlap-run"
+                | "dummy-clear-lane"
+                | "dummy-let-run"
+                | "lane-yield"
                 | "set-play-run"
+                | "buildup-receive"
                 | "keeper-survey-hands"
                 | "keeper-foot-control-outside-box"
                 | "keeper-mpc-floor-pass"
@@ -5820,8 +5831,21 @@ impl SoccerMatch {
             ));
         }
         if let Some(flight) = pass_like_action_flight(label) {
+            let wall_return_plan;
+            let pass_plan = if label == "wall-return" && plan.target_player.is_none() {
+                let return_target = snapshot.wall_return_pass_target_for(player_id);
+                wall_return_plan = SoccerLearnedPlan {
+                    action: plan.action.clone(),
+                    target_player: return_target,
+                    target_point: return_target.and_then(|target| snapshot.player_position(target)),
+                    mpc_replan: plan.mpc_replan.clone(),
+                };
+                &wall_return_plan
+            } else {
+                plan
+            };
             return Some(Self::learned_pass_mpc_execution_probability(
-                snapshot, player_id, plan, flight,
+                snapshot, player_id, pass_plan, flight,
             ));
         }
         if let Some(kind) = dribble_move_kind_for_action_label(label) {
@@ -6126,13 +6150,47 @@ impl SoccerMatch {
         }
         let current = snapshot.player_snapshot_position(player);
         let target = match label {
-            "tackle" | "blindside-steal" => snapshot
+            "tackle" | "slide-tackle" | "blindside-steal" => snapshot
                 .ball
                 .holder
                 .and_then(|holder| snapshot.player_position(holder)),
-            "defend" | "press-cover" => {
+            "defend" | "defend-shape" => {
                 Some(snapshot.defensive_assignment_for(player.id, player.home_position, false))
             }
+            "defend-roam" | "press-cover" => Some(snapshot.goal_side_defensive_target_for(
+                player.id,
+                snapshot.defensive_assignment_for(player.id, player.home_position, true),
+            )),
+            "dummy-clear-lane" => snapshot.teammate_pass_lane_clearance_target_for(player.id),
+            "dummy-let-run" => snapshot.teammate_dummy_let_run_target_for(player.id),
+            "lane-yield" => snapshot
+                .pass_lane_yield_target_for(player.id, player.home_position)
+                .map(|(target, _)| target),
+            "buildup-receive" => Some(
+                snapshot.goalkeeper_buildup_lane_target_for(player.id, player.home_position),
+            ),
+            "check-to-ball" => {
+                snapshot.check_to_ball_target_for(player.id, player.home_position)
+            }
+            "run-in-behind" => snapshot.in_behind_run_target_for(player.id),
+            "one-two-run" => snapshot.one_two_run_target_for(player.id),
+            "wide-outlet" => {
+                snapshot.wide_possession_outlet_target_for(player.id, player.home_position)
+            }
+            "pinch-cross-arrival" => {
+                snapshot.flank_cross_arrival_target_for(player.id, player.home_position)
+            }
+            "exploit-space-run" | "shot-creation-run" | "overlap-run" | "support-screen"
+            | "support-push-up" | "support-shape" | "support-roam" | "vacate-space"
+            | "set-play-run" => Some(
+                snapshot
+                    .attacking_support_movement_for(
+                        player.id,
+                        player.home_position,
+                        matches!(label, "support-roam" | "overlap-run" | "vacate-space"),
+                    )
+                    .point,
+            ),
             "keeper-position" | "keeper-save" => {
                 Some(snapshot.goalkeeper_ball_goal_tracking_target(player.team))
             }
@@ -6198,7 +6256,14 @@ impl SoccerMatch {
             .player_velocity(player_id)
             .unwrap_or(player.velocity);
         let execution_skill = match label {
-            "tackle" | "defend" | "press-cover" | "keeper-save" => {
+            "tackle"
+            | "slide-tackle"
+            | "blindside-steal"
+            | "defend"
+            | "defend-shape"
+            | "defend-roam"
+            | "press-cover"
+            | "keeper-save" => {
                 ability01(player.skills.defending) * 0.48
                     + ability01(player.skills.acceleration) * 0.22
                     + ability01(player.skills.strength) * 0.18
@@ -10349,7 +10414,7 @@ impl SoccerMatch {
         if !has_teammate || !has_opponent {
             return;
         }
-        self.record_reward_event(winner, 6.0);
+        self.record_reward_event(winner, WON_FIFTY_FIFTY_DUEL_REWARD_POINTS);
         for (player_id, team) in contenders {
             if team != winner_team {
                 self.record_reward_event(player_id, -LOST_FIFTY_FIFTY_DUEL_PENALTY_POINTS);

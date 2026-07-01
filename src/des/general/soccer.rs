@@ -1630,15 +1630,15 @@ const ILLEGAL_SHORT_PASS_MAX_YARDS: f64 = 3.0;
 // about 5x the distance-risk units of a 10yd backward ball.
 const BACKWARD_PASS_DISTANCE_RISK_REFERENCE_YARDS: f64 = 10.0;
 const BACKWARD_PASS_DISTANCE_RISK_EXPONENT: f64 = 2.321_928_094_887_362; // log2(5)
-const LONG_BACKWARD_PASS_PENALTY_PER_RISK_UNIT: f64 = 7.6;
+const LONG_BACKWARD_PASS_PENALTY_PER_RISK_UNIT: f64 = 9.8;
 const BACKWARD_PASS_COMPLETION_RISK_PER_UNIT: f64 = 0.13;
 const BACKWARD_PASS_HIGH_PRESSURE_MIN: f64 = 0.72;
 const BACKWARD_PASS_HIGH_PRESSURE_FULL: f64 = 0.88;
 const BACKWARD_PASS_CONSTRAINED_TOUCHLINE_MARGIN_YARDS: f64 = 5.0;
 const BACKWARD_PASS_CONSTRAINED_CORNER_DEPTH_YARDS: f64 = 12.0;
 const BACKWARD_PASS_BOUNDARY_PRESSURE_OPP_RADIUS_YARDS: f64 = 3.0;
-const BACKWARD_PASS_LOW_PRESSURE_BASE_PENALTY: f64 = 10.5;
-const BACKWARD_PASS_LOW_PRESSURE_RISK_PENALTY_PER_UNIT: f64 = 8.8;
+const BACKWARD_PASS_LOW_PRESSURE_BASE_PENALTY: f64 = 12.5;
+const BACKWARD_PASS_LOW_PRESSURE_RISK_PENALTY_PER_UNIT: f64 = 11.0;
 // Opponents standing in the path of a backward pass make that retreat progressively riskier.
 // Traffic count stays linear, while backward distance uses the compounding risk curve; short
 // 3-5yd resets stay free from corridor-traffic pricing.
@@ -1826,6 +1826,7 @@ pub(crate) const KEEPER_GIVEAWAY_DANGER_ZONE_MAX_MULT: f64 = 2.0;
 // flurry of turnovers can't back up the deferred-training queue.
 const TURNOVER_PENALTY_MAX_TRANSITIONS: usize = 64;
 const FAILED_DISPOSSESSION_PENALTY_POINTS: f64 = 2.0;
+const WON_FIFTY_FIFTY_DUEL_REWARD_POINTS: f64 = DEFENSIVE_DISPOSSESSION_REWARD_POINTS;
 const LOST_FIFTY_FIFTY_DUEL_PENALTY_POINTS: f64 = FAILED_DISPOSSESSION_PENALTY_POINTS;
 // --- Wasted-energy penalty (off-ball running with no ball involvement) ------------
 // A small, retroactive MDP/POMDP cost for locomotion energy a player spends in a tick
@@ -2109,12 +2110,12 @@ const BACKWARD_PASS_MIN_PENALIZED_YARDS: f64 = 2.0;
 /// shrink) but still requires a close opponent; mere positional urgency is not enough.
 const BACKWARD_PASS_HIGH_PRESSURE_RADIUS_YARDS: f64 = 3.0;
 /// Base penalty points for an UNPRESSURED backward pass, before the distance term.
-const BACKWARD_PASS_BASE_PENALTY_POINTS: f64 = 2.0;
+const BACKWARD_PASS_BASE_PENALTY_POINTS: f64 = 3.5;
 /// Extra penalty points per yard of backward distance — the deeper the ball is played back the
 /// worse it is, so a long recycle toward our own goal is punished far more than a short drop.
-const BACKWARD_PASS_PENALTY_PER_YARD_POINTS: f64 = 0.5;
+const BACKWARD_PASS_PENALTY_PER_YARD_POINTS: f64 = 0.85;
 /// Cap on the total unpressured-backward-pass penalty so one very deep ball can't swamp the signal.
-const BACKWARD_PASS_MAX_PENALTY_POINTS: f64 = 12.0;
+const BACKWARD_PASS_MAX_PENALTY_POINTS: f64 = 18.0;
 /// Over-dribble dispossession penalty (the carrier held the ball too long and was tackled for it).
 /// Hold time (seconds) past which staying on the ball is "overdue" — a pass or a forward drive
 /// should have happened by now. Below this a tackle on a fresh touch is just an unlucky duel, not an
@@ -4457,7 +4458,9 @@ const SOCCER_NEURAL_PRE_CURVE_ACTION_FEATURE_DIM: usize =
 /// for this coarse action, so value/world models can learn when curl pays.
 const SOCCER_NEURAL_CURVE_ACTION_FEATURE_DIM: usize = 5;
 /// Append-only learning attribution block: MDP/POMDP owns the idea, MPC owns execution.
-const SOCCER_NEURAL_IDEA_EXECUTION_FEATURE_DIM: usize = 7;
+/// Newly promoted action bits also live at this tail so older nets migrate by
+/// zero-padding without disturbing prior feature positions.
+const SOCCER_NEURAL_IDEA_EXECUTION_FEATURE_DIM: usize = 8;
 const SOCCER_NEURAL_PRE_IDEA_EXECUTION_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_CURVE_ACTION_FEATURE_DIM + SOCCER_NEURAL_CURVE_ACTION_FEATURE_DIM;
 const SOCCER_NEURAL_FEATURE_DIM: usize =
@@ -4968,6 +4971,8 @@ const SOCCER_NEURAL_FEATURE_WRONG_IDEA_RIGHT_EXECUTION: usize =
     SOCCER_NEURAL_FEATURE_RIGHT_IDEA_WRONG_EXECUTION + 1;
 const SOCCER_NEURAL_FEATURE_WRONG_IDEA_WRONG_EXECUTION: usize =
     SOCCER_NEURAL_FEATURE_WRONG_IDEA_RIGHT_EXECUTION + 1;
+const SOCCER_NEURAL_FEATURE_SUPPORT_PUSH_UP_ACTION: usize =
+    SOCCER_NEURAL_FEATURE_WRONG_IDEA_WRONG_EXECUTION + 1;
 const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     61,
     62,
@@ -5116,6 +5121,8 @@ const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     498,
     // Same schema with curve-action execution channels, before idea/execution attribution.
     SOCCER_NEURAL_PRE_IDEA_EXECUTION_FEATURE_DIM,
+    // Same schema with idea/execution attribution, before support-push-up got its own bit.
+    SOCCER_NEURAL_FEATURE_SUPPORT_PUSH_UP_ACTION,
 ];
 const TEAM_SHAPE_NEAR_BALL_RADIUS_YARDS: f64 = 18.0;
 // Tight same-team congestion rings reported in the brain trace so a human can see
@@ -13952,7 +13959,7 @@ pub(crate) fn give_and_go_ambition_enabled() -> bool {
 fn pass_like_action_flight(action: &str) -> Option<PassFlight> {
     use SoccerActionLabel::*;
     match SoccerActionLabel::classify(action)? {
-        Pass | FirstTimePass | FlankLowCross | WallPass | CornerFlagCross | SurprisePass
+        Pass | FirstTimePass | FlankLowCross | WallPass | WallReturn | CornerFlagCross | SurprisePass
         | KillerPass | SwitchPlay | RecycleReset => Some(PassFlight::Floor),
         ScoopPass => Some(PassFlight::Scoop),
         AerialPass | FlankHighCross | FlickOn => Some(PassFlight::Aerial),
@@ -14052,11 +14059,14 @@ fn is_attacking_support_action_label(action: &str) -> bool {
                 | PinchCrossArrival
                 | OverlapRun
                 | SupportScreen
+                | SupportPushUp
                 | VerticalAttack
                 | VacateSpace
                 | DummyClearLane
                 | DummyLetRun
+                | LaneYield
                 | OneTwoRun
+                | BuildupReceive
         )
     )
 }
@@ -14064,7 +14074,9 @@ fn is_attacking_support_action_label(action: &str) -> bool {
 fn dribble_move_kind_for_action_label(action: &str) -> Option<DribbleMoveKind> {
     use SoccerActionLabel::*;
     match SoccerActionLabel::classify(action)? {
-        LeftCut | SideStep | Dribble | HoldUpFlank | OpenPassLane => Some(DribbleMoveKind::LeftCut),
+        LeftCut | SideStep | Dribble | HoldUpFlank | OpenPassingLane | OpenPassLane => {
+            Some(DribbleMoveKind::LeftCut)
+        }
         CarryForward | VerticalAttack | TurnoverBurst | RoundGoalkeeper | RunaroundDribble => {
             Some(DribbleMoveKind::CarryForward)
         }
@@ -23458,10 +23470,8 @@ fn soccer_goal_credit_action_is_relevant(action: &str) -> bool {
                 | CarryOutLeft | CarryOutRight | ProtectBall | SideStep | LeftCut | RightCut
                 | Nutmeg | XaviTurn | FakeLeftCutRight | FakeRightCutLeft | HoldUpFlank | Space
                 | SupportShape | SupportRoam | CheckToBall | RunInBehind | ExploitSpaceRun
-                // NB: original had the DEAD `"support-push-up"` arm but no live
-                // `"vertical-attack"`, so vertical-attack is intentionally excluded.
                 | WideOutlet | ShotCreationRun | PinchCrossArrival | OverlapRun | SupportScreen
-                | ControlTouch | SetPlayRun | Clearance | RouteOne
+                | SupportPushUp | ControlTouch | SetPlayRun | Clearance | RouteOne
         )
     )
 }
@@ -39507,8 +39517,9 @@ fn soccer_neural_action_family_features(action: &str) -> (f64, f64, f64) {
 }
 
 /// The discrete action families the neural **policy head** (`π(a|s)`) ranges
-/// over — a coarse, fixed vocabulary so the actor outputs a small, stable
-/// distribution while the existing machinery still picks the concrete target.
+/// over. Football heuristics still seed the priors and legality gates, but live
+/// support, defensive, and loose-ball choices belong in this neural actor
+/// vocabulary so self-play can learn when to prefer them.
 /// Order is the output-index order and must stay stable (it indexes a trained
 /// network); append only.
 const SOCCER_POLICY_ACTIONS: &[&str] = &[
@@ -39558,6 +39569,34 @@ const SOCCER_POLICY_ACTIONS: &[&str] = &[
     "keeper-mpc-clearance",
     "keeper-position",
     "keeper-save",
+    "recover",
+    "hold-up-flank",
+    "wait-for-support",
+    "open-passing-lane",
+    "open-pass-lane",
+    "runaround-dribble",
+    "slide-tackle",
+    "defend-shape",
+    "defend-roam",
+    "support-shape",
+    "support-roam",
+    "support-screen",
+    "check-to-ball",
+    "run-in-behind",
+    "exploit-space-run",
+    "wide-outlet",
+    "shot-creation-run",
+    "pinch-cross-arrival",
+    "overlap-run",
+    "one-two-run",
+    "dummy-clear-lane",
+    "dummy-let-run",
+    "lane-yield",
+    "set-play-run",
+    "buildup-receive",
+    "blindside-steal",
+    "wall-return",
+    "support-push-up",
 ];
 
 const SOCCER_POLICY_PASS_ACTIONS: &[&str] = &[
@@ -39571,6 +39610,7 @@ const SOCCER_POLICY_PASS_ACTIONS: &[&str] = &[
     "switch-play",
     "recycle-reset",
     "wall-pass",
+    "wall-return",
     "corner-flag-cross",
     "surprise-pass",
     "flick-on",
@@ -39615,11 +39655,9 @@ const SOCCER_POLICY_GOALKEEPER_ACTIONS: &[&str] = &[
 ];
 
 /// Map any soccer action label to its policy-head family index, or `None` if it
-/// falls outside the policy vocabulary (rare set-piece roles / support actions —
-/// those simply don't train the actor). Dribble-carry, protection, cut, and feint
-/// variants get their own append-only families so the actor can learn technical
-/// execution choices; first-touch pass/shot stay separate from ordinary pass/shoot
-/// because control-first is a mutually exclusive receiving decision.
+/// falls outside the policy vocabulary. Dribble-carry, protection, cut, support,
+/// defensive, and loose-ball variants get append-only families so the actor can
+/// learn the concrete choice while the planner keeps providing priors/targets.
 fn soccer_policy_action_index(action: &str) -> Option<usize> {
     use SoccerActionLabel::*;
     let action = normalize_soccer_action_label(action);
@@ -39633,13 +39671,18 @@ fn soccer_policy_action_index(action: &str) -> Option<usize> {
         Hold => "hold",
         Space => "space",
         ControlTouch => "control-touch",
-        Dribble | OpenPassLane => "dribble",
+        Dribble => "dribble",
         RoundGoalkeeper => "round-goalkeeper",
         CarryForward => "carry-forward",
         CarryOutLeft => "carry-out-left",
         CarryOutRight => "carry-out-right",
         ProtectBall => "protect-ball",
         SideStep => "side-step",
+        HoldUpFlank => "hold-up-flank",
+        OpenPassingLane => "open-passing-lane",
+        WaitForSupport => "wait-for-support",
+        OpenPassLane => "open-pass-lane",
+        RunaroundDribble => "runaround-dribble",
         LeftCut => "left-cut",
         RightCut => "right-cut",
         Nutmeg => "nutmeg",
@@ -39651,9 +39694,27 @@ fn soccer_policy_action_index(action: &str) -> Option<usize> {
         AerialPass => "aerial-pass",
         KillerPass => "killer-pass",
         WallPass => "wall-pass",
+        WallReturn => "wall-return",
         CornerFlagCross => "corner-flag-cross",
-        VerticalAttack | RunInBehind | ExploitSpaceRun => "vertical-attack",
-        VacateSpace | SupportScreen | DummyClearLane | DummyLetRun => "vacate-space",
+        VerticalAttack => "vertical-attack",
+        SupportShape => "support-shape",
+        SupportRoam => "support-roam",
+        SupportScreen => "support-screen",
+        CheckToBall => "check-to-ball",
+        RunInBehind => "run-in-behind",
+        ExploitSpaceRun => "exploit-space-run",
+        WideOutlet => "wide-outlet",
+        ShotCreationRun => "shot-creation-run",
+        PinchCrossArrival => "pinch-cross-arrival",
+        OverlapRun => "overlap-run",
+        SupportPushUp => "support-push-up",
+        OneTwoRun => "one-two-run",
+        VacateSpace => "vacate-space",
+        DummyClearLane => "dummy-clear-lane",
+        DummyLetRun => "dummy-let-run",
+        LaneYield => "lane-yield",
+        SetPlayRun => "set-play-run",
+        BuildupReceive => "buildup-receive",
         SurprisePass => "surprise-pass",
         ScoopPass => "scoop-pass",
         FlickOn => "flick-on",
@@ -39667,7 +39728,11 @@ fn soccer_policy_action_index(action: &str) -> Option<usize> {
         Shoot => "shoot",
         FirstTimeShot | FirstTimeHeader => "first-time-shot",
         Tackle => "tackle",
+        SlideTackle => "slide-tackle",
+        DefendShape => "defend-shape",
+        DefendRoam => "defend-roam",
         PressCover => "press-cover",
+        Recover => "recover",
         _ => return None,
     };
     SOCCER_POLICY_ACTIONS
@@ -41924,6 +41989,8 @@ fn soccer_neural_transition_features_with_action(
         soccer_neural_bool(context.wrong_idea_right_execution);
     features[SOCCER_NEURAL_FEATURE_WRONG_IDEA_WRONG_EXECUTION] =
         soccer_neural_bool(context.wrong_idea_wrong_execution);
+    features[SOCCER_NEURAL_FEATURE_SUPPORT_PUSH_UP_ACTION] =
+        soccer_neural_bool(action_label == "support-push-up");
     debug_assert_eq!(features.len(), SOCCER_NEURAL_FEATURE_DIM);
     features
 }
@@ -51663,15 +51730,25 @@ fn normalize_tracking_ball_action(raw: &str) -> Result<Option<String>, String> {
         | "support-roam"
         | "check-to-ball"
         | "run-in-behind"
+        | "one-two-run"
         | "exploit-space-run"
         | "wide-outlet"
         | "shot-creation-run"
+        | "pinch-cross-arrival"
         | "overlap-run"
+        | "dummy-clear-lane"
+        | "dummy-let-run"
+        | "lane-yield"
         | "support-push-up"
         | "support-screen"
         | "vacate-space"
+        | "buildup-receive"
         | "defend"
+        | "defend-shape"
+        | "defend-roam"
         | "tackle"
+        | "slide-tackle"
+        | "blindside-steal"
         | "recover"
         | "hold"
         | "kickoff"
@@ -52379,8 +52456,11 @@ fn tracking_explicit_off_ball_action(
     let action = normalize_tracking_ball_action(raw_action).ok().flatten()?;
     match action.as_str() {
         "space" | "support-shape" | "support-roam" | "check-to-ball" | "run-in-behind"
-        | "exploit-space-run" | "wide-outlet" | "shot-creation-run" | "overlap-run"
-        | "support-push-up" | "support-screen" | "defend" | "tackle" | "recover" | "hold" => {
+        | "one-two-run" | "exploit-space-run" | "wide-outlet" | "shot-creation-run"
+        | "pinch-cross-arrival" | "overlap-run" | "dummy-clear-lane" | "dummy-let-run"
+        | "lane-yield" | "support-push-up" | "support-screen" | "vacate-space"
+        | "buildup-receive" | "defend" | "defend-shape" | "defend-roam" | "tackle"
+        | "slide-tackle" | "blindside-steal" | "recover" | "hold" => {
             Some(action)
         }
         _ => None,
@@ -52628,15 +52708,13 @@ fn tracking_action_target_trace(
         match SoccerActionLabel::classify(normalized) {
             Some(Clearance | RouteOne) => (after.ball.position, None),
             Some(Shoot | FirstTimeShot | FirstTimeHeader) => (goal, None),
-            // NB: original listed the DEAD `"support-push-up"` arm but no live
-            // `"vertical-attack"`, so vertical-attack stays in the `_ => None`
-            // bucket — preserve that exactly (do not add VerticalAttack here).
             Some(
                 Dribble | CarryForward | CarryOutLeft | CarryOutRight | ProtectBall | SideStep
                 | LeftCut | RightCut | Nutmeg | XaviTurn | FakeLeftCutRight | FakeRightCutLeft
                 | OpenPassLane | ControlTouch | Space | SupportShape | SupportRoam | CheckToBall
                 | RunInBehind | ExploitSpaceRun | WideOutlet | ShotCreationRun
-                | PinchCrossArrival | OverlapRun | SupportScreen | VacateSpace | Defend,
+                | PinchCrossArrival | OverlapRun | SupportScreen | SupportPushUp | VacateSpace
+                | Defend,
             ) => (
                 next_player.map(|p| p.position).unwrap_or(player.position),
                 None,
@@ -52958,18 +53036,26 @@ fn soccer_moment_action_target_trace(
         | "support-roam"
         | "check-to-ball"
         | "run-in-behind"
+        | "one-two-run"
         | "exploit-space-run"
         | "wide-outlet"
         | "shot-creation-run"
+        | "pinch-cross-arrival"
         | "overlap-run"
+        | "dummy-clear-lane"
+        | "dummy-let-run"
+        | "lane-yield"
         | "support-push-up"
         | "support-screen"
         | "vacate-space"
-        | "defend" => (
+        | "buildup-receive"
+        | "defend"
+        | "defend-shape"
+        | "defend-roam" => (
             next_player.map(|p| p.position).unwrap_or(player.position),
             None,
         ),
-        "tackle" => {
+        "tackle" | "slide-tackle" | "blindside-steal" => {
             let target_player = before.ball.holder.or(after.ball.holder);
             let point = target_player
                 .and_then(|id| {
@@ -62189,6 +62275,9 @@ fn learned_action_label_is_legal(action: &str, snapshot: &WorldSnapshot, player_
         }
         "pass" => observation.has_ball && snapshot.best_visible_pass_target(player_id).is_some(),
         "wall-pass" => observation.has_ball && snapshot.wall_pass_option_for(player_id).is_some(),
+        "wall-return" => {
+            observation.has_ball && snapshot.wall_return_pass_target_for(player_id).is_some()
+        }
         "killer-pass" => {
             observation.has_ball
                 && (!goal_attack_blocks_alternatives
@@ -62268,6 +62357,14 @@ fn learned_action_label_is_legal(action: &str, snapshot: &WorldSnapshot, player_
         }
         "control-touch" => observation.has_ball && observation.first_touch_available,
         "dribble" | "carry-forward" | "open-pass-lane" => observation.has_ball,
+        "open-passing-lane" => {
+            observation.has_ball
+                && player.role != PlayerRole::Goalkeeper
+                && snapshot.dribble_to_open_passing_lane_for(player_id).is_some()
+        }
+        "wait-for-support" => {
+            observation.has_ball && snapshot.hold_for_support_option_for(player_id).is_some()
+        }
         "runaround-dribble" => {
             observation.has_ball && snapshot.runaround_dribble_option_for(player_id).is_some()
         }
@@ -62318,7 +62415,9 @@ fn learned_action_label_is_legal(action: &str, snapshot: &WorldSnapshot, player_
                 && observation.nearest_opponent_distance <= 4.6
                 && observation.perceived_pressure >= 0.28
         }
-        "defend" => snapshot.controlled_possession_team() == Some(player.team.other()),
+        "defend" | "defend-shape" | "defend-roam" => {
+            snapshot.controlled_possession_team() == Some(player.team.other())
+        }
         "recover" => snapshot.controlled_possession_team().is_none(),
         "tackle" => snapshot.ball.holder.is_some_and(|holder| {
             snapshot
@@ -62338,6 +62437,36 @@ fn learned_action_label_is_legal(action: &str, snapshot: &WorldSnapshot, player_
                         && player_position.distance(holder_position) <= 1.85
                 })
         }),
+        "slide-tackle" => {
+            snapshot.slide_tackle_enabled
+                && player.role != PlayerRole::Goalkeeper
+                && snapshot.ball.holder.is_some_and(|holder| {
+                    snapshot
+                        .players
+                        .iter()
+                        .find(|p| p.id == holder)
+                        .is_some_and(|holder_player| {
+                            if holder_player.team != player.team.other() {
+                                return false;
+                            }
+                            let player_position = snapshot.player_snapshot_position(player);
+                            let holder_position = snapshot.player_snapshot_position(holder_player);
+                            let distance = player_position.distance(holder_position);
+                            let holder_speed = snapshot
+                                .player_velocity(holder)
+                                .unwrap_or(holder_player.velocity)
+                                .len();
+                            (SLIDE_TACKLE_MIN_REACH_YARDS..=SLIDE_TACKLE_MAX_REACH_YARDS)
+                                .contains(&distance)
+                                && !snapshot.tackle_blocked_from_behind(holder, player_position)
+                                && holder_speed >= SLIDE_TACKLE_MIN_HOLDER_SPEED_YPS
+                                && snapshot.advancing_carrier_steal_urgency(player_id)
+                                    >= SLIDE_TACKLE_MIN_COMMIT_URGENCY
+                        })
+                })
+        }
+        "blindside-steal" => player.role != PlayerRole::Goalkeeper
+            && snapshot.blindside_steal_assessment(player_id).is_some(),
         "check-to-ball" => {
             !observation.has_ball
                 && snapshot.controlled_possession_team() == Some(player.team)
@@ -62357,6 +62486,18 @@ fn learned_action_label_is_legal(action: &str, snapshot: &WorldSnapshot, player_
                     .wide_possession_outlet_target_for(player_id, player.home_position)
                     .is_some()
         }
+        "pinch-cross-arrival" => {
+            !observation.has_ball
+                && snapshot.controlled_possession_team() == Some(player.team)
+                && snapshot
+                    .flank_cross_arrival_target_for(player_id, player.home_position)
+                    .is_some()
+        }
+        "one-two-run" => {
+            !observation.has_ball
+                && snapshot.controlled_possession_team() == Some(player.team)
+                && snapshot.one_two_run_target_for(player_id).is_some()
+        }
         "dummy-clear-lane" => {
             !observation.has_ball
                 && snapshot.controlled_possession_team() == Some(player.team)
@@ -62370,8 +62511,21 @@ fn learned_action_label_is_legal(action: &str, snapshot: &WorldSnapshot, player_
                     .teammate_dummy_let_run_target_for(player_id)
                     .is_some()
         }
+        "lane-yield" => {
+            !observation.has_ball
+                && snapshot.controlled_possession_team() == Some(player.team)
+                && snapshot
+                    .pass_lane_yield_target_for(player_id, player.home_position)
+                    .is_some()
+        }
+        "buildup-receive" => {
+            !observation.has_ball
+                && player.role == PlayerRole::Defender
+                && snapshot.goalkeeper_will_safely_collect(player.team)
+        }
         "exploit-space-run" | "shot-creation-run" | "overlap-run" | "support-push-up"
-        | "support-screen" | "vacate-space" | "support-shape" | "support-roam" => {
+        | "support-screen" | "vacate-space" | "support-shape" | "support-roam"
+        | "set-play-run" => {
             !observation.has_ball && snapshot.controlled_possession_team() == Some(player.team)
         }
         "space" => !observation.has_ball,

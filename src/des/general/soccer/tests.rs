@@ -5791,8 +5791,8 @@ fn long_backward_pass_penalty_grows_exponentially_past_short_reset() {
 
     assert!(long_backward_pass_penalty(-5.0) > 0.0);
     assert!(
-        ten_back > 7.0,
-        "10yd backward must be a real penalty: {ten_back}"
+        ten_back > 9.0,
+        "10yd backward must be a heavy penalty: {ten_back}"
     );
     assert!(
         (twenty_back / ten_back - 5.0).abs() < 1e-9,
@@ -19545,7 +19545,7 @@ fn long_backward_pass_penalty_grows_exponentially_with_retreat() {
         "penalty must compound with backward distance"
     );
     // A >10yd backward ball is heavily demoted, and 20yd is tuned to roughly 5x 10yd.
-    assert!(p10 >= 6.0);
+    assert!(p10 >= 9.0);
     let p20 = long_backward_pass_penalty(-20.0);
     assert!(
         (p20 / p10 - 5.0).abs() < 1e-9,
@@ -36519,7 +36519,7 @@ fn policy_action_index_maps_families_and_rejects_out_of_vocab() {
         soccer_policy_action_index("support-push-up"),
         SOCCER_POLICY_ACTIONS
             .iter()
-            .position(|&a| a == "vertical-attack")
+            .position(|&a| a == "support-push-up")
     );
     assert_eq!(
         soccer_policy_action_index("decoy-run"),
@@ -36594,8 +36594,34 @@ fn policy_action_index_maps_families_and_rejects_out_of_vocab() {
         soccer_policy_action_index("shoot"),
         "one-touch shot must be its own policy family, not generic shoot"
     );
-    // Out-of-vocabulary support/role actions don't train the actor.
-    assert_eq!(soccer_policy_action_index("support-roam"), None);
+    // Live support, defensive, and loose-ball choices train the actor as their own
+    // append-only policy outputs instead of being flattened into broad movement.
+    for label in [
+        "support-roam",
+        "support-shape",
+        "support-push-up",
+        "check-to-ball",
+        "run-in-behind",
+        "one-two-run",
+        "wide-outlet",
+        "pinch-cross-arrival",
+        "dummy-clear-lane",
+        "dummy-let-run",
+        "lane-yield",
+        "buildup-receive",
+        "defend-shape",
+        "defend-roam",
+        "slide-tackle",
+        "blindside-steal",
+        "wall-return",
+        "recover",
+    ] {
+        assert_eq!(
+            soccer_policy_action_index(label),
+            SOCCER_POLICY_ACTIONS.iter().position(|&a| a == label),
+            "{label} should train as its own actor family"
+        );
+    }
     assert_eq!(soccer_policy_action_index("taker"), None);
 }
 
@@ -43002,7 +43028,11 @@ fn losing_fifty_fifty_duel_uses_failed_dispossession_penalty() {
         LOST_FIFTY_FIFTY_DUEL_PENALTY_POINTS,
         FAILED_DISPOSSESSION_PENALTY_POINTS
     );
-    assert_eq!(reward_for(winner), 6.0);
+    assert_eq!(reward_for(winner), WON_FIFTY_FIFTY_DUEL_REWARD_POINTS);
+    assert!(
+        WON_FIFTY_FIFTY_DUEL_REWARD_POINTS >= DEFENSIVE_DISPOSSESSION_REWARD_POINTS,
+        "winning a 50:50 loose ball should be a heavy possession reward"
+    );
     assert_eq!(reward_for(loser), -FAILED_DISPOSSESSION_PENALTY_POINTS);
 }
 
@@ -53622,6 +53652,10 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
         SOCCER_NEURAL_FEATURE_DIM,
         SOCCER_NEURAL_PRE_IDEA_EXECUTION_FEATURE_DIM + SOCCER_NEURAL_IDEA_EXECUTION_FEATURE_DIM
     );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_SUPPORT_PUSH_UP_ACTION,
+        SOCCER_NEURAL_FEATURE_WRONG_IDEA_WRONG_EXECUTION + 1
+    );
     assert_eq!(SOCCER_NEURAL_TEAM_CENTER_FEATURE_DIM, 18);
     assert_eq!(SOCCER_NEURAL_RELATIONAL_ATTENTION_FEATURE_DIM, 8);
     assert_eq!(SOCCER_NEURAL_SOLO_CARRIER_FEATURE_DIM, 4);
@@ -53879,6 +53913,8 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
         SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_OFFSIDE_RECOVERY_FEATURE_DIM)
     );
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_CURVE_ACTION_FEATURE_DIM));
+    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_IDEA_EXECUTION_FEATURE_DIM));
+    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_FEATURE_SUPPORT_PUSH_UP_ACTION));
 
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let (a, b) = (2usize, 3usize);
@@ -53983,11 +54019,25 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
         corner_features[SOCCER_NEURAL_FEATURE_CORNER_FLAG_CROSS_ACTION],
         1.0
     );
-    let vertical_features =
+    let support_push_features =
         soccer_neural_transition_features_with_action(&mpc_transition, "support-push-up");
+    assert_eq!(
+        support_push_features[SOCCER_NEURAL_FEATURE_SUPPORT_PUSH_UP_ACTION],
+        1.0
+    );
+    assert_eq!(
+        support_push_features[SOCCER_NEURAL_FEATURE_VERTICAL_ATTACK_ACTION],
+        0.0
+    );
+    let vertical_features =
+        soccer_neural_transition_features_with_action(&mpc_transition, "vertical-attack");
     assert_eq!(
         vertical_features[SOCCER_NEURAL_FEATURE_VERTICAL_ATTACK_ACTION],
         1.0
+    );
+    assert_eq!(
+        vertical_features[SOCCER_NEURAL_FEATURE_SUPPORT_PUSH_UP_ACTION],
+        0.0
     );
     let vacate_features =
         soccer_neural_transition_features_with_action(&mpc_transition, "decoy-run");
@@ -73189,6 +73239,10 @@ fn first_touch_escape_lateral_neural_block_is_appended_and_migration_safe() {
         SOCCER_NEURAL_FEATURE_DIM,
         SOCCER_NEURAL_PRE_IDEA_EXECUTION_FEATURE_DIM + SOCCER_NEURAL_IDEA_EXECUTION_FEATURE_DIM
     );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_SUPPORT_PUSH_UP_ACTION,
+        SOCCER_NEURAL_FEATURE_WRONG_IDEA_WRONG_EXECUTION + 1
+    );
     assert_eq!(SOCCER_NEURAL_RELATIONAL_ATTENTION_FEATURE_DIM, 8);
     assert_eq!(SOCCER_NEURAL_SOLO_CARRIER_FEATURE_DIM, 4);
     assert_eq!(SOCCER_NEURAL_GRAPH_TEMPORAL_FEATURE_DIM, 8);
@@ -73204,6 +73258,14 @@ fn first_touch_escape_lateral_neural_block_is_appended_and_migration_safe() {
     assert!(
         SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_GRAPH_TEMPORAL_FEATURE_DIM),
         "the pre-graph-temporal total must be a recognised legacy dim so old nets migrate"
+    );
+    assert!(
+        SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_IDEA_EXECUTION_FEATURE_DIM),
+        "the pre-idea/execution total must be a recognised legacy dim so old nets migrate"
+    );
+    assert!(
+        SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_FEATURE_SUPPORT_PUSH_UP_ACTION),
+        "the pre-support-push-up total must be a recognised legacy dim so old nets migrate"
     );
     assert_eq!(SOCCER_NEURAL_FIRST_TOUCH_ESCAPE_LANE_FEATURE_DIM, 2);
     assert_eq!(SOCCER_NEURAL_DRIBBLE_BEAT_FEATURE_DIM, 4);
@@ -73321,6 +73383,14 @@ fn first_touch_escape_lateral_neural_block_is_appended_and_migration_safe() {
     );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_ACTION_CURVE_DIRECTION + 1,
+        SOCCER_NEURAL_PRE_IDEA_EXECUTION_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_SUPPORT_PUSH_UP_ACTION,
+        SOCCER_NEURAL_FEATURE_WRONG_IDEA_WRONG_EXECUTION + 1
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_SUPPORT_PUSH_UP_ACTION + 1,
         SOCCER_NEURAL_FEATURE_DIM
     );
     assert!(SOCCER_NEURAL_FEATURE_DEFENSIVE_PRESS_ACTION < SOCCER_NEURAL_FEATURE_DIM);
@@ -73342,6 +73412,7 @@ fn first_touch_escape_lateral_neural_block_is_appended_and_migration_safe() {
     assert!(SOCCER_NEURAL_FEATURE_ACTION_CURVE_INSIDE_FOOT < SOCCER_NEURAL_FEATURE_DIM);
     assert!(SOCCER_NEURAL_FEATURE_ACTION_CURVE_OUTSIDE_FOOT < SOCCER_NEURAL_FEATURE_DIM);
     assert!(SOCCER_NEURAL_FEATURE_ACTION_CURVE_DIRECTION < SOCCER_NEURAL_FEATURE_DIM);
+    assert!(SOCCER_NEURAL_FEATURE_SUPPORT_PUSH_UP_ACTION < SOCCER_NEURAL_FEATURE_DIM);
     assert!(SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_LANE_OPEN < SOCCER_NEURAL_FEATURE_DIM);
     assert!(SOCCER_NEURAL_FEATURE_FIRST_TOUCH_FREEZE_RISK < SOCCER_NEURAL_FEATURE_DIM);
     assert!(SOCCER_NEURAL_FEATURE_DRIBBLE_DEFENDER_OVERCOMMIT < SOCCER_NEURAL_FEATURE_DIM);
@@ -93797,7 +93868,10 @@ fn unpressured_backward_pass_penalty_truth_table() {
     );
     // An unpressured backward pass at the threshold is penalized (base + per-yard).
     let p_min = unpressured_backward_pass_penalty_points(BACKWARD_PASS_MIN_PENALIZED_YARDS, free);
-    assert!(p_min > 0.0);
+    assert!(
+        p_min >= 5.0,
+        "even the minimum unpressured backward pass should now matter: {p_min}"
+    );
     // The DEEPER the backward pass, the BIGGER the penalty (monotonic) until the cap.
     let p_short = unpressured_backward_pass_penalty_points(5.0, free);
     let p_long = unpressured_backward_pass_penalty_points(10.0, free);
@@ -93805,11 +93879,16 @@ fn unpressured_backward_pass_penalty_truth_table() {
         p_long > p_short && p_short > p_min,
         "penalty must grow with backward distance: {p_min} < {p_short} < {p_long}"
     );
+    assert!(
+        p_long >= 12.0,
+        "a 10yd unpressured backward pass should be strongly penalized: {p_long}"
+    );
     // Very deep recycles are capped.
     assert_eq!(
         unpressured_backward_pass_penalty_points(1000.0, free),
         BACKWARD_PASS_MAX_PENALTY_POINTS
     );
+    assert_eq!(BACKWARD_PASS_MAX_PENALTY_POINTS, 18.0);
 }
 
 #[test]
