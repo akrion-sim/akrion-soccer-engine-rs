@@ -19448,6 +19448,25 @@ pub(crate) fn stationary_hold_penalty_enabled() -> bool {
     }
 }
 
+/// Whether the **15yd ideal-pass-length** preference is active this process. Shifts the
+/// optimal-pass-length peak in [`pass_length_preference`] from 8yd to 15yd (with the fade-out
+/// stretched to match), so the pass-selection tiebreaker prefers a ~15yd progression over a
+/// short square. Player vision already reaches 28-56yd so a 15yd outlet is within sight.
+/// Default-ON in production (env `DD_SOCCER_ENABLE_IDEAL_PASS_LENGTH_15YD=0/false` is the kill
+/// switch); default-OFF under test so the decision-parity suite stays byte-identical.
+pub(crate) fn ideal_pass_length_15yd_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_IDEAL_PASS_LENGTH_15YD").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_IDEAL_PASS_LENGTH_15YD"))
+    }
+}
+
 /// Whether the **gait step-limit** is active this process. A body has inertia: it cannot
 /// teleport across locomotor gears in a single tick (sprint→walk, run→walk). With this
 /// on, once the gait-commitment dwell is satisfied an effort-tier change is taken ONE
