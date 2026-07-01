@@ -8717,6 +8717,8 @@ impl SoccerMatch {
         self.collect_head_scan_rl_samples(&next_snapshot);
         // Learnable crash-the-box commit RL samples (no-op under test / when disabled).
         self.collect_crash_box_rl_samples(&next_snapshot);
+        // Learnable off-ball run-selection RL samples (no-op under test / when disabled).
+        self.collect_run_prediction_rl_samples(&next_snapshot);
         self.collect_long_pass_run_rl_samples(&next_snapshot);
         // Learnable give-and-go / wall-pass appetite RL samples (no-op + byte-identical unless
         // `DD_SOCCER_ENABLE_LEARNED_GIVE_AND_GO` is set).
