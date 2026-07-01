@@ -23852,7 +23852,6 @@ fn dd_soccer_disable_show_for_ball_boost() -> bool {
 /// inside the carrier's comfortable receiving radius are penalised (unless the carrier is
 /// pressured and genuinely needs a short option). This kills the "two off-ball players >4yd
 /// apart spiral into the carrier to <3yd while the passing lane is already open" red flag.
-/// Enable via `DD_SOCCER_ENABLE_OFF_BALL_SPACE_DISCIPLINE=1`.
 fn dd_soccer_enable_off_ball_space_discipline() -> bool {
     #[cfg(test)]
     {
