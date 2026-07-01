@@ -58790,6 +58790,105 @@ fn off_ball_space_discipline_punishes_spiralling_into_the_carrier() {
 }
 
 #[test]
+fn forward_run_when_unmarked_bias_is_a_no_op_without_a_forward_option() {
+    // Gate off / marked / everything-ahead-covered => `forward_space_available == false` =>
+    // the bias is exactly 0.0 for a backward, square, or forward candidate, so `open_space_for`
+    // is byte-identical. A legitimate drop when there is no forward space is never vetoed.
+    for forward in [-12.0, -3.0, 0.0, 5.0, 20.0] {
+        for into_open in [false, true] {
+            assert_eq!(
+                forward_run_when_unmarked_bias(forward, false, into_open),
+                0.0,
+                "no forward-space state must leave every candidate untouched (forward={forward})"
+            );
+        }
+    }
+}
+
+#[test]
+fn forward_run_when_unmarked_bias_vetoes_backward_and_rewards_forward() {
+    // The principle: an unmarked off-ball player WITH a forward-into-space option must not drift
+    // backward. A backward candidate is net-penalised (veto strength), a forward-into-open one is
+    // rewarded, and the backward veto strictly dominates the best forward bonus so the argmax can
+    // never pick a backward run over an available forward one.
+    let backward = forward_run_when_unmarked_bias(-10.0, true, false);
+    let deeper_backward = forward_run_when_unmarked_bias(-20.0, true, false);
+    let forward_open = forward_run_when_unmarked_bias(18.0, true, true);
+    let forward_covered = forward_run_when_unmarked_bias(18.0, true, false);
+    let square = forward_run_when_unmarked_bias(0.0, true, true);
+
+    assert!(backward < 0.0, "a backward run while unmarked must be penalised: {backward}");
+    assert!(
+        deeper_backward < backward,
+        "the further back, the worse: deeper={deeper_backward} shallow={backward}"
+    );
+    assert!(
+        forward_open > 0.0,
+        "a forward run into open space must be rewarded: {forward_open}"
+    );
+    assert_eq!(
+        forward_covered, 0.0,
+        "a forward-but-covered candidate earns no forward bonus: {forward_covered}"
+    );
+    assert_eq!(square, 0.0, "a square shuffle inside the deadband is neutral: {square}");
+    assert!(
+        backward < -forward_open,
+        "the backward veto must dominate the best forward bonus so backward can never win: \
+         backward={backward} forward_open={forward_open}"
+    );
+}
+
+#[test]
+fn forward_open_space_available_true_when_lane_ahead_is_clear_else_false() {
+    // A central carrier with an unmarked teammate who has an open, clear lane ahead: the teammate
+    // genuinely CAN run forward into space => precondition satisfied.
+    let mut open = SoccerMatch::default_11v11(MatchConfig::default());
+    let holder = 6;
+    let support = 8;
+    park_players_except(&mut open, &[holder, support]);
+    open.ball.holder = Some(holder);
+    open.ball.position = Vec2::new(40.0, 55.0);
+    open.ball.velocity = Vec2::zero();
+    open.ball.last_touch_team = Some(Team::Home);
+    open.players[holder].position = open.ball.position;
+    open.players[support].position = Vec2::new(46.0, 58.0);
+    open.players[support].home_position = open.players[support].position;
+    let open_snapshot = WorldSnapshot::from_match(&open);
+    let support_player = open_snapshot
+        .players
+        .iter()
+        .find(|p| p.id == support)
+        .expect("support snapshot");
+    assert!(
+        open_snapshot
+            .forward_open_space_available(support_player, support_player.position),
+        "an unmarked teammate with a clear forward lane must have a forward-into-space option"
+    );
+
+    // Now wall the space directly ahead of the same teammate with opponents: no forward option, so
+    // a drop is legitimate and the bias must stay inert.
+    let mut walled = open.clone();
+    for (i, away) in (11..22).enumerate() {
+        // Pack defenders across the channel just ahead of the support player.
+        walled.players[away].position = Vec2::new(
+            38.0 + (i as f64) * 2.0,
+            support_player.position.y + Team::Home.attack_dir() * 8.0,
+        );
+    }
+    let walled_snapshot = WorldSnapshot::from_match(&walled);
+    let walled_support = walled_snapshot
+        .players
+        .iter()
+        .find(|p| p.id == support)
+        .expect("support snapshot");
+    assert!(
+        !walled_snapshot
+            .forward_open_space_available(walled_support, walled_support.position),
+        "with the forward channel walled by opponents there is no forward-into-space option"
+    );
+}
+
+#[test]
 fn tactical_trace_penalizes_endline_camping_and_deep_retreat() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let defender = 2;
