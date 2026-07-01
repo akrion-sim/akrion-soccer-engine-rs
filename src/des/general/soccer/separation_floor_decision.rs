@@ -650,10 +650,13 @@ mod separation_floor_tests {
 
     #[test]
     fn reward_weighted_training_steers_toward_the_high_reward_action() {
-        let mut head = SeparationFloorHead::new(13);
+        // Two heads from the SAME init: one rewarded for combining tighter (−0.8), the other for
+        // spreading (+0.8). RWR must leave the tighten-rewarded head lower than the spread one —
+        // robust to the random initialisation (which a single-head before/after check is not).
         let inputs = baseline_inputs();
-        let before = head.predict(&inputs).expect("finite");
-        let samples: Vec<SeparationFloorSample> = (0..32)
+        let mut tighten = SeparationFloorHead::new(13);
+        let mut spread = SeparationFloorHead::new(13);
+        let tighten_samples: Vec<SeparationFloorSample> = (0..32)
             .flat_map(|_| {
                 [
                     SeparationFloorSample { inputs: inputs.clone(), action_bias: -0.8, reward: 1.0 },
@@ -661,11 +664,24 @@ mod separation_floor_tests {
                 ]
             })
             .collect();
+        let spread_samples: Vec<SeparationFloorSample> = (0..32)
+            .flat_map(|_| {
+                [
+                    SeparationFloorSample { inputs: inputs.clone(), action_bias: 0.8, reward: 1.0 },
+                    SeparationFloorSample { inputs: inputs.clone(), action_bias: -0.8, reward: -1.0 },
+                ]
+            })
+            .collect();
         for _ in 0..80 {
-            head.train_reward_weighted(&samples, 0.05);
+            tighten.train_reward_weighted(&tighten_samples, 0.05);
+            spread.train_reward_weighted(&spread_samples, 0.05);
         }
-        let after = head.predict(&inputs).expect("finite");
-        assert!(after < before && after < 0.0);
+        let tighten_out = tighten.predict(&inputs).expect("finite");
+        let spread_out = spread.predict(&inputs).expect("finite");
+        assert!(
+            tighten_out < spread_out,
+            "tighten-rewarded head ({tighten_out}) should sit below spread-rewarded ({spread_out})"
+        );
     }
 
     #[test]
