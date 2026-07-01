@@ -92290,6 +92290,46 @@ fn carrier_forward_drive_gait_floor_grades_by_space_and_pressure() {
 }
 
 #[test]
+fn stationary_hold_penalty_multiplier_ramps_from_walk_to_ten_x() {
+    // Dead-stationary holder ⇒ full 10× surcharge.
+    assert!(
+        (stationary_hold_penalty_multiplier(0.0) - STATIONARY_HOLD_PENALTY_MAX_MULT).abs() < 1e-9
+    );
+    // Back-pedalling with the ball is treated the same as standing still (fully surcharged).
+    assert!(
+        (stationary_hold_penalty_multiplier(-4.0) - STATIONARY_HOLD_PENALTY_MAX_MULT).abs() < 1e-9
+    );
+    // Jogging forward at/above the cutoff ⇒ NO surcharge (dribbling forward is fine).
+    assert!(
+        (stationary_hold_penalty_multiplier(STATIONARY_HOLD_FORWARD_JOG_YPS) - 1.0).abs() < 1e-9
+    );
+    assert!((stationary_hold_penalty_multiplier(9.0) - 1.0).abs() < 1e-9); // sprinting forward
+    // Walking pace sits strictly between the two extremes and is monotone in stillness.
+    let walk = stationary_hold_penalty_multiplier(STATIONARY_HOLD_FORWARD_JOG_YPS * 0.5);
+    assert!(walk > 1.0 && walk < STATIONARY_HOLD_PENALTY_MAX_MULT);
+    let midpoint_expected = 1.0 + 0.5 * (STATIONARY_HOLD_PENALTY_MAX_MULT - 1.0);
+    assert!((walk - midpoint_expected).abs() < 1e-9);
+    let slower = stationary_hold_penalty_multiplier(STATIONARY_HOLD_FORWARD_JOG_YPS * 0.25);
+    assert!(slower > walk, "slower carrier is surcharged harder");
+    // Non-finite ⇒ neutral.
+    assert!((stationary_hold_penalty_multiplier(f64::NAN) - 1.0).abs() < 1e-9);
+}
+
+#[test]
+fn ideal_pass_length_preference_peaks_at_fifteen_when_gated_on() {
+    // With the gate ON the peak is 15yd and a 15yd ball is preferred over a short 5yd square.
+    std::env::set_var("DD_SOCCER_ENABLE_IDEAL_PASS_LENGTH_15YD", "1");
+    assert!((pass_length_preference(IDEAL_PASS_LENGTH_OPTIMAL_YARDS) - 1.0).abs() < 1e-9);
+    assert!(pass_length_preference(15.0) > pass_length_preference(5.0));
+    // A 15yd pass is well within a good player's vision range (28-56yd).
+    assert!(vision_range_yards(1.0) >= 15.0 && vision_range_yards(0.0) >= 15.0);
+    std::env::remove_var("DD_SOCCER_ENABLE_IDEAL_PASS_LENGTH_15YD");
+    // With the gate OFF the historical 8yd peak is restored (parity).
+    assert!((pass_length_preference(PASS_LENGTH_OPTIMAL_YARDS) - 1.0).abs() < 1e-9);
+    assert!(pass_length_preference(8.0) > pass_length_preference(15.0));
+}
+
+#[test]
 fn carrier_forward_drive_floor_lifts_a_walking_carrier_into_open_space() {
     // End-to-end: a ball carrier driving into wide-open forward space should be lifted to a higher
     // gear by the gait floor when the feature is enabled. Self-adapts to the ambient gate so it is
