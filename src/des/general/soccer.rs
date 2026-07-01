@@ -19398,6 +19398,49 @@ pub(crate) fn carrier_forward_drive_enabled() -> bool {
     }
 }
 
+/// Surcharge multiplier applied to the excessive-hold penalty when a ball carrier holds while
+/// STANDING STILL or WALKING instead of driving the ball forward — the "if you're not going
+/// forward, pass it NOW" rule. Graded on the carrier's FORWARD speed (velocity component toward
+/// the opponent goal, yards/sec): at/above [`STATIONARY_HOLD_FORWARD_JOG_YPS`] the carry is
+/// progressing forward and earns NO surcharge (returns `1.0` — dribbling forward at pace is
+/// fine). Below that cutoff the surcharge ramps in linearly, reaching the full
+/// [`STATIONARY_HOLD_PENALTY_MAX_MULT`] at zero-or-backward forward speed (a dead-stationary or
+/// back-pedalling holder is treated as maximally guilty). Pure (env-free) so it is unit-tested
+/// directly. Non-finite input ⇒ neutral `1.0`. See [`stationary_hold_penalty_enabled`].
+fn stationary_hold_penalty_multiplier(carrier_forward_speed_yps: f64) -> f64 {
+    if !carrier_forward_speed_yps.is_finite() {
+        return 1.0;
+    }
+    if carrier_forward_speed_yps >= STATIONARY_HOLD_FORWARD_JOG_YPS {
+        return 1.0;
+    }
+    // Clamp forward speed at 0 so back-pedalling with the ball counts the same as standing
+    // still (fully surcharged), and normalise into a 0..1 "stillness" fraction.
+    let stillness = ((STATIONARY_HOLD_FORWARD_JOG_YPS - carrier_forward_speed_yps.max(0.0))
+        / STATIONARY_HOLD_FORWARD_JOG_YPS)
+        .clamp(0.0, 1.0);
+    1.0 + stillness * (STATIONARY_HOLD_PENALTY_MAX_MULT - 1.0)
+}
+
+/// Whether the **stationary-hold penalty surcharge** is active this process. Multiplies the
+/// excessive-hold learning penalty by up to [`STATIONARY_HOLD_PENALTY_MAX_MULT`] for a carrier
+/// holding the ball while standing still or walking (see [`stationary_hold_penalty_multiplier`]),
+/// so the policy learns that a non-progressing holder with open outlets must release the ball
+/// immediately. Default-ON in production (env `DD_SOCCER_ENABLE_STATIONARY_HOLD_PENALTY=0/false`
+/// is the kill switch); default-OFF under test so the reward-parity suite stays byte-identical.
+pub(crate) fn stationary_hold_penalty_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_STATIONARY_HOLD_PENALTY").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_STATIONARY_HOLD_PENALTY"))
+    }
+}
+
 /// Whether the **gait step-limit** is active this process. A body has inertia: it cannot
 /// teleport across locomotor gears in a single tick (sprint→walk, run→walk). With this
 /// on, once the gait-commitment dwell is satisfied an effort-tier change is taken ONE
