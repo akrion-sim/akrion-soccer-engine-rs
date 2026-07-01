@@ -23627,8 +23627,8 @@ pub(crate) fn wasted_energy_tracking_active() -> bool {
     dd_soccer_enable_wasted_energy_penalty()
         || dd_soccer_enable_sustained_effort_no_outcome_penalty()
 }
-/// Far-from-ball off-ball energy conservation throttle. OFF by default; set
-/// `DD_SOCCER_ENABLE_FAR_OFFBALL_ENERGY_CONSERVATION=1`. Off ⇒ byte-identical & zero-cost.
+/// Far-from-ball off-ball energy conservation throttle. Default-ON in prod (kill switch
+/// `DD_SOCCER_ENABLE_FAR_OFFBALL_ENERGY_CONSERVATION=0`); default-OFF under test ⇒ byte-identical & zero-cost.
 pub(crate) fn dd_soccer_enable_far_offball_energy_conservation() -> bool {
     #[cfg(test)]
     {
