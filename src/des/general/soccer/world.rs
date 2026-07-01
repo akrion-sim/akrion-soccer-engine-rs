@@ -39552,6 +39552,72 @@ impl WorldSnapshot {
         self.is_among_closest_loose_ball_retrievers(player_id, target, contesters)
     }
 
+    /// True when `player_id` — one of our elected 1–2 loose-ball chasers — should
+    /// SPRINT to match the pace an opponent has committed to the same contest.
+    ///
+    /// The chase effort is "to a degree a function of how fast the nearest opponents
+    /// are moving": if an opponent is running/sprinting the loose ball down (its
+    /// closing speed onto the contest point clears
+    /// [`LOOSE_BALL_PACE_MATCH_OPPONENT_SPRINT_FRACTION`] of its own top speed and the
+    /// absolute [`LOOSE_BALL_PACE_MATCH_OPPONENT_MIN_CLOSING_YPS`] floor), the chaser
+    /// must sprint to keep up rather than jog and lose the 50/50. A strolling opponent
+    /// draws no forced sprint — distance still governs the gait then.
+    ///
+    /// Limited to committed chasers ([`Self::is_committed_loose_ball_chaser`]) so at
+    /// most the elected 1–2 keep up; the rest keep shape. `movement_target` is the
+    /// chaser's own recovery point (the caller has it in hand). Returns `false` without
+    /// scanning when the gate is off, keeping the default gait byte-identical.
+    pub(crate) fn loose_ball_opponent_pace_match_sprint(
+        &self,
+        player_id: usize,
+        movement_target: Vec2,
+    ) -> bool {
+        if !loose_ball_opponent_pace_match_enabled() {
+            return false;
+        }
+        if self.ball.holder.is_some() || self.active_set_play.is_some() {
+            return false;
+        }
+        let Some(me) = self.players.iter().find(|p| p.id == player_id) else {
+            return false;
+        };
+        if me.role == PlayerRole::Goalkeeper {
+            return false;
+        }
+        if self.player_snapshot_position(me).distance(movement_target)
+            <= LOOSE_BALL_PACE_MATCH_MIN_DISTANCE_YARDS
+        {
+            return false;
+        }
+        // Only our elected 1–2 chasers respond — the rest hold their support shape.
+        if !self.is_committed_loose_ball_chaser(player_id) {
+            return false;
+        }
+        // The contest point the opponents are racing toward (their lead point, not this
+        // chaser's own control-plan target).
+        let contest = self.loose_ball_contest_target_for(player_id);
+        self.players.iter().any(|opp| {
+            if opp.team == me.team || opp.role == PlayerRole::Goalkeeper {
+                return false;
+            }
+            let opp_pos = self.player_snapshot_position(opp);
+            let to_contest = contest - opp_pos;
+            let dist = to_contest.len();
+            if dist > LOOSE_BALL_PACE_MATCH_OPPONENT_RADIUS_YARDS || dist <= 1e-3 {
+                return false;
+            }
+            let closing = self
+                .player_velocity(opp.id)
+                .unwrap_or(opp.velocity)
+                .dot(to_contest * (1.0 / dist));
+            if closing < LOOSE_BALL_PACE_MATCH_OPPONENT_MIN_CLOSING_YPS {
+                return false;
+            }
+            let opp_top = player_top_speed_yps(opp.role, &opp.skills);
+            closing >= opp_top * LOOSE_BALL_PACE_MATCH_OPPONENT_SPRINT_FRACTION
+        })
+    }
+
     pub(crate) fn loose_ball_recovery_target_for(&self, player_id: usize) -> Vec2 {
         if self.active_rebound_for_player(player_id).is_some() {
             return self
