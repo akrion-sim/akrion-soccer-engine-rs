@@ -648,8 +648,8 @@ impl Default for DefensiveShapeTunables {
         DefensiveShapeTunables {
             defensive_line_max_into_opp_half_yards: 5.0,
             back_four_block_width_yards: 22.0,
-            back_four_horizontal_min_gap_yards: 1.5,
-            back_four_horizontal_max_gap_yards: 8.0,
+            back_four_horizontal_min_gap_yards: 6.0,
+            back_four_horizontal_max_gap_yards: 15.0,
             wingback_defensive_pinch_target_seconds: 3.0,
             wingback_defensive_pinch_opponent_half_margin_yards: 8.0,
             defensive_goal_side_min_yards: 1.5,
@@ -4243,8 +4243,8 @@ mod tests {
             5.0
         );
         assert_eq!(t.defensive_shape.back_four_block_width_yards, 22.0);
-        assert_eq!(t.defensive_shape.back_four_horizontal_min_gap_yards, 1.5);
-        assert_eq!(t.defensive_shape.back_four_horizontal_max_gap_yards, 8.0);
+        assert_eq!(t.defensive_shape.back_four_horizontal_min_gap_yards, 6.0);
+        assert_eq!(t.defensive_shape.back_four_horizontal_max_gap_yards, 15.0);
         assert_eq!(
             t.defensive_shape.wingback_defensive_pinch_target_seconds,
             3.0

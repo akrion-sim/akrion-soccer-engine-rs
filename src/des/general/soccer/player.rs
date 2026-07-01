@@ -1042,6 +1042,10 @@ pub struct WallPassPlan {
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocomotionCommitment {
+    /// Desired effort tier carried by the locomotion commitment. This is intentionally
+    /// separate from `PlayerAgent::movement_gait`, which is resolved from physical speed.
+    #[serde(default)]
+    pub committed_gait: MovementGait,
     /// Seconds the player has continuously held the current gait effort tier, summed
     /// per movement step from `dt`. Reset when the tier changes; gates downshifts.
     pub gait_held_seconds: f64,
@@ -2640,9 +2644,7 @@ pub(crate) fn player_mdp_mpc_comparison_trace(
         ),
         mpc_recommended_spin_rps: finite_metric(execution_estimate.recommended_spin_rps),
         mpc_recommended_curve: execution_estimate.recommended_curve.to_string(),
-        mpc_recommended_curve_technique: execution_estimate
-            .recommended_curve_technique
-            .to_string(),
+        mpc_recommended_curve_technique: execution_estimate.recommended_curve_technique.to_string(),
         mpc_execution_horizon_seconds: finite_metric(execution_estimate.horizon_seconds),
         mpc_reselect_reason: execution_estimate.reselect_reason.to_string(),
         mpc_guidance_present: true,
@@ -8156,7 +8158,8 @@ impl PlayerAgent {
         let intent = snapshot.midfield_line_band_adjusted_intent(intent);
         let intent = snapshot.forward_line_band_adjusted_intent(intent);
         let intent = snapshot.wingback_width_adjusted_intent(intent);
-        snapshot.possession_wide_lane_floor_adjusted_intent(intent)
+        let intent = snapshot.possession_wide_lane_floor_adjusted_intent(intent);
+        snapshot.teammate_spacing_path_adjusted_intent(intent)
     }
 
     /// Per-tick decision entry. Thin wrapper over [`Self::run_time_step_with_context_inner`]
@@ -9836,13 +9839,13 @@ impl PlayerAgent {
                 let technique = ability01(self.skills.flair_passing) * 0.5
                     + ability01(self.skills.passing) * 0.3
                     + ability01(self.skills.vision) * 0.2;
-                let scoop_chance = (0.22 + technique * 0.56)
+                let scoop_chance = (1.24 + technique * 0.32)
                     .max(if scoop_strategy_requested {
-                        0.78 + technique * 0.10
+                        1.42 + technique * 0.24
                     } else {
                         0.0
                     })
-                    .clamp(0.0, if scoop_strategy_requested { 0.94 } else { 0.80 });
+                    .clamp(0.0, if scoop_strategy_requested { 1.72 } else { 1.60 });
                 (target, scoop_chance)
             });
             if let Some((_, scoop_chance)) = scoop_pass_option {

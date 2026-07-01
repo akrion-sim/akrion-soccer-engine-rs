@@ -1007,11 +1007,10 @@ const LONG_AERIAL_CONTROL_RACE_REFERENCE_SECONDS: f64 = 1.4;
 /// small keeps lateral/short lofts honestly short rather than sailing past the receiver.
 const AERIAL_LAND_AT_TARGET_DRAG_COMP: f64 = 1.08;
 // Scoops are delicate short chips over a close defender. They must clear a standing/lunging
-// block early in the path, but stay in a clipped 6-9ft window and land on the receiver: high
-// enough to clip over a close foot/lunge (origin/alex-1's concern) yet low enough to drop back
-// down promptly instead of looping (the user's "scoop goes too high / hangs too long" report).
-const SCOOP_LOFT_APEX_MIN_YARDS: f64 = 2.0; // 6ft — clears a standing foot
-const SCOOP_LOFT_APEX_MAX_YARDS: f64 = 3.0; // 9ft — drops back down promptly, no balloon
+// block early in the path, but stay in a clipped 10-13ft window and land on the receiver:
+// high enough to carry over the blocker into the teammate's run, low enough to avoid ballooning.
+const SCOOP_LOFT_APEX_MIN_YARDS: f64 = 10.0 / 3.0; // 10ft — clears a standing/lunging blocker
+const SCOOP_LOFT_APEX_MAX_YARDS: f64 = 13.0 / 3.0; // 13ft — clipped scoop, no hanging lob
 const SCOOP_LAND_AT_TARGET_DRAG_COMP: f64 = 1.20;
 const SCOOP_MIN_SPEED_MPH: f64 = 16.0;
 const SCOOP_MAX_SPEED_MPH: f64 = 38.0;
@@ -1709,9 +1708,10 @@ const SCOOP_PASS_RECEIVER_OPEN_RADIUS_YARDS: f64 = 3.0;
 // A defender standing this far off the direct line still blocks a GROUND pass with their reach —
 // which is exactly what we lift the ball over (was 1.8, too tight to catch real blockers).
 const SCOOP_PASS_DEFENDER_LANE_RADIUS_YARDS: f64 = 2.4;
-// The carrier must be relatively surrounded (this many opponents within this radius) and the
-// receiver must sit within ±75° (a 150° cone) of the way the carrier is facing — a pressured
-// player chips across their body more than a tight ±50° allowed.
+// Nearby pressure is a bonus, not a hard gate: the essential trigger is an otherwise-ideal
+// teammate whose direct floor lane is blocked by an opponent. The receiver must sit within ±75°
+// (a 150° cone) of the way the carrier is facing — a pressured player chips across their body
+// more than a tight ±50° allowed.
 const SCOOP_PASS_PASSER_CROWD_RADIUS_YARDS: f64 = 7.0;
 const SCOOP_PASS_PASSER_MIN_CROWD: usize = 2;
 const SCOOP_PASS_FACING_HALF_CONE_DEGREES: f64 = 75.0;
@@ -3111,7 +3111,7 @@ const DEFENDER_LINE_FORWARD_BIAS_YARDS: f64 = 2.5;
 // flank is meaningfully a "weak side" worth pinning; below it both flanks are live.
 const WEAKSIDE_WIDTH_BALL_OFFSET_MIN: f64 = 0.10;
 const POSSESSION_WIDE_LANE_FLOOR_MIN_SHORTAGE: f64 = 0.08;
-const POSSESSION_WIDE_LANE_FLOOR_MIN_FRACTION: f64 = 0.30;
+const POSSESSION_WIDE_LANE_FLOOR_MIN_FRACTION: f64 = 0.40;
 // Defenders slide toward the ball laterally a touch more than before, and
 // wing-backs (wide defenders) slide much more — they are the ones who shuttle out
 // to the ball on their flank. Centre-backs get only a small amount: they hold
@@ -4014,7 +4014,8 @@ const SOCCER_NEURAL_HUMAN_INTENT_FEATURE_DIM: usize = 4;
 /// average defensive-line `y` state explicit for the value, actor, and world-model
 /// heads while preserving old snapshots by zero-padding these newest channels.
 const SOCCER_NEURAL_BACK_FOUR_LINE_FEATURE_DIM_V1: usize = 14;
-const SOCCER_NEURAL_BACK_FOUR_LINE_FEATURE_DIM: usize = 16;
+const SOCCER_NEURAL_BACK_FOUR_LINE_FEATURE_DIM_V2: usize = 16;
+const SOCCER_NEURAL_BACK_FOUR_LINE_FEATURE_DIM: usize = 18;
 /// Append-only carrier line-break block: legal self-dribble progress beyond the
 /// second-last defender line, plus the distance to that break while carrying.
 const SOCCER_NEURAL_CARRIER_LINE_BREAK_FEATURE_DIM: usize = 2;
@@ -4074,6 +4075,8 @@ const SOCCER_NEURAL_PRE_CARRIER_LINE_BREAK_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_BACK_FOUR_LINE_FEATURE_DIM + SOCCER_NEURAL_BACK_FOUR_LINE_FEATURE_DIM;
 const SOCCER_NEURAL_PRE_CARRIER_LINE_BREAK_FEATURE_DIM_V1: usize =
     SOCCER_NEURAL_PRE_BACK_FOUR_LINE_FEATURE_DIM + SOCCER_NEURAL_BACK_FOUR_LINE_FEATURE_DIM_V1;
+const SOCCER_NEURAL_PRE_CARRIER_LINE_BREAK_FEATURE_DIM_V2: usize =
+    SOCCER_NEURAL_PRE_BACK_FOUR_LINE_FEATURE_DIM + SOCCER_NEURAL_BACK_FOUR_LINE_FEATURE_DIM_V2;
 const SOCCER_NEURAL_PRE_MIDFIELD_FOUR_BAND_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_CARRIER_LINE_BREAK_FEATURE_DIM + SOCCER_NEURAL_CARRIER_LINE_BREAK_FEATURE_DIM;
 const SOCCER_NEURAL_PRE_SUPPORT_SPACING_FEATURE_DIM: usize =
@@ -4405,8 +4408,12 @@ const SOCCER_NEURAL_FEATURE_BACK_FOUR_FOREMOST_FOUR_ATTACKER_GAP: usize =
     SOCCER_NEURAL_FEATURE_BACK_FOUR_OFFSIDE_TRAP_NEXT + 1;
 const SOCCER_NEURAL_FEATURE_BACK_FOUR_FOREMOST_FOUR_ATTACKER_GAP_PRESSURE: usize =
     SOCCER_NEURAL_FEATURE_BACK_FOUR_FOREMOST_FOUR_ATTACKER_GAP + 1;
-const SOCCER_NEURAL_FEATURE_CARRIER_OFFSIDE_LINE_BREAK: usize =
+const SOCCER_NEURAL_FEATURE_BACK_FOUR_LATERAL_WIDTH: usize =
     SOCCER_NEURAL_FEATURE_BACK_FOUR_FOREMOST_FOUR_ATTACKER_GAP_PRESSURE + 1;
+const SOCCER_NEURAL_FEATURE_BACK_FOUR_LATERAL_WIDTH_PRESSURE: usize =
+    SOCCER_NEURAL_FEATURE_BACK_FOUR_LATERAL_WIDTH + 1;
+const SOCCER_NEURAL_FEATURE_CARRIER_OFFSIDE_LINE_BREAK: usize =
+    SOCCER_NEURAL_FEATURE_BACK_FOUR_LATERAL_WIDTH_PRESSURE + 1;
 const SOCCER_NEURAL_FEATURE_CARRIER_OFFSIDE_LINE_BREAK_WINDOW: usize =
     SOCCER_NEURAL_FEATURE_CARRIER_OFFSIDE_LINE_BREAK + 1;
 const SOCCER_NEURAL_FEATURE_MIDFIELD_FOUR_BAND_Y: usize =
@@ -4783,7 +4790,9 @@ const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     SOCCER_NEURAL_PRE_BACK_FOUR_LINE_FEATURE_DIM,
     // Old back-four model tail before the foremost-four attacker gap channels.
     SOCCER_NEURAL_PRE_CARRIER_LINE_BREAK_FEATURE_DIM_V1,
-    // Same schema with the back-four model tail, before legal carrier line-break features.
+    // Same schema with foremost-four attacker gap, before lateral width-pressure channels.
+    SOCCER_NEURAL_PRE_CARRIER_LINE_BREAK_FEATURE_DIM_V2,
+    // Same schema with the full back-four model tail, before legal carrier line-break features.
     SOCCER_NEURAL_PRE_CARRIER_LINE_BREAK_FEATURE_DIM,
     // Same schema with carrier line-break features, before the midfield-four band tail.
     SOCCER_NEURAL_PRE_MIDFIELD_FOUR_BAND_FEATURE_DIM,
@@ -4899,13 +4908,14 @@ const SOCCER_NEURAL_FORMATION_INTENT_SAMPLE_PLAYERS: usize = 2;
 /// while the MARL/MAPPO safety knobs are exposed on `SoccerNeuralLearningConfig`.
 const SOCCER_POLICY_ROLE_EMBEDDING_DIM: usize = 4;
 /// Exact-position one-hot appended after the broad role one-hot so the shared actor can
-/// specialize per assigned slot (GK / LB / LCB / RCB / RB / DM / CM / AM / LW / RW / ST)
-/// rather than treating all four defenders — or both wide forwards — identically. Always
+/// specialize per assigned slot (GK / LB / LCB / RCB / RB / LM / LCM / RCM / RM / LS / RS)
+/// rather than treating all defenders, all midfielders, or both forwards identically. Always
 /// present in the feature schema; populated only when
-/// `DD_SOCCER_ENABLE_ASSIGNED_POSITION_EMBEDDING` is set (else all-zero ⇒ a clean A/B
+/// `DD_SOCCER_ENABLE_ASSIGNED_POSITION_EMBEDDING` is set (else all-zero, a clean A/B
 /// against the role-only actor within the same network dimensions). See
 /// [`SoccerAssignedPosition`] and [`soccer_assigned_position_for`].
-const SOCCER_POLICY_ASSIGNED_POSITION_DIM: usize = 11;
+pub const SOCCER_ASSIGNED_POSITION_COUNT: usize = 11;
+const SOCCER_POLICY_ASSIGNED_POSITION_DIM: usize = SOCCER_ASSIGNED_POSITION_COUNT;
 const SOCCER_POLICY_FEATURE_DIM: usize = SOCCER_NEURAL_FEATURE_DIM
     + SOCCER_POLICY_ROLE_EMBEDDING_DIM
     + SOCCER_POLICY_ASSIGNED_POSITION_DIM;
@@ -6005,6 +6015,10 @@ pub struct SoccerMdpState {
     pub ball_grid: PitchGridAddress,
     #[serde(default)]
     pub player_grid: PitchGridAddress,
+    /// Actor's formation slot. This keeps the symbolic MDP state position-aware without
+    /// reintroducing high-cardinality live pitch cells into the tabular key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assigned_position: Option<SoccerAssignedPosition>,
     #[serde(default)]
     pub receive_facing: FacingBucket,
     #[serde(default)]
@@ -6240,6 +6254,12 @@ pub struct SoccerNeuralExtendedObservation {
     /// Unit pressure from the same gap: 0 means connected, 1 means too stretched.
     #[serde(default)]
     pub back_four_opponent_foremost_four_gap_pressure: f64,
+    /// Current lateral width of the back four along the pitch x-axis.
+    #[serde(default)]
+    pub back_four_lateral_width_yards: f64,
+    /// Unit pressure for a too-narrow back four: 0 means acceptably spread, 1 means collapsed.
+    #[serde(default)]
+    pub back_four_lateral_width_pressure: f64,
     // --- Midfield-four average-y band model (team aggregate, attack-direction frame) ---
     /// Raw average `y` position of the team's midfielders, in yards.
     #[serde(default)]
@@ -6362,6 +6382,10 @@ fn field_teammate_ratio_default() -> f64 {
 #[serde(rename_all = "camelCase")]
 pub struct SoccerPomdpObservation {
     pub player_id: usize,
+    /// Actor's formation slot, mirrored from the MDP state so POMDP consumers can decide
+    /// from the player's football job even when only the observation is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assigned_position: Option<SoccerAssignedPosition>,
     #[serde(default)]
     pub player_grid: PitchGridAddress,
     #[serde(default)]
@@ -7376,6 +7400,10 @@ pub struct SoccerDecisionContext {
     /// from `actor_position`: a left back overlapping high remains a left back to the actor.
     #[serde(default)]
     pub assigned_position_grid: PitchGridAddress,
+    /// Exact 11-slot assignment (GK/LB/LCB/RCB/RB/LM/LCM/RCM/RM/LS/RS), distinct from the
+    /// broad role and live grid. Decision traces use this to audit position-specific choices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assigned_position: Option<SoccerAssignedPosition>,
     #[serde(default)]
     pub actor_velocity: Vec2,
     #[serde(default)]
@@ -9163,6 +9191,10 @@ fn weighted_mean(left_mean: f64, left_count: usize, right_mean: f64, right_count
 pub struct SoccerQStateKey {
     pub phase: TacticalPhase,
     pub role: PlayerRole,
+    /// Exact formation slot. This deliberately splits the tabular policy by the 11 football
+    /// jobs while still omitting noisy live player pitch cells.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assigned_position: Option<SoccerAssignedPosition>,
     pub possession_relative: i8,
     pub ball_zone_x: usize,
     pub ball_zone_y: usize,
@@ -9252,6 +9284,10 @@ pub struct SoccerQStateKey {
     pub back_four_foremost_four_gap_bin: u8,
     #[serde(default)]
     pub back_four_foremost_four_gap_pressure_bin: u8,
+    #[serde(default)]
+    pub back_four_lateral_width_bin: u8,
+    #[serde(default)]
+    pub back_four_lateral_width_pressure_bin: u8,
     #[serde(default)]
     pub defensive_press_action_bin: u8,
     #[serde(default)]
@@ -9788,9 +9824,11 @@ impl SoccerQStateKey {
         let (ball_fine_lane, ball_fine_row) = q_state_ball_fine_lane_row(state, observation);
         let (field_motion_shape_bin, field_motion_ball_relation_bin, field_motion_intensity_bin) =
             q_state_field_motion_bins(observation);
+        let assigned_position = state.assigned_position.or(observation.assigned_position);
         SoccerQStateKey {
             phase: state.phase,
             role,
+            assigned_position,
             possession_relative,
             ball_zone_x: state.ball_zone_x,
             ball_zone_y: state.ball_zone_y,
@@ -9910,6 +9948,14 @@ impl SoccerQStateKey {
                 observation
                     .neural_extended
                     .back_four_opponent_foremost_four_gap_pressure,
+                &[0.15, 0.35, 0.60, 0.82],
+            ),
+            back_four_lateral_width_bin: distance_bucket(
+                observation.neural_extended.back_four_lateral_width_yards,
+                &[12.0, 18.0, 24.0, 30.0, 38.0, 48.0],
+            ),
+            back_four_lateral_width_pressure_bin: distance_bucket(
+                observation.neural_extended.back_four_lateral_width_pressure,
                 &[0.15, 0.35, 0.60, 0.82],
             ),
             defensive_press_action_bin: distance_bucket(
@@ -10681,6 +10727,7 @@ impl SoccerQStateKey {
     fn matches_learning_context(&self, other: &Self) -> bool {
         self.phase == other.phase
             && self.role == other.role
+            && self.assigned_position == other.assigned_position
             && self.possession_relative == other.possession_relative
             && self.ball_zone_x == other.ball_zone_x
             && self.ball_zone_y == other.ball_zone_y
@@ -10726,6 +10773,9 @@ impl SoccerQStateKey {
             && self.back_four_foremost_four_gap_bin == other.back_four_foremost_four_gap_bin
             && self.back_four_foremost_four_gap_pressure_bin
                 == other.back_four_foremost_four_gap_pressure_bin
+            && self.back_four_lateral_width_bin == other.back_four_lateral_width_bin
+            && self.back_four_lateral_width_pressure_bin
+                == other.back_four_lateral_width_pressure_bin
             && self.defensive_press_action_bin == other.defensive_press_action_bin
             && self.defensive_contain_risk_bin == other.defensive_contain_risk_bin
             && self.defensive_goal_side_line_fit_bin == other.defensive_goal_side_line_fit_bin
@@ -10968,6 +11018,7 @@ impl SoccerQStateKey {
 
     fn matches_relaxed_learning_context(&self, other: &Self) -> bool {
         self.role == other.role
+            && self.assigned_position == other.assigned_position
             && self.possession_relative == other.possession_relative
             && self.has_ball == other.has_ball
             && self.visible_ball == other.visible_ball
@@ -11001,16 +11052,17 @@ pub struct SoccerQActionKey {
     pub action: String,
 }
 
-// Position-free coarse fallback key. With the player pitch-grid cells gone from
+// Live-position-free coarse fallback key. With the player pitch-grid cells gone from
 // the Q-key there is no multi-resolution spatial backoff left; lookups try the
 // exact context (the full state key, via `action_exact_index`) and then this one
-// relaxed bucket — role/possession/ball-availability/facing only — so a sample
-// can still generalize across the ~120 remaining noisy fields. Offside-recovery context stays in
-// this relaxed key so sparse data cannot smear stranded-offside decisions into normal attacking
-// runs.
+// relaxed bucket. It still keeps the assigned 11-slot position so sparse data can
+// generalize across noisy fields without smearing a right mid's run into a center mid.
+// Offside-recovery context stays in this relaxed key so sparse data cannot smear
+// stranded-offside decisions into normal attacking runs.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct SoccerQRelaxedIndexKey {
     role: PlayerRole,
+    assigned_position: Option<SoccerAssignedPosition>,
     possession_relative: i8,
     has_ball: bool,
     visible_ball: bool,
@@ -11382,6 +11434,7 @@ impl SoccerQPolicy {
     fn relaxed_index_key_for_state(state: &SoccerQStateKey) -> SoccerQRelaxedIndexKey {
         SoccerQRelaxedIndexKey {
             role: state.role,
+            assigned_position: state.assigned_position,
             possession_relative: state.possession_relative,
             has_ball: state.has_ball,
             visible_ball: state.visible_ball,
@@ -13551,6 +13604,7 @@ fn is_attacking_support_action_label(action: &str) -> bool {
                 | ExploitSpaceRun
                 | WideOutlet
                 | ShotCreationRun
+                | PinchCrossArrival
                 | OverlapRun
                 | SupportScreen
                 | VerticalAttack
@@ -21965,6 +22019,7 @@ fn soccer_decision_context_for(
             pitch_grid_address(actor.home_position, before.field_width, before.field_length)
         })
         .unwrap_or_default();
+    let assigned_position = actor_snapshot.map(|actor| actor.assigned_position);
     let (target_point, target_player) =
         soccer_decision_target_point(team, action, action_target, before, after);
     let target_player_position = target_player.and_then(|target_id| {
@@ -22241,6 +22296,7 @@ fn soccer_decision_context_for(
     SoccerDecisionContext {
         actor_position,
         assigned_position_grid,
+        assigned_position,
         actor_velocity,
         actor_acceleration,
         field_player_motion: soccer_field_player_motion_block(before, player_id, team),
@@ -22825,7 +22881,7 @@ fn soccer_goal_credit_action_is_relevant(action: &str) -> bool {
                 | SupportShape | SupportRoam | CheckToBall | RunInBehind | ExploitSpaceRun
                 // NB: original had the DEAD `"support-push-up"` arm but no live
                 // `"vertical-attack"`, so vertical-attack is intentionally excluded.
-                | WideOutlet | ShotCreationRun | OverlapRun | SupportScreen
+                | WideOutlet | ShotCreationRun | PinchCrossArrival | OverlapRun | SupportScreen
                 | ControlTouch | SetPlayRun | Clearance | RouteOne
         )
     )
@@ -32555,6 +32611,13 @@ pub struct SoccerDecisionModelContract {
     pub mdp_state_grid_enabled: bool,
     pub pomdp_observation_grid_enabled: bool,
     pub action_target_grid_enabled: bool,
+    pub assigned_position_count: usize,
+    pub assigned_position_in_mdp_state: bool,
+    pub assigned_position_in_pomdp_observation: bool,
+    pub assigned_position_in_q_state: bool,
+    pub assigned_position_in_decision_context: bool,
+    pub assigned_position_actor_embedding_available: bool,
+    pub outside_mid_final_third_pinch_option_enabled: bool,
     pub shot_lane_through_line_required: bool,
     pub blocked_shot_lane_makes_shoot_illegal: bool,
     pub clean_shot_must_shoot_yards: f64,
@@ -33505,6 +33568,13 @@ fn soccer_decision_model_contract() -> SoccerDecisionModelContract {
         mdp_state_grid_enabled: true,
         pomdp_observation_grid_enabled: true,
         action_target_grid_enabled: true,
+        assigned_position_count: SOCCER_ASSIGNED_POSITION_COUNT,
+        assigned_position_in_mdp_state: true,
+        assigned_position_in_pomdp_observation: true,
+        assigned_position_in_q_state: true,
+        assigned_position_in_decision_context: true,
+        assigned_position_actor_embedding_available: true,
+        outside_mid_final_third_pinch_option_enabled: true,
         shot_lane_through_line_required: true,
         blocked_shot_lane_makes_shoot_illegal: true,
         clean_shot_must_shoot_yards: CLEAN_SHOT_MUST_SHOOT_YARDS,
@@ -38552,68 +38622,85 @@ fn soccer_policy_role_embedding(role: PlayerRole) -> [f64; SOCCER_POLICY_ROLE_EM
     embedding
 }
 
-/// Exact assigned position, refining the broad [`PlayerRole`] into the conventional 11 slots.
-/// Ordering is the one-hot index used in the policy feature block.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SoccerAssignedPosition {
+/// Exact assigned position, refining the broad [`PlayerRole`] into the 11 autonomous football jobs.
+/// Ordering is the one-hot index used in the policy feature block and the documented contract.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SoccerAssignedPosition {
+    #[default]
     Goalkeeper,
     LeftBack,
     LeftCentreBack,
     RightCentreBack,
     RightBack,
-    DefensiveMidfield,
-    CentreMidfield,
-    AttackingMidfield,
-    LeftWing,
-    RightWing,
-    Striker,
+    LeftMidfielder,
+    LeftCentreMidfielder,
+    RightCentreMidfielder,
+    RightMidfielder,
+    LeftStriker,
+    RightStriker,
 }
 
 impl SoccerAssignedPosition {
-    fn one_hot_index(self) -> usize {
+    pub fn one_hot_index(self) -> usize {
         match self {
             SoccerAssignedPosition::Goalkeeper => 0,
             SoccerAssignedPosition::LeftBack => 1,
             SoccerAssignedPosition::LeftCentreBack => 2,
             SoccerAssignedPosition::RightCentreBack => 3,
             SoccerAssignedPosition::RightBack => 4,
-            SoccerAssignedPosition::DefensiveMidfield => 5,
-            SoccerAssignedPosition::CentreMidfield => 6,
-            SoccerAssignedPosition::AttackingMidfield => 7,
-            SoccerAssignedPosition::LeftWing => 8,
-            SoccerAssignedPosition::RightWing => 9,
-            SoccerAssignedPosition::Striker => 10,
+            SoccerAssignedPosition::LeftMidfielder => 5,
+            SoccerAssignedPosition::LeftCentreMidfielder => 6,
+            SoccerAssignedPosition::RightCentreMidfielder => 7,
+            SoccerAssignedPosition::RightMidfielder => 8,
+            SoccerAssignedPosition::LeftStriker => 9,
+            SoccerAssignedPosition::RightStriker => 10,
         }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SoccerAssignedPosition::Goalkeeper => "GK",
+            SoccerAssignedPosition::LeftBack => "LB",
+            SoccerAssignedPosition::LeftCentreBack => "LCB",
+            SoccerAssignedPosition::RightCentreBack => "RCB",
+            SoccerAssignedPosition::RightBack => "RB",
+            SoccerAssignedPosition::LeftMidfielder => "LM",
+            SoccerAssignedPosition::LeftCentreMidfielder => "LCM",
+            SoccerAssignedPosition::RightCentreMidfielder => "RCM",
+            SoccerAssignedPosition::RightMidfielder => "RM",
+            SoccerAssignedPosition::LeftStriker => "LS",
+            SoccerAssignedPosition::RightStriker => "RS",
+        }
+    }
+
+    pub fn is_outside_midfielder(self) -> bool {
+        matches!(
+            self,
+            SoccerAssignedPosition::LeftMidfielder | SoccerAssignedPosition::RightMidfielder
+        )
     }
 }
 
 /// Derive the exact assigned position from the player's broad role and its **formation
 /// anchor** (`home_position`, static for the match), team-relative so "left"/"deep" mean the
-/// same thing for both sides. Defenders split L→R into LB/LCB/RCB/RB by lateral quartile;
-/// midfielders split by depth into DM/CM/AM; forwards split L→R into LW/ST/RW. Deterministic,
-/// so the decision-time and training-time feature vectors agree.
-pub(crate) fn soccer_assigned_position_for(
+/// same thing for both sides. Defenders split L-to-R into LB/LCB/RCB/RB, midfielders into
+/// LM/LCM/RCM/RM, and forwards into LS/RS. Deterministic, so the decision-time and
+/// training-time feature vectors agree.
+pub fn soccer_assigned_position_for(
     role: PlayerRole,
     home_position: Vec2,
     field_width_yards: f64,
-    field_length_yards: f64,
+    _field_length_yards: f64,
     team: Team,
 ) -> SoccerAssignedPosition {
-    // Team-relative lateral fraction (0 = own left touchline, 1 = own right) and forward
-    // depth fraction (0 = own goal line, 1 = opponent goal line).
+    // Team-relative lateral fraction (0 = own left touchline, 1 = own right).
     let width = field_width_yards.max(1.0);
-    let length = field_length_yards.max(1.0);
     let lateral = (home_position.x / width).clamp(0.0, 1.0);
     let lateral = if team == Team::Home {
         lateral
     } else {
         1.0 - lateral
-    };
-    let depth = (home_position.y / length).clamp(0.0, 1.0);
-    let depth = if team == Team::Home {
-        depth
-    } else {
-        1.0 - depth
     };
     match role {
         PlayerRole::Goalkeeper => SoccerAssignedPosition::Goalkeeper,
@@ -38629,21 +38716,21 @@ pub(crate) fn soccer_assigned_position_for(
             }
         }
         PlayerRole::Midfielder => {
-            if depth < 0.42 {
-                SoccerAssignedPosition::DefensiveMidfield
-            } else if depth < 0.62 {
-                SoccerAssignedPosition::CentreMidfield
+            if lateral < 0.25 {
+                SoccerAssignedPosition::LeftMidfielder
+            } else if lateral < 0.5 {
+                SoccerAssignedPosition::LeftCentreMidfielder
+            } else if lateral < 0.75 {
+                SoccerAssignedPosition::RightCentreMidfielder
             } else {
-                SoccerAssignedPosition::AttackingMidfield
+                SoccerAssignedPosition::RightMidfielder
             }
         }
         PlayerRole::Forward => {
-            if lateral < 0.33 {
-                SoccerAssignedPosition::LeftWing
-            } else if lateral < 0.67 {
-                SoccerAssignedPosition::Striker
+            if lateral < 0.5 {
+                SoccerAssignedPosition::LeftStriker
             } else {
-                SoccerAssignedPosition::RightWing
+                SoccerAssignedPosition::RightStriker
             }
         }
     }
@@ -38969,6 +39056,8 @@ struct BackFourLineLearningSignal {
     offside_trap_next_three_seconds: f64,
     opponent_foremost_four_forward_gap_yards: f64,
     opponent_foremost_four_gap_pressure: f64,
+    lateral_width_yards: f64,
+    lateral_width_pressure: f64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -38998,6 +39087,8 @@ fn back_four_line_learning_signal(
     let mut defender_y_total = 0.0;
     let mut defender_velocity_y_total = 0.0;
     let mut defender_acceleration_y_total = 0.0;
+    let mut defender_min_x = f64::INFINITY;
+    let mut defender_max_x = f64::NEG_INFINITY;
     let mut defender_min_y = f64::INFINITY;
     let mut defender_max_y = f64::NEG_INFINITY;
     let mut projected_defender_min_y = f64::INFINITY;
@@ -39012,6 +39103,8 @@ fn back_four_line_learning_signal(
         defender_y_total += position.y;
         defender_velocity_y_total += defender.velocity.y;
         defender_acceleration_y_total += defender.acceleration.y;
+        defender_min_x = defender_min_x.min(position.x);
+        defender_max_x = defender_max_x.max(position.x);
         defender_min_y = defender_min_y.min(position.y);
         defender_max_y = defender_max_y.max(position.y);
         let projected_y = position.y
@@ -39036,6 +39129,9 @@ fn back_four_line_learning_signal(
     let line_forward_acceleration_yps2 = line_acceleration_y * attack_dir;
     let line_spread_yards = (defender_max_y - defender_min_y).abs();
     let projected_line_spread_yards = (projected_defender_max_y - projected_defender_min_y).abs();
+    let lateral_width_yards = finite_metric((defender_max_x - defender_min_x).abs());
+    let lateral_width_pressure =
+        back_four_lateral_width_pressure(lateral_width_yards, snapshot.field_width);
 
     let mut opponent_y_total = 0.0;
     let mut opponent_velocity_y_total = 0.0;
@@ -39198,7 +39294,25 @@ fn back_four_line_learning_signal(
         offside_trap_next_three_seconds,
         opponent_foremost_four_forward_gap_yards,
         opponent_foremost_four_gap_pressure,
+        lateral_width_yards,
+        lateral_width_pressure,
     }
+}
+
+const BACK_FOUR_LATERAL_IDEAL_WIDTH_FRACTION: f64 = 0.46;
+const BACK_FOUR_LATERAL_IDEAL_WIDTH_MIN_YARDS: f64 = 30.0;
+const BACK_FOUR_LATERAL_IDEAL_WIDTH_MAX_YARDS: f64 = 42.0;
+const BACK_FOUR_LATERAL_WIDTH_PRESSURE_WINDOW_YARDS: f64 = 16.0;
+
+pub(crate) fn back_four_lateral_ideal_width_yards(field_width: f64) -> f64 {
+    (field_width.max(1.0) * BACK_FOUR_LATERAL_IDEAL_WIDTH_FRACTION)
+        .clamp(BACK_FOUR_LATERAL_IDEAL_WIDTH_MIN_YARDS, BACK_FOUR_LATERAL_IDEAL_WIDTH_MAX_YARDS)
+}
+
+pub(crate) fn back_four_lateral_width_pressure(width_yards: f64, field_width: f64) -> f64 {
+    let ideal = back_four_lateral_ideal_width_yards(field_width);
+    ((ideal - finite_metric(width_yards).max(0.0)) / BACK_FOUR_LATERAL_WIDTH_PRESSURE_WINDOW_YARDS)
+        .clamp(0.0, 1.0)
 }
 
 fn back_four_foremost_four_gap_pressure(gap_yards: f64, possession_state: f64) -> f64 {
@@ -39860,6 +39974,8 @@ fn soccer_neural_extended_observation(
             .opponent_foremost_four_forward_gap_yards,
         back_four_opponent_foremost_four_gap_pressure: back_four_line
             .opponent_foremost_four_gap_pressure,
+        back_four_lateral_width_yards: back_four_line.lateral_width_yards,
+        back_four_lateral_width_pressure: back_four_line.lateral_width_pressure,
         midfield_four_band_y: midfield_four_band.band_y,
         midfield_four_band_target_delta_yards: midfield_four_band.target_delta_yards,
         midfield_four_band_forward_velocity_yps: midfield_four_band.band_forward_velocity_yps,
@@ -40743,6 +40859,10 @@ fn soccer_neural_transition_features_with_action(
     );
     features[SOCCER_NEURAL_FEATURE_BACK_FOUR_FOREMOST_FOUR_ATTACKER_GAP_PRESSURE] =
         soccer_neural_unit(line_model.back_four_opponent_foremost_four_gap_pressure);
+    features[SOCCER_NEURAL_FEATURE_BACK_FOUR_LATERAL_WIDTH] =
+        soccer_neural_scaled(line_model.back_four_lateral_width_yards, DEFAULT_FIELD_WIDTH_YARDS);
+    features[SOCCER_NEURAL_FEATURE_BACK_FOUR_LATERAL_WIDTH_PRESSURE] =
+        soccer_neural_unit(line_model.back_four_lateral_width_pressure);
     features[SOCCER_NEURAL_FEATURE_CARRIER_OFFSIDE_LINE_BREAK] =
         soccer_neural_scaled(line_model.carrier_offside_line_break_yards, 18.0);
     features[SOCCER_NEURAL_FEATURE_CARRIER_OFFSIDE_LINE_BREAK_WINDOW] =
@@ -50893,6 +51013,17 @@ fn tracking_frame_to_world_snapshot(
                 .skills
                 .clone()
                 .unwrap_or_else(|| neutral_tracking_skill_profile(p.role));
+            let home_position = home_positions
+                .get(&p.id)
+                .copied()
+                .unwrap_or(p.home_position.unwrap_or(p.position));
+            let assigned_position = soccer_assigned_position_for(
+                p.role,
+                home_position,
+                config.field_width_yards,
+                config.field_length_yards,
+                p.team,
+            );
             PlayerSnapshot {
                 id: p.id,
                 name: p
@@ -50901,6 +51032,7 @@ fn tracking_frame_to_world_snapshot(
                     .unwrap_or_else(|| format!("Tracking {}", p.id)),
                 team: p.team,
                 role: p.role,
+                assigned_position,
                 shirt: p.shirt.unwrap_or((p.id % 100).max(1) as u8),
                 position: p.position,
                 position_history: vec![p.position],
@@ -50918,10 +51050,7 @@ fn tracking_frame_to_world_snapshot(
                 skills,
                 fatigue: 0.0,
                 anaerobic_load: 0.0,
-                home_position: home_positions
-                    .get(&p.id)
-                    .copied()
-                    .unwrap_or(p.home_position.unwrap_or(p.position)),
+                home_position,
                 controller_slot: None,
                 scheduled_index: None,
                 preferences: AgentPreferences::default(),
@@ -51092,6 +51221,7 @@ fn tracking_frame_to_world_snapshot(
         formation_lp_guidance: Vec::new(),
         formation_lp_teams: Vec::new(),
         teammate_spacing_notices: Vec::new(),
+        back_four_anchor_pivots: [None, None],
         // A tracking-frame reconstruction has no completed-pass chain, so there is no
         // recycled-possession history to derive urgency from.
         home_recycle_urgency: 0.0,
@@ -51789,8 +51919,8 @@ fn tracking_action_target_trace(
                 Dribble | CarryForward | CarryOutLeft | CarryOutRight | ProtectBall | SideStep
                 | LeftCut | RightCut | Nutmeg | XaviTurn | FakeLeftCutRight | FakeRightCutLeft
                 | OpenPassLane | ControlTouch | Space | SupportShape | SupportRoam | CheckToBall
-                | RunInBehind | ExploitSpaceRun | WideOutlet | ShotCreationRun | OverlapRun
-                | SupportScreen | VacateSpace | Defend,
+                | RunInBehind | ExploitSpaceRun | WideOutlet | ShotCreationRun
+                | PinchCrossArrival | OverlapRun | SupportScreen | VacateSpace | Defend,
             ) => (
                 next_player.map(|p| p.position).unwrap_or(player.position),
                 None,
@@ -52563,10 +52693,10 @@ fn dd_soccer_enable_blindside_steal() -> bool {
     }
 }
 
-/// Set `DD_SOCCER_ENABLE_ASSIGNED_POSITION_EMBEDDING=1` to populate the exact-position
-/// one-hot in the actor's feature block ([`soccer_assigned_position_for`]). Default off ⇒
+/// Set `DD_SOCCER_ENABLE_ASSIGNED_POSITION_EMBEDDING=1` to populate the 11-slot assigned-position
+/// one-hot in the actor's feature block ([`soccer_assigned_position_for`]). Default off means
 /// the block stays all-zero and the actor sees only the broad role one-hot, so the policy
-/// network has identical dimensions either way (a clean A/B for positional specialization).
+/// network has identical dimensions either way (a clean A/B for neural positional specialization).
 fn dd_soccer_enable_assigned_position_embedding() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
@@ -57620,8 +57750,8 @@ pub(crate) fn pending_pass_snapshot_apex_yards(pass: &PendingPassSnapshot) -> f6
 
 fn pass_loft_apex_yards(pass: &PendingPass) -> f64 {
     if pass.flight.is_scoop() {
-        // A scoop pops over a close foot and drops onto the receiver, not into a
-        // hanging balloon arc. Keep it in the requested 7-12ft band with stable variation.
+        // A scoop pops over a close blocker and drops onto the receiver, not into a
+        // hanging balloon arc. Keep it in the requested 10-13ft band with stable variation.
         let seed = pass.launch_tick.wrapping_mul(0x9E37_79B9_7F4A_7C15)
             ^ (pass.from as u64).wrapping_shl(17);
         let unit = ((seed >> 40) & 0xFFFF) as f64 / 65535.0;

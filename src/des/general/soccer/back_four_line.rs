@@ -524,7 +524,7 @@ pub fn analytic_line_centre_gap_fraction(inputs: &BackFourLineInputs) -> f64 {
     } else {
         (
             BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_DISPOSSESSION_YARDS,
-            0.18,
+            0.22,
         )
     };
     let excess_attacker_gap = ((attacker_gap - ideal_attacker_gap) / 24.0).clamp(0.0, 1.0);
