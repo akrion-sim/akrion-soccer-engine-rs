@@ -22236,6 +22236,10 @@ pub struct WorldSnapshot {
     /// MPC keep-out. `None` ⇒ analytic seed (parity). Skipped by serde.
     #[serde(skip)]
     pub(crate) separation_floor_head: Option<std::sync::Arc<SeparationFloorHead>>,
+    /// The trained pass-lane yield head, carried from the match for live consumption in the
+    /// pass-lane yield seam. `None` ⇒ analytic seed (parity). Skipped by serde.
+    #[serde(skip)]
+    pub(crate) pass_lane_yield_head: Option<std::sync::Arc<PassLaneYieldHead>>,
     /// The trained long-pass run head, carried from the match for live consumption in
     /// `backfield_long_pass_run_invite_for`. `None` ⇒ analytic seed (parity). Skipped by
     /// serde (an internal decision aid; Default = None).
