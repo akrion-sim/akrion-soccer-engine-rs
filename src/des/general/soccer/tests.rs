@@ -89583,8 +89583,18 @@ fn weak_long_aerial_does_not_float_in_the_air() {
     }
 }
 
+/// Serialises the scoop tests that toggle `DD_SOCCER_ENABLE_SCOOP_LAND_AT_TARGET` against the
+/// ones that rely on its default (OFF under test), so their process-wide `set_var` windows never
+/// overlap and race.
+fn scoop_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[test]
 fn scoop_pass_is_low_and_snappy_not_a_balloon() {
+    let _env = scoop_env_lock();
+    std::env::remove_var("DD_SOCCER_ENABLE_SCOOP_LAND_AT_TARGET");
     let skills = SkillProfile {
         passing: 0.45,
         passing_completion_rate: 0.50,
