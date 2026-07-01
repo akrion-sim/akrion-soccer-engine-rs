@@ -3046,6 +3046,33 @@ impl RewardTunables {
             25.0,
         );
         sanitize_f64(
+            "reward.loose_ball_uncontested_penalty_per_second",
+            &mut self.loose_ball_uncontested_penalty_per_second,
+            default.loose_ball_uncontested_penalty_per_second,
+            0.0,
+            50.0,
+            0.0,
+            10.0,
+        );
+        sanitize_f64(
+            "reward.loose_ball_uncontested_penalty_max",
+            &mut self.loose_ball_uncontested_penalty_max,
+            default.loose_ball_uncontested_penalty_max,
+            0.0,
+            100.0,
+            0.0,
+            20.0,
+        );
+        sanitize_f64(
+            "reward.loose_ball_win_points",
+            &mut self.loose_ball_win_points,
+            default.loose_ball_win_points,
+            0.0,
+            200.0,
+            0.0,
+            25.0,
+        );
+        sanitize_f64(
             "reward.pitch_value_threat_delta_points",
             &mut self.pitch_value_threat_delta_points,
             default.pitch_value_threat_delta_points,
