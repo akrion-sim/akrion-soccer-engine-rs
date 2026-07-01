@@ -11280,6 +11280,7 @@ impl SoccerMatch {
             .collect();
         crashers.sort_unstable();
         if crashers.len() < crash_box::CRASH_BOX_ARRIVAL_MIN_RUNNERS {
+            self.penalize_flank_crash_box_no_shows(team, crosser, crashers.len());
             return;
         }
         let total = apply_dense_shaping_budget(
@@ -11289,6 +11290,59 @@ impl SoccerMatch {
         let share = total / crashers.len() as f64;
         for id in crashers {
             self.record_reward_event_with_kind(id, share, SoccerRewardEventKind::CrashBoxArrival);
+        }
+    }
+
+    /// The negative MIRROR of [`Self::reward_flank_crash_box_arrivals`]: when a qualifying flank
+    /// aerial cross is delivered but fewer than [`crash_box::CRASH_BOX_ARRIVAL_MIN_RUNNERS`]
+    /// attackers crashed the box, charge the attacking-role no-shows nearest the box who should
+    /// have completed the run — the ones best placed to have arrived — a small bounded
+    /// [`crash_box::CRASH_BOX_NO_SHOW_PENALTY_POINTS`] each, capped at the runner shortfall so it
+    /// can never rival the terminal goal credit. Only Forwards/Midfielders already inside the
+    /// attacking final third are eligible (a deep player who could not plausibly have crashed in
+    /// is not blamed). Gated default-OFF by
+    /// [`crash_box::crash_box_no_show_penalty_enabled`] ⇒ byte-identical baseline / A/B.
+    /// Deterministic (no-shows sorted by distance to goal, then id).
+    fn penalize_flank_crash_box_no_shows(&mut self, team: Team, crosser: usize, crashers: usize) {
+        if !crash_box::crash_box_no_show_penalty_enabled() {
+            return;
+        }
+        let shortfall = crash_box::CRASH_BOX_ARRIVAL_MIN_RUNNERS.saturating_sub(crashers);
+        if shortfall == 0 {
+            return;
+        }
+        let opponent_box_team = team.other();
+        let length = self.config.field_length_yards;
+        let attacked_goal_y = team.goal_y(length);
+        let goal_center = Vec2::new(self.config.field_width_yards * 0.5, attacked_goal_y);
+        let mut no_shows: Vec<(usize, f64)> = self
+            .players
+            .iter()
+            .filter(|player| {
+                player.team == team
+                    && player.id != crosser
+                    && matches!(player.role, PlayerRole::Forward | PlayerRole::Midfielder)
+                    && !self.point_in_own_penalty_area(opponent_box_team, player.position)
+                    && crash_box::ball_in_attacking_final_third(
+                        player.position.y,
+                        attacked_goal_y,
+                        length,
+                    )
+            })
+            .map(|player| (player.id, player.position.distance(goal_center)))
+            .collect();
+        // Blame the ones best placed to have arrived first: nearest the goal, id as tiebreak.
+        no_shows.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+        let penalty = apply_dense_shaping_budget(
+            crash_box::CRASH_BOX_NO_SHOW_PENALTY_POINTS,
+            tunables().reward.dense_shaping_budget_points,
+        );
+        for (id, _) in no_shows.into_iter().take(shortfall) {
+            self.record_reward_event_with_kind(
+                id,
+                -penalty,
+                SoccerRewardEventKind::CrashBoxNoShow,
+            );
         }
     }
 
