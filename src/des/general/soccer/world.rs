@@ -23129,7 +23129,8 @@ pub(crate) fn dd_soccer_disable_onside_support_hold() -> bool {
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_ONSIDE_SUPPORT_HOLD").is_ok())
 }
 
-/// Quick forward ground-pass priority (OFF by default = byte-identical). When set, players
+/// Quick forward ground-pass priority (default-ON in prod, kill switch
+/// `DD_SOCCER_ENABLE_QUICK_FORWARD_PASS=0`; default-OFF under test = byte-identical). When on, players
 /// place much more value on a short progressive GROUND pass (5-15 yd) into an OPEN, advanced
 /// teammate and release it SOONER — as a first-time ball off the carry or a one-touch off
 /// the first touch — rather than settling or dwelling on the ball. The forward-open value is
@@ -23254,8 +23255,8 @@ pub(crate) fn soccer_mappo_epochs() -> usize {
 /// Whether to standardize (zero-mean / unit-variance) the MAPPO actor's GAE advantages
 /// across each episode's policy batch before the policy-gradient step. This is the
 /// standard PPO/MAPPO variance-reduction normalization, but it changes the effective
-/// gradient scale, so it is OFF by default (set `DD_SOCCER_ENABLE_ADVANTAGE_NORMALIZATION=1`
-/// to opt in) — leaving the default training run byte-identical. Read once per process.
+/// gradient scale. Default-ON in prod (kill switch `DD_SOCCER_ENABLE_ADVANTAGE_NORMALIZATION=0`);
+/// default-OFF under test so the parity training run stays byte-identical. Read once per process.
 pub(crate) fn dd_soccer_enable_advantage_normalization() -> bool {
     #[cfg(test)]
     {
@@ -23306,9 +23307,9 @@ pub(crate) fn policy_advantage_standardization(advantages: &[f64]) -> Option<(f6
 
 /// Whether to suppress the centralized MAPPO team component on single-team ticks (ticks where only
 /// one team logged a sample, so the opponent mean is undefined and the "zero-sum" term degenerates
-/// into a one-sided bias — see [`soccer_marl_adjusted_reward`]). OFF by default so the default
-/// training run is byte-identical; set `DD_SOCCER_ENABLE_MARL_BALANCED_TEAM_COMPONENT=1` to opt in.
-/// Read once per process.
+/// into a one-sided bias — see [`soccer_marl_adjusted_reward`]). Default-ON in prod (kill switch
+/// `DD_SOCCER_ENABLE_MARL_BALANCED_TEAM_COMPONENT=0`); default-OFF under test so the parity
+/// training run stays byte-identical. Read once per process.
 pub(crate) fn dd_soccer_enable_marl_balanced_team_component() -> bool {
     #[cfg(test)]
     {
@@ -23425,7 +23426,8 @@ fn dd_soccer_disable_six_yard_line_floor() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_SIX_YARD_LINE_FLOOR").is_ok())
 }
-/// Defensive shepherding ("show one way"). Gated, default OFF = byte-identical for clean A/B.
+/// Defensive shepherding ("show one way"). Default-ON in prod (kill switch
+/// `DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD=0`); default-OFF under test = byte-identical for clean A/B.
 /// When ON, the single nearest defender pressing an opponent carrier in our own half does not
 /// just meet the ball square on the goal-side line: it approaches on a curved angle so its body
 /// takes the carrier's inside (goal-centre) shoulder, cutting the central / goal-bound route and
@@ -23433,7 +23435,6 @@ fn dd_soccer_disable_six_yard_line_floor() -> bool {
 /// defender). This is the real-soccer answer to "don't back off forever" — the carrier driving
 /// from ~40 to ~15yd is jockeyed wide into low-value space instead of being allowed straight down
 /// the middle. Affects only the lone presser's engage target; the rest of the block keeps shape.
-/// Enable via `DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD=1`.
 fn dd_soccer_enable_defensive_shepherd() -> bool {
     #[cfg(test)]
     {
@@ -23449,7 +23450,8 @@ fn dd_soccer_enable_defensive_shepherd() -> bool {
     }
 }
 
-/// Press-cover hardening gate (default OFF ⇒ byte-identical). When on, a single cover
+/// Press-cover hardening gate. Default-ON in prod (kill switch `DD_SOCCER_ENABLE_PRESS_COVER=0`);
+/// default-OFF under test ⇒ byte-identical. When on, a single cover
 /// defender tucks goal-side behind the lone presser so a beaten press meets immediate
 /// second pressure rather than a clean run at the back line. See
 /// [`WorldSnapshot::press_cover_target_for`].
@@ -23581,8 +23583,8 @@ pub(crate) fn own_half_short_pass_liability_penalty_factor(
     OWN_HALF_SHORT_PASS_LIABILITY_PENALTY * (floor + (1.0 - floor) * shortness)
 }
 /// Small retroactive MDP/POMDP penalty for locomotion energy spent in a tick that bought no
-/// ball interaction over the next 10s (pointless off-ball running). OFF by default; set
-/// `DD_SOCCER_ENABLE_WASTED_ENERGY_PENALTY=1` to enable. Off ⇒ byte-identical & zero-cost.
+/// ball interaction over the next 10s (pointless off-ball running). Default-ON in prod (kill switch
+/// `DD_SOCCER_ENABLE_WASTED_ENERGY_PENALTY=0`); default-OFF under test ⇒ byte-identical & zero-cost.
 pub(crate) fn dd_soccer_enable_wasted_energy_penalty() -> bool {
     #[cfg(test)]
     {
@@ -23599,8 +23601,8 @@ pub(crate) fn dd_soccer_enable_wasted_energy_penalty() -> bool {
 }
 /// Stricter, team-aware refinement of the wasted-energy penalty: only a genuine SUSTAINED
 /// flat-out sprint that bought NO positive team outcome (or personal touch) over the next 10s
-/// is docked. OFF by default; set `DD_SOCCER_ENABLE_SUSTAINED_EFFORT_NO_OUTCOME_PENALTY=1`.
-/// Off ⇒ byte-identical & zero-cost. See `SUSTAINED_EFFORT_*`.
+/// is docked. Default-ON in prod (kill switch `DD_SOCCER_ENABLE_SUSTAINED_EFFORT_NO_OUTCOME_PENALTY=0`);
+/// default-OFF under test ⇒ byte-identical & zero-cost. See `SUSTAINED_EFFORT_*`.
 pub(crate) fn dd_soccer_enable_sustained_effort_no_outcome_penalty() -> bool {
     #[cfg(test)]
     {
@@ -23625,8 +23627,8 @@ pub(crate) fn wasted_energy_tracking_active() -> bool {
     dd_soccer_enable_wasted_energy_penalty()
         || dd_soccer_enable_sustained_effort_no_outcome_penalty()
 }
-/// Far-from-ball off-ball energy conservation throttle. OFF by default; set
-/// `DD_SOCCER_ENABLE_FAR_OFFBALL_ENERGY_CONSERVATION=1`. Off ⇒ byte-identical & zero-cost.
+/// Far-from-ball off-ball energy conservation throttle. Default-ON in prod (kill switch
+/// `DD_SOCCER_ENABLE_FAR_OFFBALL_ENERGY_CONSERVATION=0`); default-OFF under test ⇒ byte-identical & zero-cost.
 pub(crate) fn dd_soccer_enable_far_offball_energy_conservation() -> bool {
     #[cfg(test)]
     {
@@ -23842,14 +23844,14 @@ fn dd_soccer_disable_show_for_ball_boost() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_SHOW_FOR_BALL_BOOST").is_ok())
 }
-/// Off-ball spacing discipline (gated, default OFF = byte-identical for clean A/B). When ON,
+/// Off-ball spacing discipline. Default-ON in prod (kill switch
+/// `DD_SOCCER_ENABLE_OFF_BALL_SPACE_DISCIPLINE=0`); default-OFF under test = byte-identical for clean A/B. When ON,
 /// `open_space_for` rewards off-ball teammates for *improving* the passing picture rather than
 /// merely closing on the ball: the "show for the ball" / ball-arrival proximity pulls are
 /// cancelled for a player who is ALREADY a clean, in-range outlet, and candidates that collapse
 /// inside the carrier's comfortable receiving radius are penalised (unless the carrier is
 /// pressured and genuinely needs a short option). This kills the "two off-ball players >4yd
 /// apart spiral into the carrier to <3yd while the passing lane is already open" red flag.
-/// Enable via `DD_SOCCER_ENABLE_OFF_BALL_SPACE_DISCIPLINE=1`.
 fn dd_soccer_enable_off_ball_space_discipline() -> bool {
     #[cfg(test)]
     {
@@ -23917,10 +23919,11 @@ fn dd_soccer_enable_scored_shot_placement() -> bool {
     *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_SCORED_SHOT_PLACEMENT").is_ok())
 }
 
-/// Set `DD_SOCCER_ENABLE_KEEPER_SAVE_REWARD=1` to give the goalkeeper a positive
-/// learning reward for stopping a shot (save/parry/claim/smother), scaled by the danger
-/// of the effort denied — an xG-prevented proxy. Default off ⇒ the keeper keeps only the
-/// retrospective concede penalty (byte-identical baseline / A/B). See
+/// Gives the goalkeeper a positive learning reward for stopping a shot
+/// (save/parry/claim/smother), scaled by the danger of the effort denied — an xG-prevented
+/// proxy. Default-ON in prod (kill switch `DD_SOCCER_ENABLE_KEEPER_SAVE_REWARD=0` reverts to
+/// the keeper keeping only the retrospective concede penalty); default-OFF under test for a
+/// byte-identical baseline / A/B. See
 /// [`SoccerSimulation::record_keeper_save_reward`].
 fn dd_soccer_enable_keeper_save_reward() -> bool {
     #[cfg(test)]

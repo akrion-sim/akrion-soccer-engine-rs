@@ -44234,8 +44234,22 @@ pub struct SoccerLiveHttpBridge {
 impl SoccerLiveHttpBridge {
     pub fn new(config: SoccerLiveServerConfig) -> Self {
         let server = SoccerLiveServer::new(config);
+        let session = server.session;
+        // dd-soccer-rs (and other embedders) construct the bridge but never call
+        // `SoccerLiveServer::run()`, which is where the cluster-learner policy hot-swap loop
+        // is normally started. Start it here too — otherwise the embedding server would only
+        // ever serve the local-file fallback and never reflect the RDS learning.
+        #[cfg(feature = "postgres-persistence")]
+        {
+            let refresh_session = Arc::clone(&session);
+            let config = {
+                let guard = soccer_mutex_lock(&refresh_session, "soccer_live_session");
+                guard.sim.config.clone()
+            };
+            start_soccer_live_pg_policy_refresh(refresh_session, config);
+        }
         SoccerLiveHttpBridge {
-            session: server.session,
+            session,
             input_queue: server.input_queue,
             controller_input_router: server.controller_input_router,
         }
@@ -44343,6 +44357,23 @@ fn soccer_live_pg_neural_tactical_only() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the live server shows the learner's best *candidate* rather than only the
+/// last promotion-gated `active` version. Default `false` (promoted-only). Set
+/// `SOCCER_LIVE_POLICY_INCLUDE_UNPROMOTED=1` so :5055 reflects the highest-fitness policy
+/// the learner has produced even when the promotion gate is holding it out of `active` —
+/// useful when the gate is strict and generations rarely promote. The refresh thread then
+/// hot-swaps to a new candidate only when a strictly higher-fitness one is published.
+#[cfg(feature = "postgres-persistence")]
+fn soccer_live_pg_include_unpromoted() -> bool {
+    std::env::var("SOCCER_LIVE_POLICY_INCLUDE_UNPROMOTED")
+        .ok()
+        .map(|raw| {
+            let raw = raw.trim().to_ascii_lowercase();
+            matches!(raw.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
 /// Whether the live server pays the (potentially minutes-long) initial Postgres policy load
 /// *before* binding the HTTP port. Default `false`: bind first and defer the first load to the
 /// background refresh thread (which does an immediate first pass), so `:5055` is never dead on
@@ -44413,8 +44444,11 @@ fn soccer_live_fetch_latest_pg_policy(
     experiment_id: &str,
 ) -> Result<Option<crate::des::soccer_learning_pg::SoccerLearningPgPolicyVersion>, String> {
     let options = SoccerQPolicyOptions::default();
+    let include_unpromoted = soccer_live_pg_include_unpromoted();
     if soccer_live_pg_neural_tactical_only() {
-        let Some(metadata) = store.load_latest_active_policy_metadata(experiment_id)? else {
+        let Some(metadata) =
+            store.load_latest_policy_metadata(experiment_id, include_unpromoted)?
+        else {
             return Ok(None);
         };
         return Ok(Some(
@@ -44435,11 +44469,12 @@ fn soccer_live_fetch_latest_pg_policy(
     // plus the well-learned tabular core — entries visited at least
     // `SOCCER_LIVE_POLICY_MIN_VISITS` times — instead of hauling the full
     // multi-million-row policy tip over the wire. `0` (default) loads everything.
-    store.load_latest_active_policy_with_min_visits(
+    store.load_latest_policy_with_min_visits(
         experiment_id,
         options.clone(),
         options,
         soccer_live_policy_min_visits(),
+        include_unpromoted,
     )
 }
 
@@ -44462,6 +44497,109 @@ fn soccer_live_install_pg_policy(
         let _ = sim.set_neural_network_snapshot(net);
     }
     stamp
+}
+
+/// Spawn the background thread that keeps the live policy in lock-step with the cluster
+/// learner: it polls Postgres and hot-swaps the policy whenever a newer/better version is
+/// published (the policy is queried per-decision, so swapping between ticks is safe). The
+/// first pass runs immediately so the cluster policy loads within seconds of the port
+/// binding. No-op when the refresh interval is `0` or there is no `SOCCER_DATABASE_URL`.
+/// Shared by [`SoccerLiveServer::run`] and [`SoccerLiveHttpBridge::new`] so an embedding
+/// server (dd-soccer-rs) gets the identical live refresh without copying the loop.
+#[cfg(feature = "postgres-persistence")]
+fn start_soccer_live_pg_policy_refresh(
+    session: Arc<Mutex<SoccerRealtimeSession>>,
+    config: MatchConfig,
+) {
+    let refresh_seconds = soccer_live_pg_refresh_seconds();
+    if refresh_seconds == 0 {
+        return;
+    }
+    // Exactly ONE refresh thread per process. Embedders like dd-soccer-rs build a fresh
+    // SoccerLiveHttpBridge per game session, so without this guard every game would spawn
+    // its own poller. The thread keeps the process-wide warm-policy cache current, and every
+    // new game session clones that cache on creation — so one refresher serves them all.
+    static REFRESH_STARTED: std::sync::Once = std::sync::Once::new();
+    REFRESH_STARTED.call_once(move || {
+    // Promoted-only by default; `SOCCER_LIVE_POLICY_INCLUDE_UNPROMOTED=1` reflects the
+    // learner's best candidate even while the promotion gate holds it out of `active`.
+    let include_unpromoted = soccer_live_pg_include_unpromoted();
+    let _ = thread::Builder::new()
+        .name("soccer-live-pg-policy-refresh".to_string())
+        .spawn(move || {
+            // `None` until the first successful connect. A transient failure (RDS briefly
+            // down at boot, or the connection later dropping unrecoverably) is RETRIED on the
+            // next tick rather than killing the refresher — so the live policy still catches
+            // up once Postgres is reachable again.
+            let mut connected: Option<(
+                crate::des::soccer_learning_pg::SoccerLearningPgStore,
+                String,
+            )> = None;
+            let mut last_seen: Option<i64> = None;
+            // The first pass runs immediately (no pre-sleep) so the cluster policy is loaded
+            // within seconds of the port binding — this is what the bind-first startup (see
+            // `new()`) relies on to swap the deferred policy in. Every later pass, and every
+            // retry after a transient failure, waits the refresh interval first.
+            let mut first_pass = true;
+            loop {
+                if first_pass {
+                    first_pass = false;
+                } else {
+                    thread::sleep(std::time::Duration::from_secs(refresh_seconds));
+                }
+                if connected.is_none() {
+                    match soccer_live_pg_connect_for_policy(&config) {
+                        Ok(Some(pair)) => connected = Some(pair),
+                        Ok(None) => return, // no DB url — never will be; stop the thread
+                        Err(err) => {
+                            eprintln!("# soccer-live: pg refresh connect failed (will retry): {err}");
+                            continue;
+                        }
+                    }
+                }
+                let Some((store, experiment_id)) = connected.as_mut() else {
+                    continue;
+                };
+                // Cheap metadata probe first (no lock); only do the full fetch on a newer
+                // publish. In best-candidate mode this is the highest-fitness version, so its
+                // updated_at only moves when a strictly better candidate is published.
+                let updated_at =
+                    match store.load_latest_policy_metadata(experiment_id, include_unpromoted) {
+                        Ok(Some(meta)) if last_seen != Some(meta.updated_at_micros) => {
+                            meta.updated_at_micros
+                        }
+                        Ok(_) => continue, // unchanged or no policy yet
+                        Err(err) => {
+                            eprintln!("# soccer-live: pg refresh probe failed (will retry): {err}");
+                            continue; // store auto-reconnects via ensure_connected next tick
+                        }
+                    };
+                // Fetch the full policy WITHOUT the session lock (the slow part: DB +
+                // deserialise), then take the lock only to swap the structs in — so a refresh
+                // never stalls the HTTP workers on a DB round-trip.
+                match soccer_live_fetch_latest_pg_policy(store, experiment_id) {
+                    Ok(Some(version)) => {
+                        let (generation, installed) = {
+                            let mut guard = soccer_mutex_lock(&session, "soccer_live_session");
+                            let stamp = soccer_live_install_pg_policy(&mut guard.sim, version);
+                            // Keep the per-game warm cache current so new game links started
+                            // after this publish reuse the NEW generation.
+                            soccer_live_store_warm_policy(&guard.sim);
+                            stamp
+                        };
+                        last_seen = Some(installed.max(updated_at));
+                        println!(
+                            "# soccer-live: refreshed to learned policy gen {generation} from postgres"
+                        );
+                    }
+                    Ok(None) => last_seen = Some(updated_at),
+                    Err(err) => {
+                        eprintln!("# soccer-live: pg refresh load failed (will retry): {err}")
+                    }
+                }
+            }
+        });
+    });
 }
 
 /// Process-wide cache of the live learned policy (trimmed tabular Q + neural snapshot). The FIRST
@@ -44699,92 +44837,18 @@ impl SoccerLiveServer {
         // Keep the live policy in lock-step with the cluster learner: a background thread polls
         // Postgres and hot-swaps the policy whenever a newer ACTIVE version is published. The
         // policy is queried per-decision, so swapping it between ticks is safe.
+        // Start the cluster-learner policy hot-swap loop: an immediate first pass loads the
+        // current policy, then newer/better publishes are swapped in. Shared with the
+        // SoccerLiveHttpBridge entrypoint so an embedding server (e.g. dd-soccer-rs) gets the
+        // same live refresh without duplicating the loop.
         #[cfg(feature = "postgres-persistence")]
         {
-            let refresh_seconds = soccer_live_pg_refresh_seconds();
-            if refresh_seconds > 0 {
-                let session = Arc::clone(&self.session);
-                let config = {
-                    let guard = soccer_mutex_lock(&session, "soccer_live_session");
-                    guard.sim.config.clone()
-                };
-                let _ = thread::Builder::new()
-                    .name("soccer-live-pg-policy-refresh".to_string())
-                    .spawn(move || {
-                        // `None` until the first successful connect. A transient failure (RDS
-                        // briefly down at boot, or the connection later dropping unrecoverably)
-                        // is RETRIED on the next tick rather than killing the refresher — so the
-                        // live policy still catches up once Postgres is reachable again.
-                        let mut connected:
-                            Option<(crate::des::soccer_learning_pg::SoccerLearningPgStore, String)> =
-                            None;
-                        let mut last_seen: Option<i64> = None;
-                        // The first pass runs immediately (no pre-sleep) so the cluster policy is
-                        // loaded within seconds of the port binding — this is what the bind-first
-                        // startup (see `new()`) relies on to swap the deferred policy in. Every
-                        // later pass, and every retry after a transient failure, waits the refresh
-                        // interval first.
-                        let mut first_pass = true;
-                        loop {
-                            if first_pass {
-                                first_pass = false;
-                            } else {
-                                thread::sleep(std::time::Duration::from_secs(refresh_seconds));
-                            }
-                            if connected.is_none() {
-                                match soccer_live_pg_connect_for_policy(&config) {
-                                    Ok(Some(pair)) => connected = Some(pair),
-                                    Ok(None) => return, // no DB url — never will be; stop the thread
-                                    Err(err) => {
-                                        eprintln!("# soccer-live: pg refresh connect failed (will retry): {err}");
-                                        continue;
-                                    }
-                                }
-                            }
-                            let Some((store, experiment_id)) = connected.as_mut() else {
-                                continue;
-                            };
-                            // Cheap metadata probe first (no lock); only do the full fetch on a
-                            // newer publish.
-                            let updated_at = match store.load_latest_active_policy_metadata(experiment_id)
-                            {
-                                Ok(Some(meta)) if last_seen != Some(meta.updated_at_micros) => {
-                                    meta.updated_at_micros
-                                }
-                                Ok(_) => continue, // unchanged or no active policy
-                                Err(err) => {
-                                    eprintln!("# soccer-live: pg refresh probe failed (will retry): {err}");
-                                    continue; // store auto-reconnects via ensure_connected next tick
-                                }
-                            };
-                            // Fetch the full policy WITHOUT the session lock (the slow part: DB +
-                            // deserialise), then take the lock only to swap the structs in — so a
-                            // refresh never stalls the HTTP workers on a DB round-trip.
-                            match soccer_live_fetch_latest_pg_policy(store, experiment_id) {
-                                Ok(Some(version)) => {
-                                    let (generation, installed) = {
-                                        let mut guard =
-                                            soccer_mutex_lock(&session, "soccer_live_session");
-                                        let stamp =
-                                            soccer_live_install_pg_policy(&mut guard.sim, version);
-                                        // Keep the per-game warm cache current so new game links
-                                        // started after this publish reuse the NEW generation.
-                                        soccer_live_store_warm_policy(&guard.sim);
-                                        stamp
-                                    };
-                                    last_seen = Some(installed.max(updated_at));
-                                    println!(
-                                        "# soccer-live: refreshed to learned policy gen {generation} from postgres"
-                                    );
-                                }
-                                Ok(None) => last_seen = Some(updated_at),
-                                Err(err) => eprintln!(
-                                    "# soccer-live: pg refresh load failed (will retry): {err}"
-                                ),
-                            }
-                        }
-                    });
-            }
+            let session = Arc::clone(&self.session);
+            let config = {
+                let guard = soccer_mutex_lock(&session, "soccer_live_session");
+                guard.sim.config.clone()
+            };
+            start_soccer_live_pg_policy_refresh(session, config);
         }
         let worker_count = live_http_worker_threads(self.config.http_worker_threads);
         let queue_capacity = live_http_worker_queue_capacity(worker_count);
