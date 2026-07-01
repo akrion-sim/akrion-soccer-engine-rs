@@ -344,7 +344,7 @@ impl WorldSnapshot {
         let my_side = (player.home_position.x - center_x).signum();
         let ball_side = (crosser.x - center_x).signum();
         let ball_on_my_flank = my_side != 0.0 && my_side == ball_side;
-        let crossing_position_on = winger_pinch::flank_final_third_crash_box_geometry(
+        let crossing_position_on = crash_box::flank_final_third_crash_box_geometry(
             crosser,
             attacked_goal_y,
             self.field_width,
