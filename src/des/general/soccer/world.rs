@@ -596,6 +596,13 @@ pub struct SoccerMatch {
     pub(crate) winger_pinch_samples: Vec<WingerPinchSample>,
     /// Open winger-pinch decisions awaiting their windowed reward.
     pub(crate) pending_winger_pinch: Vec<PendingWingerPinchDecision>,
+    /// The trained same-team separation head (desired keep-out radius), when present. `None` ⇒
+    /// analytic seed. Shared into each [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) separation_floor_head: Option<std::sync::Arc<SeparationFloorHead>>,
+    /// Rolling RL corpus for the separation head. Collected only while the model is enabled.
+    pub(crate) separation_floor_samples: Vec<SeparationFloorSample>,
+    /// Open separation decisions awaiting their windowed reward.
+    pub(crate) pending_separation_floor: Vec<PendingSeparationFloorDecision>,
     /// The trained long-pass run head (which attacker should break forward so a deep carrier
     /// can pick them out), when present. Carried + trained across games by the learner; `None`
     /// ⇒ the analytic `backfield_long_pass_run_invite_for` seed. Shared into each
