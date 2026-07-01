@@ -1891,6 +1891,13 @@ fn load_initial_policies(
 static CARRIED_LINE_DEPTH_HEAD: std::sync::Mutex<Option<BackFourLineHead>> =
     std::sync::Mutex::new(None);
 
+/// In-memory per-defender individual line head (the MAPPO layer on top of the group
+/// line centre), carried + trained across games WITHIN a learner process, mirroring
+/// `CARRIED_LINE_DEPTH_HEAD`. Resets on pod restart; untouched unless the individual
+/// model is enabled (DD_SOCCER_ENABLE_BACK_FOUR_INDIVIDUAL_MODEL).
+static CARRIED_DEFENDER_LINE_HEAD: std::sync::Mutex<Option<DefenderLinePolicyHead>> =
+    std::sync::Mutex::new(None);
+
 /// In-memory loose-ball commit head (which player attacks a loose ball), carried +
 /// trained across games WITHIN a learner process, mirroring `CARRIED_LINE_DEPTH_HEAD`.
 /// Resets on pod restart; untouched unless the commit model is enabled
