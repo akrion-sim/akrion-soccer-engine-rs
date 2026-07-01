@@ -47602,12 +47602,66 @@ impl WorldSnapshot {
         // theirs' possession-aware gap adjustment (in-possession / dispossession / defending
         // regimes), kept behind ours' `back_four_press_to_attackers_enabled` gate so it stays
         // toggleable + byte-identical when off. Only ever raises a too-deep centre toward them.
-        let centre_fwd = own_goal_fwd + centre_depth;
+        let mut centre_fwd = own_goal_fwd + centre_depth;
         if back_four_press_to_attackers_enabled() {
-            self.back_four_attacker_gap_adjusted_centre_fwd(team, centre_fwd, own_goal_fwd, max_depth)
-        } else {
-            centre_fwd
+            centre_fwd = self.back_four_attacker_gap_adjusted_centre_fwd(
+                team,
+                centre_fwd,
+                own_goal_fwd,
+                max_depth,
+            );
         }
+        // Ball-far offside-trap push-up: when the ball is far upfield and the line is still deep in
+        // our own half, step up to a high trap line (goalside of the deepest attacker). See
+        // `back_four_ball_far_push_up_centre_fwd`.
+        if back_four_ball_far_push_up_enabled() {
+            centre_fwd = self.back_four_ball_far_push_up_centre_fwd(
+                team, centre_fwd, own_goal_fwd, ball_depth, max_depth,
+            );
+        }
+        centre_fwd
+    }
+
+    /// Aggressive **ball-far offside-trap push-up** of the line centre (attack frame). When the
+    /// (predicted) ball is far upfield in the opponent half AND the current line centre still sits
+    /// more than [`BACK_FOUR_BALL_FAR_PUSH_UP_OWN_HALF_MARGIN_YARDS`] inside our own half, the four
+    /// step up to a high line: [`BACK_FOUR_BALL_FAR_PUSH_UP_TRAP_GAP_YARDS`] GOALSIDE of the
+    /// opponents' SINGLE most-advanced attacker (never ahead of him, so nobody is played in behind),
+    /// capped at the high-line ceiling and never below the incoming centre (push up only). Held off
+    /// while the opponent is in clear control — we do not push into a live counter. Off ⇒ unchanged.
+    fn back_four_ball_far_push_up_centre_fwd(
+        &self,
+        team: Team,
+        centre_fwd: f64,
+        own_goal_fwd: f64,
+        ball_depth: f64,
+        max_depth: f64,
+    ) -> f64 {
+        let half = self.field_length * 0.5;
+        // Ball must be far upfield (into the opponent half by a margin).
+        if ball_depth < half + BACK_FOUR_BALL_FAR_PUSH_UP_BALL_MARGIN_YARDS {
+            return centre_fwd;
+        }
+        // Do not push up into a counter we are already defending.
+        if self.controlled_possession_team() == Some(team.other()) {
+            return centre_fwd;
+        }
+        // Only when the line still sits more than 5yd inside our own half.
+        let centre_depth = centre_fwd - own_goal_fwd;
+        if centre_depth >= half - BACK_FOUR_BALL_FAR_PUSH_UP_OWN_HALF_MARGIN_YARDS {
+            return centre_fwd;
+        }
+        let ceiling = own_goal_fwd + max_depth;
+        // Reference the SINGLE most-advanced opponent (count 1), so the trap line stays goalside of
+        // the deepest attacker — never leaving anyone in behind. Fall back to (own half − margin).
+        let trap_fwd = match self.opponent_foremost_attackers_line_depth(team, 1) {
+            Some(deepest_depth) => {
+                own_goal_fwd + (deepest_depth - BACK_FOUR_BALL_FAR_PUSH_UP_TRAP_GAP_YARDS)
+            }
+            None => own_goal_fwd + (half - BACK_FOUR_BALL_FAR_PUSH_UP_OWN_HALF_MARGIN_YARDS),
+        };
+        // Push up only; never past the high-line ceiling.
+        centre_fwd.max(trap_fwd.min(ceiling))
     }
 
     /// Mean depth (yd from `team`'s own goal, in `team`'s attacking frame) of the opponent's
