@@ -43889,6 +43889,40 @@ impl WorldSnapshot {
         resolve_attack_spacing_target(ctx, head)
     }
 
+    /// Does an OPEN forward-into-space option genuinely exist for this off-ball player? Probes
+    /// a few points ahead of the player (along its channel with a small lateral spread) and
+    /// returns true if any is a receivable, unmarked forward destination: forward of the
+    /// player, no opponent within [`FORWARD_RUN_UNMARKED_MARK_RADIUS_YARDS`] of the point, a
+    /// clear passing lane from the ball, and not offside. Gates the forward-run-when-unmarked
+    /// bias so a backward drop is only vetoed when forward space really is available (the
+    /// principle's "can run forward into space" precondition) — never when everything ahead is
+    /// covered and a drop to offer an outlet is legitimate.
+    fn forward_open_space_available(&self, me: &PlayerSnapshot, me_position: Vec2) -> bool {
+        let attack = me.team.attack_dir();
+        for depth in [8.0_f64, 15.0, 23.0] {
+            for lat in [-8.0_f64, 0.0, 8.0] {
+                let p = Vec2::new(me_position.x + lat, me_position.y + depth * attack)
+                    .clamp_to_pitch(self.field_width, self.field_length);
+                let forward = (p.y - me_position.y) * attack;
+                if forward < FORWARD_RUN_UNMARKED_DIR_EPS_YARDS {
+                    continue;
+                }
+                if self.nearest_opponent_distance_at(me.team, p)
+                    < FORWARD_RUN_UNMARKED_MARK_RADIUS_YARDS
+                {
+                    continue;
+                }
+                if self.open_space_offside_excess_yards_for_player(me.id, me.team, p) > 0.0 {
+                    continue;
+                }
+                if self.clear_line(self.ball.position, p, me.team.other(), 2.0) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub fn open_space_for(&self, player_id: usize, home: Vec2) -> Vec2 {
         let Some(me) = self.players.iter().find(|p| p.id == player_id) else {
             return home;
