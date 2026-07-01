@@ -1330,6 +1330,16 @@ const STALE_DRIBBLE_STEAL_EXTRA_PENALTY_POINTS: f64 = 5.25;
 const NON_ELITE_DRIBBLE_HOLD_SKILL_CUTOFF: f64 = 0.90;
 const NON_ELITE_DRIBBLE_HOLD_BASE_SECONDS: f64 = 2.35;
 const ELITE_DRIBBLE_HOLD_BASE_SECONDS: f64 = 4.8;
+// Stationary-hold surcharge: a carrier who holds the ball while STANDING STILL or WALKING
+// (rather than driving it forward) is a passing failure — with open outlets it must release
+// NOW. The excessive-hold penalty is multiplied by up to this factor for a dead-stationary
+// (or back-pedalling) holder, ramping down to 1× (no surcharge) once the carrier is jogging
+// forward. Dribbling forward at pace is untouched. The cutoff is the FORWARD speed (yards/sec
+// toward the opponent goal) at/above which the carry counts as "driving forward": ~3.5 yps
+// sits just above a walk (~2.7 yps) and at a slow jog, so walking/standing is fully surcharged
+// while a genuine forward jog/run/sprint pays nothing extra.
+const STATIONARY_HOLD_PENALTY_MAX_MULT: f64 = 10.0;
+const STATIONARY_HOLD_FORWARD_JOG_YPS: f64 = 3.5;
 // When a teammate is genuinely open AHEAD of the ball, prefer the pass over driving
 // into traffic ("pass even if a player is open ahead"). Scales pass scores up and the
 // dribble proclivity down; collapses to no-effect when there is no open forward outlet.
