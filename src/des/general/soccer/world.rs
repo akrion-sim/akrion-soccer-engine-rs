@@ -15724,11 +15724,10 @@ impl SoccerMatch {
             * side_glance_speed_factor;
         let strength_to_weight_factor =
             strength_to_weight_acceleration_multiplier(&self.players[player_id].skills);
-        // HARD same-team separation floor — the smooth movement-barrier layer. Snapshot each
-        // teammate's CURRENT position (positions don't change until integration below) plus a
-        // per-pair "exempt" flag (both inside an 18-yard box) so the post-integration velocity
-        // can be radially damped to never cross within 4yd of a teammate. Empty (skips entirely)
-        // when the gate is off ⇒ byte-identical.
+        // Same-team proximity tracking (feeds the grace timers for the graduated crowding
+        // penalty). Snapshot each teammate's CURRENT position (positions don't change until
+        // integration below) plus a per-pair "exempt" flag (both inside an 18-yard box). Empty
+        // (skips entirely) when the gate is off ⇒ byte-identical.
         let same_team_separation_obstacles: Vec<(Vec2, bool)> =
             if dd_soccer_enable_same_team_separation_floor() {
                 let my_team = self.players[player_id].team;
