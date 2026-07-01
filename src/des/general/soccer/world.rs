@@ -50446,7 +50446,21 @@ impl WorldSnapshot {
                 // Smooth relief taper instead of the legacy cliff: a mild relief
                 // relaxes the lane, it doesn't abandon it (floored at the same soft
                 // blend the legacy else-branch used under full relief).
-                let blend = lane_discipline::lane_clamp_blend(fit.commitment, relief);
+                let base_blend = lane_discipline::lane_clamp_blend(fit.commitment, relief);
+                // Learnable lane-affinity decision (MDP/POMDP): the hard clamp is a
+                // predilection, not an order — the player may CHOOSE to break out of its
+                // lane into space it found (loosen the blend) or hold harder. Gated ON in
+                // prod (seeded by the ≈0 analytic prior ⇒ near-identical), OFF under test
+                // ⇒ `base_blend` unchanged (byte-identical).
+                let blend = self.lane_affinity_effective_clamp_blend(
+                    me,
+                    bounded,
+                    lane_x,
+                    &fit,
+                    relief,
+                    in_possession,
+                    base_blend,
+                );
                 bounded.x = bounded.x * (1.0 - blend) + lane_x * blend;
             } else if fit.commitment >= 0.65 && relief < 0.15 {
                 bounded.x = lane_x;
