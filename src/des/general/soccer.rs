@@ -2731,7 +2731,6 @@ const TEAMMATE_MAX_SPACING_YARDS: f64 = 10.0;
 // is legitimate, so the expected spacing band tightens from 5-10 to 3-6 yards.
 const TEAMMATE_MIN_SPACING_BOX_YARDS: f64 = 3.0;
 const TEAMMATE_MAX_SPACING_BOX_YARDS: f64 = 6.0;
-<<<<<<< HEAD
 // ---- HARD same-team separation floor ("never within 4 yards") ----
 // Unlike the soft 5-10yd proclivity band above (a *seed* the learners may move off),
 // this is a firm minimum: two teammates must not crowd inside 4 yards of each other in
