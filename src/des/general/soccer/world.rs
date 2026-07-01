@@ -617,6 +617,13 @@ pub struct SoccerMatch {
     pub(crate) head_scan_samples: Vec<HeadScanSample>,
     /// Open head-scan decisions awaiting their windowed reward.
     pub(crate) pending_head_scan: Vec<PendingHeadScanDecision>,
+    /// The trained crash-box commit head, when present. `None` ⇒ analytic seed. Shared into each
+    /// [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) crash_box_head: Option<std::sync::Arc<CrashBoxHead>>,
+    /// Rolling RL corpus for the crash-box head. Collected only while the model is enabled.
+    pub(crate) crash_box_samples: Vec<CrashBoxSample>,
+    /// Open crash-box decisions awaiting their windowed reward.
+    pub(crate) pending_crash_box: Vec<PendingCrashBoxDecision>,
     /// The trained long-pass run head (which attacker should break forward so a deep carrier
     /// can pick them out), when present. Carried + trained across games by the learner; `None`
     /// ⇒ the analytic `backfield_long_pass_run_invite_for` seed. Shared into each
