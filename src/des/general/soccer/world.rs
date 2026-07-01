@@ -302,6 +302,68 @@ pub(crate) struct TurnoverOutcomeWatch {
     pub(crate) base_penalty_replays: Vec<SoccerLearningTransition>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TeammateProximityClock {
+    under_seven_seconds: f64,
+    under_six_seconds: f64,
+    under_five_seconds: f64,
+}
+
+impl TeammateProximityClock {
+    fn cool(&mut self, cooldown: f64) {
+        self.under_seven_seconds = (self.under_seven_seconds - cooldown).max(0.0);
+        self.under_six_seconds = (self.under_six_seconds - cooldown).max(0.0);
+        self.under_five_seconds = (self.under_five_seconds - cooldown).max(0.0);
+    }
+
+    fn has_live_time(self) -> bool {
+        self.under_seven_seconds > 1e-3
+            || self.under_six_seconds > 1e-3
+            || self.under_five_seconds > 1e-3
+    }
+
+    fn tick(&mut self, distance_yards: f64, dt: f64, cooldown: f64, cap: f64) {
+        if distance_yards < 7.0 {
+            self.under_seven_seconds = (self.under_seven_seconds + dt).min(cap);
+        } else {
+            self.under_seven_seconds = (self.under_seven_seconds - cooldown).max(0.0);
+        }
+        if distance_yards < 6.0 {
+            self.under_six_seconds = (self.under_six_seconds + dt).min(cap);
+        } else {
+            self.under_six_seconds = (self.under_six_seconds - cooldown).max(0.0);
+        }
+        if distance_yards < 5.0 {
+            self.under_five_seconds = (self.under_five_seconds + dt).min(cap);
+        } else {
+            self.under_five_seconds = (self.under_five_seconds - cooldown).max(0.0);
+        }
+    }
+
+    fn time_pressure(self, distance_yards: f64) -> f64 {
+        let mut pressure: f64 = 0.0;
+        if distance_yards < 7.0 {
+            pressure = pressure.max(
+                (self.under_seven_seconds - TEAMMATE_SPACING_GRACE_UNDER_SEVEN_SECONDS)
+                    / TEAMMATE_SPACING_PRESSURE_SATURATION_SECONDS,
+            );
+        }
+        if distance_yards < 6.0 {
+            pressure = pressure.max(
+                (self.under_six_seconds - TEAMMATE_SPACING_GRACE_UNDER_SIX_SECONDS)
+                    / TEAMMATE_SPACING_PRESSURE_SATURATION_SECONDS,
+            );
+        }
+        if distance_yards < 5.0 {
+            pressure = pressure.max(
+                (self.under_five_seconds - TEAMMATE_SPACING_GRACE_UNDER_FIVE_SECONDS)
+                    / TEAMMATE_SPACING_PRESSURE_SATURATION_SECONDS,
+            );
+        }
+        pressure.clamp(0.0, 1.0)
+    }
+}
+
 pub struct SoccerMatch {
     pub config: MatchConfig,
     pub tick: u64,
@@ -590,11 +652,12 @@ pub struct SoccerMatch {
     pub(crate) defensive_delay_clocks: HashMap<usize, f64>,
     pub(crate) defensive_beat_clocks: HashMap<usize, f64>,
     pub(crate) offside_clocks: HashMap<usize, f64>,
-    /// Seconds each same-team field pair has continuously been within its
-    /// minimum-spacing band (keyed by sorted `(id, id)`). Drives the "too close
-    /// for too long → one of you move" notices. Ticked every match step in
-    /// [`Self::update_teammate_spacing_proximity`].
-    pub(crate) teammate_proximity_seconds: HashMap<(usize, usize), f64>,
+    /// Seconds each same-team field pair has continuously spent below the 7/6/5
+    /// yard spacing bands (keyed by sorted `(id, id)`). Going tighter does not
+    /// reset the wider-band clock; each band cools only after the pair leaves it.
+    /// Drives the "too close for too long -> one of you move" notices. Ticked
+    /// every match step in [`Self::update_teammate_spacing_proximity`].
+    pub(crate) teammate_proximity_seconds: HashMap<(usize, usize), TeammateProximityClock>,
     /// Spacing notices produced from `teammate_proximity_seconds` this tick;
     /// copied by value into every [`WorldSnapshot`] for the next tick's decisions.
     pub(crate) teammate_spacing_notices: Vec<TeammateSpacingNotice>,
@@ -15724,22 +15787,12 @@ impl SoccerMatch {
         if p.velocity.len() > SOCCER_PHYSICS_PLAYER_MAX_SPEED_YPS {
             p.velocity = p.velocity.normalized() * SOCCER_PHYSICS_PLAYER_MAX_SPEED_YPS;
         }
-        // HARD same-team separation floor: smoothly damp the finalized velocity's inward
-        // component toward any non-exempt teammate so this step can never close the gap below
-        // 4yd — a gentle deceleration approaching the floor, not a hard stop. No-op when the
-        // gate is off (the obstacle list is empty). Runs BEFORE the physical-gait derivation
-        // below so the visible gait reflects the actual (damped) speed the player travels at.
+        // Same-team proximity GRACE timers. Advance the nested dwell timers off the nearest
+        // NON-EXEMPT teammate so the graduated reward penalty only accrues on a SUSTAINED crowd.
+        // NOTE: there is deliberately NO hard movement barrier — a player MAY close inside 4yd,
+        // it just draws a strong/huge penalty (reward) plus an MPC route cost; it is not a
+        // physical wall. No-op when the gate is off (the list is empty ⇒ byte-identical).
         if !same_team_separation_obstacles.is_empty() {
-            p.velocity = apply_same_team_separation_barrier(
-                p.position,
-                p.velocity,
-                &same_team_separation_obstacles,
-                dt,
-            );
-            // Advance the nested proximity-dwell GRACE timers off the same obstacle set (nearest
-            // NON-EXEMPT teammate distance). Feeds the graduated reward penalty's grace gate so a
-            // brief overlap is forgiven and only a sustained crowd is punished. Uses the pre-
-            // integration position (matches how the obstacle set was snapshotted).
             let nearest_nonexempt_yards = same_team_separation_obstacles
                 .iter()
                 .filter(|(_, exempt)| !exempt)
@@ -19200,7 +19253,7 @@ impl SoccerMatch {
     ///
     /// "Cover territory" is a fundamental of soccer: two teammates in the same
     /// small patch add no value. So same-team field players are expected to keep
-    /// at least [`TEAMMATE_MIN_SPACING_YARDS`] apart ([`TEAMMATE_MIN_SPACING_BOX_YARDS`]
+    /// at least [`TEAMMATE_OCCUPIED_SPACE_RADIUS_YARDS`] apart ([`TEAMMATE_MIN_SPACING_BOX_YARDS`]
     /// inside either 18-yard box). A *brief* overlap — a handoff, a block, a double
     /// team — is fine: it is tolerated for a grace window (shorter the tighter the
     /// overlap). Past that, the pair is flagged and the weaker-claim player gets a
@@ -19214,9 +19267,9 @@ impl SoccerMatch {
         // Dead-ball / set-play shapes are scripted (walls, lined-up restarts), so do
         // not police spacing then: cool every clock and emit no notices.
         if self.active_set_play.is_some() {
-            self.teammate_proximity_seconds.retain(|_, seconds| {
-                *seconds -= cooldown;
-                *seconds > 1e-3
+            self.teammate_proximity_seconds.retain(|_, clock| {
+                clock.cool(cooldown);
+                clock.has_live_time()
             });
             self.teammate_spacing_notices.clear();
             return;
@@ -19240,7 +19293,6 @@ impl SoccerMatch {
             b_exempt: bool,
             distance: f64,
             min_spacing: f64,
-            hard_radius: f64,
         }
         // A player with a live commitment to the ball never yields (and so is also
         // never the one nudged): the carrier, the intended pass receiver, or a
@@ -19272,7 +19324,7 @@ impl SoccerMatch {
                     let min_spacing = if both_in_box {
                         TEAMMATE_MIN_SPACING_BOX_YARDS
                     } else {
-                        TEAMMATE_MIN_SPACING_YARDS
+                        TEAMMATE_OCCUPIED_SPACE_RADIUS_YARDS
                     };
                     let key = if a.id <= b.id {
                         (a.id, b.id)
@@ -19291,7 +19343,6 @@ impl SoccerMatch {
                         b_exempt: exempt(b),
                         distance,
                         min_spacing,
-                        hard_radius: min_spacing * TEAMMATE_SPACING_HARD_FRACTION,
                     });
                 }
             }
@@ -19300,7 +19351,7 @@ impl SoccerMatch {
         // Phase 2 — accumulate / cool each clock and emit notices for pairs past
         // their grace window. `scored` is exhaustive over current field pairs, so
         // iterating it covers every clock; we prune the cooled-to-zero entries.
-        let clock_cap = TEAMMATE_SPACING_SOFT_GRACE_SECONDS
+        let clock_cap = TEAMMATE_SPACING_GRACE_UNDER_SEVEN_SECONDS
             + TEAMMATE_SPACING_PRESSURE_SATURATION_SECONDS
             + 1.0;
         let mut notices: Vec<TeammateSpacingNotice> = Vec::new();
@@ -19308,28 +19359,22 @@ impl SoccerMatch {
             let clock = self
                 .teammate_proximity_seconds
                 .entry(pair.key)
-                .or_insert(0.0);
+                .or_default();
             // A non-finite separation (a corrupted position) is not an overlap —
             // `NaN > min` is false, which would otherwise spuriously accumulate the
             // clock. Treat it as separated and cool down.
-            if !pair.distance.is_finite() || pair.distance > pair.min_spacing {
-                *clock = (*clock - cooldown).max(0.0);
+            if !pair.distance.is_finite() || pair.distance >= pair.min_spacing {
+                clock.cool(cooldown);
                 continue;
             }
-            *clock = (*clock + dt).min(clock_cap);
-            let elapsed = *clock;
-            let within_hard = pair.distance <= pair.hard_radius;
-            let grace = if within_hard {
-                TEAMMATE_SPACING_HARD_GRACE_SECONDS
-            } else {
-                TEAMMATE_SPACING_SOFT_GRACE_SECONDS
-            };
-            if elapsed <= grace {
+            clock.tick(pair.distance, dt, cooldown, clock_cap);
+            let time_pressure = clock.time_pressure(pair.distance);
+            if time_pressure <= 0.0 {
                 // Still inside the tolerated window (handoff / block / double-team).
                 continue;
             }
-            let severity =
-                ((elapsed - grace) / TEAMMATE_SPACING_PRESSURE_SATURATION_SECONDS).clamp(0.0, 1.0);
+            let distance_pressure = teammate_spacing_warning_pressure_from_distance(pair.distance);
+            let severity = (time_pressure * distance_pressure).clamp(0.0, 1.0);
             // Pick the yielder: weaker claim moves. A committed player never yields;
             // otherwise the one further from its own slot has the weaker positional
             // claim, with a deterministic id tie-break.
@@ -19370,7 +19415,7 @@ impl SoccerMatch {
             });
         }
         self.teammate_proximity_seconds
-            .retain(|_, seconds| *seconds > 1e-3);
+            .retain(|_, clock| clock.has_live_time());
         self.teammate_spacing_notices = notices;
     }
 
