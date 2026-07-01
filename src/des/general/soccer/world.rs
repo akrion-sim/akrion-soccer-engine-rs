@@ -589,6 +589,13 @@ pub struct SoccerMatch {
     pub(crate) goal_side_recovery_samples: Vec<GoalSideRecoverySample>,
     /// Open goal-side recovery decisions awaiting their windowed reward.
     pub(crate) pending_goal_side_recovery: Vec<PendingGoalSideRecoveryDecision>,
+    /// The trained winger pinch-appetite head (stay wide vs pinch infield), when present.
+    /// `None` ⇒ analytic seed. Shared into each [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) winger_pinch_head: Option<std::sync::Arc<WingerPinchHead>>,
+    /// Rolling RL corpus for the winger-pinch head. Collected only while the model is enabled.
+    pub(crate) winger_pinch_samples: Vec<WingerPinchSample>,
+    /// Open winger-pinch decisions awaiting their windowed reward.
+    pub(crate) pending_winger_pinch: Vec<PendingWingerPinchDecision>,
     /// The trained long-pass run head (which attacker should break forward so a deep carrier
     /// can pick them out), when present. Carried + trained across games by the learner; `None`
     /// ⇒ the analytic `backfield_long_pass_run_invite_for` seed. Shared into each
@@ -3143,6 +3150,9 @@ impl SoccerMatch {
             goal_side_recovery_head: None,
             goal_side_recovery_samples: Vec::new(),
             pending_goal_side_recovery: Vec::new(),
+            winger_pinch_head: None,
+            winger_pinch_samples: Vec::new(),
+            pending_winger_pinch: Vec::new(),
             long_pass_run_head: None,
             long_pass_run_samples: Vec::new(),
             pending_long_pass_run: Vec::new(),
@@ -8644,6 +8654,9 @@ impl SoccerMatch {
         // Learnable goal-side recovery (collapse-onto-line vs hold-width) RL samples (no-op
         // under test / when disabled; live in prod, seeded by the ≈0 analytic prior).
         self.collect_goal_side_recovery_rl_samples(&next_snapshot);
+        // Learnable winger pinch-appetite (stay-wide vs pinch-in) RL samples (no-op under test /
+        // when disabled; live in prod, seeded by the analytic prior).
+        self.collect_winger_pinch_rl_samples(&next_snapshot);
         self.collect_long_pass_run_rl_samples(&next_snapshot);
         // Learnable give-and-go / wall-pass appetite RL samples (no-op + byte-identical unless
         // `DD_SOCCER_ENABLE_LEARNED_GIVE_AND_GO` is set).
@@ -22185,6 +22198,10 @@ pub struct WorldSnapshot {
     /// goal-side lateral-pull seam. `None` ⇒ analytic seed (parity). Skipped by serde.
     #[serde(skip)]
     pub(crate) goal_side_recovery_head: Option<std::sync::Arc<GoalSideRecoveryHead>>,
+    /// The trained winger pinch-appetite head, carried from the match for live consumption in the
+    /// winger-pinch bucket scoring. `None` ⇒ analytic seed (parity). Skipped by serde.
+    #[serde(skip)]
+    pub(crate) winger_pinch_head: Option<std::sync::Arc<WingerPinchHead>>,
     /// The trained long-pass run head, carried from the match for live consumption in
     /// `backfield_long_pass_run_invite_for`. `None` ⇒ analytic seed (parity). Skipped by
     /// serde (an internal decision aid; Default = None).
@@ -24861,6 +24878,7 @@ impl WorldSnapshot {
             receive_approach_head: m.receive_approach_head.clone(),
             lane_affinity_head: m.lane_affinity_head.clone(),
             goal_side_recovery_head: m.goal_side_recovery_head.clone(),
+            winger_pinch_head: m.winger_pinch_head.clone(),
             long_pass_run_head: m.long_pass_run_head.clone(),
             give_and_go_head: m.give_and_go_head.clone(),
             attack_spacing_head: m.attack_spacing_head.clone(),
@@ -43911,7 +43929,7 @@ impl WorldSnapshot {
 
     /// A wide attacking player — a wide midfielder OR a wide forward (a "winger"). These are the
     /// players who should be making runs to open flank space when their team has the ball.
-    fn is_wide_attacker(&self, player: &PlayerSnapshot) -> bool {
+    pub(crate) fn is_wide_attacker(&self, player: &PlayerSnapshot) -> bool {
         let is_wide = player.home_position.x < self.field_width * 0.30
             || player.home_position.x > self.field_width * 0.70;
         let is_attacker =
@@ -44544,12 +44562,20 @@ impl WorldSnapshot {
         let back_post_offside = back_post_probe
             .map(|probe| self.position_would_be_offside(player.team, probe))
             .unwrap_or(true);
-        let choice = decide_winger_pinch(
+        // Learnable pinch appetite (MDP/POMDP): fold a learned stay-vs-pinch bias into the bucket
+        // scoring. Gated ON in prod (analytic prior ≈ 0 ⇒ near-identical argmax), OFF under test
+        // ⇒ bias 0 ⇒ byte-identical to `decide_winger_pinch`.
+        let pinch_bias = self
+            .build_winger_pinch_inputs(player)
+            .map(|inputs| self.winger_pinch_effective_bias(&inputs))
+            .unwrap_or(0.0);
+        let choice = decide_winger_pinch_with_bias(
             ball_on_my_flank,
             crossing_position_on,
             depth_frac,
             box_congestion,
             back_post_offside,
+            pinch_bias,
         );
         let target = winger_pinch_target(
             choice,
