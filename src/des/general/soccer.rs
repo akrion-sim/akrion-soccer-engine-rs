@@ -104,6 +104,8 @@ mod separation_floor_decision;
 pub use separation_floor_decision::*;
 mod pass_lane_yield_decision;
 pub use pass_lane_yield_decision::*;
+mod head_scan_decision;
+pub use head_scan_decision::*;
 mod policy_select;
 pub use policy_select::*;
 mod pass_lane_yield;
