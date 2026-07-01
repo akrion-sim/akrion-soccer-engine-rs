@@ -13,8 +13,9 @@ use serde::Serialize;
 use soccer_engine::des::general::soccer::{
     soccer_moment_records_from_jsonl, soccer_moment_records_to_learning_dataset,
     train_soccer_pass_completion_head, AttackSpacingHead, BackFourLineHead, GiveAndGoHead,
-    LongPassRunHead, LooseBallCommitHead, MatchConfig, MatchSummary, ReceiveApproachHead,
-    ShotTriggerHead, SoccerConfigMomentInsert, SoccerMarlAlgorithm, SoccerMatch,
+    LaneAffinityHead, LongPassRunHead, LooseBallCommitHead, MatchConfig, MatchSummary,
+    ReceiveApproachHead, ShotTriggerHead, SoccerConfigMomentInsert, SoccerMarlAlgorithm,
+    SoccerMatch,
     SoccerMomentWindow, SoccerNeuralLearningBackend, SoccerNeuralLearningConfig,
     SoccerNeuralNetworkSnapshot, SoccerPassCompletionHead, SoccerPassLearningMetrics,
     SoccerPassOutcomeSample, SoccerQEntry, SoccerQPolicy, SoccerQPolicyOptions, SoccerQTargetEntry,
