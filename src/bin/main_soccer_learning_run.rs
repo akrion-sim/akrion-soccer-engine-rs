@@ -2264,6 +2264,23 @@ fn run_game(
             final_loss
         );
     }
+    // Train the CARRIED head-scan effort head on this game's reward-weighted RL corpus.
+    let head_scan_samples = sim.drain_head_scan_samples();
+    if !head_scan_samples.is_empty() {
+        let mut guard = CARRIED_HEAD_SCAN_HEAD.lock().unwrap();
+        let head = guard.get_or_insert_with(|| HeadScanHead::new(episode_seed as u32));
+        let mut final_loss = 0.0;
+        for _ in 0..4 {
+            final_loss = head.train_reward_weighted(&head_scan_samples, 0.02);
+        }
+        eprintln!(
+            "head_scan_training samples={} training_steps={} consumed={} final_loss={:.5}",
+            head_scan_samples.len(),
+            head.training_steps(),
+            head.training_steps() >= HEAD_SCAN_HEAD_MIN_TRAINING_STEPS,
+            final_loss
+        );
+    }
     // Train the CARRIED long-pass run head on this game's reward-weighted RL corpus (which
     // attacker breaking forward led to the team advancing the ball). Empty + skipped unless
     // DD_SOCCER_ENABLE_LEARNED_LONG_PASS_RUN is set.
