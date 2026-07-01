@@ -49043,7 +49043,13 @@ impl WorldSnapshot {
         let we_control = self.controlled_possession_team() == Some(team);
         let gap_min = back_four_desired_gap_min_yards(we_control);
         let base_gap = gap_min + (BACK_FOUR_LINE_DESIRED_GAP_MAX_YARDS - gap_min) * frac;
-        if !back_four_push_into_dead_space_enabled() {
+        // Only step into dead space while WE CONTROL the ball (goal-fest fix, origin/learning
+        // 0d6b9c38): pushing the line up off the ball — out of possession, or on a loose/contested
+        // ball — just vacates the space BEHIND it for an opponent runner to be sprung into over the
+        // top (the `space_occupied` check sees only CURRENT positions, so a late run arrives after
+        // the line has stepped up). That high line gets burned both ways and collapses matches into
+        // goal-fests; out of possession we hold the deeper possession-aware line instead.
+        if !back_four_push_into_dead_space_enabled() || !we_control {
             return base_gap;
         }
         // Push up to FILL DEAD SPACE: the line should not sit ~40yd off the ball when the zone in
