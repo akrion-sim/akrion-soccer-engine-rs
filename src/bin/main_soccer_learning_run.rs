@@ -2210,6 +2210,25 @@ fn run_game(
             final_loss
         );
     }
+    // Train the CARRIED same-team separation head on this game's reward-weighted RL corpus
+    // (whether spreading / combining improved outcomes). Empty + skipped unless the model is
+    // enabled (on by default in prod).
+    let separation_floor_samples = sim.drain_separation_floor_samples();
+    if !separation_floor_samples.is_empty() {
+        let mut guard = CARRIED_SEPARATION_FLOOR_HEAD.lock().unwrap();
+        let head = guard.get_or_insert_with(|| SeparationFloorHead::new(episode_seed as u32));
+        let mut final_loss = 0.0;
+        for _ in 0..4 {
+            final_loss = head.train_reward_weighted(&separation_floor_samples, 0.02);
+        }
+        eprintln!(
+            "separation_floor_training samples={} training_steps={} consumed={} final_loss={:.5}",
+            separation_floor_samples.len(),
+            head.training_steps(),
+            head.training_steps() >= SEPARATION_FLOOR_HEAD_MIN_TRAINING_STEPS,
+            final_loss
+        );
+    }
     // Train the CARRIED long-pass run head on this game's reward-weighted RL corpus (which
     // attacker breaking forward led to the team advancing the ball). Empty + skipped unless
     // DD_SOCCER_ENABLE_LEARNED_LONG_PASS_RUN is set.
