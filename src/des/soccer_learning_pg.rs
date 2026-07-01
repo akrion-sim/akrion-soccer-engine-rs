@@ -1352,9 +1352,10 @@ impl SoccerLearningPgStore {
     /// Latest policy metadata for a live/inference server. With `include_unpromoted =
     /// false` this is the strict "newest ACTIVE (promotion-gated)" selection every
     /// training path relies on. With `include_unpromoted = true` it returns the
-    /// highest match-fitness version on record REGARDLESS of promotion status (ties
-    /// broken toward the newest) — so :5055 can reflect the learner's best candidate
-    /// even while the promotion gate is holding it out of `active`.
+    /// best-fitness candidate at the NEWEST generation REGARDLESS of promotion status
+    /// (generation desc, then fitness desc) — so :5055 reflects the learner's latest
+    /// strong candidate even while the promotion gate holds it out of `active`, without
+    /// falling back to a stale older generation that once scored a lucky high fitness.
     pub fn load_latest_policy_metadata(
         &mut self,
         experiment_id: &str,
