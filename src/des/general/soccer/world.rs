@@ -44555,7 +44555,7 @@ impl WorldSnapshot {
         intent
     }
 
-    fn is_wide_defender(&self, player: &PlayerSnapshot) -> bool {
+    pub(crate) fn is_wide_defender(&self, player: &PlayerSnapshot) -> bool {
         player.role == PlayerRole::Defender
             && (player.home_position.x < self.field_width * 0.28
                 || player.home_position.x > self.field_width * 0.72)
