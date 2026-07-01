@@ -23871,6 +23871,17 @@ fn dense_soccer_transition_reward(
         reward -= after_obs.teammate_overlap_pressure.clamp(0.0, 1.0)
             * tunables().reward.teammate_overlap_camp_penalty;
     }
+    // HARD same-team separation floor — the graduated MDP/POMDP penalty layer (the user's
+    // "never within 4 yards" rule). A steeply-growing per-tick cost for crowding a teammate:
+    // huge inside 4yd, big at 5, medium at 6, small at 7, nothing beyond 8 — evaluated on the
+    // AFTER position so it credits the move that closed (or held) the gap. Universal: attack
+    // AND defence, every role (keepers included; the box exception covers legitimate goalmouth
+    // congestion). Gated (default-on); OFF ⇒ this term vanishes (byte-identical A/B).
+    if dd_soccer_enable_same_team_separation_floor() {
+        if let Some(nearest) = nearest_same_team_distance_for_floor(after, player.id, player.team) {
+            reward -= same_team_proximity_penalty_unit(nearest) * SAME_TEAM_PROXIMITY_PENALTY_POINTS;
+        }
+    }
     // Off-ball support spacing: when a teammate already has the ball and the
     // direct passing lane is open, collapsing from a useful pocket into the
     // holder's feet is a decision-quality failure, not useful support.
