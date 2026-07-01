@@ -1961,6 +1961,10 @@ static CARRIED_CRASH_BOX_HEAD: std::sync::Mutex<Option<CrashBoxHead>> = std::syn
 static CARRIED_RUN_PREDICTION_HEAD: std::sync::Mutex<Option<RunPredictionHead>> =
     std::sync::Mutex::new(None);
 
+/// In-memory slip-break commit head, carried + trained across games WITHIN a learner process.
+static CARRIED_SLIP_BREAK_HEAD: std::sync::Mutex<Option<SlipBreakHead>> =
+    std::sync::Mutex::new(None);
+
 /// In-memory learned pass-completion head, carried + trained across games WITHIN a learner
 /// process (seeded once from the Postgres corpus at startup), mirroring
 /// `CARRIED_LINE_DEPTH_HEAD`. Installed on each game so the pass-quality assessor consumes it
