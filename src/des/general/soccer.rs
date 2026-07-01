@@ -24163,7 +24163,20 @@ fn dense_soccer_transition_reward(
             player, action, before_obs, &after_obs, before, after, before_pos, after_pos,
         );
         if is_dribble_action_label(action) && after_possession == Some(player.team) {
-            reward -= excessive_hold_penalty_points(before_obs, ability01(player.skills.dribbling));
+            let mut hold_penalty =
+                excessive_hold_penalty_points(before_obs, ability01(player.skills.dribbling));
+            // Standing-still / walking-with-the-ball surcharge: a holder who is not driving
+            // the ball forward (open outlets everywhere) must release it NOW — scale the hold
+            // penalty by up to 10× as the carrier's forward speed drops toward a walk/stand.
+            // Dribbling forward at a jog or faster is untouched.
+            if stationary_hold_penalty_enabled() {
+                if let Some(forward_speed) =
+                    after.player_velocity(player.id).map(|v| v.y * attack_dir)
+                {
+                    hold_penalty *= stationary_hold_penalty_multiplier(forward_speed);
+                }
+            }
+            reward -= hold_penalty;
             let carry_progress = ball_forward.max(player_forward).clamp(-4.0, 18.0);
             if carry_progress > 0.0 {
                 let role_multiplier = match player.role {
