@@ -15773,6 +15773,17 @@ impl SoccerMatch {
         let opponent_radius = self.config.mpc.opponent_keepout_yards.max(0.0);
         let teammate_radius = self.config.mpc.teammate_keepout_yards.max(0.0);
         let keepout_weight = self.config.mpc.keepout_weight.max(0.0);
+        // HARD same-team separation floor — the LIVE-movement MPC keep-out layer, kept in
+        // unison with the smooth barrier and the graduated POMDP penalty. When the gate is on
+        // this player's teammate obstacles are inflated to the 4yd floor so the point-mass plan
+        // that the policy actually executes routes AROUND teammates rather than into them.
+        // Waived per-pair when BOTH are inside an 18-yard box.
+        let separation_floor_on = dd_soccer_enable_same_team_separation_floor();
+        let me_in_box = separation_floor_on
+            && self
+                .players
+                .get(player_id)
+                .is_some_and(|me| self.point_in_either_penalty_area(me.position));
         let mut obstacles = Vec::with_capacity(self.players.len().saturating_add(1));
 
         for other in &self.players {
