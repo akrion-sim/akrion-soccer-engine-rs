@@ -20073,20 +20073,21 @@ fn loose_ball_chaser_matches_a_sprinting_opponents_pace() {
         "our chaser must sprint to match an opponent sprinting the loose ball down"
     );
 
-    // A still opponent draws no forced sprint — distance would govern the gait.
-    let mut still = sim.clone();
-    still.players[opponent].velocity = Vec2::zero();
-    let still_snap = WorldSnapshot::from_match(&still);
-    assert!(
-        !still_snap.loose_ball_opponent_pace_match_sprint(chaser, target),
-        "a stationary opponent must not force a pace-matched sprint"
-    );
-
     // Gate OFF ⇒ byte-identical no-op even against the sprinting opponent.
     std::env::set_var("DD_SOCCER_ENABLE_LOOSE_BALL_OPPONENT_PACE_MATCH", "0");
     assert!(
         !snap.loose_ball_opponent_pace_match_sprint(chaser, target),
         "gate off must leave the chase gait untouched"
+    );
+    std::env::set_var("DD_SOCCER_ENABLE_LOOSE_BALL_OPPONENT_PACE_MATCH", "1");
+
+    // A still opponent draws no forced sprint — distance would govern the gait.
+    sim.players[opponent].velocity = Vec2::zero();
+    let still_snap = WorldSnapshot::from_match(&sim);
+    let still_target = still_snap.loose_ball_recovery_target_for(chaser);
+    assert!(
+        !still_snap.loose_ball_opponent_pace_match_sprint(chaser, still_target),
+        "a stationary opponent must not force a pace-matched sprint"
     );
     std::env::remove_var("DD_SOCCER_ENABLE_LOOSE_BALL_OPPONENT_PACE_MATCH");
 }
