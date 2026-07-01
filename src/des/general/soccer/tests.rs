@@ -92711,3 +92711,94 @@ fn separation_barrier_never_lets_a_step_cross_the_floor() {
         );
     }
 }
+
+/// Serialise the same-team separation-floor tests that toggle the env gate (read fresh under
+/// cfg(test)), so concurrent tests don't see each other's `set_var` window.
+fn separation_floor_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// MPC, POMDP-reward and barrier must act in UNISON: all three key off the one gate. Here we
+/// prove the live-movement MPC keep-out flips with the gate (routes around teammates), that the
+/// graduated reward penalty the policy sees is live for the same crowded gap, and that the
+/// smooth barrier actually holds the 4yd floor across real ticks of the full step loop.
+#[test]
+fn separation_floor_mpc_reward_and_barrier_work_in_unison() {
+    let _env = separation_floor_env_lock();
+    let dt = DEFAULT_DT_SECONDS;
+
+    // Two Home teammates 3yd apart at mid-pitch (well outside either 18yd box).
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    sim.players[5].position = Vec2::new(40.0, 60.0);
+    sim.players[6].position = Vec2::new(40.0, 63.0);
+    sim.players[5].velocity = Vec2::zero();
+    sim.players[6].velocity = Vec2::zero();
+    let mate_pos = sim.players[6].position;
+    let radius_of_mate = |sim: &SoccerMatch| -> f64 {
+        sim.mpc_field_obstacles(5, Team::Home, dt)
+            .into_iter()
+            .min_by(|a, b| {
+                let da = Vec2::new(a.center[0], a.center[1]).distance(mate_pos);
+                let db = Vec2::new(b.center[0], b.center[1]).distance(mate_pos);
+                da.total_cmp(&db)
+            })
+            .map(|o| o.radius)
+            .expect("an obstacle exists")
+    };
+
+    // Gate OFF ⇒ the teammate MPC keep-out is the small default (< the 4yd floor).
+    std::env::remove_var("DD_SOCCER_ENABLE_SAME_TEAM_SEPARATION_FLOOR");
+    assert!(!dd_soccer_enable_same_team_separation_floor());
+    let radius_off = radius_of_mate(&sim);
+    assert!(
+        radius_off < SAME_TEAM_MIN_SEPARATION_YARDS,
+        "gate off: teammate keep-out should be the small default, got {radius_off}"
+    );
+
+    // Gate ON ⇒ the SAME live-movement MPC path inflates the teammate keep-out to the 4yd floor,
+    // so the executed plan routes around the teammate — in unison with the reward + barrier.
+    std::env::set_var("DD_SOCCER_ENABLE_SAME_TEAM_SEPARATION_FLOOR", "1");
+    assert!(dd_soccer_enable_same_team_separation_floor());
+    let radius_on = radius_of_mate(&sim);
+    assert!(
+        radius_on >= SAME_TEAM_MIN_SEPARATION_YARDS,
+        "gate on: teammate MPC keep-out must reach the 4yd floor, got {radius_on}"
+    );
+
+    // The POMDP/MDP reward penalty the policy is trained on is live for that same 3yd gap.
+    let gap = nearest_same_team_distance_for_floor(&WorldSnapshot::from_match(&sim), 5, Team::Home)
+        .expect("a nearest teammate");
+    assert!((gap - 3.0).abs() < 1e-6, "nearest teammate gap is 3yd, got {gap}");
+    assert!(
+        same_team_proximity_penalty_unit(gap) > same_team_proximity_penalty_unit(5.0),
+        "crowding at 3yd is penalised harder than at 5yd"
+    );
+
+    // The barrier holds the floor across real ticks of the full step loop: no non-box same-team
+    // pair is ever inside 4yd once the loop runs.
+    for _ in 0..30 {
+        sim.run_time_step();
+        for a in sim.players.iter() {
+            for b in sim.players.iter() {
+                if a.id >= b.id || a.team != b.team {
+                    continue;
+                }
+                if sim.point_in_either_penalty_area(a.position)
+                    && sim.point_in_either_penalty_area(b.position)
+                {
+                    continue; // both-in-box pairs are exempt
+                }
+                assert!(
+                    a.position.distance(b.position) >= SAME_TEAM_MIN_SEPARATION_YARDS - 0.25,
+                    "barrier let same-team {} and {} crowd inside the 4yd floor: {}yd",
+                    a.id,
+                    b.id,
+                    a.position.distance(b.position)
+                );
+            }
+        }
+    }
+
+    std::env::remove_var("DD_SOCCER_ENABLE_SAME_TEAM_SEPARATION_FLOOR");
+}
