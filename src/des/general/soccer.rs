@@ -55174,7 +55174,10 @@ fn threaded_goal_channel_fit_for_reception(
     let center_x = field_width * 0.5;
     let goal_y = team.goal_y(field_length);
     let yards_to_goal = (goal_y - reception.y).abs();
-    let channel_half_width = (goal_width * 2.25).clamp(10.0, field_width * 0.32);
+    let max_channel_half_width = (field_width * 0.32).max(1.0);
+    let min_channel_half_width = 10.0_f64.min(max_channel_half_width);
+    let channel_half_width =
+        (goal_width * 2.25).clamp(min_channel_half_width, max_channel_half_width);
     let central_fit = (1.0 - (reception.x - center_x).abs() / channel_half_width).clamp(0.0, 1.0);
     let range_fit = ((KILLER_PASS_MAX_YARDS_TO_GOAL - yards_to_goal)
         / KILLER_PASS_MAX_YARDS_TO_GOAL)

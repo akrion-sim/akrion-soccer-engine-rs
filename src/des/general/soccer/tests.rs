@@ -10494,6 +10494,23 @@ fn completed_killer_pass_reward_values_threaded_goal_channel_delivery() {
 }
 
 #[test]
+fn threaded_goal_channel_fit_handles_small_curriculum_fields() {
+    let fit = threaded_goal_channel_fit_for_reception(
+        Team::Home,
+        Vec2::new(15.0, 50.0),
+        30.0,
+        54.0,
+        8.0,
+    );
+
+    assert!(fit.is_finite());
+    assert!(
+        (0.0..=1.0).contains(&fit),
+        "threaded goal channel fit should stay normalized on tiny curriculum fields: {fit}"
+    );
+}
+
+#[test]
 fn completed_killer_pass_reward_ramps_as_goal_thread_gets_closer() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let passer = 6;
