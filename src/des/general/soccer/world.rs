@@ -44049,6 +44049,20 @@ impl WorldSnapshot {
         // (byte-identical). Resolved once here — it depends on the player/team/ball state,
         // not the candidate point — so it is cheap.
         let attack_spacing_target = self.attack_spacing_target_for(me, me_position, width_shortage);
+        // Forward-run-when-unmarked (gated, default-on). If this off-ball player is UNMARKED
+        // (no opponent within the mark radius) AND a forward-into-space option genuinely
+        // exists, backward candidates are vetoed and forward-into-space ones rewarded below —
+        // the team should move forward in possession. Computed once here (depends on the
+        // player/ball, not the candidate). Gate off / marked / no forward space ⇒ the per-
+        // candidate bias is 0, byte-identical.
+        let me_unmarked_for_forward_run = possession
+            && self.ball.holder != Some(player_id)
+            && me.role != PlayerRole::Goalkeeper
+            && dd_soccer_enable_forward_run_when_unmarked()
+            && self.nearest_opponent_distance_at(me.team, me_position)
+                >= FORWARD_RUN_UNMARKED_MARK_RADIUS_YARDS;
+        let forward_run_space_available =
+            me_unmarked_for_forward_run && self.forward_open_space_available(me, me_position);
         for dx in [-22.0, -13.0, -6.0, 0.0, 6.0, 13.0, 22.0] {
             for dy in [-8.0, 0.0, 7.0, 14.0, 22.0, 30.0] {
                 let raw_p = Vec2::new(
