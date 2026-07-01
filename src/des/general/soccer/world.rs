@@ -610,6 +610,13 @@ pub struct SoccerMatch {
     pub(crate) pass_lane_yield_samples: Vec<PassLaneYieldSample>,
     /// Open pass-lane yield decisions awaiting their windowed reward.
     pub(crate) pending_pass_lane_yield: Vec<PendingPassLaneYieldDecision>,
+    /// The trained head-scan effort head, when present. `None` ⇒ analytic seed. Shared into each
+    /// [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) head_scan_head: Option<std::sync::Arc<HeadScanHead>>,
+    /// Rolling RL corpus for the head-scan head. Collected only while the model is enabled.
+    pub(crate) head_scan_samples: Vec<HeadScanSample>,
+    /// Open head-scan decisions awaiting their windowed reward.
+    pub(crate) pending_head_scan: Vec<PendingHeadScanDecision>,
     /// The trained long-pass run head (which attacker should break forward so a deep carrier
     /// can pick them out), when present. Carried + trained across games by the learner; `None`
     /// ⇒ the analytic `backfield_long_pass_run_invite_for` seed. Shared into each
@@ -3173,6 +3180,9 @@ impl SoccerMatch {
             pass_lane_yield_head: None,
             pass_lane_yield_samples: Vec::new(),
             pending_pass_lane_yield: Vec::new(),
+            head_scan_head: None,
+            head_scan_samples: Vec::new(),
+            pending_head_scan: Vec::new(),
             long_pass_run_head: None,
             long_pass_run_samples: Vec::new(),
             pending_long_pass_run: Vec::new(),
@@ -8683,6 +8693,8 @@ impl SoccerMatch {
         // Learnable pass-lane yield (step out vs hold) RL samples (no-op under test / when
         // disabled; live in prod when pass-lane-yield is on).
         self.collect_pass_lane_yield_rl_samples(&next_snapshot);
+        // Learnable head-scan effort RL samples (no-op under test / when disabled).
+        self.collect_head_scan_rl_samples(&next_snapshot);
         self.collect_long_pass_run_rl_samples(&next_snapshot);
         // Learnable give-and-go / wall-pass appetite RL samples (no-op + byte-identical unless
         // `DD_SOCCER_ENABLE_LEARNED_GIVE_AND_GO` is set).
@@ -22243,6 +22255,10 @@ pub struct WorldSnapshot {
     /// pass-lane yield seam. `None` ⇒ analytic seed (parity). Skipped by serde.
     #[serde(skip)]
     pub(crate) pass_lane_yield_head: Option<std::sync::Arc<PassLaneYieldHead>>,
+    /// The trained head-scan effort head, carried from the match for live consumption in the
+    /// head-scan visibility seam. `None` ⇒ analytic seed (parity). Skipped by serde.
+    #[serde(skip)]
+    pub(crate) head_scan_head: Option<std::sync::Arc<HeadScanHead>>,
     /// The trained long-pass run head, carried from the match for live consumption in
     /// `backfield_long_pass_run_invite_for`. `None` ⇒ analytic seed (parity). Skipped by
     /// serde (an internal decision aid; Default = None).
@@ -24922,6 +24938,7 @@ impl WorldSnapshot {
             winger_pinch_head: m.winger_pinch_head.clone(),
             separation_floor_head: m.separation_floor_head.clone(),
             pass_lane_yield_head: m.pass_lane_yield_head.clone(),
+            head_scan_head: m.head_scan_head.clone(),
             long_pass_run_head: m.long_pass_run_head.clone(),
             give_and_go_head: m.give_and_go_head.clone(),
             attack_spacing_head: m.attack_spacing_head.clone(),
@@ -34656,6 +34673,9 @@ impl WorldSnapshot {
         if scan_seconds <= 0.0 {
             return false;
         }
+        // Learnable scan effort (MDP/POMDP): scale the effective scan time by how hard the carrier
+        // has chosen to scan this situation. Multiplier is 1.0 when the model is off ⇒ byte-identical.
+        let scan_seconds = scan_seconds * self.head_scan_effort_multiplier(observer_id);
         let off_axis = angle_between_vectors_degrees(facing, to_point).to_radians();
         let fov_half = ball_holder_shoulder_scan_limit_degrees().to_radians();
         scan_coverage(
