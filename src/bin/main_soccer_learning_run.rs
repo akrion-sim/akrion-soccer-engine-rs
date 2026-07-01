@@ -2179,6 +2179,25 @@ fn run_game(
             final_loss
         );
     }
+    // Train the CARRIED winger pinch-appetite head on this game's reward-weighted RL corpus
+    // (whether pinching in / holding width led to a rewarded box arrival). Empty + skipped unless
+    // the model is enabled (on by default in prod).
+    let winger_pinch_samples = sim.drain_winger_pinch_samples();
+    if !winger_pinch_samples.is_empty() {
+        let mut guard = CARRIED_WINGER_PINCH_HEAD.lock().unwrap();
+        let head = guard.get_or_insert_with(|| WingerPinchHead::new(episode_seed as u32));
+        let mut final_loss = 0.0;
+        for _ in 0..4 {
+            final_loss = head.train_reward_weighted(&winger_pinch_samples, 0.02);
+        }
+        eprintln!(
+            "winger_pinch_training samples={} training_steps={} consumed={} final_loss={:.5}",
+            winger_pinch_samples.len(),
+            head.training_steps(),
+            head.training_steps() >= WINGER_PINCH_HEAD_MIN_TRAINING_STEPS,
+            final_loss
+        );
+    }
     // Train the CARRIED long-pass run head on this game's reward-weighted RL corpus (which
     // attacker breaking forward led to the team advancing the ball). Empty + skipped unless
     // DD_SOCCER_ENABLE_LEARNED_LONG_PASS_RUN is set.
