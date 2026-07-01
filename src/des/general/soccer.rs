@@ -52659,6 +52659,7 @@ fn tracking_frame_to_world_snapshot(
         ranked_aerial_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         support_decision_feature_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         line_depth_head: None,
+        defender_line_head: None,
         back_four_line_latch_centre_depth: [None, None],
         pass_completion_head: None,
         loose_ball_commit_head: None,
