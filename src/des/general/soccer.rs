@@ -60,6 +60,8 @@ pub use pitch_value::*;
 // `lane_match`) that read clearly as `lane_discipline::strength()`.
 mod back_four_line;
 mod lane_discipline;
+mod lane_affinity_decision;
+pub use lane_affinity_decision::*;
 pub use back_four_line::*;
 mod loose_ball_commit;
 pub use loose_ball_commit::*;
