@@ -8654,6 +8654,9 @@ impl SoccerMatch {
         // Learnable goal-side recovery (collapse-onto-line vs hold-width) RL samples (no-op
         // under test / when disabled; live in prod, seeded by the ≈0 analytic prior).
         self.collect_goal_side_recovery_rl_samples(&next_snapshot);
+        // Learnable winger pinch-appetite (stay-wide vs pinch-in) RL samples (no-op under test /
+        // when disabled; live in prod, seeded by the analytic prior).
+        self.collect_winger_pinch_rl_samples(&next_snapshot);
         self.collect_long_pass_run_rl_samples(&next_snapshot);
         // Learnable give-and-go / wall-pass appetite RL samples (no-op + byte-identical unless
         // `DD_SOCCER_ENABLE_LEARNED_GIVE_AND_GO` is set).
