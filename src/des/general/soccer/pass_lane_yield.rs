@@ -109,6 +109,23 @@ impl WorldSnapshot {
         player_id: usize,
         home_position: Vec2,
     ) -> Option<(Vec2, f64)> {
+        let _ = home_position;
+        let (inputs, spot, base_strength) = self.pass_lane_yield_context(player_id)?;
+        // Learnable yield willingness (MDP/POMDP): shift the hand-computed strength by a learned
+        // bias so a middle man chooses to vacate the lane (open the longer ball) or hold his slot.
+        // Off ⇒ `base_strength` unchanged (byte-identical).
+        let strength = self.pass_lane_yield_effective_strength(&inputs, base_strength);
+        Some((spot, strength))
+    }
+
+    /// Read-only geometry for the pass-lane yield decision: the [`PassLaneYieldInputs`] the choice
+    /// is a function of, the elected step-out `spot`, and the hand-computed base strength. Shared by
+    /// [`Self::pass_lane_yield_target_for`] (the seam) and the RL collector. `None` when the yield
+    /// does not apply. Gated by [`pass_lane_yield_enabled`] (off ⇒ byte-identical early return).
+    pub(crate) fn pass_lane_yield_context(
+        &self,
+        player_id: usize,
+    ) -> Option<(super::PassLaneYieldInputs, Vec2, f64)> {
         if !pass_lane_yield_enabled() {
             return None;
         }
