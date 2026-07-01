@@ -48643,19 +48643,65 @@ impl WorldSnapshot {
         let Some(me) = self.players.iter().find(|p| p.id == player_id) else {
             return home;
         };
-        if roam {
-            return target.clamp_to_pitch(self.field_width, self.field_length);
-        }
         let in_possession = self.possession_team() == Some(me.team);
+        let tighten = formation_hold_tighten_enabled();
+        if roam {
+            if !tighten {
+                return target.clamp_to_pitch(self.field_width, self.field_length);
+            }
+            // Formation-hold: even a roaming/support/press option is bounded to a generous role
+            // radius around home, so a player can range to press or support but never wanders to the
+            // far side of the pitch off the ball (the "nobody holds their position / everyone bunches"
+            // failure). Still far looser than the shape radius, so overlaps and runs stay free.
+            let roam_radius = match me.role {
+                PlayerRole::Goalkeeper => 12.0,
+                PlayerRole::Defender if self.is_wide_defender(me) => 30.0,
+                PlayerRole::Defender => 24.0,
+                PlayerRole::Midfielder => 30.0,
+                PlayerRole::Forward => 34.0,
+            };
+            let delta = target - home;
+            let bounded = if delta.len() <= roam_radius {
+                target
+            } else {
+                home + delta.normalized() * roam_radius
+            };
+            return bounded.clamp_to_pitch(self.field_width, self.field_length);
+        }
+        // Shape radii: how far a NON-roaming player may sit from its formation home. The
+        // in-possession values were loose enough (24yd ≈ 3.5 lanes) that the four/eleven drifted off
+        // formation and compressed; tightened so they hold their positions and keep the pitch spread.
         let radius = match me.role {
             PlayerRole::Goalkeeper => 7.0,
             PlayerRole::Defender if in_possession && self.is_wide_defender(me) => {
-                26.0 + self.wingback_extra_push_yards(me) * 0.38
+                if tighten {
+                    20.0 + self.wingback_extra_push_yards(me) * 0.30
+                } else {
+                    26.0 + self.wingback_extra_push_yards(me) * 0.38
+                }
             }
-            PlayerRole::Defender if in_possession => 24.0,
+            PlayerRole::Defender if in_possession => {
+                if tighten {
+                    18.0
+                } else {
+                    24.0
+                }
+            }
             PlayerRole::Defender => 13.0,
-            PlayerRole::Midfielder => 24.0,
-            PlayerRole::Forward => 20.0,
+            PlayerRole::Midfielder => {
+                if tighten {
+                    18.0
+                } else {
+                    24.0
+                }
+            }
+            PlayerRole::Forward => {
+                if tighten {
+                    18.0
+                } else {
+                    20.0
+                }
+            }
         };
         let delta = target - home;
         let mut bounded = if delta.len() <= radius {
