@@ -798,7 +798,7 @@ fn mpc_latent_objective_shapes_controller_weights_but_keeps_short_horizon() {
         .map(|(_, controller)| *controller.config())
         .expect("home latent MPC controller");
     assert_eq!(cfg.horizon, sim.config.mpc.player_horizon);
-    assert_eq!(cfg.iters, 90);
+    assert_eq!(cfg.iters, 45);
     assert!(cfg.q_pos > base.q_pos);
     assert!(cfg.q_vel > base.q_vel);
     assert!(cfg.qf_pos > base.qf_pos);
@@ -15845,8 +15845,13 @@ fn pomdp_q_state_and_player_decision_use_front_behind_field_context() {
         SOCCER_NEURAL_PRE_OFFSIDE_RECOVERY_FEATURE_DIM + SOCCER_NEURAL_OFFSIDE_RECOVERY_FEATURE_DIM
     );
     assert_eq!(
-        SOCCER_NEURAL_PRE_IDEA_EXECUTION_FEATURE_DIM + SOCCER_NEURAL_IDEA_EXECUTION_FEATURE_DIM,
-        SOCCER_NEURAL_FEATURE_DIM
+        SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_IDEA_EXECUTION_FEATURE_DIM + SOCCER_NEURAL_IDEA_EXECUTION_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM
+            + SOCCER_NEURAL_EXECUTION_MPC_FEATURE_DIM
     );
 
     let mut stale_observation = observation.clone();
@@ -40705,12 +40710,67 @@ fn learning_context_splits_mdp_pomdp_idea_from_mpc_execution() {
         features[SOCCER_NEURAL_FEATURE_RIGHT_IDEA_WRONG_EXECUTION],
         0.0
     );
+    let execution_mpc = SoccerDecisionContext {
+        execution_mpc_guidance_present: true,
+        execution_mpc_blend_eligible: true,
+        execution_mpc_deviation_recorded: true,
+        execution_mpc_probability: 0.73,
+        execution_mpc_target_delta_yards: 9.0,
+        execution_mpc_velocity_delta_yps: 6.0,
+        execution_mpc_horizon_seconds: 1.5,
+        execution_mpc_recommended_speed_yps: 8.0,
+        ..SoccerDecisionContext::default()
+    };
+    transition.decision_context = execution_mpc;
+    let features = soccer_neural_transition_features(&transition);
     assert_eq!(
-        SOCCER_NEURAL_FEATURE_WRONG_IDEA_WRONG_EXECUTION + 1,
+        features[SOCCER_NEURAL_FEATURE_EXECUTION_MPC_GUIDANCE_PRESENT],
+        1.0
+    );
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_EXECUTION_MPC_BLEND_ELIGIBLE],
+        1.0
+    );
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_EXECUTION_MPC_DEVIATION_RECORDED],
+        1.0
+    );
+    assert!(
+        (features[SOCCER_NEURAL_FEATURE_EXECUTION_MPC_PROBABILITY] - 0.73).abs() < 1e-9
+    );
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_EXECUTION_MPC_TARGET_DELTA],
+        soccer_neural_scaled(9.0, 18.0)
+    );
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_EXECUTION_MPC_VELOCITY_DELTA],
+        soccer_neural_scaled(6.0, 12.0)
+    );
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_EXECUTION_MPC_HORIZON_SECONDS],
+        soccer_neural_scaled(1.5, 3.0)
+    );
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_EXECUTION_MPC_RECOMMENDED_SPEED],
+        soccer_neural_scaled(8.0, 12.0)
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_SUPPORT_PUSH_UP_ACTION,
+        SOCCER_NEURAL_FEATURE_WRONG_IDEA_WRONG_EXECUTION + 1
+    );
+    assert_eq!(
+        SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM,
+        SOCCER_NEURAL_FEATURE_SUPPORT_PUSH_UP_ACTION + 1
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_EXECUTION_MPC_RECOMMENDED_SPEED + 1,
         SOCCER_NEURAL_FEATURE_DIM
     );
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(
         &SOCCER_NEURAL_PRE_IDEA_EXECUTION_FEATURE_DIM
+    ));
+    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(
+        &SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM
     ));
 }
 
@@ -42287,8 +42347,8 @@ fn live_gameplay_defaults_keep_online_learning_off_and_neural_inference_ready() 
     assert!(config.mpc.tier2_player_enabled);
     assert!(config.mpc.reconcile_enabled);
     assert!(config.mpc.field_aware_enabled);
-    assert_eq!(config.mpc.player_horizon, 45);
-    assert!(config.mpc.player_horizon <= 60);
+    assert_eq!(config.mpc.player_horizon, 30);
+    assert!(config.mpc.player_horizon <= 45);
     assert!(config.mpc.active_radius_yards > 0.0);
     assert!(config.mpc.active_radius_yards <= 14.0);
     assert!(config.mpc.latent_objective_enabled);
@@ -42410,10 +42470,10 @@ fn live_gameplay_executes_tier2_mpc_and_records_reconciliation() {
     );
     for controller in sim.mpc_player_controllers.values() {
         let cfg = controller.config();
-        let expected_iters = ((cfg.horizon as f64 * 2.0).clamp(60.0, 200.0)) as usize;
+        let expected_iters = ((cfg.horizon as f64 * 1.5).clamp(36.0, 120.0)) as usize;
         assert_eq!(cfg.horizon, sim.config.mpc.player_horizon);
         assert_eq!(cfg.iters, expected_iters);
-        assert_eq!(cfg.iters, 90);
+        assert_eq!(cfg.iters, 45);
     }
     let stats = sim.mpc_reconcile_stats();
     assert!(
@@ -50628,6 +50688,186 @@ fn outside_midfielder_pinch_cross_arrival_when_ball_reaches_final_third() {
 }
 
 #[test]
+fn winger_pinch_and_crash_box_contexts_feed_q_state_and_neural_tail() {
+    let _env = crash_box_env_lock();
+    std::env::set_var(WINGER_PINCH_IN_ENABLE_ENV, "1");
+    std::env::set_var(FLANK_CRASH_BOX_ENABLE_ENV, "1");
+
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let crosser = sim
+        .players
+        .iter()
+        .find(|player| player.team == Team::Home && player.shirt == 7)
+        .map(|player| player.id)
+        .expect("home right midfielder");
+    let weak_side_winger = sim
+        .players
+        .iter()
+        .find(|player| player.team == Team::Home && player.shirt == 11)
+        .map(|player| player.id)
+        .expect("home left midfielder");
+    park_players_except(&mut sim, &[crosser, weak_side_winger, 9, 10]);
+    sim.ball.holder = Some(crosser);
+    sim.ball.position = Vec2::new(74.0, 96.0);
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.players[crosser].position = sim.ball.position;
+    sim.players[weak_side_winger].position = Vec2::new(13.0, 84.0);
+    sim.players[weak_side_winger].role = PlayerRole::Midfielder;
+    sim.players[weak_side_winger].preferences.offensive_mindedness = 0.9;
+    sim.players[9].role = PlayerRole::Forward;
+    sim.players[9].position = Vec2::new(36.0, 82.0);
+    sim.players[10].role = PlayerRole::Forward;
+    sim.players[10].position = Vec2::new(46.0, 82.0);
+    for away in 11..22 {
+        sim.players[away].position = Vec2::new(22.0 + (away - 11) as f64 * 4.0, 116.0);
+    }
+    sim.players[11].position = Vec2::new(40.0, 119.0);
+
+    let mut directive = TeamTacticalDirective::neutral(
+        Team::Home,
+        sim.config.field_width_yards,
+        sim.config.field_length_yards,
+    );
+    directive.attack_strategy = TeamAttackStrategy::CrashTheBox;
+    directive.flank_attack_policy = FlankAttackPolicy::PlayDownFlankHighCross;
+    sim.central_brain.home_directive = directive;
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let observation = snapshot.observation_for(weak_side_winger);
+    assert!(observation.winger_pinch_decision_active);
+    assert!(
+        observation.winger_pinch_choice_code > 0.0,
+        "weak-side winger should choose an infield pinch bucket: {observation:?}"
+    );
+    assert!(observation.winger_pinch_pressure > 0.0);
+    assert!(observation.winger_pinch_final_third_depth > 0.0);
+    assert!(observation.crash_box_commit_active);
+    assert!(
+        observation.crash_box_target_available,
+        "crash-the-box target should be visible to the learner"
+    );
+
+    let q_key = SoccerQStateKey::from_parts(
+        &snapshot.mdp_state_for_player(weak_side_winger),
+        &observation,
+        Team::Home,
+        sim.players[weak_side_winger].role,
+    );
+    assert!(q_key.winger_pinch_decision_active);
+    assert!(q_key.winger_pinch_choice_bin > 0);
+    assert!(q_key.winger_pinch_pressure_bin > 0);
+    assert!(q_key.crash_box_commit_active);
+    assert!(q_key.crash_box_target_available);
+    assert!(q_key.crash_box_target_distance_bin > 0);
+
+    let transition = test_learning_transition(
+        &sim,
+        sim.tick,
+        weak_side_winger,
+        Team::Home,
+        "pinch-cross-arrival",
+    );
+    let features = soccer_neural_transition_features(&transition);
+    assert_eq!(features[SOCCER_NEURAL_FEATURE_WINGER_PINCH_ACTIVE], 1.0);
+    assert!(features[SOCCER_NEURAL_FEATURE_WINGER_PINCH_CHOICE] > 0.0);
+    assert!(features[SOCCER_NEURAL_FEATURE_WINGER_PINCH_PRESSURE] > 0.0);
+    assert_eq!(features[SOCCER_NEURAL_FEATURE_CRASH_BOX_COMMIT_ACTIVE], 1.0);
+    assert_eq!(features[SOCCER_NEURAL_FEATURE_CRASH_BOX_TARGET_AVAILABLE], 1.0);
+    assert!(features[SOCCER_NEURAL_FEATURE_CRASH_BOX_TARGET_DISTANCE] > 0.0);
+
+    std::env::remove_var(WINGER_PINCH_IN_ENABLE_ENV);
+    std::env::remove_var(FLANK_CRASH_BOX_ENABLE_ENV);
+}
+
+#[test]
+fn lane_yield_and_onside_support_contexts_feed_q_state_and_neural_tail() {
+    let _env = crash_box_env_lock();
+    std::env::set_var("DD_SOCCER_ENABLE_PASS_LANE_YIELD", "1");
+
+    let mut lane_sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let outfield: Vec<usize> = lane_sim
+        .players
+        .iter()
+        .filter(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+        .map(|player| player.id)
+        .collect();
+    let (carrier, middle, far) = (outfield[0], outfield[1], outfield[2]);
+    park_players_except(&mut lane_sim, &[carrier, middle, far]);
+    lane_sim.players[carrier].position = Vec2::new(40.0, 50.0);
+    lane_sim.players[middle].position = Vec2::new(40.0, 58.0);
+    lane_sim.players[far].position = Vec2::new(40.0, 70.0);
+    lane_sim.ball.holder = Some(carrier);
+    lane_sim.ball.position = lane_sim.players[carrier].position;
+    lane_sim.ball.velocity = Vec2::zero();
+    lane_sim.ball.last_touch_team = Some(Team::Home);
+
+    let lane_snapshot = WorldSnapshot::from_match(&lane_sim);
+    let lane_observation = lane_snapshot.observation_for(middle);
+    assert!(lane_observation.pass_lane_yield_available);
+    assert!(lane_observation.pass_lane_yield_strength > 0.0);
+    assert!(lane_observation.pass_lane_yield_target_distance_yards > 0.0);
+    let lane_q = SoccerQStateKey::from_parts(
+        &lane_snapshot.mdp_state_for_player(middle),
+        &lane_observation,
+        Team::Home,
+        lane_sim.players[middle].role,
+    );
+    assert!(lane_q.pass_lane_yield_available);
+    assert!(lane_q.pass_lane_yield_strength_bin > 0);
+    assert!(lane_q.pass_lane_yield_target_distance_bin > 0);
+    let lane_transition = test_learning_transition(&lane_sim, lane_sim.tick, middle, Team::Home, "lane-yield");
+    let lane_features = soccer_neural_transition_features(&lane_transition);
+    assert_eq!(lane_features[SOCCER_NEURAL_FEATURE_PASS_LANE_YIELD_AVAILABLE], 1.0);
+    assert!(lane_features[SOCCER_NEURAL_FEATURE_PASS_LANE_YIELD_STRENGTH] > 0.0);
+    assert!(lane_features[SOCCER_NEURAL_FEATURE_PASS_LANE_YIELD_TARGET_DISTANCE] > 0.0);
+
+    let mut onside_sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let holder = 6;
+    let striker = 9;
+    onside_sim.ball.holder = Some(holder);
+    onside_sim.ball.position = Vec2::new(40.0, 84.0);
+    onside_sim.ball.velocity = Vec2::zero();
+    onside_sim.ball.last_touch_team = Some(Team::Home);
+    onside_sim.players[holder].position = onside_sim.ball.position;
+    onside_sim.players[striker].role = PlayerRole::Forward;
+    onside_sim.players[striker].position = Vec2::new(40.0, 99.0);
+    onside_sim.players[11].position = Vec2::new(40.0, 118.0);
+    for (k, away) in (12..22).enumerate() {
+        onside_sim.players[away].position = Vec2::new(20.0 + k as f64 * 5.0, 95.0);
+    }
+
+    let onside_snapshot = WorldSnapshot::from_match(&onside_sim);
+    let onside_observation = onside_snapshot.observation_for(striker);
+    assert!(onside_observation.forward_onside_support_gamble_active);
+    assert!(onside_observation.forward_onside_support_line_gap_yards < 0.0);
+    assert!(onside_observation.forward_onside_support_clamp_distance_yards > 0.0);
+    assert!(onside_observation.forward_onside_support_pressure > 0.0);
+    let onside_q = SoccerQStateKey::from_parts(
+        &onside_snapshot.mdp_state_for_player(striker),
+        &onside_observation,
+        Team::Home,
+        onside_sim.players[striker].role,
+    );
+    assert!(onside_q.forward_onside_support_gamble_active);
+    assert!(onside_q.forward_onside_support_line_gap_bin > 0);
+    assert!(onside_q.forward_onside_support_clamp_distance_bin > 0);
+    assert!(onside_q.forward_onside_support_pressure_bin > 0);
+    let onside_transition =
+        test_learning_transition(&onside_sim, onside_sim.tick, striker, Team::Home, "support-push-up");
+    let onside_features = soccer_neural_transition_features(&onside_transition);
+    assert_eq!(
+        onside_features[SOCCER_NEURAL_FEATURE_FORWARD_ONSIDE_SUPPORT_ACTIVE],
+        1.0
+    );
+    assert!(onside_features[SOCCER_NEURAL_FEATURE_FORWARD_ONSIDE_SUPPORT_LINE_GAP] < 0.0);
+    assert!(onside_features[SOCCER_NEURAL_FEATURE_FORWARD_ONSIDE_SUPPORT_CLAMP_DISTANCE] > 0.0);
+    assert!(onside_features[SOCCER_NEURAL_FEATURE_FORWARD_ONSIDE_SUPPORT_PRESSURE] > 0.0);
+
+    std::env::remove_var("DD_SOCCER_ENABLE_PASS_LANE_YIELD");
+}
+
+#[test]
 fn crash_box_grid_trigger_matches_outer_three_lanes_in_final_third() {
     let config = MatchConfig::default();
     let field_width = config.field_width_yards;
@@ -53650,6 +53890,11 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
     );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM
+            + SOCCER_NEURAL_EXECUTION_MPC_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM,
         SOCCER_NEURAL_PRE_IDEA_EXECUTION_FEATURE_DIM + SOCCER_NEURAL_IDEA_EXECUTION_FEATURE_DIM
     );
     assert_eq!(
@@ -53856,8 +54101,13 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
         SOCCER_NEURAL_PRE_OFFSIDE_RECOVERY_FEATURE_DIM + SOCCER_NEURAL_OFFSIDE_RECOVERY_FEATURE_DIM
     );
     assert_eq!(
-        SOCCER_NEURAL_PRE_IDEA_EXECUTION_FEATURE_DIM + SOCCER_NEURAL_IDEA_EXECUTION_FEATURE_DIM,
-        SOCCER_NEURAL_FEATURE_DIM
+        SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_IDEA_EXECUTION_FEATURE_DIM + SOCCER_NEURAL_IDEA_EXECUTION_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM
+            + SOCCER_NEURAL_EXECUTION_MPC_FEATURE_DIM
     );
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&170));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&177));
@@ -53914,6 +54164,9 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
     );
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_CURVE_ACTION_FEATURE_DIM));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_IDEA_EXECUTION_FEATURE_DIM));
+    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(
+        &SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM
+    ));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_FEATURE_SUPPORT_PUSH_UP_ACTION));
 
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
@@ -54206,9 +54459,9 @@ fn pass_neural_features_include_mpc_receipt_context() {
     sim.players[passer].skills.passing_completion_rate = 8.0;
     sim.players[receiver].team = Team::Home;
     sim.players[receiver].role = PlayerRole::Forward;
-    sim.players[receiver].position = Vec2::new(42.0, 64.0);
+    sim.players[receiver].position = Vec2::new(42.0, 56.0);
     sim.players[receiver].home_position = sim.players[receiver].position;
-    sim.players[receiver].velocity = Vec2::new(0.0, 3.8);
+    sim.players[receiver].velocity = Vec2::new(0.0, 1.2);
     sim.players[receiver].skills.acceleration = 8.0;
     sim.players[receiver].skills.first_touch = 8.0;
     sim.ball.holder = Some(passer);
@@ -54217,9 +54470,7 @@ fn pass_neural_features_include_mpc_receipt_context() {
 
     let snapshot = WorldSnapshot::from_match(&sim);
     let observation = snapshot.observation_for(passer);
-    let target_point = snapshot
-        .anticipated_pass_reception_point(passer, receiver, PassFlight::Floor, 16.0)
-        .unwrap_or(sim.players[receiver].position);
+    let target_point = sim.players[receiver].position + Vec2::new(0.0, 1.5);
     let action_target = AgentActionTargetTrace {
         point: Some(target_point),
         player_id: Some(receiver),
@@ -73237,6 +73488,11 @@ fn first_touch_escape_lateral_neural_block_is_appended_and_migration_safe() {
     );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM
+            + SOCCER_NEURAL_EXECUTION_MPC_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM,
         SOCCER_NEURAL_PRE_IDEA_EXECUTION_FEATURE_DIM + SOCCER_NEURAL_IDEA_EXECUTION_FEATURE_DIM
     );
     assert_eq!(
@@ -73262,6 +73518,10 @@ fn first_touch_escape_lateral_neural_block_is_appended_and_migration_safe() {
     assert!(
         SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_IDEA_EXECUTION_FEATURE_DIM),
         "the pre-idea/execution total must be a recognised legacy dim so old nets migrate"
+    );
+    assert!(
+        SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM),
+        "the pre-execution-MPC total must be a recognised legacy dim so old nets migrate"
     );
     assert!(
         SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_FEATURE_SUPPORT_PUSH_UP_ACTION),
@@ -73391,6 +73651,14 @@ fn first_touch_escape_lateral_neural_block_is_appended_and_migration_safe() {
     );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_SUPPORT_PUSH_UP_ACTION + 1,
+        SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_EXECUTION_MPC_GUIDANCE_PRESENT,
+        SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_EXECUTION_MPC_RECOMMENDED_SPEED + 1,
         SOCCER_NEURAL_FEATURE_DIM
     );
     assert!(SOCCER_NEURAL_FEATURE_DEFENSIVE_PRESS_ACTION < SOCCER_NEURAL_FEATURE_DIM);
@@ -73413,6 +73681,9 @@ fn first_touch_escape_lateral_neural_block_is_appended_and_migration_safe() {
     assert!(SOCCER_NEURAL_FEATURE_ACTION_CURVE_OUTSIDE_FOOT < SOCCER_NEURAL_FEATURE_DIM);
     assert!(SOCCER_NEURAL_FEATURE_ACTION_CURVE_DIRECTION < SOCCER_NEURAL_FEATURE_DIM);
     assert!(SOCCER_NEURAL_FEATURE_SUPPORT_PUSH_UP_ACTION < SOCCER_NEURAL_FEATURE_DIM);
+    assert!(SOCCER_NEURAL_FEATURE_EXECUTION_MPC_GUIDANCE_PRESENT < SOCCER_NEURAL_FEATURE_DIM);
+    assert!(SOCCER_NEURAL_FEATURE_EXECUTION_MPC_PROBABILITY < SOCCER_NEURAL_FEATURE_DIM);
+    assert!(SOCCER_NEURAL_FEATURE_EXECUTION_MPC_RECOMMENDED_SPEED < SOCCER_NEURAL_FEATURE_DIM);
     assert!(SOCCER_NEURAL_FEATURE_FIRST_TOUCH_ESCAPE_LANE_OPEN < SOCCER_NEURAL_FEATURE_DIM);
     assert!(SOCCER_NEURAL_FEATURE_FIRST_TOUCH_FREEZE_RISK < SOCCER_NEURAL_FEATURE_DIM);
     assert!(SOCCER_NEURAL_FEATURE_DRIBBLE_DEFENDER_OVERCOMMIT < SOCCER_NEURAL_FEATURE_DIM);
@@ -82541,8 +82812,8 @@ fn teammate_inside_twenty_five_suppresses_backward_pass_outlet() {
     // the shot-trigger discipline (a SET keeper from 23yd+ is now a work-it-closer call).
     sim.players[attacker].position = Vec2::new(40.0, 101.0);
     sim.players[attacker].velocity = Vec2::new(0.0, -1.0);
-    sim.players[attacker].action_facing = FacingBucket::North;
-    sim.players[attacker].receive_facing = FacingBucket::North;
+    sim.players[attacker].action_facing = FacingBucket::South;
+    sim.players[attacker].receive_facing = FacingBucket::South;
     sim.players[attacker].skills.shooting = 7.6;
     sim.players[attacker].skills.right_foot_shot_power = 7.8;
     sim.players[attacker].skills.left_foot_shot_power = 7.2;
@@ -82550,11 +82821,11 @@ fn teammate_inside_twenty_five_suppresses_backward_pass_outlet() {
     sim.players[attacker].preferences.shoot_bias = 0.72;
     sim.players[attacker].preferences.pass_bias = 1.0;
     sim.players[attacker].preferences.dribble_bias = 0.80;
-    sim.players[backward_target].position = Vec2::new(39.5, 84.0);
+    sim.players[backward_target].position = Vec2::new(39.5, 94.0);
     sim.players[backward_target].velocity = Vec2::new(0.0, 1.0);
     sim.players[keeper].position = Vec2::new(38.5, 116.0);
     sim.players[keeper].skills.goalkeeping = 5.0;
-    sim.players[pressure_defender].position = Vec2::new(47.0, 96.0);
+    sim.players[pressure_defender].position = Vec2::new(44.0, 99.0);
     sim.ball.holder = Some(attacker);
     sim.ball.position = sim.players[attacker].position;
     sim.ball.velocity = Vec2::zero();
@@ -93869,7 +94140,7 @@ fn unpressured_backward_pass_penalty_truth_table() {
     // An unpressured backward pass at the threshold is penalized (base + per-yard).
     let p_min = unpressured_backward_pass_penalty_points(BACKWARD_PASS_MIN_PENALIZED_YARDS, free);
     assert!(
-        p_min >= 5.0,
+        p_min >= 7.0,
         "even the minimum unpressured backward pass should now matter: {p_min}"
     );
     // The DEEPER the backward pass, the BIGGER the penalty (monotonic) until the cap.
@@ -93880,7 +94151,7 @@ fn unpressured_backward_pass_penalty_truth_table() {
         "penalty must grow with backward distance: {p_min} < {p_short} < {p_long}"
     );
     assert!(
-        p_long >= 12.0,
+        p_long >= 18.0,
         "a 10yd unpressured backward pass should be strongly penalized: {p_long}"
     );
     // Very deep recycles are capped.
@@ -93888,7 +94159,7 @@ fn unpressured_backward_pass_penalty_truth_table() {
         unpressured_backward_pass_penalty_points(1000.0, free),
         BACKWARD_PASS_MAX_PENALTY_POINTS
     );
-    assert_eq!(BACKWARD_PASS_MAX_PENALTY_POINTS, 18.0);
+    assert_eq!(BACKWARD_PASS_MAX_PENALTY_POINTS, 28.0);
 }
 
 #[test]
@@ -94500,6 +94771,67 @@ fn separation_floor_mpc_reward_and_grace_work_in_unison() {
     assert!(
         same_team_proximity_penalty_unit(gap) > same_team_proximity_penalty_unit(5.0),
         "crowding at 3yd is penalised harder than at 5yd"
+    );
+
+    // The same 4/5/6/7-yard Euclidean floor and dwell-grace state must be visible to
+    // POMDP/Q/neural learners, not just applied as a hidden shaping penalty.
+    sim.players[5].same_team_proximity_dwell_lt7_seconds =
+        SAME_TEAM_PROXIMITY_GRACE_LT7_SECONDS;
+    sim.players[5].same_team_proximity_dwell_lt6_seconds =
+        SAME_TEAM_PROXIMITY_GRACE_LT6_SECONDS;
+    sim.players[5].same_team_proximity_dwell_lt5_seconds =
+        SAME_TEAM_PROXIMITY_GRACE_LT5_SECONDS;
+    let learned_snapshot = WorldSnapshot::from_match(&sim);
+    let learned_obs = learned_snapshot.observation_for(5);
+    assert!(
+        learned_obs.same_team_separation_floor_active,
+        "POMDP observation should expose the active same-team separation floor"
+    );
+    assert!(
+        (learned_obs.same_team_separation_floor_distance_yards - gap).abs() < 1e-6,
+        "POMDP observation should carry the exact non-exempt Euclidean gap: {} vs {gap}",
+        learned_obs.same_team_separation_floor_distance_yards
+    );
+    assert!(
+        (learned_obs.same_team_separation_floor_pressure
+            - same_team_proximity_penalty_unit(gap))
+        .abs()
+            < 1e-9,
+        "POMDP observation should carry the graduated 4/5/6/7yd pressure"
+    );
+    assert!(
+        learned_obs.same_team_separation_penalty_live,
+        "POMDP observation should know the dwell grace has made the penalty live"
+    );
+    let learned_state = learned_snapshot.mdp_state_for_player(5);
+    let learned_q_key =
+        SoccerQStateKey::from_parts(&learned_state, &learned_obs, Team::Home, sim.players[5].role);
+    assert!(learned_q_key.same_team_separation_floor_active);
+    assert_eq!(
+        learned_q_key.same_team_separation_floor_distance_bin, 0,
+        "3yd should bucket as inside the hard 4yd floor"
+    );
+    assert!(learned_q_key.same_team_separation_floor_pressure_bin > 0);
+    assert!(learned_q_key.same_team_separation_dwell_lt7_bin > 0);
+    assert!(learned_q_key.same_team_separation_penalty_live);
+
+    let transition = test_learning_transition(&sim, learned_snapshot.tick, 5, Team::Home, "space");
+    let features = soccer_neural_transition_features(&transition);
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_SAME_TEAM_SEPARATION_ACTIVE], 1.0,
+        "neural learner should see that the floor is active"
+    );
+    assert!(
+        features[SOCCER_NEURAL_FEATURE_SAME_TEAM_SEPARATION_CLOSENESS] > 0.60,
+        "neural learner should see the close Euclidean spacing"
+    );
+    assert!(
+        features[SOCCER_NEURAL_FEATURE_SAME_TEAM_SEPARATION_PRESSURE] > 0.90,
+        "neural learner should see the large graduated pressure"
+    );
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_SAME_TEAM_SEPARATION_PENALTY_LIVE], 1.0,
+        "neural learner should see that the grace window has tripped"
     );
 
     // The GRACE timers are live under the gate: a pair kept crowded accrues dwell across real ticks

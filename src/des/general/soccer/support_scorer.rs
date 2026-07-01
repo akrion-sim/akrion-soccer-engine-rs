@@ -42,7 +42,7 @@ use crate::des::general::prng::mulberry32;
 /// Number of features in the off-ball support candidate vector. The ordering is defined
 /// once in [`SupportCandidateFeatures::to_features`] — change it and bump this constant and
 /// any persisted head.
-pub const SUPPORT_CANDIDATE_FEATURE_DIM: usize = 22;
+pub const SUPPORT_CANDIDATE_FEATURE_DIM: usize = 25;
 /// Hidden width of the learned regression head.
 pub const SUPPORT_SCORER_HIDDEN_UNITS: usize = 24;
 /// Reference score magnitude used to normalize the (already-weighted) candidate terms into
@@ -50,14 +50,39 @@ pub const SUPPORT_SCORER_HIDDEN_UNITS: usize = 24;
 const SUPPORT_TERM_REF: f64 = 8.0;
 
 const SUPPORT_SCORER_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_LEARNED_SUPPORT_SCORER";
+const SUPPORT_SCORER_DISABLE_ENV: &str = "DD_SOCCER_DISABLE_LEARNED_SUPPORT_SCORER";
+
+fn support_env_flag(name: &str) -> Option<bool> {
+    std::env::var(name).ok().map(|raw| {
+        let v = raw.trim().to_ascii_lowercase();
+        matches!(v.as_str(), "1" | "true" | "yes" | "on")
+    })
+}
+
+fn support_scorer_enabled_from_env() -> bool {
+    if support_env_flag(SUPPORT_SCORER_DISABLE_ENV).unwrap_or(false) {
+        return false;
+    }
+    support_env_flag(SUPPORT_SCORER_ENABLE_ENV).unwrap_or(true)
+}
 
 /// Whether the learned support scorer is consulted at the live `open_space_for` chokepoint
-/// this process. Off (unset) ⇒ the analytic seed (the existing fixed-weight sum) stands, so
-/// the ranking is byte-identical.
+/// this process. Production default is on (analytic seed until a warm head is installed);
+/// tests default off so the broad movement suite keeps byte-identical parity unless it opts in.
 pub fn support_scorer_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var(SUPPORT_SCORER_ENABLE_ENV).is_ok())
+    #[cfg(test)]
+    {
+        if support_env_flag(SUPPORT_SCORER_DISABLE_ENV).unwrap_or(false) {
+            return false;
+        }
+        support_env_flag(SUPPORT_SCORER_ENABLE_ENV).unwrap_or(false)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(support_scorer_enabled_from_env)
+    }
 }
 
 /// The per-candidate feature vector for one off-ball destination point. Every field is the
@@ -68,8 +93,11 @@ pub fn support_scorer_enabled() -> bool {
 pub struct SupportCandidateFeatures {
     pub open_space_score: f64,
     pub counterattack_bonus: f64,
+    pub advance_upfield_bonus: f64,
     pub goal_directness_bonus: f64,
     pub vacuum_run_bonus: f64,
+    pub forward_run_bias: f64,
+    pub attacking_spacing_bonus: f64,
     pub forward_term: f64,
     pub forward_from_ball_term: f64,
     pub role_depth_deviation_term: f64,
@@ -97,8 +125,11 @@ impl SupportCandidateFeatures {
     pub fn analytic_score(&self) -> f64 {
         self.open_space_score
             + self.counterattack_bonus
+            + self.advance_upfield_bonus
             + self.goal_directness_bonus
             + self.vacuum_run_bonus
+            + self.forward_run_bias
+            + self.attacking_spacing_bonus
             + self.forward_term
             + self.forward_from_ball_term
             + self.role_depth_deviation_term
@@ -127,8 +158,11 @@ impl SupportCandidateFeatures {
         [
             n(self.open_space_score),
             n(self.counterattack_bonus),
+            n(self.advance_upfield_bonus),
             n(self.goal_directness_bonus),
             n(self.vacuum_run_bonus),
+            n(self.forward_run_bias),
+            n(self.attacking_spacing_bonus),
             n(self.forward_term),
             n(self.forward_from_ball_term),
             n(self.role_depth_deviation_term),
@@ -185,6 +219,9 @@ pub const SUPPORT_MOVE_SAMPLE_INTERVAL_TICKS: u64 = 15;
 pub const SUPPORT_MOVE_REWARD_WINDOW_TICKS: u64 = 45;
 /// Cap on the rolling RL sample buffer (drained by the learner).
 pub const SUPPORT_MOVE_SAMPLE_CAP: usize = 4096;
+/// Minimum training steps before live support ranking trusts the carried head over the
+/// analytic seed. Before that, the seam records samples but keeps the known heuristic.
+pub const SUPPORT_SCORER_HEAD_MIN_TRAINING_STEPS: usize = 200;
 
 /// Learned regression head for the candidate value: a `FeedForwardNetwork`
 /// (`DIM → hidden → 1`, linear output) predicting the expected territorial reward of moving
@@ -311,13 +348,19 @@ pub fn train_support_scorer_head(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static SUPPORT_SCORER_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn baseline_features() -> SupportCandidateFeatures {
         SupportCandidateFeatures {
             open_space_score: 6.0,
             counterattack_bonus: 0.0,
+            advance_upfield_bonus: 0.0,
             goal_directness_bonus: 0.0,
             vacuum_run_bonus: 0.0,
+            forward_run_bias: 0.0,
+            attacking_spacing_bonus: 0.0,
             forward_term: 0.4,
             forward_from_ball_term: 1.2,
             role_depth_deviation_term: -0.3,
@@ -399,5 +442,44 @@ mod tests {
         }];
         assert_eq!(head.train(&bad, 0.05), 0.0);
         assert_eq!(head.training_steps(), 0);
+    }
+
+    #[test]
+    fn installed_warm_head_is_consumed_by_snapshot_scorer() {
+        let _lock = SUPPORT_SCORER_ENV_LOCK
+            .lock()
+            .expect("support scorer env lock");
+        std::env::set_var(SUPPORT_SCORER_ENABLE_ENV, "1");
+        std::env::remove_var(SUPPORT_SCORER_DISABLE_ENV);
+
+        let features = baseline_features();
+        let analytic = analytic_candidate_score(&features);
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let cold_snapshot = WorldSnapshot::from_match(&sim);
+        assert!(
+            (cold_snapshot.support_candidate_score(&features) - analytic).abs() < 1e-9,
+            "no installed head should fall back to analytic seed"
+        );
+
+        let samples: Vec<SupportMoveSample> = (0..SUPPORT_SCORER_HEAD_MIN_TRAINING_STEPS)
+            .map(|_| SupportMoveSample {
+                features: features.clone(),
+                reward: analytic + 6.0,
+            })
+            .collect();
+        let mut head = SupportScorerHead::new(19);
+        for _ in 0..6 {
+            head.train(&samples, 0.05);
+        }
+        assert!(head.training_steps() >= SUPPORT_SCORER_HEAD_MIN_TRAINING_STEPS);
+
+        sim.set_support_scorer_head(head);
+        let learned_snapshot = WorldSnapshot::from_match(&sim);
+        let learned = learned_snapshot.support_candidate_score(&features);
+        std::env::remove_var(SUPPORT_SCORER_ENABLE_ENV);
+        assert!(
+            (learned - analytic).abs() > 0.10,
+            "warm installed head should replace the analytic support score: analytic={analytic} learned={learned}"
+        );
     }
 }
