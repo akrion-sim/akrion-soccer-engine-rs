@@ -92,11 +92,10 @@ const SOCCER_POLICY_ENTRY_INSERT_BATCH_SIZE: usize = 1024;
 const SOCCER_RUN_DELTA_INSERT_BATCH_SIZE: usize = 1024;
 const SOCCER_COMPLETED_RUN_INSERT_BATCH_SIZE: usize = 512;
 const SOCCER_POLICY_RETENTION_BRANCH_TIP: &str = "branch_tip";
-/// Rows deleted per statement when cleaning up a superseded generation's entries
-/// ([`SoccerLearningPgStore::prune_superseded_branch_entries_batched`]). Each batch is its own
-/// statement well under the session `statement_timeout`, so a multi-million-row cleanup never
-/// trips the timeout — and because it runs AFTER the promotion commits, a slow cleanup can no
-/// longer roll back the promotion (the bug that stalled generation promotion for a week).
+const SOCCER_POLICY_INLINE_PRUNE_ENV: &str = "SOCCER_PG_INLINE_POLICY_PRUNE";
+/// Rows deleted per statement when cleaning up a superseded generation's entries.
+/// Inline pruning is opt-in via [`SOCCER_POLICY_INLINE_PRUNE_ENV`]; live learners defer this
+/// heavyweight maintenance so policy promotion cannot stall on a large delete.
 const SOCCER_POLICY_PRUNE_DELETE_BATCH_SIZE: i64 = 50_000;
 pub const SOCCER_MOMENT_VECTOR_SOFT_DELETE_AFTER_DAYS: i64 = 10;
 
@@ -1691,19 +1690,23 @@ impl SoccerLearningPgStore {
         tx.commit()
             .map_err(|err| format!("commit soccer policy version: {err}"))?;
 
-        // The promotion is now durable. Clean up the superseded generation's entries OUTSIDE the
-        // promotion transaction, in timeout-bounded batches, best-effort: a slow or failed
-        // cleanup can never roll back the promotion, and an interrupted cleanup is simply retried
-        // by the next promotion (drained versions keep `full_entries_retained = true` until their
-        // entries are actually gone).
+        // The promotion is now durable. Cleanup is deliberately out-of-band by default: on the
+        // production policy table, even LIMIT-bounded deletes can block learners for minutes while
+        // autovacuum and heap reads churn. Operators can opt in for a dedicated maintenance run.
         if full_entries_retained {
-            if let Err(err) = self.prune_superseded_branch_entries_batched(
-                experiment_id,
-                &branch_key,
-                policy_version_id,
-            ) {
+            if soccer_policy_inline_prune_enabled() {
+                if let Err(err) = self.prune_superseded_branch_entries_batched(
+                    experiment_id,
+                    &branch_key,
+                    policy_version_id,
+                ) {
+                    eprintln!(
+                        "soccer policy retention: superseded-entry cleanup deferred (best-effort) for {policy_version_id}: {err}"
+                    );
+                }
+            } else {
                 eprintln!(
-                    "soccer policy retention: superseded-entry cleanup deferred (best-effort) for {policy_version_id}: {err}"
+                    "soccer policy retention: superseded-entry cleanup deferred for {policy_version_id}; set {SOCCER_POLICY_INLINE_PRUNE_ENV}=true for dedicated inline maintenance"
                 );
             }
         }
@@ -4967,6 +4970,19 @@ fn soccer_learning_pg_statement_timeout() -> String {
     }
 }
 
+fn soccer_policy_inline_prune_enabled() -> bool {
+    let raw = std::env::var(SOCCER_POLICY_INLINE_PRUNE_ENV).ok();
+    soccer_policy_inline_prune_enabled_from_env_value(raw.as_deref())
+}
+
+fn soccer_policy_inline_prune_enabled_from_env_value(raw: Option<&str>) -> bool {
+    let value = raw.unwrap_or("").trim();
+    value == "1"
+        || value.eq_ignore_ascii_case("true")
+        || value.eq_ignore_ascii_case("yes")
+        || value.eq_ignore_ascii_case("on")
+}
+
 fn soccer_learning_pg_should_verify_certificates(database_url: &str) -> bool {
     soccer_learning_pg_should_verify_certificates_with_override(
         database_url,
@@ -5844,6 +5860,18 @@ mod tests {
         assert!(soccer_policy_version_retains_full_entries("candidate"));
         assert!(!soccer_policy_version_retains_full_entries("archived"));
         assert!(!soccer_policy_version_retains_full_entries("rejected"));
+    }
+
+    #[test]
+    fn inline_policy_prune_is_opt_in_for_learning_jobs() {
+        assert!(!soccer_policy_inline_prune_enabled_from_env_value(None));
+        assert!(!soccer_policy_inline_prune_enabled_from_env_value(Some("")));
+        assert!(!soccer_policy_inline_prune_enabled_from_env_value(Some("0")));
+        assert!(!soccer_policy_inline_prune_enabled_from_env_value(Some("false")));
+        assert!(soccer_policy_inline_prune_enabled_from_env_value(Some("1")));
+        assert!(soccer_policy_inline_prune_enabled_from_env_value(Some("true")));
+        assert!(soccer_policy_inline_prune_enabled_from_env_value(Some("YES")));
+        assert!(soccer_policy_inline_prune_enabled_from_env_value(Some(" on ")));
     }
 
     #[test]
