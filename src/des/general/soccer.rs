@@ -24113,8 +24113,17 @@ fn dense_soccer_transition_reward(
     // huge inside 4yd, big at 5, medium at 6, small at 7, nothing beyond 8 — evaluated on the
     // AFTER position so it credits the move that closed (or held) the gap. Universal: attack
     // AND defence, every role (keepers included; the box exception covers legitimate goalmouth
-    // congestion). Gated (default-on); OFF ⇒ this term vanishes (byte-identical A/B).
-    if dd_soccer_enable_same_team_separation_floor() {
+    // congestion). GATED BEHIND A GRACE WINDOW (`same_team_proximity_penalty_past_grace` over the
+    // player's nested dwell timers) so a brief, legitimate overlap costs nothing and only a
+    // SUSTAINED crowd is punished: 3s grace within 7yd, 2s within 6yd, 1s within 5yd. Gated
+    // (default-on); OFF ⇒ this term vanishes (byte-identical A/B; the timers also stay 0).
+    if dd_soccer_enable_same_team_separation_floor()
+        && same_team_proximity_penalty_past_grace(
+            player.same_team_proximity_dwell_lt7_seconds,
+            player.same_team_proximity_dwell_lt6_seconds,
+            player.same_team_proximity_dwell_lt5_seconds,
+        )
+    {
         if let Some(nearest) = nearest_same_team_distance_for_floor(after, player.id, player.team) {
             reward -= same_team_proximity_penalty_unit(nearest) * SAME_TEAM_PROXIMITY_PENALTY_POINTS;
         }
