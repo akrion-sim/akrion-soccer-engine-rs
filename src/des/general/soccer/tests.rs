@@ -94186,53 +94186,8 @@ fn same_team_proximity_penalty_curve_is_graduated_huge_to_small() {
     assert_eq!(same_team_proximity_penalty_unit(f64::NAN), 0.0);
 }
 
-#[test]
-fn separation_barrier_smoothly_stops_approach_at_the_floor() {
-    let dt = 1.0 / 15.0;
-    let me = Vec2::new(50.0, 50.0);
-    // A teammate 5yd straight ahead (+y); I am sprinting straight at them.
-    let mate = Vec2::new(50.0, 55.0);
-    let toward = Vec2::new(0.0, 8.0);
-    let damped = apply_same_team_separation_barrier(me, toward, &[(mate, false)], dt);
-    // Inside the influence band, the inward (toward-teammate) speed is reduced, never reversed.
-    assert!(damped.y > 0.0 && damped.y < toward.y, "inward speed smoothly reduced, not stopped hard: {damped:?}");
-
-    // Exactly at the floor there is zero permitted approach (smooth arrival, not a wall bounce).
-    let at_floor_mate = Vec2::new(50.0, 54.0); // 4yd ahead
-    let at_floor = apply_same_team_separation_barrier(me, toward, &[(at_floor_mate, false)], dt);
-    assert!(at_floor.y <= 1e-6, "no inward motion permitted at the 4yd floor: {at_floor:?}");
-
-    // Tangential motion (parallel, no closing) is untouched.
-    let sideways = Vec2::new(6.0, 0.0);
-    let tangential = apply_same_team_separation_barrier(me, sideways, &[(at_floor_mate, false)], dt);
-    assert!((tangential.x - 6.0).abs() < 1e-9 && tangential.y.abs() < 1e-9, "tangential preserved: {tangential:?}");
-
-    // Moving AWAY is never constrained.
-    let away = Vec2::new(0.0, -8.0);
-    let away_out = apply_same_team_separation_barrier(me, away, &[(at_floor_mate, false)], dt);
-    assert!((away_out.y + 8.0).abs() < 1e-9, "peeling away is free: {away_out:?}");
-
-    // The both-in-box exemption disables the barrier for that pair.
-    let exempt = apply_same_team_separation_barrier(me, toward, &[(at_floor_mate, true)], dt);
-    assert!((exempt.y - toward.y).abs() < 1e-9, "exempt (both in box) pair is not damped: {exempt:?}");
-}
-
-#[test]
-fn separation_barrier_never_lets_a_step_cross_the_floor() {
-    // Integrate one tick under a high inward speed and assert the gap never drops below 4yd.
-    let dt = 1.0 / 15.0;
-    let mate = Vec2::new(50.0, 55.0);
-    let mut me = Vec2::new(50.0, 50.0);
-    for _ in 0..40 {
-        let v = apply_same_team_separation_barrier(me, Vec2::new(0.0, 20.0), &[(mate, false)], dt);
-        me = me + v * dt;
-        assert!(
-            me.distance(mate) >= SAME_TEAM_MIN_SEPARATION_YARDS - 1e-6,
-            "step crossed the 4yd floor: gap={}",
-            me.distance(mate)
-        );
-    }
-}
+// NOTE: the old `separation_barrier_*` tests were removed with the hard movement barrier — the
+// 4yd line is enforced by a strong graduated PENALTY (+ MPC route cost), not a physical clamp.
 
 /// Serialise the same-team separation-floor tests that toggle the env gate (read fresh under
 /// cfg(test)), so concurrent tests don't see each other's `set_var` window.
@@ -94241,12 +94196,12 @@ fn separation_floor_env_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// MPC, POMDP-reward and barrier must act in UNISON: all three key off the one gate. Here we
-/// prove the live-movement MPC keep-out flips with the gate (routes around teammates), that the
-/// graduated reward penalty the policy sees is live for the same crowded gap, and that the
-/// smooth barrier actually holds the 4yd floor across real ticks of the full step loop.
+/// MPC keep-out, the graduated reward penalty and its grace timers act in UNISON off the one gate.
+/// There is deliberately NO hard barrier — the 4yd line is a strong penalty, not a wall. Proves the
+/// live-movement MPC keep-out flips with the gate (routes around teammates), the reward penalty
+/// curve is live for the crowded gap, and the nested grace timers accrue across real ticks.
 #[test]
-fn separation_floor_mpc_reward_and_barrier_work_in_unison() {
+fn separation_floor_mpc_reward_and_grace_work_in_unison() {
     let _env = separation_floor_env_lock();
     let dt = DEFAULT_DT_SECONDS;
 
@@ -94278,8 +94233,8 @@ fn separation_floor_mpc_reward_and_barrier_work_in_unison() {
         "gate off: teammate keep-out should be the small default, got {radius_off}"
     );
 
-    // Gate ON ⇒ the SAME live-movement MPC path inflates the teammate keep-out to the 4yd floor,
-    // so the executed plan routes around the teammate — in unison with the reward + barrier.
+    // Gate ON ⇒ the SAME live-movement MPC path inflates the teammate keep-out to the influence
+    // radius, so the executed plan routes around the teammate — in unison with the reward + grace.
     std::env::set_var("DD_SOCCER_ENABLE_SAME_TEAM_SEPARATION_FLOOR", "1");
     assert!(dd_soccer_enable_same_team_separation_floor());
     let radius_on = radius_of_mate(&sim);
@@ -94299,46 +94254,19 @@ fn separation_floor_mpc_reward_and_barrier_work_in_unison() {
         "crowding at 3yd is penalised harder than at 5yd"
     );
 
-    // The barrier's guarantee across real ticks of the full step loop: no non-box same-team pair
-    // that is currently AT/ABOVE the 4yd floor ever CLOSES below it on the next tick. (The barrier
-    // prevents crossing the floor; it does not forcibly separate a pair spawned already inside it —
-    // that dispersal is the reward/policy's job — so players 5 & 6, placed at 3yd, are exempt via
-    // the `before >= floor` guard rather than asserted apart.)
-    let floor = SAME_TEAM_MIN_SEPARATION_YARDS;
-    let pair_gap = |sim: &SoccerMatch, i: usize, j: usize| -> Option<f64> {
-        let (a, b) = (&sim.players[i], &sim.players[j]);
-        if sim.point_in_either_penalty_area(a.position)
-            && sim.point_in_either_penalty_area(b.position)
-        {
-            return None; // both-in-box pairs are exempt
-        }
-        Some(a.position.distance(b.position))
-    };
-    for _ in 0..30 {
-        let mut before: Vec<(usize, usize, f64)> = Vec::new();
-        for i in 0..sim.players.len() {
-            for j in (i + 1)..sim.players.len() {
-                if sim.players[i].team != sim.players[j].team {
-                    continue;
-                }
-                if let Some(g) = pair_gap(&sim, i, j) {
-                    before.push((i, j, g));
-                }
-            }
-        }
+    // The GRACE timers are live under the gate: a pair kept crowded accrues dwell across real ticks
+    // of the full step loop. Players 5 & 6 start 3yd apart, so they cannot separate past 7yd in a
+    // few ticks ⇒ the 7yd dwell timer must grow (proving the timer path is wired, off the same gate
+    // as the MPC keep-out and reward penalty above). There is no barrier, so nothing physically
+    // stops them closing — the enforcement is the penalty the timer eventually un-graces.
+    for _ in 0..4 {
         sim.run_time_step();
-        for (i, j, gap_before) in before {
-            if gap_before < floor {
-                continue; // pre-existing overlap: barrier only prevents crossing, not resolves
-            }
-            if let Some(gap_after) = pair_gap(&sim, i, j) {
-                assert!(
-                    gap_after >= floor - 0.25,
-                    "barrier let same-team {i} and {j} close from {gap_before}yd across the 4yd floor to {gap_after}yd"
-                );
-            }
-        }
     }
+    assert!(
+        sim.players[5].same_team_proximity_dwell_lt7_seconds > 0.0,
+        "grace dwell timer must accrue while crowded under the gate: {}",
+        sim.players[5].same_team_proximity_dwell_lt7_seconds
+    );
 
     std::env::remove_var("DD_SOCCER_ENABLE_SAME_TEAM_SEPARATION_FLOOR");
 }

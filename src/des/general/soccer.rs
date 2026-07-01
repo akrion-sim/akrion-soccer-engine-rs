@@ -2731,33 +2731,33 @@ const TEAMMATE_MAX_SPACING_YARDS: f64 = 10.0;
 // is legitimate, so the expected spacing band tightens from 5-10 to 3-6 yards.
 const TEAMMATE_MIN_SPACING_BOX_YARDS: f64 = 3.0;
 const TEAMMATE_MAX_SPACING_BOX_YARDS: f64 = 6.0;
-// ---- HARD same-team separation floor ("never within 4 yards") ----
-// Unlike the soft 5-10yd proclivity band above (a *seed* the learners may move off),
-// this is a firm minimum: two teammates must not crowd inside 4 yards of each other in
-// open play. The nightmare it kills: playerB, 5yd from the carrier with the passing lane
-// already open, drifting IN to 2yd — closing the gap buys nothing and clutters the pitch.
-// It is enforced on THREE layers so the policy, the planner and the physics all agree:
-//   1. a SMOOTH radial movement barrier — the component of a player's velocity directed
-//      toward a teammate is damped to zero as the gap closes to the floor, so it is a
-//      gentle deceleration (`apply_same_team_separation_barrier`), NEVER a hard stop;
-//   2. a graduated MDP/POMDP reward penalty that grows steeply as the gap shrinks
-//      (`same_team_proximity_penalty_unit`): huge inside 4yd, big at 5, medium at 6,
-//      small at 7, nothing beyond 8 — applied to attack AND defence, every role;
-//   3. an inflated same-team MPC keep-out radius so the point-mass planner routes runs
-//      around teammates rather than through them (see `soccer_local_mpc_planar_obstacles`).
-// The single exception, mirroring the spacing band, is when BOTH players are inside an
-// 18-yard box, where goalmouth congestion (finishing / defending crosses) is legitimate.
-// Gated (default-on) by `DD_SOCCER_ENABLE_SAME_TEAM_SEPARATION_FLOOR`; OFF ⇒ all three
-// layers vanish (byte-identical A/B).
+// ---- Same-team crowding penalty ("strong/huge penalty within 4 yards") ----
+// NOT a hard floor: two teammates MAY close inside 4 yards, it just draws a strong/huge penalty
+// (and an MPC route cost) so the policy learns not to. The nightmare it kills: playerB, 5yd from
+// the carrier with the passing lane already open, drifting IN to 2yd — closing the gap buys
+// nothing and clutters the pitch. Unlike the soft 5-10yd proclivity band above (a *seed* the
+// learners may move off), this is a sharp, dominant cost peaking at/under the 4yd line. Enforced
+// on TWO layers (an earlier hard velocity barrier was removed on purpose — see the note where
+// `apply_same_team_separation_barrier` used to live):
+//   1. a graduated MDP/POMDP reward penalty that grows steeply as the gap shrinks
+//      (`same_team_proximity_penalty_unit`): huge inside 4yd, big at 5, medium at 6, small at 7,
+//      nothing beyond 8 — applied to attack AND defence, every role, behind a GRACE window so a
+//      brief overlap is forgiven and only a sustained crowd is punished;
+//   2. an inflated same-team MPC keep-out radius so the point-mass planner routes runs around
+//      teammates rather than through them (graduated 7→6→5→4 via the influence-radius keep-out).
+// The single exception, mirroring the spacing band, is when BOTH players are inside an 18-yard
+// box, where goalmouth congestion (finishing / defending crosses) is legitimate. Gated
+// (default-on) by `DD_SOCCER_ENABLE_SAME_TEAM_SEPARATION_FLOOR`; OFF ⇒ both layers vanish
+// (byte-identical A/B).
 const SAME_TEAM_MIN_SEPARATION_YARDS: f64 = 4.0;
-// Distance beyond the floor over which the smooth barrier / graduated penalty ramp in:
-// the influence band is `[floor, floor + this]`, i.e. 4yd → 8yd. Above it there is no
-// effect at all.
+// Distance beyond the 4yd peak over which the graduated penalty / MPC keep-out ramp in: the
+// influence band is `[4, 4 + this]`, i.e. 4yd → 8yd. Above it there is no effect at all.
 const SAME_TEAM_SEPARATION_INFLUENCE_YARDS: f64 = 4.0;
-// Base points of the graduated proximity reward penalty at the 4-yard floor (rises past
-// it, quadratically decays to 0 by 8yd). Large among the dense shaping terms so crowding
-// is a genuinely "huge" cost, but still inside `reward.dense_shaping_budget_points`.
-const SAME_TEAM_PROXIMITY_PENALTY_POINTS: f64 = 0.8;
+// Base points of the graduated proximity reward penalty at the 4-yard peak (rises further as the
+// gap collapses, quadratically decays to 0 by 8yd). Deliberately large — the biggest of the dense
+// shaping terms so crowding a teammate is a genuinely "huge" cost — but still inside
+// `reward.dense_shaping_budget_points` (12.0). This is the primary dial for how hard it bites.
+const SAME_TEAM_PROXIMITY_PENALTY_POINTS: f64 = 1.5;
 // Multiplier applied to a same-team MPC obstacle's avoidance weight when the floor is in
 // force, so the planner treats an imminent teammate crossing as a strong route cost.
 const SAME_TEAM_MPC_OBSTACLE_WEIGHT_GAIN: f64 = 1.6;
@@ -2896,51 +2896,10 @@ pub(crate) fn nearest_same_team_distance_for_floor(
     nearest.is_finite().then_some(nearest)
 }
 
-/// Smoothly damp a player's velocity so it can never carry them across the 4-yard same-team
-/// separation floor: for each non-exempt teammate, the component of velocity directed TOWARD
-/// that teammate is scaled down (smoothstep) as the gap closes to the floor, reaching zero
-/// exactly at the floor — a smooth deceleration, not a hard stop. Tangential and outward
-/// motion is untouched, so a crowded player can still slide around or peel away freely.
-/// `obstacles` = `(teammate_position, exempt)` where `exempt` means both players are inside
-/// an 18-yard box.
-pub(crate) fn apply_same_team_separation_barrier(
-    me_pos: Vec2,
-    velocity: Vec2,
-    obstacles: &[(Vec2, bool)],
-    dt: f64,
-) -> Vec2 {
-    if dt <= 0.0 || !me_pos.x.is_finite() || !me_pos.y.is_finite() {
-        return velocity;
-    }
-    let floor = SAME_TEAM_MIN_SEPARATION_YARDS;
-    let influence = floor + SAME_TEAM_SEPARATION_INFLUENCE_YARDS;
-    let mut v = velocity;
-    for &(other_pos, exempt) in obstacles {
-        if exempt || !other_pos.x.is_finite() || !other_pos.y.is_finite() {
-            continue;
-        }
-        let delta = other_pos - me_pos; // points toward the teammate
-        let dist = delta.len();
-        if !dist.is_finite() || dist <= 1e-6 || dist >= influence {
-            continue;
-        }
-        let radial = delta * (1.0 / dist); // unit vector toward the teammate
-        let inward = v.dot(radial); // + = closing the gap
-        if inward <= 0.0 {
-            continue; // moving away / purely tangential: never constrained
-        }
-        // Smoothstep ramp: full inward speed allowed at/beyond the influence radius,
-        // tapering (C1-continuous) to zero at the floor — a gentle deceleration.
-        let x = ((dist - floor) / (influence - floor)).clamp(0.0, 1.0);
-        let ramp = x * x * (3.0 - 2.0 * x);
-        // Hard safety: also never close more than the remaining gap within this tick.
-        let physical_cap = ((dist - floor) / dt).max(0.0);
-        let allowed_inward = (inward * ramp).min(physical_cap);
-        // Rebuild the velocity with the reduced inward component (tangential preserved).
-        v = v + radial * (allowed_inward - inward);
-    }
-    v
-}
+// NOTE: an earlier design also damped a player's velocity to physically prevent crossing inside
+// 4yd (a "hard floor"). That was removed on purpose: per the directive it is NOT a hard floor —
+// closing inside 4yd is permitted, it just draws a strong/huge crowding penalty (the graduated
+// reward term below) plus an MPC route cost. The 4yd line lives on only as the penalty's peak.
 
 // The "hard" (tighter) overlap band of the legacy soft-spacing framework. Raised to 0.80 of the
 // minimum-spacing radius so it lands at 4yd outside the box (5 * 0.80) — deliberately aligned
