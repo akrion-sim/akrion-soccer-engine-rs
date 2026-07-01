@@ -308,6 +308,102 @@ pub fn report_winger_pinch_training(
 }
 
 impl WorldSnapshot {
+    /// Build the [`WingerPinchInputs`] for a wide attacker whose team is attacking in the final
+    /// third — the same POMDP context [`WorldSnapshot::winger_pinch_target_for`] derives, plus the
+    /// openness of the two arrival points. `None` when the winger-pinch recogniser does not apply
+    /// to `player` (not a wide attacker in possession in the final third off the ball).
+    pub(crate) fn build_winger_pinch_inputs(
+        &self,
+        player: &PlayerSnapshot,
+    ) -> Option<WingerPinchInputs> {
+        if self.possession_team() != Some(player.team)
+            || self.ball.holder == Some(player.id)
+            || player.controller_slot.is_some()
+            || !self.is_wide_attacker(player)
+            || self.active_set_play.is_some()
+        {
+            return None;
+        }
+        let attacked_goal_y = player.team.goal_y(self.field_length);
+        if !ball_in_attacking_final_third(self.ball.position.y, attacked_goal_y, self.field_length) {
+            return None;
+        }
+        let dir = player.team.attack_dir();
+        let center_x = self.field_width * 0.5;
+        let crosser = self
+            .ball
+            .holder
+            .and_then(|h| self.players.iter().find(|p| p.id == h))
+            .filter(|p| p.team == player.team)
+            .map(|p| self.player_snapshot_position(p))
+            .unwrap_or(self.ball.position);
+        let my_side = (player.home_position.x - center_x).signum();
+        let ball_side = (crosser.x - center_x).signum();
+        let ball_on_my_flank = my_side != 0.0 && my_side == ball_side;
+        let crossing_position_on = winger_pinch::flank_final_third_crash_box_geometry(
+            crosser,
+            attacked_goal_y,
+            self.field_width,
+            self.field_length,
+        );
+        let depth_frac = winger_pinch::final_third_depth_frac(
+            self.ball.position.y,
+            attacked_goal_y,
+            self.field_length,
+        );
+        let box_congestion = self
+            .players
+            .iter()
+            .filter(|p| {
+                p.team == player.team
+                    && p.id != player.id
+                    && self.ball.holder != Some(p.id)
+                    && matches!(p.role, PlayerRole::Forward | PlayerRole::Midfielder)
+                    && self
+                        .point_in_own_penalty_area(player.team.other(), self.player_snapshot_position(p))
+            })
+            .count();
+        let back_post_probe = winger_pinch::winger_pinch_target(
+            winger_pinch::WingerPinchChoice::PinchBackPost,
+            player.home_position.x,
+            attacked_goal_y,
+            dir,
+            self.field_width,
+            self.field_length,
+        );
+        let half_space_probe = winger_pinch::winger_pinch_target(
+            winger_pinch::WingerPinchChoice::PinchHalfSpace,
+            player.home_position.x,
+            attacked_goal_y,
+            dir,
+            self.field_width,
+            self.field_length,
+        );
+        let back_post_offside = back_post_probe
+            .map(|probe| self.position_would_be_offside(player.team, probe))
+            .unwrap_or(true);
+        let openness = |probe: Option<Vec2>| {
+            probe
+                .map(|p| (self.nearest_opponent_distance_at(player.team, p) / 12.0).clamp(0.0, 1.0))
+                .unwrap_or(0.0)
+        };
+
+        Some(WingerPinchInputs {
+            ball_on_my_flank: ball_on_my_flank as i32 as f64,
+            crossing_position_on: crossing_position_on as i32 as f64,
+            depth_frac,
+            box_congestion: (box_congestion as f64 / 4.0).clamp(0.0, 1.0),
+            back_post_offside: back_post_offside as i32 as f64,
+            back_post_space: openness(back_post_probe),
+            half_space_space: openness(half_space_probe),
+            dist_to_ball: (self
+                .player_snapshot_position(player)
+                .distance(self.ball.position)
+                / 40.0)
+                .clamp(0.0, 1.0),
+        })
+    }
+
     /// The model's signed pinch bias in `(-1, 1)`, or `None` when gated off / degenerate.
     pub(crate) fn winger_pinch_bias(&self, inputs: &WingerPinchInputs) -> Option<f64> {
         if !winger_pinch_model_enabled() {
