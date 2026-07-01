@@ -610,6 +610,13 @@ pub struct SoccerMatch {
     pub(crate) pass_lane_yield_samples: Vec<PassLaneYieldSample>,
     /// Open pass-lane yield decisions awaiting their windowed reward.
     pub(crate) pending_pass_lane_yield: Vec<PendingPassLaneYieldDecision>,
+    /// The trained head-scan effort head, when present. `None` ⇒ analytic seed. Shared into each
+    /// [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) head_scan_head: Option<std::sync::Arc<HeadScanHead>>,
+    /// Rolling RL corpus for the head-scan head. Collected only while the model is enabled.
+    pub(crate) head_scan_samples: Vec<HeadScanSample>,
+    /// Open head-scan decisions awaiting their windowed reward.
+    pub(crate) pending_head_scan: Vec<PendingHeadScanDecision>,
     /// The trained long-pass run head (which attacker should break forward so a deep carrier
     /// can pick them out), when present. Carried + trained across games by the learner; `None`
     /// ⇒ the analytic `backfield_long_pass_run_invite_for` seed. Shared into each
