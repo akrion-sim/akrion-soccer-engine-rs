@@ -8562,6 +8562,9 @@ impl SoccerMatch {
         // Learnable receive-approach RL samples (no-op + byte-identical unless
         // `DD_SOCCER_ENABLE_RECEIVE_APPROACH_MODEL` is set).
         self.collect_receive_approach_rl_samples(&next_snapshot);
+        // Learnable lane-affinity (break-out vs hold) RL samples (no-op under test /
+        // when disabled; live in prod, seeded by the ≈0 analytic prior).
+        self.collect_lane_affinity_rl_samples(&next_snapshot);
         self.collect_long_pass_run_rl_samples(&next_snapshot);
         // Learnable give-and-go / wall-pass appetite RL samples (no-op + byte-identical unless
         // `DD_SOCCER_ENABLE_LEARNED_GIVE_AND_GO` is set).
