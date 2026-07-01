@@ -44468,6 +44468,12 @@ impl WorldSnapshot {
         {
             return None;
         }
+        // Learnable crash-commit (MDP/POMDP): the geometric trigger is a predilection — the
+        // attacker may CHOOSE to hold (recycle / cut-back) instead of gambling into a full box.
+        // Always false when the model is off ⇒ byte-identical (the crash fires as before).
+        if self.crash_box_should_hold(player) {
+            return None;
+        }
         let dir = player.team.attack_dir();
         let center_x = self.field_width * 0.5;
         let goal_y = player.team.goal_y(self.field_length);
