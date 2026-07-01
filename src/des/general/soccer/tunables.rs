@@ -490,6 +490,19 @@ pub struct RewardTunables {
     pub concede_keeper_defender_penalty: f64,
     /// Penalty when conceding, for an outfield non-defender. Was `2.0`.
     pub concede_outfield_penalty: f64,
+    /// Concede penalty for a goalkeeper/defender when the **concede-symmetry rebalance** is
+    /// active (`DD_SOCCER_ENABLE_CONCEDE_SYMMETRY`). Moves the concede *stick* up toward the
+    /// `goal_scored_points` *carrot* so conceding is a genuine counterweight to scoring rather
+    /// than a token cost (default 8.0 is ~12× lighter than a +100 goal). Unused unless the gate
+    /// is on. Default `100.0` — full parity with a goal for the back line most responsible for
+    /// preventing one.
+    pub concede_keeper_defender_penalty_symmetric: f64,
+    /// Concede penalty for an outfield non-defender under the concede-symmetry rebalance:
+    /// meaningful but below the back line's share (an outfielder is less responsible for a
+    /// concede, mirroring how the back line is less responsible for a goal — the goal carrot is
+    /// flat team-wide, so the concede stick keeps a role gradient). Unused unless
+    /// `DD_SOCCER_ENABLE_CONCEDE_SYMMETRY` is on. Default `60.0`.
+    pub concede_outfield_penalty_symmetric: f64,
     /// Shaping reward for easing out of a sustained teammate overlap. Was the
     /// `TEAMMATE_SPACING_OVERLAP_RELIEF_REWARD` const.
     pub teammate_overlap_relief_reward: f64,
