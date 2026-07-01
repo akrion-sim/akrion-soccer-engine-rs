@@ -15826,13 +15826,17 @@ impl SoccerMatch {
             } else {
                 keepout_weight * 0.25
             } * kinematic_weight;
-            // Same-team 4yd floor: inflate the keep-out to the floor + strengthen the route
-            // cost so the executed plan avoids crowding a teammate (unless both are in a box).
+            // Same-team floor: set the MPC keep-out to the full INFLUENCE radius (8yd) so the
+            // point-mass penalty `weight·(radius−d)²` is felt increasingly from 7→6→5→4yd (the
+            // same graduated shape as the reward), not just inside 4yd. The hard 4yd floor is the
+            // barrier's job; this makes the planned route bend away from a teammate ever more
+            // strongly as it closes in. Waived when both are in a box.
             if !opponent && separation_floor_on {
                 let both_in_box =
                     me_in_box && self.point_in_either_penalty_area(other.position);
                 if !both_in_box {
-                    radius = radius.max(SAME_TEAM_MIN_SEPARATION_YARDS);
+                    radius = radius
+                        .max(SAME_TEAM_MIN_SEPARATION_YARDS + SAME_TEAM_SEPARATION_INFLUENCE_YARDS);
                     weight *= SAME_TEAM_MPC_OBSTACLE_WEIGHT_GAIN;
                 }
             }
