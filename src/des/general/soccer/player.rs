@@ -6437,6 +6437,7 @@ impl PlayerAgent {
             check_to_ball: snapshot.check_to_ball_target_for(self.id, self.home_position),
             in_behind: snapshot.in_behind_run_target_for(self.id),
             exploit_space: snapshot.exploit_space_run_target_for(self.id, self.home_position),
+            forward_receive: snapshot.open_forward_receive_run_target_for(self.id, self.home_position),
             wide_outlet: snapshot.wide_possession_outlet_target_for(self.id, self.home_position),
             flank_cross_arrival: snapshot
                 .flank_cross_arrival_target_for(self.id, self.home_position),
@@ -6567,13 +6568,26 @@ impl PlayerAgent {
                 true,
             ));
         }
-        if let Some(target) = special_targets.exploit_space {
-            let target = guarded_exploit_space_target(target);
+        if let Some(target) = special_targets
+            .forward_receive
+            .or(special_targets.exploit_space)
+        {
+            let target = if special_targets.forward_receive.is_some() {
+                target
+            } else {
+                guarded_exploit_space_target(target)
+            };
+            let forward_receive_lift = if special_targets.forward_receive.is_some() {
+                0.48 + holder_pressure_urgency * 0.10
+            } else {
+                0.0
+            };
             options.push(AgentActionOptionTrace::new(
                 "exploit-space-run",
                 special_score(
                     target,
-                    0.66 + shape_support_urgency * 0.16
+                    0.66 + forward_receive_lift
+                        + shape_support_urgency * 0.16
                         + holder_pressure_urgency * 0.14
                         + if advance_upfield_strategy_active {
                             0.26
@@ -6791,6 +6805,8 @@ impl PlayerAgent {
         {
             let strategy_floor = if exploit_space_strategy_active {
                 0.42
+            } else if special_targets.forward_receive.is_some() {
+                0.36
             } else {
                 0.0
             };
@@ -6807,6 +6823,9 @@ impl PlayerAgent {
                     },
                 );
             ensure_min_legal_option_probability(&mut options, "exploit-space-run", exploit_floor);
+            if special_targets.forward_receive.is_some() {
+                ensure_min_legal_option_probability(&mut options, "exploit-space-run", 0.58);
+            }
         }
         if options
             .iter()
@@ -9856,6 +9875,12 @@ impl PlayerAgent {
                 ));
                 if scoop_strategy_requested {
                     ensure_min_legal_option_probability(&mut action_options, "scoop-pass", 0.64);
+                } else if dd_soccer_enable_scoop_lane_blocked() {
+                    // Live-frequency bias: a scoop is only ever offered into a genuinely blocked
+                    // lane to an open man (every geometry check in `scoop_pass_target_for` passed),
+                    // so floor its propensity enough to compete with a carry / square ball instead
+                    // of being buried by the policy. Off ⇒ unchanged (technique-scored only).
+                    ensure_min_legal_option_probability(&mut action_options, "scoop-pass", 0.52);
                 }
             }
             let wall_pass_option = snapshot.wall_pass_option_for(self.id).map(|plan| {
@@ -11770,12 +11795,19 @@ impl PlayerAgent {
                         }
                     }),
                     "exploit-space-run" => {
-                        support_context.special_targets.exploit_space.map(|point| {
+                        if let Some(point) = support_context.special_targets.forward_receive {
+                            Some(SupportMovementTarget {
+                                point,
+                                action_label: "exploit-space-run",
+                            })
+                        } else {
+                            support_context.special_targets.exploit_space.map(|point| {
                             SupportMovementTarget {
                                 point: guarded_support_special(point),
                                 action_label: "exploit-space-run",
                             }
                         })
+                        }
                     }
                     "wide-outlet" => support_context.special_targets.wide_outlet.map(|point| {
                         SupportMovementTarget {
@@ -12085,12 +12117,17 @@ impl PlayerAgent {
                     })
                     .map(|player| player.position.distance(movement_target))
                     .fold(f64::INFINITY, f64::min);
-                loose_ball_pressured_sprint = self.role != PlayerRole::Goalkeeper
+                loose_ball_pressured_sprint = (self.role != PlayerRole::Goalkeeper
                     && self.position.distance(movement_target)
                         > LOOSE_BALL_PRESSURED_SPRINT_MIN_DISTANCE_YARDS
                     && (fifty_fifty_duel
                         || nearest_opponent_to_ball
-                            <= LOOSE_BALL_PRESSURED_SPRINT_OPPONENT_RADIUS_YARDS);
+                            <= LOOSE_BALL_PRESSURED_SPRINT_OPPONENT_RADIUS_YARDS))
+                    // Match the opponent's committed pace: if a nearby opponent is
+                    // running/sprinting this ball down, our elected chaser sprints to
+                    // keep up even when the proximity gate above would not have fired.
+                    || snapshot
+                        .loose_ball_opponent_pace_match_sprint(self.id, movement_target);
                 (
                     SoccerAction::MoveTo(movement_target),
                     ACTION_LABEL_RECOVER.to_string(),
