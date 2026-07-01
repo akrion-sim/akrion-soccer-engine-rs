@@ -556,6 +556,7 @@ pub struct SoccerLearningPgStore {
     /// Retained so a connection dropped mid-session (e.g. RDS failover, idle socket reaped)
     /// can be rebuilt — `connect_with_retry` originally covered only the first connect.
     database_url: String,
+    policy_retention_schema_ready: bool,
 }
 
 impl SoccerLearningPgStore {
@@ -571,6 +572,7 @@ impl SoccerLearningPgStore {
             soccer_learning_pg_connect_max_attempts(),
         )?;
         self.client = rebuilt.client;
+        self.policy_retention_schema_ready = rebuilt.policy_retention_schema_ready;
         Ok(())
     }
 
@@ -584,6 +586,22 @@ impl SoccerLearningPgStore {
             );
             self.reconnect()?;
         }
+        Ok(())
+    }
+
+    fn ensure_policy_retention_schema_ready(&mut self) -> Result<(), String> {
+        if self.policy_retention_schema_ready {
+            return Ok(());
+        }
+        self.ensure_connected()?;
+        let mut tx = self
+            .client
+            .transaction()
+            .map_err(|err| format!("begin soccer policy retention schema transaction: {err}"))?;
+        ensure_soccer_learning_policy_retention_columns(&mut tx)?;
+        tx.commit()
+            .map_err(|err| format!("commit soccer policy retention schema transaction: {err}"))?;
+        self.policy_retention_schema_ready = true;
         Ok(())
     }
 
@@ -713,6 +731,7 @@ impl SoccerLearningPgStore {
                     return Ok(Self {
                         client,
                         database_url: database_url.to_string(),
+                        policy_retention_schema_ready: false,
                     });
                 }
                 Err(err) => {
@@ -1546,11 +1565,11 @@ impl SoccerLearningPgStore {
         );
         let visit_count = checked_i64(policies.home.visit_count() + policies.away.visit_count());
         let fitness_micros = soccer_learning_to_micros(fitness);
+        self.ensure_policy_retention_schema_ready()?;
         let mut tx = self
             .client
             .transaction()
             .map_err(|err| format!("begin soccer policy version transaction: {err}"))?;
-        ensure_soccer_learning_policy_retention_columns(&mut tx)?;
         let branch_key = soccer_policy_branch_key_for_insert(
             &mut tx,
             parent_policy_version_id,
@@ -2625,11 +2644,11 @@ impl SoccerLearningPgStore {
                 .sum::<u64>(),
         );
 
+        self.ensure_policy_retention_schema_ready()?;
         let mut tx = self
             .client
             .transaction()
             .map_err(|err| format!("begin soccer set-play training transaction: {err}"))?;
-        ensure_soccer_learning_policy_retention_columns(&mut tx)?;
         ensure_soccer_learning_set_play_tables(&mut tx)?;
         let policy_version_id = Uuid::new_v4().to_string();
         let retention_kind = SOCCER_POLICY_RETENTION_BRANCH_TIP;
