@@ -154,7 +154,8 @@ impl WorldSnapshot {
 
         // Find the best far team-mate F such that I (the middle) am the sole blocker of the
         // carrier→F lane, and F is a genuinely longer, productive option than me.
-        let mut best: Option<(usize, Vec2, f64)> = None; // (far_id, far_pos, value)
+        // (far_id, far_pos, value, forward_gain, openness, lane_len)
+        let mut best: Option<(usize, Vec2, f64, f64, f64, f64)> = None;
         for far in self.players.iter() {
             if far.id == player_id || far.id == carrier_id || far.team != me.team {
                 continue;
