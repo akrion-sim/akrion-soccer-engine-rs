@@ -570,6 +570,9 @@ impl Default for RewardTunables {
             giveaway_to_opponent_opp_half_penalty: 2.2,
             giveaway_to_loose_own_half_penalty: 0.85,
             giveaway_to_loose_opp_half_penalty: 0.55,
+            loose_ball_uncontested_penalty_per_second: 0.30,
+            loose_ball_uncontested_penalty_max: 1.2,
+            loose_ball_win_points: 1.5,
             pitch_value_threat_delta_points: 12.0,
             dense_shaping_budget_points: 12.0,
         }
