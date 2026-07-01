@@ -23450,7 +23450,8 @@ fn dd_soccer_enable_defensive_shepherd() -> bool {
     }
 }
 
-/// Press-cover hardening gate (default OFF ⇒ byte-identical). When on, a single cover
+/// Press-cover hardening gate. Default-ON in prod (kill switch `DD_SOCCER_ENABLE_PRESS_COVER=0`);
+/// default-OFF under test ⇒ byte-identical. When on, a single cover
 /// defender tucks goal-side behind the lone presser so a beaten press meets immediate
 /// second pressure rather than a clean run at the back line. See
 /// [`WorldSnapshot::press_cover_target_for`].
