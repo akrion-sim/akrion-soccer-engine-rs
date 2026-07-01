@@ -247,12 +247,18 @@ impl WorldSnapshot {
                 break;
             }
         }
-        let (spot, _) = chosen?;
-        // Keep the yield home-aware: a defender shouldn't bolt miles from its slot. Blend a
-        // touch toward the home slot only as a tiebreak via the existing strength scaling.
-        let _ = home_position;
-        let strength = (raw_value / 14.0).clamp(0.0, 1.0);
-        Some((spot, strength))
+        let (spot, spot_space) = chosen?;
+        let base_strength = (raw_value / 14.0).clamp(0.0, 1.0);
+        let inputs = super::PassLaneYieldInputs {
+            forward_gain: (best_forward_gain / 20.0).clamp(0.0, 1.0),
+            far_openness: best_openness.clamp(0.0, 1.0),
+            lane_len: (best_lane_len / 40.0).clamp(0.0, 1.0),
+            dist_from_carrier: (me_from_carrier / 30.0).clamp(0.0, 1.0),
+            spot_space: (spot_space / 18.0).clamp(0.0, 1.0),
+            is_defender: (me.role == PlayerRole::Defender) as i32 as f64,
+            base_strength,
+        };
+        Some((inputs, spot, base_strength))
     }
 }
 
