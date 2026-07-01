@@ -44234,8 +44234,22 @@ pub struct SoccerLiveHttpBridge {
 impl SoccerLiveHttpBridge {
     pub fn new(config: SoccerLiveServerConfig) -> Self {
         let server = SoccerLiveServer::new(config);
+        let session = server.session;
+        // dd-soccer-rs (and other embedders) construct the bridge but never call
+        // `SoccerLiveServer::run()`, which is where the cluster-learner policy hot-swap loop
+        // is normally started. Start it here too — otherwise the embedding server would only
+        // ever serve the local-file fallback and never reflect the RDS learning.
+        #[cfg(feature = "postgres-persistence")]
+        {
+            let refresh_session = Arc::clone(&session);
+            let config = {
+                let guard = soccer_mutex_lock(&refresh_session, "soccer_live_session");
+                guard.sim.config.clone()
+            };
+            start_soccer_live_pg_policy_refresh(refresh_session, config);
+        }
         SoccerLiveHttpBridge {
-            session: server.session,
+            session,
             input_queue: server.input_queue,
             controller_input_router: server.controller_input_router,
         }
