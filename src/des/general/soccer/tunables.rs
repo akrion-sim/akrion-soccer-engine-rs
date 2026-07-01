@@ -3191,6 +3191,30 @@ impl RewardTunables {
         );
         validate_f64(
             prefix,
+            "loose_ball_uncontested_penalty_per_second",
+            self.loose_ball_uncontested_penalty_per_second,
+            0.0,
+            50.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "loose_ball_uncontested_penalty_max",
+            self.loose_ball_uncontested_penalty_max,
+            0.0,
+            100.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "loose_ball_win_points",
+            self.loose_ball_win_points,
+            0.0,
+            200.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
             "pitch_value_threat_delta_points",
             self.pitch_value_threat_delta_points,
             0.0,
