@@ -2114,6 +2114,25 @@ fn run_game(
             final_loss
         );
     }
+    // Train the CARRIED lane-affinity head on this game's reward-weighted RL corpus
+    // (whether breaking out of / holding the lane improved territorial control). Empty +
+    // skipped unless the lane-affinity model is enabled (on by default in prod).
+    let lane_affinity_samples = sim.drain_lane_affinity_samples();
+    if !lane_affinity_samples.is_empty() {
+        let mut guard = CARRIED_LANE_AFFINITY_HEAD.lock().unwrap();
+        let head = guard.get_or_insert_with(|| LaneAffinityHead::new(episode_seed as u32));
+        let mut final_loss = 0.0;
+        for _ in 0..4 {
+            final_loss = head.train_reward_weighted(&lane_affinity_samples, 0.02);
+        }
+        eprintln!(
+            "lane_affinity_training samples={} training_steps={} consumed={} final_loss={:.5}",
+            lane_affinity_samples.len(),
+            head.training_steps(),
+            head.training_steps() >= LANE_AFFINITY_HEAD_MIN_TRAINING_STEPS,
+            final_loss
+        );
+    }
     // Train the CARRIED long-pass run head on this game's reward-weighted RL corpus (which
     // attacker breaking forward led to the team advancing the ball). Empty + skipped unless
     // DD_SOCCER_ENABLE_LEARNED_LONG_PASS_RUN is set.
