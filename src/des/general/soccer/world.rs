@@ -16178,8 +16178,15 @@ impl SoccerMatch {
                 let both_in_box =
                     me_in_box && self.point_in_either_penalty_area(other.position);
                 if !both_in_box {
+                    // Learnable desired separation (MDP/POMDP): the 8yd keep-out influence is a
+                    // predilection — the player may learn to spread WIDER (stretch build-up) or
+                    // combine TIGHTER (link in the box) per situation. `separation_floor_on` is
+                    // off under test, and the modulation is 0 unless its own model gate is on ⇒
+                    // byte-identical fallback to the fixed 8yd radius.
+                    let base_influence =
+                        SAME_TEAM_MIN_SEPARATION_YARDS + SAME_TEAM_SEPARATION_INFLUENCE_YARDS;
                     radius = radius
-                        .max(SAME_TEAM_MIN_SEPARATION_YARDS + SAME_TEAM_SEPARATION_INFLUENCE_YARDS);
+                        .max(self.separation_floor_influence_radius(player_id, base_influence));
                     weight *= SAME_TEAM_MPC_OBSTACLE_WEIGHT_GAIN;
                 }
             }
