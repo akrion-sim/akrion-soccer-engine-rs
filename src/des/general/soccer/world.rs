@@ -22378,6 +22378,11 @@ pub struct WorldSnapshot {
     /// decision aid; Default = None).
     #[serde(skip)]
     pub(crate) line_depth_head: Option<std::sync::Arc<BackFourLineHead>>,
+    /// The trained per-defender individual line head, carried from the match for live
+    /// consumption in `back_four_individual_push_delta`. `None` ⇒ the analytic seed
+    /// (parity). Skipped by serde (an internal decision aid; Default = None).
+    #[serde(skip)]
+    pub(crate) defender_line_head: Option<std::sync::Arc<DefenderLinePolicyHead>>,
     /// Held back-four line-centre depth (yd from own goal) per team (Home=0, Away=1), copied from the
     /// match's sticky latch so the live line chokepoint reads the LATCHED centre instead of
     /// recomputing it every tick. `None` ⇒ compute fresh (sticky anchor off, or not yet set).
