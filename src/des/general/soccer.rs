@@ -100,6 +100,8 @@ mod goal_side_recovery_decision;
 pub use goal_side_recovery_decision::*;
 mod winger_pinch_decision;
 pub use winger_pinch_decision::*;
+mod separation_floor_decision;
+pub use separation_floor_decision::*;
 mod policy_select;
 pub use policy_select::*;
 mod pass_lane_yield;
