@@ -51968,6 +51968,7 @@ fn tracking_frame_to_world_snapshot(
         loose_ball_commit_head: None,
         receive_approach_head: None,
         lane_affinity_head: None,
+        goal_side_recovery_head: None,
         long_pass_run_head: None,
         give_and_go_head: None,
         attack_spacing_head: None,
