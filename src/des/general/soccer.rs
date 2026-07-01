@@ -19163,6 +19163,14 @@ pub(crate) enum SoccerRewardEventKind {
     /// Bounded shaped credit for an attacker having crashed into the box as a flank aerial
     /// cross is released — the off-ball "be there for the delivery" signal.
     CrashBoxArrival,
+    /// PENALTY (negative): the negative MIRROR of [`CrashBoxArrival`]. A qualifying flank aerial
+    /// cross was delivered into the box but too few attackers crashed in; the attacking-role
+    /// no-shows nearest the box who should have completed the run are charged a small bounded
+    /// "you weren't there for the delivery" penalty (capped at the runner shortfall). The direct
+    /// off-ball learning signal that failing to attack the box on a good cross is a mistake, not
+    /// just that arriving is nice. Emitted only when `DD_SOCCER_ENABLE_CRASH_BOX_NO_SHOW_PENALTY`
+    /// is on. See [`crash_box`] and `penalize_flank_crash_box_no_shows`.
+    CrashBoxNoShow,
     /// PENALTY (negative): a Forward / winger isolated in the attacking half with no teammate
     /// ahead played a panicked BACKWARD/square pass instead of driving at goal or holding the
     /// ball up for support. The direct learning signal that trains the policy off the
