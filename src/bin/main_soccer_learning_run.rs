@@ -1910,6 +1910,14 @@ static CARRIED_GIVE_AND_GO_HEAD: std::sync::Mutex<Option<GiveAndGoHead>> =
 static CARRIED_RECEIVE_APPROACH_HEAD: std::sync::Mutex<Option<ReceiveApproachHead>> =
     std::sync::Mutex::new(None);
 
+/// In-memory lane-affinity head (whether an out-of-lane player breaks out or is held
+/// back into its channel), carried + trained across games WITHIN a learner process,
+/// mirroring `CARRIED_RECEIVE_APPROACH_HEAD`. Resets on pod restart; the seam is on by
+/// default in prod (seeded by the analytic prior) so the head is consumed live once it
+/// crosses `LANE_AFFINITY_HEAD_MIN_TRAINING_STEPS`.
+static CARRIED_LANE_AFFINITY_HEAD: std::sync::Mutex<Option<LaneAffinityHead>> =
+    std::sync::Mutex::new(None);
+
 /// In-memory learned pass-completion head, carried + trained across games WITHIN a learner
 /// process (seeded once from the Postgres corpus at startup), mirroring
 /// `CARRIED_LINE_DEPTH_HEAD`. Installed on each game so the pass-quality assessor consumes it
