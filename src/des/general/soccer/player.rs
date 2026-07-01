@@ -1113,6 +1113,22 @@ pub struct PlayerAgent {
     /// `sustained_sprint_seconds` (reset together). See its note for the gating contract.
     #[serde(default)]
     pub sustained_sprint_distance_yards: f64,
+    /// Nested same-team-proximity dwell timers (seconds) for the GRACE window on the graduated
+    /// same-team separation penalty. Each accumulates while the nearest NON-EXEMPT teammate is
+    /// within the named radius and resets the instant the player is farther than that radius —
+    /// so they never reset when merely crossing into a TIGHTER band (the user's spec: time does
+    /// not reset moving inward). The graduated penalty only accrues once ANY timer passes its
+    /// band's grace: `< 7yd → 3s`, `< 6yd → 2s`, `< 5yd → 1s`. Because the bands nest
+    /// (`lt5 ≤ lt6 ≤ lt7`), a player who eases in slowly is caught by the 7yd/3s timer while one
+    /// who dives straight inside 5yd is caught by the 5yd/1s timer. Maintained only while the
+    /// separation floor is enabled; otherwise they stay 0 and are read by nothing, so the
+    /// simulation trajectory is byte-identical. Never gate a decision off these.
+    #[serde(default)]
+    pub same_team_proximity_dwell_lt7_seconds: f64,
+    #[serde(default)]
+    pub same_team_proximity_dwell_lt6_seconds: f64,
+    #[serde(default)]
+    pub same_team_proximity_dwell_lt5_seconds: f64,
     #[serde(default)]
     pub incoming_ball: Option<IncomingBallContext>,
     pub skills: SkillProfile,
