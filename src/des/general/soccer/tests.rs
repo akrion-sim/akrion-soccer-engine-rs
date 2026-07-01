@@ -89665,6 +89665,86 @@ fn scoop_pass_is_low_and_snappy_not_a_balloon() {
     }
 }
 
+/// The "hot-air-balloon" fix: with `DD_SOCCER_ENABLE_SCOOP_LAND_AT_TARGET` on, a scoop is paced to
+/// LAND on the receiver in ~one gravity hang time instead of reaching the spot early and hovering.
+/// Two decouplings caused the float and both are asserted fixed here: (1) the apex the ball FLIES
+/// equals the apex its launch speed was PACED from (no random-vs-fixed mismatch); (2) short scoops
+/// are no longer force-floored to 16mph, so they don't cross the lane in a fraction of the hang time.
+#[test]
+fn scoop_land_at_target_kills_the_balloon_float() {
+    let _env = scoop_env_lock();
+    let skills = SkillProfile {
+        passing: 0.45,
+        passing_completion_rate: 0.50,
+        flair_passing: 0.55,
+        ..SkillProfile::default()
+    };
+    let from = Vec2::new(38.0, 48.0);
+    let skill = pass_execution_skill(&skills, PassFlight::Scoop, false);
+    for distance in [5.0_f64, 6.0, 7.0] {
+        let target = Vec2::new(38.0, 48.0 + distance);
+        let raw = pass_speed_yps_from_power(0.30, PassFlight::Scoop, false, &skills);
+
+        std::env::remove_var("DD_SOCCER_ENABLE_SCOOP_LAND_AT_TARGET");
+        let mut rng = SeededRandom::new(17);
+        let off_speed = modulated_pass_speed_yps(
+            raw, from, target, PassFlight::Scoop, false, skill, 0.70, &mut rng,
+        );
+
+        std::env::set_var("DD_SOCCER_ENABLE_SCOOP_LAND_AT_TARGET", "1");
+        let mut rng = SeededRandom::new(17);
+        let on_speed = modulated_pass_speed_yps(
+            raw, from, target, PassFlight::Scoop, false, skill, 0.70, &mut rng,
+        );
+
+        let pass = PendingPass {
+            team: Team::Home,
+            from: 4,
+            target: Some(9),
+            flight: PassFlight::Scoop,
+            is_cross: false,
+            launch_tick: 123,
+            origin: from,
+            intended_target: target,
+            distance_yards: distance,
+            receiver_openness: 0.70,
+            passer_skill: skill,
+            launch_speed_yps: on_speed,
+            receiver_position_at_launch: Some(target),
+            receiver_velocity_at_launch: Some(Vec2::zero()),
+            offside: None,
+            offside_candidates: Vec::new(),
+            learn_features: Vec::new(),
+        };
+
+        // (1) apex flown == apex the launch speed was paced from (unit 0.5, deterministic).
+        let flown_apex = pass_loft_apex_yards(&pass);
+        let paced_apex = scoop_loft_apex_yards(distance, 0.5);
+        assert!(
+            (flown_apex - paced_apex).abs() < 1e-9,
+            "flown apex {flown_apex:.3} must match paced apex {paced_apex:.3} for {distance:.0}yd"
+        );
+
+        // (2) the short scoop is no longer over-paced up to the fixed 16mph floor.
+        assert!(
+            on_speed < off_speed - 0.5,
+            "land-at-target should slow the over-paced short scoop: on {on_speed:.2} off {off_speed:.2} \
+             for {distance:.0}yd"
+        );
+
+        // (3) at that pace the ball spends most of its hang time getting there — it drops onto the
+        // man rather than arriving in a fraction of T and floating (the balloon).
+        let hang_time = 2.0 * (2.0 * flown_apex / GRAVITY_YPS2).sqrt();
+        let flight_time_const = distance / on_speed;
+        assert!(
+            flight_time_const >= hang_time * 0.55,
+            "scoop should not reach the spot in a fraction of its hang time (that is the float); \
+             got {flight_time_const:.2}s vs hang {hang_time:.2}s for {distance:.0}yd"
+        );
+    }
+    std::env::remove_var("DD_SOCCER_ENABLE_SCOOP_LAND_AT_TARGET");
+}
+
 #[test]
 fn slide_tackle_flag_defaults_on_and_respects_config() {
     // The committed slide-tackle mechanic is live by default (unless the process-wide
