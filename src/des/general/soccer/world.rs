@@ -44299,11 +44299,34 @@ impl WorldSnapshot {
                     carrier_position.distance(p),
                     current_to_carrier,
                 );
+                // Forward-run-when-unmarked bias (gated; 0.0 unless the player is unmarked and
+                // a forward-into-space option exists). An unmarked off-ball player who can go
+                // forward must not drift backward: veto backward candidates (scaled by how far
+                // back, so the least-backward is least bad), and reward a forward candidate that
+                // runs into open, receivable space.
+                let forward_run_when_unmarked_bias = if forward_run_space_available {
+                    if forward < -FORWARD_RUN_UNMARKED_DIR_EPS_YARDS {
+                        -(FORWARD_RUN_UNMARKED_BACKWARD_PENALTY_BASE
+                            + (-forward - FORWARD_RUN_UNMARKED_DIR_EPS_YARDS)
+                                * FORWARD_RUN_UNMARKED_BACKWARD_PENALTY_PER_YARD)
+                    } else if forward > FORWARD_RUN_UNMARKED_DIR_EPS_YARDS
+                        && self.nearest_opponent_distance_at(me.team, p)
+                            >= FORWARD_RUN_UNMARKED_MARK_RADIUS_YARDS
+                        && self.clear_line(self.ball.position, p, me.team.other(), 2.0)
+                    {
+                        (forward / 12.0).clamp(0.0, 1.5) * FORWARD_RUN_UNMARKED_FORWARD_BONUS
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
                 let score = occupancy.open_space_score
                     + counterattack_bonus
                     + advance_upfield_bonus
                     + goal_directness_bonus
                     + vacuum_run_bonus
+                    + forward_run_when_unmarked_bias
                     + attacking_spacing_bonus
                     + forward.max(-4.0) * (0.04 + directive.risk_tolerance * 0.08)
                     + forward_from_ball.clamp(-6.0, 28.0)
