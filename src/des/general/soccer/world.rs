@@ -15565,6 +15565,18 @@ impl SoccerMatch {
         if p.velocity.len() > SOCCER_PHYSICS_PLAYER_MAX_SPEED_YPS {
             p.velocity = p.velocity.normalized() * SOCCER_PHYSICS_PLAYER_MAX_SPEED_YPS;
         }
+        // HARD same-team separation floor: smoothly damp the finalized velocity's inward
+        // component toward any non-exempt teammate so this step can never close the gap below
+        // 4yd — a gentle deceleration approaching the floor, not a hard stop. No-op when the
+        // gate is off (the obstacle list is empty).
+        if !same_team_separation_obstacles.is_empty() {
+            p.velocity = apply_same_team_separation_barrier(
+                p.position,
+                p.velocity,
+                &same_team_separation_obstacles,
+                dt,
+            );
+        }
         let movement_facing = movement_action_facing_bucket(
             p.team,
             p.position,
