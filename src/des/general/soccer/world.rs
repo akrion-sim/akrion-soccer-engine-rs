@@ -27576,8 +27576,17 @@ impl WorldSnapshot {
                     self.field_length,
                     target_depth,
                 );
-                guarded.x +=
-                    (line_target.x - guarded.x) * goal_side::GOAL_SIDE_LATERAL_PULL_FRACTION;
+                // Learnable goal-side recovery (MDP/POMDP): the 0.35 shade is a predilection,
+                // not a fixed rule — the defender may collapse HARDER onto the central screening
+                // line or HOLD width for a wide man. Gated ON in prod (seeded by the ≈0 analytic
+                // prior ⇒ near-identical), OFF under test ⇒ base fraction unchanged (parity).
+                let pull_fraction = self.goal_side_effective_lateral_pull_fraction(
+                    player,
+                    guarded,
+                    line_target.x,
+                    goal_side::GOAL_SIDE_LATERAL_PULL_FRACTION,
+                );
+                guarded.x += (line_target.x - guarded.x) * pull_fraction;
             }
             return guarded.clamp_to_pitch(self.field_width, self.field_length);
         }
