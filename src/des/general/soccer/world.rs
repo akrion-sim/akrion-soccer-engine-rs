@@ -624,6 +624,13 @@ pub struct SoccerMatch {
     pub(crate) crash_box_samples: Vec<CrashBoxSample>,
     /// Open crash-box decisions awaiting their windowed reward.
     pub(crate) pending_crash_box: Vec<PendingCrashBoxDecision>,
+    /// The trained off-ball run-selection head, when present. `None` ⇒ analytic seed. Shared into
+    /// each [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) run_prediction_head: Option<std::sync::Arc<RunPredictionHead>>,
+    /// Rolling RL corpus for the run-selection head. Collected only while the model is enabled.
+    pub(crate) run_prediction_samples: Vec<RunPredictionSample>,
+    /// Open run-selection decisions awaiting their windowed reward.
+    pub(crate) pending_run_prediction: Vec<PendingRunPredictionDecision>,
     /// The trained long-pass run head (which attacker should break forward so a deep carrier
     /// can pick them out), when present. Carried + trained across games by the learner; `None`
     /// ⇒ the analytic `backfield_long_pass_run_invite_for` seed. Shared into each
