@@ -29484,10 +29484,14 @@ impl WorldSnapshot {
         } else {
             active_line_y
         };
-        let beyond_line = (target.y - cap_y) * attack > 0.0;
+        // Learnable onside-support gamble (MDP/POMDP): the cap-at-the-line is a predilection — the
+        // attacker may push onto / a yard beyond the shoulder (time a break) or tuck deeper. Push is
+        // 0 when the model is off ⇒ cap stays exactly at the line (byte-identical).
+        let effective_cap_y = cap_y + self.onside_support_push_yards(player) * attack;
+        let beyond_line = (target.y - effective_cap_y) * attack > 0.0;
         let in_attacking_half = (target.y - half_line) * attack > 0.0;
         if in_attacking_half && beyond_line {
-            target.y = cap_y;
+            target.y = effective_cap_y;
         }
         target.clamp_to_pitch(self.field_width, self.field_length)
     }
