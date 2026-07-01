@@ -581,6 +581,14 @@ pub struct SoccerMatch {
     pub(crate) lane_affinity_samples: Vec<LaneAffinitySample>,
     /// Open lane-affinity decisions awaiting their windowed reward.
     pub(crate) pending_lane_affinity: Vec<PendingLaneAffinityDecision>,
+    /// The trained goal-side recovery head (how hard a recovering defender collapses onto the
+    /// ball→goal line vs. holds width), when present. `None` ⇒ analytic seed. Shared into each
+    /// [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) goal_side_recovery_head: Option<std::sync::Arc<GoalSideRecoveryHead>>,
+    /// Rolling RL corpus for the goal-side recovery head. Collected only while the model is enabled.
+    pub(crate) goal_side_recovery_samples: Vec<GoalSideRecoverySample>,
+    /// Open goal-side recovery decisions awaiting their windowed reward.
+    pub(crate) pending_goal_side_recovery: Vec<PendingGoalSideRecoveryDecision>,
     /// The trained long-pass run head (which attacker should break forward so a deep carrier
     /// can pick them out), when present. Carried + trained across games by the learner; `None`
     /// ⇒ the analytic `backfield_long_pass_run_invite_for` seed. Shared into each
@@ -3132,6 +3140,9 @@ impl SoccerMatch {
             lane_affinity_head: None,
             lane_affinity_samples: Vec::new(),
             pending_lane_affinity: Vec::new(),
+            goal_side_recovery_head: None,
+            goal_side_recovery_samples: Vec::new(),
+            pending_goal_side_recovery: Vec::new(),
             long_pass_run_head: None,
             long_pass_run_samples: Vec::new(),
             pending_long_pass_run: Vec::new(),
@@ -8630,6 +8641,9 @@ impl SoccerMatch {
         // Learnable lane-affinity (break-out vs hold) RL samples (no-op under test /
         // when disabled; live in prod, seeded by the ≈0 analytic prior).
         self.collect_lane_affinity_rl_samples(&next_snapshot);
+        // Learnable goal-side recovery (collapse-onto-line vs hold-width) RL samples (no-op
+        // under test / when disabled; live in prod, seeded by the ≈0 analytic prior).
+        self.collect_goal_side_recovery_rl_samples(&next_snapshot);
         self.collect_long_pass_run_rl_samples(&next_snapshot);
         // Learnable give-and-go / wall-pass appetite RL samples (no-op + byte-identical unless
         // `DD_SOCCER_ENABLE_LEARNED_GIVE_AND_GO` is set).
@@ -22167,6 +22181,10 @@ pub struct WorldSnapshot {
     /// (parity). Skipped by serde (an internal decision aid; Default = None).
     #[serde(skip)]
     pub(crate) lane_affinity_head: Option<std::sync::Arc<LaneAffinityHead>>,
+    /// The trained goal-side recovery head, carried from the match for live consumption in the
+    /// goal-side lateral-pull seam. `None` ⇒ analytic seed (parity). Skipped by serde.
+    #[serde(skip)]
+    pub(crate) goal_side_recovery_head: Option<std::sync::Arc<GoalSideRecoveryHead>>,
     /// The trained long-pass run head, carried from the match for live consumption in
     /// `backfield_long_pass_run_invite_for`. `None` ⇒ analytic seed (parity). Skipped by
     /// serde (an internal decision aid; Default = None).
@@ -24842,6 +24860,7 @@ impl WorldSnapshot {
             loose_ball_commit_head: m.loose_ball_commit_head.clone(),
             receive_approach_head: m.receive_approach_head.clone(),
             lane_affinity_head: m.lane_affinity_head.clone(),
+            goal_side_recovery_head: m.goal_side_recovery_head.clone(),
             long_pass_run_head: m.long_pass_run_head.clone(),
             give_and_go_head: m.give_and_go_head.clone(),
             attack_spacing_head: m.attack_spacing_head.clone(),
@@ -27576,8 +27595,17 @@ impl WorldSnapshot {
                     self.field_length,
                     target_depth,
                 );
-                guarded.x +=
-                    (line_target.x - guarded.x) * goal_side::GOAL_SIDE_LATERAL_PULL_FRACTION;
+                // Learnable goal-side recovery (MDP/POMDP): the 0.35 shade is a predilection,
+                // not a fixed rule — the defender may collapse HARDER onto the central screening
+                // line or HOLD width for a wide man. Gated ON in prod (seeded by the ≈0 analytic
+                // prior ⇒ near-identical), OFF under test ⇒ base fraction unchanged (parity).
+                let pull_fraction = self.goal_side_effective_lateral_pull_fraction(
+                    player,
+                    guarded,
+                    line_target.x,
+                    goal_side::GOAL_SIDE_LATERAL_PULL_FRACTION,
+                );
+                guarded.x += (line_target.x - guarded.x) * pull_fraction;
             }
             return guarded.clamp_to_pitch(self.field_width, self.field_length);
         }

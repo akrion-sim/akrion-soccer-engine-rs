@@ -13,7 +13,8 @@ use serde::Serialize;
 use soccer_engine::des::general::soccer::{
     soccer_moment_records_from_jsonl, soccer_moment_records_to_learning_dataset,
     train_soccer_pass_completion_head, AttackSpacingHead, BackFourLineHead, GiveAndGoHead,
-    LaneAffinityHead, LongPassRunHead, LooseBallCommitHead, MatchConfig, MatchSummary,
+    GoalSideRecoveryHead, LaneAffinityHead, LongPassRunHead, LooseBallCommitHead, MatchConfig,
+    MatchSummary,
     ReceiveApproachHead, ShotTriggerHead, SoccerConfigMomentInsert, SoccerMarlAlgorithm,
     SoccerMatch, SoccerMomentWindow, SoccerNeuralLearningBackend, SoccerNeuralLearningConfig,
     SoccerNeuralNetworkSnapshot, SoccerPassCompletionHead, SoccerPassLearningMetrics,
@@ -22,7 +23,8 @@ use soccer_engine::des::general::soccer::{
     SoccerTacticalLearningSummary, SoccerTacticalLearningWeights, SoccerTeamPolicyArtifact,
     SoccerTeamQPolicies, ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS,
     DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE, DEFAULT_SOCCER_PASS_COMPLETION_LEARNING_RATE,
-    GIVE_AND_GO_HEAD_MIN_TRAINING_STEPS, LANE_AFFINITY_HEAD_MIN_TRAINING_STEPS,
+    GIVE_AND_GO_HEAD_MIN_TRAINING_STEPS, GOAL_SIDE_RECOVERY_HEAD_MIN_TRAINING_STEPS,
+    LANE_AFFINITY_HEAD_MIN_TRAINING_STEPS,
     LONG_PASS_RUN_HEAD_MIN_TRAINING_STEPS, LOOSE_BALL_COMMIT_HEAD_MIN_TRAINING_STEPS,
     PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS, RECEIVE_APPROACH_HEAD_MIN_TRAINING_STEPS,
     SHOT_TRIGGER_HEAD_MIN_TRAINING_STEPS,
@@ -1919,6 +1921,13 @@ static CARRIED_RECEIVE_APPROACH_HEAD: std::sync::Mutex<Option<ReceiveApproachHea
 static CARRIED_LANE_AFFINITY_HEAD: std::sync::Mutex<Option<LaneAffinityHead>> =
     std::sync::Mutex::new(None);
 
+/// In-memory goal-side recovery head (how hard a recovering defender collapses onto the
+/// ball→goal line vs. holds width), carried + trained across games WITHIN a learner process.
+/// Resets on pod restart; consumed live once it crosses
+/// `GOAL_SIDE_RECOVERY_HEAD_MIN_TRAINING_STEPS` (seam on by default in prod).
+static CARRIED_GOAL_SIDE_RECOVERY_HEAD: std::sync::Mutex<Option<GoalSideRecoveryHead>> =
+    std::sync::Mutex::new(None);
+
 /// In-memory learned pass-completion head, carried + trained across games WITHIN a learner
 /// process (seeded once from the Postgres corpus at startup), mirroring
 /// `CARRIED_LINE_DEPTH_HEAD`. Installed on each game so the pass-quality assessor consumes it
@@ -2003,6 +2012,11 @@ fn run_game(
     // trained. No-op unless the lane-affinity model is enabled (on by default in prod).
     if let Some(head) = CARRIED_LANE_AFFINITY_HEAD.lock().unwrap().as_ref() {
         sim.set_lane_affinity_head(head.clone());
+    }
+    // Install the carried goal-side recovery head so the goal-side lateral-pull seam consumes it
+    // live once trained. No-op unless the model is enabled (on by default in prod).
+    if let Some(head) = CARRIED_GOAL_SIDE_RECOVERY_HEAD.lock().unwrap().as_ref() {
+        sim.set_goal_side_recovery_head(head.clone());
     }
     // Install the carried long-pass run head so `backfield_long_pass_run_invite_for` consumes
     // it live once trained. No-op unless DD_SOCCER_ENABLE_LEARNED_LONG_PASS_RUN is set.
@@ -2132,6 +2146,25 @@ fn run_game(
             lane_affinity_samples.len(),
             head.training_steps(),
             head.training_steps() >= LANE_AFFINITY_HEAD_MIN_TRAINING_STEPS,
+            final_loss
+        );
+    }
+    // Train the CARRIED goal-side recovery head on this game's reward-weighted RL corpus
+    // (whether collapsing onto the line / holding width best protected the goal). Empty +
+    // skipped unless the model is enabled (on by default in prod).
+    let goal_side_recovery_samples = sim.drain_goal_side_recovery_samples();
+    if !goal_side_recovery_samples.is_empty() {
+        let mut guard = CARRIED_GOAL_SIDE_RECOVERY_HEAD.lock().unwrap();
+        let head = guard.get_or_insert_with(|| GoalSideRecoveryHead::new(episode_seed as u32));
+        let mut final_loss = 0.0;
+        for _ in 0..4 {
+            final_loss = head.train_reward_weighted(&goal_side_recovery_samples, 0.02);
+        }
+        eprintln!(
+            "goal_side_recovery_training samples={} training_steps={} consumed={} final_loss={:.5}",
+            goal_side_recovery_samples.len(),
+            head.training_steps(),
+            head.training_steps() >= GOAL_SIDE_RECOVERY_HEAD_MIN_TRAINING_STEPS,
             final_loss
         );
     }
