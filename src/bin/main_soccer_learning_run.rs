@@ -2341,6 +2341,23 @@ fn run_game(
             final_loss
         );
     }
+    // Train the CARRIED slip-break commit head on this game's reward-weighted RL corpus.
+    let slip_break_samples = sim.drain_slip_break_samples();
+    if !slip_break_samples.is_empty() {
+        let mut guard = CARRIED_SLIP_BREAK_HEAD.lock().unwrap();
+        let head = guard.get_or_insert_with(|| SlipBreakHead::new(episode_seed as u32));
+        let mut final_loss = 0.0;
+        for _ in 0..4 {
+            final_loss = head.train_reward_weighted(&slip_break_samples, 0.02);
+        }
+        eprintln!(
+            "slip_break_training samples={} training_steps={} consumed={} final_loss={:.5}",
+            slip_break_samples.len(),
+            head.training_steps(),
+            head.training_steps() >= SLIP_BREAK_HEAD_MIN_TRAINING_STEPS,
+            final_loss
+        );
+    }
     // Train the CARRIED long-pass run head on this game's reward-weighted RL corpus (which
     // attacker breaking forward led to the team advancing the ball). Empty + skipped unless
     // DD_SOCCER_ENABLE_LEARNED_LONG_PASS_RUN is set.
