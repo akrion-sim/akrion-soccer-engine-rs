@@ -2191,6 +2191,28 @@ fn run_game(
             final_loss
         );
     }
+    // Train the CARRIED per-defender individual line head on this game's reward-weighted RL
+    // corpus (the MAPPO shared policy; reward = the defending team's windowed territorial
+    // advantage). Empty + skipped unless the individual model is enabled
+    // (DD_SOCCER_ENABLE_BACK_FOUR_INDIVIDUAL_MODEL). Cross-restart Postgres persistence is the
+    // remaining durability step, mirroring the group line-depth head.
+    let defender_line_samples = sim.drain_defender_line_samples();
+    if !defender_line_samples.is_empty() {
+        let mut guard = CARRIED_DEFENDER_LINE_HEAD.lock().unwrap();
+        let head = guard.get_or_insert_with(|| DefenderLinePolicyHead::new(episode_seed as u32));
+        let mut final_loss = 0.0;
+        for _ in 0..4 {
+            final_loss = head.train_reward_weighted(&defender_line_samples, 0.02);
+        }
+        eprintln!(
+            "defender_line_training samples={} training_steps={} consumed={} final_loss={:.5}",
+            defender_line_samples.len(),
+            head.training_steps(),
+            head.training_steps()
+                >= soccer_engine::des::general::soccer::DEFENDER_LINE_HEAD_MIN_TRAINING_STEPS,
+            final_loss
+        );
+    }
     // Train the CARRIED loose-ball commit head on this game's reward-weighted RL
     // corpus (which player attacking the loose ball won/kept possession without
     // breaking shape). Empty + skipped unless the commit model is enabled.
