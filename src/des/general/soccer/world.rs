@@ -25004,6 +25004,7 @@ impl WorldSnapshot {
             crash_box_head: m.crash_box_head.clone(),
             run_prediction_head: m.run_prediction_head.clone(),
             slip_break_head: m.slip_break_head.clone(),
+            onside_support_head: m.onside_support_head.clone(),
             long_pass_run_head: m.long_pass_run_head.clone(),
             give_and_go_head: m.give_and_go_head.clone(),
             attack_spacing_head: m.attack_spacing_head.clone(),
