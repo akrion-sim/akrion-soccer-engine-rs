@@ -23426,7 +23426,8 @@ fn dd_soccer_disable_six_yard_line_floor() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_SIX_YARD_LINE_FLOOR").is_ok())
 }
-/// Defensive shepherding ("show one way"). Gated, default OFF = byte-identical for clean A/B.
+/// Defensive shepherding ("show one way"). Default-ON in prod (kill switch
+/// `DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD=0`); default-OFF under test = byte-identical for clean A/B.
 /// When ON, the single nearest defender pressing an opponent carrier in our own half does not
 /// just meet the ball square on the goal-side line: it approaches on a curved angle so its body
 /// takes the carrier's inside (goal-centre) shoulder, cutting the central / goal-bound route and
