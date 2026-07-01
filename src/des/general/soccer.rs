@@ -44455,11 +44455,12 @@ fn soccer_live_fetch_latest_pg_policy(
     // plus the well-learned tabular core — entries visited at least
     // `SOCCER_LIVE_POLICY_MIN_VISITS` times — instead of hauling the full
     // multi-million-row policy tip over the wire. `0` (default) loads everything.
-    store.load_latest_active_policy_with_min_visits(
+    store.load_latest_policy_with_min_visits(
         experiment_id,
         options.clone(),
         options,
         soccer_live_policy_min_visits(),
+        include_unpromoted,
     )
 }
 
