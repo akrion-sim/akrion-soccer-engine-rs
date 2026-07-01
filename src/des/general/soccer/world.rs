@@ -15736,6 +15736,22 @@ impl SoccerMatch {
                 &same_team_separation_obstacles,
                 dt,
             );
+            // Advance the nested proximity-dwell GRACE timers off the same obstacle set (nearest
+            // NON-EXEMPT teammate distance). Feeds the graduated reward penalty's grace gate so a
+            // brief overlap is forgiven and only a sustained crowd is punished. Uses the pre-
+            // integration position (matches how the obstacle set was snapshotted).
+            let nearest_nonexempt_yards = same_team_separation_obstacles
+                .iter()
+                .filter(|(_, exempt)| !exempt)
+                .map(|(pos, _)| p.position.distance(*pos))
+                .fold(f64::INFINITY, f64::min);
+            advance_same_team_proximity_dwell(
+                &mut p.same_team_proximity_dwell_lt7_seconds,
+                &mut p.same_team_proximity_dwell_lt6_seconds,
+                &mut p.same_team_proximity_dwell_lt5_seconds,
+                nearest_nonexempt_yards,
+                dt,
+            );
         }
         let physical_gait = movement_gait_for_physical_speed(
             gait,
