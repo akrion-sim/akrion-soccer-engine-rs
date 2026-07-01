@@ -1704,12 +1704,17 @@ pub fn soccer_learning_from_micros(value: i64) -> f64 {
     value as f64 / SOCCER_LEARNING_FIXED_SCALE as f64
 }
 
+pub const SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION: f64 = 0.25;
+
 pub fn soccer_policy_version_insert_status_after_active_head(
     requested_status: &'static str,
     parent_policy_version_id: Option<&str>,
     generation: i32,
+    fitness: f64,
     latest_active_policy_version_id: Option<&str>,
     latest_active_generation: Option<i32>,
+    latest_active_fitness: Option<f64>,
+    max_active_fitness_regression: f64,
 ) -> &'static str {
     if requested_status != SOCCER_POLICY_STATUS_ACTIVE {
         return requested_status;
@@ -1722,6 +1727,14 @@ pub fn soccer_policy_version_insert_status_after_active_head(
     }
     if latest_active_generation.is_some_and(|active_generation| active_generation >= generation) {
         return SOCCER_POLICY_STATUS_ARCHIVED;
+    }
+    if let Some(active_fitness) = latest_active_fitness {
+        let allowed_regression = max_active_fitness_regression.max(0.0);
+        if !fitness.is_finite()
+            || (active_fitness.is_finite() && fitness < active_fitness - allowed_regression)
+        {
+            return SOCCER_POLICY_STATUS_ARCHIVED;
+        }
     }
     SOCCER_POLICY_STATUS_ACTIVE
 }
@@ -6787,8 +6800,11 @@ mod tests {
                 SOCCER_POLICY_STATUS_ACTIVE,
                 Some("parent"),
                 12,
+                1.10,
                 Some("parent"),
                 Some(11),
+                Some(1.00),
+                SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION,
             ),
             SOCCER_POLICY_STATUS_ACTIVE
         );
@@ -6797,8 +6813,11 @@ mod tests {
                 SOCCER_POLICY_STATUS_ACTIVE,
                 Some("parent"),
                 12,
+                1.10,
                 Some("newer-head"),
                 Some(12),
+                Some(1.00),
+                SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION,
             ),
             SOCCER_POLICY_STATUS_ARCHIVED
         );
@@ -6807,8 +6826,37 @@ mod tests {
                 SOCCER_POLICY_STATUS_ACTIVE,
                 Some("parent"),
                 12,
+                1.10,
                 Some("parent"),
                 Some(12),
+                Some(1.00),
+                SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION,
+            ),
+            SOCCER_POLICY_STATUS_ARCHIVED
+        );
+        assert_eq!(
+            soccer_policy_version_insert_status_after_active_head(
+                SOCCER_POLICY_STATUS_ACTIVE,
+                Some("parent"),
+                13,
+                4.90,
+                Some("parent"),
+                Some(12),
+                Some(5.00),
+                SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION,
+            ),
+            SOCCER_POLICY_STATUS_ACTIVE
+        );
+        assert_eq!(
+            soccer_policy_version_insert_status_after_active_head(
+                SOCCER_POLICY_STATUS_ACTIVE,
+                Some("parent"),
+                13,
+                2.40,
+                Some("parent"),
+                Some(12),
+                Some(5.30),
+                SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION,
             ),
             SOCCER_POLICY_STATUS_ARCHIVED
         );
@@ -6817,8 +6865,11 @@ mod tests {
                 "archived",
                 Some("parent"),
                 12,
+                1.10,
                 Some("newer-head"),
                 Some(14),
+                Some(1.00),
+                SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION,
             ),
             "archived"
         );
