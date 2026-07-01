@@ -8693,6 +8693,8 @@ impl SoccerMatch {
         // Learnable pass-lane yield (step out vs hold) RL samples (no-op under test / when
         // disabled; live in prod when pass-lane-yield is on).
         self.collect_pass_lane_yield_rl_samples(&next_snapshot);
+        // Learnable head-scan effort RL samples (no-op under test / when disabled).
+        self.collect_head_scan_rl_samples(&next_snapshot);
         self.collect_long_pass_run_rl_samples(&next_snapshot);
         // Learnable give-and-go / wall-pass appetite RL samples (no-op + byte-identical unless
         // `DD_SOCCER_ENABLE_LEARNED_GIVE_AND_GO` is set).
