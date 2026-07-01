@@ -13,8 +13,9 @@ use serde::Serialize;
 use soccer_engine::des::general::soccer::{
     soccer_moment_records_from_jsonl, soccer_moment_records_to_learning_dataset,
     train_soccer_pass_completion_head, AttackSpacingHead, BackFourLineHead, GiveAndGoHead,
-    GoalSideRecoveryHead, LaneAffinityHead, LongPassRunHead, LooseBallCommitHead, MatchConfig,
-    MatchSummary, PassLaneYieldHead, SeparationFloorHead, WingerPinchHead,
+    CrashBoxHead, GoalSideRecoveryHead, HeadScanHead, LaneAffinityHead, LongPassRunHead,
+    LooseBallCommitHead, MatchConfig, MatchSummary, OnsideSupportHead, PassLaneYieldHead,
+    RunPredictionHead, SeparationFloorHead, SlipBreakHead, WingerPinchHead,
     ReceiveApproachHead, ShotTriggerHead, SoccerConfigMomentInsert, SoccerMarlAlgorithm,
     SoccerMatch, SoccerMomentWindow, SoccerNeuralLearningBackend, SoccerNeuralLearningConfig,
     SoccerNeuralNetworkSnapshot, SoccerPassCompletionHead, SoccerPassLearningMetrics,
@@ -23,9 +24,12 @@ use soccer_engine::des::general::soccer::{
     SoccerTacticalLearningSummary, SoccerTacticalLearningWeights, SoccerTeamPolicyArtifact,
     SoccerTeamQPolicies, SupportScorerHead, ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS,
     DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE, DEFAULT_SOCCER_PASS_COMPLETION_LEARNING_RATE,
-    GIVE_AND_GO_HEAD_MIN_TRAINING_STEPS, GOAL_SIDE_RECOVERY_HEAD_MIN_TRAINING_STEPS,
-    LANE_AFFINITY_HEAD_MIN_TRAINING_STEPS, PASS_LANE_YIELD_HEAD_MIN_TRAINING_STEPS,
-    SEPARATION_FLOOR_HEAD_MIN_TRAINING_STEPS, WINGER_PINCH_HEAD_MIN_TRAINING_STEPS,
+    CRASH_BOX_HEAD_MIN_TRAINING_STEPS, GIVE_AND_GO_HEAD_MIN_TRAINING_STEPS,
+    GOAL_SIDE_RECOVERY_HEAD_MIN_TRAINING_STEPS, HEAD_SCAN_HEAD_MIN_TRAINING_STEPS,
+    LANE_AFFINITY_HEAD_MIN_TRAINING_STEPS, ONSIDE_SUPPORT_HEAD_MIN_TRAINING_STEPS,
+    PASS_LANE_YIELD_HEAD_MIN_TRAINING_STEPS, RUN_PREDICTION_HEAD_MIN_TRAINING_STEPS,
+    SEPARATION_FLOOR_HEAD_MIN_TRAINING_STEPS, SLIP_BREAK_HEAD_MIN_TRAINING_STEPS,
+    WINGER_PINCH_HEAD_MIN_TRAINING_STEPS,
     LONG_PASS_RUN_HEAD_MIN_TRAINING_STEPS, LOOSE_BALL_COMMIT_HEAD_MIN_TRAINING_STEPS,
     PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS, RECEIVE_APPROACH_HEAD_MIN_TRAINING_STEPS,
     SHOT_TRIGGER_HEAD_MIN_TRAINING_STEPS, SUPPORT_SCORER_HEAD_MIN_TRAINING_STEPS,
@@ -1947,6 +1951,24 @@ static CARRIED_SEPARATION_FLOOR_HEAD: std::sync::Mutex<Option<SeparationFloorHea
 static CARRIED_PASS_LANE_YIELD_HEAD: std::sync::Mutex<Option<PassLaneYieldHead>> =
     std::sync::Mutex::new(None);
 
+/// In-memory head-scan effort head, carried + trained across games WITHIN a learner process.
+static CARRIED_HEAD_SCAN_HEAD: std::sync::Mutex<Option<HeadScanHead>> = std::sync::Mutex::new(None);
+
+/// In-memory crash-the-box commit head, carried + trained across games WITHIN a learner process.
+static CARRIED_CRASH_BOX_HEAD: std::sync::Mutex<Option<CrashBoxHead>> = std::sync::Mutex::new(None);
+
+/// In-memory off-ball run-selection head, carried + trained across games WITHIN a learner process.
+static CARRIED_RUN_PREDICTION_HEAD: std::sync::Mutex<Option<RunPredictionHead>> =
+    std::sync::Mutex::new(None);
+
+/// In-memory slip-break commit head, carried + trained across games WITHIN a learner process.
+static CARRIED_SLIP_BREAK_HEAD: std::sync::Mutex<Option<SlipBreakHead>> =
+    std::sync::Mutex::new(None);
+
+/// In-memory onside-support push head, carried + trained across games WITHIN a learner process.
+static CARRIED_ONSIDE_SUPPORT_HEAD: std::sync::Mutex<Option<OnsideSupportHead>> =
+    std::sync::Mutex::new(None);
+
 /// In-memory learned pass-completion head, carried + trained across games WITHIN a learner
 /// process (seeded once from the Postgres corpus at startup), mirroring
 /// `CARRIED_LINE_DEPTH_HEAD`. Installed on each game so the pass-quality assessor consumes it
@@ -2056,6 +2078,26 @@ fn run_game(
     // Install the carried pass-lane yield head so the yield seam consumes it live once trained.
     if let Some(head) = CARRIED_PASS_LANE_YIELD_HEAD.lock().unwrap().as_ref() {
         sim.set_pass_lane_yield_head(head.clone());
+    }
+    // Install the carried head-scan effort head so the head-scan visibility seam consumes it live.
+    if let Some(head) = CARRIED_HEAD_SCAN_HEAD.lock().unwrap().as_ref() {
+        sim.set_head_scan_head(head.clone());
+    }
+    // Install the carried crash-the-box commit head so the box-flood seam consumes it live.
+    if let Some(head) = CARRIED_CRASH_BOX_HEAD.lock().unwrap().as_ref() {
+        sim.set_crash_box_head(head.clone());
+    }
+    // Install the carried off-ball run-selection head so the open-space run seam consumes it live.
+    if let Some(head) = CARRIED_RUN_PREDICTION_HEAD.lock().unwrap().as_ref() {
+        sim.set_run_prediction_head(head.clone());
+    }
+    // Install the carried slip-break commit head so the slip-break opportunity seam consumes it live.
+    if let Some(head) = CARRIED_SLIP_BREAK_HEAD.lock().unwrap().as_ref() {
+        sim.set_slip_break_head(head.clone());
+    }
+    // Install the carried onside-support push head so the onside-support clamp consumes it live.
+    if let Some(head) = CARRIED_ONSIDE_SUPPORT_HEAD.lock().unwrap().as_ref() {
+        sim.set_onside_support_head(head.clone());
     }
     // Install the carried long-pass run head so `backfield_long_pass_run_invite_for` consumes
     // it live once trained. No-op unless DD_SOCCER_ENABLE_LEARNED_LONG_PASS_RUN is set.
@@ -2264,6 +2306,91 @@ fn run_game(
             pass_lane_yield_samples.len(),
             head.training_steps(),
             head.training_steps() >= PASS_LANE_YIELD_HEAD_MIN_TRAINING_STEPS,
+            final_loss
+        );
+    }
+    // Train the CARRIED head-scan effort head on this game's reward-weighted RL corpus.
+    let head_scan_samples = sim.drain_head_scan_samples();
+    if !head_scan_samples.is_empty() {
+        let mut guard = CARRIED_HEAD_SCAN_HEAD.lock().unwrap();
+        let head = guard.get_or_insert_with(|| HeadScanHead::new(episode_seed as u32));
+        let mut final_loss = 0.0;
+        for _ in 0..4 {
+            final_loss = head.train_reward_weighted(&head_scan_samples, 0.02);
+        }
+        eprintln!(
+            "head_scan_training samples={} training_steps={} consumed={} final_loss={:.5}",
+            head_scan_samples.len(),
+            head.training_steps(),
+            head.training_steps() >= HEAD_SCAN_HEAD_MIN_TRAINING_STEPS,
+            final_loss
+        );
+    }
+    // Train the CARRIED crash-the-box commit head on this game's reward-weighted RL corpus.
+    let crash_box_samples = sim.drain_crash_box_samples();
+    if !crash_box_samples.is_empty() {
+        let mut guard = CARRIED_CRASH_BOX_HEAD.lock().unwrap();
+        let head = guard.get_or_insert_with(|| CrashBoxHead::new(episode_seed as u32));
+        let mut final_loss = 0.0;
+        for _ in 0..4 {
+            final_loss = head.train_reward_weighted(&crash_box_samples, 0.02);
+        }
+        eprintln!(
+            "crash_box_training samples={} training_steps={} consumed={} final_loss={:.5}",
+            crash_box_samples.len(),
+            head.training_steps(),
+            head.training_steps() >= CRASH_BOX_HEAD_MIN_TRAINING_STEPS,
+            final_loss
+        );
+    }
+    // Train the CARRIED off-ball run-selection head on this game's reward-weighted RL corpus.
+    let run_prediction_samples = sim.drain_run_prediction_samples();
+    if !run_prediction_samples.is_empty() {
+        let mut guard = CARRIED_RUN_PREDICTION_HEAD.lock().unwrap();
+        let head = guard.get_or_insert_with(|| RunPredictionHead::new(episode_seed as u32));
+        let mut final_loss = 0.0;
+        for _ in 0..4 {
+            final_loss = head.train_reward_weighted(&run_prediction_samples, 0.02);
+        }
+        eprintln!(
+            "run_prediction_training samples={} training_steps={} consumed={} final_loss={:.5}",
+            run_prediction_samples.len(),
+            head.training_steps(),
+            head.training_steps() >= RUN_PREDICTION_HEAD_MIN_TRAINING_STEPS,
+            final_loss
+        );
+    }
+    // Train the CARRIED slip-break commit head on this game's reward-weighted RL corpus.
+    let slip_break_samples = sim.drain_slip_break_samples();
+    if !slip_break_samples.is_empty() {
+        let mut guard = CARRIED_SLIP_BREAK_HEAD.lock().unwrap();
+        let head = guard.get_or_insert_with(|| SlipBreakHead::new(episode_seed as u32));
+        let mut final_loss = 0.0;
+        for _ in 0..4 {
+            final_loss = head.train_reward_weighted(&slip_break_samples, 0.02);
+        }
+        eprintln!(
+            "slip_break_training samples={} training_steps={} consumed={} final_loss={:.5}",
+            slip_break_samples.len(),
+            head.training_steps(),
+            head.training_steps() >= SLIP_BREAK_HEAD_MIN_TRAINING_STEPS,
+            final_loss
+        );
+    }
+    // Train the CARRIED onside-support push head on this game's reward-weighted RL corpus.
+    let onside_support_samples = sim.drain_onside_support_samples();
+    if !onside_support_samples.is_empty() {
+        let mut guard = CARRIED_ONSIDE_SUPPORT_HEAD.lock().unwrap();
+        let head = guard.get_or_insert_with(|| OnsideSupportHead::new(episode_seed as u32));
+        let mut final_loss = 0.0;
+        for _ in 0..4 {
+            final_loss = head.train_reward_weighted(&onside_support_samples, 0.02);
+        }
+        eprintln!(
+            "onside_support_training samples={} training_steps={} consumed={} final_loss={:.5}",
+            onside_support_samples.len(),
+            head.training_steps(),
+            head.training_steps() >= ONSIDE_SUPPORT_HEAD_MIN_TRAINING_STEPS,
             final_loss
         );
     }

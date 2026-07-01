@@ -615,6 +615,41 @@ pub struct SoccerMatch {
     pub(crate) pass_lane_yield_samples: Vec<PassLaneYieldSample>,
     /// Open pass-lane yield decisions awaiting their windowed reward.
     pub(crate) pending_pass_lane_yield: Vec<PendingPassLaneYieldDecision>,
+    /// The trained head-scan effort head, when present. `None` ⇒ analytic seed. Shared into each
+    /// [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) head_scan_head: Option<std::sync::Arc<HeadScanHead>>,
+    /// Rolling RL corpus for the head-scan head. Collected only while the model is enabled.
+    pub(crate) head_scan_samples: Vec<HeadScanSample>,
+    /// Open head-scan decisions awaiting their windowed reward.
+    pub(crate) pending_head_scan: Vec<PendingHeadScanDecision>,
+    /// The trained crash-box commit head, when present. `None` ⇒ analytic seed. Shared into each
+    /// [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) crash_box_head: Option<std::sync::Arc<CrashBoxHead>>,
+    /// Rolling RL corpus for the crash-box head. Collected only while the model is enabled.
+    pub(crate) crash_box_samples: Vec<CrashBoxSample>,
+    /// Open crash-box decisions awaiting their windowed reward.
+    pub(crate) pending_crash_box: Vec<PendingCrashBoxDecision>,
+    /// The trained off-ball run-selection head, when present. `None` ⇒ analytic seed. Shared into
+    /// each [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) run_prediction_head: Option<std::sync::Arc<RunPredictionHead>>,
+    /// Rolling RL corpus for the run-selection head. Collected only while the model is enabled.
+    pub(crate) run_prediction_samples: Vec<RunPredictionSample>,
+    /// Open run-selection decisions awaiting their windowed reward.
+    pub(crate) pending_run_prediction: Vec<PendingRunPredictionDecision>,
+    /// The trained slip-break commit head, when present. `None` ⇒ analytic seed. Shared into each
+    /// [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) slip_break_head: Option<std::sync::Arc<SlipBreakHead>>,
+    /// Rolling RL corpus for the slip-break head. Collected only while the model is enabled.
+    pub(crate) slip_break_samples: Vec<SlipBreakSample>,
+    /// Open slip-break decisions awaiting their windowed reward.
+    pub(crate) pending_slip_break: Vec<PendingSlipBreakDecision>,
+    /// The trained onside-support push head, when present. `None` ⇒ analytic seed. Shared into each
+    /// [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) onside_support_head: Option<std::sync::Arc<OnsideSupportHead>>,
+    /// Rolling RL corpus for the onside-support head. Collected only while the model is enabled.
+    pub(crate) onside_support_samples: Vec<OnsideSupportSample>,
+    /// Open onside-support decisions awaiting their windowed reward.
+    pub(crate) pending_onside_support: Vec<PendingOnsideSupportDecision>,
     /// The trained long-pass run head (which attacker should break forward so a deep carrier
     /// can pick them out), when present. Carried + trained across games by the learner; `None`
     /// ⇒ the analytic `backfield_long_pass_run_invite_for` seed. Shared into each
@@ -3185,6 +3220,21 @@ impl SoccerMatch {
             pass_lane_yield_head: None,
             pass_lane_yield_samples: Vec::new(),
             pending_pass_lane_yield: Vec::new(),
+            head_scan_head: None,
+            head_scan_samples: Vec::new(),
+            pending_head_scan: Vec::new(),
+            crash_box_head: None,
+            crash_box_samples: Vec::new(),
+            pending_crash_box: Vec::new(),
+            run_prediction_head: None,
+            run_prediction_samples: Vec::new(),
+            pending_run_prediction: Vec::new(),
+            slip_break_head: None,
+            slip_break_samples: Vec::new(),
+            pending_slip_break: Vec::new(),
+            onside_support_head: None,
+            onside_support_samples: Vec::new(),
+            pending_onside_support: Vec::new(),
             long_pass_run_head: None,
             long_pass_run_samples: Vec::new(),
             pending_long_pass_run: Vec::new(),
@@ -8764,6 +8814,16 @@ impl SoccerMatch {
         // Learnable pass-lane yield (step out vs hold) RL samples (no-op under test / when
         // disabled; live in prod when pass-lane-yield is on).
         self.collect_pass_lane_yield_rl_samples(&next_snapshot);
+        // Learnable head-scan effort RL samples (no-op under test / when disabled).
+        self.collect_head_scan_rl_samples(&next_snapshot);
+        // Learnable crash-the-box commit RL samples (no-op under test / when disabled).
+        self.collect_crash_box_rl_samples(&next_snapshot);
+        // Learnable off-ball run-selection RL samples (no-op under test / when disabled).
+        self.collect_run_prediction_rl_samples(&next_snapshot);
+        // Learnable slip-break commit RL samples (no-op under test / when disabled).
+        self.collect_slip_break_rl_samples(&next_snapshot);
+        // Learnable onside-support push (gamble the shoulder vs hold) RL samples (no-op under test).
+        self.collect_onside_support_rl_samples(&next_snapshot);
         self.collect_long_pass_run_rl_samples(&next_snapshot);
         // Learnable give-and-go / wall-pass appetite RL samples (no-op + byte-identical unless
         // `DD_SOCCER_ENABLE_LEARNED_GIVE_AND_GO` is set).
@@ -22344,6 +22404,26 @@ pub struct WorldSnapshot {
     /// pass-lane yield seam. `None` ⇒ analytic seed (parity). Skipped by serde.
     #[serde(skip)]
     pub(crate) pass_lane_yield_head: Option<std::sync::Arc<PassLaneYieldHead>>,
+    /// The trained head-scan effort head, carried from the match for live consumption in the
+    /// head-scan visibility seam. `None` ⇒ analytic seed (parity). Skipped by serde.
+    #[serde(skip)]
+    pub(crate) head_scan_head: Option<std::sync::Arc<HeadScanHead>>,
+    /// The trained crash-box commit head, carried from the match for live consumption in the
+    /// crash-the-box seam. `None` ⇒ analytic seed (parity). Skipped by serde.
+    #[serde(skip)]
+    pub(crate) crash_box_head: Option<std::sync::Arc<CrashBoxHead>>,
+    /// The trained off-ball run-selection head, carried from the match for live consumption in the
+    /// open-space run seam. `None` ⇒ analytic seed (parity). Skipped by serde.
+    #[serde(skip)]
+    pub(crate) run_prediction_head: Option<std::sync::Arc<RunPredictionHead>>,
+    /// The trained slip-break commit head, carried from the match for live consumption in the
+    /// slip-break opportunity seam. `None` ⇒ analytic seed (parity). Skipped by serde.
+    #[serde(skip)]
+    pub(crate) slip_break_head: Option<std::sync::Arc<SlipBreakHead>>,
+    /// The trained onside-support push head, carried from the match for live consumption in the
+    /// onside-support clamp seam. `None` ⇒ analytic seed (parity). Skipped by serde.
+    #[serde(skip)]
+    pub(crate) onside_support_head: Option<std::sync::Arc<OnsideSupportHead>>,
     /// The trained long-pass run head, carried from the match for live consumption in
     /// `backfield_long_pass_run_invite_for`. `None` ⇒ analytic seed (parity). Skipped by
     /// serde (an internal decision aid; Default = None).
@@ -25070,6 +25150,11 @@ impl WorldSnapshot {
             winger_pinch_head: m.winger_pinch_head.clone(),
             separation_floor_head: m.separation_floor_head.clone(),
             pass_lane_yield_head: m.pass_lane_yield_head.clone(),
+            head_scan_head: m.head_scan_head.clone(),
+            crash_box_head: m.crash_box_head.clone(),
+            run_prediction_head: m.run_prediction_head.clone(),
+            slip_break_head: m.slip_break_head.clone(),
+            onside_support_head: m.onside_support_head.clone(),
             long_pass_run_head: m.long_pass_run_head.clone(),
             give_and_go_head: m.give_and_go_head.clone(),
             attack_spacing_head: m.attack_spacing_head.clone(),
@@ -29565,10 +29650,14 @@ impl WorldSnapshot {
         } else {
             active_line_y
         };
-        let beyond_line = (target.y - cap_y) * attack > 0.0;
+        // Learnable onside-support gamble (MDP/POMDP): the cap-at-the-line is a predilection — the
+        // attacker may push onto / a yard beyond the shoulder (time a break) or tuck deeper. Push is
+        // 0 when the model is off ⇒ cap stays exactly at the line (byte-identical).
+        let effective_cap_y = cap_y + self.onside_support_push_yards(player) * attack;
+        let beyond_line = (target.y - effective_cap_y) * attack > 0.0;
         let in_attacking_half = (target.y - half_line) * attack > 0.0;
         if in_attacking_half && beyond_line {
-            target.y = cap_y;
+            target.y = effective_cap_y;
         }
         target.clamp_to_pitch(self.field_width, self.field_length)
     }
@@ -35059,6 +35148,9 @@ impl WorldSnapshot {
         if scan_seconds <= 0.0 {
             return false;
         }
+        // Learnable scan effort (MDP/POMDP): scale the effective scan time by how hard the carrier
+        // has chosen to scan this situation. Multiplier is 1.0 when the model is off ⇒ byte-identical.
+        let scan_seconds = scan_seconds * self.head_scan_effort_multiplier(observer_id);
         let off_axis = angle_between_vectors_degrees(facing, to_point).to_radians();
         let fov_half = ball_holder_shoulder_scan_limit_degrees().to_radians();
         scan_coverage(
@@ -35585,8 +35677,20 @@ impl WorldSnapshot {
         let lane_open = self.clear_line(passer_pos, seam_target, attacking_team.other(), 2.0);
         let lane_openness = if lane_open { 1.0 } else { 0.35 };
         let timing = slip_break_release_timing(yards_to_line, onside, runner_forward_yps);
-        let opportunity =
+        let base_opportunity =
             slip_break_opportunity_quality(seam_quality, timing, lane_openness, speed_advantage);
+        // Learnable slip-break commit (MDP/POMDP): scale the opportunity by a learned appetite so
+        // the cooperative break is backed more/less readily per situation. Unchanged when the
+        // model is off ⇒ byte-identical.
+        let inputs = SlipBreakInputs {
+            seam_quality,
+            timing,
+            lane_openness,
+            speed_advantage,
+            onside_margin: (yards_to_line / 10.0).clamp(0.0, 1.0),
+            role_forward: (runner.role == PlayerRole::Forward) as i32 as f64,
+        };
+        let opportunity = self.slip_break_effective_opportunity(&inputs, base_opportunity);
         Some(SlipBreakOpportunity {
             timing,
             lane_openness,
@@ -35594,10 +35698,58 @@ impl WorldSnapshot {
         })
     }
 
+    /// The [`SlipBreakInputs`] (POMDP obs) + base (un-modulated) opportunity quality for a slip-break
+    /// from `passer_id` to `runner_id`. Shares the geometry of [`Self::slip_break_runner_opportunity`];
+    /// used by the RL collector. `None` when no slip-break applies to the pair.
+    pub(crate) fn slip_break_decision_inputs(
+        &self,
+        attacking_team: Team,
+        passer_id: usize,
+        passer_pos: Vec2,
+        runner_id: usize,
+    ) -> Option<(SlipBreakInputs, f64)> {
+        if runner_id == passer_id {
+            return None;
+        }
+        let runner = self.players.iter().find(|p| p.id == runner_id)?;
+        if runner.team != attacking_team
+            || !matches!(runner.role, PlayerRole::Forward | PlayerRole::Midfielder)
+        {
+            return None;
+        }
+        let line_y = self.second_last_defender_line_for(attacking_team)?;
+        let attack_dir = attacking_team.attack_dir();
+        let runner_pos = self.player_snapshot_position(runner);
+        let yards_to_line = (line_y - runner_pos.y) * attack_dir;
+        if !slip_break_runner_in_staging_band(yards_to_line) {
+            return None;
+        }
+        let onside = yards_to_line > 0.0;
+        let runner_vel = self.player_velocity(runner_id).unwrap_or_else(|| Vec2::new(0.0, 0.0));
+        let runner_forward_yps = runner_vel.y * attack_dir;
+        let (seam_target, seam_quality) = self.slip_break_seam_for(attacking_team, runner_pos)?;
+        let line_forward_yps = self.slip_break_line_forward_velocity(attacking_team, line_y);
+        let speed_advantage = slip_break_speed_advantage(runner_forward_yps, line_forward_yps);
+        let lane_open = self.clear_line(passer_pos, seam_target, attacking_team.other(), 2.0);
+        let lane_openness = if lane_open { 1.0 } else { 0.35 };
+        let timing = slip_break_release_timing(yards_to_line, onside, runner_forward_yps);
+        let base_opportunity =
+            slip_break_opportunity_quality(seam_quality, timing, lane_openness, speed_advantage);
+        let inputs = SlipBreakInputs {
+            seam_quality,
+            timing,
+            lane_openness,
+            speed_advantage,
+            onside_margin: (yards_to_line / 10.0).clamp(0.0, 1.0),
+            role_forward: (runner.role == PlayerRole::Forward) as i32 as f64,
+        };
+        Some((inputs, base_opportunity))
+    }
+
     /// Mean forward velocity (yd/s, attacking frame) of the opponent defenders forming the line —
     /// negative when the line is stepping up to spring the offside trap. Zero if the line cannot
     /// be sampled.
-    fn slip_break_line_forward_velocity(&self, attacking_team: Team, line_y: f64) -> f64 {
+    pub(crate) fn slip_break_line_forward_velocity(&self, attacking_team: Team, line_y: f64) -> f64 {
         let attack_dir = attacking_team.attack_dir();
         let mut total = 0.0;
         let mut count = 0.0;
@@ -44851,6 +45003,12 @@ impl WorldSnapshot {
         {
             return None;
         }
+        // Learnable crash-commit (MDP/POMDP): the geometric trigger is a predilection — the
+        // attacker may CHOOSE to hold (recycle / cut-back) instead of gambling into a full box.
+        // Always false when the model is off ⇒ byte-identical (the crash fires as before).
+        if self.crash_box_should_hold(player) {
+            return None;
+        }
         let dir = player.team.attack_dir();
         let center_x = self.field_width * 0.5;
         let goal_y = player.team.goal_y(self.field_length);
@@ -46468,6 +46626,10 @@ impl WorldSnapshot {
         // its own spatial cluster. No-op when off (empty `scored_candidates`) or
         // when the argmax sits alone ⇒ byte-identical to the bare argmax.
         if collect_run_modes {
+            // Learnable run selection (MDP/POMDP): tilt the argmax off the scored surface toward a
+            // more forward / safer run per a learned preference. At bias 0 (or model off) the
+            // argmax is unchanged ⇒ byte-identical.
+            best = self.run_prediction_tilted_destination(player_id, &scored_candidates, best);
             best = blended_argmax_destination(&scored_candidates, best);
         }
         // Final safety: hold attacking players onside (forwards/mids, in
