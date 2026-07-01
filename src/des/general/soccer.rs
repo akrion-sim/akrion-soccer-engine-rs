@@ -25430,6 +25430,68 @@ fn dense_soccer_transition_reward(
     reward.clamp(-4.0, 4.0)
 }
 
+/// Env gate for the **both-teams loose-ball contest pressure** reward term (the
+/// symmetric time-escalating uncontested penalty + explicit loose-ball-win reward).
+/// Default-ON; set `DD_SOCCER_ENABLE_LOOSE_BALL_CONTEST_PRESSURE=0` to restore the
+/// prior reward exactly.
+pub(crate) fn loose_ball_contest_pressure_enabled() -> bool {
+    #[cfg(test)]
+    {
+        gate_default_on("DD_SOCCER_ENABLE_LOOSE_BALL_CONTEST_PRESSURE")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_LOOSE_BALL_CONTEST_PRESSURE"))
+    }
+}
+
+/// Both-teams loose-ball **contest pressure**: a symmetric, time-escalating penalty
+/// charged to every outfield player on BOTH teams for each tick an unpossessed ball
+/// is left uncontested beyond the grace (so standing off a loose ball is never free
+/// for either side), plus an explicit reward for actually WINNING the unclaimed ball.
+///
+/// Unlike [`loose_ball_contest_learning_reward`] (which shapes a single candidate's
+/// race/hold choice), this term is deliberately NOT potential-based — the
+/// uncontested-time cost is meant to move the optimal policy toward going and winning
+/// the ball. Because it is charged identically to both teams, it biases only the
+/// urgency of contesting, not the match outcome.
+///
+/// * `uncontested_seconds` — how long the ball has sat loose & uncontested
+///   ([`WorldSnapshot::loose_ball_uncontested_seconds`], read from `before`).
+/// * `won_loose_ball` — the actor's team took controlled possession of the
+///   previously-unheld ball this transition.
+/// * `won_as_holder` — the actor is the player who personally secured it.
+///
+/// Returns `0.0` for a goalkeeper (kept goalside, not pressured off its line) and
+/// when the gate is off, so an unconfigured/off process stays byte-identical.
+fn loose_ball_contest_pressure_reward(
+    role: PlayerRole,
+    uncontested_seconds: f64,
+    won_loose_ball: bool,
+    won_as_holder: bool,
+) -> f64 {
+    if !loose_ball_contest_pressure_enabled() || role == PlayerRole::Goalkeeper {
+        return 0.0;
+    }
+    let reward_cfg = &tunables().reward;
+    let over_grace = (uncontested_seconds - LOOSE_BALL_MAX_UNCONTESTED_SECONDS).max(0.0);
+    let mut reward = 0.0;
+    if over_grace > 0.0 {
+        let penalty = (reward_cfg.loose_ball_uncontested_penalty_per_second * over_grace)
+            .min(reward_cfg.loose_ball_uncontested_penalty_max.max(0.0));
+        reward -= penalty;
+    }
+    if won_loose_ball {
+        // Winning a ball that had sat longer uncontested is more decisive.
+        let urgency_bonus = 1.0 + (over_grace / 1.5).clamp(0.0, 1.0);
+        let secured = if won_as_holder { 1.0 } else { 0.4 };
+        reward += reward_cfg.loose_ball_win_points * urgency_bonus * secured;
+    }
+    reward
+}
+
 fn loose_ball_contest_learning_reward(
     player: &PlayerAgent,
     action: &str,
