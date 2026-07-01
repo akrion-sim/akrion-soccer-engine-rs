@@ -174,7 +174,7 @@ output mapping differ.
 
 ## What's the same
 
-- The **same 26-d feature vector**, in the same attacking frame — now describing
+- The **same 27-d feature vector**, in the same attacking frame — now describing
   the *midfield* line's own kinematics in the `line_*` slots (the builder is called
   with `PlayerRole::Midfielder`).
 - The **same analytic-seed → head** path; `analytic_midfield_gap_fraction` is the
