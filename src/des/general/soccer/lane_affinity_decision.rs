@@ -549,17 +549,48 @@ impl SoccerMatch {
             return;
         }
         let tick = self.tick;
+        // Accumulate THIS tick's real reward-pipeline events per team into every open
+        // decision (the exact reward the rest of the engine optimizes). `reward_events`
+        // is the per-tick scratch buffer; sum each team's players' signed amounts.
+        if !self.pending_lane_affinity.is_empty() && !self.reward_events.is_empty() {
+            let mut home_reward = 0.0;
+            let mut away_reward = 0.0;
+            for event in &self.reward_events {
+                if event.player_id >= self.players.len() || !event.amount.is_finite() {
+                    continue;
+                }
+                match self.players[event.player_id].team {
+                    Team::Home => home_reward += event.amount,
+                    Team::Away => away_reward += event.amount,
+                }
+            }
+            for decision in &mut self.pending_lane_affinity {
+                decision.reward_accum += match decision.team {
+                    Team::Home => home_reward,
+                    Team::Away => away_reward,
+                };
+            }
+        }
         // Resolve due decisions.
         let mut i = 0;
         while i < self.pending_lane_affinity.len() {
             if self.pending_lane_affinity[i].due_tick <= tick {
                 let decision = self.pending_lane_affinity.swap_remove(i);
                 let now_territorial = territorial_advantage(snapshot, decision.team);
-                if now_territorial.is_finite() && decision.decision_territorial.is_finite() {
+                let territorial_delta = if now_territorial.is_finite()
+                    && decision.decision_territorial.is_finite()
+                {
+                    now_territorial - decision.decision_territorial
+                } else {
+                    0.0
+                };
+                let reward = decision.reward_accum
+                    + LANE_AFFINITY_TERRITORIAL_SHAPING_WEIGHT * territorial_delta;
+                if reward.is_finite() {
                     self.lane_affinity_samples.push(LaneAffinitySample {
                         inputs: decision.inputs,
                         action_bias: decision.action_bias,
-                        reward: now_territorial - decision.decision_territorial,
+                        reward,
                     });
                     if self.lane_affinity_samples.len() > LANE_AFFINITY_SAMPLE_CAP {
                         let overflow =
