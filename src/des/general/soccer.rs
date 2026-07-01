@@ -51986,6 +51986,7 @@ fn tracking_frame_to_world_snapshot(
         pass_lane_yield_head: None,
         head_scan_head: None,
         crash_box_head: None,
+        run_prediction_head: None,
         long_pass_run_head: None,
         give_and_go_head: None,
         attack_spacing_head: None,
