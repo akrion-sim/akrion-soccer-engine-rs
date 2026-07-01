@@ -23307,9 +23307,9 @@ pub(crate) fn policy_advantage_standardization(advantages: &[f64]) -> Option<(f6
 
 /// Whether to suppress the centralized MAPPO team component on single-team ticks (ticks where only
 /// one team logged a sample, so the opponent mean is undefined and the "zero-sum" term degenerates
-/// into a one-sided bias — see [`soccer_marl_adjusted_reward`]). OFF by default so the default
-/// training run is byte-identical; set `DD_SOCCER_ENABLE_MARL_BALANCED_TEAM_COMPONENT=1` to opt in.
-/// Read once per process.
+/// into a one-sided bias — see [`soccer_marl_adjusted_reward`]). Default-ON in prod (kill switch
+/// `DD_SOCCER_ENABLE_MARL_BALANCED_TEAM_COMPONENT=0`); default-OFF under test so the parity
+/// training run stays byte-identical. Read once per process.
 pub(crate) fn dd_soccer_enable_marl_balanced_team_component() -> bool {
     #[cfg(test)]
     {
