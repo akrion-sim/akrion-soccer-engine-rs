@@ -4087,6 +4087,11 @@ fn soccer_formation_lp_anchor(
             };
             pull = (pull + bonus).min(0.9);
         }
+        // Do not collapse the spread onto the ball's lane as hard — the block shifts ball-side but
+        // keeps its width so the far side of the pitch is not vacated.
+        if spread {
+            pull *= 0.60;
+        }
         x = x * (1.0 - pull) + (width * 0.5 + ball_lane_pull * width * 0.28) * pull;
         let lane_x =
             vertical_lane_clamped_x_for_role(player.role, home_position.x, x, width, in_possession);
