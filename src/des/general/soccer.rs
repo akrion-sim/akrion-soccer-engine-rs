@@ -2888,15 +2888,12 @@ pub(crate) fn apply_same_team_separation_barrier(
     v
 }
 
-// The "hard" (tighter) overlap band is this fraction of the minimum-spacing
-// radius: about 3.33 yd outside the box, 2 yd inside it. A hard overlap is policed
-// sooner than a merely-soft one.
-const TEAMMATE_SPACING_HARD_FRACTION: f64 = 2.0 / 3.0;
-=======
-// The hard overlap band is 4yd outside the box (5 * 0.80) and 2.4yd when the
-// both-in-box exception applies. Hard overlaps are policed sooner.
+// The "hard" (tighter) overlap band of the legacy soft-spacing framework. Raised to 0.80 of the
+// minimum-spacing radius so it lands at 4yd outside the box (5 * 0.80) — deliberately aligned
+// with the new SAME_TEAM_MIN_SEPARATION_YARDS floor above so the legacy overlap policing and the
+// new hard floor agree on the same 4yd line — and 2.4yd (3 * 0.80) under the both-in-box
+// exception. Hard overlaps are policed sooner than merely-soft ones.
 const TEAMMATE_SPACING_HARD_FRACTION: f64 = 0.80;
->>>>>>> ec46e0b57efb29b0ac82e7b758ec4e34b74343a5
 // Grace windows before a *sustained* overlap is flagged and one of the pair is
 // nudged to move. The target is two seconds to become consistent with the spacing
 // contract; legitimate handoffs still fit inside that window.
