@@ -617,6 +617,13 @@ pub struct SoccerMatch {
     pub(crate) head_scan_samples: Vec<HeadScanSample>,
     /// Open head-scan decisions awaiting their windowed reward.
     pub(crate) pending_head_scan: Vec<PendingHeadScanDecision>,
+    /// The trained crash-box commit head, when present. `None` ⇒ analytic seed. Shared into each
+    /// [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) crash_box_head: Option<std::sync::Arc<CrashBoxHead>>,
+    /// Rolling RL corpus for the crash-box head. Collected only while the model is enabled.
+    pub(crate) crash_box_samples: Vec<CrashBoxSample>,
+    /// Open crash-box decisions awaiting their windowed reward.
+    pub(crate) pending_crash_box: Vec<PendingCrashBoxDecision>,
     /// The trained long-pass run head (which attacker should break forward so a deep carrier
     /// can pick them out), when present. Carried + trained across games by the learner; `None`
     /// ⇒ the analytic `backfield_long_pass_run_invite_for` seed. Shared into each
@@ -3183,6 +3190,9 @@ impl SoccerMatch {
             head_scan_head: None,
             head_scan_samples: Vec::new(),
             pending_head_scan: Vec::new(),
+            crash_box_head: None,
+            crash_box_samples: Vec::new(),
+            pending_crash_box: Vec::new(),
             long_pass_run_head: None,
             long_pass_run_samples: Vec::new(),
             pending_long_pass_run: Vec::new(),
@@ -8695,6 +8705,8 @@ impl SoccerMatch {
         self.collect_pass_lane_yield_rl_samples(&next_snapshot);
         // Learnable head-scan effort RL samples (no-op under test / when disabled).
         self.collect_head_scan_rl_samples(&next_snapshot);
+        // Learnable crash-the-box commit RL samples (no-op under test / when disabled).
+        self.collect_crash_box_rl_samples(&next_snapshot);
         self.collect_long_pass_run_rl_samples(&next_snapshot);
         // Learnable give-and-go / wall-pass appetite RL samples (no-op + byte-identical unless
         // `DD_SOCCER_ENABLE_LEARNED_GIVE_AND_GO` is set).
@@ -22259,6 +22271,10 @@ pub struct WorldSnapshot {
     /// head-scan visibility seam. `None` ⇒ analytic seed (parity). Skipped by serde.
     #[serde(skip)]
     pub(crate) head_scan_head: Option<std::sync::Arc<HeadScanHead>>,
+    /// The trained crash-box commit head, carried from the match for live consumption in the
+    /// crash-the-box seam. `None` ⇒ analytic seed (parity). Skipped by serde.
+    #[serde(skip)]
+    pub(crate) crash_box_head: Option<std::sync::Arc<CrashBoxHead>>,
     /// The trained long-pass run head, carried from the match for live consumption in
     /// `backfield_long_pass_run_invite_for`. `None` ⇒ analytic seed (parity). Skipped by
     /// serde (an internal decision aid; Default = None).
@@ -24939,6 +24955,7 @@ impl WorldSnapshot {
             separation_floor_head: m.separation_floor_head.clone(),
             pass_lane_yield_head: m.pass_lane_yield_head.clone(),
             head_scan_head: m.head_scan_head.clone(),
+            crash_box_head: m.crash_box_head.clone(),
             long_pass_run_head: m.long_pass_run_head.clone(),
             give_and_go_head: m.give_and_go_head.clone(),
             attack_spacing_head: m.attack_spacing_head.clone(),
@@ -44466,6 +44483,12 @@ impl WorldSnapshot {
         if player.role == PlayerRole::Midfielder
             && player.preferences.defensive_mindedness > player.preferences.offensive_mindedness
         {
+            return None;
+        }
+        // Learnable crash-commit (MDP/POMDP): the geometric trigger is a predilection — the
+        // attacker may CHOOSE to hold (recycle / cut-back) instead of gambling into a full box.
+        // Always false when the model is off ⇒ byte-identical (the crash fires as before).
+        if self.crash_box_should_hold(player) {
             return None;
         }
         let dir = player.team.attack_dir();

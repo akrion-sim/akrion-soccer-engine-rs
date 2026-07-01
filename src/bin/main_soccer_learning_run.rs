@@ -13,8 +13,9 @@ use serde::Serialize;
 use soccer_engine::des::general::soccer::{
     soccer_moment_records_from_jsonl, soccer_moment_records_to_learning_dataset,
     train_soccer_pass_completion_head, AttackSpacingHead, BackFourLineHead, GiveAndGoHead,
-    GoalSideRecoveryHead, HeadScanHead, LaneAffinityHead, LongPassRunHead, LooseBallCommitHead,
-    MatchConfig, MatchSummary, PassLaneYieldHead, SeparationFloorHead, WingerPinchHead,
+    CrashBoxHead, GoalSideRecoveryHead, HeadScanHead, LaneAffinityHead, LongPassRunHead,
+    LooseBallCommitHead, MatchConfig, MatchSummary, PassLaneYieldHead, SeparationFloorHead,
+    WingerPinchHead,
     ReceiveApproachHead, ShotTriggerHead, SoccerConfigMomentInsert, SoccerMarlAlgorithm,
     SoccerMatch, SoccerMomentWindow, SoccerNeuralLearningBackend, SoccerNeuralLearningConfig,
     SoccerNeuralNetworkSnapshot, SoccerPassCompletionHead, SoccerPassLearningMetrics,
@@ -23,8 +24,9 @@ use soccer_engine::des::general::soccer::{
     SoccerTacticalLearningSummary, SoccerTacticalLearningWeights, SoccerTeamPolicyArtifact,
     SoccerTeamQPolicies, ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS,
     DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE, DEFAULT_SOCCER_PASS_COMPLETION_LEARNING_RATE,
-    GIVE_AND_GO_HEAD_MIN_TRAINING_STEPS, GOAL_SIDE_RECOVERY_HEAD_MIN_TRAINING_STEPS,
-    HEAD_SCAN_HEAD_MIN_TRAINING_STEPS, LANE_AFFINITY_HEAD_MIN_TRAINING_STEPS,
+    CRASH_BOX_HEAD_MIN_TRAINING_STEPS, GIVE_AND_GO_HEAD_MIN_TRAINING_STEPS,
+    GOAL_SIDE_RECOVERY_HEAD_MIN_TRAINING_STEPS, HEAD_SCAN_HEAD_MIN_TRAINING_STEPS,
+    LANE_AFFINITY_HEAD_MIN_TRAINING_STEPS,
     PASS_LANE_YIELD_HEAD_MIN_TRAINING_STEPS,
     SEPARATION_FLOOR_HEAD_MIN_TRAINING_STEPS, WINGER_PINCH_HEAD_MIN_TRAINING_STEPS,
     LONG_PASS_RUN_HEAD_MIN_TRAINING_STEPS, LOOSE_BALL_COMMIT_HEAD_MIN_TRAINING_STEPS,
@@ -1951,6 +1953,9 @@ static CARRIED_PASS_LANE_YIELD_HEAD: std::sync::Mutex<Option<PassLaneYieldHead>>
 /// In-memory head-scan effort head, carried + trained across games WITHIN a learner process.
 static CARRIED_HEAD_SCAN_HEAD: std::sync::Mutex<Option<HeadScanHead>> = std::sync::Mutex::new(None);
 
+/// In-memory crash-the-box commit head, carried + trained across games WITHIN a learner process.
+static CARRIED_CRASH_BOX_HEAD: std::sync::Mutex<Option<CrashBoxHead>> = std::sync::Mutex::new(None);
+
 /// In-memory learned pass-completion head, carried + trained across games WITHIN a learner
 /// process (seeded once from the Postgres corpus at startup), mirroring
 /// `CARRIED_LINE_DEPTH_HEAD`. Installed on each game so the pass-quality assessor consumes it
@@ -2058,6 +2063,10 @@ fn run_game(
     // Install the carried head-scan effort head so the head-scan visibility seam consumes it live.
     if let Some(head) = CARRIED_HEAD_SCAN_HEAD.lock().unwrap().as_ref() {
         sim.set_head_scan_head(head.clone());
+    }
+    // Install the carried crash-the-box commit head so the box-flood seam consumes it live.
+    if let Some(head) = CARRIED_CRASH_BOX_HEAD.lock().unwrap().as_ref() {
+        sim.set_crash_box_head(head.clone());
     }
     // Install the carried long-pass run head so `backfield_long_pass_run_invite_for` consumes
     // it live once trained. No-op unless DD_SOCCER_ENABLE_LEARNED_LONG_PASS_RUN is set.
@@ -2278,6 +2287,23 @@ fn run_game(
             head_scan_samples.len(),
             head.training_steps(),
             head.training_steps() >= HEAD_SCAN_HEAD_MIN_TRAINING_STEPS,
+            final_loss
+        );
+    }
+    // Train the CARRIED crash-the-box commit head on this game's reward-weighted RL corpus.
+    let crash_box_samples = sim.drain_crash_box_samples();
+    if !crash_box_samples.is_empty() {
+        let mut guard = CARRIED_CRASH_BOX_HEAD.lock().unwrap();
+        let head = guard.get_or_insert_with(|| CrashBoxHead::new(episode_seed as u32));
+        let mut final_loss = 0.0;
+        for _ in 0..4 {
+            final_loss = head.train_reward_weighted(&crash_box_samples, 0.02);
+        }
+        eprintln!(
+            "crash_box_training samples={} training_steps={} consumed={} final_loss={:.5}",
+            crash_box_samples.len(),
+            head.training_steps(),
+            head.training_steps() >= CRASH_BOX_HEAD_MIN_TRAINING_STEPS,
             final_loss
         );
     }
