@@ -25405,6 +25405,16 @@ fn dense_soccer_transition_reward(
                 0.24
             };
         }
+        // Both-teams contest pressure: a symmetric time-escalating penalty while the
+        // ball sits uncontested (charged to every outfielder on both sides) plus an
+        // explicit reward for winning the unclaimed ball. See
+        // `loose_ball_contest_pressure_reward`.
+        reward += loose_ball_contest_pressure_reward(
+            player.role,
+            before.loose_ball_uncontested_seconds(),
+            after_possession == Some(player.team),
+            after.ball.holder == Some(player.id),
+        );
         if moved_yards < 0.06 && before_distance > 9.0 {
             reward -= 0.20;
         }
