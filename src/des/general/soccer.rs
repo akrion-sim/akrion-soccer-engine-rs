@@ -5153,6 +5153,8 @@ const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     SOCCER_NEURAL_PRE_OFFSIDE_RECOVERY_FEATURE_DIM,
     // Same schema with offside-recovery channels, before curve-action execution channels.
     SOCCER_NEURAL_PRE_CURVE_ACTION_FEATURE_DIM,
+    // Persisted queue generation 38 was trained before the remaining Akrion feature tail.
+    498,
     // Same schema with curve-action execution channels, before idea/execution attribution.
     SOCCER_NEURAL_PRE_IDEA_EXECUTION_FEATURE_DIM,
 ];

@@ -42043,6 +42043,64 @@ fn neural_learning_pads_previous_full_snapshot_belief_tail_without_shifting_moti
 }
 
 #[test]
+fn neural_learning_pads_persisted_queue_generation_38_snapshot() {
+    let config = MatchConfig {
+        duration_seconds: 0.2,
+        max_human_players: 0,
+        neural_learning: SoccerNeuralLearningConfig {
+            enabled: true,
+            backend: SoccerNeuralLearningBackend::Inline,
+            hidden_units: 8,
+            ..SoccerNeuralLearningConfig::default()
+        },
+        seed: 15094,
+        ..Default::default()
+    };
+    let mut previous_snapshot = SoccerMatch::default_11v11(config.clone())
+        .learning_snapshot()
+        .neural_network
+        .expect("initial neural snapshot");
+    let previous_dim = 498;
+    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&previous_dim));
+    let removed_weights = previous_snapshot
+        .layers
+        .first()
+        .map(|layer| layer.weights.len())
+        .unwrap_or(0)
+        .saturating_mul(SOCCER_NEURAL_FEATURE_DIM - previous_dim);
+    previous_snapshot.input_dim = previous_dim;
+    previous_snapshot.parameter_count = previous_snapshot
+        .parameter_count
+        .saturating_sub(removed_weights);
+    for row in &mut previous_snapshot.layers[0].weights {
+        row.truncate(previous_dim);
+    }
+    previous_snapshot.layers[0].weights[0][previous_dim - 1] = 0.498_38;
+
+    let resumed = SoccerMatch::default_11v11(config)
+        .with_neural_network_snapshot(previous_snapshot)
+        .expect("resume persisted queue generation 38 neural snapshot");
+    let resumed_snapshot = resumed
+        .learning_snapshot()
+        .neural_network
+        .expect("resumed neural snapshot");
+
+    assert_eq!(resumed_snapshot.input_dim, SOCCER_NEURAL_FEATURE_DIM);
+    assert_eq!(
+        resumed_snapshot.layers[0].weights[0].len(),
+        SOCCER_NEURAL_FEATURE_DIM
+    );
+    assert_eq!(
+        resumed_snapshot.layers[0].weights[0][previous_dim - 1],
+        0.498_38
+    );
+    assert_eq!(
+        resumed_snapshot.layers[0].weights[0][previous_dim], 0.0,
+        "new Akrion tail input should start neutral for 498-input snapshots"
+    );
+}
+
+#[test]
 fn neural_learning_trains_on_threaded_backend() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.4,

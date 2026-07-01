@@ -4798,7 +4798,13 @@ where
                 episode_summaries.push(game.episode_summary);
                 completed_games += 1;
             }
-            Err(_) => {
+            Err(err) => {
+                if failed_games < 5 || failed_games + 1 == config.games {
+                    eprintln!(
+                        "soccer_learning_queue_game_failed failed_game={} error={err}",
+                        failed_games + 1
+                    );
+                }
                 failed_games += 1;
             }
         }
