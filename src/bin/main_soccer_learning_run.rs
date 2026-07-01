@@ -15,7 +15,7 @@ use soccer_engine::des::general::soccer::{
     train_soccer_pass_completion_head, AttackSpacingHead, BackFourLineHead, GiveAndGoHead,
     CrashBoxHead, GoalSideRecoveryHead, HeadScanHead, LaneAffinityHead, LongPassRunHead,
     LooseBallCommitHead, MatchConfig, MatchSummary, PassLaneYieldHead, RunPredictionHead,
-    SeparationFloorHead, WingerPinchHead,
+    SeparationFloorHead, SlipBreakHead, WingerPinchHead,
     ReceiveApproachHead, ShotTriggerHead, SoccerConfigMomentInsert, SoccerMarlAlgorithm,
     SoccerMatch, SoccerMomentWindow, SoccerNeuralLearningBackend, SoccerNeuralLearningConfig,
     SoccerNeuralNetworkSnapshot, SoccerPassCompletionHead, SoccerPassLearningMetrics,
@@ -28,7 +28,8 @@ use soccer_engine::des::general::soccer::{
     GOAL_SIDE_RECOVERY_HEAD_MIN_TRAINING_STEPS, HEAD_SCAN_HEAD_MIN_TRAINING_STEPS,
     LANE_AFFINITY_HEAD_MIN_TRAINING_STEPS,
     PASS_LANE_YIELD_HEAD_MIN_TRAINING_STEPS, RUN_PREDICTION_HEAD_MIN_TRAINING_STEPS,
-    SEPARATION_FLOOR_HEAD_MIN_TRAINING_STEPS, WINGER_PINCH_HEAD_MIN_TRAINING_STEPS,
+    SEPARATION_FLOOR_HEAD_MIN_TRAINING_STEPS, SLIP_BREAK_HEAD_MIN_TRAINING_STEPS,
+    WINGER_PINCH_HEAD_MIN_TRAINING_STEPS,
     LONG_PASS_RUN_HEAD_MIN_TRAINING_STEPS, LOOSE_BALL_COMMIT_HEAD_MIN_TRAINING_STEPS,
     PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS, RECEIVE_APPROACH_HEAD_MIN_TRAINING_STEPS,
     SHOT_TRIGGER_HEAD_MIN_TRAINING_STEPS,
@@ -1960,6 +1961,10 @@ static CARRIED_CRASH_BOX_HEAD: std::sync::Mutex<Option<CrashBoxHead>> = std::syn
 static CARRIED_RUN_PREDICTION_HEAD: std::sync::Mutex<Option<RunPredictionHead>> =
     std::sync::Mutex::new(None);
 
+/// In-memory slip-break commit head, carried + trained across games WITHIN a learner process.
+static CARRIED_SLIP_BREAK_HEAD: std::sync::Mutex<Option<SlipBreakHead>> =
+    std::sync::Mutex::new(None);
+
 /// In-memory learned pass-completion head, carried + trained across games WITHIN a learner
 /// process (seeded once from the Postgres corpus at startup), mirroring
 /// `CARRIED_LINE_DEPTH_HEAD`. Installed on each game so the pass-quality assessor consumes it
@@ -2075,6 +2080,10 @@ fn run_game(
     // Install the carried off-ball run-selection head so the open-space run seam consumes it live.
     if let Some(head) = CARRIED_RUN_PREDICTION_HEAD.lock().unwrap().as_ref() {
         sim.set_run_prediction_head(head.clone());
+    }
+    // Install the carried slip-break commit head so the slip-break opportunity seam consumes it live.
+    if let Some(head) = CARRIED_SLIP_BREAK_HEAD.lock().unwrap().as_ref() {
+        sim.set_slip_break_head(head.clone());
     }
     // Install the carried long-pass run head so `backfield_long_pass_run_invite_for` consumes
     // it live once trained. No-op unless DD_SOCCER_ENABLE_LEARNED_LONG_PASS_RUN is set.
@@ -2329,6 +2338,23 @@ fn run_game(
             run_prediction_samples.len(),
             head.training_steps(),
             head.training_steps() >= RUN_PREDICTION_HEAD_MIN_TRAINING_STEPS,
+            final_loss
+        );
+    }
+    // Train the CARRIED slip-break commit head on this game's reward-weighted RL corpus.
+    let slip_break_samples = sim.drain_slip_break_samples();
+    if !slip_break_samples.is_empty() {
+        let mut guard = CARRIED_SLIP_BREAK_HEAD.lock().unwrap();
+        let head = guard.get_or_insert_with(|| SlipBreakHead::new(episode_seed as u32));
+        let mut final_loss = 0.0;
+        for _ in 0..4 {
+            final_loss = head.train_reward_weighted(&slip_break_samples, 0.02);
+        }
+        eprintln!(
+            "slip_break_training samples={} training_steps={} consumed={} final_loss={:.5}",
+            slip_break_samples.len(),
+            head.training_steps(),
+            head.training_steps() >= SLIP_BREAK_HEAD_MIN_TRAINING_STEPS,
             final_loss
         );
     }
