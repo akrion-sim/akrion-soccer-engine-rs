@@ -63621,6 +63621,9 @@ fn default_players(config: &MatchConfig, _rng: &mut SeededRandom) -> Vec<PlayerA
                 last_tick_locomotion_joules: 0.0,
                 sustained_sprint_seconds: 0.0,
                 sustained_sprint_distance_yards: 0.0,
+                same_team_proximity_dwell_lt7_seconds: 0.0,
+                same_team_proximity_dwell_lt6_seconds: 0.0,
+                same_team_proximity_dwell_lt5_seconds: 0.0,
                 incoming_ball: None,
                 // Deterministic, position-only skills: every player is the same
                 // overall standard, shaped by their shirt (1-11) and identical
