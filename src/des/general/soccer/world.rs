@@ -44544,12 +44544,20 @@ impl WorldSnapshot {
         let back_post_offside = back_post_probe
             .map(|probe| self.position_would_be_offside(player.team, probe))
             .unwrap_or(true);
-        let choice = decide_winger_pinch(
+        // Learnable pinch appetite (MDP/POMDP): fold a learned stay-vs-pinch bias into the bucket
+        // scoring. Gated ON in prod (analytic prior ≈ 0 ⇒ near-identical argmax), OFF under test
+        // ⇒ bias 0 ⇒ byte-identical to `decide_winger_pinch`.
+        let pinch_bias = self
+            .build_winger_pinch_inputs(player)
+            .map(|inputs| self.winger_pinch_effective_bias(&inputs))
+            .unwrap_or(0.0);
+        let choice = decide_winger_pinch_with_bias(
             ball_on_my_flank,
             crossing_position_on,
             depth_frac,
             box_congestion,
             back_post_offside,
+            pinch_bias,
         );
         let target = winger_pinch_target(
             choice,
