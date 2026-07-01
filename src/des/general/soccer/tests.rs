@@ -94186,53 +94186,8 @@ fn same_team_proximity_penalty_curve_is_graduated_huge_to_small() {
     assert_eq!(same_team_proximity_penalty_unit(f64::NAN), 0.0);
 }
 
-#[test]
-fn separation_barrier_smoothly_stops_approach_at_the_floor() {
-    let dt = 1.0 / 15.0;
-    let me = Vec2::new(50.0, 50.0);
-    // A teammate 5yd straight ahead (+y); I am sprinting straight at them.
-    let mate = Vec2::new(50.0, 55.0);
-    let toward = Vec2::new(0.0, 8.0);
-    let damped = apply_same_team_separation_barrier(me, toward, &[(mate, false)], dt);
-    // Inside the influence band, the inward (toward-teammate) speed is reduced, never reversed.
-    assert!(damped.y > 0.0 && damped.y < toward.y, "inward speed smoothly reduced, not stopped hard: {damped:?}");
-
-    // Exactly at the floor there is zero permitted approach (smooth arrival, not a wall bounce).
-    let at_floor_mate = Vec2::new(50.0, 54.0); // 4yd ahead
-    let at_floor = apply_same_team_separation_barrier(me, toward, &[(at_floor_mate, false)], dt);
-    assert!(at_floor.y <= 1e-6, "no inward motion permitted at the 4yd floor: {at_floor:?}");
-
-    // Tangential motion (parallel, no closing) is untouched.
-    let sideways = Vec2::new(6.0, 0.0);
-    let tangential = apply_same_team_separation_barrier(me, sideways, &[(at_floor_mate, false)], dt);
-    assert!((tangential.x - 6.0).abs() < 1e-9 && tangential.y.abs() < 1e-9, "tangential preserved: {tangential:?}");
-
-    // Moving AWAY is never constrained.
-    let away = Vec2::new(0.0, -8.0);
-    let away_out = apply_same_team_separation_barrier(me, away, &[(at_floor_mate, false)], dt);
-    assert!((away_out.y + 8.0).abs() < 1e-9, "peeling away is free: {away_out:?}");
-
-    // The both-in-box exemption disables the barrier for that pair.
-    let exempt = apply_same_team_separation_barrier(me, toward, &[(at_floor_mate, true)], dt);
-    assert!((exempt.y - toward.y).abs() < 1e-9, "exempt (both in box) pair is not damped: {exempt:?}");
-}
-
-#[test]
-fn separation_barrier_never_lets_a_step_cross_the_floor() {
-    // Integrate one tick under a high inward speed and assert the gap never drops below 4yd.
-    let dt = 1.0 / 15.0;
-    let mate = Vec2::new(50.0, 55.0);
-    let mut me = Vec2::new(50.0, 50.0);
-    for _ in 0..40 {
-        let v = apply_same_team_separation_barrier(me, Vec2::new(0.0, 20.0), &[(mate, false)], dt);
-        me = me + v * dt;
-        assert!(
-            me.distance(mate) >= SAME_TEAM_MIN_SEPARATION_YARDS - 1e-6,
-            "step crossed the 4yd floor: gap={}",
-            me.distance(mate)
-        );
-    }
-}
+// NOTE: the old `separation_barrier_*` tests were removed with the hard movement barrier — the
+// 4yd line is enforced by a strong graduated PENALTY (+ MPC route cost), not a physical clamp.
 
 /// Serialise the same-team separation-floor tests that toggle the env gate (read fresh under
 /// cfg(test)), so concurrent tests don't see each other's `set_var` window.
