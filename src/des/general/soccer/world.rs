@@ -25158,6 +25158,7 @@ impl WorldSnapshot {
                 std::collections::HashMap::new(),
             ),
             line_depth_head: m.line_depth_head.clone(),
+            defender_line_head: m.defender_line_head.clone(),
             back_four_line_latch_centre_depth: [
                 m.back_four_line_latch[0].map(|l| l.centre_depth),
                 m.back_four_line_latch[1].map(|l| l.centre_depth),
