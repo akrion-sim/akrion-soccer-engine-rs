@@ -23293,6 +23293,29 @@ fn dd_soccer_enable_off_ball_space_discipline() -> bool {
         *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_OFF_BALL_SPACE_DISCIPLINE"))
     }
 }
+/// Forward-run-when-unmarked (gated, default-ON = the desired behaviour; kill switch for A/B).
+/// Principle: when the team is in possession and this off-ball player is UNMARKED (no opponent
+/// within [`FORWARD_RUN_UNMARKED_MARK_RADIUS_YARDS`]) and CAN run forward into open space, he must
+/// not elect a BACKWARD run — the team should move forward in possession. When ON, `open_space_for`
+/// applies a veto-strength penalty to backward candidates (and a bonus to forward-into-space ones)
+/// for such a player, but ONLY when a forward-into-space option genuinely exists, so a legitimate
+/// drop to offer an outlet when everything ahead is covered is untouched. Set
+/// `DD_SOCCER_ENABLE_FORWARD_RUN_WHEN_UNMARKED=0` (or `false`/`no`/`off`) to restore the old
+/// weak-forward-bias scoring (byte-identical A/B).
+fn dd_soccer_enable_forward_run_when_unmarked() -> bool {
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_FORWARD_RUN_WHEN_UNMARKED").is_ok())
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_FORWARD_RUN_WHEN_UNMARKED"))
+    }
+}
 /// One-two "give to feet" + bound wall-partner reception. ON by default: a one-two give is aimed
 /// at the wall partner's feet (not led ahead toward goal like a through-ball) and the named
 /// partner is bound to collect it, so the give can't be thrown into space the partner never
