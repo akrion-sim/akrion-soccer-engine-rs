@@ -15,7 +15,7 @@ use soccer_engine::des::general::soccer::{
     train_soccer_pass_completion_head, AttackSpacingHead, BackFourLineHead, GiveAndGoHead,
     CrashBoxHead, GoalSideRecoveryHead, HeadScanHead, LaneAffinityHead, LongPassRunHead,
     LooseBallCommitHead, MatchConfig, MatchSummary, PassLaneYieldHead, RunPredictionHead,
-    SeparationFloorHead, WingerPinchHead,
+    SeparationFloorHead, SlipBreakHead, WingerPinchHead,
     ReceiveApproachHead, ShotTriggerHead, SoccerConfigMomentInsert, SoccerMarlAlgorithm,
     SoccerMatch, SoccerMomentWindow, SoccerNeuralLearningBackend, SoccerNeuralLearningConfig,
     SoccerNeuralNetworkSnapshot, SoccerPassCompletionHead, SoccerPassLearningMetrics,
