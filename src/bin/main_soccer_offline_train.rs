@@ -106,8 +106,19 @@ fn main() -> std::io::Result<()> {
 
     // 2) Fold the accumulated cross-game tabular corpus into the policy — no games, just the
     //    logged experience re-weighted by `prior_weight` (>1 trusts the fresh corpus more).
+    //    Bound the scan to runs completed SINCE the base version (the delta since base), like the
+    //    live learner — an unbounded ORDER BY over the full 20M+ row corpus times out and would
+    //    also over-weight ancient experience. `SOCCER_OFFLINE_TRAIN_SINCE_BASE=0` widens to all
+    //    history (only sane with a large `SOCCER_PG_STATEMENT_TIMEOUT` and a small delta_rows).
+    let created_after_micros = if env_flag("SOCCER_OFFLINE_TRAIN_ALL_HISTORY") {
+        None
+    } else if base.updated_at_micros > 0 {
+        Some(base.updated_at_micros)
+    } else {
+        None
+    };
     let delta = store
-        .load_recent_completed_run_policy_delta(&source_experiment, delta_rows, None)
+        .load_recent_completed_run_policy_delta(&source_experiment, delta_rows, created_after_micros)
         .map_err(other)?;
     let delta_entries = delta.entries.len();
     let merged = if delta_entries > 0 {
