@@ -1324,11 +1324,37 @@ impl SoccerLearningPgStore {
         &mut self,
         experiment_id: &str,
     ) -> Result<Option<SoccerLearningPgPolicyMetadata>, String> {
+        self.load_latest_policy_metadata(experiment_id, false)
+    }
+
+    /// Latest policy metadata for a live/inference server. With `include_unpromoted =
+    /// false` this is the strict "newest ACTIVE (promotion-gated)" selection every
+    /// training path relies on. With `include_unpromoted = true` it returns the
+    /// highest match-fitness version on record REGARDLESS of promotion status (ties
+    /// broken toward the newest) — so :5055 can reflect the learner's best candidate
+    /// even while the promotion gate is holding it out of `active`.
+    pub fn load_latest_policy_metadata(
+        &mut self,
+        experiment_id: &str,
+        include_unpromoted: bool,
+    ) -> Result<Option<SoccerLearningPgPolicyMetadata>, String> {
         self.ensure_connected()?;
-        let Some(row) = self
-            .client
-            .query_opt(
-                r#"
+        // Same row shape for both selections; only the WHERE/ORDER differ.
+        let sql = if include_unpromoted {
+            r#"
+                select
+                  id::text,
+                  generation,
+                  metrics,
+                  config,
+                  coalesce((extract(epoch from updated_at) * 1000000)::bigint, 0)
+                from des_soccer_learning_policy_versions
+                where experiment_id = $1::text::uuid and fitness_micros is not null
+                order by fitness_micros desc, generation desc, updated_at desc, id desc
+                limit 1
+                "#
+        } else {
+            r#"
                 select
                   id::text,
                   generation,
@@ -1339,9 +1365,11 @@ impl SoccerLearningPgStore {
                 where experiment_id = $1::text::uuid and status = 'active'
                 order by generation desc, updated_at desc, id desc
                 limit 1
-                "#,
-                &[&experiment_id],
-            )
+                "#
+        };
+        let Some(row) = self
+            .client
+            .query_opt(sql, &[&experiment_id])
             .map_err(|err| format!("select latest soccer policy version metadata: {err}"))?
         else {
             return Ok(None);
