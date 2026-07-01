@@ -624,6 +624,13 @@ pub struct SoccerMatch {
     pub(crate) crash_box_samples: Vec<CrashBoxSample>,
     /// Open crash-box decisions awaiting their windowed reward.
     pub(crate) pending_crash_box: Vec<PendingCrashBoxDecision>,
+    /// The trained off-ball run-selection head, when present. `None` ⇒ analytic seed. Shared into
+    /// each [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) run_prediction_head: Option<std::sync::Arc<RunPredictionHead>>,
+    /// Rolling RL corpus for the run-selection head. Collected only while the model is enabled.
+    pub(crate) run_prediction_samples: Vec<RunPredictionSample>,
+    /// Open run-selection decisions awaiting their windowed reward.
+    pub(crate) pending_run_prediction: Vec<PendingRunPredictionDecision>,
     /// The trained long-pass run head (which attacker should break forward so a deep carrier
     /// can pick them out), when present. Carried + trained across games by the learner; `None`
     /// ⇒ the analytic `backfield_long_pass_run_invite_for` seed. Shared into each
@@ -3193,6 +3200,9 @@ impl SoccerMatch {
             crash_box_head: None,
             crash_box_samples: Vec::new(),
             pending_crash_box: Vec::new(),
+            run_prediction_head: None,
+            run_prediction_samples: Vec::new(),
+            pending_run_prediction: Vec::new(),
             long_pass_run_head: None,
             long_pass_run_samples: Vec::new(),
             pending_long_pass_run: Vec::new(),
@@ -8707,6 +8717,8 @@ impl SoccerMatch {
         self.collect_head_scan_rl_samples(&next_snapshot);
         // Learnable crash-the-box commit RL samples (no-op under test / when disabled).
         self.collect_crash_box_rl_samples(&next_snapshot);
+        // Learnable off-ball run-selection RL samples (no-op under test / when disabled).
+        self.collect_run_prediction_rl_samples(&next_snapshot);
         self.collect_long_pass_run_rl_samples(&next_snapshot);
         // Learnable give-and-go / wall-pass appetite RL samples (no-op + byte-identical unless
         // `DD_SOCCER_ENABLE_LEARNED_GIVE_AND_GO` is set).
@@ -22275,6 +22287,10 @@ pub struct WorldSnapshot {
     /// crash-the-box seam. `None` ⇒ analytic seed (parity). Skipped by serde.
     #[serde(skip)]
     pub(crate) crash_box_head: Option<std::sync::Arc<CrashBoxHead>>,
+    /// The trained off-ball run-selection head, carried from the match for live consumption in the
+    /// open-space run seam. `None` ⇒ analytic seed (parity). Skipped by serde.
+    #[serde(skip)]
+    pub(crate) run_prediction_head: Option<std::sync::Arc<RunPredictionHead>>,
     /// The trained long-pass run head, carried from the match for live consumption in
     /// `backfield_long_pass_run_invite_for`. `None` ⇒ analytic seed (parity). Skipped by
     /// serde (an internal decision aid; Default = None).
@@ -24956,6 +24972,7 @@ impl WorldSnapshot {
             pass_lane_yield_head: m.pass_lane_yield_head.clone(),
             head_scan_head: m.head_scan_head.clone(),
             crash_box_head: m.crash_box_head.clone(),
+            run_prediction_head: m.run_prediction_head.clone(),
             long_pass_run_head: m.long_pass_run_head.clone(),
             give_and_go_head: m.give_and_go_head.clone(),
             attack_spacing_head: m.attack_spacing_head.clone(),
@@ -46072,6 +46089,10 @@ impl WorldSnapshot {
         // its own spatial cluster. No-op when off (empty `scored_candidates`) or
         // when the argmax sits alone ⇒ byte-identical to the bare argmax.
         if collect_run_modes {
+            // Learnable run selection (MDP/POMDP): tilt the argmax off the scored surface toward a
+            // more forward / safer run per a learned preference. At bias 0 (or model off) the
+            // argmax is unchanged ⇒ byte-identical.
+            best = self.run_prediction_tilted_destination(player_id, &scored_candidates, best);
             best = blended_argmax_destination(&scored_candidates, best);
         }
         // Final safety: hold attacking players onside (forwards/mids, in

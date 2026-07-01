@@ -14,8 +14,8 @@ use soccer_engine::des::general::soccer::{
     soccer_moment_records_from_jsonl, soccer_moment_records_to_learning_dataset,
     train_soccer_pass_completion_head, AttackSpacingHead, BackFourLineHead, GiveAndGoHead,
     CrashBoxHead, GoalSideRecoveryHead, HeadScanHead, LaneAffinityHead, LongPassRunHead,
-    LooseBallCommitHead, MatchConfig, MatchSummary, PassLaneYieldHead, SeparationFloorHead,
-    WingerPinchHead,
+    LooseBallCommitHead, MatchConfig, MatchSummary, PassLaneYieldHead, RunPredictionHead,
+    SeparationFloorHead, WingerPinchHead,
     ReceiveApproachHead, ShotTriggerHead, SoccerConfigMomentInsert, SoccerMarlAlgorithm,
     SoccerMatch, SoccerMomentWindow, SoccerNeuralLearningBackend, SoccerNeuralLearningConfig,
     SoccerNeuralNetworkSnapshot, SoccerPassCompletionHead, SoccerPassLearningMetrics,
@@ -27,7 +27,7 @@ use soccer_engine::des::general::soccer::{
     CRASH_BOX_HEAD_MIN_TRAINING_STEPS, GIVE_AND_GO_HEAD_MIN_TRAINING_STEPS,
     GOAL_SIDE_RECOVERY_HEAD_MIN_TRAINING_STEPS, HEAD_SCAN_HEAD_MIN_TRAINING_STEPS,
     LANE_AFFINITY_HEAD_MIN_TRAINING_STEPS,
-    PASS_LANE_YIELD_HEAD_MIN_TRAINING_STEPS,
+    PASS_LANE_YIELD_HEAD_MIN_TRAINING_STEPS, RUN_PREDICTION_HEAD_MIN_TRAINING_STEPS,
     SEPARATION_FLOOR_HEAD_MIN_TRAINING_STEPS, WINGER_PINCH_HEAD_MIN_TRAINING_STEPS,
     LONG_PASS_RUN_HEAD_MIN_TRAINING_STEPS, LOOSE_BALL_COMMIT_HEAD_MIN_TRAINING_STEPS,
     PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS, RECEIVE_APPROACH_HEAD_MIN_TRAINING_STEPS,
@@ -1956,6 +1956,10 @@ static CARRIED_HEAD_SCAN_HEAD: std::sync::Mutex<Option<HeadScanHead>> = std::syn
 /// In-memory crash-the-box commit head, carried + trained across games WITHIN a learner process.
 static CARRIED_CRASH_BOX_HEAD: std::sync::Mutex<Option<CrashBoxHead>> = std::sync::Mutex::new(None);
 
+/// In-memory off-ball run-selection head, carried + trained across games WITHIN a learner process.
+static CARRIED_RUN_PREDICTION_HEAD: std::sync::Mutex<Option<RunPredictionHead>> =
+    std::sync::Mutex::new(None);
+
 /// In-memory learned pass-completion head, carried + trained across games WITHIN a learner
 /// process (seeded once from the Postgres corpus at startup), mirroring
 /// `CARRIED_LINE_DEPTH_HEAD`. Installed on each game so the pass-quality assessor consumes it
@@ -2067,6 +2071,10 @@ fn run_game(
     // Install the carried crash-the-box commit head so the box-flood seam consumes it live.
     if let Some(head) = CARRIED_CRASH_BOX_HEAD.lock().unwrap().as_ref() {
         sim.set_crash_box_head(head.clone());
+    }
+    // Install the carried off-ball run-selection head so the open-space run seam consumes it live.
+    if let Some(head) = CARRIED_RUN_PREDICTION_HEAD.lock().unwrap().as_ref() {
+        sim.set_run_prediction_head(head.clone());
     }
     // Install the carried long-pass run head so `backfield_long_pass_run_invite_for` consumes
     // it live once trained. No-op unless DD_SOCCER_ENABLE_LEARNED_LONG_PASS_RUN is set.
@@ -2304,6 +2312,23 @@ fn run_game(
             crash_box_samples.len(),
             head.training_steps(),
             head.training_steps() >= CRASH_BOX_HEAD_MIN_TRAINING_STEPS,
+            final_loss
+        );
+    }
+    // Train the CARRIED off-ball run-selection head on this game's reward-weighted RL corpus.
+    let run_prediction_samples = sim.drain_run_prediction_samples();
+    if !run_prediction_samples.is_empty() {
+        let mut guard = CARRIED_RUN_PREDICTION_HEAD.lock().unwrap();
+        let head = guard.get_or_insert_with(|| RunPredictionHead::new(episode_seed as u32));
+        let mut final_loss = 0.0;
+        for _ in 0..4 {
+            final_loss = head.train_reward_weighted(&run_prediction_samples, 0.02);
+        }
+        eprintln!(
+            "run_prediction_training samples={} training_steps={} consumed={} final_loss={:.5}",
+            run_prediction_samples.len(),
+            head.training_steps(),
+            head.training_steps() >= RUN_PREDICTION_HEAD_MIN_TRAINING_STEPS,
             final_loss
         );
     }

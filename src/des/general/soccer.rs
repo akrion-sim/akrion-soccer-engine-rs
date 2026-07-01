@@ -108,6 +108,8 @@ mod head_scan_decision;
 pub use head_scan_decision::*;
 mod crash_box_decision;
 pub use crash_box_decision::*;
+mod run_prediction_decision;
+pub use run_prediction_decision::*;
 mod policy_select;
 pub use policy_select::*;
 mod pass_lane_yield;
@@ -51984,6 +51986,7 @@ fn tracking_frame_to_world_snapshot(
         pass_lane_yield_head: None,
         head_scan_head: None,
         crash_box_head: None,
+        run_prediction_head: None,
         long_pass_run_head: None,
         give_and_go_head: None,
         attack_spacing_head: None,
