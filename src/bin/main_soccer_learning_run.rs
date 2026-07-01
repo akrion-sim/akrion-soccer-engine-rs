@@ -2315,6 +2315,23 @@ fn run_game(
             final_loss
         );
     }
+    // Train the CARRIED off-ball run-selection head on this game's reward-weighted RL corpus.
+    let run_prediction_samples = sim.drain_run_prediction_samples();
+    if !run_prediction_samples.is_empty() {
+        let mut guard = CARRIED_RUN_PREDICTION_HEAD.lock().unwrap();
+        let head = guard.get_or_insert_with(|| RunPredictionHead::new(episode_seed as u32));
+        let mut final_loss = 0.0;
+        for _ in 0..4 {
+            final_loss = head.train_reward_weighted(&run_prediction_samples, 0.02);
+        }
+        eprintln!(
+            "run_prediction_training samples={} training_steps={} consumed={} final_loss={:.5}",
+            run_prediction_samples.len(),
+            head.training_steps(),
+            head.training_steps() >= RUN_PREDICTION_HEAD_MIN_TRAINING_STEPS,
+            final_loss
+        );
+    }
     // Train the CARRIED long-pass run head on this game's reward-weighted RL corpus (which
     // attacker breaking forward led to the team advancing the ball). Empty + skipped unless
     // DD_SOCCER_ENABLE_LEARNED_LONG_PASS_RUN is set.
