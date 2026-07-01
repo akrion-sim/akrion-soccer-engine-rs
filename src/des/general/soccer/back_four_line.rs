@@ -89,6 +89,12 @@ const DEFENSIVE_LINE_WINGBACK_FORWARD_PRIORITY_ENABLE_ENV: &str =
     "DD_SOCCER_ENABLE_WINGBACK_FORWARD_PRIORITY";
 /// Env gate (default-ON) for the press-to-attackers compaction of the v2 line centre.
 const BACK_FOUR_ATTACKER_PRESS_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_ATTACKER_PRESS";
+/// Env kill switch (default-ON) for the TIGHTER foremost-four gaps + harder push (sit closer to the
+/// opponents' front line). See [`back_four_tighter_line_enabled`].
+const BACK_FOUR_TIGHTER_LINE_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_TIGHTER_LINE";
+/// Env kill switch (default-ON) for the ball-far offside-trap push-up. See
+/// [`back_four_ball_far_push_up_enabled`].
+const BACK_FOUR_BALL_FAR_PUSH_UP_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_BALL_FAR_PUSH_UP";
 /// Env gate (default-ON) for the energy-conservation hold deadband on the v2 line target.
 const BACK_FOUR_LINE_HOLD_DEADBAND_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_LINE_HOLD_DEADBAND";
 /// Env kill switch (default-ON) for the **sticky line anchor**: the back-four line CENTRE is latched
@@ -135,6 +141,28 @@ pub const BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_DISPOSSESSION_YARDS: f64 = 
 pub const BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_DEFENDING_YARDS: f64 = 30.0;
 pub const BACK_FOUR_FOREMOST_FOUR_ATTACKER_MIN_GAP_YARDS: f64 = 14.0;
 pub const BACK_FOUR_FOREMOST_FOUR_ATTACKER_MAX_PUSH_YARDS: f64 = 12.0;
+
+// ---- Tighter line (default-ON): sit CLOSER to the opponents' foremost four and push up harder ----
+// The legacy ideal gaps (24/26/30) left the back four sitting ~24-30yd behind the opponents' front
+// line — far too much space to play a pass into feet, and visually "backing off". These tighter
+// gaps + a higher push cap + firmer gains make the line step up to stay connected to the foremost
+// four, per the coaching cue "there shouldn't be so much space between the back 4 and the
+// forward-most opponents". Still never steps AHEAD of the attackers (no runner played onside).
+pub const BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_IN_POSSESSION_TIGHT_YARDS: f64 = 12.0;
+pub const BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_DISPOSSESSION_TIGHT_YARDS: f64 = 15.0;
+pub const BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_DEFENDING_TIGHT_YARDS: f64 = 20.0;
+pub const BACK_FOUR_FOREMOST_FOUR_ATTACKER_MAX_PUSH_TIGHT_YARDS: f64 = 26.0;
+
+// ---- Ball-far offside-trap push-up (default-ON) ----
+// "The defense can push up to play an offside trap when the ball is far away and the back four is
+// more than 5 yards inside its own half." When the (predicted) ball is upfield in the opponent
+// half by this margin AND the line still sits deeper than [own half − OWN_HALF_MARGIN], the line
+// steps up to a high trap line: a small gap GOALSIDE of the opponents' SINGLE most-advanced
+// attacker (so nobody is left in behind), capped at the high-line ceiling. Held off while the
+// opponent is in clear control (no pushing into a live counter).
+pub const BACK_FOUR_BALL_FAR_PUSH_UP_BALL_MARGIN_YARDS: f64 = 6.0;
+pub const BACK_FOUR_BALL_FAR_PUSH_UP_OWN_HALF_MARGIN_YARDS: f64 = 5.0;
+pub const BACK_FOUR_BALL_FAR_PUSH_UP_TRAP_GAP_YARDS: f64 = 4.0;
 
 /// Minimum trailing gap (yd behind the ball) the back four holds **while WE control the ball**.
 /// In possession the line may step right up to support the attack, so the floor drops from the
@@ -217,6 +245,20 @@ pub const BACK_FOUR_ATTACKER_COMPACTNESS_REWARD_PER_YARD: f64 = 0.02;
 /// Env kill switch for the state-adaptive back-four block width (see
 /// [`back_four_adaptive_width_enabled`]).
 const BACK_FOUR_ADAPTIVE_WIDTH_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_ADAPTIVE_WIDTH";
+/// Env kill switch for flooring the back-four block width at the four's own FORMATION span (see
+/// [`back_four_formation_width_floor_enabled`]).
+const BACK_FOUR_FORMATION_WIDTH_FLOOR_ENABLE_ENV: &str =
+    "DD_SOCCER_ENABLE_BACK_FOUR_FORMATION_WIDTH_FLOOR";
+/// Fraction of the back four's home-lane span (the max minus min of the four defenders' home x)
+/// that the block width may never fall below. The adaptive-width floor
+/// ([`BACK_FOUR_ADAPTIVE_WIDTH_MIN_YARDS`] = 34yd) is far narrower than a standard back-four home
+/// span (~52yd on an 80yd pitch: home x 14/31/49/66), so against a central attack the block tucked
+/// the fullbacks a full lane infield off their channels (lanes 2/9 → 3/8) and GIFTED the flanks —
+/// the "back four ignore their lane" bug. Flooring the width at ~the formation span keeps each
+/// defender in its lane; kept just under 1.0 so a small justified tuck is still allowed and the
+/// ball-side centre shift never forces the ball-far fullback off the pitch. The floor only ever
+/// WIDENS the block, so it cannot worsen flank coverage.
+pub const BACK_FOUR_FORMATION_WIDTH_FLOOR_FRACTION: f64 = 0.94;
 /// Shoulder margin (yd) the state-adaptive back-four width adds beyond the widest foremost attacker
 /// on each side, so the line COVERS the man rather than sitting level with him. See
 /// [`back_four_adaptive_width_yards`].
@@ -248,6 +290,24 @@ pub fn back_four_adaptive_width_enabled() -> bool {
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| gate_default_on(BACK_FOUR_ADAPTIVE_WIDTH_ENABLE_ENV))
+    }
+}
+
+/// Whether the back-four block width is floored at the four's own FORMATION span
+/// ([`BACK_FOUR_FORMATION_WIDTH_FLOOR_FRACTION`] × the home-lane span), so the fullbacks hold their
+/// wide lanes instead of tucking infield behind the narrower adaptive-width floor. Default-ON in
+/// production (kill switch `DD_SOCCER_ENABLE_BACK_FOUR_FORMATION_WIDTH_FLOOR=0`); default-OFF under
+/// test so the defensive-shape parity suite stays byte-identical.
+pub fn back_four_formation_width_floor_enabled() -> bool {
+    #[cfg(test)]
+    {
+        env_flag_enabled(BACK_FOUR_FORMATION_WIDTH_FLOOR_ENABLE_ENV)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| gate_default_on(BACK_FOUR_FORMATION_WIDTH_FLOOR_ENABLE_ENV))
     }
 }
 
@@ -351,6 +411,40 @@ pub fn back_four_press_to_attackers_enabled() -> bool {
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| gate_default_on(BACK_FOUR_ATTACKER_PRESS_ENABLE_ENV))
+    }
+}
+
+/// Whether the back four uses the TIGHTER foremost-four ideal gaps + higher push cap (sit closer to
+/// the opponents' front line, step up harder). Default-ON in production (kill switch
+/// `DD_SOCCER_ENABLE_BACK_FOUR_TIGHTER_LINE=0` reverts to the legacy 24/26/30 gaps); default-OFF
+/// under test so the line-depth parity suite stays byte-identical.
+pub fn back_four_tighter_line_enabled() -> bool {
+    #[cfg(test)]
+    {
+        env_flag_enabled(BACK_FOUR_TIGHTER_LINE_ENABLE_ENV)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| gate_default_on(BACK_FOUR_TIGHTER_LINE_ENABLE_ENV))
+    }
+}
+
+/// Whether the **ball-far offside-trap push-up** is applied: when the ball is far upfield and the
+/// line is still >5yd inside our own half (and we are not being driven at), step the line up to a
+/// small gap goalside of the opponents' most-advanced attacker. Default-ON in production (kill
+/// switch `DD_SOCCER_ENABLE_BACK_FOUR_BALL_FAR_PUSH_UP=0`); default-OFF under test.
+pub fn back_four_ball_far_push_up_enabled() -> bool {
+    #[cfg(test)]
+    {
+        env_flag_enabled(BACK_FOUR_BALL_FAR_PUSH_UP_ENABLE_ENV)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| gate_default_on(BACK_FOUR_BALL_FAR_PUSH_UP_ENABLE_ENV))
     }
 }
 

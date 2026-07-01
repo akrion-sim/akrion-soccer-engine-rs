@@ -1330,6 +1330,16 @@ const STALE_DRIBBLE_STEAL_EXTRA_PENALTY_POINTS: f64 = 5.25;
 const NON_ELITE_DRIBBLE_HOLD_SKILL_CUTOFF: f64 = 0.90;
 const NON_ELITE_DRIBBLE_HOLD_BASE_SECONDS: f64 = 2.35;
 const ELITE_DRIBBLE_HOLD_BASE_SECONDS: f64 = 4.8;
+// Stationary-hold surcharge: a carrier who holds the ball while STANDING STILL or WALKING
+// (rather than driving it forward) is a passing failure — with open outlets it must release
+// NOW. The excessive-hold penalty is multiplied by up to this factor for a dead-stationary
+// (or back-pedalling) holder, ramping down to 1× (no surcharge) once the carrier is jogging
+// forward. Dribbling forward at pace is untouched. The cutoff is the FORWARD speed (yards/sec
+// toward the opponent goal) at/above which the carry counts as "driving forward": ~3.5 yps
+// sits just above a walk (~2.7 yps) and at a slow jog, so walking/standing is fully surcharged
+// while a genuine forward jog/run/sprint pays nothing extra.
+const STATIONARY_HOLD_PENALTY_MAX_MULT: f64 = 10.0;
+const STATIONARY_HOLD_FORWARD_JOG_YPS: f64 = 3.5;
 // When a teammate is genuinely open AHEAD of the ball, prefer the pass over driving
 // into traffic ("pass even if a player is open ahead"). Scales pass scores up and the
 // dribble proclivity down; collapses to no-effect when there is no open forward outlet.
@@ -1686,6 +1696,13 @@ const FINAL_THIRD_FORWARD_RACE_RELAX_BAND_YARDS: f64 = 14.0;
 const PASS_LENGTH_PREFERENCE_WEIGHT: f64 = 0.5;
 const PASS_LENGTH_OPTIMAL_YARDS: f64 = 8.0;
 const PASS_LENGTH_FADEOUT_YARDS: f64 = 24.0;
+// Ideal-pass-length target: a ~15yd ball is the ideal length (progresses the play, still
+// reliably completed and within a good player's field of vision, which already extends to
+// 28-56yd). When `DD_SOCCER_ENABLE_IDEAL_PASS_LENGTH_15YD` is on, the optimal-length peak
+// shifts from 8yd to 15yd (fade-out stretched proportionally) so the engine prefers a
+// meaningful 15yd progression over a short square pass.
+const IDEAL_PASS_LENGTH_OPTIMAL_YARDS: f64 = 15.0;
+const IDEAL_PASS_LENGTH_FADEOUT_YARDS: f64 = 32.0;
 const GROUND_LATERAL_PASS_PENALTY: f64 = 1.85;
 const AERIAL_LATERAL_PASS_PENALTY: f64 = 1.20;
 // Build-up short-pass discouragement. OUTSIDE the final attacking third, sub-4yd passes are
@@ -2703,6 +2720,163 @@ const TEAMMATE_MAX_SPACING_YARDS: f64 = 10.0;
 // is legitimate, so the expected spacing band tightens from 5-10 to 3-6 yards.
 const TEAMMATE_MIN_SPACING_BOX_YARDS: f64 = 3.0;
 const TEAMMATE_MAX_SPACING_BOX_YARDS: f64 = 6.0;
+// ---- HARD same-team separation floor ("never within 4 yards") ----
+// Unlike the soft 5-10yd proclivity band above (a *seed* the learners may move off),
+// this is a firm minimum: two teammates must not crowd inside 4 yards of each other in
+// open play. The nightmare it kills: playerB, 5yd from the carrier with the passing lane
+// already open, drifting IN to 2yd — closing the gap buys nothing and clutters the pitch.
+// It is enforced on THREE layers so the policy, the planner and the physics all agree:
+//   1. a SMOOTH radial movement barrier — the component of a player's velocity directed
+//      toward a teammate is damped to zero as the gap closes to the floor, so it is a
+//      gentle deceleration (`apply_same_team_separation_barrier`), NEVER a hard stop;
+//   2. a graduated MDP/POMDP reward penalty that grows steeply as the gap shrinks
+//      (`same_team_proximity_penalty_unit`): huge inside 4yd, big at 5, medium at 6,
+//      small at 7, nothing beyond 8 — applied to attack AND defence, every role;
+//   3. an inflated same-team MPC keep-out radius so the point-mass planner routes runs
+//      around teammates rather than through them (see `soccer_local_mpc_planar_obstacles`).
+// The single exception, mirroring the spacing band, is when BOTH players are inside an
+// 18-yard box, where goalmouth congestion (finishing / defending crosses) is legitimate.
+// Gated (default-on) by `DD_SOCCER_ENABLE_SAME_TEAM_SEPARATION_FLOOR`; OFF ⇒ all three
+// layers vanish (byte-identical A/B).
+const SAME_TEAM_MIN_SEPARATION_YARDS: f64 = 4.0;
+// Distance beyond the floor over which the smooth barrier / graduated penalty ramp in:
+// the influence band is `[floor, floor + this]`, i.e. 4yd → 8yd. Above it there is no
+// effect at all.
+const SAME_TEAM_SEPARATION_INFLUENCE_YARDS: f64 = 4.0;
+// Base points of the graduated proximity reward penalty at the 4-yard floor (rises past
+// it, quadratically decays to 0 by 8yd). Large among the dense shaping terms so crowding
+// is a genuinely "huge" cost, but still inside `reward.dense_shaping_budget_points`.
+const SAME_TEAM_PROXIMITY_PENALTY_POINTS: f64 = 0.8;
+// Multiplier applied to a same-team MPC obstacle's avoidance weight when the floor is in
+// force, so the planner treats an imminent teammate crossing as a strong route cost.
+const SAME_TEAM_MPC_OBSTACLE_WEIGHT_GAIN: f64 = 1.6;
+
+/// Whether the hard same-team 4-yard separation floor (barrier + graduated penalty + MPC
+/// keep-out) is active this process. Default-ON in production; opt-in under `#[cfg(test)]`
+/// so the default test corpus stays byte-identical (set
+/// `DD_SOCCER_ENABLE_SAME_TEAM_SEPARATION_FLOOR=1` to exercise it in a test).
+pub(crate) fn dd_soccer_enable_same_team_separation_floor() -> bool {
+    #[cfg(test)]
+    {
+        // Read fresh under test so a single process can A/B the gate per test.
+        std::env::var("DD_SOCCER_ENABLE_SAME_TEAM_SEPARATION_FLOOR").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_SAME_TEAM_SEPARATION_FLOOR"))
+    }
+}
+
+/// Graduated same-team proximity penalty as a fraction of
+/// [`SAME_TEAM_PROXIMITY_PENALTY_POINTS`] for a realized nearest-teammate distance
+/// (yards). Zero at/beyond the influence radius (8yd), quadratically rising to 1.0 at the
+/// 4yd floor ("small at 7, medium at 6, big at 5"), and rising further (up to 2.0) below
+/// the floor ("huge inside 4"). Pure / RNG-free.
+pub(crate) fn same_team_proximity_penalty_unit(distance_yards: f64) -> f64 {
+    if !distance_yards.is_finite() {
+        return 0.0;
+    }
+    let floor = SAME_TEAM_MIN_SEPARATION_YARDS;
+    let influence = floor + SAME_TEAM_SEPARATION_INFLUENCE_YARDS;
+    if distance_yards >= influence {
+        return 0.0;
+    }
+    if distance_yards <= floor {
+        // At/inside the floor the penalty is "huge" and keeps growing the tighter the
+        // crowd, capped so a degenerate overlap can't produce an unbounded term.
+        return (1.0 + (floor - distance_yards).max(0.0) / floor).min(2.0);
+    }
+    let t = (influence - distance_yards) / (influence - floor); // 0 at influence, 1 at floor
+    (t * t).clamp(0.0, 1.0)
+}
+
+/// Distance (yards) from the player `player_id` to its nearest same-team teammate in
+/// `snapshot`, EXCLUDING any teammate for which the floor is waived because BOTH are inside
+/// an 18-yard box. `None` when the player is missing / off-pitch or has no eligible
+/// teammate. Feeds the graduated same-team proximity penalty.
+pub(crate) fn nearest_same_team_distance_for_floor(
+    snapshot: &WorldSnapshot,
+    player_id: usize,
+    team: Team,
+) -> Option<f64> {
+    let me = snapshot.players.iter().find(|p| p.id == player_id)?;
+    let me_pos = me.position;
+    if !me_pos.x.is_finite() || !me_pos.y.is_finite() {
+        return None;
+    }
+    let me_in_box =
+        soccer_point_in_either_penalty_area(me_pos, snapshot.field_width, snapshot.field_length);
+    let mut nearest = f64::INFINITY;
+    for other in snapshot.players.iter() {
+        if other.id == player_id || other.team != team {
+            continue;
+        }
+        if !other.position.x.is_finite() || !other.position.y.is_finite() {
+            continue;
+        }
+        // Both-in-box exception: goalmouth congestion is legitimate.
+        if me_in_box
+            && soccer_point_in_either_penalty_area(
+                other.position,
+                snapshot.field_width,
+                snapshot.field_length,
+            )
+        {
+            continue;
+        }
+        nearest = nearest.min(me_pos.distance(other.position));
+    }
+    nearest.is_finite().then_some(nearest)
+}
+
+/// Smoothly damp a player's velocity so it can never carry them across the 4-yard same-team
+/// separation floor: for each non-exempt teammate, the component of velocity directed TOWARD
+/// that teammate is scaled down (smoothstep) as the gap closes to the floor, reaching zero
+/// exactly at the floor — a smooth deceleration, not a hard stop. Tangential and outward
+/// motion is untouched, so a crowded player can still slide around or peel away freely.
+/// `obstacles` = `(teammate_position, exempt)` where `exempt` means both players are inside
+/// an 18-yard box.
+pub(crate) fn apply_same_team_separation_barrier(
+    me_pos: Vec2,
+    velocity: Vec2,
+    obstacles: &[(Vec2, bool)],
+    dt: f64,
+) -> Vec2 {
+    if dt <= 0.0 || !me_pos.x.is_finite() || !me_pos.y.is_finite() {
+        return velocity;
+    }
+    let floor = SAME_TEAM_MIN_SEPARATION_YARDS;
+    let influence = floor + SAME_TEAM_SEPARATION_INFLUENCE_YARDS;
+    let mut v = velocity;
+    for &(other_pos, exempt) in obstacles {
+        if exempt || !other_pos.x.is_finite() || !other_pos.y.is_finite() {
+            continue;
+        }
+        let delta = other_pos - me_pos; // points toward the teammate
+        let dist = delta.len();
+        if !dist.is_finite() || dist <= 1e-6 || dist >= influence {
+            continue;
+        }
+        let radial = delta * (1.0 / dist); // unit vector toward the teammate
+        let inward = v.dot(radial); // + = closing the gap
+        if inward <= 0.0 {
+            continue; // moving away / purely tangential: never constrained
+        }
+        // Smoothstep ramp: full inward speed allowed at/beyond the influence radius,
+        // tapering (C1-continuous) to zero at the floor — a gentle deceleration.
+        let x = ((dist - floor) / (influence - floor)).clamp(0.0, 1.0);
+        let ramp = x * x * (3.0 - 2.0 * x);
+        // Hard safety: also never close more than the remaining gap within this tick.
+        let physical_cap = ((dist - floor) / dt).max(0.0);
+        let allowed_inward = (inward * ramp).min(physical_cap);
+        // Rebuild the velocity with the reduced inward component (tangential preserved).
+        v = v + radial * (allowed_inward - inward);
+    }
+    v
+}
+
 // The "hard" (tighter) overlap band is this fraction of the minimum-spacing
 // radius: about 3.33 yd outside the box, 2 yd inside it. A hard overlap is policed
 // sooner than a merely-soft one.
@@ -5042,6 +5216,25 @@ static SOCCER_LAST_SITE_PLAYBACK_SEED: AtomicU32 = AtomicU32::new(0);
 const GOAL_URGENCY_MAX_YARDS: f64 = 30.0;
 const GOAL_URGENCY_KEEPER_CROWD_YARDS: f64 = 6.0;
 const SUPPORT_MIN_UPFIELD_PER_LATERAL_YARD: f64 = 0.10;
+// Forward-run-when-unmarked (gated `DD_SOCCER_ENABLE_FORWARD_RUN_WHEN_UNMARKED`, default-on).
+// Principle: in possession, an OPEN, UNMARKED off-ball player who CAN run forward into
+// space must not elect a backward run — the team should move forward in possession. These
+// tune the `open_space_for` bias that encodes it.
+/// "Unmarked" radius: no opponent within this many yards of the player / candidate point.
+const FORWARD_RUN_UNMARKED_MARK_RADIUS_YARDS: f64 = 6.0;
+/// Deadband (yards) before a candidate counts as genuinely forward / backward of the
+/// player's current position, so a square shuffle is neither vetoed nor rewarded.
+const FORWARD_RUN_UNMARKED_DIR_EPS_YARDS: f64 = 1.5;
+/// Veto-strength base penalty applied to a backward candidate when the player is unmarked
+/// and a forward-into-space option genuinely exists (comparable to the offside penalty, so
+/// it dominates the spacing/width pulls that would otherwise drag the runner backward).
+const FORWARD_RUN_UNMARKED_BACKWARD_PENALTY_BASE: f64 = 12.0;
+/// Additional per-yard penalty on how far backward the candidate is, so the least-backward
+/// option is the least bad if a drop is somehow still forced.
+const FORWARD_RUN_UNMARKED_BACKWARD_PENALTY_PER_YARD: f64 = 0.6;
+/// Reward scale for a forward candidate that runs into open, receivable space while the
+/// player is unmarked — reinforces the forward run the principle wants.
+const FORWARD_RUN_UNMARKED_FORWARD_BONUS: f64 = 2.2;
 const WIDE_OUTLET_TOUCHLINE_BUFFER_YARDS: f64 = 3.0;
 const WIDE_OUTLET_MIN_FORWARD_YARDS: f64 = 2.0;
 const WINGBACK_ATTACK_COVER_MIN_OTHER_PLAYERS_BEHIND_BALL: usize = 4;
@@ -13463,6 +13656,25 @@ pub(crate) fn attack_ambition_enabled() -> bool {
     !*V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_ATTACK_AMBITION").is_ok())
 }
 
+/// Whether **formation-hold tightening** is active this process: off-ball players are held closer to
+/// their formation home (tighter shape radii) AND a roaming/support/press option is bounded to a
+/// generous role radius instead of being unclamped — so the eleven maintain their positions and keep
+/// the pitch spread instead of drifting ~20yd off formation and bunching. **Default-ON in production**
+/// (`DD_SOCCER_ENABLE_FORMATION_HOLD_TIGHTEN=0/false/no/off` is the kill switch), read once.
+/// **Default-OFF under test** so the shape/parity suites stay byte-identical unless a test opts in.
+pub(crate) fn formation_hold_tighten_enabled() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_FORMATION_HOLD_TIGHTEN")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_FORMATION_HOLD_TIGHTEN"))
+    }
+}
+
 /// Whether the **loose-ball opponent-pace match** is active this process: an elected
 /// 1–2 chaser sprints for a loose ball when the nearest opponent has committed a
 /// run/sprint at the contest point, keeping the 50/50 a real race rather than jogging
@@ -19350,6 +19562,68 @@ pub(crate) fn carrier_forward_drive_enabled() -> bool {
     }
 }
 
+/// Surcharge multiplier applied to the excessive-hold penalty when a ball carrier holds while
+/// STANDING STILL or WALKING instead of driving the ball forward — the "if you're not going
+/// forward, pass it NOW" rule. Graded on the carrier's FORWARD speed (velocity component toward
+/// the opponent goal, yards/sec): at/above [`STATIONARY_HOLD_FORWARD_JOG_YPS`] the carry is
+/// progressing forward and earns NO surcharge (returns `1.0` — dribbling forward at pace is
+/// fine). Below that cutoff the surcharge ramps in linearly, reaching the full
+/// [`STATIONARY_HOLD_PENALTY_MAX_MULT`] at zero-or-backward forward speed (a dead-stationary or
+/// back-pedalling holder is treated as maximally guilty). Pure (env-free) so it is unit-tested
+/// directly. Non-finite input ⇒ neutral `1.0`. See [`stationary_hold_penalty_enabled`].
+fn stationary_hold_penalty_multiplier(carrier_forward_speed_yps: f64) -> f64 {
+    if !carrier_forward_speed_yps.is_finite() {
+        return 1.0;
+    }
+    if carrier_forward_speed_yps >= STATIONARY_HOLD_FORWARD_JOG_YPS {
+        return 1.0;
+    }
+    // Clamp forward speed at 0 so back-pedalling with the ball counts the same as standing
+    // still (fully surcharged), and normalise into a 0..1 "stillness" fraction.
+    let stillness = ((STATIONARY_HOLD_FORWARD_JOG_YPS - carrier_forward_speed_yps.max(0.0))
+        / STATIONARY_HOLD_FORWARD_JOG_YPS)
+        .clamp(0.0, 1.0);
+    1.0 + stillness * (STATIONARY_HOLD_PENALTY_MAX_MULT - 1.0)
+}
+
+/// Whether the **stationary-hold penalty surcharge** is active this process. Multiplies the
+/// excessive-hold learning penalty by up to [`STATIONARY_HOLD_PENALTY_MAX_MULT`] for a carrier
+/// holding the ball while standing still or walking (see [`stationary_hold_penalty_multiplier`]),
+/// so the policy learns that a non-progressing holder with open outlets must release the ball
+/// immediately. Default-ON in production (env `DD_SOCCER_ENABLE_STATIONARY_HOLD_PENALTY=0/false`
+/// is the kill switch); default-OFF under test so the reward-parity suite stays byte-identical.
+pub(crate) fn stationary_hold_penalty_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_STATIONARY_HOLD_PENALTY").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_STATIONARY_HOLD_PENALTY"))
+    }
+}
+
+/// Whether the **15yd ideal-pass-length** preference is active this process. Shifts the
+/// optimal-pass-length peak in [`pass_length_preference`] from 8yd to 15yd (with the fade-out
+/// stretched to match), so the pass-selection tiebreaker prefers a ~15yd progression over a
+/// short square. Player vision already reaches 28-56yd so a 15yd outlet is within sight.
+/// Default-ON in production (env `DD_SOCCER_ENABLE_IDEAL_PASS_LENGTH_15YD=0/false` is the kill
+/// switch); default-OFF under test so the decision-parity suite stays byte-identical.
+pub(crate) fn ideal_pass_length_15yd_enabled() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_IDEAL_PASS_LENGTH_15YD").is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_IDEAL_PASS_LENGTH_15YD"))
+    }
+}
+
 /// Whether the **gait step-limit** is active this process. A body has inertia: it cannot
 /// teleport across locomotor gears in a single tick (sprint→walk, run→walk). With this
 /// on, once the gait-commitment dwell is satisfied an effort-tier change is taken ONE
@@ -23596,6 +23870,17 @@ fn dense_soccer_transition_reward(
         reward -= after_obs.teammate_overlap_pressure.clamp(0.0, 1.0)
             * tunables().reward.teammate_overlap_camp_penalty;
     }
+    // HARD same-team separation floor — the graduated MDP/POMDP penalty layer (the user's
+    // "never within 4 yards" rule). A steeply-growing per-tick cost for crowding a teammate:
+    // huge inside 4yd, big at 5, medium at 6, small at 7, nothing beyond 8 — evaluated on the
+    // AFTER position so it credits the move that closed (or held) the gap. Universal: attack
+    // AND defence, every role (keepers included; the box exception covers legitimate goalmouth
+    // congestion). Gated (default-on); OFF ⇒ this term vanishes (byte-identical A/B).
+    if dd_soccer_enable_same_team_separation_floor() {
+        if let Some(nearest) = nearest_same_team_distance_for_floor(after, player.id, player.team) {
+            reward -= same_team_proximity_penalty_unit(nearest) * SAME_TEAM_PROXIMITY_PENALTY_POINTS;
+        }
+    }
     // Off-ball support spacing: when a teammate already has the ball and the
     // direct passing lane is open, collapsing from a useful pocket into the
     // holder's feet is a decision-quality failure, not useful support.
@@ -24072,7 +24357,20 @@ fn dense_soccer_transition_reward(
             player, action, before_obs, &after_obs, before, after, before_pos, after_pos,
         );
         if is_dribble_action_label(action) && after_possession == Some(player.team) {
-            reward -= excessive_hold_penalty_points(before_obs, ability01(player.skills.dribbling));
+            let mut hold_penalty =
+                excessive_hold_penalty_points(before_obs, ability01(player.skills.dribbling));
+            // Standing-still / walking-with-the-ball surcharge: a holder who is not driving
+            // the ball forward (open outlets everywhere) must release it NOW — scale the hold
+            // penalty by up to 10× as the carrier's forward speed drops toward a walk/stand.
+            // Dribbling forward at a jog or faster is untouched.
+            if stationary_hold_penalty_enabled() {
+                if let Some(forward_speed) =
+                    after.player_velocity(player.id).map(|v| v.y * attack_dir)
+                {
+                    hold_penalty *= stationary_hold_penalty_multiplier(forward_speed);
+                }
+            }
+            reward -= hold_penalty;
             let carry_progress = ball_forward.max(player_forward).clamp(-4.0, 18.0);
             if carry_progress > 0.0 {
                 let role_multiplier = match player.role {
@@ -33678,6 +33976,8 @@ fn soccer_requested_tactical_feature_gate_names() -> Vec<String> {
         "DD_SOCCER_ENABLE_QUICK_FORWARD_PASS",
         "DD_SOCCER_ENABLE_OVERDRIBBLE_PENALTY",
         "DD_SOCCER_ENABLE_CARRIER_FORWARD_DRIVE",
+        "DD_SOCCER_ENABLE_STATIONARY_HOLD_PENALTY",
+        "DD_SOCCER_ENABLE_IDEAL_PASS_LENGTH_15YD",
     ]
     .into_iter()
     .map(str::to_string)
@@ -60878,16 +61178,30 @@ fn clamp_dir_to_cone(target: Vec2, axis: Vec2, max_angle: f64) -> Vec2 {
     return Vec2::new(a.x * c - a.y * s, a.x * s + a.y * c);
 }
 
-/// Preference (0..1) for a pass of length `dist`: 8yd is the sole optimum.
+/// Preference (0..1) for a pass of length `dist`: a single optimum length scores 1.0, with a
+/// linear ramp up to it and a linear fade beyond. The optimum is 8yd by default, or 15yd when
+/// the ideal-pass-length gate is on (see [`ideal_pass_length_15yd_enabled`]) so the engine
+/// favours a meaningful ~15yd progression over a short square pass.
 fn pass_length_preference(dist: f64) -> f64 {
+    let (optimal, fadeout) = if ideal_pass_length_15yd_enabled() {
+        (IDEAL_PASS_LENGTH_OPTIMAL_YARDS, IDEAL_PASS_LENGTH_FADEOUT_YARDS)
+    } else {
+        (PASS_LENGTH_OPTIMAL_YARDS, PASS_LENGTH_FADEOUT_YARDS)
+    };
+    pass_length_preference_curve(dist, optimal, fadeout)
+}
+
+/// Pure triangular length-preference curve: 1.0 at `optimal`, linear ramp up to it and linear
+/// fade to zero at `fadeout`. Env-free so it is unit-tested directly without the gate.
+fn pass_length_preference_curve(dist: f64, optimal: f64, fadeout: f64) -> f64 {
     if !dist.is_finite() || dist <= 0.0 {
         return 0.0;
     }
-    if dist <= PASS_LENGTH_OPTIMAL_YARDS {
-        return (dist / PASS_LENGTH_OPTIMAL_YARDS).clamp(0.0, 1.0);
+    if dist <= optimal {
+        return (dist / optimal).clamp(0.0, 1.0);
     }
-    let fade_band = (PASS_LENGTH_FADEOUT_YARDS - PASS_LENGTH_OPTIMAL_YARDS).max(1.0);
-    (1.0 - (dist - PASS_LENGTH_OPTIMAL_YARDS) / fade_band).clamp(0.0, 1.0)
+    let fade_band = (fadeout - optimal).max(1.0);
+    (1.0 - (dist - optimal) / fade_band).clamp(0.0, 1.0)
 }
 
 /// Length preference for a BACKWARD pass. Unlike the forward/lateral curve (which peaks at

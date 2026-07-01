@@ -58790,6 +58790,113 @@ fn off_ball_space_discipline_punishes_spiralling_into_the_carrier() {
 }
 
 #[test]
+fn forward_run_when_unmarked_bias_is_a_no_op_without_a_forward_option() {
+    // Gate off / marked / everything-ahead-covered => `forward_space_available == false` =>
+    // the bias is exactly 0.0 for a backward, square, or forward candidate, so `open_space_for`
+    // is byte-identical. A legitimate drop when there is no forward space is never vetoed.
+    for forward in [-12.0, -3.0, 0.0, 5.0, 20.0] {
+        for into_open in [false, true] {
+            assert_eq!(
+                forward_run_when_unmarked_bias(forward, false, into_open),
+                0.0,
+                "no forward-space state must leave every candidate untouched (forward={forward})"
+            );
+        }
+    }
+}
+
+#[test]
+fn forward_run_when_unmarked_bias_vetoes_backward_and_rewards_forward() {
+    // The principle: an unmarked off-ball player WITH a forward-into-space option must not drift
+    // backward. A backward candidate is net-penalised (veto strength), a forward-into-open one is
+    // rewarded, and the backward veto strictly dominates the best forward bonus so the argmax can
+    // never pick a backward run over an available forward one.
+    let backward = forward_run_when_unmarked_bias(-10.0, true, false);
+    let deeper_backward = forward_run_when_unmarked_bias(-20.0, true, false);
+    let forward_open = forward_run_when_unmarked_bias(18.0, true, true);
+    let forward_covered = forward_run_when_unmarked_bias(18.0, true, false);
+    let square = forward_run_when_unmarked_bias(0.0, true, true);
+
+    assert!(backward < 0.0, "a backward run while unmarked must be penalised: {backward}");
+    assert!(
+        deeper_backward < backward,
+        "the further back, the worse: deeper={deeper_backward} shallow={backward}"
+    );
+    assert!(
+        forward_open > 0.0,
+        "a forward run into open space must be rewarded: {forward_open}"
+    );
+    assert_eq!(
+        forward_covered, 0.0,
+        "a forward-but-covered candidate earns no forward bonus: {forward_covered}"
+    );
+    assert_eq!(square, 0.0, "a square shuffle inside the deadband is neutral: {square}");
+    assert!(
+        backward < -forward_open,
+        "the backward veto must dominate the best forward bonus so backward can never win: \
+         backward={backward} forward_open={forward_open}"
+    );
+}
+
+#[test]
+fn forward_open_space_available_true_when_lane_ahead_is_clear_else_false() {
+    // A central carrier with an unmarked teammate who has an open, clear lane ahead: the teammate
+    // genuinely CAN run forward into space => precondition satisfied.
+    let mut open = SoccerMatch::default_11v11(MatchConfig::default());
+    let holder = 6;
+    let support = 8;
+    park_players_except(&mut open, &[holder, support]);
+    open.ball.holder = Some(holder);
+    open.ball.position = Vec2::new(40.0, 55.0);
+    open.ball.velocity = Vec2::zero();
+    open.ball.last_touch_team = Some(Team::Home);
+    open.players[holder].position = open.ball.position;
+    open.players[support].position = Vec2::new(46.0, 58.0);
+    open.players[support].home_position = open.players[support].position;
+    let open_snapshot = WorldSnapshot::from_match(&open);
+    let support_player = open_snapshot
+        .players
+        .iter()
+        .find(|p| p.id == support)
+        .expect("support snapshot");
+    assert!(
+        open_snapshot
+            .forward_open_space_available(support_player, support_player.position),
+        "an unmarked teammate with a clear forward lane must have a forward-into-space option"
+    );
+
+    // Now wall the space directly ahead of the same teammate with opponents: no forward option, so
+    // a drop is legitimate and the bias must stay inert.
+    let mut walled = SoccerMatch::default_11v11(MatchConfig::default());
+    park_players_except(&mut walled, &[holder, support]);
+    walled.ball.holder = Some(holder);
+    walled.ball.position = Vec2::new(40.0, 55.0);
+    walled.ball.velocity = Vec2::zero();
+    walled.ball.last_touch_team = Some(Team::Home);
+    walled.players[holder].position = walled.ball.position;
+    walled.players[support].position = Vec2::new(46.0, 58.0);
+    walled.players[support].home_position = walled.players[support].position;
+    for (i, away) in (11..22).enumerate() {
+        // Pack defenders across the channel just ahead of the support player.
+        walled.players[away].position = Vec2::new(
+            38.0 + (i as f64) * 2.0,
+            walled.players[support].position.y + Team::Home.attack_dir() * 8.0,
+        );
+    }
+    let walled_snapshot = WorldSnapshot::from_match(&walled);
+    let walled_support = walled_snapshot
+        .players
+        .iter()
+        .find(|p| p.id == support)
+        .expect("support snapshot");
+    assert!(
+        !walled_snapshot
+            .forward_open_space_available(walled_support, walled_support.position),
+        "with the forward channel walled by opponents there is no forward-into-space option"
+    );
+}
+
+#[test]
 fn tactical_trace_penalizes_endline_camping_and_deep_retreat() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let defender = 2;
@@ -92183,6 +92290,51 @@ fn carrier_forward_drive_gait_floor_grades_by_space_and_pressure() {
 }
 
 #[test]
+fn stationary_hold_penalty_multiplier_ramps_from_walk_to_ten_x() {
+    // Dead-stationary holder ⇒ full 10× surcharge.
+    assert!(
+        (stationary_hold_penalty_multiplier(0.0) - STATIONARY_HOLD_PENALTY_MAX_MULT).abs() < 1e-9
+    );
+    // Back-pedalling with the ball is treated the same as standing still (fully surcharged).
+    assert!(
+        (stationary_hold_penalty_multiplier(-4.0) - STATIONARY_HOLD_PENALTY_MAX_MULT).abs() < 1e-9
+    );
+    // Jogging forward at/above the cutoff ⇒ NO surcharge (dribbling forward is fine).
+    assert!(
+        (stationary_hold_penalty_multiplier(STATIONARY_HOLD_FORWARD_JOG_YPS) - 1.0).abs() < 1e-9
+    );
+    assert!((stationary_hold_penalty_multiplier(9.0) - 1.0).abs() < 1e-9); // sprinting forward
+    // Walking pace sits strictly between the two extremes and is monotone in stillness.
+    let walk = stationary_hold_penalty_multiplier(STATIONARY_HOLD_FORWARD_JOG_YPS * 0.5);
+    assert!(walk > 1.0 && walk < STATIONARY_HOLD_PENALTY_MAX_MULT);
+    let midpoint_expected = 1.0 + 0.5 * (STATIONARY_HOLD_PENALTY_MAX_MULT - 1.0);
+    assert!((walk - midpoint_expected).abs() < 1e-9);
+    let slower = stationary_hold_penalty_multiplier(STATIONARY_HOLD_FORWARD_JOG_YPS * 0.25);
+    assert!(slower > walk, "slower carrier is surcharged harder");
+    // Non-finite ⇒ neutral.
+    assert!((stationary_hold_penalty_multiplier(f64::NAN) - 1.0).abs() < 1e-9);
+}
+
+#[test]
+fn ideal_pass_length_curve_peaks_at_fifteen_yards() {
+    // The 15yd ideal curve peaks at 15yd and prefers a meaningful 15yd ball over a short square.
+    // Tested on the pure curve directly (no env toggling) so it never races the default-8yd
+    // parity test in a parallel run.
+    let ideal =
+        |d: f64| pass_length_preference_curve(d, IDEAL_PASS_LENGTH_OPTIMAL_YARDS, IDEAL_PASS_LENGTH_FADEOUT_YARDS);
+    assert!((ideal(IDEAL_PASS_LENGTH_OPTIMAL_YARDS) - 1.0).abs() < 1e-9);
+    assert!(ideal(15.0) > ideal(5.0), "15yd preferred over a 5yd square");
+    assert!(ideal(15.0) > ideal(8.0), "15yd preferred over the old 8yd optimum");
+    assert!(ideal(15.0) > ideal(25.0), "peak beats an over-long ball");
+    // A 15yd pass is well within a good player's vision range (already 28-56yd).
+    assert!(vision_range_yards(0.0) >= 15.0 && vision_range_yards(1.0) >= 15.0);
+    // The default 8yd curve is unchanged (parity): still peaks at 8yd.
+    let base = |d: f64| pass_length_preference_curve(d, PASS_LENGTH_OPTIMAL_YARDS, PASS_LENGTH_FADEOUT_YARDS);
+    assert!((base(8.0) - 1.0).abs() < 1e-9);
+    assert!(base(8.0) > base(15.0));
+}
+
+#[test]
 fn carrier_forward_drive_floor_lifts_a_walking_carrier_into_open_space() {
     // End-to-end: a ball carrier driving into wide-open forward space should be lifted to a higher
     // gear by the gait floor when the feature is enabled. Self-adapts to the ambient gate so it is
@@ -92489,4 +92641,182 @@ fn slip_break_seam_and_runner_opportunity_are_recognised() {
             .is_none(),
         "a runner already beyond the line is not a slip-break candidate"
     );
+}
+
+#[test]
+fn same_team_proximity_penalty_curve_is_graduated_huge_to_small() {
+    // The user's gradient: huge inside 4yd, big at 5, medium at 6, small at 7, nothing past 8.
+    let at_4 = same_team_proximity_penalty_unit(4.0);
+    let at_5 = same_team_proximity_penalty_unit(5.0);
+    let at_6 = same_team_proximity_penalty_unit(6.0);
+    let at_7 = same_team_proximity_penalty_unit(7.0);
+    let at_8 = same_team_proximity_penalty_unit(8.0);
+    assert!(
+        at_4 > at_5 && at_5 > at_6 && at_6 > at_7 && at_7 > 0.0,
+        "penalty must decrease with distance across 4<5<6<7: {at_4} {at_5} {at_6} {at_7}"
+    );
+    assert!((at_4 - 1.0).abs() < 1e-9, "unit penalty is 1.0 exactly at the floor: {at_4}");
+    assert_eq!(at_8, 0.0, "no penalty at/beyond the influence radius");
+    assert_eq!(same_team_proximity_penalty_unit(20.0), 0.0);
+    // Inside the floor the penalty is "huge" (> the at-floor value) and capped.
+    assert!(same_team_proximity_penalty_unit(2.0) > at_4, "crowding tighter is worse");
+    assert!(same_team_proximity_penalty_unit(0.0) <= 2.0, "capped so overlap can't blow up");
+    assert_eq!(same_team_proximity_penalty_unit(f64::NAN), 0.0);
+}
+
+#[test]
+fn separation_barrier_smoothly_stops_approach_at_the_floor() {
+    let dt = 1.0 / 15.0;
+    let me = Vec2::new(50.0, 50.0);
+    // A teammate 5yd straight ahead (+y); I am sprinting straight at them.
+    let mate = Vec2::new(50.0, 55.0);
+    let toward = Vec2::new(0.0, 8.0);
+    let damped = apply_same_team_separation_barrier(me, toward, &[(mate, false)], dt);
+    // Inside the influence band, the inward (toward-teammate) speed is reduced, never reversed.
+    assert!(damped.y > 0.0 && damped.y < toward.y, "inward speed smoothly reduced, not stopped hard: {damped:?}");
+
+    // Exactly at the floor there is zero permitted approach (smooth arrival, not a wall bounce).
+    let at_floor_mate = Vec2::new(50.0, 54.0); // 4yd ahead
+    let at_floor = apply_same_team_separation_barrier(me, toward, &[(at_floor_mate, false)], dt);
+    assert!(at_floor.y <= 1e-6, "no inward motion permitted at the 4yd floor: {at_floor:?}");
+
+    // Tangential motion (parallel, no closing) is untouched.
+    let sideways = Vec2::new(6.0, 0.0);
+    let tangential = apply_same_team_separation_barrier(me, sideways, &[(at_floor_mate, false)], dt);
+    assert!((tangential.x - 6.0).abs() < 1e-9 && tangential.y.abs() < 1e-9, "tangential preserved: {tangential:?}");
+
+    // Moving AWAY is never constrained.
+    let away = Vec2::new(0.0, -8.0);
+    let away_out = apply_same_team_separation_barrier(me, away, &[(at_floor_mate, false)], dt);
+    assert!((away_out.y + 8.0).abs() < 1e-9, "peeling away is free: {away_out:?}");
+
+    // The both-in-box exemption disables the barrier for that pair.
+    let exempt = apply_same_team_separation_barrier(me, toward, &[(at_floor_mate, true)], dt);
+    assert!((exempt.y - toward.y).abs() < 1e-9, "exempt (both in box) pair is not damped: {exempt:?}");
+}
+
+#[test]
+fn separation_barrier_never_lets_a_step_cross_the_floor() {
+    // Integrate one tick under a high inward speed and assert the gap never drops below 4yd.
+    let dt = 1.0 / 15.0;
+    let mate = Vec2::new(50.0, 55.0);
+    let mut me = Vec2::new(50.0, 50.0);
+    for _ in 0..40 {
+        let v = apply_same_team_separation_barrier(me, Vec2::new(0.0, 20.0), &[(mate, false)], dt);
+        me = me + v * dt;
+        assert!(
+            me.distance(mate) >= SAME_TEAM_MIN_SEPARATION_YARDS - 1e-6,
+            "step crossed the 4yd floor: gap={}",
+            me.distance(mate)
+        );
+    }
+}
+
+/// Serialise the same-team separation-floor tests that toggle the env gate (read fresh under
+/// cfg(test)), so concurrent tests don't see each other's `set_var` window.
+fn separation_floor_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// MPC, POMDP-reward and barrier must act in UNISON: all three key off the one gate. Here we
+/// prove the live-movement MPC keep-out flips with the gate (routes around teammates), that the
+/// graduated reward penalty the policy sees is live for the same crowded gap, and that the
+/// smooth barrier actually holds the 4yd floor across real ticks of the full step loop.
+#[test]
+fn separation_floor_mpc_reward_and_barrier_work_in_unison() {
+    let _env = separation_floor_env_lock();
+    let dt = DEFAULT_DT_SECONDS;
+
+    // Two Home teammates 3yd apart at mid-pitch (well outside either 18yd box).
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    sim.players[5].position = Vec2::new(40.0, 60.0);
+    sim.players[6].position = Vec2::new(40.0, 63.0);
+    sim.players[5].velocity = Vec2::zero();
+    sim.players[6].velocity = Vec2::zero();
+    let mate_pos = sim.players[6].position;
+    let radius_of_mate = |sim: &SoccerMatch| -> f64 {
+        sim.mpc_field_obstacles(5, Team::Home, dt)
+            .into_iter()
+            .min_by(|a, b| {
+                let da = Vec2::new(a.center[0], a.center[1]).distance(mate_pos);
+                let db = Vec2::new(b.center[0], b.center[1]).distance(mate_pos);
+                da.total_cmp(&db)
+            })
+            .map(|o| o.radius)
+            .expect("an obstacle exists")
+    };
+
+    // Gate OFF ⇒ the teammate MPC keep-out is the small default (< the 4yd floor).
+    std::env::remove_var("DD_SOCCER_ENABLE_SAME_TEAM_SEPARATION_FLOOR");
+    assert!(!dd_soccer_enable_same_team_separation_floor());
+    let radius_off = radius_of_mate(&sim);
+    assert!(
+        radius_off < SAME_TEAM_MIN_SEPARATION_YARDS,
+        "gate off: teammate keep-out should be the small default, got {radius_off}"
+    );
+
+    // Gate ON ⇒ the SAME live-movement MPC path inflates the teammate keep-out to the 4yd floor,
+    // so the executed plan routes around the teammate — in unison with the reward + barrier.
+    std::env::set_var("DD_SOCCER_ENABLE_SAME_TEAM_SEPARATION_FLOOR", "1");
+    assert!(dd_soccer_enable_same_team_separation_floor());
+    let radius_on = radius_of_mate(&sim);
+    // The keep-out reaches the full INFLUENCE radius (8yd) so the quadratic MPC cost is felt
+    // increasingly from 7→6→5→4yd (graduated, matching the reward), not only inside 4yd.
+    assert!(
+        radius_on >= SAME_TEAM_MIN_SEPARATION_YARDS + SAME_TEAM_SEPARATION_INFLUENCE_YARDS - 1e-9,
+        "gate on: teammate MPC keep-out must reach the 8yd influence radius, got {radius_on}"
+    );
+
+    // The POMDP/MDP reward penalty the policy is trained on is live for that same 3yd gap.
+    let gap = nearest_same_team_distance_for_floor(&WorldSnapshot::from_match(&sim), 5, Team::Home)
+        .expect("a nearest teammate");
+    assert!((gap - 3.0).abs() < 1e-6, "nearest teammate gap is 3yd, got {gap}");
+    assert!(
+        same_team_proximity_penalty_unit(gap) > same_team_proximity_penalty_unit(5.0),
+        "crowding at 3yd is penalised harder than at 5yd"
+    );
+
+    // The barrier's guarantee across real ticks of the full step loop: no non-box same-team pair
+    // that is currently AT/ABOVE the 4yd floor ever CLOSES below it on the next tick. (The barrier
+    // prevents crossing the floor; it does not forcibly separate a pair spawned already inside it —
+    // that dispersal is the reward/policy's job — so players 5 & 6, placed at 3yd, are exempt via
+    // the `before >= floor` guard rather than asserted apart.)
+    let floor = SAME_TEAM_MIN_SEPARATION_YARDS;
+    let pair_gap = |sim: &SoccerMatch, i: usize, j: usize| -> Option<f64> {
+        let (a, b) = (&sim.players[i], &sim.players[j]);
+        if sim.point_in_either_penalty_area(a.position)
+            && sim.point_in_either_penalty_area(b.position)
+        {
+            return None; // both-in-box pairs are exempt
+        }
+        Some(a.position.distance(b.position))
+    };
+    for _ in 0..30 {
+        let mut before: Vec<(usize, usize, f64)> = Vec::new();
+        for i in 0..sim.players.len() {
+            for j in (i + 1)..sim.players.len() {
+                if sim.players[i].team != sim.players[j].team {
+                    continue;
+                }
+                if let Some(g) = pair_gap(&sim, i, j) {
+                    before.push((i, j, g));
+                }
+            }
+        }
+        sim.run_time_step();
+        for (i, j, gap_before) in before {
+            if gap_before < floor {
+                continue; // pre-existing overlap: barrier only prevents crossing, not resolves
+            }
+            if let Some(gap_after) = pair_gap(&sim, i, j) {
+                assert!(
+                    gap_after >= floor - 0.25,
+                    "barrier let same-team {i} and {j} close from {gap_before}yd across the 4yd floor to {gap_after}yd"
+                );
+            }
+        }
+    }
+
+    std::env::remove_var("DD_SOCCER_ENABLE_SAME_TEAM_SEPARATION_FLOOR");
 }
