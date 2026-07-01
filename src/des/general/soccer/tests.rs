@@ -75273,7 +75273,7 @@ fn defensive_shepherd_end_to_end_shifts_assignment_inside_when_enabled() {
     // assignment is biased to the carrier's inside shoulder; with it OFF it squares up on the
     // goal-side line (byte-identical baseline). Run the ON case in isolation with
     // `DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD=1` so the process-global gate reads true.
-    let enabled = std::env::var("DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD").is_ok();
+    let enabled = soccer_env_flag_enabled("DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD");
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     for id in 0..=10 {
         sim.players[id].position = Vec2::new(5.0, 5.0);

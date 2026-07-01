@@ -23152,7 +23152,7 @@ pub(crate) fn dd_soccer_disable_onside_support_hold() -> bool {
 pub(crate) fn dd_soccer_enable_quick_forward_pass() -> bool {
     #[cfg(test)]
     {
-        std::env::var("DD_SOCCER_ENABLE_QUICK_FORWARD_PASS").is_ok()
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_QUICK_FORWARD_PASS")
     }
     #[cfg(not(test))]
     {
@@ -23173,7 +23173,7 @@ pub(crate) fn dd_soccer_enable_quick_forward_pass() -> bool {
 pub(crate) fn dd_soccer_enable_scoop_lane_blocked() -> bool {
     #[cfg(test)]
     {
-        std::env::var("DD_SOCCER_ENABLE_SCOOP_LANE_BLOCKED").is_ok()
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_SCOOP_LANE_BLOCKED")
     }
     #[cfg(not(test))]
     {
@@ -23195,13 +23195,13 @@ pub(crate) fn dd_soccer_enable_scoop_lane_blocked() -> bool {
 pub(crate) fn dd_soccer_enable_genome_anchor_home_positions() -> bool {
     #[cfg(test)]
     {
-        std::env::var("DD_SOCCER_ENABLE_GENOME_ANCHOR_HOME_POSITIONS").is_ok()
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_GENOME_ANCHOR_HOME_POSITIONS")
     }
     #[cfg(not(test))]
     {
         use std::sync::OnceLock;
         static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_GENOME_ANCHOR_HOME_POSITIONS").is_ok())
+        *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_GENOME_ANCHOR_HOME_POSITIONS"))
     }
 }
 
@@ -23450,7 +23450,7 @@ fn dd_soccer_enable_defensive_shepherd() -> bool {
     {
         use std::sync::OnceLock;
         static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD").is_ok())
+        *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_DEFENSIVE_SHEPHERD"))
     }
     #[cfg(not(test))]
     {
@@ -23469,7 +23469,7 @@ fn dd_soccer_enable_press_cover() -> bool {
     {
         use std::sync::OnceLock;
         static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_PRESS_COVER").is_ok())
+        *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_PRESS_COVER"))
     }
     #[cfg(not(test))]
     {
@@ -23599,7 +23599,7 @@ pub(crate) fn dd_soccer_enable_wasted_energy_penalty() -> bool {
     {
         use std::sync::OnceLock;
         static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_WASTED_ENERGY_PENALTY").is_ok())
+        *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_WASTED_ENERGY_PENALTY"))
     }
     #[cfg(not(test))]
     {
@@ -23618,7 +23618,7 @@ pub(crate) fn dd_soccer_enable_sustained_effort_no_outcome_penalty() -> bool {
         use std::sync::OnceLock;
         static V: OnceLock<bool> = OnceLock::new();
         *V.get_or_init(|| {
-            std::env::var("DD_SOCCER_ENABLE_SUSTAINED_EFFORT_NO_OUTCOME_PENALTY").is_ok()
+            soccer_env_flag_enabled("DD_SOCCER_ENABLE_SUSTAINED_EFFORT_NO_OUTCOME_PENALTY")
         })
     }
     #[cfg(not(test))]
@@ -23643,7 +23643,7 @@ pub(crate) fn dd_soccer_enable_far_offball_energy_conservation() -> bool {
     {
         use std::sync::OnceLock;
         static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_FAR_OFFBALL_ENERGY_CONSERVATION").is_ok())
+        *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_FAR_OFFBALL_ENERGY_CONSERVATION"))
     }
     #[cfg(not(test))]
     {
@@ -23734,7 +23734,7 @@ pub(crate) fn dd_soccer_enable_receive_in_stride() -> bool {
     {
         use std::sync::OnceLock;
         static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_RECEIVE_IN_STRIDE").is_ok())
+        *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_RECEIVE_IN_STRIDE"))
     }
     #[cfg(not(test))]
     {
@@ -23866,7 +23866,7 @@ fn dd_soccer_enable_off_ball_space_discipline() -> bool {
     {
         use std::sync::OnceLock;
         static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_OFF_BALL_SPACE_DISCIPLINE").is_ok())
+        *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_OFF_BALL_SPACE_DISCIPLINE"))
     }
     #[cfg(not(test))]
     {
@@ -23889,7 +23889,7 @@ fn dd_soccer_enable_forward_run_when_unmarked() -> bool {
     {
         use std::sync::OnceLock;
         static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_FORWARD_RUN_WHEN_UNMARKED").is_ok())
+        *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_FORWARD_RUN_WHEN_UNMARKED"))
     }
     #[cfg(not(test))]
     {
@@ -23925,7 +23925,7 @@ const SCORED_SHOT_POST_MARGIN_SKILL_YARDS: f64 = 1.6;
 fn dd_soccer_enable_scored_shot_placement() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_SCORED_SHOT_PLACEMENT").is_ok())
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_SCORED_SHOT_PLACEMENT"))
 }
 
 /// Set `DD_SOCCER_ENABLE_KEEPER_SAVE_REWARD=1` to give the goalkeeper a positive
@@ -23938,7 +23938,7 @@ fn dd_soccer_enable_keeper_save_reward() -> bool {
     {
         use std::sync::OnceLock;
         static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_KEEPER_SAVE_REWARD").is_ok())
+        *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_KEEPER_SAVE_REWARD"))
     }
     #[cfg(not(test))]
     {
@@ -24152,7 +24152,7 @@ fn dd_soccer_disable_first_touch_escape() -> bool {
 fn soccer_mpc_pass_enabled() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_MPC_PASS").is_ok())
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_MPC_PASS"))
 }
 
 /// A potential obstruction in a loose-ball chaser's dash corridor: current position plus the
@@ -48319,7 +48319,7 @@ impl WorldSnapshot {
     /// the ball and the receiver arriving together (within tolerance), the lane being clear of a
     /// defender cut-out, the open space at the reception, and forward progress. Returns the optimal
     /// `(aim_point, launch_speed)`, or `None` to fall back to the analytic lead (gate
-    /// `DD_SOCCER_DISABLE_MPC_PASS`, degenerate input, or no feasible rendezvous found).
+    /// `DD_SOCCER_ENABLE_MPC_PASS` is off, degenerate input, or no feasible rendezvous found).
     pub(crate) fn mpc_pass_execution(
         &self,
         passer_id: usize,
@@ -52171,7 +52171,7 @@ pub(crate) fn dd_soccer_enable_fisher_yates_schedule() -> bool {
         {
             return enabled;
         }
-        std::env::var("DD_SOCCER_ENABLE_FISHER_YATES_SCHEDULE").is_ok()
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_FISHER_YATES_SCHEDULE")
     }
     #[cfg(not(test))]
     {
