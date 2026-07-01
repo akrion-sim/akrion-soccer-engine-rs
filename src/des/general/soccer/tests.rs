@@ -92775,26 +92775,42 @@ fn separation_floor_mpc_reward_and_barrier_work_in_unison() {
         "crowding at 3yd is penalised harder than at 5yd"
     );
 
-    // The barrier holds the floor across real ticks of the full step loop: no non-box same-team
-    // pair is ever inside 4yd once the loop runs.
+    // The barrier's guarantee across real ticks of the full step loop: no non-box same-team pair
+    // that is currently AT/ABOVE the 4yd floor ever CLOSES below it on the next tick. (The barrier
+    // prevents crossing the floor; it does not forcibly separate a pair spawned already inside it —
+    // that dispersal is the reward/policy's job — so players 5 & 6, placed at 3yd, are exempt via
+    // the `before >= floor` guard rather than asserted apart.)
+    let floor = SAME_TEAM_MIN_SEPARATION_YARDS;
+    let pair_gap = |sim: &SoccerMatch, i: usize, j: usize| -> Option<f64> {
+        let (a, b) = (&sim.players[i], &sim.players[j]);
+        if sim.point_in_either_penalty_area(a.position)
+            && sim.point_in_either_penalty_area(b.position)
+        {
+            return None; // both-in-box pairs are exempt
+        }
+        Some(a.position.distance(b.position))
+    };
     for _ in 0..30 {
-        sim.run_time_step();
-        for a in sim.players.iter() {
-            for b in sim.players.iter() {
-                if a.id >= b.id || a.team != b.team {
+        let mut before: Vec<(usize, usize, f64)> = Vec::new();
+        for i in 0..sim.players.len() {
+            for j in (i + 1)..sim.players.len() {
+                if sim.players[i].team != sim.players[j].team {
                     continue;
                 }
-                if sim.point_in_either_penalty_area(a.position)
-                    && sim.point_in_either_penalty_area(b.position)
-                {
-                    continue; // both-in-box pairs are exempt
+                if let Some(g) = pair_gap(&sim, i, j) {
+                    before.push((i, j, g));
                 }
+            }
+        }
+        sim.run_time_step();
+        for (i, j, gap_before) in before {
+            if gap_before < floor {
+                continue; // pre-existing overlap: barrier only prevents crossing, not resolves
+            }
+            if let Some(gap_after) = pair_gap(&sim, i, j) {
                 assert!(
-                    a.position.distance(b.position) >= SAME_TEAM_MIN_SEPARATION_YARDS - 0.25,
-                    "barrier let same-team {} and {} crowd inside the 4yd floor: {}yd",
-                    a.id,
-                    b.id,
-                    a.position.distance(b.position)
+                    gap_after >= floor - 0.25,
+                    "barrier let same-team {i} and {j} close from {gap_before}yd across the 4yd floor to {gap_after}yd"
                 );
             }
         }
