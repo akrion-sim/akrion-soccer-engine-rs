@@ -603,6 +603,13 @@ pub struct SoccerMatch {
     pub(crate) separation_floor_samples: Vec<SeparationFloorSample>,
     /// Open separation decisions awaiting their windowed reward.
     pub(crate) pending_separation_floor: Vec<PendingSeparationFloorDecision>,
+    /// The trained pass-lane yield head (step out of the lane vs hold), when present. `None` ⇒
+    /// analytic seed. Shared into each [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) pass_lane_yield_head: Option<std::sync::Arc<PassLaneYieldHead>>,
+    /// Rolling RL corpus for the pass-lane yield head. Collected only while the model is enabled.
+    pub(crate) pass_lane_yield_samples: Vec<PassLaneYieldSample>,
+    /// Open pass-lane yield decisions awaiting their windowed reward.
+    pub(crate) pending_pass_lane_yield: Vec<PendingPassLaneYieldDecision>,
     /// The trained long-pass run head (which attacker should break forward so a deep carrier
     /// can pick them out), when present. Carried + trained across games by the learner; `None`
     /// ⇒ the analytic `backfield_long_pass_run_invite_for` seed. Shared into each
