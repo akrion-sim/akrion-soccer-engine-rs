@@ -3479,6 +3479,24 @@ const LOOSE_BALL_PEEL_LATERAL_YARDS: f64 = 7.0;
 // it back rather than jogging. Only the chase gait changes — still a soft cue.
 const LOOSE_BALL_PRESSURED_SPRINT_MIN_DISTANCE_YARDS: f64 = 2.0;
 const LOOSE_BALL_PRESSURED_SPRINT_OPPONENT_RADIUS_YARDS: f64 = 10.0;
+// "Match the opponent's pace to a loose ball": the effort a chaser puts into a 50/50
+// is not just a function of distance — it responds to how hard the nearest OPPONENTS
+// are running the ball down. If an opponent has committed to a sprint at the contest
+// point, our elected 1–2 chasers must sprint to keep up rather than jog and lose the
+// race; a strolling opponent draws no such response (distance still governs then).
+// An opponent counts as "sprinting at it" when its closing speed toward the contest
+// point is at least this fraction of its own top speed (run pace ≈ 0.90×top, sprint
+// ≈ 1.12×top, so 0.80 captures a genuine run/sprint with a little angle tolerance
+// while excluding a jog ≈ 0.62×top)…
+const LOOSE_BALL_PACE_MATCH_OPPONENT_SPRINT_FRACTION: f64 = 0.80;
+// …AND its closing speed clears this absolute floor (yps), so a low-top-speed player
+// drifting onto the ball never trips the match.
+const LOOSE_BALL_PACE_MATCH_OPPONENT_MIN_CLOSING_YPS: f64 = 5.5;
+// Only opponents within this of the contest point are genuinely IN the race — a
+// sprinter 30yd away is not a reason to burn a chaser's reserve.
+const LOOSE_BALL_PACE_MATCH_OPPONENT_RADIUS_YARDS: f64 = 16.0;
+// No point matching pace when we are essentially already on the ball.
+const LOOSE_BALL_PACE_MATCH_MIN_DISTANCE_YARDS: f64 = 1.5;
 // Ball played IN BEHIND the back line (a through-ball goalside of our 2nd-to-last defender):
 // the back line must turn and recover. Counts as "in behind" once the ball is this far past
 // the 2nd-to-last defender, and only while it is within _MAX_FROM_GOAL of our own goal (a ball
