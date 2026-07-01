@@ -596,6 +596,13 @@ pub struct SoccerMatch {
     pub(crate) winger_pinch_samples: Vec<WingerPinchSample>,
     /// Open winger-pinch decisions awaiting their windowed reward.
     pub(crate) pending_winger_pinch: Vec<PendingWingerPinchDecision>,
+    /// The trained same-team separation head (desired keep-out radius), when present. `None` ⇒
+    /// analytic seed. Shared into each [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) separation_floor_head: Option<std::sync::Arc<SeparationFloorHead>>,
+    /// Rolling RL corpus for the separation head. Collected only while the model is enabled.
+    pub(crate) separation_floor_samples: Vec<SeparationFloorSample>,
+    /// Open separation decisions awaiting their windowed reward.
+    pub(crate) pending_separation_floor: Vec<PendingSeparationFloorDecision>,
     /// The trained long-pass run head (which attacker should break forward so a deep carrier
     /// can pick them out), when present. Carried + trained across games by the learner; `None`
     /// ⇒ the analytic `backfield_long_pass_run_invite_for` seed. Shared into each
@@ -3153,6 +3160,9 @@ impl SoccerMatch {
             winger_pinch_head: None,
             winger_pinch_samples: Vec::new(),
             pending_winger_pinch: Vec::new(),
+            separation_floor_head: None,
+            separation_floor_samples: Vec::new(),
+            pending_separation_floor: Vec::new(),
             long_pass_run_head: None,
             long_pass_run_samples: Vec::new(),
             pending_long_pass_run: Vec::new(),
@@ -8657,6 +8667,9 @@ impl SoccerMatch {
         // Learnable winger pinch-appetite (stay-wide vs pinch-in) RL samples (no-op under test /
         // when disabled; live in prod, seeded by the analytic prior).
         self.collect_winger_pinch_rl_samples(&next_snapshot);
+        // Learnable same-team separation (spread vs combine) RL samples (no-op under test / when
+        // disabled; live in prod, seeded by the ≈0 analytic prior).
+        self.collect_separation_floor_rl_samples(&next_snapshot);
         self.collect_long_pass_run_rl_samples(&next_snapshot);
         // Learnable give-and-go / wall-pass appetite RL samples (no-op + byte-identical unless
         // `DD_SOCCER_ENABLE_LEARNED_GIVE_AND_GO` is set).
@@ -16178,8 +16191,15 @@ impl SoccerMatch {
                 let both_in_box =
                     me_in_box && self.point_in_either_penalty_area(other.position);
                 if !both_in_box {
+                    // Learnable desired separation (MDP/POMDP): the 8yd keep-out influence is a
+                    // predilection — the player may learn to spread WIDER (stretch build-up) or
+                    // combine TIGHTER (link in the box) per situation. `separation_floor_on` is
+                    // off under test, and the modulation is 0 unless its own model gate is on ⇒
+                    // byte-identical fallback to the fixed 8yd radius.
+                    let base_influence =
+                        SAME_TEAM_MIN_SEPARATION_YARDS + SAME_TEAM_SEPARATION_INFLUENCE_YARDS;
                     radius = radius
-                        .max(SAME_TEAM_MIN_SEPARATION_YARDS + SAME_TEAM_SEPARATION_INFLUENCE_YARDS);
+                        .max(self.separation_floor_influence_radius(player_id, base_influence));
                     weight *= SAME_TEAM_MPC_OBSTACLE_WEIGHT_GAIN;
                 }
             }
@@ -22202,6 +22222,10 @@ pub struct WorldSnapshot {
     /// winger-pinch bucket scoring. `None` ⇒ analytic seed (parity). Skipped by serde.
     #[serde(skip)]
     pub(crate) winger_pinch_head: Option<std::sync::Arc<WingerPinchHead>>,
+    /// The trained same-team separation head, carried from the match for live consumption in the
+    /// MPC keep-out. `None` ⇒ analytic seed (parity). Skipped by serde.
+    #[serde(skip)]
+    pub(crate) separation_floor_head: Option<std::sync::Arc<SeparationFloorHead>>,
     /// The trained long-pass run head, carried from the match for live consumption in
     /// `backfield_long_pass_run_invite_for`. `None` ⇒ analytic seed (parity). Skipped by
     /// serde (an internal decision aid; Default = None).
@@ -24879,6 +24903,7 @@ impl WorldSnapshot {
             lane_affinity_head: m.lane_affinity_head.clone(),
             goal_side_recovery_head: m.goal_side_recovery_head.clone(),
             winger_pinch_head: m.winger_pinch_head.clone(),
+            separation_floor_head: m.separation_floor_head.clone(),
             long_pass_run_head: m.long_pass_run_head.clone(),
             give_and_go_head: m.give_and_go_head.clone(),
             attack_spacing_head: m.attack_spacing_head.clone(),

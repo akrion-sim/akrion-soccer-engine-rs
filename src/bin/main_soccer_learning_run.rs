@@ -14,7 +14,7 @@ use soccer_engine::des::general::soccer::{
     soccer_moment_records_from_jsonl, soccer_moment_records_to_learning_dataset,
     train_soccer_pass_completion_head, AttackSpacingHead, BackFourLineHead, GiveAndGoHead,
     GoalSideRecoveryHead, LaneAffinityHead, LongPassRunHead, LooseBallCommitHead, MatchConfig,
-    MatchSummary, WingerPinchHead,
+    MatchSummary, SeparationFloorHead, WingerPinchHead,
     ReceiveApproachHead, ShotTriggerHead, SoccerConfigMomentInsert, SoccerMarlAlgorithm,
     SoccerMatch, SoccerMomentWindow, SoccerNeuralLearningBackend, SoccerNeuralLearningConfig,
     SoccerNeuralNetworkSnapshot, SoccerPassCompletionHead, SoccerPassLearningMetrics,
@@ -24,7 +24,8 @@ use soccer_engine::des::general::soccer::{
     SoccerTeamQPolicies, ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS,
     DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE, DEFAULT_SOCCER_PASS_COMPLETION_LEARNING_RATE,
     GIVE_AND_GO_HEAD_MIN_TRAINING_STEPS, GOAL_SIDE_RECOVERY_HEAD_MIN_TRAINING_STEPS,
-    LANE_AFFINITY_HEAD_MIN_TRAINING_STEPS, WINGER_PINCH_HEAD_MIN_TRAINING_STEPS,
+    LANE_AFFINITY_HEAD_MIN_TRAINING_STEPS, SEPARATION_FLOOR_HEAD_MIN_TRAINING_STEPS,
+    WINGER_PINCH_HEAD_MIN_TRAINING_STEPS,
     LONG_PASS_RUN_HEAD_MIN_TRAINING_STEPS, LOOSE_BALL_COMMIT_HEAD_MIN_TRAINING_STEPS,
     PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS, RECEIVE_APPROACH_HEAD_MIN_TRAINING_STEPS,
     SHOT_TRIGGER_HEAD_MIN_TRAINING_STEPS,
@@ -1934,6 +1935,12 @@ static CARRIED_GOAL_SIDE_RECOVERY_HEAD: std::sync::Mutex<Option<GoalSideRecovery
 static CARRIED_WINGER_PINCH_HEAD: std::sync::Mutex<Option<WingerPinchHead>> =
     std::sync::Mutex::new(None);
 
+/// In-memory same-team separation head (desired keep-out radius: spread vs combine), carried +
+/// trained across games WITHIN a learner process. Consumed live once it crosses
+/// `SEPARATION_FLOOR_HEAD_MIN_TRAINING_STEPS` (seam on by default in prod).
+static CARRIED_SEPARATION_FLOOR_HEAD: std::sync::Mutex<Option<SeparationFloorHead>> =
+    std::sync::Mutex::new(None);
+
 /// In-memory learned pass-completion head, carried + trained across games WITHIN a learner
 /// process (seeded once from the Postgres corpus at startup), mirroring
 /// `CARRIED_LINE_DEPTH_HEAD`. Installed on each game so the pass-quality assessor consumes it
@@ -2028,6 +2035,11 @@ fn run_game(
     // trained. No-op unless the model is enabled (on by default in prod).
     if let Some(head) = CARRIED_WINGER_PINCH_HEAD.lock().unwrap().as_ref() {
         sim.set_winger_pinch_head(head.clone());
+    }
+    // Install the carried same-team separation head so the MPC keep-out consumes it live once
+    // trained. No-op unless the model is enabled (on by default in prod).
+    if let Some(head) = CARRIED_SEPARATION_FLOOR_HEAD.lock().unwrap().as_ref() {
+        sim.set_separation_floor_head(head.clone());
     }
     // Install the carried long-pass run head so `backfield_long_pass_run_invite_for` consumes
     // it live once trained. No-op unless DD_SOCCER_ENABLE_LEARNED_LONG_PASS_RUN is set.
@@ -2195,6 +2207,25 @@ fn run_game(
             winger_pinch_samples.len(),
             head.training_steps(),
             head.training_steps() >= WINGER_PINCH_HEAD_MIN_TRAINING_STEPS,
+            final_loss
+        );
+    }
+    // Train the CARRIED same-team separation head on this game's reward-weighted RL corpus
+    // (whether spreading / combining improved outcomes). Empty + skipped unless the model is
+    // enabled (on by default in prod).
+    let separation_floor_samples = sim.drain_separation_floor_samples();
+    if !separation_floor_samples.is_empty() {
+        let mut guard = CARRIED_SEPARATION_FLOOR_HEAD.lock().unwrap();
+        let head = guard.get_or_insert_with(|| SeparationFloorHead::new(episode_seed as u32));
+        let mut final_loss = 0.0;
+        for _ in 0..4 {
+            final_loss = head.train_reward_weighted(&separation_floor_samples, 0.02);
+        }
+        eprintln!(
+            "separation_floor_training samples={} training_steps={} consumed={} final_loss={:.5}",
+            separation_floor_samples.len(),
+            head.training_steps(),
+            head.training_steps() >= SEPARATION_FLOOR_HEAD_MIN_TRAINING_STEPS,
             final_loss
         );
     }
