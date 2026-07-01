@@ -2765,7 +2765,10 @@ pub(crate) fn soccer_local_mpc_planar_obstacles(
             let both_in_box = soccer_point_in_either_penalty_area(player.position, width, length)
                 && soccer_point_in_either_penalty_area(other.position, width, length);
             if !both_in_box {
-                radius = radius.max(SAME_TEAM_MIN_SEPARATION_YARDS);
+                // Full influence radius (8yd) so the quadratic keep-out cost grows increasingly
+                // from 7→6→5→4yd, matching the graduated reward; the hard floor is the barrier.
+                radius = radius
+                    .max(SAME_TEAM_MIN_SEPARATION_YARDS + SAME_TEAM_SEPARATION_INFLUENCE_YARDS);
                 weight *= SAME_TEAM_MPC_OBSTACLE_WEIGHT_GAIN;
             }
         }
