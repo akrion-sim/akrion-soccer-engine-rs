@@ -2980,6 +2980,24 @@ impl RewardTunables {
             25.0,
         );
         sanitize_f64(
+            "reward.concede_keeper_defender_penalty_symmetric",
+            &mut self.concede_keeper_defender_penalty_symmetric,
+            default.concede_keeper_defender_penalty_symmetric,
+            0.0,
+            250.0,
+            0.0,
+            150.0,
+        );
+        sanitize_f64(
+            "reward.concede_outfield_penalty_symmetric",
+            &mut self.concede_outfield_penalty_symmetric,
+            default.concede_outfield_penalty_symmetric,
+            0.0,
+            250.0,
+            0.0,
+            150.0,
+        );
+        sanitize_f64(
             "reward.teammate_overlap_relief_reward",
             &mut self.teammate_overlap_relief_reward,
             default.teammate_overlap_relief_reward,
