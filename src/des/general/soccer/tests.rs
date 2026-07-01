@@ -10696,6 +10696,76 @@ fn flank_crash_box_cross_latches_window_and_rewards_box_arrivals() {
     }
 }
 
+/// The negative MIRROR of the arrival reward: a qualifying wide aerial cross is delivered but
+/// only ONE attacker crashed the box (below the 2-runner minimum), so the nearest attacking-role
+/// no-show in the final third is charged the bounded no-show penalty — capped at the runner
+/// shortfall. Farther no-shows and the lone crasher are NOT penalised, and with the no-show gate
+/// off the whole thing is byte-identical (only the arrival path, which pays nothing here, runs).
+#[test]
+fn flank_crash_box_underattacked_cross_penalizes_nearest_no_show() {
+    let _env = crash_box_env_lock();
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    // Home attacks y = 120; the opponent (Away) box is y in [102, 120], x in [18, 62].
+    sim.players[9].role = PlayerRole::Forward;
+    sim.players[10].role = PlayerRole::Forward;
+    sim.players[7].role = PlayerRole::Midfielder;
+    // Exactly ONE crasher inside the box ⇒ below the 2-runner minimum (shortfall = 1).
+    sim.players[9].position = Vec2::new(35.0, 110.0);
+    // Two attacking no-shows in the final third (y >= 80) but outside the box (y < 102):
+    // players[10] is nearest the goal ⇒ it (and only it) should be blamed.
+    sim.players[10].position = Vec2::new(40.0, 100.0);
+    sim.players[7].position = Vec2::new(52.0, 88.0);
+    let crosser = 8;
+    let origin = Vec2::new(8.0, 100.0); // outer flank lane, attacking final third.
+
+    // Flank gate ON but no-show gate OFF ⇒ no arrival reward (under-attacked) and no penalty.
+    std::env::set_var("DD_SOCCER_ENABLE_FLANK_CRASH_BOX", "1");
+    let before_off = sim.reward_events.len();
+    sim.register_flank_crash_box_cross(Team::Home, crosser, origin, true, PassFlight::Aerial);
+    let no_show_off = sim.reward_events[before_off..]
+        .iter()
+        .filter(|event| event.kind == SoccerRewardEventKind::CrashBoxNoShow)
+        .count();
+    assert_eq!(
+        no_show_off, 0,
+        "no-show penalty gate off must emit no CrashBoxNoShow events (byte-identical)"
+    );
+
+    // No-show gate ON ⇒ exactly `shortfall` (=1) nearest no-show is penalised.
+    std::env::set_var("DD_SOCCER_ENABLE_CRASH_BOX_NO_SHOW_PENALTY", "1");
+    let before_on = sim.reward_events.len();
+    sim.register_flank_crash_box_cross(Team::Home, crosser, origin, true, PassFlight::Aerial);
+    std::env::remove_var("DD_SOCCER_ENABLE_CRASH_BOX_NO_SHOW_PENALTY");
+    std::env::remove_var("DD_SOCCER_ENABLE_FLANK_CRASH_BOX");
+
+    let no_shows: Vec<&SoccerRewardEvent> = sim.reward_events[before_on..]
+        .iter()
+        .filter(|event| event.kind == SoccerRewardEventKind::CrashBoxNoShow)
+        .collect();
+    assert_eq!(
+        no_shows.len(),
+        1,
+        "shortfall of 1 runner must charge exactly one no-show, got {no_shows:?}"
+    );
+    assert_eq!(
+        no_shows[0].player_id, 10,
+        "the no-show nearest the goal must be the one blamed"
+    );
+    assert!(
+        no_shows[0].amount < 0.0,
+        "a no-show event must carry a negative (penalty) amount, got {}",
+        no_shows[0].amount
+    );
+    // The lone crasher and the farther no-show are not blamed.
+    assert!(
+        sim.reward_events[before_on..].iter().all(|event| {
+            event.kind != SoccerRewardEventKind::CrashBoxNoShow
+                || (event.player_id != 9 && event.player_id != 7)
+        }),
+        "only the nearest eligible no-show may be penalised"
+    );
+}
+
 /// A genuine ground pass (not an aerial cross), or a central origin, must not open the window —
 /// the play is specifically a *wide aerial cross* into a crashed box.
 #[test]
