@@ -2104,19 +2104,25 @@ const FORWARD_CARRY_MAX_REWARDED_FINE_SEGMENTS: u32 = 20;
 const FORWARD_CARRY_MAX_REWARDED_SEGMENTS: u32 = 10;
 /// A pass with at least this much BACKWARD component (yards toward our OWN goal, i.e. -Δy·attack)
 /// is subject to backward-pass discipline. Below this a square/short ball is treated as neutral.
-const BACKWARD_PASS_MIN_PENALIZED_YARDS: f64 = 2.0;
+/// Lowered 2.0 → 1.5 so even a modest recycle backward is now caught — backward passing is
+/// disfavoured, so the neutral dead-band is tighter.
+const BACKWARD_PASS_MIN_PENALIZED_YARDS: f64 = 1.5;
 /// "High pressure" radius for backward-pass discipline: a backward pass is only JUSTIFIED when an
 /// opponent is within this many yards of the passer at release. This is the genuine-pressure test
 /// the user asked for — it also covers the touchline/corner case (where passing/dribbling options
 /// shrink) but still requires a close opponent; mere positional urgency is not enough.
 const BACKWARD_PASS_HIGH_PRESSURE_RADIUS_YARDS: f64 = 3.0;
-/// Base penalty points for an UNPRESSURED backward pass, before the distance term.
-const BACKWARD_PASS_BASE_PENALTY_POINTS: f64 = 2.0;
+/// Base penalty points for an UNPRESSURED backward pass, before the distance term. Raised
+/// 2.0 → 3.5: passing backward is penalized more heavily so the policy prefers holding /
+/// forward / square options over recycling toward our own goal.
+const BACKWARD_PASS_BASE_PENALTY_POINTS: f64 = 3.5;
 /// Extra penalty points per yard of backward distance — the deeper the ball is played back the
 /// worse it is, so a long recycle toward our own goal is punished far more than a short drop.
-const BACKWARD_PASS_PENALTY_PER_YARD_POINTS: f64 = 0.5;
+/// Raised 0.5 → 1.0 so the depth term bites harder.
+const BACKWARD_PASS_PENALTY_PER_YARD_POINTS: f64 = 1.0;
 /// Cap on the total unpressured-backward-pass penalty so one very deep ball can't swamp the signal.
-const BACKWARD_PASS_MAX_PENALTY_POINTS: f64 = 12.0;
+/// Raised 12.0 → 20.0 to keep headroom for the heavier base/per-yard terms.
+const BACKWARD_PASS_MAX_PENALTY_POINTS: f64 = 20.0;
 /// Over-dribble dispossession penalty (the carrier held the ball too long and was tackled for it).
 /// Hold time (seconds) past which staying on the ball is "overdue" — a pass or a forward drive
 /// should have happened by now. Below this a tackle on a fresh touch is just an unlucky duel, not an
