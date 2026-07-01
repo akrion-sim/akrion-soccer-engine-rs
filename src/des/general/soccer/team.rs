@@ -2534,19 +2534,30 @@ impl SoccerFormationLpBrain {
         if max_players == 0 || self.last_guidance.is_empty() {
             return 0;
         }
-        let mut candidates = self
-            .last_guidance
-            .iter()
-            .enumerate()
-            .filter_map(|(guidance_index, guidance)| {
-                soccer_local_mpc_candidate_priority(snapshot, guidance).map(|priority| {
-                    SoccerLocalMpcCandidate {
-                        guidance_index,
-                        priority,
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
+        let max_players = max_players.min(self.last_guidance.len());
+        let mut candidates = Vec::with_capacity(max_players);
+        for (guidance_index, guidance) in self.last_guidance.iter().enumerate() {
+            let Some(priority) = soccer_local_mpc_candidate_priority(snapshot, guidance) else {
+                continue;
+            };
+            let candidate = SoccerLocalMpcCandidate {
+                guidance_index,
+                priority,
+            };
+            if candidates.len() < max_players {
+                candidates.push(candidate);
+                continue;
+            }
+            if let Some((lowest_index, lowest)) = candidates.iter().enumerate().min_by(|a, b| {
+                a.1.priority
+                    .partial_cmp(&b.1.priority)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }) {
+                if candidate.priority > lowest.priority {
+                    candidates[lowest_index] = candidate;
+                }
+            }
+        }
         candidates.sort_by(|a, b| {
             b.priority
                 .partial_cmp(&a.priority)
@@ -2554,7 +2565,7 @@ impl SoccerFormationLpBrain {
         });
 
         let mut solved = 0usize;
-        for candidate in candidates.into_iter().take(max_players) {
+        for candidate in candidates {
             let original = self.last_guidance[candidate.guidance_index].clone();
             if let Some(refined) = soccer_local_mpc_refined_guidance(snapshot, &original) {
                 self.last_guidance[candidate.guidance_index] = refined;
@@ -2860,7 +2871,7 @@ fn soccer_local_mpc_refined_guidance(
         + whole_field_context.position_weight_bonus;
     let vel_weight =
         1.25 + guidance.speed_match_weight * 3.0 + whole_field_context.velocity_weight_bonus;
-    let horizon = (2.25 / dt).round().clamp(8.0, 45.0) as usize;
+    let horizon = (1.5 / dt).round().clamp(8.0, 30.0) as usize;
     let obstacle_decay_per_step = 0.5_f64.powf(dt / 1.5).clamp(0.70, 1.0);
     let mut controller = PlanarPointMassMpc::new(PlanarMpcConfig {
         horizon,
@@ -2871,7 +2882,7 @@ fn soccer_local_mpc_refined_guidance(
         qf_vel: vel_weight * 2.0,
         r: 0.10,
         a_max: accel_cap,
-        iters: (horizon.saturating_mul(5)).clamp(48, 160),
+        iters: (horizon.saturating_mul(4)).clamp(32, 96),
         obstacle_decay_per_step,
     })
     .ok()?;

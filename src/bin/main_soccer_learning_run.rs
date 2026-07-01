@@ -20,12 +20,12 @@ use soccer_engine::des::general::soccer::{
     SoccerPassOutcomeSample, SoccerQEntry, SoccerQPolicy, SoccerQPolicyOptions, SoccerQTargetEntry,
     SoccerSelfPlayEpisodeSummary, SoccerSelfPlayLearnedParams, SoccerSelfPlayTrainingArtifact,
     SoccerTacticalLearningSummary, SoccerTacticalLearningWeights, SoccerTeamPolicyArtifact,
-    SoccerTeamQPolicies, ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS,
+    SoccerTeamQPolicies, SupportScorerHead, ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS,
     DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE, DEFAULT_SOCCER_PASS_COMPLETION_LEARNING_RATE,
     GIVE_AND_GO_HEAD_MIN_TRAINING_STEPS, LANE_AFFINITY_HEAD_MIN_TRAINING_STEPS,
     LONG_PASS_RUN_HEAD_MIN_TRAINING_STEPS, LOOSE_BALL_COMMIT_HEAD_MIN_TRAINING_STEPS,
     PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS, RECEIVE_APPROACH_HEAD_MIN_TRAINING_STEPS,
-    SHOT_TRIGGER_HEAD_MIN_TRAINING_STEPS,
+    SHOT_TRIGGER_HEAD_MIN_TRAINING_STEPS, SUPPORT_SCORER_HEAD_MIN_TRAINING_STEPS,
 };
 use soccer_engine::des::soccer_learning::{
     evaluate_soccer_policy_promotion_gate, evolve_soccer_tactical_learning_weights_from_genomes,
@@ -1934,6 +1934,12 @@ static CARRIED_PASS_COMPLETION_HEAD: std::sync::Mutex<Option<SoccerPassCompletio
 static CARRIED_ATTACK_SPACING_HEAD: std::sync::Mutex<Option<AttackSpacingHead>> =
     std::sync::Mutex::new(None);
 
+/// In-memory off-ball support scorer head, carried + trained across games WITHIN a
+/// learner process, then installed into the next game so `open_space_for` can turn
+/// support movement predilections into learned candidate choices once warm.
+static CARRIED_SUPPORT_SCORER_HEAD: std::sync::Mutex<Option<SupportScorerHead>> =
+    std::sync::Mutex::new(None);
+
 /// In-memory shot-trigger value head (when to pull the trigger on a shot), carried +
 /// trained across games WITHIN a learner process, then installed into the next game so
 /// the shot decision consumes what was learned. Mirrors `CARRIED_LINE_DEPTH_HEAD`.
@@ -2024,6 +2030,11 @@ fn run_game(
     // formation LP consume the learned spacing band once trained.
     if let Some(head) = CARRIED_ATTACK_SPACING_HEAD.lock().unwrap().as_ref() {
         sim.set_attack_spacing_head(head.clone());
+    }
+    // Install the carried support scorer so open-space support destination ranking can
+    // consume learned candidate values once warm.
+    if let Some(head) = CARRIED_SUPPORT_SCORER_HEAD.lock().unwrap().as_ref() {
+        sim.set_support_scorer_head(head.clone());
     }
     // Install the carried shot-trigger head so the shot decision consumes it live once
     // trained. Default-ON model; no-op unless DD_SOCCER_DISABLE_SHOT_TRIGGER_MDP is unset
@@ -2191,6 +2202,25 @@ fn run_game(
             attack_spacing_samples.len(),
             head.training_steps(),
             head.training_steps() >= ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS,
+            final_loss
+        );
+    }
+    // Train the CARRIED support scorer on this game's off-ball support destination
+    // choices and install it into the next game, so lane/spacing/open-space
+    // predilections remain biases but the candidate choice becomes learnable once warm.
+    let support_move_samples = sim.drain_support_move_samples();
+    if !support_move_samples.is_empty() {
+        let mut guard = CARRIED_SUPPORT_SCORER_HEAD.lock().unwrap();
+        let head = guard.get_or_insert_with(|| SupportScorerHead::new(episode_seed as u32));
+        let mut final_loss = 0.0;
+        for _ in 0..4 {
+            final_loss = head.train(&support_move_samples, 0.02);
+        }
+        eprintln!(
+            "support_scorer_training samples={} training_steps={} consumed={} final_loss={:.5}",
+            support_move_samples.len(),
+            head.training_steps(),
+            head.training_steps() >= SUPPORT_SCORER_HEAD_MIN_TRAINING_STEPS,
             final_loss
         );
     }

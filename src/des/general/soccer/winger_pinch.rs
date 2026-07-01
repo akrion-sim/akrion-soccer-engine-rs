@@ -97,6 +97,20 @@ impl WingerPinchChoice {
     }
 }
 
+/// Learner-visible profile for the stay-wide / half-space / back-post bucket choice.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WingerPinchDecisionProfile {
+    pub(crate) choice: WingerPinchChoice,
+    pub(crate) stay_score: f64,
+    pub(crate) half_space_score: f64,
+    pub(crate) back_post_score: f64,
+    pub(crate) ball_on_my_flank: bool,
+    pub(crate) crossing_position_on: bool,
+    pub(crate) ball_final_third_depth_frac: f64,
+    pub(crate) box_congestion: usize,
+    pub(crate) back_post_offside: bool,
+}
+
 // --- Decision bucket scoring weights (calibrated priors; reinforced via the cross-arrival
 // reward channel — see module docs). Kept as named constants so an A/B can tune them and a
 // later learned head can replace the scoring while keeping the same bucket space. ---
@@ -143,13 +157,13 @@ pub(crate) const PINCH_CROWDED_BOX_RUNNERS: usize = 3;
 /// * `ball_final_third_depth_frac` — 0 at the final-third edge → 1 at the byline (clamped).
 /// * `box_congestion` — own attackers already inside the opponent box (excluding this winger).
 /// * `back_post_offside` — the back-post arrival point would be offside ⇒ that bucket is masked.
-pub(crate) fn decide_winger_pinch(
+pub(crate) fn winger_pinch_decision_profile(
     ball_on_my_flank: bool,
     crossing_position_on: bool,
     ball_final_third_depth_frac: f64,
     box_congestion: usize,
     back_post_offside: bool,
-) -> WingerPinchChoice {
+) -> WingerPinchDecisionProfile {
     let depth = ball_final_third_depth_frac.clamp(0.0, 1.0);
     let congestion = box_congestion as f64;
 
@@ -177,8 +191,9 @@ pub(crate) fn decide_winger_pinch(
     }
 
     // Legality mask: an offside back-post arrival is illegal — prune that bucket.
+    let mut masked_back = back;
     if back_post_offside {
-        back = f64::NEG_INFINITY;
+        masked_back = f64::NEG_INFINITY;
     }
 
     // Argmax over the three buckets, ties resolved toward the safer (wider) option.
@@ -188,10 +203,41 @@ pub(crate) fn decide_winger_pinch(
         best = WingerPinchChoice::PinchHalfSpace;
         best_score = half;
     }
-    if back > best_score {
+    if masked_back > best_score {
         best = WingerPinchChoice::PinchBackPost;
     }
-    best
+    WingerPinchDecisionProfile {
+        choice: best,
+        stay_score: stay.max(0.0),
+        half_space_score: half.max(0.0),
+        back_post_score: if back_post_offside {
+            0.0
+        } else {
+            back.max(0.0)
+        },
+        ball_on_my_flank,
+        crossing_position_on,
+        ball_final_third_depth_frac: depth,
+        box_congestion,
+        back_post_offside,
+    }
+}
+
+pub(crate) fn decide_winger_pinch(
+    ball_on_my_flank: bool,
+    crossing_position_on: bool,
+    ball_final_third_depth_frac: f64,
+    box_congestion: usize,
+    back_post_offside: bool,
+) -> WingerPinchChoice {
+    winger_pinch_decision_profile(
+        ball_on_my_flank,
+        crossing_position_on,
+        ball_final_third_depth_frac,
+        box_congestion,
+        back_post_offside,
+    )
+    .choice
 }
 
 /// Lower a pinch choice to its realised off-ball target. Returns `None` for [`WingerPinchChoice::StayWide`]

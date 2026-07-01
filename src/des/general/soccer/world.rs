@@ -555,6 +555,11 @@ pub struct SoccerMatch {
     /// [`WorldSnapshot`] via an `Arc` clone so the off-ball ranker and LP floor read
     /// the same learned band.
     pub(crate) attack_spacing_head: Option<std::sync::Arc<AttackSpacingHead>>,
+    /// The trained off-ball support candidate scorer, when present. Carried + trained
+    /// across games by the learner; `None` ⇒ analytic open-space seed. Shared into each
+    /// [`WorldSnapshot`] via an `Arc` clone so support destinations can remain a
+    /// predilection with learnable candidate choice.
+    pub(crate) support_scorer_head: Option<std::sync::Arc<SupportScorerHead>>,
     /// Rolling RL corpus for the loose-ball commit head: per-candidate state + the
     /// commit action taken + the windowed possession/territorial reward. Collected
     /// only while the commit model is enabled; empty + untouched in the default process.
@@ -636,6 +641,12 @@ pub struct SoccerMatch {
     pub(crate) attack_spacing_samples: Vec<AttackSpacingSample>,
     /// Open attacking-spacing decisions awaiting their windowed reward.
     pub(crate) pending_attack_spacing: Vec<PendingAttackSpacingDecision>,
+    /// Rolling RL training corpus for the learnable support candidate scorer: the
+    /// selected off-ball destination features + the windowed territorial reward.
+    /// Collected only while the support scorer is enabled; drained by the learner.
+    pub(crate) support_move_samples: Vec<SupportMoveSample>,
+    /// Open support destination decisions awaiting their windowed reward.
+    pub(crate) pending_support_decisions: Vec<PendingSupportDecision>,
     /// Rolling ~5s window of recent learning transitions, evicted by tick-age. Maintained
     /// only while the turnover-window penalty is enabled, so a dispossession/interception
     /// can retroactively penalize the losing team's last-5s actions (`penalize_turnover_window`).
@@ -3124,6 +3135,7 @@ impl SoccerMatch {
             back_four_line_latch: [None, None],
             loose_ball_commit_head: None,
             attack_spacing_head: None,
+            support_scorer_head: None,
             loose_ball_commit_samples: Vec::new(),
             pending_loose_ball_commit: Vec::new(),
             receive_approach_head: None,
@@ -3147,6 +3159,8 @@ impl SoccerMatch {
             loose_ball_uncontested_since_tick: None,
             attack_spacing_samples: Vec::new(),
             pending_attack_spacing: Vec::new(),
+            support_move_samples: Vec::new(),
+            pending_support_decisions: Vec::new(),
             turnover_penalty_history: VecDeque::new(),
             last_turnover_penalty_tick: None,
             pending_turnover_outcome: None,
@@ -3224,6 +3238,73 @@ impl SoccerMatch {
 
     pub fn learned_policy_mut(&mut self) -> Option<&mut SoccerQPolicy> {
         self.learned_policy.as_mut()
+    }
+
+    /// Gated per-tick RL sample collection for the learnable off-ball support scorer.
+    /// When on: resolve open support choices whose reward window has elapsed, then
+    /// sample the current support destination choice for each off-ball teammate in
+    /// possession. The feature row comes from `open_space_for` itself, so training is
+    /// tied to the exact candidate surface the live ranker used.
+    pub(crate) fn collect_support_scorer_rl_samples(&mut self, snapshot: &WorldSnapshot) {
+        if !support_scorer_enabled() {
+            return;
+        }
+        let tick = self.tick;
+        let mut i = 0;
+        while i < self.pending_support_decisions.len() {
+            if self.pending_support_decisions[i].due_tick <= tick {
+                let decision = self.pending_support_decisions.swap_remove(i);
+                let now_territorial = territorial_advantage(snapshot, decision.team);
+                if now_territorial.is_finite() && decision.decision_territorial.is_finite() {
+                    self.support_move_samples.push(SupportMoveSample {
+                        features: decision.features,
+                        reward: now_territorial - decision.decision_territorial,
+                    });
+                    if self.support_move_samples.len() > SUPPORT_MOVE_SAMPLE_CAP {
+                        let overflow = self.support_move_samples.len() - SUPPORT_MOVE_SAMPLE_CAP;
+                        self.support_move_samples.drain(0..overflow);
+                    }
+                }
+            } else {
+                i += 1;
+            }
+        }
+        if tick % SUPPORT_MOVE_SAMPLE_INTERVAL_TICKS != 0 {
+            return;
+        }
+        let Some(team) = snapshot.possession_team() else {
+            return;
+        };
+        let territorial = territorial_advantage(snapshot, team);
+        if !territorial.is_finite() {
+            return;
+        }
+        for player in snapshot.players.iter().filter(|player| {
+            player.team == team
+                && player.role != PlayerRole::Goalkeeper
+                && snapshot.ball.holder != Some(player.id)
+        }) {
+            let _target = snapshot.open_space_for(player.id, player.home_position);
+            let Some(features) = snapshot.cached_support_decision_features(player.id) else {
+                continue;
+            };
+            self.pending_support_decisions.push(PendingSupportDecision {
+                team,
+                features,
+                decision_territorial: territorial,
+                due_tick: tick + SUPPORT_MOVE_REWARD_WINDOW_TICKS,
+            });
+        }
+    }
+
+    /// Drain collected support-move RL samples for the learner.
+    pub fn drain_support_move_samples(&mut self) -> Vec<SupportMoveSample> {
+        std::mem::take(&mut self.support_move_samples)
+    }
+
+    /// Install the trained support scorer for live off-ball destination ranking.
+    pub fn set_support_scorer_head(&mut self, head: SupportScorerHead) {
+        self.support_scorer_head = Some(std::sync::Arc::new(head));
     }
 
     /// Opt the match into blending the trained neural value head into live action
@@ -8637,6 +8718,10 @@ impl SoccerMatch {
         // Learnable attacking-spacing target RL samples (no-op + byte-identical unless
         // `DD_SOCCER_ENABLE_LEARNED_SPACING_TARGET` is set).
         self.collect_attack_spacing_rl_samples(&next_snapshot);
+        // Learnable support candidate scorer (open-space destination choice). Default-on
+        // in production with analytic fallback; no-op when explicitly disabled / under
+        // tests unless opted in.
+        self.collect_support_scorer_rl_samples(&next_snapshot);
         // Learnable aerial-reception control RL samples (no-op + byte-identical unless
         // `DD_SOCCER_ENABLE_LEARNED_AERIAL_RECEPTION` is set).
         self.collect_aerial_reception_rl_samples(&next_snapshot);
@@ -16594,7 +16679,7 @@ impl SoccerMatch {
         pitch_value_terminal_gain: f64,
     ) -> PlanarMpcConfig {
         let base = PlanarMpcConfig::default();
-        let iters = ((horizon as f64 * 2.0).clamp(60.0, 200.0)) as usize;
+        let iters = ((horizon as f64 * 1.5).clamp(36.0, 120.0)) as usize;
         let obstacle_decay_per_step = 0.5_f64.powf(dt / 1.5);
         let weight_boost = if self.config.mpc.latent_weight_boost.is_finite() {
             self.config.mpc.latent_weight_boost.clamp(0.0, 2.0)
@@ -22004,6 +22089,15 @@ pub struct PlayerSnapshot {
     /// summoned teammates can read the carrier's signal from the shared snapshot.
     #[serde(default)]
     pub hold_for_support: Option<HoldForSupport>,
+    /// Same-team separation-floor dwell timers, mirrored from [`PlayerAgent`],
+    /// so POMDP observations and replayed learning transitions can see when the
+    /// 4/5/6/7-yard Euclidean spacing penalty has crossed grace.
+    #[serde(default)]
+    pub same_team_proximity_dwell_lt7_seconds: f64,
+    #[serde(default)]
+    pub same_team_proximity_dwell_lt6_seconds: f64,
+    #[serde(default)]
+    pub same_team_proximity_dwell_lt5_seconds: f64,
     /// Seconds the player is still grounded after a missed slide tackle (mirrors
     /// [`PlayerAgent::slide_recovery_seconds`]); `> 0` means it is prone and out of the
     /// play. Surfaced so teammates/opponents and the UI can read it from the snapshot.
@@ -22136,6 +22230,13 @@ pub struct WorldSnapshot {
     #[serde(skip)]
     pub(crate) ranked_aerial_pass_cache:
         std::cell::RefCell<std::collections::HashMap<(usize, bool), Vec<usize>>>,
+    /// Per-snapshot memo of the support candidate feature row selected by
+    /// `open_space_for`, keyed by player id. The RL sampler calls the same scorer and
+    /// drains this exact row into the pending reward window; skipped by serde and
+    /// rebuilt lazily.
+    #[serde(skip)]
+    pub(crate) support_decision_feature_cache:
+        std::cell::RefCell<std::collections::HashMap<usize, SupportCandidateFeatures>>,
     /// The trained back-four line-depth head, carried from the match for live
     /// consumption in `back_four_line_model_centre_fwd` (Gap 5 step 3b). `None` ⇒ the
     /// decision uses the analytic seed (parity). Skipped by serde (an internal
@@ -22183,6 +22284,11 @@ pub struct WorldSnapshot {
     /// Default = None).
     #[serde(skip)]
     pub(crate) attack_spacing_head: Option<std::sync::Arc<AttackSpacingHead>>,
+    /// The trained support-candidate value head, carried from the match for live
+    /// consumption by `open_space_for`. `None` ⇒ analytic seed (parity). Skipped by
+    /// serde (internal decision aid; Default = None).
+    #[serde(skip)]
+    pub(crate) support_scorer_head: Option<std::sync::Arc<SupportScorerHead>>,
     /// Carried from the match for live consumption in the aerial-reception decision: how
     /// high to attack a dropping lofted ball. `None` ⇒ analytic seed (parity). Skipped by
     /// serde (an internal decision aid; Default = None).
@@ -24607,6 +24713,42 @@ fn offside_position_assessment(
     })
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct WingerPinchLearningContext {
+    active: bool,
+    choice_code: f64,
+    stay_score: f64,
+    half_space_score: f64,
+    back_post_score: f64,
+    pinch_pressure: f64,
+    depth_frac: f64,
+    box_congestion: f64,
+    ball_on_own_flank: bool,
+    back_post_offside: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PassLaneYieldLearningContext {
+    available: bool,
+    strength: f64,
+    target_distance_yards: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CrashBoxLearningContext {
+    commit_active: bool,
+    target_available: bool,
+    target_distance_yards: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ForwardOnsideSupportLearningContext {
+    active: bool,
+    line_gap_yards: f64,
+    clamp_distance_yards: f64,
+    pressure: f64,
+}
+
 impl WorldSnapshot {
     pub(crate) fn from_match(m: &SoccerMatch) -> Self {
         Self::from_match_with_options(m, WorldSnapshotOptions::FULL)
@@ -24783,6 +24925,9 @@ impl WorldSnapshot {
                 one_two: p.one_two,
                 runaround: p.runaround,
                 hold_for_support: p.hold_for_support.clone(),
+                same_team_proximity_dwell_lt7_seconds: p.same_team_proximity_dwell_lt7_seconds,
+                same_team_proximity_dwell_lt6_seconds: p.same_team_proximity_dwell_lt6_seconds,
+                same_team_proximity_dwell_lt5_seconds: p.same_team_proximity_dwell_lt5_seconds,
                 slide_recovery_seconds: p.slide_recovery_seconds,
             })
             .collect::<Vec<_>>();
@@ -24833,6 +24978,9 @@ impl WorldSnapshot {
             keeper_commit_bias: [0.0, 0.0],
             ranked_floor_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             ranked_aerial_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            support_decision_feature_cache: std::cell::RefCell::new(
+                std::collections::HashMap::new(),
+            ),
             line_depth_head: m.line_depth_head.clone(),
             back_four_line_latch_centre_depth: [
                 m.back_four_line_latch[0].map(|l| l.centre_depth),
@@ -24845,6 +24993,7 @@ impl WorldSnapshot {
             long_pass_run_head: m.long_pass_run_head.clone(),
             give_and_go_head: m.give_and_go_head.clone(),
             attack_spacing_head: m.attack_spacing_head.clone(),
+            support_scorer_head: m.support_scorer_head.clone(),
             aerial_reception_head: m.aerial_reception_head.clone(),
             shot_trigger_head: m.shot_trigger_head.clone(),
             loose_ball_uncontested_since_tick: m.loose_ball_uncontested_since_tick,
@@ -29335,6 +29484,179 @@ impl WorldSnapshot {
         target.clamp_to_pitch(self.field_width, self.field_length)
     }
 
+    fn winger_pinch_learning_context_for(
+        &self,
+        player: &PlayerSnapshot,
+    ) -> WingerPinchLearningContext {
+        if !winger_pinch_in_enabled() || self.active_set_play.is_some() {
+            return WingerPinchLearningContext::default();
+        }
+        if self.possession_team() != Some(player.team)
+            || self.ball.holder == Some(player.id)
+            || player.controller_slot.is_some()
+            || !self.is_wide_attacker(player)
+        {
+            return WingerPinchLearningContext::default();
+        }
+        let attacked_goal_y = player.team.goal_y(self.field_length);
+        if !ball_in_attacking_final_third(self.ball.position.y, attacked_goal_y, self.field_length) {
+            return WingerPinchLearningContext::default();
+        }
+        let dir = player.team.attack_dir();
+        let center_x = self.field_width * 0.5;
+        let crosser = self
+            .ball
+            .holder
+            .and_then(|h| self.players.iter().find(|p| p.id == h))
+            .filter(|p| p.team == player.team)
+            .map(|p| self.player_snapshot_position(p))
+            .unwrap_or(self.ball.position);
+        let my_side = (player.home_position.x - center_x).signum();
+        let ball_side = (crosser.x - center_x).signum();
+        let ball_on_my_flank = my_side != 0.0 && my_side == ball_side;
+        let crossing_position_on = flank_final_third_crash_box_geometry(
+            crosser,
+            attacked_goal_y,
+            self.field_width,
+            self.field_length,
+        );
+        let depth_frac =
+            final_third_depth_frac(self.ball.position.y, attacked_goal_y, self.field_length);
+        let box_congestion = self
+            .players
+            .iter()
+            .filter(|p| {
+                p.team == player.team
+                    && p.id != player.id
+                    && self.ball.holder != Some(p.id)
+                    && matches!(p.role, PlayerRole::Forward | PlayerRole::Midfielder)
+                    && self
+                        .point_in_own_penalty_area(player.team.other(), self.player_snapshot_position(p))
+            })
+            .count();
+        let back_post_probe = winger_pinch_target(
+            WingerPinchChoice::PinchBackPost,
+            player.home_position.x,
+            attacked_goal_y,
+            dir,
+            self.field_width,
+            self.field_length,
+        );
+        let back_post_offside = back_post_probe
+            .map(|probe| self.position_would_be_offside(player.team, probe))
+            .unwrap_or(true);
+        let profile = winger_pinch_decision_profile(
+            ball_on_my_flank,
+            crossing_position_on,
+            depth_frac,
+            box_congestion,
+            back_post_offside,
+        );
+        let choice_code = match profile.choice {
+            WingerPinchChoice::StayWide => 0.0,
+            WingerPinchChoice::PinchHalfSpace => 0.5,
+            WingerPinchChoice::PinchBackPost => 1.0,
+        };
+        let pinch_best = profile.half_space_score.max(profile.back_post_score);
+        let score_total =
+            (profile.stay_score + profile.half_space_score + profile.back_post_score).max(1e-6);
+        WingerPinchLearningContext {
+            active: true,
+            choice_code,
+            stay_score: profile.stay_score,
+            half_space_score: profile.half_space_score,
+            back_post_score: profile.back_post_score,
+            pinch_pressure: (pinch_best / score_total).clamp(0.0, 1.0),
+            depth_frac: profile.ball_final_third_depth_frac,
+            box_congestion: profile.box_congestion.min(6) as f64 / 6.0,
+            ball_on_own_flank: profile.ball_on_my_flank,
+            back_post_offside: profile.back_post_offside,
+        }
+    }
+
+    fn pass_lane_yield_learning_context_for(
+        &self,
+        player: &PlayerSnapshot,
+        player_position: Vec2,
+    ) -> PassLaneYieldLearningContext {
+        let Some((target, strength)) =
+            self.pass_lane_yield_target_for(player.id, player.home_position)
+        else {
+            return PassLaneYieldLearningContext::default();
+        };
+        PassLaneYieldLearningContext {
+            available: true,
+            strength: strength.clamp(0.0, 1.0),
+            target_distance_yards: player_position.distance(target),
+        }
+    }
+
+    fn crash_box_learning_context_for(
+        &self,
+        player: &PlayerSnapshot,
+        player_position: Vec2,
+    ) -> CrashBoxLearningContext {
+        if dd_soccer_disable_crash_the_box() || self.active_set_play.is_some() {
+            return CrashBoxLearningContext::default();
+        }
+        let attack_strategy = self.tactical_directive(player.team).attack_strategy;
+        let commit_active = attack_strategy == TeamAttackStrategy::CrashTheBox
+            || is_byline_cross_drive_strategy(attack_strategy)
+            || self.flank_final_third_crash_box_active(player.team);
+        if !commit_active {
+            return CrashBoxLearningContext::default();
+        }
+        let target = self.crash_the_box_target_for(player);
+        CrashBoxLearningContext {
+            commit_active,
+            target_available: target.is_some(),
+            target_distance_yards: target
+                .map(|target| player_position.distance(target))
+                .unwrap_or(0.0),
+        }
+    }
+
+    fn forward_onside_support_learning_context_for(
+        &self,
+        player: &PlayerSnapshot,
+        player_position: Vec2,
+    ) -> ForwardOnsideSupportLearningContext {
+        if self.possession_team() != Some(player.team)
+            || self.ball.holder == Some(player.id)
+            || !matches!(player.role, PlayerRole::Forward | PlayerRole::Midfielder)
+            || self.in_behind_run_target_for(player.id).is_some()
+            || self
+                .slip_break_offside_trap_run_target_for(player.id)
+                .is_some()
+        {
+            return ForwardOnsideSupportLearningContext::default();
+        }
+        let Some(line_y) = self.second_last_defender_line_for(player.team) else {
+            return ForwardOnsideSupportLearningContext::default();
+        };
+        let attack = player.team.attack_dir();
+        let active_line_y = active_offside_line_y(player.team, self.ball.position.y, line_y);
+        let cap_y = if dd_soccer_disable_onside_support_hold() {
+            self.open_space_support_line_y(player.team, active_line_y)
+        } else {
+            active_line_y
+        };
+        let line_gap_yards = (cap_y - player_position.y) * attack;
+        let clamped = self.clamp_forward_onside_support(player, player_position);
+        let clamp_distance_yards = player_position.distance(clamped);
+        let pressure = if line_gap_yards < 0.0 {
+            (-line_gap_yards / 8.0).clamp(0.0, 1.0)
+        } else {
+            ((1.0 - line_gap_yards / 6.0).clamp(0.0, 1.0) * 0.55).clamp(0.0, 1.0)
+        };
+        ForwardOnsideSupportLearningContext {
+            active: true,
+            line_gap_yards,
+            clamp_distance_yards,
+            pressure,
+        }
+    }
+
     pub fn tactical_directive(&self, team: Team) -> &TeamTacticalDirective {
         match team {
             Team::Home => &self.home_directive,
@@ -29477,6 +29799,26 @@ impl WorldSnapshot {
                 side_glance_scan_rate_hz: 0.0,
                 side_glance_surprise_recognition: 0.0,
                 side_glance_control_cost: 0.0,
+                winger_pinch_decision_active: false,
+                winger_pinch_choice_code: 0.0,
+                winger_pinch_stay_wide_score: 0.0,
+                winger_pinch_half_space_score: 0.0,
+                winger_pinch_back_post_score: 0.0,
+                winger_pinch_pressure: 0.0,
+                winger_pinch_final_third_depth: 0.0,
+                winger_pinch_box_congestion: 0.0,
+                winger_pinch_ball_on_own_flank: false,
+                winger_pinch_back_post_offside: false,
+                pass_lane_yield_available: false,
+                pass_lane_yield_strength: 0.0,
+                pass_lane_yield_target_distance_yards: 0.0,
+                crash_box_commit_active: false,
+                crash_box_target_available: false,
+                crash_box_target_distance_yards: 0.0,
+                forward_onside_support_gamble_active: false,
+                forward_onside_support_line_gap_yards: 0.0,
+                forward_onside_support_clamp_distance_yards: 0.0,
+                forward_onside_support_pressure: 0.0,
                 previous_tick_carryover: None,
                 scheduled_index: None,
                 ball_scheduled_index: None,
@@ -29524,6 +29866,13 @@ impl WorldSnapshot {
                 positional_shape_exception_relief: 0.0,
                 nearest_teammate_id: None,
                 teammate_overlap_pressure: 0.0,
+                same_team_separation_floor_active: false,
+                same_team_separation_floor_distance_yards: 0.0,
+                same_team_separation_floor_pressure: 0.0,
+                same_team_separation_dwell_lt7_seconds: 0.0,
+                same_team_separation_dwell_lt6_seconds: 0.0,
+                same_team_separation_dwell_lt5_seconds: 0.0,
+                same_team_separation_penalty_live: false,
                 spacing_nudge_target: None,
                 support_ball_holder_distance_yards: 0.0,
                 support_ball_holder_lane_open: 0.0,
@@ -29759,6 +30108,22 @@ impl WorldSnapshot {
             .iter()
             .find(|notice| notice.player_id == me.id)
             .map(|notice| notice.suggested_point);
+        let same_team_separation_floor_distance =
+            dd_soccer_enable_same_team_separation_floor()
+                .then(|| nearest_same_team_distance_for_floor(self, me.id, me.team))
+                .flatten();
+        let same_team_separation_floor_active = same_team_separation_floor_distance.is_some();
+        let same_team_separation_floor_distance_yards =
+            same_team_separation_floor_distance.unwrap_or(0.0);
+        let same_team_separation_floor_pressure = same_team_separation_floor_distance
+            .map(same_team_proximity_penalty_unit)
+            .unwrap_or(0.0);
+        let same_team_separation_penalty_live = same_team_separation_floor_pressure > 0.0
+            && same_team_proximity_penalty_past_grace(
+                me.same_team_proximity_dwell_lt7_seconds,
+                me.same_team_proximity_dwell_lt6_seconds,
+                me.same_team_proximity_dwell_lt5_seconds,
+            );
         let (team_spacing_score, preferred_team_spacing_yards) = self
             .team_spacing_mode_for(me.team)
             .map(|mode| {
@@ -30885,6 +31250,11 @@ impl WorldSnapshot {
         // `slip_break_carrier_recognition`.
         let (slip_break_seam_quality, slip_break_release_now) =
             self.slip_break_carrier_recognition(me, me_position);
+        let winger_pinch_learning = self.winger_pinch_learning_context_for(me);
+        let pass_lane_yield_learning = self.pass_lane_yield_learning_context_for(me, me_position);
+        let crash_box_learning = self.crash_box_learning_context_for(me, me_position);
+        let forward_onside_support_learning =
+            self.forward_onside_support_learning_context_for(me, me_position);
         let mut observation = SoccerPomdpObservation {
             player_id,
             assigned_position: Some(me.assigned_position),
@@ -31064,6 +31434,27 @@ impl WorldSnapshot {
             side_glance_scan_rate_hz: surprise_behind_steal.holder_glance_scan_rate_hz,
             side_glance_surprise_recognition: surprise_behind_steal.holder_glance_recognition,
             side_glance_control_cost: surprise_behind_steal.holder_glance_control_cost,
+            winger_pinch_decision_active: winger_pinch_learning.active,
+            winger_pinch_choice_code: winger_pinch_learning.choice_code,
+            winger_pinch_stay_wide_score: winger_pinch_learning.stay_score,
+            winger_pinch_half_space_score: winger_pinch_learning.half_space_score,
+            winger_pinch_back_post_score: winger_pinch_learning.back_post_score,
+            winger_pinch_pressure: winger_pinch_learning.pinch_pressure,
+            winger_pinch_final_third_depth: winger_pinch_learning.depth_frac,
+            winger_pinch_box_congestion: winger_pinch_learning.box_congestion,
+            winger_pinch_ball_on_own_flank: winger_pinch_learning.ball_on_own_flank,
+            winger_pinch_back_post_offside: winger_pinch_learning.back_post_offside,
+            pass_lane_yield_available: pass_lane_yield_learning.available,
+            pass_lane_yield_strength: pass_lane_yield_learning.strength,
+            pass_lane_yield_target_distance_yards: pass_lane_yield_learning.target_distance_yards,
+            crash_box_commit_active: crash_box_learning.commit_active,
+            crash_box_target_available: crash_box_learning.target_available,
+            crash_box_target_distance_yards: crash_box_learning.target_distance_yards,
+            forward_onside_support_gamble_active: forward_onside_support_learning.active,
+            forward_onside_support_line_gap_yards: forward_onside_support_learning.line_gap_yards,
+            forward_onside_support_clamp_distance_yards: forward_onside_support_learning
+                .clamp_distance_yards,
+            forward_onside_support_pressure: forward_onside_support_learning.pressure,
             previous_tick_carryover,
             scheduled_index,
             ball_scheduled_index,
@@ -31115,6 +31506,13 @@ impl WorldSnapshot {
             positional_shape_exception_relief: lane_relief,
             nearest_teammate_id,
             teammate_overlap_pressure,
+            same_team_separation_floor_active,
+            same_team_separation_floor_distance_yards,
+            same_team_separation_floor_pressure,
+            same_team_separation_dwell_lt7_seconds: me.same_team_proximity_dwell_lt7_seconds,
+            same_team_separation_dwell_lt6_seconds: me.same_team_proximity_dwell_lt6_seconds,
+            same_team_separation_dwell_lt5_seconds: me.same_team_proximity_dwell_lt5_seconds,
+            same_team_separation_penalty_live,
             spacing_nudge_target,
             support_ball_holder_distance_yards,
             support_ball_holder_lane_open,
@@ -45423,6 +45821,29 @@ impl WorldSnapshot {
         resolve_attack_spacing_target(ctx, head)
     }
 
+    pub(crate) fn support_candidate_score(&self, features: &SupportCandidateFeatures) -> f64 {
+        let analytic = analytic_candidate_score(features);
+        if !support_scorer_enabled() {
+            return analytic;
+        }
+        self.support_scorer_head
+            .as_deref()
+            .filter(|head| head.training_steps() >= SUPPORT_SCORER_HEAD_MIN_TRAINING_STEPS)
+            .and_then(|head| head.predict(features))
+            .filter(|score| score.is_finite())
+            .unwrap_or(analytic)
+    }
+
+    pub(crate) fn cached_support_decision_features(
+        &self,
+        player_id: usize,
+    ) -> Option<SupportCandidateFeatures> {
+        self.support_decision_feature_cache
+            .borrow()
+            .get(&player_id)
+            .cloned()
+    }
+
     /// Does an OPEN forward-into-space option genuinely exist for this off-ball player? Probes
     /// a few points ahead of the player (along its channel with a small lateral spread) and
     /// returns true if any is a receivable, unmarked forward destination: forward of the
@@ -45466,6 +45887,9 @@ impl WorldSnapshot {
             return home;
         };
         let me_position = self.player_snapshot_position(me);
+        self.support_decision_feature_cache
+            .borrow_mut()
+            .remove(&player_id);
         // How far the ball is ahead of this player (in the attacking direction). When
         // the ball is well ahead, the player should run UPFIELD into the channel the
         // ball can be played into, not drift square/wide.
@@ -45549,6 +45973,7 @@ impl WorldSnapshot {
         };
         let mut best = base.clamp_to_pitch(self.field_width, self.field_length);
         let mut best_score = f64::NEG_INFINITY;
+        let mut best_support_features: Option<SupportCandidateFeatures> = None;
         let mut open_space_hypotheses: Vec<(Vec2, f64)> = Vec::new();
         // Multimodal run prediction (gated; OFF ⇒ never collects, argmax stands so
         // the destination is byte-identical). When on, the scored candidate surface
@@ -45885,32 +46310,35 @@ impl WorldSnapshot {
                             >= FORWARD_RUN_UNMARKED_MARK_RADIUS_YARDS
                         && self.clear_line(self.ball.position, p, me.team.other(), 2.0),
                 );
-                let score = occupancy.open_space_score
-                    + counterattack_bonus
-                    + advance_upfield_bonus
-                    + goal_directness_bonus
-                    + vacuum_run_bonus
-                    + forward_run_bias
-                    + attacking_spacing_bonus
-                    + forward.max(-4.0) * (0.04 + directive.risk_tolerance * 0.08)
-                    + forward_from_ball.clamp(-6.0, 28.0)
-                        * (0.08 + directive.risk_tolerance * 0.09)
-                    - (forward_from_ball - role_depth).abs() * 0.035
-                    - defensive_midfield_screen_penalty
-                    - p.distance(home) * 0.010
-                    + lane_bonus
-                    + diagonal_support_bonus
-                    + spacing_bonus
-                    + width_possession_bonus
-                    + wingback_flank_opening_bonus
-                    + dynamic_lane_fit_bonus
-                    + ball_arrival_bonus
-                    + short_outlet_bonus
-                    + off_ball_space_discipline
-                    - offside_penalty
-                    - lane_position_penalty
-                    - teammate_occupation_penalty
-                    - line_shape_penalty;
+                let support_features = SupportCandidateFeatures {
+                    open_space_score: occupancy.open_space_score,
+                    counterattack_bonus,
+                    advance_upfield_bonus,
+                    goal_directness_bonus,
+                    vacuum_run_bonus,
+                    forward_run_bias,
+                    attacking_spacing_bonus,
+                    forward_term: forward.max(-4.0) * (0.04 + directive.risk_tolerance * 0.08),
+                    forward_from_ball_term: forward_from_ball.clamp(-6.0, 28.0)
+                        * (0.08 + directive.risk_tolerance * 0.09),
+                    role_depth_deviation_term: -(forward_from_ball - role_depth).abs() * 0.035,
+                    defensive_midfield_screen_penalty,
+                    distance_from_home_term: -p.distance(home) * 0.010,
+                    lane_bonus,
+                    diagonal_support_bonus,
+                    spacing_bonus,
+                    width_possession_bonus,
+                    wingback_flank_opening_bonus,
+                    dynamic_lane_fit_bonus,
+                    ball_arrival_bonus,
+                    short_outlet_bonus,
+                    off_ball_space_discipline,
+                    offside_penalty,
+                    lane_position_penalty,
+                    teammate_occupation_penalty,
+                    line_shape_penalty,
+                };
+                let score = self.support_candidate_score(&support_features);
                 Self::push_open_space_hypothesis(&mut open_space_hypotheses, p, score);
                 if collect_run_modes && score.is_finite() {
                     scored_candidates.push((p, score));
@@ -45918,8 +46346,14 @@ impl WorldSnapshot {
                 if score > best_score {
                     best = p;
                     best_score = score;
+                    best_support_features = Some(support_features);
                 }
             }
+        }
+        if let Some(features) = best_support_features {
+            self.support_decision_feature_cache
+                .borrow_mut()
+                .insert(player_id, features);
         }
         if possession && self.ball.holder != Some(player_id) && me.role != PlayerRole::Goalkeeper {
             if let Some(weighted) =
