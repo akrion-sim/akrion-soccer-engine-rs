@@ -13463,6 +13463,25 @@ pub(crate) fn attack_ambition_enabled() -> bool {
     !*V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_ATTACK_AMBITION").is_ok())
 }
 
+/// Whether **formation-hold tightening** is active this process: off-ball players are held closer to
+/// their formation home (tighter shape radii) AND a roaming/support/press option is bounded to a
+/// generous role radius instead of being unclamped — so the eleven maintain their positions and keep
+/// the pitch spread instead of drifting ~20yd off formation and bunching. **Default-ON in production**
+/// (`DD_SOCCER_ENABLE_FORMATION_HOLD_TIGHTEN=0/false/no/off` is the kill switch), read once.
+/// **Default-OFF under test** so the shape/parity suites stay byte-identical unless a test opts in.
+pub(crate) fn formation_hold_tighten_enabled() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_FORMATION_HOLD_TIGHTEN")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_FORMATION_HOLD_TIGHTEN"))
+    }
+}
+
 /// Whether the **loose-ball opponent-pace match** is active this process: an elected
 /// 1–2 chaser sprints for a loose ball when the nearest opponent has committed a
 /// run/sprint at the contest point, keeping the 50/50 a real race rather than jogging
