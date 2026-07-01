@@ -34656,6 +34656,9 @@ impl WorldSnapshot {
         if scan_seconds <= 0.0 {
             return false;
         }
+        // Learnable scan effort (MDP/POMDP): scale the effective scan time by how hard the carrier
+        // has chosen to scan this situation. Multiplier is 1.0 when the model is off ⇒ byte-identical.
+        let scan_seconds = scan_seconds * self.head_scan_effort_multiplier(observer_id);
         let off_axis = angle_between_vectors_degrees(facing, to_point).to_radians();
         let fov_half = ball_holder_shoulder_scan_limit_degrees().to_radians();
         scan_coverage(
