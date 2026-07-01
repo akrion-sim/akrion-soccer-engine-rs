@@ -23583,8 +23583,8 @@ pub(crate) fn own_half_short_pass_liability_penalty_factor(
     OWN_HALF_SHORT_PASS_LIABILITY_PENALTY * (floor + (1.0 - floor) * shortness)
 }
 /// Small retroactive MDP/POMDP penalty for locomotion energy spent in a tick that bought no
-/// ball interaction over the next 10s (pointless off-ball running). OFF by default; set
-/// `DD_SOCCER_ENABLE_WASTED_ENERGY_PENALTY=1` to enable. Off ⇒ byte-identical & zero-cost.
+/// ball interaction over the next 10s (pointless off-ball running). Default-ON in prod (kill switch
+/// `DD_SOCCER_ENABLE_WASTED_ENERGY_PENALTY=0`); default-OFF under test ⇒ byte-identical & zero-cost.
 pub(crate) fn dd_soccer_enable_wasted_energy_penalty() -> bool {
     #[cfg(test)]
     {
