@@ -2024,6 +2024,11 @@ fn run_game(
     if let Some(head) = CARRIED_GOAL_SIDE_RECOVERY_HEAD.lock().unwrap().as_ref() {
         sim.set_goal_side_recovery_head(head.clone());
     }
+    // Install the carried winger pinch-appetite head so the bucket scoring consumes it live once
+    // trained. No-op unless the model is enabled (on by default in prod).
+    if let Some(head) = CARRIED_WINGER_PINCH_HEAD.lock().unwrap().as_ref() {
+        sim.set_winger_pinch_head(head.clone());
+    }
     // Install the carried long-pass run head so `backfield_long_pass_run_invite_for` consumes
     // it live once trained. No-op unless DD_SOCCER_ENABLE_LEARNED_LONG_PASS_RUN is set.
     if let Some(head) = CARRIED_LONG_PASS_RUN_HEAD.lock().unwrap().as_ref() {
