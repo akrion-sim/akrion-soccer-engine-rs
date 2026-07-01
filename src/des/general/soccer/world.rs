@@ -15503,6 +15503,30 @@ impl SoccerMatch {
             * side_glance_speed_factor;
         let strength_to_weight_factor =
             strength_to_weight_acceleration_multiplier(&self.players[player_id].skills);
+        // HARD same-team separation floor — the smooth movement-barrier layer. Snapshot each
+        // teammate's CURRENT position (positions don't change until integration below) plus a
+        // per-pair "exempt" flag (both inside an 18-yard box) so the post-integration velocity
+        // can be radially damped to never cross within 4yd of a teammate. Empty (skips entirely)
+        // when the gate is off ⇒ byte-identical.
+        let same_team_separation_obstacles: Vec<(Vec2, bool)> =
+            if dd_soccer_enable_same_team_separation_floor() {
+                let my_team = self.players[player_id].team;
+                let me_pos = self.players[player_id].position;
+                let me_in_box = self.point_in_either_penalty_area(me_pos);
+                self.players
+                    .iter()
+                    .filter(|other| other.id != player_id && other.team == my_team)
+                    .filter(|other| other.position.x.is_finite() && other.position.y.is_finite())
+                    .map(|other| {
+                        (
+                            other.position,
+                            me_in_box && self.point_in_either_penalty_area(other.position),
+                        )
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
         let p = &mut self.players[player_id];
         // Accumulate time-in-tier: reset on an effort-tier change, otherwise add this
         // step's dt so the dwell measures how long the current gait has been carried.
