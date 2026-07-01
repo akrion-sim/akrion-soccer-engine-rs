@@ -46072,6 +46072,10 @@ impl WorldSnapshot {
         // its own spatial cluster. No-op when off (empty `scored_candidates`) or
         // when the argmax sits alone ⇒ byte-identical to the bare argmax.
         if collect_run_modes {
+            // Learnable run selection (MDP/POMDP): tilt the argmax off the scored surface toward a
+            // more forward / safer run per a learned preference. At bias 0 (or model off) the
+            // argmax is unchanged ⇒ byte-identical.
+            best = self.run_prediction_tilted_destination(player_id, &scored_candidates, best);
             best = blended_argmax_destination(&scored_candidates, best);
         }
         // Final safety: hold attacking players onside (forwards/mids, in
