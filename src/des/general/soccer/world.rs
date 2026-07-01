@@ -571,6 +571,16 @@ pub struct SoccerMatch {
     pub(crate) receive_approach_samples: Vec<ReceiveApproachSample>,
     /// Open receive-approach decisions awaiting their windowed reward.
     pub(crate) pending_receive_approach: Vec<PendingReceiveApproachDecision>,
+    /// The trained lane-affinity head (whether an out-of-lane player breaks out or is
+    /// held), when present. Carried + trained across games by the learner; `None` ⇒ the
+    /// analytic seed. Shared into each [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) lane_affinity_head: Option<std::sync::Arc<LaneAffinityHead>>,
+    /// Rolling RL corpus for the lane-affinity head: per-player lane state + the break/hold
+    /// action taken + the windowed territorial reward. Collected only while the model is
+    /// enabled.
+    pub(crate) lane_affinity_samples: Vec<LaneAffinitySample>,
+    /// Open lane-affinity decisions awaiting their windowed reward.
+    pub(crate) pending_lane_affinity: Vec<PendingLaneAffinityDecision>,
     /// The trained long-pass run head (which attacker should break forward so a deep carrier
     /// can pick them out), when present. Carried + trained across games by the learner; `None`
     /// ⇒ the analytic `backfield_long_pass_run_invite_for` seed. Shared into each
