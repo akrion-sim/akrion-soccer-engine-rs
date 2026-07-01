@@ -524,6 +524,21 @@ pub struct RewardTunables {
     /// Flat penalty for losing the ball into a loose/contested state from the
     /// OPPONENT's half. Was the inline `0.55`.
     pub giveaway_to_loose_opp_half_penalty: f64,
+    /// Per-second magnitude of the **both-teams loose-ball contest pressure**
+    /// penalty: charged to every outfield player on BOTH teams for each tick an
+    /// unpossessed ball is left uncontested beyond the grace, so standing off a
+    /// loose ball is never free for either side. Symmetric across teams, so it
+    /// biases only the urgency of contesting, not the match outcome. Gated by
+    /// `DD_SOCCER_ENABLE_LOOSE_BALL_CONTEST_PRESSURE` (default-on).
+    pub loose_ball_uncontested_penalty_per_second: f64,
+    /// Cap (points) on the per-tick loose-ball uncontested-time penalty, so a ball
+    /// left sitting can't runaway-dominate the sparse signal.
+    pub loose_ball_uncontested_penalty_max: f64,
+    /// Reward for **winning the unclaimed/loose ball** — the actor's team takes
+    /// controlled possession of a previously-unheld ball. Scaled up the longer the
+    /// ball had gone uncontested (winning a genuinely loose ball is decisive) and
+    /// down for a teammate who forced it loose but did not personally secure it.
+    pub loose_ball_win_points: f64,
     /// Scale on the dense **territorial pitch-control × expected-threat** delta
     /// reward (see [`crate::des::general::soccer::pitch_value`]). Multiplies the
     /// net change in the acting team's controlled threat between the before/after
