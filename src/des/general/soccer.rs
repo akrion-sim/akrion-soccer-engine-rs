@@ -19971,6 +19971,25 @@ pub(crate) fn gate_default_on(name: &str) -> bool {
     }
 }
 
+/// Concede-symmetry rebalance gate. **Default-OFF everywhere** (production and test): a brand-new
+/// reward-balance change is opt-in, not a kill-switch default-on. When
+/// `DD_SOCCER_ENABLE_CONCEDE_SYMMETRY` is truthy, `soccer_transition_reward_with_tactics` swaps
+/// the light default concede penalties (8/2) for the heavier `*_symmetric` tunables (100/60) so
+/// conceding becomes a genuine counterweight to a +100 goal. Off ⇒ byte-identical baseline / A/B.
+/// Tests re-read the env each call so an A/B can toggle it within the process; production caches.
+pub(crate) fn dd_soccer_enable_concede_symmetry() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_CONCEDE_SYMMETRY")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_CONCEDE_SYMMETRY"))
+    }
+}
+
 /// Pure space/pressure test for the team-upfield-advance cue: a controlled-possession outfield
 /// carrier is "advancing into space" when he either has an open forward lane to dribble into
 /// (`forward_dribble_space_yards >= TEAM_ADVANCE_FORWARD_SPACE_YARDS` — the "received a pass with a
