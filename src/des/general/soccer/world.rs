@@ -47503,28 +47503,39 @@ impl WorldSnapshot {
             return centre_fwd;
         };
         let possession = self.controlled_possession_team();
+        let tighter = back_four_tighter_line_enabled();
         let (ideal_gap, push_gain) = if possession == Some(team) {
-            (
-                BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_IN_POSSESSION_YARDS,
-                0.50,
-            )
+            let gap = if tighter {
+                BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_IN_POSSESSION_TIGHT_YARDS
+            } else {
+                BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_IN_POSSESSION_YARDS
+            };
+            (gap, if tighter { 0.60 } else { 0.50 })
         } else if possession.is_none() {
-            (
-                BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_DISPOSSESSION_YARDS,
-                0.42,
-            )
+            let gap = if tighter {
+                BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_DISPOSSESSION_TIGHT_YARDS
+            } else {
+                BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_DISPOSSESSION_YARDS
+            };
+            (gap, if tighter { 0.50 } else { 0.42 })
         } else {
-            (
-                BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_DEFENDING_YARDS,
-                0.18,
-            )
+            let gap = if tighter {
+                BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_DEFENDING_TIGHT_YARDS
+            } else {
+                BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_DEFENDING_YARDS
+            };
+            (gap, if tighter { 0.24 } else { 0.18 })
+        };
+        let max_push = if tighter {
+            BACK_FOUR_FOREMOST_FOUR_ATTACKER_MAX_PUSH_TIGHT_YARDS
+        } else {
+            BACK_FOUR_FOREMOST_FOUR_ATTACKER_MAX_PUSH_YARDS
         };
         let attacker_gap = attackers_fwd - centre_fwd;
         if attacker_gap <= ideal_gap {
             return centre_fwd;
         }
-        let push = ((attacker_gap - ideal_gap) * push_gain)
-            .clamp(0.0, BACK_FOUR_FOREMOST_FOUR_ATTACKER_MAX_PUSH_YARDS);
+        let push = ((attacker_gap - ideal_gap) * push_gain).clamp(0.0, max_push);
         (centre_fwd + push).clamp(own_goal_fwd, own_goal_fwd + max_depth)
     }
 
