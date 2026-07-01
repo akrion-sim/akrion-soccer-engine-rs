@@ -94254,46 +94254,19 @@ fn separation_floor_mpc_reward_and_grace_work_in_unison() {
         "crowding at 3yd is penalised harder than at 5yd"
     );
 
-    // The barrier's guarantee across real ticks of the full step loop: no non-box same-team pair
-    // that is currently AT/ABOVE the 4yd floor ever CLOSES below it on the next tick. (The barrier
-    // prevents crossing the floor; it does not forcibly separate a pair spawned already inside it —
-    // that dispersal is the reward/policy's job — so players 5 & 6, placed at 3yd, are exempt via
-    // the `before >= floor` guard rather than asserted apart.)
-    let floor = SAME_TEAM_MIN_SEPARATION_YARDS;
-    let pair_gap = |sim: &SoccerMatch, i: usize, j: usize| -> Option<f64> {
-        let (a, b) = (&sim.players[i], &sim.players[j]);
-        if sim.point_in_either_penalty_area(a.position)
-            && sim.point_in_either_penalty_area(b.position)
-        {
-            return None; // both-in-box pairs are exempt
-        }
-        Some(a.position.distance(b.position))
-    };
-    for _ in 0..30 {
-        let mut before: Vec<(usize, usize, f64)> = Vec::new();
-        for i in 0..sim.players.len() {
-            for j in (i + 1)..sim.players.len() {
-                if sim.players[i].team != sim.players[j].team {
-                    continue;
-                }
-                if let Some(g) = pair_gap(&sim, i, j) {
-                    before.push((i, j, g));
-                }
-            }
-        }
+    // The GRACE timers are live under the gate: a pair kept crowded accrues dwell across real ticks
+    // of the full step loop. Players 5 & 6 start 3yd apart, so they cannot separate past 7yd in a
+    // few ticks ⇒ the 7yd dwell timer must grow (proving the timer path is wired, off the same gate
+    // as the MPC keep-out and reward penalty above). There is no barrier, so nothing physically
+    // stops them closing — the enforcement is the penalty the timer eventually un-graces.
+    for _ in 0..4 {
         sim.run_time_step();
-        for (i, j, gap_before) in before {
-            if gap_before < floor {
-                continue; // pre-existing overlap: barrier only prevents crossing, not resolves
-            }
-            if let Some(gap_after) = pair_gap(&sim, i, j) {
-                assert!(
-                    gap_after >= floor - 0.25,
-                    "barrier let same-team {i} and {j} close from {gap_before}yd across the 4yd floor to {gap_after}yd"
-                );
-            }
-        }
     }
+    assert!(
+        sim.players[5].same_team_proximity_dwell_lt7_seconds > 0.0,
+        "grace dwell timer must accrue while crowded under the gate: {}",
+        sim.players[5].same_team_proximity_dwell_lt7_seconds
+    );
 
     std::env::remove_var("DD_SOCCER_ENABLE_SAME_TEAM_SEPARATION_FLOOR");
 }
