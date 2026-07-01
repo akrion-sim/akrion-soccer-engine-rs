@@ -22219,6 +22219,10 @@ pub struct WorldSnapshot {
     /// winger-pinch bucket scoring. `None` ⇒ analytic seed (parity). Skipped by serde.
     #[serde(skip)]
     pub(crate) winger_pinch_head: Option<std::sync::Arc<WingerPinchHead>>,
+    /// The trained same-team separation head, carried from the match for live consumption in the
+    /// MPC keep-out. `None` ⇒ analytic seed (parity). Skipped by serde.
+    #[serde(skip)]
+    pub(crate) separation_floor_head: Option<std::sync::Arc<SeparationFloorHead>>,
     /// The trained long-pass run head, carried from the match for live consumption in
     /// `backfield_long_pass_run_invite_for`. `None` ⇒ analytic seed (parity). Skipped by
     /// serde (an internal decision aid; Default = None).
