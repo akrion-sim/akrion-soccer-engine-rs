@@ -130,7 +130,7 @@ line when we press, trap, or control). That seed is the **fallback and the
 bootstrap target**. The path to "solve it optimally":
 
 1. **Head.** `BackFourLineHead` is a `FeedForwardNetwork` regression head
-   (25 → hidden → 1, sigmoid), mirroring `SoccerPassCompletionHead` /
+   (27 → hidden → 1, sigmoid), mirroring `SoccerPassCompletionHead` /
    `SoccerPolicyHead`: live net is not serde, it round-trips through the existing
    `SoccerNeuralNetworkSnapshot` Postgres path. Construction + `predict` + `train`
    are in place; it is wired but not yet consumed live (same staging as the
