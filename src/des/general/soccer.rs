@@ -4463,8 +4463,13 @@ const SOCCER_NEURAL_CURVE_ACTION_FEATURE_DIM: usize = 5;
 const SOCCER_NEURAL_IDEA_EXECUTION_FEATURE_DIM: usize = 8;
 const SOCCER_NEURAL_PRE_IDEA_EXECUTION_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_CURVE_ACTION_FEATURE_DIM + SOCCER_NEURAL_CURVE_ACTION_FEATURE_DIM;
-const SOCCER_NEURAL_FEATURE_DIM: usize =
+/// Append-only execution-MPC trace block: raw model-predictive-control guidance
+/// and reconciliation signals, not just the compressed "execution quality" score.
+const SOCCER_NEURAL_EXECUTION_MPC_FEATURE_DIM: usize = 8;
+const SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_IDEA_EXECUTION_FEATURE_DIM + SOCCER_NEURAL_IDEA_EXECUTION_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_DIM: usize =
+    SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM + SOCCER_NEURAL_EXECUTION_MPC_FEATURE_DIM;
 /// Fixed dimensionality of a persisted **moment embedding** (the vector stored
 /// in pgvector for similarity retrieval). Deliberately decoupled from — and
 /// larger than — `SOCCER_NEURAL_FEATURE_DIM`, which grows as features are added:
@@ -4973,6 +4978,22 @@ const SOCCER_NEURAL_FEATURE_WRONG_IDEA_WRONG_EXECUTION: usize =
     SOCCER_NEURAL_FEATURE_WRONG_IDEA_RIGHT_EXECUTION + 1;
 const SOCCER_NEURAL_FEATURE_SUPPORT_PUSH_UP_ACTION: usize =
     SOCCER_NEURAL_FEATURE_WRONG_IDEA_WRONG_EXECUTION + 1;
+const SOCCER_NEURAL_FEATURE_EXECUTION_MPC_GUIDANCE_PRESENT: usize =
+    SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_EXECUTION_MPC_BLEND_ELIGIBLE: usize =
+    SOCCER_NEURAL_FEATURE_EXECUTION_MPC_GUIDANCE_PRESENT + 1;
+const SOCCER_NEURAL_FEATURE_EXECUTION_MPC_DEVIATION_RECORDED: usize =
+    SOCCER_NEURAL_FEATURE_EXECUTION_MPC_BLEND_ELIGIBLE + 1;
+const SOCCER_NEURAL_FEATURE_EXECUTION_MPC_PROBABILITY: usize =
+    SOCCER_NEURAL_FEATURE_EXECUTION_MPC_DEVIATION_RECORDED + 1;
+const SOCCER_NEURAL_FEATURE_EXECUTION_MPC_TARGET_DELTA: usize =
+    SOCCER_NEURAL_FEATURE_EXECUTION_MPC_PROBABILITY + 1;
+const SOCCER_NEURAL_FEATURE_EXECUTION_MPC_VELOCITY_DELTA: usize =
+    SOCCER_NEURAL_FEATURE_EXECUTION_MPC_TARGET_DELTA + 1;
+const SOCCER_NEURAL_FEATURE_EXECUTION_MPC_HORIZON_SECONDS: usize =
+    SOCCER_NEURAL_FEATURE_EXECUTION_MPC_VELOCITY_DELTA + 1;
+const SOCCER_NEURAL_FEATURE_EXECUTION_MPC_RECOMMENDED_SPEED: usize =
+    SOCCER_NEURAL_FEATURE_EXECUTION_MPC_HORIZON_SECONDS + 1;
 const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     61,
     62,
@@ -5123,6 +5144,8 @@ const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     SOCCER_NEURAL_PRE_IDEA_EXECUTION_FEATURE_DIM,
     // Same schema with idea/execution attribution, before support-push-up got its own bit.
     SOCCER_NEURAL_FEATURE_SUPPORT_PUSH_UP_ACTION,
+    // Same schema with support-push-up, before raw execution-MPC trace channels.
+    SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM,
 ];
 const TEAM_SHAPE_NEAR_BALL_RADIUS_YARDS: f64 = 18.0;
 // Tight same-team congestion rings reported in the brain trace so a human can see
@@ -7852,6 +7875,25 @@ pub struct SoccerDecisionContext {
     pub chosen_action_mpc_feasibility: f64,
     #[serde(default)]
     pub chosen_action_control_cost: f64,
+    /// Raw execution-MPC trace surfaced to learning. The quality score below
+    /// stays as a summary; these fields let the network learn the actual blend,
+    /// deviation, horizon, and speed context.
+    #[serde(default)]
+    pub execution_mpc_guidance_present: bool,
+    #[serde(default)]
+    pub execution_mpc_blend_eligible: bool,
+    #[serde(default)]
+    pub execution_mpc_deviation_recorded: bool,
+    #[serde(default)]
+    pub execution_mpc_probability: f64,
+    #[serde(default)]
+    pub execution_mpc_target_delta_yards: f64,
+    #[serde(default)]
+    pub execution_mpc_velocity_delta_yps: f64,
+    #[serde(default)]
+    pub execution_mpc_horizon_seconds: f64,
+    #[serde(default)]
+    pub execution_mpc_recommended_speed_yps: f64,
     /// Learning attribution split: MDP/POMDP scores the idea, MPC scores execution.
     #[serde(default)]
     pub idea_execution_attribution_available: bool,
@@ -22933,6 +22975,14 @@ fn soccer_decision_context_for(
         action_option_entropy: 0.0,
         chosen_action_mpc_feasibility,
         chosen_action_control_cost,
+        execution_mpc_guidance_present: false,
+        execution_mpc_blend_eligible: false,
+        execution_mpc_deviation_recorded: false,
+        execution_mpc_probability: 0.0,
+        execution_mpc_target_delta_yards: 0.0,
+        execution_mpc_velocity_delta_yps: 0.0,
+        execution_mpc_horizon_seconds: 0.0,
+        execution_mpc_recommended_speed_yps: 0.0,
         idea_execution_attribution_available: false,
         mdp_pomdp_idea_quality: 0.0,
         mpc_execution_quality: 0.0,
@@ -22998,6 +23048,18 @@ fn soccer_decision_context_with_trace(
     context.action_option_entropy = option_context.action_option_entropy;
     if let Some(comparison) = decision.mdp_mpc_comparison.as_ref() {
         let execution_probability = finite_unit_interval(comparison.mpc_execution_probability);
+        context.execution_mpc_guidance_present = comparison.mpc_guidance_present;
+        context.execution_mpc_blend_eligible = comparison.blend_eligible;
+        context.execution_mpc_deviation_recorded = comparison.deviation_recorded;
+        context.execution_mpc_probability = execution_probability;
+        context.execution_mpc_target_delta_yards =
+            soccer_finite_nonnegative_metric(comparison.target_delta_yards);
+        context.execution_mpc_velocity_delta_yps =
+            soccer_finite_nonnegative_metric(comparison.velocity_delta_yps);
+        context.execution_mpc_horizon_seconds =
+            soccer_finite_nonnegative_metric(comparison.mpc_execution_horizon_seconds);
+        context.execution_mpc_recommended_speed_yps =
+            soccer_finite_nonnegative_metric(comparison.mpc_recommended_speed_yps);
         if execution_probability > 0.0 {
             context.chosen_action_mpc_feasibility = context
                 .chosen_action_mpc_feasibility
@@ -41991,6 +42053,22 @@ fn soccer_neural_transition_features_with_action(
         soccer_neural_bool(context.wrong_idea_wrong_execution);
     features[SOCCER_NEURAL_FEATURE_SUPPORT_PUSH_UP_ACTION] =
         soccer_neural_bool(action_label == "support-push-up");
+    features[SOCCER_NEURAL_FEATURE_EXECUTION_MPC_GUIDANCE_PRESENT] =
+        soccer_neural_bool(context.execution_mpc_guidance_present);
+    features[SOCCER_NEURAL_FEATURE_EXECUTION_MPC_BLEND_ELIGIBLE] =
+        soccer_neural_bool(context.execution_mpc_blend_eligible);
+    features[SOCCER_NEURAL_FEATURE_EXECUTION_MPC_DEVIATION_RECORDED] =
+        soccer_neural_bool(context.execution_mpc_deviation_recorded);
+    features[SOCCER_NEURAL_FEATURE_EXECUTION_MPC_PROBABILITY] =
+        soccer_neural_unit(context.execution_mpc_probability);
+    features[SOCCER_NEURAL_FEATURE_EXECUTION_MPC_TARGET_DELTA] =
+        soccer_neural_scaled(context.execution_mpc_target_delta_yards, 18.0);
+    features[SOCCER_NEURAL_FEATURE_EXECUTION_MPC_VELOCITY_DELTA] =
+        soccer_neural_scaled(context.execution_mpc_velocity_delta_yps, 12.0);
+    features[SOCCER_NEURAL_FEATURE_EXECUTION_MPC_HORIZON_SECONDS] =
+        soccer_neural_scaled(context.execution_mpc_horizon_seconds, 3.0);
+    features[SOCCER_NEURAL_FEATURE_EXECUTION_MPC_RECOMMENDED_SPEED] =
+        soccer_neural_scaled(context.execution_mpc_recommended_speed_yps, 12.0);
     debug_assert_eq!(features.len(), SOCCER_NEURAL_FEATURE_DIM);
     features
 }
