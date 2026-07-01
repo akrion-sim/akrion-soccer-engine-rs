@@ -22091,6 +22091,11 @@ pub struct WorldSnapshot {
     /// (parity). Skipped by serde (an internal decision aid; Default = None).
     #[serde(skip)]
     pub(crate) receive_approach_head: Option<std::sync::Arc<ReceiveApproachHead>>,
+    /// The trained lane-affinity head, carried from the match for live consumption in the
+    /// lane clamp seam (`lane_affinity_effective_clamp_blend`). `None` ⇒ analytic seed
+    /// (parity). Skipped by serde (an internal decision aid; Default = None).
+    #[serde(skip)]
+    pub(crate) lane_affinity_head: Option<std::sync::Arc<LaneAffinityHead>>,
     /// The trained long-pass run head, carried from the match for live consumption in
     /// `backfield_long_pass_run_invite_for`. `None` ⇒ analytic seed (parity). Skipped by
     /// serde (an internal decision aid; Default = None).
