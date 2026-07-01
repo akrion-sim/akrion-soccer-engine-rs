@@ -8807,6 +8807,9 @@ impl SoccerMatch {
         // Gap 5: collect line-depth RL samples off the per-tick snapshot (no-op +
         // byte-identical unless a line-depth model is enabled).
         self.collect_line_depth_rl_samples(&next_snapshot);
+        // Per-defender individual line (MAPPO) RL samples, off the same snapshot (no-op +
+        // byte-identical unless DD_SOCCER_ENABLE_BACK_FOUR_INDIVIDUAL_MODEL is set).
+        self.collect_defender_line_rl_samples(&next_snapshot);
         // Maintain the loose-ball urgency clock (every tick) and, when the commit model
         // is enabled, collect its per-candidate RL samples (no-op + byte-identical off).
         self.update_loose_ball_urgency(&next_snapshot);
