@@ -57975,7 +57975,7 @@ pub(crate) fn long_aerial_bounds_risk_for_target(
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct PassTargetQuality {
+pub(crate) struct PassTargetQuality {
     receiver_openness: f64,
     expected_completion: f64,
     stride_fit: f64,
