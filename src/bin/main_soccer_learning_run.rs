@@ -2814,7 +2814,7 @@ fn flush_postgres_completed_runs(
                     metadata.fitness_micros,
                 )
             }),
-            SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION,
+            active_max_fitness_regression(),
         );
         if insert_status != policy_version.status {
             println!(
