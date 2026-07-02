@@ -20043,6 +20043,25 @@ pub(crate) fn dd_soccer_enable_concede_symmetry() -> bool {
     }
 }
 
+/// Offside-infraction penalty gate. **Default-OFF everywhere** (production and test): a brand-new
+/// reward signal is opt-in until an A/B. When `DD_SOCCER_ENABLE_OFFSIDE_INFRACTION_PENALTY` is
+/// truthy, `call_offside` charges the flagged runner (and, discounted, the passer) the sparse
+/// infraction penalty — the negative counterpart to the onside-timing / slip-break rewards. Off ⇒
+/// byte-identical baseline / A/B. Tests re-read the env each call so an A/B can toggle it within
+/// the process; production caches once.
+pub(crate) fn dd_soccer_enable_offside_infraction_penalty() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_OFFSIDE_INFRACTION_PENALTY")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_OFFSIDE_INFRACTION_PENALTY"))
+    }
+}
+
 /// Pure space/pressure test for the team-upfield-advance cue: a controlled-possession outfield
 /// carrier is "advancing into space" when he either has an open forward lane to dribble into
 /// (`forward_dribble_space_yards >= TEAM_ADVANCE_FORWARD_SPACE_YARDS` — the "received a pass with a
