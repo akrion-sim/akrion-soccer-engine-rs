@@ -3395,6 +3395,27 @@ fn run() -> Result<(), Box<dyn Error>> {
     };
     validate_soccer_policy_promotion_gate_config_for_learning_run(&policy_promotion_gate)
         .map_err(invalid_data)?;
+    // Anti-regression ratchet for activation (see `active_max_fitness_regression`):
+    // how much fitness a newer generation may lose vs the incumbent and still go
+    // `active`. Configmap-tunable so the operator can tighten it (→ 0.0 = "no
+    // regression") to stop the tip drifting below earlier peaks, without a rebuild.
+    let active_max_fitness_regression_setting = env_f64_alias(
+        "SOCCER_BATCH_POLICY_ACTIVE_MAX_FITNESS_REGRESSION",
+        "SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION",
+        SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION,
+    )?;
+    if !active_max_fitness_regression_setting.is_finite()
+        || active_max_fitness_regression_setting < 0.0
+    {
+        return Err(invalid_data(
+            "SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION must be finite and non-negative",
+        )
+        .into());
+    }
+    let _ = ACTIVE_MAX_FITNESS_REGRESSION.set(active_max_fitness_regression_setting);
+    println!(
+        "policy_active_max_fitness_regression value={active_max_fitness_regression_setting:.4} (lower = stricter anti-regression ratchet; 0.0 = newer generation must not regress)"
+    );
     let neural_drain_timeout_ms = env_usize(
         "SOCCER_NEURAL_DRAIN_TIMEOUT_MS",
         DEFAULT_SOCCER_NEURAL_DRAIN_TIMEOUT_MS,
