@@ -4389,8 +4389,17 @@ fn run() -> Result<(), Box<dyn Error>> {
                     [&game.episode_summary.summary],
                     policy_promotion_gate,
                 );
-                let policy_version_status =
-                    policy_version_status_for_promotion_gate(&policy_promotion_evaluation);
+                let policy_version_status = apply_anchor_promotion_gate(
+                    &anchor_promotion_gate,
+                    policy_version_status_for_promotion_gate(&policy_promotion_evaluation),
+                    should_write_policy_version,
+                    latest_neural_network.as_ref(),
+                    &mut anchor_neural_network,
+                    &mut anchor_gate_runner,
+                    &mut anchor_gate_write_index,
+                    completed_episode as u32,
+                    &format!("completed_games={completed_episode}"),
+                );
                 if should_write_policy_version
                     && policy_version_status != SOCCER_POLICY_STATUS_ACTIVE
                 {
