@@ -1944,6 +1944,105 @@ fn active_max_fitness_regression() -> f64 {
         .unwrap_or(&SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION)
 }
 
+/// Frozen-anchor promotion gate (DEFAULT-OFF). The live analogue of
+/// [`soccer_engine::des::general::soccer_eval_gate::evaluate_promotion`]: a
+/// newly-learned candidate may only be written `active` (and advance the anchor) if
+/// it beats the current *frozen anchor* brain head-to-head over a held-out slate with
+/// statistical confidence. Wired into the learner so "newer generation" means "beat
+/// the one it replaces" rather than "scored a lucky self-play `match_fitness`", which
+/// is the mechanism that let the active tip regress below earlier peaks. Brains are
+/// compared by their neural snapshots — the live on-ball driver — mirroring the
+/// standalone `soccer_eval_gate_run` gate. Off unless
+/// `SOCCER_ANCHOR_PROMOTION_GATE_ENABLED=1`.
+#[derive(Clone, Copy, Debug)]
+struct AnchorPromotionGateConfig {
+    enabled: bool,
+    /// Held-out games per verdict (candidate vs anchor, home/away alternated).
+    games: usize,
+    /// Sim minutes per held-out fixture (short: this runs inline in the learner).
+    minutes: f64,
+    /// Run the gate only every Nth `active` write (1 = every promotion), to bound the
+    /// extra sim cost when policy versions are written frequently.
+    interval_writes: usize,
+    /// Held-out promote/reject thresholds (Wilson floor, worst-case floor, min games).
+    thresholds: PromotionThresholds,
+    /// Base seed for held-out fixtures — kept disjoint from the training seed space so
+    /// the verdict is on matches the candidate never trained on.
+    seed_base: u32,
+}
+
+/// Play `cfg.games` held-out FROZEN fixtures (neither side learns) between the
+/// candidate (id 0) and the anchor (id 1), alternating home/away, and fold them into
+/// a promotion verdict. Returns `None` when no comparison is possible — either brain
+/// lacks a neural snapshot, or every fixture errored — in which case the caller must
+/// NOT block promotion (absence of evidence is not evidence of regression).
+fn anchor_promotion_gate_verdict(
+    runner: &mut EngineMatchRunner,
+    candidate_neural: Option<&SoccerNeuralNetworkSnapshot>,
+    anchor_neural: Option<&SoccerNeuralNetworkSnapshot>,
+    cfg: &AnchorPromotionGateConfig,
+    seed_salt: u32,
+) -> Option<PromotionVerdict> {
+    let (candidate_neural, anchor_neural) = match (candidate_neural, anchor_neural) {
+        (Some(candidate), Some(anchor)) => (candidate, anchor),
+        _ => return None,
+    };
+    let candidate = TeamBrain::from_snapshot(candidate_neural.clone());
+    let anchor = TeamBrain::from_snapshot(anchor_neural.clone());
+    let candidate_id = 0usize;
+    let anchor_id = 1usize;
+    let games = cfg.games.max(2);
+    let mut reports = Vec::with_capacity(games);
+    for g in 0..games {
+        let seed = cfg
+            .seed_base
+            .wrapping_add(seed_salt.wrapping_mul(2_246_822_519))
+            .wrapping_add(g as u32);
+        // Alternate orientation so the candidate's edge isn't a home-field artifact.
+        let (home_id, away_id, home, away) = if g % 2 == 0 {
+            (candidate_id, anchor_id, &candidate, &anchor)
+        } else {
+            (anchor_id, candidate_id, &anchor, &candidate)
+        };
+        let ctx = TournamentMatchContext {
+            stage: TournamentStage::Group,
+            round_index: 0,
+            match_index: g,
+            seed,
+            home_id,
+            away_id,
+            home_name: format!("team{home_id}"),
+            away_name: format!("team{away_id}"),
+            home_learns: false,
+            away_learns: false,
+        };
+        match runner.play(&ctx, home, away) {
+            Ok(outcome) => reports.push(MatchReport {
+                stage: ctx.stage,
+                home_id,
+                away_id,
+                home_name: ctx.home_name,
+                away_name: ctx.away_name,
+                home_goals: outcome.home_goals,
+                away_goals: outcome.away_goals,
+                shootout_winner: None,
+                home_training_steps: outcome.home_training_steps,
+                away_training_steps: outcome.away_training_steps,
+            }),
+            Err(e) => eprintln!("anchor_gate fixture error (g {g}): {e}"),
+        }
+    }
+    if reports.is_empty() {
+        return None;
+    }
+    Some(evaluate_promotion(
+        &reports,
+        candidate_id,
+        anchor_id,
+        cfg.thresholds,
+    ))
+}
+
 /// In-memory back-four line-depth head, carried + trained across games WITHIN a
 /// learner process (parallel_games=1), so it accumulates and the back-four line
 /// consumes it live once trained. Resets on pod restart — cross-restart Postgres
