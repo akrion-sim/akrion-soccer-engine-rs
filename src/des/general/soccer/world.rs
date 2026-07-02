@@ -19660,6 +19660,27 @@ impl SoccerMatch {
         }
 
         self.stat_offside(offside.team);
+        // INFRACTION PENALTY (negative): the mistimed offside run that killed the move and turned
+        // the ball over. The flagged runner takes the primary hit (time your run / don't stray
+        // beyond the line); the passer who fed them offside takes a small discounted share. This is
+        // the sparse whistle-moment stick — distinct from the positional per-tick lingering penalty
+        // — and the negative counterpart to the onside-timing / slip-break rewards. Gated
+        // default-OFF ⇒ byte-identical baseline / A/B.
+        if dd_soccer_enable_offside_infraction_penalty() {
+            self.record_reward_event_with_kind(
+                offside.target,
+                -OFFSIDE_INFRACTION_RUNNER_PENALTY_POINTS,
+                SoccerRewardEventKind::OffsideInfraction,
+            );
+            if offside.passer != offside.target {
+                self.record_reward_event_with_kind(
+                    offside.passer,
+                    -OFFSIDE_INFRACTION_RUNNER_PENALTY_POINTS
+                        * OFFSIDE_INFRACTION_PASSER_PENALTY_SHARE,
+                    SoccerRewardEventKind::OffsideInfraction,
+                );
+            }
+        }
         self.finish_possession_progress_chain(false);
         self.ball.position = restart_spot;
         self.ball.velocity = Vec2::zero();
