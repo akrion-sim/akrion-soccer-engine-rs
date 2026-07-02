@@ -4129,6 +4129,12 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut latest_neural_network = initial_neural_network.clone();
     let mut latest_policy_arc_cache = None::<CachedTeamQPoliciesArc>;
     let mut latest_neural_network_arc_cache = None::<CachedNeuralNetworkSnapshotArc>;
+    // Frozen-anchor promotion-gate state (used only when the gate is enabled): the
+    // current anchor brain a candidate must beat to advance, a reusable held-out
+    // match runner, and a counter to apply the gate every `interval_writes` writes.
+    let mut anchor_neural_network = latest_neural_network.clone();
+    let mut anchor_gate_runner: Option<EngineMatchRunner> = None;
+    let mut anchor_gate_write_index: usize = 0;
     let mut evolution_search_samples =
         VecDeque::<EvolutionSearchSample>::with_capacity(evolution_window_games);
     let mut local_tactical_evolved_since_pg_refresh = false;
