@@ -54,7 +54,9 @@ use soccer_engine::des::soccer_learning::{
     SoccerTacticalLearningGenomeParent, SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION,
     SOCCER_POLICY_STATUS_ACTIVE, SOCCER_POLICY_STATUS_ARCHIVED,
 };
-use soccer_engine::des::general::soccer_eval_gate::{evaluate_promotion, PromotionThresholds};
+use soccer_engine::des::general::soccer_eval_gate::{
+    evaluate_promotion, PromotionThresholds, PromotionVerdict,
+};
 use soccer_engine::des::general::tournament::{
     EngineMatchRunner, EngineMatchRunnerConfig, MatchReport, TeamBrain, TournamentMatchContext,
     TournamentMatchRunner, TournamentStage,
