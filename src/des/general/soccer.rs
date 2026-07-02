@@ -58952,6 +58952,51 @@ fn pass_target_quality_for_snapshot_inner(
     flight: PassFlight,
     apply_dynamic_lane_risk_gate: bool,
 ) -> PassTargetQuality {
+    // Per-tick memo choke point. A single carrier decision scores the same
+    // (passer, target, flight) several times across independent sub-checks; each score
+    // runs a nested MPC receipt estimate (QP solves) plus a full-team lane/occupancy scan —
+    // the dominant per-tick cost the profiler flags. Collapse the duplicates. The scorer is
+    // pure over the immutable `&WorldSnapshot`, so a cache hit is byte-identical to
+    // recomputing; the key carries the exact float bits of both positions and the gate flag.
+    // See `WorldSnapshot::pass_target_quality_cache` (auto-invalidated: fresh snapshot/tick).
+    let key = (
+        passer.id,
+        target.id,
+        flight,
+        passer_position.x.to_bits(),
+        passer_position.y.to_bits(),
+        target_position.x.to_bits(),
+        target_position.y.to_bits(),
+        apply_dynamic_lane_risk_gate,
+    );
+    if let Some(cached) = snapshot.pass_target_quality_cache.borrow().get(&key) {
+        return *cached;
+    }
+    let quality = pass_target_quality_for_snapshot_uncached(
+        snapshot,
+        passer,
+        passer_position,
+        target,
+        target_position,
+        flight,
+        apply_dynamic_lane_risk_gate,
+    );
+    snapshot
+        .pass_target_quality_cache
+        .borrow_mut()
+        .insert(key, quality);
+    quality
+}
+
+fn pass_target_quality_for_snapshot_uncached(
+    snapshot: &WorldSnapshot,
+    passer: &PlayerSnapshot,
+    passer_position: Vec2,
+    target: &PlayerSnapshot,
+    target_position: Vec2,
+    flight: PassFlight,
+    apply_dynamic_lane_risk_gate: bool,
+) -> PassTargetQuality {
     let initial_is_cross = pass_would_be_cross(
         passer_position,
         target_position,
