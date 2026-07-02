@@ -1239,15 +1239,12 @@ const FIRST_TIME_SHORT_FORWARD_PASS_MIN_PROGRESS_YARDS: f64 = 1.25;
 const FIRST_TIME_SHORT_FORWARD_PASS_MIN_YARDS: f64 = 5.47;
 const FIRST_TIME_SHORT_FORWARD_PASS_IDEAL_MAX_YARDS: f64 = 8.75;
 const FIRST_TIME_SHORT_FORWARD_PASS_TAPER_YARDS: f64 = 8.0;
-// A completed back pass KEEPS possession — it is far better than forcing a forward
-// ball into a turnover. It is only mildly discouraged (so the policy still prefers to
-// progress when it safely can), not punished, so the team learns to retain rather than
-// gamble. Sterile under-no-pressure recycling is still handled by the dedicated stagnant /
-// pointless-short-pass penalties; a smart back/lateral escape under pressure is REWARDED
-// (`PRESSURE_RELIEF_PASS_BONUS`). Own-half back passes sit nearer our goal so sting a touch
-// more. (Lowered from 2.6 / 1.4 to value ball retention and cut manufactured turnovers.)
-const COMPLETED_BACK_PASS_PENALTY_OWN_HALF: f64 = 1.0;
-const COMPLETED_BACK_PASS_PENALTY_OPPONENT_HALF: f64 = 0.5;
+// A completed back pass KEEPS possession, so it must still beat a turnover, but it should
+// no longer look like an attractive default recycle. Penalize it enough that safe lateral
+// and forward options win clearly, with own-half retreats stinging more because they move
+// the ball back toward danger. Pressure-relief escapes are still handled separately.
+const COMPLETED_BACK_PASS_PENALTY_OWN_HALF: f64 = 3.2;
+const COMPLETED_BACK_PASS_PENALTY_OPPONENT_HALF: f64 = 1.7;
 const COMPLETED_DANGEROUS_CROSS_BONUS_POINTS: f64 = 3.8;
 const COMPLETED_CROSS_MAX_BONUS_POINTS: f64 = 5.0;
 // Through-balls (killer passes) are the one user-named penetration pattern that did NOT get a new
@@ -1339,6 +1336,13 @@ const OFFSIDE_DISTANCE_PENALTY_PER_YARD: f64 = 0.25;
 const OFFSIDE_LINGER_PENALTY_CAP_SECONDS: f64 = 6.0;
 const OFFSIDE_DISTANCE_PENALTY_CAP_YARDS: f64 = 25.0;
 const OFFSIDE_RECOVERY_REWARD: f64 = 1.0;
+// Offside INFRACTION penalty (distinct from the positional lingering penalty above): the sparse
+// cost of actually being flagged offside when the ball is played — a mistimed run that killed the
+// move and gave the ball away. The flagged runner takes the primary hit; the passer who fed them
+// offside a small discounted share. Bounded, comparable to an opponent-half giveaway. Only charged
+// when `DD_SOCCER_ENABLE_OFFSIDE_INFRACTION_PENALTY` is on (see `call_offside`).
+const OFFSIDE_INFRACTION_RUNNER_PENALTY_POINTS: f64 = 2.5;
+const OFFSIDE_INFRACTION_PASSER_PENALTY_SHARE: f64 = 0.3;
 // Center-backs must remain the last line: penalize a central defender for every
 // yard they advance ahead of their wing-backs, amplified when the ball is in the
 // attacking part of the field (so they stay the deepest two ~95% of the time).
@@ -1646,7 +1650,7 @@ const FORWARD_OPEN_PASS_BONUS_PER_YARD: f64 = 0.075;
 // ball now carries a stronger direct demerit even before the deeper long-retreat terms.
 // Lateral/square balls are handled separately by explicit penalties.
 const FORWARD_PASS_VALUE_MULTIPLIER: f64 = 3.0;
-const BACKWARD_PASS_VALUE_MULTIPLIER: f64 = 1.4;
+const BACKWARD_PASS_VALUE_MULTIPLIER: f64 = 1.8;
 // Passes below this are removed from ordinary pass candidates and vetoed again at release time.
 // They are not "passes" for now; the carrier should keep/carry/dribble instead.
 const ILLEGAL_SHORT_PASS_MAX_YARDS: f64 = 3.0;
@@ -1655,15 +1659,15 @@ const ILLEGAL_SHORT_PASS_MAX_YARDS: f64 = 3.0;
 // about 5x the distance-risk units of a 10yd backward ball.
 const BACKWARD_PASS_DISTANCE_RISK_REFERENCE_YARDS: f64 = 10.0;
 const BACKWARD_PASS_DISTANCE_RISK_EXPONENT: f64 = 2.321_928_094_887_362; // log2(5)
-const LONG_BACKWARD_PASS_PENALTY_PER_RISK_UNIT: f64 = 13.5;
-const BACKWARD_PASS_COMPLETION_RISK_PER_UNIT: f64 = 0.16;
+const LONG_BACKWARD_PASS_PENALTY_PER_RISK_UNIT: f64 = 17.0;
+const BACKWARD_PASS_COMPLETION_RISK_PER_UNIT: f64 = 0.22;
 const BACKWARD_PASS_HIGH_PRESSURE_MIN: f64 = 0.72;
 const BACKWARD_PASS_HIGH_PRESSURE_FULL: f64 = 0.88;
 const BACKWARD_PASS_CONSTRAINED_TOUCHLINE_MARGIN_YARDS: f64 = 5.0;
 const BACKWARD_PASS_CONSTRAINED_CORNER_DEPTH_YARDS: f64 = 12.0;
 const BACKWARD_PASS_BOUNDARY_PRESSURE_OPP_RADIUS_YARDS: f64 = 3.0;
-const BACKWARD_PASS_LOW_PRESSURE_BASE_PENALTY: f64 = 16.0;
-const BACKWARD_PASS_LOW_PRESSURE_RISK_PENALTY_PER_UNIT: f64 = 15.0;
+const BACKWARD_PASS_LOW_PRESSURE_BASE_PENALTY: f64 = 18.0;
+const BACKWARD_PASS_LOW_PRESSURE_RISK_PENALTY_PER_UNIT: f64 = 18.0;
 // Opponents standing in the path of a backward pass make that retreat progressively riskier.
 // Traffic count stays linear, while backward distance uses the compounding risk curve; short
 // 3-5yd resets stay free from corridor-traffic pricing.
@@ -1678,8 +1682,8 @@ const BACKWARD_PASS_PATH_TRAFFIC_RISK_GATE_STRENGTH: f64 = 0.90;
 // balls played more than 5yd back toward our own goal.
 const BACKWARD_PASS_SHORT_RESET_MIN_YARDS: f64 = 3.0;
 const BACKWARD_PASS_SHORT_RESET_MAX_YARDS: f64 = 5.0;
-const BACKWARD_PASS_SHORT_RESET_PENALTY_PER_YARD: f64 = 0.24;
-const BACKWARD_PASS_LONG_RESET_PENALTY_PER_RISK_UNIT: f64 = 1.70;
+const BACKWARD_PASS_SHORT_RESET_PENALTY_PER_YARD: f64 = 0.38;
+const BACKWARD_PASS_LONG_RESET_PENALTY_PER_RISK_UNIT: f64 = 2.40;
 // Be optimistic/skilled about playing a forward teammate who is only half-open:
 // qualified forward targets stay visible and get sane scoring floors instead of being
 // hidden behind safe square/backward recycling.
@@ -2066,9 +2070,16 @@ const TEAM_ADVANCE_REWARD_REFERENCE_YARDS: f64 = 4.0;
 /// as a unit — the "take the space" signal. Comparable in magnitude to the other in-possession
 /// spacing shaping terms so it nudges without swamping the sparse goal/possession signal.
 const TEAM_ADVANCE_CARRIER_DRIVE_REWARD: f64 = 0.30;
+/// Dense shaping penalty for the carrier wasting the same team-advance cue by stalling or moving
+/// the ball backward. This is the stick paired with the carrier-drive carrot above.
+const TEAM_ADVANCE_CARRIER_STALL_PENALTY: f64 = 0.24;
 /// Dense shaping reward for an OFF-BALL teammate making a forward supporting run while the team
 /// advances upfield — the "whole team moves forward" signal that pulls runners up with the ball.
 const TEAM_ADVANCE_SUPPORT_RUN_REWARD: f64 = 0.22;
+/// Dense shaping penalty for an attacker who fails to join a live team-advance cue, retreats, or
+/// runs into an offside support lane. This mirrors the support-run reward without forcing defenders
+/// to abandon shape.
+const TEAM_ADVANCE_SUPPORT_FAILURE_PENALTY: f64 = 0.16;
 /// A teammate must be at least this far BEYOND the opponent's last outfield defender (the offside
 /// line) to count as a "release long inside own half" target — a genuine break of the line.
 const RELEASE_LONG_MIN_BEYOND_YARDS: f64 = 3.0;
@@ -3391,6 +3402,7 @@ const DEFENDER_STAY_BACK_REWARD_PER_YARD: f64 = 0.04;
 const DEFENDER_LANE_DEVIATION_PENALTY_PER_YARD: f64 = 0.20;
 const DEFENDER_LANE_DEADZONE_YARDS: f64 = 12.0;
 const DEFENDER_LANE_BALL_RELIEF_RADIUS_YARDS: f64 = 16.0;
+const DEFENDER_LANE_RECOVERY_REWARD_PER_YARD: f64 = 0.08;
 // In possession, a winger holds at least this much padding off the wing-back behind
 // it; all midfielders are rewarded for pushing forward when the ball is in the
 // opponent half.
@@ -3399,9 +3411,13 @@ const MIDFIELDER_PADDING_PENALTY_PER_YARD: f64 = 0.15;
 const MIDFIELDER_PUSH_FORWARD_REWARD_PER_YARD: f64 = 0.06;
 const DEFENDER_OUT_OF_LANE_TEAM_PENALTY_THRESHOLD_YARDS: f64 = 14.0;
 const DEFENDER_OUT_OF_LANE_TEAM_PENALTY: f64 = 0.4;
+const DEFENDER_OUT_OF_LANE_TEAM_RECOVERY_REWARD: f64 = 0.18;
 const STATIONARY_RECEIVER_BALL_RADIUS_YARDS: f64 = 6.0;
 const STATIONARY_RECEIVER_MIN_MOVE_YARDS: f64 = 0.15;
 const STATIONARY_RECEIVER_PENALTY: f64 = 0.5;
+const ACTIVE_RECEIVER_MEET_BALL_REWARD: f64 = 0.35;
+const GOALKEEPER_HOME_RECOVERY_REWARD_PER_YARD: f64 = 0.18;
+const GOALKEEPER_HOME_RECOVERY_BONUS: f64 = 0.20;
 // A retreating player turns and runs (instead of back-pedalling) only when a
 // fast opponent is this close and moving at least this fast (running/sprinting).
 const CHASE_EMERGENCY_RADIUS_YARDS: f64 = 5.0;
@@ -3645,6 +3661,12 @@ const LOOSE_BALL_UNCONTESTED_ATTACK_GRACE_SECONDS: f64 = LOOSE_BALL_MAX_UNCONTES
 const LOOSE_BALL_SHAPE_SAFE_RETRIEVAL_WEIGHT_YARDS: f64 = 2.4;
 const LOOSE_BALL_ATTACK_CANDIDATE_REWARD: f64 = 0.20;
 const LOOSE_BALL_UNCONTESTED_HOLD_PENALTY: f64 = 0.34;
+const LOOSE_BALL_UNCLAIMED_PRESSURE_FULL_SECONDS: f64 = 1.25;
+const LOOSE_BALL_UNCLAIMED_TEAM_PENALTY_PER_TICK: f64 = 0.018;
+const LOOSE_BALL_UNCLAIMED_RECOVERY_BASE_REWARD_POINTS: f64 = 2.4;
+const LOOSE_BALL_UNCLAIMED_RECOVERY_PRESSURE_REWARD_POINTS: f64 = 4.6;
+const LOOSE_BALL_UNCLAIMED_POMDP_PENALTY_POINTS: f64 = 0.08;
+const LOOSE_BALL_UNCLAIMED_RECOVERY_DENSE_REWARD_POINTS: f64 = 0.72;
 // ---- Off-ball pass-reception belief / hand-off (anticipate the trajectory; best man receives) ----
 // When a ground pass is in flight, the receiving team predicts where it will arrive and the
 // genuinely best-placed team-mate goes to meet it. A team-mate is only treated as a live contender
@@ -5842,6 +5864,17 @@ fn sane_dt_seconds(dt_seconds: f64, fallback: f64) -> f64 {
         DEFAULT_DT_SECONDS
     };
     chosen.max(MIN_SANE_DT_SECONDS)
+}
+
+fn loose_ball_unclaimed_pressure_from_elapsed(elapsed_seconds: f64) -> f64 {
+    if !elapsed_seconds.is_finite() {
+        return 0.0;
+    }
+    let over_grace = elapsed_seconds - LOOSE_BALL_MAX_UNCONTESTED_SECONDS;
+    if over_grace <= 0.0 {
+        return 0.0;
+    }
+    (over_grace / LOOSE_BALL_UNCLAIMED_PRESSURE_FULL_SECONDS.max(1e-6)).clamp(0.0, 1.0)
 }
 
 fn bounded_tick_count(duration_seconds: f64, dt_seconds: f64) -> u64 {
@@ -19171,6 +19204,15 @@ pub(crate) enum SoccerRewardEventKind {
     /// just that arriving is nice. Emitted only when `DD_SOCCER_ENABLE_CRASH_BOX_NO_SHOW_PENALTY`
     /// is on. See [`crash_box`] and `penalize_flank_crash_box_no_shows`.
     CrashBoxNoShow,
+    /// PENALTY (negative): a runner was flagged OFFSIDE when the ball was played to them — the
+    /// mistimed run that killed the move and turned possession over. The sparse infraction stick
+    /// that complements the *positional* lingering-offside penalty (a per-tick cost for loitering
+    /// beyond the line) and is the negative counterpart to the onside-timing / slip-break-the-trap
+    /// rewards: getting the run right is rewarded, getting whistled is now penalised. The flagged
+    /// runner takes the primary hit; the passer who fed them offside takes a small discounted
+    /// share. Emitted only when `DD_SOCCER_ENABLE_OFFSIDE_INFRACTION_PENALTY` is on. See
+    /// `call_offside`.
+    OffsideInfraction,
     /// PENALTY (negative): a Forward / winger isolated in the attacking half with no teammate
     /// ahead played a panicked BACKWARD/square pass instead of driving at goal or holding the
     /// ball up for support. The direct learning signal that trains the policy off the
@@ -19224,6 +19266,13 @@ pub(crate) enum SoccerRewardEventKind {
     /// just the final touch. The negative mirror of `BuildupChainCredit`. Emitted only when
     /// `DD_SOCCER_ENABLE_TURNOVER_CHAIN_BLAME` is on. See `record_turnover_chain_blame`.
     TurnoverChainBlame,
+    /// PENALTY (negative): the ball is loose, out of set play, and has remained uncontested past
+    /// the loose-ball grace window. Applied to both teams' outfielders so MARL/MAPPO learn that
+    /// nobody is allowed to leave an unclaimed ball sitting in open play.
+    LooseBallUnclaimedPenalty,
+    /// Positive: an outfielder wins a loose ball after the unclaimed-ball pressure clock has run.
+    /// The longer everyone left it, the more credit the claimant receives.
+    LooseBallUnclaimedRecovery,
     MatchResult,
 }
 
@@ -19245,6 +19294,7 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::HeaderGoalFromCross
                 | SoccerRewardEventKind::CrashBoxArrival
                 | SoccerRewardEventKind::CrashBoxNoShow
+                | SoccerRewardEventKind::OffsideInfraction
                 | SoccerRewardEventKind::IsolatedCarrierPanicBackPass
                 | SoccerRewardEventKind::SustainedForwardDribble
                 | SoccerRewardEventKind::UnpressuredBackwardPass
@@ -19254,6 +19304,8 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::ReleaseLongInsideOwnHalf
                 | SoccerRewardEventKind::OverdribbleDispossession
                 | SoccerRewardEventKind::TurnoverChainBlame
+                | SoccerRewardEventKind::LooseBallUnclaimedPenalty
+                | SoccerRewardEventKind::LooseBallUnclaimedRecovery
                 | SoccerRewardEventKind::MatchResult
         )
     }
@@ -19281,6 +19333,7 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::BuildupChainCredit
                 | SoccerRewardEventKind::WallPassCombination
                 | SoccerRewardEventKind::ReleaseLongInsideOwnHalf
+                | SoccerRewardEventKind::LooseBallUnclaimedRecovery
         )
     }
 }
@@ -19987,6 +20040,25 @@ pub(crate) fn dd_soccer_enable_concede_symmetry() -> bool {
         use std::sync::OnceLock;
         static V: OnceLock<bool> = OnceLock::new();
         *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_CONCEDE_SYMMETRY"))
+    }
+}
+
+/// Offside-infraction penalty gate. **Default-OFF everywhere** (production and test): a brand-new
+/// reward signal is opt-in until an A/B. When `DD_SOCCER_ENABLE_OFFSIDE_INFRACTION_PENALTY` is
+/// truthy, `call_offside` charges the flagged runner (and, discounted, the passer) the sparse
+/// infraction penalty — the negative counterpart to the onside-timing / slip-break rewards. Off ⇒
+/// byte-identical baseline / A/B. Tests re-read the env each call so an A/B can toggle it within
+/// the process; production caches once.
+pub(crate) fn dd_soccer_enable_offside_infraction_penalty() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_OFFSIDE_INFRACTION_PENALTY")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_OFFSIDE_INFRACTION_PENALTY"))
     }
 }
 
@@ -24713,20 +24785,35 @@ fn dense_soccer_transition_reward(
     // shape, and a run into an offside position is a wasted run, not support.
     if team_advance_upfield_enabled()
         && before_possession == Some(player.team)
-        && after_possession != Some(player.team.other())
         && before.team_advance_upfield_active(player.team).is_some()
     {
         if before.ball.holder == Some(player.id) {
-            if ball_forward > 0.0 {
+            if after_possession == Some(player.team.other()) {
+                reward -= TEAM_ADVANCE_CARRIER_STALL_PENALTY;
+            } else if ball_forward > 0.0 {
                 reward += (ball_forward / TEAM_ADVANCE_REWARD_REFERENCE_YARDS).clamp(0.0, 1.0)
                     * TEAM_ADVANCE_CARRIER_DRIVE_REWARD;
+            } else if ball_forward < -0.25 {
+                reward -= ((-ball_forward) / TEAM_ADVANCE_REWARD_REFERENCE_YARDS).clamp(0.0, 1.0)
+                    * TEAM_ADVANCE_CARRIER_STALL_PENALTY;
             }
-        } else if matches!(player.role, PlayerRole::Forward | PlayerRole::Midfielder)
-            && player_forward > 0.0
-            && !after.position_would_be_offside_for_player(player.id, player.team, after_pos)
-        {
-            reward += (player_forward / TEAM_ADVANCE_REWARD_REFERENCE_YARDS).clamp(0.0, 1.0)
-                * TEAM_ADVANCE_SUPPORT_RUN_REWARD;
+        } else if matches!(player.role, PlayerRole::Forward | PlayerRole::Midfielder) {
+            let offside_support =
+                after.position_would_be_offside_for_player(player.id, player.team, after_pos);
+            let offside_forward_run = offside_support && player_forward > 0.0;
+            if player_forward > 0.0 && !offside_support {
+                reward += (player_forward / TEAM_ADVANCE_REWARD_REFERENCE_YARDS).clamp(0.0, 1.0)
+                    * TEAM_ADVANCE_SUPPORT_RUN_REWARD;
+            } else if offside_forward_run {
+                reward -= TEAM_ADVANCE_SUPPORT_FAILURE_PENALTY;
+            } else if !offside_support && (player_forward < -0.25 || moved_yards < 0.10) {
+                let failure = if player_forward < -0.25 {
+                    ((-player_forward) / TEAM_ADVANCE_REWARD_REFERENCE_YARDS).clamp(0.0, 1.0)
+                } else {
+                    0.35
+                };
+                reward -= failure * TEAM_ADVANCE_SUPPORT_FAILURE_PENALTY;
+            }
         }
     }
     if player.role == PlayerRole::Midfielder
@@ -24760,8 +24847,17 @@ fn dense_soccer_transition_reward(
     // keeper home except for genuine sweeping, matching the desired rarity
     // (>20 yds uncommon, >25 rarer, >30 very rare).
     if player.role == PlayerRole::Goalkeeper {
+        let before_dist_from_own_goal =
+            ball_distance_from_own_goal(player.team, before_pos, before.field_length);
         let dist_from_own_goal =
             ball_distance_from_own_goal(player.team, after_pos, after.field_length);
+        let home_recovery = before_dist_from_own_goal - dist_from_own_goal;
+        if before_dist_from_own_goal > 20.0 && home_recovery > 0.0 {
+            reward += home_recovery.clamp(0.0, 6.0) * GOALKEEPER_HOME_RECOVERY_REWARD_PER_YARD;
+            if dist_from_own_goal <= 20.0 {
+                reward += GOALKEEPER_HOME_RECOVERY_BONUS;
+            }
+        }
         if dist_from_own_goal > 20.0 {
             reward -= (dist_from_own_goal - 20.0) * 0.6;
         }
@@ -24849,6 +24945,13 @@ fn dense_soccer_transition_reward(
         // runner — so the policy learns drifting out of the quadrant is wrong, not
         // the norm. Farther drift costs more per yard, so crossing flanks is rare.
         let in_possession = after_possession == Some(player.team);
+        let before_lane_dev = vertical_lane_deviation_yards(
+            before_pos.x,
+            player.role,
+            player.home_position.x,
+            before.field_width,
+            before_possession == Some(player.team),
+        );
         let lane_dev = vertical_lane_deviation_yards(
             after_pos.x,
             player.role,
@@ -24878,11 +24981,29 @@ fn dense_soccer_transition_reward(
             let drift = (lane_dev - DEFENDER_LANE_DEADZONE_YARDS).max(0.0);
             reward -= drift * DEFENDER_LANE_DEVIATION_PENALTY_PER_YARD * (1.0 - relief);
         }
+        let before_drift = (before_lane_dev - DEFENDER_LANE_DEADZONE_YARDS).max(0.0);
+        let after_drift = (lane_dev - DEFENDER_LANE_DEADZONE_YARDS).max(0.0);
+        if before_drift > after_drift {
+            reward += (before_drift - after_drift).clamp(0.0, 8.0)
+                * DEFENDER_LANE_RECOVERY_REWARD_PER_YARD;
+        }
     }
     // Team-shape signal: if any defender has been dragged well outside their lane,
     // mildly penalize every defender AND midfielder — the policy learns the team got
     // pulled out of shape (a coordination failure), not just the strayer.
     if matches!(player.role, PlayerRole::Defender | PlayerRole::Midfielder) {
+        let before_team_in_possession = before_possession == Some(player.team);
+        let any_defender_out_of_lane_before = before.players.iter().any(|p| {
+            p.team == player.team
+                && p.role == PlayerRole::Defender
+                && vertical_lane_deviation_yards(
+                    before.player_position(p.id).unwrap_or(p.position).x,
+                    p.role,
+                    p.home_position.x,
+                    before.field_width,
+                    before_team_in_possession,
+                ) > DEFENDER_OUT_OF_LANE_TEAM_PENALTY_THRESHOLD_YARDS
+        });
         let team_in_possession = after_possession == Some(player.team);
         let any_defender_out_of_lane = after.players.iter().any(|p| {
             p.team == player.team
@@ -24897,17 +25018,30 @@ fn dense_soccer_transition_reward(
         });
         if any_defender_out_of_lane {
             reward -= DEFENDER_OUT_OF_LANE_TEAM_PENALTY;
+        } else if any_defender_out_of_lane_before {
+            reward += DEFENDER_OUT_OF_LANE_TEAM_RECOVERY_REWARD;
         }
     }
     // A receiver should move to meet the ball, not stand flat: mildly penalize being
     // close to a ball that isn't yours while barely moving.
     let dist_to_ball = after_pos.distance(after.ball.position);
-    if after_possession == Some(player.team)
+    let active_receive_context = before_obs.receiving_pending_pass || before.ball.holder.is_none();
+    let same_team_ball_context = after_possession == Some(player.team)
+        || (active_receive_context && after.possession_team() == Some(player.team));
+    if same_team_ball_context
         && after.ball.holder != Some(player.id)
         && dist_to_ball < STATIONARY_RECEIVER_BALL_RADIUS_YARDS
-        && moved_yards < STATIONARY_RECEIVER_MIN_MOVE_YARDS
     {
-        reward -= STATIONARY_RECEIVER_PENALTY;
+        if moved_yards < STATIONARY_RECEIVER_MIN_MOVE_YARDS {
+            reward -= STATIONARY_RECEIVER_PENALTY;
+        } else if active_receive_context {
+            let before_dist_to_ball = before_pos.distance(before.ball.position);
+            let approach = (before_dist_to_ball - dist_to_ball).max(0.0);
+            if approach > 0.0 {
+                reward += (approach / STATIONARY_RECEIVER_BALL_RADIUS_YARDS).clamp(0.0, 1.0)
+                    * ACTIVE_RECEIVER_MEET_BALL_REWARD;
+            }
+        }
     }
     // Midfield shape in possession: wide midfielders (wingers) hold vertical padding
     // off the wing-backs behind them rather than stacking on the flank, and all
@@ -25659,14 +25793,17 @@ fn loose_ball_contest_learning_reward(
     } else {
         (0.38 + (-time_advantage) / 4.0).clamp(0.38, 0.82)
     };
+    let unclaimed_pressure = before.loose_ball_unclaimed_pressure();
+    let loose_ball_urgency = before_obs.loose_ball_uncontested_urgency.clamp(0.0, 1.0);
     let mut reward = closing_yards * (0.10 + race_urgency * 0.08 + player_time_fit * 0.05);
+    reward -= LOOSE_BALL_UNCLAIMED_POMDP_PENALTY_POINTS * unclaimed_pressure;
 
     if action == "recover" {
         reward += 0.12 + race_urgency * 0.20 + player_time_fit * 0.16;
         reward += before_obs.loose_ball_attack_candidate.clamp(0.0, 1.0)
             * before_obs.loose_ball_attack_shape_safety.clamp(0.0, 1.0)
             * (LOOSE_BALL_ATTACK_CANDIDATE_REWARD
-                + before_obs.loose_ball_uncontested_urgency.clamp(0.0, 1.0) * 0.20);
+                + loose_ball_urgency * 0.20);
     } else if SoccerActionLabel::classify(action) == Some(SoccerActionLabel::Hold)
         && (before_obs.loose_ball_fifty_fifty || time_advantage > 0.10)
     {
@@ -25682,7 +25819,10 @@ fn loose_ball_contest_learning_reward(
     match after.controlled_possession_team() {
         Some(team) if team == player.team => {
             reward += if after.ball.holder == Some(player.id) {
-                0.88 + race_urgency * 0.44 + player_time_fit * 0.24
+                0.88
+                    + race_urgency * 0.44
+                    + player_time_fit * 0.24
+                    + unclaimed_pressure * LOOSE_BALL_UNCLAIMED_RECOVERY_DENSE_REWARD_POINTS
             } else {
                 0.34 + race_urgency * 0.22
             };
@@ -36435,6 +36575,21 @@ pub struct SoccerNeuralNetworkSnapshot {
     /// trained passing/dribbling/shooting/GK specialists across episodes and persisted runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_head: Option<Box<SoccerPolicyHeadSnapshot>>,
+    /// Optional carried back-four line-depth head. It is trained from the group-of-four
+    /// line-depth MDP/POMDP samples and restored with the value/actor snapshot so a
+    /// localhost/live server can consume the same push/drop head the learner warmed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_depth_head: Option<Box<SoccerAuxiliaryHeadSnapshot>>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SoccerAuxiliaryHeadSnapshot {
+    pub network: SoccerNeuralNetworkSnapshot,
+    #[serde(default)]
+    pub training_steps: usize,
+    #[serde(default)]
+    pub average_loss: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -39593,6 +39748,7 @@ fn soccer_neural_network_snapshot(network: &FeedForwardNetwork) -> SoccerNeuralN
         training_steps: 0,
         average_loss: None,
         policy_head: None,
+        line_depth_head: None,
     }
 }
 
@@ -52698,6 +52854,23 @@ fn tracking_frame_to_world_snapshot(
         ranked_floor_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         ranked_aerial_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         support_decision_feature_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+        support_open_space_target_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+        loose_ball_contest_target_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+        loose_ball_on_path_intercept_cache: std::cell::RefCell::new(
+            std::collections::HashMap::new(),
+        ),
+        loose_ball_intercept_solution_cache: std::cell::RefCell::new(
+            std::collections::HashMap::new(),
+        ),
+        loose_ball_retrieval_score_cache: std::cell::RefCell::new(
+            std::collections::HashMap::new(),
+        ),
+        loose_ball_attack_profile_cache: std::cell::RefCell::new(
+            std::collections::HashMap::new(),
+        ),
+        loose_ball_committed_chaser_cache: std::cell::RefCell::new(
+            std::collections::HashMap::new(),
+        ),
         line_depth_head: None,
         defender_line_head: None,
         back_four_line_latch_centre_depth: [None, None],
