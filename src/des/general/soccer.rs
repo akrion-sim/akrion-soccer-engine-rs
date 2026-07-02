@@ -20626,6 +20626,20 @@ pub(crate) fn dd_soccer_enable_aerial_pass_oob_discipline() -> bool {
     }
 }
 
+/// Gate for interception-aware route-one / clearance training credit. OFF (the default) leaves the
+/// `soccer_goal_credit_transition_score` long-ball branch byte-identical to baseline, where a hoofed
+/// forward ball is credited purely on distance/pressure/urgency with NO interception or completion
+/// term — so self-play keeps rewarding 60-70yd balls that get picked off (passes straight to the
+/// opponent). ON prices aerial interception + OOB bounds the same way ordinary aerial passes are
+/// priced and gates the raw forward-distance credit behind expected completion, so an interceptable
+/// long ball no longer out-scores a retained shorter outlet. The own-goal urgency term is left
+/// intact, so a genuine clearance under pressure is still credited.
+pub(crate) fn dd_soccer_enable_route_one_interception_credit() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_ROUTE_ONE_INTERCEPTION_CREDIT"))
+}
+
 /// Gate for overload-weighted progression rewards (see the `OVERLOAD_*` constants). OFF (the
 /// default) forces every overload progression weight to 0.0, so the reward path is byte-identical.
 pub(crate) fn dd_soccer_enable_overload_weighted_progression() -> bool {
@@ -24127,12 +24141,33 @@ fn soccer_goal_credit_transition_score(
         Some(Clearance | RouteOne) => {
             let weight_fit = soccer_goal_credit_pass_weight_fit(context);
             let own_goal_urgency = (1.0 - obs.yards_to_own_goal / 36.0).clamp(0.0, 1.0);
-            0.26 + pressure * 0.42
-                + own_goal_urgency * 0.52
-                + target_forward.max(0.0) * 0.50
-                + lane_score * 0.22
-                + weight_fit * 0.30
-                + dense_signal
+            if dd_soccer_enable_route_one_interception_credit() {
+                // A hoofed long ball that gets picked off is a turnover, not progress. Price aerial
+                // interception + OOB bounds exactly as the ordinary aerial-pass branch does, and gate
+                // the raw forward-distance credit behind expected completion so an interceptable
+                // 70yd ball can no longer out-score a retained shorter outlet. `own_goal_urgency`
+                // is untouched, so a real clearance under own-goal pressure keeps its safety credit.
+                let completion = obs
+                    .expected_aerial_pass_completion
+                    .max(obs.expected_pass_completion * 0.82)
+                    .clamp(0.0, 1.0);
+                0.26 + pressure * 0.42
+                    + own_goal_urgency * 0.52
+                    + target_forward.max(0.0) * 0.50 * completion
+                    + completion * 0.34
+                    + lane_score * 0.22
+                    + weight_fit * 0.30
+                    - obs.aerial_pass_interception_risk.clamp(0.0, 1.0) * 0.54
+                    - obs.long_aerial_bounds_risk.clamp(0.0, 1.0) * 0.62
+                    + dense_signal
+            } else {
+                0.26 + pressure * 0.42
+                    + own_goal_urgency * 0.52
+                    + target_forward.max(0.0) * 0.50
+                    + lane_score * 0.22
+                    + weight_fit * 0.30
+                    + dense_signal
+            }
         }
         _ => {
             0.18 + obs.open_space_score.clamp(0.0, 1.0) * 0.50
