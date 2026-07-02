@@ -4243,6 +4243,12 @@ fn run() -> Result<(), Box<dyn Error>> {
                             pg_base_policy_version_id.as_deref(),
                             &mut evolution_search_samples,
                         );
+                        // Re-anchor the promotion gate to the incumbent just pulled
+                        // from Postgres: that refreshed brain is the new baseline a
+                        // candidate must beat, so the ratchet tracks it.
+                        if anchor_promotion_gate.enabled {
+                            anchor_neural_network = latest_neural_network.clone();
+                        }
                     }
                 }
             }
