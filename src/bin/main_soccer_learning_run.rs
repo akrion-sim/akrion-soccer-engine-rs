@@ -1833,6 +1833,42 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), Box<dyn Error>
     Ok(())
 }
 
+fn neural_sidecar_path_for_policy_artifact(policy_path: &Path) -> PathBuf {
+    let Some(parent) = policy_path.parent() else {
+        return PathBuf::from("out/soccer-live/team-policy.neural.json");
+    };
+    let stem = policy_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("team-policy");
+    parent.join(format!("{stem}.neural.json"))
+}
+
+fn write_neural_sidecar_for_policy_artifact(
+    policy_path: &Path,
+    snapshot: Option<&SoccerNeuralNetworkSnapshot>,
+) -> Result<Option<PathBuf>, Box<dyn Error>> {
+    let Some(snapshot) = snapshot else {
+        return Ok(None);
+    };
+    let sidecar_path = neural_sidecar_path_for_policy_artifact(policy_path);
+    write_json(&sidecar_path, snapshot)?;
+    Ok(Some(sidecar_path))
+}
+
+fn load_neural_sidecar_for_policy_artifact(
+    policy_path: &Path,
+) -> Result<Option<(PathBuf, SoccerNeuralNetworkSnapshot)>, Box<dyn Error>> {
+    let sidecar_path = neural_sidecar_path_for_policy_artifact(policy_path);
+    if !sidecar_path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&sidecar_path)?;
+    let snapshot = serde_json::from_str::<SoccerNeuralNetworkSnapshot>(&raw)?;
+    Ok(Some((sidecar_path, snapshot)))
+}
+
 fn default_run_id() -> String {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2033,13 +2069,40 @@ fn run_game(
         // still warm-starts the tabular policy + tactical weights, trains a fresh net,
         // and persists a forward-compatible snapshot, so subsequent games warm-start
         // normally (self-healing). Any other snapshot error still aborts.
-        if let Err(err) = sim.set_neural_network_snapshot((**snapshot).clone()) {
-            if err.contains("input_dim") && err.contains("does not match expected") {
-                eprintln!(
-                    "soccer warm-start: dropping incompatible neural snapshot, starting net cold ({err})"
-                );
-            } else {
-                return Err(err);
+        match sim.set_neural_network_snapshot((**snapshot).clone()) {
+            Ok(()) => {
+                if let Some(line_depth_snapshot) = snapshot.line_depth_head.as_deref() {
+                    match BackFourLineHead::from_snapshot(line_depth_snapshot) {
+                        Ok(restored_head) => {
+                            let restored_steps = restored_head.training_steps();
+                            let mut guard = CARRIED_LINE_DEPTH_HEAD.lock().unwrap();
+                            let should_replace = guard
+                                .as_ref()
+                                .map(|head| head.training_steps() < restored_steps)
+                                .unwrap_or(true);
+                            if should_replace {
+                                *guard = Some(restored_head);
+                                eprintln!(
+                                    "soccer warm-start: carried line-depth head restored training_steps={restored_steps}"
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "soccer warm-start: dropping incompatible line-depth snapshot ({err})"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                if err.contains("input_dim") && err.contains("does not match expected") {
+                    eprintln!(
+                        "soccer warm-start: dropping incompatible neural snapshot, starting net cold ({err})"
+                    );
+                } else {
+                    return Err(err);
+                }
             }
         }
     }
@@ -2182,6 +2245,7 @@ fn run_game(
         for _ in 0..4 {
             final_loss = head.train_reward_weighted(&line_depth_samples, 0.02);
         }
+        sim.set_line_depth_head(head.clone());
         eprintln!(
             "line_depth_training samples={} training_steps={} consumed={} final_loss={:.5}",
             line_depth_samples.len(),
@@ -3482,6 +3546,20 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut pg_persisted_games = 0usize;
     let mut policies = load_initial_policies(resume_artifact.as_deref(), options.clone())?;
     let mut initial_neural_network = None::<SoccerNeuralNetworkSnapshot>;
+    if let Some(resume_path) = resume_artifact.as_deref() {
+        if let Some((sidecar_path, snapshot)) =
+            load_neural_sidecar_for_policy_artifact(Path::new(resume_path))?
+        {
+            println!(
+                "resume_neural_sidecar={} line_depth_head={}",
+                sidecar_path.display(),
+                snapshot.line_depth_head.is_some()
+            );
+            pg_base_neural_network_fingerprint =
+                Some(soccer_neural_network_snapshot_fingerprint(&snapshot));
+            initial_neural_network = Some(snapshot);
+        }
+    }
     if let Some(store) = pg_store.as_mut() {
         let experiment_slug =
             env_value("SOCCER_EXPERIMENT_SLUG").unwrap_or_else(|| "soccer-self-play".to_string());
@@ -4450,6 +4528,16 @@ fn run() -> Result<(), Box<dyn Error>> {
                     latest_neural_network.clone(),
                 );
             write_json(&learned_params_path, &checkpoint_params)?;
+            if let Some(sidecar_path) = write_neural_sidecar_for_policy_artifact(
+                &checkpoint_artifact_path,
+                latest_neural_network.as_ref(),
+            )? {
+                println!(
+                    "checkpoint_neural_sidecar games_completed={} artifact={}",
+                    episode_summaries.len(),
+                    sidecar_path.display()
+                );
+            }
             let checkpoint_manifest = run_manifest(
                 &run_id,
                 &run_dir,
@@ -4540,6 +4628,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             let final_export =
                 compact_training_artifact_for_export(&artifact, artifact_max_entries_per_policy);
             write_json(&final_artifact_path, &final_export)?;
+            if let Some(sidecar_path) = write_neural_sidecar_for_policy_artifact(
+                &final_artifact_path,
+                latest_neural_network.as_ref(),
+            )? {
+                println!("final_neural_sidecar={}", sidecar_path.display());
+            }
         } else {
             println!("final_policy_artifact=disabled");
         }
@@ -4678,6 +4772,20 @@ mod tests {
     use std::sync::Mutex;
 
     static SOCCER_RUN_PG_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn neural_sidecar_path_matches_live_policy_autoload_contract() {
+        assert_eq!(
+            neural_sidecar_path_for_policy_artifact(Path::new(
+                "out/local-learning/run/checkpoint-policy.json"
+            )),
+            PathBuf::from("out/local-learning/run/checkpoint-policy.neural.json")
+        );
+        assert_eq!(
+            neural_sidecar_path_for_policy_artifact(Path::new("team-policy.json")),
+            PathBuf::from("team-policy.neural.json")
+        );
+    }
 
     struct EnvVarGuard {
         key: &'static str,
@@ -5687,6 +5795,7 @@ mod tests {
             training_steps: 0,
             average_loss: None,
             policy_head: None,
+            line_depth_head: None,
         };
 
         assert_eq!(policies.home.entries()[0].visits, 1);
