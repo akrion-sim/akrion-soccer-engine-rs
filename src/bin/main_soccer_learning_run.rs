@@ -3522,6 +3522,63 @@ fn run() -> Result<(), Box<dyn Error>> {
     println!(
         "policy_active_max_fitness_regression value={active_max_fitness_regression_setting:.4} (lower = stricter anti-regression ratchet; 0.0 = newer generation must not regress)"
     );
+    // Frozen-anchor promotion gate (DEFAULT-OFF): a candidate must beat the frozen
+    // anchor brain over a held-out slate before it is written `active`. See
+    // `AnchorPromotionGateConfig` / `anchor_promotion_gate_verdict`.
+    let anchor_promotion_gate = {
+        let enabled = env_bool_alias(
+            "SOCCER_BATCH_ANCHOR_PROMOTION_GATE_ENABLED",
+            "SOCCER_ANCHOR_PROMOTION_GATE_ENABLED",
+            false,
+        )?;
+        let games = env_usize("SOCCER_ANCHOR_PROMOTION_GATE_GAMES", 8)?.max(2);
+        let minutes = env_f64("SOCCER_ANCHOR_PROMOTION_GATE_MINUTES", 2.0)?;
+        if !minutes.is_finite() || minutes <= 0.0 {
+            return Err(
+                invalid_data("SOCCER_ANCHOR_PROMOTION_GATE_MINUTES must be finite and positive")
+                    .into(),
+            );
+        }
+        let interval_writes =
+            env_usize("SOCCER_ANCHOR_PROMOTION_GATE_INTERVAL_WRITES", 1)?.max(1);
+        let mut thresholds = PromotionThresholds::default();
+        // We play exactly `games` fixtures, so require the full slate as evidence.
+        thresholds.min_games = games;
+        thresholds.wilson_floor = env_f64(
+            "SOCCER_ANCHOR_PROMOTION_GATE_WILSON_FLOOR",
+            thresholds.wilson_floor,
+        )?;
+        thresholds.worst_case_floor = env_f64(
+            "SOCCER_ANCHOR_PROMOTION_GATE_WORST_CASE_FLOOR",
+            thresholds.worst_case_floor,
+        )?;
+        if !(0.0..=1.0).contains(&thresholds.wilson_floor)
+            || !(0.0..=1.0).contains(&thresholds.worst_case_floor)
+        {
+            return Err(invalid_data(
+                "SOCCER_ANCHOR_PROMOTION_GATE_WILSON_FLOOR / _WORST_CASE_FLOOR must be in [0, 1]",
+            )
+            .into());
+        }
+        AnchorPromotionGateConfig {
+            enabled,
+            games,
+            minutes,
+            interval_writes,
+            thresholds,
+            // Disjoint from the training seed space (see `effective_seed`).
+            seed_base: 0xE7A1_0000,
+        }
+    };
+    println!(
+        "anchor_promotion_gate enabled={} games={} minutes={:.2} interval_writes={} wilson_floor={:.3} worst_case_floor={:.3}",
+        anchor_promotion_gate.enabled,
+        anchor_promotion_gate.games,
+        anchor_promotion_gate.minutes,
+        anchor_promotion_gate.interval_writes,
+        anchor_promotion_gate.thresholds.wilson_floor,
+        anchor_promotion_gate.thresholds.worst_case_floor,
+    );
     let neural_drain_timeout_ms = env_usize(
         "SOCCER_NEURAL_DRAIN_TIMEOUT_MS",
         DEFAULT_SOCCER_NEURAL_DRAIN_TIMEOUT_MS,
