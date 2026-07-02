@@ -44,7 +44,7 @@ uses, and it halves the state space the net must cover.
 | 7 | **Offside trap state — now and the next ~3 s** | `offside_in_force` (restart suspensions lifted); `trap_active_or_imminent` (offside live **and** ball in a mid/high block so a flat trap is meaningful). The *next-3 s* horizon is supplied implicitly through the ball/opponent **velocity and acceleration** features and through using the **predicted** ball position — the net is meant to learn the lead from them rather than us hard-coding a 3 s extrapolation. |
 | 8 | **Existing determinants (retained)** | `heuristic_centre_fwd_from_own_goal` — where the engine's *current* heuristic already puts the line centre (it folds in the directive line target, the ball blend, the role bias, the press focus, and the legal band). The model learns **relative to** this, so the well-tuned existing line is never thrown away — only refined. |
 
-`BACK_FOUR_LINE_FEATURE_DIM = 26`. The exact ordering is the single source of
+`BACK_FOUR_LINE_FEATURE_DIM = 27`. The exact ordering is the single source of
 truth in `back_four_line.rs::BackFourLineInputs::to_features`.
 
 ### Retaining existing determinants (group 8)
@@ -130,7 +130,7 @@ line when we press, trap, or control). That seed is the **fallback and the
 bootstrap target**. The path to "solve it optimally":
 
 1. **Head.** `BackFourLineHead` is a `FeedForwardNetwork` regression head
-   (25 → hidden → 1, sigmoid), mirroring `SoccerPassCompletionHead` /
+   (27 → hidden → 1, sigmoid), mirroring `SoccerPassCompletionHead` /
    `SoccerPolicyHead`: live net is not serde, it round-trips through the existing
    `SoccerNeuralNetworkSnapshot` Postgres path. Construction + `predict` + `train`
    are in place; it is wired but not yet consumed live (same staging as the
@@ -174,7 +174,7 @@ output mapping differ.
 
 ## What's the same
 
-- The **same 26-d feature vector**, in the same attacking frame — now describing
+- The **same 27-d feature vector**, in the same attacking frame — now describing
   the *midfield* line's own kinematics in the `line_*` slots (the builder is called
   with `PlayerRole::Midfielder`).
 - The **same analytic-seed → head** path; `analytic_midfield_gap_fraction` is the

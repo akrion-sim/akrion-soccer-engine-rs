@@ -12,7 +12,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use soccer_engine::des::general::soccer::{
     soccer_moment_records_from_jsonl, soccer_moment_records_to_learning_dataset,
-    train_soccer_pass_completion_head, AttackSpacingHead, BackFourLineHead, GiveAndGoHead,
+    train_soccer_pass_completion_head, AttackSpacingHead, BackFourLineHead, DefenderLinePolicyHead,
+    GiveAndGoHead,
     CrashBoxHead, GoalSideRecoveryHead, HeadScanHead, LaneAffinityHead, LongPassRunHead,
     LooseBallCommitHead, MatchConfig, MatchSummary, OnsideSupportHead, PassLaneYieldHead,
     RunPredictionHead, SeparationFloorHead, SlipBreakHead, WingerPinchHead,
@@ -1890,6 +1891,13 @@ fn load_initial_policies(
 static CARRIED_LINE_DEPTH_HEAD: std::sync::Mutex<Option<BackFourLineHead>> =
     std::sync::Mutex::new(None);
 
+/// In-memory per-defender individual line head (the MAPPO layer on top of the group
+/// line centre), carried + trained across games WITHIN a learner process, mirroring
+/// `CARRIED_LINE_DEPTH_HEAD`. Resets on pod restart; untouched unless the individual
+/// model is enabled (DD_SOCCER_ENABLE_BACK_FOUR_INDIVIDUAL_MODEL).
+static CARRIED_DEFENDER_LINE_HEAD: std::sync::Mutex<Option<DefenderLinePolicyHead>> =
+    std::sync::Mutex::new(None);
+
 /// In-memory loose-ball commit head (which player attacks a loose ball), carried +
 /// trained across games WITHIN a learner process, mirroring `CARRIED_LINE_DEPTH_HEAD`.
 /// Resets on pod restart; untouched unless the commit model is enabled
@@ -2044,6 +2052,11 @@ fn run_game(
     if let Some(head) = CARRIED_LINE_DEPTH_HEAD.lock().unwrap().as_ref() {
         sim.set_line_depth_head(head.clone());
     }
+    // Install the carried per-defender individual line head so the per-defender push/drop
+    // seam consumes it live once trained. No-op unless the individual model is enabled.
+    if let Some(head) = CARRIED_DEFENDER_LINE_HEAD.lock().unwrap().as_ref() {
+        sim.set_defender_line_head(head.clone());
+    }
     // Install the carried loose-ball commit head so the retriever election consumes it
     // live once trained. No-op unless the commit model is enabled.
     if let Some(head) = CARRIED_LOOSE_BALL_COMMIT_HEAD.lock().unwrap().as_ref() {
@@ -2175,6 +2188,28 @@ fn run_game(
             head.training_steps(),
             head.training_steps()
                 >= soccer_engine::des::general::soccer::LINE_DEPTH_HEAD_MIN_TRAINING_STEPS,
+            final_loss
+        );
+    }
+    // Train the CARRIED per-defender individual line head on this game's reward-weighted RL
+    // corpus (the MAPPO shared policy; reward = the defending team's windowed territorial
+    // advantage). Empty + skipped unless the individual model is enabled
+    // (DD_SOCCER_ENABLE_BACK_FOUR_INDIVIDUAL_MODEL). Cross-restart Postgres persistence is the
+    // remaining durability step, mirroring the group line-depth head.
+    let defender_line_samples = sim.drain_defender_line_samples();
+    if !defender_line_samples.is_empty() {
+        let mut guard = CARRIED_DEFENDER_LINE_HEAD.lock().unwrap();
+        let head = guard.get_or_insert_with(|| DefenderLinePolicyHead::new(episode_seed as u32));
+        let mut final_loss = 0.0;
+        for _ in 0..4 {
+            final_loss = head.train_reward_weighted(&defender_line_samples, 0.02);
+        }
+        eprintln!(
+            "defender_line_training samples={} training_steps={} consumed={} final_loss={:.5}",
+            defender_line_samples.len(),
+            head.training_steps(),
+            head.training_steps()
+                >= soccer_engine::des::general::soccer::DEFENDER_LINE_HEAD_MIN_TRAINING_STEPS,
             final_loss
         );
     }
@@ -3383,6 +3418,12 @@ fn run() -> Result<(), Box<dyn Error>> {
     let actor_critic_default = config.neural_learning.marl_algorithm != SoccerMarlAlgorithm::Off;
     config.neural_blend.actor_critic =
         env_bool("SOCCER_ENABLE_ACTOR_CRITIC", actor_critic_default)?;
+    // Train the learned dynamics model P̂(s'|s,a) on each episode's replay so MCTS look-ahead can
+    // plan inside the model (model-based / "imagined-rollout" learning — more updates per real
+    // game). Mirrors the set-play learner's `SOCCER_NEURAL_WORLD_MODEL` hook; default preserves
+    // `MatchConfig::default()` (off), so an unset env is byte-identical to before.
+    config.neural_blend.world_model =
+        env_bool("SOCCER_NEURAL_WORLD_MODEL", config.neural_blend.world_model)?;
     let run_id = env_value("SOCCER_RUN_ID").unwrap_or_else(default_run_id);
     let run_dir = PathBuf::from(
         env_value("SOCCER_RUN_DIR").unwrap_or_else(|| format!("out/soccer-learning-runs/{run_id}")),

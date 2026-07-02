@@ -10696,6 +10696,148 @@ fn flank_crash_box_cross_latches_window_and_rewards_box_arrivals() {
     }
 }
 
+/// The negative MIRROR of the arrival reward: a qualifying wide aerial cross is delivered but
+/// only ONE attacker crashed the box (below the 2-runner minimum), so the nearest attacking-role
+/// no-show in the final third is charged the bounded no-show penalty — capped at the runner
+/// shortfall. Farther no-shows and the lone crasher are NOT penalised, and with the no-show gate
+/// off the whole thing is byte-identical (only the arrival path, which pays nothing here, runs).
+#[test]
+fn flank_crash_box_underattacked_cross_penalizes_nearest_no_show() {
+    let _env = crash_box_env_lock();
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    // Home attacks y = 120; the opponent (Away) box is y in [102, 120], x in [18, 62].
+    sim.players[9].role = PlayerRole::Forward;
+    sim.players[10].role = PlayerRole::Forward;
+    sim.players[7].role = PlayerRole::Midfielder;
+    // Exactly ONE crasher inside the box ⇒ below the 2-runner minimum (shortfall = 1).
+    sim.players[9].position = Vec2::new(35.0, 110.0);
+    // Two attacking no-shows in the final third (y >= 80) but outside the box (y < 102):
+    // players[10] is nearest the goal ⇒ it (and only it) should be blamed.
+    sim.players[10].position = Vec2::new(40.0, 100.0);
+    sim.players[7].position = Vec2::new(52.0, 88.0);
+    let crosser = 8;
+    let origin = Vec2::new(8.0, 100.0); // outer flank lane, attacking final third.
+
+    // Flank gate ON but no-show gate OFF ⇒ no arrival reward (under-attacked) and no penalty.
+    std::env::set_var("DD_SOCCER_ENABLE_FLANK_CRASH_BOX", "1");
+    let before_off = sim.reward_events.len();
+    sim.register_flank_crash_box_cross(Team::Home, crosser, origin, true, PassFlight::Aerial);
+    let no_show_off = sim.reward_events[before_off..]
+        .iter()
+        .filter(|event| event.kind == SoccerRewardEventKind::CrashBoxNoShow)
+        .count();
+    assert_eq!(
+        no_show_off, 0,
+        "no-show penalty gate off must emit no CrashBoxNoShow events (byte-identical)"
+    );
+
+    // No-show gate ON ⇒ exactly `shortfall` (=1) nearest no-show is penalised.
+    std::env::set_var("DD_SOCCER_ENABLE_CRASH_BOX_NO_SHOW_PENALTY", "1");
+    let before_on = sim.reward_events.len();
+    sim.register_flank_crash_box_cross(Team::Home, crosser, origin, true, PassFlight::Aerial);
+    std::env::remove_var("DD_SOCCER_ENABLE_CRASH_BOX_NO_SHOW_PENALTY");
+    std::env::remove_var("DD_SOCCER_ENABLE_FLANK_CRASH_BOX");
+
+    let no_shows: Vec<&SoccerRewardEvent> = sim.reward_events[before_on..]
+        .iter()
+        .filter(|event| event.kind == SoccerRewardEventKind::CrashBoxNoShow)
+        .collect();
+    assert_eq!(
+        no_shows.len(),
+        1,
+        "shortfall of 1 runner must charge exactly one no-show, got {no_shows:?}"
+    );
+    assert_eq!(
+        no_shows[0].player_id, 10,
+        "the no-show nearest the goal must be the one blamed"
+    );
+    assert!(
+        no_shows[0].amount < 0.0,
+        "a no-show event must carry a negative (penalty) amount, got {}",
+        no_shows[0].amount
+    );
+    // The lone crasher and the farther no-show are not blamed.
+    assert!(
+        sim.reward_events[before_on..].iter().all(|event| {
+            event.kind != SoccerRewardEventKind::CrashBoxNoShow
+                || (event.player_id != 9 && event.player_id != 7)
+        }),
+        "only the nearest eligible no-show may be penalised"
+    );
+}
+
+fn concede_symmetry_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The concede-symmetry rebalance (gated, default-OFF) swaps the light default concede penalties
+/// (8 for keeper/def, 2 for outfield) for the heavier `*_symmetric` tunables (100 / 60) so
+/// conceding is a real counterweight to a +100 goal. With the gate off the concede term is the
+/// original light value (byte-identical baseline). Because every other reward term is identical
+/// between the on/off calls, the drop in reward isolates exactly the concede-term increase.
+#[test]
+fn concede_symmetry_gate_scales_up_the_concede_penalty() {
+    let _env = concede_symmetry_env_lock();
+    std::env::remove_var("DD_SOCCER_ENABLE_CONCEDE_SYMMETRY");
+    let sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let before = WorldSnapshot::from_match(&sim);
+    // A concede for Home: the Away score goes 0 -> 1 (args: home_before, away_before, home_after,
+    // away_after). The `after` snapshot is otherwise identical, so only the score-against changes.
+    let after = before.clone();
+    let defender = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role == PlayerRole::Defender)
+        .expect("a home defender")
+        .id;
+    let forward = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role == PlayerRole::Forward)
+        .expect("a home forward")
+        .id;
+
+    let reward_for = |pid: usize| -> f64 {
+        let decision = test_decision_trace(&before, pid, "hold");
+        soccer_transition_reward(&sim.players[pid], &decision, &before, &after, 0, 0, 0, 1, true)
+    };
+
+    let def_baseline = reward_for(defender);
+    let fwd_baseline = reward_for(forward);
+
+    std::env::set_var("DD_SOCCER_ENABLE_CONCEDE_SYMMETRY", "1");
+    let def_symmetric = reward_for(defender);
+    let fwd_symmetric = reward_for(forward);
+    std::env::remove_var("DD_SOCCER_ENABLE_CONCEDE_SYMMETRY");
+
+    let reward_cfg = &tunables().reward;
+    let def_delta = reward_cfg.concede_keeper_defender_penalty_symmetric
+        - reward_cfg.concede_keeper_defender_penalty;
+    let fwd_delta =
+        reward_cfg.concede_outfield_penalty_symmetric - reward_cfg.concede_outfield_penalty;
+    assert!(
+        (def_baseline - def_symmetric - def_delta).abs() < 1e-6,
+        "defender concede drop must equal the symmetric increase {def_delta}: \
+         baseline={def_baseline} symmetric={def_symmetric}"
+    );
+    assert!(
+        (fwd_baseline - fwd_symmetric - fwd_delta).abs() < 1e-6,
+        "outfielder concede drop must equal the symmetric increase {fwd_delta}: \
+         baseline={fwd_baseline} symmetric={fwd_symmetric}"
+    );
+    // The rebalanced concede is a genuine counterweight, and the back line still bears more of
+    // it than an outfielder (the goal carrot is flat team-wide, so the stick keeps a role gradient).
+    assert!(
+        def_symmetric < def_baseline - 80.0,
+        "symmetric defender concede must be a real hit: baseline={def_baseline} symmetric={def_symmetric}"
+    );
+    assert!(
+        def_symmetric < fwd_symmetric,
+        "a defender should feel a concede more than an outfielder: def={def_symmetric} fwd={fwd_symmetric}"
+    );
+}
+
 /// A genuine ground pass (not an aerial cross), or a central origin, must not open the window —
 /// the play is specifically a *wide aerial cross* into a crashed box.
 #[test]

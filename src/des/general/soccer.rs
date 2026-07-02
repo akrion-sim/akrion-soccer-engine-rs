@@ -59,10 +59,14 @@ pub use pitch_value::*;
 // re-export) — its public fns have deliberately generic names (`strength`,
 // `lane_match`) that read clearly as `lane_discipline::strength()`.
 mod back_four_line;
+// Per-defender individual line decision (the MAPPO layer on top of the back_four_line
+// group centre). Full-22 egocentric observation + analytic seed + shared policy head.
+mod back_four_individual;
 mod lane_discipline;
 mod lane_affinity_decision;
 pub use lane_affinity_decision::*;
 pub use back_four_line::*;
+pub use back_four_individual::*;
 mod loose_ball_commit;
 pub use loose_ball_commit::*;
 mod receive_approach;
@@ -14348,6 +14352,42 @@ pub(crate) fn give_and_go_ambition_enabled() -> bool {
     }
 }
 
+/// Scale the scoop-pass option's propensity (and its floor) by how likely the lofted ball
+/// actually reaches the target. The scoop option was scored from TECHNIQUE alone and then
+/// floored to a 52-64% share, so a chip into a covered lane (aerial interception risk high /
+/// aerial completion ~0) won a majority of the probability mass regardless of outcome — the
+/// live "passes straight to the opponent". Default-ON; kill switch
+/// `DD_SOCCER_ENABLE_SCOOP_COMPLETION_GATE=0` restores the technique-only propensity. Under
+/// test it is default-OFF + env-driven so the parity suite stays byte-identical.
+pub(crate) fn dd_soccer_enable_scoop_completion_gate() -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("DD_SOCCER_ENABLE_SCOOP_COMPLETION_GATE")
+            .map(|raw| {
+                let v = raw.trim().to_ascii_lowercase();
+                matches!(v.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_SCOOP_COMPLETION_GATE"))
+    }
+}
+
+/// Viability factor in `[0, 1]` for a lofted scoop pass: high only when the ball is both likely
+/// to reach the target (`expected_aerial_pass_completion`) AND not sitting in a cuttable flight
+/// lane (`aerial_pass_interception_risk`). A receiver can be wide open yet a defender cuts the
+/// arc, so BOTH must be favourable. `SCOOP_COMPLETION_GATE_FLOOR` keeps a genuinely technical
+/// chip alive rather than zeroing it, so a good scoop still competes; a giveaway collapses.
+pub(crate) fn scoop_completion_viability(observation: &SoccerPomdpObservation) -> f64 {
+    let completion = observation.expected_aerial_pass_completion.clamp(0.0, 1.0);
+    let lane_open = 1.0 - observation.aerial_pass_interception_risk.clamp(0.0, 1.0);
+    (completion * lane_open).clamp(0.0, 1.0)
+}
+
 fn pass_like_action_flight(action: &str) -> Option<PassFlight> {
     use SoccerActionLabel::*;
     match SoccerActionLabel::classify(action)? {
@@ -19123,6 +19163,14 @@ pub(crate) enum SoccerRewardEventKind {
     /// Bounded shaped credit for an attacker having crashed into the box as a flank aerial
     /// cross is released — the off-ball "be there for the delivery" signal.
     CrashBoxArrival,
+    /// PENALTY (negative): the negative MIRROR of [`CrashBoxArrival`]. A qualifying flank aerial
+    /// cross was delivered into the box but too few attackers crashed in; the attacking-role
+    /// no-shows nearest the box who should have completed the run are charged a small bounded
+    /// "you weren't there for the delivery" penalty (capped at the runner shortfall). The direct
+    /// off-ball learning signal that failing to attack the box on a good cross is a mistake, not
+    /// just that arriving is nice. Emitted only when `DD_SOCCER_ENABLE_CRASH_BOX_NO_SHOW_PENALTY`
+    /// is on. See [`crash_box`] and `penalize_flank_crash_box_no_shows`.
+    CrashBoxNoShow,
     /// PENALTY (negative): a Forward / winger isolated in the attacking half with no teammate
     /// ahead played a panicked BACKWARD/square pass instead of driving at goal or holding the
     /// ball up for support. The direct learning signal that trains the policy off the
@@ -19196,6 +19244,7 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::Goal
                 | SoccerRewardEventKind::HeaderGoalFromCross
                 | SoccerRewardEventKind::CrashBoxArrival
+                | SoccerRewardEventKind::CrashBoxNoShow
                 | SoccerRewardEventKind::IsolatedCarrierPanicBackPass
                 | SoccerRewardEventKind::SustainedForwardDribble
                 | SoccerRewardEventKind::UnpressuredBackwardPass
@@ -19919,6 +19968,25 @@ pub(crate) fn gate_default_on(name: &str) -> bool {
             "0" | "false" | "no" | "off"
         ),
         Err(_) => true,
+    }
+}
+
+/// Concede-symmetry rebalance gate. **Default-OFF everywhere** (production and test): a brand-new
+/// reward-balance change is opt-in, not a kill-switch default-on. When
+/// `DD_SOCCER_ENABLE_CONCEDE_SYMMETRY` is truthy, `soccer_transition_reward_with_tactics` swaps
+/// the light default concede penalties (8/2) for the heavier `*_symmetric` tunables (100/60) so
+/// conceding becomes a genuine counterweight to a +100 goal. Off ⇒ byte-identical baseline / A/B.
+/// Tests re-read the env each call so an A/B can toggle it within the process; production caches.
+pub(crate) fn dd_soccer_enable_concede_symmetry() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_CONCEDE_SYMMETRY")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_CONCEDE_SYMMETRY"))
     }
 }
 
@@ -24217,8 +24285,20 @@ fn soccer_transition_reward_with_tactics(
     let reward_cfg = &tunables().reward;
     reward += (after_for as f64 - before_for as f64) * reward_cfg.goal_scored_points;
     if after_against > before_against {
+        // The concede STICK, mirror of the goal CARROT above. By default it is deliberately
+        // light (8/2 vs a +100 goal). The concede-symmetry rebalance (gated, default-OFF) swaps
+        // in the heavier `*_symmetric` values so conceding becomes a real counterweight to
+        // scoring — a full-parity hit for the back line, a role-graded share for outfielders —
+        // rather than a token cost. OFF ⇒ the original 8/2 values, byte-identical baseline / A/B.
+        let symmetric = dd_soccer_enable_concede_symmetry();
         reward -= if matches!(player.role, PlayerRole::Goalkeeper | PlayerRole::Defender) {
-            reward_cfg.concede_keeper_defender_penalty
+            if symmetric {
+                reward_cfg.concede_keeper_defender_penalty_symmetric
+            } else {
+                reward_cfg.concede_keeper_defender_penalty
+            }
+        } else if symmetric {
+            reward_cfg.concede_outfield_penalty_symmetric
         } else {
             reward_cfg.concede_outfield_penalty
         };
@@ -25365,6 +25445,16 @@ fn dense_soccer_transition_reward(
                 0.24
             };
         }
+        // Both-teams contest pressure: a symmetric time-escalating penalty while the
+        // ball sits uncontested (charged to every outfielder on both sides) plus an
+        // explicit reward for winning the unclaimed ball. See
+        // `loose_ball_contest_pressure_reward`.
+        reward += loose_ball_contest_pressure_reward(
+            player.role,
+            before.loose_ball_uncontested_seconds(),
+            after_possession == Some(player.team),
+            after.ball.holder == Some(player.id),
+        );
         if moved_yards < 0.06 && before_distance > 9.0 {
             reward -= 0.20;
         }
@@ -25388,6 +25478,157 @@ fn dense_soccer_transition_reward(
     reward += pitch_value_reward_delta(before, after, player.team);
 
     reward.clamp(-4.0, 4.0)
+}
+
+/// Env gate for the **both-teams loose-ball contest pressure** reward term (the
+/// symmetric time-escalating uncontested penalty + explicit loose-ball-win reward).
+/// Default-ON; set `DD_SOCCER_ENABLE_LOOSE_BALL_CONTEST_PRESSURE=0` to restore the
+/// prior reward exactly.
+pub(crate) fn loose_ball_contest_pressure_enabled() -> bool {
+    #[cfg(test)]
+    {
+        gate_default_on("DD_SOCCER_ENABLE_LOOSE_BALL_CONTEST_PRESSURE")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_LOOSE_BALL_CONTEST_PRESSURE"))
+    }
+}
+
+/// Both-teams loose-ball **contest pressure**: a symmetric, time-escalating penalty
+/// charged to every outfield player on BOTH teams for each tick an unpossessed ball
+/// is left uncontested beyond the grace (so standing off a loose ball is never free
+/// for either side), plus an explicit reward for actually WINNING the unclaimed ball.
+///
+/// Unlike [`loose_ball_contest_learning_reward`] (which shapes a single candidate's
+/// race/hold choice), this term is deliberately NOT potential-based — the
+/// uncontested-time cost is meant to move the optimal policy toward going and winning
+/// the ball. Because it is charged identically to both teams, it biases only the
+/// urgency of contesting, not the match outcome.
+///
+/// * `uncontested_seconds` — how long the ball has sat loose & uncontested
+///   ([`WorldSnapshot::loose_ball_uncontested_seconds`], read from `before`).
+/// * `won_loose_ball` — the actor's team took controlled possession of the
+///   previously-unheld ball this transition.
+/// * `won_as_holder` — the actor is the player who personally secured it.
+///
+/// Returns `0.0` for a goalkeeper (kept goalside, not pressured off its line) and
+/// when the gate is off, so an unconfigured/off process stays byte-identical.
+fn loose_ball_contest_pressure_reward(
+    role: PlayerRole,
+    uncontested_seconds: f64,
+    won_loose_ball: bool,
+    won_as_holder: bool,
+) -> f64 {
+    if !loose_ball_contest_pressure_enabled() || role == PlayerRole::Goalkeeper {
+        return 0.0;
+    }
+    let reward_cfg = &tunables().reward;
+    let over_grace = (uncontested_seconds - LOOSE_BALL_MAX_UNCONTESTED_SECONDS).max(0.0);
+    let mut reward = 0.0;
+    if over_grace > 0.0 {
+        let penalty = (reward_cfg.loose_ball_uncontested_penalty_per_second * over_grace)
+            .min(reward_cfg.loose_ball_uncontested_penalty_max.max(0.0));
+        reward -= penalty;
+    }
+    if won_loose_ball {
+        // Winning a ball that had sat longer uncontested is more decisive.
+        let urgency_bonus = 1.0 + (over_grace / 1.5).clamp(0.0, 1.0);
+        let secured = if won_as_holder { 1.0 } else { 0.4 };
+        reward += reward_cfg.loose_ball_win_points * urgency_bonus * secured;
+    }
+    reward
+}
+
+#[cfg(test)]
+mod loose_ball_contest_pressure_tests {
+    use super::*;
+
+    // The gate reads a process-global env var; serialize the tests that toggle it.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn uncontested_penalty_grows_with_time_and_is_symmetric() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("DD_SOCCER_ENABLE_LOOSE_BALL_CONTEST_PRESSURE");
+        let grace = LOOSE_BALL_MAX_UNCONTESTED_SECONDS;
+        // Within grace ⇒ no penalty; beyond it ⇒ a penalty that escalates.
+        assert_eq!(
+            loose_ball_contest_pressure_reward(PlayerRole::Midfielder, grace, false, false),
+            0.0
+        );
+        let short = loose_ball_contest_pressure_reward(
+            PlayerRole::Midfielder,
+            grace + 0.5,
+            false,
+            false,
+        );
+        let long =
+            loose_ball_contest_pressure_reward(PlayerRole::Midfielder, grace + 2.0, false, false);
+        assert!(short < 0.0, "an uncontested ball must cost something: {short}");
+        assert!(long < short, "longer uncontested must cost more: {long} !< {short}");
+        // Symmetric: role/team-independent — a defender pays the same as a forward.
+        let def =
+            loose_ball_contest_pressure_reward(PlayerRole::Defender, grace + 0.5, false, false);
+        assert!((def - short).abs() < 1e-12, "penalty must be team/role-symmetric");
+    }
+
+    #[test]
+    fn uncontested_penalty_is_capped() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("DD_SOCCER_ENABLE_LOOSE_BALL_CONTEST_PRESSURE");
+        let huge =
+            loose_ball_contest_pressure_reward(PlayerRole::Forward, 1_000.0, false, false);
+        let cap = tunables().reward.loose_ball_uncontested_penalty_max;
+        assert!(huge >= -cap - 1e-9, "penalty {huge} exceeds cap -{cap}");
+    }
+
+    #[test]
+    fn goalkeeper_is_exempt() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("DD_SOCCER_ENABLE_LOOSE_BALL_CONTEST_PRESSURE");
+        assert_eq!(
+            loose_ball_contest_pressure_reward(PlayerRole::Goalkeeper, 5.0, false, false),
+            0.0,
+            "the keeper is kept goalside, not pressured off its line"
+        );
+    }
+
+    #[test]
+    fn winning_the_loose_ball_is_rewarded_holder_over_teammate() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("DD_SOCCER_ENABLE_LOOSE_BALL_CONTEST_PRESSURE");
+        let holder =
+            loose_ball_contest_pressure_reward(PlayerRole::Midfielder, 0.0, true, true);
+        let teammate =
+            loose_ball_contest_pressure_reward(PlayerRole::Midfielder, 0.0, true, false);
+        assert!(holder > 0.0, "winning the ball must be rewarded: {holder}");
+        assert!(
+            holder > teammate && teammate > 0.0,
+            "the player who secured it gets more than a teammate who forced it: {holder} vs {teammate}"
+        );
+        // A ball won after sitting longer uncontested is worth more (decisive).
+        let decisive = loose_ball_contest_pressure_reward(
+            PlayerRole::Midfielder,
+            LOOSE_BALL_MAX_UNCONTESTED_SECONDS + 2.0,
+            true,
+            true,
+        );
+        assert!(decisive > holder, "winning a longer-loose ball is more decisive");
+    }
+
+    #[test]
+    fn gate_off_restores_byte_identical_zero() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("DD_SOCCER_ENABLE_LOOSE_BALL_CONTEST_PRESSURE", "0");
+        assert_eq!(
+            loose_ball_contest_pressure_reward(PlayerRole::Midfielder, 5.0, true, true),
+            0.0
+        );
+        std::env::remove_var("DD_SOCCER_ENABLE_LOOSE_BALL_CONTEST_PRESSURE");
+    }
 }
 
 fn loose_ball_contest_learning_reward(
@@ -52458,6 +52699,7 @@ fn tracking_frame_to_world_snapshot(
         ranked_aerial_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         support_decision_feature_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         line_depth_head: None,
+        defender_line_head: None,
         back_four_line_latch_centre_depth: [None, None],
         pass_completion_head: None,
         loose_ball_commit_head: None,

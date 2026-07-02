@@ -540,6 +540,18 @@ pub struct SoccerMatch {
     pub(crate) line_depth_samples: Vec<LineDepthSample>,
     /// Open line-depth decisions awaiting their windowed reward.
     pub(crate) pending_line_depth: Vec<PendingLineDepthDecision>,
+    /// The trained **per-defender** individual line head (the MAPPO layer on top of the
+    /// group line centre), when present. Set by the learner (carried + trained across
+    /// games) so the per-defender push/drop decision consumes it live; `None` ⇒ the
+    /// analytic seed. Shared into each [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) defender_line_head: Option<std::sync::Arc<DefenderLinePolicyHead>>,
+    /// Rolling RL training corpus for the per-defender head: an egocentric state + the
+    /// push delta used + the windowed shared-team territorial reward. Collected only
+    /// while the individual model is enabled (`collect_defender_line_rl_samples`);
+    /// drained by the cluster learner. Empty + untouched in the default process.
+    pub(crate) defender_line_samples: Vec<DefenderLineSample>,
+    /// Open per-defender decisions awaiting their windowed reward.
+    pub(crate) pending_defender_line: Vec<PendingDefenderLineDecision>,
     /// Sticky back-four line-centre latch per team (Home=0, Away=1): the line centre held on the
     /// sim-tick loop for ~[`BACK_FOUR_LINE_STICKY_ANCHOR_SECONDS`] so the four stop oscillating (the
     /// "sine-wave"). `None` until first set / whenever the sticky anchor (or the v2 line) is gated
@@ -3196,6 +3208,9 @@ impl SoccerMatch {
             line_depth_head: None,
             line_depth_samples: Vec::new(),
             pending_line_depth: Vec::new(),
+            defender_line_head: None,
+            defender_line_samples: Vec::new(),
+            pending_defender_line: Vec::new(),
             back_four_line_latch: [None, None],
             loose_ball_commit_head: None,
             attack_spacing_head: None,
@@ -8792,6 +8807,9 @@ impl SoccerMatch {
         // Gap 5: collect line-depth RL samples off the per-tick snapshot (no-op +
         // byte-identical unless a line-depth model is enabled).
         self.collect_line_depth_rl_samples(&next_snapshot);
+        // Per-defender individual line (MAPPO) RL samples, off the same snapshot (no-op +
+        // byte-identical unless DD_SOCCER_ENABLE_BACK_FOUR_INDIVIDUAL_MODEL is set).
+        self.collect_defender_line_rl_samples(&next_snapshot);
         // Maintain the loose-ball urgency clock (every tick) and, when the commit model
         // is enabled, collect its per-candidate RL samples (no-op + byte-identical off).
         self.update_loose_ball_urgency(&next_snapshot);
@@ -11262,6 +11280,7 @@ impl SoccerMatch {
             .collect();
         crashers.sort_unstable();
         if crashers.len() < crash_box::CRASH_BOX_ARRIVAL_MIN_RUNNERS {
+            self.penalize_flank_crash_box_no_shows(team, crosser, crashers.len());
             return;
         }
         let total = apply_dense_shaping_budget(
@@ -11271,6 +11290,59 @@ impl SoccerMatch {
         let share = total / crashers.len() as f64;
         for id in crashers {
             self.record_reward_event_with_kind(id, share, SoccerRewardEventKind::CrashBoxArrival);
+        }
+    }
+
+    /// The negative MIRROR of [`Self::reward_flank_crash_box_arrivals`]: when a qualifying flank
+    /// aerial cross is delivered but fewer than [`crash_box::CRASH_BOX_ARRIVAL_MIN_RUNNERS`]
+    /// attackers crashed the box, charge the attacking-role no-shows nearest the box who should
+    /// have completed the run — the ones best placed to have arrived — a small bounded
+    /// [`crash_box::CRASH_BOX_NO_SHOW_PENALTY_POINTS`] each, capped at the runner shortfall so it
+    /// can never rival the terminal goal credit. Only Forwards/Midfielders already inside the
+    /// attacking final third are eligible (a deep player who could not plausibly have crashed in
+    /// is not blamed). Gated default-OFF by
+    /// [`crash_box::crash_box_no_show_penalty_enabled`] ⇒ byte-identical baseline / A/B.
+    /// Deterministic (no-shows sorted by distance to goal, then id).
+    fn penalize_flank_crash_box_no_shows(&mut self, team: Team, crosser: usize, crashers: usize) {
+        if !crash_box::crash_box_no_show_penalty_enabled() {
+            return;
+        }
+        let shortfall = crash_box::CRASH_BOX_ARRIVAL_MIN_RUNNERS.saturating_sub(crashers);
+        if shortfall == 0 {
+            return;
+        }
+        let opponent_box_team = team.other();
+        let length = self.config.field_length_yards;
+        let attacked_goal_y = team.goal_y(length);
+        let goal_center = Vec2::new(self.config.field_width_yards * 0.5, attacked_goal_y);
+        let mut no_shows: Vec<(usize, f64)> = self
+            .players
+            .iter()
+            .filter(|player| {
+                player.team == team
+                    && player.id != crosser
+                    && matches!(player.role, PlayerRole::Forward | PlayerRole::Midfielder)
+                    && !self.point_in_own_penalty_area(opponent_box_team, player.position)
+                    && crash_box::ball_in_attacking_final_third(
+                        player.position.y,
+                        attacked_goal_y,
+                        length,
+                    )
+            })
+            .map(|player| (player.id, player.position.distance(goal_center)))
+            .collect();
+        // Blame the ones best placed to have arrived first: nearest the goal, id as tiebreak.
+        no_shows.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+        let penalty = apply_dense_shaping_budget(
+            crash_box::CRASH_BOX_NO_SHOW_PENALTY_POINTS,
+            tunables().reward.dense_shaping_budget_points,
+        );
+        for (id, _) in no_shows.into_iter().take(shortfall) {
+            self.record_reward_event_with_kind(
+                id,
+                -penalty,
+                SoccerRewardEventKind::CrashBoxNoShow,
+            );
         }
     }
 
@@ -22363,6 +22435,11 @@ pub struct WorldSnapshot {
     /// decision aid; Default = None).
     #[serde(skip)]
     pub(crate) line_depth_head: Option<std::sync::Arc<BackFourLineHead>>,
+    /// The trained per-defender individual line head, carried from the match for live
+    /// consumption in `back_four_individual_push_delta`. `None` ⇒ the analytic seed
+    /// (parity). Skipped by serde (an internal decision aid; Default = None).
+    #[serde(skip)]
+    pub(crate) defender_line_head: Option<std::sync::Arc<DefenderLinePolicyHead>>,
     /// Held back-four line-centre depth (yd from own goal) per team (Home=0, Away=1), copied from the
     /// match's sticky latch so the live line chokepoint reads the LATCHED centre instead of
     /// recomputing it every tick. `None` ⇒ compute fresh (sticky anchor off, or not yet set).
@@ -25138,6 +25215,7 @@ impl WorldSnapshot {
                 std::collections::HashMap::new(),
             ),
             line_depth_head: m.line_depth_head.clone(),
+            defender_line_head: m.defender_line_head.clone(),
             back_four_line_latch_centre_depth: [
                 m.back_four_line_latch[0].map(|l| l.centre_depth),
                 m.back_four_line_latch[1].map(|l| l.centre_depth),
@@ -40099,6 +40177,24 @@ impl WorldSnapshot {
         self.loose_ball_urgency_active() || self.loose_ball_team_stalled_for(team)
     }
 
+    /// Seconds the ball has sat **loose and uncontested** (no outfielder on it or
+    /// closing it down), read from the global clock the match maintains in
+    /// [`SoccerMatch::update_loose_ball_urgency`] and carried into this snapshot.
+    /// `0.0` when the ball is held, in controlled transit, or being contested this
+    /// tick. The clock is symmetric across teams (it resets the moment either side
+    /// challenges), so this drives the both-teams loose-ball contest-pressure
+    /// penalty in the learning reward.
+    pub(crate) fn loose_ball_uncontested_seconds(&self) -> f64 {
+        if self.ball.holder.is_some() || self.pending_pass_keeps_ball_in_transit() {
+            return 0.0;
+        }
+        let Some(since) = self.loose_ball_uncontested_since_tick else {
+            return 0.0;
+        };
+        let dt = sane_dt_seconds(self.dt_seconds, DEFAULT_DT_SECONDS).max(1e-6);
+        (self.tick.saturating_sub(since) as f64 * dt).max(0.0)
+    }
+
     fn pending_pass_keeps_ball_in_transit(&self) -> bool {
         self.pending_pass.is_some()
             && self.ball.holder.is_none()
@@ -44513,7 +44609,7 @@ impl WorldSnapshot {
         intent
     }
 
-    fn is_wide_defender(&self, player: &PlayerSnapshot) -> bool {
+    pub(crate) fn is_wide_defender(&self, player: &PlayerSnapshot) -> bool {
         player.role == PlayerRole::Defender
             && (player.home_position.x < self.field_width * 0.28
                 || player.home_position.x > self.field_width * 0.72)
@@ -50044,7 +50140,51 @@ impl WorldSnapshot {
                 team, centre_fwd, own_goal_fwd, ball_depth, max_depth,
             );
         }
+        // Learned GROUP line-depth head (promotion): the trained `BackFourLineHead` (or the
+        // analytic seed) refines WHERE inside the legal band the geometric v2 centre sits. It
+        // was previously reachable only from the legacy band path (bypassed while v2 is on),
+        // so enabling `DD_SOCCER_ENABLE_BACK_FOUR_LINE_MODEL` had no live effect; consulting it
+        // here makes the group MARL/MAPPO head actually drive the live (v2) line. Gated off by
+        // default ⇒ byte-identical; the blend keeps the well-tuned geometry dominant and the
+        // result is re-clamped to the legal `[own_goal, own_goal+max_depth]` band so the head
+        // can never set an illegal line.
+        if back_four_line_model_enabled() {
+            if let Some(model_centre_fwd) =
+                self.back_four_line_v2_model_centre_fwd(team, predicted_fwd, own_goal_fwd, max_depth)
+            {
+                let blend = BACK_FOUR_LINE_MODEL_BLEND.clamp(0.0, 1.0);
+                centre_fwd = (centre_fwd * (1.0 - blend) + model_centre_fwd * blend)
+                    .clamp(own_goal_fwd, own_goal_fwd + max_depth);
+            }
+        }
         centre_fwd
+    }
+
+    /// The GROUP line-depth head's preferred line CENTRE (attack frame) for the v2 path: build
+    /// the [`BackFourLineInputs`], take the trained head's gap fraction once it clears
+    /// [`LINE_DEPTH_HEAD_MIN_TRAINING_STEPS`] (else the analytic seed), and map the fraction to a
+    /// centre trailing the predicted ball by up to [`BACK_FOUR_LINE_DESIRED_GAP_MAX_YARDS`]
+    /// (`0` = level with the ball / high line, `1` = the full 40yd deep block). Clamped to the
+    /// legal band. `None` on a degenerate roster (the caller then keeps the geometric centre).
+    fn back_four_line_v2_model_centre_fwd(
+        &self,
+        team: Team,
+        predicted_fwd: f64,
+        own_goal_fwd: f64,
+        max_depth: f64,
+    ) -> Option<f64> {
+        let inputs = self.build_back_four_line_inputs(team)?;
+        let gap_fraction = self
+            .line_depth_head
+            .as_ref()
+            .filter(|head| head.training_steps() >= LINE_DEPTH_HEAD_MIN_TRAINING_STEPS)
+            .and_then(|head| head.predict(&inputs))
+            .unwrap_or_else(|| analytic_line_centre_gap_fraction(&inputs));
+        if !gap_fraction.is_finite() {
+            return None;
+        }
+        let model_centre_fwd = predicted_fwd - gap_fraction * BACK_FOUR_LINE_DESIRED_GAP_MAX_YARDS;
+        Some(model_centre_fwd.clamp(own_goal_fwd, own_goal_fwd + max_depth))
     }
 
     /// Aggressive **ball-far offside-trap push-up** of the line centre (attack frame). When the
@@ -50214,6 +50354,14 @@ impl WorldSnapshot {
             }
             back_four_line_hold_target_fwd(cur_fwd, target_fwd, cap, BACK_FOUR_LINE_HOLD_DEADBAND_YARDS)
         };
+        // Per-defender MAPPO push/drop (the individual layer on top of the group centre):
+        // `+` steps THIS defender up toward the attackers, `−` drops it to cover a runner
+        // its collective centroid misses. It perturbs the target forward and is RE-CLAMPED
+        // to exactly the same legal band + offside cap as the group target, so it can only
+        // change where inside the legal line this defender eases to — never step it
+        // illegally ahead (playing a runner onside). `None` (model gated off / degenerate
+        // roster) ⇒ `0` ⇒ byte-identical to the group-only line.
+        let push = self.back_four_individual_push_delta(me).unwrap_or(0.0);
         // The flat trap is lifted while WE control (centre-backs split / full-backs
         // overlap), while a pass is in flight (offside already judged; lane-cutters
         // must be free to step), and when the offside law is suspended (a restart in
@@ -50221,7 +50369,9 @@ impl WorldSnapshot {
         // off deep in our own third: holding the flat 15yd line there is the point.
         let controls_ball = self.controlled_possession_team() == Some(me.team);
         if controls_ball || self.pending_pass.is_some() || self.offside_currently_suspended() {
-            return hold(clamped_fwd, None) * attack;
+            // No offside cap here (trap lifted) — the individual delta re-clamps to the band.
+            let adjusted = (clamped_fwd + push).clamp(deepest_fwd, shallowest_fwd);
+            return hold(adjusted, None) * attack;
         }
         let ahead_cap = centre_fwd + level_half_band;
         // While a carrier breaks through, the line must be free to DROP and cover, so
@@ -50231,7 +50381,10 @@ impl WorldSnapshot {
         } else {
             clamped_fwd.clamp(centre_fwd - level_half_band, ahead_cap)
         };
-        hold(leveled_fwd, Some(ahead_cap)) * attack
+        // Apply the individual delta, then re-clamp to the offside cap (never ahead) and no
+        // deeper than the own goal — a DROP always stays legal; a step-UP is capped flat.
+        let adjusted = (leveled_fwd + push).clamp(deepest_fwd, ahead_cap);
+        hold(adjusted, Some(ahead_cap)) * attack
     }
 
     /// Clamp a defender's target forward-position to the hard back-four line band so the four stay
