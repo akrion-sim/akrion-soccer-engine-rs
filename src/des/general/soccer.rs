@@ -1336,6 +1336,13 @@ const OFFSIDE_DISTANCE_PENALTY_PER_YARD: f64 = 0.25;
 const OFFSIDE_LINGER_PENALTY_CAP_SECONDS: f64 = 6.0;
 const OFFSIDE_DISTANCE_PENALTY_CAP_YARDS: f64 = 25.0;
 const OFFSIDE_RECOVERY_REWARD: f64 = 1.0;
+// Offside INFRACTION penalty (distinct from the positional lingering penalty above): the sparse
+// cost of actually being flagged offside when the ball is played — a mistimed run that killed the
+// move and gave the ball away. The flagged runner takes the primary hit; the passer who fed them
+// offside a small discounted share. Bounded, comparable to an opponent-half giveaway. Only charged
+// when `DD_SOCCER_ENABLE_OFFSIDE_INFRACTION_PENALTY` is on (see `call_offside`).
+const OFFSIDE_INFRACTION_RUNNER_PENALTY_POINTS: f64 = 2.5;
+const OFFSIDE_INFRACTION_PASSER_PENALTY_SHARE: f64 = 0.3;
 // Center-backs must remain the last line: penalize a central defender for every
 // yard they advance ahead of their wing-backs, amplified when the ball is in the
 // attacking part of the field (so they stay the deepest two ~95% of the time).
