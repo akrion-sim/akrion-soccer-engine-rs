@@ -49519,6 +49519,81 @@ fn offside_geometry_uses_ball_second_last_defender_and_halfway_line() {
     assert_eq!(json["offsidePlayerY"], 108.0);
 }
 
+fn offside_infraction_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The offside INFRACTION penalty (gated, default-OFF): when a runner is flagged offside as the
+/// ball is played, `call_offside` charges the flagged runner the primary penalty and the passer a
+/// small discounted share — the sparse whistle-moment stick that pairs with the onside-timing /
+/// slip-break rewards. With the gate off no such reward events are emitted (byte-identical).
+#[test]
+fn offside_infraction_penalty_charges_runner_and_discounted_passer() {
+    let _env = offside_infraction_env_lock();
+    std::env::remove_var("DD_SOCCER_ENABLE_OFFSIDE_INFRACTION_PENALTY");
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    sim.players[5].position = Vec2::new(40.0, 70.0);
+    sim.players[9].position = Vec2::new(40.0, 108.0);
+    for away in 11..22 {
+        sim.players[away].position = Vec2::new(8.0 + away as f64, 82.0);
+    }
+    sim.players[11].position = Vec2::new(40.0, 118.0);
+    sim.players[12].position = Vec2::new(42.0, 96.0);
+    sim.ball.position = sim.players[5].position;
+    sim.ball.holder = Some(5);
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let offside = snapshot
+        .pending_offside_for_pass(5, 9)
+        .expect("runner should be offside");
+    assert_eq!(offside.passer, 5);
+    assert_eq!(offside.target, 9);
+
+    // Gate OFF ⇒ no infraction reward events (only the restart/bookkeeping runs).
+    let before_off = sim.reward_events.len();
+    sim.call_offside(offside.clone());
+    assert!(
+        sim.reward_events[before_off..]
+            .iter()
+            .all(|event| event.kind != SoccerRewardEventKind::OffsideInfraction),
+        "gate off must emit no OffsideInfraction events"
+    );
+
+    // Gate ON ⇒ runner takes the primary hit, passer the discounted share.
+    std::env::set_var("DD_SOCCER_ENABLE_OFFSIDE_INFRACTION_PENALTY", "1");
+    let before_on = sim.reward_events.len();
+    sim.call_offside(offside);
+    std::env::remove_var("DD_SOCCER_ENABLE_OFFSIDE_INFRACTION_PENALTY");
+
+    let runner_pen: f64 = sim.reward_events[before_on..]
+        .iter()
+        .filter(|event| {
+            event.kind == SoccerRewardEventKind::OffsideInfraction && event.player_id == 9
+        })
+        .map(|event| event.amount)
+        .sum();
+    let passer_pen: f64 = sim.reward_events[before_on..]
+        .iter()
+        .filter(|event| {
+            event.kind == SoccerRewardEventKind::OffsideInfraction && event.player_id == 5
+        })
+        .map(|event| event.amount)
+        .sum();
+    assert!(
+        runner_pen < 0.0 && passer_pen < 0.0,
+        "both the flagged runner and the feeding passer must be charged: runner={runner_pen} passer={passer_pen}"
+    );
+    assert!(
+        runner_pen < passer_pen,
+        "the flagged runner must bear a heavier penalty than the passer: runner={runner_pen} passer={passer_pen}"
+    );
+    assert!(
+        (passer_pen - runner_pen * OFFSIDE_INFRACTION_PASSER_PENALTY_SHARE).abs() < 1e-6,
+        "passer share must be exactly the discounted fraction of the runner penalty: \
+         runner={runner_pen} passer={passer_pen}"
+    );
+}
+
 // Empirical proof of the law against the real rule function: across hundreds of
 // thousands of randomized whole-pitch configurations, `pending_offside_for_pass`
 // (the single chokepoint every enforcement path funnels through) must NEVER flag
