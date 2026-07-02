@@ -3619,7 +3619,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             env_usize("SOCCER_ANCHOR_PROMOTION_GATE_INTERVAL_WRITES", 1)?.max(1);
         let mut thresholds = PromotionThresholds::default();
         // We play exactly `games` fixtures, so require the full slate as evidence.
-        thresholds.min_games = games;
+        thresholds.min_games = games as u32;
         thresholds.wilson_floor = env_f64(
             "SOCCER_ANCHOR_PROMOTION_GATE_WILSON_FLOOR",
             thresholds.wilson_floor,
