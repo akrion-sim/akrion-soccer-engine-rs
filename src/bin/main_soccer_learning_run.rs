@@ -6389,4 +6389,93 @@ mod tests {
         assert!(default_disk_learning_artifacts_enabled(false));
         assert!(!default_disk_learning_artifacts_enabled(true));
     }
+
+    fn anchor_gate_config(enabled: bool) -> AnchorPromotionGateConfig {
+        let mut thresholds = PromotionThresholds::default();
+        thresholds.min_games = 8;
+        AnchorPromotionGateConfig {
+            enabled,
+            games: 8,
+            minutes: 2.0,
+            interval_writes: 1,
+            thresholds,
+            seed_base: 0xE7A1_0000,
+        }
+    }
+
+    #[test]
+    fn anchor_gate_disabled_is_a_no_op() {
+        let cfg = anchor_gate_config(false);
+        let mut anchor = None;
+        let mut runner = None;
+        let mut index = 0usize;
+        let status = apply_anchor_promotion_gate(
+            &cfg,
+            SOCCER_POLICY_STATUS_ACTIVE,
+            true,
+            None,
+            &mut anchor,
+            &mut runner,
+            &mut index,
+            0,
+            "test",
+        );
+        assert_eq!(status, SOCCER_POLICY_STATUS_ACTIVE);
+        assert!(anchor.is_none(), "disabled gate must not touch the anchor");
+        assert_eq!(index, 0, "disabled gate must not consume the write cadence");
+    }
+
+    #[test]
+    fn anchor_gate_only_applies_to_active_promotions() {
+        let cfg = anchor_gate_config(true);
+        let mut anchor = None;
+        let mut runner = None;
+        let mut index = 0usize;
+        // An already-archived candidate is never resurrected or gate-evaluated.
+        let status = apply_anchor_promotion_gate(
+            &cfg,
+            SOCCER_POLICY_STATUS_ARCHIVED,
+            true,
+            None,
+            &mut anchor,
+            &mut runner,
+            &mut index,
+            0,
+            "test",
+        );
+        assert_eq!(status, SOCCER_POLICY_STATUS_ARCHIVED);
+        assert!(anchor.is_none());
+    }
+
+    #[test]
+    fn anchor_gate_bootstraps_first_anchor_without_playing() {
+        let cfg = anchor_gate_config(true);
+        let candidate = SoccerNeuralNetworkSnapshot::default();
+        let mut anchor = None;
+        // `runner` stays None: bootstrap must not build a match runner or play games.
+        let mut runner = None;
+        let mut index = 0usize;
+        let status = apply_anchor_promotion_gate(
+            &cfg,
+            SOCCER_POLICY_STATUS_ACTIVE,
+            true,
+            Some(&candidate),
+            &mut anchor,
+            &mut runner,
+            &mut index,
+            0,
+            "test",
+        );
+        assert_eq!(status, SOCCER_POLICY_STATUS_ACTIVE);
+        assert!(anchor.is_some(), "bootstrap sets the first frozen anchor");
+        assert!(runner.is_none(), "bootstrap must not play any fixtures");
+    }
+
+    #[test]
+    fn anchor_gate_verdict_is_none_without_neural_brains() {
+        let cfg = anchor_gate_config(true);
+        let mut runner = EngineMatchRunner::with_defaults();
+        // No neural snapshot on either side ⇒ nothing to compare ⇒ never block.
+        assert!(anchor_promotion_gate_verdict(&mut runner, None, None, &cfg, 0).is_none());
+    }
 }
