@@ -2045,6 +2045,82 @@ fn anchor_promotion_gate_verdict(
     ))
 }
 
+/// Apply the frozen-anchor gate to a candidate about to be written with `base_status`.
+/// Returns the status to actually persist: unchanged when the gate is disabled, not a
+/// promotion, not due this write, or cannot compare; downgraded to `archived` when the
+/// candidate fails to beat the anchor. On a passing verdict (or the bootstrap write
+/// that sets the first anchor) the anchor advances to the candidate — so the anchor
+/// can only move forward by being beaten, giving a real monotonic ratchet.
+#[allow(clippy::too_many_arguments)]
+fn apply_anchor_promotion_gate(
+    cfg: &AnchorPromotionGateConfig,
+    base_status: &'static str,
+    should_write: bool,
+    candidate_neural: Option<&SoccerNeuralNetworkSnapshot>,
+    anchor_neural: &mut Option<SoccerNeuralNetworkSnapshot>,
+    runner: &mut Option<EngineMatchRunner>,
+    write_index: &mut usize,
+    seed_salt: u32,
+    context_label: &str,
+) -> &'static str {
+    if !cfg.enabled || !should_write || base_status != SOCCER_POLICY_STATUS_ACTIVE {
+        return base_status;
+    }
+    *write_index = write_index.wrapping_add(1);
+    if *write_index % cfg.interval_writes != 0 {
+        // Not due this write; keep the base gate's decision (bounded gate cost).
+        return base_status;
+    }
+    if anchor_neural.is_none() {
+        // Bootstrap: nothing to beat yet — accept and set the first frozen anchor.
+        *anchor_neural = candidate_neural.cloned();
+        if anchor_neural.is_some() {
+            println!("anchor_gate_bootstrap {context_label}");
+        }
+        return base_status;
+    }
+    let runner = runner.get_or_insert_with(|| {
+        let mut runner_config = EngineMatchRunnerConfig::default();
+        runner_config.base.duration_seconds = cfg.minutes * 60.0;
+        EngineMatchRunner::new(runner_config)
+    });
+    match anchor_promotion_gate_verdict(
+        runner,
+        candidate_neural,
+        anchor_neural.as_ref(),
+        cfg,
+        seed_salt,
+    ) {
+        Some(verdict) if verdict.promote => {
+            *anchor_neural = candidate_neural.cloned();
+            println!(
+                "anchor_gate_promote {context_label} record={}W-{}D-{}L wilson={:.3} elo_delta={:+.1} mean_payoff={:.3}",
+                verdict.record.wins,
+                verdict.record.draws,
+                verdict.record.losses,
+                verdict.wilson_lower_bound,
+                verdict.elo_delta,
+                verdict.mean_payoff_vs_field.unwrap_or(0.0),
+            );
+            base_status
+        }
+        Some(verdict) => {
+            println!(
+                "anchor_gate_blocked {context_label} record={}W-{}D-{}L wilson={:.3} elo_delta={:+.1} reasons={}",
+                verdict.record.wins,
+                verdict.record.draws,
+                verdict.record.losses,
+                verdict.wilson_lower_bound,
+                verdict.elo_delta,
+                verdict.reasons.join("|"),
+            );
+            SOCCER_POLICY_STATUS_ARCHIVED
+        }
+        // No verdict (e.g. neural disabled, so nothing to compare) — never block.
+        None => base_status,
+    }
+}
+
 /// In-memory back-four line-depth head, carried + trained across games WITHIN a
 /// learner process (parallel_games=1), so it accumulates and the back-four line
 /// consumes it live once trained. Resets on pod restart — cross-restart Postgres
