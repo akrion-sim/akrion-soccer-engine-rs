@@ -490,6 +490,19 @@ pub struct RewardTunables {
     pub concede_keeper_defender_penalty: f64,
     /// Penalty when conceding, for an outfield non-defender. Was `2.0`.
     pub concede_outfield_penalty: f64,
+    /// Concede penalty for a goalkeeper/defender when the **concede-symmetry rebalance** is
+    /// active (`DD_SOCCER_ENABLE_CONCEDE_SYMMETRY`). Moves the concede *stick* up toward the
+    /// `goal_scored_points` *carrot* so conceding is a genuine counterweight to scoring rather
+    /// than a token cost (default 8.0 is ~12× lighter than a +100 goal). Unused unless the gate
+    /// is on. Default `100.0` — full parity with a goal for the back line most responsible for
+    /// preventing one.
+    pub concede_keeper_defender_penalty_symmetric: f64,
+    /// Concede penalty for an outfield non-defender under the concede-symmetry rebalance:
+    /// meaningful but below the back line's share (an outfielder is less responsible for a
+    /// concede, mirroring how the back line is less responsible for a goal — the goal carrot is
+    /// flat team-wide, so the concede stick keeps a role gradient). Unused unless
+    /// `DD_SOCCER_ENABLE_CONCEDE_SYMMETRY` is on. Default `60.0`.
+    pub concede_outfield_penalty_symmetric: f64,
     /// Shaping reward for easing out of a sustained teammate overlap. Was the
     /// `TEAMMATE_SPACING_OVERLAP_RELIEF_REWARD` const.
     pub teammate_overlap_relief_reward: f64,
@@ -524,6 +537,21 @@ pub struct RewardTunables {
     /// Flat penalty for losing the ball into a loose/contested state from the
     /// OPPONENT's half. Was the inline `0.55`.
     pub giveaway_to_loose_opp_half_penalty: f64,
+    /// Per-second magnitude of the **both-teams loose-ball contest pressure**
+    /// penalty: charged to every outfield player on BOTH teams for each tick an
+    /// unpossessed ball is left uncontested beyond the grace, so standing off a
+    /// loose ball is never free for either side. Symmetric across teams, so it
+    /// biases only the urgency of contesting, not the match outcome. Gated by
+    /// `DD_SOCCER_ENABLE_LOOSE_BALL_CONTEST_PRESSURE` (default-on).
+    pub loose_ball_uncontested_penalty_per_second: f64,
+    /// Cap (points) on the per-tick loose-ball uncontested-time penalty, so a ball
+    /// left sitting can't runaway-dominate the sparse signal.
+    pub loose_ball_uncontested_penalty_max: f64,
+    /// Reward for **winning the unclaimed/loose ball** — the actor's team takes
+    /// controlled possession of a previously-unheld ball. Scaled up the longer the
+    /// ball had gone uncontested (winning a genuinely loose ball is decisive) and
+    /// down for a teammate who forced it loose but did not personally secure it.
+    pub loose_ball_win_points: f64,
     /// Scale on the dense **territorial pitch-control × expected-threat** delta
     /// reward (see [`crate::des::general::soccer::pitch_value`]). Multiplies the
     /// net change in the acting team's controlled threat between the before/after
@@ -546,6 +574,8 @@ impl Default for RewardTunables {
             goal_scored_points: 100.0,
             concede_keeper_defender_penalty: 8.0,
             concede_outfield_penalty: 2.0,
+            concede_keeper_defender_penalty_symmetric: 100.0,
+            concede_outfield_penalty_symmetric: 60.0,
             teammate_overlap_relief_reward: 0.06,
             teammate_overlap_camp_penalty: 0.03,
             center_back_ahead_of_wingback_penalty_per_yard: 0.11,
@@ -555,6 +585,9 @@ impl Default for RewardTunables {
             giveaway_to_opponent_opp_half_penalty: 2.2,
             giveaway_to_loose_own_half_penalty: 0.85,
             giveaway_to_loose_opp_half_penalty: 0.55,
+            loose_ball_uncontested_penalty_per_second: 0.30,
+            loose_ball_uncontested_penalty_max: 1.2,
+            loose_ball_win_points: 1.5,
             pitch_value_threat_delta_points: 12.0,
             dense_shaping_budget_points: 12.0,
         }
@@ -2947,6 +2980,24 @@ impl RewardTunables {
             25.0,
         );
         sanitize_f64(
+            "reward.concede_keeper_defender_penalty_symmetric",
+            &mut self.concede_keeper_defender_penalty_symmetric,
+            default.concede_keeper_defender_penalty_symmetric,
+            0.0,
+            250.0,
+            0.0,
+            150.0,
+        );
+        sanitize_f64(
+            "reward.concede_outfield_penalty_symmetric",
+            &mut self.concede_outfield_penalty_symmetric,
+            default.concede_outfield_penalty_symmetric,
+            0.0,
+            250.0,
+            0.0,
+            150.0,
+        );
+        sanitize_f64(
             "reward.teammate_overlap_relief_reward",
             &mut self.teammate_overlap_relief_reward,
             default.teammate_overlap_relief_reward,
@@ -3022,6 +3073,33 @@ impl RewardTunables {
             "reward.giveaway_to_loose_opp_half_penalty",
             &mut self.giveaway_to_loose_opp_half_penalty,
             default.giveaway_to_loose_opp_half_penalty,
+            0.0,
+            200.0,
+            0.0,
+            25.0,
+        );
+        sanitize_f64(
+            "reward.loose_ball_uncontested_penalty_per_second",
+            &mut self.loose_ball_uncontested_penalty_per_second,
+            default.loose_ball_uncontested_penalty_per_second,
+            0.0,
+            50.0,
+            0.0,
+            10.0,
+        );
+        sanitize_f64(
+            "reward.loose_ball_uncontested_penalty_max",
+            &mut self.loose_ball_uncontested_penalty_max,
+            default.loose_ball_uncontested_penalty_max,
+            0.0,
+            100.0,
+            0.0,
+            20.0,
+        );
+        sanitize_f64(
+            "reward.loose_ball_win_points",
+            &mut self.loose_ball_win_points,
+            default.loose_ball_win_points,
             0.0,
             200.0,
             0.0,
@@ -3140,6 +3218,30 @@ impl RewardTunables {
             prefix,
             "giveaway_to_loose_opp_half_penalty",
             self.giveaway_to_loose_opp_half_penalty,
+            0.0,
+            200.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "loose_ball_uncontested_penalty_per_second",
+            self.loose_ball_uncontested_penalty_per_second,
+            0.0,
+            50.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "loose_ball_uncontested_penalty_max",
+            self.loose_ball_uncontested_penalty_max,
+            0.0,
+            100.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "loose_ball_win_points",
+            self.loose_ball_win_points,
             0.0,
             200.0,
             errors,
