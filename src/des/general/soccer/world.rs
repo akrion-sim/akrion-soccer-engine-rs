@@ -25403,6 +25403,7 @@ impl WorldSnapshot {
             keeper_commit_bias: [0.0, 0.0],
             ranked_floor_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             ranked_aerial_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            pass_target_quality_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             support_decision_feature_cache: std::cell::RefCell::new(
                 std::collections::HashMap::new(),
             ),
