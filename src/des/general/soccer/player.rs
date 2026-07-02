@@ -9910,39 +9910,19 @@ impl PlayerAgent {
                 (target, scoop_chance)
             });
             if let Some((_, scoop_chance)) = scoop_pass_option {
-                // Completion gate: a scoop scored from TECHNIQUE alone (and floored below) wins a
-                // majority share even into a covered lane — the live "pass straight to the
-                // opponent". Scale BOTH the propensity and the floor by how likely the lofted ball
-                // actually reaches the target (aerial completion × open flight lane). A good chip
-                // keeps ~full weight; a giveaway collapses so a carry / square ball wins instead.
-                // Off (`DD_SOCCER_ENABLE_SCOOP_COMPLETION_GATE=0`) ⇒ technique-only (byte-identical).
-                let scoop_completion_gate = dd_soccer_enable_scoop_completion_gate();
-                let scoop_viability = if scoop_completion_gate {
-                    scoop_completion_viability(&observation)
-                } else {
-                    1.0
-                };
                 action_options.push(AgentActionOptionTrace::new(
                     "scoop-pass",
-                    scoop_chance * scoop_viability,
+                    scoop_chance,
                     true,
                 ));
                 if scoop_strategy_requested {
-                    ensure_min_legal_option_probability(
-                        &mut action_options,
-                        "scoop-pass",
-                        0.64 * scoop_viability,
-                    );
+                    ensure_min_legal_option_probability(&mut action_options, "scoop-pass", 0.64);
                 } else if dd_soccer_enable_scoop_lane_blocked() {
                     // Live-frequency bias: a scoop is only ever offered into a genuinely blocked
                     // lane to an open man (every geometry check in `scoop_pass_target_for` passed),
                     // so floor its propensity enough to compete with a carry / square ball instead
                     // of being buried by the policy. Off ⇒ unchanged (technique-scored only).
-                    ensure_min_legal_option_probability(
-                        &mut action_options,
-                        "scoop-pass",
-                        0.52 * scoop_viability,
-                    );
+                    ensure_min_legal_option_probability(&mut action_options, "scoop-pass", 0.52);
                 }
             }
             let wall_pass_option = snapshot.wall_pass_option_for(self.id).map(|plan| {
