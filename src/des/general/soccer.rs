@@ -19287,6 +19287,7 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::HeaderGoalFromCross
                 | SoccerRewardEventKind::CrashBoxArrival
                 | SoccerRewardEventKind::CrashBoxNoShow
+                | SoccerRewardEventKind::OffsideInfraction
                 | SoccerRewardEventKind::IsolatedCarrierPanicBackPass
                 | SoccerRewardEventKind::SustainedForwardDribble
                 | SoccerRewardEventKind::UnpressuredBackwardPass
