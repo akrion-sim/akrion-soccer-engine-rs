@@ -10614,7 +10614,10 @@ impl SoccerMatch {
         interceptor: usize,
         intercepted_pass: Option<&PendingPass>,
     ) {
-        self.record_reward_event(interceptor, 10.0);
+        // Winning the ball via interception is a steal too — scale it up inside either box.
+        let intercept_reward =
+            self.steal_reward_scaled_for_box(10.0, self.players[interceptor].position);
+        self.record_reward_event(interceptor, intercept_reward);
         if let Some(pass) = intercepted_pass {
             let penalty = intercepted_pass_passer_penalty(pass, self.config.field_length_yards);
             // Spread discounted blame over the PREVIOUS passers BEFORE the interceptor's touch
