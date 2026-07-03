@@ -10593,12 +10593,31 @@ impl SoccerMatch {
         );
     }
 
+    /// A ball-winning reward scaled UP when the ball is won inside EITHER 18-yard box: winning it
+    /// in our defensive box snuffs a near-certain chance, and winning it in the attacking box is a
+    /// chance created. Trains defenders (and attackers) to attack the ball in both boxes instead
+    /// of standing off. `position` is where the ball was won.
+    fn steal_reward_scaled_for_box(&self, base: f64, position: Vec2) -> f64 {
+        if soccer_point_in_either_penalty_area(
+            position,
+            self.config.field_width_yards,
+            self.config.field_length_yards,
+        ) {
+            base * STEAL_IN_BOX_REWARD_MULTIPLIER
+        } else {
+            base
+        }
+    }
+
     pub(crate) fn record_interception_reward(
         &mut self,
         interceptor: usize,
         intercepted_pass: Option<&PendingPass>,
     ) {
-        self.record_reward_event(interceptor, 10.0);
+        // Winning the ball via interception is a steal too — scale it up inside either box.
+        let intercept_reward =
+            self.steal_reward_scaled_for_box(10.0, self.players[interceptor].position);
+        self.record_reward_event(interceptor, intercept_reward);
         if let Some(pass) = intercepted_pass {
             let penalty = intercepted_pass_passer_penalty(pass, self.config.field_length_yards);
             // Spread discounted blame over the PREVIOUS passers BEFORE the interceptor's touch
@@ -10652,7 +10671,9 @@ impl SoccerMatch {
         if !has_teammate || !has_opponent {
             return;
         }
-        self.record_reward_event(winner, WON_FIFTY_FIFTY_DUEL_REWARD_POINTS);
+        let duel_reward =
+            self.steal_reward_scaled_for_box(WON_FIFTY_FIFTY_DUEL_REWARD_POINTS, self.ball.position);
+        self.record_reward_event(winner, duel_reward);
         for (player_id, team) in contenders {
             if team != winner_team {
                 self.record_reward_event(player_id, -LOST_FIFTY_FIFTY_DUEL_PENALTY_POINTS);
@@ -12960,9 +12981,11 @@ impl SoccerMatch {
         self.pending_pass = None;
         self.pending_shot = None;
         self.mark_ball_received(defender_id);
+        let dispossession_reward =
+            self.steal_reward_scaled_for_box(DEFENSIVE_DISPOSSESSION_REWARD_POINTS, self.ball.position);
         self.record_reward_event_with_kind(
             defender_id,
-            DEFENSIVE_DISPOSSESSION_REWARD_POINTS,
+            dispossession_reward,
             SoccerRewardEventKind::DefensiveDispossession,
         );
         self.record_possession_touch(defender_id);

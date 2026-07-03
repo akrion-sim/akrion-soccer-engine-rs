@@ -669,7 +669,11 @@ const CARRIER_CHANNEL_PRESS_START_YARDS: f64 = 40.0;
 const CARRIER_CHANNEL_PRESS_FULL_YARDS: f64 = 15.0;
 const CARRIER_CHANNEL_JOCKEY_YARDS: f64 = 2.2;
 const CARRIER_CHANNEL_SIDE_BLOCK_YARDS: f64 = 1.6;
-const CARRIER_CHANNEL_STEPUP_FRACTION: f64 = 0.62;
+// Raised 0.62→0.85: the back four (CBs + full-backs) were backing off too much as an opponent
+// dribbled 40→20yd from goal, only engaging near the 15. Step the pressing defender up MUCH
+// closer through the whole channel window so the carrier is contested in the danger zone rather
+// than escorted to the edge of the box. (Pairs with the box-scaled steal reward that trains it.)
+const CARRIER_CHANNEL_STEPUP_FRACTION: f64 = 0.85;
 const CARRIER_CHANNEL_DOUBLE_TEAM_PRESS_MIN: f64 = 0.40;
 const CARRIER_CHANNEL_WIDE_TRAP_FRACTION: f64 = 0.42;
 /// Depth-scaled pressing aggression in our own defensive third. The closer an
@@ -682,7 +686,7 @@ const CARRIER_CHANNEL_WIDE_TRAP_FRACTION: f64 = 0.42;
 /// byte-identical to the contain baseline.
 const OWN_GOAL_PRESS_FULL_YARDS: f64 = 6.0; // at/inside this depth from our goal ⇒ full urgency.
 const OWN_GOAL_PRESS_SPEED_RELAX: f64 = 0.9; // deep ⇒ relax the engage speed threshold by up to 90%.
-const OWN_GOAL_PRESS_MIN_BOOST: f64 = 0.15; // deep lone defender crosses the 1.0 step-up trigger even vs a slow dribble.
+const OWN_GOAL_PRESS_MIN_BOOST: f64 = 0.35; // raised 0.15→0.35: lone defender steps up to press an advancing carrier well before the 6-yard box, not only deep.
                                             // --- Defensive shepherding / "show one way" (gated, default OFF = byte-identical) ---
                                             // Real defending of a 1v1 as the carrier drives from ~40 to ~15yd out is not a square
                                             // retreat: the pressing defender approaches on a CURVED angle so their body sits on the
@@ -1227,14 +1231,21 @@ const SHOT_OFF_TARGET_REWARD_POINTS: f64 = 10.0;
 const SHOT_OFF_TARGET_FORGIVENESS_YARDS: f64 = 0.5;
 const SHOT_OFF_TARGET_PENALTY_PER_YARD: f64 = 0.6;
 const SHOT_OFF_TARGET_MAX_PENALTY_POINTS: f64 = 3.0;
-const COMPLETED_FORWARD_PASS_BASE_REWARD_OWN_HALF: f64 = 9.5;
-const COMPLETED_FORWARD_PASS_BASE_REWARD_OPPONENT_HALF: f64 = 12.0;
+// Base reward for a completed forward pass. Deliberately kept WELL BELOW the shot-on-target
+// (40) and goal (100) rewards so that a string of successive forward passes can never out-earn
+// shooting/scoring — otherwise "pass in succession forever" becomes the optimal POMDP policy.
+// A ~5-pass forward sequence now tops out ~30 pts < shot 40 < goal 100. Passes that actually
+// LEAD to a shot/goal are still credited richly via GOAL_CHAIN_REWARD_PATTERN / the shot pattern.
+const COMPLETED_FORWARD_PASS_BASE_REWARD_OWN_HALF: f64 = 3.0;
+const COMPLETED_FORWARD_PASS_BASE_REWARD_OPPONENT_HALF: f64 = 4.0;
 const COMPLETED_FORWARD_PASS_PROGRESS_REWARD_PER_YARD: f64 = 0.24;
 const COMPLETED_FORWARD_PASS_PROGRESS_REWARD_MAX_YARDS: f64 = 30.0;
 const COMPLETED_FLANK_PASS_BONUS_POINTS: f64 = 2.4;
 const COMPLETED_FLANK_PASS_OWN_HALF_MULTIPLIER: f64 = 1.55;
 const OWN_HALF_FLANK_TACTICAL_REWARD_MULTIPLIER: f64 = 1.35;
-const COMPLETED_FIRST_TIME_SHORT_FORWARD_PASS_BONUS_POINTS: f64 = 3.4;
+// Raised 3.4→7.0: a first-touch/quick forward pass is exactly the fast, progressive ball we want
+// the policy to prefer over holding or dribbling — reward it well above a plain completed pass (4).
+const COMPLETED_FIRST_TIME_SHORT_FORWARD_PASS_BONUS_POINTS: f64 = 7.0;
 const FIRST_TIME_SHORT_FORWARD_PASS_MIN_PROGRESS_YARDS: f64 = 1.25;
 const FIRST_TIME_SHORT_FORWARD_PASS_MIN_YARDS: f64 = 5.47;
 const FIRST_TIME_SHORT_FORWARD_PASS_IDEAL_MAX_YARDS: f64 = 8.75;
@@ -1802,6 +1813,12 @@ const DEFENSIVE_CLEAR_AND_HOLD_SECOND_SECONDS: f64 = 10.0;
 const DEFENSIVE_CLEAR_AND_HOLD_FIRST_REWARD_POINTS: f64 = 10.0;
 const DEFENSIVE_CLEAR_AND_HOLD_SECOND_REWARD_POINTS: f64 = 20.0;
 const DEFENSIVE_DISPOSSESSION_REWARD_POINTS: f64 = 10.0;
+// Winning the ball inside EITHER 18-yard box is worth much more than a midfield steal: in our
+// defensive box it snuffs a near-certain chance; in the attacking box the steal IS a chance. So
+// the dispossession / 50-50 / loose-ball reward is multiplied by this when the ball is won inside
+// a box — training defenders (and attackers) to attack the ball hard in both boxes rather than
+// stand off. (User rule: steal rewards higher in the 18yd box, both offense and defense.)
+const STEAL_IN_BOX_REWARD_MULTIPLIER: f64 = 2.5;
 // While the back line is defending, train it mostly on LP/IPM position quality.
 // Ball-winning stays positive, but no longer dominates the shape gradient.
 const DEFENSIVE_POSITIONING_FOCUS_CHASE_REWARD_MULTIPLIER: f64 = 0.42;
@@ -2042,8 +2059,10 @@ const SHOT_ON_TARGET_REWARD_PATTERN: [f64; 10] =
     [12.0, 9.0, 6.0, 4.0, 3.0, 2.0, 1.5, 1.0, 0.8, 0.7];
 const PASS_CHAIN_HISTORY_LIMIT: usize = 8;
 const PASS_CHAIN_MAX_CONTINUATION_SECONDS: f64 = 12.0;
-const PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS: f64 = 7.5;
-const PASS_CHAIN_THREE_NET_FORWARD_EVENT_REWARD_POINTS: f64 = 10.0;
+// Pass-chain event bonuses trimmed (7.5→2.5, 10→3.5) for the same reason as the forward-pass
+// base above: successive passing must stay a build-up MEANS, not an end that rivals a shot/goal.
+const PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS: f64 = 2.5;
+const PASS_CHAIN_THREE_NET_FORWARD_EVENT_REWARD_POINTS: f64 = 3.5;
 /// Penalty (points, applied negative) for an isolated attacking carrier panicking a
 /// backward/square ball instead of driving at goal or holding it up — see
 /// [`SoccerRewardEventKind::IsolatedCarrierPanicBackPass`]. Comparable in magnitude to one
@@ -2069,13 +2088,23 @@ const TEAM_ADVANCE_REWARD_REFERENCE_YARDS: f64 = 4.0;
 /// Dense shaping reward for the CARRIER driving the ball forward into space while the team advances
 /// as a unit — the "take the space" signal. Comparable in magnitude to the other in-possession
 /// spacing shaping terms so it nudges without swamping the sparse goal/possession signal.
-const TEAM_ADVANCE_CARRIER_DRIVE_REWARD: f64 = 0.30;
+// Raised 0.30→0.60 (carrier) / 0.22→0.45 (support run): advancing the ball/team upfield was
+// under-rewarded vs the large turnover/backward/hold penalties, leaving the policy timid. Doubling
+// the positive advancement terms restores brave forward play. These are per-agent rewards so they
+// also feed the MARL/MAPPO team component (team-avg reward delta) — the whole team shares the credit.
+const TEAM_ADVANCE_CARRIER_DRIVE_REWARD: f64 = 0.60;
 /// Dense shaping penalty for the carrier wasting the same team-advance cue by stalling or moving
 /// the ball backward. This is the stick paired with the carrier-drive carrot above.
 const TEAM_ADVANCE_CARRIER_STALL_PENALTY: f64 = 0.24;
 /// Dense shaping reward for an OFF-BALL teammate making a forward supporting run while the team
 /// advances upfield — the "whole team moves forward" signal that pulls runners up with the ball.
-const TEAM_ADVANCE_SUPPORT_RUN_REWARD: f64 = 0.22;
+const TEAM_ADVANCE_SUPPORT_RUN_REWARD: f64 = 0.45;
+// Quick-release: a forward pass moved on within this many seconds of receiving earns a bonus that
+// is largest for an instant (first-touch) release and decays to zero by the cap — trains fast
+// forward ball movement over holding/dribbling. Per-agent ⇒ also shared via the MARL/MAPPO team component.
+const QUICK_RELEASE_MAX_HOLD_SECONDS: f64 = 1.2;
+const QUICK_RELEASE_FORWARD_REFERENCE_YARDS: f64 = 12.0;
+const QUICK_RELEASE_FORWARD_PASS_BONUS_POINTS: f64 = 5.0;
 /// Dense shaping penalty for an attacker who fails to join a live team-advance cue, retreats, or
 /// runs into an offside support lane. This mirrors the support-run reward without forcing defenders
 /// to abandon shape.
@@ -22284,21 +22313,43 @@ fn progressive_pass_escape_reward(pass: &PendingPass, end: Vec2) -> f64 {
     amount.clamp(0.0, PROGRESSIVE_PASS_REWARD_CAP)
 }
 
+/// Reward a FORWARD pass released quickly after receiving — largest for a first-touch/instant ball,
+/// decaying to zero by `QUICK_RELEASE_MAX_HOLD_SECONDS`, and scaled a little by how far forward it
+/// progresses. Pushes fast forward ball movement over holding/dribbling. `hold_seconds` is how long
+/// the passer had possessed the ball. Pure / RNG-free. Per-agent ⇒ shared via the MARL/MAPPO team
+/// component (team-average reward delta), so the whole team is credited for quick forward play.
+fn quick_release_forward_pass_reward(team: Team, origin: Vec2, target: Vec2, hold_seconds: f64) -> f64 {
+    let forward_yards = (target.y - origin.y) * team.attack_dir();
+    if forward_yards <= 1.25 || !hold_seconds.is_finite() || hold_seconds < 0.0 {
+        return 0.0;
+    }
+    let speed_fraction = (1.0 - hold_seconds / QUICK_RELEASE_MAX_HOLD_SECONDS).clamp(0.0, 1.0);
+    let forward_fraction = (forward_yards / QUICK_RELEASE_FORWARD_REFERENCE_YARDS).clamp(0.0, 1.0);
+    QUICK_RELEASE_FORWARD_PASS_BONUS_POINTS * speed_fraction * (0.5 + 0.5 * forward_fraction)
+}
+
+/// Forward-yards scale over which the intercepted-pass DIRECTION multiplier ramps from 1x (a pass
+/// this far forward) through 2x (square) to 3x (a pass this far backward). A backward giveaway is
+/// turned over facing our own goal, so it is punished up to 3x a forward one.
+const INTERCEPT_DIRECTION_REFERENCE_YARDS: f64 = 15.0;
+
 fn intercepted_pass_passer_penalty(pass: &PendingPass, field_length: f64) -> f64 {
-    let direction = pass_direction_bucket(pass.team, pass.origin, pass.intended_target);
     let own_half = pass_origin_in_own_half(pass.team, pass.origin, field_length);
-    // Giving the ball straight to an opponent must be strongly unlearned. The
-    // dominant term is receiver openness: a low-openness target means a defender
-    // was sitting in the lane, so the "pass" was effectively a gift.
-    let openness_cost = (1.0 - pass.receiver_openness.clamp(0.0, 1.0)) * 5.0;
-    let direction_cost = match direction {
-        PassDirectionBucket::Forward => 0.80,
-        PassDirectionBucket::Lateral => 1.35,
-        PassDirectionBucket::Backward => 2.10,
-    };
+    // Base severity of losing the ball to the opponent, BEFORE direction. Dominant term is
+    // receiver openness: a low-openness target means a defender was sitting in the lane, so the
+    // "pass" was effectively a gift. Own-half and risky aerial balls add to it.
+    let openness_cost = (1.0 - pass.receiver_openness.clamp(0.0, 1.0)) * 7.0;
     let own_half_cost = if own_half { 1.15 } else { 0.35 };
     let aerial_cost = if pass.flight.is_aerial() { 0.85 } else { 0.0 };
-    (3.0 + openness_cost + direction_cost + own_half_cost + aerial_cost).clamp(4.0, 13.0)
+    let base_penalty = (5.0 + openness_cost + own_half_cost + aerial_cost).clamp(6.0, 16.0);
+    // DIRECTION as a CONTINUOUS multiplier (user rule): a BACKWARD pass lost to the opponent is
+    // turned over facing our OWN goal, so it costs up to 3x a forward pass lost; a square ball 2x;
+    // a forward ball 1x. Scaled by the pass's forward YARDS — the further BACKWARD, the nearer 3x;
+    // the further FORWARD, the nearer 1x — ramping over ±`INTERCEPT_DIRECTION_REFERENCE_YARDS`.
+    let forward_yards = (pass.intended_target.y - pass.origin.y) * pass.team.attack_dir();
+    let forward_ratio = (forward_yards / INTERCEPT_DIRECTION_REFERENCE_YARDS).clamp(-1.0, 1.0);
+    let directional_multiplier = 2.0 - forward_ratio; // forward → 1.0, square → 2.0, backward → 3.0
+    (base_penalty * directional_multiplier).clamp(6.0, 40.0)
 }
 
 /// A pass is a "backheel" when its direction is substantially behind where the player
@@ -24511,6 +24562,12 @@ fn soccer_transition_reward_with_tactics(
                         target,
                         receiver_openness,
                         pass_into_stride_fit_for_context(&action_context, player.team),
+                    );
+                    reward += quick_release_forward_pass_reward(
+                        player.team,
+                        origin,
+                        target,
+                        before.ball_holder_possession_seconds,
                     );
                     reward += pass_and_move_forward_reward_from_parts(
                         player.team,
