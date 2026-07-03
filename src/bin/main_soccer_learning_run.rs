@@ -4064,7 +4064,6 @@ fn run() -> Result<(), Box<dyn Error>> {
         "SOCCER_POLICY_PROMOTION_RECALIBRATE_INCUMBENT_ON_RESUME",
         false,
     )?;
->>>>>>> 33f1ca69b56d074fef26bf8ebda6126af4b19696
     let neural_drain_timeout_ms = env_usize(
         "SOCCER_NEURAL_DRAIN_TIMEOUT_MS",
         DEFAULT_SOCCER_NEURAL_DRAIN_TIMEOUT_MS,
