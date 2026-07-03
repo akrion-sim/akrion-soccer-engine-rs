@@ -12962,9 +12962,11 @@ impl SoccerMatch {
         self.pending_pass = None;
         self.pending_shot = None;
         self.mark_ball_received(defender_id);
+        let dispossession_reward =
+            self.steal_reward_scaled_for_box(DEFENSIVE_DISPOSSESSION_REWARD_POINTS, self.ball.position);
         self.record_reward_event_with_kind(
             defender_id,
-            DEFENSIVE_DISPOSSESSION_REWARD_POINTS,
+            dispossession_reward,
             SoccerRewardEventKind::DefensiveDispossession,
         );
         self.record_possession_touch(defender_id);
