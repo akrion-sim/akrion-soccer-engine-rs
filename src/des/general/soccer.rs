@@ -22297,7 +22297,7 @@ fn intercepted_pass_passer_penalty(pass: &PendingPass, field_length: f64) -> f64
     // Giving the ball straight to an opponent must be strongly unlearned. The
     // dominant term is receiver openness: a low-openness target means a defender
     // was sitting in the lane, so the "pass" was effectively a gift.
-    let openness_cost = (1.0 - pass.receiver_openness.clamp(0.0, 1.0)) * 5.0;
+    let openness_cost = (1.0 - pass.receiver_openness.clamp(0.0, 1.0)) * 7.0;
     let direction_cost = match direction {
         PassDirectionBucket::Forward => 0.80,
         PassDirectionBucket::Lateral => 1.35,
@@ -22305,7 +22305,11 @@ fn intercepted_pass_passer_penalty(pass: &PendingPass, field_length: f64) -> f64
     };
     let own_half_cost = if own_half { 1.15 } else { 0.35 };
     let aerial_cost = if pass.flight.is_aerial() { 0.85 } else { 0.0 };
-    (3.0 + openness_cost + direction_cost + own_half_cost + aerial_cost).clamp(4.0, 13.0)
+    // Strengthened (base 3→5, openness ×5→×7, clamp [4,13]→[7,20]): giving the ball straight to
+    // the opponent must cost clearly MORE than a completed forward pass (+4) gains, so the policy
+    // stops playing risky passes that get intercepted. A blind gift into a sitting defender now
+    // costs up to 20; even a "clean" intercepted pass floors at 7. Interceptor still earns +10.
+    (5.0 + openness_cost + direction_cost + own_half_cost + aerial_cost).clamp(7.0, 20.0)
 }
 
 /// A pass is a "backheel" when its direction is substantially behind where the player
