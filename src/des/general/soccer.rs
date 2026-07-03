@@ -22313,6 +22313,21 @@ fn progressive_pass_escape_reward(pass: &PendingPass, end: Vec2) -> f64 {
     amount.clamp(0.0, PROGRESSIVE_PASS_REWARD_CAP)
 }
 
+/// Reward a FORWARD pass released quickly after receiving — largest for a first-touch/instant ball,
+/// decaying to zero by `QUICK_RELEASE_MAX_HOLD_SECONDS`, and scaled a little by how far forward it
+/// progresses. Pushes fast forward ball movement over holding/dribbling. `hold_seconds` is how long
+/// the passer had possessed the ball. Pure / RNG-free. Per-agent ⇒ shared via the MARL/MAPPO team
+/// component (team-average reward delta), so the whole team is credited for quick forward play.
+fn quick_release_forward_pass_reward(team: Team, origin: Vec2, target: Vec2, hold_seconds: f64) -> f64 {
+    let forward_yards = (target.y - origin.y) * team.attack_dir();
+    if forward_yards <= 1.25 || !hold_seconds.is_finite() || hold_seconds < 0.0 {
+        return 0.0;
+    }
+    let speed_fraction = (1.0 - hold_seconds / QUICK_RELEASE_MAX_HOLD_SECONDS).clamp(0.0, 1.0);
+    let forward_fraction = (forward_yards / QUICK_RELEASE_FORWARD_REFERENCE_YARDS).clamp(0.0, 1.0);
+    QUICK_RELEASE_FORWARD_PASS_BONUS_POINTS * speed_fraction * (0.5 + 0.5 * forward_fraction)
+}
+
 /// Forward-yards scale over which the intercepted-pass DIRECTION multiplier ramps from 1x (a pass
 /// this far forward) through 2x (square) to 3x (a pass this far backward). A backward giveaway is
 /// turned over facing our own goal, so it is punished up to 3x a forward one.
