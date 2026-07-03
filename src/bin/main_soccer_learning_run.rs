@@ -4697,7 +4697,6 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut anchor_neural_network = latest_neural_network.clone();
     let mut anchor_gate_runner: Option<EngineMatchRunner> = None;
     let mut anchor_gate_write_index: usize = 0;
-=======
     let policy_promotion_window_games =
         pg_policy_version_interval_games.max(policy_promotion_gate.min_sample_games);
     let mut policy_promotion_summaries =
