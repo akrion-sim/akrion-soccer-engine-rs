@@ -22302,32 +22302,22 @@ fn progressive_pass_escape_reward(pass: &PendingPass, end: Vec2) -> f64 {
 }
 
 fn intercepted_pass_passer_penalty(pass: &PendingPass, field_length: f64) -> f64 {
-    let direction = pass_direction_bucket(pass.team, pass.origin, pass.intended_target);
     let own_half = pass_origin_in_own_half(pass.team, pass.origin, field_length);
-    // Giving the ball straight to an opponent must be strongly unlearned. The
-    // dominant term is receiver openness: a low-openness target means a defender
-    // was sitting in the lane, so the "pass" was effectively a gift.
+    // Base severity of losing the ball to the opponent, BEFORE direction. Dominant term is
+    // receiver openness: a low-openness target means a defender was sitting in the lane, so the
+    // "pass" was effectively a gift. Own-half and risky aerial balls add to it.
     let openness_cost = (1.0 - pass.receiver_openness.clamp(0.0, 1.0)) * 7.0;
-    let direction_cost = match direction {
-        PassDirectionBucket::Forward => 0.80,
-        PassDirectionBucket::Lateral => 1.35,
-        PassDirectionBucket::Backward => 2.10,
-    };
     let own_half_cost = if own_half { 1.15 } else { 0.35 };
     let aerial_cost = if pass.flight.is_aerial() { 0.85 } else { 0.0 };
-    // Strengthened (base 3→5, openness ×5→×7, clamp [4,13]→[7,20]): giving the ball straight to
-    // the opponent must cost clearly MORE than a completed forward pass (+4) gains, so the policy
-    // stops playing risky passes that get intercepted. A blind gift into a sitting defender now
-    // costs up to 20; even a "clean" intercepted pass floors at 7. Interceptor still earns +10.
-    let base_penalty =
-        (5.0 + openness_cost + direction_cost + own_half_cost + aerial_cost).clamp(7.0, 20.0);
-    // A BACKWARD pass intercepted by the opponent is the worst giveaway — possession lost while
-    // facing our OWN goal — so DOUBLE the penalty (up to 40).
-    if matches!(direction, PassDirectionBucket::Backward) {
-        base_penalty * 2.0
-    } else {
-        base_penalty
-    }
+    let base_penalty = (5.0 + openness_cost + own_half_cost + aerial_cost).clamp(6.0, 16.0);
+    // DIRECTION as a CONTINUOUS multiplier (user rule): a BACKWARD pass lost to the opponent is
+    // turned over facing our OWN goal, so it costs up to 3x a forward pass lost; a square ball 2x;
+    // a forward ball 1x. Scaled by the pass's forward YARDS — the further BACKWARD, the nearer 3x;
+    // the further FORWARD, the nearer 1x — ramping over ±`INTERCEPT_DIRECTION_REFERENCE_YARDS`.
+    let forward_yards = (pass.intended_target.y - pass.origin.y) * pass.team.attack_dir();
+    let forward_ratio = (forward_yards / INTERCEPT_DIRECTION_REFERENCE_YARDS).clamp(-1.0, 1.0);
+    let directional_multiplier = 2.0 - forward_ratio; // forward → 1.0, square → 2.0, backward → 3.0
+    (base_penalty * directional_multiplier).clamp(6.0, 40.0)
 }
 
 /// A pass is a "backheel" when its direction is substantially behind where the player
