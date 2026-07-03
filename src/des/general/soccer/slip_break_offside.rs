@@ -176,10 +176,7 @@ pub(crate) fn slip_break_runner_in_staging_band(runner_yards_to_line: f64) -> bo
 /// spring the trap — moving *against* the attack — increases the advantage). This is the
 /// ball-holder's core recognition cue: a runner with a real pace advantage will beat the line into
 /// the space behind, so the slip is on. Zero when the runner has no edge. Pure.
-pub(crate) fn slip_break_speed_advantage(
-    runner_forward_yps: f64,
-    line_forward_yps: f64,
-) -> f64 {
+pub(crate) fn slip_break_speed_advantage(runner_forward_yps: f64, line_forward_yps: f64) -> f64 {
     let differential = runner_forward_yps - line_forward_yps;
     (differential / SLIP_BREAK_SPEED_ADVANTAGE_REFERENCE_YPS).clamp(0.0, 1.0)
 }

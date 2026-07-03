@@ -7,11 +7,11 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use soccer_engine::des::general::soccer::{
-    train_soccer_set_play_restarts_with_events, MatchConfig, SoccerNeuralBlendConfig,
-    SoccerMarlAlgorithm, SoccerNeuralBlendMode, SoccerNeuralLearningBackend,
-    SoccerNeuralLearningConfig, DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
-    SoccerNeuralNetworkSnapshot, SoccerQPolicyOptions, SoccerSetPlayRestartKind,
-    SoccerSetPlayTrainingEvent, SoccerSetPlayTrainingRequest, SoccerTeamQPolicies, Team, Vec2,
+    train_soccer_set_play_restarts_with_events, MatchConfig, SoccerMarlAlgorithm,
+    SoccerNeuralBlendConfig, SoccerNeuralBlendMode, SoccerNeuralLearningBackend,
+    SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot, SoccerQPolicyOptions,
+    SoccerSetPlayRestartKind, SoccerSetPlayTrainingEvent, SoccerSetPlayTrainingRequest,
+    SoccerTeamQPolicies, Team, Vec2, DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
 };
 use soccer_engine::des::soccer_learning::{
     soccer_neural_network_snapshot_fingerprint,
@@ -75,7 +75,9 @@ fn env_marl_algorithm(default: SoccerMarlAlgorithm) -> Result<SoccerMarlAlgorith
     };
     match value.to_ascii_lowercase().as_str() {
         "off" | "disabled" | "none" => Ok(SoccerMarlAlgorithm::Off),
-        "independent" | "independent-actor-critic" | "independent_actor_critic"
+        "independent"
+        | "independent-actor-critic"
+        | "independent_actor_critic"
         | "independentactorcritic" => Ok(SoccerMarlAlgorithm::IndependentActorCritic),
         "mappo" | "ppo" => Ok(SoccerMarlAlgorithm::Mappo),
         _ => Err(format!(

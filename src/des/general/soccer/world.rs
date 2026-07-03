@@ -11344,11 +11344,7 @@ impl SoccerMatch {
             tunables().reward.dense_shaping_budget_points,
         );
         for (id, _) in no_shows.into_iter().take(shortfall) {
-            self.record_reward_event_with_kind(
-                id,
-                -penalty,
-                SoccerRewardEventKind::CrashBoxNoShow,
-            );
+            self.record_reward_event_with_kind(id, -penalty, SoccerRewardEventKind::CrashBoxNoShow);
         }
     }
 
@@ -50528,9 +50524,12 @@ impl WorldSnapshot {
         // result is re-clamped to the legal `[own_goal, own_goal+max_depth]` band so the head
         // can never set an illegal line.
         if back_four_line_model_enabled() {
-            if let Some(model_centre_fwd) =
-                self.back_four_line_v2_model_centre_fwd(team, predicted_fwd, own_goal_fwd, max_depth)
-            {
+            if let Some(model_centre_fwd) = self.back_four_line_v2_model_centre_fwd(
+                team,
+                predicted_fwd,
+                own_goal_fwd,
+                max_depth,
+            ) {
                 let blend = BACK_FOUR_LINE_MODEL_BLEND.clamp(0.0, 1.0);
                 centre_fwd = (centre_fwd * (1.0 - blend) + model_centre_fwd * blend)
                     .clamp(own_goal_fwd, own_goal_fwd + max_depth);

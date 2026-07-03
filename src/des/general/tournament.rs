@@ -862,8 +862,8 @@ impl Tournament {
                 .map(|(position, &team_id)| {
                     let team = &self.teams[self.team_index(team_id)];
                     let tied_above = position > 0 && level_with(team_id, ranked[position - 1]);
-                    let tied_below = position + 1 < ranked.len()
-                        && level_with(team_id, ranked[position + 1]);
+                    let tied_below =
+                        position + 1 < ranked.len() && level_with(team_id, ranked[position + 1]);
                     GroupStanding {
                         team_id,
                         name: team.name.clone(),
@@ -1871,7 +1871,9 @@ mod tests {
                 7,
             )
             .unwrap();
-            tournament.run(&mut AllDrawsRunner).expect("tournament runs")
+            tournament
+                .run(&mut AllDrawsRunner)
+                .expect("tournament runs")
         };
         let report = run_once();
 
@@ -1914,7 +1916,9 @@ mod tests {
             11,
         )
         .unwrap();
-        let report = tournament.run(&mut AllDrawsRunner).expect("tournament runs");
+        let report = tournament
+            .run(&mut AllDrawsRunner)
+            .expect("tournament runs");
 
         // Exactly one champion, distinct runner-up and third place.
         assert!(report.team(report.champion_id).is_some());
@@ -1928,7 +1932,9 @@ mod tests {
             .iter()
             .filter(|m| matches!(m.stage, TournamentStage::Knockout { .. }))
         {
-            let sw = m.shootout_winner.expect("level knockout must go to a shootout");
+            let sw = m
+                .shootout_winner
+                .expect("level knockout must go to a shootout");
             assert!(sw == m.home_id || sw == m.away_id);
             assert_eq!(m.winner_id(), Some(sw));
         }

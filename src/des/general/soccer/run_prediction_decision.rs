@@ -26,7 +26,10 @@ const RUN_PREDICTION_MODEL_DISABLE_ENV: &str = "DD_SOCCER_DISABLE_RUN_PREDICTION
 
 fn env_flag(name: &str) -> Option<bool> {
     std::env::var(name).ok().map(|raw| {
-        matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+        matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
     })
 }
 
@@ -138,7 +141,11 @@ impl RunPredictionHead {
             },
             &mut rng,
         );
-        RunPredictionHead { network, training_steps: 0, last_loss: None }
+        RunPredictionHead {
+            network,
+            training_steps: 0,
+            last_loss: None,
+        }
     }
 
     pub fn predict(&self, inputs: &RunPredictionInputs) -> Option<f64> {
@@ -146,10 +153,18 @@ impl RunPredictionHead {
         if features.iter().any(|v| !v.is_finite()) {
             return None;
         }
-        self.network.predict(&features[..]).first().copied().filter(|p| p.is_finite())
+        self.network
+            .predict(&features[..])
+            .first()
+            .copied()
+            .filter(|p| p.is_finite())
     }
 
-    pub fn train_reward_weighted(&mut self, samples: &[RunPredictionSample], learning_rate: f64) -> f64 {
+    pub fn train_reward_weighted(
+        &mut self,
+        samples: &[RunPredictionSample],
+        learning_rate: f64,
+    ) -> f64 {
         let finite: Vec<&RunPredictionSample> = samples
             .iter()
             .filter(|s| s.reward.is_finite() && s.action_bias.is_finite())
@@ -159,7 +174,11 @@ impl RunPredictionHead {
         }
         let n = finite.len() as f64;
         let baseline = finite.iter().map(|s| s.reward).sum::<f64>() / n;
-        let std = (finite.iter().map(|s| (s.reward - baseline).powi(2)).sum::<f64>() / n)
+        let std = (finite
+            .iter()
+            .map(|s| (s.reward - baseline).powi(2))
+            .sum::<f64>()
+            / n)
             .sqrt()
             .max(1e-3);
         let mut total = 0.0;
@@ -172,15 +191,23 @@ impl RunPredictionHead {
             let advantage = (s.reward - baseline) / std;
             let weight = advantage.clamp(-4.0, 2.0).exp().min(7.5);
             let target = [s.action_bias.clamp(-1.0, 1.0)];
-            let result =
-                self.network.train_sample_clipped(&features[..], &target, learning_rate * weight, 4.0);
+            let result = self.network.train_sample_clipped(
+                &features[..],
+                &target,
+                learning_rate * weight,
+                4.0,
+            );
             if result.applied && result.loss.is_finite() {
                 total += result.loss;
                 applied += 1;
                 self.training_steps += 1;
             }
         }
-        let mean = if applied > 0 { total / applied as f64 } else { 0.0 };
+        let mean = if applied > 0 {
+            total / applied as f64
+        } else {
+            0.0
+        };
         self.last_loss = Some(mean);
         mean
     }
@@ -240,30 +267,45 @@ pub fn report_run_prediction_training(
 
 impl WorldSnapshot {
     /// Build the [`RunPredictionInputs`] for an off-ball `player`. Pure / RNG-free.
-    pub(crate) fn build_run_prediction_inputs(&self, player: &PlayerSnapshot) -> Option<RunPredictionInputs> {
+    pub(crate) fn build_run_prediction_inputs(
+        &self,
+        player: &PlayerSnapshot,
+    ) -> Option<RunPredictionInputs> {
         if !matches!(player.role, PlayerRole::Forward | PlayerRole::Midfielder) {
             return None;
         }
         let pos = self.player_snapshot_position(player);
         let attack_dir = player.team.attack_dir();
         let goal_y = player.team.goal_y(self.field_length);
-        let pressure =
-            (1.0 - (self.nearest_opponent_distance_at(player.team, pos) / 8.0).clamp(0.0, 1.0)).clamp(0.0, 1.0);
-        let ahead = Vec2 { x: pos.x, y: pos.y + attack_dir * 10.0 };
-        let space_ahead = (self.nearest_opponent_distance_at(player.team, ahead) / 12.0).clamp(0.0, 1.0);
+        let pressure = (1.0
+            - (self.nearest_opponent_distance_at(player.team, pos) / 8.0).clamp(0.0, 1.0))
+        .clamp(0.0, 1.0);
+        let ahead = Vec2 {
+            x: pos.x,
+            y: pos.y + attack_dir * 10.0,
+        };
+        let space_ahead =
+            (self.nearest_opponent_distance_at(player.team, ahead) / 12.0).clamp(0.0, 1.0);
         let ball_fwd = self.ball.position.y * attack_dir;
         let attackers_ahead = self
             .players
             .iter()
-            .filter(|p| p.team == player.team && self.player_snapshot_position(p).y * attack_dir > ball_fwd)
+            .filter(|p| {
+                p.team == player.team && self.player_snapshot_position(p).y * attack_dir > ball_fwd
+            })
             .count();
         let defenders_ahead = self
             .players
             .iter()
-            .filter(|p| p.team == player.team.other() && self.player_snapshot_position(p).y * attack_dir > ball_fwd)
+            .filter(|p| {
+                p.team == player.team.other()
+                    && self.player_snapshot_position(p).y * attack_dir > ball_fwd
+            })
             .count();
-        let numbers_up = ((attackers_ahead as f64 - defenders_ahead as f64 + 3.0) / 6.0).clamp(0.0, 1.0);
-        let in_final_third = crash_box::ball_in_attacking_final_third(pos.y, goal_y, self.field_length);
+        let numbers_up =
+            ((attackers_ahead as f64 - defenders_ahead as f64 + 3.0) / 6.0).clamp(0.0, 1.0);
+        let in_final_third =
+            crash_box::ball_in_attacking_final_third(pos.y, goal_y, self.field_length);
         Some(RunPredictionInputs {
             pressure,
             space_ahead,
@@ -362,13 +404,12 @@ impl SoccerMatch {
             if self.pending_run_prediction[i].due_tick <= tick {
                 let decision = self.pending_run_prediction.swap_remove(i);
                 let now_territorial = territorial_advantage(snapshot, decision.team);
-                let territorial_delta = if now_territorial.is_finite()
-                    && decision.decision_territorial.is_finite()
-                {
-                    now_territorial - decision.decision_territorial
-                } else {
-                    0.0
-                };
+                let territorial_delta =
+                    if now_territorial.is_finite() && decision.decision_territorial.is_finite() {
+                        now_territorial - decision.decision_territorial
+                    } else {
+                        0.0
+                    };
                 let reward = decision.reward_accum
                     + RUN_PREDICTION_TERRITORIAL_SHAPING_WEIGHT * territorial_delta;
                 if reward.is_finite() {
@@ -394,7 +435,9 @@ impl SoccerMatch {
             .players
             .iter()
             .filter(|p| matches!(p.role, PlayerRole::Forward | PlayerRole::Midfielder))
-            .filter(|p| snapshot.possession_team() == Some(p.team) && snapshot.ball.holder != Some(p.id))
+            .filter(|p| {
+                snapshot.possession_team() == Some(p.team) && snapshot.ball.holder != Some(p.id)
+            })
             .map(|p| p.id)
             .collect();
         for id in ids {
@@ -409,15 +452,16 @@ impl SoccerMatch {
                 .unwrap_or_else(|| analytic_run_forward_preference(&inputs));
             let territorial = territorial_advantage(snapshot, player.team);
             if territorial.is_finite() {
-                self.pending_run_prediction.push(PendingRunPredictionDecision {
-                    team: player.team,
-                    player_id: id,
-                    inputs,
-                    action_bias,
-                    decision_territorial: territorial,
-                    reward_accum: 0.0,
-                    due_tick: tick + RUN_PREDICTION_REWARD_WINDOW_TICKS,
-                });
+                self.pending_run_prediction
+                    .push(PendingRunPredictionDecision {
+                        team: player.team,
+                        player_id: id,
+                        inputs,
+                        action_bias,
+                        decision_territorial: territorial,
+                        reward_accum: 0.0,
+                        due_tick: tick + RUN_PREDICTION_REWARD_WINDOW_TICKS,
+                    });
             }
         }
     }
@@ -480,16 +524,36 @@ mod run_prediction_model_tests {
         let mut hi = RunPredictionHead::new(1);
         let mut lo = RunPredictionHead::new(1);
         let hi_s: Vec<RunPredictionSample> = (0..32)
-            .flat_map(|_| [
-                RunPredictionSample { inputs: inputs.clone(), action_bias: 0.8, reward: 1.0 },
-                RunPredictionSample { inputs: inputs.clone(), action_bias: -0.8, reward: -1.0 },
-            ])
+            .flat_map(|_| {
+                [
+                    RunPredictionSample {
+                        inputs: inputs.clone(),
+                        action_bias: 0.8,
+                        reward: 1.0,
+                    },
+                    RunPredictionSample {
+                        inputs: inputs.clone(),
+                        action_bias: -0.8,
+                        reward: -1.0,
+                    },
+                ]
+            })
             .collect();
         let lo_s: Vec<RunPredictionSample> = (0..32)
-            .flat_map(|_| [
-                RunPredictionSample { inputs: inputs.clone(), action_bias: -0.8, reward: 1.0 },
-                RunPredictionSample { inputs: inputs.clone(), action_bias: 0.8, reward: -1.0 },
-            ])
+            .flat_map(|_| {
+                [
+                    RunPredictionSample {
+                        inputs: inputs.clone(),
+                        action_bias: -0.8,
+                        reward: 1.0,
+                    },
+                    RunPredictionSample {
+                        inputs: inputs.clone(),
+                        action_bias: 0.8,
+                        reward: -1.0,
+                    },
+                ]
+            })
             .collect();
         for _ in 0..80 {
             hi.train_reward_weighted(&hi_s, 0.05);
