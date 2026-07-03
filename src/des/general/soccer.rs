@@ -24772,7 +24772,7 @@ fn dense_soccer_transition_reward(
     // AND defence, every role (keepers included; the box exception covers legitimate goalmouth
     // congestion). GATED BEHIND A GRACE WINDOW (`same_team_proximity_penalty_past_grace` over the
     // player's nested dwell timers) so a brief, legitimate overlap costs nothing and only a
-    // SUSTAINED crowd is punished: 3s grace within 7yd, 2s within 6yd, 1s within 5yd. Gated
+    // SUSTAINED crowd is punished: 1.5s grace within 8yd, 1.0s within 6yd, 0.5s within 5yd. Gated
     // (default-on); OFF ⇒ this term vanishes (byte-identical A/B; the timers also stay 0). The
     // gated proximity check + penalty is encapsulated in `same_team_separation_reward_penalty`,
     // and the subtraction is deliberately re-applied OUTSIDE the dense-shaping budget clamp in
