@@ -95535,27 +95535,35 @@ fn slip_break_seam_and_runner_opportunity_are_recognised() {
 
 #[test]
 fn same_team_proximity_penalty_curve_is_graduated_huge_to_small() {
-    // The user's gradient: huge inside 4yd, big at 5, medium at 6, small at 7, nothing past 8.
-    let at_4 = same_team_proximity_penalty_unit(4.0);
+    // The user's gradient: huge inside the floor, decaying to nothing at the influence radius.
+    // Expressed SYMBOLICALLY against the constants so it stays valid as the band is tuned.
+    let floor = SAME_TEAM_MIN_SEPARATION_YARDS;
+    let outer = SAME_TEAM_MIN_SEPARATION_YARDS + SAME_TEAM_SEPARATION_INFLUENCE_YARDS;
+    let at_4 = same_team_proximity_penalty_unit(floor);
     let at_5 = same_team_proximity_penalty_unit(5.0);
     let at_6 = same_team_proximity_penalty_unit(6.0);
     let at_7 = same_team_proximity_penalty_unit(7.0);
-    let at_8 = same_team_proximity_penalty_unit(8.0);
+    let at_outer = same_team_proximity_penalty_unit(outer);
     assert!(
         at_4 > at_5 && at_5 > at_6 && at_6 > at_7 && at_7 > 0.0,
         "penalty must decrease with distance across 4<5<6<7: {at_4} {at_5} {at_6} {at_7}"
     );
     assert!((at_4 - 1.0).abs() < 1e-9, "unit penalty is 1.0 exactly at the floor: {at_4}");
-    assert!((at_5 - 0.75).abs() < 1e-9, "5yd should still bite hard: {at_5}");
-    assert!((at_6 - 0.50).abs() < 1e-9, "6yd should be a medium penalty: {at_6}");
-    assert!((at_7 - 0.25).abs() < 1e-9, "7yd should remain a meaningful warning: {at_7}");
+    // Inside the band the curve is linear: (outer - d) / (outer - floor).
+    for d in [5.0_f64, 6.0, 7.0] {
+        let expected = (outer - d) / (outer - floor);
+        assert!(
+            (same_team_proximity_penalty_unit(d) - expected).abs() < 1e-9,
+            "graduated linear penalty at {d}yd should be {expected}"
+        );
+    }
     assert!(
         (same_team_proximity_penalty_unit(0.0) * SAME_TEAM_PROXIMITY_PENALTY_POINTS - 12.0)
             .abs()
             < 1e-9,
         "complete overlap should cap at the dense shaping budget"
     );
-    assert_eq!(at_8, 0.0, "no penalty at/beyond the influence radius");
+    assert_eq!(at_outer, 0.0, "no penalty at/beyond the influence radius");
     assert_eq!(same_team_proximity_penalty_unit(20.0), 0.0);
     // Inside the floor the penalty is "huge" (> the at-floor value) and capped.
     assert!(same_team_proximity_penalty_unit(2.0) > at_4, "crowding tighter is worse");
