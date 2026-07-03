@@ -2943,6 +2943,27 @@ pub(crate) fn nearest_same_team_distance_for_floor(
     nearest.is_finite().then_some(nearest)
 }
 
+/// The same-team crowding penalty (a POSITIVE magnitude to SUBTRACT from reward) for `player`
+/// on the `after` snapshot: gate + grace + 18yd-box exception + graduated distance curve, in one
+/// place so the dense reward and the budget-exemption wrapper compute the identical value. Zero
+/// when the gate is off, the grace window has not elapsed, or there is no eligible teammate.
+/// Pure w.r.t. the two inputs; RNG-free. Reward/learning-only — never touches physics.
+pub(crate) fn same_team_separation_reward_penalty(player: &PlayerAgent, after: &WorldSnapshot) -> f64 {
+    if !dd_soccer_enable_same_team_separation_floor()
+        || !same_team_proximity_penalty_past_grace(
+            player.same_team_proximity_dwell_lt7_seconds,
+            player.same_team_proximity_dwell_lt6_seconds,
+            player.same_team_proximity_dwell_lt5_seconds,
+        )
+    {
+        return 0.0;
+    }
+    match nearest_same_team_distance_for_floor(after, player.id, player.team) {
+        Some(nearest) => same_team_proximity_penalty_unit(nearest) * SAME_TEAM_PROXIMITY_PENALTY_POINTS,
+        None => 0.0,
+    }
+}
+
 // NOTE: an earlier design also damped a player's velocity to physically prevent crossing inside
 // 4yd (a "hard floor"). That was removed on purpose: per the directive it is NOT a hard floor —
 // closing inside 4yd is permitted, it just draws a strong/huge crowding penalty (the graduated
