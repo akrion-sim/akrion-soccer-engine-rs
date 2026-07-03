@@ -4701,7 +4701,6 @@ fn run() -> Result<(), Box<dyn Error>> {
         pg_policy_version_interval_games.max(policy_promotion_gate.min_sample_games);
     let mut policy_promotion_summaries =
         VecDeque::<MatchSummary>::with_capacity(policy_promotion_window_games.max(1));
->>>>>>> 33f1ca69b56d074fef26bf8ebda6126af4b19696
     let mut evolution_search_samples =
         VecDeque::<EvolutionSearchSample>::with_capacity(evolution_window_games);
     let mut local_tactical_evolved_since_pg_refresh = false;
