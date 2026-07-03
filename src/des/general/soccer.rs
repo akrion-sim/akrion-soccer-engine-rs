@@ -2795,8 +2795,11 @@ const TEAMMATE_MAX_SPACING_BOX_YARDS: f64 = 6.0;
 // (byte-identical A/B).
 const SAME_TEAM_MIN_SEPARATION_YARDS: f64 = 4.0;
 // Distance beyond the 4yd peak over which the graduated penalty / MPC keep-out ramp in: the
-// influence band is `[4, 4 + this]`, i.e. 4yd → 8yd. Above it there is no effect at all.
-const SAME_TEAM_SEPARATION_INFLUENCE_YARDS: f64 = 4.0;
+// influence band is `[4, 4 + this]`, i.e. 4yd → 9yd. Above it there is no effect at all.
+// Widened 4→5 (band 4→9yd) so teammates perceive crowding pressure and the MPC planner routes
+// apart from farther out, and the reward curve is steeper at every gap inside the band — spacing
+// is respected earlier, not only once players are almost on top of each other.
+const SAME_TEAM_SEPARATION_INFLUENCE_YARDS: f64 = 5.0;
 // Base points of the graduated proximity reward penalty at the 4-yard peak (rises further as the
 // gap collapses, linearly decays to 0 by 8yd). Deliberately large — the biggest of the dense
 // shaping terms so crowding a teammate is a genuinely "huge" cost — while a total overlap caps at
@@ -2808,18 +2811,18 @@ const SAME_TEAM_MPC_OBSTACLE_WEIGHT_GAIN: f64 = 1.6;
 // GRACE windows before the graduated same-team penalty (negative reward) begins to accrue — so a
 // brief, legitimate overlap (a handoff, a run past, crossing paths) is not punished, only a
 // SUSTAINED one. Nested by how close the pair is (the user's spec): a pair easing in gently is
-// caught by the widest 7yd/3s timer; a pair diving straight inside 5yd by the tightest 5yd/1s
+// caught by the widest 8yd timer; a pair diving straight inside 5yd by the tightest 5yd/0.5s
 // timer. The dwell timers accumulate continuously while inside the named radius and do NOT reset
 // when crossing into a tighter band — they reset only when the pair moves farther than that band.
-// Worked example (user's): 2.5s at 6.5yd then 0.25s at 5.5yd then into 3.5yd ⇒ the 7yd timer is at
-// 2.75s on entering 3.5yd and trips its 3s grace 0.25s later, so the penalty starts 0.25s in.
-// The barrier + MPC keep-out have NO grace — the hard 4yd floor is always enforced; only the
-// learning penalty is graced. The 18-yard-box pair exception applies here too (nearest NON-EXEMPT
-// teammate only). All inert when the separation floor gate is off (timers stay 0).
-const SAME_TEAM_PROXIMITY_GRACE_LT7_SECONDS: f64 = 3.0;
-const SAME_TEAM_PROXIMITY_GRACE_LT6_SECONDS: f64 = 2.0;
-const SAME_TEAM_PROXIMITY_GRACE_LT5_SECONDS: f64 = 1.0;
-const SAME_TEAM_PROXIMITY_BAND_LT7_YARDS: f64 = 7.0;
+// Grace HALVED (3/2/1s → 1.5/1.0/0.5s) and the widest band widened 7→8yd so the penalty fires
+// sooner, more often, and from farther out — the policy gets a denser learning signal that
+// crowding is bad, while still forgiving a momentary crossing/handoff. The MPC keep-out has NO
+// grace. The 18-yard-box pair exception applies here too (nearest NON-EXEMPT teammate only). All
+// inert when the separation floor gate is off (timers stay 0).
+const SAME_TEAM_PROXIMITY_GRACE_LT7_SECONDS: f64 = 1.5;
+const SAME_TEAM_PROXIMITY_GRACE_LT6_SECONDS: f64 = 1.0;
+const SAME_TEAM_PROXIMITY_GRACE_LT5_SECONDS: f64 = 0.5;
+const SAME_TEAM_PROXIMITY_BAND_LT7_YARDS: f64 = 8.0;
 const SAME_TEAM_PROXIMITY_BAND_LT6_YARDS: f64 = 6.0;
 const SAME_TEAM_PROXIMITY_BAND_LT5_YARDS: f64 = 5.0;
 
@@ -2938,6 +2941,27 @@ pub(crate) fn nearest_same_team_distance_for_floor(
         nearest = nearest.min(me_pos.distance(other.position));
     }
     nearest.is_finite().then_some(nearest)
+}
+
+/// The same-team crowding penalty (a POSITIVE magnitude to SUBTRACT from reward) for `player`
+/// on the `after` snapshot: gate + grace + 18yd-box exception + graduated distance curve, in one
+/// place so the dense reward and the budget-exemption wrapper compute the identical value. Zero
+/// when the gate is off, the grace window has not elapsed, or there is no eligible teammate.
+/// Pure w.r.t. the two inputs; RNG-free. Reward/learning-only — never touches physics.
+pub(crate) fn same_team_separation_reward_penalty(player: &PlayerAgent, after: &WorldSnapshot) -> f64 {
+    if !dd_soccer_enable_same_team_separation_floor()
+        || !same_team_proximity_penalty_past_grace(
+            player.same_team_proximity_dwell_lt7_seconds,
+            player.same_team_proximity_dwell_lt6_seconds,
+            player.same_team_proximity_dwell_lt5_seconds,
+        )
+    {
+        return 0.0;
+    }
+    match nearest_same_team_distance_for_floor(after, player.id, player.team) {
+        Some(nearest) => same_team_proximity_penalty_unit(nearest) * SAME_TEAM_PROXIMITY_PENALTY_POINTS,
+        None => 0.0,
+    }
 }
 
 // NOTE: an earlier design also damped a player's velocity to physically prevent crossing inside
@@ -24348,10 +24372,19 @@ fn soccer_transition_reward_with_tactics(
     // separately and uncapped downstream (see `learning_transitions_for`). Inert
     // (byte-identical) unless `DD_SOCCER_ENABLE_SHAPING_DISCIPLINE` is on with a finite
     // positive `reward.dense_shaping_budget_points`.
+    //
+    // The same-team crowding penalty is EXEMPT from that clamp: it is the same value
+    // `dense_soccer_transition_reward` already subtracted, so we add it back before clamping (the
+    // clamp then sees the dense reward WITHOUT it) and subtract it again after — applying it
+    // uncapped. Otherwise a large positive on-ball reward on the same tick could push the sum to
+    // the +budget rail and swallow the crowding penalty, so the policy would never feel that
+    // spacing was violated. Reward/learning-only; the clamp never affected physics to begin with.
+    let separation_penalty = same_team_separation_reward_penalty(player, after);
     let mut reward = apply_dense_shaping_budget(
-        dense_soccer_transition_reward(player, decision, before, after, action, tactical_learning),
+        dense_soccer_transition_reward(player, decision, before, after, action, tactical_learning)
+            + separation_penalty,
         tunables().reward.dense_shaping_budget_points,
-    );
+    ) - separation_penalty;
 
     if !infer_discrete_events {
         return reward;
@@ -24734,25 +24767,18 @@ fn dense_soccer_transition_reward(
     }
     // HARD same-team separation floor — the graduated MDP/POMDP penalty layer (the user's
     // "never within 4 yards" rule). A steeply-growing per-tick cost for crowding a teammate:
-    // huge inside 4yd, big at 5, medium at 6, small at 7, nothing beyond 8 — evaluated on the
+    // huge inside 4yd, big at 5, medium at 6, small at 7/8, nothing beyond 9 — evaluated on the
     // AFTER position so it credits the move that closed (or held) the gap. Universal: attack
     // AND defence, every role (keepers included; the box exception covers legitimate goalmouth
     // congestion). GATED BEHIND A GRACE WINDOW (`same_team_proximity_penalty_past_grace` over the
     // player's nested dwell timers) so a brief, legitimate overlap costs nothing and only a
-    // SUSTAINED crowd is punished: 3s grace within 7yd, 2s within 6yd, 1s within 5yd. Gated
-    // (default-on); OFF ⇒ this term vanishes (byte-identical A/B; the timers also stay 0).
-    if dd_soccer_enable_same_team_separation_floor()
-        && same_team_proximity_penalty_past_grace(
-            player.same_team_proximity_dwell_lt7_seconds,
-            player.same_team_proximity_dwell_lt6_seconds,
-            player.same_team_proximity_dwell_lt5_seconds,
-        )
-    {
-        if let Some(nearest) = nearest_same_team_distance_for_floor(after, player.id, player.team) {
-            reward -=
-                same_team_proximity_penalty_unit(nearest) * SAME_TEAM_PROXIMITY_PENALTY_POINTS;
-        }
-    }
+    // SUSTAINED crowd is punished: 1.5s grace within 8yd, 1.0s within 6yd, 0.5s within 5yd. Gated
+    // (default-on); OFF ⇒ this term vanishes (byte-identical A/B; the timers also stay 0). The
+    // gated proximity check + penalty is encapsulated in `same_team_separation_reward_penalty`,
+    // and the subtraction is deliberately re-applied OUTSIDE the dense-shaping budget clamp in
+    // `soccer_transition_reward_with_tactics` so a big positive on-ball reward on the same tick
+    // cannot dilute or clip the crowding penalty away.
+    reward -= same_team_separation_reward_penalty(player, after);
     // Off-ball support spacing: when a teammate already has the ball and the
     // direct passing lane is open, collapsing from a useful pocket into the
     // holder's feet is a decision-quality failure, not useful support.
@@ -52935,6 +52961,7 @@ fn tracking_frame_to_world_snapshot(
         keeper_commit_bias: [0.0, 0.0],
         ranked_floor_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         ranked_aerial_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+        pass_target_quality_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         support_decision_feature_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         support_open_space_target_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         loose_ball_contest_target_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -58070,7 +58097,7 @@ pub(crate) fn long_aerial_bounds_risk_for_target(
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct PassTargetQuality {
+pub(crate) struct PassTargetQuality {
     receiver_openness: f64,
     expected_completion: f64,
     stride_fit: f64,
@@ -59041,6 +59068,51 @@ fn pass_target_quality_for_snapshot_threaded(
 }
 
 fn pass_target_quality_for_snapshot_inner(
+    snapshot: &WorldSnapshot,
+    passer: &PlayerSnapshot,
+    passer_position: Vec2,
+    target: &PlayerSnapshot,
+    target_position: Vec2,
+    flight: PassFlight,
+    apply_dynamic_lane_risk_gate: bool,
+) -> PassTargetQuality {
+    // Per-tick memo choke point. A single carrier decision scores the same
+    // (passer, target, flight) several times across independent sub-checks; each score
+    // runs a nested MPC receipt estimate (QP solves) plus a full-team lane/occupancy scan —
+    // the dominant per-tick cost the profiler flags. Collapse the duplicates. The scorer is
+    // pure over the immutable `&WorldSnapshot`, so a cache hit is byte-identical to
+    // recomputing; the key carries the exact float bits of both positions and the gate flag.
+    // See `WorldSnapshot::pass_target_quality_cache` (auto-invalidated: fresh snapshot/tick).
+    let key = (
+        passer.id,
+        target.id,
+        flight,
+        passer_position.x.to_bits(),
+        passer_position.y.to_bits(),
+        target_position.x.to_bits(),
+        target_position.y.to_bits(),
+        apply_dynamic_lane_risk_gate,
+    );
+    if let Some(cached) = snapshot.pass_target_quality_cache.borrow().get(&key) {
+        return *cached;
+    }
+    let quality = pass_target_quality_for_snapshot_uncached(
+        snapshot,
+        passer,
+        passer_position,
+        target,
+        target_position,
+        flight,
+        apply_dynamic_lane_risk_gate,
+    );
+    snapshot
+        .pass_target_quality_cache
+        .borrow_mut()
+        .insert(key, quality);
+    quality
+}
+
+fn pass_target_quality_for_snapshot_uncached(
     snapshot: &WorldSnapshot,
     passer: &PlayerSnapshot,
     passer_position: Vec2,

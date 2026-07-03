@@ -52,6 +52,13 @@ use soccer_engine::des::soccer_learning::{
     SoccerPolicyPromotionGateEvaluation, SoccerPostgresPolicyRefreshCheck,
     SoccerTacticalLearningGenomeParent, SOCCER_POLICY_STATUS_ACTIVE, SOCCER_POLICY_STATUS_ARCHIVED,
 };
+use soccer_engine::des::general::soccer_eval_gate::{
+    evaluate_promotion, PromotionThresholds, PromotionVerdict,
+};
+use soccer_engine::des::general::tournament::{
+    EngineMatchRunner, EngineMatchRunnerConfig, MatchReport, TeamBrain, TournamentMatchContext,
+    TournamentMatchRunner, TournamentStage,
+};
 use soccer_engine::des::soccer_learning_pg::{
     soccer_learning_git_commit, SoccerLearningPgCompletedRunInsert,
     SoccerLearningPgPolicyPromotionBaseline, SoccerLearningPgStore,
@@ -2367,6 +2374,201 @@ fn load_initial_policies(
     .into())
 }
 
+/// Max fitness *regression* (relative to the incumbent active head) tolerated before
+/// a newer generation still goes `active`, resolved once from env at learner startup
+/// (`SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION`, or the `SOCCER_BATCH_…` alias) so
+/// the anti-regression ratchet is tunable from the configmap without a rebuild. Falls
+/// back to the compile-time [`SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION`] default
+/// when never set (the queue binary and unit tests keep the constant). Lower ⇒
+/// stricter: a newer generation must land closer to — or above — the incumbent's
+/// fitness to promote, which directly counters the observed tip regression; too low
+/// risks the promotion stall, so it is operator-tuned against the live climb/stall
+/// tradeoff rather than baked in.
+static ACTIVE_MAX_FITNESS_REGRESSION: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+
+/// Resolve the configured activation regression tolerance, defaulting to the
+/// compile-time constant when unset.
+fn active_max_fitness_regression() -> f64 {
+    *ACTIVE_MAX_FITNESS_REGRESSION
+        .get()
+        .unwrap_or(&SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION)
+}
+
+/// Frozen-anchor promotion gate (DEFAULT-OFF). The live analogue of
+/// [`soccer_engine::des::general::soccer_eval_gate::evaluate_promotion`]: a
+/// newly-learned candidate may only be written `active` (and advance the anchor) if
+/// it beats the current *frozen anchor* brain head-to-head over a held-out slate with
+/// statistical confidence. Wired into the learner so "newer generation" means "beat
+/// the one it replaces" rather than "scored a lucky self-play `match_fitness`", which
+/// is the mechanism that let the active tip regress below earlier peaks. Brains are
+/// compared by their neural snapshots — the live on-ball driver — mirroring the
+/// standalone `soccer_eval_gate_run` gate. Off unless
+/// `SOCCER_ANCHOR_PROMOTION_GATE_ENABLED=1`.
+#[derive(Clone, Copy, Debug)]
+struct AnchorPromotionGateConfig {
+    enabled: bool,
+    /// Held-out games per verdict (candidate vs anchor, home/away alternated).
+    games: usize,
+    /// Sim minutes per held-out fixture (short: this runs inline in the learner).
+    minutes: f64,
+    /// Run the gate only every Nth `active` write (1 = every promotion), to bound the
+    /// extra sim cost when policy versions are written frequently.
+    interval_writes: usize,
+    /// Held-out promote/reject thresholds (Wilson floor, worst-case floor, min games).
+    thresholds: PromotionThresholds,
+    /// Base seed for held-out fixtures — kept disjoint from the training seed space so
+    /// the verdict is on matches the candidate never trained on.
+    seed_base: u32,
+}
+
+/// Play `cfg.games` held-out FROZEN fixtures (neither side learns) between the
+/// candidate (id 0) and the anchor (id 1), alternating home/away, and fold them into
+/// a promotion verdict. Returns `None` when no comparison is possible — either brain
+/// lacks a neural snapshot, or every fixture errored — in which case the caller must
+/// NOT block promotion (absence of evidence is not evidence of regression).
+fn anchor_promotion_gate_verdict(
+    runner: &mut EngineMatchRunner,
+    candidate_neural: Option<&SoccerNeuralNetworkSnapshot>,
+    anchor_neural: Option<&SoccerNeuralNetworkSnapshot>,
+    cfg: &AnchorPromotionGateConfig,
+    seed_salt: u32,
+) -> Option<PromotionVerdict> {
+    let (candidate_neural, anchor_neural) = match (candidate_neural, anchor_neural) {
+        (Some(candidate), Some(anchor)) => (candidate, anchor),
+        _ => return None,
+    };
+    let candidate = TeamBrain::from_snapshot(candidate_neural.clone());
+    let anchor = TeamBrain::from_snapshot(anchor_neural.clone());
+    let candidate_id = 0usize;
+    let anchor_id = 1usize;
+    let games = cfg.games.max(2);
+    let mut reports = Vec::with_capacity(games);
+    for g in 0..games {
+        let seed = cfg
+            .seed_base
+            .wrapping_add(seed_salt.wrapping_mul(2_246_822_519))
+            .wrapping_add(g as u32);
+        // Alternate orientation so the candidate's edge isn't a home-field artifact.
+        let (home_id, away_id, home, away) = if g % 2 == 0 {
+            (candidate_id, anchor_id, &candidate, &anchor)
+        } else {
+            (anchor_id, candidate_id, &anchor, &candidate)
+        };
+        let ctx = TournamentMatchContext {
+            stage: TournamentStage::Group,
+            round_index: 0,
+            match_index: g,
+            seed,
+            home_id,
+            away_id,
+            home_name: format!("team{home_id}"),
+            away_name: format!("team{away_id}"),
+            home_learns: false,
+            away_learns: false,
+        };
+        match runner.play(&ctx, home, away) {
+            Ok(outcome) => reports.push(MatchReport {
+                stage: ctx.stage,
+                home_id,
+                away_id,
+                home_name: ctx.home_name,
+                away_name: ctx.away_name,
+                home_goals: outcome.home_goals,
+                away_goals: outcome.away_goals,
+                shootout_winner: None,
+                home_training_steps: outcome.home_training_steps,
+                away_training_steps: outcome.away_training_steps,
+            }),
+            Err(e) => eprintln!("anchor_gate fixture error (g {g}): {e}"),
+        }
+    }
+    if reports.is_empty() {
+        return None;
+    }
+    Some(evaluate_promotion(
+        &reports,
+        candidate_id,
+        anchor_id,
+        cfg.thresholds,
+    ))
+}
+
+/// Apply the frozen-anchor gate to a candidate about to be written with `base_status`.
+/// Returns the status to actually persist: unchanged when the gate is disabled, not a
+/// promotion, not due this write, or cannot compare; downgraded to `archived` when the
+/// candidate fails to beat the anchor. On a passing verdict (or the bootstrap write
+/// that sets the first anchor) the anchor advances to the candidate — so the anchor
+/// can only move forward by being beaten, giving a real monotonic ratchet.
+#[allow(clippy::too_many_arguments)]
+fn apply_anchor_promotion_gate(
+    cfg: &AnchorPromotionGateConfig,
+    base_status: &'static str,
+    should_write: bool,
+    candidate_neural: Option<&SoccerNeuralNetworkSnapshot>,
+    anchor_neural: &mut Option<SoccerNeuralNetworkSnapshot>,
+    runner: &mut Option<EngineMatchRunner>,
+    write_index: &mut usize,
+    seed_salt: u32,
+    context_label: &str,
+) -> &'static str {
+    if !cfg.enabled || !should_write || base_status != SOCCER_POLICY_STATUS_ACTIVE {
+        return base_status;
+    }
+    *write_index = write_index.wrapping_add(1);
+    if *write_index % cfg.interval_writes != 0 {
+        // Not due this write; keep the base gate's decision (bounded gate cost).
+        return base_status;
+    }
+    if anchor_neural.is_none() {
+        // Bootstrap: nothing to beat yet — accept and set the first frozen anchor.
+        *anchor_neural = candidate_neural.cloned();
+        if anchor_neural.is_some() {
+            println!("anchor_gate_bootstrap {context_label}");
+        }
+        return base_status;
+    }
+    let runner = runner.get_or_insert_with(|| {
+        let mut runner_config = EngineMatchRunnerConfig::default();
+        runner_config.base.duration_seconds = cfg.minutes * 60.0;
+        EngineMatchRunner::new(runner_config)
+    });
+    match anchor_promotion_gate_verdict(
+        runner,
+        candidate_neural,
+        anchor_neural.as_ref(),
+        cfg,
+        seed_salt,
+    ) {
+        Some(verdict) if verdict.promote => {
+            *anchor_neural = candidate_neural.cloned();
+            println!(
+                "anchor_gate_promote {context_label} record={}W-{}D-{}L wilson={:.3} elo_delta={:+.1} mean_payoff={:.3}",
+                verdict.record.wins,
+                verdict.record.draws,
+                verdict.record.losses,
+                verdict.wilson_lower_bound,
+                verdict.elo_delta,
+                verdict.mean_payoff_vs_field.unwrap_or(0.0),
+            );
+            base_status
+        }
+        Some(verdict) => {
+            println!(
+                "anchor_gate_blocked {context_label} record={}W-{}D-{}L wilson={:.3} elo_delta={:+.1} reasons={}",
+                verdict.record.wins,
+                verdict.record.draws,
+                verdict.record.losses,
+                verdict.wilson_lower_bound,
+                verdict.elo_delta,
+                verdict.reasons.join("|"),
+            );
+            SOCCER_POLICY_STATUS_ARCHIVED
+        }
+        // No verdict (e.g. neural disabled, so nothing to compare) — never block.
+        None => base_status,
+    }
+}
+
 /// In-memory back-four line-depth head, carried + trained across games WITHIN a
 /// learner process (parallel_games=1), so it accumulates and the back-four line
 /// consumes it live once trained. Resets on pod restart — cross-restart Postgres
@@ -3246,7 +3448,7 @@ fn flush_postgres_completed_runs(
                     metadata.fitness_micros,
                 )
             }),
-            soccer_policy_active_max_fitness_regression(),
+            active_max_fitness_regression(),
         );
         if insert_status != policy_version.status {
             println!(
@@ -3828,6 +4030,84 @@ fn run() -> Result<(), Box<dyn Error>> {
     };
     validate_soccer_policy_promotion_gate_config_for_learning_run(&policy_promotion_gate)
         .map_err(invalid_data)?;
+    // Anti-regression ratchet for activation (see `active_max_fitness_regression`):
+    // how much fitness a newer generation may lose vs the incumbent and still go
+    // `active`. Configmap-tunable so the operator can tighten it (→ 0.0 = "no
+    // regression") to stop the tip drifting below earlier peaks, without a rebuild.
+    let active_max_fitness_regression_setting = env_f64_alias(
+        "SOCCER_BATCH_POLICY_ACTIVE_MAX_FITNESS_REGRESSION",
+        "SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION",
+        SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION,
+    )?;
+    if !active_max_fitness_regression_setting.is_finite()
+        || active_max_fitness_regression_setting < 0.0
+    {
+        return Err(invalid_data(
+            "SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION must be finite and non-negative",
+        )
+        .into());
+    }
+    let _ = ACTIVE_MAX_FITNESS_REGRESSION.set(active_max_fitness_regression_setting);
+    println!(
+        "policy_active_max_fitness_regression value={active_max_fitness_regression_setting:.4} (lower = stricter anti-regression ratchet; 0.0 = newer generation must not regress)"
+    );
+    // Frozen-anchor promotion gate (DEFAULT-OFF): a candidate must beat the frozen
+    // anchor brain over a held-out slate before it is written `active`. See
+    // `AnchorPromotionGateConfig` / `anchor_promotion_gate_verdict`.
+    let anchor_promotion_gate = {
+        let enabled = env_bool_alias(
+            "SOCCER_BATCH_ANCHOR_PROMOTION_GATE_ENABLED",
+            "SOCCER_ANCHOR_PROMOTION_GATE_ENABLED",
+            false,
+        )?;
+        let games = env_usize("SOCCER_ANCHOR_PROMOTION_GATE_GAMES", 8)?.max(2);
+        let minutes = env_f64("SOCCER_ANCHOR_PROMOTION_GATE_MINUTES", 2.0)?;
+        if !minutes.is_finite() || minutes <= 0.0 {
+            return Err(
+                invalid_data("SOCCER_ANCHOR_PROMOTION_GATE_MINUTES must be finite and positive")
+                    .into(),
+            );
+        }
+        let interval_writes =
+            env_usize("SOCCER_ANCHOR_PROMOTION_GATE_INTERVAL_WRITES", 1)?.max(1);
+        let mut thresholds = PromotionThresholds::default();
+        // We play exactly `games` fixtures, so require the full slate as evidence.
+        thresholds.min_games = games as u32;
+        thresholds.wilson_floor = env_f64(
+            "SOCCER_ANCHOR_PROMOTION_GATE_WILSON_FLOOR",
+            thresholds.wilson_floor,
+        )?;
+        thresholds.worst_case_floor = env_f64(
+            "SOCCER_ANCHOR_PROMOTION_GATE_WORST_CASE_FLOOR",
+            thresholds.worst_case_floor,
+        )?;
+        if !(0.0..=1.0).contains(&thresholds.wilson_floor)
+            || !(0.0..=1.0).contains(&thresholds.worst_case_floor)
+        {
+            return Err(invalid_data(
+                "SOCCER_ANCHOR_PROMOTION_GATE_WILSON_FLOOR / _WORST_CASE_FLOOR must be in [0, 1]",
+            )
+            .into());
+        }
+        AnchorPromotionGateConfig {
+            enabled,
+            games,
+            minutes,
+            interval_writes,
+            thresholds,
+            // Disjoint from the training seed space (see `effective_seed`).
+            seed_base: 0xE7A1_0000,
+        }
+    };
+    println!(
+        "anchor_promotion_gate enabled={} games={} minutes={:.2} interval_writes={} wilson_floor={:.3} worst_case_floor={:.3}",
+        anchor_promotion_gate.enabled,
+        anchor_promotion_gate.games,
+        anchor_promotion_gate.minutes,
+        anchor_promotion_gate.interval_writes,
+        anchor_promotion_gate.thresholds.wilson_floor,
+        anchor_promotion_gate.thresholds.worst_case_floor,
+    );
     let policy_promotion_baseline_lookback_generations = env_usize(
         "SOCCER_POLICY_PROMOTION_BASELINE_LOOKBACK_GENERATIONS",
         DEFAULT_SOCCER_POLICY_PROMOTION_BASELINE_LOOKBACK_GENERATIONS,
@@ -4531,6 +4811,12 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut latest_neural_network = initial_neural_network.clone();
     let mut latest_policy_arc_cache = None::<CachedTeamQPoliciesArc>;
     let mut latest_neural_network_arc_cache = None::<CachedNeuralNetworkSnapshotArc>;
+    // Frozen-anchor promotion-gate state (used only when the gate is enabled): the
+    // current anchor brain a candidate must beat to advance, a reusable held-out
+    // match runner, and a counter to apply the gate every `interval_writes` writes.
+    let mut anchor_neural_network = latest_neural_network.clone();
+    let mut anchor_gate_runner: Option<EngineMatchRunner> = None;
+    let mut anchor_gate_write_index: usize = 0;
     let policy_promotion_window_games =
         pg_policy_version_interval_games.max(policy_promotion_gate.min_sample_games);
     let mut policy_promotion_summaries =
@@ -4651,6 +4937,12 @@ fn run() -> Result<(), Box<dyn Error>> {
                             pg_base_policy_version_id.as_deref(),
                             &mut evolution_search_samples,
                         );
+                        // Re-anchor the promotion gate to the incumbent just pulled
+                        // from Postgres: that refreshed brain is the new baseline a
+                        // candidate must beat, so the ratchet tracks it.
+                        if anchor_promotion_gate.enabled {
+                            anchor_neural_network = latest_neural_network.clone();
+                        }
                         local_evolution_trial_active = false;
                     }
                 }
@@ -4722,6 +5014,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                     promotion_summary_refs,
                     policy_promotion_gate,
                 );
+                // Incumbent recalibration (origin): when a resume trial has settled, freeze the
+                // current evaluation as the new incumbent baseline before comparing against it.
                 if policy_promotion_recalibration_pending
                     && !local_evolution_trial_active
                     && policy_promotion_evaluation.enabled
@@ -4744,6 +5038,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                         policy_promotion_evaluation.mean_play_quality
                     );
                 }
+                // Incumbent-comparison gate (origin): may downgrade the evaluation in place.
                 apply_policy_promotion_incumbent_gate(
                     &mut policy_promotion_evaluation,
                     pg_base_policy_promotion_baseline,
@@ -4752,8 +5047,19 @@ fn run() -> Result<(), Box<dyn Error>> {
                     policy_promotion_max_mean_fitness_regression,
                     policy_promotion_max_play_quality_regression,
                 );
-                let policy_version_status =
-                    policy_version_status_for_promotion_gate(&policy_promotion_evaluation);
+                // Frozen-anchor gate (HEAD): the incumbent-adjusted status is then run through the
+                // held-out anchor gate, so a candidate must clear BOTH gates to be written active.
+                let policy_version_status = apply_anchor_promotion_gate(
+                    &anchor_promotion_gate,
+                    policy_version_status_for_promotion_gate(&policy_promotion_evaluation),
+                    should_write_policy_version,
+                    latest_neural_network.as_ref(),
+                    &mut anchor_neural_network,
+                    &mut anchor_gate_runner,
+                    &mut anchor_gate_write_index,
+                    completed_episode as u32,
+                    &format!("completed_games={completed_episode}"),
+                );
                 let skip_incumbent_rejected_policy_version = should_write_policy_version
                     && policy_promotion_rejected_by_incumbent(&policy_promotion_evaluation);
                 let latest_neural_network_fingerprint = latest_neural_network
@@ -5316,8 +5622,19 @@ fn run() -> Result<(), Box<dyn Error>> {
                             completed_after_batch.saturating_sub(1),
                         )
                     );
-                    let policy_version_status =
-                        policy_version_status_for_promotion_gate(&policy_promotion_evaluation);
+                    // Frozen-anchor gate (HEAD): gate the evolution-sourced candidate through the
+                    // held-out anchor before it can be written active (no-op when the gate is off).
+                    let policy_version_status = apply_anchor_promotion_gate(
+                        &anchor_promotion_gate,
+                        policy_version_status_for_promotion_gate(&policy_promotion_evaluation),
+                        true,
+                        latest_neural_network.as_ref(),
+                        &mut anchor_neural_network,
+                        &mut anchor_gate_runner,
+                        &mut anchor_gate_write_index,
+                        completed_after_batch as u32,
+                        &format!("evolution completed_games={completed_after_batch}"),
+                    );
                     pg_policy_version_buffer.push(PendingPostgresPolicyVersion {
                         id: output_policy_version_id.clone(),
                         parent_policy_version_id: pg_base_policy_version_id.clone(),
@@ -7173,5 +7490,94 @@ mod tests {
     fn default_disk_learning_artifacts_are_disabled_when_postgres_is_configured() {
         assert!(default_disk_learning_artifacts_enabled(false));
         assert!(!default_disk_learning_artifacts_enabled(true));
+    }
+
+    fn anchor_gate_config(enabled: bool) -> AnchorPromotionGateConfig {
+        let mut thresholds = PromotionThresholds::default();
+        thresholds.min_games = 8;
+        AnchorPromotionGateConfig {
+            enabled,
+            games: 8,
+            minutes: 2.0,
+            interval_writes: 1,
+            thresholds,
+            seed_base: 0xE7A1_0000,
+        }
+    }
+
+    #[test]
+    fn anchor_gate_disabled_is_a_no_op() {
+        let cfg = anchor_gate_config(false);
+        let mut anchor = None;
+        let mut runner = None;
+        let mut index = 0usize;
+        let status = apply_anchor_promotion_gate(
+            &cfg,
+            SOCCER_POLICY_STATUS_ACTIVE,
+            true,
+            None,
+            &mut anchor,
+            &mut runner,
+            &mut index,
+            0,
+            "test",
+        );
+        assert_eq!(status, SOCCER_POLICY_STATUS_ACTIVE);
+        assert!(anchor.is_none(), "disabled gate must not touch the anchor");
+        assert_eq!(index, 0, "disabled gate must not consume the write cadence");
+    }
+
+    #[test]
+    fn anchor_gate_only_applies_to_active_promotions() {
+        let cfg = anchor_gate_config(true);
+        let mut anchor = None;
+        let mut runner = None;
+        let mut index = 0usize;
+        // An already-archived candidate is never resurrected or gate-evaluated.
+        let status = apply_anchor_promotion_gate(
+            &cfg,
+            SOCCER_POLICY_STATUS_ARCHIVED,
+            true,
+            None,
+            &mut anchor,
+            &mut runner,
+            &mut index,
+            0,
+            "test",
+        );
+        assert_eq!(status, SOCCER_POLICY_STATUS_ARCHIVED);
+        assert!(anchor.is_none());
+    }
+
+    #[test]
+    fn anchor_gate_bootstraps_first_anchor_without_playing() {
+        let cfg = anchor_gate_config(true);
+        let candidate = SoccerNeuralNetworkSnapshot::default();
+        let mut anchor = None;
+        // `runner` stays None: bootstrap must not build a match runner or play games.
+        let mut runner = None;
+        let mut index = 0usize;
+        let status = apply_anchor_promotion_gate(
+            &cfg,
+            SOCCER_POLICY_STATUS_ACTIVE,
+            true,
+            Some(&candidate),
+            &mut anchor,
+            &mut runner,
+            &mut index,
+            0,
+            "test",
+        );
+        assert_eq!(status, SOCCER_POLICY_STATUS_ACTIVE);
+        assert!(anchor.is_some(), "bootstrap sets the first frozen anchor");
+        assert!(runner.is_none(), "bootstrap must not play any fixtures");
+    }
+
+    #[test]
+    fn anchor_gate_verdict_is_none_without_neural_brains() {
+        let cfg = anchor_gate_config(true);
+        let mut runner = EngineMatchRunner::with_defaults();
+        // No neural snapshot on either side ⇒ nothing to compare ⇒ never block.
+        assert!(anchor_promotion_gate_verdict(&mut runner, None, None, &cfg, 0).is_none());
     }
 }
