@@ -4002,7 +4002,6 @@ fn run() -> Result<(), Box<dyn Error>> {
         anchor_promotion_gate.thresholds.wilson_floor,
         anchor_promotion_gate.thresholds.worst_case_floor,
     );
-=======
     let policy_promotion_baseline_lookback_generations = env_usize(
         "SOCCER_POLICY_PROMOTION_BASELINE_LOOKBACK_GENERATIONS",
         DEFAULT_SOCCER_POLICY_PROMOTION_BASELINE_LOOKBACK_GENERATIONS,
