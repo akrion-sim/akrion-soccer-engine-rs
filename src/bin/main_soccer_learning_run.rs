@@ -4893,19 +4893,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                     promotion_summary_refs,
                     policy_promotion_gate,
                 );
-<<<<<<< HEAD
-                let policy_version_status = apply_anchor_promotion_gate(
-                    &anchor_promotion_gate,
-                    policy_version_status_for_promotion_gate(&policy_promotion_evaluation),
-                    should_write_policy_version,
-                    latest_neural_network.as_ref(),
-                    &mut anchor_neural_network,
-                    &mut anchor_gate_runner,
-                    &mut anchor_gate_write_index,
-                    completed_episode as u32,
-                    &format!("completed_games={completed_episode}"),
-                );
-=======
+                // Incumbent recalibration (origin): when a resume trial has settled, freeze the
+                // current evaluation as the new incumbent baseline before comparing against it.
                 if policy_promotion_recalibration_pending
                     && !local_evolution_trial_active
                     && policy_promotion_evaluation.enabled
@@ -4928,6 +4917,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                         policy_promotion_evaluation.mean_play_quality
                     );
                 }
+                // Incumbent-comparison gate (origin): may downgrade the evaluation in place.
                 apply_policy_promotion_incumbent_gate(
                     &mut policy_promotion_evaluation,
                     pg_base_policy_promotion_baseline,
@@ -4936,11 +4926,21 @@ fn run() -> Result<(), Box<dyn Error>> {
                     policy_promotion_max_mean_fitness_regression,
                     policy_promotion_max_play_quality_regression,
                 );
-                let policy_version_status =
-                    policy_version_status_for_promotion_gate(&policy_promotion_evaluation);
+                // Frozen-anchor gate (HEAD): the incumbent-adjusted status is then run through the
+                // held-out anchor gate, so a candidate must clear BOTH gates to be written active.
+                let policy_version_status = apply_anchor_promotion_gate(
+                    &anchor_promotion_gate,
+                    policy_version_status_for_promotion_gate(&policy_promotion_evaluation),
+                    should_write_policy_version,
+                    latest_neural_network.as_ref(),
+                    &mut anchor_neural_network,
+                    &mut anchor_gate_runner,
+                    &mut anchor_gate_write_index,
+                    completed_episode as u32,
+                    &format!("completed_games={completed_episode}"),
+                );
                 let skip_incumbent_rejected_policy_version = should_write_policy_version
                     && policy_promotion_rejected_by_incumbent(&policy_promotion_evaluation);
->>>>>>> 33f1ca69b56d074fef26bf8ebda6126af4b19696
                 if should_write_policy_version
                     && policy_version_status != SOCCER_POLICY_STATUS_ACTIVE
                 {
