@@ -24548,6 +24548,12 @@ fn soccer_transition_reward_with_tactics(
                         receiver_openness,
                         pass_into_stride_fit_for_context(&action_context, player.team),
                     );
+                    reward += quick_release_forward_pass_reward(
+                        player.team,
+                        origin,
+                        target,
+                        before.ball_holder_possession_seconds,
+                    );
                     reward += pass_and_move_forward_reward_from_parts(
                         player.team,
                         flight,
