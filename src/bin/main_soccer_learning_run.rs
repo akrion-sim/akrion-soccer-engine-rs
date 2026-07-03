@@ -4822,9 +4822,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                         if anchor_promotion_gate.enabled {
                             anchor_neural_network = latest_neural_network.clone();
                         }
-=======
                         local_evolution_trial_active = false;
->>>>>>> 33f1ca69b56d074fef26bf8ebda6126af4b19696
                     }
                 }
             }
