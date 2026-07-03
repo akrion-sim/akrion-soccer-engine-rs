@@ -24741,24 +24741,17 @@ fn dense_soccer_transition_reward(
     }
     // HARD same-team separation floor — the graduated MDP/POMDP penalty layer (the user's
     // "never within 4 yards" rule). A steeply-growing per-tick cost for crowding a teammate:
-    // huge inside 4yd, big at 5, medium at 6, small at 7, nothing beyond 8 — evaluated on the
+    // huge inside 4yd, big at 5, medium at 6, small at 7/8, nothing beyond 9 — evaluated on the
     // AFTER position so it credits the move that closed (or held) the gap. Universal: attack
     // AND defence, every role (keepers included; the box exception covers legitimate goalmouth
     // congestion). GATED BEHIND A GRACE WINDOW (`same_team_proximity_penalty_past_grace` over the
     // player's nested dwell timers) so a brief, legitimate overlap costs nothing and only a
-    // SUSTAINED crowd is punished: 3s grace within 7yd, 2s within 6yd, 1s within 5yd. Gated
-    // (default-on); OFF ⇒ this term vanishes (byte-identical A/B; the timers also stay 0).
-    if dd_soccer_enable_same_team_separation_floor()
-        && same_team_proximity_penalty_past_grace(
-            player.same_team_proximity_dwell_lt7_seconds,
-            player.same_team_proximity_dwell_lt6_seconds,
-            player.same_team_proximity_dwell_lt5_seconds,
-        )
-    {
-        if let Some(nearest) = nearest_same_team_distance_for_floor(after, player.id, player.team) {
-            reward -= same_team_proximity_penalty_unit(nearest) * SAME_TEAM_PROXIMITY_PENALTY_POINTS;
-        }
-    }
+    // SUSTAINED crowd is punished: 1.5s grace within 8yd, 1.0s within 6yd, 0.5s within 5yd. Gated
+    // (default-on); OFF ⇒ this term vanishes (byte-identical A/B; the timers also stay 0). The
+    // subtraction is deliberately re-applied OUTSIDE the dense-shaping budget clamp in
+    // `soccer_transition_reward_with_tactics` (see `same_team_separation_reward_penalty`) so a big
+    // positive on-ball reward on the same tick cannot dilute or clip the crowding penalty away.
+    reward -= same_team_separation_reward_penalty(player, after);
     // Off-ball support spacing: when a teammate already has the ball and the
     // direct passing lane is open, collapsing from a useful pocket into the
     // holder's feet is a decision-quality failure, not useful support.
