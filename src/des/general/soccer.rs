@@ -2795,8 +2795,11 @@ const TEAMMATE_MAX_SPACING_BOX_YARDS: f64 = 6.0;
 // (byte-identical A/B).
 const SAME_TEAM_MIN_SEPARATION_YARDS: f64 = 4.0;
 // Distance beyond the 4yd peak over which the graduated penalty / MPC keep-out ramp in: the
-// influence band is `[4, 4 + this]`, i.e. 4yd → 8yd. Above it there is no effect at all.
-const SAME_TEAM_SEPARATION_INFLUENCE_YARDS: f64 = 4.0;
+// influence band is `[4, 4 + this]`, i.e. 4yd → 9yd. Above it there is no effect at all.
+// Widened 4→5 (band 4→9yd) so teammates perceive crowding pressure and the MPC planner routes
+// apart from farther out, and the reward curve is steeper at every gap inside the band — spacing
+// is respected earlier, not only once players are almost on top of each other.
+const SAME_TEAM_SEPARATION_INFLUENCE_YARDS: f64 = 5.0;
 // Base points of the graduated proximity reward penalty at the 4-yard peak (rises further as the
 // gap collapses, linearly decays to 0 by 8yd). Deliberately large — the biggest of the dense
 // shaping terms so crowding a teammate is a genuinely "huge" cost — while a total overlap caps at
