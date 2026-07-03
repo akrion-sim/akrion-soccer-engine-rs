@@ -10593,6 +10593,22 @@ impl SoccerMatch {
         );
     }
 
+    /// A ball-winning reward scaled UP when the ball is won inside EITHER 18-yard box: winning it
+    /// in our defensive box snuffs a near-certain chance, and winning it in the attacking box is a
+    /// chance created. Trains defenders (and attackers) to attack the ball in both boxes instead
+    /// of standing off. `position` is where the ball was won.
+    fn steal_reward_scaled_for_box(&self, base: f64, position: Vec2) -> f64 {
+        if soccer_point_in_either_penalty_area(
+            position,
+            self.config.field_width_yards,
+            self.config.field_length_yards,
+        ) {
+            base * STEAL_IN_BOX_REWARD_MULTIPLIER
+        } else {
+            base
+        }
+    }
+
     pub(crate) fn record_interception_reward(
         &mut self,
         interceptor: usize,
