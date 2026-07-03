@@ -669,7 +669,11 @@ const CARRIER_CHANNEL_PRESS_START_YARDS: f64 = 40.0;
 const CARRIER_CHANNEL_PRESS_FULL_YARDS: f64 = 15.0;
 const CARRIER_CHANNEL_JOCKEY_YARDS: f64 = 2.2;
 const CARRIER_CHANNEL_SIDE_BLOCK_YARDS: f64 = 1.6;
-const CARRIER_CHANNEL_STEPUP_FRACTION: f64 = 0.62;
+// Raised 0.62→0.85: the back four (CBs + full-backs) were backing off too much as an opponent
+// dribbled 40→20yd from goal, only engaging near the 15. Step the pressing defender up MUCH
+// closer through the whole channel window so the carrier is contested in the danger zone rather
+// than escorted to the edge of the box. (Pairs with the box-scaled steal reward that trains it.)
+const CARRIER_CHANNEL_STEPUP_FRACTION: f64 = 0.85;
 const CARRIER_CHANNEL_DOUBLE_TEAM_PRESS_MIN: f64 = 0.40;
 const CARRIER_CHANNEL_WIDE_TRAP_FRACTION: f64 = 0.42;
 /// Depth-scaled pressing aggression in our own defensive third. The closer an
