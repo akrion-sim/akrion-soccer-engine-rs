@@ -24355,10 +24355,19 @@ fn soccer_transition_reward_with_tactics(
     // separately and uncapped downstream (see `learning_transitions_for`). Inert
     // (byte-identical) unless `DD_SOCCER_ENABLE_SHAPING_DISCIPLINE` is on with a finite
     // positive `reward.dense_shaping_budget_points`.
+    //
+    // The same-team crowding penalty is EXEMPT from that clamp: it is the same value
+    // `dense_soccer_transition_reward` already subtracted, so we add it back before clamping (the
+    // clamp then sees the dense reward WITHOUT it) and subtract it again after — applying it
+    // uncapped. Otherwise a large positive on-ball reward on the same tick could push the sum to
+    // the +budget rail and swallow the crowding penalty, so the policy would never feel that
+    // spacing was violated. Reward/learning-only; the clamp never affected physics to begin with.
+    let separation_penalty = same_team_separation_reward_penalty(player, after);
     let mut reward = apply_dense_shaping_budget(
-        dense_soccer_transition_reward(player, decision, before, after, action, tactical_learning),
+        dense_soccer_transition_reward(player, decision, before, after, action, tactical_learning)
+            + separation_penalty,
         tunables().reward.dense_shaping_budget_points,
-    );
+    ) - separation_penalty;
 
     if !infer_discrete_events {
         return reward;
