@@ -5439,8 +5439,19 @@ fn run() -> Result<(), Box<dyn Error>> {
                             completed_after_batch.saturating_sub(1),
                         )
                     );
-                    let policy_version_status =
-                        policy_version_status_for_promotion_gate(&policy_promotion_evaluation);
+                    // Frozen-anchor gate (HEAD): gate the evolution-sourced candidate through the
+                    // held-out anchor before it can be written active (no-op when the gate is off).
+                    let policy_version_status = apply_anchor_promotion_gate(
+                        &anchor_promotion_gate,
+                        policy_version_status_for_promotion_gate(&policy_promotion_evaluation),
+                        true,
+                        latest_neural_network.as_ref(),
+                        &mut anchor_neural_network,
+                        &mut anchor_gate_runner,
+                        &mut anchor_gate_write_index,
+                        completed_after_batch as u32,
+                        &format!("evolution completed_games={completed_after_batch}"),
+                    );
                     pg_policy_version_buffer.push(PendingPostgresPolicyVersion {
                         id: output_policy_version_id.clone(),
                         parent_policy_version_id: pg_base_policy_version_id.clone(),
