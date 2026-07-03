@@ -95863,14 +95863,7 @@ fn same_team_proximity_grace_matches_the_worked_example() {
     // timers keep running while the pair is still inside them.
     advance_same_team_proximity_dwell(&mut b7, &mut b6, &mut b5, between_5_6, dt);
     assert_eq!(b5, 0.0, "leaving the 5yd band resets its timer");
-<<<<<<< HEAD
     assert!(b6 > 0.0 && b7 > 0.0, "but the wider timers keep running while still inside them");
-=======
-    assert!(
-        b6 > 0.0 && b7 > 0.0,
-        "but the 6yd/7yd timers keep running while still inside them"
-    );
->>>>>>> 33f1ca69b56d074fef26bf8ebda6126af4b19696
     advance_same_team_proximity_dwell(&mut b7, &mut b6, &mut b5, 99.0, dt); // fully clear
     assert_eq!(
         (b7, b6, b5),
