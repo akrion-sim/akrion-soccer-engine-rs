@@ -22309,7 +22309,15 @@ fn intercepted_pass_passer_penalty(pass: &PendingPass, field_length: f64) -> f64
     // the opponent must cost clearly MORE than a completed forward pass (+4) gains, so the policy
     // stops playing risky passes that get intercepted. A blind gift into a sitting defender now
     // costs up to 20; even a "clean" intercepted pass floors at 7. Interceptor still earns +10.
-    (5.0 + openness_cost + direction_cost + own_half_cost + aerial_cost).clamp(7.0, 20.0)
+    let base_penalty =
+        (5.0 + openness_cost + direction_cost + own_half_cost + aerial_cost).clamp(7.0, 20.0);
+    // A BACKWARD pass intercepted by the opponent is the worst giveaway — possession lost while
+    // facing our OWN goal — so DOUBLE the penalty (up to 40).
+    if matches!(direction, PassDirectionBucket::Backward) {
+        base_penalty * 2.0
+    } else {
+        base_penalty
+    }
 }
 
 /// A pass is a "backheel" when its direction is substantially behind where the player
