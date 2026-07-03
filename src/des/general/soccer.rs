@@ -22301,6 +22301,11 @@ fn progressive_pass_escape_reward(pass: &PendingPass, end: Vec2) -> f64 {
     amount.clamp(0.0, PROGRESSIVE_PASS_REWARD_CAP)
 }
 
+/// Forward-yards scale over which the intercepted-pass DIRECTION multiplier ramps from 1x (a pass
+/// this far forward) through 2x (square) to 3x (a pass this far backward). A backward giveaway is
+/// turned over facing our own goal, so it is punished up to 3x a forward one.
+const INTERCEPT_DIRECTION_REFERENCE_YARDS: f64 = 15.0;
+
 fn intercepted_pass_passer_penalty(pass: &PendingPass, field_length: f64) -> f64 {
     let own_half = pass_origin_in_own_half(pass.team, pass.origin, field_length);
     // Base severity of losing the ball to the opponent, BEFORE direction. Dominant term is
