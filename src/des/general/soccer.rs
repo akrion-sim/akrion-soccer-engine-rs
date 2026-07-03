@@ -36821,6 +36821,38 @@ pub const PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS: usize = 200;
 /// estimate (the rest stays analytic). Conservative: the head nudges, it does not replace.
 const PASS_COMPLETION_HEAD_BLEND_WEIGHT: f64 = 0.5;
 
+fn pass_completion_head_blend_weight() -> f64 {
+    #[cfg(test)]
+    {
+        pass_completion_head_blend_weight_from_env()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static WEIGHT: OnceLock<f64> = OnceLock::new();
+        *WEIGHT.get_or_init(pass_completion_head_blend_weight_from_env)
+    }
+}
+
+fn pass_completion_head_blend_weight_from_env() -> f64 {
+    let raw = std::env::var("SOCCER_PASS_COMPLETION_HEAD_BLEND_WEIGHT")
+        .ok()
+        .or_else(|| std::env::var("DD_SOCCER_PASS_COMPLETION_HEAD_BLEND_WEIGHT").ok());
+    let Some(raw) = raw else {
+        return PASS_COMPLETION_HEAD_BLEND_WEIGHT;
+    };
+    match raw.trim().parse::<f64>() {
+        Ok(value) if value.is_finite() => value.clamp(0.0, 1.0),
+        _ => {
+            eprintln!(
+                "soccer: invalid pass-completion blend weight {:?}; using default {:.3}",
+                raw, PASS_COMPLETION_HEAD_BLEND_WEIGHT
+            );
+            PASS_COMPLETION_HEAD_BLEND_WEIGHT
+        }
+    }
+}
+
 /// Env flag enabling live consumption of the learned pass-completion head in
 /// `pass_target_quality_for_snapshot`. Off ⇒ the analytic completion estimate stands alone
 /// (byte-identical to the pre-wiring behaviour). Read once per process.
@@ -59407,9 +59439,10 @@ fn pass_target_quality_for_snapshot_uncached(
                     flight,
                 );
                 if let Some(learned) = head.predict(&features) {
+                    let blend_weight = pass_completion_head_blend_weight();
                     expected_completion = expected_completion
-                        * (1.0 - PASS_COMPLETION_HEAD_BLEND_WEIGHT)
-                        + learned.clamp(0.0, 1.0) * PASS_COMPLETION_HEAD_BLEND_WEIGHT;
+                        * (1.0 - blend_weight)
+                        + learned.clamp(0.0, 1.0) * blend_weight;
                 }
             }
         }

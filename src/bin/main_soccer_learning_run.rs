@@ -2389,9 +2389,10 @@ static ACTIVE_MAX_FITNESS_REGRESSION: std::sync::OnceLock<f64> = std::sync::Once
 /// Resolve the configured activation regression tolerance, defaulting to the
 /// compile-time constant when unset.
 fn active_max_fitness_regression() -> f64 {
-    *ACTIVE_MAX_FITNESS_REGRESSION
+    ACTIVE_MAX_FITNESS_REGRESSION
         .get()
-        .unwrap_or(&SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION)
+        .copied()
+        .unwrap_or_else(soccer_policy_active_max_fitness_regression)
 }
 
 /// Frozen-anchor promotion gate (DEFAULT-OFF). The live analogue of
@@ -4037,7 +4038,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let active_max_fitness_regression_setting = env_f64_alias(
         "SOCCER_BATCH_POLICY_ACTIVE_MAX_FITNESS_REGRESSION",
         "SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION",
-        SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION,
+        soccer_policy_active_max_fitness_regression(),
     )?;
     if !active_max_fitness_regression_setting.is_finite()
         || active_max_fitness_regression_setting < 0.0
@@ -4273,6 +4274,42 @@ fn run() -> Result<(), Box<dyn Error>> {
     };
     config.neural_blend.actor_critic =
         env_bool_alias("SOCCER_NEURAL_ACTOR_CRITIC", "SOCCER_ACTOR_CRITIC", true)?;
+    config.policy_train_max_transitions_per_tick = env_usize(
+        "SOCCER_POLICY_TRAIN_MAX_TRANSITIONS_PER_TICK",
+        config.policy_train_max_transitions_per_tick,
+    )?;
+    config.neural_blend.lambda =
+        env_f64("SOCCER_NEURAL_BLEND_LAMBDA", config.neural_blend.lambda)?;
+    config.neural_blend.tie_epsilon = env_f64(
+        "SOCCER_NEURAL_BLEND_TIE_EPSILON",
+        config.neural_blend.tie_epsilon,
+    )?;
+    config.neural_blend.min_confidence_visits = env_u32(
+        "SOCCER_NEURAL_BLEND_MIN_CONFIDENCE_VISITS",
+        config.neural_blend.min_confidence_visits,
+    )?;
+    config.neural_blend.candidates =
+        env_usize("SOCCER_NEURAL_BLEND_CANDIDATES", config.neural_blend.candidates)?;
+    config.neural_blend.warmup_steps = env_usize(
+        "SOCCER_NEURAL_BLEND_WARMUP_STEPS",
+        config.neural_blend.warmup_steps,
+    )?;
+    config.neural_blend.mcts_enabled =
+        env_bool("SOCCER_NEURAL_MCTS_ENABLED", config.neural_blend.mcts_enabled)?;
+    config.neural_blend.mcts_simulations = env_usize(
+        "SOCCER_NEURAL_MCTS_SIMULATIONS",
+        config.neural_blend.mcts_simulations,
+    )?;
+    config.neural_blend.mcts_candidates = env_usize(
+        "SOCCER_NEURAL_MCTS_CANDIDATES",
+        config.neural_blend.mcts_candidates,
+    )?;
+    config.neural_blend.mcts_depth =
+        env_usize("SOCCER_NEURAL_MCTS_DEPTH", config.neural_blend.mcts_depth)?;
+    config.neural_blend.mcts_model_weight = env_f64(
+        "SOCCER_NEURAL_MCTS_MODEL_WEIGHT",
+        config.neural_blend.mcts_model_weight,
+    )?;
     apply_env_mpc_config(&mut config, &default_config)?;
     // The neural ACTOR (and MAPPO, which is itself gated on `actor_critic`) was previously left
     // disabled in standard learning runs: `neural_blend` came straight from `MatchConfig::default()`
@@ -5210,6 +5247,48 @@ fn run() -> Result<(), Box<dyn Error>> {
                                     .unwrap_or_else(|| "none".to_string())
                             );
                         }
+                        if policy_evolution_reset_to_incumbent_after_held_trial {
+                            if let (Some(experiment_id), Some(store)) =
+                                (pg_experiment_id.as_deref(), pg_store.as_mut())
+                            {
+                                match reset_policy_to_strongest_promotion_baseline(
+                                    store,
+                                    experiment_id,
+                                    completed_episode,
+                                    &options,
+                                    &mut config,
+                                    &mut tactical_learning,
+                                    &mut policies,
+                                    &mut latest_neural_network,
+                                    &mut pg_base_policy_version_id,
+                                    &mut pg_last_policy_version_id,
+                                    &mut pg_generation,
+                                    &mut pg_base_policy_version_updated_at_micros,
+                                    &mut pg_base_policy_fingerprint,
+                                    &mut pg_base_neural_network_fingerprint,
+                                    &mut pg_base_tactical_learning_fingerprint,
+                                    &mut pg_base_policy_promotion_baseline,
+                                    &mut local_tactical_evolved_since_pg_refresh,
+                                    policy_promotion_gate.min_sample_games,
+                                    policy_promotion_baseline_lookback_generations,
+                                ) {
+                                    Ok(true) => {
+                                        evolution_search_samples.clear();
+                                        policy_promotion_summaries.clear();
+                                        local_evolution_trial_active = false;
+                                        policy_promotion_recalibration_pending =
+                                            policy_promotion_recalibrate_incumbent_on_resume;
+                                    }
+                                    Ok(false) => {}
+                                    Err(err) => {
+                                        eprintln!(
+                                            "policy_promotion_reset_to_incumbent_error completed_games={} error={}",
+                                            completed_episode, err
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                     pg_last_policy_version_id.clone()
                 };
@@ -5468,10 +5547,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                         policy_promotion_evaluation.mean_play_quality,
                         policy_promotion_evaluation.rejection_reasons.join("|")
                     );
-                    if policy_evolution_apply_when_promotion_held
-                        && policy_evolution_reset_to_incumbent_after_held_trial
-                        && evaluated_local_trial
-                    {
+                    if policy_evolution_reset_to_incumbent_after_held_trial && evaluated_local_trial {
                         if let (Some(experiment_id), Some(store)) =
                             (pg_experiment_id.as_deref(), pg_store.as_mut())
                         {
