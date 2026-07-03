@@ -89,6 +89,7 @@ const DEFAULT_SOCCER_EVOLUTION_ELITE_GAMES: usize = 4;
 const SOCCER_LEARNING_LOCAL_MPC_MAX_PLAYERS_PER_TEAM_LIMIT: usize = 11;
 const SOCCER_POLICY_SOURCE_MERGE: &str = "merge";
 const SOCCER_POLICY_SOURCE_EVOLUTION: &str = "mutation";
+const SOCCER_POLICY_SOURCE_NEURAL_CHECKPOINT: &str = "replay";
 
 fn env_value(name: &str) -> Option<String> {
     std::env::var(name)
@@ -372,15 +373,42 @@ fn retain_stronger_policy_promotion_baseline(
     candidate: Option<PolicyPromotionIncumbentBaseline>,
 ) -> Option<PolicyPromotionIncumbentBaseline> {
     match (current, candidate) {
-        (Some(current), Some(candidate)) => Some(PolicyPromotionIncumbentBaseline {
-            sample_games: current.sample_games.max(candidate.sample_games),
-            mean_match_fitness: current.mean_match_fitness.max(candidate.mean_match_fitness),
-            best_match_fitness: current.best_match_fitness.max(candidate.best_match_fitness),
-            mean_play_quality: current.mean_play_quality.max(candidate.mean_play_quality),
-        }),
+        (Some(current), Some(candidate)) => Some(stronger_policy_promotion_baseline(
+            current, candidate,
+        )),
         (Some(current), None) => Some(current),
         (None, Some(candidate)) => Some(candidate),
         (None, None) => None,
+    }
+}
+
+fn stronger_policy_promotion_baseline(
+    current: PolicyPromotionIncumbentBaseline,
+    candidate: PolicyPromotionIncumbentBaseline,
+) -> PolicyPromotionIncumbentBaseline {
+    const EPSILON: f64 = 1e-12;
+    if candidate.mean_match_fitness > current.mean_match_fitness + EPSILON {
+        return candidate;
+    }
+    if current.mean_match_fitness > candidate.mean_match_fitness + EPSILON {
+        return current;
+    }
+    if candidate.mean_play_quality > current.mean_play_quality + EPSILON {
+        return candidate;
+    }
+    if current.mean_play_quality > candidate.mean_play_quality + EPSILON {
+        return current;
+    }
+    if candidate.best_match_fitness > current.best_match_fitness + EPSILON {
+        return candidate;
+    }
+    if current.best_match_fitness > candidate.best_match_fitness + EPSILON {
+        return current;
+    }
+    if candidate.sample_games >= current.sample_games {
+        candidate
+    } else {
+        current
     }
 }
 
@@ -432,6 +460,20 @@ fn policy_promotion_rejected_by_incumbent(
             .rejection_reasons
             .iter()
             .any(|reason| reason.starts_with("incumbent_"))
+}
+
+fn should_write_neural_checkpoint_for_rejected_promotion(
+    enabled: bool,
+    should_write_policy_version: bool,
+    incumbent_rejected: bool,
+    latest_neural_network_fingerprint: Option<u64>,
+    last_neural_checkpoint_fingerprint: Option<u64>,
+) -> bool {
+    enabled
+        && should_write_policy_version
+        && incumbent_rejected
+        && latest_neural_network_fingerprint.is_some()
+        && latest_neural_network_fingerprint != last_neural_checkpoint_fingerprint
 }
 
 fn default_disk_learning_artifacts_enabled(postgres_configured: bool) -> bool {
@@ -1107,6 +1149,52 @@ fn maybe_apply_postgres_evolution_options(
     true
 }
 
+fn maybe_apply_latest_postgres_neural_snapshot(
+    event_label: &str,
+    next_episode: usize,
+    store: &mut SoccerLearningPgStore,
+    experiment_id: &str,
+    latest_neural_network: &mut Option<SoccerNeuralNetworkSnapshot>,
+    active_neural_network_fingerprint: &mut Option<u64>,
+) -> Result<bool, Box<dyn Error>> {
+    let Some(metadata) = store
+        .load_latest_neural_policy_metadata(experiment_id)
+        .map_err(invalid_data)?
+    else {
+        return Ok(false);
+    };
+    let Some(snapshot) = metadata.neural_network else {
+        return Ok(false);
+    };
+    let fingerprint = soccer_neural_network_snapshot_fingerprint(&snapshot);
+    if Some(fingerprint) == *active_neural_network_fingerprint {
+        return Ok(false);
+    }
+    let previous_fingerprint = (*active_neural_network_fingerprint)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let reason = metadata
+        .search_metadata
+        .as_ref()
+        .and_then(|search_metadata| search_metadata.get("neuralCheckpoint"))
+        .and_then(|checkpoint| checkpoint.get("reason"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("policy-version");
+    println!(
+        "{} next_episode={} policy_version={} generation={} neural_fingerprint={} previous_neural_fingerprint={} reason={}",
+        event_label,
+        next_episode,
+        metadata.id,
+        metadata.generation,
+        fingerprint,
+        previous_fingerprint,
+        reason
+    );
+    *latest_neural_network = Some(snapshot);
+    *active_neural_network_fingerprint = Some(fingerprint);
+    Ok(true)
+}
+
 fn refresh_postgres_policy_for_next_sim(
     store: &mut SoccerLearningPgStore,
     experiment_id: &str,
@@ -1308,6 +1396,16 @@ fn refresh_postgres_policy_for_next_sim(
             changed = true;
         }
     }
+    if maybe_apply_latest_postgres_neural_snapshot(
+        "postgres_refresh_neural_checkpoint_for_game",
+        next_episode,
+        store,
+        experiment_id,
+        latest_neural_network,
+        pg_base_neural_network_fingerprint,
+    )? {
+        changed = true;
+    }
     Ok(changed)
 }
 
@@ -1402,6 +1500,14 @@ fn reset_policy_to_strongest_promotion_baseline(
     *pg_base_tactical_learning_fingerprint = version_tactical_learning_fingerprint;
     *pg_base_policy_promotion_baseline = Some(baseline);
     *local_tactical_evolved_since_pg_refresh = false;
+    let _ = maybe_apply_latest_postgres_neural_snapshot(
+        "policy_local_trial_reset_neural_checkpoint",
+        completed_games,
+        store,
+        experiment_id,
+        latest_neural_network,
+        pg_base_neural_network_fingerprint,
+    )?;
     Ok(true)
 }
 
@@ -4059,6 +4165,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         "SOCCER_POLICY_EVOLUTION_REQUIRE_TRIAL_BEFORE_WRITE",
         true,
     )?;
+    let policy_write_neural_checkpoint_when_promotion_held = env_bool_alias(
+        "SOCCER_BATCH_POLICY_WRITE_NEURAL_CHECKPOINT_WHEN_PROMOTION_HELD",
+        "SOCCER_POLICY_WRITE_NEURAL_CHECKPOINT_WHEN_PROMOTION_HELD",
+        true,
+    )?;
     let policy_promotion_recalibrate_incumbent_on_resume = env_bool_alias(
         "SOCCER_BATCH_POLICY_PROMOTION_RECALIBRATE_INCUMBENT_ON_RESUME",
         "SOCCER_POLICY_PROMOTION_RECALIBRATE_INCUMBENT_ON_RESUME",
@@ -4378,6 +4489,14 @@ fn run() -> Result<(), Box<dyn Error>> {
                         .map(|(_, baseline)| *baseline),
                     version_policy_promotion_baseline,
                 );
+                let _ = maybe_apply_latest_postgres_neural_snapshot(
+                    "postgres_resume_neural_checkpoint",
+                    0,
+                    store,
+                    &experiment_id,
+                    &mut initial_neural_network,
+                    &mut pg_base_neural_network_fingerprint,
+                )?;
             }
         }
         if pg_training_replay_delta_rows > 0 {
@@ -4585,7 +4704,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         curriculum_config.full_match_after_games
     );
     println!(
-        "policy_promotion_gate enabled={} min_sample_games={} min_mean_match_fitness={:.4} min_best_match_fitness={:.4} min_mean_play_quality={:.4} max_mean_conceded_goals={:.4} max_mean_goal_margin={:.4} max_mean_chain_net_loss={:.4} active_max_fitness_regression={:.4} compare_incumbent={} min_mean_fitness_delta={:.4} max_mean_fitness_regression={:.4} max_play_quality_regression={:.4} baseline_lookback_generations={} apply_evolution_when_held={} reset_to_incumbent_after_held_trial={} require_trial_before_write={} recalibrate_incumbent_on_resume={}",
+        "policy_promotion_gate enabled={} min_sample_games={} min_mean_match_fitness={:.4} min_best_match_fitness={:.4} min_mean_play_quality={:.4} max_mean_conceded_goals={:.4} max_mean_goal_margin={:.4} max_mean_chain_net_loss={:.4} active_max_fitness_regression={:.4} compare_incumbent={} min_mean_fitness_delta={:.4} max_mean_fitness_regression={:.4} max_play_quality_regression={:.4} baseline_lookback_generations={} apply_evolution_when_held={} reset_to_incumbent_after_held_trial={} require_trial_before_write={} neural_checkpoint_when_held={} recalibrate_incumbent_on_resume={}",
         policy_promotion_gate.enabled,
         policy_promotion_gate.min_sample_games,
         policy_promotion_gate.min_mean_match_fitness,
@@ -4603,6 +4722,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         policy_evolution_apply_when_promotion_held,
         policy_evolution_reset_to_incumbent_after_held_trial,
         policy_evolution_require_trial_before_write,
+        policy_write_neural_checkpoint_when_promotion_held,
         policy_promotion_recalibrate_incumbent_on_resume
     );
     println!(
@@ -4705,6 +4825,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         VecDeque::<EvolutionSearchSample>::with_capacity(evolution_window_games);
     let mut local_tactical_evolved_since_pg_refresh = false;
     let mut local_evolution_trial_active = false;
+    let mut pg_last_neural_checkpoint_fingerprint = pg_base_neural_network_fingerprint;
     let mut policy_promotion_recalibration_pending =
         policy_promotion_recalibrate_incumbent_on_resume && pg_load_initial_policy_from_postgres;
     let mut pg_policy_version_buffer = Vec::new();
@@ -4941,6 +5062,17 @@ fn run() -> Result<(), Box<dyn Error>> {
                 );
                 let skip_incumbent_rejected_policy_version = should_write_policy_version
                     && policy_promotion_rejected_by_incumbent(&policy_promotion_evaluation);
+                let latest_neural_network_fingerprint = latest_neural_network
+                    .as_ref()
+                    .map(soccer_neural_network_snapshot_fingerprint);
+                let write_neural_checkpoint_for_rejected_promotion =
+                    should_write_neural_checkpoint_for_rejected_promotion(
+                        policy_write_neural_checkpoint_when_promotion_held,
+                        should_write_policy_version,
+                        skip_incumbent_rejected_policy_version,
+                        latest_neural_network_fingerprint,
+                        pg_last_neural_checkpoint_fingerprint,
+                    );
                 if should_write_policy_version
                     && policy_version_status != SOCCER_POLICY_STATUS_ACTIVE
                 {
@@ -5027,6 +5159,57 @@ fn run() -> Result<(), Box<dyn Error>> {
                             policy_promotion_evaluation.rejection_reasons.join("|")
                         );
                         policy_promotion_summaries.clear();
+                        if write_neural_checkpoint_for_rejected_promotion {
+                            let output_policy_version_id = Uuid::new_v4().to_string();
+                            let checkpoint_generation =
+                                pg_generation.max(game.starting_policy_generation);
+                            let version_label = format!(
+                                "{}-neural-checkpoint",
+                                soccer_learning_pg_version_label(
+                                    &run_id,
+                                    shard_index,
+                                    game.episode_summary.episode,
+                                )
+                            );
+                            pg_policy_version_buffer.push(PendingPostgresPolicyVersion {
+                                id: output_policy_version_id.clone(),
+                                parent_policy_version_id: pg_game_base_policy_version_id.clone(),
+                                generation: checkpoint_generation,
+                                version_label,
+                                source_kind: SOCCER_POLICY_SOURCE_NEURAL_CHECKPOINT,
+                                status: SOCCER_POLICY_STATUS_ARCHIVED,
+                                config: config.clone(),
+                                home_options: options.clone(),
+                                away_options: options.clone(),
+                                policies: policies.clone(),
+                                fitness: policy_promotion_evaluation.mean_match_fitness,
+                                neural_network: latest_neural_network.clone(),
+                                search_metadata: Some(serde_json::json!({
+                                    "neuralCheckpoint": {
+                                        "reason": "incumbent-promotion-held",
+                                        "completedGames": completed_episode,
+                                        "policyGeneration": pg_generation,
+                                        "neuralFingerprint": latest_neural_network_fingerprint,
+                                    },
+                                    "promotion": policy_promotion_search_metadata(
+                                        curriculum_stage_label,
+                                        &policy_promotion_evaluation,
+                                    )
+                                })),
+                            });
+                            pg_last_neural_checkpoint_fingerprint =
+                                latest_neural_network_fingerprint;
+                            println!(
+                                "policy_promotion_rejected_neural_checkpoint_written completed_games={} curriculum_stage={} policy_version={} generation={} neural_fingerprint={}",
+                                completed_episode,
+                                curriculum_stage_label,
+                                output_policy_version_id,
+                                checkpoint_generation,
+                                latest_neural_network_fingerprint
+                                    .map(|fingerprint| fingerprint.to_string())
+                                    .unwrap_or_else(|| "none".to_string())
+                            );
+                        }
                     }
                     pg_last_policy_version_id.clone()
                 };
@@ -6678,7 +6861,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_promotion_incumbent_baseline_retains_stronger_metrics() {
+    fn policy_promotion_incumbent_baseline_retains_stronger_actual_policy() {
         let current = PolicyPromotionIncumbentBaseline {
             sample_games: 8,
             mean_match_fitness: 1.20,
@@ -6695,10 +6878,45 @@ mod tests {
         let retained = retain_stronger_policy_promotion_baseline(Some(current), Some(candidate))
             .expect("retained baseline");
 
-        assert_eq!(retained.sample_games, 16);
+        assert_eq!(retained.sample_games, 8);
         assert!((retained.mean_match_fitness - 1.20).abs() < 1e-12);
-        assert!((retained.best_match_fitness - 2.80).abs() < 1e-12);
+        assert!((retained.best_match_fitness - 2.40).abs() < 1e-12);
         assert!((retained.mean_play_quality - 0.44).abs() < 1e-12);
+    }
+
+    #[test]
+    fn rejected_promotion_neural_checkpoint_requires_new_snapshot() {
+        assert!(should_write_neural_checkpoint_for_rejected_promotion(
+            true,
+            true,
+            true,
+            Some(101),
+            Some(100)
+        ));
+        assert!(!should_write_neural_checkpoint_for_rejected_promotion(
+            false,
+            true,
+            true,
+            Some(101),
+            Some(100)
+        ));
+        assert!(!should_write_neural_checkpoint_for_rejected_promotion(
+            true,
+            true,
+            false,
+            Some(101),
+            Some(100)
+        ));
+        assert!(!should_write_neural_checkpoint_for_rejected_promotion(
+            true,
+            true,
+            true,
+            Some(101),
+            Some(101)
+        ));
+        assert!(!should_write_neural_checkpoint_for_rejected_promotion(
+            true, true, true, None, Some(101)
+        ));
     }
 
     #[test]
@@ -7217,6 +7435,10 @@ mod tests {
 
         assert_eq!(SOCCER_POLICY_SOURCE_MERGE, "merge");
         assert_eq!(SOCCER_POLICY_SOURCE_EVOLUTION, "mutation");
+        assert_eq!(
+            SOCCER_POLICY_SOURCE_NEURAL_CHECKPOINT,
+            "replay"
+        );
         assert!(label.ends_with("-evolution"));
         assert!(!label.ends_with("-mutation"));
     }

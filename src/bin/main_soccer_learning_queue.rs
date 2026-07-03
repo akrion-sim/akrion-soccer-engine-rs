@@ -891,15 +891,42 @@ fn retain_stronger_policy_promotion_baseline(
     candidate: Option<PolicyPromotionIncumbentBaseline>,
 ) -> Option<PolicyPromotionIncumbentBaseline> {
     match (current, candidate) {
-        (Some(current), Some(candidate)) => Some(PolicyPromotionIncumbentBaseline {
-            sample_games: current.sample_games.max(candidate.sample_games),
-            mean_match_fitness: current.mean_match_fitness.max(candidate.mean_match_fitness),
-            best_match_fitness: current.best_match_fitness.max(candidate.best_match_fitness),
-            mean_play_quality: current.mean_play_quality.max(candidate.mean_play_quality),
-        }),
+        (Some(current), Some(candidate)) => Some(stronger_policy_promotion_baseline(
+            current, candidate,
+        )),
         (Some(current), None) => Some(current),
         (None, Some(candidate)) => Some(candidate),
         (None, None) => None,
+    }
+}
+
+fn stronger_policy_promotion_baseline(
+    current: PolicyPromotionIncumbentBaseline,
+    candidate: PolicyPromotionIncumbentBaseline,
+) -> PolicyPromotionIncumbentBaseline {
+    const EPSILON: f64 = 1e-12;
+    if candidate.mean_match_fitness > current.mean_match_fitness + EPSILON {
+        return candidate;
+    }
+    if current.mean_match_fitness > candidate.mean_match_fitness + EPSILON {
+        return current;
+    }
+    if candidate.mean_play_quality > current.mean_play_quality + EPSILON {
+        return candidate;
+    }
+    if current.mean_play_quality > candidate.mean_play_quality + EPSILON {
+        return current;
+    }
+    if candidate.best_match_fitness > current.best_match_fitness + EPSILON {
+        return candidate;
+    }
+    if current.best_match_fitness > candidate.best_match_fitness + EPSILON {
+        return current;
+    }
+    if candidate.sample_games >= current.sample_games {
+        candidate
+    } else {
+        current
     }
 }
 
@@ -3506,7 +3533,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_policy_promotion_incumbent_baseline_retains_stronger_metrics() {
+    fn queue_policy_promotion_incumbent_baseline_retains_stronger_actual_policy() {
         let current = PolicyPromotionIncumbentBaseline {
             sample_games: 8,
             mean_match_fitness: 1.20,
@@ -3523,9 +3550,9 @@ mod tests {
         let retained = retain_stronger_policy_promotion_baseline(Some(current), Some(candidate))
             .expect("retained baseline");
 
-        assert_eq!(retained.sample_games, 16);
+        assert_eq!(retained.sample_games, 8);
         assert!((retained.mean_match_fitness - 1.20).abs() < 1e-12);
-        assert!((retained.best_match_fitness - 2.80).abs() < 1e-12);
+        assert!((retained.best_match_fitness - 2.40).abs() < 1e-12);
         assert!((retained.mean_play_quality - 0.44).abs() < 1e-12);
     }
 

@@ -1524,6 +1524,62 @@ impl SoccerLearningPgStore {
         }))
     }
 
+    /// Newest persisted neural snapshot for warm-start/live inference. This is
+    /// intentionally independent of policy promotion status: rejected candidate
+    /// windows may still contain the latest trained network, but their tabular
+    /// policy should stay archived until it beats the incumbent gate.
+    pub fn load_latest_neural_policy_metadata(
+        &mut self,
+        experiment_id: &str,
+    ) -> Result<Option<SoccerLearningPgPolicyMetadata>, String> {
+        self.ensure_connected()?;
+        let Some(row) = self
+            .client
+            .query_opt(
+                r#"
+                select
+                  id::text,
+                  generation,
+                  coalesce(fitness_micros, 0),
+                  metrics,
+                  config,
+                  coalesce((extract(epoch from updated_at) * 1000000)::bigint, 0)
+                from des_soccer_learning_policy_versions
+                where experiment_id = $1::text::uuid and metrics ? 'neuralNetwork'
+                order by generation desc, created_at desc, updated_at desc, id desc
+                limit 1
+                "#,
+                &[&experiment_id],
+            )
+            .map_err(|err| format!("select latest soccer neural policy metadata: {err}"))?
+        else {
+            return Ok(None);
+        };
+        let id: String = row.get(0);
+        let generation: i32 = row.get(1);
+        let fitness_micros: i64 = row.get(2);
+        let metrics: Value = row.get(3);
+        let config: Value = row.get(4);
+        let updated_at_micros: i64 = row.get(5);
+        let neural_network = soccer_policy_version_neural_network_from_metrics(&metrics)?;
+        let tactical_learning =
+            soccer_policy_version_tactical_learning_from_values(&config, &metrics)?;
+        let search_metadata = soccer_policy_version_search_metadata_from_metrics(&metrics)?;
+        let policy_fingerprint = soccer_policy_version_policy_fingerprint_from_metrics(&metrics);
+        let policy_entry_count = soccer_policy_version_policy_entry_count_from_metrics(&metrics);
+        Ok(Some(SoccerLearningPgPolicyMetadata {
+            id,
+            generation,
+            fitness_micros,
+            updated_at_micros,
+            policy_fingerprint,
+            policy_entry_count,
+            neural_network,
+            tactical_learning,
+            search_metadata,
+        }))
+    }
+
     pub fn load_policy_metadata_by_id(
         &mut self,
         policy_version_id: &str,
