@@ -1807,6 +1807,12 @@ const DEFENSIVE_CLEAR_AND_HOLD_SECOND_SECONDS: f64 = 10.0;
 const DEFENSIVE_CLEAR_AND_HOLD_FIRST_REWARD_POINTS: f64 = 10.0;
 const DEFENSIVE_CLEAR_AND_HOLD_SECOND_REWARD_POINTS: f64 = 20.0;
 const DEFENSIVE_DISPOSSESSION_REWARD_POINTS: f64 = 10.0;
+// Winning the ball inside EITHER 18-yard box is worth much more than a midfield steal: in our
+// defensive box it snuffs a near-certain chance; in the attacking box the steal IS a chance. So
+// the dispossession / 50-50 / loose-ball reward is multiplied by this when the ball is won inside
+// a box — training defenders (and attackers) to attack the ball hard in both boxes rather than
+// stand off. (User rule: steal rewards higher in the 18yd box, both offense and defense.)
+const STEAL_IN_BOX_REWARD_MULTIPLIER: f64 = 2.5;
 // While the back line is defending, train it mostly on LP/IPM position quality.
 // Ball-winning stays positive, but no longer dominates the shape gradient.
 const DEFENSIVE_POSITIONING_FOCUS_CHASE_REWARD_MULTIPLIER: f64 = 0.42;
