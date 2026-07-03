@@ -3924,7 +3924,6 @@ fn run() -> Result<(), Box<dyn Error>> {
     };
     validate_soccer_policy_promotion_gate_config_for_learning_run(&policy_promotion_gate)
         .map_err(invalid_data)?;
-<<<<<<< HEAD
     // Anti-regression ratchet for activation (see `active_max_fitness_regression`):
     // how much fitness a newer generation may lose vs the incumbent and still go
     // `active`. Configmap-tunable so the operator can tighten it (→ 0.0 = "no
