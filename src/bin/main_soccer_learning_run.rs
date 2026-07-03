@@ -5273,49 +5273,11 @@ fn run() -> Result<(), Box<dyn Error>> {
             let _ = std::io::stdout().flush();
 
             if pg_experiment_id.is_some() {
-<<<<<<< HEAD
-                let next_generation = pg_generation.saturating_add(1);
-                let output_policy_version_id = Uuid::new_v4().to_string();
-                let version_label = format!(
-                    "{}-evolution",
-                    soccer_learning_pg_version_label(
-                        &run_id,
-                        shard_index,
-                        completed_after_batch.saturating_sub(1),
-                    )
-                );
-                let policy_version_status = apply_anchor_promotion_gate(
-                    &anchor_promotion_gate,
-                    policy_version_status_for_promotion_gate(&policy_promotion_evaluation),
-                    true,
-                    latest_neural_network.as_ref(),
-                    &mut anchor_neural_network,
-                    &mut anchor_gate_runner,
-                    &mut anchor_gate_write_index,
-                    completed_after_batch as u32,
-                    &format!("evolution completed_games={completed_after_batch}"),
-                );
-                pg_policy_version_buffer.push(PendingPostgresPolicyVersion {
-                    id: output_policy_version_id.clone(),
-                    parent_policy_version_id: pg_base_policy_version_id.clone(),
-                    generation: next_generation,
-                    version_label,
-                    source_kind: SOCCER_POLICY_SOURCE_EVOLUTION,
-                    status: policy_version_status,
-                    config: evolved_config,
-                    home_options: options.clone(),
-                    away_options: options.clone(),
-                    policies: evolved_policies.clone(),
-                    fitness: best_fitness,
-                    neural_network: latest_neural_network.clone(),
-                    search_metadata: Some(run_evolution_search_metadata(
-=======
                 let skip_incumbent_rejected_policy_version =
                     policy_promotion_rejected_by_incumbent(&policy_promotion_evaluation);
                 if skip_incumbent_rejected_policy_version {
                     println!(
                         "policy_evolution_rejected_not_written games_completed={} curriculum_stage={} sample_games={} mean_match_fitness={:.4} mean_play_quality={:.4} reasons={}",
->>>>>>> 33f1ca69b56d074fef26bf8ebda6126af4b19696
                         completed_after_batch,
                         curriculum_stage_label,
                         policy_promotion_evaluation.sample_games,
