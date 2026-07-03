@@ -10652,7 +10652,9 @@ impl SoccerMatch {
         if !has_teammate || !has_opponent {
             return;
         }
-        self.record_reward_event(winner, WON_FIFTY_FIFTY_DUEL_REWARD_POINTS);
+        let duel_reward =
+            self.steal_reward_scaled_for_box(WON_FIFTY_FIFTY_DUEL_REWARD_POINTS, self.ball.position);
+        self.record_reward_event(winner, duel_reward);
         for (player_id, team) in contenders {
             if team != winner_team {
                 self.record_reward_event(player_id, -LOST_FIFTY_FIFTY_DUEL_PENALTY_POINTS);
