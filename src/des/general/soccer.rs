@@ -2098,7 +2098,13 @@ const TEAM_ADVANCE_CARRIER_DRIVE_REWARD: f64 = 0.60;
 const TEAM_ADVANCE_CARRIER_STALL_PENALTY: f64 = 0.24;
 /// Dense shaping reward for an OFF-BALL teammate making a forward supporting run while the team
 /// advances upfield — the "whole team moves forward" signal that pulls runners up with the ball.
-const TEAM_ADVANCE_SUPPORT_RUN_REWARD: f64 = 0.22;
+const TEAM_ADVANCE_SUPPORT_RUN_REWARD: f64 = 0.45;
+// Quick-release: a forward pass moved on within this many seconds of receiving earns a bonus that
+// is largest for an instant (first-touch) release and decays to zero by the cap — trains fast
+// forward ball movement over holding/dribbling. Per-agent ⇒ also shared via the MARL/MAPPO team component.
+const QUICK_RELEASE_MAX_HOLD_SECONDS: f64 = 1.2;
+const QUICK_RELEASE_FORWARD_REFERENCE_YARDS: f64 = 12.0;
+const QUICK_RELEASE_FORWARD_PASS_BONUS_POINTS: f64 = 5.0;
 /// Dense shaping penalty for an attacker who fails to join a live team-advance cue, retreats, or
 /// runs into an offside support lane. This mirrors the support-run reward without forcing defenders
 /// to abandon shape.
