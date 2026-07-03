@@ -2047,8 +2047,10 @@ const SHOT_ON_TARGET_REWARD_PATTERN: [f64; 10] =
     [12.0, 9.0, 6.0, 4.0, 3.0, 2.0, 1.5, 1.0, 0.8, 0.7];
 const PASS_CHAIN_HISTORY_LIMIT: usize = 8;
 const PASS_CHAIN_MAX_CONTINUATION_SECONDS: f64 = 12.0;
-const PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS: f64 = 7.5;
-const PASS_CHAIN_THREE_NET_FORWARD_EVENT_REWARD_POINTS: f64 = 10.0;
+// Pass-chain event bonuses trimmed (7.5→2.5, 10→3.5) for the same reason as the forward-pass
+// base above: successive passing must stay a build-up MEANS, not an end that rivals a shot/goal.
+const PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS: f64 = 2.5;
+const PASS_CHAIN_THREE_NET_FORWARD_EVENT_REWARD_POINTS: f64 = 3.5;
 /// Penalty (points, applied negative) for an isolated attacking carrier panicking a
 /// backward/square ball instead of driving at goal or holding it up — see
 /// [`SoccerRewardEventKind::IsolatedCarrierPanicBackPass`]. Comparable in magnitude to one
