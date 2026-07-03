@@ -63,3 +63,4 @@ only as `PlanarObstacle` soft keep-outs, never co-optimized state):
 MPC defaults: base `MatchConfig` OFF (deterministic tests/learning); live-gameplay
 preset ON (tier2 + field-aware + reconcile + latent + formation-local). Master live
 toggle: `SOCCER_LIVE_MPC`.
+this repo is outmoded locally, use ~/codes/akrion-sim instead

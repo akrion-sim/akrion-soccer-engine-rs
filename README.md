@@ -93,3 +93,4 @@ See `docs/observability.md` for the collector manifest and CockroachDB TTL schem
 ```sh
 cargo test --lib
 ```
+this repo is outmoded locally, use ~/codes/akrion-sim instead
