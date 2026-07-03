@@ -95623,11 +95623,11 @@ fn separation_floor_mpc_reward_and_grace_work_in_unison() {
     std::env::set_var("DD_SOCCER_ENABLE_SAME_TEAM_SEPARATION_FLOOR", "1");
     assert!(dd_soccer_enable_same_team_separation_floor());
     let radius_on = radius_of_mate(&sim);
-    // The keep-out reaches the full INFLUENCE radius (8yd) so the quadratic MPC cost is felt
-    // increasingly from 7→6→5→4yd (graduated, matching the reward), not only inside 4yd.
+    // The keep-out reaches the full INFLUENCE radius (9yd) so the quadratic MPC cost is felt
+    // increasingly from 8→7→6→5→4yd (graduated, matching the reward), not only inside 4yd.
     assert!(
         radius_on >= SAME_TEAM_MIN_SEPARATION_YARDS + SAME_TEAM_SEPARATION_INFLUENCE_YARDS - 1e-9,
-        "gate on: teammate MPC keep-out must reach the 8yd influence radius, got {radius_on}"
+        "gate on: teammate MPC keep-out must reach the full influence radius, got {radius_on}"
     );
 
     // The POMDP/MDP reward penalty the policy is trained on is live for that same 3yd gap.
