@@ -45512,6 +45512,53 @@ fn soccer_live_pg_connect_for_policy(
 /// lock only for the cheap struct swap. Returns `None` when the experiment has no active
 /// policy yet.
 #[cfg(feature = "postgres-persistence")]
+fn soccer_live_overlay_latest_pg_neural_snapshot(
+    store: &mut crate::des::soccer_learning_pg::SoccerLearningPgStore,
+    experiment_id: &str,
+    mut version: crate::des::soccer_learning_pg::SoccerLearningPgPolicyVersion,
+) -> Result<crate::des::soccer_learning_pg::SoccerLearningPgPolicyVersion, String> {
+    let Some(metadata) = store.load_latest_neural_policy_metadata(experiment_id)? else {
+        return Ok(version);
+    };
+    let Some(neural_network) = metadata.neural_network else {
+        return Ok(version);
+    };
+    let reason = metadata
+        .search_metadata
+        .as_ref()
+        .and_then(|search_metadata| search_metadata.get("neuralCheckpoint"))
+        .and_then(|checkpoint| checkpoint.get("reason"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("policy-version");
+    println!(
+        "# soccer-live: overlaid neural policy_version={} generation={} onto_policy_version={} onto_generation={} reason={}",
+        metadata.id,
+        metadata.generation,
+        version.id,
+        version.generation,
+        reason
+    );
+    version.neural_network = Some(neural_network);
+    version.updated_at_micros = version.updated_at_micros.max(metadata.updated_at_micros);
+    Ok(version)
+}
+
+#[cfg(feature = "postgres-persistence")]
+fn soccer_live_latest_pg_policy_or_neural_updated_at(
+    store: &mut crate::des::soccer_learning_pg::SoccerLearningPgStore,
+    experiment_id: &str,
+    include_unpromoted: bool,
+) -> Result<Option<i64>, String> {
+    let policy_updated_at = store
+        .load_latest_policy_metadata(experiment_id, include_unpromoted)?
+        .map(|metadata| metadata.updated_at_micros);
+    let neural_updated_at = store
+        .load_latest_neural_policy_metadata(experiment_id)?
+        .map(|metadata| metadata.updated_at_micros);
+    Ok(policy_updated_at.into_iter().chain(neural_updated_at).max())
+}
+
+#[cfg(feature = "postgres-persistence")]
 fn soccer_live_fetch_latest_pg_policy(
     store: &mut crate::des::soccer_learning_pg::SoccerLearningPgStore,
     experiment_id: &str,
@@ -45524,31 +45571,35 @@ fn soccer_live_fetch_latest_pg_policy(
         else {
             return Ok(None);
         };
-        return Ok(Some(
-            crate::des::soccer_learning_pg::SoccerLearningPgPolicyVersion {
-                id: metadata.id,
-                generation: metadata.generation,
-                updated_at_micros: metadata.updated_at_micros,
-                policy_fingerprint: metadata.policy_fingerprint,
-                policy_entry_count: metadata.policy_entry_count,
-                policies: SoccerTeamQPolicies::new(options),
-                neural_network: metadata.neural_network,
-                tactical_learning: metadata.tactical_learning,
-                search_metadata: metadata.search_metadata,
-            },
-        ));
+        let version = crate::des::soccer_learning_pg::SoccerLearningPgPolicyVersion {
+            id: metadata.id,
+            generation: metadata.generation,
+            updated_at_micros: metadata.updated_at_micros,
+            policy_fingerprint: metadata.policy_fingerprint,
+            policy_entry_count: metadata.policy_entry_count,
+            policies: SoccerTeamQPolicies::new(options),
+            neural_network: metadata.neural_network,
+            tactical_learning: metadata.tactical_learning,
+            search_metadata: metadata.search_metadata,
+        };
+        return soccer_live_overlay_latest_pg_neural_snapshot(store, experiment_id, version)
+            .map(Some);
     }
     // The live server does inference only, so it loads the neural net (always, in full)
     // plus the well-learned tabular core — entries visited at least
     // `SOCCER_LIVE_POLICY_MIN_VISITS` times — instead of hauling the full
     // multi-million-row policy tip over the wire. `0` (default) loads everything.
-    store.load_latest_policy_with_min_visits(
+    let Some(version) = store.load_latest_policy_with_min_visits(
         experiment_id,
         options.clone(),
         options,
         soccer_live_policy_min_visits(),
         include_unpromoted,
-    )
+    )?
+    else {
+        return Ok(None);
+    };
+    soccer_live_overlay_latest_pg_neural_snapshot(store, experiment_id, version).map(Some)
 }
 
 /// Install an already-fetched policy version into `sim` (the cheap, lock-held step): move the
@@ -45636,12 +45687,13 @@ fn start_soccer_live_pg_policy_refresh(
                 // Cheap metadata probe first (no lock); only do the full fetch on a newer
                 // publish. In best-candidate mode this is the highest-fitness version, so its
                 // updated_at only moves when a strictly better candidate is published.
-                let updated_at =
-                    match store.load_latest_policy_metadata(experiment_id, include_unpromoted) {
-                        Ok(Some(meta)) if last_seen != Some(meta.updated_at_micros) => {
-                            meta.updated_at_micros
-                        }
-                        Ok(_) => continue, // unchanged or no policy yet
+                let updated_at = match soccer_live_latest_pg_policy_or_neural_updated_at(
+                    store,
+                    experiment_id,
+                    include_unpromoted,
+                ) {
+                        Ok(Some(updated_at)) if last_seen != Some(updated_at) => updated_at,
+                        Ok(_) => continue, // unchanged or no policy/neural snapshot yet
                         Err(err) => {
                             eprintln!("# soccer-live: pg refresh probe failed (will retry): {err}");
                             continue; // store auto-reconnects via ensure_connected next tick
