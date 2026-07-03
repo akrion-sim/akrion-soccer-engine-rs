@@ -2088,7 +2088,11 @@ const TEAM_ADVANCE_REWARD_REFERENCE_YARDS: f64 = 4.0;
 /// Dense shaping reward for the CARRIER driving the ball forward into space while the team advances
 /// as a unit — the "take the space" signal. Comparable in magnitude to the other in-possession
 /// spacing shaping terms so it nudges without swamping the sparse goal/possession signal.
-const TEAM_ADVANCE_CARRIER_DRIVE_REWARD: f64 = 0.30;
+// Raised 0.30→0.60 (carrier) / 0.22→0.45 (support run): advancing the ball/team upfield was
+// under-rewarded vs the large turnover/backward/hold penalties, leaving the policy timid. Doubling
+// the positive advancement terms restores brave forward play. These are per-agent rewards so they
+// also feed the MARL/MAPPO team component (team-avg reward delta) — the whole team shares the credit.
+const TEAM_ADVANCE_CARRIER_DRIVE_REWARD: f64 = 0.60;
 /// Dense shaping penalty for the carrier wasting the same team-advance cue by stalling or moving
 /// the ball backward. This is the stick paired with the carrier-drive carrot above.
 const TEAM_ADVANCE_CARRIER_STALL_PENALTY: f64 = 0.24;
