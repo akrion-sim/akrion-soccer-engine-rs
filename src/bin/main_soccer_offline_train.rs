@@ -40,14 +40,21 @@ fn env_str(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty())
 }
 fn env_usize(key: &str, default: usize) -> usize {
-    env_str(key).and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+    env_str(key)
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
 }
 fn env_f64(key: &str, default: f64) -> f64 {
-    env_str(key).and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+    env_str(key)
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
 }
 fn env_flag(key: &str) -> bool {
     matches!(
-        env_str(key).as_deref().map(|v| v.to_ascii_lowercase()).as_deref(),
+        env_str(key)
+            .as_deref()
+            .map(|v| v.to_ascii_lowercase())
+            .as_deref(),
         Some("1") | Some("true") | Some("yes") | Some("on")
     )
 }
@@ -93,7 +100,11 @@ fn main() -> std::io::Result<()> {
             true,
         )
         .map_err(other)?
-        .ok_or_else(|| other(format!("no policy version to refine in experiment '{source_slug}'")))?;
+        .ok_or_else(|| {
+            other(format!(
+                "no policy version to refine in experiment '{source_slug}'"
+            ))
+        })?;
     let base_home_entries = base.policies.home.q_values.len();
     let base_away_entries = base.policies.away.q_values.len();
     println!(
@@ -118,7 +129,11 @@ fn main() -> std::io::Result<()> {
         None
     };
     let delta = store
-        .load_recent_completed_run_policy_delta(&source_experiment, delta_rows, created_after_micros)
+        .load_recent_completed_run_policy_delta(
+            &source_experiment,
+            delta_rows,
+            created_after_micros,
+        )
         .map_err(other)?;
     let delta_entries = delta.entries.len();
     let merged = if delta_entries > 0 {

@@ -1808,7 +1808,9 @@ mod back_four_line_tests {
         let snapshot = head.to_snapshot();
 
         let restored = BackFourLineHead::from_snapshot(&snapshot).expect("restores line head");
-        let after = restored.predict(&inputs).expect("finite restored prediction");
+        let after = restored
+            .predict(&inputs)
+            .expect("finite restored prediction");
 
         assert_eq!(restored.training_steps(), head.training_steps());
         assert_eq!(restored.last_loss(), head.last_loss());
@@ -2055,7 +2057,7 @@ mod back_four_line_tests {
     #[test]
     fn sticky_anchor_holds_then_repicks_on_window_flip_or_deep_drop() {
         let latch_ticks = 45; // ~3s at 15tps
-        // Held steady: small fluctuation, same possession, window not elapsed ⇒ HOLD.
+                              // Held steady: small fluctuation, same possession, window not elapsed ⇒ HOLD.
         assert!(!back_four_line_sticky_should_repick(
             20.0,
             21.5,

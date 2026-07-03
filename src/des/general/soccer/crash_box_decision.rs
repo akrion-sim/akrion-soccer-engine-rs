@@ -31,7 +31,10 @@ const CRASH_BOX_MODEL_DISABLE_ENV: &str = "DD_SOCCER_DISABLE_CRASH_BOX_MODEL";
 
 fn env_flag(name: &str) -> Option<bool> {
     std::env::var(name).ok().map(|raw| {
-        matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+        matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
     })
 }
 
@@ -147,7 +150,11 @@ impl CrashBoxHead {
             },
             &mut rng,
         );
-        CrashBoxHead { network, training_steps: 0, last_loss: None }
+        CrashBoxHead {
+            network,
+            training_steps: 0,
+            last_loss: None,
+        }
     }
 
     pub fn predict(&self, inputs: &CrashBoxInputs) -> Option<f64> {
@@ -155,7 +162,11 @@ impl CrashBoxHead {
         if features.iter().any(|v| !v.is_finite()) {
             return None;
         }
-        self.network.predict(&features[..]).first().copied().filter(|p| p.is_finite())
+        self.network
+            .predict(&features[..])
+            .first()
+            .copied()
+            .filter(|p| p.is_finite())
     }
 
     pub fn train_reward_weighted(&mut self, samples: &[CrashBoxSample], learning_rate: f64) -> f64 {
@@ -168,7 +179,11 @@ impl CrashBoxHead {
         }
         let n = finite.len() as f64;
         let baseline = finite.iter().map(|s| s.reward).sum::<f64>() / n;
-        let std = (finite.iter().map(|s| (s.reward - baseline).powi(2)).sum::<f64>() / n)
+        let std = (finite
+            .iter()
+            .map(|s| (s.reward - baseline).powi(2))
+            .sum::<f64>()
+            / n)
             .sqrt()
             .max(1e-3);
         let mut total = 0.0;
@@ -181,15 +196,23 @@ impl CrashBoxHead {
             let advantage = (s.reward - baseline) / std;
             let weight = advantage.clamp(-4.0, 2.0).exp().min(7.5);
             let target = [s.action_bias.clamp(-1.0, 1.0)];
-            let result =
-                self.network.train_sample_clipped(&features[..], &target, learning_rate * weight, 4.0);
+            let result = self.network.train_sample_clipped(
+                &features[..],
+                &target,
+                learning_rate * weight,
+                4.0,
+            );
             if result.applied && result.loss.is_finite() {
                 total += result.loss;
                 applied += 1;
                 self.training_steps += 1;
             }
         }
-        let mean = if applied > 0 { total / applied as f64 } else { 0.0 };
+        let mean = if applied > 0 {
+            total / applied as f64
+        } else {
+            0.0
+        };
         self.last_loss = Some(mean);
         mean
     }
@@ -274,11 +297,15 @@ impl WorldSnapshot {
             let n = self
                 .players
                 .iter()
-                .filter(|p| p.team == opp && self.point_in_own_penalty_area(opp, self.player_snapshot_position(p)))
+                .filter(|p| {
+                    p.team == opp
+                        && self.point_in_own_penalty_area(opp, self.player_snapshot_position(p))
+                })
                 .count();
             (n as f64 / 5.0).clamp(0.0, 1.0)
         };
-        let dist_to_box = ((goal_y - pos.y).abs() / (self.field_length * 0.3).max(1.0)).clamp(0.0, 1.0);
+        let dist_to_box =
+            ((goal_y - pos.y).abs() / (self.field_length * 0.3).max(1.0)).clamp(0.0, 1.0);
         let cross_imminent = if crash_box::flank_final_third_crash_box_geometry(
             self.ball.position,
             goal_y,
@@ -289,7 +316,10 @@ impl WorldSnapshot {
         } else {
             0.0
         };
-        let arrival_zone = Vec2 { x: pos.x, y: goal_y - attack_dir * 8.0 };
+        let arrival_zone = Vec2 {
+            x: pos.x,
+            y: goal_y - attack_dir * 8.0,
+        };
         let arrival_space =
             (self.nearest_opponent_distance_at(player.team, arrival_zone) / 10.0).clamp(0.0, 1.0);
         let needed_behind = {
@@ -373,15 +403,14 @@ impl SoccerMatch {
             if self.pending_crash_box[i].due_tick <= tick {
                 let decision = self.pending_crash_box.swap_remove(i);
                 let now_territorial = territorial_advantage(snapshot, decision.team);
-                let territorial_delta = if now_territorial.is_finite()
-                    && decision.decision_territorial.is_finite()
-                {
-                    now_territorial - decision.decision_territorial
-                } else {
-                    0.0
-                };
-                let reward =
-                    decision.reward_accum + CRASH_BOX_TERRITORIAL_SHAPING_WEIGHT * territorial_delta;
+                let territorial_delta =
+                    if now_territorial.is_finite() && decision.decision_territorial.is_finite() {
+                        now_territorial - decision.decision_territorial
+                    } else {
+                        0.0
+                    };
+                let reward = decision.reward_accum
+                    + CRASH_BOX_TERRITORIAL_SHAPING_WEIGHT * territorial_delta;
                 if reward.is_finite() {
                     self.crash_box_samples.push(CrashBoxSample {
                         inputs: decision.inputs,
@@ -491,16 +520,36 @@ mod crash_box_model_tests {
         let mut hi = CrashBoxHead::new(1);
         let mut lo = CrashBoxHead::new(1);
         let hi_s: Vec<CrashBoxSample> = (0..32)
-            .flat_map(|_| [
-                CrashBoxSample { inputs: inputs.clone(), action_bias: 0.8, reward: 1.0 },
-                CrashBoxSample { inputs: inputs.clone(), action_bias: -0.8, reward: -1.0 },
-            ])
+            .flat_map(|_| {
+                [
+                    CrashBoxSample {
+                        inputs: inputs.clone(),
+                        action_bias: 0.8,
+                        reward: 1.0,
+                    },
+                    CrashBoxSample {
+                        inputs: inputs.clone(),
+                        action_bias: -0.8,
+                        reward: -1.0,
+                    },
+                ]
+            })
             .collect();
         let lo_s: Vec<CrashBoxSample> = (0..32)
-            .flat_map(|_| [
-                CrashBoxSample { inputs: inputs.clone(), action_bias: -0.8, reward: 1.0 },
-                CrashBoxSample { inputs: inputs.clone(), action_bias: 0.8, reward: -1.0 },
-            ])
+            .flat_map(|_| {
+                [
+                    CrashBoxSample {
+                        inputs: inputs.clone(),
+                        action_bias: -0.8,
+                        reward: 1.0,
+                    },
+                    CrashBoxSample {
+                        inputs: inputs.clone(),
+                        action_bias: 0.8,
+                        reward: -1.0,
+                    },
+                ]
+            })
             .collect();
         for _ in 0..80 {
             hi.train_reward_weighted(&hi_s, 0.05);

@@ -377,8 +377,7 @@ pub fn select_beat_move(
                     closing_speed: commitment.closing_speed,
                     separation: commitment.separation,
                 }) {
-                    p = (p * (1.0 - BEAT_DEFENDER_HEAD_BLEND)
-                        + learned * BEAT_DEFENDER_HEAD_BLEND)
+                    p = (p * (1.0 - BEAT_DEFENDER_HEAD_BLEND) + learned * BEAT_DEFENDER_HEAD_BLEND)
                         .clamp(0.05, 0.95);
                 }
             }
@@ -394,7 +393,11 @@ pub fn select_beat_move(
     } else {
         space_open_side.signum()
     };
-    let exit_side = if exit_side.abs() < 0.5 { 1.0 } else { exit_side };
+    let exit_side = if exit_side.abs() < 0.5 {
+        1.0
+    } else {
+        exit_side
+    };
 
     if commitment.is_over_committed() {
         // Already leaning/diving — exploit it directly.
@@ -518,7 +521,11 @@ mod tests {
         assert!(state.lateral_commit > 0.0);
         // Open side is the opposite of the lean (−x).
         assert!(state.open_side < 0.0, "open_side={}", state.open_side);
-        assert!(state.is_over_committed(), "over_commit={}", state.over_commit);
+        assert!(
+            state.is_over_committed(),
+            "over_commit={}",
+            state.over_commit
+        );
     }
 
     #[test]
@@ -672,7 +679,8 @@ mod tests {
             .iter()
             .position(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
             .expect("an Away outfielder");
-        sim.players[defender].position = Vec2::new(carrier_pos.x + 0.5, carrier_pos.y + attack * 3.0);
+        sim.players[defender].position =
+            Vec2::new(carrier_pos.x + 0.5, carrier_pos.y + attack * 3.0);
         sim.players[defender].velocity = Vec2::new(4.0, 0.0);
         let snapshot = WorldSnapshot::from_match(&sim);
         let plan = snapshot

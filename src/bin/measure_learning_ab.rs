@@ -227,20 +227,32 @@ fn main() {
         late.accumulate(k);
     }
 
-    println!("\n----- per-game averages ({games} games, {:.1}s elapsed) -----", started.elapsed().as_secs_f64());
+    println!(
+        "\n----- per-game averages ({games} games, {:.1}s elapsed) -----",
+        started.elapsed().as_secs_f64()
+    );
     overall.scaled(1.0 / n).print_row("OVERALL");
     early.scaled(1.0 / third as f64).print_row("EARLY(1st⅓)");
     late.scaled(1.0 / third as f64).print_row("LATE(last⅓)");
 
     let early_avg = early.scaled(1.0 / third as f64);
     let late_avg = late.scaled(1.0 / third as f64);
-    let pct = |a: f64, b: f64| if a.abs() > 1e-9 { (b - a) / a * 100.0 } else { 0.0 };
+    let pct = |a: f64, b: f64| {
+        if a.abs() > 1e-9 {
+            (b - a) / a * 100.0
+        } else {
+            0.0
+        }
+    };
     println!(
         "\nTREND late-vs-early: fwd_passes {:+.1}%  chains {:+.1}%  chain_gain_yds {:+.1}%  \
          shot_after_pass {:+.1}%  goals {:+.1}%",
         pct(early_avg.passes_forward, late_avg.passes_forward),
         pct(early_avg.pass_chains, late_avg.pass_chains),
-        pct(early_avg.pass_chain_gain_yards, late_avg.pass_chain_gain_yards),
+        pct(
+            early_avg.pass_chain_gain_yards,
+            late_avg.pass_chain_gain_yards
+        ),
         pct(early_avg.shots_after_pass, late_avg.shots_after_pass),
         pct(early_avg.goals, late_avg.goals),
     );

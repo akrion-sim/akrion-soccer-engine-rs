@@ -612,25 +612,31 @@ impl WorldSnapshot {
         opponent_rows.sort_by(|a, b| a.0.total_cmp(&b.0));
 
         let mut teammates = [NeighbourKinematics::default(); DEFENDER_OBS_TEAMMATES];
-        for (slot, (_, k)) in teammate_rows.into_iter().take(DEFENDER_OBS_TEAMMATES).enumerate() {
+        for (slot, (_, k)) in teammate_rows
+            .into_iter()
+            .take(DEFENDER_OBS_TEAMMATES)
+            .enumerate()
+        {
             teammates[slot] = k;
         }
         let mut opponents = [NeighbourKinematics::default(); DEFENDER_OBS_MAX_OPPONENTS];
-        for (slot, (_, k)) in opponent_rows.into_iter().take(DEFENDER_OBS_MAX_OPPONENTS).enumerate()
+        for (slot, (_, k)) in opponent_rows
+            .into_iter()
+            .take(DEFENDER_OBS_MAX_OPPONENTS)
+            .enumerate()
         {
             opponents[slot] = k;
         }
 
-        let (own_attack_fwd, own_attack_lat, own_attack_vfwd, own_attack_vlat) = if own_attack_n
-            > 0.0
-        {
-            let inv = 1.0 / own_attack_n;
-            let c = own_attack_pos * inv;
-            let v = own_attack_vel * inv;
-            (fwd_from_goal(c.y), lat(c.x), v.y * attack, v.x * attack)
-        } else {
-            (self_fwd, self_lat, 0.0, 0.0)
-        };
+        let (own_attack_fwd, own_attack_lat, own_attack_vfwd, own_attack_vlat) =
+            if own_attack_n > 0.0 {
+                let inv = 1.0 / own_attack_n;
+                let c = own_attack_pos * inv;
+                let v = own_attack_vel * inv;
+                (fwd_from_goal(c.y), lat(c.x), v.y * attack, v.x * attack)
+            } else {
+                (self_fwd, self_lat, 0.0, 0.0)
+            };
 
         let controlled = self.controlled_possession_team();
         let trap_active_or_imminent =
@@ -757,14 +763,15 @@ impl SoccerMatch {
                     .unwrap_or_else(|| analytic_defender_push_delta(&inputs));
                 let territorial = territorial_advantage(snapshot, team);
                 if action.is_finite() && territorial.is_finite() {
-                    self.pending_defender_line.push(PendingDefenderLineDecision {
-                        team,
-                        player_id: id,
-                        inputs,
-                        action_push_yards: action,
-                        decision_territorial: territorial,
-                        due_tick: tick + DEFENDER_LINE_REWARD_WINDOW_TICKS,
-                    });
+                    self.pending_defender_line
+                        .push(PendingDefenderLineDecision {
+                            team,
+                            player_id: id,
+                            inputs,
+                            action_push_yards: action,
+                            decision_territorial: territorial,
+                            due_tick: tick + DEFENDER_LINE_REWARD_WINDOW_TICKS,
+                        });
                 }
             }
         }
@@ -878,7 +885,10 @@ mod back_four_individual_tests {
     fn head_predicts_a_bounded_delta() {
         let head = DefenderLinePolicyHead::new(7);
         let d = head.predict(&baseline_inputs()).expect("finite prediction");
-        assert!(d.abs() <= DEFENDER_MAX_PUSH_YARDS + 1e-9, "delta {d} unbounded");
+        assert!(
+            d.abs() <= DEFENDER_MAX_PUSH_YARDS + 1e-9,
+            "delta {d} unbounded"
+        );
     }
 
     #[test]
@@ -909,7 +919,10 @@ mod back_four_individual_tests {
         }
         let after = head.predict(&inputs).expect("finite");
         assert!(last.is_finite());
-        assert!(after < 0.0, "RWR should steer toward the rewarded drop: {after}");
+        assert!(
+            after < 0.0,
+            "RWR should steer toward the rewarded drop: {after}"
+        );
     }
 
     #[test]

@@ -40,8 +40,7 @@ pub(crate) const KILLER_PASS_OVER_TOP_PASS_FLIGHT_ALIASES: &[&str] = &[
 ];
 pub(crate) const KILLER_PASS_OVER_TOP_DISTANCE_BINS_YARDS: [f64; 4] = [25.0, 28.0, 32.0, 35.0];
 pub(crate) const KILLER_PASS_OVER_TOP_HEIGHT_BINS_YARDS: [f64; 4] = [2.0, 3.4, 4.6, 6.0];
-pub(crate) const KILLER_PASS_OVER_TOP_LATERAL_OFFSET_BINS_YARDS: [f64; 4] =
-    [1.0, 3.0, 5.0, 8.0];
+pub(crate) const KILLER_PASS_OVER_TOP_LATERAL_OFFSET_BINS_YARDS: [f64; 4] = [1.0, 3.0, 5.0, 8.0];
 pub(crate) const KILLER_PASS_OVER_TOP_BACK_LINE_CLEARANCE_BINS_YARDS: [f64; 4] =
     [0.5, 2.0, 4.0, 7.0];
 pub(crate) const KILLER_PASS_OVER_TOP_GOALKEEPER_AVOIDANCE_BINS_YARDS: [f64; 4] =
@@ -3733,7 +3732,14 @@ impl CarrierKeepRollingTunables {
     }
 
     fn validate_strict(&self, prefix: &str, errors: &mut Vec<String>) {
-        validate_f64(prefix, "stop_target_yards", self.stop_target_yards, 0.0, 6.0, errors);
+        validate_f64(
+            prefix,
+            "stop_target_yards",
+            self.stop_target_yards,
+            0.0,
+            6.0,
+            errors,
+        );
         validate_f64(
             prefix,
             "min_opponent_distance_yards",
@@ -3742,7 +3748,14 @@ impl CarrierKeepRollingTunables {
             15.0,
             errors,
         );
-        validate_f64(prefix, "min_space_yards", self.min_space_yards, 0.0, 40.0, errors);
+        validate_f64(
+            prefix,
+            "min_space_yards",
+            self.min_space_yards,
+            0.0,
+            40.0,
+            errors,
+        );
         validate_f64(
             prefix,
             "carry_target_yards",
@@ -3884,7 +3897,14 @@ impl FreshPossessionEscapeTunables {
     }
 
     fn validate_strict(&self, prefix: &str, errors: &mut Vec<String>) {
-        validate_f64(prefix, "fresh_seconds", self.fresh_seconds, 0.0, 5.0, errors);
+        validate_f64(
+            prefix,
+            "fresh_seconds",
+            self.fresh_seconds,
+            0.0,
+            5.0,
+            errors,
+        );
         validate_f64(prefix, "min_pressure", self.min_pressure, 0.0, 1.0, errors);
         validate_f64(
             prefix,
@@ -4026,7 +4046,9 @@ impl KillerPassOverTopTunables {
             + self.fit_line_weight
             + self.fit_keeper_weight;
         if fit_weight_sum <= 1e-9 {
-            eprintln!("soccer tunables: killer_pass_over_top fit weights sum to zero; using defaults");
+            eprintln!(
+                "soccer tunables: killer_pass_over_top fit weights sum to zero; using defaults"
+            );
             self.fit_distance_weight = default.fit_distance_weight;
             self.fit_angle_weight = default.fit_angle_weight;
             self.fit_line_weight = default.fit_line_weight;
@@ -4291,12 +4313,8 @@ mod tests {
         // The ordering the turnover model encodes: an own-half giveaway straight to
         // the opponent is the most expensive; a loose ball lost in the opponent's
         // half the least. Locking it in stops a future retune from inverting it.
-        assert!(
-            r.giveaway_to_opponent_own_half_penalty > r.giveaway_to_opponent_opp_half_penalty
-        );
-        assert!(
-            r.giveaway_to_opponent_opp_half_penalty > r.giveaway_to_loose_own_half_penalty
-        );
+        assert!(r.giveaway_to_opponent_own_half_penalty > r.giveaway_to_opponent_opp_half_penalty);
+        assert!(r.giveaway_to_opponent_opp_half_penalty > r.giveaway_to_loose_own_half_penalty);
         assert!(r.giveaway_to_loose_own_half_penalty > r.giveaway_to_loose_opp_half_penalty);
     }
 
@@ -4309,7 +4327,10 @@ mod tests {
         assert_eq!(r.giveaway_to_loose_opp_half_penalty, 0.55);
         let mut errors = Vec::new();
         r.validate_strict("reward", &mut errors);
-        assert!(errors.is_empty(), "default reward tunables must validate: {errors:?}");
+        assert!(
+            errors.is_empty(),
+            "default reward tunables must validate: {errors:?}"
+        );
 
         // A degenerate config can never inject a non-finite or wild penalty into a
         // gradient: non-finite is repaired to the default, out-of-range is clamped
@@ -4318,8 +4339,14 @@ mod tests {
         bad.giveaway_to_opponent_own_half_penalty = f64::NAN;
         bad.giveaway_to_loose_opp_half_penalty = 10_000.0;
         bad.sanitize();
-        assert_eq!(bad.giveaway_to_opponent_own_half_penalty, 3.5, "NaN -> default");
-        assert_eq!(bad.giveaway_to_loose_opp_half_penalty, 200.0, "out-of-range -> hard cap");
+        assert_eq!(
+            bad.giveaway_to_opponent_own_half_penalty, 3.5,
+            "NaN -> default"
+        );
+        assert_eq!(
+            bad.giveaway_to_loose_opp_half_penalty, 200.0,
+            "out-of-range -> hard cap"
+        );
     }
 
     #[test]
@@ -4401,46 +4428,33 @@ mod tests {
         assert_eq!(t.pomdp_perception.ball_holder_shoulder_confidence, 0.70);
         assert_eq!(t.pomdp_perception.ball_holder_side_scan_confidence, 0.52);
         assert_eq!(t.pomdp_perception.ball_holder_rear_scan_confidence, 0.38);
-        assert_eq!(
-            t.pomdp_perception.ball_holder_head_scan_min_seconds,
-            0.75
-        );
-        assert_eq!(
-            t.pomdp_perception.ball_holder_head_scan_max_seconds,
-            1.85
-        );
+        assert_eq!(t.pomdp_perception.ball_holder_head_scan_min_seconds, 0.75);
+        assert_eq!(t.pomdp_perception.ball_holder_head_scan_max_seconds, 1.85);
         assert_eq!(
             t.pomdp_perception
                 .ball_holder_head_scan_vision_relief_seconds,
             0.35
         );
         assert_eq!(
-            t.pomdp_perception
-                .ball_holder_scan_confidence_vision_bonus,
+            t.pomdp_perception.ball_holder_scan_confidence_vision_bonus,
             0.08
         );
         assert_eq!(t.pomdp_perception.ball_holder_scan_confidence_cap, 0.62);
         assert_eq!(
-            t.pomdp_perception
-                .ball_holder_head_scan_drift_risk_base,
+            t.pomdp_perception.ball_holder_head_scan_drift_risk_base,
             0.24
         );
         assert_eq!(
-            t.pomdp_perception
-                .ball_holder_head_scan_drift_risk_span,
+            t.pomdp_perception.ball_holder_head_scan_drift_risk_span,
             0.42
         );
         assert_eq!(t.pomdp_perception.kalman_point_match_radius_yards, 0.35);
         assert_eq!(t.pomdp_perception.kalman_min_history_samples, 2);
-        assert_eq!(
-            t.pomdp_perception.kalman_current_sample_epsilon_yards,
-            0.15
-        );
+        assert_eq!(t.pomdp_perception.kalman_current_sample_epsilon_yards, 0.15);
         assert_eq!(t.pomdp_perception.kalman_base_sigma_yards, 0.85);
         assert_eq!(t.pomdp_perception.kalman_speed_sigma_per_yps, 0.10);
         assert_eq!(
-            t.pomdp_perception
-                .kalman_velocity_disagreement_sigma_yards,
+            t.pomdp_perception.kalman_velocity_disagreement_sigma_yards,
             0.14
         );
         assert_eq!(t.pomdp_perception.kalman_visible_max_confidence, 0.96);
@@ -4503,8 +4517,7 @@ mod tests {
         assert_eq!(t.pomdp_perception.ball_holder_head_scan_max_seconds, 2.0);
         assert_eq!(t.pomdp_perception.ball_holder_side_scan_confidence, 0.55);
         assert_eq!(
-            t.pomdp_perception
-                .ball_holder_head_scan_drift_risk_span,
+            t.pomdp_perception.ball_holder_head_scan_drift_risk_span,
             0.50
         );
         assert_eq!(t.pomdp_perception.kalman_min_history_samples, 3);
@@ -4631,36 +4644,24 @@ mod tests {
         assert_eq!(t.pomdp_perception.player_reaction_max_seconds, 1.0);
         assert_eq!(t.pomdp_perception.ball_holder_core_degrees, 1.0);
         assert_eq!(t.pomdp_perception.ball_holder_side_scan_confidence, 1.0);
+        assert_eq!(t.pomdp_perception.ball_holder_head_scan_min_seconds, 3.0);
+        assert_eq!(t.pomdp_perception.ball_holder_head_scan_max_seconds, 3.0);
         assert_eq!(
-            t.pomdp_perception.ball_holder_head_scan_min_seconds,
-            3.0
-        );
-        assert_eq!(
-            t.pomdp_perception.ball_holder_head_scan_max_seconds,
-            3.0
-        );
-        assert_eq!(
-            t.pomdp_perception
-                .ball_holder_scan_confidence_vision_bonus,
+            t.pomdp_perception.ball_holder_scan_confidence_vision_bonus,
             0.25
         );
         assert_eq!(t.pomdp_perception.ball_holder_scan_confidence_cap, 0.0);
         assert_eq!(
-            t.pomdp_perception
-                .ball_holder_head_scan_drift_risk_base,
+            t.pomdp_perception.ball_holder_head_scan_drift_risk_base,
             1.0
         );
         assert_eq!(
-            t.pomdp_perception
-                .ball_holder_head_scan_drift_risk_span,
+            t.pomdp_perception.ball_holder_head_scan_drift_risk_span,
             0.0
         );
         assert_eq!(t.pomdp_perception.kalman_point_match_radius_yards, 5.0);
         assert_eq!(t.pomdp_perception.kalman_min_history_samples, 10);
-        assert_eq!(
-            t.pomdp_perception.kalman_current_sample_epsilon_yards,
-            0.0
-        );
+        assert_eq!(t.pomdp_perception.kalman_current_sample_epsilon_yards, 0.0);
         assert_eq!(t.pomdp_perception.kalman_base_sigma_yards, 0.01);
         assert_eq!(t.pomdp_perception.kalman_visible_max_confidence, 1.0);
     }
@@ -4702,9 +4703,7 @@ mod tests {
             "pomdp_perception.player_reaction_max_seconds < pomdp_perception.player_reaction_min_seconds"
         ));
         assert!(err.contains("pomdp_perception.ball_holder_side_scan_confidence"));
-        assert!(err.contains(
-            "pomdp_perception.ball_holder_head_scan_drift_risk_base"
-        ));
+        assert!(err.contains("pomdp_perception.ball_holder_head_scan_drift_risk_base"));
         assert!(err.contains("pomdp_perception.kalman_min_history_samples"));
         assert!(err.contains(
             "pomdp_perception.ball_holder_head_scan_max_seconds < pomdp_perception.ball_holder_head_scan_min_seconds"

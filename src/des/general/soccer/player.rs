@@ -6479,7 +6479,8 @@ impl PlayerAgent {
             check_to_ball: snapshot.check_to_ball_target_for(self.id, self.home_position),
             in_behind: snapshot.in_behind_run_target_for(self.id),
             exploit_space: snapshot.exploit_space_run_target_for(self.id, self.home_position),
-            forward_receive: snapshot.open_forward_receive_run_target_for(self.id, self.home_position),
+            forward_receive: snapshot
+                .open_forward_receive_run_target_for(self.id, self.home_position),
             wide_outlet: snapshot.wide_possession_outlet_target_for(self.id, self.home_position),
             flank_cross_arrival: snapshot
                 .flank_cross_arrival_target_for(self.id, self.home_position),
@@ -8577,10 +8578,7 @@ impl PlayerAgent {
                             "keeper-foot-control-outside-box",
                         )
                     } else {
-                        (
-                            vec!["ball-at-feet-reflex".to_string()],
-                            "control-touch",
-                        )
+                        (vec!["ball-at-feet-reflex".to_string()], "control-touch")
                     };
                     self.last_decision = Some(self.decision_trace(
                         snapshot,
@@ -11864,11 +11862,11 @@ impl PlayerAgent {
                             })
                         } else {
                             support_context.special_targets.exploit_space.map(|point| {
-                            SupportMovementTarget {
-                                point: guarded_support_special(point),
-                                action_label: "exploit-space-run",
-                            }
-                        })
+                                SupportMovementTarget {
+                                    point: guarded_support_special(point),
+                                    action_label: "exploit-space-run",
+                                }
+                            })
                         }
                     }
                     "wide-outlet" => support_context.special_targets.wide_outlet.map(|point| {
@@ -12092,7 +12090,11 @@ impl PlayerAgent {
                         let (target, push_up) =
                             snapshot.defensive_push_up_adjustment(self.id, target);
                         push_up_sprint = push_up;
-                        let label = if press_cover { "press-cover" } else { op.as_str() };
+                        let label = if press_cover {
+                            "press-cover"
+                        } else {
+                            op.as_str()
+                        };
                         chosen = Some((SoccerAction::MoveTo(target), label.to_string()));
                         break;
                     }
@@ -12472,16 +12474,15 @@ impl PlayerAgent {
                         snapshot
                             .dribble_to_open_passing_lane_for(self.id)
                             .map(|(target, _, _)| {
-                                let kind = open_pass_lane_kind_for_target(self.team, current, target);
-                                let touch = open_pass_lane_touch_for_target(
-                                    self.team,
-                                    current,
-                                    target,
-                                )
-                                .unwrap_or_else(|| {
-                                    snapshot
-                                        .deterministic_dribble_touch_decision_for(self.id, kind)
-                                });
+                                let kind =
+                                    open_pass_lane_kind_for_target(self.team, current, target);
+                                let touch =
+                                    open_pass_lane_touch_for_target(self.team, current, target)
+                                        .unwrap_or_else(|| {
+                                            snapshot.deterministic_dribble_touch_decision_for(
+                                                self.id, kind,
+                                            )
+                                        });
                                 (target, kind, touch)
                             })
                     })
@@ -13205,14 +13206,16 @@ impl PlayerAgent {
                     "slide-tackle".to_string(),
                 )
             }),
-            "blindside-steal" => snapshot.blindside_steal_assessment(self.id).map(|assessment| {
-                (
-                    SoccerAction::Tackle {
-                        target_player: assessment.target,
-                    },
-                    "blindside-steal".to_string(),
-                )
-            }),
+            "blindside-steal" => snapshot
+                .blindside_steal_assessment(self.id)
+                .map(|assessment| {
+                    (
+                        SoccerAction::Tackle {
+                            target_player: assessment.target,
+                        },
+                        "blindside-steal".to_string(),
+                    )
+                }),
             "press-cover" if snapshot.controlled_possession_team() == Some(self.team.other()) => {
                 let assignment =
                     snapshot.defensive_assignment_for(self.id, self.home_position, true);
@@ -13253,14 +13256,12 @@ impl PlayerAgent {
                         "lane-yield".to_string(),
                     )
                 }),
-            "buildup-receive" if !observation.has_ball => {
-                Some((
-                    SoccerAction::MoveTo(
-                        snapshot.goalkeeper_buildup_lane_target_for(self.id, self.home_position),
-                    ),
-                    "buildup-receive".to_string(),
-                ))
-            }
+            "buildup-receive" if !observation.has_ball => Some((
+                SoccerAction::MoveTo(
+                    snapshot.goalkeeper_buildup_lane_target_for(self.id, self.home_position),
+                ),
+                "buildup-receive".to_string(),
+            )),
             "check-to-ball" if !observation.has_ball => snapshot
                 .check_to_ball_target_for(self.id, self.home_position)
                 .map(|target| {
@@ -13305,14 +13306,9 @@ impl PlayerAgent {
                         "wide-outlet".to_string(),
                     )
                 }),
-            "one-two-run" if !observation.has_ball => {
-                snapshot.one_two_run_target_for(self.id).map(|target| {
-                    (
-                        SoccerAction::MoveTo(target),
-                        "one-two-run".to_string(),
-                    )
-                })
-            }
+            "one-two-run" if !observation.has_ball => snapshot
+                .one_two_run_target_for(self.id)
+                .map(|target| (SoccerAction::MoveTo(target), "one-two-run".to_string())),
             "pinch-cross-arrival" if !observation.has_ball => snapshot
                 .flank_cross_arrival_target_for(self.id, self.home_position)
                 .map(|target| {
