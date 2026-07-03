@@ -1243,7 +1243,9 @@ const COMPLETED_FORWARD_PASS_PROGRESS_REWARD_MAX_YARDS: f64 = 30.0;
 const COMPLETED_FLANK_PASS_BONUS_POINTS: f64 = 2.4;
 const COMPLETED_FLANK_PASS_OWN_HALF_MULTIPLIER: f64 = 1.55;
 const OWN_HALF_FLANK_TACTICAL_REWARD_MULTIPLIER: f64 = 1.35;
-const COMPLETED_FIRST_TIME_SHORT_FORWARD_PASS_BONUS_POINTS: f64 = 3.4;
+// Raised 3.4→7.0: a first-touch/quick forward pass is exactly the fast, progressive ball we want
+// the policy to prefer over holding or dribbling — reward it well above a plain completed pass (4).
+const COMPLETED_FIRST_TIME_SHORT_FORWARD_PASS_BONUS_POINTS: f64 = 7.0;
 const FIRST_TIME_SHORT_FORWARD_PASS_MIN_PROGRESS_YARDS: f64 = 1.25;
 const FIRST_TIME_SHORT_FORWARD_PASS_MIN_YARDS: f64 = 5.47;
 const FIRST_TIME_SHORT_FORWARD_PASS_IDEAL_MAX_YARDS: f64 = 8.75;
