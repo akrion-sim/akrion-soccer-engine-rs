@@ -1943,6 +1943,11 @@ fn soccer_learning_team_play_quality(team: Team, summary: &MatchSummary) -> f64 
     let pass_volume = soccer_learning_bounded_count(pass_attempts, 60.0);
     let pass_completion = soccer_learning_ratio(pass_completed, pass_attempts);
     let forward_share = soccer_learning_ratio(forward_completed, pass_completed);
+    let goals_scored = match team {
+        Team::Home => summary.score_home,
+        Team::Away => summary.score_away,
+    };
+    let goal_quality = soccer_learning_bounded_count(goals_scored, 4.0);
     let shot_volume = soccer_learning_bounded_count(shots, 12.0);
     let shot_accuracy = soccer_learning_ratio(shots_on_target, shots);
     let dribble_quality = soccer_learning_bounded_count(dribble_beats, 8.0);
@@ -1959,19 +1964,20 @@ fn soccer_learning_team_play_quality(team: Team, summary: &MatchSummary) -> f64 
     let chain_backward_penalty = soccer_learning_bounded_count(chains_net_loss, 10.0);
     let chain_progress_quality = (chain_forward - chain_backward_penalty * 0.5).clamp(0.0, 1.0);
 
-    (pass_volume * 0.05
-        + pass_completion * 0.20
-        + forward_share * 0.10
-        + shot_volume * 0.08
-        + shot_accuracy * 0.13
-        + dribble_quality * 0.05
+    (pass_volume * 0.03
+        + pass_completion * 0.15
+        + forward_share * 0.08
+        + goal_quality * 0.12
+        + shot_volume * 0.10
+        + shot_accuracy * 0.14
+        + dribble_quality * 0.04
         + recovery_quality * 0.04
-        + upfield_quality * 0.08
+        + upfield_quality * 0.07
         + near_ball_quality * 0.03
-        + assist_quality * 0.09
+        + assist_quality * 0.08
         + cross_quality * 0.03
-        + worked_chance_quality * 0.04
-        + chain_progress_quality * 0.08)
+        + worked_chance_quality * 0.05
+        + chain_progress_quality * 0.04)
         .clamp(0.0, 1.0)
 }
 
@@ -8537,6 +8543,44 @@ mod tests {
         assert!(
             fitness(&worked) > fitness(&scrappy),
             "same scoreline: more chance-creation/progression must rank higher"
+        );
+    }
+
+    #[test]
+    fn play_quality_prioritizes_goals_and_shots_over_pass_chain_farming() {
+        let mut incisive_stats = MatchStats::default();
+        incisive_stats.passes_attempted_home = 16;
+        incisive_stats.passes_completed_home = 10;
+        incisive_stats.passes_completed_forward_home = 6;
+        incisive_stats.shots_home = 6;
+        incisive_stats.shots_on_target_home = 4;
+        incisive_stats.shots_after_pass_home = 2;
+        let incisive = MatchSummary {
+            score_home: 2,
+            score_away: 0,
+            ticks: 100,
+            simulated_seconds: 90.0,
+            stats: incisive_stats,
+        };
+
+        let mut sterile_stats = MatchStats::default();
+        sterile_stats.passes_attempted_home = 60;
+        sterile_stats.passes_completed_home = 54;
+        sterile_stats.passes_completed_forward_home = 45;
+        sterile_stats.pass_chain_gain_yards_home = 160.0;
+        let sterile = MatchSummary {
+            score_home: 0,
+            score_away: 0,
+            ticks: 100,
+            simulated_seconds: 90.0,
+            stats: sterile_stats,
+        };
+
+        let incisive_quality = soccer_learning_team_play_quality(Team::Home, &incisive);
+        let sterile_quality = soccer_learning_team_play_quality(Team::Home, &sterile);
+        assert!(
+            incisive_quality > sterile_quality,
+            "goals and shots-on-target should outrank sterile pass chains: incisive={incisive_quality}, sterile={sterile_quality}"
         );
     }
 }

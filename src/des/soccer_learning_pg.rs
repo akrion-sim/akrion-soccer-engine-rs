@@ -105,6 +105,8 @@ const SOCCER_COMPLETED_RUN_INSERT_BATCH_SIZE: usize = 512;
 const SOCCER_POLICY_RETENTION_BRANCH_TIP: &str = "branch_tip";
 const SOCCER_POLICY_INLINE_PRUNE_ENV: &str = "SOCCER_PG_INLINE_POLICY_PRUNE";
 const SOCCER_POLICY_RETAIN_ARCHIVED_ENTRIES_ENV: &str = "SOCCER_PG_RETAIN_ARCHIVED_POLICY_ENTRIES";
+const SOCCER_PG_PERSIST_RUN_DELTAS_ENV: &str = "SOCCER_PG_PERSIST_RUN_DELTAS";
+const SOCCER_PG_RESUME_MAX_POLICY_ENTRIES_ENV: &str = "SOCCER_PG_RESUME_MAX_POLICY_ENTRIES";
 /// Rows deleted per statement when cleaning up a superseded generation's entries.
 /// Inline pruning is opt-in via [`SOCCER_POLICY_INLINE_PRUNE_ENV`]; live learners defer this
 /// heavyweight maintenance so policy promotion cannot stall on a large delete.
@@ -2544,7 +2546,9 @@ impl SoccerLearningPgStore {
                 runner_id,
                 chunk,
             )?;
-            insert_completed_run_delta_rows_in_transaction(&mut tx, &chunk_run_ids, chunk)?;
+            if soccer_learning_pg_persist_run_deltas_enabled() {
+                insert_completed_run_delta_rows_in_transaction(&mut tx, &chunk_run_ids, chunk)?;
+            }
             if has_config_moments {
                 for (run_id, run) in chunk_run_ids.iter().zip(chunk.iter()) {
                     if !run.game.config_moments.is_empty() {
@@ -3245,10 +3249,22 @@ impl SoccerLearningPgStore {
         // the full multi-million-row policy. See `load_latest_active_policy_with_min_visits`.
         min_visits: i32,
     ) -> Result<SoccerTeamQPolicies, String> {
+        let max_policy_entries = soccer_pg_resume_max_policy_entries();
+        if max_policy_entries == Some(0) {
+            println!(
+                "soccer-learning-pg: skipping tabular policy entries for policy_version={} because {}=0; neural snapshot/config still load",
+                policy_version_id, SOCCER_PG_RESUME_MAX_POLICY_ENTRIES_ENV
+            );
+            return Ok(SoccerTeamQPolicies {
+                home: SoccerQPolicy::new(home_options),
+                away: SoccerQPolicy::new(away_options),
+            });
+        }
         let mut home_entries = Vec::new();
         let mut away_entries = Vec::new();
         let mut home_targets = Vec::new();
         let mut away_targets = Vec::new();
+        let mut loaded_entries = 0usize;
 
         // Keyset (seek) pagination over the FULL unique key — paging on only
         // (team, entry_kind, state_hash, action) would skip rows at a page boundary because
@@ -3323,6 +3339,9 @@ impl SoccerLearningPgStore {
             }
 
             for row in &rows {
+                if max_policy_entries.is_some_and(|max_entries| loaded_entries >= max_entries) {
+                    break;
+                }
                 let team: String = row.get(0);
                 let entry_kind: String = row.get(1);
                 let state_key_json: Value = row.get(2);
@@ -3372,6 +3391,18 @@ impl SoccerLearningPgStore {
                     }),
                     _ => {}
                 }
+                loaded_entries = loaded_entries.saturating_add(1);
+            }
+
+            if max_policy_entries.is_some_and(|max_entries| loaded_entries >= max_entries) {
+                println!(
+                    "soccer-learning-pg: capped tabular policy entry load policy_version={} loaded_entries={} {}={}",
+                    policy_version_id,
+                    loaded_entries,
+                    SOCCER_PG_RESUME_MAX_POLICY_ENTRIES_ENV,
+                    loaded_entries
+                );
+                break;
             }
 
             // A short page means the last row of the version has been read.
@@ -3518,7 +3549,9 @@ fn insert_completed_run_in_transaction(
         .map_err(|err| format!("insert soccer learning run: {err}"))?;
     let run_id: String = row.get(0);
 
-    insert_run_delta_rows(tx, &run_id, &game.delta.entries)?;
+    if soccer_learning_pg_persist_run_deltas_enabled() {
+        insert_run_delta_rows(tx, &run_id, &game.delta.entries)?;
+    }
 
     Ok(run_id)
 }
@@ -5337,6 +5370,12 @@ fn soccer_learning_env_nonnegative_i32(name: &str, default: i32) -> i32 {
         .unwrap_or(default)
 }
 
+fn soccer_pg_resume_max_policy_entries() -> Option<usize> {
+    std::env::var(SOCCER_PG_RESUME_MAX_POLICY_ENTRIES_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+}
+
 fn soccer_neural_snapshot_lookback_generations() -> i32 {
     soccer_learning_env_nonnegative_i32("SOCCER_POLICY_PROMOTION_BASELINE_LOOKBACK_GENERATIONS", 16)
 }
@@ -5380,6 +5419,19 @@ fn soccer_policy_inline_prune_enabled_from_env_value(raw: Option<&str>) -> bool 
         || value.eq_ignore_ascii_case("true")
         || value.eq_ignore_ascii_case("yes")
         || value.eq_ignore_ascii_case("on")
+}
+
+fn soccer_learning_pg_persist_run_deltas_enabled() -> bool {
+    let raw = std::env::var(SOCCER_PG_PERSIST_RUN_DELTAS_ENV).ok();
+    soccer_learning_pg_persist_run_deltas_enabled_from_env_value(raw.as_deref())
+}
+
+fn soccer_learning_pg_persist_run_deltas_enabled_from_env_value(raw: Option<&str>) -> bool {
+    let value = raw.unwrap_or("").trim();
+    !(value == "0"
+        || value.eq_ignore_ascii_case("false")
+        || value.eq_ignore_ascii_case("no")
+        || value.eq_ignore_ascii_case("off"))
 }
 
 fn soccer_learning_pg_should_verify_certificates(database_url: &str) -> bool {
@@ -6297,6 +6349,17 @@ mod tests {
         assert!(soccer_policy_inline_prune_enabled_from_env_value(Some(
             " on "
         )));
+    }
+
+    #[test]
+    fn run_delta_persistence_defaults_on_and_can_be_disabled() {
+        assert!(soccer_learning_pg_persist_run_deltas_enabled_from_env_value(None));
+        assert!(soccer_learning_pg_persist_run_deltas_enabled_from_env_value(Some("")));
+        assert!(soccer_learning_pg_persist_run_deltas_enabled_from_env_value(Some("1")));
+        assert!(soccer_learning_pg_persist_run_deltas_enabled_from_env_value(Some("true")));
+        assert!(!soccer_learning_pg_persist_run_deltas_enabled_from_env_value(Some("0")));
+        assert!(!soccer_learning_pg_persist_run_deltas_enabled_from_env_value(Some("false")));
+        assert!(!soccer_learning_pg_persist_run_deltas_enabled_from_env_value(Some(" off ")));
     }
 
     #[test]
