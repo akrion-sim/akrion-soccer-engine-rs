@@ -303,7 +303,10 @@ mod tests {
         // 100% over few games is NOT confidently > 0.5; over many games it is.
         let few = wilson_lower_bound(1.0, 3, PROMOTION_WILSON_Z);
         let many = wilson_lower_bound(1.0, 50, PROMOTION_WILSON_Z);
-        assert!(few < many, "more games ⇒ tighter (higher) lower bound: {few} vs {many}");
+        assert!(
+            few < many,
+            "more games ⇒ tighter (higher) lower bound: {few} vs {many}"
+        );
         assert!(few < 1.0 && few > 0.0);
         // n == 0 is the floor.
         assert_eq!(wilson_lower_bound(1.0, 0, PROMOTION_WILSON_Z), 0.0);
@@ -314,10 +317,11 @@ mod tests {
     #[test]
     fn candidate_record_counts_both_orientations_and_shootouts() {
         let reports = vec![
-            report(1, 2, 3, 1),           // home win
-            report(2, 1, 0, 2),           // away win
-            report(1, 3, 1, 1),           // draw
-            MatchReport {                 // level, shootout to candidate
+            report(1, 2, 3, 1), // home win
+            report(2, 1, 0, 2), // away win
+            report(1, 3, 1, 1), // draw
+            MatchReport {
+                // level, shootout to candidate
                 shootout_winner: Some(1),
                 ..report(1, 4, 2, 2)
             },
@@ -350,10 +354,7 @@ mod tests {
         }
         let verdict = evaluate_promotion(&reports, 1, 2, PromotionThresholds::default());
         assert!(!verdict.promote);
-        assert!(verdict
-            .reasons
-            .iter()
-            .any(|r| r.contains("not confident")));
+        assert!(verdict.reasons.iter().any(|r| r.contains("not confident")));
     }
 
     #[test]
@@ -369,7 +370,10 @@ mod tests {
             reports.push(report(4, 1, 2, 0)); // 4 beats the candidate every time
         }
         let verdict = evaluate_promotion(&reports, 1, 2, PromotionThresholds::default());
-        assert!(!verdict.promote, "a hard-countered brain is different, not better");
+        assert!(
+            !verdict.promote,
+            "a hard-countered brain is different, not better"
+        );
         assert_eq!(verdict.worst_case.map(|(o, _)| o), Some(4));
         assert!(verdict.reasons.iter().any(|r| r.contains("exploitable")));
     }

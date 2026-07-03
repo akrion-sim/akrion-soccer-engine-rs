@@ -312,7 +312,11 @@ impl LaneAffinityHead {
                 self.training_steps += 1;
             }
         }
-        let mean = if applied > 0 { total / applied as f64 } else { 0.0 };
+        let mean = if applied > 0 {
+            total / applied as f64
+        } else {
+            0.0
+        };
         self.last_loss = Some(mean);
         mean
     }
@@ -366,7 +370,11 @@ impl LaneAffinityHead {
                 self.training_steps += 1;
             }
         }
-        let mean = if applied > 0 { total / applied as f64 } else { 0.0 };
+        let mean = if applied > 0 {
+            total / applied as f64
+        } else {
+            0.0
+        };
         self.last_loss = Some(mean);
         mean
     }
@@ -453,7 +461,10 @@ impl WorldSnapshot {
             return None;
         }
         // The two competing positions: `bounded` (break, out of lane) and the lane edge.
-        let lane_pos = Vec2 { x: lane_x, y: bounded.y };
+        let lane_pos = Vec2 {
+            x: lane_x,
+            y: bounded.y,
+        };
         let break_dx = bounded.x - lane_x;
         if break_dx.abs() <= 1e-3 {
             return None;
@@ -577,13 +588,12 @@ impl SoccerMatch {
             if self.pending_lane_affinity[i].due_tick <= tick {
                 let decision = self.pending_lane_affinity.swap_remove(i);
                 let now_territorial = territorial_advantage(snapshot, decision.team);
-                let territorial_delta = if now_territorial.is_finite()
-                    && decision.decision_territorial.is_finite()
-                {
-                    now_territorial - decision.decision_territorial
-                } else {
-                    0.0
-                };
+                let territorial_delta =
+                    if now_territorial.is_finite() && decision.decision_territorial.is_finite() {
+                        now_territorial - decision.decision_territorial
+                    } else {
+                        0.0
+                    };
                 let reward = decision.reward_accum
                     + LANE_AFFINITY_TERRITORIAL_SHAPING_WEIGHT * territorial_delta;
                 if reward.is_finite() {
@@ -593,8 +603,7 @@ impl SoccerMatch {
                         reward,
                     });
                     if self.lane_affinity_samples.len() > LANE_AFFINITY_SAMPLE_CAP {
-                        let overflow =
-                            self.lane_affinity_samples.len() - LANE_AFFINITY_SAMPLE_CAP;
+                        let overflow = self.lane_affinity_samples.len() - LANE_AFFINITY_SAMPLE_CAP;
                         self.lane_affinity_samples.drain(0..overflow);
                     }
                 }
@@ -634,9 +643,14 @@ impl SoccerMatch {
                 snapshot.field_width,
                 in_possession,
             );
-            let Some(inputs) =
-                snapshot.build_lane_affinity_inputs(player, pos, lane_x, &fit, relief, in_possession)
-            else {
+            let Some(inputs) = snapshot.build_lane_affinity_inputs(
+                player,
+                pos,
+                lane_x,
+                &fit,
+                relief,
+                in_possession,
+            ) else {
                 continue;
             };
             // The break/hold action the engine used this tick (head once trained, else seed).
@@ -645,15 +659,16 @@ impl SoccerMatch {
                 .unwrap_or_else(|| analytic_lane_break_bias(&inputs));
             let territorial = territorial_advantage(snapshot, player.team);
             if territorial.is_finite() {
-                self.pending_lane_affinity.push(PendingLaneAffinityDecision {
-                    team: player.team,
-                    player_id: id,
-                    inputs,
-                    action_bias,
-                    decision_territorial: territorial,
-                    reward_accum: 0.0,
-                    due_tick: tick + LANE_AFFINITY_REWARD_WINDOW_TICKS,
-                });
+                self.pending_lane_affinity
+                    .push(PendingLaneAffinityDecision {
+                        team: player.team,
+                        player_id: id,
+                        inputs,
+                        action_bias,
+                        decision_territorial: territorial,
+                        reward_accum: 0.0,
+                        due_tick: tick + LANE_AFFINITY_REWARD_WINDOW_TICKS,
+                    });
             }
         }
     }
@@ -715,7 +730,10 @@ mod lane_affinity_tests {
     fn even_break_offers_no_reason_to_leave_the_lane() {
         // Equal space, no ball pull ⇒ the coach's prior holds the lane (≈ 0).
         let b = analytic_lane_break_bias(&baseline_inputs());
-        assert!(b.abs() < 0.05, "a neutral state should barely move the clamp, got {b}");
+        assert!(
+            b.abs() < 0.05,
+            "a neutral state should barely move the clamp, got {b}"
+        );
     }
 
     #[test]
@@ -726,7 +744,10 @@ mod lane_affinity_tests {
         brk.ball_alignment = 1.0; // toward the play
         brk.teammate_redundancy = 0.0;
         let b = analytic_lane_break_bias(&brk);
-        assert!(b < 0.0, "real space toward the play should bias toward breaking, got {b}");
+        assert!(
+            b < 0.0,
+            "real space toward the play should bias toward breaking, got {b}"
+        );
     }
 
     #[test]
@@ -755,7 +776,10 @@ mod lane_affinity_tests {
         def.space_at_lane = 9.0;
         def.nearest_opp_at_target = 2.0; // contested
         let b = analytic_lane_break_bias(&def);
-        assert!(b > 0.0, "a defender with covered out-of-lane space should hold harder, got {b}");
+        assert!(
+            b > 0.0,
+            "a defender with covered out-of-lane space should hold harder, got {b}"
+        );
     }
 
     #[test]
@@ -775,8 +799,16 @@ mod lane_affinity_tests {
         let samples: Vec<LaneAffinitySample> = (0..32)
             .flat_map(|_| {
                 [
-                    LaneAffinitySample { inputs: inputs.clone(), action_bias: -0.8, reward: 1.0 },
-                    LaneAffinitySample { inputs: inputs.clone(), action_bias: 0.8, reward: -1.0 },
+                    LaneAffinitySample {
+                        inputs: inputs.clone(),
+                        action_bias: -0.8,
+                        reward: 1.0,
+                    },
+                    LaneAffinitySample {
+                        inputs: inputs.clone(),
+                        action_bias: 0.8,
+                        reward: -1.0,
+                    },
                 ]
             })
             .collect();

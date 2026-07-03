@@ -5761,8 +5761,7 @@ fn forward_pass_progress_is_valued_three_times_backward_recycle() {
         "forward progress should still outrank equal-yard backward recycling: forward={forward} backward={backward}"
     );
     assert!(
-        (forward / backward.abs()
-            - FORWARD_PASS_VALUE_MULTIPLIER / BACKWARD_PASS_VALUE_MULTIPLIER)
+        (forward / backward.abs() - FORWARD_PASS_VALUE_MULTIPLIER / BACKWARD_PASS_VALUE_MULTIPLIER)
             .abs()
             < 1e-12,
         "directional score must follow the configured forward/backward weights"
@@ -10502,13 +10501,8 @@ fn completed_killer_pass_reward_values_threaded_goal_channel_delivery() {
 
 #[test]
 fn threaded_goal_channel_fit_handles_small_curriculum_fields() {
-    let fit = threaded_goal_channel_fit_for_reception(
-        Team::Home,
-        Vec2::new(15.0, 50.0),
-        30.0,
-        54.0,
-        8.0,
-    );
+    let fit =
+        threaded_goal_channel_fit_for_reception(Team::Home, Vec2::new(15.0, 50.0), 30.0, 54.0, 8.0);
 
     assert!(fit.is_finite());
     assert!(
@@ -10807,7 +10801,17 @@ fn concede_symmetry_gate_scales_up_the_concede_penalty() {
 
     let reward_for = |pid: usize| -> f64 {
         let decision = test_decision_trace(&before, pid, "hold");
-        soccer_transition_reward(&sim.players[pid], &decision, &before, &after, 0, 0, 0, 1, true)
+        soccer_transition_reward(
+            &sim.players[pid],
+            &decision,
+            &before,
+            &after,
+            0,
+            0,
+            0,
+            1,
+            true,
+        )
     };
 
     let def_baseline = reward_for(defender);
@@ -15723,6 +15727,21 @@ fn whole_field_motion_block_feeds_all_players_into_the_neural_input() {
             "whole-field POMDP channel {i} must appear in the neural feature tail"
         );
     }
+    let policy_features = soccer_policy_features_for_role(
+        &features,
+        transition.role,
+        transition
+            .state
+            .assigned_position
+            .or(transition.observation.assigned_position),
+    );
+    for (i, &v) in block.iter().enumerate() {
+        assert_eq!(
+            policy_features[SOCCER_NEURAL_BASE_FEATURE_DIM + i],
+            f64::from(v),
+            "actor/MAPPO state channel {i} must preserve the whole-field POMDP vector"
+        );
+    }
     assert_eq!(
         features[SOCCER_NEURAL_FEATURE_BALL_FINE_LANE],
         soccer_neural_scaled(
@@ -15998,9 +16017,17 @@ fn pomdp_q_state_and_player_decision_use_front_behind_field_context() {
         SOCCER_NEURAL_PRE_IDEA_EXECUTION_FEATURE_DIM + SOCCER_NEURAL_IDEA_EXECUTION_FEATURE_DIM
     );
     assert_eq!(
+        SOCCER_NEURAL_PRE_SAME_TEAM_SEPARATION_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM + SOCCER_NEURAL_EXECUTION_MPC_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_PRE_DECISION_CONTEXT_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_SAME_TEAM_SEPARATION_FEATURE_DIM
+            + SOCCER_NEURAL_SAME_TEAM_SEPARATION_FEATURE_DIM
+    );
+    assert_eq!(
         SOCCER_NEURAL_FEATURE_DIM,
-        SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM
-            + SOCCER_NEURAL_EXECUTION_MPC_FEATURE_DIM
+        SOCCER_NEURAL_PRE_DECISION_CONTEXT_FEATURE_DIM + SOCCER_NEURAL_DECISION_CONTEXT_FEATURE_DIM
     );
 
     let mut stale_observation = observation.clone();
@@ -20930,7 +20957,10 @@ fn unclaimed_loose_ball_penalizes_both_teams_and_rewards_claimant() {
         .ceil() as u64;
 
     let pressure = sim.loose_ball_unclaimed_reward_pressure();
-    assert!(pressure > 0.65, "test setup should create stale loose-ball pressure: {pressure}");
+    assert!(
+        pressure > 0.65,
+        "test setup should create stale loose-ball pressure: {pressure}"
+    );
     sim.record_unclaimed_loose_ball_tick_penalties();
     let home_penalty = sim
         .reward_events
@@ -21095,7 +21125,10 @@ fn unclaimed_loose_ball_recovery_reward_survives_live_ball_step_control() {
         / sim.config.dt_seconds)
         .ceil() as u64;
     let pressure = sim.loose_ball_unclaimed_reward_pressure();
-    assert!(pressure > 0.55, "test setup should create stale loose-ball pressure: {pressure}");
+    assert!(
+        pressure > 0.55,
+        "test setup should create stale loose-ball pressure: {pressure}"
+    );
 
     let event_start = sim.reward_events.len();
     sim.run_ball_time_step();
@@ -22796,8 +22829,8 @@ fn back_four_anchor_pivot_holds_multiple_defenders_already_on_desired_line() {
     let anchored = WorldSnapshot::from_match(&sim);
     let first_target =
         anchored.back_four_shape_adjusted_target(first_anchor, sim.players[first_anchor].position);
-    let second_target =
-        anchored.back_four_shape_adjusted_target(second_anchor, sim.players[second_anchor].position);
+    let second_target = anchored
+        .back_four_shape_adjusted_target(second_anchor, sim.players[second_anchor].position);
     let deep_target =
         anchored.back_four_shape_adjusted_target(deep_peer, sim.players[deep_peer].position);
     let high_target =
@@ -37216,12 +37249,18 @@ fn assigned_positions_cover_default_xi_and_feed_learning_state() {
     let left_mid = snapshot
         .players
         .iter()
-        .find(|player| player.team == Team::Home && player.assigned_position == SoccerAssignedPosition::LeftMidfielder)
+        .find(|player| {
+            player.team == Team::Home
+                && player.assigned_position == SoccerAssignedPosition::LeftMidfielder
+        })
         .expect("home left midfielder");
     let state = snapshot.mdp_state_for_player(left_mid.id);
     let observation = snapshot.observation_for(left_mid.id);
     let q_key = SoccerQStateKey::from_parts(&state, &observation, left_mid.team, left_mid.role);
-    assert_eq!(state.assigned_position, Some(SoccerAssignedPosition::LeftMidfielder));
+    assert_eq!(
+        state.assigned_position,
+        Some(SoccerAssignedPosition::LeftMidfielder)
+    );
     assert_eq!(
         observation.assigned_position,
         Some(SoccerAssignedPosition::LeftMidfielder)
@@ -41115,18 +41154,16 @@ fn learning_context_splits_mdp_pomdp_idea_from_mpc_execution() {
     assert!(right_idea_wrong_execution.right_idea_wrong_execution);
     assert!(!right_idea_wrong_execution.wrong_idea_right_execution);
 
-    let mut transition =
-        test_learning_transition(&sim, 11, player_id, team, "pass");
+    let mut transition = test_learning_transition(&sim, 11, player_id, team, "pass");
     transition.decision_context = right_idea_wrong_execution;
     let features = soccer_neural_transition_features(&transition);
 
-    assert_eq!(features[SOCCER_NEURAL_FEATURE_IDEA_EXECUTION_AVAILABLE], 1.0);
-    assert!(
-        (features[SOCCER_NEURAL_FEATURE_MDP_POMDP_IDEA_QUALITY] - 0.82).abs() < 1e-9
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_IDEA_EXECUTION_AVAILABLE],
+        1.0
     );
-    assert!(
-        (features[SOCCER_NEURAL_FEATURE_MPC_EXECUTION_QUALITY] - 0.24).abs() < 1e-9
-    );
+    assert!((features[SOCCER_NEURAL_FEATURE_MDP_POMDP_IDEA_QUALITY] - 0.82).abs() < 1e-9);
+    assert!((features[SOCCER_NEURAL_FEATURE_MPC_EXECUTION_QUALITY] - 0.24).abs() < 1e-9);
     assert_eq!(
         features[SOCCER_NEURAL_FEATURE_RIGHT_IDEA_WRONG_EXECUTION],
         1.0
@@ -41180,9 +41217,7 @@ fn learning_context_splits_mdp_pomdp_idea_from_mpc_execution() {
         features[SOCCER_NEURAL_FEATURE_EXECUTION_MPC_DEVIATION_RECORDED],
         1.0
     );
-    assert!(
-        (features[SOCCER_NEURAL_FEATURE_EXECUTION_MPC_PROBABILITY] - 0.73).abs() < 1e-9
-    );
+    assert!((features[SOCCER_NEURAL_FEATURE_EXECUTION_MPC_PROBABILITY] - 0.73).abs() < 1e-9);
     assert_eq!(
         features[SOCCER_NEURAL_FEATURE_EXECUTION_MPC_TARGET_DELTA],
         soccer_neural_scaled(9.0, 18.0)
@@ -41209,14 +41244,23 @@ fn learning_context_splits_mdp_pomdp_idea_from_mpc_execution() {
     );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_EXECUTION_MPC_RECOMMENDED_SPEED + 1,
-        SOCCER_NEURAL_FEATURE_DIM
+        SOCCER_NEURAL_PRE_SAME_TEAM_SEPARATION_FEATURE_DIM
     );
-    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(
-        &SOCCER_NEURAL_PRE_IDEA_EXECUTION_FEATURE_DIM
-    ));
-    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(
-        &SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM
-    ));
+    assert_eq!(
+        SOCCER_NEURAL_PRE_DECISION_CONTEXT_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_SAME_TEAM_SEPARATION_FEATURE_DIM
+            + SOCCER_NEURAL_SAME_TEAM_SEPARATION_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_DECISION_CONTEXT_FEATURE_DIM + SOCCER_NEURAL_DECISION_CONTEXT_FEATURE_DIM
+    );
+    assert!(
+        SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_IDEA_EXECUTION_FEATURE_DIM)
+    );
+    assert!(
+        SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM)
+    );
 }
 
 #[test]
@@ -51195,7 +51239,10 @@ fn outside_midfielder_pinch_cross_arrival_when_ball_reaches_final_third() {
     let support = snapshot.attacking_support_movement_for(outside_mid, home, false);
     let center_x = sim.config.field_width_yards * 0.5;
 
-    assert_eq!(snapshot.players[outside_mid].assigned_position, SoccerAssignedPosition::LeftMidfielder);
+    assert_eq!(
+        snapshot.players[outside_mid].assigned_position,
+        SoccerAssignedPosition::LeftMidfielder
+    );
     assert_eq!(support.action_label, "pinch-cross-arrival");
     assert!(
         (pinch.x - center_x).abs() + 6.0 < (wide.x - center_x).abs(),
@@ -51234,7 +51281,9 @@ fn winger_pinch_and_crash_box_contexts_feed_q_state_and_neural_tail() {
     sim.players[crosser].position = sim.ball.position;
     sim.players[weak_side_winger].position = Vec2::new(13.0, 84.0);
     sim.players[weak_side_winger].role = PlayerRole::Midfielder;
-    sim.players[weak_side_winger].preferences.offensive_mindedness = 0.9;
+    sim.players[weak_side_winger]
+        .preferences
+        .offensive_mindedness = 0.9;
     sim.players[9].role = PlayerRole::Forward;
     sim.players[9].position = Vec2::new(36.0, 82.0);
     sim.players[10].role = PlayerRole::Forward;
@@ -51293,7 +51342,10 @@ fn winger_pinch_and_crash_box_contexts_feed_q_state_and_neural_tail() {
     assert!(features[SOCCER_NEURAL_FEATURE_WINGER_PINCH_CHOICE] > 0.0);
     assert!(features[SOCCER_NEURAL_FEATURE_WINGER_PINCH_PRESSURE] > 0.0);
     assert_eq!(features[SOCCER_NEURAL_FEATURE_CRASH_BOX_COMMIT_ACTIVE], 1.0);
-    assert_eq!(features[SOCCER_NEURAL_FEATURE_CRASH_BOX_TARGET_AVAILABLE], 1.0);
+    assert_eq!(
+        features[SOCCER_NEURAL_FEATURE_CRASH_BOX_TARGET_AVAILABLE],
+        1.0
+    );
     assert!(features[SOCCER_NEURAL_FEATURE_CRASH_BOX_TARGET_DISTANCE] > 0.0);
 
     std::env::remove_var(WINGER_PINCH_IN_ENABLE_ENV);
@@ -51336,9 +51388,13 @@ fn lane_yield_and_onside_support_contexts_feed_q_state_and_neural_tail() {
     assert!(lane_q.pass_lane_yield_available);
     assert!(lane_q.pass_lane_yield_strength_bin > 0);
     assert!(lane_q.pass_lane_yield_target_distance_bin > 0);
-    let lane_transition = test_learning_transition(&lane_sim, lane_sim.tick, middle, Team::Home, "lane-yield");
+    let lane_transition =
+        test_learning_transition(&lane_sim, lane_sim.tick, middle, Team::Home, "lane-yield");
     let lane_features = soccer_neural_transition_features(&lane_transition);
-    assert_eq!(lane_features[SOCCER_NEURAL_FEATURE_PASS_LANE_YIELD_AVAILABLE], 1.0);
+    assert_eq!(
+        lane_features[SOCCER_NEURAL_FEATURE_PASS_LANE_YIELD_AVAILABLE],
+        1.0
+    );
     assert!(lane_features[SOCCER_NEURAL_FEATURE_PASS_LANE_YIELD_STRENGTH] > 0.0);
     assert!(lane_features[SOCCER_NEURAL_FEATURE_PASS_LANE_YIELD_TARGET_DISTANCE] > 0.0);
 
@@ -51373,8 +51429,13 @@ fn lane_yield_and_onside_support_contexts_feed_q_state_and_neural_tail() {
     assert!(onside_q.forward_onside_support_line_gap_bin > 0);
     assert!(onside_q.forward_onside_support_clamp_distance_bin > 0);
     assert!(onside_q.forward_onside_support_pressure_bin > 0);
-    let onside_transition =
-        test_learning_transition(&onside_sim, onside_sim.tick, striker, Team::Home, "support-push-up");
+    let onside_transition = test_learning_transition(
+        &onside_sim,
+        onside_sim.tick,
+        striker,
+        Team::Home,
+        "support-push-up",
+    );
     let onside_features = soccer_neural_transition_features(&onside_transition);
     assert_eq!(
         onside_features[SOCCER_NEURAL_FEATURE_FORWARD_ONSIDE_SUPPORT_ACTIVE],
@@ -53555,10 +53616,7 @@ fn teammate_spacing_notice_fires_only_after_the_grace_window() {
         park_players_except(&mut sim, &[a, b]);
         sim.active_set_play = None;
         sim.ball.holder = None;
-        let (pa, pb) = (
-            Vec2::new(40.0, 60.0),
-            Vec2::new(40.0 + distance, 60.0),
-        );
+        let (pa, pb) = (Vec2::new(40.0, 60.0), Vec2::new(40.0 + distance, 60.0));
 
         camp_pair_for(&mut sim, a, b, pa, pb, before_seconds);
         assert!(
@@ -53862,11 +53920,7 @@ fn move_player_towards_breaks_stationary_teammate_overlap() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let (runner, teammate) = (5usize, 8usize);
     let runner_idx = sim.players.iter().position(|p| p.id == runner).unwrap();
-    let teammate_idx = sim
-        .players
-        .iter()
-        .position(|p| p.id == teammate)
-        .unwrap();
+    let teammate_idx = sim.players.iter().position(|p| p.id == teammate).unwrap();
     park_players_except(&mut sim, &[runner, teammate]);
     sim.active_set_play = None;
     sim.ball.holder = None;
@@ -54147,7 +54201,10 @@ fn back_four_neural_features_encode_dynamic_average_line_state() {
     );
     assert_eq!(
         features[SOCCER_NEURAL_FEATURE_BACK_FOUR_LATERAL_WIDTH],
-        soccer_neural_scaled(line.back_four_lateral_width_yards, DEFAULT_FIELD_WIDTH_YARDS)
+        soccer_neural_scaled(
+            line.back_four_lateral_width_yards,
+            DEFAULT_FIELD_WIDTH_YARDS
+        )
     );
     assert_eq!(
         features[SOCCER_NEURAL_FEATURE_BACK_FOUR_LATERAL_WIDTH_PRESSURE],
@@ -54410,8 +54467,7 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
     );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_DIM,
-        SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM
-            + SOCCER_NEURAL_EXECUTION_MPC_FEATURE_DIM
+        SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM + SOCCER_NEURAL_EXECUTION_MPC_FEATURE_DIM
     );
     assert_eq!(
         SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM,
@@ -54626,8 +54682,7 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
     );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_DIM,
-        SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM
-            + SOCCER_NEURAL_EXECUTION_MPC_FEATURE_DIM
+        SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM + SOCCER_NEURAL_EXECUTION_MPC_FEATURE_DIM
     );
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&170));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&177));
@@ -54683,11 +54738,15 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
         SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_OFFSIDE_RECOVERY_FEATURE_DIM)
     );
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_CURVE_ACTION_FEATURE_DIM));
-    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_IDEA_EXECUTION_FEATURE_DIM));
-    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(
-        &SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM
-    ));
-    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_FEATURE_SUPPORT_PUSH_UP_ACTION));
+    assert!(
+        SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_IDEA_EXECUTION_FEATURE_DIM)
+    );
+    assert!(
+        SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM)
+    );
+    assert!(
+        SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_FEATURE_SUPPORT_PUSH_UP_ACTION)
+    );
 
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let (a, b) = (2usize, 3usize);
@@ -60992,7 +61051,10 @@ fn teammate_spacing_warning_pressure_ramps_from_seven_to_four_yards() {
     let p6 = teammate_occupied_space_pressure_from_distance(6.0);
     let p7 = teammate_occupied_space_pressure_from_distance(7.0);
 
-    assert!((p4 - 1.0).abs() < 1e-9, "4yd must be saturated pressure: {p4}");
+    assert!(
+        (p4 - 1.0).abs() < 1e-9,
+        "4yd must be saturated pressure: {p4}"
+    );
     assert!(p5 > 0.65, "5yd should be a steep penalty: {p5}");
     assert!(p6 > 0.20 && p6 < p5, "6yd should be rising pressure: {p6}");
     assert!(p7 <= 1e-9, "7yd should be clear of the warning band: {p7}");
@@ -61090,7 +61152,10 @@ fn forward_run_when_unmarked_bias_vetoes_backward_and_rewards_forward() {
     let forward_covered = forward_run_when_unmarked_bias(18.0, true, false);
     let square = forward_run_when_unmarked_bias(0.0, true, true);
 
-    assert!(backward < 0.0, "a backward run while unmarked must be penalised: {backward}");
+    assert!(
+        backward < 0.0,
+        "a backward run while unmarked must be penalised: {backward}"
+    );
     assert!(
         deeper_backward < backward,
         "the further back, the worse: deeper={deeper_backward} shallow={backward}"
@@ -61103,7 +61168,10 @@ fn forward_run_when_unmarked_bias_vetoes_backward_and_rewards_forward() {
         forward_covered, 0.0,
         "a forward-but-covered candidate earns no forward bonus: {forward_covered}"
     );
-    assert_eq!(square, 0.0, "a square shuffle inside the deadband is neutral: {square}");
+    assert_eq!(
+        square, 0.0,
+        "a square shuffle inside the deadband is neutral: {square}"
+    );
     assert!(
         backward < -forward_open,
         "the backward veto must dominate the best forward bonus so backward can never win: \
@@ -61133,8 +61201,7 @@ fn forward_open_space_available_true_when_lane_ahead_is_clear_else_false() {
         .find(|p| p.id == support)
         .expect("support snapshot");
     assert!(
-        open_snapshot
-            .forward_open_space_available(support_player, support_player.position),
+        open_snapshot.forward_open_space_available(support_player, support_player.position),
         "an unmarked teammate with a clear forward lane must have a forward-into-space option"
     );
 
@@ -61163,8 +61230,7 @@ fn forward_open_space_available_true_when_lane_ahead_is_clear_else_false() {
         .find(|p| p.id == support)
         .expect("support snapshot");
     assert!(
-        !walled_snapshot
-            .forward_open_space_available(walled_support, walled_support.position),
+        !walled_snapshot.forward_open_space_available(walled_support, walled_support.position),
         "with the forward channel walled by opponents there is no forward-into-space option"
     );
 }
@@ -71503,9 +71569,11 @@ fn standing_or_walking_holder_releases_fifteen_yard_forward_outlet_pronto() {
     standing_observation.best_forward_pass_receiver_openness = standing_observation
         .best_forward_pass_receiver_openness
         .max(0.70);
-    standing_observation.best_forward_pass_option_quality =
-        standing_observation.best_forward_pass_option_quality.max(0.76);
-    standing_observation.floor_pass_lane_score = standing_observation.floor_pass_lane_score.max(0.82);
+    standing_observation.best_forward_pass_option_quality = standing_observation
+        .best_forward_pass_option_quality
+        .max(0.76);
+    standing_observation.floor_pass_lane_score =
+        standing_observation.floor_pass_lane_score.max(0.82);
 
     let mut walking_observation = standing_observation.clone();
     walking_observation.movement_gait = MovementGait::Walk;
@@ -71761,16 +71829,16 @@ fn learned_stale_non_elite_dribble_releases_to_open_outlet() {
         .expect("stationary elite in moderate pressure should release the open outlet");
     assert_eq!(static_moderate_label, "pass1");
     assert!(
-            matches!(
-                static_moderate_action,
-                SoccerAction::Pass {
-                    target_player: Some(target),
-                    flight: PassFlight::Floor,
-                    ..
-                } if target == outlet
-            ),
-            "stationary elite should pass the open forward outlet, got {static_moderate_action:?}"
-        );
+        matches!(
+            static_moderate_action,
+            SoccerAction::Pass {
+                target_player: Some(target),
+                flight: PassFlight::Floor,
+                ..
+            } if target == outlet
+        ),
+        "stationary elite should pass the open forward outlet, got {static_moderate_action:?}"
+    );
 
     let mut moving_moderate_elite_observation = SoccerPomdpObservation {
         movement_gait: MovementGait::Run,
@@ -74094,8 +74162,7 @@ fn first_touch_escape_lateral_neural_block_is_appended_and_migration_safe() {
     );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_DIM,
-        SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM
-            + SOCCER_NEURAL_EXECUTION_MPC_FEATURE_DIM
+        SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM + SOCCER_NEURAL_EXECUTION_MPC_FEATURE_DIM
     );
     assert_eq!(
         SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM,
@@ -92481,13 +92548,27 @@ fn scoop_land_at_target_kills_the_balloon_float() {
         std::env::remove_var("DD_SOCCER_ENABLE_SCOOP_LAND_AT_TARGET");
         let mut rng = SeededRandom::new(17);
         let off_speed = modulated_pass_speed_yps(
-            raw, from, target, PassFlight::Scoop, false, skill, 0.70, &mut rng,
+            raw,
+            from,
+            target,
+            PassFlight::Scoop,
+            false,
+            skill,
+            0.70,
+            &mut rng,
         );
 
         std::env::set_var("DD_SOCCER_ENABLE_SCOOP_LAND_AT_TARGET", "1");
         let mut rng = SeededRandom::new(17);
         let on_speed = modulated_pass_speed_yps(
-            raw, from, target, PassFlight::Scoop, false, skill, 0.70, &mut rng,
+            raw,
+            from,
+            target,
+            PassFlight::Scoop,
+            false,
+            skill,
+            0.70,
+            &mut rng,
         );
 
         let pass = PendingPass {
@@ -94595,7 +94676,9 @@ fn team_advance_reward_pairs_support_offside_recovery_avoids_extra_stick() {
         recover_after.position_would_be_offside_for_player(
             support,
             Team::Home,
-            recover_after.player_position(support).expect("support position")
+            recover_after
+                .player_position(support)
+                .expect("support position")
         ),
         "recovery target should still be offside, so this proves offside recovery is exempt"
     );
@@ -95177,7 +95260,7 @@ fn stationary_hold_penalty_multiplier_ramps_from_walk_to_ten_x() {
         (stationary_hold_penalty_multiplier(STATIONARY_HOLD_FORWARD_JOG_YPS) - 1.0).abs() < 1e-9
     );
     assert!((stationary_hold_penalty_multiplier(9.0) - 1.0).abs() < 1e-9); // sprinting forward
-    // Walking pace sits strictly between the two extremes and is monotone in stillness.
+                                                                           // Walking pace sits strictly between the two extremes and is monotone in stillness.
     let walk = stationary_hold_penalty_multiplier(STATIONARY_HOLD_FORWARD_JOG_YPS * 0.5);
     assert!(walk > 1.0 && walk < STATIONARY_HOLD_PENALTY_MAX_MULT);
     let midpoint_expected = 1.0 + 0.5 * (STATIONARY_HOLD_PENALTY_MAX_MULT - 1.0);
@@ -95193,16 +95276,26 @@ fn ideal_pass_length_curve_peaks_at_fifteen_yards() {
     // The 15yd ideal curve peaks at 15yd and prefers a meaningful 15yd ball over a short square.
     // Tested on the pure curve directly (no env toggling) so it never races the default-8yd
     // parity test in a parallel run.
-    let ideal =
-        |d: f64| pass_length_preference_curve(d, IDEAL_PASS_LENGTH_OPTIMAL_YARDS, IDEAL_PASS_LENGTH_FADEOUT_YARDS);
+    let ideal = |d: f64| {
+        pass_length_preference_curve(
+            d,
+            IDEAL_PASS_LENGTH_OPTIMAL_YARDS,
+            IDEAL_PASS_LENGTH_FADEOUT_YARDS,
+        )
+    };
     assert!((ideal(IDEAL_PASS_LENGTH_OPTIMAL_YARDS) - 1.0).abs() < 1e-9);
     assert!(ideal(15.0) > ideal(5.0), "15yd preferred over a 5yd square");
-    assert!(ideal(15.0) > ideal(8.0), "15yd preferred over the old 8yd optimum");
+    assert!(
+        ideal(15.0) > ideal(8.0),
+        "15yd preferred over the old 8yd optimum"
+    );
     assert!(ideal(15.0) > ideal(25.0), "peak beats an over-long ball");
     // A 15yd pass is well within a good player's vision range (already 28-56yd).
     assert!(vision_range_yards(0.0) >= 15.0 && vision_range_yards(1.0) >= 15.0);
     // The default 8yd curve is unchanged (parity): still peaks at 8yd.
-    let base = |d: f64| pass_length_preference_curve(d, PASS_LENGTH_OPTIMAL_YARDS, PASS_LENGTH_FADEOUT_YARDS);
+    let base = |d: f64| {
+        pass_length_preference_curve(d, PASS_LENGTH_OPTIMAL_YARDS, PASS_LENGTH_FADEOUT_YARDS)
+    };
     assert!((base(8.0) - 1.0).abs() < 1e-9);
     assert!(base(8.0) > base(15.0));
 }
@@ -95545,21 +95638,38 @@ fn same_team_proximity_penalty_curve_is_graduated_huge_to_small() {
         at_4 > at_5 && at_5 > at_6 && at_6 > at_7 && at_7 > 0.0,
         "penalty must decrease with distance across 4<5<6<7: {at_4} {at_5} {at_6} {at_7}"
     );
-    assert!((at_4 - 1.0).abs() < 1e-9, "unit penalty is 1.0 exactly at the floor: {at_4}");
-    assert!((at_5 - 0.75).abs() < 1e-9, "5yd should still bite hard: {at_5}");
-    assert!((at_6 - 0.50).abs() < 1e-9, "6yd should be a medium penalty: {at_6}");
-    assert!((at_7 - 0.25).abs() < 1e-9, "7yd should remain a meaningful warning: {at_7}");
     assert!(
-        (same_team_proximity_penalty_unit(0.0) * SAME_TEAM_PROXIMITY_PENALTY_POINTS - 12.0)
-            .abs()
+        (at_4 - 1.0).abs() < 1e-9,
+        "unit penalty is 1.0 exactly at the floor: {at_4}"
+    );
+    assert!(
+        (at_5 - 0.75).abs() < 1e-9,
+        "5yd should still bite hard: {at_5}"
+    );
+    assert!(
+        (at_6 - 0.50).abs() < 1e-9,
+        "6yd should be a medium penalty: {at_6}"
+    );
+    assert!(
+        (at_7 - 0.25).abs() < 1e-9,
+        "7yd should remain a meaningful warning: {at_7}"
+    );
+    assert!(
+        (same_team_proximity_penalty_unit(0.0) * SAME_TEAM_PROXIMITY_PENALTY_POINTS - 12.0).abs()
             < 1e-9,
         "complete overlap should cap at the dense shaping budget"
     );
     assert_eq!(at_8, 0.0, "no penalty at/beyond the influence radius");
     assert_eq!(same_team_proximity_penalty_unit(20.0), 0.0);
     // Inside the floor the penalty is "huge" (> the at-floor value) and capped.
-    assert!(same_team_proximity_penalty_unit(2.0) > at_4, "crowding tighter is worse");
-    assert!(same_team_proximity_penalty_unit(0.0) <= 2.0, "capped so overlap can't blow up");
+    assert!(
+        same_team_proximity_penalty_unit(2.0) > at_4,
+        "crowding tighter is worse"
+    );
+    assert!(
+        same_team_proximity_penalty_unit(0.0) <= 2.0,
+        "capped so overlap can't blow up"
+    );
     assert_eq!(same_team_proximity_penalty_unit(f64::NAN), 0.0);
 }
 
@@ -95625,7 +95735,10 @@ fn separation_floor_mpc_reward_and_grace_work_in_unison() {
     // The POMDP/MDP reward penalty the policy is trained on is live for that same 3yd gap.
     let gap = nearest_same_team_distance_for_floor(&WorldSnapshot::from_match(&sim), 5, Team::Home)
         .expect("a nearest teammate");
-    assert!((gap - 3.0).abs() < 1e-6, "nearest teammate gap is 3yd, got {gap}");
+    assert!(
+        (gap - 3.0).abs() < 1e-6,
+        "nearest teammate gap is 3yd, got {gap}"
+    );
     assert!(
         same_team_proximity_penalty_unit(gap) > same_team_proximity_penalty_unit(5.0),
         "crowding at 3yd is penalised harder than at 5yd"
@@ -95633,12 +95746,9 @@ fn separation_floor_mpc_reward_and_grace_work_in_unison() {
 
     // The same 4/5/6/7-yard Euclidean floor and dwell-grace state must be visible to
     // POMDP/Q/neural learners, not just applied as a hidden shaping penalty.
-    sim.players[5].same_team_proximity_dwell_lt7_seconds =
-        SAME_TEAM_PROXIMITY_GRACE_LT7_SECONDS;
-    sim.players[5].same_team_proximity_dwell_lt6_seconds =
-        SAME_TEAM_PROXIMITY_GRACE_LT6_SECONDS;
-    sim.players[5].same_team_proximity_dwell_lt5_seconds =
-        SAME_TEAM_PROXIMITY_GRACE_LT5_SECONDS;
+    sim.players[5].same_team_proximity_dwell_lt7_seconds = SAME_TEAM_PROXIMITY_GRACE_LT7_SECONDS;
+    sim.players[5].same_team_proximity_dwell_lt6_seconds = SAME_TEAM_PROXIMITY_GRACE_LT6_SECONDS;
+    sim.players[5].same_team_proximity_dwell_lt5_seconds = SAME_TEAM_PROXIMITY_GRACE_LT5_SECONDS;
     let learned_snapshot = WorldSnapshot::from_match(&sim);
     let learned_obs = learned_snapshot.observation_for(5);
     assert!(
@@ -95651,9 +95761,8 @@ fn separation_floor_mpc_reward_and_grace_work_in_unison() {
         learned_obs.same_team_separation_floor_distance_yards
     );
     assert!(
-        (learned_obs.same_team_separation_floor_pressure
-            - same_team_proximity_penalty_unit(gap))
-        .abs()
+        (learned_obs.same_team_separation_floor_pressure - same_team_proximity_penalty_unit(gap))
+            .abs()
             < 1e-9,
         "POMDP observation should carry the graduated 4/5/6/7yd pressure"
     );
@@ -95662,8 +95771,12 @@ fn separation_floor_mpc_reward_and_grace_work_in_unison() {
         "POMDP observation should know the dwell grace has made the penalty live"
     );
     let learned_state = learned_snapshot.mdp_state_for_player(5);
-    let learned_q_key =
-        SoccerQStateKey::from_parts(&learned_state, &learned_obs, Team::Home, sim.players[5].role);
+    let learned_q_key = SoccerQStateKey::from_parts(
+        &learned_state,
+        &learned_obs,
+        Team::Home,
+        sim.players[5].role,
+    );
     assert!(learned_q_key.same_team_separation_floor_active);
     assert_eq!(
         learned_q_key.same_team_separation_floor_distance_bin, 0,
@@ -95725,31 +95838,59 @@ fn same_team_proximity_grace_matches_the_worked_example() {
 
     // 2.5s at 6.5yd: only the 7yd timer runs; well under its 3s grace.
     run(&mut lt7, &mut lt6, &mut lt5, 6.5, 2.5);
-    assert!((lt7 - 2.5).abs() < 1e-6 && lt6 == 0.0 && lt5 == 0.0, "lt7={lt7} lt6={lt6} lt5={lt5}");
-    assert!(!same_team_proximity_penalty_past_grace(lt7, lt6, lt5), "graced at 6.5yd/2.5s");
+    assert!(
+        (lt7 - 2.5).abs() < 1e-6 && lt6 == 0.0 && lt5 == 0.0,
+        "lt7={lt7} lt6={lt6} lt5={lt5}"
+    );
+    assert!(
+        !same_team_proximity_penalty_past_grace(lt7, lt6, lt5),
+        "graced at 6.5yd/2.5s"
+    );
 
     // 0.25s at 5.5yd: 7yd timer keeps running (2.75s), 6yd timer starts (0.25s), 5yd still 0.
     run(&mut lt7, &mut lt6, &mut lt5, 5.5, 0.25);
     assert!((lt7 - 2.75).abs() < 1e-6 && (lt6 - 0.25).abs() < 1e-6 && lt5 == 0.0);
-    assert!(!same_team_proximity_penalty_past_grace(lt7, lt6, lt5), "still graced at 2.75/0.25/0");
+    assert!(
+        !same_team_proximity_penalty_past_grace(lt7, lt6, lt5),
+        "still graced at 2.75/0.25/0"
+    );
 
     // Into 3.5yd: 0.20s later still graced (lt7=2.95<3), but crossing ~0.25s trips the 7yd/3s grace.
     run(&mut lt7, &mut lt6, &mut lt5, 3.5, 0.20);
-    assert!(!same_team_proximity_penalty_past_grace(lt7, lt6, lt5), "0.20s into 3.5yd still graced: lt7={lt7}");
+    assert!(
+        !same_team_proximity_penalty_past_grace(lt7, lt6, lt5),
+        "0.20s into 3.5yd still graced: lt7={lt7}"
+    );
     run(&mut lt7, &mut lt6, &mut lt5, 3.5, 0.10);
-    assert!(same_team_proximity_penalty_past_grace(lt7, lt6, lt5), "~0.25s into 3.5yd the 7yd/3s timer trips: lt7={lt7}");
+    assert!(
+        same_team_proximity_penalty_past_grace(lt7, lt6, lt5),
+        "~0.25s into 3.5yd the 7yd/3s timer trips: lt7={lt7}"
+    );
 
     // A fast dive straight inside 5yd is caught by the tight 5yd/1s timer, well before 3s.
     let (mut b7, mut b6, mut b5) = (0.0, 0.0, 0.0);
     run(&mut b7, &mut b6, &mut b5, 4.5, 0.95);
-    assert!(!same_team_proximity_penalty_past_grace(b7, b6, b5), "0.95s at 4.5yd still graced");
+    assert!(
+        !same_team_proximity_penalty_past_grace(b7, b6, b5),
+        "0.95s at 4.5yd still graced"
+    );
     run(&mut b7, &mut b6, &mut b5, 4.5, 0.10);
-    assert!(same_team_proximity_penalty_past_grace(b7, b6, b5), "past 1s at 4.5yd the 5yd/1s timer trips: b5={b5}");
+    assert!(
+        same_team_proximity_penalty_past_grace(b7, b6, b5),
+        "past 1s at 4.5yd the 5yd/1s timer trips: b5={b5}"
+    );
 
     // Separating beyond a band resets that band's timer (only real dispersal forgives).
     advance_same_team_proximity_dwell(&mut b7, &mut b6, &mut b5, 5.5, dt); // now ≥5yd
     assert_eq!(b5, 0.0, "leaving the 5yd band resets its timer");
-    assert!(b6 > 0.0 && b7 > 0.0, "but the 6yd/7yd timers keep running while still inside them");
+    assert!(
+        b6 > 0.0 && b7 > 0.0,
+        "but the 6yd/7yd timers keep running while still inside them"
+    );
     advance_same_team_proximity_dwell(&mut b7, &mut b6, &mut b5, 99.0, dt); // fully clear
-    assert_eq!((b7, b6, b5), (0.0, 0.0, 0.0), "clearing all bands resets every timer");
+    assert_eq!(
+        (b7, b6, b5),
+        (0.0, 0.0, 0.0),
+        "clearing all bands resets every timer"
+    );
 }
