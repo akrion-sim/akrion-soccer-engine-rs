@@ -4691,7 +4691,6 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut latest_neural_network = initial_neural_network.clone();
     let mut latest_policy_arc_cache = None::<CachedTeamQPoliciesArc>;
     let mut latest_neural_network_arc_cache = None::<CachedNeuralNetworkSnapshotArc>;
-<<<<<<< HEAD
     // Frozen-anchor promotion-gate state (used only when the gate is enabled): the
     // current anchor brain a candidate must beat to advance, a reusable held-out
     // match runner, and a counter to apply the gate every `interval_writes` writes.
