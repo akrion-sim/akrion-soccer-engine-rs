@@ -686,7 +686,7 @@ const CARRIER_CHANNEL_WIDE_TRAP_FRACTION: f64 = 0.42;
 /// byte-identical to the contain baseline.
 const OWN_GOAL_PRESS_FULL_YARDS: f64 = 6.0; // at/inside this depth from our goal ⇒ full urgency.
 const OWN_GOAL_PRESS_SPEED_RELAX: f64 = 0.9; // deep ⇒ relax the engage speed threshold by up to 90%.
-const OWN_GOAL_PRESS_MIN_BOOST: f64 = 0.15; // deep lone defender crosses the 1.0 step-up trigger even vs a slow dribble.
+const OWN_GOAL_PRESS_MIN_BOOST: f64 = 0.35; // raised 0.15→0.35: lone defender steps up to press an advancing carrier well before the 6-yard box, not only deep.
                                             // --- Defensive shepherding / "show one way" (gated, default OFF = byte-identical) ---
                                             // Real defending of a 1v1 as the carrier drives from ~40 to ~15yd out is not a square
                                             // retreat: the pressing defender approaches on a CURVED angle so their body sits on the
