@@ -95641,7 +95641,6 @@ fn same_team_proximity_penalty_curve_is_graduated_huge_to_small() {
         at_4 > at_5 && at_5 > at_6 && at_6 > at_7 && at_7 > 0.0,
         "penalty must decrease with distance across 4<5<6<7: {at_4} {at_5} {at_6} {at_7}"
     );
-<<<<<<< HEAD
     assert!((at_4 - 1.0).abs() < 1e-9, "unit penalty is 1.0 exactly at the floor: {at_4}");
     // Inside the band the curve is linear: (outer - d) / (outer - floor).
     for d in [5.0_f64, 6.0, 7.0] {
@@ -95651,24 +95650,6 @@ fn same_team_proximity_penalty_curve_is_graduated_huge_to_small() {
             "graduated linear penalty at {d}yd should be {expected}"
         );
     }
-=======
->>>>>>> 33f1ca69b56d074fef26bf8ebda6126af4b19696
-    assert!(
-        (at_4 - 1.0).abs() < 1e-9,
-        "unit penalty is 1.0 exactly at the floor: {at_4}"
-    );
-    assert!(
-        (at_5 - 0.75).abs() < 1e-9,
-        "5yd should still bite hard: {at_5}"
-    );
-    assert!(
-        (at_6 - 0.50).abs() < 1e-9,
-        "6yd should be a medium penalty: {at_6}"
-    );
-    assert!(
-        (at_7 - 0.25).abs() < 1e-9,
-        "7yd should remain a meaningful warning: {at_7}"
-    );
     assert!(
         (same_team_proximity_penalty_unit(0.0) * SAME_TEAM_PROXIMITY_PENALTY_POINTS - 12.0).abs()
             < 1e-9,
