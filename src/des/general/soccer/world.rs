@@ -22570,6 +22570,23 @@ pub struct WorldSnapshot {
     #[serde(skip)]
     pub(crate) ranked_aerial_pass_cache:
         std::cell::RefCell<std::collections::HashMap<(usize, bool), Vec<usize>>>,
+    /// Per-snapshot memo of `pass_target_quality_for_snapshot_inner`. A snapshot is one
+    /// immutable world state, so that pure scorer returns the same quality for identical
+    /// inputs for the snapshot's whole lifetime. A single carrier decision evaluates the
+    /// SAME (passer, target, flight) several times across independent sub-checks
+    /// (forward-option recognition, own-half progressive-outlet availability, and the main
+    /// ranked selection); each call runs a nested MPC receipt estimate (QP solves) plus a
+    /// full-team lane/occupancy scan — the dominant per-tick cost. Collapsing the duplicates
+    /// into one computation is byte-identical: keyed on both player ids, the flight, the
+    /// exact float bits of both positions, and the lane-risk-gate flag. RefCell for &self
+    /// interior mutability; skipped by serde (rebuilt lazily; Default = empty per new tick).
+    #[serde(skip)]
+    pub(crate) pass_target_quality_cache: std::cell::RefCell<
+        std::collections::HashMap<
+            (usize, usize, PassFlight, u64, u64, u64, u64, bool),
+            PassTargetQuality,
+        >,
+    >,
     /// Per-snapshot memo of the support candidate feature row selected by
     /// `open_space_for`, keyed by player id. The RL sampler calls the same scorer and
     /// drains this exact row into the pending reward window; skipped by serde and
@@ -25386,6 +25403,7 @@ impl WorldSnapshot {
             keeper_commit_bias: [0.0, 0.0],
             ranked_floor_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             ranked_aerial_pass_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            pass_target_quality_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             support_decision_feature_cache: std::cell::RefCell::new(
                 std::collections::HashMap::new(),
             ),
