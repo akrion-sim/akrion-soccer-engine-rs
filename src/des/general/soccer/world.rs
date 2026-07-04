@@ -30330,11 +30330,12 @@ impl WorldSnapshot {
             .map(same_team_proximity_penalty_unit)
             .unwrap_or(0.0);
         let same_team_separation_penalty_live = same_team_separation_floor_pressure > 0.0
-            && same_team_proximity_penalty_past_grace(
-                me.same_team_proximity_dwell_lt7_seconds,
-                me.same_team_proximity_dwell_lt6_seconds,
-                me.same_team_proximity_dwell_lt5_seconds,
-            );
+            && (same_team_separation_floor_distance_yards <= SAME_TEAM_MIN_SEPARATION_YARDS
+                || same_team_proximity_penalty_past_grace(
+                    me.same_team_proximity_dwell_lt7_seconds,
+                    me.same_team_proximity_dwell_lt6_seconds,
+                    me.same_team_proximity_dwell_lt5_seconds,
+                ));
         let (team_spacing_score, preferred_team_spacing_yards) = self
             .team_spacing_mode_for(me.team)
             .map(|mode| {
