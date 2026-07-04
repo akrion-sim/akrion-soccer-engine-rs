@@ -423,6 +423,32 @@ fn main() {
             frontier.neural = Some(s);
         }
 
+        // Warm-restart weight perturbation (explicit exploration / escape mechanism): every
+        // SOCCER_LEAGUE_WARM_RESTART_EVERY rounds, kick the net out of its basin with annealed
+        // Gaussian noise (scale decays each cycle — simulated annealing), then let the next round
+        // re-descend. Env-gated: SOCCER_LEAGUE_WEIGHT_NOISE=0 (default) leaves training unchanged.
+        let wn_base = env_f64("SOCCER_LEAGUE_WEIGHT_NOISE", 0.0);
+        if wn_base > 0.0 {
+            let wn_every = env_usize("SOCCER_LEAGUE_WARM_RESTART_EVERY", 4).max(1) as u32;
+            if round % wn_every == 0 {
+                let wn_frac = env_f64("SOCCER_LEAGUE_WEIGHT_NOISE_FRAC", 0.1);
+                let wn_decay = env_f64("SOCCER_LEAGUE_WEIGHT_NOISE_DECAY", 0.9);
+                let cycle = (round / wn_every).max(1) as i32;
+                let scale = wn_base * wn_decay.powi(cycle - 1);
+                if let Some(mut s) = frontier.neural.take() {
+                    let seed = 0x9E37_79B9_7F4A_7C15u64
+                        ^ (round as u64).wrapping_mul(0x0000_0001_00000193)
+                        ^ (s.training_steps as u64);
+                    perturb_weights(&mut s, scale, wn_frac, seed);
+                    println!(
+                        "league_warm_restart round={round} cycle={cycle} scale={scale:.4} frac={wn_frac} l2={:.3}",
+                        s.l2_norm
+                    );
+                    frontier.neural = Some(s);
+                }
+            }
+        }
+
         // Persist the frontier for :5055 / eval / champion-gate.
         let (l2, steps) = frontier
             .neural
