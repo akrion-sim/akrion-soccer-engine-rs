@@ -6,7 +6,7 @@
 
 use std::collections::{hash_map::DefaultHasher, BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -42,9 +42,6 @@ const SOCCER_MATCH_FITNESS_MAX: f64 = 12.0;
 const SOCCER_POLICY_PLATEAU_FITNESS_SPREAD: f64 = 0.075;
 const SOCCER_POLICY_LOW_CEILING_FITNESS: f64 = 1.50;
 const SOCCER_POLICY_SEARCH_MAX_ADAPTED_POPULATION: usize = 128;
-const SOCCER_POLICY_SEARCH_MAX_ADAPTED_POPULATION_ENV: &str =
-    "SOCCER_POLICY_SEARCH_MAX_ADAPTED_POPULATION";
-static SOCCER_POLICY_SEARCH_MAX_ADAPTED_POPULATION_OVERRIDE: OnceLock<usize> = OnceLock::new();
 const SOCCER_POLICY_NOVELTY_MAX_STATES: usize = 256;
 const SOCCER_POLICY_NOVELTY_MAX_ACTIONS_PER_STATE: usize = 3;
 const SOCCER_POLICY_NOVELTY_VISIT_WEIGHT_MAX: f64 = 3.0;
@@ -1052,40 +1049,6 @@ fn soccer_evolution_population_size_for_learning_run(population_size: usize) -> 
     population_size.clamp(1, SOCCER_EVOLUTION_MAX_POPULATION_SIZE)
 }
 
-fn parse_soccer_policy_search_max_adapted_population(raw: Option<&str>) -> Result<usize, String> {
-    let Some(raw) = raw else {
-        return Ok(SOCCER_POLICY_SEARCH_MAX_ADAPTED_POPULATION);
-    };
-    let trimmed = raw.trim();
-    let parsed = trimmed.parse::<usize>().map_err(|_| {
-        format!(
-            "{SOCCER_POLICY_SEARCH_MAX_ADAPTED_POPULATION_ENV} must be a positive integer, got {raw:?}"
-        )
-    })?;
-    if parsed == 0 {
-        return Err(format!(
-            "{SOCCER_POLICY_SEARCH_MAX_ADAPTED_POPULATION_ENV} must be a positive integer, got {raw:?}"
-        ));
-    }
-    Ok(parsed.min(SOCCER_EVOLUTION_MAX_POPULATION_SIZE))
-}
-
-fn soccer_policy_search_max_adapted_population() -> usize {
-    *SOCCER_POLICY_SEARCH_MAX_ADAPTED_POPULATION_OVERRIDE.get_or_init(|| {
-        let raw = std::env::var(SOCCER_POLICY_SEARCH_MAX_ADAPTED_POPULATION_ENV).ok();
-        match parse_soccer_policy_search_max_adapted_population(raw.as_deref()) {
-            Ok(value) => value,
-            Err(err) => {
-                eprintln!(
-                    "soccer-learning: {err}; using default {}",
-                    SOCCER_POLICY_SEARCH_MAX_ADAPTED_POPULATION
-                );
-                SOCCER_POLICY_SEARCH_MAX_ADAPTED_POPULATION
-            }
-        }
-    })
-}
-
 fn normalize_soccer_evolution_options_for_learning_search(
     mut options: SoccerEvolutionOptions,
 ) -> Result<SoccerEvolutionOptions, String> {
@@ -1742,41 +1705,6 @@ pub fn soccer_learning_from_micros(value: i64) -> f64 {
 }
 
 pub const SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION: f64 = 0.25;
-const SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION_ENV: &str =
-    "SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION";
-static SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION_OVERRIDE: OnceLock<f64> = OnceLock::new();
-
-fn parse_soccer_policy_active_max_fitness_regression(raw: Option<&str>) -> Result<f64, String> {
-    let Some(raw) = raw else {
-        return Ok(SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION);
-    };
-    let trimmed = raw.trim();
-    let parsed = trimmed.parse::<f64>().map_err(|_| {
-        format!("{SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION_ENV} must be a finite non-negative number, got {raw:?}")
-    })?;
-    if !parsed.is_finite() || parsed < 0.0 {
-        return Err(format!(
-            "{SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION_ENV} must be a finite non-negative number, got {raw:?}"
-        ));
-    }
-    Ok(parsed)
-}
-
-pub fn soccer_policy_active_max_fitness_regression() -> f64 {
-    *SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION_OVERRIDE.get_or_init(|| {
-        let raw = std::env::var(SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION_ENV).ok();
-        match parse_soccer_policy_active_max_fitness_regression(raw.as_deref()) {
-            Ok(value) => value,
-            Err(err) => {
-                eprintln!(
-                    "soccer-learning: {err}; using default {}",
-                    SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION
-                );
-                SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION
-            }
-        }
-    })
-}
 
 pub fn soccer_policy_version_insert_status_after_active_head(
     requested_status: &'static str,
@@ -2441,7 +2369,7 @@ pub fn adapt_soccer_evolution_options_for_policy_search(
         let cap = options
             .population_size
             .saturating_mul(3)
-            .min(soccer_policy_search_max_adapted_population());
+            .min(SOCCER_POLICY_SEARCH_MAX_ADAPTED_POPULATION);
         options.population_size = options
             .population_size
             .saturating_add(extra_candidates)
@@ -3719,8 +3647,7 @@ fn search_soccer_tactical_strategy_candidates<F>(
         balanced_shape.attack_flank_lane_weight += attack_flank_gap * 0.34 + attack_pressure * 0.12;
         balanced_shape.attack_spacing_delta_weight += attack_spacing_gap * 0.07 * shape_pressure;
         balanced_shape.goal_entry_pass_learning_weight += attack_pressure * 0.08;
-        balanced_shape.pressure_release_learning_weight +=
-            attack_spacing_gap * 0.05 * shape_pressure;
+        balanced_shape.pressure_release_learning_weight += attack_spacing_gap * 0.05 * shape_pressure;
         balanced_shape.pass_target_ranking_learning_weight +=
             attack_width_gap.max(attack_flank_gap) * 0.07;
         balanced_shape.defense_contract_delta_weight +=
@@ -4479,15 +4406,14 @@ fn clamp_soccer_tactical_learning_weights(
     clamped.attack_width_delta_weight = clamped.attack_width_delta_weight.max(0.0).min(2.2);
     clamped.attack_width_score_weight = clamped.attack_width_score_weight.max(0.0).min(1.2);
     clamped.attack_flank_lane_weight = clamped.attack_flank_lane_weight.max(0.0).min(2.2);
-    clamped.shot_choice_learning_weight = clamped.shot_choice_learning_weight.max(0.0).min(2.0);
+    clamped.shot_choice_learning_weight =
+        clamped.shot_choice_learning_weight.max(0.0).min(2.0);
     clamped.goal_entry_pass_learning_weight =
         clamped.goal_entry_pass_learning_weight.max(0.0).min(2.0);
     clamped.pressure_release_learning_weight =
         clamped.pressure_release_learning_weight.max(0.0).min(2.0);
-    clamped.pass_target_ranking_learning_weight = clamped
-        .pass_target_ranking_learning_weight
-        .max(0.0)
-        .min(2.0);
+    clamped.pass_target_ranking_learning_weight =
+        clamped.pass_target_ranking_learning_weight.max(0.0).min(2.0);
     clamped.defense_spacing_delta_weight = clamped.defense_spacing_delta_weight.max(0.0).min(1.8);
     clamped.defense_spacing_score_weight = clamped.defense_spacing_score_weight.max(0.0).min(1.2);
     clamped.defense_contract_delta_weight = clamped.defense_contract_delta_weight.max(0.0).min(2.4);
@@ -4506,10 +4432,8 @@ fn clamp_soccer_tactical_learning_weights(
     clamped.defender_midfielder_press_weight =
         clamped.defender_midfielder_press_weight.max(0.0).min(1.6);
     clamped.midfielder_press_weight = clamped.midfielder_press_weight.max(0.0).min(1.6);
-    clamped.defensive_line_press_learning_weight = clamped
-        .defensive_line_press_learning_weight
-        .max(0.0)
-        .min(2.0);
+    clamped.defensive_line_press_learning_weight =
+        clamped.defensive_line_press_learning_weight.max(0.0).min(2.0);
     clamped.formation_lp_alignment_weight =
         clamped.formation_lp_alignment_weight.max(-5.0).min(5.0);
     clamped
@@ -4536,7 +4460,9 @@ fn soccer_tactical_weight_search_score(
         + weights.attack_spacing_delta_weight * attack_spacing_gap * 0.85
         + weights.attack_spacing_score_weight * attack_spacing_gap * 0.35
         + weights.shot_choice_learning_weight * attack_decision_gap * 0.10
-        + weights.goal_entry_pass_learning_weight * attack_width_gap.max(attack_flank_gap) * 0.18
+        + weights.goal_entry_pass_learning_weight
+            * attack_width_gap.max(attack_flank_gap)
+            * 0.18
         + weights.pressure_release_learning_weight
             * (attack_spacing_gap * 0.50 + press_gap * 0.50)
             * 0.14
@@ -5999,32 +5925,6 @@ mod tests {
     }
 
     #[test]
-    fn policy_search_adapted_population_cap_parser_validates_positive_values() {
-        assert_eq!(
-            parse_soccer_policy_search_max_adapted_population(None).unwrap(),
-            SOCCER_POLICY_SEARCH_MAX_ADAPTED_POPULATION
-        );
-        assert_eq!(
-            parse_soccer_policy_search_max_adapted_population(Some("12")).unwrap(),
-            12
-        );
-        assert!(parse_soccer_policy_search_max_adapted_population(Some("0")).is_err());
-        assert!(parse_soccer_policy_search_max_adapted_population(Some("nope")).is_err());
-    }
-
-    #[test]
-    fn policy_search_adapted_population_respects_process_cap() {
-        let base = SoccerEvolutionOptions {
-            population_size: 16,
-            ..SoccerEvolutionOptions::default()
-        };
-        let pressure = 1.0;
-        let adapted = adapt_soccer_evolution_options_for_policy_search(base, pressure);
-
-        assert!(adapted.population_size <= soccer_policy_search_max_adapted_population());
-    }
-
-    #[test]
     fn policy_plateau_novelty_injects_missing_sibling_actions() {
         let policy = policy_with_home_actions(&[("pass", 1.0, 6)]);
         let mut action_accumulators = BTreeMap::<PolicyEntryKey, MergeAccumulator>::new();
@@ -6894,25 +6794,6 @@ mod tests {
     }
 
     #[test]
-    fn active_max_fitness_regression_env_parser_defaults_and_validates() {
-        assert_eq!(
-            parse_soccer_policy_active_max_fitness_regression(None).unwrap(),
-            SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION
-        );
-        assert_eq!(
-            parse_soccer_policy_active_max_fitness_regression(Some("0")).unwrap(),
-            0.0
-        );
-        assert_eq!(
-            parse_soccer_policy_active_max_fitness_regression(Some("0.1")).unwrap(),
-            0.1
-        );
-        assert!(parse_soccer_policy_active_max_fitness_regression(Some("-0.1")).is_err());
-        assert!(parse_soccer_policy_active_max_fitness_regression(Some("NaN")).is_err());
-        assert!(parse_soccer_policy_active_max_fitness_regression(Some("abc")).is_err());
-    }
-
-    #[test]
     fn pending_policy_stays_active_only_when_latest_head_matches_parent() {
         assert_eq!(
             soccer_policy_version_insert_status_after_active_head(
@@ -7552,9 +7433,7 @@ mod tests {
         assert!(evolved.shot_choice_learning_weight > base.shot_choice_learning_weight);
         assert!(evolved.goal_entry_pass_learning_weight > base.goal_entry_pass_learning_weight);
         assert!(evolved.pressure_release_learning_weight > base.pressure_release_learning_weight);
-        assert!(
-            evolved.pass_target_ranking_learning_weight > base.pass_target_ranking_learning_weight
-        );
+        assert!(evolved.pass_target_ranking_learning_weight > base.pass_target_ranking_learning_weight);
         assert!(
             evolved.defensive_line_press_learning_weight
                 > base.defensive_line_press_learning_weight

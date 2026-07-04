@@ -272,22 +272,12 @@ mod tests {
         let line = (Vec2::new(0.0, 0.0), Vec2::new(0.0, 20.0));
         // Beyond the target.
         assert_eq!(
-            sightline_occlusion_fraction(
-                line.0,
-                line.1,
-                [Vec2::new(0.0, 25.0)],
-                OCCLUSION_BODY_RADIUS_YARDS
-            ),
+            sightline_occlusion_fraction(line.0, line.1, [Vec2::new(0.0, 25.0)], OCCLUSION_BODY_RADIUS_YARDS),
             0.0
         );
         // Behind the observer.
         assert_eq!(
-            sightline_occlusion_fraction(
-                line.0,
-                line.1,
-                [Vec2::new(0.0, -5.0)],
-                OCCLUSION_BODY_RADIUS_YARDS
-            ),
+            sightline_occlusion_fraction(line.0, line.1, [Vec2::new(0.0, -5.0)], OCCLUSION_BODY_RADIUS_YARDS),
             0.0
         );
     }
@@ -306,10 +296,7 @@ mod tests {
             [Vec2::new(0.9, 10.0)],
             OCCLUSION_BODY_RADIUS_YARDS,
         );
-        assert!(
-            near > far && far > 0.0,
-            "closer to the line screens more: {near} vs {far}"
-        );
+        assert!(near > far && far > 0.0, "closer to the line screens more: {near} vs {far}");
     }
 
     #[test]
@@ -323,10 +310,7 @@ mod tests {
         let p = Vec2::new(30.0, 40.0);
         let high = perceived_position(p, 0.9, 7).distance(p);
         let low = perceived_position(p, 0.1, 7).distance(p);
-        assert!(
-            low > high,
-            "lower confidence ⇒ larger error: {low} vs {high}"
-        );
+        assert!(low > high, "lower confidence ⇒ larger error: {low} vs {high}");
         assert!(
             low <= PERCEPTION_MAX_POSITION_ERROR_YARDS + 1e-9,
             "error stays bounded: {low}"
@@ -336,10 +320,7 @@ mod tests {
     #[test]
     fn perceived_position_is_deterministic_per_seed() {
         let p = Vec2::new(10.0, 10.0);
-        assert_eq!(
-            perceived_position(p, 0.3, 99),
-            perceived_position(p, 0.3, 99)
-        );
+        assert_eq!(perceived_position(p, 0.3, 99), perceived_position(p, 0.3, 99));
         assert_ne!(
             perceived_position(p, 0.3, 99),
             perceived_position(p, 0.3, 100),
@@ -360,10 +341,7 @@ mod tests {
             "error magnitude must vary with the seed (disk, not ring): {m1} {m2} {m3}"
         );
         for m in [m1, m2, m3] {
-            assert!(
-                m <= 0.8 * PERCEPTION_MAX_POSITION_ERROR_YARDS + 1e-9,
-                "bounded: {m}"
-            );
+            assert!(m <= 0.8 * PERCEPTION_MAX_POSITION_ERROR_YARDS + 1e-9, "bounded: {m}");
         }
     }
 
@@ -371,8 +349,8 @@ mod tests {
     fn lagged_belief_trails_a_fast_mover_and_is_exact_when_sure() {
         let true_pos = Vec2::new(0.0, 50.0);
         let velocity = Vec2::new(0.0, 20.0); // sprinting up-field (+y)
-                                             // Fully uncertain: belief lags ~v·MAX_LAG (8yd back), dominating the ≤3.2yd
-                                             // disk error, so the perceived y is clearly behind the true y.
+        // Fully uncertain: belief lags ~v·MAX_LAG (8yd back), dominating the ≤3.2yd
+        // disk error, so the perceived y is clearly behind the true y.
         let unsure = perceived_position_lagged(true_pos, velocity, 0.0, 5);
         assert!(
             unsure.y < true_pos.y,

@@ -264,11 +264,7 @@ impl GiveAndGoHead {
     /// ACTION (committed / held), weighted by how much its reward beat the batch baseline, so the
     /// head learns the one-two that actually advanced the ball. Mirrors
     /// [`super::long_pass_run::LongPassRunHead::train_reward_weighted`].
-    pub fn train_reward_weighted(
-        &mut self,
-        samples: &[GiveAndGoSample],
-        learning_rate: f64,
-    ) -> f64 {
+    pub fn train_reward_weighted(&mut self, samples: &[GiveAndGoSample], learning_rate: f64) -> f64 {
         let finite: Vec<&GiveAndGoSample> = samples
             .iter()
             .filter(|s| s.reward.is_finite() && s.action_commit.is_finite())

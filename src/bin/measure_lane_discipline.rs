@@ -29,12 +29,7 @@ fn main() {
     let seeds: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4);
 
     let gate = std::env::var("DD_SOCCER_ENABLE_LANE_DISCIPLINE_V2")
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);
 
     let mut drift_sum = 0.0_f64; // sum |x - home_x| over outfield player-ticks
@@ -71,8 +66,8 @@ fn main() {
                     if drift > 15.0 {
                         out_of_band += 1;
                     }
-                    let lane =
-                        ((p.position.x.max(0.0) / lane_width).floor() as usize).min(LANES - 1);
+                    let lane = ((p.position.x.max(0.0) / lane_width).floor() as usize)
+                        .min(LANES - 1);
                     occ[lane] += 1;
                     min_x = min_x.min(p.position.x);
                     max_x = max_x.max(p.position.x);
@@ -94,20 +89,11 @@ fn main() {
         if gate { "ON" } else { "off" }
     );
     println!("outfield player-ticks: {player_ticks}");
-    println!(
-        "lateral drift   |x-home_x|  : {:.3} yd  (lower = tighter)",
-        drift_sum / pt
-    );
+    println!("lateral drift   |x-home_x|  : {:.3} yd  (lower = tighter)", drift_sum / pt);
     println!(
         "out-of-band     >15yd off home: {:.2}%      (lower = tighter)",
         100.0 * out_of_band as f64 / pt
     );
-    println!(
-        "lane bunching   max lane occ : {:.3} / 11 (lower = less bunched)",
-        bunch_sum / tt
-    );
-    println!(
-        "team width      max_x-min_x  : {:.3} yd  (must NOT collapse)",
-        width_sum / tt
-    );
+    println!("lane bunching   max lane occ : {:.3} / 11 (lower = less bunched)", bunch_sum / tt);
+    println!("team width      max_x-min_x  : {:.3} yd  (must NOT collapse)", width_sum / tt);
 }

@@ -35,11 +35,13 @@ use std::time::{Duration, Instant};
 use soccer_engine::des::general::soccer::{
     MatchConfig, SoccerNeuralNetworkSnapshot, SoccerQPolicyOptions, SoccerTeamQPolicies,
 };
-use soccer_engine::des::general::soccer_elo::{CrossPlayMatrix, EloRatings, ELO_DEFAULT_K};
 use soccer_engine::des::general::tournament::{
     EngineMatchRunner, EngineMatchRunnerConfig, GenomeRng, SoccerTeamGenome, TeamBrain, Tournament,
     TournamentFormat, TournamentLearningMode, TournamentReport, TournamentTeam,
     TOURNAMENT_DEFAULT_MATCH_SECONDS,
+};
+use soccer_engine::des::general::soccer_elo::{
+    CrossPlayMatrix, EloRatings, ELO_DEFAULT_K,
 };
 use soccer_engine::des::soccer_learning::SOCCER_POLICY_STATUS_ACTIVE;
 use soccer_engine::des::soccer_learning_pg::{SoccerLearningPgStore, TournamentElite};

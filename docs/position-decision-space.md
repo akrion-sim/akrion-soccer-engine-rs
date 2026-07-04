@@ -27,13 +27,9 @@ distinguishes a left-back from a centre-back though both are "defenders":
 So a decision is "position-specific" when it is **gated on these predicates** before it can
 fire. The sections below enumerate every position and the decisions gated to it.
 
-A position making a decision sees only its **POMDP observation `O`** plus the legal-action
-mask, never the full mutable state `S`. That observation is the rich
-`SoccerPomdpObservation`/feature-builder surface: role/phase/context scalars plus the
-append-only whole-field motion block for 22 players + the ball (position, velocity,
-acceleration, jerk and direction channels). Every decision below is therefore a function of
-*observable* features only, even when the neural learner also consumes the same field-vector
-tail through `SOCCER_NEURAL_FEATURE_DIM`.
+A position making a decision sees only its **POMDP observation `O`** (≈129-dim feature
+vector + legality mask, built in `perception.rs` / the feature builder), never the full state
+`S`. Every decision below is therefore a function of *observable* features only.
 
 ## 2. Shared decision families (all positions)
 

@@ -117,11 +117,7 @@ fn env_flag_enabled(name: &str) -> bool {
 pub fn decision_unit_draw(decision_seed: u64, player_id: usize, tick: u64, site: u64) -> f64 {
     let mut z = decision_seed
         .wrapping_mul(0x9e37_79b9_7f4a_7c15)
-        .wrapping_add(
-            (player_id as u64)
-                .wrapping_add(1)
-                .wrapping_mul(0xbf58_476d_1ce4_e5b9),
-        )
+        .wrapping_add((player_id as u64).wrapping_add(1).wrapping_mul(0xbf58_476d_1ce4_e5b9))
         .wrapping_add(tick.wrapping_mul(0x94d0_49bb_1331_11eb))
         .wrapping_add(site.wrapping_mul(0xd6e8_feb8_6659_fd93));
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -192,11 +188,7 @@ fn boltzmann_pick(scores: &[f64], temperature: f64, draw: f64) -> (usize, f64) {
     if !(total > 0.0) {
         return (argmax_index(scores), 1.0);
     }
-    let draw = if draw.is_finite() {
-        draw.clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
+    let draw = if draw.is_finite() { draw.clamp(0.0, 1.0) } else { 0.0 };
     let target = draw * total;
     let mut acc = 0.0;
     for (i, &w) in weights.iter().enumerate() {
@@ -236,7 +228,11 @@ const SELECTION_PROB_FLOOR: f64 = 1e-3;
 /// `n` is the number of candidates actually present. With `n >= 3` the full
 /// `[0.70, 0.20, 0.10]` applies; with `n == 2` it is `[0.70, 0.20]` renormalised
 /// to `~[0.78, 0.22]`; with `n <= 1` rank 0 is forced.
-pub fn sampled_rank(n: usize, weights: [f64; POLICY_SELECTION_TOP_RANK_LIMIT], draw: f64) -> usize {
+pub fn sampled_rank(
+    n: usize,
+    weights: [f64; POLICY_SELECTION_TOP_RANK_LIMIT],
+    draw: f64,
+) -> usize {
     let k = n.min(POLICY_SELECTION_TOP_RANK_LIMIT);
     if k <= 1 {
         return 0;
@@ -481,7 +477,14 @@ pub fn sampled_index_by_score_traced(
     } else {
         0.0
     };
-    sampled_index_by_score_traced_at(scores, temperature, decision_seed, player_id, tick, site)
+    sampled_index_by_score_traced_at(
+        scores,
+        temperature,
+        decision_seed,
+        player_id,
+        tick,
+        site,
+    )
 }
 
 /// [`sampled_index_by_score_traced`] with the Boltzmann `temperature` passed in
@@ -501,16 +504,8 @@ fn sampled_index_by_score_traced_at(
     // the deterministic argmax is rank 0.
     let mut idx: Vec<usize> = (0..scores.len()).collect();
     idx.sort_by(|&a, &b| {
-        let sa = if scores[a].is_finite() {
-            scores[a]
-        } else {
-            f64::NEG_INFINITY
-        };
-        let sb = if scores[b].is_finite() {
-            scores[b]
-        } else {
-            f64::NEG_INFINITY
-        };
+        let sa = if scores[a].is_finite() { scores[a] } else { f64::NEG_INFINITY };
+        let sb = if scores[b].is_finite() { scores[b] } else { f64::NEG_INFINITY };
         sb.total_cmp(&sa).then_with(|| a.cmp(&b))
     });
     if !stochastic_policy_topk_enabled() || idx.len() < 2 {
@@ -524,10 +519,7 @@ fn sampled_index_by_score_traced_at(
     } else {
         let weights = rank_weights();
         let rank = sampled_rank(idx.len(), weights, draw);
-        (
-            rank,
-            behavior_probability_for_rank(idx.len(), weights, rank),
-        )
+        (rank, behavior_probability_for_rank(idx.len(), weights, rank))
     };
     idx.get(rank).copied().map(|i| (i, Some(probability)))
 }
@@ -705,10 +697,7 @@ mod tests {
         // near-tie should leave a much larger non-best mass than a clear gap.
         let near = boltzmann_pick(&[1.00, 0.99], 0.5, 1.0).1; // p(2nd) for a near-tie
         let clear = boltzmann_pick(&[1.00, 0.00], 0.5, 1.0).1; // p(2nd) for a clear gap
-        assert!(
-            near > clear,
-            "near-tie {near} should exceed clear-gap {clear}"
-        );
+        assert!(near > clear, "near-tie {near} should exceed clear-gap {clear}");
         // And hotter temperature flattens (more exploration) vs. colder.
         let hot = boltzmann_pick(&[1.0, 0.0], 2.0, 1.0).1;
         let cold = boltzmann_pick(&[1.0, 0.0], 0.2, 1.0).1;
@@ -776,10 +765,7 @@ mod tests {
                 p_second > prev,
                 "temp {t}: p(2nd)={p_second} did not exceed previous {prev}"
             );
-            assert!(
-                p_second < 0.5,
-                "temp {t}: p(2nd)={p_second} should stay < 0.5"
-            );
+            assert!(p_second < 0.5, "temp {t}: p(2nd)={p_second} should stay < 0.5");
             prev = p_second;
         }
     }
@@ -839,15 +825,8 @@ mod tests {
         with_gate(false, || {
             let base = vec!["a", "b", "c", "d"];
             let scores = [4.0, 3.0, 2.0, 1.0];
-            let out = reorder_with_scores_traced_at(
-                base.clone(),
-                &scores,
-                2.5,
-                7,
-                3,
-                100,
-                site::POSSESSION,
-            );
+            let out =
+                reorder_with_scores_traced_at(base.clone(), &scores, 2.5, 7, 3, 100, site::POSSESSION);
             assert_eq!(out.ordered, base);
             assert_eq!(out.behavior_probability, None);
         });

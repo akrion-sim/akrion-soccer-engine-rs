@@ -18,9 +18,7 @@
 //!
 //! Run: cargo run --release --bin measure_loose_ball [ticks] [seeds]
 
-use soccer_engine::des::general::soccer::{
-    enable_deterministic_formation_lp, MatchConfig, PlayerRole, SoccerMatch, Team,
-};
+use soccer_engine::des::general::soccer::{enable_deterministic_formation_lp, MatchConfig, SoccerMatch, PlayerRole, Team};
 
 const NEAR_RADIUS_YARDS: f64 = 2.0;
 const PROGRESS_WINDOW_TICKS: usize = 3;
@@ -153,9 +151,9 @@ fn main() {
     let mut home_fail = StreakStats::default();
     let mut away_fail = StreakStats::default();
     let mut ball_idle = StreakStats::default(); // BOTH teams failing at once
-                                                // Settled ball with nobody within 2yd, REGARDLESS of whether someone is
-                                                // closing — i.e. "ball physically unpossessed" time, which is what the eye
-                                                // reads as 'uncontested' even while a far chaser is en route.
+    // Settled ball with nobody within 2yd, REGARDLESS of whether someone is
+    // closing — i.e. "ball physically unpossessed" time, which is what the eye
+    // reads as 'uncontested' even while a far chaser is en route.
     let mut settled_unpossessed = StreakStats::default();
 
     for s in 0..seeds {
@@ -227,12 +225,7 @@ fn main() {
             home_fail.tick(home_failing, dt_seen, home_min, ball_speed);
             away_fail.tick(away_failing, dt_seen, away_min, ball_speed);
             ball_idle.tick(ball_fully_idle, dt_seen, nearest, ball_speed);
-            settled_unpossessed.tick(
-                settled && nearest > NEAR_RADIUS_YARDS,
-                dt_seen,
-                nearest,
-                ball_speed,
-            );
+            settled_unpossessed.tick(settled && nearest > NEAR_RADIUS_YARDS, dt_seen, nearest, ball_speed);
         }
         // Close any open streaks at match end.
         home_fail.close(dt_seen);
@@ -259,26 +252,10 @@ fn main() {
         "thresholds: near<= {NEAR_RADIUS_YARDS} yd, no-progress over {PROGRESS_WINDOW_TICKS} ticks, contest only counted on SETTLED balls\n"
     );
     // Denominator = settled loose ticks (the only ticks where "failing" can fire).
-    settled_unpossessed.report(
-        "SETTLED BALL UNPOSSESSED (nobody within 2yd, even if a far chaser is closing)",
-        dt_seen,
-        settled_loose_ticks,
-    );
-    ball_idle.report(
-        "BALL FULLY IDLE (settled; both teams failing to contest)",
-        dt_seen,
-        settled_loose_ticks,
-    );
-    home_fail.report(
-        "HOME failing to contest a settled ball",
-        dt_seen,
-        settled_loose_ticks,
-    );
-    away_fail.report(
-        "AWAY failing to contest a settled ball",
-        dt_seen,
-        settled_loose_ticks,
-    );
+    settled_unpossessed.report("SETTLED BALL UNPOSSESSED (nobody within 2yd, even if a far chaser is closing)", dt_seen, settled_loose_ticks);
+    ball_idle.report("BALL FULLY IDLE (settled; both teams failing to contest)", dt_seen, settled_loose_ticks);
+    home_fail.report("HOME failing to contest a settled ball", dt_seen, settled_loose_ticks);
+    away_fail.report("AWAY failing to contest a settled ball", dt_seen, settled_loose_ticks);
     println!(
         "\n(Episodes >=2s in 'BALL FULLY IDLE' = the gap: a SETTLED loose ball neither team\n commits to. Large mean nearest-body distance = the 'open-space ball nobody chases' case.)"
     );

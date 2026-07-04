@@ -50,9 +50,7 @@ budget. Larger effort; gated and eval-gated identically.
 3. `soccer_eval_gate` A/B; promote on positive verdict.
 
 ## Non-goals (explicit)
-- No full-state per-tick GNN/RNN/deep MCTS (blows the 22-agent / 66 ms budget — see
-  architecture-audit.md). Bounded MCTS/PUCT remains an opt-in reranker over capped legal
-  candidates, not part of this offline encoder step.
+- No per-tick GNN/RNN/MCTS (blows the 22-agent / 66 ms budget — see architecture-audit.md).
 - No change to the tabular `state_key` encoding (would orphan existing tabular entries).
 
 ## Findings during implementation (2026-06-28) — must resolve before the Rust bin

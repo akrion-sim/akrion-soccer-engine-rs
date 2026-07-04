@@ -25,12 +25,12 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use soccer_engine::des::general::soccer::SoccerMatch;
 use soccer_engine::des::general::soccer::{
     enable_deterministic_formation_lp, MatchConfig, SoccerMarlAlgorithm,
     SoccerNeuralLearningBackend, SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot,
     SoccerQPolicyOptions, SoccerTeamQPolicies, DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
 };
+use soccer_engine::des::general::soccer::SoccerMatch;
 use soccer_engine::des::general::soccer_eval_gate::{evaluate_promotion, PromotionThresholds};
 use soccer_engine::des::general::tournament::{
     EngineMatchRunner, EngineMatchRunnerConfig, MatchReport, TeamBrain, TournamentMatchContext,
@@ -158,9 +158,7 @@ fn main() {
     // Frozen field (ids 1..pool): distinct-genome fresh brains, the incumbent +
     // diverse opponents the candidate must beat without being countered.
     let pool: Vec<TeamBrain> = (1..pool_size)
-        .map(|id| {
-            TeamBrain::fresh_with_seed(0xF0_0000u32.wrapping_add(id as u32 * 2_654_435_761), id)
-        })
+        .map(|id| TeamBrain::fresh_with_seed(0xF0_0000u32.wrapping_add(id as u32 * 2_654_435_761), id))
         .collect();
 
     let mut runner_config = EngineMatchRunnerConfig::default();
@@ -201,7 +199,11 @@ fn main() {
                 Ok(report) => {
                     eprintln!(
                         "  holdout {}v{} seed=0x{:08X} -> {}-{}",
-                        report.home_id, report.away_id, seed, report.home_goals, report.away_goals
+                        report.home_id,
+                        report.away_id,
+                        seed,
+                        report.home_goals,
+                        report.away_goals
                     );
                     reports.push(report);
                 }
@@ -237,21 +239,14 @@ fn main() {
     );
     println!(
         "cross-play: mean payoff vs field {:?}  vs baseline {:?}  worst-case {:?}",
-        verdict
-            .mean_payoff_vs_field
-            .map(|p| (p * 1000.0).round() / 1000.0),
-        verdict
-            .payoff_vs_baseline
-            .map(|p| (p * 1000.0).round() / 1000.0),
+        verdict.mean_payoff_vs_field.map(|p| (p * 1000.0).round() / 1000.0),
+        verdict.payoff_vs_baseline.map(|p| (p * 1000.0).round() / 1000.0),
         verdict
             .worst_case
             .map(|(o, p)| (o, (p * 1000.0).round() / 1000.0)),
     );
     println!("Wilson lower bound: {:.3}", verdict.wilson_lower_bound);
-    println!(
-        "\nDECISION: {}",
-        if verdict.promote { "PROMOTE" } else { "REJECT" }
-    );
+    println!("\nDECISION: {}", if verdict.promote { "PROMOTE" } else { "REJECT" });
     for reason in &verdict.reasons {
         println!("  - {reason}");
     }

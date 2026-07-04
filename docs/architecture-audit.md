@@ -17,7 +17,7 @@ system in which the learned layer **re-ranks a small heuristic candidate set**
 | 4 | Reward too sparse? | **No — densely shaped**: `PITCH_VALUE` (xT-like), `REWARD_PER_YARD`, half-field weighting, `REWARD_MIN_PRESSURE`, possession progression, `EFFORT_REWARD`, shot/pass ladders | soccer.rs reward consts |
 | 5 | 11 independent NNs? | **No — MARL/MAPPO**: team reward weight 0.35 / intermediate 1.0, centralized lane-discipline, balanced-team component, MAPPO feature channels | `DEFAULT_SOCCER_MARL_TEAM_REWARD_WEIGHT`, `field_numbers` |
 | 6 | Player relationships modeled? | **Engineered, not learned**: 22-body `field_numbers` vector, relational shape (neighbors), lane affinity, nearest-opponent/marking | `mod field_numbers`, `RELATIONAL_SHAPE_NEIGHBORS` |
-| 7 | Sequence search? | **Bounded and opt-in**: analytic lookahead (pass-lane 2s, reactive 1.4s, energy 10s) + MPC are always available; neural MCTS/PUCT can rerank a capped set of legal candidates when `mcts_enabled` is on. There is still no full match-state tree search. | `SoccerNeuralBlendConfig::{mcts_*}`, `neural_mcts_action_from_candidates`, `*_LOOKAHEAD_SECONDS` consts |
+| 7 | Sequence search? | **Analytic lookahead only** (pass-lane 2s, reactive 1.4s, energy 10s) + MPC — **no MCTS/rollout/learned-model search** | `*_LOOKAHEAD_SECONDS` consts |
 | 8 | MPC = execution only? | **Yes (correct)** — MPC/QP gates ball control + pass execution; tactics decided upstream | `bounded_accel_qp_control_fit`, "MPC pass execution" |
 
 ## What is genuinely missing (the audit's valid points)
@@ -26,9 +26,8 @@ system in which the learned layer **re-ranks a small heuristic candidate set**
    features (`SOCCER_NEURAL_BASE_FEATURE_DIM = 192` + appended channels). No learned
    GNN/attention over the player graph; no learned RNN/Transformer temporal belief. The
    relational + temporal signal is *feature-engineered in*.
-2. **Richer learned-model search.** The engine now has a shallow, capped neural MCTS/PUCT
-   reranker over already-legal candidates. What is still missing is MuZero/POMCP-style full-state
-   belief search or a deep learned transition rollout over the whole match state.
+2. **Learned-model search.** No MuZero/MCTS/POMCP. Planning is analytic lookahead + MPC, not
+   tree search over a learned transition model.
 
 ## The reality check the external audit missed (decisive here)
 
@@ -52,11 +51,10 @@ graph/recurrent/tree-search cost."
    - First step: export a feature+outcome dataset from PG; train encoder→head offline;
      ship only the distilled dense weights through the existing neural-snapshot path
      (append at tail, zero-pad old snapshots — already supported, see "new variables").
-3. **Keep bounded MCTS/PUCT on the top-k only (captures audit #7 within budget).**
-   - Already implemented as an opt-in reranker over legal candidates, with hard caps on
-     candidates, simulations, and depth.
-   - Do not widen it into team MPC or full match-tree search; deepen only through cheap
-     one-step/world-model value estimates that preserve the tick budget.
+3. **Bounded learned-model rollout over the top-k only (captures audit #7 within budget).**
+   - Not full MCTS. 1–2 ply lookahead over the existing ≤12 candidates using a learned
+     one-step outcome head (reuse the pass/shot/carry outcome heads already present).
+   - Cost is bounded: `≤12 candidates × 1–2 ply × cheap outcome head` — fits the tick budget.
 4. **Lean into the CTDE you already have.** Strengthen the centralized critic *offline*
    (MAPPO team reward already wired); runtime stays decentralized per-player.
 5. **New-variable discipline (already-correct pattern).** Append features at the tail and
@@ -71,9 +69,8 @@ graph/recurrent/tree-search cost."
   (overflow bug), so `SOCCER_LIVE_POLICY_MIN_VISITS` can't trim the policy load — gen-308 is
   1.32M entries with no usable visit filter. Worth fixing (i64 / capped counter) to enable
   fast partial loads.
-- Older live-generation examples in this file may drift quickly. For current generation health,
-  query `des_soccer_learning_policy_versions` / `des_soccer_learning_runs` for the active
-  experiment instead of trusting a dated snapshot.
+- Tip generations (2026-06-28): `soccer-self-play-k8s-overnight` gen 308 (actively training,
+  +17 gens/24h), `…-deterministic` gen 372 (stalled ~3 days), `…-queue` gen 38 (stalled).
 
 ## Offline distilled-encoder harness — status
 
