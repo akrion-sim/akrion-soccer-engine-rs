@@ -194,9 +194,19 @@ fn main() {
 
     // Frozen field (ids 1..pool): distinct-genome fresh brains, the incumbent +
     // diverse opponents the candidate must beat without being countered.
-    let pool: Vec<TeamBrain> = (1..pool_size)
+    let mut pool: Vec<TeamBrain> = (1..pool_size)
         .map(|id| TeamBrain::fresh_with_seed(0xF0_0000u32.wrapping_add(id as u32 * 2_654_435_761), id))
         .collect();
+    // Champion-gate: when SOCCER_EVAL_BASELINE_PATH is set, replace the incumbent
+    // (id 1 == pool[0]) with the champion loaded from a local learned-params file, so
+    // the held-out fixtures become a direct candidate-vs-champion comparison (the
+    // monotone promotion gate) instead of candidate-vs-fresh.
+    if let Some(snapshot) = snapshot_from_env_file("SOCCER_EVAL_BASELINE_PATH") {
+        if let Some(first) = pool.first_mut() {
+            *first = TeamBrain::from_snapshot(snapshot);
+            eprintln!("eval_baseline_replaced_with_champion id={baseline_id}");
+        }
+    }
 
     let mut runner_config = EngineMatchRunnerConfig::default();
     runner_config.base.duration_seconds = minutes * 60.0;
