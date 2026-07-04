@@ -210,6 +210,13 @@ fn main() {
 
     let mut runner_config = EngineMatchRunnerConfig::default();
     runner_config.base.duration_seconds = minutes * 60.0;
+    // CRITICAL: the runner defaults neural_blend.actor_critic=false ("critic-only"),
+    // which leaves the loaded neural ACTOR inert — the match is then decided by the
+    // deterministic analytic base on fixed seeds, so every eval returns an IDENTICAL
+    // result regardless of which policy is loaded (a constant, useless as a gate).
+    // Drive play with the neural actor, exactly as the learner trains it, so the gate
+    // actually measures the neural policy and varies as the net climbs.
+    runner_config.base.neural_blend.actor_critic = true;
     let mut runner = EngineMatchRunner::new(runner_config);
 
     let started = Instant::now();
