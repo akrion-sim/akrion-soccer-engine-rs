@@ -88,6 +88,42 @@ fn load_snapshot(path: &str) -> Option<SoccerNeuralNetworkSnapshot> {
     serde_json::from_value(v.get("neuralNetwork")?.clone()).ok()
 }
 
+/// Federated / data-parallel averaging: each worker trained a CLONE of the same frontier on a
+/// disjoint slice of the round's games; averaging their weights recombines the parallel work
+/// into one net (all share identical architecture). training_steps accumulates total gradient
+/// work across workers so warmth/step-count keep climbing.
+fn average_snapshots(
+    base_steps: usize,
+    snaps: Vec<SoccerNeuralNetworkSnapshot>,
+) -> Option<SoccerNeuralNetworkSnapshot> {
+    if snaps.len() <= 1 {
+        return snaps.into_iter().next();
+    }
+    let n = snaps.len() as f64;
+    let mut out = snaps[0].clone();
+    for (li, layer) in out.layers.iter_mut().enumerate() {
+        for (ri, row) in layer.weights.iter_mut().enumerate() {
+            for (wi, w) in row.iter_mut().enumerate() {
+                *w = snaps.iter().map(|s| s.layers[li].weights[ri][wi]).sum::<f64>() / n;
+            }
+        }
+        for (bi, b) in layer.biases.iter_mut().enumerate() {
+            *b = snaps.iter().map(|s| s.layers[li].biases[bi]).sum::<f64>() / n;
+        }
+    }
+    let new_total: usize = snaps
+        .iter()
+        .map(|s| s.training_steps.saturating_sub(base_steps))
+        .sum();
+    out.training_steps = base_steps + new_total;
+    let losses: Vec<f64> = snaps.iter().filter_map(|s| s.average_loss).collect();
+    if !losses.is_empty() {
+        out.average_loss = Some(losses.iter().sum::<f64>() / losses.len() as f64);
+    }
+    recompute_norm(&mut out);
+    Some(out)
+}
+
 /// Write the frontier snapshot into a COMPACT learned-params.json (drops the large tabular
 /// table — we are neural-first and every consumer only reads `neuralNetwork`). Atomic + .prev.
 fn write_frontier(path: &str, snap: &SoccerNeuralNetworkSnapshot) -> std::io::Result<()> {
