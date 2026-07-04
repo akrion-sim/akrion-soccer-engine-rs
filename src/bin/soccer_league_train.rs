@@ -351,6 +351,12 @@ fn main() {
             seed: u32,
             home: bool,
         }
+        // With an asymmetric per-team skill handicap (SOCCER_SKILL_SCALE_HOME on the frontier),
+        // the frontier must always occupy the handicapped side, so pin it Home when requested;
+        // otherwise keep the home/away alternation that removes a home-side artifact.
+        let frontier_always_home = std::env::var("SOCCER_LEAGUE_FRONTIER_ALWAYS_HOME")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         let mut fixtures: Vec<Fx> = Vec::new();
         let mut fixture = 0u32;
         for idx in 0..opponents.len() {
@@ -359,7 +365,8 @@ fn main() {
                     .wrapping_add(round.wrapping_mul(1_000_003))
                     .wrapping_add(fixture.wrapping_mul(2_246_822_519))
                     .wrapping_add(g as u32);
-                fixtures.push(Fx { opp_idx: idx, opp_id: idx + 1, seed, home: g % 2 == 0 });
+                let home = frontier_always_home || g % 2 == 0;
+                fixtures.push(Fx { opp_idx: idx, opp_id: idx + 1, seed, home });
                 fixture += 1;
             }
         }
