@@ -230,7 +230,7 @@ fn main() {
     // trains. (Setting actor_critic=true shares the policy_head/actor across teams and
     // BLURS which brain is better, per the runner's own docs.) The eval is policy-sensitive
     // through the per-team critic; comparisons must be between DIFFERENT-lineage nets.
-    let mut runner = EngineMatchRunner::new(runner_config);
+    let runner = EngineMatchRunner::new(runner_config);
 
     let started = Instant::now();
 

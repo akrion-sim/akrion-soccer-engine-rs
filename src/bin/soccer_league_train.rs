@@ -201,6 +201,12 @@ fn main() {
     runner_config.base.neural_learning.replay_samples_per_tick =
         env_usize("SOCCER_LEAGUE_REPLAY_SAMPLES_PER_TICK", 128).max(1);
     runner_config.base.neural_learning.batch_size = env_usize("SOCCER_LEAGUE_BATCH_SIZE", 64).max(1);
+    // Network capacity: bigger hidden layer for more expressive value function over the
+    // 610-dim field vector (the 24-unit net plateaued at parity with the analytic engine).
+    // Only takes effect on a FRESH net — a resumed snapshot keeps its own architecture.
+    runner_config.base.neural_learning.hidden_units =
+        env_usize("SOCCER_LEAGUE_HIDDEN_UNITS", runner_config.base.neural_learning.hidden_units)
+            .max(1);
     // Keep the engine's designed independent-brain mode (per-team critic drives each side).
     let mut runner = EngineMatchRunner::new(runner_config);
 
