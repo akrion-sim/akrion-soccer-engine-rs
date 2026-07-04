@@ -2802,7 +2802,7 @@ const SAME_TEAM_MPC_OBSTACLE_WEIGHT_GAIN: f64 = 1.6;
 // learning penalty is graced. The 18-yard-box pair exception applies here too (nearest NON-EXEMPT
 // teammate only). All inert when the separation floor gate is off (timers stay 0).
 const SAME_TEAM_PROXIMITY_GRACE_LT7_SECONDS: f64 = 2.0;
-const SAME_TEAM_PROXIMITY_GRACE_LT6_SECONDS: f64 = 2.0;
+const SAME_TEAM_PROXIMITY_GRACE_LT6_SECONDS: f64 = 1.5;
 const SAME_TEAM_PROXIMITY_GRACE_LT5_SECONDS: f64 = 1.0;
 const SAME_TEAM_PROXIMITY_BAND_LT7_YARDS: f64 = 7.0;
 const SAME_TEAM_PROXIMITY_BAND_LT6_YARDS: f64 = 6.0;
