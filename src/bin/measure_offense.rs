@@ -78,10 +78,7 @@ fn main() {
                 prev_one_two[i] = now;
             }
         }
-        eprintln!(
-            "seed {s}: final {}-{}",
-            sim.score_home, sim.score_away
-        );
+        eprintln!("seed {s}: final {}-{}", sim.score_home, sim.score_away);
     }
 
     println!("\n===== OFFENSE UTILIZATION ({seeds} matches x {ticks} ticks) =====");

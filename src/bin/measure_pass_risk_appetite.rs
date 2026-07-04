@@ -187,7 +187,11 @@ fn main() {
 
     println!(
         "\n===== PASS RISK APPETITE ({seeds} matches x {ticks} ticks) — gate {} =====",
-        if gate_on { "ON (treatment)" } else { "OFF (baseline)" }
+        if gate_on {
+            "ON (treatment)"
+        } else {
+            "OFF (baseline)"
+        }
     );
     println!(
         "total goals: home {goals_home} / away {goals_away} (sum {})   unique pass decisions: {unique_pass_decisions}",
@@ -208,12 +212,7 @@ fn main() {
         "role | zone", "passes", "fwd%", "lat%", "back%", "avgFwdYds", "avgComp", "avgOpen"
     );
     // Stable ordering: role major, zone minor.
-    let order = [
-        "Goalkeeper",
-        "Defender",
-        "Midfielder",
-        "Forward",
-    ];
+    let order = ["Goalkeeper", "Defender", "Midfielder", "Forward"];
     let zones = ["own-third", "middle", "final-third"];
     for r in order {
         for z in zones {

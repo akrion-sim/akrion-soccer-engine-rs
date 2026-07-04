@@ -153,7 +153,10 @@ pub fn run_hypotheses(scored: &[(Vec2, f64)]) -> Vec<RunHypothesis> {
             modes.push((p, s));
         }
     }
-    let weights = softmax(&modes.iter().map(|(_, s)| *s).collect::<Vec<_>>(), RUN_PREDICTION_TEMPERATURE);
+    let weights = softmax(
+        &modes.iter().map(|(_, s)| *s).collect::<Vec<_>>(),
+        RUN_PREDICTION_TEMPERATURE,
+    );
     modes
         .into_iter()
         .zip(weights)
@@ -233,10 +236,10 @@ mod tests {
         // neighbour. We must get back exactly the two distinct modes, not 4 points
         // and not an average of the clusters.
         let scored = vec![
-            (Vec2::new(10.0, 50.0), 9.0),  // mode A (best)
-            (Vec2::new(12.0, 51.0), 8.5),  // A's neighbour (within cluster)
-            (Vec2::new(40.0, 50.0), 8.0),  // mode B (best of its cluster)
-            (Vec2::new(41.0, 49.0), 7.0),  // B's neighbour
+            (Vec2::new(10.0, 50.0), 9.0), // mode A (best)
+            (Vec2::new(12.0, 51.0), 8.5), // A's neighbour (within cluster)
+            (Vec2::new(40.0, 50.0), 8.0), // mode B (best of its cluster)
+            (Vec2::new(41.0, 49.0), 7.0), // B's neighbour
         ];
         let modes = run_hypotheses(&scored);
         assert_eq!(modes.len(), 2, "two distinct clusters ⇒ two modes");
@@ -245,8 +248,14 @@ mod tests {
         // Modes are ≥ cluster radius apart.
         assert!(modes[0].dest.distance(modes[1].dest) >= RUN_PREDICTION_CLUSTER_YARDS);
         // The higher-scoring cluster (A) carries more probability.
-        let a = modes.iter().min_by(|x, y| x.dest.x.total_cmp(&y.dest.x)).unwrap();
-        let b = modes.iter().max_by(|x, y| x.dest.x.total_cmp(&y.dest.x)).unwrap();
+        let a = modes
+            .iter()
+            .min_by(|x, y| x.dest.x.total_cmp(&y.dest.x))
+            .unwrap();
+        let b = modes
+            .iter()
+            .max_by(|x, y| x.dest.x.total_cmp(&y.dest.x))
+            .unwrap();
         assert!(a.prob > b.prob, "A scored higher so should be likelier");
     }
 
@@ -285,7 +294,9 @@ mod tests {
     #[test]
     fn handles_non_finite_gracefully() {
         let argmax = Vec2::new(f64::NAN, 1.0);
-        assert!(blended_argmax_destination(&[(argmax, 1.0)], argmax).x.is_nan());
+        assert!(blended_argmax_destination(&[(argmax, 1.0)], argmax)
+            .x
+            .is_nan());
         assert!(run_hypotheses(&[(Vec2::new(f64::INFINITY, 0.0), f64::NAN)]).is_empty());
     }
 }

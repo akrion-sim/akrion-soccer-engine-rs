@@ -72,6 +72,11 @@ path = "src/bin/main_soccer_learning_run.rs"
 required-features = ["postgres-persistence"]
 
 [[bin]]
+name = "main_soccer_offline_train"
+path = "src/bin/main_soccer_offline_train.rs"
+required-features = ["postgres-persistence"]
+
+[[bin]]
 name = "main_soccer_set_play_learning_run"
 path = "src/bin/main_soccer_set_play_learning_run.rs"
 required-features = ["postgres-persistence"]

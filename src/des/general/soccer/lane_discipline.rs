@@ -227,7 +227,10 @@ mod tests {
             assert!((none - 1.0).abs() < 1e-9, "unrelieved ⇒ hard lock");
             assert!(none > mild && mild > lots, "monotone taper, not a cliff");
             let soft_floor = 0.9 * params().soft_blend_max;
-            assert!(lots >= soft_floor - 1e-9, "never below the legacy soft blend");
+            assert!(
+                lots >= soft_floor - 1e-9,
+                "never below the legacy soft blend"
+            );
         });
     }
 }
