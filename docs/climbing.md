@@ -154,9 +154,15 @@ without a database.)
 
 ---
 
-## Where it stands
+## Where it stands (honest)
 
-On-policy authoritative training is climbing steeply (−109 → +105 → round record +7 at 128k
-steps), the net is genuinely deciding on the full 22-player + ball kinematic vector, and the
-improvement is visible in live play. Next levers if/when it plateaus: relational-attention over
-entities, more capacity, and embedding-space retrieval for rare states.
+On-policy authoritative training took the net from **losing every game (−109) to ~even** with
+the reference (clean 12-game Δ ≈ 0 at 128k), the net is genuinely deciding on the full
+22-player + ball kinematic vector, and the improvement is **visible in live play**. It is
+**not** yet confidently beating the reference/analytic engine — the head-to-head is noisy at
+12 games and needs a bigger sample or a frozen eval pool to state the level precisely. Next
+levers to push past "competitive" toward "clearly better": **relational-attention over the
+entities** (biggest representational upgrade), **more capacity** (24 → 64/128 hidden units),
+keep exploiting the velocity/accel/jerk channels, and **embedding-space retrieval** for rare
+states — plus a **lower-variance eval** (frozen diverse pool, more games) so we stop chasing
+noisy single samples.
