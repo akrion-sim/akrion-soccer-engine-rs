@@ -1168,7 +1168,7 @@ const GOAL_CONTEXT_CREDIT_MAX_PLAYERS: usize = 5;
 const GOAL_CONTEXT_CREDIT_SCAN_ACTIONS: usize = 48;
 const GOAL_CONTEXT_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(60.0);
 const GOAL_CONTEXT_CREDIT_MIN_SCORE: f64 = 0.05;
-const SHOT_ON_TARGET_REWARD_POINTS: f64 = 70.0;
+const SHOT_ON_TARGET_REWARD_POINTS: f64 = 80.0;
 /// Direct keeper credit for stopping a shot, scaled upward for close-range danger.
 /// This trains the goalkeeper's preceding positioning/claim decision instead of only
 /// rewarding the shooter and penalising the keeper later when a goal is conceded.
@@ -1220,14 +1220,15 @@ const OFF_BALL_CARRIER_COLLAPSE_PENALTY: f64 = 8.0;
 // The carrier is "pressured" (and so genuinely wants a short option) when its nearest opponent is
 // inside this radius; the keep-out / marginal-cancel are suspended in that case.
 const OFF_BALL_CARRIER_PRESSURED_YARDS: f64 = 4.5;
-// A shot OFF the frame still earns a small attempt reward (vs the on-frame value).
+// A shot OFF the frame still earns a small attempt reward, but it must stay far below
+// the on-frame value so the learner improves shot quality instead of volume alone.
 const SHOT_OFF_TARGET_REWARD_POINTS: f64 = 12.0;
 // Shot accuracy: a missed effort that crosses the line more than this far outside the
 // nearest post draws a small per-yard penalty (capped), so the policy is taught to hit
 // the frame rather than blaze it wide. Within the forgiveness margin a near-miss is free.
 const SHOT_OFF_TARGET_FORGIVENESS_YARDS: f64 = 0.5;
-const SHOT_OFF_TARGET_PENALTY_PER_YARD: f64 = 0.6;
-const SHOT_OFF_TARGET_MAX_PENALTY_POINTS: f64 = 3.0;
+const SHOT_OFF_TARGET_PENALTY_PER_YARD: f64 = 0.8;
+const SHOT_OFF_TARGET_MAX_PENALTY_POINTS: f64 = 5.0;
 const COMPLETED_FORWARD_PASS_BASE_REWARD_OWN_HALF: f64 = 4.5;
 const COMPLETED_FORWARD_PASS_BASE_REWARD_OPPONENT_HALF: f64 = 5.5;
 const COMPLETED_FORWARD_PASS_PROGRESS_REWARD_PER_YARD: f64 = 0.08;
@@ -1244,8 +1245,8 @@ const FIRST_TIME_SHORT_FORWARD_PASS_TAPER_YARDS: f64 = 8.0;
 // no longer look like an attractive default recycle. Penalize it enough that safe lateral
 // and forward options win clearly, with own-half retreats stinging more because they move
 // the ball back toward danger. Pressure-relief escapes are still handled separately.
-const COMPLETED_BACK_PASS_PENALTY_OWN_HALF: f64 = 3.2;
-const COMPLETED_BACK_PASS_PENALTY_OPPONENT_HALF: f64 = 1.7;
+const COMPLETED_BACK_PASS_PENALTY_OWN_HALF: f64 = 4.0;
+const COMPLETED_BACK_PASS_PENALTY_OPPONENT_HALF: f64 = 3.4;
 const COMPLETED_DANGEROUS_CROSS_BONUS_POINTS: f64 = 3.8;
 const COMPLETED_CROSS_MAX_BONUS_POINTS: f64 = 5.0;
 // Through-balls (killer passes) are the one user-named penetration pattern that did NOT get a new
@@ -1348,7 +1349,7 @@ const OFFSIDE_INFRACTION_PASSER_PENALTY_SHARE: f64 = 0.3;
 // yard they advance ahead of their wing-backs, amplified when the ball is in the
 // attacking part of the field (so they stay the deepest two ~95% of the time).
 // (center-back-ahead-of-wingback penalty/yard folded into tunables().reward — env/PG-overridable)
-const NEAR_GOAL_NO_SHOT_PENALTY_POINTS: f64 = 3.0;
+const NEAR_GOAL_NO_SHOT_PENALTY_POINTS: f64 = 5.0;
 const EXCESSIVE_HOLD_PENALTY_POINTS: f64 = 2.10;
 const STALE_DRIBBLE_STEAL_EXTRA_PENALTY_POINTS: f64 = 5.25;
 const NON_ELITE_DRIBBLE_HOLD_SKILL_CUTOFF: f64 = 0.90;
@@ -2042,9 +2043,9 @@ const FAST_AWAY_FACING_BALL_DOT: f64 = -0.55;
 const STRIKER_HOLD_UP_SIDEWAYS_YARDS: f64 = 7.5;
 const STRIKER_HOLD_UP_FORWARD_YARDS: f64 = 2.8;
 const GOAL_CHAIN_REWARD_PATTERN: [f64; 10] =
-    [50.0, 36.0, 25.0, 16.0, 11.0, 8.0, 6.0, 4.0, 3.0, 3.0];
+    [50.0, 36.0, 25.0, 16.0, 11.0, 8.0, 6.0, 4.0, 3.0, 1.0];
 const SHOT_ON_TARGET_REWARD_PATTERN: [f64; 10] =
-    [22.0, 16.0, 11.0, 7.0, 5.0, 3.5, 2.5, 1.8, 1.2, 1.0];
+    [25.0, 18.0, 12.0, 8.0, 5.5, 4.0, 2.8, 2.0, 1.5, 1.2];
 const PASS_CHAIN_HISTORY_LIMIT: usize = 8;
 const PASS_CHAIN_MAX_CONTINUATION_SECONDS: f64 = 12.0;
 const PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS: f64 = 3.0;
@@ -4137,6 +4138,7 @@ const LIVE_HTTP_MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 /// match's end; this bounds a single call (~4 min of match time) so long runs must page
 /// through multiple calls instead of monopolising the server.
 const LIVE_HTTP_MAX_STEP_TICKS: u64 = 3600;
+const LIVE_HTTP_MAX_RESPONSE_FRAMES: u64 = 120;
 /// Per-request bounds on `/api/train-self-play`, which runs synchronously under the session
 /// lock: cap episode count and match minutes, floor dt, so a single request cannot pin the
 /// server for an unbounded time.
@@ -17364,6 +17366,10 @@ pub enum SoccerNeuralBlendMode {
     /// (`visits < min_confidence_visits`) — it fills the generalisation gaps the
     /// bins leave blank, tabular elsewhere.
     ConfidenceGated,
+    /// The neural critic/actor owns the legal-action ranking. Tabular Q-values
+    /// only supply the legal candidate set and a deterministic last-ditch tie
+    /// breaker, so league/evolutionary policy fitness cannot overrule the net.
+    Authoritative,
 }
 
 /// Decision-time coupling of the neural value head to the tabular policy.
@@ -21904,10 +21910,9 @@ fn completed_pass_reward_for_pitch(
         (PassDirectionBucket::Forward, false) => {
             COMPLETED_FORWARD_PASS_BASE_REWARD_OPPONENT_HALF + forward_progress_reward
         }
-        // A completed lateral ball keeps possession and switches the angle of attack —
-        // a positive retention reward (raised from 1.6) so safe ball circulation is
-        // valued, not treated as near-worthless versus a risky forward ball.
-        (PassDirectionBucket::Lateral, _) => 2.6,
+        // A completed lateral ball keeps possession and may switch the attack, but generic
+        // recycle completions must not outscore working the ball into shots.
+        (PassDirectionBucket::Lateral, _) => 1.2,
         (PassDirectionBucket::Backward, true) => -COMPLETED_BACK_PASS_PENALTY_OWN_HALF,
         (PassDirectionBucket::Backward, false) => -COMPLETED_BACK_PASS_PENALTY_OPPONENT_HALF,
     };
@@ -22253,8 +22258,8 @@ fn pass_chain_link_reward(direction: PassDirectionBucket, depth: usize) -> f64 {
     // goal / 70-pt shot-on-target chains distributed back through the build-up).
     let base = match direction {
         PassDirectionBucket::Forward => 3.10,
-        PassDirectionBucket::Lateral => 1.55,
-        PassDirectionBucket::Backward => 0.55,
+        PassDirectionBucket::Lateral => 0.90,
+        PassDirectionBucket::Backward => 0.20,
     };
     let depth_multiplier = match depth {
         0 => 1.0,
@@ -35538,7 +35543,9 @@ pub struct SoccerStepResponse {
 impl SoccerStepResponse {
     fn compact_for_live_http(mut self) -> Self {
         compact_match_frame_for_live_http(&mut self.frame);
-        self.frames.clear();
+        for frame in &mut self.frames {
+            compact_match_frame_for_live_http(frame);
+        }
         self.learning_transitions.clear();
         self
     }
@@ -37845,6 +37852,15 @@ fn read_soccer_team_policy_artifact(path: &Path) -> Result<SoccerTeamPolicyArtif
         .map_err(|err| format!("parse team policy artifact: {err}"))
 }
 
+fn read_soccer_self_play_training_artifact(
+    path: &Path,
+) -> Result<SoccerSelfPlayTrainingArtifact, String> {
+    let raw = fs::read_to_string(path)
+        .map_err(|err| format!("read self-play training artifact: {err}"))?;
+    serde_json::from_str::<SoccerSelfPlayTrainingArtifact>(&raw)
+        .map_err(|err| format!("parse self-play training artifact: {err}"))
+}
+
 // Champion–challenger via an APPEND-ONLY log: each save appends one policy version
 // tagged with its fitness, so an existing champion is never overwritten (a crash
 // mid-write at worst leaves a partial trailing line, which the reader skips). The
@@ -39794,6 +39810,87 @@ fn build_soccer_neural_network_from_snapshot(
         &SOCCER_NEURAL_LEGACY_FEATURE_DIMS,
         "soccer neural",
     )
+}
+
+fn soccer_neural_snapshot_parameter_count(snapshot: &SoccerNeuralNetworkSnapshot) -> usize {
+    snapshot
+        .layers
+        .iter()
+        .map(|layer| {
+            layer
+                .weights
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>()
+                .saturating_add(layer.biases.len())
+        })
+        .sum()
+}
+
+fn soccer_neural_snapshot_l2_norm(snapshot: &SoccerNeuralNetworkSnapshot) -> f64 {
+    snapshot
+        .layers
+        .iter()
+        .flat_map(|layer| {
+            layer
+                .weights
+                .iter()
+                .flat_map(|row| row.iter())
+                .chain(layer.biases.iter())
+        })
+        .map(|value| value * value)
+        .sum::<f64>()
+        .sqrt()
+}
+
+fn widen_soccer_neural_snapshot_for_config(
+    mut snapshot: SoccerNeuralNetworkSnapshot,
+    config: &SoccerNeuralLearningConfig,
+    seed: u32,
+) -> SoccerNeuralNetworkSnapshot {
+    let target_hidden = config.sanitized_hidden_units();
+    if snapshot.layers.len() != 2 || snapshot.output_dim != 1 {
+        return snapshot;
+    }
+    let current_hidden = snapshot
+        .layers
+        .first()
+        .map(|layer| layer.biases.len())
+        .unwrap_or(0);
+    if target_hidden <= current_hidden || current_hidden == 0 {
+        return snapshot;
+    }
+
+    let (hidden_layers, output_layers) = snapshot.layers.split_at_mut(1);
+    let hidden_layer = &mut hidden_layers[0];
+    let output_layer = &mut output_layers[0];
+    if hidden_layer.weights.len() != current_hidden
+        || hidden_layer.weights.iter().any(|row| row.len() != snapshot.input_dim)
+        || output_layer.weights.len() != snapshot.output_dim
+        || output_layer
+            .weights
+            .iter()
+            .any(|row| row.len() != current_hidden)
+    {
+        return snapshot;
+    }
+
+    let mut rng =
+        mulberry32(seed ^ (snapshot.training_steps as u32).rotate_left(7) ^ 0xC0D3_6401);
+    let scale = 0.05;
+    for _ in current_hidden..target_hidden {
+        let row = (0..snapshot.input_dim)
+            .map(|_| (2.0 * rng.next_float() - 1.0) * scale)
+            .collect::<Vec<_>>();
+        hidden_layer.weights.push(row);
+        hidden_layer.biases.push(0.0);
+    }
+    for row in &mut output_layer.weights {
+        row.resize(target_hidden, 0.0);
+    }
+    snapshot.parameter_count = soccer_neural_snapshot_parameter_count(&snapshot);
+    snapshot.l2_norm = soccer_neural_snapshot_l2_norm(&snapshot);
+    snapshot
 }
 
 fn build_soccer_policy_network_from_snapshot(
@@ -43952,6 +44049,12 @@ impl SoccerRealtimeSession {
 
         let ticks = request.ticks.clamp(1, LIVE_HTTP_MAX_STEP_TICKS);
         let record_every = request.record_every_ticks.unwrap_or(1).max(1);
+        let response_record_every = if ticks > 1 {
+            record_every.max(ticks.div_ceil(LIVE_HTTP_MAX_RESPONSE_FRAMES))
+        } else {
+            record_every
+        };
+        let mut frames = Vec::new();
         for i in 0..ticks {
             if self.sim.is_done() {
                 break;
@@ -43959,6 +44062,9 @@ impl SoccerRealtimeSession {
             self.sim.run_time_step();
             if (i + 1) % record_every == 0 || self.sim.is_done() {
                 self.record_tracking_frame_if_new_tick();
+            }
+            if ticks > 1 && ((i + 1) % response_record_every == 0 || self.sim.is_done()) {
+                frames.push(self.sim.to_live_http_frame());
             }
         }
         self.record_tracking_frame_if_new_tick();
@@ -43995,6 +44101,9 @@ impl SoccerRealtimeSession {
             }
         };
         let frame = self.sim.to_live_http_frame();
+        if ticks > 1 && frames.last().map_or(true, |last| last.tick != frame.tick) {
+            frames.push(frame.clone());
+        }
         let live_accounting = soccer_live_frame_accounting_report(&frame);
         let live_physics = soccer_live_frame_physics_report(&frame, &self.sim.config);
         let controller_threads = self.controller_thread_stats();
@@ -44009,7 +44118,7 @@ impl SoccerRealtimeSession {
         );
         SoccerStepResponse {
             frame,
-            frames: Vec::new(),
+            frames,
             events,
             learning_transitions: Vec::new(),
             recent_moments: self.recent_moment_summaries(),
@@ -44073,6 +44182,7 @@ impl SoccerRealtimeSession {
             .preserve_shared_policy
             .then(|| self.sim.learned_policy.take())
             .flatten();
+        let neural_snapshot = self.sim.neural_network_snapshot();
         let preserved_team_policy = team_policies.is_some();
         let preserved_shared_policy = learned_policy.is_some();
 
@@ -44091,6 +44201,13 @@ impl SoccerRealtimeSession {
         }
         if let Some(learned_policy) = learned_policy {
             next_match.set_learned_policy(learned_policy);
+        }
+        let installed_neural_snapshot = neural_snapshot
+            .map(|snapshot| next_match.set_neural_network_snapshot(snapshot).is_ok())
+            .unwrap_or(false);
+        #[cfg(feature = "postgres-persistence")]
+        if !installed_neural_snapshot {
+            let _ = soccer_live_install_warm_policy(&mut next_match);
         }
         next_match.clear_controller_assignments();
         next_match.set_decision_trace_capture(self.sim.decision_trace_capture_enabled());
@@ -44271,7 +44388,47 @@ impl SoccerRealtimeSession {
         path: impl AsRef<Path>,
     ) -> Result<SoccerTeamPolicyDiskResponse, String> {
         let path = path.as_ref();
-        let response = self.sim.load_team_policy_artifact_from_path(path)?;
+        let mut response = match self.sim.load_team_policy_artifact_from_path(path) {
+            Ok(response) => response,
+            Err(team_policy_err) => {
+                let artifact = read_soccer_self_play_training_artifact(path)
+                    .map_err(|training_err| format!("{team_policy_err}; {training_err}"))?;
+                let imported = self.sim.import_self_play_training_artifact(artifact)?;
+                let learning = imported.learning;
+                SoccerTeamPolicyDiskResponse {
+                    path: path.display().to_string(),
+                    history_path: policy_history_disk_path(path).display().to_string(),
+                    policy_probability: imported.policy_probability,
+                    home_policy_entries: learning.home_policy_entries,
+                    away_policy_entries: learning.away_policy_entries,
+                    home_policy_target_entries: learning.home_policy_target_entries,
+                    away_policy_target_entries: learning.away_policy_target_entries,
+                    learning,
+                }
+            }
+        };
+        match read_soccer_neural_snapshot(path) {
+            Ok(Some(snapshot)) => {
+                if let Err(err) = self.sim.set_neural_network_snapshot(snapshot) {
+                    self.policy_autosave
+                        .record_error(format!("load neural snapshot: {err}"));
+                }
+            }
+            Ok(None) => {}
+            Err(err) => self
+                .policy_autosave
+                .record_error(format!("read neural snapshot: {err}")),
+        }
+        match read_soccer_tactical_learning_snapshot(path) {
+            Ok(Some(snapshot)) => {
+                self.sim.config.tactical_learning = snapshot;
+            }
+            Ok(None) => {}
+            Err(err) => self
+                .policy_autosave
+                .record_error(format!("read tactical learning snapshot: {err}")),
+        }
+        response.learning = self.sim.learning_stats_snapshot();
         if path == self.policy_autosave.path.as_path() {
             self.policy_autosave
                 .record_success(self.sim.tick, self.current_policy_visit_count());
@@ -63418,6 +63575,17 @@ fn learned_action_label_is_legal(action: &str, snapshot: &WorldSnapshot, player_
         return false;
     };
     let observation = snapshot.observation_for(player_id);
+    learned_action_label_is_legal_for_observation(action, snapshot, player_id, player, &observation)
+}
+
+fn learned_action_label_is_legal_for_observation(
+    action: &str,
+    snapshot: &WorldSnapshot,
+    player_id: usize,
+    player: &PlayerSnapshot,
+    observation: &SoccerPomdpObservation,
+) -> bool {
+    let action = normalize_soccer_action_label(action);
     let held_restart = held_restart_action_for_snapshot(snapshot, player_id);
     if let Some(restart_label) = held_restart {
         return match restart_label {

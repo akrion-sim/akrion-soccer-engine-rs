@@ -12070,14 +12070,17 @@ fn aerial_pass_requires_enough_body_power_to_release() {
 
 #[test]
 fn goal_and_shot_reward_pools_and_buildup_chain_are_locked() {
-    // 100 points for a goal, 40 for a shot on target, distributed back through the
+    // Goals outrank shots on target, and shots on target outrank pass-only chains,
+    // with the reward distributed back through the
     // attacking chain (so an intermediate received pass that leads to a shot/goal
     // earns a share).
-    assert_eq!(GOAL_REWARD_POINTS, 100.0);
-    assert_eq!(DIRECT_TURNOVER_GOAL_REWARD_POINTS, 30.0);
-    assert_eq!(SHOT_ON_TARGET_REWARD_POINTS, 40.0);
-    assert!((GOAL_CHAIN_REWARD_PATTERN.iter().sum::<f64>() - 100.0).abs() < 1e-9);
-    assert!((SHOT_ON_TARGET_REWARD_PATTERN.iter().sum::<f64>() - 40.0).abs() < 1e-9);
+    assert_eq!(GOAL_REWARD_POINTS, 160.0);
+    assert_eq!(DIRECT_TURNOVER_GOAL_REWARD_POINTS, 85.0);
+    assert_eq!(SHOT_ON_TARGET_REWARD_POINTS, 80.0);
+    assert!((GOAL_CHAIN_REWARD_PATTERN.iter().sum::<f64>() - 160.0).abs() < 1e-9);
+    assert!((SHOT_ON_TARGET_REWARD_PATTERN.iter().sum::<f64>() - 80.0).abs() < 1e-9);
+    assert!(SHOT_ON_TARGET_REWARD_POINTS < DIRECT_TURNOVER_GOAL_REWARD_POINTS);
+    assert!(DIRECT_TURNOVER_GOAL_REWARD_POINTS < GOAL_REWARD_POINTS);
 
     // A pass that leads to a subsequent received pass is rewarded, more for forward
     // build-up than sideways/back, and the immediate link more than a deeper one.
@@ -40549,6 +40552,54 @@ fn learning_disabled_runtime_does_not_grow_training_buffers_or_timing_cost() {
     assert_eq!(timing.learning_log_ms, 0.0);
     assert_eq!(timing.full_game_learning_ms, 0.0);
     assert_eq!(timing.learning_over_budget_ticks, 0);
+}
+
+#[test]
+fn zero_policy_train_limit_keeps_tabular_policies_frozen() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.5,
+        learning_enabled: true,
+        learning_logging_enabled: false,
+        full_game_learning_enabled: false,
+        learning_interval_ticks: 1,
+        policy_train_max_transitions_per_tick: 0,
+        neural_learning: SoccerNeuralLearningConfig {
+            enabled: false,
+            ..SoccerNeuralLearningConfig::default()
+        },
+        seed: 15073,
+        ..Default::default()
+    })
+    .with_team_policies(SoccerTeamQPolicies::new(SoccerQPolicyOptions::default()));
+    sim.set_learned_policy(SoccerQPolicy::default());
+    let seeded_policy_visits = sim
+        .learned_policy()
+        .map(SoccerQPolicy::visit_count)
+        .unwrap_or(0);
+    let seeded_team_visits = sim
+        .team_policies()
+        .map(|policies| policies.home.visit_count() + policies.away.visit_count())
+        .unwrap_or(0);
+
+    for _ in 0..sim.config.total_ticks() {
+        sim.run_time_step();
+    }
+
+    let learning = sim.learning_snapshot();
+    assert_eq!(learning.policy_train_max_transitions_per_tick, 0);
+    assert!(learning.deferred_reward_transitions > 0);
+    assert_eq!(
+        sim.learned_policy()
+            .map(SoccerQPolicy::visit_count)
+            .unwrap_or(0),
+        seeded_policy_visits
+    );
+    assert_eq!(
+        sim.team_policies()
+            .map(|policies| policies.home.visit_count() + policies.away.visit_count())
+            .unwrap_or(0),
+        seeded_team_visits
+    );
 }
 
 #[test]
@@ -88335,7 +88386,7 @@ fn assert_soccer_learning_contract_json(meta: &serde_json::Value, config: &Match
     );
     assert_eq!(
         contract["policyTrainMaxTransitionsPerTick"],
-        config.policy_train_max_transitions_per_tick.max(1)
+        config.policy_train_max_transitions_per_tick
     );
     assert_eq!(
         contract["fullGameLearningEnabled"],

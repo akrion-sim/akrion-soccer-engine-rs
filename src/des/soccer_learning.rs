@@ -643,7 +643,7 @@ impl Default for SoccerPolicyPromotionGateConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            min_sample_games: 1,
+            min_sample_games: 8,
             min_mean_match_fitness: -0.25,
             min_best_match_fitness: 0.0,
             min_mean_play_quality: 0.0,
@@ -1963,21 +1963,23 @@ fn soccer_learning_team_play_quality(team: Team, summary: &MatchSummary) -> f64 
     let chain_forward = soccer_learning_bounded_metric(chain_forward_yards, 120.0);
     let chain_backward_penalty = soccer_learning_bounded_count(chains_net_loss, 10.0);
     let chain_progress_quality = (chain_forward - chain_backward_penalty * 0.5).clamp(0.0, 1.0);
+    let productive_completion =
+        pass_completion * (0.30 + forward_share * 0.50 + chain_progress_quality * 0.20);
 
-    (pass_volume * 0.03
-        + pass_completion * 0.15
+    (pass_volume * 0.01
+        + productive_completion * 0.10
         + forward_share * 0.08
-        + goal_quality * 0.12
-        + shot_volume * 0.10
-        + shot_accuracy * 0.14
+        + goal_quality * 0.20
+        + shot_volume * 0.12
+        + shot_accuracy * 0.18
         + dribble_quality * 0.04
         + recovery_quality * 0.04
         + upfield_quality * 0.07
         + near_ball_quality * 0.03
         + assist_quality * 0.08
         + cross_quality * 0.03
-        + worked_chance_quality * 0.05
-        + chain_progress_quality * 0.04)
+        + worked_chance_quality * 0.08
+        + chain_progress_quality * 0.03)
         .clamp(0.0, 1.0)
 }
 
@@ -6329,6 +6331,11 @@ mod tests {
     fn promotion_gate_uses_quality_and_sample_floor_before_activation() {
         use crate::des::general::soccer::MatchStats;
 
+        assert_eq!(
+            SoccerPolicyPromotionGateConfig::default().min_sample_games,
+            8
+        );
+
         let mut strong_stats = MatchStats::default();
         strong_stats.shots_home = 8;
         strong_stats.shots_away = 7;
@@ -8581,6 +8588,25 @@ mod tests {
         assert!(
             incisive_quality > sterile_quality,
             "goals and shots-on-target should outrank sterile pass chains: incisive={incisive_quality}, sterile={sterile_quality}"
+        );
+
+        let mut backward_stats = MatchStats::default();
+        backward_stats.passes_attempted_home = 60;
+        backward_stats.passes_completed_home = 54;
+        backward_stats.passes_completed_forward_home = 0;
+        backward_stats.pass_chains_net_loss_home = 8;
+        backward_stats.pass_chain_gain_yards_home = -42.0;
+        let backward = MatchSummary {
+            score_home: 0,
+            score_away: 0,
+            ticks: 100,
+            simulated_seconds: 90.0,
+            stats: backward_stats,
+        };
+        let backward_quality = soccer_learning_team_play_quality(Team::Home, &backward);
+        assert!(
+            backward_quality < sterile_quality,
+            "net-backward pass farming should be worse than sterile forward possession: backward={backward_quality}, sterile={sterile_quality}"
         );
     }
 }

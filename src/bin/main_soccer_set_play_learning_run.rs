@@ -15,6 +15,7 @@ use soccer_engine::des::general::soccer::{
 };
 use soccer_engine::des::soccer_learning::{
     soccer_neural_network_snapshot_fingerprint,
+    soccer_policy_active_max_fitness_regression,
     soccer_policy_version_insert_status_after_active_head, soccer_postgres_policy_refresh_decision,
     soccer_tactical_learning_weights_fingerprint, soccer_team_q_policies_fingerprint,
     validate_soccer_neural_learning_config_for_learning_run,
@@ -91,7 +92,7 @@ fn env_marl_algorithm(default: SoccerMarlAlgorithm) -> Result<SoccerMarlAlgorith
 /// set-piece curriculum is where it pays off: short restarts give many dense reps
 /// to warm the head before its value drives play. The specialist actor is on by
 /// default so passing/dribbling/shooting/GK heads also get dense set-play reps.
-///   SOCCER_NEURAL_BLEND_MODE = off | additive | tiebreak | confidence
+///   SOCCER_NEURAL_BLEND_MODE = off | additive | tiebreak | confidence | authoritative
 ///   SOCCER_NEURAL_BLEND_LAMBDA, SOCCER_NEURAL_BLEND_WARMUP_STEPS (optional)
 fn env_neural_blend() -> Result<SoccerNeuralBlendConfig, Box<dyn Error>> {
     let mut blend = SoccerNeuralBlendConfig::default();
@@ -102,6 +103,9 @@ fn env_neural_blend() -> Result<SoccerNeuralBlendConfig, Box<dyn Error>> {
             "additive" | "add" => SoccerNeuralBlendMode::Additive,
             "tiebreak" | "tie" => SoccerNeuralBlendMode::TieBreak,
             "confidence" | "confidencegated" | "gated" => SoccerNeuralBlendMode::ConfidenceGated,
+            "authoritative" | "neural" | "neural-authoritative" | "neural_authoritative" => {
+                SoccerNeuralBlendMode::Authoritative
+            }
             _ => return Err(format!("SOCCER_NEURAL_BLEND_MODE={value:?} is invalid").into()),
         };
     }
@@ -598,12 +602,19 @@ fn run() -> Result<(), Box<dyn Error>> {
             SOCCER_POLICY_STATUS_ACTIVE,
             pg_base_policy_version_id.as_deref(),
             generation,
+            artifact.goal_rate,
             latest_active_metadata
                 .as_ref()
                 .map(|metadata| metadata.id.as_str()),
             latest_active_metadata
                 .as_ref()
                 .map(|metadata| metadata.generation),
+            latest_active_metadata.as_ref().map(|metadata| {
+                soccer_engine::des::soccer_learning::soccer_learning_from_micros(
+                    metadata.fitness_micros,
+                )
+            }),
+            soccer_policy_active_max_fitness_regression(),
         );
         if insert_status != SOCCER_POLICY_STATUS_ACTIVE {
             println!(

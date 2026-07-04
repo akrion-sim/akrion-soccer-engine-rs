@@ -3453,6 +3453,11 @@ impl SoccerMatch {
             self.neural_learner = None;
             return Ok(());
         }
+        let snapshot = widen_soccer_neural_snapshot_for_config(
+            snapshot,
+            &self.config.neural_learning,
+            self.config.seed,
+        );
         let network = build_soccer_neural_network_from_snapshot(&snapshot)?;
         self.neural_learner = Some(SoccerNeuralLearner::from_pretrained_snapshot(
             &self.config,
@@ -4284,10 +4289,7 @@ impl SoccerMatch {
             learning_enabled: self.config.learning_enabled,
             learning_logging_enabled: self.config.learning_logging_enabled,
             learning_interval_ticks: self.config.learning_interval_ticks.max(1),
-            policy_train_max_transitions_per_tick: self
-                .config
-                .policy_train_max_transitions_per_tick
-                .max(1),
+            policy_train_max_transitions_per_tick: self.config.policy_train_max_transitions_per_tick,
             deferred_reward_transitions: self.deferred_reward_transitions.len(),
             full_game_learning_enabled: self.config.full_game_learning_enabled,
             full_game_learning_applied: self.full_game_learning_applied,
@@ -4994,6 +4996,15 @@ impl SoccerMatch {
             })
     }
 
+    fn top_scored_candidate_choice(
+        candidates: &[SoccerNeuralMctsCandidate],
+    ) -> Option<SoccerPolicyActionChoice> {
+        candidates.first().map(|candidate| SoccerPolicyActionChoice {
+            label: candidate.label.clone(),
+            behavior_probability: 1.0,
+        })
+    }
+
     fn apply_retrieval_prior_to_policy_actions(
         ranked: &mut [SoccerLearnedActionTrace],
         retrieval_prior: Option<(&std::collections::HashMap<String, f64>, f64)>,
@@ -5553,7 +5564,10 @@ impl SoccerMatch {
                 .copied()
                 .unwrap_or(0.0)
         };
-        if learner.is_some() {
+        if let (Some(_), Some(player)) = (
+            learner,
+            snapshot.players.iter().find(|player| player.id == player_id),
+        ) {
             for &label in SOCCER_POLICY_ACTIONS {
                 let normalized = normalize_soccer_action_label(label);
                 if legal
@@ -5562,7 +5576,13 @@ impl SoccerMatch {
                 {
                     continue;
                 }
-                if !learned_action_label_is_legal(normalized, snapshot, player_id) {
+                if !learned_action_label_is_legal_for_observation(
+                    normalized,
+                    snapshot,
+                    player_id,
+                    player,
+                    observation,
+                ) {
                     continue;
                 }
                 legal.push(SoccerLearnedActionTrace {
@@ -5630,10 +5650,18 @@ impl SoccerMatch {
                         candidate.value
                     }
                 }
+                SoccerNeuralBlendMode::Authoritative => {
+                    let neural = neural_value.unwrap_or(0.0);
+                    lambda * neural + candidate.value * 1.0e-6
+                }
             };
             // Actor bias: nudge toward the family the learned policy prefers.
             let actor_bonus = policy_bonus(&candidate.label);
-            let retrieved_bonus = retrieval_bonus(&candidate.label);
+            let retrieved_bonus = if blend.mode == SoccerNeuralBlendMode::Authoritative {
+                0.0
+            } else {
+                retrieval_bonus(&candidate.label)
+            };
             let model_bonus = mcts_model_weight
                 * self.neural_mcts_model_rollout_value(
                     learner,
@@ -5671,6 +5699,9 @@ impl SoccerMatch {
             Self::neural_mcts_action_from_candidates(blend, &scored_candidates, rank_draw)
         {
             return Some(mcts_label);
+        }
+        if blend.mode == SoccerNeuralBlendMode::Authoritative {
+            return Self::top_scored_candidate_choice(&scored_candidates);
         }
         Self::weighted_scored_candidate_choice(&scored_candidates, rank_draw)
     }
@@ -8997,32 +9028,50 @@ impl SoccerMatch {
                     learning_log_elapsed += phase_started.elapsed();
                 }
                 if learning_due {
-                    let mut train_transitions = tick_transitions.clone();
-                    let train_limit = self.config.policy_train_max_transitions_per_tick.max(1);
-                    if train_transitions.len() > train_limit {
-                        let overflow = train_transitions.split_off(train_limit);
-                        self.deferred_reward_transitions.extend(overflow);
-                    }
-                    let deferred_limit = train_limit.saturating_sub(train_transitions.len());
-                    if deferred_limit > 0 && !self.deferred_reward_transitions.is_empty() {
-                        let drain_count =
-                            deferred_limit.min(self.deferred_reward_transitions.len());
-                        let deferred = self
-                            .deferred_reward_transitions
-                            .drain(0..drain_count)
-                            .collect::<Vec<_>>();
-                        train_transitions.extend(deferred);
-                    }
                     let neural_due = self.neural_learning_due(learning_due);
+                    let tabular_train_limit = self.config.policy_train_max_transitions_per_tick;
+                    let train_limit = if tabular_train_limit == 0 {
+                        if neural_due {
+                            tick_transitions.len().max(1)
+                        } else {
+                            0
+                        }
+                    } else {
+                        tabular_train_limit
+                    };
+                    let mut train_transitions = if train_limit == 0 {
+                        self.deferred_reward_transitions.extend(tick_transitions);
+                        Vec::new()
+                    } else {
+                        tick_transitions.clone()
+                    };
+                    if train_limit > 0 {
+                        if train_transitions.len() > train_limit {
+                            let overflow = train_transitions.split_off(train_limit);
+                            self.deferred_reward_transitions.extend(overflow);
+                        }
+                        let deferred_limit = train_limit.saturating_sub(train_transitions.len());
+                        if deferred_limit > 0 && !self.deferred_reward_transitions.is_empty() {
+                            let drain_count =
+                                deferred_limit.min(self.deferred_reward_transitions.len());
+                            let deferred = self
+                                .deferred_reward_transitions
+                                .drain(0..drain_count)
+                                .collect::<Vec<_>>();
+                            train_transitions.extend(deferred);
+                        }
+                    }
                     if self.config.learning_enabled {
-                        let phase_started = Instant::now();
-                        if let Some(team_policies) = &mut self.team_policies {
-                            team_policies.train_adversarial(&train_transitions);
+                        if tabular_train_limit > 0 {
+                            let phase_started = Instant::now();
+                            if let Some(team_policies) = &mut self.team_policies {
+                                team_policies.train_adversarial(&train_transitions);
+                            }
+                            if let Some(policy) = &mut self.learned_policy {
+                                policy.train(&train_transitions);
+                            }
+                            policy_train_elapsed += phase_started.elapsed();
                         }
-                        if let Some(policy) = &mut self.learned_policy {
-                            policy.train(&train_transitions);
-                        }
-                        policy_train_elapsed += phase_started.elapsed();
                         if neural_due {
                             // Routes to the shared net or to each team's own brain
                             // (skipping frozen teams) depending on the match mode.

@@ -1161,6 +1161,7 @@ mod tests {
             training_steps: 0,
             average_loss: None,
             policy_head: None,
+            line_depth_head: None,
         };
         refresh_snapshot_norm(&mut snapshot);
         snapshot
