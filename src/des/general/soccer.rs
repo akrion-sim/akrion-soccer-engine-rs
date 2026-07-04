@@ -64531,7 +64531,7 @@ fn default_players(config: &MatchConfig, _rng: &mut SeededRandom) -> Vec<PlayerA
                 // retained only for signature compatibility; it no longer drives
                 // live-match randomness.
                 skills: {
-                    if seed_varied_skills_enabled() {
+                    let base = if seed_varied_skills_enabled() {
                         // A/B MEASUREMENT ONLY: the heuristic match is otherwise fully
                         // deterministic (skills/positions keyed on player id, `config.seed`
                         // inert), so multi-seed runs are byte-identical — n=1 scenario. Mixing
@@ -64543,7 +64543,9 @@ fn default_players(config: &MatchConfig, _rng: &mut SeededRandom) -> Vec<PlayerA
                     } else {
                         let _discarded_compat_profile = SkillProfile::blended(id, role, _rng);
                         SkillProfile::for_shirt(shirt, role)
-                    }
+                    };
+                    // Asymmetric team handicap (env-gated, default 1.0 = no change).
+                    base.handicap_scaled(soccer_team_skill_scale(team))
                 },
                 fatigue: 0.0,
                 controller_slot: None,
