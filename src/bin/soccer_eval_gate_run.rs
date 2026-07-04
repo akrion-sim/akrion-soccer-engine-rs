@@ -210,13 +210,11 @@ fn main() {
 
     let mut runner_config = EngineMatchRunnerConfig::default();
     runner_config.base.duration_seconds = minutes * 60.0;
-    // CRITICAL: the runner defaults neural_blend.actor_critic=false ("critic-only"),
-    // which leaves the loaded neural ACTOR inert — the match is then decided by the
-    // deterministic analytic base on fixed seeds, so every eval returns an IDENTICAL
-    // result regardless of which policy is loaded (a constant, useless as a gate).
-    // Drive play with the neural actor, exactly as the learner trains it, so the gate
-    // actually measures the neural policy and varies as the net climbs.
-    runner_config.base.neural_blend.actor_critic = true;
+    // Keep the engine's designed independent-brain mode (actor_critic=false, default):
+    // each side is driven by its OWN per-team CRITIC — which is exactly what league play
+    // trains. (Setting actor_critic=true shares the policy_head/actor across teams and
+    // BLURS which brain is better, per the runner's own docs.) The eval is policy-sensitive
+    // through the per-team critic; comparisons must be between DIFFERENT-lineage nets.
     let mut runner = EngineMatchRunner::new(runner_config);
 
     let started = Instant::now();
