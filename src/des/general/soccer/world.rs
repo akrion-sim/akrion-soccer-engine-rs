@@ -3432,7 +3432,11 @@ impl SoccerMatch {
         &mut self,
         snapshot: SoccerNeuralNetworkSnapshot,
     ) -> Result<(), String> {
-        if !self.config.neural_learning.enabled {
+        // Normally a net is only installed when learning is enabled. But under NEURAL-AUTHORITATIVE
+        // serve (DD_SOCCER_NEURAL_AUTHORITATIVE_LAMBDA>0) the live server has learning OFF yet must
+        // still install the net for INFERENCE so it can drive decisions — otherwise the net is
+        // dropped and play silently falls back to the tabular/analytic path.
+        if !self.config.neural_learning.enabled && dd_soccer_neural_authoritative_lambda() <= 0.0 {
             self.neural_learner = None;
             return Ok(());
         }
