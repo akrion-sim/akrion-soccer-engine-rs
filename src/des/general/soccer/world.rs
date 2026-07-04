@@ -23587,6 +23587,21 @@ pub(crate) fn dd_soccer_lookahead_depth() -> usize {
     })
 }
 
+/// NEURAL-AUTHORITATIVE weight: when > 0, the neural value head is given this fixed λ in the
+/// per-player action blend (`candidate.value + λ·V_net`), so the net — not the coarse tabular
+/// Q — decides the action. 0 (default) preserves the normal bounded-nudge behaviour. Read once.
+pub(crate) fn dd_soccer_neural_authoritative_lambda() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_NEURAL_AUTHORITATIVE_LAMBDA")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(0.0)
+    })
+}
+
 /// Number of PPO/MAPPO optimization epochs the actor takes over each game's frozen
 /// policy batch. The actor trains once per full game (`apply_full_game_learning_if_ready`)
 /// on the whole-game replay, with `old_action_probability` captured from the behavior
