@@ -24607,15 +24607,19 @@ fn dense_soccer_transition_reward(
     // player's nested dwell timers) so a brief, legitimate overlap costs nothing and only a
     // SUSTAINED crowd is punished: 3s grace within 7yd, 2s within 6yd, 1s within 5yd. Gated
     // (default-on); OFF ⇒ this term vanishes (byte-identical A/B; the timers also stay 0).
-    if dd_soccer_enable_same_team_separation_floor()
-        && same_team_proximity_penalty_past_grace(
-            player.same_team_proximity_dwell_lt7_seconds,
-            player.same_team_proximity_dwell_lt6_seconds,
-            player.same_team_proximity_dwell_lt5_seconds,
-        )
-    {
+    if dd_soccer_enable_same_team_separation_floor() {
         if let Some(nearest) = nearest_same_team_distance_for_floor(after, player.id, player.team) {
-            reward -= same_team_proximity_penalty_unit(nearest) * SAME_TEAM_PROXIMITY_PENALTY_POINTS;
+            // Grace: 2s within 7yd, 1.5s within 6yd, 1s within 5yd — but 0s (INSTANT) at/inside
+            // the 4yd floor. `nearest_same_team_distance_for_floor` already waives teammates when
+            // BOTH are inside an 18yd box, so goalmouth congestion is exempt from all of this.
+            let past_grace = same_team_proximity_penalty_past_grace(
+                player.same_team_proximity_dwell_lt7_seconds,
+                player.same_team_proximity_dwell_lt6_seconds,
+                player.same_team_proximity_dwell_lt5_seconds,
+            );
+            if nearest <= SAME_TEAM_MIN_SEPARATION_YARDS || past_grace {
+                reward -= same_team_proximity_penalty_unit(nearest) * SAME_TEAM_PROXIMITY_PENALTY_POINTS;
+            }
         }
     }
     // Off-ball support spacing: when a teammate already has the ball and the
