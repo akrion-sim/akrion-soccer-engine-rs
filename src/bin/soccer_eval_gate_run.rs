@@ -233,51 +233,96 @@ fn main() {
     let mut runner = EngineMatchRunner::new(runner_config);
 
     let started = Instant::now();
-    let mut reports: Vec<MatchReport> = Vec::new();
-    let mut fixture = 0u32;
-    for (offset, opponent) in pool.iter().enumerate() {
+
+    // Pre-build every fixture with the SAME sequential seeds/order as the old serial loop,
+    // so parallel results are byte-identical (each match is independent + deterministic).
+    struct Fixture {
+        index: usize,
+        opponent_idx: usize,
+        opponent_id: usize,
+        g: usize,
+        seed: u32,
+        candidate_home: bool,
+    }
+    let mut fixtures: Vec<Fixture> = Vec::new();
+    let mut fixture_ctr = 0u32;
+    for offset in 0..pool.len() {
         let opponent_id = offset + 1;
         for g in 0..eval_games_per_opp {
-            // Alternate home/away so the candidate's edge isn't a home-field artifact.
             let seed = holdout_seed_base
-                .wrapping_add(fixture.wrapping_mul(2_246_822_519))
+                .wrapping_add(fixture_ctr.wrapping_mul(2_246_822_519))
                 .wrapping_add(g as u32);
-            fixture += 1;
-            let result = if g % 2 == 0 {
-                play_holdout_fixture(
-                    &mut runner,
-                    candidate_id,
-                    opponent_id,
-                    seed,
-                    &candidate_brain,
-                    opponent,
-                )
-            } else {
-                play_holdout_fixture(
-                    &mut runner,
-                    opponent_id,
-                    candidate_id,
-                    seed,
-                    opponent,
-                    &candidate_brain,
-                )
-            };
-            match result {
-                Ok(report) => {
-                    eprintln!(
-                        "  holdout {}v{} seed=0x{:08X} -> {}-{}",
-                        report.home_id,
-                        report.away_id,
-                        seed,
-                        report.home_goals,
-                        report.away_goals
-                    );
-                    reports.push(report);
-                }
-                Err(e) => eprintln!("  fixture error (opp {opponent_id}, g {g}): {e}"),
-            }
+            fixtures.push(Fixture {
+                index: fixtures.len(),
+                opponent_idx: offset,
+                opponent_id,
+                g,
+                seed,
+                candidate_home: g % 2 == 0,
+            });
+            fixture_ctr += 1;
         }
     }
+
+    // Run fixtures on a bounded thread pool — each worker clones the runner and pulls the
+    // next fixture off a shared atomic cursor. Capped low (default 3, override via
+    // SOCCER_EVAL_PARALLELISM) so we don't starve the on-policy trainer / co-train learner.
+    let workers = std::env::var("SOCCER_EVAL_PARALLELISM")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(3)
+        .clamp(1, fixtures.len().max(1));
+    eprintln!("eval_parallelism={workers} fixtures={}", fixtures.len());
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let collected = std::sync::Mutex::new(Vec::<(usize, MatchReport)>::new());
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let next = &next;
+            let collected = &collected;
+            let fixtures = &fixtures;
+            let pool = &pool;
+            let candidate_brain = &candidate_brain;
+            let mut runner = runner.clone();
+            scope.spawn(move || loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(fx) = fixtures.get(i) else { break };
+                let opponent = &pool[fx.opponent_idx];
+                let result = if fx.candidate_home {
+                    play_holdout_fixture(
+                        &mut runner,
+                        candidate_id,
+                        fx.opponent_id,
+                        fx.seed,
+                        candidate_brain,
+                        opponent,
+                    )
+                } else {
+                    play_holdout_fixture(
+                        &mut runner,
+                        fx.opponent_id,
+                        candidate_id,
+                        fx.seed,
+                        opponent,
+                        candidate_brain,
+                    )
+                };
+                match result {
+                    Ok(report) => {
+                        eprintln!(
+                            "  holdout {}v{} seed=0x{:08X} -> {}-{}",
+                            report.home_id, report.away_id, fx.seed, report.home_goals, report.away_goals
+                        );
+                        collected.lock().unwrap().push((fx.index, report));
+                    }
+                    Err(e) => eprintln!("  fixture error (opp {}, g {}): {e}", fx.opponent_id, fx.g),
+                }
+            });
+        }
+    });
+    // Sort back into the original fixture order so scoring is identical to the serial path.
+    let mut collected = collected.into_inner().unwrap();
+    collected.sort_by_key(|(i, _)| *i);
+    let reports: Vec<MatchReport> = collected.into_iter().map(|(_, r)| r).collect();
 
     let verdict = evaluate_promotion(
         &reports,
