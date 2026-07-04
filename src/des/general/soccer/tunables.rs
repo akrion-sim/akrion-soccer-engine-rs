@@ -272,9 +272,12 @@ impl PolicySelectionTunables {
 impl Default for PolicySelectionTunables {
     fn default() -> Self {
         PolicySelectionTunables {
-            top1_weight: 0.70,
-            top2_weight: 0.20,
-            top3_weight: 0.10,
+            // PLATEAU-BREAK: flattened 70/20/10 -> 50/30/20 so the policy commits LESS to its
+            // current-optimal choice and explores 2nd/3rd more — with win=200 rewarding whatever
+            // WINS, this broader search can find aggressive play the tidy local-optimum never tries.
+            top1_weight: 0.50,
+            top2_weight: 0.30,
+            top3_weight: 0.20,
             boltzmann_temperature: 0.0,
         }
     }
