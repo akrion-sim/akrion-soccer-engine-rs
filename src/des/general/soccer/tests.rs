@@ -95692,7 +95692,10 @@ fn same_team_proximity_penalty_curve_is_graduated_huge_to_small() {
         at_4 > at_5 && at_5 > at_6 && at_6 > at_7 && at_7 > 0.0,
         "penalty must decrease with distance across 4<5<6<7: {at_4} {at_5} {at_6} {at_7}"
     );
-    assert!((at_4 - 1.0).abs() < 1e-9, "unit penalty is 1.0 exactly at the floor: {at_4}");
+    assert!(
+        (at_4 - 1.0).abs() < 1e-9,
+        "unit penalty is 1.0 exactly at the floor: {at_4}"
+    );
     // Inside the band the curve is linear: (outer - d) / (outer - floor).
     for d in [5.0_f64, 6.0, 7.0] {
         let expected = (outer - d) / (outer - floor);
@@ -95884,37 +95887,66 @@ fn same_team_proximity_grace_matches_the_worked_example() {
     // Expressed against the constants so the scenario stays valid as the bands/grace are tuned.
     // A distance in (BAND_LT6, BAND_LT7) runs ONLY the widest timer; one in (FLOOR, BAND_LT5) runs
     // all three; one in (BAND_LT5, BAND_LT6) runs the two wider ones.
-    let only_lt7 =
-        (SAME_TEAM_PROXIMITY_BAND_LT6_YARDS + SAME_TEAM_PROXIMITY_BAND_LT7_YARDS) / 2.0;
+    let only_lt7 = (SAME_TEAM_PROXIMITY_BAND_LT6_YARDS + SAME_TEAM_PROXIMITY_BAND_LT7_YARDS) / 2.0;
     let dive = (SAME_TEAM_MIN_SEPARATION_YARDS + SAME_TEAM_PROXIMITY_BAND_LT5_YARDS) / 2.0;
     let between_5_6 =
         (SAME_TEAM_PROXIMITY_BAND_LT5_YARDS + SAME_TEAM_PROXIMITY_BAND_LT6_YARDS) / 2.0;
 
     // A slow drift held in the widest band trips the widest (LT7) grace and nothing tighter.
     let (mut lt7, mut lt6, mut lt5) = (0.0, 0.0, 0.0);
-    run(&mut lt7, &mut lt6, &mut lt5, only_lt7, SAME_TEAM_PROXIMITY_GRACE_LT7_SECONDS - 0.1);
-    assert!(lt6 == 0.0 && lt5 == 0.0, "only the widest timer runs at {only_lt7}yd: lt6={lt6} lt5={lt5}");
-    assert!(!same_team_proximity_penalty_past_grace(lt7, lt6, lt5), "still graced just under LT7: lt7={lt7}");
+    run(
+        &mut lt7,
+        &mut lt6,
+        &mut lt5,
+        only_lt7,
+        SAME_TEAM_PROXIMITY_GRACE_LT7_SECONDS - 0.1,
+    );
+    assert!(
+        lt6 == 0.0 && lt5 == 0.0,
+        "only the widest timer runs at {only_lt7}yd: lt6={lt6} lt5={lt5}"
+    );
+    assert!(
+        !same_team_proximity_penalty_past_grace(lt7, lt6, lt5),
+        "still graced just under LT7: lt7={lt7}"
+    );
     run(&mut lt7, &mut lt6, &mut lt5, only_lt7, 0.2);
-    assert!(same_team_proximity_penalty_past_grace(lt7, lt6, lt5), "the widest timer trips its grace: lt7={lt7}");
+    assert!(
+        same_team_proximity_penalty_past_grace(lt7, lt6, lt5),
+        "the widest timer trips its grace: lt7={lt7}"
+    );
 
     // A fast dive straight inside 5yd is caught by the TIGHT (LT5) grace first — well before the
     // widest timer would have — because LT5's grace is the shortest.
     let (mut b7, mut b6, mut b5) = (0.0, 0.0, 0.0);
-    run(&mut b7, &mut b6, &mut b5, dive, SAME_TEAM_PROXIMITY_GRACE_LT5_SECONDS - 0.1);
-    assert!(!same_team_proximity_penalty_past_grace(b7, b6, b5), "just under LT5 grace, still forgiven: b5={b5}");
+    run(
+        &mut b7,
+        &mut b6,
+        &mut b5,
+        dive,
+        SAME_TEAM_PROXIMITY_GRACE_LT5_SECONDS - 0.1,
+    );
+    assert!(
+        !same_team_proximity_penalty_past_grace(b7, b6, b5),
+        "just under LT5 grace, still forgiven: b5={b5}"
+    );
     assert!(
         b5 < SAME_TEAM_PROXIMITY_GRACE_LT6_SECONDS && b5 < SAME_TEAM_PROXIMITY_GRACE_LT7_SECONDS,
         "the tight timer trips first, before the wider ones' grace"
     );
     run(&mut b7, &mut b6, &mut b5, dive, 0.2);
-    assert!(same_team_proximity_penalty_past_grace(b7, b6, b5), "past LT5 grace the tight timer trips: b5={b5}");
+    assert!(
+        same_team_proximity_penalty_past_grace(b7, b6, b5),
+        "past LT5 grace the tight timer trips: b5={b5}"
+    );
 
     // Separating beyond a band resets that band's timer (only real dispersal forgives); the wider
     // timers keep running while the pair is still inside them.
     advance_same_team_proximity_dwell(&mut b7, &mut b6, &mut b5, between_5_6, dt);
     assert_eq!(b5, 0.0, "leaving the 5yd band resets its timer");
-    assert!(b6 > 0.0 && b7 > 0.0, "but the wider timers keep running while still inside them");
+    assert!(
+        b6 > 0.0 && b7 > 0.0,
+        "but the wider timers keep running while still inside them"
+    );
     advance_same_team_proximity_dwell(&mut b7, &mut b6, &mut b5, 99.0, dt); // fully clear
     assert_eq!(
         (b7, b6, b5),

@@ -1996,8 +1996,7 @@ impl SoccerLearningPgStore {
             soccer_policy_version_status_after_promotion_sample_floor(status, &metrics_for_status);
         let full_entries_retained = soccer_policy_version_retains_full_entries(effective_status)
             && soccer_policy_version_full_entries_enabled();
-        base_metrics["learningProvenance"]["policyWeightsPersisted"] =
-            json!(full_entries_retained);
+        base_metrics["learningProvenance"]["policyWeightsPersisted"] = json!(full_entries_retained);
         let metrics = soccer_policy_version_metrics_with_retention(
             base_metrics,
             policy_version_id,

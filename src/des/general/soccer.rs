@@ -205,6 +205,7 @@ const PASS_LANE_DECISION_LOOKAHEAD_SECONDS: f64 = 2.0;
 const PASS_LANE_DYNAMIC_RISK_HIGH: f64 = 0.62;
 const PASS_LANE_DYNAMIC_RISK_GATE_STRENGTH: f64 = 0.74;
 const PASS_LANE_DYNAMIC_RISK_SCORE_PENALTY: f64 = 3.8;
+const OWN_HALF_PASS_LANE_DYNAMIC_RISK_SCORE_MULT: f64 = 1.55;
 // Misplaced-pass guard: the linear risk penalty above is not enough on its own — a juicy
 // forward option can still outscore it and get played straight to an opponent. For a SAFE pass
 // (we need OUR man to actually receive it), pile on this STEEP extra penalty for every unit of
@@ -1776,7 +1777,7 @@ const SHORT_PASS_BUILDUP_PENALTY: f64 = 2.8;
 // Waived for a real escape (receiver clearly less pressured than the holder). Gated by
 // `DD_SOCCER_DISABLE_OWN_HALF_SHORT_PASS_LIABILITY` (default-on; off ⇒ byte-identical).
 const OWN_HALF_SHORT_PASS_LIABILITY_MAX_YARDS: f64 = 4.0;
-const OWN_HALF_SHORT_PASS_LIABILITY_PENALTY: f64 = 3.4;
+const OWN_HALF_SHORT_PASS_LIABILITY_PENALTY: f64 = 5.5;
 // Fraction of the penalty applied even at the 4yd edge (no fade-to-zero): a 3.9yd square
 // ball in our own half still costs 0.6 * 3.4; a tap at the feet costs the full 3.4.
 const OWN_HALF_SHORT_PASS_LIABILITY_FLOOR_FRACTION: f64 = 0.6;
@@ -1785,8 +1786,8 @@ const OWN_HALF_SHORT_PASS_LIABILITY_FLOOR_FRACTION: f64 = 0.6;
 // `DAMP` is the max fraction shaved off `pass_score`; the cut scales with how short the ball
 // is and eases for a wide-open receiver (a genuine out). `MIN_MULT` floors the multiplier so
 // a short pass is demoted, never hard-vetoed (dribbling into trouble can still be worse).
-const OWN_HALF_SHORT_PASS_DRIBBLE_DAMP: f64 = 0.6;
-const OWN_HALF_SHORT_PASS_DRIBBLE_MIN_MULT: f64 = 0.35;
+const OWN_HALF_SHORT_PASS_DRIBBLE_DAMP: f64 = 0.78;
+const OWN_HALF_SHORT_PASS_DRIBBLE_MIN_MULT: f64 = 0.22;
 // Scoop (lofted dink over a close defender): a teammate this far away, open on all sides by
 // this radius, with a defender within this distance of the direct lane.
 const SCOOP_PASS_MIN_RANGE_YARDS: f64 = 5.0;
@@ -2301,7 +2302,7 @@ const RECYCLED_POSSESSION_PINGPONG_PENALTY: f64 = 2.6;
 const PROGRESSIVE_PASS_LATERAL_REWARD_PER_YARD: f64 = 0.14;
 const PROGRESSIVE_PASS_BACKWARD_REWARD_PER_YARD: f64 = 0.05;
 const PROGRESSIVE_PASS_REWARD_CAP: f64 = 10.0;
-const MATCH_RESULT_WIN_PLAYER_REWARD: f64 = 8.0;
+const MATCH_RESULT_WIN_PLAYER_REWARD: f64 = 24.0;
 // Back-four defensive-line band relative to the ball (average of the team's defenders, measured
 // along the attacking axis; the line normally sits BEHIND the ball). Past the 15+20yd shelf the
 // line holds 20-40yd goal-side of the ball. From 15-35yd out, that band compresses onto the
@@ -2424,9 +2425,9 @@ const MIDFIELD_BAND_END_MAX_YARDS: f64 = 15.0;
 const GOALSIDE_BALL_TRANSIT_MIN_SPEED_YPS: f64 = 3.0;
 const GOALSIDE_RECEIVE_CHANCE_RADIUS_YARDS: f64 = 10.0;
 const GOALSIDE_MARGIN_YARDS: f64 = 1.5;
-const MATCH_RESULT_LOSS_PLAYER_PENALTY: f64 = 5.0;
-const MATCH_RESULT_MARGIN_REWARD_PER_GOAL: f64 = 1.25;
-const MATCH_RESULT_MARGIN_PENALTY_PER_GOAL: f64 = 0.75;
+const MATCH_RESULT_LOSS_PLAYER_PENALTY: f64 = 18.0;
+const MATCH_RESULT_MARGIN_REWARD_PER_GOAL: f64 = 6.0;
+const MATCH_RESULT_MARGIN_PENALTY_PER_GOAL: f64 = 4.0;
 const DEFENSIVE_GOAL_HISTORY_ACTIONS: usize = 50;
 const DEFENSIVE_GOAL_HISTORY_MAX_PENALTY: f64 = 0.075;
 const DEFENSIVE_GOAL_HISTORY_MIN_PENALTY: f64 = 0.014;
@@ -2983,7 +2984,10 @@ pub(crate) fn nearest_same_team_distance_for_floor(
 /// place so the dense reward and the budget-exemption wrapper compute the identical value. Zero
 /// when the gate is off, the grace window has not elapsed, or there is no eligible teammate.
 /// Pure w.r.t. the two inputs; RNG-free. Reward/learning-only — never touches physics.
-pub(crate) fn same_team_separation_reward_penalty(player: &PlayerAgent, after: &WorldSnapshot) -> f64 {
+pub(crate) fn same_team_separation_reward_penalty(
+    player: &PlayerAgent,
+    after: &WorldSnapshot,
+) -> f64 {
     if !dd_soccer_enable_same_team_separation_floor()
         || !same_team_proximity_penalty_past_grace(
             player.same_team_proximity_dwell_lt7_seconds,
@@ -2994,7 +2998,9 @@ pub(crate) fn same_team_separation_reward_penalty(player: &PlayerAgent, after: &
         return 0.0;
     }
     match nearest_same_team_distance_for_floor(after, player.id, player.team) {
-        Some(nearest) => same_team_proximity_penalty_unit(nearest) * SAME_TEAM_PROXIMITY_PENALTY_POINTS,
+        Some(nearest) => {
+            same_team_proximity_penalty_unit(nearest) * SAME_TEAM_PROXIMITY_PENALTY_POINTS
+        }
         None => 0.0,
     }
 }
@@ -5458,10 +5464,13 @@ const SOCCER_OUTCOME_CREDIT_MILESTONE_REWARD_CAP: f64 = GOAL_REWARD_POINTS;
 // `return − V(s)` credits whether THIS game beat that expectation — the constant is
 // not absorbed because it differs by the realised result, which the state alone
 // cannot predict. Magnitudes are a starting point and MUST be A/B'd through the
-// promotion eval gate (held-out Elo/win-rate), never tuned on raw reward.
-const MATCH_OUTCOME_WIN_REWARD_POINTS: f64 = 12.0;
+// promotion eval gate (held-out Elo/win-rate), never tuned on raw reward. The
+// local neural-authoritative learner now trains directly against the analytic
+// stack, so this label must be large enough to make "beat the match" dominate
+// dense pass/shape competence after target scaling.
+const MATCH_OUTCOME_WIN_REWARD_POINTS: f64 = 45.0;
 const MATCH_OUTCOME_DRAW_REWARD_POINTS: f64 = 0.0;
-const MATCH_OUTCOME_PER_GOAL_MARGIN_POINTS: f64 = 2.5;
+const MATCH_OUTCOME_PER_GOAL_MARGIN_POINTS: f64 = 10.0;
 const MATCH_OUTCOME_MARGIN_CAP_GOALS: f64 = 4.0;
 // INSTANTANEOUS (single-frame) player speed ceiling: 25mph ≈ 12.22yps, plus a hair of
 // numerical margin. A human sprints at most ~25mph in a moment.
@@ -22328,7 +22337,12 @@ fn progressive_pass_escape_reward(pass: &PendingPass, end: Vec2) -> f64 {
 /// progresses. Pushes fast forward ball movement over holding/dribbling. `hold_seconds` is how long
 /// the passer had possessed the ball. Pure / RNG-free. Per-agent ⇒ shared via the MARL/MAPPO team
 /// component (team-average reward delta), so the whole team is credited for quick forward play.
-fn quick_release_forward_pass_reward(team: Team, origin: Vec2, target: Vec2, hold_seconds: f64) -> f64 {
+fn quick_release_forward_pass_reward(
+    team: Team,
+    origin: Vec2,
+    target: Vec2,
+    hold_seconds: f64,
+) -> f64 {
     let forward_yards = (target.y - origin.y) * team.attack_dir();
     if forward_yards <= 1.25 || !hold_seconds.is_finite() || hold_seconds < 0.0 {
         return 0.0;
@@ -22347,11 +22361,10 @@ fn intercepted_pass_passer_penalty(pass: &PendingPass, field_length: f64) -> f64
     let openness_cost = (1.0 - pass.receiver_openness.clamp(0.0, 1.0)) * 10.0;
     let own_half_cost = if own_half { 3.0 } else { 1.0 };
     let aerial_cost = if pass.flight.is_aerial() { 1.5 } else { 0.0 };
-    let ordinary_interception_penalty = (7.0 + openness_cost + own_half_cost + aerial_cost)
-        .clamp(
-            INTERCEPTED_PASS_BASE_PENALTY_MIN_POINTS,
-            INTERCEPTED_PASS_BASE_PENALTY_MAX_POINTS,
-        );
+    let ordinary_interception_penalty = (7.0 + openness_cost + own_half_cost + aerial_cost).clamp(
+        INTERCEPTED_PASS_BASE_PENALTY_MIN_POINTS,
+        INTERCEPTED_PASS_BASE_PENALTY_MAX_POINTS,
+    );
     // Backward interceptions are exactly doubled; forward and lateral interceptions share the
     // ordinary bad-lane penalty so the learner gets a clean, testable directional signal.
     if matches!(direction, PassDirectionBucket::Backward) {
@@ -39917,7 +39930,10 @@ fn widen_soccer_neural_snapshot_for_config(
     let hidden_layer = &mut hidden_layers[0];
     let output_layer = &mut output_layers[0];
     if hidden_layer.weights.len() != current_hidden
-        || hidden_layer.weights.iter().any(|row| row.len() != snapshot.input_dim)
+        || hidden_layer
+            .weights
+            .iter()
+            .any(|row| row.len() != snapshot.input_dim)
         || output_layer.weights.len() != snapshot.output_dim
         || output_layer
             .weights
@@ -39927,8 +39943,7 @@ fn widen_soccer_neural_snapshot_for_config(
         return snapshot;
     }
 
-    let mut rng =
-        mulberry32(seed ^ (snapshot.training_steps as u32).rotate_left(7) ^ 0xC0D3_6401);
+    let mut rng = mulberry32(seed ^ (snapshot.training_steps as u32).rotate_left(7) ^ 0xC0D3_6401);
     let scale = 0.05;
     for _ in current_hidden..target_hidden {
         let row = (0..snapshot.input_dim)
@@ -59777,8 +59792,7 @@ fn pass_target_quality_for_snapshot_uncached(
                 );
                 if let Some(learned) = head.predict(&features) {
                     let blend_weight = pass_completion_head_blend_weight();
-                    expected_completion = expected_completion
-                        * (1.0 - blend_weight)
+                    expected_completion = expected_completion * (1.0 - blend_weight)
                         + learned.clamp(0.0, 1.0) * blend_weight;
                 }
             }

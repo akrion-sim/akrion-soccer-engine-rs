@@ -1907,7 +1907,8 @@ fn soccer_learning_match_turnover_risk(summary: &MatchSummary) -> f64 {
 
     let backward_recycling_risk = soccer_learning_bounded_count(backward_completed, 32.0) * 0.18;
     let own_half_interception_risk =
-        soccer_learning_bounded_count(stats.pass_interceptions_own_half, 6.0) * 0.38;
+        soccer_learning_bounded_count(stats.pass_interceptions_own_half, 6.0) * 0.25
+            + soccer_learning_bounded_count(stats.pass_interceptions_own_half, 24.0) * 0.35;
     let opp_half_interception_risk =
         soccer_learning_bounded_count(stats.pass_interceptions_opp_half, 8.0) * 0.16;
     let chain_loss_risk = soccer_learning_bounded_count(chain_losses, 10.0) * 0.20;
@@ -8695,6 +8696,18 @@ mod tests {
         assert!(
             clean_fitness > risky_fitness + 0.80,
             "same scoreline must prefer the safer, more progressive policy: clean={clean_fitness}, risky={risky_fitness}"
+        );
+
+        let mut severe_stats = risky.stats.clone();
+        severe_stats.pass_interceptions_own_half = 24;
+        let severe = MatchSummary {
+            stats: severe_stats,
+            ..risky
+        };
+        let severe_fitness = soccer_learning_run_score(&severe).match_fitness;
+        assert!(
+            risky_fitness > severe_fitness + 0.25,
+            "own-half interception risk must keep worsening beyond the first few turnovers: risky={risky_fitness}, severe={severe_fitness}"
         );
     }
 }

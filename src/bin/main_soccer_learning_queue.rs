@@ -891,9 +891,9 @@ fn retain_stronger_policy_promotion_baseline(
     candidate: Option<PolicyPromotionIncumbentBaseline>,
 ) -> Option<PolicyPromotionIncumbentBaseline> {
     match (current, candidate) {
-        (Some(current), Some(candidate)) => Some(stronger_policy_promotion_baseline(
-            current, candidate,
-        )),
+        (Some(current), Some(candidate)) => {
+            Some(stronger_policy_promotion_baseline(current, candidate))
+        }
         (Some(current), None) => Some(current),
         (None, Some(candidate)) => Some(candidate),
         (None, None) => None,

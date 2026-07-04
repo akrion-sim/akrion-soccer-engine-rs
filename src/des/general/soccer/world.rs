@@ -1446,6 +1446,17 @@ mod tests {
     }
 
     #[test]
+    fn own_half_lane_risk_scores_costlier_than_attacking_half() {
+        let attacking_half = pass_lane_dynamic_risk_score_penalty(0.58, 1.0, false);
+        let own_half = pass_lane_dynamic_risk_score_penalty(0.58, 1.0, true);
+
+        assert!(
+            own_half > attacking_half * 1.5,
+            "own-half lane risk must be priced materially harder: own={own_half}, attacking={attacking_half}"
+        );
+    }
+
+    #[test]
     fn bad_pass_chain_penalty_discounts_prior_possession_contributors() {
         fn amount_for(events: &[SoccerRewardEvent], player_id: usize) -> f64 {
             events
@@ -3490,10 +3501,13 @@ impl SoccerMatch {
     fn neural_learner_for(&self, team: Team) -> Option<&SoccerNeuralLearner> {
         match team {
             Team::Home => self.neural_learner.as_ref(),
-            Team::Away => self
-                .away_neural_learner
-                .as_ref()
-                .or(self.neural_learner.as_ref()),
+            Team::Away => self.away_neural_learner.as_ref().or_else(|| {
+                if self.away_neural_frozen {
+                    None
+                } else {
+                    self.neural_learner.as_ref()
+                }
+            }),
         }
     }
 
@@ -3505,6 +3519,8 @@ impl SoccerMatch {
             Team::Away => {
                 if self.away_neural_learner.is_some() {
                     self.away_neural_learner.as_mut()
+                } else if self.away_neural_frozen {
+                    None
                 } else {
                     self.neural_learner.as_mut()
                 }
@@ -3748,6 +3764,21 @@ impl SoccerMatch {
             }
         }
         Ok(())
+    }
+
+    /// Explicitly keep a team on the analytic decision stack. For Away this also
+    /// suppresses the shared-home neural fallback used by legacy single-net runs.
+    pub fn disable_team_neural_brain(&mut self, team: Team) {
+        match team {
+            Team::Home => {
+                self.neural_learner = None;
+                self.home_neural_frozen = true;
+            }
+            Team::Away => {
+                self.away_neural_learner = None;
+                self.away_neural_frozen = true;
+            }
+        }
     }
 
     pub fn set_team_policies(&mut self, team_policies: SoccerTeamQPolicies) {
@@ -4289,7 +4320,9 @@ impl SoccerMatch {
             learning_enabled: self.config.learning_enabled,
             learning_logging_enabled: self.config.learning_logging_enabled,
             learning_interval_ticks: self.config.learning_interval_ticks.max(1),
-            policy_train_max_transitions_per_tick: self.config.policy_train_max_transitions_per_tick,
+            policy_train_max_transitions_per_tick: self
+                .config
+                .policy_train_max_transitions_per_tick,
             deferred_reward_transitions: self.deferred_reward_transitions.len(),
             full_game_learning_enabled: self.config.full_game_learning_enabled,
             full_game_learning_applied: self.full_game_learning_applied,
@@ -4999,10 +5032,12 @@ impl SoccerMatch {
     fn top_scored_candidate_choice(
         candidates: &[SoccerNeuralMctsCandidate],
     ) -> Option<SoccerPolicyActionChoice> {
-        candidates.first().map(|candidate| SoccerPolicyActionChoice {
-            label: candidate.label.clone(),
-            behavior_probability: 1.0,
-        })
+        candidates
+            .first()
+            .map(|candidate| SoccerPolicyActionChoice {
+                label: candidate.label.clone(),
+                behavior_probability: 1.0,
+            })
     }
 
     fn apply_retrieval_prior_to_policy_actions(
@@ -5566,7 +5601,10 @@ impl SoccerMatch {
         };
         if let (Some(_), Some(player)) = (
             learner,
-            snapshot.players.iter().find(|player| player.id == player_id),
+            snapshot
+                .players
+                .iter()
+                .find(|player| player.id == player_id),
         ) {
             for &label in SOCCER_POLICY_ACTIONS {
                 let normalized = normalize_soccer_action_label(label);
@@ -10720,8 +10758,8 @@ impl SoccerMatch {
         if !has_teammate || !has_opponent {
             return;
         }
-        let duel_reward =
-            self.steal_reward_scaled_for_box(WON_FIFTY_FIFTY_DUEL_REWARD_POINTS, self.ball.position);
+        let duel_reward = self
+            .steal_reward_scaled_for_box(WON_FIFTY_FIFTY_DUEL_REWARD_POINTS, self.ball.position);
         self.record_reward_event(winner, duel_reward);
         for (player_id, team) in contenders {
             if team != winner_team {
@@ -13030,8 +13068,8 @@ impl SoccerMatch {
         self.pending_pass = None;
         self.pending_shot = None;
         self.mark_ball_received(defender_id);
-        let dispossession_reward =
-            self.steal_reward_scaled_for_box(DEFENSIVE_DISPOSSESSION_REWARD_POINTS, self.ball.position);
+        let dispossession_reward = self
+            .steal_reward_scaled_for_box(DEFENSIVE_DISPOSSESSION_REWARD_POINTS, self.ball.position);
         self.record_reward_event_with_kind(
             defender_id,
             dispossession_reward,
@@ -23182,6 +23220,22 @@ fn pass_target_risk_from_quality(quality: &PassTargetQuality) -> f64 {
 
 fn pass_target_safety_from_quality(quality: &PassTargetQuality) -> f64 {
     1.0 - pass_target_risk_from_quality(quality)
+}
+
+fn pass_lane_dynamic_risk_score_penalty(
+    lane_interception_risk: f64,
+    appetite_risk_penalty_mult: f64,
+    own_half: bool,
+) -> f64 {
+    let own_half_mult = if own_half {
+        OWN_HALF_PASS_LANE_DYNAMIC_RISK_SCORE_MULT
+    } else {
+        1.0
+    };
+    pass_quality_unit_interval(lane_interception_risk)
+        * PASS_LANE_DYNAMIC_RISK_SCORE_PENALTY
+        * appetite_risk_penalty_mult.max(0.0)
+        * own_half_mult
 }
 
 fn pass_role_risk_penalty_weight(role: PlayerRole) -> f64 {
@@ -34909,9 +34963,11 @@ impl WorldSnapshot {
                     - pointless_short_pass_penalty
                     - build_up_short_pass_penalty
                     - own_half_short_pass_liability
-                    - pass_quality.lane_interception_risk
-                        * PASS_LANE_DYNAMIC_RISK_SCORE_PENALTY
-                        * appetite_risk_penalty_mult
+                    - pass_lane_dynamic_risk_score_penalty(
+                        pass_quality.lane_interception_risk,
+                        appetite_risk_penalty_mult,
+                        own_half,
+                    )
                     - safe_pass_overrisk_penalty
                     - occluded_lane_gift_penalty
                     - role_risk.penalty

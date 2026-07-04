@@ -9,20 +9,22 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use soccer_engine::des::general::soccer::{
     soccer_moment_records_from_jsonl, soccer_moment_records_to_learning_dataset,
     train_soccer_pass_completion_head, AttackSpacingHead, BackFourLineHead, CrashBoxHead,
     DefenderLinePolicyHead, GiveAndGoHead, GoalSideRecoveryHead, HeadScanHead, LaneAffinityHead,
     LongPassRunHead, LooseBallCommitHead, MatchConfig, MatchSummary, OnsideSupportHead,
     PassLaneYieldHead, ReceiveApproachHead, RunPredictionHead, SeparationFloorHead,
-    ShotTriggerHead, SlipBreakHead, SoccerConfigMomentInsert, SoccerMarlAlgorithm, SoccerMatch,
-    SoccerMomentWindow, SoccerNeuralLearningBackend, SoccerNeuralLearningConfig,
+    ShotTriggerHead, SlipBreakHead, SoccerAuxiliaryHeadSnapshot, SoccerConfigMomentInsert,
+    SoccerMarlAlgorithm, SoccerMatch, SoccerMomentWindow, SoccerNeuralBlendMode,
+    SoccerNeuralLayerSnapshot, SoccerNeuralLearningBackend, SoccerNeuralLearningConfig,
     SoccerNeuralNetworkSnapshot, SoccerPassCompletionHead, SoccerPassLearningMetrics,
-    SoccerPassOutcomeSample, SoccerQEntry, SoccerQPolicy, SoccerQPolicyOptions, SoccerQTargetEntry,
-    SoccerSelfPlayEpisodeSummary, SoccerSelfPlayLearnedParams, SoccerSelfPlayTrainingArtifact,
-    SoccerTacticalLearningSummary, SoccerTacticalLearningWeights, SoccerTeamPolicyArtifact,
-    SoccerTeamQPolicies, SoccerNeuralBlendMode, SupportScorerHead, WingerPinchHead,
+    SoccerPassOutcomeSample, SoccerPolicyHeadSnapshot, SoccerPolicyRoleHeadSnapshot,
+    SoccerPolicySpecialistHeadSnapshot, SoccerQEntry, SoccerQPolicy, SoccerQPolicyOptions,
+    SoccerQTargetEntry, SoccerSelfPlayEpisodeSummary, SoccerSelfPlayLearnedParams,
+    SoccerSelfPlayTrainingArtifact, SoccerTacticalLearningSummary, SoccerTacticalLearningWeights,
+    SoccerTeamPolicyArtifact, SoccerTeamQPolicies, SupportScorerHead, Team, WingerPinchHead,
     ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS, CRASH_BOX_HEAD_MIN_TRAINING_STEPS,
     DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE, DEFAULT_SOCCER_PASS_COMPLETION_LEARNING_RATE,
     GIVE_AND_GO_HEAD_MIN_TRAINING_STEPS, GOAL_SIDE_RECOVERY_HEAD_MIN_TRAINING_STEPS,
@@ -86,10 +88,22 @@ const DEFAULT_SOCCER_PRINT_COMPLETED_GAMES: bool = false;
 const DEFAULT_SOCCER_EVOLUTION_ENABLED: bool = true;
 const DEFAULT_SOCCER_EVOLUTION_INTERVAL_GAMES: usize = 10;
 const DEFAULT_SOCCER_EVOLUTION_ELITE_GAMES: usize = 4;
+const DEFAULT_SOCCER_NEURAL_POPULATION_SEARCH_ENABLED: bool = false;
+const DEFAULT_SOCCER_NEURAL_POPULATION_INTERVAL_GAMES: usize = 6;
+const DEFAULT_SOCCER_NEURAL_POPULATION_SIZE: usize = 6;
+const MAX_SOCCER_NEURAL_POPULATION_SIZE: usize = 16;
+const DEFAULT_SOCCER_NEURAL_POPULATION_EVAL_GAMES: usize = 6;
+const DEFAULT_SOCCER_NEURAL_POPULATION_EVAL_MINUTES: f64 = 0.75;
+const DEFAULT_SOCCER_NEURAL_POPULATION_MUTATION_RATE: f64 = 0.08;
+const DEFAULT_SOCCER_NEURAL_POPULATION_MUTATION_SCALE: f64 = 0.04;
+const DEFAULT_SOCCER_NEURAL_POPULATION_CROSSOVER_RATE: f64 = 0.55;
+const DEFAULT_SOCCER_NEURAL_POPULATION_MIN_FITNESS_DELTA: f64 = 0.05;
 const SOCCER_LEARNING_LOCAL_MPC_MAX_PLAYERS_PER_TEAM_LIMIT: usize = 11;
 const SOCCER_POLICY_SOURCE_MERGE: &str = "merge";
 const SOCCER_POLICY_SOURCE_EVOLUTION: &str = "mutation";
 const SOCCER_POLICY_SOURCE_NEURAL_CHECKPOINT: &str = "replay";
+const SOCCER_LEARNING_OBJECTIVE_FITNESS_MIN: f64 = -8.0;
+const SOCCER_LEARNING_OBJECTIVE_FITNESS_MAX: f64 = 12.0;
 
 fn env_value(name: &str) -> Option<String> {
     std::env::var(name)
@@ -153,6 +167,15 @@ fn env_u32(name: &str, default: u32) -> Result<u32, Box<dyn Error>> {
         .map_err(|_| invalid_data(format!("{name} must be a u32, got {value:?}")).into())
 }
 
+fn env_u64(name: &str, default: u64) -> Result<u64, Box<dyn Error>> {
+    let Some(value) = env_value(name) else {
+        return Ok(default);
+    };
+    value
+        .parse::<u64>()
+        .map_err(|_| invalid_data(format!("{name} must be a u64, got {value:?}")).into())
+}
+
 fn env_f64(name: &str, default: f64) -> Result<f64, Box<dyn Error>> {
     let Some(value) = env_value(name) else {
         return Ok(default);
@@ -208,6 +231,114 @@ fn neural_backend_label(backend: SoccerNeuralLearningBackend) -> &'static str {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BatchNeuralSnapshotSelectionMode {
+    Fitness,
+    TrainingSteps,
+    LatestEpisode,
+}
+
+impl BatchNeuralSnapshotSelectionMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Fitness => "fitness",
+            Self::TrainingSteps => "training_steps",
+            Self::LatestEpisode => "latest_episode",
+        }
+    }
+}
+
+fn env_batch_neural_snapshot_selection_mode(
+) -> Result<BatchNeuralSnapshotSelectionMode, Box<dyn Error>> {
+    let Some(value) = env_value("SOCCER_NEURAL_BATCH_SNAPSHOT_SELECTION") else {
+        return Ok(BatchNeuralSnapshotSelectionMode::Fitness);
+    };
+    match value.to_ascii_lowercase().replace('-', "_").as_str() {
+        "fitness" | "best_fitness" | "best" => Ok(BatchNeuralSnapshotSelectionMode::Fitness),
+        "training_steps" | "steps" | "most_trained" => {
+            Ok(BatchNeuralSnapshotSelectionMode::TrainingSteps)
+        }
+        "latest_episode" | "latest" | "episode" => Ok(BatchNeuralSnapshotSelectionMode::LatestEpisode),
+        _ => Err(invalid_data(format!(
+            "SOCCER_NEURAL_BATCH_SNAPSHOT_SELECTION must be fitness, training_steps, or latest_episode, got {value:?}"
+        ))
+        .into()),
+    }
+}
+
+fn soccer_learning_objective_match_fitness(
+    summary: &MatchSummary,
+    analytic_neural_opponent: bool,
+) -> f64 {
+    let score = soccer_learning_run_score(summary);
+    if analytic_neural_opponent {
+        score.home.fitness.clamp(
+            SOCCER_LEARNING_OBJECTIVE_FITNESS_MIN,
+            SOCCER_LEARNING_OBJECTIVE_FITNESS_MAX,
+        )
+    } else {
+        score.match_fitness
+    }
+}
+
+fn evaluate_soccer_policy_promotion_gate_for_learning_objective(
+    summaries: &[&MatchSummary],
+    config: SoccerPolicyPromotionGateConfig,
+    analytic_neural_opponent: bool,
+) -> SoccerPolicyPromotionGateEvaluation {
+    let mut evaluation = evaluate_soccer_policy_promotion_gate(summaries.iter().copied(), config);
+    if !analytic_neural_opponent {
+        return evaluation;
+    }
+    let mut sum = 0.0;
+    let mut best = f64::NEG_INFINITY;
+    let mut non_finite = 0usize;
+    for summary in summaries {
+        let fitness = soccer_learning_objective_match_fitness(summary, true);
+        if fitness.is_finite() {
+            sum += fitness;
+            best = best.max(fitness);
+        } else {
+            non_finite = non_finite.saturating_add(1);
+            sum += SOCCER_LEARNING_OBJECTIVE_FITNESS_MIN;
+            best = best.max(SOCCER_LEARNING_OBJECTIVE_FITNESS_MIN);
+        }
+    }
+    let denominator = summaries.len().max(1) as f64;
+    evaluation.mean_match_fitness = sum / denominator;
+    evaluation.best_match_fitness = if best.is_finite() {
+        best
+    } else {
+        SOCCER_LEARNING_OBJECTIVE_FITNESS_MIN
+    };
+    evaluation.rejection_reasons.retain(|reason| {
+        !reason.starts_with("mean_match_fitness ")
+            && !reason.starts_with("best_match_fitness ")
+            && !reason.starts_with("non_finite_learning_objective ")
+    });
+    if config.enabled {
+        if non_finite > 0 {
+            evaluation.rejection_reasons.push(format!(
+                "non_finite_learning_objective {non_finite} samples"
+            ));
+        }
+        if evaluation.mean_match_fitness < config.min_mean_match_fitness {
+            evaluation.rejection_reasons.push(format!(
+                "mean_match_fitness {:.4} below min_mean_match_fitness {:.4}",
+                evaluation.mean_match_fitness, config.min_mean_match_fitness
+            ));
+        }
+        if evaluation.best_match_fitness < config.min_best_match_fitness {
+            evaluation.rejection_reasons.push(format!(
+                "best_match_fitness {:.4} below min_best_match_fitness {:.4}",
+                evaluation.best_match_fitness, config.min_best_match_fitness
+            ));
+        }
+    }
+    evaluation.eligible = !config.enabled || evaluation.rejection_reasons.is_empty();
+    evaluation
+}
+
 fn default_postgres_policy_version_interval_games(parallel_games: usize) -> usize {
     parallel_games.max(DEFAULT_SOCCER_POSTGRES_POLICY_VERSION_INTERVAL_GAMES)
 }
@@ -225,6 +356,907 @@ fn default_evolution_window_games(
     evolution_elite_games: usize,
 ) -> usize {
     evolution_interval_games.max(evolution_elite_games).max(1)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NeuralPopulationSearchConfig {
+    enabled: bool,
+    interval_games: usize,
+    population_size: usize,
+    eval_games: usize,
+    eval_minutes: f64,
+    mutation_rate: f64,
+    mutation_scale: f64,
+    crossover_rate: f64,
+    min_fitness_delta: f64,
+    seed: u64,
+}
+
+fn env_neural_population_search_config(
+    seed: u64,
+    parallel_games: usize,
+) -> Result<NeuralPopulationSearchConfig, Box<dyn Error>> {
+    let enabled = env_bool(
+        "SOCCER_NEURAL_POPULATION_SEARCH_ENABLED",
+        DEFAULT_SOCCER_NEURAL_POPULATION_SEARCH_ENABLED,
+    )?;
+    let interval_games = env_usize(
+        "SOCCER_NEURAL_POPULATION_INTERVAL_GAMES",
+        parallel_games.max(DEFAULT_SOCCER_NEURAL_POPULATION_INTERVAL_GAMES),
+    )?
+    .max(1);
+    let population_size = env_usize(
+        "SOCCER_NEURAL_POPULATION_SIZE",
+        DEFAULT_SOCCER_NEURAL_POPULATION_SIZE,
+    )?
+    .max(2)
+    .min(MAX_SOCCER_NEURAL_POPULATION_SIZE);
+    let eval_games = env_usize(
+        "SOCCER_NEURAL_POPULATION_EVAL_GAMES",
+        DEFAULT_SOCCER_NEURAL_POPULATION_EVAL_GAMES,
+    )?
+    .max(1);
+    let eval_minutes = env_f64(
+        "SOCCER_NEURAL_POPULATION_EVAL_MINUTES",
+        DEFAULT_SOCCER_NEURAL_POPULATION_EVAL_MINUTES,
+    )?;
+    if eval_minutes <= 0.0 {
+        return Err(invalid_data("SOCCER_NEURAL_POPULATION_EVAL_MINUTES must be positive").into());
+    }
+    let mutation_rate = env_f64(
+        "SOCCER_NEURAL_POPULATION_MUTATION_RATE",
+        DEFAULT_SOCCER_NEURAL_POPULATION_MUTATION_RATE,
+    )?;
+    if !(0.0..=1.0).contains(&mutation_rate) {
+        return Err(
+            invalid_data("SOCCER_NEURAL_POPULATION_MUTATION_RATE must be in [0, 1]").into(),
+        );
+    }
+    let mutation_scale = env_f64(
+        "SOCCER_NEURAL_POPULATION_MUTATION_SCALE",
+        DEFAULT_SOCCER_NEURAL_POPULATION_MUTATION_SCALE,
+    )?;
+    if mutation_scale < 0.0 {
+        return Err(
+            invalid_data("SOCCER_NEURAL_POPULATION_MUTATION_SCALE must be non-negative").into(),
+        );
+    }
+    let crossover_rate = env_f64(
+        "SOCCER_NEURAL_POPULATION_CROSSOVER_RATE",
+        DEFAULT_SOCCER_NEURAL_POPULATION_CROSSOVER_RATE,
+    )?;
+    if !(0.0..=1.0).contains(&crossover_rate) {
+        return Err(
+            invalid_data("SOCCER_NEURAL_POPULATION_CROSSOVER_RATE must be in [0, 1]").into(),
+        );
+    }
+    let min_fitness_delta = env_f64(
+        "SOCCER_NEURAL_POPULATION_MIN_FITNESS_DELTA",
+        DEFAULT_SOCCER_NEURAL_POPULATION_MIN_FITNESS_DELTA,
+    )?;
+    if min_fitness_delta < 0.0 {
+        return Err(invalid_data(
+            "SOCCER_NEURAL_POPULATION_MIN_FITNESS_DELTA must be non-negative",
+        )
+        .into());
+    }
+    let search_seed = env_u64(
+        "SOCCER_NEURAL_POPULATION_SEED",
+        seed ^ 0xA5A5_5A5A_D3C3_B4B4,
+    )?;
+    Ok(NeuralPopulationSearchConfig {
+        enabled,
+        interval_games,
+        population_size,
+        eval_games,
+        eval_minutes,
+        mutation_rate,
+        mutation_scale,
+        crossover_rate,
+        min_fitness_delta,
+        seed: search_seed,
+    })
+}
+
+/// Deterministic splitmix64 RNG for local neural population search. The search
+/// must be reproducible so a "climb" is not just a lucky one-off process seed.
+struct NeuralPopulationRng {
+    state: u64,
+}
+
+impl NeuralPopulationRng {
+    fn new(seed: u64) -> Self {
+        NeuralPopulationRng {
+            state: seed ^ 0x9E37_79B9_7F4A_7C15,
+        }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn unit(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / ((1u64 << 53) as f64)
+    }
+
+    fn gaussian(&mut self) -> f64 {
+        let u1 = self.unit().max(1e-12);
+        let u2 = self.unit();
+        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+    }
+
+    fn coin(&mut self) -> bool {
+        self.next_u64() & 1 == 1
+    }
+
+    fn index(&mut self, len: usize) -> usize {
+        if len == 0 {
+            0
+        } else {
+            (self.next_u64() as usize) % len
+        }
+    }
+}
+
+fn neural_layer_rms(layer: &SoccerNeuralLayerSnapshot) -> f64 {
+    let mut sum_sq = 0.0;
+    let mut count = 0usize;
+    for row in &layer.weights {
+        for weight in row {
+            if weight.is_finite() {
+                sum_sq += *weight * *weight;
+                count += 1;
+            }
+        }
+    }
+    for bias in &layer.biases {
+        if bias.is_finite() {
+            sum_sq += *bias * *bias;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        0.01
+    } else {
+        (sum_sq / count as f64).sqrt().max(0.01)
+    }
+}
+
+fn refresh_neural_snapshot_norm(snapshot: &mut SoccerNeuralNetworkSnapshot) {
+    let mut sum_sq = 0.0;
+    let mut count = 0usize;
+    for layer in &mut snapshot.layers {
+        for row in &mut layer.weights {
+            for weight in row.iter_mut() {
+                if !weight.is_finite() {
+                    *weight = 0.0;
+                }
+                sum_sq += *weight * *weight;
+                count += 1;
+            }
+        }
+        for bias in layer.biases.iter_mut() {
+            if !bias.is_finite() {
+                *bias = 0.0;
+            }
+            sum_sq += *bias * *bias;
+            count += 1;
+        }
+    }
+    snapshot.parameter_count = count;
+    snapshot.l2_norm = sum_sq.sqrt();
+}
+
+fn refresh_neural_snapshot_norm_recursive(
+    snapshot: &mut SoccerNeuralNetworkSnapshot,
+    depth: usize,
+) {
+    refresh_neural_snapshot_norm(snapshot);
+    if depth >= 8 {
+        return;
+    }
+    if let Some(policy_head) = snapshot.policy_head.as_mut() {
+        refresh_policy_head_snapshot_norm(policy_head, depth + 1);
+    }
+    if let Some(line_depth_head) = snapshot.line_depth_head.as_mut() {
+        refresh_auxiliary_head_snapshot_norm(line_depth_head, depth + 1);
+    }
+}
+
+fn refresh_auxiliary_head_snapshot_norm(head: &mut SoccerAuxiliaryHeadSnapshot, depth: usize) {
+    refresh_neural_snapshot_norm_recursive(&mut head.network, depth + 1);
+}
+
+fn refresh_specialist_head_snapshot_norm(
+    head: &mut SoccerPolicySpecialistHeadSnapshot,
+    depth: usize,
+) {
+    refresh_neural_snapshot_norm_recursive(&mut head.network, depth + 1);
+}
+
+fn refresh_role_head_snapshot_norm(head: &mut SoccerPolicyRoleHeadSnapshot, depth: usize) {
+    refresh_neural_snapshot_norm_recursive(&mut head.network, depth + 1);
+    for specialist in &mut head.specialist_heads {
+        refresh_specialist_head_snapshot_norm(specialist, depth + 1);
+    }
+}
+
+fn refresh_policy_head_snapshot_norm(head: &mut SoccerPolicyHeadSnapshot, depth: usize) {
+    refresh_neural_snapshot_norm_recursive(&mut head.network, depth + 1);
+    for specialist in &mut head.specialist_heads {
+        refresh_specialist_head_snapshot_norm(specialist, depth + 1);
+    }
+    for role_head in &mut head.role_heads {
+        refresh_role_head_snapshot_norm(role_head, depth + 1);
+    }
+}
+
+fn mutate_neural_layer(
+    layer: &mut SoccerNeuralLayerSnapshot,
+    rng: &mut NeuralPopulationRng,
+    mutation_rate: f64,
+    mutation_scale: f64,
+) {
+    if mutation_rate <= 0.0 || mutation_scale <= 0.0 {
+        return;
+    }
+    let sigma = neural_layer_rms(layer) * mutation_scale;
+    for row in &mut layer.weights {
+        for weight in row.iter_mut() {
+            if rng.unit() <= mutation_rate {
+                *weight += rng.gaussian() * sigma;
+            }
+        }
+    }
+    for bias in &mut layer.biases {
+        if rng.unit() <= mutation_rate {
+            *bias += rng.gaussian() * sigma;
+        }
+    }
+}
+
+fn mutate_neural_snapshot_recursive(
+    mut snapshot: SoccerNeuralNetworkSnapshot,
+    rng: &mut NeuralPopulationRng,
+    config: NeuralPopulationSearchConfig,
+    depth: usize,
+) -> SoccerNeuralNetworkSnapshot {
+    for layer in &mut snapshot.layers {
+        mutate_neural_layer(layer, rng, config.mutation_rate, config.mutation_scale);
+    }
+    if depth < 8 {
+        if let Some(policy_head) = snapshot.policy_head.as_mut() {
+            mutate_policy_head_snapshot(policy_head, rng, config, depth + 1);
+        }
+        if let Some(line_depth_head) = snapshot.line_depth_head.as_mut() {
+            mutate_auxiliary_head_snapshot(line_depth_head, rng, config, depth + 1);
+        }
+    }
+    refresh_neural_snapshot_norm_recursive(&mut snapshot, depth);
+    snapshot
+}
+
+fn mutate_auxiliary_head_snapshot(
+    head: &mut SoccerAuxiliaryHeadSnapshot,
+    rng: &mut NeuralPopulationRng,
+    config: NeuralPopulationSearchConfig,
+    depth: usize,
+) {
+    let network = std::mem::take(&mut head.network);
+    head.network = mutate_neural_snapshot_recursive(network, rng, config, depth + 1);
+}
+
+fn mutate_specialist_head_snapshot(
+    head: &mut SoccerPolicySpecialistHeadSnapshot,
+    rng: &mut NeuralPopulationRng,
+    config: NeuralPopulationSearchConfig,
+    depth: usize,
+) {
+    let network = std::mem::take(&mut head.network);
+    head.network = mutate_neural_snapshot_recursive(network, rng, config, depth + 1);
+}
+
+fn mutate_role_head_snapshot(
+    head: &mut SoccerPolicyRoleHeadSnapshot,
+    rng: &mut NeuralPopulationRng,
+    config: NeuralPopulationSearchConfig,
+    depth: usize,
+) {
+    let network = std::mem::take(&mut head.network);
+    head.network = mutate_neural_snapshot_recursive(network, rng, config, depth + 1);
+    for specialist in &mut head.specialist_heads {
+        mutate_specialist_head_snapshot(specialist, rng, config, depth + 1);
+    }
+}
+
+fn mutate_policy_head_snapshot(
+    head: &mut SoccerPolicyHeadSnapshot,
+    rng: &mut NeuralPopulationRng,
+    config: NeuralPopulationSearchConfig,
+    depth: usize,
+) {
+    let network = std::mem::take(&mut head.network);
+    head.network = mutate_neural_snapshot_recursive(network, rng, config, depth + 1);
+    for specialist in &mut head.specialist_heads {
+        mutate_specialist_head_snapshot(specialist, rng, config, depth + 1);
+    }
+    for role_head in &mut head.role_heads {
+        mutate_role_head_snapshot(role_head, rng, config, depth + 1);
+    }
+}
+
+fn crossover_neural_snapshot_layers(
+    a: &SoccerNeuralNetworkSnapshot,
+    b: &SoccerNeuralNetworkSnapshot,
+    rng: &mut NeuralPopulationRng,
+) -> SoccerNeuralNetworkSnapshot {
+    let mut child = a.clone();
+    for (layer_index, layer) in child.layers.iter_mut().enumerate() {
+        let Some(b_layer) = b.layers.get(layer_index) else {
+            continue;
+        };
+        for (row_index, row) in layer.weights.iter_mut().enumerate() {
+            for (column_index, weight) in row.iter_mut().enumerate() {
+                if rng.coin() {
+                    if let Some(b_weight) = b_layer
+                        .weights
+                        .get(row_index)
+                        .and_then(|b_row| b_row.get(column_index))
+                    {
+                        *weight = *b_weight;
+                    }
+                }
+            }
+        }
+        for (bias_index, bias) in layer.biases.iter_mut().enumerate() {
+            if rng.coin() {
+                if let Some(b_bias) = b_layer.biases.get(bias_index) {
+                    *bias = *b_bias;
+                }
+            }
+        }
+    }
+    refresh_neural_snapshot_norm(&mut child);
+    child
+}
+
+fn crossover_neural_snapshot_recursive(
+    a: &SoccerNeuralNetworkSnapshot,
+    b: &SoccerNeuralNetworkSnapshot,
+    rng: &mut NeuralPopulationRng,
+    depth: usize,
+) -> SoccerNeuralNetworkSnapshot {
+    let mut child = crossover_neural_snapshot_layers(a, b, rng);
+    if depth < 8 {
+        if let (Some(child_head), Some(b_head)) =
+            (child.policy_head.as_mut(), b.policy_head.as_ref())
+        {
+            crossover_policy_head_snapshot(child_head, b_head, rng, depth + 1);
+        } else if child.policy_head.is_none() && b.policy_head.is_some() && rng.coin() {
+            child.policy_head = b.policy_head.clone();
+        }
+        if let (Some(child_head), Some(b_head)) =
+            (child.line_depth_head.as_mut(), b.line_depth_head.as_ref())
+        {
+            crossover_auxiliary_head_snapshot(child_head, b_head, rng, depth + 1);
+        } else if child.line_depth_head.is_none() && b.line_depth_head.is_some() && rng.coin() {
+            child.line_depth_head = b.line_depth_head.clone();
+        }
+    }
+    refresh_neural_snapshot_norm_recursive(&mut child, depth);
+    child
+}
+
+fn crossover_auxiliary_head_snapshot(
+    child: &mut SoccerAuxiliaryHeadSnapshot,
+    b: &SoccerAuxiliaryHeadSnapshot,
+    rng: &mut NeuralPopulationRng,
+    depth: usize,
+) {
+    let current = std::mem::take(&mut child.network);
+    child.network = crossover_neural_snapshot_recursive(&current, &b.network, rng, depth + 1);
+}
+
+fn crossover_specialist_head_snapshot(
+    child: &mut SoccerPolicySpecialistHeadSnapshot,
+    b: &SoccerPolicySpecialistHeadSnapshot,
+    rng: &mut NeuralPopulationRng,
+    depth: usize,
+) {
+    if child.kind != b.kind && rng.coin() {
+        *child = b.clone();
+        refresh_specialist_head_snapshot_norm(child, depth + 1);
+        return;
+    }
+    let current = std::mem::take(&mut child.network);
+    child.network = crossover_neural_snapshot_recursive(&current, &b.network, rng, depth + 1);
+}
+
+fn crossover_role_head_snapshot(
+    child: &mut SoccerPolicyRoleHeadSnapshot,
+    b: &SoccerPolicyRoleHeadSnapshot,
+    rng: &mut NeuralPopulationRng,
+    depth: usize,
+) {
+    if child.role != b.role && rng.coin() {
+        *child = b.clone();
+        refresh_role_head_snapshot_norm(child, depth + 1);
+        return;
+    }
+    let current = std::mem::take(&mut child.network);
+    child.network = crossover_neural_snapshot_recursive(&current, &b.network, rng, depth + 1);
+    for (index, child_specialist) in child.specialist_heads.iter_mut().enumerate() {
+        if let Some(b_specialist) = b
+            .specialist_heads
+            .iter()
+            .find(|specialist| specialist.kind == child_specialist.kind)
+            .or_else(|| b.specialist_heads.get(index))
+        {
+            crossover_specialist_head_snapshot(child_specialist, b_specialist, rng, depth + 1);
+        }
+    }
+    if child.specialist_heads.len() < b.specialist_heads.len() {
+        for b_specialist in b.specialist_heads.iter().skip(child.specialist_heads.len()) {
+            if rng.unit() < 0.25 {
+                child.specialist_heads.push(b_specialist.clone());
+            }
+        }
+    }
+}
+
+fn crossover_policy_head_snapshot(
+    child: &mut SoccerPolicyHeadSnapshot,
+    b: &SoccerPolicyHeadSnapshot,
+    rng: &mut NeuralPopulationRng,
+    depth: usize,
+) {
+    let current = std::mem::take(&mut child.network);
+    child.network = crossover_neural_snapshot_recursive(&current, &b.network, rng, depth + 1);
+    for (index, child_specialist) in child.specialist_heads.iter_mut().enumerate() {
+        if let Some(b_specialist) = b
+            .specialist_heads
+            .iter()
+            .find(|specialist| specialist.kind == child_specialist.kind)
+            .or_else(|| b.specialist_heads.get(index))
+        {
+            crossover_specialist_head_snapshot(child_specialist, b_specialist, rng, depth + 1);
+        }
+    }
+    if child.specialist_heads.len() < b.specialist_heads.len() {
+        for b_specialist in b.specialist_heads.iter().skip(child.specialist_heads.len()) {
+            if rng.unit() < 0.25 {
+                child.specialist_heads.push(b_specialist.clone());
+            }
+        }
+    }
+    for (index, child_role) in child.role_heads.iter_mut().enumerate() {
+        if let Some(b_role) = b
+            .role_heads
+            .iter()
+            .find(|role| role.role == child_role.role)
+            .or_else(|| b.role_heads.get(index))
+        {
+            crossover_role_head_snapshot(child_role, b_role, rng, depth + 1);
+        }
+    }
+    if child.role_heads.len() < b.role_heads.len() {
+        for b_role in b.role_heads.iter().skip(child.role_heads.len()) {
+            if rng.unit() < 0.25 {
+                child.role_heads.push(b_role.clone());
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct NeuralPopulationCandidate {
+    index: usize,
+    source: String,
+    snapshot: SoccerNeuralNetworkSnapshot,
+}
+
+#[derive(Clone)]
+struct NeuralPopulationCandidateEval {
+    index: usize,
+    source: String,
+    fitness: f64,
+    wins: usize,
+    draws: usize,
+    losses: usize,
+    goals_for: u32,
+    goals_against: u32,
+    snapshot: SoccerNeuralNetworkSnapshot,
+}
+
+fn push_unique_neural_parent(
+    parents: &mut Vec<(String, SoccerNeuralNetworkSnapshot)>,
+    source: &str,
+    snapshot: &SoccerNeuralNetworkSnapshot,
+) {
+    let fingerprint = soccer_neural_network_snapshot_fingerprint(snapshot);
+    if parents
+        .iter()
+        .any(|(_, existing)| soccer_neural_network_snapshot_fingerprint(existing) == fingerprint)
+    {
+        return;
+    }
+    parents.push((source.to_string(), snapshot.clone()));
+}
+
+fn neural_population_exploration_config(
+    config: NeuralPopulationSearchConfig,
+    candidate_index: usize,
+) -> (NeuralPopulationSearchConfig, &'static str) {
+    let mut child_config = config;
+    match candidate_index % 4 {
+        0 => {
+            child_config.mutation_rate = (config.mutation_rate * 0.5).clamp(0.0, 1.0);
+            child_config.mutation_scale = config.mutation_scale * 0.5;
+            (child_config, "micro")
+        }
+        1 => (child_config, "base"),
+        2 => {
+            child_config.mutation_rate = (config.mutation_rate * 1.5).clamp(0.0, 1.0);
+            child_config.mutation_scale = config.mutation_scale * 1.75;
+            (child_config, "wide")
+        }
+        _ => {
+            child_config.mutation_rate = (config.mutation_rate * 0.25).clamp(0.0, 1.0);
+            child_config.mutation_scale = config.mutation_scale * 1.25;
+            (child_config, "pinpoint")
+        }
+    }
+}
+
+fn build_neural_population_candidates(
+    incumbent: &SoccerNeuralNetworkSnapshot,
+    local_best: Option<&LocalNeuralPromotionTrialBest>,
+    anchor: Option<&SoccerNeuralNetworkSnapshot>,
+    config: NeuralPopulationSearchConfig,
+    completed_games: usize,
+) -> Vec<NeuralPopulationCandidate> {
+    let mut parents = Vec::new();
+    push_unique_neural_parent(&mut parents, "incumbent", incumbent);
+    if let Some(local_best_snapshot) = local_best.and_then(|best| best.neural_network.as_ref()) {
+        push_unique_neural_parent(&mut parents, "local_best", local_best_snapshot);
+    }
+    if let Some(anchor_snapshot) = anchor {
+        push_unique_neural_parent(&mut parents, "anchor", anchor_snapshot);
+    }
+
+    let mut candidates = Vec::new();
+    candidates.push(NeuralPopulationCandidate {
+        index: 0,
+        source: "incumbent".to_string(),
+        snapshot: incumbent.clone(),
+    });
+    for (source, snapshot) in parents.iter().skip(1) {
+        if candidates.len() >= config.population_size {
+            break;
+        }
+        candidates.push(NeuralPopulationCandidate {
+            index: candidates.len(),
+            source: format!("{source}_baseline"),
+            snapshot: snapshot.clone(),
+        });
+    }
+
+    let mut rng = NeuralPopulationRng::new(
+        config.seed
+            ^ (completed_games as u64).wrapping_mul(0xD1B5_4A32_D192_ED03)
+            ^ (config.population_size as u64).rotate_left(17),
+    );
+    if parents.len() >= 2 && candidates.len() < config.population_size {
+        let (parent_source, parent_snapshot) = &parents[0];
+        let (other_source, other_snapshot) = &parents[1];
+        let child_index = candidates.len();
+        let (child_config, exploration_label) =
+            neural_population_exploration_config(config, child_index);
+        let child =
+            crossover_neural_snapshot_recursive(parent_snapshot, other_snapshot, &mut rng, 0);
+        let child = mutate_neural_snapshot_recursive(child, &mut rng, child_config, 0);
+        candidates.push(NeuralPopulationCandidate {
+            index: child_index,
+            source: format!("crossover:{parent_source}+{other_source}:{exploration_label}"),
+            snapshot: child,
+        });
+    }
+    while candidates.len() < config.population_size {
+        let parent_index = rng.index(parents.len());
+        let (parent_source, parent_snapshot) = &parents[parent_index];
+        let child_index = candidates.len();
+        let (child_config, exploration_label) =
+            neural_population_exploration_config(config, child_index);
+        let (source, child) = if parents.len() >= 2 && rng.unit() < config.crossover_rate {
+            let mut other_index = rng.index(parents.len());
+            if other_index == parent_index {
+                other_index = (other_index + 1) % parents.len();
+            }
+            let (other_source, other_snapshot) = &parents[other_index];
+            (
+                format!("crossover:{parent_source}+{other_source}:{exploration_label}"),
+                crossover_neural_snapshot_recursive(parent_snapshot, other_snapshot, &mut rng, 0),
+            )
+        } else {
+            (
+                format!("mutation:{parent_source}:{exploration_label}"),
+                parent_snapshot.clone(),
+            )
+        };
+        let child = mutate_neural_snapshot_recursive(child, &mut rng, child_config, 0);
+        candidates.push(NeuralPopulationCandidate {
+            index: child_index,
+            source,
+            snapshot: child,
+        });
+    }
+    candidates
+}
+
+fn neural_population_eval_runner_config(
+    base: &MatchConfig,
+    config: NeuralPopulationSearchConfig,
+) -> EngineMatchRunnerConfig {
+    let mut eval_base = base.clone();
+    eval_base.max_human_players = 0;
+    eval_base.duration_seconds = config.eval_minutes * 60.0;
+    eval_base.learning_enabled = false;
+    eval_base.learning_logging_enabled = false;
+    eval_base.full_game_learning_enabled = false;
+    eval_base.neural_learning.enabled = true;
+    eval_base.neural_learning.backend = SoccerNeuralLearningBackend::Inline;
+    EngineMatchRunnerConfig {
+        base: eval_base,
+        match_wall_time_limit: Some(Duration::from_secs_f64(
+            (config.eval_minutes * 60.0 * 4.0).max(20.0),
+        )),
+    }
+}
+
+fn neural_population_game_fitness(goals_for: u32, goals_against: u32) -> (f64, bool, bool) {
+    let goal_delta = goals_for as f64 - goals_against as f64;
+    let result_score = if goals_for > goals_against {
+        1.0
+    } else if goals_for == goals_against {
+        0.0
+    } else {
+        -1.0
+    };
+    (
+        result_score + 0.25 * goal_delta + 0.05 * goals_for as f64 - 0.05 * goals_against as f64,
+        goals_for > goals_against,
+        goals_for == goals_against,
+    )
+}
+
+fn evaluate_neural_population_candidate_against_analytic(
+    candidate: NeuralPopulationCandidate,
+    base_config: MatchConfig,
+    search_config: NeuralPopulationSearchConfig,
+    seed: u64,
+) -> Result<NeuralPopulationCandidateEval, String> {
+    let mut runner = EngineMatchRunner::new(neural_population_eval_runner_config(
+        &base_config,
+        search_config,
+    ));
+    let mut total_fitness = 0.0;
+    let mut wins = 0usize;
+    let mut draws = 0usize;
+    let mut losses = 0usize;
+    let mut goals_for = 0u32;
+    let mut goals_against = 0u32;
+    for game_index in 0..search_config.eval_games {
+        let candidate_home = game_index % 2 == 0;
+        let ctx = TournamentMatchContext {
+            stage: TournamentStage::Group,
+            round_index: 0,
+            match_index: game_index,
+            seed: (seed
+                ^ (candidate.index as u64).wrapping_mul(0x517C_C1B7_2722_0A95)
+                ^ (game_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)) as u32,
+            home_id: if candidate_home {
+                candidate.index + 1
+            } else {
+                0
+            },
+            away_id: if candidate_home {
+                0
+            } else {
+                candidate.index + 1
+            },
+            home_name: if candidate_home {
+                format!("Candidate {}", candidate.index)
+            } else {
+                "Analytic".to_string()
+            },
+            away_name: if candidate_home {
+                "Analytic".to_string()
+            } else {
+                format!("Candidate {}", candidate.index)
+            },
+            home_learns: false,
+            away_learns: false,
+        };
+        let candidate_brain = TeamBrain::from_snapshot(candidate.snapshot.clone());
+        let analytic_brain = TeamBrain::fresh();
+        let outcome = if candidate_home {
+            runner.play(&ctx, &candidate_brain, &analytic_brain)?
+        } else {
+            runner.play(&ctx, &analytic_brain, &candidate_brain)?
+        };
+        let (candidate_goals, analytic_goals) = if candidate_home {
+            (outcome.home_goals, outcome.away_goals)
+        } else {
+            (outcome.away_goals, outcome.home_goals)
+        };
+        let (fitness, won, drew) = neural_population_game_fitness(candidate_goals, analytic_goals);
+        total_fitness += fitness;
+        goals_for = goals_for.saturating_add(candidate_goals);
+        goals_against = goals_against.saturating_add(analytic_goals);
+        if won {
+            wins += 1;
+        } else if drew {
+            draws += 1;
+        } else {
+            losses += 1;
+        }
+    }
+    Ok(NeuralPopulationCandidateEval {
+        index: candidate.index,
+        source: candidate.source,
+        fitness: total_fitness / search_config.eval_games.max(1) as f64,
+        wins,
+        draws,
+        losses,
+        goals_for,
+        goals_against,
+        snapshot: candidate.snapshot,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_run_neural_population_search(
+    completed_games: usize,
+    config: &MatchConfig,
+    search_config: NeuralPopulationSearchConfig,
+    local_best: Option<&LocalNeuralPromotionTrialBest>,
+    anchor: Option<&SoccerNeuralNetworkSnapshot>,
+    latest_neural_network: &mut Option<SoccerNeuralNetworkSnapshot>,
+    latest_neural_network_arc_cache: &mut Option<CachedNeuralNetworkSnapshotArc>,
+) -> Result<bool, Box<dyn Error>> {
+    if !search_config.enabled
+        || search_config.interval_games == 0
+        || completed_games == 0
+        || completed_games % search_config.interval_games != 0
+    {
+        return Ok(false);
+    }
+    let Some(incumbent) = latest_neural_network.as_ref() else {
+        println!(
+            "neural_population_search_held completed_games={} reasons=missing_neural_snapshot",
+            completed_games
+        );
+        return Ok(false);
+    };
+    let candidates = build_neural_population_candidates(
+        incumbent,
+        local_best,
+        anchor,
+        search_config,
+        completed_games,
+    );
+    println!(
+        "neural_population_search_start completed_games={} population={} eval_games={} eval_minutes={:.2} mutation_rate={:.4} mutation_scale={:.4} crossover_rate={:.4} min_fitness_delta={:.4}",
+        completed_games,
+        candidates.len(),
+        search_config.eval_games,
+        search_config.eval_minutes,
+        search_config.mutation_rate,
+        search_config.mutation_scale,
+        search_config.crossover_rate,
+        search_config.min_fitness_delta
+    );
+    let mut handles = Vec::new();
+    for candidate in candidates {
+        let eval_config = config.clone();
+        let candidate_seed = search_config.seed
+            ^ (completed_games as u64).wrapping_mul(0x94D0_49BB_1331_11EB)
+            ^ (candidate.index as u64).rotate_left(29);
+        handles.push(thread::spawn(move || {
+            evaluate_neural_population_candidate_against_analytic(
+                candidate,
+                eval_config,
+                search_config,
+                candidate_seed,
+            )
+        }));
+    }
+
+    let mut evals = Vec::new();
+    for handle in handles {
+        match handle.join() {
+            Ok(Ok(candidate_eval)) => {
+                println!(
+                    "neural_population_candidate_eval index={} source={} fitness={:.4} record={}-{}-{} goals={}-{}",
+                    candidate_eval.index,
+                    candidate_eval.source,
+                    candidate_eval.fitness,
+                    candidate_eval.wins,
+                    candidate_eval.draws,
+                    candidate_eval.losses,
+                    candidate_eval.goals_for,
+                    candidate_eval.goals_against
+                );
+                evals.push(candidate_eval);
+            }
+            Ok(Err(error)) => {
+                println!(
+                    "neural_population_candidate_failed completed_games={} error={}",
+                    completed_games, error
+                );
+            }
+            Err(_) => {
+                println!(
+                    "neural_population_candidate_failed completed_games={} error=thread_panicked",
+                    completed_games
+                );
+            }
+        }
+    }
+    let Some(incumbent_eval) = evals.iter().find(|candidate| candidate.index == 0) else {
+        println!(
+            "neural_population_search_held completed_games={} reasons=incumbent_eval_failed",
+            completed_games
+        );
+        return Ok(false);
+    };
+    let Some(best_eval) = evals
+        .iter()
+        .max_by(|a, b| a.fitness.total_cmp(&b.fitness))
+        .cloned()
+    else {
+        println!(
+            "neural_population_search_held completed_games={} reasons=no_successful_evals",
+            completed_games
+        );
+        return Ok(false);
+    };
+    let improvement = best_eval.fitness - incumbent_eval.fitness;
+    if best_eval.index == 0 || improvement < search_config.min_fitness_delta {
+        println!(
+            "neural_population_search_held completed_games={} incumbent_fitness={:.4} best_index={} best_source={} best_fitness={:.4} improvement={:.4} min_delta={:.4} reasons=insufficient_heldout_gain",
+            completed_games,
+            incumbent_eval.fitness,
+            best_eval.index,
+            best_eval.source,
+            best_eval.fitness,
+            improvement,
+            search_config.min_fitness_delta
+        );
+        return Ok(false);
+    }
+
+    *latest_neural_network = Some(best_eval.snapshot.clone());
+    *latest_neural_network_arc_cache = None;
+    println!(
+        "neural_population_search_accepted completed_games={} incumbent_fitness={:.4} accepted_index={} accepted_source={} accepted_fitness={:.4} improvement={:.4} record={}-{}-{} goals={}-{} note=heldout_analytic_candidate_will_train_on_policy_next_batch",
+        completed_games,
+        incumbent_eval.fitness,
+        best_eval.index,
+        best_eval.source,
+        best_eval.fitness,
+        improvement,
+        best_eval.wins,
+        best_eval.draws,
+        best_eval.losses,
+        best_eval.goals_for,
+        best_eval.goals_against
+    );
+    Ok(true)
 }
 
 fn policy_version_status_for_promotion_gate(
@@ -250,6 +1282,16 @@ fn policy_promotion_search_metadata(
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PolicyPromotionIncumbentBaseline {
+    sample_games: usize,
+    mean_match_fitness: f64,
+    best_match_fitness: f64,
+    mean_play_quality: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalPolicyPromotionBestMetadata {
+    completed_games: usize,
     sample_games: usize,
     mean_match_fitness: f64,
     best_match_fitness: f64,
@@ -365,6 +1407,38 @@ fn policy_promotion_incumbent_baseline_from_evaluation(
         mean_match_fitness: evaluation.mean_match_fitness,
         best_match_fitness: evaluation.best_match_fitness,
         mean_play_quality: evaluation.mean_play_quality,
+    })
+}
+
+fn policy_promotion_incumbent_baseline_from_local_best_metadata(
+    metadata: &LocalPolicyPromotionBestMetadata,
+) -> Option<PolicyPromotionIncumbentBaseline> {
+    if metadata.sample_games == 0
+        || !metadata.mean_match_fitness.is_finite()
+        || !metadata.best_match_fitness.is_finite()
+        || !metadata.mean_play_quality.is_finite()
+    {
+        return None;
+    }
+    Some(PolicyPromotionIncumbentBaseline {
+        sample_games: metadata.sample_games,
+        mean_match_fitness: metadata.mean_match_fitness,
+        best_match_fitness: metadata.best_match_fitness,
+        mean_play_quality: metadata.mean_play_quality,
+    })
+}
+
+fn local_policy_promotion_best_metadata_from_evaluation(
+    completed_games: usize,
+    evaluation: &SoccerPolicyPromotionGateEvaluation,
+) -> Option<LocalPolicyPromotionBestMetadata> {
+    let baseline = policy_promotion_incumbent_baseline_from_evaluation(evaluation)?;
+    Some(LocalPolicyPromotionBestMetadata {
+        completed_games,
+        sample_games: baseline.sample_games,
+        mean_match_fitness: baseline.mean_match_fitness,
+        best_match_fitness: baseline.best_match_fitness,
+        mean_play_quality: baseline.mean_play_quality,
     })
 }
 
@@ -495,9 +1569,19 @@ fn policy_promotion_evaluation_beats_local_best(
 fn policy_promotion_evaluation_regresses_from_local_best(
     evaluation: &SoccerPolicyPromotionGateEvaluation,
     best: &LocalNeuralPromotionTrialBest,
+    max_mean_match_fitness_regression: f64,
+    max_play_quality_regression: f64,
 ) -> bool {
     const EPSILON: f64 = 1e-9;
-    evaluation.mean_match_fitness + EPSILON < best.evaluation.mean_match_fitness
+    let mean_match_fitness_regression =
+        best.evaluation.mean_match_fitness - evaluation.mean_match_fitness;
+    if mean_match_fitness_regression > max_mean_match_fitness_regression + EPSILON {
+        return true;
+    }
+    let mean_play_quality_regression =
+        best.evaluation.mean_play_quality - evaluation.mean_play_quality;
+    mean_match_fitness_regression >= -EPSILON
+        && mean_play_quality_regression > max_play_quality_regression + EPSILON
 }
 
 fn apply_local_best_neural_backoff(
@@ -539,13 +1623,22 @@ fn restore_local_best_after_held_promotion(
     backoff_factor: f64,
     backoff_min_learning_rate: f64,
     backoff_min_blend_lambda: f64,
+    max_mean_match_fitness_regression: f64,
+    max_play_quality_regression: f64,
 ) -> bool {
     if latest_neural_network.is_none() {
         return false;
     }
     let local_best_restore = local_neural_promotion_trial_best
         .as_ref()
-        .filter(|best| policy_promotion_evaluation_regresses_from_local_best(evaluation, best))
+        .filter(|best| {
+            policy_promotion_evaluation_regresses_from_local_best(
+                evaluation,
+                best,
+                max_mean_match_fitness_regression,
+                max_play_quality_regression,
+            )
+        })
         .cloned();
     let Some(best) = local_best_restore else {
         return false;
@@ -1731,23 +2824,53 @@ struct BatchNeuralSnapshotSelection {
 }
 
 fn batch_neural_snapshot_candidate_better(
+    mode: BatchNeuralSnapshotSelectionMode,
     candidate_fitness: f64,
     candidate_episode: usize,
+    candidate_training_steps: usize,
     best_fitness: f64,
     best_episode: usize,
+    best_training_steps: usize,
 ) -> bool {
     const EPSILON: f64 = 1e-12;
-    if candidate_fitness > best_fitness + EPSILON {
-        return true;
+    match mode {
+        BatchNeuralSnapshotSelectionMode::Fitness => {
+            if candidate_fitness > best_fitness + EPSILON {
+                return true;
+            }
+            if best_fitness > candidate_fitness + EPSILON {
+                return false;
+            }
+            candidate_episode > best_episode
+        }
+        BatchNeuralSnapshotSelectionMode::TrainingSteps => {
+            if candidate_training_steps != best_training_steps {
+                return candidate_training_steps > best_training_steps;
+            }
+            if candidate_fitness > best_fitness + EPSILON {
+                return true;
+            }
+            if best_fitness > candidate_fitness + EPSILON {
+                return false;
+            }
+            candidate_episode > best_episode
+        }
+        BatchNeuralSnapshotSelectionMode::LatestEpisode => {
+            if candidate_episode != best_episode {
+                return candidate_episode > best_episode;
+            }
+            if candidate_training_steps != best_training_steps {
+                return candidate_training_steps > best_training_steps;
+            }
+            candidate_fitness > best_fitness + EPSILON
+        }
     }
-    if best_fitness > candidate_fitness + EPSILON {
-        return false;
-    }
-    candidate_episode > best_episode
 }
 
 fn select_batch_neural_snapshot(
     completed_games: &mut [CompletedGame],
+    mode: BatchNeuralSnapshotSelectionMode,
+    analytic_neural_opponent: bool,
 ) -> Option<BatchNeuralSnapshotSelection> {
     let snapshot_count = completed_games
         .iter()
@@ -1756,23 +2879,35 @@ fn select_batch_neural_snapshot(
     if snapshot_count == 0 {
         return None;
     }
-    let mut best = None::<(usize, usize, f64)>;
+    let mut best = None::<(usize, usize, f64, usize)>;
     for (index, game) in completed_games.iter().enumerate() {
-        if game.neural_network.is_none() {
+        let Some(snapshot) = game.neural_network.as_ref() else {
             continue;
-        }
+        };
         let episode = game.episode_summary.episode + 1;
-        let fitness = soccer_learning_run_score(&game.episode_summary.summary).match_fitness;
+        let fitness = soccer_learning_objective_match_fitness(
+            &game.episode_summary.summary,
+            analytic_neural_opponent,
+        );
+        let training_steps = snapshot.training_steps;
         let replace = best
-            .map(|(_, best_episode, best_fitness)| {
-                batch_neural_snapshot_candidate_better(fitness, episode, best_fitness, best_episode)
+            .map(|(_, best_episode, best_fitness, best_training_steps)| {
+                batch_neural_snapshot_candidate_better(
+                    mode,
+                    fitness,
+                    episode,
+                    training_steps,
+                    best_fitness,
+                    best_episode,
+                    best_training_steps,
+                )
             })
             .unwrap_or(true);
         if replace {
-            best = Some((index, episode, fitness));
+            best = Some((index, episode, fitness, training_steps));
         }
     }
-    let (index, episode, match_fitness) = best?;
+    let (index, episode, match_fitness, _) = best?;
     let snapshot = completed_games[index].neural_network.take()?;
     let training_steps = snapshot.training_steps;
     Some(BatchNeuralSnapshotSelection {
@@ -1914,6 +3049,7 @@ struct SoccerLearningWorkerTask {
     starting_policy_version_id: Option<String>,
     starting_policy_generation: i32,
     initial_neural_network: Option<Arc<SoccerNeuralNetworkSnapshot>>,
+    analytic_neural_opponent: bool,
     adversarial_moment_windows: Arc<Vec<SoccerMomentWindow>>,
     print_progress: bool,
     neural_drain_timeout: Duration,
@@ -2011,6 +3147,7 @@ impl SoccerLearningWorkerPool {
                         task.starting_policy_version_id,
                         task.starting_policy_generation,
                         task.initial_neural_network,
+                        task.analytic_neural_opponent,
                         task.adversarial_moment_windows,
                         task.print_progress,
                         task.neural_drain_timeout,
@@ -2525,6 +3662,18 @@ fn neural_sidecar_path_for_policy_artifact(policy_path: &Path) -> PathBuf {
     parent.join(format!("{stem}.neural.json"))
 }
 
+fn local_policy_promotion_best_path_for_policy_artifact(policy_path: &Path) -> PathBuf {
+    let Some(parent) = policy_path.parent() else {
+        return PathBuf::from("out/soccer-live/team-policy.local-best.json");
+    };
+    let stem = policy_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("team-policy");
+    parent.join(format!("{stem}.local-best.json"))
+}
+
 fn candidate_checkpoint_path(path: &Path) -> PathBuf {
     let candidate_name = match (
         path.file_stem().and_then(|stem| stem.to_str()),
@@ -2585,6 +3734,33 @@ fn load_neural_sidecar_for_policy_artifact(
     let raw = fs::read_to_string(&sidecar_path)?;
     let snapshot = serde_json::from_str::<SoccerNeuralNetworkSnapshot>(&raw)?;
     Ok(Some((sidecar_path, snapshot)))
+}
+
+fn load_local_policy_promotion_best(
+    policy_path: &Path,
+) -> Result<Option<(PathBuf, LocalPolicyPromotionBestMetadata)>, Box<dyn Error>> {
+    let metadata_path = local_policy_promotion_best_path_for_policy_artifact(policy_path);
+    if !metadata_path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&metadata_path)?;
+    let metadata = serde_json::from_str::<LocalPolicyPromotionBestMetadata>(&raw)?;
+    Ok(Some((metadata_path, metadata)))
+}
+
+fn write_local_policy_promotion_best(
+    policy_path: &Path,
+    completed_games: usize,
+    evaluation: &SoccerPolicyPromotionGateEvaluation,
+) -> Result<Option<PathBuf>, Box<dyn Error>> {
+    let Some(metadata) =
+        local_policy_promotion_best_metadata_from_evaluation(completed_games, evaluation)
+    else {
+        return Ok(None);
+    };
+    let metadata_path = local_policy_promotion_best_path_for_policy_artifact(policy_path);
+    write_json(&metadata_path, &metadata)?;
+    Ok(Some(metadata_path))
 }
 
 fn default_run_id() -> String {
@@ -3058,6 +4234,7 @@ fn run_game(
     starting_policy_version_id: Option<String>,
     starting_policy_generation: i32,
     initial_neural_network: Option<Arc<SoccerNeuralNetworkSnapshot>>,
+    analytic_neural_opponent: bool,
     adversarial_moment_windows: Arc<Vec<SoccerMomentWindow>>,
     print_progress: bool,
     neural_drain_timeout: Duration,
@@ -3080,7 +4257,13 @@ fn run_game(
         // still warm-starts the tabular policy + tactical weights, trains a fresh net,
         // and persists a forward-compatible snapshot, so subsequent games warm-start
         // normally (self-healing). Any other snapshot error still aborts.
-        match sim.set_neural_network_snapshot((**snapshot).clone()) {
+        let install_result = if analytic_neural_opponent {
+            sim.set_team_neural_brain(Team::Home, Some((**snapshot).clone()), false)
+                .map(|()| sim.disable_team_neural_brain(Team::Away))
+        } else {
+            sim.set_neural_network_snapshot((**snapshot).clone())
+        };
+        match install_result {
             Ok(()) => {
                 if let Some(line_depth_snapshot) = snapshot.line_depth_head.as_deref() {
                     match BackFourLineHead::from_snapshot(line_depth_snapshot) {
@@ -3116,6 +4299,9 @@ fn run_game(
                 }
             }
         }
+    } else if analytic_neural_opponent {
+        sim.set_team_neural_brain(Team::Home, None, false)?;
+        sim.disable_team_neural_brain(Team::Away);
     }
     for window in adversarial_moment_windows.iter() {
         sim.remember_adversarial_moment_window(window.clone());
@@ -4226,8 +5412,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "SOCCER_WRITE_LEARNED_PARAMS_ARTIFACTS",
         write_final_artifacts,
     )?;
-    let checkpoint_artifact_best_only =
-        env_bool("SOCCER_CHECKPOINT_ARTIFACT_BEST_ONLY", false)?;
+    let checkpoint_artifact_best_only = env_bool("SOCCER_CHECKPOINT_ARTIFACT_BEST_ONLY", false)?;
     let write_episode_log_file = env_bool(
         "SOCCER_WRITE_EPISODE_LOG",
         default_disk_learning_artifacts && DEFAULT_SOCCER_WRITE_EPISODE_LOG,
@@ -4616,12 +5801,37 @@ fn run() -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
+    let policy_promotion_local_best_restore_max_mean_fitness_regression = env_f64(
+        "SOCCER_POLICY_PROMOTION_LOCAL_BEST_RESTORE_MAX_MEAN_FITNESS_REGRESSION",
+        0.0,
+    )?;
+    if !policy_promotion_local_best_restore_max_mean_fitness_regression.is_finite()
+        || policy_promotion_local_best_restore_max_mean_fitness_regression < 0.0
+    {
+        return Err(invalid_data(
+            "SOCCER_POLICY_PROMOTION_LOCAL_BEST_RESTORE_MAX_MEAN_FITNESS_REGRESSION must be finite and non-negative",
+        )
+        .into());
+    }
+    let policy_promotion_local_best_restore_max_play_quality_regression = env_f64(
+        "SOCCER_POLICY_PROMOTION_LOCAL_BEST_RESTORE_MAX_PLAY_QUALITY_REGRESSION",
+        0.0,
+    )?;
+    if !policy_promotion_local_best_restore_max_play_quality_regression.is_finite()
+        || policy_promotion_local_best_restore_max_play_quality_regression < 0.0
+    {
+        return Err(invalid_data(
+            "SOCCER_POLICY_PROMOTION_LOCAL_BEST_RESTORE_MAX_PLAY_QUALITY_REGRESSION must be finite and non-negative",
+        )
+        .into());
+    }
     let neural_drain_timeout_ms = env_usize(
         "SOCCER_NEURAL_DRAIN_TIMEOUT_MS",
         DEFAULT_SOCCER_NEURAL_DRAIN_TIMEOUT_MS,
     )?;
     let neural_drain_timeout =
         Duration::from_millis(neural_drain_timeout_ms.min(u64::MAX as usize) as u64);
+    let neural_batch_snapshot_selection_mode = env_batch_neural_snapshot_selection_mode()?;
     let game_artifact_mode = env_value("SOCCER_GAME_ARTIFACT_MODE")
         .unwrap_or_else(|| "summary".to_string())
         .to_ascii_lowercase();
@@ -4643,6 +5853,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     let seed = env_u32("SOCCER_SEED", 2026)?;
     let shard_seed_stride = env_u32("SOCCER_SHARD_SEED_STRIDE", 1_000_000)?;
     let effective_seed = seed.wrapping_add((shard_index as u32).wrapping_mul(shard_seed_stride));
+    let neural_population_search_config =
+        env_neural_population_search_config(u64::from(effective_seed), parallel_games)?;
     let options = SoccerQPolicyOptions {
         alpha: env_f64("SOCCER_ALPHA", 0.20)?,
         gamma: env_f64("SOCCER_GAMMA", 0.96)?,
@@ -4690,6 +5902,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         "SOCCER_OPPONENT_BELIEF_ENABLED",
         "SOCCER_OPPONENT_BELIEF",
         true,
+    )?;
+    let analytic_neural_opponent = env_bool_alias(
+        "SOCCER_LEARNING_ANALYTIC_OPPONENT",
+        "SOCCER_ANALYTIC_OPPONENT",
+        false,
     )?;
     let mut config = MatchConfig {
         dt_seconds,
@@ -4785,6 +6002,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     let checkpoint_artifact_path = env_value("SOCCER_CHECKPOINT_ARTIFACT_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|| run_dir.join("checkpoint-policy.json"));
+    let local_policy_promotion_best_path =
+        local_policy_promotion_best_path_for_policy_artifact(&checkpoint_artifact_path);
     let episode_log_path = env_value("SOCCER_EPISODE_LOG_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|| run_dir.join("episodes.jsonl"));
@@ -5127,6 +6346,42 @@ fn run() -> Result<(), Box<dyn Error>> {
             policies.train_adversarial(&replay_dataset.transitions);
         }
     }
+    if checkpoint_artifact_best_only {
+        match load_local_policy_promotion_best(&checkpoint_artifact_path) {
+            Ok(Some((metadata_path, metadata))) => {
+                let loaded_baseline =
+                    policy_promotion_incumbent_baseline_from_local_best_metadata(&metadata);
+                if let Some(baseline) = loaded_baseline {
+                    pg_base_policy_promotion_baseline = retain_stronger_policy_promotion_baseline(
+                        pg_base_policy_promotion_baseline,
+                        Some(baseline),
+                    );
+                    println!(
+                        "local_policy_promotion_best_loaded path={} completed_games={} sample_games={} mean_match_fitness={:.4} best_match_fitness={:.4} mean_play_quality={:.4}",
+                        metadata_path.display(),
+                        metadata.completed_games,
+                        metadata.sample_games,
+                        metadata.mean_match_fitness,
+                        metadata.best_match_fitness,
+                        metadata.mean_play_quality,
+                    );
+                } else {
+                    eprintln!(
+                        "local_policy_promotion_best_ignored path={} reason=invalid-metadata",
+                        metadata_path.display()
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!(
+                    "local_policy_promotion_best_load_error path={} error={}",
+                    local_policy_promotion_best_path.display(),
+                    err
+                );
+            }
+        }
+    }
 
     println!(
         "soccer_self_play_start run_id={} games={} parallel_games={} minutes={:.1} halves={} half_minutes={:.1} period_break_recovery_seconds={:.1} dt={:.3}s learning_interval_ticks={} ticks_per_game={} shard={}/{} base_seed={} effective_seed={} logging_transitions={} print_progress={} print_completed_games={} episode_log_flush_interval_games={} pg_policy_version_interval_games={} pg_completed_run_batch_games={} pg_completed_run_retention_games={} pg_completed_async={} pg_completed_async_queue_batches={} pg_completed_async_coalesce_batches={} pg_completed_async_coalesce_wait_ms={} neural_drain_timeout_ms={} game_artifact_mode={} checkpoint_interval_games={} artifact_max_entries_per_policy={} max_policy_entries_per_team={} max_policy_target_entries_per_team={} min_policy_visits={} moment_replay_records={} moment_replay_transitions={} moment_replay_passes={} moment_replay_reward_scale={:.3}",
@@ -5196,6 +6451,19 @@ fn run() -> Result<(), Box<dyn Error>> {
         evolution_options.seed
     );
     println!(
+        "neural_population_search enabled={} interval_games={} population_size={} eval_games={} eval_minutes={:.2} mutation_rate={:.4} mutation_scale={:.4} crossover_rate={:.4} min_fitness_delta={:.4} seed={}",
+        neural_population_search_config.enabled,
+        neural_population_search_config.interval_games,
+        neural_population_search_config.population_size,
+        neural_population_search_config.eval_games,
+        neural_population_search_config.eval_minutes,
+        neural_population_search_config.mutation_rate,
+        neural_population_search_config.mutation_scale,
+        neural_population_search_config.crossover_rate,
+        neural_population_search_config.min_fitness_delta,
+        neural_population_search_config.seed
+    );
+    println!(
         "curriculum ball_skills_after_games={} duels_after_games={} small_sided_after_games={} team_shape_after_games={} full_match_after_games={}",
         curriculum_config.ball_skills_after_games,
         curriculum_config.duels_after_games,
@@ -5204,7 +6472,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         curriculum_config.full_match_after_games
     );
     println!(
-        "policy_promotion_gate enabled={} min_sample_games={} min_mean_match_fitness={:.4} min_best_match_fitness={:.4} min_mean_play_quality={:.4} max_mean_conceded_goals={:.4} max_mean_goal_margin={:.4} max_mean_chain_net_loss={:.4} active_max_fitness_regression={:.4} compare_incumbent={} min_mean_fitness_delta={:.4} max_mean_fitness_regression={:.4} max_play_quality_regression={:.4} baseline_lookback_generations={} apply_evolution_when_held={} reset_to_incumbent_after_held_trial={} require_trial_before_write={} neural_checkpoint_when_held={} recalibrate_incumbent_on_resume={} local_best_rollback={} local_best_backoff={} local_best_backoff_factor={:.3} local_best_backoff_min_lr={:.5} local_best_backoff_min_blend={:.3}",
+        "policy_promotion_gate enabled={} min_sample_games={} min_mean_match_fitness={:.4} min_best_match_fitness={:.4} min_mean_play_quality={:.4} max_mean_conceded_goals={:.4} max_mean_goal_margin={:.4} max_mean_chain_net_loss={:.4} active_max_fitness_regression={:.4} compare_incumbent={} min_mean_fitness_delta={:.4} max_mean_fitness_regression={:.4} max_play_quality_regression={:.4} baseline_lookback_generations={} apply_evolution_when_held={} reset_to_incumbent_after_held_trial={} require_trial_before_write={} neural_checkpoint_when_held={} recalibrate_incumbent_on_resume={} local_best_rollback={} local_best_backoff={} local_best_backoff_factor={:.3} local_best_backoff_min_lr={:.5} local_best_backoff_min_blend={:.3} local_best_restore_max_mean_fitness_regression={:.4} local_best_restore_max_play_quality_regression={:.4}",
         policy_promotion_gate.enabled,
         policy_promotion_gate.min_sample_games,
         policy_promotion_gate.min_mean_match_fitness,
@@ -5228,7 +6496,13 @@ fn run() -> Result<(), Box<dyn Error>> {
         policy_promotion_local_best_backoff,
         policy_promotion_local_best_backoff_factor,
         policy_promotion_local_best_backoff_min_learning_rate,
-        policy_promotion_local_best_backoff_min_blend_lambda
+        policy_promotion_local_best_backoff_min_blend_lambda,
+        policy_promotion_local_best_restore_max_mean_fitness_regression,
+        policy_promotion_local_best_restore_max_play_quality_regression
+    );
+    println!(
+        "learning_opponent analytic_neural_opponent={} (true = home neural trains against away net-less analytic stack)",
+        analytic_neural_opponent
     );
     println!(
         "postgres_resumed_neural_network={}",
@@ -5250,6 +6524,12 @@ fn run() -> Result<(), Box<dyn Error>> {
     } else {
         println!("checkpoint_artifact={}", checkpoint_artifact_path.display());
         println!("checkpoint_interval_games={}", checkpoint_interval_games);
+    }
+    if checkpoint_artifact_best_only {
+        println!(
+            "checkpoint_local_best_metadata={}",
+            local_policy_promotion_best_path.display()
+        );
     }
     if let Some(path) = &resume_artifact {
         println!("resume_artifact={path}");
@@ -5277,7 +6557,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         tactical_learning.defense_compactness_score_weight,
     );
     println!(
-        "neural_learning enabled={} backend={} learning_rate={:.5} batch_size={} train_every_ticks={} max_batches_per_tick={} hidden_units={} target_scale={:.3} max_pending_batches={} replay_capacity={} replay_samples_per_tick={} target_clip={:.3} snapshot_every_batches={}",
+        "neural_learning enabled={} backend={} learning_rate={:.5} batch_size={} train_every_ticks={} max_batches_per_tick={} hidden_units={} target_scale={:.3} max_pending_batches={} replay_capacity={} replay_samples_per_tick={} target_clip={:.3} snapshot_every_batches={} batch_snapshot_selection={}",
         neural_learning.enabled,
         neural_backend_label(neural_learning.backend),
         neural_learning.learning_rate,
@@ -5291,6 +6571,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         neural_learning.replay_samples_per_tick,
         neural_learning.target_clip,
         neural_learning.snapshot_every_batches,
+        neural_batch_snapshot_selection_mode.label(),
     );
     println!(
         "adversarial_embedding enabled={} memory_limit={} preloaded_windows={}",
@@ -5502,6 +6783,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 starting_policy_version_id: episode_starting_policy_version_id,
                 starting_policy_generation: episode_starting_policy_generation,
                 initial_neural_network: episode_starting_neural_network.as_ref().map(Arc::clone),
+                analytic_neural_opponent,
                 adversarial_moment_windows: Arc::clone(&adversarial_moment_windows),
                 print_progress,
                 neural_drain_timeout,
@@ -5516,14 +6798,19 @@ fn run() -> Result<(), Box<dyn Error>> {
         completed_games.sort_by_key(|game| game.episode_summary.episode);
 
         let merge_deltas = completed_games.len() > 1;
-        if let Some(selection) = select_batch_neural_snapshot(&mut completed_games) {
+        if let Some(selection) = select_batch_neural_snapshot(
+            &mut completed_games,
+            neural_batch_snapshot_selection_mode,
+            analytic_neural_opponent,
+        ) {
             latest_neural_network = Some(selection.snapshot);
             if selection.snapshot_count > 1 {
                 println!(
-                    "neural_batch_snapshot_selected episodes={}..{} snapshots={} selected_episode={} selected_match_fitness={:.4} selected_training_steps={}",
+                    "neural_batch_snapshot_selected episodes={}..{} snapshots={} selection_mode={} selected_episode={} selected_match_fitness={:.4} selected_training_steps={}",
                     batch_start_episode + 1,
                     batch_start_episode + batch_size,
                     selection.snapshot_count,
+                    neural_batch_snapshot_selection_mode.label(),
                     selection.episode,
                     selection.match_fitness,
                     selection.training_steps
@@ -5558,10 +6845,12 @@ fn run() -> Result<(), Box<dyn Error>> {
                 );
                 let curriculum_stage_label = curriculum_stage.as_str();
                 let promotion_summary_refs = policy_promotion_summaries.iter().collect::<Vec<_>>();
-                let mut policy_promotion_evaluation = evaluate_soccer_policy_promotion_gate(
-                    promotion_summary_refs,
-                    policy_promotion_gate,
-                );
+                let mut policy_promotion_evaluation =
+                    evaluate_soccer_policy_promotion_gate_for_learning_objective(
+                        &promotion_summary_refs,
+                        policy_promotion_gate,
+                        analytic_neural_opponent,
+                    );
                 let mut policy_promotion_recalibrated_this_window = false;
                 // Incumbent recalibration (origin): when a resume trial has settled, freeze the
                 // current evaluation as the new incumbent baseline before comparing against it.
@@ -5774,6 +7063,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                             policy_promotion_local_best_backoff_factor,
                             policy_promotion_local_best_backoff_min_learning_rate,
                             policy_promotion_local_best_backoff_min_blend_lambda,
+                            policy_promotion_local_best_restore_max_mean_fitness_regression,
+                            policy_promotion_local_best_restore_max_play_quality_regression,
                         );
                     } else if policy_promotion_local_best_rollback {
                         restore_local_best_after_held_promotion(
@@ -5792,6 +7083,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                             policy_promotion_local_best_backoff_factor,
                             policy_promotion_local_best_backoff_min_learning_rate,
                             policy_promotion_local_best_backoff_min_blend_lambda,
+                            policy_promotion_local_best_restore_max_mean_fitness_regression,
+                            policy_promotion_local_best_restore_max_play_quality_regression,
                         );
                     }
                     policy_promotion_summaries.clear();
@@ -5865,6 +7158,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                                     policy_promotion_evaluation_regresses_from_local_best(
                                         &policy_promotion_evaluation,
                                         best,
+                                        policy_promotion_local_best_restore_max_mean_fitness_regression,
+                                        policy_promotion_local_best_restore_max_play_quality_regression,
                                     )
                                 })
                                 .cloned();
@@ -6130,12 +7425,16 @@ fn run() -> Result<(), Box<dyn Error>> {
                 .seed
                 .wrapping_add(completed_after_batch as u64)
                 .wrapping_add((shard_index as u64) << 32);
-            let mut policy_promotion_evaluation = evaluate_soccer_policy_promotion_gate(
-                evolution_search_samples
-                    .iter()
-                    .map(|sample| &sample.summary),
-                policy_promotion_gate,
-            );
+            let evolution_promotion_summary_refs = evolution_search_samples
+                .iter()
+                .map(|sample| &sample.summary)
+                .collect::<Vec<_>>();
+            let mut policy_promotion_evaluation =
+                evaluate_soccer_policy_promotion_gate_for_learning_objective(
+                    &evolution_promotion_summary_refs,
+                    policy_promotion_gate,
+                    analytic_neural_opponent,
+                );
             apply_policy_promotion_incumbent_gate(
                 &mut policy_promotion_evaluation,
                 pg_base_policy_promotion_baseline,
@@ -6545,7 +7844,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         if should_checkpoint {
             let checkpoint_summary_refs = policy_promotion_summaries.iter().collect::<Vec<_>>();
             let checkpoint_promotion_evaluation =
-                evaluate_soccer_policy_promotion_gate(checkpoint_summary_refs, policy_promotion_gate);
+                evaluate_soccer_policy_promotion_gate_for_learning_objective(
+                    &checkpoint_summary_refs,
+                    policy_promotion_gate,
+                    analytic_neural_opponent,
+                );
             let publish_live_checkpoint = should_publish_live_checkpoint(
                 checkpoint_artifact_best_only,
                 &checkpoint_promotion_evaluation,
@@ -6600,6 +7903,17 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
             if checkpoint_artifact_best_only {
                 if publish_live_checkpoint {
+                    if let Some(metadata_path) = write_local_policy_promotion_best(
+                        &checkpoint_artifact_path,
+                        episode_summaries.len(),
+                        &checkpoint_promotion_evaluation,
+                    )? {
+                        println!(
+                            "checkpoint_local_best_metadata_written games_completed={} artifact={}",
+                            episode_summaries.len(),
+                            metadata_path.display()
+                        );
+                    }
                     local_neural_promotion_trial_best = Some(LocalNeuralPromotionTrialBest {
                         completed_games: episode_summaries.len(),
                         evaluation: checkpoint_promotion_evaluation.clone(),
@@ -6636,6 +7950,27 @@ fn run() -> Result<(), Box<dyn Error>> {
                         checkpoint_write_path.display(),
                         checkpoint_artifact_path.display()
                     );
+                    if policy_promotion_local_best_rollback {
+                        restore_local_best_after_held_promotion(
+                            "checkpoint-local-best-held",
+                            episode_summaries.len(),
+                            &checkpoint_promotion_evaluation,
+                            &mut local_neural_promotion_trial_best,
+                            &mut config,
+                            &mut tactical_learning,
+                            &mut policies,
+                            &mut latest_neural_network,
+                            &mut latest_policy_arc_cache,
+                            &mut latest_neural_network_arc_cache,
+                            &mut local_tactical_evolved_since_pg_refresh,
+                            policy_promotion_local_best_backoff,
+                            policy_promotion_local_best_backoff_factor,
+                            policy_promotion_local_best_backoff_min_learning_rate,
+                            policy_promotion_local_best_backoff_min_blend_lambda,
+                            policy_promotion_local_best_restore_max_mean_fitness_regression,
+                            policy_promotion_local_best_restore_max_play_quality_regression,
+                        );
+                    }
                 }
             }
             let checkpoint_manifest = run_manifest(
@@ -6687,6 +8022,18 @@ fn run() -> Result<(), Box<dyn Error>> {
                 checkpoint_write_path.display(),
                 manifest_path.display()
             );
+            let _ = std::io::stdout().flush();
+        }
+        let neural_population_accepted = maybe_run_neural_population_search(
+            completed_after_batch,
+            &config,
+            neural_population_search_config,
+            local_neural_promotion_trial_best.as_ref(),
+            anchor_neural_network.as_ref(),
+            &mut latest_neural_network,
+            &mut latest_neural_network_arc_cache,
+        )?;
+        if neural_population_accepted {
             let _ = std::io::stdout().flush();
         }
     }
@@ -6895,17 +8242,228 @@ mod tests {
     }
 
     #[test]
-    fn candidate_checkpoint_path_preserves_live_artifact_name() {
+    fn local_policy_promotion_best_path_matches_live_policy_contract() {
         assert_eq!(
-            candidate_checkpoint_path(Path::new(
+            local_policy_promotion_best_path_for_policy_artifact(Path::new(
                 "/tmp/soccer-live/team-policy.json"
             )),
+            PathBuf::from("/tmp/soccer-live/team-policy.local-best.json")
+        );
+        assert_eq!(
+            local_policy_promotion_best_path_for_policy_artifact(Path::new("team-policy.json")),
+            PathBuf::from("team-policy.local-best.json")
+        );
+    }
+
+    #[test]
+    fn candidate_checkpoint_path_preserves_live_artifact_name() {
+        assert_eq!(
+            candidate_checkpoint_path(Path::new("/tmp/soccer-live/team-policy.json")),
             PathBuf::from("/tmp/soccer-live/team-policy.candidate.json")
         );
         assert_eq!(
             candidate_checkpoint_path(Path::new("learned-params.json")),
             PathBuf::from("learned-params.candidate.json")
         );
+    }
+
+    fn neural_population_test_config() -> NeuralPopulationSearchConfig {
+        NeuralPopulationSearchConfig {
+            enabled: true,
+            interval_games: 1,
+            population_size: 4,
+            eval_games: 2,
+            eval_minutes: 0.1,
+            mutation_rate: 1.0,
+            mutation_scale: 0.35,
+            crossover_rate: 1.0,
+            min_fitness_delta: 0.0,
+            seed: 99,
+        }
+    }
+
+    fn neural_population_layer(base: f64) -> SoccerNeuralLayerSnapshot {
+        SoccerNeuralLayerSnapshot {
+            activation: "linear".to_string(),
+            weights: vec![vec![base, base + 0.25], vec![base + 0.5, base + 0.75]],
+            biases: vec![base + 1.0, base + 1.25],
+        }
+    }
+
+    fn neural_population_network(base: f64) -> SoccerNeuralNetworkSnapshot {
+        let mut snapshot = SoccerNeuralNetworkSnapshot {
+            input_dim: 2,
+            output_dim: 2,
+            layers: vec![neural_population_layer(base)],
+            ..SoccerNeuralNetworkSnapshot::default()
+        };
+        refresh_neural_snapshot_norm_recursive(&mut snapshot, 0);
+        snapshot
+    }
+
+    fn neural_population_full_snapshot(base: f64) -> SoccerNeuralNetworkSnapshot {
+        let mut snapshot = neural_population_network(base);
+        snapshot.policy_head = Some(Box::new(SoccerPolicyHeadSnapshot {
+            network: neural_population_network(base + 10.0),
+            training_steps: 17,
+            average_loss: Some(0.125),
+            specialist_heads: vec![SoccerPolicySpecialistHeadSnapshot {
+                kind: "shoot".to_string(),
+                network: neural_population_network(base + 20.0),
+                training_steps: 7,
+                average_loss: Some(0.25),
+            }],
+            role_heads: vec![SoccerPolicyRoleHeadSnapshot {
+                role: "winger".to_string(),
+                network: neural_population_network(base + 30.0),
+                training_steps: 11,
+                average_loss: Some(0.5),
+                specialist_heads: vec![SoccerPolicySpecialistHeadSnapshot {
+                    kind: "pass".to_string(),
+                    network: neural_population_network(base + 40.0),
+                    training_steps: 5,
+                    average_loss: Some(0.75),
+                }],
+            }],
+        }));
+        snapshot.line_depth_head = Some(Box::new(SoccerAuxiliaryHeadSnapshot {
+            network: neural_population_network(base + 50.0),
+            training_steps: 13,
+            average_loss: Some(0.0625),
+        }));
+        refresh_neural_snapshot_norm_recursive(&mut snapshot, 0);
+        snapshot
+    }
+
+    fn neural_population_first_weight(snapshot: &SoccerNeuralNetworkSnapshot) -> f64 {
+        snapshot.layers[0].weights[0][0]
+    }
+
+    fn collect_neural_population_values(
+        snapshot: &SoccerNeuralNetworkSnapshot,
+        values: &mut Vec<f64>,
+    ) {
+        for layer in &snapshot.layers {
+            for row in &layer.weights {
+                values.extend(row.iter().copied());
+            }
+            values.extend(layer.biases.iter().copied());
+        }
+        if let Some(policy_head) = snapshot.policy_head.as_ref() {
+            collect_neural_population_values(&policy_head.network, values);
+            for specialist in &policy_head.specialist_heads {
+                collect_neural_population_values(&specialist.network, values);
+            }
+            for role_head in &policy_head.role_heads {
+                collect_neural_population_values(&role_head.network, values);
+                for specialist in &role_head.specialist_heads {
+                    collect_neural_population_values(&specialist.network, values);
+                }
+            }
+        }
+        if let Some(line_depth_head) = snapshot.line_depth_head.as_ref() {
+            collect_neural_population_values(&line_depth_head.network, values);
+        }
+    }
+
+    #[test]
+    fn neural_population_mutation_reaches_actor_role_specialist_and_line_heads() {
+        let original = neural_population_full_snapshot(1.0);
+        let mut rng = NeuralPopulationRng::new(1234);
+        let mutated = mutate_neural_snapshot_recursive(
+            original.clone(),
+            &mut rng,
+            neural_population_test_config(),
+            0,
+        );
+
+        assert_ne!(
+            neural_population_first_weight(&original),
+            neural_population_first_weight(&mutated)
+        );
+        assert_ne!(
+            neural_population_first_weight(&original.policy_head.as_ref().unwrap().network),
+            neural_population_first_weight(&mutated.policy_head.as_ref().unwrap().network)
+        );
+        assert_ne!(
+            neural_population_first_weight(
+                &original.policy_head.as_ref().unwrap().role_heads[0].network
+            ),
+            neural_population_first_weight(
+                &mutated.policy_head.as_ref().unwrap().role_heads[0].network
+            )
+        );
+        assert_ne!(
+            neural_population_first_weight(
+                &original.policy_head.as_ref().unwrap().role_heads[0].specialist_heads[0].network
+            ),
+            neural_population_first_weight(
+                &mutated.policy_head.as_ref().unwrap().role_heads[0].specialist_heads[0].network
+            )
+        );
+        assert_ne!(
+            neural_population_first_weight(&original.line_depth_head.as_ref().unwrap().network),
+            neural_population_first_weight(&mutated.line_depth_head.as_ref().unwrap().network)
+        );
+        assert!(mutated.l2_norm.is_finite());
+        assert_eq!(mutated.parameter_count, 6);
+    }
+
+    #[test]
+    fn neural_population_crossover_preserves_recursive_heads() {
+        let a = neural_population_full_snapshot(1.0);
+        let b = neural_population_full_snapshot(100.0);
+        let mut saw_b_value = false;
+        for seed in 0..16 {
+            let mut rng = NeuralPopulationRng::new(seed);
+            let child = crossover_neural_snapshot_recursive(&a, &b, &mut rng, 0);
+            assert_eq!(child.layers.len(), a.layers.len());
+            assert_eq!(
+                child.policy_head.as_ref().unwrap().role_heads.len(),
+                a.policy_head.as_ref().unwrap().role_heads.len()
+            );
+            assert!(child.line_depth_head.is_some());
+            let mut child_values = Vec::new();
+            let mut b_values = Vec::new();
+            collect_neural_population_values(&child, &mut child_values);
+            collect_neural_population_values(&b, &mut b_values);
+            assert!(child_values.iter().all(|value| value.is_finite()));
+            saw_b_value |= child_values
+                .iter()
+                .any(|value| b_values.iter().any(|b_value| value == b_value));
+        }
+        assert!(saw_b_value);
+    }
+
+    #[test]
+    fn neural_population_candidates_keep_incumbent_as_baseline() {
+        let incumbent = neural_population_full_snapshot(1.0);
+        let anchor = neural_population_full_snapshot(3.0);
+        let candidates = build_neural_population_candidates(
+            &incumbent,
+            None,
+            Some(&anchor),
+            neural_population_test_config(),
+            6,
+        );
+
+        assert_eq!(
+            candidates.len(),
+            neural_population_test_config().population_size
+        );
+        assert_eq!(candidates[0].index, 0);
+        assert_eq!(candidates[0].source, "incumbent");
+        assert_eq!(
+            soccer_neural_network_snapshot_fingerprint(&candidates[0].snapshot),
+            soccer_neural_network_snapshot_fingerprint(&incumbent)
+        );
+        assert!(candidates.iter().skip(1).any(
+            |candidate| soccer_neural_network_snapshot_fingerprint(&candidate.snapshot)
+                != soccer_neural_network_snapshot_fingerprint(&incumbent)
+        ));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.source.starts_with("crossover:incumbent+anchor:")));
     }
 
     fn promotion_eval(
@@ -6962,11 +8520,31 @@ mod tests {
         ));
         assert!(policy_promotion_evaluation_regresses_from_local_best(
             &promotion_eval(0.68, 0.90),
-            &best
+            &best,
+            0.0,
+            0.0
+        ));
+        assert!(!policy_promotion_evaluation_regresses_from_local_best(
+            &promotion_eval(0.68, 0.90),
+            &best,
+            0.03,
+            0.0
         ));
         assert!(policy_promotion_evaluation_beats_local_best(
             &promotion_eval(0.70, 0.43),
             &best
+        ));
+        assert!(policy_promotion_evaluation_regresses_from_local_best(
+            &promotion_eval(0.70, 0.41),
+            &best,
+            0.0,
+            0.0
+        ));
+        assert!(!policy_promotion_evaluation_regresses_from_local_best(
+            &promotion_eval(0.70, 0.41),
+            &best,
+            0.0,
+            0.02
         ));
     }
 
@@ -6992,6 +8570,12 @@ mod tests {
             Some(&best),
             true
         ));
+        assert!(!should_publish_live_checkpoint(
+            true,
+            &eligible_promotion_eval(0.70, 0.41),
+            Some(&best),
+            true
+        ));
         assert!(should_publish_live_checkpoint(
             true,
             &eligible_promotion_eval(0.72, 0.30),
@@ -7007,11 +8591,106 @@ mod tests {
     }
 
     #[test]
+    fn local_policy_promotion_best_metadata_blocks_restart_regression() {
+        let metadata = LocalPolicyPromotionBestMetadata {
+            completed_games: 6,
+            sample_games: 6,
+            mean_match_fitness: 1.3124,
+            best_match_fitness: 2.8707,
+            mean_play_quality: 0.3702,
+        };
+        let baseline = policy_promotion_incumbent_baseline_from_local_best_metadata(&metadata)
+            .expect("valid local-best metadata");
+        let best = local_neural_trial_best_for_test(
+            metadata.completed_games,
+            baseline.mean_match_fitness,
+            baseline.mean_play_quality,
+        );
+
+        assert!(!should_publish_live_checkpoint(
+            true,
+            &eligible_promotion_eval(0.8307, 0.3118),
+            Some(&best),
+            true
+        ));
+        assert!(should_publish_live_checkpoint(
+            true,
+            &eligible_promotion_eval(1.3300, 0.3000),
+            Some(&best),
+            true
+        ));
+    }
+
+    #[test]
     fn batch_neural_snapshot_selection_prefers_fitness_then_later_episode() {
-        assert!(batch_neural_snapshot_candidate_better(1.2, 8, 1.1, 9));
-        assert!(!batch_neural_snapshot_candidate_better(1.0, 12, 1.1, 9));
-        assert!(batch_neural_snapshot_candidate_better(1.1, 12, 1.1, 9));
-        assert!(!batch_neural_snapshot_candidate_better(1.1, 8, 1.1, 9));
+        assert!(batch_neural_snapshot_candidate_better(
+            BatchNeuralSnapshotSelectionMode::Fitness,
+            1.2,
+            8,
+            100,
+            1.1,
+            9,
+            200,
+        ));
+        assert!(!batch_neural_snapshot_candidate_better(
+            BatchNeuralSnapshotSelectionMode::Fitness,
+            1.0,
+            12,
+            400,
+            1.1,
+            9,
+            100,
+        ));
+        assert!(batch_neural_snapshot_candidate_better(
+            BatchNeuralSnapshotSelectionMode::Fitness,
+            1.1,
+            12,
+            100,
+            1.1,
+            9,
+            200,
+        ));
+        assert!(!batch_neural_snapshot_candidate_better(
+            BatchNeuralSnapshotSelectionMode::Fitness,
+            1.1,
+            8,
+            400,
+            1.1,
+            9,
+            100,
+        ));
+        assert!(batch_neural_snapshot_candidate_better(
+            BatchNeuralSnapshotSelectionMode::TrainingSteps,
+            1.0,
+            8,
+            400,
+            1.5,
+            9,
+            300,
+        ));
+        assert!(!batch_neural_snapshot_candidate_better(
+            BatchNeuralSnapshotSelectionMode::TrainingSteps,
+            1.5,
+            12,
+            300,
+            1.0,
+            9,
+            400,
+        ));
+    }
+
+    #[test]
+    fn analytic_opponent_objective_scores_home_neural_not_match_winner() {
+        let summary = soccer_engine::des::general::soccer::MatchSummary {
+            score_home: 3,
+            score_away: 12,
+            ticks: 10,
+            simulated_seconds: 1.0,
+            stats: Default::default(),
+        };
+
+        assert!(soccer_learning_objective_match_fitness(&summary, false) > 1.0);
+        assert!(soccer_learning_objective_match_fitness(&summary, true) < 0.0);
     }
 
     #[test]
@@ -8215,6 +9894,7 @@ mod tests {
             starting_policy_version_id: Some("pg-v11".to_string()),
             starting_policy_generation: 11,
             initial_neural_network: episode_starting_neural_network.as_ref().map(Arc::clone),
+            analytic_neural_opponent: true,
             adversarial_moment_windows: Arc::new(Vec::new()),
             print_progress: false,
             neural_drain_timeout: Duration::from_millis(0),

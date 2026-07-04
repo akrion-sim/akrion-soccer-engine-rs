@@ -14,8 +14,7 @@ use soccer_engine::des::general::soccer::{
     SoccerTeamQPolicies, Team, Vec2, DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
 };
 use soccer_engine::des::soccer_learning::{
-    soccer_neural_network_snapshot_fingerprint,
-    soccer_policy_active_max_fitness_regression,
+    soccer_neural_network_snapshot_fingerprint, soccer_policy_active_max_fitness_regression,
     soccer_policy_version_insert_status_after_active_head, soccer_postgres_policy_refresh_decision,
     soccer_tactical_learning_weights_fingerprint, soccer_team_q_policies_fingerprint,
     validate_soccer_neural_learning_config_for_learning_run,
