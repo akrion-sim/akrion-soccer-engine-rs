@@ -46,12 +46,8 @@ uses, and it halves the state space the net must cover.
 | 8 | **Existing determinants (retained)** | `heuristic_centre_fwd_from_own_goal` — where the engine's *current* heuristic already puts the line centre (it folds in the directive line target, the ball blend, the role bias, the press focus, and the legal band). The model learns **relative to** this, so the well-tuned existing line is never thrown away — only refined. |
 | 9 | **Full field kinematic vector** | own 11, opponent 11, then ball; each slot carries forward position, lateral position, forward velocity, lateral velocity, forward acceleration, and lateral acceleration in the same defending frame. This gives the MDP/POMDP line decision the 22-player-plus-ball vector rather than only the aggregate centroids. |
 
-<<<<<<< HEAD
-`BACK_FOUR_LINE_FEATURE_DIM = 27`. The exact ordering is the single source of
-=======
 `BACK_FOUR_LINE_FEATURE_DIM = 169` (`27` aggregate/retained features + `4`
 line-health features + `23 × 6` full-field kinematic features). The exact ordering is the single source of
->>>>>>> 86f8a0f0133d65ee2f9e538bc51357891b34640e
 truth in `back_four_line.rs::BackFourLineInputs::to_features`.
 
 ### Retaining existing determinants (group 8)
@@ -137,11 +133,7 @@ line when we press, trap, or control). That seed is the **fallback and the
 bootstrap target**. The path to "solve it optimally":
 
 1. **Head.** `BackFourLineHead` is a `FeedForwardNetwork` regression head
-<<<<<<< HEAD
-   (27 → hidden → 1, sigmoid), mirroring `SoccerPassCompletionHead` /
-=======
    (169 → hidden → 1, sigmoid), mirroring `SoccerPassCompletionHead` /
->>>>>>> 86f8a0f0133d65ee2f9e538bc51357891b34640e
    `SoccerPolicyHead`: live net is not serde, it round-trips through the existing
    `SoccerNeuralNetworkSnapshot` auxiliary-head path. Construction + `predict` +
    `train`, snapshot round-trip, learner carry, and gated runtime consumption are
@@ -188,11 +180,7 @@ output mapping differ.
 
 ## What's the same
 
-<<<<<<< HEAD
-- The **same 27-d feature vector**, in the same attacking frame — now describing
-=======
 - The **same 169-d feature vector**, in the same attacking frame — now describing
->>>>>>> 86f8a0f0133d65ee2f9e538bc51357891b34640e
   the *midfield* line's own kinematics in the `line_*` slots (the builder is called
   with `PlayerRole::Midfielder`).
 - The **same analytic-seed → head** path; `analytic_midfield_gap_fraction` is the

@@ -33,9 +33,10 @@ const SOCCER_NEURAL_MCTS_MAX_SIMULATIONS: usize = 32;
 const SOCCER_NEURAL_MCTS_MAX_CANDIDATES: usize = 8;
 const SOCCER_NEURAL_MCTS_MAX_DEPTH: usize = 3;
 const SOCCER_NEURAL_MCTS_MAX_EXPLORATION: f64 = 4.0;
-const SOCCER_MATCH_FITNESS_WINNER_WEIGHT: f64 = 0.72;
-const SOCCER_MATCH_FITNESS_QUALITY_WEIGHT: f64 = 0.28;
-const SOCCER_MATCH_FITNESS_DECISIVE_MARGIN_WEIGHT: f64 = 0.06;
+const SOCCER_MATCH_FITNESS_WINNER_WEIGHT: f64 = 0.55;
+const SOCCER_MATCH_FITNESS_QUALITY_WEIGHT: f64 = 1.25;
+const SOCCER_MATCH_FITNESS_DECISIVE_MARGIN_WEIGHT: f64 = 0.03;
+const SOCCER_MATCH_FITNESS_TURNOVER_RISK_WEIGHT: f64 = 1.50;
 const SOCCER_MATCH_FITNESS_MAX_DECISIVE_MARGIN: f64 = 6.0;
 const SOCCER_MATCH_FITNESS_MIN: f64 = -8.0;
 const SOCCER_MATCH_FITNESS_MAX: f64 = 12.0;
@@ -1827,15 +1828,20 @@ pub fn soccer_learning_run_score(summary: &MatchSummary) -> SoccerLearningRunSco
     // of generations. Both this branch and origin fixed it convergently; we keep origin's
     // principled structure — the WINNER's (non-cancelling) goal-diff fitness, plus a
     // normalised both-teams play-quality term (now enriched with the proxies for "more goals":
-    // assists, completed crosses, consecutive forward passes — see
-    // `soccer_learning_team_play_quality`), plus a decisive-margin bonus, all bounded.
+    // goals, shots on target, assists, completed crosses, worked chances, and forward
+    // progression), minus the pass-risk behaviours that were making newer neural checkpoints
+    // look acceptable while recycling backward into pressure. This is intentionally a neural
+    // promotion score now: a win still matters, but dense action quality has enough weight to
+    // guide local-best rollback and checkpoint selection between noisy short self-play games.
     let winner_fitness = home.fitness.max(away.fitness);
     let play_quality = soccer_learning_match_play_quality(summary);
+    let turnover_risk = soccer_learning_match_turnover_risk(summary);
     let decisive_margin = (summary.score_home as i32 - summary.score_away as i32).abs() as f64;
     let match_fitness = (winner_fitness * SOCCER_MATCH_FITNESS_WINNER_WEIGHT
         + play_quality * SOCCER_MATCH_FITNESS_QUALITY_WEIGHT
         + decisive_margin.min(SOCCER_MATCH_FITNESS_MAX_DECISIVE_MARGIN)
-            * SOCCER_MATCH_FITNESS_DECISIVE_MARGIN_WEIGHT)
+            * SOCCER_MATCH_FITNESS_DECISIVE_MARGIN_WEIGHT
+        - turnover_risk * SOCCER_MATCH_FITNESS_TURNOVER_RISK_WEIGHT)
         .clamp(SOCCER_MATCH_FITNESS_MIN, SOCCER_MATCH_FITNESS_MAX);
     SoccerLearningRunScore {
         home,
@@ -1884,9 +1890,33 @@ pub fn soccer_learning_team_score(
 }
 
 fn soccer_learning_match_play_quality(summary: &MatchSummary) -> f64 {
-    (soccer_learning_team_play_quality(Team::Home, summary)
+    let raw = (soccer_learning_team_play_quality(Team::Home, summary)
         + soccer_learning_team_play_quality(Team::Away, summary))
-        * 0.5
+        * 0.5;
+    (raw - soccer_learning_match_turnover_risk(summary) * 0.35).clamp(0.0, 1.0)
+}
+
+fn soccer_learning_match_turnover_risk(summary: &MatchSummary) -> f64 {
+    let stats = &summary.stats;
+    let backward_completed = stats
+        .passes_completed_backward_home
+        .saturating_add(stats.passes_completed_backward_away);
+    let chain_losses = stats
+        .pass_chains_net_loss_home
+        .saturating_add(stats.pass_chains_net_loss_away);
+
+    let backward_recycling_risk = soccer_learning_bounded_count(backward_completed, 32.0) * 0.18;
+    let own_half_interception_risk =
+        soccer_learning_bounded_count(stats.pass_interceptions_own_half, 6.0) * 0.38;
+    let opp_half_interception_risk =
+        soccer_learning_bounded_count(stats.pass_interceptions_opp_half, 8.0) * 0.16;
+    let chain_loss_risk = soccer_learning_bounded_count(chain_losses, 10.0) * 0.20;
+
+    (backward_recycling_risk
+        + own_half_interception_risk
+        + opp_half_interception_risk
+        + chain_loss_risk)
+        .clamp(0.0, 1.0)
 }
 
 fn soccer_learning_team_play_quality(team: Team, summary: &MatchSummary) -> f64 {
@@ -1895,6 +1925,7 @@ fn soccer_learning_team_play_quality(team: Team, summary: &MatchSummary) -> f64 
         pass_attempts,
         pass_completed,
         forward_completed,
+        backward_completed,
         shots,
         shots_on_target,
         dribble_beats,
@@ -1911,6 +1942,7 @@ fn soccer_learning_team_play_quality(team: Team, summary: &MatchSummary) -> f64 
             stats.passes_attempted_home,
             stats.passes_completed_home,
             stats.passes_completed_forward_home,
+            stats.passes_completed_backward_home,
             stats.shots_home,
             stats.shots_on_target_home,
             stats.dribble_beats_home,
@@ -1927,6 +1959,7 @@ fn soccer_learning_team_play_quality(team: Team, summary: &MatchSummary) -> f64 
             stats.passes_attempted_away,
             stats.passes_completed_away,
             stats.passes_completed_forward_away,
+            stats.passes_completed_backward_away,
             stats.shots_away,
             stats.shots_on_target_away,
             stats.dribble_beats_away,
@@ -1963,23 +1996,25 @@ fn soccer_learning_team_play_quality(team: Team, summary: &MatchSummary) -> f64 
     let chain_forward = soccer_learning_bounded_metric(chain_forward_yards, 120.0);
     let chain_backward_penalty = soccer_learning_bounded_count(chains_net_loss, 10.0);
     let chain_progress_quality = (chain_forward - chain_backward_penalty * 0.5).clamp(0.0, 1.0);
+    let backward_completion_penalty = soccer_learning_bounded_count(backward_completed, 18.0);
     let productive_completion =
         pass_completion * (0.30 + forward_share * 0.50 + chain_progress_quality * 0.20);
 
-    (pass_volume * 0.01
-        + productive_completion * 0.10
-        + forward_share * 0.08
-        + goal_quality * 0.20
-        + shot_volume * 0.12
-        + shot_accuracy * 0.18
+    (pass_volume * 0.005
+        + productive_completion * 0.07
+        + forward_share * 0.06
+        + goal_quality * 0.30
+        + shot_volume * 0.15
+        + shot_accuracy * 0.22
         + dribble_quality * 0.04
         + recovery_quality * 0.04
         + upfield_quality * 0.07
-        + near_ball_quality * 0.03
-        + assist_quality * 0.08
+        + near_ball_quality * 0.02
+        + assist_quality * 0.10
         + cross_quality * 0.03
-        + worked_chance_quality * 0.08
-        + chain_progress_quality * 0.03)
+        + worked_chance_quality * 0.12
+        + chain_progress_quality * 0.02
+        - backward_completion_penalty * 0.10)
         .clamp(0.0, 1.0)
 }
 
@@ -8594,6 +8629,7 @@ mod tests {
         backward_stats.passes_attempted_home = 60;
         backward_stats.passes_completed_home = 54;
         backward_stats.passes_completed_forward_home = 0;
+        backward_stats.passes_completed_backward_home = 54;
         backward_stats.pass_chains_net_loss_home = 8;
         backward_stats.pass_chain_gain_yards_home = -42.0;
         let backward = MatchSummary {
@@ -8607,6 +8643,58 @@ mod tests {
         assert!(
             backward_quality < sterile_quality,
             "net-backward pass farming should be worse than sterile forward possession: backward={backward_quality}, sterile={sterile_quality}"
+        );
+    }
+
+    #[test]
+    fn match_fitness_penalizes_backward_recycling_and_own_half_interceptions() {
+        let mut clean_stats = MatchStats::default();
+        clean_stats.passes_attempted_home = 30;
+        clean_stats.passes_attempted_away = 30;
+        clean_stats.passes_completed_home = 20;
+        clean_stats.passes_completed_away = 20;
+        clean_stats.passes_completed_forward_home = 12;
+        clean_stats.passes_completed_forward_away = 12;
+        clean_stats.shots_home = 5;
+        clean_stats.shots_away = 5;
+        clean_stats.shots_on_target_home = 3;
+        clean_stats.shots_on_target_away = 3;
+        clean_stats.shots_after_pass_home = 2;
+        clean_stats.shots_after_pass_away = 2;
+        let clean = MatchSummary {
+            score_home: 1,
+            score_away: 1,
+            ticks: 100,
+            simulated_seconds: 90.0,
+            stats: clean_stats,
+        };
+
+        let mut risky_stats = clean.stats.clone();
+        risky_stats.passes_completed_backward_home = 32;
+        risky_stats.passes_completed_backward_away = 32;
+        risky_stats.pass_interceptions_own_half = 6;
+        risky_stats.pass_interceptions_opp_half = 4;
+        risky_stats.pass_chains_net_loss_home = 6;
+        risky_stats.pass_chains_net_loss_away = 6;
+        risky_stats.pass_chain_gain_yards_home = -24.0;
+        risky_stats.pass_chain_gain_yards_away = -24.0;
+        let risky = MatchSummary {
+            stats: risky_stats,
+            ..clean.clone()
+        };
+
+        let clean_quality = soccer_learning_match_play_quality(&clean);
+        let risky_quality = soccer_learning_match_play_quality(&risky);
+        assert!(
+            clean_quality > risky_quality + 0.20,
+            "own-half interceptions and backward recycling must lower play quality: clean={clean_quality}, risky={risky_quality}"
+        );
+
+        let clean_fitness = soccer_learning_run_score(&clean).match_fitness;
+        let risky_fitness = soccer_learning_run_score(&risky).match_fitness;
+        assert!(
+            clean_fitness > risky_fitness + 0.80,
+            "same scoreline must prefer the safer, more progressive policy: clean={clean_fitness}, risky={risky_fitness}"
         );
     }
 }

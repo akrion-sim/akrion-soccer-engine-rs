@@ -669,7 +669,11 @@ const CARRIER_CHANNEL_PRESS_START_YARDS: f64 = 40.0;
 const CARRIER_CHANNEL_PRESS_FULL_YARDS: f64 = 15.0;
 const CARRIER_CHANNEL_JOCKEY_YARDS: f64 = 2.2;
 const CARRIER_CHANNEL_SIDE_BLOCK_YARDS: f64 = 1.6;
-const CARRIER_CHANNEL_STEPUP_FRACTION: f64 = 0.62;
+// Raised 0.62→0.85: the back four (CBs + full-backs) were backing off too much as an opponent
+// dribbled 40→20yd from goal, only engaging near the 15. Step the pressing defender up MUCH
+// closer through the whole channel window so the carrier is contested in the danger zone rather
+// than escorted to the edge of the box. (Pairs with the box-scaled steal reward that trains it.)
+const CARRIER_CHANNEL_STEPUP_FRACTION: f64 = 0.85;
 const CARRIER_CHANNEL_DOUBLE_TEAM_PRESS_MIN: f64 = 0.40;
 const CARRIER_CHANNEL_WIDE_TRAP_FRACTION: f64 = 0.42;
 /// Depth-scaled pressing aggression in our own defensive third. The closer an
@@ -682,7 +686,7 @@ const CARRIER_CHANNEL_WIDE_TRAP_FRACTION: f64 = 0.42;
 /// byte-identical to the contain baseline.
 const OWN_GOAL_PRESS_FULL_YARDS: f64 = 6.0; // at/inside this depth from our goal ⇒ full urgency.
 const OWN_GOAL_PRESS_SPEED_RELAX: f64 = 0.9; // deep ⇒ relax the engage speed threshold by up to 90%.
-const OWN_GOAL_PRESS_MIN_BOOST: f64 = 0.15; // deep lone defender crosses the 1.0 step-up trigger even vs a slow dribble.
+const OWN_GOAL_PRESS_MIN_BOOST: f64 = 0.35; // raised 0.15→0.35: lone defender steps up to press an advancing carrier well before the 6-yard box, not only deep.
                                             // --- Defensive shepherding / "show one way" (gated, default OFF = byte-identical) ---
                                             // Real defending of a 1v1 as the carrier drives from ~40 to ~15yd out is not a square
                                             // retreat: the pressing defender approaches on a CURVED angle so their body sits on the
@@ -1229,14 +1233,21 @@ const SHOT_OFF_TARGET_REWARD_POINTS: f64 = 12.0;
 const SHOT_OFF_TARGET_FORGIVENESS_YARDS: f64 = 0.5;
 const SHOT_OFF_TARGET_PENALTY_PER_YARD: f64 = 0.8;
 const SHOT_OFF_TARGET_MAX_PENALTY_POINTS: f64 = 5.0;
-const COMPLETED_FORWARD_PASS_BASE_REWARD_OWN_HALF: f64 = 4.5;
-const COMPLETED_FORWARD_PASS_BASE_REWARD_OPPONENT_HALF: f64 = 5.5;
-const COMPLETED_FORWARD_PASS_PROGRESS_REWARD_PER_YARD: f64 = 0.08;
-const COMPLETED_FORWARD_PASS_PROGRESS_REWARD_MAX_YARDS: f64 = 20.0;
+// Base reward for a completed forward pass. Deliberately kept WELL BELOW the shot-on-target
+// (40) and goal (100) rewards so that a string of successive forward passes can never out-earn
+// shooting/scoring — otherwise "pass in succession forever" becomes the optimal POMDP policy.
+// A ~5-pass forward sequence now tops out ~30 pts < shot 40 < goal 100. Passes that actually
+// LEAD to a shot/goal are still credited richly via GOAL_CHAIN_REWARD_PATTERN / the shot pattern.
+const COMPLETED_FORWARD_PASS_BASE_REWARD_OWN_HALF: f64 = 3.0;
+const COMPLETED_FORWARD_PASS_BASE_REWARD_OPPONENT_HALF: f64 = 4.0;
+const COMPLETED_FORWARD_PASS_PROGRESS_REWARD_PER_YARD: f64 = 0.24;
+const COMPLETED_FORWARD_PASS_PROGRESS_REWARD_MAX_YARDS: f64 = 30.0;
 const COMPLETED_FLANK_PASS_BONUS_POINTS: f64 = 2.4;
 const COMPLETED_FLANK_PASS_OWN_HALF_MULTIPLIER: f64 = 1.55;
 const OWN_HALF_FLANK_TACTICAL_REWARD_MULTIPLIER: f64 = 1.35;
-const COMPLETED_FIRST_TIME_SHORT_FORWARD_PASS_BONUS_POINTS: f64 = 3.4;
+// Raised 3.4→7.0: a first-touch/quick forward pass is exactly the fast, progressive ball we want
+// the policy to prefer over holding or dribbling — reward it well above a plain completed pass (4).
+const COMPLETED_FIRST_TIME_SHORT_FORWARD_PASS_BONUS_POINTS: f64 = 7.0;
 const FIRST_TIME_SHORT_FORWARD_PASS_MIN_PROGRESS_YARDS: f64 = 1.25;
 const FIRST_TIME_SHORT_FORWARD_PASS_MIN_YARDS: f64 = 5.47;
 const FIRST_TIME_SHORT_FORWARD_PASS_IDEAL_MAX_YARDS: f64 = 8.75;
@@ -1804,6 +1815,12 @@ const DEFENSIVE_CLEAR_AND_HOLD_SECOND_SECONDS: f64 = 10.0;
 const DEFENSIVE_CLEAR_AND_HOLD_FIRST_REWARD_POINTS: f64 = 10.0;
 const DEFENSIVE_CLEAR_AND_HOLD_SECOND_REWARD_POINTS: f64 = 20.0;
 const DEFENSIVE_DISPOSSESSION_REWARD_POINTS: f64 = 10.0;
+// Winning the ball inside EITHER 18-yard box is worth much more than a midfield steal: in our
+// defensive box it snuffs a near-certain chance; in the attacking box the steal IS a chance. So
+// the dispossession / 50-50 / loose-ball reward is multiplied by this when the ball is won inside
+// a box — training defenders (and attackers) to attack the ball hard in both boxes rather than
+// stand off. (User rule: steal rewards higher in the 18yd box, both offense and defense.)
+const STEAL_IN_BOX_REWARD_MULTIPLIER: f64 = 2.5;
 // While the back line is defending, train it mostly on LP/IPM position quality.
 // Ball-winning stays positive, but no longer dominates the shape gradient.
 const DEFENSIVE_POSITIONING_FOCUS_CHASE_REWARD_MULTIPLIER: f64 = 0.42;
@@ -1834,8 +1851,8 @@ const LOST_POSSESSION_CHAIN_PENALTY_WEIGHTS: [f64; 3] = [0.55, 0.30, 0.15];
 const TURNOVER_CHAIN_BLAME_DISCOUNTS: [f64; 3] = [1.0, 0.20, 0.05];
 // Below this the discounted blame is dropped (negligible tail / sub-noise nudge).
 const TURNOVER_CHAIN_BLAME_MIN_POINTS: f64 = 0.05;
-const INTERCEPTED_PASS_BASE_PENALTY_MIN_POINTS: f64 = 4.0;
-const INTERCEPTED_PASS_BASE_PENALTY_MAX_POINTS: f64 = 13.0;
+const INTERCEPTED_PASS_BASE_PENALTY_MIN_POINTS: f64 = 6.0;
+const INTERCEPTED_PASS_BASE_PENALTY_MAX_POINTS: f64 = 20.0;
 const BACKWARD_INTERCEPTED_PASS_PENALTY_MULTIPLIER: f64 = 2.0;
 // Bad-pass turnover blame is not a normalized pool: the passer gets the full
 // chain penalty, then the prior two teammates get discounted echoes.
@@ -2048,8 +2065,10 @@ const SHOT_ON_TARGET_REWARD_PATTERN: [f64; 10] =
     [25.0, 18.0, 12.0, 8.0, 5.5, 4.0, 2.8, 2.0, 1.5, 1.2];
 const PASS_CHAIN_HISTORY_LIMIT: usize = 8;
 const PASS_CHAIN_MAX_CONTINUATION_SECONDS: f64 = 12.0;
-const PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS: f64 = 3.0;
-const PASS_CHAIN_THREE_NET_FORWARD_EVENT_REWARD_POINTS: f64 = 4.5;
+// Pass-chain event bonuses trimmed (7.5→2.5, 10→3.5) for the same reason as the forward-pass
+// base above: successive passing must stay a build-up MEANS, not an end that rivals a shot/goal.
+const PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS: f64 = 2.5;
+const PASS_CHAIN_THREE_NET_FORWARD_EVENT_REWARD_POINTS: f64 = 3.5;
 /// Penalty (points, applied negative) for an isolated attacking carrier panicking a
 /// backward/square ball instead of driving at goal or holding it up — see
 /// [`SoccerRewardEventKind::IsolatedCarrierPanicBackPass`]. Comparable in magnitude to one
@@ -2075,13 +2094,23 @@ const TEAM_ADVANCE_REWARD_REFERENCE_YARDS: f64 = 4.0;
 /// Dense shaping reward for the CARRIER driving the ball forward into space while the team advances
 /// as a unit — the "take the space" signal. Comparable in magnitude to the other in-possession
 /// spacing shaping terms so it nudges without swamping the sparse goal/possession signal.
-const TEAM_ADVANCE_CARRIER_DRIVE_REWARD: f64 = 0.30;
+// Raised 0.30→0.60 (carrier) / 0.22→0.45 (support run): advancing the ball/team upfield was
+// under-rewarded vs the large turnover/backward/hold penalties, leaving the policy timid. Doubling
+// the positive advancement terms restores brave forward play. These are per-agent rewards so they
+// also feed the MARL/MAPPO team component (team-avg reward delta) — the whole team shares the credit.
+const TEAM_ADVANCE_CARRIER_DRIVE_REWARD: f64 = 0.60;
 /// Dense shaping penalty for the carrier wasting the same team-advance cue by stalling or moving
 /// the ball backward. This is the stick paired with the carrier-drive carrot above.
 const TEAM_ADVANCE_CARRIER_STALL_PENALTY: f64 = 0.24;
 /// Dense shaping reward for an OFF-BALL teammate making a forward supporting run while the team
 /// advances upfield — the "whole team moves forward" signal that pulls runners up with the ball.
-const TEAM_ADVANCE_SUPPORT_RUN_REWARD: f64 = 0.22;
+const TEAM_ADVANCE_SUPPORT_RUN_REWARD: f64 = 0.45;
+// Quick-release: a forward pass moved on within this many seconds of receiving earns a bonus that
+// is largest for an instant (first-touch) release and decays to zero by the cap — trains fast
+// forward ball movement over holding/dribbling. Per-agent ⇒ also shared via the MARL/MAPPO team component.
+const QUICK_RELEASE_MAX_HOLD_SECONDS: f64 = 1.2;
+const QUICK_RELEASE_FORWARD_REFERENCE_YARDS: f64 = 12.0;
+const QUICK_RELEASE_FORWARD_PASS_BONUS_POINTS: f64 = 5.0;
 /// Dense shaping penalty for an attacker who fails to join a live team-advance cue, retreats, or
 /// runs into an offside support lane. This mirrors the support-run reward without forcing defenders
 /// to abandon shape.
@@ -22294,20 +22323,37 @@ fn progressive_pass_escape_reward(pass: &PendingPass, end: Vec2) -> f64 {
     amount.clamp(0.0, PROGRESSIVE_PASS_REWARD_CAP)
 }
 
+/// Reward a FORWARD pass released quickly after receiving — largest for a first-touch/instant ball,
+/// decaying to zero by `QUICK_RELEASE_MAX_HOLD_SECONDS`, and scaled a little by how far forward it
+/// progresses. Pushes fast forward ball movement over holding/dribbling. `hold_seconds` is how long
+/// the passer had possessed the ball. Pure / RNG-free. Per-agent ⇒ shared via the MARL/MAPPO team
+/// component (team-average reward delta), so the whole team is credited for quick forward play.
+fn quick_release_forward_pass_reward(team: Team, origin: Vec2, target: Vec2, hold_seconds: f64) -> f64 {
+    let forward_yards = (target.y - origin.y) * team.attack_dir();
+    if forward_yards <= 1.25 || !hold_seconds.is_finite() || hold_seconds < 0.0 {
+        return 0.0;
+    }
+    let speed_fraction = (1.0 - hold_seconds / QUICK_RELEASE_MAX_HOLD_SECONDS).clamp(0.0, 1.0);
+    let forward_fraction = (forward_yards / QUICK_RELEASE_FORWARD_REFERENCE_YARDS).clamp(0.0, 1.0);
+    QUICK_RELEASE_FORWARD_PASS_BONUS_POINTS * speed_fraction * (0.5 + 0.5 * forward_fraction)
+}
+
 fn intercepted_pass_passer_penalty(pass: &PendingPass, field_length: f64) -> f64 {
     let direction = pass_direction_bucket(pass.team, pass.origin, pass.intended_target);
     let own_half = pass_origin_in_own_half(pass.team, pass.origin, field_length);
-    // Giving the ball straight to an opponent must be strongly unlearned. The
-    // dominant term is receiver openness: a low-openness target means a defender
-    // was sitting in the lane, so the "pass" was effectively a gift.
-    let openness_cost = (1.0 - pass.receiver_openness.clamp(0.0, 1.0)) * 5.0;
-    let own_half_cost = if own_half { 1.15 } else { 0.35 };
-    let aerial_cost = if pass.flight.is_aerial() { 0.85 } else { 0.0 };
-    let ordinary_interception_penalty = (3.0 + openness_cost + 1.0 + own_half_cost + aerial_cost)
+    // Base severity of losing the ball to the opponent before direction. Dominant term is
+    // receiver openness: a low-openness target means a defender was sitting in the lane, so the
+    // "pass" was effectively a gift. Own-half and risky aerial balls add to it.
+    let openness_cost = (1.0 - pass.receiver_openness.clamp(0.0, 1.0)) * 10.0;
+    let own_half_cost = if own_half { 3.0 } else { 1.0 };
+    let aerial_cost = if pass.flight.is_aerial() { 1.5 } else { 0.0 };
+    let ordinary_interception_penalty = (7.0 + openness_cost + own_half_cost + aerial_cost)
         .clamp(
             INTERCEPTED_PASS_BASE_PENALTY_MIN_POINTS,
             INTERCEPTED_PASS_BASE_PENALTY_MAX_POINTS,
         );
+    // Backward interceptions are exactly doubled; forward and lateral interceptions share the
+    // ordinary bad-lane penalty so the learner gets a clean, testable directional signal.
     if matches!(direction, PassDirectionBucket::Backward) {
         ordinary_interception_penalty * BACKWARD_INTERCEPTED_PASS_PENALTY_MULTIPLIER
     } else {
@@ -24525,6 +24571,12 @@ fn soccer_transition_reward_with_tactics(
                         target,
                         receiver_openness,
                         pass_into_stride_fit_for_context(&action_context, player.team),
+                    );
+                    reward += quick_release_forward_pass_reward(
+                        player.team,
+                        origin,
+                        target,
+                        before.ball_holder_possession_seconds,
                     );
                     reward += pass_and_move_forward_reward_from_parts(
                         player.team,
@@ -45619,6 +45671,128 @@ fn soccer_live_pg_refresh_seconds() -> u64 {
         .unwrap_or(60)
 }
 
+/// How often the live server re-checks the local JSON neural/tactical sidecars (seconds).
+/// `0` disables the background refresh. This is separate from the Postgres refresh path so
+/// a local-only learner can keep `:5055` on the newest neural weights without polling RDS.
+fn soccer_live_local_policy_refresh_seconds() -> u64 {
+    std::env::var("SOCCER_LIVE_POLICY_LOCAL_REFRESH_SECONDS")
+        .or_else(|_| std::env::var("SOCCER_POLICY_LOCAL_REFRESH_SECONDS"))
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+fn soccer_live_policy_path_from_config(config: &SoccerLiveServerConfig) -> PathBuf {
+    let policy_path = PathBuf::from(config.policy_disk_path.trim());
+    if policy_path.as_os_str().is_empty() {
+        PathBuf::from(DEFAULT_LIVE_TEAM_POLICY_PATH)
+    } else {
+        policy_path
+    }
+}
+
+fn soccer_live_policy_sidecar_modified(path: &Path) -> Option<SystemTime> {
+    [
+        path.to_path_buf(),
+        policy_neural_snapshot_disk_path(path),
+        policy_tactical_learning_disk_path(path),
+    ]
+    .into_iter()
+    .filter_map(|candidate| {
+        fs::metadata(candidate)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+    })
+    .max()
+}
+
+fn start_soccer_live_local_policy_refresh(
+    session: Arc<Mutex<SoccerRealtimeSession>>,
+    config: SoccerLiveServerConfig,
+) {
+    let refresh_seconds = soccer_live_local_policy_refresh_seconds();
+    if refresh_seconds == 0 || !config.autoload_team_policy {
+        return;
+    }
+    let policy_path = soccer_live_policy_path_from_config(&config);
+    let _ = thread::Builder::new()
+        .name("soccer-live-local-policy-refresh".to_string())
+        .spawn(move || {
+            let mut last_seen = soccer_live_policy_sidecar_modified(&policy_path);
+            loop {
+                thread::sleep(Duration::from_secs(refresh_seconds));
+                let Some(modified) = soccer_live_policy_sidecar_modified(&policy_path) else {
+                    continue;
+                };
+                if last_seen.is_some_and(|seen| modified <= seen) {
+                    continue;
+                }
+
+                let neural_snapshot = match read_soccer_neural_snapshot(&policy_path) {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => {
+                        if let Ok(mut guard) = session.lock() {
+                            guard
+                                .policy_autosave
+                                .record_error(format!("local neural refresh: {err}"));
+                        }
+                        continue;
+                    }
+                };
+                let tactical_snapshot = match read_soccer_tactical_learning_snapshot(&policy_path) {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => {
+                        if let Ok(mut guard) = session.lock() {
+                            guard
+                                .policy_autosave
+                                .record_error(format!("local tactical refresh: {err}"));
+                        }
+                        continue;
+                    }
+                };
+
+                if neural_snapshot.is_none() && tactical_snapshot.is_none() {
+                    last_seen = Some(modified);
+                    continue;
+                }
+
+                let mut installed_neural = false;
+                let mut installed_tactical = false;
+                {
+                    let mut guard = soccer_mutex_lock(&session, "soccer_live_session");
+                    if let Some(snapshot) = neural_snapshot {
+                        match guard.sim.set_neural_network_snapshot(snapshot) {
+                            Ok(()) => installed_neural = true,
+                            Err(err) => guard
+                                .policy_autosave
+                                .record_error(format!("local neural refresh install: {err}")),
+                        }
+                    }
+                    if let Some(snapshot) = tactical_snapshot {
+                        guard.sim.config.tactical_learning = snapshot;
+                        installed_tactical = true;
+                    }
+                    #[cfg(feature = "postgres-persistence")]
+                    {
+                        if installed_neural || installed_tactical {
+                            soccer_live_store_warm_policy(&guard.sim);
+                        }
+                    }
+                }
+
+                if installed_neural || installed_tactical {
+                    last_seen = Some(modified);
+                    println!(
+                        "# soccer-live: refreshed local policy sidecars neural={} tactical={} path={}",
+                        installed_neural,
+                        installed_tactical,
+                        policy_path.display()
+                    );
+                }
+            }
+        });
+}
+
 /// The learning experiment slug the live server pulls its policy from — must match the
 /// experiment the cluster learner writes to (e.g. `soccer-self-play-k8s-overnight`).
 #[cfg(feature = "postgres-persistence")]
@@ -46003,12 +46177,7 @@ impl SoccerLiveServer {
     pub fn new(config: SoccerLiveServerConfig) -> Self {
         let mut session = SoccerRealtimeSession::new(config.match_config.clone());
         session.set_live_http_worker_threads(config.http_worker_threads);
-        let policy_path = PathBuf::from(config.policy_disk_path.trim());
-        let policy_path = if policy_path.as_os_str().is_empty() {
-            PathBuf::from(DEFAULT_LIVE_TEAM_POLICY_PATH)
-        } else {
-            policy_path
-        };
+        let policy_path = soccer_live_policy_path_from_config(&config);
         let moment_path = PathBuf::from(config.moment_disk_path.trim());
         let moment_path = if moment_path.as_os_str().is_empty() {
             PathBuf::from(DEFAULT_LIVE_MOMENT_WINDOWS_PATH)
@@ -46164,9 +46333,11 @@ impl SoccerLiveServer {
         }
         let input_queue = session.input_queue();
         let controller_input_router = session.controller_input_router();
+        let session = Arc::new(Mutex::new(session));
+        start_soccer_live_local_policy_refresh(Arc::clone(&session), config.clone());
         SoccerLiveServer {
             config,
-            session: Arc::new(Mutex::new(session)),
+            session,
             input_queue,
             controller_input_router,
         }

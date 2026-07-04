@@ -1722,6 +1722,68 @@ struct CompletedGame {
     elapsed_seconds: f64,
 }
 
+struct BatchNeuralSnapshotSelection {
+    episode: usize,
+    match_fitness: f64,
+    training_steps: usize,
+    snapshot_count: usize,
+    snapshot: SoccerNeuralNetworkSnapshot,
+}
+
+fn batch_neural_snapshot_candidate_better(
+    candidate_fitness: f64,
+    candidate_episode: usize,
+    best_fitness: f64,
+    best_episode: usize,
+) -> bool {
+    const EPSILON: f64 = 1e-12;
+    if candidate_fitness > best_fitness + EPSILON {
+        return true;
+    }
+    if best_fitness > candidate_fitness + EPSILON {
+        return false;
+    }
+    candidate_episode > best_episode
+}
+
+fn select_batch_neural_snapshot(
+    completed_games: &mut [CompletedGame],
+) -> Option<BatchNeuralSnapshotSelection> {
+    let snapshot_count = completed_games
+        .iter()
+        .filter(|game| game.neural_network.is_some())
+        .count();
+    if snapshot_count == 0 {
+        return None;
+    }
+    let mut best = None::<(usize, usize, f64)>;
+    for (index, game) in completed_games.iter().enumerate() {
+        if game.neural_network.is_none() {
+            continue;
+        }
+        let episode = game.episode_summary.episode + 1;
+        let fitness = soccer_learning_run_score(&game.episode_summary.summary).match_fitness;
+        let replace = best
+            .map(|(_, best_episode, best_fitness)| {
+                batch_neural_snapshot_candidate_better(fitness, episode, best_fitness, best_episode)
+            })
+            .unwrap_or(true);
+        if replace {
+            best = Some((index, episode, fitness));
+        }
+    }
+    let (index, episode, match_fitness) = best?;
+    let snapshot = completed_games[index].neural_network.take()?;
+    let training_steps = snapshot.training_steps;
+    Some(BatchNeuralSnapshotSelection {
+        episode,
+        match_fitness,
+        training_steps,
+        snapshot_count,
+        snapshot,
+    })
+}
+
 #[derive(Clone, Debug)]
 struct EvolutionSearchSample {
     summary: MatchSummary,
@@ -2461,6 +2523,44 @@ fn neural_sidecar_path_for_policy_artifact(policy_path: &Path) -> PathBuf {
         .filter(|stem| !stem.is_empty())
         .unwrap_or("team-policy");
     parent.join(format!("{stem}.neural.json"))
+}
+
+fn candidate_checkpoint_path(path: &Path) -> PathBuf {
+    let candidate_name = match (
+        path.file_stem().and_then(|stem| stem.to_str()),
+        path.extension().and_then(|extension| extension.to_str()),
+        path.file_name().and_then(|file_name| file_name.to_str()),
+    ) {
+        (Some(stem), Some(extension), _) if !stem.is_empty() && !extension.is_empty() => {
+            format!("{stem}.candidate.{extension}")
+        }
+        (Some(stem), _, _) if !stem.is_empty() => format!("{stem}.candidate"),
+        (_, _, Some(file_name)) if !file_name.is_empty() => format!("{file_name}.candidate"),
+        _ => "checkpoint.candidate.json".to_string(),
+    };
+    path.parent()
+        .map(|parent| parent.join(&candidate_name))
+        .unwrap_or_else(|| PathBuf::from(candidate_name))
+}
+
+fn should_publish_live_checkpoint(
+    best_only: bool,
+    evaluation: &SoccerPolicyPromotionGateEvaluation,
+    local_best: Option<&LocalNeuralPromotionTrialBest>,
+    has_neural_snapshot: bool,
+) -> bool {
+    if !best_only {
+        return true;
+    }
+    if !has_neural_snapshot {
+        return false;
+    }
+    if evaluation.enabled && !evaluation.eligible {
+        return false;
+    }
+    local_best
+        .map(|best| policy_promotion_evaluation_beats_local_best(evaluation, best))
+        .unwrap_or(true)
 }
 
 fn write_neural_sidecar_for_policy_artifact(
@@ -4121,6 +4221,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     )?;
     let write_checkpoint_artifacts =
         env_bool("SOCCER_WRITE_CHECKPOINT_ARTIFACTS", write_final_artifacts)?;
+    let checkpoint_artifact_best_only =
+        env_bool("SOCCER_CHECKPOINT_ARTIFACT_BEST_ONLY", false)?;
     let write_episode_log_file = env_bool(
         "SOCCER_WRITE_EPISODE_LOG",
         default_disk_learning_artifacts && DEFAULT_SOCCER_WRITE_EPISODE_LOG,
@@ -5135,6 +5237,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     println!("write_final_artifacts={write_final_artifacts}");
     println!("write_final_policy_artifact={write_final_policy_artifact}");
     println!("write_checkpoint_artifacts={write_checkpoint_artifacts}");
+    println!("checkpoint_artifact_best_only={checkpoint_artifact_best_only}");
     println!("write_episode_log={write_episode_log_file}");
     if checkpoint_interval_games == 0 || !write_checkpoint_artifacts {
         println!("checkpoint_artifact=disabled");
@@ -5407,10 +5510,21 @@ fn run() -> Result<(), Box<dyn Error>> {
         completed_games.sort_by_key(|game| game.episode_summary.episode);
 
         let merge_deltas = completed_games.len() > 1;
-        for game in completed_games.iter_mut() {
-            if let Some(snapshot) = game.neural_network.take() {
-                latest_neural_network = Some(snapshot);
+        if let Some(selection) = select_batch_neural_snapshot(&mut completed_games) {
+            latest_neural_network = Some(selection.snapshot);
+            if selection.snapshot_count > 1 {
+                println!(
+                    "neural_batch_snapshot_selected episodes={}..{} snapshots={} selected_episode={} selected_match_fitness={:.4} selected_training_steps={}",
+                    batch_start_episode + 1,
+                    batch_start_episode + batch_size,
+                    selection.snapshot_count,
+                    selection.episode,
+                    selection.match_fitness,
+                    selection.training_steps
+                );
             }
+        }
+        for game in completed_games.iter_mut() {
             let completed_learning_game = soccer_learning_completed_game_from_completed(game);
             if merge_deltas {
                 merge_team_policy_delta(
@@ -5421,17 +5535,17 @@ fn run() -> Result<(), Box<dyn Error>> {
             } else {
                 policies = game.policies.clone();
             }
+            push_policy_promotion_summary(
+                &mut policy_promotion_summaries,
+                &game.episode_summary.summary,
+                policy_promotion_window_games,
+            );
             if pg_experiment_id.is_some() {
                 let pg_game_base_policy_version_id = game.starting_policy_version_id.clone();
                 let completed_episode = game.episode_summary.episode + 1;
                 let should_write_policy_version = pg_policy_version_interval_games <= 1
                     || completed_episode >= games
                     || completed_episode % pg_policy_version_interval_games == 0;
-                push_policy_promotion_summary(
-                    &mut policy_promotion_summaries,
-                    &game.episode_summary.summary,
-                    policy_promotion_window_games,
-                );
                 let curriculum_stage = soccer_learning_curriculum_stage_for_completed_games(
                     completed_episode,
                     &curriculum_config,
@@ -6423,6 +6537,25 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
         }
         if should_checkpoint {
+            let checkpoint_summary_refs = policy_promotion_summaries.iter().collect::<Vec<_>>();
+            let checkpoint_promotion_evaluation =
+                evaluate_soccer_policy_promotion_gate(checkpoint_summary_refs, policy_promotion_gate);
+            let publish_live_checkpoint = should_publish_live_checkpoint(
+                checkpoint_artifact_best_only,
+                &checkpoint_promotion_evaluation,
+                local_neural_promotion_trial_best.as_ref(),
+                latest_neural_network.is_some(),
+            );
+            let checkpoint_write_path = if publish_live_checkpoint {
+                checkpoint_artifact_path.clone()
+            } else {
+                candidate_checkpoint_path(&checkpoint_artifact_path)
+            };
+            let checkpoint_learned_params_path = if publish_live_checkpoint {
+                learned_params_path.clone()
+            } else {
+                candidate_checkpoint_path(&learned_params_path)
+            };
             let checkpoint_artifact = self_play_artifact_from_policies(
                 config.clone(),
                 options.clone(),
@@ -6434,15 +6567,15 @@ fn run() -> Result<(), Box<dyn Error>> {
                 &checkpoint_artifact,
                 artifact_max_entries_per_policy,
             );
-            write_json(&checkpoint_artifact_path, &checkpoint_export)?;
+            write_json(&checkpoint_write_path, &checkpoint_export)?;
             let checkpoint_params =
                 SoccerSelfPlayLearnedParams::from_training_artifact_with_neural_network(
                     &checkpoint_artifact,
                     latest_neural_network.clone(),
                 );
-            write_json(&learned_params_path, &checkpoint_params)?;
+            write_json(&checkpoint_learned_params_path, &checkpoint_params)?;
             if let Some(sidecar_path) = write_neural_sidecar_for_policy_artifact(
-                &checkpoint_artifact_path,
+                &checkpoint_write_path,
                 latest_neural_network.as_ref(),
             )? {
                 println!(
@@ -6450,6 +6583,46 @@ fn run() -> Result<(), Box<dyn Error>> {
                     episode_summaries.len(),
                     sidecar_path.display()
                 );
+            }
+            if checkpoint_artifact_best_only {
+                if publish_live_checkpoint {
+                    local_neural_promotion_trial_best = Some(LocalNeuralPromotionTrialBest {
+                        completed_games: episode_summaries.len(),
+                        evaluation: checkpoint_promotion_evaluation.clone(),
+                        config: config.clone(),
+                        tactical_learning: tactical_learning.clone(),
+                        policies: policies.clone(),
+                        neural_network: latest_neural_network.clone(),
+                    });
+                    println!(
+                        "checkpoint_local_best_published games_completed={} sample_games={} mean_match_fitness={:.4} best_match_fitness={:.4} mean_play_quality={:.4} artifact={}",
+                        episode_summaries.len(),
+                        checkpoint_promotion_evaluation.sample_games,
+                        checkpoint_promotion_evaluation.mean_match_fitness,
+                        checkpoint_promotion_evaluation.best_match_fitness,
+                        checkpoint_promotion_evaluation.mean_play_quality,
+                        checkpoint_write_path.display()
+                    );
+                } else {
+                    let hold_reasons = if latest_neural_network.is_none() {
+                        "missing_neural_snapshot".to_string()
+                    } else if checkpoint_promotion_evaluation.rejection_reasons.is_empty() {
+                        "local_best_not_improved".to_string()
+                    } else {
+                        checkpoint_promotion_evaluation.rejection_reasons.join("|")
+                    };
+                    println!(
+                        "checkpoint_local_best_held games_completed={} sample_games={} mean_match_fitness={:.4} best_match_fitness={:.4} mean_play_quality={:.4} reasons={} candidate_artifact={} live_artifact={}",
+                        episode_summaries.len(),
+                        checkpoint_promotion_evaluation.sample_games,
+                        checkpoint_promotion_evaluation.mean_match_fitness,
+                        checkpoint_promotion_evaluation.best_match_fitness,
+                        checkpoint_promotion_evaluation.mean_play_quality,
+                        hold_reasons,
+                        checkpoint_write_path.display(),
+                        checkpoint_artifact_path.display()
+                    );
+                }
             }
             let checkpoint_manifest = run_manifest(
                 &run_id,
@@ -6464,8 +6637,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                 config.clone(),
                 options.clone(),
                 &final_artifact_path,
-                &learned_params_path,
-                &checkpoint_artifact_path,
+                &checkpoint_learned_params_path,
+                &checkpoint_write_path,
                 &episode_log_path,
                 checkpoint_interval_games,
                 artifact_max_entries_per_policy,
@@ -6497,7 +6670,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             println!(
                 "checkpoint games_completed={} artifact={} manifest={}",
                 episode_summaries.len(),
-                checkpoint_artifact_path.display(),
+                checkpoint_write_path.display(),
                 manifest_path.display()
             );
             let _ = std::io::stdout().flush();
@@ -6700,6 +6873,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn candidate_checkpoint_path_preserves_live_artifact_name() {
+        assert_eq!(
+            candidate_checkpoint_path(Path::new(
+                "/tmp/soccer-live/team-policy.json"
+            )),
+            PathBuf::from("/tmp/soccer-live/team-policy.candidate.json")
+        );
+        assert_eq!(
+            candidate_checkpoint_path(Path::new("learned-params.json")),
+            PathBuf::from("learned-params.candidate.json")
+        );
+    }
+
     fn promotion_eval(
         mean_match_fitness: f64,
         mean_play_quality: f64,
@@ -6717,6 +6904,16 @@ mod tests {
             mean_chain_net_loss: 0.0,
             rejection_reasons: vec!["incumbent_mean_match_fitness below".to_string()],
         }
+    }
+
+    fn eligible_promotion_eval(
+        mean_match_fitness: f64,
+        mean_play_quality: f64,
+    ) -> SoccerPolicyPromotionGateEvaluation {
+        let mut evaluation = promotion_eval(mean_match_fitness, mean_play_quality);
+        evaluation.eligible = true;
+        evaluation.rejection_reasons.clear();
+        evaluation
     }
 
     fn local_neural_trial_best_for_test(
@@ -6750,6 +6947,50 @@ mod tests {
             &promotion_eval(0.70, 0.43),
             &best
         ));
+    }
+
+    #[test]
+    fn best_only_checkpoint_publish_requires_eligible_local_improvement() {
+        let best = local_neural_trial_best_for_test(8, 0.70, 0.42);
+
+        assert!(!should_publish_live_checkpoint(
+            true,
+            &promotion_eval(0.90, 0.70),
+            Some(&best),
+            true
+        ));
+        assert!(!should_publish_live_checkpoint(
+            true,
+            &eligible_promotion_eval(0.72, 0.30),
+            Some(&best),
+            false
+        ));
+        assert!(!should_publish_live_checkpoint(
+            true,
+            &eligible_promotion_eval(0.68, 0.90),
+            Some(&best),
+            true
+        ));
+        assert!(should_publish_live_checkpoint(
+            true,
+            &eligible_promotion_eval(0.72, 0.30),
+            Some(&best),
+            true
+        ));
+        assert!(should_publish_live_checkpoint(
+            false,
+            &promotion_eval(0.10, 0.10),
+            Some(&best),
+            false
+        ));
+    }
+
+    #[test]
+    fn batch_neural_snapshot_selection_prefers_fitness_then_later_episode() {
+        assert!(batch_neural_snapshot_candidate_better(1.2, 8, 1.1, 9));
+        assert!(!batch_neural_snapshot_candidate_better(1.0, 12, 1.1, 9));
+        assert!(batch_neural_snapshot_candidate_better(1.1, 12, 1.1, 9));
+        assert!(!batch_neural_snapshot_candidate_better(1.1, 8, 1.1, 9));
     }
 
     #[test]
