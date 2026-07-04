@@ -1160,18 +1160,19 @@ const POSSESSION_CHASE_MIN_CREDIT: f64 = 0.035;
 const TEAMWORK_PROGRESS_NEAR_BALL_PLAYERS: usize = 5;
 const TEAMWORK_PROGRESS_MIN_RELOCATION_YARDS: f64 = 0.08;
 const TEAMWORK_PROGRESS_MIN_CREDIT: f64 = 0.024;
-const GOAL_REWARD_POINTS: f64 = 100.0;
+const GOAL_REWARD_POINTS: f64 = 160.0;
 /// Reduced reward pool for a goal scored directly off a turnover — a single
 /// scoring-team player touched the ball between winning it from the opponent and
 /// finishing. There is no build-up play to credit, only the steal-and-finish, so
-/// the goal distributes 30 points instead of the full [`GOAL_REWARD_POINTS`].
-const DIRECT_TURNOVER_GOAL_REWARD_POINTS: f64 = 30.0;
+/// the goal distributes less than the full [`GOAL_REWARD_POINTS`] while still
+/// staying above any non-goal outcome.
+const DIRECT_TURNOVER_GOAL_REWARD_POINTS: f64 = 85.0;
 const GOAL_CONTEXT_CREDIT_MIN_PLAYERS: usize = 3;
 const GOAL_CONTEXT_CREDIT_MAX_PLAYERS: usize = 5;
 const GOAL_CONTEXT_CREDIT_SCAN_ACTIONS: usize = 48;
 const GOAL_CONTEXT_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(60.0);
 const GOAL_CONTEXT_CREDIT_MIN_SCORE: f64 = 0.05;
-const SHOT_ON_TARGET_REWARD_POINTS: f64 = 40.0;
+const SHOT_ON_TARGET_REWARD_POINTS: f64 = 70.0;
 /// Direct keeper credit for stopping a shot, scaled upward for close-range danger.
 /// This trains the goalkeeper's preceding positioning/claim decision instead of only
 /// rewarding the shooter and penalising the keeper later when a goal is conceded.
@@ -1224,13 +1225,14 @@ const OFF_BALL_CARRIER_COLLAPSE_PENALTY: f64 = 8.0;
 // inside this radius; the keep-out / marginal-cancel are suspended in that case.
 const OFF_BALL_CARRIER_PRESSURED_YARDS: f64 = 4.5;
 // A shot OFF the frame still earns a small attempt reward (vs the on-frame value).
-const SHOT_OFF_TARGET_REWARD_POINTS: f64 = 10.0;
+const SHOT_OFF_TARGET_REWARD_POINTS: f64 = 12.0;
 // Shot accuracy: a missed effort that crosses the line more than this far outside the
 // nearest post draws a small per-yard penalty (capped), so the policy is taught to hit
 // the frame rather than blaze it wide. Within the forgiveness margin a near-miss is free.
 const SHOT_OFF_TARGET_FORGIVENESS_YARDS: f64 = 0.5;
 const SHOT_OFF_TARGET_PENALTY_PER_YARD: f64 = 0.6;
 const SHOT_OFF_TARGET_MAX_PENALTY_POINTS: f64 = 3.0;
+<<<<<<< HEAD
 // Base reward for a completed forward pass. Deliberately kept WELL BELOW the shot-on-target
 // (40) and goal (100) rewards so that a string of successive forward passes can never out-earn
 // shooting/scoring — otherwise "pass in succession forever" becomes the optimal POMDP policy.
@@ -1240,6 +1242,12 @@ const COMPLETED_FORWARD_PASS_BASE_REWARD_OWN_HALF: f64 = 3.0;
 const COMPLETED_FORWARD_PASS_BASE_REWARD_OPPONENT_HALF: f64 = 4.0;
 const COMPLETED_FORWARD_PASS_PROGRESS_REWARD_PER_YARD: f64 = 0.24;
 const COMPLETED_FORWARD_PASS_PROGRESS_REWARD_MAX_YARDS: f64 = 30.0;
+=======
+const COMPLETED_FORWARD_PASS_BASE_REWARD_OWN_HALF: f64 = 4.5;
+const COMPLETED_FORWARD_PASS_BASE_REWARD_OPPONENT_HALF: f64 = 5.5;
+const COMPLETED_FORWARD_PASS_PROGRESS_REWARD_PER_YARD: f64 = 0.08;
+const COMPLETED_FORWARD_PASS_PROGRESS_REWARD_MAX_YARDS: f64 = 20.0;
+>>>>>>> 3d1d2d8b72a416582b67d5fd21f5bb2f393a8f7f
 const COMPLETED_FLANK_PASS_BONUS_POINTS: f64 = 2.4;
 const COMPLETED_FLANK_PASS_OWN_HALF_MULTIPLIER: f64 = 1.55;
 const OWN_HALF_FLANK_TACTICAL_REWARD_MULTIPLIER: f64 = 1.35;
@@ -1849,6 +1857,9 @@ const LOST_POSSESSION_CHAIN_PENALTY_WEIGHTS: [f64; 3] = [0.55, 0.30, 0.15];
 const TURNOVER_CHAIN_BLAME_DISCOUNTS: [f64; 3] = [1.0, 0.20, 0.05];
 // Below this the discounted blame is dropped (negligible tail / sub-noise nudge).
 const TURNOVER_CHAIN_BLAME_MIN_POINTS: f64 = 0.05;
+const INTERCEPTED_PASS_BASE_PENALTY_MIN_POINTS: f64 = 4.0;
+const INTERCEPTED_PASS_BASE_PENALTY_MAX_POINTS: f64 = 13.0;
+const BACKWARD_INTERCEPTED_PASS_PENALTY_MULTIPLIER: f64 = 2.0;
 // Bad-pass turnover blame is not a normalized pool: the passer gets the full
 // chain penalty, then the prior two teammates get discounted echoes.
 const BAD_PASS_CHAIN_PENALTY_MULTIPLIERS: [f64; 3] = [1.0, 0.20, 0.05];
@@ -2007,13 +2018,13 @@ const GOALKEEPER_PLAY_OUT_FLOOR_POWER: f64 = 0.70;
 const GOALKEEPER_PLAY_OUT_AERIAL_POWER: f64 = 0.86;
 const GOALKEEPER_OUTSIDE_BOX_URGENT_PRESSURE_YARDS: f64 = 6.0;
 const POSSESSION_PROGRESS_MILESTONE_YARDS: f64 = 30.0;
-const POSSESSION_PROGRESS_REWARD_POINTS: f64 = 30.0;
+const POSSESSION_PROGRESS_REWARD_POINTS: f64 = 22.0;
 const POSSESSION_STALL_PASS_THRESHOLD: usize = 4;
 const POSSESSION_STALL_MIN_GAIN_YARDS: f64 = 30.0;
-const POSSESSION_STALL_PENALTY_POINTS: f64 = 18.0;
+const POSSESSION_STALL_PENALTY_POINTS: f64 = 24.0;
 const POSSESSION_PROGRESS_REWARD_WEIGHTS: [f64; 5] = [0.38, 0.27, 0.18, 0.11, 0.06];
 const POSSESSION_STALL_PENALTY_WEIGHTS: [f64; 5] = [0.34, 0.27, 0.20, 0.13, 0.06];
-const DENSE_FORWARD_PASS_PROGRESS_REWARD_PER_YARD: f64 = 0.12;
+const DENSE_FORWARD_PASS_PROGRESS_REWARD_PER_YARD: f64 = 0.04;
 const DENSE_FORWARD_CARRY_PROGRESS_REWARD_PER_YARD: f64 = 0.145;
 const PROGRESSIVE_CARRY_OUTCOME_MIN_YARDS: f64 = 2.0;
 const PROGRESSIVE_CARRY_OUTCOME_REWARD_PER_TWO_YARDS: f64 = 1.35;
@@ -2054,15 +2065,21 @@ const FAST_AWAY_FACING_MIN_SPEED_YPS: f64 = 0.35;
 const FAST_AWAY_FACING_BALL_DOT: f64 = -0.55;
 const STRIKER_HOLD_UP_SIDEWAYS_YARDS: f64 = 7.5;
 const STRIKER_HOLD_UP_FORWARD_YARDS: f64 = 2.8;
-const GOAL_CHAIN_REWARD_PATTERN: [f64; 10] = [30.0, 22.0, 15.0, 10.0, 7.0, 5.0, 4.0, 3.0, 2.0, 2.0];
+const GOAL_CHAIN_REWARD_PATTERN: [f64; 10] =
+    [50.0, 36.0, 25.0, 16.0, 11.0, 8.0, 6.0, 4.0, 3.0, 3.0];
 const SHOT_ON_TARGET_REWARD_PATTERN: [f64; 10] =
-    [12.0, 9.0, 6.0, 4.0, 3.0, 2.0, 1.5, 1.0, 0.8, 0.7];
+    [22.0, 16.0, 11.0, 7.0, 5.0, 3.5, 2.5, 1.8, 1.2, 1.0];
 const PASS_CHAIN_HISTORY_LIMIT: usize = 8;
 const PASS_CHAIN_MAX_CONTINUATION_SECONDS: f64 = 12.0;
+<<<<<<< HEAD
 // Pass-chain event bonuses trimmed (7.5→2.5, 10→3.5) for the same reason as the forward-pass
 // base above: successive passing must stay a build-up MEANS, not an end that rivals a shot/goal.
 const PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS: f64 = 2.5;
 const PASS_CHAIN_THREE_NET_FORWARD_EVENT_REWARD_POINTS: f64 = 3.5;
+=======
+const PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS: f64 = 3.0;
+const PASS_CHAIN_THREE_NET_FORWARD_EVENT_REWARD_POINTS: f64 = 4.5;
+>>>>>>> 3d1d2d8b72a416582b67d5fd21f5bb2f393a8f7f
 /// Penalty (points, applied negative) for an isolated attacking carrier panicking a
 /// backward/square ball instead of driving at goal or holding it up — see
 /// [`SoccerRewardEventKind::IsolatedCarrierPanicBackPass`]. Comparable in magnitude to one
@@ -2152,7 +2169,7 @@ const FORWARD_CARRY_BACKWARD_RESET_YARDS: f64 = 1.0;
 /// 2-yard nudge earns nothing; the 2nd, 3rd… consecutive segment each earn this), so the signal
 /// rewards a carrier who keeps driving the ball forward, escalating with the length of the run.
 /// Deliberately small: this is UNCONDITIONAL shaping (paid even if possession is then lost), so a
-/// full-length run must stay well below an outcome reward (shot on target 40, goal 100).
+/// full-length run must stay well below an outcome reward (shot on target 70, goal 160).
 const SUSTAINED_FORWARD_DRIBBLE_SEGMENT_REWARD_POINTS: f64 = 0.5;
 /// FINE (1-yard) cadence of the sustained-dribble reward: "a yard of forward dribbling followed by
 /// another yard". Paid PER 1-yard segment past the first, in ADDITION to the 2-yard cadence above,
@@ -2210,7 +2227,7 @@ const OVERDRIBBLE_PER_IGNORED_OUTLET_POINTS: f64 = 1.5;
 /// How many ranked forward-outlet candidates to probe when counting ignored passing options.
 const OVERDRIBBLE_OUTLET_PROBE_LIMIT: usize = 3;
 /// Cap on the NEUTRAL-ZONE over-dribble penalty so one very long hold can't swamp the
-/// goal/possession signal — kept below shot-on-target(40)/goal(100), in line with the turnover
+/// goal/possession signal — kept below shot-on-target(70)/goal(160), in line with the turnover
 /// penalties. The absolute cap is this times [`OVERDRIBBLE_DANGER_MAX_MULT`] for a deep own-half
 /// giveaway.
 const OVERDRIBBLE_MAX_PENALTY_POINTS: f64 = 16.0;
@@ -2233,9 +2250,9 @@ const BUILDUP_CHAIN_CREDIT_MIN_POINTS: f64 = 0.05;
 /// ANY shot (incl. off target) < shot ON FRAME (on target) < GOAL. A goal also fires the on-frame
 /// tier (it is on target), so the finisher of a goal collects on-frame + goal credit — "especially
 /// a goal".
-const BUILDUP_CHAIN_CREDIT_SHOT_BASE_POINTS: f64 = 2.0;
-const BUILDUP_CHAIN_CREDIT_SHOT_ON_FRAME_BASE_POINTS: f64 = 5.0;
-const BUILDUP_CHAIN_CREDIT_GOAL_BASE_POINTS: f64 = 14.0;
+const BUILDUP_CHAIN_CREDIT_SHOT_BASE_POINTS: f64 = 3.0;
+const BUILDUP_CHAIN_CREDIT_SHOT_ON_FRAME_BASE_POINTS: f64 = 9.0;
+const BUILDUP_CHAIN_CREDIT_GOAL_BASE_POINTS: f64 = 24.0;
 const PASS_CHAIN_THREE_NET_FORWARD_MIN_YARDS: f64 = 4.0;
 const PASS_CHAIN_EVENT_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(12.0);
 const PASS_AND_MOVE_FORWARD_MIN_YARDS: f64 = 4.0;
@@ -5452,9 +5469,9 @@ const SOCCER_OUTCOME_CREDIT_MILESTONE_REWARD_CAP: f64 = GOAL_REWARD_POINTS;
 // not absorbed because it differs by the realised result, which the state alone
 // cannot predict. Magnitudes are a starting point and MUST be A/B'd through the
 // promotion eval gate (held-out Elo/win-rate), never tuned on raw reward.
-const MATCH_OUTCOME_WIN_REWARD_POINTS: f64 = 8.0;
+const MATCH_OUTCOME_WIN_REWARD_POINTS: f64 = 12.0;
 const MATCH_OUTCOME_DRAW_REWARD_POINTS: f64 = 0.0;
-const MATCH_OUTCOME_PER_GOAL_MARGIN_POINTS: f64 = 1.5;
+const MATCH_OUTCOME_PER_GOAL_MARGIN_POINTS: f64 = 2.5;
 const MATCH_OUTCOME_MARGIN_CAP_GOALS: f64 = 4.0;
 // INSTANTANEOUS (single-frame) player speed ceiling: 25mph ≈ 12.22yps, plus a hair of
 // numerical margin. A human sprints at most ~25mph in a moment.
@@ -22273,8 +22290,8 @@ fn completed_pass_anticipation_reward_from_context(
 
 fn pass_chain_link_reward(direction: PassDirectionBucket, depth: usize) -> f64 {
     // A pass that leads to a subsequent received pass is rewarded — moreso for forward
-    // build-up — so progressive combination play is reinforced (on top of the 100-pt
-    // goal / 40-pt shot-on-target chains distributed back through the build-up).
+    // build-up — so progressive combination play is reinforced (on top of the 160-pt
+    // goal / 70-pt shot-on-target chains distributed back through the build-up).
     let base = match direction {
         PassDirectionBucket::Forward => 3.10,
         PassDirectionBucket::Lateral => 1.55,
@@ -22335,6 +22352,7 @@ const INTERCEPT_DIRECTION_REFERENCE_YARDS: f64 = 15.0;
 
 fn intercepted_pass_passer_penalty(pass: &PendingPass, field_length: f64) -> f64 {
     let own_half = pass_origin_in_own_half(pass.team, pass.origin, field_length);
+<<<<<<< HEAD
     // Base severity of losing the ball to the opponent, BEFORE direction. Dominant term is
     // receiver openness: a low-openness target means a defender was sitting in the lane, so the
     // "pass" was effectively a gift. Own-half and risky aerial balls add to it.
@@ -22350,6 +22368,24 @@ fn intercepted_pass_passer_penalty(pass: &PendingPass, field_length: f64) -> f64
     let forward_ratio = (forward_yards / INTERCEPT_DIRECTION_REFERENCE_YARDS).clamp(-1.0, 1.0);
     let directional_multiplier = 2.0 - forward_ratio; // forward → 1.0, square → 2.0, backward → 3.0
     (base_penalty * directional_multiplier).clamp(6.0, 40.0)
+=======
+    // Giving the ball straight to an opponent must be strongly unlearned. The
+    // dominant term is receiver openness: a low-openness target means a defender
+    // was sitting in the lane, so the "pass" was effectively a gift.
+    let openness_cost = (1.0 - pass.receiver_openness.clamp(0.0, 1.0)) * 5.0;
+    let own_half_cost = if own_half { 1.15 } else { 0.35 };
+    let aerial_cost = if pass.flight.is_aerial() { 0.85 } else { 0.0 };
+    let ordinary_interception_penalty = (3.0 + openness_cost + 1.0 + own_half_cost + aerial_cost)
+        .clamp(
+            INTERCEPTED_PASS_BASE_PENALTY_MIN_POINTS,
+            INTERCEPTED_PASS_BASE_PENALTY_MAX_POINTS,
+        );
+    if matches!(direction, PassDirectionBucket::Backward) {
+        ordinary_interception_penalty * BACKWARD_INTERCEPTED_PASS_PENALTY_MULTIPLIER
+    } else {
+        ordinary_interception_penalty
+    }
+>>>>>>> 3d1d2d8b72a416582b67d5fd21f5bb2f393a8f7f
 }
 
 /// A pass is a "backheel" when its direction is substantially behind where the player
@@ -36877,6 +36913,38 @@ pub const PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS: usize = 200;
 /// Weight given to the learned head's P(complete) when blended with the analytic completion
 /// estimate (the rest stays analytic). Conservative: the head nudges, it does not replace.
 const PASS_COMPLETION_HEAD_BLEND_WEIGHT: f64 = 0.5;
+
+fn pass_completion_head_blend_weight() -> f64 {
+    #[cfg(test)]
+    {
+        pass_completion_head_blend_weight_from_env()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static WEIGHT: OnceLock<f64> = OnceLock::new();
+        *WEIGHT.get_or_init(pass_completion_head_blend_weight_from_env)
+    }
+}
+
+fn pass_completion_head_blend_weight_from_env() -> f64 {
+    let raw = std::env::var("SOCCER_PASS_COMPLETION_HEAD_BLEND_WEIGHT")
+        .ok()
+        .or_else(|| std::env::var("DD_SOCCER_PASS_COMPLETION_HEAD_BLEND_WEIGHT").ok());
+    let Some(raw) = raw else {
+        return PASS_COMPLETION_HEAD_BLEND_WEIGHT;
+    };
+    match raw.trim().parse::<f64>() {
+        Ok(value) if value.is_finite() => value.clamp(0.0, 1.0),
+        _ => {
+            eprintln!(
+                "soccer: invalid pass-completion blend weight {:?}; using default {:.3}",
+                raw, PASS_COMPLETION_HEAD_BLEND_WEIGHT
+            );
+            PASS_COMPLETION_HEAD_BLEND_WEIGHT
+        }
+    }
+}
 
 /// Env flag enabling live consumption of the learned pass-completion head in
 /// `pass_target_quality_for_snapshot`. Off ⇒ the analytic completion estimate stands alone
@@ -59464,9 +59532,10 @@ fn pass_target_quality_for_snapshot_uncached(
                     flight,
                 );
                 if let Some(learned) = head.predict(&features) {
+                    let blend_weight = pass_completion_head_blend_weight();
                     expected_completion = expected_completion
-                        * (1.0 - PASS_COMPLETION_HEAD_BLEND_WEIGHT)
-                        + learned.clamp(0.0, 1.0) * PASS_COMPLETION_HEAD_BLEND_WEIGHT;
+                        * (1.0 - blend_weight)
+                        + learned.clamp(0.0, 1.0) * blend_weight;
                 }
             }
         }
@@ -65473,6 +65542,93 @@ mod locomotion_commitment_tests {
         let (vel, _heading, _held) =
             commit_travel_heading(reversal, Some(committed), 0.0, 0.1, true);
         assert!(vel.distance(reversal) < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod reward_priority_tests {
+    use super::*;
+
+    #[test]
+    fn outcome_rewards_dominate_pass_only_shaping() {
+        let max_completed_forward_pass = (COMPLETED_FORWARD_PASS_BASE_REWARD_OWN_HALF
+            + COMPLETED_FORWARD_PASS_PROGRESS_REWARD_MAX_YARDS
+                * COMPLETED_FORWARD_PASS_PROGRESS_REWARD_PER_YARD
+            + COMPLETED_FLANK_PASS_BONUS_POINTS * COMPLETED_FLANK_PASS_OWN_HALF_MULTIPLIER)
+            .max(
+                COMPLETED_FORWARD_PASS_BASE_REWARD_OPPONENT_HALF
+                    + COMPLETED_FORWARD_PASS_PROGRESS_REWARD_MAX_YARDS
+                        * COMPLETED_FORWARD_PASS_PROGRESS_REWARD_PER_YARD
+                    + COMPLETED_FLANK_PASS_BONUS_POINTS,
+            );
+        let max_dense_forward_pass = 24.0 * DENSE_FORWARD_PASS_PROGRESS_REWARD_PER_YARD;
+        let three_pass_only_sequence = 3.0 * (max_completed_forward_pass + max_dense_forward_pass)
+            + PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS
+            + PASS_CHAIN_THREE_NET_FORWARD_EVENT_REWARD_POINTS;
+
+        assert!(
+            three_pass_only_sequence < SHOT_ON_TARGET_REWARD_POINTS,
+            "pass-only sequence {three_pass_only_sequence} should stay below shot-on-target {SHOT_ON_TARGET_REWARD_POINTS}"
+        );
+        assert!(
+            SHOT_ON_TARGET_REWARD_POINTS < DIRECT_TURNOVER_GOAL_REWARD_POINTS,
+            "any goal reward should outrank a shot on target"
+        );
+        assert!(
+            DIRECT_TURNOVER_GOAL_REWARD_POINTS < GOAL_REWARD_POINTS,
+            "full goal reward should outrank direct-turnover goal pool"
+        );
+        assert!(
+            BUILDUP_CHAIN_CREDIT_GOAL_BASE_POINTS
+                > BUILDUP_CHAIN_CREDIT_SHOT_ON_FRAME_BASE_POINTS
+                    + BUILDUP_CHAIN_CREDIT_SHOT_BASE_POINTS,
+            "goal buildup credit should dominate non-goal shot buildup credit"
+        );
+    }
+
+    #[test]
+    fn backward_interception_penalty_doubles_ordinary_pass_interception() {
+        let forward = PendingPass {
+            team: Team::Home,
+            from: 6,
+            target: Some(9),
+            flight: PassFlight::Floor,
+            is_cross: false,
+            launch_tick: 0,
+            origin: Vec2::new(40.0, 62.0),
+            intended_target: Vec2::new(40.0, 74.0),
+            distance_yards: 12.0,
+            receiver_openness: 0.42,
+            passer_skill: 1.0,
+            launch_speed_yps: 18.0,
+            receiver_position_at_launch: Some(Vec2::new(40.0, 74.0)),
+            receiver_velocity_at_launch: Some(Vec2::zero()),
+            offside: None,
+            offside_candidates: Vec::new(),
+            learn_features: Vec::new(),
+        };
+        let mut lateral = forward.clone();
+        lateral.intended_target = Vec2::new(52.0, 62.0);
+        lateral.receiver_position_at_launch = Some(lateral.intended_target);
+        let mut backward = forward.clone();
+        backward.intended_target = Vec2::new(40.0, 50.0);
+        backward.receiver_position_at_launch = Some(backward.intended_target);
+
+        let field_length = DEFAULT_FIELD_LENGTH_YARDS;
+        let forward_penalty = intercepted_pass_passer_penalty(&forward, field_length);
+        let lateral_penalty = intercepted_pass_passer_penalty(&lateral, field_length);
+        let backward_penalty = intercepted_pass_passer_penalty(&backward, field_length);
+
+        assert!(
+            (forward_penalty - lateral_penalty).abs() < 1e-9,
+            "forward/lateral interceptions should share the ordinary penalty curve"
+        );
+        assert!(
+            (backward_penalty - forward_penalty * BACKWARD_INTERCEPTED_PASS_PENALTY_MULTIPLIER)
+                .abs()
+                < 1e-9,
+            "backward intercepted pass penalty should be exactly doubled"
+        );
     }
 }
 
