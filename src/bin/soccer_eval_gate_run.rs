@@ -185,7 +185,7 @@ fn main() {
     // Candidate brain (id 0): prefer a local learned-params file (the fully-local
     // learner's accumulated policy) when SOCCER_EVAL_CANDIDATE_PATH is set; otherwise
     // fall back to inline self-play training (the original behaviour). Then FROZEN for the gate.
-    let candidate_snapshot = candidate_snapshot_from_env_file()
+    let candidate_snapshot = snapshot_from_env_file("SOCCER_EVAL_CANDIDATE_PATH")
         .or_else(|| train_candidate_snapshot(train_games, minutes, train_seed_base));
     let candidate_brain = match candidate_snapshot {
         Some(s) => TeamBrain::from_snapshot(s),
