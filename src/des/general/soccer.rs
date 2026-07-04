@@ -59412,6 +59412,22 @@ fn seed_varied_skills_enabled() -> bool {
     std::env::var("SOCCER_SEED_VARIED_SKILLS").is_ok()
 }
 
+/// Per-team skill multiplier for an ASYMMETRIC HANDICAP (default 1.0 = no change). Reading it per
+/// team lets a trainer weaken one side (e.g. the learner) so it must out-think a stronger
+/// opponent — a curriculum lever to break the parity plateau. Env: SOCCER_SKILL_SCALE_HOME /
+/// SOCCER_SKILL_SCALE_AWAY. Off by default ⇒ byte-identical to the equal-footing build.
+fn soccer_team_skill_scale(team: Team) -> f64 {
+    let var = match team {
+        Team::Home => "SOCCER_SKILL_SCALE_HOME",
+        Team::Away => "SOCCER_SKILL_SCALE_AWAY",
+    };
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|f| f.is_finite() && *f > 0.0)
+        .unwrap_or(1.0)
+}
+
 fn pass_receiver_openness_for_agents(
     players: &[PlayerAgent],
     receiving_team: Team,
