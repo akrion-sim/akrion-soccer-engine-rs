@@ -114,10 +114,7 @@ fn candidate_snapshot_from_env_file() -> Option<SoccerNeuralNetworkSnapshot> {
     let nn = value.get("neuralNetwork")?.clone();
     match serde_json::from_value::<SoccerNeuralNetworkSnapshot>(nn) {
         Ok(s) => {
-            eprintln!(
-                "eval_candidate_loaded_from_file path={path} params={} training_steps={}",
-                s.parameter_count, s.training_steps
-            );
+            eprintln!("eval_candidate_loaded_from_file path={path}");
             Some(s)
         }
         Err(e) => {
