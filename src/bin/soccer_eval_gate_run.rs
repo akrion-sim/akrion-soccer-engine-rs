@@ -90,6 +90,43 @@ fn train_candidate_snapshot(
     snapshot
 }
 
+/// Load a candidate neural snapshot directly from a local `learned-params.json`
+/// artifact (the fully-local learner's durable policy file), via `SOCCER_EVAL_CANDIDATE_PATH`.
+/// This lets the gate score the REAL accumulated local policy against the frozen field
+/// (a held-out climb number over time) instead of only an inline-trained-from-fresh one.
+/// The learned-params artifact embeds the snapshot under the `neuralNetwork` key.
+fn candidate_snapshot_from_env_file() -> Option<SoccerNeuralNetworkSnapshot> {
+    let path = std::env::var("SOCCER_EVAL_CANDIDATE_PATH").ok()?;
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) => {
+            eprintln!("eval_candidate_read_failed path={path}: {e}");
+            return None;
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("eval_candidate_json_failed path={path}: {e}");
+            return None;
+        }
+    };
+    let nn = value.get("neuralNetwork")?.clone();
+    match serde_json::from_value::<SoccerNeuralNetworkSnapshot>(nn) {
+        Ok(s) => {
+            eprintln!(
+                "eval_candidate_loaded_from_file path={path} params={} training_steps={}",
+                s.parameter_count, s.training_steps
+            );
+            Some(s)
+        }
+        Err(e) => {
+            eprintln!("eval_candidate_snapshot_parse_failed path={path}: {e}");
+            None
+        }
+    }
+}
+
 /// A held-out frozen-vs-frozen fixture between two brains. Builds the context with
 /// learning OFF for both sides and a held-out seed, plays it, and returns the
 /// `MatchReport`.
