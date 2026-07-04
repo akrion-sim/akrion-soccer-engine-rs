@@ -3808,6 +3808,15 @@ impl SoccerMatch {
     }
 
     fn neural_blend_lambda_for_learner(&self, learner: &SoccerNeuralLearner) -> f64 {
+        // NEURAL-AUTHORITATIVE experiment: when DD_SOCCER_NEURAL_AUTHORITATIVE_LAMBDA > 0, the
+        // neural value head OWNS the per-player action decision. Return a large fixed weight so
+        // `candidate.value + λ·V_net` is dominated by V_net (the coarse tabular Q becomes a
+        // negligible tie-break floor), bypassing the 0.5 nudge AND the warm-up ramp. Requires a
+        // usable prediction network so a net-less run still falls back to tabular.
+        let authoritative = dd_soccer_neural_authoritative_lambda();
+        if authoritative > 0.0 && learner.has_prediction_network() {
+            return authoritative;
+        }
         if !self.neural_blend.lambda.is_finite() || self.neural_blend.lambda <= 0.0 {
             return 0.0;
         }
