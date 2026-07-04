@@ -1,8 +1,7 @@
 # Remaining next steps (roadmap)
 
 Master checklist of outstanding work, prioritized. Detailed designs live in the
-referenced docs; this is the actionable index. Operational cluster facts drift quickly;
-verify current learner/tournament status through the runbook, DB, and rollout checks.
+referenced docs; this is the actionable index. Status as of 2026-06-28.
 
 ## Done & deployed (for context — no action)
 - Live `/soccer/` jumpiness fixed: WebSocket endpoint + **server-authoritative push**
@@ -38,11 +37,14 @@ slow WAN load on `:5099`).
 3. Re-enable a high `SOCCER_LIVE_POLICY_MIN_VISITS` / top-N load; re-measure `:5099` load time.
 
 ## P3 — Cluster learning ops
-- Treat the AWS continuous learner as the canonical RDS self-play lane, then verify its
-  current health from live rollout/log/DB state before changing it.
-- Hetzner is primarily the tournament farm unless a queue learner is explicitly enabled.
-  If queue pods are failing, diagnose live: pod logs, cronjob config, node reachability,
-  and whether the queue deployment is expected to be on for this experiment.
+- **Hetzner `dd-soccer-learning-queue` is failing** (Error pods seen this session; node SSH
+  was also refusing connections). Diagnose: `kubectl logs` the failed jobs, check the
+  cronjob, confirm the node/SSH. The AWS `dd-soccer-learning-rds-continuous` is healthy;
+  the Hetzner queue is the gap.
+- Roll status (2026-06-28): **AWS `dd-soccer-rs` = 1/1 with the jitter-buffer build ✓**.
+  **Hetzner SSH is timing out** (banner-exchange timeouts/resets) — can't verify its roll or
+  queue, and that node connectivity issue is almost certainly why the Hetzner learning-queue
+  is failing. First ops step: restore Hetzner node/SSH reachability, then re-check the queue.
 
 ## P4 — Step 2b (later): learned relational encoder
 Only after P1 proves value. Tiny GNN/attention encoder over the raw 22-body graph, trained
@@ -50,9 +52,7 @@ offline and **distilled into the same dense head shape** (still one forward pass
 Gated + eval-gated identically. The audit's #1 done within the 66 ms / 22-agent budget.
 
 ## Cross-cutting constraints (do not violate)
-- **66 ms / 15 Hz / 22-agent real-time budget** — no full-state per-tick GNN/RNN/deep MCTS;
-  bounded neural MCTS/PUCT may only rerank an already-legal, hard-capped candidate set
-  (`architecture-audit.md`).
+- **66 ms / 15 Hz / 22-agent real-time budget** — no per-tick GNN/RNN/MCTS (`architecture-audit.md`).
 - **Determinism** — new learnable paths land **default-OFF / byte-identical**; A/B behind the eval gate.
 - **New variables** — append at the tail (zero-pad old neural snapshots); keep them OUT of the
   tabular `state_key` unless re-accumulating that experiment.

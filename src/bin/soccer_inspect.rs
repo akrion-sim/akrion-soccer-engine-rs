@@ -53,11 +53,8 @@ fn parse_args() -> Result<Args, String> {
             }
             "--fields" | "--field" | "-f" => {
                 let raw = it.next().ok_or("--fields needs a value")?;
-                args.fields.extend(
-                    raw.split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty()),
-                );
+                args.fields
+                    .extend(raw.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
             }
             "--history" | "-n" => {
                 args.history = it
@@ -147,10 +144,7 @@ fn field_value(p: &PlayerInspect, field: &str) -> String {
         "decision_confidence" | "decisionconfidence" => format!("{:.4}", p.decision_confidence),
         "position" => format!("({:.2},{:.2})", p.position.x, p.position.y),
         "velocity" => format!("({:.2},{:.2})", p.velocity.x, p.velocity.y),
-        "speed" => format!(
-            "{:.2}",
-            (p.velocity.x.powi(2) + p.velocity.y.powi(2)).sqrt()
-        ),
+        "speed" => format!("{:.2}", (p.velocity.x.powi(2) + p.velocity.y.powi(2)).sqrt()),
         other => format!("<unknown:{other}>"),
     }
 }

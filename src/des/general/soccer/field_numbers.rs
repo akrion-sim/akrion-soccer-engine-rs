@@ -267,11 +267,9 @@ pub fn compute_field_numbers(
     // by how fast those teammates are arriving and by the team's forward shove. Zero unless
     // we both hold the ball and actually have the extra body forward.
     let offensive_numbers_urgency = if team_has_possession && ahead_overload > 0 {
-        let count_term =
-            (ahead_overload as f64 / FIELD_NUMBERS_OVERLOAD_SATURATION).clamp(0.0, 1.0);
+        let count_term = (ahead_overload as f64 / FIELD_NUMBERS_OVERLOAD_SATURATION).clamp(0.0, 1.0);
         let ratio_term = (ahead_ratio - 1.0).clamp(0.0, 1.0);
-        let momentum_term =
-            (teammate_ahead_momentum / FIELD_NUMBERS_OVERLOAD_SATURATION).clamp(0.0, 1.0);
+        let momentum_term = (teammate_ahead_momentum / FIELD_NUMBERS_OVERLOAD_SATURATION).clamp(0.0, 1.0);
         (count_term * 0.50 + ratio_term * 0.25 + momentum_term * 0.13 + own_push_term * 0.12)
             .clamp(0.0, 1.0)
     } else {
@@ -284,11 +282,9 @@ pub fn compute_field_numbers(
     // possession — a recovering player feels it even off the ball.
     let behind_deficit = (-behind_overload).max(0);
     let defensive_numbers_urgency = if behind_deficit > 0 {
-        let count_term =
-            (behind_deficit as f64 / FIELD_NUMBERS_OVERLOAD_SATURATION).clamp(0.0, 1.0);
+        let count_term = (behind_deficit as f64 / FIELD_NUMBERS_OVERLOAD_SATURATION).clamp(0.0, 1.0);
         let ratio_term = (1.0 - behind_ratio).clamp(0.0, 1.0);
-        let momentum_term =
-            (opponent_behind_threat / FIELD_NUMBERS_OVERLOAD_SATURATION).clamp(0.0, 1.0);
+        let momentum_term = (opponent_behind_threat / FIELD_NUMBERS_OVERLOAD_SATURATION).clamp(0.0, 1.0);
         (count_term * 0.50 + ratio_term * 0.25 + momentum_term * 0.13 + opp_push_term * 0.12)
             .clamp(0.0, 1.0)
     } else {
@@ -392,7 +388,11 @@ mod tests {
     #[test]
     fn outnumbered_at_the_back_sparks_defensive_urgency_off_ball() {
         // Two opponents goal-side of us, only one covering teammate: exposed at the back.
-        let bodies = [opponent_at(-10.0), opponent_at(-18.0), teammate_at(-14.0)];
+        let bodies = [
+            opponent_at(-10.0),
+            opponent_at(-18.0),
+            teammate_at(-14.0),
+        ];
         // Possession off — defensive urgency must still fire for a recovering player.
         let v = compute_field_numbers(&bodies, 0.0, 0.0, false);
         assert_eq!(v.opponents_behind, 2);

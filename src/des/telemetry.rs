@@ -35,10 +35,7 @@ pub fn init_soccer_telemetry(default_service_name: &'static str) -> SoccerTeleme
         match build_tracer_provider(&config) {
             Ok(provider) => Some(provider),
             Err(err) => {
-                eprintln!(
-                    "soccer_telemetry_otlp_init_failed service={} error={err}",
-                    config.service_name
-                );
+                eprintln!("soccer_telemetry_otlp_init_failed service={} error={err}", config.service_name);
                 None
             }
         }
@@ -74,10 +71,7 @@ pub fn init_soccer_telemetry(default_service_name: &'static str) -> SoccerTeleme
     };
 
     if let Err(err) = init_result {
-        eprintln!(
-            "soccer_telemetry_subscriber_init_failed service={} error={err}",
-            config.service_name
-        );
+        eprintln!("soccer_telemetry_subscriber_init_failed service={} error={err}", config.service_name);
     }
 
     SoccerTelemetryGuard { provider }
@@ -92,8 +86,7 @@ pub fn emit_process_start(service_name: &str) {
             .unwrap_or_else(|| "local".to_string()),
         pod = telemetry_env("HOSTNAME").unwrap_or_else(|| "local".to_string()),
         run_id = telemetry_env("SOCCER_RUN_ID").unwrap_or_else(|| "unset".to_string()),
-        source_commit =
-            telemetry_env("SOCCER_SOURCE_COMMIT").unwrap_or_else(|| "unknown".to_string())
+        source_commit = telemetry_env("SOCCER_SOURCE_COMMIT").unwrap_or_else(|| "unknown".to_string())
     );
 }
 
@@ -138,8 +131,8 @@ impl SoccerTelemetryConfig {
             "SOCCER_TELEMETRY_ENABLED",
             json_logs || otlp_traces || env::var_os("SOCCER_RUST_LOG").is_some(),
         );
-        let service_name = telemetry_env("SOCCER_SERVICE_NAME")
-            .unwrap_or_else(|| default_service_name.to_string());
+        let service_name =
+            telemetry_env("SOCCER_SERVICE_NAME").unwrap_or_else(|| default_service_name.to_string());
 
         Self {
             enabled,

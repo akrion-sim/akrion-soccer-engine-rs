@@ -16,11 +16,11 @@ pub mod streaming;
 // Soccer-only subsystems.
 pub mod runners;
 pub mod soccer_learning;
+pub mod telemetry;
 #[cfg(feature = "postgres-persistence")]
 pub mod soccer_learning_pg;
 #[cfg(feature = "planner")]
 pub mod soccer_planner;
-pub mod telemetry;
 
 // Thin demo runners (the bins wrap these).
 pub mod main_soccer;

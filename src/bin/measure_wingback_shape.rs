@@ -31,12 +31,7 @@ const OPP_HALF_CAP_YARDS: f64 = 5.0;
 
 fn env_on(name: &str) -> bool {
     std::env::var(name)
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false)
 }
 
@@ -116,8 +111,8 @@ fn main() {
                 }
 
                 // Rule 2: four-defender average depth past halfway (in attack frame).
-                let avg_y =
-                    defenders.iter().map(|p| p.position.y).sum::<f64>() / defenders.len() as f64;
+                let avg_y = defenders.iter().map(|p| p.position.y).sum::<f64>()
+                    / defenders.len() as f64;
                 let into_opp = (avg_y - half_length) * attack;
                 into_opp_sum += into_opp;
                 into_opp_max = into_opp_max.max(into_opp);
@@ -168,7 +163,9 @@ fn main() {
     let lt = line_team_ticks.max(1) as f64;
     let wt = wb_ticks.max(1) as f64;
     let wd = width_ticks.max(1) as f64;
-    println!("\n===== WING-BACK / BACK-FOUR SHAPE ({seeds} matches x {ticks} ticks) =====");
+    println!(
+        "\n===== WING-BACK / BACK-FOUR SHAPE ({seeds} matches x {ticks} ticks) ====="
+    );
     println!(
         "gates: single-wingback={}  lane-stickiness={}  resync-grace={}",
         label(single),

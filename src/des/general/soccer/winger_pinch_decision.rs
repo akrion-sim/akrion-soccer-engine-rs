@@ -245,11 +245,7 @@ impl WingerPinchHead {
                 self.training_steps += 1;
             }
         }
-        let mean = if applied > 0 {
-            total / applied as f64
-        } else {
-            0.0
-        };
+        let mean = if applied > 0 { total / applied as f64 } else { 0.0 };
         self.last_loss = Some(mean);
         mean
     }
@@ -367,10 +363,8 @@ impl WorldSnapshot {
                     && p.id != player.id
                     && self.ball.holder != Some(p.id)
                     && matches!(p.role, PlayerRole::Forward | PlayerRole::Midfielder)
-                    && self.point_in_own_penalty_area(
-                        player.team.other(),
-                        self.player_snapshot_position(p),
-                    )
+                    && self
+                        .point_in_own_penalty_area(player.team.other(), self.player_snapshot_position(p))
             })
             .count();
         let back_post_probe = winger_pinch::winger_pinch_target(
@@ -465,12 +459,13 @@ impl SoccerMatch {
             if self.pending_winger_pinch[i].due_tick <= tick {
                 let decision = self.pending_winger_pinch.swap_remove(i);
                 let now_territorial = territorial_advantage(snapshot, decision.team);
-                let territorial_delta =
-                    if now_territorial.is_finite() && decision.decision_territorial.is_finite() {
-                        now_territorial - decision.decision_territorial
-                    } else {
-                        0.0
-                    };
+                let territorial_delta = if now_territorial.is_finite()
+                    && decision.decision_territorial.is_finite()
+                {
+                    now_territorial - decision.decision_territorial
+                } else {
+                    0.0
+                };
                 let reward = decision.reward_accum
                     + WINGER_PINCH_TERRITORIAL_SHAPING_WEIGHT * territorial_delta;
                 if reward.is_finite() {
@@ -567,10 +562,7 @@ mod winger_pinch_model_tests {
     #[test]
     fn weak_side_deep_cross_with_space_biases_toward_pinching() {
         let b = analytic_winger_pinch_bias(&baseline_inputs());
-        assert!(
-            b > 0.0,
-            "a weak-side winger with a deep cross + space should pinch, got {b}"
-        );
+        assert!(b > 0.0, "a weak-side winger with a deep cross + space should pinch, got {b}");
     }
 
     #[test]
@@ -598,16 +590,8 @@ mod winger_pinch_model_tests {
         let samples: Vec<WingerPinchSample> = (0..32)
             .flat_map(|_| {
                 [
-                    WingerPinchSample {
-                        inputs: inputs.clone(),
-                        action_bias: 0.8,
-                        reward: 1.0,
-                    },
-                    WingerPinchSample {
-                        inputs: inputs.clone(),
-                        action_bias: -0.8,
-                        reward: -1.0,
-                    },
+                    WingerPinchSample { inputs: inputs.clone(), action_bias: 0.8, reward: 1.0 },
+                    WingerPinchSample { inputs: inputs.clone(), action_bias: -0.8, reward: -1.0 },
                 ]
             })
             .collect();

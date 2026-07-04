@@ -116,36 +116,6 @@ pub(crate) const CRASH_BOX_ARRIVAL_SHAPED_POINTS: f64 = 3.0;
 /// Minimum attackers in the box for the shaped arrival reward to pay out.
 pub(crate) const CRASH_BOX_ARRIVAL_MIN_RUNNERS: usize = 2;
 
-/// Small, bounded shaped PENALTY (per no-show) — the negative MIRROR of
-/// [`CRASH_BOX_ARRIVAL_SHAPED_POINTS`]. Charged when a qualifying flank aerial cross is
-/// delivered but fewer than [`CRASH_BOX_ARRIVAL_MIN_RUNNERS`] attackers crashed the box: the
-/// attacking-role no-shows nearest the box who should have completed the run are each charged
-/// this (capped at the runner shortfall, budget-bounded) so the "get bodies in the box" carrot
-/// gains its stick without ever rivalling the terminal goal credit.
-pub(crate) const CRASH_BOX_NO_SHOW_PENALTY_POINTS: f64 = 2.0;
-
-/// Opt-in env gate for the crash-box no-show penalty. **Default-OFF everywhere** (production and
-/// test) so the baseline and current network weights stay byte-identical until the flag is
-/// flipped on (`DD_SOCCER_ENABLE_CRASH_BOX_NO_SHOW_PENALTY=1`) for a retrain A/B — a brand-new
-/// penalty is opt-in, not a kill-switch default-on like the established arrival reward.
-pub(crate) const CRASH_BOX_NO_SHOW_PENALTY_ENABLE_ENV: &str =
-    "DD_SOCCER_ENABLE_CRASH_BOX_NO_SHOW_PENALTY";
-
-/// Whether the crash-box no-show penalty is active. Off unless the env flag is truthy; tests
-/// re-read the env each call (so an A/B can toggle it within the process), production caches once.
-pub(crate) fn crash_box_no_show_penalty_enabled() -> bool {
-    #[cfg(test)]
-    {
-        soccer_env_flag_enabled(CRASH_BOX_NO_SHOW_PENALTY_ENABLE_ENV)
-    }
-    #[cfg(not(test))]
-    {
-        use std::sync::OnceLock;
-        static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| soccer_env_flag_enabled(CRASH_BOX_NO_SHOW_PENALTY_ENABLE_ENV))
-    }
-}
-
 /// Seconds a released aerial cross keeps its "live cross" window open for crediting a headed
 /// finish. A real cross→header resolves within ~2–3 s.
 pub(crate) const FLANK_CRASH_BOX_CROSS_WINDOW_SECONDS: f64 = 3.0;

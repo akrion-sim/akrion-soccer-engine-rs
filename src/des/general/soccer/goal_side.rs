@@ -216,10 +216,7 @@ mod tests {
     fn caught_upfield_is_a_mild_negative() {
         // Upfield of the ball (y = 70 > 50) on the line ⇒ failed to recover ⇒ negative.
         let q = goal_side_quality(Vec2::new(40.0, 70.0), ball(), goal(), HALF, SAT);
-        assert!(
-            q < 0.0,
-            "ball-side defender failed to get goalside, got {q}"
-        );
+        assert!(q < 0.0, "ball-side defender failed to get goalside, got {q}");
         assert!(q >= -1.0);
     }
 
@@ -252,9 +249,6 @@ mod tests {
     #[test]
     fn degenerate_inputs_are_neutral() {
         // Ball sitting in the goal mouth ⇒ no axis ⇒ neutral.
-        assert_eq!(
-            goal_side_quality(Vec2::new(40.0, 5.0), goal(), goal(), HALF, SAT),
-            0.0
-        );
+        assert_eq!(goal_side_quality(Vec2::new(40.0, 5.0), goal(), goal(), HALF, SAT), 0.0);
     }
 }

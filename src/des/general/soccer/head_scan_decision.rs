@@ -29,10 +29,7 @@ const HEAD_SCAN_MODEL_DISABLE_ENV: &str = "DD_SOCCER_DISABLE_HEAD_SCAN_MODEL";
 
 fn env_flag(name: &str) -> Option<bool> {
     std::env::var(name).ok().map(|raw| {
-        matches!(
-            raw.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
+        matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
     })
 }
 
@@ -146,11 +143,7 @@ impl HeadScanHead {
             },
             &mut rng,
         );
-        HeadScanHead {
-            network,
-            training_steps: 0,
-            last_loss: None,
-        }
+        HeadScanHead { network, training_steps: 0, last_loss: None }
     }
 
     pub fn predict(&self, inputs: &HeadScanInputs) -> Option<f64> {
@@ -158,11 +151,7 @@ impl HeadScanHead {
         if features.iter().any(|v| !v.is_finite()) {
             return None;
         }
-        self.network
-            .predict(&features[..])
-            .first()
-            .copied()
-            .filter(|p| p.is_finite())
+        self.network.predict(&features[..]).first().copied().filter(|p| p.is_finite())
     }
 
     pub fn train_reward_weighted(&mut self, samples: &[HeadScanSample], learning_rate: f64) -> f64 {
@@ -175,11 +164,7 @@ impl HeadScanHead {
         }
         let n = finite.len() as f64;
         let baseline = finite.iter().map(|s| s.reward).sum::<f64>() / n;
-        let std = (finite
-            .iter()
-            .map(|s| (s.reward - baseline).powi(2))
-            .sum::<f64>()
-            / n)
+        let std = (finite.iter().map(|s| (s.reward - baseline).powi(2)).sum::<f64>() / n)
             .sqrt()
             .max(1e-3);
         let mut total = 0.0;
@@ -192,23 +177,15 @@ impl HeadScanHead {
             let advantage = (s.reward - baseline) / std;
             let weight = advantage.clamp(-4.0, 2.0).exp().min(7.5);
             let target = [s.action_bias.clamp(-1.0, 1.0)];
-            let result = self.network.train_sample_clipped(
-                &features[..],
-                &target,
-                learning_rate * weight,
-                4.0,
-            );
+            let result =
+                self.network.train_sample_clipped(&features[..], &target, learning_rate * weight, 4.0);
             if result.applied && result.loss.is_finite() {
                 total += result.loss;
                 applied += 1;
                 self.training_steps += 1;
             }
         }
-        let mean = if applied > 0 {
-            total / applied as f64
-        } else {
-            0.0
-        };
+        let mean = if applied > 0 { total / applied as f64 } else { 0.0 };
         self.last_loss = Some(mean);
         mean
     }
@@ -276,9 +253,9 @@ impl WorldSnapshot {
         let observer = self.players.iter().find(|p| p.id == observer_id)?;
         let pos = self.player_snapshot_position(observer);
         let attack_dir = observer.team.attack_dir();
-        let pressure = (1.0
-            - (self.nearest_opponent_distance_at(observer.team, pos) / 8.0).clamp(0.0, 1.0))
-        .clamp(0.0, 1.0);
+        let pressure =
+            (1.0 - (self.nearest_opponent_distance_at(observer.team, pos) / 8.0).clamp(0.0, 1.0))
+                .clamp(0.0, 1.0);
         let time_on_ball = (self.ball_holder_possession_seconds.max(0.0) / 2.0).clamp(0.0, 1.0);
         let options_behind = {
             let n = self
@@ -292,15 +269,11 @@ impl WorldSnapshot {
                 .count();
             (n as f64 / 4.0).clamp(0.0, 1.0)
         };
-        let ahead = Vec2 {
-            x: pos.x,
-            y: pos.y + attack_dir * 8.0,
-        };
-        let space_ahead =
-            (self.nearest_opponent_distance_at(observer.team, ahead) / 12.0).clamp(0.0, 1.0);
+        let ahead = Vec2 { x: pos.x, y: pos.y + attack_dir * 8.0 };
+        let space_ahead = (self.nearest_opponent_distance_at(observer.team, ahead) / 12.0)
+            .clamp(0.0, 1.0);
         let goal_y = observer.team.goal_y(self.field_length);
-        let in_final_third =
-            crash_box::ball_in_attacking_final_third(pos.y, goal_y, self.field_length);
+        let in_final_third = crash_box::ball_in_attacking_final_third(pos.y, goal_y, self.field_length);
         Some(HeadScanInputs {
             pressure,
             time_on_ball,
@@ -373,14 +346,15 @@ impl SoccerMatch {
             if self.pending_head_scan[i].due_tick <= tick {
                 let decision = self.pending_head_scan.swap_remove(i);
                 let now_territorial = territorial_advantage(snapshot, decision.team);
-                let territorial_delta =
-                    if now_territorial.is_finite() && decision.decision_territorial.is_finite() {
-                        now_territorial - decision.decision_territorial
-                    } else {
-                        0.0
-                    };
-                let reward = decision.reward_accum
-                    + HEAD_SCAN_TERRITORIAL_SHAPING_WEIGHT * territorial_delta;
+                let territorial_delta = if now_territorial.is_finite()
+                    && decision.decision_territorial.is_finite()
+                {
+                    now_territorial - decision.decision_territorial
+                } else {
+                    0.0
+                };
+                let reward =
+                    decision.reward_accum + HEAD_SCAN_TERRITORIAL_SHAPING_WEIGHT * territorial_delta;
                 if reward.is_finite() {
                     self.head_scan_samples.push(HeadScanSample {
                         inputs: decision.inputs,
@@ -485,36 +459,16 @@ mod head_scan_model_tests {
         let mut hi = HeadScanHead::new(1);
         let mut lo = HeadScanHead::new(1);
         let hi_s: Vec<HeadScanSample> = (0..32)
-            .flat_map(|_| {
-                [
-                    HeadScanSample {
-                        inputs: inputs.clone(),
-                        action_bias: 0.8,
-                        reward: 1.0,
-                    },
-                    HeadScanSample {
-                        inputs: inputs.clone(),
-                        action_bias: -0.8,
-                        reward: -1.0,
-                    },
-                ]
-            })
+            .flat_map(|_| [
+                HeadScanSample { inputs: inputs.clone(), action_bias: 0.8, reward: 1.0 },
+                HeadScanSample { inputs: inputs.clone(), action_bias: -0.8, reward: -1.0 },
+            ])
             .collect();
         let lo_s: Vec<HeadScanSample> = (0..32)
-            .flat_map(|_| {
-                [
-                    HeadScanSample {
-                        inputs: inputs.clone(),
-                        action_bias: -0.8,
-                        reward: 1.0,
-                    },
-                    HeadScanSample {
-                        inputs: inputs.clone(),
-                        action_bias: 0.8,
-                        reward: -1.0,
-                    },
-                ]
-            })
+            .flat_map(|_| [
+                HeadScanSample { inputs: inputs.clone(), action_bias: -0.8, reward: 1.0 },
+                HeadScanSample { inputs: inputs.clone(), action_bias: 0.8, reward: -1.0 },
+            ])
             .collect();
         for _ in 0..80 {
             hi.train_reward_weighted(&hi_s, 0.05);
