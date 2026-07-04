@@ -1,28 +1,40 @@
 # Climbing — how we got the neural net to actually improve (July 2026)
 
 Companion to [`reframe-july-2026.md`](./reframe-july-2026.md). That doc explains the
-*reframe*; this one explains **why the curve finally went up steeply**, and **how to build
-on the 22-player + ball field vector** so the neural net keeps climbing.
+*reframe*; this one explains **what actually moved the curve**, honestly (including where an
+early sample got ahead of the truth), and **how to build on the 22-player + ball field
+vector** so the neural net keeps climbing.
 
 ---
 
-## Part 1 — How we accomplished actual steep climbing
+## Part 1 — What we actually accomplished (honestly)
 
-The climb is real and measured. Against a fixed reference opponent, the authoritative net:
+The improvement is **real but modest and noisy** — the net went from **losing every game** to
+**roughly even** with a fixed reference opponent. Measured with clean 12-game held-out
+head-to-heads (authoritative both sides):
 
-| On-policy steps | Head-to-head vs reference | League round record |
-|---:|---:|---|
-| 85k  | **Δ −109** (loses) | — |
-| 106k | **Δ +105** (wins, 12-game) | round 1: 4W-11L (−7) |
-| 117k | positive (meter CPU-starved) | round 2: 4W-7L (−3) |
-| 128k | *(clean 12-game pending)* | round 3: **11W-4L (+7)** |
+| On-policy steps | Clean 12-game vs reference | Confident? (Wilson ≥ 0.5) | League round record |
+|---:|---:|---|---|
+| 85k  | **Δ −109** (0W-2D-1L) | clearly losing | — |
+| 106k | Δ **+105** (4W-7D-1L) | **no** (Wilson 0.35 — noisy high sample) | round 1: 4W-11L (−7) |
+| 128k | Δ **−12** (5W-2D-5L, GD 0) | no (Wilson 0.25) | round 3: **11W-4L (+7)** |
 
-A **+214 Elo swing** and a league record that went **−7 → −3 → +7** over ~40k on-policy
-steps — and, the part that actually matters, **visibly better play on the live server**.
-That is steep climbing, not motion.
+**Read it straight:** on-policy training pulled the net out of the broken off-policy state
+(−109, losing every game) up to **~even** with the reference. The **+105 was a noisy high
+sample, not a confident win** — its own Wilson lower bound was below the confidence floor, and
+the next clean read was ≈0. So this is **"went from clearly-losing to competitive,"** *not* a
+confident steep climb to beating the engine. (An earlier draft of this doc claimed a "+214
+steep climb"; that was a lucky 12-game sample getting ahead of the data — corrected here.)
 
-It took **four fixes stacked in the right order**. Any one alone did nothing; together they
-unlocked it.
+What *is* solid: (1) it improved from losing-everything to competitive; (2) the league round
+record trended up (−7 → −3 → +7 — though confounded by the growing league); (3) **the play is
+visibly better on the live server.** Real progress, honestly modest, and the head-to-head
+meter is too noisy at 12 games to claim a confident win — bigger samples (or a frozen eval
+pool) are needed to state the level precisely.
+
+The mechanism below is what took it from broken to competitive — **four fixes stacked in the
+right order**. Any one alone did nothing; together they made dense-reward RL actually move the
+play.
 
 ### 1. Make the neural net *decide*, not nudge
 
