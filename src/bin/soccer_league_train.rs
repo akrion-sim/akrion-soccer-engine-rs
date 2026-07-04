@@ -283,6 +283,20 @@ fn main() {
             opponents.push(TeamBrain::fresh_with_seed(0xABCD, 100));
         }
 
+        // SOCCER_LEAGUE_ANALYTIC_OPPONENTS=1: strip the net from every opponent so they play the
+        // PURE ANALYTIC engine (no net -> authoritative branch skipped -> hand-built engine
+        // decides). The frontier (authoritative neural) must then learn to BEAT the analytic
+        // engine to win — that IS the gradient to break past parity. (Genome variation still
+        // gives the analytic opponents slightly different styles.)
+        if std::env::var("SOCCER_LEAGUE_ANALYTIC_OPPONENTS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+        {
+            for opp in opponents.iter_mut() {
+                opp.neural = None;
+            }
+        }
+
         // Build this round's fixtures, then run them DATA-PARALLEL across N workers: each worker
         // clones the current frontier + runner, plays a disjoint slice (carry-forward within the
         // slice), and returns its trained net; we then AVERAGE the workers' nets. ~N× faster per
