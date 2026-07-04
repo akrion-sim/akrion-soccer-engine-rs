@@ -26,7 +26,8 @@ use std::time::Instant;
 
 use soccer_engine::des::general::soccer::SoccerNeuralNetworkSnapshot;
 use soccer_engine::des::general::tournament::{
-    EngineMatchRunner, EngineMatchRunnerConfig, TeamBrain, TournamentMatchContext, TournamentStage,
+    EngineMatchRunner, EngineMatchRunnerConfig, TeamBrain, TournamentMatchContext,
+    TournamentMatchRunner, TournamentStage,
 };
 
 fn env_str(k: &str, d: &str) -> String {
