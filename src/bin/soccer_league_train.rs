@@ -81,6 +81,49 @@ fn apply_weight_decay(s: &mut SoccerNeuralNetworkSnapshot, lambda: f64) {
     recompute_norm(s);
 }
 
+/// Tiny deterministic PRNG (xorshift64*) + Box-Muller gaussian, so the warm-restart perturbation
+/// is reproducible from (round, training_steps) without pulling in a rand dependency.
+struct WarmRng(u64);
+impl WarmRng {
+    fn unit(&mut self) -> f64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        ((self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)) >> 11) as f64 / ((1u64 << 53) as f64)
+    }
+    fn gauss(&mut self) -> f64 {
+        let u1 = self.unit().max(1e-12);
+        let u2 = self.unit();
+        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+    }
+}
+
+/// Warm-restart weight perturbation: add annealed Gaussian noise to a random fraction of the
+/// weights — an explicit "kick" out of the current basin (SGDR / simulated-annealing style). The
+/// next round's gradient then re-descends from the perturbed point, so the net can escape a local
+/// optimum instead of just settling deeper into parity. Env-gated (scale 0 = off).
+fn perturb_weights(s: &mut SoccerNeuralNetworkSnapshot, scale: f64, frac: f64, seed: u64) {
+    if !(scale > 0.0) || !(frac > 0.0) {
+        return;
+    }
+    let mut rng = WarmRng(seed | 1);
+    for layer in &mut s.layers {
+        for row in &mut layer.weights {
+            for w in row.iter_mut() {
+                if rng.unit() < frac {
+                    *w += scale * rng.gauss();
+                }
+            }
+        }
+        for b in &mut layer.biases {
+            if rng.unit() < frac {
+                *b += scale * rng.gauss();
+            }
+        }
+    }
+    recompute_norm(s);
+}
+
 /// Load the frontier neural snapshot from a learned-params.json (its `neuralNetwork` key).
 fn load_snapshot(path: &str) -> Option<SoccerNeuralNetworkSnapshot> {
     let raw = fs::read_to_string(path).ok()?;
