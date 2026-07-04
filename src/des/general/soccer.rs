@@ -5380,9 +5380,9 @@ const SOCCER_OUTCOME_CREDIT_MILESTONE_REWARD_CAP: f64 = GOAL_REWARD_POINTS;
 // terminal outcome (win + goal-margin) must DOMINATE so "beat the opponent" — not "play tidy" — is
 // what's optimized. Broadcast to every transition (clipped ±250), so this drives the value across
 // the whole game. Symmetric/zero-sum (loser gets the negation).
-const MATCH_OUTCOME_WIN_REWARD_POINTS: f64 = 40.0;
+const MATCH_OUTCOME_WIN_REWARD_POINTS: f64 = 200.0;
 const MATCH_OUTCOME_DRAW_REWARD_POINTS: f64 = 0.0;
-const MATCH_OUTCOME_PER_GOAL_MARGIN_POINTS: f64 = 14.0;
+const MATCH_OUTCOME_PER_GOAL_MARGIN_POINTS: f64 = 15.0;
 const MATCH_OUTCOME_MARGIN_CAP_GOALS: f64 = 5.0;
 // INSTANTANEOUS (single-frame) player speed ceiling: 25mph ≈ 12.22yps, plus a hair of
 // numerical margin. A human sprints at most ~25mph in a moment.
