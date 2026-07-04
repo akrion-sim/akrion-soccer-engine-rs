@@ -5375,10 +5375,15 @@ const SOCCER_OUTCOME_CREDIT_MILESTONE_REWARD_CAP: f64 = GOAL_REWARD_POINTS;
 // not absorbed because it differs by the realised result, which the state alone
 // cannot predict. Magnitudes are a starting point and MUST be A/B'd through the
 // promotion eval gate (held-out Elo/win-rate), never tuned on raw reward.
-const MATCH_OUTCOME_WIN_REWARD_POINTS: f64 = 8.0;
+// PLATEAU-BREAK rebalance (Jul 2026): the net topped out at PARITY because winning was a rounding
+// error in its objective (win +8 vs +100/goal + heavy dense shaping). Per TiZero/AlphaStar, the
+// terminal outcome (win + goal-margin) must DOMINATE so "beat the opponent" — not "play tidy" — is
+// what's optimized. Broadcast to every transition (clipped ±250), so this drives the value across
+// the whole game. Symmetric/zero-sum (loser gets the negation).
+const MATCH_OUTCOME_WIN_REWARD_POINTS: f64 = 40.0;
 const MATCH_OUTCOME_DRAW_REWARD_POINTS: f64 = 0.0;
-const MATCH_OUTCOME_PER_GOAL_MARGIN_POINTS: f64 = 1.5;
-const MATCH_OUTCOME_MARGIN_CAP_GOALS: f64 = 4.0;
+const MATCH_OUTCOME_PER_GOAL_MARGIN_POINTS: f64 = 14.0;
+const MATCH_OUTCOME_MARGIN_CAP_GOALS: f64 = 5.0;
 // INSTANTANEOUS (single-frame) player speed ceiling: 25mph ≈ 12.22yps, plus a hair of
 // numerical margin. A human sprints at most ~25mph in a moment.
 const SOCCER_PHYSICS_PLAYER_MAX_SPEED_YPS: f64 = 12.45;
