@@ -188,6 +188,19 @@ fn main() {
 
     let mut runner_config = EngineMatchRunnerConfig::default();
     runner_config.base.duration_seconds = minutes * 60.0;
+    // The runner's Inline backend is step-STARVED by default (~10 gradient steps/game),
+    // so the value net is hopelessly undertrained (net-negative vs the base engine even
+    // after many rounds). Crank the per-game training volume — replay + train-every-tick —
+    // so each game does thousands of updates (like the self-play threaded config did).
+    runner_config.base.neural_learning.train_every_ticks =
+        env_usize("SOCCER_LEAGUE_TRAIN_EVERY_TICKS", 1).max(1);
+    runner_config.base.neural_learning.max_batches_per_tick =
+        env_usize("SOCCER_LEAGUE_MAX_BATCHES_PER_TICK", 4).max(1);
+    runner_config.base.neural_learning.replay_capacity =
+        env_usize("SOCCER_LEAGUE_REPLAY_CAPACITY", 8192).max(1);
+    runner_config.base.neural_learning.replay_samples_per_tick =
+        env_usize("SOCCER_LEAGUE_REPLAY_SAMPLES_PER_TICK", 128).max(1);
+    runner_config.base.neural_learning.batch_size = env_usize("SOCCER_LEAGUE_BATCH_SIZE", 64).max(1);
     // Keep the engine's designed independent-brain mode (per-team critic drives each side).
     let mut runner = EngineMatchRunner::new(runner_config);
 
