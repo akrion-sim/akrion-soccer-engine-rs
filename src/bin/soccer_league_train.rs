@@ -283,26 +283,81 @@ fn main() {
             opponents.push(TeamBrain::fresh_with_seed(0xABCD, 100));
         }
 
+        // Build this round's fixtures, then run them DATA-PARALLEL across N workers: each worker
+        // clones the current frontier + runner, plays a disjoint slice (carry-forward within the
+        // slice), and returns its trained net; we then AVERAGE the workers' nets. ~N× faster per
+        // round while keeping the full opponent league. Cap kept modest (default 3) so we don't
+        // starve the box.
+        struct Fx {
+            opp_idx: usize,
+            opp_id: usize,
+            seed: u32,
+            home: bool,
+        }
+        let mut fixtures: Vec<Fx> = Vec::new();
         let mut fixture = 0u32;
-        let mut wins = 0i32;
-        let mut losses = 0i32;
-        for (idx, opp) in opponents.iter().enumerate() {
-            let opp_id = idx + 1;
+        for idx in 0..opponents.len() {
             for g in 0..games_per_opp {
                 let seed = train_seed_base
                     .wrapping_add(round.wrapping_mul(1_000_003))
                     .wrapping_add(fixture.wrapping_mul(2_246_822_519))
                     .wrapping_add(g as u32);
+                fixtures.push(Fx { opp_idx: idx, opp_id: idx + 1, seed, home: g % 2 == 0 });
                 fixture += 1;
-                let frontier_home = g % 2 == 0;
-                let (trained, gd) = play_and_carry(&mut runner, frontier, opp, seed, frontier_home, opp_id);
-                frontier = trained;
-                if gd > 0 {
-                    wins += 1;
-                } else if gd < 0 {
-                    losses += 1;
-                }
             }
+        }
+        let workers = env_usize("SOCCER_LEAGUE_PARALLELISM", 3).clamp(1, fixtures.len().max(1));
+        let base_steps = frontier
+            .neural
+            .as_ref()
+            .map(|s| s.training_steps)
+            .unwrap_or(0);
+        let chunk = fixtures.len().div_ceil(workers);
+        let wins_a = std::sync::atomic::AtomicI32::new(0);
+        let losses_a = std::sync::atomic::AtomicI32::new(0);
+        let trained_nets = std::sync::Mutex::new(Vec::<SoccerNeuralNetworkSnapshot>::new());
+        std::thread::scope(|scope| {
+            for w in 0..workers {
+                let lo = w * chunk;
+                let hi = ((w + 1) * chunk).min(fixtures.len());
+                if lo >= hi {
+                    continue;
+                }
+                let slice = &fixtures[lo..hi];
+                let opponents = &opponents;
+                let wins_a = &wins_a;
+                let losses_a = &losses_a;
+                let trained_nets = &trained_nets;
+                let mut runner = runner.clone();
+                let mut wf = frontier.clone();
+                scope.spawn(move || {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    for fx in slice {
+                        let (t, gd) = play_and_carry(
+                            &mut runner,
+                            wf,
+                            &opponents[fx.opp_idx],
+                            fx.seed,
+                            fx.home,
+                            fx.opp_id,
+                        );
+                        wf = t;
+                        if gd > 0 {
+                            wins_a.fetch_add(1, Relaxed);
+                        } else if gd < 0 {
+                            losses_a.fetch_add(1, Relaxed);
+                        }
+                    }
+                    if let Some(s) = wf.neural {
+                        trained_nets.lock().unwrap().push(s);
+                    }
+                });
+            }
+        });
+        let wins = wins_a.load(std::sync::atomic::Ordering::Relaxed);
+        let losses = losses_a.load(std::sync::atomic::Ordering::Relaxed);
+        if let Some(avg) = average_snapshots(base_steps, trained_nets.into_inner().unwrap()) {
+            frontier.neural = Some(avg);
         }
 
         // Weight decay to keep the net in the trainable regime.
