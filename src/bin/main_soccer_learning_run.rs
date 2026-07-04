@@ -4221,6 +4221,11 @@ fn run() -> Result<(), Box<dyn Error>> {
     )?;
     let write_checkpoint_artifacts =
         env_bool("SOCCER_WRITE_CHECKPOINT_ARTIFACTS", write_final_artifacts)?;
+    let write_learned_params_artifact = env_bool_alias(
+        "SOCCER_WRITE_LEARNED_PARAMS_ARTIFACT",
+        "SOCCER_WRITE_LEARNED_PARAMS_ARTIFACTS",
+        write_final_artifacts,
+    )?;
     let checkpoint_artifact_best_only =
         env_bool("SOCCER_CHECKPOINT_ARTIFACT_BEST_ONLY", false)?;
     let write_episode_log_file = env_bool(
@@ -5237,6 +5242,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     println!("write_final_artifacts={write_final_artifacts}");
     println!("write_final_policy_artifact={write_final_policy_artifact}");
     println!("write_checkpoint_artifacts={write_checkpoint_artifacts}");
+    println!("write_learned_params_artifact={write_learned_params_artifact}");
     println!("checkpoint_artifact_best_only={checkpoint_artifact_best_only}");
     println!("write_episode_log={write_episode_log_file}");
     if checkpoint_interval_games == 0 || !write_checkpoint_artifacts {
@@ -6568,12 +6574,20 @@ fn run() -> Result<(), Box<dyn Error>> {
                 artifact_max_entries_per_policy,
             );
             write_json(&checkpoint_write_path, &checkpoint_export)?;
-            let checkpoint_params =
-                SoccerSelfPlayLearnedParams::from_training_artifact_with_neural_network(
-                    &checkpoint_artifact,
-                    latest_neural_network.clone(),
+            if write_learned_params_artifact {
+                let checkpoint_params =
+                    SoccerSelfPlayLearnedParams::from_training_artifact_with_neural_network(
+                        &checkpoint_artifact,
+                        latest_neural_network.clone(),
+                    );
+                write_json(&checkpoint_learned_params_path, &checkpoint_params)?;
+            } else {
+                println!(
+                    "checkpoint_learned_params=disabled games_completed={} artifact={}",
+                    episode_summaries.len(),
+                    checkpoint_learned_params_path.display()
                 );
-            write_json(&checkpoint_learned_params_path, &checkpoint_params)?;
+            }
             if let Some(sidecar_path) = write_neural_sidecar_for_policy_artifact(
                 &checkpoint_write_path,
                 latest_neural_network.as_ref(),
@@ -6723,12 +6737,19 @@ fn run() -> Result<(), Box<dyn Error>> {
         } else {
             println!("final_policy_artifact=disabled");
         }
-        let learned_params =
-            SoccerSelfPlayLearnedParams::from_training_artifact_with_neural_network(
-                &artifact,
-                latest_neural_network.clone(),
+        if write_learned_params_artifact {
+            let learned_params =
+                SoccerSelfPlayLearnedParams::from_training_artifact_with_neural_network(
+                    &artifact,
+                    latest_neural_network.clone(),
+                );
+            write_json(&learned_params_path, &learned_params)?;
+        } else {
+            println!(
+                "learned_params_artifact=disabled path={}",
+                learned_params_path.display()
             );
-        write_json(&learned_params_path, &learned_params)?;
+        }
 
         let manifest = run_manifest(
             &run_id,
