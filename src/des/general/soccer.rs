@@ -2801,7 +2801,7 @@ const SAME_TEAM_MPC_OBSTACLE_WEIGHT_GAIN: f64 = 1.6;
 // The barrier + MPC keep-out have NO grace — the hard 4yd floor is always enforced; only the
 // learning penalty is graced. The 18-yard-box pair exception applies here too (nearest NON-EXEMPT
 // teammate only). All inert when the separation floor gate is off (timers stay 0).
-const SAME_TEAM_PROXIMITY_GRACE_LT7_SECONDS: f64 = 3.0;
+const SAME_TEAM_PROXIMITY_GRACE_LT7_SECONDS: f64 = 2.0;
 const SAME_TEAM_PROXIMITY_GRACE_LT6_SECONDS: f64 = 2.0;
 const SAME_TEAM_PROXIMITY_GRACE_LT5_SECONDS: f64 = 1.0;
 const SAME_TEAM_PROXIMITY_BAND_LT7_YARDS: f64 = 7.0;
