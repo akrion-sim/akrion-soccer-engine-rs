@@ -20984,6 +20984,23 @@ pub(crate) fn dd_soccer_dp_bootstrap_sweeps() -> usize {
     })
 }
 
+/// Gate for **value-target standardization** (the fix for value-head collapse). The value net
+/// trains on `target = (r + γ·max_next) / target_scale` with a fixed `target_scale` (30), which
+/// shrinks whole-game returns to a near-constant ~0.04 cluster; predicting that constant is
+/// loss-optimal, so the output layer's weights decay toward zero and the value function goes FLAT
+/// (verified: `mean|W_out|≈0.005`, output std ≈0.05 across all states). A flat value can't rank
+/// actions, so the authoritative decision defaults to the analytic candidate order ⇒ parity.
+/// ON re-centers + rescales each training batch's targets to ~zero-mean / unit-variance, so
+/// "predict the mean" is no longer loss-optimal and the net is forced to encode state-dependent
+/// value (ranking is scale/shift-invariant, so decisions are unaffected by the rescale). OFF
+/// (default) is byte-identical. Complements the DP bootstrap: DP sharpens the target signal,
+/// standardization makes the net actually use it.
+pub(crate) fn dd_soccer_enable_target_standardization() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_TARGET_STANDARDIZATION"))
+}
+
 /// Gate for interception-aware route-one / clearance training credit. OFF (the default) leaves the
 /// `soccer_goal_credit_transition_score` long-ball branch byte-identical to baseline, where a hoofed
 /// forward ball is credited purely on distance/pressure/urgency with NO interception or completion
