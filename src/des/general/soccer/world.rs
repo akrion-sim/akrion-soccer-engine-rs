@@ -2120,6 +2120,62 @@ mod tests {
     }
 
     #[test]
+    fn turnover_window_penalty_skips_non_possession_defensive_context() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            learning_enabled: true,
+            full_game_learning_enabled: true,
+            ..MatchConfig::default()
+        });
+        let attacker = sim
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home && player.role == PlayerRole::Forward)
+            .expect("home forward")
+            .id;
+        let defender = sim
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home && player.role == PlayerRole::Defender)
+            .expect("home defender")
+            .id;
+
+        sim.tick = 150;
+        let mut attacking_pass = world_test_transition(&sim, attacker, "pass", 146);
+        attacking_pass.state.possession_team = Some(Team::Home);
+        attacking_pass.next_state.possession_team = Some(Team::Home);
+        attacking_pass.observation.has_ball = true;
+        attacking_pass.next_observation.has_ball = false;
+        sim.turnover_penalty_history.push_back(attacking_pass);
+
+        let mut defending_action = world_test_transition(&sim, defender, "defend", 147);
+        defending_action.state.possession_team = Some(Team::Away);
+        defending_action.next_state.possession_team = Some(Team::Away);
+        defending_action.observation.has_ball = false;
+        defending_action.next_observation.has_ball = false;
+        sim.turnover_penalty_history.push_back(defending_action);
+
+        let deferred_start = sim.deferred_reward_transitions.len();
+        assert!(sim.penalize_turnover_window_with_context(
+            Team::Home,
+            Some(Team::Away),
+            Vec2::new(40.0, 60.0)
+        ));
+        let added = &sim.deferred_reward_transitions[deferred_start..];
+        assert_eq!(
+            added.len(),
+            1,
+            "only turnover-relevant context should be blamed"
+        );
+        assert_eq!(added[0].player_id, attacker);
+        assert!(
+            added
+                .iter()
+                .all(|transition| transition.reward < 0.0 && transition.player_id != defender),
+            "out-of-possession defensive actions must not receive turnover-window blame"
+        );
+    }
+
+    #[test]
     fn quick_receiver_dispossession_penalty_replays_original_pass_transition_across_ticks() {
         let mut sim = SoccerMatch::default_11v11(MatchConfig {
             learning_enabled: true,
@@ -23655,6 +23711,9 @@ impl SoccerMatch {
             if transition.team != losing_team {
                 continue;
             }
+            if !Self::turnover_window_blameable_transition(transition, losing_team) {
+                continue;
+            }
             let age = tick.saturating_sub(transition.tick) as f64;
             let recency = (1.0 - age / window as f64).clamp(0.0, 1.0);
             if recency <= 1e-3 {
@@ -23687,6 +23746,35 @@ impl SoccerMatch {
         self.deferred_reward_transitions.extend(penalized);
         self.cap_deferred_reward_transitions();
         true
+    }
+
+    fn turnover_window_blameable_transition(
+        transition: &SoccerLearningTransition,
+        losing_team: Team,
+    ) -> bool {
+        if transition.team != losing_team {
+            return false;
+        }
+        let had_possession_context = transition.observation.has_ball
+            || transition.next_observation.has_ball
+            || transition.state.possession_team == Some(losing_team)
+            || transition.next_state.possession_team == Some(losing_team);
+        if had_possession_context {
+            return true;
+        }
+
+        let action = normalize_soccer_action_label(&transition.action);
+        is_pass_like_action(action)
+            || is_dribble_action_label(action)
+            || matches!(
+                action,
+                "shoot"
+                    | "first-time-shot"
+                    | "first-time-header"
+                    | "carry"
+                    | "clearance"
+                    | "route-one"
+            )
     }
 
     pub(crate) fn learning_transitions_for(
