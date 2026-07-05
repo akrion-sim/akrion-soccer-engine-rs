@@ -14216,6 +14216,64 @@ fn soccer_dp_bootstrapped_replay_transitions(
     replay
 }
 
+#[cfg(test)]
+mod soccer_dp_bootstrap_tests {
+    use super::*;
+
+    #[test]
+    fn value_iteration_propagates_reward_backward_through_chain() {
+        // Chain 0 -> 1 -> 2, with reward 10 collected on the terminal step out of bucket 2.
+        // Fitted VI should give V(2)=10, V(1)=γ·10, V(0)=γ²·10 (monotone, all positive).
+        let samples = vec![
+            (0u32, 0.0, Some(1u32)),
+            (1u32, 0.0, Some(2u32)),
+            (2u32, 10.0, None),
+        ];
+        let gamma = 0.9;
+        let v = soccer_dp_value_iteration(&samples, gamma, 80);
+        let v0 = *v.get(&0).unwrap();
+        let v1 = *v.get(&1).unwrap();
+        let v2 = *v.get(&2).unwrap();
+        assert!((v2 - 10.0).abs() < 1e-6, "terminal-reward bucket = raw reward");
+        assert!((v1 - gamma * 10.0).abs() < 1e-6, "one step back discounts once");
+        assert!(
+            (v0 - gamma * gamma * 10.0).abs() < 1e-6,
+            "two steps back discounts twice"
+        );
+        assert!(v0 > 0.0 && v0 < v1 && v1 < v2, "value rises toward the reward");
+    }
+
+    #[test]
+    fn value_iteration_empty_is_empty() {
+        assert!(soccer_dp_value_iteration(&[], 0.98, 40).is_empty());
+    }
+
+    #[test]
+    fn nstep_return_truncates_horizon_and_bootstraps_value() {
+        // seq of (tick, reward, bucket); constant reward 1, all bucket 0; V(0)=5.
+        let seq = vec![(0u64, 1.0, 0u32), (1, 1.0, 0), (2, 1.0, 0), (3, 1.0, 0)];
+        let mut value = BTreeMap::new();
+        value.insert(0u32, 5.0);
+        let gamma = 0.9;
+        // horizon 2 from start 0: 1 + γ·1 + γ²·V(0) = 1 + 0.9 + 0.81·5 = 5.95.
+        let r = soccer_dp_nstep_return(&seq, 0, 2, gamma, &value);
+        assert!((r - 5.95).abs() < 1e-6, "n-step = discounted rewards + bootstrap, got {r}");
+        // At the tail (start 3) the window can't fill and has no successor ⇒ no bootstrap ⇒ just 1.0.
+        let tail = soccer_dp_nstep_return(&seq, 3, 2, gamma, &value);
+        assert!((tail - 1.0).abs() < 1e-6, "terminal tail bootstraps 0, got {tail}");
+    }
+
+    #[test]
+    fn nstep_return_without_value_table_is_plain_discounted_sum() {
+        // Empty value table ⇒ bootstrap term is 0 ⇒ pure n-step Monte-Carlo sum.
+        let seq = vec![(0u64, 2.0, 7u32), (1, 2.0, 7), (2, 2.0, 7)];
+        let empty = BTreeMap::new();
+        let r = soccer_dp_nstep_return(&seq, 0, 2, 0.5, &empty);
+        // 2 + 0.5·2 + 0.25·V(7=absent→0) = 3.0.
+        assert!((r - 3.0).abs() < 1e-9, "got {r}");
+    }
+}
+
 fn soccer_outcome_credit_replay_transitions(
     transitions: &[SoccerLearningTransition],
     match_outcome: Option<MatchOutcomeReward>,
