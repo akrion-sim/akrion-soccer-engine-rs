@@ -21020,6 +21020,37 @@ pub(crate) fn dd_soccer_neural_blend_candidates(config_value: usize) -> usize {
     .unwrap_or(config_value)
 }
 
+/// Gate for the **count-based novelty exploration bonus** (gate-two lever). The un-collapsed value
+/// can rank states but only *matches* the analytic engine because it only ever sees analytic-quality
+/// candidate actions — exploration diversifies among *already-visited* actions rather than seeking
+/// novel ones. ON adds an optimism bonus `coef / sqrt(1 + count(bucket, action))` to each training
+/// transition's reward, where `count` is how often that (abstract-state-bucket, action-family) pair
+/// appears in the batch. Rarely-tried actions get a bonus → the value rates them higher → the policy
+/// (which ranks by value) tries them → they get explored and their true value learned (optimism in
+/// the face of uncertainty). The bonus self-decays as an action becomes common. Reuses the DP
+/// abstract-state bucket. OFF (default) ⇒ byte-identical.
+pub(crate) fn dd_soccer_enable_novelty_bonus() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_NOVELTY_BONUS"))
+}
+
+/// Coefficient (in reward points) for the novelty exploration bonus. Bonus =
+/// `coef / sqrt(1 + count)`, so a never-before-seen (bucket, action) gets ~`coef` and it decays
+/// toward 0 as the pair is repeated. Default 6.0 (~a completed-pass-scale nudge). Env
+/// `DD_SOCCER_NOVELTY_BONUS_COEF`.
+pub(crate) fn dd_soccer_novelty_bonus_coef() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_NOVELTY_BONUS_COEF")
+            .ok()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|c| c.is_finite() && *c >= 0.0 && *c <= 100.0)
+            .unwrap_or(6.0)
+    })
+}
+
 /// Gate for interception-aware route-one / clearance training credit. OFF (the default) leaves the
 /// `soccer_goal_credit_transition_score` long-ball branch byte-identical to baseline, where a hoofed
 /// forward ball is credited purely on distance/pressure/urgency with NO interception or completion
