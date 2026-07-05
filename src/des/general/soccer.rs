@@ -5480,10 +5480,15 @@ const SOCCER_OUTCOME_CREDIT_MILESTONE_REWARD_CAP: f64 = GOAL_REWARD_POINTS;
 // local neural-authoritative learner now trains directly against the analytic
 // stack, so this label must be large enough to make "beat the match" dominate
 // dense pass/shape competence after target scaling.
-const MATCH_OUTCOME_WIN_REWARD_POINTS: f64 = 45.0;
+// PLATEAU-BREAK rebalance (Jul 2026): both main (8→45) and the local experiment independently
+// pushed the terminal outcome up to dominate dense shaping; adopting the stronger 200/15 so
+// "beat the opponent" — not "play tidy" — is unambiguously what the value is optimizing (TiZero/
+// AlphaStar). Broadcast to every transition (clipped ±SOCCER_FULL_GAME_RETURN_CLIP). MUST still be
+// A/B'd through the promotion eval gate; do not tune on raw reward.
+const MATCH_OUTCOME_WIN_REWARD_POINTS: f64 = 200.0;
 const MATCH_OUTCOME_DRAW_REWARD_POINTS: f64 = 0.0;
-const MATCH_OUTCOME_PER_GOAL_MARGIN_POINTS: f64 = 10.0;
-const MATCH_OUTCOME_MARGIN_CAP_GOALS: f64 = 4.0;
+const MATCH_OUTCOME_PER_GOAL_MARGIN_POINTS: f64 = 15.0;
+const MATCH_OUTCOME_MARGIN_CAP_GOALS: f64 = 5.0;
 // INSTANTANEOUS (single-frame) player speed ceiling: 25mph ≈ 12.22yps, plus a hair of
 // numerical margin. A human sprints at most ~25mph in a moment.
 const SOCCER_PHYSICS_PLAYER_MAX_SPEED_YPS: f64 = 12.45;
