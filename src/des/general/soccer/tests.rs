@@ -4448,7 +4448,7 @@ fn wide_misses_draw_an_accuracy_penalty_but_near_misses_do_not() {
         "a near miss inside the forgiveness margin draws no penalty"
     );
 
-    // 4yd wide: a small, capped, negative reward for the shooter == (4-0.5)*0.6.
+    // 4yd wide: a meaningful, capped, negative reward for the shooter == (4-0.5)*1.6.
     sim.record_shot_off_target_penalty(Team::Home, shooter, 4.0);
     let ev = sim
         .reward_events
@@ -4462,8 +4462,8 @@ fn wide_misses_draw_an_accuracy_penalty_but_near_misses_do_not() {
         ev.amount
     );
     assert!(
-        (ev.amount + 2.1).abs() < 1e-9,
-        "expected -(4-0.5)*0.6 = -2.1, got {}",
+        (ev.amount + 5.6).abs() < 1e-9,
+        "expected -(4-0.5)*1.6 = -5.6, got {}",
         ev.amount
     );
 
@@ -8399,7 +8399,10 @@ fn possession_run_time_step_uses_agentic_internal_operation_order() {
     sim.players[holder].incoming_ball = None;
 
     let snapshot = WorldSnapshot::from_match(&sim);
-    let observation = snapshot.observation_for(holder);
+    let mut observation = snapshot.observation_for(holder);
+    observation.aerial_forward_runner_pass_multiplier = 1.35;
+    observation.expected_aerial_pass_completion = 0.50;
+    observation.aerial_pass_interception_risk = 0.20;
     assert!(observation.has_ball);
     assert!(!observation.first_touch_available);
     assert!(
@@ -31632,7 +31635,7 @@ fn human_input_action_can_hoof_defensive_clearance() {
 }
 
 #[test]
-fn human_input_action_can_play_route_one_ball() {
+fn human_input_action_can_play_route_one_ball_when_last_ditch_pressure_makes_it_viable() {
     let mut session = SoccerRealtimeSession::new_without_controller_threads(MatchConfig {
         duration_seconds: 1.0,
         max_human_players: 1,
@@ -31640,14 +31643,17 @@ fn human_input_action_can_play_route_one_ball() {
         ..Default::default()
     });
     let holder = 6;
+    let presser = 12;
     {
         let sim = session.match_mut();
         sim.clear_controller_assignments();
         sim.assign_controller_slot(0, Some(holder))
             .expect("assign route-one player");
-        park_players_except(sim, &[holder]);
-        sim.players[holder].position = Vec2::new(42.0, 42.0);
+        park_players_except(sim, &[holder, presser]);
+        sim.players[holder].position = Vec2::new(42.0, 16.0);
         sim.players[holder].velocity = Vec2::zero();
+        sim.players[presser].position = Vec2::new(42.7, 17.5);
+        sim.players[presser].velocity = Vec2::zero();
         sim.ball.holder = Some(holder);
         sim.ball.position = sim.players[holder].position;
         sim.ball.velocity = Vec2::zero();
@@ -31686,6 +31692,65 @@ fn human_input_action_can_play_route_one_ball() {
             .as_ref()
             .map(|decision| decision.action.as_str()),
         Some("route-one")
+    );
+}
+
+#[test]
+fn calm_human_route_one_input_defer_to_regular_control() {
+    let mut session = SoccerRealtimeSession::new_without_controller_threads(MatchConfig {
+        duration_seconds: 1.0,
+        max_human_players: 1,
+        seed: 794,
+        ..Default::default()
+    });
+    let holder = 6;
+    {
+        let sim = session.match_mut();
+        sim.clear_controller_assignments();
+        sim.assign_controller_slot(0, Some(holder))
+            .expect("assign calm route-one player");
+        park_players_except(sim, &[holder]);
+        sim.players[holder].position = Vec2::new(42.0, 42.0);
+        sim.players[holder].velocity = Vec2::zero();
+        sim.ball.holder = Some(holder);
+        sim.ball.position = sim.players[holder].position;
+        sim.ball.velocity = Vec2::zero();
+        sim.ball.last_touch_team = Some(Team::Home);
+        sim.ball.last_decision = None;
+        sim.pending_pass = None;
+    }
+
+    let response = session.step(SoccerStepRequest {
+        inputs: vec![HumanInputFrame {
+            pace: 0,
+            controller_slot: 0,
+            player_id: Some(holder),
+            seq: 1,
+            axis: Vec2::zero(),
+            sprint: false,
+            pass: false,
+            pass_flight: PassFlight::Floor,
+            shoot: false,
+            action: Some("route1".to_string()),
+            target_player: None,
+        }],
+        ticks: 1,
+        record_every_ticks: Some(1),
+    });
+
+    assert_eq!(response.accepted_inputs, 1);
+    let sim = session.match_ref();
+    assert_eq!(sim.stats.route_one_balls_home, 0);
+    assert_eq!(sim.stats.clearances_home, 0);
+    assert_eq!(sim.stats.passes_attempted_home, 0);
+    assert!(sim.pending_pass.is_none());
+    assert_eq!(sim.ball.holder, Some(holder));
+    assert_eq!(
+        sim.players[holder]
+            .last_decision
+            .as_ref()
+            .map(|decision| decision.action.as_str()),
+        Some("human-move")
     );
 }
 
@@ -41087,6 +41152,7 @@ fn neural_threaded_worker_shutdown_closes_training_channel() {
         build_soccer_neural_network(&config, 9183),
         config.sanitized_learning_rate(),
         config.sanitized_max_pending_batches(),
+        None,
     );
 
     worker
@@ -41096,6 +41162,7 @@ fn neural_threaded_worker_shutdown_closes_training_channel() {
         .try_send(SoccerNeuralLearningWorkerCommand::Train {
             batches,
             snapshot_after_train: true,
+            popart_targets: Vec::new(),
         })
         .expect("queue training");
     // Signals cancel + drops the sender (closing the channel) and detaches the thread —
@@ -44561,6 +44628,66 @@ fn shot_attempt_reward_credits_last_ten_teammates_even_when_off_frame() {
     ));
     assert!(reward_for(shooter) > reward_for(chain[8]));
     assert!(reward_for(chain[8]) > reward_for(chain[0]));
+}
+
+#[test]
+fn out_of_play_missed_shot_records_attempt_and_accuracy_penalty() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 1544,
+        ..Default::default()
+    });
+    sim.tick = 42;
+    let chain = install_home_possession_chain(&mut sim, 10);
+    let shooter = *chain.last().unwrap();
+    sim.players[shooter].position = Vec2::new(
+        sim.config.field_width_yards * 0.5,
+        sim.config.field_length_yards - 12.0,
+    );
+    let start = sim.reward_events.len();
+
+    sim.apply_ball_outcome(BallStepOutcome::OutOfPlay {
+        restart: BallRestart {
+            kind: BallRestartKind::GoalKick,
+            awarded_team: Team::Away,
+            position: Vec2::new(
+                sim.config.field_width_yards * 0.5,
+                sim.config.field_length_yards,
+            ),
+        },
+        shot: Some(PendingShot {
+            team: Team::Home,
+            shooter,
+            origin: sim.players[shooter].position,
+        }),
+        shot_off_target_yards: 8.0,
+    });
+
+    let emitted = &sim.reward_events[start..];
+    assert!(
+        emitted.iter().any(|event| {
+            event.kind == SoccerRewardEventKind::ShotAttempt
+                && event.player_id == shooter
+                && event.amount > 0.0
+        }),
+        "a missed shot that goes out must still credit the shot attempt, got {emitted:?}"
+    );
+    assert!(
+        emitted.iter().any(|event| {
+            event.kind == SoccerRewardEventKind::ShotOffTargetPenalty
+                && event.player_id == shooter
+                && event.amount < 0.0
+        }),
+        "a missed shot that goes out must also penalize poor accuracy, got {emitted:?}"
+    );
+    assert!(
+        sim.events.iter().any(|event| {
+            event.kind == "miss"
+                && event.team == Some(Team::Home)
+                && event.player_id == Some(shooter)
+        }),
+        "missed shot finalization should emit the visible miss event"
+    );
 }
 
 #[test]
@@ -57653,7 +57780,10 @@ fn learned_route_one_uses_visible_runner_shaped_landing_zone() {
     sim.ball.last_touch_team = Some(Team::Home);
 
     let snapshot = WorldSnapshot::from_match(&sim);
-    let observation = snapshot.observation_for(holder);
+    let mut observation = snapshot.observation_for(holder);
+    observation.aerial_forward_runner_pass_multiplier = 1.35;
+    observation.expected_aerial_pass_completion = 0.50;
+    observation.aerial_pass_interception_risk = 0.20;
     let base = route_one_target_for_player(
         Team::Home,
         sim.players[holder].position,
@@ -58002,7 +58132,7 @@ fn untargeted_long_ball_penalizes_launcher_when_opponent_controls() {
 }
 
 #[test]
-fn pressure_and_own_half_make_clearance_and_route_one_legal_choices() {
+fn pressure_and_own_half_make_clearance_legal_but_route_one_last_ditch() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let defender = 2;
     sim.players[defender].position = Vec2::new(30.0, 28.0);
@@ -58034,14 +58164,65 @@ fn pressure_and_own_half_make_clearance_and_route_one_legal_choices() {
     assert!(observation.perceived_pressure >= 0.35);
     assert!(clearance.legal);
     assert!(clearance.probability > 0.0);
-    assert!(route_one.legal);
-    assert!(learned_action_label_is_legal("hoof", &snapshot, defender));
-    assert!(learned_action_label_is_legal("route1", &snapshot, defender));
+    assert!(!route_one.legal);
+    assert!(
+        learned_action_label_is_legal("hoof", &snapshot, defender),
+        "hoof is a clearance alias and should remain legal under generic pressure"
+    );
+    assert!(!learned_action_label_is_legal(
+        "route1", &snapshot, defender
+    ));
+    assert!(!learned_action_label_is_legal(
+        "longball", &snapshot, defender
+    ));
+    let route_one_plan = SoccerLearnedPlan {
+        action: "route-one".to_string(),
+        target_player: None,
+        target_point: None,
+        mpc_replan: None,
+    };
+    assert!(
+        sim.players[defender]
+            .action_from_learned_plan(&route_one_plan, &snapshot, &observation)
+            .is_none(),
+        "learned route-one should defer under generic own-half pressure; clearance is the safe release"
+    );
+
+    let mut last_ditch_observation = observation.clone();
+    last_ditch_observation.yards_to_own_goal = 16.0;
+    last_ditch_observation.pressure_urgency = last_ditch_observation.pressure_urgency.max(0.55);
+    last_ditch_observation.perceived_pressure = last_ditch_observation.perceived_pressure.max(0.55);
+    last_ditch_observation.defensive_urgency = last_ditch_observation.defensive_urgency.max(0.70);
+    assert!(
+        learned_action_label_is_legal_for_observation(
+            "route-one",
+            &snapshot,
+            defender,
+            &snapshot.players[defender],
+            &last_ditch_observation,
+        ),
+        "learned route-one remains available as a last-ditch box escape"
+    );
+    assert!(
+        sim.players[defender]
+            .action_from_learned_plan(&route_one_plan, &snapshot, &last_ditch_observation)
+            .is_some(),
+        "learned plan execution should allow last-ditch route-one"
+    );
 
     let mut calm_observation = observation.clone();
     calm_observation.perceived_pressure = 0.05;
     calm_observation.pressure_urgency = 0.05;
     calm_observation.immediate_dispossession_risk = 0.05;
+    calm_observation.defensive_urgency = calm_observation.defensive_urgency.min(0.10);
+    calm_observation.excessive_hold_pressure = 0.0;
+    calm_observation.visible_forward_pass_options =
+        calm_observation.visible_forward_pass_options.max(1);
+    calm_observation.open_support_outlets = calm_observation.open_support_outlets.max(1);
+    calm_observation.expected_pass_completion = calm_observation.expected_pass_completion.max(0.72);
+    calm_observation.best_pass_receiver_openness =
+        calm_observation.best_pass_receiver_openness.max(0.72);
+    calm_observation.attacking_overload_score = 0.80;
     calm_observation.decision_urgency = calm_observation
         .offensive_urgency
         .max(calm_observation.defensive_urgency);
@@ -58066,9 +58247,52 @@ fn pressure_and_own_half_make_clearance_and_route_one_legal_choices() {
     assert_eq!(calm_clearance.probability, 0.0);
     assert!(
         !calm_route_one.legal,
-        "route-one should need pressure, a vertical runner, or poor outlets"
+        "route-one should need pressure, a vertical runner, or poor outlets; overload alone is not enough"
     );
     assert_eq!(calm_route_one.probability, 0.0);
+    assert!(
+        !learned_action_label_is_legal_for_observation(
+            "route1",
+            &snapshot,
+            defender,
+            &snapshot.players[defender],
+            &calm_observation,
+        ),
+        "learned legality must not re-open calm own-half route-one"
+    );
+    assert!(
+        sim.players[defender]
+            .action_from_learned_plan(&route_one_plan, &snapshot, &calm_observation)
+            .is_none(),
+        "learned plan execution must defer on calm own-half route-one"
+    );
+
+    let mut speculative_runner_observation = calm_observation.clone();
+    speculative_runner_observation.visible_forward_pass_options = 0;
+    speculative_runner_observation.open_support_outlets = 0;
+    speculative_runner_observation.expected_pass_completion = 0.22;
+    speculative_runner_observation.best_pass_receiver_openness = 0.20;
+    speculative_runner_observation.aerial_forward_runner_pass_multiplier = 1.45;
+    speculative_runner_observation.expected_aerial_pass_completion = 0.40;
+    speculative_runner_observation.aerial_pass_interception_risk =
+        LEARNED_PASS_MAX_INTERCEPTION_RISK - 0.05;
+    speculative_runner_observation.nearest_opponent_distance = 30.0;
+    assert!(
+        !learned_action_label_is_legal_for_observation(
+            "route-one",
+            &snapshot,
+            defender,
+            &snapshot.players[defender],
+            &speculative_runner_observation,
+        ),
+        "a speculative runner window without pressure must not reopen learned route-one"
+    );
+    assert!(
+        sim.players[defender]
+            .action_from_learned_plan(&route_one_plan, &snapshot, &speculative_runner_observation)
+            .is_none(),
+        "learned plan execution must reject speculative calm route-one"
+    );
 }
 
 #[test]

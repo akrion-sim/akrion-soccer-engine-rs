@@ -5087,23 +5087,30 @@ impl PlayerAgent {
         let route_one_attack_signal = observation.attacking_overload_score.clamp(0.0, 1.0);
         let route_one_runner_signal =
             ((observation.aerial_forward_runner_pass_multiplier - 1.0) / 0.50).clamp(0.0, 1.0);
-        let route_one_low_outlets = pass_target_count == 0
-            || (pass_target_count <= 1 && observation.expected_pass_completion < 0.38)
-            || observation.expected_pass_completion < 0.28;
-        let route_one_vertical_window = route_one_attack_signal >= 0.42
-            || (route_one_runner_signal >= 0.38
-                && observation.expected_aerial_pass_completion >= 0.30);
-        let route_one_release_need = route_one_pressure_signal >= 0.30
-            || (defensive_urgency >= 0.40 && route_one_pressure_signal >= 0.18)
-            || (route_one_low_outlets && route_one_pressure_signal >= 0.14);
+        let route_one_safe_short_outlet = observation.visible_forward_pass_options > 0
+            && observation.expected_pass_completion >= OPEN_OUTLET_RELEASE_COMPLETION
+            && observation.best_pass_receiver_openness >= OPEN_OUTLET_RELEASE_OPENNESS;
+        let route_one_vertical_window = route_one_runner_signal >= 0.52
+            && observation.expected_aerial_pass_completion >= 0.45
+            && observation.aerial_pass_interception_risk <= LEARNED_PASS_MAX_INTERCEPTION_RISK;
+        let route_one_release_need = defensive_urgency >= 0.62 && route_one_pressure_signal >= 0.50;
+        let route_one_forced_escape = route_one_pressure_signal >= 0.55
+            || observation.immediate_dispossession_risk >= 0.50
+            || defensive_urgency >= 0.62
+            || observation.yards_to_own_goal <= 18.0;
+        let route_one_last_ditch =
+            observation.yards_to_own_goal <= 18.0 && route_one_pressure_signal >= 0.50;
         let route_one_proximity_gate = observation.nearest_opponent_distance <= 24.0
             || observation.immediate_dispossession_risk >= 0.45
             || defensive_urgency >= 0.52
-            || observation.yards_to_own_goal <= 24.0
+            || observation.yards_to_own_goal <= 18.0
             || route_one_vertical_window;
+        let route_one_outlet_gate =
+            !route_one_safe_short_outlet || route_one_forced_escape || route_one_vertical_window;
         let route_one_legal = own_half
             && route_one_proximity_gate
-            && (route_one_release_need || route_one_vertical_window);
+            && route_one_outlet_gate
+            && (route_one_vertical_window || (route_one_release_need && route_one_last_ditch));
         let route_one_score = ((0.05
             + directive.risk_tolerance * 0.12
             + passing * 0.12
@@ -10795,7 +10802,13 @@ impl PlayerAgent {
                     "route-one" => {
                         order_names.push("route-one".to_string());
                         let route_one_chance = action_option_score(&action_options, "route-one");
-                        if agentic_action_commitment(
+                        let visible_runner_target = snapshot.route_one_target_for(self.id);
+                        if Self::learned_route_one_viable(
+                            &observation,
+                            self.role,
+                            ability01(self.skills.dribbling),
+                            visible_runner_target.is_some(),
+                        ) && agentic_action_commitment(
                             route_one_chance,
                             snapshot.dt_seconds,
                             &observation,
@@ -10803,17 +10816,15 @@ impl PlayerAgent {
                         ) {
                             chosen = Some((
                                 SoccerAction::RouteOne {
-                                    target: snapshot.route_one_target_for(self.id).unwrap_or_else(
-                                        || {
-                                            route_one_target_for_actor(
-                                                self.team,
-                                                self.position,
-                                                snapshot.field_width,
-                                                snapshot.field_length,
-                                                self.role,
-                                            )
-                                        },
-                                    ),
+                                    target: visible_runner_target.unwrap_or_else(|| {
+                                        route_one_target_for_actor(
+                                            self.team,
+                                            self.position,
+                                            snapshot.field_width,
+                                            snapshot.field_length,
+                                            self.role,
+                                        )
+                                    }),
                                     power: 0.76
                                         + 0.18 * passing_skill.max(ability01(self.skills.strength)),
                                 },
@@ -11734,23 +11745,33 @@ impl PlayerAgent {
                                 },
                                 "clearance".to_string(),
                             )),
-                            "route-one" => Some((
-                                SoccerAction::RouteOne {
-                                    target: snapshot.route_one_target_for(self.id).unwrap_or_else(
-                                        || {
-                                            route_one_target_for_actor(
-                                                self.team,
-                                                self.position,
-                                                snapshot.field_width,
-                                                snapshot.field_length,
-                                                self.role,
-                                            )
+                            "route-one" => {
+                                let visible_runner_target = snapshot.route_one_target_for(self.id);
+                                if Self::learned_route_one_viable(
+                                    &observation,
+                                    self.role,
+                                    ability01(self.skills.dribbling),
+                                    visible_runner_target.is_some(),
+                                ) {
+                                    Some((
+                                        SoccerAction::RouteOne {
+                                            target: visible_runner_target.unwrap_or_else(|| {
+                                                route_one_target_for_actor(
+                                                    self.team,
+                                                    self.position,
+                                                    snapshot.field_width,
+                                                    snapshot.field_length,
+                                                    self.role,
+                                                )
+                                            }),
+                                            power: 0.80,
                                         },
-                                    ),
-                                    power: 0.80,
-                                },
-                                "route-one".to_string(),
-                            )),
+                                        "route-one".to_string(),
+                                    ))
+                                } else {
+                                    None
+                                }
+                            }
                             _ => None,
                         };
                         candidate
@@ -13063,28 +13084,39 @@ impl PlayerAgent {
                     "clearance".to_string(),
                 ))
             }
-            "route-one" if observation.has_ball => Some((
-                SoccerAction::RouteOne {
-                    target: plan
-                        .target_point
-                        .map(|target| {
-                            target.clamp_to_pitch(snapshot.field_width, snapshot.field_length)
-                        })
-                        .unwrap_or_else(|| {
-                            snapshot.route_one_target_for(self.id).unwrap_or_else(|| {
-                                route_one_target_for_actor(
-                                    self.team,
-                                    self.position,
-                                    snapshot.field_width,
-                                    snapshot.field_length,
-                                    self.role,
-                                )
+            "route-one" if observation.has_ball => {
+                let visible_runner_target = snapshot.route_one_target_for(self.id);
+                if !Self::learned_route_one_viable(
+                    observation,
+                    self.role,
+                    ability01(self.skills.dribbling),
+                    visible_runner_target.is_some(),
+                ) {
+                    return None;
+                }
+                Some((
+                    SoccerAction::RouteOne {
+                        target: plan
+                            .target_point
+                            .map(|target| {
+                                target.clamp_to_pitch(snapshot.field_width, snapshot.field_length)
                             })
-                        }),
-                    power: 0.88,
-                },
-                "route-one".to_string(),
-            )),
+                            .unwrap_or_else(|| {
+                                visible_runner_target.unwrap_or_else(|| {
+                                    route_one_target_for_actor(
+                                        self.team,
+                                        self.position,
+                                        snapshot.field_width,
+                                        snapshot.field_length,
+                                        self.role,
+                                    )
+                                })
+                            }),
+                        power: 0.88,
+                    },
+                    "route-one".to_string(),
+                ))
+            }
             "hold-up-flank" if observation.has_ball => {
                 if goal_approach_forces_goalmouth_carry(observation, self.role) {
                     let kind = DribbleMoveKind::CarryForward;
@@ -13734,6 +13766,68 @@ impl PlayerAgent {
             && observation.best_pass_receiver_openness < LEARNED_PASS_MIN_OPENNESS
             && observation.forward_dribble_space_yards < DRIBBLE_OPEN_PLAY_MIN_FORWARD_SPACE_YARDS;
         close_danger && no_safe_short_option
+    }
+
+    pub(crate) fn learned_route_one_viable(
+        observation: &SoccerPomdpObservation,
+        role: PlayerRole,
+        dribbling01: f64,
+        has_visible_runner_target: bool,
+    ) -> bool {
+        if !observation.has_ball || observation.yards_to_own_goal >= observation.yards_to_goal {
+            return false;
+        }
+
+        let pressure_signal = observation
+            .pressure_urgency
+            .max(observation.perceived_pressure)
+            .max(observation.immediate_dispossession_risk)
+            .max(observation.excessive_hold_pressure)
+            .max(excessive_hold_pressure(observation, dribbling01))
+            .clamp(0.0, 1.0);
+        let runner_signal =
+            ((observation.aerial_forward_runner_pass_multiplier - 1.0) / 0.50).clamp(0.0, 1.0);
+        let true_vertical_runner = runner_signal >= 0.52
+            && observation.expected_aerial_pass_completion >= 0.45
+            && observation.aerial_pass_interception_risk <= LEARNED_PASS_MAX_INTERCEPTION_RISK;
+        let safe_short_outlet = observation.visible_forward_pass_options > 0
+            && observation.expected_pass_completion >= OPEN_OUTLET_RELEASE_COMPLETION
+            && observation.best_pass_receiver_openness >= OPEN_OUTLET_RELEASE_OPENNESS;
+        let snapshot_vertical_window = has_visible_runner_target
+            && !safe_short_outlet
+            && observation.expected_aerial_pass_completion >= 0.38
+            && observation.aerial_pass_interception_risk <= LEARNED_PASS_MAX_INTERCEPTION_RISK;
+        let release_need = observation.defensive_urgency >= 0.62 && pressure_signal >= 0.50;
+        let forced_escape = pressure_signal >= 0.55
+            || observation.immediate_dispossession_risk >= 0.50
+            || observation.defensive_urgency >= 0.62
+            || observation.yards_to_own_goal <= 18.0;
+        let pressure_or_emergency = pressure_signal >= 0.30
+            || (observation.defensive_urgency >= 0.40 && pressure_signal >= 0.18)
+            || observation.yards_to_own_goal <= 18.0;
+        let last_ditch_escape = observation.yards_to_own_goal <= 18.0 && pressure_signal >= 0.50;
+        let proximity_gate = observation.nearest_opponent_distance <= 24.0
+            || observation.immediate_dispossession_risk >= 0.45
+            || observation.defensive_urgency >= 0.52
+            || observation.yards_to_own_goal <= 18.0
+            || true_vertical_runner
+            || (snapshot_vertical_window && pressure_or_emergency);
+        let outlet_gate = !safe_short_outlet
+            || forced_escape
+            || true_vertical_runner
+            || (snapshot_vertical_window && pressure_or_emergency);
+        let role_can_release = !matches!(role, PlayerRole::Forward)
+            || pressure_signal >= 0.45
+            || true_vertical_runner
+            || (snapshot_vertical_window && pressure_or_emergency)
+            || last_ditch_escape;
+
+        role_can_release
+            && proximity_gate
+            && outlet_gate
+            && (true_vertical_runner
+                || (snapshot_vertical_window && pressure_or_emergency && release_need)
+                || (release_need && last_ditch_escape))
     }
 
     fn learned_stale_dribble_release_override(

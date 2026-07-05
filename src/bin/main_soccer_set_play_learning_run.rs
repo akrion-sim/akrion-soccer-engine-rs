@@ -322,6 +322,10 @@ fn run() -> Result<(), Box<dyn Error>> {
             "SOCCER_NEURAL_TARGET_CLIP",
             SoccerNeuralLearningConfig::default().target_clip,
         )?,
+        target_popart_enabled: env_bool(
+            "SOCCER_NEURAL_TARGET_POPART",
+            SoccerNeuralLearningConfig::default().target_popart_enabled,
+        )?,
         snapshot_every_batches: env_parse(
             "SOCCER_NEURAL_SNAPSHOT_EVERY_BATCHES",
             SoccerNeuralLearningConfig::default().snapshot_every_batches,

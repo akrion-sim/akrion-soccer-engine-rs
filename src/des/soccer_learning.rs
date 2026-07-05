@@ -1560,6 +1560,13 @@ pub fn soccer_neural_network_snapshot_fingerprint(snapshot: &SoccerNeuralNetwork
             }
         }
     }
+    if let Some(popart) = snapshot.target_popart {
+        soccer_learning_fingerprint_str(&mut hash, "targetPopArt");
+        soccer_learning_fingerprint_usize(&mut hash, popart.count);
+        soccer_learning_fingerprint_f64(&mut hash, popart.mean);
+        soccer_learning_fingerprint_f64(&mut hash, popart.std);
+        soccer_learning_fingerprint_f64(&mut hash, popart.m2);
+    }
     hash
 }
 

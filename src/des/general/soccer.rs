@@ -1225,15 +1225,15 @@ const OFF_BALL_CARRIER_COLLAPSE_PENALTY: f64 = 8.0;
 // The carrier is "pressured" (and so genuinely wants a short option) when its nearest opponent is
 // inside this radius; the keep-out / marginal-cancel are suspended in that case.
 const OFF_BALL_CARRIER_PRESSURED_YARDS: f64 = 4.5;
-// A shot OFF the frame still earns a small attempt reward, but it must stay far below
-// the on-frame value so the learner improves shot quality instead of volume alone.
-const SHOT_OFF_TARGET_REWARD_POINTS: f64 = 12.0;
+// A shot OFF the frame earns only a tiny attempt reward. Wide misses must be net-negative after
+// the accuracy penalty below, otherwise the learner can optimize for shot volume instead of SOT.
+const SHOT_OFF_TARGET_REWARD_POINTS: f64 = 4.0;
 // Shot accuracy: a missed effort that crosses the line more than this far outside the
 // nearest post draws a small per-yard penalty (capped), so the policy is taught to hit
 // the frame rather than blaze it wide. Within the forgiveness margin a near-miss is free.
 const SHOT_OFF_TARGET_FORGIVENESS_YARDS: f64 = 0.5;
-const SHOT_OFF_TARGET_PENALTY_PER_YARD: f64 = 0.8;
-const SHOT_OFF_TARGET_MAX_PENALTY_POINTS: f64 = 5.0;
+const SHOT_OFF_TARGET_PENALTY_PER_YARD: f64 = 1.6;
+const SHOT_OFF_TARGET_MAX_PENALTY_POINTS: f64 = 14.0;
 // Base reward for a completed forward pass. Deliberately kept WELL BELOW the shot-on-target
 // (40) and goal (100) rewards so that a string of successive forward passes can never out-earn
 // shooting/scoring — otherwise "pass in succession forever" becomes the optimal POMDP policy.
@@ -5389,6 +5389,7 @@ pub const DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE: f64 = 0.25;
 /// `FeedForwardNetwork::train_sample_clipped`, which drops poisoned steps
 /// outright so the value blended back into live play can never go NaN.
 const SOCCER_NEURAL_GRAD_CLIP_NORM: f64 = 8.0;
+const SOCCER_NEURAL_POPART_MIN_STD: f64 = 1.0e-3;
 /// Sensitivity of the formation-LP forward-pull to the value head's per-team
 /// advance-vs-hold advantage (in Q units). The advantage is squashed through
 /// `tanh(advantage · this)` into a [0, 1] pull, so a modest scale keeps the LP
@@ -5802,6 +5803,10 @@ fn default_soccer_neural_replay_samples_per_tick() -> usize {
 
 fn default_soccer_neural_target_clip() -> f64 {
     DEFAULT_SOCCER_NEURAL_TARGET_CLIP
+}
+
+fn default_soccer_neural_popart_std() -> f64 {
+    1.0
 }
 
 fn default_soccer_neural_snapshot_every_batches() -> usize {
@@ -17688,6 +17693,12 @@ pub struct SoccerNeuralLearningConfig {
     pub replay_samples_per_tick: usize,
     #[serde(default = "default_soccer_neural_target_clip")]
     pub target_clip: f64,
+    /// PopArt target normalization for the value critic. When enabled, clipped
+    /// target units are tracked with a running mean/std, the network trains on
+    /// normalized labels, and output-layer affine weights are rescaled whenever
+    /// stats move so unnormalized predictions remain stable.
+    #[serde(default)]
+    pub target_popart_enabled: bool,
     #[serde(default = "default_soccer_neural_snapshot_every_batches")]
     pub snapshot_every_batches: usize,
     /// When enabled, the gradient-trained critic feeds the formation LP: each
@@ -17750,6 +17761,7 @@ impl Default for SoccerNeuralLearningConfig {
             replay_capacity: DEFAULT_SOCCER_NEURAL_REPLAY_CAPACITY,
             replay_samples_per_tick: DEFAULT_SOCCER_NEURAL_REPLAY_SAMPLES_PER_TICK,
             target_clip: DEFAULT_SOCCER_NEURAL_TARGET_CLIP,
+            target_popart_enabled: false,
             snapshot_every_batches: DEFAULT_SOCCER_NEURAL_SNAPSHOT_EVERY_BATCHES,
             lp_coupling_enabled: false,
             critic_baseline_weight: 0.0,
@@ -36933,6 +36945,97 @@ pub struct SoccerNeuralLayerSnapshot {
     pub biases: Vec<f64>,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SoccerNeuralTargetPopArtStats {
+    #[serde(default)]
+    pub count: usize,
+    #[serde(default)]
+    pub mean: f64,
+    #[serde(default = "default_soccer_neural_popart_std")]
+    pub std: f64,
+    #[serde(default)]
+    pub m2: f64,
+}
+
+impl Default for SoccerNeuralTargetPopArtStats {
+    fn default() -> Self {
+        SoccerNeuralTargetPopArtStats {
+            count: 0,
+            mean: 0.0,
+            std: 1.0,
+            m2: 0.0,
+        }
+    }
+}
+
+impl SoccerNeuralTargetPopArtStats {
+    fn sanitized(self) -> Self {
+        let mut stats = self;
+        if stats.count == 0 {
+            return SoccerNeuralTargetPopArtStats::default();
+        }
+        if !stats.mean.is_finite() {
+            stats.mean = 0.0;
+        }
+        if !stats.std.is_finite() || stats.std < SOCCER_NEURAL_POPART_MIN_STD {
+            stats.std = 1.0;
+        }
+        if !stats.m2.is_finite() || stats.m2 < 0.0 {
+            stats.m2 = 0.0;
+        }
+        if stats.count > 1 && stats.m2 <= 0.0 {
+            stats.m2 = stats.std * stats.std * (stats.count.saturating_sub(1) as f64);
+        }
+        stats
+    }
+
+    fn normalize(self, target: f64) -> f64 {
+        let stats = self.sanitized();
+        ((target - stats.mean) / stats.std).clamp(-8.0, 8.0)
+    }
+
+    fn denormalize(self, value: f64) -> f64 {
+        let stats = self.sanitized();
+        value * stats.std + stats.mean
+    }
+
+    fn observe_targets<I>(&mut self, targets: I) -> Option<(Self, Self)>
+    where
+        I: IntoIterator<Item = f64>,
+    {
+        let old = self.sanitized();
+        let mut next = old;
+        let mut observed = false;
+        for target in targets {
+            if !target.is_finite() {
+                continue;
+            }
+            observed = true;
+            let count = next.count.saturating_add(1);
+            let delta = target - next.mean;
+            next.mean += delta / (count as f64);
+            let delta2 = target - next.mean;
+            next.m2 += delta * delta2;
+            next.count = count;
+        }
+        if !observed {
+            *self = old;
+            return None;
+        }
+        if next.count > 1 {
+            next.std = (next.m2 / (next.count.saturating_sub(1) as f64))
+                .sqrt()
+                .max(SOCCER_NEURAL_POPART_MIN_STD);
+        } else {
+            next.std = old.std.max(SOCCER_NEURAL_POPART_MIN_STD);
+        }
+        next = next.sanitized();
+        *self = next;
+        Some((old, next))
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SoccerNeuralNetworkSnapshot {
@@ -36952,6 +37055,11 @@ pub struct SoccerNeuralNetworkSnapshot {
     pub training_steps: usize,
     #[serde(default)]
     pub average_loss: Option<f64>,
+    /// Running PopArt target stats for the top-level value critic. These stats
+    /// are required to denormalize the network's scalar output when the value
+    /// head was trained with `SoccerNeuralLearningConfig::target_popart_enabled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_popart: Option<SoccerNeuralTargetPopArtStats>,
     /// Optional policy actor carried beside the value/critic net. The critic still owns
     /// the top-level snapshot; this sidecar preserves the shared actor and its independently
     /// trained passing/dribbling/shooting/GK specialists across episodes and persisted runs.
@@ -38276,6 +38384,7 @@ enum SoccerNeuralLearningWorkerCommand {
     Train {
         batches: Vec<Vec<SoccerNeuralTrainingSample>>,
         snapshot_after_train: bool,
+        popart_targets: Vec<f64>,
     },
     Snapshot,
 }
@@ -38368,6 +38477,70 @@ impl Drop for SoccerNeuralLearningWorker {
     fn drop(&mut self) {
         self.signal_shutdown();
     }
+}
+
+fn soccer_neural_rescale_output_affine(
+    network: &mut FeedForwardNetwork,
+    old: SoccerNeuralTargetPopArtStats,
+    new: SoccerNeuralTargetPopArtStats,
+) -> bool {
+    let old = old.sanitized();
+    let new = new.sanitized();
+    let scale = old.std / new.std;
+    let shift = (old.mean - new.mean) / new.std;
+    if !scale.is_finite() || !shift.is_finite() {
+        return false;
+    }
+    let Some(layer) = network.layers.last_mut() else {
+        return false;
+    };
+    if !matches!(layer.activation, ActivationName::Linear)
+        || layer.weights.len() != 1
+        || layer.biases.len() != 1
+        || layer.weights[0].iter().any(|weight| !weight.is_finite())
+        || !layer.biases[0].is_finite()
+    {
+        return false;
+    }
+    for weight in &mut layer.weights[0] {
+        *weight *= scale;
+    }
+    layer.biases[0] = layer.biases[0] * scale + shift;
+    true
+}
+
+fn soccer_neural_apply_popart_update(
+    network: &mut FeedForwardNetwork,
+    target_popart: &mut Option<SoccerNeuralTargetPopArtStats>,
+    targets: &[f64],
+) {
+    let Some(stats) = target_popart.as_mut() else {
+        return;
+    };
+    let Some((old, new)) = stats.observe_targets(targets.iter().copied()) else {
+        return;
+    };
+    if !soccer_neural_rescale_output_affine(network, old, new) {
+        *stats = old;
+    }
+}
+
+fn soccer_neural_target_popart_from_config(
+    config: &SoccerNeuralLearningConfig,
+) -> Option<SoccerNeuralTargetPopArtStats> {
+    config
+        .target_popart_enabled
+        .then(SoccerNeuralTargetPopArtStats::default)
+}
+
+fn soccer_neural_target_popart_from_snapshot(
+    config: &SoccerNeuralLearningConfig,
+    snapshot: &SoccerNeuralNetworkSnapshot,
+) -> Option<SoccerNeuralTargetPopArtStats> {
+    snapshot
+        .target_popart
+        .or_else(|| soccer_neural_target_popart_from_config(config))
+        .map(SoccerNeuralTargetPopArtStats::sanitized)
 }
 
 /// One actor-critic training example for the policy head: state features
@@ -39476,6 +39649,7 @@ pub(crate) struct SoccerNeuralLearner {
     replay_cursor: usize,
     stats: SoccerNeuralLearningStatsState,
     last_network_snapshot: Option<SoccerNeuralNetworkSnapshot>,
+    target_popart: Option<SoccerNeuralTargetPopArtStats>,
     /// Read-only network used to score live decisions on the `Threaded` backend,
     /// where `inline_network` is `None` because the trainable weights live on the
     /// worker thread. Rebuilt from each fresh worker snapshot. On the `Inline`
@@ -39487,7 +39661,11 @@ pub(crate) struct SoccerNeuralLearner {
 impl SoccerNeuralLearner {
     fn new(config: &MatchConfig) -> Self {
         let network = build_soccer_neural_network(&config.neural_learning, config.seed);
-        Self::from_network(config, network)
+        Self::from_network(
+            config,
+            network,
+            soccer_neural_target_popart_from_config(&config.neural_learning),
+        )
     }
 
     /// Build a learner around a network LOADED from a persisted snapshot (live serving or a
@@ -39499,17 +39677,26 @@ impl SoccerNeuralLearner {
         network: FeedForwardNetwork,
         snapshot: &SoccerNeuralNetworkSnapshot,
     ) -> Self {
-        let mut learner = Self::from_network(config, network);
+        let mut learner = Self::from_network(
+            config,
+            network,
+            soccer_neural_target_popart_from_snapshot(&config.neural_learning, snapshot),
+        );
         learner
             .stats
             .seed_pretrained(snapshot.training_steps, snapshot.average_loss);
         learner
     }
 
-    fn from_network(config: &MatchConfig, network: FeedForwardNetwork) -> Self {
+    fn from_network(
+        config: &MatchConfig,
+        network: FeedForwardNetwork,
+        target_popart: Option<SoccerNeuralTargetPopArtStats>,
+    ) -> Self {
         let neural_config = &config.neural_learning;
         let parameter_count = network.num_parameters();
-        let initial_snapshot = soccer_neural_network_snapshot(&network);
+        let initial_snapshot =
+            soccer_neural_network_snapshot_with_target_popart(&network, target_popart);
         let stats = SoccerNeuralLearningStatsState {
             parameter_count,
             replay_capacity: neural_config.sanitized_replay_capacity(),
@@ -39524,6 +39711,7 @@ impl SoccerNeuralLearner {
                 replay_cursor: 0,
                 stats,
                 last_network_snapshot: Some(initial_snapshot),
+                target_popart,
                 prediction_network: None,
             },
             SoccerNeuralLearningBackend::Threaded => SoccerNeuralLearner {
@@ -39538,11 +39726,13 @@ impl SoccerNeuralLearner {
                     network.clone(),
                     neural_config.sanitized_learning_rate(),
                     neural_config.sanitized_max_pending_batches(),
+                    target_popart,
                 )),
                 replay: VecDeque::with_capacity(neural_config.sanitized_replay_capacity()),
                 replay_cursor: 0,
                 stats,
                 last_network_snapshot: Some(initial_snapshot),
+                target_popart,
             },
         }
     }
@@ -39558,6 +39748,7 @@ impl SoccerNeuralLearner {
                 // dropping prediction entirely.
                 if let Ok(network) = build_soccer_neural_network_from_snapshot(&snapshot) {
                     self.prediction_network = Some(network);
+                    self.target_popart = snapshot.target_popart;
                 }
                 self.last_network_snapshot = Some(snapshot);
             }
@@ -39583,6 +39774,10 @@ impl SoccerNeuralLearner {
         }
         let output = network.predict(&features[..]);
         let value = *output.first()?;
+        let value = self
+            .target_popart
+            .map(|stats| stats.denormalize(value))
+            .unwrap_or(value);
         value.is_finite().then_some(value)
     }
 
@@ -39618,7 +39813,11 @@ impl SoccerNeuralLearner {
         match self.backend {
             SoccerNeuralLearningBackend::Inline => {
                 if let Some(network) = &self.inline_network {
-                    self.last_network_snapshot = Some(soccer_neural_network_snapshot(network));
+                    self.last_network_snapshot =
+                        Some(soccer_neural_network_snapshot_with_target_popart(
+                            network,
+                            self.target_popart,
+                        ));
                 }
             }
             SoccerNeuralLearningBackend::Threaded => {
@@ -39653,7 +39852,9 @@ impl SoccerNeuralLearner {
                     };
                     match result {
                         Ok(SoccerNeuralLearningWorkerResult::Snapshot(snapshot)) => {
-                            self.last_network_snapshot = Some(snapshot);
+                            self.record_worker_result(SoccerNeuralLearningWorkerResult::Snapshot(
+                                snapshot,
+                            ));
                             break;
                         }
                         Ok(result) => self.record_worker_result(result),
@@ -39777,6 +39978,15 @@ impl SoccerNeuralLearner {
         config: &SoccerNeuralLearningConfig,
     ) {
         self.drain_results();
+        let popart_targets = if self.target_popart.is_some() {
+            samples
+                .iter()
+                .filter(|sample| soccer_neural_sample_is_valid(sample))
+                .map(|sample| sample.target)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let samples = self.training_mix(samples, config);
         if samples.is_empty() {
             return;
@@ -39790,10 +40000,24 @@ impl SoccerNeuralLearner {
         match self.backend {
             SoccerNeuralLearningBackend::Inline => {
                 if let Some(network) = &mut self.inline_network {
+                    soccer_neural_apply_popart_update(
+                        network,
+                        &mut self.target_popart,
+                        &popart_targets,
+                    );
+                    let target_popart = self.target_popart;
                     for batch in samples.chunks(batch_size).take(max_batches) {
+                        let targets = batch
+                            .iter()
+                            .map(|sample| {
+                                target_popart
+                                    .map(|stats| stats.normalize(sample.target))
+                                    .unwrap_or(sample.target)
+                            })
+                            .collect::<Vec<_>>();
                         let loss = network.train_batch_slices_clipped(
-                            batch.iter().map(|sample| {
-                                (&sample.input[..], std::slice::from_ref(&sample.target))
+                            batch.iter().zip(targets.iter()).map(|(sample, target)| {
+                                (&sample.input[..], std::slice::from_ref(target))
                             }),
                             learning_rate,
                             SOCCER_NEURAL_GRAD_CLIP_NORM,
@@ -39806,7 +40030,11 @@ impl SoccerNeuralLearner {
                             failed_batches: 0,
                         });
                     }
-                    self.last_network_snapshot = Some(soccer_neural_network_snapshot(network));
+                    self.last_network_snapshot =
+                        Some(soccer_neural_network_snapshot_with_target_popart(
+                            network,
+                            self.target_popart,
+                        ));
                 }
             }
             SoccerNeuralLearningBackend::Threaded => {
@@ -39834,6 +40062,7 @@ impl SoccerNeuralLearner {
                     match sender.try_send(SoccerNeuralLearningWorkerCommand::Train {
                         batches,
                         snapshot_after_train,
+                        popart_targets,
                     }) {
                         Ok(()) => {
                             self.stats.pending_batches =
@@ -39917,6 +40146,7 @@ fn spawn_soccer_neural_learning_worker(
     mut network: FeedForwardNetwork,
     learning_rate: f64,
     max_pending_batches: usize,
+    mut target_popart: Option<SoccerNeuralTargetPopArtStats>,
 ) -> SoccerNeuralLearningWorker {
     let (sample_tx, sample_rx) =
         mpsc::sync_channel::<SoccerNeuralLearningWorkerCommand>(max_pending_batches.max(1));
@@ -39936,7 +40166,14 @@ fn spawn_soccer_neural_learning_worker(
                 SoccerNeuralLearningWorkerCommand::Train {
                     batches,
                     snapshot_after_train,
+                    popart_targets,
                 } => {
+                    soccer_neural_apply_popart_update(
+                        &mut network,
+                        &mut target_popart,
+                        &popart_targets,
+                    );
+                    let target_popart_for_batch = target_popart;
                     let mut processed_any = false;
                     let mut trained_batches = 0usize;
                     let mut failed_batches = 0usize;
@@ -39950,9 +40187,17 @@ fn spawn_soccer_neural_learning_worker(
                             continue;
                         }
                         processed_any = true;
+                        let targets = samples
+                            .iter()
+                            .map(|sample| {
+                                target_popart_for_batch
+                                    .map(|stats| stats.normalize(sample.target))
+                                    .unwrap_or(sample.target)
+                            })
+                            .collect::<Vec<_>>();
                         let loss = network.train_batch_slices_clipped(
-                            samples.iter().map(|sample| {
-                                (&sample.input[..], std::slice::from_ref(&sample.target))
+                            samples.iter().zip(targets.iter()).map(|(sample, target)| {
+                                (&sample.input[..], std::slice::from_ref(target))
                             }),
                             learning_rate,
                             SOCCER_NEURAL_GRAD_CLIP_NORM,
@@ -39988,7 +40233,10 @@ fn spawn_soccer_neural_learning_worker(
                         && !worker_cancel.load(Ordering::Relaxed)
                     {
                         let _ = result_tx.send(SoccerNeuralLearningWorkerResult::Snapshot(
-                            soccer_neural_network_snapshot(&network),
+                            soccer_neural_network_snapshot_with_target_popart(
+                                &network,
+                                target_popart,
+                            ),
                         ));
                     }
                 }
@@ -39997,7 +40245,7 @@ fn spawn_soccer_neural_learning_worker(
                         break;
                     }
                     let _ = result_tx.send(SoccerNeuralLearningWorkerResult::Snapshot(
-                        soccer_neural_network_snapshot(&network),
+                        soccer_neural_network_snapshot_with_target_popart(&network, target_popart),
                     ));
                 }
             }
@@ -40332,9 +40580,19 @@ fn soccer_neural_network_snapshot(network: &FeedForwardNetwork) -> SoccerNeuralN
         // when the snapshot is exposed for persistence; the raw weight snapshot is neutral.
         training_steps: 0,
         average_loss: None,
+        target_popart: None,
         policy_head: None,
         line_depth_head: None,
     }
+}
+
+fn soccer_neural_network_snapshot_with_target_popart(
+    network: &FeedForwardNetwork,
+    target_popart: Option<SoccerNeuralTargetPopArtStats>,
+) -> SoccerNeuralNetworkSnapshot {
+    let mut snapshot = soccer_neural_network_snapshot(network);
+    snapshot.target_popart = target_popart.map(SoccerNeuralTargetPopArtStats::sanitized);
+    snapshot
 }
 
 fn soccer_policy_specialist_head_snapshot(
@@ -42392,6 +42650,59 @@ mod grid_neural_feature_tests {
                     (PITCH_TACTICAL_GRID_COLUMNS * PITCH_TACTICAL_GRID_ROWS) as f64 - 1.0,
                 ),
             )
+        );
+    }
+}
+
+#[cfg(test)]
+mod neural_popart_tests {
+    use super::*;
+
+    #[test]
+    fn output_affine_rescale_preserves_denormalized_prediction() {
+        let config = SoccerNeuralLearningConfig {
+            enabled: true,
+            hidden_units: 4,
+            target_popart_enabled: true,
+            ..SoccerNeuralLearningConfig::default()
+        };
+        let mut network = build_soccer_neural_network(&config, 17);
+        let mut features = [0.0; SOCCER_NEURAL_FEATURE_DIM];
+        for (index, value) in features.iter_mut().enumerate() {
+            *value = ((index % 9) as f64 - 4.0) / 12.0;
+        }
+        let old = SoccerNeuralTargetPopArtStats {
+            count: 8,
+            mean: 0.75,
+            std: 2.0,
+            m2: 28.0,
+        };
+        let new = SoccerNeuralTargetPopArtStats {
+            count: 12,
+            mean: -0.40,
+            std: 3.5,
+            m2: 134.75,
+        };
+        let before = old.denormalize(network.predict(&features[..])[0]);
+        assert!(soccer_neural_rescale_output_affine(&mut network, old, new));
+        let after = new.denormalize(network.predict(&features[..])[0]);
+        assert!(
+            (before - after).abs() < 1e-9,
+            "PopArt rescale should preserve unnormalized value: before={before} after={after}"
+        );
+    }
+
+    #[test]
+    fn target_stats_normalize_and_denormalize_round_trip() {
+        let mut stats = SoccerNeuralTargetPopArtStats::default();
+        stats.observe_targets([-1.0, 0.5, 2.0, 3.5]);
+        assert_eq!(stats.count, 4);
+        assert!(stats.std > 0.0);
+        let target = 1.25;
+        let restored = stats.denormalize(stats.normalize(target));
+        assert!(
+            (target - restored).abs() < 1e-9,
+            "normalized target should round trip"
         );
     }
 }
@@ -44602,6 +44913,8 @@ impl SoccerRealtimeSession {
         let installed_neural_snapshot = neural_snapshot
             .map(|snapshot| next_match.set_neural_network_snapshot(snapshot).is_ok())
             .unwrap_or(false);
+        #[cfg(not(feature = "postgres-persistence"))]
+        let _ = installed_neural_snapshot;
         #[cfg(feature = "postgres-persistence")]
         if !installed_neural_snapshot {
             let _ = soccer_live_install_warm_policy(&mut next_match);
@@ -64262,9 +64575,12 @@ fn learned_action_label_is_legal_for_observation(
                         .is_empty())
         }
         "clearance" => observation.has_ball && observation.perceived_pressure >= 0.35,
-        "route-one" => {
-            observation.has_ball && observation.yards_to_own_goal < observation.yards_to_goal
-        }
+        "route-one" => PlayerAgent::learned_route_one_viable(
+            &observation,
+            player.role,
+            ability01(player.skills.dribbling),
+            snapshot.route_one_target_for(player_id).is_some(),
+        ),
         "first-time-shot" | "first-time-header" => {
             observation.has_ball
                 && observation.first_touch_available

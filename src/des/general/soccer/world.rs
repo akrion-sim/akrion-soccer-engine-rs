@@ -24,6 +24,7 @@ const NEURAL_MCTS_DISTILLATION_PRIORITY_WEIGHT: f64 = 1.4;
 const NEURAL_MCTS_DISTILLATION_ADVANTAGE_NOISE_TOLERANCE: f64 = 0.12;
 const NEURAL_MCTS_DISTILLATION_MIN_REWARD: f64 = -0.05;
 const NEURAL_MCTS_PASS_TARGET_CANDIDATE_LIMIT: usize = 3;
+const NEURAL_MCTS_PASS_TARGET_CANDIDATE_LIMIT_MAX: usize = 11;
 const SOCCER_ACTOR_DECISIVE_EVENT_PRIORITY_WEIGHT: f64 = 2.0;
 const SOCCER_ACTOR_NEGATIVE_OUTCOME_PRIORITY_WEIGHT: f64 = 1.6;
 const COMPLETED_PASS_LEARNING_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(5.0);
@@ -101,6 +102,19 @@ fn neural_mcts_distillation_min_reward() -> f64 {
         -2.0,
         2.0,
     )
+}
+
+fn neural_mcts_pass_target_candidate_limit() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("SOCCER_NEURAL_MCTS_PASS_TARGET_CANDIDATES")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(NEURAL_MCTS_PASS_TARGET_CANDIDATE_LIMIT)
+            .clamp(1, NEURAL_MCTS_PASS_TARGET_CANDIDATE_LIMIT_MAX)
+    })
 }
 
 fn learned_mpc_replan_thresholds() -> LearnedMpcReplanThresholds {
@@ -7541,16 +7555,25 @@ impl SoccerMatch {
             return Vec::new();
         }
         let (prefix, targets) = match normalized {
-            "pass" => ("pass", snapshot.ranked_visible_pass_targets(player_id, 11)),
+            "pass" => {
+                let mut targets = snapshot.ranked_visible_pass_targets(player_id, 11);
+                for target in snapshot.ranked_threaded_pass_candidates(player_id, 11) {
+                    if !targets.contains(&target) {
+                        targets.push(target);
+                    }
+                }
+                ("pass", targets)
+            }
             "aerial-pass" => (
                 "aerial-pass",
                 snapshot.ranked_visible_aerial_pass_targets(player_id, 11),
             ),
             _ => return Vec::new(),
         };
+        let limit = neural_mcts_pass_target_candidate_limit();
         targets
             .into_iter()
-            .take(NEURAL_MCTS_PASS_TARGET_CANDIDATE_LIMIT)
+            .take(limit)
             .enumerate()
             .filter_map(|(index, target_player)| {
                 Some(SoccerLearnedPlan {
@@ -7971,9 +7994,9 @@ impl SoccerMatch {
             )
             .map(|v| v * target_scale)
         };
-        let mut scored_candidates = Vec::with_capacity(
-            legal.len() + legal.len() * NEURAL_MCTS_PASS_TARGET_CANDIDATE_LIMIT.min(3),
-        );
+        let pass_target_candidate_limit = neural_mcts_pass_target_candidate_limit();
+        let mut scored_candidates =
+            Vec::with_capacity(legal.len() + legal.len() * pass_target_candidate_limit);
         let mut push_scored_candidate =
             |candidate: &SoccerLearnedActionTrace, candidate_plan: SoccerLearnedPlan| {
                 let transition = self.neural_decision_transition_for_plan(
@@ -21354,27 +21377,12 @@ impl SoccerMatch {
                 self.score_goal(scoring_team);
             }
             BallStepOutcome::Miss { shot } => {
-                self.record_shot_off_target_rewards(shot.team, shot.shooter);
+                self.record_missed_shot_outcome(shot, None);
                 self.pending_shot = None;
                 self.pending_rebound = None;
                 self.ball.altitude_yards = 0.0;
                 self.ball.untargeted_long_ball_flight = None;
                 self.ball.untargeted_long_ball_launcher = None;
-                let shooter_name = self
-                    .players
-                    .iter()
-                    .find(|player| player.id == shot.shooter)
-                    .map(|player| player.name.as_str())
-                    .unwrap_or("Player");
-                self.events.push(MatchEvent {
-                    tick: self.tick,
-                    clock_seconds: self.clock_seconds,
-                    kind: "miss".to_string(),
-                    team: Some(shot.team),
-                    player_id: Some(shot.shooter),
-                    description: format!("{shooter_name} missed"),
-                    ..MatchEvent::default()
-                });
             }
             BallStepOutcome::ShotBlocked {
                 shot,
@@ -21456,12 +21464,7 @@ impl SoccerMatch {
                 self.ball.untargeted_long_ball_flight = None;
                 self.ball.untargeted_long_ball_launcher = None;
                 if let Some(shot) = shot {
-                    self.record_shot_off_target_penalty(
-                        shot.team,
-                        shot.shooter,
-                        shot_off_target_yards,
-                    );
-                    self.record_miss_event(shot);
+                    self.record_missed_shot_outcome(shot, Some(shot_off_target_yards));
                 }
                 let restart_kind = restart.kind;
                 let restart_awarded = restart.awarded_team;
@@ -21491,6 +21494,14 @@ impl SoccerMatch {
                 self.suppress_generic_oob_turnover = false;
             }
         }
+    }
+
+    fn record_missed_shot_outcome(&mut self, shot: PendingShot, off_target_yards: Option<f64>) {
+        self.record_shot_off_target_rewards(shot.team, shot.shooter);
+        if let Some(off_target_yards) = off_target_yards {
+            self.record_shot_off_target_penalty(shot.team, shot.shooter, off_target_yards);
+        }
+        self.record_miss_event(shot);
     }
 
     fn record_miss_event(&mut self, shot: PendingShot) {

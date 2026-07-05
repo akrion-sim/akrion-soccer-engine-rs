@@ -346,6 +346,10 @@ fn env_neural_learning_config() -> Result<SoccerNeuralLearningConfig, Box<dyn Er
             "SOCCER_NEURAL_LEARNING_TARGET_CLIP",
             default.target_clip,
         )?,
+        target_popart_enabled: env_bool(
+            "SOCCER_NEURAL_TARGET_POPART",
+            default.target_popart_enabled,
+        )?,
         snapshot_every_batches: env_usize_alias(
             "SOCCER_NEURAL_SNAPSHOT_EVERY_BATCHES",
             "SOCCER_NEURAL_LEARNING_SNAPSHOT_EVERY_BATCHES",
@@ -2076,7 +2080,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     };
 
     println!(
-        "soccer_learning_queue_start run_id={} games={} parallel_games={} minutes={:.1} dt={:.3}s ticks_per_game={} seed={} neural_enabled={} neural_backend={:?} neural_snapshot_every_batches={} neural_drain_timeout_ms={} postgres_required={} pg_policy_version_interval_games={} pg_completed_run_batch_games={} pg_completed_run_retention_games={} pg_completed_async={} pg_completed_async_queue_batches={} pg_completed_async_coalesce_batches={} pg_completed_async_coalesce_wait_ms={} pg_tactical_learning_authoritative={} pg_refresh_with_resume_artifact={} pg_flush_policy_versions_before_new_sim={} pg_training_replay_delta_rows={} pg_training_replay_prior_weight={:.3}",
+        "soccer_learning_queue_start run_id={} games={} parallel_games={} minutes={:.1} dt={:.3}s ticks_per_game={} seed={} neural_enabled={} neural_backend={:?} neural_target_popart={} neural_snapshot_every_batches={} neural_drain_timeout_ms={} postgres_required={} pg_policy_version_interval_games={} pg_completed_run_batch_games={} pg_completed_run_retention_games={} pg_completed_async={} pg_completed_async_queue_batches={} pg_completed_async_coalesce_batches={} pg_completed_async_coalesce_wait_ms={} pg_tactical_learning_authoritative={} pg_refresh_with_resume_artifact={} pg_flush_policy_versions_before_new_sim={} pg_training_replay_delta_rows={} pg_training_replay_prior_weight={:.3}",
         run_id,
         games,
         parallel_games,
@@ -2086,6 +2090,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         seed,
         neural_learning.enabled,
         neural_learning.backend,
+        neural_learning.target_popart_enabled,
         neural_learning.snapshot_every_batches,
         neural_drain_timeout_ms,
         postgres_required,
