@@ -5364,7 +5364,12 @@ const MAX_SOCCER_NEURAL_MAX_PENDING_BATCHES: usize = 256;
 const MAX_SOCCER_NEURAL_REPLAY_CAPACITY: usize = 50_000;
 const MAX_SOCCER_NEURAL_REPLAY_SAMPLES_PER_TICK: usize = 4096;
 const MAX_SOCCER_NEURAL_SNAPSHOT_EVERY_BATCHES: usize = 4096;
-const SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK: f64 = 0.995;
+// CREDIT-ASSIGNMENT fix (Jul 2026, GAE/n-step inspired): 0.995 credited a decision for everything
+// over the next ~9.2s (half-life 138 ticks) — near-Monte-Carlo, max variance, diffusing credit
+// across unrelated events (the research's λ=1 worst case). 0.98 = ~2.3s half-life: credits the
+// actual causal build-up (a 2-3 pass move into a shot) while cutting the noisy long tail, so the
+// fast signals (forward-pass chains, shots) get focused, low-variance, attributable credit.
+const SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK: f64 = 0.98;
 const SOCCER_FULL_GAME_RETURN_BLEND: f64 = 0.35;
 const SOCCER_FULL_GAME_RETURN_CLIP: f64 = 400.0;
 const DD_SOCCER_OUTCOME_CREDIT_ENV: &str = "DD_SOCCER_OUTCOME_CREDIT";
