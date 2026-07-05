@@ -13909,6 +13909,9 @@ fn soccer_full_game_replay_transitions(
     transitions: &[SoccerLearningTransition],
     match_outcome: Option<MatchOutcomeReward>,
 ) -> Vec<SoccerLearningTransition> {
+    if dd_soccer_enable_dp_bootstrap() {
+        return soccer_dp_bootstrapped_replay_transitions(transitions, match_outcome);
+    }
     if dd_soccer_enable_outcome_credit() {
         let outcome =
             match_outcome.or_else(|| soccer_outcome_match_reward_from_transitions(transitions));
