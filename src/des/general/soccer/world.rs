@@ -9511,11 +9511,18 @@ impl SoccerMatch {
         }
         let credits = std::mem::take(&mut self.deferred_reward_credits);
         for (tick, player_id, amount) in credits {
-            if let Some(t) = self
+            if !amount.is_finite() || amount == 0.0 {
+                continue;
+            }
+            // Prefer the exact decision transition; otherwise the player's latest decision AT-OR-
+            // BEFORE the event tick (the decision that was active), so a delayed credit is never
+            // SILENTLY LOST if the exact launch tick wasn't captured as a learning transition.
+            let target = self
                 .episode_learning_transitions
                 .iter_mut()
-                .find(|t| t.tick == tick && t.player_id == player_id)
-            {
+                .filter(|t| t.player_id == player_id && t.tick <= tick)
+                .max_by_key(|t| t.tick);
+            if let Some(t) = target {
                 t.reward += amount;
             }
         }
