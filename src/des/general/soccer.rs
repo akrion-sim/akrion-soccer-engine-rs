@@ -20672,6 +20672,52 @@ pub(crate) fn dd_soccer_enable_deferred_pass_credit() -> bool {
     *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_DEFERRED_PASS_CREDIT"))
 }
 
+/// Gate for the **approximate-dynamic-programming bootstrap** of the full-game replay's correlated
+/// team return. OFF (default) leaves the return a pure Monte-Carlo backward accumulation over the
+/// whole game (`home_return = home_mean + γ·home_return`, `done=true` ⇒ no bootstrap), which is the
+/// highest-variance / worst credit-assignment target the authoritative value net can train on. ON
+/// replaces the full-MC team return with an **n-step return bootstrapped by a value-iterated
+/// abstract-state table** V(ball-zone × possession × score-sign × phase): value iteration over the
+/// game's own (s, r, s') tuples gives a low-variance DP value, and the n-step truncation stops the
+/// whole-game noise from swamping each decision. This is the "fitted value iteration from replay"
+/// bridge between pure neural learning and architecture changes — the net stays the function
+/// approximator, DP just supplies a better target. Byte-identical to baseline when OFF.
+pub(crate) fn dd_soccer_enable_dp_bootstrap() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_DP_BOOTSTRAP"))
+}
+
+/// n-step horizon (in decision ticks) for the DP-bootstrapped return. After this many ticks the
+/// return bootstraps off the value-iterated abstract table instead of continuing the Monte-Carlo
+/// sum. Small ⇒ low variance but leans hard on the DP value; large ⇒ closer to full MC. Default 16.
+pub(crate) fn dd_soccer_dp_bootstrap_horizon() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_DP_BOOTSTRAP_HORIZON")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|n| *n >= 1 && *n <= 4096)
+            .unwrap_or(16)
+    })
+}
+
+/// Number of value-iteration sweeps over the abstract-state table built from a single game's
+/// transitions. The table is tiny (≤ a few hundred buckets) so this is cheap; ~40 sweeps at
+/// γ=0.98 propagates value across the whole abstract MDP. Default 40.
+pub(crate) fn dd_soccer_dp_bootstrap_sweeps() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_DP_BOOTSTRAP_SWEEPS")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|n| *n >= 1 && *n <= 1000)
+            .unwrap_or(40)
+    })
+}
+
 /// Gate for interception-aware route-one / clearance training credit. OFF (the default) leaves the
 /// `soccer_goal_credit_transition_score` long-ball branch byte-identical to baseline, where a hoofed
 /// forward ball is credited purely on distance/pressure/urgency with NO interception or completion
