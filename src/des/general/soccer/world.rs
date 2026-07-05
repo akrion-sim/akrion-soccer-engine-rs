@@ -1507,6 +1507,80 @@ fn stamp_learned_policy_behavior_probability_on_decision(
     }];
 }
 
+/// Extra Bellman sweeps over the whole-game replay before neural value training.
+///
+/// The first pass preserves the historical online Q update order. Opt-in reverse/
+/// forward passes make this approximate dynamic programming: delayed rewards from
+/// goals, shots, turnovers, and completed actions can propagate backward through
+/// the abstract Q buckets before the neural critic builds its Bellman targets.
+fn soccer_approx_dp_replay_passes() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("SOCCER_APPROX_DP_REPLAY_PASSES")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, 8)
+    })
+}
+
+fn train_soccer_team_policies_with_approx_dp(
+    team_policies: &mut SoccerTeamQPolicies,
+    replay: &[SoccerLearningTransition],
+    critic_baselines: Option<&[Option<f64>]>,
+    passes: usize,
+) {
+    if replay.is_empty() {
+        return;
+    }
+    match critic_baselines {
+        Some(baselines) => team_policies.train_adversarial_with_baselines(replay, baselines),
+        None => team_policies.train_adversarial(replay),
+    }
+    train_soccer_team_policy_extra_dp_sweeps(team_policies, replay, passes);
+}
+
+fn train_soccer_team_policy_extra_dp_sweeps(
+    team_policies: &mut SoccerTeamQPolicies,
+    replay: &[SoccerLearningTransition],
+    passes: usize,
+) {
+    if passes <= 1 || replay.is_empty() {
+        return;
+    }
+    let reverse_replay: Vec<SoccerLearningTransition> = replay.iter().rev().cloned().collect();
+    for pass_index in 1..passes {
+        if pass_index % 2 == 1 {
+            team_policies.train_adversarial(&reverse_replay);
+        } else {
+            team_policies.train_adversarial(replay);
+        }
+    }
+}
+
+fn train_soccer_policy_with_approx_dp(
+    policy: &mut SoccerQPolicy,
+    replay: &[SoccerLearningTransition],
+    passes: usize,
+) {
+    if replay.is_empty() {
+        return;
+    }
+    policy.train(replay);
+    if passes <= 1 {
+        return;
+    }
+    let reverse_replay: Vec<SoccerLearningTransition> = replay.iter().rev().cloned().collect();
+    for pass_index in 1..passes {
+        if pass_index % 2 == 1 {
+            policy.train(&reverse_replay);
+        } else {
+            policy.train(replay);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1558,6 +1632,45 @@ mod tests {
             next_observation: observation,
             done: false,
         }
+    }
+
+    #[test]
+    fn approx_dp_replay_sweeps_propagate_late_reward_backward() {
+        let sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let (player_id, _) = first_home_field_pair(&sim);
+        let mut early = world_test_transition(&sim, player_id, "carry", 1);
+        let mut late = early.clone();
+        late.tick = 2;
+        late.action = "shoot".to_string();
+        late.reward = 10.0;
+        late.done = true;
+        early.reward = 0.0;
+        early.done = false;
+        early.next_state = late.state.clone();
+        early.next_observation = late.observation.clone();
+        let replay = vec![early.clone(), late];
+        let early_state = SoccerQStateKey::from_transition(&early);
+        let options = SoccerQPolicyOptions {
+            alpha: 1.0,
+            gamma: 0.9,
+            exploration_epsilon: 0.0,
+        };
+
+        let mut one_pass = SoccerQPolicy::new(options.clone());
+        train_soccer_policy_with_approx_dp(&mut one_pass, &replay, 1);
+        let one_pass_value = one_pass.q_value(&early_state, "carry").unwrap_or(0.0);
+        assert!(
+            one_pass_value.abs() < 1e-9,
+            "single chronological pass cannot see the later reward yet: {one_pass_value}"
+        );
+
+        let mut swept = SoccerQPolicy::new(options);
+        train_soccer_policy_with_approx_dp(&mut swept, &replay, 2);
+        let swept_value = swept.q_value(&early_state, "carry").unwrap_or(0.0);
+        assert!(
+            swept_value > 8.99 && swept_value < 9.01,
+            "reverse Bellman sweep should propagate gamma * late reward backward, got {swept_value}"
+        );
     }
 
     fn world_test_transition(
@@ -9191,16 +9304,17 @@ impl SoccerMatch {
                 })
                 .collect()
         });
+        let approx_dp_passes = soccer_approx_dp_replay_passes();
         if let Some(team_policies) = &mut self.team_policies {
-            match &critic_baselines {
-                Some(baselines) => {
-                    team_policies.train_adversarial_with_baselines(&replay, baselines)
-                }
-                None => team_policies.train_adversarial(&replay),
-            }
+            train_soccer_team_policies_with_approx_dp(
+                team_policies,
+                &replay,
+                critic_baselines.as_deref(),
+                approx_dp_passes,
+            );
         }
         if let Some(policy) = &mut self.learned_policy {
-            policy.train(&replay);
+            train_soccer_policy_with_approx_dp(policy, &replay, approx_dp_passes);
         }
         // Actor (policy head): compute GAE advantages with the *current* critic
         // (before this episode's value update), then take a policy-gradient step.
