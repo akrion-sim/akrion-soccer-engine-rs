@@ -1628,6 +1628,12 @@ fn soccer_approx_dp_replay_passes() -> usize {
     })
 }
 
+fn dd_soccer_enable_bellman_terminals() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_BELLMAN_TERMINALS"))
+}
+
 fn soccer_bellman_replay_with_trajectory_terminals(
     replay: &[SoccerLearningTransition],
 ) -> Vec<SoccerLearningTransition> {
@@ -1659,6 +1665,29 @@ fn soccer_bellman_replay_with_trajectory_terminals(
         }
     }
     bellman_replay
+}
+
+fn soccer_trainable_replay_indices_for_frozen_teams(
+    replay: &[SoccerLearningTransition],
+    home_frozen: bool,
+    away_frozen: bool,
+) -> Option<Vec<usize>> {
+    if !home_frozen && !away_frozen {
+        return None;
+    }
+    Some(
+        replay
+            .iter()
+            .enumerate()
+            .filter_map(|(index, transition)| {
+                let frozen = match transition.team {
+                    Team::Home => home_frozen,
+                    Team::Away => away_frozen,
+                };
+                (!frozen).then_some(index)
+            })
+            .collect(),
+    )
 }
 
 fn train_soccer_team_policies_with_approx_dp(
@@ -4369,6 +4398,23 @@ mod tests {
         let samples = sim.neural_training_samples_for(&[home, away]);
 
         assert_eq!(samples.len(), 1);
+    }
+
+    #[test]
+    fn frozen_analytic_opponent_is_filtered_from_dp_replay() {
+        let home = policy_test_transition_with_mcts(false);
+        let mut away = home.clone();
+        away.team = Team::Away;
+        let replay = vec![home, away];
+
+        assert_eq!(
+            soccer_trainable_replay_indices_for_frozen_teams(&replay, false, true),
+            Some(vec![0])
+        );
+        assert_eq!(
+            soccer_trainable_replay_indices_for_frozen_teams(&replay, false, false),
+            None
+        );
     }
 
     #[test]
@@ -9693,17 +9739,47 @@ impl SoccerMatch {
         // Rebuild terminal flags from per-agent successor gaps for Bellman Q/value
         // bootstrapping; actor/GAE and world-model paths below already derive their
         // own trajectory continuity from tick gaps.
-        let bellman_replay = soccer_bellman_replay_with_trajectory_terminals(&replay);
+        let bellman_replay = if dd_soccer_enable_bellman_terminals() {
+            soccer_bellman_replay_with_trajectory_terminals(&replay)
+        } else {
+            replay.clone()
+        };
+        let trainable_bellman_indices = soccer_trainable_replay_indices_for_frozen_teams(
+            &bellman_replay,
+            self.home_neural_frozen,
+            self.away_neural_frozen,
+        );
+        let filtered_bellman_replay;
+        let filtered_critic_baselines;
+        let (policy_bellman_replay, policy_critic_baselines) =
+            if let Some(indices) = trainable_bellman_indices.as_ref() {
+                filtered_bellman_replay = indices
+                    .iter()
+                    .filter_map(|&index| bellman_replay.get(index).cloned())
+                    .collect::<Vec<_>>();
+                filtered_critic_baselines = critic_baselines.as_ref().map(|baselines| {
+                    indices
+                        .iter()
+                        .filter_map(|&index| baselines.get(index).copied())
+                        .collect::<Vec<_>>()
+                });
+                (
+                    filtered_bellman_replay.as_slice(),
+                    filtered_critic_baselines.as_deref(),
+                )
+            } else {
+                (bellman_replay.as_slice(), critic_baselines.as_deref())
+            };
         if let Some(team_policies) = &mut self.team_policies {
             train_soccer_team_policies_with_approx_dp(
                 team_policies,
-                &bellman_replay,
-                critic_baselines.as_deref(),
+                policy_bellman_replay,
+                policy_critic_baselines,
                 approx_dp_passes,
             );
         }
         if let Some(policy) = &mut self.learned_policy {
-            train_soccer_policy_with_approx_dp(policy, &bellman_replay, approx_dp_passes);
+            train_soccer_policy_with_approx_dp(policy, policy_bellman_replay, approx_dp_passes);
         }
         // Actor (policy head): compute GAE advantages with the *current* critic
         // (before this episode's value update), then take a policy-gradient step.
