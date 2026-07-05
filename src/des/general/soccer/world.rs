@@ -6644,21 +6644,8 @@ impl SoccerMatch {
         // longer loss-optimal and the output layer must encode state-dependent value. Ranking is
         // shift/scale-invariant, so decisions are unaffected by the rescale. Gated; OFF ⇒
         // byte-identical (the `target_scale`-scaled targets are returned unchanged).
-        if dd_soccer_enable_target_standardization() && samples.len() >= 8 {
-            let n = samples.len() as f64;
-            let mean = samples.iter().map(|s| s.target).sum::<f64>() / n;
-            let var = samples
-                .iter()
-                .map(|s| (s.target - mean) * (s.target - mean))
-                .sum::<f64>()
-                / n;
-            let std = var.sqrt();
-            if std.is_finite() && std > 1e-4 {
-                for sample in &mut samples {
-                    sample.target =
-                        ((sample.target - mean) / std).clamp(-target_clip, target_clip);
-                }
-            }
+        if dd_soccer_enable_target_standardization() {
+            soccer_standardize_sample_targets(&mut samples, target_clip);
         }
         samples
     }
