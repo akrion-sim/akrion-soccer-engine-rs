@@ -1335,6 +1335,18 @@ const AERIAL_PASS_OOB_MAX_PENALTY_POINTS: f64 = 9.0;
 /// How far inside the nearest boundary the MPC launch-speed cap aims a lofted ball to land,
 /// and the reference span over which `aerial_pass_landing_safety` ramps 0→1.
 const AERIAL_PASS_OOB_LANDING_SAFETY_MARGIN_YARDS: f64 = 2.5;
+// General pass-out-of-bounds penalty (gated `DD_SOCCER_ENABLE_PASS_OOB_PENALTY`, default OFF ⇒
+// byte-identical). ANY pass — ground or aerial — that the team concedes out of play (a throw-in or
+// goal-kick awarded to the opponent) is an unforced turnover. The bite runs 10→15 points, scaled
+// UP by how FAST the ball was travelling when it crossed the line and how FAR it ran before
+// exiting: a slow ball nicked out is the 10-pt floor; a driven ball blazed a long way out is the
+// full 15. Supersedes the aerial-only handler when enabled (it covers ground passes too).
+const PASS_OOB_BASE_PENALTY_POINTS: f64 = 10.0;
+const PASS_OOB_MAX_PENALTY_POINTS: f64 = 15.0;
+const PASS_OOB_FULL_SPEED_YPS: f64 = 30.0; // exit speed at which the speed term saturates
+const PASS_OOB_FULL_TRAVEL_YARDS: f64 = 40.0; // ball travel at which the distance term saturates
+const PASS_OOB_SPEED_TERM_POINTS: f64 = 3.0;
+const PASS_OOB_TRAVEL_TERM_POINTS: f64 = 2.0;
 // Attackers may run offside briefly, but should get back onside within a few
 // seconds. After the grace window the penalty grows with how long they linger,
 // and stepping back onside after lingering earns a small recovery reward.
@@ -5440,7 +5452,7 @@ const MAX_SOCCER_NEURAL_REPLAY_SAMPLES_PER_TICK: usize = 4096;
 const MAX_SOCCER_NEURAL_SNAPSHOT_EVERY_BATCHES: usize = 4096;
 const SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK: f64 = 0.995;
 const SOCCER_FULL_GAME_RETURN_BLEND: f64 = 0.35;
-const SOCCER_FULL_GAME_RETURN_CLIP: f64 = 250.0;
+const SOCCER_FULL_GAME_RETURN_CLIP: f64 = 400.0;
 const DD_SOCCER_OUTCOME_CREDIT_ENV: &str = "DD_SOCCER_OUTCOME_CREDIT";
 const DD_SOCCER_MATCH_OUTCOME_REWARD_ENV: &str = "DD_SOCCER_ENABLE_MATCH_OUTCOME_REWARD";
 const SOCCER_OUTCOME_CREDIT_MILESTONE_REWARD_CAP: f64 = GOAL_REWARD_POINTS;
@@ -5468,10 +5480,15 @@ const SOCCER_OUTCOME_CREDIT_MILESTONE_REWARD_CAP: f64 = GOAL_REWARD_POINTS;
 // local neural-authoritative learner now trains directly against the analytic
 // stack, so this label must be large enough to make "beat the match" dominate
 // dense pass/shape competence after target scaling.
-const MATCH_OUTCOME_WIN_REWARD_POINTS: f64 = 45.0;
+// PLATEAU-BREAK rebalance (Jul 2026): both main (8→45) and the local experiment independently
+// pushed the terminal outcome up to dominate dense shaping; adopting the stronger 200/15 so
+// "beat the opponent" — not "play tidy" — is unambiguously what the value is optimizing (TiZero/
+// AlphaStar). Broadcast to every transition (clipped ±SOCCER_FULL_GAME_RETURN_CLIP). MUST still be
+// A/B'd through the promotion eval gate; do not tune on raw reward.
+const MATCH_OUTCOME_WIN_REWARD_POINTS: f64 = 200.0;
 const MATCH_OUTCOME_DRAW_REWARD_POINTS: f64 = 0.0;
-const MATCH_OUTCOME_PER_GOAL_MARGIN_POINTS: f64 = 10.0;
-const MATCH_OUTCOME_MARGIN_CAP_GOALS: f64 = 4.0;
+const MATCH_OUTCOME_PER_GOAL_MARGIN_POINTS: f64 = 15.0;
+const MATCH_OUTCOME_MARGIN_CAP_GOALS: f64 = 5.0;
 // INSTANTANEOUS (single-frame) player speed ceiling: 25mph ≈ 12.22yps, plus a hair of
 // numerical margin. A human sprints at most ~25mph in a moment.
 const SOCCER_PHYSICS_PLAYER_MAX_SPEED_YPS: f64 = 12.45;
@@ -20881,6 +20898,15 @@ pub(crate) fn dd_soccer_enable_aerial_pass_oob_discipline() -> bool {
         static V: OnceLock<bool> = OnceLock::new();
         *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_AERIAL_PASS_OOB_DISCIPLINE"))
     }
+}
+
+/// Gate for the GENERAL pass-out-of-bounds penalty (10-15 points scaled by exit speed + travel).
+/// OFF (default) ⇒ byte-identical to baseline. ON supersedes the aerial-only handler for every
+/// conceded pass out of play — ground passes included.
+pub(crate) fn dd_soccer_enable_pass_oob_penalty() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_PASS_OOB_PENALTY"))
 }
 
 /// Gate for overload-weighted progression rewards (see the `OVERLOAD_*` constants). OFF (the
@@ -60462,6 +60488,22 @@ fn seed_varied_skills_enabled() -> bool {
     std::env::var("SOCCER_SEED_VARIED_SKILLS").is_ok()
 }
 
+/// Per-team skill multiplier for an ASYMMETRIC HANDICAP (default 1.0 = no change). Reading it per
+/// team lets a trainer weaken one side (e.g. the learner) so it must out-think a stronger
+/// opponent — a curriculum lever to break the parity plateau. Env: SOCCER_SKILL_SCALE_HOME /
+/// SOCCER_SKILL_SCALE_AWAY. Off by default ⇒ byte-identical to the equal-footing build.
+fn soccer_team_skill_scale(team: Team) -> f64 {
+    let var = match team {
+        Team::Home => "SOCCER_SKILL_SCALE_HOME",
+        Team::Away => "SOCCER_SKILL_SCALE_AWAY",
+    };
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|f| f.is_finite() && *f > 0.0)
+        .unwrap_or(1.0)
+}
+
 fn pass_receiver_openness_for_agents(
     players: &[PlayerAgent],
     receiving_team: Team,
@@ -65582,7 +65624,7 @@ fn default_players(config: &MatchConfig, _rng: &mut SeededRandom) -> Vec<PlayerA
                 // retained only for signature compatibility; it no longer drives
                 // live-match randomness.
                 skills: {
-                    if seed_varied_skills_enabled() {
+                    let base = if seed_varied_skills_enabled() {
                         // A/B MEASUREMENT ONLY: the heuristic match is otherwise fully
                         // deterministic (skills/positions keyed on player id, `config.seed`
                         // inert), so multi-seed runs are byte-identical — n=1 scenario. Mixing
@@ -65594,7 +65636,9 @@ fn default_players(config: &MatchConfig, _rng: &mut SeededRandom) -> Vec<PlayerA
                     } else {
                         let _discarded_compat_profile = SkillProfile::blended(id, role, _rng);
                         SkillProfile::for_shirt(shirt, role)
-                    }
+                    };
+                    // Asymmetric team handicap (env-gated, default 1.0 = no change).
+                    base.handicap_scaled(soccer_team_skill_scale(team))
                 },
                 fatigue: 0.0,
                 controller_slot: None,
