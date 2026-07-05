@@ -19,8 +19,7 @@ const LEARNED_MPC_SOFT_REPLAN_MIN_REPLACEMENT_PROBABILITY: f64 = 0.68;
 const LEARNED_MPC_SOFT_REPLAN_MIN_IMPROVEMENT: f64 = 0.22;
 const NEURAL_MCTS_DISTILLATION_MAX_SCORE_REGRESSION: f64 = 0.08;
 const NEURAL_MCTS_DISTILLATION_REJECTED_PROBABILITY: f64 = 0.35;
-const NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR: f64 = 0.06;
-const NEURAL_MCTS_DISTILLATION_MAX_RESCUED_NEGATIVE: f64 = 0.12;
+const NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR: f64 = 0.04;
 const LEARNED_MPC_REJECTED_ACTION_PENALTY_POINTS: f64 = 2.5;
 const LEARNED_TARGET_GRID_MIN_VISITS: u32 = 1;
 const GAIT_PHYSICS_STAND_SPEED_YPS: f64 = 0.25;
@@ -3127,13 +3126,9 @@ mod tests {
     }
 
     #[test]
-    fn neural_mcts_distillation_floors_near_neutral_actor_advantage() {
+    fn neural_mcts_distillation_floors_positive_actor_advantage() {
         let transition = policy_test_transition_with_mcts(true);
 
-        assert_eq!(
-            soccer_actor_advantage_with_planner_distillation(&transition, -0.02),
-            NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR
-        );
         assert_eq!(
             soccer_actor_advantage_with_planner_distillation(&transition, 0.01),
             NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR
@@ -3143,11 +3138,10 @@ mod tests {
     #[test]
     fn neural_mcts_distillation_keeps_bad_outcomes_negative() {
         let transition = policy_test_transition_with_mcts(true);
-        let bad_advantage = -NEURAL_MCTS_DISTILLATION_MAX_RESCUED_NEGATIVE - 0.01;
 
         assert_eq!(
-            soccer_actor_advantage_with_planner_distillation(&transition, bad_advantage),
-            bad_advantage
+            soccer_actor_advantage_with_planner_distillation(&transition, -0.02),
+            -0.02
         );
         assert_eq!(
             soccer_actor_advantage_with_planner_distillation(
@@ -3155,6 +3149,12 @@ mod tests {
                 -0.02
             ),
             -0.02
+        );
+        let mut negative_reward = policy_test_transition_with_mcts(true);
+        negative_reward.reward = -0.01;
+        assert_eq!(
+            soccer_actor_advantage_with_planner_distillation(&negative_reward, 0.01),
+            0.01
         );
     }
 
@@ -3497,7 +3497,8 @@ fn soccer_actor_advantage_with_planner_distillation(
     if !advantage.is_finite()
         || !transition.decision_context.neural_mcts_selected
         || learned_mpc_rejected_action_counterexample(transition)
-        || advantage < -NEURAL_MCTS_DISTILLATION_MAX_RESCUED_NEGATIVE
+        || advantage < 0.0
+        || transition.reward < 0.0
     {
         return advantage;
     }
