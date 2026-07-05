@@ -9949,7 +9949,9 @@ impl SoccerMatch {
             + self.completed_pass_and_move_forward_reward(pass)
             + progressive_pass_escape_reward(pass, self.ball.position)
             + self.overload_forward_pass_progression_bonus(pass, self.ball.position);
-        self.record_reward_event(pass.from, amount);
+        // Back-date the completed-pass reward to the PASS DECISION tick (launch), not the reception
+        // tick, so the passer's actual decision transition gets credited (gated; off ⇒ current-tick).
+        self.record_reward_event_deferred(pass.launch_tick, pass.from, amount);
         let completed_forward_yards =
             (self.ball.position.y - pass.origin.y) * pass.team.attack_dir();
         if completed_forward_yards >= PROGRESSIVE_CARRY_FORWARD_PASS_MIN_YARDS {
