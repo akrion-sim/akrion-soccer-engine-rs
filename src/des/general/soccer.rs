@@ -21051,6 +21051,39 @@ pub(crate) fn dd_soccer_novelty_bonus_coef() -> f64 {
     })
 }
 
+/// Gate for the **neural self-bootstrap value target** (Priority-1 Part C — the true
+/// policy-improvement lever). By default the neural value target's `max_next` comes from the
+/// **tabular** Q (`best_value_hierarchical`), so the net is trained to *match* the tabular/analytic
+/// policy's values — it can converge to but structurally not EXCEED analytic (imitation ceiling).
+/// ON blends the net's **own** predicted successor value into `max_next` at weight
+/// `dd_soccer_self_bootstrap_weight()`, turning the update into real neural TD/Q-learning: the value
+/// can now rate a policy *better* than tabular, which is the only thing here that can exceed
+/// analytic. (Main already ships a 0.65 blend behind `DD_SOCCER_ENABLE_NEURAL_VALUE_BOOTSTRAP`; this
+/// is the local equivalent so the /tmp tree can test it.) OFF (default) ⇒ byte-identical tabular
+/// target. Note: bootstrapping off the net's own value is the deadly triad — keep the weight < 1
+/// early and watch for divergence.
+pub(crate) fn dd_soccer_enable_neural_self_bootstrap() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_NEURAL_SELF_BOOTSTRAP"))
+}
+
+/// Blend weight for the neural self-bootstrap: `max_next = w·V_net(s') + (1-w)·tabular`. Default 0.7
+/// (near main's 0.65); env `DD_SOCCER_SELF_BOOTSTRAP_WEIGHT`, clamped [0,1]. 1.0 = pure neural
+/// self-bootstrap (most policy-improvement power, least stable).
+pub(crate) fn dd_soccer_self_bootstrap_weight() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_SELF_BOOTSTRAP_WEIGHT")
+            .ok()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|w| w.is_finite())
+            .map(|w| w.clamp(0.0, 1.0))
+            .unwrap_or(0.7)
+    })
+}
+
 /// Gate for interception-aware route-one / clearance training credit. OFF (the default) leaves the
 /// `soccer_goal_credit_transition_score` long-ball branch byte-identical to baseline, where a hoofed
 /// forward ball is credited purely on distance/pressure/urgency with NO interception or completion
