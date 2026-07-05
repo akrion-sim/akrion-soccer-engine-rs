@@ -7297,6 +7297,10 @@ impl SoccerMatch {
         }
 
         self.full_game_learning_applied = true;
+        // Apply cross-tick deferred credits (delayed outcome rewards back-dated to their DECISION
+        // tick) onto the episode transitions BEFORE the replay blend, so the pass/shot decision that
+        // earned the outcome is credited. No-op unless the deferred gate is on.
+        self.apply_deferred_reward_credits();
         // Terminal won-game reward (the "long" rung): label every transition with the
         // realised result when the gate is on. Off ⇒ `None`, byte-identical replay.
         let match_outcome = match_outcome_reward_enabled()
