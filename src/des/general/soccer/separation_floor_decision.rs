@@ -256,7 +256,11 @@ impl SeparationFloorHead {
                 self.training_steps += 1;
             }
         }
-        let mean = if applied > 0 { total / applied as f64 } else { 0.0 };
+        let mean = if applied > 0 {
+            total / applied as f64
+        } else {
+            0.0
+        };
         self.last_loss = Some(mean);
         mean
     }
@@ -344,7 +348,8 @@ impl WorldSnapshot {
         } else {
             0.0
         };
-        let space_around = (self.nearest_opponent_distance_at(player.team, pos) / 12.0).clamp(0.0, 1.0);
+        let space_around =
+            (self.nearest_opponent_distance_at(player.team, pos) / 12.0).clamp(0.0, 1.0);
         let dist_to_ball = pos.distance(self.ball.position);
         let near_ball = (1.0 - (dist_to_ball / 20.0).clamp(0.0, 1.0)).clamp(0.0, 1.0);
         let combine_support = {
@@ -354,7 +359,10 @@ impl WorldSnapshot {
                 .filter(|p| {
                     p.team == player.team
                         && p.id != player.id
-                        && self.player_snapshot_position(p).distance(self.ball.position) < 18.0
+                        && self
+                            .player_snapshot_position(p)
+                            .distance(self.ball.position)
+                            < 18.0
                 })
                 .count();
             (n as f64 / 3.0).clamp(0.0, 1.0)
@@ -386,7 +394,6 @@ impl WorldSnapshot {
             .unwrap_or_else(|| analytic_separation_bias(inputs));
         bias.is_finite().then(|| bias.clamp(-1.0, 1.0))
     }
-
 }
 
 impl SoccerMatch {
@@ -468,8 +475,10 @@ impl SoccerMatch {
         if !bias.is_finite() {
             return base_influence;
         }
-        (base_influence + bias.clamp(-1.0, 1.0) * SEPARATION_FLOOR_MAX_ADJUST_YARDS)
-            .clamp(SAME_TEAM_MIN_SEPARATION_YARDS, SEPARATION_FLOOR_MAX_RADIUS_YARDS)
+        (base_influence + bias.clamp(-1.0, 1.0) * SEPARATION_FLOOR_MAX_ADJUST_YARDS).clamp(
+            SAME_TEAM_MIN_SEPARATION_YARDS,
+            SEPARATION_FLOOR_MAX_RADIUS_YARDS,
+        )
     }
 }
 
@@ -504,13 +513,12 @@ impl SoccerMatch {
             if self.pending_separation_floor[i].due_tick <= tick {
                 let decision = self.pending_separation_floor.swap_remove(i);
                 let now_territorial = territorial_advantage(snapshot, decision.team);
-                let territorial_delta = if now_territorial.is_finite()
-                    && decision.decision_territorial.is_finite()
-                {
-                    now_territorial - decision.decision_territorial
-                } else {
-                    0.0
-                };
+                let territorial_delta =
+                    if now_territorial.is_finite() && decision.decision_territorial.is_finite() {
+                        now_territorial - decision.decision_territorial
+                    } else {
+                        0.0
+                    };
                 let reward = decision.reward_accum
                     + SEPARATION_FLOOR_TERRITORIAL_SHAPING_WEIGHT * territorial_delta;
                 if reward.is_finite() {
@@ -659,16 +667,32 @@ mod separation_floor_tests {
         let tighten_samples: Vec<SeparationFloorSample> = (0..32)
             .flat_map(|_| {
                 [
-                    SeparationFloorSample { inputs: inputs.clone(), action_bias: -0.8, reward: 1.0 },
-                    SeparationFloorSample { inputs: inputs.clone(), action_bias: 0.8, reward: -1.0 },
+                    SeparationFloorSample {
+                        inputs: inputs.clone(),
+                        action_bias: -0.8,
+                        reward: 1.0,
+                    },
+                    SeparationFloorSample {
+                        inputs: inputs.clone(),
+                        action_bias: 0.8,
+                        reward: -1.0,
+                    },
                 ]
             })
             .collect();
         let spread_samples: Vec<SeparationFloorSample> = (0..32)
             .flat_map(|_| {
                 [
-                    SeparationFloorSample { inputs: inputs.clone(), action_bias: 0.8, reward: 1.0 },
-                    SeparationFloorSample { inputs: inputs.clone(), action_bias: -0.8, reward: -1.0 },
+                    SeparationFloorSample {
+                        inputs: inputs.clone(),
+                        action_bias: 0.8,
+                        reward: 1.0,
+                    },
+                    SeparationFloorSample {
+                        inputs: inputs.clone(),
+                        action_bias: -0.8,
+                        reward: -1.0,
+                    },
                 ]
             })
             .collect();

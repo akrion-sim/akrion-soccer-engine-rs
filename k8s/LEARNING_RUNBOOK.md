@@ -1,8 +1,9 @@
 # Soccer continuous-learning + tournament runbook
 
 How overnight/continuous learning works, what fires on a push, and the manual levers.
-**TL;DR: to train on new code, just `git push origin learning` (and `main`). Everything else is
-automatic within ~120s** — both clusters rebuild the learner from source and kick off tournaments.
+**TL;DR: to train on new code, push the configured learner ref (`git push origin learning` in
+this repo). Everything else is automatic within ~120s** — both clusters rebuild the learner from
+source and kick off tournaments.
 
 ## The push → learn → tournament loop (automatic)
 
@@ -11,7 +12,7 @@ automatic within ~120s** — both clusters rebuild the learner from source and k
 
 1. `kubectl rollout restart deployment/dd-soccer-learning-rds-continuous` — the learner
    re-clones + `cargo build`s the branch from source (~4–5 min cold build) and resumes self-play.
-2. Launches a **push-tournament** Job from the nightly cronjob template with `SOURCE_REF=learning`
+2. Launches a **push-tournament** Job from the nightly cronjob template with `SOCCER_SOURCE_REF=learning`
    (24 teams, group size 3, 1 advancer, `THREADS=2`, 10-min matches), labelled
    `dd-soccer/push-tournament=true`, capped at `MAX_PARALLEL_PUSH_TOURNAMENTS=5` per cluster.
 3. Records the SHA in configmap `dd-soccer-commit-watcher-state` (`.data.lastSha`).

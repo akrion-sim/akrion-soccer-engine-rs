@@ -196,7 +196,10 @@ impl WorldSnapshot {
                 Some(carrier_id),
             );
             let value = forward_gain.max(0.0) * 0.5 + openness * 6.0 + (lane_len * 0.12);
-            if best.as_ref().is_none_or(|(_, _, best_value, ..)| value > *best_value) {
+            if best
+                .as_ref()
+                .is_none_or(|(_, _, best_value, ..)| value > *best_value)
+            {
                 best = Some((far.id, far_pos, value, forward_gain, openness, lane_len));
             }
         }
@@ -239,7 +242,10 @@ impl WorldSnapshot {
                     continue;
                 }
                 let space = self.space_score_at(spot, me.team);
-                if chosen.as_ref().is_none_or(|(_, best_space)| space > *best_space) {
+                if chosen
+                    .as_ref()
+                    .is_none_or(|(_, best_space)| space > *best_space)
+                {
                     chosen = Some((spot, space));
                 }
             }
@@ -324,7 +330,10 @@ impl SoccerMatch {
                 continue;
             }
             // The dummy nearest the ball acts first (it would trap it first).
-            if best.as_ref().is_none_or(|(_, best_dist)| dist_to_ball < *best_dist) {
+            if best
+                .as_ref()
+                .is_none_or(|(_, best_dist)| dist_to_ball < *best_dist)
+            {
                 best = Some((p.id, dist_to_ball));
             }
         }
@@ -387,7 +396,9 @@ mod tests {
         assert!(!pass_lane_yield_enabled());
         let (sim, _c, m, _f) = three_in_a_line();
         let snap = WorldSnapshot::from_match(&sim);
-        assert!(snap.pass_lane_yield_target_for(m, sim.players[m].home_position).is_none());
+        assert!(snap
+            .pass_lane_yield_target_for(m, sim.players[m].home_position)
+            .is_none());
         assert!(sim.pass_lane_dummy_guard().is_none());
     }
 
@@ -433,8 +444,14 @@ mod tests {
         std::env::remove_var(ENV);
 
         // Home attacks toward +y: the attacker pushes forward, the deep defender drops back.
-        assert!(fwd.y > 58.0, "attacking middle should move forward, got {fwd:?}");
-        assert!(back.y < 58.0, "defending middle should drop back, got {back:?}");
+        assert!(
+            fwd.y > 58.0,
+            "attacking middle should move forward, got {fwd:?}"
+        );
+        assert!(
+            back.y < 58.0,
+            "defending middle should drop back, got {back:?}"
+        );
     }
 
     fn floor_pass(team: Team, from: usize, target: usize, origin: Vec2, dest: Vec2) -> PendingPass {
@@ -474,7 +491,11 @@ mod tests {
 
         let guard = sim.pass_lane_dummy_guard();
         std::env::remove_var(ENV);
-        assert_eq!(guard, Some(m), "the middle man in the path should dummy the pass");
+        assert_eq!(
+            guard,
+            Some(m),
+            "the middle man in the path should dummy the pass"
+        );
     }
 
     #[test]

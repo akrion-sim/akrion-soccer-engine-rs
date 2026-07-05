@@ -316,86 +316,34 @@ impl SoccerActionLabel {
             "move" => "space",
             "pass1" | "pass2" | "pass3" => "pass",
             "aerial-pass1" | "aerial-pass2" | "aerial-pass3" => "aerial-pass",
-            "wall-pass" | "wall_pass" | "wallpass" | "give-and-go" | "give_and_go" | "giveandgo"
-            | "one-two-pass" | "one_two_pass" | "onetwopass" => "wall-pass",
-            "wall-return"
-            | "wall_return"
-            | "wallreturn"
-            | "give-and-go-return"
-            | "give_and_go_return"
-            | "giveandgoreturn"
-            | "one-two-return"
-            | "one_two_return"
+            "wall-pass" | "wall_pass" | "wallpass" | "give-and-go" | "give_and_go"
+            | "giveandgo" | "one-two-pass" | "one_two_pass" | "onetwopass" => "wall-pass",
+            "wall-return" | "wall_return" | "wallreturn" | "give-and-go-return"
+            | "give_and_go_return" | "giveandgoreturn" | "one-two-return" | "one_two_return"
             | "onetworeturn" => "wall-return",
-            "corner-flag-cross"
-            | "corner_flag_cross"
-            | "cornerflagcross"
-            | "byline-cross"
-            | "byline_cross"
-            | "bylinecross"
-            | "penalty-spot-cross"
-            | "penalty_spot_cross"
+            "corner-flag-cross" | "corner_flag_cross" | "cornerflagcross" | "byline-cross"
+            | "byline_cross" | "bylinecross" | "penalty-spot-cross" | "penalty_spot_cross"
             | "penaltyspotcross" => "corner-flag-cross",
-            "vertical-attack"
-            | "vertical_attack"
-            | "verticalattack"
-            | "attack-vertical"
-            | "attack_vertical"
-            | "drive-forward"
-            | "drive_forward"
-            | "driveforward" => "vertical-attack",
-            "support-push-up"
-            | "support_push_up"
-            | "supportpushup"
-            | "push-up"
-            | "push_up"
+            "vertical-attack" | "vertical_attack" | "verticalattack" | "attack-vertical"
+            | "attack_vertical" | "drive-forward" | "drive_forward" | "driveforward" => {
+                "vertical-attack"
+            }
+            "support-push-up" | "support_push_up" | "supportpushup" | "push-up" | "push_up"
             | "pushup" => "support-push-up",
-            "vacate-space"
-            | "vacate_space"
-            | "vacatespace"
-            | "create-space-run"
-            | "create_space_run"
-            | "createspacerun"
-            | "decoy-run"
-            | "decoy_run"
-            | "decoyrun" => "vacate-space",
-            "surprise-pass"
-            | "surprise_pass"
-            | "surprisepass"
-            | "backheel-pass"
-            | "backheel_pass"
-            | "backheelpass"
-            | "backheel" => "surprise-pass",
-            "scoop-pass"
-            | "scoop_pass"
-            | "scooppass"
-            | "lob"
-            | "lob-pass"
-            | "lob_pass"
-            | "lobpass"
-            | "chip-pass"
-            | "chip_pass"
-            | "chippass" => "scoop-pass",
+            "vacate-space" | "vacate_space" | "vacatespace" | "create-space-run"
+            | "create_space_run" | "createspacerun" | "decoy-run" | "decoy_run" | "decoyrun" => {
+                "vacate-space"
+            }
+            "surprise-pass" | "surprise_pass" | "surprisepass" | "backheel-pass"
+            | "backheel_pass" | "backheelpass" | "backheel" => "surprise-pass",
+            "scoop-pass" | "scoop_pass" | "scooppass" | "lob" | "lob-pass" | "lob_pass"
+            | "lobpass" | "chip-pass" | "chip_pass" | "chippass" => "scoop-pass",
             "flick-on" | "flick_on" | "flickon" | "header-flick" | "header_flick" => "flick-on",
-            "wait-for-support"
-            | "wait_for_support"
-            | "waitforsupport"
-            | "hold-and-summon"
-            | "hold_and_summon"
-            | "holdandsummon"
-            | "summon-support"
-            | "summon_support"
-            | "delay-pass"
-            | "delay_pass"
-            | "delaypass" => "wait-for-support",
-            "open-pass-lane"
-            | "open_pass_lane"
-            | "openpasslane"
-            | "pass-lane-dribble"
-            | "pass_lane_dribble"
-            | "passlanedribble"
-            | "dribble-to-pass"
-            | "dribble_to_pass"
+            "wait-for-support" | "wait_for_support" | "waitforsupport" | "hold-and-summon"
+            | "hold_and_summon" | "holdandsummon" | "summon-support" | "summon_support"
+            | "delay-pass" | "delay_pass" | "delaypass" => "wait-for-support",
+            "open-pass-lane" | "open_pass_lane" | "openpasslane" | "pass-lane-dribble"
+            | "pass_lane_dribble" | "passlanedribble" | "dribble-to-pass" | "dribble_to_pass"
             | "dribbletopass" => "open-pass-lane",
             // Unified vocabulary: both teams' alias spellings (ours "round-the-keeper" et al.
             // and theirs "round-goalkeeper" et al.) normalize to the single canonical label so
@@ -436,31 +384,16 @@ impl SoccerActionLabel {
             | "attack-defender"
             | "attack_defender"
             | "attackdefender" => "runaround-dribble",
-            "turnover-burst"
-            | "turnover_burst"
-            | "turnoverburst"
-            | "transition-burst"
-            | "transition_burst"
-            | "counter-burst"
-            | "counter_burst"
-            | "counterburst" => "turnover-burst",
-            "switch"
-            | "switch_play"
-            | "switchplay"
-            | "side-switch"
-            | "side_switch"
-            | "cross-field-pass"
-            | "cross_field_pass"
-            | "crossfieldpass" => "switch-play",
-            "recycle"
-            | "recycle_reset"
-            | "recyclereset"
-            | "reset-pass"
-            | "reset_pass"
-            | "short-reset"
-            | "short_reset"
-            | "backward-reset"
-            | "backward_reset" => "recycle-reset",
+            "turnover-burst" | "turnover_burst" | "turnoverburst" | "transition-burst"
+            | "transition_burst" | "counter-burst" | "counter_burst" | "counterburst" => {
+                "turnover-burst"
+            }
+            "switch" | "switch_play" | "switchplay" | "side-switch" | "side_switch"
+            | "cross-field-pass" | "cross_field_pass" | "crossfieldpass" => "switch-play",
+            "recycle" | "recycle_reset" | "recyclereset" | "reset-pass" | "reset_pass"
+            | "short-reset" | "short_reset" | "backward-reset" | "backward_reset" => {
+                "recycle-reset"
+            }
             "press-cover" | "press_cover" | "presscover" | "cover-press" | "cover_press" => {
                 "press-cover"
             }
@@ -506,10 +439,14 @@ impl SoccerActionLabel {
             "route1" | "route-1" | "long-ball" | "longball" => "route-one",
             "hoof" | "hoofed-clearance" => "clearance",
             "header" => "first-time-header",
-            "one-touch-shot" | "one_touch_shot" | "onetouchshot" | "1-touch-shot" | "1touchshot"
-            | "first-touch-shot" | "first_touch_shot" | "firsttouchshot" => "first-time-shot",
-            "one-touch-pass" | "one_touch_pass" | "onetouchpass" | "1-touch-pass" | "1touchpass"
-            | "first-touch-pass" | "first_touch_pass" | "firsttouchpass" => "first-time-pass",
+            "one-touch-shot" | "one_touch_shot" | "onetouchshot" | "1-touch-shot"
+            | "1touchshot" | "first-touch-shot" | "first_touch_shot" | "firsttouchshot" => {
+                "first-time-shot"
+            }
+            "one-touch-pass" | "one_touch_pass" | "onetouchpass" | "1-touch-pass"
+            | "1touchpass" | "first-touch-pass" | "first_touch_pass" | "firsttouchpass" => {
+                "first-time-pass"
+            }
             "chest-control" => "control-touch",
             "sidestep" | "side_step" | "side-step-dribble" | "sidestep-dribble" => "side-step",
             "hold-up" | "holdup" | "hold_up" | "hold-up-dribble" | "hold-up-flank-dribble" => {
@@ -524,23 +461,17 @@ impl SoccerActionLabel {
                 "carry-out-left"
             }
             "carryoutleft" | "carry_out_left" | "carry-left" | "carry_left" => "carry-out-left",
-            "carryoutright" | "carry_out_right" | "carry-right" | "carry_right" => "carry-out-right",
-            "protect" | "protectball" | "protect_ball" | "shield" | "shield-ball" | "shield_ball"
-            | "body-shield" => "protect-ball",
+            "carryoutright" | "carry_out_right" | "carry-right" | "carry_right" => {
+                "carry-out-right"
+            }
+            "protect" | "protectball" | "protect_ball" | "shield" | "shield-ball"
+            | "shield_ball" | "body-shield" => "protect-ball",
             "leftcut" | "left_cut" | "left-cut-dribble" | "cut-left" => "left-cut",
             "rightcut" | "right_cut" | "right-cut-dribble" | "cut-right" => "right-cut",
             "nut-meg" | "nut_meg" | "meg" => "nutmeg",
-            "xavi"
-            | "xaviturn"
-            | "xavi_turn"
-            | "xavi-turn"
-            | "xavi-turn-dribble"
-            | "xavi_turn_dribble"
-            | "la-pelopina"
-            | "la_pelopina"
-            | "shielded-turn"
-            | "shielded_turn"
-            | "turn-and-shield" => "xavi-turn",
+            "xavi" | "xaviturn" | "xavi_turn" | "xavi-turn" | "xavi-turn-dribble"
+            | "xavi_turn_dribble" | "la-pelopina" | "la_pelopina" | "shielded-turn"
+            | "shielded_turn" | "turn-and-shield" => "xavi-turn",
             "open_passing_lane"
             | "open-lane"
             | "open_lane"
@@ -558,13 +489,8 @@ impl SoccerActionLabel {
             "supportroam" | "support_roam" => "support-roam",
             "checktoball" | "check_to_ball" | "check-ball" | "checkrun" => "check-to-ball",
             "runinbehind" | "run_in_behind" | "inbehind" | "in-behind" => "run-in-behind",
-            "exploitspace"
-            | "exploit_space"
-            | "exploit-space"
-            | "exploitspacerun"
-            | "exploit_space_run"
-            | "space-run"
-            | "space_run" => "exploit-space-run",
+            "exploitspace" | "exploit_space" | "exploit-space" | "exploitspacerun"
+            | "exploit_space_run" | "space-run" | "space_run" => "exploit-space-run",
             "wideoutlet" | "wide_outlet" | "touchlineoutlet" | "touchline-outlet" => "wide-outlet",
             "lane_yield" | "laneyield" | "yield-lane" | "yield_lane" => "lane-yield",
             "shotcreationrun" | "shot_creation_run" | "shootingrun" | "shooting-run" => {
@@ -731,11 +657,20 @@ mod tests {
 
     #[test]
     fn aliases_fold_onto_canonical() {
-        assert_eq!(SoccerActionLabel::from_label("give-and-go").as_str(), "wall-pass");
+        assert_eq!(
+            SoccerActionLabel::from_label("give-and-go").as_str(),
+            "wall-pass"
+        );
         assert_eq!(SoccerActionLabel::from_label("hoof").as_str(), "clearance");
         assert_eq!(SoccerActionLabel::from_label("move").as_str(), "space");
-        assert_eq!(SoccerActionLabel::from_label("through-pass").as_str(), "killer-pass");
-        assert_eq!(SoccerActionLabel::from_label("xavi_turn").as_str(), "xavi-turn");
+        assert_eq!(
+            SoccerActionLabel::from_label("through-pass").as_str(),
+            "killer-pass"
+        );
+        assert_eq!(
+            SoccerActionLabel::from_label("xavi_turn").as_str(),
+            "xavi-turn"
+        );
     }
 
     #[test]
@@ -748,7 +683,10 @@ mod tests {
     #[test]
     fn canonical_str_matches_passthrough_semantics() {
         // Known alias -> canonical 'static string.
-        assert_eq!(SoccerActionLabel::canonical_str("giveandgo"), Some("wall-pass"));
+        assert_eq!(
+            SoccerActionLabel::canonical_str("giveandgo"),
+            Some("wall-pass")
+        );
         // Unknown -> None, so the historical `unwrap_or(input)` passes it through.
         assert_eq!(SoccerActionLabel::canonical_str("brand-new"), None);
         // Bare canonical that had no explicit alias arm also passes through.
