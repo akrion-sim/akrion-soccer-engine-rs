@@ -5391,14 +5391,15 @@ const SOCCER_OUTCOME_CREDIT_MILESTONE_REWARD_CAP: f64 = GOAL_REWARD_POINTS;
 // not absorbed because it differs by the realised result, which the state alone
 // cannot predict. Magnitudes are a starting point and MUST be A/B'd through the
 // promotion eval gate (held-out Elo/win-rate), never tuned on raw reward.
-// PLATEAU-BREAK rebalance (Jul 2026): the net topped out at PARITY because winning was a rounding
-// error in its objective (win +8 vs +100/goal + heavy dense shaping). Per TiZero/AlphaStar, the
-// terminal outcome (win + goal-margin) must DOMINATE so "beat the opponent" — not "play tidy" — is
-// what's optimized. Broadcast to every transition (clipped ±250), so this drives the value across
-// the whole game. Symmetric/zero-sum (loser gets the negation).
-const MATCH_OUTCOME_WIN_REWARD_POINTS: f64 = 200.0;
+// FAST-SIGNAL rebalance (Jul 2026): win=200 was WRONG. Broadcasting ±200 to EVERY transition
+// drowned the fast, clean, attributable signals (2/3 consecutive forward passes 30/40, shot-on-
+// target 40, goal 100) ~8-30:1, so the value net learned "did we eventually win" (SLOW, high-
+// variance, hard to attribute) instead of "was this good play" (FAST). Winning is a slow feedback
+// signal; forward-pass chains + shots are the strong fast one. Cut the win broadcast to a small
+// NUDGE so the fast dense signals dominate the value target (was 200 / margin 15).
+const MATCH_OUTCOME_WIN_REWARD_POINTS: f64 = 30.0;
 const MATCH_OUTCOME_DRAW_REWARD_POINTS: f64 = 0.0;
-const MATCH_OUTCOME_PER_GOAL_MARGIN_POINTS: f64 = 15.0;
+const MATCH_OUTCOME_PER_GOAL_MARGIN_POINTS: f64 = 5.0;
 const MATCH_OUTCOME_MARGIN_CAP_GOALS: f64 = 5.0;
 // INSTANTANEOUS (single-frame) player speed ceiling: 25mph ≈ 12.22yps, plus a hair of
 // numerical margin. A human sprints at most ~25mph in a moment.
