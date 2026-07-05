@@ -1593,6 +1593,27 @@ mod tests {
         (first, second)
     }
 
+    struct TestEnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for TestEnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn set_test_env_var(key: &'static str, value: &str) -> TestEnvVarGuard {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        TestEnvVarGuard { key, previous }
+    }
+
     #[test]
     fn pass_role_risk_composite_orders_safe_and_risky() {
         let safe = pass_role_risk_test_quality(0.94, 0.03, 0.92, 0.0, 0.0);
@@ -1808,6 +1829,117 @@ mod tests {
     }
 
     #[test]
+    fn turnover_chain_blame_replays_prior_pass_transitions_across_ticks() {
+        let _env = set_test_env_var("DD_SOCCER_ENABLE_TURNOVER_CHAIN_BLAME", "1");
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            learning_enabled: true,
+            full_game_learning_enabled: true,
+            ..MatchConfig::default()
+        });
+        let passers = sim
+            .players
+            .iter()
+            .filter(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .map(|player| player.id)
+            .take(4)
+            .collect::<Vec<_>>();
+        assert_eq!(passers.len(), 4);
+        for player_id in &passers {
+            sim.record_possession_touch(*player_id);
+        }
+        sim.tick = 210;
+        sim.recent_learning_history
+            .push_back(world_test_transition(&sim, passers[1], "pass", 201));
+        sim.recent_learning_history
+            .push_back(world_test_transition(&sim, passers[2], "pass", 205));
+
+        let deferred_start = sim.deferred_reward_transitions.len();
+        let episode_start = sim.episode_learning_transitions.len();
+        let base = 10.0;
+        sim.record_turnover_chain_blame(Team::Home, passers[3], base);
+
+        let added = &sim.deferred_reward_transitions[deferred_start..];
+        let immediate = turnover_chain_blame_points(base, 1);
+        let earlier = turnover_chain_blame_points(base, 2);
+        assert!(added.iter().any(|transition| {
+            transition.player_id == passers[2]
+                && transition.tick == 205
+                && normalize_soccer_action_label(&transition.action) == "pass"
+                && (transition.reward + immediate).abs() < 1e-9
+        }));
+        assert!(added.iter().any(|transition| {
+            transition.player_id == passers[1]
+                && transition.tick == 201
+                && normalize_soccer_action_label(&transition.action) == "pass"
+                && (transition.reward + earlier).abs() < 1e-9
+        }));
+        assert!(
+            sim.episode_learning_transitions[episode_start..]
+                .iter()
+                .any(|transition| {
+                    transition.player_id == passers[2]
+                        && transition.tick == 205
+                        && transition.reward < 0.0
+                }),
+            "full-game replay must see delayed turnover-chain blame"
+        );
+    }
+
+    #[test]
+    fn quick_receiver_dispossession_penalty_replays_original_pass_transition_across_ticks() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            learning_enabled: true,
+            full_game_learning_enabled: true,
+            ..MatchConfig::default()
+        });
+        let (passer, receiver) = first_home_field_pair(&sim);
+        sim.tick = 120;
+        sim.clock_seconds = 18.0;
+        let origin = Vec2::new(38.0, 60.0);
+        let end = Vec2::new(34.0, 57.0);
+        sim.completed_pass_chain.push_back(CompletedPassChainEntry {
+            team: Team::Home,
+            from: passer,
+            to: receiver,
+            direction: PassDirectionBucket::Backward,
+            receiver_openness: 0.15,
+            target_forward_yards: -3.0,
+            origin,
+            end,
+            tick: 116,
+            clock_seconds: 16.4,
+            continuation_rewarded: false,
+        });
+        sim.recent_learning_history
+            .push_back(world_test_transition(&sim, passer, "pass", 116));
+
+        let deferred_start = sim.deferred_reward_transitions.len();
+        let episode_start = sim.episode_learning_transitions.len();
+        sim.record_quick_receiver_dispossession_penalty(receiver);
+
+        let added = &sim.deferred_reward_transitions[deferred_start..];
+        assert!(
+            added.iter().any(|transition| {
+                transition.player_id == passer
+                    && transition.tick == 116
+                    && normalize_soccer_action_label(&transition.action) == "pass"
+                    && transition.reward < 0.0
+            }),
+            "quick receiver loss must replay the original pass decision, got {added:?}"
+        );
+        assert!(
+            sim.episode_learning_transitions[episode_start..]
+                .iter()
+                .any(|transition| {
+                    transition.player_id == passer
+                        && transition.tick == 116
+                        && transition.reward < 0.0
+                }),
+            "full-game replay must see quick receiver dispossession penalty"
+        );
+    }
+
+    #[test]
     fn shot_on_target_reward_replays_original_shot_transition_across_ticks() {
         let mut sim = SoccerMatch::default_11v11(MatchConfig {
             learning_enabled: true,
@@ -1908,6 +2040,84 @@ mod tests {
                         && transition.reward > 0.0
                 }),
             "full-game replay must also see delayed dribble credit"
+        );
+    }
+
+    #[test]
+    fn overdribble_dispossession_penalty_replays_original_dribble_transition_across_ticks() {
+        let _env = set_test_env_var("DD_SOCCER_ENABLE_OVERDRIBBLE_PENALTY", "1");
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            learning_enabled: true,
+            full_game_learning_enabled: true,
+            duration_seconds: 1.0,
+            seed: 13_337,
+            ..MatchConfig::default()
+        });
+        let attacker = sim
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home field player")
+            .id;
+        let defender = sim
+            .players
+            .iter()
+            .find(|player| player.team == Team::Away && player.role != PlayerRole::Goalkeeper)
+            .expect("away field player")
+            .id;
+        let spot = Vec2::new(
+            sim.config.field_width_yards * 0.5,
+            sim.config.field_length_yards * 0.5,
+        );
+        sim.tick = 240;
+        sim.clock_seconds = 5.0;
+        sim.players[attacker].position = spot;
+        sim.players[defender].position = spot + Vec2::new(1.0, 0.0);
+        sim.ball.holder = Some(attacker);
+        sim.ball.position = spot;
+        sim.ball.last_touch_team = Some(Team::Home);
+        sim.ball.position_history.clear();
+        for i in 0..40_u64 {
+            sim.ball.position_history.push_back(BallPositionSample {
+                tick: i,
+                clock_seconds: 3.0 + i as f64 * 0.05,
+                position: spot,
+                velocity: Vec2::zero(),
+                acceleration: Vec2::zero(),
+                jerk: Vec2::zero(),
+                curl_acceleration: Vec2::zero(),
+                altitude_yards: 0.0,
+                resistance: BallResistanceFrame::default(),
+                holder: Some(attacker),
+                last_touch_team: Some(Team::Home),
+            });
+        }
+        sim.recent_learning_history
+            .push_back(world_test_transition(&sim, attacker, "dribble", 238));
+
+        let deferred_start = sim.deferred_reward_transitions.len();
+        let episode_start = sim.episode_learning_transitions.len();
+        sim.complete_defensive_dispossession(defender, attacker, "tackle");
+
+        let added = &sim.deferred_reward_transitions[deferred_start..];
+        assert!(
+            added.iter().any(|transition| {
+                transition.player_id == attacker
+                    && transition.tick == 238
+                    && normalize_soccer_action_label(&transition.action) == "dribble"
+                    && transition.reward < 0.0
+            }),
+            "overdribble loss must replay the original dribble decision, got {added:?}"
+        );
+        assert!(
+            sim.episode_learning_transitions[episode_start..]
+                .iter()
+                .any(|transition| {
+                    transition.player_id == attacker
+                        && transition.tick == 238
+                        && transition.reward < 0.0
+                }),
+            "full-game replay must see overdribble dispossession penalty"
         );
     }
 
@@ -12193,7 +12403,17 @@ impl SoccerMatch {
         let age_seconds = self.clock_seconds - entry.clock_seconds;
         let penalty = quick_receiver_dispossession_passer_penalty(&entry, age_seconds);
         if penalty > 0.0 {
-            self.record_reward_event(entry.from, -penalty);
+            let replayed = self.queue_recent_outcome_learning_credit(
+                entry.from,
+                entry.team,
+                -penalty,
+                SoccerRewardEventKind::BadPassChainPenalty,
+                COMPLETED_PASS_LEARNING_CREDIT_MAX_AGE_TICKS,
+                is_pass_like_action,
+            );
+            if !replayed {
+                self.record_reward_event(entry.from, -penalty);
+            }
         }
     }
 
@@ -12410,11 +12630,21 @@ impl SoccerMatch {
             // Index 0 is the ball-loser (full penalty applied by the caller) ⇒ points = 0.
             let amount = turnover_chain_blame_points(base_penalty, recency_index);
             if amount > 0.0 {
-                self.record_reward_event_with_kind(
+                let replayed = self.queue_recent_outcome_learning_credit(
                     player_id,
+                    team,
                     -amount,
                     SoccerRewardEventKind::TurnoverChainBlame,
+                    COMPLETED_PASS_LEARNING_CREDIT_MAX_AGE_TICKS,
+                    is_pass_like_action,
                 );
+                if !replayed {
+                    self.record_reward_event_with_kind(
+                        player_id,
+                        -amount,
+                        SoccerRewardEventKind::TurnoverChainBlame,
+                    );
+                }
             }
         }
     }
@@ -14584,11 +14814,21 @@ impl SoccerMatch {
                 danger_severity,
             );
             if penalty > 0.0 {
-                self.record_reward_event_with_kind(
+                let replayed = self.queue_recent_outcome_learning_credit(
                     attacker_id,
+                    attacker_team,
                     -penalty,
                     SoccerRewardEventKind::OverdribbleDispossession,
+                    DRIBBLE_BEAT_LEARNING_CREDIT_MAX_AGE_TICKS,
+                    |action| is_dribble_action_label(action) || action == "hold",
                 );
+                if !replayed {
+                    self.record_reward_event_with_kind(
+                        attacker_id,
+                        -penalty,
+                        SoccerRewardEventKind::OverdribbleDispossession,
+                    );
+                }
             }
         }
         self.record_weighted_possession_chain_reward_at(
