@@ -21,6 +21,8 @@ const NEURAL_MCTS_DISTILLATION_MAX_SCORE_REGRESSION: f64 = 0.08;
 const NEURAL_MCTS_DISTILLATION_REJECTED_PROBABILITY: f64 = 0.35;
 const NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR: f64 = 0.04;
 const NEURAL_MCTS_DISTILLATION_PRIORITY_WEIGHT: f64 = 3.0;
+const NEURAL_MCTS_DISTILLATION_ADVANTAGE_NOISE_TOLERANCE: f64 = 0.12;
+const NEURAL_MCTS_DISTILLATION_MIN_REWARD: f64 = -0.05;
 const NEURAL_MCTS_PASS_TARGET_CANDIDATE_LIMIT: usize = 3;
 const SOCCER_ACTOR_DECISIVE_EVENT_PRIORITY_WEIGHT: f64 = 2.0;
 const SOCCER_ACTOR_NEGATIVE_OUTCOME_PRIORITY_WEIGHT: f64 = 1.6;
@@ -72,6 +74,33 @@ fn learned_mpc_probability_env(name: &str, default: f64) -> f64 {
         .filter(|value| value.is_finite())
         .unwrap_or(default)
         .clamp(0.0, 1.0)
+}
+
+fn learned_mpc_metric_env(name: &str, default: f64, min: f64, max: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(default)
+        .clamp(min, max)
+}
+
+fn neural_mcts_distillation_advantage_noise_tolerance() -> f64 {
+    learned_mpc_metric_env(
+        "SOCCER_NEURAL_MCTS_DISTILLATION_ADVANTAGE_NOISE_TOLERANCE",
+        NEURAL_MCTS_DISTILLATION_ADVANTAGE_NOISE_TOLERANCE,
+        0.0,
+        2.0,
+    )
+}
+
+fn neural_mcts_distillation_min_reward() -> f64 {
+    learned_mpc_metric_env(
+        "SOCCER_NEURAL_MCTS_DISTILLATION_MIN_REWARD",
+        NEURAL_MCTS_DISTILLATION_MIN_REWARD,
+        -2.0,
+        2.0,
+    )
 }
 
 fn learned_mpc_replan_thresholds() -> LearnedMpcReplanThresholds {
@@ -4250,7 +4279,7 @@ mod tests {
 
         assert_eq!(
             soccer_actor_advantage_with_planner_distillation(&transition, -0.02),
-            -0.02
+            NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR
         );
         assert_eq!(
             soccer_actor_advantage_with_planner_distillation(
@@ -4260,10 +4289,35 @@ mod tests {
             -0.02
         );
         let mut negative_reward = policy_test_transition_with_mcts(true);
-        negative_reward.reward = -0.01;
+        negative_reward.reward = -0.25;
         assert_eq!(
             soccer_actor_advantage_with_planner_distillation(&negative_reward, 0.01),
             0.01
+        );
+    }
+
+    #[test]
+    fn neural_mcts_distillation_tolerates_small_value_noise() {
+        let mut transition = policy_test_transition_with_mcts(true);
+        transition.reward = -0.01;
+
+        assert_eq!(
+            soccer_actor_advantage_with_planner_distillation(&transition, -0.03),
+            NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR
+        );
+        assert_eq!(
+            soccer_actor_priority_weight(&transition, NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR),
+            NEURAL_MCTS_DISTILLATION_PRIORITY_WEIGHT
+        );
+    }
+
+    #[test]
+    fn neural_mcts_distillation_rejects_deep_negative_value() {
+        let transition = policy_test_transition_with_mcts(true);
+
+        assert_eq!(
+            soccer_actor_advantage_with_planner_distillation(&transition, -0.50),
+            -0.50
         );
     }
 
@@ -4599,26 +4653,29 @@ fn soccer_actor_advantage_with_planner_distillation(
     transition: &SoccerLearningTransition,
     advantage: f64,
 ) -> f64 {
-    if !advantage.is_finite()
-        || !transition.decision_context.neural_mcts_selected
-        || learned_mpc_rejected_action_counterexample(transition)
-        || advantage < 0.0
-        || transition.reward < 0.0
-    {
+    if !soccer_actor_mcts_distillation_candidate(transition, advantage) {
         return advantage;
     }
     advantage.max(NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR)
 }
 
-fn soccer_actor_mcts_distillation_priority(
+fn soccer_actor_mcts_distillation_candidate(
     transition: &SoccerLearningTransition,
     advantage: f64,
 ) -> bool {
     advantage.is_finite()
         && transition.decision_context.neural_mcts_selected
         && !learned_mpc_rejected_action_counterexample(transition)
+        && advantage >= -neural_mcts_distillation_advantage_noise_tolerance()
+        && transition.reward >= neural_mcts_distillation_min_reward()
+}
+
+fn soccer_actor_mcts_distillation_priority(
+    transition: &SoccerLearningTransition,
+    advantage: f64,
+) -> bool {
+    soccer_actor_mcts_distillation_candidate(transition, advantage)
         && advantage >= NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR
-        && transition.reward >= 0.0
 }
 
 fn soccer_actor_decisive_event_priority(transition: &SoccerLearningTransition) -> bool {
