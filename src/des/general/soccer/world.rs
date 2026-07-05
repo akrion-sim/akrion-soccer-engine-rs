@@ -53,6 +53,66 @@ const SOCCER_POLICY_EXPLORATION_CANDIDATE_LIMIT: usize =
         POLICY_SELECTION_TOP_RANK_LIMIT
     };
 
+#[derive(Clone, Copy, Debug)]
+struct LearnedMpcReplanThresholds {
+    pass_impossible_probability: f64,
+    dribble_impossible_probability: f64,
+    shot_impossible_probability: f64,
+    soft_min_original_probability: f64,
+    soft_max_original_probability: f64,
+    soft_min_replacement_probability: f64,
+    soft_min_improvement: f64,
+}
+
+fn learned_mpc_probability_env(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(default)
+        .clamp(0.0, 1.0)
+}
+
+fn learned_mpc_replan_thresholds() -> LearnedMpcReplanThresholds {
+    use std::sync::OnceLock;
+    static V: OnceLock<LearnedMpcReplanThresholds> = OnceLock::new();
+    *V.get_or_init(|| {
+        let soft_min_original = learned_mpc_probability_env(
+            "SOCCER_LEARNED_MPC_SOFT_REPLAN_MIN_ORIGINAL_PROBABILITY",
+            LEARNED_MPC_SOFT_REPLAN_MIN_ORIGINAL_PROBABILITY,
+        );
+        let soft_max_original = learned_mpc_probability_env(
+            "SOCCER_LEARNED_MPC_SOFT_REPLAN_MAX_ORIGINAL_PROBABILITY",
+            LEARNED_MPC_SOFT_REPLAN_MAX_ORIGINAL_PROBABILITY,
+        )
+        .max(soft_min_original);
+        LearnedMpcReplanThresholds {
+            pass_impossible_probability: learned_mpc_probability_env(
+                "SOCCER_LEARNED_MPC_PASS_IMPOSSIBLE_PROBABILITY",
+                LEARNED_MPC_PASS_IMPOSSIBLE_PROBABILITY,
+            ),
+            dribble_impossible_probability: learned_mpc_probability_env(
+                "SOCCER_LEARNED_MPC_DRIBBLE_IMPOSSIBLE_PROBABILITY",
+                LEARNED_MPC_DRIBBLE_IMPOSSIBLE_PROBABILITY,
+            ),
+            shot_impossible_probability: learned_mpc_probability_env(
+                "SOCCER_LEARNED_MPC_SHOT_IMPOSSIBLE_PROBABILITY",
+                LEARNED_MPC_SHOT_IMPOSSIBLE_PROBABILITY,
+            ),
+            soft_min_original_probability: soft_min_original,
+            soft_max_original_probability: soft_max_original,
+            soft_min_replacement_probability: learned_mpc_probability_env(
+                "SOCCER_LEARNED_MPC_SOFT_REPLAN_MIN_REPLACEMENT_PROBABILITY",
+                LEARNED_MPC_SOFT_REPLAN_MIN_REPLACEMENT_PROBABILITY,
+            ),
+            soft_min_improvement: learned_mpc_probability_env(
+                "SOCCER_LEARNED_MPC_SOFT_REPLAN_MIN_IMPROVEMENT",
+                LEARNED_MPC_SOFT_REPLAN_MIN_IMPROVEMENT,
+            ),
+        }
+    })
+}
+
 fn defensive_shot_on_target_penalty_points() -> (f64, f64) {
     use std::sync::OnceLock;
     static V: OnceLock<(f64, f64)> = OnceLock::new();
@@ -7944,13 +8004,14 @@ impl SoccerMatch {
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0);
         let hard_replan = Self::learned_plan_needs_mpc_replan(snapshot, player_id, &plan);
+        let thresholds = learned_mpc_replan_thresholds();
         let soft_replan_eligible = !hard_replan
             && !matches!(
                 original_family,
                 "shoot" | "first-time-shot" | "first-time-header"
             )
-            && original_execution_probability >= LEARNED_MPC_SOFT_REPLAN_MIN_ORIGINAL_PROBABILITY
-            && original_execution_probability <= LEARNED_MPC_SOFT_REPLAN_MAX_ORIGINAL_PROBABILITY;
+            && original_execution_probability >= thresholds.soft_min_original_probability
+            && original_execution_probability <= thresholds.soft_max_original_probability;
         if !hard_replan && !soft_replan_eligible {
             return plan;
         }
@@ -8004,12 +8065,13 @@ impl SoccerMatch {
         plan: &SoccerLearnedPlan,
     ) -> bool {
         let label = normalize_soccer_action_label(&plan.action);
+        let thresholds = learned_mpc_replan_thresholds();
         let threshold = if pass_like_action_flight(label).is_some() {
-            Some(LEARNED_MPC_PASS_IMPOSSIBLE_PROBABILITY)
+            Some(thresholds.pass_impossible_probability)
         } else if is_dribble_action_label(label) {
-            Some(LEARNED_MPC_DRIBBLE_IMPOSSIBLE_PROBABILITY)
+            Some(thresholds.dribble_impossible_probability)
         } else if matches!(label, "shoot" | "first-time-shot" | "first-time-header") {
-            Some(LEARNED_MPC_SHOT_IMPOSSIBLE_PROBABILITY)
+            Some(thresholds.shot_impossible_probability)
         } else {
             None
         };
@@ -8034,11 +8096,11 @@ impl SoccerMatch {
         }
         let original_probability = finite_unit_interval(original_probability);
         let candidate_probability = finite_unit_interval(candidate_probability);
-        original_probability >= LEARNED_MPC_SOFT_REPLAN_MIN_ORIGINAL_PROBABILITY
-            && original_probability <= LEARNED_MPC_SOFT_REPLAN_MAX_ORIGINAL_PROBABILITY
-            && candidate_probability >= LEARNED_MPC_SOFT_REPLAN_MIN_REPLACEMENT_PROBABILITY
-            && candidate_probability - original_probability
-                >= LEARNED_MPC_SOFT_REPLAN_MIN_IMPROVEMENT
+        let thresholds = learned_mpc_replan_thresholds();
+        original_probability >= thresholds.soft_min_original_probability
+            && original_probability <= thresholds.soft_max_original_probability
+            && candidate_probability >= thresholds.soft_min_replacement_probability
+            && candidate_probability - original_probability >= thresholds.soft_min_improvement
     }
 
     fn learned_plan_mpc_execution_probability(
