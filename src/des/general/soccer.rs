@@ -20895,6 +20895,15 @@ pub(crate) fn dd_soccer_enable_aerial_pass_oob_discipline() -> bool {
     }
 }
 
+/// Gate for the GENERAL pass-out-of-bounds penalty (10-15 points scaled by exit speed + travel).
+/// OFF (default) ⇒ byte-identical to baseline. ON supersedes the aerial-only handler for every
+/// conceded pass out of play — ground passes included.
+pub(crate) fn dd_soccer_enable_pass_oob_penalty() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_PASS_OOB_PENALTY"))
+}
+
 /// Gate for overload-weighted progression rewards (see the `OVERLOAD_*` constants). OFF (the
 /// default) forces every overload progression weight to 0.0, so the reward path is byte-identical.
 pub(crate) fn dd_soccer_enable_overload_weighted_progression() -> bool {
