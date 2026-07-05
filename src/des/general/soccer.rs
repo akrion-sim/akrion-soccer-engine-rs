@@ -20662,6 +20662,16 @@ pub(crate) fn dd_soccer_enable_pass_oob_penalty() -> bool {
     *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_PASS_OOB_PENALTY"))
 }
 
+/// Cached gate for the cross-tick deferred credit/penalty attribution fix (completed passes +
+/// turnover penalties back-dated to their decision transition). Cached in a `OnceLock` because it
+/// is read on the hot training path (per completed pass / per turnover) where a per-call
+/// `std::env::var` syscall would be wasteful. OFF (default) ⇒ byte-identical to baseline.
+pub(crate) fn dd_soccer_enable_deferred_pass_credit() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_DEFERRED_PASS_CREDIT"))
+}
+
 /// Gate for interception-aware route-one / clearance training credit. OFF (the default) leaves the
 /// `soccer_goal_credit_transition_score` long-ball branch byte-identical to baseline, where a hoofed
 /// forward ball is credited purely on distance/pressure/urgency with NO interception or completion
