@@ -20,7 +20,7 @@ const LEARNED_MPC_SOFT_REPLAN_MIN_IMPROVEMENT: f64 = 0.22;
 const NEURAL_MCTS_DISTILLATION_MAX_SCORE_REGRESSION: f64 = 0.08;
 const NEURAL_MCTS_DISTILLATION_REJECTED_PROBABILITY: f64 = 0.35;
 const NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR: f64 = 0.04;
-const NEURAL_MCTS_DISTILLATION_PRIORITY_WEIGHT: f64 = 3.0;
+const NEURAL_MCTS_DISTILLATION_PRIORITY_WEIGHT: f64 = 1.4;
 const NEURAL_MCTS_DISTILLATION_ADVANTAGE_NOISE_TOLERANCE: f64 = 0.12;
 const NEURAL_MCTS_DISTILLATION_MIN_REWARD: f64 = -0.05;
 const NEURAL_MCTS_PASS_TARGET_CANDIDATE_LIMIT: usize = 3;
@@ -4229,14 +4229,17 @@ mod tests {
     }
 
     #[test]
-    fn neural_mcts_selection_without_replacement_trains_normally() {
+    fn neural_mcts_selection_without_replacement_gets_light_teacher_signal() {
         let transition = policy_test_transition_with_mcts(true);
 
         assert_eq!(
             soccer_actor_advantage_with_planner_distillation(&transition, 0.01),
-            0.01
+            NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR
         );
-        assert_eq!(soccer_actor_priority_weight(&transition, 0.01), 1.0);
+        assert_eq!(
+            soccer_actor_priority_weight(&transition, NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR),
+            NEURAL_MCTS_DISTILLATION_PRIORITY_WEIGHT
+        );
     }
 
     #[test]
@@ -4715,6 +4718,9 @@ fn soccer_actor_mcts_distillation_candidate(
         || learned_mpc_rejected_action_counterexample(transition)
     {
         return false;
+    }
+    if advantage >= 0.0 && transition.reward >= 0.0 {
+        return true;
     }
     if !soccer_actor_mcts_distillation_replacement_trace(transition) {
         return false;
