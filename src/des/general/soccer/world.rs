@@ -2570,6 +2570,50 @@ mod tests {
     }
 
     #[test]
+    fn analytic_difference_reward_keeps_unknown_neural_action_neutral() {
+        let _env = set_test_env_var("DD_SOCCER_ENABLE_ANALYTIC_DIFFERENCE_REWARD", "1");
+        let sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let player = &sim.players[0];
+        let mdp_state = snapshot.mdp_state_for_player(player.id);
+        let observation = snapshot.observation_for(player.id);
+        let belief = belief_from_observation(&observation);
+        let decision = AgentDecisionTrace {
+            mdp_state,
+            observation,
+            belief,
+            operation_order: vec!["learned-policy".to_string(), "novel-action".to_string()],
+            scheduled_index: None,
+            action_options: vec![
+                AgentActionOptionTrace::new("pass1", 1.20, true),
+                AgentActionOptionTrace::new("novel-action", 1.20, true),
+            ],
+            action_target: None,
+            mdp_mpc_comparison: None,
+            learned_mpc_replan: None,
+            behavior_policy_probability: None,
+            neural_mcts_selected: false,
+            action: "novel-action".to_string(),
+        };
+
+        assert_eq!(soccer_analytic_difference_reward(&decision), 0.0);
+    }
+
+    #[test]
+    fn policy_entropy_coeff_is_env_tunable_and_bounded() {
+        {
+            let _env = set_test_env_var("SOCCER_POLICY_ENTROPY_COEFF", "0.035");
+            assert!((soccer_policy_entropy_coeff() - 0.035).abs() < 1e-12);
+        }
+        {
+            let _env = set_test_env_var("SOCCER_POLICY_ENTROPY_COEFF", "9.0");
+            assert!(
+                (soccer_policy_entropy_coeff() - SOCCER_POLICY_ENTROPY_COEFF_MAX).abs() < 1e-12
+            );
+        }
+    }
+
+    #[test]
     fn learned_policy_action_mpc_definition_covers_policy_head_vocabulary() {
         for action in SOCCER_POLICY_ACTIONS {
             assert!(

@@ -13561,7 +13561,16 @@ impl PlayerAgent {
             .iter()
             .any(|option| learned_mpc_action_labels_match(&option.label, action_label))
         {
-            options.push(AgentActionOptionTrace::new(action_label, 0.0, true));
+            let neutral_score = options
+                .iter()
+                .filter(|option| option.legal)
+                .map(soccer_finite_option_score)
+                .fold(1.0, f64::max);
+            options.push(AgentActionOptionTrace::new(
+                action_label,
+                neutral_score,
+                true,
+            ));
         }
         normalize_action_options(options)
     }

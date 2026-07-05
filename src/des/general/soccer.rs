@@ -5418,8 +5418,11 @@ const SOCCER_POLICY_FEATURE_DIM: usize = SOCCER_NEURAL_FEATURE_DIM
     + SOCCER_POLICY_ASSIGNED_POSITION_DIM;
 const SOCCER_POLICY_HIDDEN_UNITS: usize = 24;
 const SOCCER_POLICY_LEARNING_RATE: f64 = 0.05;
-/// Entropy bonus — keeps the actor from collapsing onto one family too early.
-const SOCCER_POLICY_ENTROPY_COEFF: f64 = 0.01;
+/// Default entropy bonus — keeps the actor from collapsing onto one family too early.
+/// Override with `SOCCER_POLICY_ENTROPY_COEFF` when local runs show policy entropy
+/// falling into a safe-action plateau.
+const SOCCER_POLICY_ENTROPY_COEFF_DEFAULT: f64 = 0.01;
+const SOCCER_POLICY_ENTROPY_COEFF_MAX: f64 = 0.20;
 /// GAE(λ) trace decay for advantage estimation along an agent's trajectory.
 const SOCCER_POLICY_GAE_LAMBDA: f64 = 0.95;
 /// Max tick gap between an agent's *consecutive decisions* that still counts as a
@@ -5430,6 +5433,36 @@ const SOCCER_POLICY_GAE_LAMBDA: f64 = 0.95;
 const SOCCER_TRAJECTORY_MAX_DECISION_GAP_TICKS: u64 = secs_to_ticks(0.3);
 /// Gradient-norm ceiling for the actor's SGD step (same guard family as the critic).
 const SOCCER_POLICY_GRAD_CLIP_NORM: f64 = 5.0;
+
+fn soccer_policy_entropy_coeff() -> f64 {
+    #[cfg(test)]
+    {
+        soccer_policy_entropy_coeff_from_env().unwrap_or(SOCCER_POLICY_ENTROPY_COEFF_DEFAULT)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static COEFF: OnceLock<f64> = OnceLock::new();
+        *COEFF.get_or_init(|| {
+            soccer_policy_entropy_coeff_from_env().unwrap_or(SOCCER_POLICY_ENTROPY_COEFF_DEFAULT)
+        })
+    }
+}
+
+fn soccer_policy_entropy_coeff_from_env() -> Option<f64> {
+    let raw = std::env::var("SOCCER_POLICY_ENTROPY_COEFF").ok()?;
+    match raw.trim().parse::<f64>() {
+        Ok(value) if value.is_finite() => Some(value.clamp(0.0, SOCCER_POLICY_ENTROPY_COEFF_MAX)),
+        _ => {
+            eprintln!(
+                "soccer: invalid SOCCER_POLICY_ENTROPY_COEFF {:?}; using default {:.4}",
+                raw, SOCCER_POLICY_ENTROPY_COEFF_DEFAULT
+            );
+            None
+        }
+    }
+}
+
 /// Upper bound for prioritized actor samples. Planner-teacher and decisive
 /// soccer events need to survive batch standardization, but one rare row should
 /// not explode the clipped policy-gradient step.
@@ -38648,7 +38681,7 @@ impl SoccerPolicyRoleHead {
                 &sample.state_features[..],
                 sample.action_index,
                 weighted_advantage,
-                SOCCER_POLICY_ENTROPY_COEFF,
+                soccer_policy_entropy_coeff(),
                 SOCCER_POLICY_LEARNING_RATE,
                 SOCCER_POLICY_GRAD_CLIP_NORM,
             );
@@ -38677,7 +38710,7 @@ impl SoccerPolicyRoleHead {
                     &sample.state_features[..],
                     local_action_index,
                     weighted_advantage,
-                    SOCCER_POLICY_ENTROPY_COEFF,
+                    soccer_policy_entropy_coeff(),
                     SOCCER_POLICY_LEARNING_RATE,
                     SOCCER_POLICY_GRAD_CLIP_NORM,
                 );
@@ -38976,7 +39009,7 @@ impl SoccerSkillPolicyHead {
                     &sample.state_features[..],
                     local,
                     weighted_advantage,
-                    SOCCER_POLICY_ENTROPY_COEFF,
+                    soccer_policy_entropy_coeff(),
                     SOCCER_POLICY_LEARNING_RATE,
                     SOCCER_POLICY_GRAD_CLIP_NORM,
                 );
@@ -39243,7 +39276,7 @@ impl SoccerKeeperPolicyHead {
                 &sample.state_features[..],
                 sample.action_index,
                 sample.advantage,
-                SOCCER_POLICY_ENTROPY_COEFF,
+                soccer_policy_entropy_coeff(),
                 SOCCER_POLICY_LEARNING_RATE,
                 SOCCER_POLICY_GRAD_CLIP_NORM,
             );
