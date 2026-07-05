@@ -6743,6 +6743,34 @@ impl SoccerMatch {
                         })
                     })
                     .unwrap_or((SoccerQPolicyOptions::default().gamma, 0.0));
+                // Part C — neural self-bootstrap: blend the net's OWN predicted successor value into
+                // `max_next` instead of only the tabular teacher, so the target can rate a policy
+                // BETTER than tabular (true neural TD/Q-learning). Off ⇒ pure tabular (byte-identical).
+                let max_next = if !transition.done && dd_soccer_enable_neural_self_bootstrap() {
+                    let neural_raw = self
+                        .neural_learner_for(transition.team)
+                        .filter(|learner| learner.has_prediction_network())
+                        .and_then(|learner| {
+                            let mut succ = transition.clone();
+                            succ.state = transition.next_state.clone();
+                            succ.observation = transition.next_observation.clone();
+                            learner
+                                .predict_value(&soccer_neural_transition_features_with_action(
+                                    &succ, "",
+                                ))
+                                .map(|scaled| scaled * target_scale)
+                        })
+                        .filter(|value| value.is_finite());
+                    match neural_raw {
+                        Some(neural) => {
+                            let w = dd_soccer_self_bootstrap_weight();
+                            w * neural + (1.0 - w) * tabular_max_next
+                        }
+                        None => tabular_max_next,
+                    }
+                } else {
+                    tabular_max_next
+                };
                 let (target, priority) = soccer_neural_target_and_priority(
                     adjusted_reward,
                     gamma,
