@@ -4272,6 +4272,43 @@ mod tests {
     }
 
     #[test]
+    fn neural_mcts_route_one_without_replacement_trains_normally() {
+        let mut transition = policy_test_transition_with_mcts(true);
+        transition.action = "route-one".to_string();
+        transition.reward = 2.0;
+
+        assert_eq!(
+            soccer_actor_advantage_with_planner_distillation(&transition, 0.01),
+            0.01,
+            "weak route-one MCTS selections should not get a special actor floor"
+        );
+        assert_eq!(
+            soccer_actor_priority_weight(&transition, 0.01),
+            1.0,
+            "route-one stays trainable by its real advantage, not planner-teacher priority"
+        );
+    }
+
+    #[test]
+    fn neural_mcts_route_one_replacement_can_distill() {
+        let mut transition = policy_test_transition_with_mcts(true);
+        transition.action = "route-one".to_string();
+        transition.reward = 2.0;
+        transition.decision_context.learned_mpc_replanned = true;
+        transition.decision_context.learned_mpc_original_action = Some("dribble".to_string());
+        transition.decision_context.learned_mpc_replacement_action = Some("route-one".to_string());
+
+        assert_eq!(
+            soccer_actor_advantage_with_planner_distillation(&transition, 0.01),
+            NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR
+        );
+        assert_eq!(
+            soccer_actor_priority_weight(&transition, NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR),
+            NEURAL_MCTS_DISTILLATION_PRIORITY_WEIGHT
+        );
+    }
+
+    #[test]
     fn actor_priority_weight_keeps_bad_outcomes_negative() {
         let mut transition = policy_test_transition_with_mcts(false);
         transition.reward = -1.0;
@@ -4765,14 +4802,29 @@ fn soccer_actor_mcts_distillation_candidate(
     {
         return false;
     }
+    let replacement_trace = soccer_actor_mcts_distillation_replacement_trace(transition);
+    if !soccer_actor_mcts_distillation_action_allowed(transition, replacement_trace) {
+        return false;
+    }
     if advantage >= 0.0 && transition.reward >= 0.0 {
         return true;
     }
-    if !soccer_actor_mcts_distillation_replacement_trace(transition) {
+    if !replacement_trace {
         return false;
     }
     advantage >= -neural_mcts_distillation_advantage_noise_tolerance()
         && transition.reward >= neural_mcts_distillation_min_reward()
+}
+
+fn soccer_actor_mcts_distillation_action_allowed(
+    transition: &SoccerLearningTransition,
+    replacement_trace: bool,
+) -> bool {
+    let action = normalize_soccer_action_label(&transition.action);
+    if action == "route-one" {
+        return replacement_trace;
+    }
+    true
 }
 
 fn soccer_actor_mcts_distillation_replacement_trace(transition: &SoccerLearningTransition) -> bool {
