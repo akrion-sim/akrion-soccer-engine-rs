@@ -1525,6 +1525,39 @@ fn soccer_approx_dp_replay_passes() -> usize {
     })
 }
 
+fn soccer_bellman_replay_with_trajectory_terminals(
+    replay: &[SoccerLearningTransition],
+) -> Vec<SoccerLearningTransition> {
+    if replay.is_empty() {
+        return Vec::new();
+    }
+    let mut bellman_replay = replay.to_vec();
+    for transition in &mut bellman_replay {
+        transition.done = true;
+    }
+    let mut by_agent: HashMap<(Team, usize), Vec<usize>> = HashMap::new();
+    for (index, transition) in replay.iter().enumerate() {
+        if learned_mpc_rejected_action_counterexample(transition) {
+            continue;
+        }
+        by_agent
+            .entry((transition.team, transition.player_id))
+            .or_default()
+            .push(index);
+    }
+    for (_, mut indices) in by_agent {
+        indices.sort_by_key(|&index| replay[index].tick);
+        for window in indices.windows(2) {
+            let (current, next) = (window[0], window[1]);
+            let gap = replay[next].tick.saturating_sub(replay[current].tick);
+            if gap > 0 && gap <= SOCCER_TRAJECTORY_MAX_DECISION_GAP_TICKS {
+                bellman_replay[current].done = false;
+            }
+        }
+    }
+    bellman_replay
+}
+
 fn train_soccer_team_policies_with_approx_dp(
     team_policies: &mut SoccerTeamQPolicies,
     replay: &[SoccerLearningTransition],
@@ -1671,6 +1704,33 @@ mod tests {
             swept_value > 8.99 && swept_value < 9.01,
             "reverse Bellman sweep should propagate gamma * late reward backward, got {swept_value}"
         );
+    }
+
+    #[test]
+    fn bellman_replay_rebuilds_full_game_done_flags_for_dp_bootstrap() {
+        let sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let (player_id, _) = first_home_field_pair(&sim);
+        let mut early = world_test_transition(&sim, player_id, "carry", 1);
+        let mut late = early.clone();
+        late.tick = 2;
+        late.action = "shoot".to_string();
+        late.reward = 10.0;
+        early.reward = 0.0;
+        early.next_state = late.state.clone();
+        early.next_observation = late.observation.clone();
+
+        let full_game_replay = soccer_correlated_full_game_replay_transitions(&[early, late], None);
+        assert!(
+            full_game_replay.iter().all(|transition| transition.done),
+            "full-game replay overloads done=true on every row"
+        );
+
+        let bellman_replay = soccer_bellman_replay_with_trajectory_terminals(&full_game_replay);
+        assert!(
+            !bellman_replay[0].done,
+            "adjacent same-agent decision should bootstrap"
+        );
+        assert!(bellman_replay[1].done, "trajectory tail remains terminal");
     }
 
     fn world_test_transition(
@@ -9305,16 +9365,21 @@ impl SoccerMatch {
                 .collect()
         });
         let approx_dp_passes = soccer_approx_dp_replay_passes();
+        // Full-game replay overloads `done` as "this row has final-game credit".
+        // Rebuild terminal flags from per-agent successor gaps for Bellman Q/value
+        // bootstrapping; actor/GAE and world-model paths below already derive their
+        // own trajectory continuity from tick gaps.
+        let bellman_replay = soccer_bellman_replay_with_trajectory_terminals(&replay);
         if let Some(team_policies) = &mut self.team_policies {
             train_soccer_team_policies_with_approx_dp(
                 team_policies,
-                &replay,
+                &bellman_replay,
                 critic_baselines.as_deref(),
                 approx_dp_passes,
             );
         }
         if let Some(policy) = &mut self.learned_policy {
-            train_soccer_policy_with_approx_dp(policy, &replay, approx_dp_passes);
+            train_soccer_policy_with_approx_dp(policy, &bellman_replay, approx_dp_passes);
         }
         // Actor (policy head): compute GAE advantages with the *current* critic
         // (before this episode's value update), then take a policy-gradient step.
@@ -9341,7 +9406,7 @@ impl SoccerMatch {
             } else {
                 Vec::new()
             };
-        self.train_neural_value_models(&replay);
+        self.train_neural_value_models(&bellman_replay);
         if !policy_samples.is_empty() {
             let priority_samples = policy_samples
                 .iter()
