@@ -4258,16 +4258,18 @@ mod tests {
     }
 
     #[test]
-    fn neural_mcts_selection_without_replacement_gets_light_teacher_signal() {
+    fn neural_mcts_selection_without_replacement_trains_normally() {
         let transition = policy_test_transition_with_mcts(true);
 
         assert_eq!(
             soccer_actor_advantage_with_planner_distillation(&transition, 0.01),
-            NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR
+            0.01,
+            "MCTS selection alone should not get artificial actor advantage"
         );
         assert_eq!(
-            soccer_actor_priority_weight(&transition, NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR),
-            NEURAL_MCTS_DISTILLATION_PRIORITY_WEIGHT
+            soccer_actor_priority_weight(&transition, 0.01),
+            1.0,
+            "MCTS selection alone should train by its real advantage weight"
         );
     }
 
@@ -4803,14 +4805,14 @@ fn soccer_actor_mcts_distillation_candidate(
         return false;
     }
     let replacement_trace = soccer_actor_mcts_distillation_replacement_trace(transition);
+    if !replacement_trace {
+        return false;
+    }
     if !soccer_actor_mcts_distillation_action_allowed(transition, replacement_trace) {
         return false;
     }
     if advantage >= 0.0 && transition.reward >= 0.0 {
         return true;
-    }
-    if !replacement_trace {
-        return false;
     }
     advantage >= -neural_mcts_distillation_advantage_noise_tolerance()
         && transition.reward >= neural_mcts_distillation_min_reward()
