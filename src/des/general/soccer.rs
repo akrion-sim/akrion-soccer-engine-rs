@@ -14011,6 +14011,70 @@ fn soccer_correlated_full_game_replay_transitions(
     replay
 }
 
+/// Sample-based (fitted) value iteration over the abstract-state MDP. `samples` are
+/// `(bucket, reward, next_bucket)` tuples drawn from the replay; `next_bucket = None` marks a
+/// terminal step (bootstraps 0 — the flat outcome label is credited separately). Each Jacobi sweep
+/// sets `V(b) ← mean over samples from b of [r + γ·V(b')]`; the table is tiny so a few dozen sweeps
+/// propagate value across the whole abstract MDP. Values are clamped to the shared return clip.
+fn soccer_dp_value_iteration(
+    samples: &[(u32, f64, Option<u32>)],
+    gamma: f64,
+    sweeps: usize,
+) -> BTreeMap<u32, f64> {
+    let mut value: BTreeMap<u32, f64> = BTreeMap::new();
+    for _ in 0..sweeps {
+        let mut acc: BTreeMap<u32, (f64, usize)> = BTreeMap::new();
+        for (b, r, nb) in samples {
+            let boot = match nb {
+                Some(nb) => gamma * *value.get(nb).unwrap_or(&0.0),
+                None => 0.0,
+            };
+            let e = acc.entry(*b).or_insert((0.0, 0));
+            e.0 += *r + boot;
+            e.1 += 1;
+        }
+        for (b, (sum, count)) in acc {
+            if count > 0 {
+                value.insert(
+                    b,
+                    (sum / count as f64)
+                        .clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP),
+                );
+            }
+        }
+    }
+    value
+}
+
+/// n-step bootstrapped return starting at index `start` of one team's decision sequence `seq`
+/// (`(tick, reward, bucket)` tuples): `Σ_{k<h} γ^k r_{start+k} + γ^h V(b_{start+h})`. The horizon
+/// truncates the Monte-Carlo tail; when the sequence ends before the horizon fills, the tail
+/// bootstraps 0 (the outcome label is added by the caller). Clamped to the shared return clip.
+fn soccer_dp_nstep_return(
+    seq: &[(u64, f64, u32)],
+    start: usize,
+    horizon: usize,
+    gamma: f64,
+    value: &BTreeMap<u32, f64>,
+) -> f64 {
+    let mut ret = 0.0;
+    let mut disc = 1.0;
+    for k in 0..horizon {
+        let j = start + k;
+        if j >= seq.len() {
+            break;
+        }
+        ret += disc * seq[j].1;
+        disc *= gamma;
+        if k + 1 == horizon {
+            if let Some(nb) = seq.get(j + 1).map(|n| n.2) {
+                ret += disc * *value.get(&nb).unwrap_or(&0.0);
+            }
+        }
+    }
+    ret.clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP)
+}
+
 /// Compact, team-relative abstraction of the symbolic MDP state for the DP value table. From the
 /// acting team's perspective: attacking-third of the ball (x), lateral third (y), possession
 /// (us/them/loose), score sign (winning/level/losing), and a team-relative phase (our-build /
