@@ -21,6 +21,7 @@ const NEURAL_MCTS_DISTILLATION_MAX_SCORE_REGRESSION: f64 = 0.08;
 const NEURAL_MCTS_DISTILLATION_REJECTED_PROBABILITY: f64 = 0.35;
 const NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR: f64 = 0.04;
 const NEURAL_MCTS_DISTILLATION_PRIORITY_WEIGHT: f64 = 3.0;
+const NEURAL_MCTS_PASS_TARGET_CANDIDATE_LIMIT: usize = 3;
 const SOCCER_ACTOR_DECISIVE_EVENT_PRIORITY_WEIGHT: f64 = 2.0;
 const SOCCER_ACTOR_NEGATIVE_OUTCOME_PRIORITY_WEIGHT: f64 = 1.6;
 const COMPLETED_PASS_LEARNING_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(5.0);
@@ -3441,6 +3442,36 @@ mod tests {
                 .any(|(a, b)| (*a - *b).abs() > 1e-9),
             "different pass targets must produce different neural candidate features"
         );
+        let expanded =
+            SoccerMatch::neural_mcts_pass_target_candidate_plans(&snapshot, actor_id, "pass");
+        assert!(
+            expanded.len() >= 2,
+            "neural MCTS should score multiple concrete pass targets"
+        );
+        assert_eq!(expanded[0].action, "pass1");
+        assert_eq!(expanded[1].action, "pass2");
+        assert_ne!(expanded[0].target_player, expanded[1].target_player);
+        assert!(expanded[0].target_point.is_some());
+        assert!(expanded[1].target_point.is_some());
+        let scored_ranked = sim.neural_decision_transition_for_plan(
+            &base,
+            &snapshot,
+            actor_id,
+            actor_team,
+            &expanded[1],
+        );
+        assert_eq!(scored_ranked.action, "pass2");
+        assert_eq!(
+            scored_ranked
+                .action_target
+                .as_ref()
+                .and_then(|target| target.player_id),
+            expanded[1].target_player
+        );
+        let (_, executed_label) = sim.players[actor]
+            .action_from_learned_plan(&expanded[1], &snapshot, &observation)
+            .expect("target-specific learned pass should execute");
+        assert_eq!(executed_label, "pass2");
     }
 
     #[test]
@@ -6813,7 +6844,7 @@ impl SoccerMatch {
         team: Team,
         plan: &SoccerLearnedPlan,
     ) -> SoccerLearningTransition {
-        let action = normalize_soccer_action_label(&plan.action).to_string();
+        let action = learned_mpc_action_label_key(&plan.action);
         let action_target = Self::learned_plan_action_target_trace(snapshot, player_id, plan);
         let mut transition = base.clone();
         transition.action = action.clone();
@@ -6827,6 +6858,38 @@ impl SoccerMatch {
             snapshot,
         );
         transition
+    }
+
+    fn neural_mcts_pass_target_candidate_plans(
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        candidate_label: &str,
+    ) -> Vec<SoccerLearnedPlan> {
+        let normalized = normalize_soccer_action_label(candidate_label);
+        if candidate_label != normalized {
+            return Vec::new();
+        }
+        let (prefix, targets) = match normalized {
+            "pass" => ("pass", snapshot.ranked_visible_pass_targets(player_id, 11)),
+            "aerial-pass" => (
+                "aerial-pass",
+                snapshot.ranked_visible_aerial_pass_targets(player_id, 11),
+            ),
+            _ => return Vec::new(),
+        };
+        targets
+            .into_iter()
+            .take(NEURAL_MCTS_PASS_TARGET_CANDIDATE_LIMIT)
+            .enumerate()
+            .filter_map(|(index, target_player)| {
+                Some(SoccerLearnedPlan {
+                    action: format!("{}{}", prefix, index + 1),
+                    target_player: Some(target_player),
+                    target_point: snapshot.player_position(target_player),
+                    mpc_replan: None,
+                })
+            })
+            .collect()
     }
 
     fn neural_mcts_action_from_candidates(
@@ -7237,80 +7300,91 @@ impl SoccerMatch {
             )
             .map(|v| v * target_scale)
         };
-        let mut scored_candidates = Vec::with_capacity(legal.len());
+        let mut scored_candidates = Vec::with_capacity(
+            legal.len() + legal.len() * NEURAL_MCTS_PASS_TARGET_CANDIDATE_LIMIT.min(3),
+        );
+        let mut push_scored_candidate =
+            |candidate: &SoccerLearnedActionTrace, candidate_plan: SoccerLearnedPlan| {
+                let transition = self.neural_decision_transition_for_plan(
+                    &base,
+                    snapshot,
+                    player_id,
+                    team,
+                    &candidate_plan,
+                );
+                let candidate_label = transition.action.clone();
+                let neural_value = neural_q(&transition);
+                // Value contribution (0-weighted when the value blend is off/cold).
+                let value_score = match blend.mode {
+                    SoccerNeuralBlendMode::Off => candidate.value,
+                    SoccerNeuralBlendMode::Additive => {
+                        candidate.value + lambda * neural_value.unwrap_or(0.0)
+                    }
+                    SoccerNeuralBlendMode::TieBreak => {
+                        if best_tabular - candidate.value > blend.tie_epsilon {
+                            // Outside the tie window — not a candidate for re-ranking.
+                            return;
+                        }
+                        candidate.value + lambda * neural_value.unwrap_or(0.0)
+                    }
+                    SoccerNeuralBlendMode::ConfidenceGated => {
+                        if candidate.visits < blend.min_confidence_visits {
+                            // Tabular is blind here — blend toward the net's estimate.
+                            let weight = lambda.min(1.0);
+                            let nv = neural_value.unwrap_or(candidate.value);
+                            (1.0 - weight) * candidate.value + weight * nv
+                        } else {
+                            candidate.value
+                        }
+                    }
+                    SoccerNeuralBlendMode::Authoritative => {
+                        let neural = neural_value.unwrap_or(0.0);
+                        lambda * neural + candidate.value * 1.0e-6
+                    }
+                };
+                // Actor bias: nudge toward the family the learned policy prefers.
+                let actor_bonus = policy_bonus(&candidate_label);
+                let retrieved_bonus = if blend.mode == SoccerNeuralBlendMode::Authoritative {
+                    0.0
+                } else {
+                    retrieval_bonus(&candidate_label)
+                };
+                let model_bonus = mcts_model_weight
+                    * self.neural_mcts_model_rollout_value(
+                        learner,
+                        &transition,
+                        target_scale,
+                        mcts_depth,
+                        gamma,
+                    );
+                let score = value_score + actor_bonus + retrieved_bonus + model_bonus;
+                if !score.is_finite() {
+                    return;
+                }
+                let actor_prior = policy_log_probs
+                    .as_ref()
+                    .and_then(|log_probs| {
+                        soccer_policy_action_index(&candidate_label).and_then(|i| log_probs.get(i))
+                    })
+                    .map(|log_p| log_p.exp())
+                    .unwrap_or(0.0);
+                scored_candidates.push(SoccerNeuralMctsCandidate {
+                    label: candidate_label,
+                    plan: Some(candidate_plan),
+                    score,
+                    prior: actor_prior + retrieved_bonus.max(0.0),
+                    q_visits: candidate.visits,
+                });
+            };
         for candidate in legal.iter() {
             let candidate_plan =
                 Self::learned_plan_for_policy(policy, snapshot, player_id, candidate.label.clone());
-            let transition = self.neural_decision_transition_for_plan(
-                &base,
-                snapshot,
-                player_id,
-                team,
-                &candidate_plan,
-            );
-            let candidate_label = transition.action.clone();
-            let neural_value = neural_q(&transition);
-            // Value contribution (0-weighted when the value blend is off/cold).
-            let value_score = match blend.mode {
-                SoccerNeuralBlendMode::Off => candidate.value,
-                SoccerNeuralBlendMode::Additive => {
-                    candidate.value + lambda * neural_value.unwrap_or(0.0)
-                }
-                SoccerNeuralBlendMode::TieBreak => {
-                    if best_tabular - candidate.value > blend.tie_epsilon {
-                        // Outside the tie window — not a candidate for re-ranking.
-                        continue;
-                    }
-                    candidate.value + lambda * neural_value.unwrap_or(0.0)
-                }
-                SoccerNeuralBlendMode::ConfidenceGated => {
-                    if candidate.visits < blend.min_confidence_visits {
-                        // Tabular is blind here — blend toward the net's estimate.
-                        let weight = lambda.min(1.0);
-                        let nv = neural_value.unwrap_or(candidate.value);
-                        (1.0 - weight) * candidate.value + weight * nv
-                    } else {
-                        candidate.value
-                    }
-                }
-                SoccerNeuralBlendMode::Authoritative => {
-                    let neural = neural_value.unwrap_or(0.0);
-                    lambda * neural + candidate.value * 1.0e-6
-                }
-            };
-            // Actor bias: nudge toward the family the learned policy prefers.
-            let actor_bonus = policy_bonus(&candidate_label);
-            let retrieved_bonus = if blend.mode == SoccerNeuralBlendMode::Authoritative {
-                0.0
-            } else {
-                retrieval_bonus(&candidate_label)
-            };
-            let model_bonus = mcts_model_weight
-                * self.neural_mcts_model_rollout_value(
-                    learner,
-                    &transition,
-                    target_scale,
-                    mcts_depth,
-                    gamma,
-                );
-            let score = value_score + actor_bonus + retrieved_bonus + model_bonus;
-            if !score.is_finite() {
-                continue;
+            push_scored_candidate(candidate, candidate_plan);
+            for expanded_plan in
+                Self::neural_mcts_pass_target_candidate_plans(snapshot, player_id, &candidate.label)
+            {
+                push_scored_candidate(candidate, expanded_plan);
             }
-            let actor_prior = policy_log_probs
-                .as_ref()
-                .and_then(|log_probs| {
-                    soccer_policy_action_index(&candidate_label).and_then(|i| log_probs.get(i))
-                })
-                .map(|log_p| log_p.exp())
-                .unwrap_or(0.0);
-            scored_candidates.push(SoccerNeuralMctsCandidate {
-                label: candidate_label,
-                plan: Some(candidate_plan),
-                score,
-                prior: actor_prior + retrieved_bonus.max(0.0),
-                q_visits: candidate.visits,
-            });
         }
         scored_candidates.sort_by(|a, b| {
             b.score

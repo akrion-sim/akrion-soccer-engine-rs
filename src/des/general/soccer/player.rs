@@ -12854,13 +12854,20 @@ impl PlayerAgent {
                     })
                     .or_else(|| visible_targets.first().copied());
                 target.map(|target| {
+                    let action_label = if ranked_pass_action_label(&plan.action)
+                        && plan.target_player == Some(target)
+                    {
+                        learned_mpc_action_label_key(&plan.action)
+                    } else {
+                        "pass".to_string()
+                    };
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
                             power: 0.58 + 0.32 * ability01(self.skills.passing_completion_rate),
                             flight: PassFlight::Floor,
                         },
-                        "pass".to_string(),
+                        action_label,
                     )
                 })
             }
@@ -12916,6 +12923,13 @@ impl PlayerAgent {
                 target.map(|target| {
                     let crossing =
                         ability01(self.skills.crossing_left.max(self.skills.crossing_right));
+                    let action_label = if ranked_pass_action_label(&plan.action)
+                        && plan.target_player == Some(target)
+                    {
+                        learned_mpc_action_label_key(&plan.action)
+                    } else {
+                        "aerial-pass".to_string()
+                    };
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
@@ -12924,7 +12938,7 @@ impl PlayerAgent {
                                     * crossing.max(ability01(self.skills.passing_completion_rate)),
                             flight: PassFlight::Aerial,
                         },
-                        "aerial-pass".to_string(),
+                        action_label,
                     )
                 })
             }
