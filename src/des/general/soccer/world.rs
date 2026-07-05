@@ -7533,6 +7533,15 @@ impl SoccerMatch {
                 world_model.train(&world_model_pairs);
             }
         }
+        if self.neural_blend.world_model {
+            if let Some(world_model) = &self.world_model {
+                let stats = world_model.stats();
+                self.stats.world_model_enabled = stats.enabled;
+                self.stats.world_model_training_steps = stats.training_steps;
+                self.stats.world_model_loss = stats.last_loss;
+                self.stats.world_model_validation_loss = stats.last_validation_loss;
+            }
+        }
     }
 
     pub fn controller_yield_stats(&self) -> ControllerYieldStats {
