@@ -25,17 +25,17 @@ const SOCCER_POLICY_RANK_SALT_TEAM_NEURAL: u64 = 0x5445_414d_4e45_5552;
 const SOCCER_POLICY_RANK_SALT_SHARED_NEURAL: u64 = 0x5348_4152_4e45_5552;
 const SOCCER_POLICY_RANK_SALT_EXPLORATION: u64 = 0x4558_504c_4f52_4552;
 const SOCCER_POLICY_EPSILON_SALT_EXPLORATION: u64 = 0x4558_504c_4741_5445;
-const SOCCER_POLICY_EXPLORATION_UNCERTAINTY_SCALE: f64 = 0.35;
-const SOCCER_POLICY_EXPLORATION_UNCERTAINTY_MAX_MULTIPLIER: f64 = 4.0;
-const SOCCER_POLICY_EXPLORATION_TAIL_CANDIDATE_LIMIT: usize = 6;
+const SOCCER_POLICY_EXPLORATION_UNCERTAINTY_SCALE: f64 = 0.60;
+const SOCCER_POLICY_EXPLORATION_UNCERTAINTY_MAX_MULTIPLIER: f64 = 6.0;
+const SOCCER_POLICY_EXPLORATION_TAIL_CANDIDATE_LIMIT: usize = 10;
 const SOCCER_POLICY_EXPLORATION_CANDIDATE_LIMIT: usize =
     if SOCCER_POLICY_EXPLORATION_TAIL_CANDIDATE_LIMIT > POLICY_SELECTION_TOP_RANK_LIMIT {
         SOCCER_POLICY_EXPLORATION_TAIL_CANDIDATE_LIMIT
     } else {
         POLICY_SELECTION_TOP_RANK_LIMIT
     };
-const SOCCER_POLICY_EXPLORATION_TAIL_MASS_LIMIT: f64 = 0.10;
-const SOCCER_POLICY_EXPLORATION_TAIL_RANK_DECAY: f64 = 0.65;
+const SOCCER_POLICY_EXPLORATION_TAIL_MASS_LIMIT: f64 = 0.25;
+const SOCCER_POLICY_EXPLORATION_TAIL_RANK_DECAY: f64 = 0.85;
 const PASS_TARGET_MARK_HORIZON_TICKS: [f64; 5] = [0.0, 1.0, 2.0, 4.0, 8.0];
 const DEFENSIVE_PRESS_CONTAIN_MIN_PRESS_SCORE: f64 = 0.42;
 const DEFENSIVE_PRESS_CONTAIN_PRIMARY_MARGIN: f64 = 0.06;
@@ -18649,13 +18649,23 @@ impl SoccerMatch {
                 // Apply the aerial-OOB penalty FIRST so it can claim the event; the generic
                 // turnover penalty inside `apply_restart` then defers via the guard flag.
                 if !was_shot {
-                    self.suppress_generic_oob_turnover = self
-                        .record_aerial_pass_out_of_bounds_penalty(
+                    // The general pass-OOB penalty (gated) covers ground passes too and supersedes
+                    // the aerial-only handler when enabled; fall back to the aerial handler otherwise.
+                    self.suppress_generic_oob_turnover = if dd_soccer_enable_pass_oob_penalty() {
+                        self.record_pass_out_of_bounds_penalty(
                             oob_pass.as_ref(),
                             restart_kind,
                             restart_awarded,
                             restart_position,
-                        );
+                        )
+                    } else {
+                        self.record_aerial_pass_out_of_bounds_penalty(
+                            oob_pass.as_ref(),
+                            restart_kind,
+                            restart_awarded,
+                            restart_position,
+                        )
+                    };
                 }
                 self.apply_restart(restart);
                 self.suppress_generic_oob_turnover = false;
@@ -20241,6 +20251,52 @@ impl SoccerMatch {
         // An aerial hoofed out is also a turnover: give the offending team's last few seconds the
         // same retroactive, all-learner penalty (per-tick de-dup guarded), mirroring the generic
         // handler this one supersedes.
+        self.penalize_turnover_window(pass.team);
+        true
+    }
+
+    /// General pass-out-of-bounds penalty: ANY pass (ground or aerial) the team concedes out of
+    /// play is an unforced turnover, penalised 10→15 points scaled by how fast the ball was
+    /// travelling when it crossed the line and how far it ran before exiting. Gated
+    /// `DD_SOCCER_ENABLE_PASS_OOB_PENALTY` (default off). Returns true when it claims the event so
+    /// the generic OOB turnover penalty doesn't double-charge. Supersedes the aerial-only handler.
+    fn record_pass_out_of_bounds_penalty(
+        &mut self,
+        pass: Option<&PendingPass>,
+        restart_kind: BallRestartKind,
+        awarded_team: Team,
+        restart_position: Vec2,
+    ) -> bool {
+        if !dd_soccer_enable_pass_oob_penalty() {
+            return false;
+        }
+        let Some(pass) = pass else {
+            return false;
+        };
+        // Only a pass the passer's team CONCEDED out of play: a throw-in or goal-kick awarded to
+        // the other team. A corner is won off a defensive touch — not the passer's error.
+        let conceded = matches!(
+            restart_kind,
+            BallRestartKind::ThrowIn | BallRestartKind::GoalKick
+        ) && awarded_team != pass.team;
+        if !conceded {
+            return false;
+        }
+        // Scale the bite by exit speed (how hard it was driven across the line) and travel (how far
+        // it ran before exiting): floor 10 for a slow ball nicked out, up to 15 for a driven ball
+        // blazed a long way out.
+        let exit_speed = self.ball.velocity.len();
+        let travel = restart_position.distance(pass.origin);
+        let speed01 = (exit_speed / PASS_OOB_FULL_SPEED_YPS).clamp(0.0, 1.0);
+        let travel01 = (travel / PASS_OOB_FULL_TRAVEL_YARDS).clamp(0.0, 1.0);
+        let penalty = (PASS_OOB_BASE_PENALTY_POINTS
+            + speed01 * PASS_OOB_SPEED_TERM_POINTS
+            + travel01 * PASS_OOB_TRAVEL_TERM_POINTS)
+            .min(PASS_OOB_MAX_PENALTY_POINTS);
+        self.record_reward_event(pass.from, -penalty);
+        // An out-of-bounds pass is also a turnover: give the offending team's last few seconds the
+        // same retroactive, all-learner penalty (per-tick de-dup guarded), mirroring the aerial
+        // and generic handlers this one supersedes.
         self.penalize_turnover_window(pass.team);
         true
     }

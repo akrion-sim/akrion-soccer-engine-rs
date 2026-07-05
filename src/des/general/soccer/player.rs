@@ -618,6 +618,37 @@ struct ShirtAccent {
 }
 
 impl SkillProfile {
+    /// Multiply the performance attributes by `factor` (clamped to the 1-10 skill scale),
+    /// leaving physical constants (height/weight) and behavioural fields untouched. Used for an
+    /// asymmetric TEAM HANDICAP: a factor < 1 makes that side genuinely weaker, so the learner
+    /// must find superior tactics to still win — a curriculum pressure to escape the parity
+    /// plateau, rather than more of the same self-play against an equal analytic engine.
+    pub(crate) fn handicap_scaled(mut self, factor: f64) -> Self {
+        if !factor.is_finite() || (factor - 1.0).abs() <= f64::EPSILON {
+            return self;
+        }
+        let s = |x: f64| (x * factor).clamp(1.0, 10.0);
+        self.top_speed = s(self.top_speed);
+        self.acceleration = s(self.acceleration);
+        self.strength = s(self.strength);
+        self.shooting = s(self.shooting);
+        self.right_foot_shot_power = s(self.right_foot_shot_power);
+        self.left_foot_shot_power = s(self.left_foot_shot_power);
+        self.passing = s(self.passing);
+        self.passing_completion_rate = s(self.passing_completion_rate);
+        self.flair_passing = s(self.flair_passing);
+        self.crossing_left = s(self.crossing_left);
+        self.crossing_right = s(self.crossing_right);
+        self.dribbling = s(self.dribbling);
+        self.first_touch = s(self.first_touch);
+        self.defending = s(self.defending);
+        self.goalkeeping = s(self.goalkeeping);
+        self.defensive_tracking = s(self.defensive_tracking);
+        self.stamina = s(self.stamina);
+        self.vision = s(self.vision);
+        self
+    }
+
     /// Balanced per-role attribute baseline (14-tuple): top_speed, acceleration,
     /// strength, height, shooting, passing, dribbling, first_touch, defending,
     /// stamina, vision, aggression, goalkeeping, defensive_tracking_base. Shared by
