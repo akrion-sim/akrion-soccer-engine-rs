@@ -19873,6 +19873,52 @@ impl SoccerMatch {
         true
     }
 
+    /// General pass-out-of-bounds penalty: ANY pass (ground or aerial) the team concedes out of
+    /// play is an unforced turnover, penalised 10→15 points scaled by how fast the ball was
+    /// travelling when it crossed the line and how far it ran before exiting. Gated
+    /// `DD_SOCCER_ENABLE_PASS_OOB_PENALTY` (default off). Returns true when it claims the event so
+    /// the generic OOB turnover penalty doesn't double-charge. Supersedes the aerial-only handler.
+    fn record_pass_out_of_bounds_penalty(
+        &mut self,
+        pass: Option<&PendingPass>,
+        restart_kind: BallRestartKind,
+        awarded_team: Team,
+        restart_position: Vec2,
+    ) -> bool {
+        if !dd_soccer_enable_pass_oob_penalty() {
+            return false;
+        }
+        let Some(pass) = pass else {
+            return false;
+        };
+        // Only a pass the passer's team CONCEDED out of play: a throw-in or goal-kick awarded to
+        // the other team. A corner is won off a defensive touch — not the passer's error.
+        let conceded = matches!(
+            restart_kind,
+            BallRestartKind::ThrowIn | BallRestartKind::GoalKick
+        ) && awarded_team != pass.team;
+        if !conceded {
+            return false;
+        }
+        // Scale the bite by exit speed (how hard it was driven across the line) and travel (how far
+        // it ran before exiting): floor 10 for a slow ball nicked out, up to 15 for a driven ball
+        // blazed a long way out.
+        let exit_speed = self.ball.velocity.len();
+        let travel = restart_position.distance(pass.origin);
+        let speed01 = (exit_speed / PASS_OOB_FULL_SPEED_YPS).clamp(0.0, 1.0);
+        let travel01 = (travel / PASS_OOB_FULL_TRAVEL_YARDS).clamp(0.0, 1.0);
+        let penalty = (PASS_OOB_BASE_PENALTY_POINTS
+            + speed01 * PASS_OOB_SPEED_TERM_POINTS
+            + travel01 * PASS_OOB_TRAVEL_TERM_POINTS)
+            .min(PASS_OOB_MAX_PENALTY_POINTS);
+        self.record_reward_event(pass.from, -penalty);
+        // An out-of-bounds pass is also a turnover: give the offending team's last few seconds the
+        // same retroactive, all-learner penalty (per-tick de-dup guarded), mirroring the aerial
+        // and generic handlers this one supersedes.
+        self.penalize_turnover_window(pass.team);
+        true
+    }
+
     fn record_out_of_bounds_turnover_penalty(
         &mut self,
         restart_kind: BallRestartKind,
