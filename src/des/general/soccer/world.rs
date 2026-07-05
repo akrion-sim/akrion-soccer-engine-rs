@@ -3169,6 +3169,7 @@ impl SoccerMatch {
             pending_aerial_finish: None,
             coach_set_play_hints: HashMap::new(),
             reward_events: Vec::new(),
+            deferred_reward_credits: Vec::new(),
             episode_learning_transitions: Vec::new(),
             episode_config_captures: Vec::new(),
             retrieval_action_prior: HashMap::new(),
