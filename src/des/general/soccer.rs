@@ -5430,6 +5430,10 @@ const SOCCER_POLICY_GAE_LAMBDA: f64 = 0.95;
 const SOCCER_TRAJECTORY_MAX_DECISION_GAP_TICKS: u64 = secs_to_ticks(0.3);
 /// Gradient-norm ceiling for the actor's SGD step (same guard family as the critic).
 const SOCCER_POLICY_GRAD_CLIP_NORM: f64 = 5.0;
+/// Upper bound for prioritized actor samples. Planner-teacher and decisive
+/// soccer events need to survive batch standardization, but one rare row should
+/// not explode the clipped policy-gradient step.
+const SOCCER_POLICY_PRIORITY_WEIGHT_MAX: f64 = 4.0;
 /// Decision-time weight on the actor's log-probability when it biases action
 /// selection (multiplies `ln π(family|s)` added to each candidate's blend score).
 const SOCCER_POLICY_DECISION_WEIGHT: f64 = 0.6;
@@ -18733,6 +18737,14 @@ pub struct MatchStats {
     #[serde(default)]
     pub learned_mpc_replans: u32,
     #[serde(default)]
+    pub policy_priority_samples: u32,
+    #[serde(default)]
+    pub policy_priority_weight_sum: f64,
+    #[serde(default)]
+    pub neural_mcts_distillation_samples: u32,
+    #[serde(default)]
+    pub neural_mcts_distillation_weight_sum: f64,
+    #[serde(default)]
     pub policy_entropy_sum: f64,
     #[serde(default)]
     pub world_model_enabled: bool,
@@ -18752,6 +18764,12 @@ pub struct SoccerPlanningValidationStats {
     pub neural_mcts_selection_rate: f64,
     pub learned_mpc_replans: u32,
     pub learned_mpc_replan_rate: f64,
+    pub policy_priority_samples: u32,
+    pub policy_priority_sample_rate: f64,
+    pub mean_policy_priority_weight: f64,
+    pub neural_mcts_distillation_samples: u32,
+    pub neural_mcts_distillation_rate: f64,
+    pub mean_neural_mcts_distillation_weight: f64,
     pub mean_policy_entropy: f64,
 }
 
@@ -18858,6 +18876,15 @@ impl MatchStats {
             neural_mcts_selection_rate: self.neural_mcts_selections as f64 / decisions as f64,
             learned_mpc_replans: self.learned_mpc_replans,
             learned_mpc_replan_rate: self.learned_mpc_replans as f64 / decisions as f64,
+            policy_priority_samples: self.policy_priority_samples,
+            policy_priority_sample_rate: self.policy_priority_samples as f64 / decisions as f64,
+            mean_policy_priority_weight: self.policy_priority_weight_sum
+                / self.policy_priority_samples.max(1) as f64,
+            neural_mcts_distillation_samples: self.neural_mcts_distillation_samples,
+            neural_mcts_distillation_rate: self.neural_mcts_distillation_samples as f64
+                / decisions as f64,
+            mean_neural_mcts_distillation_weight: self.neural_mcts_distillation_weight_sum
+                / self.neural_mcts_distillation_samples.max(1) as f64,
             mean_policy_entropy: self.policy_entropy_sum / decisions as f64,
         }
     }
@@ -38219,6 +38246,22 @@ struct SoccerPolicySample {
     action_index: usize,
     advantage: f64,
     old_action_probability: Option<f64>,
+    sample_weight: f64,
+}
+
+impl SoccerPolicySample {
+    fn sanitized_weight(&self) -> f64 {
+        if self.sample_weight.is_finite() {
+            self.sample_weight
+                .clamp(1.0, SOCCER_POLICY_PRIORITY_WEIGHT_MAX)
+        } else {
+            1.0
+        }
+    }
+
+    fn weighted_advantage(&self, advantage: f64) -> f64 {
+        advantage * self.sanitized_weight()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38526,10 +38569,11 @@ impl SoccerPolicyRoleHead {
         let mut loss_sum = 0.0;
         let mut applied = 0usize;
         for (sample, advantage) in &prepared {
+            let weighted_advantage = sample.weighted_advantage(*advantage);
             let result = self.network.train_policy_gradient_sample(
                 &sample.state_features[..],
                 sample.action_index,
-                *advantage,
+                weighted_advantage,
                 SOCCER_POLICY_ENTROPY_COEFF,
                 SOCCER_POLICY_LEARNING_RATE,
                 SOCCER_POLICY_GRAD_CLIP_NORM,
@@ -38554,10 +38598,11 @@ impl SoccerPolicyRoleHead {
                 else {
                     continue;
                 };
+                let weighted_advantage = sample.weighted_advantage(*advantage);
                 let result = specialist.network.train_policy_gradient_sample(
                     &sample.state_features[..],
                     local_action_index,
-                    *advantage,
+                    weighted_advantage,
                     SOCCER_POLICY_ENTROPY_COEFF,
                     SOCCER_POLICY_LEARNING_RATE,
                     SOCCER_POLICY_GRAD_CLIP_NORM,
@@ -38852,10 +38897,11 @@ impl SoccerSkillPolicyHead {
         while i < bucket.len() && taken < balanced_n {
             let (sample, local) = bucket[i];
             if sample.advantage.is_finite() && local < self.network.output_dim {
+                let weighted_advantage = sample.weighted_advantage(sample.advantage);
                 let result = self.network.train_policy_gradient_sample(
                     &sample.state_features[..],
                     local,
-                    sample.advantage,
+                    weighted_advantage,
                     SOCCER_POLICY_ENTROPY_COEFF,
                     SOCCER_POLICY_LEARNING_RATE,
                     SOCCER_POLICY_GRAD_CLIP_NORM,

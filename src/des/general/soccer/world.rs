@@ -20,6 +20,9 @@ const LEARNED_MPC_SOFT_REPLAN_MIN_IMPROVEMENT: f64 = 0.22;
 const NEURAL_MCTS_DISTILLATION_MAX_SCORE_REGRESSION: f64 = 0.08;
 const NEURAL_MCTS_DISTILLATION_REJECTED_PROBABILITY: f64 = 0.35;
 const NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR: f64 = 0.04;
+const NEURAL_MCTS_DISTILLATION_PRIORITY_WEIGHT: f64 = 3.0;
+const SOCCER_ACTOR_DECISIVE_EVENT_PRIORITY_WEIGHT: f64 = 2.0;
+const SOCCER_ACTOR_NEGATIVE_OUTCOME_PRIORITY_WEIGHT: f64 = 1.6;
 const LEARNED_MPC_REJECTED_ACTION_PENALTY_POINTS: f64 = 2.5;
 const LEARNED_TARGET_GRID_MIN_VISITS: u32 = 1;
 const GAIT_PHYSICS_STAND_SPEED_YPS: f64 = 0.25;
@@ -3136,6 +3139,68 @@ mod tests {
     }
 
     #[test]
+    fn neural_mcts_distillation_gets_priority_weight() {
+        let transition = policy_test_transition_with_mcts(true);
+        let advantage = soccer_actor_advantage_with_planner_distillation(&transition, 0.01);
+
+        assert_eq!(
+            soccer_actor_priority_weight(&transition, advantage),
+            NEURAL_MCTS_DISTILLATION_PRIORITY_WEIGHT
+        );
+    }
+
+    #[test]
+    fn actor_priority_weight_keeps_bad_outcomes_negative() {
+        let mut transition = policy_test_transition_with_mcts(false);
+        transition.reward = -1.0;
+        let sample = SoccerPolicySample {
+            state_features: [0.0; SOCCER_POLICY_FEATURE_DIM],
+            action_index: 0,
+            advantage: -0.5,
+            old_action_probability: None,
+            sample_weight: soccer_actor_priority_weight(&transition, -0.5),
+        };
+
+        assert_eq!(
+            sample.sample_weight,
+            SOCCER_ACTOR_NEGATIVE_OUTCOME_PRIORITY_WEIGHT
+        );
+        assert!(sample.weighted_advantage(sample.advantage) < sample.advantage);
+    }
+
+    #[test]
+    fn neutral_actor_sample_keeps_unit_priority_weight() {
+        let transition = policy_test_transition_with_mcts(false);
+
+        assert_eq!(soccer_actor_priority_weight(&transition, 0.05), 1.0);
+    }
+
+    #[test]
+    fn priority_actor_standardization_preserves_positive_teacher_signal() {
+        let sample = |advantage: f64, sample_weight: f64| SoccerPolicySample {
+            state_features: [0.0; SOCCER_POLICY_FEATURE_DIM],
+            action_index: 0,
+            advantage,
+            old_action_probability: None,
+            sample_weight,
+        };
+        let mut samples = vec![
+            sample(0.01, NEURAL_MCTS_DISTILLATION_PRIORITY_WEIGHT),
+            sample(5.0, 1.0),
+            sample(6.0, 1.0),
+        ];
+
+        soccer_standardize_actor_policy_sample_advantages(&mut samples);
+
+        assert!(
+            samples[0].advantage >= NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR,
+            "priority teacher sample must not be normalized into a negative update"
+        );
+        assert!(samples[1].advantage.is_finite());
+        assert!(samples[2].advantage.is_finite());
+    }
+
+    #[test]
     fn neural_mcts_distillation_keeps_bad_outcomes_negative() {
         let transition = policy_test_transition_with_mcts(true);
 
@@ -3503,6 +3568,60 @@ fn soccer_actor_advantage_with_planner_distillation(
         return advantage;
     }
     advantage.max(NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR)
+}
+
+fn soccer_actor_mcts_distillation_priority(
+    transition: &SoccerLearningTransition,
+    advantage: f64,
+) -> bool {
+    advantage.is_finite()
+        && transition.decision_context.neural_mcts_selected
+        && !learned_mpc_rejected_action_counterexample(transition)
+        && advantage >= NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR
+        && transition.reward >= 0.0
+}
+
+fn soccer_actor_decisive_event_priority(transition: &SoccerLearningTransition) -> bool {
+    use SoccerActionLabel::*;
+    let label = SoccerActionLabel::classify(&transition.action);
+    let attacking_action = matches!(
+        label,
+        Some(Shoot | FirstTimeShot | FirstTimeHeader | KillerPass | FlankLowCross | FlankHighCross)
+    );
+    attacking_action && transition.reward > 0.0
+}
+
+fn soccer_actor_priority_weight(transition: &SoccerLearningTransition, advantage: f64) -> f64 {
+    let mut weight: f64 = 1.0;
+    if soccer_actor_mcts_distillation_priority(transition, advantage) {
+        weight = weight.max(NEURAL_MCTS_DISTILLATION_PRIORITY_WEIGHT);
+    }
+    if soccer_actor_decisive_event_priority(transition) {
+        weight = weight.max(SOCCER_ACTOR_DECISIVE_EVENT_PRIORITY_WEIGHT);
+    }
+    if transition.reward <= -0.75 || advantage <= -0.75 {
+        weight = weight.max(SOCCER_ACTOR_NEGATIVE_OUTCOME_PRIORITY_WEIGHT);
+    }
+    weight.clamp(1.0, SOCCER_POLICY_PRIORITY_WEIGHT_MAX)
+}
+
+fn soccer_standardize_actor_policy_sample_advantages(samples: &mut [SoccerPolicySample]) {
+    let advantages: Vec<f64> = samples.iter().map(|s| s.advantage).collect();
+    let positive_priority_floors: Vec<bool> = samples
+        .iter()
+        .map(|sample| sample.sanitized_weight() > 1.0 + 1e-9 && sample.advantage > 0.0)
+        .collect();
+    if let Some((mean, std)) = policy_advantage_standardization(&advantages) {
+        for (sample, keep_positive) in samples.iter_mut().zip(positive_priority_floors.into_iter())
+        {
+            sample.advantage = (sample.advantage - mean) / (std + 1e-8);
+            if keep_positive {
+                sample.advantage = sample
+                    .advantage
+                    .max(NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR);
+            }
+        }
+    }
 }
 
 fn soccer_actor_advantage_tick_rewards(
@@ -8010,6 +8129,7 @@ impl SoccerMatch {
                 };
                 let advantage =
                     soccer_actor_advantage_with_planner_distillation(transition, advantage);
+                let sample_weight = soccer_actor_priority_weight(transition, advantage);
                 let state_features = self.policy_state_features(transition);
                 let actor_probability = self
                     .policy_head
@@ -8032,6 +8152,7 @@ impl SoccerMatch {
                     action_index,
                     advantage,
                     old_action_probability,
+                    sample_weight,
                 })
             })
             .collect();
@@ -8043,12 +8164,7 @@ impl SoccerMatch {
         // on (its flat label needs it — see `dd_soccer_standardize_policy_advantages`).
         // Default OFF ⇒ byte-identical; a degenerate (zero-variance) batch is left untouched.
         if dd_soccer_standardize_policy_advantages() {
-            let advantages: Vec<f64> = samples.iter().map(|s| s.advantage).collect();
-            if let Some((mean, std)) = policy_advantage_standardization(&advantages) {
-                for sample in &mut samples {
-                    sample.advantage = (sample.advantage - mean) / (std + 1e-8);
-                }
-            }
+            soccer_standardize_actor_policy_sample_advantages(&mut samples);
         }
         samples
     }
@@ -8383,6 +8499,35 @@ impl SoccerMatch {
             };
         self.train_neural_value_models(&replay);
         if !policy_samples.is_empty() {
+            let priority_samples = policy_samples
+                .iter()
+                .filter(|sample| sample.sanitized_weight() > 1.0 + 1e-9)
+                .count();
+            let priority_weight_sum: f64 = policy_samples
+                .iter()
+                .filter_map(|sample| {
+                    let weight = sample.sanitized_weight();
+                    (weight > 1.0 + 1e-9).then_some(weight)
+                })
+                .sum();
+            let mcts_distillation_samples = policy_samples
+                .iter()
+                .filter(|sample| {
+                    sample.sanitized_weight() >= NEURAL_MCTS_DISTILLATION_PRIORITY_WEIGHT - 1e-9
+                })
+                .count();
+            let mcts_distillation_weight_sum: f64 = policy_samples
+                .iter()
+                .filter_map(|sample| {
+                    let weight = sample.sanitized_weight();
+                    (weight >= NEURAL_MCTS_DISTILLATION_PRIORITY_WEIGHT - 1e-9).then_some(weight)
+                })
+                .sum();
+            self.stats.policy_priority_samples = priority_samples.min(u32::MAX as usize) as u32;
+            self.stats.policy_priority_weight_sum = priority_weight_sum;
+            self.stats.neural_mcts_distillation_samples =
+                mcts_distillation_samples.min(u32::MAX as usize) as u32;
+            self.stats.neural_mcts_distillation_weight_sum = mcts_distillation_weight_sum;
             self.ensure_policy_head();
             let mappo_clip_epsilon = self
                 .config
