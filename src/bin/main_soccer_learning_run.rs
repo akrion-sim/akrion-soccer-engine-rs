@@ -20,6 +20,7 @@ use soccer_engine::des::general::soccer::{
     SoccerMarlAlgorithm, SoccerMatch, SoccerMomentWindow, SoccerNeuralBlendMode,
     SoccerNeuralLayerSnapshot, SoccerNeuralLearningBackend, SoccerNeuralLearningConfig,
     SoccerNeuralNetworkSnapshot, SoccerPassCompletionHead, SoccerPassLearningMetrics,
+    SoccerWorldModel,
     SoccerPassOutcomeSample, SoccerPolicyHeadSnapshot, SoccerPolicyRoleHeadSnapshot,
     SoccerPolicySpecialistHeadSnapshot, SoccerQEntry, SoccerQPolicy, SoccerQPolicyOptions,
     SoccerQTargetEntry, SoccerSelfPlayEpisodeSummary, SoccerSelfPlayLearnedParams,
@@ -4227,6 +4228,11 @@ static CARRIED_SUPPORT_SCORER_HEAD: std::sync::Mutex<Option<SupportScorerHead>> 
 static CARRIED_SHOT_TRIGGER_HEAD: std::sync::Mutex<Option<ShotTriggerHead>> =
     std::sync::Mutex::new(None);
 
+/// In-memory learned world model carried across local games so neural MCTS/lookahead
+/// can plan with accumulated dynamics instead of a fresh per-match model.
+static CARRIED_WORLD_MODEL: std::sync::Mutex<Option<SoccerWorldModel>> =
+    std::sync::Mutex::new(None);
+
 fn run_game(
     episode: usize,
     config: MatchConfig,
@@ -4305,6 +4311,19 @@ fn run_game(
     }
     for window in adversarial_moment_windows.iter() {
         sim.remember_adversarial_moment_window(window.clone());
+    }
+    if sim.config.neural_blend.world_model {
+        if let Some(model) = CARRIED_WORLD_MODEL.lock().unwrap().as_ref() {
+            let training_steps = model.training_steps();
+            sim.set_world_model(model.clone());
+            eprintln!(
+                "world_model_installed episode={} training_steps={} last_loss={:?} validation_loss={:?}",
+                episode + 1,
+                training_steps,
+                model.last_loss(),
+                model.last_validation_loss()
+            );
+        }
     }
     // Gap 5 step 3b: install the carried line-depth head so the back-four line
     // consumes it live once trained. No-op unless a line-depth model is enabled (the
@@ -4805,6 +4824,33 @@ fn run_game(
             head.training_steps(),
             head.training_steps() >= PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS,
             final_loss
+        );
+    }
+    if sim.config.neural_blend.world_model {
+        let world_model_stats = sim.world_model_stats();
+        let planning_stats = sim.planning_validation_stats();
+        if let Some(model) = sim.world_model_snapshot() {
+            let model_steps = model.training_steps();
+            let mut guard = CARRIED_WORLD_MODEL.lock().unwrap();
+            let should_replace = guard
+                .as_ref()
+                .map(|current| current.training_steps() <= model_steps)
+                .unwrap_or(true);
+            if should_replace {
+                *guard = Some(model);
+            }
+        }
+        eprintln!(
+            "world_model_training episode={} enabled={} training_steps={} loss={:?} validation_loss={:?} planning_decisions={} neural_mcts_selection_rate={:.4} mpc_replan_rate={:.4} policy_entropy={:.4}",
+            episode + 1,
+            world_model_stats.enabled,
+            world_model_stats.training_steps,
+            world_model_stats.last_loss,
+            world_model_stats.last_validation_loss,
+            planning_stats.decisions,
+            planning_stats.neural_mcts_selection_rate,
+            planning_stats.learned_mpc_replan_rate,
+            planning_stats.mean_policy_entropy
         );
     }
     let mut artifact = sim.team_policy_artifact();

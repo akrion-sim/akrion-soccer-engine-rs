@@ -7441,6 +7441,7 @@ impl PlayerAgent {
             mdp_mpc_comparison,
             learned_mpc_replan: None,
             behavior_policy_probability: self.pending_policy_behavior_probability,
+            neural_mcts_selected: false,
             action: action_label,
         }
     }

@@ -8139,6 +8139,10 @@ pub struct SoccerDecisionContext {
     /// features), so recording it here changes neither of those.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub behavior_policy_probability: Option<f64>,
+    /// Whether neural MCTS/lookahead selected this action. Kept out of the feature
+    /// schema for now and used as a validation/diagnostic metric.
+    #[serde(default)]
+    pub neural_mcts_selected: bool,
     #[serde(default)]
     pub chosen_action_score: f64,
     #[serde(default)]
@@ -8249,6 +8253,10 @@ pub struct AgentDecisionTrace {
     /// the rank mix becomes the behaviour policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub behavior_policy_probability: Option<f64>,
+    /// True when the learned-policy action came from the neural MCTS/lookahead reranker.
+    /// This is a trace/metric bit only; the neural feature vector stays unchanged.
+    #[serde(default)]
+    pub neural_mcts_selected: bool,
     pub action: String,
 }
 
@@ -18700,6 +18708,44 @@ pub struct MatchStats {
     pub teamwork_near_ball_progress_home: f64,
     #[serde(default)]
     pub teamwork_near_ball_progress_away: f64,
+    #[serde(default)]
+    pub planning_decisions: u32,
+    #[serde(default)]
+    pub neural_mcts_selections: u32,
+    #[serde(default)]
+    pub learned_mpc_replans: u32,
+    #[serde(default)]
+    pub policy_entropy_sum: f64,
+    #[serde(default)]
+    pub world_model_enabled: bool,
+    #[serde(default)]
+    pub world_model_training_steps: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub world_model_loss: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub world_model_validation_loss: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SoccerPlanningValidationStats {
+    pub decisions: u32,
+    pub neural_mcts_selections: u32,
+    pub neural_mcts_selection_rate: f64,
+    pub learned_mpc_replans: u32,
+    pub learned_mpc_replan_rate: f64,
+    pub mean_policy_entropy: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SoccerWorldModelStats {
+    pub enabled: bool,
+    pub training_steps: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_loss: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_validation_loss: Option<f64>,
 }
 
 /// Learning-progress pass metrics for one match, aggregated over BOTH teams (self-play uses
@@ -18783,6 +18829,18 @@ impl MatchStats {
                     self.pass_chains_net_loss_away += 1;
                 }
             }
+        }
+    }
+
+    pub fn planning_validation_stats(&self) -> SoccerPlanningValidationStats {
+        let decisions = self.planning_decisions.max(1);
+        SoccerPlanningValidationStats {
+            decisions: self.planning_decisions,
+            neural_mcts_selections: self.neural_mcts_selections,
+            neural_mcts_selection_rate: self.neural_mcts_selections as f64 / decisions as f64,
+            learned_mpc_replans: self.learned_mpc_replans,
+            learned_mpc_replan_rate: self.learned_mpc_replans as f64 / decisions as f64,
+            mean_policy_entropy: self.policy_entropy_sum / decisions as f64,
         }
     }
 
@@ -23615,6 +23673,7 @@ fn soccer_decision_context_for(
         legal_action_option_count: 0,
         chosen_action_probability: 0.0,
         behavior_policy_probability: None,
+        neural_mcts_selected: false,
         chosen_action_score: 0.0,
         best_legal_action_score: 0.0,
         action_score_margin: 0.0,
@@ -23683,6 +23742,7 @@ fn soccer_decision_context_with_trace(
     // probability instead of recomputing the actor head's own softmax — `None`
     // (the default) leaves on-policy learning exactly as it was.
     context.behavior_policy_probability = decision.behavior_policy_probability;
+    context.neural_mcts_selected = decision.neural_mcts_selected;
     let option_context =
         soccer_action_option_learning_context(&decision.action, &decision.action_options);
     context.action_option_count = option_context.action_option_count;
@@ -39062,10 +39122,12 @@ struct SoccerKeeperPolicySample {
 /// model lets the agent look ahead — score a predicted next state with the critic
 /// (1-step model-based value) or roll out synthetic experience (Dyna). Trained by
 /// clipped MSE on consecutive same-agent transitions. Inline-only, like the actor.
-pub(crate) struct SoccerWorldModel {
+#[derive(Clone, Debug)]
+pub struct SoccerWorldModel {
     network: FeedForwardNetwork,
     training_steps: usize,
     last_loss: Option<f64>,
+    last_validation_loss: Option<f64>,
 }
 
 impl SoccerWorldModel {
@@ -39086,6 +39148,28 @@ impl SoccerWorldModel {
             network,
             training_steps: 0,
             last_loss: None,
+            last_validation_loss: None,
+        }
+    }
+
+    pub fn training_steps(&self) -> usize {
+        self.training_steps
+    }
+
+    pub fn last_loss(&self) -> Option<f64> {
+        self.last_loss
+    }
+
+    pub fn last_validation_loss(&self) -> Option<f64> {
+        self.last_validation_loss
+    }
+
+    pub fn stats(&self) -> SoccerWorldModelStats {
+        SoccerWorldModelStats {
+            enabled: true,
+            training_steps: self.training_steps,
+            last_loss: self.last_loss,
+            last_validation_loss: self.last_validation_loss,
         }
     }
 
@@ -39109,6 +39193,23 @@ impl SoccerWorldModel {
         Some(out)
     }
 
+    fn prediction_loss(
+        &self,
+        input: &[f64; SOCCER_NEURAL_FEATURE_DIM],
+        target: &[f64; SOCCER_NEURAL_FEATURE_DIM],
+    ) -> Option<f64> {
+        let prediction = self.predict_next(input)?;
+        let mut loss = 0.0;
+        for (predicted, expected) in prediction.iter().zip(target.iter()) {
+            if !predicted.is_finite() || !expected.is_finite() {
+                return None;
+            }
+            let error = predicted - expected;
+            loss += error * error;
+        }
+        Some(loss / SOCCER_NEURAL_FEATURE_DIM as f64)
+    }
+
     /// One clipped-MSE pass over `(features_t, next_state_features)` pairs.
     fn train(
         &mut self,
@@ -39117,9 +39218,13 @@ impl SoccerWorldModel {
             [f64; SOCCER_NEURAL_FEATURE_DIM],
         )],
     ) {
+        let holdout_enabled = pairs.len() >= 10;
         let mut loss_sum = 0.0;
         let mut applied = 0usize;
-        for (input, target) in pairs {
+        for (index, (input, target)) in pairs.iter().enumerate() {
+            if holdout_enabled && index % 5 == 0 {
+                continue;
+            }
             let result = self.network.train_sample_clipped(
                 &input[..],
                 &target[..],
@@ -39134,6 +39239,20 @@ impl SoccerWorldModel {
         if applied > 0 {
             self.training_steps = self.training_steps.saturating_add(applied);
             self.last_loss = Some(loss_sum / applied as f64);
+        }
+        let mut validation_loss_sum = 0.0;
+        let mut validation_samples = 0usize;
+        for (index, (input, target)) in pairs.iter().enumerate() {
+            if holdout_enabled && index % 5 != 0 {
+                continue;
+            }
+            if let Some(loss) = self.prediction_loss(input, target) {
+                validation_loss_sum += loss;
+                validation_samples += 1;
+            }
+        }
+        if validation_samples > 0 {
+            self.last_validation_loss = Some(validation_loss_sum / validation_samples as f64);
         }
     }
 }
@@ -45110,6 +45229,8 @@ impl SoccerRealtimeSession {
             "mappoClipEpsilon": sim.config.neural_learning.sanitized_mappo_clip_epsilon(),
             "mappoTeamRewardShare": sim.config.neural_learning.sanitized_mappo_team_reward_share(),
             "worldModelEnabled": sim.world_model.is_some(),
+            "worldModel": val(serde_json::to_value(sim.world_model_stats())),
+            "planning": val(serde_json::to_value(sim.planning_validation_stats())),
         });
 
         serde_json::json!({
@@ -50723,6 +50844,7 @@ pub fn soccer_tracking_dataset_to_learning_dataset(
                 mdp_mpc_comparison: None,
                 learned_mpc_replan: None,
                 behavior_policy_probability: None,
+                neural_mcts_selected: false,
                 action,
             };
             let player_agent = player_agent_from_snapshot(player);
@@ -54678,6 +54800,7 @@ fn soccer_moment_replay_transition(
             mdp_mpc_comparison: None,
             learned_mpc_replan: None,
             behavior_policy_probability: None,
+            neural_mcts_selected: false,
             action: action.clone(),
         },
         &before,

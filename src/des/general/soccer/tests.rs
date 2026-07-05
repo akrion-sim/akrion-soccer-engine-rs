@@ -60,6 +60,7 @@ fn test_decision_trace(
         mdp_mpc_comparison: None,
         learned_mpc_replan: None,
         behavior_policy_probability: None,
+        neural_mcts_selected: false,
         action: action.to_string(),
     }
 }
@@ -58983,6 +58984,7 @@ fn transition_reward_reinforces_completed_pass_into_future_stride() {
             mdp_mpc_comparison: None,
             learned_mpc_replan: None,
             behavior_policy_probability: None,
+            neural_mcts_selected: false,
             action: "pass".to_string(),
         };
         soccer_transition_reward(

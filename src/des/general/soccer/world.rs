@@ -1123,12 +1123,14 @@ impl SoccerNeuralMctsNode {
 struct SoccerPolicyActionChoice {
     label: String,
     behavior_probability: f64,
+    neural_mcts_selected: bool,
 }
 
 #[derive(Clone, Debug)]
 struct SoccerLearnedDecisionPlan {
     plan: SoccerLearnedPlan,
     behavior_probability: f64,
+    neural_mcts_selected: bool,
 }
 
 fn soccer_policy_rank_draw(seed: u32, tick: u64, player_id: usize, salt: u64) -> f64 {
@@ -1298,6 +1300,7 @@ fn soccer_policy_uncertainty_weighted_ranked_action_choice(
                 candidate_count.min(POLICY_SELECTION_TOP_RANK_LIMIT),
                 selected_rank,
             ),
+            neural_mcts_selected: false,
         });
     }
     let mut threshold = draw.clamp(0.0, 1.0 - f64::EPSILON) * total;
@@ -1313,6 +1316,7 @@ fn soccer_policy_uncertainty_weighted_ranked_action_choice(
     legal[selected_rank].map(|action| SoccerPolicyActionChoice {
         label: action.label.clone(),
         behavior_probability: (weights[selected_rank] / total).clamp(0.0, 1.0),
+        neural_mcts_selected: false,
     })
 }
 
@@ -1837,6 +1841,7 @@ mod tests {
             mdp_mpc_comparison: None,
             learned_mpc_replan: None,
             behavior_policy_probability: None,
+            neural_mcts_selected: false,
             action: "pass".to_string(),
         };
 
@@ -2210,6 +2215,7 @@ mod tests {
                 candidate_count: 1,
             }),
             behavior_policy_probability: None,
+            neural_mcts_selected: false,
             action: "hold".to_string(),
         });
         let after = WorldSnapshot::from_match(&sim);
@@ -5006,6 +5012,7 @@ impl SoccerMatch {
                     candidate_count,
                     selected_rank,
                 ),
+                neural_mcts_selected: false,
             })
     }
 
@@ -5026,6 +5033,7 @@ impl SoccerMatch {
                     candidate_count,
                     selected_rank,
                 ),
+                neural_mcts_selected: false,
             })
     }
 
@@ -5037,6 +5045,7 @@ impl SoccerMatch {
             .map(|candidate| SoccerPolicyActionChoice {
                 label: candidate.label.clone(),
                 behavior_probability: 1.0,
+                neural_mcts_selected: false,
             })
     }
 
@@ -5143,6 +5152,7 @@ impl SoccerMatch {
                 .map(|label| SoccerPolicyActionChoice {
                     label,
                     behavior_probability: 1.0,
+                    neural_mcts_selected: false,
                 })
         })
     }
@@ -5209,6 +5219,7 @@ impl SoccerMatch {
                         choice.label,
                     ),
                     behavior_probability: choice.behavior_probability,
+                    neural_mcts_selected: choice.neural_mcts_selected,
                 });
             }
         }
@@ -5252,6 +5263,7 @@ impl SoccerMatch {
                 choice.label,
             ),
             behavior_probability: choice.behavior_probability,
+            neural_mcts_selected: choice.neural_mcts_selected,
         })
     }
 
@@ -5263,6 +5275,16 @@ impl SoccerMatch {
             return;
         };
         stamp_learned_policy_behavior_probability_on_decision(decision, behavior_probability);
+    }
+
+    fn stamp_neural_mcts_selection(player: &mut PlayerAgent, selected: bool) {
+        if !selected {
+            return;
+        }
+        let Some(decision) = player.last_decision.as_mut() else {
+            return;
+        };
+        decision.neural_mcts_selected = true;
     }
 
     /// Build a feature-only decision-time transition: the player's real
@@ -5422,6 +5444,7 @@ impl SoccerMatch {
                     candidate_count,
                     selected_rank,
                 ),
+                neural_mcts_selected: true,
             })
     }
 
@@ -7229,6 +7252,25 @@ impl SoccerMatch {
         samples
     }
 
+    pub fn set_world_model(&mut self, model: SoccerWorldModel) {
+        self.world_model = Some(model);
+    }
+
+    pub fn world_model_snapshot(&self) -> Option<SoccerWorldModel> {
+        self.world_model.clone()
+    }
+
+    pub fn world_model_stats(&self) -> SoccerWorldModelStats {
+        self.world_model
+            .as_ref()
+            .map(SoccerWorldModel::stats)
+            .unwrap_or_default()
+    }
+
+    pub fn planning_validation_stats(&self) -> SoccerPlanningValidationStats {
+        self.stats.planning_validation_stats()
+    }
+
     fn ensure_world_model(&mut self) {
         if self.world_model.is_none() {
             self.world_model = Some(SoccerWorldModel::new(self.config.seed));
@@ -8753,6 +8795,10 @@ impl SoccerMatch {
                         Self::stamp_learned_policy_behavior_probability(
                             &mut self.players[actor],
                             learned_decision.behavior_probability,
+                        );
+                        Self::stamp_neural_mcts_selection(
+                            &mut self.players[actor],
+                            learned_decision.neural_mcts_selected,
                         );
                     }
                     let intent = self.players[actor]
@@ -20927,6 +20973,19 @@ impl SoccerMatch {
     ) {
         self.record_progressive_carry_continuation_rewards(transitions);
         for transition in transitions {
+            if !learned_mpc_rejected_action_counterexample(transition) {
+                self.stats.planning_decisions = self.stats.planning_decisions.saturating_add(1);
+                if transition.decision_context.neural_mcts_selected {
+                    self.stats.neural_mcts_selections =
+                        self.stats.neural_mcts_selections.saturating_add(1);
+                }
+                if transition.decision_context.learned_mpc_replanned {
+                    self.stats.learned_mpc_replans =
+                        self.stats.learned_mpc_replans.saturating_add(1);
+                }
+                self.stats.policy_entropy_sum +=
+                    finite_unit_interval(transition.decision_context.action_option_entropy);
+            }
             self.recent_learning_history.push_back(transition.clone());
         }
         while self.recent_learning_history.len() > DEFENSIVE_GOAL_HISTORY_ACTIONS * 4 {
