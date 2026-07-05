@@ -14111,59 +14111,21 @@ fn soccer_dp_bootstrapped_replay_transitions(
     }
 
     // Sample-based value iteration over pooled (bucket, reward, next_bucket) tuples from both teams.
-    // Jacobi sweeps: V(b) <- mean over samples from b of [r + γ·V(b')]. Terminal step bootstraps 0
-    // (the flat outcome label is added separately below, exactly as in the MC path).
     let mut samples: Vec<(u32, f64, Option<u32>)> = Vec::new();
     for s in &seq {
         for i in 0..s.len() {
             samples.push((s[i].2, s[i].1, s.get(i + 1).map(|n| n.2)));
         }
     }
-    let mut value: BTreeMap<u32, f64> = BTreeMap::new();
-    for _ in 0..sweeps {
-        let mut acc: BTreeMap<u32, (f64, usize)> = BTreeMap::new();
-        for (b, r, nb) in &samples {
-            let boot = match nb {
-                Some(nb) => gamma * *value.get(nb).unwrap_or(&0.0),
-                None => 0.0,
-            };
-            let e = acc.entry(*b).or_insert((0.0, 0));
-            e.0 += *r + boot;
-            e.1 += 1;
-        }
-        for (b, (sum, count)) in acc {
-            if count > 0 {
-                value.insert(
-                    b,
-                    (sum / count as f64)
-                        .clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP),
-                );
-            }
-        }
-    }
+    let value = soccer_dp_value_iteration(&samples, gamma, sweeps);
 
-    // n-step bootstrapped correlated return per (team, tick): Σ_{k<h} γ^k r_{i+k} + γ^h V(b_{i+h}).
+    // n-step bootstrapped correlated return per (team, tick).
     let mut correlated: BTreeMap<(usize, u64), f64> = BTreeMap::new();
     for (ti, s) in seq.iter().enumerate() {
         for i in 0..s.len() {
-            let mut ret = 0.0;
-            let mut disc = 1.0;
-            for k in 0..horizon {
-                let j = i + k;
-                if j >= s.len() {
-                    break;
-                }
-                ret += disc * s[j].1;
-                disc *= gamma;
-                if k + 1 == horizon {
-                    if let Some(nb) = s.get(j + 1).map(|n| n.2) {
-                        ret += disc * *value.get(&nb).unwrap_or(&0.0);
-                    }
-                }
-            }
             correlated.insert(
                 (ti, s[i].0),
-                ret.clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP),
+                soccer_dp_nstep_return(s, i, horizon, gamma, &value),
             );
         }
     }
