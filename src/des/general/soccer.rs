@@ -2046,8 +2046,12 @@ const SHOT_ON_TARGET_REWARD_PATTERN: [f64; 10] =
     [12.0, 9.0, 6.0, 4.0, 3.0, 2.0, 1.5, 1.0, 0.8, 0.7];
 const PASS_CHAIN_HISTORY_LIMIT: usize = 8;
 const PASS_CHAIN_MAX_CONTINUATION_SECONDS: f64 = 12.0;
-const PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS: f64 = 7.5;
-const PASS_CHAIN_THREE_NET_FORWARD_EVENT_REWARD_POINTS: f64 = 10.0;
+// FAST-SIGNAL rebalance (Jul 2026): 2 & 3 consecutive positive-y forward passes are the strongest,
+// fastest, most-attributable "good soccer" signal we have — they were being drowned ~30:1 by the
+// slow ±200 win/loss broadcast. Boosted to dominate the value target so learning gets an immediate,
+// clean gradient (was 7.5 / 10.0).
+const PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS: f64 = 30.0;
+const PASS_CHAIN_THREE_NET_FORWARD_EVENT_REWARD_POINTS: f64 = 40.0;
 /// Penalty (points, applied negative) for an isolated attacking carrier panicking a
 /// backward/square ball instead of driving at goal or holding it up — see
 /// [`SoccerRewardEventKind::IsolatedCarrierPanicBackPass`]. Comparable in magnitude to one
