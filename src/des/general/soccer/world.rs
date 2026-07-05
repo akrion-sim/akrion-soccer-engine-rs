@@ -20991,12 +20991,18 @@ impl SoccerMatch {
                 (TURNOVER_WINDOW_PENALTY_POINTS + stale_dribble_penalty) * recency * severity;
             penalized_transition.reward = (penalized_transition.reward - penalty).min(-penalty);
             penalized.push(penalized_transition);
+            deferred_turnover_credits.push((transition.tick, transition.player_id, -penalty));
             if penalized.len() >= TURNOVER_PENALTY_MAX_TRANSITIONS {
                 break;
             }
         }
         if penalized.is_empty() {
             return false;
+        }
+        // Back-date the turnover penalty onto the actual decision transitions so it reaches the
+        // full-game replay (gated; off ⇒ unchanged, penalties only go to deferred_reward_transitions).
+        if soccer_env_flag_enabled("DD_SOCCER_ENABLE_DEFERRED_PASS_CREDIT") {
+            self.deferred_reward_credits.extend(deferred_turnover_credits);
         }
         self.arm_turnover_outcome_watch(
             losing_team,
