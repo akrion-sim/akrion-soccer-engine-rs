@@ -21084,6 +21084,36 @@ pub(crate) fn dd_soccer_self_bootstrap_weight() -> f64 {
     })
 }
 
+/// The **max_a** upgrade of the self-bootstrap (the real policy-IMPROVEMENT lever). When the
+/// self-bootstrap is on, OFF (default) uses the observed-successor / state value `V(s')` — that is
+/// SARSA / policy *evaluation*, which accurately values the *current* (analytic-ish) policy and
+/// therefore lands at parity. ON evaluates `max_a V_net(s', a)` over a curated set of core action
+/// families — Q-learning / policy *improvement*: the target assumes the successor takes the BEST
+/// action, so the value can rate a policy *better* than the behavior policy and thus EXCEED analytic.
+/// Kept to a small in-distribution family set to avoid out-of-distribution/deadly-triad blowup.
+pub(crate) fn dd_soccer_enable_maxa_bootstrap() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_MAXA_BOOTSTRAP"))
+}
+
+/// Curated core action families for the `max_a` self-bootstrap. Deliberately the primary,
+/// high-frequency, almost-always-legal decisions the net has seen densely in training, so
+/// `V_net(s', family)` stays in-distribution (a full 73-family max would include rarely-seen /
+/// illegal families whose OOD value could spike the target and diverge).
+pub(crate) const SOCCER_MAXA_BOOTSTRAP_FAMILIES: &[&str] = &[
+    "hold",
+    "dribble",
+    "carry-forward",
+    "pass",
+    "aerial-pass",
+    "killer-pass",
+    "switch-play",
+    "clearance",
+    "shoot",
+    "vertical-attack",
+];
+
 /// Gate for interception-aware route-one / clearance training credit. OFF (the default) leaves the
 /// `soccer_goal_credit_transition_score` long-ball branch byte-identical to baseline, where a hoofed
 /// forward ball is credited purely on distance/pressure/urgency with NO interception or completion
