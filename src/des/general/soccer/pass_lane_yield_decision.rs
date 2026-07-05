@@ -29,10 +29,7 @@ const PASS_LANE_YIELD_MODEL_DISABLE_ENV: &str = "DD_SOCCER_DISABLE_PASS_LANE_YIE
 
 fn env_flag(name: &str) -> Option<bool> {
     std::env::var(name).ok().map(|raw| {
-        matches!(
-            raw.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
+        matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
     })
 }
 
@@ -150,11 +147,7 @@ impl PassLaneYieldHead {
             },
             &mut rng,
         );
-        PassLaneYieldHead {
-            network,
-            training_steps: 0,
-            last_loss: None,
-        }
+        PassLaneYieldHead { network, training_steps: 0, last_loss: None }
     }
 
     pub fn predict(&self, inputs: &PassLaneYieldInputs) -> Option<f64> {
@@ -162,18 +155,10 @@ impl PassLaneYieldHead {
         if features.iter().any(|v| !v.is_finite()) {
             return None;
         }
-        self.network
-            .predict(&features[..])
-            .first()
-            .copied()
-            .filter(|p| p.is_finite())
+        self.network.predict(&features[..]).first().copied().filter(|p| p.is_finite())
     }
 
-    pub fn train_reward_weighted(
-        &mut self,
-        samples: &[PassLaneYieldSample],
-        learning_rate: f64,
-    ) -> f64 {
+    pub fn train_reward_weighted(&mut self, samples: &[PassLaneYieldSample], learning_rate: f64) -> f64 {
         let finite: Vec<&PassLaneYieldSample> = samples
             .iter()
             .filter(|s| s.reward.is_finite() && s.action_bias.is_finite())
@@ -183,11 +168,7 @@ impl PassLaneYieldHead {
         }
         let n = finite.len() as f64;
         let baseline = finite.iter().map(|s| s.reward).sum::<f64>() / n;
-        let std = (finite
-            .iter()
-            .map(|s| (s.reward - baseline).powi(2))
-            .sum::<f64>()
-            / n)
+        let std = (finite.iter().map(|s| (s.reward - baseline).powi(2)).sum::<f64>() / n)
             .sqrt()
             .max(1e-3);
         let mut total = 0.0;
@@ -200,23 +181,15 @@ impl PassLaneYieldHead {
             let advantage = (s.reward - baseline) / std;
             let weight = advantage.clamp(-4.0, 2.0).exp().min(7.5);
             let target = [s.action_bias.clamp(-1.0, 1.0)];
-            let result = self.network.train_sample_clipped(
-                &features[..],
-                &target,
-                learning_rate * weight,
-                4.0,
-            );
+            let result =
+                self.network.train_sample_clipped(&features[..], &target, learning_rate * weight, 4.0);
             if result.applied && result.loss.is_finite() {
                 total += result.loss;
                 applied += 1;
                 self.training_steps += 1;
             }
         }
-        let mean = if applied > 0 {
-            total / applied as f64
-        } else {
-            0.0
-        };
+        let mean = if applied > 0 { total / applied as f64 } else { 0.0 };
         self.last_loss = Some(mean);
         mean
     }
@@ -334,12 +307,13 @@ impl SoccerMatch {
             if self.pending_pass_lane_yield[i].due_tick <= tick {
                 let decision = self.pending_pass_lane_yield.swap_remove(i);
                 let now_territorial = territorial_advantage(snapshot, decision.team);
-                let territorial_delta =
-                    if now_territorial.is_finite() && decision.decision_territorial.is_finite() {
-                        now_territorial - decision.decision_territorial
-                    } else {
-                        0.0
-                    };
+                let territorial_delta = if now_territorial.is_finite()
+                    && decision.decision_territorial.is_finite()
+                {
+                    now_territorial - decision.decision_territorial
+                } else {
+                    0.0
+                };
                 let reward = decision.reward_accum
                     + PASS_LANE_YIELD_TERRITORIAL_SHAPING_WEIGHT * territorial_delta;
                 if reward.is_finite() {
@@ -379,16 +353,15 @@ impl SoccerMatch {
             };
             let territorial = territorial_advantage(snapshot, player.team);
             if territorial.is_finite() {
-                self.pending_pass_lane_yield
-                    .push(PendingPassLaneYieldDecision {
-                        team: player.team,
-                        player_id: id,
-                        inputs,
-                        action_bias,
-                        decision_territorial: territorial,
-                        reward_accum: 0.0,
-                        due_tick: tick + PASS_LANE_YIELD_REWARD_WINDOW_TICKS,
-                    });
+                self.pending_pass_lane_yield.push(PendingPassLaneYieldDecision {
+                    team: player.team,
+                    player_id: id,
+                    inputs,
+                    action_bias,
+                    decision_territorial: territorial,
+                    reward_accum: 0.0,
+                    due_tick: tick + PASS_LANE_YIELD_REWARD_WINDOW_TICKS,
+                });
             }
         }
     }
@@ -454,36 +427,16 @@ mod pass_lane_yield_model_tests {
         let mut yes = PassLaneYieldHead::new(4);
         let mut no = PassLaneYieldHead::new(4);
         let yes_s: Vec<PassLaneYieldSample> = (0..32)
-            .flat_map(|_| {
-                [
-                    PassLaneYieldSample {
-                        inputs: inputs.clone(),
-                        action_bias: 0.8,
-                        reward: 1.0,
-                    },
-                    PassLaneYieldSample {
-                        inputs: inputs.clone(),
-                        action_bias: -0.8,
-                        reward: -1.0,
-                    },
-                ]
-            })
+            .flat_map(|_| [
+                PassLaneYieldSample { inputs: inputs.clone(), action_bias: 0.8, reward: 1.0 },
+                PassLaneYieldSample { inputs: inputs.clone(), action_bias: -0.8, reward: -1.0 },
+            ])
             .collect();
         let no_s: Vec<PassLaneYieldSample> = (0..32)
-            .flat_map(|_| {
-                [
-                    PassLaneYieldSample {
-                        inputs: inputs.clone(),
-                        action_bias: -0.8,
-                        reward: 1.0,
-                    },
-                    PassLaneYieldSample {
-                        inputs: inputs.clone(),
-                        action_bias: 0.8,
-                        reward: -1.0,
-                    },
-                ]
-            })
+            .flat_map(|_| [
+                PassLaneYieldSample { inputs: inputs.clone(), action_bias: -0.8, reward: 1.0 },
+                PassLaneYieldSample { inputs: inputs.clone(), action_bias: 0.8, reward: -1.0 },
+            ])
             .collect();
         for _ in 0..80 {
             yes.train_reward_weighted(&yes_s, 0.05);

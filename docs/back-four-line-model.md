@@ -21,9 +21,8 @@ logic is left untouched.
 ## The function
 
 ```
-line_centre_fwd  =  f( ball, opponents, self, individual_line_health,
-                       opp_centre_of_mass, possession, own_gk,
-                       offside_trap_state, full_field_kinematics )
+line_centre_fwd  =  f( ball, opponents, self, opp_centre_of_mass,
+                       possession, own_gk, offside_trap_state )
 ```
 
 All quantities are expressed in the **defending team's attacking frame** (`fwd =
@@ -32,22 +31,20 @@ mirror-invariant: flip the pitch and swap the team and the features — and the
 output — are identical. This is the same orientation convention `pitch_value.rs`
 uses, and it halves the state space the net must cover.
 
-### Inputs
+### Inputs (the 7 groups requested)
 
 | # | Group | Features (normalized, forward frame) |
 |---|-------|--------------------------------------|
 | 1 | **Ball** position / velocity / acceleration | gap of ball ahead of our own goal (÷L); ball lateral (÷½W); ball vel fwd & lat (÷v_max); ball accel fwd & lat (÷a_max) |
 | 2 | **Opponent vector** position / velocity / acceleration | foremost (deepest) attacker's gap toward our goal; opponent **centroid** fwd & lat; opponent **mean** velocity fwd & lat; opponent mean acceleration fwd & lat |
-| 3 | **Self** — the back four's own kinematics | line-centre gap ahead of own goal; line-centre lateral; line-centre velocity fwd & lat; line-centre acceleration fwd & lat; fore-aft line spread; lateral width; worst individual line error; that defender's closing velocity toward the line |
+| 3 | **Self** — the back four's own kinematics | line-centre gap ahead of own goal; line-centre lateral; line-centre velocity fwd & lat; line-centre acceleration fwd & lat |
 | 4 | **Opponent centre of mass** | folded into group 2 (`opp_centroid_*`) — the centroid *is* the centre of mass of the outfield opponents |
 | 5 | **Possession** | `we_control`, `they_control` (both 0 ⇒ contested / loose) |
 | 6 | **Own goalkeeper** | GK gap ahead of own goal; GK lateral |
 | 7 | **Offside trap state — now and the next ~3 s** | `offside_in_force` (restart suspensions lifted); `trap_active_or_imminent` (offside live **and** ball in a mid/high block so a flat trap is meaningful). The *next-3 s* horizon is supplied implicitly through the ball/opponent **velocity and acceleration** features and through using the **predicted** ball position — the net is meant to learn the lead from them rather than us hard-coding a 3 s extrapolation. |
 | 8 | **Existing determinants (retained)** | `heuristic_centre_fwd_from_own_goal` — where the engine's *current* heuristic already puts the line centre (it folds in the directive line target, the ball blend, the role bias, the press focus, and the legal band). The model learns **relative to** this, so the well-tuned existing line is never thrown away — only refined. |
-| 9 | **Full field kinematic vector** | own 11, opponent 11, then ball; each slot carries forward position, lateral position, forward velocity, lateral velocity, forward acceleration, and lateral acceleration in the same defending frame. This gives the MDP/POMDP line decision the 22-player-plus-ball vector rather than only the aggregate centroids. |
 
-`BACK_FOUR_LINE_FEATURE_DIM = 169` (`27` aggregate/retained features + `4`
-line-health features + `23 × 6` full-field kinematic features). The exact ordering is the single source of
+`BACK_FOUR_LINE_FEATURE_DIM = 26`. The exact ordering is the single source of
 truth in `back_four_line.rs::BackFourLineInputs::to_features`.
 
 ### Retaining existing determinants (group 8)
@@ -133,12 +130,11 @@ line when we press, trap, or control). That seed is the **fallback and the
 bootstrap target**. The path to "solve it optimally":
 
 1. **Head.** `BackFourLineHead` is a `FeedForwardNetwork` regression head
-   (169 → hidden → 1, sigmoid), mirroring `SoccerPassCompletionHead` /
+   (25 → hidden → 1, sigmoid), mirroring `SoccerPassCompletionHead` /
    `SoccerPolicyHead`: live net is not serde, it round-trips through the existing
-   `SoccerNeuralNetworkSnapshot` auxiliary-head path. Construction + `predict` +
-   `train`, snapshot round-trip, learner carry, and gated runtime consumption are
-   in place; `back_four_line_model_centre_fwd` reads the head once the gate is on
-   and `LINE_DEPTH_HEAD_MIN_TRAINING_STEPS` is satisfied.
+   `SoccerNeuralNetworkSnapshot` Postgres path. Construction + `predict` + `train`
+   are in place; it is wired but not yet consumed live (same staging as the
+   pass-completion head).
 2. **Features.** `BackFourLineInputs::to_features` is the captured state vector.
    Logged per tick, it is the training corpus's `x`.
 3. **Label / reward.** Two viable signals, both already available in-engine:
@@ -148,13 +144,11 @@ bootstrap target**. The path to "solve it optimally":
      (`pitch_value.rs`) plus the conceded-shot / offside-trap-sprung outcomes, so
      the net learns the depth that maximises net territorial threat while
      minimising balls played in behind. The gap fraction is the action; the
-     reward is the change in net dangerous-space control over the next window,
-     with an extra MARL/MAPPO penalty when the four remain ragged or an individual
-     defender is still far off the line.
+     reward is the change in net dangerous-space control over the next window.
 4. **Promotion.** Once `predict` beats the analytic seed on held-out matches,
-   raise the carried/persisted head into live use by enabling the gate and blend.
-   The analytic fraction stays as the fallback; the seam does not change, only
-   the source and weight of the fraction does.
+   flip `back_four_line_model_centre_fwd` to read the head instead of the
+   analytic fraction. The seam does not change; only the source of the fraction
+   does.
 
 ## Parity & safety summary
 
@@ -180,7 +174,7 @@ output mapping differ.
 
 ## What's the same
 
-- The **same 169-d feature vector**, in the same attacking frame — now describing
+- The **same 26-d feature vector**, in the same attacking frame — now describing
   the *midfield* line's own kinematics in the `line_*` slots (the builder is called
   with `PlayerRole::Midfielder`).
 - The **same analytic-seed → head** path; `analytic_midfield_gap_fraction` is the
@@ -219,3 +213,4 @@ to the legacy band.
 Same as the back four — the pitch-value × xT territorial reward, conditioned on the
 midfield's own depth. The shared head can carry a line-id input later if a single
 net is preferred over one head per line; today each line trains its own head.
+

@@ -311,11 +311,13 @@ fn main() {
         round += 1;
         let started = Instant::now();
 
-        // Build this round's opponent league: frozen champions + fresh (exploration).
+        // Build this round's opponent league: frozen champions (the archive = the frontier's own
+        // improving PAST SELVES) + fresh (exploration).
         let mut opponents: Vec<TeamBrain> = load_league(&archive_dir)
             .into_iter()
             .map(TeamBrain::from_snapshot)
             .collect();
+        let champion_count = opponents.len();
         for i in 0..fresh_opponents {
             opponents.push(TeamBrain::fresh_with_seed(
                 0xF0_0000u32.wrapping_add(round.wrapping_mul(2_654_435_761)).wrapping_add(i as u32),
@@ -326,15 +328,24 @@ fn main() {
             opponents.push(TeamBrain::fresh_with_seed(0xABCD, 100));
         }
 
-        // SOCCER_LEAGUE_ANALYTIC_OPPONENTS=1: strip the net from every opponent so they play the
-        // PURE ANALYTIC engine (no net -> authoritative branch skipped -> hand-built engine
-        // decides). The frontier (authoritative neural) must then learn to BEAT the analytic
-        // engine to win — that IS the gradient to break past parity. (Genome variation still
-        // gives the analytic opponents slightly different styles.)
-        if std::env::var("SOCCER_LEAGUE_ANALYTIC_OPPONENTS")
+        let self_play = std::env::var("SOCCER_LEAGUE_SELF_PLAY")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-        {
+            .unwrap_or(false);
+        let analytic_opponents = std::env::var("SOCCER_LEAGUE_ANALYTIC_OPPONENTS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if self_play {
+            // SELF-PLAY LEAGUE: the archived champion checkpoints KEEP their nets — they are the
+            // frontier's own improving past selves (the MOVING TARGET). The fresh opponents are
+            // stripped to the PURE ANALYTIC engine as a fixed anchor so the frontier can't quietly
+            // regress. Beating an ever-improving league of past selves is the AlphaZero/AlphaStar
+            // escape a single fixed opponent structurally can't provide. (Requires a seeded archive
+            // so champion_count>0; otherwise it degenerates to all-analytic.)
+            for opp in opponents.iter_mut().skip(champion_count) {
+                opp.neural = None;
+            }
+        } else if analytic_opponents {
+            // Strip every opponent's net so they all play the PURE ANALYTIC engine (fixed target).
             for opp in opponents.iter_mut() {
                 opp.neural = None;
             }

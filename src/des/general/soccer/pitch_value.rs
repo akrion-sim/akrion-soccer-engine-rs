@@ -206,12 +206,7 @@ fn arrival_time_core(pos: Vec2, vel: Vec2, vmax: f64, cell: Vec2) -> f64 {
 
 /// Velocity-aware time (seconds) for `player` to arrive at `cell`.
 fn arrival_time_seconds(player: &PlayerSnapshot, cell: Vec2) -> f64 {
-    arrival_time_core(
-        player.position,
-        player.velocity,
-        player_top_speed(player),
-        cell,
-    )
+    arrival_time_core(player.position, player.velocity, player_top_speed(player), cell)
 }
 
 /// Minimum arrival time over a team's players, or `None` if the team has nobody.
@@ -372,11 +367,9 @@ pub fn xt_terminal_shaped_target(
     let h = XT_TERMINAL_PROBE_YARDS;
     let v = |p: Vec2| control_weighted_threat(points, team, p, field_width, field_length);
     // Central finite-difference gradient of the value surface at `reference`.
-    let gx = (v(Vec2::new(reference.x + h, reference.y))
-        - v(Vec2::new(reference.x - h, reference.y)))
+    let gx = (v(Vec2::new(reference.x + h, reference.y)) - v(Vec2::new(reference.x - h, reference.y)))
         / (2.0 * h);
-    let gy = (v(Vec2::new(reference.x, reference.y + h))
-        - v(Vec2::new(reference.x, reference.y - h)))
+    let gy = (v(Vec2::new(reference.x, reference.y + h)) - v(Vec2::new(reference.x, reference.y - h)))
         / (2.0 * h);
     if !gx.is_finite() || !gy.is_finite() {
         return reference;

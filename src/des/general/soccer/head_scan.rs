@@ -177,17 +177,14 @@ mod tests {
     fn coverage_grows_with_scan_time_and_reaches_behind_in_about_one_to_two_seconds() {
         let cone = FRAC_PI_2; // ball-holder 90° half-arc
         let behind = PI; // directly behind
-                         // Average vision: ~1.65 s to sweep the π/2 from cone edge to directly behind.
+        // Average vision: ~1.65 s to sweep the π/2 from cone edge to directly behind.
         let half_second = scan_coverage(behind, cone, 0.5, 0.5);
         let two_second = scan_coverage(behind, cone, 2.0, 0.5);
         assert!(
             two_second > half_second,
             "more scan time ⇒ more rear coverage: {two_second} vs {half_second}"
         );
-        assert!(
-            half_second < HEAD_SCAN_VISIBLE_COVERAGE,
-            "behind not yet seen at 0.5s: {half_second}"
-        );
+        assert!(half_second < HEAD_SCAN_VISIBLE_COVERAGE, "behind not yet seen at 0.5s: {half_second}");
         assert!(
             two_second >= HEAD_SCAN_VISIBLE_COVERAGE,
             "behind seen by 2s: {two_second}"
@@ -210,10 +207,7 @@ mod tests {
         let bearing = cone + 1.0;
         let avg = scan_coverage(bearing, cone, 0.8, 0.0);
         let elite = scan_coverage(bearing, cone, 0.8, 1.0);
-        assert!(
-            elite > avg,
-            "elite scans wider in the same time: {elite} vs {avg}"
-        );
+        assert!(elite > avg, "elite scans wider in the same time: {elite} vs {avg}");
     }
 
     #[test]
@@ -222,10 +216,7 @@ mod tests {
         assert_eq!(scanned_confidence(0.0, base), base);
         assert!((scanned_confidence(1.0, base) - HEAD_SCAN_MAX_SCANNED_CONFIDENCE).abs() < 1e-9);
         let mid = scanned_confidence(0.5, base);
-        assert!(
-            mid > base && mid < HEAD_SCAN_MAX_SCANNED_CONFIDENCE,
-            "mid lift: {mid}"
-        );
+        assert!(mid > base && mid < HEAD_SCAN_MAX_SCANNED_CONFIDENCE, "mid lift: {mid}");
         // Stays below a clean shoulder-check (0.70) even fully scanned.
         assert!(scanned_confidence(1.0, base) < 0.70);
         // Never lowers a base that already exceeds the ceiling.

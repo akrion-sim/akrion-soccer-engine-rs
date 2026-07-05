@@ -29,10 +29,7 @@ const ONSIDE_SUPPORT_MODEL_DISABLE_ENV: &str = "DD_SOCCER_DISABLE_ONSIDE_SUPPORT
 
 fn env_flag(name: &str) -> Option<bool> {
     std::env::var(name).ok().map(|raw| {
-        matches!(
-            raw.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
+        matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
     })
 }
 
@@ -147,11 +144,7 @@ impl OnsideSupportHead {
             },
             &mut rng,
         );
-        OnsideSupportHead {
-            network,
-            training_steps: 0,
-            last_loss: None,
-        }
+        OnsideSupportHead { network, training_steps: 0, last_loss: None }
     }
 
     pub fn predict(&self, inputs: &OnsideSupportInputs) -> Option<f64> {
@@ -159,18 +152,10 @@ impl OnsideSupportHead {
         if features.iter().any(|v| !v.is_finite()) {
             return None;
         }
-        self.network
-            .predict(&features[..])
-            .first()
-            .copied()
-            .filter(|p| p.is_finite())
+        self.network.predict(&features[..]).first().copied().filter(|p| p.is_finite())
     }
 
-    pub fn train_reward_weighted(
-        &mut self,
-        samples: &[OnsideSupportSample],
-        learning_rate: f64,
-    ) -> f64 {
+    pub fn train_reward_weighted(&mut self, samples: &[OnsideSupportSample], learning_rate: f64) -> f64 {
         let finite: Vec<&OnsideSupportSample> = samples
             .iter()
             .filter(|s| s.reward.is_finite() && s.action_bias.is_finite())
@@ -180,11 +165,7 @@ impl OnsideSupportHead {
         }
         let n = finite.len() as f64;
         let baseline = finite.iter().map(|s| s.reward).sum::<f64>() / n;
-        let std = (finite
-            .iter()
-            .map(|s| (s.reward - baseline).powi(2))
-            .sum::<f64>()
-            / n)
+        let std = (finite.iter().map(|s| (s.reward - baseline).powi(2)).sum::<f64>() / n)
             .sqrt()
             .max(1e-3);
         let mut total = 0.0;
@@ -197,23 +178,15 @@ impl OnsideSupportHead {
             let advantage = (s.reward - baseline) / std;
             let weight = advantage.clamp(-4.0, 2.0).exp().min(7.5);
             let target = [s.action_bias.clamp(-1.0, 1.0)];
-            let result = self.network.train_sample_clipped(
-                &features[..],
-                &target,
-                learning_rate * weight,
-                4.0,
-            );
+            let result =
+                self.network.train_sample_clipped(&features[..], &target, learning_rate * weight, 4.0);
             if result.applied && result.loss.is_finite() {
                 total += result.loss;
                 applied += 1;
                 self.training_steps += 1;
             }
         }
-        let mean = if applied > 0 {
-            total / applied as f64
-        } else {
-            0.0
-        };
+        let mean = if applied > 0 { total / applied as f64 } else { 0.0 };
         self.last_loss = Some(mean);
         mean
     }
@@ -273,10 +246,7 @@ pub fn report_onside_support_training(
 
 impl WorldSnapshot {
     /// Build the [`OnsideSupportInputs`] for an idle attacking supporter `player`. Pure / RNG-free.
-    pub(crate) fn build_onside_support_inputs(
-        &self,
-        player: &PlayerSnapshot,
-    ) -> Option<OnsideSupportInputs> {
+    pub(crate) fn build_onside_support_inputs(&self, player: &PlayerSnapshot) -> Option<OnsideSupportInputs> {
         if !matches!(player.role, PlayerRole::Forward | PlayerRole::Midfielder) {
             return None;
         }
@@ -292,12 +262,8 @@ impl WorldSnapshot {
             .unwrap_or(0.0)
             / 6.0)
             .clamp(0.0, 1.0);
-        let behind = Vec2 {
-            x: pos.x,
-            y: line_y + attack_dir * 6.0,
-        };
-        let space_behind =
-            (self.nearest_opponent_distance_at(player.team, behind) / 12.0).clamp(0.0, 1.0);
+        let behind = Vec2 { x: pos.x, y: line_y + attack_dir * 6.0 };
+        let space_behind = (self.nearest_opponent_distance_at(player.team, behind) / 12.0).clamp(0.0, 1.0);
         let goal_y = player.team.goal_y(self.field_length);
         let cross_imminent = if crash_box::flank_final_third_crash_box_geometry(
             self.ball.position,
@@ -363,10 +329,7 @@ impl WorldSnapshot {
         let Some(bias) = self.onside_support_push_bias(&inputs) else {
             return 0.0;
         };
-        (bias * ONSIDE_SUPPORT_MAX_PUSH_YARDS).clamp(
-            -ONSIDE_SUPPORT_MAX_PUSH_YARDS,
-            ONSIDE_SUPPORT_MAX_PUSH_YARDS,
-        )
+        (bias * ONSIDE_SUPPORT_MAX_PUSH_YARDS).clamp(-ONSIDE_SUPPORT_MAX_PUSH_YARDS, ONSIDE_SUPPORT_MAX_PUSH_YARDS)
     }
 }
 
@@ -401,12 +364,13 @@ impl SoccerMatch {
             if self.pending_onside_support[i].due_tick <= tick {
                 let decision = self.pending_onside_support.swap_remove(i);
                 let now_territorial = territorial_advantage(snapshot, decision.team);
-                let territorial_delta =
-                    if now_territorial.is_finite() && decision.decision_territorial.is_finite() {
-                        now_territorial - decision.decision_territorial
-                    } else {
-                        0.0
-                    };
+                let territorial_delta = if now_territorial.is_finite()
+                    && decision.decision_territorial.is_finite()
+                {
+                    now_territorial - decision.decision_territorial
+                } else {
+                    0.0
+                };
                 let reward = decision.reward_accum
                     + ONSIDE_SUPPORT_TERRITORIAL_SHAPING_WEIGHT * territorial_delta;
                 if reward.is_finite() {
@@ -432,9 +396,7 @@ impl SoccerMatch {
             .players
             .iter()
             .filter(|p| matches!(p.role, PlayerRole::Forward | PlayerRole::Midfielder))
-            .filter(|p| {
-                snapshot.possession_team() == Some(p.team) && snapshot.ball.holder != Some(p.id)
-            })
+            .filter(|p| snapshot.possession_team() == Some(p.team) && snapshot.ball.holder != Some(p.id))
             .map(|p| p.id)
             .collect();
         for id in ids {
@@ -449,16 +411,15 @@ impl SoccerMatch {
                 .unwrap_or_else(|| analytic_onside_support_push(&inputs));
             let territorial = territorial_advantage(snapshot, player.team);
             if territorial.is_finite() {
-                self.pending_onside_support
-                    .push(PendingOnsideSupportDecision {
-                        team: player.team,
-                        player_id: id,
-                        inputs,
-                        action_bias,
-                        decision_territorial: territorial,
-                        reward_accum: 0.0,
-                        due_tick: tick + ONSIDE_SUPPORT_REWARD_WINDOW_TICKS,
-                    });
+                self.pending_onside_support.push(PendingOnsideSupportDecision {
+                    team: player.team,
+                    player_id: id,
+                    inputs,
+                    action_bias,
+                    decision_territorial: territorial,
+                    reward_accum: 0.0,
+                    due_tick: tick + ONSIDE_SUPPORT_REWARD_WINDOW_TICKS,
+                });
             }
         }
     }
@@ -522,36 +483,16 @@ mod onside_support_model_tests {
         let mut hi = OnsideSupportHead::new(1);
         let mut lo = OnsideSupportHead::new(1);
         let hi_s: Vec<OnsideSupportSample> = (0..32)
-            .flat_map(|_| {
-                [
-                    OnsideSupportSample {
-                        inputs: inputs.clone(),
-                        action_bias: 0.8,
-                        reward: 1.0,
-                    },
-                    OnsideSupportSample {
-                        inputs: inputs.clone(),
-                        action_bias: -0.8,
-                        reward: -1.0,
-                    },
-                ]
-            })
+            .flat_map(|_| [
+                OnsideSupportSample { inputs: inputs.clone(), action_bias: 0.8, reward: 1.0 },
+                OnsideSupportSample { inputs: inputs.clone(), action_bias: -0.8, reward: -1.0 },
+            ])
             .collect();
         let lo_s: Vec<OnsideSupportSample> = (0..32)
-            .flat_map(|_| {
-                [
-                    OnsideSupportSample {
-                        inputs: inputs.clone(),
-                        action_bias: -0.8,
-                        reward: 1.0,
-                    },
-                    OnsideSupportSample {
-                        inputs: inputs.clone(),
-                        action_bias: 0.8,
-                        reward: -1.0,
-                    },
-                ]
-            })
+            .flat_map(|_| [
+                OnsideSupportSample { inputs: inputs.clone(), action_bias: -0.8, reward: 1.0 },
+                OnsideSupportSample { inputs: inputs.clone(), action_bias: 0.8, reward: -1.0 },
+            ])
             .collect();
         for _ in 0..80 {
             hi.train_reward_weighted(&hi_s, 0.05);

@@ -199,12 +199,12 @@ pub fn aerial_descent_plan(
     }
     // A non-finite velocity ⇒ treat the ball as dropping vertically (project off the aim
     // bearing only), never propagate a NaN into the target.
-    let ball_horizontal_vel =
-        if ball_horizontal_vel.x.is_finite() && ball_horizontal_vel.y.is_finite() {
-            ball_horizontal_vel
-        } else {
-            Vec2::new(0.0, 0.0)
-        };
+    let ball_horizontal_vel = if ball_horizontal_vel.x.is_finite() && ball_horizontal_vel.y.is_finite()
+    {
+        ball_horizontal_vel
+    } else {
+        Vec2::new(0.0, 0.0)
+    };
     let hang = 2.0 * (2.0 * apex_yards / GRAVITY_YPS2).sqrt();
     if !hang.is_finite() || hang <= 1e-3 {
         return None;
@@ -313,24 +313,23 @@ pub fn analytic_aerial_reception(
     let pressured = contest <= AERIAL_CONTEST_MARGIN_SECONDS
         || inputs.opponent_distance_to_drop <= AERIAL_CONTROL_BAND_TOP_YARDS + 1.5;
 
-    let (decision, mut attack_blend) =
-        if settle_arrival > plan.time_to_settle + AERIAL_CHASE_TOLERANCE_SECONDS {
-            // Can't get under it in time: chase the ball down as it lands.
-            (AerialReceptionDecision::ChaseDrop, 0.0)
-        } else if pressured {
-            // Win it in the air. How high we attack scales with how hard we are pressed and
-            // our aerial tool — a strong header attacks the very top of the band.
-            let press =
-                (1.0 - (contest / AERIAL_CONTEST_MARGIN_SECONDS).clamp(0.0, 1.0)).clamp(0.0, 1.0);
-            let blend = (0.55 + press * 0.30 + inputs.aerial_tool * 0.15).clamp(0.0, 1.0);
-            (AerialReceptionDecision::AttackInFront, blend)
-        } else if slack >= AERIAL_SETTLE_SLACK_SECONDS {
-            // Comfortably under it and free: let it drop to the feet for a clean touch.
-            (AerialReceptionDecision::SettleUnder, 0.0)
-        } else {
-            // Reachable but tight: take it slightly above the feet to be sure of it.
-            (AerialReceptionDecision::AttackInFront, 0.30)
-        };
+    let (decision, mut attack_blend) = if settle_arrival > plan.time_to_settle + AERIAL_CHASE_TOLERANCE_SECONDS
+    {
+        // Can't get under it in time: chase the ball down as it lands.
+        (AerialReceptionDecision::ChaseDrop, 0.0)
+    } else if pressured {
+        // Win it in the air. How high we attack scales with how hard we are pressed and
+        // our aerial tool — a strong header attacks the very top of the band.
+        let press = (1.0 - (contest / AERIAL_CONTEST_MARGIN_SECONDS).clamp(0.0, 1.0)).clamp(0.0, 1.0);
+        let blend = (0.55 + press * 0.30 + inputs.aerial_tool * 0.15).clamp(0.0, 1.0);
+        (AerialReceptionDecision::AttackInFront, blend)
+    } else if slack >= AERIAL_SETTLE_SLACK_SECONDS {
+        // Comfortably under it and free: let it drop to the feet for a clean touch.
+        (AerialReceptionDecision::SettleUnder, 0.0)
+    } else {
+        // Reachable but tight: take it slightly above the feet to be sure of it.
+        (AerialReceptionDecision::AttackInFront, 0.30)
+    };
 
     // Clean-control estimate: settling under a dropping ball with a good first touch is
     // the most secure; attacking it high under pressure is less so. This is the analytic
@@ -338,8 +337,9 @@ pub fn analytic_aerial_reception(
     let tool = (inputs.first_touch_tool * (1.0 - attack_blend) + inputs.aerial_tool * attack_blend)
         .clamp(0.0, 1.0);
     let lateness = (settle_arrival - plan.time_to_settle).max(0.0);
-    let control_estimate =
-        (0.40 + tool * 0.45 + contest.clamp(-0.6, 0.8) * 0.18 - lateness * 0.30).clamp(0.0, 1.0);
+    let control_estimate = (0.40 + tool * 0.45 + contest.clamp(-0.6, 0.8) * 0.18
+        - lateness * 0.30)
+        .clamp(0.0, 1.0);
 
     // A chase runs onto where the ball actually comes down (the landing point), not the
     // settle spot it can't reach in time — keep the full attack blend at 0 for the trace.
@@ -568,11 +568,7 @@ impl AerialReceptionControlHead {
                 self.training_steps += 1;
             }
         }
-        let mean = if applied > 0 {
-            total / applied as f64
-        } else {
-            0.0
-        };
+        let mean = if applied > 0 { total / applied as f64 } else { 0.0 };
         self.last_loss = Some(mean);
         mean
     }
@@ -673,8 +669,7 @@ impl SoccerMatch {
                     reward,
                 });
                 if self.aerial_reception_samples.len() > AERIAL_RECEPTION_SAMPLE_CAP {
-                    let overflow =
-                        self.aerial_reception_samples.len() - AERIAL_RECEPTION_SAMPLE_CAP;
+                    let overflow = self.aerial_reception_samples.len() - AERIAL_RECEPTION_SAMPLE_CAP;
                     self.aerial_reception_samples.drain(0..overflow);
                 }
             } else {
@@ -706,8 +701,7 @@ impl SoccerMatch {
             return;
         };
         let current = snapshot.player_snapshot_position(me);
-        if let Some((descent, inputs, plan)) = snapshot.aerial_reception_resolve(me, pass, current)
-        {
+        if let Some((descent, inputs, plan)) = snapshot.aerial_reception_resolve(me, pass, current) {
             let context = AerialReceptionContext::build(&descent, &inputs, plan.attack_blend);
             // Resolve the outcome shortly AFTER the ball actually lands (flight time + a
             // touch-settling grace), not a fixed window — a long lob is still airborne a

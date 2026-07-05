@@ -2801,10 +2801,8 @@ pub(crate) fn soccer_local_mpc_planar_obstacles(
         length,
         ball_position,
     );
-    let ball_obstacle_velocity = limit_vec2_len(
-        ball_velocity + ball_acceleration * dt + ball_jerk * half_dt2,
-        32.0,
-    );
+    let ball_obstacle_velocity =
+        limit_vec2_len(ball_velocity + ball_acceleration * dt + ball_jerk * half_dt2, 32.0);
     let ball_weight = 4.5
         + ball_velocity.len().clamp(0.0, 28.0) / 7.0
         + ball_acceleration.len().clamp(0.0, 28.0) / 14.0;

@@ -29,6 +29,6 @@ pub mod des;
 pub use des::general::soccer;
 pub use des::general::soccer_rotation as rotation;
 pub use des::soccer_learning;
+pub use des::telemetry;
 #[cfg(feature = "planner")]
 pub use des::soccer_planner;
-pub use des::telemetry;

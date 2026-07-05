@@ -26,8 +26,7 @@ use crate::des::general::tournament::{
 use crate::des::soccer_learning::{
     soccer_learning_from_micros, soccer_learning_to_micros, soccer_team_label,
     soccer_team_q_policies_fingerprint, SoccerLearningCompletedGame, SoccerLearningPolicyDelta,
-    SoccerLearningPolicyDeltaEntry, SoccerLearningPolicyEntryKind, SOCCER_POLICY_STATUS_ACTIVE,
-    SOCCER_POLICY_STATUS_ARCHIVED,
+    SoccerLearningPolicyDeltaEntry, SoccerLearningPolicyEntryKind,
 };
 use std::collections::HashMap;
 
@@ -65,16 +64,6 @@ pub struct SoccerLearningPgPolicyMetadata {
     pub search_metadata: Option<Value>,
 }
 
-#[derive(Clone, Debug)]
-pub struct SoccerLearningPgPolicyPromotionBaseline {
-    pub policy_version_id: String,
-    pub generation: i32,
-    pub sample_games: usize,
-    pub mean_match_fitness: f64,
-    pub best_match_fitness: f64,
-    pub mean_play_quality: f64,
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct SoccerLearningPgCompletedRunInsert<'a> {
     pub base_policy_version_id: Option<&'a str>,
@@ -105,10 +94,6 @@ const SOCCER_RUN_DELTA_INSERT_BATCH_SIZE: usize = 1024;
 const SOCCER_COMPLETED_RUN_INSERT_BATCH_SIZE: usize = 512;
 const SOCCER_POLICY_RETENTION_BRANCH_TIP: &str = "branch_tip";
 const SOCCER_POLICY_INLINE_PRUNE_ENV: &str = "SOCCER_PG_INLINE_POLICY_PRUNE";
-const SOCCER_POLICY_RETAIN_ARCHIVED_ENTRIES_ENV: &str = "SOCCER_PG_RETAIN_ARCHIVED_POLICY_ENTRIES";
-const SOCCER_POLICY_VERSION_FULL_ENTRIES_ENV: &str = "SOCCER_PG_POLICY_VERSION_FULL_ENTRIES";
-const SOCCER_PG_PERSIST_RUN_DELTAS_ENV: &str = "SOCCER_PG_PERSIST_RUN_DELTAS";
-const SOCCER_PG_RESUME_MAX_POLICY_ENTRIES_ENV: &str = "SOCCER_PG_RESUME_MAX_POLICY_ENTRIES";
 /// Rows deleted per statement when cleaning up a superseded generation's entries.
 /// Inline pruning is opt-in via [`SOCCER_POLICY_INLINE_PRUNE_ENV`]; live learners defer this
 /// heavyweight maintenance so policy promotion cannot stall on a large delete.
@@ -424,48 +409,6 @@ fn soccer_policy_version_policy_entry_count_from_metrics(metrics: &Value) -> Opt
 }
 
 fn soccer_policy_version_retains_full_entries(status: &str) -> bool {
-    soccer_policy_version_retains_full_entries_with_override(
-        status,
-        soccer_learning_pg_env_flag(SOCCER_POLICY_RETAIN_ARCHIVED_ENTRIES_ENV),
-    )
-}
-
-fn soccer_policy_version_status_after_promotion_sample_floor<'a>(
-    requested_status: &'a str,
-    metrics: &Value,
-) -> &'a str {
-    if requested_status != SOCCER_POLICY_STATUS_ACTIVE {
-        return requested_status;
-    }
-    let Some(gate) = metrics
-        .get("learningProvenance")
-        .and_then(|provenance| provenance.get("searchParameters"))
-        .and_then(|search_parameters| search_parameters.get("promotion"))
-        .and_then(|promotion| promotion.get("gate"))
-    else {
-        return requested_status;
-    };
-    let sample_games = gate.get("sampleGames").and_then(Value::as_u64);
-    let configured_min_sample_games = soccer_neural_snapshot_min_sample_games().max(0) as u64;
-    let min_sample_games = gate
-        .get("minSampleGames")
-        .and_then(Value::as_u64)
-        .unwrap_or(configured_min_sample_games)
-        .max(configured_min_sample_games);
-    if sample_games.is_some_and(|sample_games| sample_games >= min_sample_games) {
-        requested_status
-    } else {
-        SOCCER_POLICY_STATUS_ARCHIVED
-    }
-}
-
-fn soccer_policy_version_retains_full_entries_with_override(
-    status: &str,
-    retain_archived_entries: bool,
-) -> bool {
-    if retain_archived_entries {
-        return !matches!(status, "rejected");
-    }
     !matches!(status, "archived" | "rejected")
 }
 
@@ -651,46 +594,16 @@ impl SoccerLearningPgStore {
         if self.policy_retention_schema_ready {
             return Ok(());
         }
-        if self.policy_retention_columns_present()? {
-            self.policy_retention_schema_ready = true;
-            return Ok(());
-        }
-        self.with_transient_retry("ensure soccer policy retention schema", |store| {
-            let mut tx = store.client.transaction().map_err(|err| {
-                format!("begin soccer policy retention schema transaction: {err}")
-            })?;
-            ensure_soccer_learning_policy_retention_columns(&mut tx)?;
-            tx.commit().map_err(|err| {
-                format!("commit soccer policy retention schema transaction: {err}")
-            })?;
-            Ok(())
-        })?;
+        self.ensure_connected()?;
+        let mut tx = self
+            .client
+            .transaction()
+            .map_err(|err| format!("begin soccer policy retention schema transaction: {err}"))?;
+        ensure_soccer_learning_policy_retention_columns(&mut tx)?;
+        tx.commit()
+            .map_err(|err| format!("commit soccer policy retention schema transaction: {err}"))?;
         self.policy_retention_schema_ready = true;
         Ok(())
-    }
-
-    fn policy_retention_columns_present(&mut self) -> Result<bool, String> {
-        self.with_transient_retry("check soccer policy retention columns", |store| {
-            let row = store
-                .client
-                .query_one(
-                    r#"
-                    select count(*) = 4
-                    from information_schema.columns
-                    where table_schema = current_schema()
-                      and table_name = 'des_soccer_learning_policy_versions'
-                      and column_name in (
-                        'branch_key',
-                        'retention_kind',
-                        'full_entries_retained',
-                        'full_entries_pruned_at'
-                      )
-                    "#,
-                    &[],
-                )
-                .map_err(|err| format!("check soccer policy retention columns: {err}"))?;
-            Ok(row.get(0))
-        })
     }
 
     /// Run an **idempotent** database operation, retrying on a transient connection
@@ -1426,30 +1339,6 @@ impl SoccerLearningPgStore {
         else {
             return Ok(None);
         };
-        self.load_policy_version_from_metadata(metadata, home_options, away_options, min_visits)
-    }
-
-    pub fn load_policy_version_with_min_visits(
-        &mut self,
-        policy_version_id: &str,
-        home_options: SoccerQPolicyOptions,
-        away_options: SoccerQPolicyOptions,
-        min_visits: i32,
-    ) -> Result<Option<SoccerLearningPgPolicyVersion>, String> {
-        self.ensure_connected()?;
-        let Some(metadata) = self.load_policy_metadata_by_id(policy_version_id)? else {
-            return Ok(None);
-        };
-        self.load_policy_version_from_metadata(metadata, home_options, away_options, min_visits)
-    }
-
-    fn load_policy_version_from_metadata(
-        &mut self,
-        metadata: SoccerLearningPgPolicyMetadata,
-        home_options: SoccerQPolicyOptions,
-        away_options: SoccerQPolicyOptions,
-        min_visits: i32,
-    ) -> Result<Option<SoccerLearningPgPolicyVersion>, String> {
         let policies =
             self.load_policy_entries(&metadata.id, home_options, away_options, min_visits.max(0))?;
         let policy_fingerprint = metadata
@@ -1481,10 +1370,10 @@ impl SoccerLearningPgStore {
     /// Latest policy metadata for a live/inference server. With `include_unpromoted =
     /// false` this is the strict "newest ACTIVE (promotion-gated)" selection every
     /// training path relies on. With `include_unpromoted = true` it returns the
-    /// best-fitness candidate at the NEWEST generation that passed the learner-side
-    /// promotion gate, even if the DB active-head guard later archived it. That keeps
-    /// :5055 on the latest strong branch tip without resuming from windows the
-    /// comparison gate explicitly rejected.
+    /// best-fitness candidate at the NEWEST generation REGARDLESS of promotion status
+    /// (generation desc, then fitness desc) — so :5055 reflects the learner's latest
+    /// strong candidate even while the promotion gate holds it out of `active`, without
+    /// falling back to a stale older generation that once scored a lucky high fitness.
     pub fn load_latest_policy_metadata(
         &mut self,
         experiment_id: &str,
@@ -1503,10 +1392,6 @@ impl SoccerLearningPgStore {
                   coalesce((extract(epoch from updated_at) * 1000000)::bigint, 0)
                 from des_soccer_learning_policy_versions
                 where experiment_id = $1::text::uuid and fitness_micros is not null
-                  and coalesce(
-                    metrics #>> '{learningProvenance,searchParameters,promotion,status}',
-                    'active'
-                  ) != 'archived'
                 order by generation desc, fitness_micros desc, updated_at desc, id desc
                 limit 1
                 "#
@@ -1554,247 +1439,6 @@ impl SoccerLearningPgStore {
             neural_network,
             tactical_learning,
             search_metadata,
-        }))
-    }
-
-    /// Strongest recent persisted neural snapshot for warm-start/live inference.
-    /// Live neural-authoritative play must not load snapshots that a promotion or
-    /// anchor gate already archived; those can have high self-play fitness while
-    /// losing the held-out comparison.
-    pub fn load_latest_neural_policy_metadata(
-        &mut self,
-        experiment_id: &str,
-    ) -> Result<Option<SoccerLearningPgPolicyMetadata>, String> {
-        self.ensure_connected()?;
-        let lookback_generations = soccer_neural_snapshot_lookback_generations();
-        let min_sample_games = soccer_neural_snapshot_min_sample_games();
-        let latest_qualified_trained = soccer_neural_snapshot_latest_qualified_trained();
-        let Some(row) = self
-            .client
-            .query_opt(
-                r#"
-                with latest_generation as (
-                  select coalesce(max(generation), 0) as generation
-                  from des_soccer_learning_policy_versions
-                  where experiment_id = $1::text::uuid
-                    and metrics ? 'neuralNetwork'
-                ),
-                candidates as (
-                select
-                  policy_versions.id::text,
-                  policy_versions.generation,
-                  coalesce(policy_versions.fitness_micros, 0) as fitness_micros,
-                  policy_versions.metrics,
-                  policy_versions.config,
-                  coalesce((extract(epoch from policy_versions.updated_at) * 1000000)::bigint, 0) as updated_at_micros,
-                  nullif(policy_versions.metrics #>> '{learningProvenance,searchParameters,promotion,gate,sampleGames}', '')::int as sample_games,
-                  nullif(policy_versions.metrics #>> '{learningProvenance,searchParameters,promotion,gate,meanMatchFitness}', '')::double precision as mean_match_fitness,
-                  nullif(policy_versions.metrics #>> '{learningProvenance,searchParameters,promotion,gate,meanPlayQuality}', '')::double precision as mean_play_quality,
-                  nullif(policy_versions.metrics #>> '{neuralNetwork,trainingSteps}', '')::int as neural_training_steps,
-                  policy_versions.created_at,
-                  policy_versions.updated_at
-                from des_soccer_learning_policy_versions policy_versions
-                cross join latest_generation
-                where policy_versions.experiment_id = $1::text::uuid
-                  and policy_versions.metrics ? 'neuralNetwork'
-                  and policy_versions.generation between latest_generation.generation - $2 and latest_generation.generation
-                  and (
-                    policy_versions.status = 'active'
-                    or (
-                      (policy_versions.metrics #>> '{learningProvenance,searchParameters,neuralCheckpoint,reason}') is null
-                      and coalesce(
-                        policy_versions.metrics #>> '{learningProvenance,searchParameters,promotion,status}',
-                        'active'
-                      ) != 'archived'
-                      and coalesce(
-                        policy_versions.metrics #>> '{learningProvenance,searchParameters,anchorPromotion,status}',
-                        'active'
-                      ) != 'archived'
-                    )
-                  )
-                )
-                select
-                  id,
-                  generation,
-                  fitness_micros,
-                  metrics,
-                  config,
-                  updated_at_micros
-                from candidates
-                order by
-                  case
-                    when $4::bool
-                      and sample_games >= $3
-                      and coalesce(neural_training_steps, 0) > 0
-                    then 0
-                    when not $4::bool
-                      and sample_games >= $3
-                      and mean_match_fitness is not null
-                      and mean_play_quality is not null
-                    then 0
-                    else 1
-                  end,
-                  case when $4::bool then mean_match_fitness end desc nulls last,
-                  case when $4::bool then mean_play_quality end desc nulls last,
-                  case when $4::bool then sample_games end desc nulls last,
-                  case when $4::bool then neural_training_steps end desc nulls last,
-                  case when $4::bool then generation end desc nulls last,
-                  case when not $4::bool then mean_match_fitness end desc nulls last,
-                  case when not $4::bool then mean_play_quality end desc nulls last,
-                  generation desc,
-                  created_at desc,
-                  updated_at desc,
-                  id desc
-                limit 1
-                "#,
-                &[
-                    &experiment_id,
-                    &lookback_generations,
-                    &min_sample_games,
-                    &latest_qualified_trained,
-                ],
-            )
-            .map_err(|err| format!("select latest soccer neural policy metadata: {err}"))?
-        else {
-            return Ok(None);
-        };
-        let id: String = row.get(0);
-        let generation: i32 = row.get(1);
-        let fitness_micros: i64 = row.get(2);
-        let metrics: Value = row.get(3);
-        let config: Value = row.get(4);
-        let updated_at_micros: i64 = row.get(5);
-        let neural_network = soccer_policy_version_neural_network_from_metrics(&metrics)?;
-        let tactical_learning =
-            soccer_policy_version_tactical_learning_from_values(&config, &metrics)?;
-        let search_metadata = soccer_policy_version_search_metadata_from_metrics(&metrics)?;
-        let policy_fingerprint = soccer_policy_version_policy_fingerprint_from_metrics(&metrics);
-        let policy_entry_count = soccer_policy_version_policy_entry_count_from_metrics(&metrics);
-        Ok(Some(SoccerLearningPgPolicyMetadata {
-            id,
-            generation,
-            fitness_micros,
-            updated_at_micros,
-            policy_fingerprint,
-            policy_entry_count,
-            neural_network,
-            tactical_learning,
-            search_metadata,
-        }))
-    }
-
-    pub fn load_policy_metadata_by_id(
-        &mut self,
-        policy_version_id: &str,
-    ) -> Result<Option<SoccerLearningPgPolicyMetadata>, String> {
-        self.ensure_connected()?;
-        let Some(row) = self
-            .client
-            .query_opt(
-                r#"
-                select
-                  id::text,
-                  generation,
-                  fitness_micros,
-                  metrics,
-                  config,
-                  coalesce((extract(epoch from updated_at) * 1000000)::bigint, 0)
-                from des_soccer_learning_policy_versions
-                where id = $1::text::uuid
-                limit 1
-                "#,
-                &[&policy_version_id],
-            )
-            .map_err(|err| format!("select soccer policy version metadata by id: {err}"))?
-        else {
-            return Ok(None);
-        };
-        let id: String = row.get(0);
-        let generation: i32 = row.get(1);
-        let fitness_micros: i64 = row.get(2);
-        let metrics: Value = row.get(3);
-        let config: Value = row.get(4);
-        let updated_at_micros: i64 = row.get(5);
-        let neural_network = soccer_policy_version_neural_network_from_metrics(&metrics)?;
-        let tactical_learning =
-            soccer_policy_version_tactical_learning_from_values(&config, &metrics)?;
-        let search_metadata = soccer_policy_version_search_metadata_from_metrics(&metrics)?;
-        let policy_fingerprint = soccer_policy_version_policy_fingerprint_from_metrics(&metrics);
-        let policy_entry_count = soccer_policy_version_policy_entry_count_from_metrics(&metrics);
-        Ok(Some(SoccerLearningPgPolicyMetadata {
-            id,
-            generation,
-            fitness_micros,
-            updated_at_micros,
-            policy_fingerprint,
-            policy_entry_count,
-            neural_network,
-            tactical_learning,
-            search_metadata,
-        }))
-    }
-
-    pub fn load_strongest_recent_policy_promotion_baseline(
-        &mut self,
-        experiment_id: &str,
-        latest_generation: i32,
-        lookback_generations: i32,
-        min_sample_games: usize,
-    ) -> Result<Option<SoccerLearningPgPolicyPromotionBaseline>, String> {
-        let min_generation = latest_generation.saturating_sub(lookback_generations.max(0));
-        let min_sample_games = checked_i32(min_sample_games);
-        let row = self.with_transient_retry(
-            "select strongest soccer promotion baseline",
-            |store| {
-                store.client.query_opt(
-                    r#"
-                select
-                  id::text,
-                  generation,
-                  (metrics #>> '{learningProvenance,searchParameters,promotion,gate,sampleGames}')::int,
-                  (metrics #>> '{learningProvenance,searchParameters,promotion,gate,meanMatchFitness}')::double precision,
-                  (metrics #>> '{learningProvenance,searchParameters,promotion,gate,bestMatchFitness}')::double precision,
-                  (metrics #>> '{learningProvenance,searchParameters,promotion,gate,meanPlayQuality}')::double precision
-                from des_soccer_learning_policy_versions
-                where experiment_id = $1::text::uuid
-                  and generation between $2 and $3
-                  and coalesce(
-                    metrics #>> '{learningProvenance,searchParameters,promotion,status}',
-                    'archived'
-                  ) = 'active'
-                  and (metrics #>> '{learningProvenance,searchParameters,promotion,gate,sampleGames}')::int >= $4
-                  and (metrics #>> '{learningProvenance,searchParameters,promotion,gate,meanMatchFitness}') is not null
-                  and (metrics #>> '{learningProvenance,searchParameters,promotion,gate,bestMatchFitness}') is not null
-                  and (metrics #>> '{learningProvenance,searchParameters,promotion,gate,meanPlayQuality}') is not null
-                order by
-                  (metrics #>> '{learningProvenance,searchParameters,promotion,gate,meanMatchFitness}')::double precision desc,
-                  (metrics #>> '{learningProvenance,searchParameters,promotion,gate,meanPlayQuality}')::double precision desc,
-                  generation desc,
-                  updated_at desc,
-                  id desc
-                limit 1
-                "#,
-                &[
-                    &experiment_id,
-                    &min_generation,
-                    &latest_generation,
-                    &min_sample_games,
-                ],
-                )
-                .map_err(|err| format!("select strongest soccer promotion baseline: {err}"))
-            },
-        )?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let sample_games: i32 = row.get(2);
-        Ok(Some(SoccerLearningPgPolicyPromotionBaseline {
-            policy_version_id: row.get(0),
-            generation: row.get(1),
-            sample_games: usize::try_from(sample_games.max(0)).unwrap_or(usize::MAX),
-            mean_match_fitness: row.get(3),
-            best_match_fitness: row.get(4),
-            mean_play_quality: row.get(5),
         }))
     }
 
@@ -1968,6 +1612,7 @@ impl SoccerLearningPgStore {
         )?;
         stamp_soccer_policy_weight_metrics(&mut base_metrics, policies);
         let retention_kind = SOCCER_POLICY_RETENTION_BRANCH_TIP;
+        let full_entries_retained = soccer_policy_version_retains_full_entries(status);
         let entry_count =
             checked_i32(policies.home.entries().len() + policies.away.entries().len());
         let target_entry_count = checked_i32(
@@ -1985,18 +1630,6 @@ impl SoccerLearningPgStore {
             parent_policy_version_id,
             policy_version_id,
         )?;
-        let metrics_for_status = soccer_policy_version_metrics_with_retention(
-            base_metrics.clone(),
-            policy_version_id,
-            &branch_key,
-            retention_kind,
-            soccer_policy_version_retains_full_entries(status),
-        );
-        let effective_status =
-            soccer_policy_version_status_after_promotion_sample_floor(status, &metrics_for_status);
-        let full_entries_retained = soccer_policy_version_retains_full_entries(effective_status)
-            && soccer_policy_version_full_entries_enabled();
-        base_metrics["learningProvenance"]["policyWeightsPersisted"] = json!(full_entries_retained);
         let metrics = soccer_policy_version_metrics_with_retention(
             base_metrics,
             policy_version_id,
@@ -2005,7 +1638,7 @@ impl SoccerLearningPgStore {
             full_entries_retained,
         );
 
-        if effective_status == SOCCER_POLICY_STATUS_ACTIVE {
+        if status == "active" {
             // Serialize active-policy promotions PER EXPERIMENT so the
             // archive-old-active + insert-new-active pair is atomic against any
             // other promoter (a concurrent tournament run, the continuous learner,
@@ -2021,11 +1654,6 @@ impl SoccerLearningPgStore {
                 &[&experiment_id],
             )
             .map_err(|err| format!("acquire policy promotion advisory lock: {err}"))?;
-            tx.execute(
-                "select set_config('des_soccer.policy_active_promotion_in_progress', '1', true)",
-                &[],
-            )
-            .map_err(|err| format!("mark policy promotion transaction: {err}"))?;
             tx.execute(
                 r#"
                 update des_soccer_learning_policy_versions
@@ -2090,7 +1718,7 @@ impl SoccerLearningPgStore {
                     &generation,
                     &version_label,
                     &source_kind,
-                    &effective_status,
+                    &status,
                     &options_json,
                     &config_json,
                     &lineage,
@@ -2104,12 +1732,7 @@ impl SoccerLearningPgStore {
                     &full_entries_retained,
                 ],
             )
-            .map_err(|err| {
-                format!(
-                    "insert soccer policy version: {}",
-                    soccer_learning_pg_error_context(&err)
-                )
-            })?;
+            .map_err(|err| format!("insert soccer policy version: {err}"))?;
         if inserted != 1 {
             return Err(format!(
                 "insert soccer policy version inserted {inserted} rows for policy version {policy_version_id}"
@@ -2624,9 +2247,7 @@ impl SoccerLearningPgStore {
                 runner_id,
                 chunk,
             )?;
-            if soccer_learning_pg_persist_run_deltas_enabled() {
-                insert_completed_run_delta_rows_in_transaction(&mut tx, &chunk_run_ids, chunk)?;
-            }
+            insert_completed_run_delta_rows_in_transaction(&mut tx, &chunk_run_ids, chunk)?;
             if has_config_moments {
                 for (run_id, run) in chunk_run_ids.iter().zip(chunk.iter()) {
                     if !run.game.config_moments.is_empty() {
@@ -3086,21 +2707,12 @@ impl SoccerLearningPgStore {
         ensure_soccer_learning_set_play_tables(&mut tx)?;
         let policy_version_id = Uuid::new_v4().to_string();
         let retention_kind = SOCCER_POLICY_RETENTION_BRANCH_TIP;
+        let full_entries_retained = soccer_policy_version_retains_full_entries(status);
         let branch_key = soccer_policy_branch_key_for_insert(
             &mut tx,
             base_policy_version_id,
             &policy_version_id,
         )?;
-        let metrics_for_status = soccer_policy_version_metrics_with_retention(
-            base_metrics.clone(),
-            &policy_version_id,
-            &branch_key,
-            retention_kind,
-            soccer_policy_version_retains_full_entries(status),
-        );
-        let effective_status =
-            soccer_policy_version_status_after_promotion_sample_floor(status, &metrics_for_status);
-        let full_entries_retained = soccer_policy_version_retains_full_entries(effective_status);
         let metrics = soccer_policy_version_metrics_with_retention(
             base_metrics,
             &policy_version_id,
@@ -3109,7 +2721,7 @@ impl SoccerLearningPgStore {
             full_entries_retained,
         );
 
-        if effective_status == SOCCER_POLICY_STATUS_ACTIVE {
+        if status == "active" {
             // Serialize active-policy promotions PER EXPERIMENT so the
             // archive-old-active + insert-new-active pair is atomic against any
             // other promoter (a concurrent tournament run, the continuous learner,
@@ -3125,11 +2737,6 @@ impl SoccerLearningPgStore {
                 &[&experiment_id],
             )
             .map_err(|err| format!("acquire policy promotion advisory lock: {err}"))?;
-            tx.execute(
-                "select set_config('des_soccer.policy_active_promotion_in_progress', '1', true)",
-                &[],
-            )
-            .map_err(|err| format!("mark policy promotion transaction: {err}"))?;
             tx.execute(
                 r#"
                 update des_soccer_learning_policy_versions
@@ -3193,7 +2800,7 @@ impl SoccerLearningPgStore {
                     &base_policy_version_id,
                     &generation,
                     &version_label,
-                    &effective_status,
+                    &status,
                     &options_json,
                     &config_json,
                     &lineage,
@@ -3341,22 +2948,10 @@ impl SoccerLearningPgStore {
         // the full multi-million-row policy. See `load_latest_active_policy_with_min_visits`.
         min_visits: i32,
     ) -> Result<SoccerTeamQPolicies, String> {
-        let max_policy_entries = soccer_pg_resume_max_policy_entries();
-        if max_policy_entries == Some(0) {
-            println!(
-                "soccer-learning-pg: skipping tabular policy entries for policy_version={} because {}=0; neural snapshot/config still load",
-                policy_version_id, SOCCER_PG_RESUME_MAX_POLICY_ENTRIES_ENV
-            );
-            return Ok(SoccerTeamQPolicies {
-                home: SoccerQPolicy::new(home_options),
-                away: SoccerQPolicy::new(away_options),
-            });
-        }
         let mut home_entries = Vec::new();
         let mut away_entries = Vec::new();
         let mut home_targets = Vec::new();
         let mut away_targets = Vec::new();
-        let mut loaded_entries = 0usize;
 
         // Keyset (seek) pagination over the FULL unique key — paging on only
         // (team, entry_kind, state_hash, action) would skip rows at a page boundary because
@@ -3431,9 +3026,6 @@ impl SoccerLearningPgStore {
             }
 
             for row in &rows {
-                if max_policy_entries.is_some_and(|max_entries| loaded_entries >= max_entries) {
-                    break;
-                }
                 let team: String = row.get(0);
                 let entry_kind: String = row.get(1);
                 let state_key_json: Value = row.get(2);
@@ -3483,18 +3075,6 @@ impl SoccerLearningPgStore {
                     }),
                     _ => {}
                 }
-                loaded_entries = loaded_entries.saturating_add(1);
-            }
-
-            if max_policy_entries.is_some_and(|max_entries| loaded_entries >= max_entries) {
-                println!(
-                    "soccer-learning-pg: capped tabular policy entry load policy_version={} loaded_entries={} {}={}",
-                    policy_version_id,
-                    loaded_entries,
-                    SOCCER_PG_RESUME_MAX_POLICY_ENTRIES_ENV,
-                    loaded_entries
-                );
-                break;
             }
 
             // A short page means the last row of the version has been read.
@@ -3641,9 +3221,7 @@ fn insert_completed_run_in_transaction(
         .map_err(|err| format!("insert soccer learning run: {err}"))?;
     let run_id: String = row.get(0);
 
-    if soccer_learning_pg_persist_run_deltas_enabled() {
-        insert_run_delta_rows(tx, &run_id, &game.delta.entries)?;
-    }
+    insert_run_delta_rows(tx, &run_id, &game.delta.entries)?;
 
     Ok(run_id)
 }
@@ -4811,23 +4389,11 @@ fn ensure_soccer_pass_outcome_tables(tx: &mut postgres::Transaction<'_>) -> Resu
           created_at timestamptz not null default now(),
           deleted_at timestamptz
         );
-        do $$
-        begin
-          if not exists (
-            select 1
-            from pg_constraint
-            where conname = 'des_soccer_pass_outcome_features_len_chk'
-              and conrelid = 'des_soccer_pass_outcome_samples'::regclass
-          ) then
-            begin
-              alter table des_soccer_pass_outcome_samples
-                add constraint des_soccer_pass_outcome_features_len_chk
-                  check (array_length(features, 1) in ({legacy_dim}, {dim}));
-            exception when duplicate_object then
-              null;
-            end;
-          end if;
-        end $$;
+        alter table des_soccer_pass_outcome_samples
+          drop constraint if exists des_soccer_pass_outcome_features_len_chk;
+        alter table des_soccer_pass_outcome_samples
+          add constraint des_soccer_pass_outcome_features_len_chk
+            check (array_length(features, 1) in ({legacy_dim}, {dim}));
         create index if not exists des_soccer_pass_outcome_run_idx
           on des_soccer_pass_outcome_samples (run_id);
         create index if not exists des_soccer_pass_outcome_live_created_idx
@@ -5454,32 +5020,6 @@ fn soccer_learning_database_url() -> Option<String> {
     })
 }
 
-fn soccer_learning_env_nonnegative_i32(name: &str, default: i32) -> i32 {
-    std::env::var(name)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<i32>().ok())
-        .filter(|value| *value >= 0)
-        .unwrap_or(default)
-}
-
-fn soccer_pg_resume_max_policy_entries() -> Option<usize> {
-    std::env::var(SOCCER_PG_RESUME_MAX_POLICY_ENTRIES_ENV)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-}
-
-fn soccer_neural_snapshot_lookback_generations() -> i32 {
-    soccer_learning_env_nonnegative_i32("SOCCER_POLICY_PROMOTION_BASELINE_LOOKBACK_GENERATIONS", 16)
-}
-
-fn soccer_neural_snapshot_min_sample_games() -> i32 {
-    soccer_learning_env_nonnegative_i32("SOCCER_POLICY_PROMOTION_MIN_SAMPLE_GAMES", 8)
-}
-
-fn soccer_neural_snapshot_latest_qualified_trained() -> bool {
-    soccer_learning_pg_env_flag("SOCCER_LIVE_POLICY_NEURAL_LATEST_QUALIFIED")
-}
-
 /// Session `statement_timeout` for soccer-learning PG connections. Defaults to "30s" so a slow or
 /// stuck query can't hang a long-lived queue/server loop, but is overridable via
 /// `SOCCER_PG_STATEMENT_TIMEOUT` (a Postgres interval such as "180s") for read-heavy clients like
@@ -5515,32 +5055,6 @@ fn soccer_policy_inline_prune_enabled_from_env_value(raw: Option<&str>) -> bool 
         || value.eq_ignore_ascii_case("true")
         || value.eq_ignore_ascii_case("yes")
         || value.eq_ignore_ascii_case("on")
-}
-
-fn soccer_learning_pg_persist_run_deltas_enabled() -> bool {
-    let raw = std::env::var(SOCCER_PG_PERSIST_RUN_DELTAS_ENV).ok();
-    soccer_learning_pg_persist_run_deltas_enabled_from_env_value(raw.as_deref())
-}
-
-fn soccer_learning_pg_persist_run_deltas_enabled_from_env_value(raw: Option<&str>) -> bool {
-    let value = raw.unwrap_or("").trim();
-    !(value == "0"
-        || value.eq_ignore_ascii_case("false")
-        || value.eq_ignore_ascii_case("no")
-        || value.eq_ignore_ascii_case("off"))
-}
-
-fn soccer_policy_version_full_entries_enabled() -> bool {
-    let raw = std::env::var(SOCCER_POLICY_VERSION_FULL_ENTRIES_ENV).ok();
-    soccer_policy_version_full_entries_enabled_from_env_value(raw.as_deref())
-}
-
-fn soccer_policy_version_full_entries_enabled_from_env_value(raw: Option<&str>) -> bool {
-    let value = raw.unwrap_or("").trim();
-    !(value == "0"
-        || value.eq_ignore_ascii_case("false")
-        || value.eq_ignore_ascii_case("no")
-        || value.eq_ignore_ascii_case("off"))
 }
 
 fn soccer_learning_pg_should_verify_certificates(database_url: &str) -> bool {
@@ -5684,35 +5198,6 @@ fn soccer_learning_pg_error_is_transient(err: &postgres::Error) -> bool {
     }
 }
 
-fn soccer_learning_pg_error_context(err: &postgres::Error) -> String {
-    let Some(db_error) = err.as_db_error() else {
-        return err.to_string();
-    };
-    let mut parts = vec![
-        format!("sqlstate={}", db_error.code().code()),
-        format!("message={}", db_error.message()),
-    ];
-    if let Some(detail) = db_error.detail() {
-        parts.push(format!("detail={detail}"));
-    }
-    if let Some(hint) = db_error.hint() {
-        parts.push(format!("hint={hint}"));
-    }
-    if let Some(schema) = db_error.schema() {
-        parts.push(format!("schema={schema}"));
-    }
-    if let Some(table) = db_error.table() {
-        parts.push(format!("table={table}"));
-    }
-    if let Some(column) = db_error.column() {
-        parts.push(format!("column={column}"));
-    }
-    if let Some(constraint) = db_error.constraint() {
-        parts.push(format!("constraint={constraint}"));
-    }
-    parts.join(" ")
-}
-
 fn soccer_learning_pg_sslmode(database_url: &str) -> Option<&str> {
     let query = database_url.split_once('?')?.1;
     query.split('&').find_map(|part| {
@@ -5773,7 +5258,6 @@ mod tests {
             training_steps: 0,
             average_loss: None,
             policy_head: None,
-            line_depth_head: None,
         }
     }
 
@@ -6446,97 +5930,10 @@ mod tests {
 
     #[test]
     fn policy_version_retention_skips_archived_and_rejected_entries() {
-        assert!(soccer_policy_version_retains_full_entries_with_override(
-            "active", false
-        ));
-        assert!(soccer_policy_version_retains_full_entries_with_override(
-            "candidate",
-            false
-        ));
-        assert!(!soccer_policy_version_retains_full_entries_with_override(
-            "archived", false
-        ));
-        assert!(!soccer_policy_version_retains_full_entries_with_override(
-            "rejected", false
-        ));
-        assert!(soccer_policy_version_retains_full_entries_with_override(
-            "archived", true
-        ));
-        assert!(!soccer_policy_version_retains_full_entries_with_override(
-            "rejected", true
-        ));
-    }
-
-    #[test]
-    fn policy_version_active_status_requires_promotion_sample_floor() {
-        let one_game_metrics = soccer_policy_version_metrics(
-            "merge",
-            1.0,
-            None,
-            None,
-            Some(&json!({
-                "promotion": {
-                    "gate": {
-                        "sampleGames": 1,
-                        "minSampleGames": 8
-                    }
-                }
-            })),
-        )
-        .expect("metrics");
-        assert_eq!(
-            soccer_policy_version_status_after_promotion_sample_floor(
-                SOCCER_POLICY_STATUS_ACTIVE,
-                &one_game_metrics,
-            ),
-            SOCCER_POLICY_STATUS_ARCHIVED
-        );
-
-        let one_game_self_reported_floor_metrics = soccer_policy_version_metrics(
-            "merge",
-            1.0,
-            None,
-            None,
-            Some(&json!({
-                "promotion": {
-                    "gate": {
-                        "sampleGames": 1,
-                        "minSampleGames": 1
-                    }
-                }
-            })),
-        )
-        .expect("metrics");
-        assert_eq!(
-            soccer_policy_version_status_after_promotion_sample_floor(
-                SOCCER_POLICY_STATUS_ACTIVE,
-                &one_game_self_reported_floor_metrics,
-            ),
-            SOCCER_POLICY_STATUS_ARCHIVED
-        );
-
-        let eight_game_metrics = soccer_policy_version_metrics(
-            "merge",
-            1.0,
-            None,
-            None,
-            Some(&json!({
-                "promotion": {
-                    "gate": {
-                        "sampleGames": 8,
-                        "minSampleGames": 8
-                    }
-                }
-            })),
-        )
-        .expect("metrics");
-        assert_eq!(
-            soccer_policy_version_status_after_promotion_sample_floor(
-                SOCCER_POLICY_STATUS_ACTIVE,
-                &eight_game_metrics,
-            ),
-            SOCCER_POLICY_STATUS_ACTIVE
-        );
+        assert!(soccer_policy_version_retains_full_entries("active"));
+        assert!(soccer_policy_version_retains_full_entries("candidate"));
+        assert!(!soccer_policy_version_retains_full_entries("archived"));
+        assert!(!soccer_policy_version_retains_full_entries("rejected"));
     }
 
     #[test]
@@ -6559,17 +5956,6 @@ mod tests {
         assert!(soccer_policy_inline_prune_enabled_from_env_value(Some(
             " on "
         )));
-    }
-
-    #[test]
-    fn run_delta_persistence_defaults_on_and_can_be_disabled() {
-        assert!(soccer_learning_pg_persist_run_deltas_enabled_from_env_value(None));
-        assert!(soccer_learning_pg_persist_run_deltas_enabled_from_env_value(Some("")));
-        assert!(soccer_learning_pg_persist_run_deltas_enabled_from_env_value(Some("1")));
-        assert!(soccer_learning_pg_persist_run_deltas_enabled_from_env_value(Some("true")));
-        assert!(!soccer_learning_pg_persist_run_deltas_enabled_from_env_value(Some("0")));
-        assert!(!soccer_learning_pg_persist_run_deltas_enabled_from_env_value(Some("false")));
-        assert!(!soccer_learning_pg_persist_run_deltas_enabled_from_env_value(Some(" off ")));
     }
 
     #[test]

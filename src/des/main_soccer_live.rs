@@ -1,8 +1,7 @@
 //! Blocking live server for the 2D soccer simulation.
 
 use crate::des::general::soccer::{
-    run_live_soccer_server, SoccerLiveServerConfig, SoccerNeuralBlendMode,
-    SoccerNeuralLearningBackend,
+    run_live_soccer_server, SoccerLiveServerConfig, SoccerNeuralLearningBackend,
 };
 
 pub const SOCCER_LIVE_REVIVAL_PORT: u16 = 5056;
@@ -107,30 +106,6 @@ where
     })
 }
 
-fn env_neural_blend_mode<F>(
-    lookup: &F,
-    primary: &str,
-    fallback: &str,
-) -> Option<SoccerNeuralBlendMode>
-where
-    F: Fn(&str) -> Option<String>,
-{
-    env_value(lookup, primary, fallback).and_then(|raw| {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "off" | "disabled" | "none" => Some(SoccerNeuralBlendMode::Off),
-            "additive" | "add" => Some(SoccerNeuralBlendMode::Additive),
-            "tiebreak" | "tie" | "tie-break" | "tie_break" => Some(SoccerNeuralBlendMode::TieBreak),
-            "confidence" | "confidencegated" | "confidence-gated" | "gated" => {
-                Some(SoccerNeuralBlendMode::ConfidenceGated)
-            }
-            "authoritative" | "neural" | "neural-authoritative" | "neural_authoritative" => {
-                Some(SoccerNeuralBlendMode::Authoritative)
-            }
-            _ => None,
-        }
-    })
-}
-
 fn live_server_config_from_lookup<F>(lookup: F) -> SoccerLiveServerConfig
 where
     F: Fn(&str) -> Option<String>,
@@ -230,69 +205,6 @@ where
         "SOCCER_NEURAL_LEARNING_BACKEND",
     ) {
         cfg.match_config.neural_learning.backend = backend;
-    }
-    if let Some(mode) = env_neural_blend_mode(
-        &lookup,
-        "SOCCER_LIVE_NEURAL_BLEND_MODE",
-        "SOCCER_NEURAL_BLEND_MODE",
-    ) {
-        cfg.match_config.neural_blend.mode = mode;
-    }
-    if let Some(lambda) = env_positive_f64(
-        &lookup,
-        "SOCCER_LIVE_NEURAL_BLEND_LAMBDA",
-        "SOCCER_NEURAL_BLEND_LAMBDA",
-    ) {
-        cfg.match_config.neural_blend.lambda = lambda;
-    }
-    if let Some(warmup_steps) = env_nonnegative_usize(
-        &lookup,
-        "SOCCER_LIVE_NEURAL_BLEND_WARMUP_STEPS",
-        "SOCCER_NEURAL_BLEND_WARMUP_STEPS",
-    ) {
-        cfg.match_config.neural_blend.warmup_steps = warmup_steps;
-    }
-    if let Some(candidates) = env_positive_usize(
-        &lookup,
-        "SOCCER_LIVE_NEURAL_BLEND_CANDIDATES",
-        "SOCCER_NEURAL_BLEND_CANDIDATES",
-    ) {
-        cfg.match_config.neural_blend.candidates = candidates;
-    }
-    if let Some(actor_critic) = env_bool(
-        &lookup,
-        "SOCCER_LIVE_NEURAL_ACTOR_CRITIC",
-        "SOCCER_NEURAL_ACTOR_CRITIC",
-    ) {
-        cfg.match_config.neural_blend.actor_critic = actor_critic;
-    }
-    if let Some(mcts_enabled) = env_bool(
-        &lookup,
-        "SOCCER_LIVE_NEURAL_MCTS_ENABLED",
-        "SOCCER_NEURAL_MCTS_ENABLED",
-    ) {
-        cfg.match_config.neural_blend.mcts_enabled = mcts_enabled;
-    }
-    if let Some(mcts_simulations) = env_positive_usize(
-        &lookup,
-        "SOCCER_LIVE_NEURAL_MCTS_SIMULATIONS",
-        "SOCCER_NEURAL_MCTS_SIMULATIONS",
-    ) {
-        cfg.match_config.neural_blend.mcts_simulations = mcts_simulations;
-    }
-    if let Some(mcts_candidates) = env_positive_usize(
-        &lookup,
-        "SOCCER_LIVE_NEURAL_MCTS_CANDIDATES",
-        "SOCCER_NEURAL_MCTS_CANDIDATES",
-    ) {
-        cfg.match_config.neural_blend.mcts_candidates = mcts_candidates;
-    }
-    if let Some(mcts_depth) = env_positive_usize(
-        &lookup,
-        "SOCCER_LIVE_NEURAL_MCTS_DEPTH",
-        "SOCCER_NEURAL_MCTS_DEPTH",
-    ) {
-        cfg.match_config.neural_blend.mcts_depth = mcts_depth;
     }
     if let Some(adversarial_enabled) = env_bool(
         &lookup,
@@ -473,12 +385,6 @@ mod tests {
             ("SOCCER_LIVE_HTTP_WORKERS", "6"),
             ("SOCCER_LIVE_NEURAL_LEARNING_ENABLED", "1"),
             ("SOCCER_LIVE_NEURAL_LEARNING_BACKEND", "threaded"),
-            ("SOCCER_LIVE_NEURAL_BLEND_MODE", "authoritative"),
-            ("SOCCER_LIVE_NEURAL_BLEND_LAMBDA", "1.25"),
-            ("SOCCER_LIVE_NEURAL_BLEND_WARMUP_STEPS", "0"),
-            ("SOCCER_LIVE_NEURAL_BLEND_CANDIDATES", "12"),
-            ("SOCCER_LIVE_NEURAL_ACTOR_CRITIC", "1"),
-            ("SOCCER_LIVE_NEURAL_MCTS_ENABLED", "0"),
             ("SOCCER_LIVE_ADVERSARIAL_EMBEDDING_ENABLED", "yes"),
             ("SOCCER_LIVE_POLICY_AUTOLOAD_MAX_BYTES", "123456"),
         ]);
@@ -497,15 +403,6 @@ mod tests {
             cfg.match_config.neural_learning.backend,
             SoccerNeuralLearningBackend::Threaded
         );
-        assert_eq!(
-            cfg.match_config.neural_blend.mode,
-            SoccerNeuralBlendMode::Authoritative
-        );
-        assert_eq!(cfg.match_config.neural_blend.lambda, 1.25);
-        assert_eq!(cfg.match_config.neural_blend.warmup_steps, 0);
-        assert_eq!(cfg.match_config.neural_blend.candidates, 12);
-        assert!(cfg.match_config.neural_blend.actor_critic);
-        assert!(!cfg.match_config.neural_blend.mcts_enabled);
         assert!(cfg.match_config.adversarial_embedding_exploitation_enabled);
     }
 

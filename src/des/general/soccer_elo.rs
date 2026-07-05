@@ -31,16 +31,8 @@ pub const ELO_DEFAULT_K: f64 = 24.0;
 /// probability plus half its draw probability, in `(0, 1)`. Symmetric:
 /// `expected(a, b) + expected(b, a) == 1`.
 pub fn elo_expected_score(rating_a: f64, rating_b: f64) -> f64 {
-    let ra = if rating_a.is_finite() {
-        rating_a
-    } else {
-        ELO_DEFAULT_RATING
-    };
-    let rb = if rating_b.is_finite() {
-        rating_b
-    } else {
-        ELO_DEFAULT_RATING
-    };
+    let ra = if rating_a.is_finite() { rating_a } else { ELO_DEFAULT_RATING };
+    let rb = if rating_b.is_finite() { rating_b } else { ELO_DEFAULT_RATING };
     1.0 / (1.0 + 10.0_f64.powf((rb - ra) / 400.0))
 }
 
@@ -75,11 +67,7 @@ impl Default for EloRatings {
 
 impl EloRatings {
     pub fn new(k: f64) -> Self {
-        let k = if k.is_finite() && k > 0.0 {
-            k
-        } else {
-            ELO_DEFAULT_K
-        };
+        let k = if k.is_finite() && k > 0.0 { k } else { ELO_DEFAULT_K };
         EloRatings {
             ratings: BTreeMap::new(),
             k,
@@ -129,7 +117,8 @@ impl EloRatings {
     /// Ids ranked best-first by rating (ties broken by ascending id for
     /// determinism).
     pub fn ranked(&self) -> Vec<(usize, f64)> {
-        let mut ranked: Vec<(usize, f64)> = self.ratings.iter().map(|(&id, &r)| (id, r)).collect();
+        let mut ranked: Vec<(usize, f64)> =
+            self.ratings.iter().map(|(&id, &r)| (id, r)).collect();
         ranked.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -215,7 +204,11 @@ impl CrossPlayMatrix {
 
     /// All distinct competitor ids that appear in the matrix (sorted).
     pub fn ids(&self) -> Vec<usize> {
-        let mut ids: Vec<usize> = self.pairs.keys().flat_map(|&(a, b)| [a, b]).collect();
+        let mut ids: Vec<usize> = self
+            .pairs
+            .keys()
+            .flat_map(|&(a, b)| [a, b])
+            .collect();
         ids.sort_unstable();
         ids.dedup();
         ids
@@ -319,16 +312,8 @@ mod tests {
         ];
         let elo = EloRatings::from_match_reports(&reports, ELO_DEFAULT_K, 12);
         let ranked = elo.ranked();
-        assert_eq!(
-            ranked.first().unwrap().0,
-            1,
-            "the team that beat everyone leads"
-        );
-        assert_eq!(
-            ranked.last().unwrap().0,
-            4,
-            "the team that lost to everyone trails"
-        );
+        assert_eq!(ranked.first().unwrap().0, 1, "the team that beat everyone leads");
+        assert_eq!(ranked.last().unwrap().0, 4, "the team that lost to everyone trails");
         assert_eq!(elo.leader(), Some(1));
     }
 
@@ -356,10 +341,7 @@ mod tests {
             report(4, 1, 2, 0), // 4 beats 1
         ];
         let matrix = CrossPlayMatrix::from_match_reports(&reports);
-        assert!(
-            matrix.mean_payoff_vs_field(1).unwrap() > 0.5,
-            "1 is strong on average"
-        );
+        assert!(matrix.mean_payoff_vs_field(1).unwrap() > 0.5, "1 is strong on average");
         let (counter, payoff) = matrix.worst_case(1).unwrap();
         assert_eq!(counter, 4, "team 4 is the exploit");
         assert_eq!(payoff, 0.0, "1 loses to its counter every time");

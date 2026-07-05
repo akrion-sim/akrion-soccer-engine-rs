@@ -6,7 +6,7 @@
 
 use std::collections::{hash_map::DefaultHasher, BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -33,19 +33,15 @@ const SOCCER_NEURAL_MCTS_MAX_SIMULATIONS: usize = 32;
 const SOCCER_NEURAL_MCTS_MAX_CANDIDATES: usize = 8;
 const SOCCER_NEURAL_MCTS_MAX_DEPTH: usize = 3;
 const SOCCER_NEURAL_MCTS_MAX_EXPLORATION: f64 = 4.0;
-const SOCCER_MATCH_FITNESS_WINNER_WEIGHT: f64 = 0.55;
-const SOCCER_MATCH_FITNESS_QUALITY_WEIGHT: f64 = 1.25;
-const SOCCER_MATCH_FITNESS_DECISIVE_MARGIN_WEIGHT: f64 = 0.03;
-const SOCCER_MATCH_FITNESS_TURNOVER_RISK_WEIGHT: f64 = 1.50;
+const SOCCER_MATCH_FITNESS_WINNER_WEIGHT: f64 = 0.72;
+const SOCCER_MATCH_FITNESS_QUALITY_WEIGHT: f64 = 0.28;
+const SOCCER_MATCH_FITNESS_DECISIVE_MARGIN_WEIGHT: f64 = 0.06;
 const SOCCER_MATCH_FITNESS_MAX_DECISIVE_MARGIN: f64 = 6.0;
 const SOCCER_MATCH_FITNESS_MIN: f64 = -8.0;
 const SOCCER_MATCH_FITNESS_MAX: f64 = 12.0;
 const SOCCER_POLICY_PLATEAU_FITNESS_SPREAD: f64 = 0.075;
 const SOCCER_POLICY_LOW_CEILING_FITNESS: f64 = 1.50;
 const SOCCER_POLICY_SEARCH_MAX_ADAPTED_POPULATION: usize = 128;
-const SOCCER_POLICY_SEARCH_MAX_ADAPTED_POPULATION_ENV: &str =
-    "SOCCER_POLICY_SEARCH_MAX_ADAPTED_POPULATION";
-static SOCCER_POLICY_SEARCH_MAX_ADAPTED_POPULATION_OVERRIDE: OnceLock<usize> = OnceLock::new();
 const SOCCER_POLICY_NOVELTY_MAX_STATES: usize = 256;
 const SOCCER_POLICY_NOVELTY_MAX_ACTIONS_PER_STATE: usize = 3;
 const SOCCER_POLICY_NOVELTY_VISIT_WEIGHT_MAX: f64 = 3.0;
@@ -644,7 +640,7 @@ impl Default for SoccerPolicyPromotionGateConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            min_sample_games: 8,
+            min_sample_games: 1,
             min_mean_match_fitness: -0.25,
             min_best_match_fitness: 0.0,
             min_mean_play_quality: 0.0,
@@ -1051,40 +1047,6 @@ pub fn validate_soccer_neural_blend_config_for_learning_run(
 
 fn soccer_evolution_population_size_for_learning_run(population_size: usize) -> usize {
     population_size.clamp(1, SOCCER_EVOLUTION_MAX_POPULATION_SIZE)
-}
-
-fn parse_soccer_policy_search_max_adapted_population(raw: Option<&str>) -> Result<usize, String> {
-    let Some(raw) = raw else {
-        return Ok(SOCCER_POLICY_SEARCH_MAX_ADAPTED_POPULATION);
-    };
-    let trimmed = raw.trim();
-    let parsed = trimmed.parse::<usize>().map_err(|_| {
-        format!(
-            "{SOCCER_POLICY_SEARCH_MAX_ADAPTED_POPULATION_ENV} must be a positive integer, got {raw:?}"
-        )
-    })?;
-    if parsed == 0 {
-        return Err(format!(
-            "{SOCCER_POLICY_SEARCH_MAX_ADAPTED_POPULATION_ENV} must be a positive integer, got {raw:?}"
-        ));
-    }
-    Ok(parsed.min(SOCCER_EVOLUTION_MAX_POPULATION_SIZE))
-}
-
-fn soccer_policy_search_max_adapted_population() -> usize {
-    *SOCCER_POLICY_SEARCH_MAX_ADAPTED_POPULATION_OVERRIDE.get_or_init(|| {
-        let raw = std::env::var(SOCCER_POLICY_SEARCH_MAX_ADAPTED_POPULATION_ENV).ok();
-        match parse_soccer_policy_search_max_adapted_population(raw.as_deref()) {
-            Ok(value) => value,
-            Err(err) => {
-                eprintln!(
-                    "soccer-learning: {err}; using default {}",
-                    SOCCER_POLICY_SEARCH_MAX_ADAPTED_POPULATION
-                );
-                SOCCER_POLICY_SEARCH_MAX_ADAPTED_POPULATION
-            }
-        }
-    })
 }
 
 fn normalize_soccer_evolution_options_for_learning_search(
@@ -1743,41 +1705,6 @@ pub fn soccer_learning_from_micros(value: i64) -> f64 {
 }
 
 pub const SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION: f64 = 0.25;
-const SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION_ENV: &str =
-    "SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION";
-static SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION_OVERRIDE: OnceLock<f64> = OnceLock::new();
-
-fn parse_soccer_policy_active_max_fitness_regression(raw: Option<&str>) -> Result<f64, String> {
-    let Some(raw) = raw else {
-        return Ok(SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION);
-    };
-    let trimmed = raw.trim();
-    let parsed = trimmed.parse::<f64>().map_err(|_| {
-        format!("{SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION_ENV} must be a finite non-negative number, got {raw:?}")
-    })?;
-    if !parsed.is_finite() || parsed < 0.0 {
-        return Err(format!(
-            "{SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION_ENV} must be a finite non-negative number, got {raw:?}"
-        ));
-    }
-    Ok(parsed)
-}
-
-pub fn soccer_policy_active_max_fitness_regression() -> f64 {
-    *SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION_OVERRIDE.get_or_init(|| {
-        let raw = std::env::var(SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION_ENV).ok();
-        match parse_soccer_policy_active_max_fitness_regression(raw.as_deref()) {
-            Ok(value) => value,
-            Err(err) => {
-                eprintln!(
-                    "soccer-learning: {err}; using default {}",
-                    SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION
-                );
-                SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION
-            }
-        }
-    })
-}
 
 pub fn soccer_policy_version_insert_status_after_active_head(
     requested_status: &'static str,
@@ -1828,20 +1755,15 @@ pub fn soccer_learning_run_score(summary: &MatchSummary) -> SoccerLearningRunSco
     // of generations. Both this branch and origin fixed it convergently; we keep origin's
     // principled structure — the WINNER's (non-cancelling) goal-diff fitness, plus a
     // normalised both-teams play-quality term (now enriched with the proxies for "more goals":
-    // goals, shots on target, assists, completed crosses, worked chances, and forward
-    // progression), minus the pass-risk behaviours that were making newer neural checkpoints
-    // look acceptable while recycling backward into pressure. This is intentionally a neural
-    // promotion score now: a win still matters, but dense action quality has enough weight to
-    // guide local-best rollback and checkpoint selection between noisy short self-play games.
+    // assists, completed crosses, consecutive forward passes — see
+    // `soccer_learning_team_play_quality`), plus a decisive-margin bonus, all bounded.
     let winner_fitness = home.fitness.max(away.fitness);
     let play_quality = soccer_learning_match_play_quality(summary);
-    let turnover_risk = soccer_learning_match_turnover_risk(summary);
     let decisive_margin = (summary.score_home as i32 - summary.score_away as i32).abs() as f64;
     let match_fitness = (winner_fitness * SOCCER_MATCH_FITNESS_WINNER_WEIGHT
         + play_quality * SOCCER_MATCH_FITNESS_QUALITY_WEIGHT
         + decisive_margin.min(SOCCER_MATCH_FITNESS_MAX_DECISIVE_MARGIN)
-            * SOCCER_MATCH_FITNESS_DECISIVE_MARGIN_WEIGHT
-        - turnover_risk * SOCCER_MATCH_FITNESS_TURNOVER_RISK_WEIGHT)
+            * SOCCER_MATCH_FITNESS_DECISIVE_MARGIN_WEIGHT)
         .clamp(SOCCER_MATCH_FITNESS_MIN, SOCCER_MATCH_FITNESS_MAX);
     SoccerLearningRunScore {
         home,
@@ -1890,34 +1812,9 @@ pub fn soccer_learning_team_score(
 }
 
 fn soccer_learning_match_play_quality(summary: &MatchSummary) -> f64 {
-    let raw = (soccer_learning_team_play_quality(Team::Home, summary)
+    (soccer_learning_team_play_quality(Team::Home, summary)
         + soccer_learning_team_play_quality(Team::Away, summary))
-        * 0.5;
-    (raw - soccer_learning_match_turnover_risk(summary) * 0.35).clamp(0.0, 1.0)
-}
-
-fn soccer_learning_match_turnover_risk(summary: &MatchSummary) -> f64 {
-    let stats = &summary.stats;
-    let backward_completed = stats
-        .passes_completed_backward_home
-        .saturating_add(stats.passes_completed_backward_away);
-    let chain_losses = stats
-        .pass_chains_net_loss_home
-        .saturating_add(stats.pass_chains_net_loss_away);
-
-    let backward_recycling_risk = soccer_learning_bounded_count(backward_completed, 32.0) * 0.18;
-    let own_half_interception_risk =
-        soccer_learning_bounded_count(stats.pass_interceptions_own_half, 6.0) * 0.25
-            + soccer_learning_bounded_count(stats.pass_interceptions_own_half, 24.0) * 0.35;
-    let opp_half_interception_risk =
-        soccer_learning_bounded_count(stats.pass_interceptions_opp_half, 8.0) * 0.16;
-    let chain_loss_risk = soccer_learning_bounded_count(chain_losses, 10.0) * 0.20;
-
-    (backward_recycling_risk
-        + own_half_interception_risk
-        + opp_half_interception_risk
-        + chain_loss_risk)
-        .clamp(0.0, 1.0)
+        * 0.5
 }
 
 fn soccer_learning_team_play_quality(team: Team, summary: &MatchSummary) -> f64 {
@@ -1926,7 +1823,6 @@ fn soccer_learning_team_play_quality(team: Team, summary: &MatchSummary) -> f64 
         pass_attempts,
         pass_completed,
         forward_completed,
-        backward_completed,
         shots,
         shots_on_target,
         dribble_beats,
@@ -1943,7 +1839,6 @@ fn soccer_learning_team_play_quality(team: Team, summary: &MatchSummary) -> f64 
             stats.passes_attempted_home,
             stats.passes_completed_home,
             stats.passes_completed_forward_home,
-            stats.passes_completed_backward_home,
             stats.shots_home,
             stats.shots_on_target_home,
             stats.dribble_beats_home,
@@ -1960,7 +1855,6 @@ fn soccer_learning_team_play_quality(team: Team, summary: &MatchSummary) -> f64 
             stats.passes_attempted_away,
             stats.passes_completed_away,
             stats.passes_completed_forward_away,
-            stats.passes_completed_backward_away,
             stats.shots_away,
             stats.shots_on_target_away,
             stats.dribble_beats_away,
@@ -1977,11 +1871,6 @@ fn soccer_learning_team_play_quality(team: Team, summary: &MatchSummary) -> f64 
     let pass_volume = soccer_learning_bounded_count(pass_attempts, 60.0);
     let pass_completion = soccer_learning_ratio(pass_completed, pass_attempts);
     let forward_share = soccer_learning_ratio(forward_completed, pass_completed);
-    let goals_scored = match team {
-        Team::Home => summary.score_home,
-        Team::Away => summary.score_away,
-    };
-    let goal_quality = soccer_learning_bounded_count(goals_scored, 4.0);
     let shot_volume = soccer_learning_bounded_count(shots, 12.0);
     let shot_accuracy = soccer_learning_ratio(shots_on_target, shots);
     let dribble_quality = soccer_learning_bounded_count(dribble_beats, 8.0);
@@ -1997,25 +1886,20 @@ fn soccer_learning_team_play_quality(team: Team, summary: &MatchSummary) -> f64 
     let chain_forward = soccer_learning_bounded_metric(chain_forward_yards, 120.0);
     let chain_backward_penalty = soccer_learning_bounded_count(chains_net_loss, 10.0);
     let chain_progress_quality = (chain_forward - chain_backward_penalty * 0.5).clamp(0.0, 1.0);
-    let backward_completion_penalty = soccer_learning_bounded_count(backward_completed, 18.0);
-    let productive_completion =
-        pass_completion * (0.30 + forward_share * 0.50 + chain_progress_quality * 0.20);
 
-    (pass_volume * 0.005
-        + productive_completion * 0.07
-        + forward_share * 0.06
-        + goal_quality * 0.30
-        + shot_volume * 0.15
-        + shot_accuracy * 0.22
-        + dribble_quality * 0.04
+    (pass_volume * 0.05
+        + pass_completion * 0.20
+        + forward_share * 0.10
+        + shot_volume * 0.08
+        + shot_accuracy * 0.13
+        + dribble_quality * 0.05
         + recovery_quality * 0.04
-        + upfield_quality * 0.07
-        + near_ball_quality * 0.02
-        + assist_quality * 0.10
+        + upfield_quality * 0.08
+        + near_ball_quality * 0.03
+        + assist_quality * 0.09
         + cross_quality * 0.03
-        + worked_chance_quality * 0.12
-        + chain_progress_quality * 0.02
-        - backward_completion_penalty * 0.10)
+        + worked_chance_quality * 0.04
+        + chain_progress_quality * 0.08)
         .clamp(0.0, 1.0)
 }
 
@@ -2485,7 +2369,7 @@ pub fn adapt_soccer_evolution_options_for_policy_search(
         let cap = options
             .population_size
             .saturating_mul(3)
-            .min(soccer_policy_search_max_adapted_population());
+            .min(SOCCER_POLICY_SEARCH_MAX_ADAPTED_POPULATION);
         options.population_size = options
             .population_size
             .saturating_add(extra_candidates)
@@ -3763,8 +3647,7 @@ fn search_soccer_tactical_strategy_candidates<F>(
         balanced_shape.attack_flank_lane_weight += attack_flank_gap * 0.34 + attack_pressure * 0.12;
         balanced_shape.attack_spacing_delta_weight += attack_spacing_gap * 0.07 * shape_pressure;
         balanced_shape.goal_entry_pass_learning_weight += attack_pressure * 0.08;
-        balanced_shape.pressure_release_learning_weight +=
-            attack_spacing_gap * 0.05 * shape_pressure;
+        balanced_shape.pressure_release_learning_weight += attack_spacing_gap * 0.05 * shape_pressure;
         balanced_shape.pass_target_ranking_learning_weight +=
             attack_width_gap.max(attack_flank_gap) * 0.07;
         balanced_shape.defense_contract_delta_weight +=
@@ -4523,15 +4406,14 @@ fn clamp_soccer_tactical_learning_weights(
     clamped.attack_width_delta_weight = clamped.attack_width_delta_weight.max(0.0).min(2.2);
     clamped.attack_width_score_weight = clamped.attack_width_score_weight.max(0.0).min(1.2);
     clamped.attack_flank_lane_weight = clamped.attack_flank_lane_weight.max(0.0).min(2.2);
-    clamped.shot_choice_learning_weight = clamped.shot_choice_learning_weight.max(0.0).min(2.0);
+    clamped.shot_choice_learning_weight =
+        clamped.shot_choice_learning_weight.max(0.0).min(2.0);
     clamped.goal_entry_pass_learning_weight =
         clamped.goal_entry_pass_learning_weight.max(0.0).min(2.0);
     clamped.pressure_release_learning_weight =
         clamped.pressure_release_learning_weight.max(0.0).min(2.0);
-    clamped.pass_target_ranking_learning_weight = clamped
-        .pass_target_ranking_learning_weight
-        .max(0.0)
-        .min(2.0);
+    clamped.pass_target_ranking_learning_weight =
+        clamped.pass_target_ranking_learning_weight.max(0.0).min(2.0);
     clamped.defense_spacing_delta_weight = clamped.defense_spacing_delta_weight.max(0.0).min(1.8);
     clamped.defense_spacing_score_weight = clamped.defense_spacing_score_weight.max(0.0).min(1.2);
     clamped.defense_contract_delta_weight = clamped.defense_contract_delta_weight.max(0.0).min(2.4);
@@ -4550,10 +4432,8 @@ fn clamp_soccer_tactical_learning_weights(
     clamped.defender_midfielder_press_weight =
         clamped.defender_midfielder_press_weight.max(0.0).min(1.6);
     clamped.midfielder_press_weight = clamped.midfielder_press_weight.max(0.0).min(1.6);
-    clamped.defensive_line_press_learning_weight = clamped
-        .defensive_line_press_learning_weight
-        .max(0.0)
-        .min(2.0);
+    clamped.defensive_line_press_learning_weight =
+        clamped.defensive_line_press_learning_weight.max(0.0).min(2.0);
     clamped.formation_lp_alignment_weight =
         clamped.formation_lp_alignment_weight.max(-5.0).min(5.0);
     clamped
@@ -4580,7 +4460,9 @@ fn soccer_tactical_weight_search_score(
         + weights.attack_spacing_delta_weight * attack_spacing_gap * 0.85
         + weights.attack_spacing_score_weight * attack_spacing_gap * 0.35
         + weights.shot_choice_learning_weight * attack_decision_gap * 0.10
-        + weights.goal_entry_pass_learning_weight * attack_width_gap.max(attack_flank_gap) * 0.18
+        + weights.goal_entry_pass_learning_weight
+            * attack_width_gap.max(attack_flank_gap)
+            * 0.18
         + weights.pressure_release_learning_weight
             * (attack_spacing_gap * 0.50 + press_gap * 0.50)
             * 0.14
@@ -6043,32 +5925,6 @@ mod tests {
     }
 
     #[test]
-    fn policy_search_adapted_population_cap_parser_validates_positive_values() {
-        assert_eq!(
-            parse_soccer_policy_search_max_adapted_population(None).unwrap(),
-            SOCCER_POLICY_SEARCH_MAX_ADAPTED_POPULATION
-        );
-        assert_eq!(
-            parse_soccer_policy_search_max_adapted_population(Some("12")).unwrap(),
-            12
-        );
-        assert!(parse_soccer_policy_search_max_adapted_population(Some("0")).is_err());
-        assert!(parse_soccer_policy_search_max_adapted_population(Some("nope")).is_err());
-    }
-
-    #[test]
-    fn policy_search_adapted_population_respects_process_cap() {
-        let base = SoccerEvolutionOptions {
-            population_size: 16,
-            ..SoccerEvolutionOptions::default()
-        };
-        let pressure = 1.0;
-        let adapted = adapt_soccer_evolution_options_for_policy_search(base, pressure);
-
-        assert!(adapted.population_size <= soccer_policy_search_max_adapted_population());
-    }
-
-    #[test]
     fn policy_plateau_novelty_injects_missing_sibling_actions() {
         let policy = policy_with_home_actions(&[("pass", 1.0, 6)]);
         let mut action_accumulators = BTreeMap::<PolicyEntryKey, MergeAccumulator>::new();
@@ -6366,11 +6222,6 @@ mod tests {
     #[test]
     fn promotion_gate_uses_quality_and_sample_floor_before_activation() {
         use crate::des::general::soccer::MatchStats;
-
-        assert_eq!(
-            SoccerPolicyPromotionGateConfig::default().min_sample_games,
-            8
-        );
 
         let mut strong_stats = MatchStats::default();
         strong_stats.shots_home = 8;
@@ -6940,25 +6791,6 @@ mod tests {
             soccer_team_q_policies_fingerprint(&policy),
             soccer_team_q_policies_fingerprint(&updated_policy)
         );
-    }
-
-    #[test]
-    fn active_max_fitness_regression_env_parser_defaults_and_validates() {
-        assert_eq!(
-            parse_soccer_policy_active_max_fitness_regression(None).unwrap(),
-            SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION
-        );
-        assert_eq!(
-            parse_soccer_policy_active_max_fitness_regression(Some("0")).unwrap(),
-            0.0
-        );
-        assert_eq!(
-            parse_soccer_policy_active_max_fitness_regression(Some("0.1")).unwrap(),
-            0.1
-        );
-        assert!(parse_soccer_policy_active_max_fitness_regression(Some("-0.1")).is_err());
-        assert!(parse_soccer_policy_active_max_fitness_regression(Some("NaN")).is_err());
-        assert!(parse_soccer_policy_active_max_fitness_regression(Some("abc")).is_err());
     }
 
     #[test]
@@ -7601,9 +7433,7 @@ mod tests {
         assert!(evolved.shot_choice_learning_weight > base.shot_choice_learning_weight);
         assert!(evolved.goal_entry_pass_learning_weight > base.goal_entry_pass_learning_weight);
         assert!(evolved.pressure_release_learning_weight > base.pressure_release_learning_weight);
-        assert!(
-            evolved.pass_target_ranking_learning_weight > base.pass_target_ranking_learning_weight
-        );
+        assert!(evolved.pass_target_ranking_learning_weight > base.pass_target_ranking_learning_weight);
         assert!(
             evolved.defensive_line_press_learning_weight
                 > base.defensive_line_press_learning_weight
@@ -8586,128 +8416,6 @@ mod tests {
         assert!(
             fitness(&worked) > fitness(&scrappy),
             "same scoreline: more chance-creation/progression must rank higher"
-        );
-    }
-
-    #[test]
-    fn play_quality_prioritizes_goals_and_shots_over_pass_chain_farming() {
-        let mut incisive_stats = MatchStats::default();
-        incisive_stats.passes_attempted_home = 16;
-        incisive_stats.passes_completed_home = 10;
-        incisive_stats.passes_completed_forward_home = 6;
-        incisive_stats.shots_home = 6;
-        incisive_stats.shots_on_target_home = 4;
-        incisive_stats.shots_after_pass_home = 2;
-        let incisive = MatchSummary {
-            score_home: 2,
-            score_away: 0,
-            ticks: 100,
-            simulated_seconds: 90.0,
-            stats: incisive_stats,
-        };
-
-        let mut sterile_stats = MatchStats::default();
-        sterile_stats.passes_attempted_home = 60;
-        sterile_stats.passes_completed_home = 54;
-        sterile_stats.passes_completed_forward_home = 45;
-        sterile_stats.pass_chain_gain_yards_home = 160.0;
-        let sterile = MatchSummary {
-            score_home: 0,
-            score_away: 0,
-            ticks: 100,
-            simulated_seconds: 90.0,
-            stats: sterile_stats,
-        };
-
-        let incisive_quality = soccer_learning_team_play_quality(Team::Home, &incisive);
-        let sterile_quality = soccer_learning_team_play_quality(Team::Home, &sterile);
-        assert!(
-            incisive_quality > sterile_quality,
-            "goals and shots-on-target should outrank sterile pass chains: incisive={incisive_quality}, sterile={sterile_quality}"
-        );
-
-        let mut backward_stats = MatchStats::default();
-        backward_stats.passes_attempted_home = 60;
-        backward_stats.passes_completed_home = 54;
-        backward_stats.passes_completed_forward_home = 0;
-        backward_stats.passes_completed_backward_home = 54;
-        backward_stats.pass_chains_net_loss_home = 8;
-        backward_stats.pass_chain_gain_yards_home = -42.0;
-        let backward = MatchSummary {
-            score_home: 0,
-            score_away: 0,
-            ticks: 100,
-            simulated_seconds: 90.0,
-            stats: backward_stats,
-        };
-        let backward_quality = soccer_learning_team_play_quality(Team::Home, &backward);
-        assert!(
-            backward_quality < sterile_quality,
-            "net-backward pass farming should be worse than sterile forward possession: backward={backward_quality}, sterile={sterile_quality}"
-        );
-    }
-
-    #[test]
-    fn match_fitness_penalizes_backward_recycling_and_own_half_interceptions() {
-        let mut clean_stats = MatchStats::default();
-        clean_stats.passes_attempted_home = 30;
-        clean_stats.passes_attempted_away = 30;
-        clean_stats.passes_completed_home = 20;
-        clean_stats.passes_completed_away = 20;
-        clean_stats.passes_completed_forward_home = 12;
-        clean_stats.passes_completed_forward_away = 12;
-        clean_stats.shots_home = 5;
-        clean_stats.shots_away = 5;
-        clean_stats.shots_on_target_home = 3;
-        clean_stats.shots_on_target_away = 3;
-        clean_stats.shots_after_pass_home = 2;
-        clean_stats.shots_after_pass_away = 2;
-        let clean = MatchSummary {
-            score_home: 1,
-            score_away: 1,
-            ticks: 100,
-            simulated_seconds: 90.0,
-            stats: clean_stats,
-        };
-
-        let mut risky_stats = clean.stats.clone();
-        risky_stats.passes_completed_backward_home = 32;
-        risky_stats.passes_completed_backward_away = 32;
-        risky_stats.pass_interceptions_own_half = 6;
-        risky_stats.pass_interceptions_opp_half = 4;
-        risky_stats.pass_chains_net_loss_home = 6;
-        risky_stats.pass_chains_net_loss_away = 6;
-        risky_stats.pass_chain_gain_yards_home = -24.0;
-        risky_stats.pass_chain_gain_yards_away = -24.0;
-        let risky = MatchSummary {
-            stats: risky_stats,
-            ..clean.clone()
-        };
-
-        let clean_quality = soccer_learning_match_play_quality(&clean);
-        let risky_quality = soccer_learning_match_play_quality(&risky);
-        assert!(
-            clean_quality > risky_quality + 0.20,
-            "own-half interceptions and backward recycling must lower play quality: clean={clean_quality}, risky={risky_quality}"
-        );
-
-        let clean_fitness = soccer_learning_run_score(&clean).match_fitness;
-        let risky_fitness = soccer_learning_run_score(&risky).match_fitness;
-        assert!(
-            clean_fitness > risky_fitness + 0.80,
-            "same scoreline must prefer the safer, more progressive policy: clean={clean_fitness}, risky={risky_fitness}"
-        );
-
-        let mut severe_stats = risky.stats.clone();
-        severe_stats.pass_interceptions_own_half = 24;
-        let severe = MatchSummary {
-            stats: severe_stats,
-            ..risky
-        };
-        let severe_fitness = soccer_learning_run_score(&severe).match_fitness;
-        assert!(
-            risky_fitness > severe_fitness + 0.25,
-            "own-half interception risk must keep worsening beyond the first few turnovers: risky={risky_fitness}, severe={severe_fitness}"
         );
     }
 }

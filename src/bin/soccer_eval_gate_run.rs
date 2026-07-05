@@ -25,12 +25,12 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use soccer_engine::des::general::soccer::SoccerMatch;
 use soccer_engine::des::general::soccer::{
     enable_deterministic_formation_lp, MatchConfig, SoccerMarlAlgorithm,
     SoccerNeuralLearningBackend, SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot,
     SoccerQPolicyOptions, SoccerTeamQPolicies, DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
 };
+use soccer_engine::des::general::soccer::SoccerMatch;
 use soccer_engine::des::general::soccer_eval_gate::{evaluate_promotion, PromotionThresholds};
 use soccer_engine::des::general::tournament::{
     EngineMatchRunner, EngineMatchRunnerConfig, MatchReport, TeamBrain, TournamentMatchContext,
@@ -90,10 +90,11 @@ fn train_candidate_snapshot(
     snapshot
 }
 
-/// Load a candidate/champion neural snapshot directly from a local `learned-params.json`
-/// artifact (the fully-local learner's durable policy file), via an env var pointing at the path.
-/// Lets the gate score the REAL accumulated local policy against the frozen field instead of only
-/// an inline-trained-from-fresh one. The artifact embeds the snapshot under the `neuralNetwork` key.
+/// Load a candidate neural snapshot directly from a local `learned-params.json`
+/// artifact (the fully-local learner's durable policy file), via `SOCCER_EVAL_CANDIDATE_PATH`.
+/// This lets the gate score the REAL accumulated local policy against the frozen field
+/// (a held-out climb number over time) instead of only an inline-trained-from-fresh one.
+/// The learned-params artifact embeds the snapshot under the `neuralNetwork` key.
 fn snapshot_from_env_file(var: &str) -> Option<SoccerNeuralNetworkSnapshot> {
     let path = std::env::var(var).ok()?;
     let raw = match std::fs::read_to_string(&path) {
@@ -181,8 +182,9 @@ fn main() {
          train_games={train_games} holdout_seed_base=0x{holdout_seed_base:08X}"
     );
 
-    // Candidate brain (id 0): prefer a local learned-params file (the fully-local learner's
-    // accumulated policy) when SOCCER_EVAL_CANDIDATE_PATH is set; otherwise inline self-play train.
+    // Candidate brain (id 0): prefer a local learned-params file (the fully-local
+    // learner's accumulated policy) when SOCCER_EVAL_CANDIDATE_PATH is set; otherwise
+    // fall back to inline self-play training (the original behaviour). Then FROZEN for the gate.
     let candidate_snapshot = snapshot_from_env_file("SOCCER_EVAL_CANDIDATE_PATH")
         .or_else(|| train_candidate_snapshot(train_games, minutes, train_seed_base));
     let candidate_brain = match candidate_snapshot {
@@ -193,22 +195,24 @@ fn main() {
     // Frozen field (ids 1..pool): distinct-genome fresh brains, the incumbent +
     // diverse opponents the candidate must beat without being countered.
     let mut pool: Vec<TeamBrain> = (1..pool_size)
-        .map(|id| {
-            TeamBrain::fresh_with_seed(0xF0_0000u32.wrapping_add(id as u32 * 2_654_435_761), id)
-        })
+        .map(|id| TeamBrain::fresh_with_seed(0xF0_0000u32.wrapping_add(id as u32 * 2_654_435_761), id))
         .collect();
-    // SOCCER_EVAL_BASELINE_PATH: replace the incumbent (id 1 == pool[0]) with a champion loaded
-    // from a local learned-params file, making the fixtures a direct candidate-vs-champion gate.
+    // Champion-gate: when SOCCER_EVAL_BASELINE_PATH is set, replace the incumbent
+    // (id 1 == pool[0]) with the champion loaded from a local learned-params file, so
+    // the held-out fixtures become a direct candidate-vs-champion comparison (the
+    // monotone promotion gate) instead of candidate-vs-fresh.
     if let Some(snapshot) = snapshot_from_env_file("SOCCER_EVAL_BASELINE_PATH") {
         if let Some(first) = pool.first_mut() {
             *first = TeamBrain::from_snapshot(snapshot);
             eprintln!("eval_baseline_replaced_with_champion id={baseline_id}");
         }
     }
-    // SOCCER_EVAL_ANALYTIC_FIELD=1: strip the net from every pool opponent so they play PURE
-    // ANALYTIC (no net -> authoritative branch skipped -> the hand-built engine decides). The
-    // candidate keeps its net, so this is the honest "authoritative neural vs analytic" meter
-    // (the field's distinct genomes still give diverse analytic styles).
+    // SOCCER_EVAL_ANALYTIC_FIELD=1: strip the net from every pool opponent so they play
+    // PURE ANALYTIC (no net -> no prediction network -> the authoritative branch is skipped
+    // -> the hand-built analytic engine decides). The candidate keeps its net and, under
+    // DD_SOCCER_NEURAL_AUTHORITATIVE_LAMBDA>0, is the ONLY authoritative-neural side. This is
+    // the honest "authoritative neural net vs the analytic engine" measurement (the field's
+    // distinct genomes still give diverse analytic styles).
     if std::env::var("SOCCER_EVAL_ANALYTIC_FIELD")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
@@ -221,12 +225,17 @@ fn main() {
 
     let mut runner_config = EngineMatchRunnerConfig::default();
     runner_config.base.duration_seconds = minutes * 60.0;
+    // Keep the engine's designed independent-brain mode (actor_critic=false, default):
+    // each side is driven by its OWN per-team CRITIC — which is exactly what league play
+    // trains. (Setting actor_critic=true shares the policy_head/actor across teams and
+    // BLURS which brain is better, per the runner's own docs.) The eval is policy-sensitive
+    // through the per-team critic; comparisons must be between DIFFERENT-lineage nets.
     let runner = EngineMatchRunner::new(runner_config);
 
     let started = Instant::now();
 
-    // Pre-build every fixture with the SAME sequential seeds/order as the old serial loop, so
-    // parallel results are byte-identical (each match is independent + deterministic).
+    // Pre-build every fixture with the SAME sequential seeds/order as the old serial loop,
+    // so parallel results are byte-identical (each match is independent + deterministic).
     struct Fixture {
         index: usize,
         opponent_idx: usize,
@@ -255,9 +264,9 @@ fn main() {
         }
     }
 
-    // Run fixtures on a bounded thread pool — each worker clones the runner and pulls the next
-    // fixture off a shared atomic cursor. Capped low (default 3, override SOCCER_EVAL_PARALLELISM)
-    // so we don't starve a co-running trainer.
+    // Run fixtures on a bounded thread pool — each worker clones the runner and pulls the
+    // next fixture off a shared atomic cursor. Capped low (default 3, override via
+    // SOCCER_EVAL_PARALLELISM) so we don't starve the on-policy trainer / co-train learner.
     let workers = std::env::var("SOCCER_EVAL_PARALLELISM")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
@@ -342,21 +351,14 @@ fn main() {
     );
     println!(
         "cross-play: mean payoff vs field {:?}  vs baseline {:?}  worst-case {:?}",
-        verdict
-            .mean_payoff_vs_field
-            .map(|p| (p * 1000.0).round() / 1000.0),
-        verdict
-            .payoff_vs_baseline
-            .map(|p| (p * 1000.0).round() / 1000.0),
+        verdict.mean_payoff_vs_field.map(|p| (p * 1000.0).round() / 1000.0),
+        verdict.payoff_vs_baseline.map(|p| (p * 1000.0).round() / 1000.0),
         verdict
             .worst_case
             .map(|(o, p)| (o, (p * 1000.0).round() / 1000.0)),
     );
     println!("Wilson lower bound: {:.3}", verdict.wilson_lower_bound);
-    println!(
-        "\nDECISION: {}",
-        if verdict.promote { "PROMOTE" } else { "REJECT" }
-    );
+    println!("\nDECISION: {}", if verdict.promote { "PROMOTE" } else { "REJECT" });
     for reason in &verdict.reasons {
         println!("  - {reason}");
     }

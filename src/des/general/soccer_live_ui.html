@@ -910,7 +910,6 @@ const LIVE_STEP_INTERVAL_MS = 67;
 // keep the two in sync. Normally dt comes from the backend (state.config.dtSeconds).
 const FALLBACK_DT_SECONDS = 1 / 15;
 const LIVE_DEFAULT_TICKS_PER_PULSE = 1;
-const LIVE_MAX_INTERPOLATION_FRAMES_PER_STEP = 30;
 const LIVE_INPUT_FLUSH_INTERVAL_MS = 33;
 const LIVE_INPUT_RETRY_MIN_MS = 120;
 const LIVE_INPUT_RETRY_MAX_MS = 1000;
@@ -3512,7 +3511,7 @@ function drawBall(ball, r) {
   ctx.restore();
 }
 // --- Smooth 60fps field rendering via entity interpolation -------------------
-// Server frames arrive at ~15Hz (LIVE_STEP_INTERVAL_MS) and the /api/step
+// Server frames arrive at ~10Hz (LIVE_STEP_INTERVAL_MS) and the /api/step
 // round-trip drops that further over a network, so drawing those discrete frames
 // directly is choppy. Instead a requestAnimationFrame loop draws the field at the
 // display refresh rate, lerping each entity's position between the previous and
@@ -5657,12 +5656,9 @@ async function stepOnce(options = {}) {
         lastAutoPulseAt = 0; // a manual single-step breaks the wall-clock chain
       }
       try {
-        const recordEveryTicks = ticksThisPulse <= LIVE_MAX_INTERPOLATION_FRAMES_PER_STEP
-          ? 1
-          : Math.ceil(ticksThisPulse / LIVE_MAX_INTERPOLATION_FRAMES_PER_STEP);
         response = await postSoccerJson("/api/step", {
           ticks: ticksThisPulse,
-          recordEveryTicks,
+          recordEveryTicks: Math.max(1, ticksThisPulse),
           inputs
         }, "step");
       } catch (err) {
@@ -5685,10 +5681,6 @@ async function stepOnce(options = {}) {
     if (!options.injectedResponse && incomingTick + 0.5 < currentTick) {
       return;
     }
-    const responseFrames = Array.isArray(response.frames) && response.frames.length
-      ? response.frames
-      : [response.frame];
-    responseFrames.forEach(registerFrameForInterpolation);
     state = {
       config: state.config,
       frame: response.frame,
@@ -5756,7 +5748,10 @@ async function stepOnce(options = {}) {
     recentLearningTransitions = Array.isArray(response.learningTransitions)
       ? response.learningTransitions
       : [];
-    rememberSemanticBallActionsFromFrames(responseFrames);
+    const semanticFrames = Array.isArray(response.frames) && response.frames.length
+      ? response.frames
+      : [response.frame];
+    rememberSemanticBallActionsFromFrames(semanticFrames);
     rememberSemanticBallActionsFromTransitions(recentLearningTransitions);
     applyAssignmentsToFrame(state.controllerAssignments);
     if (assignmentKey(state.controllerAssignments) !== beforeAssignments) {

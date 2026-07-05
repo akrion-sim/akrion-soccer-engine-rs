@@ -265,11 +265,7 @@ impl GoalSideRecoveryHead {
                 self.training_steps += 1;
             }
         }
-        let mean = if applied > 0 {
-            total / applied as f64
-        } else {
-            0.0
-        };
+        let mean = if applied > 0 { total / applied as f64 } else { 0.0 };
         self.last_loss = Some(mean);
         mean
     }
@@ -319,11 +315,7 @@ impl GoalSideRecoveryHead {
                 self.training_steps += 1;
             }
         }
-        let mean = if applied > 0 {
-            total / applied as f64
-        } else {
-            0.0
-        };
+        let mean = if applied > 0 { total / applied as f64 } else { 0.0 };
         self.last_loss = Some(mean);
         mean
     }
@@ -392,10 +384,7 @@ impl WorldSnapshot {
             Team::Home => 0.0,
             Team::Away => self.field_length,
         };
-        Vec2 {
-            x: self.field_width * 0.5,
-            y,
-        }
+        Vec2 { x: self.field_width * 0.5, y }
     }
 
     /// Build the [`GoalSideRecoveryInputs`] for a recovering `player` whose depth-guarded target
@@ -457,7 +446,8 @@ impl WorldSnapshot {
         let nearest_opp_at_hold = self.nearest_opponent_distance_at(player.team, me_pos);
         let width_hold_value = (1.0 - (nearest_opp_at_hold / 12.0).clamp(0.0, 1.0)).clamp(0.0, 1.0);
 
-        let ball_danger = (1.0 - (ball_depth / (self.field_length * 0.5).max(1.0))).clamp(0.0, 1.0);
+        let ball_danger = (1.0 - (ball_depth / (self.field_length * 0.5).max(1.0)))
+            .clamp(0.0, 1.0);
 
         Some(GoalSideRecoveryInputs {
             goal_side_quality: q,
@@ -559,21 +549,21 @@ impl SoccerMatch {
             if self.pending_goal_side_recovery[i].due_tick <= tick {
                 let decision = self.pending_goal_side_recovery.swap_remove(i);
                 let now_territorial = territorial_advantage(snapshot, decision.team);
-                let territorial_delta =
-                    if now_territorial.is_finite() && decision.decision_territorial.is_finite() {
-                        now_territorial - decision.decision_territorial
-                    } else {
-                        0.0
-                    };
+                let territorial_delta = if now_territorial.is_finite()
+                    && decision.decision_territorial.is_finite()
+                {
+                    now_territorial - decision.decision_territorial
+                } else {
+                    0.0
+                };
                 let reward = decision.reward_accum
                     + GOAL_SIDE_RECOVERY_TERRITORIAL_SHAPING_WEIGHT * territorial_delta;
                 if reward.is_finite() {
-                    self.goal_side_recovery_samples
-                        .push(GoalSideRecoverySample {
-                            inputs: decision.inputs,
-                            action_bias: decision.action_bias,
-                            reward,
-                        });
+                    self.goal_side_recovery_samples.push(GoalSideRecoverySample {
+                        inputs: decision.inputs,
+                        action_bias: decision.action_bias,
+                        reward,
+                    });
                     if self.goal_side_recovery_samples.len() > GOAL_SIDE_RECOVERY_SAMPLE_CAP {
                         let overflow =
                             self.goal_side_recovery_samples.len() - GOAL_SIDE_RECOVERY_SAMPLE_CAP;
@@ -730,16 +720,8 @@ mod goal_side_recovery_tests {
         let samples: Vec<GoalSideRecoverySample> = (0..32)
             .flat_map(|_| {
                 [
-                    GoalSideRecoverySample {
-                        inputs: inputs.clone(),
-                        action_bias: 0.8,
-                        reward: 1.0,
-                    },
-                    GoalSideRecoverySample {
-                        inputs: inputs.clone(),
-                        action_bias: -0.8,
-                        reward: -1.0,
-                    },
+                    GoalSideRecoverySample { inputs: inputs.clone(), action_bias: 0.8, reward: 1.0 },
+                    GoalSideRecoverySample { inputs: inputs.clone(), action_bias: -0.8, reward: -1.0 },
                 ]
             })
             .collect();
@@ -749,10 +731,7 @@ mod goal_side_recovery_tests {
         }
         let after = head.predict(&inputs).expect("finite");
         assert!(last.is_finite());
-        assert!(
-            after > before && after > 0.0,
-            "RWR should move toward the high-reward action"
-        );
+        assert!(after > before && after > 0.0, "RWR should move toward the high-reward action");
     }
 
     #[test]

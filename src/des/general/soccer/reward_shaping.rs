@@ -147,10 +147,7 @@ mod tests {
             assert_eq!(disciplined_gamma(), REWARD_SHAPING_DEFAULT_GAMMA);
             // A held potential now telescopes to a small time cost instead of 0.
             let hold = potential_based_shaping(disciplined_gamma(), 0.09, 0.09);
-            assert!(
-                hold < 0.0 && hold > -0.01,
-                "holding a state has a tiny γ time-cost: {hold}"
-            );
+            assert!(hold < 0.0 && hold > -0.01, "holding a state has a tiny γ time-cost: {hold}");
         });
     }
 
@@ -159,11 +156,7 @@ mod tests {
         with_discipline(|| {
             assert_eq!(apply_dense_shaping_budget(50.0, 6.0), 6.0);
             assert_eq!(apply_dense_shaping_budget(-50.0, 6.0), -6.0);
-            assert_eq!(
-                apply_dense_shaping_budget(2.0, 6.0),
-                2.0,
-                "within budget ⇒ untouched"
-            );
+            assert_eq!(apply_dense_shaping_budget(2.0, 6.0), 2.0, "within budget ⇒ untouched");
             // A non-positive / non-finite budget disables the cap (still on).
             assert_eq!(apply_dense_shaping_budget(50.0, 0.0), 50.0);
             assert_eq!(apply_dense_shaping_budget(50.0, f64::INFINITY), 50.0);
@@ -196,10 +189,7 @@ mod tests {
             .windows(2)
             .map(|w| potential_based_shaping(1.0, w[0], w[1]))
             .sum();
-        assert!(
-            total.abs() < 1e-12,
-            "returning trajectory must net to zero, got {total}"
-        );
+        assert!(total.abs() < 1e-12, "returning trajectory must net to zero, got {total}");
     }
 
     #[test]

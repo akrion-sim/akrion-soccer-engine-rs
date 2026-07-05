@@ -295,8 +295,9 @@ fn run_with_defaults(defaults: &SoccerRunDefaults) {
         .to_lowercase();
     let mip_time_limit_ms = env_f64("MIP_TIME_LIMIT_MS", 30_000.0);
     let mip_max_nodes = env_usize("MIP_MAX_NODES", 5_000);
-    let mip_lp_algorithm =
-        parse_lp_algorithm(&std::env::var("MIP_LP_ALGO").unwrap_or_else(|_| "auto".to_string()));
+    let mip_lp_algorithm = parse_lp_algorithm(
+        &std::env::var("MIP_LP_ALGO").unwrap_or_else(|_| "auto".to_string()),
+    );
     let mip_allow_external_solvers = env_bool("MIP_ALLOW_EXTERNAL_SOLVERS", true);
 
     // Roster / match shape (all overridable so the same model serves 11-, 12-,
