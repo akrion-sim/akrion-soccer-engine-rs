@@ -1428,6 +1428,51 @@ fn soccer_standardize_sample_targets(samples: &mut [SoccerNeuralTrainingSample],
 mod tests {
     use super::*;
 
+    #[test]
+    fn standardize_targets_yields_zero_mean_unit_variance_and_preserves_order() {
+        let mk = |t: f64| SoccerNeuralTrainingSample {
+            input: [0.0; SOCCER_NEURAL_FEATURE_DIM],
+            target: t,
+            priority: 1.0,
+        };
+        // Targets clustered near a small constant — the collapse regime the fix targets.
+        let raw = [
+            0.041, 0.043, 0.038, 0.050, 0.045, 0.039, 0.047, 0.042, 0.044, 0.040,
+        ];
+        let mut samples: Vec<SoccerNeuralTrainingSample> = raw.iter().map(|&t| mk(t)).collect();
+        soccer_standardize_sample_targets(&mut samples, 13.0);
+        let n = samples.len() as f64;
+        let mean = samples.iter().map(|s| s.target).sum::<f64>() / n;
+        let var = samples.iter().map(|s| (s.target - mean).powi(2)).sum::<f64>() / n;
+        assert!(mean.abs() < 1e-9, "standardized mean ≈ 0, got {mean}");
+        assert!((var - 1.0).abs() < 1e-6, "standardized variance ≈ 1, got {var}");
+        // Ranking invariance: the largest raw target (idx 3 = 0.050) stays largest.
+        assert!(
+            samples[3].target > samples[2].target && samples[3].target > samples[0].target,
+            "affine rescale preserves relative order"
+        );
+    }
+
+    #[test]
+    fn standardize_targets_noop_for_small_or_degenerate_batches() {
+        let mk = |t: f64| SoccerNeuralTrainingSample {
+            input: [0.0; SOCCER_NEURAL_FEATURE_DIM],
+            target: t,
+            priority: 1.0,
+        };
+        // Small batch (<8): untouched (per-batch stats too noisy to trust).
+        let mut small: Vec<SoccerNeuralTrainingSample> = (0..5).map(|i| mk(i as f64)).collect();
+        soccer_standardize_sample_targets(&mut small, 13.0);
+        assert_eq!(small[4].target, 4.0, "small batch left unchanged");
+        // Degenerate (all equal ⇒ std 0): untouched, no divide-by-zero blowup.
+        let mut flat: Vec<SoccerNeuralTrainingSample> = (0..10).map(|_| mk(0.044)).collect();
+        soccer_standardize_sample_targets(&mut flat, 13.0);
+        assert!(
+            flat.iter().all(|s| (s.target - 0.044).abs() < 1e-12),
+            "zero-variance batch left unchanged"
+        );
+    }
+
     fn pass_role_risk_test_quality(
         expected_completion: f64,
         lane_interception_risk: f64,
