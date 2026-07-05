@@ -6586,7 +6586,7 @@ impl SoccerMatch {
         let target_scale = self.config.neural_learning.sanitized_target_scale();
         let target_clip = self.config.neural_learning.sanitized_target_clip();
         let tick_rewards = soccer_marl_tick_rewards(transitions);
-        transitions
+        let mut samples: Vec<SoccerNeuralTrainingSample> = transitions
             .iter()
             .filter(|transition| team_filter.map_or(true, |team| transition.team == team))
             .filter_map(|transition| {
