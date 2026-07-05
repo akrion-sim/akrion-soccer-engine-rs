@@ -6716,7 +6716,7 @@ impl SoccerMatch {
                     adjusted_reward += novelty_coef / ((1 + count) as f64).sqrt();
                 }
                 let next_state = SoccerQStateKey::from_next_transition(transition);
-                let (gamma, max_next) = self
+                let (gamma, tabular_max_next) = self
                     .team_policies
                     .as_ref()
                     .map(|policies| {
