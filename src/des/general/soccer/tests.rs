@@ -57916,9 +57916,9 @@ fn route_one_reward_values_territorial_gain_from_own_half() {
         "gained={gained_reward}, sideways={sideways_reward}"
     );
     assert!(
-            opponent_high_reward > 1.2,
-            "opponent winning far upfield should not be treated as an own-half giveaway: {opponent_high_reward}"
-        );
+        opponent_high_reward < 0.0,
+        "opponent winning a route-one ball is still a turnover, not a success: {opponent_high_reward}"
+    );
 }
 
 #[test]
@@ -58058,8 +58058,17 @@ fn pressure_and_own_half_make_clearance_and_route_one_legal_choices() {
         .iter()
         .find(|option| option.label == "clearance")
         .expect("calm clearance option");
+    let calm_route_one = calm_options
+        .iter()
+        .find(|option| option.label == "route-one")
+        .expect("calm route-one option");
     assert!(!calm_clearance.legal);
     assert_eq!(calm_clearance.probability, 0.0);
+    assert!(
+        !calm_route_one.legal,
+        "route-one should need pressure, a vertical runner, or poor outlets"
+    );
+    assert_eq!(calm_route_one.probability, 0.0);
 }
 
 #[test]

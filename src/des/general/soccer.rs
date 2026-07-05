@@ -22832,15 +22832,15 @@ fn intentional_long_ball_loss_penalty(
         "route-one" => {
             let penalty = if ball_forward >= 30.0 {
                 if loose_ball {
-                    0.10
+                    0.42
                 } else {
-                    0.48
+                    1.18
                 }
             } else if ball_forward >= 15.0 {
                 if loose_ball {
-                    0.30
+                    0.62
                 } else {
-                    0.86
+                    1.36
                 }
             } else if own_half_holder {
                 if loose_ball {
@@ -22905,15 +22905,28 @@ fn intentional_long_ball_release_reward(
                 - if from_own_half { 0.0 } else { 0.45 }
         }
         "route-one" => {
-            let overload_bonus = before_obs.attacking_overload_score.clamp(0.0, 1.0) * 0.42;
-            let territory_reward = ball_forward.clamp(-12.0, 65.0) * 0.052;
-            let own_half_bonus = if from_own_half { 0.34 } else { -0.55 };
-            let half_cross_bonus = if after_in_opponent_half { 0.48 } else { 0.0 };
-            let opponent_recovery_penalty = if after_possession == Some(player.team.other()) {
-                if ball_forward >= 30.0 {
+            let overload_bonus = before_obs.attacking_overload_score.clamp(0.0, 1.0) * 0.34;
+            let territory_reward = ball_forward.clamp(-12.0, 65.0) * 0.038;
+            let pressure_relief_bonus = pressure * 0.22 + defensive_third * 0.18;
+            let own_half_bonus = if from_own_half {
+                0.14 + pressure_relief_bonus
+            } else {
+                -0.55
+            };
+            let half_cross_bonus = if after_in_opponent_half {
+                if after_possession == Some(player.team.other()) {
                     0.10
                 } else {
-                    0.58
+                    0.36
+                }
+            } else {
+                0.0
+            };
+            let opponent_recovery_penalty = if after_possession == Some(player.team.other()) {
+                if ball_forward >= 30.0 {
+                    1.85
+                } else {
+                    1.18
                 }
             } else {
                 0.0
@@ -25031,6 +25044,9 @@ fn dense_soccer_transition_reward(
     let attack_dir = player.team.attack_dir();
     let ball_forward = (after.ball.position.y - before.ball.position.y) * attack_dir;
     let player_forward = (after_pos.y - before_pos.y) * attack_dir;
+    let lost_untargeted_long_ball_to_opponent = before.ball.holder == Some(player.id)
+        && is_untargeted_long_ball_action(action)
+        && after_possession == Some(player.team.other());
     let mut reward = 0.0;
     reward += soccer_decision_option_control_reward(decision);
     if player.role != PlayerRole::Goalkeeper && !before_obs.has_ball {
@@ -25521,17 +25537,21 @@ fn dense_soccer_transition_reward(
                 reward_cfg.giveaway_to_loose_opp_half_penalty
             });
         }
-        reward += ball_forward.clamp(-8.0, 14.0) * 0.15;
-        if own_half_holder {
-            reward += ball_forward.clamp(-8.0, 16.0) * 0.11;
-            if ball_forward < -1.25 && before_obs.perceived_pressure < 0.25 {
-                reward -= 2.0;
-            }
-            if is_pass_like_action(action)
-                && ball_forward < -1.25
-                && before_obs.perceived_pressure < 0.35
-            {
-                reward -= 1.7;
+        if lost_untargeted_long_ball_to_opponent {
+            reward -= 0.35 + (ball_forward.max(0.0) / 50.0).clamp(0.0, 1.0) * 0.55;
+        } else {
+            reward += ball_forward.clamp(-8.0, 14.0) * 0.15;
+            if own_half_holder {
+                reward += ball_forward.clamp(-8.0, 16.0) * 0.11;
+                if ball_forward < -1.25 && before_obs.perceived_pressure < 0.25 {
+                    reward -= 2.0;
+                }
+                if is_pass_like_action(action)
+                    && ball_forward < -1.25
+                    && before_obs.perceived_pressure < 0.35
+                {
+                    reward -= 1.7;
+                }
             }
         }
         if is_pass_like_action(action) {
@@ -25595,7 +25615,14 @@ fn dense_soccer_transition_reward(
             ball_forward,
             own_goal_relief,
         );
-        reward += (before_obs.yards_to_goal - after_obs.yards_to_goal).clamp(-8.0, 8.0) * 0.07;
+        if lost_untargeted_long_ball_to_opponent {
+            reward -= (before_obs.yards_to_goal - after_obs.yards_to_goal)
+                .max(0.0)
+                .clamp(0.0, 8.0)
+                * 0.03;
+        } else {
+            reward += (before_obs.yards_to_goal - after_obs.yards_to_goal).clamp(-8.0, 8.0) * 0.07;
+        }
         // Shot-distance discipline pivoting on 20yd: reward shooting from inside 20yd (rising as
         // the shooter nears goal) and penalise shooting from outside it (escalating with distance,
         // up to the hard 30yd cap). The outside penalty is relieved when the keeper is genuinely

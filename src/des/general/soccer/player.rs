@@ -5079,17 +5079,43 @@ impl PlayerAgent {
             PlayerRole::Midfielder => 0.72,
             PlayerRole::Forward => 0.24,
         };
-        let route_one_legal = own_half;
+        let route_one_pressure_signal = pressure_urgency
+            .max(pressure)
+            .max(observation.immediate_dispossession_risk)
+            .max(excessive_hold_pressure(observation, dribbling))
+            .clamp(0.0, 1.0);
+        let route_one_attack_signal = observation.attacking_overload_score.clamp(0.0, 1.0);
+        let route_one_runner_signal =
+            ((observation.aerial_forward_runner_pass_multiplier - 1.0) / 0.50).clamp(0.0, 1.0);
+        let route_one_low_outlets = pass_target_count == 0
+            || (pass_target_count <= 1 && observation.expected_pass_completion < 0.38)
+            || observation.expected_pass_completion < 0.28;
+        let route_one_vertical_window = route_one_attack_signal >= 0.42
+            || (route_one_runner_signal >= 0.38
+                && observation.expected_aerial_pass_completion >= 0.30);
+        let route_one_release_need = route_one_pressure_signal >= 0.30
+            || (defensive_urgency >= 0.40 && route_one_pressure_signal >= 0.18)
+            || (route_one_low_outlets && route_one_pressure_signal >= 0.14);
+        let route_one_proximity_gate = observation.nearest_opponent_distance <= 24.0
+            || observation.immediate_dispossession_risk >= 0.45
+            || defensive_urgency >= 0.52
+            || observation.yards_to_own_goal <= 24.0
+            || route_one_vertical_window;
+        let route_one_legal = own_half
+            && route_one_proximity_gate
+            && (route_one_release_need || route_one_vertical_window);
         let route_one_score = ((0.05
             + directive.risk_tolerance * 0.12
             + passing * 0.12
-            + defensive_urgency * 0.22
-            + excessive_hold_pressure(observation, dribbling) * 0.18
-            + observation.attacking_overload_score.clamp(0.0, 1.0) * 0.22
+            + defensive_urgency * 0.18
+            + route_one_pressure_signal * 0.20
+            + route_one_attack_signal * 0.24
+            + route_one_runner_signal * 0.18
             + (1.0 - observation.expected_pass_completion.clamp(0.0, 1.0)) * 0.10
             + (1.0 - (pass_target_count as f64 / 3.0).clamp(0.0, 1.0)) * 0.08)
             * route_one_role_bias
-            * hold_release_multiplier)
+            * hold_release_multiplier
+            * (0.58 + route_one_pressure_signal * 0.24 + route_one_attack_signal * 0.18))
             .clamp(0.02, 1.12);
         options.push(AgentActionOptionTrace::new(
             "clearance",
