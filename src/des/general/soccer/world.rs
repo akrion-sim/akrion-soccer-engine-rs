@@ -21,8 +21,8 @@ const TURNOVER_DANGER_OUTCOME_LOOKAHEAD_TICKS: u64 = 120;
 const TURNOVER_DANGER_OUTCOME_PROGRESS_YARDS: f64 = 30.0;
 const TURNOVER_DANGER_OUTCOME_EXTRA_MULTIPLIER: f64 = 1.0;
 const DEFENSIVE_SHOT_ON_TARGET_HISTORY_ACTIONS: usize = 36;
-const DEFENSIVE_SHOT_ON_TARGET_MAX_PENALTY: f64 = 0.95;
-const DEFENSIVE_SHOT_ON_TARGET_MIN_PENALTY: f64 = 0.18;
+const DEFENSIVE_SHOT_ON_TARGET_MAX_PENALTY: f64 = 2.65;
+const DEFENSIVE_SHOT_ON_TARGET_MIN_PENALTY: f64 = 0.50;
 const SOCCER_POLICY_RANK_SALT_TEAM_TABULAR: u64 = 0x5445_414d_5441_4255;
 const SOCCER_POLICY_RANK_SALT_SHARED_TABULAR: u64 = 0x5348_4152_5441_4255;
 const SOCCER_POLICY_RANK_SALT_TEAM_NEURAL: u64 = 0x5445_414d_4e45_5552;
@@ -2492,6 +2492,10 @@ mod tests {
         assert!(
             defender_penalty < goalkeeper_penalty,
             "defenders should receive stronger shot-on-target blame than keepers: defender={defender_penalty}, keeper={goalkeeper_penalty}"
+        );
+        assert!(
+            defender_penalty <= -2.0,
+            "conceded shots on target need a material defensive learning signal, got {defender_penalty}"
         );
     }
 
