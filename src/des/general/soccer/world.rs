@@ -13,6 +13,10 @@ const LEARNED_MPC_REPLAN_CANDIDATES: usize = 8;
 const LEARNED_MPC_PASS_IMPOSSIBLE_PROBABILITY: f64 = 0.06;
 const LEARNED_MPC_DRIBBLE_IMPOSSIBLE_PROBABILITY: f64 = 0.06;
 const LEARNED_MPC_SHOT_IMPOSSIBLE_PROBABILITY: f64 = 0.04;
+const LEARNED_MPC_SOFT_REPLAN_MIN_ORIGINAL_PROBABILITY: f64 = 0.08;
+const LEARNED_MPC_SOFT_REPLAN_MAX_ORIGINAL_PROBABILITY: f64 = 0.55;
+const LEARNED_MPC_SOFT_REPLAN_MIN_REPLACEMENT_PROBABILITY: f64 = 0.68;
+const LEARNED_MPC_SOFT_REPLAN_MIN_IMPROVEMENT: f64 = 0.22;
 const LEARNED_MPC_REJECTED_ACTION_PENALTY_POINTS: f64 = 2.5;
 const LEARNED_TARGET_GRID_MIN_VISITS: u32 = 1;
 const GAIT_PHYSICS_STAND_SPEED_YPS: f64 = 0.25;
@@ -2342,6 +2346,65 @@ mod tests {
     }
 
     #[test]
+    fn soft_learned_mpc_replan_trains_toward_planner_replacement() {
+        let sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let player = snapshot
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home field player");
+        let state = snapshot.mdp_state_for_player(player.id);
+        let observation = snapshot.observation_for(player.id);
+        let mut realized = SoccerLearningTransition {
+            tick: snapshot.tick,
+            player_id: player.id,
+            team: player.team,
+            role: player.role,
+            state: state.clone(),
+            observation: observation.clone(),
+            belief: belief_from_observation(&observation),
+            action: "defend-shape".to_string(),
+            action_target: None,
+            decision_context: soccer_decision_context_for(
+                player.id,
+                player.team,
+                "defend-shape",
+                None,
+                &snapshot,
+                &snapshot,
+            ),
+            tactical_trace: SoccerTacticalLearningTrace::default(),
+            reward: 0.0,
+            next_state: state,
+            next_observation: observation,
+            done: false,
+        };
+        realized.decision_context.learned_mpc_replanned = true;
+        realized.decision_context.learned_mpc_original_action = Some("press-cover".to_string());
+        realized.decision_context.learned_mpc_replacement_action =
+            Some("defend-shape".to_string());
+        realized
+            .decision_context
+            .learned_mpc_rejected_execution_probability =
+            LEARNED_MPC_SOFT_REPLAN_MIN_ORIGINAL_PROBABILITY;
+
+        assert!(
+            soccer_actor_policy_sample_allowed(&realized),
+            "soft planner-improvement replacements should train the actor toward the better MPC choice"
+        );
+
+        realized
+            .decision_context
+            .learned_mpc_rejected_execution_probability =
+            LEARNED_MPC_SOFT_REPLAN_MIN_ORIGINAL_PROBABILITY * 0.5;
+        assert!(
+            !soccer_actor_policy_sample_allowed(&realized),
+            "hard impossible-action fallbacks remain excluded from actor imitation"
+        );
+    }
+
+    #[test]
     fn keeper_policy_samples_skip_realized_mpc_fallback_replacements() {
         let sim = SoccerMatch::default_11v11(MatchConfig::default());
         let keeper = sim
@@ -2938,6 +3001,30 @@ mod tests {
     }
 
     #[test]
+    fn soft_mpc_replan_requires_material_execution_improvement() {
+        assert!(SoccerMatch::learned_plan_soft_mpc_replan_candidate(
+            "press-cover",
+            0.22,
+            0.72,
+        ));
+        assert!(!SoccerMatch::learned_plan_soft_mpc_replan_candidate(
+            "press-cover",
+            0.62,
+            0.90,
+        ));
+        assert!(!SoccerMatch::learned_plan_soft_mpc_replan_candidate(
+            "press-cover",
+            0.22,
+            0.38,
+        ));
+        assert!(!SoccerMatch::learned_plan_soft_mpc_replan_candidate(
+            "shoot",
+            0.22,
+            0.92,
+        ));
+    }
+
+    #[test]
     fn retrieved_action_priors_use_matching_whole_field_moment_shapes() {
         let mut sim = SoccerMatch::default_11v11(MatchConfig::live_gameplay());
         let frame = tracking_frame_from_match(&sim);
@@ -3231,6 +3318,18 @@ fn learned_mpc_rejected_action_counterexample(transition: &SoccerLearningTransit
 fn soccer_actor_policy_sample_allowed(transition: &SoccerLearningTransition) -> bool {
     !transition.decision_context.learned_mpc_replanned
         || learned_mpc_rejected_action_counterexample(transition)
+        || (transition
+            .decision_context
+            .learned_mpc_rejected_execution_probability
+            >= LEARNED_MPC_SOFT_REPLAN_MIN_ORIGINAL_PROBABILITY
+            && transition
+                .decision_context
+                .learned_mpc_original_action
+                .as_deref()
+                .is_some_and(|original| {
+                    normalize_soccer_action_label(original)
+                        != normalize_soccer_action_label(&transition.action)
+                }))
 }
 
 fn soccer_actor_advantage_tick_rewards(
@@ -6602,14 +6701,22 @@ impl SoccerMatch {
         player_id: usize,
         plan: SoccerLearnedPlan,
     ) -> SoccerLearnedPlan {
-        if !Self::learned_plan_needs_mpc_replan(snapshot, player_id, &plan) {
-            return plan;
-        }
         let original_action = normalize_soccer_action_label(&plan.action).to_string();
-        let rejected_execution_probability =
+        let original_execution_probability =
             Self::learned_plan_mpc_execution_probability(snapshot, player_id, &plan)
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0);
+        let hard_replan = Self::learned_plan_needs_mpc_replan(snapshot, player_id, &plan);
+        let soft_replan_eligible = !hard_replan
+            && !matches!(
+                original_action.as_str(),
+                "shoot" | "first-time-shot" | "first-time-header"
+            )
+            && original_execution_probability >= LEARNED_MPC_SOFT_REPLAN_MIN_ORIGINAL_PROBABILITY
+            && original_execution_probability <= LEARNED_MPC_SOFT_REPLAN_MAX_ORIGINAL_PROBABILITY;
+        if !hard_replan && !soft_replan_eligible {
+            return plan;
+        }
         let Some((_, ranked)) = policy.ranked_action_values_for_snapshot(
             snapshot,
             player_id,
@@ -6625,12 +6732,28 @@ impl SoccerMatch {
             candidate_count += 1;
             let mut candidate_plan =
                 Self::learned_plan_for_policy(policy, snapshot, player_id, candidate.label.clone());
-            if !Self::learned_plan_needs_mpc_replan(snapshot, player_id, &candidate_plan) {
+            let candidate_hard_replan =
+                Self::learned_plan_needs_mpc_replan(snapshot, player_id, &candidate_plan);
+            let candidate_execution_probability =
+                Self::learned_plan_mpc_execution_probability(snapshot, player_id, &candidate_plan)
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0);
+            let candidate_is_replacement = if hard_replan {
+                !candidate_hard_replan
+            } else {
+                !candidate_hard_replan
+                    && Self::learned_plan_soft_mpc_replan_candidate(
+                        &original_action,
+                        original_execution_probability,
+                        candidate_execution_probability,
+                    )
+            };
+            if candidate_is_replacement {
                 candidate_plan.mpc_replan = Some(SoccerLearnedMpcReplanTrace {
                     original_action: original_action.clone(),
                     replacement_action: normalize_soccer_action_label(&candidate_plan.action)
                         .to_string(),
-                    rejected_execution_probability,
+                    rejected_execution_probability: original_execution_probability,
                     candidate_count,
                 });
                 return candidate_plan;
@@ -6659,6 +6782,26 @@ impl SoccerMatch {
         };
         Self::learned_plan_mpc_execution_probability(snapshot, player_id, plan)
             .is_some_and(|probability| probability < threshold)
+    }
+
+    fn learned_plan_soft_mpc_replan_candidate(
+        original_action: &str,
+        original_probability: f64,
+        candidate_probability: f64,
+    ) -> bool {
+        let original_action = normalize_soccer_action_label(original_action);
+        if matches!(
+            original_action,
+            "shoot" | "first-time-shot" | "first-time-header"
+        ) {
+            return false;
+        }
+        let original_probability = finite_unit_interval(original_probability);
+        let candidate_probability = finite_unit_interval(candidate_probability);
+        original_probability >= LEARNED_MPC_SOFT_REPLAN_MIN_ORIGINAL_PROBABILITY
+            && original_probability <= LEARNED_MPC_SOFT_REPLAN_MAX_ORIGINAL_PROBABILITY
+            && candidate_probability >= LEARNED_MPC_SOFT_REPLAN_MIN_REPLACEMENT_PROBABILITY
+            && candidate_probability - original_probability >= LEARNED_MPC_SOFT_REPLAN_MIN_IMPROVEMENT
     }
 
     fn learned_plan_mpc_execution_probability(
