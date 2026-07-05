@@ -4320,6 +4320,7 @@ mod tests {
             advantage: -0.5,
             old_action_probability: None,
             sample_weight: soccer_actor_priority_weight(&transition, -0.5),
+            mcts_distillation: false,
         };
 
         assert_eq!(
@@ -4344,6 +4345,7 @@ mod tests {
             advantage,
             old_action_probability: None,
             sample_weight,
+            mcts_distillation: sample_weight >= NEURAL_MCTS_DISTILLATION_PRIORITY_WEIGHT - 1e-9,
         };
         let mut samples = vec![
             sample(0.01, NEURAL_MCTS_DISTILLATION_PRIORITY_WEIGHT),
@@ -9455,6 +9457,8 @@ impl SoccerMatch {
                 };
                 let advantage =
                     soccer_actor_advantage_with_planner_distillation(transition, advantage);
+                let mcts_distillation =
+                    soccer_actor_mcts_distillation_priority(transition, advantage);
                 let sample_weight = soccer_actor_priority_weight(transition, advantage);
                 let state_features = self.policy_state_features(transition);
                 let actor_probability = self
@@ -9479,6 +9483,7 @@ impl SoccerMatch {
                     advantage,
                     old_action_probability,
                     sample_weight,
+                    mcts_distillation,
                 })
             })
             .collect();
@@ -9875,15 +9880,13 @@ impl SoccerMatch {
                 .sum();
             let mcts_distillation_samples = policy_samples
                 .iter()
-                .filter(|sample| {
-                    sample.sanitized_weight() >= NEURAL_MCTS_DISTILLATION_PRIORITY_WEIGHT - 1e-9
-                })
+                .filter(|sample| sample.mcts_distillation)
                 .count();
             let mcts_distillation_weight_sum: f64 = policy_samples
                 .iter()
                 .filter_map(|sample| {
                     let weight = sample.sanitized_weight();
-                    (weight >= NEURAL_MCTS_DISTILLATION_PRIORITY_WEIGHT - 1e-9).then_some(weight)
+                    sample.mcts_distillation.then_some(weight)
                 })
                 .sum();
             self.stats.policy_priority_samples = priority_samples.min(u32::MAX as usize) as u32;

@@ -38354,6 +38354,7 @@ struct SoccerPolicySample {
     advantage: f64,
     old_action_probability: Option<f64>,
     sample_weight: f64,
+    mcts_distillation: bool,
 }
 
 impl SoccerPolicySample {
