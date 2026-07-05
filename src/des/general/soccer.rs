@@ -21001,6 +21001,25 @@ pub(crate) fn dd_soccer_enable_target_standardization() -> bool {
     *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_TARGET_STANDARDIZATION"))
 }
 
+/// Env override for the neural-blend **candidate cap** — how many top tabular candidates the value
+/// net re-ranks per decision (the "action interface"). The default (4) bottlenecks even a perfectly
+/// un-collapsed value head to 4 tabular-selected actions, so it can match but not exceed a strong
+/// analytic engine. Widening it lets a discriminative value express a better policy over more
+/// options — the lever for the action-interface ceiling that sits *behind* the value collapse.
+/// `DD_SOCCER_NEURAL_BLEND_CANDIDATES` (clamped 2..=64) overrides the config value; unset ⇒ the
+/// config value is used unchanged (byte-identical).
+pub(crate) fn dd_soccer_neural_blend_candidates(config_value: usize) -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<Option<usize>> = OnceLock::new();
+    (*V.get_or_init(|| {
+        std::env::var("DD_SOCCER_NEURAL_BLEND_CANDIDATES")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .map(|n| n.clamp(2, 64))
+    }))
+    .unwrap_or(config_value)
+}
+
 /// Gate for interception-aware route-one / clearance training credit. OFF (the default) leaves the
 /// `soccer_goal_credit_transition_score` long-ball branch byte-identical to baseline, where a hoofed
 /// forward ball is credited purely on distance/pressure/urgency with NO interception or completion
