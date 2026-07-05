@@ -109,12 +109,18 @@ The neural value head is the **whole point** of this architecture, and remains s
 
 ## 7. Status & how to run
 
-- **Un-collapse: confirmed** (mechanistic — the readout weights grow, loss rises, baseline stays
-  flat).
-- **Eval climb above parity: under test.** Un-collapse is *necessary but not sufficient* — the
-  now-discriminative value must also learn the *correct* ordering. This is measured by held-out
-  evaluation vs the analytic engine (`SOCCER_EVAL_ANALYTIC_FIELD=1`), watching whether the
-  standardization arm pulls above ~0.55 with a Wilson lower bound > 0.5.
+- **Un-collapse: confirmed, via two independent routes.** (1) target standardization (this doc);
+  (2) **Bellman-terminal restore** (proper `r+γ·V(s')` bootstrapping instead of a done-flagged
+  whole-game MC return). Cross-checked on two machines: Bellman-restored nets show `mean|W_out|`
+  ≈0.20–0.25 (un-collapsed) while pre-Bellman/unnormalized nets sit at ≈0.005–0.01 (collapsed). The
+  DP-bootstrap sweep *alone* did **not** un-collapse — standardization or Bellman terminals is what
+  does it.
+- **Eval climb above parity: necessary-but-not-yet-confirmed-sufficient.** The now-discriminative
+  value must still learn the *correct* ordering. Measured by held-out eval vs the analytic engine
+  (`SOCCER_EVAL_ANALYTIC_FIELD=1`), bar = sustained above ~0.55 with Wilson lower bound > 0.5. Early
+  evidence is mixed-to-encouraging (an un-collapsed arm trended 0.49→0.60 as it trained past the
+  un-collapse) but not yet past the noise floor of 40-game evals — do not declare a climb on a
+  single lucky eval.
 
 ```
 # value-target standardization (the un-collapse fix)
