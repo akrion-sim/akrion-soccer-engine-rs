@@ -25,6 +25,13 @@ const NEURAL_MCTS_DISTILLATION_ADVANTAGE_NOISE_TOLERANCE: f64 = 0.12;
 const NEURAL_MCTS_DISTILLATION_MIN_REWARD: f64 = -0.05;
 const NEURAL_MCTS_PASS_TARGET_CANDIDATE_LIMIT: usize = 3;
 const NEURAL_MCTS_PASS_TARGET_CANDIDATE_LIMIT_MAX: usize = 11;
+const NEURAL_MCTS_KICK_POWER_CANDIDATE_LIMIT: usize = 4;
+const NEURAL_MCTS_KICK_POWER_CANDIDATE_LIMIT_MAX: usize = 5;
+const NEURAL_MCTS_MIN_DISCRETIZED_KICK_CANDIDATES: usize = 0;
+const NEURAL_VALUE_BOOTSTRAP_DEFAULT_WEIGHT: f64 = 0.45;
+const NEURAL_VALUE_BOOTSTRAP_MIN_TRAINING_STEPS: usize = 128;
+const NEURAL_MCTS_FLOOR_KICK_POWER_BUCKETS: [u8; 5] = [3, 5, 6, 7, 9];
+const NEURAL_MCTS_AERIAL_KICK_POWER_BUCKETS: [u8; 5] = [3, 5, 7, 8, 9];
 const SOCCER_ACTOR_DECISIVE_EVENT_PRIORITY_WEIGHT: f64 = 2.0;
 const SOCCER_ACTOR_NEGATIVE_OUTCOME_PRIORITY_WEIGHT: f64 = 1.6;
 const COMPLETED_PASS_LEARNING_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(5.0);
@@ -114,6 +121,73 @@ fn neural_mcts_pass_target_candidate_limit() -> usize {
             .filter(|value| *value > 0)
             .unwrap_or(NEURAL_MCTS_PASS_TARGET_CANDIDATE_LIMIT)
             .clamp(1, NEURAL_MCTS_PASS_TARGET_CANDIDATE_LIMIT_MAX)
+    })
+}
+
+fn neural_mcts_kick_power_candidate_limit() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("SOCCER_NEURAL_MCTS_KICK_POWER_CANDIDATES")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(NEURAL_MCTS_KICK_POWER_CANDIDATE_LIMIT)
+            .clamp(1, NEURAL_MCTS_KICK_POWER_CANDIDATE_LIMIT_MAX)
+    })
+}
+
+fn neural_mcts_min_discretized_kick_candidates() -> usize {
+    let read = || {
+        std::env::var("SOCCER_NEURAL_MCTS_MIN_DISCRETIZED_KICK_CANDIDATES")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .unwrap_or(NEURAL_MCTS_MIN_DISCRETIZED_KICK_CANDIDATES)
+            .clamp(0, NEURAL_MCTS_KICK_POWER_CANDIDATE_LIMIT_MAX)
+    };
+    #[cfg(test)]
+    {
+        read()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<usize> = OnceLock::new();
+        *V.get_or_init(read)
+    }
+}
+
+fn neural_value_bootstrap_weight() -> f64 {
+    #[cfg(test)]
+    {
+        if !soccer_env_flag_enabled("DD_SOCCER_ENABLE_NEURAL_VALUE_BOOTSTRAP") {
+            return 0.0;
+        }
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        if !*ENABLED.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_NEURAL_VALUE_BOOTSTRAP")) {
+            return 0.0;
+        }
+    }
+    learned_mpc_metric_env(
+        "SOCCER_NEURAL_VALUE_BOOTSTRAP_WEIGHT",
+        NEURAL_VALUE_BOOTSTRAP_DEFAULT_WEIGHT,
+        0.0,
+        1.0,
+    )
+}
+
+fn neural_value_bootstrap_min_training_steps() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("SOCCER_NEURAL_VALUE_BOOTSTRAP_MIN_TRAINING_STEPS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .unwrap_or(NEURAL_VALUE_BOOTSTRAP_MIN_TRAINING_STEPS)
     })
 }
 
@@ -3986,6 +4060,97 @@ mod tests {
     }
 
     #[test]
+    fn discretized_kick_gate_expands_pass_targets_into_power_bucket_candidates() {
+        let _env = set_test_env_var("DD_SOCCER_ENABLE_DISCRETIZED_KICK", "1");
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            learning_enabled: true,
+            ..MatchConfig::default()
+        });
+        let actor = sim
+            .players
+            .iter()
+            .position(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home field player");
+        let actor_id = sim.players[actor].id;
+        let actor_team = sim.players[actor].team;
+        let actor_role = sim.players[actor].role;
+        sim.players[actor].position = Vec2::new(40.0, 44.0);
+        sim.ball.holder = Some(actor_id);
+        sim.ball.position = sim.players[actor].position;
+
+        let target = sim
+            .players
+            .iter()
+            .position(|player| {
+                player.team == actor_team
+                    && player.id != actor_id
+                    && player.role != PlayerRole::Goalkeeper
+            })
+            .expect("same-team pass target");
+        sim.players[target].position = Vec2::new(46.0, 62.0);
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let observation = snapshot.observation_for(actor_id);
+        let mdp_state = snapshot.mdp_state_for_player(actor_id);
+        let base = sim.neural_decision_transition(
+            &snapshot,
+            actor_id,
+            actor_team,
+            actor_role,
+            &mdp_state,
+            &observation,
+        );
+
+        let expanded =
+            SoccerMatch::neural_mcts_pass_target_candidate_plans(&snapshot, actor_id, "pass");
+        assert!(
+            expanded.iter().any(|plan| plan.action == "pass1-kp3"),
+            "discretized kick gate should add a soft learned pass-power candidate"
+        );
+        assert!(
+            expanded.iter().any(|plan| plan.action == "pass1-kp7"),
+            "discretized kick gate should add a firm learned pass-power candidate"
+        );
+        let baseline = expanded
+            .iter()
+            .find(|plan| plan.action == "pass1")
+            .expect("baseline target-specific pass remains available");
+        let learned_bucket = expanded
+            .iter()
+            .find(|plan| plan.action == "pass1-kp7")
+            .expect("learned kick bucket candidate");
+        let scored_baseline = sim
+            .neural_decision_transition_for_plan(&base, &snapshot, actor_id, actor_team, baseline);
+        let scored_bucket = sim.neural_decision_transition_for_plan(
+            &base,
+            &snapshot,
+            actor_id,
+            actor_team,
+            learned_bucket,
+        );
+        assert_eq!(scored_bucket.action, "pass1-kp7");
+        assert_eq!(
+            learned_discretized_kick_speed_bucket_for_action_label(&scored_bucket.action),
+            Some(7)
+        );
+        assert!(
+            scored_bucket.decision_context.action_ball_speed_yps
+                > scored_baseline.decision_context.action_ball_speed_yps + 1e-6,
+            "candidate features should expose the learned kick speed, not only a label hash"
+        );
+        let (action, executed_label) = sim.players[actor]
+            .action_from_learned_plan(learned_bucket, &snapshot, &observation)
+            .expect("learned kick bucket pass should execute");
+        assert_eq!(executed_label, "pass1-kp7");
+        let SoccerAction::Pass { power, .. } = action else {
+            panic!("learned kick bucket should execute as a pass");
+        };
+        assert!(
+            (power - 0.75).abs() < 1e-9,
+            "execution must carry the selected discretized kick power bucket"
+        );
+    }
+
+    #[test]
     fn learned_plan_uses_policy_target_grid_for_concrete_target_points() {
         let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
         let actor = sim
@@ -4242,6 +4407,51 @@ mod tests {
                 .map(|choice| choice.label.as_str()),
             Some("pass")
         );
+    }
+
+    #[test]
+    fn neural_mcts_root_floor_keeps_discretized_kick_candidate() {
+        let _gate = set_test_env_var("DD_SOCCER_ENABLE_DISCRETIZED_KICK", "1");
+        let _floor = set_test_env_var("SOCCER_NEURAL_MCTS_MIN_DISCRETIZED_KICK_CANDIDATES", "1");
+        let candidates = vec![
+            SoccerNeuralMctsCandidate {
+                label: "shoot".to_string(),
+                plan: None,
+                score: 1.0,
+                prior: 0.5,
+                q_visits: 1,
+            },
+            SoccerNeuralMctsCandidate {
+                label: "pass".to_string(),
+                plan: None,
+                score: 0.9,
+                prior: 0.4,
+                q_visits: 1,
+            },
+            SoccerNeuralMctsCandidate {
+                label: "dribble".to_string(),
+                plan: None,
+                score: 0.8,
+                prior: 0.3,
+                q_visits: 1,
+            },
+            SoccerNeuralMctsCandidate {
+                label: "pass1-kp7".to_string(),
+                plan: None,
+                score: 0.1,
+                prior: 0.0,
+                q_visits: 1,
+            },
+        ];
+
+        let root = SoccerMatch::neural_mcts_root_candidates(&candidates, 3);
+        let labels = root
+            .iter()
+            .map(|candidate| candidate.label.as_str())
+            .collect::<Vec<_>>();
+        assert!(labels.contains(&"shoot"));
+        assert!(labels.contains(&"pass1-kp7"));
+        assert!(!labels.contains(&"dribble"));
     }
 
     #[test]
@@ -7575,13 +7785,45 @@ impl SoccerMatch {
             .into_iter()
             .take(limit)
             .enumerate()
-            .filter_map(|(index, target_player)| {
-                Some(SoccerLearnedPlan {
-                    action: format!("{}{}", prefix, index + 1),
+            .flat_map(|(index, target_player)| {
+                let base_action = format!("{}{}", prefix, index + 1);
+                let mut plans = Vec::with_capacity(
+                    1 + if dd_soccer_enable_discretized_kick() {
+                        neural_mcts_kick_power_candidate_limit()
+                    } else {
+                        0
+                    },
+                );
+                plans.push(SoccerLearnedPlan {
+                    action: base_action.clone(),
                     target_player: Some(target_player),
                     target_point: snapshot.player_position(target_player),
                     mpc_replan: None,
-                })
+                });
+                if dd_soccer_enable_discretized_kick() {
+                    let buckets = if prefix == "aerial-pass" {
+                        &NEURAL_MCTS_AERIAL_KICK_POWER_BUCKETS[..]
+                    } else {
+                        &NEURAL_MCTS_FLOOR_KICK_POWER_BUCKETS[..]
+                    };
+                    plans.extend(
+                        buckets
+                            .iter()
+                            .copied()
+                            .take(neural_mcts_kick_power_candidate_limit())
+                            .filter_map(|bucket| {
+                                learned_discretized_kick_candidate_label(&base_action, bucket).map(
+                                    |action| SoccerLearnedPlan {
+                                        action,
+                                        target_player: Some(target_player),
+                                        target_point: snapshot.player_position(target_player),
+                                        mpc_replan: None,
+                                    },
+                                )
+                            }),
+                    );
+                }
+                plans
             })
             .collect()
     }
@@ -7600,7 +7842,7 @@ impl SoccerMatch {
         }
         let simulations = blend.sanitized_mcts_simulations();
         let exploration = blend.sanitized_mcts_exploration();
-        let candidates = &candidates[..candidate_count];
+        let candidates = Self::neural_mcts_root_candidates(candidates, candidate_count);
         let min_score = candidates
             .iter()
             .map(|candidate| candidate.score)
@@ -7718,6 +7960,59 @@ impl SoccerMatch {
                 neural_mcts_selected: true,
             }
         })
+    }
+
+    fn neural_mcts_root_candidates(
+        candidates: &[SoccerNeuralMctsCandidate],
+        candidate_count: usize,
+    ) -> Vec<SoccerNeuralMctsCandidate> {
+        let candidate_count = candidate_count.min(candidates.len());
+        let mut root = candidates
+            .iter()
+            .take(candidate_count)
+            .cloned()
+            .collect::<Vec<_>>();
+        if candidate_count < 2 || !dd_soccer_enable_discretized_kick() {
+            return root;
+        }
+        let min_discretized = neural_mcts_min_discretized_kick_candidates().min(candidate_count);
+        if min_discretized == 0 {
+            return root;
+        }
+        let mut discretized_count = root
+            .iter()
+            .filter(|candidate| {
+                learned_discretized_kick_speed_bucket_for_action_label(&candidate.label).is_some()
+            })
+            .count();
+        for candidate in candidates.iter().skip(candidate_count) {
+            if discretized_count >= min_discretized {
+                break;
+            }
+            if learned_discretized_kick_speed_bucket_for_action_label(&candidate.label).is_none() {
+                continue;
+            }
+            if root.iter().any(|current| current.label == candidate.label) {
+                continue;
+            }
+            let Some(replace_index) = root.iter().enumerate().rev().find_map(|(index, current)| {
+                (index > 0
+                    && learned_discretized_kick_speed_bucket_for_action_label(&current.label)
+                        .is_none())
+                .then_some(index)
+            }) else {
+                break;
+            };
+            root[replace_index] = candidate.clone();
+            discretized_count += 1;
+        }
+        root.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.q_visits.cmp(&b.q_visits))
+                .then_with(|| a.label.cmp(&b.label))
+        });
+        root
     }
 
     fn neural_mcts_policy_improvement_replan(
@@ -9105,6 +9400,78 @@ impl SoccerMatch {
         interval <= 1 || self.is_done() || self.tick as usize % interval == 0
     }
 
+    fn neural_successor_indices(transitions: &[SoccerLearningTransition]) -> Vec<Option<usize>> {
+        let mut by_tick: std::collections::BTreeMap<u64, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (index, transition) in transitions.iter().enumerate() {
+            by_tick.entry(transition.tick).or_default().push(index);
+        }
+        let mut next_by_actor: std::collections::HashMap<(Team, usize), usize> =
+            std::collections::HashMap::new();
+        let mut successors = vec![None; transitions.len()];
+        for (_tick, indices) in by_tick.iter().rev() {
+            for &index in indices {
+                let transition = &transitions[index];
+                if let Some(&next_index) =
+                    next_by_actor.get(&(transition.team, transition.player_id))
+                {
+                    successors[index] = Some(next_index);
+                }
+            }
+            for &index in indices {
+                let transition = &transitions[index];
+                next_by_actor.insert((transition.team, transition.player_id), index);
+            }
+        }
+        successors
+    }
+
+    fn neural_successor_bootstrap_value(
+        &self,
+        transition: &SoccerLearningTransition,
+        successor: Option<&SoccerLearningTransition>,
+        target_scale: f64,
+    ) -> Option<f64> {
+        if transition.done {
+            return Some(0.0);
+        }
+        let learner = self.neural_learner_for(transition.team)?;
+        if learner.training_steps() < neural_value_bootstrap_min_training_steps() {
+            return None;
+        }
+        let successor = successor.filter(|candidate| {
+            candidate.team == transition.team
+                && candidate.player_id == transition.player_id
+                && candidate.tick > transition.tick
+        })?;
+        let target_scale = if target_scale.is_finite() && target_scale.abs() > 1e-9 {
+            target_scale.abs()
+        } else {
+            DEFAULT_SOCCER_NEURAL_TARGET_SCALE
+        };
+        let features = soccer_neural_transition_features(successor);
+        learner
+            .predict_value(&features)
+            .map(|value| value * target_scale)
+            .filter(|value| value.is_finite())
+    }
+
+    fn blended_successor_bootstrap_value(
+        &self,
+        transition: &SoccerLearningTransition,
+        successor: Option<&SoccerLearningTransition>,
+        tabular_max_next: f64,
+        target_scale: f64,
+    ) -> f64 {
+        let weight = neural_value_bootstrap_weight();
+        if weight <= 0.0 || transition.done {
+            return tabular_max_next;
+        }
+        self.neural_successor_bootstrap_value(transition, successor, target_scale)
+            .map(|neural_max_next| tabular_max_next * (1.0 - weight) + neural_max_next * weight)
+            .unwrap_or(tabular_max_next)
+    }
+
     pub(crate) fn neural_training_samples_for(
         &self,
         transitions: &[SoccerLearningTransition],
@@ -9128,18 +9495,20 @@ impl SoccerMatch {
         let target_scale = self.config.neural_learning.sanitized_target_scale();
         let target_clip = self.config.neural_learning.sanitized_target_clip();
         let tick_rewards = soccer_marl_tick_rewards(transitions);
+        let successor_indices = Self::neural_successor_indices(transitions);
         transitions
             .iter()
-            .filter(|transition| !self.neural_team_frozen(transition.team))
-            .filter(|transition| team_filter.map_or(true, |team| transition.team == team))
-            .filter_map(|transition| {
+            .enumerate()
+            .filter(|(_, transition)| !self.neural_team_frozen(transition.team))
+            .filter(|(_, transition)| team_filter.map_or(true, |team| transition.team == team))
+            .filter_map(|(transition_index, transition)| {
                 let adjusted_reward = soccer_marl_adjusted_reward(
                     transition,
                     &tick_rewards,
                     &self.config.neural_learning,
                 );
                 let next_state = SoccerQStateKey::from_next_transition(transition);
-                let (gamma, max_next) = self
+                let (gamma, tabular_max_next) = self
                     .team_policies
                     .as_ref()
                     .map(|policies| {
@@ -9166,6 +9535,15 @@ impl SoccerMatch {
                         })
                     })
                     .unwrap_or((SoccerQPolicyOptions::default().gamma, 0.0));
+                let successor = successor_indices.get(transition_index).and_then(|index| {
+                    index.and_then(|successor_index| transitions.get(successor_index))
+                });
+                let max_next = self.blended_successor_bootstrap_value(
+                    transition,
+                    successor,
+                    tabular_max_next,
+                    target_scale,
+                );
                 let (target, priority) = soccer_neural_target_and_priority(
                     adjusted_reward,
                     gamma,
@@ -11594,6 +11972,25 @@ impl SoccerMatch {
                     score_away_before,
                     tick_reward_events,
                 );
+                let captured_transitions = tick_transitions.len().min(u32::MAX as usize) as u32;
+                let nonzero_reward_transitions = tick_transitions
+                    .iter()
+                    .filter(|transition| transition.reward.abs() > 1e-9)
+                    .count()
+                    .min(u32::MAX as usize) as u32;
+                let reward_events = tick_reward_events.len().min(u32::MAX as usize) as u32;
+                self.stats.learning_transitions_captured = self
+                    .stats
+                    .learning_transitions_captured
+                    .saturating_add(captured_transitions);
+                self.stats.learning_nonzero_reward_transitions = self
+                    .stats
+                    .learning_nonzero_reward_transitions
+                    .saturating_add(nonzero_reward_transitions);
+                self.stats.learning_reward_events = self
+                    .stats
+                    .learning_reward_events
+                    .saturating_add(reward_events);
                 learning_transition_elapsed += phase_started.elapsed();
                 if capture_full_game || capture_config_moments {
                     self.episode_learning_transitions
@@ -11667,6 +12064,7 @@ impl SoccerMatch {
                     } else {
                         tick_transitions.clone()
                     };
+                    let mut deferred_drained = 0_u32;
                     if train_limit > 0 {
                         if train_transitions.len() > train_limit {
                             let overflow = train_transitions.split_off(train_limit);
@@ -11676,6 +12074,7 @@ impl SoccerMatch {
                         if deferred_limit > 0 && !self.deferred_reward_transitions.is_empty() {
                             let drain_count =
                                 deferred_limit.min(self.deferred_reward_transitions.len());
+                            deferred_drained = drain_count.min(u32::MAX as usize) as u32;
                             let deferred = self
                                 .deferred_reward_transitions
                                 .drain(0..drain_count)
@@ -11698,12 +12097,26 @@ impl SoccerMatch {
                             // Routes to the shared net or to each team's own brain
                             // (skipping frozen teams) depending on the match mode.
                             let phase_started = Instant::now();
+                            let trained_transitions =
+                                train_transitions.len().min(u32::MAX as usize) as u32;
+                            self.stats.learning_transitions_trained = self
+                                .stats
+                                .learning_transitions_trained
+                                .saturating_add(trained_transitions);
+                            self.stats.learning_deferred_reward_transitions_drained = self
+                                .stats
+                                .learning_deferred_reward_transitions_drained
+                                .saturating_add(deferred_drained);
                             self.train_neural_value_models(&train_transitions);
                             neural_sample_elapsed += phase_started.elapsed();
                         }
                     }
+                    self.stats.learning_deferred_reward_backlog =
+                        self.deferred_reward_transitions.len().min(u32::MAX as usize) as u32;
                 } else if capture_reward_transitions {
                     self.deferred_reward_transitions.extend(tick_transitions);
+                    self.stats.learning_deferred_reward_backlog =
+                        self.deferred_reward_transitions.len().min(u32::MAX as usize) as u32;
                 }
             }
             let phase_started = Instant::now();
@@ -16949,6 +17362,8 @@ impl SoccerMatch {
                         self.config.field_width_yards,
                         self.config.field_length_yards,
                     );
+                    let learned_kick_power_selected =
+                        learned_discretized_kick_power_is_authoritative(power);
                     let initial_pass_skill = pass_execution_skill(
                         &self.players[player_id].skills,
                         flight,
@@ -16962,16 +17377,20 @@ impl SoccerMatch {
                     );
                     let receiver_openness_at_player =
                         pass_receiver_openness_for_agents(&self.players, player_team, target);
-                    let initial_speed = modulated_pass_speed_yps(
-                        initial_raw_speed,
-                        player_pos,
-                        target,
-                        flight,
-                        initial_is_cross,
-                        initial_pass_skill,
-                        receiver_openness_at_player,
-                        &mut self.rng,
-                    );
+                    let initial_speed = if learned_kick_power_selected {
+                        initial_raw_speed
+                    } else {
+                        modulated_pass_speed_yps(
+                            initial_raw_speed,
+                            player_pos,
+                            target,
+                            flight,
+                            initial_is_cross,
+                            initial_pass_skill,
+                            receiver_openness_at_player,
+                            &mut self.rng,
+                        )
+                    };
                     // A one-two "give" is a firm lay-off to the wall partner's FEET so they can
                     // play it back first-time — NOT a led through-ball. The generic lead
                     // (`anticipated_pass_reception_point`) biases the aim forward toward goal by
@@ -17046,7 +17465,9 @@ impl SoccerMatch {
                                     self.config.field_width_yards,
                                     self.config.field_length_yards,
                                 );
-                                mpc_pass_speed = Some(v);
+                                if !learned_kick_power_selected {
+                                    mpc_pass_speed = Some(v);
+                                }
                             }
                         }
                     }
@@ -17166,7 +17587,11 @@ impl SoccerMatch {
                     // receiver's predicted arrival so a ground pass isn't struck too fast or too slow
                     // by the heuristic curve. Aim is unchanged; only the weight is solved. Gated
                     // (default-on); off ⇒ None ⇒ the analytic speed is used (byte-identical).
-                    if mpc_pass_speed.is_none() && !flight.is_aerial() && !is_one_two_give {
+                    if mpc_pass_speed.is_none()
+                        && !flight.is_aerial()
+                        && !is_one_two_give
+                        && !learned_kick_power_selected
+                    {
                         if let Some(id) = target_id {
                             mpc_pass_speed =
                                 snapshot.mpc_refined_pass_weight(player_id, id, led_target);
@@ -17233,16 +17658,20 @@ impl SoccerMatch {
                     );
                     let receiver_openness =
                         pass_receiver_openness_for_agents(&self.players, player_team, led_target);
-                    let modulated_speed = modulated_pass_speed_yps(
-                        raw_speed,
-                        player_pos,
-                        led_target,
-                        flight,
-                        is_cross,
-                        pass_skill,
-                        receiver_openness,
-                        &mut self.rng,
-                    );
+                    let modulated_speed = if learned_kick_power_selected {
+                        raw_speed
+                    } else {
+                        modulated_pass_speed_yps(
+                            raw_speed,
+                            player_pos,
+                            led_target,
+                            flight,
+                            is_cross,
+                            pass_skill,
+                            receiver_openness,
+                            &mut self.rng,
+                        )
+                    };
                     // The MPC chose a launch speed for the ball/receiver rendezvous; nudge the
                     // analytic speed toward it (kept close so it stays a real ground pass and does
                     // not outrun the receiver's control), else keep the analytic modulated speed.
@@ -17275,7 +17704,8 @@ impl SoccerMatch {
                     // it was too weak for a runner the target/launch timing could diverge. Pull
                     // the struck speed toward the receipt-aware bucket so weight is a state
                     // decision, not a random or one-way correction.
-                    let speed = if !flight.is_aerial()
+                    let speed = if !learned_kick_power_selected
+                        && !flight.is_aerial()
                         && !dd_soccer_disable_learnable_pass_velocity()
                     {
                         if let Some(passer_snap) =
@@ -23874,6 +24304,14 @@ impl SoccerMatch {
                 if transition.decision_context.neural_mcts_selected {
                     self.stats.neural_mcts_selections =
                         self.stats.neural_mcts_selections.saturating_add(1);
+                    if learned_discretized_kick_speed_bucket_for_action_label(&transition.action)
+                        .is_some()
+                    {
+                        self.stats.neural_mcts_discretized_kick_selections = self
+                            .stats
+                            .neural_mcts_discretized_kick_selections
+                            .saturating_add(1);
+                    }
                 }
                 if transition.decision_context.learned_mpc_replanned {
                     self.stats.learned_mpc_replans =

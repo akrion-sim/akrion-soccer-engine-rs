@@ -5110,7 +5110,8 @@ impl PlayerAgent {
         let route_one_legal = own_half
             && route_one_proximity_gate
             && route_one_outlet_gate
-            && (route_one_vertical_window || (route_one_release_need && route_one_last_ditch));
+            && route_one_release_need
+            && route_one_last_ditch;
         let route_one_score = ((0.05
             + directive.risk_tolerance * 0.12
             + passing * 0.12
@@ -12860,24 +12861,28 @@ impl PlayerAgent {
                 if !Self::learned_pass_viable(observation, PassFlight::Floor) {
                     return None;
                 }
+                let learned_kick_power =
+                    learned_discretized_kick_power_for_action_label(&plan.action);
                 let visible_targets = snapshot.ranked_visible_pass_targets(self.id, 11);
-                if let Some(target) = learned_generic_pass_killer_upgrade_target_for(
-                    self,
-                    snapshot,
-                    observation,
-                    &visible_targets,
-                ) {
-                    return Some((
-                        SoccerAction::Pass {
-                            target_player: Some(target),
-                            power: 0.66
-                                + 0.24
-                                    * ability01(self.skills.passing_completion_rate)
-                                        .max(ability01(self.skills.vision)),
-                            flight: snapshot.killer_pass_flight_for(self.id, &visible_targets),
-                        },
-                        "killer-pass".to_string(),
-                    ));
+                if learned_kick_power.is_none() {
+                    if let Some(target) = learned_generic_pass_killer_upgrade_target_for(
+                        self,
+                        snapshot,
+                        observation,
+                        &visible_targets,
+                    ) {
+                        return Some((
+                            SoccerAction::Pass {
+                                target_player: Some(target),
+                                power: 0.66
+                                    + 0.24
+                                        * ability01(self.skills.passing_completion_rate)
+                                            .max(ability01(self.skills.vision)),
+                                flight: snapshot.killer_pass_flight_for(self.id, &visible_targets),
+                            },
+                            "killer-pass".to_string(),
+                        ));
+                    }
                 }
                 let target = plan
                     .target_player
@@ -12911,7 +12916,9 @@ impl PlayerAgent {
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
-                            power: 0.58 + 0.32 * ability01(self.skills.passing_completion_rate),
+                            power: learned_kick_power.unwrap_or_else(|| {
+                                0.58 + 0.32 * ability01(self.skills.passing_completion_rate)
+                            }),
                             flight: PassFlight::Floor,
                         },
                         action_label,
@@ -12970,6 +12977,8 @@ impl PlayerAgent {
                 target.map(|target| {
                     let crossing =
                         ability01(self.skills.crossing_left.max(self.skills.crossing_right));
+                    let learned_kick_power =
+                        learned_discretized_kick_power_for_action_label(&plan.action);
                     let action_label = if ranked_pass_action_label(&plan.action)
                         && plan.target_player == Some(target)
                     {
@@ -12980,9 +12989,10 @@ impl PlayerAgent {
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
-                            power: 0.56
-                                + 0.28
-                                    * crossing.max(ability01(self.skills.passing_completion_rate)),
+                            power: learned_kick_power.unwrap_or_else(|| {
+                                0.56 + 0.28
+                                    * crossing.max(ability01(self.skills.passing_completion_rate))
+                            }),
                             flight: PassFlight::Aerial,
                         },
                         action_label,
@@ -13822,12 +13832,7 @@ impl PlayerAgent {
             || (snapshot_vertical_window && pressure_or_emergency)
             || last_ditch_escape;
 
-        role_can_release
-            && proximity_gate
-            && outlet_gate
-            && (true_vertical_runner
-                || (snapshot_vertical_window && pressure_or_emergency && release_need)
-                || (release_need && last_ditch_escape))
+        role_can_release && proximity_gate && outlet_gate && release_need && last_ditch_escape
     }
 
     fn learned_stale_dribble_release_override(

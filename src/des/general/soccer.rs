@@ -29,7 +29,8 @@ use crate::des::general::mpc_point_mass::{
     PlanarMpcConfig, PlanarObstacle, PlanarPointMassMpc, PlanarReference, PlanarState,
 };
 use crate::des::general::neural_network::{
-    ActivationName, DenseLayerConfig, FeedForwardNetwork, RandomNetworkSpec,
+    ActivationName, DenseLayerConfig, FeedForwardMomentumState, FeedForwardNetwork,
+    RandomNetworkSpec,
 };
 use crate::des::general::prng::{mulberry32, SeededRandom};
 // `RandomSource` brings `.next_float()` etc. into scope for `SeededRandom`; re-exported here so
@@ -5374,6 +5375,8 @@ const DEFAULT_SOCCER_NEURAL_REPLAY_CAPACITY: usize = 512;
 const DEFAULT_SOCCER_NEURAL_REPLAY_SAMPLES_PER_TICK: usize = 16;
 const DEFAULT_SOCCER_NEURAL_TARGET_CLIP: f64 = 3.0;
 const DEFAULT_SOCCER_NEURAL_SNAPSHOT_EVERY_BATCHES: usize = 16;
+const DEFAULT_SOCCER_NEURAL_OPTIMIZER_MOMENTUM: f64 = 0.0;
+const MAX_SOCCER_NEURAL_OPTIMIZER_MOMENTUM: f64 = 0.99;
 const DEFAULT_SOCCER_MARL_TEAM_REWARD_WEIGHT: f64 = 0.35;
 const DEFAULT_SOCCER_MARL_INTERMEDIATE_REWARD_WEIGHT: f64 = 1.0;
 const DEFAULT_SOCCER_MAPPO_CLIP_EPSILON: f64 = 0.20;
@@ -5738,6 +5741,10 @@ fn default_neural_learning_config() -> SoccerNeuralLearningConfig {
 
 fn default_soccer_neural_learning_rate() -> f64 {
     DEFAULT_SOCCER_NEURAL_LEARNING_RATE
+}
+
+fn default_soccer_neural_optimizer_momentum() -> f64 {
+    DEFAULT_SOCCER_NEURAL_OPTIMIZER_MOMENTUM
 }
 
 pub fn soccer_sanitized_learning_rate(learning_rate: f64, fallback_learning_rate: f64) -> f64 {
@@ -14355,7 +14362,55 @@ impl SoccerTeamQPolicies {
     }
 }
 
+fn ranked_pass_action_family(action: &str) -> Option<&'static str> {
+    ["pass", "aerial-pass"].iter().copied().find(|prefix| {
+        action
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
+fn learned_discretized_kick_suffix_parts(action: &str) -> Option<(&str, u8)> {
+    let (base, suffix) = action.trim().rsplit_once("-kp")?;
+    let bucket = suffix.parse::<u8>().ok()?;
+    if bucket >= DISCRETIZED_KICK_SPEED_BUCKETS || ranked_pass_action_family(base).is_none() {
+        return None;
+    }
+    Some((base, bucket))
+}
+
+pub(crate) fn learned_discretized_kick_candidate_label(base: &str, bucket: u8) -> Option<String> {
+    let base = base.trim();
+    if bucket >= DISCRETIZED_KICK_SPEED_BUCKETS || ranked_pass_action_family(base).is_none() {
+        return None;
+    }
+    Some(format!("{base}-kp{bucket}"))
+}
+
+pub(crate) fn learned_discretized_kick_speed_bucket_for_action_label(action: &str) -> Option<u8> {
+    learned_discretized_kick_suffix_parts(action).map(|(_, bucket)| bucket)
+}
+
+pub(crate) fn learned_discretized_kick_power_for_action_label(action: &str) -> Option<f64> {
+    learned_discretized_kick_speed_bucket_for_action_label(action)
+        .map(|bucket| discretized_kick_power_for_bucket(bucket, DiscretizedKickDither::none()))
+}
+
+pub(crate) fn learned_discretized_kick_power_is_authoritative(power: f64) -> bool {
+    power.is_finite()
+        && (0..DISCRETIZED_KICK_SPEED_BUCKETS).any(|bucket| {
+            (power - discretized_kick_power_for_bucket(bucket, DiscretizedKickDither::none())).abs()
+                <= 1e-9
+        })
+}
+
 fn normalize_soccer_action_label(action: &str) -> &str {
+    let action = learned_discretized_kick_suffix_parts(action)
+        .map(|(base, _)| base)
+        .unwrap_or(action);
+    if let Some(family) = ranked_pass_action_family(action) {
+        return family;
+    }
     // Alias -> canonical mapping is centralised in `SoccerActionLabel`
     // (soccer/labels.rs). Unrecognised labels pass straight through with no
     // allocation, exactly as the old `other => other` arm did.
@@ -14376,11 +14431,10 @@ fn learned_mpc_action_labels_match(left: &str, right: &str) -> bool {
 }
 
 fn ranked_pass_action_label(action: &str) -> bool {
-    ["pass", "aerial-pass"].iter().any(|prefix| {
-        action
-            .strip_prefix(prefix)
-            .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()))
-    })
+    let action = learned_discretized_kick_suffix_parts(action)
+        .map(|(base, _)| base)
+        .unwrap_or(action);
+    ranked_pass_action_family(action).is_some()
 }
 
 // FLANK_CROSS_MIN_FLANK_SCORE / FLANK_CROSS_MAX_YARDS_TO_GOAL moved to
@@ -14569,7 +14623,7 @@ pub(crate) fn scoop_completion_viability(observation: &SoccerPomdpObservation) -
 
 fn pass_like_action_flight(action: &str) -> Option<PassFlight> {
     use SoccerActionLabel::*;
-    match SoccerActionLabel::classify(action)? {
+    match SoccerActionLabel::classify(normalize_soccer_action_label(action))? {
         Pass | FirstTimePass | FlankLowCross | WallPass | WallReturn | CornerFlagCross
         | SurprisePass | KillerPass | SwitchPlay | RecycleReset => Some(PassFlight::Floor),
         ScoopPass => Some(PassFlight::Scoop),
@@ -17675,6 +17729,10 @@ pub struct SoccerNeuralLearningConfig {
     pub backend: SoccerNeuralLearningBackend,
     #[serde(default = "default_soccer_neural_learning_rate")]
     pub learning_rate: f64,
+    /// Classical SGD momentum for the value critic. This is an optimizer aid for
+    /// Bellman/counterfactual learning, not a reward or promotion shortcut.
+    #[serde(default = "default_soccer_neural_optimizer_momentum")]
+    pub optimizer_momentum: f64,
     #[serde(default = "default_soccer_neural_batch_size")]
     pub batch_size: usize,
     #[serde(default = "default_soccer_neural_train_every_ticks")]
@@ -17752,6 +17810,7 @@ impl Default for SoccerNeuralLearningConfig {
             enabled: false,
             backend: SoccerNeuralLearningBackend::Inline,
             learning_rate: DEFAULT_SOCCER_NEURAL_LEARNING_RATE,
+            optimizer_momentum: DEFAULT_SOCCER_NEURAL_OPTIMIZER_MOMENTUM,
             batch_size: DEFAULT_SOCCER_NEURAL_BATCH_SIZE,
             train_every_ticks: DEFAULT_SOCCER_NEURAL_TRAIN_EVERY_TICKS,
             max_batches_per_tick: DEFAULT_SOCCER_NEURAL_MAX_BATCHES_PER_TICK,
@@ -17794,6 +17853,15 @@ impl SoccerNeuralLearningConfig {
 
     fn sanitized_learning_rate(&self) -> f64 {
         soccer_sanitized_learning_rate(self.learning_rate, DEFAULT_SOCCER_NEURAL_LEARNING_RATE)
+    }
+
+    fn sanitized_optimizer_momentum(&self) -> f64 {
+        if self.optimizer_momentum.is_finite() {
+            self.optimizer_momentum
+                .clamp(0.0, MAX_SOCCER_NEURAL_OPTIMIZER_MOMENTUM)
+        } else {
+            DEFAULT_SOCCER_NEURAL_OPTIMIZER_MOMENTUM
+        }
     }
 
     fn sanitized_critic_baseline_weight(&self) -> f64 {
@@ -18803,6 +18871,8 @@ pub struct MatchStats {
     #[serde(default)]
     pub neural_mcts_selections: u32,
     #[serde(default)]
+    pub neural_mcts_discretized_kick_selections: u32,
+    #[serde(default)]
     pub learned_mpc_replans: u32,
     #[serde(default)]
     pub policy_priority_samples: u32,
@@ -18814,6 +18884,18 @@ pub struct MatchStats {
     pub neural_mcts_distillation_weight_sum: f64,
     #[serde(default)]
     pub policy_entropy_sum: f64,
+    #[serde(default)]
+    pub learning_transitions_captured: u32,
+    #[serde(default)]
+    pub learning_transitions_trained: u32,
+    #[serde(default)]
+    pub learning_nonzero_reward_transitions: u32,
+    #[serde(default)]
+    pub learning_reward_events: u32,
+    #[serde(default)]
+    pub learning_deferred_reward_transitions_drained: u32,
+    #[serde(default)]
+    pub learning_deferred_reward_backlog: u32,
     #[serde(default)]
     pub world_model_enabled: bool,
     #[serde(default)]
@@ -18830,6 +18912,8 @@ pub struct SoccerPlanningValidationStats {
     pub decisions: u32,
     pub neural_mcts_selections: u32,
     pub neural_mcts_selection_rate: f64,
+    pub neural_mcts_discretized_kick_selections: u32,
+    pub neural_mcts_discretized_kick_selection_rate: f64,
     pub learned_mpc_replans: u32,
     pub learned_mpc_replan_rate: f64,
     pub policy_priority_samples: u32,
@@ -18942,6 +19026,11 @@ impl MatchStats {
             decisions: self.planning_decisions,
             neural_mcts_selections: self.neural_mcts_selections,
             neural_mcts_selection_rate: self.neural_mcts_selections as f64 / decisions as f64,
+            neural_mcts_discretized_kick_selections: self.neural_mcts_discretized_kick_selections,
+            neural_mcts_discretized_kick_selection_rate: self
+                .neural_mcts_discretized_kick_selections
+                as f64
+                / decisions as f64,
             learned_mpc_replans: self.learned_mpc_replans,
             learned_mpc_replan_rate: self.learned_mpc_replans as f64 / decisions as f64,
             policy_priority_samples: self.policy_priority_samples,
@@ -23435,7 +23524,26 @@ fn soccer_decision_context_for(
     let target_angle_degrees = target_delta
         .map(|delta| angle_between_vectors_degrees(Vec2::new(0.0, attack_dir), delta))
         .unwrap_or(0.0);
-    let action_ball_speed_yps = after.ball.velocity.len();
+    let learned_kick_speed_yps =
+        learned_discretized_kick_power_for_action_label(action).and_then(|power| {
+            let flight = pass_like_action_flight(action)?;
+            let target = target_point?;
+            let actor = actor_snapshot?;
+            let is_cross = pass_would_be_cross(
+                actor_position,
+                target,
+                team,
+                before.field_width,
+                before.field_length,
+            );
+            Some(pass_speed_yps_from_power(
+                power,
+                flight,
+                is_cross,
+                &actor.skills,
+            ))
+        });
+    let action_ball_speed_yps = learned_kick_speed_yps.unwrap_or_else(|| after.ball.velocity.len());
     let pass_quality_for_action = pass_like_action_flight(action).and_then(|flight| {
         let passer = before
             .players
@@ -39650,6 +39758,8 @@ pub(crate) struct SoccerNeuralLearner {
     stats: SoccerNeuralLearningStatsState,
     last_network_snapshot: Option<SoccerNeuralNetworkSnapshot>,
     target_popart: Option<SoccerNeuralTargetPopArtStats>,
+    optimizer_momentum: f64,
+    optimizer_state: FeedForwardMomentumState,
     /// Read-only network used to score live decisions on the `Threaded` backend,
     /// where `inline_network` is `None` because the trainable weights live on the
     /// worker thread. Rebuilt from each fresh worker snapshot. On the `Inline`
@@ -39712,6 +39822,8 @@ impl SoccerNeuralLearner {
                 stats,
                 last_network_snapshot: Some(initial_snapshot),
                 target_popart,
+                optimizer_momentum: neural_config.sanitized_optimizer_momentum(),
+                optimizer_state: FeedForwardMomentumState::default(),
                 prediction_network: None,
             },
             SoccerNeuralLearningBackend::Threaded => SoccerNeuralLearner {
@@ -39725,6 +39837,7 @@ impl SoccerNeuralLearner {
                 worker: Some(spawn_soccer_neural_learning_worker(
                     network.clone(),
                     neural_config.sanitized_learning_rate(),
+                    neural_config.sanitized_optimizer_momentum(),
                     neural_config.sanitized_max_pending_batches(),
                     target_popart,
                 )),
@@ -39733,6 +39846,8 @@ impl SoccerNeuralLearner {
                 stats,
                 last_network_snapshot: Some(initial_snapshot),
                 target_popart,
+                optimizer_momentum: neural_config.sanitized_optimizer_momentum(),
+                optimizer_state: FeedForwardMomentumState::default(),
             },
         }
     }
@@ -40015,12 +40130,14 @@ impl SoccerNeuralLearner {
                                     .unwrap_or(sample.target)
                             })
                             .collect::<Vec<_>>();
-                        let loss = network.train_batch_slices_clipped(
+                        let loss = network.train_batch_slices_clipped_with_momentum(
                             batch.iter().zip(targets.iter()).map(|(sample, target)| {
                                 (&sample.input[..], std::slice::from_ref(target))
                             }),
                             learning_rate,
                             SOCCER_NEURAL_GRAD_CLIP_NORM,
+                            self.optimizer_momentum,
+                            &mut self.optimizer_state,
                         );
                         self.stats.record_result(SoccerNeuralTrainingResult {
                             batches: 1,
@@ -40145,6 +40262,7 @@ fn should_snapshot_after_threaded_neural_train(
 fn spawn_soccer_neural_learning_worker(
     mut network: FeedForwardNetwork,
     learning_rate: f64,
+    optimizer_momentum: f64,
     max_pending_batches: usize,
     mut target_popart: Option<SoccerNeuralTargetPopArtStats>,
 ) -> SoccerNeuralLearningWorker {
@@ -40158,6 +40276,7 @@ fn spawn_soccer_neural_learning_worker(
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = Arc::clone(&cancel);
     let handle = thread::spawn(move || {
+        let mut optimizer_state = FeedForwardMomentumState::default();
         while let Ok(command) = sample_rx.recv() {
             if worker_cancel.load(Ordering::Relaxed) {
                 break;
@@ -40195,12 +40314,14 @@ fn spawn_soccer_neural_learning_worker(
                                     .unwrap_or(sample.target)
                             })
                             .collect::<Vec<_>>();
-                        let loss = network.train_batch_slices_clipped(
+                        let loss = network.train_batch_slices_clipped_with_momentum(
                             samples.iter().zip(targets.iter()).map(|(sample, target)| {
                                 (&sample.input[..], std::slice::from_ref(target))
                             }),
                             learning_rate,
                             SOCCER_NEURAL_GRAD_CLIP_NORM,
+                            optimizer_momentum,
+                            &mut optimizer_state,
                         );
                         if loss.is_finite() {
                             trained_batches = trained_batches.saturating_add(1);
@@ -40281,7 +40402,7 @@ fn build_soccer_neural_network(
             output_dim: 1,
             hidden_activation: ActivationName::Tanh,
             output_activation: ActivationName::Linear,
-            weight_scale: Some(0.05),
+            weight_scale: None,
         },
         &mut rng,
     )
@@ -66783,6 +66904,32 @@ mod discretized_kick_scaffold_tests {
                 "floor elevation lowers to ground altitude"
             );
         }
+    }
+
+    #[test]
+    fn learned_discretized_kick_labels_preserve_pass_family_and_bucket() {
+        let label = learned_discretized_kick_candidate_label("pass4", 7)
+            .expect("ranked pass should accept a learned kick bucket");
+        assert_eq!(label, "pass4-kp7");
+        assert!(ranked_pass_action_label(&label));
+        assert_eq!(normalize_soccer_action_label(&label), "pass");
+        assert_eq!(
+            learned_mpc_action_label_key(&label),
+            "pass4-kp7".to_string()
+        );
+        assert_eq!(
+            learned_discretized_kick_speed_bucket_for_action_label(&label),
+            Some(7)
+        );
+        assert!(
+            (learned_discretized_kick_power_for_action_label(&label).unwrap() - 0.75).abs() < 1e-9
+        );
+
+        let aerial = learned_discretized_kick_candidate_label("aerial-pass2", 4)
+            .expect("ranked aerial pass should accept a learned kick bucket");
+        assert_eq!(normalize_soccer_action_label(&aerial), "aerial-pass");
+        assert_eq!(learned_discretized_kick_candidate_label("pass", 4), None);
+        assert_eq!(learned_discretized_kick_candidate_label("pass1", 12), None);
     }
 
     #[test]

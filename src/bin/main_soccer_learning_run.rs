@@ -1874,6 +1874,11 @@ fn env_neural_learning_config() -> Result<SoccerNeuralLearningConfig, Box<dyn Er
             "SOCCER_NEURAL_RATE",
             default.learning_rate,
         )?,
+        optimizer_momentum: env_f64_alias(
+            "SOCCER_NEURAL_OPTIMIZER_MOMENTUM",
+            "SOCCER_NEURAL_MOMENTUM",
+            default.optimizer_momentum,
+        )?,
         batch_size: env_usize_alias(
             "SOCCER_NEURAL_BATCH_SIZE",
             "SOCCER_NEURAL_LEARNING_BATCH_SIZE",
@@ -4951,7 +4956,7 @@ fn run_game(
             }
         }
         eprintln!(
-            "world_model_training episode={} enabled={} training_steps={} loss={:?} validation_loss={:?} planning_decisions={} neural_mcts_selection_rate={:.4} mpc_replan_rate={:.4} policy_entropy={:.4}",
+            "world_model_training episode={} enabled={} training_steps={} loss={:?} validation_loss={:?} planning_decisions={} neural_mcts_selection_rate={:.4} neural_mcts_discretized_kick_rate={:.4} mpc_replan_rate={:.4} policy_entropy={:.4} learning_transitions_captured={} learning_transitions_trained={} learning_nonzero_reward_transitions={} learning_reward_events={} learning_deferred_reward_drained={} learning_deferred_reward_backlog={}",
             episode + 1,
             world_model_stats.enabled,
             world_model_stats.training_steps,
@@ -4959,8 +4964,15 @@ fn run_game(
             world_model_stats.last_validation_loss,
             planning_stats.decisions,
             planning_stats.neural_mcts_selection_rate,
+            planning_stats.neural_mcts_discretized_kick_selection_rate,
             planning_stats.learned_mpc_replan_rate,
-            planning_stats.mean_policy_entropy
+            planning_stats.mean_policy_entropy,
+            sim.stats.learning_transitions_captured,
+            sim.stats.learning_transitions_trained,
+            sim.stats.learning_nonzero_reward_transitions,
+            sim.stats.learning_reward_events,
+            sim.stats.learning_deferred_reward_transitions_drained,
+            sim.stats.learning_deferred_reward_backlog
         );
     }
     let mut artifact = sim.team_policy_artifact();
@@ -5525,7 +5537,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         900.0,
     )?;
     let dt_seconds = env_f64("SOCCER_DT_SECONDS", 0.2)?;
-    let learning_interval_ticks = env_usize("SOCCER_LEARNING_INTERVAL_TICKS", 4)?;
+    let learning_interval_ticks = env_usize("SOCCER_LEARNING_INTERVAL_TICKS", 1)?;
     let parallel_games = env_usize("SOCCER_PARALLEL_GAMES", default_soccer_parallel_games())?;
     let checkpoint_interval_games = env_usize("SOCCER_CHECKPOINT_INTERVAL_GAMES", 10)?;
     let artifact_max_entries_per_policy =
@@ -6719,10 +6731,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         tactical_learning.defense_compactness_score_weight,
     );
     println!(
-        "neural_learning enabled={} backend={} learning_rate={:.5} batch_size={} train_every_ticks={} max_batches_per_tick={} hidden_units={} target_scale={:.3} max_pending_batches={} replay_capacity={} replay_samples_per_tick={} target_clip={:.3} target_popart={} snapshot_every_batches={} batch_snapshot_selection={} batch_snapshot_max_fitness_regression={:.3} batch_snapshot_min_fitness={:.3} batch_snapshot_min_batch_mean_fitness={:.3}",
+        "neural_learning enabled={} backend={} learning_rate={:.5} optimizer_momentum={:.3} batch_size={} train_every_ticks={} max_batches_per_tick={} hidden_units={} target_scale={:.3} max_pending_batches={} replay_capacity={} replay_samples_per_tick={} target_clip={:.3} target_popart={} snapshot_every_batches={} batch_snapshot_selection={} batch_snapshot_max_fitness_regression={:.3} batch_snapshot_min_fitness={:.3} batch_snapshot_min_batch_mean_fitness={:.3}",
         neural_learning.enabled,
         neural_backend_label(neural_learning.backend),
         neural_learning.learning_rate,
+        neural_learning.optimizer_momentum,
         neural_learning.batch_size,
         neural_learning.train_every_ticks,
         neural_learning.max_batches_per_tick,

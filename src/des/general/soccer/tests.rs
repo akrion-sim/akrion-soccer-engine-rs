@@ -41151,6 +41151,7 @@ fn neural_threaded_worker_shutdown_closes_training_channel() {
     let mut worker = spawn_soccer_neural_learning_worker(
         build_soccer_neural_network(&config, 9183),
         config.sanitized_learning_rate(),
+        0.0,
         config.sanitized_max_pending_batches(),
         None,
     );
@@ -57762,12 +57763,12 @@ fn route_one_target_bends_toward_visible_forward_runner_path() {
 }
 
 #[test]
-fn learned_route_one_uses_visible_runner_shaped_landing_zone() {
+fn learned_route_one_last_ditch_resolves_escape_landing_zone() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let holder = 6;
     let runner = 9;
     park_players_except(&mut sim, &[holder, runner]);
-    sim.players[holder].position = Vec2::new(30.0, 34.0);
+    sim.players[holder].position = Vec2::new(30.0, 16.0);
     sim.players[holder].home_position = sim.players[holder].position;
     sim.players[holder].action_facing = FacingBucket::South;
     sim.players[holder].receive_facing = FacingBucket::South;
@@ -57784,6 +57785,10 @@ fn learned_route_one_uses_visible_runner_shaped_landing_zone() {
     observation.aerial_forward_runner_pass_multiplier = 1.35;
     observation.expected_aerial_pass_completion = 0.50;
     observation.aerial_pass_interception_risk = 0.20;
+    observation.yards_to_own_goal = 16.0;
+    observation.pressure_urgency = observation.pressure_urgency.max(0.58);
+    observation.perceived_pressure = observation.perceived_pressure.max(0.58);
+    observation.defensive_urgency = observation.defensive_urgency.max(0.72);
     let base = route_one_target_for_player(
         Team::Home,
         sim.players[holder].position,
@@ -57798,17 +57803,16 @@ fn learned_route_one_uses_visible_runner_shaped_landing_zone() {
     };
     let (action, label) = sim.players[holder]
         .action_from_learned_plan(&plan, &snapshot, &observation)
-        .expect("learned route-one should resolve");
+        .expect("last-ditch learned route-one should resolve");
 
     assert_eq!(label, "route-one");
     let SoccerAction::RouteOne { target, .. } = action else {
         panic!("expected route-one action, got {action:?}");
     };
     assert!(
-            target.x > base.x + 8.0,
-            "learned route-one should use the runner-shaped landing zone: base={base:?} target={target:?}"
-        );
-    assert!(target.y > sim.config.field_length_yards * 0.56);
+        target.y > sim.config.field_length_yards * 0.56,
+        "last-ditch route-one should still escape into the opponent half: base={base:?} target={target:?}"
+    );
 }
 
 #[test]
@@ -58186,6 +58190,32 @@ fn pressure_and_own_half_make_clearance_legal_but_route_one_last_ditch() {
             .action_from_learned_plan(&route_one_plan, &snapshot, &observation)
             .is_none(),
         "learned route-one should defer under generic own-half pressure; clearance is the safe release"
+    );
+
+    let mut high_quality_runner_observation = observation.clone();
+    high_quality_runner_observation.visible_forward_pass_options = 0;
+    high_quality_runner_observation.open_support_outlets = 0;
+    high_quality_runner_observation.expected_pass_completion = 0.22;
+    high_quality_runner_observation.best_pass_receiver_openness = 0.20;
+    high_quality_runner_observation.aerial_forward_runner_pass_multiplier = 1.45;
+    high_quality_runner_observation.expected_aerial_pass_completion = 0.70;
+    high_quality_runner_observation.aerial_pass_interception_risk =
+        LEARNED_PASS_MAX_INTERCEPTION_RISK - 0.12;
+    assert!(
+        !learned_action_label_is_legal_for_observation(
+            "route-one",
+            &snapshot,
+            defender,
+            &snapshot.players[defender],
+            &high_quality_runner_observation,
+        ),
+        "a runner window should use targeted pass actions, not reopen learned route-one outside the box"
+    );
+    assert!(
+        sim.players[defender]
+            .action_from_learned_plan(&route_one_plan, &snapshot, &high_quality_runner_observation)
+            .is_none(),
+        "learned plan execution must reject non-last-ditch route-one even with a runner window"
     );
 
     let mut last_ditch_observation = observation.clone();
