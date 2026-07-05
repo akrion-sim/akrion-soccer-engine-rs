@@ -20961,6 +20961,12 @@ impl SoccerMatch {
         let window = TURNOVER_PENALTY_WINDOW_TICKS.max(1);
         let cutoff = tick.saturating_sub(window);
         let mut penalized = Vec::new();
+        // Route the SAME age-discounted penalty to the DECISION transition in the full-game corpus
+        // (gated): the full-game replay trains on `episode_learning_transitions`, NOT the
+        // `deferred_reward_transitions` the penalized clones go to — so without this, correctly-
+        // attributed turnover penalties (intercepted pass / lost dribble) never reach full-game
+        // training. Collected here, applied after the borrow ends.
+        let mut deferred_turnover_credits: Vec<(u64, usize, f64)> = Vec::new();
         // Newest first: stop once we fall out of the window (history is tick-ordered).
         for transition in self.turnover_penalty_history.iter().rev() {
             if transition.tick < cutoff {
