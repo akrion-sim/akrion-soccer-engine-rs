@@ -5536,7 +5536,7 @@ impl SoccerMatch {
         let (_state, ranked) = policy.ranked_action_values_for_snapshot(
             snapshot,
             player_id,
-            blend.candidates.max(2),
+            dd_soccer_neural_blend_candidates(blend.candidates).max(2),
         )?;
         let mut legal: Vec<SoccerLearnedActionTrace> =
             ranked.into_iter().filter(|action| action.legal).collect();
