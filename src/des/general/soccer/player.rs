@@ -2733,26 +2733,37 @@ fn mpc_reselects_candidate(
     action: &SoccerAction,
     action_label: &str,
 ) -> bool {
+    mpc_reselect_rejection_probability(snapshot, player, action, action_label).is_some()
+}
+
+fn mpc_reselect_rejection_probability(
+    snapshot: &WorldSnapshot,
+    player: &PlayerAgent,
+    action: &SoccerAction,
+    action_label: &str,
+) -> Option<f64> {
     let action_target = player.action_target_trace(action, snapshot);
     if !snapshot
         .formation_lp_guidance_for(player.id)
         .is_some_and(|guidance| guidance.local_mpc_guidance)
     {
-        return false;
+        return None;
     }
-    if player_mdp_mpc_comparison_trace(snapshot, player, &action_target, action_label)
-        .is_some_and(|trace| trace.decision == "reselect-mdp-after-mpc-low-confidence")
+    if let Some(trace) =
+        player_mdp_mpc_comparison_trace(snapshot, player, &action_target, action_label)
+            .filter(|trace| trace.decision == "reselect-mdp-after-mpc-low-confidence")
     {
-        return true;
+        return Some(trace.mpc_execution_probability.clamp(0.0, 1.0));
     }
     direct_mpc_execution_estimate_for_candidate(snapshot, player, &action_target, action_label)
-        .is_some_and(|estimate| {
+        .filter(|estimate| {
             !estimate.reselect_reason.is_empty()
                 && estimate.execution_probability
                     < tunables()
                         .decision_mpc
                         .reselect_min_ball_execution_probability
         })
+        .map(|estimate| estimate.execution_probability.clamp(0.0, 1.0))
 }
 
 /// Minimum ticks between two consecutive deliberative decisions (≈0.20 s at 15 Hz): at most one
@@ -9688,6 +9699,7 @@ impl PlayerAgent {
         }
 
         let mut learned_mpc_reselect_label: Option<String> = None;
+        let mut learned_mpc_reselect_probability: Option<f64> = None;
         if let Some(plan) = learned_plan {
             if let Some((action, action_label)) =
                 self.action_from_learned_plan(plan, snapshot, &observation)
@@ -9766,8 +9778,11 @@ impl PlayerAgent {
                         };
                     }
                 }
-                if mpc_reselects_candidate(snapshot, self, &action, &action_label) {
+                if let Some(rejected_probability) =
+                    mpc_reselect_rejection_probability(snapshot, self, &action, &action_label)
+                {
                     learned_mpc_reselect_label = Some(action_label.clone());
+                    learned_mpc_reselect_probability = Some(rejected_probability);
                 } else {
                     if action_label == "wall-pass" {
                         if let Some(plan) = snapshot.wall_pass_option_for(self.id) {
@@ -11780,7 +11795,7 @@ impl PlayerAgent {
                     || observation.decision_urgency > 0.46
                     || observation.offensive_urgency > 0.34
             };
-            self.last_decision = Some(self.decision_trace(
+            let mut decision = self.decision_trace(
                 snapshot,
                 mdp_state,
                 observation,
@@ -11789,7 +11804,28 @@ impl PlayerAgent {
                 action_options,
                 &action,
                 action_label,
-            ));
+            );
+            if let (Some(original), Some(rejected_execution_probability)) = (
+                learned_mpc_reselect_label.as_deref(),
+                learned_mpc_reselect_probability,
+            ) {
+                let original_action = normalize_soccer_action_label(original).to_string();
+                let replacement_action =
+                    normalize_soccer_action_label(&decision.action).to_string();
+                if original_action != replacement_action {
+                    decision.learned_mpc_replan = Some(SoccerLearnedMpcReplanTrace {
+                        original_action,
+                        replacement_action,
+                        rejected_execution_probability,
+                        candidate_count: decision
+                            .action_options
+                            .iter()
+                            .filter(|option| option.legal)
+                            .count(),
+                    });
+                }
+            }
+            self.last_decision = Some(decision);
             return PlayerIntent {
                 player_id: self.id,
                 action,
@@ -13284,7 +13320,7 @@ impl PlayerAgent {
                         },
                         "blindside-steal".to_string(),
                     )
-            }),
+                }),
             "press-cover" if snapshot.controlled_possession_team() == Some(self.team.other()) => {
                 let target = snapshot
                     .players
@@ -14009,6 +14045,101 @@ mod decision_refractory_tests {
             }
         }
         assert_eq!(allowed, vec![1, 4, 8]);
+    }
+}
+
+#[cfg(test)]
+mod learned_mpc_reselect_tests {
+    use super::*;
+
+    fn push_test_mpc_guidance(snapshot: &mut WorldSnapshot, player: &PlayerAgent) {
+        snapshot
+            .formation_lp_guidance
+            .retain(|guidance| guidance.player_id != player.id);
+        snapshot
+            .formation_lp_guidance
+            .push(SoccerFormationLpPlayerGuidance {
+                team: player.team,
+                player_id: player.id,
+                slot: player.id,
+                current: player.position,
+                target: player.position,
+                formation_anchor: player.position,
+                pressure_target: None,
+                recommended_move: Vec2::zero(),
+                target_velocity: Vec2::zero(),
+                target_acceleration: Vec2::zero(),
+                local_mpc_guidance: true,
+                recommended_move_yards: 0.0,
+                recommended_speed_yps: 0.0,
+                recommended_acceleration_yps2: 0.0,
+                formation_error_yards: 0.0,
+                movement_error_yards: 0.0,
+                pair_error_yards: 0.0,
+                role_line_error_yards: 0.0,
+                pressure_error_yards: 0.0,
+                fore_aft_speed_error_yps: 0.0,
+                pressure_weight: 0.0,
+                speed_match_weight: 0.0,
+                alignment_weight: 0.0,
+                reduced_cost_target_x: 0.0,
+                reduced_cost_target_y: 0.0,
+                solver_status: "test".to_string(),
+                solver_objective: 0.0,
+                solver_iterations: None,
+                solver_elapsed_ms: 0.0,
+                variable_count: 0,
+                constraint_count: 0,
+            });
+    }
+
+    #[test]
+    fn mpc_reselect_rejection_probability_exposes_low_confidence_candidate() {
+        let sim = SoccerMatch::default_11v11(MatchConfig {
+            local_mpc_enabled: true,
+            ..MatchConfig::default()
+        });
+        let player = sim
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home field player");
+        let mut snapshot = WorldSnapshot::from_match(&sim);
+        push_test_mpc_guidance(&mut snapshot, player);
+        let impossible_pass = SoccerAction::Pass {
+            target_player: None,
+            power: 0.5,
+            flight: PassFlight::Floor,
+        };
+
+        let rejected_probability =
+            mpc_reselect_rejection_probability(&snapshot, player, &impossible_pass, "pass")
+                .expect("a no-target learned pass should become a neural-visible MPC rejection");
+        assert!(
+            (0.0..=1.0).contains(&rejected_probability),
+            "MPC rejection probability should be bounded, got {rejected_probability}"
+        );
+
+        let no_mpc = SoccerMatch::default_11v11(MatchConfig {
+            local_mpc_enabled: false,
+            ..MatchConfig::default()
+        });
+        let no_mpc_player = no_mpc
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home field player");
+        let no_mpc_snapshot = WorldSnapshot::from_match(&no_mpc);
+        assert_eq!(
+            mpc_reselect_rejection_probability(
+                &no_mpc_snapshot,
+                no_mpc_player,
+                &impossible_pass,
+                "pass"
+            ),
+            None,
+            "without local MPC guidance there is no planner rejection to train from"
+        );
     }
 }
 

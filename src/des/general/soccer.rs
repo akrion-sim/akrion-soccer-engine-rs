@@ -19338,6 +19338,10 @@ pub(crate) enum SoccerRewardEventKind {
     TwoForwardPasses,
     ThreePassForwardNetGain,
     ShotAttempt,
+    /// PENALTY (negative): a shot missed the frame by more than the forgiveness margin. This is
+    /// separate from [`ShotAttempt`](SoccerRewardEventKind::ShotAttempt) so a poor attempt never
+    /// masquerades as a positive team outcome.
+    ShotOffTargetPenalty,
     ShotOnTarget,
     /// A ball carrier moved forward in useful 2-yard chunks and converted that carry into a
     /// completed forward pass or shot-on-target, so the carry transitions get outcome credit.
@@ -19448,6 +19452,7 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::TwoForwardPasses
                 | SoccerRewardEventKind::ThreePassForwardNetGain
                 | SoccerRewardEventKind::ShotAttempt
+                | SoccerRewardEventKind::ShotOffTargetPenalty
                 | SoccerRewardEventKind::ShotOnTarget
                 | SoccerRewardEventKind::ProgressiveCarryIntoAttack
                 | SoccerRewardEventKind::ProgressiveCarryContinuation

@@ -1984,6 +1984,46 @@ mod tests {
     }
 
     #[test]
+    fn shot_off_target_penalty_replays_original_shot_transition_across_ticks() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            learning_enabled: true,
+            full_game_learning_enabled: true,
+            ..MatchConfig::default()
+        });
+        let (shooter, _) = first_home_field_pair(&sim);
+        sim.tick = 124;
+        sim.recent_learning_history
+            .push_back(world_test_transition(&sim, shooter, "shoot", 121));
+
+        let deferred_start = sim.deferred_reward_transitions.len();
+        let episode_start = sim.episode_learning_transitions.len();
+        sim.record_shot_off_target_penalty(Team::Home, shooter, 8.0);
+
+        let added = &sim.deferred_reward_transitions[deferred_start..];
+        assert!(
+            added.iter().any(|transition| {
+                transition.player_id == shooter
+                    && transition.tick == 121
+                    && normalize_soccer_action_label(&transition.action) == "shoot"
+                    && transition.reward < 0.0
+                    && !transition.done
+            }),
+            "shot-off-target penalty must replay the original shot decision, got {added:?}"
+        );
+        assert!(
+            sim.episode_learning_transitions[episode_start..]
+                .iter()
+                .any(|transition| {
+                    transition.player_id == shooter
+                        && transition.tick == 121
+                        && normalize_soccer_action_label(&transition.action) == "shoot"
+                        && transition.reward < 0.0
+                }),
+            "full-game replay must also see delayed shot-off-target penalty"
+        );
+    }
+
+    #[test]
     fn dribble_beat_feedback_replays_attacker_and_defender_transitions_across_ticks() {
         let mut sim = SoccerMatch::default_11v11(MatchConfig {
             learning_enabled: true,
@@ -12829,7 +12869,6 @@ impl SoccerMatch {
         shooter: usize,
         off_target_yards: f64,
     ) {
-        let _ = shooting_team;
         if !off_target_yards.is_finite() {
             return;
         }
@@ -12839,7 +12878,21 @@ impl SoccerMatch {
         }
         let penalty =
             (over * SHOT_OFF_TARGET_PENALTY_PER_YARD).min(SHOT_OFF_TARGET_MAX_PENALTY_POINTS);
-        self.record_reward_event(shooter, -penalty);
+        let replayed = self.queue_recent_outcome_learning_credit(
+            shooter,
+            shooting_team,
+            -penalty,
+            SoccerRewardEventKind::ShotOffTargetPenalty,
+            SHOT_OUTCOME_LEARNING_CREDIT_MAX_AGE_TICKS,
+            |action| matches!(action, "shoot" | "first-time-shot" | "first-time-header"),
+        );
+        if !replayed {
+            self.record_reward_event_with_kind(
+                shooter,
+                -penalty,
+                SoccerRewardEventKind::ShotOffTargetPenalty,
+            );
+        }
     }
 
     /// A shot OFF the frame still earns a small attempt reward (10 vs the on-frame
