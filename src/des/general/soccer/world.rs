@@ -2912,6 +2912,46 @@ mod tests {
     }
 
     #[test]
+    fn learned_mpc_replan_preserves_ranked_pass_target_counterexamples() {
+        let sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let player = sim
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home field player");
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let mdp_state = snapshot.mdp_state_for_player(player.id);
+        let observation = snapshot.observation_for(player.id);
+        let mut realized = sim.neural_decision_transition(
+            &snapshot,
+            player.id,
+            player.team,
+            player.role,
+            &mdp_state,
+            &observation,
+        );
+        realized.action = "pass2".to_string();
+        realized.decision_context.learned_mpc_replanned = true;
+        realized.decision_context.learned_mpc_original_action = Some("pass1".to_string());
+        realized.decision_context.learned_mpc_replacement_action = Some("pass2".to_string());
+        realized
+            .decision_context
+            .learned_mpc_rejected_execution_probability = 0.05;
+
+        assert!(!learned_mpc_rejected_action_counterexample(&realized));
+        assert!(
+            !soccer_actor_policy_sample_allowed(&realized),
+            "hard pass-target fallback should not train the actor to imitate the replacement"
+        );
+        let rejected = learned_mpc_rejected_action_transition(&realized)
+            .expect("ranked pass-target reselect should create a rejected original sample");
+        assert_eq!(rejected.action, "pass1");
+        assert!(learned_mpc_rejected_action_counterexample(&rejected));
+        assert!(soccer_actor_policy_sample_allowed(&rejected));
+        assert!(rejected.reward < 0.0);
+    }
+
+    #[test]
     fn soft_learned_mpc_replan_trains_toward_planner_replacement() {
         let sim = SoccerMatch::default_11v11(MatchConfig::default());
         let snapshot = WorldSnapshot::from_match(&sim);
@@ -4053,8 +4093,7 @@ fn learned_mpc_rejected_action_counterexample(transition: &SoccerLearningTransit
     else {
         return false;
     };
-    normalize_soccer_action_label(&transition.action)
-        == normalize_soccer_action_label(original_action)
+    learned_mpc_action_labels_match(&transition.action, original_action)
 }
 
 fn soccer_actor_policy_sample_allowed(transition: &SoccerLearningTransition) -> bool {
@@ -4069,8 +4108,7 @@ fn soccer_actor_policy_sample_allowed(transition: &SoccerLearningTransition) -> 
                 .learned_mpc_original_action
                 .as_deref()
                 .is_some_and(|original| {
-                    normalize_soccer_action_label(original)
-                        != normalize_soccer_action_label(&transition.action)
+                    !learned_mpc_action_labels_match(original, &transition.action)
                 }))
 }
 
@@ -4208,8 +4246,7 @@ fn learned_mpc_rejected_action_context(
     context.dribble_touch_distance_bin = 0;
     context.dribble_touch_forward_class = 0;
     context.learned_mpc_replanned = true;
-    context.learned_mpc_original_action =
-        Some(normalize_soccer_action_label(original_action).to_string());
+    context.learned_mpc_original_action = Some(learned_mpc_action_label_key(original_action));
     let rejected_execution =
         finite_unit_interval(context.learned_mpc_rejected_execution_probability);
     context.chosen_action_mpc_feasibility = rejected_execution;
@@ -4231,9 +4268,9 @@ fn learned_mpc_rejected_action_transition(
         .decision_context
         .learned_mpc_original_action
         .as_deref()
-        .map(normalize_soccer_action_label)?;
+        .map(learned_mpc_action_label_key)?;
     if original_action.trim().is_empty()
-        || original_action == normalize_soccer_action_label(&realized.action)
+        || learned_mpc_action_labels_match(&original_action, &realized.action)
     {
         return None;
     }
@@ -4249,7 +4286,7 @@ fn learned_mpc_rejected_action_transition(
     rejected.action = original_action.to_string();
     rejected.action_target = None;
     rejected.decision_context =
-        learned_mpc_rejected_action_context(&realized.decision_context, original_action);
+        learned_mpc_rejected_action_context(&realized.decision_context, &original_action);
     rejected.tactical_trace = SoccerTacticalLearningTrace::default();
     rejected.reward = reward;
     rejected.next_state = rejected.state.clone();
@@ -6834,16 +6871,18 @@ impl SoccerMatch {
         selected: &SoccerNeuralMctsNode,
         candidate_count: usize,
     ) -> Option<SoccerLearnedMpcReplanTrace> {
-        let original_label = normalize_soccer_action_label(&original.label);
-        let selected_label = normalize_soccer_action_label(&selected.label);
+        let original_label = learned_mpc_action_label_key(&original.label);
+        let selected_label = learned_mpc_action_label_key(&selected.label);
         if original_label == selected_label {
             return None;
         }
+        let original_family = normalize_soccer_action_label(&original.label);
+        let selected_family = normalize_soccer_action_label(&selected.label);
         if matches!(
-            original_label,
+            original_family,
             "shoot" | "first-time-shot" | "first-time-header"
         ) && !matches!(
-            selected_label,
+            selected_family,
             "shoot" | "first-time-shot" | "first-time-header"
         ) {
             return None;
@@ -6852,8 +6891,8 @@ impl SoccerMatch {
             return None;
         }
         Some(SoccerLearnedMpcReplanTrace {
-            original_action: original_label.to_string(),
-            replacement_action: selected_label.to_string(),
+            original_action: original_label,
+            replacement_action: selected_label,
             rejected_execution_probability: NEURAL_MCTS_DISTILLATION_REJECTED_PROBABILITY,
             candidate_count,
         })
@@ -7554,7 +7593,8 @@ impl SoccerMatch {
         player_id: usize,
         plan: SoccerLearnedPlan,
     ) -> SoccerLearnedPlan {
-        let original_action = normalize_soccer_action_label(&plan.action).to_string();
+        let original_action = learned_mpc_action_label_key(&plan.action);
+        let original_family = normalize_soccer_action_label(&plan.action);
         let original_execution_probability =
             Self::learned_plan_mpc_execution_probability(snapshot, player_id, &plan)
                 .unwrap_or(0.0)
@@ -7562,7 +7602,7 @@ impl SoccerMatch {
         let hard_replan = Self::learned_plan_needs_mpc_replan(snapshot, player_id, &plan);
         let soft_replan_eligible = !hard_replan
             && !matches!(
-                original_action.as_str(),
+                original_family,
                 "shoot" | "first-time-shot" | "first-time-header"
             )
             && original_execution_probability >= LEARNED_MPC_SOFT_REPLAN_MIN_ORIGINAL_PROBABILITY
@@ -7579,7 +7619,7 @@ impl SoccerMatch {
         };
         let mut candidate_count = 0usize;
         for candidate in ranked.iter().filter(|candidate| candidate.legal) {
-            if normalize_soccer_action_label(&candidate.label) == original_action {
+            if learned_mpc_action_labels_match(&candidate.label, &original_action) {
                 continue;
             }
             candidate_count += 1;
@@ -7596,7 +7636,7 @@ impl SoccerMatch {
             } else {
                 !candidate_hard_replan
                     && Self::learned_plan_soft_mpc_replan_candidate(
-                        &original_action,
+                        original_family,
                         original_execution_probability,
                         candidate_execution_probability,
                     )
@@ -7604,8 +7644,7 @@ impl SoccerMatch {
             if candidate_is_replacement {
                 candidate_plan.mpc_replan = Some(SoccerLearnedMpcReplanTrace {
                     original_action: original_action.clone(),
-                    replacement_action: normalize_soccer_action_label(&candidate_plan.action)
-                        .to_string(),
+                    replacement_action: learned_mpc_action_label_key(&candidate_plan.action),
                     rejected_execution_probability: original_execution_probability,
                     candidate_count,
                 });

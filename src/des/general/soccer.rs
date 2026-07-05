@@ -14322,6 +14322,27 @@ fn normalize_soccer_action_label(action: &str) -> &str {
     SoccerActionLabel::canonical_str(action).unwrap_or(action)
 }
 
+fn learned_mpc_action_label_key(action: &str) -> String {
+    let trimmed = action.trim();
+    if ranked_pass_action_label(trimmed) {
+        trimmed.to_string()
+    } else {
+        normalize_soccer_action_label(trimmed).to_string()
+    }
+}
+
+fn learned_mpc_action_labels_match(left: &str, right: &str) -> bool {
+    learned_mpc_action_label_key(left) == learned_mpc_action_label_key(right)
+}
+
+fn ranked_pass_action_label(action: &str) -> bool {
+    ["pass", "aerial-pass"].iter().any(|prefix| {
+        action
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
 // FLANK_CROSS_MIN_FLANK_SCORE / FLANK_CROSS_MAX_YARDS_TO_GOAL moved to
 // `tunables().flank_cross` (env/Postgres-overridable). See soccer/tunables.rs.
 const FLANK_OVERLAP_MIN_OPTION_SHARE: f64 = 1.0 / 3.0;

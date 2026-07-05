@@ -11809,9 +11809,8 @@ impl PlayerAgent {
                 learned_mpc_reselect_label.as_deref(),
                 learned_mpc_reselect_probability,
             ) {
-                let original_action = normalize_soccer_action_label(original).to_string();
-                let replacement_action =
-                    normalize_soccer_action_label(&decision.action).to_string();
+                let original_action = learned_mpc_action_label_key(original);
+                let replacement_action = learned_mpc_action_label_key(&decision.action);
                 if original_action != replacement_action {
                     decision.learned_mpc_replan = Some(SoccerLearnedMpcReplanTrace {
                         original_action,
