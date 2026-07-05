@@ -14008,6 +14008,185 @@ fn soccer_correlated_full_game_replay_transitions(
     replay
 }
 
+/// Compact, team-relative abstraction of the symbolic MDP state for the DP value table. From the
+/// acting team's perspective: attacking-third of the ball (x), lateral third (y), possession
+/// (us/them/loose), score sign (winning/level/losing), and a team-relative phase (our-build /
+/// our-attack / their-build / their-attack / kickoff / transition). Cardinality ≤ 3·3·3·3·6 = 486
+/// so a single game's transitions sample it densely. Away's attacking third is mirrored so that
+/// "in our attacking third" maps to the SAME bucket for both teams, pooling samples.
+fn soccer_dp_state_bucket(
+    state: &SoccerMdpState,
+    team: Team,
+    ball_x_max: usize,
+    ball_y_max: usize,
+) -> u32 {
+    let third = |z: usize, max: usize| -> u32 {
+        if max == 0 {
+            return 1;
+        }
+        ((z as u64 * 3 / (max as u64 + 1)) as u32).min(2)
+    };
+    let mut x_third = third(state.ball_zone_x, ball_x_max);
+    if team == Team::Away {
+        x_third = 2 - x_third;
+    }
+    let y_third = third(state.ball_zone_y, ball_y_max);
+    let poss = match state.possession_team {
+        Some(t) if t == team => 0u32,
+        Some(_) => 1,
+        None => 2,
+    };
+    let sd = match team {
+        Team::Home => state.score_diff_for_home,
+        Team::Away => -state.score_diff_for_home,
+    };
+    let score_sign = if sd > 0 {
+        2u32
+    } else if sd < 0 {
+        0
+    } else {
+        1
+    };
+    let phase = match (state.phase, team) {
+        (TacticalPhase::Kickoff, _) => 4u32,
+        (TacticalPhase::Transition, _) => 5,
+        (TacticalPhase::HomeBuildUp, Team::Home) | (TacticalPhase::AwayBuildUp, Team::Away) => 0,
+        (TacticalPhase::HomeAttack, Team::Home) | (TacticalPhase::AwayAttack, Team::Away) => 1,
+        (TacticalPhase::HomeBuildUp, Team::Away) | (TacticalPhase::AwayBuildUp, Team::Home) => 2,
+        (TacticalPhase::HomeAttack, Team::Away) | (TacticalPhase::AwayAttack, Team::Home) => 3,
+    };
+    (((x_third * 3 + y_third) * 3 + poss) * 3 + score_sign) * 6 + phase
+}
+
+/// Fitted-value-iteration replay (approximate dynamic programming). Replaces the pure Monte-Carlo
+/// correlated team return of `soccer_correlated_full_game_replay_transitions` with an **n-step
+/// return bootstrapped by a value-iterated abstract-state table**. The individual-reward blend,
+/// flat outcome label, clamps, and `done` flag are byte-identical to the MC path, so the gate is a
+/// clean A/B that changes ONLY the correlated-return quantity from full-MC to DP-bootstrapped.
+fn soccer_dp_bootstrapped_replay_transitions(
+    transitions: &[SoccerLearningTransition],
+    match_outcome: Option<MatchOutcomeReward>,
+) -> Vec<SoccerLearningTransition> {
+    if transitions.is_empty() {
+        return Vec::new();
+    }
+    let gamma = SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK;
+    let horizon = dd_soccer_dp_bootstrap_horizon();
+    let sweeps = dd_soccer_dp_bootstrap_sweeps();
+    let team_index = |team: Team| -> usize {
+        match team {
+            Team::Home => 0,
+            Team::Away => 1,
+        }
+    };
+
+    // Ball-zone extents for adaptive thirds.
+    let mut ball_x_max = 0usize;
+    let mut ball_y_max = 0usize;
+    for t in transitions {
+        ball_x_max = ball_x_max.max(t.state.ball_zone_x);
+        ball_y_max = ball_y_max.max(t.state.ball_zone_y);
+    }
+
+    // Per-team decision sequences (tick-sorted): mean team reward + abstract bucket at each tick.
+    let mut by_tick: BTreeMap<u64, [(f64, usize, u32); 2]> = BTreeMap::new();
+    for t in transitions {
+        let bucket = soccer_dp_state_bucket(&t.state, t.team, ball_x_max, ball_y_max);
+        let slot = &mut by_tick.entry(t.tick).or_insert([(0.0, 0, 0); 2])[team_index(t.team)];
+        slot.0 += finite_metric(t.reward);
+        slot.1 += 1;
+        slot.2 = bucket;
+    }
+    let mut seq: [Vec<(u64, f64, u32)>; 2] = [Vec::new(), Vec::new()];
+    for (tick, slots) in &by_tick {
+        for (ti, slot) in slots.iter().enumerate() {
+            let (sum, count, bucket) = *slot;
+            if count > 0 {
+                seq[ti].push((*tick, sum / count as f64, bucket));
+            }
+        }
+    }
+
+    // Sample-based value iteration over pooled (bucket, reward, next_bucket) tuples from both teams.
+    // Jacobi sweeps: V(b) <- mean over samples from b of [r + γ·V(b')]. Terminal step bootstraps 0
+    // (the flat outcome label is added separately below, exactly as in the MC path).
+    let mut samples: Vec<(u32, f64, Option<u32>)> = Vec::new();
+    for s in &seq {
+        for i in 0..s.len() {
+            samples.push((s[i].2, s[i].1, s.get(i + 1).map(|n| n.2)));
+        }
+    }
+    let mut value: BTreeMap<u32, f64> = BTreeMap::new();
+    for _ in 0..sweeps {
+        let mut acc: BTreeMap<u32, (f64, usize)> = BTreeMap::new();
+        for (b, r, nb) in &samples {
+            let boot = match nb {
+                Some(nb) => gamma * *value.get(nb).unwrap_or(&0.0),
+                None => 0.0,
+            };
+            let e = acc.entry(*b).or_insert((0.0, 0));
+            e.0 += *r + boot;
+            e.1 += 1;
+        }
+        for (b, (sum, count)) in acc {
+            if count > 0 {
+                value.insert(
+                    b,
+                    (sum / count as f64)
+                        .clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP),
+                );
+            }
+        }
+    }
+
+    // n-step bootstrapped correlated return per (team, tick): Σ_{k<h} γ^k r_{i+k} + γ^h V(b_{i+h}).
+    let mut correlated: BTreeMap<(usize, u64), f64> = BTreeMap::new();
+    for (ti, s) in seq.iter().enumerate() {
+        for i in 0..s.len() {
+            let mut ret = 0.0;
+            let mut disc = 1.0;
+            for k in 0..horizon {
+                let j = i + k;
+                if j >= s.len() {
+                    break;
+                }
+                ret += disc * s[j].1;
+                disc *= gamma;
+                if k + 1 == horizon {
+                    if let Some(nb) = s.get(j + 1).map(|n| n.2) {
+                        ret += disc * *value.get(&nb).unwrap_or(&0.0);
+                    }
+                }
+            }
+            correlated.insert(
+                (ti, s[i].0),
+                ret.clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP),
+            );
+        }
+    }
+
+    // Assemble replay: identical blend / outcome / clamp / done to the MC correlated path.
+    let mut replay = Vec::with_capacity(transitions.len());
+    for t in transitions {
+        let mut transition = t.clone();
+        let corr = correlated
+            .get(&(team_index(transition.team), transition.tick))
+            .copied()
+            .unwrap_or(0.0);
+        let blended = (1.0 - SOCCER_FULL_GAME_RETURN_BLEND) * finite_metric(transition.reward)
+            + SOCCER_FULL_GAME_RETURN_BLEND * corr;
+        let with_outcome = match match_outcome {
+            Some(outcome) => blended + outcome.for_team(transition.team),
+            None => blended,
+        };
+        transition.reward =
+            with_outcome.clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP);
+        transition.done = true;
+        replay.push(transition);
+    }
+    replay
+}
+
 fn soccer_outcome_credit_replay_transitions(
     transitions: &[SoccerLearningTransition],
     match_outcome: Option<MatchOutcomeReward>,
