@@ -4279,7 +4279,7 @@ mod tests {
 
         assert_eq!(
             soccer_actor_advantage_with_planner_distillation(&transition, -0.02),
-            NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR
+            -0.02
         );
         assert_eq!(
             soccer_actor_advantage_with_planner_distillation(
@@ -4299,6 +4299,9 @@ mod tests {
     #[test]
     fn neural_mcts_distillation_tolerates_small_value_noise() {
         let mut transition = policy_test_transition_with_mcts(true);
+        transition.decision_context.learned_mpc_replanned = true;
+        transition.decision_context.learned_mpc_original_action = Some("dribble".to_string());
+        transition.decision_context.learned_mpc_replacement_action = Some("pass".to_string());
         transition.reward = -0.01;
 
         assert_eq!(
@@ -4312,13 +4315,40 @@ mod tests {
     }
 
     #[test]
+    fn neural_mcts_distillation_noise_tolerance_requires_replacement_trace() {
+        let mut transition = policy_test_transition_with_mcts(true);
+        transition.reward = -0.01;
+
+        assert_eq!(
+            soccer_actor_advantage_with_planner_distillation(&transition, -0.03),
+            -0.03
+        );
+    }
+
+    #[test]
     fn neural_mcts_distillation_rejects_deep_negative_value() {
-        let transition = policy_test_transition_with_mcts(true);
+        let mut transition = policy_test_transition_with_mcts(true);
+        transition.decision_context.learned_mpc_replanned = true;
+        transition.decision_context.learned_mpc_original_action = Some("dribble".to_string());
+        transition.decision_context.learned_mpc_replacement_action = Some("pass".to_string());
 
         assert_eq!(
             soccer_actor_advantage_with_planner_distillation(&transition, -0.50),
             -0.50
         );
+    }
+
+    #[test]
+    fn neural_training_samples_skip_frozen_analytic_opponent() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        sim.disable_team_neural_brain(Team::Away);
+        let home = policy_test_transition_with_mcts(false);
+        let mut away = home.clone();
+        away.team = Team::Away;
+
+        let samples = sim.neural_training_samples_for(&[home, away]);
+
+        assert_eq!(samples.len(), 1);
     }
 
     #[test]
@@ -4663,11 +4693,32 @@ fn soccer_actor_mcts_distillation_candidate(
     transition: &SoccerLearningTransition,
     advantage: f64,
 ) -> bool {
-    advantage.is_finite()
-        && transition.decision_context.neural_mcts_selected
-        && !learned_mpc_rejected_action_counterexample(transition)
+    if !advantage.is_finite()
+        || !transition.decision_context.neural_mcts_selected
+        || learned_mpc_rejected_action_counterexample(transition)
+    {
+        return false;
+    }
+    if advantage >= 0.0 && transition.reward >= 0.0 {
+        return true;
+    }
+    soccer_actor_mcts_distillation_replacement_trace(transition)
         && advantage >= -neural_mcts_distillation_advantage_noise_tolerance()
         && transition.reward >= neural_mcts_distillation_min_reward()
+}
+
+fn soccer_actor_mcts_distillation_replacement_trace(transition: &SoccerLearningTransition) -> bool {
+    if !transition.decision_context.learned_mpc_replanned {
+        return false;
+    }
+    let Some(original) = transition
+        .decision_context
+        .learned_mpc_original_action
+        .as_deref()
+    else {
+        return false;
+    };
+    !learned_mpc_action_labels_match(original, &transition.action)
 }
 
 fn soccer_actor_mcts_distillation_priority(
@@ -8848,6 +8899,7 @@ impl SoccerMatch {
         let tick_rewards = soccer_marl_tick_rewards(transitions);
         transitions
             .iter()
+            .filter(|transition| !self.neural_team_frozen(transition.team))
             .filter(|transition| team_filter.map_or(true, |team| transition.team == team))
             .filter_map(|transition| {
                 let adjusted_reward = soccer_marl_adjusted_reward(
@@ -9159,10 +9211,12 @@ impl SoccerMatch {
         // transition is later valued by its own team's critic.
         let home_ready = self
             .neural_learner_for(Team::Home)
-            .map_or(false, |learner| learner.has_prediction_network());
+            .map_or(false, |learner| learner.has_prediction_network())
+            && !self.neural_team_frozen(Team::Home);
         let away_ready = self
             .neural_learner_for(Team::Away)
-            .map_or(false, |learner| learner.has_prediction_network());
+            .map_or(false, |learner| learner.has_prediction_network())
+            && !self.neural_team_frozen(Team::Away);
         if (!home_ready && !away_ready) || replay.is_empty() {
             return Vec::new();
         }
@@ -9217,6 +9271,9 @@ impl SoccerMatch {
             if learned_mpc_rejected_action_counterexample(transition) {
                 continue;
             }
+            if self.neural_team_frozen(transition.team) {
+                continue;
+            }
             by_agent
                 .entry((transition.team, transition.player_id))
                 .or_default()
@@ -9260,6 +9317,9 @@ impl SoccerMatch {
             .iter()
             .enumerate()
             .filter_map(|(index, transition)| {
+                if self.neural_team_frozen(transition.team) {
+                    return None;
+                }
                 let rejected_counterexample =
                     learned_mpc_rejected_action_counterexample(transition);
                 if !soccer_actor_policy_sample_allowed(transition) {
@@ -9373,6 +9433,7 @@ impl SoccerMatch {
     ) -> Vec<SoccerKeeperPolicySample> {
         let mut samples: Vec<SoccerKeeperPolicySample> = replay
             .iter()
+            .filter(|transition| !self.neural_team_frozen(transition.team))
             .filter(|transition| transition.role == PlayerRole::Goalkeeper)
             .filter(|transition| soccer_actor_policy_sample_allowed(transition))
             .filter_map(|transition| {
