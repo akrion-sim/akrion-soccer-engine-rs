@@ -21,8 +21,8 @@ const TURNOVER_DANGER_OUTCOME_LOOKAHEAD_TICKS: u64 = 120;
 const TURNOVER_DANGER_OUTCOME_PROGRESS_YARDS: f64 = 30.0;
 const TURNOVER_DANGER_OUTCOME_EXTRA_MULTIPLIER: f64 = 1.0;
 const DEFENSIVE_SHOT_ON_TARGET_HISTORY_ACTIONS: usize = 36;
-const DEFENSIVE_SHOT_ON_TARGET_MAX_PENALTY: f64 = 2.65;
-const DEFENSIVE_SHOT_ON_TARGET_MIN_PENALTY: f64 = 0.50;
+const DEFENSIVE_SHOT_ON_TARGET_DEFAULT_MAX_PENALTY: f64 = 1.35;
+const DEFENSIVE_SHOT_ON_TARGET_DEFAULT_MIN_PENALTY: f64 = 0.25;
 const SOCCER_POLICY_RANK_SALT_TEAM_TABULAR: u64 = 0x5445_414d_5441_4255;
 const SOCCER_POLICY_RANK_SALT_SHARED_TABULAR: u64 = 0x5348_4152_5441_4255;
 const SOCCER_POLICY_RANK_SALT_TEAM_NEURAL: u64 = 0x5445_414d_4e45_5552;
@@ -38,6 +38,26 @@ const SOCCER_POLICY_EXPLORATION_CANDIDATE_LIMIT: usize =
     } else {
         POLICY_SELECTION_TOP_RANK_LIMIT
     };
+
+fn defensive_shot_on_target_penalty_points() -> (f64, f64) {
+    use std::sync::OnceLock;
+    static V: OnceLock<(f64, f64)> = OnceLock::new();
+    *V.get_or_init(|| {
+        let max = std::env::var("SOCCER_DEFENSIVE_SOT_MAX_PENALTY")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .unwrap_or(DEFENSIVE_SHOT_ON_TARGET_DEFAULT_MAX_PENALTY);
+        let min = std::env::var("SOCCER_DEFENSIVE_SOT_MIN_PENALTY")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .unwrap_or(DEFENSIVE_SHOT_ON_TARGET_DEFAULT_MIN_PENALTY)
+            .min(max);
+        (min, max)
+    })
+}
+
 const SOCCER_POLICY_EXPLORATION_TAIL_MASS_LIMIT: f64 = 0.25;
 const SOCCER_POLICY_EXPLORATION_TAIL_RANK_DECAY: f64 = 0.85;
 const PASS_TARGET_MARK_HORIZON_TICKS: [f64; 5] = [0.0, 1.0, 2.0, 4.0, 8.0];
@@ -2494,7 +2514,7 @@ mod tests {
             "defenders should receive stronger shot-on-target blame than keepers: defender={defender_penalty}, keeper={goalkeeper_penalty}"
         );
         assert!(
-            defender_penalty <= -2.0,
+            defender_penalty <= -1.0,
             "conceded shots on target need a material defensive learning signal, got {defender_penalty}"
         );
     }
@@ -12205,6 +12225,7 @@ impl SoccerMatch {
         }
 
         let danger = (0.35 + 0.65 * shot_danger_scale.clamp(0.0, 1.0)).clamp(0.35, 1.0);
+        let (min_penalty, max_penalty) = defensive_shot_on_target_penalty_points();
         let history = self
             .recent_learning_history
             .iter()
@@ -12226,9 +12247,7 @@ impl SoccerMatch {
             } else {
                 1.0 - actions as f64 / (DEFENSIVE_SHOT_ON_TARGET_HISTORY_ACTIONS - 1) as f64
             };
-            let base = DEFENSIVE_SHOT_ON_TARGET_MIN_PENALTY
-                + (DEFENSIVE_SHOT_ON_TARGET_MAX_PENALTY - DEFENSIVE_SHOT_ON_TARGET_MIN_PENALTY)
-                    * recency.clamp(0.0, 1.0);
+            let base = min_penalty + (max_penalty - min_penalty) * recency.clamp(0.0, 1.0);
             transition.reward = -(base * role_multiplier * danger);
             transition.done = false;
             self.deferred_reward_transitions.push(transition);
