@@ -19,6 +19,8 @@ const LEARNED_MPC_SOFT_REPLAN_MIN_REPLACEMENT_PROBABILITY: f64 = 0.68;
 const LEARNED_MPC_SOFT_REPLAN_MIN_IMPROVEMENT: f64 = 0.22;
 const NEURAL_MCTS_DISTILLATION_MAX_SCORE_REGRESSION: f64 = 0.08;
 const NEURAL_MCTS_DISTILLATION_REJECTED_PROBABILITY: f64 = 0.35;
+const NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR: f64 = 0.06;
+const NEURAL_MCTS_DISTILLATION_MAX_RESCUED_NEGATIVE: f64 = 0.12;
 const LEARNED_MPC_REJECTED_ACTION_PENALTY_POINTS: f64 = 2.5;
 const LEARNED_TARGET_GRID_MIN_VISITS: u32 = 1;
 const GAIT_PHYSICS_STAND_SPEED_YPS: f64 = 0.25;
@@ -1517,6 +1519,44 @@ mod tests {
             backward_path_traffic_risk,
             long_aerial_bounds_risk,
             ..PassTargetQuality::default()
+        }
+    }
+
+    fn policy_test_transition_with_mcts(selected: bool) -> SoccerLearningTransition {
+        let sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let player = snapshot
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home field player");
+        let state = snapshot.mdp_state_for_player(player.id);
+        let observation = snapshot.observation_for(player.id);
+        let mut decision_context = soccer_decision_context_for(
+            player.id,
+            player.team,
+            "pass",
+            None,
+            &snapshot,
+            &snapshot,
+        );
+        decision_context.neural_mcts_selected = selected;
+        SoccerLearningTransition {
+            tick: snapshot.tick,
+            player_id: player.id,
+            team: player.team,
+            role: player.role,
+            state: state.clone(),
+            observation: observation.clone(),
+            belief: belief_from_observation(&observation),
+            action: "pass".to_string(),
+            action_target: None,
+            decision_context,
+            tactical_trace: SoccerTacticalLearningTrace::default(),
+            reward: 0.0,
+            next_state: state,
+            next_observation: observation,
+            done: false,
         }
     }
 
@@ -3087,6 +3127,38 @@ mod tests {
     }
 
     #[test]
+    fn neural_mcts_distillation_floors_near_neutral_actor_advantage() {
+        let transition = policy_test_transition_with_mcts(true);
+
+        assert_eq!(
+            soccer_actor_advantage_with_planner_distillation(&transition, -0.02),
+            NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR
+        );
+        assert_eq!(
+            soccer_actor_advantage_with_planner_distillation(&transition, 0.01),
+            NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR
+        );
+    }
+
+    #[test]
+    fn neural_mcts_distillation_keeps_bad_outcomes_negative() {
+        let transition = policy_test_transition_with_mcts(true);
+        let bad_advantage = -NEURAL_MCTS_DISTILLATION_MAX_RESCUED_NEGATIVE - 0.01;
+
+        assert_eq!(
+            soccer_actor_advantage_with_planner_distillation(&transition, bad_advantage),
+            bad_advantage
+        );
+        assert_eq!(
+            soccer_actor_advantage_with_planner_distillation(
+                &policy_test_transition_with_mcts(false),
+                -0.02
+            ),
+            -0.02
+        );
+    }
+
+    #[test]
     fn soft_mpc_replan_requires_material_execution_improvement() {
         assert!(SoccerMatch::learned_plan_soft_mpc_replan_candidate(
             "press-cover",
@@ -3416,6 +3488,20 @@ fn soccer_actor_policy_sample_allowed(transition: &SoccerLearningTransition) -> 
                     normalize_soccer_action_label(original)
                         != normalize_soccer_action_label(&transition.action)
                 }))
+}
+
+fn soccer_actor_advantage_with_planner_distillation(
+    transition: &SoccerLearningTransition,
+    advantage: f64,
+) -> f64 {
+    if !advantage.is_finite()
+        || !transition.decision_context.neural_mcts_selected
+        || learned_mpc_rejected_action_counterexample(transition)
+        || advantage < -NEURAL_MCTS_DISTILLATION_MAX_RESCUED_NEGATIVE
+    {
+        return advantage;
+    }
+    advantage.max(NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR)
 }
 
 fn soccer_actor_advantage_tick_rewards(
@@ -7921,6 +8007,8 @@ impl SoccerMatch {
                 } else {
                     advantages[index]
                 };
+                let advantage =
+                    soccer_actor_advantage_with_planner_distillation(transition, advantage);
                 let state_features = self.policy_state_features(transition);
                 let actor_probability = self
                     .policy_head
