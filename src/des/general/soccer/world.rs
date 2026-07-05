@@ -17,6 +17,8 @@ const LEARNED_MPC_SOFT_REPLAN_MIN_ORIGINAL_PROBABILITY: f64 = 0.08;
 const LEARNED_MPC_SOFT_REPLAN_MAX_ORIGINAL_PROBABILITY: f64 = 0.55;
 const LEARNED_MPC_SOFT_REPLAN_MIN_REPLACEMENT_PROBABILITY: f64 = 0.68;
 const LEARNED_MPC_SOFT_REPLAN_MIN_IMPROVEMENT: f64 = 0.22;
+const NEURAL_MCTS_DISTILLATION_MAX_SCORE_REGRESSION: f64 = 0.08;
+const NEURAL_MCTS_DISTILLATION_REJECTED_PROBABILITY: f64 = 0.35;
 const LEARNED_MPC_REJECTED_ACTION_PENALTY_POINTS: f64 = 2.5;
 const LEARNED_TARGET_GRID_MIN_VISITS: u32 = 1;
 const GAIT_PHYSICS_STAND_SPEED_YPS: f64 = 0.25;
@@ -2997,6 +2999,90 @@ mod tests {
                 .as_ref()
                 .map(|choice| choice.label.as_str()),
             Some("pass")
+        );
+    }
+
+    #[test]
+    fn neural_mcts_distills_top_visit_winner_as_policy_improvement() {
+        let blend = SoccerNeuralBlendConfig {
+            mcts_enabled: true,
+            mcts_simulations: 6,
+            mcts_candidates: 2,
+            ..SoccerNeuralBlendConfig::default()
+        };
+        let candidates = vec![
+            SoccerNeuralMctsCandidate {
+                label: "dribble".to_string(),
+                plan: Some(SoccerLearnedPlan {
+                    action: "dribble".to_string(),
+                    ..SoccerLearnedPlan::default()
+                }),
+                score: 0.5,
+                prior: 0.05,
+                q_visits: 1,
+            },
+            SoccerNeuralMctsCandidate {
+                label: "pass".to_string(),
+                plan: Some(SoccerLearnedPlan {
+                    action: "pass".to_string(),
+                    ..SoccerLearnedPlan::default()
+                }),
+                score: 0.5,
+                prior: 0.9,
+                q_visits: 1,
+            },
+        ];
+
+        let choice =
+            SoccerMatch::neural_mcts_action_from_candidates(blend, &candidates, 0.0).unwrap();
+        assert_eq!(choice.label, "pass");
+        let replan = choice.plan.and_then(|plan| plan.mpc_replan).unwrap();
+        assert_eq!(replan.original_action, "dribble");
+        assert_eq!(replan.replacement_action, "pass");
+        assert_eq!(
+            replan.rejected_execution_probability,
+            NEURAL_MCTS_DISTILLATION_REJECTED_PROBABILITY
+        );
+        assert_eq!(replan.candidate_count, 2);
+    }
+
+    #[test]
+    fn neural_mcts_distillation_does_not_train_away_from_shots() {
+        let blend = SoccerNeuralBlendConfig {
+            mcts_enabled: true,
+            mcts_simulations: 6,
+            mcts_candidates: 2,
+            ..SoccerNeuralBlendConfig::default()
+        };
+        let candidates = vec![
+            SoccerNeuralMctsCandidate {
+                label: "shoot".to_string(),
+                plan: Some(SoccerLearnedPlan {
+                    action: "shoot".to_string(),
+                    ..SoccerLearnedPlan::default()
+                }),
+                score: 0.5,
+                prior: 0.05,
+                q_visits: 1,
+            },
+            SoccerNeuralMctsCandidate {
+                label: "pass".to_string(),
+                plan: Some(SoccerLearnedPlan {
+                    action: "pass".to_string(),
+                    ..SoccerLearnedPlan::default()
+                }),
+                score: 0.5,
+                prior: 0.9,
+                q_visits: 1,
+            },
+        ];
+
+        let choice =
+            SoccerMatch::neural_mcts_action_from_candidates(blend, &candidates, 0.0).unwrap();
+        assert_eq!(choice.label, "pass");
+        assert!(
+            choice.plan.and_then(|plan| plan.mpc_replan).is_none(),
+            "search may choose the pass, but the actor must not be trained to replace a shot"
         );
     }
 
@@ -5993,17 +6079,59 @@ impl SoccerMatch {
             return None;
         }
         let selected_rank = soccer_policy_weighted_rank_index(candidate_count, draw);
-        nodes
-            .get(selected_rank)
-            .map(|node| SoccerPolicyActionChoice {
+        nodes.get(selected_rank).map(|node| {
+            let mut plan = node.plan.clone();
+            if selected_rank == 0 {
+                if let (Some(original), Some(plan)) = (candidates.first(), plan.as_mut()) {
+                    if plan.mpc_replan.is_none() {
+                        plan.mpc_replan = Self::neural_mcts_policy_improvement_replan(
+                            original,
+                            node,
+                            candidate_count,
+                        );
+                    }
+                }
+            }
+            SoccerPolicyActionChoice {
                 label: node.label.clone(),
-                plan: node.plan.clone(),
+                plan,
                 behavior_probability: soccer_policy_rank_probability(
                     candidate_count,
                     selected_rank,
                 ),
                 neural_mcts_selected: true,
-            })
+            }
+        })
+    }
+
+    fn neural_mcts_policy_improvement_replan(
+        original: &SoccerNeuralMctsCandidate,
+        selected: &SoccerNeuralMctsNode,
+        candidate_count: usize,
+    ) -> Option<SoccerLearnedMpcReplanTrace> {
+        let original_label = normalize_soccer_action_label(&original.label);
+        let selected_label = normalize_soccer_action_label(&selected.label);
+        if original_label == selected_label {
+            return None;
+        }
+        if matches!(
+            original_label,
+            "shoot" | "first-time-shot" | "first-time-header"
+        ) && !matches!(
+            selected_label,
+            "shoot" | "first-time-shot" | "first-time-header"
+        ) {
+            return None;
+        }
+        if selected.raw_score + NEURAL_MCTS_DISTILLATION_MAX_SCORE_REGRESSION < original.score {
+            return None;
+        }
+        Some(SoccerLearnedMpcReplanTrace {
+            original_action: original_label.to_string(),
+            replacement_action: selected_label.to_string(),
+            rejected_execution_probability: NEURAL_MCTS_DISTILLATION_REJECTED_PROBABILITY,
+            candidate_count,
+        })
     }
 
     fn neural_mcts_model_rollout_value(

@@ -4380,6 +4380,7 @@ const SOCCER_NEURAL_BELIEF_FEATURE_DIM: usize = 4;
 const SOCCER_NEURAL_OPP_BELIEF_DIM: usize = 4;
 const SOCCER_NEURAL_OPP_BELIEF_NEAR_RADIUS_YARDS: f64 = 18.0;
 const SOCCER_NEURAL_LEARNED_MPC_REPLAN_FEATURE_DIM: usize = 4;
+const LEARNED_MPC_SOFT_REPLAN_REWARD_THRESHOLD: f64 = 0.08;
 const SOCCER_NEURAL_OPTION_CONTROL_FEATURE_DIM: usize = 8;
 const SOCCER_NEURAL_HUMAN_INTENT_FEATURE_DIM: usize = 4;
 /// Append-only back-four line model block. The existing whole-field motion block
@@ -24752,7 +24753,10 @@ fn soccer_decision_option_control_reward(decision: &AgentDecisionTrace) -> f64 {
         }
     }
     if let Some(replan) = decision.learned_mpc_replan.as_ref() {
-        reward -= 0.45 + replan.rejected_execution_probability.clamp(0.0, 1.0) * 1.10;
+        let rejected_probability = replan.rejected_execution_probability.clamp(0.0, 1.0);
+        if rejected_probability < LEARNED_MPC_SOFT_REPLAN_REWARD_THRESHOLD {
+            reward -= 0.45 + rejected_probability * 1.10;
+        }
     }
     if let Some(comparison) = decision.mdp_mpc_comparison.as_ref() {
         reward += finite_unit_interval(comparison.mpc_execution_probability) * 0.18;
