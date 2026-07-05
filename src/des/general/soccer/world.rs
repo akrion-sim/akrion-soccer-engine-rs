@@ -2135,6 +2135,90 @@ mod tests {
     }
 
     #[test]
+    fn loose_pass_to_nobody_penalty_replays_original_pass_transition_across_ticks() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            learning_enabled: true,
+            full_game_learning_enabled: true,
+            ..MatchConfig::default()
+        });
+        let (passer, receiver) = first_home_field_pair(&sim);
+        let opponent = sim
+            .players
+            .iter()
+            .find(|player| player.team == Team::Away && player.role != PlayerRole::Goalkeeper)
+            .expect("away field player")
+            .id;
+        sim.tick = 122;
+        let origin = Vec2::new(40.0, 92.0);
+        let target = Vec2::new(40.0, 108.0);
+        sim.players[passer].position = origin;
+        sim.players[receiver].position = target;
+        sim.players[opponent].position = target;
+        sim.ball.position = target;
+        sim.recent_learning_history
+            .push_back(world_test_transition(&sim, passer, "pass", 118));
+
+        let mut pass = PendingPass {
+            team: Team::Home,
+            from: passer,
+            target: Some(receiver),
+            flight: PassFlight::Floor,
+            is_cross: false,
+            launch_tick: 118,
+            origin,
+            intended_target: target,
+            distance_yards: origin.distance(target),
+            receiver_openness: 0.10,
+            passer_skill: 0.5,
+            launch_speed_yps: 16.0,
+            receiver_position_at_launch: Some(target),
+            receiver_velocity_at_launch: Some(Vec2::zero()),
+            offside: None,
+            offside_candidates: Vec::new(),
+            learn_features: Vec::new(),
+        };
+        let nobody_penalty =
+            pass_to_nobody_passer_penalty(&pass, sim.config.field_length_yards, true);
+        sim.pending_pass = Some(pass.clone());
+
+        let deferred_start = sim.deferred_reward_transitions.len();
+        let episode_start = sim.episode_learning_transitions.len();
+        sim.apply_ball_outcome(BallStepOutcome::Controlled {
+            holder: opponent,
+            holder_team: Team::Away,
+            possession_result: BallPossessionResult::LooseBallRecovery(Team::Away),
+            untargeted_long_ball: None,
+        });
+
+        let added = &sim.deferred_reward_transitions[deferred_start..];
+        assert!(
+            added.iter().any(|transition| {
+                transition.player_id == passer
+                    && transition.tick == 118
+                    && normalize_soccer_action_label(&transition.action) == "pass"
+                    && (transition.reward + nobody_penalty).abs() < 1e-9
+            }),
+            "loose pass-to-nobody penalty must replay the original pass decision, got {added:?}"
+        );
+        assert!(
+            sim.episode_learning_transitions[episode_start..]
+                .iter()
+                .any(|transition| {
+                    transition.player_id == passer
+                        && transition.tick == 118
+                        && normalize_soccer_action_label(&transition.action) == "pass"
+                        && (transition.reward + nobody_penalty).abs() < 1e-9
+                }),
+            "full-game replay must also see delayed pass-to-nobody penalty"
+        );
+
+        pass.receiver_openness = 1.0;
+        let open_penalty =
+            pass_to_nobody_passer_penalty(&pass, sim.config.field_length_yards, true);
+        assert!(nobody_penalty > open_penalty);
+    }
+
+    #[test]
     fn turnover_chain_blame_replays_prior_pass_transitions_across_ticks() {
         let _env = set_test_env_var("DD_SOCCER_ENABLE_TURNOVER_CHAIN_BLAME", "1");
         let mut sim = SoccerMatch::default_11v11(MatchConfig {
@@ -21102,6 +21186,14 @@ impl SoccerMatch {
                                     opponent_recovered,
                                 );
                                 self.record_reward_event(pass.from, -penalty);
+                                self.queue_recent_outcome_learning_credit(
+                                    pass.from,
+                                    pass.team,
+                                    -penalty,
+                                    SoccerRewardEventKind::BadPassChainPenalty,
+                                    COMPLETED_PASS_LEARNING_CREDIT_MAX_AGE_TICKS,
+                                    is_pass_like_action,
+                                );
                             }
                         }
                         self.record_untargeted_long_ball_outcome(
