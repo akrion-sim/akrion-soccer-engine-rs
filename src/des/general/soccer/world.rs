@@ -4203,7 +4203,10 @@ mod tests {
 
     #[test]
     fn neural_mcts_distillation_floors_positive_actor_advantage() {
-        let transition = policy_test_transition_with_mcts(true);
+        let mut transition = policy_test_transition_with_mcts(true);
+        transition.decision_context.learned_mpc_replanned = true;
+        transition.decision_context.learned_mpc_original_action = Some("dribble".to_string());
+        transition.decision_context.learned_mpc_replacement_action = Some("pass".to_string());
 
         assert_eq!(
             soccer_actor_advantage_with_planner_distillation(&transition, 0.01),
@@ -4213,13 +4216,27 @@ mod tests {
 
     #[test]
     fn neural_mcts_distillation_gets_priority_weight() {
-        let transition = policy_test_transition_with_mcts(true);
+        let mut transition = policy_test_transition_with_mcts(true);
+        transition.decision_context.learned_mpc_replanned = true;
+        transition.decision_context.learned_mpc_original_action = Some("dribble".to_string());
+        transition.decision_context.learned_mpc_replacement_action = Some("pass".to_string());
         let advantage = soccer_actor_advantage_with_planner_distillation(&transition, 0.01);
 
         assert_eq!(
             soccer_actor_priority_weight(&transition, advantage),
             NEURAL_MCTS_DISTILLATION_PRIORITY_WEIGHT
         );
+    }
+
+    #[test]
+    fn neural_mcts_selection_without_replacement_trains_normally() {
+        let transition = policy_test_transition_with_mcts(true);
+
+        assert_eq!(
+            soccer_actor_advantage_with_planner_distillation(&transition, 0.01),
+            0.01
+        );
+        assert_eq!(soccer_actor_priority_weight(&transition, 0.01), 1.0);
     }
 
     #[test]
@@ -4699,11 +4716,10 @@ fn soccer_actor_mcts_distillation_candidate(
     {
         return false;
     }
-    if advantage >= 0.0 && transition.reward >= 0.0 {
-        return true;
+    if !soccer_actor_mcts_distillation_replacement_trace(transition) {
+        return false;
     }
-    soccer_actor_mcts_distillation_replacement_trace(transition)
-        && advantage >= -neural_mcts_distillation_advantage_noise_tolerance()
+    advantage >= -neural_mcts_distillation_advantage_noise_tolerance()
         && transition.reward >= neural_mcts_distillation_min_reward()
 }
 
