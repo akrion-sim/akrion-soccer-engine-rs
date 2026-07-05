@@ -34,7 +34,8 @@ const GAIT_PHYSICS_MIN_REFERENCE_SPEED_YPS: f64 = 1.0;
 const TURNOVER_DANGER_OUTCOME_LOOKAHEAD_TICKS: u64 = 120;
 const TURNOVER_DANGER_OUTCOME_PROGRESS_YARDS: f64 = 30.0;
 const TURNOVER_DANGER_OUTCOME_EXTRA_MULTIPLIER: f64 = 1.0;
-const DEFENSIVE_SHOT_ON_TARGET_HISTORY_ACTIONS: usize = 36;
+const DEFENSIVE_SHOT_ON_TARGET_DEFAULT_HISTORY_ACTIONS: usize = 18;
+const DEFENSIVE_SHOT_ON_TARGET_MAX_HISTORY_ACTIONS: usize = 36;
 const DEFENSIVE_SHOT_ON_TARGET_DEFAULT_MAX_PENALTY: f64 = 0.95;
 const DEFENSIVE_SHOT_ON_TARGET_DEFAULT_MIN_PENALTY: f64 = 0.18;
 const SOCCER_POLICY_RANK_SALT_TEAM_TABULAR: u64 = 0x5445_414d_5441_4255;
@@ -129,6 +130,19 @@ fn defensive_shot_on_target_penalty_points() -> (f64, f64) {
             .unwrap_or(DEFENSIVE_SHOT_ON_TARGET_DEFAULT_MIN_PENALTY)
             .min(max);
         (min, max)
+    })
+}
+
+fn defensive_shot_on_target_history_actions() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("SOCCER_DEFENSIVE_SOT_HISTORY_ACTIONS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFENSIVE_SHOT_ON_TARGET_DEFAULT_HISTORY_ACTIONS)
+            .clamp(1, DEFENSIVE_SHOT_ON_TARGET_MAX_HISTORY_ACTIONS)
     })
 }
 
@@ -13977,6 +13991,7 @@ impl SoccerMatch {
 
         let danger = (0.35 + 0.65 * shot_danger_scale.clamp(0.0, 1.0)).clamp(0.35, 1.0);
         let (min_penalty, max_penalty) = defensive_shot_on_target_penalty_points();
+        let history_actions = defensive_shot_on_target_history_actions();
         let history = self
             .recent_learning_history
             .iter()
@@ -13984,7 +13999,7 @@ impl SoccerMatch {
             .filter(|transition| {
                 Self::defensive_shot_on_target_blameable_transition(transition, defending_team)
             })
-            .take(DEFENSIVE_SHOT_ON_TARGET_HISTORY_ACTIONS)
+            .take(history_actions)
             .cloned()
             .collect::<Vec<_>>();
 
@@ -13993,15 +14008,17 @@ impl SoccerMatch {
                 PlayerRole::Goalkeeper => 0.35,
                 PlayerRole::Defender => 1.00,
                 PlayerRole::Midfielder => 0.70,
-                PlayerRole::Forward => 0.35,
+                PlayerRole::Forward => 0.20,
             };
-            let recency = if DEFENSIVE_SHOT_ON_TARGET_HISTORY_ACTIONS <= 1 {
+            let context_multiplier =
+                Self::defensive_shot_on_target_penalty_context_multiplier(&transition);
+            let recency = if history_actions <= 1 {
                 1.0
             } else {
-                1.0 - actions as f64 / (DEFENSIVE_SHOT_ON_TARGET_HISTORY_ACTIONS - 1) as f64
+                1.0 - actions as f64 / (history_actions - 1) as f64
             };
             let base = min_penalty + (max_penalty - min_penalty) * recency.clamp(0.0, 1.0);
-            transition.reward = -(base * role_multiplier * danger);
+            transition.reward = -(base * role_multiplier * context_multiplier * danger);
             transition.done = false;
             self.deferred_reward_transitions.push(transition);
         }
@@ -14041,6 +14058,39 @@ impl SoccerMatch {
         }
 
         true
+    }
+
+    fn defensive_shot_on_target_penalty_context_multiplier(
+        transition: &SoccerLearningTransition,
+    ) -> f64 {
+        let trace = &transition.tactical_trace;
+        let ball_gap_failure = (-trace.defense_ball_gap_score).clamp(0.0, 1.0);
+        let press_failure = (-trace.defense_role_press_score).clamp(0.0, 1.0);
+        let endline_failure = (trace.defense_endline_soft_penalty * 0.65
+            + trace.defense_endline_hard_penalty * 0.35)
+            .clamp(0.0, 1.0);
+        let own_goal_urgency = if transition.observation.yards_to_own_goal.is_finite() {
+            (1.0 - transition.observation.yards_to_own_goal / 58.0).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let tactical_failure = ball_gap_failure
+            .max(press_failure)
+            .max(endline_failure)
+            .max(own_goal_urgency * 0.70);
+        let floor = match transition.role {
+            PlayerRole::Goalkeeper => 0.40,
+            PlayerRole::Defender => 0.76,
+            PlayerRole::Midfielder => 0.22,
+            PlayerRole::Forward => 0.08,
+        };
+        let span = match transition.role {
+            PlayerRole::Goalkeeper => 0.35,
+            PlayerRole::Defender => 0.24,
+            PlayerRole::Midfielder => 0.56,
+            PlayerRole::Forward => 0.32,
+        };
+        (floor + span * tactical_failure).clamp(0.05, 1.0)
     }
 
     /// Detect an open-play turnover (controlled possession passing from one team
