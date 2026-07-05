@@ -6657,15 +6657,39 @@ impl SoccerMatch {
         let target_scale = self.config.neural_learning.sanitized_target_scale();
         let target_clip = self.config.neural_learning.sanitized_target_clip();
         let tick_rewards = soccer_marl_tick_rewards(transitions);
+        // Novelty exploration bonus (gate-two): count (abstract-state-bucket, action-family) pairs
+        // in this batch so rarely-tried pairs get an optimism bonus, nudging the value — and thus
+        // the value-ranked policy — to try under-explored actions instead of only analytic ones.
+        let novelty_on = dd_soccer_enable_novelty_bonus();
+        let novelty_coef = dd_soccer_novelty_bonus_coef();
+        let (novelty_counts, nb_x_max, nb_y_max) = if novelty_on {
+            soccer_novelty_bucket_counts(transitions, team_filter)
+        } else {
+            (std::collections::HashMap::new(), 0usize, 0usize)
+        };
         let mut samples: Vec<SoccerNeuralTrainingSample> = transitions
             .iter()
             .filter(|transition| team_filter.map_or(true, |team| transition.team == team))
             .filter_map(|transition| {
-                let adjusted_reward = soccer_marl_adjusted_reward(
+                let mut adjusted_reward = soccer_marl_adjusted_reward(
                     transition,
                     &tick_rewards,
                     &self.config.neural_learning,
                 );
+                if novelty_on {
+                    let bucket = soccer_dp_state_bucket(
+                        &transition.state,
+                        transition.team,
+                        nb_x_max,
+                        nb_y_max,
+                    );
+                    let key = (
+                        bucket,
+                        normalize_soccer_action_label(&transition.action).to_string(),
+                    );
+                    let count = novelty_counts.get(&key).copied().unwrap_or(1);
+                    adjusted_reward += novelty_coef / ((1 + count) as f64).sqrt();
+                }
                 let next_state = SoccerQStateKey::from_next_transition(transition);
                 let (gamma, max_next) = self
                     .team_policies
