@@ -21022,8 +21022,8 @@ impl SoccerMatch {
         // so do NOT also feed the per-tick deferred_reward_transitions path, or it double-penalizes.
         if !soccer_env_flag_enabled("DD_SOCCER_ENABLE_DEFERRED_PASS_CREDIT") {
             self.deferred_reward_transitions.extend(penalized);
-            self.cap_deferred_reward_transitions();
         }
+        self.cap_deferred_reward_transitions();
         true
     }
 
