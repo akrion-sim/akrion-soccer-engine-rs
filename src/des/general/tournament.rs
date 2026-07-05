@@ -24,7 +24,7 @@
 
 use crate::des::general::soccer::{
     MatchConfig, SoccerMatch, SoccerNeuralLearningBackend, SoccerNeuralNetworkSnapshot,
-    SoccerQPolicy, SoccerQPolicyOptions, SoccerTeamQPolicies, Team,
+    SoccerQPolicy, SoccerQPolicyOptions, SoccerQTargetEntry, SoccerTeamQPolicies, Team,
 };
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -125,12 +125,17 @@ impl TournamentStage {
 
 /// The persistent, learnable state of a competitor — carried from match to match
 /// so a team improves as the tournament unfolds. The neural value/critic snapshot
-/// is the real learner; tabular Q is intentionally not carried (it is a degenerate
-/// per-match prior that bloats without converging).
+/// is the real learner; action-Q is intentionally not carried (it bloats without
+/// converging), but target-Q is retained because learned plans use it to turn an
+/// action label into a concrete receiver/space target.
 #[derive(Clone, Debug, Default)]
 pub struct TeamBrain {
     /// Trained value/critic network. `None` = start from a fresh net.
     pub neural: Option<SoccerNeuralNetworkSnapshot>,
+    /// Compact learned action-target preferences for this brain when playing as Home.
+    pub home_target_entries: Vec<SoccerQTargetEntry>,
+    /// Compact learned action-target preferences for this brain when playing as Away.
+    pub away_target_entries: Vec<SoccerQTargetEntry>,
     /// Per-team Q options (gamma etc.); carried so brains can differ in horizon.
     pub options: SoccerQPolicyOptions,
     /// How many matches' worth of learning this brain has absorbed.
@@ -165,6 +170,19 @@ impl TeamBrain {
     pub fn from_snapshot(neural: SoccerNeuralNetworkSnapshot) -> Self {
         TeamBrain {
             neural: Some(neural),
+            ..TeamBrain::default()
+        }
+    }
+
+    pub fn from_snapshot_with_targets(
+        neural: SoccerNeuralNetworkSnapshot,
+        home_target_entries: Vec<SoccerQTargetEntry>,
+        away_target_entries: Vec<SoccerQTargetEntry>,
+    ) -> Self {
+        TeamBrain {
+            neural: Some(neural),
+            home_target_entries,
+            away_target_entries,
             ..TeamBrain::default()
         }
     }
@@ -1460,10 +1478,24 @@ impl TournamentMatchRunner for EngineMatchRunner {
         let mut config = self.config.base.clone();
         config.seed = ctx.seed;
 
-        // Honor each side's own tabular Q options (e.g. discount horizon); the
-        // shared constructor would otherwise apply the home options to both.
-        let mut team_policies = SoccerTeamQPolicies::new(home.options.clone());
-        team_policies.away = SoccerQPolicy::new(away.options.clone());
+        // Honor each side's own target-Q/options (e.g. discount horizon); the
+        // shared constructor would otherwise apply the home options to both, and
+        // target-only policy carry is what lets neural plans execute learned
+        // receiver/space choices without reintroducing action-Q bloat.
+        let team_policies = SoccerTeamQPolicies {
+            home: SoccerQPolicy::from_entries_with_targets(
+                home.options.clone(),
+                &[],
+                &home.home_target_entries,
+            )
+            .map_err(|err| format!("failed to restore home target-Q: {err}"))?,
+            away: SoccerQPolicy::from_entries_with_targets(
+                away.options.clone(),
+                &[],
+                &away.away_target_entries,
+            )
+            .map_err(|err| format!("failed to restore away target-Q: {err}"))?,
+        };
         let mut sim = SoccerMatch::default_11v11(config).with_team_policies(team_policies);
 
         // Install each side's brain. `frozen = !learns` so a non-learning side
@@ -1563,6 +1595,12 @@ impl TournamentMatchRunner for EngineMatchRunner {
         let away_goals = sim.score_away;
         let home_training_steps = sim.neural_training_steps_for(Team::Home);
         let away_training_steps = sim.neural_training_steps_for(Team::Away);
+        let learned_target_entries = sim.team_policies().map(|policies| {
+            (
+                policies.home.target_entries(),
+                policies.away.target_entries(),
+            )
+        });
         eprintln!(
             "tournament_match_finish home={} away={} score={}-{} wall_secs={:.1} ticks={} home_training_steps={} away_training_steps={}",
             ctx.home_id,
@@ -1579,12 +1617,20 @@ impl TournamentMatchRunner for EngineMatchRunner {
         let home_brain = carry_brain(
             home,
             sim.neural_network_snapshot_for(Team::Home),
+            Team::Home,
+            learned_target_entries
+                .as_ref()
+                .map(|(home_targets, _)| home_targets.clone()),
             ctx.home_learns,
             home_training_steps as u64,
         );
         let away_brain = carry_brain(
             away,
             sim.neural_network_snapshot_for(Team::Away),
+            Team::Away,
+            learned_target_entries
+                .as_ref()
+                .map(|(_, away_targets)| away_targets.clone()),
             ctx.away_learns,
             away_training_steps as u64,
         );
@@ -1603,6 +1649,8 @@ impl TournamentMatchRunner for EngineMatchRunner {
 fn carry_brain(
     previous: &TeamBrain,
     snapshot: Option<SoccerNeuralNetworkSnapshot>,
+    side: Team,
+    target_entries: Option<Vec<SoccerQTargetEntry>>,
     learned: bool,
     match_training_steps: u64,
 ) -> TeamBrain {
@@ -1613,6 +1661,12 @@ fn carry_brain(
         next.neural = Some(snapshot);
     }
     if learned {
+        if let Some(target_entries) = target_entries {
+            match side {
+                Team::Home => next.home_target_entries = target_entries,
+                Team::Away => next.away_target_entries = target_entries,
+            }
+        }
         next.matches_learned += 1;
         // Accumulate this match's gradient steps so the brain's lineage (persisted
         // to Postgres) reflects its total training, not just match count.

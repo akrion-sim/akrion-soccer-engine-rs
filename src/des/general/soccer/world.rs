@@ -14,6 +14,7 @@ const LEARNED_MPC_PASS_IMPOSSIBLE_PROBABILITY: f64 = 0.06;
 const LEARNED_MPC_DRIBBLE_IMPOSSIBLE_PROBABILITY: f64 = 0.06;
 const LEARNED_MPC_SHOT_IMPOSSIBLE_PROBABILITY: f64 = 0.04;
 const LEARNED_MPC_REJECTED_ACTION_PENALTY_POINTS: f64 = 2.5;
+const LEARNED_TARGET_GRID_MIN_VISITS: u32 = 1;
 const GAIT_PHYSICS_STAND_SPEED_YPS: f64 = 0.25;
 const GAIT_PHYSICS_MIN_REFERENCE_SPEED_YPS: f64 = 1.0;
 const TURNOVER_DANGER_OUTCOME_LOOKAHEAD_TICKS: u64 = 120;
@@ -1093,6 +1094,7 @@ impl SoccerStepTimingStats {
 #[derive(Clone, Debug)]
 struct SoccerNeuralMctsCandidate {
     label: String,
+    plan: Option<SoccerLearnedPlan>,
     score: f64,
     prior: f64,
     q_visits: u32,
@@ -1101,6 +1103,7 @@ struct SoccerNeuralMctsCandidate {
 #[derive(Clone, Debug)]
 struct SoccerNeuralMctsNode {
     label: String,
+    plan: Option<SoccerLearnedPlan>,
     raw_score: f64,
     value_estimate: f64,
     prior: f64,
@@ -1122,6 +1125,7 @@ impl SoccerNeuralMctsNode {
 #[derive(Clone, Debug)]
 struct SoccerPolicyActionChoice {
     label: String,
+    plan: Option<SoccerLearnedPlan>,
     behavior_probability: f64,
     neural_mcts_selected: bool,
 }
@@ -1296,6 +1300,7 @@ fn soccer_policy_uncertainty_weighted_ranked_action_choice(
         );
         return legal[selected_rank].map(|action| SoccerPolicyActionChoice {
             label: action.label.clone(),
+            plan: None,
             behavior_probability: soccer_policy_rank_probability(
                 candidate_count.min(POLICY_SELECTION_TOP_RANK_LIMIT),
                 selected_rank,
@@ -1315,6 +1320,7 @@ fn soccer_policy_uncertainty_weighted_ranked_action_choice(
     }
     legal[selected_rank].map(|action| SoccerPolicyActionChoice {
         label: action.label.clone(),
+        plan: None,
         behavior_probability: (weights[selected_rank] / total).clamp(0.0, 1.0),
         neural_mcts_selected: false,
     })
@@ -1368,6 +1374,64 @@ fn learned_policy_action_has_mpc_definition(action: &str) -> bool {
                 | "keeper-mpc-clearance"
                 | "keeper-position"
                 | "keeper-save"
+        )
+}
+
+fn learned_policy_action_uses_target_grid_point(action: &str) -> bool {
+    let label = normalize_soccer_action_label(action);
+    if pass_like_action_flight(label).is_some()
+        || matches!(
+            label,
+            "shoot"
+                | "first-time-shot"
+                | "first-time-header"
+                | "control-touch"
+                | "tackle"
+                | "slide-tackle"
+                | "blindside-steal"
+                | "keeper-mpc-floor-pass"
+                | "keeper-mpc-aerial-pass"
+                | "keeper-mpc-clearance"
+                | "keeper-position"
+                | "keeper-save"
+        )
+    {
+        return false;
+    }
+    dribble_move_kind_for_action_label(label).is_some()
+        || matches!(
+            label,
+            "clearance"
+                | "route-one"
+                | "hold"
+                | "wait-for-support"
+                | "open-passing-lane"
+                | "space"
+                | "defend"
+                | "defend-shape"
+                | "defend-roam"
+                | "press-cover"
+                | "recover"
+                | "vacate-space"
+                | "support-shape"
+                | "support-roam"
+                | "support-screen"
+                | "support-push-up"
+                | "check-to-ball"
+                | "run-in-behind"
+                | "one-two-run"
+                | "exploit-space-run"
+                | "wide-outlet"
+                | "shot-creation-run"
+                | "pinch-cross-arrival"
+                | "overlap-run"
+                | "dummy-clear-lane"
+                | "dummy-let-run"
+                | "lane-yield"
+                | "set-play-run"
+                | "buildup-receive"
+                | "keeper-survey-hands"
+                | "keeper-foot-control-outside-box"
         )
 }
 
@@ -2426,6 +2490,241 @@ mod tests {
     }
 
     #[test]
+    fn neural_candidate_transition_refreshes_target_context_per_plan() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            duration_seconds: 0.1,
+            seed: 912,
+            ..MatchConfig::default()
+        });
+        let actor = sim
+            .players
+            .iter()
+            .position(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home field player");
+        let actor_id = sim.players[actor].id;
+        let actor_team = sim.players[actor].team;
+        let actor_role = sim.players[actor].role;
+        sim.players[actor].position = Vec2::new(40.0, 52.0);
+        sim.ball.holder = Some(actor_id);
+        sim.ball.position = sim.players[actor].position;
+
+        let targets: Vec<usize> = sim
+            .players
+            .iter()
+            .enumerate()
+            .filter(|(_, player)| {
+                player.team == actor_team
+                    && player.id != actor_id
+                    && player.role != PlayerRole::Goalkeeper
+            })
+            .map(|(index, _)| index)
+            .take(2)
+            .collect();
+        assert_eq!(targets.len(), 2, "need two same-team pass targets");
+        sim.players[targets[0]].position = Vec2::new(34.0, 64.0);
+        sim.players[targets[1]].position = Vec2::new(58.0, 72.0);
+        let target_a = sim.players[targets[0]].id;
+        let target_b = sim.players[targets[1]].id;
+
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let observation = snapshot.observation_for(actor_id);
+        let mdp_state = snapshot.mdp_state_for_player(actor_id);
+        let base = sim.neural_decision_transition(
+            &snapshot,
+            actor_id,
+            actor_team,
+            actor_role,
+            &mdp_state,
+            &observation,
+        );
+        let mut blank = base.clone();
+        blank.action = "pass".to_string();
+        let blank_features = soccer_neural_transition_features(&blank);
+
+        let plan_a = SoccerLearnedPlan {
+            action: "pass".to_string(),
+            target_player: Some(target_a),
+            target_point: snapshot.player_position(target_a),
+            mpc_replan: None,
+        };
+        let plan_b = SoccerLearnedPlan {
+            action: "pass".to_string(),
+            target_player: Some(target_b),
+            target_point: snapshot.player_position(target_b),
+            mpc_replan: None,
+        };
+        let scored_a = sim
+            .neural_decision_transition_for_plan(&base, &snapshot, actor_id, actor_team, &plan_a);
+        let scored_b = sim
+            .neural_decision_transition_for_plan(&base, &snapshot, actor_id, actor_team, &plan_b);
+
+        assert_eq!(scored_a.action, "pass");
+        assert_eq!(
+            scored_a
+                .action_target
+                .as_ref()
+                .and_then(|target| target.player_id),
+            Some(target_a)
+        );
+        assert!(
+            scored_a.decision_context.target_distance_yards > 0.0,
+            "candidate scoring must include concrete target geometry"
+        );
+        let features_a = soccer_neural_transition_features(&scored_a);
+        let features_b = soccer_neural_transition_features(&scored_b);
+        assert!(
+            features_a
+                .iter()
+                .zip(blank_features.iter())
+                .any(|(a, b)| (*a - *b).abs() > 1e-9),
+            "label-only decision features should no longer match target-aware pass features"
+        );
+        assert!(
+            features_a
+                .iter()
+                .zip(features_b.iter())
+                .any(|(a, b)| (*a - *b).abs() > 1e-9),
+            "different pass targets must produce different neural candidate features"
+        );
+    }
+
+    #[test]
+    fn learned_plan_uses_policy_target_grid_for_concrete_target_points() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let actor = sim
+            .players
+            .iter()
+            .position(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home field player");
+        let actor_id = sim.players[actor].id;
+        sim.players[actor].position = Vec2::new(39.0, 12.0);
+        sim.ball.holder = Some(actor_id);
+        sim.ball.position = sim.players[actor].position;
+
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let mut policy = SoccerQPolicy::default();
+        let learned_carry_target = Vec2::new(63.0, 82.0);
+        assert!(policy.set_target_value_for_snapshot(
+            &snapshot,
+            actor_id,
+            "carry-forward",
+            learned_carry_target,
+            2.0,
+        ));
+
+        let carry_plan = SoccerMatch::learned_plan_for_policy(
+            &policy,
+            &snapshot,
+            actor_id,
+            "carry-forward".to_string(),
+        );
+        let carry_target = carry_plan.target_point.expect("learned carry target");
+        assert_eq!(
+            pitch_grid_address(carry_target, snapshot.field_width, snapshot.field_length)
+                .fine
+                .id,
+            pitch_grid_address(
+                learned_carry_target,
+                snapshot.field_width,
+                snapshot.field_length,
+            )
+            .fine
+            .id,
+            "learned target-grid cell must become the concrete carry target"
+        );
+
+        let learned_clearance_target = Vec2::new(12.0, 96.0);
+        assert!(policy.set_target_value_for_snapshot(
+            &snapshot,
+            actor_id,
+            "clearance",
+            learned_clearance_target,
+            3.0,
+        ));
+        let clearance_plan = SoccerMatch::learned_plan_for_policy(
+            &policy,
+            &snapshot,
+            actor_id,
+            "clearance".to_string(),
+        );
+        let clearance_target = clearance_plan
+            .target_point
+            .expect("learned clearance target");
+        assert_eq!(
+            pitch_grid_address(
+                clearance_target,
+                snapshot.field_width,
+                snapshot.field_length,
+            )
+            .fine
+            .id,
+            pitch_grid_address(
+                learned_clearance_target,
+                snapshot.field_width,
+                snapshot.field_length,
+            )
+            .fine
+            .id,
+            "learned target-grid cell must override generic clearance aim"
+        );
+        let observation = snapshot.observation_for(actor_id);
+        let (clearance_action, clearance_label) = sim.players[actor]
+            .action_from_learned_plan(&clearance_plan, &snapshot, &observation)
+            .expect("learned clearance should execute");
+        assert_eq!(clearance_label, "clearance");
+        let SoccerAction::Clearance {
+            target: executed_target,
+            ..
+        } = clearance_action
+        else {
+            panic!("learned clearance plan should execute as clearance");
+        };
+        assert_eq!(
+            pitch_grid_address(executed_target, snapshot.field_width, snapshot.field_length,)
+                .fine
+                .id,
+            pitch_grid_address(
+                learned_clearance_target,
+                snapshot.field_width,
+                snapshot.field_length,
+            )
+            .fine
+            .id,
+            "execution must honor the learned clearance target-grid cell"
+        );
+    }
+
+    #[test]
+    fn learned_clearance_defers_when_not_warranted_by_danger() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let actor = sim
+            .players
+            .iter()
+            .position(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home field player");
+        let actor_id = sim.players[actor].id;
+        sim.players[actor].position = Vec2::new(40.0, 74.0);
+        sim.ball.holder = Some(actor_id);
+        sim.ball.position = sim.players[actor].position;
+
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let observation = snapshot.observation_for(actor_id);
+        let plan = SoccerLearnedPlan {
+            action: "clearance".to_string(),
+            target_player: None,
+            target_point: Some(Vec2::new(20.0, 110.0)),
+            mpc_replan: None,
+        };
+
+        assert!(
+            sim.players[actor]
+                .action_from_learned_plan(&plan, &snapshot, &observation)
+                .is_none(),
+            "learned clearance should defer outside defensive danger instead of hoofing"
+        );
+    }
+
+    #[test]
     fn imported_frozen_neural_network_is_ready_for_inference() {
         let config = MatchConfig::live_gameplay();
         assert!(!config.learning_enabled);
@@ -2493,12 +2792,14 @@ mod tests {
         let candidates = vec![
             SoccerNeuralMctsCandidate {
                 label: "pass".to_string(),
+                plan: None,
                 score: 0.5,
                 prior: 0.8,
                 q_visits: 1,
             },
             SoccerNeuralMctsCandidate {
                 label: "shoot".to_string(),
+                plan: None,
                 score: 0.5,
                 prior: 0.1,
                 q_visits: 1,
@@ -2524,12 +2825,14 @@ mod tests {
         let candidates = vec![
             SoccerNeuralMctsCandidate {
                 label: "shoot".to_string(),
+                plan: None,
                 score: 0.5,
                 prior: f64::INFINITY,
                 q_visits: 1,
             },
             SoccerNeuralMctsCandidate {
                 label: "pass".to_string(),
+                plan: None,
                 score: 0.5,
                 prior: 0.8,
                 q_visits: 1,
@@ -5008,6 +5311,7 @@ impl SoccerMatch {
             .nth(selected_rank)
             .map(|action| SoccerPolicyActionChoice {
                 label: action.label.clone(),
+                plan: None,
                 behavior_probability: soccer_policy_rank_probability(
                     candidate_count,
                     selected_rank,
@@ -5029,6 +5333,7 @@ impl SoccerMatch {
             .get(selected_rank)
             .map(|candidate| SoccerPolicyActionChoice {
                 label: candidate.label.clone(),
+                plan: candidate.plan.clone(),
                 behavior_probability: soccer_policy_rank_probability(
                     candidate_count,
                     selected_rank,
@@ -5044,6 +5349,7 @@ impl SoccerMatch {
             .first()
             .map(|candidate| SoccerPolicyActionChoice {
                 label: candidate.label.clone(),
+                plan: candidate.plan.clone(),
                 behavior_probability: 1.0,
                 neural_mcts_selected: false,
             })
@@ -5151,6 +5457,7 @@ impl SoccerMatch {
                 )
                 .map(|label| SoccerPolicyActionChoice {
                     label,
+                    plan: None,
                     behavior_probability: 1.0,
                     neural_mcts_selected: false,
                 })
@@ -5211,15 +5518,19 @@ impl SoccerMatch {
                     )
                 })
             {
+                let SoccerPolicyActionChoice {
+                    label,
+                    plan,
+                    behavior_probability,
+                    neural_mcts_selected,
+                } = choice;
+                let plan = plan.unwrap_or_else(|| {
+                    Self::learned_plan_for_policy(policy, snapshot, player_id, label)
+                });
                 return Some(SoccerLearnedDecisionPlan {
-                    plan: Self::mpc_reconciled_learned_plan_for_policy(
-                        policy,
-                        snapshot,
-                        player_id,
-                        choice.label,
-                    ),
-                    behavior_probability: choice.behavior_probability,
-                    neural_mcts_selected: choice.neural_mcts_selected,
+                    plan: Self::mpc_reconciled_learned_plan(policy, snapshot, player_id, plan),
+                    behavior_probability,
+                    neural_mcts_selected,
                 });
             }
         }
@@ -5255,15 +5566,21 @@ impl SoccerMatch {
                 SOCCER_POLICY_RANK_SALT_SHARED_TABULAR,
             )
         })
-        .map(|choice| SoccerLearnedDecisionPlan {
-            plan: Self::mpc_reconciled_learned_plan_for_policy(
-                learned_policy,
-                snapshot,
-                player_id,
-                choice.label,
-            ),
-            behavior_probability: choice.behavior_probability,
-            neural_mcts_selected: choice.neural_mcts_selected,
+        .map(|choice| {
+            let SoccerPolicyActionChoice {
+                label,
+                plan,
+                behavior_probability,
+                neural_mcts_selected,
+            } = choice;
+            let plan = plan.unwrap_or_else(|| {
+                Self::learned_plan_for_policy(learned_policy, snapshot, player_id, label)
+            });
+            SoccerLearnedDecisionPlan {
+                plan: Self::mpc_reconciled_learned_plan(learned_policy, snapshot, player_id, plan),
+                behavior_probability,
+                neural_mcts_selected,
+            }
         })
     }
 
@@ -5328,6 +5645,56 @@ impl SoccerMatch {
         }
     }
 
+    fn learned_plan_action_target_trace(
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        plan: &SoccerLearnedPlan,
+    ) -> Option<AgentActionTargetTrace> {
+        let point = plan
+            .target_point
+            .or_else(|| {
+                plan.target_player
+                    .and_then(|id| snapshot.player_position(id))
+            })?
+            .clamp_to_pitch(snapshot.field_width, snapshot.field_length);
+        let actor_position = snapshot.player_position(player_id).unwrap_or(point);
+        Some(AgentActionTargetTrace {
+            point: Some(point),
+            player_id: plan.target_player,
+            grid: Some(pitch_grid_address(
+                point,
+                snapshot.field_width,
+                snapshot.field_length,
+            )),
+            facing: facing_bucket_from_vector(point - actor_position),
+            dribble_touch: None,
+        })
+    }
+
+    fn neural_decision_transition_for_plan(
+        &self,
+        base: &SoccerLearningTransition,
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        team: Team,
+        plan: &SoccerLearnedPlan,
+    ) -> SoccerLearningTransition {
+        let action = normalize_soccer_action_label(&plan.action).to_string();
+        let action_target = Self::learned_plan_action_target_trace(snapshot, player_id, plan);
+        let mut transition = base.clone();
+        transition.action = action.clone();
+        transition.action_target = action_target.clone();
+        transition.decision_context = soccer_decision_context_for(
+            player_id,
+            team,
+            &action,
+            action_target.as_ref(),
+            snapshot,
+            snapshot,
+        );
+        transition
+    }
+
     fn neural_mcts_action_from_candidates(
         blend: SoccerNeuralBlendConfig,
         candidates: &[SoccerNeuralMctsCandidate],
@@ -5380,6 +5747,7 @@ impl SoccerMatch {
                 };
                 SoccerNeuralMctsNode {
                     label: candidate.label.clone(),
+                    plan: candidate.plan.clone(),
                     raw_score: candidate.score,
                     value_estimate,
                     prior: if prior_sum > 1e-9 {
@@ -5440,6 +5808,7 @@ impl SoccerMatch {
             .get(selected_rank)
             .map(|node| SoccerPolicyActionChoice {
                 label: node.label.clone(),
+                plan: node.plan.clone(),
                 behavior_probability: soccer_policy_rank_probability(
                     candidate_count,
                     selected_rank,
@@ -5491,8 +5860,10 @@ impl SoccerMatch {
 
     /// Re-rank legal tabular candidates with the trained value head per
     /// `neural_blend`, then supplement from the fixed neural action vocabulary
-    /// when a warmed critic exists. That lets the 22+ball kinematic critic
-    /// de-alias sparse Q buckets without letting an untrained net into play.
+    /// when a warmed critic exists. Each candidate is scored through its concrete
+    /// learned plan so the critic sees target-player/target-point context, not
+    /// just a label like "pass". That lets the 22+ball kinematic critic de-alias
+    /// sparse Q buckets without letting an untrained net into play.
     fn neural_blended_action(
         &self,
         policy: &SoccerQPolicy,
@@ -5675,19 +6046,32 @@ impl SoccerMatch {
         } else {
             0.0
         };
-        let neural_q = |label: &str| -> Option<f64> {
+        let neural_q = |transition: &SoccerLearningTransition| -> Option<f64> {
             let learner = learner?;
             // Look-ahead-aware critic value: depth 0 is the direct critic (byte-identical to the
             // pre-look-ahead path, since `model_based_lookahead_value` at depth 0 == predict_value
             // of the same features); depth >= 1 rolls the world model one step forward first.
-            self.model_based_lookahead_value(&base, label, learner, lookahead_depth)
-                .map(|v| v * target_scale)
+            self.model_based_lookahead_value(
+                transition,
+                &transition.action,
+                learner,
+                lookahead_depth,
+            )
+            .map(|v| v * target_scale)
         };
         let mut scored_candidates = Vec::with_capacity(legal.len());
         for candidate in legal.iter() {
-            let mut transition = base.clone();
-            transition.action = candidate.label.clone();
-            let neural_value = neural_q(&candidate.label);
+            let candidate_plan =
+                Self::learned_plan_for_policy(policy, snapshot, player_id, candidate.label.clone());
+            let transition = self.neural_decision_transition_for_plan(
+                &base,
+                snapshot,
+                player_id,
+                team,
+                &candidate_plan,
+            );
+            let candidate_label = transition.action.clone();
+            let neural_value = neural_q(&transition);
             // Value contribution (0-weighted when the value blend is off/cold).
             let value_score = match blend.mode {
                 SoccerNeuralBlendMode::Off => candidate.value,
@@ -5717,11 +6101,11 @@ impl SoccerMatch {
                 }
             };
             // Actor bias: nudge toward the family the learned policy prefers.
-            let actor_bonus = policy_bonus(&candidate.label);
+            let actor_bonus = policy_bonus(&candidate_label);
             let retrieved_bonus = if blend.mode == SoccerNeuralBlendMode::Authoritative {
                 0.0
             } else {
-                retrieval_bonus(&candidate.label)
+                retrieval_bonus(&candidate_label)
             };
             let model_bonus = mcts_model_weight
                 * self.neural_mcts_model_rollout_value(
@@ -5738,12 +6122,13 @@ impl SoccerMatch {
             let actor_prior = policy_log_probs
                 .as_ref()
                 .and_then(|log_probs| {
-                    soccer_policy_action_index(&candidate.label).and_then(|i| log_probs.get(i))
+                    soccer_policy_action_index(&candidate_label).and_then(|i| log_probs.get(i))
                 })
                 .map(|log_p| log_p.exp())
                 .unwrap_or(0.0);
             scored_candidates.push(SoccerNeuralMctsCandidate {
-                label: candidate.label.clone(),
+                label: candidate_label,
+                plan: Some(candidate_plan),
                 score,
                 prior: actor_prior + retrieved_bonus.max(0.0),
                 q_visits: candidate.visits,
@@ -5957,6 +6342,47 @@ impl SoccerMatch {
         })
     }
 
+    fn target_grid_entry_center_for_snapshot(
+        entry: &SoccerQTargetEntry,
+        snapshot: &WorldSnapshot,
+    ) -> Vec2 {
+        let (field_width, field_length) =
+            sane_pitch_dimensions(snapshot.field_width, snapshot.field_length);
+        let columns = PITCH_FINE_GRID_COLUMNS.max(1);
+        let rows = PITCH_FINE_GRID_ROWS.max(1);
+        let cell_count = columns.saturating_mul(rows).max(1);
+        let cell_id = entry.target_fine_cell_id.min(cell_count - 1);
+        let x = cell_id % columns;
+        let y = cell_id / columns;
+        Vec2::new(
+            (x as f64 + 0.5) / columns as f64 * field_width,
+            (y as f64 + 0.5) / rows as f64 * field_length,
+        )
+        .clamp_to_pitch(snapshot.field_width, snapshot.field_length)
+    }
+
+    fn learned_target_grid_point_for_policy(
+        policy: &SoccerQPolicy,
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        action: &str,
+    ) -> Option<Vec2> {
+        let player = snapshot.players.iter().find(|p| p.id == player_id)?;
+        let state = SoccerQStateKey::from_parts(
+            &snapshot.mdp_state_for_player(player_id),
+            &snapshot.observation_for(player_id),
+            player.team,
+            player.role,
+        );
+        let target = policy.best_target_grid_for_state_action(&state, action)?;
+        if target.visits < LEARNED_TARGET_GRID_MIN_VISITS || !target.value.is_finite() {
+            return None;
+        }
+        Some(Self::target_grid_entry_center_for_snapshot(
+            &target, snapshot,
+        ))
+    }
+
     fn learned_plan_for_policy(
         policy: &SoccerQPolicy,
         snapshot: &WorldSnapshot,
@@ -5965,6 +6391,17 @@ impl SoccerMatch {
     ) -> SoccerLearnedPlan {
         let normalized_action = normalize_soccer_action_label(&action).to_string();
         let is_pass = pass_like_action_flight(&normalized_action).is_some();
+        let mut learned_grid_target =
+            if learned_policy_action_uses_target_grid_point(&normalized_action) {
+                Self::learned_target_grid_point_for_policy(
+                    policy,
+                    snapshot,
+                    player_id,
+                    &normalized_action,
+                )
+            } else {
+                None
+            };
         let mut plan = SoccerLearnedPlan {
             action,
             target_player: None,
@@ -6004,26 +6441,30 @@ impl SoccerMatch {
                 .find(|player| player.id == player_id)
             {
                 plan.target_point = if normalized_action == "route-one" {
-                    snapshot.route_one_target_for(player_id).or_else(|| {
-                        Some(route_one_target_for_actor(
-                            player.team,
-                            snapshot.player_snapshot_position(player),
-                            snapshot.field_width,
-                            snapshot.field_length,
-                            player.role,
-                        ))
-                    })
-                } else {
-                    snapshot
-                        .pressure_clearance_target_for(player_id)
-                        .or_else(|| {
-                            Some(clearance_target_for_player(
+                    learned_grid_target.take().or_else(|| {
+                        snapshot.route_one_target_for(player_id).or_else(|| {
+                            Some(route_one_target_for_actor(
                                 player.team,
                                 snapshot.player_snapshot_position(player),
                                 snapshot.field_width,
                                 snapshot.field_length,
+                                player.role,
                             ))
                         })
+                    })
+                } else {
+                    learned_grid_target.take().or_else(|| {
+                        snapshot
+                            .pressure_clearance_target_for(player_id)
+                            .or_else(|| {
+                                Some(clearance_target_for_player(
+                                    player.team,
+                                    snapshot.player_snapshot_position(player),
+                                    snapshot.field_width,
+                                    snapshot.field_length,
+                                ))
+                            })
+                    })
                 };
             }
         } else if matches!(
@@ -6049,6 +6490,9 @@ impl SoccerMatch {
                 }
             }
         }
+        if plan.target_point.is_none() {
+            plan.target_point = learned_grid_target;
+        }
         plan
     }
 
@@ -6059,6 +6503,15 @@ impl SoccerMatch {
         action: String,
     ) -> SoccerLearnedPlan {
         let plan = Self::learned_plan_for_policy(policy, snapshot, player_id, action);
+        Self::mpc_reconciled_learned_plan(policy, snapshot, player_id, plan)
+    }
+
+    fn mpc_reconciled_learned_plan(
+        policy: &SoccerQPolicy,
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        plan: SoccerLearnedPlan,
+    ) -> SoccerLearnedPlan {
         if !Self::learned_plan_needs_mpc_replan(snapshot, player_id, &plan) {
             return plan;
         }

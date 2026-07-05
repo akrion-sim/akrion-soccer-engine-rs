@@ -12928,33 +12928,52 @@ impl PlayerAgent {
                     "control-touch".to_string(),
                 ))
             }
-            "clearance" if observation.has_ball => Some((
-                SoccerAction::Clearance {
-                    target: snapshot
-                        .pressure_clearance_target_for(self.id)
-                        .unwrap_or_else(|| {
-                            clearance_target_for_player(
-                                self.team,
-                                self.position,
-                                snapshot.field_width,
-                                snapshot.field_length,
-                            )
-                        }),
-                    power: 0.92,
-                },
-                "clearance".to_string(),
-            )),
+            "clearance" if observation.has_ball => {
+                if !Self::learned_clearance_viable(observation, self.role) {
+                    return None;
+                }
+                Some((
+                    SoccerAction::Clearance {
+                        target: plan
+                            .target_point
+                            .map(|target| {
+                                target.clamp_to_pitch(snapshot.field_width, snapshot.field_length)
+                            })
+                            .unwrap_or_else(|| {
+                                snapshot
+                                    .pressure_clearance_target_for(self.id)
+                                    .unwrap_or_else(|| {
+                                        clearance_target_for_player(
+                                            self.team,
+                                            self.position,
+                                            snapshot.field_width,
+                                            snapshot.field_length,
+                                        )
+                                    })
+                            }),
+                        power: 0.92,
+                    },
+                    "clearance".to_string(),
+                ))
+            }
             "route-one" if observation.has_ball => Some((
                 SoccerAction::RouteOne {
-                    target: snapshot.route_one_target_for(self.id).unwrap_or_else(|| {
-                        route_one_target_for_actor(
-                            self.team,
-                            self.position,
-                            snapshot.field_width,
-                            snapshot.field_length,
-                            self.role,
-                        )
-                    }),
+                    target: plan
+                        .target_point
+                        .map(|target| {
+                            target.clamp_to_pitch(snapshot.field_width, snapshot.field_length)
+                        })
+                        .unwrap_or_else(|| {
+                            snapshot.route_one_target_for(self.id).unwrap_or_else(|| {
+                                route_one_target_for_actor(
+                                    self.team,
+                                    self.position,
+                                    snapshot.field_width,
+                                    snapshot.field_length,
+                                    self.role,
+                                )
+                            })
+                        }),
                     power: 0.88,
                 },
                 "route-one".to_string(),
@@ -13500,6 +13519,28 @@ impl PlayerAgent {
             return false;
         }
         completion >= LEARNED_PASS_MIN_COMPLETION || openness >= LEARNED_PASS_MIN_OPENNESS
+    }
+
+    fn learned_clearance_viable(observation: &SoccerPomdpObservation, role: PlayerRole) -> bool {
+        if observation.yards_to_own_goal >= observation.yards_to_goal {
+            return false;
+        }
+        if observation.yards_to_own_goal <= 20.0 {
+            return true;
+        }
+        let close_danger = observation.nearest_opponent_distance
+            <= CLEARANCE_MAX_OPPONENT_DISTANCE_YARDS
+            || observation.immediate_dispossession_risk >= 0.50
+            || observation.pressure_urgency >= 0.62
+            || observation.defensive_urgency >= 0.70;
+        if matches!(role, PlayerRole::Goalkeeper | PlayerRole::Defender) && close_danger {
+            return true;
+        }
+        let no_safe_short_option = observation.expected_pass_completion
+            < LEARNED_PASS_MIN_COMPLETION
+            && observation.best_pass_receiver_openness < LEARNED_PASS_MIN_OPENNESS
+            && observation.forward_dribble_space_yards < DRIBBLE_OPEN_PLAY_MIN_FORWARD_SPACE_YARDS;
+        close_danger && no_safe_short_option
     }
 
     fn learned_stale_dribble_release_override(

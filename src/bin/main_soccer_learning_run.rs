@@ -20,13 +20,12 @@ use soccer_engine::des::general::soccer::{
     SoccerMarlAlgorithm, SoccerMatch, SoccerMomentWindow, SoccerNeuralBlendMode,
     SoccerNeuralLayerSnapshot, SoccerNeuralLearningBackend, SoccerNeuralLearningConfig,
     SoccerNeuralNetworkSnapshot, SoccerPassCompletionHead, SoccerPassLearningMetrics,
-    SoccerWorldModel,
     SoccerPassOutcomeSample, SoccerPolicyHeadSnapshot, SoccerPolicyRoleHeadSnapshot,
     SoccerPolicySpecialistHeadSnapshot, SoccerQEntry, SoccerQPolicy, SoccerQPolicyOptions,
     SoccerQTargetEntry, SoccerSelfPlayEpisodeSummary, SoccerSelfPlayLearnedParams,
     SoccerSelfPlayTrainingArtifact, SoccerTacticalLearningSummary, SoccerTacticalLearningWeights,
-    SoccerTeamPolicyArtifact, SoccerTeamQPolicies, SupportScorerHead, Team, WingerPinchHead,
-    ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS, CRASH_BOX_HEAD_MIN_TRAINING_STEPS,
+    SoccerTeamPolicyArtifact, SoccerTeamQPolicies, SoccerWorldModel, SupportScorerHead, Team,
+    WingerPinchHead, ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS, CRASH_BOX_HEAD_MIN_TRAINING_STEPS,
     DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE, DEFAULT_SOCCER_PASS_COMPLETION_LEARNING_RATE,
     GIVE_AND_GO_HEAD_MIN_TRAINING_STEPS, GOAL_SIDE_RECOVERY_HEAD_MIN_TRAINING_STEPS,
     HEAD_SCAN_HEAD_MIN_TRAINING_STEPS, LANE_AFFINITY_HEAD_MIN_TRAINING_STEPS,
@@ -99,6 +98,7 @@ const DEFAULT_SOCCER_NEURAL_POPULATION_MUTATION_RATE: f64 = 0.08;
 const DEFAULT_SOCCER_NEURAL_POPULATION_MUTATION_SCALE: f64 = 0.04;
 const DEFAULT_SOCCER_NEURAL_POPULATION_CROSSOVER_RATE: f64 = 0.55;
 const DEFAULT_SOCCER_NEURAL_POPULATION_MIN_FITNESS_DELTA: f64 = 0.05;
+const DEFAULT_SOCCER_NEURAL_POPULATION_MIN_ACCEPTED_FITNESS: f64 = 0.25;
 const SOCCER_LEARNING_LOCAL_MPC_MAX_PLAYERS_PER_TEAM_LIMIT: usize = 11;
 const SOCCER_POLICY_SOURCE_MERGE: &str = "merge";
 const SOCCER_POLICY_SOURCE_EVOLUTION: &str = "mutation";
@@ -370,6 +370,7 @@ struct NeuralPopulationSearchConfig {
     mutation_scale: f64,
     crossover_rate: f64,
     min_fitness_delta: f64,
+    min_accepted_fitness: f64,
     seed: u64,
 }
 
@@ -441,6 +442,15 @@ fn env_neural_population_search_config(
         )
         .into());
     }
+    let min_accepted_fitness = env_f64(
+        "SOCCER_NEURAL_POPULATION_MIN_ACCEPTED_FITNESS",
+        DEFAULT_SOCCER_NEURAL_POPULATION_MIN_ACCEPTED_FITNESS,
+    )?;
+    if !min_accepted_fitness.is_finite() {
+        return Err(
+            invalid_data("SOCCER_NEURAL_POPULATION_MIN_ACCEPTED_FITNESS must be finite").into(),
+        );
+    }
     let search_seed = env_u64(
         "SOCCER_NEURAL_POPULATION_SEED",
         seed ^ 0xA5A5_5A5A_D3C3_B4B4,
@@ -455,6 +465,7 @@ fn env_neural_population_search_config(
         mutation_scale,
         crossover_rate,
         min_fitness_delta,
+        min_accepted_fitness,
         seed: search_seed,
     })
 }
@@ -1151,7 +1162,7 @@ fn maybe_run_neural_population_search(
         completed_games,
     );
     println!(
-        "neural_population_search_start completed_games={} population={} eval_games={} eval_minutes={:.2} mutation_rate={:.4} mutation_scale={:.4} crossover_rate={:.4} min_fitness_delta={:.4}",
+        "neural_population_search_start completed_games={} population={} eval_games={} eval_minutes={:.2} mutation_rate={:.4} mutation_scale={:.4} crossover_rate={:.4} min_fitness_delta={:.4} min_accepted_fitness={:.4}",
         completed_games,
         candidates.len(),
         search_config.eval_games,
@@ -1159,7 +1170,8 @@ fn maybe_run_neural_population_search(
         search_config.mutation_rate,
         search_config.mutation_scale,
         search_config.crossover_rate,
-        search_config.min_fitness_delta
+        search_config.min_fitness_delta,
+        search_config.min_accepted_fitness
     );
     let mut handles = Vec::new();
     for candidate in candidates {
@@ -1237,6 +1249,19 @@ fn maybe_run_neural_population_search(
             best_eval.fitness,
             improvement,
             search_config.min_fitness_delta
+        );
+        return Ok(false);
+    }
+    if best_eval.fitness < search_config.min_accepted_fitness {
+        println!(
+            "neural_population_search_held completed_games={} incumbent_fitness={:.4} best_index={} best_source={} best_fitness={:.4} improvement={:.4} min_accepted_fitness={:.4} reasons=below_min_accepted_fitness",
+            completed_games,
+            incumbent_eval.fitness,
+            best_eval.index,
+            best_eval.source,
+            best_eval.fitness,
+            improvement,
+            search_config.min_accepted_fitness
         );
         return Ok(false);
     }
@@ -6497,7 +6522,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         evolution_options.seed
     );
     println!(
-        "neural_population_search enabled={} interval_games={} population_size={} eval_games={} eval_minutes={:.2} mutation_rate={:.4} mutation_scale={:.4} crossover_rate={:.4} min_fitness_delta={:.4} seed={}",
+        "neural_population_search enabled={} interval_games={} population_size={} eval_games={} eval_minutes={:.2} mutation_rate={:.4} mutation_scale={:.4} crossover_rate={:.4} min_fitness_delta={:.4} min_accepted_fitness={:.4} seed={}",
         neural_population_search_config.enabled,
         neural_population_search_config.interval_games,
         neural_population_search_config.population_size,
@@ -6507,6 +6532,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         neural_population_search_config.mutation_scale,
         neural_population_search_config.crossover_rate,
         neural_population_search_config.min_fitness_delta,
+        neural_population_search_config.min_accepted_fitness,
         neural_population_search_config.seed
     );
     println!(
@@ -8324,6 +8350,7 @@ mod tests {
             mutation_scale: 0.35,
             crossover_rate: 1.0,
             min_fitness_delta: 0.0,
+            min_accepted_fitness: -8.0,
             seed: 99,
         }
     }
