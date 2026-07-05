@@ -9493,7 +9493,7 @@ impl SoccerMatch {
     /// `DD_SOCCER_ENABLE_DEFERRED_PASS_CREDIT`; when off, falls back to the current-tick event
     /// (byte-identical to baseline).
     fn record_reward_event_deferred(&mut self, decision_tick: u64, player_id: usize, amount: f64) {
-        if soccer_env_flag_enabled("DD_SOCCER_ENABLE_DEFERRED_PASS_CREDIT") {
+        if dd_soccer_enable_deferred_pass_credit() {
             if amount.is_finite() && amount != 0.0 {
                 self.deferred_reward_credits
                     .push((decision_tick, player_id, amount));
@@ -21008,7 +21008,7 @@ impl SoccerMatch {
         }
         // Back-date the turnover penalty onto the actual decision transitions so it reaches the
         // full-game replay (gated; off ⇒ unchanged, penalties only go to deferred_reward_transitions).
-        if soccer_env_flag_enabled("DD_SOCCER_ENABLE_DEFERRED_PASS_CREDIT") {
+        if dd_soccer_enable_deferred_pass_credit() {
             self.deferred_reward_credits.extend(deferred_turnover_credits);
         }
         self.arm_turnover_outcome_watch(
@@ -21020,7 +21020,7 @@ impl SoccerMatch {
         // When the deferred-credit gate is on, the penalty is already applied to the DECISION
         // transition (via deferred_reward_credits above), which the full-game replay trains on —
         // so do NOT also feed the per-tick deferred_reward_transitions path, or it double-penalizes.
-        if !soccer_env_flag_enabled("DD_SOCCER_ENABLE_DEFERRED_PASS_CREDIT") {
+        if !dd_soccer_enable_deferred_pass_credit() {
             self.deferred_reward_transitions.extend(penalized);
         }
         self.cap_deferred_reward_transitions();
