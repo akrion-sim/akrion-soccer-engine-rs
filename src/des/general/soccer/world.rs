@@ -9483,6 +9483,40 @@ impl SoccerMatch {
         self.record_reward_event_at(self.tick, player_id, amount);
     }
 
+    /// Cross-tick credit for a DELAYED outcome reward: back-date `amount` to the DECISION tick that
+    /// earned it (e.g. a completed pass credits the pass decision, not the reception tick). Applied
+    /// to the matching `episode_learning_transitions` entry at end-of-game. Gated
+    /// `DD_SOCCER_ENABLE_DEFERRED_PASS_CREDIT`; when off, falls back to the current-tick event
+    /// (byte-identical to baseline).
+    fn record_reward_event_deferred(&mut self, decision_tick: u64, player_id: usize, amount: f64) {
+        if soccer_env_flag_enabled("DD_SOCCER_ENABLE_DEFERRED_PASS_CREDIT") {
+            if amount.is_finite() && amount != 0.0 {
+                self.deferred_reward_credits
+                    .push((decision_tick, player_id, amount));
+            }
+        } else {
+            self.record_reward_event(player_id, amount);
+        }
+    }
+
+    /// Apply all deferred cross-tick credits onto the decision transitions that earned them, by
+    /// matching `(decision_tick, player_id)`. Runs once at end-of-game before the replay blend.
+    fn apply_deferred_reward_credits(&mut self) {
+        if self.deferred_reward_credits.is_empty() {
+            return;
+        }
+        let credits = std::mem::take(&mut self.deferred_reward_credits);
+        for (tick, player_id, amount) in credits {
+            if let Some(t) = self
+                .episode_learning_transitions
+                .iter_mut()
+                .find(|t| t.tick == tick && t.player_id == player_id)
+            {
+                t.reward += amount;
+            }
+        }
+    }
+
     fn record_reward_event_at(&mut self, tick: u64, player_id: usize, amount: f64) {
         self.record_reward_event_at_with_kind(
             tick,
