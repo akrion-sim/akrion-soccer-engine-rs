@@ -6754,11 +6754,28 @@ impl SoccerMatch {
                             let mut succ = transition.clone();
                             succ.state = transition.next_state.clone();
                             succ.observation = transition.next_observation.clone();
-                            learner
-                                .predict_value(&soccer_neural_transition_features_with_action(
-                                    &succ, "",
-                                ))
-                                .map(|scaled| scaled * target_scale)
+                            let value = if dd_soccer_enable_maxa_bootstrap() {
+                                // max_a Q(s', a) over core families — policy IMPROVEMENT: the target
+                                // assumes the successor takes the BEST action, so the value can rate
+                                // a policy better than the behavior policy (can exceed analytic).
+                                let best = SOCCER_MAXA_BOOTSTRAP_FAMILIES
+                                    .iter()
+                                    .filter_map(|&family| {
+                                        learner.predict_value(
+                                            &soccer_neural_transition_features_with_action(
+                                                &succ, family,
+                                            ),
+                                        )
+                                    })
+                                    .fold(f64::NEG_INFINITY, f64::max);
+                                best.is_finite().then_some(best)
+                            } else {
+                                // observed-successor / state value V(s') — policy EVALUATION.
+                                learner.predict_value(
+                                    &soccer_neural_transition_features_with_action(&succ, ""),
+                                )
+                            };
+                            value.map(|scaled| scaled * target_scale)
                         })
                         .filter(|value| value.is_finite());
                     match neural_raw {
