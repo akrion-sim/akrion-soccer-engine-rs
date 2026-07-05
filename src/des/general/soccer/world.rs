@@ -1424,6 +1424,31 @@ fn soccer_standardize_sample_targets(samples: &mut [SoccerNeuralTrainingSample],
     }
 }
 
+/// Count (abstract-state-bucket, action-family) occurrences in a training batch, for the novelty
+/// exploration bonus. Also returns the ball-zone extents used to bucket, so the bonus uses the same
+/// adaptive thirds as the DP table. See `dd_soccer_enable_novelty_bonus`.
+fn soccer_novelty_bucket_counts(
+    transitions: &[SoccerLearningTransition],
+    team_filter: Option<Team>,
+) -> (std::collections::HashMap<(u32, String), usize>, usize, usize) {
+    let mut x_max = 0usize;
+    let mut y_max = 0usize;
+    for t in transitions {
+        x_max = x_max.max(t.state.ball_zone_x);
+        y_max = y_max.max(t.state.ball_zone_y);
+    }
+    let mut counts: std::collections::HashMap<(u32, String), usize> =
+        std::collections::HashMap::new();
+    for t in transitions {
+        if team_filter.map_or(true, |team| t.team == team) {
+            let bucket = soccer_dp_state_bucket(&t.state, t.team, x_max, y_max);
+            let key = (bucket, normalize_soccer_action_label(&t.action).to_string());
+            *counts.entry(key).or_insert(0) += 1;
+        }
+    }
+    (counts, x_max, y_max)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
