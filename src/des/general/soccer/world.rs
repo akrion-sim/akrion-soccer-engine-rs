@@ -20,6 +20,9 @@ const GAIT_PHYSICS_MIN_REFERENCE_SPEED_YPS: f64 = 1.0;
 const TURNOVER_DANGER_OUTCOME_LOOKAHEAD_TICKS: u64 = 120;
 const TURNOVER_DANGER_OUTCOME_PROGRESS_YARDS: f64 = 30.0;
 const TURNOVER_DANGER_OUTCOME_EXTRA_MULTIPLIER: f64 = 1.0;
+const DEFENSIVE_SHOT_ON_TARGET_HISTORY_ACTIONS: usize = 36;
+const DEFENSIVE_SHOT_ON_TARGET_MAX_PENALTY: f64 = 0.95;
+const DEFENSIVE_SHOT_ON_TARGET_MIN_PENALTY: f64 = 0.18;
 const SOCCER_POLICY_RANK_SALT_TEAM_TABULAR: u64 = 0x5445_414d_5441_4255;
 const SOCCER_POLICY_RANK_SALT_SHARED_TABULAR: u64 = 0x5348_4152_5441_4255;
 const SOCCER_POLICY_RANK_SALT_TEAM_NEURAL: u64 = 0x5445_414d_4e45_5552;
@@ -2426,6 +2429,70 @@ mod tests {
 
         sim.set_team_policies(SoccerTeamQPolicies::new(SoccerQPolicyOptions::default()));
         assert!(sim.learned_policy_inference_enabled());
+    }
+
+    #[test]
+    fn conceded_shot_on_target_queues_defensive_learning_penalties() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            duration_seconds: 0.1,
+            learning_enabled: true,
+            seed: 913,
+            ..MatchConfig::default()
+        });
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let defenders = [
+            PlayerRole::Goalkeeper,
+            PlayerRole::Defender,
+            PlayerRole::Midfielder,
+        ]
+        .into_iter()
+        .map(|role| {
+            sim.players
+                .iter()
+                .find(|player| player.team == Team::Home && player.role == role)
+                .map(|player| (player.id, player.team, player.role))
+                .unwrap_or_else(|| panic!("missing home {role:?}"))
+        })
+        .collect::<Vec<_>>();
+
+        for (offset, (player_id, team, role)) in defenders.iter().copied().enumerate() {
+            let observation = snapshot.observation_for(player_id);
+            let mdp_state = snapshot.mdp_state_for_player(player_id);
+            let mut transition = sim.neural_decision_transition(
+                &snapshot,
+                player_id,
+                team,
+                role,
+                &mdp_state,
+                &observation,
+            );
+            transition.tick = offset as u64;
+            transition.action = "hold".to_string();
+            sim.recent_learning_history.push_back(transition);
+        }
+
+        let deferred_start = sim.deferred_reward_transitions.len();
+        sim.record_recent_defensive_shot_on_target_penalties(Team::Home, 1.0);
+        let added = &sim.deferred_reward_transitions[deferred_start..];
+        assert_eq!(added.len(), defenders.len());
+        assert!(added.iter().all(|transition| {
+            transition.team == Team::Home && transition.reward < 0.0 && !transition.done
+        }));
+
+        let goalkeeper_penalty = added
+            .iter()
+            .find(|transition| transition.role == PlayerRole::Goalkeeper)
+            .map(|transition| transition.reward)
+            .expect("goalkeeper penalty");
+        let defender_penalty = added
+            .iter()
+            .find(|transition| transition.role == PlayerRole::Defender)
+            .map(|transition| transition.reward)
+            .expect("defender penalty");
+        assert!(
+            defender_penalty < goalkeeper_penalty,
+            "defenders should receive stronger shot-on-target blame than keepers: defender={defender_penalty}, keeper={goalkeeper_penalty}"
+        );
     }
 
     #[test]
@@ -11479,6 +11546,7 @@ impl SoccerMatch {
                 < 1e-9
         );
         let scale = self.shot_reward_distance_scale(shooting_team, shooter);
+        self.record_recent_defensive_shot_on_target_penalties(shooting_team.other(), scale);
         let contextual_pool = SHOT_ON_TARGET_REWARD_POINTS * scale;
         self.record_weighted_possession_chain_reward_at_with_kind(
             self.tick,
@@ -12121,6 +12189,47 @@ impl SoccerMatch {
             self.deferred_reward_transitions.push(transition);
             actions += 1;
         }
+    }
+
+    fn record_recent_defensive_shot_on_target_penalties(
+        &mut self,
+        defending_team: Team,
+        shot_danger_scale: f64,
+    ) {
+        if !self.config.learning_enabled {
+            return;
+        }
+
+        let danger = (0.35 + 0.65 * shot_danger_scale.clamp(0.0, 1.0)).clamp(0.35, 1.0);
+        let history = self
+            .recent_learning_history
+            .iter()
+            .rev()
+            .filter(|transition| transition.team == defending_team)
+            .take(DEFENSIVE_SHOT_ON_TARGET_HISTORY_ACTIONS)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for (actions, mut transition) in history.into_iter().enumerate() {
+            let role_multiplier = match transition.role {
+                PlayerRole::Goalkeeper => 0.35,
+                PlayerRole::Defender => 1.00,
+                PlayerRole::Midfielder => 0.70,
+                PlayerRole::Forward => 0.35,
+            };
+            let recency = if DEFENSIVE_SHOT_ON_TARGET_HISTORY_ACTIONS <= 1 {
+                1.0
+            } else {
+                1.0 - actions as f64 / (DEFENSIVE_SHOT_ON_TARGET_HISTORY_ACTIONS - 1) as f64
+            };
+            let base = DEFENSIVE_SHOT_ON_TARGET_MIN_PENALTY
+                + (DEFENSIVE_SHOT_ON_TARGET_MAX_PENALTY - DEFENSIVE_SHOT_ON_TARGET_MIN_PENALTY)
+                    * recency.clamp(0.0, 1.0);
+            transition.reward = -(base * role_multiplier * danger);
+            transition.done = false;
+            self.deferred_reward_transitions.push(transition);
+        }
+        self.cap_deferred_reward_transitions();
     }
 
     /// Detect an open-play turnover (controlled possession passing from one team
