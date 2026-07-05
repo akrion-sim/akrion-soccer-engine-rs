@@ -9755,6 +9755,13 @@ impl PlayerAgent {
                             kind,
                             touch,
                         };
+                        let action_options = self.learned_policy_counterfactual_action_options(
+                            snapshot,
+                            &observation,
+                            &directive,
+                            has_ball,
+                            kind.label(),
+                        );
                         let mut decision = self.decision_trace(
                             snapshot,
                             mdp_state,
@@ -9765,7 +9772,7 @@ impl PlayerAgent {
                                 plan.action.clone(),
                                 "defer-shot".to_string(),
                             ],
-                            single_action_option(kind.label()),
+                            action_options,
                             &defer_action,
                             kind.label(),
                         );
@@ -9821,13 +9828,20 @@ impl PlayerAgent {
                             &action,
                         )
                     };
+                    let action_options = self.learned_policy_counterfactual_action_options(
+                        snapshot,
+                        &observation,
+                        &directive,
+                        has_ball,
+                        &action_label,
+                    );
                     let mut decision = self.decision_trace(
                         snapshot,
                         mdp_state,
                         observation,
                         belief,
                         vec!["learned-policy".to_string(), plan.action.clone()],
-                        single_action_option(&action_label),
+                        action_options,
                         &action,
                         action_label,
                     );
@@ -13477,6 +13491,79 @@ impl PlayerAgent {
             "hold" => Some((SoccerAction::MoveTo(self.home_position), "hold".to_string())),
             _ => None,
         }
+    }
+
+    fn learned_policy_counterfactual_action_options(
+        &self,
+        snapshot: &WorldSnapshot,
+        observation: &SoccerPomdpObservation,
+        directive: &TeamTacticalDirective,
+        has_ball: bool,
+        action_label: &str,
+    ) -> Vec<AgentActionOptionTrace> {
+        let mut options = if has_ball {
+            let pass_targets = snapshot.ranked_visible_pass_targets(self.id, 3);
+            let strategic_pass_targets = snapshot.ranked_visible_pass_targets(self.id, 11);
+            let aerial_pass_targets = snapshot.ranked_visible_aerial_pass_targets(self.id, 3);
+            let hold_up_flank_target = snapshot.attacking_hold_up_flank_target_for(self.id);
+            let mut options = self.possession_action_options(
+                observation,
+                directive,
+                pass_targets.len(),
+                aerial_pass_targets.len(),
+                hold_up_flank_target.is_some(),
+                snapshot.dt_seconds,
+                snapshot.field_width,
+            );
+            if let Some(plan) =
+                self.open_pass_lane_dribble_plan_for(snapshot, observation, &strategic_pass_targets)
+            {
+                options.push(AgentActionOptionTrace::new(
+                    OPEN_PASS_LANE_ACTION_LABEL,
+                    plan.score,
+                    true,
+                ));
+            }
+            if let Some(plan) = self.round_goalkeeper_dribble_plan_for(snapshot, observation) {
+                options.push(AgentActionOptionTrace::new(
+                    ROUND_GOALKEEPER_ACTION_LABEL,
+                    plan.score,
+                    true,
+                ));
+            }
+            if let Some(plan) = snapshot.runaround_dribble_option_for(self.id) {
+                options.push(AgentActionOptionTrace::new(
+                    "runaround-dribble",
+                    plan.quality.clamp(0.0, 1.0),
+                    true,
+                ));
+            }
+            if let Some(plan) = snapshot.wall_pass_option_for(self.id) {
+                options.push(AgentActionOptionTrace::new(
+                    "wall-pass",
+                    (0.35 + plan.quality).clamp(0.0, 1.45),
+                    true,
+                ));
+            }
+            if snapshot.scoop_pass_target_for(self.id).is_some() {
+                options.push(AgentActionOptionTrace::new("scoop-pass", 0.85, true));
+            }
+            options
+        } else if snapshot.controlled_possession_team() == Some(self.team.other()) {
+            self.defensive_action_options(snapshot, directive, snapshot.dt_seconds)
+        } else {
+            Vec::new()
+        };
+        if options.is_empty() {
+            return single_action_option(action_label);
+        }
+        if !options
+            .iter()
+            .any(|option| learned_mpc_action_labels_match(&option.label, action_label))
+        {
+            options.push(AgentActionOptionTrace::new(action_label, 0.0, true));
+        }
+        normalize_action_options(options)
     }
 
     fn switch_play_target_for(

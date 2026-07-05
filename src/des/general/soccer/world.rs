@@ -2517,6 +2517,59 @@ mod tests {
     }
 
     #[test]
+    fn action_option_context_preserves_ranked_pass_target_identity() {
+        let options = vec![
+            AgentActionOptionTrace::new("pass1", 1.40, true),
+            AgentActionOptionTrace::new("pass2", 0.35, true),
+        ];
+        let pass1_context = soccer_action_option_learning_context("pass1", &options);
+        let pass2_context = soccer_action_option_learning_context("pass2", &options);
+
+        assert!((pass1_context.chosen_action_score - 1.40).abs() < 1e-9);
+        assert!((pass2_context.chosen_action_score - 0.35).abs() < 1e-9);
+        assert!(pass1_context.action_score_margin > 0.0);
+        assert!(pass2_context.action_score_margin < 0.0);
+    }
+
+    #[test]
+    fn analytic_difference_reward_credits_learned_action_over_analytic_default() {
+        let _env = set_test_env_var("DD_SOCCER_ENABLE_ANALYTIC_DIFFERENCE_REWARD", "1");
+        let sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let player = &sim.players[0];
+        let mdp_state = snapshot.mdp_state_for_player(player.id);
+        let observation = snapshot.observation_for(player.id);
+        let belief = belief_from_observation(&observation);
+        let mut decision = AgentDecisionTrace {
+            mdp_state,
+            observation,
+            belief,
+            operation_order: vec!["learned-policy".to_string(), "pass2".to_string()],
+            scheduled_index: None,
+            action_options: vec![
+                AgentActionOptionTrace::new("pass1", 1.00, true),
+                AgentActionOptionTrace::new("pass2", 2.00, true),
+            ],
+            action_target: None,
+            mdp_mpc_comparison: None,
+            learned_mpc_replan: None,
+            behavior_policy_probability: None,
+            neural_mcts_selected: false,
+            action: "pass2".to_string(),
+        };
+
+        let better_than_analytic = soccer_analytic_difference_reward(&decision);
+        assert!(better_than_analytic > 0.0);
+
+        decision.action = "pass1".to_string();
+        let worse_than_analytic = soccer_analytic_difference_reward(&decision);
+        assert!(worse_than_analytic < 0.0);
+
+        decision.operation_order = vec!["heuristic".to_string()];
+        assert_eq!(soccer_analytic_difference_reward(&decision), 0.0);
+    }
+
+    #[test]
     fn learned_policy_action_mpc_definition_covers_policy_head_vocabulary() {
         for action in SOCCER_POLICY_ACTIONS {
             assert!(

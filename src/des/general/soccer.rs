@@ -8743,12 +8743,12 @@ fn soccer_action_option_learning_context(
     if options.is_empty() {
         return SoccerActionOptionLearningContext::default();
     }
-    let action = normalize_soccer_action_label(action);
+    let action_key = learned_mpc_action_label_key(action);
     let action_option_count = options.len();
     let legal_action_option_count = options.iter().filter(|option| option.legal).count();
     let chosen = options
         .iter()
-        .find(|option| normalize_soccer_action_label(&option.label) == action);
+        .find(|option| learned_mpc_action_labels_match(&option.label, &action_key));
     let chosen_action_probability = chosen.map(soccer_finite_option_probability).unwrap_or(0.0);
     let chosen_action_score = chosen.map(soccer_finite_option_score).unwrap_or(0.0);
     let best_legal_action_score = options
@@ -8758,7 +8758,9 @@ fn soccer_action_option_learning_context(
         .fold(0.0, f64::max);
     let best_other_legal_action_score = options
         .iter()
-        .filter(|option| option.legal && normalize_soccer_action_label(&option.label) != action)
+        .filter(|option| {
+            option.legal && !learned_mpc_action_labels_match(&option.label, &action_key)
+        })
         .map(soccer_finite_option_score)
         .fold(0.0, f64::max);
     let action_score_margin = chosen_action_score - best_other_legal_action_score;
@@ -24598,6 +24600,7 @@ fn soccer_transition_reward_with_tactics(
             + separation_penalty,
         tunables().reward.dense_shaping_budget_points,
     ) - separation_penalty;
+    reward += soccer_analytic_difference_reward(decision);
 
     if !infer_discrete_events {
         return reward;
@@ -24793,9 +24796,7 @@ fn soccer_decision_option_control_reward(decision: &AgentDecisionTrace) -> f64 {
         let legal_fraction = option_context.legal_action_option_count as f64
             / option_context.action_option_count.max(1) as f64;
         let chosen_legal = decision.action_options.iter().any(|option| {
-            option.legal
-                && normalize_soccer_action_label(&option.label)
-                    == normalize_soccer_action_label(&decision.action)
+            option.legal && learned_mpc_action_labels_match(&option.label, &decision.action)
         });
         if chosen_legal {
             reward += option_context.chosen_action_probability.clamp(0.0, 1.0) * 0.16;
@@ -24821,6 +24822,53 @@ fn soccer_decision_option_control_reward(decision: &AgentDecisionTrace) -> f64 {
             * 0.12;
     }
     reward
+}
+
+const SOCCER_ANALYTIC_DIFFERENCE_REWARD_CAP_POINTS: f64 = 1.25;
+const SOCCER_ANALYTIC_DIFFERENCE_REWARD_WEIGHT: f64 = 1.0;
+const SOCCER_ANALYTIC_DIFFERENCE_REWARD_MIN_OPTIONS: usize = 2;
+
+fn soccer_analytic_difference_reward_enabled() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_ANALYTIC_DIFFERENCE_REWARD")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_ANALYTIC_DIFFERENCE_REWARD"))
+    }
+}
+
+fn soccer_decision_trace_is_learned_policy(decision: &AgentDecisionTrace) -> bool {
+    decision.neural_mcts_selected
+        || decision.learned_mpc_replan.is_some()
+        || decision
+            .operation_order
+            .iter()
+            .any(|op| op == "learned-policy" || op == "neural-mcts")
+}
+
+fn soccer_analytic_difference_reward(decision: &AgentDecisionTrace) -> f64 {
+    if !soccer_analytic_difference_reward_enabled()
+        || !soccer_decision_trace_is_learned_policy(decision)
+    {
+        return 0.0;
+    }
+    let option_context =
+        soccer_action_option_learning_context(&decision.action, &decision.action_options);
+    if option_context.legal_action_option_count < SOCCER_ANALYTIC_DIFFERENCE_REWARD_MIN_OPTIONS {
+        return 0.0;
+    }
+    let scale = option_context
+        .best_legal_action_score
+        .max(option_context.chosen_action_score)
+        .max(1.0);
+    (option_context.action_score_margin / scale * SOCCER_ANALYTIC_DIFFERENCE_REWARD_WEIGHT).clamp(
+        -SOCCER_ANALYTIC_DIFFERENCE_REWARD_CAP_POINTS,
+        SOCCER_ANALYTIC_DIFFERENCE_REWARD_CAP_POINTS,
+    )
 }
 
 pub(crate) fn teammate_spacing_warning_pressure_from_distance(distance_yards: f64) -> f64 {
