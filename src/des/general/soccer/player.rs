@@ -12086,7 +12086,21 @@ impl PlayerAgent {
                         let target = if self.role == PlayerRole::Goalkeeper {
                             snapshot.defensive_assignment_for(self.id, self.home_position, roam)
                         } else if press_cover {
-                            snapshot.defensive_assignment_for(self.id, self.home_position, true)
+                            snapshot
+                                .players
+                                .iter()
+                                .find(|player| player.id == self.id)
+                                .and_then(|player| snapshot.press_cover_target_for(player))
+                                .unwrap_or_else(|| {
+                                    snapshot.goal_side_defensive_target_for(
+                                        self.id,
+                                        snapshot.defensive_assignment_for(
+                                            self.id,
+                                            self.home_position,
+                                            true,
+                                        ),
+                                    )
+                                })
                         } else if roam && dist < defend_radius {
                             snapshot.goal_side_defensive_target_for(self.id, snapshot.ball.position)
                         } else {
@@ -12117,7 +12131,11 @@ impl PlayerAgent {
                                 target
                             }
                         };
-                        let target = snapshot.goal_side_defensive_target_for(self.id, target);
+                        let target = if press_cover {
+                            target.clamp_to_pitch(snapshot.field_width, snapshot.field_length)
+                        } else {
+                            snapshot.goal_side_defensive_target_for(self.id, target)
+                        };
                         // Push up to fill the space ahead when the ball is far upfield.
                         let (target, push_up) =
                             snapshot.defensive_push_up_adjustment(self.id, target);
@@ -13266,16 +13284,20 @@ impl PlayerAgent {
                         },
                         "blindside-steal".to_string(),
                     )
-                }),
+            }),
             "press-cover" if snapshot.controlled_possession_team() == Some(self.team.other()) => {
-                let assignment =
-                    snapshot.defensive_assignment_for(self.id, self.home_position, true);
-                Some((
-                    SoccerAction::MoveTo(
-                        snapshot.goal_side_defensive_target_for(self.id, assignment),
-                    ),
-                    "press-cover".to_string(),
-                ))
+                let target = snapshot
+                    .players
+                    .iter()
+                    .find(|player| player.id == self.id)
+                    .and_then(|player| snapshot.press_cover_target_for(player))
+                    .unwrap_or_else(|| {
+                        snapshot.goal_side_defensive_target_for(
+                            self.id,
+                            snapshot.defensive_assignment_for(self.id, self.home_position, true),
+                        )
+                    });
+                Some((SoccerAction::MoveTo(target), "press-cover".to_string()))
             }
             DUMMY_LET_RUN_ACTION_LABEL if !observation.has_ball => snapshot
                 .teammate_dummy_let_run_target_for(self.id)

@@ -24192,6 +24192,71 @@ fn press_cover_assigns_a_second_defender_goal_side_behind_the_lone_presser() {
 }
 
 #[test]
+fn learned_press_cover_executes_the_dedicated_cover_target() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let carrier_id = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && p.role == PlayerRole::Forward)
+        .map(|p| p.id)
+        .expect("an away forward");
+    let carrier_pos = Vec2::new(40.0, 30.0);
+    sim.players[carrier_id].position = carrier_pos;
+    sim.ball.holder = Some(carrier_id);
+    sim.ball.position = carrier_pos;
+    sim.ball.last_touch_team = Some(Team::Away);
+
+    let home_def: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home && p.role == PlayerRole::Defender)
+        .map(|p| p.id)
+        .collect();
+    assert!(home_def.len() >= 2, "need a back line");
+    let presser = home_def[0];
+    let cover = home_def[1];
+    for p in sim.players.iter_mut() {
+        if p.team == Team::Home
+            && p.role != PlayerRole::Goalkeeper
+            && p.id != presser
+            && p.id != cover
+        {
+            p.position = Vec2::new(5.0, 115.0);
+        }
+    }
+    sim.players[presser].position = Vec2::new(40.0, 25.0);
+    sim.players[cover].position = Vec2::new(40.0, 20.0);
+
+    let snap = WorldSnapshot::from_match(&sim);
+    let cover_snap = snap.players.iter().find(|p| p.id == cover).unwrap();
+    let expected = snap
+        .press_cover_target_for(cover_snap)
+        .expect("the second defender should be assigned cover");
+    let observation = snap.observation_for(cover);
+    let stale_grid_target = Vec2::new(5.0, 112.0);
+    let plan = SoccerLearnedPlan {
+        action: "press-cover".to_string(),
+        target_player: None,
+        target_point: Some(stale_grid_target),
+        mpc_replan: None,
+    };
+
+    let (action, label) = sim.players[cover]
+        .action_from_learned_plan(&plan, &snap, &observation)
+        .expect("learned press-cover should execute while defending");
+    assert_eq!(label, "press-cover");
+    match action {
+        SoccerAction::MoveTo(actual) => {
+            assert!(
+                actual.distance(expected) < 0.01,
+                "learned press-cover should ignore stale grid target {stale_grid_target:?} and move to {expected:?}, got {actual:?}"
+            );
+        }
+        other => panic!("press-cover must move to the cover point, got {other:?}"),
+    }
+}
+
+#[test]
 fn neural_policy_legality_allows_press_cover_when_opponent_has_the_ball() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let carrier_id = sim

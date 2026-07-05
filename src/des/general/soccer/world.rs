@@ -1433,7 +1433,6 @@ fn learned_policy_action_uses_target_grid_point(action: &str) -> bool {
                 | "defend"
                 | "defend-shape"
                 | "defend-roam"
-                | "press-cover"
                 | "recover"
                 | "vacate-space"
                 | "support-shape"
@@ -6991,8 +6990,10 @@ impl SoccerMatch {
         plan: &SoccerLearnedPlan,
         label: &str,
     ) -> Vec2 {
-        if let Some(target) = plan.target_point {
-            return target.clamp_to_pitch(snapshot.field_width, snapshot.field_length);
+        if label != "press-cover" {
+            if let Some(target) = plan.target_point {
+                return target.clamp_to_pitch(snapshot.field_width, snapshot.field_length);
+            }
         }
         let current = snapshot.player_snapshot_position(player);
         let target = match label {
@@ -7003,10 +7004,16 @@ impl SoccerMatch {
             "defend" | "defend-shape" => {
                 Some(snapshot.defensive_assignment_for(player.id, player.home_position, false))
             }
-            "defend-roam" | "press-cover" => Some(snapshot.goal_side_defensive_target_for(
+            "defend-roam" => Some(snapshot.goal_side_defensive_target_for(
                 player.id,
                 snapshot.defensive_assignment_for(player.id, player.home_position, true),
             )),
+            "press-cover" => snapshot.press_cover_target_for(player).or_else(|| {
+                Some(snapshot.goal_side_defensive_target_for(
+                    player.id,
+                    snapshot.defensive_assignment_for(player.id, player.home_position, true),
+                ))
+            }),
             "dummy-clear-lane" => snapshot.teammate_pass_lane_clearance_target_for(player.id),
             "dummy-let-run" => snapshot.teammate_dummy_let_run_target_for(player.id),
             "lane-yield" => snapshot
