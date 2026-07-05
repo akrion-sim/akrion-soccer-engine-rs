@@ -1320,6 +1320,18 @@ const AERIAL_PASS_OOB_MAX_PENALTY_POINTS: f64 = 9.0;
 /// How far inside the nearest boundary the MPC launch-speed cap aims a lofted ball to land,
 /// and the reference span over which `aerial_pass_landing_safety` ramps 0→1.
 const AERIAL_PASS_OOB_LANDING_SAFETY_MARGIN_YARDS: f64 = 2.5;
+// General pass-out-of-bounds penalty (gated `DD_SOCCER_ENABLE_PASS_OOB_PENALTY`, default OFF ⇒
+// byte-identical). ANY pass — ground or aerial — that the team concedes out of play (a throw-in or
+// goal-kick awarded to the opponent) is an unforced turnover. The bite runs 10→15 points, scaled
+// UP by how FAST the ball was travelling when it crossed the line and how FAR it ran before
+// exiting: a slow ball nicked out is the 10-pt floor; a driven ball blazed a long way out is the
+// full 15. Supersedes the aerial-only handler when enabled (it covers ground passes too).
+const PASS_OOB_BASE_PENALTY_POINTS: f64 = 10.0;
+const PASS_OOB_MAX_PENALTY_POINTS: f64 = 15.0;
+const PASS_OOB_FULL_SPEED_YPS: f64 = 30.0; // exit speed at which the speed term saturates
+const PASS_OOB_FULL_TRAVEL_YARDS: f64 = 40.0; // ball travel at which the distance term saturates
+const PASS_OOB_SPEED_TERM_POINTS: f64 = 3.0;
+const PASS_OOB_TRAVEL_TERM_POINTS: f64 = 2.0;
 // Attackers may run offside briefly, but should get back onside within a few
 // seconds. After the grace window the penalty grows with how long they linger,
 // and stepping back onside after lingering earns a small recovery reward.
