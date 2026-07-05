@@ -23,6 +23,9 @@ const NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR: f64 = 0.04;
 const NEURAL_MCTS_DISTILLATION_PRIORITY_WEIGHT: f64 = 3.0;
 const SOCCER_ACTOR_DECISIVE_EVENT_PRIORITY_WEIGHT: f64 = 2.0;
 const SOCCER_ACTOR_NEGATIVE_OUTCOME_PRIORITY_WEIGHT: f64 = 1.6;
+const COMPLETED_PASS_LEARNING_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(5.0);
+const SHOT_OUTCOME_LEARNING_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(4.0);
+const DRIBBLE_BEAT_LEARNING_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(2.0);
 const LEARNED_MPC_REJECTED_ACTION_PENALTY_POINTS: f64 = 2.5;
 const LEARNED_TARGET_GRID_MIN_VISITS: u32 = 1;
 const GAIT_PHYSICS_STAND_SPEED_YPS: f64 = 0.25;
@@ -1534,14 +1537,8 @@ mod tests {
             .expect("home field player");
         let state = snapshot.mdp_state_for_player(player.id);
         let observation = snapshot.observation_for(player.id);
-        let mut decision_context = soccer_decision_context_for(
-            player.id,
-            player.team,
-            "pass",
-            None,
-            &snapshot,
-            &snapshot,
-        );
+        let mut decision_context =
+            soccer_decision_context_for(player.id, player.team, "pass", None, &snapshot, &snapshot);
         decision_context.neural_mcts_selected = selected;
         SoccerLearningTransition {
             tick: snapshot.tick,
@@ -1560,6 +1557,40 @@ mod tests {
             next_observation: observation,
             done: false,
         }
+    }
+
+    fn world_test_transition(
+        sim: &SoccerMatch,
+        player_id: usize,
+        action: &str,
+        tick: u64,
+    ) -> SoccerLearningTransition {
+        let snapshot = WorldSnapshot::from_match(sim);
+        let player = sim.players.get(player_id).expect("test player exists");
+        let mdp_state = snapshot.mdp_state_for_player(player_id);
+        let observation = snapshot.observation_for(player_id);
+        let mut transition = sim.neural_decision_transition(
+            &snapshot,
+            player_id,
+            player.team,
+            player.role,
+            &mdp_state,
+            &observation,
+        );
+        transition.tick = tick;
+        transition.action = action.to_string();
+        transition
+    }
+
+    fn first_home_field_pair(sim: &SoccerMatch) -> (usize, usize) {
+        let mut ids = sim
+            .players
+            .iter()
+            .filter(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .map(|player| player.id);
+        let first = ids.next().expect("home field player");
+        let second = ids.next().expect("second home field player");
+        (first, second)
     }
 
     #[test]
@@ -1637,6 +1668,247 @@ mod tests {
         assert!(SoccerMatch::has_significant_learning_event(
             &sim.reward_events
         ));
+    }
+
+    #[test]
+    fn completed_pass_reward_replays_original_pass_transition_across_ticks() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            learning_enabled: true,
+            full_game_learning_enabled: true,
+            ..MatchConfig::default()
+        });
+        let (passer, receiver) = first_home_field_pair(&sim);
+        sim.tick = 100;
+        let origin = Vec2::new(34.0, 44.0);
+        let target = Vec2::new(38.0, 55.0);
+        sim.players[passer].position = origin;
+        sim.players[receiver].position = target;
+        sim.ball.position = target;
+        sim.recent_learning_history
+            .push_back(world_test_transition(&sim, passer, "pass", 96));
+
+        let pass = PendingPass {
+            team: Team::Home,
+            from: passer,
+            target: Some(receiver),
+            flight: PassFlight::Floor,
+            is_cross: false,
+            launch_tick: 96,
+            origin,
+            intended_target: target,
+            distance_yards: origin.distance(target),
+            receiver_openness: 1.0,
+            passer_skill: 1.0,
+            launch_speed_yps: 18.0,
+            receiver_position_at_launch: Some(target),
+            receiver_velocity_at_launch: Some(Vec2::zero()),
+            offside: None,
+            offside_candidates: Vec::new(),
+            learn_features: Vec::new(),
+        };
+
+        let deferred_start = sim.deferred_reward_transitions.len();
+        let episode_start = sim.episode_learning_transitions.len();
+        sim.record_completed_pass_reward(&pass, receiver);
+
+        let added = &sim.deferred_reward_transitions[deferred_start..];
+        assert!(
+            added.iter().any(|transition| {
+                transition.player_id == passer
+                    && transition.tick == 96
+                    && normalize_soccer_action_label(&transition.action) == "pass"
+                    && transition.reward > 0.0
+                    && !transition.done
+            }),
+            "completed-pass reward must replay the original pass decision, got {added:?}"
+        );
+        assert!(
+            sim.episode_learning_transitions[episode_start..]
+                .iter()
+                .any(|transition| {
+                    transition.player_id == passer
+                        && transition.tick == 96
+                        && normalize_soccer_action_label(&transition.action) == "pass"
+                        && transition.reward > 0.0
+                }),
+            "full-game replay must also see delayed completed-pass credit"
+        );
+    }
+
+    #[test]
+    fn intercepted_pass_penalty_replays_original_pass_transition_across_ticks() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            learning_enabled: true,
+            full_game_learning_enabled: true,
+            ..MatchConfig::default()
+        });
+        let (passer, receiver) = first_home_field_pair(&sim);
+        let interceptor = sim
+            .players
+            .iter()
+            .find(|player| player.team == Team::Away && player.role != PlayerRole::Goalkeeper)
+            .expect("away field player")
+            .id;
+        sim.tick = 110;
+        let origin = Vec2::new(34.0, 44.0);
+        let target = Vec2::new(39.0, 52.0);
+        sim.players[passer].position = origin;
+        sim.players[receiver].position = target;
+        sim.players[interceptor].position = target;
+        sim.ball.position = target;
+        sim.recent_learning_history
+            .push_back(world_test_transition(&sim, passer, "pass", 105));
+
+        let pass = PendingPass {
+            team: Team::Home,
+            from: passer,
+            target: Some(receiver),
+            flight: PassFlight::Floor,
+            is_cross: false,
+            launch_tick: 105,
+            origin,
+            intended_target: target,
+            distance_yards: origin.distance(target),
+            receiver_openness: 0.2,
+            passer_skill: 0.5,
+            launch_speed_yps: 16.0,
+            receiver_position_at_launch: Some(target),
+            receiver_velocity_at_launch: Some(Vec2::zero()),
+            offside: None,
+            offside_candidates: Vec::new(),
+            learn_features: Vec::new(),
+        };
+
+        let deferred_start = sim.deferred_reward_transitions.len();
+        let episode_start = sim.episode_learning_transitions.len();
+        sim.record_interception_reward(interceptor, Some(&pass));
+
+        let added = &sim.deferred_reward_transitions[deferred_start..];
+        assert!(
+            added.iter().any(|transition| {
+                transition.player_id == passer
+                    && transition.tick == 105
+                    && normalize_soccer_action_label(&transition.action) == "pass"
+                    && transition.reward < 0.0
+                    && !transition.done
+            }),
+            "interception penalty must replay the original pass decision, got {added:?}"
+        );
+        assert!(
+            sim.episode_learning_transitions[episode_start..]
+                .iter()
+                .any(|transition| {
+                    transition.player_id == passer
+                        && transition.tick == 105
+                        && normalize_soccer_action_label(&transition.action) == "pass"
+                        && transition.reward < 0.0
+                }),
+            "full-game replay must also see delayed bad-pass penalty"
+        );
+    }
+
+    #[test]
+    fn shot_on_target_reward_replays_original_shot_transition_across_ticks() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            learning_enabled: true,
+            full_game_learning_enabled: true,
+            ..MatchConfig::default()
+        });
+        let (shooter, _) = first_home_field_pair(&sim);
+        sim.tick = 120;
+        let goal_y = Team::Home.goal_y(sim.config.field_length_yards);
+        sim.players[shooter].position =
+            Vec2::new(sim.config.field_width_yards * 0.5, goal_y - 12.0);
+        sim.ball.position = sim.players[shooter].position;
+        sim.recent_learning_history
+            .push_back(world_test_transition(&sim, shooter, "shoot", 117));
+
+        let deferred_start = sim.deferred_reward_transitions.len();
+        let episode_start = sim.episode_learning_transitions.len();
+        sim.record_shot_on_target_rewards(Team::Home, shooter);
+
+        let added = &sim.deferred_reward_transitions[deferred_start..];
+        assert!(
+            added.iter().any(|transition| {
+                transition.player_id == shooter
+                    && transition.tick == 117
+                    && normalize_soccer_action_label(&transition.action) == "shoot"
+                    && transition.reward > 0.0
+                    && !transition.done
+            }),
+            "shot-on-target reward must replay the original shot decision, got {added:?}"
+        );
+        assert!(
+            sim.episode_learning_transitions[episode_start..]
+                .iter()
+                .any(|transition| {
+                    transition.player_id == shooter
+                        && transition.tick == 117
+                        && normalize_soccer_action_label(&transition.action) == "shoot"
+                        && transition.reward > 0.0
+                }),
+            "full-game replay must also see delayed shot-on-target credit"
+        );
+    }
+
+    #[test]
+    fn dribble_beat_feedback_replays_attacker_and_defender_transitions_across_ticks() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            learning_enabled: true,
+            full_game_learning_enabled: true,
+            ..MatchConfig::default()
+        });
+        let attacker = 9;
+        let defender = 13;
+        sim.tick = 130;
+        sim.players[defender].position = Vec2::new(40.0, 60.0);
+        sim.players[defender].position_history = VecDeque::from([sim.players[defender].position]);
+        sim.players[attacker].position = Vec2::new(40.5, 59.0);
+        sim.players[attacker].position_history = VecDeque::from([sim.players[attacker].position]);
+        sim.ball.holder = Some(attacker);
+        sim.ball.position = sim.players[attacker].position;
+        sim.ball.last_touch_team = Some(Team::Home);
+        sim.recent_learning_history
+            .push_back(world_test_transition(&sim, attacker, "nutmeg", 128));
+        sim.recent_learning_history
+            .push_back(world_test_transition(&sim, defender, "defend", 128));
+
+        let deferred_start = sim.deferred_reward_transitions.len();
+        let episode_start = sim.episode_learning_transitions.len();
+        sim.players[attacker].position = Vec2::new(40.5, 61.2);
+        sim.ball.position = sim.players[attacker].position;
+        sim.record_dribble_beat_event(attacker, defender, DribbleMoveKind::Nutmeg);
+
+        let added = &sim.deferred_reward_transitions[deferred_start..];
+        assert!(
+            added.iter().any(|transition| {
+                transition.player_id == attacker
+                    && transition.tick == 128
+                    && normalize_soccer_action_label(&transition.action) == "nutmeg"
+                    && transition.reward > 0.0
+            }),
+            "successful dribble must replay the original dribble decision, got {added:?}"
+        );
+        assert!(
+            added.iter().any(|transition| {
+                transition.player_id == defender
+                    && transition.tick == 128
+                    && normalize_soccer_action_label(&transition.action) == "defend"
+                    && transition.reward < 0.0
+            }),
+            "beaten defender penalty must replay the original defensive decision, got {added:?}"
+        );
+        assert!(
+            sim.episode_learning_transitions[episode_start..]
+                .iter()
+                .any(|transition| {
+                    transition.player_id == attacker
+                        && transition.tick == 128
+                        && normalize_soccer_action_label(&transition.action) == "nutmeg"
+                        && transition.reward > 0.0
+                }),
+            "full-game replay must also see delayed dribble credit"
+        );
     }
 
     #[test]
@@ -2426,8 +2698,7 @@ mod tests {
         };
         realized.decision_context.learned_mpc_replanned = true;
         realized.decision_context.learned_mpc_original_action = Some("press-cover".to_string());
-        realized.decision_context.learned_mpc_replacement_action =
-            Some("defend-shape".to_string());
+        realized.decision_context.learned_mpc_replacement_action = Some("defend-shape".to_string());
         realized
             .decision_context
             .learned_mpc_rejected_execution_probability =
@@ -3241,9 +3512,7 @@ mod tests {
             0.38,
         ));
         assert!(!SoccerMatch::learned_plan_soft_mpc_replan_candidate(
-            "shoot",
-            0.22,
-            0.92,
+            "shoot", 0.22, 0.92,
         ));
     }
 
@@ -7135,7 +7404,8 @@ impl SoccerMatch {
         original_probability >= LEARNED_MPC_SOFT_REPLAN_MIN_ORIGINAL_PROBABILITY
             && original_probability <= LEARNED_MPC_SOFT_REPLAN_MAX_ORIGINAL_PROBABILITY
             && candidate_probability >= LEARNED_MPC_SOFT_REPLAN_MIN_REPLACEMENT_PROBABILITY
-            && candidate_probability - original_probability >= LEARNED_MPC_SOFT_REPLAN_MIN_IMPROVEMENT
+            && candidate_probability - original_probability
+                >= LEARNED_MPC_SOFT_REPLAN_MIN_IMPROVEMENT
     }
 
     fn learned_plan_mpc_execution_probability(
@@ -10886,6 +11156,14 @@ impl SoccerMatch {
                 -base_penalty * multiplier,
                 SoccerRewardEventKind::BadPassChainPenalty,
             );
+            self.queue_recent_outcome_learning_credit(
+                player_id,
+                team,
+                -base_penalty * multiplier,
+                SoccerRewardEventKind::BadPassChainPenalty,
+                COMPLETED_PASS_LEARNING_CREDIT_MAX_AGE_TICKS,
+                is_pass_like_action,
+            );
         }
     }
 
@@ -11117,6 +11395,14 @@ impl SoccerMatch {
             + progressive_pass_escape_reward(pass, self.ball.position)
             + self.overload_forward_pass_progression_bonus(pass, self.ball.position);
         self.record_reward_event(pass.from, amount);
+        self.queue_recent_outcome_learning_credit(
+            pass.from,
+            pass.team,
+            amount,
+            SoccerRewardEventKind::Routine,
+            COMPLETED_PASS_LEARNING_CREDIT_MAX_AGE_TICKS,
+            |action| is_pass_like_action(action) && action != "wall-return",
+        );
         let completed_forward_yards =
             (self.ball.position.y - pass.origin.y) * pass.team.attack_dir();
         if completed_forward_yards >= PROGRESSIVE_CARRY_FORWARD_PASS_MIN_YARDS {
@@ -11500,6 +11786,69 @@ impl SoccerMatch {
         }
     }
 
+    fn queue_rewarded_learning_transition_for_outcome(
+        &mut self,
+        mut transition: SoccerLearningTransition,
+        amount: f64,
+        kind: SoccerRewardEventKind,
+    ) -> bool {
+        if !self.config.learning_enabled || !amount.is_finite() || amount.abs() <= 1e-9 {
+            return false;
+        }
+        transition.reward = amount;
+        transition.done = false;
+        if transition.tick != self.tick {
+            self.record_reward_event_at_with_kind(
+                transition.tick,
+                transition.player_id,
+                amount,
+                kind,
+            );
+        }
+        if self.config.full_game_learning_enabled && !self.full_game_learning_applied {
+            self.episode_learning_transitions.push(transition.clone());
+        }
+        self.deferred_reward_transitions.push(transition);
+        self.cap_deferred_reward_transitions();
+        true
+    }
+
+    fn queue_recent_outcome_learning_credit<F>(
+        &mut self,
+        player_id: usize,
+        team: Team,
+        amount: f64,
+        kind: SoccerRewardEventKind,
+        max_age_ticks: u64,
+        action_matches: F,
+    ) -> bool
+    where
+        F: Fn(&str) -> bool,
+    {
+        if player_id >= self.players.len()
+            || self.players[player_id].team != team
+            || !amount.is_finite()
+            || amount.abs() <= 1e-9
+        {
+            return false;
+        }
+        let Some(transition) = self
+            .recent_learning_history
+            .iter()
+            .rev()
+            .take_while(|transition| self.tick.saturating_sub(transition.tick) <= max_age_ticks)
+            .find(|transition| {
+                transition.player_id == player_id
+                    && transition.team == team
+                    && action_matches(normalize_soccer_action_label(&transition.action))
+            })
+            .cloned()
+        else {
+            return false;
+        };
+        self.queue_rewarded_learning_transition_for_outcome(transition, amount, kind)
+    }
+
     fn queue_recent_significant_reward_transition(
         &mut self,
         player_id: usize,
@@ -11509,27 +11858,17 @@ impl SoccerMatch {
         if !self.config.learning_enabled || amount <= 1e-9 || !amount.is_finite() {
             return;
         }
-        let Some(mut transition) = self
-            .recent_learning_history
-            .iter()
-            .rev()
-            .take_while(|transition| {
-                self.tick.saturating_sub(transition.tick) <= PASS_CHAIN_EVENT_CREDIT_MAX_AGE_TICKS
-            })
-            .find(|transition| {
-                transition.player_id == player_id
-                    && soccer_goal_credit_action_is_relevant(&transition.action)
-            })
-            .cloned()
-        else {
+        let Some(team) = self.players.get(player_id).map(|player| player.team) else {
             return;
         };
-        transition.reward = amount;
-        transition.done = false;
-        if transition.tick != self.tick {
-            self.record_reward_event_at_with_kind(transition.tick, player_id, amount, kind);
-        }
-        self.deferred_reward_transitions.push(transition);
+        self.queue_recent_outcome_learning_credit(
+            player_id,
+            team,
+            amount,
+            kind,
+            PASS_CHAIN_EVENT_CREDIT_MAX_AGE_TICKS,
+            soccer_goal_credit_action_is_relevant,
+        );
     }
 
     fn record_significant_pass_chain_rewards(
@@ -11825,6 +12164,14 @@ impl SoccerMatch {
             self.record_turnover_chain_blame(pass.team, pass.from, penalty);
             self.record_possession_touch(interceptor);
             self.record_reward_event(pass.from, -penalty);
+            self.queue_recent_outcome_learning_credit(
+                pass.from,
+                pass.team,
+                -penalty,
+                SoccerRewardEventKind::BadPassChainPenalty,
+                COMPLETED_PASS_LEARNING_CREDIT_MAX_AGE_TICKS,
+                is_pass_like_action,
+            );
             // The intercepted team just turned the ball over — penalize its last ~5s.
             let gaining_team = self.players.get(interceptor).map(|player| player.team);
             self.penalize_turnover_window_with_context(pass.team, gaining_team, self.ball.position);
@@ -12028,6 +12375,14 @@ impl SoccerMatch {
                     amount,
                     SoccerRewardEventKind::BuildupChainCredit,
                 );
+                self.queue_recent_outcome_learning_credit(
+                    player_id,
+                    team,
+                    amount,
+                    SoccerRewardEventKind::BuildupChainCredit,
+                    PASS_CHAIN_EVENT_CREDIT_MAX_AGE_TICKS,
+                    soccer_goal_credit_action_is_relevant,
+                );
             }
         }
     }
@@ -12092,12 +12447,23 @@ impl SoccerMatch {
             &SHOT_ON_TARGET_REWARD_PATTERN,
             SoccerRewardEventKind::ShotOnTarget,
         );
-        if self.record_contextual_attacking_rewards(
+        let contextual_recorded = self.record_contextual_attacking_rewards(
             shooting_team,
             Some(shooter),
             contextual_pool,
             SoccerRewardEventKind::ShotOnTarget,
-        ) {
+        );
+        if !contextual_recorded {
+            self.queue_recent_outcome_learning_credit(
+                shooter,
+                shooting_team,
+                contextual_pool,
+                SoccerRewardEventKind::ShotOnTarget,
+                SHOT_OUTCOME_LEARNING_CREDIT_MAX_AGE_TICKS,
+                |action| matches!(action, "shoot" | "first-time-shot" | "first-time-header"),
+            );
+        }
+        if contextual_recorded {
             self.update_mpc_latent_objective(shooting_team, None, Some(scale), None);
             return;
         }
@@ -12266,6 +12632,14 @@ impl SoccerMatch {
             reward_pool,
             &SHOT_ON_TARGET_REWARD_PATTERN,
             SoccerRewardEventKind::ShotAttempt,
+        );
+        self.queue_recent_outcome_learning_credit(
+            shooter,
+            shooting_team,
+            reward_pool,
+            SoccerRewardEventKind::ShotAttempt,
+            SHOT_OUTCOME_LEARNING_CREDIT_MAX_AGE_TICKS,
+            |action| matches!(action, "shoot" | "first-time-shot" | "first-time-header"),
         );
     }
 
@@ -12638,6 +13012,16 @@ impl SoccerMatch {
                 &[reward_points],
                 SoccerRewardEventKind::Goal,
             );
+            if let Some(shooter) = shooter {
+                self.queue_recent_outcome_learning_credit(
+                    shooter,
+                    scoring_team,
+                    reward_points,
+                    SoccerRewardEventKind::Goal,
+                    SHOT_OUTCOME_LEARNING_CREDIT_MAX_AGE_TICKS,
+                    |action| matches!(action, "shoot" | "first-time-shot" | "first-time-header"),
+                );
+            }
         } else {
             debug_assert!(
                 (GOAL_CHAIN_REWARD_PATTERN.iter().sum::<f64>() - GOAL_REWARD_POINTS).abs() < 1e-9
@@ -12650,7 +13034,20 @@ impl SoccerMatch {
                 &GOAL_CHAIN_REWARD_PATTERN,
                 SoccerRewardEventKind::Goal,
             );
-            self.record_contextual_goal_rewards(scoring_team, shooter, GOAL_REWARD_POINTS);
+            if !self.record_contextual_goal_rewards(scoring_team, shooter, GOAL_REWARD_POINTS) {
+                if let Some(shooter) = shooter {
+                    self.queue_recent_outcome_learning_credit(
+                        shooter,
+                        scoring_team,
+                        GOAL_REWARD_POINTS,
+                        SoccerRewardEventKind::Goal,
+                        SHOT_OUTCOME_LEARNING_CREDIT_MAX_AGE_TICKS,
+                        |action| {
+                            matches!(action, "shoot" | "first-time-shot" | "first-time-header")
+                        },
+                    );
+                }
+            }
         }
         self.update_mpc_latent_objective(scoring_team, None, Some(1.0), Some(1.0));
         self.record_recent_defensive_goal_penalties(scoring_team.other());
@@ -14322,10 +14719,32 @@ impl SoccerMatch {
             kind.beat_reward_points(),
             SoccerRewardEventKind::DribbleBeat,
         );
+        self.queue_recent_outcome_learning_credit(
+            attacker_id,
+            attacker_team,
+            kind.beat_reward_points(),
+            SoccerRewardEventKind::DribbleBeat,
+            DRIBBLE_BEAT_LEARNING_CREDIT_MAX_AGE_TICKS,
+            is_dribble_action_label,
+        );
         self.record_reward_event_with_kind(
             defender_id,
             -BEATEN_BY_DRIBBLE_PENALTY_POINTS,
             SoccerRewardEventKind::DribbleBeat,
+        );
+        let defender_team = self.players[defender_id].team;
+        self.queue_recent_outcome_learning_credit(
+            defender_id,
+            defender_team,
+            -BEATEN_BY_DRIBBLE_PENALTY_POINTS,
+            SoccerRewardEventKind::DribbleBeat,
+            DRIBBLE_BEAT_LEARNING_CREDIT_MAX_AGE_TICKS,
+            |action| {
+                matches!(
+                    action,
+                    "defend" | "press" | "press-cover" | "tackle" | "slide-tackle"
+                )
+            },
         );
         self.stat_dribble_beat(attacker_team);
         self.record_possession_touch(attacker_id);
