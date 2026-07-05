@@ -40,6 +40,8 @@ const SOCCER_MATCH_FITNESS_TURNOVER_RISK_WEIGHT: f64 = 1.50;
 const SOCCER_MATCH_FITNESS_MAX_DECISIVE_MARGIN: f64 = 6.0;
 const SOCCER_MATCH_FITNESS_MIN: f64 = -8.0;
 const SOCCER_MATCH_FITNESS_MAX: f64 = 12.0;
+const SOCCER_DIRECTIONAL_OBJECTIVE_MIN: f64 = -8.0;
+const SOCCER_DIRECTIONAL_OBJECTIVE_MAX: f64 = 12.0;
 const SOCCER_POLICY_PLATEAU_FITNESS_SPREAD: f64 = 0.075;
 const SOCCER_POLICY_LOW_CEILING_FITNESS: f64 = 1.50;
 const SOCCER_POLICY_SEARCH_MAX_ADAPTED_POPULATION: usize = 128;
@@ -1887,6 +1889,65 @@ pub fn soccer_learning_team_score(
         fitness,
         fitness_micros: soccer_learning_to_micros(fitness),
     }
+}
+
+pub fn soccer_learning_directional_objective_fitness(team: Team, summary: &MatchSummary) -> f64 {
+    let goals_for = match team {
+        Team::Home => summary.score_home,
+        Team::Away => summary.score_away,
+    };
+    let goals_against = match team {
+        Team::Home => summary.score_away,
+        Team::Away => summary.score_home,
+    };
+    let base = soccer_learning_team_score(team, goals_for, goals_against).fitness;
+    let own_quality = soccer_learning_team_play_quality(team, summary);
+    let opp_quality = soccer_learning_team_play_quality(team.other(), summary);
+    let stats = &summary.stats;
+    let (
+        shots_for,
+        shots_against,
+        shots_on_target_for,
+        shots_on_target_against,
+        shots_after_pass_for,
+        shots_after_pass_against,
+        backward_completed_for,
+        chain_losses_for,
+    ) = match team {
+        Team::Home => (
+            stats.shots_home,
+            stats.shots_away,
+            stats.shots_on_target_home,
+            stats.shots_on_target_away,
+            stats.shots_after_pass_home,
+            stats.shots_after_pass_away,
+            stats.passes_completed_backward_home,
+            stats.pass_chains_net_loss_home,
+        ),
+        Team::Away => (
+            stats.shots_away,
+            stats.shots_home,
+            stats.shots_on_target_away,
+            stats.shots_on_target_home,
+            stats.shots_after_pass_away,
+            stats.shots_after_pass_home,
+            stats.passes_completed_backward_away,
+            stats.pass_chains_net_loss_away,
+        ),
+    };
+    let shot_creation = soccer_learning_bounded_count(shots_on_target_for, 8.0) * 0.45
+        + soccer_learning_bounded_count(shots_for, 12.0) * 0.12
+        + soccer_learning_bounded_count(shots_after_pass_for, 8.0) * 0.20;
+    let shot_concession = soccer_learning_bounded_count(shots_on_target_against, 8.0) * 0.55
+        + soccer_learning_bounded_count(shots_against, 12.0) * 0.12
+        + soccer_learning_bounded_count(shots_after_pass_against, 8.0) * 0.18;
+    let recycle_penalty = soccer_learning_bounded_count(backward_completed_for, 18.0) * 0.12
+        + soccer_learning_bounded_count(chain_losses_for, 10.0) * 0.15;
+    (base + (own_quality - opp_quality) * 0.75 + shot_creation - shot_concession - recycle_penalty)
+        .clamp(
+            SOCCER_DIRECTIONAL_OBJECTIVE_MIN,
+            SOCCER_DIRECTIONAL_OBJECTIVE_MAX,
+        )
 }
 
 fn soccer_learning_match_play_quality(summary: &MatchSummary) -> f64 {
@@ -8644,6 +8705,72 @@ mod tests {
         assert!(
             backward_quality < sterile_quality,
             "net-backward pass farming should be worse than sterile forward possession: backward={backward_quality}, sterile={sterile_quality}"
+        );
+    }
+
+    #[test]
+    fn directional_objective_rewards_sot_and_prevents_conceded_sot() {
+        let mut attacking_stats = MatchStats::default();
+        attacking_stats.shots_home = 10;
+        attacking_stats.shots_on_target_home = 6;
+        attacking_stats.shots_after_pass_home = 4;
+        attacking_stats.passes_attempted_home = 18;
+        attacking_stats.passes_completed_home = 12;
+        attacking_stats.passes_completed_forward_home = 8;
+        let attacking = MatchSummary {
+            score_home: 0,
+            score_away: 0,
+            ticks: 100,
+            simulated_seconds: 90.0,
+            stats: attacking_stats,
+        };
+
+        let mut passive_stats = MatchStats::default();
+        passive_stats.passes_attempted_home = 60;
+        passive_stats.passes_completed_home = 54;
+        passive_stats.passes_completed_forward_home = 48;
+        passive_stats.pass_chain_gain_yards_home = 180.0;
+        let passive = MatchSummary {
+            score_home: 0,
+            score_away: 0,
+            ticks: 100,
+            simulated_seconds: 90.0,
+            stats: passive_stats,
+        };
+
+        let attacking_objective =
+            soccer_learning_directional_objective_fitness(Team::Home, &attacking);
+        let passive_objective = soccer_learning_directional_objective_fitness(Team::Home, &passive);
+        assert!(
+            attacking_objective > passive_objective,
+            "shots on target should beat sterile pass chains: attacking={attacking_objective}, passive={passive_objective}"
+        );
+
+        let mut exposed_stats = attacking.stats.clone();
+        exposed_stats.shots_away = 10;
+        exposed_stats.shots_on_target_away = 7;
+        exposed_stats.shots_after_pass_away = 4;
+        let exposed = MatchSummary {
+            stats: exposed_stats,
+            ..attacking.clone()
+        };
+        let exposed_objective = soccer_learning_directional_objective_fitness(Team::Home, &exposed);
+        assert!(
+            attacking_objective > exposed_objective + 0.40,
+            "conceded shots on target must lower the HOME objective: clean={attacking_objective}, exposed={exposed_objective}"
+        );
+
+        let one_goal = MatchSummary {
+            score_home: 1,
+            score_away: 0,
+            ticks: 100,
+            simulated_seconds: 90.0,
+            stats: MatchStats::default(),
+        };
+        let goal_objective = soccer_learning_directional_objective_fitness(Team::Home, &one_goal);
+        assert!(
+            goal_objective > attacking_objective,
+            "a real goal should still dominate sterile scoreless shot pressure: goal={goal_objective}, attacking={attacking_objective}"
         );
     }
 

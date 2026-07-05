@@ -47,7 +47,8 @@ use soccer_engine::des::soccer_learning::{
     evaluate_soccer_policy_promotion_gate, evolve_soccer_tactical_learning_weights_from_genomes,
     evolve_soccer_team_policies, merge_soccer_policy_deltas,
     soccer_evolution_options_from_search_metadata, soccer_learning_curriculum_episode_config,
-    soccer_learning_curriculum_stage_for_completed_games, soccer_learning_run_score,
+    soccer_learning_curriculum_stage_for_completed_games,
+    soccer_learning_directional_objective_fitness, soccer_learning_run_score,
     soccer_neural_network_snapshot_fingerprint, soccer_policy_active_max_fitness_regression,
     soccer_policy_delta_entries, soccer_policy_version_insert_status_after_active_head,
     soccer_postgres_new_sim_refresh_plan, soccer_postgres_policy_refresh_decision,
@@ -273,7 +274,7 @@ fn soccer_learning_objective_match_fitness(
 ) -> f64 {
     let score = soccer_learning_run_score(summary);
     if analytic_neural_opponent {
-        score.home.fitness.clamp(
+        soccer_learning_directional_objective_fitness(Team::Home, summary).clamp(
             SOCCER_LEARNING_OBJECTIVE_FITNESS_MIN,
             SOCCER_LEARNING_OBJECTIVE_FITNESS_MAX,
         )
@@ -8764,6 +8765,31 @@ mod tests {
 
         assert!(soccer_learning_objective_match_fitness(&summary, false) > 1.0);
         assert!(soccer_learning_objective_match_fitness(&summary, true) < 0.0);
+    }
+
+    #[test]
+    fn analytic_opponent_objective_uses_dense_home_shot_pressure() {
+        let mut active_stats = soccer_engine::des::general::soccer::MatchStats::default();
+        active_stats.shots_home = 10;
+        active_stats.shots_on_target_home = 6;
+        active_stats.shots_after_pass_home = 4;
+        let active = soccer_engine::des::general::soccer::MatchSummary {
+            score_home: 0,
+            score_away: 0,
+            ticks: 10,
+            simulated_seconds: 1.0,
+            stats: active_stats,
+        };
+
+        let mut exposed = active.clone();
+        exposed.stats.shots_away = 10;
+        exposed.stats.shots_on_target_away = 7;
+        exposed.stats.shots_after_pass_away = 4;
+
+        assert!(
+            soccer_learning_objective_match_fitness(&active, true)
+                > soccer_learning_objective_match_fitness(&exposed, true) + 0.40
+        );
     }
 
     #[test]
