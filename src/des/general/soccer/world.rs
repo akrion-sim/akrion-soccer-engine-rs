@@ -466,6 +466,13 @@ pub struct SoccerMatch {
     pub(crate) pending_aerial_finish: Option<(usize, u64)>,
     pub(crate) coach_set_play_hints: HashMap<Team, SoccerSetPlayVectorHint>,
     pub(crate) reward_events: Vec<SoccerRewardEvent>,
+    /// Cross-tick DEFERRED credit: `(decision_tick, player_id, amount)` for delayed OUTCOME rewards
+    /// (a completed pass resolves ~30 ticks AFTER the pass decision). The per-tick `reward_events`
+    /// buffer is cleared each tick, so a delayed reward recorded at the RESOLUTION tick lands on the
+    /// wrong (later) decision transition. These are back-dated to the DECISION tick and applied to
+    /// the matching `episode_learning_transitions` entry at end-of-game, before the replay blend, so
+    /// the pass/shot DECISION that earned the outcome actually gets credited. Gated (default off).
+    pub(crate) deferred_reward_credits: Vec<(u64, usize, f64)>,
     pub(crate) episode_learning_transitions: Vec<SoccerLearningTransition>,
     /// Per-tick whole-field configuration captures (ball carrier only) for the
     /// retrieval corpus. Populated only when `config.retrieval.capture_enabled`
