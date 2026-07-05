@@ -24192,6 +24192,57 @@ fn press_cover_assigns_a_second_defender_goal_side_behind_the_lone_presser() {
 }
 
 #[test]
+fn neural_policy_legality_allows_press_cover_when_opponent_has_the_ball() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let carrier_id = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && p.role == PlayerRole::Forward)
+        .map(|p| p.id)
+        .expect("an away forward");
+    let carrier_pos = Vec2::new(40.0, 30.0);
+    sim.players[carrier_id].position = carrier_pos;
+    sim.ball.holder = Some(carrier_id);
+    sim.ball.position = carrier_pos;
+    sim.ball.last_touch_team = Some(Team::Away);
+
+    let snap = WorldSnapshot::from_match(&sim);
+    let cover = snap
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role == PlayerRole::Defender)
+        .expect("home defender");
+    let cover_observation = snap.observation_for(cover.id);
+    assert!(
+        learned_action_label_is_legal_for_observation(
+            "press-cover",
+            &snap,
+            cover.id,
+            cover,
+            &cover_observation,
+        ),
+        "neural policy legality must admit press-cover when defending an opponent carrier"
+    );
+
+    let keeper = snap
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role == PlayerRole::Goalkeeper)
+        .expect("home goalkeeper");
+    let keeper_observation = snap.observation_for(keeper.id);
+    assert!(
+        !learned_action_label_is_legal_for_observation(
+            "press-cover",
+            &snap,
+            keeper.id,
+            keeper,
+            &keeper_observation,
+        ),
+        "goalkeepers should not be admitted to the press-cover policy action"
+    );
+}
+
+#[test]
 fn press_cover_is_inactive_when_the_carrier_is_in_our_attacking_half() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let carrier_id = sim

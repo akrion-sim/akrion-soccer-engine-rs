@@ -64165,6 +64165,11 @@ fn learned_action_label_is_legal_for_observation(
         "defend" | "defend-shape" | "defend-roam" => {
             snapshot.controlled_possession_team() == Some(player.team.other())
         }
+        "press-cover" => {
+            player.role != PlayerRole::Goalkeeper
+                && snapshot.controlled_possession_team() == Some(player.team.other())
+                && snapshot.ball.holder.is_some()
+        }
         "recover" => snapshot.controlled_possession_team().is_none(),
         "tackle" => snapshot.ball.holder.is_some_and(|holder| {
             snapshot
