@@ -1398,6 +1398,32 @@ fn stamp_learned_policy_behavior_probability_on_decision(
     }];
 }
 
+/// Recenter + rescale a training batch's value targets to ~zero-mean / unit-variance. This is the
+/// fix for value-head collapse: with fixed `target_scale` the targets cluster near a constant, so
+/// the loss-optimal solution is a constant output (dead output layer / flat value). Standardizing
+/// makes the constant no longer optimal, forcing the net to encode state-dependent value. Ranking
+/// is invariant to this affine transform, so decisions are unaffected. No-op for tiny batches
+/// (<8) or degenerate (≈zero-variance) batches, so it never amplifies pure noise.
+fn soccer_standardize_sample_targets(samples: &mut [SoccerNeuralTrainingSample], target_clip: f64) {
+    if samples.len() < 8 {
+        return;
+    }
+    let n = samples.len() as f64;
+    let mean = samples.iter().map(|s| s.target).sum::<f64>() / n;
+    let var = samples
+        .iter()
+        .map(|s| (s.target - mean) * (s.target - mean))
+        .sum::<f64>()
+        / n;
+    let std = var.sqrt();
+    if !std.is_finite() || std <= 1e-4 {
+        return;
+    }
+    for sample in samples.iter_mut() {
+        sample.target = ((sample.target - mean) / std).clamp(-target_clip, target_clip);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
