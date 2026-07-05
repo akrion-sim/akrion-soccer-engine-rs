@@ -3486,6 +3486,10 @@ mod tests {
             );
             transition.tick = offset as u64;
             transition.action = "hold".to_string();
+            transition.state.possession_team = Some(Team::Away);
+            transition.next_state.possession_team = Some(Team::Away);
+            transition.observation.has_ball = false;
+            transition.next_observation.has_ball = false;
             sim.recent_learning_history.push_back(transition);
         }
 
@@ -3514,6 +3518,54 @@ mod tests {
         assert!(
             defender_penalty <= -0.75,
             "conceded shots on target need a material defensive learning signal, got {defender_penalty}"
+        );
+    }
+
+    #[test]
+    fn conceded_shot_on_target_does_not_blame_own_possession_attacks() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            duration_seconds: 0.1,
+            learning_enabled: true,
+            seed: 914,
+            ..MatchConfig::default()
+        });
+        let attacker = sim
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home && player.role == PlayerRole::Forward)
+            .expect("home forward")
+            .id;
+        let defender = sim
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home && player.role == PlayerRole::Defender)
+            .expect("home defender")
+            .id;
+
+        let mut attacking_pass = world_test_transition(&sim, attacker, "pass", 41);
+        attacking_pass.state.possession_team = Some(Team::Home);
+        attacking_pass.next_state.possession_team = Some(Team::Home);
+        attacking_pass.observation.has_ball = true;
+        attacking_pass.next_observation.has_ball = true;
+        sim.recent_learning_history.push_back(attacking_pass);
+
+        let mut defending_action = world_test_transition(&sim, defender, "defend", 42);
+        defending_action.state.possession_team = Some(Team::Away);
+        defending_action.next_state.possession_team = Some(Team::Away);
+        defending_action.observation.has_ball = false;
+        defending_action.next_observation.has_ball = false;
+        sim.recent_learning_history.push_back(defending_action);
+
+        let deferred_start = sim.deferred_reward_transitions.len();
+        sim.record_recent_defensive_shot_on_target_penalties(Team::Home, 1.0);
+        let added = &sim.deferred_reward_transitions[deferred_start..];
+        assert_eq!(added.len(), 1, "only defensive context should be blamed");
+        assert_eq!(added[0].player_id, defender);
+        assert!(
+            added
+                .iter()
+                .all(|transition| transition.player_id != attacker),
+            "own-possession attacking actions must not receive defensive shot-on-target blame"
         );
     }
 
@@ -13873,7 +13925,9 @@ impl SoccerMatch {
             .recent_learning_history
             .iter()
             .rev()
-            .filter(|transition| transition.team == defending_team)
+            .filter(|transition| {
+                Self::defensive_shot_on_target_blameable_transition(transition, defending_team)
+            })
             .take(DEFENSIVE_SHOT_ON_TARGET_HISTORY_ACTIONS)
             .cloned()
             .collect::<Vec<_>>();
@@ -13896,6 +13950,41 @@ impl SoccerMatch {
             self.deferred_reward_transitions.push(transition);
         }
         self.cap_deferred_reward_transitions();
+    }
+
+    fn defensive_shot_on_target_blameable_transition(
+        transition: &SoccerLearningTransition,
+        defending_team: Team,
+    ) -> bool {
+        if transition.team != defending_team {
+            return false;
+        }
+        if transition.observation.has_ball || transition.next_observation.has_ball {
+            return false;
+        }
+        if transition.state.possession_team == Some(defending_team)
+            || transition.next_state.possession_team == Some(defending_team)
+        {
+            return false;
+        }
+
+        let action = normalize_soccer_action_label(&transition.action);
+        if matches!(
+            action,
+            "pass"
+                | "aerial-pass"
+                | "cross"
+                | "through-ball"
+                | "shoot"
+                | "first-time-shot"
+                | "first-time-header"
+                | "carry"
+        ) || is_dribble_action_label(action)
+        {
+            return false;
+        }
+
+        true
     }
 
     /// Detect an open-play turnover (controlled possession passing from one team
