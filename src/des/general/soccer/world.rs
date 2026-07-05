@@ -18295,13 +18295,23 @@ impl SoccerMatch {
                 // Apply the aerial-OOB penalty FIRST so it can claim the event; the generic
                 // turnover penalty inside `apply_restart` then defers via the guard flag.
                 if !was_shot {
-                    self.suppress_generic_oob_turnover = self
-                        .record_aerial_pass_out_of_bounds_penalty(
+                    // The general pass-OOB penalty (gated) covers ground passes too and supersedes
+                    // the aerial-only handler when enabled; fall back to the aerial handler otherwise.
+                    self.suppress_generic_oob_turnover = if dd_soccer_enable_pass_oob_penalty() {
+                        self.record_pass_out_of_bounds_penalty(
                             oob_pass.as_ref(),
                             restart_kind,
                             restart_awarded,
                             restart_position,
-                        );
+                        )
+                    } else {
+                        self.record_aerial_pass_out_of_bounds_penalty(
+                            oob_pass.as_ref(),
+                            restart_kind,
+                            restart_awarded,
+                            restart_position,
+                        )
+                    };
                 }
                 self.apply_restart(restart);
                 self.suppress_generic_oob_turnover = false;
