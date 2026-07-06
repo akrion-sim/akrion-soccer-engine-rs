@@ -1801,10 +1801,14 @@ fn restore_local_best_after_held_promotion(
     backoff_factor: f64,
     backoff_min_learning_rate: f64,
     backoff_min_blend_lambda: f64,
+    min_restore_games: usize,
     max_mean_match_fitness_regression: f64,
     max_play_quality_regression: f64,
 ) -> bool {
     if latest_neural_network.is_none() {
+        return false;
+    }
+    if completed_games < min_restore_games {
         return false;
     }
     let local_best_restore = local_neural_promotion_trial_best
@@ -6487,6 +6491,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     let policy_promotion_local_best_anchor_held =
         env_bool("SOCCER_POLICY_PROMOTION_LOCAL_BEST_ANCHOR_HELD", false)?;
+    let policy_promotion_local_best_restore_min_games =
+        env_usize("SOCCER_POLICY_PROMOTION_LOCAL_BEST_RESTORE_MIN_GAMES", 0)?;
     let policy_promotion_local_best_restore_max_mean_fitness_regression = env_f64(
         "SOCCER_POLICY_PROMOTION_LOCAL_BEST_RESTORE_MAX_MEAN_FITNESS_REGRESSION",
         0.0,
@@ -7229,7 +7235,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         curriculum_config.full_match_after_games
     );
     println!(
-        "policy_promotion_gate enabled={} min_sample_games={} min_mean_match_fitness={:.4} min_best_match_fitness={:.4} min_mean_play_quality={:.4} max_mean_conceded_goals={:.4} max_mean_goal_margin={:.4} max_mean_chain_net_loss={:.4} active_max_fitness_regression={:.4} compare_incumbent={} min_mean_fitness_delta={:.4} max_mean_fitness_regression={:.4} max_play_quality_regression={:.4} baseline_lookback_generations={} apply_evolution_when_held={} reset_to_incumbent_after_held_trial={} require_trial_before_write={} neural_checkpoint_when_held={} recalibrate_incumbent_on_resume={} local_best_rollback={} local_best_anchor_held={} local_best_backoff={} local_best_backoff_factor={:.3} local_best_backoff_min_lr={:.5} local_best_backoff_min_blend={:.3} local_best_restore_max_mean_fitness_regression={:.4} local_best_restore_max_play_quality_regression={:.4}",
+        "policy_promotion_gate enabled={} min_sample_games={} min_mean_match_fitness={:.4} min_best_match_fitness={:.4} min_mean_play_quality={:.4} max_mean_conceded_goals={:.4} max_mean_goal_margin={:.4} max_mean_chain_net_loss={:.4} active_max_fitness_regression={:.4} compare_incumbent={} min_mean_fitness_delta={:.4} max_mean_fitness_regression={:.4} max_play_quality_regression={:.4} baseline_lookback_generations={} apply_evolution_when_held={} reset_to_incumbent_after_held_trial={} require_trial_before_write={} neural_checkpoint_when_held={} recalibrate_incumbent_on_resume={} local_best_rollback={} local_best_anchor_held={} local_best_backoff={} local_best_backoff_factor={:.3} local_best_backoff_min_lr={:.5} local_best_backoff_min_blend={:.3} local_best_restore_min_games={} local_best_restore_max_mean_fitness_regression={:.4} local_best_restore_max_play_quality_regression={:.4}",
         policy_promotion_gate.enabled,
         policy_promotion_gate.min_sample_games,
         policy_promotion_gate.min_mean_match_fitness,
@@ -7255,6 +7261,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         policy_promotion_local_best_backoff_factor,
         policy_promotion_local_best_backoff_min_learning_rate,
         policy_promotion_local_best_backoff_min_blend_lambda,
+        policy_promotion_local_best_restore_min_games,
         policy_promotion_local_best_restore_max_mean_fitness_regression,
         policy_promotion_local_best_restore_max_play_quality_regression
     );
@@ -8143,6 +8150,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                             policy_promotion_local_best_backoff_factor,
                             policy_promotion_local_best_backoff_min_learning_rate,
                             policy_promotion_local_best_backoff_min_blend_lambda,
+                            policy_promotion_local_best_restore_min_games,
                             policy_promotion_local_best_restore_max_mean_fitness_regression,
                             policy_promotion_local_best_restore_max_play_quality_regression,
                         );
@@ -8163,6 +8171,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                             policy_promotion_local_best_backoff_factor,
                             policy_promotion_local_best_backoff_min_learning_rate,
                             policy_promotion_local_best_backoff_min_blend_lambda,
+                            policy_promotion_local_best_restore_min_games,
                             policy_promotion_local_best_restore_max_mean_fitness_regression,
                             policy_promotion_local_best_restore_max_play_quality_regression,
                         );
@@ -8231,7 +8240,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                                     .unwrap_or_else(|| "none".to_string())
                             );
                         }
-                        if policy_promotion_local_best_rollback && latest_neural_network.is_some() {
+                        if policy_promotion_local_best_rollback
+                            && latest_neural_network.is_some()
+                            && completed_episode >= policy_promotion_local_best_restore_min_games
+                        {
                             let local_best_restore = local_neural_promotion_trial_best
                                 .as_ref()
                                 .filter(|best| {
@@ -9060,6 +9072,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                             policy_promotion_local_best_backoff_factor,
                             policy_promotion_local_best_backoff_min_learning_rate,
                             policy_promotion_local_best_backoff_min_blend_lambda,
+                            policy_promotion_local_best_restore_min_games,
                             policy_promotion_local_best_restore_max_mean_fitness_regression,
                             policy_promotion_local_best_restore_max_play_quality_regression,
                         );
