@@ -171,9 +171,23 @@ fn eval(candidate_path: &str, baseline_path: &str, games: usize, minutes: f64, h
         let seed = holdout_base.wrapping_add((g as u32).wrapping_mul(2_246_822_519));
         // Alternate home/away so the verdict isn't a home-field artifact.
         let report = if g % 2 == 0 {
-            play_holdout_fixture(&mut runner, candidate_id, baseline_id, seed, &candidate, &baseline)
+            play_holdout_fixture(
+                &mut runner,
+                candidate_id,
+                baseline_id,
+                seed,
+                &candidate,
+                &baseline,
+            )
         } else {
-            play_holdout_fixture(&mut runner, baseline_id, candidate_id, seed, &baseline, &candidate)
+            play_holdout_fixture(
+                &mut runner,
+                baseline_id,
+                candidate_id,
+                seed,
+                &baseline,
+                &candidate,
+            )
         };
         if let Some(r) = report {
             eprintln!(
@@ -211,10 +225,15 @@ fn eval(candidate_path: &str, baseline_path: &str, games: usize, minutes: f64, h
     );
     println!(
         "payoff vs baseline {:?}  Wilson lower bound {:.3}",
-        verdict.payoff_vs_baseline.map(|p| (p * 1000.0).round() / 1000.0),
+        verdict
+            .payoff_vs_baseline
+            .map(|p| (p * 1000.0).round() / 1000.0),
         verdict.wilson_lower_bound,
     );
-    println!("DECISION: {}", if verdict.promote { "PROMOTE" } else { "REJECT" });
+    println!(
+        "DECISION: {}",
+        if verdict.promote { "PROMOTE" } else { "REJECT" }
+    );
     for reason in &verdict.reasons {
         println!("  - {reason}");
     }
@@ -224,15 +243,21 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("train") => {
-            let out = args.get(2).expect("usage: train <out.json> [games] [minutes] [seed_hex]");
+            let out = args
+                .get(2)
+                .expect("usage: train <out.json> [games] [minutes] [seed_hex]");
             let games = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(40);
             let minutes = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(3.0);
             let seed = parse_hex(args.get(5), 0x71A1_0000);
             train(out, games, minutes, seed);
         }
         Some("eval") => {
-            let candidate = args.get(2).expect("usage: eval <candidate.json> <baseline.json> ...");
-            let baseline = args.get(3).expect("usage: eval <candidate.json> <baseline.json> ...");
+            let candidate = args
+                .get(2)
+                .expect("usage: eval <candidate.json> <baseline.json> ...");
+            let baseline = args
+                .get(3)
+                .expect("usage: eval <candidate.json> <baseline.json> ...");
             let games = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(30);
             let minutes = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(3.0);
             let holdout = parse_hex(args.get(6), 0xE7A1_0000);

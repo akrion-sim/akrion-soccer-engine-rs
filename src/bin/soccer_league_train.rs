@@ -20,11 +20,14 @@
 //!      SOCCER_LEAGUE_FRESH_OPPONENTS (usize, default 2)
 //!      SOCCER_LEAGUE_CHECKPOINT_EVERY_ROUNDS (usize, default 10 — add frontier to league)
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::time::Instant;
 
-use soccer_engine::des::general::soccer::SoccerNeuralNetworkSnapshot;
+use soccer_engine::des::general::soccer::{
+    SoccerNeuralNetworkSnapshot, SoccerQStateKey, SoccerQTargetEntry,
+};
 use soccer_engine::des::general::tournament::{
     EngineMatchRunner, EngineMatchRunnerConfig, TeamBrain, TournamentMatchContext,
     TournamentMatchRunner, TournamentStage,
@@ -34,10 +37,16 @@ fn env_str(k: &str, d: &str) -> String {
     std::env::var(k).unwrap_or_else(|_| d.to_string())
 }
 fn env_usize(k: &str, d: usize) -> usize {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 fn env_f64(k: &str, d: f64) -> f64 {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 
 /// Recompute parameter_count + l2_norm after mutating weights (the persistence validator
@@ -124,11 +133,109 @@ fn perturb_weights(s: &mut SoccerNeuralNetworkSnapshot, scale: f64, frac: f64, s
     recompute_norm(s);
 }
 
-/// Load the frontier neural snapshot from a learned-params.json (its `neuralNetwork` key).
-fn load_snapshot(path: &str) -> Option<SoccerNeuralNetworkSnapshot> {
+type TargetEntryKey = (SoccerQStateKey, String, usize, usize, usize, usize);
+
+fn target_entry_key(entry: &SoccerQTargetEntry) -> TargetEntryKey {
+    (
+        entry.state.clone(),
+        entry.action.trim().to_string(),
+        entry.target_fine_cell_id,
+        entry.target_tactical_cell_id,
+        entry.target_macro_cell_id,
+        entry.target_root_cell_id,
+    )
+}
+
+fn target_entry_order(a: &SoccerQTargetEntry, b: &SoccerQTargetEntry) -> std::cmp::Ordering {
+    b.visits.cmp(&a.visits).then_with(|| {
+        b.value
+            .abs()
+            .partial_cmp(&a.value.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })
+}
+
+fn merge_target_entries(
+    entry_sets: impl IntoIterator<Item = Vec<SoccerQTargetEntry>>,
+    max_entries: usize,
+) -> Vec<SoccerQTargetEntry> {
+    let mut by_key: HashMap<TargetEntryKey, SoccerQTargetEntry> = HashMap::new();
+    for entries in entry_sets {
+        for entry in entries {
+            if !entry.value.is_finite() || entry.action.trim().is_empty() {
+                continue;
+            }
+            let key = target_entry_key(&entry);
+            by_key
+                .entry(key)
+                .and_modify(|existing| {
+                    let existing_visits = existing.visits.max(1) as f64;
+                    let entry_visits = entry.visits.max(1) as f64;
+                    let total_visits = existing_visits + entry_visits;
+                    existing.value = (existing.value * existing_visits
+                        + entry.value * entry_visits)
+                        / total_visits;
+                    existing.visits = existing.visits.saturating_add(entry.visits);
+                })
+                .or_insert(entry);
+        }
+    }
+    let mut merged = by_key.into_values().collect::<Vec<_>>();
+    merged.sort_by(target_entry_order);
+    if max_entries > 0 && merged.len() > max_entries {
+        merged.truncate(max_entries);
+    }
+    merged
+}
+
+fn load_target_entries(value: &serde_json::Value, key: &str) -> Vec<SoccerQTargetEntry> {
+    value
+        .get(key)
+        .cloned()
+        .and_then(|entries| serde_json::from_value(entries).ok())
+        .unwrap_or_default()
+}
+
+fn neural_snapshot_from_value(value: &serde_json::Value) -> Option<SoccerNeuralNetworkSnapshot> {
+    value
+        .get("neuralNetwork")
+        .cloned()
+        .or_else(|| value.get("learning")?.get("neuralNetwork").cloned())
+        .and_then(|neural| serde_json::from_value(neural).ok())
+}
+
+fn neural_sidecar_path(path: &str) -> Option<String> {
+    path.strip_suffix(".json")
+        .map(|stem| format!("{stem}.neural.json"))
+}
+
+fn load_neural_snapshot(
+    path: &str,
+    value: &serde_json::Value,
+) -> Option<SoccerNeuralNetworkSnapshot> {
+    if let Some(neural) = neural_snapshot_from_value(value) {
+        return Some(neural);
+    }
+    let sidecar = neural_sidecar_path(path)?;
+    let raw = fs::read_to_string(&sidecar).ok()?;
+    let sidecar_value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    neural_snapshot_from_value(&sidecar_value)
+        .or_else(|| serde_json::from_value::<SoccerNeuralNetworkSnapshot>(sidecar_value).ok())
+}
+
+/// Load the frontier brain from a learned-params.json. The neural snapshot remains the learner,
+/// while side-specific target-Q lets the brain turn learned action labels into concrete targets.
+fn load_brain(path: &str) -> Option<TeamBrain> {
     let raw = fs::read_to_string(path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    serde_json::from_value(v.get("neuralNetwork")?.clone()).ok()
+    let neural = load_neural_snapshot(path, &v)?;
+    let home_targets = load_target_entries(&v, "homeTargetEntries");
+    let away_targets = load_target_entries(&v, "awayTargetEntries");
+    Some(TeamBrain::from_snapshot_with_targets(
+        neural,
+        home_targets,
+        away_targets,
+    ))
 }
 
 /// Federated / data-parallel averaging: each worker trained a CLONE of the same frontier on a
@@ -147,7 +254,11 @@ fn average_snapshots(
     for (li, layer) in out.layers.iter_mut().enumerate() {
         for (ri, row) in layer.weights.iter_mut().enumerate() {
             for (wi, w) in row.iter_mut().enumerate() {
-                *w = snaps.iter().map(|s| s.layers[li].weights[ri][wi]).sum::<f64>() / n;
+                *w = snaps
+                    .iter()
+                    .map(|s| s.layers[li].weights[ri][wi])
+                    .sum::<f64>()
+                    / n;
             }
         }
         for (bi, b) in layer.biases.iter_mut().enumerate() {
@@ -167,15 +278,18 @@ fn average_snapshots(
     Some(out)
 }
 
-/// Write the frontier snapshot into a COMPACT learned-params.json (drops the large tabular
-/// table — we are neural-first and every consumer only reads `neuralNetwork`). Atomic + .prev.
-fn write_frontier(path: &str, snap: &SoccerNeuralNetworkSnapshot) -> std::io::Result<()> {
+/// Write the frontier brain into a COMPACT learned-params.json. Action-Q stays empty because it
+/// bloats; target-Q is compact enough and is required for learned concrete receiver/space choices.
+fn write_frontier(path: &str, brain: &TeamBrain) -> std::io::Result<()> {
+    let Some(snap) = brain.neural.as_ref() else {
+        return Ok(());
+    };
     let v = serde_json::json!({
         "version": 0,
         "homeEntries": [],
-        "homeTargetEntries": [],
+        "homeTargetEntries": brain.home_target_entries,
         "awayEntries": [],
-        "awayTargetEntries": [],
+        "awayTargetEntries": brain.away_target_entries,
         "episodes": 0,
         "neuralNetwork": serde_json::to_value(snap).unwrap(),
     });
@@ -184,13 +298,17 @@ fn write_frontier(path: &str, snap: &SoccerNeuralNetworkSnapshot) -> std::io::Re
         let _ = fs::copy(path, prev);
     }
     let tmp = format!("{path}.tmp");
-    fs::write(&tmp, serde_json::to_string(&v)?)?;
+    fs::write(
+        &tmp,
+        serde_json::to_string(&v)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
+    )?;
     fs::rename(&tmp, path)?;
     Ok(())
 }
 
 /// Load the frozen champion league from the archive dir (each is a learned-params.json).
-fn load_league(dir: &str) -> Vec<SoccerNeuralNetworkSnapshot> {
+fn load_league(dir: &str) -> Vec<TeamBrain> {
     let mut out = Vec::new();
     if let Ok(entries) = fs::read_dir(dir) {
         let mut paths: Vec<_> = entries
@@ -200,8 +318,8 @@ fn load_league(dir: &str) -> Vec<SoccerNeuralNetworkSnapshot> {
             .collect();
         paths.sort();
         for p in paths {
-            if let Some(s) = load_snapshot(&p.display().to_string()) {
-                out.push(s);
+            if let Some(brain) = load_brain(&p.display().to_string()) {
+                out.push(brain);
             }
         }
     }
@@ -246,7 +364,11 @@ fn play_and_carry(
             } else {
                 o.away_goals as i32 - o.home_goals as i32
             };
-            let trained = if frontier_home { o.home_brain } else { o.away_brain };
+            let trained = if frontier_home {
+                o.home_brain
+            } else {
+                o.away_brain
+            };
             (trained, gd)
         }
         Err(e) => {
@@ -257,13 +379,17 @@ fn play_and_carry(
 }
 
 fn main() {
-    let frontier_path = env_str("SOCCER_LEAGUE_FRONTIER", "/tmp/neural-climb-local/learned-params.json");
+    let frontier_path = env_str(
+        "SOCCER_LEAGUE_FRONTIER",
+        "/tmp/neural-climb-local/learned-params.json",
+    );
     let archive_dir = env_str("SOCCER_LEAGUE_ARCHIVE", "/tmp/neural-climb-local/champions");
     let games_per_opp = env_usize("SOCCER_LEAGUE_GAMES_PER_OPP", 2).max(1);
     let minutes = env_f64("SOCCER_LEAGUE_MINUTES", 2.0);
     let weight_decay = env_f64("SOCCER_LEAGUE_WEIGHT_DECAY", 0.01);
     let fresh_opponents = env_usize("SOCCER_LEAGUE_FRESH_OPPONENTS", 2);
     let checkpoint_every = env_usize("SOCCER_LEAGUE_CHECKPOINT_EVERY_ROUNDS", 10).max(1);
+    let max_target_entries_per_side = env_usize("SOCCER_LEAGUE_MAX_TARGET_ENTRIES_PER_SIDE", 4096);
 
     let mut runner_config = EngineMatchRunnerConfig::default();
     runner_config.base.duration_seconds = minutes * 60.0;
@@ -279,20 +405,43 @@ fn main() {
         env_usize("SOCCER_LEAGUE_REPLAY_CAPACITY", 8192).max(1);
     runner_config.base.neural_learning.replay_samples_per_tick =
         env_usize("SOCCER_LEAGUE_REPLAY_SAMPLES_PER_TICK", 128).max(1);
-    runner_config.base.neural_learning.batch_size = env_usize("SOCCER_LEAGUE_BATCH_SIZE", 64).max(1);
+    runner_config.base.neural_learning.batch_size =
+        env_usize("SOCCER_LEAGUE_BATCH_SIZE", 64).max(1);
     // Network capacity: bigger hidden layer for more expressive value function over the
     // 610-dim field vector (the 24-unit net plateaued at parity with the analytic engine).
     // Only takes effect on a FRESH net — a resumed snapshot keeps its own architecture.
-    runner_config.base.neural_learning.hidden_units =
-        env_usize("SOCCER_LEAGUE_HIDDEN_UNITS", runner_config.base.neural_learning.hidden_units)
-            .max(1);
+    runner_config.base.neural_learning.hidden_units = env_usize(
+        "SOCCER_LEAGUE_HIDDEN_UNITS",
+        runner_config.base.neural_learning.hidden_units,
+    )
+    .max(1);
+    // Un-collapse the value head on fresh nets: honour SOCCER_NEURAL_TARGET_POPART here (the
+    // league bin otherwise leaves target-PopArt at the config default = off, unlike the
+    // learning-run bins). A collapsed value can't rank candidates, which would make the Part-B
+    // action-space A/B uninterpretable. Only takes effect on a FRESH net (same as hidden_units).
+    runner_config.base.neural_learning.target_popart_enabled = std::env::var(
+        "SOCCER_NEURAL_TARGET_POPART",
+    )
+    .ok()
+    .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
+    .unwrap_or(runner_config.base.neural_learning.target_popart_enabled);
     // Keep the engine's designed independent-brain mode (per-team critic drives each side).
-    let mut runner = EngineMatchRunner::new(runner_config);
+    let runner = EngineMatchRunner::new(runner_config);
 
-    let mut frontier = match load_snapshot(&frontier_path) {
-        Some(s) => {
-            println!("league_resume frontier l2={:.3} params={} from {}", s.l2_norm, s.parameter_count, frontier_path);
-            TeamBrain::from_snapshot(s)
+    let mut frontier = match load_brain(&frontier_path) {
+        Some(brain) => {
+            let (l2, params) = brain
+                .neural
+                .as_ref()
+                .map(|s| (s.l2_norm, s.parameter_count))
+                .unwrap_or((0.0, 0));
+            println!(
+                "league_resume frontier l2={l2:.3} params={params} home_targets={} away_targets={} from {}",
+                brain.home_target_entries.len(),
+                brain.away_target_entries.len(),
+                frontier_path
+            );
+            brain
         }
         None => {
             println!("league_fresh_start (no frontier at {frontier_path})");
@@ -303,24 +452,21 @@ fn main() {
     let train_seed_base: u32 = 0x5EED_0000;
     let mut round = 0u32;
     println!(
-        "league_train_started_at_utc={} games/opp={} minutes={} weight_decay={} fresh_opp={} checkpoint_every={} frontier={} archive={}",
-        chrono_now(), games_per_opp, minutes, weight_decay, fresh_opponents, checkpoint_every, frontier_path, archive_dir
+        "league_train_started_at_utc={} games/opp={} minutes={} weight_decay={} fresh_opp={} checkpoint_every={} max_target_entries_per_side={} frontier={} archive={}",
+        chrono_now(), games_per_opp, minutes, weight_decay, fresh_opponents, checkpoint_every, max_target_entries_per_side, frontier_path, archive_dir
     );
 
     loop {
         round += 1;
         let started = Instant::now();
 
-        // Build this round's opponent league: frozen champions (the archive = the frontier's own
-        // improving PAST SELVES) + fresh (exploration).
-        let mut opponents: Vec<TeamBrain> = load_league(&archive_dir)
-            .into_iter()
-            .map(TeamBrain::from_snapshot)
-            .collect();
-        let champion_count = opponents.len();
+        // Build this round's opponent league: frozen champions + fresh (exploration).
+        let mut opponents: Vec<TeamBrain> = load_league(&archive_dir);
         for i in 0..fresh_opponents {
             opponents.push(TeamBrain::fresh_with_seed(
-                0xF0_0000u32.wrapping_add(round.wrapping_mul(2_654_435_761)).wrapping_add(i as u32),
+                0xF0_0000u32
+                    .wrapping_add(round.wrapping_mul(2_654_435_761))
+                    .wrapping_add(i as u32),
                 100 + i,
             ));
         }
@@ -328,24 +474,15 @@ fn main() {
             opponents.push(TeamBrain::fresh_with_seed(0xABCD, 100));
         }
 
-        let self_play = std::env::var("SOCCER_LEAGUE_SELF_PLAY")
+        // SOCCER_LEAGUE_ANALYTIC_OPPONENTS=1: strip the net from every opponent so they play the
+        // PURE ANALYTIC engine (no net -> authoritative branch skipped -> hand-built engine
+        // decides). The frontier (authoritative neural) must then learn to BEAT the analytic
+        // engine to win — that IS the gradient to break past parity. (Genome variation still
+        // gives the analytic opponents slightly different styles.)
+        if std::env::var("SOCCER_LEAGUE_ANALYTIC_OPPONENTS")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        let analytic_opponents = std::env::var("SOCCER_LEAGUE_ANALYTIC_OPPONENTS")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        if self_play {
-            // SELF-PLAY LEAGUE: the archived champion checkpoints KEEP their nets — they are the
-            // frontier's own improving past selves (the MOVING TARGET). The fresh opponents are
-            // stripped to the PURE ANALYTIC engine as a fixed anchor so the frontier can't quietly
-            // regress. Beating an ever-improving league of past selves is the AlphaZero/AlphaStar
-            // escape a single fixed opponent structurally can't provide. (Requires a seeded archive
-            // so champion_count>0; otherwise it degenerates to all-analytic.)
-            for opp in opponents.iter_mut().skip(champion_count) {
-                opp.neural = None;
-            }
-        } else if analytic_opponents {
-            // Strip every opponent's net so they all play the PURE ANALYTIC engine (fixed target).
+            .unwrap_or(false)
+        {
             for opp in opponents.iter_mut() {
                 opp.neural = None;
             }
@@ -377,7 +514,12 @@ fn main() {
                     .wrapping_add(fixture.wrapping_mul(2_246_822_519))
                     .wrapping_add(g as u32);
                 let home = frontier_always_home || g % 2 == 0;
-                fixtures.push(Fx { opp_idx: idx, opp_id: idx + 1, seed, home });
+                fixtures.push(Fx {
+                    opp_idx: idx,
+                    opp_id: idx + 1,
+                    seed,
+                    home,
+                });
                 fixture += 1;
             }
         }
@@ -390,7 +532,7 @@ fn main() {
         let chunk = fixtures.len().div_ceil(workers);
         let wins_a = std::sync::atomic::AtomicI32::new(0);
         let losses_a = std::sync::atomic::AtomicI32::new(0);
-        let trained_nets = std::sync::Mutex::new(Vec::<SoccerNeuralNetworkSnapshot>::new());
+        let trained_brains = std::sync::Mutex::new(Vec::<TeamBrain>::new());
         std::thread::scope(|scope| {
             for w in 0..workers {
                 let lo = w * chunk;
@@ -402,7 +544,7 @@ fn main() {
                 let opponents = &opponents;
                 let wins_a = &wins_a;
                 let losses_a = &losses_a;
-                let trained_nets = &trained_nets;
+                let trained_brains = &trained_brains;
                 let mut runner = runner.clone();
                 let mut wf = frontier.clone();
                 scope.spawn(move || {
@@ -423,16 +565,33 @@ fn main() {
                             losses_a.fetch_add(1, Relaxed);
                         }
                     }
-                    if let Some(s) = wf.neural {
-                        trained_nets.lock().unwrap().push(s);
-                    }
+                    trained_brains.lock().unwrap().push(wf);
                 });
             }
         });
         let wins = wins_a.load(std::sync::atomic::Ordering::Relaxed);
         let losses = losses_a.load(std::sync::atomic::Ordering::Relaxed);
-        if let Some(avg) = average_snapshots(base_steps, trained_nets.into_inner().unwrap()) {
+        let trained_brains = trained_brains.into_inner().unwrap();
+        let trained_snapshots = trained_brains
+            .iter()
+            .filter_map(|brain| brain.neural.clone())
+            .collect::<Vec<_>>();
+        if let Some(avg) = average_snapshots(base_steps, trained_snapshots) {
             frontier.neural = Some(avg);
+        }
+        if !trained_brains.is_empty() {
+            frontier.home_target_entries = merge_target_entries(
+                trained_brains
+                    .iter()
+                    .map(|brain| brain.home_target_entries.clone()),
+                max_target_entries_per_side,
+            );
+            frontier.away_target_entries = merge_target_entries(
+                trained_brains
+                    .iter()
+                    .map(|brain| brain.away_target_entries.clone()),
+                max_target_entries_per_side,
+            );
         }
 
         // Weight decay to keep the net in the trainable regime.
@@ -473,26 +632,33 @@ fn main() {
             .as_ref()
             .map(|s| (s.l2_norm, s.training_steps))
             .unwrap_or((0.0, 0));
-        if let Some(s) = frontier.neural.as_ref() {
-            if let Err(e) = write_frontier(&frontier_path, s) {
+        if frontier.neural.is_some() {
+            if let Err(e) = write_frontier(&frontier_path, &frontier) {
                 eprintln!("league_write_error: {e}");
             }
         }
 
         // Temporal checkpoint into the league (growing diversity of past selves).
         if round % (checkpoint_every as u32) == 0 {
-            if let Some(s) = frontier.neural.as_ref() {
-                let cp = format!("{}/league-r{:04}-{}.json", archive_dir.trim_end_matches('/'), round, chrono_stamp());
+            if frontier.neural.is_some() {
+                let cp = format!(
+                    "{}/league-r{:04}-{}.json",
+                    archive_dir.trim_end_matches('/'),
+                    round,
+                    chrono_stamp()
+                );
                 let _ = fs::create_dir_all(&archive_dir);
-                let _ = write_frontier(&cp, s);
+                let _ = write_frontier(&cp, &frontier);
                 println!("league_checkpoint round={round} -> {cp}");
             }
         }
 
         println!(
-            "league_round round={round} opponents={} games={} frontier_wins={wins} frontier_losses={losses} l2={l2:.3} training_steps={steps} secs={:.1}",
+            "league_round round={round} opponents={} games={} frontier_wins={wins} frontier_losses={losses} l2={l2:.3} training_steps={steps} home_targets={} away_targets={} secs={:.1}",
             opponents.len(),
             fixture,
+            frontier.home_target_entries.len(),
+            frontier.away_target_entries.len(),
             started.elapsed().as_secs_f64()
         );
     }

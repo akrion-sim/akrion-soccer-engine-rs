@@ -25,12 +25,13 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use soccer_engine::des::general::soccer::SoccerMatch;
 use soccer_engine::des::general::soccer::{
     enable_deterministic_formation_lp, MatchConfig, SoccerMarlAlgorithm,
     SoccerNeuralLearningBackend, SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot,
-    SoccerQPolicyOptions, SoccerTeamQPolicies, DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
+    SoccerQPolicyOptions, SoccerQTargetEntry, SoccerTeamQPolicies,
+    DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
 };
-use soccer_engine::des::general::soccer::SoccerMatch;
 use soccer_engine::des::general::soccer_eval_gate::{evaluate_promotion, PromotionThresholds};
 use soccer_engine::des::general::tournament::{
     EngineMatchRunner, EngineMatchRunnerConfig, MatchReport, TeamBrain, TournamentMatchContext,
@@ -39,12 +40,8 @@ use soccer_engine::des::general::tournament::{
 
 /// Train a candidate neural brain by inline self-play carry-forward (the real
 /// learner's per-process pattern, mirroring `measure_learning_ab`). Returns the
-/// trained value/critic snapshot, or `None` for `games == 0` (fresh candidate).
-fn train_candidate_snapshot(
-    games: usize,
-    minutes: f64,
-    seed_base: u32,
-) -> Option<SoccerNeuralNetworkSnapshot> {
+/// trained brain, including target-Q, or `None` for `games == 0` (fresh candidate).
+fn train_candidate_brain(games: usize, minutes: f64, seed_base: u32) -> Option<TeamBrain> {
     if games == 0 {
         return None;
     }
@@ -87,15 +84,58 @@ fn train_candidate_snapshot(
         }
         eprintln!("  trained candidate: game {}/{games}", g + 1);
     }
-    snapshot
+    snapshot.map(|neural| {
+        let mut brain = TeamBrain::from_snapshot_with_targets(
+            neural,
+            policies.home.target_entries(),
+            policies.away.target_entries(),
+        );
+        brain.matches_learned = games as u32;
+        brain
+    })
 }
 
-/// Load a candidate neural snapshot directly from a local `learned-params.json`
-/// artifact (the fully-local learner's durable policy file), via `SOCCER_EVAL_CANDIDATE_PATH`.
-/// This lets the gate score the REAL accumulated local policy against the frozen field
-/// (a held-out climb number over time) instead of only an inline-trained-from-fresh one.
-/// The learned-params artifact embeds the snapshot under the `neuralNetwork` key.
-fn snapshot_from_env_file(var: &str) -> Option<SoccerNeuralNetworkSnapshot> {
+fn target_entries_from_value(value: &serde_json::Value, key: &str) -> Vec<SoccerQTargetEntry> {
+    value
+        .get(key)
+        .cloned()
+        .and_then(|entries| serde_json::from_value(entries).ok())
+        .unwrap_or_default()
+}
+
+fn neural_snapshot_from_value(value: &serde_json::Value) -> Option<SoccerNeuralNetworkSnapshot> {
+    value
+        .get("neuralNetwork")
+        .cloned()
+        .or_else(|| value.get("learning")?.get("neuralNetwork").cloned())
+        .and_then(|neural| serde_json::from_value(neural).ok())
+}
+
+fn neural_sidecar_path(path: &str) -> Option<String> {
+    path.strip_suffix(".json")
+        .map(|stem| format!("{stem}.neural.json"))
+}
+
+fn load_neural_snapshot(
+    path: &str,
+    value: &serde_json::Value,
+) -> Option<SoccerNeuralNetworkSnapshot> {
+    if let Some(neural) = neural_snapshot_from_value(value) {
+        return Some(neural);
+    }
+    let sidecar = neural_sidecar_path(path)?;
+    let raw = std::fs::read_to_string(&sidecar).ok()?;
+    let sidecar_value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    neural_snapshot_from_value(&sidecar_value)
+        .or_else(|| serde_json::from_value::<SoccerNeuralNetworkSnapshot>(sidecar_value).ok())
+}
+
+/// Load a candidate/champion brain directly from a local `learned-params.json`
+/// artifact (the fully-local learner's durable policy file), via an env var pointing at the path.
+/// Lets the gate score the REAL accumulated local policy against the frozen field instead of only
+/// an inline-trained-from-fresh one. The artifact embeds the snapshot under the `neuralNetwork` key
+/// and may also carry side-specific target-Q.
+fn brain_from_env_file(var: &str) -> Option<TeamBrain> {
     let path = std::env::var(var).ok()?;
     let raw = match std::fs::read_to_string(&path) {
         Ok(raw) => raw,
@@ -111,14 +151,23 @@ fn snapshot_from_env_file(var: &str) -> Option<SoccerNeuralNetworkSnapshot> {
             return None;
         }
     };
-    let nn = value.get("neuralNetwork")?.clone();
-    match serde_json::from_value::<SoccerNeuralNetworkSnapshot>(nn) {
-        Ok(s) => {
-            eprintln!("eval_snapshot_loaded_from_file var={var} path={path}");
-            Some(s)
+    match load_neural_snapshot(&path, &value) {
+        Some(s) => {
+            let home_targets = target_entries_from_value(&value, "homeTargetEntries");
+            let away_targets = target_entries_from_value(&value, "awayTargetEntries");
+            eprintln!(
+                "eval_brain_loaded_from_file var={var} path={path} home_targets={} away_targets={}",
+                home_targets.len(),
+                away_targets.len()
+            );
+            Some(TeamBrain::from_snapshot_with_targets(
+                s,
+                home_targets,
+                away_targets,
+            ))
         }
-        Err(e) => {
-            eprintln!("eval_snapshot_parse_failed var={var} path={path}: {e}");
+        None => {
+            eprintln!("eval_snapshot_parse_failed var={var} path={path}: missing neural snapshot");
             None
         }
     }
@@ -182,37 +231,31 @@ fn main() {
          train_games={train_games} holdout_seed_base=0x{holdout_seed_base:08X}"
     );
 
-    // Candidate brain (id 0): prefer a local learned-params file (the fully-local
-    // learner's accumulated policy) when SOCCER_EVAL_CANDIDATE_PATH is set; otherwise
-    // fall back to inline self-play training (the original behaviour). Then FROZEN for the gate.
-    let candidate_snapshot = snapshot_from_env_file("SOCCER_EVAL_CANDIDATE_PATH")
-        .or_else(|| train_candidate_snapshot(train_games, minutes, train_seed_base));
-    let candidate_brain = match candidate_snapshot {
-        Some(s) => TeamBrain::from_snapshot(s),
-        None => TeamBrain::fresh_with_seed(0xCA11_D1DA, candidate_id),
-    };
+    // Candidate brain (id 0): prefer a local learned-params file (the fully-local learner's
+    // accumulated policy) when SOCCER_EVAL_CANDIDATE_PATH is set; otherwise inline self-play train.
+    let candidate_brain = brain_from_env_file("SOCCER_EVAL_CANDIDATE_PATH")
+        .or_else(|| train_candidate_brain(train_games, minutes, train_seed_base))
+        .unwrap_or_else(|| TeamBrain::fresh_with_seed(0xCA11_D1DA, candidate_id));
 
     // Frozen field (ids 1..pool): distinct-genome fresh brains, the incumbent +
     // diverse opponents the candidate must beat without being countered.
     let mut pool: Vec<TeamBrain> = (1..pool_size)
-        .map(|id| TeamBrain::fresh_with_seed(0xF0_0000u32.wrapping_add(id as u32 * 2_654_435_761), id))
+        .map(|id| {
+            TeamBrain::fresh_with_seed(0xF0_0000u32.wrapping_add(id as u32 * 2_654_435_761), id)
+        })
         .collect();
-    // Champion-gate: when SOCCER_EVAL_BASELINE_PATH is set, replace the incumbent
-    // (id 1 == pool[0]) with the champion loaded from a local learned-params file, so
-    // the held-out fixtures become a direct candidate-vs-champion comparison (the
-    // monotone promotion gate) instead of candidate-vs-fresh.
-    if let Some(snapshot) = snapshot_from_env_file("SOCCER_EVAL_BASELINE_PATH") {
+    // SOCCER_EVAL_BASELINE_PATH: replace the incumbent (id 1 == pool[0]) with a champion loaded
+    // from a local learned-params file, making the fixtures a direct candidate-vs-champion gate.
+    if let Some(brain) = brain_from_env_file("SOCCER_EVAL_BASELINE_PATH") {
         if let Some(first) = pool.first_mut() {
-            *first = TeamBrain::from_snapshot(snapshot);
+            *first = brain;
             eprintln!("eval_baseline_replaced_with_champion id={baseline_id}");
         }
     }
-    // SOCCER_EVAL_ANALYTIC_FIELD=1: strip the net from every pool opponent so they play
-    // PURE ANALYTIC (no net -> no prediction network -> the authoritative branch is skipped
-    // -> the hand-built analytic engine decides). The candidate keeps its net and, under
-    // DD_SOCCER_NEURAL_AUTHORITATIVE_LAMBDA>0, is the ONLY authoritative-neural side. This is
-    // the honest "authoritative neural net vs the analytic engine" measurement (the field's
-    // distinct genomes still give diverse analytic styles).
+    // SOCCER_EVAL_ANALYTIC_FIELD=1: strip the net from every pool opponent so they play PURE
+    // ANALYTIC (no net -> authoritative branch skipped -> the hand-built engine decides). The
+    // candidate keeps its net, so this is the honest "authoritative neural vs analytic" meter
+    // (the field's distinct genomes still give diverse analytic styles).
     if std::env::var("SOCCER_EVAL_ANALYTIC_FIELD")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
@@ -225,17 +268,12 @@ fn main() {
 
     let mut runner_config = EngineMatchRunnerConfig::default();
     runner_config.base.duration_seconds = minutes * 60.0;
-    // Keep the engine's designed independent-brain mode (actor_critic=false, default):
-    // each side is driven by its OWN per-team CRITIC — which is exactly what league play
-    // trains. (Setting actor_critic=true shares the policy_head/actor across teams and
-    // BLURS which brain is better, per the runner's own docs.) The eval is policy-sensitive
-    // through the per-team critic; comparisons must be between DIFFERENT-lineage nets.
     let runner = EngineMatchRunner::new(runner_config);
 
     let started = Instant::now();
 
-    // Pre-build every fixture with the SAME sequential seeds/order as the old serial loop,
-    // so parallel results are byte-identical (each match is independent + deterministic).
+    // Pre-build every fixture with the SAME sequential seeds/order as the old serial loop, so
+    // parallel results are byte-identical (each match is independent + deterministic).
     struct Fixture {
         index: usize,
         opponent_idx: usize,
@@ -264,9 +302,9 @@ fn main() {
         }
     }
 
-    // Run fixtures on a bounded thread pool — each worker clones the runner and pulls the
-    // next fixture off a shared atomic cursor. Capped low (default 3, override via
-    // SOCCER_EVAL_PARALLELISM) so we don't starve the on-policy trainer / co-train learner.
+    // Run fixtures on a bounded thread pool — each worker clones the runner and pulls the next
+    // fixture off a shared atomic cursor. Capped low (default 3, override SOCCER_EVAL_PARALLELISM)
+    // so we don't starve a co-running trainer.
     let workers = std::env::var("SOCCER_EVAL_PARALLELISM")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
@@ -310,11 +348,17 @@ fn main() {
                     Ok(report) => {
                         eprintln!(
                             "  holdout {}v{} seed=0x{:08X} -> {}-{}",
-                            report.home_id, report.away_id, fx.seed, report.home_goals, report.away_goals
+                            report.home_id,
+                            report.away_id,
+                            fx.seed,
+                            report.home_goals,
+                            report.away_goals
                         );
                         collected.lock().unwrap().push((fx.index, report));
                     }
-                    Err(e) => eprintln!("  fixture error (opp {}, g {}): {e}", fx.opponent_id, fx.g),
+                    Err(e) => {
+                        eprintln!("  fixture error (opp {}, g {}): {e}", fx.opponent_id, fx.g)
+                    }
                 }
             });
         }
@@ -351,14 +395,21 @@ fn main() {
     );
     println!(
         "cross-play: mean payoff vs field {:?}  vs baseline {:?}  worst-case {:?}",
-        verdict.mean_payoff_vs_field.map(|p| (p * 1000.0).round() / 1000.0),
-        verdict.payoff_vs_baseline.map(|p| (p * 1000.0).round() / 1000.0),
+        verdict
+            .mean_payoff_vs_field
+            .map(|p| (p * 1000.0).round() / 1000.0),
+        verdict
+            .payoff_vs_baseline
+            .map(|p| (p * 1000.0).round() / 1000.0),
         verdict
             .worst_case
             .map(|(o, p)| (o, (p * 1000.0).round() / 1000.0)),
     );
     println!("Wilson lower bound: {:.3}", verdict.wilson_lower_bound);
-    println!("\nDECISION: {}", if verdict.promote { "PROMOTE" } else { "REJECT" });
+    println!(
+        "\nDECISION: {}",
+        if verdict.promote { "PROMOTE" } else { "REJECT" }
+    );
     for reason in &verdict.reasons {
         println!("  - {reason}");
     }

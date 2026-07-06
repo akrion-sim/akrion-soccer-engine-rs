@@ -216,8 +216,8 @@ pub(crate) fn winger_pinch_decision_profile_with_bias(
     // holding width — the head's contribution to the stay-vs-pinch choice. Bounded by
     // `super::winger_pinch_decision::WINGER_PINCH_APPETITE_WEIGHT` so it nudges without
     // overriding the same-flank "hold width" rule.
-    let pinch_shift = pinch_bias.clamp(-1.0, 1.0)
-        * super::winger_pinch_decision::WINGER_PINCH_APPETITE_WEIGHT;
+    let pinch_shift =
+        pinch_bias.clamp(-1.0, 1.0) * super::winger_pinch_decision::WINGER_PINCH_APPETITE_WEIGHT;
     half += pinch_shift;
     back += pinch_shift;
 
@@ -332,11 +332,7 @@ pub(crate) fn winger_pinch_target(
 
 /// Ball depth within the attacking final third: 0 at the final-third edge, 1 at the byline.
 /// Returns 0 when the ball is short of the final third.
-pub(crate) fn final_third_depth_frac(
-    ball_y: f64,
-    attacked_goal_y: f64,
-    field_length: f64,
-) -> f64 {
+pub(crate) fn final_third_depth_frac(ball_y: f64, attacked_goal_y: f64, field_length: f64) -> f64 {
     if !ball_y.is_finite() || !attacked_goal_y.is_finite() || field_length <= 0.0 {
         return 0.0;
     }
@@ -406,12 +402,21 @@ mod tests {
         )
         .expect("back-post target");
         assert!(target.x > W * 0.5, "back post is on the winger's own side");
-        assert!((L - target.y).abs() <= 7.0, "back post sits close to the goal line");
+        assert!(
+            (L - target.y).abs() <= 7.0,
+            "back post sits close to the goal line"
+        );
         // Half-space tuck is wider of the post and shallower than the back-post run.
         let half = winger_pinch_target(WingerPinchChoice::PinchHalfSpace, W * 0.85, L, 1.0, W, L)
             .expect("half-space target");
-        assert!(half.x > target.x, "half-space sits wider than the back post");
-        assert!((L - half.y) > (L - target.y), "half-space sits further from goal");
+        assert!(
+            half.x > target.x,
+            "half-space sits wider than the back post"
+        );
+        assert!(
+            (L - half.y) > (L - target.y),
+            "half-space sits further from goal"
+        );
     }
 
     #[test]
@@ -425,7 +430,7 @@ mod tests {
         assert_eq!(final_third_depth_frac(70.0, L, L), 0.0); // short of the final third
         assert!(final_third_depth_frac(100.0, L, L) > 0.4);
         assert!(final_third_depth_frac(118.0, L, L) > 0.9); // near the byline
-        // Away attacks y = 0: depth grows toward y = 0.
+                                                            // Away attacks y = 0: depth grows toward y = 0.
         assert!(final_third_depth_frac(2.0, 0.0, L) > 0.9);
         assert_eq!(final_third_depth_frac(50.0, 0.0, L), 0.0);
     }
