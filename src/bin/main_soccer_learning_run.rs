@@ -3014,7 +3014,7 @@ impl LearningActionOutcomeStats {
         if transition.decision_context.learned_mpc_replanned {
             self.replanned = self.replanned.saturating_add(1);
         }
-        if learning_action_label_for_log(&transition.action).contains("-kp") {
+        if learning_action_has_discretized_kick_for_log(&transition.action) {
             self.discretized_kick = self.discretized_kick.saturating_add(1);
         }
         self.mpc_feasibility_sum +=
@@ -3087,10 +3087,36 @@ fn finite_log_metric(value: f64) -> f64 {
     }
 }
 
+fn learning_action_has_discretized_kick_for_log(action: &str) -> bool {
+    action
+        .trim()
+        .to_ascii_lowercase()
+        .rsplit_once("-kp")
+        .is_some_and(|(_, suffix)| {
+            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
+fn learning_ranked_pass_family_for_log(action: &str) -> Option<&'static str> {
+    ["aerial-pass", "pass"].iter().copied().find(|prefix| {
+        action
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
 fn learning_action_label_for_log(action: &str) -> String {
     let mut label = action.trim().to_ascii_lowercase();
     if label.is_empty() {
         label.push_str("unknown");
+    }
+    if let Some((base, suffix)) = label.rsplit_once("-kp") {
+        if !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+            label = base.to_string();
+        }
+    }
+    if let Some(family) = learning_ranked_pass_family_for_log(&label) {
+        label = family.to_string();
     }
     label
         .chars()
@@ -9237,6 +9263,21 @@ mod tests {
             candidate_checkpoint_path(Path::new("learned-params.json")),
             PathBuf::from("learned-params.candidate.json")
         );
+    }
+
+    #[test]
+    fn learning_action_outcome_log_groups_ranked_and_bucketed_passes() {
+        assert_eq!(learning_action_label_for_log("pass1"), "pass");
+        assert_eq!(learning_action_label_for_log("pass1-kp7"), "pass");
+        assert_eq!(
+            learning_action_label_for_log("aerial-pass2-kp4"),
+            "aerial-pass"
+        );
+        assert!(learning_action_has_discretized_kick_for_log("pass1-kp7"));
+        assert!(learning_action_has_discretized_kick_for_log(
+            "aerial-pass2-kp4"
+        ));
+        assert!(!learning_action_has_discretized_kick_for_log("pass1"));
     }
 
     fn neural_population_test_config() -> NeuralPopulationSearchConfig {

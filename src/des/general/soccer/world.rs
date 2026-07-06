@@ -5473,7 +5473,7 @@ mod tests {
     fn on_ball_actor_actions_get_priority_without_overweighting_shape_noise() {
         let mut transition = policy_test_transition_with_mcts(false);
         transition.observation.has_ball = true;
-        transition.action = "pass".to_string();
+        transition.action = "pass1-kp7".to_string();
         transition.reward = 0.05;
 
         assert_eq!(
