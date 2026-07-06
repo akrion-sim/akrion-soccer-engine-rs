@@ -5525,7 +5525,6 @@ const SOCCER_OUTCOME_CREDIT_MILESTONE_REWARD_CAP: f64 = GOAL_REWARD_POINTS;
 // `return − V(s)` credits whether THIS game beat that expectation — the constant is
 // not absorbed because it differs by the realised result, which the state alone
 // cannot predict. Magnitudes are a starting point and MUST be A/B'd through the
-<<<<<<< ours
 // promotion eval gate (held-out Elo/win-rate), never tuned on raw reward. The
 // local neural-authoritative learner now trains directly against the analytic
 // stack, so this label must be large enough to make "beat the match" dominate
@@ -5535,21 +5534,12 @@ const SOCCER_OUTCOME_CREDIT_MILESTONE_REWARD_CAP: f64 = GOAL_REWARD_POINTS;
 // "beat the opponent" — not "play tidy" — is unambiguously what the value is optimizing (TiZero/
 // AlphaStar). Broadcast to every transition (clipped ±SOCCER_FULL_GAME_RETURN_CLIP). MUST still be
 // A/B'd through the promotion eval gate; do not tune on raw reward.
+// (A later "fast-signal" experiment argued the reverse — that ±200 on every transition drowns the
+// fast attributable pass-chain/shot signals ~8-30:1 and should be cut to a ~30 nudge; NOT adopted,
+// pending an eval-gate A/B, since it inverts this outcome-dominant design.)
 const MATCH_OUTCOME_WIN_REWARD_POINTS: f64 = 200.0;
 const MATCH_OUTCOME_DRAW_REWARD_POINTS: f64 = 0.0;
 const MATCH_OUTCOME_PER_GOAL_MARGIN_POINTS: f64 = 15.0;
-=======
-// promotion eval gate (held-out Elo/win-rate), never tuned on raw reward.
-// FAST-SIGNAL rebalance (Jul 2026): win=200 was WRONG. Broadcasting ±200 to EVERY transition
-// drowned the fast, clean, attributable signals (2/3 consecutive forward passes 30/40, shot-on-
-// target 40, goal 100) ~8-30:1, so the value net learned "did we eventually win" (SLOW, high-
-// variance, hard to attribute) instead of "was this good play" (FAST). Winning is a slow feedback
-// signal; forward-pass chains + shots are the strong fast one. Cut the win broadcast to a small
-// NUDGE so the fast dense signals dominate the value target (was 200 / margin 15).
-const MATCH_OUTCOME_WIN_REWARD_POINTS: f64 = 30.0;
-const MATCH_OUTCOME_DRAW_REWARD_POINTS: f64 = 0.0;
-const MATCH_OUTCOME_PER_GOAL_MARGIN_POINTS: f64 = 5.0;
->>>>>>> theirs
 const MATCH_OUTCOME_MARGIN_CAP_GOALS: f64 = 5.0;
 // INSTANTANEOUS (single-frame) player speed ceiling: 25mph ≈ 12.22yps, plus a hair of
 // numerical margin. A human sprints at most ~25mph in a moment.
