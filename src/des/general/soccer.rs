@@ -2865,7 +2865,6 @@ const SAME_TEAM_MPC_OBSTACLE_WEIGHT_GAIN: f64 = 1.6;
 // caught by the widest 8yd timer; a pair diving straight inside 5yd by the tightest 5yd/0.5s
 // timer. The dwell timers accumulate continuously while inside the named radius and do NOT reset
 // when crossing into a tighter band — they reset only when the pair moves farther than that band.
-<<<<<<< ours
 // Grace HALVED (3/2/1s → 1.5/1.0/0.5s) and the widest band widened 7→8yd so the penalty fires
 // sooner, more often, and from farther out — the policy gets a denser learning signal that
 // crowding is bad, while still forgiving a momentary crossing/handoff. The MPC keep-out has NO
@@ -2875,17 +2874,6 @@ const SAME_TEAM_PROXIMITY_GRACE_LT7_SECONDS: f64 = 1.5;
 const SAME_TEAM_PROXIMITY_GRACE_LT6_SECONDS: f64 = 1.0;
 const SAME_TEAM_PROXIMITY_GRACE_LT5_SECONDS: f64 = 0.5;
 const SAME_TEAM_PROXIMITY_BAND_LT7_YARDS: f64 = 8.0;
-=======
-// Worked example (user's): 2.5s at 6.5yd then 0.25s at 5.5yd then into 3.5yd ⇒ the 7yd timer is at
-// 2.75s on entering 3.5yd and trips its 3s grace 0.25s later, so the penalty starts 0.25s in.
-// The barrier + MPC keep-out have NO grace — the hard 4yd floor is always enforced; only the
-// learning penalty is graced. The 18-yard-box pair exception applies here too (nearest NON-EXEMPT
-// teammate only). All inert when the separation floor gate is off (timers stay 0).
-const SAME_TEAM_PROXIMITY_GRACE_LT7_SECONDS: f64 = 2.0;
-const SAME_TEAM_PROXIMITY_GRACE_LT6_SECONDS: f64 = 1.5;
-const SAME_TEAM_PROXIMITY_GRACE_LT5_SECONDS: f64 = 1.0;
-const SAME_TEAM_PROXIMITY_BAND_LT7_YARDS: f64 = 7.0;
->>>>>>> theirs
 const SAME_TEAM_PROXIMITY_BAND_LT6_YARDS: f64 = 6.0;
 const SAME_TEAM_PROXIMITY_BAND_LT5_YARDS: f64 = 5.0;
 
