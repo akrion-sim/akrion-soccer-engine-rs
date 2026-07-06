@@ -6576,6 +6576,21 @@ fn run() -> Result<(), Box<dyn Error>> {
             invalid_data("SOCCER_NEURAL_BATCH_SNAPSHOT_VALIDATE_MINUTES must be positive").into(),
         );
     }
+    let policy_promotion_seed_local_best_eval_games = env_usize(
+        "SOCCER_POLICY_PROMOTION_SEED_LOCAL_BEST_EVAL_GAMES",
+        policy_promotion_gate.min_sample_games.max(1),
+    )?
+    .max(1);
+    let policy_promotion_seed_local_best_eval_minutes = env_f64(
+        "SOCCER_POLICY_PROMOTION_SEED_LOCAL_BEST_EVAL_MINUTES",
+        neural_batch_snapshot_validate_minutes,
+    )?;
+    if policy_promotion_seed_local_best_eval_minutes <= 0.0 {
+        return Err(invalid_data(
+            "SOCCER_POLICY_PROMOTION_SEED_LOCAL_BEST_EVAL_MINUTES must be positive",
+        )
+        .into());
+    }
     let neural_batch_snapshot_validate_min_fitness = env_f64(
         "SOCCER_NEURAL_BATCH_SNAPSHOT_VALIDATE_MIN_FITNESS",
         DEFAULT_SOCCER_NEURAL_BATCH_SNAPSHOT_VALIDATE_MIN_FITNESS,
@@ -6668,6 +6683,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         "SOCCER_LEARNING_ANALYTIC_OPPONENT",
         "SOCCER_ANALYTIC_OPPONENT",
         false,
+    )?;
+    let policy_promotion_seed_local_best_reevaluate_resume = env_bool(
+        "SOCCER_POLICY_PROMOTION_SEED_LOCAL_BEST_REEVALUATE_RESUME",
+        analytic_neural_opponent,
     )?;
     let mut config = MatchConfig {
         dt_seconds,
@@ -7297,8 +7316,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         );
     }
     println!(
-        "policy_promotion_local_best_resume_seed enabled={} (false keeps resume metadata as publish baseline only)",
-        policy_promotion_seed_local_best_from_resume
+        "policy_promotion_local_best_resume_seed enabled={} reevaluate_resume={} eval_games={} eval_minutes={:.2} (false keeps resume metadata as publish baseline only)",
+        policy_promotion_seed_local_best_from_resume,
+        policy_promotion_seed_local_best_reevaluate_resume,
+        policy_promotion_seed_local_best_eval_games,
+        policy_promotion_seed_local_best_eval_minutes
     );
     if let Some(path) = &resume_artifact {
         println!("resume_artifact={path}");
@@ -7403,35 +7425,114 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut local_evolution_trial_active = false;
     let mut local_neural_promotion_trial_best = None::<LocalNeuralPromotionTrialBest>;
     if policy_promotion_seed_local_best_from_resume {
-        if let Some(baseline) = pg_base_policy_promotion_baseline {
-            local_neural_promotion_trial_best = Some(LocalNeuralPromotionTrialBest {
-                completed_games: 0,
-                evaluation: SoccerPolicyPromotionGateEvaluation {
-                    enabled: policy_promotion_gate.enabled,
-                    eligible: true,
-                    sample_games: baseline.sample_games,
-                    min_sample_games: policy_promotion_gate.min_sample_games,
-                    mean_match_fitness: baseline.mean_match_fitness,
-                    best_match_fitness: baseline.best_match_fitness,
-                    mean_play_quality: baseline.mean_play_quality,
-                    mean_conceded_goals: 0.0,
-                    mean_goal_margin: 0.0,
-                    mean_chain_net_loss: 0.0,
-                    rejection_reasons: Vec::new(),
-                },
-                config: config.clone(),
-                tactical_learning: tactical_learning.clone(),
-                policies: policies.clone(),
-                neural_network: latest_neural_network.clone(),
-                carried_world_model: current_carried_world_model_snapshot(),
-            });
-            println!(
+        let mut seeded_from_fresh_eval = false;
+        if policy_promotion_seed_local_best_reevaluate_resume {
+            if let Some(snapshot) = latest_neural_network.clone() {
+                let mut seed_eval_config = neural_population_search_config;
+                seed_eval_config.eval_games = policy_promotion_seed_local_best_eval_games;
+                seed_eval_config.eval_minutes = policy_promotion_seed_local_best_eval_minutes;
+                let candidate = NeuralPopulationCandidate {
+                    index: 0,
+                    source: "resume-local-best".to_string(),
+                    snapshot,
+                };
+                match evaluate_neural_population_candidate_against_analytic(
+                    candidate,
+                    config.clone(),
+                    seed_eval_config,
+                    neural_population_search_config.seed ^ 0xA77A_C01D_5EED_BA5E,
+                ) {
+                    Ok(eval) => {
+                        let sample_games = eval.wins + eval.draws + eval.losses;
+                        let mean_goal_margin = neural_population_candidate_goal_margin(&eval);
+                        let mean_conceded_goals =
+                            f64::from(eval.goals_against) / sample_games.max(1) as f64;
+                        println!(
+                            "policy_promotion_local_best_seeded_from_resume_eval eval_games={} mean_match_fitness={:.4} mean_goal_margin={:.4} record={}-{}-{} goals={}-{}",
+                            sample_games,
+                            eval.fitness,
+                            mean_goal_margin,
+                            eval.wins,
+                            eval.draws,
+                            eval.losses,
+                            eval.goals_for,
+                            eval.goals_against,
+                        );
+                        local_neural_promotion_trial_best = Some(LocalNeuralPromotionTrialBest {
+                            completed_games: 0,
+                            evaluation: SoccerPolicyPromotionGateEvaluation {
+                                enabled: policy_promotion_gate.enabled,
+                                eligible: true,
+                                sample_games,
+                                min_sample_games: policy_promotion_gate.min_sample_games,
+                                mean_match_fitness: eval.fitness,
+                                best_match_fitness: eval.fitness,
+                                mean_play_quality: 0.0,
+                                mean_conceded_goals,
+                                mean_goal_margin,
+                                mean_chain_net_loss: 0.0,
+                                rejection_reasons: Vec::new(),
+                            },
+                            config: config.clone(),
+                            tactical_learning: tactical_learning.clone(),
+                            policies: policies.clone(),
+                            neural_network: latest_neural_network.clone(),
+                            carried_world_model: current_carried_world_model_snapshot(),
+                        });
+                        seeded_from_fresh_eval = true;
+                    }
+                    Err(error) => {
+                        println!(
+                            "policy_promotion_local_best_resume_seed_reevaluate_failed error={}",
+                            error.replace(char::is_whitespace, "_")
+                        );
+                    }
+                }
+            } else {
+                println!("policy_promotion_local_best_resume_seed_reevaluate_skipped reason=no_neural_network");
+            }
+        }
+        if !seeded_from_fresh_eval {
+            if let Some(baseline) = pg_base_policy_promotion_baseline {
+                if policy_promotion_seed_local_best_reevaluate_resume {
+                    println!(
+                        "policy_promotion_local_best_resume_seed_stored_metadata_ignored sample_games={} mean_match_fitness={:.4} best_match_fitness={:.4} mean_play_quality={:.4} reason=reevaluate_required",
+                        baseline.sample_games,
+                        baseline.mean_match_fitness,
+                        baseline.best_match_fitness,
+                        baseline.mean_play_quality,
+                    );
+                } else {
+                    local_neural_promotion_trial_best = Some(LocalNeuralPromotionTrialBest {
+                        completed_games: 0,
+                        evaluation: SoccerPolicyPromotionGateEvaluation {
+                            enabled: policy_promotion_gate.enabled,
+                            eligible: true,
+                            sample_games: baseline.sample_games,
+                            min_sample_games: policy_promotion_gate.min_sample_games,
+                            mean_match_fitness: baseline.mean_match_fitness,
+                            best_match_fitness: baseline.best_match_fitness,
+                            mean_play_quality: baseline.mean_play_quality,
+                            mean_conceded_goals: 0.0,
+                            mean_goal_margin: 0.0,
+                            mean_chain_net_loss: 0.0,
+                            rejection_reasons: Vec::new(),
+                        },
+                        config: config.clone(),
+                        tactical_learning: tactical_learning.clone(),
+                        policies: policies.clone(),
+                        neural_network: latest_neural_network.clone(),
+                        carried_world_model: current_carried_world_model_snapshot(),
+                    });
+                    println!(
                 "policy_promotion_local_best_seeded_from_resume sample_games={} mean_match_fitness={:.4} best_match_fitness={:.4} mean_play_quality={:.4}",
                 baseline.sample_games,
                 baseline.mean_match_fitness,
                 baseline.best_match_fitness,
                 baseline.mean_play_quality,
             );
+                }
+            }
         }
     } else if let Some(baseline) = pg_base_policy_promotion_baseline {
         println!(
