@@ -5108,7 +5108,7 @@ fn run_game(
             }
         }
         eprintln!(
-            "world_model_training episode={} enabled={} training_steps={} loss={:?} validation_loss={:?} planning_decisions={} neural_mcts_selection_rate={:.4} neural_mcts_discretized_kick_rate={:.4} neural_mcts_discretized_kick_candidate_share={:.4} neural_mcts_root_discretized_kick_candidate_share={:.4} mpc_replan_rate={:.4} policy_entropy={:.4} learning_transitions_captured={} learning_transitions_trained={} learning_nonzero_reward_transitions={} learning_reward_events={} learning_deferred_reward_drained={} learning_deferred_reward_backlog={}",
+            "world_model_training episode={} enabled={} training_steps={} loss={:?} validation_loss={:?} planning_decisions={} neural_mcts_selection_rate={:.4} neural_mcts_discretized_kick_rate={:.4} neural_mcts_technical_action_rate={:.4} neural_mcts_discretized_kick_candidate_share={:.4} neural_mcts_root_discretized_kick_candidate_share={:.4} mpc_replan_rate={:.4} policy_entropy={:.4} learning_transitions_captured={} learning_transitions_trained={} learning_nonzero_reward_transitions={} learning_reward_events={} learning_deferred_reward_drained={} learning_deferred_reward_backlog={}",
             episode + 1,
             world_model_stats.enabled,
             world_model_stats.training_steps,
@@ -5117,6 +5117,7 @@ fn run_game(
             planning_stats.decisions,
             planning_stats.neural_mcts_selection_rate,
             planning_stats.neural_mcts_discretized_kick_selection_rate,
+            planning_stats.neural_mcts_technical_action_selection_rate,
             planning_stats.neural_mcts_discretized_kick_candidate_share,
             planning_stats.neural_mcts_root_discretized_kick_candidate_share,
             planning_stats.learned_mpc_replan_rate,

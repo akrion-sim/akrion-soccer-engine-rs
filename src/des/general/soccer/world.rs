@@ -8671,6 +8671,15 @@ impl SoccerMatch {
         }]
     }
 
+    fn neural_mcts_technical_action_label(action: &str) -> bool {
+        if learned_discretized_kick_speed_bucket_for_action_label(action).is_some() {
+            return true;
+        }
+        let normalized = normalize_soccer_action_label(action);
+        matches!(normalized, "first-time-shot")
+            || (normalized != "dribble" && is_dribble_action_label(normalized))
+    }
+
     fn neural_mcts_action_from_candidates(
         blend: SoccerNeuralBlendConfig,
         candidates: &[SoccerNeuralMctsCandidate],
@@ -25419,6 +25428,12 @@ impl SoccerMatch {
                         self.stats.neural_mcts_discretized_kick_selections = self
                             .stats
                             .neural_mcts_discretized_kick_selections
+                            .saturating_add(1);
+                    }
+                    if Self::neural_mcts_technical_action_label(&transition.action) {
+                        self.stats.neural_mcts_technical_action_selections = self
+                            .stats
+                            .neural_mcts_technical_action_selections
                             .saturating_add(1);
                     }
                 }

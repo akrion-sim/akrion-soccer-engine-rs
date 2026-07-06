@@ -18885,6 +18885,8 @@ pub struct MatchStats {
     #[serde(default)]
     pub neural_mcts_discretized_kick_selections: u32,
     #[serde(default)]
+    pub neural_mcts_technical_action_selections: u32,
+    #[serde(default)]
     pub neural_mcts_candidate_sets: u32,
     #[serde(default)]
     pub neural_mcts_candidates: u32,
@@ -18934,6 +18936,8 @@ pub struct SoccerPlanningValidationStats {
     pub neural_mcts_selection_rate: f64,
     pub neural_mcts_discretized_kick_selections: u32,
     pub neural_mcts_discretized_kick_selection_rate: f64,
+    pub neural_mcts_technical_action_selections: u32,
+    pub neural_mcts_technical_action_selection_rate: f64,
     pub neural_mcts_candidate_sets: u32,
     pub neural_mcts_candidates: u32,
     pub neural_mcts_discretized_kick_candidates: u32,
@@ -19056,6 +19060,11 @@ impl MatchStats {
             neural_mcts_discretized_kick_selections: self.neural_mcts_discretized_kick_selections,
             neural_mcts_discretized_kick_selection_rate: self
                 .neural_mcts_discretized_kick_selections
+                as f64
+                / decisions as f64,
+            neural_mcts_technical_action_selections: self.neural_mcts_technical_action_selections,
+            neural_mcts_technical_action_selection_rate: self
+                .neural_mcts_technical_action_selections
                 as f64
                 / decisions as f64,
             neural_mcts_candidate_sets: self.neural_mcts_candidate_sets,
