@@ -208,7 +208,7 @@ fn neural_mcts_discretized_kick_exploration_max_score_regression() -> f64 {
         "SOCCER_NEURAL_MCTS_DISCRETIZED_KICK_EXPLORATION_MAX_SCORE_REGRESSION",
         NEURAL_MCTS_DISCRETIZED_KICK_EXPLORATION_MAX_SCORE_REGRESSION,
         0.0,
-        12.0,
+        64.0,
     )
     .max(neural_mcts_discretized_kick_selection_max_score_regression())
 }
@@ -4858,7 +4858,7 @@ mod tests {
         );
         let _exploration_regression = set_test_env_var(
             "SOCCER_NEURAL_MCTS_DISCRETIZED_KICK_EXPLORATION_MAX_SCORE_REGRESSION",
-            "4.0",
+            "32.0",
         );
         let _min_prior = set_test_env_var(
             "SOCCER_NEURAL_MCTS_DISCRETIZED_KICK_EXPLORATION_MIN_PRIOR",
@@ -4895,7 +4895,7 @@ mod tests {
             SoccerNeuralMctsCandidate {
                 label: "pass1-kp7".to_string(),
                 plan: None,
-                score: -2.0,
+                score: -20.0,
                 prior: 0.12,
                 q_visits: 1,
             },
@@ -4925,7 +4925,7 @@ mod tests {
         );
         let _exploration_regression = set_test_env_var(
             "SOCCER_NEURAL_MCTS_DISCRETIZED_KICK_EXPLORATION_MAX_SCORE_REGRESSION",
-            "4.0",
+            "32.0",
         );
         let _min_prior = set_test_env_var(
             "SOCCER_NEURAL_MCTS_DISCRETIZED_KICK_EXPLORATION_MIN_PRIOR",
@@ -4962,7 +4962,7 @@ mod tests {
             SoccerNeuralMctsCandidate {
                 label: "pass1-kp7".to_string(),
                 plan: None,
-                score: -2.0,
+                score: -20.0,
                 prior: 0.01,
                 q_visits: 1,
             },
