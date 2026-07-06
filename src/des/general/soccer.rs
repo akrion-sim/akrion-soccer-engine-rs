@@ -21610,10 +21610,9 @@ pub(crate) const SOCCER_MAXA_BOOTSTRAP_FAMILIES: &[&str] = &[
 /// long ball no longer out-scores a retained shorter outlet. The own-goal urgency term is left
 /// intact, so a genuine clearance under pressure is still credited.
 pub(crate) fn dd_soccer_enable_route_one_interception_credit() -> bool {
->>>>>>> theirs
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_PASS_OOB_PENALTY"))
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_ROUTE_ONE_INTERCEPTION_CREDIT"))
 }
 
 /// Gate for overload-weighted progression rewards (see the `OVERLOAD_*` constants). OFF (the
