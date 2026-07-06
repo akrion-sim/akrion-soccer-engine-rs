@@ -32,6 +32,8 @@ const NEURAL_MCTS_PASS_MPC_PRIOR_WEIGHT: f64 = 0.55;
 const NEURAL_MCTS_DISCRETIZED_KICK_BASE_VALUE_WEIGHT: f64 = 0.0;
 const NEURAL_MCTS_DISCRETIZED_KICK_SELECTION_FLOOR: f64 = 0.0;
 const NEURAL_MCTS_DISCRETIZED_KICK_SELECTION_MAX_SCORE_REGRESSION: f64 = 1.50;
+const NEURAL_MCTS_DISCRETIZED_KICK_EXPLORATION_MAX_SCORE_REGRESSION: f64 = 1.50;
+const NEURAL_MCTS_DISCRETIZED_KICK_EXPLORATION_MIN_PRIOR: f64 = 0.04;
 const SOCCER_CENTERED_POLICY_BONUS_CLIP: f64 = 0.45;
 const SOCCER_CENTERED_SKILL_POLICY_BONUS_CLIP: f64 = 0.30;
 const NEURAL_VALUE_BOOTSTRAP_DEFAULT_WEIGHT: f64 = 0.45;
@@ -198,6 +200,25 @@ fn neural_mcts_discretized_kick_selection_max_score_regression() -> f64 {
         NEURAL_MCTS_DISCRETIZED_KICK_SELECTION_MAX_SCORE_REGRESSION,
         0.0,
         5.0,
+    )
+}
+
+fn neural_mcts_discretized_kick_exploration_max_score_regression() -> f64 {
+    learned_mpc_metric_env(
+        "SOCCER_NEURAL_MCTS_DISCRETIZED_KICK_EXPLORATION_MAX_SCORE_REGRESSION",
+        NEURAL_MCTS_DISCRETIZED_KICK_EXPLORATION_MAX_SCORE_REGRESSION,
+        0.0,
+        12.0,
+    )
+    .max(neural_mcts_discretized_kick_selection_max_score_regression())
+}
+
+fn neural_mcts_discretized_kick_exploration_min_prior() -> f64 {
+    learned_mpc_metric_env(
+        "SOCCER_NEURAL_MCTS_DISCRETIZED_KICK_EXPLORATION_MIN_PRIOR",
+        NEURAL_MCTS_DISCRETIZED_KICK_EXPLORATION_MIN_PRIOR,
+        0.0,
+        1.0,
     )
 }
 
@@ -4822,6 +4843,140 @@ mod tests {
     }
 
     #[test]
+    fn neural_mcts_discretized_kick_floor_uses_guarded_exploration_band() {
+        let _env_lock = soccer_world_env_lock();
+        let _gate = set_test_env_var("DD_SOCCER_ENABLE_DISCRETIZED_KICK", "1");
+        let _root_floor =
+            set_test_env_var("SOCCER_NEURAL_MCTS_MIN_DISCRETIZED_KICK_CANDIDATES", "1");
+        let _selection_floor = set_test_env_var(
+            "SOCCER_NEURAL_MCTS_DISCRETIZED_KICK_SELECTION_FLOOR",
+            "0.35",
+        );
+        let _strict_regression = set_test_env_var(
+            "SOCCER_NEURAL_MCTS_DISCRETIZED_KICK_SELECTION_MAX_SCORE_REGRESSION",
+            "0.05",
+        );
+        let _exploration_regression = set_test_env_var(
+            "SOCCER_NEURAL_MCTS_DISCRETIZED_KICK_EXPLORATION_MAX_SCORE_REGRESSION",
+            "4.0",
+        );
+        let _min_prior = set_test_env_var(
+            "SOCCER_NEURAL_MCTS_DISCRETIZED_KICK_EXPLORATION_MIN_PRIOR",
+            "0.05",
+        );
+        let blend = SoccerNeuralBlendConfig {
+            mcts_enabled: true,
+            mcts_simulations: 2,
+            mcts_candidates: 4,
+            ..SoccerNeuralBlendConfig::default()
+        };
+        let candidates = vec![
+            SoccerNeuralMctsCandidate {
+                label: "shoot".to_string(),
+                plan: None,
+                score: 1.0,
+                prior: 0.6,
+                q_visits: 1,
+            },
+            SoccerNeuralMctsCandidate {
+                label: "pass".to_string(),
+                plan: None,
+                score: 0.9,
+                prior: 0.3,
+                q_visits: 1,
+            },
+            SoccerNeuralMctsCandidate {
+                label: "dribble".to_string(),
+                plan: None,
+                score: 0.8,
+                prior: 0.2,
+                q_visits: 1,
+            },
+            SoccerNeuralMctsCandidate {
+                label: "pass1-kp7".to_string(),
+                plan: None,
+                score: -2.0,
+                prior: 0.12,
+                q_visits: 1,
+            },
+        ];
+
+        assert_eq!(
+            SoccerMatch::neural_mcts_action_from_candidates(blend, &candidates, 0.0)
+                .as_ref()
+                .map(|choice| choice.label.as_str()),
+            Some("pass1-kp7")
+        );
+    }
+
+    #[test]
+    fn neural_mcts_discretized_kick_exploration_band_requires_prior() {
+        let _env_lock = soccer_world_env_lock();
+        let _gate = set_test_env_var("DD_SOCCER_ENABLE_DISCRETIZED_KICK", "1");
+        let _root_floor =
+            set_test_env_var("SOCCER_NEURAL_MCTS_MIN_DISCRETIZED_KICK_CANDIDATES", "1");
+        let _selection_floor = set_test_env_var(
+            "SOCCER_NEURAL_MCTS_DISCRETIZED_KICK_SELECTION_FLOOR",
+            "0.35",
+        );
+        let _strict_regression = set_test_env_var(
+            "SOCCER_NEURAL_MCTS_DISCRETIZED_KICK_SELECTION_MAX_SCORE_REGRESSION",
+            "0.05",
+        );
+        let _exploration_regression = set_test_env_var(
+            "SOCCER_NEURAL_MCTS_DISCRETIZED_KICK_EXPLORATION_MAX_SCORE_REGRESSION",
+            "4.0",
+        );
+        let _min_prior = set_test_env_var(
+            "SOCCER_NEURAL_MCTS_DISCRETIZED_KICK_EXPLORATION_MIN_PRIOR",
+            "0.05",
+        );
+        let blend = SoccerNeuralBlendConfig {
+            mcts_enabled: true,
+            mcts_simulations: 2,
+            mcts_candidates: 4,
+            ..SoccerNeuralBlendConfig::default()
+        };
+        let candidates = vec![
+            SoccerNeuralMctsCandidate {
+                label: "shoot".to_string(),
+                plan: None,
+                score: 1.0,
+                prior: 0.6,
+                q_visits: 1,
+            },
+            SoccerNeuralMctsCandidate {
+                label: "pass".to_string(),
+                plan: None,
+                score: 0.9,
+                prior: 0.3,
+                q_visits: 1,
+            },
+            SoccerNeuralMctsCandidate {
+                label: "dribble".to_string(),
+                plan: None,
+                score: 0.8,
+                prior: 0.2,
+                q_visits: 1,
+            },
+            SoccerNeuralMctsCandidate {
+                label: "pass1-kp7".to_string(),
+                plan: None,
+                score: -2.0,
+                prior: 0.01,
+                q_visits: 1,
+            },
+        ];
+
+        assert_ne!(
+            SoccerMatch::neural_mcts_action_from_candidates(blend, &candidates, 0.0)
+                .as_ref()
+                .map(|choice| choice.label.as_str()),
+            Some("pass1-kp7")
+        );
+    }
+
+    #[test]
     fn centered_actor_bonus_is_neutral_and_bounded() {
         let _env_lock = soccer_world_env_lock();
         let _joint_clip = set_test_env_var("SOCCER_CENTERED_POLICY_BONUS_CLIP", "0.25");
@@ -8522,24 +8677,24 @@ impl SoccerMatch {
         }
         let max_regression = neural_mcts_discretized_kick_selection_max_score_regression();
         let rank_weights = soccer_policy_top_rank_weights();
-        let mut eligible = [(0usize, 0.0f64); POLICY_SELECTION_TOP_RANK_LIMIT];
-        let mut eligible_count = 0usize;
-        let mut total = 0.0;
-        for rank in 0..candidate_count {
-            let node = &nodes[rank];
-            if learned_discretized_kick_speed_bucket_for_action_label(&node.label).is_none() {
-                continue;
-            }
-            if node.raw_score + max_regression < best_score {
-                continue;
-            }
-            let weight = rank_weights[rank].max(0.0);
-            if weight <= 0.0 {
-                continue;
-            }
-            eligible[eligible_count] = (rank, weight);
-            eligible_count += 1;
-            total += weight;
+        let (mut eligible, mut eligible_count, mut total) =
+            Self::discretized_kick_floor_eligible_ranks(
+                nodes,
+                candidate_count,
+                best_score,
+                max_regression,
+                0.0,
+                &rank_weights,
+            );
+        if eligible_count == 0 {
+            (eligible, eligible_count, total) = Self::discretized_kick_floor_eligible_ranks(
+                nodes,
+                candidate_count,
+                best_score,
+                neural_mcts_discretized_kick_exploration_max_score_regression(),
+                neural_mcts_discretized_kick_exploration_min_prior(),
+                &rank_weights,
+            );
         }
         if eligible_count == 0 || !total.is_finite() || total <= 1e-9 {
             return None;
@@ -8552,6 +8707,46 @@ impl SoccerMatch {
             threshold -= weight;
         }
         Some(eligible[eligible_count - 1].0)
+    }
+
+    fn discretized_kick_floor_eligible_ranks(
+        nodes: &[SoccerNeuralMctsNode],
+        candidate_count: usize,
+        best_score: f64,
+        max_regression: f64,
+        min_prior: f64,
+        rank_weights: &[f64; POLICY_SELECTION_TOP_RANK_LIMIT],
+    ) -> ([(usize, f64); POLICY_SELECTION_TOP_RANK_LIMIT], usize, f64) {
+        let mut eligible = [(0usize, 0.0f64); POLICY_SELECTION_TOP_RANK_LIMIT];
+        let mut eligible_count = 0usize;
+        let mut total = 0.0;
+        if !best_score.is_finite() || !max_regression.is_finite() || max_regression < 0.0 {
+            return (eligible, eligible_count, total);
+        }
+        let min_prior = min_prior.max(0.0);
+        for rank in 0..candidate_count
+            .min(nodes.len())
+            .min(POLICY_SELECTION_TOP_RANK_LIMIT)
+        {
+            let node = &nodes[rank];
+            if learned_discretized_kick_speed_bucket_for_action_label(&node.label).is_none() {
+                continue;
+            }
+            if node.raw_score + max_regression < best_score {
+                continue;
+            }
+            if min_prior > 0.0 && node.prior < min_prior {
+                continue;
+            }
+            let weight = rank_weights[rank].max(0.0);
+            if weight <= 0.0 {
+                continue;
+            }
+            eligible[eligible_count] = (rank, weight);
+            eligible_count += 1;
+            total += weight;
+        }
+        (eligible, eligible_count, total)
     }
 
     fn has_selectable_discretized_kick_node(

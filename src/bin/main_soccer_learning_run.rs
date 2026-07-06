@@ -6142,12 +6142,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     let neural_batch_snapshot_min_fitness = env_batch_neural_snapshot_min_fitness()?;
     let neural_batch_snapshot_min_batch_mean_fitness =
         env_batch_neural_snapshot_min_batch_mean_fitness()?;
-    let neural_batch_snapshot_rescue_min_fitness =
-        env_batch_neural_snapshot_rescue_min_fitness()?;
-    let neural_batch_policy_merge_selected_only = env_bool(
-        "SOCCER_NEURAL_BATCH_POLICY_MERGE_SELECTED_ONLY",
-        false,
-    )?;
+    let neural_batch_snapshot_rescue_min_fitness = env_batch_neural_snapshot_rescue_min_fitness()?;
+    let neural_batch_policy_merge_selected_only =
+        env_bool("SOCCER_NEURAL_BATCH_POLICY_MERGE_SELECTED_ONLY", false)?;
     let neural_drain_timeout_ms = env_usize(
         "SOCCER_NEURAL_DRAIN_TIMEOUT_MS",
         DEFAULT_SOCCER_NEURAL_DRAIN_TIMEOUT_MS,
@@ -6187,10 +6184,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         neural_population_search_config.eval_minutes,
     )?;
     if neural_batch_snapshot_validate_minutes <= 0.0 {
-        return Err(invalid_data(
-            "SOCCER_NEURAL_BATCH_SNAPSHOT_VALIDATE_MINUTES must be positive",
-        )
-        .into());
+        return Err(
+            invalid_data("SOCCER_NEURAL_BATCH_SNAPSHOT_VALIDATE_MINUTES must be positive").into(),
+        );
     }
     let neural_batch_snapshot_validate_min_fitness = env_f64(
         "SOCCER_NEURAL_BATCH_SNAPSHOT_VALIDATE_MIN_FITNESS",
