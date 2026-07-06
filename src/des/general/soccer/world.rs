@@ -45,6 +45,9 @@ const NEURAL_MCTS_FLOOR_KICK_POWER_BUCKETS: [u8; 5] = [3, 5, 6, 7, 9];
 const NEURAL_MCTS_AERIAL_KICK_POWER_BUCKETS: [u8; 5] = [3, 5, 7, 8, 9];
 const SOCCER_ACTOR_DECISIVE_EVENT_PRIORITY_WEIGHT: f64 = 2.0;
 const SOCCER_ACTOR_NEGATIVE_OUTCOME_PRIORITY_WEIGHT: f64 = 1.6;
+const SOCCER_ACTOR_ON_BALL_ACTION_PRIORITY_WEIGHT: f64 = 1.35;
+const SOCCER_ACTOR_ON_BALL_OUTCOME_PRIORITY_WEIGHT: f64 = 1.75;
+const SOCCER_ACTOR_ON_BALL_OUTCOME_ADVANTAGE_FLOOR: f64 = 0.25;
 const COMPLETED_PASS_LEARNING_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(5.0);
 const SHOT_OUTCOME_LEARNING_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(4.0);
 const DRIBBLE_BEAT_LEARNING_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(2.0);
@@ -5467,6 +5470,46 @@ mod tests {
     }
 
     #[test]
+    fn on_ball_actor_actions_get_priority_without_overweighting_shape_noise() {
+        let mut transition = policy_test_transition_with_mcts(false);
+        transition.observation.has_ball = true;
+        transition.action = "pass".to_string();
+        transition.reward = 0.05;
+
+        assert_eq!(
+            soccer_actor_priority_weight(&transition, 0.05),
+            SOCCER_ACTOR_ON_BALL_ACTION_PRIORITY_WEIGHT
+        );
+
+        transition.action = "space".to_string();
+        assert_eq!(
+            soccer_actor_priority_weight(&transition, 0.05),
+            1.0,
+            "off-ball shape samples should not drown possession-changing actor updates"
+        );
+    }
+
+    #[test]
+    fn on_ball_actor_outcomes_get_stronger_priority() {
+        let mut transition = policy_test_transition_with_mcts(false);
+        transition.observation.has_ball = true;
+        transition.action = "shoot".to_string();
+        transition.reward = -0.30;
+
+        assert_eq!(
+            soccer_actor_priority_weight(&transition, -0.10),
+            SOCCER_ACTOR_ON_BALL_OUTCOME_PRIORITY_WEIGHT
+        );
+
+        transition.reward = 0.30;
+        assert_eq!(
+            soccer_actor_priority_weight(&transition, 0.10),
+            SOCCER_ACTOR_DECISIVE_EVENT_PRIORITY_WEIGHT,
+            "decisive positive attacking outcomes keep the existing strongest priority"
+        );
+    }
+
+    #[test]
     fn priority_actor_standardization_preserves_positive_teacher_signal() {
         let sample = |advantage: f64, sample_weight: f64| SoccerPolicySample {
             state_features: [0.0; SOCCER_POLICY_FEATURE_DIM],
@@ -6029,11 +6072,58 @@ fn soccer_actor_decisive_event_priority(transition: &SoccerLearningTransition) -
     attacking_action && transition.reward > 0.0
 }
 
+fn soccer_actor_on_ball_action_priority_weight(
+    transition: &SoccerLearningTransition,
+    advantage: f64,
+) -> f64 {
+    if !transition.observation.has_ball {
+        return 1.0;
+    }
+    let action = normalize_soccer_action_label(&transition.action);
+    let on_ball_action = is_pass_like_action(action)
+        || is_dribble_action_label(action)
+        || matches!(
+            action,
+            "shoot"
+                | "first-time-shot"
+                | "first-time-header"
+                | "killer-pass"
+                | "flank-low-cross"
+                | "flank-high-cross"
+                | "route-one"
+                | "clearance"
+        );
+    if !on_ball_action {
+        return 1.0;
+    }
+
+    let mut weight = learned_mpc_metric_env(
+        "SOCCER_ACTOR_ON_BALL_ACTION_PRIORITY_WEIGHT",
+        SOCCER_ACTOR_ON_BALL_ACTION_PRIORITY_WEIGHT,
+        1.0,
+        SOCCER_POLICY_PRIORITY_WEIGHT_MAX,
+    );
+    if transition.reward.abs() >= SOCCER_ACTOR_ON_BALL_OUTCOME_ADVANTAGE_FLOOR
+        || advantage.abs() >= SOCCER_ACTOR_ON_BALL_OUTCOME_ADVANTAGE_FLOOR
+    {
+        weight = weight.max(learned_mpc_metric_env(
+            "SOCCER_ACTOR_ON_BALL_OUTCOME_PRIORITY_WEIGHT",
+            SOCCER_ACTOR_ON_BALL_OUTCOME_PRIORITY_WEIGHT,
+            1.0,
+            SOCCER_POLICY_PRIORITY_WEIGHT_MAX,
+        ));
+    }
+    weight
+}
+
 fn soccer_actor_priority_weight(transition: &SoccerLearningTransition, advantage: f64) -> f64 {
     let mut weight: f64 = 1.0;
     if soccer_actor_mcts_distillation_priority(transition, advantage) {
         weight = weight.max(NEURAL_MCTS_DISTILLATION_PRIORITY_WEIGHT);
     }
+    weight = weight.max(soccer_actor_on_ball_action_priority_weight(
+        transition, advantage,
+    ));
     if soccer_actor_decisive_event_priority(transition) {
         weight = weight.max(SOCCER_ACTOR_DECISIVE_EVENT_PRIORITY_WEIGHT);
     }
