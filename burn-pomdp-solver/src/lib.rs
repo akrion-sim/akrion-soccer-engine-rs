@@ -10,6 +10,8 @@
 //! Unlike the candle inference-skeleton, this trains: Burn gives autodiff + Adam + real
 //! MultiHeadAttention/GRU modules. Forward consumes a whole trajectory (BPTT over decisions).
 
+pub mod adapter;
+
 use burn::config::Config;
 use burn::module::Module;
 use burn::nn::attention::{MhaInput, MultiHeadAttention, MultiHeadAttentionConfig};
