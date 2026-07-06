@@ -105,6 +105,6 @@ impl PomdpActorCritic {
         Ok(AcOutput { policy_logits, value, hidden })
     }
     pub fn zero_hidden(&self, dev: &candle_core::Device) -> Result<Tensor> {
-        Tensor::zeros(self.hidden_dim, candle_core::DType::F32, dev)
+        Tensor::zeros((1, self.hidden_dim), candle_core::DType::F32, dev)
     }
 }
