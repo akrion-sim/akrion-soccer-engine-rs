@@ -113,6 +113,10 @@ const DEFAULT_SOCCER_NEURAL_BATCH_SNAPSHOT_MIN_BATCH_MEAN_FITNESS: f64 =
     SOCCER_LEARNING_OBJECTIVE_FITNESS_MIN;
 const DEFAULT_SOCCER_NEURAL_BATCH_SNAPSHOT_RESCUE_MIN_FITNESS: f64 =
     SOCCER_LEARNING_OBJECTIVE_FITNESS_MAX + 1.0;
+const DEFAULT_SOCCER_NEURAL_BATCH_SNAPSHOT_VALIDATE_GAMES: usize = 0;
+const DEFAULT_SOCCER_NEURAL_BATCH_SNAPSHOT_VALIDATE_MIN_FITNESS: f64 =
+    DEFAULT_SOCCER_NEURAL_POPULATION_MIN_ACCEPTED_FITNESS;
+const DEFAULT_SOCCER_NEURAL_BATCH_SNAPSHOT_VALIDATE_MIN_GOAL_MARGIN: f64 = 0.0;
 
 fn env_value(name: &str) -> Option<String> {
     std::env::var(name)
@@ -955,6 +959,15 @@ struct NeuralPopulationCandidateEval {
 fn neural_population_candidate_goal_margin(eval: &NeuralPopulationCandidateEval) -> f64 {
     let games = (eval.wins + eval.draws + eval.losses).max(1) as f64;
     (f64::from(eval.goals_for) - f64::from(eval.goals_against)) / games
+}
+
+fn batch_neural_snapshot_validation_passes(
+    eval: &NeuralPopulationCandidateEval,
+    min_fitness: f64,
+    min_goal_margin: f64,
+) -> bool {
+    eval.fitness + 1e-12 >= min_fitness
+        && neural_population_candidate_goal_margin(eval) + 1e-12 >= min_goal_margin
 }
 
 fn push_unique_neural_parent(
@@ -6165,6 +6178,40 @@ fn run() -> Result<(), Box<dyn Error>> {
     let effective_seed = seed.wrapping_add((shard_index as u32).wrapping_mul(shard_seed_stride));
     let neural_population_search_config =
         env_neural_population_search_config(u64::from(effective_seed), parallel_games)?;
+    let neural_batch_snapshot_validate_games = env_usize(
+        "SOCCER_NEURAL_BATCH_SNAPSHOT_VALIDATE_GAMES",
+        DEFAULT_SOCCER_NEURAL_BATCH_SNAPSHOT_VALIDATE_GAMES,
+    )?;
+    let neural_batch_snapshot_validate_minutes = env_f64(
+        "SOCCER_NEURAL_BATCH_SNAPSHOT_VALIDATE_MINUTES",
+        neural_population_search_config.eval_minutes,
+    )?;
+    if neural_batch_snapshot_validate_minutes <= 0.0 {
+        return Err(invalid_data(
+            "SOCCER_NEURAL_BATCH_SNAPSHOT_VALIDATE_MINUTES must be positive",
+        )
+        .into());
+    }
+    let neural_batch_snapshot_validate_min_fitness = env_f64(
+        "SOCCER_NEURAL_BATCH_SNAPSHOT_VALIDATE_MIN_FITNESS",
+        DEFAULT_SOCCER_NEURAL_BATCH_SNAPSHOT_VALIDATE_MIN_FITNESS,
+    )?;
+    if !neural_batch_snapshot_validate_min_fitness.is_finite() {
+        return Err(invalid_data(
+            "SOCCER_NEURAL_BATCH_SNAPSHOT_VALIDATE_MIN_FITNESS must be finite",
+        )
+        .into());
+    }
+    let neural_batch_snapshot_validate_min_goal_margin = env_f64(
+        "SOCCER_NEURAL_BATCH_SNAPSHOT_VALIDATE_MIN_GOAL_MARGIN",
+        DEFAULT_SOCCER_NEURAL_BATCH_SNAPSHOT_VALIDATE_MIN_GOAL_MARGIN,
+    )?;
+    if !neural_batch_snapshot_validate_min_goal_margin.is_finite() {
+        return Err(invalid_data(
+            "SOCCER_NEURAL_BATCH_SNAPSHOT_VALIDATE_MIN_GOAL_MARGIN must be finite",
+        )
+        .into());
+    }
     let options = SoccerQPolicyOptions {
         alpha: env_f64("SOCCER_ALPHA", 0.20)?,
         gamma: env_f64("SOCCER_GAMMA", 0.96)?,
@@ -6897,6 +6944,13 @@ fn run() -> Result<(), Box<dyn Error>> {
         neural_batch_policy_merge_selected_only,
     );
     println!(
+        "neural_batch_snapshot_validation games={} eval_minutes={:.2} min_fitness={:.4} min_goal_margin={:.4}",
+        neural_batch_snapshot_validate_games,
+        neural_batch_snapshot_validate_minutes,
+        neural_batch_snapshot_validate_min_fitness,
+        neural_batch_snapshot_validate_min_goal_margin,
+    );
+    println!(
         "adversarial_embedding enabled={} memory_limit={} preloaded_windows={}",
         adversarial_embedding_exploitation_enabled,
         adversarial_embedding_memory_limit,
@@ -7179,13 +7233,89 @@ fn run() -> Result<(), Box<dyn Error>> {
                 snapshot: selected_snapshot,
                 world_model: selected_world_model,
             } = selection;
-            selected_neural_snapshot_episode = Some(selected_episode);
-            let selected_world_model_steps =
-                install_carried_world_model_snapshot(selected_world_model);
-            latest_neural_network = Some(selected_snapshot);
-            if selected_snapshot_count > 1 {
+            let mut validation_eval = None::<NeuralPopulationCandidateEval>;
+            let mut validation_failed = false;
+            if neural_batch_snapshot_validate_games > 0 {
+                let mut validation_config = neural_population_search_config;
+                validation_config.eval_games = neural_batch_snapshot_validate_games.max(1);
+                validation_config.eval_minutes = neural_batch_snapshot_validate_minutes;
+                let validation_seed = u64::from(effective_seed)
+                    ^ (selected_episode as u64).wrapping_mul(0xB492_B66F_BE98_F273)
+                    ^ ((batch_start_episode + batch_size) as u64)
+                        .wrapping_mul(0x9AE1_6A3B_2F90_404F);
+                let validation_candidate = NeuralPopulationCandidate {
+                    index: 0,
+                    source: format!("batch_snapshot_episode_{selected_episode}"),
+                    snapshot: selected_snapshot.clone(),
+                };
+                match evaluate_neural_population_candidate_against_analytic(
+                    validation_candidate,
+                    config.clone(),
+                    validation_config,
+                    validation_seed,
+                ) {
+                    Ok(eval) => {
+                        let goal_margin = neural_population_candidate_goal_margin(&eval);
+                        if batch_neural_snapshot_validation_passes(
+                            &eval,
+                            neural_batch_snapshot_validate_min_fitness,
+                            neural_batch_snapshot_validate_min_goal_margin,
+                        ) {
+                            println!(
+                                "neural_batch_snapshot_validation_passed episodes={}..{} selected_episode={} eval_games={} fitness={:.4} goal_margin={:.4} record={}-{}-{} goals={}-{}",
+                                batch_start_episode + 1,
+                                batch_start_episode + batch_size,
+                                selected_episode,
+                                neural_batch_snapshot_validate_games,
+                                eval.fitness,
+                                goal_margin,
+                                eval.wins,
+                                eval.draws,
+                                eval.losses,
+                                eval.goals_for,
+                                eval.goals_against,
+                            );
+                            validation_eval = Some(eval);
+                        } else {
+                            println!(
+                                "neural_batch_snapshot_validation_held episodes={}..{} selected_episode={} selected_match_fitness={:.4} eval_games={} fitness={:.4} goal_margin={:.4} min_fitness={:.4} min_goal_margin={:.4} record={}-{}-{} goals={}-{}",
+                                batch_start_episode + 1,
+                                batch_start_episode + batch_size,
+                                selected_episode,
+                                selected_match_fitness,
+                                neural_batch_snapshot_validate_games,
+                                eval.fitness,
+                                goal_margin,
+                                neural_batch_snapshot_validate_min_fitness,
+                                neural_batch_snapshot_validate_min_goal_margin,
+                                eval.wins,
+                                eval.draws,
+                                eval.losses,
+                                eval.goals_for,
+                                eval.goals_against,
+                            );
+                            validation_failed = true;
+                        }
+                    }
+                    Err(error) => {
+                        println!(
+                            "neural_batch_snapshot_validation_error episodes={}..{} selected_episode={} error={}",
+                            batch_start_episode + 1,
+                            batch_start_episode + batch_size,
+                            selected_episode,
+                            error.replace(char::is_whitespace, "_"),
+                        );
+                        validation_failed = true;
+                    }
+                }
+            }
+            if !validation_failed {
+                selected_neural_snapshot_episode = Some(selected_episode);
+                let selected_world_model_steps =
+                    install_carried_world_model_snapshot(selected_world_model);
+                latest_neural_network = Some(selected_snapshot);
                 println!(
-                    "neural_batch_snapshot_selected episodes={}..{} snapshots={} selection_mode={} selected_episode={} selected_match_fitness={:.4} selected_training_steps={} selected_world_model_steps={}",
+                    "neural_batch_snapshot_selected episodes={}..{} snapshots={} selection_mode={} selected_episode={} selected_match_fitness={:.4} selected_training_steps={} selected_world_model_steps={} validation_fitness={} validation_goal_margin={}",
                     batch_start_episode + 1,
                     batch_start_episode + batch_size,
                     selected_snapshot_count,
@@ -7193,7 +7323,18 @@ fn run() -> Result<(), Box<dyn Error>> {
                     selected_episode,
                     selected_match_fitness,
                     selected_training_steps,
-                    selected_world_model_steps
+                    selected_world_model_steps,
+                    validation_eval
+                        .as_ref()
+                        .map(|eval| format!("{:.4}", eval.fitness))
+                        .unwrap_or_else(|| "disabled".to_string()),
+                    validation_eval
+                        .as_ref()
+                        .map(|eval| format!(
+                            "{:.4}",
+                            neural_population_candidate_goal_margin(eval)
+                        ))
+                        .unwrap_or_else(|| "disabled".to_string()),
                 );
             }
         } else if neural_batch_snapshot_count > 0 {
@@ -9013,6 +9154,37 @@ mod tests {
             neural_population_candidate_goal_margin(&eval) >= config.min_accepted_goal_margin,
             "population search should compare goal margin per eval game, not total margin"
         );
+    }
+
+    #[test]
+    fn batch_snapshot_validation_requires_fitness_and_goal_margin() {
+        let losing_eval = NeuralPopulationCandidateEval {
+            index: 3,
+            source: "batch_snapshot_episode_42".to_string(),
+            fitness: 0.35,
+            wins: 3,
+            draws: 1,
+            losses: 2,
+            goals_for: 7,
+            goals_against: 9,
+            snapshot: neural_population_full_snapshot(3.0),
+        };
+        assert!(!batch_neural_snapshot_validation_passes(
+            &losing_eval,
+            0.25,
+            0.0
+        ));
+
+        let winning_eval = NeuralPopulationCandidateEval {
+            goals_for: 10,
+            goals_against: 8,
+            ..losing_eval
+        };
+        assert!(batch_neural_snapshot_validation_passes(
+            &winning_eval,
+            0.25,
+            0.0
+        ));
     }
 
     fn promotion_eval(
