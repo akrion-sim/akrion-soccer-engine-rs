@@ -17,6 +17,7 @@ use burn::module::Module;
 use burn::nn::attention::{MhaInput, MultiHeadAttention, MultiHeadAttentionConfig};
 use burn::nn::gru::{Gru, GruConfig};
 use burn::nn::{Linear, LinearConfig};
+use burn::record::{BinFileRecorder, FullPrecisionSettings};
 use burn::tensor::{backend::Backend, activation::softmax, Tensor};
 
 #[derive(Config, Debug)]
@@ -80,5 +81,18 @@ impl<B: Backend> PomdpActorCritic<B> {
     /// Softmax action probabilities per decision — for sampling / entropy.
     pub fn policy(&self, entities: Tensor<B, 3>) -> Tensor<B, 2> {
         softmax(self.forward(entities).logits, 1)
+    }
+
+    /// Snapshot bridge: persist trained weights to `<path>.bin` (the sidecar loads this to serve
+    /// the policy). Consumes self (Burn's recorder API).
+    pub fn save(self, path: &str) -> Result<(), burn::record::RecorderError> {
+        use burn::module::Module;
+        self.save_file(path, &BinFileRecorder::<FullPrecisionSettings>::new())
+    }
+
+    /// Load weights from `<path>.bin` into this (freshly-`init`'d) module.
+    pub fn load(self, path: &str, dev: &B::Device) -> Result<Self, burn::record::RecorderError> {
+        use burn::module::Module;
+        self.load_file(path, &BinFileRecorder::<FullPrecisionSettings>::new(), dev)
     }
 }

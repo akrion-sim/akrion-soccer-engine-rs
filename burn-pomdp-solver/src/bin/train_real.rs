@@ -92,5 +92,10 @@ fn main() {
             println!("epoch {epoch}: actor(ema)={ema_actor:.4}  critic_mse(ema)={ema_critic:.4}  awr_w(ema)={ema_w:.3}");
         }
     }
+    let out_path = std::env::var("MODEL_OUT").unwrap_or_else(|_| "/tmp/burn-pomdp-solver".into());
+    match net.save(&out_path) {
+        Ok(_) => println!("saved trained model -> {out_path}.bin"),
+        Err(e) => println!("save failed: {e}"),
+    }
     println!("OK: AWR training on REAL soccer trajectories (normalized returns, clamped weights).");
 }
