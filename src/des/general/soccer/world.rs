@@ -29,6 +29,7 @@ const NEURAL_MCTS_KICK_POWER_CANDIDATE_LIMIT: usize = 4;
 const NEURAL_MCTS_KICK_POWER_CANDIDATE_LIMIT_MAX: usize = 5;
 const NEURAL_MCTS_MIN_DISCRETIZED_KICK_CANDIDATES: usize = 0;
 const NEURAL_MCTS_PASS_MPC_PRIOR_WEIGHT: f64 = 0.55;
+const NEURAL_MCTS_TECHNICAL_MPC_EXECUTION_WEIGHT: f64 = 0.75;
 const NEURAL_MCTS_DISCRETIZED_KICK_BASE_VALUE_WEIGHT: f64 = 0.0;
 const NEURAL_MCTS_DISCRETIZED_KICK_SELECTION_FLOOR: f64 = 0.0;
 const NEURAL_MCTS_DISCRETIZED_KICK_SELECTION_MAX_SCORE_REGRESSION: f64 = 1.50;
@@ -174,6 +175,23 @@ fn neural_mcts_pass_mpc_prior_weight() -> f64 {
         0.0,
         2.0,
     )
+}
+
+fn neural_mcts_technical_mpc_execution_weight() -> f64 {
+    learned_mpc_metric_env(
+        "SOCCER_NEURAL_MCTS_TECHNICAL_MPC_EXECUTION_WEIGHT",
+        NEURAL_MCTS_TECHNICAL_MPC_EXECUTION_WEIGHT,
+        0.0,
+        2.0,
+    )
+}
+
+fn neural_mcts_mpc_execution_probability_bonus(probability: f64, weight: f64) -> f64 {
+    if weight <= 0.0 {
+        return 0.0;
+    }
+    let probability = finite_unit_interval(probability);
+    (probability - 0.58).clamp(-0.60, 0.40) * weight
 }
 
 fn neural_mcts_discretized_kick_base_value_weight() -> f64 {
@@ -4451,6 +4469,33 @@ mod tests {
     }
 
     #[test]
+    fn neural_mcts_technical_mpc_bonus_prefers_executable_variants_without_double_counting_passes()
+    {
+        let _env_lock = soccer_world_env_lock();
+        let _weight = set_test_env_var("SOCCER_NEURAL_MCTS_TECHNICAL_MPC_EXECUTION_WEIGHT", "1.0");
+        let good_bonus = neural_mcts_mpc_execution_probability_bonus(0.90, 1.0);
+        let poor_bonus = neural_mcts_mpc_execution_probability_bonus(0.05, 1.0);
+        assert!(
+            good_bonus > 0.0 && poor_bonus < 0.0 && good_bonus > poor_bonus,
+            "technical MPC execution prior should lift executable variants and suppress poor ones: good={good_bonus} poor={poor_bonus}"
+        );
+
+        let sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let pass_plan = SoccerLearnedPlan {
+            action: "pass".to_string(),
+            target_player: None,
+            target_point: None,
+            mpc_replan: None,
+        };
+        assert_eq!(
+            SoccerMatch::neural_mcts_technical_mpc_execution_bonus(&snapshot, 5, &pass_plan),
+            0.0,
+            "pass-like candidates already use the pass MPC prior and must not be double counted"
+        );
+    }
+
+    #[test]
     fn learned_plan_uses_policy_target_grid_for_concrete_target_points() {
         let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
         let actor = sim
@@ -8680,6 +8725,26 @@ impl SoccerMatch {
             || (normalized != "dribble" && is_dribble_action_label(normalized))
     }
 
+    fn neural_mcts_technical_mpc_execution_bonus(
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        plan: &SoccerLearnedPlan,
+    ) -> f64 {
+        let label = normalize_soccer_action_label(&plan.action);
+        if pass_like_action_flight(label).is_some()
+            || !Self::neural_mcts_technical_action_label(label)
+        {
+            return 0.0;
+        }
+        let weight = neural_mcts_technical_mpc_execution_weight();
+        if weight <= 0.0 {
+            return 0.0;
+        }
+        Self::learned_plan_mpc_execution_probability(snapshot, player_id, plan)
+            .map(|probability| neural_mcts_mpc_execution_probability_bonus(probability, weight))
+            .unwrap_or(0.0)
+    }
+
     fn neural_mcts_action_from_candidates(
         blend: SoccerNeuralBlendConfig,
         candidates: &[SoccerNeuralMctsCandidate],
@@ -9420,8 +9485,17 @@ impl SoccerMatch {
                         gamma,
                     );
                 let pass_mpc_bonus = neural_mcts_pass_mpc_candidate_bonus(&transition);
-                let score =
-                    value_score + actor_bonus + retrieved_bonus + model_bonus + pass_mpc_bonus;
+                let technical_mpc_bonus = Self::neural_mcts_technical_mpc_execution_bonus(
+                    snapshot,
+                    player_id,
+                    &candidate_plan,
+                );
+                let score = value_score
+                    + actor_bonus
+                    + retrieved_bonus
+                    + model_bonus
+                    + pass_mpc_bonus
+                    + technical_mpc_bonus;
                 if !score.is_finite() {
                     return;
                 }
@@ -9436,7 +9510,10 @@ impl SoccerMatch {
                     label: candidate_label,
                     plan: Some(candidate_plan),
                     score,
-                    prior: actor_prior + retrieved_bonus.max(0.0) + pass_mpc_bonus.max(0.0),
+                    prior: actor_prior
+                        + retrieved_bonus.max(0.0)
+                        + pass_mpc_bonus.max(0.0)
+                        + technical_mpc_bonus.max(0.0),
                     q_visits: candidate.visits,
                 });
             };
