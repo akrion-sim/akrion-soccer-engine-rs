@@ -61,6 +61,9 @@ fn test_decision_trace(
         learned_mpc_replan: None,
         behavior_policy_probability: None,
         neural_mcts_selected: false,
+        neural_mcts_candidate_count: 0,
+        neural_mcts_discretized_kick_candidate_count: 0,
+        neural_mcts_root_discretized_kick_candidate_count: 0,
         action: action.to_string(),
     }
 }
@@ -59384,6 +59387,9 @@ fn transition_reward_reinforces_completed_pass_into_future_stride() {
             learned_mpc_replan: None,
             behavior_policy_probability: None,
             neural_mcts_selected: false,
+            neural_mcts_candidate_count: 0,
+            neural_mcts_discretized_kick_candidate_count: 0,
+            neural_mcts_root_discretized_kick_candidate_count: 0,
             action: "pass".to_string(),
         };
         soccer_transition_reward(

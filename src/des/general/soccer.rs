@@ -8211,6 +8211,12 @@ pub struct SoccerDecisionContext {
     #[serde(default)]
     pub neural_mcts_selected: bool,
     #[serde(default)]
+    pub neural_mcts_candidate_count: u32,
+    #[serde(default)]
+    pub neural_mcts_discretized_kick_candidate_count: u32,
+    #[serde(default)]
+    pub neural_mcts_root_discretized_kick_candidate_count: u32,
+    #[serde(default)]
     pub chosen_action_score: f64,
     #[serde(default)]
     pub best_legal_action_score: f64,
@@ -8324,6 +8330,12 @@ pub struct AgentDecisionTrace {
     /// This is a trace/metric bit only; the neural feature vector stays unchanged.
     #[serde(default)]
     pub neural_mcts_selected: bool,
+    #[serde(default)]
+    pub neural_mcts_candidate_count: u32,
+    #[serde(default)]
+    pub neural_mcts_discretized_kick_candidate_count: u32,
+    #[serde(default)]
+    pub neural_mcts_root_discretized_kick_candidate_count: u32,
     pub action: String,
 }
 
@@ -17696,7 +17708,7 @@ impl SoccerNeuralBlendConfig {
     }
 
     fn sanitized_mcts_candidates(&self) -> usize {
-        self.mcts_candidates.clamp(2, 8)
+        self.mcts_candidates.clamp(2, 16)
     }
 
     fn sanitized_mcts_depth(&self) -> usize {
@@ -18873,6 +18885,14 @@ pub struct MatchStats {
     #[serde(default)]
     pub neural_mcts_discretized_kick_selections: u32,
     #[serde(default)]
+    pub neural_mcts_candidate_sets: u32,
+    #[serde(default)]
+    pub neural_mcts_candidates: u32,
+    #[serde(default)]
+    pub neural_mcts_discretized_kick_candidates: u32,
+    #[serde(default)]
+    pub neural_mcts_root_discretized_kick_candidates: u32,
+    #[serde(default)]
     pub learned_mpc_replans: u32,
     #[serde(default)]
     pub policy_priority_samples: u32,
@@ -18914,6 +18934,12 @@ pub struct SoccerPlanningValidationStats {
     pub neural_mcts_selection_rate: f64,
     pub neural_mcts_discretized_kick_selections: u32,
     pub neural_mcts_discretized_kick_selection_rate: f64,
+    pub neural_mcts_candidate_sets: u32,
+    pub neural_mcts_candidates: u32,
+    pub neural_mcts_discretized_kick_candidates: u32,
+    pub neural_mcts_root_discretized_kick_candidates: u32,
+    pub neural_mcts_discretized_kick_candidate_share: f64,
+    pub neural_mcts_root_discretized_kick_candidate_share: f64,
     pub learned_mpc_replans: u32,
     pub learned_mpc_replan_rate: f64,
     pub policy_priority_samples: u32,
@@ -19022,6 +19048,7 @@ impl MatchStats {
 
     pub fn planning_validation_stats(&self) -> SoccerPlanningValidationStats {
         let decisions = self.planning_decisions.max(1);
+        let neural_mcts_candidates = self.neural_mcts_candidates.max(1);
         SoccerPlanningValidationStats {
             decisions: self.planning_decisions,
             neural_mcts_selections: self.neural_mcts_selections,
@@ -19031,6 +19058,19 @@ impl MatchStats {
                 .neural_mcts_discretized_kick_selections
                 as f64
                 / decisions as f64,
+            neural_mcts_candidate_sets: self.neural_mcts_candidate_sets,
+            neural_mcts_candidates: self.neural_mcts_candidates,
+            neural_mcts_discretized_kick_candidates: self.neural_mcts_discretized_kick_candidates,
+            neural_mcts_root_discretized_kick_candidates: self
+                .neural_mcts_root_discretized_kick_candidates,
+            neural_mcts_discretized_kick_candidate_share: self
+                .neural_mcts_discretized_kick_candidates
+                as f64
+                / neural_mcts_candidates as f64,
+            neural_mcts_root_discretized_kick_candidate_share: self
+                .neural_mcts_root_discretized_kick_candidates
+                as f64
+                / neural_mcts_candidates as f64,
             learned_mpc_replans: self.learned_mpc_replans,
             learned_mpc_replan_rate: self.learned_mpc_replans as f64 / decisions as f64,
             policy_priority_samples: self.policy_priority_samples,
@@ -23601,6 +23641,7 @@ fn soccer_decision_context_for(
             is_cross,
             Some((target, target_position)),
         );
+        let receipt_speed_yps = learned_kick_speed_yps.unwrap_or(velocity_plan.speed_yps);
         Some(pass_mpc_receipt_estimate_for_snapshot(
             before,
             passer,
@@ -23608,7 +23649,7 @@ fn soccer_decision_context_for(
             target,
             target_position,
             flight,
-            velocity_plan.speed_yps,
+            receipt_speed_yps,
             explicit_target,
         ))
     });
@@ -23635,7 +23676,9 @@ fn soccer_decision_context_for(
         .map(|estimate| estimate.qp_accel_fit)
         .or_else(|| pass_quality_for_action.map(|quality| quality.mpc_receipt_qp_accel_fit))
         .unwrap_or(0.0);
-    let pass_receipt_is_explicitly_infeasible = pass_mpc_for_explicit_target
+    let pass_receipt_can_use_quality_fallback = learned_kick_speed_yps.is_none();
+    let pass_receipt_is_explicitly_infeasible = pass_receipt_can_use_quality_fallback
+        && pass_mpc_for_explicit_target
         .map(|estimate| estimate.probability <= 1e-9 && estimate.qp_accel_fit <= 1e-9)
         .unwrap_or(false);
     let pass_mpc_receipt_probability = if pass_receipt_is_explicitly_infeasible {
@@ -23922,6 +23965,9 @@ fn soccer_decision_context_for(
         chosen_action_probability: 0.0,
         behavior_policy_probability: None,
         neural_mcts_selected: false,
+        neural_mcts_candidate_count: 0,
+        neural_mcts_discretized_kick_candidate_count: 0,
+        neural_mcts_root_discretized_kick_candidate_count: 0,
         chosen_action_score: 0.0,
         best_legal_action_score: 0.0,
         action_score_margin: 0.0,
@@ -23991,6 +24037,11 @@ fn soccer_decision_context_with_trace(
     // (the default) leaves on-policy learning exactly as it was.
     context.behavior_policy_probability = decision.behavior_policy_probability;
     context.neural_mcts_selected = decision.neural_mcts_selected;
+    context.neural_mcts_candidate_count = decision.neural_mcts_candidate_count;
+    context.neural_mcts_discretized_kick_candidate_count =
+        decision.neural_mcts_discretized_kick_candidate_count;
+    context.neural_mcts_root_discretized_kick_candidate_count =
+        decision.neural_mcts_root_discretized_kick_candidate_count;
     let option_context =
         soccer_action_option_learning_context(&decision.action, &decision.action_options);
     context.action_option_count = option_context.action_option_count;
@@ -51490,6 +51541,9 @@ pub fn soccer_tracking_dataset_to_learning_dataset(
                 learned_mpc_replan: None,
                 behavior_policy_probability: None,
                 neural_mcts_selected: false,
+                neural_mcts_candidate_count: 0,
+                neural_mcts_discretized_kick_candidate_count: 0,
+                neural_mcts_root_discretized_kick_candidate_count: 0,
                 action,
             };
             let player_agent = player_agent_from_snapshot(player);
@@ -55446,6 +55500,9 @@ fn soccer_moment_replay_transition(
             learned_mpc_replan: None,
             behavior_policy_probability: None,
             neural_mcts_selected: false,
+            neural_mcts_candidate_count: 0,
+            neural_mcts_discretized_kick_candidate_count: 0,
+            neural_mcts_root_discretized_kick_candidate_count: 0,
             action: action.clone(),
         },
         &before,

@@ -301,6 +301,11 @@ fn env_neural_learning_config() -> Result<SoccerNeuralLearningConfig, Box<dyn Er
             "SOCCER_NEURAL_RATE",
             default.learning_rate,
         )?,
+        optimizer_momentum: env_f64_alias(
+            "SOCCER_NEURAL_OPTIMIZER_MOMENTUM",
+            "SOCCER_NEURAL_MOMENTUM",
+            default.optimizer_momentum,
+        )?,
         batch_size: env_usize_alias(
             "SOCCER_NEURAL_BATCH_SIZE",
             "SOCCER_NEURAL_LEARNING_BATCH_SIZE",

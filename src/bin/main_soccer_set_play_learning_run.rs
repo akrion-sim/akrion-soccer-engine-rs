@@ -307,6 +307,10 @@ fn run() -> Result<(), Box<dyn Error>> {
             "SOCCER_NEURAL_LEARNING_RATE",
             SoccerNeuralLearningConfig::default().learning_rate,
         )?,
+        optimizer_momentum: env_parse(
+            "SOCCER_NEURAL_OPTIMIZER_MOMENTUM",
+            SoccerNeuralLearningConfig::default().optimizer_momentum,
+        )?,
         batch_size: env_parse("SOCCER_NEURAL_BATCH_SIZE", 32usize)?,
         train_every_ticks: env_parse("SOCCER_NEURAL_TRAIN_EVERY_TICKS", 1usize)?,
         max_batches_per_tick: env_parse("SOCCER_NEURAL_MAX_BATCHES_PER_TICK", 1usize)?,

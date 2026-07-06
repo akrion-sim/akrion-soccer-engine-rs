@@ -38,6 +38,8 @@ const COMPLETED_PASS_LEARNING_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(5.0);
 const SHOT_OUTCOME_LEARNING_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(4.0);
 const DRIBBLE_BEAT_LEARNING_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(2.0);
 const LEARNED_MPC_REJECTED_ACTION_PENALTY_POINTS: f64 = 2.5;
+const NEURAL_DEFERRED_REWARD_DRAIN_PER_TICK: usize = 64;
+const NEURAL_DEFERRED_REWARD_DRAIN_PER_TICK_MAX: usize = 512;
 const LEARNED_TARGET_GRID_MIN_VISITS: u32 = 1;
 const GAIT_PHYSICS_STAND_SPEED_YPS: f64 = 0.25;
 const GAIT_PHYSICS_MIN_REFERENCE_SPEED_YPS: f64 = 1.0;
@@ -178,6 +180,26 @@ fn neural_value_bootstrap_weight() -> f64 {
         0.0,
         1.0,
     )
+}
+
+fn neural_deferred_reward_drain_per_tick() -> usize {
+    let read = || {
+        std::env::var("SOCCER_NEURAL_DEFERRED_REWARD_DRAIN_PER_TICK")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .unwrap_or(NEURAL_DEFERRED_REWARD_DRAIN_PER_TICK)
+            .min(NEURAL_DEFERRED_REWARD_DRAIN_PER_TICK_MAX)
+    };
+    #[cfg(test)]
+    {
+        read()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<usize> = OnceLock::new();
+        *V.get_or_init(read)
+    }
 }
 
 fn neural_value_bootstrap_min_training_steps() -> usize {
@@ -1356,6 +1378,9 @@ struct SoccerPolicyActionChoice {
     plan: Option<SoccerLearnedPlan>,
     behavior_probability: f64,
     neural_mcts_selected: bool,
+    neural_mcts_candidate_count: u32,
+    neural_mcts_discretized_kick_candidate_count: u32,
+    neural_mcts_root_discretized_kick_candidate_count: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1363,6 +1388,9 @@ struct SoccerLearnedDecisionPlan {
     plan: SoccerLearnedPlan,
     behavior_probability: f64,
     neural_mcts_selected: bool,
+    neural_mcts_candidate_count: u32,
+    neural_mcts_discretized_kick_candidate_count: u32,
+    neural_mcts_root_discretized_kick_candidate_count: u32,
 }
 
 fn soccer_policy_rank_draw(seed: u32, tick: u64, player_id: usize, salt: u64) -> f64 {
@@ -1534,6 +1562,9 @@ fn soccer_policy_uncertainty_weighted_ranked_action_choice(
                 selected_rank,
             ),
             neural_mcts_selected: false,
+            neural_mcts_candidate_count: 0,
+            neural_mcts_discretized_kick_candidate_count: 0,
+            neural_mcts_root_discretized_kick_candidate_count: 0,
         });
     }
     let mut threshold = draw.clamp(0.0, 1.0 - f64::EPSILON) * total;
@@ -1551,6 +1582,9 @@ fn soccer_policy_uncertainty_weighted_ranked_action_choice(
         plan: None,
         behavior_probability: (weights[selected_rank] / total).clamp(0.0, 1.0),
         neural_mcts_selected: false,
+        neural_mcts_candidate_count: 0,
+        neural_mcts_discretized_kick_candidate_count: 0,
+        neural_mcts_root_discretized_kick_candidate_count: 0,
     })
 }
 
@@ -3032,6 +3066,9 @@ mod tests {
             learned_mpc_replan: None,
             behavior_policy_probability: None,
             neural_mcts_selected: false,
+            neural_mcts_candidate_count: 0,
+            neural_mcts_discretized_kick_candidate_count: 0,
+            neural_mcts_root_discretized_kick_candidate_count: 0,
             action: "pass".to_string(),
         };
 
@@ -3089,6 +3126,9 @@ mod tests {
             learned_mpc_replan: None,
             behavior_policy_probability: None,
             neural_mcts_selected: false,
+            neural_mcts_candidate_count: 0,
+            neural_mcts_discretized_kick_candidate_count: 0,
+            neural_mcts_root_discretized_kick_candidate_count: 0,
             action: "pass2".to_string(),
         };
 
@@ -3127,6 +3167,9 @@ mod tests {
             learned_mpc_replan: None,
             behavior_policy_probability: None,
             neural_mcts_selected: false,
+            neural_mcts_candidate_count: 0,
+            neural_mcts_discretized_kick_candidate_count: 0,
+            neural_mcts_root_discretized_kick_candidate_count: 0,
             action: "novel-action".to_string(),
         };
 
@@ -3503,6 +3546,9 @@ mod tests {
             }),
             behavior_policy_probability: None,
             neural_mcts_selected: false,
+            neural_mcts_candidate_count: 0,
+            neural_mcts_discretized_kick_candidate_count: 0,
+            neural_mcts_root_discretized_kick_candidate_count: 0,
             action: "hold".to_string(),
         });
         let after = WorldSnapshot::from_match(&sim);
@@ -4136,6 +4182,51 @@ mod tests {
             scored_bucket.decision_context.action_ball_speed_yps
                 > scored_baseline.decision_context.action_ball_speed_yps + 1e-6,
             "candidate features should expose the learned kick speed, not only a label hash"
+        );
+        let passer = snapshot
+            .players
+            .iter()
+            .find(|player| player.id == actor_id)
+            .expect("passer snapshot");
+        let target_snapshot = snapshot
+            .players
+            .iter()
+            .find(|player| player.id == sim.players[target].id)
+            .expect("target snapshot");
+        let context_target_point = scored_bucket
+            .decision_context
+            .target_point
+            .expect("context target point");
+        let context_target_position = scored_bucket
+            .decision_context
+            .target_player_position
+            .expect("context target player position");
+        let flight = pass_like_action_flight(&scored_bucket.action).expect("pass flight");
+        let expected_mpc = pass_mpc_receipt_estimate_for_snapshot(
+            &snapshot,
+            passer,
+            scored_bucket.decision_context.actor_position,
+            target_snapshot,
+            context_target_position,
+            flight,
+            scored_bucket.decision_context.action_ball_speed_yps,
+            context_target_point,
+        );
+        assert!(
+            (scored_bucket
+                .decision_context
+                .pass_mpc_receipt_probability
+                - expected_mpc.probability)
+                .abs()
+                < 1e-9,
+            "learned kick candidates must score receipt MPC with the selected bucket speed: context={} expected={} speed={} qp={} expected_qp={}",
+            scored_bucket
+                .decision_context
+                .pass_mpc_receipt_probability,
+            expected_mpc.probability,
+            scored_bucket.decision_context.action_ball_speed_yps,
+            scored_bucket.decision_context.pass_receipt_qp_accel_fit,
+            expected_mpc.qp_accel_fit
         );
         let (action, executed_label) = sim.players[actor]
             .action_from_learned_plan(learned_bucket, &snapshot, &observation)
@@ -7377,6 +7468,9 @@ impl SoccerMatch {
                     selected_rank,
                 ),
                 neural_mcts_selected: false,
+                neural_mcts_candidate_count: 0,
+                neural_mcts_discretized_kick_candidate_count: 0,
+                neural_mcts_root_discretized_kick_candidate_count: 0,
             })
     }
 
@@ -7399,6 +7493,9 @@ impl SoccerMatch {
                     selected_rank,
                 ),
                 neural_mcts_selected: false,
+                neural_mcts_candidate_count: 0,
+                neural_mcts_discretized_kick_candidate_count: 0,
+                neural_mcts_root_discretized_kick_candidate_count: 0,
             })
     }
 
@@ -7412,6 +7509,9 @@ impl SoccerMatch {
                 plan: candidate.plan.clone(),
                 behavior_probability: 1.0,
                 neural_mcts_selected: false,
+                neural_mcts_candidate_count: 0,
+                neural_mcts_discretized_kick_candidate_count: 0,
+                neural_mcts_root_discretized_kick_candidate_count: 0,
             })
     }
 
@@ -7520,6 +7620,9 @@ impl SoccerMatch {
                     plan: None,
                     behavior_probability: 1.0,
                     neural_mcts_selected: false,
+                    neural_mcts_candidate_count: 0,
+                    neural_mcts_discretized_kick_candidate_count: 0,
+                    neural_mcts_root_discretized_kick_candidate_count: 0,
                 })
         })
     }
@@ -7583,6 +7686,9 @@ impl SoccerMatch {
                     plan,
                     behavior_probability,
                     neural_mcts_selected,
+                    neural_mcts_candidate_count,
+                    neural_mcts_discretized_kick_candidate_count,
+                    neural_mcts_root_discretized_kick_candidate_count,
                 } = choice;
                 let plan = plan.unwrap_or_else(|| {
                     Self::learned_plan_for_policy(policy, snapshot, player_id, label)
@@ -7591,6 +7697,9 @@ impl SoccerMatch {
                     plan: Self::mpc_reconciled_learned_plan(policy, snapshot, player_id, plan),
                     behavior_probability,
                     neural_mcts_selected,
+                    neural_mcts_candidate_count,
+                    neural_mcts_discretized_kick_candidate_count,
+                    neural_mcts_root_discretized_kick_candidate_count,
                 });
             }
         }
@@ -7632,6 +7741,9 @@ impl SoccerMatch {
                 plan,
                 behavior_probability,
                 neural_mcts_selected,
+                neural_mcts_candidate_count,
+                neural_mcts_discretized_kick_candidate_count,
+                neural_mcts_root_discretized_kick_candidate_count,
             } = choice;
             let plan = plan.unwrap_or_else(|| {
                 Self::learned_plan_for_policy(learned_policy, snapshot, player_id, label)
@@ -7640,6 +7752,9 @@ impl SoccerMatch {
                 plan: Self::mpc_reconciled_learned_plan(learned_policy, snapshot, player_id, plan),
                 behavior_probability,
                 neural_mcts_selected,
+                neural_mcts_candidate_count,
+                neural_mcts_discretized_kick_candidate_count,
+                neural_mcts_root_discretized_kick_candidate_count,
             }
         })
     }
@@ -7654,14 +7769,23 @@ impl SoccerMatch {
         stamp_learned_policy_behavior_probability_on_decision(decision, behavior_probability);
     }
 
-    fn stamp_neural_mcts_selection(player: &mut PlayerAgent, selected: bool) {
-        if !selected {
-            return;
-        }
+    fn stamp_neural_mcts_selection(
+        player: &mut PlayerAgent,
+        selected: bool,
+        candidate_count: u32,
+        discretized_kick_candidate_count: u32,
+        root_discretized_kick_candidate_count: u32,
+    ) {
         let Some(decision) = player.last_decision.as_mut() else {
             return;
         };
-        decision.neural_mcts_selected = true;
+        if selected {
+            decision.neural_mcts_selected = true;
+        }
+        decision.neural_mcts_candidate_count = candidate_count;
+        decision.neural_mcts_discretized_kick_candidate_count = discretized_kick_candidate_count;
+        decision.neural_mcts_root_discretized_kick_candidate_count =
+            root_discretized_kick_candidate_count;
     }
 
     /// Build a feature-only decision-time transition: the player's real
@@ -7842,7 +7966,22 @@ impl SoccerMatch {
         }
         let simulations = blend.sanitized_mcts_simulations();
         let exploration = blend.sanitized_mcts_exploration();
+        let neural_mcts_candidate_count = candidates.len().min(u32::MAX as usize) as u32;
+        let neural_mcts_discretized_kick_candidate_count = candidates
+            .iter()
+            .filter(|candidate| {
+                learned_discretized_kick_speed_bucket_for_action_label(&candidate.label).is_some()
+            })
+            .count()
+            .min(u32::MAX as usize) as u32;
         let candidates = Self::neural_mcts_root_candidates(candidates, candidate_count);
+        let neural_mcts_root_discretized_kick_candidate_count = candidates
+            .iter()
+            .filter(|candidate| {
+                learned_discretized_kick_speed_bucket_for_action_label(&candidate.label).is_some()
+            })
+            .count()
+            .min(u32::MAX as usize) as u32;
         let min_score = candidates
             .iter()
             .map(|candidate| candidate.score)
@@ -7958,6 +8097,9 @@ impl SoccerMatch {
                     selected_rank,
                 ),
                 neural_mcts_selected: true,
+                neural_mcts_candidate_count,
+                neural_mcts_discretized_kick_candidate_count,
+                neural_mcts_root_discretized_kick_candidate_count,
             }
         })
     }
@@ -11715,6 +11857,9 @@ impl SoccerMatch {
                         Self::stamp_neural_mcts_selection(
                             &mut self.players[actor],
                             learned_decision.neural_mcts_selected,
+                            learned_decision.neural_mcts_candidate_count,
+                            learned_decision.neural_mcts_discretized_kick_candidate_count,
+                            learned_decision.neural_mcts_root_discretized_kick_candidate_count,
                         );
                     }
                     let intent = self.players[actor]
@@ -12049,9 +12194,18 @@ impl SoccerMatch {
                 if learning_due {
                     let neural_due = self.neural_learning_due(learning_due);
                     let tabular_train_limit = self.config.policy_train_max_transitions_per_tick;
+                    let neural_deferred_drain_budget = if neural_due {
+                        neural_deferred_reward_drain_per_tick()
+                            .min(self.deferred_reward_transitions.len())
+                    } else {
+                        0
+                    };
                     let train_limit = if tabular_train_limit == 0 {
                         if neural_due {
-                            tick_transitions.len().max(1)
+                            tick_transitions
+                                .len()
+                                .saturating_add(neural_deferred_drain_budget)
+                                .max(1)
                         } else {
                             0
                         }
@@ -24304,6 +24458,28 @@ impl SoccerMatch {
                 if transition.decision_context.neural_mcts_selected {
                     self.stats.neural_mcts_selections =
                         self.stats.neural_mcts_selections.saturating_add(1);
+                    if transition.decision_context.neural_mcts_candidate_count > 0 {
+                        self.stats.neural_mcts_candidate_sets =
+                            self.stats.neural_mcts_candidate_sets.saturating_add(1);
+                        self.stats.neural_mcts_candidates =
+                            self.stats.neural_mcts_candidates.saturating_add(
+                                transition.decision_context.neural_mcts_candidate_count,
+                            );
+                        self.stats.neural_mcts_discretized_kick_candidates =
+                            self.stats.neural_mcts_discretized_kick_candidates
+                                .saturating_add(
+                                    transition
+                                        .decision_context
+                                        .neural_mcts_discretized_kick_candidate_count,
+                                );
+                        self.stats.neural_mcts_root_discretized_kick_candidates =
+                            self.stats.neural_mcts_root_discretized_kick_candidates
+                                .saturating_add(
+                                    transition
+                                        .decision_context
+                                        .neural_mcts_root_discretized_kick_candidate_count,
+                                );
+                    }
                     if learned_discretized_kick_speed_bucket_for_action_label(&transition.action)
                         .is_some()
                     {

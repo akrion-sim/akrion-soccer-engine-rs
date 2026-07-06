@@ -7518,6 +7518,9 @@ impl PlayerAgent {
             learned_mpc_replan: None,
             behavior_policy_probability: self.pending_policy_behavior_probability,
             neural_mcts_selected: false,
+            neural_mcts_candidate_count: 0,
+            neural_mcts_discretized_kick_candidate_count: 0,
+            neural_mcts_root_discretized_kick_candidate_count: 0,
             action: action_label,
         }
     }
