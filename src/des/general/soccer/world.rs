@@ -266,6 +266,28 @@ fn neural_mcts_discretized_kick_exploration_min_prior() -> f64 {
     )
 }
 
+fn neural_mcts_discretized_kick_force_floor() -> bool {
+    let read = || {
+        std::env::var("SOCCER_NEURAL_MCTS_DISCRETIZED_KICK_FORCE_FLOOR")
+            .ok()
+            .map(|raw| {
+                let value = raw.trim().to_ascii_lowercase();
+                matches!(value.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(false)
+    };
+    #[cfg(test)]
+    {
+        read()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(read)
+    }
+}
+
 fn neural_authoritative_on_ball_only_enabled() -> bool {
     std::env::var("SOCCER_NEURAL_AUTHORITATIVE_ON_BALL_ONLY")
         .ok()
@@ -4999,6 +5021,51 @@ mod tests {
     }
 
     #[test]
+    fn neural_mcts_force_floor_can_sample_cold_discretized_kick_bucket() {
+        let _env_lock = soccer_world_env_lock();
+        let _gate = set_test_env_var("DD_SOCCER_ENABLE_DISCRETIZED_KICK", "1");
+        let _floor = set_test_env_var("SOCCER_NEURAL_MCTS_MIN_DISCRETIZED_KICK_CANDIDATES", "1");
+        let _force = set_test_env_var("SOCCER_NEURAL_MCTS_DISCRETIZED_KICK_FORCE_FLOOR", "1");
+        let _strict_regression = set_test_env_var(
+            "SOCCER_NEURAL_MCTS_DISCRETIZED_KICK_SELECTION_MAX_SCORE_REGRESSION",
+            "0.01",
+        );
+        let _exploration_regression = set_test_env_var(
+            "SOCCER_NEURAL_MCTS_DISCRETIZED_KICK_EXPLORATION_MAX_SCORE_REGRESSION",
+            "0.01",
+        );
+        let _min_prior = set_test_env_var(
+            "SOCCER_NEURAL_MCTS_DISCRETIZED_KICK_EXPLORATION_MIN_PRIOR",
+            "0.99",
+        );
+        let node = |label: &str, raw_score: f64, prior: f64, visits: u32| SoccerNeuralMctsNode {
+            label: label.to_string(),
+            plan: None,
+            raw_score,
+            value_estimate: raw_score,
+            prior,
+            q_visits: 1,
+            search_visits: visits,
+            total_value: raw_score * f64::from(visits.max(1)),
+        };
+        let mut nodes = vec![
+            node("shoot", 1.0, 0.6, 4),
+            node("pass", 0.9, 0.3, 3),
+            node("dribble", 0.8, 0.2, 2),
+            node("pass1-kp7", -9.0, 0.0, 0),
+        ];
+
+        SoccerMatch::ensure_sampleable_discretized_kick_nodes(&mut nodes, 3);
+
+        let sampleable = nodes[..3]
+            .iter()
+            .map(|node| node.label.as_str())
+            .collect::<Vec<_>>();
+        assert!(sampleable.contains(&"pass1-kp7"));
+        assert!(!sampleable.contains(&"dribble"));
+    }
+
+    #[test]
     fn neural_mcts_discretized_kick_selection_floor_can_sample_bucket() {
         let _env_lock = soccer_world_env_lock();
         let _gate = set_test_env_var("DD_SOCCER_ENABLE_DISCRETIZED_KICK", "1");
@@ -9401,6 +9468,9 @@ impl SoccerMatch {
     ) -> bool {
         if learned_discretized_kick_speed_bucket_for_action_label(label).is_none() {
             return false;
+        }
+        if neural_mcts_discretized_kick_force_floor() {
+            return true;
         }
         if !raw_score.is_finite()
             || !best_score.is_finite()
