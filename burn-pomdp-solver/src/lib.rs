@@ -17,6 +17,7 @@ use burn::module::Module;
 use burn::nn::attention::{MhaInput, MultiHeadAttention, MultiHeadAttentionConfig};
 use burn::nn::gru::{Gru, GruConfig};
 use burn::nn::{Linear, LinearConfig};
+use burn::record::{BinFileRecorder, FullPrecisionSettings};
 use burn::tensor::{backend::Backend, activation::softmax, Tensor};
 
 #[derive(Config, Debug)]
