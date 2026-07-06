@@ -3497,6 +3497,25 @@ fn should_merge_batch_policy_delta(
     selected_episode == Some(completed_episode)
 }
 
+fn should_carry_no_publishable_neural_snapshot(
+    carry_unvalidated: bool,
+    carry_no_publishable: bool,
+    selected_episode: Option<usize>,
+    carried_unvalidated_episode: Option<usize>,
+) -> bool {
+    carry_unvalidated
+        && carry_no_publishable
+        && selected_episode.is_none()
+        && carried_unvalidated_episode.is_none()
+}
+
+fn batch_policy_delta_frontier_episode(
+    selected_episode: Option<usize>,
+    carried_unvalidated_episode: Option<usize>,
+) -> Option<usize> {
+    selected_episode.or(carried_unvalidated_episode)
+}
+
 #[derive(Clone, Debug)]
 struct EvolutionSearchSample {
     summary: MatchSummary,
@@ -6487,6 +6506,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         env_bool("SOCCER_NEURAL_BATCH_POLICY_MERGE_SELECTED_ONLY", false)?;
     let neural_batch_snapshot_carry_unvalidated =
         env_bool("SOCCER_NEURAL_BATCH_SNAPSHOT_CARRY_UNVALIDATED", false)?;
+    let neural_batch_snapshot_carry_no_publishable = env_bool(
+        "SOCCER_NEURAL_BATCH_SNAPSHOT_CARRY_NO_PUBLISHABLE",
+        neural_batch_snapshot_carry_unvalidated,
+    )?;
     let neural_drain_timeout_ms = env_usize(
         "SOCCER_NEURAL_DRAIN_TIMEOUT_MS",
         DEFAULT_SOCCER_NEURAL_DRAIN_TIMEOUT_MS,
@@ -7258,7 +7281,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         tactical_learning.defense_compactness_score_weight,
     );
     println!(
-        "neural_learning enabled={} backend={} learning_rate={:.5} optimizer_momentum={:.3} batch_size={} train_every_ticks={} max_batches_per_tick={} hidden_units={} target_scale={:.3} max_pending_batches={} replay_capacity={} replay_samples_per_tick={} target_clip={:.3} target_popart={} snapshot_every_batches={} batch_snapshot_selection={} batch_snapshot_max_fitness_regression={:.3} batch_snapshot_min_fitness={:.3} batch_snapshot_min_batch_mean_fitness={:.3} batch_snapshot_rescue_min_fitness={:.3} batch_policy_merge_selected_only={} batch_snapshot_carry_unvalidated={}",
+        "neural_learning enabled={} backend={} learning_rate={:.5} optimizer_momentum={:.3} batch_size={} train_every_ticks={} max_batches_per_tick={} hidden_units={} target_scale={:.3} max_pending_batches={} replay_capacity={} replay_samples_per_tick={} target_clip={:.3} target_popart={} snapshot_every_batches={} batch_snapshot_selection={} batch_snapshot_max_fitness_regression={:.3} batch_snapshot_min_fitness={:.3} batch_snapshot_min_batch_mean_fitness={:.3} batch_snapshot_rescue_min_fitness={:.3} batch_policy_merge_selected_only={} batch_snapshot_carry_unvalidated={} batch_snapshot_carry_no_publishable={}",
         neural_learning.enabled,
         neural_backend_label(neural_learning.backend),
         neural_learning.learning_rate,
@@ -7281,6 +7304,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         neural_batch_snapshot_rescue_min_fitness,
         neural_batch_policy_merge_selected_only,
         neural_batch_snapshot_carry_unvalidated,
+        neural_batch_snapshot_carry_no_publishable,
     );
     println!(
         "neural_batch_snapshot_validation games={} eval_minutes={:.2} min_fitness={:.4} min_goal_margin={:.4}",
@@ -7709,10 +7733,12 @@ fn run() -> Result<(), Box<dyn Error>> {
                 neural_batch_snapshot_rescue_min_fitness,
             );
         }
-        if neural_batch_snapshot_carry_unvalidated
-            && selected_neural_snapshot_episode.is_none()
-            && carried_unvalidated_neural_snapshot_episode.is_none()
-        {
+        if should_carry_no_publishable_neural_snapshot(
+            neural_batch_snapshot_carry_unvalidated,
+            neural_batch_snapshot_carry_no_publishable,
+            selected_neural_snapshot_episode,
+            carried_unvalidated_neural_snapshot_episode,
+        ) {
             if let Some(carry_selection) = select_batch_neural_snapshot_for_training_carry(
                 &mut completed_games,
                 analytic_neural_opponent,
@@ -7762,12 +7788,16 @@ fn run() -> Result<(), Box<dyn Error>> {
                     .unwrap_or_else(|| "none".to_string()),
             );
         }
+        let policy_delta_frontier_episode = batch_policy_delta_frontier_episode(
+            selected_neural_snapshot_episode,
+            carried_unvalidated_neural_snapshot_episode,
+        );
         for game in completed_games.iter_mut() {
             let completed_learning_game = soccer_learning_completed_game_from_completed(game);
             let completed_episode_for_policy_merge = game.episode_summary.episode + 1;
             let should_merge_policy_delta = should_merge_batch_policy_delta(
                 neural_batch_policy_merge_selected_only,
-                selected_neural_snapshot_episode,
+                policy_delta_frontier_episode,
                 completed_episode_for_policy_merge,
             );
             if merge_deltas {
@@ -9992,6 +10022,44 @@ mod tests {
         assert!(!should_merge_batch_policy_delta(true, None, 7));
         assert!(should_merge_batch_policy_delta(true, Some(7), 7));
         assert!(!should_merge_batch_policy_delta(true, Some(8), 7));
+    }
+
+    #[test]
+    fn no_publishable_neural_snapshot_carry_has_separate_gate() {
+        assert!(should_carry_no_publishable_neural_snapshot(
+            true, true, None, None
+        ));
+        assert!(!should_carry_no_publishable_neural_snapshot(
+            true, false, None, None
+        ));
+        assert!(!should_carry_no_publishable_neural_snapshot(
+            false, true, None, None
+        ));
+        assert!(!should_carry_no_publishable_neural_snapshot(
+            true,
+            true,
+            Some(7),
+            None
+        ));
+        assert!(!should_carry_no_publishable_neural_snapshot(
+            true,
+            true,
+            None,
+            Some(7)
+        ));
+    }
+
+    #[test]
+    fn carried_frontier_episode_drives_selected_only_policy_delta_merge() {
+        assert_eq!(batch_policy_delta_frontier_episode(Some(7), None), Some(7));
+        assert_eq!(batch_policy_delta_frontier_episode(None, Some(7)), Some(7));
+        assert_eq!(
+            batch_policy_delta_frontier_episode(Some(7), Some(8)),
+            Some(7)
+        );
+        let frontier = batch_policy_delta_frontier_episode(None, Some(7));
+        assert!(should_merge_batch_policy_delta(true, frontier, 7));
+        assert!(!should_merge_batch_policy_delta(true, frontier, 8));
     }
 
     #[test]
