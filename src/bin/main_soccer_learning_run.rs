@@ -111,6 +111,8 @@ const DEFAULT_SOCCER_NEURAL_BATCH_SNAPSHOT_MAX_FITNESS_REGRESSION: f64 = 0.75;
 const DEFAULT_SOCCER_NEURAL_BATCH_SNAPSHOT_MIN_FITNESS: f64 = SOCCER_LEARNING_OBJECTIVE_FITNESS_MIN;
 const DEFAULT_SOCCER_NEURAL_BATCH_SNAPSHOT_MIN_BATCH_MEAN_FITNESS: f64 =
     SOCCER_LEARNING_OBJECTIVE_FITNESS_MIN;
+const DEFAULT_SOCCER_NEURAL_BATCH_SNAPSHOT_RESCUE_MIN_FITNESS: f64 =
+    SOCCER_LEARNING_OBJECTIVE_FITNESS_MAX + 1.0;
 
 fn env_value(name: &str) -> Option<String> {
     std::env::var(name)
@@ -302,6 +304,13 @@ fn env_batch_neural_snapshot_min_batch_mean_fitness() -> Result<f64, Box<dyn Err
     env_f64(
         "SOCCER_NEURAL_BATCH_SNAPSHOT_MIN_BATCH_MEAN_FITNESS",
         DEFAULT_SOCCER_NEURAL_BATCH_SNAPSHOT_MIN_BATCH_MEAN_FITNESS,
+    )
+}
+
+fn env_batch_neural_snapshot_rescue_min_fitness() -> Result<f64, Box<dyn Error>> {
+    env_f64(
+        "SOCCER_NEURAL_BATCH_SNAPSHOT_RESCUE_MIN_FITNESS",
+        DEFAULT_SOCCER_NEURAL_BATCH_SNAPSHOT_RESCUE_MIN_FITNESS,
     )
 }
 
@@ -944,7 +953,8 @@ struct NeuralPopulationCandidateEval {
 }
 
 fn neural_population_candidate_goal_margin(eval: &NeuralPopulationCandidateEval) -> f64 {
-    f64::from(eval.goals_for) - f64::from(eval.goals_against)
+    let games = (eval.wins + eval.draws + eval.losses).max(1) as f64;
+    (f64::from(eval.goals_for) - f64::from(eval.goals_against)) / games
 }
 
 fn push_unique_neural_parent(
@@ -3036,6 +3046,7 @@ fn select_batch_neural_snapshot(
     max_fitness_regression: f64,
     min_fitness: f64,
     min_batch_mean_fitness: f64,
+    rescue_min_fitness: f64,
 ) -> Option<BatchNeuralSnapshotSelection> {
     let snapshot_count = completed_games
         .iter()
@@ -3055,23 +3066,21 @@ fn select_batch_neural_snapshot(
         })
         .sum();
     let batch_mean_fitness = batch_fitness_sum / snapshot_count as f64;
-    if batch_mean_fitness + 1e-12 < min_batch_mean_fitness {
+    let batch_best_fitness = completed_games
+        .iter()
+        .filter(|game| game.neural_network.is_some())
+        .map(|game| {
+            soccer_learning_objective_match_fitness(
+                &game.episode_summary.summary,
+                analytic_neural_opponent,
+            )
+        })
+        .fold(f64::NEG_INFINITY, f64::max);
+    if batch_mean_fitness + 1e-12 < min_batch_mean_fitness
+        && batch_best_fitness + 1e-12 < rescue_min_fitness
+    {
         return None;
     }
-    let batch_best_fitness = if mode == BatchNeuralSnapshotSelectionMode::TrainingStepsGuarded {
-        completed_games
-            .iter()
-            .filter(|game| game.neural_network.is_some())
-            .map(|game| {
-                soccer_learning_objective_match_fitness(
-                    &game.episode_summary.summary,
-                    analytic_neural_opponent,
-                )
-            })
-            .fold(f64::NEG_INFINITY, f64::max)
-    } else {
-        f64::NEG_INFINITY
-    };
     let fitness_floor = batch_best_fitness
         - max_fitness_regression
             .max(0.0)
@@ -3124,6 +3133,17 @@ fn select_batch_neural_snapshot(
         snapshot,
         world_model,
     })
+}
+
+fn should_merge_batch_policy_delta(
+    selected_only: bool,
+    selected_episode: Option<usize>,
+    completed_episode: usize,
+) -> bool {
+    if !selected_only {
+        return true;
+    }
+    selected_episode == Some(completed_episode)
 }
 
 #[derive(Clone, Debug)]
@@ -6109,6 +6129,12 @@ fn run() -> Result<(), Box<dyn Error>> {
     let neural_batch_snapshot_min_fitness = env_batch_neural_snapshot_min_fitness()?;
     let neural_batch_snapshot_min_batch_mean_fitness =
         env_batch_neural_snapshot_min_batch_mean_fitness()?;
+    let neural_batch_snapshot_rescue_min_fitness =
+        env_batch_neural_snapshot_rescue_min_fitness()?;
+    let neural_batch_policy_merge_selected_only = env_bool(
+        "SOCCER_NEURAL_BATCH_POLICY_MERGE_SELECTED_ONLY",
+        false,
+    )?;
     let neural_drain_timeout_ms = env_usize(
         "SOCCER_NEURAL_DRAIN_TIMEOUT_MS",
         DEFAULT_SOCCER_NEURAL_DRAIN_TIMEOUT_MS,
@@ -6847,7 +6873,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         tactical_learning.defense_compactness_score_weight,
     );
     println!(
-        "neural_learning enabled={} backend={} learning_rate={:.5} optimizer_momentum={:.3} batch_size={} train_every_ticks={} max_batches_per_tick={} hidden_units={} target_scale={:.3} max_pending_batches={} replay_capacity={} replay_samples_per_tick={} target_clip={:.3} target_popart={} snapshot_every_batches={} batch_snapshot_selection={} batch_snapshot_max_fitness_regression={:.3} batch_snapshot_min_fitness={:.3} batch_snapshot_min_batch_mean_fitness={:.3}",
+        "neural_learning enabled={} backend={} learning_rate={:.5} optimizer_momentum={:.3} batch_size={} train_every_ticks={} max_batches_per_tick={} hidden_units={} target_scale={:.3} max_pending_batches={} replay_capacity={} replay_samples_per_tick={} target_clip={:.3} target_popart={} snapshot_every_batches={} batch_snapshot_selection={} batch_snapshot_max_fitness_regression={:.3} batch_snapshot_min_fitness={:.3} batch_snapshot_min_batch_mean_fitness={:.3} batch_snapshot_rescue_min_fitness={:.3} batch_policy_merge_selected_only={}",
         neural_learning.enabled,
         neural_backend_label(neural_learning.backend),
         neural_learning.learning_rate,
@@ -6867,6 +6893,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         neural_batch_snapshot_max_fitness_regression,
         neural_batch_snapshot_min_fitness,
         neural_batch_snapshot_min_batch_mean_fitness,
+        neural_batch_snapshot_rescue_min_fitness,
+        neural_batch_policy_merge_selected_only,
     );
     println!(
         "adversarial_embedding enabled={} memory_limit={} preloaded_windows={}",
@@ -7133,6 +7161,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 .sum::<f64>()
                 / neural_batch_snapshot_count as f64
         };
+        let mut selected_neural_snapshot_episode = None::<usize>;
         if let Some(selection) = select_batch_neural_snapshot(
             &mut completed_games,
             neural_batch_snapshot_selection_mode,
@@ -7140,6 +7169,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             neural_batch_snapshot_max_fitness_regression,
             neural_batch_snapshot_min_fitness,
             neural_batch_snapshot_min_batch_mean_fitness,
+            neural_batch_snapshot_rescue_min_fitness,
         ) {
             let BatchNeuralSnapshotSelection {
                 episode: selected_episode,
@@ -7149,6 +7179,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 snapshot: selected_snapshot,
                 world_model: selected_world_model,
             } = selection;
+            selected_neural_snapshot_episode = Some(selected_episode);
             let selected_world_model_steps =
                 install_carried_world_model_snapshot(selected_world_model);
             latest_neural_network = Some(selected_snapshot);
@@ -7167,7 +7198,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
         } else if neural_batch_snapshot_count > 0 {
             println!(
-                "neural_batch_snapshot_held episodes={}..{} snapshots={} selection_mode={} mean_match_fitness={:.4} best_match_fitness={:.4} min_snapshot_fitness={:.4} min_batch_mean_fitness={:.4}",
+                "neural_batch_snapshot_held episodes={}..{} snapshots={} selection_mode={} mean_match_fitness={:.4} best_match_fitness={:.4} min_snapshot_fitness={:.4} min_batch_mean_fitness={:.4} rescue_min_fitness={:.4}",
                 batch_start_episode + 1,
                 batch_start_episode + batch_size,
                 neural_batch_snapshot_count,
@@ -7176,17 +7207,36 @@ fn run() -> Result<(), Box<dyn Error>> {
                 neural_batch_best_snapshot_fitness,
                 neural_batch_snapshot_min_fitness,
                 neural_batch_snapshot_min_batch_mean_fitness,
+                neural_batch_snapshot_rescue_min_fitness,
+            );
+        }
+        if neural_batch_policy_merge_selected_only {
+            println!(
+                "neural_batch_policy_merge_selected_only episodes={}..{} selected_episode={}",
+                batch_start_episode + 1,
+                batch_start_episode + batch_size,
+                selected_neural_snapshot_episode
+                    .map(|episode| episode.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
             );
         }
         for game in completed_games.iter_mut() {
             let completed_learning_game = soccer_learning_completed_game_from_completed(game);
+            let completed_episode_for_policy_merge = game.episode_summary.episode + 1;
+            let should_merge_policy_delta = should_merge_batch_policy_delta(
+                neural_batch_policy_merge_selected_only,
+                selected_neural_snapshot_episode,
+                completed_episode_for_policy_merge,
+            );
             if merge_deltas {
-                merge_team_policy_delta(
-                    &mut policies,
-                    game.starting_policies.as_ref(),
-                    &game.policies,
-                );
-            } else {
+                if should_merge_policy_delta {
+                    merge_team_policy_delta(
+                        &mut policies,
+                        game.starting_policies.as_ref(),
+                        &game.policies,
+                    );
+                }
+            } else if should_merge_policy_delta {
                 policies = game.policies.clone();
             }
             push_policy_promotion_summary(
@@ -8378,6 +8428,45 @@ fn run() -> Result<(), Box<dyn Error>> {
                                 checkpoint_promotion_evaluation.best_match_fitness,
                                 checkpoint_promotion_evaluation.mean_play_quality,
                             );
+                        } else if restored {
+                            let restored_checkpoint_artifact = self_play_artifact_from_policies(
+                                config.clone(),
+                                options.clone(),
+                                tactical_summary.clone(),
+                                episode_summaries.clone(),
+                                &policies,
+                            );
+                            let restored_checkpoint_export = compact_training_artifact_for_export(
+                                &restored_checkpoint_artifact,
+                                artifact_max_entries_per_policy,
+                            );
+                            write_json(&checkpoint_write_path, &restored_checkpoint_export)?;
+                            if write_learned_params_artifact {
+                                let restored_checkpoint_params =
+                                    SoccerSelfPlayLearnedParams::from_training_artifact_with_neural_network(
+                                        &restored_checkpoint_artifact,
+                                        latest_neural_network.clone(),
+                                    );
+                                write_json(
+                                    &checkpoint_learned_params_path,
+                                    &restored_checkpoint_params,
+                                )?;
+                            }
+                            if let Some(sidecar_path) = write_neural_sidecar_for_policy_artifact(
+                                &checkpoint_write_path,
+                                latest_neural_network.as_ref(),
+                            )? {
+                                println!(
+                                    "checkpoint_local_best_restored_candidate_neural_sidecar games_completed={} artifact={}",
+                                    episode_summaries.len(),
+                                    sidecar_path.display()
+                                );
+                            }
+                            println!(
+                                "checkpoint_local_best_restored_candidate_rewritten games_completed={} artifact={}",
+                                episode_summaries.len(),
+                                checkpoint_write_path.display()
+                            );
                         }
                     }
                 }
@@ -8901,6 +8990,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn neural_population_goal_margin_gate_uses_mean_margin_per_eval_game() {
+        let eval = NeuralPopulationCandidateEval {
+            index: 2,
+            source: "mutation:wide".to_string(),
+            fitness: -0.15,
+            wins: 5,
+            draws: 2,
+            losses: 5,
+            goals_for: 9,
+            goals_against: 15,
+            snapshot: neural_population_full_snapshot(2.0),
+        };
+        let config = NeuralPopulationSearchConfig {
+            min_accepted_goal_margin: -1.0,
+            ..neural_population_test_config()
+        };
+
+        assert_eq!(neural_population_candidate_goal_margin(&eval), -0.5);
+        assert!(
+            neural_population_candidate_goal_margin(&eval) >= config.min_accepted_goal_margin,
+            "population search should compare goal margin per eval game, not total margin"
+        );
+    }
+
     fn promotion_eval(
         mean_match_fitness: f64,
         mean_play_quality: f64,
@@ -9151,6 +9265,7 @@ mod tests {
             0.75,
             0.0,
             SOCCER_LEARNING_OBJECTIVE_FITNESS_MIN,
+            DEFAULT_SOCCER_NEURAL_BATCH_SNAPSHOT_RESCUE_MIN_FITNESS,
         )
         .expect("guarded selector should keep an eligible snapshot");
 
@@ -9178,6 +9293,7 @@ mod tests {
             0.75,
             SOCCER_LEARNING_OBJECTIVE_FITNESS_MIN,
             SOCCER_LEARNING_OBJECTIVE_FITNESS_MIN,
+            DEFAULT_SOCCER_NEURAL_BATCH_SNAPSHOT_RESCUE_MIN_FITNESS,
         )
         .expect("unguarded selector should pick a snapshot");
 
@@ -9200,6 +9316,7 @@ mod tests {
             0.0,
             0.0,
             SOCCER_LEARNING_OBJECTIVE_FITNESS_MIN,
+            DEFAULT_SOCCER_NEURAL_BATCH_SNAPSHOT_RESCUE_MIN_FITNESS,
         );
 
         assert!(
@@ -9234,12 +9351,59 @@ mod tests {
             0.0,
             0.0,
             0.0,
+            DEFAULT_SOCCER_NEURAL_BATCH_SNAPSHOT_RESCUE_MIN_FITNESS,
         );
 
         assert!(
             selection.is_none(),
             "negative batches must not install a lucky positive outlier snapshot"
         );
+    }
+
+    #[test]
+    fn batch_neural_snapshot_selection_rescues_strong_snapshot_from_noisy_batch() {
+        let mut games = vec![
+            completed_game_with_score_and_neural_steps(0, 3, 0, 100),
+            completed_game_with_score_and_neural_steps(1, 0, 4, 500),
+            completed_game_with_score_and_neural_steps(2, 0, 4, 900),
+        ];
+        let mean = games
+            .iter()
+            .map(|game| {
+                soccer_learning_objective_match_fitness(&game.episode_summary.summary, true)
+            })
+            .sum::<f64>()
+            / games.len() as f64;
+        assert!(
+            mean < 0.0,
+            "test setup should model a noisy negative batch with one breakthrough"
+        );
+
+        let selection = select_batch_neural_snapshot(
+            &mut games,
+            BatchNeuralSnapshotSelectionMode::Fitness,
+            true,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        )
+        .expect("strong breakthrough snapshot should bypass the noisy-batch mean gate");
+
+        assert_eq!(selection.episode, 1);
+        assert!(
+            selection.match_fitness >= 1.0,
+            "rescued snapshot must be clearly above the noise floor, got {}",
+            selection.match_fitness
+        );
+    }
+
+    #[test]
+    fn selected_only_policy_merge_skips_all_deltas_without_selected_snapshot() {
+        assert!(should_merge_batch_policy_delta(false, None, 7));
+        assert!(!should_merge_batch_policy_delta(true, None, 7));
+        assert!(should_merge_batch_policy_delta(true, Some(7), 7));
+        assert!(!should_merge_batch_policy_delta(true, Some(8), 7));
     }
 
     #[test]
