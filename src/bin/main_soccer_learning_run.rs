@@ -17,24 +17,25 @@ use soccer_engine::des::general::soccer::{
     LongPassRunHead, LooseBallCommitHead, MatchConfig, MatchSummary, OnsideSupportHead,
     PassLaneYieldHead, ReceiveApproachHead, RunPredictionHead, SeparationFloorHead,
     ShotTriggerHead, SlipBreakHead, SoccerAuxiliaryHeadSnapshot, SoccerConfigMomentInsert,
-    SoccerMarlAlgorithm, SoccerMatch, SoccerMomentWindow, SoccerNeuralBlendMode,
-    SoccerNeuralLayerSnapshot, SoccerNeuralLearningBackend, SoccerNeuralLearningConfig,
-    SoccerNeuralNetworkSnapshot, SoccerPassCompletionHead, SoccerPassLearningMetrics,
-    SoccerPassOutcomeSample, SoccerPolicyHeadSnapshot, SoccerPolicyRoleHeadSnapshot,
-    SoccerPolicySpecialistHeadSnapshot, SoccerQEntry, SoccerQPolicy, SoccerQPolicyOptions,
-    SoccerQTargetEntry, SoccerSelfPlayEpisodeSummary, SoccerSelfPlayLearnedParams,
-    SoccerSelfPlayTrainingArtifact, SoccerTacticalLearningSummary, SoccerTacticalLearningWeights,
-    SoccerTeamPolicyArtifact, SoccerTeamQPolicies, SoccerWorldModel, SupportScorerHead, Team,
-    WingerPinchHead, ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS, CRASH_BOX_HEAD_MIN_TRAINING_STEPS,
-    DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE, DEFAULT_SOCCER_PASS_COMPLETION_LEARNING_RATE,
-    GIVE_AND_GO_HEAD_MIN_TRAINING_STEPS, GOAL_SIDE_RECOVERY_HEAD_MIN_TRAINING_STEPS,
-    HEAD_SCAN_HEAD_MIN_TRAINING_STEPS, LANE_AFFINITY_HEAD_MIN_TRAINING_STEPS,
-    LONG_PASS_RUN_HEAD_MIN_TRAINING_STEPS, LOOSE_BALL_COMMIT_HEAD_MIN_TRAINING_STEPS,
-    ONSIDE_SUPPORT_HEAD_MIN_TRAINING_STEPS, PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS,
-    PASS_LANE_YIELD_HEAD_MIN_TRAINING_STEPS, RECEIVE_APPROACH_HEAD_MIN_TRAINING_STEPS,
-    RUN_PREDICTION_HEAD_MIN_TRAINING_STEPS, SEPARATION_FLOOR_HEAD_MIN_TRAINING_STEPS,
-    SHOT_TRIGGER_HEAD_MIN_TRAINING_STEPS, SLIP_BREAK_HEAD_MIN_TRAINING_STEPS,
-    SUPPORT_SCORER_HEAD_MIN_TRAINING_STEPS, WINGER_PINCH_HEAD_MIN_TRAINING_STEPS,
+    SoccerLearningTransition, SoccerMarlAlgorithm, SoccerMatch, SoccerMomentWindow,
+    SoccerNeuralBlendMode, SoccerNeuralLayerSnapshot, SoccerNeuralLearningBackend,
+    SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot, SoccerPassCompletionHead,
+    SoccerPassLearningMetrics, SoccerPassOutcomeSample, SoccerPolicyHeadSnapshot,
+    SoccerPolicyRoleHeadSnapshot, SoccerPolicySpecialistHeadSnapshot, SoccerQEntry, SoccerQPolicy,
+    SoccerQPolicyOptions, SoccerQTargetEntry, SoccerSelfPlayEpisodeSummary,
+    SoccerSelfPlayLearnedParams, SoccerSelfPlayTrainingArtifact, SoccerTacticalLearningSummary,
+    SoccerTacticalLearningWeights, SoccerTeamPolicyArtifact, SoccerTeamQPolicies, SoccerWorldModel,
+    SupportScorerHead, Team, WingerPinchHead, ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS,
+    CRASH_BOX_HEAD_MIN_TRAINING_STEPS, DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
+    DEFAULT_SOCCER_PASS_COMPLETION_LEARNING_RATE, GIVE_AND_GO_HEAD_MIN_TRAINING_STEPS,
+    GOAL_SIDE_RECOVERY_HEAD_MIN_TRAINING_STEPS, HEAD_SCAN_HEAD_MIN_TRAINING_STEPS,
+    LANE_AFFINITY_HEAD_MIN_TRAINING_STEPS, LONG_PASS_RUN_HEAD_MIN_TRAINING_STEPS,
+    LOOSE_BALL_COMMIT_HEAD_MIN_TRAINING_STEPS, ONSIDE_SUPPORT_HEAD_MIN_TRAINING_STEPS,
+    PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS, PASS_LANE_YIELD_HEAD_MIN_TRAINING_STEPS,
+    RECEIVE_APPROACH_HEAD_MIN_TRAINING_STEPS, RUN_PREDICTION_HEAD_MIN_TRAINING_STEPS,
+    SEPARATION_FLOOR_HEAD_MIN_TRAINING_STEPS, SHOT_TRIGGER_HEAD_MIN_TRAINING_STEPS,
+    SLIP_BREAK_HEAD_MIN_TRAINING_STEPS, SUPPORT_SCORER_HEAD_MIN_TRAINING_STEPS,
+    WINGER_PINCH_HEAD_MIN_TRAINING_STEPS,
 };
 use soccer_engine::des::general::soccer_eval_gate::{
     evaluate_promotion, PromotionThresholds, PromotionVerdict,
@@ -2982,6 +2983,260 @@ fn action_summary(entries: &[SoccerQEntry]) -> Vec<(String, u64, f64)> {
     summary
 }
 
+#[derive(Clone, Debug, Default)]
+struct LearningActionOutcomeStats {
+    count: usize,
+    reward_sum: f64,
+    positive_rewards: usize,
+    negative_rewards: usize,
+    neural_mcts: usize,
+    replanned: usize,
+    discretized_kick: usize,
+    mpc_feasibility_sum: f64,
+    chosen_probability_sum: f64,
+    score_margin_sum: f64,
+    target_forward_yards_sum: f64,
+    realized_forward_yards_sum: f64,
+}
+
+impl LearningActionOutcomeStats {
+    fn record(&mut self, transition: &SoccerLearningTransition) {
+        self.count = self.count.saturating_add(1);
+        self.reward_sum += finite_log_metric(transition.reward);
+        if transition.reward > 1e-9 {
+            self.positive_rewards = self.positive_rewards.saturating_add(1);
+        } else if transition.reward < -1e-9 {
+            self.negative_rewards = self.negative_rewards.saturating_add(1);
+        }
+        if transition.decision_context.neural_mcts_selected {
+            self.neural_mcts = self.neural_mcts.saturating_add(1);
+        }
+        if transition.decision_context.learned_mpc_replanned {
+            self.replanned = self.replanned.saturating_add(1);
+        }
+        if learning_action_label_for_log(&transition.action).contains("-kp") {
+            self.discretized_kick = self.discretized_kick.saturating_add(1);
+        }
+        self.mpc_feasibility_sum +=
+            finite_log_metric(transition.decision_context.chosen_action_mpc_feasibility);
+        self.chosen_probability_sum +=
+            finite_log_metric(transition.decision_context.chosen_action_probability);
+        self.score_margin_sum += finite_log_metric(transition.decision_context.action_score_margin);
+        self.target_forward_yards_sum +=
+            finite_log_metric(transition.decision_context.target_forward_yards);
+        self.realized_forward_yards_sum +=
+            finite_log_metric(transition.decision_context.realized_ball_forward_yards).max(
+                finite_log_metric(transition.decision_context.realized_player_forward_yards),
+            );
+    }
+
+    fn mean_reward(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.reward_sum / self.count as f64
+        }
+    }
+
+    fn mean_mpc_feasibility(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.mpc_feasibility_sum / self.count as f64
+        }
+    }
+
+    fn mean_chosen_probability(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.chosen_probability_sum / self.count as f64
+        }
+    }
+
+    fn mean_score_margin(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.score_margin_sum / self.count as f64
+        }
+    }
+
+    fn mean_target_forward_yards(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.target_forward_yards_sum / self.count as f64
+        }
+    }
+
+    fn mean_realized_forward_yards(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.realized_forward_yards_sum / self.count as f64
+        }
+    }
+}
+
+fn finite_log_metric(value: f64) -> f64 {
+    if value.is_finite() {
+        value
+    } else {
+        0.0
+    }
+}
+
+fn learning_action_label_for_log(action: &str) -> String {
+    let mut label = action.trim().to_ascii_lowercase();
+    if label.is_empty() {
+        label.push_str("unknown");
+    }
+    label
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn team_label_for_log(team: Team) -> &'static str {
+    match team {
+        Team::Home => "home",
+        Team::Away => "away",
+    }
+}
+
+fn learning_action_outcome_top(buckets: &BTreeMap<String, LearningActionOutcomeStats>) -> String {
+    let mut ranked = buckets.iter().collect::<Vec<_>>();
+    ranked.sort_by(|(left_action, left), (right_action, right)| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| {
+                right
+                    .reward_sum
+                    .partial_cmp(&left.reward_sum)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| left_action.cmp(right_action))
+    });
+    let entries = ranked
+        .into_iter()
+        .take(10)
+        .map(|(action, stats)| {
+            format!(
+                "{}:n={},rmean={:.4},rsum={:.2},pos={},neg={},mcts={},replan={},dk={},mpc={:.3},prob={:.3},margin={:.3},tfwd={:.2},rfwd={:.2}",
+                action,
+                stats.count,
+                stats.mean_reward(),
+                stats.reward_sum,
+                stats.positive_rewards,
+                stats.negative_rewards,
+                stats.neural_mcts,
+                stats.replanned,
+                stats.discretized_kick,
+                stats.mean_mpc_feasibility(),
+                stats.mean_chosen_probability(),
+                stats.mean_score_margin(),
+                stats.mean_target_forward_yards(),
+                stats.mean_realized_forward_yards()
+            )
+        })
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        "none".to_string()
+    } else {
+        entries.join(";")
+    }
+}
+
+fn learning_action_outcome_entry(action: &str, stats: &LearningActionOutcomeStats) -> String {
+    format!(
+        "{}:n={},rmean={:.4},rsum={:.2},pos={},neg={},mcts={},replan={},dk={},mpc={:.3},prob={:.3},margin={:.3},tfwd={:.2},rfwd={:.2}",
+        action,
+        stats.count,
+        stats.mean_reward(),
+        stats.reward_sum,
+        stats.positive_rewards,
+        stats.negative_rewards,
+        stats.neural_mcts,
+        stats.replanned,
+        stats.discretized_kick,
+        stats.mean_mpc_feasibility(),
+        stats.mean_chosen_probability(),
+        stats.mean_score_margin(),
+        stats.mean_target_forward_yards(),
+        stats.mean_realized_forward_yards()
+    )
+}
+
+fn learning_action_outcome_key(buckets: &BTreeMap<String, LearningActionOutcomeStats>) -> String {
+    const KEY_ACTIONS: [&str; 12] = [
+        "pass",
+        "aerial-pass",
+        "shoot",
+        "first-time-shot",
+        "dribble",
+        "runaround-dribble",
+        "nutmeg",
+        "vertical-attack",
+        "overlap-run",
+        "exploit-space-run",
+        "hold",
+        "recover",
+    ];
+    KEY_ACTIONS
+        .iter()
+        .map(|action| {
+            let empty = LearningActionOutcomeStats::default();
+            learning_action_outcome_entry(action, buckets.get(*action).unwrap_or(&empty))
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+fn log_learning_action_outcomes(episode: usize, transitions: &[SoccerLearningTransition]) {
+    for team in [Team::Home, Team::Away] {
+        let mut total = LearningActionOutcomeStats::default();
+        let mut buckets: BTreeMap<String, LearningActionOutcomeStats> = BTreeMap::new();
+        for transition in transitions
+            .iter()
+            .filter(|transition| transition.team == team)
+        {
+            total.record(transition);
+            buckets
+                .entry(learning_action_label_for_log(&transition.action))
+                .or_default()
+                .record(transition);
+        }
+        eprintln!(
+            "learning_action_outcomes episode={} team={} transitions={} reward_sum={:.4} reward_mean={:.4} positive={} negative={} neural_mcts={} replanned={} discretized_kick={} mpc_mean={:.4} prob_mean={:.4} margin_mean={:.4} target_forward_mean={:.4} realized_forward_mean={:.4} key={} top={}",
+            episode + 1,
+            team_label_for_log(team),
+            total.count,
+            total.reward_sum,
+            total.mean_reward(),
+            total.positive_rewards,
+            total.negative_rewards,
+            total.neural_mcts,
+            total.replanned,
+            total.discretized_kick,
+            total.mean_mpc_feasibility(),
+            total.mean_chosen_probability(),
+            total.mean_score_margin(),
+            total.mean_target_forward_yards(),
+            total.mean_realized_forward_yards(),
+            learning_action_outcome_key(&buckets),
+            learning_action_outcome_top(&buckets)
+        );
+    }
+}
+
 #[derive(Debug)]
 struct CompletedGame {
     episode_summary: SoccerSelfPlayEpisodeSummary,
@@ -5130,6 +5385,7 @@ fn run_game(
             sim.stats.learning_deferred_reward_backlog
         );
     }
+    log_learning_action_outcomes(episode, sim.episode_learning_transitions());
     let mut artifact = sim.team_policy_artifact();
     let neural_network = if retain_neural_network_in_game_artifact {
         artifact.learning.neural_network.clone()

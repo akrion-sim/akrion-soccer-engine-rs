@@ -11418,6 +11418,10 @@ impl SoccerMatch {
             .unwrap_or_default()
     }
 
+    pub fn episode_learning_transitions(&self) -> &[SoccerLearningTransition] {
+        &self.episode_learning_transitions
+    }
+
     pub fn planning_validation_stats(&self) -> SoccerPlanningValidationStats {
         self.stats.planning_validation_stats()
     }
