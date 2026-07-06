@@ -4161,8 +4161,9 @@ mod tests {
                 .any(|(a, b)| (*a - *b).abs() > 1e-9),
             "different pass targets must produce different neural candidate features"
         );
-        let expanded =
-            SoccerMatch::neural_mcts_pass_target_candidate_plans(&snapshot, actor_id, "pass");
+        let expanded = SoccerMatch::neural_mcts_expanded_candidate_plans(
+            &snapshot, actor_id, actor_team, "pass",
+        );
         assert!(
             expanded.len() >= 2,
             "neural MCTS should score multiple concrete pass targets"
@@ -4191,6 +4192,67 @@ mod tests {
             .action_from_learned_plan(&expanded[1], &snapshot, &observation)
             .expect("target-specific learned pass should execute");
         assert_eq!(executed_label, "pass2");
+    }
+
+    #[test]
+    fn neural_mcts_expands_dribble_into_targeted_technical_candidates() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            learning_enabled: true,
+            ..MatchConfig::default()
+        });
+        let actor = sim
+            .players
+            .iter()
+            .position(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home field player");
+        let actor_id = sim.players[actor].id;
+        let actor_team = sim.players[actor].team;
+        sim.players[actor].position = Vec2::new(38.0, 54.0);
+        sim.ball.holder = Some(actor_id);
+        sim.ball.position = sim.players[actor].position;
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let expanded = SoccerMatch::neural_mcts_expanded_candidate_plans(
+            &snapshot, actor_id, actor_team, "dribble",
+        );
+        let labels = expanded
+            .iter()
+            .map(|plan| plan.action.as_str())
+            .collect::<Vec<_>>();
+        assert!(labels.contains(&"carry-forward"));
+        assert!(labels.contains(&"left-cut"));
+        assert!(labels.contains(&"protect-ball"));
+        assert!(
+            expanded.iter().all(|plan| plan.target_point.is_some()),
+            "technical dribble candidates need concrete target geometry"
+        );
+    }
+
+    #[test]
+    fn neural_mcts_expands_shoot_into_targeted_shot_variant() {
+        let sim = SoccerMatch::default_11v11(MatchConfig {
+            learning_enabled: true,
+            ..MatchConfig::default()
+        });
+        let actor = sim
+            .players
+            .iter()
+            .position(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home field player");
+        let actor_id = sim.players[actor].id;
+        let actor_team = sim.players[actor].team;
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let expanded = SoccerMatch::neural_mcts_expanded_candidate_plans(
+            &snapshot, actor_id, actor_team, "shoot",
+        );
+        assert_eq!(expanded.len(), 1);
+        assert_eq!(expanded[0].action, "first-time-shot");
+        assert_eq!(
+            expanded[0].target_point,
+            Some(Vec2::new(
+                snapshot.field_width * 0.5,
+                actor_team.goal_y(snapshot.field_length),
+            ))
+        );
     }
 
     #[test]
@@ -4235,8 +4297,9 @@ mod tests {
             &observation,
         );
 
-        let expanded =
-            SoccerMatch::neural_mcts_pass_target_candidate_plans(&snapshot, actor_id, "pass");
+        let expanded = SoccerMatch::neural_mcts_expanded_candidate_plans(
+            &snapshot, actor_id, actor_team, "pass",
+        );
         let visible_targets = snapshot.ranked_visible_pass_targets(actor_id, 11);
         let learned_buckets = expanded
             .iter()
@@ -8467,14 +8530,21 @@ impl SoccerMatch {
         transition
     }
 
-    fn neural_mcts_pass_target_candidate_plans(
+    fn neural_mcts_expanded_candidate_plans(
         snapshot: &WorldSnapshot,
         player_id: usize,
+        team: Team,
         candidate_label: &str,
     ) -> Vec<SoccerLearnedPlan> {
         let normalized = normalize_soccer_action_label(candidate_label);
         if candidate_label != normalized {
             return Vec::new();
+        }
+        if normalized == "dribble" {
+            return Self::neural_mcts_dribble_variant_candidate_plans(snapshot, player_id);
+        }
+        if normalized == "shoot" {
+            return Self::neural_mcts_shot_variant_candidate_plans(snapshot, team);
         }
         let (prefix, targets) = match normalized {
             "pass" => {
@@ -8538,6 +8608,67 @@ impl SoccerMatch {
                 plans
             })
             .collect()
+    }
+
+    fn neural_mcts_dribble_variant_candidate_plans(
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+    ) -> Vec<SoccerLearnedPlan> {
+        const DRIBBLE_VARIANTS: &[&str] = &[
+            "carry-forward",
+            "carry-out-left",
+            "carry-out-right",
+            "left-cut",
+            "right-cut",
+            "side-step",
+            "protect-ball",
+            "open-passing-lane",
+            "nutmeg",
+            "xavi-turn",
+            "fake-left-cut-right",
+            "fake-right-cut-left",
+        ];
+        let Some(player) = snapshot
+            .players
+            .iter()
+            .find(|player| player.id == player_id)
+        else {
+            return Vec::new();
+        };
+        DRIBBLE_VARIANTS
+            .iter()
+            .filter_map(|action| {
+                let kind = dribble_move_kind_for_action_label(action)?;
+                let touch = snapshot.deterministic_dribble_touch_decision_for(player_id, kind);
+                let target = snapshot.dribble_move_target_for_touch(
+                    player_id,
+                    player.home_position,
+                    kind,
+                    touch,
+                );
+                Some(SoccerLearnedPlan {
+                    action: (*action).to_string(),
+                    target_player: None,
+                    target_point: Some(target),
+                    mpc_replan: None,
+                })
+            })
+            .collect()
+    }
+
+    fn neural_mcts_shot_variant_candidate_plans(
+        snapshot: &WorldSnapshot,
+        team: Team,
+    ) -> Vec<SoccerLearnedPlan> {
+        vec![SoccerLearnedPlan {
+            action: "first-time-shot".to_string(),
+            target_player: None,
+            target_point: Some(Vec2::new(
+                snapshot.field_width * 0.5,
+                team.goal_y(snapshot.field_length),
+            )),
+            mpc_replan: None,
+        }]
     }
 
     fn neural_mcts_action_from_candidates(
@@ -9304,9 +9435,12 @@ impl SoccerMatch {
             let candidate_plan =
                 Self::learned_plan_for_policy(policy, snapshot, player_id, candidate.label.clone());
             push_scored_candidate(candidate, candidate_plan);
-            for expanded_plan in
-                Self::neural_mcts_pass_target_candidate_plans(snapshot, player_id, &candidate.label)
-            {
+            for expanded_plan in Self::neural_mcts_expanded_candidate_plans(
+                snapshot,
+                player_id,
+                team,
+                &candidate.label,
+            ) {
                 push_scored_candidate(candidate, expanded_plan);
             }
         }
