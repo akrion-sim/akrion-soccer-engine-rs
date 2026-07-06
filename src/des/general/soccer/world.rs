@@ -4977,6 +4977,65 @@ mod tests {
     }
 
     #[test]
+    fn learned_kick_bucket_label_survives_visible_retarget() {
+        let _env_lock = soccer_world_env_lock();
+        let _gate = set_test_env_var("DD_SOCCER_ENABLE_DISCRETIZED_KICK", "1");
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let actor = sim
+            .players
+            .iter()
+            .position(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home field player");
+        let actor_id = sim.players[actor].id;
+        sim.players[actor].position = Vec2::new(40.0, 58.0);
+        sim.ball.holder = Some(actor_id);
+        sim.ball.position = sim.players[actor].position;
+        let teammate_id = sim
+            .players
+            .iter()
+            .find(|player| {
+                player.team == Team::Home
+                    && player.id != actor_id
+                    && player.role != PlayerRole::Goalkeeper
+            })
+            .map(|player| player.id)
+            .expect("home pass target");
+        let teammate_index = sim
+            .players
+            .iter()
+            .position(|player| player.id == teammate_id)
+            .expect("target index");
+        sim.players[teammate_index].position = Vec2::new(42.0, 69.0);
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let observation = snapshot.observation_for(actor_id);
+        let bucketed_action = "pass1-kp7";
+        let plan = SoccerLearnedPlan {
+            action: bucketed_action.to_string(),
+            target_player: Some(usize::MAX),
+            target_point: snapshot.player_position(teammate_id),
+            mpc_replan: None,
+        };
+
+        let (action, label) = sim.players[actor]
+            .action_from_learned_plan(&plan, &snapshot, &observation)
+            .expect("bucketed pass should retarget to visible teammate");
+
+        assert_eq!(
+            label, bucketed_action,
+            "learned kick power must stay visible to reward/critic labels even when the receiver is retargeted"
+        );
+        let SoccerAction::Pass { power, .. } = action else {
+            panic!("bucketed learned plan should execute as a pass");
+        };
+        let expected_power =
+            learned_discretized_kick_power_for_action_label(bucketed_action).expect("bucket power");
+        assert!(
+            (power - expected_power).abs() < 1e-9,
+            "execution should use the same learned bucket power that the label exposes"
+        );
+    }
+
+    #[test]
     fn centered_actor_bonus_is_neutral_and_bounded() {
         let _env_lock = soccer_world_env_lock();
         let _joint_clip = set_test_env_var("SOCCER_CENTERED_POLICY_BONUS_CLIP", "0.25");
