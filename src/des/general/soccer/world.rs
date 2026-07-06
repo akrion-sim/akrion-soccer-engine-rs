@@ -4496,6 +4496,33 @@ mod tests {
     }
 
     #[test]
+    fn neural_mcts_candidate_filter_rejects_hard_mpc_replan_plans() {
+        let sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let impossible_pass = SoccerLearnedPlan {
+            action: "pass".to_string(),
+            target_player: None,
+            target_point: None,
+            mpc_replan: None,
+        };
+        let hold = SoccerLearnedPlan {
+            action: "hold".to_string(),
+            target_player: None,
+            target_point: None,
+            mpc_replan: None,
+        };
+
+        assert!(
+            !SoccerMatch::neural_mcts_candidate_plan_is_executable(&snapshot, 5, &impossible_pass),
+            "MCTS should not select a plan that the MPC layer must immediately replan"
+        );
+        assert!(
+            SoccerMatch::neural_mcts_candidate_plan_is_executable(&snapshot, 5, &hold),
+            "ordinary non-MPC plans should stay eligible"
+        );
+    }
+
+    #[test]
     fn learned_plan_uses_policy_target_grid_for_concrete_target_points() {
         let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
         let actor = sim
@@ -8745,6 +8772,14 @@ impl SoccerMatch {
             .unwrap_or(0.0)
     }
 
+    fn neural_mcts_candidate_plan_is_executable(
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        plan: &SoccerLearnedPlan,
+    ) -> bool {
+        !Self::learned_plan_needs_mpc_replan(snapshot, player_id, plan)
+    }
+
     fn neural_mcts_action_from_candidates(
         blend: SoccerNeuralBlendConfig,
         candidates: &[SoccerNeuralMctsCandidate],
@@ -9424,6 +9459,13 @@ impl SoccerMatch {
             Vec::with_capacity(legal.len() + legal.len() * pass_target_candidate_limit);
         let mut push_scored_candidate =
             |candidate: &SoccerLearnedActionTrace, candidate_plan: SoccerLearnedPlan| {
+                if !Self::neural_mcts_candidate_plan_is_executable(
+                    snapshot,
+                    player_id,
+                    &candidate_plan,
+                ) {
+                    return;
+                }
                 let transition = self.neural_decision_transition_for_plan(
                     &base,
                     snapshot,
