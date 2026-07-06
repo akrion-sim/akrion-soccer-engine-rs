@@ -6335,7 +6335,6 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut pg_persisted_games = 0usize;
     let mut policies = load_initial_policies(resume_artifact.as_deref(), options.clone())?;
     let mut initial_neural_network = None::<SoccerNeuralNetworkSnapshot>;
-<<<<<<< ours
     if let Some(resume_path) = resume_artifact.as_deref() {
         if let Some((sidecar_path, snapshot)) =
             load_neural_sidecar_for_policy_artifact(Path::new(resume_path))?
@@ -6348,20 +6347,17 @@ fn run() -> Result<(), Box<dyn Error>> {
             pg_base_neural_network_fingerprint =
                 Some(soccer_neural_network_snapshot_fingerprint(&snapshot));
             initial_neural_network = Some(snapshot);
-=======
-    // LOCAL neural resume: load_initial_policies only restores the tabular Q-table,
-    // but the on-disk learned-params artifact also embeds the trained neural snapshot.
-    // Pull it back in so a fully-local (no-postgres) run compounds the NETWORK across
-    // cycles, not just the table. Postgres (below) overrides this when configured.
-    if let Some(path) = resume_artifact.as_deref() {
-        if let Ok(raw) = fs::read_to_string(path) {
+        } else if let Ok(raw) = fs::read_to_string(resume_path) {
+            // LOCAL neural resume fallback: when there is no sidecar, the on-disk learned-params
+            // artifact may itself embed the trained neural snapshot (the fully-local, no-postgres
+            // co-training format). Pull it back in so a local run compounds the NETWORK across
+            // cycles, not just the tabular Q-table. Postgres (below) overrides this when configured.
             if let Ok(params) = serde_json::from_str::<SoccerSelfPlayLearnedParams>(&raw) {
                 if params.neural_network.is_some() {
-                    println!("local_resume_neural_network=true path={path}");
+                    println!("local_resume_neural_network=true path={resume_path}");
                     initial_neural_network = params.neural_network;
                 }
             }
->>>>>>> theirs
         }
     }
     if let Some(store) = pg_store.as_mut() {
