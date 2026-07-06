@@ -23564,8 +23564,6 @@ fn soccer_decision_context_for(
     let target_angle_degrees = target_delta
         .map(|delta| angle_between_vectors_degrees(Vec2::new(0.0, attack_dir), delta))
         .unwrap_or(0.0);
-    let learned_kick_power_selected =
-        learned_discretized_kick_speed_bucket_for_action_label(action).is_some();
     let learned_kick_speed_yps =
         learned_discretized_kick_power_for_action_label(action).and_then(|power| {
             let flight = pass_like_action_flight(action)?;
@@ -23643,12 +23641,8 @@ fn soccer_decision_context_for(
             is_cross,
             Some((target, target_position)),
         );
-        let receipt_speed_yps = if learned_kick_power_selected {
-            action_ball_speed_yps
-        } else {
-            velocity_plan.speed_yps
-        };
-        let estimate = pass_mpc_receipt_estimate_for_snapshot(
+        let receipt_speed_yps = learned_kick_speed_yps.unwrap_or(velocity_plan.speed_yps);
+        Some(pass_mpc_receipt_estimate_for_snapshot(
             before,
             passer,
             actor_position,
@@ -23657,8 +23651,7 @@ fn soccer_decision_context_for(
             flight,
             receipt_speed_yps,
             explicit_target,
-        );
-        Some(estimate)
+        ))
     });
     let pass_target_expected_completion = pass_quality_for_action
         .map(|quality| quality.expected_completion)
@@ -23683,11 +23676,11 @@ fn soccer_decision_context_for(
         .map(|estimate| estimate.qp_accel_fit)
         .or_else(|| pass_quality_for_action.map(|quality| quality.mpc_receipt_qp_accel_fit))
         .unwrap_or(0.0);
-    let pass_receipt_can_use_quality_fallback = !learned_kick_power_selected;
+    let pass_receipt_can_use_quality_fallback = learned_kick_speed_yps.is_none();
     let pass_receipt_is_explicitly_infeasible = pass_receipt_can_use_quality_fallback
         && pass_mpc_for_explicit_target
-            .map(|estimate| estimate.probability <= 1e-9 && estimate.qp_accel_fit <= 1e-9)
-            .unwrap_or(false);
+        .map(|estimate| estimate.probability <= 1e-9 && estimate.qp_accel_fit <= 1e-9)
+        .unwrap_or(false);
     let pass_mpc_receipt_probability = if pass_receipt_is_explicitly_infeasible {
         pass_quality_for_action
             .map(|quality| quality.mpc_receipt_probability)
@@ -25063,6 +25056,18 @@ fn soccer_analytic_difference_reward_enabled() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_ANALYTIC_DIFFERENCE_REWARD"))
     }
+}
+
+/// Gate for the COMA-style analytic ADVANTAGE (the principled "beat analytic" lever). When on, the
+/// PPO actor's advantage is the raw return MINUS a DETACHED tabular baseline
+/// `best_value_hierarchical(s)` — the analytic default's value, from the SEPARATE tabular policy, so
+/// there is no critic self-circularity. Policy-gradient then rewards the actor for choosing actions
+/// whose return EXCEEDS what analytic would score in that state, instead of regressing onto the
+/// analytic/tabular teacher (the value-imitation parity ceiling). OFF (default) ⇒ byte-identical.
+pub(crate) fn dd_soccer_enable_coma_analytic_advantage() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_COMA_ANALYTIC_ADVANTAGE"))
 }
 
 fn soccer_decision_trace_is_learned_policy(decision: &AgentDecisionTrace) -> bool {
@@ -39213,26 +39218,6 @@ const SOCCER_SKILL_PASS_FAMILIES: &[&str] = &[
     "surprise-pass",
     "scoop-pass",
     "first-time-pass",
-    "pass-kp0",
-    "pass-kp1",
-    "pass-kp2",
-    "pass-kp3",
-    "pass-kp4",
-    "pass-kp5",
-    "pass-kp6",
-    "pass-kp7",
-    "pass-kp8",
-    "pass-kp9",
-    "aerial-pass-kp0",
-    "aerial-pass-kp1",
-    "aerial-pass-kp2",
-    "aerial-pass-kp3",
-    "aerial-pass-kp4",
-    "aerial-pass-kp5",
-    "aerial-pass-kp6",
-    "aerial-pass-kp7",
-    "aerial-pass-kp8",
-    "aerial-pass-kp9",
 ];
 const SOCCER_SKILL_DRIBBLE_FAMILIES: &[&str] = &[
     "dribble",
@@ -39438,17 +39423,6 @@ impl SoccerSkillLogProbs {
         let (group, local) = soccer_policy_skill_group_for_action_index(action_index)?;
         let prob = self.group(group)?.get(local).copied()?;
         Some(prob.max(1e-8).ln())
-    }
-
-    fn centered_log_prob_for_action_index(&self, action_index: usize) -> Option<f64> {
-        let (group, local) = soccer_policy_skill_group_for_action_index(action_index)?;
-        let probs = self.group(group)?;
-        let prob = probs.get(local).copied()?;
-        if probs.is_empty() {
-            return None;
-        }
-        let uniform_log_prob = -(probs.len() as f64).ln();
-        Some(prob.max(1e-8).ln() - uniform_log_prob)
     }
 }
 
@@ -41532,26 +41506,6 @@ const SOCCER_POLICY_ACTIONS: &[&str] = &[
     "blindside-steal",
     "wall-return",
     "support-push-up",
-    "pass-kp0",
-    "pass-kp1",
-    "pass-kp2",
-    "pass-kp3",
-    "pass-kp4",
-    "pass-kp5",
-    "pass-kp6",
-    "pass-kp7",
-    "pass-kp8",
-    "pass-kp9",
-    "aerial-pass-kp0",
-    "aerial-pass-kp1",
-    "aerial-pass-kp2",
-    "aerial-pass-kp3",
-    "aerial-pass-kp4",
-    "aerial-pass-kp5",
-    "aerial-pass-kp6",
-    "aerial-pass-kp7",
-    "aerial-pass-kp8",
-    "aerial-pass-kp9",
 ];
 
 const SOCCER_POLICY_PASS_ACTIONS: &[&str] = &[
@@ -41571,26 +41525,6 @@ const SOCCER_POLICY_PASS_ACTIONS: &[&str] = &[
     "flick-on",
     "first-time-pass",
     "scoop-pass",
-    "pass-kp0",
-    "pass-kp1",
-    "pass-kp2",
-    "pass-kp3",
-    "pass-kp4",
-    "pass-kp5",
-    "pass-kp6",
-    "pass-kp7",
-    "pass-kp8",
-    "pass-kp9",
-    "aerial-pass-kp0",
-    "aerial-pass-kp1",
-    "aerial-pass-kp2",
-    "aerial-pass-kp3",
-    "aerial-pass-kp4",
-    "aerial-pass-kp5",
-    "aerial-pass-kp6",
-    "aerial-pass-kp7",
-    "aerial-pass-kp8",
-    "aerial-pass-kp9",
 ];
 
 const SOCCER_POLICY_DRIBBLE_ACTIONS: &[&str] = &[
@@ -41635,16 +41569,6 @@ const SOCCER_POLICY_GOALKEEPER_ACTIONS: &[&str] = &[
 /// learn the concrete choice while the planner keeps providing priors/targets.
 fn soccer_policy_action_index(action: &str) -> Option<usize> {
     use SoccerActionLabel::*;
-    if let Some((base, bucket)) = learned_discretized_kick_suffix_parts(action) {
-        let family = ranked_pass_action_family(base)?;
-        let bucket_family = format!("{family}-kp{bucket}");
-        if let Some(index) = SOCCER_POLICY_ACTIONS
-            .iter()
-            .position(|candidate| *candidate == bucket_family)
-        {
-            return Some(index);
-        }
-    }
     let action = normalize_soccer_action_label(action);
     if let Some(index) = SOCCER_POLICY_ACTIONS
         .iter()
@@ -67059,21 +66983,6 @@ mod discretized_kick_scaffold_tests {
         assert!(ranked_pass_action_label(&label));
         assert_eq!(normalize_soccer_action_label(&label), "pass");
         assert_eq!(
-            soccer_policy_action_index(&label),
-            soccer_policy_action_index("pass-kp7")
-        );
-        let pass_bucket_index =
-            soccer_policy_action_index("pass-kp7").expect("pass bucket actor index");
-        let (pass_bucket_group, pass_bucket_local) =
-            soccer_policy_skill_group_for_action_index(pass_bucket_index)
-                .expect("pass bucket should train the pass skill policy head");
-        assert_eq!(pass_bucket_group, SoccerSkillGroup::Pass);
-        assert_eq!(SOCCER_SKILL_PASS_FAMILIES[pass_bucket_local], "pass-kp7");
-        assert_ne!(
-            soccer_policy_action_index(&label),
-            soccer_policy_action_index("pass")
-        );
-        assert_eq!(
             learned_mpc_action_label_key(&label),
             "pass4-kp7".to_string()
         );
@@ -67088,40 +66997,6 @@ mod discretized_kick_scaffold_tests {
         let aerial = learned_discretized_kick_candidate_label("aerial-pass2", 4)
             .expect("ranked aerial pass should accept a learned kick bucket");
         assert_eq!(normalize_soccer_action_label(&aerial), "aerial-pass");
-        assert_eq!(
-            soccer_policy_action_index(&aerial),
-            soccer_policy_action_index("aerial-pass-kp4")
-        );
-        let aerial_bucket_index =
-            soccer_policy_action_index("aerial-pass-kp4").expect("aerial bucket actor index");
-        let (aerial_bucket_group, aerial_bucket_local) =
-            soccer_policy_skill_group_for_action_index(aerial_bucket_index)
-                .expect("aerial bucket should train the pass skill policy head");
-        assert_eq!(aerial_bucket_group, SoccerSkillGroup::Pass);
-        assert_eq!(
-            SOCCER_SKILL_PASS_FAMILIES[aerial_bucket_local],
-            "aerial-pass-kp4"
-        );
-        let uniform_pass_prob = 1.0 / SOCCER_SKILL_PASS_FAMILIES.len() as f64;
-        let skill_log_probs = SoccerSkillLogProbs {
-            pass: Some(vec![uniform_pass_prob; SOCCER_SKILL_PASS_FAMILIES.len()]),
-            dribble: None,
-            shot: None,
-        };
-        assert!(
-            skill_log_probs
-                .centered_log_prob_for_action_index(pass_bucket_index)
-                .unwrap()
-                .abs()
-                < 1e-12
-        );
-        assert!(
-            skill_log_probs
-                .centered_log_prob_for_action_index(aerial_bucket_index)
-                .unwrap()
-                .abs()
-                < 1e-12
-        );
         assert_eq!(learned_discretized_kick_candidate_label("pass", 4), None);
         assert_eq!(learned_discretized_kick_candidate_label("pass1", 12), None);
     }
