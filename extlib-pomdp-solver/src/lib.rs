@@ -36,7 +36,7 @@ impl GruCell {
         let n = (self.in_.forward(x)? + (&r * self.hn.forward(h)?)?)?.tanh()?;
         // h' = (1 - z) * n + z * h
         let one = Tensor::ones_like(&z)?;
-        (&((&one - &z)? * &n)? + &(&z * h)?)
+        &((&one - &z)? * &n)? + &(&z * h)?
     }
 }
 
