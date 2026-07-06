@@ -13,7 +13,7 @@
 use burn::config::Config;
 use burn::module::Module;
 use burn::nn::attention::{MhaInput, MultiHeadAttention, MultiHeadAttentionConfig};
-use burn::nn::rnn::{Gru, GruConfig};
+use burn::nn::gru::{Gru, GruConfig};
 use burn::nn::{Linear, LinearConfig};
 use burn::tensor::{backend::Backend, activation::softmax, Tensor};
 
