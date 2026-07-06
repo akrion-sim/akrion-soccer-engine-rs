@@ -21410,8 +21410,6 @@ pub(crate) fn dd_soccer_enable_aerial_pass_oob_discipline() -> bool {
 /// OFF (default) ⇒ byte-identical to baseline. ON supersedes the aerial-only handler for every
 /// conceded pass out of play — ground passes included.
 pub(crate) fn dd_soccer_enable_pass_oob_penalty() -> bool {
-<<<<<<< ours
-=======
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_PASS_OOB_PENALTY"))
