@@ -415,16 +415,6 @@ fn main() {
         runner_config.base.neural_learning.hidden_units,
     )
     .max(1);
-    // Un-collapse the value head on fresh nets: honour SOCCER_NEURAL_TARGET_POPART here (the
-    // league bin otherwise leaves target-PopArt at the config default = off, unlike the
-    // learning-run bins). A collapsed value can't rank candidates, which would make the Part-B
-    // action-space A/B uninterpretable. Only takes effect on a FRESH net (same as hidden_units).
-    runner_config.base.neural_learning.target_popart_enabled = std::env::var(
-        "SOCCER_NEURAL_TARGET_POPART",
-    )
-    .ok()
-    .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
-    .unwrap_or(runner_config.base.neural_learning.target_popart_enabled);
     // Keep the engine's designed independent-brain mode (per-team critic drives each side).
     let runner = EngineMatchRunner::new(runner_config);
 
