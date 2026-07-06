@@ -24969,6 +24969,14 @@ impl SoccerMatch {
                 next_observation: after.observation_for(player.id),
                 done,
             };
+            soccer_trajectory_export_decision(
+                before,
+                player.id,
+                player.team,
+                &decision.action,
+                reward,
+                done,
+            );
             if let Some(rejected) = learned_mpc_rejected_action_transition(&transition) {
                 transitions.push(transition);
                 transitions.push(rejected);
