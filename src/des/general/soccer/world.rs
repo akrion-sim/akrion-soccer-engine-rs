@@ -266,6 +266,16 @@ fn neural_mcts_discretized_kick_exploration_min_prior() -> f64 {
     )
 }
 
+fn neural_authoritative_on_ball_only_enabled() -> bool {
+    std::env::var("SOCCER_NEURAL_AUTHORITATIVE_ON_BALL_ONLY")
+        .ok()
+        .map(|raw| {
+            let value = raw.trim().to_ascii_lowercase();
+            matches!(value.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
 fn soccer_centered_policy_bonus(centered_log_prob: f64) -> f64 {
     let clip = learned_mpc_metric_env(
         "SOCCER_CENTERED_POLICY_BONUS_CLIP",
@@ -5300,6 +5310,41 @@ mod tests {
     }
 
     #[test]
+    fn neural_authoritative_on_ball_only_blocks_off_ball_players() {
+        let _env_lock = soccer_world_env_lock();
+        let _gate = set_test_env_var("SOCCER_NEURAL_AUTHORITATIVE_ON_BALL_ONLY", "1");
+        let sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let holder_id = snapshot.ball.holder.expect("kickoff holder");
+        let off_ball_teammate = snapshot
+            .players
+            .iter()
+            .find(|player| {
+                player.team == Team::Home
+                    && player.id != holder_id
+                    && player.role != PlayerRole::Goalkeeper
+            })
+            .map(|player| player.id)
+            .expect("off-ball teammate");
+
+        assert!(SoccerMatch::neural_authoritative_allows_player(
+            SoccerNeuralBlendMode::Authoritative,
+            &snapshot,
+            holder_id,
+        ));
+        assert!(!SoccerMatch::neural_authoritative_allows_player(
+            SoccerNeuralBlendMode::Authoritative,
+            &snapshot,
+            off_ball_teammate,
+        ));
+        assert!(SoccerMatch::neural_authoritative_allows_player(
+            SoccerNeuralBlendMode::Additive,
+            &snapshot,
+            off_ball_teammate,
+        ));
+    }
+
+    #[test]
     fn centered_actor_bonus_is_neutral_and_bounded() {
         let _env_lock = soccer_world_env_lock();
         let _joint_clip = set_test_env_var("SOCCER_CENTERED_POLICY_BONUS_CLIP", "0.25");
@@ -9013,6 +9058,19 @@ impl SoccerMatch {
             || (normalized != "dribble" && is_dribble_action_label(normalized))
     }
 
+    fn neural_authoritative_allows_player(
+        mode: SoccerNeuralBlendMode,
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+    ) -> bool {
+        if mode != SoccerNeuralBlendMode::Authoritative
+            || !neural_authoritative_on_ball_only_enabled()
+        {
+            return true;
+        }
+        snapshot.ball.holder == Some(player_id)
+    }
+
     fn neural_mcts_technical_mpc_execution_bonus(
         snapshot: &WorldSnapshot,
         player_id: usize,
@@ -9638,6 +9696,9 @@ impl SoccerMatch {
             .as_ref()
             .is_some_and(|priors| !priors.is_empty());
         if !value_active && !actor_requested && !retrieval_active {
+            return None;
+        }
+        if !Self::neural_authoritative_allows_player(blend.mode, snapshot, player_id) {
             return None;
         }
         // Decisions are scored by the deciding player's own team brain. Retrieval
