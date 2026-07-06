@@ -398,11 +398,20 @@ fn evaluate_soccer_policy_promotion_gate_for_learning_objective(
 
 fn policy_promotion_evaluation_can_anchor_local_trial(
     evaluation: &SoccerPolicyPromotionGateEvaluation,
+    anchor_held_trials: bool,
 ) -> bool {
-    evaluation
+    if evaluation
         .rejection_reasons
         .iter()
         .all(|reason| reason.starts_with("sample_games ") || reason == "local_best_not_improved")
+    {
+        return true;
+    }
+    anchor_held_trials
+        && evaluation
+            .rejection_reasons
+            .iter()
+            .all(|reason| !reason.starts_with("non_finite_learning_objective "))
 }
 
 fn default_postgres_policy_version_interval_games(parallel_games: usize) -> usize {
@@ -6476,6 +6485,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
+    let policy_promotion_local_best_anchor_held =
+        env_bool("SOCCER_POLICY_PROMOTION_LOCAL_BEST_ANCHOR_HELD", false)?;
     let policy_promotion_local_best_restore_max_mean_fitness_regression = env_f64(
         "SOCCER_POLICY_PROMOTION_LOCAL_BEST_RESTORE_MAX_MEAN_FITNESS_REGRESSION",
         0.0,
@@ -7218,7 +7229,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         curriculum_config.full_match_after_games
     );
     println!(
-        "policy_promotion_gate enabled={} min_sample_games={} min_mean_match_fitness={:.4} min_best_match_fitness={:.4} min_mean_play_quality={:.4} max_mean_conceded_goals={:.4} max_mean_goal_margin={:.4} max_mean_chain_net_loss={:.4} active_max_fitness_regression={:.4} compare_incumbent={} min_mean_fitness_delta={:.4} max_mean_fitness_regression={:.4} max_play_quality_regression={:.4} baseline_lookback_generations={} apply_evolution_when_held={} reset_to_incumbent_after_held_trial={} require_trial_before_write={} neural_checkpoint_when_held={} recalibrate_incumbent_on_resume={} local_best_rollback={} local_best_backoff={} local_best_backoff_factor={:.3} local_best_backoff_min_lr={:.5} local_best_backoff_min_blend={:.3} local_best_restore_max_mean_fitness_regression={:.4} local_best_restore_max_play_quality_regression={:.4}",
+        "policy_promotion_gate enabled={} min_sample_games={} min_mean_match_fitness={:.4} min_best_match_fitness={:.4} min_mean_play_quality={:.4} max_mean_conceded_goals={:.4} max_mean_goal_margin={:.4} max_mean_chain_net_loss={:.4} active_max_fitness_regression={:.4} compare_incumbent={} min_mean_fitness_delta={:.4} max_mean_fitness_regression={:.4} max_play_quality_regression={:.4} baseline_lookback_generations={} apply_evolution_when_held={} reset_to_incumbent_after_held_trial={} require_trial_before_write={} neural_checkpoint_when_held={} recalibrate_incumbent_on_resume={} local_best_rollback={} local_best_anchor_held={} local_best_backoff={} local_best_backoff_factor={:.3} local_best_backoff_min_lr={:.5} local_best_backoff_min_blend={:.3} local_best_restore_max_mean_fitness_regression={:.4} local_best_restore_max_play_quality_regression={:.4}",
         policy_promotion_gate.enabled,
         policy_promotion_gate.min_sample_games,
         policy_promotion_gate.min_mean_match_fitness,
@@ -7239,6 +7250,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         policy_write_neural_checkpoint_when_promotion_held,
         policy_promotion_recalibrate_incumbent_on_resume,
         policy_promotion_local_best_rollback,
+        policy_promotion_local_best_anchor_held,
         policy_promotion_local_best_backoff,
         policy_promotion_local_best_backoff_factor,
         policy_promotion_local_best_backoff_min_learning_rate,
@@ -9055,6 +9067,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                             && latest_neural_network.is_some()
                             && policy_promotion_evaluation_can_anchor_local_trial(
                                 &checkpoint_promotion_evaluation,
+                                policy_promotion_local_best_anchor_held,
                             )
                             && local_neural_promotion_trial_best
                                 .as_ref()
@@ -9801,12 +9814,13 @@ mod tests {
     }
 
     #[test]
-    fn local_trial_anchor_rejects_bad_fitness_even_when_checkpoint_is_held() {
+    fn local_trial_anchor_can_opt_into_held_fitness_for_rollback() {
         let mut too_few_samples = promotion_eval(0.40, 0.30);
         too_few_samples.rejection_reasons =
             vec!["sample_games 6 below min_sample_games 18".to_string()];
         assert!(policy_promotion_evaluation_can_anchor_local_trial(
-            &too_few_samples
+            &too_few_samples,
+            false
         ));
 
         let mut below_mean = promotion_eval(-0.80, 0.30);
@@ -9815,7 +9829,12 @@ mod tests {
             "mean_match_fitness -0.8000 below min_mean_match_fitness -0.2500".to_string(),
         ];
         assert!(!policy_promotion_evaluation_can_anchor_local_trial(
-            &below_mean
+            &below_mean,
+            false
+        ));
+        assert!(policy_promotion_evaluation_can_anchor_local_trial(
+            &below_mean,
+            true
         ));
     }
 
