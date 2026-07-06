@@ -65,20 +65,61 @@ pub fn to_tensors<B: Backend>(
     (entities, actions, returns_t)
 }
 
-/// Load a JSONL export: one `{ "trajectory": [Decision, ...] }` per line, or one `Decision` per
-/// line with `done` marking boundaries. Here: one JSON array (a trajectory) per line.
-pub fn load_jsonl(path: &str) -> std::io::Result<Vec<Trajectory>> {
+/// A flat export row (one JSON object per line) as emitted by the engine's
+/// `soccer_trajectory_export_decision`: adds `agent` for grouping.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FlatDecision {
+    pub field_motion: Vec<f32>,
+    pub action: usize,
+    pub reward: f32,
+    pub done: bool,
+    pub agent: usize,
+}
+
+/// Load the engine's FLAT export (one `FlatDecision` per line, in emit order) and group into
+/// per-(agent, episode) trajectories: consecutive same-agent rows form a trajectory, split after
+/// each `done`. Malformed / partial trailing lines (e.g. a timeout-truncated last line) are skipped.
+pub fn load_flat_grouped(path: &str) -> std::io::Result<Vec<Trajectory>> {
+    use std::collections::HashMap;
     use std::io::BufRead;
     let f = std::fs::File::open(path)?;
-    let mut out = Vec::new();
+    let mut open: HashMap<usize, Trajectory> = HashMap::new();
+    let mut out: Vec<Trajectory> = Vec::new();
     for line in std::io::BufReader::new(f).lines() {
-        let line = line?;
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
         if line.trim().is_empty() {
             continue;
         }
-        let traj: Trajectory = serde_json::from_str(&line)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        out.push(traj);
+        let d: FlatDecision = match serde_json::from_str(&line) {
+            Ok(d) => d,
+            Err(_) => continue, // skip a truncated/partial row
+        };
+        if d.field_motion.len() != FIELD_MOTION_DIM {
+            continue;
+        }
+        let done = d.done;
+        let agent = d.agent;
+        open.entry(agent).or_default().push(Decision {
+            field_motion: d.field_motion,
+            action: d.action,
+            reward: d.reward,
+            done: d.done,
+        });
+        if done {
+            if let Some(traj) = open.remove(&agent) {
+                if !traj.is_empty() {
+                    out.push(traj);
+                }
+            }
+        }
+    }
+    for (_, traj) in open {
+        if !traj.is_empty() {
+            out.push(traj);
+        }
     }
     Ok(out)
 }
