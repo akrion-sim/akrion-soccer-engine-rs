@@ -377,6 +377,15 @@ fn evaluate_soccer_policy_promotion_gate_for_learning_objective(
     evaluation
 }
 
+fn policy_promotion_evaluation_can_anchor_local_trial(
+    evaluation: &SoccerPolicyPromotionGateEvaluation,
+) -> bool {
+    evaluation
+        .rejection_reasons
+        .iter()
+        .all(|reason| reason.starts_with("sample_games ") || reason == "local_best_not_improved")
+}
+
 fn default_postgres_policy_version_interval_games(parallel_games: usize) -> usize {
     parallel_games.max(DEFAULT_SOCCER_POSTGRES_POLICY_VERSION_INTERVAL_GAMES)
 }
@@ -1607,6 +1616,20 @@ struct LocalNeuralPromotionTrialBest {
     tactical_learning: SoccerTacticalLearningWeights,
     policies: SoccerTeamQPolicies,
     neural_network: Option<SoccerNeuralNetworkSnapshot>,
+    carried_world_model: Option<SoccerWorldModel>,
+}
+
+fn current_carried_world_model_snapshot() -> Option<SoccerWorldModel> {
+    CARRIED_WORLD_MODEL.lock().unwrap().clone()
+}
+
+fn install_carried_world_model_snapshot(snapshot: Option<SoccerWorldModel>) -> usize {
+    let training_steps = snapshot
+        .as_ref()
+        .map(SoccerWorldModel::training_steps)
+        .unwrap_or(0);
+    *CARRIED_WORLD_MODEL.lock().unwrap() = snapshot;
+    training_steps
 }
 
 fn policy_promotion_evaluation_beats_local_best(
@@ -1627,6 +1650,26 @@ fn policy_promotion_evaluation_beats_local_best(
         return false;
     }
     evaluation.best_match_fitness > best.evaluation.best_match_fitness + EPSILON
+}
+
+fn policy_promotion_evaluation_beats_incumbent_baseline(
+    evaluation: &SoccerPolicyPromotionGateEvaluation,
+    baseline: PolicyPromotionIncumbentBaseline,
+) -> bool {
+    const EPSILON: f64 = 1e-9;
+    if evaluation.mean_match_fitness > baseline.mean_match_fitness + EPSILON {
+        return true;
+    }
+    if baseline.mean_match_fitness > evaluation.mean_match_fitness + EPSILON {
+        return false;
+    }
+    if evaluation.mean_play_quality > baseline.mean_play_quality + EPSILON {
+        return true;
+    }
+    if baseline.mean_play_quality > evaluation.mean_play_quality + EPSILON {
+        return false;
+    }
+    evaluation.best_match_fitness > baseline.best_match_fitness + EPSILON
 }
 
 fn policy_promotion_evaluation_regresses_from_local_best(
@@ -1716,6 +1759,8 @@ fn restore_local_best_after_held_promotion(
     *latest_policy_arc_cache = None;
     *latest_neural_network_arc_cache = None;
     *local_tactical_evolved_since_pg_refresh = true;
+    let restored_world_model_steps =
+        install_carried_world_model_snapshot(best.carried_world_model.clone());
     let backoff = backoff_enabled.then(|| {
         apply_local_best_neural_backoff(
             config,
@@ -1733,6 +1778,13 @@ fn restore_local_best_after_held_promotion(
         best.evaluation.mean_match_fitness,
         regressed_mean_play_quality,
         best.evaluation.mean_play_quality,
+    );
+    println!(
+        "policy_promotion_local_best_world_model_restored context={} completed_games={} restored_from_games={} training_steps={}",
+        context_label,
+        completed_games,
+        best.completed_games,
+        restored_world_model_steps,
     );
     if let Some((
         previous_learning_rate,
@@ -2884,6 +2936,7 @@ struct CompletedGame {
     config_moments: Vec<SoccerConfigMomentInsert>,
     pass_outcome_samples: Vec<SoccerPassOutcomeSample>,
     neural_network: Option<SoccerNeuralNetworkSnapshot>,
+    world_model: Option<SoccerWorldModel>,
     elapsed_seconds: f64,
 }
 
@@ -2893,6 +2946,7 @@ struct BatchNeuralSnapshotSelection {
     training_steps: usize,
     snapshot_count: usize,
     snapshot: SoccerNeuralNetworkSnapshot,
+    world_model: Option<SoccerWorldModel>,
 }
 
 fn batch_neural_snapshot_candidate_better(
@@ -3025,6 +3079,7 @@ fn select_batch_neural_snapshot(
     }
     let (index, episode, match_fitness, _) = best?;
     let snapshot = completed_games[index].neural_network.take()?;
+    let world_model = completed_games[index].world_model.take();
     let training_steps = snapshot.training_steps;
     Some(BatchNeuralSnapshotSelection {
         episode,
@@ -3032,6 +3087,7 @@ fn select_batch_neural_snapshot(
         training_steps,
         snapshot_count,
         snapshot,
+        world_model,
     })
 }
 
@@ -3811,6 +3867,7 @@ fn candidate_checkpoint_path(path: &Path) -> PathBuf {
 fn should_publish_live_checkpoint(
     best_only: bool,
     evaluation: &SoccerPolicyPromotionGateEvaluation,
+    protected_baseline: Option<PolicyPromotionIncumbentBaseline>,
     local_best: Option<&LocalNeuralPromotionTrialBest>,
     has_neural_snapshot: bool,
 ) -> bool {
@@ -3821,6 +3878,12 @@ fn should_publish_live_checkpoint(
         return false;
     }
     if evaluation.enabled && !evaluation.eligible {
+        return false;
+    }
+    if protected_baseline
+        .map(|baseline| !policy_promotion_evaluation_beats_incumbent_baseline(evaluation, baseline))
+        .unwrap_or(false)
+    {
         return false;
     }
     local_best
@@ -4941,10 +5004,16 @@ fn run_game(
             final_loss
         );
     }
+    let completed_world_model = sim
+        .config
+        .neural_blend
+        .world_model
+        .then(|| sim.world_model_snapshot())
+        .flatten();
     if sim.config.neural_blend.world_model {
         let world_model_stats = sim.world_model_stats();
         let planning_stats = sim.planning_validation_stats();
-        if let Some(model) = sim.world_model_snapshot() {
+        if let Some(model) = completed_world_model.clone() {
             let model_steps = model.training_steps();
             let mut guard = CARRIED_WORLD_MODEL.lock().unwrap();
             let should_replace = guard
@@ -5005,6 +5074,7 @@ fn run_game(
         config_moments,
         pass_outcome_samples,
         neural_network,
+        world_model: completed_world_model,
         elapsed_seconds: started.elapsed().as_secs_f64(),
     })
 }
@@ -5937,6 +6007,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         "SOCCER_POLICY_PROMOTION_RECALIBRATE_INCUMBENT_ON_RESUME",
         false,
     )?;
+    let policy_promotion_seed_local_best_from_resume = env_bool(
+        "SOCCER_POLICY_PROMOTION_SEED_LOCAL_BEST_ROLLBACK_FROM_RESUME",
+        true,
+    )?;
     let policy_promotion_local_best_rollback =
         env_bool("SOCCER_POLICY_PROMOTION_LOCAL_BEST_ROLLBACK", false)?;
     let policy_promotion_local_best_backoff =
@@ -6707,6 +6781,10 @@ fn run() -> Result<(), Box<dyn Error>> {
             local_policy_promotion_best_path.display()
         );
     }
+    println!(
+        "policy_promotion_local_best_resume_seed enabled={} (false keeps resume metadata as publish baseline only)",
+        policy_promotion_seed_local_best_from_resume
+    );
     if let Some(path) = &resume_artifact {
         println!("resume_artifact={path}");
     }
@@ -6795,29 +6873,40 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut local_tactical_evolved_since_pg_refresh = false;
     let mut local_evolution_trial_active = false;
     let mut local_neural_promotion_trial_best = None::<LocalNeuralPromotionTrialBest>;
-    if let Some(baseline) = pg_base_policy_promotion_baseline {
-        local_neural_promotion_trial_best = Some(LocalNeuralPromotionTrialBest {
-            completed_games: 0,
-            evaluation: SoccerPolicyPromotionGateEvaluation {
-                enabled: policy_promotion_gate.enabled,
-                eligible: true,
-                sample_games: baseline.sample_games,
-                min_sample_games: policy_promotion_gate.min_sample_games,
-                mean_match_fitness: baseline.mean_match_fitness,
-                best_match_fitness: baseline.best_match_fitness,
-                mean_play_quality: baseline.mean_play_quality,
-                mean_conceded_goals: 0.0,
-                mean_goal_margin: 0.0,
-                mean_chain_net_loss: 0.0,
-                rejection_reasons: Vec::new(),
-            },
-            config: config.clone(),
-            tactical_learning: tactical_learning.clone(),
-            policies: policies.clone(),
-            neural_network: latest_neural_network.clone(),
-        });
+    if policy_promotion_seed_local_best_from_resume {
+        if let Some(baseline) = pg_base_policy_promotion_baseline {
+            local_neural_promotion_trial_best = Some(LocalNeuralPromotionTrialBest {
+                completed_games: 0,
+                evaluation: SoccerPolicyPromotionGateEvaluation {
+                    enabled: policy_promotion_gate.enabled,
+                    eligible: true,
+                    sample_games: baseline.sample_games,
+                    min_sample_games: policy_promotion_gate.min_sample_games,
+                    mean_match_fitness: baseline.mean_match_fitness,
+                    best_match_fitness: baseline.best_match_fitness,
+                    mean_play_quality: baseline.mean_play_quality,
+                    mean_conceded_goals: 0.0,
+                    mean_goal_margin: 0.0,
+                    mean_chain_net_loss: 0.0,
+                    rejection_reasons: Vec::new(),
+                },
+                config: config.clone(),
+                tactical_learning: tactical_learning.clone(),
+                policies: policies.clone(),
+                neural_network: latest_neural_network.clone(),
+                carried_world_model: current_carried_world_model_snapshot(),
+            });
+            println!(
+                "policy_promotion_local_best_seeded_from_resume sample_games={} mean_match_fitness={:.4} best_match_fitness={:.4} mean_play_quality={:.4}",
+                baseline.sample_games,
+                baseline.mean_match_fitness,
+                baseline.best_match_fitness,
+                baseline.mean_play_quality,
+            );
+        }
+    } else if let Some(baseline) = pg_base_policy_promotion_baseline {
         println!(
-            "policy_promotion_local_best_seeded_from_resume sample_games={} mean_match_fitness={:.4} best_match_fitness={:.4} mean_play_quality={:.4}",
+            "policy_promotion_local_best_resume_seed_skipped sample_games={} mean_match_fitness={:.4} best_match_fitness={:.4} mean_play_quality={:.4} reason=publish-baseline-only",
             baseline.sample_games,
             baseline.mean_match_fitness,
             baseline.best_match_fitness,
@@ -7016,17 +7105,28 @@ fn run() -> Result<(), Box<dyn Error>> {
             neural_batch_snapshot_min_fitness,
             neural_batch_snapshot_min_batch_mean_fitness,
         ) {
-            latest_neural_network = Some(selection.snapshot);
-            if selection.snapshot_count > 1 {
+            let BatchNeuralSnapshotSelection {
+                episode: selected_episode,
+                match_fitness: selected_match_fitness,
+                training_steps: selected_training_steps,
+                snapshot_count: selected_snapshot_count,
+                snapshot: selected_snapshot,
+                world_model: selected_world_model,
+            } = selection;
+            let selected_world_model_steps =
+                install_carried_world_model_snapshot(selected_world_model);
+            latest_neural_network = Some(selected_snapshot);
+            if selected_snapshot_count > 1 {
                 println!(
-                    "neural_batch_snapshot_selected episodes={}..{} snapshots={} selection_mode={} selected_episode={} selected_match_fitness={:.4} selected_training_steps={}",
+                    "neural_batch_snapshot_selected episodes={}..{} snapshots={} selection_mode={} selected_episode={} selected_match_fitness={:.4} selected_training_steps={} selected_world_model_steps={}",
                     batch_start_episode + 1,
                     batch_start_episode + batch_size,
-                    selection.snapshot_count,
+                    selected_snapshot_count,
                     neural_batch_snapshot_selection_mode.label(),
-                    selection.episode,
-                    selection.match_fitness,
-                    selection.training_steps
+                    selected_episode,
+                    selected_match_fitness,
+                    selected_training_steps,
+                    selected_world_model_steps
                 );
             }
         } else if neural_batch_snapshot_count > 0 {
@@ -7251,6 +7351,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                             tactical_learning: tactical_learning.clone(),
                             policies: policies.clone(),
                             neural_network: latest_neural_network.clone(),
+                            carried_world_model: current_carried_world_model_snapshot(),
                         });
                         pg_base_policy_version_id = Some(output_policy_version_id.clone());
                         pg_last_policy_version_id = Some(output_policy_version_id.clone());
@@ -7401,6 +7502,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                                 latest_policy_arc_cache = None;
                                 latest_neural_network_arc_cache = None;
                                 local_tactical_evolved_since_pg_refresh = true;
+                                let restored_world_model_steps =
+                                    install_carried_world_model_snapshot(
+                                        best.carried_world_model.clone(),
+                                    );
                                 let backoff = policy_promotion_local_best_backoff.then(|| {
                                     apply_local_best_neural_backoff(
                                         &mut config,
@@ -7417,6 +7522,12 @@ fn run() -> Result<(), Box<dyn Error>> {
                                     best.evaluation.mean_match_fitness,
                                     regressed_mean_play_quality,
                                     best.evaluation.mean_play_quality,
+                                );
+                                println!(
+                                    "policy_promotion_local_best_world_model_restored completed_games={} restored_from_games={} training_steps={}",
+                                    completed_episode,
+                                    best.completed_games,
+                                    restored_world_model_steps,
                                 );
                                 if let Some((
                                     previous_learning_rate,
@@ -7455,6 +7566,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                                         tactical_learning: tactical_learning.clone(),
                                         policies: policies.clone(),
                                         neural_network: latest_neural_network.clone(),
+                                        carried_world_model: current_carried_world_model_snapshot(),
                                     });
                                 println!(
                                     "policy_promotion_local_best_updated completed_games={} sample_games={} mean_match_fitness={:.4} best_match_fitness={:.4} mean_play_quality={:.4}",
@@ -8077,6 +8189,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             let publish_live_checkpoint = should_publish_live_checkpoint(
                 checkpoint_artifact_best_only,
                 &checkpoint_promotion_evaluation,
+                pg_base_policy_promotion_baseline,
                 local_neural_promotion_trial_best.as_ref(),
                 latest_neural_network.is_some(),
             );
@@ -8146,6 +8259,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                         tactical_learning: tactical_learning.clone(),
                         policies: policies.clone(),
                         neural_network: latest_neural_network.clone(),
+                        carried_world_model: current_carried_world_model_snapshot(),
                     });
                     println!(
                         "checkpoint_local_best_published games_completed={} sample_games={} mean_match_fitness={:.4} best_match_fitness={:.4} mean_play_quality={:.4} artifact={}",
@@ -8176,7 +8290,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                         checkpoint_artifact_path.display()
                     );
                     if policy_promotion_local_best_rollback {
-                        restore_local_best_after_held_promotion(
+                        let restored = restore_local_best_after_held_promotion(
                             "checkpoint-local-best-held",
                             episode_summaries.len(),
                             &checkpoint_promotion_evaluation,
@@ -8195,6 +8309,40 @@ fn run() -> Result<(), Box<dyn Error>> {
                             policy_promotion_local_best_restore_max_mean_fitness_regression,
                             policy_promotion_local_best_restore_max_play_quality_regression,
                         );
+                        if !restored
+                            && latest_neural_network.is_some()
+                            && policy_promotion_evaluation_can_anchor_local_trial(
+                                &checkpoint_promotion_evaluation,
+                            )
+                            && local_neural_promotion_trial_best
+                                .as_ref()
+                                .map(|best| {
+                                    policy_promotion_evaluation_beats_local_best(
+                                        &checkpoint_promotion_evaluation,
+                                        best,
+                                    )
+                                })
+                                .unwrap_or(true)
+                        {
+                            local_neural_promotion_trial_best =
+                                Some(LocalNeuralPromotionTrialBest {
+                                    completed_games: episode_summaries.len(),
+                                    evaluation: checkpoint_promotion_evaluation.clone(),
+                                    config: config.clone(),
+                                    tactical_learning: tactical_learning.clone(),
+                                    policies: policies.clone(),
+                                    neural_network: latest_neural_network.clone(),
+                                    carried_world_model: current_carried_world_model_snapshot(),
+                                });
+                            println!(
+                                "checkpoint_local_trial_best_updated games_completed={} sample_games={} mean_match_fitness={:.4} best_match_fitness={:.4} mean_play_quality={:.4}",
+                                episode_summaries.len(),
+                                checkpoint_promotion_evaluation.sample_games,
+                                checkpoint_promotion_evaluation.mean_match_fitness,
+                                checkpoint_promotion_evaluation.best_match_fitness,
+                                checkpoint_promotion_evaluation.mean_play_quality,
+                            );
+                        }
                     }
                 }
             }
@@ -8733,6 +8881,7 @@ mod tests {
             tactical_learning: SoccerTacticalLearningWeights::default(),
             policies: SoccerTeamQPolicies::new(SoccerQPolicyOptions::default()),
             neural_network: None,
+            carried_world_model: None,
         }
     }
 
@@ -8775,42 +8924,67 @@ mod tests {
     }
 
     #[test]
+    fn local_trial_anchor_rejects_bad_fitness_even_when_checkpoint_is_held() {
+        let mut too_few_samples = promotion_eval(0.40, 0.30);
+        too_few_samples.rejection_reasons =
+            vec!["sample_games 6 below min_sample_games 18".to_string()];
+        assert!(policy_promotion_evaluation_can_anchor_local_trial(
+            &too_few_samples
+        ));
+
+        let mut below_mean = promotion_eval(-0.80, 0.30);
+        below_mean.rejection_reasons = vec![
+            "sample_games 6 below min_sample_games 18".to_string(),
+            "mean_match_fitness -0.8000 below min_mean_match_fitness -0.2500".to_string(),
+        ];
+        assert!(!policy_promotion_evaluation_can_anchor_local_trial(
+            &below_mean
+        ));
+    }
+
+    #[test]
     fn best_only_checkpoint_publish_requires_eligible_local_improvement() {
         let best = local_neural_trial_best_for_test(8, 0.70, 0.42);
 
         assert!(!should_publish_live_checkpoint(
             true,
             &promotion_eval(0.90, 0.70),
+            None,
             Some(&best),
             true
         ));
         assert!(!should_publish_live_checkpoint(
             true,
             &eligible_promotion_eval(0.72, 0.30),
+            None,
             Some(&best),
             false
         ));
         assert!(!should_publish_live_checkpoint(
             true,
             &eligible_promotion_eval(0.68, 0.90),
+            None,
             Some(&best),
             true
         ));
         assert!(!should_publish_live_checkpoint(
             true,
             &eligible_promotion_eval(0.70, 0.41),
+            None,
             Some(&best),
             true
         ));
         assert!(should_publish_live_checkpoint(
             true,
             &eligible_promotion_eval(0.72, 0.30),
+            None,
             Some(&best),
             true
         ));
         assert!(should_publish_live_checkpoint(
             false,
             &promotion_eval(0.10, 0.10),
+            None,
             Some(&best),
             false
         ));
@@ -8827,22 +9001,18 @@ mod tests {
         };
         let baseline = policy_promotion_incumbent_baseline_from_local_best_metadata(&metadata)
             .expect("valid local-best metadata");
-        let best = local_neural_trial_best_for_test(
-            metadata.completed_games,
-            baseline.mean_match_fitness,
-            baseline.mean_play_quality,
-        );
-
         assert!(!should_publish_live_checkpoint(
             true,
             &eligible_promotion_eval(0.8307, 0.3118),
-            Some(&best),
+            Some(baseline),
+            None,
             true
         ));
         assert!(should_publish_live_checkpoint(
             true,
             &eligible_promotion_eval(1.3300, 0.3000),
-            Some(&best),
+            Some(baseline),
+            None,
             true
         ));
     }
@@ -9562,6 +9732,7 @@ mod tests {
             config_moments: Vec::new(),
             pass_outcome_samples: Vec::new(),
             neural_network: None,
+            world_model: None,
             elapsed_seconds: 0.0,
         }
     }
@@ -9648,6 +9819,7 @@ mod tests {
             config_moments: Vec::new(),
             pass_outcome_samples: Vec::new(),
             neural_network: None,
+            world_model: None,
             elapsed_seconds: 0.0,
         };
 
