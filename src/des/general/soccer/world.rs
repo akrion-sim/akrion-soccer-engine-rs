@@ -8241,6 +8241,49 @@ impl SoccerMatch {
             })
     }
 
+    fn weighted_replan_safe_ranked_action_choice(
+        policy: &SoccerQPolicy,
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        ranked: &[SoccerLearnedActionTrace],
+        draw: f64,
+    ) -> Option<SoccerPolicyActionChoice> {
+        let candidates = ranked
+            .iter()
+            .filter(|action| action.legal)
+            .filter_map(|action| {
+                let plan = Self::learned_plan_for_policy(
+                    policy,
+                    snapshot,
+                    player_id,
+                    action.label.clone(),
+                );
+                Self::neural_mcts_candidate_plan_is_executable(snapshot, player_id, &plan)
+                    .then_some((action, plan))
+            })
+            .take(POLICY_SELECTION_TOP_RANK_LIMIT)
+            .collect::<Vec<_>>();
+        let candidate_count = candidates.len();
+        if candidate_count == 0 {
+            return None;
+        }
+        let selected_rank = soccer_policy_weighted_rank_index(candidate_count, draw);
+        candidates
+            .get(selected_rank)
+            .map(|(action, plan)| SoccerPolicyActionChoice {
+                label: action.label.clone(),
+                plan: Some(plan.clone()),
+                behavior_probability: soccer_policy_rank_probability(
+                    candidate_count,
+                    selected_rank,
+                ),
+                neural_mcts_selected: false,
+                neural_mcts_candidate_count: 0,
+                neural_mcts_discretized_kick_candidate_count: 0,
+                neural_mcts_root_discretized_kick_candidate_count: 0,
+            })
+    }
+
     fn weighted_scored_candidate_choice(
         candidates: &[SoccerNeuralMctsCandidate],
         draw: f64,
@@ -8373,25 +8416,27 @@ impl SoccerMatch {
             SOCCER_RETRIEVAL_PRIOR_RERANK_LIMIT.max(POLICY_SELECTION_TOP_RANK_LIMIT),
         )?;
         Self::apply_retrieval_prior_to_policy_actions(&mut ranked, retrieval_prior);
-        Self::weighted_ranked_action_choice(&ranked, draw).or_else(|| {
-            policy
-                .best_action_for_state_observation_with_prior(
-                    snapshot,
-                    player_id,
-                    mdp_state,
-                    observation,
-                    retrieval_prior,
-                )
-                .map(|label| SoccerPolicyActionChoice {
-                    label,
-                    plan: None,
-                    behavior_probability: 1.0,
-                    neural_mcts_selected: false,
-                    neural_mcts_candidate_count: 0,
-                    neural_mcts_discretized_kick_candidate_count: 0,
-                    neural_mcts_root_discretized_kick_candidate_count: 0,
-                })
-        })
+        Self::weighted_replan_safe_ranked_action_choice(policy, snapshot, player_id, &ranked, draw)
+            .or_else(|| Self::weighted_ranked_action_choice(&ranked, draw))
+            .or_else(|| {
+                policy
+                    .best_action_for_state_observation_with_prior(
+                        snapshot,
+                        player_id,
+                        mdp_state,
+                        observation,
+                        retrieval_prior,
+                    )
+                    .map(|label| SoccerPolicyActionChoice {
+                        label,
+                        plan: None,
+                        behavior_probability: 1.0,
+                        neural_mcts_selected: false,
+                        neural_mcts_candidate_count: 0,
+                        neural_mcts_discretized_kick_candidate_count: 0,
+                        neural_mcts_root_discretized_kick_candidate_count: 0,
+                    })
+            })
     }
 
     fn learned_action_for_player_with_context(
@@ -9769,6 +9814,15 @@ impl SoccerMatch {
             SOCCER_POLICY_RANK_SALT_EXPLORATION,
         );
         let mut choice = soccer_policy_uncertainty_weighted_ranked_action_choice(&ranked, draw)?;
+        let exploration_plan =
+            Self::learned_plan_for_policy(policy, snapshot, player_id, choice.label.clone());
+        if Self::neural_mcts_candidate_plan_is_executable(snapshot, player_id, &exploration_plan) {
+            choice.plan = Some(exploration_plan);
+        } else {
+            choice = Self::weighted_replan_safe_ranked_action_choice(
+                policy, snapshot, player_id, &ranked, draw,
+            )?;
+        }
         let fallback_probability = self.weighted_policy_action_probability_for_player(
             policy,
             snapshot,
