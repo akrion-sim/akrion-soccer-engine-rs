@@ -67,7 +67,7 @@ impl EntityEncoder {
         let scores = (q.matmul(&k.t()?)? / scale)?; // (N, N)
         let attn = softmax(&scores, D::Minus1)?;
         let ctx = attn.matmul(&v)?; // (N, d)
-        ctx.mean(0) // mean-pool over entities → permutation-invariant (d)
+        ctx.mean_keepdim(0) // mean-pool over entities → permutation-invariant (1, d)
     }
 }
 
