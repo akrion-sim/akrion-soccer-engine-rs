@@ -10077,7 +10077,32 @@ impl SoccerMatch {
                     return None;
                 }
                 let action_index = soccer_policy_action_index(&transition.action)?;
-                let advantage = if rejected_counterexample {
+                // COMA-analytic advantage (gated): reconstruct the raw return and subtract the
+                // DETACHED tabular baseline V_analytic(s) = best_value_hierarchical(current s) from
+                // the SEPARATE tabular policy, so policy-gradient rewards the actor for BEATING
+                // analytic rather than matching it (the escape from value-imitation parity). Raw
+                // reward units throughout (reward_adv / values are ×target_scale; tabular Q is raw),
+                // so no rescale. Gate off ⇒ the original SARSA-style advantage, byte-identical.
+                let advantage = if dd_soccer_enable_coma_analytic_advantage() {
+                    let mut adv = if rejected_counterexample {
+                        reward_adv[index]
+                    } else {
+                        advantages[index] + values[index]
+                    };
+                    let baseline = self.team_policies.as_ref().and_then(|policies| {
+                        let key = SoccerQStateKey::from_parts(
+                            &transition.state,
+                            &transition.observation,
+                            transition.team,
+                            transition.role,
+                        );
+                        policies.policy(transition.team).best_value_hierarchical(&key)
+                    });
+                    if let Some(baseline) = baseline.filter(|value| value.is_finite()) {
+                        adv -= baseline;
+                    }
+                    adv
+                } else if rejected_counterexample {
                     reward_adv[index] - values[index]
                 } else {
                     advantages[index]
