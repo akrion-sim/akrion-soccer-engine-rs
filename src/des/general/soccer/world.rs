@@ -30,6 +30,8 @@ const NEURAL_MCTS_KICK_POWER_CANDIDATE_LIMIT_MAX: usize = 5;
 const NEURAL_MCTS_MIN_DISCRETIZED_KICK_CANDIDATES: usize = 0;
 const NEURAL_MCTS_PASS_MPC_PRIOR_WEIGHT: f64 = 0.55;
 const NEURAL_MCTS_TECHNICAL_MPC_EXECUTION_WEIGHT: f64 = 0.75;
+const NEURAL_MCTS_MIN_REPLAN_SAFE_EXECUTION_PROBABILITY: f64 =
+    LEARNED_MPC_SOFT_REPLAN_MAX_ORIGINAL_PROBABILITY;
 const NEURAL_MCTS_DISCRETIZED_KICK_BASE_VALUE_WEIGHT: f64 = 0.0;
 const NEURAL_MCTS_DISCRETIZED_KICK_SELECTION_FLOOR: f64 = 0.0;
 const NEURAL_MCTS_DISCRETIZED_KICK_SELECTION_MAX_SCORE_REGRESSION: f64 = 1.50;
@@ -186,12 +188,33 @@ fn neural_mcts_technical_mpc_execution_weight() -> f64 {
     )
 }
 
+fn neural_mcts_min_replan_safe_execution_probability() -> f64 {
+    learned_mpc_metric_env(
+        "SOCCER_NEURAL_MCTS_MIN_REPLAN_SAFE_EXECUTION_PROBABILITY",
+        NEURAL_MCTS_MIN_REPLAN_SAFE_EXECUTION_PROBABILITY,
+        0.0,
+        1.0,
+    )
+}
+
 fn neural_mcts_mpc_execution_probability_bonus(probability: f64, weight: f64) -> f64 {
     if weight <= 0.0 {
         return 0.0;
     }
     let probability = finite_unit_interval(probability);
     (probability - 0.58).clamp(-0.60, 0.40) * weight
+}
+
+fn neural_mcts_replan_safe_execution_probability(action: &str, probability: f64) -> bool {
+    let label = normalize_soccer_action_label(action);
+    if matches!(label, "shoot" | "first-time-shot" | "first-time-header") {
+        return true;
+    }
+    let thresholds = learned_mpc_replan_thresholds();
+    let min_safe_probability = neural_mcts_min_replan_safe_execution_probability()
+        .max(thresholds.soft_max_original_probability)
+        .clamp(0.0, 1.0);
+    finite_unit_interval(probability) > min_safe_probability
 }
 
 fn neural_mcts_discretized_kick_base_value_weight() -> f64 {
@@ -4497,6 +4520,11 @@ mod tests {
 
     #[test]
     fn neural_mcts_candidate_filter_rejects_hard_mpc_replan_plans() {
+        let _env_lock = soccer_world_env_lock();
+        let _min_safe = set_test_env_var(
+            "SOCCER_NEURAL_MCTS_MIN_REPLAN_SAFE_EXECUTION_PROBABILITY",
+            "0.55",
+        );
         let sim = SoccerMatch::default_11v11(MatchConfig::default());
         let snapshot = WorldSnapshot::from_match(&sim);
         let impossible_pass = SoccerLearnedPlan {
@@ -4505,8 +4533,8 @@ mod tests {
             target_point: None,
             mpc_replan: None,
         };
-        let hold = SoccerLearnedPlan {
-            action: "hold".to_string(),
+        let non_mpc_placeholder = SoccerLearnedPlan {
+            action: "debug-non-mpc-placeholder".to_string(),
             target_player: None,
             target_point: None,
             mpc_replan: None,
@@ -4517,8 +4545,24 @@ mod tests {
             "MCTS should not select a plan that the MPC layer must immediately replan"
         );
         assert!(
-            SoccerMatch::neural_mcts_candidate_plan_is_executable(&snapshot, 5, &hold),
-            "ordinary non-MPC plans should stay eligible"
+            SoccerMatch::neural_mcts_candidate_plan_is_executable(
+                &snapshot,
+                5,
+                &non_mpc_placeholder
+            ),
+            "plans without an MPC execution probability should stay eligible"
+        );
+        assert!(
+            !neural_mcts_replan_safe_execution_probability("pass", 0.54),
+            "MCTS should not keep pass/dribble candidates in the soft-replan probability band"
+        );
+        assert!(
+            neural_mcts_replan_safe_execution_probability("pass", 0.70),
+            "high-probability pass futures should stay eligible"
+        );
+        assert!(
+            neural_mcts_replan_safe_execution_probability("first-time-shot", 0.20),
+            "shot candidates are governed by shot value/accuracy, not the pass/dribble soft-replan band"
         );
     }
 
@@ -8777,7 +8821,19 @@ impl SoccerMatch {
         player_id: usize,
         plan: &SoccerLearnedPlan,
     ) -> bool {
-        !Self::learned_plan_needs_mpc_replan(snapshot, player_id, plan)
+        if Self::learned_plan_needs_mpc_replan(snapshot, player_id, plan) {
+            return false;
+        }
+        let label = normalize_soccer_action_label(&plan.action);
+        if matches!(label, "shoot" | "first-time-shot" | "first-time-header") {
+            return true;
+        }
+        let Some(probability) =
+            Self::learned_plan_mpc_execution_probability(snapshot, player_id, plan)
+        else {
+            return true;
+        };
+        neural_mcts_replan_safe_execution_probability(label, probability)
     }
 
     fn neural_mcts_action_from_candidates(
