@@ -6548,6 +6548,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         "SOCCER_NEURAL_BATCH_SNAPSHOT_VALIDATE_GAMES",
         DEFAULT_SOCCER_NEURAL_BATCH_SNAPSHOT_VALIDATE_GAMES,
     )?;
+    let neural_batch_snapshot_validate_candidates =
+        env_usize("SOCCER_NEURAL_BATCH_SNAPSHOT_VALIDATE_CANDIDATES", 1)?.max(1);
     let neural_batch_snapshot_validate_minutes = env_f64(
         "SOCCER_NEURAL_BATCH_SNAPSHOT_VALIDATE_MINUTES",
         neural_population_search_config.eval_minutes,
@@ -7331,8 +7333,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         neural_batch_snapshot_carry_no_publishable,
     );
     println!(
-        "neural_batch_snapshot_validation games={} eval_minutes={:.2} min_fitness={:.4} min_goal_margin={:.4} carry_min_fitness={:.4} carry_min_goal_margin={:.4}",
+        "neural_batch_snapshot_validation games={} candidates={} eval_minutes={:.2} min_fitness={:.4} min_goal_margin={:.4} carry_min_fitness={:.4} carry_min_goal_margin={:.4}",
         neural_batch_snapshot_validate_games,
+        neural_batch_snapshot_validate_candidates,
         neural_batch_snapshot_validate_minutes,
         neural_batch_snapshot_validate_min_fitness,
         neural_batch_snapshot_validate_min_goal_margin,
@@ -7606,15 +7609,25 @@ fn run() -> Result<(), Box<dyn Error>> {
         };
         let mut selected_neural_snapshot_episode = None::<usize>;
         let mut carried_unvalidated_neural_snapshot_episode = None::<usize>;
-        if let Some(selection) = select_batch_neural_snapshot(
-            &mut completed_games,
-            neural_batch_snapshot_selection_mode,
-            analytic_neural_opponent,
-            neural_batch_snapshot_max_fitness_regression,
-            neural_batch_snapshot_min_fitness,
-            neural_batch_snapshot_min_batch_mean_fitness,
-            neural_batch_snapshot_rescue_min_fitness,
-        ) {
+        let mut neural_batch_snapshot_attempted = false;
+        let mut neural_batch_snapshot_attempts = 0usize;
+        while selected_neural_snapshot_episode.is_none()
+            && carried_unvalidated_neural_snapshot_episode.is_none()
+            && neural_batch_snapshot_attempts < neural_batch_snapshot_validate_candidates
+        {
+            let Some(selection) = select_batch_neural_snapshot(
+                &mut completed_games,
+                neural_batch_snapshot_selection_mode,
+                analytic_neural_opponent,
+                neural_batch_snapshot_max_fitness_regression,
+                neural_batch_snapshot_min_fitness,
+                neural_batch_snapshot_min_batch_mean_fitness,
+                neural_batch_snapshot_rescue_min_fitness,
+            ) else {
+                break;
+            };
+            neural_batch_snapshot_attempted = true;
+            neural_batch_snapshot_attempts += 1;
             let BatchNeuralSnapshotSelection {
                 episode: selected_episode,
                 match_fitness: selected_match_fitness,
@@ -7655,10 +7668,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                             neural_batch_snapshot_validate_min_goal_margin,
                         ) {
                             println!(
-                                "neural_batch_snapshot_validation_passed episodes={}..{} selected_episode={} eval_games={} fitness={:.4} goal_margin={:.4} record={}-{}-{} goals={}-{}",
+                                "neural_batch_snapshot_validation_passed episodes={}..{} selected_episode={} attempt={} eval_games={} fitness={:.4} goal_margin={:.4} record={}-{}-{} goals={}-{}",
                                 batch_start_episode + 1,
                                 batch_start_episode + batch_size,
                                 selected_episode,
+                                neural_batch_snapshot_attempts,
                                 neural_batch_snapshot_validate_games,
                                 eval.fitness,
                                 goal_margin,
@@ -7678,11 +7692,12 @@ fn run() -> Result<(), Box<dyn Error>> {
                                 neural_batch_snapshot_carry_min_validation_goal_margin,
                             );
                             println!(
-                                "neural_batch_snapshot_validation_held episodes={}..{} selected_episode={} selected_match_fitness={:.4} eval_games={} fitness={:.4} goal_margin={:.4} min_fitness={:.4} min_goal_margin={:.4} record={}-{}-{} goals={}-{}",
+                                "neural_batch_snapshot_validation_held episodes={}..{} selected_episode={} selected_match_fitness={:.4} attempt={} eval_games={} fitness={:.4} goal_margin={:.4} min_fitness={:.4} min_goal_margin={:.4} record={}-{}-{} goals={}-{}",
                                 batch_start_episode + 1,
                                 batch_start_episode + batch_size,
                                 selected_episode,
                                 selected_match_fitness,
+                                neural_batch_snapshot_attempts,
                                 neural_batch_snapshot_validate_games,
                                 eval.fitness,
                                 goal_margin,
@@ -7698,11 +7713,13 @@ fn run() -> Result<(), Box<dyn Error>> {
                         }
                     }
                     Err(error) => {
+                        validation_carry_allowed = false;
                         println!(
-                            "neural_batch_snapshot_validation_error episodes={}..{} selected_episode={} error={}",
+                            "neural_batch_snapshot_validation_error episodes={}..{} selected_episode={} attempt={} error={}",
                             batch_start_episode + 1,
                             batch_start_episode + batch_size,
                             selected_episode,
+                            neural_batch_snapshot_attempts,
                             error.replace(char::is_whitespace, "_"),
                         );
                         validation_failed = true;
@@ -7756,13 +7773,14 @@ fn run() -> Result<(), Box<dyn Error>> {
                 );
             } else if neural_batch_snapshot_carry_unvalidated {
                 println!(
-                    "neural_batch_snapshot_carry_unvalidated_held episodes={}..{} snapshots={} selection_mode={} held_episode={} held_match_fitness={:.4} validation_fitness={} validation_goal_margin={} carry_min_fitness={:.4} carry_min_goal_margin={:.4} reason=validation_floor publish_selected=false",
+                    "neural_batch_snapshot_carry_unvalidated_held episodes={}..{} snapshots={} selection_mode={} held_episode={} held_match_fitness={:.4} attempt={} validation_fitness={} validation_goal_margin={} carry_min_fitness={:.4} carry_min_goal_margin={:.4} reason=validation_floor publish_selected=false",
                     batch_start_episode + 1,
                     batch_start_episode + batch_size,
                     selected_snapshot_count,
                     neural_batch_snapshot_selection_mode.label(),
                     selected_episode,
                     selected_match_fitness,
+                    neural_batch_snapshot_attempts,
                     validation_carry_fitness
                         .map(|fitness| format!("{fitness:.4}"))
                         .unwrap_or_else(|| "unavailable".to_string()),
@@ -7773,7 +7791,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                     neural_batch_snapshot_carry_min_validation_goal_margin,
                 );
             }
-        } else if neural_batch_snapshot_count > 0 {
+        }
+        if !neural_batch_snapshot_attempted && neural_batch_snapshot_count > 0 {
             println!(
                 "neural_batch_snapshot_held episodes={}..{} snapshots={} selection_mode={} mean_match_fitness={:.4} best_match_fitness={:.4} min_snapshot_fitness={:.4} min_batch_mean_fitness={:.4} rescue_min_fitness={:.4}",
                 batch_start_episode + 1,
@@ -7785,6 +7804,17 @@ fn run() -> Result<(), Box<dyn Error>> {
                 neural_batch_snapshot_min_fitness,
                 neural_batch_snapshot_min_batch_mean_fitness,
                 neural_batch_snapshot_rescue_min_fitness,
+            );
+        } else if neural_batch_snapshot_attempted
+            && selected_neural_snapshot_episode.is_none()
+            && carried_unvalidated_neural_snapshot_episode.is_none()
+        {
+            println!(
+                "neural_batch_snapshot_validation_candidates_exhausted episodes={}..{} attempts={} max_candidates={} publish_selected=false carry_selected=false",
+                batch_start_episode + 1,
+                batch_start_episode + batch_size,
+                neural_batch_snapshot_attempts,
+                neural_batch_snapshot_validate_candidates,
             );
         }
         if should_carry_no_publishable_neural_snapshot(
