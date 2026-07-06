@@ -1,0 +1,12 @@
+[package]
+name = "burn-pomdp-solver"
+version = "0.0.1"
+edition = "2021"
+description = "Burn-backed recurrent, permutation-invariant CTDE actor-critic — a real learned POMDP solver for the soccer engine (Lock-2). Trains via autodiff + Adam; MultiHeadAttention over entities + GRU belief over decisions."
+
+[dependencies]
+burn = { version = "0.16", features = ["ndarray", "autodiff"] }
+
+[features]
+# Apple Metal GPU via wgpu (add when scaling up):
+wgpu = ["burn/wgpu"]
