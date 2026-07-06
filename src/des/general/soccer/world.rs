@@ -4863,6 +4863,10 @@ mod tests {
         let _env_lock = soccer_world_env_lock();
         let _gate = set_test_env_var("DD_SOCCER_ENABLE_DISCRETIZED_KICK", "1");
         let _floor = set_test_env_var("SOCCER_NEURAL_MCTS_MIN_DISCRETIZED_KICK_CANDIDATES", "1");
+        let _max_regression = set_test_env_var(
+            "SOCCER_NEURAL_MCTS_DISCRETIZED_KICK_SELECTION_MAX_SCORE_REGRESSION",
+            "0.75",
+        );
         let candidates = vec![
             SoccerNeuralMctsCandidate {
                 label: "shoot".to_string(),
@@ -4888,7 +4892,7 @@ mod tests {
             SoccerNeuralMctsCandidate {
                 label: "pass1-kp7".to_string(),
                 plan: None,
-                score: 0.1,
+                score: 0.4,
                 prior: 0.0,
                 q_visits: 1,
             },
@@ -4909,6 +4913,10 @@ mod tests {
         let _env_lock = soccer_world_env_lock();
         let _gate = set_test_env_var("DD_SOCCER_ENABLE_DISCRETIZED_KICK", "1");
         let _floor = set_test_env_var("SOCCER_NEURAL_MCTS_MIN_DISCRETIZED_KICK_CANDIDATES", "1");
+        let _max_regression = set_test_env_var(
+            "SOCCER_NEURAL_MCTS_DISCRETIZED_KICK_SELECTION_MAX_SCORE_REGRESSION",
+            "0.75",
+        );
         let node = |label: &str, raw_score: f64, visits: u32| SoccerNeuralMctsNode {
             label: label.to_string(),
             plan: None,
@@ -4923,7 +4931,7 @@ mod tests {
             node("shoot", 1.0, 4),
             node("pass", 0.9, 3),
             node("dribble", 0.8, 2),
-            node("pass1-kp7", 0.1, 0),
+            node("pass1-kp7", 0.4, 0),
         ];
 
         SoccerMatch::ensure_sampleable_discretized_kick_nodes(&mut nodes, 3);
@@ -4934,6 +4942,50 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(sampleable.contains(&"pass1-kp7"));
         assert!(!sampleable.contains(&"dribble"));
+    }
+
+    #[test]
+    fn neural_mcts_discretized_kick_floor_rejects_weak_bucket_without_prior() {
+        let _env_lock = soccer_world_env_lock();
+        let _gate = set_test_env_var("DD_SOCCER_ENABLE_DISCRETIZED_KICK", "1");
+        let _floor = set_test_env_var("SOCCER_NEURAL_MCTS_MIN_DISCRETIZED_KICK_CANDIDATES", "1");
+        let _strict_regression = set_test_env_var(
+            "SOCCER_NEURAL_MCTS_DISCRETIZED_KICK_SELECTION_MAX_SCORE_REGRESSION",
+            "0.25",
+        );
+        let _exploration_regression = set_test_env_var(
+            "SOCCER_NEURAL_MCTS_DISCRETIZED_KICK_EXPLORATION_MAX_SCORE_REGRESSION",
+            "2.00",
+        );
+        let _min_prior = set_test_env_var(
+            "SOCCER_NEURAL_MCTS_DISCRETIZED_KICK_EXPLORATION_MIN_PRIOR",
+            "0.05",
+        );
+        let node = |label: &str, raw_score: f64, prior: f64, visits: u32| SoccerNeuralMctsNode {
+            label: label.to_string(),
+            plan: None,
+            raw_score,
+            value_estimate: raw_score,
+            prior,
+            q_visits: 1,
+            search_visits: visits,
+            total_value: raw_score * f64::from(visits.max(1)),
+        };
+        let mut nodes = vec![
+            node("shoot", 1.0, 0.6, 4),
+            node("pass", 0.9, 0.3, 3),
+            node("dribble", 0.8, 0.2, 2),
+            node("pass1-kp7", 0.1, 0.0, 0),
+        ];
+
+        SoccerMatch::ensure_sampleable_discretized_kick_nodes(&mut nodes, 3);
+
+        let sampleable = nodes[..3]
+            .iter()
+            .map(|node| node.label.as_str())
+            .collect::<Vec<_>>();
+        assert!(sampleable.contains(&"dribble"));
+        assert!(!sampleable.contains(&"pass1-kp7"));
     }
 
     #[test]
@@ -9260,13 +9312,14 @@ impl SoccerMatch {
             .min(POLICY_SELECTION_TOP_RANK_LIMIT)
         {
             let node = &nodes[rank];
-            if learned_discretized_kick_speed_bucket_for_action_label(&node.label).is_none() {
-                continue;
-            }
-            if node.raw_score + max_regression < best_score {
-                continue;
-            }
-            if min_prior > 0.0 && node.prior < min_prior {
+            if !Self::discretized_kick_floor_eligible_in_band(
+                &node.label,
+                node.raw_score,
+                node.prior,
+                best_score,
+                max_regression,
+                min_prior,
+            ) {
                 continue;
             }
             let weight = rank_weights[rank].max(0.0);
@@ -9278,6 +9331,53 @@ impl SoccerMatch {
             total += weight;
         }
         (eligible, eligible_count, total)
+    }
+
+    fn discretized_kick_floor_eligible_in_band(
+        label: &str,
+        raw_score: f64,
+        prior: f64,
+        best_score: f64,
+        max_regression: f64,
+        min_prior: f64,
+    ) -> bool {
+        if learned_discretized_kick_speed_bucket_for_action_label(label).is_none() {
+            return false;
+        }
+        if !raw_score.is_finite()
+            || !best_score.is_finite()
+            || !max_regression.is_finite()
+            || max_regression < 0.0
+        {
+            return false;
+        }
+        if raw_score + max_regression < best_score {
+            return false;
+        }
+        min_prior <= 0.0 || prior >= min_prior
+    }
+
+    fn discretized_kick_floor_candidate_is_eligible(
+        label: &str,
+        raw_score: f64,
+        prior: f64,
+        best_score: f64,
+    ) -> bool {
+        Self::discretized_kick_floor_eligible_in_band(
+            label,
+            raw_score,
+            prior,
+            best_score,
+            neural_mcts_discretized_kick_selection_max_score_regression(),
+            0.0,
+        ) || Self::discretized_kick_floor_eligible_in_band(
+            label,
+            raw_score,
+            prior,
+            best_score,
+            neural_mcts_discretized_kick_exploration_max_score_regression(),
+            neural_mcts_discretized_kick_exploration_min_prior(),
+        )
     }
 
     fn has_selectable_discretized_kick_node(
@@ -9316,10 +9416,22 @@ impl SoccerMatch {
         let desired = neural_mcts_min_discretized_kick_candidates()
             .min(sampleable_count)
             .min(nodes.len());
+        let best_score = nodes[..sampleable_count]
+            .iter()
+            .map(|node| node.raw_score)
+            .fold(f64::NEG_INFINITY, f64::max);
+        if !best_score.is_finite() {
+            return;
+        }
         let mut current = nodes[..sampleable_count]
             .iter()
             .filter(|node| {
-                learned_discretized_kick_speed_bucket_for_action_label(&node.label).is_some()
+                Self::discretized_kick_floor_candidate_is_eligible(
+                    &node.label,
+                    node.raw_score,
+                    node.prior,
+                    best_score,
+                )
             })
             .count();
         while current < desired {
@@ -9329,9 +9441,13 @@ impl SoccerMatch {
                     .enumerate()
                     .skip(sampleable_count)
                     .find_map(|(index, node)| {
-                        learned_discretized_kick_speed_bucket_for_action_label(&node.label)
-                            .is_some()
-                            .then_some(index)
+                        Self::discretized_kick_floor_candidate_is_eligible(
+                            &node.label,
+                            node.raw_score,
+                            node.prior,
+                            best_score,
+                        )
+                        .then_some(index)
                     })
             else {
                 return;
@@ -9371,17 +9487,34 @@ impl SoccerMatch {
         if min_discretized == 0 {
             return root;
         }
+        let best_score = root
+            .iter()
+            .map(|candidate| candidate.score)
+            .fold(f64::NEG_INFINITY, f64::max);
+        if !best_score.is_finite() {
+            return root;
+        }
         let mut discretized_count = root
             .iter()
             .filter(|candidate| {
-                learned_discretized_kick_speed_bucket_for_action_label(&candidate.label).is_some()
+                Self::discretized_kick_floor_candidate_is_eligible(
+                    &candidate.label,
+                    candidate.score,
+                    candidate.prior,
+                    best_score,
+                )
             })
             .count();
         for candidate in candidates.iter().skip(candidate_count) {
             if discretized_count >= min_discretized {
                 break;
             }
-            if learned_discretized_kick_speed_bucket_for_action_label(&candidate.label).is_none() {
+            if !Self::discretized_kick_floor_candidate_is_eligible(
+                &candidate.label,
+                candidate.score,
+                candidate.prior,
+                best_score,
+            ) {
                 continue;
             }
             if root.iter().any(|current| current.label == candidate.label) {
