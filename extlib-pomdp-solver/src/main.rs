@@ -21,8 +21,8 @@ fn main() -> candle_core::Result<()> {
         let entities = Tensor::randn(0f32, 1.0, (n_entities, entity_dim), &dev)?;
         let out = net.step(&entities, &hidden)?;
         hidden = out.hidden;
-        let logits = out.policy_logits.to_vec1::<f32>()?;
-        let value = out.value.to_vec1::<f32>()?;
+        let logits = out.policy_logits.flatten_all()?.to_vec1::<f32>()?;
+        let value = out.value.flatten_all()?.to_vec1::<f32>()?;
         println!(
             "decision {t}: value={:.4}  argmax_action={}  belief_norm={:.4}",
             value[0],
