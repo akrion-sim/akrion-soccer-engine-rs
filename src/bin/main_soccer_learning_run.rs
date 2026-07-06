@@ -2993,6 +2993,9 @@ struct LearningActionOutcomeStats {
     replanned: usize,
     discretized_kick: usize,
     mpc_feasibility_sum: f64,
+    pass_receipt_probability_sum: f64,
+    pass_receipt_qp_fit_sum: f64,
+    pass_receipt_race_advantage_seconds_sum: f64,
     chosen_probability_sum: f64,
     score_margin_sum: f64,
     target_forward_yards_sum: f64,
@@ -3019,6 +3022,15 @@ impl LearningActionOutcomeStats {
         }
         self.mpc_feasibility_sum +=
             finite_log_metric(transition.decision_context.chosen_action_mpc_feasibility);
+        self.pass_receipt_probability_sum +=
+            finite_log_metric(transition.decision_context.pass_mpc_receipt_probability);
+        self.pass_receipt_qp_fit_sum +=
+            finite_log_metric(transition.decision_context.pass_receipt_qp_accel_fit);
+        self.pass_receipt_race_advantage_seconds_sum += finite_log_metric(
+            transition
+                .decision_context
+                .pass_receipt_race_advantage_seconds,
+        );
         self.chosen_probability_sum +=
             finite_log_metric(transition.decision_context.chosen_action_probability);
         self.score_margin_sum += finite_log_metric(transition.decision_context.action_score_margin);
@@ -3043,6 +3055,30 @@ impl LearningActionOutcomeStats {
             0.0
         } else {
             self.mpc_feasibility_sum / self.count as f64
+        }
+    }
+
+    fn mean_pass_receipt_probability(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.pass_receipt_probability_sum / self.count as f64
+        }
+    }
+
+    fn mean_pass_receipt_qp_fit(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.pass_receipt_qp_fit_sum / self.count as f64
+        }
+    }
+
+    fn mean_pass_receipt_race_advantage_seconds(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.pass_receipt_race_advantage_seconds_sum / self.count as f64
         }
     }
 
@@ -3156,7 +3192,7 @@ fn learning_action_outcome_top(buckets: &BTreeMap<String, LearningActionOutcomeS
         .take(10)
         .map(|(action, stats)| {
             format!(
-                "{}:n={},rmean={:.4},rsum={:.2},pos={},neg={},mcts={},replan={},dk={},mpc={:.3},prob={:.3},margin={:.3},tfwd={:.2},rfwd={:.2}",
+                "{}:n={},rmean={:.4},rsum={:.2},pos={},neg={},mcts={},replan={},dk={},mpc={:.3},receipt={:.3},qp={:.3},race={:.2},prob={:.3},margin={:.3},tfwd={:.2},rfwd={:.2}",
                 action,
                 stats.count,
                 stats.mean_reward(),
@@ -3167,6 +3203,9 @@ fn learning_action_outcome_top(buckets: &BTreeMap<String, LearningActionOutcomeS
                 stats.replanned,
                 stats.discretized_kick,
                 stats.mean_mpc_feasibility(),
+                stats.mean_pass_receipt_probability(),
+                stats.mean_pass_receipt_qp_fit(),
+                stats.mean_pass_receipt_race_advantage_seconds(),
                 stats.mean_chosen_probability(),
                 stats.mean_score_margin(),
                 stats.mean_target_forward_yards(),
@@ -3183,7 +3222,7 @@ fn learning_action_outcome_top(buckets: &BTreeMap<String, LearningActionOutcomeS
 
 fn learning_action_outcome_entry(action: &str, stats: &LearningActionOutcomeStats) -> String {
     format!(
-        "{}:n={},rmean={:.4},rsum={:.2},pos={},neg={},mcts={},replan={},dk={},mpc={:.3},prob={:.3},margin={:.3},tfwd={:.2},rfwd={:.2}",
+        "{}:n={},rmean={:.4},rsum={:.2},pos={},neg={},mcts={},replan={},dk={},mpc={:.3},receipt={:.3},qp={:.3},race={:.2},prob={:.3},margin={:.3},tfwd={:.2},rfwd={:.2}",
         action,
         stats.count,
         stats.mean_reward(),
@@ -3194,6 +3233,9 @@ fn learning_action_outcome_entry(action: &str, stats: &LearningActionOutcomeStat
         stats.replanned,
         stats.discretized_kick,
         stats.mean_mpc_feasibility(),
+        stats.mean_pass_receipt_probability(),
+        stats.mean_pass_receipt_qp_fit(),
+        stats.mean_pass_receipt_race_advantage_seconds(),
         stats.mean_chosen_probability(),
         stats.mean_score_margin(),
         stats.mean_target_forward_yards(),

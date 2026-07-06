@@ -4570,6 +4570,36 @@ mod tests {
     }
 
     #[test]
+    fn neural_mcts_context_filter_rejects_low_feasibility_pass_transitions() {
+        let _env_lock = soccer_world_env_lock();
+        let _min_safe = set_test_env_var(
+            "SOCCER_NEURAL_MCTS_MIN_REPLAN_SAFE_EXECUTION_PROBABILITY",
+            "0.55",
+        );
+        let mut transition = policy_test_transition_with_mcts(true);
+        transition.action = "pass1-kp7".to_string();
+        transition.decision_context.chosen_action_mpc_feasibility = 0.33;
+
+        assert!(
+            !SoccerMatch::neural_mcts_transition_context_is_executable(&transition),
+            "MCTS should not train/select learned pass buckets whose final transition context is low-feasibility"
+        );
+
+        transition.decision_context.chosen_action_mpc_feasibility = 0.70;
+        assert!(
+            SoccerMatch::neural_mcts_transition_context_is_executable(&transition),
+            "high-feasibility learned pass buckets should remain eligible"
+        );
+
+        transition.action = "first-time-shot".to_string();
+        transition.decision_context.chosen_action_mpc_feasibility = 0.20;
+        assert!(
+            SoccerMatch::neural_mcts_transition_context_is_executable(&transition),
+            "shot candidates are scored by shot value and accuracy rather than pass/dribble feasibility"
+        );
+    }
+
+    #[test]
     fn learned_plan_uses_policy_target_grid_for_concrete_target_points() {
         let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
         let actor = sim
@@ -8971,6 +9001,17 @@ impl SoccerMatch {
         neural_mcts_replan_safe_execution_probability(label, probability)
     }
 
+    fn neural_mcts_transition_context_is_executable(transition: &SoccerLearningTransition) -> bool {
+        let label = normalize_soccer_action_label(&transition.action);
+        if pass_like_action_flight(label).is_some() || is_dribble_action_label(label) {
+            return neural_mcts_replan_safe_execution_probability(
+                label,
+                transition.decision_context.chosen_action_mpc_feasibility,
+            );
+        }
+        true
+    }
+
     fn neural_mcts_action_from_candidates(
         blend: SoccerNeuralBlendConfig,
         candidates: &[SoccerNeuralMctsCandidate],
@@ -9665,6 +9706,9 @@ impl SoccerMatch {
                     &candidate_plan,
                 );
                 let candidate_label = transition.action.clone();
+                if !Self::neural_mcts_transition_context_is_executable(&transition) {
+                    return;
+                }
                 let discretized_kick_candidate =
                     learned_discretized_kick_speed_bucket_for_action_label(&candidate_label)
                         .is_some();
