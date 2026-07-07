@@ -165,6 +165,37 @@ state rows.
   - **Revised priority:** Step 1 (cheap off-ball capability A/B: flip run/support gates, read
     SOT/game) is now the highest-value *next* experiment, ahead of any further pitch_value work.
 
+## ACTION LOG — 2026-07-07 (execution, continued)
+
+**Gate-default audit — most "levers" are already spent.** Auditing release (`cfg(not(test))`)
+defaults revealed the incumbent stuck at 0.53 already ships nearly everything:
+- **Default-ON (spent, in the 0.53 baseline):** `pitch_value` reward, `support_scorer`,
+  `run_prediction_model`, `onside_support_model`, `xt_terminal_cost`. NB their comments say they
+  run an **analytic seed until a warm head is installed** — plumbed-on ≠ trained-and-contributing.
+- **Default-OFF (genuinely unspent):** `DD_SOCCER_ENABLE_LEARNED_LONG_PASS_RUN`,
+  `DD_SOCCER_ENABLE_MULTIMODAL_RUN_PREDICTION`, `DD_SOCCER_ENABLE_RELATIONAL_ATTENTION`.
+
+**Consequence:** "flip a gate" is mostly *not* a lever — the off-ball support machinery is
+already on. The real climb is (a) making those on-but-analytic-seed heads actually *learn*
+better than their seed (needs the EPV reward, Step 2), and (b) the few genuinely-off levers.
+
+**Killed the pitch_value ablation** (diagnostic-only of an already-on feature) and pivoted CPU to
+the first real climb attempt on an **unspent** lever.
+
+**Launched the off-ball behavioral A/B** — `scripts/run_gate_ab.sh` (reusable generic gate A/B):
+- baseline = clean incumbent defaults (via `env -i`; note MULTIMODAL uses `.is_ok()` so "off"
+  means UNSET, not `=0`);
+- treatment = `MULTIMODAL_RUN_PREDICTION=1 + LEARNED_LONG_PASS_RUN=1`;
+- both fixed-73, 80 train / 140 held-out eval, eval in the lever-active world.
+- Pre-registered: Wilson lower bound(treatment vs baseline) > 0.500 = the lever climbs; secondary
+  reads = goals/game and draw-rate. Artifacts `/tmp/gate-ab-offball/`, verdict in `verdict.log`.
+- Caveat (Codex): no per-team head isolation, so eval applies the lever to both brains — this is a
+  detection test ("did training WITH the lever build a stronger policy for the lever-on world"),
+  not a diverse-field promotion proof.
+
+**Queued next if this is flat:** relational-attention + capacity (own run, larger train budget,
+since representational upgrades need more data), then the EPV possession-chain export (Step 2).
+
 ## One-line summary
 
 The ceiling is structural: the net is a *selector over analytic candidates* optimizing
