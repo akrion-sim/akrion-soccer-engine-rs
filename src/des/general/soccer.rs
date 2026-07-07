@@ -14420,10 +14420,24 @@ fn ranked_pass_action_family(action: &str) -> Option<&'static str> {
     })
 }
 
+fn ranked_shot_action_family(action: &str) -> Option<&'static str> {
+    match action.trim() {
+        "shoot" => Some("shoot"),
+        "first-time-shot" => Some("first-time-shot"),
+        _ => None,
+    }
+}
+
+fn learned_discretized_kick_action_family(action: &str) -> Option<&'static str> {
+    ranked_pass_action_family(action).or_else(|| ranked_shot_action_family(action))
+}
+
 fn learned_discretized_kick_suffix_parts(action: &str) -> Option<(&str, u8)> {
     let (base, suffix) = action.trim().rsplit_once("-kp")?;
     let bucket = suffix.parse::<u8>().ok()?;
-    if bucket >= DISCRETIZED_KICK_SPEED_BUCKETS || ranked_pass_action_family(base).is_none() {
+    if bucket >= DISCRETIZED_KICK_SPEED_BUCKETS
+        || learned_discretized_kick_action_family(base).is_none()
+    {
         return None;
     }
     Some((base, bucket))
@@ -14431,7 +14445,9 @@ fn learned_discretized_kick_suffix_parts(action: &str) -> Option<(&str, u8)> {
 
 pub(crate) fn learned_discretized_kick_candidate_label(base: &str, bucket: u8) -> Option<String> {
     let base = base.trim();
-    if bucket >= DISCRETIZED_KICK_SPEED_BUCKETS || ranked_pass_action_family(base).is_none() {
+    if bucket >= DISCRETIZED_KICK_SPEED_BUCKETS
+        || learned_discretized_kick_action_family(base).is_none()
+    {
         return None;
     }
     Some(format!("{base}-kp{bucket}"))
@@ -14461,6 +14477,9 @@ fn normalize_soccer_action_label(action: &str) -> &str {
     if let Some(family) = ranked_pass_action_family(action) {
         return family;
     }
+    if let Some(family) = ranked_shot_action_family(action) {
+        return family;
+    }
     // Alias -> canonical mapping is centralised in `SoccerActionLabel`
     // (soccer/labels.rs). Unrecognised labels pass straight through with no
     // allocation, exactly as the old `other => other` arm did.
@@ -14469,7 +14488,8 @@ fn normalize_soccer_action_label(action: &str) -> &str {
 
 fn learned_mpc_action_label_key(action: &str) -> String {
     let trimmed = action.trim();
-    if ranked_pass_action_label(trimmed) {
+    if ranked_pass_action_label(trimmed) || learned_discretized_kick_suffix_parts(trimmed).is_some()
+    {
         trimmed.to_string()
     } else {
         normalize_soccer_action_label(trimmed).to_string()
@@ -39331,6 +39351,59 @@ mod soccer_policy_actor_capacity_tests {
         );
         assert_eq!(forward.network.layers.last().unwrap().weights[0].len(), 64);
     }
+
+    #[test]
+    fn policy_actor_snapshot_widens_appended_action_outputs() {
+        let _lock = env_lock();
+        let _policy_units = set_test_env_var("SOCCER_POLICY_HIDDEN_UNITS", "24");
+        let old = SoccerPolicyHead::new(11);
+        let mut old_snapshot = soccer_policy_head_snapshot(&old);
+        let previous_joint_outputs = SOCCER_POLICY_ACTIONS.len() - 20;
+        let previous_shot_outputs = 2;
+
+        fn truncate_outputs(snapshot: &mut SoccerNeuralNetworkSnapshot, output_dim: usize) {
+            let output_layer = snapshot.layers.last_mut().expect("output layer");
+            output_layer.weights.truncate(output_dim);
+            output_layer.biases.truncate(output_dim);
+            snapshot.output_dim = output_dim;
+            snapshot.parameter_count = soccer_neural_snapshot_parameter_count(snapshot);
+            snapshot.l2_norm = soccer_neural_snapshot_l2_norm(snapshot);
+        }
+
+        truncate_outputs(&mut old_snapshot.network, previous_joint_outputs);
+        for specialist in &mut old_snapshot.specialist_heads {
+            if specialist.kind == "shooting" {
+                truncate_outputs(&mut specialist.network, previous_shot_outputs);
+            }
+        }
+        for role in &mut old_snapshot.role_heads {
+            truncate_outputs(&mut role.network, previous_joint_outputs);
+            for specialist in &mut role.specialist_heads {
+                if specialist.kind == "shooting" {
+                    truncate_outputs(&mut specialist.network, previous_shot_outputs);
+                }
+            }
+        }
+
+        let restored = soccer_policy_head_from_snapshot(&old_snapshot, 11).expect("restore policy");
+        let forward = restored
+            .role_head_for_group(SoccerPolicyRoleGroup::Forward)
+            .expect("forward role head");
+        let shooting = forward
+            .specialist_heads
+            .iter()
+            .find(|head| head.kind == SoccerPolicySpecialistKind::Shooting)
+            .expect("shooting specialist");
+
+        assert_eq!(forward.network.output_dim, SOCCER_POLICY_ACTIONS.len());
+        assert_eq!(shooting.network.output_dim, SOCCER_POLICY_SHOT_ACTIONS.len());
+        assert_eq!(
+            soccer_policy_action_index("shoot-kp7"),
+            SOCCER_POLICY_ACTIONS
+                .iter()
+                .position(|candidate| *candidate == "shoot-kp7")
+        );
+    }
 }
 
 /// Technical skill groups the specialist actor heads cover. Each maps to a disjoint subset of
@@ -39390,7 +39463,30 @@ const SOCCER_SKILL_DRIBBLE_FAMILIES: &[&str] = &[
     "xavi-turn",
     "round-goalkeeper",
 ];
-const SOCCER_SKILL_SHOT_FAMILIES: &[&str] = &["shoot", "first-time-shot"];
+const SOCCER_SKILL_SHOT_FAMILIES: &[&str] = &[
+    "shoot",
+    "first-time-shot",
+    "shoot-kp0",
+    "shoot-kp1",
+    "shoot-kp2",
+    "shoot-kp3",
+    "shoot-kp4",
+    "shoot-kp5",
+    "shoot-kp6",
+    "shoot-kp7",
+    "shoot-kp8",
+    "shoot-kp9",
+    "first-time-shot-kp0",
+    "first-time-shot-kp1",
+    "first-time-shot-kp2",
+    "first-time-shot-kp3",
+    "first-time-shot-kp4",
+    "first-time-shot-kp5",
+    "first-time-shot-kp6",
+    "first-time-shot-kp7",
+    "first-time-shot-kp8",
+    "first-time-shot-kp9",
+];
 
 impl SoccerSkillGroup {
     const ALL: [SoccerSkillGroup; 3] = [
@@ -40896,7 +40992,7 @@ fn widen_soccer_policy_snapshot_for_config(
     let target_hidden = soccer_policy_hidden_units();
     if snapshot.layers.len() != 2
         || snapshot.input_dim != SOCCER_POLICY_FEATURE_DIM
-        || snapshot.output_dim != expected_output_dim
+        || snapshot.output_dim > expected_output_dim
     {
         return snapshot;
     }
@@ -40905,7 +41001,9 @@ fn widen_soccer_policy_snapshot_for_config(
         .first()
         .map(|layer| layer.biases.len())
         .unwrap_or(0);
-    if target_hidden <= current_hidden || current_hidden == 0 {
+    if (target_hidden <= current_hidden && snapshot.output_dim == expected_output_dim)
+        || current_hidden == 0
+    {
         return snapshot;
     }
 
@@ -40926,22 +41024,31 @@ fn widen_soccer_policy_snapshot_for_config(
         return snapshot;
     }
 
-    let mut rng = mulberry32(
-        (snapshot.parameter_count as u32)
-            ^ (snapshot.training_steps as u32).rotate_left(11)
-            ^ (expected_output_dim as u32).rotate_left(19)
-            ^ 0xA17C_0128,
-    );
-    let scale = 0.05;
-    for _ in current_hidden..target_hidden {
-        let row = (0..snapshot.input_dim)
-            .map(|_| (2.0 * rng.next_float() - 1.0) * scale)
-            .collect::<Vec<_>>();
-        hidden_layer.weights.push(row);
-        hidden_layer.biases.push(0.0);
+    if target_hidden > current_hidden {
+        let mut rng = mulberry32(
+            (snapshot.parameter_count as u32)
+                ^ (snapshot.training_steps as u32).rotate_left(11)
+                ^ (expected_output_dim as u32).rotate_left(19)
+                ^ 0xA17C_0128,
+        );
+        let scale = 0.05;
+        for _ in current_hidden..target_hidden {
+            let row = (0..snapshot.input_dim)
+                .map(|_| (2.0 * rng.next_float() - 1.0) * scale)
+                .collect::<Vec<_>>();
+            hidden_layer.weights.push(row);
+            hidden_layer.biases.push(0.0);
+        }
+        for row in &mut output_layer.weights {
+            row.resize(target_hidden, 0.0);
+        }
     }
-    for row in &mut output_layer.weights {
-        row.resize(target_hidden, 0.0);
+    if snapshot.output_dim < expected_output_dim {
+        output_layer.weights.extend(
+            (snapshot.output_dim..expected_output_dim).map(|_| vec![0.0; target_hidden]),
+        );
+        output_layer.biases.resize(expected_output_dim, 0.0);
+        snapshot.output_dim = expected_output_dim;
     }
     snapshot.parameter_count = soccer_neural_snapshot_parameter_count(&snapshot);
     snapshot.l2_norm = soccer_neural_snapshot_l2_norm(&snapshot);
@@ -41753,6 +41860,26 @@ const SOCCER_POLICY_ACTIONS: &[&str] = &[
     "aerial-pass-kp7",
     "aerial-pass-kp8",
     "aerial-pass-kp9",
+    "shoot-kp0",
+    "shoot-kp1",
+    "shoot-kp2",
+    "shoot-kp3",
+    "shoot-kp4",
+    "shoot-kp5",
+    "shoot-kp6",
+    "shoot-kp7",
+    "shoot-kp8",
+    "shoot-kp9",
+    "first-time-shot-kp0",
+    "first-time-shot-kp1",
+    "first-time-shot-kp2",
+    "first-time-shot-kp3",
+    "first-time-shot-kp4",
+    "first-time-shot-kp5",
+    "first-time-shot-kp6",
+    "first-time-shot-kp7",
+    "first-time-shot-kp8",
+    "first-time-shot-kp9",
 ];
 
 const SOCCER_POLICY_PASS_ACTIONS: &[&str] = &[
@@ -41810,7 +41937,30 @@ const SOCCER_POLICY_DRIBBLE_ACTIONS: &[&str] = &[
     "round-goalkeeper",
 ];
 
-const SOCCER_POLICY_SHOT_ACTIONS: &[&str] = &["shoot", "first-time-shot"];
+const SOCCER_POLICY_SHOT_ACTIONS: &[&str] = &[
+    "shoot",
+    "first-time-shot",
+    "shoot-kp0",
+    "shoot-kp1",
+    "shoot-kp2",
+    "shoot-kp3",
+    "shoot-kp4",
+    "shoot-kp5",
+    "shoot-kp6",
+    "shoot-kp7",
+    "shoot-kp8",
+    "shoot-kp9",
+    "first-time-shot-kp0",
+    "first-time-shot-kp1",
+    "first-time-shot-kp2",
+    "first-time-shot-kp3",
+    "first-time-shot-kp4",
+    "first-time-shot-kp5",
+    "first-time-shot-kp6",
+    "first-time-shot-kp7",
+    "first-time-shot-kp8",
+    "first-time-shot-kp9",
+];
 
 const SOCCER_POLICY_GOALKEEPER_ACTIONS: &[&str] = &[
     "hold",
@@ -41837,7 +41987,7 @@ const SOCCER_POLICY_GOALKEEPER_ACTIONS: &[&str] = &[
 fn soccer_policy_action_index(action: &str) -> Option<usize> {
     use SoccerActionLabel::*;
     if let Some((base, bucket)) = learned_discretized_kick_suffix_parts(action) {
-        let family = ranked_pass_action_family(base)?;
+        let family = learned_discretized_kick_action_family(base)?;
         let bucket_family = format!("{family}-kp{bucket}");
         if let Some(index) = SOCCER_POLICY_ACTIONS
             .iter()
@@ -67302,6 +67452,37 @@ mod discretized_kick_scaffold_tests {
         assert_eq!(
             SOCCER_SKILL_PASS_FAMILIES[aerial_bucket_local],
             "aerial-pass-kp4"
+        );
+        let shot = learned_discretized_kick_candidate_label("shoot", 7)
+            .expect("shot should accept a learned kick bucket");
+        assert_eq!(shot, "shoot-kp7");
+        assert!(!ranked_pass_action_label(&shot));
+        assert_eq!(normalize_soccer_action_label(&shot), "shoot");
+        assert_eq!(
+            soccer_policy_action_index(&shot),
+            soccer_policy_action_index("shoot-kp7")
+        );
+        let shot_bucket_index =
+            soccer_policy_action_index("shoot-kp7").expect("shot bucket actor index");
+        let (shot_bucket_group, shot_bucket_local) =
+            soccer_policy_skill_group_for_action_index(shot_bucket_index)
+                .expect("shot bucket should train the shot skill policy head");
+        assert_eq!(shot_bucket_group, SoccerSkillGroup::Shot);
+        assert_eq!(
+            SOCCER_SKILL_SHOT_FAMILIES[shot_bucket_local],
+            "shoot-kp7"
+        );
+        assert_ne!(
+            soccer_policy_action_index(&shot),
+            soccer_policy_action_index("shoot")
+        );
+        assert_eq!(learned_mpc_action_label_key(&shot), "shoot-kp7".to_string());
+        assert_eq!(
+            learned_discretized_kick_speed_bucket_for_action_label(&shot),
+            Some(7)
+        );
+        assert!(
+            (learned_discretized_kick_power_for_action_label(&shot).unwrap() - 0.75).abs() < 1e-9
         );
         let uniform_pass_prob = 1.0 / SOCCER_SKILL_PASS_FAMILIES.len() as f64;
         let skill_log_probs = SoccerSkillLogProbs {

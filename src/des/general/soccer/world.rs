@@ -43,6 +43,7 @@ const NEURAL_VALUE_BOOTSTRAP_DEFAULT_WEIGHT: f64 = 0.45;
 const NEURAL_VALUE_BOOTSTRAP_MIN_TRAINING_STEPS: usize = 128;
 const NEURAL_MCTS_FLOOR_KICK_POWER_BUCKETS: [u8; 5] = [3, 5, 6, 7, 9];
 const NEURAL_MCTS_AERIAL_KICK_POWER_BUCKETS: [u8; 5] = [3, 5, 7, 8, 9];
+const NEURAL_MCTS_SHOT_POWER_BUCKETS: [u8; 5] = [5, 6, 7, 8, 9];
 const SOCCER_ACTOR_DECISIVE_EVENT_PRIORITY_WEIGHT: f64 = 2.0;
 const SOCCER_ACTOR_NEGATIVE_OUTCOME_PRIORITY_WEIGHT: f64 = 1.6;
 const SOCCER_ACTOR_ON_BALL_ACTION_PRIORITY_WEIGHT: f64 = 1.35;
@@ -4355,6 +4356,8 @@ mod tests {
 
     #[test]
     fn neural_mcts_expands_shoot_into_targeted_shot_variant() {
+        let _env_lock = soccer_world_env_lock();
+        let _gate = set_test_env_var("DD_SOCCER_ENABLE_DISCRETIZED_KICK", "1");
         let sim = SoccerMatch::default_11v11(MatchConfig {
             learning_enabled: true,
             ..MatchConfig::default()
@@ -4370,15 +4373,32 @@ mod tests {
         let expanded = SoccerMatch::neural_mcts_expanded_candidate_plans(
             &snapshot, actor_id, actor_team, "shoot",
         );
-        assert_eq!(expanded.len(), 1);
-        assert_eq!(expanded[0].action, "first-time-shot");
-        assert_eq!(
-            expanded[0].target_point,
-            Some(Vec2::new(
-                snapshot.field_width * 0.5,
-                actor_team.goal_y(snapshot.field_length),
-            ))
+        let labels = expanded
+            .iter()
+            .map(|plan| plan.action.as_str())
+            .collect::<Vec<_>>();
+        assert!(labels.contains(&"shoot"));
+        assert!(
+            labels.iter().any(|label| label.starts_with("shoot-kp")),
+            "shoot expansion should include learnable shot-power buckets"
         );
+        let goal_center = Some(Vec2::new(
+            snapshot.field_width * 0.5,
+            actor_team.goal_y(snapshot.field_length),
+        ));
+        assert!(expanded
+            .iter()
+            .all(|plan| plan.target_player.is_none() && plan.target_point == goal_center));
+
+        let exact_bucket = SoccerMatch::neural_mcts_expanded_candidate_plans(
+            &snapshot,
+            actor_id,
+            actor_team,
+            "shoot-kp7",
+        );
+        assert_eq!(exact_bucket.len(), 1);
+        assert_eq!(exact_bucket[0].action, "shoot-kp7");
+        assert_eq!(exact_bucket[0].target_point, goal_center);
     }
 
     #[test]
@@ -9092,14 +9112,21 @@ impl SoccerMatch {
         candidate_label: &str,
     ) -> Vec<SoccerLearnedPlan> {
         let normalized = normalize_soccer_action_label(candidate_label);
-        if candidate_label != normalized {
+        let exact_learned_kick =
+            learned_discretized_kick_speed_bucket_for_action_label(candidate_label).is_some();
+        if candidate_label != normalized && !exact_learned_kick {
             return Vec::new();
         }
         if normalized == "dribble" {
             return Self::neural_mcts_dribble_variant_candidate_plans(snapshot, player_id);
         }
-        if normalized == "shoot" {
-            return Self::neural_mcts_shot_variant_candidate_plans(snapshot, team);
+        if matches!(normalized, "shoot" | "first-time-shot") {
+            return Self::neural_mcts_shot_variant_candidate_plans(
+                snapshot,
+                team,
+                normalized,
+                candidate_label,
+            );
         }
         let (prefix, targets) = match normalized {
             "pass" => {
@@ -9214,16 +9241,51 @@ impl SoccerMatch {
     fn neural_mcts_shot_variant_candidate_plans(
         snapshot: &WorldSnapshot,
         team: Team,
+        label: &str,
+        candidate_label: &str,
     ) -> Vec<SoccerLearnedPlan> {
-        vec![SoccerLearnedPlan {
-            action: "first-time-shot".to_string(),
+        let target_point = Some(Vec2::new(
+            snapshot.field_width * 0.5,
+            team.goal_y(snapshot.field_length),
+        ));
+        let mut plans = Vec::with_capacity(
+            1 + if dd_soccer_enable_discretized_kick() {
+                neural_mcts_kick_power_candidate_limit()
+            } else {
+                0
+            },
+        );
+        let exact_bucket =
+            learned_discretized_kick_speed_bucket_for_action_label(candidate_label).is_some();
+        plans.push(SoccerLearnedPlan {
+            action: if exact_bucket {
+                candidate_label.to_string()
+            } else {
+                label.to_string()
+            },
             target_player: None,
-            target_point: Some(Vec2::new(
-                snapshot.field_width * 0.5,
-                team.goal_y(snapshot.field_length),
-            )),
+            target_point,
             mpc_replan: None,
-        }]
+        });
+        if dd_soccer_enable_discretized_kick() && !exact_bucket {
+            plans.extend(
+                NEURAL_MCTS_SHOT_POWER_BUCKETS
+                    .iter()
+                    .copied()
+                    .take(neural_mcts_kick_power_candidate_limit())
+                    .filter_map(|bucket| {
+                        learned_discretized_kick_candidate_label(label, bucket).map(|action| {
+                            SoccerLearnedPlan {
+                                action,
+                                target_player: None,
+                                target_point,
+                                mpc_replan: None,
+                            }
+                        })
+                    }),
+            );
+        }
+        plans
     }
 
     fn neural_mcts_technical_action_label(action: &str) -> bool {
@@ -10719,7 +10781,7 @@ impl SoccerMatch {
         }
         if matches!(label, "shoot" | "first-time-shot" | "first-time-header") {
             return Some(Self::learned_shot_mpc_execution_probability(
-                snapshot, player_id, label,
+                snapshot, player_id, plan, label,
             ));
         }
         if matches!(label, "clearance" | "route-one") {
@@ -10876,6 +10938,7 @@ impl SoccerMatch {
     fn learned_shot_mpc_execution_probability(
         snapshot: &WorldSnapshot,
         player_id: usize,
+        plan: &SoccerLearnedPlan,
         label: &str,
     ) -> f64 {
         let Some(player) = snapshot
@@ -10905,11 +10968,14 @@ impl SoccerMatch {
                 + ability01(player.skills.first_touch) * 0.12)
                 .clamp(0.0, 1.0)
         };
-        let power = if first_time {
-            shot_power_for_finish_skill(finish_skill)
-        } else {
-            shot_power_for_skill(ability01(player.skills.shooting))
-        };
+        let power = learned_discretized_kick_power_for_action_label(&plan.action)
+            .unwrap_or_else(|| {
+                if first_time {
+                    shot_power_for_finish_skill(finish_skill)
+                } else {
+                    shot_power_for_skill(ability01(player.skills.shooting))
+                }
+            });
         let shot_speed = shot_speed_yps_from_power(power, &player.skills);
         let nearest_opponent_distance = snapshot
             .players
