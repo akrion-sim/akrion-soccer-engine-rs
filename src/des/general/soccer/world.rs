@@ -2716,6 +2716,56 @@ mod tests {
     }
 
     #[test]
+    fn shot_on_target_contextual_credit_still_replays_shooter_transition() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            learning_enabled: true,
+            full_game_learning_enabled: true,
+            ..MatchConfig::default()
+        });
+        let (shooter, teammate) = first_home_field_pair(&sim);
+        let third = sim
+            .players
+            .iter()
+            .find(|player| {
+                player.team == Team::Home
+                    && player.id != shooter
+                    && player.id != teammate
+                    && player.role != PlayerRole::Goalkeeper
+            })
+            .map(|player| player.id)
+            .expect("third home field player");
+        sim.tick = 150;
+        let goal_y = Team::Home.goal_y(sim.config.field_length_yards);
+        sim.players[shooter].position =
+            Vec2::new(sim.config.field_width_yards * 0.5, goal_y - 10.0);
+        sim.ball.position = sim.players[shooter].position;
+        sim.recent_learning_history
+            .push_back(world_test_transition(&sim, third, "pass", 143));
+        sim.recent_learning_history
+            .push_back(world_test_transition(&sim, teammate, "dribble", 145));
+        sim.recent_learning_history
+            .push_back(world_test_transition(&sim, shooter, "shoot", 147));
+
+        let deferred_start = sim.deferred_reward_transitions.len();
+        sim.record_shot_on_target_rewards(Team::Home, shooter);
+
+        let added = &sim.deferred_reward_transitions[deferred_start..];
+        let shooter_replays = added
+            .iter()
+            .filter(|transition| {
+                transition.player_id == shooter
+                    && transition.tick == 147
+                    && normalize_soccer_action_label(&transition.action) == "shoot"
+                    && transition.reward > 0.0
+            })
+            .count();
+        assert!(
+            shooter_replays >= 2,
+            "contextual shot credit should not replace direct shooter replay, got {added:?}"
+        );
+    }
+
+    #[test]
     fn shot_off_target_penalty_replays_original_shot_transition_across_ticks() {
         let mut sim = SoccerMatch::default_11v11(MatchConfig {
             learning_enabled: true,
@@ -15874,22 +15924,18 @@ impl SoccerMatch {
             &SHOT_ON_TARGET_REWARD_PATTERN,
             SoccerRewardEventKind::ShotOnTarget,
         );
+        self.queue_direct_shot_outcome_learning_credit(
+            shooter,
+            shooting_team,
+            contextual_pool,
+            SoccerRewardEventKind::ShotOnTarget,
+        );
         let contextual_recorded = self.record_contextual_attacking_rewards(
             shooting_team,
             Some(shooter),
             contextual_pool,
             SoccerRewardEventKind::ShotOnTarget,
         );
-        if !contextual_recorded {
-            self.queue_recent_outcome_learning_credit(
-                shooter,
-                shooting_team,
-                contextual_pool,
-                SoccerRewardEventKind::ShotOnTarget,
-                SHOT_OUTCOME_LEARNING_CREDIT_MAX_AGE_TICKS,
-                |action| matches!(action, "shoot" | "first-time-shot" | "first-time-header"),
-            );
-        }
         if contextual_recorded {
             self.update_mpc_latent_objective(shooting_team, None, Some(scale), None);
             return;
@@ -16081,6 +16127,23 @@ impl SoccerMatch {
             SHOT_OUTCOME_LEARNING_CREDIT_MAX_AGE_TICKS,
             |action| matches!(action, "shoot" | "first-time-shot" | "first-time-header"),
         );
+    }
+
+    fn queue_direct_shot_outcome_learning_credit(
+        &mut self,
+        shooter: usize,
+        shooting_team: Team,
+        amount: f64,
+        kind: SoccerRewardEventKind,
+    ) -> bool {
+        self.queue_recent_outcome_learning_credit(
+            shooter,
+            shooting_team,
+            amount,
+            kind,
+            SHOT_OUTCOME_LEARNING_CREDIT_MAX_AGE_TICKS,
+            |action| matches!(action, "shoot" | "first-time-shot" | "first-time-header"),
+        )
     }
 
     fn current_goal_credit_transition(&self, player_id: usize) -> Option<SoccerLearningTransition> {
@@ -16453,13 +16516,11 @@ impl SoccerMatch {
                 SoccerRewardEventKind::Goal,
             );
             if let Some(shooter) = shooter {
-                self.queue_recent_outcome_learning_credit(
+                self.queue_direct_shot_outcome_learning_credit(
                     shooter,
                     scoring_team,
                     reward_points,
                     SoccerRewardEventKind::Goal,
-                    SHOT_OUTCOME_LEARNING_CREDIT_MAX_AGE_TICKS,
-                    |action| matches!(action, "shoot" | "first-time-shot" | "first-time-header"),
                 );
             }
         } else {
@@ -16474,20 +16535,15 @@ impl SoccerMatch {
                 &GOAL_CHAIN_REWARD_PATTERN,
                 SoccerRewardEventKind::Goal,
             );
-            if !self.record_contextual_goal_rewards(scoring_team, shooter, GOAL_REWARD_POINTS) {
-                if let Some(shooter) = shooter {
-                    self.queue_recent_outcome_learning_credit(
-                        shooter,
-                        scoring_team,
-                        GOAL_REWARD_POINTS,
-                        SoccerRewardEventKind::Goal,
-                        SHOT_OUTCOME_LEARNING_CREDIT_MAX_AGE_TICKS,
-                        |action| {
-                            matches!(action, "shoot" | "first-time-shot" | "first-time-header")
-                        },
-                    );
-                }
+            if let Some(shooter) = shooter {
+                self.queue_direct_shot_outcome_learning_credit(
+                    shooter,
+                    scoring_team,
+                    GOAL_REWARD_POINTS,
+                    SoccerRewardEventKind::Goal,
+                );
             }
+            self.record_contextual_goal_rewards(scoring_team, shooter, GOAL_REWARD_POINTS);
         }
         self.update_mpc_latent_objective(scoring_team, None, Some(1.0), Some(1.0));
         self.record_recent_defensive_goal_penalties(scoring_team.other());
