@@ -138,7 +138,9 @@ fn main() {
         .map(|u| u.trim_start_matches("http://").split('/').next().unwrap_or("127.0.0.1:8091").to_string())
         .unwrap_or_else(|| "127.0.0.1:8091".into());
     let listener = TcpListener::bind(&addr).expect("bind sidecar");
-    let mut srv = Server { net, dev, belief: HashMap::new(), n_actions };
+    let sample = std::env::var("SIDECAR_SAMPLE").ok().as_deref() == Some("1");
+    let mut srv = Server { net, dev, belief: HashMap::new(), n_actions, sample, rng: 0x1234_5678_9abc_def0 };
+    println!("  sample(explore)={sample}");
     println!("burn-pomdp sidecar listening on http://{addr}/infer  model={model}.bin  n_actions={n_actions}");
     let mut nreq = 0usize;
     for stream in listener.incoming() {
