@@ -13424,6 +13424,39 @@ impl SoccerMatch {
         let target_clip = self.config.neural_learning.sanitized_target_clip();
         let tick_rewards = soccer_marl_tick_rewards(transitions);
         let successor_indices = Self::neural_successor_indices(transitions);
+        // MC critic target (gated, Codex anti-alias lever): realized discounted return per transition,
+        // accumulated BACKWARD along each player's successor chain, so the value head learns E[return]
+        // from real outcomes instead of regressing onto the aliased tabular Q(next). Empty ⇒ use the
+        // default tabular-bootstrapped target.
+        let mc_returns: Vec<f64> = if dd_soccer_enable_mc_critic_target() {
+            let n = transitions.len();
+            let mc_gamma = soccer_q_sanitized_gamma(SoccerQPolicyOptions::default().gamma);
+            let adj: Vec<f64> = transitions
+                .iter()
+                .map(|t| {
+                    finite_metric(soccer_marl_adjusted_reward(
+                        t,
+                        &tick_rewards,
+                        &self.config.neural_learning,
+                    ))
+                })
+                .collect();
+            let mut ret = vec![0.0f64; n];
+            for i in (0..n).rev() {
+                let future = if transitions[i].done {
+                    0.0
+                } else {
+                    match successor_indices.get(i).copied().flatten() {
+                        Some(s) if s < n => mc_gamma * ret[s],
+                        _ => 0.0,
+                    }
+                };
+                ret[i] = adj[i] + future;
+            }
+            ret
+        } else {
+            Vec::new()
+        };
         transitions
             .iter()
             .enumerate()
