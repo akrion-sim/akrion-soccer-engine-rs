@@ -9293,6 +9293,30 @@ impl SoccerMatch {
         })
     }
 
+    /// The single off-ball SUPPORT runner the net may drive under the support-outlet lever: the
+    /// nearest Midfielder/Forward teammate to the ball carrier (excluding the carrier + GK/defenders),
+    /// while our side has possession. Deterministic (distance tie-broken by `total_cmp`). `None` ⇒
+    /// nobody eligible ⇒ everyone off-ball stays MPC.
+    fn designated_support_actor(&self, snapshot: &WorldSnapshot) -> Option<usize> {
+        let holder = snapshot.ball.holder?;
+        let carrier = snapshot.players.iter().find(|p| p.id == holder)?;
+        let cpos = carrier.position;
+        snapshot
+            .players
+            .iter()
+            .filter(|p| {
+                p.team == carrier.team
+                    && p.id != holder
+                    && matches!(p.role, PlayerRole::Midfielder | PlayerRole::Forward)
+            })
+            .min_by(|a, b| {
+                let da = (a.position.x - cpos.x).powi(2) + (a.position.y - cpos.y).powi(2);
+                let db = (b.position.x - cpos.x).powi(2) + (b.position.y - cpos.y).powi(2);
+                da.total_cmp(&db)
+            })
+            .map(|p| p.id)
+    }
+
     fn learned_action_for_player_with_context(
         &self,
         snapshot: &WorldSnapshot,
