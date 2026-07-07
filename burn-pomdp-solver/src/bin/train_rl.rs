@@ -31,7 +31,7 @@ fn synth(t: usize, n_actions: usize, seed: &mut u64) -> (Trajectory, Vec<usize>)
         for e in 0..N_ENTITIES { s += fm[e * ENTITY_DIM]; } // channel 0 pooled
         let g = ((((s / N_ENTITIES as f32) + 1.0) / 2.0 * n_actions as f32) as usize).min(n_actions - 1);
         good.push(g);
-        traj.push(Decision { field_motion: fm, action: 0, reward: 0.0, done: i == t - 1 });
+        traj.push(Decision { field_motion: fm, action: 0, reward: 0.0, done: i == t - 1, behavior_policy_probability: 1.0 });
     }
     (traj, good)
 }
