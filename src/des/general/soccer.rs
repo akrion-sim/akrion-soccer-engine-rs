@@ -18959,6 +18959,20 @@ pub struct MatchStats {
     #[serde(default)]
     pub learned_mpc_replans: u32,
     #[serde(default)]
+    pub learned_policy_option_decisions: u32,
+    #[serde(default)]
+    pub learned_policy_multi_option_decisions: u32,
+    #[serde(default)]
+    pub learned_policy_legal_action_options: u32,
+    #[serde(default)]
+    pub analytic_difference_reward_events: u32,
+    #[serde(default)]
+    pub analytic_difference_reward_positive_events: u32,
+    #[serde(default)]
+    pub analytic_difference_reward_negative_events: u32,
+    #[serde(default)]
+    pub analytic_difference_reward_sum: f64,
+    #[serde(default)]
     pub policy_priority_samples: u32,
     #[serde(default)]
     pub policy_priority_weight_sum: f64,
@@ -39396,7 +39410,10 @@ mod soccer_policy_actor_capacity_tests {
             .expect("shooting specialist");
 
         assert_eq!(forward.network.output_dim, SOCCER_POLICY_ACTIONS.len());
-        assert_eq!(shooting.network.output_dim, SOCCER_POLICY_SHOT_ACTIONS.len());
+        assert_eq!(
+            shooting.network.output_dim,
+            SOCCER_POLICY_SHOT_ACTIONS.len()
+        );
         assert_eq!(
             soccer_policy_action_index("shoot-kp7"),
             SOCCER_POLICY_ACTIONS
@@ -41044,9 +41061,9 @@ fn widen_soccer_policy_snapshot_for_config(
         }
     }
     if snapshot.output_dim < expected_output_dim {
-        output_layer.weights.extend(
-            (snapshot.output_dim..expected_output_dim).map(|_| vec![0.0; target_hidden]),
-        );
+        output_layer
+            .weights
+            .extend((snapshot.output_dim..expected_output_dim).map(|_| vec![0.0; target_hidden]));
         output_layer.biases.resize(expected_output_dim, 0.0);
         snapshot.output_dim = expected_output_dim;
     }
@@ -67468,10 +67485,7 @@ mod discretized_kick_scaffold_tests {
             soccer_policy_skill_group_for_action_index(shot_bucket_index)
                 .expect("shot bucket should train the shot skill policy head");
         assert_eq!(shot_bucket_group, SoccerSkillGroup::Shot);
-        assert_eq!(
-            SOCCER_SKILL_SHOT_FAMILIES[shot_bucket_local],
-            "shoot-kp7"
-        );
+        assert_eq!(SOCCER_SKILL_SHOT_FAMILIES[shot_bucket_local], "shoot-kp7");
         assert_ne!(
             soccer_policy_action_index(&shot),
             soccer_policy_action_index("shoot")

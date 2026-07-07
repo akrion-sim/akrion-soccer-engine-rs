@@ -47,6 +47,7 @@ const NEURAL_MCTS_PITCH_VALUE_CANDIDATE_WEIGHT: f64 = 1.50;
 const NEURAL_MCTS_PITCH_VALUE_COUNTER_WEIGHT: f64 = 0.85;
 const SOCCER_CENTERED_POLICY_BONUS_CLIP: f64 = 0.45;
 const SOCCER_CENTERED_SKILL_POLICY_BONUS_CLIP: f64 = 0.30;
+const SOCCER_APPROX_DP_POLICY_PRIOR_CLIP: f64 = 1.25;
 const NEURAL_VALUE_BOOTSTRAP_DEFAULT_WEIGHT: f64 = 0.45;
 const NEURAL_VALUE_BOOTSTRAP_MIN_TRAINING_STEPS: usize = 128;
 const NEURAL_MCTS_FLOOR_KICK_POWER_BUCKETS: [u8; 5] = [3, 5, 6, 7, 9];
@@ -58,6 +59,7 @@ const SOCCER_ACTOR_ON_BALL_ACTION_PRIORITY_WEIGHT: f64 = 1.35;
 const SOCCER_ACTOR_ON_BALL_OUTCOME_PRIORITY_WEIGHT: f64 = 1.75;
 const SOCCER_ACTOR_ON_BALL_OUTCOME_ADVANTAGE_FLOOR: f64 = 0.25;
 const SOCCER_NEURAL_AUTHORITATIVE_TRAIN_DECISIVE_REWARD_FLOOR: f64 = 0.75;
+const SOCCER_NEURAL_AUTHORITATIVE_PASSIVE_OFF_BALL_CRITIC_SAMPLE_RATE: f64 = 0.12;
 const COMPLETED_PASS_LEARNING_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(5.0);
 const SHOT_OUTCOME_LEARNING_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(4.0);
 const DRIBBLE_BEAT_LEARNING_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(2.0);
@@ -454,6 +456,15 @@ fn neural_authoritative_train_decisive_reward_floor() -> f64 {
     )
 }
 
+fn neural_authoritative_passive_off_ball_critic_sample_rate() -> f64 {
+    learned_mpc_metric_env(
+        "SOCCER_NEURAL_AUTHORITATIVE_PASSIVE_OFF_BALL_CRITIC_SAMPLE_RATE",
+        SOCCER_NEURAL_AUTHORITATIVE_PASSIVE_OFF_BALL_CRITIC_SAMPLE_RATE,
+        0.0,
+        1.0,
+    )
+}
+
 fn soccer_centered_policy_bonus(centered_log_prob: f64) -> f64 {
     let clip = learned_mpc_metric_env(
         "SOCCER_CENTERED_POLICY_BONUS_CLIP",
@@ -472,6 +483,68 @@ fn soccer_centered_skill_policy_bonus(centered_log_prob: f64) -> f64 {
         2.0,
     );
     (SOCCER_SKILL_POLICY_DECISION_WEIGHT * centered_log_prob).clamp(-clip, clip)
+}
+
+fn soccer_approx_dp_policy_prior_weight() -> f64 {
+    learned_mpc_metric_env("SOCCER_APPROX_DP_POLICY_PRIOR_WEIGHT", 0.0, 0.0, 2.0)
+}
+
+fn soccer_approx_dp_policy_prior_clip() -> f64 {
+    learned_mpc_metric_env(
+        "SOCCER_APPROX_DP_POLICY_PRIOR_CLIP",
+        SOCCER_APPROX_DP_POLICY_PRIOR_CLIP,
+        0.0,
+        8.0,
+    )
+}
+
+fn soccer_approx_dp_policy_prior_bonus(value: f64, center: f64) -> f64 {
+    let weight = soccer_approx_dp_policy_prior_weight();
+    if weight <= 0.0 || !value.is_finite() || !center.is_finite() {
+        return 0.0;
+    }
+    let clip = soccer_approx_dp_policy_prior_clip();
+    weight * (value - center).clamp(-clip, clip)
+}
+
+fn soccer_neural_authoritative_dp_safety_enabled() -> bool {
+    #[cfg(test)]
+    {
+        gate_default_on("DD_SOCCER_ENABLE_NEURAL_AUTHORITATIVE_DP_SAFETY")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_NEURAL_AUTHORITATIVE_DP_SAFETY"))
+    }
+}
+
+fn soccer_neural_authoritative_dp_safety_min_best_value() -> f64 {
+    learned_mpc_metric_env(
+        "SOCCER_NEURAL_AUTHORITATIVE_DP_SAFETY_MIN_BEST_VALUE",
+        4.0,
+        0.0,
+        200.0,
+    )
+}
+
+fn soccer_neural_authoritative_dp_safety_min_margin() -> f64 {
+    learned_mpc_metric_env(
+        "SOCCER_NEURAL_AUTHORITATIVE_DP_SAFETY_MIN_MARGIN",
+        3.0,
+        0.0,
+        200.0,
+    )
+}
+
+fn soccer_neural_authoritative_dp_safety_min_ratio() -> f64 {
+    learned_mpc_metric_env(
+        "SOCCER_NEURAL_AUTHORITATIVE_DP_SAFETY_MIN_RATIO",
+        0.50,
+        0.0,
+        1.0,
+    )
 }
 
 fn neural_value_bootstrap_weight() -> f64 {
@@ -2055,13 +2128,23 @@ fn stamp_learned_policy_behavior_probability_on_decision(
         return;
     }
     decision.behavior_policy_probability = Some(probability);
-    decision.action_options = vec![AgentActionOptionTrace {
-        label: decision.action.clone(),
-        score: probability,
-        probability,
-        tick_probability: probability,
-        legal: true,
-    }];
+    if let Some(option) = decision
+        .action_options
+        .iter_mut()
+        .find(|option| learned_mpc_action_labels_match(&option.label, &decision.action))
+    {
+        option.probability = probability;
+        option.tick_probability = probability;
+        option.legal = true;
+    } else {
+        decision.action_options.push(AgentActionOptionTrace {
+            label: decision.action.clone(),
+            score: probability,
+            probability,
+            tick_probability: probability,
+            legal: true,
+        });
+    }
 }
 
 /// Extra Bellman sweeps over the whole-game replay before neural value training.
@@ -2562,6 +2645,27 @@ mod tests {
             "adjacent same-agent decision should bootstrap"
         );
         assert!(bellman_replay[1].done, "trajectory tail remains terminal");
+    }
+
+    #[test]
+    fn world_model_trains_from_same_agent_replay_without_full_game_gate() {
+        let mut config = MatchConfig::default();
+        config.neural_learning.enabled = true;
+        config.neural_blend.world_model = true;
+        let mut sim = SoccerMatch::default_11v11(config);
+        let (player_id, _) = first_home_field_pair(&sim);
+        let early = world_test_transition(&sim, player_id, "carry-forward", 1);
+        let mut late = world_test_transition(&sim, player_id, "shoot", 2);
+        late.done = true;
+
+        sim.train_world_model_from_replay(&[early, late]);
+
+        let stats = sim.world_model_stats();
+        assert!(stats.enabled, "world model should be constructed");
+        assert!(
+            stats.training_steps > 0,
+            "same-agent adjacent replay should train the world model"
+        );
     }
 
     fn world_test_transition(
@@ -3815,6 +3919,103 @@ mod tests {
         let option_context =
             soccer_action_option_learning_context(&decision.action, &decision.action_options);
         assert!((option_context.chosen_action_probability - 0.20).abs() < 1e-9);
+    }
+
+    #[test]
+    fn learned_policy_behavior_probability_preserves_counterfactual_options() {
+        let _env = set_test_env_var("DD_SOCCER_ENABLE_ANALYTIC_DIFFERENCE_REWARD", "1");
+        let sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let player = &sim.players[0];
+        let mdp_state = snapshot.mdp_state_for_player(player.id);
+        let observation = snapshot.observation_for(player.id);
+        let belief = belief_from_observation(&observation);
+        let mut decision = AgentDecisionTrace {
+            mdp_state,
+            observation,
+            belief,
+            operation_order: vec!["learned-policy".to_string(), "pass2".to_string()],
+            scheduled_index: None,
+            action_options: vec![
+                AgentActionOptionTrace::new("pass1", 1.00, true),
+                AgentActionOptionTrace::new("pass2", 2.00, true),
+            ],
+            action_target: None,
+            mdp_mpc_comparison: None,
+            learned_mpc_replan: None,
+            behavior_policy_probability: None,
+            neural_mcts_selected: false,
+            neural_mcts_candidate_count: 0,
+            neural_mcts_discretized_kick_candidate_count: 0,
+            neural_mcts_root_discretized_kick_candidate_count: 0,
+            action: "pass2".to_string(),
+        };
+
+        stamp_learned_policy_behavior_probability_on_decision(&mut decision, 0.20);
+        let option_context =
+            soccer_action_option_learning_context(&decision.action, &decision.action_options);
+
+        assert_eq!(
+            decision.action_options.len(),
+            2,
+            "behavior-probability stamping must not erase the analytic/default option set"
+        );
+        assert!((option_context.chosen_action_probability - 0.20).abs() < 1e-9);
+        assert!(option_context.action_score_margin > 0.0);
+        assert!(
+            soccer_analytic_difference_reward(&decision) > 0.0,
+            "counterfactual reward needs the preserved alternative options"
+        );
+    }
+
+    #[test]
+    fn learned_policy_option_telemetry_counts_counterfactual_reward_events() {
+        let _env = set_test_env_var("DD_SOCCER_ENABLE_ANALYTIC_DIFFERENCE_REWARD", "1");
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let mut transition = policy_test_transition_with_mcts(false);
+        transition.decision_context.behavior_policy_probability = Some(0.20);
+        transition.decision_context.action_option_count = 3;
+        transition.decision_context.legal_action_option_count = 2;
+        transition.decision_context.chosen_action_score = 2.0;
+        transition.decision_context.best_legal_action_score = 2.0;
+        transition.decision_context.action_score_margin = 0.5;
+
+        sim.remember_recent_learning_transitions(&[transition]);
+
+        assert_eq!(sim.stats.learned_policy_option_decisions, 1);
+        assert_eq!(sim.stats.learned_policy_multi_option_decisions, 1);
+        assert_eq!(sim.stats.learned_policy_legal_action_options, 2);
+        assert_eq!(sim.stats.analytic_difference_reward_events, 1);
+        assert_eq!(sim.stats.analytic_difference_reward_positive_events, 1);
+        assert_eq!(sim.stats.analytic_difference_reward_negative_events, 0);
+        assert!(sim.stats.analytic_difference_reward_sum > 0.0);
+    }
+
+    #[test]
+    fn scored_candidate_telemetry_counts_without_mcts_selection() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let mut transition = policy_test_transition_with_mcts(false);
+        transition.action = "shoot-kp7".to_string();
+        transition.decision_context.neural_mcts_candidate_count = 16;
+        transition
+            .decision_context
+            .neural_mcts_discretized_kick_candidate_count = 4;
+        transition
+            .decision_context
+            .neural_mcts_root_discretized_kick_candidate_count = 4;
+
+        sim.remember_recent_learning_transitions(&[transition]);
+
+        assert_eq!(sim.stats.neural_mcts_selections, 0);
+        assert_eq!(sim.stats.neural_mcts_candidate_sets, 1);
+        assert_eq!(sim.stats.neural_mcts_candidates, 16);
+        assert_eq!(sim.stats.neural_mcts_discretized_kick_candidates, 4);
+        assert_eq!(sim.stats.neural_mcts_discretized_kick_candidate_sets, 1);
+        assert_eq!(sim.stats.neural_mcts_discretized_kick_selections, 1);
+        let planning = sim.planning_validation_stats();
+        assert_eq!(planning.neural_mcts_selection_rate, 0.0);
+        assert!(planning.neural_mcts_discretized_kick_candidate_share > 0.0);
+        assert!(planning.neural_mcts_discretized_kick_selection_rate > 0.0);
     }
 
     #[test]
@@ -5735,6 +5936,21 @@ mod tests {
             "learned target-grid cell must become the concrete carry target"
         );
 
+        let cold_policy = SoccerQPolicy::default();
+        let cold_carry_plan = SoccerMatch::learned_plan_for_policy(
+            &cold_policy,
+            &snapshot,
+            actor_id,
+            "carry-forward".to_string(),
+        );
+        let cold_carry_target = cold_carry_plan
+            .target_point
+            .expect("cold technical dribble still needs concrete geometry");
+        assert!(
+            cold_carry_target.distance(snapshot.player_position(actor_id).unwrap()) > 0.25,
+            "direct technical dribble candidates must not be label-only when scored"
+        );
+
         let learned_clearance_target = Vec2::new(12.0, 96.0);
         assert!(policy.set_target_value_for_snapshot(
             &snapshot,
@@ -6699,6 +6915,51 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_technical_floor_samples_without_mcts() {
+        let _env_lock = soccer_world_env_lock();
+        let _selection_floor =
+            set_test_env_var("SOCCER_NEURAL_MCTS_TECHNICAL_SELECTION_FLOOR", "0.25");
+        let _max_regression = set_test_env_var(
+            "SOCCER_NEURAL_MCTS_TECHNICAL_SELECTION_MAX_SCORE_REGRESSION",
+            "1.0",
+        );
+        let candidates = vec![
+            SoccerNeuralMctsCandidate {
+                label: "shoot".to_string(),
+                plan: None,
+                score: 1.0,
+                prior: 0.6,
+                q_visits: 1,
+            },
+            SoccerNeuralMctsCandidate {
+                label: "pass".to_string(),
+                plan: None,
+                score: 0.9,
+                prior: 0.3,
+                q_visits: 1,
+            },
+            SoccerNeuralMctsCandidate {
+                label: "carry-forward".to_string(),
+                plan: None,
+                score: 0.4,
+                prior: 0.2,
+                q_visits: 1,
+            },
+        ];
+
+        assert_eq!(
+            SoccerMatch::technical_scored_candidate_floor_choice(&candidates, 0.0)
+                .as_ref()
+                .map(|choice| choice.label.as_str()),
+            Some("carry-forward")
+        );
+        assert!(
+            SoccerMatch::technical_scored_candidate_floor_choice(&candidates, 0.30).is_none(),
+            "draws outside the floor should leave authoritative top-score selection alone"
+        );
+    }
+
+    #[test]
     fn neural_mcts_technical_selection_floor_respects_score_regression() {
         let _env_lock = soccer_world_env_lock();
         let _selection_floor =
@@ -6851,6 +7112,94 @@ mod tests {
         assert!((soccer_centered_policy_bonus(-100.0) + 0.25).abs() < 1e-12);
         assert!((soccer_centered_skill_policy_bonus(100.0) - 0.20).abs() < 1e-12);
         assert!((soccer_centered_skill_policy_bonus(-100.0) + 0.20).abs() < 1e-12);
+    }
+
+    #[test]
+    fn approx_dp_policy_prior_bonus_is_neutral_centered_and_bounded() {
+        let _env_lock = soccer_world_env_lock();
+        assert_eq!(soccer_approx_dp_policy_prior_bonus(10.0, 0.0), 0.0);
+
+        let _weight = set_test_env_var("SOCCER_APPROX_DP_POLICY_PRIOR_WEIGHT", "0.5");
+        let _clip = set_test_env_var("SOCCER_APPROX_DP_POLICY_PRIOR_CLIP", "1.0");
+
+        assert!((soccer_approx_dp_policy_prior_bonus(3.0, 2.0) - 0.5).abs() < 1e-12);
+        assert!((soccer_approx_dp_policy_prior_bonus(1.0, 2.0) + 0.5).abs() < 1e-12);
+        assert!((soccer_approx_dp_policy_prior_bonus(20.0, 2.0) - 0.5).abs() < 1e-12);
+        assert!((soccer_approx_dp_policy_prior_bonus(-20.0, 2.0) + 0.5).abs() < 1e-12);
+    }
+
+    fn test_neural_candidate(label: &str, score: f64) -> SoccerNeuralMctsCandidate {
+        SoccerNeuralMctsCandidate {
+            label: label.to_string(),
+            plan: Some(SoccerLearnedPlan {
+                action: label.to_string(),
+                ..SoccerLearnedPlan::default()
+            }),
+            score,
+            prior: 0.0,
+            q_visits: 0,
+        }
+    }
+
+    fn test_learned_action(label: &str, value: f64) -> SoccerLearnedActionTrace {
+        SoccerLearnedActionTrace {
+            label: label.to_string(),
+            value,
+            visits: 0,
+            probability: 0.0,
+            legal: true,
+            level: PitchGridLevel::WholePitch,
+        }
+    }
+
+    #[test]
+    fn neural_authoritative_dp_safety_blocks_catastrophic_hold_regression() {
+        let _env_lock = soccer_world_env_lock();
+        let _enabled = set_test_env_var("DD_SOCCER_ENABLE_NEURAL_AUTHORITATIVE_DP_SAFETY", "1");
+        let _min_best =
+            set_test_env_var("SOCCER_NEURAL_AUTHORITATIVE_DP_SAFETY_MIN_BEST_VALUE", "4.0");
+        let _min_margin =
+            set_test_env_var("SOCCER_NEURAL_AUTHORITATIVE_DP_SAFETY_MIN_MARGIN", "3.0");
+        let _min_ratio =
+            set_test_env_var("SOCCER_NEURAL_AUTHORITATIVE_DP_SAFETY_MIN_RATIO", "0.50");
+        let candidates = vec![
+            test_neural_candidate("protect-ball", 10.0),
+            test_neural_candidate("carry-forward", 9.0),
+            test_neural_candidate("pass1", 8.0),
+        ];
+        let legal = vec![
+            test_learned_action("protect-ball", 1.2),
+            test_learned_action("carry-forward", 50.0),
+            test_learned_action("pass1", 9.0),
+        ];
+
+        let choice = SoccerMatch::neural_authoritative_dp_safety_choice(&candidates, &legal)
+            .expect("severe DP regression should be guarded");
+
+        assert_eq!(choice.label, "carry-forward");
+        assert_eq!(choice.behavior_probability, 1.0);
+    }
+
+    #[test]
+    fn neural_authoritative_dp_safety_leaves_near_ties_to_neural_value() {
+        let _env_lock = soccer_world_env_lock();
+        let _enabled = set_test_env_var("DD_SOCCER_ENABLE_NEURAL_AUTHORITATIVE_DP_SAFETY", "1");
+        let _min_best =
+            set_test_env_var("SOCCER_NEURAL_AUTHORITATIVE_DP_SAFETY_MIN_BEST_VALUE", "4.0");
+        let _min_margin =
+            set_test_env_var("SOCCER_NEURAL_AUTHORITATIVE_DP_SAFETY_MIN_MARGIN", "3.0");
+        let _min_ratio =
+            set_test_env_var("SOCCER_NEURAL_AUTHORITATIVE_DP_SAFETY_MIN_RATIO", "0.50");
+        let candidates = vec![
+            test_neural_candidate("protect-ball", 10.0),
+            test_neural_candidate("carry-forward", 9.0),
+        ];
+        let legal = vec![
+            test_learned_action("protect-ball", 4.5),
+            test_learned_action("carry-forward", 6.0),
+        ];
+
+        assert!(SoccerMatch::neural_authoritative_dp_safety_choice(&candidates, &legal).is_none());
     }
 
     #[test]
@@ -7089,6 +7438,68 @@ mod tests {
     }
 
     #[test]
+    fn neural_authoritative_technical_dribble_can_distill_without_mcts_selection() {
+        let mut transition = policy_test_transition_with_mcts(false);
+        transition.action = "dribble".to_string();
+        transition.reward = 0.08;
+        transition.decision_context.dribble_mpc_control_probability = 0.86;
+        transition.decision_context.dribble_mpc_qp_accel_fit = 0.78;
+        transition.decision_context.chosen_action_mpc_feasibility = 0.82;
+        transition.decision_context.chosen_action_control_cost = 0.12;
+
+        assert_eq!(
+            soccer_actor_advantage_with_planner_distillation(&transition, 0.01),
+            NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR,
+            "neural-authoritative planner choices should teach executable dribbles even when tree search is disabled"
+        );
+        assert_eq!(
+            soccer_actor_priority_weight(&transition, NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR),
+            NEURAL_MCTS_DISTILLATION_PRIORITY_WEIGHT
+        );
+    }
+
+    #[test]
+    fn neural_authoritative_shot_bucket_can_distill_without_mcts_selection() {
+        let mut transition = policy_test_transition_with_mcts(false);
+        transition.action = "shoot-kp8".to_string();
+        transition.reward = 0.12;
+        transition.decision_context.shot_mpc_accuracy_probability = 0.86;
+        transition.decision_context.shot_mpc_qp_target_fit = 0.84;
+        transition.decision_context.shot_mpc_goal_probability = 0.38;
+        transition.decision_context.chosen_action_mpc_feasibility = 0.90;
+        transition.decision_context.chosen_action_control_cost = 0.10;
+
+        assert_eq!(
+            soccer_actor_advantage_with_planner_distillation(&transition, 0.01),
+            NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR,
+            "learned shot buckets should become actor targets when MPC says they are executable, even without MCTS"
+        );
+        assert_eq!(
+            soccer_actor_priority_weight(&transition, NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR),
+            NEURAL_MCTS_DISTILLATION_PRIORITY_WEIGHT
+        );
+    }
+
+    #[test]
+    fn neural_authoritative_poor_shot_bucket_without_mcts_stays_normal() {
+        let mut transition = policy_test_transition_with_mcts(false);
+        transition.action = "shoot-kp8".to_string();
+        transition.reward = 0.12;
+        transition.decision_context.shot_mpc_accuracy_probability = 0.12;
+        transition.decision_context.shot_mpc_qp_target_fit = 0.10;
+        transition.decision_context.shot_mpc_goal_probability = 0.02;
+        transition.decision_context.chosen_action_mpc_feasibility = 0.15;
+        transition.decision_context.chosen_action_control_cost = 0.80;
+
+        assert_eq!(
+            soccer_actor_advantage_with_planner_distillation(&transition, 0.01),
+            0.01,
+            "MCTS-off shot buckets still need a positive MPC prior before becoming planner-teacher samples"
+        );
+        assert_eq!(soccer_actor_priority_weight(&transition, 0.01), 1.0);
+    }
+
+    #[test]
     fn neural_mcts_shot_bucket_distillation_requires_positive_mpc_shot_prior() {
         let mut transition = policy_test_transition_with_mcts(true);
         transition.action = "shoot-kp8".to_string();
@@ -7220,6 +7631,10 @@ mod tests {
         let _env_lock = soccer_world_env_lock();
         let _on_ball = set_test_env_var("SOCCER_NEURAL_AUTHORITATIVE_ON_BALL_ONLY", "1");
         let _filter = set_test_env_var("SOCCER_NEURAL_AUTHORITATIVE_TRAIN_CONTROLLABLE_ONLY", "1");
+        let _off_ball = set_test_env_var(
+            "SOCCER_NEURAL_AUTHORITATIVE_PASSIVE_OFF_BALL_CRITIC_SAMPLE_RATE",
+            "1.0",
+        );
         let _floor = set_test_env_var(
             "SOCCER_NEURAL_AUTHORITATIVE_TRAIN_DECISIVE_REWARD_FLOOR",
             "0.75",
@@ -7241,6 +7656,46 @@ mod tests {
         assert!(
             !soccer_neural_authoritative_actor_training_transition_allowed(&defensive_penalty),
             "the critic should learn decisive defense, but an on-ball-only actor should not train on defend-shape"
+        );
+    }
+
+    #[test]
+    fn neural_authoritative_critic_filter_stratifies_passive_off_ball_rows() {
+        let _env_lock = soccer_world_env_lock();
+        let _on_ball = set_test_env_var("SOCCER_NEURAL_AUTHORITATIVE_ON_BALL_ONLY", "1");
+        let _filter = set_test_env_var("SOCCER_NEURAL_AUTHORITATIVE_TRAIN_CONTROLLABLE_ONLY", "1");
+        let _off_ball = set_test_env_var(
+            "SOCCER_NEURAL_AUTHORITATIVE_PASSIVE_OFF_BALL_CRITIC_SAMPLE_RATE",
+            "0.0",
+        );
+        let _floor = set_test_env_var(
+            "SOCCER_NEURAL_AUTHORITATIVE_TRAIN_DECISIVE_REWARD_FLOOR",
+            "0.75",
+        );
+        let mut off_ball_hold = policy_test_transition_with_mcts(false);
+        off_ball_hold.observation.has_ball = false;
+        off_ball_hold.next_observation.has_ball = false;
+        off_ball_hold.action = "hold".to_string();
+        off_ball_hold.reward = -2.0;
+
+        let mut on_ball_hold = off_ball_hold.clone();
+        on_ball_hold.observation.has_ball = true;
+
+        let mut off_ball_tackle = off_ball_hold.clone();
+        off_ball_tackle.action = "tackle".to_string();
+        off_ball_tackle.reward = 2.0;
+
+        assert!(
+            !soccer_neural_authoritative_critic_training_transition_allowed(&off_ball_hold),
+            "passive off-ball rows should be sampled as a stratum, not flood the critic"
+        );
+        assert!(
+            soccer_neural_authoritative_critic_training_transition_allowed(&on_ball_hold),
+            "on-ball hold is still a real candidate value the critic must learn"
+        );
+        assert!(
+            soccer_neural_authoritative_critic_training_transition_allowed(&off_ball_tackle),
+            "high-signal ball-winning defensive actions stay in the critic even when passive rows are thinned"
         );
     }
 
@@ -7727,10 +8182,7 @@ fn soccer_actor_mcts_distillation_candidate(
     transition: &SoccerLearningTransition,
     advantage: f64,
 ) -> bool {
-    if !advantage.is_finite()
-        || !transition.decision_context.neural_mcts_selected
-        || learned_mpc_rejected_action_counterexample(transition)
-    {
+    if !advantage.is_finite() || learned_mpc_rejected_action_counterexample(transition) {
         return false;
     }
     let replacement_trace = soccer_actor_mcts_distillation_replacement_trace(transition);
@@ -7750,9 +8202,6 @@ fn soccer_actor_mcts_distillation_candidate(
 }
 
 fn soccer_actor_mcts_distillation_technical_trace(transition: &SoccerLearningTransition) -> bool {
-    if !transition.decision_context.neural_mcts_selected {
-        return false;
-    }
     let action = normalize_soccer_action_label(&transition.action);
     let context = &transition.decision_context;
     if is_dribble_action_label(action) {
@@ -7793,9 +8242,7 @@ fn soccer_actor_mcts_distillation_action_allowed(
 fn soccer_actor_mcts_distillation_discretized_kick_trace(
     transition: &SoccerLearningTransition,
 ) -> bool {
-    if !transition.decision_context.neural_mcts_selected
-        || learned_discretized_kick_speed_bucket_for_action_label(&transition.action).is_none()
-    {
+    if learned_discretized_kick_speed_bucket_for_action_label(&transition.action).is_none() {
         return false;
     }
     if pass_like_action_flight(&transition.action).is_some() {
@@ -8062,6 +8509,49 @@ fn soccer_neural_authoritative_possession_context(transition: &SoccerLearningTra
     transition.observation.has_ball || transition.next_observation.has_ball
 }
 
+fn soccer_neural_authoritative_high_signal_off_ball_action(action: &str) -> bool {
+    matches!(
+        normalize_soccer_action_label(action),
+        "recover" | "tackle" | "slide-tackle" | "blindside-steal" | "keeper-save"
+    )
+}
+
+fn soccer_transition_deterministic_sample_fraction(
+    transition: &SoccerLearningTransition,
+    salt: u64,
+) -> f64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    salt.hash(&mut hasher);
+    transition.tick.hash(&mut hasher);
+    transition.player_id.hash(&mut hasher);
+    match transition.team {
+        Team::Home => 1_u8,
+        Team::Away => 2_u8,
+    }
+    .hash(&mut hasher);
+    normalize_soccer_action_label(&transition.action).hash(&mut hasher);
+    (hasher.finish() as f64) / (u64::MAX as f64)
+}
+
+fn soccer_neural_authoritative_passive_off_ball_critic_sample_allowed(
+    transition: &SoccerLearningTransition,
+) -> bool {
+    if soccer_neural_authoritative_high_signal_off_ball_action(&transition.action) {
+        return true;
+    }
+    let sample_rate = neural_authoritative_passive_off_ball_critic_sample_rate();
+    if sample_rate >= 1.0 {
+        return true;
+    }
+    if sample_rate <= 0.0 {
+        return false;
+    }
+    soccer_transition_deterministic_sample_fraction(transition, 0x4f46_4642_414c_4c43) < sample_rate
+}
+
 fn soccer_neural_authoritative_critic_training_transition_allowed(
     transition: &SoccerLearningTransition,
 ) -> bool {
@@ -8079,7 +8569,13 @@ fn soccer_neural_authoritative_critic_training_transition_allowed(
     {
         return true;
     }
-    transition.reward.abs() >= neural_authoritative_train_decisive_reward_floor()
+    if transition.reward.abs() < neural_authoritative_train_decisive_reward_floor() {
+        return false;
+    }
+    if soccer_neural_authoritative_possession_context(transition) {
+        return true;
+    }
+    soccer_neural_authoritative_passive_off_ball_critic_sample_allowed(transition)
 }
 
 fn soccer_neural_authoritative_actor_training_transition_allowed(
@@ -10410,18 +10906,53 @@ impl SoccerMatch {
         let selected_rank = soccer_policy_weighted_rank_index(candidate_count, draw);
         candidates
             .get(selected_rank)
-            .map(|candidate| SoccerPolicyActionChoice {
-                label: candidate.label.clone(),
-                plan: candidate.plan.clone(),
-                behavior_probability: soccer_policy_rank_probability(
-                    candidate_count,
-                    selected_rank,
-                ),
-                neural_mcts_selected: false,
-                neural_mcts_candidate_count: 0,
-                neural_mcts_discretized_kick_candidate_count: 0,
-                neural_mcts_root_discretized_kick_candidate_count: 0,
+            .map(|candidate| {
+                Self::scored_candidate_policy_choice(
+                    candidate,
+                    candidates,
+                    soccer_policy_rank_probability(candidate_count, selected_rank),
+                    false,
+                )
             })
+    }
+
+    fn scored_candidate_counts(candidates: &[SoccerNeuralMctsCandidate]) -> (u32, u32, u32) {
+        let candidate_count = candidates.len().min(u32::MAX as usize) as u32;
+        let discretized_kick_candidate_count = candidates
+            .iter()
+            .filter(|candidate| {
+                learned_discretized_kick_speed_bucket_for_action_label(&candidate.label).is_some()
+            })
+            .count()
+            .min(u32::MAX as usize) as u32;
+        // Outside tree-search, every scored candidate is a root candidate.
+        (
+            candidate_count,
+            discretized_kick_candidate_count,
+            discretized_kick_candidate_count,
+        )
+    }
+
+    fn scored_candidate_policy_choice(
+        candidate: &SoccerNeuralMctsCandidate,
+        candidates: &[SoccerNeuralMctsCandidate],
+        behavior_probability: f64,
+        neural_mcts_selected: bool,
+    ) -> SoccerPolicyActionChoice {
+        let (
+            neural_mcts_candidate_count,
+            neural_mcts_discretized_kick_candidate_count,
+            neural_mcts_root_discretized_kick_candidate_count,
+        ) = Self::scored_candidate_counts(candidates);
+        SoccerPolicyActionChoice {
+            label: candidate.label.clone(),
+            plan: candidate.plan.clone(),
+            behavior_probability,
+            neural_mcts_selected,
+            neural_mcts_candidate_count,
+            neural_mcts_discretized_kick_candidate_count,
+            neural_mcts_root_discretized_kick_candidate_count,
+        }
     }
 
     fn top_scored_candidate_choice(
@@ -10429,14 +10960,144 @@ impl SoccerMatch {
     ) -> Option<SoccerPolicyActionChoice> {
         candidates
             .first()
-            .map(|candidate| SoccerPolicyActionChoice {
-                label: candidate.label.clone(),
-                plan: candidate.plan.clone(),
-                behavior_probability: 1.0,
-                neural_mcts_selected: false,
-                neural_mcts_candidate_count: 0,
-                neural_mcts_discretized_kick_candidate_count: 0,
-                neural_mcts_root_discretized_kick_candidate_count: 0,
+            .map(|candidate| Self::scored_candidate_policy_choice(candidate, candidates, 1.0, false))
+    }
+
+    fn neural_authoritative_dp_safety_choice(
+        candidates: &[SoccerNeuralMctsCandidate],
+        legal: &[SoccerLearnedActionTrace],
+    ) -> Option<SoccerPolicyActionChoice> {
+        if !soccer_neural_authoritative_dp_safety_enabled() {
+            return None;
+        }
+        let top = candidates.first()?;
+        let top_key = normalize_soccer_action_label(&top.label);
+        let min_best = soccer_neural_authoritative_dp_safety_min_best_value();
+        let min_margin = soccer_neural_authoritative_dp_safety_min_margin();
+        let min_ratio = soccer_neural_authoritative_dp_safety_min_ratio();
+        let dp_value_for = |label: &str| -> Option<f64> {
+            let key = normalize_soccer_action_label(label);
+            legal
+                .iter()
+                .filter(|action| action.legal)
+                .filter(|action| normalize_soccer_action_label(&action.label) == key)
+                .map(|action| action.value)
+                .filter(|value| value.is_finite())
+                .max_by(|a, b| a.total_cmp(b))
+        };
+        let top_dp_value = dp_value_for(&top.label).unwrap_or(0.0);
+        let mut ranked_dp = legal
+            .iter()
+            .filter(|action| action.legal && action.value.is_finite())
+            .collect::<Vec<_>>();
+        ranked_dp.sort_by(|a, b| {
+            b.value
+                .total_cmp(&a.value)
+                .then_with(|| a.label.cmp(&b.label))
+        });
+        for fallback in ranked_dp {
+            let fallback_key = normalize_soccer_action_label(&fallback.label);
+            if fallback_key == top_key {
+                return None;
+            }
+            if fallback.value < min_best {
+                return None;
+            }
+            let margin = fallback.value - top_dp_value;
+            if margin < min_margin {
+                continue;
+            }
+            if top_dp_value >= fallback.value * min_ratio {
+                continue;
+            }
+            if let Some(candidate) = candidates
+                .iter()
+                .find(|candidate| normalize_soccer_action_label(&candidate.label) == fallback_key)
+            {
+                return Some(Self::scored_candidate_policy_choice(
+                    candidate, candidates, 1.0, false,
+                ));
+            }
+        }
+        None
+    }
+
+    fn technical_scored_candidate_floor_choice(
+        candidates: &[SoccerNeuralMctsCandidate],
+        draw: f64,
+    ) -> Option<SoccerPolicyActionChoice> {
+        let floor = neural_mcts_technical_selection_floor();
+        if floor <= 1e-9 || !draw.is_finite() || draw >= floor {
+            return None;
+        }
+        let candidate_count = candidates.len().min(POLICY_SELECTION_TOP_RANK_LIMIT);
+        if candidate_count == 0 {
+            return None;
+        }
+        let best_score = candidates[..candidate_count]
+            .iter()
+            .map(|candidate| candidate.score)
+            .fold(f64::NEG_INFINITY, f64::max);
+        if !best_score.is_finite() {
+            return None;
+        }
+        let max_regression = neural_mcts_technical_selection_max_score_regression();
+        if max_regression <= 0.0 || !max_regression.is_finite() {
+            return None;
+        }
+        let rank_weights = soccer_policy_top_rank_weights();
+        let mut eligible = [(0usize, 0.0f64); POLICY_SELECTION_TOP_RANK_LIMIT];
+        let mut eligible_count = 0usize;
+        let mut total = 0.0;
+        for rank in 0..candidate_count {
+            let candidate = &candidates[rank];
+            if !candidate.score.is_finite() || candidate.score + max_regression < best_score {
+                continue;
+            }
+            let label = normalize_soccer_action_label(&candidate.label);
+            if !is_dribble_action_label(label)
+                && learned_discretized_kick_speed_bucket_for_action_label(&candidate.label)
+                    .is_none()
+                && !matches!(label, "first-time-shot" | "first-time-header")
+            {
+                continue;
+            }
+            let weight = rank_weights[rank].max(0.0);
+            if weight <= 0.0 {
+                continue;
+            }
+            eligible[eligible_count] = (rank, weight);
+            eligible_count += 1;
+            total += weight;
+        }
+        if eligible_count == 0 || !total.is_finite() || total <= 1e-9 {
+            return None;
+        }
+        let mut threshold = (draw / floor).clamp(0.0, 1.0 - f64::EPSILON) * total;
+        for (rank, weight) in eligible[..eligible_count].iter().copied() {
+            if threshold < weight {
+                return candidates
+                    .get(rank)
+                    .map(|candidate| {
+                        Self::scored_candidate_policy_choice(
+                            candidate,
+                            candidates,
+                            soccer_policy_rank_probability(candidate_count, rank),
+                            false,
+                        )
+                    });
+            }
+            threshold -= weight;
+        }
+        candidates
+            .get(eligible[eligible_count - 1].0)
+            .map(|candidate| {
+                Self::scored_candidate_policy_choice(
+                    candidate,
+                    candidates,
+                    soccer_policy_rank_probability(candidate_count, eligible[eligible_count - 1].0),
+                    false,
+                )
             })
     }
 
@@ -12138,6 +12799,21 @@ impl SoccerMatch {
             // Nothing to re-rank — let the tabular greedy path decide.
             return None;
         }
+        let dp_policy_value_center = {
+            let mut sum = 0.0;
+            let mut count = 0usize;
+            for candidate in &legal {
+                if candidate.value.is_finite() {
+                    sum += candidate.value;
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                sum / count as f64
+            } else {
+                0.0
+            }
+        };
 
         let gamma = soccer_q_sanitized_gamma(policy.options.gamma);
         let mcts_depth = if blend.mcts_enabled {
@@ -12225,6 +12901,12 @@ impl SoccerMatch {
                 };
                 // Actor bias: nudge toward the family the learned policy prefers.
                 let actor_bonus = policy_bonus(&candidate_label);
+                // Approximate-DP bridge: authoritative neural scoring used to all but ignore
+                // the Bellman-swept tabular value (`candidate.value * 1e-6`). Keep neural in
+                // charge, but let the learned DP/Q prior reward actions whose replay-backed value
+                // is above this candidate set's center and suppress actions below it.
+                let dp_policy_bonus =
+                    soccer_approx_dp_policy_prior_bonus(candidate.value, dp_policy_value_center);
                 let retrieved_bonus = if blend.mode == SoccerNeuralBlendMode::Authoritative {
                     0.0
                 } else {
@@ -12244,8 +12926,12 @@ impl SoccerMatch {
                     &candidate_plan,
                     &transition,
                 );
-                let score =
-                    value_score + actor_bonus + retrieved_bonus + model_bonus + mpc_candidate_bonus;
+                let score = value_score
+                    + actor_bonus
+                    + dp_policy_bonus
+                    + retrieved_bonus
+                    + model_bonus
+                    + mpc_candidate_bonus;
                 if !score.is_finite() {
                     return;
                 }
@@ -12291,6 +12977,16 @@ impl SoccerMatch {
             return Some(mcts_label);
         }
         if blend.mode == SoccerNeuralBlendMode::Authoritative {
+            if let Some(dp_safe_choice) =
+                Self::neural_authoritative_dp_safety_choice(&scored_candidates, &legal)
+            {
+                return Some(dp_safe_choice);
+            }
+            if let Some(technical_choice) =
+                Self::technical_scored_candidate_floor_choice(&scored_candidates, rank_draw)
+            {
+                return Some(technical_choice);
+            }
             return Self::top_scored_candidate_choice(&scored_candidates);
         }
         Self::weighted_scored_candidate_choice(&scored_candidates, rank_draw)
@@ -12587,6 +13283,20 @@ impl SoccerMatch {
             plan.target_point = plan
                 .target_player
                 .and_then(|target| snapshot.player_position(target));
+        } else if let Some(kind) = dribble_move_kind_for_action_label(&normalized_action) {
+            plan.target_point = learned_grid_target.take().or_else(|| {
+                let player = snapshot
+                    .players
+                    .iter()
+                    .find(|player| player.id == player_id)?;
+                let touch = snapshot.deterministic_dribble_touch_decision_for(player_id, kind);
+                Some(snapshot.dribble_move_target_for_touch(
+                    player_id,
+                    player.home_position,
+                    kind,
+                    touch,
+                ))
+            });
         } else if matches!(normalized_action.as_str(), "clearance" | "route-one") {
             if let Some(player) = snapshot
                 .players
@@ -14118,6 +14828,25 @@ impl SoccerMatch {
             .map(|value| value * target_scale)
     }
 
+    fn train_world_model_from_replay(&mut self, replay: &[SoccerLearningTransition]) {
+        if !self.neural_blend.world_model || !self.config.neural_learning.enabled {
+            return;
+        }
+        let world_model_pairs = self.neural_world_model_training_pairs(replay);
+        if world_model_pairs.is_empty() {
+            return;
+        }
+        self.ensure_world_model();
+        if let Some(world_model) = &mut self.world_model {
+            world_model.train(&world_model_pairs);
+            let stats = world_model.stats();
+            self.stats.world_model_enabled = stats.enabled;
+            self.stats.world_model_training_steps = stats.training_steps;
+            self.stats.world_model_loss = stats.last_loss;
+            self.stats.world_model_validation_loss = stats.last_validation_loss;
+        }
+    }
+
     /// Model-based look-ahead value of a candidate `action` at decision time
     /// (AlphaZero/MuZero-style planning): roll the learned world model forward from
     /// the current state + this candidate action and score the predicted state with
@@ -14268,14 +14997,6 @@ impl SoccerMatch {
         } else {
             Vec::new()
         };
-        // World model: predict-next-state pairs from the *current* features
-        // (built before the value update, like the actor's advantages).
-        let world_model_pairs =
-            if self.neural_blend.world_model && self.config.neural_learning.enabled {
-                self.neural_world_model_training_pairs(&replay)
-            } else {
-                Vec::new()
-            };
         self.train_neural_value_models(&bellman_replay);
         if !policy_samples.is_empty() {
             let priority_samples = policy_samples
@@ -14360,21 +15081,9 @@ impl SoccerMatch {
         if !policy_samples.is_empty() || !keeper_policy_samples.is_empty() {
             self.specialist_curriculum_round = self.specialist_curriculum_round.saturating_add(1);
         }
-        if !world_model_pairs.is_empty() {
-            self.ensure_world_model();
-            if let Some(world_model) = &mut self.world_model {
-                world_model.train(&world_model_pairs);
-            }
-        }
-        if self.neural_blend.world_model {
-            if let Some(world_model) = &self.world_model {
-                let stats = world_model.stats();
-                self.stats.world_model_enabled = stats.enabled;
-                self.stats.world_model_training_steps = stats.training_steps;
-                self.stats.world_model_loss = stats.last_loss;
-                self.stats.world_model_validation_loss = stats.last_validation_loss;
-            }
-        }
+        // World model: predict-next-state pairs from the *current* features
+        // (built before the value update, like the actor's advantages).
+        self.train_world_model_from_replay(&replay);
     }
 
     pub fn controller_yield_stats(&self) -> ControllerYieldStats {
@@ -16047,6 +16756,14 @@ impl SoccerMatch {
                                 .learning_deferred_reward_transitions_drained
                                 .saturating_add(deferred_drained);
                             self.train_neural_value_models(&train_transitions);
+                            if self.neural_blend.world_model {
+                                let world_model_replay = self
+                                    .recent_learning_history
+                                    .iter()
+                                    .cloned()
+                                    .collect::<Vec<_>>();
+                                self.train_world_model_from_replay(&world_model_replay);
+                            }
                             neural_sample_elapsed += phase_started.elapsed();
                         }
                     }
@@ -28295,71 +29012,135 @@ impl SoccerMatch {
         for transition in transitions {
             if !learned_mpc_rejected_action_counterexample(transition) {
                 self.stats.planning_decisions = self.stats.planning_decisions.saturating_add(1);
+                if transition.decision_context.neural_mcts_candidate_count > 0 {
+                    self.stats.neural_mcts_candidate_sets =
+                        self.stats.neural_mcts_candidate_sets.saturating_add(1);
+                    self.stats.neural_mcts_candidates =
+                        self.stats.neural_mcts_candidates.saturating_add(
+                            transition.decision_context.neural_mcts_candidate_count,
+                        );
+                    self.stats.neural_mcts_discretized_kick_candidates = self
+                        .stats
+                        .neural_mcts_discretized_kick_candidates
+                        .saturating_add(
+                            transition
+                                .decision_context
+                                .neural_mcts_discretized_kick_candidate_count,
+                        );
+                    if transition
+                        .decision_context
+                        .neural_mcts_discretized_kick_candidate_count
+                        > 0
+                    {
+                        self.stats.neural_mcts_discretized_kick_candidate_sets = self
+                            .stats
+                            .neural_mcts_discretized_kick_candidate_sets
+                            .saturating_add(1);
+                    }
+                    self.stats.neural_mcts_root_discretized_kick_candidates = self
+                        .stats
+                        .neural_mcts_root_discretized_kick_candidates
+                        .saturating_add(
+                            transition
+                                .decision_context
+                                .neural_mcts_root_discretized_kick_candidate_count,
+                        );
+                    if transition
+                        .decision_context
+                        .neural_mcts_root_discretized_kick_candidate_count
+                        > 0
+                    {
+                        self.stats.neural_mcts_root_discretized_kick_candidate_sets = self
+                            .stats
+                            .neural_mcts_root_discretized_kick_candidate_sets
+                            .saturating_add(1);
+                    }
+                }
                 if transition.decision_context.neural_mcts_selected {
                     self.stats.neural_mcts_selections =
                         self.stats.neural_mcts_selections.saturating_add(1);
-                    if transition.decision_context.neural_mcts_candidate_count > 0 {
-                        self.stats.neural_mcts_candidate_sets =
-                            self.stats.neural_mcts_candidate_sets.saturating_add(1);
-                        self.stats.neural_mcts_candidates =
-                            self.stats.neural_mcts_candidates.saturating_add(
-                                transition.decision_context.neural_mcts_candidate_count,
-                            );
-                        self.stats.neural_mcts_discretized_kick_candidates = self
-                            .stats
-                            .neural_mcts_discretized_kick_candidates
-                            .saturating_add(
-                                transition
-                                    .decision_context
-                                    .neural_mcts_discretized_kick_candidate_count,
-                            );
-                        if transition
-                            .decision_context
-                            .neural_mcts_discretized_kick_candidate_count
-                            > 0
-                        {
-                            self.stats.neural_mcts_discretized_kick_candidate_sets = self
-                                .stats
-                                .neural_mcts_discretized_kick_candidate_sets
-                                .saturating_add(1);
-                        }
-                        self.stats.neural_mcts_root_discretized_kick_candidates = self
-                            .stats
-                            .neural_mcts_root_discretized_kick_candidates
-                            .saturating_add(
-                                transition
-                                    .decision_context
-                                    .neural_mcts_root_discretized_kick_candidate_count,
-                            );
-                        if transition
-                            .decision_context
-                            .neural_mcts_root_discretized_kick_candidate_count
-                            > 0
-                        {
-                            self.stats.neural_mcts_root_discretized_kick_candidate_sets = self
-                                .stats
-                                .neural_mcts_root_discretized_kick_candidate_sets
-                                .saturating_add(1);
-                        }
-                    }
-                    if learned_discretized_kick_speed_bucket_for_action_label(&transition.action)
-                        .is_some()
-                    {
-                        self.stats.neural_mcts_discretized_kick_selections = self
-                            .stats
-                            .neural_mcts_discretized_kick_selections
-                            .saturating_add(1);
-                    }
-                    if Self::neural_mcts_technical_action_label(&transition.action) {
-                        self.stats.neural_mcts_technical_action_selections = self
-                            .stats
-                            .neural_mcts_technical_action_selections
-                            .saturating_add(1);
-                    }
+                }
+                if learned_discretized_kick_speed_bucket_for_action_label(&transition.action)
+                    .is_some()
+                {
+                    self.stats.neural_mcts_discretized_kick_selections = self
+                        .stats
+                        .neural_mcts_discretized_kick_selections
+                        .saturating_add(1);
+                }
+                if Self::neural_mcts_technical_action_label(&transition.action) {
+                    self.stats.neural_mcts_technical_action_selections = self
+                        .stats
+                        .neural_mcts_technical_action_selections
+                        .saturating_add(1);
                 }
                 if transition.decision_context.learned_mpc_replanned {
                     self.stats.learned_mpc_replans =
                         self.stats.learned_mpc_replans.saturating_add(1);
+                }
+                let learned_policy_option_decision = transition
+                    .decision_context
+                    .behavior_policy_probability
+                    .is_some()
+                    || transition.decision_context.neural_mcts_selected
+                    || transition.decision_context.learned_mpc_replanned;
+                if learned_policy_option_decision
+                    && transition.decision_context.action_option_count > 0
+                {
+                    self.stats.learned_policy_option_decisions =
+                        self.stats.learned_policy_option_decisions.saturating_add(1);
+                    self.stats.learned_policy_legal_action_options = self
+                        .stats
+                        .learned_policy_legal_action_options
+                        .saturating_add(
+                            transition
+                                .decision_context
+                                .legal_action_option_count
+                                .min(u32::MAX as usize) as u32,
+                        );
+                    if transition.decision_context.legal_action_option_count >= 2 {
+                        self.stats.learned_policy_multi_option_decisions = self
+                            .stats
+                            .learned_policy_multi_option_decisions
+                            .saturating_add(1);
+                    }
+                    if soccer_analytic_difference_reward_enabled()
+                        && transition.decision_context.legal_action_option_count
+                            >= SOCCER_ANALYTIC_DIFFERENCE_REWARD_MIN_OPTIONS
+                    {
+                        let scale = transition
+                            .decision_context
+                            .best_legal_action_score
+                            .max(transition.decision_context.chosen_action_score)
+                            .max(1.0);
+                        let analytic_difference_reward = (transition
+                            .decision_context
+                            .action_score_margin
+                            / scale
+                            * SOCCER_ANALYTIC_DIFFERENCE_REWARD_WEIGHT)
+                            .clamp(
+                                -SOCCER_ANALYTIC_DIFFERENCE_REWARD_CAP_POINTS,
+                                SOCCER_ANALYTIC_DIFFERENCE_REWARD_CAP_POINTS,
+                            );
+                        if analytic_difference_reward.abs() > 1e-9 {
+                            self.stats.analytic_difference_reward_events = self
+                                .stats
+                                .analytic_difference_reward_events
+                                .saturating_add(1);
+                            if analytic_difference_reward > 0.0 {
+                                self.stats.analytic_difference_reward_positive_events = self
+                                    .stats
+                                    .analytic_difference_reward_positive_events
+                                    .saturating_add(1);
+                            } else {
+                                self.stats.analytic_difference_reward_negative_events = self
+                                    .stats
+                                    .analytic_difference_reward_negative_events
+                                    .saturating_add(1);
+                            }
+                            self.stats.analytic_difference_reward_sum += analytic_difference_reward;
+                        }
+                    }
                 }
                 self.stats.policy_entropy_sum +=
                     finite_unit_interval(transition.decision_context.action_option_entropy);
