@@ -48,14 +48,26 @@ fn main() {
     let epochs = env_usize("PPO_EPOCHS", 250);
     let batch = env_usize("PPO_BATCH", 64);
 
-    let mut trajs = load_flat_grouped(&path).expect("load export");
-    trajs.retain(|t| t.len() >= 4);
-    for t in trajs.iter_mut() {
-        if t.len() > MAX_T {
-            t.truncate(MAX_T);
-            if let Some(last) = t.last_mut() {
-                last.done = true;
+    // Window-SPLIT long agent-trajectories into ≤MAX_T chunks instead of truncating: the old
+    // truncate discarded ~80% of collected decisions (100k rows → 19k used). Each window becomes an
+    // independent sub-trajectory (its own MC returns, last decision marked done). Uses ALL the data.
+    let raw = load_flat_grouped(&path).expect("load export");
+    let mut trajs: Vec<Trajectory> = Vec::new();
+    for t in raw {
+        if t.len() < 4 {
+            continue;
+        }
+        let mut i = 0;
+        while i < t.len() {
+            let end = (i + MAX_T).min(t.len());
+            let mut w: Trajectory = t[i..end].to_vec();
+            if w.len() >= 4 {
+                if let Some(last) = w.last_mut() {
+                    last.done = true;
+                }
+                trajs.push(w);
             }
+            i = end;
         }
     }
     let n_decisions: usize = trajs.iter().map(|t| t.len()).sum();
