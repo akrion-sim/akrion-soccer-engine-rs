@@ -18616,9 +18616,15 @@ impl MatchConfig {
                 // net's choices back toward the analytic policy (entrenching parity). SOCCER_DISABLE_NEURAL_MCTS=1
                 // lets the raw actor-critic policy drive directly, to A/B whether MCTS helps or hurts the climb.
                 mcts_enabled: std::env::var("SOCCER_DISABLE_NEURAL_MCTS").ok().as_deref() != Some("1"),
-                mcts_simulations: 8,
-                mcts_candidates: 4,
-                mcts_depth: 1,
+                // Env-tunable so we can A/B whether SOLVING MORE EXACTLY (deeper lookahead / more
+                // simulations / wider candidate set) climbs above parity — i.e. whether the plateau is
+                // a shallow-search approximation ceiling. Sanitizers clamp to [1,32]/[2,16]/[1,3].
+                mcts_simulations: std::env::var("SOCCER_MCTS_SIMULATIONS")
+                    .ok().and_then(|s| s.trim().parse().ok()).unwrap_or(8),
+                mcts_candidates: std::env::var("SOCCER_MCTS_CANDIDATES")
+                    .ok().and_then(|s| s.trim().parse().ok()).unwrap_or(4),
+                mcts_depth: std::env::var("SOCCER_MCTS_DEPTH")
+                    .ok().and_then(|s| s.trim().parse().ok()).unwrap_or(1),
                 ..SoccerNeuralBlendConfig::default()
             },
             mpc: SoccerMpcConfig {
