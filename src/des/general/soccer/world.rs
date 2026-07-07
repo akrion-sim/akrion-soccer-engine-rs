@@ -5730,6 +5730,47 @@ mod tests {
     }
 
     #[test]
+    fn neural_mcts_shot_bucket_selection_can_distill_without_replacement_trace() {
+        let mut transition = policy_test_transition_with_mcts(true);
+        transition.action = "shoot-kp8".to_string();
+        transition.reward = 0.12;
+        transition.decision_context.shot_mpc_accuracy_probability = 0.86;
+        transition.decision_context.shot_mpc_qp_target_fit = 0.84;
+        transition.decision_context.shot_mpc_goal_probability = 0.38;
+        transition.decision_context.chosen_action_mpc_feasibility = 0.90;
+        transition.decision_context.chosen_action_control_cost = 0.10;
+
+        assert_eq!(
+            soccer_actor_advantage_with_planner_distillation(&transition, 0.01),
+            NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR,
+            "MCTS-selected learned shot buckets are planner targets when shot MPC says they are executable"
+        );
+        assert_eq!(
+            soccer_actor_priority_weight(&transition, NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR),
+            NEURAL_MCTS_DISTILLATION_PRIORITY_WEIGHT
+        );
+    }
+
+    #[test]
+    fn neural_mcts_shot_bucket_distillation_requires_positive_mpc_shot_prior() {
+        let mut transition = policy_test_transition_with_mcts(true);
+        transition.action = "shoot-kp8".to_string();
+        transition.reward = 0.12;
+        transition.decision_context.shot_mpc_accuracy_probability = 0.12;
+        transition.decision_context.shot_mpc_qp_target_fit = 0.10;
+        transition.decision_context.shot_mpc_goal_probability = 0.02;
+        transition.decision_context.chosen_action_mpc_feasibility = 0.15;
+        transition.decision_context.chosen_action_control_cost = 0.80;
+
+        assert_eq!(
+            soccer_actor_advantage_with_planner_distillation(&transition, 0.01),
+            0.01,
+            "learned shot bucket distillation should not imitate MPC-poor shot powers"
+        );
+        assert_eq!(soccer_actor_priority_weight(&transition, 0.01), 1.0);
+    }
+
+    #[test]
     fn neural_mcts_route_one_without_replacement_trains_normally() {
         let mut transition = policy_test_transition_with_mcts(true);
         transition.action = "route-one".to_string();
@@ -6331,10 +6372,17 @@ fn soccer_actor_mcts_distillation_action_allowed(
 fn soccer_actor_mcts_distillation_discretized_kick_trace(
     transition: &SoccerLearningTransition,
 ) -> bool {
-    transition.decision_context.neural_mcts_selected
-        && learned_discretized_kick_speed_bucket_for_action_label(&transition.action).is_some()
-        && pass_like_action_flight(&transition.action).is_some()
-        && neural_mcts_pass_mpc_candidate_bonus(transition) > 0.0
+    if !transition.decision_context.neural_mcts_selected
+        || learned_discretized_kick_speed_bucket_for_action_label(&transition.action).is_none()
+    {
+        return false;
+    }
+    if pass_like_action_flight(&transition.action).is_some() {
+        return neural_mcts_pass_mpc_candidate_bonus(transition) > 0.0;
+    }
+    let action = normalize_soccer_action_label(&transition.action);
+    matches!(action, "shoot" | "first-time-shot")
+        && neural_mcts_shot_mpc_candidate_bonus(transition) > 0.0
 }
 
 fn soccer_actor_mcts_distillation_replacement_trace(transition: &SoccerLearningTransition) -> bool {
@@ -6376,6 +6424,32 @@ fn neural_mcts_pass_mpc_candidate_bonus(transition: &SoccerLearningTransition) -
         forward_fit.max(0.0) * 0.06
     };
     (technical_fit - 0.58 + territorial_fit).clamp(-0.40, 0.45) * weight
+}
+
+fn neural_mcts_shot_mpc_candidate_bonus(transition: &SoccerLearningTransition) -> f64 {
+    if learned_discretized_kick_speed_bucket_for_action_label(&transition.action).is_none() {
+        return 0.0;
+    }
+    let action = normalize_soccer_action_label(&transition.action);
+    if !matches!(action, "shoot" | "first-time-shot") {
+        return 0.0;
+    }
+    let weight = neural_mcts_technical_mpc_execution_weight();
+    if weight <= 0.0 {
+        return 0.0;
+    }
+    let context = &transition.decision_context;
+    let accuracy = finite_unit_interval(context.shot_mpc_accuracy_probability);
+    let target_fit = finite_unit_interval(context.shot_mpc_qp_target_fit);
+    let goal_probability = finite_unit_interval(context.shot_mpc_goal_probability);
+    let feasibility = finite_unit_interval(context.chosen_action_mpc_feasibility);
+    let low_cost = 1.0 - finite_unit_interval(context.chosen_action_control_cost);
+    let shot_fit = accuracy * 0.40
+        + target_fit * 0.20
+        + goal_probability * 0.22
+        + feasibility * 0.12
+        + low_cost * 0.06;
+    (shot_fit - 0.45).clamp(-0.35, 0.45) * weight
 }
 
 fn soccer_actor_mcts_distillation_priority(
