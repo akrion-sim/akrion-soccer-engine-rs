@@ -13508,14 +13508,26 @@ impl SoccerMatch {
                     tabular_max_next,
                     target_scale,
                 );
-                let (target, priority) = soccer_neural_target_and_priority(
-                    adjusted_reward,
-                    gamma,
-                    max_next,
-                    transition.done,
-                    target_scale,
-                    target_clip,
-                );
+                let (target, priority) = if !mc_returns.is_empty() {
+                    // MC target: clip(realized_return / target_scale) — NO tabular bootstrap. This is
+                    // the alias-breaking label; `max_next`/`gamma` above are ignored on this path.
+                    let raw = mc_returns.get(transition_index).copied().unwrap_or(0.0);
+                    let scaled = if raw.is_finite() {
+                        (raw / target_scale).clamp(-target_clip, target_clip)
+                    } else {
+                        0.0
+                    };
+                    (scaled, scaled.abs().max(1e-6))
+                } else {
+                    soccer_neural_target_and_priority(
+                        adjusted_reward,
+                        gamma,
+                        max_next,
+                        transition.done,
+                        target_scale,
+                        target_clip,
+                    )
+                };
                 let sample = SoccerNeuralTrainingSample {
                     input: soccer_neural_transition_features(transition),
                     target,
