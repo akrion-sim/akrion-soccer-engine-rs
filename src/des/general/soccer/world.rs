@@ -4675,6 +4675,33 @@ mod tests {
             neural_mcts_pass_mpc_candidate_bonus(&loose) < 0.0,
             "merely executable aerial passes should not get positive MCTS pressure"
         );
+
+        let mut shallow_race_edge = loose.clone();
+        shallow_race_edge.decision_context.pass_mpc_receipt_probability = 0.74;
+        shallow_race_edge.decision_context.pass_receipt_qp_accel_fit = 0.62;
+        shallow_race_edge.decision_context.chosen_action_mpc_feasibility = 0.74;
+        shallow_race_edge
+            .decision_context
+            .pass_receipt_race_advantage_seconds = 0.30;
+        shallow_race_edge.decision_context.target_forward_yards = 2.5;
+        assert!(
+            neural_mcts_pass_mpc_candidate_bonus(&shallow_race_edge) < 0.0,
+            "a short aerial with only a small receiver race edge was over-selected live"
+        );
+
+        let mut deep_no_edge = loose.clone();
+        deep_no_edge.decision_context.pass_mpc_receipt_probability = 0.78;
+        deep_no_edge.decision_context.pass_receipt_qp_accel_fit = 0.68;
+        deep_no_edge.decision_context.chosen_action_mpc_feasibility = 0.82;
+        deep_no_edge
+            .decision_context
+            .pass_receipt_race_advantage_seconds = 0.04;
+        deep_no_edge.decision_context.target_forward_yards = 22.0;
+        assert!(
+            neural_mcts_pass_mpc_candidate_bonus(&deep_no_edge) < 0.0,
+            "deep aerials still need receiver edge or elite receipt quality"
+        );
+
         assert!(
             neural_mcts_pass_mpc_candidate_bonus(&breakthrough) > 0.0,
             "line-breaking aerial passes with a receiver race edge should remain selectable"
@@ -4822,6 +4849,18 @@ mod tests {
         assert!(
             !SoccerMatch::neural_mcts_transition_context_is_executable(&transition),
             "feasible but non-breakthrough aerial passes were dominating MCTS with negative reward"
+        );
+
+        transition.decision_context.pass_mpc_receipt_probability = 0.74;
+        transition.decision_context.pass_receipt_qp_accel_fit = 0.62;
+        transition.decision_context.chosen_action_mpc_feasibility = 0.74;
+        transition
+            .decision_context
+            .pass_receipt_race_advantage_seconds = 0.30;
+        transition.decision_context.target_forward_yards = 2.5;
+        assert!(
+            !SoccerMatch::neural_mcts_transition_context_is_executable(&transition),
+            "shallow aerials with a marginal race edge should stay out of MCTS"
         );
 
         transition.decision_context.pass_mpc_receipt_probability = 0.90;
@@ -6542,6 +6581,9 @@ fn neural_mcts_pass_mpc_candidate_bonus(transition: &SoccerLearningTransition) -
     }
     let action = normalize_soccer_action_label(&transition.action);
     let context = &transition.decision_context;
+    if action == "aerial-pass" && !neural_mcts_aerial_pass_has_breakthrough_context(transition) {
+        return -0.40 * weight;
+    }
     let receipt = finite_unit_interval(context.pass_mpc_receipt_probability);
     let qp_fit = finite_unit_interval(context.pass_receipt_qp_accel_fit);
     let feasibility = finite_unit_interval(context.chosen_action_mpc_feasibility);
@@ -6571,6 +6613,34 @@ fn neural_mcts_pass_mpc_candidate_bonus(transition: &SoccerLearningTransition) -
         (0.58, 0.0)
     };
     (technical_fit - threshold + aerial_relief + territorial_fit).clamp(-0.40, 0.45) * weight
+}
+
+fn neural_mcts_aerial_pass_has_breakthrough_context(transition: &SoccerLearningTransition) -> bool {
+    if normalize_soccer_action_label(&transition.action) != "aerial-pass" {
+        return true;
+    }
+    let context = &transition.decision_context;
+    let forward_yards = context.target_forward_yards;
+    let receipt = finite_unit_interval(context.pass_mpc_receipt_probability);
+    let qp_fit = finite_unit_interval(context.pass_receipt_qp_accel_fit);
+    let feasibility = finite_unit_interval(context.chosen_action_mpc_feasibility);
+    let race_edge = context.pass_receipt_race_advantage_seconds;
+
+    let line_break = forward_yards >= 14.0
+        && race_edge >= 0.18
+        && receipt >= 0.70
+        && qp_fit >= 0.55
+        && feasibility >= 0.68;
+    let clean_deep_switch = forward_yards >= 24.0
+        && race_edge >= 0.05
+        && receipt >= 0.82
+        && qp_fit >= 0.72
+        && feasibility >= 0.72;
+    let elite_receipt = forward_yards >= 30.0
+        && receipt >= 0.88
+        && qp_fit >= 0.78
+        && feasibility >= 0.78;
+    line_break || clean_deep_switch || elite_receipt
 }
 
 fn neural_mcts_shot_mpc_candidate_bonus(transition: &SoccerLearningTransition) -> f64 {
