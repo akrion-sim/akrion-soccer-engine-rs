@@ -139,6 +139,32 @@ state rows.
 - Constraints from `remaining-next-steps.md` still bind: default-OFF / byte-identical new paths,
   66 ms / 15 Hz / 22-agent budget, append new channels at the tail, A/B behind the eval gate.
 
+## ACTION LOG — 2026-07-07 (execution)
+
+- **Launched Step 0** as a clean single-variable A/B via `scripts/run_pitch_value_ab.sh` (reuses
+  `soccer_outcome_ab_run`: two separate train processes since the gate is a per-process OnceLock,
+  then frozen head-to-head over a held-out disjoint seed range printing the Wilson lower bound).
+  Both arms `DD_SOCCER_ENABLE_DISCRETIZED_KICK=0` (fixed 73 interface); arms differ only by
+  `DD_SOCCER_ENABLE_PITCH_VALUE_REWARD` (0 vs 1). Verified live: no `DD_SOCCER_OUTCOME_CREDIT`
+  inherited (Codex's contamination watchpoint — that replay path applies pitch shaping bypassing
+  the gate), clean per-process env. Artifacts: `/tmp/pitchvalue-ab/`, verdict in `verdict.log`.
+
+- **DISCOVERY that reframes the ladder: `pitch_value` is DEFAULT-ON in release/production**
+  (`pitch_value.rs:108` — "Promoted to default-ON in production"; the module's top "gated off by
+  default" comment is **stale**). So the 0.53 ceiling was **already measured with pitch_value ON**.
+  Consequences:
+  - Lever **A is not a fresh climb lever — it's already spent in the incumbent.** The Step-0 run
+    is therefore an **ablation** (does removing pitch_value hurt?), diagnostic not a climb, and an
+    80-train-game null is a smoke-test null, not a trusted reject (Codex wants 240–320 games or
+    3×80 seeds for a trusted verdict). Read: `pv_on ≫ pv_off` → territory reward is load-bearing,
+    supports the EPV upgrade; `pv_on ≈ pv_off` → the territory channel is NOT the active
+    constraint → redirect straight to lever **B**.
+  - The diagnosis gets *stronger*: territory shaping is already on and we still draw at 0.53 →
+    territory-without-conversion is confirmed as the wall → the real climb is **B (off-ball
+    support runner) + Step 2 (learned EPV replacing the territorial signal in both channels).**
+  - **Revised priority:** Step 1 (cheap off-ball capability A/B: flip run/support gates, read
+    SOT/game) is now the highest-value *next* experiment, ahead of any further pitch_value work.
+
 ## One-line summary
 
 The ceiling is structural: the net is a *selector over analytic candidates* optimizing
