@@ -137,56 +137,40 @@ fn main() {
         }
         let (mut pi_sum, mut v_sum, mut r_sum, mut kl_sum, mut count) = (0f32, 0f32, 0f32, 0f32, 0usize);
         for &idx in order.iter().take(batch) {
-            let traj: &Trajectory = &trajs[idx];
-            let t = traj.len();
-            let (entities, actions, returns_raw) = to_tensors::<B>(traj, gamma, &dev);
-            let returns = returns_raw.sub_scalar(gmean).div_scalar(gstd); // normalized critic target
+            let c = &cache[idx];
+            let t = c.entities.dims()[0];
 
-            let out = net.forward(entities.clone());
+            let out = net.forward(c.entities.clone());
 
             // Standardized, detached advantage (GAE-free MC advantage; batch-standardized like AWR).
-            let adv = (returns.clone() - out.values.clone()).detach();
+            let adv = (c.returns.clone() - out.values.clone()).detach();
             let am = adv.clone().mean();
             let astd = (adv.clone() - am.clone()).powf_scalar(2.0).mean().sqrt().add_scalar(1e-6);
             let adv = (adv - am).div(astd); // (T)
 
             let logp = log_softmax(out.logits.clone(), 1); // (T, n_actions)
-            let logp_a = logp.clone().gather(1, actions.clone().reshape([t, 1])).reshape([t]); // (T)
+            let logp_a = logp.clone().gather(1, c.actions.clone().reshape([t, 1])).reshape([t]); // (T)
 
-            // Behavior policy = the frozen reference (the BEST model that COLLECTED this data). Its
-            // all-73 log-prob of the taken action is the exact old-policy log-prob: because π_new and
-            // π_ref share the same softmax normalization on the same state, the legal-renormalization
-            // the sidecar applied at sampling time CANCELS in the ratio — so this is exact, not the
-            // mild-conservative estimate the logged (legal-renormalized) prob would give.
-            let (old_logp, kl) = match &reference {
-                Some(r) => {
-                    let ref_logp = log_softmax(r.forward(entities).logits, 1).detach(); // (T,73)
-                    let ola = ref_logp.clone().gather(1, actions.reshape([t, 1])).reshape([t]); // (T)
-                    let ref_p = ref_logp.clone().exp();
-                    // KL(π_ref ‖ π_new): mode-covering anchor ⇒ anti-collapse.
-                    let kl = (ref_p * (ref_logp - logp.clone())).sum_dim(1).mean();
-                    (ola, kl)
-                }
-                None => {
-                    // No reference ⇒ fall back to the logged behavior prob (1.0 for legacy exports ⇒
-                    // ratio≈1 ⇒ advantage-weighted PG). KL anchor disabled.
-                    let old_p: Vec<f32> =
-                        traj.iter().map(|d| d.behavior_policy_probability.clamp(1e-6, 1.0)).collect();
-                    let ola = Tensor::<B, 1>::from_data(TensorData::new(old_p, [t]), &dev).log();
-                    let zero = Tensor::<B, 1>::from_data(TensorData::new(vec![0f32], [1]), &dev).mean();
-                    (ola, zero)
-                }
-            };
-
-            // Clipped surrogate: -mean( min(ratio·A, clip(ratio,1±ε)·A) ).
-            let ratio = (logp_a - old_logp).exp(); // (T)
+            // old_logp precomputed from the frozen reference (= behavior policy). Because π_new and
+            // π_ref share the same all-73 softmax normalization on the same state, the legal-
+            // renormalization the sidecar applied at sampling time CANCELS in the ratio — exact.
+            let ratio = (logp_a - c.old_logp.clone()).exp(); // (T)
             let unclipped = ratio.clone() * adv.clone();
             let clipped = ratio.clone().clamp(1.0 - eps, 1.0 + eps) * adv;
             let policy_loss = unclipped.min_pair(clipped).mean().neg();
 
-            let value_loss = (out.values - returns).powf_scalar(2.0).mean();
+            let value_loss = (out.values - c.returns.clone()).powf_scalar(2.0).mean();
             let probs = softmax(out.logits, 1);
-            let entropy = (probs * logp).sum_dim(1).mean().neg();
+            let entropy = (probs * logp.clone()).sum_dim(1).mean().neg();
+
+            // KL(π_ref ‖ π_new): mode-covering anchor to the frozen reference ⇒ anti-collapse.
+            let kl = match &c.ref_logp {
+                Some(rlp) => {
+                    let ref_p = rlp.clone().exp();
+                    (ref_p * (rlp.clone() - logp)).sum_dim(1).mean()
+                }
+                None => Tensor::<B, 1>::from_data(TensorData::new(vec![0f32], [1]), &dev).mean(),
+            };
 
             // entropy var = +H(π); SUBTRACT it (maximize entropy ⇒ exploration). KL is ≥0 and ADDED
             // (penalize divergence from the frozen reference ⇒ anti-collapse).
