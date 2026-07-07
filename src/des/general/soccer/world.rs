@@ -4803,6 +4803,38 @@ mod tests {
     }
 
     #[test]
+    fn neural_mcts_context_filter_rejects_loose_aerial_passes() {
+        let _env_lock = soccer_world_env_lock();
+        let _min_safe = set_test_env_var(
+            "SOCCER_NEURAL_MCTS_MIN_REPLAN_SAFE_EXECUTION_PROBABILITY",
+            "0.55",
+        );
+        let _weight = set_test_env_var("SOCCER_NEURAL_MCTS_PASS_MPC_PRIOR_WEIGHT", "1.0");
+        let mut transition = policy_test_transition_with_mcts(true);
+        transition.action = "aerial-pass1-kp7".to_string();
+        transition.decision_context.chosen_action_mpc_feasibility = 0.74;
+        transition.decision_context.chosen_action_control_cost = 0.12;
+        transition.decision_context.pass_mpc_receipt_probability = 0.74;
+        transition.decision_context.pass_receipt_qp_accel_fit = 0.58;
+        transition.decision_context.pass_receipt_race_advantage_seconds = 0.02;
+        transition.decision_context.target_forward_yards = 4.0;
+
+        assert!(
+            !SoccerMatch::neural_mcts_transition_context_is_executable(&transition),
+            "feasible but non-breakthrough aerial passes were dominating MCTS with negative reward"
+        );
+
+        transition.decision_context.pass_mpc_receipt_probability = 0.90;
+        transition.decision_context.pass_receipt_qp_accel_fit = 0.84;
+        transition.decision_context.pass_receipt_race_advantage_seconds = 0.65;
+        transition.decision_context.target_forward_yards = 28.0;
+        assert!(
+            SoccerMatch::neural_mcts_transition_context_is_executable(&transition),
+            "true line-breaking aerial passes should remain legal for MCTS"
+        );
+    }
+
+    #[test]
     fn learned_plan_uses_policy_target_grid_for_concrete_target_points() {
         let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
         let actor = sim
@@ -9553,10 +9585,16 @@ impl SoccerMatch {
     fn neural_mcts_transition_context_is_executable(transition: &SoccerLearningTransition) -> bool {
         let label = normalize_soccer_action_label(&transition.action);
         if pass_like_action_flight(label).is_some() || is_dribble_action_label(label) {
-            return neural_mcts_replan_safe_execution_probability(
+            if !neural_mcts_replan_safe_execution_probability(
                 label,
                 transition.decision_context.chosen_action_mpc_feasibility,
-            );
+            ) {
+                return false;
+            }
+            if label == "aerial-pass" && neural_mcts_pass_mpc_candidate_bonus(transition) <= 0.0 {
+                return false;
+            }
+            return true;
         }
         true
     }
