@@ -4624,6 +4624,64 @@ mod tests {
     }
 
     #[test]
+    fn neural_mcts_pass_mpc_bonus_scores_plain_and_bucketed_passes() {
+        let _env_lock = soccer_world_env_lock();
+        let _weight = set_test_env_var("SOCCER_NEURAL_MCTS_PASS_MPC_PRIOR_WEIGHT", "1.0");
+        let mut plain = policy_test_transition_with_mcts(true);
+        plain.action = "pass1".to_string();
+        plain.decision_context.pass_mpc_receipt_probability = 0.88;
+        plain.decision_context.pass_receipt_qp_accel_fit = 0.82;
+        plain.decision_context.chosen_action_mpc_feasibility = 0.90;
+        plain.decision_context.chosen_action_control_cost = 0.08;
+        plain.decision_context.pass_receipt_race_advantage_seconds = 0.45;
+        plain.decision_context.target_forward_yards = 22.0;
+
+        let mut bucketed = plain.clone();
+        bucketed.action = "pass1-kp7".to_string();
+
+        assert!(
+            neural_mcts_pass_mpc_candidate_bonus(&plain) > 0.0,
+            "plain concrete passes need the same MPC quality prior as learned bucket variants"
+        );
+        assert!(
+            (neural_mcts_pass_mpc_candidate_bonus(&plain)
+                - neural_mcts_pass_mpc_candidate_bonus(&bucketed))
+            .abs()
+                < 1e-9,
+            "bucket labels should preserve pass quality, not be the only labels receiving it"
+        );
+    }
+
+    #[test]
+    fn neural_mcts_aerial_pass_prior_requires_breakthrough_context() {
+        let _env_lock = soccer_world_env_lock();
+        let _weight = set_test_env_var("SOCCER_NEURAL_MCTS_PASS_MPC_PRIOR_WEIGHT", "1.0");
+        let mut loose = policy_test_transition_with_mcts(true);
+        loose.action = "aerial-pass1-kp7".to_string();
+        loose.decision_context.pass_mpc_receipt_probability = 0.74;
+        loose.decision_context.pass_receipt_qp_accel_fit = 0.58;
+        loose.decision_context.chosen_action_mpc_feasibility = 0.72;
+        loose.decision_context.chosen_action_control_cost = 0.12;
+        loose.decision_context.pass_receipt_race_advantage_seconds = 0.02;
+        loose.decision_context.target_forward_yards = 4.0;
+
+        let mut breakthrough = loose.clone();
+        breakthrough.decision_context.pass_mpc_receipt_probability = 0.90;
+        breakthrough.decision_context.pass_receipt_qp_accel_fit = 0.84;
+        breakthrough.decision_context.pass_receipt_race_advantage_seconds = 0.65;
+        breakthrough.decision_context.target_forward_yards = 28.0;
+
+        assert!(
+            neural_mcts_pass_mpc_candidate_bonus(&loose) < 0.0,
+            "merely executable aerial passes should not get positive MCTS pressure"
+        );
+        assert!(
+            neural_mcts_pass_mpc_candidate_bonus(&breakthrough) > 0.0,
+            "line-breaking aerial passes with a receiver race edge should remain selectable"
+        );
+    }
+
+    #[test]
     fn neural_mcts_candidate_bonus_includes_shot_mpc_prior() {
         let _env_lock = soccer_world_env_lock();
         let _weight = set_test_env_var("SOCCER_NEURAL_MCTS_TECHNICAL_MPC_EXECUTION_WEIGHT", "1.0");
@@ -6443,15 +6501,14 @@ fn soccer_actor_mcts_distillation_replacement_trace(transition: &SoccerLearningT
 }
 
 fn neural_mcts_pass_mpc_candidate_bonus(transition: &SoccerLearningTransition) -> f64 {
-    if learned_discretized_kick_speed_bucket_for_action_label(&transition.action).is_none()
-        || pass_like_action_flight(&transition.action).is_none()
-    {
+    if pass_like_action_flight(&transition.action).is_none() {
         return 0.0;
     }
     let weight = neural_mcts_pass_mpc_prior_weight();
     if weight <= 0.0 {
         return 0.0;
     }
+    let action = normalize_soccer_action_label(&transition.action);
     let context = &transition.decision_context;
     let receipt = finite_unit_interval(context.pass_mpc_receipt_probability);
     let qp_fit = finite_unit_interval(context.pass_receipt_qp_accel_fit);
@@ -6466,7 +6523,22 @@ fn neural_mcts_pass_mpc_candidate_bonus(transition: &SoccerLearningTransition) -
     } else {
         forward_fit.max(0.0) * 0.06
     };
-    (technical_fit - 0.58 + territorial_fit).clamp(-0.40, 0.45) * weight
+    let (threshold, aerial_relief) = if action == "aerial-pass" {
+        // Aerial routes are executable far more often than they are valuable.
+        // Require either line-breaking depth, a receiver race edge, or a very
+        // clean receipt before MCTS treats them as a positive tactical prior.
+        let forward_break = ((context.target_forward_yards - 8.0) / 20.0).clamp(0.0, 1.0);
+        let race_break = ((context.pass_receipt_race_advantage_seconds - 0.10) / 0.80)
+            .clamp(0.0, 1.0);
+        let receipt_break = ((receipt - 0.70) / 0.25).clamp(0.0, 1.0);
+        (
+            0.68,
+            0.10 * (forward_break * 0.45 + race_break * 0.35 + receipt_break * 0.20),
+        )
+    } else {
+        (0.58, 0.0)
+    };
+    (technical_fit - threshold + aerial_relief + territorial_fit).clamp(-0.40, 0.45) * weight
 }
 
 fn neural_mcts_shot_mpc_candidate_bonus(transition: &SoccerLearningTransition) -> f64 {
