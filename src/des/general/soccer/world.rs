@@ -9198,11 +9198,13 @@ impl SoccerMatch {
         {
             let support_outlet =
                 std::env::var("SOCCER_BURN_SIDECAR_SUPPORT_OUTLET").ok().as_deref() == Some("1");
-            match (support_outlet, self.designated_support_actor(snapshot)) {
-                (true, Some(support_id)) if support_id == player_id => {
-                    support_only_mask = true; // serve this actor, but support-family actions only
-                }
-                _ => return None,
+            // MULTI-ROLE possession scope (Codex): drive the K nearest mid/fwd support runners
+            // (K = SOCCER_BURN_SIDECAR_SUPPORT_ACTORS, default 3), each support-masked — a coordinated
+            // receiver SET creates options for the carrier, where one runner (0.479) could not.
+            if support_outlet && self.designated_support_actor_set(snapshot).contains(&player_id) {
+                support_only_mask = true; // serve this actor, but support-family actions only
+            } else {
+                return None;
             }
         }
         {
