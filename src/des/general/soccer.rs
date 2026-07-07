@@ -5420,7 +5420,9 @@ const SOCCER_POLICY_ASSIGNED_POSITION_DIM: usize = SOCCER_ASSIGNED_POSITION_COUN
 const SOCCER_POLICY_FEATURE_DIM: usize = SOCCER_NEURAL_FEATURE_DIM
     + SOCCER_POLICY_ROLE_EMBEDDING_DIM
     + SOCCER_POLICY_ASSIGNED_POSITION_DIM;
-const SOCCER_POLICY_HIDDEN_UNITS: usize = 24;
+const DEFAULT_SOCCER_POLICY_HIDDEN_UNITS: usize = 24;
+const MIN_SOCCER_POLICY_HIDDEN_UNITS: usize = 8;
+const MAX_SOCCER_POLICY_HIDDEN_UNITS: usize = 512;
 const SOCCER_POLICY_LEARNING_RATE: f64 = 0.05;
 /// Default entropy bonus — keeps the actor from collapsing onto one family too early.
 /// Override with `SOCCER_POLICY_ENTROPY_COEFF` when local runs show policy entropy
@@ -5461,6 +5463,42 @@ fn soccer_policy_entropy_coeff_from_env() -> Option<f64> {
             eprintln!(
                 "soccer: invalid SOCCER_POLICY_ENTROPY_COEFF {:?}; using default {:.4}",
                 raw, SOCCER_POLICY_ENTROPY_COEFF_DEFAULT
+            );
+            None
+        }
+    }
+}
+
+fn soccer_policy_hidden_units() -> usize {
+    #[cfg(test)]
+    {
+        soccer_policy_hidden_units_from_env()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static UNITS: OnceLock<usize> = OnceLock::new();
+        *UNITS.get_or_init(soccer_policy_hidden_units_from_env)
+    }
+}
+
+fn soccer_policy_hidden_units_from_env() -> usize {
+    soccer_policy_hidden_units_env_value("SOCCER_POLICY_HIDDEN_UNITS")
+        .or_else(|| soccer_policy_hidden_units_env_value("SOCCER_NEURAL_HIDDEN_UNITS"))
+        .unwrap_or(DEFAULT_SOCCER_POLICY_HIDDEN_UNITS)
+}
+
+fn soccer_policy_hidden_units_env_value(name: &str) -> Option<usize> {
+    let raw = std::env::var(name).ok()?;
+    match raw.trim().parse::<usize>() {
+        Ok(value) if value > 0 => Some(value.clamp(
+            MIN_SOCCER_POLICY_HIDDEN_UNITS,
+            MAX_SOCCER_POLICY_HIDDEN_UNITS,
+        )),
+        _ => {
+            eprintln!(
+                "soccer: invalid {name} {:?}; using policy hidden default {}",
+                raw, DEFAULT_SOCCER_POLICY_HIDDEN_UNITS
             );
             None
         }
@@ -38835,7 +38873,7 @@ impl SoccerPolicySpecialistHead {
         let network = FeedForwardNetwork::random(
             &RandomNetworkSpec {
                 input_dim: SOCCER_POLICY_FEATURE_DIM,
-                hidden_layers: vec![SOCCER_POLICY_HIDDEN_UNITS],
+                hidden_layers: vec![soccer_policy_hidden_units()],
                 output_dim: kind.actions().len(),
                 hidden_activation: ActivationName::Tanh,
                 output_activation: ActivationName::Linear,
@@ -38944,7 +38982,7 @@ impl SoccerPolicyRoleHead {
         let network = FeedForwardNetwork::random(
             &RandomNetworkSpec {
                 input_dim: SOCCER_POLICY_FEATURE_DIM,
-                hidden_layers: vec![SOCCER_POLICY_HIDDEN_UNITS],
+                hidden_layers: vec![soccer_policy_hidden_units()],
                 output_dim: SOCCER_POLICY_ACTIONS.len(),
                 hidden_activation: ActivationName::Tanh,
                 // Linear outputs = logits; softmax is applied in the trainer/sampler.
@@ -39222,6 +39260,79 @@ impl SoccerPolicyHead {
     }
 }
 
+#[cfg(test)]
+mod soccer_policy_actor_capacity_tests {
+    use super::*;
+
+    struct TestEnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for TestEnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn set_test_env_var(key: &'static str, value: &str) -> TestEnvVarGuard {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        TestEnvVarGuard { key, previous }
+    }
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().expect("test poison soccer policy env lock")
+    }
+
+    #[test]
+    fn policy_actor_uses_neural_hidden_units_fallback() {
+        let _lock = env_lock();
+        let _policy_units = set_test_env_var("SOCCER_POLICY_HIDDEN_UNITS", "0");
+        let _neural_units = set_test_env_var("SOCCER_NEURAL_HIDDEN_UNITS", "64");
+
+        let head = SoccerPolicyHead::new(7);
+        let midfielder = head
+            .role_head_for_group(SoccerPolicyRoleGroup::Midfielder)
+            .expect("midfielder role head");
+
+        assert_eq!(soccer_policy_hidden_units(), 64);
+        assert_eq!(midfielder.network.layers[0].biases.len(), 64);
+        assert_eq!(
+            midfielder.specialist_heads[0].network.layers[0]
+                .biases
+                .len(),
+            64
+        );
+    }
+
+    #[test]
+    fn policy_actor_snapshot_widens_to_configured_hidden_units() {
+        let _lock = env_lock();
+        let _policy_units = set_test_env_var("SOCCER_POLICY_HIDDEN_UNITS", "24");
+        let old = SoccerPolicyHead::new(11);
+        let old_snapshot = soccer_policy_head_snapshot(&old);
+
+        let _policy_units = set_test_env_var("SOCCER_POLICY_HIDDEN_UNITS", "64");
+        let restored = soccer_policy_head_from_snapshot(&old_snapshot, 11).expect("restore policy");
+        let forward = restored
+            .role_head_for_group(SoccerPolicyRoleGroup::Forward)
+            .expect("forward role head");
+
+        assert_eq!(forward.network.layers[0].biases.len(), 64);
+        assert_eq!(
+            forward.specialist_heads[0].network.layers[0].biases.len(),
+            64
+        );
+        assert_eq!(forward.network.layers.last().unwrap().weights[0].len(), 64);
+    }
+}
+
 /// Technical skill groups the specialist actor heads cover. Each maps to a disjoint subset of
 /// [`SOCCER_POLICY_ACTIONS`] (the passing, dribbling, and shooting families respectively).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39371,7 +39482,7 @@ impl SoccerSkillPolicyHead {
         let network = FeedForwardNetwork::random(
             &RandomNetworkSpec {
                 input_dim: SOCCER_POLICY_FEATURE_DIM,
-                hidden_layers: vec![SOCCER_POLICY_HIDDEN_UNITS],
+                hidden_layers: vec![soccer_policy_hidden_units()],
                 output_dim: group.families().len(),
                 hidden_activation: ActivationName::Tanh,
                 output_activation: ActivationName::Linear,
@@ -39641,7 +39752,7 @@ impl SoccerKeeperPolicyHead {
         let network = FeedForwardNetwork::random(
             &RandomNetworkSpec {
                 input_dim: SOCCER_POLICY_FEATURE_DIM,
-                hidden_layers: vec![SOCCER_POLICY_HIDDEN_UNITS],
+                hidden_layers: vec![soccer_policy_hidden_units()],
                 output_dim: SOCCER_KEEPER_ACTIONS.len(),
                 hidden_activation: ActivationName::Tanh,
                 output_activation: ActivationName::Linear,
@@ -40778,13 +40889,73 @@ fn widen_soccer_neural_snapshot_for_config(
     snapshot
 }
 
+fn widen_soccer_policy_snapshot_for_config(
+    mut snapshot: SoccerNeuralNetworkSnapshot,
+    expected_output_dim: usize,
+) -> SoccerNeuralNetworkSnapshot {
+    let target_hidden = soccer_policy_hidden_units();
+    if snapshot.layers.len() != 2
+        || snapshot.input_dim != SOCCER_POLICY_FEATURE_DIM
+        || snapshot.output_dim != expected_output_dim
+    {
+        return snapshot;
+    }
+    let current_hidden = snapshot
+        .layers
+        .first()
+        .map(|layer| layer.biases.len())
+        .unwrap_or(0);
+    if target_hidden <= current_hidden || current_hidden == 0 {
+        return snapshot;
+    }
+
+    let (hidden_layers, output_layers) = snapshot.layers.split_at_mut(1);
+    let hidden_layer = &mut hidden_layers[0];
+    let output_layer = &mut output_layers[0];
+    if hidden_layer.weights.len() != current_hidden
+        || hidden_layer
+            .weights
+            .iter()
+            .any(|row| row.len() != snapshot.input_dim)
+        || output_layer.weights.len() != snapshot.output_dim
+        || output_layer
+            .weights
+            .iter()
+            .any(|row| row.len() != current_hidden)
+    {
+        return snapshot;
+    }
+
+    let mut rng = mulberry32(
+        (snapshot.parameter_count as u32)
+            ^ (snapshot.training_steps as u32).rotate_left(11)
+            ^ (expected_output_dim as u32).rotate_left(19)
+            ^ 0xA17C_0128,
+    );
+    let scale = 0.05;
+    for _ in current_hidden..target_hidden {
+        let row = (0..snapshot.input_dim)
+            .map(|_| (2.0 * rng.next_float() - 1.0) * scale)
+            .collect::<Vec<_>>();
+        hidden_layer.weights.push(row);
+        hidden_layer.biases.push(0.0);
+    }
+    for row in &mut output_layer.weights {
+        row.resize(target_hidden, 0.0);
+    }
+    snapshot.parameter_count = soccer_neural_snapshot_parameter_count(&snapshot);
+    snapshot.l2_norm = soccer_neural_snapshot_l2_norm(&snapshot);
+    snapshot
+}
+
 fn build_soccer_policy_network_from_snapshot(
     snapshot: &SoccerNeuralNetworkSnapshot,
     output_dim: usize,
     label: &str,
 ) -> Result<FeedForwardNetwork, String> {
+    let snapshot = widen_soccer_policy_snapshot_for_config(snapshot.clone(), output_dim);
     build_soccer_feed_forward_network_from_snapshot(
-        snapshot,
+        &snapshot,
         SOCCER_POLICY_FEATURE_DIM,
         output_dim,
         &[],
