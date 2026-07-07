@@ -1,0 +1,180 @@
+//! Clipped-PPO fine-tuner for the Burn POMDP-solver — Codex lever #1: use the engine's now-REAL
+//! logged behavior probability (the sidecar's true sampled prob, stamped on each decision) as the
+//! old-policy prob for importance-weighted PPO, replacing AWR's proxy weight.
+//!
+//!   ratio      = π_new(a|belief) / π_behavior(a)          (π_behavior = logged sidecar prob)
+//!   L_clip     = -mean( min(ratio·A, clip(ratio,1±ε)·A) )  (trust-region policy improvement)
+//!   L_value    =  mean( (V - R̂)² )                          (normalized MC-return critic)
+//!   L_entropy  = -H(π_new)                                  (exploration)
+//!   L_kl       =  KL(π_ref ‖ π_new)                         (anchor to the pre-fine-tune BEST so
+//!                                                            fine-tuning can't collapse back into
+//!                                                            the mediocre deterministic mode)
+//!   loss = L_clip + 0.5·L_value + ent_coef·L_entropy + kl_coef·L_kl
+//!
+//! Warm-started from MODEL_IN (= the current BEST = the behavior policy), so at epoch 0 ratio≈1
+//! (a proper on-policy PPO start) and the clip/KL keep every step inside a trust region.
+//!
+//! CAVEAT: π_new here is log_softmax over ALL actions; the logged behavior prob was renormalized
+//! over the LEGAL set. After the offline/AWR warm-start the net puts little mass on illegal actions,
+//! so the ratio is a mild-conservative estimate; the clip + KL absorb the slack. Exporting the legal
+//! mask would make it exact (future work).
+
+use burn::backend::{Autodiff, NdArray};
+use burn::optim::{AdamConfig, GradientsParams, Optimizer};
+use burn::tensor::activation::{log_softmax, softmax};
+use burn::tensor::{backend::Backend, Tensor, TensorData};
+use burn_pomdp_solver::adapter::{load_flat_grouped, returns as mc_returns, to_tensors, Trajectory};
+use burn_pomdp_solver::{PomdpActorCritic, PomdpConfig};
+
+type B = Autodiff<NdArray>;
+
+const MAX_T: usize = 128;
+
+fn env_f32(k: &str, d: f32) -> f32 {
+    std::env::var(k).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(d)
+}
+fn env_usize(k: &str, d: usize) -> usize {
+    std::env::var(k).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(d)
+}
+
+fn main() {
+    let path = std::env::var("TRAJ").unwrap_or_else(|_| "/tmp/traj_export.jsonl".into());
+    let dev = Default::default();
+    let gamma = env_f32("PPO_GAMMA", 0.98);
+    let eps = env_f32("PPO_CLIP", 0.2);
+    let ent_coef = env_f32("PPO_ENT", 0.01);
+    let kl_coef = env_f32("PPO_KL", 0.5);
+    let lr = env_f32("PPO_LR", 2e-4) as f64;
+    let epochs = env_usize("PPO_EPOCHS", 250);
+    let batch = env_usize("PPO_BATCH", 64);
+
+    let mut trajs = load_flat_grouped(&path).expect("load export");
+    trajs.retain(|t| t.len() >= 4);
+    for t in trajs.iter_mut() {
+        if t.len() > MAX_T {
+            t.truncate(MAX_T);
+            if let Some(last) = t.last_mut() {
+                last.done = true;
+            }
+        }
+    }
+    let n_decisions: usize = trajs.iter().map(|t| t.len()).sum();
+    let data_n = trajs.iter().flatten().map(|d| d.action).max().unwrap_or(0) + 1;
+    let n_actions = env_usize("N_ACTIONS", data_n).max(data_n);
+
+    // Global return stats → normalize the critic target (matches train_real; keeps critic_mse ~O(1)).
+    let all_returns: Vec<f32> = trajs.iter().flat_map(|t| mc_returns(t, gamma)).collect();
+    let gmean = all_returns.iter().sum::<f32>() / all_returns.len().max(1) as f32;
+    let gvar = all_returns.iter().map(|r| (r - gmean).powi(2)).sum::<f32>() / all_returns.len().max(1) as f32;
+    let gstd = gvar.sqrt().max(1e-3);
+    // Diagnostic: how much real exploration signal is in the logged probs? (all 1.0 ⇒ deterministic
+    // export ⇒ PPO degenerates to plain PG; <1.0 spread ⇒ true stochastic behavior policy).
+    let bpps: Vec<f32> = trajs.iter().flatten().map(|d| d.behavior_policy_probability).collect();
+    let bpp_mean = bpps.iter().sum::<f32>() / bpps.len().max(1) as f32;
+    let bpp_det = bpps.iter().filter(|&&p| p >= 0.999).count() as f32 / bpps.len().max(1) as f32;
+    println!(
+        "loaded {} trajectories, {} decisions, n_actions={}, return mean={:.3} std={:.3} | behavior_prob mean={:.3} frac_deterministic={:.2}",
+        trajs.len(), n_decisions, n_actions, gmean, gstd, bpp_mean, bpp_det
+    );
+    if bpp_det > 0.95 {
+        println!("  WARNING: {:.0}% of logged probs are 1.0 — export looks deterministic; PPO ratio≈PG. Ensure SIDECAR_SAMPLE=1 at collection and the behavior_policy_probability engine patch is built.", bpp_det * 100.0);
+    }
+
+    let cfg = PomdpConfig::new(8, n_actions).with_model_dim(96).with_hidden_dim(128).with_n_heads(6);
+    let mut net = cfg.init::<B>(&dev);
+    // Frozen reference = the behavior policy (pre-fine-tune BEST). Used only for the KL anchor; never
+    // stepped. Loaded as a second instance from the same checkpoint (Burn modules aren't Clone).
+    let mut reference: Option<PomdpActorCritic<B>> = None;
+    if let Ok(mi) = std::env::var("MODEL_IN") {
+        net = net.load(&mi, &dev).expect("load checkpoint for fine-tuning");
+        reference = Some(cfg.init::<B>(&dev).load(&mi, &dev).expect("load frozen reference"));
+        println!("fine-tuning from checkpoint {mi}.bin  (KL-anchored to it, coef={kl_coef})");
+    } else {
+        println!("no MODEL_IN — training from init, KL anchor disabled");
+    }
+
+    let mut opt = AdamConfig::new().init();
+    let mut order: Vec<usize> = (0..trajs.len()).collect();
+    let mut seed = 0x51EEDu64;
+    let (mut ema_pi, mut ema_v, mut ema_ratio, mut ema_kl) = (0f32, 0f32, 1f32, 0f32);
+
+    for epoch in 0..epochs {
+        for i in (1..order.len()).rev() {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let j = (seed >> 33) as usize % (i + 1);
+            order.swap(i, j);
+        }
+        let (mut pi_sum, mut v_sum, mut r_sum, mut kl_sum, mut count) = (0f32, 0f32, 0f32, 0f32, 0usize);
+        for &idx in order.iter().take(batch) {
+            let traj: &Trajectory = &trajs[idx];
+            let t = traj.len();
+            let (entities, actions, returns_raw) = to_tensors::<B>(traj, gamma, &dev);
+            let returns = returns_raw.sub_scalar(gmean).div_scalar(gstd); // normalized critic target
+
+            let out = net.forward(entities.clone());
+
+            // Standardized, detached advantage (GAE-free MC advantage; batch-standardized like AWR).
+            let adv = (returns.clone() - out.values.clone()).detach();
+            let am = adv.clone().mean();
+            let astd = (adv.clone() - am.clone()).powf_scalar(2.0).mean().sqrt().add_scalar(1e-6);
+            let adv = (adv - am).div(astd); // (T)
+
+            let logp = log_softmax(out.logits.clone(), 1); // (T, n_actions)
+            let logp_a = logp.clone().gather(1, actions.reshape([t, 1])).reshape([t]); // (T)
+
+            // Logged old-policy log-prob (ln of the sidecar's true sampled prob), detached constant.
+            let old_p: Vec<f32> = traj.iter().map(|d| d.behavior_policy_probability.clamp(1e-6, 1.0)).collect();
+            let old_logp = Tensor::<B, 1>::from_data(TensorData::new(old_p, [t]), &dev).log();
+
+            // Clipped surrogate: -mean( min(ratio·A, clip(ratio,1±ε)·A) ).
+            let ratio = (logp_a - old_logp).exp(); // (T)
+            let unclipped = ratio.clone() * adv.clone();
+            let clipped = ratio.clone().clamp(1.0 - eps, 1.0 + eps) * adv;
+            let policy_loss = unclipped.min_pair(clipped).mean().neg();
+
+            let value_loss = (out.values - returns).powf_scalar(2.0).mean();
+            let probs = softmax(out.logits, 1);
+            let entropy = (probs.clone() * logp.clone()).sum_dim(1).mean().neg();
+
+            // KL(π_ref ‖ π_new) anchor to the frozen behavior policy (mode-covering ⇒ anti-collapse).
+            let kl = match &reference {
+                Some(r) => {
+                    let ref_logp = log_softmax(r.forward(entities).logits, 1).detach();
+                    let ref_p = ref_logp.clone().exp();
+                    (ref_p * (ref_logp - logp)).sum_dim(1).mean()
+                }
+                None => Tensor::<B, 1>::from_data(TensorData::new(vec![0f32], [1]), &dev).mean(),
+            };
+
+            let loss = policy_loss.clone()
+                + value_loss.clone().mul_scalar(0.5)
+                + entropy.clone().mul_scalar(ent_coef)
+                + kl.clone().mul_scalar(kl_coef);
+
+            pi_sum += policy_loss.into_scalar();
+            v_sum += value_loss.into_scalar();
+            r_sum += ratio.mean().into_scalar();
+            kl_sum += kl.into_scalar();
+            count += 1;
+            let grads = GradientsParams::from_grads(loss.backward(), &net);
+            net = opt.step(lr, net, grads);
+        }
+        let n = count.max(1) as f32;
+        ema_pi = 0.9 * ema_pi + 0.1 * (pi_sum / n);
+        ema_v = 0.9 * ema_v + 0.1 * (v_sum / n);
+        ema_ratio = 0.9 * ema_ratio + 0.1 * (r_sum / n);
+        ema_kl = 0.9 * ema_kl + 0.1 * (kl_sum / n);
+        if epoch % 25 == 0 {
+            println!(
+                "epoch {epoch}: policy(ema)={ema_pi:.4}  critic_mse(ema)={ema_v:.4}  ratio(ema)={ema_ratio:.3}  kl(ema)={ema_kl:.4}"
+            );
+        }
+    }
+
+    let out_path = std::env::var("MODEL_OUT").unwrap_or_else(|_| "/tmp/burn-pomdp-ppo".into());
+    match net.save(&out_path) {
+        Ok(_) => println!("saved PPO-fine-tuned model -> {out_path}.bin"),
+        Err(e) => println!("save failed: {e}"),
+    }
+    println!("OK: clipped-PPO fine-tune on REAL logged behavior probs (KL-anchored, entropy-regularized).");
+}
