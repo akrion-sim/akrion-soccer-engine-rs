@@ -5066,6 +5066,66 @@ mod tests {
     }
 
     #[test]
+    fn neural_mcts_force_floor_selects_discretized_kick_above_floor_draw() {
+        let _env_lock = soccer_world_env_lock();
+        let _gate = set_test_env_var("DD_SOCCER_ENABLE_DISCRETIZED_KICK", "1");
+        let _root_floor =
+            set_test_env_var("SOCCER_NEURAL_MCTS_MIN_DISCRETIZED_KICK_CANDIDATES", "1");
+        let _force = set_test_env_var("SOCCER_NEURAL_MCTS_DISCRETIZED_KICK_FORCE_FLOOR", "1");
+        let _selection_floor = set_test_env_var(
+            "SOCCER_NEURAL_MCTS_DISCRETIZED_KICK_SELECTION_FLOOR",
+            "0.35",
+        );
+        let _strict_regression = set_test_env_var(
+            "SOCCER_NEURAL_MCTS_DISCRETIZED_KICK_SELECTION_MAX_SCORE_REGRESSION",
+            "0.01",
+        );
+        let blend = SoccerNeuralBlendConfig {
+            mcts_enabled: true,
+            mcts_simulations: 2,
+            mcts_candidates: 4,
+            ..SoccerNeuralBlendConfig::default()
+        };
+        let candidates = vec![
+            SoccerNeuralMctsCandidate {
+                label: "shoot".to_string(),
+                plan: None,
+                score: 1.0,
+                prior: 0.6,
+                q_visits: 4,
+            },
+            SoccerNeuralMctsCandidate {
+                label: "pass".to_string(),
+                plan: None,
+                score: 0.9,
+                prior: 0.3,
+                q_visits: 3,
+            },
+            SoccerNeuralMctsCandidate {
+                label: "dribble".to_string(),
+                plan: None,
+                score: 0.8,
+                prior: 0.2,
+                q_visits: 2,
+            },
+            SoccerNeuralMctsCandidate {
+                label: "pass1-kp7".to_string(),
+                plan: None,
+                score: -9.0,
+                prior: 0.0,
+                q_visits: 0,
+            },
+        ];
+
+        assert_eq!(
+            SoccerMatch::neural_mcts_action_from_candidates(blend, &candidates, 0.99)
+                .as_ref()
+                .map(|choice| choice.label.as_str()),
+            Some("pass1-kp7")
+        );
+    }
+
+    #[test]
     fn neural_mcts_discretized_kick_selection_floor_can_sample_bucket() {
         let _env_lock = soccer_world_env_lock();
         let _gate = set_test_env_var("DD_SOCCER_ENABLE_DISCRETIZED_KICK", "1");
@@ -9365,9 +9425,10 @@ impl SoccerMatch {
         draw: f64,
     ) -> Option<usize> {
         let floor = neural_mcts_discretized_kick_selection_floor();
+        let force_floor = neural_mcts_discretized_kick_force_floor();
         if floor <= 1e-9
             || !draw.is_finite()
-            || draw >= floor
+            || (!force_floor && draw >= floor)
             || !dd_soccer_enable_discretized_kick()
         {
             return None;
@@ -9407,7 +9468,12 @@ impl SoccerMatch {
         if eligible_count == 0 || !total.is_finite() || total <= 1e-9 {
             return None;
         }
-        let mut threshold = (draw / floor).clamp(0.0, 1.0 - f64::EPSILON) * total;
+        let floor_draw = if force_floor && draw >= floor {
+            draw
+        } else {
+            draw / floor
+        };
+        let mut threshold = floor_draw.clamp(0.0, 1.0 - f64::EPSILON) * total;
         for (rank, weight) in eligible[..eligible_count].iter().copied() {
             if threshold < weight {
                 return Some(rank);
