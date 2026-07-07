@@ -277,6 +277,28 @@ fn neural_mcts_pass_like_non_pass_margin() -> f64 {
     )
 }
 
+fn neural_mcts_aerial_pass_candidates_enabled() -> bool {
+    let read = || {
+        std::env::var("SOCCER_NEURAL_MCTS_AERIAL_PASS_ENABLED")
+            .ok()
+            .map(|raw| {
+                let value = raw.trim().to_ascii_lowercase();
+                matches!(value.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(false)
+    };
+    #[cfg(test)]
+    {
+        read()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(read)
+    }
+}
+
 fn neural_mcts_discretized_kick_force_floor() -> bool {
     let read = || {
         std::env::var("SOCCER_NEURAL_MCTS_DISCRETIZED_KICK_FORCE_FLOOR")
@@ -4842,6 +4864,7 @@ mod tests {
     #[test]
     fn neural_mcts_context_filter_rejects_loose_aerial_passes() {
         let _env_lock = soccer_world_env_lock();
+        let _aerial_enabled = set_test_env_var("SOCCER_NEURAL_MCTS_AERIAL_PASS_ENABLED", "1");
         let _min_safe = set_test_env_var(
             "SOCCER_NEURAL_MCTS_MIN_REPLAN_SAFE_EXECUTION_PROBABILITY",
             "0.55",
@@ -4880,6 +4903,35 @@ mod tests {
         assert!(
             SoccerMatch::neural_mcts_transition_context_is_executable(&transition),
             "true line-breaking aerial passes should remain legal for MCTS"
+        );
+    }
+
+    #[test]
+    fn neural_mcts_context_filter_quarantines_aerial_passes_by_default() {
+        let _env_lock = soccer_world_env_lock();
+        let _min_safe = set_test_env_var(
+            "SOCCER_NEURAL_MCTS_MIN_REPLAN_SAFE_EXECUTION_PROBABILITY",
+            "0.55",
+        );
+        let _weight = set_test_env_var("SOCCER_NEURAL_MCTS_PASS_MPC_PRIOR_WEIGHT", "1.0");
+        let mut transition = policy_test_transition_with_mcts(true);
+        transition.action = "aerial-pass1-kp7".to_string();
+        transition.decision_context.chosen_action_mpc_feasibility = 0.90;
+        transition.decision_context.chosen_action_control_cost = 0.05;
+        transition.decision_context.pass_mpc_receipt_probability = 0.94;
+        transition.decision_context.pass_receipt_qp_accel_fit = 0.88;
+        transition
+            .decision_context
+            .pass_receipt_race_advantage_seconds = 0.70;
+        transition.decision_context.target_forward_yards = 32.0;
+
+        assert!(
+            neural_mcts_pass_mpc_candidate_bonus(&transition) > 0.0,
+            "setup should be a high-quality aerial by the old prior"
+        );
+        assert!(
+            !SoccerMatch::neural_mcts_transition_context_is_executable(&transition),
+            "live traces showed even high-forward aerial MCTS candidates remain a negative sink"
         );
     }
 
@@ -9768,8 +9820,13 @@ impl SoccerMatch {
             ) {
                 return false;
             }
-            if label == "aerial-pass" && neural_mcts_pass_mpc_candidate_bonus(transition) <= 0.0 {
-                return false;
+            if label == "aerial-pass" {
+                if !neural_mcts_aerial_pass_candidates_enabled() {
+                    return false;
+                }
+                if neural_mcts_pass_mpc_candidate_bonus(transition) <= 0.0 {
+                    return false;
+                }
             }
             return true;
         }
