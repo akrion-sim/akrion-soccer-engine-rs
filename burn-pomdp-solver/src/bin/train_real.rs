@@ -44,6 +44,10 @@ fn main() {
 
     let cfg = PomdpConfig::new(8, n_actions).with_model_dim(96).with_hidden_dim(128).with_n_heads(6);
     let mut net = cfg.init::<B>(&dev);
+    if let Ok(mi) = std::env::var("MODEL_IN") {
+        net = net.load(&mi, &dev).expect("load checkpoint for fine-tuning");
+        println!("fine-tuning from checkpoint {mi}.bin");
+    }
     let mut opt = AdamConfig::new().init();
     let mut order: Vec<usize> = (0..trajs.len()).collect();
     let mut seed = 0x51EEDu64;
