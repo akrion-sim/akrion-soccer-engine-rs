@@ -37,6 +37,7 @@ const NEURAL_MCTS_DISCRETIZED_KICK_SELECTION_FLOOR: f64 = 0.0;
 const NEURAL_MCTS_DISCRETIZED_KICK_SELECTION_MAX_SCORE_REGRESSION: f64 = 1.50;
 const NEURAL_MCTS_DISCRETIZED_KICK_EXPLORATION_MAX_SCORE_REGRESSION: f64 = 1.50;
 const NEURAL_MCTS_DISCRETIZED_KICK_EXPLORATION_MIN_PRIOR: f64 = 0.04;
+const NEURAL_MCTS_PASS_LIKE_NON_PASS_MARGIN: f64 = 0.55;
 const SOCCER_CENTERED_POLICY_BONUS_CLIP: f64 = 0.45;
 const SOCCER_CENTERED_SKILL_POLICY_BONUS_CLIP: f64 = 0.30;
 const NEURAL_VALUE_BOOTSTRAP_DEFAULT_WEIGHT: f64 = 0.45;
@@ -264,6 +265,15 @@ fn neural_mcts_discretized_kick_exploration_min_prior() -> f64 {
         NEURAL_MCTS_DISCRETIZED_KICK_EXPLORATION_MIN_PRIOR,
         0.0,
         1.0,
+    )
+}
+
+fn neural_mcts_pass_like_non_pass_margin() -> f64 {
+    learned_mpc_metric_env(
+        "SOCCER_NEURAL_MCTS_PASS_LIKE_NON_PASS_MARGIN",
+        NEURAL_MCTS_PASS_LIKE_NON_PASS_MARGIN,
+        0.0,
+        8.0,
     )
 }
 
@@ -5133,6 +5143,103 @@ mod tests {
     }
 
     #[test]
+    fn neural_mcts_pass_like_margin_gate_filters_low_trust_passes() {
+        let _env_lock = soccer_world_env_lock();
+        let _margin = set_test_env_var("SOCCER_NEURAL_MCTS_PASS_LIKE_NON_PASS_MARGIN", "0.50");
+        let mut candidates = vec![
+            SoccerNeuralMctsCandidate {
+                label: "shoot".to_string(),
+                plan: None,
+                score: 1.20,
+                prior: 0.4,
+                q_visits: 1,
+            },
+            SoccerNeuralMctsCandidate {
+                label: "runaround-dribble".to_string(),
+                plan: None,
+                score: 1.05,
+                prior: 0.2,
+                q_visits: 1,
+            },
+            SoccerNeuralMctsCandidate {
+                label: "pass1-kp7".to_string(),
+                plan: None,
+                score: 1.40,
+                prior: 0.8,
+                q_visits: 1,
+            },
+            SoccerNeuralMctsCandidate {
+                label: "aerial-pass1-kp8".to_string(),
+                plan: None,
+                score: 0.90,
+                prior: 0.9,
+                q_visits: 1,
+            },
+        ];
+
+        SoccerMatch::apply_neural_mcts_pass_like_margin_gate(&mut candidates);
+
+        let labels = candidates
+            .iter()
+            .map(|candidate| candidate.label.as_str())
+            .collect::<Vec<_>>();
+        assert!(labels.contains(&"shoot"));
+        assert!(labels.contains(&"runaround-dribble"));
+        assert!(!labels.contains(&"pass1-kp7"));
+        assert!(!labels.contains(&"aerial-pass1-kp8"));
+    }
+
+    #[test]
+    fn neural_mcts_pass_like_margin_gate_keeps_proven_or_pass_only_candidates() {
+        let _env_lock = soccer_world_env_lock();
+        let _margin = set_test_env_var("SOCCER_NEURAL_MCTS_PASS_LIKE_NON_PASS_MARGIN", "0.50");
+        let mut mixed = vec![
+            SoccerNeuralMctsCandidate {
+                label: "shoot".to_string(),
+                plan: None,
+                score: 1.00,
+                prior: 0.4,
+                q_visits: 1,
+            },
+            SoccerNeuralMctsCandidate {
+                label: "pass1-kp7".to_string(),
+                plan: None,
+                score: 1.65,
+                prior: 0.8,
+                q_visits: 1,
+            },
+        ];
+        SoccerMatch::apply_neural_mcts_pass_like_margin_gate(&mut mixed);
+        assert!(
+            mixed.iter().any(|candidate| candidate.label == "pass1-kp7"),
+            "pass-like candidates that clearly beat the non-pass baseline should remain expressible"
+        );
+
+        let mut pass_only = vec![
+            SoccerNeuralMctsCandidate {
+                label: "pass1-kp7".to_string(),
+                plan: None,
+                score: -1.00,
+                prior: 0.2,
+                q_visits: 1,
+            },
+            SoccerNeuralMctsCandidate {
+                label: "aerial-pass1-kp8".to_string(),
+                plan: None,
+                score: -2.00,
+                prior: 0.1,
+                q_visits: 1,
+            },
+        ];
+        SoccerMatch::apply_neural_mcts_pass_like_margin_gate(&mut pass_only);
+        assert_eq!(
+            pass_only.len(),
+            2,
+            "the gate needs a non-pass baseline; pass-only states fall back to existing scoring"
+        );
+    }
+
+    #[test]
     fn neural_mcts_root_floor_keeps_discretized_kick_candidate() {
         let _env_lock = soccer_world_env_lock();
         let _gate = set_test_env_var("DD_SOCCER_ENABLE_DISCRETIZED_KICK", "1");
@@ -9669,6 +9776,32 @@ impl SoccerMatch {
         true
     }
 
+    fn neural_mcts_candidate_is_pass_like(candidate: &SoccerNeuralMctsCandidate) -> bool {
+        pass_like_action_flight(&candidate.label).is_some()
+    }
+
+    fn apply_neural_mcts_pass_like_margin_gate(
+        candidates: &mut Vec<SoccerNeuralMctsCandidate>,
+    ) {
+        let margin = neural_mcts_pass_like_non_pass_margin();
+        if margin <= 0.0 || candidates.len() < 2 {
+            return;
+        }
+        let best_non_pass_score = candidates
+            .iter()
+            .filter(|candidate| !Self::neural_mcts_candidate_is_pass_like(candidate))
+            .map(|candidate| candidate.score)
+            .fold(f64::NEG_INFINITY, f64::max);
+        if !best_non_pass_score.is_finite() {
+            return;
+        }
+        let required_score = best_non_pass_score + margin;
+        candidates.retain(|candidate| {
+            !Self::neural_mcts_candidate_is_pass_like(candidate)
+                || candidate.score >= required_score
+        });
+    }
+
     fn neural_mcts_action_from_candidates(
         blend: SoccerNeuralBlendConfig,
         candidates: &[SoccerNeuralMctsCandidate],
@@ -10555,6 +10688,7 @@ impl SoccerMatch {
                 push_scored_candidate(candidate, expanded_plan);
             }
         }
+        Self::apply_neural_mcts_pass_like_margin_gate(&mut scored_candidates);
         scored_candidates.sort_by(|a, b| {
             b.score
                 .total_cmp(&a.score)
