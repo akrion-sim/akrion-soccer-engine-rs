@@ -83,6 +83,30 @@ impl<B: Backend> PomdpActorCritic<B> {
         softmax(self.forward(entities).logits, 1)
     }
 
+    /// SINGLE-decision inference carrying the GRU belief explicitly — the exact call the sidecar
+    /// makes each tick. `entities`: (1, N, entity_dim); `hidden`: prev belief (1,1,hidden_dim) or
+    /// None (episode reset). Returns (logits (1,n_actions), value (1), new_hidden (1,1,hidden_dim)).
+    /// The caller (sidecar) keys `new_hidden` per (agent, episode) and feeds it back next tick.
+    pub fn step_infer(
+        &self,
+        entities: Tensor<B, 3>,
+        hidden: Option<Tensor<B, 3>>,
+    ) -> (Tensor<B, 2>, Tensor<B, 1>, Tensor<B, 3>) {
+        let t = entities.dims()[0];
+        let embedded = self.embed.forward(entities);
+        let attended = self.attn.forward(MhaInput::self_attn(embedded)).context;
+        let pooled = attended.mean_dim(1);
+        let m = pooled.dims()[2];
+        let seq = pooled.reshape([1, t, m]);
+        let belief = self.gru.forward(seq, hidden); // (1, t, hidden)
+        let h = belief.dims()[2];
+        let new_hidden = belief.clone();
+        let flat = belief.reshape([t, h]);
+        let logits = self.actor.forward(flat.clone());
+        let value = self.critic.forward(flat).reshape([t]);
+        (logits, value, new_hidden)
+    }
+
     /// Snapshot bridge: persist trained weights to `<path>.bin` (the sidecar loads this to serve
     /// the policy). Consumes self (Burn's recorder API).
     pub fn save(self, path: &str) -> Result<(), burn::record::RecorderError> {
