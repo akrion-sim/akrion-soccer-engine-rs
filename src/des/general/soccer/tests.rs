@@ -24572,6 +24572,12 @@ fn learned_pass_plan_cannot_bypass_pomdp_visibility() {
         target_point: None,
         mpc_replan: None,
     };
+    let hidden_bucketed_pass_plan = SoccerLearnedPlan {
+        action: "pass1-kp4".to_string(),
+        target_player: Some(hidden_teammate),
+        target_point: None,
+        mpc_replan: None,
+    };
     let hidden_low_cross_plan = SoccerLearnedPlan {
         action: "play-down-flank-low-cross".to_string(),
         target_player: Some(hidden_teammate),
@@ -24597,6 +24603,12 @@ fn learned_pass_plan_cannot_bypass_pomdp_visibility() {
             ..
         } if target == visible_teammate
     ));
+    assert!(
+        sim.players[passer]
+            .action_from_learned_plan(&hidden_bucketed_pass_plan, &snapshot, &observation)
+            .is_none(),
+        "bucketed learned passes must not retarget a hidden candidate and keep the learned kick label"
+    );
 
     let (cross_action, cross_label) = sim.players[passer]
         .action_from_learned_plan(&hidden_low_cross_plan, &snapshot, &observation)

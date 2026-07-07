@@ -12868,6 +12868,19 @@ impl PlayerAgent {
                 let learned_kick_power =
                     learned_discretized_kick_power_for_action_label(&plan.action);
                 let visible_targets = snapshot.ranked_visible_pass_targets(self.id, 11);
+                if let Some(power) = learned_kick_power {
+                    let target = plan
+                        .target_player
+                        .filter(|target| visible_targets.contains(target))?;
+                    return Some((
+                        SoccerAction::Pass {
+                            target_player: Some(target),
+                            power,
+                            flight: PassFlight::Floor,
+                        },
+                        learned_mpc_action_label_key(&plan.action),
+                    ));
+                }
                 if learned_kick_power.is_none() {
                     if let Some(target) = learned_generic_pass_killer_upgrade_target_for(
                         self,
@@ -12974,6 +12987,21 @@ impl PlayerAgent {
                     return None;
                 }
                 let visible_targets = snapshot.ranked_visible_aerial_pass_targets(self.id, 11);
+                let learned_kick_power =
+                    learned_discretized_kick_power_for_action_label(&plan.action);
+                if let Some(power) = learned_kick_power {
+                    let target = plan
+                        .target_player
+                        .filter(|target| visible_targets.contains(target))?;
+                    return Some((
+                        SoccerAction::Pass {
+                            target_player: Some(target),
+                            power,
+                            flight: PassFlight::Aerial,
+                        },
+                        learned_mpc_action_label_key(&plan.action),
+                    ));
+                }
                 let target = plan
                     .target_player
                     .filter(|target| visible_targets.contains(target))
@@ -12981,8 +13009,6 @@ impl PlayerAgent {
                 target.map(|target| {
                     let crossing =
                         ability01(self.skills.crossing_left.max(self.skills.crossing_right));
-                    let learned_kick_power =
-                        learned_discretized_kick_power_for_action_label(&plan.action);
                     let action_label = if ranked_pass_action_label(&plan.action)
                         && (learned_kick_power.is_some() || plan.target_player == Some(target))
                     {
