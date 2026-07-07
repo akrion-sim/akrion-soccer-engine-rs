@@ -118,6 +118,7 @@ pub fn load_flat_grouped(path: &str) -> std::io::Result<Vec<Trajectory>> {
             action: d.action,
             reward: d.reward,
             done: d.done,
+            behavior_policy_probability: d.behavior_policy_probability,
         });
         if done {
             if let Some(traj) = open.remove(&agent) {
