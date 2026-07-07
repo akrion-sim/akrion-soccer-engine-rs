@@ -83,6 +83,8 @@ pub struct FlatDecision {
     pub reward: f32,
     pub done: bool,
     pub agent: usize,
+    #[serde(default = "default_behavior_policy_probability")]
+    pub behavior_policy_probability: f32,
 }
 
 /// Load the engine's FLAT export (one `FlatDecision` per line, in emit order) and group into
