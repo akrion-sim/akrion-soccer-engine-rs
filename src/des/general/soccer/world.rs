@@ -13453,6 +13453,18 @@ impl SoccerMatch {
                 };
                 ret[i] = adj[i] + future;
             }
+            // STANDARDIZE (PopArt-style): realized returns are goal-dominated (a scored possession is
+            // ~100+ while a quiet one is ~1), so the fixed target_scale/clip would saturate them into a
+            // near-binary signal. Normalizing to ~unit scale gives the critic a graded target — this is
+            // exactly how the external Burn solver (the only thing that beat parity) handles returns.
+            if n > 1 {
+                let mean = ret.iter().sum::<f64>() / n as f64;
+                let var = ret.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / n as f64;
+                let std = var.sqrt().max(1e-3);
+                for r in ret.iter_mut() {
+                    *r = (*r - mean) / std;
+                }
+            }
             ret
         } else {
             Vec::new()
