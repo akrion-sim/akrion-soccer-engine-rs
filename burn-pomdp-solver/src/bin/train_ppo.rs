@@ -73,12 +73,9 @@ fn main() {
     let bpp_mean = bpps.iter().sum::<f32>() / bpps.len().max(1) as f32;
     let bpp_det = bpps.iter().filter(|&&p| p >= 0.999).count() as f32 / bpps.len().max(1) as f32;
     println!(
-        "loaded {} trajectories, {} decisions, n_actions={}, return mean={:.3} std={:.3} | behavior_prob mean={:.3} frac_deterministic={:.2}",
+        "loaded {} trajectories, {} decisions, n_actions={}, return mean={:.3} std={:.3} | logged behavior_prob mean={:.3} frac_deterministic={:.2} (informational — old-policy prob is RECOMPUTED from the reference net, so this is exact regardless)",
         trajs.len(), n_decisions, n_actions, gmean, gstd, bpp_mean, bpp_det
     );
-    if bpp_det > 0.95 {
-        println!("  WARNING: {:.0}% of logged probs are 1.0 — export looks deterministic; PPO ratio≈PG. Ensure SIDECAR_SAMPLE=1 at collection and the behavior_policy_probability engine patch is built.", bpp_det * 100.0);
-    }
 
     let cfg = PomdpConfig::new(8, n_actions).with_model_dim(96).with_hidden_dim(128).with_n_heads(6);
     let mut net = cfg.init::<B>(&dev);
