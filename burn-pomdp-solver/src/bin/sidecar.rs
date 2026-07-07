@@ -32,6 +32,16 @@ struct Resp {
     logits: Vec<f64>,
     value: f64,
     contract_version: u32,
+    // TRUE on-policy behavior probability of the returned action under the sampling policy
+    // (softmax over legal logits). The engine stamps this onto the decision so the offline
+    // trainer has a real old-policy prob for clipped-PPO importance weighting (Codex lever #1).
+    // None on the argmax/eval path (deterministic → engine falls back to 1.0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    behavior_policy_probability: Option<f64>,
+    // The action the sidecar actually chose (sampled). The engine prefers this (after a legality
+    // re-check) over re-deriving argmax, so the logged action == the one whose prob we report.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action_index: Option<usize>,
 }
 
 struct Server {
