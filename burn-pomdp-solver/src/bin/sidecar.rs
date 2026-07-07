@@ -169,7 +169,7 @@ fn main() {
         }
         let resp = match parsed {
             Some(req) => srv.infer(&req),
-            None => Resp { logits: vec![], value: 0.0, contract_version: 1 },
+            None => Resp { logits: vec![], value: 0.0, contract_version: 1, behavior_policy_probability: None, action_index: None },
         };
         let body = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into());
         let _ = write!(
