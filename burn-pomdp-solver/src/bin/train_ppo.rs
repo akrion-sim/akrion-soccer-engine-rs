@@ -90,8 +90,42 @@ fn main() {
         println!("no MODEL_IN — training from init, KL anchor disabled");
     }
 
+    // Precompute EVERY constant tensor once. entities/actions/normalized-returns and the frozen
+    // reference's log-probs do NOT change across epochs — recomputing the reference forward each epoch
+    // was the 20-min-timeout cost. After this the hot loop runs only the trainable net's fwd/bwd.
+    struct Cached<B: Backend> {
+        entities: Tensor<B, 3>,
+        actions: Tensor<B, 1, Int>,
+        returns: Tensor<B, 1>,          // normalized critic target (constant)
+        old_logp: Tensor<B, 1>,         // ref log-prob of taken action (exact old-policy log-prob)
+        ref_logp: Option<Tensor<B, 2>>, // full ref log-probs (T,73) for the KL anchor; None ⇒ no anchor
+    }
+    let cache: Vec<Cached<B>> = trajs
+        .iter()
+        .map(|traj| {
+            let t = traj.len();
+            let (entities, actions, returns_raw) = to_tensors::<B>(traj, gamma, &dev);
+            let returns = returns_raw.sub_scalar(gmean).div_scalar(gstd);
+            let (old_logp, ref_logp) = match &reference {
+                Some(r) => {
+                    let rlp = log_softmax(r.forward(entities.clone()).logits, 1).detach(); // (T,73)
+                    let ola = rlp.clone().gather(1, actions.clone().reshape([t, 1])).reshape([t]).detach();
+                    (ola, Some(rlp))
+                }
+                None => {
+                    let old_p: Vec<f32> =
+                        traj.iter().map(|d| d.behavior_policy_probability.clamp(1e-6, 1.0)).collect();
+                    (Tensor::<B, 1>::from_data(TensorData::new(old_p, [t]), &dev).log(), None)
+                }
+            };
+            Cached { entities, actions, returns, old_logp, ref_logp }
+        })
+        .collect();
+    drop(reference); // free the reference net; the cache holds its (detached) outputs
+    println!("precomputed {} trajectory tensor caches (reference forward done once, not per-epoch)", cache.len());
+
     let mut opt = AdamConfig::new().init();
-    let mut order: Vec<usize> = (0..trajs.len()).collect();
+    let mut order: Vec<usize> = (0..cache.len()).collect();
     let mut seed = 0x51EEDu64;
     let (mut ema_pi, mut ema_v, mut ema_ratio, mut ema_kl) = (0f32, 0f32, 1f32, 0f32);
 
