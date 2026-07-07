@@ -26110,6 +26110,16 @@ impl SoccerMatch {
                                     .decision_context
                                     .neural_mcts_discretized_kick_candidate_count,
                             );
+                        if transition
+                            .decision_context
+                            .neural_mcts_discretized_kick_candidate_count
+                            > 0
+                        {
+                            self.stats.neural_mcts_discretized_kick_candidate_sets = self
+                                .stats
+                                .neural_mcts_discretized_kick_candidate_sets
+                                .saturating_add(1);
+                        }
                         self.stats.neural_mcts_root_discretized_kick_candidates = self
                             .stats
                             .neural_mcts_root_discretized_kick_candidates
@@ -26118,6 +26128,16 @@ impl SoccerMatch {
                                     .decision_context
                                     .neural_mcts_root_discretized_kick_candidate_count,
                             );
+                        if transition
+                            .decision_context
+                            .neural_mcts_root_discretized_kick_candidate_count
+                            > 0
+                        {
+                            self.stats.neural_mcts_root_discretized_kick_candidate_sets = self
+                                .stats
+                                .neural_mcts_root_discretized_kick_candidate_sets
+                                .saturating_add(1);
+                        }
                     }
                     if learned_discretized_kick_speed_bucket_for_action_label(&transition.action)
                         .is_some()
