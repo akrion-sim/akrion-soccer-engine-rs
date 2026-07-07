@@ -146,9 +146,11 @@ fn main() {
                 None => Tensor::<B, 1>::from_data(TensorData::new(vec![0f32], [1]), &dev).mean(),
             };
 
+            // entropy var = +H(π); SUBTRACT it (maximize entropy ⇒ exploration). KL is ≥0 and ADDED
+            // (penalize divergence from the frozen reference ⇒ anti-collapse).
             let loss = policy_loss.clone()
                 + value_loss.clone().mul_scalar(0.5)
-                + entropy.clone().mul_scalar(ent_coef)
+                - entropy.mul_scalar(ent_coef)
                 + kl.clone().mul_scalar(kl_coef);
 
             pi_sum += policy_loss.into_scalar();
