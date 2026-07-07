@@ -27025,6 +27025,7 @@ impl SoccerMatch {
                 transitions.push(transition);
             }
         }
+        soccer_trajectory_export_write(&transitions);
         transitions
     }
 }
