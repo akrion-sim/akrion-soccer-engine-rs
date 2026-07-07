@@ -2088,6 +2088,18 @@ fn dd_soccer_enable_bellman_terminals() -> bool {
     *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_BELLMAN_TERMINALS"))
 }
 
+/// MC critic target (default-OFF, Codex-designed anti-alias lever). When on, the value head trains on
+/// the REALIZED discounted return (summed forward along each player's successor chain) instead of the
+/// tabular-bootstrapped `reward + γ·best_value_hierarchical(next)`. This breaks the aliased-tabular
+/// fixed point the neural value otherwise inherits by construction — the leading suspect for the
+/// parity ceiling. Run with DD_SOCCER_ENABLE_BELLMAN_TERMINALS=0 so terminal reconstruction doesn't
+/// reintroduce a bootstrap into the return labels.
+fn dd_soccer_enable_mc_critic_target() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_MC_CRITIC_TARGET"))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SoccerTrajectoryExportDecision {
