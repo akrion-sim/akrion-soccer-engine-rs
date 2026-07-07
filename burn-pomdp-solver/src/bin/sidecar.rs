@@ -109,7 +109,7 @@ fn main() {
     let addr = std::env::var("SOCCER_BURN_POMDP_SIDECAR_URL")
         .ok()
         .map(|u| u.trim_start_matches("http://").split('/').next().unwrap_or("127.0.0.1:8091").to_string())
-        .unwrap_or_else(|_| "127.0.0.1:8091".into());
+        .unwrap_or_else(|| "127.0.0.1:8091".into());
     let listener = TcpListener::bind(&addr).expect("bind sidecar");
     let mut srv = Server { net, dev, belief: HashMap::new(), n_actions };
     println!("burn-pomdp sidecar listening on http://{addr}/infer  model={model}.bin  n_actions={n_actions}");
