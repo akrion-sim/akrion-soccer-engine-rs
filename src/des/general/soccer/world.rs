@@ -1577,6 +1577,7 @@ struct SoccerPolicyActionChoice {
 
 #[derive(Clone, Debug)]
 struct SoccerLearnedDecisionPlan {
+    label: String,
     plan: SoccerLearnedPlan,
     behavior_probability: f64,
     neural_mcts_selected: bool,
@@ -3332,6 +3333,65 @@ mod tests {
         let option_context =
             soccer_action_option_learning_context(&decision.action, &decision.action_options);
         assert!((option_context.chosen_action_probability - 0.20).abs() < 1e-9);
+    }
+
+    #[test]
+    fn neural_mcts_stamp_counts_only_the_executed_action_family() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let player = &sim.players[0];
+        let mdp_state = snapshot.mdp_state_for_player(player.id);
+        let observation = snapshot.observation_for(player.id);
+        let belief = belief_from_observation(&observation);
+        sim.players[0].last_decision = Some(AgentDecisionTrace {
+            mdp_state,
+            observation,
+            belief,
+            operation_order: vec!["learned-policy".to_string(), "aerial-pass".to_string()],
+            scheduled_index: None,
+            action_options: single_action_option("aerial-pass"),
+            action_target: None,
+            mdp_mpc_comparison: None,
+            learned_mpc_replan: None,
+            behavior_policy_probability: None,
+            neural_mcts_selected: false,
+            neural_mcts_candidate_count: 0,
+            neural_mcts_discretized_kick_candidate_count: 0,
+            neural_mcts_root_discretized_kick_candidate_count: 0,
+            action: "aerial-pass".to_string(),
+        });
+
+        SoccerMatch::stamp_neural_mcts_selection(
+            &mut sim.players[0],
+            true,
+            Some("shoot"),
+            16,
+            3,
+            2,
+        );
+        let decision = sim.players[0]
+            .last_decision
+            .as_ref()
+            .expect("decision trace");
+        assert!(!decision.neural_mcts_selected);
+        assert_eq!(decision.neural_mcts_candidate_count, 0);
+
+        SoccerMatch::stamp_neural_mcts_selection(
+            &mut sim.players[0],
+            true,
+            Some("aerial-pass1-kp7"),
+            16,
+            3,
+            2,
+        );
+        let decision = sim.players[0]
+            .last_decision
+            .as_ref()
+            .expect("decision trace");
+        assert!(decision.neural_mcts_selected);
+        assert_eq!(decision.neural_mcts_candidate_count, 16);
+        assert_eq!(decision.neural_mcts_discretized_kick_candidate_count, 3);
+        assert_eq!(decision.neural_mcts_root_discretized_kick_candidate_count, 2);
     }
 
     #[test]
@@ -9367,9 +9427,10 @@ impl SoccerMatch {
                     neural_mcts_root_discretized_kick_candidate_count,
                 } = choice;
                 let plan = plan.unwrap_or_else(|| {
-                    Self::learned_plan_for_policy(policy, snapshot, player_id, label)
+                    Self::learned_plan_for_policy(policy, snapshot, player_id, label.clone())
                 });
                 return Some(SoccerLearnedDecisionPlan {
+                    label,
                     plan: Self::mpc_reconciled_learned_plan(policy, snapshot, player_id, plan),
                     behavior_probability,
                     neural_mcts_selected,
@@ -9422,9 +9483,10 @@ impl SoccerMatch {
                 neural_mcts_root_discretized_kick_candidate_count,
             } = choice;
             let plan = plan.unwrap_or_else(|| {
-                Self::learned_plan_for_policy(learned_policy, snapshot, player_id, label)
+                Self::learned_plan_for_policy(learned_policy, snapshot, player_id, label.clone())
             });
             SoccerLearnedDecisionPlan {
+                label,
                 plan: Self::mpc_reconciled_learned_plan(learned_policy, snapshot, player_id, plan),
                 behavior_probability,
                 neural_mcts_selected,
@@ -9448,6 +9510,7 @@ impl SoccerMatch {
     fn stamp_neural_mcts_selection(
         player: &mut PlayerAgent,
         selected: bool,
+        selected_action: Option<&str>,
         candidate_count: u32,
         discretized_kick_candidate_count: u32,
         root_discretized_kick_candidate_count: u32,
@@ -9455,13 +9518,24 @@ impl SoccerMatch {
         let Some(decision) = player.last_decision.as_mut() else {
             return;
         };
-        if selected {
-            decision.neural_mcts_selected = true;
+        let selected_matches_executed = selected
+            && selected_action
+                .map(|label| {
+                    normalize_soccer_action_label(label)
+                        == normalize_soccer_action_label(&decision.action)
+                })
+                .unwrap_or(false);
+        decision.neural_mcts_selected = selected_matches_executed;
+        if selected_matches_executed {
+            decision.neural_mcts_candidate_count = candidate_count;
+            decision.neural_mcts_discretized_kick_candidate_count = discretized_kick_candidate_count;
+            decision.neural_mcts_root_discretized_kick_candidate_count =
+                root_discretized_kick_candidate_count;
+        } else {
+            decision.neural_mcts_candidate_count = 0;
+            decision.neural_mcts_discretized_kick_candidate_count = 0;
+            decision.neural_mcts_root_discretized_kick_candidate_count = 0;
         }
-        decision.neural_mcts_candidate_count = candidate_count;
-        decision.neural_mcts_discretized_kick_candidate_count = discretized_kick_candidate_count;
-        decision.neural_mcts_root_discretized_kick_candidate_count =
-            root_discretized_kick_candidate_count;
     }
 
     /// Build a feature-only decision-time transition: the player's real
@@ -14103,6 +14177,7 @@ impl SoccerMatch {
                         Self::stamp_neural_mcts_selection(
                             &mut self.players[actor],
                             learned_decision.neural_mcts_selected,
+                            Some(&learned_decision.label),
                             learned_decision.neural_mcts_candidate_count,
                             learned_decision.neural_mcts_discretized_kick_candidate_count,
                             learned_decision.neural_mcts_root_discretized_kick_candidate_count,
