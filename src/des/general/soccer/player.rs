@@ -12656,11 +12656,12 @@ impl PlayerAgent {
                             ability01(self.skills.shooting),
                         )) =>
             {
+                let learned_label = learned_mpc_action_label_key(&plan.action);
+                let power = learned_discretized_kick_power_for_action_label(&plan.action)
+                    .unwrap_or_else(|| shot_power_for_skill(ability01(self.skills.shooting)));
                 Some((
-                    SoccerAction::Shoot {
-                        power: shot_power_for_skill(ability01(self.skills.shooting)),
-                    },
-                    "shoot".to_string(),
+                    SoccerAction::Shoot { power },
+                    learned_label,
                 ))
             }
             "wall-pass" if observation.has_ball => {
@@ -12867,6 +12868,19 @@ impl PlayerAgent {
                 let learned_kick_power =
                     learned_discretized_kick_power_for_action_label(&plan.action);
                 let visible_targets = snapshot.ranked_visible_pass_targets(self.id, 11);
+                if let Some(power) = learned_kick_power {
+                    let target = plan
+                        .target_player
+                        .filter(|target| visible_targets.contains(target))?;
+                    return Some((
+                        SoccerAction::Pass {
+                            target_player: Some(target),
+                            power,
+                            flight: PassFlight::Floor,
+                        },
+                        learned_mpc_action_label_key(&plan.action),
+                    ));
+                }
                 if learned_kick_power.is_none() {
                     if let Some(target) = learned_generic_pass_killer_upgrade_target_for(
                         self,
@@ -12910,7 +12924,7 @@ impl PlayerAgent {
                     .or_else(|| visible_targets.first().copied());
                 target.map(|target| {
                     let action_label = if ranked_pass_action_label(&plan.action)
-                        && plan.target_player == Some(target)
+                        && (learned_kick_power.is_some() || plan.target_player == Some(target))
                     {
                         learned_mpc_action_label_key(&plan.action)
                     } else {
@@ -12973,6 +12987,21 @@ impl PlayerAgent {
                     return None;
                 }
                 let visible_targets = snapshot.ranked_visible_aerial_pass_targets(self.id, 11);
+                let learned_kick_power =
+                    learned_discretized_kick_power_for_action_label(&plan.action);
+                if let Some(power) = learned_kick_power {
+                    let target = plan
+                        .target_player
+                        .filter(|target| visible_targets.contains(target))?;
+                    return Some((
+                        SoccerAction::Pass {
+                            target_player: Some(target),
+                            power,
+                            flight: PassFlight::Aerial,
+                        },
+                        learned_mpc_action_label_key(&plan.action),
+                    ));
+                }
                 let target = plan
                     .target_player
                     .filter(|target| visible_targets.contains(target))
@@ -12980,10 +13009,8 @@ impl PlayerAgent {
                 target.map(|target| {
                     let crossing =
                         ability01(self.skills.crossing_left.max(self.skills.crossing_right));
-                    let learned_kick_power =
-                        learned_discretized_kick_power_for_action_label(&plan.action);
                     let action_label = if ranked_pass_action_label(&plan.action)
-                        && plan.target_player == Some(target)
+                        && (learned_kick_power.is_some() || plan.target_player == Some(target))
                     {
                         learned_mpc_action_label_key(&plan.action)
                     } else {
@@ -13035,12 +13062,14 @@ impl PlayerAgent {
                             .max(self.skills.left_foot_shot_power),
                     )
                 };
-                Some((
-                    SoccerAction::Shoot {
-                        power: shot_power_for_finish_skill(finish_skill),
-                    },
-                    label.to_string(),
-                ))
+                let power = learned_discretized_kick_power_for_action_label(&plan.action)
+                    .unwrap_or_else(|| shot_power_for_finish_skill(finish_skill));
+                let learned_label = if label == "first-time-shot" {
+                    learned_mpc_action_label_key(&plan.action)
+                } else {
+                    label.to_string()
+                };
+                Some((SoccerAction::Shoot { power }, learned_label))
             }
             "first-time-pass" if observation.has_ball && observation.first_touch_available => {
                 let visible = snapshot.ranked_visible_pass_targets(self.id, 11);

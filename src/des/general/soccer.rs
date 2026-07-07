@@ -5420,7 +5420,9 @@ const SOCCER_POLICY_ASSIGNED_POSITION_DIM: usize = SOCCER_ASSIGNED_POSITION_COUN
 const SOCCER_POLICY_FEATURE_DIM: usize = SOCCER_NEURAL_FEATURE_DIM
     + SOCCER_POLICY_ROLE_EMBEDDING_DIM
     + SOCCER_POLICY_ASSIGNED_POSITION_DIM;
-const SOCCER_POLICY_HIDDEN_UNITS: usize = 24;
+const DEFAULT_SOCCER_POLICY_HIDDEN_UNITS: usize = 24;
+const MIN_SOCCER_POLICY_HIDDEN_UNITS: usize = 8;
+const MAX_SOCCER_POLICY_HIDDEN_UNITS: usize = 512;
 const SOCCER_POLICY_LEARNING_RATE: f64 = 0.05;
 /// Default entropy bonus — keeps the actor from collapsing onto one family too early.
 /// Override with `SOCCER_POLICY_ENTROPY_COEFF` when local runs show policy entropy
@@ -5461,6 +5463,42 @@ fn soccer_policy_entropy_coeff_from_env() -> Option<f64> {
             eprintln!(
                 "soccer: invalid SOCCER_POLICY_ENTROPY_COEFF {:?}; using default {:.4}",
                 raw, SOCCER_POLICY_ENTROPY_COEFF_DEFAULT
+            );
+            None
+        }
+    }
+}
+
+fn soccer_policy_hidden_units() -> usize {
+    #[cfg(test)]
+    {
+        soccer_policy_hidden_units_from_env()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static UNITS: OnceLock<usize> = OnceLock::new();
+        *UNITS.get_or_init(soccer_policy_hidden_units_from_env)
+    }
+}
+
+fn soccer_policy_hidden_units_from_env() -> usize {
+    soccer_policy_hidden_units_env_value("SOCCER_POLICY_HIDDEN_UNITS")
+        .or_else(|| soccer_policy_hidden_units_env_value("SOCCER_NEURAL_HIDDEN_UNITS"))
+        .unwrap_or(DEFAULT_SOCCER_POLICY_HIDDEN_UNITS)
+}
+
+fn soccer_policy_hidden_units_env_value(name: &str) -> Option<usize> {
+    let raw = std::env::var(name).ok()?;
+    match raw.trim().parse::<usize>() {
+        Ok(value) if value > 0 => Some(value.clamp(
+            MIN_SOCCER_POLICY_HIDDEN_UNITS,
+            MAX_SOCCER_POLICY_HIDDEN_UNITS,
+        )),
+        _ => {
+            eprintln!(
+                "soccer: invalid {name} {:?}; using policy hidden default {}",
+                raw, DEFAULT_SOCCER_POLICY_HIDDEN_UNITS
             );
             None
         }
@@ -14382,10 +14420,24 @@ fn ranked_pass_action_family(action: &str) -> Option<&'static str> {
     })
 }
 
+fn ranked_shot_action_family(action: &str) -> Option<&'static str> {
+    match action.trim() {
+        "shoot" => Some("shoot"),
+        "first-time-shot" => Some("first-time-shot"),
+        _ => None,
+    }
+}
+
+fn learned_discretized_kick_action_family(action: &str) -> Option<&'static str> {
+    ranked_pass_action_family(action).or_else(|| ranked_shot_action_family(action))
+}
+
 fn learned_discretized_kick_suffix_parts(action: &str) -> Option<(&str, u8)> {
     let (base, suffix) = action.trim().rsplit_once("-kp")?;
     let bucket = suffix.parse::<u8>().ok()?;
-    if bucket >= DISCRETIZED_KICK_SPEED_BUCKETS || ranked_pass_action_family(base).is_none() {
+    if bucket >= DISCRETIZED_KICK_SPEED_BUCKETS
+        || learned_discretized_kick_action_family(base).is_none()
+    {
         return None;
     }
     Some((base, bucket))
@@ -14393,7 +14445,9 @@ fn learned_discretized_kick_suffix_parts(action: &str) -> Option<(&str, u8)> {
 
 pub(crate) fn learned_discretized_kick_candidate_label(base: &str, bucket: u8) -> Option<String> {
     let base = base.trim();
-    if bucket >= DISCRETIZED_KICK_SPEED_BUCKETS || ranked_pass_action_family(base).is_none() {
+    if bucket >= DISCRETIZED_KICK_SPEED_BUCKETS
+        || learned_discretized_kick_action_family(base).is_none()
+    {
         return None;
     }
     Some(format!("{base}-kp{bucket}"))
@@ -14423,6 +14477,9 @@ fn normalize_soccer_action_label(action: &str) -> &str {
     if let Some(family) = ranked_pass_action_family(action) {
         return family;
     }
+    if let Some(family) = ranked_shot_action_family(action) {
+        return family;
+    }
     // Alias -> canonical mapping is centralised in `SoccerActionLabel`
     // (soccer/labels.rs). Unrecognised labels pass straight through with no
     // allocation, exactly as the old `other => other` arm did.
@@ -14431,7 +14488,8 @@ fn normalize_soccer_action_label(action: &str) -> &str {
 
 fn learned_mpc_action_label_key(action: &str) -> String {
     let trimmed = action.trim();
-    if ranked_pass_action_label(trimmed) {
+    if ranked_pass_action_label(trimmed) || learned_discretized_kick_suffix_parts(trimmed).is_some()
+    {
         trimmed.to_string()
     } else {
         normalize_soccer_action_label(trimmed).to_string()
@@ -18554,7 +18612,10 @@ impl MatchConfig {
             neural_blend: SoccerNeuralBlendConfig {
                 mode: SoccerNeuralBlendMode::Additive,
                 actor_critic: true,
-                mcts_enabled: true,
+                // MCTS is DP-lookahead scored by the value net + analytic MPC priors — it can pull the
+                // net's choices back toward the analytic policy (entrenching parity). SOCCER_DISABLE_NEURAL_MCTS=1
+                // lets the raw actor-critic policy drive directly, to A/B whether MCTS helps or hurts the climb.
+                mcts_enabled: std::env::var("SOCCER_DISABLE_NEURAL_MCTS").ok().as_deref() != Some("1"),
                 mcts_simulations: 8,
                 mcts_candidates: 4,
                 mcts_depth: 1,
@@ -18885,6 +18946,8 @@ pub struct MatchStats {
     #[serde(default)]
     pub neural_mcts_discretized_kick_selections: u32,
     #[serde(default)]
+    pub neural_mcts_technical_action_selections: u32,
+    #[serde(default)]
     pub neural_mcts_candidate_sets: u32,
     #[serde(default)]
     pub neural_mcts_candidates: u32,
@@ -18892,6 +18955,10 @@ pub struct MatchStats {
     pub neural_mcts_discretized_kick_candidates: u32,
     #[serde(default)]
     pub neural_mcts_root_discretized_kick_candidates: u32,
+    #[serde(default)]
+    pub neural_mcts_discretized_kick_candidate_sets: u32,
+    #[serde(default)]
+    pub neural_mcts_root_discretized_kick_candidate_sets: u32,
     #[serde(default)]
     pub learned_mpc_replans: u32,
     #[serde(default)]
@@ -18934,12 +19001,18 @@ pub struct SoccerPlanningValidationStats {
     pub neural_mcts_selection_rate: f64,
     pub neural_mcts_discretized_kick_selections: u32,
     pub neural_mcts_discretized_kick_selection_rate: f64,
+    pub neural_mcts_technical_action_selections: u32,
+    pub neural_mcts_technical_action_selection_rate: f64,
     pub neural_mcts_candidate_sets: u32,
     pub neural_mcts_candidates: u32,
     pub neural_mcts_discretized_kick_candidates: u32,
     pub neural_mcts_root_discretized_kick_candidates: u32,
+    pub neural_mcts_discretized_kick_candidate_sets: u32,
+    pub neural_mcts_root_discretized_kick_candidate_sets: u32,
     pub neural_mcts_discretized_kick_candidate_share: f64,
     pub neural_mcts_root_discretized_kick_candidate_share: f64,
+    pub neural_mcts_discretized_kick_candidate_set_rate: f64,
+    pub neural_mcts_root_discretized_kick_candidate_set_rate: f64,
     pub learned_mpc_replans: u32,
     pub learned_mpc_replan_rate: f64,
     pub policy_priority_samples: u32,
@@ -19049,6 +19122,7 @@ impl MatchStats {
     pub fn planning_validation_stats(&self) -> SoccerPlanningValidationStats {
         let decisions = self.planning_decisions.max(1);
         let neural_mcts_candidates = self.neural_mcts_candidates.max(1);
+        let neural_mcts_candidate_sets = self.neural_mcts_candidate_sets.max(1);
         SoccerPlanningValidationStats {
             decisions: self.planning_decisions,
             neural_mcts_selections: self.neural_mcts_selections,
@@ -19058,11 +19132,20 @@ impl MatchStats {
                 .neural_mcts_discretized_kick_selections
                 as f64
                 / decisions as f64,
+            neural_mcts_technical_action_selections: self.neural_mcts_technical_action_selections,
+            neural_mcts_technical_action_selection_rate: self
+                .neural_mcts_technical_action_selections
+                as f64
+                / decisions as f64,
             neural_mcts_candidate_sets: self.neural_mcts_candidate_sets,
             neural_mcts_candidates: self.neural_mcts_candidates,
             neural_mcts_discretized_kick_candidates: self.neural_mcts_discretized_kick_candidates,
             neural_mcts_root_discretized_kick_candidates: self
                 .neural_mcts_root_discretized_kick_candidates,
+            neural_mcts_discretized_kick_candidate_sets: self
+                .neural_mcts_discretized_kick_candidate_sets,
+            neural_mcts_root_discretized_kick_candidate_sets: self
+                .neural_mcts_root_discretized_kick_candidate_sets,
             neural_mcts_discretized_kick_candidate_share: self
                 .neural_mcts_discretized_kick_candidates
                 as f64
@@ -19071,6 +19154,14 @@ impl MatchStats {
                 .neural_mcts_root_discretized_kick_candidates
                 as f64
                 / neural_mcts_candidates as f64,
+            neural_mcts_discretized_kick_candidate_set_rate: self
+                .neural_mcts_discretized_kick_candidate_sets
+                as f64
+                / neural_mcts_candidate_sets as f64,
+            neural_mcts_root_discretized_kick_candidate_set_rate: self
+                .neural_mcts_root_discretized_kick_candidate_sets
+                as f64
+                / neural_mcts_candidate_sets as f64,
             learned_mpc_replans: self.learned_mpc_replans,
             learned_mpc_replan_rate: self.learned_mpc_replans as f64 / decisions as f64,
             policy_priority_samples: self.policy_priority_samples,
@@ -38805,7 +38896,7 @@ impl SoccerPolicySpecialistHead {
         let network = FeedForwardNetwork::random(
             &RandomNetworkSpec {
                 input_dim: SOCCER_POLICY_FEATURE_DIM,
-                hidden_layers: vec![SOCCER_POLICY_HIDDEN_UNITS],
+                hidden_layers: vec![soccer_policy_hidden_units()],
                 output_dim: kind.actions().len(),
                 hidden_activation: ActivationName::Tanh,
                 output_activation: ActivationName::Linear,
@@ -38914,7 +39005,7 @@ impl SoccerPolicyRoleHead {
         let network = FeedForwardNetwork::random(
             &RandomNetworkSpec {
                 input_dim: SOCCER_POLICY_FEATURE_DIM,
-                hidden_layers: vec![SOCCER_POLICY_HIDDEN_UNITS],
+                hidden_layers: vec![soccer_policy_hidden_units()],
                 output_dim: SOCCER_POLICY_ACTIONS.len(),
                 hidden_activation: ActivationName::Tanh,
                 // Linear outputs = logits; softmax is applied in the trainer/sampler.
@@ -39192,6 +39283,132 @@ impl SoccerPolicyHead {
     }
 }
 
+#[cfg(test)]
+mod soccer_policy_actor_capacity_tests {
+    use super::*;
+
+    struct TestEnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for TestEnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn set_test_env_var(key: &'static str, value: &str) -> TestEnvVarGuard {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        TestEnvVarGuard { key, previous }
+    }
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().expect("test poison soccer policy env lock")
+    }
+
+    #[test]
+    fn policy_actor_uses_neural_hidden_units_fallback() {
+        let _lock = env_lock();
+        let _policy_units = set_test_env_var("SOCCER_POLICY_HIDDEN_UNITS", "0");
+        let _neural_units = set_test_env_var("SOCCER_NEURAL_HIDDEN_UNITS", "64");
+
+        let head = SoccerPolicyHead::new(7);
+        let midfielder = head
+            .role_head_for_group(SoccerPolicyRoleGroup::Midfielder)
+            .expect("midfielder role head");
+
+        assert_eq!(soccer_policy_hidden_units(), 64);
+        assert_eq!(midfielder.network.layers[0].biases.len(), 64);
+        assert_eq!(
+            midfielder.specialist_heads[0].network.layers[0]
+                .biases
+                .len(),
+            64
+        );
+    }
+
+    #[test]
+    fn policy_actor_snapshot_widens_to_configured_hidden_units() {
+        let _lock = env_lock();
+        let _policy_units = set_test_env_var("SOCCER_POLICY_HIDDEN_UNITS", "24");
+        let old = SoccerPolicyHead::new(11);
+        let old_snapshot = soccer_policy_head_snapshot(&old);
+
+        let _policy_units = set_test_env_var("SOCCER_POLICY_HIDDEN_UNITS", "64");
+        let restored = soccer_policy_head_from_snapshot(&old_snapshot, 11).expect("restore policy");
+        let forward = restored
+            .role_head_for_group(SoccerPolicyRoleGroup::Forward)
+            .expect("forward role head");
+
+        assert_eq!(forward.network.layers[0].biases.len(), 64);
+        assert_eq!(
+            forward.specialist_heads[0].network.layers[0].biases.len(),
+            64
+        );
+        assert_eq!(forward.network.layers.last().unwrap().weights[0].len(), 64);
+    }
+
+    #[test]
+    fn policy_actor_snapshot_widens_appended_action_outputs() {
+        let _lock = env_lock();
+        let _policy_units = set_test_env_var("SOCCER_POLICY_HIDDEN_UNITS", "24");
+        let old = SoccerPolicyHead::new(11);
+        let mut old_snapshot = soccer_policy_head_snapshot(&old);
+        let previous_joint_outputs = SOCCER_POLICY_ACTIONS.len() - 20;
+        let previous_shot_outputs = 2;
+
+        fn truncate_outputs(snapshot: &mut SoccerNeuralNetworkSnapshot, output_dim: usize) {
+            let output_layer = snapshot.layers.last_mut().expect("output layer");
+            output_layer.weights.truncate(output_dim);
+            output_layer.biases.truncate(output_dim);
+            snapshot.output_dim = output_dim;
+            snapshot.parameter_count = soccer_neural_snapshot_parameter_count(snapshot);
+            snapshot.l2_norm = soccer_neural_snapshot_l2_norm(snapshot);
+        }
+
+        truncate_outputs(&mut old_snapshot.network, previous_joint_outputs);
+        for specialist in &mut old_snapshot.specialist_heads {
+            if specialist.kind == "shooting" {
+                truncate_outputs(&mut specialist.network, previous_shot_outputs);
+            }
+        }
+        for role in &mut old_snapshot.role_heads {
+            truncate_outputs(&mut role.network, previous_joint_outputs);
+            for specialist in &mut role.specialist_heads {
+                if specialist.kind == "shooting" {
+                    truncate_outputs(&mut specialist.network, previous_shot_outputs);
+                }
+            }
+        }
+
+        let restored = soccer_policy_head_from_snapshot(&old_snapshot, 11).expect("restore policy");
+        let forward = restored
+            .role_head_for_group(SoccerPolicyRoleGroup::Forward)
+            .expect("forward role head");
+        let shooting = forward
+            .specialist_heads
+            .iter()
+            .find(|head| head.kind == SoccerPolicySpecialistKind::Shooting)
+            .expect("shooting specialist");
+
+        assert_eq!(forward.network.output_dim, SOCCER_POLICY_ACTIONS.len());
+        assert_eq!(shooting.network.output_dim, SOCCER_POLICY_SHOT_ACTIONS.len());
+        assert_eq!(
+            soccer_policy_action_index("shoot-kp7"),
+            SOCCER_POLICY_ACTIONS
+                .iter()
+                .position(|candidate| *candidate == "shoot-kp7")
+        );
+    }
+}
+
 /// Technical skill groups the specialist actor heads cover. Each maps to a disjoint subset of
 /// [`SOCCER_POLICY_ACTIONS`] (the passing, dribbling, and shooting families respectively).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39249,7 +39466,30 @@ const SOCCER_SKILL_DRIBBLE_FAMILIES: &[&str] = &[
     "xavi-turn",
     "round-goalkeeper",
 ];
-const SOCCER_SKILL_SHOT_FAMILIES: &[&str] = &["shoot", "first-time-shot"];
+const SOCCER_SKILL_SHOT_FAMILIES: &[&str] = &[
+    "shoot",
+    "first-time-shot",
+    "shoot-kp0",
+    "shoot-kp1",
+    "shoot-kp2",
+    "shoot-kp3",
+    "shoot-kp4",
+    "shoot-kp5",
+    "shoot-kp6",
+    "shoot-kp7",
+    "shoot-kp8",
+    "shoot-kp9",
+    "first-time-shot-kp0",
+    "first-time-shot-kp1",
+    "first-time-shot-kp2",
+    "first-time-shot-kp3",
+    "first-time-shot-kp4",
+    "first-time-shot-kp5",
+    "first-time-shot-kp6",
+    "first-time-shot-kp7",
+    "first-time-shot-kp8",
+    "first-time-shot-kp9",
+];
 
 impl SoccerSkillGroup {
     const ALL: [SoccerSkillGroup; 3] = [
@@ -39341,7 +39581,7 @@ impl SoccerSkillPolicyHead {
         let network = FeedForwardNetwork::random(
             &RandomNetworkSpec {
                 input_dim: SOCCER_POLICY_FEATURE_DIM,
-                hidden_layers: vec![SOCCER_POLICY_HIDDEN_UNITS],
+                hidden_layers: vec![soccer_policy_hidden_units()],
                 output_dim: group.families().len(),
                 hidden_activation: ActivationName::Tanh,
                 output_activation: ActivationName::Linear,
@@ -39611,7 +39851,7 @@ impl SoccerKeeperPolicyHead {
         let network = FeedForwardNetwork::random(
             &RandomNetworkSpec {
                 input_dim: SOCCER_POLICY_FEATURE_DIM,
-                hidden_layers: vec![SOCCER_POLICY_HIDDEN_UNITS],
+                hidden_layers: vec![soccer_policy_hidden_units()],
                 output_dim: SOCCER_KEEPER_ACTIONS.len(),
                 hidden_activation: ActivationName::Tanh,
                 output_activation: ActivationName::Linear,
@@ -40748,13 +40988,84 @@ fn widen_soccer_neural_snapshot_for_config(
     snapshot
 }
 
+fn widen_soccer_policy_snapshot_for_config(
+    mut snapshot: SoccerNeuralNetworkSnapshot,
+    expected_output_dim: usize,
+) -> SoccerNeuralNetworkSnapshot {
+    let target_hidden = soccer_policy_hidden_units();
+    if snapshot.layers.len() != 2
+        || snapshot.input_dim != SOCCER_POLICY_FEATURE_DIM
+        || snapshot.output_dim > expected_output_dim
+    {
+        return snapshot;
+    }
+    let current_hidden = snapshot
+        .layers
+        .first()
+        .map(|layer| layer.biases.len())
+        .unwrap_or(0);
+    if (target_hidden <= current_hidden && snapshot.output_dim == expected_output_dim)
+        || current_hidden == 0
+    {
+        return snapshot;
+    }
+
+    let (hidden_layers, output_layers) = snapshot.layers.split_at_mut(1);
+    let hidden_layer = &mut hidden_layers[0];
+    let output_layer = &mut output_layers[0];
+    if hidden_layer.weights.len() != current_hidden
+        || hidden_layer
+            .weights
+            .iter()
+            .any(|row| row.len() != snapshot.input_dim)
+        || output_layer.weights.len() != snapshot.output_dim
+        || output_layer
+            .weights
+            .iter()
+            .any(|row| row.len() != current_hidden)
+    {
+        return snapshot;
+    }
+
+    if target_hidden > current_hidden {
+        let mut rng = mulberry32(
+            (snapshot.parameter_count as u32)
+                ^ (snapshot.training_steps as u32).rotate_left(11)
+                ^ (expected_output_dim as u32).rotate_left(19)
+                ^ 0xA17C_0128,
+        );
+        let scale = 0.05;
+        for _ in current_hidden..target_hidden {
+            let row = (0..snapshot.input_dim)
+                .map(|_| (2.0 * rng.next_float() - 1.0) * scale)
+                .collect::<Vec<_>>();
+            hidden_layer.weights.push(row);
+            hidden_layer.biases.push(0.0);
+        }
+        for row in &mut output_layer.weights {
+            row.resize(target_hidden, 0.0);
+        }
+    }
+    if snapshot.output_dim < expected_output_dim {
+        output_layer.weights.extend(
+            (snapshot.output_dim..expected_output_dim).map(|_| vec![0.0; target_hidden]),
+        );
+        output_layer.biases.resize(expected_output_dim, 0.0);
+        snapshot.output_dim = expected_output_dim;
+    }
+    snapshot.parameter_count = soccer_neural_snapshot_parameter_count(&snapshot);
+    snapshot.l2_norm = soccer_neural_snapshot_l2_norm(&snapshot);
+    snapshot
+}
+
 fn build_soccer_policy_network_from_snapshot(
     snapshot: &SoccerNeuralNetworkSnapshot,
     output_dim: usize,
     label: &str,
 ) -> Result<FeedForwardNetwork, String> {
+    let snapshot = widen_soccer_policy_snapshot_for_config(snapshot.clone(), output_dim);
     build_soccer_feed_forward_network_from_snapshot(
-        snapshot,
+        &snapshot,
         SOCCER_POLICY_FEATURE_DIM,
         output_dim,
         &[],
@@ -41552,6 +41863,26 @@ const SOCCER_POLICY_ACTIONS: &[&str] = &[
     "aerial-pass-kp7",
     "aerial-pass-kp8",
     "aerial-pass-kp9",
+    "shoot-kp0",
+    "shoot-kp1",
+    "shoot-kp2",
+    "shoot-kp3",
+    "shoot-kp4",
+    "shoot-kp5",
+    "shoot-kp6",
+    "shoot-kp7",
+    "shoot-kp8",
+    "shoot-kp9",
+    "first-time-shot-kp0",
+    "first-time-shot-kp1",
+    "first-time-shot-kp2",
+    "first-time-shot-kp3",
+    "first-time-shot-kp4",
+    "first-time-shot-kp5",
+    "first-time-shot-kp6",
+    "first-time-shot-kp7",
+    "first-time-shot-kp8",
+    "first-time-shot-kp9",
 ];
 
 const SOCCER_POLICY_PASS_ACTIONS: &[&str] = &[
@@ -41609,7 +41940,30 @@ const SOCCER_POLICY_DRIBBLE_ACTIONS: &[&str] = &[
     "round-goalkeeper",
 ];
 
-const SOCCER_POLICY_SHOT_ACTIONS: &[&str] = &["shoot", "first-time-shot"];
+const SOCCER_POLICY_SHOT_ACTIONS: &[&str] = &[
+    "shoot",
+    "first-time-shot",
+    "shoot-kp0",
+    "shoot-kp1",
+    "shoot-kp2",
+    "shoot-kp3",
+    "shoot-kp4",
+    "shoot-kp5",
+    "shoot-kp6",
+    "shoot-kp7",
+    "shoot-kp8",
+    "shoot-kp9",
+    "first-time-shot-kp0",
+    "first-time-shot-kp1",
+    "first-time-shot-kp2",
+    "first-time-shot-kp3",
+    "first-time-shot-kp4",
+    "first-time-shot-kp5",
+    "first-time-shot-kp6",
+    "first-time-shot-kp7",
+    "first-time-shot-kp8",
+    "first-time-shot-kp9",
+];
 
 const SOCCER_POLICY_GOALKEEPER_ACTIONS: &[&str] = &[
     "hold",
@@ -41636,7 +41990,7 @@ const SOCCER_POLICY_GOALKEEPER_ACTIONS: &[&str] = &[
 fn soccer_policy_action_index(action: &str) -> Option<usize> {
     use SoccerActionLabel::*;
     if let Some((base, bucket)) = learned_discretized_kick_suffix_parts(action) {
-        let family = ranked_pass_action_family(base)?;
+        let family = learned_discretized_kick_action_family(base)?;
         let bucket_family = format!("{family}-kp{bucket}");
         if let Some(index) = SOCCER_POLICY_ACTIONS
             .iter()
@@ -67101,6 +67455,37 @@ mod discretized_kick_scaffold_tests {
         assert_eq!(
             SOCCER_SKILL_PASS_FAMILIES[aerial_bucket_local],
             "aerial-pass-kp4"
+        );
+        let shot = learned_discretized_kick_candidate_label("shoot", 7)
+            .expect("shot should accept a learned kick bucket");
+        assert_eq!(shot, "shoot-kp7");
+        assert!(!ranked_pass_action_label(&shot));
+        assert_eq!(normalize_soccer_action_label(&shot), "shoot");
+        assert_eq!(
+            soccer_policy_action_index(&shot),
+            soccer_policy_action_index("shoot-kp7")
+        );
+        let shot_bucket_index =
+            soccer_policy_action_index("shoot-kp7").expect("shot bucket actor index");
+        let (shot_bucket_group, shot_bucket_local) =
+            soccer_policy_skill_group_for_action_index(shot_bucket_index)
+                .expect("shot bucket should train the shot skill policy head");
+        assert_eq!(shot_bucket_group, SoccerSkillGroup::Shot);
+        assert_eq!(
+            SOCCER_SKILL_SHOT_FAMILIES[shot_bucket_local],
+            "shoot-kp7"
+        );
+        assert_ne!(
+            soccer_policy_action_index(&shot),
+            soccer_policy_action_index("shoot")
+        );
+        assert_eq!(learned_mpc_action_label_key(&shot), "shoot-kp7".to_string());
+        assert_eq!(
+            learned_discretized_kick_speed_bucket_for_action_label(&shot),
+            Some(7)
+        );
+        assert!(
+            (learned_discretized_kick_power_for_action_label(&shot).unwrap() - 0.75).abs() < 1e-9
         );
         let uniform_pass_prob = 1.0 / SOCCER_SKILL_PASS_FAMILIES.len() as f64;
         let skill_log_probs = SoccerSkillLogProbs {
