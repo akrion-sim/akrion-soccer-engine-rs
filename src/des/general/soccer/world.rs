@@ -13524,8 +13524,10 @@ impl SoccerMatch {
                     // MC target: clip(realized_return / target_scale) — NO tabular bootstrap. This is
                     // the alias-breaking label; `max_next`/`gamma` above are ignored on this path.
                     let raw = mc_returns.get(transition_index).copied().unwrap_or(0.0);
+                    // Already standardized to ~unit scale in the precompute; clip to the same bound
+                    // (no /target_scale — that division is what saturated the goal-dominated returns).
                     let scaled = if raw.is_finite() {
-                        (raw / target_scale).clamp(-target_clip, target_clip)
+                        raw.clamp(-target_clip, target_clip)
                     } else {
                         0.0
                     };
