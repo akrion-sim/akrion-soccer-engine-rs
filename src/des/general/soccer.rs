@@ -18885,6 +18885,8 @@ pub struct MatchStats {
     #[serde(default)]
     pub neural_mcts_discretized_kick_selections: u32,
     #[serde(default)]
+    pub neural_mcts_technical_action_selections: u32,
+    #[serde(default)]
     pub neural_mcts_candidate_sets: u32,
     #[serde(default)]
     pub neural_mcts_candidates: u32,
@@ -18892,6 +18894,10 @@ pub struct MatchStats {
     pub neural_mcts_discretized_kick_candidates: u32,
     #[serde(default)]
     pub neural_mcts_root_discretized_kick_candidates: u32,
+    #[serde(default)]
+    pub neural_mcts_discretized_kick_candidate_sets: u32,
+    #[serde(default)]
+    pub neural_mcts_root_discretized_kick_candidate_sets: u32,
     #[serde(default)]
     pub learned_mpc_replans: u32,
     #[serde(default)]
@@ -18934,12 +18940,18 @@ pub struct SoccerPlanningValidationStats {
     pub neural_mcts_selection_rate: f64,
     pub neural_mcts_discretized_kick_selections: u32,
     pub neural_mcts_discretized_kick_selection_rate: f64,
+    pub neural_mcts_technical_action_selections: u32,
+    pub neural_mcts_technical_action_selection_rate: f64,
     pub neural_mcts_candidate_sets: u32,
     pub neural_mcts_candidates: u32,
     pub neural_mcts_discretized_kick_candidates: u32,
     pub neural_mcts_root_discretized_kick_candidates: u32,
+    pub neural_mcts_discretized_kick_candidate_sets: u32,
+    pub neural_mcts_root_discretized_kick_candidate_sets: u32,
     pub neural_mcts_discretized_kick_candidate_share: f64,
     pub neural_mcts_root_discretized_kick_candidate_share: f64,
+    pub neural_mcts_discretized_kick_candidate_set_rate: f64,
+    pub neural_mcts_root_discretized_kick_candidate_set_rate: f64,
     pub learned_mpc_replans: u32,
     pub learned_mpc_replan_rate: f64,
     pub policy_priority_samples: u32,
@@ -19049,6 +19061,7 @@ impl MatchStats {
     pub fn planning_validation_stats(&self) -> SoccerPlanningValidationStats {
         let decisions = self.planning_decisions.max(1);
         let neural_mcts_candidates = self.neural_mcts_candidates.max(1);
+        let neural_mcts_candidate_sets = self.neural_mcts_candidate_sets.max(1);
         SoccerPlanningValidationStats {
             decisions: self.planning_decisions,
             neural_mcts_selections: self.neural_mcts_selections,
@@ -19058,11 +19071,20 @@ impl MatchStats {
                 .neural_mcts_discretized_kick_selections
                 as f64
                 / decisions as f64,
+            neural_mcts_technical_action_selections: self.neural_mcts_technical_action_selections,
+            neural_mcts_technical_action_selection_rate: self
+                .neural_mcts_technical_action_selections
+                as f64
+                / decisions as f64,
             neural_mcts_candidate_sets: self.neural_mcts_candidate_sets,
             neural_mcts_candidates: self.neural_mcts_candidates,
             neural_mcts_discretized_kick_candidates: self.neural_mcts_discretized_kick_candidates,
             neural_mcts_root_discretized_kick_candidates: self
                 .neural_mcts_root_discretized_kick_candidates,
+            neural_mcts_discretized_kick_candidate_sets: self
+                .neural_mcts_discretized_kick_candidate_sets,
+            neural_mcts_root_discretized_kick_candidate_sets: self
+                .neural_mcts_root_discretized_kick_candidate_sets,
             neural_mcts_discretized_kick_candidate_share: self
                 .neural_mcts_discretized_kick_candidates
                 as f64
@@ -19071,6 +19093,14 @@ impl MatchStats {
                 .neural_mcts_root_discretized_kick_candidates
                 as f64
                 / neural_mcts_candidates as f64,
+            neural_mcts_discretized_kick_candidate_set_rate: self
+                .neural_mcts_discretized_kick_candidate_sets
+                as f64
+                / neural_mcts_candidate_sets as f64,
+            neural_mcts_root_discretized_kick_candidate_set_rate: self
+                .neural_mcts_root_discretized_kick_candidate_sets
+                as f64
+                / neural_mcts_candidate_sets as f64,
             learned_mpc_replans: self.learned_mpc_replans,
             learned_mpc_replan_rate: self.learned_mpc_replans as f64 / decisions as f64,
             policy_priority_samples: self.policy_priority_samples,
