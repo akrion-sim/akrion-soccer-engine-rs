@@ -9226,14 +9226,29 @@ impl SoccerMatch {
         let SoccerExternalNnPomdpSidecarResponse {
             logits,
             value: _value,
+            behavior_policy_probability,
+            action_index: sidecar_action_index,
         } = soccer_external_nn_pomdp_sidecar_infer(&request)?;
-        let action_index =
-            soccer_external_nn_pomdp_select_legal_argmax(&logits, &legal_action_mask)?;
+        // Prefer the sidecar's OWN sampled action (so the logged action matches the reported prob),
+        // but only if it is legal for this snapshot; otherwise fall back to the legal argmax.
+        let action_index = sidecar_action_index
+            .filter(|&i| legal_action_mask.get(i).copied().unwrap_or(false))
+            .or_else(|| soccer_external_nn_pomdp_select_legal_argmax(&logits, &legal_action_mask))?;
         let label = SOCCER_POLICY_ACTIONS.get(action_index)?.to_string();
+        // Stamp the TRUE sampled probability when the sidecar provided one (finite, >0); else 1.0
+        // (deterministic argmax). This gives the offline trainer a real old-policy prob for
+        // clipped-PPO importance weighting instead of a constant 1.0.
+        let behavior_probability = match behavior_policy_probability {
+            Some(p) => {
+                let p = finite_unit_interval(p);
+                if p > 0.0 { p } else { 1.0 }
+            }
+            None => 1.0,
+        };
         Some(SoccerPolicyActionChoice {
             label,
             plan: None,
-            behavior_probability: 1.0,
+            behavior_probability,
             neural_mcts_selected: false,
             neural_mcts_candidate_count: 0,
             neural_mcts_discretized_kick_candidate_count: 0,
