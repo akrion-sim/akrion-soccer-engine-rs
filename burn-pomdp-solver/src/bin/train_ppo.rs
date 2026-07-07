@@ -22,7 +22,7 @@
 use burn::backend::{Autodiff, NdArray};
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::tensor::activation::{log_softmax, softmax};
-use burn::tensor::{backend::Backend, Tensor, TensorData};
+use burn::tensor::{Tensor, TensorData};
 use burn_pomdp_solver::adapter::{load_flat_grouped, returns as mc_returns, to_tensors, Trajectory};
 use burn_pomdp_solver::{PomdpActorCritic, PomdpConfig};
 
