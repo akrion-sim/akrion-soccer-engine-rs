@@ -12910,7 +12910,7 @@ impl PlayerAgent {
                     .or_else(|| visible_targets.first().copied());
                 target.map(|target| {
                     let action_label = if ranked_pass_action_label(&plan.action)
-                        && (learned_kick_power.is_some() || plan.target_player == Some(target))
+                        && plan.target_player == Some(target)
                     {
                         learned_mpc_action_label_key(&plan.action)
                     } else {
@@ -12983,7 +12983,7 @@ impl PlayerAgent {
                     let learned_kick_power =
                         learned_discretized_kick_power_for_action_label(&plan.action);
                     let action_label = if ranked_pass_action_label(&plan.action)
-                        && (learned_kick_power.is_some() || plan.target_player == Some(target))
+                        && plan.target_player == Some(target)
                     {
                         learned_mpc_action_label_key(&plan.action)
                     } else {
