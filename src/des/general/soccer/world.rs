@@ -4624,6 +4624,49 @@ mod tests {
     }
 
     #[test]
+    fn neural_mcts_candidate_bonus_includes_shot_mpc_prior() {
+        let _env_lock = soccer_world_env_lock();
+        let _weight = set_test_env_var("SOCCER_NEURAL_MCTS_TECHNICAL_MPC_EXECUTION_WEIGHT", "1.0");
+        let sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let mut transition = policy_test_transition_with_mcts(true);
+        transition.action = "shoot-kp8".to_string();
+        transition.decision_context.shot_mpc_accuracy_probability = 0.88;
+        transition.decision_context.shot_mpc_qp_target_fit = 0.82;
+        transition.decision_context.shot_mpc_goal_probability = 0.36;
+        transition.decision_context.chosen_action_mpc_feasibility = 0.90;
+        transition.decision_context.chosen_action_control_cost = 0.08;
+        let plan = SoccerLearnedPlan {
+            action: transition.action.clone(),
+            target_player: None,
+            target_point: None,
+            mpc_replan: None,
+        };
+
+        let shot_bonus = neural_mcts_shot_mpc_candidate_bonus(&transition);
+        let technical_bonus = SoccerMatch::neural_mcts_technical_mpc_execution_bonus(
+            &snapshot,
+            transition.player_id,
+            &plan,
+        );
+        let combined_bonus = SoccerMatch::neural_mcts_candidate_mpc_bonus(
+            &snapshot,
+            transition.player_id,
+            &plan,
+            &transition,
+        );
+
+        assert!(
+            shot_bonus > 0.0,
+            "test setup should produce a positive shot-MPC prior"
+        );
+        assert!(
+            (combined_bonus - (shot_bonus + technical_bonus)).abs() < 1e-9,
+            "shot bucket scoring must include the shot accuracy/goal prior, not only post-selection distillation"
+        );
+    }
+
+    #[test]
     fn neural_mcts_candidate_filter_rejects_hard_mpc_replan_plans() {
         let _env_lock = soccer_world_env_lock();
         let _min_safe = set_test_env_var(
@@ -9404,6 +9447,17 @@ impl SoccerMatch {
             .unwrap_or(0.0)
     }
 
+    fn neural_mcts_candidate_mpc_bonus(
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        plan: &SoccerLearnedPlan,
+        transition: &SoccerLearningTransition,
+    ) -> f64 {
+        neural_mcts_pass_mpc_candidate_bonus(transition)
+            + neural_mcts_shot_mpc_candidate_bonus(transition)
+            + Self::neural_mcts_technical_mpc_execution_bonus(snapshot, player_id, plan)
+    }
+
     fn neural_mcts_candidate_plan_is_executable(
         snapshot: &WorldSnapshot,
         player_id: usize,
@@ -10277,18 +10331,17 @@ impl SoccerMatch {
                         mcts_depth,
                         gamma,
                     );
-                let pass_mpc_bonus = neural_mcts_pass_mpc_candidate_bonus(&transition);
-                let technical_mpc_bonus = Self::neural_mcts_technical_mpc_execution_bonus(
+                let mpc_candidate_bonus = Self::neural_mcts_candidate_mpc_bonus(
                     snapshot,
                     player_id,
                     &candidate_plan,
+                    &transition,
                 );
                 let score = value_score
                     + actor_bonus
                     + retrieved_bonus
                     + model_bonus
-                    + pass_mpc_bonus
-                    + technical_mpc_bonus;
+                    + mpc_candidate_bonus;
                 if !score.is_finite() {
                     return;
                 }
@@ -10305,8 +10358,7 @@ impl SoccerMatch {
                     score,
                     prior: actor_prior
                         + retrieved_bonus.max(0.0)
-                        + pass_mpc_bonus.max(0.0)
-                        + technical_mpc_bonus.max(0.0),
+                        + mpc_candidate_bonus.max(0.0),
                     q_visits: candidate.visits,
                 });
             };
