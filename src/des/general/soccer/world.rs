@@ -9295,15 +9295,24 @@ impl SoccerMatch {
         })
     }
 
-    /// The single off-ball SUPPORT runner the net may drive under the support-outlet lever: the
-    /// nearest Midfielder/Forward teammate to the ball carrier (excluding the carrier + GK/defenders),
-    /// while our side has possession. Deterministic (distance tie-broken by `total_cmp`). `None` ⇒
-    /// nobody eligible ⇒ everyone off-ball stays MPC.
-    fn designated_support_actor(&self, snapshot: &WorldSnapshot) -> Option<usize> {
-        let holder = snapshot.ball.holder?;
-        let carrier = snapshot.players.iter().find(|p| p.id == holder)?;
+    /// The SET of off-ball support runners the net may drive under the multi-role support-outlet
+    /// lever: the K nearest Midfielder/Forward teammates to the ball carrier (K =
+    /// SOCCER_BURN_SIDECAR_SUPPORT_ACTORS, default 3, clamped 1..=4; excludes carrier + GK/defenders),
+    /// while our side has possession. Deterministic (distance-sorted, `total_cmp`). Empty ⇒ all-MPC.
+    fn designated_support_actor_set(&self, snapshot: &WorldSnapshot) -> Vec<usize> {
+        let Some(holder) = snapshot.ball.holder else {
+            return Vec::new();
+        };
+        let Some(carrier) = snapshot.players.iter().find(|p| p.id == holder) else {
+            return Vec::new();
+        };
         let cpos = carrier.position;
-        snapshot
+        let k = std::env::var("SOCCER_BURN_SIDECAR_SUPPORT_ACTORS")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(3)
+            .clamp(1, 4);
+        let mut cands: Vec<(usize, f64)> = snapshot
             .players
             .iter()
             .filter(|p| {
@@ -9311,12 +9320,14 @@ impl SoccerMatch {
                     && p.id != holder
                     && matches!(p.role, PlayerRole::Midfielder | PlayerRole::Forward)
             })
-            .min_by(|a, b| {
-                let da = (a.position.x - cpos.x).powi(2) + (a.position.y - cpos.y).powi(2);
-                let db = (b.position.x - cpos.x).powi(2) + (b.position.y - cpos.y).powi(2);
-                da.total_cmp(&db)
+            .map(|p| {
+                let d = (p.position.x - cpos.x).powi(2) + (p.position.y - cpos.y).powi(2);
+                (p.id, d)
             })
-            .map(|p| p.id)
+            .collect();
+        cands.sort_by(|a, b| a.1.total_cmp(&b.1));
+        cands.truncate(k);
+        cands.into_iter().map(|(id, _)| id).collect()
     }
 
     fn learned_action_for_player_with_context(
