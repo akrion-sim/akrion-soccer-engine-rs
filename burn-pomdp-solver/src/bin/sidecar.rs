@@ -67,6 +67,31 @@ impl Server {
             }
         }
         let v = value.into_data().to_vec::<f32>().unwrap().first().copied().unwrap_or(0.0) as f64;
+        // Stochastic collection: sample a legal action from softmax(logits) and rewrite logits so the
+        // engine's argmax picks it. Gives on-policy EXPLORATION so fine-tuning can improve, not just
+        // entrench the deterministic policy. Eval leaves sample=false (argmax = best play).
+        if self.sample {
+            let legal: Vec<usize> = (0..lg.len()).filter(|&i| lg[i].is_finite()).collect();
+            if !legal.is_empty() {
+                let maxl = legal.iter().map(|&i| lg[i]).fold(f64::NEG_INFINITY, f64::max);
+                let exps: Vec<f64> = legal.iter().map(|&i| (lg[i] - maxl).exp()).collect();
+                let sum: f64 = exps.iter().sum::<f64>().max(1e-9);
+                self.rng = self.rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let u = ((self.rng >> 33) as f64 / (1u64 << 31) as f64) * sum;
+                let mut cum = 0.0;
+                let mut chosen = *legal.last().unwrap();
+                for (k, &i) in legal.iter().enumerate() {
+                    cum += exps[k];
+                    if u <= cum {
+                        chosen = i;
+                        break;
+                    }
+                }
+                for (i, v) in lg.iter_mut().enumerate() {
+                    *v = if i == chosen { 0.0 } else { f64::NEG_INFINITY };
+                }
+            }
+        }
         Resp { logits: lg, value: v, contract_version: 1 }
     }
 }
