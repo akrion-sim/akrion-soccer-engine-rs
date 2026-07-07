@@ -9214,10 +9214,33 @@ impl SoccerMatch {
             }
         }
         let player = snapshot.players.iter().find(|p| p.id == player_id)?;
-        let Some(legal_action_mask) = soccer_policy_legal_action_mask_for_snapshot(snapshot, player_id) else {
+        let Some(mut legal_action_mask) = soccer_policy_legal_action_mask_for_snapshot(snapshot, player_id) else {
             eprintln!("SIDECAR_DBG bail=mask_none player={player_id}");
             return None;
         };
+        if support_only_mask {
+            // Support runner learns timing/FAMILY only; analytic target-gen + shape/offside/spacing
+            // guards + MPC handle execution. Restrict its legal mask to support-family actions.
+            fn is_support_family(index: usize) -> bool {
+                matches!(
+                    SOCCER_POLICY_ACTIONS.get(index).copied(),
+                    Some("support-shape") | Some("support-roam") | Some("support-screen")
+                        | Some("check-to-ball") | Some("run-in-behind") | Some("exploit-space-run")
+                        | Some("wide-outlet") | Some("shot-creation-run") | Some("pinch-cross-arrival")
+                        | Some("overlap-run") | Some("one-two-run") | Some("support-push-up")
+                        | Some("hold-up-flank") | Some("wait-for-support") | Some("open-passing-lane")
+                        | Some("open-pass-lane") | Some("buildup-receive")
+                )
+            }
+            for (i, ok) in legal_action_mask.iter_mut().enumerate() {
+                if *ok && !is_support_family(i) {
+                    *ok = false;
+                }
+            }
+            if !legal_action_mask.iter().any(|&ok| ok) {
+                return None; // no legal support action this tick ⇒ fall back to MPC
+            }
+        }
         let entities = soccer_field_player_motion_block(snapshot, player_id, player.team);
         if entities.len() != SOCCER_NEURAL_FIELD_MOTION_DIM {
             return None;
