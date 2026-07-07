@@ -80,6 +80,9 @@ impl Server {
         // Stochastic collection: sample a legal action from softmax(logits) and rewrite logits so the
         // engine's argmax picks it. Gives on-policy EXPLORATION so fine-tuning can improve, not just
         // entrench the deterministic policy. Eval leaves sample=false (argmax = best play).
+        // We also report the TRUE softmax probability of the chosen action + its index, so the engine
+        // can stamp a real old-policy prob on the decision (enables clipped-PPO importance weighting).
+        let (mut bpp, mut act_idx): (Option<f64>, Option<usize>) = (None, None);
         if self.sample {
             let legal: Vec<usize> = (0..lg.len()).filter(|&i| lg[i].is_finite()).collect();
             if !legal.is_empty() {
@@ -89,20 +92,24 @@ impl Server {
                 self.rng = self.rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
                 let u = ((self.rng >> 33) as f64 / (1u64 << 31) as f64) * sum;
                 let mut cum = 0.0;
-                let mut chosen = *legal.last().unwrap();
+                let (mut chosen, mut chosen_k) = (*legal.last().unwrap(), legal.len() - 1);
                 for (k, &i) in legal.iter().enumerate() {
                     cum += exps[k];
                     if u <= cum {
                         chosen = i;
+                        chosen_k = k;
                         break;
                     }
                 }
+                // p(chosen) under the sampling softmax over the LEGAL set = exps[k]/sum.
+                bpp = Some((exps[chosen_k] / sum).clamp(1e-6, 1.0));
+                act_idx = Some(chosen);
                 for (i, v) in lg.iter_mut().enumerate() {
                     *v = if i == chosen { 0.0 } else { f64::NEG_INFINITY };
                 }
             }
         }
-        Resp { logits: lg, value: v, contract_version: 1 }
+        Resp { logits: lg, value: v, contract_version: 1, behavior_policy_probability: bpp, action_index: act_idx }
     }
 }
 
