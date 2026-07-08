@@ -12559,16 +12559,23 @@ impl PlayerAgent {
                         } else if roam && dist < defend_radius {
                             snapshot.goal_side_defensive_target_for(self.id, snapshot.ball.position)
                         } else {
+                            // Own defensive coordinate; the LP shape only NUDGES it (gated). Off ⇒
+                            // formation_nudged_target returns guidance.target ⇒ authoritative as before.
+                            let own_defensive = snapshot.defensive_assignment_for(
+                                self.id,
+                                self.home_position,
+                                roam,
+                            );
                             let target = snapshot
                                 .formation_lp_guidance_for(self.id)
-                                .map(|guidance| guidance.target)
-                                .unwrap_or_else(|| {
-                                    snapshot.defensive_assignment_for(
-                                        self.id,
-                                        self.home_position,
-                                        roam,
+                                .map(|guidance| {
+                                    formation_nudged_target(
+                                        self.decision_confidence,
+                                        own_defensive,
+                                        guidance.target,
                                     )
-                                });
+                                })
+                                .unwrap_or(own_defensive);
                             if self.role == PlayerRole::Defender {
                                 if let Some((holder_position, line_gap)) =
                                     snapshot.opponent_breakthrough_ball_carrier(self.team)
