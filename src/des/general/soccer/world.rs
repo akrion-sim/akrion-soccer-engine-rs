@@ -64,6 +64,9 @@ const COMPLETED_PASS_LEARNING_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(5.0);
 const SHOT_OUTCOME_LEARNING_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(4.0);
 const DRIBBLE_BEAT_LEARNING_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(2.0);
 const LEARNED_MPC_REJECTED_ACTION_PENALTY_POINTS: f64 = 2.5;
+const SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_SAMPLE_RATE: f64 = 1.0;
+const SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_ADVANTAGE_SCALE: f64 = 1.0;
+const SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_SAMPLE_SALT: u64 = 0x4f50_5453_4146_4554;
 const NEURAL_DEFERRED_REWARD_DRAIN_PER_TICK: usize = 64;
 const NEURAL_DEFERRED_REWARD_DRAIN_PER_TICK_MAX: usize = 512;
 const LEARNED_TARGET_GRID_MIN_VISITS: u32 = 1;
@@ -4687,6 +4690,121 @@ mod tests {
     }
 
     #[test]
+    fn option_score_safety_counterexample_sampling_can_throttle_actor_rows() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            learning_enabled: true,
+            ..MatchConfig::default()
+        });
+        let player_id = sim
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home field player")
+            .id;
+        let before = WorldSnapshot::from_match(&sim);
+        let observation = before.observation_for(player_id);
+        sim.players
+            .iter_mut()
+            .find(|player| player.id == player_id)
+            .expect("player agent")
+            .last_decision = Some(AgentDecisionTrace {
+            mdp_state: before.mdp_state_for_player(player_id),
+            observation: observation.clone(),
+            belief: belief_from_observation(&observation),
+            operation_order: vec![
+                "learned-policy".to_string(),
+                "pass".to_string(),
+                "option-score-safety:pass->hold".to_string(),
+            ],
+            scheduled_index: None,
+            action_options: single_action_option("hold"),
+            action_target: None,
+            mdp_mpc_comparison: None,
+            learned_mpc_replan: Some(SoccerLearnedMpcReplanTrace {
+                original_action: "pass".to_string(),
+                replacement_action: "hold".to_string(),
+                source: SoccerLearnedMpcReplanSource::OptionScoreSafety,
+                rejected_execution_probability: 0.02,
+                candidate_count: 2,
+            }),
+            behavior_policy_probability: None,
+            neural_mcts_selected: false,
+            neural_mcts_candidate_count: 0,
+            neural_mcts_discretized_kick_candidate_count: 0,
+            neural_mcts_root_discretized_kick_candidate_count: 0,
+            action: "hold".to_string(),
+        });
+        let after = WorldSnapshot::from_match(&sim);
+
+        let transitions = sim.learning_transitions_for(&before, &after, 0, 0, &[]);
+        let rejected = transitions
+            .iter()
+            .find(|transition| normalize_soccer_action_label(&transition.action) == "pass")
+            .expect("rejected option-score-safety action transition");
+
+        assert!(option_score_safety_rejected_action_counterexample(rejected));
+        assert!(!option_score_safety_counterexample_sample_allowed_with_rate(rejected, 0.0));
+        assert!(option_score_safety_counterexample_sample_allowed_with_rate(
+            rejected, 1.0
+        ));
+    }
+
+    #[test]
+    fn option_score_safety_counterexample_detection_ignores_mpc_source() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            learning_enabled: true,
+            ..MatchConfig::default()
+        });
+        let player_id = sim
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home field player")
+            .id;
+        let before = WorldSnapshot::from_match(&sim);
+        let observation = before.observation_for(player_id);
+        sim.players
+            .iter_mut()
+            .find(|player| player.id == player_id)
+            .expect("player agent")
+            .last_decision = Some(AgentDecisionTrace {
+            mdp_state: before.mdp_state_for_player(player_id),
+            observation: observation.clone(),
+            belief: belief_from_observation(&observation),
+            operation_order: vec!["learned-policy".to_string(), "hold".to_string()],
+            scheduled_index: None,
+            action_options: single_action_option("hold"),
+            action_target: None,
+            mdp_mpc_comparison: None,
+            learned_mpc_replan: Some(SoccerLearnedMpcReplanTrace {
+                original_action: "pass".to_string(),
+                replacement_action: "hold".to_string(),
+                source: SoccerLearnedMpcReplanSource::Mpc,
+                rejected_execution_probability: 0.02,
+                candidate_count: 1,
+            }),
+            behavior_policy_probability: None,
+            neural_mcts_selected: false,
+            neural_mcts_candidate_count: 0,
+            neural_mcts_discretized_kick_candidate_count: 0,
+            neural_mcts_root_discretized_kick_candidate_count: 0,
+            action: "hold".to_string(),
+        });
+        let after = WorldSnapshot::from_match(&sim);
+
+        let transitions = sim.learning_transitions_for(&before, &after, 0, 0, &[]);
+        let rejected = transitions
+            .iter()
+            .find(|transition| normalize_soccer_action_label(&transition.action) == "pass")
+            .expect("rejected learned-MPC action transition");
+
+        assert!(learned_mpc_rejected_action_counterexample(rejected));
+        assert!(!option_score_safety_rejected_action_counterexample(
+            rejected
+        ));
+    }
+
+    #[test]
     fn learned_mpc_replan_preserves_ranked_pass_target_counterexamples() {
         let sim = SoccerMatch::default_11v11(MatchConfig::default());
         let player = sim
@@ -8310,6 +8428,46 @@ fn learned_mpc_rejected_action_counterexample(transition: &SoccerLearningTransit
         return false;
     };
     learned_mpc_action_labels_match(&transition.action, original_action)
+}
+
+fn option_score_safety_rejected_action_counterexample(
+    transition: &SoccerLearningTransition,
+) -> bool {
+    learned_mpc_rejected_action_counterexample(transition)
+        && matches!(
+            transition.decision_context.learned_mpc_replan_source,
+            SoccerLearnedMpcReplanSource::OptionScoreSafety
+        )
+}
+
+fn option_score_safety_counterexample_sample_rate() -> f64 {
+    learned_mpc_probability_env(
+        "SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_SAMPLE_RATE",
+        SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_SAMPLE_RATE,
+    )
+}
+
+fn option_score_safety_counterexample_advantage_scale() -> f64 {
+    learned_mpc_probability_env(
+        "SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_ADVANTAGE_SCALE",
+        SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_ADVANTAGE_SCALE,
+    )
+}
+
+fn option_score_safety_counterexample_sample_allowed_with_rate(
+    transition: &SoccerLearningTransition,
+    sample_rate: f64,
+) -> bool {
+    if sample_rate >= 1.0 {
+        return true;
+    }
+    if sample_rate <= 0.0 {
+        return false;
+    }
+    soccer_transition_deterministic_sample_fraction(
+        transition,
+        SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_SAMPLE_SALT,
+    ) < sample_rate
 }
 
 fn soccer_actor_policy_sample_allowed(transition: &SoccerLearningTransition) -> bool {
@@ -14730,15 +14888,28 @@ impl SoccerMatch {
                 }
                 let rejected_counterexample =
                     learned_mpc_rejected_action_counterexample(transition);
+                let option_score_safety_counterexample =
+                    option_score_safety_rejected_action_counterexample(transition);
+                if option_score_safety_counterexample
+                    && !option_score_safety_counterexample_sample_allowed_with_rate(
+                        transition,
+                        option_score_safety_counterexample_sample_rate(),
+                    )
+                {
+                    return None;
+                }
                 if !soccer_actor_policy_sample_allowed(transition) {
                     return None;
                 }
                 let action_index = soccer_policy_action_index(&transition.action)?;
-                let advantage = if rejected_counterexample {
+                let mut advantage = if rejected_counterexample {
                     reward_adv[index] - values[index]
                 } else {
                     advantages[index]
                 };
+                if option_score_safety_counterexample {
+                    advantage *= option_score_safety_counterexample_advantage_scale();
+                }
                 let advantage =
                     soccer_actor_advantage_with_planner_distillation(transition, advantage);
                 let mcts_distillation =
