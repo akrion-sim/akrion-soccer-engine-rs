@@ -2338,7 +2338,6 @@ pub fn soccer_trajectory_export_write(replay: &[SoccerLearningTransition]) {
     }
 }
 
->>>>>>> wip/sidecar-engine-hook
 #[derive(Clone, Debug)]
 struct SoccerExternalNnPomdpSidecarEndpoint {
     host: String,
