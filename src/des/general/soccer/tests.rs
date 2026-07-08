@@ -44946,6 +44946,7 @@ fn push_contextual_goal_credit_history(sim: &mut SoccerMatch, before: &WorldSnap
                         .unwrap_or(before.ball.position),
             ),
             dribble_touch: None,
+            receiver_descriptor: None,
         });
         decision.observation.expected_pass_completion = 0.92;
         decision.observation.expected_aerial_pass_completion = 0.78;
