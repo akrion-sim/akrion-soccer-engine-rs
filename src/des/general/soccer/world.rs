@@ -13000,7 +13000,6 @@ impl SoccerMatch {
                 return None; // no legal support action this tick ⇒ fall back to MPC
             }
         }
->>>>>>> wip/sidecar-engine-hook
         let entities = soccer_field_player_motion_block(snapshot, player_id, player.team);
         if entities.len() != SOCCER_NEURAL_FIELD_MOTION_DIM {
             return None;
