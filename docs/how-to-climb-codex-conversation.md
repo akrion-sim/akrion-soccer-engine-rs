@@ -196,6 +196,39 @@ the first real climb attempt on an **unspent** lever.
 **Queued next if this is flat:** relational-attention + capacity (own run, larger train budget,
 since representational upgrades need more data), then the EPV possession-chain export (Step 2).
 
+## ACTION LOG — 2026-07-07 (Step 2 scaffold BUILT — the EPV critical path)
+
+Built and validated the possession-chain export + EPV fitter — the thing that was *missing*
+(Codex: a calibrated EPV can't be fit from the existing value-policy export; needs outcome-labeled
+chains first). This unblocks the only lever with a real path past 0.53.
+
+- **Engine accessor** (byte-identical, pure read): `SoccerMatch::export_world_snapshot()` in
+  `world.rs` — a `pub` wrapper over the `pub(crate)` snapshot constructor so external tooling can
+  read possession/ball/features. No behavior change, off every hot path.
+- **Export binary** `src/bin/soccer_export_possession_chains.rs` — runs self-play, segments
+  possession chains (contiguous `possession_team()` control), labels each with the TERMINAL
+  outcome and emits one JSONL row/tick. Data contract per row: `match_id, chain_id, team, tick,
+  t_in_chain, forward (canonical 0=own goal..1=opp goal), lateral, ball_x/y, field_*,
+  terminal_outcome ∈ {goal, shot_on_target, shot, turnover, timeout}, ticks_to_terminal,
+  [features[210]]`. Terminal detection: goals via score delta, shots/SOT via **per-team
+  `MatchStats` counter diffs** (NOT the reward-event stream — that distributes one shot's credit
+  across the whole buildup chain, which over-counts SOT ~15×; this was found and fixed in the
+  smoke test).
+- **Fitter** `scripts/fit_epv_grid.py` — `Φ_epv(cell) = E[γ^ticks_to_terminal · value(outcome)]`
+  over a forward×lateral grid (default 16×10, the pitch_value grid). Outcome values
+  (goal 1.0 / SOT 0.30 / shot 0.10 / turnover −0.15 / timeout 0.0) and γ are the calibration knobs.
+- **Wrapper** `scripts/export_possession_chains.sh` (export → fit in one shot).
+- **Validated end-to-end.** Outcome rates realistic (2.7 goals, 9.7 shots, 46 chains/game). The
+  fitted grid is a real EPV surface: mean start-forward is monotone in terminal danger
+  (goal 0.895 > SOT 0.841 > shot 0.590 > turnover 0.504 > timeout 0.327), and Φ_epv rises from
+  ~−0.09 in the own half to **+0.32 at the box edge**, dipping on the goal line (pinned
+  possessions that don't score turn over) — textbook xT/EPV shape.
+
+**Next (wiring, when a falsifier or this justifies it):** feed `Φ_epv` into `pitch_value.rs` as
+the PBRS potential (replacing the hardcoded xT seed) and into the support/run head reward as the
+**residual** contribution (observed ΔΦ − expected ΔΦ, per the double-counting fix) — both behind
+default-OFF gates, A/B'd via the eval gate.
+
 ## One-line summary
 
 The ceiling is structural: the net is a *selector over analytic candidates* optimizing
