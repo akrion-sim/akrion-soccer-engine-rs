@@ -1422,6 +1422,7 @@ fn soccer_q_target_entry_fingerprint(entry: &SoccerQTargetEntry) -> u64 {
     soccer_learning_fingerprint_usize(&mut hash, entry.target_tactical_cell_id);
     soccer_learning_fingerprint_usize(&mut hash, entry.target_macro_cell_id);
     soccer_learning_fingerprint_usize(&mut hash, entry.target_root_cell_id);
+    soccer_learning_fingerprint_mix(&mut hash, u64::from(entry.receiver_descriptor as u32));
     soccer_learning_fingerprint_f64(&mut hash, entry.value);
     soccer_learning_fingerprint_mix(&mut hash, u64::from(entry.visits));
     hash
