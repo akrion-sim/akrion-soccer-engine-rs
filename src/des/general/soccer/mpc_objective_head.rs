@@ -55,6 +55,28 @@ pub struct MpcObjectiveSample {
     pub reward: f64,
 }
 
+/// Which execution family the residual is shaping. Sets the one-hot flags in the exec-context
+/// feature block so a SINGLE head can serve shots, passes, and dribbles without conflating them —
+/// the analytic seed and reward attribution differ per family, but the geometry (bounded aim/lead
+/// nudge under the optimizer's feasibility guard) is identical.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MpcObjectiveFamily {
+    Shot,
+    Pass,
+    Dribble,
+}
+
+impl MpcObjectiveFamily {
+    /// `(is_shot, is_pass, is_dribble)` one-hot flags, in that fixed order.
+    pub fn one_hot(self) -> [f32; 3] {
+        match self {
+            MpcObjectiveFamily::Shot => [1.0, 0.0, 0.0],
+            MpcObjectiveFamily::Pass => [0.0, 1.0, 0.0],
+            MpcObjectiveFamily::Dribble => [0.0, 0.0, 1.0],
+        }
+    }
+}
+
 /// Learned execution-objective head: MLP over `[field embedding ++ exec features]` → a bounded
 /// `(forward, lateral)` target residual (Tanh output × `MAX_RESIDUAL` = hard-bounded yards).
 #[derive(Clone, Debug)]
