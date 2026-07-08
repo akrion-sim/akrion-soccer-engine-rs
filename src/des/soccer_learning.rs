@@ -1716,6 +1716,7 @@ struct PolicyEntryKey {
     target_tactical_cell_id: i32,
     target_macro_cell_id: i32,
     target_root_cell_id: i32,
+    receiver_descriptor: i32,
 }
 
 #[derive(Clone, Debug)]
@@ -1728,6 +1729,7 @@ struct EntryValue {
     target_tactical_cell_id: i32,
     target_macro_cell_id: i32,
     target_root_cell_id: i32,
+    receiver_descriptor: i32,
 }
 
 #[derive(Clone, Debug)]
@@ -1741,6 +1743,7 @@ struct MergeAccumulator {
     target_tactical_cell_id: i32,
     target_macro_cell_id: i32,
     target_root_cell_id: i32,
+    receiver_descriptor: i32,
 }
 
 pub fn soccer_learning_to_micros(value: f64) -> i64 {
