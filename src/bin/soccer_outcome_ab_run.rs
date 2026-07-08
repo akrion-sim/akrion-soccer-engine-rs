@@ -212,6 +212,12 @@ fn eval(candidate_path: &str, baseline_path: &str, games: usize, minutes: f64, h
 
     let started = Instant::now();
     let mut reports: Vec<MatchReport> = Vec::new();
+    // Dense advancement metric: the per-game (candidate − baseline) completed-forward-pass
+    // differential. Because both sides play the same seeded fixture head-to-head, this is a PAIRED
+    // sample — far more statistically powerful than the sparse, draw-heavy goal margin.
+    let mut forward_pass_diffs: Vec<f64> = Vec::new();
+    let mut candidate_forward_total: u64 = 0;
+    let mut baseline_forward_total: u64 = 0;
     for g in 0..games {
         let seed = holdout_base.wrapping_add((g as u32).wrapping_mul(2_246_822_519));
         // Alternate home/away so the verdict isn't a home-field artifact.
@@ -234,14 +240,26 @@ fn eval(candidate_path: &str, baseline_path: &str, games: usize, minutes: f64, h
                 &candidate,
             )
         };
-        if let Some(r) = report {
+        if let Some((r, home_forward, away_forward)) = report {
+            // Map the fixture's home/away forward-pass counts back to candidate/baseline
+            // regardless of this game's orientation.
+            let (candidate_forward, baseline_forward) = if r.home_id == candidate_id {
+                (home_forward, away_forward)
+            } else {
+                (away_forward, home_forward)
+            };
+            candidate_forward_total += u64::from(candidate_forward);
+            baseline_forward_total += u64::from(baseline_forward);
+            forward_pass_diffs.push(f64::from(candidate_forward) - f64::from(baseline_forward));
             eprintln!(
-                "[eval] game {:>2}/{games} {}v{} -> {}-{} ({:.0}s)",
+                "[eval] game {:>2}/{games} {}v{} -> {}-{}  fwd-passes cand/base {}/{} ({:.0}s)",
                 g + 1,
                 r.home_id,
                 r.away_id,
                 r.home_goals,
                 r.away_goals,
+                candidate_forward,
+                baseline_forward,
                 started.elapsed().as_secs_f64()
             );
             reports.push(r);
