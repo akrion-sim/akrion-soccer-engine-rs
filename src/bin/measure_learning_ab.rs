@@ -148,8 +148,14 @@ fn main() {
     let mut policies = Arc::new(SoccerTeamQPolicies::new(SoccerQPolicyOptions::default()));
     let mut snapshot: Option<SoccerNeuralNetworkSnapshot> = None;
     // Learned MPC execution-objective head, carried + RWR-trained across games (mirrors the
-    // pass-completion head's per-process carry). Only exercised when the gate is on.
-    let mut mpc_objective_head: Option<SoccerMpcObjectiveHead> = None;
+    // pass-completion head's per-process carry). Seeded up-front when the gate is on so game 1
+    // already captures cold-exploration samples (the head must exist for the residual to apply);
+    // stays `None` (never installed, byte-identical) when the gate is off.
+    let mut mpc_objective_head: Option<SoccerMpcObjectiveHead> = if learned_mpc_objective_enabled() {
+        Some(SoccerMpcObjectiveHead::new(seed_base))
+    } else {
+        None
+    };
 
     let mut per_game: Vec<GameKpis> = Vec::with_capacity(games);
     let started = Instant::now();
