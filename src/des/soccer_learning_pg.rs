@@ -3449,6 +3449,10 @@ impl SoccerLearningPgStore {
                 let visits_i32: i32 = row.get(9);
                 let visits = visits_i32.max(0) as u32;
                 let value = soccer_learning_from_micros(value_micros);
+                // PERSISTENCE(receiver_descriptor): wired to the real `receiver_descriptor` column
+                // + keyset pagination in the persistence pass; Unspecified until the column lands so
+                // pre-migration reads stay byte-identical to the grid-only loader.
+                let receiver_descriptor = RECEIVER_DESCRIPTOR_UNSPECIFIED;
                 match (team.as_str(), entry_kind.as_str()) {
                     ("home", "action") => home_entries.push(SoccerQEntry {
                         state,
