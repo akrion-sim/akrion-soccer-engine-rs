@@ -12519,6 +12519,7 @@ impl SoccerQPolicy {
                 target_tactical_cell_id: entry.target_tactical_cell_id,
                 target_macro_cell_id: entry.target_macro_cell_id,
                 target_root_cell_id: entry.target_root_cell_id,
+                receiver_descriptor: entry.receiver_descriptor,
             };
             if policy.insert_target_value(key.clone(), entry.value) {
                 policy.target_visits.insert(key, entry.visits);
