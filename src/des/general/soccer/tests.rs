@@ -11187,6 +11187,7 @@ fn transition_reward_infers_threaded_killer_pass_goal_channel_bonus() {
             )),
             facing: facing_bucket_from_vector(target - origin),
             dribble_touch: None,
+            receiver_descriptor: None,
         });
         decision.observation.expected_pass_completion = 0.88;
         decision.observation.best_pass_receiver_openness = 0.90;
@@ -11319,6 +11320,7 @@ fn transition_reward_ramps_threaded_killer_pass_as_goal_gets_closer() {
             )),
             facing: facing_bucket_from_vector(target - origin),
             dribble_touch: None,
+            receiver_descriptor: None,
         });
         decision.observation.expected_pass_completion = 0.88;
         decision.observation.best_pass_receiver_openness = 0.90;
