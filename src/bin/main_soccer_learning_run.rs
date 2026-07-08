@@ -5703,8 +5703,8 @@ static CARRIED_PASS_COMPLETION_HEAD: std::sync::Mutex<Option<SoccerPassCompletio
 /// In-memory MPC execution-objective head, carried + RWR-trained across games WITHIN a learner
 /// process (mirrors [`CARRIED_PASS_COMPLETION_HEAD`]). Unlike pass-completion — whose samples are
 /// captured head-independently — the executor head only captures when installed, so it is SEEDED
-/// at install time whenever `DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE` is on (else it stays `None`,
-/// byte-identical). Consumption + training both require the gate.
+/// at install time whenever `DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE` is on. Production defaults the
+/// gate on so MPC execution participates in learning; a falsey env value leaves it `None`.
 static CARRIED_MPC_OBJECTIVE_HEAD: std::sync::Mutex<Option<SoccerMpcObjectiveHead>> =
     std::sync::Mutex::new(None);
 
@@ -5907,7 +5907,7 @@ fn run_game(
     }
     // Install the carried executor head so this game's on-ball execution gets the learned aim/lead
     // residual. Seed-on-first-install when the gate is on (the residual must be applied for a sample
-    // to be captured — otherwise the head could never bootstrap); no-op + never seeded when off.
+    // to be captured — otherwise the head could never bootstrap); falsey env disables seeding.
     if learned_mpc_objective_enabled() {
         let mut guard = CARRIED_MPC_OBJECTIVE_HEAD.lock().unwrap();
         let head = guard.get_or_insert_with(|| SoccerMpcObjectiveHead::new(episode_seed as u32));
@@ -6335,7 +6335,7 @@ fn run_game(
     }
     // Train the CARRIED executor head on this game's (features, applied_residual, advantage) RWR
     // corpus so the aim/lead residual improves across games. Only accrues when the gate is on (the
-    // head is seeded + installed above), so this is a no-op in the default byte-identical path.
+    // head is seeded + installed above), so this is a no-op when the env kill switch disables it.
     if !mpc_objective_samples.is_empty() {
         let mut guard = CARRIED_MPC_OBJECTIVE_HEAD.lock().unwrap();
         let head = guard.get_or_insert_with(|| SoccerMpcObjectiveHead::new(episode_seed as u32));
@@ -12992,11 +12992,30 @@ mod tests {
             continuous_manifest_env_value("DD_SOCCER_ENABLE_LEARNED_SPACING_TARGET"),
             Some("true")
         );
+        assert_eq!(
+            continuous_manifest_env_value("DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE"),
+            Some("true")
+        );
+        assert_eq!(
+            continuous_manifest_env_value("DD_SOCCER_FORWARD_PASS_REWARD_SCALE"),
+            Some("6")
+        );
+        assert_eq!(
+            continuous_manifest_env_value("DD_SOCCER_SHOT_SHAPING_REWARD_SCALE"),
+            Some("0.4")
+        );
         assert_continuous_manifest_contains(
             "require_value DD_SOCCER_ENABLE_LOOSE_BALL_COMMIT_MODEL true",
         );
         assert_continuous_manifest_contains(
             "require_value DD_SOCCER_ENABLE_LEARNED_SPACING_TARGET true",
+        );
+        assert_continuous_manifest_contains(
+            "require_value DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE true",
+        );
+        assert_continuous_manifest_contains("require_value DD_SOCCER_FORWARD_PASS_REWARD_SCALE 6");
+        assert_continuous_manifest_contains(
+            "require_value DD_SOCCER_SHOT_SHAPING_REWARD_SCALE 0.4",
         );
         assert_eq!(
             continuous_manifest_env_value("SOCCER_GAME_ARTIFACT_MODE"),
