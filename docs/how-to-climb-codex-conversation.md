@@ -285,6 +285,38 @@ Note: in this tree `target_scale`/`target_clip` are `SoccerNeuralLearningConfig`
 override), so the window fix needs a tiny change to expose `SOCCER_NEURAL_TARGET_CLIP` (Codex's
 tree already runs 8/3; ours defaults 30/3).
 
+## DIAGNOSTIC VERDICT + FIRST FIX BUILT (2026-07-08)
+
+**Built the advantage diagnostic** (gated `DD_SOCCER_DUMP_ADVANTAGE_DIAGNOSTIC` in
+`neural_policy_training_samples`, world.rs; byte-identical off) and ran a 50-game / 2.6M-sample
+self-play burst. **Verdict — the root is the REWARD, and the advantage-norm fear was an overclaim:**
+
+| game result | raw_adv | std_adv |  | draw by chance-creation | raw_adv | std_adv |
+|---|---|---|---|---|---|---|
+| Win | +3312 | +0.997 | | created MORE (sot_diff>0) | 68 | +0.066 |
+| **Draw** | **+75** | **+0.003** | | even (sot_diff=0) | 111 | +0.003 |
+| Loss | −3178 | −0.994 | | created FEWER (sot_diff<0) | 44 | −0.061 |
+
+The actor signal is a near-binary win/lose rail with **draws at ~0**, and within draws the reward
+is **near-zero and non-monotonic** in chances created — a chance-rich draw is indistinguishable
+from a sterile one. Standardization keeps outcome-correlation high (0.87) and even faintly
+*surfaces* the draw gradient, so **std-only mode is DEMOTED** — there was never a rich signal for
+it to erase. The reward simply doesn't create one.
+
+**Built the fix — gated chance-quality terminal reward** (`DD_SOCCER_ENABLE_CHANCE_QUALITY_REWARD`,
+default-off byte-identical): a zero-sum, capped shots-on-target differential folded into the
+match-outcome label — `home += 15·clamp(sot_home − sot_away, ±4)`, `away −= same`, on all results
+(soccer.rs `MatchOutcomeReward::with_chance_quality`, wired at world.rs:14319 with `self.stats`).
+
+**Validated it reaches the gradient** — re-ran the diagnostic with the gate on: within draws the
+std-advantage spread went from ~0.13 non-monotonic noise to **+0.63 (created more) vs −0.61
+(created fewer)** — ~10× stronger and correctly signed. The 45% of games that were a learning void
+now teach "create danger."
+
+**Climb A/B running** — chance-quality OFF vs ON, fixed-73, 80 train / 140 held-out, judged by the
+corrected empirical-variance Wilson. Verdict pending. (Off-ball behavioral gate-flip A/B already
+REJECTED decisively — Δ−159 Elo — confirming gate-flipping is dead; EPV export+grid complete as v2.)
+
 ## One-line summary
 
 The ceiling is structural: the net is a *selector over analytic candidates* optimizing
