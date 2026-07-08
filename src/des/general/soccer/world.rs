@@ -1243,6 +1243,14 @@ pub struct SoccerMatch {
     /// (parity). Shared into each [`WorldSnapshot`] via an `Arc` clone, mirroring
     /// [`Self::line_depth_head`].
     pub(crate) pass_completion_head: Option<std::sync::Arc<SoccerPassCompletionHead>>,
+    /// Rolling window of MPC execution-objective training samples: the launch-time features + the
+    /// bounded aim/lead residual actually applied, labelled with the delayed outcome advantage when
+    /// the pass resolves. Drained by the learner to train [`SoccerMpcObjectiveHead`] (RWR).
+    pub(crate) mpc_objective_samples: Vec<MpcObjectiveSample>,
+    /// The learned MPC execution-objective head, when present (carried + trained across games).
+    /// When warm + gated on, it nudges the analytic aim/lead target by a hard-bounded residual so
+    /// pass/shot/dribble QUALITY becomes learnable; `None` ⇒ pure analytic target (parity).
+    pub(crate) mpc_objective_head: Option<std::sync::Arc<SoccerMpcObjectiveHead>>,
     /// The trained back-four line-depth head, when present. Set by the learner
     /// (carried + trained across games) so the line decision consumes it live; `None`
     /// ⇒ analytic seed. Shared into each [`WorldSnapshot`] via an `Arc` clone.
@@ -2238,6 +2246,18 @@ fn dd_soccer_enable_bellman_terminals() -> bool {
     *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_BELLMAN_TERMINALS"))
 }
 
+/// MC critic target (default-OFF, Codex-designed anti-alias lever). When on, the value head trains on
+/// the REALIZED discounted return (summed forward along each player's successor chain) instead of the
+/// tabular-bootstrapped `reward + γ·best_value_hierarchical(next)`. This breaks the aliased-tabular
+/// fixed point the neural value otherwise inherits by construction — the leading suspect for the
+/// parity ceiling. Run with DD_SOCCER_ENABLE_BELLMAN_TERMINALS=0 so terminal reconstruction doesn't
+/// reintroduce a bootstrap into the return labels.
+fn dd_soccer_enable_mc_critic_target() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_MC_CRITIC_TARGET"))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SoccerTrajectoryExportDecision {
@@ -2959,6 +2979,7 @@ mod tests {
             offside: None,
             offside_candidates: Vec::new(),
             learn_features: Vec::new(),
+            mpc_objective: None,
         };
 
         let deferred_start = sim.deferred_reward_transitions.len();
@@ -3033,6 +3054,7 @@ mod tests {
             offside: None,
             offside_candidates: Vec::new(),
             learn_features: Vec::new(),
+            mpc_objective: None,
         };
 
         let deferred_start = sim.deferred_reward_transitions.len();
@@ -3105,6 +3127,7 @@ mod tests {
             offside: None,
             offside_candidates: Vec::new(),
             learn_features: Vec::new(),
+            mpc_objective: None,
         };
         let nobody_penalty =
             pass_to_nobody_passer_penalty(&pass, sim.config.field_length_yards, true);
@@ -10678,6 +10701,8 @@ impl SoccerMatch {
             deferred_reward_transitions: Vec::new(),
             pass_outcome_samples: Vec::new(),
             pass_completion_head: None,
+            mpc_objective_samples: Vec::new(),
+            mpc_objective_head: None,
             line_depth_head: None,
             line_depth_samples: Vec::new(),
             pending_line_depth: Vec::new(),
@@ -11673,6 +11698,13 @@ impl SoccerMatch {
             description: format!("{taker} kickoff for {}", team.label()),
             ..MatchEvent::default()
         });
+    }
+
+    /// Read-only world snapshot for external tooling (possession-chain / EPV export).
+    /// Constructs the same agent-decision snapshot the engine uses internally; pure read,
+    /// no mutation, so calling it is byte-identical to not calling it. Off any hot path.
+    pub fn export_world_snapshot(&self) -> WorldSnapshot {
+        WorldSnapshot::from_match_for_agent_decision(self)
     }
 
     pub fn summary(&self) -> MatchSummary {
@@ -13173,6 +13205,26 @@ impl SoccerMatch {
             })?
             .clamp_to_pitch(snapshot.field_width, snapshot.field_length);
         let actor_position = snapshot.player_position(player_id).unwrap_or(point);
+        // Credit the learned pass-receiver head per-receiver only when the gate is on; otherwise
+        // leave it None so training folds in RECEIVER_DESCRIPTOR_UNSPECIFIED (grid-only parity).
+        let receiver_descriptor = if dd_soccer_enable_learned_pass_receiver()
+            && pass_like_action_flight(normalize_soccer_action_label(&plan.action)).is_some()
+        {
+            let (kind, role) = match plan.target_player {
+                Some(target_id) => (
+                    ReceiverKind::Teammate,
+                    snapshot
+                        .players
+                        .iter()
+                        .find(|p| p.id == target_id)
+                        .map(|p| p.role),
+                ),
+                None => (ReceiverKind::Space, None),
+            };
+            Some(snapshot.pass_receiver_descriptor(player_id, kind, point, role))
+        } else {
+            None
+        };
         Some(AgentActionTargetTrace {
             point: Some(point),
             player_id: plan.target_player,
@@ -13183,6 +13235,7 @@ impl SoccerMatch {
             )),
             facing: facing_bucket_from_vector(point - actor_position),
             dribble_touch: None,
+            receiver_descriptor,
         })
     }
 
@@ -13269,6 +13322,45 @@ impl SoccerMatch {
                     target_point: snapshot.player_position(target_player),
                     mpc_replan: None,
                 });
+                // Pass-to-space variant (gated, Codex round-10 shape): same receiver, but the ball
+                // is led into the anticipated reception point ahead of them, so the CRITIC scores
+                // feet-vs-run-onto and owns that spatial choice. Keeps `target_player` bound so pass
+                // MPC/receipt/concede-veto logic is unchanged. Skipped when the lead coincides with
+                // the feet target (no distinct candidate to score). Default OFF ⇒ byte-identical.
+                if dd_soccer_enable_neural_pass_space() {
+                    if let (Some(passer), Some(receiver_position)) = (
+                        snapshot.players.iter().find(|p| p.id == player_id),
+                        snapshot.player_position(target_player),
+                    ) {
+                        let flight = pass_like_action_flight(prefix).unwrap_or(PassFlight::Floor);
+                        let passer_position =
+                            snapshot.player_position(player_id).unwrap_or(receiver_position);
+                        let is_cross = pass_would_be_cross(
+                            passer_position,
+                            receiver_position,
+                            team,
+                            snapshot.field_width,
+                            snapshot.field_length,
+                        );
+                        let nominal_speed =
+                            pass_speed_yps_from_power(0.68, flight, is_cross, &passer.skills);
+                        if let Some(space_point) = snapshot.anticipated_pass_reception_point(
+                            player_id,
+                            target_player,
+                            flight,
+                            nominal_speed,
+                        ) {
+                            if space_point.distance(receiver_position) > 1.0 {
+                                plans.push(SoccerLearnedPlan {
+                                    action: base_action.clone(),
+                                    target_player: Some(target_player),
+                                    target_point: Some(space_point),
+                                    mpc_replan: None,
+                                });
+                            }
+                        }
+                    }
+                }
                 if dd_soccer_enable_discretized_kick() {
                     let buckets = if prefix == "aerial-pass" {
                         &NEURAL_MCTS_AERIAL_KICK_POWER_BUCKETS[..]
@@ -15199,20 +15291,43 @@ impl SoccerMatch {
                 candidates
             };
             let flight = pass_like_action_flight(&normalized_action).unwrap_or(PassFlight::Floor);
-            let ranked_target =
-                Self::learned_ranked_pass_target_for_policy(&plan.action, flight, &candidates);
-            plan.target_player = ranked_target.or_else(|| {
-                policy.best_pass_target_player_for_snapshot(
+            if dd_soccer_enable_learned_pass_receiver() {
+                // The head decides WHO (a ranked teammate) or open space; MPC feasibility is a
+                // legality mask that kicks an infeasible receiver back to the head for its next
+                // choice, rather than a heuristic silently overriding the head.
+                let (target_player, target_point) = Self::learned_pass_receiver_selection(
+                    policy,
                     snapshot,
                     player_id,
                     &normalized_action,
                     flight,
                     &candidates,
-                )
-            });
-            plan.target_point = plan
-                .target_player
-                .and_then(|target| snapshot.player_position(target));
+                );
+                plan.target_player = target_player;
+                plan.target_point = target_point.or_else(|| {
+                    plan.target_player
+                        .and_then(|target| snapshot.player_position(target))
+                });
+            } else {
+                // Pass-receiver head off: preserve main's ranked-target path (the neural-MCTS
+                // ranked pass target baked into the plan action), then fall back to the analytic
+                // best-target ranker — so main's mcts receiver improvement stays the gate-off
+                // behaviour rather than regressing to the analytic ranker alone.
+                let ranked_target =
+                    Self::learned_ranked_pass_target_for_policy(&plan.action, flight, &candidates);
+                plan.target_player = ranked_target.or_else(|| {
+                    policy.best_pass_target_player_for_snapshot(
+                        snapshot,
+                        player_id,
+                        &normalized_action,
+                        flight,
+                        &candidates,
+                    )
+                });
+                plan.target_point = plan
+                    .target_player
+                    .and_then(|target| snapshot.player_position(target));
+            }
         } else if let Some(kind) = dribble_move_kind_for_action_label(&normalized_action) {
             plan.target_point = learned_grid_target.take().or_else(|| {
                 let player = snapshot
@@ -15317,6 +15432,132 @@ impl SoccerMatch {
             plan.target_point = learned_grid_target;
         }
         plan
+    }
+
+    /// Learned-pass-receiver selection (gate on): the POMDP head ranks the receivers (visible
+    /// teammates + an optional "into open space" option from the grid head) and MPC feasibility
+    /// masks the ranking — an MPC-infeasible receiver is skipped ("kicked back to the head") and
+    /// the next-best is tried. Returns `(target_player, target_point)`; `target_player = None` with
+    /// a `target_point` is a to-space ball. Falls back to the head's top choice if nothing is
+    /// MPC-feasible (the downstream action-level `mpc_reconciled_learned_plan` then decides whether
+    /// to abandon passing entirely).
+    fn learned_pass_receiver_selection(
+        policy: &SoccerQPolicy,
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        normalized_action: &str,
+        flight: PassFlight,
+        candidates: &[usize],
+    ) -> (Option<usize>, Option<Vec2>) {
+        let ranked = policy.ranked_pass_teammates_for_snapshot(
+            snapshot,
+            player_id,
+            normalized_action,
+            flight,
+            candidates,
+        );
+        let threshold = learned_mpc_replan_thresholds().pass_impossible_probability;
+        let feasible = |target_player: Option<usize>, target_point: Option<Vec2>| -> bool {
+            let Some(target_player) = target_player else {
+                return false;
+            };
+            let trial = SoccerLearnedPlan {
+                action: normalized_action.to_string(),
+                target_player: Some(target_player),
+                target_point,
+                mpc_replan: None,
+            };
+            Self::learned_pass_mpc_execution_probability(snapshot, player_id, &trial, flight)
+                >= threshold
+        };
+        // The head's preferred "open space" ball (grid head, min-visits gated), offered when a
+        // teammate can realistically run onto it and it out-ranks the feasible teammates.
+        let space = Self::learned_pass_space_option(policy, snapshot, player_id, normalized_action);
+        // Walk the head's ranking; commit the first MPC-feasible receiver. Prefer the space ball
+        // ahead of a teammate only when the head scores it higher (already reflected in its rank).
+        let mut best_feasible: Option<(f64, Option<usize>, Option<Vec2>)> = None;
+        for entry in &ranked {
+            let position = snapshot.player_position(entry.player_id);
+            if feasible(Some(entry.player_id), position) {
+                best_feasible = Some((entry.head_score, Some(entry.player_id), position));
+                break;
+            }
+        }
+        if let Some((space_score, space_point)) = space {
+            let space_beats = best_feasible
+                .as_ref()
+                .map(|(score, _, _)| space_score > *score)
+                .unwrap_or(true);
+            if space_beats {
+                return (None, Some(space_point));
+            }
+        }
+        if let Some((_, target_player, target_point)) = best_feasible {
+            return (target_player, target_point);
+        }
+        // Nothing MPC-feasible: hand back the head's top choice so the action-level replan can
+        // decide whether to keep passing or switch families.
+        let fallback = ranked.first().map(|entry| entry.player_id);
+        let fallback_point = fallback.and_then(|id| snapshot.player_position(id));
+        (fallback, fallback_point)
+    }
+
+    /// The head's "pass into open space" option: its preferred target grid point (min-visits
+    /// gated) when a teammate is close enough to run onto it and the point is forward of the
+    /// passer, scored by the learned Space-descriptor value. `None` when the head has no
+    /// confident space preference or no runner can reach it.
+    fn learned_pass_space_option(
+        policy: &SoccerQPolicy,
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        normalized_action: &str,
+    ) -> Option<(f64, Vec2)> {
+        let space_point =
+            Self::learned_target_grid_point_for_policy(policy, snapshot, player_id, normalized_action)?;
+        let passer = snapshot.players.iter().find(|p| p.id == player_id)?;
+        let passer_position = snapshot.player_position(player_id).unwrap_or(passer.position);
+        // A runner must be able to reach the space, otherwise it is a blind ball out of play.
+        let runner_close = snapshot
+            .players
+            .iter()
+            .filter(|p| p.team == passer.team && p.id != player_id)
+            .filter_map(|p| snapshot.player_position(p.id))
+            .any(|pos| pos.distance(space_point) <= SOCCER_SPACE_RUN_ONTO_YARDS);
+        if !runner_close {
+            return None;
+        }
+        let descriptor = snapshot.pass_receiver_descriptor(
+            player_id,
+            ReceiverKind::Space,
+            space_point,
+            None,
+        );
+        // Only forward space is worth breaking shape for; a "space" ball behind the passer is a
+        // recycle the grid head already covers as a teammate.
+        let attack_sign = if passer.team.goal_y(snapshot.field_length) >= snapshot.field_length * 0.5
+        {
+            1.0
+        } else {
+            -1.0
+        };
+        if (space_point.y - passer_position.y) * attack_sign <= SOCCER_RECEIVER_FORWARD_SQUARE_YARDS
+        {
+            return None;
+        }
+        let grid = pitch_grid_address(space_point, snapshot.field_width, snapshot.field_length);
+        let state = SoccerQStateKey::from_parts(
+            &snapshot.mdp_state_for_player(player_id),
+            &snapshot.observation_for(player_id),
+            passer.team,
+            passer.role,
+        );
+        let value = policy.target_preference_for_grid_and_receiver(
+            &state,
+            normalized_action,
+            &grid,
+            descriptor,
+        )?;
+        Some((value * LEARNED_RECEIVER_HEAD_DOMINANCE, space_point))
     }
 
     fn mpc_reconciled_learned_plan_for_policy(
@@ -16116,6 +16357,51 @@ impl SoccerMatch {
         let target_clip = self.config.neural_learning.sanitized_target_clip();
         let tick_rewards = soccer_marl_tick_rewards(transitions);
         let successor_indices = Self::neural_successor_indices(transitions);
+        // MC critic target (gated, Codex anti-alias lever): realized discounted return per transition,
+        // accumulated BACKWARD along each player's successor chain, so the value head learns E[return]
+        // from real outcomes instead of regressing onto the aliased tabular Q(next). Empty ⇒ use the
+        // default tabular-bootstrapped target.
+        let mc_returns: Vec<f64> = if dd_soccer_enable_mc_critic_target() {
+            let n = transitions.len();
+            let mc_gamma = soccer_q_sanitized_gamma(SoccerQPolicyOptions::default().gamma);
+            let adj: Vec<f64> = transitions
+                .iter()
+                .map(|t| {
+                    finite_metric(soccer_marl_adjusted_reward(
+                        t,
+                        &tick_rewards,
+                        &self.config.neural_learning,
+                    ))
+                })
+                .collect();
+            let mut ret = vec![0.0f64; n];
+            for i in (0..n).rev() {
+                let future = if transitions[i].done {
+                    0.0
+                } else {
+                    match successor_indices.get(i).copied().flatten() {
+                        Some(s) if s < n => mc_gamma * ret[s],
+                        _ => 0.0,
+                    }
+                };
+                ret[i] = adj[i] + future;
+            }
+            // STANDARDIZE (PopArt-style): realized returns are goal-dominated (a scored possession is
+            // ~100+ while a quiet one is ~1), so the fixed target_scale/clip would saturate them into a
+            // near-binary signal. Normalizing to ~unit scale gives the critic a graded target — this is
+            // exactly how the external Burn solver (the only thing that beat parity) handles returns.
+            if n > 1 {
+                let mean = ret.iter().sum::<f64>() / n as f64;
+                let var = ret.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / n as f64;
+                let std = var.sqrt().max(1e-3);
+                for r in ret.iter_mut() {
+                    *r = (*r - mean) / std;
+                }
+            }
+            ret
+        } else {
+            Vec::new()
+        };
         transitions
             .iter()
             .enumerate()
@@ -16167,14 +16453,28 @@ impl SoccerMatch {
                     tabular_max_next,
                     target_scale,
                 );
-                let (target, priority) = soccer_neural_target_and_priority(
-                    adjusted_reward,
-                    gamma,
-                    max_next,
-                    transition.done,
-                    target_scale,
-                    target_clip,
-                );
+                let (target, priority) = if !mc_returns.is_empty() {
+                    // MC target: clip(realized_return / target_scale) — NO tabular bootstrap. This is
+                    // the alias-breaking label; `max_next`/`gamma` above are ignored on this path.
+                    let raw = mc_returns.get(transition_index).copied().unwrap_or(0.0);
+                    // Already standardized to ~unit scale in the precompute; clip to the same bound
+                    // (no /target_scale — that division is what saturated the goal-dominated returns).
+                    let scaled = if raw.is_finite() {
+                        raw.clamp(-target_clip, target_clip)
+                    } else {
+                        0.0
+                    };
+                    (scaled, scaled.abs().max(1e-6))
+                } else {
+                    soccer_neural_target_and_priority(
+                        adjusted_reward,
+                        gamma,
+                        max_next,
+                        transition.done,
+                        target_scale,
+                        target_clip,
+                    )
+                };
                 let sample = SoccerNeuralTrainingSample {
                     input: soccer_neural_transition_features(transition),
                     target,
@@ -16555,6 +16855,14 @@ impl SoccerMatch {
         let option_score_safety_sample_rate = option_score_safety_counterexample_sample_rate();
         let option_score_safety_advantage_scale =
             option_score_safety_counterexample_advantage_scale();
+        // Diagnostic side-channel (gated): when `DD_SOCCER_DUMP_ADVANTAGE_DIAGNOSTIC` is set, record
+        // `(team, action_index, pre-standardization advantage)` aligned 1:1 with the kept `samples`
+        // so an offline pass can see whether raw advantages separate chance-rich from sterile draws
+        // and whether batch standardization erases that separation. Off ⇒ byte-identical. Note the
+        // recorded advantage is the FINAL per-sample advantage (post planner-distillation + outcome
+        // credit, pre batch-standardization) — the exact value that enters `SoccerPolicySample`.
+        let diag_on = std::env::var("DD_SOCCER_DUMP_ADVANTAGE_DIAGNOSTIC").is_ok();
+        let mut diag_meta: Vec<(Team, usize, f64)> = Vec::new();
         let mut samples: Vec<SoccerPolicySample> = replay
             .iter()
             .enumerate()
@@ -16633,6 +16941,9 @@ impl SoccerMatch {
                     }
                     return None;
                 }
+                if diag_on {
+                    diag_meta.push((transition.team, action_index, advantage));
+                }
                 let sample = SoccerPolicySample {
                     state_features,
                     action_index,
@@ -16658,6 +16969,12 @@ impl SoccerMatch {
         if dd_soccer_standardize_policy_advantages() {
             soccer_standardize_actor_policy_sample_advantages(&mut samples);
         }
+        // Diagnostic dump (gated) runs with the post-standardization `samples` alongside the
+        // pre-standardization `diag_meta` so the offline pass can compare both. It is a pure
+        // read-only side effect and does not affect the returned batch.
+        if diag_on {
+            self.dump_advantage_diagnostic(&diag_meta, &samples);
+        }
         SoccerPolicyTrainingBatch {
             samples,
             option_score_safety_counterexample_candidates,
@@ -16667,6 +16984,54 @@ impl SoccerMatch {
             option_score_safety_counterexample_actor_filtered,
             option_score_safety_counterexample_unindexed_action,
             option_score_safety_counterexample_nonfinite_advantage,
+        }
+    }
+
+    /// Appends per-sample advantage-diagnostic rows (JSONL) to `DD_SOCCER_DUMP_ADVANTAGE_DIAGNOSTIC`.
+    /// Offline-only instrumentation for the 0.53-ceiling investigation: for each actor training
+    /// sample it records the pre- and post-standardization advantage tagged with the game's final
+    /// result and shots-on-target differential, so we can test (a) whether the raw label separates
+    /// chance-rich from sterile draws [reward] and (b) whether batch standardization erases that
+    /// separation [gradient]. Never runs unless the env var is set.
+    fn dump_advantage_diagnostic(
+        &self,
+        meta: &[(Team, usize, f64)],
+        samples: &[SoccerPolicySample],
+    ) {
+        use std::io::Write;
+        let Ok(path) = std::env::var("DD_SOCCER_DUMP_ADVANTAGE_DIAGNOSTIC") else {
+            return;
+        };
+        let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
+            return;
+        };
+        let (score_home, score_away) = (self.score_home, self.score_away);
+        let (sot_home, sot_away) = (
+            self.stats.shots_on_target_home,
+            self.stats.shots_on_target_away,
+        );
+        for (i, &(team, action_index, raw_adv)) in meta.iter().enumerate() {
+            let std_adv = samples.get(i).map(|s| s.advantage).unwrap_or(raw_adv);
+            let (team_score, opp_score, team_sot, opp_sot) = match team {
+                Team::Home => (score_home, score_away, sot_home, sot_away),
+                Team::Away => (score_away, score_home, sot_away, sot_home),
+            };
+            let result = if team_score > opp_score {
+                "W"
+            } else if team_score < opp_score {
+                "L"
+            } else {
+                "D"
+            };
+            let family = SOCCER_POLICY_ACTIONS.get(action_index).copied().unwrap_or("?");
+            let sot_diff = team_sot as i64 - opp_sot as i64;
+            let _ = writeln!(
+                file,
+                "{{\"result\":\"{result}\",\"team\":\"{}\",\"family\":\"{family}\",\
+                 \"raw_adv\":{raw_adv:.5},\"std_adv\":{std_adv:.5},\
+                 \"team_sot\":{team_sot},\"opp_sot\":{opp_sot},\"sot_diff\":{sot_diff}}}",
+                team.label(),
+            );
         }
     }
 
@@ -16958,8 +17323,14 @@ impl SoccerMatch {
         self.full_game_learning_applied = true;
         // Terminal won-game reward (the "long" rung): label every transition with the
         // realised result when the gate is on. Off ⇒ `None`, byte-identical replay.
-        let match_outcome = match_outcome_reward_enabled()
-            .then(|| MatchOutcomeReward::from_score(self.score_home, self.score_away));
+        let match_outcome = match_outcome_reward_enabled().then(|| {
+            MatchOutcomeReward::from_score(self.score_home, self.score_away).with_chance_quality(
+                self.stats.shots_on_target_home,
+                self.stats.shots_on_target_away,
+                self.stats.shots_after_pass_home,
+                self.stats.shots_after_pass_away,
+            )
+        });
         let replay =
             soccer_full_game_replay_transitions(&self.episode_learning_transitions, match_outcome);
         self.full_game_learning_replay_transitions = replay.len();
@@ -24464,6 +24835,54 @@ impl SoccerMatch {
                     );
                     let pass_skill =
                         pass_execution_skill(&self.players[player_id].skills, flight, is_cross);
+                    // Learned MPC execution-objective (gated `DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE`,
+                    // default-off ⇒ byte-identical). Nudge the analytic lead target by a hard-bounded
+                    // (≤`MPC_OBJECTIVE_MAX_RESIDUAL_YARDS`) residual so pass QUALITY (aim/lead) becomes
+                    // learnable. The residual is re-clamped to the pitch here and still passes through
+                    // every downstream guard (noisy-aim clamp, offside/receipt/replan gate), so the
+                    // policy still owns WHO/WHETHER — this only refines WHERE within the guard envelope.
+                    // Captured with its launch features + reinforced by the delayed pass outcome (RWR).
+                    let mpc_objective_sample: Option<(Vec<f32>, Vec2)> =
+                        if learned_mpc_objective_enabled() {
+                            if let Some(head) = self.mpc_objective_head.clone() {
+                                let features = snapshot.mpc_objective_learn_features(
+                                    player_team,
+                                    MpcObjectiveFamily::Pass,
+                                    player_pos,
+                                    led_target,
+                                    pressure,
+                                );
+                                let sigma = mpc_objective_explore_sigma_yards();
+                                let (noise_fwd, noise_lat) = self.mpc_objective_exploration_noise();
+                                let residual = if head.is_warm() {
+                                    head.explore_residual(&features, sigma, noise_fwd, noise_lat)
+                                } else {
+                                    // Cold start: explore around the ANALYTIC target (zero residual)
+                                    // so the head accrues training data before it is trusted live.
+                                    Some(Vec2 {
+                                        x: (noise_lat * sigma).clamp(
+                                            -MPC_OBJECTIVE_MAX_RESIDUAL_YARDS,
+                                            MPC_OBJECTIVE_MAX_RESIDUAL_YARDS,
+                                        ),
+                                        y: (noise_fwd * sigma).clamp(
+                                            -MPC_OBJECTIVE_MAX_RESIDUAL_YARDS,
+                                            MPC_OBJECTIVE_MAX_RESIDUAL_YARDS,
+                                        ),
+                                    })
+                                };
+                                residual.map(|r| {
+                                    led_target = (led_target + r).clamp_to_pitch(
+                                        self.config.field_width_yards,
+                                        self.config.field_length_yards,
+                                    );
+                                    (features, r)
+                                })
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
                     // Body-facing gate: you can only strike the ball with the slice of your
                     // range the body is turned toward. Evaluate the intended pass line against
                     // the carrier's CURRENT facing (this tick's body orientation, before the
@@ -25078,6 +25497,7 @@ impl SoccerMatch {
                             receiver_openness,
                             flight,
                         ),
+                        mpc_objective: mpc_objective_sample,
                     });
                     // Slip-and-break-the-offside-trap execution: a firm forward GROUND ball slipped
                     // to an ONSIDE runner who timed his break into a two-defender seam. Detect the
@@ -31085,6 +31505,32 @@ impl SoccerMatch {
     /// embedding + pass features, labelled `completed`). Bounded rolling window; the cluster learner
     /// drains it to Postgres + the model. No-op when the launch features were not captured.
     fn record_pass_outcome_sample(&mut self, pass: &PendingPass, completed: bool, own_half: bool) {
+        // Executor-head (MPC-objective) sample: reinforce the applied aim/lead residual by the
+        // delayed outcome advantage. Recorded independently of the pass-completion corpus (works
+        // even when that head is off), so it sits BEFORE the `learn_features` guard below. RWR only
+        // trains on positive advantage, so a completed + progressive pass reinforces its residual
+        // while an interception (negative) is skipped — the head learns aims that actually connect.
+        if let Some((features, residual)) = pass.mpc_objective.as_ref() {
+            if features.len() == MPC_OBJECTIVE_FEATURE_DIM {
+                let forward = ((pass.intended_target.y - pass.origin.y) * pass.team.attack_dir()
+                    / 20.0)
+                    .clamp(-1.0, 1.0);
+                let reward = if completed {
+                    0.6 + 0.4 * forward.max(0.0)
+                } else {
+                    -1.0
+                };
+                self.mpc_objective_samples.push(MpcObjectiveSample {
+                    features: features.clone(),
+                    applied_residual: *residual,
+                    reward,
+                });
+                if self.mpc_objective_samples.len() > MPC_OBJECTIVE_SAMPLE_CAP {
+                    let overflow = self.mpc_objective_samples.len() - MPC_OBJECTIVE_SAMPLE_CAP;
+                    self.mpc_objective_samples.drain(0..overflow);
+                }
+            }
+        }
         if pass.learn_features.len() != SOCCER_PASS_COMPLETION_FEATURE_DIM {
             return;
         }
@@ -31103,6 +31549,29 @@ impl SoccerMatch {
     /// and trains [`SoccerPassCompletionHead`] on the pooled corpus).
     pub fn drain_pass_outcome_samples(&mut self) -> Vec<SoccerPassOutcomeSample> {
         std::mem::take(&mut self.pass_outcome_samples)
+    }
+
+    /// Install a trained MPC execution-objective head for live consumption (the learner carries +
+    /// trains it across games, mirroring [`Self::set_pass_completion_head`]).
+    pub fn set_mpc_objective_head(&mut self, head: SoccerMpcObjectiveHead) {
+        self.mpc_objective_head = Some(std::sync::Arc::new(head));
+    }
+
+    /// Drain the accumulated MPC-objective RWR samples (the learner trains
+    /// [`SoccerMpcObjectiveHead`] on them and carries the head forward).
+    pub fn drain_mpc_objective_samples(&mut self) -> Vec<MpcObjectiveSample> {
+        std::mem::take(&mut self.mpc_objective_samples)
+    }
+
+    /// Two independent standard-normal draws from the match RNG (Box–Muller), for the executor
+    /// head's exploration jitter. Threaded explicitly so the head stays deterministic + rng-free.
+    /// Guards the log against a zero `u1` (→ +inf) by flooring it to a tiny positive.
+    fn mpc_objective_exploration_noise(&mut self) -> (f64, f64) {
+        let u1 = self.rng.next_float().max(1e-12);
+        let u2 = self.rng.next_float();
+        let radius = (-2.0 * u1.ln()).sqrt();
+        let theta = 2.0 * std::f64::consts::PI * u2;
+        (radius * theta.cos(), radius * theta.sin())
     }
 
     fn stat_clearance(&mut self, team: Team) {
@@ -35206,6 +35675,19 @@ fn dd_soccer_enable_scored_shot_placement() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_SCORED_SHOT_PLACEMENT"))
+}
+
+/// Pass-to-space (spatial-target hardening, Codex round-10 shape). When set, the neural MCTS pass
+/// expansion emits, for each shortlisted receiver, a SECOND candidate plan that keeps
+/// `target_player = Some(receiver)` but sets `target_point` to the anticipated lead/into-space
+/// reception point instead of the receiver's feet — so the critic can choose to play the ball
+/// ahead into space for a runner, not only to feet. The receiver stays bound, so the existing
+/// pass MPC/receipt/concede-veto logic still applies. Default OFF ⇒ byte-identical (feet-only
+/// candidate as before).
+fn dd_soccer_enable_neural_pass_space() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_NEURAL_PASS_SPACE"))
 }
 
 /// Gives the goalkeeper a positive learning reward for stopping a shot
@@ -43603,6 +44085,90 @@ impl WorldSnapshot {
 
     pub fn ranked_visible_pass_targets(&self, player_id: usize, limit: usize) -> Vec<usize> {
         self.ranked_pass_targets_filtered(player_id, limit, true, true)
+    }
+
+    /// Attack-relative distance to the nearest opponent of `team` from `point` (yards).
+    /// Basis for the receiver-descriptor openness bucket; works for a teammate spot or open space.
+    fn nearest_opponent_distance_to_point(&self, team: Team, point: Vec2) -> f64 {
+        self.players
+            .iter()
+            .filter(|other| other.team != team)
+            .map(|other| {
+                let pos = self
+                    .player_position(other.id)
+                    .unwrap_or(other.position);
+                point.distance(pos)
+            })
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    /// Discretized [`ReceiverDescriptor`] for a pass from `passer_id` to a receiver of `kind` at
+    /// `target_point` (with `target_role` for a teammate). Attack-relative so both teams share
+    /// credit. Used identically at trace time (training credit) and inference time (head query)
+    /// so the learned `target_values[(state, action, grid, receiver_descriptor)]` line up.
+    /// Returns the encoded integer; [`RECEIVER_DESCRIPTOR_UNSPECIFIED`] if the passer is unknown.
+    pub(crate) fn pass_receiver_descriptor(
+        &self,
+        passer_id: usize,
+        kind: ReceiverKind,
+        target_point: Vec2,
+        target_role: Option<PlayerRole>,
+    ) -> i32 {
+        let Some(passer) = self.players.iter().find(|p| p.id == passer_id) else {
+            return RECEIVER_DESCRIPTOR_UNSPECIFIED;
+        };
+        let passer_position = self.player_position(passer_id).unwrap_or(passer.position);
+        let team = passer.team;
+        // Attack sign: Home attacks +y (goal_y = field_length), Away attacks -y (goal_y = 0).
+        let attack_sign = if team.goal_y(self.field_length) >= self.field_length * 0.5 {
+            1.0
+        } else {
+            -1.0
+        };
+        let forward = (target_point.y - passer_position.y) * attack_sign;
+        let progression = if forward > SOCCER_RECEIVER_FORWARD_SQUARE_YARDS {
+            2
+        } else if forward < -SOCCER_RECEIVER_FORWARD_SQUARE_YARDS {
+            0
+        } else {
+            1
+        };
+        // Attack-relative left/central/right by horizontal thirds (mirrored for the away team so
+        // "left" is the attacking team's left in both directions).
+        let width = self.field_width.max(1.0);
+        let mut lane_frac = (target_point.x / width).clamp(0.0, 1.0);
+        if attack_sign < 0.0 {
+            lane_frac = 1.0 - lane_frac;
+        }
+        let lane = if lane_frac < 1.0 / 3.0 {
+            0
+        } else if lane_frac < 2.0 / 3.0 {
+            1
+        } else {
+            2
+        };
+        let opponent_distance = self.nearest_opponent_distance_to_point(team, target_point);
+        let openness = if opponent_distance < SOCCER_RECEIVER_TIGHT_YARDS {
+            0
+        } else if opponent_distance < SOCCER_RECEIVER_OPEN_YARDS {
+            1
+        } else {
+            2
+        };
+        let role_bucket = match kind {
+            ReceiverKind::Teammate => {
+                target_role.map(ReceiverDescriptor::role_bucket_for).unwrap_or(0)
+            }
+            ReceiverKind::Space | ReceiverKind::Nobody => 0,
+        };
+        ReceiverDescriptor {
+            kind,
+            role_bucket,
+            lane,
+            progression,
+            openness,
+        }
+        .encode()
     }
 
     /// Threaded/"killer"-pass candidates: visible + clear-ish + onside, but NOT filtered by the
@@ -60011,6 +60577,61 @@ impl WorldSnapshot {
             (bounds.inward_correction_yards / LONG_AERIAL_BOUNDS_REFERENCE_MARGIN_YARDS)
                 .clamp(0.0, 1.5) as f32,
         );
+        features
+    }
+
+    /// Feature vector for [`SoccerMpcObjectiveHead`]: the 256-d whole-field config embedding
+    /// (weighted toward the `from`→`to` execution lane, exactly like `pass_completion_learn_features`
+    /// so the head emphasises the players who actually gate the outcome) followed by
+    /// [`MPC_OBJECTIVE_EXEC_FEATURES`] execution-context scalars — the family one-hot
+    /// (shot/pass/dribble), normalized target distance, the forward and lateral components of the
+    /// analytic target delta in team-canonical axes, the signed angle of that delta relative to the
+    /// straight-at-goal direction, and a pressure proxy. All bounded + slow-varying so the head
+    /// generalises across moments. The width is exactly [`MPC_OBJECTIVE_FEATURE_DIM`].
+    pub(crate) fn mpc_objective_learn_features(
+        &self,
+        team: Team,
+        family: MpcObjectiveFamily,
+        from: Vec2,
+        to: Vec2,
+        pressure: f64,
+    ) -> Vec<f32> {
+        let config = SoccerConfigVector::from_snapshot_with(
+            self,
+            team,
+            SoccerConfigComparison::PositionAgnostic,
+            ConfigWeightOptions {
+                ball_path: Some((from, to)),
+                ball_path_along_taper: 0.6,
+                ..ConfigWeightOptions::default()
+            },
+        );
+        let embedding = config.embedding();
+        let mut features: Vec<f32> = Vec::with_capacity(MPC_OBJECTIVE_FEATURE_DIM);
+        features.extend(embedding.iter().map(|&v| v as f32));
+        features.extend_from_slice(&family.one_hot());
+        let attack = team.attack_dir();
+        let distance = from.distance(to);
+        features.push((distance / 60.0).clamp(0.0, 1.5) as f32);
+        features.push((((to.y - from.y) * attack) / 40.0).clamp(-1.0, 1.5) as f32);
+        features.push(((to.x - from.x).abs() / 40.0).clamp(0.0, 1.0) as f32);
+        // Signed angle (rad, wrapped to [-pi, pi]) between the target delta and the straight line
+        // from the actor to the attacking goal centre — 0 means "aimed dead at goal", ±1 (after the
+        // /pi normalise) means square/backwards. Robust to a zero-length delta (atan2(0,0)=0).
+        let goal_x = self.field_width * 0.5;
+        let goal_y = if attack > 0.0 { self.field_length } else { 0.0 };
+        let angle_to_goal = (goal_y - from.y).atan2(goal_x - from.x);
+        let angle_to_target = (to.y - from.y).atan2(to.x - from.x);
+        let mut angle = angle_to_target - angle_to_goal;
+        while angle > std::f64::consts::PI {
+            angle -= 2.0 * std::f64::consts::PI;
+        }
+        while angle < -std::f64::consts::PI {
+            angle += 2.0 * std::f64::consts::PI;
+        }
+        features.push((angle / std::f64::consts::PI).clamp(-1.0, 1.0) as f32);
+        features.push(pressure.clamp(0.0, 1.0) as f32);
+        debug_assert_eq!(features.len(), MPC_OBJECTIVE_FEATURE_DIM);
         features
     }
 

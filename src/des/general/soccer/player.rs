@@ -7808,6 +7808,7 @@ impl PlayerAgent {
             )),
             facing,
             dribble_touch,
+            receiver_descriptor: None,
         })
     }
 
