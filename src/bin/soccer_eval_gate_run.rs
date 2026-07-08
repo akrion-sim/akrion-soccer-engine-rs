@@ -265,28 +265,15 @@ fn main() {
          train_games={train_games} holdout_seed_base=0x{holdout_seed_base:08X}"
     );
 
-<<<<<<< ours
     // Candidate brain (id 0): prefer a local learned-params file (the fully-local learner's
     // accumulated policy) when SOCCER_EVAL_CANDIDATE_PATH is set; otherwise inline self-play train.
     let candidate_brain = brain_from_env_file("SOCCER_EVAL_CANDIDATE_PATH")
         .or_else(|| train_candidate_brain(train_games, minutes, train_seed_base))
         .unwrap_or_else(|| TeamBrain::fresh_with_seed(0xCA11_D1DA, candidate_id));
-=======
-    // Candidate brain (id 0): prefer a local learned-params file (the fully-local
-    // learner's accumulated policy) when SOCCER_EVAL_CANDIDATE_PATH is set; otherwise
-    // fall back to inline self-play training (the original behaviour). Then FROZEN for the gate.
-    let candidate_snapshot = snapshot_from_env_file("SOCCER_EVAL_CANDIDATE_PATH")
-        .or_else(|| train_candidate_snapshot(train_games, minutes, train_seed_base));
-    let candidate_brain = match candidate_snapshot {
-        Some(s) => TeamBrain::from_snapshot(s),
-        None => TeamBrain::fresh_with_seed(0xCA11_D1DA, candidate_id),
-    };
->>>>>>> theirs
 
     // Frozen field (ids 1..pool): distinct-genome fresh brains, the incumbent +
     // diverse opponents the candidate must beat without being countered.
     let mut pool: Vec<TeamBrain> = (1..pool_size)
-<<<<<<< ours
         .map(|id| {
             TeamBrain::fresh_with_seed(0xF0_0000u32.wrapping_add(id as u32 * 2_654_435_761), id)
         })
@@ -303,26 +290,6 @@ fn main() {
     // ANALYTIC (no net -> authoritative branch skipped -> the hand-built engine decides). The
     // candidate keeps its net, so this is the honest "authoritative neural vs analytic" meter
     // (the field's distinct genomes still give diverse analytic styles).
-=======
-        .map(|id| TeamBrain::fresh_with_seed(0xF0_0000u32.wrapping_add(id as u32 * 2_654_435_761), id))
-        .collect();
-    // Champion-gate: when SOCCER_EVAL_BASELINE_PATH is set, replace the incumbent
-    // (id 1 == pool[0]) with the champion loaded from a local learned-params file, so
-    // the held-out fixtures become a direct candidate-vs-champion comparison (the
-    // monotone promotion gate) instead of candidate-vs-fresh.
-    if let Some(snapshot) = snapshot_from_env_file("SOCCER_EVAL_BASELINE_PATH") {
-        if let Some(first) = pool.first_mut() {
-            *first = TeamBrain::from_snapshot(snapshot);
-            eprintln!("eval_baseline_replaced_with_champion id={baseline_id}");
-        }
-    }
-    // SOCCER_EVAL_ANALYTIC_FIELD=1: strip the net from every pool opponent so they play
-    // PURE ANALYTIC (no net -> no prediction network -> the authoritative branch is skipped
-    // -> the hand-built analytic engine decides). The candidate keeps its net and, under
-    // DD_SOCCER_NEURAL_AUTHORITATIVE_LAMBDA>0, is the ONLY authoritative-neural side. This is
-    // the honest "authoritative neural net vs the analytic engine" measurement (the field's
-    // distinct genomes still give diverse analytic styles).
->>>>>>> theirs
     if std::env::var("SOCCER_EVAL_ANALYTIC_FIELD")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
@@ -335,25 +302,12 @@ fn main() {
 
     let mut runner_config = EngineMatchRunnerConfig::default();
     runner_config.base.duration_seconds = minutes * 60.0;
-<<<<<<< ours
-=======
-    // Keep the engine's designed independent-brain mode (actor_critic=false, default):
-    // each side is driven by its OWN per-team CRITIC — which is exactly what league play
-    // trains. (Setting actor_critic=true shares the policy_head/actor across teams and
-    // BLURS which brain is better, per the runner's own docs.) The eval is policy-sensitive
-    // through the per-team critic; comparisons must be between DIFFERENT-lineage nets.
->>>>>>> theirs
     let runner = EngineMatchRunner::new(runner_config);
 
     let started = Instant::now();
 
-<<<<<<< ours
     // Pre-build every fixture with the SAME sequential seeds/order as the old serial loop, so
     // parallel results are byte-identical (each match is independent + deterministic).
-=======
-    // Pre-build every fixture with the SAME sequential seeds/order as the old serial loop,
-    // so parallel results are byte-identical (each match is independent + deterministic).
->>>>>>> theirs
     struct Fixture {
         index: usize,
         opponent_idx: usize,
@@ -382,15 +336,9 @@ fn main() {
         }
     }
 
-<<<<<<< ours
     // Run fixtures on a bounded thread pool — each worker clones the runner and pulls the next
     // fixture off a shared atomic cursor. Capped low (default 3, override SOCCER_EVAL_PARALLELISM)
     // so we don't starve a co-running trainer.
-=======
-    // Run fixtures on a bounded thread pool — each worker clones the runner and pulls the
-    // next fixture off a shared atomic cursor. Capped low (default 3, override via
-    // SOCCER_EVAL_PARALLELISM) so we don't starve the on-policy trainer / co-train learner.
->>>>>>> theirs
     let workers = std::env::var("SOCCER_EVAL_PARALLELISM")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
@@ -434,7 +382,6 @@ fn main() {
                     Ok(report) => {
                         eprintln!(
                             "  holdout {}v{} seed=0x{:08X} -> {}-{}",
-<<<<<<< ours
                             report.home_id,
                             report.away_id,
                             fx.seed,
@@ -446,13 +393,6 @@ fn main() {
                     Err(e) => {
                         eprintln!("  fixture error (opp {}, g {}): {e}", fx.opponent_id, fx.g)
                     }
-=======
-                            report.home_id, report.away_id, fx.seed, report.home_goals, report.away_goals
-                        );
-                        collected.lock().unwrap().push((fx.index, report));
-                    }
-                    Err(e) => eprintln!("  fixture error (opp {}, g {}): {e}", fx.opponent_id, fx.g),
->>>>>>> theirs
                 }
             });
         }

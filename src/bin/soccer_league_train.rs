@@ -415,6 +415,47 @@ fn main() {
         runner_config.base.neural_learning.hidden_units,
     )
     .max(1);
+    // Critic-target window (un-crush A/B). The critic target is `(reward + gamma*max_next) /
+    // target_scale` clamped to +/-target_clip. With the defaults (30/3) the +/-200 win and +160
+    // goal terminal rewards BOTH saturate the +3 rail, so the value head cannot rank win vs goal
+    // vs a big win — the advantage baseline is blind above the rail. Raising `target_scale` (e.g.
+    // 120) drops those labels below the clip so terminal outcomes separate again; `target_clip`
+    // is exposed too for completeness. Unset ⇒ the config default (byte-identical).
+    runner_config.base.neural_learning.target_scale = env_f64(
+        "SOCCER_NEURAL_TARGET_SCALE",
+        runner_config.base.neural_learning.target_scale,
+    );
+    runner_config.base.neural_learning.target_clip = env_f64(
+        "SOCCER_NEURAL_TARGET_CLIP",
+        runner_config.base.neural_learning.target_clip,
+    );
+    eprintln!(
+        "[league] critic-target window: target_scale={} target_clip={} (raw-reward window +/-{}) popart={}",
+        runner_config.base.neural_learning.target_scale,
+        runner_config.base.neural_learning.target_clip,
+        runner_config.base.neural_learning.target_scale
+            * runner_config.base.neural_learning.target_clip,
+        runner_config.base.neural_learning.target_popart_enabled,
+    );
+    // Un-collapse the value head on fresh nets: honour SOCCER_NEURAL_TARGET_POPART here (the
+    // league bin otherwise leaves target-PopArt at the config default = off, unlike the
+    // learning-run bins). A collapsed value can't rank candidates, which would make the Part-B
+    // action-space A/B uninterpretable. Only takes effect on a FRESH net (same as hidden_units).
+    runner_config.base.neural_learning.target_popart_enabled = std::env::var(
+        "SOCCER_NEURAL_TARGET_POPART",
+    )
+    .ok()
+    .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
+    .unwrap_or(runner_config.base.neural_learning.target_popart_enabled);
+    // POLICY-IMPROVEMENT LEVER: opt the fresh net into the actor-critic path. When on, the neural
+    // ACTOR π(family|s) is trained by advantage policy-gradient and biases action selection on top
+    // of the value blend — the "close the policy-improvement loop" escape from value-imitation
+    // parity (policy gradient optimizes RETURN directly, not tabular-matching). Pair with a lower
+    // DD_SOCCER_NEURAL_AUTHORITATIVE_LAMBDA (more actor influence) + SOCCER_POLICY_ENTROPY_COEFF
+    // (keep exploring) so the actor can actually leave the analytic mode. Off ⇒ current behaviour.
+    if let Ok(raw) = std::env::var("SOCCER_NEURAL_ACTOR_CRITIC") {
+        runner_config.base.neural_blend.actor_critic = matches!(raw.trim(), "1" | "true" | "TRUE" | "yes" | "on");
+    }
     // Keep the engine's designed independent-brain mode (per-team critic drives each side).
     let runner = EngineMatchRunner::new(runner_config);
 
