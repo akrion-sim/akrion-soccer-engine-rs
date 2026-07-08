@@ -593,6 +593,16 @@ didn't actually apply `DD_SOCCER_ENABLE_NEURAL_PASS_SPACE`, or the eval decision
 the training MCTS expansion — worth a targeted eval-path diag before trusting "inert". Instrumentation
 is gated (`DD_SOCCER_DUMP_PASS_SPACE_DIAG`), byte-identical off; left in place.
 
+**AUTO-QUEUED: clean spatial falsification** (`/tmp/spatial_ab_launch.sh`, fires when Track B trains
+finish so it overlaps Track B's eval without oversubscribing). Codex round-15 hygiene spec exactly:
+baseline = CONFIRMED base (`chance_quality=1 scale30 clip15 popart`), treatment = base +
+`NEURAL_PASS_SPACE=1 SCORED_SHOT_PLACEMENT=1`, 160 train / 220 held-out, fresh seeds
+(train F1A10000 / eval F7A10000, avoiding the E-series optimism). Built binary
+`/tmp/passdiag-target` (current source, all gates, byte-identical off). **Pre-registered PASS = mean
+payoff > 0.5 vs same base AND GD > 0; miss either → kill spatial, no rescue.** Pass-space emission
+already proven (99.5%); scored-placement emission not yet independently verified — caveat noted.
+Artifacts `/tmp/gate-ab-spatial/`.
+
 ## One-line summary
 
 The ceiling is structural: the net is a *selector over analytic candidates* optimizing
