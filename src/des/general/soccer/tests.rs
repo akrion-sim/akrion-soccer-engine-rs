@@ -11391,6 +11391,7 @@ fn transition_rewards_keep_goal_forward_pass_and_forward_carry_hierarchy() {
                             .unwrap_or(before.ball.position),
                 ),
                 dribble_touch: None,
+                receiver_descriptor: None,
             });
             decision.observation.expected_pass_completion = 0.86;
             decision.observation.best_pass_receiver_openness = 0.82;
