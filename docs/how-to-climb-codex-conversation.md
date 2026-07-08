@@ -533,6 +533,35 @@ to avoid core oversubscription with the live protected learner; not yet evaluate
 0.417–0.500); still not clearing >0.5. Both spatial-target and forward-pass primacy are **unproven,
 not falsified.** Locked plan: run spatial falsification first, forward-pass second, combo last.
 
+## COORDINATION + 0.600 PUSH (2026-07-08 ~20:45Z, maca5 / this Claude)
+
+**Running now (mine, `nice`-priority, won't starve un-niced training or the live learner):**
+- **Track B — the 0.546→0.600 push:** `run_gate_ab` recipe, confirmed reward+window stack
+  (`DD_SOCCER_ENABLE_CHANCE_QUALITY_REWARD=1 SOCCER_NEURAL_TARGET_SCALE=30
+  SOCCER_NEURAL_TARGET_CLIP=15 SOCCER_NEURAL_TARGET_POPART=true`), **320 train / 320 eval** (double
+  cycle-2's 160). Rationale: payoff rose 0.546→0.559 as training doubled 80→160, so more training
+  is the lever. Artifacts `/tmp/gate-ab-rwbig/`, verdict → `verdict.log`.
+- **Track A — confirm the existing climb:** 200-game eval (2×100 sharded, disjoint seeds) of the
+  confirmed cycle-2 nets to Wilson-lock the 0.559 result. Artifacts `/tmp/gate-ab-rwbig/shards/`.
+- Using the **prebuilt** `/tmp/climb-target/release/soccer_outcome_ab_run` (08:56) because the
+  source tree didn't compile — see next.
+
+**FIXED the compile break** (blocked ALL source rebuilds): `MpcObjectiveSample` gained a 3rd dim
+`applied_bend` everywhere except its consumer at `world.rs:32445` — that site destructured the
+2-tuple `(features, residual)` but the payload is now the 3-tuple `(features, residual, bend)`
+(`world.rs:25758`/`26432`) and built the sample without `applied_bend`. Captured + stored the bend;
+`cargo check` clean. Uncommitted (leaving the commit call to the driving operator).
+
+**Live learner status (FYI, pre-existing, NOT mine):** `soccer-learn-local` is *learning* fine
+(heads train, `policy_evolved best_fitness=1.0158`) but every cycle ends
+`soccer learning run failed: prune soccer completed-run deltas: db error` → `local_cycle_failed
+status=1`. It's a **Postgres teardown/prune error**, not compile/resource. Whoever owns the DB
+should look — the learning work completes; only the prune step dies.
+
+**Core budget:** load ~10/16, headroom exists; other operator's `newmain league_train` (95653) is
+itself `nice 13` (~1 core, healthy). No experiment duplication — different levers. Ask: please
+don't launch a competing reward+window run; this push owns that lever tonight.
+
 ## One-line summary
 
 The ceiling is structural: the net is a *selector over analytic candidates* optimizing
