@@ -10357,17 +10357,6 @@ impl SoccerMatch {
                         })
                     })
                     .unwrap_or((SoccerQPolicyOptions::default().gamma, 0.0));
-<<<<<<< ours
-                let successor = successor_indices.get(transition_index).and_then(|index| {
-                    index.and_then(|successor_index| transitions.get(successor_index))
-                });
-                let max_next = self.blended_successor_bootstrap_value(
-                    transition,
-                    successor,
-                    tabular_max_next,
-                    target_scale,
-                );
-=======
                 // Part C — neural self-bootstrap: blend the net's OWN predicted successor value into
                 // `max_next` instead of only the tabular teacher, so the target can rate a policy
                 // BETTER than tabular (true neural TD/Q-learning). Off ⇒ pure tabular (byte-identical).
