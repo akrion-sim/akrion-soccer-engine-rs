@@ -217,6 +217,38 @@ impl SoccerMpcObjectiveHead {
         })
     }
 
+    /// Greedy signed bend (yards) for the captured features, or `None` when the head is not
+    /// bend-enabled or on malformed input. Positive/negative = curl side; `|value|` = lateral yards
+    /// the flight bows off the straight chord. The caller maps this to the kick's curve direction +
+    /// `curve_bend_yards`, which the existing lowering turns into `curl_acceleration`.
+    pub fn predict_bend(&self, features: &[f32]) -> Option<f64> {
+        if !self.bend_enabled || features.len() != MPC_OBJECTIVE_FEATURE_DIM {
+            return None;
+        }
+        let input: Vec<f64> = features.iter().map(|&v| f64::from(v)).collect();
+        let out = self.network.predict(&input);
+        let bend = *out.get(2)?;
+        if !bend.is_finite() {
+            return None;
+        }
+        Some(bend.clamp(-1.0, 1.0) * MPC_OBJECTIVE_MAX_BEND_YARDS)
+    }
+
+    /// Exploration wrapper around [`predict_bend`] — one standard-normal draw from the match RNG,
+    /// scaled by `sigma_yards`, re-clamped to the hard bend bound. Capture the RETURNED bend as the
+    /// RWR `applied_bend`. `None` when the head is not bend-enabled or on malformed input; non-finite
+    /// noise falls back to the greedy bend (never a NaN target).
+    pub fn explore_bend(&self, features: &[f32], sigma_yards: f64, noise: f64) -> Option<f64> {
+        let base = self.predict_bend(features)?;
+        let sigma = if sigma_yards.is_finite() {
+            sigma_yards.max(0.0)
+        } else {
+            0.0
+        };
+        let jitter = if noise.is_finite() { noise * sigma } else { 0.0 };
+        Some((base + jitter).clamp(-MPC_OBJECTIVE_MAX_BEND_YARDS, MPC_OBJECTIVE_MAX_BEND_YARDS))
+    }
+
     /// Reward-weighted regression: nudge the head toward residuals that earned positive advantage,
     /// with the learning rate scaled by a squashed advantage (a contextual bandit, not full policy
     /// gradient — lower variance, harder to destabilize). Returns the number of steps applied.
