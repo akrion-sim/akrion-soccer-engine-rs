@@ -281,9 +281,16 @@ pub struct SupportMoveSample {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PendingSupportDecision {
     pub team: Team,
+    /// The off-ball player who made this move decision. Used to credit their OWN outcome events at
+    /// full strength (teammates' at a discount) when `DD_SOCCER_ENABLE_SUPPORT_OUTCOME_REWARD` is on.
+    pub player_id: usize,
     pub features: SupportCandidateFeatures,
     pub decision_territorial: f64,
     pub due_tick: u64,
+    /// Running sum of normalized, mover-/team-weighted outcome-event contributions observed inside
+    /// this decision's reward window. Stays 0.0 (and unused) unless the outcome-reward seam is on,
+    /// preserving byte-identical samples in the default configuration.
+    pub outcome_accumulator: f64,
 }
 
 /// How often (ticks) an off-ball support move is sampled for RL while the scorer is on.
