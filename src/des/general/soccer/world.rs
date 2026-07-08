@@ -14316,8 +14316,12 @@ impl SoccerMatch {
         self.full_game_learning_applied = true;
         // Terminal won-game reward (the "long" rung): label every transition with the
         // realised result when the gate is on. Off ⇒ `None`, byte-identical replay.
-        let match_outcome = match_outcome_reward_enabled()
-            .then(|| MatchOutcomeReward::from_score(self.score_home, self.score_away));
+        let match_outcome = match_outcome_reward_enabled().then(|| {
+            MatchOutcomeReward::from_score(self.score_home, self.score_away).with_chance_quality(
+                self.stats.shots_on_target_home,
+                self.stats.shots_on_target_away,
+            )
+        });
         let replay =
             soccer_full_game_replay_transitions(&self.episode_learning_transitions, match_outcome);
         self.full_game_learning_replay_transitions = replay.len();
