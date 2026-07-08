@@ -18,6 +18,7 @@ use crate::des::general::soccer::{
     MatchConfig, MatchSummary, SoccerConfigMomentInsert, SoccerMatch, SoccerNeuralBlendConfig,
     SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot, SoccerPassOutcomeSample, SoccerQEntry,
     SoccerQPolicy, SoccerQPolicyOptions, SoccerQStateKey, SoccerQTargetEntry,
+    RECEIVER_DESCRIPTOR_UNSPECIFIED,
     SoccerSelfPlayEpisodeSummary, SoccerSelfPlayTrainingArtifact, SoccerTacticalLearningSummary,
     SoccerTacticalLearningWeights, SoccerTeamQPolicies, Team, DEFAULT_FIELD_LENGTH_YARDS,
     DEFAULT_FIELD_WIDTH_YARDS, MAX_SOCCER_NEURAL_LEARNING_RATE,
