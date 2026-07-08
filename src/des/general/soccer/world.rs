@@ -10449,6 +10449,8 @@ fn soccer_standardize_actor_policy_sample_advantages(samples: &mut [SoccerPolicy
         .map(|sample| sample.sanitized_weight() > 1.0 + 1e-9 && sample.advantage > 0.0)
         .collect();
     if let Some((mean, std)) = policy_advantage_standardization(&advantages) {
+        // Std-only mode zeroes the subtracted mean so the win/loss common-mode survives.
+        let mean = if dd_soccer_advantage_std_only() { 0.0 } else { mean };
         for (sample, keep_positive) in samples.iter_mut().zip(positive_priority_floors.into_iter())
         {
             sample.advantage = (sample.advantage - mean) / (std + 1e-8);
@@ -11028,9 +11030,18 @@ impl SoccerMatch {
                 let decision = self.pending_support_decisions.swap_remove(i);
                 let now_territorial = territorial_advantage(snapshot, decision.team);
                 if now_territorial.is_finite() && decision.decision_territorial.is_finite() {
+                    let territorial_delta = now_territorial - decision.decision_territorial;
+                    // Dense territorial base + (opt-in) discrete-outcome shaping accumulated over
+                    // the window. Off ⇒ accumulator is 0 and the term vanishes ⇒ byte-identical.
+                    let reward = if support_outcome_reward_enabled() {
+                        territorial_delta
+                            + support_outcome_reward_weight() * decision.outcome_accumulator
+                    } else {
+                        territorial_delta
+                    };
                     self.support_move_samples.push(SupportMoveSample {
                         features: decision.features,
-                        reward: now_territorial - decision.decision_territorial,
+                        reward,
                     });
                     if self.support_move_samples.len() > SUPPORT_MOVE_SAMPLE_CAP {
                         let overflow = self.support_move_samples.len() - SUPPORT_MOVE_SAMPLE_CAP;
@@ -11062,10 +11073,64 @@ impl SoccerMatch {
             };
             self.pending_support_decisions.push(PendingSupportDecision {
                 team,
+                player_id: player.id,
                 features,
                 decision_territorial: territorial,
                 due_tick: tick + SUPPORT_MOVE_REWARD_WINDOW_TICKS,
+                outcome_accumulator: 0.0,
             });
+        }
+    }
+
+    /// Fold this tick's discrete OUTCOME events (turnover / completed forward pass / shot-on-target
+    /// / goal) into every still-open support-move decision's window. Opt-in via
+    /// `DD_SOCCER_ENABLE_SUPPORT_OUTCOME_REWARD`; a no-op and byte-identical when off or when
+    /// nothing is pending. MUST be called AFTER all of a tick's reward emitters have run (turnovers
+    /// in particular are emitted late in the step), reading the finalized
+    /// `reward_events[reward_event_start..]` slice.
+    ///
+    /// Credit model (mover-weighted + team-discounted): a decision accrues its OWN player's outcome
+    /// events at full strength and its teammates' at [`SUPPORT_OUTCOME_TEAMMATE_DISCOUNT`]. Opponent
+    /// events are ignored — a move is trained from what ITS team's play led to, with the reward /
+    /// penalty sign already carried by [`support_outcome_event_weight`].
+    pub(crate) fn accumulate_support_outcome_rewards(
+        &mut self,
+        snapshot: &WorldSnapshot,
+        reward_event_start: usize,
+    ) {
+        if !support_outcome_reward_enabled() || self.pending_support_decisions.is_empty() {
+            return;
+        }
+        // Resolve each nonzero-weight event to (emitting player, its team, normalized weight) once,
+        // skipping the many zero-weight kinds so the common (no-outcome) tick stays cheap.
+        let mut contributions: Vec<(usize, Team, f64)> = Vec::new();
+        for event in &self.reward_events[reward_event_start..] {
+            let weight = support_outcome_event_weight(event.kind);
+            if weight == 0.0 {
+                continue;
+            }
+            if let Some(team) = snapshot
+                .players
+                .iter()
+                .find(|p| p.id == event.player_id)
+                .map(|p| p.team)
+            {
+                contributions.push((event.player_id, team, weight));
+            }
+        }
+        if contributions.is_empty() {
+            return;
+        }
+        for decision in self.pending_support_decisions.iter_mut() {
+            for &(event_player, event_team, weight) in &contributions {
+                decision.outcome_accumulator += support_outcome_decision_delta(
+                    decision.team,
+                    decision.player_id,
+                    event_team,
+                    event_player,
+                    weight,
+                );
+            }
         }
     }
 
@@ -17529,6 +17594,8 @@ impl SoccerMatch {
         if match_outcome_reward_enabled() {
             let advantages: Vec<f64> = samples.iter().map(|s| s.advantage).collect();
             if let Some((mean, std)) = policy_advantage_standardization(&advantages) {
+                // Std-only mode zeroes the subtracted mean so the win/loss common-mode survives.
+                let mean = if dd_soccer_advantage_std_only() { 0.0 } else { mean };
                 for sample in &mut samples {
                     sample.advantage = (sample.advantage - mean) / (std + 1e-8);
                 }
@@ -19487,6 +19554,10 @@ impl SoccerMatch {
                 self.record_match_result_rewards_at(tick_start_snapshot.tick);
             }
             learning_defense_elapsed += phase_started.elapsed();
+            // All of this tick's reward emitters have now run (turnovers included), so the
+            // finalized event slice can be folded into open support-move windows. Opt-in +
+            // byte-identical no-op unless `DD_SOCCER_ENABLE_SUPPORT_OUTCOME_REWARD` is set.
+            self.accumulate_support_outcome_rewards(&next_snapshot, reward_event_start);
             let tick_reward_events = &self.reward_events[reward_event_start..];
             let has_tick_reward_events = !tick_reward_events.is_empty();
             let has_significant_learning_event =
@@ -35516,6 +35587,34 @@ pub(crate) fn dd_soccer_enable_advantage_normalization() -> bool {
 /// step scale, preserving only the realised win-vs-loss contrast. Off ⇒ byte-identical.
 pub(crate) fn dd_soccer_standardize_policy_advantages() -> bool {
     dd_soccer_enable_advantage_normalization() || match_outcome_reward_enabled()
+}
+
+/// Std-only advantage normalization: divide by the batch std but DO NOT subtract the
+/// batch mean. Default-OFF (experimental climb fix). The standardization above removes
+/// the per-batch common-mode by subtracting the mean — the textbook PPO move, and
+/// correct when the critic already baselines each state. But with the match-outcome
+/// reward on, that common-mode IS the win/loss signal: every transition of a won game
+/// carries the same flat +win label, so the outcome shows up as a batch-level offset
+/// that the (currently clip-crushed) critic cannot yet baseline away. Subtracting the
+/// mean then strips the very win-vs-loss signal we added. With this on we keep the
+/// variance-reduction (÷ std) but preserve the outcome offset. Off ⇒ effective mean is
+/// the real mean ⇒ byte-identical. Read once per process. Pairs with un-crushing the
+/// value target (`DD_SOCCER_ENABLE_TARGET_STANDARDIZATION`): together the critic can
+/// represent the win magnitude and the actor keeps its gradient.
+pub(crate) fn dd_soccer_advantage_std_only() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_ENABLE_ADVANTAGE_STD_ONLY")
+            .map(|raw| {
+                let raw = raw.trim();
+                raw == "1"
+                    || raw.eq_ignore_ascii_case("true")
+                    || raw.eq_ignore_ascii_case("yes")
+                    || raw.eq_ignore_ascii_case("on")
+            })
+            .unwrap_or(false)
+    })
 }
 
 /// `(mean, std)` to standardize a policy batch's advantages by, or `None` for a
