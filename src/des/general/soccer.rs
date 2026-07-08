@@ -19696,6 +19696,12 @@ pub(crate) struct PendingPass {
     /// label, so the model learns "from THIS whole-field configuration, does THIS pass complete?".
     /// Empty ⇒ not captured (no learning sample emitted).
     learn_features: Vec<f32>,
+    /// Captured AT LAUNCH for the learned MPC execution-objective head: the
+    /// [`MPC_OBJECTIVE_FEATURE_DIM`] feature vector and the bounded aim/lead RESIDUAL that was
+    /// actually applied to this pass's analytic lead target (the "action" for RWR). When the pass
+    /// resolves it is emitted as an [`MpcObjectiveSample`] whose reward is the delayed
+    /// completion/progression advantage. `None` ⇒ the head was off/absent at launch (no sample).
+    mpc_objective: Option<(Vec<f32>, Vec2)>,
 }
 
 /// A goal counts as assisted only when the setting-up completed pass landed within this many
