@@ -14244,13 +14244,20 @@ impl SoccerMatch {
                         );
                         let nominal_speed =
                             pass_speed_yps_from_power(0.68, flight, is_cross, &passer.skills);
-                        if let Some(space_point) = snapshot.anticipated_pass_reception_point(
+                        let space_point = snapshot.anticipated_pass_reception_point(
                             player_id,
                             target_player,
                             flight,
                             nominal_speed,
-                        ) {
-                            if space_point.distance(receiver_position) > 1.0 {
+                        );
+                        let distinct = space_point
+                            .map(|sp| sp.distance(receiver_position) > 1.0)
+                            .unwrap_or(false);
+                        if pass_space_diag_enabled() {
+                            record_pass_space_diag(space_point.is_some(), distinct);
+                        }
+                        if let Some(space_point) = space_point {
+                            if distinct {
                                 plans.push(SoccerLearnedPlan {
                                     action: base_action.clone(),
                                     target_player: Some(target_player),
