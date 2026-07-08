@@ -6118,7 +6118,7 @@ fn run_game(
             }
         }
         eprintln!(
-            "world_model_training episode={} enabled={} training_steps={} loss={:?} validation_loss={:?} planning_decisions={} neural_mcts_selection_rate={:.4} neural_mcts_discretized_kick_rate={:.4} neural_mcts_technical_action_rate={:.4} neural_mcts_discretized_kick_candidate_share={:.4} neural_mcts_root_discretized_kick_candidate_share={:.4} neural_mcts_discretized_kick_candidate_set_rate={:.4} neural_mcts_root_discretized_kick_candidate_set_rate={:.4} mpc_replan_rate={:.4} policy_priority_samples={} policy_priority_rate={:.4} policy_priority_mean_weight={:.3} neural_mcts_distillation_samples={} neural_mcts_distillation_rate={:.4} neural_mcts_distillation_mean_weight={:.3} policy_entropy={:.4} learning_transitions_captured={} learning_transitions_trained={} learning_nonzero_reward_transitions={} learning_reward_events={} learning_deferred_reward_drained={} learning_deferred_reward_backlog={}",
+            "world_model_training episode={} enabled={} training_steps={} loss={:?} validation_loss={:?} planning_decisions={} neural_mcts_selection_rate={:.4} neural_mcts_discretized_kick_rate={:.4} neural_mcts_technical_action_rate={:.4} neural_mcts_discretized_kick_candidate_share={:.4} neural_mcts_root_discretized_kick_candidate_share={:.4} neural_mcts_discretized_kick_candidate_set_rate={:.4} neural_mcts_root_discretized_kick_candidate_set_rate={:.4} mpc_replan_rate={:.4} mpc_replan_mpc_rate={:.4} mpc_replan_option_score_safety_rate={:.4} mpc_replan_neural_mcts_rate={:.4} mpc_replans={} mpc_replans_mpc={} mpc_replans_option_score_safety={} mpc_replans_neural_mcts={} policy_priority_samples={} policy_priority_rate={:.4} policy_priority_mean_weight={:.3} neural_mcts_distillation_samples={} neural_mcts_distillation_rate={:.4} neural_mcts_distillation_mean_weight={:.3} policy_entropy={:.4} learning_transitions_captured={} learning_transitions_trained={} learning_nonzero_reward_transitions={} learning_reward_events={} learning_deferred_reward_drained={} learning_deferred_reward_backlog={}",
             episode + 1,
             world_model_stats.enabled,
             world_model_stats.training_steps,
@@ -6133,6 +6133,13 @@ fn run_game(
             planning_stats.neural_mcts_discretized_kick_candidate_set_rate,
             planning_stats.neural_mcts_root_discretized_kick_candidate_set_rate,
             planning_stats.learned_mpc_replan_rate,
+            planning_stats.learned_mpc_replan_mpc_rate,
+            planning_stats.learned_mpc_replan_option_score_safety_rate,
+            planning_stats.learned_mpc_replan_neural_mcts_rate,
+            planning_stats.learned_mpc_replans,
+            planning_stats.learned_mpc_replans_mpc,
+            planning_stats.learned_mpc_replans_option_score_safety,
+            planning_stats.learned_mpc_replans_neural_mcts,
             planning_stats.policy_priority_samples,
             planning_stats.policy_priority_sample_rate,
             planning_stats.mean_policy_priority_weight,
