@@ -316,6 +316,50 @@ struct RoundGoalkeeperDribblePlan {
     sprint: bool,
 }
 
+pub(crate) fn possession_ranked_pass_target_for(
+    rank: usize,
+    pass_targets: &[usize],
+    strategic_pass_targets: &[usize],
+    quick_forward_pass_target: Option<usize>,
+) -> Option<usize> {
+    let ranked_target = *pass_targets.get(rank)?;
+    if rank == 0 {
+        if let Some(target) =
+            quick_forward_pass_target.filter(|id| strategic_pass_targets.contains(id))
+        {
+            return Some(target);
+        }
+    }
+    Some(ranked_target)
+}
+
+pub(crate) fn possession_curriculum_forward_pass_target_for(
+    snapshot: &WorldSnapshot,
+    passer_id: usize,
+    strategic_pass_targets: &[usize],
+) -> Option<usize> {
+    let passer = snapshot.players.get(passer_id)?;
+    let mut best: Option<(usize, f64)> = None;
+    for target_id in strategic_pass_targets.iter().copied() {
+        let Some(receiver) = snapshot.players.get(target_id) else {
+            continue;
+        };
+        if receiver.team != passer.team {
+            continue;
+        }
+        let delta = receiver.position - passer.position;
+        let forward_yards = delta.y * passer.team.attack_dir();
+        if forward_yards < COMPLETED_FORWARD_PASS_COUNT_MIN_YARDS {
+            continue;
+        }
+        let score = forward_yards - delta.x.abs() * 0.08;
+        if best.is_none_or(|(_, best_score)| score > best_score) {
+            best = Some((target_id, score));
+        }
+    }
+    best.map(|(target_id, _)| target_id)
+}
+
 fn open_pass_lane_touch_for_target(
     team: Team,
     origin: Vec2,
@@ -6432,6 +6476,34 @@ impl PlayerAgent {
                 scale_legal_option_score(&mut options, "dribble", dribble_damp);
             }
         }
+        if forward_pass_climb_curriculum_enabled()
+            && pass_target_count > 0
+            && observation.visible_forward_pass_options > 0
+        {
+            let forward_quality = observation
+                .best_forward_pass_option_quality
+                .max(observation.best_forward_pass_receiver_openness)
+                .max(observation.quick_forward_pass_value)
+                .max(observation.expected_pass_completion * 0.72)
+                .clamp(0.0, 1.0);
+            let pass_floor = (0.76 + forward_quality * 0.20).clamp(0.76, 0.98);
+            ensure_min_legal_option_probability(&mut options, "pass1", pass_floor);
+            for label in ["shoot", "route-one", "recycle-reset", "switch-play"] {
+                scale_legal_option_score(&mut options, label, 0.32);
+            }
+            for label in [
+                "dribble",
+                "carry-forward",
+                "vertical-attack",
+                "carry-out-left",
+                "carry-out-right",
+                "protect-ball",
+                "hold-up-flank",
+                "side-step",
+            ] {
+                scale_legal_option_score(&mut options, label, 0.58);
+            }
+        }
         // Isolated attacking carrier (gated `DD_SOCCER_ENABLE_ISOLATED_CARRIER_DRIVE`; OFF ⇒
         // no-op, byte-identical). When a Forward / winger has the ball in the attacking half with
         // NO teammate ahead and no open forward pass, he used to deliberate into a panicked
@@ -10234,6 +10306,15 @@ impl PlayerAgent {
         if has_ball {
             let pass_targets = snapshot.ranked_visible_pass_targets(self.id, 3);
             let strategic_pass_targets = snapshot.ranked_visible_pass_targets(self.id, 11);
+            let curriculum_forward_pass_target = if forward_pass_climb_curriculum_enabled() {
+                possession_curriculum_forward_pass_target_for(
+                    snapshot,
+                    self.id,
+                    &strategic_pass_targets,
+                )
+            } else {
+                None
+            };
             let aerial_pass_targets = snapshot.ranked_visible_aerial_pass_targets(self.id, 3);
             let hold_up_flank_target = snapshot.attacking_hold_up_flank_target_for(self.id);
             let mut action_options = self.possession_action_options(
@@ -11546,9 +11627,17 @@ impl PlayerAgent {
                             .ok()
                             .and_then(|n| n.checked_sub(1))
                             .unwrap_or(0);
-                        if rank >= pass_targets.len() {
+                        let Some(target) = possession_ranked_pass_target_for(
+                            rank,
+                            &pass_targets,
+                            &strategic_pass_targets,
+                            observation
+                                .quick_forward_pass_target
+                                .filter(|id| strategic_pass_targets.contains(id))
+                                .or(curriculum_forward_pass_target),
+                        ) else {
                             continue;
-                        }
+                        };
                         order_names.push(format!("pass{}", rank + 1));
                         let pass_chance = action_option_score(&action_options, pass_label);
                         if agentic_action_commitment(
@@ -11557,18 +11646,6 @@ impl PlayerAgent {
                             &observation,
                             self.role,
                         ) {
-                            // The primary pass adopts the quick forward (5-15 yd, open, advanced)
-                            // teammate when one qualifies, so the floored "pass sooner" release
-                            // actually goes forward to feet. None when the gate is off ⇒ the
-                            // ranked target is used unchanged.
-                            let target = if rank == 0 {
-                                observation
-                                    .quick_forward_pass_target
-                                    .filter(|id| pass_targets.contains(id))
-                                    .unwrap_or(pass_targets[rank])
-                            } else {
-                                pass_targets[rank]
-                            };
                             chosen = Some((
                                 SoccerAction::Pass {
                                     target_player: Some(target),

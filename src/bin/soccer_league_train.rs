@@ -8,8 +8,8 @@
 //! gradient steps, the frozen side just plays its net). It carries the trained brain forward,
 //! applies WEIGHT DECAY each round (stops the l2-norm inflation that saturates activations and
 //! kills gradients — likely a direct cause of the plateau), snapshots temporal checkpoints into
-//! the league for growing diversity, and writes the frontier back into the compact
-//! learned-params.json the rest of the local stack (:5055, champion-gate, eval) already reads.
+//! the league for growing diversity, and publishes the compact learned-params.json that the
+//! local stack (:5055, champion-gate, eval) reads only after the checkpoint gate accepts it.
 //! NO genetic algorithm, NO RDS.
 //!
 //! Env: SOCCER_LEAGUE_FRONTIER (path, default /tmp/neural-climb-local/learned-params.json)
@@ -32,7 +32,6 @@ use soccer_engine::des::general::tournament::{
     EngineMatchRunner, EngineMatchRunnerConfig, TeamBrain, TournamentMatchContext,
     TournamentMatchRunner, TournamentStage,
 };
-
 fn env_str(k: &str, d: &str) -> String {
     std::env::var(k).unwrap_or_else(|_| d.to_string())
 }
@@ -53,6 +52,12 @@ fn env_bool(k: &str, d: bool) -> bool {
         .ok()
         .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
         .unwrap_or(d)
+}
+
+fn apply_league_neural_mcts_config(config: &mut EngineMatchRunnerConfig) -> bool {
+    let enabled = env_bool("SOCCER_LEAGUE_NEURAL_MCTS_ENABLED", false);
+    config.base.neural_blend.mcts_enabled = enabled;
+    enabled
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -501,6 +506,24 @@ fn write_frontier(path: &str, brain: &TeamBrain) -> std::io::Result<()> {
     Ok(())
 }
 
+fn candidate_frontier_path(frontier_path: &str) -> String {
+    let path = Path::new(frontier_path);
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("learned-params");
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .filter(|extension| !extension.is_empty())
+        .map(|extension| format!(".{extension}"))
+        .unwrap_or_default();
+    path.with_file_name(format!("{stem}.candidate{extension}"))
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Load the frozen champion league from the archive dir (each is a learned-params.json).
 fn load_league(dir: &str) -> Vec<TeamBrain> {
     let mut out = Vec::new();
@@ -575,10 +598,61 @@ fn play_and_carry(
     }
 }
 
+fn play_checkpoint_validation(
+    runner: &EngineMatchRunner,
+    candidate: &TeamBrain,
+    baseline: &TeamBrain,
+    round: u32,
+    games: usize,
+) -> LeagueRoundKpis {
+    let mut validation = LeagueRoundKpis::default();
+    let mut runner = runner.clone();
+    for g in 0..games {
+        let candidate_home = g % 2 == 0;
+        let seed = 0xC1A0_0000u32
+            .wrapping_add(round.wrapping_mul(1_000_003))
+            .wrapping_add((g as u32).wrapping_mul(2_246_822_519));
+        let (home_id, away_id, home, away, candidate_team) = if candidate_home {
+            (0usize, 1usize, candidate, baseline, Team::Home)
+        } else {
+            (1usize, 0usize, baseline, candidate, Team::Away)
+        };
+        let ctx = TournamentMatchContext {
+            stage: TournamentStage::Group,
+            round_index: round as usize,
+            match_index: g,
+            seed,
+            home_id,
+            away_id,
+            home_name: format!("team{home_id}"),
+            away_name: format!("team{away_id}"),
+            home_learns: false,
+            away_learns: false,
+        };
+        match runner.play(&ctx, home, away) {
+            Ok(outcome) => {
+                validation.add(LeagueMatchKpis::from_summary(
+                    &outcome.summary,
+                    candidate_team,
+                ));
+            }
+            Err(err) => {
+                eprintln!("league_checkpoint_validation_error round={round} game={g}: {err}");
+            }
+        }
+    }
+    validation
+}
+
 fn main() {
     let frontier_path = env_str(
         "SOCCER_LEAGUE_FRONTIER",
         "/tmp/neural-climb-local/learned-params.json",
+    );
+    let candidate_frontier_default = candidate_frontier_path(&frontier_path);
+    let candidate_frontier_path = env_str(
+        "SOCCER_LEAGUE_CANDIDATE_FRONTIER",
+        &candidate_frontier_default,
     );
     let archive_dir = env_str("SOCCER_LEAGUE_ARCHIVE", "/tmp/neural-climb-local/champions");
     let games_per_opp = env_usize("SOCCER_LEAGUE_GAMES_PER_OPP", 2).max(1);
@@ -593,6 +667,15 @@ fn main() {
         env_f64("SOCCER_LEAGUE_CHECKPOINT_MAX_FORWARD_PASS_REGRESSION", 0.0).max(0.0);
     let checkpoint_min_forward_pass_margin =
         env_f64("SOCCER_LEAGUE_CHECKPOINT_MIN_FORWARD_PASS_MARGIN", 0.0);
+    let checkpoint_validate_games = env_usize("SOCCER_LEAGUE_CHECKPOINT_VALIDATE_GAMES", 8);
+    let checkpoint_validate_min_forward_pass_margin = env_f64(
+        "SOCCER_LEAGUE_CHECKPOINT_VALIDATE_MIN_FORWARD_PASS_MARGIN",
+        0.0,
+    );
+    let checkpoint_validate_min_objective_margin = env_f64(
+        "SOCCER_LEAGUE_CHECKPOINT_VALIDATE_MIN_OBJECTIVE_MARGIN",
+        0.0,
+    );
 
     let mut runner_config = EngineMatchRunnerConfig::default();
     runner_config.base.duration_seconds = minutes * 60.0;
@@ -659,6 +742,12 @@ fn main() {
         runner_config.base.neural_blend.actor_critic =
             matches!(raw.trim(), "1" | "true" | "TRUE" | "yes" | "on");
     }
+    let league_neural_mcts_enabled = apply_league_neural_mcts_config(&mut runner_config);
+    let mpc_tier2_enabled = runner_config.base.mpc.tier2_player_enabled;
+    let mpc_reconcile_enabled = runner_config.base.mpc.reconcile_enabled;
+    let mpc_field_aware_enabled = runner_config.base.mpc.field_aware_enabled;
+    let mpc_latent_objective_enabled = runner_config.base.mpc.latent_objective_enabled;
+    let local_mpc_enabled = runner_config.base.local_mpc_enabled;
     // Keep the engine's designed independent-brain mode (per-team critic drives each side).
     let runner = EngineMatchRunner::new(runner_config);
 
@@ -687,13 +776,14 @@ fn main() {
     let mut round = 0u32;
     let mut best_checkpoint_forward_pass_margin = f64::NEG_INFINITY;
     println!(
-        "league_train_started_at_utc={} games/opp={} minutes={} weight_decay={} fresh_opp={} checkpoint_every={} max_target_entries_per_side={} advancement_metric=completed_forward_passes checkpoint_require_forward_pass_climb={} checkpoint_max_forward_pass_regression={} checkpoint_min_forward_pass_margin={} frontier={} archive={}",
-        chrono_now(), games_per_opp, minutes, weight_decay, fresh_opponents, checkpoint_every, max_target_entries_per_side, checkpoint_require_forward_pass_climb, checkpoint_max_forward_pass_regression, checkpoint_min_forward_pass_margin, frontier_path, archive_dir
+        "league_train_started_at_utc={} games/opp={} minutes={} weight_decay={} fresh_opp={} checkpoint_every={} max_target_entries_per_side={} advancement_metric=completed_forward_passes league_neural_mcts_enabled={} mpc_tier2_enabled={} mpc_reconcile_enabled={} mpc_field_aware_enabled={} mpc_latent_objective_enabled={} local_mpc_enabled={} checkpoint_require_forward_pass_climb={} checkpoint_max_forward_pass_regression={} checkpoint_min_forward_pass_margin={} checkpoint_validate_games={} checkpoint_validate_min_forward_pass_margin={} checkpoint_validate_min_objective_margin={} frontier={} candidate_frontier={} archive={}",
+        chrono_now(), games_per_opp, minutes, weight_decay, fresh_opponents, checkpoint_every, max_target_entries_per_side, league_neural_mcts_enabled, mpc_tier2_enabled, mpc_reconcile_enabled, mpc_field_aware_enabled, mpc_latent_objective_enabled, local_mpc_enabled, checkpoint_require_forward_pass_climb, checkpoint_max_forward_pass_regression, checkpoint_min_forward_pass_margin, checkpoint_validate_games, checkpoint_validate_min_forward_pass_margin, checkpoint_validate_min_objective_margin, frontier_path, candidate_frontier_path, archive_dir
     );
 
     loop {
         round += 1;
         let started = Instant::now();
+        let checkpoint_baseline = frontier.clone();
 
         // Build this round's opponent league: frozen champions + fresh (exploration).
         let mut opponents: Vec<TeamBrain> = load_league(&archive_dir);
@@ -870,15 +960,16 @@ fn main() {
             }
         }
 
-        // Persist the frontier for :5055 / eval / champion-gate.
+        // Persist the candidate every round, but keep learned-params.json protected until the
+        // checkpoint gate accepts the candidate.
         let (l2, steps) = frontier
             .neural
             .as_ref()
             .map(|s| (s.l2_norm, s.training_steps))
             .unwrap_or((0.0, 0));
         if frontier.neural.is_some() {
-            if let Err(e) = write_frontier(&frontier_path, &frontier) {
-                eprintln!("league_write_error: {e}");
+            if let Err(e) = write_frontier(&candidate_frontier_path, &frontier) {
+                eprintln!("league_candidate_write_error: {e}");
             }
         }
 
@@ -934,7 +1025,38 @@ fn main() {
                         >= prior_best;
                 let passes_forward_pass_floor =
                     mean_forward_pass_margin > checkpoint_min_forward_pass_margin;
-                if passes_forward_pass_climb && passes_forward_pass_floor {
+                let validation = if checkpoint_validate_games > 0 {
+                    let validation = play_checkpoint_validation(
+                        &runner,
+                        &frontier,
+                        &checkpoint_baseline,
+                        round,
+                        checkpoint_validate_games,
+                    );
+                    println!(
+                        "league_checkpoint_validation round={round} games={} forward_pass_margin_per_game={:.3} objective_margin={:.3} gd_total={} shots_after_pass={} completed_passes={} pass_gain_yards={:.1}",
+                        validation.games,
+                        validation.mean_forward_pass_margin(),
+                        validation.mean_objective_fitness_margin(),
+                        validation.goal_diff,
+                        validation.shots_after_pass_for,
+                        validation.passes_completed_for,
+                        validation.pass_chain_gain_yards_for,
+                    );
+                    Some(validation)
+                } else {
+                    None
+                };
+                let passes_validation = match validation.as_ref() {
+                    Some(validation) => {
+                        validation.mean_forward_pass_margin()
+                            > checkpoint_validate_min_forward_pass_margin
+                            && validation.mean_objective_fitness_margin()
+                                > checkpoint_validate_min_objective_margin
+                    }
+                    None => true,
+                };
+                if passes_forward_pass_climb && passes_forward_pass_floor && passes_validation {
                     let cp = format!(
                         "{}/league-r{:04}-{}.json",
                         archive_dir.trim_end_matches('/'),
@@ -943,6 +1065,9 @@ fn main() {
                     );
                     let _ = fs::create_dir_all(&archive_dir);
                     let _ = write_frontier(&cp, &frontier);
+                    if let Err(e) = write_frontier(&frontier_path, &frontier) {
+                        eprintln!("league_publish_write_error: {e}");
+                    }
                     if mean_forward_pass_margin > best_checkpoint_forward_pass_margin {
                         best_checkpoint_forward_pass_margin = mean_forward_pass_margin;
                     }
@@ -951,7 +1076,7 @@ fn main() {
                     );
                 } else {
                     println!(
-                        "league_checkpoint_held round={round} metric=completed_forward_passes forward_pass_margin_per_game={mean_forward_pass_margin:.3} best_forward_pass_margin_per_game={prior_best:.3} require_climb={} min_margin={checkpoint_min_forward_pass_margin:.3}",
+                        "league_checkpoint_held round={round} metric=completed_forward_passes forward_pass_margin_per_game={mean_forward_pass_margin:.3} best_forward_pass_margin_per_game={prior_best:.3} require_climb={} min_margin={checkpoint_min_forward_pass_margin:.3} validation_passed={passes_validation}",
                         checkpoint_require_forward_pass_climb
                     );
                 }
@@ -989,6 +1114,40 @@ fn chrono_stamp() -> String {
 mod tests {
     use super::*;
     use soccer_engine::des::general::soccer::MatchStats;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn clear(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+
+        fn set(key: &'static str, value: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(previous) => std::env::set_var(self.key, previous),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     #[test]
     fn league_advancement_objective_uses_forward_passes_not_score_or_shots() {
@@ -1017,5 +1176,58 @@ mod tests {
         assert_eq!(away.objective_fitness, 5.0);
         assert_eq!(away.objective_fitness_margin, -9.0);
         assert_eq!(away.forward_pass_margin, -9);
+    }
+
+    #[test]
+    fn league_trainer_neural_mcts_defaults_off_for_mdp_pomdp_mpc_learning() {
+        let _lock = env_lock().lock().unwrap();
+        let _guard = EnvVarGuard::clear("SOCCER_LEAGUE_NEURAL_MCTS_ENABLED");
+        let mut config = EngineMatchRunnerConfig::default();
+        config.base.neural_blend.mcts_enabled = true;
+
+        let enabled = apply_league_neural_mcts_config(&mut config);
+
+        assert!(!enabled);
+        assert!(!config.base.neural_blend.mcts_enabled);
+    }
+
+    #[test]
+    fn league_trainer_keeps_mpc_execution_stack_enabled() {
+        let _lock = env_lock().lock().unwrap();
+        let _guard = EnvVarGuard::clear("SOCCER_LEAGUE_NEURAL_MCTS_ENABLED");
+        let mut config = EngineMatchRunnerConfig::default();
+
+        let enabled = apply_league_neural_mcts_config(&mut config);
+
+        assert!(!enabled);
+        assert!(config.base.local_mpc_enabled);
+        assert!(config.base.mpc.tier2_player_enabled);
+        assert!(config.base.mpc.reconcile_enabled);
+        assert!(config.base.mpc.field_aware_enabled);
+        assert!(config.base.mpc.latent_objective_enabled);
+    }
+
+    #[test]
+    fn candidate_frontier_path_keeps_public_frontier_protected() {
+        assert_eq!(
+            candidate_frontier_path("/tmp/run/learned-params.json"),
+            "/tmp/run/learned-params.candidate.json"
+        );
+        assert_eq!(
+            candidate_frontier_path("/tmp/run/frontier"),
+            "/tmp/run/frontier.candidate"
+        );
+    }
+
+    #[test]
+    fn league_trainer_neural_mcts_requires_explicit_league_opt_in() {
+        let _lock = env_lock().lock().unwrap();
+        let _guard = EnvVarGuard::set("SOCCER_LEAGUE_NEURAL_MCTS_ENABLED", "1");
+        let mut config = EngineMatchRunnerConfig::default();
+
+        let enabled = apply_league_neural_mcts_config(&mut config);
+
+        assert!(enabled);
+        assert!(config.base.neural_blend.mcts_enabled);
     }
 }

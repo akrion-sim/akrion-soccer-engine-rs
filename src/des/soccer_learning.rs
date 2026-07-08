@@ -2097,6 +2097,10 @@ pub fn soccer_learning_directional_objective_fitness(team: Team, summary: &Match
         chain_losses_for,
         chain_losses_against,
         route_one_for,
+        shots_after_pass_for,
+        shots_after_pass_against,
+        shots_on_target_for,
+        shots_on_target_against,
     ) = match team {
         Team::Home => (
             stats.passes_attempted_home,
@@ -2114,6 +2118,10 @@ pub fn soccer_learning_directional_objective_fitness(team: Team, summary: &Match
             stats.pass_chains_net_loss_home,
             stats.pass_chains_net_loss_away,
             stats.route_one_balls_home,
+            stats.shots_after_pass_home,
+            stats.shots_after_pass_away,
+            stats.shots_on_target_home,
+            stats.shots_on_target_away,
         ),
         Team::Away => (
             stats.passes_attempted_away,
@@ -2131,6 +2139,10 @@ pub fn soccer_learning_directional_objective_fitness(team: Team, summary: &Match
             stats.pass_chains_net_loss_away,
             stats.pass_chains_net_loss_home,
             stats.route_one_balls_away,
+            stats.shots_after_pass_away,
+            stats.shots_after_pass_home,
+            stats.shots_on_target_away,
+            stats.shots_on_target_home,
         ),
     };
     let forward_count_margin = soccer_learning_bounded_count(forward_completed_for, 42.0) * 4.0
@@ -2151,8 +2163,34 @@ pub fn soccer_learning_directional_objective_fitness(team: Team, summary: &Match
     let opponent_recycling_credit = soccer_learning_bounded_count(backward_completed_against, 18.0)
         * 0.18
         + soccer_learning_bounded_count(chain_losses_against, 10.0) * 0.22;
+    let forward_pressure_for = (soccer_learning_bounded_count(forward_completed_for, 24.0) * 0.35
+        + soccer_learning_bounded_metric(completed_pass_gain_yards_for, 110.0) * 0.30
+        + soccer_learning_bounded_metric(chain_gain_yards_for, 130.0) * 0.25
+        + productive_for * 0.10)
+        .clamp(0.0, 1.0);
+    let forward_pressure_against = (soccer_learning_bounded_count(forward_completed_against, 24.0)
+        * 0.35
+        + soccer_learning_bounded_metric(completed_pass_gain_yards_against, 110.0) * 0.30
+        + soccer_learning_bounded_metric(chain_gain_yards_against, 130.0) * 0.25
+        + productive_against * 0.10)
+        .clamp(0.0, 1.0);
+    let worked_chance_for =
+        soccer_learning_bounded_count(shots_after_pass_for, 6.0) * forward_pressure_for;
+    let worked_chance_against =
+        soccer_learning_bounded_count(shots_after_pass_against, 6.0) * forward_pressure_against;
+    let worked_sot_for =
+        soccer_learning_bounded_count(shots_on_target_for, 6.0) * worked_chance_for;
+    let worked_sot_against =
+        soccer_learning_bounded_count(shots_on_target_against, 6.0) * worked_chance_against;
+    let worked_chance_margin = worked_chance_for * 1.05 + worked_sot_for * 0.65
+        - worked_chance_against * 0.80
+        - worked_sot_against * 0.45;
 
-    (forward_count_margin + forward_yards_margin + chain_progress_margin + productive_margin
+    (forward_count_margin
+        + forward_yards_margin
+        + chain_progress_margin
+        + productive_margin
+        + worked_chance_margin
         - recycling_risk
         + opponent_recycling_credit)
         .clamp(
@@ -9073,6 +9111,20 @@ mod tests {
         assert!(
             progressive_objective > shot_farming_objective + 0.80,
             "completed forward advancement should beat shot farming: progressive={progressive_objective}, shot_farming={shot_farming_objective}"
+        );
+
+        let mut converted_stats = progressive.stats.clone();
+        converted_stats.shots_after_pass_home = 4;
+        converted_stats.shots_on_target_home = 3;
+        let converted = MatchSummary {
+            stats: converted_stats,
+            ..progressive.clone()
+        };
+        let converted_objective =
+            soccer_learning_directional_objective_fitness(Team::Home, &converted);
+        assert!(
+            converted_objective > progressive_objective + 0.60,
+            "worked chances should break sterile forward-pass parity: converted={converted_objective}, progressive={progressive_objective}"
         );
 
         let mut matched_stats = progressive.stats.clone();

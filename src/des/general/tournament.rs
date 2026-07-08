@@ -1471,6 +1471,15 @@ pub struct EngineMatchRunner {
     config: EngineMatchRunnerConfig,
 }
 
+fn engine_match_uniform_elite_players_enabled() -> bool {
+    std::env::var("SOCCER_ENGINE_UNIFORM_ELITE_PLAYERS")
+        .map(|raw| {
+            let value = raw.trim();
+            value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false)
+}
+
 impl EngineMatchRunner {
     pub fn new(config: EngineMatchRunnerConfig) -> Self {
         EngineMatchRunner { config }
@@ -1510,6 +1519,9 @@ impl TournamentMatchRunner for EngineMatchRunner {
             .map_err(|err| format!("failed to restore away target-Q: {err}"))?,
         };
         let mut sim = SoccerMatch::default_11v11(config).with_team_policies(team_policies);
+        if engine_match_uniform_elite_players_enabled() {
+            sim.set_uniform_elite_players();
+        }
 
         // Install each side's brain. `frozen = !learns` so a non-learning side
         // still plays its trained net but takes no gradient steps. Installing the
