@@ -8017,6 +8017,12 @@ pub struct AgentActionTargetTrace {
     pub facing: FacingBucket,
     #[serde(default)]
     pub dribble_touch: Option<DribbleTouchDecision>,
+    /// Encoded [`ReceiverDescriptor`] for a pass, so the learner can credit
+    /// `target_values[(state, action, grid, receiver_descriptor)]` per-receiver. Set at trace
+    /// time (where the snapshot is available) only when the learned-pass-receiver gate is on;
+    /// `None` otherwise ⇒ training folds in [`RECEIVER_DESCRIPTOR_UNSPECIFIED`] (parity).
+    #[serde(default)]
+    pub receiver_descriptor: Option<i32>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
