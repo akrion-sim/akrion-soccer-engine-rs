@@ -13770,8 +13770,39 @@ impl SoccerQPolicy {
         action: &str,
         grid: &PitchGridAddress,
     ) -> Option<f64> {
-        self.target_preference_for_grid_with_context(state, action, grid, false)
-            .or_else(|| self.target_preference_for_grid_with_context(state, action, grid, true))
+        self.target_preference_for_grid_filtered(state, action, grid, None)
+    }
+
+    /// As [`Self::target_preference_for_grid`] but restricted to keys whose stored receiver
+    /// descriptor equals `receiver_descriptor` — the learned-pass-receiver head's per-receiver
+    /// value. `None` matches any descriptor (grid-only legacy lookup, and the parity path).
+    fn target_preference_for_grid_and_receiver(
+        &self,
+        state: &SoccerQStateKey,
+        action: &str,
+        grid: &PitchGridAddress,
+        receiver_descriptor: i32,
+    ) -> Option<f64> {
+        self.target_preference_for_grid_filtered(state, action, grid, Some(receiver_descriptor))
+    }
+
+    fn target_preference_for_grid_filtered(
+        &self,
+        state: &SoccerQStateKey,
+        action: &str,
+        grid: &PitchGridAddress,
+        receiver_descriptor: Option<i32>,
+    ) -> Option<f64> {
+        self.target_preference_for_grid_with_context(state, action, grid, receiver_descriptor, false)
+            .or_else(|| {
+                self.target_preference_for_grid_with_context(
+                    state,
+                    action,
+                    grid,
+                    receiver_descriptor,
+                    true,
+                )
+            })
     }
 
     fn target_preference_for_grid_with_context(
@@ -13779,9 +13810,13 @@ impl SoccerQPolicy {
         state: &SoccerQStateKey,
         action: &str,
         grid: &PitchGridAddress,
+        receiver_descriptor: Option<i32>,
         relaxed: bool,
     ) -> Option<f64> {
         let action = normalize_soccer_action_label(action);
+        let descriptor_matches = |key: &SoccerQTargetKey| -> bool {
+            receiver_descriptor.map_or(true, |rd| key.receiver_descriptor == rd)
+        };
         let mut best: Option<(f64, u32)> = None;
         if relaxed {
             for source in Self::relaxed_query_keys(state) {
@@ -13796,7 +13831,10 @@ impl SoccerQPolicy {
                     let Some(key) = self.target_index_keys.get(*key_id) else {
                         continue;
                     };
-                    if key.action != action || !key.state.matches_relaxed_learning_context(state) {
+                    if key.action != action
+                        || !key.state.matches_relaxed_learning_context(state)
+                        || !descriptor_matches(key)
+                    {
                         continue;
                     }
                     update_best_target_preference(self, &mut best, key, grid);
@@ -13815,7 +13853,10 @@ impl SoccerQPolicy {
                     let Some(key) = self.target_index_keys.get(*key_id) else {
                         continue;
                     };
-                    if key.action != action || !key.state.matches_learning_context(state) {
+                    if key.action != action
+                        || !key.state.matches_learning_context(state)
+                        || !descriptor_matches(key)
+                    {
                         continue;
                     }
                     update_best_target_preference(self, &mut best, key, grid);
