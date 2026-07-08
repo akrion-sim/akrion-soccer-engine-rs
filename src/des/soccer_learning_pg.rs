@@ -3895,6 +3895,7 @@ fn insert_run_delta_batch_rows(
                 target_tactical_cell_id,
                 target_macro_cell_id,
                 target_root_cell_id,
+                receiver_descriptor,
                 before_value_micros,
                 after_value_micros,
                 value_delta_micros,
