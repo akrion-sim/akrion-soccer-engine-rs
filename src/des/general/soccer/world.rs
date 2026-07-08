@@ -67,8 +67,9 @@ const DRIBBLE_BEAT_LEARNING_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(2.0);
 const LEARNED_MPC_REJECTED_ACTION_PENALTY_POINTS: f64 = 2.5;
 const SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_SAMPLE_RATE: f64 = 1.0;
 const SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_ADVANTAGE_SCALE: f64 = 1.0;
-const SOCCER_OPTION_SCORE_SAFETY_ANALYTIC_OPPONENT_MAX_SAMPLE_RATE: f64 = 0.25;
-const SOCCER_OPTION_SCORE_SAFETY_ANALYTIC_OPPONENT_MAX_ADVANTAGE_SCALE: f64 = 0.50;
+const SOCCER_OPTION_SCORE_SAFETY_ANALYTIC_OPPONENT_MAX_SAMPLE_RATE: f64 = 0.05;
+const SOCCER_OPTION_SCORE_SAFETY_ANALYTIC_OPPONENT_MAX_ADVANTAGE_SCALE: f64 = 0.25;
+const SOCCER_OPTION_SCORE_SAFETY_ANALYTIC_OPPONENT_MAX_SAMPLE_WEIGHT: f64 = 1.25;
 const SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_SAMPLE_SALT: u64 = 0x4f50_5453_4146_4554;
 const NEURAL_DEFERRED_REWARD_DRAIN_PER_TICK: usize = 64;
 const NEURAL_DEFERRED_REWARD_DRAIN_PER_TICK_MAX: usize = 512;
@@ -4830,13 +4831,19 @@ mod tests {
 
         {
             let _analytic = set_test_env_var("SOCCER_LEARNING_ANALYTIC_OPPONENT", "1");
-            assert!((option_score_safety_counterexample_sample_rate() - 0.25).abs() < 1e-9);
-            assert!((option_score_safety_counterexample_advantage_scale() - 0.50).abs() < 1e-9);
+            assert!((option_score_safety_counterexample_sample_rate() - 0.05).abs() < 1e-9);
+            assert!((option_score_safety_counterexample_advantage_scale() - 0.25).abs() < 1e-9);
+            assert!(
+                (option_score_safety_counterexample_sample_weight(3.25) - 1.25).abs() < 1e-9
+            );
         }
 
         let _analytic = set_test_env_var("SOCCER_LEARNING_ANALYTIC_OPPONENT", "0");
         assert!((option_score_safety_counterexample_sample_rate() - 1.0).abs() < 1e-9);
         assert!((option_score_safety_counterexample_advantage_scale() - 1.0).abs() < 1e-9);
+        assert!(
+            (option_score_safety_counterexample_sample_weight(3.25) - 3.25).abs() < 1e-9
+        );
     }
 
     #[test]
@@ -8622,6 +8629,14 @@ fn option_score_safety_counterexample_advantage_scale() -> f64 {
         advantage_scale.min(SOCCER_OPTION_SCORE_SAFETY_ANALYTIC_OPPONENT_MAX_ADVANTAGE_SCALE)
     } else {
         advantage_scale
+    }
+}
+
+fn option_score_safety_counterexample_sample_weight(sample_weight: f64) -> f64 {
+    if soccer_learning_analytic_opponent_env_enabled() {
+        sample_weight.min(SOCCER_OPTION_SCORE_SAFETY_ANALYTIC_OPPONENT_MAX_SAMPLE_WEIGHT)
+    } else {
+        sample_weight
     }
 }
 
@@ -15139,7 +15154,11 @@ impl SoccerMatch {
                     soccer_actor_advantage_with_planner_distillation(transition, advantage);
                 let mcts_distillation =
                     soccer_actor_mcts_distillation_priority(transition, advantage);
-                let sample_weight = soccer_actor_priority_weight(transition, advantage);
+                let mut sample_weight = soccer_actor_priority_weight(transition, advantage);
+                if option_score_safety_counterexample {
+                    sample_weight =
+                        option_score_safety_counterexample_sample_weight(sample_weight);
+                }
                 let state_features = self.policy_state_features(transition);
                 let actor_probability = self
                     .policy_head
