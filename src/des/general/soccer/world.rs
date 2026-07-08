@@ -15776,6 +15776,8 @@ impl SoccerMatch {
             MatchOutcomeReward::from_score(self.score_home, self.score_away).with_chance_quality(
                 self.stats.shots_on_target_home,
                 self.stats.shots_on_target_away,
+                self.stats.shots_after_pass_home,
+                self.stats.shots_after_pass_away,
             )
         });
         let replay =
