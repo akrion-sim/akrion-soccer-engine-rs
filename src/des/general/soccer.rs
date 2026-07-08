@@ -13394,7 +13394,64 @@ impl SoccerQPolicy {
         flight: PassFlight,
         candidates: &[usize],
     ) -> Option<usize> {
-        let player = snapshot.players.iter().find(|p| p.id == player_id)?;
+        let scored = self.scored_pass_teammates_for_snapshot(
+            snapshot, player_id, action, flight, candidates,
+        );
+        let pick = |require_clean: bool| {
+            scored
+                .iter()
+                .filter(|entry| !require_clean || !entry.concedes)
+                .max_by(|a, b| {
+                    a.head_score
+                        .total_cmp(&b.head_score)
+                        .then_with(|| b.player_id.cmp(&a.player_id))
+                })
+                .map(|entry| entry.player_id)
+        };
+        // Only fall back to the least-bad conceded target when EVERY candidate concedes
+        // (genuinely no safe pass — the holder should usually be dribbling/holding/clearing then).
+        pick(true).or_else(|| pick(false))
+    }
+
+    /// The pass-receiver candidates scored by the head, ranked best-first with concede flags.
+    /// The learned-pass-receiver MPC-kickback loop walks this ranking, masking MPC-infeasible
+    /// receivers, so control stays with the head rather than a heuristic override. Clean (non-
+    /// conceding) options come first; conceding ones are appended last as a genuine-last-resort.
+    pub(crate) fn ranked_pass_teammates_for_snapshot(
+        &self,
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        action: &str,
+        flight: PassFlight,
+        candidates: &[usize],
+    ) -> Vec<RankedPassTeammate> {
+        let mut scored = self.scored_pass_teammates_for_snapshot(
+            snapshot, player_id, action, flight, candidates,
+        );
+        scored.sort_by(|a, b| {
+            a.concedes
+                .cmp(&b.concedes)
+                .then_with(|| b.head_score.total_cmp(&a.head_score))
+                .then_with(|| a.player_id.cmp(&b.player_id))
+        });
+        scored
+    }
+
+    /// Score each visible-teammate candidate for a pass. When the learned-pass-receiver head is
+    /// on, the learned per-(grid, receiver-descriptor) value DOMINATES and the completion/openness
+    /// heuristics only tie-break; when off, this reproduces the legacy heuristic blend exactly
+    /// (learned grid preference + weighted quality) so parity suites are byte-identical.
+    fn scored_pass_teammates_for_snapshot(
+        &self,
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        action: &str,
+        flight: PassFlight,
+        candidates: &[usize],
+    ) -> Vec<RankedPassTeammate> {
+        let Some(player) = snapshot.players.iter().find(|p| p.id == player_id) else {
+            return Vec::new();
+        };
         let player_position = snapshot
             .player_position(player_id)
             .unwrap_or(player.position);
@@ -13405,19 +13462,19 @@ impl SoccerQPolicy {
             player.role,
         );
         let action = normalize_soccer_action_label(action);
+        let learned_receiver_head = dd_soccer_enable_learned_pass_receiver();
         // Re-ranking the candidate pool here would otherwise silently bypass the ranker's
         // concede veto (it only DEMOTES a conceded target, never removes it — see
         // `ranked_pass_targets_filtered_full`), which is how a learned policy could still pick a
         // pass straight to an opponent or into a tightly-marked man. Flag each candidate and
         // refuse to commit to a (perceived) conceded one while any clean option remains.
-        let scored: Vec<(usize, f64, bool)> = candidates
+        candidates
             .iter()
             .filter_map(|candidate_id| {
                 let target = snapshot.players.iter().find(|p| p.id == *candidate_id)?;
                 let position = snapshot.player_position(*candidate_id)?;
                 let grid =
                     pitch_grid_address(position, snapshot.field_width, snapshot.field_length);
-                let learned_preference = self.target_preference_for_grid(&state, action, &grid);
                 let quality = pass_target_quality_for_snapshot(
                     snapshot,
                     player,
@@ -13426,35 +13483,48 @@ impl SoccerQPolicy {
                     position,
                     flight,
                 );
-                let learned_score = learned_preference.unwrap_or(0.0);
-                let learned_weight = if learned_preference.is_some() {
-                    1.0
-                } else {
-                    0.0
-                };
-                let score = learned_score * learned_weight
-                    + quality.expected_completion * 0.82
+                let heuristic = quality.expected_completion * 0.82
                     + quality.mpc_receipt_probability * 0.52
                     + quality.stride_fit * 0.22
                     + quality.receiver_openness * 0.20;
+                let head_score = if learned_receiver_head {
+                    // The head decides WHO: rank primarily by the learned per-receiver value;
+                    // heuristics only tie-break equal/unseen receivers.
+                    let receiver_descriptor = snapshot.pass_receiver_descriptor(
+                        player_id,
+                        ReceiverKind::Teammate,
+                        position,
+                        Some(target.role),
+                    );
+                    let learned = self.target_preference_for_grid_and_receiver(
+                        &state,
+                        action,
+                        &grid,
+                        receiver_descriptor,
+                    );
+                    match learned {
+                        Some(value) => value * LEARNED_RECEIVER_HEAD_DOMINANCE + heuristic,
+                        None => heuristic,
+                    }
+                } else {
+                    // Legacy heuristic blend: learned grid preference (weight 1.0 if any) + quality.
+                    let learned_preference = self.target_preference_for_grid(&state, action, &grid);
+                    let learned_score = learned_preference.unwrap_or(0.0);
+                    let learned_weight = if learned_preference.is_some() { 1.0 } else { 0.0 };
+                    learned_score * learned_weight + heuristic
+                };
                 let concedes = snapshot.pass_target_concedes_to_perceived_opponent(
                     player_id,
                     *candidate_id,
                     flight,
                 );
-                Some((*candidate_id, score, concedes))
+                Some(RankedPassTeammate {
+                    player_id: *candidate_id,
+                    head_score,
+                    concedes,
+                })
             })
-            .collect();
-        let pick = |require_clean: bool| {
-            scored
-                .iter()
-                .filter(|(_, _, concedes)| !require_clean || !*concedes)
-                .max_by(|a, b| a.1.total_cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
-                .map(|(candidate_id, _, _)| *candidate_id)
-        };
-        // Only fall back to the least-bad conceded target when EVERY candidate concedes
-        // (genuinely no safe pass — the holder should usually be dribbling/holding/clearing then).
-        pick(true).or_else(|| pick(false))
+            .collect()
     }
 
     fn best_action_filtered<F>(&self, state: &SoccerQStateKey, is_legal: F) -> Option<String>
