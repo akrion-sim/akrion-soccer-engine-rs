@@ -10402,7 +10402,6 @@ impl SoccerMatch {
                 } else {
                     tabular_max_next
                 };
->>>>>>> theirs
                 let (target, priority) = soccer_neural_target_and_priority(
                     adjusted_reward,
                     gamma,
