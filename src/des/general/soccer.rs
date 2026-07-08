@@ -24985,12 +24985,13 @@ fn soccer_transition_reward_with_tactics(
     // the +budget rail and swallow the crowding penalty, so the policy would never feel that
     // spacing was violated. Reward/learning-only; the clamp never affected physics to begin with.
     let separation_penalty = same_team_separation_reward_penalty(player, after);
-    let mut reward = apply_dense_shaping_budget(
+    let dense_reward = apply_dense_shaping_budget(
         dense_soccer_transition_reward(player, decision, before, after, action, tactical_learning)
             + separation_penalty,
         tunables().reward.dense_shaping_budget_points,
     ) - separation_penalty;
-    reward += soccer_analytic_difference_reward(decision);
+    let mut reward = dense_reward
+        + soccer_realized_aligned_analytic_difference_reward(decision, dense_reward);
 
     if !infer_discrete_events {
         return reward;
@@ -25217,6 +25218,8 @@ fn soccer_decision_option_control_reward(decision: &AgentDecisionTrace) -> f64 {
 const SOCCER_ANALYTIC_DIFFERENCE_REWARD_CAP_POINTS: f64 = 1.25;
 const SOCCER_ANALYTIC_DIFFERENCE_REWARD_WEIGHT: f64 = 1.0;
 const SOCCER_ANALYTIC_DIFFERENCE_REWARD_MIN_OPTIONS: usize = 2;
+const SOCCER_ANALYTIC_DIFFERENCE_REWARD_NEGATIVE_DENSE_FLOOR: f64 = 0.15;
+const SOCCER_ANALYTIC_DIFFERENCE_REWARD_NEGATIVE_DENSE_SCALE: f64 = 1.0;
 
 fn soccer_analytic_difference_reward_enabled() -> bool {
     #[cfg(test)]
@@ -25259,6 +25262,63 @@ fn soccer_analytic_difference_reward(decision: &AgentDecisionTrace) -> f64 {
         -SOCCER_ANALYTIC_DIFFERENCE_REWARD_CAP_POINTS,
         SOCCER_ANALYTIC_DIFFERENCE_REWARD_CAP_POINTS,
     )
+}
+
+fn soccer_analytic_difference_reward_realized_alignment_enabled() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_ANALYTIC_DIFFERENCE_REWARD_REALIZED_ALIGNMENT")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            gate_default_on("DD_SOCCER_ENABLE_ANALYTIC_DIFFERENCE_REWARD_REALIZED_ALIGNMENT")
+        })
+    }
+}
+
+fn soccer_analytic_difference_reward_negative_dense_floor() -> f64 {
+    use std::sync::OnceLock;
+    static VALUE: OnceLock<f64> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("SOCCER_ANALYTIC_DIFFERENCE_REWARD_NEGATIVE_DENSE_FLOOR")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .unwrap_or(SOCCER_ANALYTIC_DIFFERENCE_REWARD_NEGATIVE_DENSE_FLOOR)
+            .clamp(0.0, 1.0)
+    })
+}
+
+fn soccer_analytic_difference_reward_negative_dense_scale() -> f64 {
+    use std::sync::OnceLock;
+    static VALUE: OnceLock<f64> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("SOCCER_ANALYTIC_DIFFERENCE_REWARD_NEGATIVE_DENSE_SCALE")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .unwrap_or(SOCCER_ANALYTIC_DIFFERENCE_REWARD_NEGATIVE_DENSE_SCALE)
+            .clamp(1e-6, 25.0)
+    })
+}
+
+fn soccer_realized_aligned_analytic_difference_reward(
+    decision: &AgentDecisionTrace,
+    dense_reward: f64,
+) -> f64 {
+    let reward = soccer_analytic_difference_reward(decision);
+    if reward <= 0.0 || !soccer_analytic_difference_reward_realized_alignment_enabled() {
+        return reward;
+    }
+    let dense_reward = finite_metric(dense_reward);
+    if dense_reward >= 0.0 {
+        return reward;
+    }
+    let pressure =
+        (-dense_reward / soccer_analytic_difference_reward_negative_dense_scale()).clamp(0.0, 1.0);
+    let floor = soccer_analytic_difference_reward_negative_dense_floor();
+    reward * (1.0 - pressure * (1.0 - floor))
 }
 
 pub(crate) fn teammate_spacing_warning_pressure_from_distance(distance_yards: f64) -> f64 {
