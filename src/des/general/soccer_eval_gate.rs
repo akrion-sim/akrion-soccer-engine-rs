@@ -240,7 +240,11 @@ pub fn evaluate_promotion(
     let mean_payoff_vs_field = matrix.mean_payoff_vs_field(candidate_id);
     let payoff_vs_baseline = matrix.payoff(candidate_id, baseline_id);
     let worst_case = matrix.worst_case(candidate_id);
-    let wilson = wilson_lower_bound(record.mean_score(), record.games(), thresholds.wilson_z);
+    let wilson = if draw_aware_wilson_enabled() {
+        draw_aware_lower_bound(&record, thresholds.wilson_z)
+    } else {
+        wilson_lower_bound(record.mean_score(), record.games(), thresholds.wilson_z)
+    };
 
     let mut reasons = Vec::new();
     let mut promote = true;
