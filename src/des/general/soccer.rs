@@ -12208,6 +12208,86 @@ impl SoccerQPolicyPruneSummary {
     }
 }
 
+/// LEARNED PASS-RECEIVER HEAD. When on, the POMDP head decides **which** teammate (or open
+/// space) to pass to via a learned per-receiver-descriptor value, and MPC feasibility acts as a
+/// legality mask that kicks an infeasible receiver back to the head for its next choice — rather
+/// than the receiver being chosen by heuristic quality scoring with MPC only refining aim/speed.
+/// Default-OFF (unproven); when off the receiver descriptor is [`RECEIVER_DESCRIPTOR_UNSPECIFIED`]
+/// so the target key is byte-identical to today and parity suites are unchanged. Opt-in / kill
+/// via `DD_SOCCER_ENABLE_LEARNED_PASS_RECEIVER=1|true|yes|on` / `=0|false|no|off`.
+pub(crate) fn dd_soccer_enable_learned_pass_receiver() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_LEARNED_PASS_RECEIVER")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_LEARNED_PASS_RECEIVER"))
+    }
+}
+
+/// Parity / legacy value for [`SoccerQTargetKey::receiver_descriptor`]: gate off, non-pass
+/// entries, and pre-migration RDS rows all use `-1` so behaviour and hashing match the
+/// grid-only key. Stored verbatim in the `receiver_descriptor` RDS column (`default -1`).
+pub(crate) const RECEIVER_DESCRIPTOR_UNSPECIFIED: i32 = -1;
+
+/// Kind axis of a [`ReceiverDescriptor`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReceiverKind {
+    /// A concrete visible teammate.
+    Teammate,
+    /// Open space (a target grid cell with no teammate) — "play it into the channel".
+    Space,
+    /// No particular receiver (e.g. an outlet/clearance the head chose over a marked teammate).
+    Nobody,
+}
+
+/// Discretized description of a pass RECEIVER, folded into the learned target key so the head
+/// learns *which kind of* receiver (or space) to pass to in a state, not merely which grid cell.
+/// Attack-relative so home/away share credit. Computed identically at trace time (training
+/// credit) and inference time (query) via `WorldSnapshot::pass_receiver_descriptor`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReceiverDescriptor {
+    pub kind: ReceiverKind,
+    /// GK 0 / DEF 1 / MID 2 / FWD 3; 0 for space/nobody.
+    pub role_bucket: u8,
+    /// Attack-relative lane: left 0 / central 1 / right 2.
+    pub lane: u8,
+    /// backward 0 / square 1 / forward 2 relative to the passer along the attacking axis.
+    pub progression: u8,
+    /// tight 0 / contested 1 / open 2.
+    pub openness: u8,
+}
+
+impl ReceiverDescriptor {
+    /// Pack into the non-negative integer stored in the RDS column and the Q-key.
+    /// `((kind*4 + role)*3 + lane)*3 + progression)*3 + openness` ∈ `0..=323`.
+    pub(crate) fn encode(self) -> i32 {
+        let kind = match self.kind {
+            ReceiverKind::Teammate => 0,
+            ReceiverKind::Space => 1,
+            ReceiverKind::Nobody => 2,
+        };
+        let role = i32::from(self.role_bucket.min(3));
+        let lane = i32::from(self.lane.min(2));
+        let progression = i32::from(self.progression.min(2));
+        let openness = i32::from(self.openness.min(2));
+        ((((kind * 4 + role) * 3 + lane) * 3 + progression) * 3 + openness)
+    }
+
+    /// Role bucket for a teammate receiver (GK 0 / DEF 1 / MID 2 / FWD 3).
+    pub(crate) fn role_bucket_for(role: PlayerRole) -> u8 {
+        match role {
+            PlayerRole::Goalkeeper => 0,
+            PlayerRole::Defender => 1,
+            PlayerRole::Midfielder => 2,
+            PlayerRole::Forward => 3,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SoccerQTargetKey {
@@ -12217,6 +12297,14 @@ pub struct SoccerQTargetKey {
     pub target_tactical_cell_id: usize,
     pub target_macro_cell_id: usize,
     pub target_root_cell_id: usize,
+    /// Encoded [`ReceiverDescriptor`], or [`RECEIVER_DESCRIPTOR_UNSPECIFIED`] (-1) for the
+    /// grid-only legacy/parity key. Serde-defaults so pre-migration artifacts load unchanged.
+    #[serde(default = "receiver_descriptor_unspecified")]
+    pub receiver_descriptor: i32,
+}
+
+pub(crate) fn receiver_descriptor_unspecified() -> i32 {
+    RECEIVER_DESCRIPTOR_UNSPECIFIED
 }
 
 impl SoccerQTargetKey {
@@ -12225,6 +12313,15 @@ impl SoccerQTargetKey {
         action: &str,
         grid: PitchGridAddress,
     ) -> Self {
+        Self::from_state_action_grid_receiver(state, action, grid, RECEIVER_DESCRIPTOR_UNSPECIFIED)
+    }
+
+    fn from_state_action_grid_receiver(
+        state: SoccerQStateKey,
+        action: &str,
+        grid: PitchGridAddress,
+        receiver_descriptor: i32,
+    ) -> Self {
         SoccerQTargetKey {
             state,
             action: normalize_soccer_action_label(action).to_string(),
@@ -12232,6 +12329,7 @@ impl SoccerQTargetKey {
             target_tactical_cell_id: grid.tactical.id,
             target_macro_cell_id: grid.macro_zone.id,
             target_root_cell_id: grid.whole_pitch.id,
+            receiver_descriptor,
         }
     }
 
