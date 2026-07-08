@@ -4169,6 +4169,7 @@ fn insert_policy_target_entry_rows(
             params.push(&row.target_tactical_cell_id);
             params.push(&row.target_macro_cell_id);
             params.push(&row.target_root_cell_id);
+            params.push(&row.receiver_descriptor);
             params.push(&row.value_micros);
             params.push(&row.visits);
             params.push(&source_run_id);
