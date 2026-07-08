@@ -40,6 +40,27 @@ fn parse_hex(s: Option<&String>, default: u32) -> u32 {
     .unwrap_or(default)
 }
 
+fn env_f64(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(default)
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
 /// Train a candidate by inline self-play carry-forward, honoring whatever env gates
 /// this process was launched with, and return the final value/actor snapshot.
 fn train(out_path: &str, games: usize, minutes: f64, seed_base: u32) {
