@@ -166,6 +166,17 @@ fn load_snapshot(path: &str) -> SoccerNeuralNetworkSnapshot {
     serde_json::from_str(&json).unwrap_or_else(|e| panic!("parse {path}: {e}"))
 }
 
+/// Per-team pass breakdown for one match, so the eval can separate WHO/WHEN (the POMDP chooses to
+/// pass forward) from HOW (MPC executes it): completion rate = completed/attempted (low ⇒ execution
+/// failing), forward share = forward/completed (low ⇒ the policy recycles instead of progressing).
+#[derive(Clone, Copy, Default)]
+struct PassBreak {
+    attempted: u32,
+    completed: u32,
+    forward: u32,
+    backward: u32,
+}
+
 fn play_holdout_fixture(
     runner: &mut EngineMatchRunner,
     home_id: usize,
@@ -173,7 +184,7 @@ fn play_holdout_fixture(
     seed: u32,
     home: &TeamBrain,
     away: &TeamBrain,
-) -> Option<(MatchReport, u32, u32)> {
+) -> Option<(MatchReport, PassBreak, PassBreak)> {
     let ctx = TournamentMatchContext {
         stage: TournamentStage::Group,
         round_index: 0,
