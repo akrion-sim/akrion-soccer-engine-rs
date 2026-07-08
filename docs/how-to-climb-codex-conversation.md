@@ -229,6 +229,62 @@ the PBRS potential (replacing the hardcoded xT seed) and into the support/run he
 **residual** contribution (observed ΔΦ − expected ΔΦ, per the double-counting fix) — both behind
 default-OFF gates, A/B'd via the eval gate.
 
+## DEEP RE-EVALUATION — 7-component audit + Codex synthesis (2026-07-07/08)
+
+Audited every learning component (reward, value-target/normalization, net architecture,
+training algorithm/credit-assignment, action interface, self-play/eval-gate, off-ball heads,
+state representation) with parallel agents, then converged with Codex over 3 rounds. Root cause
+is a **compound**, and — crucially — the stuck local `0.53` run already spends the "obvious"
+fixes (hidden=128, relational attention on, authoritative-vs-analytic, scored shot placement,
+entropy 0.05, boltzmann 0.42). The real, still-unspent blockers:
+
+**THE VALUE TARGET IS CRUSHED (top critic-side lever).** Local `target_scale=8`, `target_clip=3`
+⇒ raw-reward window is only **±24**, so the `+200` win label is already clipped to the `+3` rail
+— win/draw/loss collapse to `{+3, ~0, −3}` with **no magnitude**: margin, shot-quality, rich-vs-
+sterile draws, and dense shaping all alias together. PopArt does **not** fix this — it observes
+the *already-clipped* target (soccer.rs:40517 runs after the clamp in soccer.rs:41527). The fix
+is **raising `target_clip`** (≥26 for ±200, 33 for ±260, 50 to hold the ±400 full-game clamp)
++ PopArt on to stabilize the larger distribution. Raising clip does NOT shrink dense rewards.
+
+**THE REWARD CAN'T DISTINGUISH GREAT FROM SAFE.** `MATCH_OUTCOME_DRAW_REWARD_POINTS = 0.0`
+(soccer.rs:5569) ⇒ 45% of games (draws) carry zero outcome signal; a chance-rich draw scores
+identically to a sterile one. Live path drops graded shot/goal events (`infer_discrete_events=
+false`, soccer.rs:24953). Territory/pitch_value shaping is policy-invariant by construction —
+mathematically cannot raise the ceiling (that's *why* territory-on still draws).
+
+**THE GRADIENT IS NULLIFIED.** Zero-mean advantage normalization is **forced-on** with the
+outcome reward (world.rs:32699) and strips the win/loss common-mode every batch → on a draw-heavy
+slate the mean it removes *is* the climb signal. Can't be flag-disabled; needs a std-only mode.
+
+### THE LOCKED INTERVENTION (built together with Codex)
+
+**Precondition for ALL cells — un-crush the window:** raise `target_clip` (→50) + PopArt on.
+Testing anything under the crushed ±24 window gives false negatives.
+
+**Factorial (window fixed in every cell):** `{window-only, window+std-only, window+SOT-term,
+window+both}`, plus one crushed baseline as a diagnostic anchor. Candidate fix = **both**.
+1. **Advantage-std MODE** `{none, std-only, zero-mean}`; use **std-only** for outcome-credit
+   updates (preserve common-mode sign) — decouples the forced-on link at world.rs:32699.
+2. **Graded chance-quality terminal outcome term**, zero-sum + capped: `home += k·capped(
+   home_sot − away_sot)`, `away −= same`, applied on draws AND wins/losses, gated. SOT-diff for
+   v1 (cheap, tracked, hard to game); EPV-terminal (from the export already built) is v2.
+
+**Gate the A/B with the CORRECTED Wilson** (empirical {1,0.5,0} variance, not Bernoulli — that
+bug alone flips the existing 200-game record from 0.493 REJECT to 0.512 PASS) against a
+**stronger field** (trained checkpoints + analytic, not fresh untrained nets).
+
+**Step 0 — the decisive diagnostic (build first).** A gated dump at
+`neural_policy_training_samples` (world.rs:~14815), `DD_SOCCER_DUMP_ADVANTAGE_DIAGNOSTIC=path`,
+emitting per transition `{result, team, action_family, raw_reward, raw_advantage,
+standardized_advantage, value, final_sot_diff, tick}`. Separates the three hypotheses:
+raw labels don't separate chance-rich vs sterile draws → **reward**; raw separation vanishes
+after standardization → **gradient**; high-value states lack legal expressive actions →
+**interface**. Cheap, offline, decides the emphasis before the factorial.
+
+Note: in this tree `target_scale`/`target_clip` are `SoccerNeuralLearningConfig` fields (no env
+override), so the window fix needs a tiny change to expose `SOCCER_NEURAL_TARGET_CLIP` (Codex's
+tree already runs 8/3; ours defaults 30/3).
+
 ## One-line summary
 
 The ceiling is structural: the net is a *selector over analytic candidates* optimizing
