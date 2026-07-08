@@ -41763,6 +41763,7 @@ fn decision_context_prefers_defenders_in_action_lane() {
         )),
         facing: facing_bucket_from_vector(target - actor_position),
         dribble_touch: None,
+        receiver_descriptor: None,
     };
 
     let context = soccer_decision_context_for(
