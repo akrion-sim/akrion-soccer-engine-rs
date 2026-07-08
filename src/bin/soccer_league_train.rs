@@ -429,6 +429,14 @@ fn main() {
         "SOCCER_NEURAL_TARGET_CLIP",
         runner_config.base.neural_learning.target_clip,
     );
+    eprintln!(
+        "[league] critic-target window: target_scale={} target_clip={} (raw-reward window +/-{}) popart={}",
+        runner_config.base.neural_learning.target_scale,
+        runner_config.base.neural_learning.target_clip,
+        runner_config.base.neural_learning.target_scale
+            * runner_config.base.neural_learning.target_clip,
+        runner_config.base.neural_learning.target_popart_enabled,
+    );
     // Keep the engine's designed independent-brain mode (per-team critic drives each side).
     let runner = EngineMatchRunner::new(runner_config);
 
