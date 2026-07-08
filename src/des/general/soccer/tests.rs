@@ -3055,7 +3055,10 @@ fn receiver_descriptor_encoding_is_distinct_and_bounded() {
             }
         }
     }
-    assert_eq!(ReceiverDescriptor::role_bucket_for(PlayerRole::Goalkeeper), 0);
+    assert_eq!(
+        ReceiverDescriptor::role_bucket_for(PlayerRole::Goalkeeper),
+        0
+    );
     assert_eq!(ReceiverDescriptor::role_bucket_for(PlayerRole::Forward), 3);
 }
 
@@ -3077,8 +3080,18 @@ fn pass_receiver_descriptor_reads_progression_and_kind() {
 
     let forward_point = Vec2::new(40.0, 72.0);
     let backward_point = Vec2::new(40.0, 28.0);
-    let fwd = snapshot.pass_receiver_descriptor(passer, ReceiverKind::Teammate, forward_point, Some(PlayerRole::Forward));
-    let back = snapshot.pass_receiver_descriptor(passer, ReceiverKind::Teammate, backward_point, Some(PlayerRole::Forward));
+    let fwd = snapshot.pass_receiver_descriptor(
+        passer,
+        ReceiverKind::Teammate,
+        forward_point,
+        Some(PlayerRole::Forward),
+    );
+    let back = snapshot.pass_receiver_descriptor(
+        passer,
+        ReceiverKind::Teammate,
+        backward_point,
+        Some(PlayerRole::Forward),
+    );
     assert_ne!(fwd, back, "forward vs backward ball must differ");
     assert_ne!(fwd, RECEIVER_DESCRIPTOR_UNSPECIFIED);
 
@@ -4837,6 +4850,20 @@ fn spacing_params_are_configurable_and_learnable_and_sanitized() {
         hostile.validate().is_err(),
         "hostile params fail strict validation"
     );
+}
+
+#[test]
+fn tactical_learning_weights_reject_negative_formation_lp_alignment() {
+    let mut weights = SoccerTacticalLearningWeights::default();
+    weights
+        .validate()
+        .expect("default tactical learning weights validate");
+
+    weights.formation_lp_alignment_weight = -0.01;
+    let err = weights
+        .validate()
+        .expect_err("negative formation LP alignment must be rejected");
+    assert!(err.contains("formationLpAlignmentWeight"), "{err}");
 }
 
 #[test]
@@ -35485,17 +35512,23 @@ fn runtime_agent_schedule_uses_fisher_yates_for_all_field_entities_when_enabled(
     let _gate = test_force_fisher_yates_schedule(true);
     assert!(soccer_playback_agent_contract().field_entities_use_fisher_yates);
 
-    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+    let config = MatchConfig {
         duration_seconds: 0.8,
         seed: 13_084,
         ..Default::default()
-    });
+    };
+    let mut sim = SoccerMatch::default_11v11(config.clone());
+    assert_eq!(sim.config.dt_seconds, DEFAULT_DT_SECONDS);
     let expected_player_ids = (0..22).collect::<HashSet<_>>();
     let expected_official_ids = [22, 23, 24].into_iter().collect::<HashSet<_>>();
     let mut field_orders = HashSet::new();
     let mut ball_indexes = HashSet::new();
+    let mut observed_field_orders = Vec::new();
+    let mut player_field_positions = vec![HashSet::new(); 22];
+    let mut official_field_positions = vec![HashSet::new(); 3];
+    let mut ball_field_positions = HashSet::new();
 
-    for _ in 0..8 {
+    for _ in 0..12 {
         sim.run_time_step();
         let summary = agent_schedule_summary_for(
             &sim.last_agent_schedule,
@@ -35551,13 +35584,30 @@ fn runtime_agent_schedule_uses_fisher_yates_for_all_field_entities_when_enabled(
             vec![BALL_AGENT_ID],
             "ball agent should appear exactly once in the agentic field segment"
         );
-        field_orders.insert(
-            sim.last_agent_schedule
-                .iter()
-                .skip(1)
-                .map(|entry| (entry.kind.clone(), entry.id))
-                .collect::<Vec<_>>(),
-        );
+        for (field_index, entry) in field_segment.iter().enumerate() {
+            match &entry.kind {
+                AgentScheduleKind::Player if entry.id < player_field_positions.len() => {
+                    player_field_positions[entry.id].insert(field_index);
+                }
+                AgentScheduleKind::Official
+                    if (22..(22 + official_field_positions.len())).contains(&entry.id) =>
+                {
+                    official_field_positions[entry.id - 22].insert(field_index);
+                }
+                AgentScheduleKind::Ball if entry.id == BALL_AGENT_ID => {
+                    ball_field_positions.insert(field_index);
+                }
+                _ => {}
+            }
+        }
+        let field_order = sim
+            .last_agent_schedule
+            .iter()
+            .skip(1)
+            .map(|entry| (entry.kind.clone(), entry.id))
+            .collect::<Vec<_>>();
+        observed_field_orders.push(field_order.clone());
+        field_orders.insert(field_order);
     }
 
     assert!(
@@ -35567,6 +35617,42 @@ fn runtime_agent_schedule_uses_fisher_yates_for_all_field_entities_when_enabled(
     assert!(
         ball_indexes.len() > 1 && ball_indexes.iter().any(|index| *index != 26),
         "ball agent should be shuffled with players and officials, got {ball_indexes:?}"
+    );
+    assert!(
+        player_field_positions
+            .iter()
+            .enumerate()
+            .all(|(_, positions)| positions.len() > 1),
+        "every player should move across multiple field-order positions: {player_field_positions:?}"
+    );
+    assert!(
+        official_field_positions
+            .iter()
+            .enumerate()
+            .all(|(_, positions)| positions.len() > 1),
+        "every official should move across multiple field-order positions: {official_field_positions:?}"
+    );
+    assert!(
+        ball_field_positions.len() > 1,
+        "ball should move across multiple field-order positions: {ball_field_positions:?}"
+    );
+
+    let mut replay = SoccerMatch::default_11v11(config);
+    let mut replayed_field_orders = Vec::new();
+    for _ in 0..observed_field_orders.len() {
+        replay.run_time_step();
+        replayed_field_orders.push(
+            replay
+                .last_agent_schedule
+                .iter()
+                .skip(1)
+                .map(|entry| (entry.kind.clone(), entry.id))
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(
+        replayed_field_orders, observed_field_orders,
+        "Fisher-Yates must stay deterministic for a fixed match seed"
     );
 }
 
@@ -53461,6 +53547,106 @@ fn learned_support_target_points_are_shape_guarded() {
                 );
         }
         other => panic!("expected support movement, got {other:?}"),
+    }
+}
+
+#[test]
+fn learned_support_shape_without_target_uses_formation_lp_guidance() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let runner = sim
+        .players
+        .iter()
+        .find(|player| player.team == Team::Home && player.role == PlayerRole::Midfielder)
+        .expect("home midfielder")
+        .id;
+    let holder = sim
+        .players
+        .iter()
+        .find(|player| {
+            player.team == Team::Home
+                && player.role != PlayerRole::Goalkeeper
+                && player.id != runner
+        })
+        .expect("home holder")
+        .id;
+    sim.players[runner].position = Vec2::new(34.0, 48.0);
+    sim.players[runner].home_position = Vec2::new(34.0, 50.0);
+    sim.players[holder].position = Vec2::new(40.0, 45.0);
+    sim.players[holder].velocity = Vec2::zero();
+    sim.ball.holder = Some(holder);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let mut snapshot = WorldSnapshot::from_match(&sim);
+    let current = snapshot
+        .player_position(runner)
+        .unwrap_or(sim.players[runner].position);
+    let lp_target = Vec2::new(22.0, 63.0);
+    let recommended_move = lp_target - current;
+    snapshot
+        .formation_lp_guidance
+        .retain(|guidance| guidance.player_id != runner);
+    snapshot
+        .formation_lp_guidance
+        .push(SoccerFormationLpPlayerGuidance {
+            team: Team::Home,
+            player_id: runner,
+            slot: runner,
+            current,
+            target: lp_target,
+            formation_anchor: sim.players[runner].home_position,
+            pressure_target: None,
+            recommended_move,
+            target_velocity: Vec2::zero(),
+            target_acceleration: Vec2::zero(),
+            local_mpc_guidance: true,
+            recommended_move_yards: recommended_move.len(),
+            recommended_speed_yps: 0.0,
+            recommended_acceleration_yps2: 0.0,
+            formation_error_yards: 0.0,
+            movement_error_yards: 0.0,
+            pair_error_yards: 0.0,
+            role_line_error_yards: 0.0,
+            pressure_error_yards: 0.0,
+            fore_aft_speed_error_yps: 0.0,
+            pressure_weight: 0.5,
+            speed_match_weight: 0.5,
+            alignment_weight: 1.0,
+            reduced_cost_target_x: 0.0,
+            reduced_cost_target_y: 0.0,
+            solver_status: "test".to_string(),
+            solver_objective: 0.0,
+            solver_iterations: Some(1),
+            solver_elapsed_ms: 0.0,
+            variable_count: 1,
+            constraint_count: 1,
+        });
+    let observation = snapshot.observation_for(runner);
+    let expected = snapshot.clamp_to_role_position(
+        runner,
+        lp_target,
+        sim.players[runner].home_position,
+        false,
+    );
+
+    for label in ["support-shape", "support-roam"] {
+        let plan = SoccerLearnedPlan {
+            action: label.to_string(),
+            target_player: None,
+            target_point: None,
+            mpc_replan: None,
+        };
+        let (action, executed_label) = sim.players[runner]
+            .action_from_learned_plan(&plan, &snapshot, &observation)
+            .expect("learned support action should execute from LP guidance");
+        assert_eq!(executed_label, label);
+        match action {
+            SoccerAction::MoveTo(target) => assert!(
+                target.distance(expected) < 1e-9,
+                "learned {label} should execute the LP target when POMDP supplies no explicit point: target={target:?} expected={expected:?}"
+            ),
+            other => panic!("expected support movement for {label}, got {other:?}"),
+        }
     }
 }
 
@@ -81689,6 +81875,116 @@ fn live_server_autoloads_team_policy_from_configured_json_path() {
     assert!(state.live_http.reuses_workers);
     assert!(!state.live_http.spawns_per_request);
     assert!(state.live_http.batches_step_ticks);
+
+    let _ = std::fs::remove_file(policy_path);
+}
+
+#[test]
+fn live_server_autoloads_compact_league_frontier_with_targets_and_inline_neural() {
+    let policy_path = std::env::temp_dir().join(format!(
+        "soccer-league-frontier-autoload-test-{}.json",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&policy_path);
+
+    let mut source = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        learning_logging_enabled: false,
+        max_human_players: 0,
+        seed: 1591,
+        ..Default::default()
+    });
+    let player_id = 5;
+    let snapshot = WorldSnapshot::from_match(&source);
+    let player = snapshot
+        .players
+        .iter()
+        .find(|player| player.id == player_id)
+        .expect("policy player");
+    let state = SoccerQStateKey::from_parts(
+        &snapshot.mdp_state_for_player(player_id),
+        &snapshot.observation_for(player_id),
+        player.team,
+        player.role,
+    );
+    let target_grid = pitch_grid_address(
+        Vec2::new(42.0, 88.0),
+        snapshot.field_width,
+        snapshot.field_length,
+    );
+    let mut policies = SoccerTeamQPolicies::new(SoccerQPolicyOptions::default());
+    assert!(policies
+        .policy_mut(player.team)
+        .set_target_value(state, "pass", target_grid, 2.75));
+    source.set_team_policies(policies);
+    let source_artifact = source.team_policy_artifact();
+    assert_eq!(source_artifact.home_target_entries.len(), 1);
+
+    let mut neural_snapshot = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        max_human_players: 0,
+        neural_learning: SoccerNeuralLearningConfig {
+            enabled: true,
+            backend: SoccerNeuralLearningBackend::Inline,
+            hidden_units: 8,
+            ..Default::default()
+        },
+        seed: 1592,
+        ..Default::default()
+    })
+    .learning_snapshot()
+    .neural_network
+    .expect("source neural snapshot");
+    neural_snapshot.training_steps = 123;
+    neural_snapshot.average_loss = Some(0.25);
+    let expected_parameter_count = neural_snapshot.parameter_count;
+
+    let compact_frontier = serde_json::json!({
+        "version": 0,
+        "homeEntries": [],
+        "homeTargetEntries": source_artifact.home_target_entries,
+        "awayEntries": [],
+        "awayTargetEntries": [],
+        "episodes": 0,
+        "neuralNetwork": neural_snapshot,
+    });
+    std::fs::write(
+        &policy_path,
+        serde_json::to_string(&compact_frontier).expect("compact frontier json"),
+    )
+    .expect("write compact frontier");
+
+    let server = SoccerLiveServer::new(SoccerLiveServerConfig {
+        match_config: MatchConfig {
+            duration_seconds: 1.0,
+            max_human_players: 0,
+            neural_learning: SoccerNeuralLearningConfig {
+                enabled: true,
+                backend: SoccerNeuralLearningBackend::Inline,
+                hidden_units: 8,
+                ..Default::default()
+            },
+            seed: 1593,
+            ..Default::default()
+        },
+        http_worker_threads: 2,
+        policy_disk_path: policy_path.display().to_string(),
+        autoload_team_policy: true,
+        autosave_team_policy: true,
+        ..Default::default()
+    });
+    let state = server.session.lock().unwrap().state_response();
+
+    assert_eq!(state.learning.home_policy_entries, 0);
+    assert_eq!(state.learning.home_policy_target_entries, 1);
+    assert_eq!(state.learning.away_policy_target_entries, 0);
+    assert_eq!(state.learning.neural_learning_training_steps, 123);
+    assert_eq!(
+        state.learning.neural_learning_parameter_count,
+        expected_parameter_count
+    );
+    assert_eq!(state.learning.neural_learning_average_loss, Some(0.25));
+    assert!(state.policy_autosave.last_error.is_none());
 
     let _ = std::fs::remove_file(policy_path);
 }

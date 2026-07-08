@@ -76,7 +76,9 @@ fn formation_nudge_env_f64(name: &str, default: f64) -> f64 {
 fn formation_nudge_base_weight() -> f64 {
     use std::sync::OnceLock;
     static V: OnceLock<f64> = OnceLock::new();
-    *V.get_or_init(|| formation_nudge_env_f64("DD_SOCCER_FORMATION_NUDGE_BASE_WEIGHT", 0.6).clamp(0.0, 1.0))
+    *V.get_or_init(|| {
+        formation_nudge_env_f64("DD_SOCCER_FORMATION_NUDGE_BASE_WEIGHT", 0.6).clamp(0.0, 1.0)
+    })
 }
 /// Hard cap (yards) on how far the nudge may displace a player from their own chosen destination —
 /// keeps it a nudge, never a yank, however far the LP target sits. Env `DD_SOCCER_FORMATION_NUDGE_MAX_YARDS`.
@@ -13918,17 +13920,32 @@ impl PlayerAgent {
                     snapshot.attacking_support_movement_for(self.id, self.home_position, roam);
                 let target = if self.role == PlayerRole::Goalkeeper {
                     support_target.point
-                } else {
-                    plan.target_point
-                        .map(|target| {
-                            snapshot.shape_guarded_learned_support_target(
+                } else if let Some(target) = plan.target_point {
+                    snapshot.shape_guarded_learned_support_target(
+                        self.id,
+                        target,
+                        support_target.point,
+                        self.home_position,
+                    )
+                } else if matches!(label, "support-shape" | "support-roam") {
+                    snapshot
+                        .formation_lp_guidance_for(self.id)
+                        .filter(|guidance| {
+                            guidance.team == self.team
+                                && guidance.target.x.is_finite()
+                                && guidance.target.y.is_finite()
+                        })
+                        .map(|guidance| {
+                            snapshot.clamp_to_role_position(
                                 self.id,
-                                target,
-                                support_target.point,
+                                guidance.target,
                                 self.home_position,
+                                false,
                             )
                         })
                         .unwrap_or(support_target.point)
+                } else {
+                    support_target.point
                 };
                 Some((SoccerAction::MoveTo(target), label.to_string()))
             }
@@ -15628,7 +15645,10 @@ mod formation_nudge_tests {
         // Moves toward the LP target...
         assert!(out.x > own.x && out.x <= lp.x);
         // ...but never more than the max-yards cap, however far the LP sits.
-        assert!((out - own).len() <= 6.0 + 1e-9, "nudge must stay a bounded nudge: {out:?}");
+        assert!(
+            (out - own).len() <= 6.0 + 1e-9,
+            "nudge must stay a bounded nudge: {out:?}"
+        );
     }
 
     #[test]

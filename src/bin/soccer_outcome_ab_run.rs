@@ -50,7 +50,12 @@ fn env_f64(name: &str, default: f64) -> f64 {
 fn env_bool(name: &str, default: bool) -> bool {
     std::env::var(name)
         .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(default)
 }
 
@@ -148,7 +153,7 @@ fn play_holdout_fixture(
     seed: u32,
     home: &TeamBrain,
     away: &TeamBrain,
-) -> Option<MatchReport> {
+) -> Option<(MatchReport, u32, u32)> {
     let ctx = TournamentMatchContext {
         stage: TournamentStage::Group,
         round_index: 0,
@@ -162,18 +167,26 @@ fn play_holdout_fixture(
         away_learns: false,
     };
     match runner.play(&ctx, home, away) {
-        Ok(o) => Some(MatchReport {
-            stage: ctx.stage,
-            home_id,
-            away_id,
-            home_name: ctx.home_name,
-            away_name: ctx.away_name,
-            home_goals: o.home_goals,
-            away_goals: o.away_goals,
-            shootout_winner: None,
-            home_training_steps: o.home_training_steps,
-            away_training_steps: o.away_training_steps,
-        }),
+        Ok(o) => {
+            // Dense advancement signal: completed FORWARD passes per team this match (already
+            // counted in MatchStats, surfaced via the outcome summary). Returned alongside the
+            // score so the caller can measure progression, not just the rare goal outcome.
+            let home_forward = o.summary.stats.passes_completed_forward_home;
+            let away_forward = o.summary.stats.passes_completed_forward_away;
+            let report = MatchReport {
+                stage: ctx.stage,
+                home_id,
+                away_id,
+                home_name: ctx.home_name,
+                away_name: ctx.away_name,
+                home_goals: o.home_goals,
+                away_goals: o.away_goals,
+                shootout_winner: None,
+                home_training_steps: o.home_training_steps,
+                away_training_steps: o.away_training_steps,
+            };
+            Some((report, home_forward, away_forward))
+        }
         Err(e) => {
             eprintln!("[eval] fixture error: {e}");
             None

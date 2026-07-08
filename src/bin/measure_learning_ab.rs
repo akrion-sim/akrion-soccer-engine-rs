@@ -151,7 +151,8 @@ fn main() {
     // pass-completion head's per-process carry). Seeded up-front when the gate is on so game 1
     // already captures cold-exploration samples (the head must exist for the residual to apply);
     // stays `None` (never installed, byte-identical) when the gate is off.
-    let mut mpc_objective_head: Option<SoccerMpcObjectiveHead> = if learned_mpc_objective_enabled() {
+    let mut mpc_objective_head: Option<SoccerMpcObjectiveHead> = if learned_mpc_objective_enabled()
+    {
         Some(SoccerMpcObjectiveHead::new(seed_base))
     } else {
         None
@@ -195,8 +196,9 @@ fn main() {
         // MAPPO/neural carry above.
         let mpc_samples = sim.drain_mpc_objective_samples();
         if !mpc_samples.is_empty() {
-            let head = mpc_objective_head
-                .get_or_insert_with(|| SoccerMpcObjectiveHead::new(seed_base.wrapping_add(g as u32)));
+            let head = mpc_objective_head.get_or_insert_with(|| {
+                SoccerMpcObjectiveHead::new(seed_base.wrapping_add(g as u32))
+            });
             for _ in 0..4 {
                 head.train_rwr(&mpc_samples, 0.05);
             }

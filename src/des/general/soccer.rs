@@ -13033,8 +13033,12 @@ impl SoccerQPolicy {
         receiver_descriptor: i32,
         value: f64,
     ) -> bool {
-        let key =
-            SoccerQTargetKey::from_state_action_grid_receiver(state, action, grid, receiver_descriptor);
+        let key = SoccerQTargetKey::from_state_action_grid_receiver(
+            state,
+            action,
+            grid,
+            receiver_descriptor,
+        );
         if self.insert_target_value(key.clone(), value) {
             self.target_visits.entry(key).or_insert(1);
             true
@@ -13480,9 +13484,8 @@ impl SoccerQPolicy {
         flight: PassFlight,
         candidates: &[usize],
     ) -> Option<usize> {
-        let scored = self.scored_pass_teammates_for_snapshot(
-            snapshot, player_id, action, flight, candidates,
-        );
+        let scored = self
+            .scored_pass_teammates_for_snapshot(snapshot, player_id, action, flight, candidates);
         let pick = |require_clean: bool| {
             scored
                 .iter()
@@ -13511,9 +13514,8 @@ impl SoccerQPolicy {
         flight: PassFlight,
         candidates: &[usize],
     ) -> Vec<RankedPassTeammate> {
-        let mut scored = self.scored_pass_teammates_for_snapshot(
-            snapshot, player_id, action, flight, candidates,
-        );
+        let mut scored = self
+            .scored_pass_teammates_for_snapshot(snapshot, player_id, action, flight, candidates);
         scored.sort_by(|a, b| {
             a.concedes
                 .cmp(&b.concedes)
@@ -13596,7 +13598,11 @@ impl SoccerQPolicy {
                     // Legacy heuristic blend: learned grid preference (weight 1.0 if any) + quality.
                     let learned_preference = self.target_preference_for_grid(&state, action, &grid);
                     let learned_score = learned_preference.unwrap_or(0.0);
-                    let learned_weight = if learned_preference.is_some() { 1.0 } else { 0.0 };
+                    let learned_weight = if learned_preference.is_some() {
+                        1.0
+                    } else {
+                        0.0
+                    };
                     learned_score * learned_weight + heuristic
                 };
                 let concedes = snapshot.pass_target_concedes_to_perceived_opponent(
@@ -13965,16 +13971,22 @@ impl SoccerQPolicy {
         grid: &PitchGridAddress,
         receiver_descriptor: Option<i32>,
     ) -> Option<f64> {
-        self.target_preference_for_grid_with_context(state, action, grid, receiver_descriptor, false)
-            .or_else(|| {
-                self.target_preference_for_grid_with_context(
-                    state,
-                    action,
-                    grid,
-                    receiver_descriptor,
-                    true,
-                )
-            })
+        self.target_preference_for_grid_with_context(
+            state,
+            action,
+            grid,
+            receiver_descriptor,
+            false,
+        )
+        .or_else(|| {
+            self.target_preference_for_grid_with_context(
+                state,
+                action,
+                grid,
+                receiver_descriptor,
+                true,
+            )
+        })
     }
 
     fn target_preference_for_grid_with_context(
@@ -14870,13 +14882,22 @@ mod soccer_dp_bootstrap_tests {
         let v0 = *v.get(&0).unwrap();
         let v1 = *v.get(&1).unwrap();
         let v2 = *v.get(&2).unwrap();
-        assert!((v2 - 10.0).abs() < 1e-6, "terminal-reward bucket = raw reward");
-        assert!((v1 - gamma * 10.0).abs() < 1e-6, "one step back discounts once");
+        assert!(
+            (v2 - 10.0).abs() < 1e-6,
+            "terminal-reward bucket = raw reward"
+        );
+        assert!(
+            (v1 - gamma * 10.0).abs() < 1e-6,
+            "one step back discounts once"
+        );
         assert!(
             (v0 - gamma * gamma * 10.0).abs() < 1e-6,
             "two steps back discounts twice"
         );
-        assert!(v0 > 0.0 && v0 < v1 && v1 < v2, "value rises toward the reward");
+        assert!(
+            v0 > 0.0 && v0 < v1 && v1 < v2,
+            "value rises toward the reward"
+        );
     }
 
     #[test]
@@ -14893,10 +14914,16 @@ mod soccer_dp_bootstrap_tests {
         let gamma = 0.9;
         // horizon 2 from start 0: 1 + γ·1 + γ²·V(0) = 1 + 0.9 + 0.81·5 = 5.95.
         let r = soccer_dp_nstep_return(&seq, 0, 2, gamma, &value);
-        assert!((r - 5.95).abs() < 1e-6, "n-step = discounted rewards + bootstrap, got {r}");
+        assert!(
+            (r - 5.95).abs() < 1e-6,
+            "n-step = discounted rewards + bootstrap, got {r}"
+        );
         // At the tail (start 3) the window can't fill and has no successor ⇒ no bootstrap ⇒ just 1.0.
         let tail = soccer_dp_nstep_return(&seq, 3, 2, gamma, &value);
-        assert!((tail - 1.0).abs() < 1e-6, "terminal tail bootstraps 0, got {tail}");
+        assert!(
+            (tail - 1.0).abs() < 1e-6,
+            "terminal tail bootstraps 0, got {tail}"
+        );
     }
 
     #[test]
@@ -18248,8 +18275,8 @@ impl SoccerTacticalLearningWeights {
             if !value.is_finite() {
                 return Err(format!("{name} must be finite"));
             }
-            if !(-5.0..=5.0).contains(&value) {
-                return Err(format!("{name} must be between -5.0 and 5.0"));
+            if !(0.0..=5.0).contains(&value) {
+                return Err(format!("{name} must be between 0.0 and 5.0"));
             }
         }
         Ok(())
@@ -19357,16 +19384,23 @@ impl MatchConfig {
                 // MCTS is DP-lookahead scored by the value net + analytic MPC priors — it can pull the
                 // net's choices back toward the analytic policy (entrenching parity). SOCCER_DISABLE_NEURAL_MCTS=1
                 // lets the raw actor-critic policy drive directly, to A/B whether MCTS helps or hurts the climb.
-                mcts_enabled: std::env::var("SOCCER_DISABLE_NEURAL_MCTS").ok().as_deref() != Some("1"),
+                mcts_enabled: std::env::var("SOCCER_DISABLE_NEURAL_MCTS").ok().as_deref()
+                    != Some("1"),
                 // Env-tunable so we can A/B whether SOLVING MORE EXACTLY (deeper lookahead / more
                 // simulations / wider candidate set) climbs above parity — i.e. whether the plateau is
                 // a shallow-search approximation ceiling. Sanitizers clamp to [1,32]/[2,16]/[1,3].
                 mcts_simulations: std::env::var("SOCCER_MCTS_SIMULATIONS")
-                    .ok().and_then(|s| s.trim().parse().ok()).unwrap_or(8),
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok())
+                    .unwrap_or(8),
                 mcts_candidates: std::env::var("SOCCER_MCTS_CANDIDATES")
-                    .ok().and_then(|s| s.trim().parse().ok()).unwrap_or(4),
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok())
+                    .unwrap_or(4),
                 mcts_depth: std::env::var("SOCCER_MCTS_DEPTH")
-                    .ok().and_then(|s| s.trim().parse().ok()).unwrap_or(1),
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok())
+                    .unwrap_or(1),
                 ..SoccerNeuralBlendConfig::default()
             },
             mpc: SoccerMpcConfig {
@@ -39729,6 +39763,79 @@ fn read_soccer_self_play_training_artifact(
         .map_err(|err| format!("parse self-play training artifact: {err}"))
 }
 
+fn read_soccer_self_play_learned_params(
+    path: &Path,
+) -> Result<SoccerSelfPlayLearnedParams, String> {
+    let raw =
+        fs::read_to_string(path).map_err(|err| format!("read learned params artifact: {err}"))?;
+    serde_json::from_str::<SoccerSelfPlayLearnedParams>(&raw)
+        .map_err(|err| format!("parse learned params artifact: {err}"))
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SoccerLeagueFrontierArtifact {
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    options: Option<SoccerQPolicyOptions>,
+    #[serde(default)]
+    home_options: Option<SoccerQPolicyOptions>,
+    #[serde(default)]
+    away_options: Option<SoccerQPolicyOptions>,
+    #[serde(default)]
+    episodes: usize,
+    #[serde(default)]
+    home_entries: Vec<SoccerQEntry>,
+    #[serde(default)]
+    home_target_entries: Vec<SoccerQTargetEntry>,
+    #[serde(default)]
+    away_entries: Vec<SoccerQEntry>,
+    #[serde(default)]
+    away_target_entries: Vec<SoccerQTargetEntry>,
+    #[serde(default)]
+    neural_network: Option<SoccerNeuralNetworkSnapshot>,
+}
+
+impl SoccerLeagueFrontierArtifact {
+    fn has_learning_payload(&self) -> bool {
+        !self.home_entries.is_empty()
+            || !self.home_target_entries.is_empty()
+            || !self.away_entries.is_empty()
+            || !self.away_target_entries.is_empty()
+            || self.neural_network.is_some()
+    }
+
+    fn home_options(&self) -> SoccerQPolicyOptions {
+        self.home_options
+            .clone()
+            .or_else(|| self.options.clone())
+            .unwrap_or_default()
+    }
+
+    fn away_options(&self) -> SoccerQPolicyOptions {
+        self.away_options
+            .clone()
+            .or_else(|| self.options.clone())
+            .unwrap_or_default()
+    }
+}
+
+fn read_soccer_league_frontier_artifact(
+    path: &Path,
+) -> Result<SoccerLeagueFrontierArtifact, String> {
+    let raw =
+        fs::read_to_string(path).map_err(|err| format!("read league frontier artifact: {err}"))?;
+    let artifact = serde_json::from_str::<SoccerLeagueFrontierArtifact>(&raw)
+        .map_err(|err| format!("parse league frontier artifact: {err}"))?;
+    if !artifact.has_learning_payload() {
+        return Err(
+            "parse league frontier artifact: missing learned entries or neuralNetwork".to_string(),
+        );
+    }
+    Ok(artifact)
+}
+
 // Champion–challenger via an APPEND-ONLY log: each save appends one policy version
 // tagged with its fitness, so an existing champion is never overwritten (a crash
 // mid-write at worst leaves a partial trailing line, which the reader skips). The
@@ -46921,6 +47028,85 @@ impl SoccerRealtimeSession {
         Ok(response)
     }
 
+    fn team_policy_disk_response_for_import(
+        &self,
+        path: &Path,
+        imported: SoccerTeamPolicyImportResponse,
+    ) -> SoccerTeamPolicyDiskResponse {
+        let learning = imported.learning;
+        SoccerTeamPolicyDiskResponse {
+            path: path.display().to_string(),
+            history_path: policy_history_disk_path(path).display().to_string(),
+            policy_probability: imported.policy_probability,
+            home_policy_entries: learning.home_policy_entries,
+            away_policy_entries: learning.away_policy_entries,
+            home_policy_target_entries: learning.home_policy_target_entries,
+            away_policy_target_entries: learning.away_policy_target_entries,
+            learning,
+        }
+    }
+
+    fn import_self_play_learned_params_from_path(
+        &mut self,
+        path: &Path,
+        params: SoccerSelfPlayLearnedParams,
+    ) -> Result<SoccerTeamPolicyDiskResponse, String> {
+        let policies = SoccerTeamQPolicies::from_learned_params(&params)?;
+        self.sim.config.tactical_learning = params.tactical_learning;
+        self.sim.tactical_summary = params.tactical_summary;
+        self.sim.team_policies = Some(policies);
+        if let Some(snapshot) = params.neural_network {
+            self.sim.set_neural_network_snapshot(snapshot)?;
+        }
+        let learning = self.sim.learning_stats_snapshot();
+        Ok(SoccerTeamPolicyDiskResponse {
+            path: path.display().to_string(),
+            history_path: policy_history_disk_path(path).display().to_string(),
+            policy_probability: self.sim.team_policy_probability_summary(),
+            home_policy_entries: learning.home_policy_entries,
+            away_policy_entries: learning.away_policy_entries,
+            home_policy_target_entries: learning.home_policy_target_entries,
+            away_policy_target_entries: learning.away_policy_target_entries,
+            learning,
+        })
+    }
+
+    fn import_league_frontier_artifact_from_path(
+        &mut self,
+        path: &Path,
+        artifact: SoccerLeagueFrontierArtifact,
+    ) -> Result<SoccerTeamPolicyDiskResponse, String> {
+        let home_policy = SoccerQPolicy::from_entries_with_targets(
+            artifact.home_options(),
+            &artifact.home_entries,
+            &artifact.home_target_entries,
+        )?;
+        let away_policy = SoccerQPolicy::from_entries_with_targets(
+            artifact.away_options(),
+            &artifact.away_entries,
+            &artifact.away_target_entries,
+        )?;
+        let neural_network = artifact.neural_network;
+        self.sim.team_policies = Some(SoccerTeamQPolicies {
+            home: home_policy,
+            away: away_policy,
+        });
+        if let Some(snapshot) = neural_network {
+            self.sim.set_neural_network_snapshot(snapshot)?;
+        }
+        let learning = self.sim.learning_stats_snapshot();
+        Ok(SoccerTeamPolicyDiskResponse {
+            path: path.display().to_string(),
+            history_path: policy_history_disk_path(path).display().to_string(),
+            policy_probability: self.sim.team_policy_probability_summary(),
+            home_policy_entries: learning.home_policy_entries,
+            away_policy_entries: learning.away_policy_entries,
+            home_policy_target_entries: learning.home_policy_target_entries,
+            away_policy_target_entries: learning.away_policy_target_entries,
+            learning,
+        })
+    }
+
     pub fn load_team_policy_artifact_from_path(
         &mut self,
         path: impl AsRef<Path>,
@@ -46928,22 +47114,25 @@ impl SoccerRealtimeSession {
         let path = path.as_ref();
         let mut response = match self.sim.load_team_policy_artifact_from_path(path) {
             Ok(response) => response,
-            Err(team_policy_err) => {
-                let artifact = read_soccer_self_play_training_artifact(path)
-                    .map_err(|training_err| format!("{team_policy_err}; {training_err}"))?;
-                let imported = self.sim.import_self_play_training_artifact(artifact)?;
-                let learning = imported.learning;
-                SoccerTeamPolicyDiskResponse {
-                    path: path.display().to_string(),
-                    history_path: policy_history_disk_path(path).display().to_string(),
-                    policy_probability: imported.policy_probability,
-                    home_policy_entries: learning.home_policy_entries,
-                    away_policy_entries: learning.away_policy_entries,
-                    home_policy_target_entries: learning.home_policy_target_entries,
-                    away_policy_target_entries: learning.away_policy_target_entries,
-                    learning,
+            Err(team_policy_err) => match read_soccer_self_play_training_artifact(path) {
+                Ok(artifact) => {
+                    let imported = self.sim.import_self_play_training_artifact(artifact)?;
+                    self.team_policy_disk_response_for_import(path, imported)
                 }
-            }
+                Err(training_err) => match read_soccer_self_play_learned_params(path) {
+                    Ok(params) => self.import_self_play_learned_params_from_path(path, params)?,
+                    Err(params_err) => match read_soccer_league_frontier_artifact(path) {
+                        Ok(frontier) => {
+                            self.import_league_frontier_artifact_from_path(path, frontier)?
+                        }
+                        Err(frontier_err) => {
+                            return Err(format!(
+                                "{team_policy_err}; {training_err}; {params_err}; {frontier_err}"
+                            ));
+                        }
+                    },
+                },
+            },
         };
         match read_soccer_neural_snapshot(path) {
             Ok(Some(snapshot)) => {

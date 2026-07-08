@@ -18,10 +18,9 @@ use crate::des::general::soccer::{
     MatchConfig, MatchSummary, SoccerConfigMomentInsert, SoccerMatch, SoccerNeuralBlendConfig,
     SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot, SoccerPassOutcomeSample, SoccerQEntry,
     SoccerQPolicy, SoccerQPolicyOptions, SoccerQStateKey, SoccerQTargetEntry,
-    RECEIVER_DESCRIPTOR_UNSPECIFIED,
     SoccerSelfPlayEpisodeSummary, SoccerSelfPlayTrainingArtifact, SoccerTacticalLearningSummary,
     SoccerTacticalLearningWeights, SoccerTeamQPolicies, Team, DEFAULT_FIELD_LENGTH_YARDS,
-    DEFAULT_FIELD_WIDTH_YARDS, MAX_SOCCER_NEURAL_LEARNING_RATE,
+    DEFAULT_FIELD_WIDTH_YARDS, MAX_SOCCER_NEURAL_LEARNING_RATE, RECEIVER_DESCRIPTOR_UNSPECIFIED,
 };
 use crate::des::shared::capabilities::RandomSource;
 
@@ -4805,8 +4804,7 @@ fn clamp_soccer_tactical_learning_weights(
         .defensive_line_press_learning_weight
         .max(0.0)
         .min(2.0);
-    clamped.formation_lp_alignment_weight =
-        clamped.formation_lp_alignment_weight.max(-5.0).min(5.0);
+    clamped.formation_lp_alignment_weight = clamped.formation_lp_alignment_weight.max(0.0).min(5.0);
     clamped
 }
 
@@ -5887,6 +5885,22 @@ mod tests {
         let mut options = SoccerQPolicyOptions::default();
         options.alpha = alpha;
         SoccerTeamQPolicies::new(options)
+    }
+
+    #[test]
+    fn tactical_learning_clamp_keeps_formation_lp_alignment_non_negative() {
+        let mut weights = SoccerTacticalLearningWeights::default();
+        weights.formation_lp_alignment_weight = -1.25;
+        assert_eq!(
+            clamp_soccer_tactical_learning_weights(&weights).formation_lp_alignment_weight,
+            0.0
+        );
+
+        weights.formation_lp_alignment_weight = 8.0;
+        assert_eq!(
+            clamp_soccer_tactical_learning_weights(&weights).formation_lp_alignment_weight,
+            5.0
+        );
     }
 
     #[test]

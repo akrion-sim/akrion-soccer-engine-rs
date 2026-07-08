@@ -23,8 +23,9 @@
 //! always produce the same bracket and champion.
 
 use crate::des::general::soccer::{
-    MatchConfig, SoccerMatch, SoccerNeuralLearningBackend, SoccerNeuralNetworkSnapshot,
-    SoccerQPolicy, SoccerQPolicyOptions, SoccerQTargetEntry, SoccerTeamQPolicies, Team,
+    MatchConfig, MatchStats, MatchSummary, SoccerMatch, SoccerNeuralLearningBackend,
+    SoccerNeuralNetworkSnapshot, SoccerQPolicy, SoccerQPolicyOptions, SoccerQTargetEntry,
+    SoccerTeamQPolicies, Team,
 };
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -336,6 +337,7 @@ pub struct TournamentMatchContext {
 pub struct MatchOutcome {
     pub home_goals: u32,
     pub away_goals: u32,
+    pub summary: MatchSummary,
     pub home_brain: TeamBrain,
     pub away_brain: TeamBrain,
     pub home_training_steps: usize,
@@ -350,6 +352,16 @@ impl MatchOutcome {
             std::cmp::Ordering::Less => Some(MatchSide::Away),
             std::cmp::Ordering::Equal => None,
         }
+    }
+}
+
+fn score_only_summary(home_goals: u32, away_goals: u32) -> MatchSummary {
+    MatchSummary {
+        score_home: home_goals,
+        score_away: away_goals,
+        ticks: 0,
+        simulated_seconds: 0.0,
+        stats: MatchStats::default(),
     }
 }
 
@@ -1383,6 +1395,7 @@ impl TournamentMatchRunner for StrengthMatchRunner {
         Ok(MatchOutcome {
             home_goals,
             away_goals,
+            summary: score_only_summary(home_goals, away_goals),
             // Brains "learn" only nominally in the stub: bump counters when the
             // mode says the side learns, so learn-as-they-go bookkeeping is
             // testable without a real sim.
@@ -1582,6 +1595,7 @@ impl TournamentMatchRunner for EngineMatchRunner {
             return Ok(MatchOutcome {
                 home_goals: sim.score_home,
                 away_goals: sim.score_away,
+                summary: sim.summary(),
                 home_brain: home.clone(),
                 away_brain: away.clone(),
                 home_training_steps: 0,
@@ -1593,6 +1607,7 @@ impl TournamentMatchRunner for EngineMatchRunner {
 
         let home_goals = sim.score_home;
         let away_goals = sim.score_away;
+        let summary = sim.summary();
         let home_training_steps = sim.neural_training_steps_for(Team::Home);
         let away_training_steps = sim.neural_training_steps_for(Team::Away);
         let learned_target_entries = sim.team_policies().map(|policies| {
@@ -1638,6 +1653,7 @@ impl TournamentMatchRunner for EngineMatchRunner {
         Ok(MatchOutcome {
             home_goals,
             away_goals,
+            summary,
             home_brain,
             away_brain,
             home_training_steps,
@@ -1903,6 +1919,7 @@ mod tests {
             Ok(MatchOutcome {
                 home_goals: 1,
                 away_goals: 1,
+                summary: score_only_summary(1, 1),
                 home_brain: advanced_brain(home, ctx.home_learns),
                 away_brain: advanced_brain(away, ctx.away_learns),
                 home_training_steps: usize::from(ctx.home_learns),

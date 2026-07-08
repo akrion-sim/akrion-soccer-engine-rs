@@ -174,10 +174,14 @@ impl SoccerMpcObjectiveHead {
             0.0
         };
         Some(Vec2 {
-            x: (base.x + jitter_x)
-                .clamp(-MPC_OBJECTIVE_MAX_RESIDUAL_YARDS, MPC_OBJECTIVE_MAX_RESIDUAL_YARDS),
-            y: (base.y + jitter_y)
-                .clamp(-MPC_OBJECTIVE_MAX_RESIDUAL_YARDS, MPC_OBJECTIVE_MAX_RESIDUAL_YARDS),
+            x: (base.x + jitter_x).clamp(
+                -MPC_OBJECTIVE_MAX_RESIDUAL_YARDS,
+                MPC_OBJECTIVE_MAX_RESIDUAL_YARDS,
+            ),
+            y: (base.y + jitter_y).clamp(
+                -MPC_OBJECTIVE_MAX_RESIDUAL_YARDS,
+                MPC_OBJECTIVE_MAX_RESIDUAL_YARDS,
+            ),
         })
     }
 
@@ -195,10 +199,10 @@ impl SoccerMpcObjectiveHead {
                 continue;
             }
             let input: Vec<f64> = sample.features.iter().map(|&v| f64::from(v)).collect();
-            let target_y = (sample.applied_residual.y / MPC_OBJECTIVE_MAX_RESIDUAL_YARDS)
-                .clamp(-0.999, 0.999);
-            let target_x = (sample.applied_residual.x / MPC_OBJECTIVE_MAX_RESIDUAL_YARDS)
-                .clamp(-0.999, 0.999);
+            let target_y =
+                (sample.applied_residual.y / MPC_OBJECTIVE_MAX_RESIDUAL_YARDS).clamp(-0.999, 0.999);
+            let target_x =
+                (sample.applied_residual.x / MPC_OBJECTIVE_MAX_RESIDUAL_YARDS).clamp(-0.999, 0.999);
             let lr = (base_lr * weight).min(base_lr);
             let _ = self
                 .network

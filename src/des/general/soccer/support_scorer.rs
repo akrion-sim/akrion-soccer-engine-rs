@@ -593,7 +593,8 @@ mod tests {
         let goal = support_outcome_event_weight(SoccerRewardEventKind::Goal);
         let shot = support_outcome_event_weight(SoccerRewardEventKind::ShotOnTarget);
         let pass = support_outcome_event_weight(SoccerRewardEventKind::TwoForwardPasses);
-        let turnover = support_outcome_event_weight(SoccerRewardEventKind::OverdribbleDispossession);
+        let turnover =
+            support_outcome_event_weight(SoccerRewardEventKind::OverdribbleDispossession);
         assert!(goal > shot && shot > pass && pass > 0.0);
         assert!(turnover < 0.0);
         assert_eq!(
@@ -632,6 +633,9 @@ mod tests {
         // No env override → the conservative default; territorial stays the dominant dense signal.
         let w = support_outcome_reward_weight();
         assert!(w.is_finite() && w >= 0.0);
-        assert!(w <= 1.0, "default outcome blend must not swamp the territorial base: {w}");
+        assert!(
+            w <= 1.0,
+            "default outcome blend must not swamp the territorial base: {w}"
+        );
     }
 }
