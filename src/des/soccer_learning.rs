@@ -5176,6 +5176,7 @@ fn action_entry_value(entry: SoccerQEntry) -> EntryValue {
         target_tactical_cell_id: -1,
         target_macro_cell_id: -1,
         target_root_cell_id: -1,
+        receiver_descriptor: RECEIVER_DESCRIPTOR_UNSPECIFIED,
     }
 }
 
@@ -5189,6 +5190,7 @@ fn target_entry_value(entry: SoccerQTargetEntry) -> EntryValue {
         target_tactical_cell_id: entry.target_tactical_cell_id as i32,
         target_macro_cell_id: entry.target_macro_cell_id as i32,
         target_root_cell_id: entry.target_root_cell_id as i32,
+        receiver_descriptor: entry.receiver_descriptor,
     }
 }
 
