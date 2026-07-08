@@ -9562,6 +9562,13 @@ impl SoccerMatch {
         });
     }
 
+    /// Read-only world snapshot for external tooling (possession-chain / EPV export).
+    /// Constructs the same agent-decision snapshot the engine uses internally; pure read,
+    /// no mutation, so calling it is byte-identical to not calling it. Off any hot path.
+    pub fn export_world_snapshot(&self) -> WorldSnapshot {
+        WorldSnapshot::from_match_for_agent_decision(self)
+    }
+
     pub fn summary(&self) -> MatchSummary {
         // Include the still-open consecutive-pass chain (if any) so the final sequence of the
         // match is counted, without mutating live state — `summary` is a read-only view.
