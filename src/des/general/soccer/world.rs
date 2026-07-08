@@ -11121,15 +11121,13 @@ impl SoccerMatch {
         }
         for decision in self.pending_support_decisions.iter_mut() {
             for &(event_player, event_team, weight) in &contributions {
-                if event_team != decision.team {
-                    continue;
-                }
-                let factor = if event_player == decision.player_id {
-                    1.0
-                } else {
-                    SUPPORT_OUTCOME_TEAMMATE_DISCOUNT
-                };
-                decision.outcome_accumulator += weight * factor;
+                decision.outcome_accumulator += support_outcome_decision_delta(
+                    decision.team,
+                    decision.player_id,
+                    event_team,
+                    event_player,
+                    weight,
+                );
             }
         }
     }
