@@ -33,6 +33,16 @@ const MPC_OBJECTIVE_HIDDEN_UNITS: usize = 32;
 /// Hard bound (yards) on the residual — the guardrail that keeps the executor inside the
 /// "policy owns WHERE" contract. Codex round-9: ~1.0–1.5 yd for a first cut.
 pub const MPC_OBJECTIVE_MAX_RESIDUAL_YARDS: f64 = 1.5;
+/// Hard bound (yards) on the learned SIGNED bend — the 3rd output dim, present only when the head
+/// is built bend-enabled (`DD_SOCCER_ENABLE_LEARNED_CURVE`). Positive = curl one way, negative the
+/// other; `|value|` = lateral yards the flight bows off the straight chord. Sized so a warmed head
+/// can steer a pass/shot AROUND a defender on the straight lane (the "knight-move"), while the ball
+/// physics still clamp the realised curl to `MAX_BALL_CURL_YPS2`.
+pub const MPC_OBJECTIVE_MAX_BEND_YARDS: f64 = 6.0;
+/// Exploration std-dev (yards) for the bend axis. Larger than the aim-residual sigma because bend
+/// only helps in the minority of states with a blocked straight lane, so it needs a wider search to
+/// find the states where curling pays.
+pub const MPC_OBJECTIVE_BEND_EXPLORE_SIGMA_YARDS: f64 = 1.2;
 /// Default exploration std-dev (yards) added to the greedy residual at capture time. Without
 /// exploration the RWR loop only ever imitates the residual it already took, so it can never
 /// DISCOVER a better aim — the jitter is what gives the contextual bandit a gradient to climb.
