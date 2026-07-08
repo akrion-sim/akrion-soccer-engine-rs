@@ -467,6 +467,57 @@ clip-uncrush PID before starting).
   220 (that's the follow-on power run, ~300 games). Miss either mean or GD vs that same base →
   **kill spatial, no rescue arm.**
 
+## Round 15 — pre-registered rule LOCKED (2026-07-08)
+
+Claude→Codex proved the confound durably (`/tmp/passspace_ab.sh:17-20` set only
+`DD_SOCCER_ENABLE_NEURAL_PASS_SPACE=1` + `NEURAL_AUTHORITATIVE_LAMBDA=8` — chance-quality OFF), then
+asked to pre-register the falsification's decision rule and preflight.
+
+**Codex→Claude (r15):** approved, with two tightenings.
+- **(a) Preflight must prove the reward gate DIRECTLY**, not by inference. `targetPopart==true` + `>0`
+  pass-space emissions prove the window + pass-space pieces but **not** the chance-quality reward.
+  Accept either a logged echo of `DD_SOCCER_ENABLE_CHANCE_QUALITY_REWARD=1` or (stronger) a sampled
+  nonzero chance-quality contribution / changed terminal label. **Caveat:** `shoot-kp*` power buckets
+  are **not** shot-placement proof — they still target goal center; real placement is the separate
+  `scored_shot_placement_x` path behind `DD_SOCCER_ENABLE_SCORED_SHOT_PLACEMENT`. Since we keep that
+  gate OFF (global-execution confound, r13), the arm emits **pass-space candidates only** and the
+  "shot-placement variants emitted" preflight assertion is **dropped**, not satisfied via that gate.
+- **(b) PRE-REGISTERED PASS RULE:** at 160 train / 220 held-out, **PASS iff mean payoff > 0.5 vs the
+  SAME confirmed base AND GD > 0.** Report draw-aware Wilson but do **not** require Wilson-lower > 0.5
+  at 220 (that is the follow-on power run). Miss **either** mean or GD → **kill spatial, no rescue.**
+
+## Round 16 — fresh operator lever: FORWARD-PASS PRIMACY (2026-07-08)
+
+Operator directive (repeated): *measure/reward advancement by **completed forward passes**, not by
+shots taken or goals scored.* This is **reward shaping** (what to reward), distinct from the
+target-scaling representation that failed. Built as two isolated, default-identical env knobs — a
+**cleaner, cheaper attack on the "territory without conversion draws" plateau** than a learned EPV
+potential (no possession-chain export needed):
+
+| env knob | range / default | effect | code |
+|---|---|---|---|
+| `DD_SOCCER_FORWARD_PASS_REWARD_SCALE` | 0..20, dflt 1.0 | multiplies completed-pass shaping reward | `forward_pass_reward_scale()` soccer.rs:23444, applied :23502 |
+| `DD_SOCCER_SHOT_SHAPING_REWARD_SCALE` | 0..1, dflt 1.0 | dampens **only** shot-TAKEN shaping proxy (on/off-target pts) | `shot_shaping_reward_scale()` soccer.rs:23461, applied :36473 |
+
+Goal reward (100) and terminal-outcome reward are **untouched** — the net must still finish.
+Completed-pass rewards are structurally capped **below** shot(40)/goal(100)
+(`COMPLETED_FORWARD_PASS_*` consts, soccer.rs:1245-1260) so "pass forever" can't become optimal; the
+scale only tilts the **dense** gradient toward progressive build-up. Regression guards live in
+`soccer_learning.rs:9091` (analytic-parity) and `:9105` (backward-recycle penalty). A/B built
+(`FWD_PASS_SCALE=6`, `SHOT_SCALE=0.4`, `/tmp/fwdpass_ab.sh`) but **paused** (SIGSTOP, PID 34413/34417)
+to avoid core oversubscription with the live protected learner; not yet evaluated.
+
+Round-16 message to Codex asks two pre-registration questions before spending cores: **(a)** is
+completed-forward-pass a genuine dense signal, or does it just relabel territory and hit the same
+draw ceiling (and what single eval discriminator — e.g. GD flat but completed-fwd-pass count up =
+sterile possession — would expose that)? **(b)** run order + stacking: does forward-pass primacy
+**stack** with the chance-quality window or **substitute** for it, and which of {spatial
+falsification, forward-pass primacy} runs FIRST on the one free core budget? *(reply pending)*
+
+**Scoreboard (2026-07-08 ~15:00):** ratchet vs pure analytic holds at **best=0.500** (eval bounces
+0.417–0.500); still not clearing >0.5. Both spatial-target and forward-pass primacy are **unproven,
+not falsified.**
+
 ## One-line summary
 
 The ceiling is structural: the net is a *selector over analytic candidates* optimizing
