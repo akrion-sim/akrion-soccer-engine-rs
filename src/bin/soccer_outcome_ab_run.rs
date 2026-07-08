@@ -95,6 +95,11 @@ fn train(out_path: &str, games: usize, minutes: f64, seed_base: u32) {
     );
     let mut policies = Arc::new(SoccerTeamQPolicies::new(SoccerQPolicyOptions::default()));
     let mut snapshot: Option<SoccerNeuralNetworkSnapshot> = None;
+    // Carried MPC-objective (executor) head: install per game so the learned aim/lead residual is
+    // APPLIED live, drain + RWR-train it after each game, and carry the warm head forward — mirrors
+    // main_soccer_learning_run. Gated on DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE, so when the flag is
+    // off no head is installed and the arm is byte-identical to before (all prior A/Bs unchanged).
+    let mut mpc_head: Option<SoccerMpcObjectiveHead> = None;
     let started = Instant::now();
     for g in 0..games {
         let mut config = MatchConfig {
