@@ -437,7 +437,6 @@ fn main() {
             * runner_config.base.neural_learning.target_clip,
         runner_config.base.neural_learning.target_popart_enabled,
     );
-=======
     // Un-collapse the value head on fresh nets: honour SOCCER_NEURAL_TARGET_POPART here (the
     // league bin otherwise leaves target-PopArt at the config default = off, unlike the
     // learning-run bins). A collapsed value can't rank candidates, which would make the Part-B
