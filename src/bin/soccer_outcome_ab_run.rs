@@ -153,7 +153,7 @@ fn play_holdout_fixture(
     seed: u32,
     home: &TeamBrain,
     away: &TeamBrain,
-) -> Option<MatchReport> {
+) -> Option<(MatchReport, u32, u32)> {
     let ctx = TournamentMatchContext {
         stage: TournamentStage::Group,
         round_index: 0,
@@ -167,18 +167,26 @@ fn play_holdout_fixture(
         away_learns: false,
     };
     match runner.play(&ctx, home, away) {
-        Ok(o) => Some(MatchReport {
-            stage: ctx.stage,
-            home_id,
-            away_id,
-            home_name: ctx.home_name,
-            away_name: ctx.away_name,
-            home_goals: o.home_goals,
-            away_goals: o.away_goals,
-            shootout_winner: None,
-            home_training_steps: o.home_training_steps,
-            away_training_steps: o.away_training_steps,
-        }),
+        Ok(o) => {
+            // Dense advancement signal: completed FORWARD passes per team this match (already
+            // counted in MatchStats, surfaced via the outcome summary). Returned alongside the
+            // score so the caller can measure progression, not just the rare goal outcome.
+            let home_forward = o.summary.stats.passes_completed_forward_home;
+            let away_forward = o.summary.stats.passes_completed_forward_away;
+            let report = MatchReport {
+                stage: ctx.stage,
+                home_id,
+                away_id,
+                home_name: ctx.home_name,
+                away_name: ctx.away_name,
+                home_goals: o.home_goals,
+                away_goals: o.away_goals,
+                shootout_winner: None,
+                home_training_steps: o.home_training_steps,
+                away_training_steps: o.away_training_steps,
+            };
+            Some((report, home_forward, away_forward))
+        }
         Err(e) => {
             eprintln!("[eval] fixture error: {e}");
             None
@@ -204,6 +212,12 @@ fn eval(candidate_path: &str, baseline_path: &str, games: usize, minutes: f64, h
 
     let started = Instant::now();
     let mut reports: Vec<MatchReport> = Vec::new();
+    // Dense advancement metric: the per-game (candidate − baseline) completed-forward-pass
+    // differential. Because both sides play the same seeded fixture head-to-head, this is a PAIRED
+    // sample — far more statistically powerful than the sparse, draw-heavy goal margin.
+    let mut forward_pass_diffs: Vec<f64> = Vec::new();
+    let mut candidate_forward_total: u64 = 0;
+    let mut baseline_forward_total: u64 = 0;
     for g in 0..games {
         let seed = holdout_base.wrapping_add((g as u32).wrapping_mul(2_246_822_519));
         // Alternate home/away so the verdict isn't a home-field artifact.
@@ -226,14 +240,26 @@ fn eval(candidate_path: &str, baseline_path: &str, games: usize, minutes: f64, h
                 &candidate,
             )
         };
-        if let Some(r) = report {
+        if let Some((r, home_forward, away_forward)) = report {
+            // Map the fixture's home/away forward-pass counts back to candidate/baseline
+            // regardless of this game's orientation.
+            let (candidate_forward, baseline_forward) = if r.home_id == candidate_id {
+                (home_forward, away_forward)
+            } else {
+                (away_forward, home_forward)
+            };
+            candidate_forward_total += u64::from(candidate_forward);
+            baseline_forward_total += u64::from(baseline_forward);
+            forward_pass_diffs.push(f64::from(candidate_forward) - f64::from(baseline_forward));
             eprintln!(
-                "[eval] game {:>2}/{games} {}v{} -> {}-{} ({:.0}s)",
+                "[eval] game {:>2}/{games} {}v{} -> {}-{}  fwd-passes cand/base {}/{} ({:.0}s)",
                 g + 1,
                 r.home_id,
                 r.away_id,
                 r.home_goals,
                 r.away_goals,
+                candidate_forward,
+                baseline_forward,
                 started.elapsed().as_secs_f64()
             );
             reports.push(r);
@@ -273,6 +299,48 @@ fn eval(candidate_path: &str, baseline_path: &str, games: usize, minutes: f64, h
     );
     for reason in &verdict.reasons {
         println!("  - {reason}");
+    }
+
+    // ---- Forward-pass advancement: the dense progressive-play climb metric ----
+    // Completed forward passes are frequent (dozens/game), directly measure ball progression, and
+    // can't be farmed the way shots can. On a PAIRED head-to-head sample this gives a tight
+    // confidence bound that detects a real climb the sparse goal margin would call a plateau.
+    let n = forward_pass_diffs.len();
+    if n > 0 {
+        let n_f = n as f64;
+        let mean_diff = forward_pass_diffs.iter().sum::<f64>() / n_f;
+        let variance = if n > 1 {
+            forward_pass_diffs
+                .iter()
+                .map(|d| (d - mean_diff).powi(2))
+                .sum::<f64>()
+                / (n_f - 1.0)
+        } else {
+            0.0
+        };
+        let std_error = (variance / n_f).sqrt();
+        // 95% normal lower confidence bound on the mean paired differential.
+        let lower_bound = mean_diff - 1.96 * std_error;
+        let candidate_per_game = candidate_forward_total as f64 / n_f;
+        let baseline_per_game = baseline_forward_total as f64 / n_f;
+        println!("\n===== FORWARD-PASS ADVANCEMENT (dense progressive-play climb metric) =====");
+        println!(
+            "completed forward passes/game: candidate {candidate_per_game:.1}  baseline {baseline_per_game:.1}  Δ {:+.2}/game",
+            candidate_per_game - baseline_per_game
+        );
+        println!(
+            "paired per-game Δ: mean {mean_diff:+.2}, 95% lower bound {lower_bound:+.2} over {n} games"
+        );
+        let advancement = if lower_bound > 0.0 {
+            "CLIMB — candidate significantly out-progresses the baseline (lower bound > 0)"
+        } else if mean_diff > 0.0 {
+            "directional climb — more forward passes on average, not yet significant (need more games)"
+        } else {
+            "no advancement on forward passes"
+        };
+        println!("ADVANCEMENT: {advancement}");
+    } else {
+        println!("\n[advancement] no completed fixtures to measure forward-pass progression");
     }
 }
 
