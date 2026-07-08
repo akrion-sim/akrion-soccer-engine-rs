@@ -585,4 +585,53 @@ mod tests {
             "warm installed head should replace the analytic support score: analytic={analytic} learned={learned}"
         );
     }
+
+    #[test]
+    fn outcome_event_weights_rank_goal_over_pass_over_zero_over_turnover() {
+        // The ladder the off-ball move learns from: scoring ≫ a completed forward pass > neutral,
+        // and turnovers are strictly negative. Neutral/unrelated kinds contribute nothing.
+        let goal = support_outcome_event_weight(SoccerRewardEventKind::Goal);
+        let shot = support_outcome_event_weight(SoccerRewardEventKind::ShotOnTarget);
+        let pass = support_outcome_event_weight(SoccerRewardEventKind::TwoForwardPasses);
+        let turnover = support_outcome_event_weight(SoccerRewardEventKind::OverdribbleDispossession);
+        assert!(goal > shot && shot > pass && pass > 0.0);
+        assert!(turnover < 0.0);
+        assert_eq!(
+            support_outcome_event_weight(SoccerRewardEventKind::HeaderGoalFromCross),
+            goal,
+            "a headed goal from a cross is still a goal"
+        );
+        assert_eq!(
+            support_outcome_event_weight(SoccerRewardEventKind::Routine),
+            0.0,
+            "routine/unrelated events must not shape the move reward"
+        );
+    }
+
+    #[test]
+    fn outcome_credit_is_mover_full_teammate_discounted_opponent_zero() {
+        let w = 1.0;
+        // The deciding player's own outcome: full weight.
+        let own = support_outcome_decision_delta(Team::Home, 3, Team::Home, 3, w);
+        // A teammate's outcome in the same window: discounted.
+        let teammate = support_outcome_decision_delta(Team::Home, 3, Team::Home, 7, w);
+        // An opponent's outcome: ignored entirely.
+        let opponent = support_outcome_decision_delta(Team::Home, 3, Team::Away, 7, w);
+        assert!((own - 1.0).abs() < 1e-9);
+        assert!((teammate - SUPPORT_OUTCOME_TEAMMATE_DISCOUNT).abs() < 1e-9);
+        assert_eq!(opponent, 0.0);
+        assert!(own > teammate && teammate > 0.0);
+        // A turnover (negative weight) flips sign but keeps the same mover/teammate ordering.
+        let bad = support_outcome_event_weight(SoccerRewardEventKind::TurnoverChainBlame);
+        let own_turnover = support_outcome_decision_delta(Team::Home, 3, Team::Home, 3, bad);
+        assert!(own_turnover < 0.0);
+    }
+
+    #[test]
+    fn outcome_reward_weight_default_is_a_bounded_nonnegative_nudge() {
+        // No env override → the conservative default; territorial stays the dominant dense signal.
+        let w = support_outcome_reward_weight();
+        assert!(w.is_finite() && w >= 0.0);
+        assert!(w <= 1.0, "default outcome blend must not swamp the territorial base: {w}");
+    }
 }
