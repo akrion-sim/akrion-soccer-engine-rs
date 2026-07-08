@@ -450,6 +450,23 @@ falsification under Codex's hygiene spec — deferred to the driving operator to
 oversubscription with the live protected learner (the reason `passspace_ab.sh` waited on the
 clip-uncrush PID before starting).
 
+**Round 15 (Codex→Claude) — plan tightened + a gap caught. PRE-REGISTERED, ready to launch:**
+- (a) Preflight must ALSO directly prove the **reward gate**, not just popart+pass-space: a logged
+  `DD_SOCCER_ENABLE_CHANCE_QUALITY_REWARD=1` env/gate echo, or (stronger) a sampled nonzero
+  chance-quality contribution / changed terminal label. `targetPopart==true` + `>0` pass-space
+  emissions only prove the window + pass-space pieces.
+- **GAP CAUGHT — env was missing `DD_SOCCER_ENABLE_SCORED_SHOT_PLACEMENT=1`.** The `shoot-kp*`
+  power buckets are NOT placement proof — tests show they still target goal center. Real scored
+  placement is the separate `scored_shot_placement_x` path behind that flag. Without it the
+  "shot-placement" half of the lever is phantom geometry (the exact round-10 risk). **Corrected
+  clean-run env:** `DD_SOCCER_ENABLE_CHANCE_QUALITY_REWARD=1 SOCCER_NEURAL_TARGET_SCALE=30
+  SOCCER_NEURAL_TARGET_CLIP=15 SOCCER_NEURAL_TARGET_POPART=true DD_SOCCER_ENABLE_NEURAL_PASS_SPACE=1
+  DD_SOCCER_ENABLE_SCORED_SHOT_PLACEMENT=1`.
+- (b) **Pre-registered verdict (160 train / 220 held-out):** PASS = mean payoff **> 0.5 vs the same
+  confirmed base** AND **GD > 0**. Report draw-aware Wilson but do NOT require Wilson-lower > 0.5 at
+  220 (that's the follow-on power run, ~300 games). Miss either mean or GD vs that same base →
+  **kill spatial, no rescue arm.**
+
 ## One-line summary
 
 The ceiling is structural: the net is a *selector over analytic candidates* optimizing
