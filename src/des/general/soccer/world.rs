@@ -5559,6 +5559,49 @@ mod tests {
     }
 
     #[test]
+    fn neural_authoritative_keeps_discretized_kick_buckets_beside_plain_family() {
+        let plain_shoot = SoccerLearnedActionTrace {
+            label: "shoot".to_string(),
+            value: 1.0,
+            visits: 4,
+            probability: 1.0,
+            legal: true,
+            level: PitchGridLevel::Fine,
+        };
+        let legal = vec![plain_shoot.clone()];
+
+        assert!(
+            SoccerMatch::neural_authoritative_candidate_already_present(&legal, "shoot"),
+            "plain family should still dedupe by normalized action"
+        );
+        assert!(
+            !SoccerMatch::neural_authoritative_candidate_already_present(&legal, "shoot-kp7"),
+            "a plain shoot candidate must not starve the actor-owned shot-power bucket"
+        );
+        assert_eq!(
+            SoccerMatch::neural_authoritative_candidate_label_for_policy_action("shoot-kp7"),
+            "shoot-kp7"
+        );
+
+        let mut legal_with_bucket = vec![plain_shoot];
+        legal_with_bucket.push(SoccerLearnedActionTrace {
+            label: "shoot-kp7".to_string(),
+            value: 0.0,
+            visits: 0,
+            probability: 0.0,
+            legal: true,
+            level: PitchGridLevel::WholePitch,
+        });
+        assert!(
+            SoccerMatch::neural_authoritative_candidate_already_present(
+                &legal_with_bucket,
+                "shoot-kp7"
+            ),
+            "exact bucket labels should dedupe after they have been injected"
+        );
+    }
+
+    #[test]
     fn discretized_kick_gate_expands_pass_targets_into_power_bucket_candidates() {
         let _env_lock = soccer_world_env_lock();
         let _env = set_test_env_var("DD_SOCCER_ENABLE_DISCRETIZED_KICK", "1");
@@ -13032,6 +13075,30 @@ impl SoccerMatch {
         value
     }
 
+    fn neural_authoritative_candidate_label_for_policy_action(label: &str) -> String {
+        if learned_discretized_kick_speed_bucket_for_action_label(label).is_some() {
+            learned_mpc_action_label_key(label)
+        } else {
+            normalize_soccer_action_label(label).to_string()
+        }
+    }
+
+    fn neural_authoritative_candidate_already_present(
+        legal: &[SoccerLearnedActionTrace],
+        label: &str,
+    ) -> bool {
+        if learned_discretized_kick_speed_bucket_for_action_label(label).is_some() {
+            let candidate_label = Self::neural_authoritative_candidate_label_for_policy_action(label);
+            legal.iter()
+                .any(|candidate| learned_mpc_action_label_key(&candidate.label) == candidate_label)
+        } else {
+            let normalized = normalize_soccer_action_label(label);
+            legal
+                .iter()
+                .any(|candidate| normalize_soccer_action_label(&candidate.label) == normalized)
+        }
+    }
+
     /// Re-rank legal tabular candidates with the trained value head per
     /// `neural_blend`, then supplement from the fixed neural action vocabulary
     /// when a warmed critic exists. Each candidate is scored through its concrete
@@ -13184,10 +13251,7 @@ impl SoccerMatch {
         ) {
             for &label in SOCCER_POLICY_ACTIONS {
                 let normalized = normalize_soccer_action_label(label);
-                if legal
-                    .iter()
-                    .any(|candidate| normalize_soccer_action_label(&candidate.label) == normalized)
-                {
+                if Self::neural_authoritative_candidate_already_present(&legal, label) {
                     continue;
                 }
                 if !learned_action_label_is_legal_for_observation(
@@ -13200,7 +13264,7 @@ impl SoccerMatch {
                     continue;
                 }
                 legal.push(SoccerLearnedActionTrace {
-                    label: normalized.to_string(),
+                    label: Self::neural_authoritative_candidate_label_for_policy_action(label),
                     value: 0.0,
                     visits: 0,
                     probability: 0.0,
