@@ -13730,12 +13730,18 @@ impl PlayerAgent {
                 "defend".to_string(),
             )),
             "defend-shape" if snapshot.controlled_possession_team() == Some(self.team.other()) => {
+                let own_defensive =
+                    snapshot.defensive_assignment_for(self.id, self.home_position, false);
                 let target = snapshot
                     .formation_lp_guidance_for(self.id)
-                    .map(|guidance| guidance.target)
-                    .unwrap_or_else(|| {
-                        snapshot.defensive_assignment_for(self.id, self.home_position, false)
-                    });
+                    .map(|guidance| {
+                        formation_nudged_target(
+                            self.decision_confidence,
+                            own_defensive,
+                            guidance.target,
+                        )
+                    })
+                    .unwrap_or(own_defensive);
                 Some((SoccerAction::MoveTo(target), "defend-shape".to_string()))
             }
             "defend-roam" if snapshot.controlled_possession_team() == Some(self.team.other()) => {
