@@ -13045,7 +13045,6 @@ impl SoccerMatch {
             label,
             plan: None,
             behavior_probability,
->>>>>>> wip/sidecar-engine-hook
             neural_mcts_selected: false,
             neural_mcts_candidate_count: 0,
             neural_mcts_discretized_kick_candidate_count: 0,
