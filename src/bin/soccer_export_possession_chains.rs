@@ -24,9 +24,7 @@
 use std::io::{BufWriter, Write};
 use std::time::Instant;
 
-use soccer_engine::des::general::soccer::{
-    MatchConfig, SoccerConfigVector, SoccerMatch, Team,
-};
+use soccer_engine::des::general::soccer::{MatchConfig, SoccerConfigVector, SoccerMatch, Team};
 
 fn parse_hex(s: Option<&String>, default: u32) -> u32 {
     s.and_then(|raw| u32::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
@@ -75,9 +73,19 @@ fn flush_chain(
              \"forward\":{:.4},\"lateral\":{:.4},\"ball_x\":{:.2},\"ball_y\":{:.2},\
              \"field_length\":{:.1},\"field_width\":{:.1},\
              \"terminal_outcome\":\"{}\",\"ticks_to_terminal\":{}",
-            match_id, chain_id, team.label(), r.tick, tic,
-            r.forward, r.lateral, r.ball_x, r.ball_y,
-            r.field_length, r.field_width, outcome, ttt,
+            match_id,
+            chain_id,
+            team.label(),
+            r.tick,
+            tic,
+            r.forward,
+            r.lateral,
+            r.ball_x,
+            r.ball_y,
+            r.field_length,
+            r.field_width,
+            outcome,
+            ttt,
         )?;
         if let Some(f) = &r.features {
             write!(w, ",\"features\":[")?;
@@ -110,7 +118,8 @@ fn main() -> std::io::Result<()> {
     let mut total_rows = 0usize;
     let mut total_chains = 0u32;
     // Outcome tally for a quick sanity read of the label distribution.
-    let (mut n_goal, mut n_sot, mut n_shot, mut n_turn, mut n_timeout) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut n_goal, mut n_sot, mut n_shot, mut n_turn, mut n_timeout) =
+        (0u64, 0u64, 0u64, 0u64, 0u64);
 
     for g in 0..games {
         let mut config = MatchConfig {
@@ -214,8 +223,16 @@ fn main() -> std::io::Result<()> {
                         "shot" => n_shot += 1,
                         _ => n_turn += 1,
                     }
-                    total_rows +=
-                        flush_chain(&mut w, &cur_rows, ct, match_id, chain_id, oc, sim.tick, chain_start_tick)?;
+                    total_rows += flush_chain(
+                        &mut w,
+                        &cur_rows,
+                        ct,
+                        match_id,
+                        chain_id,
+                        oc,
+                        sim.tick,
+                        chain_start_tick,
+                    )?;
                     chain_id += 1;
                     cur_team = None;
                     cur_rows.clear();
@@ -228,7 +245,14 @@ fn main() -> std::io::Result<()> {
             n_timeout += 1;
             let terminal_tick = sim.tick;
             total_rows += flush_chain(
-                &mut w, &cur_rows, ct, match_id, chain_id, "timeout", terminal_tick, chain_start_tick,
+                &mut w,
+                &cur_rows,
+                ct,
+                match_id,
+                chain_id,
+                "timeout",
+                terminal_tick,
+                chain_start_tick,
             )?;
             chain_id += 1;
         }
