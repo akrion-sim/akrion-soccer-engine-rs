@@ -32774,11 +32774,7 @@ impl SoccerMatch {
                 self.mpc_objective_samples.push(MpcObjectiveSample {
                     features: features.clone(),
                     applied_residual: *residual,
-<<<<<<< HEAD
                     applied_bend: *applied_bend,
-=======
-                    applied_bend: *bend,
->>>>>>> becc85423bcd4c8a6e30f374299605c5988be0eb
                     reward,
                 });
                 if self.mpc_objective_samples.len() > MPC_OBJECTIVE_SAMPLE_CAP {
