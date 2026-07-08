@@ -129,13 +129,19 @@ fn main() -> std::io::Result<()> {
         let mut cur_rows: Vec<Row> = Vec::new();
         let mut chain_start_tick: u64 = 0;
         let mut prev_score = (0u32, 0u32);
+        // Per-team shot counters diffed each tick — MatchStats counts each shot ONCE (unlike the
+        // reward-event stream, which distributes shot credit across the whole buildup chain).
+        let mut prev_shots = (0u32, 0u32);
+        let mut prev_sot = (0u32, 0u32);
 
         for _ in 0..total_ticks {
             sim.run_time_step();
-            let (shot_att, shot_sot) = sim.tick_shot_counts();
             let snap = sim.export_world_snapshot();
             let poss = snap.possession_team();
             let score = (sim.score_home, sim.score_away);
+            let stats = sim.summary().stats;
+            let shots = (stats.shots_home, stats.shots_away);
+            let sot = (stats.shots_on_target_home, stats.shots_on_target_away);
             let scoring_team = if score.0 > prev_score.0 {
                 Some(Team::Home)
             } else if score.1 > prev_score.1 {
@@ -143,7 +149,18 @@ fn main() -> std::io::Result<()> {
             } else {
                 None
             };
+            // Per-team deltas this tick for the currently-possessing team (attributed correctly).
+            let sot_for = |t: Team| match t {
+                Team::Home => sot.0 > prev_sot.0,
+                Team::Away => sot.1 > prev_sot.1,
+            };
+            let shot_for = |t: Team| match t {
+                Team::Home => shots.0 > prev_shots.0,
+                Team::Away => shots.1 > prev_shots.1,
+            };
             prev_score = score;
+            prev_shots = shots;
+            prev_sot = sot;
 
             // Open a chain when a team first gains possession.
             if cur_team.is_none() {
