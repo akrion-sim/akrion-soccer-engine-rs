@@ -23428,6 +23428,41 @@ fn completed_flank_pass_reward(
     COMPLETED_FLANK_PASS_BONUS_POINTS * flank_use * direction_fit * half_multiplier
 }
 
+/// Forward-pass-primacy shaping (measure advancement by COMPLETED FORWARD PASSES, not shots taken).
+/// Scales the completed-pass reward so progressive build-up can be made the primary dense signal —
+/// today a completed forward pass is worth ~3-11 pts vs a shot-on-target's 80, so the net is pulled
+/// to shoot rather than progress. Env `DD_SOCCER_FORWARD_PASS_REWARD_SCALE` (clamped 0-20),
+/// default 1.0 ⇒ byte-identical.
+pub(crate) fn forward_pass_reward_scale() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_FORWARD_PASS_REWARD_SCALE")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.0, 20.0))
+            .unwrap_or(1.0)
+    })
+}
+
+/// Companion dampener for the shot-TAKEN shaping proxy (on-/off-target reward, NOT the goal or
+/// terminal-outcome reward, which stay intact — the net must still finish). Lets a forward-pass-
+/// primacy A/B stop the net shooting early instead of building up. Env
+/// `DD_SOCCER_SHOT_SHAPING_REWARD_SCALE` (clamped 0-1), default 1.0 ⇒ unchanged.
+pub(crate) fn shot_shaping_reward_scale() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_SHOT_SHAPING_REWARD_SCALE")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.0, 1.0))
+            .unwrap_or(1.0)
+    })
+}
+
 fn completed_pass_reward_for_pitch(
     team: Team,
     origin: Vec2,
@@ -23455,7 +23490,8 @@ fn completed_pass_reward_for_pitch(
         (PassDirectionBucket::Backward, true) => -COMPLETED_BACK_PASS_PENALTY_OWN_HALF,
         (PassDirectionBucket::Backward, false) => -COMPLETED_BACK_PASS_PENALTY_OPPONENT_HALF,
     };
-    base + completed_flank_pass_reward(team, origin, target, field_width, field_length)
+    (base + completed_flank_pass_reward(team, origin, target, field_width, field_length))
+        * forward_pass_reward_scale()
 }
 
 fn completed_pass_reward(team: Team, origin: Vec2, target: Vec2, field_length: f64) -> f64 {
@@ -36413,8 +36449,13 @@ fn soccer_learning_reward_contract() -> SoccerLearningRewardContract {
     SoccerLearningRewardContract {
         goal_points: GOAL_REWARD_POINTS,
         goal_chain_pattern: GOAL_CHAIN_REWARD_PATTERN.to_vec(),
-        shot_on_target_points: SHOT_ON_TARGET_REWARD_POINTS,
-        shot_on_target_pattern: SHOT_ON_TARGET_REWARD_PATTERN.to_vec(),
+        // Shot-taken SHAPING dampener (forward-pass-primacy A/B). Scales only the on-target shot
+        // PROXY reward — `goal_points` above is left intact so finishing still pays. Default 1.0.
+        shot_on_target_points: SHOT_ON_TARGET_REWARD_POINTS * shot_shaping_reward_scale(),
+        shot_on_target_pattern: SHOT_ON_TARGET_REWARD_PATTERN
+            .iter()
+            .map(|points| points * shot_shaping_reward_scale())
+            .collect(),
         possession_progress_milestone_yards: POSSESSION_PROGRESS_MILESTONE_YARDS,
         possession_progress_points: POSSESSION_PROGRESS_REWARD_POINTS,
         possession_progress_reward_weights: POSSESSION_PROGRESS_REWARD_WEIGHTS.to_vec(),
