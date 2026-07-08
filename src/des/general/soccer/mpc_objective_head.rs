@@ -98,18 +98,30 @@ pub struct SoccerMpcObjectiveHead {
     network: FeedForwardNetwork,
     training_steps: usize,
     last_loss: Option<f64>,
+    /// When true the network has a 3rd output dim = signed bend (yards). When false the head is
+    /// byte-identical to the original 2-output aim/lead head — same shape, same RNG consumption,
+    /// so the `DD_SOCCER_ENABLE_LEARNED_CURVE`-off path is unchanged.
+    bend_enabled: bool,
 }
 
 impl SoccerMpcObjectiveHead {
+    /// Original 2-output (aim/lead only) head. Bend disabled — byte-identical to prior behavior.
     pub fn new(seed: u32) -> Self {
+        Self::new_with_bend(seed, false)
+    }
+
+    /// Build the head with an optional 3rd learnable bend output. `bend_enabled=false` reproduces
+    /// [`Self::new`] exactly (output_dim 2, same init draw order).
+    pub fn new_with_bend(seed: u32, bend_enabled: bool) -> Self {
         let mut rng = mulberry32(seed ^ 0x4D50_4301);
+        let output_dim = if bend_enabled { 3 } else { 2 };
         let network = FeedForwardNetwork::random(
             &RandomNetworkSpec {
                 input_dim: MPC_OBJECTIVE_FEATURE_DIM,
                 hidden_layers: vec![MPC_OBJECTIVE_HIDDEN_UNITS],
-                output_dim: 2,
+                output_dim,
                 hidden_activation: ActivationName::Relu,
-                // Tanh → each output in (-1, 1); scaled by MAX_RESIDUAL for a hard yard bound.
+                // Tanh → each output in (-1, 1); scaled by MAX_RESIDUAL / MAX_BEND for a hard bound.
                 output_activation: ActivationName::Tanh,
                 weight_scale: None,
             },
@@ -119,7 +131,13 @@ impl SoccerMpcObjectiveHead {
             network,
             training_steps: 0,
             last_loss: None,
+            bend_enabled,
         }
+    }
+
+    /// Whether this head carries the learnable bend (3rd output) axis.
+    pub fn bend_enabled(&self) -> bool {
+        self.bend_enabled
     }
 
     pub fn training_steps(&self) -> usize {
