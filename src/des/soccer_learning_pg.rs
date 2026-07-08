@@ -4214,7 +4214,7 @@ fn append_completed_run_header_value_tuple(sql: &mut String, first_param: usize)
 fn append_run_delta_value_tuple(sql: &mut String, first_param: usize) {
     write!(
         sql,
-        "(${}::text::uuid, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+        "(${}::text::uuid, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
         first_param,
         first_param + 1,
         first_param + 2,
@@ -4230,7 +4230,8 @@ fn append_run_delta_value_tuple(sql: &mut String, first_param: usize) {
         first_param + 12,
         first_param + 13,
         first_param + 14,
-        first_param + 15
+        first_param + 15,
+        first_param + 16
     )
     .expect("write run delta tuple");
 }
