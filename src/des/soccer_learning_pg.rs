@@ -2745,6 +2745,7 @@ impl SoccerLearningPgStore {
                 target_tactical_cell_id: row.get(6),
                 target_macro_cell_id: row.get(7),
                 target_root_cell_id: row.get(8),
+                receiver_descriptor: row.get(15),
                 before_value: soccer_learning_from_micros(before_value_micros),
                 after_value: soccer_learning_from_micros(after_value_micros),
                 value_delta: soccer_learning_from_micros(value_delta_micros),
