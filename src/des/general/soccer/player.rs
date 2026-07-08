@@ -53,6 +53,67 @@ fn dd_soccer_disable_won_ball_pressure_escape() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_WON_BALL_PRESSURE_ESCAPE").is_ok())
 }
+/// Gate (default-OFF) for the **graded, overridable formation nudge**. Off-ball, the formation-LP
+/// shape target currently REPLACES a player's own POMDP/learned destination outright at the
+/// support-/defend-shape chokepoints. With this on, the LP target instead becomes a *bounded nudge*
+/// whose weight falls as the player's own decision confidence rises — so a convinced internal read
+/// overrides the shape signal (the "formation is a signal, internals can override" contract). Off ⇒
+/// the LP target is used directly, byte-identical to the prior authoritative behaviour.
+fn graded_formation_nudge_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_GRADED_FORMATION_NUDGE").is_ok())
+}
+fn formation_nudge_env_f64(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+        .unwrap_or(default)
+}
+/// Nudge weight at ZERO conviction — the most the LP can pull a fully-unsure player toward its shape
+/// target; scaled by `(1 - decision_confidence)`. Env-override `DD_SOCCER_FORMATION_NUDGE_BASE_WEIGHT`.
+fn formation_nudge_base_weight() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| formation_nudge_env_f64("DD_SOCCER_FORMATION_NUDGE_BASE_WEIGHT", 0.6).clamp(0.0, 1.0))
+}
+/// Hard cap (yards) on how far the nudge may displace a player from their own chosen destination —
+/// keeps it a nudge, never a yank, however far the LP target sits. Env `DD_SOCCER_FORMATION_NUDGE_MAX_YARDS`.
+fn formation_nudge_max_yards() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| formation_nudge_env_f64("DD_SOCCER_FORMATION_NUDGE_MAX_YARDS", 6.0).max(0.0))
+}
+/// Pure blend core: move the player's OWN destination `own` toward the formation-LP shape target
+/// `lp` by `base_weight · (1 - conviction)`, capped to `max_yards`. Conviction 1 ⇒ no pull (internal
+/// override); conviction 0 ⇒ full base pull, still bounded. Factored out for hermetic unit testing.
+fn formation_nudge_blend(
+    decision_confidence: f64,
+    own: Vec2,
+    lp: Vec2,
+    base_weight: f64,
+    max_yards: f64,
+) -> Vec2 {
+    let conviction = decision_confidence.clamp(0.0, 1.0);
+    let weight = (base_weight * (1.0 - conviction)).clamp(0.0, 1.0);
+    own + limit_vec2_len((lp - own) * weight, max_yards.max(0.0))
+}
+/// Gated wrapper: the graded formation nudge as consumed at the live off-ball chokepoints. Callers
+/// pass the LP shape target as `lp`, so when the gate is off this returns `lp` unchanged and the
+/// path is byte-identical to the prior authoritative behaviour.
+fn formation_nudged_target(decision_confidence: f64, own: Vec2, lp: Vec2) -> Vec2 {
+    if !graded_formation_nudge_enabled() {
+        return lp;
+    }
+    formation_nudge_blend(
+        decision_confidence,
+        own,
+        lp,
+        formation_nudge_base_weight(),
+        formation_nudge_max_yards(),
+    )
+}
 fn learned_policy_option_score_safety_enabled() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
