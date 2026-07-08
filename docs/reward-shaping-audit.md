@@ -65,11 +65,16 @@ shots. Two `OnceLock` env knobs, default 1.0 (identical):
   category-A and stay intact so finishing is never un-learned.
 
 **PBRS status:** the completed-forward-pass reward is a **category-C** per-visit term (a completion
-event, not a `Φ(s')−Φ(s)` delta), so scaling it up *is* increasing a farmable bias. The design
-contains the farm structurally (base+progress capped so a ~5-pass chain tops out ≈30 < shot 40 <
-goal 100, soccer.rs:1241-1260) plus regression guards in `soccer_learning.rs:9091` (analytic parity)
-and `:9105` (backward-recycle must stay penalized). It is **not** policy-invariant — hence gated and
-A/B'd vs the confirmed base, never flipped blind. The clean PBRS alternative (deferred) is a learned
+event, not a `Φ(s')−Φ(s)` delta), so scaling it up *is* increasing a farmable bias. At the DEFAULT
+scale the per-pass reward sits below `SHOT_ON_TARGET_REWARD_POINTS = 80` / `GOAL_REWARD_POINTS = 160`
+(soccer.rs:1167,1179), but the lever deliberately breaks that ordering: at `FWD_PASS_SCALE=6` a max
+forward/flank pass component reaches **≈83.5**, exceeding the shot-shaping proxy once
+`SHOT_SCALE=0.4` damps it to ≈32 (Codex r16). Goal (160) + terminal-outcome reward are **not** scaled
+and still dominate, so finishing is never un-learned, and regression guards hold in
+`soccer_learning.rs:9091` (analytic parity) and `:9105` (backward-recycle penalty). Because it is
+**not** policy-invariant and now *can* out-earn damped shot shaping, the sterile-possession
+discriminator (**held-out GD ≤ 0 while completed-forward-pass margin rises**) is mandatory in the
+A/B; gated vs the confirmed base, never flipped blind. The clean PBRS alternative (deferred) is a learned
 EPV potential routed through `potential_based_shaping`, which would value progression without the
 farm risk but needs a possession-chain export first.
 
