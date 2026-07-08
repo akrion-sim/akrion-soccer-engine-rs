@@ -13919,59 +13919,70 @@ impl SoccerMatch {
             }
         }
 
-        let mut samples: Vec<SoccerPolicySample> = replay
-            .iter()
-            .enumerate()
-            .filter_map(|(index, transition)| {
-                if self.neural_team_frozen(transition.team) {
-                    return None;
-                }
-                if !soccer_neural_authoritative_actor_training_transition_allowed(transition) {
-                    return None;
-                }
-                let rejected_counterexample =
-                    learned_mpc_rejected_action_counterexample(transition);
-                if !soccer_actor_policy_sample_allowed(transition) {
-                    return None;
-                }
-                let action_index = soccer_policy_action_index(&transition.action)?;
-                let advantage = if rejected_counterexample {
-                    reward_adv[index] - values[index]
-                } else {
-                    advantages[index]
-                };
-                let advantage =
-                    soccer_actor_advantage_with_planner_distillation(transition, advantage);
-                let mcts_distillation =
-                    soccer_actor_mcts_distillation_priority(transition, advantage);
-                let sample_weight = soccer_actor_priority_weight(transition, advantage);
-                let state_features = self.policy_state_features(transition);
-                let actor_probability = self
-                    .policy_head
-                    .as_ref()
-                    .and_then(|head| head.action_distribution(&state_features))
-                    .and_then(|probs| probs.get(action_index).copied());
-                // Stochastic top-k selection records the true behavior policy;
-                // older/deterministic rows keep their chosen-action probability
-                // before falling back to the actor head.
-                let old_action_probability = soccer_behavior_old_action_probability(
-                    transition
-                        .decision_context
-                        .behavior_policy_probability
-                        .filter(|probability| probability.is_finite() && *probability > 0.0)
-                        .or(Some(transition.decision_context.chosen_action_probability)),
-                    actor_probability,
-                );
-                advantage.is_finite().then(|| SoccerPolicySample {
-                    state_features,
-                    action_index,
-                    advantage,
-                    old_action_probability,
-                    sample_weight,
-                    mcts_distillation,
-                })
-            })
-            .collect();
+        // Diagnostic side-channel (gated): when `DD_SOCCER_DUMP_ADVANTAGE_DIAGNOSTIC` is set,
+        // record `(team, action_index, pre-standardization advantage)` aligned 1:1 with `samples`
+        // so an offline pass can see whether raw advantages separate chance-rich from sterile
+        // draws and whether batch standardization erases that separation. Off ⇒ byte-identical
+        // (the loop below is the exact filter_map that produced `samples` before, unchanged).
+        let diag_on = std::env::var("DD_SOCCER_DUMP_ADVANTAGE_DIAGNOSTIC").is_ok();
+        let mut diag_meta: Vec<(Team, usize, f64)> = Vec::new();
+        let mut samples: Vec<SoccerPolicySample> = Vec::new();
+        for (index, transition) in replay.iter().enumerate() {
+            if self.neural_team_frozen(transition.team) {
+                continue;
+            }
+            if !soccer_neural_authoritative_actor_training_transition_allowed(transition) {
+                continue;
+            }
+            let rejected_counterexample = learned_mpc_rejected_action_counterexample(transition);
+            if !soccer_actor_policy_sample_allowed(transition) {
+                continue;
+            }
+            let Some(action_index) = soccer_policy_action_index(&transition.action) else {
+                continue;
+            };
+            let advantage = if rejected_counterexample {
+                reward_adv[index] - values[index]
+            } else {
+                advantages[index]
+            };
+            let advantage =
+                soccer_actor_advantage_with_planner_distillation(transition, advantage);
+            let mcts_distillation =
+                soccer_actor_mcts_distillation_priority(transition, advantage);
+            let sample_weight = soccer_actor_priority_weight(transition, advantage);
+            let state_features = self.policy_state_features(transition);
+            let actor_probability = self
+                .policy_head
+                .as_ref()
+                .and_then(|head| head.action_distribution(&state_features))
+                .and_then(|probs| probs.get(action_index).copied());
+            // Stochastic top-k selection records the true behavior policy;
+            // older/deterministic rows keep their chosen-action probability
+            // before falling back to the actor head.
+            let old_action_probability = soccer_behavior_old_action_probability(
+                transition
+                    .decision_context
+                    .behavior_policy_probability
+                    .filter(|probability| probability.is_finite() && *probability > 0.0)
+                    .or(Some(transition.decision_context.chosen_action_probability)),
+                actor_probability,
+            );
+            if !advantage.is_finite() {
+                continue;
+            }
+            if diag_on {
+                diag_meta.push((transition.team, action_index, advantage));
+            }
+            samples.push(SoccerPolicySample {
+                state_features,
+                action_index,
+                advantage,
+                old_action_probability,
+                sample_weight,
+                mcts_distillation,
+            });
+        }
 
         // PPO/MAPPO advantage standardization (zero-mean / unit-variance over the batch):
         // the standard variance-reduction trick that keeps the policy-gradient step scale
@@ -13982,7 +13993,58 @@ impl SoccerMatch {
         if dd_soccer_standardize_policy_advantages() {
             soccer_standardize_actor_policy_sample_advantages(&mut samples);
         }
+        if diag_on {
+            self.dump_advantage_diagnostic(&diag_meta, &samples);
+        }
         samples
+    }
+
+    /// Appends per-sample advantage-diagnostic rows (JSONL) to `DD_SOCCER_DUMP_ADVANTAGE_DIAGNOSTIC`.
+    /// Offline-only instrumentation for the 0.53-ceiling investigation: for each actor training
+    /// sample it records the pre- and post-standardization advantage tagged with the game's final
+    /// result and shots-on-target differential, so we can test (a) whether the raw label separates
+    /// chance-rich from sterile draws [reward] and (b) whether batch standardization erases that
+    /// separation [gradient]. Never runs unless the env var is set.
+    fn dump_advantage_diagnostic(
+        &self,
+        meta: &[(Team, usize, f64)],
+        samples: &[SoccerPolicySample],
+    ) {
+        use std::io::Write;
+        let Ok(path) = std::env::var("DD_SOCCER_DUMP_ADVANTAGE_DIAGNOSTIC") else {
+            return;
+        };
+        let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
+            return;
+        };
+        let (score_home, score_away) = (self.score_home, self.score_away);
+        let (sot_home, sot_away) = (
+            self.stats.shots_on_target_home,
+            self.stats.shots_on_target_away,
+        );
+        for (i, &(team, action_index, raw_adv)) in meta.iter().enumerate() {
+            let std_adv = samples.get(i).map(|s| s.advantage).unwrap_or(raw_adv);
+            let (team_score, opp_score, team_sot, opp_sot) = match team {
+                Team::Home => (score_home, score_away, sot_home, sot_away),
+                Team::Away => (score_away, score_home, sot_away, sot_home),
+            };
+            let result = if team_score > opp_score {
+                "W"
+            } else if team_score < opp_score {
+                "L"
+            } else {
+                "D"
+            };
+            let family = SOCCER_POLICY_ACTIONS.get(action_index).copied().unwrap_or("?");
+            let sot_diff = team_sot as i64 - opp_sot as i64;
+            let _ = writeln!(
+                file,
+                "{{\"result\":\"{result}\",\"team\":\"{}\",\"family\":\"{family}\",\
+                 \"raw_adv\":{raw_adv:.5},\"std_adv\":{std_adv:.5},\
+                 \"team_sot\":{team_sot},\"opp_sot\":{opp_sot},\"sot_diff\":{sot_diff}}}",
+                team.label(),
+            );
+        }
     }
 
     fn ensure_policy_head(&mut self) {
