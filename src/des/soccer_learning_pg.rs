@@ -3967,6 +3967,7 @@ struct SoccerPolicyTargetEntryInsert {
     target_tactical_cell_id: i32,
     target_macro_cell_id: i32,
     target_root_cell_id: i32,
+    receiver_descriptor: i32,
     value_micros: i64,
     visits: i32,
 }
