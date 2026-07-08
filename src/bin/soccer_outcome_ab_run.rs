@@ -202,8 +202,19 @@ fn play_holdout_fixture(
             // Dense advancement signal: completed FORWARD passes per team this match (already
             // counted in MatchStats, surfaced via the outcome summary). Returned alongside the
             // score so the caller can measure progression, not just the rare goal outcome.
-            let home_forward = o.summary.stats.passes_completed_forward_home;
-            let away_forward = o.summary.stats.passes_completed_forward_away;
+            let st = &o.summary.stats;
+            let home_pass = PassBreak {
+                attempted: st.passes_attempted_home,
+                completed: st.passes_completed_home,
+                forward: st.passes_completed_forward_home,
+                backward: st.passes_completed_backward_home,
+            };
+            let away_pass = PassBreak {
+                attempted: st.passes_attempted_away,
+                completed: st.passes_completed_away,
+                forward: st.passes_completed_forward_away,
+                backward: st.passes_completed_backward_away,
+            };
             let report = MatchReport {
                 stage: ctx.stage,
                 home_id,
