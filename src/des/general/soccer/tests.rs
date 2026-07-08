@@ -19119,6 +19119,7 @@ fn contested_receiver_approach_decision_reaches_mdp_pomdp_and_neural_features() 
         )),
         facing: facing_bucket_from_vector(target - receiver_pos),
         dribble_touch: None,
+        receiver_descriptor: None,
     };
     let decision = test_decision_trace(&snapshot, receiver, "recover");
     let transition = SoccerLearningTransition {
