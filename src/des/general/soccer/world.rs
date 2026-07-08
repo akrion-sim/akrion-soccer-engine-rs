@@ -1180,6 +1180,13 @@ pub struct SoccerMatch {
     pub(crate) pending_aerial_finish: Option<(usize, u64)>,
     pub(crate) coach_set_play_hints: HashMap<Team, SoccerSetPlayVectorHint>,
     pub(crate) reward_events: Vec<SoccerRewardEvent>,
+    /// Cross-tick DEFERRED credit: `(decision_tick, player_id, amount)` for delayed OUTCOME rewards
+    /// (a completed pass resolves ~30 ticks AFTER the pass decision). The per-tick `reward_events`
+    /// buffer is cleared each tick, so a delayed reward recorded at the RESOLUTION tick lands on the
+    /// wrong (later) decision transition. These are back-dated to the DECISION tick and applied to
+    /// the matching `episode_learning_transitions` entry at end-of-game, before the replay blend, so
+    /// the pass/shot DECISION that earned the outcome actually gets credited. Gated (default off).
+    pub(crate) deferred_reward_credits: Vec<(u64, usize, f64)>,
     pub(crate) episode_learning_transitions: Vec<SoccerLearningTransition>,
     /// Per-tick whole-field configuration captures (ball carrier only) for the
     /// retrieval corpus. Populated only when `config.retrieval.capture_enabled`
@@ -2655,9 +2662,105 @@ fn train_soccer_policy_with_approx_dp(
     }
 }
 
+/// Recenter + rescale a training batch's value targets to ~zero-mean / unit-variance. This is the
+/// fix for value-head collapse: with fixed `target_scale` the targets cluster near a constant, so
+/// the loss-optimal solution is a constant output (dead output layer / flat value). Standardizing
+/// makes the constant no longer optimal, forcing the net to encode state-dependent value. Ranking
+/// is invariant to this affine transform, so decisions are unaffected. No-op for tiny batches
+/// (<8) or degenerate (≈zero-variance) batches, so it never amplifies pure noise.
+fn soccer_standardize_sample_targets(samples: &mut [SoccerNeuralTrainingSample], target_clip: f64) {
+    if samples.len() < 8 {
+        return;
+    }
+    let n = samples.len() as f64;
+    let mean = samples.iter().map(|s| s.target).sum::<f64>() / n;
+    let var = samples
+        .iter()
+        .map(|s| (s.target - mean) * (s.target - mean))
+        .sum::<f64>()
+        / n;
+    let std = var.sqrt();
+    if !std.is_finite() || std <= 1e-4 {
+        return;
+    }
+    for sample in samples.iter_mut() {
+        sample.target = ((sample.target - mean) / std).clamp(-target_clip, target_clip);
+    }
+}
+
+/// Count (abstract-state-bucket, action-family) occurrences in a training batch, for the novelty
+/// exploration bonus. Also returns the ball-zone extents used to bucket, so the bonus uses the same
+/// adaptive thirds as the DP table. See `dd_soccer_enable_novelty_bonus`.
+fn soccer_novelty_bucket_counts(
+    transitions: &[SoccerLearningTransition],
+    team_filter: Option<Team>,
+) -> (std::collections::HashMap<(u32, String), usize>, usize, usize) {
+    let mut x_max = 0usize;
+    let mut y_max = 0usize;
+    for t in transitions {
+        x_max = x_max.max(t.state.ball_zone_x);
+        y_max = y_max.max(t.state.ball_zone_y);
+    }
+    let mut counts: std::collections::HashMap<(u32, String), usize> =
+        std::collections::HashMap::new();
+    for t in transitions {
+        if team_filter.map_or(true, |team| t.team == team) {
+            let bucket = soccer_dp_state_bucket(&t.state, t.team, x_max, y_max);
+            let key = (bucket, normalize_soccer_action_label(&t.action).to_string());
+            *counts.entry(key).or_insert(0) += 1;
+        }
+    }
+    (counts, x_max, y_max)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standardize_targets_yields_zero_mean_unit_variance_and_preserves_order() {
+        let mk = |t: f64| SoccerNeuralTrainingSample {
+            input: [0.0; SOCCER_NEURAL_FEATURE_DIM],
+            target: t,
+            priority: 1.0,
+        };
+        // Targets clustered near a small constant — the collapse regime the fix targets.
+        let raw = [
+            0.041, 0.043, 0.038, 0.050, 0.045, 0.039, 0.047, 0.042, 0.044, 0.040,
+        ];
+        let mut samples: Vec<SoccerNeuralTrainingSample> = raw.iter().map(|&t| mk(t)).collect();
+        soccer_standardize_sample_targets(&mut samples, 13.0);
+        let n = samples.len() as f64;
+        let mean = samples.iter().map(|s| s.target).sum::<f64>() / n;
+        let var = samples.iter().map(|s| (s.target - mean).powi(2)).sum::<f64>() / n;
+        assert!(mean.abs() < 1e-9, "standardized mean ≈ 0, got {mean}");
+        assert!((var - 1.0).abs() < 1e-6, "standardized variance ≈ 1, got {var}");
+        // Ranking invariance: the largest raw target (idx 3 = 0.050) stays largest.
+        assert!(
+            samples[3].target > samples[2].target && samples[3].target > samples[0].target,
+            "affine rescale preserves relative order"
+        );
+    }
+
+    #[test]
+    fn standardize_targets_noop_for_small_or_degenerate_batches() {
+        let mk = |t: f64| SoccerNeuralTrainingSample {
+            input: [0.0; SOCCER_NEURAL_FEATURE_DIM],
+            target: t,
+            priority: 1.0,
+        };
+        // Small batch (<8): untouched (per-batch stats too noisy to trust).
+        let mut small: Vec<SoccerNeuralTrainingSample> = (0..5).map(|i| mk(i as f64)).collect();
+        soccer_standardize_sample_targets(&mut small, 13.0);
+        assert_eq!(small[4].target, 4.0, "small batch left unchanged");
+        // Degenerate (all equal ⇒ std 0): untouched, no divide-by-zero blowup.
+        let mut flat: Vec<SoccerNeuralTrainingSample> = (0..10).map(|_| mk(0.044)).collect();
+        soccer_standardize_sample_targets(&mut flat, 13.0);
+        assert!(
+            flat.iter().all(|s| (s.target - 0.044).abs() < 1e-12),
+            "zero-variance batch left unchanged"
+        );
+    }
 
     fn pass_role_risk_test_quality(
         expected_completion: f64,
@@ -10734,6 +10837,7 @@ impl SoccerMatch {
             pending_aerial_finish: None,
             coach_set_play_hints: HashMap::new(),
             reward_events: Vec::new(),
+            deferred_reward_credits: Vec::new(),
             episode_learning_transitions: Vec::new(),
             episode_config_captures: Vec::new(),
             retrieval_action_prior: HashMap::new(),
@@ -11009,7 +11113,11 @@ impl SoccerMatch {
         &mut self,
         snapshot: SoccerNeuralNetworkSnapshot,
     ) -> Result<(), String> {
-        if !self.config.neural_learning.enabled {
+        // Normally a net is only installed when learning is enabled. But under NEURAL-AUTHORITATIVE
+        // serve (DD_SOCCER_NEURAL_AUTHORITATIVE_LAMBDA>0) the live server has learning OFF yet must
+        // still install the net for INFERENCE so it can drive decisions — otherwise the net is
+        // dropped and play silently falls back to the tabular/analytic path.
+        if !self.config.neural_learning.enabled && dd_soccer_neural_authoritative_lambda() <= 0.0 {
             self.neural_learner = None;
             return Ok(());
         }
@@ -11427,6 +11535,15 @@ impl SoccerMatch {
     }
 
     fn neural_blend_lambda_for_learner(&self, learner: &SoccerNeuralLearner) -> f64 {
+        // NEURAL-AUTHORITATIVE experiment: when DD_SOCCER_NEURAL_AUTHORITATIVE_LAMBDA > 0, the
+        // neural value head OWNS the per-player action decision. Return a large fixed weight so
+        // `candidate.value + λ·V_net` is dominated by V_net (the coarse tabular Q becomes a
+        // negligible tie-break floor), bypassing the 0.5 nudge AND the warm-up ramp. Requires a
+        // usable prediction network so a net-less run still falls back to tabular.
+        let authoritative = dd_soccer_neural_authoritative_lambda();
+        if authoritative > 0.0 && learner.has_prediction_network() {
+            return authoritative;
+        }
         if !self.neural_blend.lambda.is_finite() || self.neural_blend.lambda <= 0.0 {
             return 0.0;
         }
@@ -14839,7 +14956,7 @@ impl SoccerMatch {
         let (_state, ranked) = policy.ranked_action_values_for_snapshot(
             snapshot,
             player_id,
-            blend.candidates.max(2),
+            dd_soccer_neural_blend_candidates(blend.candidates).max(2),
         )?;
         let mut legal: Vec<SoccerLearnedActionTrace> =
             ranked.into_iter().filter(|action| action.legal).collect();
@@ -16573,7 +16690,20 @@ impl SoccerMatch {
         } else {
             Vec::new()
         };
-        transitions
+        // Novelty exploration bonus (gate-two): count (abstract-state-bucket, action-family) pairs
+        // in this batch so rarely-tried pairs get an optimism bonus, nudging the value — and thus
+        // the value-ranked policy — to try under-explored actions instead of only analytic ones.
+        let novelty_on = dd_soccer_enable_novelty_bonus();
+        let novelty_coef = dd_soccer_novelty_bonus_coef();
+        let (novelty_counts, nb_x_max, nb_y_max) = if novelty_on {
+            soccer_novelty_bucket_counts(transitions, team_filter)
+        } else {
+            (std::collections::HashMap::new(), 0usize, 0usize)
+        };
+        // Combined builder: keep main's enumerate + successor/MC-critic indexing + the authoritative
+        // critic-training filter, session's novelty (mutable reward) and the `samples` binding the
+        // downstream target-standardization needs. Frozen-team filter preserved on all paths.
+        let mut samples: Vec<SoccerNeuralTrainingSample> = transitions
             .iter()
             .enumerate()
             .filter(|(_, transition)| !self.neural_team_frozen(transition.team))
@@ -16582,11 +16712,25 @@ impl SoccerMatch {
                 soccer_neural_authoritative_critic_training_transition_allowed(transition)
             })
             .filter_map(|(transition_index, transition)| {
-                let adjusted_reward = soccer_marl_adjusted_reward(
+                let mut adjusted_reward = soccer_marl_adjusted_reward(
                     transition,
                     &tick_rewards,
                     &self.config.neural_learning,
                 );
+                if novelty_on {
+                    let bucket = soccer_dp_state_bucket(
+                        &transition.state,
+                        transition.team,
+                        nb_x_max,
+                        nb_y_max,
+                    );
+                    let key = (
+                        bucket,
+                        normalize_soccer_action_label(&transition.action).to_string(),
+                    );
+                    let count = novelty_counts.get(&key).copied().unwrap_or(1);
+                    adjusted_reward += novelty_coef / ((1 + count) as f64).sqrt();
+                }
                 let next_state = SoccerQStateKey::from_next_transition(transition);
                 let (gamma, tabular_max_next) = self
                     .team_policies
@@ -16618,18 +16762,60 @@ impl SoccerMatch {
                 let successor = successor_indices.get(transition_index).and_then(|index| {
                     index.and_then(|successor_index| transitions.get(successor_index))
                 });
-                let max_next = self.blended_successor_bootstrap_value(
-                    transition,
-                    successor,
-                    tabular_max_next,
-                    target_scale,
-                );
+                // max_next: neural self-bootstrap (session concept) takes precedence when enabled —
+                // blend the net's OWN predicted (maxA or observed) successor value toward true neural
+                // TD/Q-learning; otherwise main's blended successor-bootstrap; otherwise tabular.
+                let max_next = if !transition.done && dd_soccer_enable_neural_self_bootstrap() {
+                    let neural_raw = self
+                        .neural_learner_for(transition.team)
+                        .filter(|learner| learner.has_prediction_network())
+                        .and_then(|learner| {
+                            let mut succ = transition.clone();
+                            succ.state = transition.next_state.clone();
+                            succ.observation = transition.next_observation.clone();
+                            let value = if dd_soccer_enable_maxa_bootstrap() {
+                                // max_a Q(s', a) over core families — policy IMPROVEMENT: the target
+                                // assumes the successor takes the BEST action, so the value can rate
+                                // a policy better than the behavior policy (can exceed analytic).
+                                let best = SOCCER_MAXA_BOOTSTRAP_FAMILIES
+                                    .iter()
+                                    .filter_map(|&family| {
+                                        learner.predict_value(
+                                            &soccer_neural_transition_features_with_action(
+                                                &succ, family,
+                                            ),
+                                        )
+                                    })
+                                    .fold(f64::NEG_INFINITY, f64::max);
+                                best.is_finite().then_some(best)
+                            } else {
+                                // observed-successor / state value V(s') — policy EVALUATION.
+                                learner.predict_value(
+                                    &soccer_neural_transition_features_with_action(&succ, ""),
+                                )
+                            };
+                            value.map(|scaled| scaled * target_scale)
+                        })
+                        .filter(|value| value.is_finite());
+                    match neural_raw {
+                        Some(neural) => {
+                            let w = dd_soccer_self_bootstrap_weight();
+                            w * neural + (1.0 - w) * tabular_max_next
+                        }
+                        None => tabular_max_next,
+                    }
+                } else {
+                    self.blended_successor_bootstrap_value(
+                        transition,
+                        successor,
+                        tabular_max_next,
+                        target_scale,
+                    )
+                };
                 let (target, priority) = if !mc_returns.is_empty() {
-                    // MC target: clip(realized_return / target_scale) — NO tabular bootstrap. This is
-                    // the alias-breaking label; `max_next`/`gamma` above are ignored on this path.
+                    // MC target: clip(realized_return) — NO tabular bootstrap. This is the
+                    // alias-breaking label; `max_next`/`gamma` above are ignored on this path.
                     let raw = mc_returns.get(transition_index).copied().unwrap_or(0.0);
-                    // Already standardized to ~unit scale in the precompute; clip to the same bound
-                    // (no /target_scale — that division is what saturated the goal-dominated returns).
                     let scaled = if raw.is_finite() {
                         raw.clamp(-target_clip, target_clip)
                     } else {
@@ -16653,7 +16839,16 @@ impl SoccerMatch {
                 };
                 soccer_neural_sample_is_valid(&sample).then_some(sample)
             })
-            .collect()
+            .collect();
+        // Value-target standardization (fix for value-head collapse): recenter + rescale this
+        // batch's targets to ~zero-mean / unit-variance so "predict the constant mean" is no
+        // longer loss-optimal and the output layer must encode state-dependent value. Ranking is
+        // shift/scale-invariant, so decisions are unaffected by the rescale. Gated; OFF ⇒
+        // byte-identical (the `target_scale`-scaled targets are returned unchanged).
+        if dd_soccer_enable_target_standardization() {
+            soccer_standardize_sample_targets(&mut samples, target_clip);
+        }
+        samples
     }
 
     fn train_neural_value_model(&mut self, samples: Vec<SoccerNeuralTrainingSample>) {
@@ -17517,6 +17712,10 @@ impl SoccerMatch {
         }
 
         self.full_game_learning_applied = true;
+        // Apply cross-tick deferred credits (delayed outcome rewards back-dated to their DECISION
+        // tick) onto the episode transitions BEFORE the replay blend, so the pass/shot decision that
+        // earned the outcome is credited. No-op unless the deferred gate is on.
+        self.apply_deferred_reward_credits();
         // Terminal won-game reward (the "long" rung): label every transition with the
         // realised result when the gate is on. Off ⇒ `None`, byte-identical replay.
         let match_outcome = match_outcome_reward_enabled().then(|| {
@@ -19943,6 +20142,47 @@ impl SoccerMatch {
         self.record_reward_event_at(self.tick, player_id, amount);
     }
 
+    /// Cross-tick credit for a DELAYED outcome reward: back-date `amount` to the DECISION tick that
+    /// earned it (e.g. a completed pass credits the pass decision, not the reception tick). Applied
+    /// to the matching `episode_learning_transitions` entry at end-of-game. Gated
+    /// `DD_SOCCER_ENABLE_DEFERRED_PASS_CREDIT`; when off, falls back to the current-tick event
+    /// (byte-identical to baseline).
+    fn record_reward_event_deferred(&mut self, decision_tick: u64, player_id: usize, amount: f64) {
+        if dd_soccer_enable_deferred_pass_credit() {
+            if amount.is_finite() && amount != 0.0 {
+                self.deferred_reward_credits
+                    .push((decision_tick, player_id, amount));
+            }
+        } else {
+            self.record_reward_event(player_id, amount);
+        }
+    }
+
+    /// Apply all deferred cross-tick credits onto the decision transitions that earned them, by
+    /// matching `(decision_tick, player_id)`. Runs once at end-of-game before the replay blend.
+    fn apply_deferred_reward_credits(&mut self) {
+        if self.deferred_reward_credits.is_empty() {
+            return;
+        }
+        let credits = std::mem::take(&mut self.deferred_reward_credits);
+        for (tick, player_id, amount) in credits {
+            if !amount.is_finite() || amount == 0.0 {
+                continue;
+            }
+            // Prefer the exact decision transition; otherwise the player's latest decision AT-OR-
+            // BEFORE the event tick (the decision that was active), so a delayed credit is never
+            // SILENTLY LOST if the exact launch tick wasn't captured as a learning transition.
+            let target = self
+                .episode_learning_transitions
+                .iter_mut()
+                .filter(|t| t.player_id == player_id && t.tick <= tick)
+                .max_by_key(|t| t.tick);
+            if let Some(t) = target {
+                t.reward += amount;
+            }
+        }
+    }
+
     fn record_reward_event_at(&mut self, tick: u64, player_id: usize, amount: f64) {
         self.record_reward_event_at_with_kind(
             tick,
@@ -20383,7 +20623,9 @@ impl SoccerMatch {
             + self.completed_pass_and_move_forward_reward(pass)
             + progressive_pass_escape_reward(pass, self.ball.position)
             + self.overload_forward_pass_progression_bonus(pass, self.ball.position);
-        self.record_reward_event(pass.from, amount);
+        // Back-date the completed-pass reward to the PASS DECISION tick (launch), not the reception
+        // tick, so the passer's actual decision transition gets credited (gated; off ⇒ current-tick).
+        self.record_reward_event_deferred(pass.launch_tick, pass.from, amount);
         self.queue_recent_outcome_learning_credit(
             pass.from,
             pass.team,
@@ -32352,6 +32594,12 @@ impl SoccerMatch {
         let window = TURNOVER_PENALTY_WINDOW_TICKS.max(1);
         let cutoff = tick.saturating_sub(window);
         let mut penalized = Vec::new();
+        // Route the SAME age-discounted penalty to the DECISION transition in the full-game corpus
+        // (gated): the full-game replay trains on `episode_learning_transitions`, NOT the
+        // `deferred_reward_transitions` the penalized clones go to — so without this, correctly-
+        // attributed turnover penalties (intercepted pass / lost dribble) never reach full-game
+        // training. Collected here, applied after the borrow ends.
+        let mut deferred_turnover_credits: Vec<(u64, usize, f64)> = Vec::new();
         // Newest first: stop once we fall out of the window (history is tick-ordered).
         for transition in self.turnover_penalty_history.iter().rev() {
             if transition.tick < cutoff {
@@ -32379,6 +32627,7 @@ impl SoccerMatch {
                 (TURNOVER_WINDOW_PENALTY_POINTS + stale_dribble_penalty) * recency * severity;
             penalized_transition.reward = (penalized_transition.reward - penalty).min(-penalty);
             penalized.push(penalized_transition);
+            deferred_turnover_credits.push((transition.tick, transition.player_id, -penalty));
             if penalized.len() >= TURNOVER_PENALTY_MAX_TRANSITIONS {
                 break;
             }
@@ -32386,13 +32635,23 @@ impl SoccerMatch {
         if penalized.is_empty() {
             return false;
         }
+        // Back-date the turnover penalty onto the actual decision transitions so it reaches the
+        // full-game replay (gated; off ⇒ unchanged, penalties only go to deferred_reward_transitions).
+        if dd_soccer_enable_deferred_pass_credit() {
+            self.deferred_reward_credits.extend(deferred_turnover_credits);
+        }
         self.arm_turnover_outcome_watch(
             losing_team,
             gaining_team,
             turnover_position,
             penalized.clone(),
         );
-        self.deferred_reward_transitions.extend(penalized);
+        // When the deferred-credit gate is on, the penalty is already applied to the DECISION
+        // transition (via deferred_reward_credits above), which the full-game replay trains on —
+        // so do NOT also feed the per-tick deferred_reward_transitions path, or it double-penalizes.
+        if !dd_soccer_enable_deferred_pass_credit() {
+            self.deferred_reward_transitions.extend(penalized);
+        }
         self.cap_deferred_reward_transitions();
         true
     }
@@ -35180,6 +35439,21 @@ pub(crate) fn dd_soccer_lookahead_depth() -> usize {
             .ok()
             .and_then(|raw| raw.trim().parse::<usize>().ok())
             .unwrap_or(0)
+    })
+}
+
+/// NEURAL-AUTHORITATIVE weight: when > 0, the neural value head is given this fixed λ in the
+/// per-player action blend (`candidate.value + λ·V_net`), so the net — not the coarse tabular
+/// Q — decides the action. 0 (default) preserves the normal bounded-nudge behaviour. Read once.
+pub(crate) fn dd_soccer_neural_authoritative_lambda() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_NEURAL_AUTHORITATIVE_LAMBDA")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(0.0)
     })
 }
 
@@ -41950,11 +42224,12 @@ impl WorldSnapshot {
             .map(same_team_proximity_penalty_unit)
             .unwrap_or(0.0);
         let same_team_separation_penalty_live = same_team_separation_floor_pressure > 0.0
-            && same_team_proximity_penalty_past_grace(
-                me.same_team_proximity_dwell_lt7_seconds,
-                me.same_team_proximity_dwell_lt6_seconds,
-                me.same_team_proximity_dwell_lt5_seconds,
-            );
+            && (same_team_separation_floor_distance_yards <= SAME_TEAM_MIN_SEPARATION_YARDS
+                || same_team_proximity_penalty_past_grace(
+                    me.same_team_proximity_dwell_lt7_seconds,
+                    me.same_team_proximity_dwell_lt6_seconds,
+                    me.same_team_proximity_dwell_lt5_seconds,
+                ));
         let (team_spacing_score, preferred_team_spacing_yards) = self
             .team_spacing_mode_for(me.team)
             .map(|mode| {
