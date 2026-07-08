@@ -17594,6 +17594,8 @@ impl SoccerMatch {
         if match_outcome_reward_enabled() {
             let advantages: Vec<f64> = samples.iter().map(|s| s.advantage).collect();
             if let Some((mean, std)) = policy_advantage_standardization(&advantages) {
+                // Std-only mode zeroes the subtracted mean so the win/loss common-mode survives.
+                let mean = if dd_soccer_advantage_std_only() { 0.0 } else { mean };
                 for sample in &mut samples {
                     sample.advantage = (sample.advantage - mean) / (std + 1e-8);
                 }
