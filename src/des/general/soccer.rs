@@ -8223,6 +8223,8 @@ pub struct SoccerDecisionContext {
     #[serde(default)]
     pub learned_mpc_replanned: bool,
     #[serde(default)]
+    pub learned_mpc_replan_source: SoccerLearnedMpcReplanSource,
+    #[serde(default)]
     pub learned_mpc_rejected_execution_probability: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub learned_mpc_original_action: Option<String>,
@@ -8328,11 +8330,27 @@ pub struct SoccerDecisionContext {
     pub defending_team_acceleration_yps2: f64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SoccerLearnedMpcReplanSource {
+    Mpc,
+    OptionScoreSafety,
+    NeuralMcts,
+}
+
+impl Default for SoccerLearnedMpcReplanSource {
+    fn default() -> Self {
+        Self::Mpc
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SoccerLearnedMpcReplanTrace {
     pub original_action: String,
     pub replacement_action: String,
+    #[serde(default)]
+    pub source: SoccerLearnedMpcReplanSource,
     #[serde(default)]
     pub rejected_execution_probability: f64,
     #[serde(default)]
@@ -18959,6 +18977,12 @@ pub struct MatchStats {
     #[serde(default)]
     pub learned_mpc_replans: u32,
     #[serde(default)]
+    pub learned_mpc_replans_mpc: u32,
+    #[serde(default)]
+    pub learned_mpc_replans_option_score_safety: u32,
+    #[serde(default)]
+    pub learned_mpc_replans_neural_mcts: u32,
+    #[serde(default)]
     pub learned_policy_option_decisions: u32,
     #[serde(default)]
     pub learned_policy_multi_option_decisions: u32,
@@ -19026,6 +19050,12 @@ pub struct SoccerPlanningValidationStats {
     pub neural_mcts_root_discretized_kick_candidate_set_rate: f64,
     pub learned_mpc_replans: u32,
     pub learned_mpc_replan_rate: f64,
+    pub learned_mpc_replans_mpc: u32,
+    pub learned_mpc_replan_mpc_rate: f64,
+    pub learned_mpc_replans_option_score_safety: u32,
+    pub learned_mpc_replan_option_score_safety_rate: f64,
+    pub learned_mpc_replans_neural_mcts: u32,
+    pub learned_mpc_replan_neural_mcts_rate: f64,
     pub policy_priority_samples: u32,
     pub policy_priority_sample_rate: f64,
     pub mean_policy_priority_weight: f64,
@@ -19175,6 +19205,16 @@ impl MatchStats {
                 / neural_mcts_candidate_sets as f64,
             learned_mpc_replans: self.learned_mpc_replans,
             learned_mpc_replan_rate: self.learned_mpc_replans as f64 / decisions as f64,
+            learned_mpc_replans_mpc: self.learned_mpc_replans_mpc,
+            learned_mpc_replan_mpc_rate: self.learned_mpc_replans_mpc as f64 / decisions as f64,
+            learned_mpc_replans_option_score_safety: self.learned_mpc_replans_option_score_safety,
+            learned_mpc_replan_option_score_safety_rate: self
+                .learned_mpc_replans_option_score_safety
+                as f64
+                / decisions as f64,
+            learned_mpc_replans_neural_mcts: self.learned_mpc_replans_neural_mcts,
+            learned_mpc_replan_neural_mcts_rate: self.learned_mpc_replans_neural_mcts as f64
+                / decisions as f64,
             policy_priority_samples: self.policy_priority_samples,
             policy_priority_sample_rate: self.policy_priority_samples as f64 / decisions as f64,
             mean_policy_priority_weight: self.policy_priority_weight_sum
@@ -24066,6 +24106,7 @@ fn soccer_decision_context_for(
         shot_mpc_qp_target_fit,
         shot_mpc_goal_probability,
         learned_mpc_replanned: false,
+        learned_mpc_replan_source: SoccerLearnedMpcReplanSource::Mpc,
         learned_mpc_rejected_execution_probability: 0.0,
         learned_mpc_original_action: None,
         learned_mpc_replacement_action: None,
@@ -24134,6 +24175,7 @@ fn soccer_decision_context_with_trace(
     );
     if let Some(replan) = decision.learned_mpc_replan.as_ref() {
         context.learned_mpc_replanned = true;
+        context.learned_mpc_replan_source = replan.source;
         context.learned_mpc_rejected_execution_probability =
             replan.rejected_execution_probability.clamp(0.0, 1.0);
         context.learned_mpc_original_action = Some(replan.original_action.clone());

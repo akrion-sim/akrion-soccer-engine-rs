@@ -145,6 +145,7 @@ fn learned_policy_option_score_safety_replan_trace(
     Some(SoccerLearnedMpcReplanTrace {
         original_action,
         replacement_action,
+        source: SoccerLearnedMpcReplanSource::OptionScoreSafety,
         rejected_execution_probability: rejected_execution_probability.clamp(0.0, 1.0),
         candidate_count: action_options.iter().filter(|option| option.legal).count(),
     })
@@ -12057,6 +12058,7 @@ impl PlayerAgent {
                     decision.learned_mpc_replan = Some(SoccerLearnedMpcReplanTrace {
                         original_action,
                         replacement_action,
+                        source: SoccerLearnedMpcReplanSource::Mpc,
                         rejected_execution_probability,
                         candidate_count: decision
                             .action_options
@@ -14753,6 +14755,7 @@ mod learned_policy_option_score_safety_tests {
         learned_policy_option_score_safety_rejected_execution_probability,
         learned_policy_option_score_safety_replan_trace,
         learned_policy_option_score_safety_trips_with_thresholds, AgentActionOptionTrace,
+        SoccerLearnedMpcReplanSource,
     };
 
     #[test]
@@ -14803,6 +14806,10 @@ mod learned_policy_option_score_safety_tests {
 
         assert_eq!(trace.original_action, "xavi-turn");
         assert_eq!(trace.replacement_action, "pass1");
+        assert_eq!(
+            trace.source,
+            SoccerLearnedMpcReplanSource::OptionScoreSafety
+        );
         assert_eq!(trace.rejected_execution_probability, 0.05);
         assert_eq!(trace.candidate_count, 2);
         assert!(

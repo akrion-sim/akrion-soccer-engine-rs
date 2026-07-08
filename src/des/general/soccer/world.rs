@@ -4104,6 +4104,25 @@ mod tests {
     }
 
     #[test]
+    fn learned_mpc_replan_telemetry_counts_source() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let mut transition = policy_test_transition_with_mcts(false);
+        transition.decision_context.learned_mpc_replanned = true;
+        transition.decision_context.learned_mpc_replan_source =
+            SoccerLearnedMpcReplanSource::OptionScoreSafety;
+
+        sim.remember_recent_learning_transitions(&[transition]);
+
+        assert_eq!(sim.stats.learned_mpc_replans, 1);
+        assert_eq!(sim.stats.learned_mpc_replans_option_score_safety, 1);
+        assert_eq!(sim.stats.learned_mpc_replans_mpc, 0);
+        assert_eq!(sim.stats.learned_mpc_replans_neural_mcts, 0);
+        let planning = sim.planning_validation_stats();
+        assert_eq!(planning.learned_mpc_replans_option_score_safety, 1);
+        assert!(planning.learned_mpc_replan_option_score_safety_rate > 0.0);
+    }
+
+    #[test]
     fn neural_mcts_stamp_counts_only_the_executed_action_family() {
         let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
         let snapshot = WorldSnapshot::from_match(&sim);
@@ -4619,6 +4638,7 @@ mod tests {
             learned_mpc_replan: Some(SoccerLearnedMpcReplanTrace {
                 original_action: "pass".to_string(),
                 replacement_action: "hold".to_string(),
+                source: SoccerLearnedMpcReplanSource::Mpc,
                 rejected_execution_probability: 0.02,
                 candidate_count: 1,
             }),
@@ -12714,6 +12734,7 @@ impl SoccerMatch {
         Some(SoccerLearnedMpcReplanTrace {
             original_action: original_label,
             replacement_action: selected_label,
+            source: SoccerLearnedMpcReplanSource::NeuralMcts,
             rejected_execution_probability: NEURAL_MCTS_DISTILLATION_REJECTED_PROBABILITY,
             candidate_count,
         })
@@ -13573,6 +13594,7 @@ impl SoccerMatch {
                 candidate_plan.mpc_replan = Some(SoccerLearnedMpcReplanTrace {
                     original_action: original_action.clone(),
                     replacement_action: learned_mpc_action_label_key(&candidate_plan.action),
+                    source: SoccerLearnedMpcReplanSource::Mpc,
                     rejected_execution_probability: original_execution_probability,
                     candidate_count,
                 });
@@ -29281,6 +29303,22 @@ impl SoccerMatch {
                 if transition.decision_context.learned_mpc_replanned {
                     self.stats.learned_mpc_replans =
                         self.stats.learned_mpc_replans.saturating_add(1);
+                    match transition.decision_context.learned_mpc_replan_source {
+                        SoccerLearnedMpcReplanSource::Mpc => {
+                            self.stats.learned_mpc_replans_mpc =
+                                self.stats.learned_mpc_replans_mpc.saturating_add(1);
+                        }
+                        SoccerLearnedMpcReplanSource::OptionScoreSafety => {
+                            self.stats.learned_mpc_replans_option_score_safety = self
+                                .stats
+                                .learned_mpc_replans_option_score_safety
+                                .saturating_add(1);
+                        }
+                        SoccerLearnedMpcReplanSource::NeuralMcts => {
+                            self.stats.learned_mpc_replans_neural_mcts =
+                                self.stats.learned_mpc_replans_neural_mcts.saturating_add(1);
+                        }
+                    }
                 }
                 let learned_policy_option_decision = transition
                     .decision_context
