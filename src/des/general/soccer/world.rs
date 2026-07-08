@@ -14081,6 +14081,132 @@ impl SoccerMatch {
         plan
     }
 
+    /// Learned-pass-receiver selection (gate on): the POMDP head ranks the receivers (visible
+    /// teammates + an optional "into open space" option from the grid head) and MPC feasibility
+    /// masks the ranking — an MPC-infeasible receiver is skipped ("kicked back to the head") and
+    /// the next-best is tried. Returns `(target_player, target_point)`; `target_player = None` with
+    /// a `target_point` is a to-space ball. Falls back to the head's top choice if nothing is
+    /// MPC-feasible (the downstream action-level `mpc_reconciled_learned_plan` then decides whether
+    /// to abandon passing entirely).
+    fn learned_pass_receiver_selection(
+        policy: &SoccerQPolicy,
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        normalized_action: &str,
+        flight: PassFlight,
+        candidates: &[usize],
+    ) -> (Option<usize>, Option<Vec2>) {
+        let ranked = policy.ranked_pass_teammates_for_snapshot(
+            snapshot,
+            player_id,
+            normalized_action,
+            flight,
+            candidates,
+        );
+        let threshold = learned_mpc_replan_thresholds().pass_impossible_probability;
+        let feasible = |target_player: Option<usize>, target_point: Option<Vec2>| -> bool {
+            let Some(target_player) = target_player else {
+                return false;
+            };
+            let trial = SoccerLearnedPlan {
+                action: normalized_action.to_string(),
+                target_player: Some(target_player),
+                target_point,
+                mpc_replan: None,
+            };
+            Self::learned_pass_mpc_execution_probability(snapshot, player_id, &trial, flight)
+                >= threshold
+        };
+        // The head's preferred "open space" ball (grid head, min-visits gated), offered when a
+        // teammate can realistically run onto it and it out-ranks the feasible teammates.
+        let space = Self::learned_pass_space_option(policy, snapshot, player_id, normalized_action);
+        // Walk the head's ranking; commit the first MPC-feasible receiver. Prefer the space ball
+        // ahead of a teammate only when the head scores it higher (already reflected in its rank).
+        let mut best_feasible: Option<(f64, Option<usize>, Option<Vec2>)> = None;
+        for entry in &ranked {
+            let position = snapshot.player_position(entry.player_id);
+            if feasible(Some(entry.player_id), position) {
+                best_feasible = Some((entry.head_score, Some(entry.player_id), position));
+                break;
+            }
+        }
+        if let Some((space_score, space_point)) = space {
+            let space_beats = best_feasible
+                .as_ref()
+                .map(|(score, _, _)| space_score > *score)
+                .unwrap_or(true);
+            if space_beats {
+                return (None, Some(space_point));
+            }
+        }
+        if let Some((_, target_player, target_point)) = best_feasible {
+            return (target_player, target_point);
+        }
+        // Nothing MPC-feasible: hand back the head's top choice so the action-level replan can
+        // decide whether to keep passing or switch families.
+        let fallback = ranked.first().map(|entry| entry.player_id);
+        let fallback_point = fallback.and_then(|id| snapshot.player_position(id));
+        (fallback, fallback_point)
+    }
+
+    /// The head's "pass into open space" option: its preferred target grid point (min-visits
+    /// gated) when a teammate is close enough to run onto it and the point is forward of the
+    /// passer, scored by the learned Space-descriptor value. `None` when the head has no
+    /// confident space preference or no runner can reach it.
+    fn learned_pass_space_option(
+        policy: &SoccerQPolicy,
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        normalized_action: &str,
+    ) -> Option<(f64, Vec2)> {
+        let space_point =
+            Self::learned_target_grid_point_for_policy(policy, snapshot, player_id, normalized_action)?;
+        let passer = snapshot.players.iter().find(|p| p.id == player_id)?;
+        let passer_position = snapshot.player_position(player_id).unwrap_or(passer.position);
+        // A runner must be able to reach the space, otherwise it is a blind ball out of play.
+        let runner_close = snapshot
+            .players
+            .iter()
+            .filter(|p| p.team == passer.team && p.id != player_id)
+            .filter_map(|p| snapshot.player_position(p.id))
+            .any(|pos| pos.distance(space_point) <= SOCCER_SPACE_RUN_ONTO_YARDS);
+        if !runner_close {
+            return None;
+        }
+        let descriptor = snapshot.pass_receiver_descriptor(
+            player_id,
+            ReceiverKind::Space,
+            space_point,
+            None,
+        );
+        // Only forward space is worth breaking shape for; a "space" ball behind the passer is a
+        // recycle the grid head already covers as a teammate.
+        let attack_sign = if passer.team.goal_y(snapshot.field_length) >= snapshot.field_length * 0.5
+        {
+            1.0
+        } else {
+            -1.0
+        };
+        if (space_point.y - passer_position.y) * attack_sign <= SOCCER_RECEIVER_FORWARD_SQUARE_YARDS
+        {
+            return None;
+        }
+        let grid = pitch_grid_address(space_point, snapshot.field_width, snapshot.field_length);
+        let state = SoccerQStateKey::from_parts(
+            &snapshot.mdp_state_for_player(player_id),
+            &snapshot.observation_for(player_id),
+            passer.team,
+            passer.role,
+        );
+        let value = policy.target_preference_for_grid_and_receiver(
+            &state,
+            normalized_action,
+            &grid,
+            descriptor,
+        )?;
+        Some((value * LEARNED_RECEIVER_HEAD_DOMINANCE, space_point))
+    }
+
     fn mpc_reconciled_learned_plan_for_policy(
         policy: &SoccerQPolicy,
         snapshot: &WorldSnapshot,
