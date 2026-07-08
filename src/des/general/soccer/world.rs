@@ -2366,8 +2366,6 @@ struct SoccerExternalNnPomdpSidecarResponse {
     logits: Vec<f64>,
     #[serde(default)]
     value: Option<f64>,
-<<<<<<< HEAD
-=======
     // True on-policy behavior probability of the returned action under the sidecar's sampling
     // policy. When present (finite, >0) it is stamped onto the decision so the offline trainer
     // has a real old-policy prob for clipped-PPO importance weighting. Absent → deterministic
@@ -2378,7 +2376,6 @@ struct SoccerExternalNnPomdpSidecarResponse {
     // legality re-check, so the logged action matches the one whose prob was reported.
     #[serde(default)]
     action_index: Option<usize>,
->>>>>>> wip/sidecar-engine-hook
 }
 
 fn soccer_external_nn_pomdp_sidecar_enabled() -> bool {
