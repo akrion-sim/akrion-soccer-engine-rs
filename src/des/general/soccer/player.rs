@@ -13918,17 +13918,32 @@ impl PlayerAgent {
                     snapshot.attacking_support_movement_for(self.id, self.home_position, roam);
                 let target = if self.role == PlayerRole::Goalkeeper {
                     support_target.point
-                } else {
-                    plan.target_point
-                        .map(|target| {
-                            snapshot.shape_guarded_learned_support_target(
+                } else if let Some(target) = plan.target_point {
+                    snapshot.shape_guarded_learned_support_target(
+                        self.id,
+                        target,
+                        support_target.point,
+                        self.home_position,
+                    )
+                } else if matches!(label, "support-shape" | "support-roam") {
+                    snapshot
+                        .formation_lp_guidance_for(self.id)
+                        .filter(|guidance| {
+                            guidance.team == self.team
+                                && guidance.target.x.is_finite()
+                                && guidance.target.y.is_finite()
+                        })
+                        .map(|guidance| {
+                            snapshot.clamp_to_role_position(
                                 self.id,
-                                target,
-                                support_target.point,
+                                guidance.target,
                                 self.home_position,
+                                false,
                             )
                         })
                         .unwrap_or(support_target.point)
+                } else {
+                    support_target.point
                 };
                 Some((SoccerAction::MoveTo(target), label.to_string()))
             }

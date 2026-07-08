@@ -13033,8 +13033,12 @@ impl SoccerQPolicy {
         receiver_descriptor: i32,
         value: f64,
     ) -> bool {
-        let key =
-            SoccerQTargetKey::from_state_action_grid_receiver(state, action, grid, receiver_descriptor);
+        let key = SoccerQTargetKey::from_state_action_grid_receiver(
+            state,
+            action,
+            grid,
+            receiver_descriptor,
+        );
         if self.insert_target_value(key.clone(), value) {
             self.target_visits.entry(key).or_insert(1);
             true
@@ -13480,9 +13484,8 @@ impl SoccerQPolicy {
         flight: PassFlight,
         candidates: &[usize],
     ) -> Option<usize> {
-        let scored = self.scored_pass_teammates_for_snapshot(
-            snapshot, player_id, action, flight, candidates,
-        );
+        let scored = self
+            .scored_pass_teammates_for_snapshot(snapshot, player_id, action, flight, candidates);
         let pick = |require_clean: bool| {
             scored
                 .iter()
@@ -13511,9 +13514,8 @@ impl SoccerQPolicy {
         flight: PassFlight,
         candidates: &[usize],
     ) -> Vec<RankedPassTeammate> {
-        let mut scored = self.scored_pass_teammates_for_snapshot(
-            snapshot, player_id, action, flight, candidates,
-        );
+        let mut scored = self
+            .scored_pass_teammates_for_snapshot(snapshot, player_id, action, flight, candidates);
         scored.sort_by(|a, b| {
             a.concedes
                 .cmp(&b.concedes)
@@ -13596,7 +13598,11 @@ impl SoccerQPolicy {
                     // Legacy heuristic blend: learned grid preference (weight 1.0 if any) + quality.
                     let learned_preference = self.target_preference_for_grid(&state, action, &grid);
                     let learned_score = learned_preference.unwrap_or(0.0);
-                    let learned_weight = if learned_preference.is_some() { 1.0 } else { 0.0 };
+                    let learned_weight = if learned_preference.is_some() {
+                        1.0
+                    } else {
+                        0.0
+                    };
                     learned_score * learned_weight + heuristic
                 };
                 let concedes = snapshot.pass_target_concedes_to_perceived_opponent(
@@ -13965,16 +13971,22 @@ impl SoccerQPolicy {
         grid: &PitchGridAddress,
         receiver_descriptor: Option<i32>,
     ) -> Option<f64> {
-        self.target_preference_for_grid_with_context(state, action, grid, receiver_descriptor, false)
-            .or_else(|| {
-                self.target_preference_for_grid_with_context(
-                    state,
-                    action,
-                    grid,
-                    receiver_descriptor,
-                    true,
-                )
-            })
+        self.target_preference_for_grid_with_context(
+            state,
+            action,
+            grid,
+            receiver_descriptor,
+            false,
+        )
+        .or_else(|| {
+            self.target_preference_for_grid_with_context(
+                state,
+                action,
+                grid,
+                receiver_descriptor,
+                true,
+            )
+        })
     }
 
     fn target_preference_for_grid_with_context(
@@ -14870,13 +14882,22 @@ mod soccer_dp_bootstrap_tests {
         let v0 = *v.get(&0).unwrap();
         let v1 = *v.get(&1).unwrap();
         let v2 = *v.get(&2).unwrap();
-        assert!((v2 - 10.0).abs() < 1e-6, "terminal-reward bucket = raw reward");
-        assert!((v1 - gamma * 10.0).abs() < 1e-6, "one step back discounts once");
+        assert!(
+            (v2 - 10.0).abs() < 1e-6,
+            "terminal-reward bucket = raw reward"
+        );
+        assert!(
+            (v1 - gamma * 10.0).abs() < 1e-6,
+            "one step back discounts once"
+        );
         assert!(
             (v0 - gamma * gamma * 10.0).abs() < 1e-6,
             "two steps back discounts twice"
         );
-        assert!(v0 > 0.0 && v0 < v1 && v1 < v2, "value rises toward the reward");
+        assert!(
+            v0 > 0.0 && v0 < v1 && v1 < v2,
+            "value rises toward the reward"
+        );
     }
 
     #[test]
@@ -14893,10 +14914,16 @@ mod soccer_dp_bootstrap_tests {
         let gamma = 0.9;
         // horizon 2 from start 0: 1 + γ·1 + γ²·V(0) = 1 + 0.9 + 0.81·5 = 5.95.
         let r = soccer_dp_nstep_return(&seq, 0, 2, gamma, &value);
-        assert!((r - 5.95).abs() < 1e-6, "n-step = discounted rewards + bootstrap, got {r}");
+        assert!(
+            (r - 5.95).abs() < 1e-6,
+            "n-step = discounted rewards + bootstrap, got {r}"
+        );
         // At the tail (start 3) the window can't fill and has no successor ⇒ no bootstrap ⇒ just 1.0.
         let tail = soccer_dp_nstep_return(&seq, 3, 2, gamma, &value);
-        assert!((tail - 1.0).abs() < 1e-6, "terminal tail bootstraps 0, got {tail}");
+        assert!(
+            (tail - 1.0).abs() < 1e-6,
+            "terminal tail bootstraps 0, got {tail}"
+        );
     }
 
     #[test]
@@ -18248,8 +18275,8 @@ impl SoccerTacticalLearningWeights {
             if !value.is_finite() {
                 return Err(format!("{name} must be finite"));
             }
-            if !(-5.0..=5.0).contains(&value) {
-                return Err(format!("{name} must be between -5.0 and 5.0"));
+            if !(0.0..=5.0).contains(&value) {
+                return Err(format!("{name} must be between 0.0 and 5.0"));
             }
         }
         Ok(())
@@ -19357,16 +19384,23 @@ impl MatchConfig {
                 // MCTS is DP-lookahead scored by the value net + analytic MPC priors — it can pull the
                 // net's choices back toward the analytic policy (entrenching parity). SOCCER_DISABLE_NEURAL_MCTS=1
                 // lets the raw actor-critic policy drive directly, to A/B whether MCTS helps or hurts the climb.
-                mcts_enabled: std::env::var("SOCCER_DISABLE_NEURAL_MCTS").ok().as_deref() != Some("1"),
+                mcts_enabled: std::env::var("SOCCER_DISABLE_NEURAL_MCTS").ok().as_deref()
+                    != Some("1"),
                 // Env-tunable so we can A/B whether SOLVING MORE EXACTLY (deeper lookahead / more
                 // simulations / wider candidate set) climbs above parity — i.e. whether the plateau is
                 // a shallow-search approximation ceiling. Sanitizers clamp to [1,32]/[2,16]/[1,3].
                 mcts_simulations: std::env::var("SOCCER_MCTS_SIMULATIONS")
-                    .ok().and_then(|s| s.trim().parse().ok()).unwrap_or(8),
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok())
+                    .unwrap_or(8),
                 mcts_candidates: std::env::var("SOCCER_MCTS_CANDIDATES")
-                    .ok().and_then(|s| s.trim().parse().ok()).unwrap_or(4),
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok())
+                    .unwrap_or(4),
                 mcts_depth: std::env::var("SOCCER_MCTS_DEPTH")
-                    .ok().and_then(|s| s.trim().parse().ok()).unwrap_or(1),
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok())
+                    .unwrap_or(1),
                 ..SoccerNeuralBlendConfig::default()
             },
             mpc: SoccerMpcConfig {
