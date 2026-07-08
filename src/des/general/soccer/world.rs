@@ -30029,6 +30029,29 @@ impl SoccerMatch {
         std::mem::take(&mut self.pass_outcome_samples)
     }
 
+    /// Install a trained MPC execution-objective head for live consumption (the learner carries +
+    /// trains it across games, mirroring [`Self::set_pass_completion_head`]).
+    pub fn set_mpc_objective_head(&mut self, head: SoccerMpcObjectiveHead) {
+        self.mpc_objective_head = Some(std::sync::Arc::new(head));
+    }
+
+    /// Drain the accumulated MPC-objective RWR samples (the learner trains
+    /// [`SoccerMpcObjectiveHead`] on them and carries the head forward).
+    pub fn drain_mpc_objective_samples(&mut self) -> Vec<MpcObjectiveSample> {
+        std::mem::take(&mut self.mpc_objective_samples)
+    }
+
+    /// Two independent standard-normal draws from the match RNG (Box–Muller), for the executor
+    /// head's exploration jitter. Threaded explicitly so the head stays deterministic + rng-free.
+    /// Guards the log against a zero `u1` (→ +inf) by flooring it to a tiny positive.
+    fn mpc_objective_exploration_noise(&mut self) -> (f64, f64) {
+        let u1 = self.rng.next_float().max(1e-12);
+        let u2 = self.rng.next_float();
+        let radius = (-2.0 * u1.ln()).sqrt();
+        let theta = 2.0 * std::f64::consts::PI * u2;
+        (radius * theta.cos(), radius * theta.sin())
+    }
+
     fn stat_clearance(&mut self, team: Team) {
         match team {
             Team::Home => self.stats.clearances_home += 1,
