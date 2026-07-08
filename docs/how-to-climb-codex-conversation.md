@@ -579,6 +579,20 @@ data — result pending an 8-game diag self-play on a freshly-built instrumented
 (`/tmp/passdiag-target`). If emission rate is high, the earlier spatial REJECT was purely the
 chance-quality confound (already proven) and the lever was testable all along.
 
+**MEASURED — pass-space is NOT inert at source (refutes the inference).** 8000 pass-candidate
+expansions in the TRAIN path (gate ON): estimator returns `Some` **100.0%**, distinct
+(>1yd-from-feet) lead pushed **99.5%**. The distinct space candidate is created on essentially every
+pass expansion — matching the code read (`team_has_possession` true, `forward_bias` fires,
+`led_pass_target_for_receiver` only adds lead). So the spatial lever was **live during training**;
+the earlier spatial REJECT (0.325–0.438) was the **chance-quality confound (already proven off in
+`passspace_ab.sh`)**, not a dead candidate. The clean spatial A/B (confirmed base + chance-quality +
+scored-placement + pass-space) is therefore a legitimate, information-bearing experiment.
+**Discrepancy to flag:** the other operator's byte-identical result was on the frozen-net **EVAL**
+path via `passspace_recover.sh`; my diag exercised the **TRAIN** path. Either the eval-gate process
+didn't actually apply `DD_SOCCER_ENABLE_NEURAL_PASS_SPACE`, or the eval decision route differs from
+the training MCTS expansion — worth a targeted eval-path diag before trusting "inert". Instrumentation
+is gated (`DD_SOCCER_DUMP_PASS_SPACE_DIAG`), byte-identical off; left in place.
+
 ## One-line summary
 
 The ceiling is structural: the net is a *selector over analytic candidates* optimizing
