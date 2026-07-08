@@ -32486,6 +32486,14 @@ impl SoccerMatch {
         (radius * theta.cos(), radius * theta.sin())
     }
 
+    /// One independent standard-normal draw for the executor head's learned-bend jitter (drawn from
+    /// its own RNG pair so it does not correlate with the aim residual's noise).
+    fn mpc_objective_bend_noise(&mut self) -> f64 {
+        let u1 = self.rng.next_float().max(1e-12);
+        let u2 = self.rng.next_float();
+        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+    }
+
     fn stat_clearance(&mut self, team: Team) {
         match team {
             Team::Home => self.stats.clearances_home += 1,
