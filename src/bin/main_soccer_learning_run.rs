@@ -5744,6 +5744,7 @@ fn run_game(
         .ok_or_else(|| "soccer learning produced no team policies".to_string())?;
     let config_moments = sim.config_moments();
     let pass_outcome_samples = sim.drain_pass_outcome_samples();
+    let mpc_objective_samples = sim.drain_mpc_objective_samples();
     // Gap 5: train the CARRIED line-depth head on this game's reward-weighted RL
     // corpus so it accumulates across games and the back-four line consumes it live
     // once trained. Empty + skipped unless a line-depth model is enabled
