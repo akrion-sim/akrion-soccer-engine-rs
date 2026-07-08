@@ -28,7 +28,9 @@ fn main() {
         }
     }
     let n_decisions: usize = trajs.iter().map(|t| t.len()).sum();
-    let n_actions = trajs.iter().flatten().map(|d| d.action).max().unwrap_or(0) + 1;
+    let data_n = trajs.iter().flatten().map(|d| d.action).max().unwrap_or(0) + 1;
+    // fixed action head (73) so a checkpoint can be fine-tuned even if this batch lacks some labels
+    let n_actions = std::env::var("N_ACTIONS").ok().and_then(|s| s.parse().ok()).unwrap_or(data_n).max(data_n);
 
     // GLOBAL return stats → normalize the critic target (the fix for critic_mse ~600).
     let all_returns: Vec<f32> = trajs.iter().flat_map(|t| mc_returns(t, gamma)).collect();
@@ -42,6 +44,10 @@ fn main() {
 
     let cfg = PomdpConfig::new(8, n_actions).with_model_dim(96).with_hidden_dim(128).with_n_heads(6);
     let mut net = cfg.init::<B>(&dev);
+    if let Ok(mi) = std::env::var("MODEL_IN") {
+        net = net.load(&mi, &dev).expect("load checkpoint for fine-tuning");
+        println!("fine-tuning from checkpoint {mi}.bin");
+    }
     let mut opt = AdamConfig::new().init();
     let mut order: Vec<usize> = (0..trajs.len()).collect();
     let mut seed = 0x51EEDu64;
