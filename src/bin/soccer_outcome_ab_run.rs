@@ -118,10 +118,25 @@ fn train(out_path: &str, games: usize, minutes: f64, seed_base: u32) {
                 eprintln!("[train] game {g}: snapshot install failed: {e}");
             }
         }
+        // Install the carried executor head so this game applies the learned aim/lead residual and
+        // records fresh samples. Seeded on first install; no-op when the gate is off.
+        if learned_mpc_objective_enabled() {
+            let head = mpc_head.get_or_insert_with(|| SoccerMpcObjectiveHead::new(seed_base));
+            sim.set_mpc_objective_head(head.clone());
+        }
         for _ in 0..total_ticks {
             sim.run_time_step();
         }
         sim.drain_neural_learning(Duration::from_millis(100));
+        // Drain this game's executor-head samples and RWR-train the carried head (warm for next game).
+        if learned_mpc_objective_enabled() {
+            let samples = sim.drain_mpc_objective_samples();
+            if !samples.is_empty() {
+                if let Some(head) = mpc_head.as_mut() {
+                    head.train_rwr(&samples, 0.05);
+                }
+            }
+        }
         if let Some(p) = sim.team_policies() {
             policies = Arc::new(p.clone());
         }
