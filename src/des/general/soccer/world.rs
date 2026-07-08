@@ -347,8 +347,6 @@ fn defensive_shot_on_target_history_actions() -> usize {
     })
 }
 
-=======
->>>>>>> theirs
 const SOCCER_POLICY_EXPLORATION_TAIL_MASS_LIMIT: f64 = 0.25;
 const SOCCER_POLICY_EXPLORATION_TAIL_RANK_DECAY: f64 = 0.85;
 const PASS_TARGET_MARK_HORIZON_TICKS: [f64; 5] = [0.0, 1.0, 2.0, 4.0, 8.0];
