@@ -67775,6 +67775,7 @@ mod reward_priority_tests {
             offside: None,
             offside_candidates: Vec::new(),
             learn_features: Vec::new(),
+            mpc_objective: None,
         };
         let mut lateral = forward.clone();
         lateral.intended_target = Vec2::new(52.0, 62.0);
