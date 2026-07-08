@@ -16535,9 +16535,11 @@ impl SoccerMatch {
         if !hard_replan && !soft_replan_eligible {
             return plan;
         }
-        let Some((_, ranked)) =
-            policy.ranked_action_values_for_snapshot(snapshot, player_id, LEARNED_MPC_REPLAN_CANDIDATES)
-        else {
+        let Some((_, ranked)) = policy.ranked_action_values_for_snapshot(
+            snapshot,
+            player_id,
+            LEARNED_MPC_REPLAN_CANDIDATES,
+        ) else {
             if hard_replan {
                 return Self::mpc_safe_fallback_learned_plan(
                     policy,
@@ -16634,14 +16636,17 @@ impl SoccerMatch {
             }
             let label = normalize_soccer_action_label(label);
             let progression_bias = match label {
-                "carry-forward" | "runaround-dribble" | "open-pass-lane"
-                | "open-passing-lane" => 0.06,
+                "carry-forward" | "runaround-dribble" | "open-pass-lane" | "open-passing-lane" => {
+                    0.06
+                }
                 "protect-ball" | "wait-for-support" | "control-touch" => 0.03,
                 "clearance" => -0.04,
                 _ => 0.0,
             };
-            let priority_bias =
-                (LEARNED_MPC_SAFE_FALLBACK_ACTIONS.len().saturating_sub(priority) as f64) * 0.001;
+            let priority_bias = (LEARNED_MPC_SAFE_FALLBACK_ACTIONS
+                .len()
+                .saturating_sub(priority) as f64)
+                * 0.001;
             let score = execution_probability + progression_bias + priority_bias;
             if best
                 .as_ref()
