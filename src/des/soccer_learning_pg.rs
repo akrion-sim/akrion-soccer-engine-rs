@@ -3375,6 +3375,7 @@ impl SoccerLearningPgStore {
         let mut cursor_tactical = i32::MIN;
         let mut cursor_macro = i32::MIN;
         let mut cursor_root = i32::MIN;
+        let mut cursor_receiver = i32::MIN;
         loop {
             let rows = self
                 .client
