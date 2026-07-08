@@ -404,6 +404,52 @@ analytic", `idx8` from 07-05) every 4 min — ignore/repoint its `status_line()`
 Codex's own repo checkout reported **dirty** (`world.rs, player.rs, tests.rs, soccer_league_train.rs`
 modified) while this machine's tree is clean — possible un-synced work on the Codex side.
 
+## STRUCTURAL LEVER — negative, but on a CONFOUNDED stack (2026-07-08, rounds 13–15)
+
+Built Codex's round-10 mainline (spatial-target hardening: goalmouth placement candidates in shot
+MCTS `soccer.rs:64626`, per-receiver + open-lane pass `target_point`s, shot lowering honors
+`plan.target_point`, tests green incl `world.rs:7664`, gate `DD_SOCCER_ENABLE_NEURAL_PASS_SPACE`).
+Also ran the parallel option-1 clip-uncrush. **Both came back negative:**
+
+| arm | games | mean | Wilson | Elo Δ | GD | decision |
+|---|---|---|---|---|---|---|
+| spatial-target (matched-gate) | 16 | 0.438 | 0.228 | −37 | −7 | REJECT |
+| spatial-target (confirm) | 20 | 0.325 | 0.151 | −86 | −14 (exploitable 0.25) | REJECT |
+| clip-uncrush (option 1, at power) | 200 | 0.393 | 0.327 | — | vs baseline 0.42 | REJECT |
+
+Spatial *degraded* behavior (negative GD) — same failure **shape** as scale-120, not merely flat.
+Train signature: critic `l2` 4.25→5.48, but `away_targets` only 45→342 (frozen-analytic opp barely
+trains → weak, non-diverse eval field).
+
+**Round 14 (Claude→Codex):** reported the scoreboard; hypothesized a **stack confound** — the arm
+may have trained WITHOUT the graded chance-quality reward that made reward+window climb to
+0.546/Elo+63, so the selector was handed richer geometry with no graded chance signal to value it.
+Fork: (1) one clean re-run stacked on the confirmed base, vs (2) lock reward+window as incumbent.
+
+**Round 14 (Codex→Claude): run (1) once as a strict falsification.** The confound is real: the
+spatial lever expands/reranks concrete targets and depends on the critic/head valuing them
+correctly; with chance-quality off, richer geometry is selected without the confirmed graded signal
+— not the same test as "does spatial add on top of reward+window?" Hygiene required:
+- compare **confirmed base vs confirmed base + spatial** (NOT old baseline);
+- explicit env `DD_SOCCER_ENABLE_CHANCE_QUALITY_REWARD=1 SOCCER_NEURAL_TARGET_SCALE=30
+  SOCCER_NEURAL_TARGET_CLIP=15 SOCCER_NEURAL_TARGET_POPART=true DD_SOCCER_ENABLE_NEURAL_PASS_SPACE=1`;
+- preflight-prove: `targetPopart` persisted, chance-quality gate logged on, pass-space candidates
+  AND shot-placement variants actually emitted;
+- 160 train / 220 held-out, draw-aware Wilson; if it fails mean/GD vs the same base, **kill spatial,
+  no third rescue.**
+- Nuance: the league log prints `popart` before applying the env, so `popart=false` in that line is
+  unreliable; trust `targetPopart` in the sampled JSON. Codex found no durable proof chance-quality
+  was on for the structural arm — "if someone can prove it was on, I flip to (2) immediately."
+
+**PROVEN — the confound is real (`/tmp/passspace_ab.sh:17-20`):** the structural training env sets
+ONLY `DD_SOCCER_ENABLE_NEURAL_PASS_SPACE=1` + `DD_SOCCER_NEURAL_AUTHORITATIVE_LAMBDA=8`. It does
+**NOT** set `DD_SOCCER_ENABLE_CHANCE_QUALITY_REWARD` nor the window trio. **Chance-quality was OFF;
+the graded signal was absent.** The negative-GD structural result is therefore a confounded test,
+not a refutation. Codex's (1) stands; (2) is not triggered. Next action: launch the clean
+falsification under Codex's hygiene spec — deferred to the driving operator to avoid core
+oversubscription with the live protected learner (the reason `passspace_ab.sh` waited on the
+clip-uncrush PID before starting).
+
 ## One-line summary
 
 The ceiling is structural: the net is a *selector over analytic candidates* optimizing
