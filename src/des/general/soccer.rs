@@ -12248,6 +12248,22 @@ pub(crate) const SOCCER_RECEIVER_TIGHT_YARDS: f64 = 3.0;
 /// between tight and this it is "contested" (openness 1).
 pub(crate) const SOCCER_RECEIVER_OPEN_YARDS: f64 = 7.0;
 
+/// Multiplier that makes the learned per-receiver value DOMINATE the heuristic quality terms
+/// when the learned-pass-receiver head is on: the head decides who, and completion/openness/MPC
+/// heuristics only tie-break equal or unseen receivers. Learned values are return-scale (a few
+/// units); ×this dwarfs the heuristic spread (< ~2).
+pub(crate) const LEARNED_RECEIVER_HEAD_DOMINANCE: f64 = 100.0;
+
+/// One ranked pass-receiver teammate under the learned-pass-receiver head: the head's score plus
+/// the perceived-concede flag, so the caller can MPC-mask down the ranking (kick an infeasible
+/// receiver back to the head) rather than silently overriding the head's choice.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RankedPassTeammate {
+    pub player_id: usize,
+    pub head_score: f64,
+    pub concedes: bool,
+}
+
 /// Kind axis of a [`ReceiverDescriptor`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReceiverKind {
