@@ -21379,12 +21379,16 @@ pub(crate) fn is_outside_mid_attack_strategy(strategy: TeamAttackStrategy) -> bo
 /// the operator explicitly sets the env var to a falsey value (`0` / `false` / `no` /
 /// `off`) — the kill switch. Empty / any other value ⇒ ON.
 pub(crate) fn gate_default_on(name: &str) -> bool {
-    match std::env::var(name) {
-        Ok(raw) => !matches!(
-            raw.trim().to_ascii_lowercase().as_str(),
+    gate_default_on_from_raw(std::env::var(name).ok().as_deref())
+}
+
+fn gate_default_on_from_raw(raw: Option<&str>) -> bool {
+    match raw {
+        Some(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
             "0" | "false" | "no" | "off"
         ),
-        Err(_) => true,
+        None => true,
     }
 }
 
@@ -38814,9 +38818,10 @@ pub fn learned_pass_completion_enabled() -> bool {
 /// Env flag enabling the learned MPC execution-objective head ([`SoccerMpcObjectiveHead`]): when a
 /// pass/shot/dribble is executed and the head is warm, it adds a hard-bounded (≤
 /// [`MPC_OBJECTIVE_MAX_RESIDUAL_YARDS`]) residual to the analytic aim/lead target before the
-/// existing pitch/onside/speed guards re-clamp it. Off ⇒ the pure analytic target stands alone
-/// (byte-identical to the pre-wiring behaviour). Read once per process. The policy still owns WHICH
-/// action and WHICH receiver — this only nudges the executor's aim within the guard envelope.
+/// existing pitch/onside/speed guards re-clamp it. Default-ON in production with
+/// `DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE=0/false/no/off` as the kill switch; default-OFF in
+/// tests so parity suites stay env-explicit. The policy still owns WHICH action and WHICH receiver
+/// — this only nudges the executor's aim within the guard envelope.
 pub fn learned_mpc_objective_enabled() -> bool {
     #[cfg(test)]
     {
@@ -38826,7 +38831,7 @@ pub fn learned_mpc_objective_enabled() -> bool {
     {
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE"))
+        *ENABLED.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE"))
     }
 }
 
@@ -38856,10 +38861,10 @@ pub(crate) fn mpc_objective_explore_sigma_yards() -> f64 {
 
 /// Whether the executor head carries the learnable SIGNED-BEND axis (3rd output) AND applies it to
 /// pass curl — the "knight-move" hook (`DD_SOCCER_ENABLE_LEARNED_CURVE`). Requires the executor head
-/// itself (`DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE`) to be on to have any effect; default-off ⇒
-/// byte-identical (head stays 2-output, curl stays analytic). Also flips the MPC pass-lane
-/// interception check to sample the CURVED arc so a learned bend around a straight-lane defender is
-/// scored feasible instead of blocked.
+/// itself (`DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE`) to be on to have any effect. The bend axis
+/// remains default-off: when `DD_SOCCER_ENABLE_LEARNED_CURVE` is unset the head stays 2-output and
+/// curl stays analytic. Also flips the MPC pass-lane interception check to sample the CURVED arc so
+/// a learned bend around a straight-lane defender is scored feasible instead of blocked.
 pub fn learned_curve_enabled() -> bool {
     #[cfg(test)]
     {
@@ -68663,6 +68668,17 @@ mod locomotion_commitment_tests {
 #[cfg(test)]
 mod reward_priority_tests {
     use super::*;
+
+    #[test]
+    fn default_on_gate_uses_falsey_values_as_kill_switches() {
+        assert!(gate_default_on_from_raw(None));
+        assert!(gate_default_on_from_raw(Some("true")));
+        assert!(gate_default_on_from_raw(Some("")));
+        assert!(!gate_default_on_from_raw(Some("0")));
+        assert!(!gate_default_on_from_raw(Some("false")));
+        assert!(!gate_default_on_from_raw(Some(" no ")));
+        assert!(!gate_default_on_from_raw(Some("OFF")));
+    }
 
     #[test]
     fn outcome_rewards_dominate_pass_only_shaping() {

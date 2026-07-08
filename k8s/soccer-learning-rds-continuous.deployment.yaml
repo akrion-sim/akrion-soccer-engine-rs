@@ -98,6 +98,9 @@ spec:
               require_value SOCCER_EVOLUTION_INTERVAL_GAMES 5
               require_value DD_SOCCER_ENABLE_LOOSE_BALL_COMMIT_MODEL true
               require_value DD_SOCCER_ENABLE_LEARNED_SPACING_TARGET true
+              require_value DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE true
+              require_value DD_SOCCER_FORWARD_PASS_REWARD_SCALE 6
+              require_value DD_SOCCER_SHOT_SHAPING_REWARD_SCALE 0.4
 
               echo "continuous_started_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
               echo "postgres_required=${SOCCER_REQUIRE_POSTGRES}"
@@ -110,6 +113,9 @@ spec:
               echo "completed_batch_games=${SOCCER_POSTGRES_COMPLETED_RUN_BATCH_GAMES}"
               echo "flush_before_new_sim=${SOCCER_POSTGRES_FLUSH_POLICY_VERSIONS_BEFORE_NEW_SIM}"
               echo "refresh_with_resume=${SOCCER_POSTGRES_REFRESH_WITH_RESUME_ARTIFACT}"
+              echo "learned_mpc_objective=${DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE}"
+              echo "forward_pass_reward_scale=${DD_SOCCER_FORWARD_PASS_REWARD_SCALE}"
+              echo "shot_shaping_reward_scale=${DD_SOCCER_SHOT_SHAPING_REWARD_SCALE}"
               echo "source_ref=${source_ref}"
               echo "engine_ref=${engine_ref}"
 
@@ -325,6 +331,12 @@ spec:
               value: "true"
             - name: DD_SOCCER_ENABLE_LEARNED_SPACING_TARGET
               value: "true"
+            - name: DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE
+              value: "true"
+            - name: DD_SOCCER_FORWARD_PASS_REWARD_SCALE
+              value: "6"
+            - name: DD_SOCCER_SHOT_SHAPING_REWARD_SCALE
+              value: "0.4"
             - name: SOCCER_PG_PASS_COMPLETION_SAMPLE_LIMIT
               value: "50000"
             - name: SOCCER_PG_PASS_COMPLETION_EPOCHS

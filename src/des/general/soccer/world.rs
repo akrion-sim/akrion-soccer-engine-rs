@@ -26066,12 +26066,14 @@ impl SoccerMatch {
                     );
                     let pass_skill =
                         pass_execution_skill(&self.players[player_id].skills, flight, is_cross);
-                    // Learned MPC execution-objective (gated `DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE`,
-                    // default-off ⇒ byte-identical). Nudge the analytic lead target by a hard-bounded
-                    // (≤`MPC_OBJECTIVE_MAX_RESIDUAL_YARDS`) residual so pass QUALITY (aim/lead) becomes
-                    // learnable. The residual is re-clamped to the pitch here and still passes through
-                    // every downstream guard (noisy-aim clamp, offside/receipt/replan gate), so the
-                    // policy still owns WHO/WHETHER — this only refines WHERE within the guard envelope.
+                    // Learned MPC execution-objective (gated
+                    // `DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE`, production-default-on; falsey env
+                    // values disable). Nudge the analytic lead target by a hard-bounded
+                    // (≤`MPC_OBJECTIVE_MAX_RESIDUAL_YARDS`) residual so pass QUALITY (aim/lead)
+                    // becomes learnable. The residual is re-clamped to the pitch here and still
+                    // passes through every downstream guard (noisy-aim clamp, offside/receipt/replan
+                    // gate), so the policy still owns WHO/WHETHER — this only refines WHERE within
+                    // the guard envelope.
                     // Captured with its launch features + reinforced by the delayed pass outcome (RWR).
                     let mpc_objective_sample: Option<(Vec<f32>, Vec2, f64)> =
                         if learned_mpc_objective_enabled() {

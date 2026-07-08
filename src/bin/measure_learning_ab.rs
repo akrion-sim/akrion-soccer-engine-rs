@@ -150,7 +150,7 @@ fn main() {
     // Learned MPC execution-objective head, carried + RWR-trained across games (mirrors the
     // pass-completion head's per-process carry). Seeded up-front when the gate is on so game 1
     // already captures cold-exploration samples (the head must exist for the residual to apply);
-    // stays `None` (never installed, byte-identical) when the gate is off.
+    // stays `None` only when the production-default-on gate is disabled with a falsey env value.
     let mut mpc_objective_head: Option<SoccerMpcObjectiveHead> = if learned_mpc_objective_enabled()
     {
         Some(SoccerMpcObjectiveHead::new(seed_base))
@@ -181,7 +181,7 @@ fn main() {
             }
         }
         // Install the carried executor head so this game's passes get the learned aim/lead residual
-        // (gated; a no-op unless DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE is set).
+        // (gated; a no-op only when DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE is falsey).
         if let Some(head) = mpc_objective_head.as_ref() {
             sim.set_mpc_objective_head(head.clone());
         }
