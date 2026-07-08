@@ -3388,6 +3388,91 @@ mod tests {
     }
 
     #[test]
+    fn runaround_success_counts_as_dribble_beat_and_replays_launch_decision() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            learning_enabled: true,
+            full_game_learning_enabled: true,
+            ..MatchConfig::default()
+        });
+        let attacker = 9;
+        let defender = 13;
+        sim.tick = 160;
+        sim.clock_seconds = 12.0;
+        sim.players[defender].position = Vec2::new(40.0, 60.0);
+        sim.players[attacker].position = Vec2::new(41.0, 62.5);
+        sim.ball.holder = Some(attacker);
+        sim.ball.position = sim.players[attacker].position;
+        sim.ball.last_touch_team = Some(Team::Home);
+        sim.players[attacker].runaround = Some(RunaroundDribble {
+            defender,
+            launch_clock_seconds: sim.clock_seconds - 2.35,
+            push_target: Vec2::new(41.0, 61.0),
+            recollect_point: sim.players[attacker].position,
+            knocked: true,
+        });
+        let launch_tick = sim
+            .tick
+            .saturating_sub(RUNAROUND_LEARNING_CREDIT_MAX_AGE_TICKS - 1);
+        sim.recent_learning_history.push_back(world_test_transition(
+            &sim,
+            attacker,
+            "runaround-dribble",
+            launch_tick,
+        ));
+        sim.recent_learning_history.push_back(world_test_transition(
+            &sim,
+            defender,
+            "defend",
+            launch_tick,
+        ));
+
+        let deferred_start = sim.deferred_reward_transitions.len();
+        let episode_start = sim.episode_learning_transitions.len();
+        let event_start = sim.events.len();
+        let beat_start = sim.stats.dribble_beats_home;
+        sim.maintain_runaround_commitments();
+
+        assert!(sim.players[attacker].runaround.is_none());
+        assert_eq!(sim.stats.dribble_beats_home, beat_start + 1);
+        assert!(
+            sim.events[event_start..]
+                .iter()
+                .any(|event| { event.team == Some(Team::Home) && event.kind == "carry-forward" }),
+            "runaround success must emit a dribble-beat event for accounting"
+        );
+        let added = &sim.deferred_reward_transitions[deferred_start..];
+        assert!(
+            added.iter().any(|transition| {
+                transition.player_id == attacker
+                    && transition.tick == launch_tick
+                    && normalize_soccer_action_label(&transition.action) == "runaround-dribble"
+                    && transition.reward > 0.0
+            }),
+            "runaround success must replay the launch decision, got {added:?}"
+        );
+        assert!(
+            added.iter().any(|transition| {
+                transition.player_id == defender
+                    && transition.tick == launch_tick
+                    && normalize_soccer_action_label(&transition.action) == "defend"
+                    && transition.reward < 0.0
+            }),
+            "runaround success must replay the beaten defender decision, got {added:?}"
+        );
+        assert!(
+            sim.episode_learning_transitions[episode_start..]
+                .iter()
+                .any(|transition| {
+                    transition.player_id == attacker
+                        && transition.tick == launch_tick
+                        && normalize_soccer_action_label(&transition.action) == "runaround-dribble"
+                        && transition.reward > 0.0
+                }),
+            "full-game replay must include the credited runaround decision"
+        );
+    }
+
+    #[test]
     fn overdribble_dispossession_penalty_replays_original_dribble_transition_across_ticks() {
         let _env = set_test_env_var("DD_SOCCER_ENABLE_OVERDRIBBLE_PENALTY", "1");
         let mut sim = SoccerMatch::default_11v11(MatchConfig {
@@ -7207,8 +7292,10 @@ mod tests {
     fn neural_authoritative_dp_safety_blocks_catastrophic_hold_regression() {
         let _env_lock = soccer_world_env_lock();
         let _enabled = set_test_env_var("DD_SOCCER_ENABLE_NEURAL_AUTHORITATIVE_DP_SAFETY", "1");
-        let _min_best =
-            set_test_env_var("SOCCER_NEURAL_AUTHORITATIVE_DP_SAFETY_MIN_BEST_VALUE", "4.0");
+        let _min_best = set_test_env_var(
+            "SOCCER_NEURAL_AUTHORITATIVE_DP_SAFETY_MIN_BEST_VALUE",
+            "4.0",
+        );
         let _min_margin =
             set_test_env_var("SOCCER_NEURAL_AUTHORITATIVE_DP_SAFETY_MIN_MARGIN", "3.0");
         let _min_ratio =
@@ -7235,8 +7322,10 @@ mod tests {
     fn neural_authoritative_dp_safety_leaves_near_ties_to_neural_value() {
         let _env_lock = soccer_world_env_lock();
         let _enabled = set_test_env_var("DD_SOCCER_ENABLE_NEURAL_AUTHORITATIVE_DP_SAFETY", "1");
-        let _min_best =
-            set_test_env_var("SOCCER_NEURAL_AUTHORITATIVE_DP_SAFETY_MIN_BEST_VALUE", "4.0");
+        let _min_best = set_test_env_var(
+            "SOCCER_NEURAL_AUTHORITATIVE_DP_SAFETY_MIN_BEST_VALUE",
+            "4.0",
+        );
         let _min_margin =
             set_test_env_var("SOCCER_NEURAL_AUTHORITATIVE_DP_SAFETY_MIN_MARGIN", "3.0");
         let _min_ratio =
@@ -10955,16 +11044,14 @@ impl SoccerMatch {
             return None;
         }
         let selected_rank = soccer_policy_weighted_rank_index(candidate_count, draw);
-        candidates
-            .get(selected_rank)
-            .map(|candidate| {
-                Self::scored_candidate_policy_choice(
-                    candidate,
-                    candidates,
-                    soccer_policy_rank_probability(candidate_count, selected_rank),
-                    false,
-                )
-            })
+        candidates.get(selected_rank).map(|candidate| {
+            Self::scored_candidate_policy_choice(
+                candidate,
+                candidates,
+                soccer_policy_rank_probability(candidate_count, selected_rank),
+                false,
+            )
+        })
     }
 
     fn scored_candidate_counts(candidates: &[SoccerNeuralMctsCandidate]) -> (u32, u32, u32) {
@@ -11009,9 +11096,9 @@ impl SoccerMatch {
     fn top_scored_candidate_choice(
         candidates: &[SoccerNeuralMctsCandidate],
     ) -> Option<SoccerPolicyActionChoice> {
-        candidates
-            .first()
-            .map(|candidate| Self::scored_candidate_policy_choice(candidate, candidates, 1.0, false))
+        candidates.first().map(|candidate| {
+            Self::scored_candidate_policy_choice(candidate, candidates, 1.0, false)
+        })
     }
 
     fn neural_authoritative_dp_safety_choice(
@@ -11127,16 +11214,14 @@ impl SoccerMatch {
         let mut threshold = (draw / floor).clamp(0.0, 1.0 - f64::EPSILON) * total;
         for (rank, weight) in eligible[..eligible_count].iter().copied() {
             if threshold < weight {
-                return candidates
-                    .get(rank)
-                    .map(|candidate| {
-                        Self::scored_candidate_policy_choice(
-                            candidate,
-                            candidates,
-                            soccer_policy_rank_probability(candidate_count, rank),
-                            false,
-                        )
-                    });
+                return candidates.get(rank).map(|candidate| {
+                    Self::scored_candidate_policy_choice(
+                        candidate,
+                        candidates,
+                        soccer_policy_rank_probability(candidate_count, rank),
+                        false,
+                    )
+                });
             }
             threshold -= weight;
         }
@@ -16005,7 +16090,7 @@ impl SoccerMatch {
             .map(|p| p.team);
         let clock = self.clock_seconds;
         let mut clears: Vec<usize> = Vec::new();
-        let mut successes: Vec<usize> = Vec::new();
+        let mut successes: Vec<(usize, usize)> = Vec::new();
         for player in self.players.iter() {
             let Some(run) = player.runaround else {
                 continue;
@@ -16021,7 +16106,7 @@ impl SoccerMatch {
                         (player.position.y - defender.position.y) * player.team.attack_dir() > 0.0
                     });
                     if beaten {
-                        successes.push(player.id);
+                        successes.push((player.id, run.defender));
                     }
                 }
             }
@@ -16031,8 +16116,67 @@ impl SoccerMatch {
                 player.runaround = None;
             }
         }
-        for id in successes {
-            self.record_reward_event(id, RUNAROUND_SUCCESS_REWARD_POINTS);
+        for (id, defender_id) in successes {
+            self.record_runaround_success_event(id, defender_id);
+        }
+    }
+
+    fn record_runaround_success_event(&mut self, attacker_id: usize, defender_id: usize) {
+        if attacker_id >= self.players.len() {
+            return;
+        }
+        let attacker_team = self.players[attacker_id].team;
+        let attacker_name = self.players[attacker_id].name.clone();
+        let defender_name = self
+            .players
+            .get(defender_id)
+            .filter(|defender| defender.team != attacker_team)
+            .map(|defender| defender.name.clone());
+
+        self.record_reward_event_with_kind(
+            attacker_id,
+            RUNAROUND_SUCCESS_REWARD_POINTS,
+            SoccerRewardEventKind::DribbleBeat,
+        );
+        self.queue_recent_outcome_learning_credit(
+            attacker_id,
+            attacker_team,
+            RUNAROUND_SUCCESS_REWARD_POINTS,
+            SoccerRewardEventKind::DribbleBeat,
+            RUNAROUND_LEARNING_CREDIT_MAX_AGE_TICKS,
+            |action| action == "runaround-dribble" || is_dribble_action_label(action),
+        );
+
+        if let Some(defender_name) = defender_name {
+            let defender_team = self.players[defender_id].team;
+            self.record_reward_event_with_kind(
+                defender_id,
+                -BEATEN_BY_DRIBBLE_PENALTY_POINTS,
+                SoccerRewardEventKind::DribbleBeat,
+            );
+            self.queue_recent_outcome_learning_credit(
+                defender_id,
+                defender_team,
+                -BEATEN_BY_DRIBBLE_PENALTY_POINTS,
+                SoccerRewardEventKind::DribbleBeat,
+                RUNAROUND_LEARNING_CREDIT_MAX_AGE_TICKS,
+                |action| {
+                    matches!(
+                        action,
+                        "defend" | "press" | "press-cover" | "tackle" | "slide-tackle"
+                    )
+                },
+            );
+            self.stat_dribble_beat(attacker_team);
+            self.events.push(MatchEvent {
+                tick: self.tick,
+                clock_seconds: self.clock_seconds,
+                kind: DribbleMoveKind::CarryForward.event_kind().to_string(),
+                team: Some(attacker_team),
+                player_id: Some(attacker_id),
+                description: format!("{attacker_name} beat {defender_name} with runaround-dribble"),
+                ..MatchEvent::default()
+            });
         }
     }
 
@@ -29075,10 +29219,10 @@ impl SoccerMatch {
                 if transition.decision_context.neural_mcts_candidate_count > 0 {
                     self.stats.neural_mcts_candidate_sets =
                         self.stats.neural_mcts_candidate_sets.saturating_add(1);
-                    self.stats.neural_mcts_candidates =
-                        self.stats.neural_mcts_candidates.saturating_add(
-                            transition.decision_context.neural_mcts_candidate_count,
-                        );
+                    self.stats.neural_mcts_candidates = self
+                        .stats
+                        .neural_mcts_candidates
+                        .saturating_add(transition.decision_context.neural_mcts_candidate_count);
                     self.stats.neural_mcts_discretized_kick_candidates = self
                         .stats
                         .neural_mcts_discretized_kick_candidates
@@ -29173,15 +29317,13 @@ impl SoccerMatch {
                             .best_legal_action_score
                             .max(transition.decision_context.chosen_action_score)
                             .max(1.0);
-                        let analytic_difference_reward = (transition
-                            .decision_context
-                            .action_score_margin
-                            / scale
-                            * SOCCER_ANALYTIC_DIFFERENCE_REWARD_WEIGHT)
-                            .clamp(
-                                -SOCCER_ANALYTIC_DIFFERENCE_REWARD_CAP_POINTS,
-                                SOCCER_ANALYTIC_DIFFERENCE_REWARD_CAP_POINTS,
-                            );
+                        let analytic_difference_reward =
+                            (transition.decision_context.action_score_margin / scale
+                                * SOCCER_ANALYTIC_DIFFERENCE_REWARD_WEIGHT)
+                                .clamp(
+                                    -SOCCER_ANALYTIC_DIFFERENCE_REWARD_CAP_POINTS,
+                                    SOCCER_ANALYTIC_DIFFERENCE_REWARD_CAP_POINTS,
+                                );
                         if analytic_difference_reward.abs() > 1e-9 {
                             self.stats.analytic_difference_reward_events = self
                                 .stats
@@ -33052,6 +33194,7 @@ fn soccer_force_runaround() -> bool {
 
 // Run-around-dribble (knock past + sprint the body the other side + re-collect behind) tunables.
 const RUNAROUND_TTL_SECONDS: f64 = 2.5;
+const RUNAROUND_LEARNING_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(RUNAROUND_TTL_SECONDS + 0.25);
 const RUNAROUND_SUCCESS_REWARD_POINTS: f64 = 8.0;
 const RUNAROUND_MIN_FORWARD_SPEED_YPS: f64 = 4.0;
 const RUNAROUND_DEFENDER_MIN_AHEAD_YARDS: f64 = 1.5;
