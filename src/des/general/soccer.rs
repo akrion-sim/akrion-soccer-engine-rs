@@ -55954,6 +55954,7 @@ fn tracking_action_target_trace(
         )),
         facing: facing_bucket_from_vector(point - player.position),
         dribble_touch,
+        receiver_descriptor: None,
     })
 }
 
@@ -56288,6 +56289,7 @@ fn soccer_moment_action_target_trace(
         )),
         facing: facing_bucket_from_vector(point - player.position),
         dribble_touch,
+        receiver_descriptor: None,
     })
 }
 
