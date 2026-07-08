@@ -80,6 +80,8 @@ mod beat_defender;
 pub use beat_defender::*;
 mod support_scorer;
 pub use support_scorer::*;
+mod mpc_objective_head;
+pub use mpc_objective_head::*;
 mod run_prediction;
 pub use run_prediction::*;
 mod perception;
