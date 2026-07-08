@@ -473,7 +473,6 @@ mod tests {
             offside: None,
             offside_candidates: Vec::new(),
             learn_features: Vec::new(),
-            mpc_objective: None,
         }
     }
 

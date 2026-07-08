@@ -18,7 +18,6 @@ use soccer_engine::des::general::soccer::{
     PassLaneYieldHead, ReceiveApproachHead, RunPredictionHead, SeparationFloorHead,
     ShotTriggerHead, SlipBreakHead, SoccerAuxiliaryHeadSnapshot, SoccerConfigMomentInsert,
     SoccerLearningTransition, SoccerMarlAlgorithm, SoccerMatch, SoccerMomentWindow,
-    SoccerMpcObjectiveHead, learned_mpc_objective_enabled,
     SoccerNeuralBlendMode, SoccerNeuralLayerSnapshot, SoccerNeuralLearningBackend,
     SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot, SoccerPassCompletionHead,
     SoccerPassLearningMetrics, SoccerPassOutcomeSample, SoccerPolicyHeadSnapshot,
@@ -46,14 +45,16 @@ use soccer_engine::des::general::tournament::{
     TournamentMatchRunner, TournamentStage,
 };
 use soccer_engine::des::soccer_learning::{
+    apply_soccer_learning_plateau_traction_to_episode_config,
     evaluate_soccer_policy_promotion_gate, evolve_soccer_tactical_learning_weights_from_genomes,
     evolve_soccer_team_policies, merge_soccer_policy_deltas,
     soccer_evolution_options_from_search_metadata, soccer_learning_curriculum_episode_config,
     soccer_learning_curriculum_stage_for_completed_games,
-    soccer_learning_directional_objective_fitness, soccer_learning_run_score,
-    soccer_neural_network_snapshot_fingerprint, soccer_policy_active_max_fitness_regression,
-    soccer_policy_delta_entries, soccer_policy_version_insert_status_after_active_head,
-    soccer_postgres_new_sim_refresh_plan, soccer_postgres_policy_refresh_decision,
+    soccer_learning_directional_objective_fitness, soccer_learning_plateau_traction_profile,
+    soccer_learning_run_score, soccer_neural_network_snapshot_fingerprint,
+    soccer_policy_active_max_fitness_regression, soccer_policy_delta_entries,
+    soccer_policy_version_insert_status_after_active_head, soccer_postgres_new_sim_refresh_plan,
+    soccer_postgres_policy_refresh_decision,
     soccer_should_flush_postgres_policy_versions_for_new_sim,
     soccer_should_refresh_postgres_for_new_sim, soccer_tactical_learning_weights_fingerprint,
     soccer_team_q_policies_fingerprint, validate_soccer_evolution_options_for_learning_run,
@@ -104,6 +105,8 @@ const DEFAULT_SOCCER_NEURAL_POPULATION_MIN_FITNESS_DELTA: f64 = 0.05;
 const DEFAULT_SOCCER_NEURAL_POPULATION_MIN_ACCEPTED_FITNESS: f64 = 0.25;
 const DEFAULT_SOCCER_NEURAL_POPULATION_MIN_ACCEPTED_GOAL_MARGIN: f64 = 1.0;
 const DEFAULT_SOCCER_NEURAL_POPULATION_CONFIRM_GAMES: usize = 6;
+const DEFAULT_SOCCER_NEURAL_POPULATION_CONFIRM_CANDIDATES: usize = 1;
+const DEFAULT_SOCCER_NEURAL_POPULATION_CONFIRM_RANK_BEHAVIOR_WEIGHT: f64 = 1.0;
 const DEFAULT_SOCCER_NEURAL_POPULATION_ACCEPT_FREEZE_GAMES: usize = 0;
 const SOCCER_LEARNING_LOCAL_MPC_MAX_PLAYERS_PER_TEAM_LIMIT: usize = 11;
 const SOCCER_POLICY_SOURCE_MERGE: &str = "merge";
@@ -477,6 +480,8 @@ struct NeuralPopulationSearchConfig {
     training_min_accepted_fitness: f64,
     training_min_accepted_goal_margin: f64,
     confirm_games: usize,
+    confirm_candidates: usize,
+    confirm_rank_behavior_weight: f64,
     confirm_min_fitness_delta: f64,
     confirm_min_accepted_fitness: f64,
     confirm_min_accepted_goal_margin: f64,
@@ -596,6 +601,22 @@ fn env_neural_population_search_config(
         "SOCCER_NEURAL_POPULATION_CONFIRM_GAMES",
         DEFAULT_SOCCER_NEURAL_POPULATION_CONFIRM_GAMES,
     )?;
+    let confirm_candidates = env_usize(
+        "SOCCER_NEURAL_POPULATION_CONFIRM_CANDIDATES",
+        DEFAULT_SOCCER_NEURAL_POPULATION_CONFIRM_CANDIDATES,
+    )?
+    .max(1)
+    .min(population_size);
+    let confirm_rank_behavior_weight = env_f64(
+        "SOCCER_NEURAL_POPULATION_CONFIRM_RANK_BEHAVIOR_WEIGHT",
+        DEFAULT_SOCCER_NEURAL_POPULATION_CONFIRM_RANK_BEHAVIOR_WEIGHT,
+    )?;
+    if confirm_rank_behavior_weight < 0.0 {
+        return Err(invalid_data(
+            "SOCCER_NEURAL_POPULATION_CONFIRM_RANK_BEHAVIOR_WEIGHT must be non-negative",
+        )
+        .into());
+    }
     let confirm_min_fitness_delta = env_f64(
         "SOCCER_NEURAL_POPULATION_CONFIRM_MIN_FITNESS_DELTA",
         min_fitness_delta,
@@ -665,6 +686,8 @@ fn env_neural_population_search_config(
         training_min_accepted_fitness,
         training_min_accepted_goal_margin,
         confirm_games,
+        confirm_candidates,
+        confirm_rank_behavior_weight,
         confirm_min_fitness_delta,
         confirm_min_accepted_fitness,
         confirm_min_accepted_goal_margin,
@@ -1075,6 +1098,77 @@ struct NeuralPopulationCandidate {
     snapshot: SoccerNeuralNetworkSnapshot,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct NeuralPopulationCandidateBehavior {
+    shots_for: u32,
+    shots_against: u32,
+    shots_on_target_for: u32,
+    shots_on_target_against: u32,
+    shots_after_pass_for: u32,
+    completed_pass_gain_yards_for: f64,
+    pass_chain_gain_yards_for: f64,
+    pass_chains_net_loss_for: u32,
+    dribble_beats_for: u32,
+    route_one_balls_for: u32,
+}
+
+impl NeuralPopulationCandidateBehavior {
+    fn add_home_summary(&mut self, summary: &MatchSummary) {
+        let stats = &summary.stats;
+        self.shots_for = self.shots_for.saturating_add(stats.shots_home);
+        self.shots_against = self.shots_against.saturating_add(stats.shots_away);
+        self.shots_on_target_for = self
+            .shots_on_target_for
+            .saturating_add(stats.shots_on_target_home);
+        self.shots_on_target_against = self
+            .shots_on_target_against
+            .saturating_add(stats.shots_on_target_away);
+        self.shots_after_pass_for = self
+            .shots_after_pass_for
+            .saturating_add(stats.shots_after_pass_home);
+        self.completed_pass_gain_yards_for += stats.completed_pass_gain_yards_home;
+        self.pass_chain_gain_yards_for += stats.pass_chain_gain_yards_home;
+        self.pass_chains_net_loss_for = self
+            .pass_chains_net_loss_for
+            .saturating_add(stats.pass_chains_net_loss_home);
+        self.dribble_beats_for = self
+            .dribble_beats_for
+            .saturating_add(stats.dribble_beats_home);
+        self.route_one_balls_for = self
+            .route_one_balls_for
+            .saturating_add(stats.route_one_balls_home);
+    }
+
+    fn combine(self, other: Self) -> Self {
+        Self {
+            shots_for: self.shots_for.saturating_add(other.shots_for),
+            shots_against: self.shots_against.saturating_add(other.shots_against),
+            shots_on_target_for: self
+                .shots_on_target_for
+                .saturating_add(other.shots_on_target_for),
+            shots_on_target_against: self
+                .shots_on_target_against
+                .saturating_add(other.shots_on_target_against),
+            shots_after_pass_for: self
+                .shots_after_pass_for
+                .saturating_add(other.shots_after_pass_for),
+            completed_pass_gain_yards_for: self.completed_pass_gain_yards_for
+                + other.completed_pass_gain_yards_for,
+            pass_chain_gain_yards_for: self.pass_chain_gain_yards_for
+                + other.pass_chain_gain_yards_for,
+            pass_chains_net_loss_for: self
+                .pass_chains_net_loss_for
+                .saturating_add(other.pass_chains_net_loss_for),
+            dribble_beats_for: self
+                .dribble_beats_for
+                .saturating_add(other.dribble_beats_for),
+            route_one_balls_for: self
+                .route_one_balls_for
+                .saturating_add(other.route_one_balls_for),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct NeuralPopulationCandidateEval {
     index: usize,
@@ -1085,6 +1179,7 @@ struct NeuralPopulationCandidateEval {
     losses: usize,
     goals_for: u32,
     goals_against: u32,
+    behavior: NeuralPopulationCandidateBehavior,
     snapshot: SoccerNeuralNetworkSnapshot,
 }
 
@@ -1101,6 +1196,41 @@ fn neural_population_candidate_eval_is_baseline(eval: &NeuralPopulationCandidate
 fn neural_population_candidate_goal_margin(eval: &NeuralPopulationCandidateEval) -> f64 {
     let games = (eval.wins + eval.draws + eval.losses).max(1) as f64;
     (f64::from(eval.goals_for) - f64::from(eval.goals_against)) / games
+}
+
+fn neural_population_candidate_behavior_rank_bonus(eval: &NeuralPopulationCandidateEval) -> f64 {
+    let games = (eval.wins + eval.draws + eval.losses).max(1) as f64;
+    let behavior = eval.behavior;
+    let goal_margin = neural_population_candidate_goal_margin(eval);
+    let shot_margin = (f64::from(behavior.shots_for) - f64::from(behavior.shots_against)) / games;
+    let sot_margin = (f64::from(behavior.shots_on_target_for)
+        - f64::from(behavior.shots_on_target_against))
+        / games;
+    let worked_shots = f64::from(behavior.shots_after_pass_for) / games;
+    let dribble_beats = f64::from(behavior.dribble_beats_for) / games;
+    let route_one = f64::from(behavior.route_one_balls_for) / games;
+    let chain_net_loss = f64::from(behavior.pass_chains_net_loss_for) / games;
+    let pass_progress = (behavior.completed_pass_gain_yards_for / games).clamp(-60.0, 90.0);
+    let chain_progress = (behavior.pass_chain_gain_yards_for / games).clamp(-60.0, 90.0);
+
+    0.20 * goal_margin
+        + 0.08 * sot_margin
+        + 0.03 * shot_margin
+        + 0.06 * worked_shots
+        + 0.18 * dribble_beats
+        + 0.006 * pass_progress
+        + 0.004 * chain_progress
+        - 0.10 * chain_net_loss
+        - 0.05 * route_one
+}
+
+fn neural_population_candidate_confirmation_rank_score(
+    eval: &NeuralPopulationCandidateEval,
+    search_config: NeuralPopulationSearchConfig,
+) -> f64 {
+    eval.fitness
+        + search_config.confirm_rank_behavior_weight
+            * neural_population_candidate_behavior_rank_bonus(eval)
 }
 
 fn neural_population_eval_seed(search_seed: u64, completed_games: usize) -> u64 {
@@ -1209,6 +1339,7 @@ fn combine_batch_neural_snapshot_validation_evals(
         losses: primary.losses + confirmation.losses,
         goals_for: primary.goals_for + confirmation.goals_for,
         goals_against: primary.goals_against + confirmation.goals_against,
+        behavior: primary.behavior.combine(confirmation.behavior),
         snapshot: primary.snapshot.clone(),
     }
 }
@@ -1455,6 +1586,7 @@ fn evaluate_neural_population_candidate_against_analytic_home_learning_objective
     let mut losses = 0usize;
     let mut goals_for = 0u32;
     let mut goals_against = 0u32;
+    let mut behavior = NeuralPopulationCandidateBehavior::default();
     for game_index in 0..search_config.eval_games {
         let game_seed = neural_population_eval_game_seed(seed, game_index);
         let summary = run_home_neural_against_analytic_learning_eval_match(
@@ -1468,6 +1600,7 @@ fn evaluate_neural_population_candidate_against_analytic_home_learning_objective
         total_fitness += fitness;
         goals_for = goals_for.saturating_add(summary.score_home);
         goals_against = goals_against.saturating_add(summary.score_away);
+        behavior.add_home_summary(&summary);
         match summary.score_home.cmp(&summary.score_away) {
             std::cmp::Ordering::Greater => wins = wins.saturating_add(1),
             std::cmp::Ordering::Equal => draws = draws.saturating_add(1),
@@ -1483,6 +1616,7 @@ fn evaluate_neural_population_candidate_against_analytic_home_learning_objective
         losses,
         goals_for,
         goals_against,
+        behavior,
         snapshot: candidate.snapshot,
     })
 }
@@ -1519,12 +1653,14 @@ fn maybe_run_neural_population_search(
         completed_games,
     );
     println!(
-        "neural_population_search_start completed_games={} population={} eval_games={} eval_minutes={:.2} confirm_games={} objective=home_directional_learning_vs_analytic mutation_rate={:.4} mutation_scale={:.4} crossover_rate={:.4} min_fitness_delta={:.4} min_accepted_fitness={:.4} min_accepted_goal_margin={:.4} training_min_accepted_fitness={:.4} training_min_accepted_goal_margin={:.4} confirm_min_delta={:.4} confirm_min_accepted_fitness={:.4} confirm_min_accepted_goal_margin={:.4} training_confirm_min_accepted_fitness={:.4} training_confirm_min_accepted_goal_margin={:.4}",
+        "neural_population_search_start completed_games={} population={} eval_games={} eval_minutes={:.2} confirm_games={} confirm_candidates={} confirm_rank_behavior_weight={:.4} objective=home_directional_learning_vs_analytic mutation_rate={:.4} mutation_scale={:.4} crossover_rate={:.4} min_fitness_delta={:.4} min_accepted_fitness={:.4} min_accepted_goal_margin={:.4} training_min_accepted_fitness={:.4} training_min_accepted_goal_margin={:.4} confirm_min_delta={:.4} confirm_min_accepted_fitness={:.4} confirm_min_accepted_goal_margin={:.4} training_confirm_min_accepted_fitness={:.4} training_confirm_min_accepted_goal_margin={:.4}",
         completed_games,
         candidates.len(),
         search_config.eval_games,
         search_config.eval_minutes,
         search_config.confirm_games,
+        search_config.confirm_candidates,
+        search_config.confirm_rank_behavior_weight,
         search_config.mutation_rate,
         search_config.mutation_scale,
         search_config.crossover_rate,
@@ -1557,11 +1693,25 @@ fn maybe_run_neural_population_search(
     for handle in handles {
         match handle.join() {
             Ok(Ok(candidate_eval)) => {
+                let rank_score = neural_population_candidate_confirmation_rank_score(
+                    &candidate_eval,
+                    search_config,
+                );
+                let games = (candidate_eval.wins + candidate_eval.draws + candidate_eval.losses)
+                    .max(1) as f64;
                 println!(
-                    "neural_population_candidate_eval index={} source={} fitness={:.4} record={}-{}-{} goals={}-{}",
+                    "neural_population_candidate_eval index={} source={} fitness={:.4} rank_score={:.4} behavior_bonus={:.4} goal_margin={:.4} sot_margin={:.4} dribble_beats={:.4} pass_progress={:.2} record={}-{}-{} goals={}-{}",
                     candidate_eval.index,
                     candidate_eval.source,
                     candidate_eval.fitness,
+                    rank_score,
+                    neural_population_candidate_behavior_rank_bonus(&candidate_eval),
+                    neural_population_candidate_goal_margin(&candidate_eval),
+                    (f64::from(candidate_eval.behavior.shots_on_target_for)
+                        - f64::from(candidate_eval.behavior.shots_on_target_against))
+                        / games,
+                    f64::from(candidate_eval.behavior.dribble_beats_for) / games,
+                    candidate_eval.behavior.completed_pass_gain_yards_for / games,
                     candidate_eval.wins,
                     candidate_eval.draws,
                     candidate_eval.losses,
@@ -1611,6 +1761,7 @@ fn maybe_run_neural_population_search(
             protected_reference_eval.losses = 0;
             protected_reference_eval.goals_for = 0;
             protected_reference_eval.goals_against = 0;
+            protected_reference_eval.behavior = NeuralPopulationCandidateBehavior::default();
         }
     }
     let Some(best_eval) = evals
@@ -1716,10 +1867,192 @@ fn maybe_run_neural_population_search(
         );
         return Ok(None);
     }
-    let best_goal_margin = neural_population_candidate_goal_margin(&best_eval);
-    if best_goal_margin < search_config.training_min_accepted_goal_margin {
+    let mut ranked_confirmation_candidates: Vec<NeuralPopulationCandidateEval> = evals
+        .iter()
+        .filter(|candidate| !neural_population_candidate_eval_is_baseline(candidate))
+        .cloned()
+        .collect();
+    ranked_confirmation_candidates.sort_by(|a, b| {
+        let b_rank = neural_population_candidate_confirmation_rank_score(b, search_config);
+        let a_rank = neural_population_candidate_confirmation_rank_score(a, search_config);
+        b_rank
+            .total_cmp(&a_rank)
+            .then_with(|| b.fitness.total_cmp(&a.fitness))
+    });
+    let confirm_candidate_limit = search_config
+        .confirm_candidates
+        .max(1)
+        .min(ranked_confirmation_candidates.len());
+    let mut confirm_reference_eval: Option<NeuralPopulationCandidateEval> = None;
+    let mut last_confirmation: Option<(
+        NeuralPopulationCandidateEval,
+        NeuralPopulationCandidateEval,
+        f64,
+        &'static str,
+    )> = None;
+
+    for candidate_eval in ranked_confirmation_candidates
+        .into_iter()
+        .take(confirm_candidate_limit)
+    {
+        let candidate_training_improvement =
+            candidate_eval.fitness - training_reference_eval.fitness;
+        let candidate_protected_improvement =
+            candidate_eval.fitness - protected_reference_eval.fitness;
+        if !neural_population_improvement_clears_delta(
+            candidate_training_improvement,
+            search_config.min_fitness_delta,
+        ) || candidate_eval.fitness < search_config.training_min_accepted_fitness
+        {
+            continue;
+        }
+        let candidate_goal_margin = neural_population_candidate_goal_margin(&candidate_eval);
+        if candidate_goal_margin < search_config.training_min_accepted_goal_margin {
+            continue;
+        }
+        let primary_clears_local_best_floor = candidate_eval.fitness
+            >= search_config.min_accepted_fitness
+            && candidate_goal_margin >= search_config.min_accepted_goal_margin;
+        let mut confirmation_clears_local_best_floor = search_config.confirm_games == 0;
+        if search_config.confirm_games > 0 {
+            let mut confirm_config = search_config;
+            confirm_config.eval_games = search_config.confirm_games;
+            let confirm_seed = neural_population_confirm_seed(search_config.seed, completed_games);
+            let confirm_candidate =
+                evaluate_neural_population_candidate_against_analytic_home_learning_objective(
+                    NeuralPopulationCandidate {
+                        index: candidate_eval.index,
+                        source: format!("confirm:{}", candidate_eval.source),
+                        snapshot: candidate_eval.snapshot.clone(),
+                    },
+                    config.clone(),
+                    confirm_config,
+                    confirm_seed,
+                )
+                .map_err(|error| {
+                    invalid_data(format!("population confirmation candidate failed: {error}"))
+                })?;
+            let confirm_reference = if let Some(reference) = confirm_reference_eval.as_ref() {
+                reference.clone()
+            } else {
+                let reference =
+                    evaluate_neural_population_candidate_against_analytic_home_learning_objective(
+                        NeuralPopulationCandidate {
+                            index: training_reference_eval.index,
+                            source: format!("confirm:{}", training_reference_eval.source),
+                            snapshot: training_reference_eval.snapshot.clone(),
+                        },
+                        config.clone(),
+                        confirm_config,
+                        confirm_seed,
+                    )
+                    .map_err(|error| {
+                        invalid_data(format!("population confirmation reference failed: {error}"))
+                    })?;
+                confirm_reference_eval = Some(reference.clone());
+                reference
+            };
+            let confirm_improvement = confirm_candidate.fitness - confirm_reference.fitness;
+            let confirm_goal_margin = neural_population_candidate_goal_margin(&confirm_candidate);
+            println!(
+                "neural_population_search_confirmation completed_games={} candidate_index={} candidate_source={} candidate_fitness={:.4} candidate_rank_score={:.4} candidate_behavior_bonus={:.4} reference_index={} reference_source={} reference_fitness={:.4} improvement={:.4} min_delta={:.4} candidate_goal_margin={:.4} min_goal_margin={:.4} record={}-{}-{} goals={}-{}",
+                completed_games,
+                candidate_eval.index,
+                candidate_eval.source,
+                confirm_candidate.fitness,
+                neural_population_candidate_confirmation_rank_score(
+                    &candidate_eval,
+                    search_config
+                ),
+                neural_population_candidate_behavior_rank_bonus(&candidate_eval),
+                training_reference_eval.index,
+                training_reference_eval.source,
+                confirm_reference.fitness,
+                confirm_improvement,
+                search_config.confirm_min_fitness_delta,
+                confirm_goal_margin,
+                search_config.confirm_min_accepted_goal_margin,
+                confirm_candidate.wins,
+                confirm_candidate.draws,
+                confirm_candidate.losses,
+                confirm_candidate.goals_for,
+                confirm_candidate.goals_against
+            );
+            if !neural_population_improvement_clears_delta(
+                confirm_improvement,
+                search_config.confirm_min_fitness_delta,
+            ) {
+                last_confirmation = Some((
+                    confirm_candidate,
+                    confirm_reference,
+                    confirm_improvement,
+                    "insufficient_confirmation_gain",
+                ));
+                continue;
+            }
+            confirmation_clears_local_best_floor = confirm_candidate.fitness
+                >= search_config.confirm_min_accepted_fitness
+                && confirm_goal_margin >= search_config.confirm_min_accepted_goal_margin;
+            if confirm_candidate.fitness < search_config.training_confirm_min_accepted_fitness {
+                last_confirmation = Some((
+                    confirm_candidate,
+                    confirm_reference,
+                    confirm_improvement,
+                    "below_training_confirmation_min_accepted_fitness",
+                ));
+                continue;
+            }
+            if confirm_goal_margin < search_config.training_confirm_min_accepted_goal_margin {
+                last_confirmation = Some((
+                    confirm_candidate,
+                    confirm_reference,
+                    confirm_improvement,
+                    "below_training_confirmation_min_goal_margin",
+                ));
+                continue;
+            }
+        }
+
+        *latest_neural_network = Some(candidate_eval.snapshot.clone());
+        *latest_neural_network_arc_cache = None;
+        let preserve_as_local_best = neural_population_improvement_clears_delta(
+            candidate_protected_improvement,
+            search_config.min_fitness_delta,
+        ) && primary_clears_local_best_floor
+            && confirmation_clears_local_best_floor;
         println!(
-            "neural_population_search_held completed_games={} incumbent_fitness={:.4} training_reference_index={} training_reference_source={} training_reference_fitness={:.4} protected_reference_index={} protected_reference_source={} protected_reference_fitness={:.4} best_index={} best_source={} best_fitness={:.4} training_improvement={:.4} protected_improvement={:.4} goals={}-{} goal_margin={:.4} min_accepted_goal_margin={:.4} reasons=below_training_min_accepted_goal_margin",
+            "neural_population_search_accepted completed_games={} incumbent_fitness={:.4} training_reference_index={} training_reference_source={} training_reference_fitness={:.4} protected_reference_index={} protected_reference_source={} protected_reference_fitness={:.4} accepted_index={} accepted_source={} accepted_fitness={:.4} training_improvement={:.4} protected_improvement={:.4} preserve_as_local_best={} record={}-{}-{} goals={}-{} note=heldout_analytic_candidate_will_train_on_policy_next_batch",
+            completed_games,
+            incumbent_eval.fitness,
+            training_reference_eval.index,
+            training_reference_eval.source,
+            training_reference_eval.fitness,
+            protected_reference_eval.index,
+            protected_reference_eval.source,
+            protected_reference_eval.fitness,
+            candidate_eval.index,
+            candidate_eval.source,
+            candidate_eval.fitness,
+            candidate_training_improvement,
+            candidate_protected_improvement,
+            preserve_as_local_best,
+            candidate_eval.wins,
+            candidate_eval.draws,
+            candidate_eval.losses,
+            candidate_eval.goals_for,
+            candidate_eval.goals_against
+        );
+        return Ok(Some(NeuralPopulationSearchAcceptance {
+            eval: candidate_eval,
+            preserve_as_local_best,
+        }));
+    }
+
+    if let Some((confirm_candidate, confirm_reference, confirm_improvement, reason)) =
+        last_confirmation
+    {
+        println!(
+            "neural_population_search_held completed_games={} incumbent_fitness={:.4} training_reference_index={} training_reference_source={} training_reference_fitness={:.4} protected_reference_index={} protected_reference_source={} protected_reference_fitness={:.4} best_index={} best_source={} best_fitness={:.4} training_improvement={:.4} protected_improvement={:.4} confirmation_fitness={:.4} confirmation_reference_fitness={:.4} confirmation_improvement={:.4} min_delta={:.4} confirm_candidates={} reasons={}",
             completed_games,
             incumbent_eval.fitness,
             training_reference_eval.index,
@@ -1733,172 +2066,33 @@ fn maybe_run_neural_population_search(
             best_eval.fitness,
             training_improvement,
             protected_improvement,
-            best_eval.goals_for,
-            best_eval.goals_against,
-            best_goal_margin,
-            search_config.training_min_accepted_goal_margin
-        );
-        return Ok(None);
-    }
-    let primary_clears_local_best_floor = best_eval.fitness >= search_config.min_accepted_fitness
-        && best_goal_margin >= search_config.min_accepted_goal_margin;
-    let mut confirmation_clears_local_best_floor = search_config.confirm_games == 0;
-    if search_config.confirm_games > 0 {
-        let mut confirm_config = search_config;
-        confirm_config.eval_games = search_config.confirm_games;
-        let confirm_seed = neural_population_confirm_seed(search_config.seed, completed_games);
-        let confirm_candidate =
-            evaluate_neural_population_candidate_against_analytic_home_learning_objective(
-                NeuralPopulationCandidate {
-                    index: best_eval.index,
-                    source: format!("confirm:{}", best_eval.source),
-                    snapshot: best_eval.snapshot.clone(),
-                },
-                config.clone(),
-                confirm_config,
-                confirm_seed,
-            )
-            .map_err(|error| {
-                invalid_data(format!("population confirmation candidate failed: {error}"))
-            })?;
-        let confirm_reference =
-            evaluate_neural_population_candidate_against_analytic_home_learning_objective(
-                NeuralPopulationCandidate {
-                    index: training_reference_eval.index,
-                    source: format!("confirm:{}", training_reference_eval.source),
-                    snapshot: training_reference_eval.snapshot.clone(),
-                },
-                config.clone(),
-                confirm_config,
-                confirm_seed,
-            )
-            .map_err(|error| {
-                invalid_data(format!("population confirmation reference failed: {error}"))
-            })?;
-        let confirm_improvement = confirm_candidate.fitness - confirm_reference.fitness;
-        let confirm_goal_margin = neural_population_candidate_goal_margin(&confirm_candidate);
-        println!(
-            "neural_population_search_confirmation completed_games={} candidate_index={} candidate_source={} candidate_fitness={:.4} reference_index={} reference_source={} reference_fitness={:.4} improvement={:.4} min_delta={:.4} candidate_goal_margin={:.4} min_goal_margin={:.4} record={}-{}-{} goals={}-{}",
-            completed_games,
-            best_eval.index,
-            best_eval.source,
             confirm_candidate.fitness,
-            training_reference_eval.index,
-            training_reference_eval.source,
             confirm_reference.fitness,
             confirm_improvement,
             search_config.confirm_min_fitness_delta,
-            confirm_goal_margin,
-            search_config.confirm_min_accepted_goal_margin,
-            confirm_candidate.wins,
-            confirm_candidate.draws,
-            confirm_candidate.losses,
-            confirm_candidate.goals_for,
-            confirm_candidate.goals_against
+            confirm_candidate_limit,
+            reason
         );
-        if !neural_population_improvement_clears_delta(
-            confirm_improvement,
-            search_config.confirm_min_fitness_delta,
-        ) {
-            println!(
-                "neural_population_search_held completed_games={} incumbent_fitness={:.4} training_reference_index={} training_reference_source={} training_reference_fitness={:.4} protected_reference_index={} protected_reference_source={} protected_reference_fitness={:.4} best_index={} best_source={} best_fitness={:.4} training_improvement={:.4} protected_improvement={:.4} confirmation_fitness={:.4} confirmation_reference_fitness={:.4} confirmation_improvement={:.4} min_delta={:.4} reasons=insufficient_confirmation_gain",
-                completed_games,
-                incumbent_eval.fitness,
-                training_reference_eval.index,
-                training_reference_eval.source,
-                training_reference_eval.fitness,
-                protected_reference_eval.index,
-                protected_reference_eval.source,
-                protected_reference_eval.fitness,
-                best_eval.index,
-                best_eval.source,
-                best_eval.fitness,
-                training_improvement,
-                protected_improvement,
-                confirm_candidate.fitness,
-                confirm_reference.fitness,
-                confirm_improvement,
-                search_config.confirm_min_fitness_delta
-            );
-            return Ok(None);
-        }
-        confirmation_clears_local_best_floor = confirm_candidate.fitness
-            >= search_config.confirm_min_accepted_fitness
-            && confirm_goal_margin >= search_config.confirm_min_accepted_goal_margin;
-        if confirm_candidate.fitness < search_config.training_confirm_min_accepted_fitness {
-            println!(
-                "neural_population_search_held completed_games={} incumbent_fitness={:.4} training_reference_index={} training_reference_source={} training_reference_fitness={:.4} protected_reference_index={} protected_reference_source={} protected_reference_fitness={:.4} best_index={} best_source={} best_fitness={:.4} confirmation_fitness={:.4} min_accepted_fitness={:.4} reasons=below_training_confirmation_min_accepted_fitness",
-                completed_games,
-                incumbent_eval.fitness,
-                training_reference_eval.index,
-                training_reference_eval.source,
-                training_reference_eval.fitness,
-                protected_reference_eval.index,
-                protected_reference_eval.source,
-                protected_reference_eval.fitness,
-                best_eval.index,
-                best_eval.source,
-                best_eval.fitness,
-                confirm_candidate.fitness,
-                search_config.training_confirm_min_accepted_fitness
-            );
-            return Ok(None);
-        }
-        if confirm_goal_margin < search_config.training_confirm_min_accepted_goal_margin {
-            println!(
-                "neural_population_search_held completed_games={} incumbent_fitness={:.4} training_reference_index={} training_reference_source={} training_reference_fitness={:.4} protected_reference_index={} protected_reference_source={} protected_reference_fitness={:.4} best_index={} best_source={} best_fitness={:.4} confirmation_fitness={:.4} confirmation_goal_margin={:.4} min_accepted_goal_margin={:.4} reasons=below_training_confirmation_min_goal_margin",
-                completed_games,
-                incumbent_eval.fitness,
-                training_reference_eval.index,
-                training_reference_eval.source,
-                training_reference_eval.fitness,
-                protected_reference_eval.index,
-                protected_reference_eval.source,
-                protected_reference_eval.fitness,
-                best_eval.index,
-                best_eval.source,
-                best_eval.fitness,
-                confirm_candidate.fitness,
-                confirm_goal_margin,
-                search_config.training_confirm_min_accepted_goal_margin
-            );
-            return Ok(None);
-        }
+    } else {
+        println!(
+            "neural_population_search_held completed_games={} incumbent_fitness={:.4} training_reference_index={} training_reference_source={} training_reference_fitness={:.4} protected_reference_index={} protected_reference_source={} protected_reference_fitness={:.4} best_index={} best_source={} best_fitness={:.4} training_improvement={:.4} protected_improvement={:.4} confirm_candidates={} reasons=no_confirmable_candidate",
+            completed_games,
+            incumbent_eval.fitness,
+            training_reference_eval.index,
+            training_reference_eval.source,
+            training_reference_eval.fitness,
+            protected_reference_eval.index,
+            protected_reference_eval.source,
+            protected_reference_eval.fitness,
+            best_eval.index,
+            best_eval.source,
+            best_eval.fitness,
+            training_improvement,
+            protected_improvement,
+            confirm_candidate_limit
+        );
     }
-
-    *latest_neural_network = Some(best_eval.snapshot.clone());
-    *latest_neural_network_arc_cache = None;
-    let preserve_as_local_best = neural_population_improvement_clears_delta(
-        protected_improvement,
-        search_config.min_fitness_delta,
-    ) && primary_clears_local_best_floor
-        && confirmation_clears_local_best_floor;
-    println!(
-        "neural_population_search_accepted completed_games={} incumbent_fitness={:.4} training_reference_index={} training_reference_source={} training_reference_fitness={:.4} protected_reference_index={} protected_reference_source={} protected_reference_fitness={:.4} accepted_index={} accepted_source={} accepted_fitness={:.4} training_improvement={:.4} protected_improvement={:.4} preserve_as_local_best={} record={}-{}-{} goals={}-{} note=heldout_analytic_candidate_will_train_on_policy_next_batch",
-        completed_games,
-        incumbent_eval.fitness,
-        training_reference_eval.index,
-        training_reference_eval.source,
-        training_reference_eval.fitness,
-        protected_reference_eval.index,
-        protected_reference_eval.source,
-        protected_reference_eval.fitness,
-        best_eval.index,
-        best_eval.source,
-        best_eval.fitness,
-        training_improvement,
-        protected_improvement,
-        preserve_as_local_best,
-        best_eval.wins,
-        best_eval.draws,
-        best_eval.losses,
-        best_eval.goals_for,
-        best_eval.goals_against
-    );
-    Ok(Some(NeuralPopulationSearchAcceptance {
-        eval: best_eval,
-        preserve_as_local_best,
-    }))
+    Ok(None)
 }
 
 fn policy_version_status_for_promotion_gate(
@@ -3795,15 +3989,33 @@ fn learning_action_outcome_entry(action: &str, stats: &LearningActionOutcomeStat
 }
 
 fn learning_action_outcome_key(buckets: &BTreeMap<String, LearningActionOutcomeStats>) -> String {
-    const KEY_ACTIONS: [&str; 12] = [
+    const KEY_ACTIONS: [&str; 30] = [
         "pass",
         "aerial-pass",
+        "recycle-reset",
+        "route-one",
+        "clearance",
         "shoot",
         "first-time-shot",
+        "control-touch",
         "dribble",
+        "carry-forward",
+        "carry-out-left",
+        "carry-out-right",
         "runaround-dribble",
         "nutmeg",
         "vertical-attack",
+        "turnover-burst",
+        "protect-ball",
+        "side-step",
+        "hold-up-flank",
+        "left-cut",
+        "right-cut",
+        "xavi-turn",
+        "open-passing-lane",
+        "fake-left-cut-right",
+        "fake-right-cut-left",
+        "round-goalkeeper",
         "overlap-run",
         "exploit-space-run",
         "hold",
@@ -5491,14 +5703,6 @@ static CARRIED_ONSIDE_SUPPORT_HEAD: std::sync::Mutex<Option<OnsideSupportHead>> 
 static CARRIED_PASS_COMPLETION_HEAD: std::sync::Mutex<Option<SoccerPassCompletionHead>> =
     std::sync::Mutex::new(None);
 
-/// In-memory MPC execution-objective head, carried + RWR-trained across games WITHIN a learner
-/// process (mirrors [`CARRIED_PASS_COMPLETION_HEAD`]). Unlike pass-completion — whose samples are
-/// captured head-independently — the executor head only captures when installed, so it is SEEDED
-/// at install time whenever `DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE` is on (else it stays `None`,
-/// byte-identical). Consumption + training both require the gate.
-static CARRIED_MPC_OBJECTIVE_HEAD: std::sync::Mutex<Option<SoccerMpcObjectiveHead>> =
-    std::sync::Mutex::new(None);
-
 /// In-memory attacking-spacing target head, carried + trained across games WITHIN a
 /// learner process, then installed into the next game so off-ball support and the LP
 /// spacing floor consume what was learned.
@@ -5696,14 +5900,6 @@ fn run_game(
     if let Some(head) = CARRIED_PASS_COMPLETION_HEAD.lock().unwrap().as_ref() {
         sim.set_pass_completion_head(head.clone());
     }
-    // Install the carried executor head so this game's on-ball execution gets the learned aim/lead
-    // residual. Seed-on-first-install when the gate is on (the residual must be applied for a sample
-    // to be captured — otherwise the head could never bootstrap); no-op + never seeded when off.
-    if learned_mpc_objective_enabled() {
-        let mut guard = CARRIED_MPC_OBJECTIVE_HEAD.lock().unwrap();
-        let head = guard.get_or_insert_with(|| SoccerMpcObjectiveHead::new(episode_seed as u32));
-        sim.set_mpc_objective_head(head.clone());
-    }
     // Install the carried attacking-spacing target head so off-ball support and the
     // formation LP consume the learned spacing band once trained.
     if let Some(head) = CARRIED_ATTACK_SPACING_HEAD.lock().unwrap().as_ref() {
@@ -5745,7 +5941,6 @@ fn run_game(
         .ok_or_else(|| "soccer learning produced no team policies".to_string())?;
     let config_moments = sim.config_moments();
     let pass_outcome_samples = sim.drain_pass_outcome_samples();
-    let mpc_objective_samples = sim.drain_mpc_objective_samples();
     // Gap 5: train the CARRIED line-depth head on this game's reward-weighted RL
     // corpus so it accumulates across games and the back-four line consumes it live
     // once trained. Empty + skipped unless a line-depth model is enabled
@@ -6124,22 +6319,6 @@ fn run_game(
             final_loss
         );
     }
-    // Train the CARRIED executor head on this game's (features, applied_residual, advantage) RWR
-    // corpus so the aim/lead residual improves across games. Only accrues when the gate is on (the
-    // head is seeded + installed above), so this is a no-op in the default byte-identical path.
-    if !mpc_objective_samples.is_empty() {
-        let mut guard = CARRIED_MPC_OBJECTIVE_HEAD.lock().unwrap();
-        let head = guard.get_or_insert_with(|| SoccerMpcObjectiveHead::new(episode_seed as u32));
-        for _ in 0..4 {
-            head.train_rwr(&mpc_objective_samples, 0.05);
-        }
-        eprintln!(
-            "mpc_objective_training samples={} training_steps={} warm={}",
-            mpc_objective_samples.len(),
-            head.training_steps(),
-            head.is_warm(),
-        );
-    }
     let completed_world_model = sim
         .config
         .neural_blend
@@ -6161,7 +6340,7 @@ fn run_game(
             }
         }
         eprintln!(
-            "world_model_training episode={} enabled={} training_steps={} loss={:?} validation_loss={:?} planning_decisions={} neural_mcts_selection_rate={:.4} neural_mcts_discretized_kick_rate={:.4} neural_mcts_technical_action_rate={:.4} neural_mcts_discretized_kick_candidate_share={:.4} neural_mcts_root_discretized_kick_candidate_share={:.4} neural_mcts_discretized_kick_candidate_set_rate={:.4} neural_mcts_root_discretized_kick_candidate_set_rate={:.4} mpc_replan_rate={:.4} mpc_replan_mpc_rate={:.4} mpc_replan_option_score_safety_rate={:.4} mpc_replan_neural_mcts_rate={:.4} mpc_replans={} mpc_replans_mpc={} mpc_replans_option_score_safety={} mpc_replans_neural_mcts={} policy_priority_samples={} policy_priority_rate={:.4} policy_priority_mean_weight={:.3} option_score_safety_actor_samples={}/{} option_score_safety_actor_sample_rate={:.4} option_score_safety_actor_mean_weight={:.3} option_score_safety_actor_drops=throttle:{},actor:{},unindexed:{},nonfinite:{} neural_mcts_distillation_samples={} neural_mcts_distillation_rate={:.4} neural_mcts_distillation_mean_weight={:.3} policy_entropy={:.4} learning_transitions_captured={} learning_transitions_trained={} learning_nonzero_reward_transitions={} learning_reward_events={} learning_deferred_reward_drained={} learning_deferred_reward_backlog={}",
+            "world_model_training episode={} enabled={} training_steps={} loss={:?} validation_loss={:?} planning_decisions={} neural_mcts_selection_rate={:.4} neural_mcts_discretized_kick_rate={:.4} neural_mcts_technical_action_rate={:.4} neural_mcts_discretized_kick_candidate_share={:.4} neural_mcts_root_discretized_kick_candidate_share={:.4} neural_mcts_dribble_candidate_share={:.4} neural_mcts_root_dribble_candidate_share={:.4} neural_mcts_discretized_kick_candidate_set_rate={:.4} neural_mcts_root_discretized_kick_candidate_set_rate={:.4} neural_mcts_dribble_candidate_set_rate={:.4} neural_mcts_root_dribble_candidate_set_rate={:.4} mpc_replan_rate={:.4} mpc_replan_mpc_rate={:.4} mpc_replan_option_score_safety_rate={:.4} mpc_replan_neural_mcts_rate={:.4} mpc_replans={} mpc_replans_mpc={} mpc_replans_option_score_safety={} mpc_replans_neural_mcts={} policy_priority_samples={} policy_priority_rate={:.4} policy_priority_mean_weight={:.3} option_score_safety_actor_samples={}/{} option_score_safety_actor_sample_rate={:.4} option_score_safety_actor_mean_weight={:.3} option_score_safety_actor_drops=throttle:{},actor:{},unindexed:{},nonfinite:{} neural_mcts_distillation_samples={} neural_mcts_distillation_rate={:.4} neural_mcts_distillation_mean_weight={:.3} policy_entropy={:.4} learning_transitions_captured={} learning_transitions_trained={} learning_nonzero_reward_transitions={} learning_reward_events={} learning_deferred_reward_drained={} learning_deferred_reward_backlog={}",
             episode + 1,
             world_model_stats.enabled,
             world_model_stats.training_steps,
@@ -6173,8 +6352,12 @@ fn run_game(
             planning_stats.neural_mcts_technical_action_selection_rate,
             planning_stats.neural_mcts_discretized_kick_candidate_share,
             planning_stats.neural_mcts_root_discretized_kick_candidate_share,
+            planning_stats.neural_mcts_dribble_candidate_share,
+            planning_stats.neural_mcts_root_dribble_candidate_share,
             planning_stats.neural_mcts_discretized_kick_candidate_set_rate,
             planning_stats.neural_mcts_root_discretized_kick_candidate_set_rate,
+            planning_stats.neural_mcts_dribble_candidate_set_rate,
+            planning_stats.neural_mcts_root_dribble_candidate_set_rate,
             planning_stats.learned_mpc_replan_rate,
             planning_stats.learned_mpc_replan_mpc_rate,
             planning_stats.learned_mpc_replan_option_score_safety_rate,
@@ -8107,13 +8290,15 @@ fn run() -> Result<(), Box<dyn Error>> {
         evolution_options.seed
     );
     println!(
-        "neural_population_search enabled={} interval_games={} population_size={} eval_games={} eval_minutes={:.2} confirm_games={} confirm_min_delta={:.4} confirm_min_accepted_fitness={:.4} confirm_min_accepted_goal_margin={:.4} training_confirm_min_accepted_fitness={:.4} training_confirm_min_accepted_goal_margin={:.4} mutation_rate={:.4} mutation_scale={:.4} crossover_rate={:.4} min_fitness_delta={:.4} min_accepted_fitness={:.4} min_accepted_goal_margin={:.4} training_min_accepted_fitness={:.4} training_min_accepted_goal_margin={:.4} accept_freeze_games={} seed={}",
+        "neural_population_search enabled={} interval_games={} population_size={} eval_games={} eval_minutes={:.2} confirm_games={} confirm_candidates={} confirm_rank_behavior_weight={:.4} confirm_min_delta={:.4} confirm_min_accepted_fitness={:.4} confirm_min_accepted_goal_margin={:.4} training_confirm_min_accepted_fitness={:.4} training_confirm_min_accepted_goal_margin={:.4} mutation_rate={:.4} mutation_scale={:.4} crossover_rate={:.4} min_fitness_delta={:.4} min_accepted_fitness={:.4} min_accepted_goal_margin={:.4} training_min_accepted_fitness={:.4} training_min_accepted_goal_margin={:.4} accept_freeze_games={} seed={}",
         neural_population_search_config.enabled,
         neural_population_search_config.interval_games,
         neural_population_search_config.population_size,
         neural_population_search_config.eval_games,
         neural_population_search_config.eval_minutes,
         neural_population_search_config.confirm_games,
+        neural_population_search_config.confirm_candidates,
+        neural_population_search_config.confirm_rank_behavior_weight,
         neural_population_search_config.confirm_min_fitness_delta,
         neural_population_search_config.confirm_min_accepted_fitness,
         neural_population_search_config.confirm_min_accepted_goal_margin,
@@ -8526,8 +8711,11 @@ fn run() -> Result<(), Box<dyn Error>> {
             batch_start_episode + batch_size.saturating_sub(1),
             &curriculum_config,
         );
+        let plateau_summary_refs = policy_promotion_summaries.iter().collect::<Vec<_>>();
+        let plateau_traction_profile =
+            soccer_learning_plateau_traction_profile(&plateau_summary_refs);
         println!(
-            "starting_batch episodes={}..{} parallel_games={} curriculum_stage={}..{} curriculum_drill_players_per_team={}..{} curriculum_duration_seconds={:.1}..{:.1}",
+            "starting_batch episodes={}..{} parallel_games={} curriculum_stage={}..{} curriculum_drill_players_per_team={}..{} curriculum_duration_seconds={:.1}..{:.1} plateau_sample_games={} plateau_pressure={:.4} plateau_fitness={:.4} plateau_score_parity={:.4} plateau_chance_stagnation={:.4}",
             batch_start_episode + 1,
             batch_start_episode + batch_size,
             batch_size,
@@ -8536,7 +8724,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             batch_start_curriculum.drill_players_per_team,
             batch_end_curriculum.drill_players_per_team,
             batch_start_curriculum.duration_seconds,
-            batch_end_curriculum.duration_seconds
+            batch_end_curriculum.duration_seconds,
+            plateau_traction_profile.sample_games,
+            plateau_traction_profile.pressure,
+            plateau_traction_profile.fitness_plateau,
+            plateau_traction_profile.score_parity,
+            plateau_traction_profile.chance_stagnation
         );
 
         for offset in 0..batch_size {
@@ -8632,8 +8825,24 @@ fn run() -> Result<(), Box<dyn Error>> {
             );
             let episode_starting_policy_version_id = pg_base_policy_version_id.clone();
             let episode_starting_policy_generation = pg_generation;
-            let (mut episode_config, _) =
+            let (mut episode_config, episode_curriculum) =
                 soccer_learning_curriculum_episode_config(&config, episode, &curriculum_config);
+            apply_soccer_learning_plateau_traction_to_episode_config(
+                &mut episode_config,
+                plateau_traction_profile,
+            );
+            if plateau_traction_profile.pressure > 0.05 {
+                println!(
+                    "plateau_traction_episode episode={} stage={} pressure={:.4} pitch_multiplier={:.3} duration_multiplier={:.3} team_reward_share={:.4} local_mpc_max_players_per_team={}",
+                    episode + 1,
+                    episode_curriculum.stage.as_str(),
+                    plateau_traction_profile.pressure,
+                    plateau_traction_profile.pitch_multiplier,
+                    plateau_traction_profile.duration_multiplier,
+                    episode_config.neural_learning.mappo_team_reward_share,
+                    episode_config.local_mpc_max_players_per_team
+                );
+            }
             episode_config.seed = effective_seed.wrapping_add(episode as u32);
             if neural_population_accept_restore_protection_games_remaining > 0 {
                 neural_population_accept_restore_protection_games_remaining =
@@ -11228,6 +11437,30 @@ mod tests {
         assert!(!learning_action_has_discretized_kick_for_log("pass1"));
     }
 
+    #[test]
+    fn learning_action_outcome_key_tracks_dribble_family_dimensions() {
+        let mut buckets = BTreeMap::new();
+        buckets.insert(
+            "protect-ball".to_string(),
+            LearningActionOutcomeStats {
+                count: 2,
+                reward_sum: 1.5,
+                positive_rewards: 1,
+                neural_mcts: 2,
+                target_forward_yards_sum: 3.0,
+                realized_forward_yards_sum: 2.0,
+                ..LearningActionOutcomeStats::default()
+            },
+        );
+        let key = learning_action_outcome_key(&buckets);
+        assert!(key.contains("protect-ball:n=2"));
+        assert!(key.contains("control-touch:n=0"));
+        assert!(key.contains("recycle-reset:n=0"));
+        assert!(key.contains("carry-forward:n=0"));
+        assert!(key.contains("xavi-turn:n=0"));
+        assert!(key.contains("round-goalkeeper:n=0"));
+    }
+
     fn neural_population_test_config() -> NeuralPopulationSearchConfig {
         NeuralPopulationSearchConfig {
             enabled: true,
@@ -11244,6 +11477,8 @@ mod tests {
             training_min_accepted_fitness: -8.0,
             training_min_accepted_goal_margin: -99.0,
             confirm_games: 0,
+            confirm_candidates: 1,
+            confirm_rank_behavior_weight: 1.0,
             confirm_min_fitness_delta: 0.0,
             confirm_min_accepted_fitness: -8.0,
             confirm_min_accepted_goal_margin: -99.0,
@@ -11488,6 +11723,7 @@ mod tests {
             losses: 1,
             goals_for: 5,
             goals_against: 5,
+            behavior: NeuralPopulationCandidateBehavior::default(),
             snapshot: neural_population_full_snapshot(1.0),
         };
         let config = NeuralPopulationSearchConfig {
@@ -11512,6 +11748,7 @@ mod tests {
             losses: 1,
             goals_for: 4,
             goals_against: 2,
+            behavior: NeuralPopulationCandidateBehavior::default(),
             snapshot: neural_population_full_snapshot(1.0),
         };
         let mutation = NeuralPopulationCandidateEval {
@@ -11523,6 +11760,71 @@ mod tests {
 
         assert!(neural_population_candidate_eval_is_baseline(&baseline));
         assert!(!neural_population_candidate_eval_is_baseline(&mutation));
+    }
+
+    #[test]
+    fn neural_population_confirmation_rank_can_surface_behavior_diversity() {
+        let scalar_leader = NeuralPopulationCandidateEval {
+            index: 1,
+            source: "mutation:scalar".to_string(),
+            fitness: 0.62,
+            wins: 3,
+            draws: 2,
+            losses: 1,
+            goals_for: 5,
+            goals_against: 4,
+            behavior: NeuralPopulationCandidateBehavior {
+                shots_for: 8,
+                shots_against: 8,
+                shots_on_target_for: 2,
+                shots_on_target_against: 2,
+                completed_pass_gain_yards_for: 12.0,
+                ..NeuralPopulationCandidateBehavior::default()
+            },
+            snapshot: neural_population_full_snapshot(1.0),
+        };
+        let dimensional_candidate = NeuralPopulationCandidateEval {
+            index: 2,
+            source: "mutation:dribble_unlock".to_string(),
+            fitness: 0.54,
+            wins: 3,
+            draws: 2,
+            losses: 1,
+            goals_for: 6,
+            goals_against: 4,
+            behavior: NeuralPopulationCandidateBehavior {
+                shots_for: 14,
+                shots_against: 6,
+                shots_on_target_for: 7,
+                shots_on_target_against: 2,
+                shots_after_pass_for: 3,
+                completed_pass_gain_yards_for: 150.0,
+                pass_chain_gain_yards_for: 90.0,
+                dribble_beats_for: 4,
+                ..NeuralPopulationCandidateBehavior::default()
+            },
+            snapshot: neural_population_full_snapshot(2.0),
+        };
+        let config = neural_population_test_config();
+
+        assert!(
+            neural_population_candidate_confirmation_rank_score(&dimensional_candidate, config)
+                > neural_population_candidate_confirmation_rank_score(&scalar_leader, config),
+            "behavior-aware ranking should spend confirmation on a broad tactical unlock"
+        );
+
+        let scalar_only_config = NeuralPopulationSearchConfig {
+            confirm_rank_behavior_weight: 0.0,
+            ..config
+        };
+        assert!(
+            neural_population_candidate_confirmation_rank_score(&scalar_leader, scalar_only_config)
+                > neural_population_candidate_confirmation_rank_score(
+                    &dimensional_candidate,
+                    scalar_only_config
+                ),
+            "setting the behavior weight to zero must recover scalar fitness ranking"
+        );
     }
 
     #[test]
@@ -11555,6 +11857,7 @@ mod tests {
             losses: 1,
             goals_for: 9,
             goals_against: 3,
+            behavior: NeuralPopulationCandidateBehavior::default(),
             snapshot: neural_population_full_snapshot(2.0),
         };
         let training_candidate = NeuralPopulationSearchAcceptance {
@@ -11628,6 +11931,7 @@ mod tests {
             losses: 5,
             goals_for: 9,
             goals_against: 15,
+            behavior: NeuralPopulationCandidateBehavior::default(),
             snapshot: neural_population_full_snapshot(2.0),
         };
         let config = NeuralPopulationSearchConfig {
@@ -11653,6 +11957,7 @@ mod tests {
             losses: 2,
             goals_for: 7,
             goals_against: 9,
+            behavior: NeuralPopulationCandidateBehavior::default(),
             snapshot: neural_population_full_snapshot(3.0),
         };
         assert!(!batch_neural_snapshot_validation_passes(
@@ -11707,6 +12012,12 @@ mod tests {
             losses: 1,
             goals_for: 11,
             goals_against: 2,
+            behavior: NeuralPopulationCandidateBehavior {
+                shots_on_target_for: 6,
+                dribble_beats_for: 2,
+                completed_pass_gain_yards_for: 90.0,
+                ..NeuralPopulationCandidateBehavior::default()
+            },
             snapshot: neural_population_full_snapshot(2.0),
         };
         let confirmation = NeuralPopulationCandidateEval {
@@ -11718,6 +12029,12 @@ mod tests {
             losses: 7,
             goals_for: 2,
             goals_against: 14,
+            behavior: NeuralPopulationCandidateBehavior {
+                shots_on_target_for: 1,
+                shots_on_target_against: 8,
+                pass_chains_net_loss_for: 3,
+                ..NeuralPopulationCandidateBehavior::default()
+            },
             snapshot: neural_population_full_snapshot(2.0),
         };
         let combined = combine_batch_neural_snapshot_validation_evals(&primary, &confirmation);
@@ -11731,6 +12048,9 @@ mod tests {
         assert_eq!(combined.losses, 8);
         assert_eq!(combined.goals_for, 13);
         assert_eq!(combined.goals_against, 16);
+        assert_eq!(combined.behavior.shots_on_target_for, 7);
+        assert_eq!(combined.behavior.dribble_beats_for, 2);
+        assert_eq!(combined.behavior.pass_chains_net_loss_for, 3);
         assert_eq!(promotion.sample_games, 24);
         assert!(
             (combined.fitness - ((1.1055 - 1.5494) / 2.0)).abs() < 1e-12,
@@ -11758,6 +12078,7 @@ mod tests {
             losses: 2,
             goals_for: 6,
             goals_against: 4,
+            behavior: NeuralPopulationCandidateBehavior::default(),
             snapshot: neural_population_network(0.0),
         };
 

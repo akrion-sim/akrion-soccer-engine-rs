@@ -25,10 +25,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use soccer_engine::des::general::soccer::{
-    enable_deterministic_formation_lp, learned_mpc_objective_enabled, MatchConfig,
-    SoccerMarlAlgorithm, SoccerMatch, SoccerMpcObjectiveHead, SoccerNeuralLearningBackend,
-    SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot, SoccerQPolicyOptions,
-    SoccerTeamQPolicies, DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
+    enable_deterministic_formation_lp, MatchConfig, SoccerMarlAlgorithm, SoccerMatch,
+    SoccerNeuralLearningBackend, SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot,
+    SoccerQPolicyOptions, SoccerTeamQPolicies, DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
 };
 
 /// One game's measured offense KPIs (both teams summed — self-play is symmetric).
@@ -139,23 +138,9 @@ fn main() {
         env_on("DD_SOCCER_ENABLE_ADVANTAGE_NORMALIZATION"),
     );
 
-    println!(
-        "gates: learned_mpc_objective={}",
-        learned_mpc_objective_enabled()
-    );
-
     // Carried across games within this process (the real learner's per-process pattern).
     let mut policies = Arc::new(SoccerTeamQPolicies::new(SoccerQPolicyOptions::default()));
     let mut snapshot: Option<SoccerNeuralNetworkSnapshot> = None;
-    // Learned MPC execution-objective head, carried + RWR-trained across games (mirrors the
-    // pass-completion head's per-process carry). Seeded up-front when the gate is on so game 1
-    // already captures cold-exploration samples (the head must exist for the residual to apply);
-    // stays `None` (never installed, byte-identical) when the gate is off.
-    let mut mpc_objective_head: Option<SoccerMpcObjectiveHead> = if learned_mpc_objective_enabled() {
-        Some(SoccerMpcObjectiveHead::new(seed_base))
-    } else {
-        None
-    };
 
     let mut per_game: Vec<GameKpis> = Vec::with_capacity(games);
     let started = Instant::now();
@@ -179,28 +164,11 @@ fn main() {
                 eprintln!("game {g}: failed to install snapshot: {e}");
             }
         }
-        // Install the carried executor head so this game's passes get the learned aim/lead residual
-        // (gated; a no-op unless DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE is set).
-        if let Some(head) = mpc_objective_head.as_ref() {
-            sim.set_mpc_objective_head(head.clone());
-        }
 
         for _ in 0..total_ticks {
             sim.run_time_step();
         }
         sim.drain_neural_learning(Duration::from_millis(100));
-
-        // Train the executor head on this game's captured (features, applied_residual, advantage)
-        // samples (RWR, 4 epochs), carried into the next game — the executor-head analog of the
-        // MAPPO/neural carry above.
-        let mpc_samples = sim.drain_mpc_objective_samples();
-        if !mpc_samples.is_empty() {
-            let head = mpc_objective_head
-                .get_or_insert_with(|| SoccerMpcObjectiveHead::new(seed_base.wrapping_add(g as u32)));
-            for _ in 0..4 {
-                head.train_rwr(&mpc_samples, 0.05);
-            }
-        }
 
         let summary = sim.summary();
         let st = &summary.stats;

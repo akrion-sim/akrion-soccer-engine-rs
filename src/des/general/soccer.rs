@@ -80,8 +80,6 @@ mod beat_defender;
 pub use beat_defender::*;
 mod support_scorer;
 pub use support_scorer::*;
-mod mpc_objective_head;
-pub use mpc_objective_head::*;
 mod run_prediction;
 pub use run_prediction::*;
 mod perception;
@@ -8017,12 +8015,6 @@ pub struct AgentActionTargetTrace {
     pub facing: FacingBucket,
     #[serde(default)]
     pub dribble_touch: Option<DribbleTouchDecision>,
-    /// Encoded [`ReceiverDescriptor`] for a pass, so the learner can credit
-    /// `target_values[(state, action, grid, receiver_descriptor)]` per-receiver. Set at trace
-    /// time (where the snapshot is available) only when the learned-pass-receiver gate is on;
-    /// `None` otherwise ⇒ training folds in [`RECEIVER_DESCRIPTOR_UNSPECIFIED`] (parity).
-    #[serde(default)]
-    pub receiver_descriptor: Option<i32>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -8247,7 +8239,7 @@ pub struct SoccerDecisionContext {
     #[serde(default)]
     pub shot_mpc_goal_probability: f64,
     /// Whether learned MDP/POMDP picked a technical action that MPC deemed
-    /// effectively unexecutable and replaced with the best feasible candidate.
+    /// effectively unexecutable, returning control to a policy-ranked replacement.
     #[serde(default)]
     pub learned_mpc_replanned: bool,
     #[serde(default)]
@@ -8284,6 +8276,10 @@ pub struct SoccerDecisionContext {
     pub neural_mcts_discretized_kick_candidate_count: u32,
     #[serde(default)]
     pub neural_mcts_root_discretized_kick_candidate_count: u32,
+    #[serde(default)]
+    pub neural_mcts_dribble_candidate_count: u32,
+    #[serde(default)]
+    pub neural_mcts_root_dribble_candidate_count: u32,
     #[serde(default)]
     pub chosen_action_score: f64,
     #[serde(default)]
@@ -8429,6 +8425,10 @@ pub struct AgentDecisionTrace {
     pub neural_mcts_discretized_kick_candidate_count: u32,
     #[serde(default)]
     pub neural_mcts_root_discretized_kick_candidate_count: u32,
+    #[serde(default)]
+    pub neural_mcts_dribble_candidate_count: u32,
+    #[serde(default)]
+    pub neural_mcts_root_dribble_candidate_count: u32,
     pub action: String,
 }
 
@@ -8959,10 +8959,54 @@ fn soccer_mdp_pomdp_idea_quality_from_option_context(
     (best_fit * 0.54 + margin_fit * 0.28 + probability_fit * 0.18).clamp(0.0, 1.0)
 }
 
-fn soccer_mpc_execution_quality_from_context(context: &SoccerDecisionContext) -> f64 {
+fn soccer_mpc_execution_quality_from_context(action: &str, context: &SoccerDecisionContext) -> f64 {
+    let action_specific = soccer_action_mpc_execution_signal_from_context(action, context);
     let feasibility = finite_unit_interval(context.chosen_action_mpc_feasibility);
+    let traced_execution = if context.execution_mpc_guidance_present {
+        finite_unit_interval(context.execution_mpc_probability)
+    } else {
+        action_specific
+    };
     let low_cost_fit = 1.0 - finite_unit_interval(context.chosen_action_control_cost);
-    (feasibility * 0.70 + low_cost_fit * 0.30).clamp(0.0, 1.0)
+    let horizon_fit = if context.execution_mpc_guidance_present {
+        (soccer_finite_nonnegative_metric(context.execution_mpc_horizon_seconds) / 2.0)
+            .clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    ((feasibility * 0.38 + action_specific * 0.34 + traced_execution * 0.18 + low_cost_fit * 0.10)
+        * (0.82 + horizon_fit * 0.18))
+        .clamp(0.0, 1.0)
+}
+
+fn soccer_action_mpc_execution_signal_from_context(
+    action: &str,
+    context: &SoccerDecisionContext,
+) -> f64 {
+    let action = normalize_soccer_action_label(action);
+    if is_pass_like_action(action) {
+        let receipt = finite_unit_interval(context.pass_mpc_receipt_probability);
+        let qp_fit = finite_unit_interval(context.pass_receipt_qp_accel_fit);
+        let completion = finite_unit_interval(context.pass_target_expected_completion);
+        let lane_fit = 1.0 - finite_unit_interval(context.pass_lane_interception_risk);
+        (receipt * 0.46 + qp_fit * 0.22 + completion * 0.22 + lane_fit * 0.10).clamp(0.0, 1.0)
+    } else if is_dribble_action_label(action) {
+        let control = finite_unit_interval(context.dribble_mpc_control_probability);
+        let qp_fit = finite_unit_interval(context.dribble_mpc_qp_accel_fit);
+        let space_fit = (soccer_finite_nonnegative_metric(context.dribble_mpc_space_margin_yards)
+            / 8.0)
+            .clamp(0.0, 1.0);
+        (control * 0.64 + qp_fit * 0.24 + space_fit * 0.12).clamp(0.0, 1.0)
+    } else if matches!(action, "shoot" | "first-time-shot" | "first-time-header") {
+        let accuracy = finite_unit_interval(context.shot_mpc_accuracy_probability);
+        let qp_fit = finite_unit_interval(context.shot_mpc_qp_target_fit);
+        let goal = finite_unit_interval(context.shot_mpc_goal_probability);
+        (accuracy * 0.50 + qp_fit * 0.22 + goal * 0.28).clamp(0.0, 1.0)
+    } else if context.execution_mpc_guidance_present {
+        finite_unit_interval(context.execution_mpc_probability)
+    } else {
+        finite_unit_interval(context.chosen_action_mpc_feasibility)
+    }
 }
 
 fn soccer_update_idea_execution_attribution(context: &mut SoccerDecisionContext, available: bool) {
@@ -12214,115 +12258,6 @@ impl SoccerQPolicyPruneSummary {
     }
 }
 
-/// LEARNED PASS-RECEIVER HEAD. When on, the POMDP head decides **which** teammate (or open
-/// space) to pass to via a learned per-receiver-descriptor value, and MPC feasibility acts as a
-/// legality mask that kicks an infeasible receiver back to the head for its next choice — rather
-/// than the receiver being chosen by heuristic quality scoring with MPC only refining aim/speed.
-/// Default-OFF (unproven); when off the receiver descriptor is [`RECEIVER_DESCRIPTOR_UNSPECIFIED`]
-/// so the target key is byte-identical to today and parity suites are unchanged. Opt-in / kill
-/// via `DD_SOCCER_ENABLE_LEARNED_PASS_RECEIVER=1|true|yes|on` / `=0|false|no|off`.
-pub(crate) fn dd_soccer_enable_learned_pass_receiver() -> bool {
-    #[cfg(test)]
-    {
-        soccer_env_flag_enabled("DD_SOCCER_ENABLE_LEARNED_PASS_RECEIVER")
-    }
-    #[cfg(not(test))]
-    {
-        use std::sync::OnceLock;
-        static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_LEARNED_PASS_RECEIVER"))
-    }
-}
-
-/// Parity / legacy value for [`SoccerQTargetKey::receiver_descriptor`]: gate off, non-pass
-/// entries, and pre-migration RDS rows all use `-1` so behaviour and hashing match the
-/// grid-only key. Stored verbatim in the `receiver_descriptor` RDS column (`default -1`).
-pub(crate) const RECEIVER_DESCRIPTOR_UNSPECIFIED: i32 = -1;
-
-/// Forward/backward dead-band (yards) for the receiver-descriptor `progression` axis: a pass
-/// whose along-attack advance is within ±this reads as "square".
-pub(crate) const SOCCER_RECEIVER_FORWARD_SQUARE_YARDS: f64 = 4.0;
-/// Nearest-opponent distance (yards) below which a receiver spot is "tight" (openness 0).
-pub(crate) const SOCCER_RECEIVER_TIGHT_YARDS: f64 = 3.0;
-/// Nearest-opponent distance (yards) at/above which a receiver spot is "open" (openness 2);
-/// between tight and this it is "contested" (openness 1).
-pub(crate) const SOCCER_RECEIVER_OPEN_YARDS: f64 = 7.0;
-
-/// Max distance (yards) a teammate may be from a proposed "pass into open space" point for it to
-/// count as a runnable ball (a runner can plausibly get onto it) rather than a blind hoof.
-pub(crate) const SOCCER_SPACE_RUN_ONTO_YARDS: f64 = 12.0;
-
-/// Multiplier that makes the learned per-receiver value DOMINATE the heuristic quality terms
-/// when the learned-pass-receiver head is on: the head decides who, and completion/openness/MPC
-/// heuristics only tie-break equal or unseen receivers. Learned values are return-scale (a few
-/// units); ×this dwarfs the heuristic spread (< ~2).
-pub(crate) const LEARNED_RECEIVER_HEAD_DOMINANCE: f64 = 100.0;
-
-/// One ranked pass-receiver teammate under the learned-pass-receiver head: the head's score plus
-/// the perceived-concede flag, so the caller can MPC-mask down the ranking (kick an infeasible
-/// receiver back to the head) rather than silently overriding the head's choice.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct RankedPassTeammate {
-    pub player_id: usize,
-    pub head_score: f64,
-    pub concedes: bool,
-}
-
-/// Kind axis of a [`ReceiverDescriptor`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ReceiverKind {
-    /// A concrete visible teammate.
-    Teammate,
-    /// Open space (a target grid cell with no teammate) — "play it into the channel".
-    Space,
-    /// No particular receiver (e.g. an outlet/clearance the head chose over a marked teammate).
-    Nobody,
-}
-
-/// Discretized description of a pass RECEIVER, folded into the learned target key so the head
-/// learns *which kind of* receiver (or space) to pass to in a state, not merely which grid cell.
-/// Attack-relative so home/away share credit. Computed identically at trace time (training
-/// credit) and inference time (query) via `WorldSnapshot::pass_receiver_descriptor`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ReceiverDescriptor {
-    pub kind: ReceiverKind,
-    /// GK 0 / DEF 1 / MID 2 / FWD 3; 0 for space/nobody.
-    pub role_bucket: u8,
-    /// Attack-relative lane: left 0 / central 1 / right 2.
-    pub lane: u8,
-    /// backward 0 / square 1 / forward 2 relative to the passer along the attacking axis.
-    pub progression: u8,
-    /// tight 0 / contested 1 / open 2.
-    pub openness: u8,
-}
-
-impl ReceiverDescriptor {
-    /// Pack into the non-negative integer stored in the RDS column and the Q-key.
-    /// `((kind*4 + role)*3 + lane)*3 + progression)*3 + openness` ∈ `0..=323`.
-    pub(crate) fn encode(self) -> i32 {
-        let kind = match self.kind {
-            ReceiverKind::Teammate => 0,
-            ReceiverKind::Space => 1,
-            ReceiverKind::Nobody => 2,
-        };
-        let role = i32::from(self.role_bucket.min(3));
-        let lane = i32::from(self.lane.min(2));
-        let progression = i32::from(self.progression.min(2));
-        let openness = i32::from(self.openness.min(2));
-        (((kind * 4 + role) * 3 + lane) * 3 + progression) * 3 + openness
-    }
-
-    /// Role bucket for a teammate receiver (GK 0 / DEF 1 / MID 2 / FWD 3).
-    pub(crate) fn role_bucket_for(role: PlayerRole) -> u8 {
-        match role {
-            PlayerRole::Goalkeeper => 0,
-            PlayerRole::Defender => 1,
-            PlayerRole::Midfielder => 2,
-            PlayerRole::Forward => 3,
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SoccerQTargetKey {
@@ -12332,14 +12267,6 @@ pub struct SoccerQTargetKey {
     pub target_tactical_cell_id: usize,
     pub target_macro_cell_id: usize,
     pub target_root_cell_id: usize,
-    /// Encoded [`ReceiverDescriptor`], or [`RECEIVER_DESCRIPTOR_UNSPECIFIED`] (-1) for the
-    /// grid-only legacy/parity key. Serde-defaults so pre-migration artifacts load unchanged.
-    #[serde(default = "receiver_descriptor_unspecified")]
-    pub receiver_descriptor: i32,
-}
-
-pub(crate) fn receiver_descriptor_unspecified() -> i32 {
-    RECEIVER_DESCRIPTOR_UNSPECIFIED
 }
 
 impl SoccerQTargetKey {
@@ -12348,15 +12275,6 @@ impl SoccerQTargetKey {
         action: &str,
         grid: PitchGridAddress,
     ) -> Self {
-        Self::from_state_action_grid_receiver(state, action, grid, RECEIVER_DESCRIPTOR_UNSPECIFIED)
-    }
-
-    fn from_state_action_grid_receiver(
-        state: SoccerQStateKey,
-        action: &str,
-        grid: PitchGridAddress,
-        receiver_descriptor: i32,
-    ) -> Self {
         SoccerQTargetKey {
             state,
             action: normalize_soccer_action_label(action).to_string(),
@@ -12364,7 +12282,6 @@ impl SoccerQTargetKey {
             target_tactical_cell_id: grid.tactical.id,
             target_macro_cell_id: grid.macro_zone.id,
             target_root_cell_id: grid.whole_pitch.id,
-            receiver_descriptor,
         }
     }
 
@@ -12387,11 +12304,6 @@ pub struct SoccerQTargetEntry {
     pub target_tactical_cell_id: usize,
     pub target_macro_cell_id: usize,
     pub target_root_cell_id: usize,
-    /// Encoded [`ReceiverDescriptor`] or [`RECEIVER_DESCRIPTOR_UNSPECIFIED`] (-1). Serde-defaults
-    /// so pre-migration artifacts / RDS rows without the `receiver_descriptor` column load as the
-    /// grid-only legacy entry.
-    #[serde(default = "receiver_descriptor_unspecified")]
-    pub receiver_descriptor: i32,
     pub value: f64,
     pub visits: u32,
 }
@@ -12554,7 +12466,6 @@ impl SoccerQPolicy {
                 target_tactical_cell_id: entry.target_tactical_cell_id,
                 target_macro_cell_id: entry.target_macro_cell_id,
                 target_root_cell_id: entry.target_root_cell_id,
-                receiver_descriptor: entry.receiver_descriptor,
             };
             if policy.insert_target_value(key.clone(), entry.value) {
                 policy.target_visits.insert(key, entry.visits);
@@ -12751,19 +12662,7 @@ impl SoccerQPolicy {
             .as_ref()
             .and_then(|target| target.grid)
         {
-            // Credit the receiver-descriptor line when the trace carried one (learned-pass-receiver
-            // gate was on at decision time); otherwise Unspecified ⇒ grid-only key (parity).
-            let receiver_descriptor = transition
-                .action_target
-                .as_ref()
-                .and_then(|target| target.receiver_descriptor)
-                .unwrap_or(RECEIVER_DESCRIPTOR_UNSPECIFIED);
-            let target_key = SoccerQTargetKey::from_state_action_grid_receiver(
-                state,
-                &action,
-                grid,
-                receiver_descriptor,
-            );
+            let target_key = SoccerQTargetKey::from_state_action_grid(state, &action, grid);
             let old_target = self
                 .target_values
                 .get(&target_key)
@@ -12961,26 +12860,6 @@ impl SoccerQPolicy {
         }
     }
 
-    /// As [`Self::set_target_value`] but for a specific encoded [`ReceiverDescriptor`] — the
-    /// learned-pass-receiver head's per-receiver value. Used to seed / test that line.
-    pub(crate) fn set_target_value_with_receiver(
-        &mut self,
-        state: SoccerQStateKey,
-        action: &str,
-        grid: PitchGridAddress,
-        receiver_descriptor: i32,
-        value: f64,
-    ) -> bool {
-        let key =
-            SoccerQTargetKey::from_state_action_grid_receiver(state, action, grid, receiver_descriptor);
-        if self.insert_target_value(key.clone(), value) {
-            self.target_visits.entry(key).or_insert(1);
-            true
-        } else {
-            false
-        }
-    }
-
     pub fn set_target_value_for_snapshot(
         &mut self,
         snapshot: &WorldSnapshot,
@@ -13046,7 +12925,6 @@ impl SoccerQPolicy {
                     target_tactical_cell_id: key.target_tactical_cell_id,
                     target_macro_cell_id: key.target_macro_cell_id,
                     target_root_cell_id: key.target_root_cell_id,
-                    receiver_descriptor: key.receiver_descriptor,
                     value,
                     visits: self.target_visits.get(key).copied().unwrap_or(0),
                 })
@@ -13339,7 +13217,6 @@ impl SoccerQPolicy {
             target_tactical_cell_id: key.target_tactical_cell_id,
             target_macro_cell_id: key.target_macro_cell_id,
             target_root_cell_id: key.target_root_cell_id,
-            receiver_descriptor: key.receiver_descriptor,
             value,
             visits,
         })
@@ -13418,64 +13295,7 @@ impl SoccerQPolicy {
         flight: PassFlight,
         candidates: &[usize],
     ) -> Option<usize> {
-        let scored = self.scored_pass_teammates_for_snapshot(
-            snapshot, player_id, action, flight, candidates,
-        );
-        let pick = |require_clean: bool| {
-            scored
-                .iter()
-                .filter(|entry| !require_clean || !entry.concedes)
-                .max_by(|a, b| {
-                    a.head_score
-                        .total_cmp(&b.head_score)
-                        .then_with(|| b.player_id.cmp(&a.player_id))
-                })
-                .map(|entry| entry.player_id)
-        };
-        // Only fall back to the least-bad conceded target when EVERY candidate concedes
-        // (genuinely no safe pass — the holder should usually be dribbling/holding/clearing then).
-        pick(true).or_else(|| pick(false))
-    }
-
-    /// The pass-receiver candidates scored by the head, ranked best-first with concede flags.
-    /// The learned-pass-receiver MPC-kickback loop walks this ranking, masking MPC-infeasible
-    /// receivers, so control stays with the head rather than a heuristic override. Clean (non-
-    /// conceding) options come first; conceding ones are appended last as a genuine-last-resort.
-    pub(crate) fn ranked_pass_teammates_for_snapshot(
-        &self,
-        snapshot: &WorldSnapshot,
-        player_id: usize,
-        action: &str,
-        flight: PassFlight,
-        candidates: &[usize],
-    ) -> Vec<RankedPassTeammate> {
-        let mut scored = self.scored_pass_teammates_for_snapshot(
-            snapshot, player_id, action, flight, candidates,
-        );
-        scored.sort_by(|a, b| {
-            a.concedes
-                .cmp(&b.concedes)
-                .then_with(|| b.head_score.total_cmp(&a.head_score))
-                .then_with(|| a.player_id.cmp(&b.player_id))
-        });
-        scored
-    }
-
-    /// Score each visible-teammate candidate for a pass. When the learned-pass-receiver head is
-    /// on, the learned per-(grid, receiver-descriptor) value DOMINATES and the completion/openness
-    /// heuristics only tie-break; when off, this reproduces the legacy heuristic blend exactly
-    /// (learned grid preference + weighted quality) so parity suites are byte-identical.
-    fn scored_pass_teammates_for_snapshot(
-        &self,
-        snapshot: &WorldSnapshot,
-        player_id: usize,
-        action: &str,
-        flight: PassFlight,
-        candidates: &[usize],
-    ) -> Vec<RankedPassTeammate> {
-        let Some(player) = snapshot.players.iter().find(|p| p.id == player_id) else {
-            return Vec::new();
-        };
+        let player = snapshot.players.iter().find(|p| p.id == player_id)?;
         let player_position = snapshot
             .player_position(player_id)
             .unwrap_or(player.position);
@@ -13486,19 +13306,19 @@ impl SoccerQPolicy {
             player.role,
         );
         let action = normalize_soccer_action_label(action);
-        let learned_receiver_head = dd_soccer_enable_learned_pass_receiver();
         // Re-ranking the candidate pool here would otherwise silently bypass the ranker's
         // concede veto (it only DEMOTES a conceded target, never removes it — see
         // `ranked_pass_targets_filtered_full`), which is how a learned policy could still pick a
         // pass straight to an opponent or into a tightly-marked man. Flag each candidate and
         // refuse to commit to a (perceived) conceded one while any clean option remains.
-        candidates
+        let scored: Vec<(usize, f64, bool)> = candidates
             .iter()
             .filter_map(|candidate_id| {
                 let target = snapshot.players.iter().find(|p| p.id == *candidate_id)?;
                 let position = snapshot.player_position(*candidate_id)?;
                 let grid =
                     pitch_grid_address(position, snapshot.field_width, snapshot.field_length);
+                let learned_preference = self.target_preference_for_grid(&state, action, &grid);
                 let quality = pass_target_quality_for_snapshot(
                     snapshot,
                     player,
@@ -13507,48 +13327,34 @@ impl SoccerQPolicy {
                     position,
                     flight,
                 );
-                let heuristic = quality.expected_completion * 0.82
-                    + quality.mpc_receipt_probability * 0.52
+                let learned_score = learned_preference.unwrap_or(0.0);
+                let learned_weight = if learned_preference.is_some() {
+                    1.0
+                } else {
+                    0.0
+                };
+                let score = learned_score * learned_weight
+                    + quality.expected_completion * 0.82
                     + quality.stride_fit * 0.22
                     + quality.receiver_openness * 0.20;
-                let head_score = if learned_receiver_head {
-                    // The head decides WHO: rank primarily by the learned per-receiver value;
-                    // heuristics only tie-break equal/unseen receivers.
-                    let receiver_descriptor = snapshot.pass_receiver_descriptor(
-                        player_id,
-                        ReceiverKind::Teammate,
-                        position,
-                        Some(target.role),
-                    );
-                    let learned = self.target_preference_for_grid_and_receiver(
-                        &state,
-                        action,
-                        &grid,
-                        receiver_descriptor,
-                    );
-                    match learned {
-                        Some(value) => value * LEARNED_RECEIVER_HEAD_DOMINANCE + heuristic,
-                        None => heuristic,
-                    }
-                } else {
-                    // Legacy heuristic blend: learned grid preference (weight 1.0 if any) + quality.
-                    let learned_preference = self.target_preference_for_grid(&state, action, &grid);
-                    let learned_score = learned_preference.unwrap_or(0.0);
-                    let learned_weight = if learned_preference.is_some() { 1.0 } else { 0.0 };
-                    learned_score * learned_weight + heuristic
-                };
                 let concedes = snapshot.pass_target_concedes_to_perceived_opponent(
                     player_id,
                     *candidate_id,
                     flight,
                 );
-                Some(RankedPassTeammate {
-                    player_id: *candidate_id,
-                    head_score,
-                    concedes,
-                })
+                Some((*candidate_id, score, concedes))
             })
-            .collect()
+            .collect();
+        let pick = |require_clean: bool| {
+            scored
+                .iter()
+                .filter(|(_, _, concedes)| !require_clean || !*concedes)
+                .max_by(|a, b| a.1.total_cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+                .map(|(candidate_id, _, _)| *candidate_id)
+        };
+        // Only fall back to the least-bad conceded target when EVERY candidate concedes
+        // (genuinely no safe pass — the holder should usually be dribbling/holding/clearing then).
+        pick(true).or_else(|| pick(false))
     }
 
     fn best_action_filtered<F>(&self, state: &SoccerQStateKey, is_legal: F) -> Option<String>
@@ -13880,39 +13686,8 @@ impl SoccerQPolicy {
         action: &str,
         grid: &PitchGridAddress,
     ) -> Option<f64> {
-        self.target_preference_for_grid_filtered(state, action, grid, None)
-    }
-
-    /// As [`Self::target_preference_for_grid`] but restricted to keys whose stored receiver
-    /// descriptor equals `receiver_descriptor` — the learned-pass-receiver head's per-receiver
-    /// value. `None` matches any descriptor (grid-only legacy lookup, and the parity path).
-    fn target_preference_for_grid_and_receiver(
-        &self,
-        state: &SoccerQStateKey,
-        action: &str,
-        grid: &PitchGridAddress,
-        receiver_descriptor: i32,
-    ) -> Option<f64> {
-        self.target_preference_for_grid_filtered(state, action, grid, Some(receiver_descriptor))
-    }
-
-    fn target_preference_for_grid_filtered(
-        &self,
-        state: &SoccerQStateKey,
-        action: &str,
-        grid: &PitchGridAddress,
-        receiver_descriptor: Option<i32>,
-    ) -> Option<f64> {
-        self.target_preference_for_grid_with_context(state, action, grid, receiver_descriptor, false)
-            .or_else(|| {
-                self.target_preference_for_grid_with_context(
-                    state,
-                    action,
-                    grid,
-                    receiver_descriptor,
-                    true,
-                )
-            })
+        self.target_preference_for_grid_with_context(state, action, grid, false)
+            .or_else(|| self.target_preference_for_grid_with_context(state, action, grid, true))
     }
 
     fn target_preference_for_grid_with_context(
@@ -13920,13 +13695,9 @@ impl SoccerQPolicy {
         state: &SoccerQStateKey,
         action: &str,
         grid: &PitchGridAddress,
-        receiver_descriptor: Option<i32>,
         relaxed: bool,
     ) -> Option<f64> {
         let action = normalize_soccer_action_label(action);
-        let descriptor_matches = |key: &SoccerQTargetKey| -> bool {
-            receiver_descriptor.map_or(true, |rd| key.receiver_descriptor == rd)
-        };
         let mut best: Option<(f64, u32)> = None;
         if relaxed {
             for source in Self::relaxed_query_keys(state) {
@@ -13941,10 +13712,7 @@ impl SoccerQPolicy {
                     let Some(key) = self.target_index_keys.get(*key_id) else {
                         continue;
                     };
-                    if key.action != action
-                        || !key.state.matches_relaxed_learning_context(state)
-                        || !descriptor_matches(key)
-                    {
+                    if key.action != action || !key.state.matches_relaxed_learning_context(state) {
                         continue;
                     }
                     update_best_target_preference(self, &mut best, key, grid);
@@ -13963,10 +13731,7 @@ impl SoccerQPolicy {
                     let Some(key) = self.target_index_keys.get(*key_id) else {
                         continue;
                     };
-                    if key.action != action
-                        || !key.state.matches_learning_context(state)
-                        || !descriptor_matches(key)
-                    {
+                    if key.action != action || !key.state.matches_learning_context(state) {
                         continue;
                     }
                     update_best_target_preference(self, &mut best, key, grid);
@@ -18563,6 +18328,38 @@ fn finite_unit_interval(value: f64) -> f64 {
     }
 }
 
+pub(crate) fn formation_lp_support_target_fit(
+    guidance: &SoccerFormationLpPlayerGuidance,
+    target: Vec2,
+) -> f64 {
+    let target_fit = if target.x.is_finite()
+        && target.y.is_finite()
+        && guidance.target.x.is_finite()
+        && guidance.target.y.is_finite()
+    {
+        (1.0 - target.distance(guidance.target) / 16.0).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let pair_fit =
+        (1.0 - soccer_finite_nonnegative_metric(guidance.pair_error_yards) / 8.0).clamp(0.0, 1.0);
+    let pressure_fit = finite_unit_interval(guidance.pressure_weight);
+    let speed_fit = finite_unit_interval(guidance.speed_match_weight);
+    let alignment_fit = finite_unit_interval(guidance.alignment_weight / 1.6);
+    let local_mpc_fit = if guidance.local_mpc_guidance {
+        1.0
+    } else {
+        0.0
+    };
+    (target_fit * 0.46
+        + pair_fit * 0.16
+        + pressure_fit * 0.11
+        + speed_fit * 0.09
+        + local_mpc_fit * 0.12
+        + alignment_fit * 0.06)
+        .clamp(0.0, 1.0)
+}
+
 fn default_soccer_mpc_player_horizon() -> usize {
     // ~2.0 s of lookahead at the 15 Hz default tick (30 × 1/15). Long enough to
     // bend around nearby traffic and brake into a target, short enough that
@@ -19344,9 +19141,17 @@ pub struct MatchStats {
     #[serde(default)]
     pub neural_mcts_root_discretized_kick_candidates: u32,
     #[serde(default)]
+    pub neural_mcts_dribble_candidates: u32,
+    #[serde(default)]
+    pub neural_mcts_root_dribble_candidates: u32,
+    #[serde(default)]
     pub neural_mcts_discretized_kick_candidate_sets: u32,
     #[serde(default)]
     pub neural_mcts_root_discretized_kick_candidate_sets: u32,
+    #[serde(default)]
+    pub neural_mcts_dribble_candidate_sets: u32,
+    #[serde(default)]
+    pub neural_mcts_root_dribble_candidate_sets: u32,
     #[serde(default)]
     pub learned_mpc_replans: u32,
     #[serde(default)]
@@ -19429,12 +19234,20 @@ pub struct SoccerPlanningValidationStats {
     pub neural_mcts_candidates: u32,
     pub neural_mcts_discretized_kick_candidates: u32,
     pub neural_mcts_root_discretized_kick_candidates: u32,
+    pub neural_mcts_dribble_candidates: u32,
+    pub neural_mcts_root_dribble_candidates: u32,
     pub neural_mcts_discretized_kick_candidate_sets: u32,
     pub neural_mcts_root_discretized_kick_candidate_sets: u32,
+    pub neural_mcts_dribble_candidate_sets: u32,
+    pub neural_mcts_root_dribble_candidate_sets: u32,
     pub neural_mcts_discretized_kick_candidate_share: f64,
     pub neural_mcts_root_discretized_kick_candidate_share: f64,
+    pub neural_mcts_dribble_candidate_share: f64,
+    pub neural_mcts_root_dribble_candidate_share: f64,
     pub neural_mcts_discretized_kick_candidate_set_rate: f64,
     pub neural_mcts_root_discretized_kick_candidate_set_rate: f64,
+    pub neural_mcts_dribble_candidate_set_rate: f64,
+    pub neural_mcts_root_dribble_candidate_set_rate: f64,
     pub learned_mpc_replans: u32,
     pub learned_mpc_replan_rate: f64,
     pub learned_mpc_replans_mpc: u32,
@@ -19578,10 +19391,14 @@ impl MatchStats {
             neural_mcts_discretized_kick_candidates: self.neural_mcts_discretized_kick_candidates,
             neural_mcts_root_discretized_kick_candidates: self
                 .neural_mcts_root_discretized_kick_candidates,
+            neural_mcts_dribble_candidates: self.neural_mcts_dribble_candidates,
+            neural_mcts_root_dribble_candidates: self.neural_mcts_root_dribble_candidates,
             neural_mcts_discretized_kick_candidate_sets: self
                 .neural_mcts_discretized_kick_candidate_sets,
             neural_mcts_root_discretized_kick_candidate_sets: self
                 .neural_mcts_root_discretized_kick_candidate_sets,
+            neural_mcts_dribble_candidate_sets: self.neural_mcts_dribble_candidate_sets,
+            neural_mcts_root_dribble_candidate_sets: self.neural_mcts_root_dribble_candidate_sets,
             neural_mcts_discretized_kick_candidate_share: self
                 .neural_mcts_discretized_kick_candidates
                 as f64
@@ -19590,12 +19407,23 @@ impl MatchStats {
                 .neural_mcts_root_discretized_kick_candidates
                 as f64
                 / neural_mcts_candidates as f64,
+            neural_mcts_dribble_candidate_share: self.neural_mcts_dribble_candidates as f64
+                / neural_mcts_candidates as f64,
+            neural_mcts_root_dribble_candidate_share: self.neural_mcts_root_dribble_candidates
+                as f64
+                / neural_mcts_candidates as f64,
             neural_mcts_discretized_kick_candidate_set_rate: self
                 .neural_mcts_discretized_kick_candidate_sets
                 as f64
                 / neural_mcts_candidate_sets as f64,
             neural_mcts_root_discretized_kick_candidate_set_rate: self
                 .neural_mcts_root_discretized_kick_candidate_sets
+                as f64
+                / neural_mcts_candidate_sets as f64,
+            neural_mcts_dribble_candidate_set_rate: self.neural_mcts_dribble_candidate_sets as f64
+                / neural_mcts_candidate_sets as f64,
+            neural_mcts_root_dribble_candidate_set_rate: self
+                .neural_mcts_root_dribble_candidate_sets
                 as f64
                 / neural_mcts_candidate_sets as f64,
             learned_mpc_replans: self.learned_mpc_replans,
@@ -19696,12 +19524,6 @@ pub(crate) struct PendingPass {
     /// label, so the model learns "from THIS whole-field configuration, does THIS pass complete?".
     /// Empty ⇒ not captured (no learning sample emitted).
     learn_features: Vec<f32>,
-    /// Captured AT LAUNCH for the learned MPC execution-objective head: the
-    /// [`MPC_OBJECTIVE_FEATURE_DIM`] feature vector and the bounded aim/lead RESIDUAL that was
-    /// actually applied to this pass's analytic lead target (the "action" for RWR). When the pass
-    /// resolves it is emitted as an [`MpcObjectiveSample`] whose reward is the delayed
-    /// completion/progression advantage. `None` ⇒ the head was off/absent at launch (no sample).
-    mpc_objective: Option<(Vec<f32>, Vec2)>,
 }
 
 /// A goal counts as assisted only when the setting-up completed pass landed within this many
@@ -24538,6 +24360,8 @@ fn soccer_decision_context_for(
         neural_mcts_candidate_count: 0,
         neural_mcts_discretized_kick_candidate_count: 0,
         neural_mcts_root_discretized_kick_candidate_count: 0,
+        neural_mcts_dribble_candidate_count: 0,
+        neural_mcts_root_dribble_candidate_count: 0,
         chosen_action_score: 0.0,
         best_legal_action_score: 0.0,
         action_score_margin: 0.0,
@@ -24615,6 +24439,9 @@ fn soccer_decision_context_with_trace(
         decision.neural_mcts_discretized_kick_candidate_count;
     context.neural_mcts_root_discretized_kick_candidate_count =
         decision.neural_mcts_root_discretized_kick_candidate_count;
+    context.neural_mcts_dribble_candidate_count = decision.neural_mcts_dribble_candidate_count;
+    context.neural_mcts_root_dribble_candidate_count =
+        decision.neural_mcts_root_dribble_candidate_count;
     let option_context =
         soccer_action_option_learning_context(&decision.action, &decision.action_options);
     context.action_option_count = option_context.action_option_count;
@@ -24677,7 +24504,8 @@ fn soccer_decision_context_with_trace(
         option_context.action_option_count > 0 && option_context.legal_action_option_count > 0;
     context.mdp_pomdp_idea_quality =
         soccer_mdp_pomdp_idea_quality_from_option_context(&option_context);
-    context.mpc_execution_quality = soccer_mpc_execution_quality_from_context(&context);
+    context.mpc_execution_quality =
+        soccer_mpc_execution_quality_from_context(&decision.action, &context);
     soccer_update_idea_execution_attribution(&mut context, attribution_available);
     context
 }
@@ -38098,49 +37926,6 @@ pub fn learned_pass_completion_enabled() -> bool {
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_LEARNED_PASS_COMPLETION"))
-    }
-}
-
-/// Env flag enabling the learned MPC execution-objective head ([`SoccerMpcObjectiveHead`]): when a
-/// pass/shot/dribble is executed and the head is warm, it adds a hard-bounded (≤
-/// [`MPC_OBJECTIVE_MAX_RESIDUAL_YARDS`]) residual to the analytic aim/lead target before the
-/// existing pitch/onside/speed guards re-clamp it. Off ⇒ the pure analytic target stands alone
-/// (byte-identical to the pre-wiring behaviour). Read once per process. The policy still owns WHICH
-/// action and WHICH receiver — this only nudges the executor's aim within the guard envelope.
-pub fn learned_mpc_objective_enabled() -> bool {
-    #[cfg(test)]
-    {
-        soccer_env_flag_enabled("DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE")
-    }
-    #[cfg(not(test))]
-    {
-        use std::sync::OnceLock;
-        static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE"))
-    }
-}
-
-/// Exploration std-dev (yards) for the MPC-objective head's residual at capture time, overridable
-/// via `SOCCER_MPC_OBJECTIVE_EXPLORE_SIGMA` for A/B sweeps. Clamped to `[0, MAX_RESIDUAL]` so the
-/// jitter can never dominate the hard bound. Default = [`MPC_OBJECTIVE_EXPLORE_SIGMA_YARDS`].
-pub(crate) fn mpc_objective_explore_sigma_yards() -> f64 {
-    let read = || {
-        std::env::var("SOCCER_MPC_OBJECTIVE_EXPLORE_SIGMA")
-            .ok()
-            .and_then(|raw| raw.trim().parse::<f64>().ok())
-            .filter(|v| v.is_finite())
-            .map(|v| v.clamp(0.0, MPC_OBJECTIVE_MAX_RESIDUAL_YARDS))
-            .unwrap_or(MPC_OBJECTIVE_EXPLORE_SIGMA_YARDS)
-    };
-    #[cfg(test)]
-    {
-        read()
-    }
-    #[cfg(not(test))]
-    {
-        use std::sync::OnceLock;
-        static SIGMA: OnceLock<f64> = OnceLock::new();
-        *SIGMA.get_or_init(read)
     }
 }
 
@@ -52591,6 +52376,8 @@ pub fn soccer_tracking_dataset_to_learning_dataset(
                 neural_mcts_candidate_count: 0,
                 neural_mcts_discretized_kick_candidate_count: 0,
                 neural_mcts_root_discretized_kick_candidate_count: 0,
+                neural_mcts_dribble_candidate_count: 0,
+                neural_mcts_root_dribble_candidate_count: 0,
                 action,
             };
             let player_agent = player_agent_from_snapshot(player);
@@ -56132,7 +55919,6 @@ fn tracking_action_target_trace(
         )),
         facing: facing_bucket_from_vector(point - player.position),
         dribble_touch,
-        receiver_descriptor: None,
     })
 }
 
@@ -56467,7 +56253,6 @@ fn soccer_moment_action_target_trace(
         )),
         facing: facing_bucket_from_vector(point - player.position),
         dribble_touch,
-        receiver_descriptor: None,
     })
 }
 
@@ -56552,6 +56337,8 @@ fn soccer_moment_replay_transition(
             neural_mcts_candidate_count: 0,
             neural_mcts_discretized_kick_candidate_count: 0,
             neural_mcts_root_discretized_kick_candidate_count: 0,
+            neural_mcts_dribble_candidate_count: 0,
+            neural_mcts_root_dribble_candidate_count: 0,
             action: action.clone(),
         },
         &before,
@@ -67775,7 +67562,6 @@ mod reward_priority_tests {
             offside: None,
             offside_candidates: Vec::new(),
             learn_features: Vec::new(),
-            mpc_objective: None,
         };
         let mut lateral = forward.clone();
         lateral.intended_target = Vec2::new(52.0, 62.0);
