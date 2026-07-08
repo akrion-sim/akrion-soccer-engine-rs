@@ -59481,6 +59481,7 @@ fn transition_reward_reinforces_completed_pass_into_future_stride() {
             )),
             facing: facing_bucket_from_vector(target - origin),
             dribble_touch: None,
+            receiver_descriptor: None,
         };
         let observation = before.observation_for(passer);
         let decision = AgentDecisionTrace {
