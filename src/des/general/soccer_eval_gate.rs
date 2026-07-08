@@ -64,6 +64,42 @@ pub fn wilson_lower_bound(p_hat: f64, n: u32, z: f64) -> f64 {
     (center - margin).clamp(0.0, 1.0)
 }
 
+/// Draw-aware lower confidence bound on the mean match score, using the TRUE empirical variance
+/// of the `{1, 0.5, 0}` score distribution instead of the Bernoulli `p(1-p)` the Wilson interval
+/// assumes. A draw-heavy record concentrates mass at 0.5, so its per-game variance is up to ~2×
+/// smaller than Bernoulli — the Wilson bound is then over-conservative and REJECTS genuine
+/// draw-heavy climbs (the measurement-plateau bug: a confirmed +Elo/+GD candidate at mean 0.56
+/// fails the gate because `p(1-p)` overstates its variance). This normal lower bound
+/// `mean − z·sqrt(var/n)` matches the actual evidence. Returns `0.0` for `n == 0`.
+pub fn draw_aware_lower_bound(record: &CandidateRecord, z: f64) -> f64 {
+    let n = record.games();
+    if n == 0 {
+        return 0.0;
+    }
+    let n_f = f64::from(n);
+    let mean = record.mean_score();
+    // E[X²] for X ∈ {1, 0.5, 0}: wins contribute 1, draws 0.25, losses 0.
+    let e_x2 = (f64::from(record.wins) + 0.25 * f64::from(record.draws)) / n_f;
+    let var = (e_x2 - mean * mean).max(0.0);
+    let se = (var / n_f).sqrt();
+    (mean - z * se).clamp(0.0, 1.0)
+}
+
+/// Whether the promotion gate uses the draw-aware empirical-variance lower bound instead of the
+/// Bernoulli Wilson bound (`DD_SOCCER_ENABLE_DRAW_AWARE_WILSON`). Default-off ⇒ byte-identical;
+/// enable it in the anti-plateau config so genuine draw-heavy climbs actually promote instead of
+/// being rejected by the over-conservative Bernoulli variance.
+pub fn draw_aware_wilson_enabled() -> bool {
+    std::env::var("DD_SOCCER_ENABLE_DRAW_AWARE_WILSON")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 /// The candidate's held-out record against the whole frozen field (every fixture
 /// where it played, either orientation).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -204,7 +240,11 @@ pub fn evaluate_promotion(
     let mean_payoff_vs_field = matrix.mean_payoff_vs_field(candidate_id);
     let payoff_vs_baseline = matrix.payoff(candidate_id, baseline_id);
     let worst_case = matrix.worst_case(candidate_id);
-    let wilson = wilson_lower_bound(record.mean_score(), record.games(), thresholds.wilson_z);
+    let wilson = if draw_aware_wilson_enabled() {
+        draw_aware_lower_bound(&record, thresholds.wilson_z)
+    } else {
+        wilson_lower_bound(record.mean_score(), record.games(), thresholds.wilson_z)
+    };
 
     let mut reasons = Vec::new();
     let mut promote = true;

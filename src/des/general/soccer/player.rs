@@ -53,6 +53,67 @@ fn dd_soccer_disable_won_ball_pressure_escape() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_WON_BALL_PRESSURE_ESCAPE").is_ok())
 }
+/// Gate (default-OFF) for the **graded, overridable formation nudge**. Off-ball, the formation-LP
+/// shape target currently REPLACES a player's own POMDP/learned destination outright at the
+/// support-/defend-shape chokepoints. With this on, the LP target instead becomes a *bounded nudge*
+/// whose weight falls as the player's own decision confidence rises — so a convinced internal read
+/// overrides the shape signal (the "formation is a signal, internals can override" contract). Off ⇒
+/// the LP target is used directly, byte-identical to the prior authoritative behaviour.
+fn graded_formation_nudge_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_GRADED_FORMATION_NUDGE").is_ok())
+}
+fn formation_nudge_env_f64(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+        .unwrap_or(default)
+}
+/// Nudge weight at ZERO conviction — the most the LP can pull a fully-unsure player toward its shape
+/// target; scaled by `(1 - decision_confidence)`. Env-override `DD_SOCCER_FORMATION_NUDGE_BASE_WEIGHT`.
+fn formation_nudge_base_weight() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| formation_nudge_env_f64("DD_SOCCER_FORMATION_NUDGE_BASE_WEIGHT", 0.6).clamp(0.0, 1.0))
+}
+/// Hard cap (yards) on how far the nudge may displace a player from their own chosen destination —
+/// keeps it a nudge, never a yank, however far the LP target sits. Env `DD_SOCCER_FORMATION_NUDGE_MAX_YARDS`.
+fn formation_nudge_max_yards() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| formation_nudge_env_f64("DD_SOCCER_FORMATION_NUDGE_MAX_YARDS", 6.0).max(0.0))
+}
+/// Pure blend core: move the player's OWN destination `own` toward the formation-LP shape target
+/// `lp` by `base_weight · (1 - conviction)`, capped to `max_yards`. Conviction 1 ⇒ no pull (internal
+/// override); conviction 0 ⇒ full base pull, still bounded. Factored out for hermetic unit testing.
+fn formation_nudge_blend(
+    decision_confidence: f64,
+    own: Vec2,
+    lp: Vec2,
+    base_weight: f64,
+    max_yards: f64,
+) -> Vec2 {
+    let conviction = decision_confidence.clamp(0.0, 1.0);
+    let weight = (base_weight * (1.0 - conviction)).clamp(0.0, 1.0);
+    own + limit_vec2_len((lp - own) * weight, max_yards.max(0.0))
+}
+/// Gated wrapper: the graded formation nudge as consumed at the live off-ball chokepoints. Callers
+/// pass the LP shape target as `lp`, so when the gate is off this returns `lp` unchanged and the
+/// path is byte-identical to the prior authoritative behaviour.
+fn formation_nudged_target(decision_confidence: f64, own: Vec2, lp: Vec2) -> Vec2 {
+    if !graded_formation_nudge_enabled() {
+        return lp;
+    }
+    formation_nudge_blend(
+        decision_confidence,
+        own,
+        lp,
+        formation_nudge_base_weight(),
+        formation_nudge_max_yards(),
+    )
+}
 fn learned_policy_option_score_safety_enabled() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
@@ -12353,9 +12414,15 @@ impl PlayerAgent {
                 snapshot
                     .formation_lp_guidance_for(self.id)
                     .map(|guidance| SupportMovementTarget {
+                        // Formation shape is a NUDGE the player's own support pick can override
+                        // (gated). Off ⇒ returns guidance.target ⇒ authoritative as before.
                         point: snapshot.clamp_to_role_position(
                             self.id,
-                            guidance.target,
+                            formation_nudged_target(
+                                self.decision_confidence,
+                                support_target.point,
+                                guidance.target,
+                            ),
                             self.home_position,
                             false,
                         ),
@@ -12492,16 +12559,23 @@ impl PlayerAgent {
                         } else if roam && dist < defend_radius {
                             snapshot.goal_side_defensive_target_for(self.id, snapshot.ball.position)
                         } else {
+                            // Own defensive coordinate; the LP shape only NUDGES it (gated). Off ⇒
+                            // formation_nudged_target returns guidance.target ⇒ authoritative as before.
+                            let own_defensive = snapshot.defensive_assignment_for(
+                                self.id,
+                                self.home_position,
+                                roam,
+                            );
                             let target = snapshot
                                 .formation_lp_guidance_for(self.id)
-                                .map(|guidance| guidance.target)
-                                .unwrap_or_else(|| {
-                                    snapshot.defensive_assignment_for(
-                                        self.id,
-                                        self.home_position,
-                                        roam,
+                                .map(|guidance| {
+                                    formation_nudged_target(
+                                        self.decision_confidence,
+                                        own_defensive,
+                                        guidance.target,
                                     )
-                                });
+                                })
+                                .unwrap_or(own_defensive);
                             if self.role == PlayerRole::Defender {
                                 if let Some((holder_position, line_gap)) =
                                     snapshot.opponent_breakthrough_ball_carrier(self.team)
@@ -13656,12 +13730,18 @@ impl PlayerAgent {
                 "defend".to_string(),
             )),
             "defend-shape" if snapshot.controlled_possession_team() == Some(self.team.other()) => {
+                let own_defensive =
+                    snapshot.defensive_assignment_for(self.id, self.home_position, false);
                 let target = snapshot
                     .formation_lp_guidance_for(self.id)
-                    .map(|guidance| guidance.target)
-                    .unwrap_or_else(|| {
-                        snapshot.defensive_assignment_for(self.id, self.home_position, false)
-                    });
+                    .map(|guidance| {
+                        formation_nudged_target(
+                            self.decision_confidence,
+                            own_defensive,
+                            guidance.target,
+                        )
+                    })
+                    .unwrap_or(own_defensive);
                 Some((SoccerAction::MoveTo(target), "defend-shape".to_string()))
             }
             "defend-roam" if snapshot.controlled_possession_team() == Some(self.team.other()) => {
@@ -14094,12 +14174,18 @@ impl PlayerAgent {
                 "defend-shape"
                     if snapshot.controlled_possession_team() == Some(self.team.other()) =>
                 {
+                    let own_defensive =
+                        snapshot.defensive_assignment_for(self.id, self.home_position, false);
                     let target = snapshot
                         .formation_lp_guidance_for(self.id)
-                        .map(|guidance| guidance.target)
-                        .unwrap_or_else(|| {
-                            snapshot.defensive_assignment_for(self.id, self.home_position, false)
-                        });
+                        .map(|guidance| {
+                            formation_nudged_target(
+                                self.decision_confidence,
+                                own_defensive,
+                                guidance.target,
+                            )
+                        })
+                        .unwrap_or(own_defensive);
                     Some((SoccerAction::MoveTo(target), "defend-shape".to_string()))
                 }
                 "defend-roam"
@@ -15517,5 +15603,43 @@ mod shot_foot_choice_tests {
     fn weak_foot_damp_is_a_reduction() {
         let damp = tunables().shooting.shot_foot_weak_foot_execution_damp;
         assert!(damp > 0.0 && damp < 1.0);
+    }
+}
+
+#[cfg(test)]
+mod formation_nudge_tests {
+    use super::formation_nudge_blend;
+    use crate::des::general::soccer::Vec2;
+
+    #[test]
+    fn full_conviction_ignores_the_shape_signal() {
+        let own = Vec2::new(10.0, 20.0);
+        let lp = Vec2::new(40.0, 20.0);
+        // decision_confidence 1.0 ⇒ weight 0 ⇒ the player's own read fully overrides the nudge.
+        let out = formation_nudge_blend(1.0, own, lp, 0.6, 6.0);
+        assert!((out.x - own.x).abs() < 1e-9 && (out.y - own.y).abs() < 1e-9);
+    }
+
+    #[test]
+    fn zero_conviction_pulls_toward_shape_but_stays_bounded() {
+        let own = Vec2::new(0.0, 0.0);
+        let lp = Vec2::new(100.0, 0.0); // far away: exercises the yard cap
+        let out = formation_nudge_blend(0.0, own, lp, 0.6, 6.0);
+        // Moves toward the LP target...
+        assert!(out.x > own.x && out.x <= lp.x);
+        // ...but never more than the max-yards cap, however far the LP sits.
+        assert!((out - own).len() <= 6.0 + 1e-9, "nudge must stay a bounded nudge: {out:?}");
+    }
+
+    #[test]
+    fn confidence_monotonically_reduces_the_pull() {
+        let own = Vec2::new(0.0, 0.0);
+        let lp = Vec2::new(4.0, 0.0); // within the cap so weight (not the clamp) drives distance
+        let unsure = (formation_nudge_blend(0.2, own, lp, 0.6, 6.0) - own).len();
+        let confident = (formation_nudge_blend(0.8, own, lp, 0.6, 6.0) - own).len();
+        assert!(
+            unsure > confident,
+            "a more convinced player should follow the shape less: unsure={unsure} confident={confident}"
+        );
     }
 }
