@@ -35585,6 +35585,34 @@ pub(crate) fn dd_soccer_standardize_policy_advantages() -> bool {
     dd_soccer_enable_advantage_normalization() || match_outcome_reward_enabled()
 }
 
+/// Std-only advantage normalization: divide by the batch std but DO NOT subtract the
+/// batch mean. Default-OFF (experimental climb fix). The standardization above removes
+/// the per-batch common-mode by subtracting the mean — the textbook PPO move, and
+/// correct when the critic already baselines each state. But with the match-outcome
+/// reward on, that common-mode IS the win/loss signal: every transition of a won game
+/// carries the same flat +win label, so the outcome shows up as a batch-level offset
+/// that the (currently clip-crushed) critic cannot yet baseline away. Subtracting the
+/// mean then strips the very win-vs-loss signal we added. With this on we keep the
+/// variance-reduction (÷ std) but preserve the outcome offset. Off ⇒ effective mean is
+/// the real mean ⇒ byte-identical. Read once per process. Pairs with un-crushing the
+/// value target (`DD_SOCCER_ENABLE_TARGET_STANDARDIZATION`): together the critic can
+/// represent the win magnitude and the actor keeps its gradient.
+pub(crate) fn dd_soccer_advantage_std_only() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_ENABLE_ADVANTAGE_STD_ONLY")
+            .map(|raw| {
+                let raw = raw.trim();
+                raw == "1"
+                    || raw.eq_ignore_ascii_case("true")
+                    || raw.eq_ignore_ascii_case("yes")
+                    || raw.eq_ignore_ascii_case("on")
+            })
+            .unwrap_or(false)
+    })
+}
+
 /// `(mean, std)` to standardize a policy batch's advantages by, or `None` for a
 /// degenerate batch (fewer than two samples, or non-finite / zero variance) that must
 /// be left untouched. Shared so the actor and keeper heads standardize identically.
