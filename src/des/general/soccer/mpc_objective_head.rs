@@ -119,6 +119,46 @@ impl SoccerMpcObjectiveHead {
         })
     }
 
+    /// Exploration wrapper around [`predict_residual`]. Adds Gaussian jitter — the caller supplies
+    /// the two standard-normal draws (`noise_fwd`, `noise_lat`) from the match RNG so the head
+    /// stays deterministic and rng-free, exactly like the rest of the engine threads randomness —
+    /// of std-dev `sigma_yards`, then RE-CLAMPS to the hard `MAX_RESIDUAL` bound so an explored
+    /// residual can never breach the "policy owns WHERE" contract. **Capture the RETURNED residual
+    /// as the RWR `applied_residual`**: reinforcing the explored action (not the greedy prediction)
+    /// is what lets the contextual bandit climb. `None` on malformed input, like `predict_residual`.
+    /// Non-finite noise is treated as zero (falls back to the greedy residual) rather than poisoning
+    /// the executor with a NaN target.
+    pub fn explore_residual(
+        &self,
+        features: &[f32],
+        sigma_yards: f64,
+        noise_fwd: f64,
+        noise_lat: f64,
+    ) -> Option<Vec2> {
+        let base = self.predict_residual(features)?;
+        let sigma = if sigma_yards.is_finite() {
+            sigma_yards.max(0.0)
+        } else {
+            0.0
+        };
+        let jitter_y = if noise_fwd.is_finite() {
+            noise_fwd * sigma
+        } else {
+            0.0
+        };
+        let jitter_x = if noise_lat.is_finite() {
+            noise_lat * sigma
+        } else {
+            0.0
+        };
+        Some(Vec2 {
+            x: (base.x + jitter_x)
+                .clamp(-MPC_OBJECTIVE_MAX_RESIDUAL_YARDS, MPC_OBJECTIVE_MAX_RESIDUAL_YARDS),
+            y: (base.y + jitter_y)
+                .clamp(-MPC_OBJECTIVE_MAX_RESIDUAL_YARDS, MPC_OBJECTIVE_MAX_RESIDUAL_YARDS),
+        })
+    }
+
     /// Reward-weighted regression: nudge the head toward residuals that earned positive advantage,
     /// with the learning rate scaled by a squashed advantage (a contextual bandit, not full policy
     /// gradient — lower variance, harder to destabilize). Returns the number of steps applied.
