@@ -120,6 +120,35 @@ fn learned_policy_option_score_safety_trips(chosen_score: f64, best_score: f64) 
         learned_policy_option_score_safety_min_ratio(),
     )
 }
+fn learned_policy_option_score_safety_rejected_execution_probability(
+    chosen_score: f64,
+    best_score: f64,
+) -> f64 {
+    let chosen_score = soccer_finite_nonnegative_metric(chosen_score);
+    let best_score = soccer_finite_nonnegative_metric(best_score);
+    if best_score <= f64::EPSILON {
+        return 0.0;
+    }
+    (chosen_score / best_score).clamp(0.0, 1.0)
+}
+fn learned_policy_option_score_safety_replan_trace(
+    original_label: &str,
+    replacement_label: &str,
+    rejected_execution_probability: f64,
+    action_options: &[AgentActionOptionTrace],
+) -> Option<SoccerLearnedMpcReplanTrace> {
+    let original_action = learned_mpc_action_label_key(original_label);
+    let replacement_action = learned_mpc_action_label_key(replacement_label);
+    if original_action == replacement_action {
+        return None;
+    }
+    Some(SoccerLearnedMpcReplanTrace {
+        original_action,
+        replacement_action,
+        rejected_execution_probability: rejected_execution_probability.clamp(0.0, 1.0),
+        candidate_count: action_options.iter().filter(|option| option.legal).count(),
+    })
+}
 fn suppress_mpc_reselected_action_option(
     options: &mut [AgentActionOptionTrace],
     candidate_label: &str,
@@ -9974,8 +10003,9 @@ impl PlayerAgent {
                     );
                     let mut operation_order =
                         vec!["learned-policy".to_string(), plan.action.clone()];
-                    if let Some((safety_action, safety_label)) = self
-                        .learned_policy_option_score_safety_override(
+                    let mut option_score_safety_original: Option<(String, f64)> = None;
+                    if let Some((safety_action, safety_label, rejected_execution_probability)) =
+                        self.learned_policy_option_score_safety_override(
                             plan,
                             snapshot,
                             &observation,
@@ -9986,8 +10016,11 @@ impl PlayerAgent {
                         let original_label = action_label.clone();
                         action = safety_action;
                         action_label = safety_label;
-                        operation_order
-                            .push(format!("option-score-safety:{original_label}->{action_label}"));
+                        operation_order.push(format!(
+                            "option-score-safety:{original_label}->{action_label}"
+                        ));
+                        option_score_safety_original =
+                            Some((original_label, rejected_execution_probability));
                     }
                     let action_options = self.learned_policy_counterfactual_action_options(
                         snapshot,
@@ -10006,7 +10039,20 @@ impl PlayerAgent {
                         &action,
                         action_label,
                     );
-                    decision.learned_mpc_replan = plan.mpc_replan.clone();
+                    if let Some((original_label, rejected_execution_probability)) =
+                        option_score_safety_original
+                    {
+                        decision.learned_mpc_replan =
+                            learned_policy_option_score_safety_replan_trace(
+                                &original_label,
+                                &decision.action,
+                                rejected_execution_probability,
+                                &decision.action_options,
+                            )
+                            .or_else(|| plan.mpc_replan.clone());
+                    } else {
+                        decision.learned_mpc_replan = plan.mpc_replan.clone();
+                    }
                     self.last_decision = Some(decision);
                     return PlayerIntent {
                         player_id: self.id,
@@ -13836,7 +13882,7 @@ impl PlayerAgent {
         observation: &SoccerPomdpObservation,
         options: &[AgentActionOptionTrace],
         action_label: &str,
-    ) -> Option<(SoccerAction, String)> {
+    ) -> Option<(SoccerAction, String, f64)> {
         if !learned_policy_option_score_safety_enabled() {
             return None;
         }
@@ -13852,19 +13898,30 @@ impl PlayerAgent {
             .iter()
             .filter(|option| option.legal)
             .filter(|option| !learned_mpc_action_labels_match(&option.label, &chosen_key))
-            .max_by(|a, b| soccer_finite_option_score(a).total_cmp(&soccer_finite_option_score(b)))?;
+            .max_by(|a, b| {
+                soccer_finite_option_score(a).total_cmp(&soccer_finite_option_score(b))
+            })?;
         let best_score = soccer_finite_option_score(best);
         if !learned_policy_option_score_safety_trips(chosen_score, best_score) {
             return None;
         }
+        let rejected_execution_probability =
+            learned_policy_option_score_safety_rejected_execution_probability(
+                chosen_score,
+                best_score,
+            );
 
-        if let Some((fallback_action, fallback_label)) =
-            self.learned_policy_option_score_safety_direct_action(&best.label, snapshot, observation)
+        if let Some((fallback_action, fallback_label)) = self
+            .learned_policy_option_score_safety_direct_action(&best.label, snapshot, observation)
         {
             if !observation.has_ball
                 || !mpc_reselects_candidate(snapshot, self, &fallback_action, &fallback_label)
             {
-                return Some((fallback_action, fallback_label));
+                return Some((
+                    fallback_action,
+                    fallback_label,
+                    rejected_execution_probability,
+                ));
             }
         }
 
@@ -13884,9 +13941,9 @@ impl PlayerAgent {
                 } else {
                     fallback_label
                 };
-                (fallback_action, trace_label)
+                (fallback_action, trace_label, rejected_execution_probability)
             })
-            .filter(|(fallback_action, fallback_label)| {
+            .filter(|(fallback_action, fallback_label, _)| {
                 !observation.has_ball
                     || !mpc_reselects_candidate(snapshot, self, fallback_action, fallback_label)
             })
@@ -13922,7 +13979,9 @@ impl PlayerAgent {
                         });
                     Some((SoccerAction::MoveTo(target), "defend-shape".to_string()))
                 }
-                "defend-roam" if snapshot.controlled_possession_team() == Some(self.team.other()) => {
+                "defend-roam"
+                    if snapshot.controlled_possession_team() == Some(self.team.other()) =>
+                {
                     Some((
                         SoccerAction::MoveTo(snapshot.goal_side_defensive_target_for(
                             self.id,
@@ -13931,7 +13990,9 @@ impl PlayerAgent {
                         "defend-roam".to_string(),
                     ))
                 }
-                "press-cover" if snapshot.controlled_possession_team() == Some(self.team.other()) => {
+                "press-cover"
+                    if snapshot.controlled_possession_team() == Some(self.team.other()) =>
+                {
                     let target = snapshot
                         .players
                         .iter()
@@ -14034,17 +14095,19 @@ impl PlayerAgent {
             }
             "killer-pass" => {
                 let pass_targets = snapshot.ranked_visible_pass_targets(self.id, 11);
-                snapshot.killer_pass_target_for(self.id, &pass_targets).map(|target| {
-                    (
-                        SoccerAction::Pass {
-                            target_player: Some(target),
-                            power: 0.66
-                                + 0.24 * passing_skill.max(ability01(self.skills.vision)),
-                            flight: snapshot.killer_pass_flight_for(self.id, &pass_targets),
-                        },
-                        "killer-pass".to_string(),
-                    )
-                })
+                snapshot
+                    .killer_pass_target_for(self.id, &pass_targets)
+                    .map(|target| {
+                        (
+                            SoccerAction::Pass {
+                                target_player: Some(target),
+                                power: 0.66
+                                    + 0.24 * passing_skill.max(ability01(self.skills.vision)),
+                                flight: snapshot.killer_pass_flight_for(self.id, &pass_targets),
+                            },
+                            "killer-pass".to_string(),
+                        )
+                    })
             }
             "shoot"
                 if shot_decision_is_qualified_for_role(observation, self.role)
@@ -14686,7 +14749,11 @@ pub struct SoccerLearnedPlan {
 
 #[cfg(test)]
 mod learned_policy_option_score_safety_tests {
-    use super::learned_policy_option_score_safety_trips_with_thresholds;
+    use super::{
+        learned_policy_option_score_safety_rejected_execution_probability,
+        learned_policy_option_score_safety_replan_trace,
+        learned_policy_option_score_safety_trips_with_thresholds, AgentActionOptionTrace,
+    };
 
     #[test]
     fn learned_policy_option_score_safety_trips_on_catastrophic_gap() {
@@ -14703,6 +14770,44 @@ mod learned_policy_option_score_safety_tests {
         assert!(!learned_policy_option_score_safety_trips_with_thresholds(
             1.0, 3.5, 4.0, 3.0, 0.50,
         ));
+    }
+
+    #[test]
+    fn learned_policy_option_score_safety_rejection_probability_is_score_ratio() {
+        let probability =
+            learned_policy_option_score_safety_rejected_execution_probability(0.2, 18.0);
+        assert!((probability - (0.2 / 18.0)).abs() < 1e-12);
+        assert_eq!(
+            learned_policy_option_score_safety_rejected_execution_probability(4.0, 2.0),
+            1.0
+        );
+        assert_eq!(
+            learned_policy_option_score_safety_rejected_execution_probability(1.0, 0.0),
+            0.0
+        );
+    }
+
+    #[test]
+    fn learned_policy_option_score_safety_replan_trace_marks_rejected_original() {
+        let trace = learned_policy_option_score_safety_replan_trace(
+            "xavi-turn",
+            "pass1",
+            0.05,
+            &[
+                AgentActionOptionTrace::new("xavi-turn", 0.2, true),
+                AgentActionOptionTrace::new("pass1", 18.0, true),
+                AgentActionOptionTrace::new("shoot", 0.0, false),
+            ],
+        )
+        .expect("safety replacement should stamp a replan trace");
+
+        assert_eq!(trace.original_action, "xavi-turn");
+        assert_eq!(trace.replacement_action, "pass1");
+        assert_eq!(trace.rejected_execution_probability, 0.05);
+        assert_eq!(trace.candidate_count, 2);
+        assert!(
+            learned_policy_option_score_safety_replan_trace("pass1", "pass1", 0.05, &[]).is_none()
+        );
     }
 }
 
