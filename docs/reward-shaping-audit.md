@@ -54,6 +54,25 @@ agent still gets pulled toward the state, but the pull cancels on exit, so it
 cannot farm the term. This is behaviour-changing for the *trained* policy, so it
 must be gated and A/B'd against the current learner, not flipped blind.
 
+## Forward-pass primacy knobs (2026-07-08, gated, default byte-identical)
+
+Operator lever: make **completed forward passes** the primary *dense* advancement signal instead of
+shots. Two `OnceLock` env knobs, default 1.0 (identical):
+- `DD_SOCCER_FORWARD_PASS_REWARD_SCALE` (0..20) — multiplies `completed_pass_reward_for_pitch`
+  (`forward_pass_reward_scale()`, soccer.rs:23444).
+- `DD_SOCCER_SHOT_SHAPING_REWARD_SCALE` (0..1) — dampens **only** the shot-TAKEN *shaping* proxy
+  (`SHOT_ON_TARGET_REWARD_POINTS`, soccer.rs:36473); the goal (100) and terminal-outcome rewards are
+  category-A and stay intact so finishing is never un-learned.
+
+**PBRS status:** the completed-forward-pass reward is a **category-C** per-visit term (a completion
+event, not a `Φ(s')−Φ(s)` delta), so scaling it up *is* increasing a farmable bias. The design
+contains the farm structurally (base+progress capped so a ~5-pass chain tops out ≈30 < shot 40 <
+goal 100, soccer.rs:1241-1260) plus regression guards in `soccer_learning.rs:9091` (analytic parity)
+and `:9105` (backward-recycle must stay penalized). It is **not** policy-invariant — hence gated and
+A/B'd vs the confirmed base, never flipped blind. The clean PBRS alternative (deferred) is a learned
+EPV potential routed through `potential_based_shaping`, which would value progression without the
+farm risk but needs a possession-chain export first.
+
 ## Follow-ups (deferred, each its own gated change)
 1. **Discount alignment.** B-terms (and pitch value) use `γ=1`; the returns use
    the learner's actual `γ` (`REWARD_SHAPING_DEFAULT_GAMMA = 0.99`). True
