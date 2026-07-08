@@ -72,6 +72,14 @@ const SOCCER_POLICY_RANK_SALT_EXPLORATION: u64 = 0x4558_504c_4f52_4552;
 const SOCCER_POLICY_EPSILON_SALT_EXPLORATION: u64 = 0x4558_504c_4741_5445;
 const SOCCER_POLICY_EXPLORATION_UNCERTAINTY_SCALE: f64 = 0.60;
 const SOCCER_POLICY_EXPLORATION_UNCERTAINTY_MAX_MULTIPLIER: f64 = 6.0;
+const SOCCER_EXTERNAL_NN_POMDP_SIDECAR_GATE_ENV: &str = "SOCCER_EXTERNAL_NN_POMDP_SIDECAR";
+const SOCCER_BURN_POMDP_SIDECAR_GATE_ENV: &str = "SOCCER_BURN_POMDP_SIDECAR";
+const SOCCER_EXTERNAL_NN_POMDP_SIDECAR_URL_ENV: &str = "SOCCER_EXTERNAL_NN_POMDP_SIDECAR_URL";
+const SOCCER_BURN_POMDP_SIDECAR_URL_ENV: &str = "SOCCER_BURN_POMDP_SIDECAR_URL";
+const SOCCER_EXTERNAL_NN_POMDP_SIDECAR_TIMEOUT_MS_ENV: &str =
+    "SOCCER_EXTERNAL_NN_POMDP_SIDECAR_TIMEOUT_MS";
+const SOCCER_EXTERNAL_NN_POMDP_SIDECAR_DEFAULT_TIMEOUT_MS: u64 = 8;
+const SOCCER_EXTERNAL_NN_POMDP_SIDECAR_CONTRACT_VERSION: u32 = 1;
 const SOCCER_POLICY_EXPLORATION_TAIL_CANDIDATE_LIMIT: usize = 10;
 const SOCCER_POLICY_EXPLORATION_CANDIDATE_LIMIT: usize =
     if SOCCER_POLICY_EXPLORATION_TAIL_CANDIDATE_LIMIT > POLICY_SELECTION_TOP_RANK_LIMIT {
@@ -1915,6 +1923,291 @@ fn dd_soccer_enable_bellman_terminals() -> bool {
     *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_BELLMAN_TERMINALS"))
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SoccerTrajectoryExportDecision {
+    pub field_motion: Vec<f32>,
+    pub action: usize,
+    pub reward: f64,
+    pub done: bool,
+    pub agent: usize,
+    pub behavior_policy_probability: f64,
+}
+
+pub fn soccer_trajectory_export_decision(
+    transition: &SoccerLearningTransition,
+) -> Option<SoccerTrajectoryExportDecision> {
+    let field_motion =
+        if transition.observation.field_player_motion.len() == SOCCER_NEURAL_FIELD_MOTION_DIM {
+            transition.observation.field_player_motion.as_slice()
+        } else if transition.decision_context.field_player_motion.len()
+            == SOCCER_NEURAL_FIELD_MOTION_DIM
+        {
+            transition.decision_context.field_player_motion.as_slice()
+        } else {
+            return None;
+        };
+    let action = soccer_policy_action_index(&transition.action)?;
+    let behavior_policy_probability = transition
+        .decision_context
+        .behavior_policy_probability
+        .filter(|probability| probability.is_finite() && *probability > 0.0)
+        .map(finite_unit_interval)
+        .unwrap_or(1.0);
+    Some(SoccerTrajectoryExportDecision {
+        field_motion: field_motion.to_vec(),
+        action,
+        reward: transition.reward,
+        done: transition.done,
+        agent: transition.player_id,
+        behavior_policy_probability,
+    })
+}
+
+pub fn soccer_trajectory_export_decisions(
+    replay: &[SoccerLearningTransition],
+) -> Vec<SoccerTrajectoryExportDecision> {
+    replay
+        .iter()
+        .filter_map(soccer_trajectory_export_decision)
+        .collect()
+}
+
+/// File-writer that was missing: consume the export rows and append them as JSONL to
+/// `DD_SOCCER_TRAJECTORY_EXPORT_PATH` (the on-policy data channel for the Burn POMDP-solver). The
+/// converter above only produced rows; nothing wrote them. Unset env ⇒ no-op. Mutex-serialised.
+pub fn soccer_trajectory_export_write(replay: &[SoccerLearningTransition]) {
+    use std::sync::OnceLock;
+    static WRITER: OnceLock<Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>> =
+        OnceLock::new();
+    let writer = WRITER.get_or_init(|| {
+        let path = std::env::var("DD_SOCCER_TRAJECTORY_EXPORT_PATH").ok()?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()?;
+        Some(std::sync::Mutex::new(std::io::BufWriter::new(file)))
+    });
+    let Some(writer) = writer.as_ref() else {
+        return;
+    };
+    use std::io::Write;
+    if let Ok(mut guard) = writer.lock() {
+        for row in soccer_trajectory_export_decisions(replay) {
+            if let Ok(line) = serde_json::to_string(&row) {
+                let _ = writeln!(guard, "{line}");
+            }
+        }
+        let _ = guard.flush();
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SoccerExternalNnPomdpSidecarEndpoint {
+    host: String,
+    port: u16,
+    path: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+struct SoccerExternalNnPomdpSidecarRequest<'a> {
+    kind: &'static str,
+    version: u32,
+    tick: u64,
+    player_id: usize,
+    team: Team,
+    role: PlayerRole,
+    entity_shape: [usize; 2],
+    entities: &'a [f32],
+    legal_action_mask: &'a [bool],
+    action_labels: &'static [&'static str],
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct SoccerExternalNnPomdpSidecarResponse {
+    logits: Vec<f64>,
+    #[serde(default)]
+    value: Option<f64>,
+    // True on-policy behavior probability of the returned action under the sidecar's sampling
+    // policy. When present (finite, >0) it is stamped onto the decision so the offline trainer
+    // has a real old-policy prob for clipped-PPO importance weighting. Absent → deterministic
+    // (falls back to 1.0).
+    #[serde(default)]
+    behavior_policy_probability: Option<f64>,
+    // The action the sidecar actually chose (sampled). Preferred over re-deriving argmax, after a
+    // legality re-check, so the logged action matches the one whose prob was reported.
+    #[serde(default)]
+    action_index: Option<usize>,
+}
+
+fn soccer_external_nn_pomdp_sidecar_enabled() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled(SOCCER_EXTERNAL_NN_POMDP_SIDECAR_GATE_ENV)
+            || soccer_env_flag_enabled(SOCCER_BURN_POMDP_SIDECAR_GATE_ENV)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            soccer_env_flag_enabled(SOCCER_EXTERNAL_NN_POMDP_SIDECAR_GATE_ENV)
+                || soccer_env_flag_enabled(SOCCER_BURN_POMDP_SIDECAR_GATE_ENV)
+        })
+    }
+}
+
+fn soccer_external_nn_pomdp_sidecar_url() -> Option<String> {
+    std::env::var(SOCCER_EXTERNAL_NN_POMDP_SIDECAR_URL_ENV)
+        .ok()
+        .or_else(|| std::env::var(SOCCER_BURN_POMDP_SIDECAR_URL_ENV).ok())
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+}
+
+fn soccer_external_nn_pomdp_sidecar_timeout() -> std::time::Duration {
+    use std::sync::OnceLock;
+    static TIMEOUT: OnceLock<std::time::Duration> = OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        let millis = std::env::var(SOCCER_EXTERNAL_NN_POMDP_SIDECAR_TIMEOUT_MS_ENV)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .unwrap_or(SOCCER_EXTERNAL_NN_POMDP_SIDECAR_DEFAULT_TIMEOUT_MS)
+            .clamp(1, 1_000);
+        std::time::Duration::from_millis(millis)
+    })
+}
+
+fn soccer_external_nn_pomdp_sidecar_endpoint(
+) -> Option<&'static SoccerExternalNnPomdpSidecarEndpoint> {
+    use std::sync::OnceLock;
+    static ENDPOINT: OnceLock<Option<SoccerExternalNnPomdpSidecarEndpoint>> = OnceLock::new();
+    ENDPOINT
+        .get_or_init(|| {
+            soccer_external_nn_pomdp_sidecar_url()
+                .and_then(|raw| soccer_parse_external_nn_pomdp_sidecar_endpoint(&raw))
+        })
+        .as_ref()
+}
+
+fn soccer_parse_external_nn_pomdp_sidecar_endpoint(
+    raw: &str,
+) -> Option<SoccerExternalNnPomdpSidecarEndpoint> {
+    let raw = raw.trim();
+    if raw.starts_with("https://") {
+        return None;
+    }
+    let rest = raw.strip_prefix("http://").unwrap_or(raw);
+    let (authority, path) = rest
+        .split_once('/')
+        .map(|(authority, path)| {
+            let path = if path.is_empty() {
+                "/infer".to_string()
+            } else {
+                format!("/{path}")
+            };
+            (authority, path)
+        })
+        .unwrap_or((rest, "/infer".to_string()));
+    let (host, port) = authority
+        .rsplit_once(':')
+        .and_then(|(host, port)| port.parse::<u16>().ok().map(|port| (host, port)))
+        .unwrap_or((authority, 80));
+    let host = host.trim();
+    if host.is_empty() {
+        return None;
+    }
+    Some(SoccerExternalNnPomdpSidecarEndpoint {
+        host: host.to_string(),
+        port,
+        path,
+    })
+}
+
+fn soccer_external_nn_pomdp_sidecar_post_json(
+    endpoint: &SoccerExternalNnPomdpSidecarEndpoint,
+    body: &str,
+    timeout: std::time::Duration,
+) -> Option<String> {
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+
+    let mut addrs = (endpoint.host.as_str(), endpoint.port)
+        .to_socket_addrs()
+        .ok()?;
+    let addr = addrs.next()?;
+    let mut stream = TcpStream::connect_timeout(&addr, timeout).ok()?;
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+    let request = format!(
+        "POST {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/json\r\nAccept: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+        endpoint.path,
+        endpoint.host,
+        endpoint.port,
+        body.as_bytes().len(),
+        body
+    );
+    stream.write_all(request.as_bytes()).ok()?;
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).ok()?;
+    let header_end = raw.find("\r\n\r\n")?;
+    let (header, body) = raw.split_at(header_end);
+    let status = header.lines().next().unwrap_or_default();
+    if !(status.starts_with("HTTP/1.1 200") || status.starts_with("HTTP/1.0 200")) {
+        return None;
+    }
+    Some(body[4..].to_string())
+}
+
+fn soccer_external_nn_pomdp_sidecar_infer(
+    request: &SoccerExternalNnPomdpSidecarRequest<'_>,
+) -> Option<SoccerExternalNnPomdpSidecarResponse> {
+    let endpoint = soccer_external_nn_pomdp_sidecar_endpoint()?;
+    let body = serde_json::to_string(request).ok()?;
+    let raw = soccer_external_nn_pomdp_sidecar_post_json(
+        endpoint,
+        &body,
+        soccer_external_nn_pomdp_sidecar_timeout(),
+    )?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn soccer_policy_legal_action_mask_for_snapshot(
+    snapshot: &WorldSnapshot,
+    player_id: usize,
+) -> Option<Vec<bool>> {
+    let mask = SOCCER_POLICY_ACTIONS
+        .iter()
+        .map(|action| learned_action_label_is_legal(action, snapshot, player_id))
+        .collect::<Vec<_>>();
+    mask.iter().any(|legal| *legal).then_some(mask)
+}
+
+fn soccer_external_nn_pomdp_select_legal_argmax(
+    logits: &[f64],
+    legal_action_mask: &[bool],
+) -> Option<usize> {
+    let mut best: Option<(usize, f64)> = None;
+    for (index, legal) in legal_action_mask.iter().enumerate() {
+        if !*legal {
+            continue;
+        }
+        let Some(logit) = logits.get(index).copied().filter(|value| value.is_finite()) else {
+            continue;
+        };
+        let replace = best
+            .map(|(_, best_logit)| logit > best_logit)
+            .unwrap_or(true);
+        if replace {
+            best = Some((index, logit));
+        }
+    }
+    best.map(|(index, _)| index)
+}
+
 fn soccer_bellman_replay_with_trajectory_terminals(
     replay: &[SoccerLearningTransition],
 ) -> Vec<SoccerLearningTransition> {
@@ -3208,6 +3501,104 @@ mod tests {
             Some(0.83)
         );
         assert_eq!(soccer_behavior_old_action_probability(None, None), None);
+    }
+
+    #[test]
+    fn trajectory_export_decision_records_behavior_policy_probability() {
+        let sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let player = snapshot
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home field player");
+        let state = snapshot.mdp_state_for_player(player.id);
+        let observation = snapshot.observation_for(player.id);
+        let mut transition = SoccerLearningTransition {
+            tick: snapshot.tick,
+            player_id: player.id,
+            team: player.team,
+            role: player.role,
+            state: state.clone(),
+            observation: observation.clone(),
+            belief: belief_from_observation(&observation),
+            action: "pass".to_string(),
+            action_target: None,
+            decision_context: soccer_decision_context_for(
+                player.id,
+                player.team,
+                "pass",
+                None,
+                &snapshot,
+                &snapshot,
+            ),
+            tactical_trace: SoccerTacticalLearningTrace::default(),
+            reward: 0.25,
+            next_state: state,
+            next_observation: observation,
+            done: false,
+        };
+        transition.decision_context.behavior_policy_probability = Some(0.20);
+
+        let row = soccer_trajectory_export_decision(&transition).expect("exported row");
+        assert_eq!(row.field_motion.len(), SOCCER_NEURAL_FIELD_MOTION_DIM);
+        assert_eq!(
+            row.action,
+            soccer_policy_action_index("pass").expect("pass action index")
+        );
+        assert_eq!(row.agent, player.id);
+        assert_eq!(row.reward, 0.25);
+        assert!(!row.done);
+        assert!((row.behavior_policy_probability - 0.20).abs() < 1e-12);
+
+        transition.decision_context.behavior_policy_probability = None;
+        let deterministic = soccer_trajectory_export_decision(&transition).expect("exported row");
+        assert_eq!(deterministic.behavior_policy_probability, 1.0);
+    }
+
+    #[test]
+    fn external_nn_pomdp_sidecar_contract_matches_field_motion_action_indices() {
+        let sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let player = snapshot
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home field player");
+        let entities = soccer_field_player_motion_block(&snapshot, player.id, player.team);
+        assert_eq!(SOCCER_NEURAL_FIELD_MOTION_PLAYERS, 22);
+        assert_eq!(SOCCER_NEURAL_FIELD_MOTION_BALLS, 1);
+        assert_eq!(SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER, 8);
+        assert_eq!(entities.len(), 23 * 8);
+        assert_eq!(entities.len(), SOCCER_NEURAL_FIELD_MOTION_DIM);
+        let engine_legal_mask = soccer_policy_legal_action_mask_for_snapshot(&snapshot, player.id)
+            .expect("at least one legal action");
+        assert_eq!(engine_legal_mask.len(), SOCCER_POLICY_ACTIONS.len());
+
+        let hold_index = soccer_policy_action_index("hold").expect("hold action index");
+        let pass_index = soccer_policy_action_index("pass").expect("pass action index");
+        let shoot_index = soccer_policy_action_index("shoot").expect("shoot action index");
+        assert_eq!(SOCCER_POLICY_ACTIONS[pass_index], "pass");
+        assert_eq!(SOCCER_POLICY_ACTIONS[shoot_index], "shoot");
+
+        let mut legal_action_mask = vec![false; SOCCER_POLICY_ACTIONS.len()];
+        legal_action_mask[pass_index] = true;
+        legal_action_mask[shoot_index] = true;
+        let mut logits = vec![0.0; SOCCER_POLICY_ACTIONS.len()];
+        logits[hold_index] = 99.0;
+        logits[pass_index] = 7.0;
+        logits[shoot_index] = 3.0;
+
+        assert_eq!(
+            soccer_external_nn_pomdp_select_legal_argmax(&logits, &legal_action_mask),
+            Some(pass_index)
+        );
+
+        logits[pass_index] = f64::NAN;
+        assert_eq!(
+            soccer_external_nn_pomdp_select_legal_argmax(&logits, &legal_action_mask),
+            Some(shoot_index)
+        );
     }
 
     #[test]
@@ -8783,6 +9174,162 @@ impl SoccerMatch {
             })
     }
 
+    fn external_nn_pomdp_sidecar_action_for_player(
+        &self,
+        _policy: &SoccerQPolicy,
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        _retrieval_prior: Option<(&std::collections::HashMap<String, f64>, f64)>,
+    ) -> Option<SoccerPolicyActionChoice> {
+        if !soccer_external_nn_pomdp_sidecar_enabled() {
+            return None;
+        }
+        // On-ball-only lever: let the strong analytic MPC keep off-ball positioning; the learned net
+        // only owns the ball-carrier's decision. Recovers score when the net's off-ball play is weak.
+        //
+        // SELECTIVE SUPPORT-OUTLET lever (gated SOCCER_BURN_SIDECAR_SUPPORT_OUTLET): in addition to
+        // the carrier, also let the net drive exactly ONE off-ball support runner when our side has
+        // possession — restricted (below) to support-family actions only. Everyone else stays MPC.
+        // Rationale: the on-ball policy can't CREATE a receiving option; one learned support runner
+        // changes the next on-ball decision surface, which the analytic pass machinery can exploit.
+        let is_carrier = snapshot.ball.holder == Some(player_id);
+        let mut support_only_mask = false;
+        if std::env::var("SOCCER_BURN_SIDECAR_ON_BALL_ONLY").ok().as_deref() == Some("1") && !is_carrier
+        {
+            let support_outlet =
+                std::env::var("SOCCER_BURN_SIDECAR_SUPPORT_OUTLET").ok().as_deref() == Some("1");
+            // MULTI-ROLE possession scope (Codex): drive the K nearest mid/fwd support runners
+            // (K = SOCCER_BURN_SIDECAR_SUPPORT_ACTORS, default 3), each support-masked — a coordinated
+            // receiver SET creates options for the carrier, where one runner (0.479) could not.
+            if support_outlet && self.designated_support_actor_set(snapshot).contains(&player_id) {
+                support_only_mask = true; // serve this actor, but support-family actions only
+            } else {
+                return None;
+            }
+        }
+        {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static N: AtomicUsize = AtomicUsize::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 3 || n % 250 == 0 {
+                eprintln!("SIDECAR_DBG reached={n} tick={} player={player_id}", snapshot.tick);
+            }
+        }
+        let player = snapshot.players.iter().find(|p| p.id == player_id)?;
+        let Some(mut legal_action_mask) = soccer_policy_legal_action_mask_for_snapshot(snapshot, player_id) else {
+            eprintln!("SIDECAR_DBG bail=mask_none player={player_id}");
+            return None;
+        };
+        if support_only_mask {
+            // Support runner learns timing/FAMILY only; analytic target-gen + shape/offside/spacing
+            // guards + MPC handle execution. Restrict its legal mask to support-family actions.
+            fn is_support_family(index: usize) -> bool {
+                matches!(
+                    SOCCER_POLICY_ACTIONS.get(index).copied(),
+                    Some("support-shape") | Some("support-roam") | Some("support-screen")
+                        | Some("check-to-ball") | Some("run-in-behind") | Some("exploit-space-run")
+                        | Some("wide-outlet") | Some("shot-creation-run") | Some("pinch-cross-arrival")
+                        | Some("overlap-run") | Some("one-two-run") | Some("support-push-up")
+                        | Some("hold-up-flank") | Some("wait-for-support") | Some("open-passing-lane")
+                        | Some("open-pass-lane") | Some("buildup-receive")
+                )
+            }
+            for (i, ok) in legal_action_mask.iter_mut().enumerate() {
+                if *ok && !is_support_family(i) {
+                    *ok = false;
+                }
+            }
+            if !legal_action_mask.iter().any(|&ok| ok) {
+                return None; // no legal support action this tick ⇒ fall back to MPC
+            }
+        }
+        let entities = soccer_field_player_motion_block(snapshot, player_id, player.team);
+        if entities.len() != SOCCER_NEURAL_FIELD_MOTION_DIM {
+            return None;
+        }
+        let request = SoccerExternalNnPomdpSidecarRequest {
+            kind: "soccer-external-nn-pomdp-sidecar-inference",
+            version: SOCCER_EXTERNAL_NN_POMDP_SIDECAR_CONTRACT_VERSION,
+            tick: snapshot.tick,
+            player_id,
+            team: player.team,
+            role: player.role,
+            entity_shape: [
+                SOCCER_NEURAL_FIELD_MOTION_PLAYERS + SOCCER_NEURAL_FIELD_MOTION_BALLS,
+                SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER,
+            ],
+            entities: entities.as_slice(),
+            legal_action_mask: legal_action_mask.as_slice(),
+            action_labels: SOCCER_POLICY_ACTIONS,
+        };
+        let SoccerExternalNnPomdpSidecarResponse {
+            logits,
+            value: _value,
+            behavior_policy_probability,
+            action_index: sidecar_action_index,
+        } = soccer_external_nn_pomdp_sidecar_infer(&request)?;
+        // Prefer the sidecar's OWN sampled action (so the logged action matches the reported prob),
+        // but only if it is legal for this snapshot; otherwise fall back to the legal argmax.
+        let action_index = sidecar_action_index
+            .filter(|&i| legal_action_mask.get(i).copied().unwrap_or(false))
+            .or_else(|| soccer_external_nn_pomdp_select_legal_argmax(&logits, &legal_action_mask))?;
+        let label = SOCCER_POLICY_ACTIONS.get(action_index)?.to_string();
+        // Stamp the TRUE sampled probability when the sidecar provided one (finite, >0); else 1.0
+        // (deterministic argmax). This gives the offline trainer a real old-policy prob for
+        // clipped-PPO importance weighting instead of a constant 1.0.
+        let behavior_probability = match behavior_policy_probability {
+            Some(p) => {
+                let p = finite_unit_interval(p);
+                if p > 0.0 { p } else { 1.0 }
+            }
+            None => 1.0,
+        };
+        Some(SoccerPolicyActionChoice {
+            label,
+            plan: None,
+            behavior_probability,
+            neural_mcts_selected: false,
+            neural_mcts_candidate_count: 0,
+            neural_mcts_discretized_kick_candidate_count: 0,
+            neural_mcts_root_discretized_kick_candidate_count: 0,
+        })
+    }
+
+    /// The SET of off-ball support runners the net may drive under the multi-role support-outlet
+    /// lever: the K nearest Midfielder/Forward teammates to the ball carrier (K =
+    /// SOCCER_BURN_SIDECAR_SUPPORT_ACTORS, default 3, clamped 1..=4; excludes carrier + GK/defenders),
+    /// while our side has possession. Deterministic (distance-sorted, `total_cmp`). Empty ⇒ all-MPC.
+    fn designated_support_actor_set(&self, snapshot: &WorldSnapshot) -> Vec<usize> {
+        let Some(holder) = snapshot.ball.holder else {
+            return Vec::new();
+        };
+        let Some(carrier) = snapshot.players.iter().find(|p| p.id == holder) else {
+            return Vec::new();
+        };
+        let cpos = carrier.position;
+        let k = std::env::var("SOCCER_BURN_SIDECAR_SUPPORT_ACTORS")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(3)
+            .clamp(1, 4);
+        let mut cands: Vec<(usize, f64)> = snapshot
+            .players
+            .iter()
+            .filter(|p| {
+                p.team == carrier.team
+                    && p.id != holder
+                    && matches!(p.role, PlayerRole::Midfielder | PlayerRole::Forward)
+            })
+            .map(|p| {
+                let d = (p.position.x - cpos.x).powi(2) + (p.position.y - cpos.y).powi(2);
+                (p.id, d)
+            })
+            .collect();
+        cands.sort_by(|a, b| a.1.total_cmp(&b.1));
+        cands.truncate(k);
+        cands.into_iter().map(|(id, _)| id).collect()
+    }
+
     fn learned_action_for_player_with_context(
         &self,
         snapshot: &WorldSnapshot,
@@ -8805,16 +9352,24 @@ impl SoccerMatch {
         if let Some(team_policies) = &self.team_policies {
             let policy = team_policies.policy(player.team);
             if let Some(choice) = self
-                .neural_blended_action(
+                .external_nn_pomdp_sidecar_action_for_player(
                     policy,
                     snapshot,
                     player_id,
-                    mdp_state,
-                    observation,
-                    player.team,
-                    player.role,
-                    SOCCER_POLICY_RANK_SALT_TEAM_NEURAL,
+                    retrieval_prior,
                 )
+                .or_else(|| {
+                    self.neural_blended_action(
+                        policy,
+                        snapshot,
+                        player_id,
+                        mdp_state,
+                        observation,
+                        player.team,
+                        player.role,
+                        SOCCER_POLICY_RANK_SALT_TEAM_NEURAL,
+                    )
+                })
                 .or_else(|| {
                     self.exploration_action_for_player(
                         policy,
@@ -8860,16 +9415,24 @@ impl SoccerMatch {
             }
         }
         let learned_policy = self.learned_policy.as_ref()?;
-        self.neural_blended_action(
+        self.external_nn_pomdp_sidecar_action_for_player(
             learned_policy,
             snapshot,
             player_id,
-            mdp_state,
-            observation,
-            player.team,
-            player.role,
-            SOCCER_POLICY_RANK_SALT_SHARED_NEURAL,
+            retrieval_prior,
         )
+        .or_else(|| {
+            self.neural_blended_action(
+                learned_policy,
+                snapshot,
+                player_id,
+                mdp_state,
+                observation,
+                player.team,
+                player.role,
+                SOCCER_POLICY_RANK_SALT_SHARED_NEURAL,
+            )
+        })
         .or_else(|| {
             self.exploration_action_for_player(
                 learned_policy,
@@ -26561,6 +27124,7 @@ impl SoccerMatch {
                 transitions.push(transition);
             }
         }
+        soccer_trajectory_export_write(&transitions);
         transitions
     }
 }
