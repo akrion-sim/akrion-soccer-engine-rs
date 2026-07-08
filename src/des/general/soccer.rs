@@ -20126,7 +20126,10 @@ pub(crate) struct PendingPass {
     /// actually applied to this pass's analytic lead target (the "action" for RWR). When the pass
     /// resolves it is emitted as an [`MpcObjectiveSample`] whose reward is the delayed
     /// completion/progression advantage. `None` ⇒ the head was off/absent at launch (no sample).
-    mpc_objective: Option<(Vec<f32>, Vec2)>,
+    /// The third element is the signed learned BEND (yards) applied to this pass's curl
+    /// (`DD_SOCCER_ENABLE_LEARNED_CURVE`); `0.0` when the bend axis is off, so the RWR credit still
+    /// matches the action actually taken.
+    mpc_objective: Option<(Vec<f32>, Vec2, f64)>,
 }
 
 /// A goal counts as assisted only when the setting-up completed pass landed within this many
@@ -38815,6 +38818,49 @@ pub(crate) fn mpc_objective_explore_sigma_yards() -> f64 {
             .filter(|v| v.is_finite())
             .map(|v| v.clamp(0.0, MPC_OBJECTIVE_MAX_RESIDUAL_YARDS))
             .unwrap_or(MPC_OBJECTIVE_EXPLORE_SIGMA_YARDS)
+    };
+    #[cfg(test)]
+    {
+        read()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static SIGMA: OnceLock<f64> = OnceLock::new();
+        *SIGMA.get_or_init(read)
+    }
+}
+
+/// Whether the executor head carries the learnable SIGNED-BEND axis (3rd output) AND applies it to
+/// pass curl — the "knight-move" hook (`DD_SOCCER_ENABLE_LEARNED_CURVE`). Requires the executor head
+/// itself (`DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE`) to be on to have any effect; default-off ⇒
+/// byte-identical (head stays 2-output, curl stays analytic). Also flips the MPC pass-lane
+/// interception check to sample the CURVED arc so a learned bend around a straight-lane defender is
+/// scored feasible instead of blocked.
+pub fn learned_curve_enabled() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_LEARNED_CURVE")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_LEARNED_CURVE"))
+    }
+}
+
+/// Exploration std-dev (yards) for the executor head's learned-bend axis at capture time,
+/// overridable via `SOCCER_MPC_OBJECTIVE_BEND_EXPLORE_SIGMA`. Clamped to `[0, MAX_BEND]`.
+/// Default = [`MPC_OBJECTIVE_BEND_EXPLORE_SIGMA_YARDS`].
+pub(crate) fn mpc_objective_bend_explore_sigma_yards() -> f64 {
+    let read = || {
+        std::env::var("SOCCER_MPC_OBJECTIVE_BEND_EXPLORE_SIGMA")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.0, MPC_OBJECTIVE_MAX_BEND_YARDS))
+            .unwrap_or(MPC_OBJECTIVE_BEND_EXPLORE_SIGMA_YARDS)
     };
     #[cfg(test)]
     {

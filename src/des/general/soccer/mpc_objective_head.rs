@@ -33,6 +33,16 @@ const MPC_OBJECTIVE_HIDDEN_UNITS: usize = 32;
 /// Hard bound (yards) on the residual — the guardrail that keeps the executor inside the
 /// "policy owns WHERE" contract. Codex round-9: ~1.0–1.5 yd for a first cut.
 pub const MPC_OBJECTIVE_MAX_RESIDUAL_YARDS: f64 = 1.5;
+/// Hard bound (yards) on the learned SIGNED bend — the 3rd output dim, present only when the head
+/// is built bend-enabled (`DD_SOCCER_ENABLE_LEARNED_CURVE`). Positive = curl one way, negative the
+/// other; `|value|` = lateral yards the flight bows off the straight chord. Sized so a warmed head
+/// can steer a pass/shot AROUND a defender on the straight lane (the "knight-move"), while the ball
+/// physics still clamp the realised curl to `MAX_BALL_CURL_YPS2`.
+pub const MPC_OBJECTIVE_MAX_BEND_YARDS: f64 = 6.0;
+/// Exploration std-dev (yards) for the bend axis. Larger than the aim-residual sigma because bend
+/// only helps in the minority of states with a blocked straight lane, so it needs a wider search to
+/// find the states where curling pays.
+pub const MPC_OBJECTIVE_BEND_EXPLORE_SIGMA_YARDS: f64 = 1.2;
 /// Default exploration std-dev (yards) added to the greedy residual at capture time. Without
 /// exploration the RWR loop only ever imitates the residual it already took, so it can never
 /// DISCOVER a better aim — the jitter is what gives the contextual bandit a gradient to climb.
@@ -52,6 +62,10 @@ pub const MPC_OBJECTIVE_SAMPLE_CAP: usize = 4096;
 pub struct MpcObjectiveSample {
     pub features: Vec<f32>,
     pub applied_residual: Vec2,
+    /// Signed bend (yards) actually applied at execution, or `0.0` when the head is not
+    /// bend-enabled. Trained as the 3rd output dim exactly like the aim residual: a completed pass
+    /// reinforces the bend taken, an interception is skipped (RWR keeps positive advantage only).
+    pub applied_bend: f64,
     pub reward: f64,
 }
 
@@ -84,18 +98,30 @@ pub struct SoccerMpcObjectiveHead {
     network: FeedForwardNetwork,
     training_steps: usize,
     last_loss: Option<f64>,
+    /// When true the network has a 3rd output dim = signed bend (yards). When false the head is
+    /// byte-identical to the original 2-output aim/lead head — same shape, same RNG consumption,
+    /// so the `DD_SOCCER_ENABLE_LEARNED_CURVE`-off path is unchanged.
+    bend_enabled: bool,
 }
 
 impl SoccerMpcObjectiveHead {
+    /// Original 2-output (aim/lead only) head. Bend disabled — byte-identical to prior behavior.
     pub fn new(seed: u32) -> Self {
+        Self::new_with_bend(seed, false)
+    }
+
+    /// Build the head with an optional 3rd learnable bend output. `bend_enabled=false` reproduces
+    /// [`Self::new`] exactly (output_dim 2, same init draw order).
+    pub fn new_with_bend(seed: u32, bend_enabled: bool) -> Self {
         let mut rng = mulberry32(seed ^ 0x4D50_4301);
+        let output_dim = if bend_enabled { 3 } else { 2 };
         let network = FeedForwardNetwork::random(
             &RandomNetworkSpec {
                 input_dim: MPC_OBJECTIVE_FEATURE_DIM,
                 hidden_layers: vec![MPC_OBJECTIVE_HIDDEN_UNITS],
-                output_dim: 2,
+                output_dim,
                 hidden_activation: ActivationName::Relu,
-                // Tanh → each output in (-1, 1); scaled by MAX_RESIDUAL for a hard yard bound.
+                // Tanh → each output in (-1, 1); scaled by MAX_RESIDUAL / MAX_BEND for a hard bound.
                 output_activation: ActivationName::Tanh,
                 weight_scale: None,
             },
@@ -105,7 +131,13 @@ impl SoccerMpcObjectiveHead {
             network,
             training_steps: 0,
             last_loss: None,
+            bend_enabled,
         }
+    }
+
+    /// Whether this head carries the learnable bend (3rd output) axis.
+    pub fn bend_enabled(&self) -> bool {
+        self.bend_enabled
     }
 
     pub fn training_steps(&self) -> usize {
@@ -185,6 +217,38 @@ impl SoccerMpcObjectiveHead {
         })
     }
 
+    /// Greedy signed bend (yards) for the captured features, or `None` when the head is not
+    /// bend-enabled or on malformed input. Positive/negative = curl side; `|value|` = lateral yards
+    /// the flight bows off the straight chord. The caller maps this to the kick's curve direction +
+    /// `curve_bend_yards`, which the existing lowering turns into `curl_acceleration`.
+    pub fn predict_bend(&self, features: &[f32]) -> Option<f64> {
+        if !self.bend_enabled || features.len() != MPC_OBJECTIVE_FEATURE_DIM {
+            return None;
+        }
+        let input: Vec<f64> = features.iter().map(|&v| f64::from(v)).collect();
+        let out = self.network.predict(&input);
+        let bend = *out.get(2)?;
+        if !bend.is_finite() {
+            return None;
+        }
+        Some(bend.clamp(-1.0, 1.0) * MPC_OBJECTIVE_MAX_BEND_YARDS)
+    }
+
+    /// Exploration wrapper around [`predict_bend`] — one standard-normal draw from the match RNG,
+    /// scaled by `sigma_yards`, re-clamped to the hard bend bound. Capture the RETURNED bend as the
+    /// RWR `applied_bend`. `None` when the head is not bend-enabled or on malformed input; non-finite
+    /// noise falls back to the greedy bend (never a NaN target).
+    pub fn explore_bend(&self, features: &[f32], sigma_yards: f64, noise: f64) -> Option<f64> {
+        let base = self.predict_bend(features)?;
+        let sigma = if sigma_yards.is_finite() {
+            sigma_yards.max(0.0)
+        } else {
+            0.0
+        };
+        let jitter = if noise.is_finite() { noise * sigma } else { 0.0 };
+        Some((base + jitter).clamp(-MPC_OBJECTIVE_MAX_BEND_YARDS, MPC_OBJECTIVE_MAX_BEND_YARDS))
+    }
+
     /// Reward-weighted regression: nudge the head toward residuals that earned positive advantage,
     /// with the learning rate scaled by a squashed advantage (a contextual bandit, not full policy
     /// gradient — lower variance, harder to destabilize). Returns the number of steps applied.
@@ -204,9 +268,17 @@ impl SoccerMpcObjectiveHead {
             let target_x =
                 (sample.applied_residual.x / MPC_OBJECTIVE_MAX_RESIDUAL_YARDS).clamp(-0.999, 0.999);
             let lr = (base_lr * weight).min(base_lr);
+            // Target vector matches the network's output_dim: 2 (aim only) or 3 (aim + bend).
+            let targets: Vec<f64> = if self.bend_enabled {
+                let target_bend =
+                    (sample.applied_bend / MPC_OBJECTIVE_MAX_BEND_YARDS).clamp(-0.999, 0.999);
+                vec![target_y, target_x, target_bend]
+            } else {
+                vec![target_y, target_x]
+            };
             let _ = self
                 .network
-                .train_sample_clipped(&input, &[target_y, target_x], lr, 4.0);
+                .train_sample_clipped(&input, &targets, lr, 4.0);
             self.training_steps += 1;
             trained += 1;
         }
@@ -239,11 +311,13 @@ mod tests {
         let good = MpcObjectiveSample {
             features: vec![0.3f32; MPC_OBJECTIVE_FEATURE_DIM],
             applied_residual: Vec2 { x: 0.8, y: 1.0 },
+            applied_bend: 0.0,
             reward: 1.5,
         };
         let bad = MpcObjectiveSample {
             features: vec![0.3f32; MPC_OBJECTIVE_FEATURE_DIM],
             applied_residual: Vec2 { x: -0.8, y: -1.0 },
+            applied_bend: 0.0,
             reward: -1.5,
         };
         let trained = head.train_rwr(&[good, bad], 0.05);
@@ -261,6 +335,47 @@ mod tests {
             .expect("residual");
         assert!(residual.x.abs() <= MPC_OBJECTIVE_MAX_RESIDUAL_YARDS + 1e-9);
         assert!(residual.y.abs() <= MPC_OBJECTIVE_MAX_RESIDUAL_YARDS + 1e-9);
+    }
+
+    #[test]
+    fn bend_axis_only_present_when_enabled() {
+        // Default head has no bend axis: predict_bend is None, byte-identical 2-output behavior.
+        let plain = SoccerMpcObjectiveHead::new(21);
+        assert!(!plain.bend_enabled());
+        let features = vec![0.4f32; MPC_OBJECTIVE_FEATURE_DIM];
+        assert!(plain.predict_bend(&features).is_none());
+
+        // Bend-enabled head yields a hard-bounded signed bend.
+        let bent = SoccerMpcObjectiveHead::new_with_bend(21, true);
+        assert!(bent.bend_enabled());
+        let bend = bent.predict_bend(&features).expect("bend");
+        assert!(bend.abs() <= MPC_OBJECTIVE_MAX_BEND_YARDS + 1e-9);
+        // Explore stays inside the bound under absurd jitter.
+        let explored = bent
+            .explore_bend(&features, 100.0, 50.0)
+            .expect("explored bend");
+        assert!(explored.abs() <= MPC_OBJECTIVE_MAX_BEND_YARDS + 1e-9);
+    }
+
+    #[test]
+    fn rwr_trains_bend_axis_on_positive_advantage() {
+        let mut head = SoccerMpcObjectiveHead::new_with_bend(23, true);
+        let sample = MpcObjectiveSample {
+            features: vec![0.3f32; MPC_OBJECTIVE_FEATURE_DIM],
+            applied_residual: Vec2 { x: 0.5, y: 0.5 },
+            applied_bend: MPC_OBJECTIVE_MAX_BEND_YARDS * 0.8,
+            reward: 1.5,
+        };
+        let before = head.predict_bend(&sample.features).expect("bend before");
+        // Many RWR steps toward a strong positive bend should move the prediction that way.
+        for _ in 0..200 {
+            head.train_rwr(std::slice::from_ref(&sample), 0.1);
+        }
+        let after = head.predict_bend(&sample.features).expect("bend after");
+        assert!(
+            after > before,
+            "positive-advantage bend target should raise the predicted bend: {before} -> {after}"
+        );
     }
 
     #[test]
