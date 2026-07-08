@@ -41813,6 +41813,7 @@ fn decision_context_records_dribble_touch_bucket_and_distance() {
         )),
         facing: facing_bucket_from_vector(target - origin),
         dribble_touch: Some(touch),
+        receiver_descriptor: None,
     };
 
     let context = soccer_decision_context_for(
