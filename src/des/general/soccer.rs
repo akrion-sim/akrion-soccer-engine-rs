@@ -5569,6 +5569,15 @@ const MATCH_OUTCOME_WIN_REWARD_POINTS: f64 = 200.0;
 const MATCH_OUTCOME_DRAW_REWARD_POINTS: f64 = 0.0;
 const MATCH_OUTCOME_PER_GOAL_MARGIN_POINTS: f64 = 15.0;
 const MATCH_OUTCOME_MARGIN_CAP_GOALS: f64 = 5.0;
+/// Gate + sizing for the terminal CHANCE-QUALITY bonus folded into the match-outcome label.
+/// The diagnostic (`docs/how-to-climb-codex-conversation.md`) showed draws — 45% of games —
+/// carry a near-zero, non-monotonic learning signal w.r.t. chances created, so a chance-rich
+/// draw is indistinguishable from a sterile one. This zero-sum, capped shots-on-target
+/// differential gives draws (and wins/losses) a graded "created danger" gradient. Off ⇒ 0.0
+/// (byte-identical), so the existing score-only label is unchanged unless the gate is set.
+const MATCH_OUTCOME_CHANCE_QUALITY_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_CHANCE_QUALITY_REWARD";
+const MATCH_OUTCOME_CHANCE_QUALITY_POINTS_PER_SOT: f64 = 15.0;
+const MATCH_OUTCOME_CHANCE_QUALITY_SOT_CAP: f64 = 4.0;
 // INSTANTANEOUS (single-frame) player speed ceiling: 25mph ≈ 12.22yps, plus a hair of
 // numerical margin. A human sprints at most ~25mph in a moment.
 const SOCCER_PHYSICS_PLAYER_MAX_SPEED_YPS: f64 = 12.45;
