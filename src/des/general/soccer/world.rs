@@ -37,6 +37,7 @@ const NEURAL_MCTS_DISCRETIZED_KICK_SELECTION_FLOOR: f64 = 0.0;
 const NEURAL_MCTS_DISCRETIZED_KICK_SELECTION_MAX_SCORE_REGRESSION: f64 = 1.50;
 const NEURAL_MCTS_DISCRETIZED_KICK_EXPLORATION_MAX_SCORE_REGRESSION: f64 = 1.50;
 const NEURAL_MCTS_DISCRETIZED_KICK_EXPLORATION_MIN_PRIOR: f64 = 0.04;
+const NEURAL_MCTS_SHOT_BUCKET_MIN_CANDIDATE_BONUS: f64 = 0.08;
 const NEURAL_MCTS_PASS_LIKE_NON_PASS_MARGIN: f64 = 0.55;
 const NEURAL_MCTS_MIN_PASS_LIKE_ROOT_CANDIDATES: usize = 0;
 const NEURAL_MCTS_MIN_DRIBBLE_ROOT_CANDIDATES: usize = 0;
@@ -132,6 +133,15 @@ fn learned_mpc_metric_env(name: &str, default: f64, min: f64, max: f64) -> f64 {
         .filter(|value| value.is_finite())
         .unwrap_or(default)
         .clamp(min, max)
+}
+
+fn neural_mcts_shot_bucket_min_candidate_bonus() -> f64 {
+    learned_mpc_metric_env(
+        "SOCCER_NEURAL_MCTS_SHOT_BUCKET_MIN_CANDIDATE_BONUS",
+        NEURAL_MCTS_SHOT_BUCKET_MIN_CANDIDATE_BONUS,
+        0.0,
+        0.45,
+    )
 }
 
 fn neural_mcts_distillation_advantage_noise_tolerance() -> f64 {
@@ -7890,6 +7900,33 @@ mod tests {
     }
 
     #[test]
+    fn neural_authoritative_marginal_shot_bucket_without_mcts_stays_normal() {
+        let mut transition = policy_test_transition_with_mcts(false);
+        transition.action = "shoot-kp8".to_string();
+        transition.reward = 0.12;
+        transition.decision_context.shot_mpc_accuracy_probability = 0.50;
+        transition.decision_context.shot_mpc_qp_target_fit = 0.50;
+        transition.decision_context.shot_mpc_goal_probability = 0.30;
+        transition.decision_context.chosen_action_mpc_feasibility = 0.80;
+        transition.decision_context.chosen_action_control_cost = 0.20;
+
+        assert!(
+            neural_mcts_shot_mpc_candidate_bonus(&transition) > 0.0,
+            "fixture should be a marginal positive shot prior"
+        );
+        assert!(
+            !SoccerMatch::neural_mcts_transition_context_is_executable(&transition),
+            "MCTS-off authoritative selection should require a strong shot-quality prior"
+        );
+        assert_eq!(
+            soccer_actor_advantage_with_planner_distillation(&transition, 0.01),
+            0.01,
+            "marginal learned shot buckets should not become planner-teacher samples"
+        );
+        assert_eq!(soccer_actor_priority_weight(&transition, 0.01), 1.0);
+    }
+
+    #[test]
     fn neural_mcts_shot_bucket_distillation_requires_positive_mpc_shot_prior() {
         let mut transition = policy_test_transition_with_mcts(true);
         transition.action = "shoot-kp8".to_string();
@@ -8665,6 +8702,11 @@ fn soccer_actor_mcts_distillation_technical_trace(transition: &SoccerLearningTra
         return execution_fit >= 0.58;
     }
     if matches!(action, "shoot" | "first-time-shot" | "first-time-header") {
+        if learned_discretized_kick_speed_bucket_for_action_label(&transition.action).is_some()
+            && matches!(action, "shoot" | "first-time-shot")
+        {
+            return neural_mcts_shot_bucket_has_quality_prior(transition);
+        }
         let accuracy = finite_unit_interval(context.shot_mpc_accuracy_probability);
         let target_fit = finite_unit_interval(context.shot_mpc_qp_target_fit);
         let goal_probability = finite_unit_interval(context.shot_mpc_goal_probability);
@@ -8702,7 +8744,7 @@ fn soccer_actor_mcts_distillation_discretized_kick_trace(
     }
     let action = normalize_soccer_action_label(&transition.action);
     matches!(action, "shoot" | "first-time-shot")
-        && neural_mcts_shot_mpc_candidate_bonus(transition) > 0.0
+        && neural_mcts_shot_bucket_has_quality_prior(transition)
 }
 
 fn soccer_actor_mcts_distillation_replacement_trace(transition: &SoccerLearningTransition) -> bool {
@@ -8813,6 +8855,10 @@ fn neural_mcts_shot_mpc_candidate_bonus(transition: &SoccerLearningTransition) -
         + feasibility * 0.12
         + low_cost * 0.06;
     (shot_fit - 0.45).clamp(-0.35, 0.45) * weight
+}
+
+fn neural_mcts_shot_bucket_has_quality_prior(transition: &SoccerLearningTransition) -> bool {
+    neural_mcts_shot_mpc_candidate_bonus(transition) >= neural_mcts_shot_bucket_min_candidate_bonus()
 }
 
 fn neural_mcts_pitch_value_success_probability(transition: &SoccerLearningTransition) -> f64 {
@@ -12289,7 +12335,7 @@ impl SoccerMatch {
         if learned_discretized_kick_speed_bucket_for_action_label(&transition.action).is_some()
             && matches!(label, "shoot" | "first-time-shot")
         {
-            return neural_mcts_shot_mpc_candidate_bonus(transition) > 0.0;
+            return neural_mcts_shot_bucket_has_quality_prior(transition);
         }
         true
     }
