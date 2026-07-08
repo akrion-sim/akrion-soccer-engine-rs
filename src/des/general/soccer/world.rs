@@ -32763,7 +32763,7 @@ impl SoccerMatch {
         // even when that head is off), so it sits BEFORE the `learn_features` guard below. RWR only
         // trains on positive advantage, so a completed + progressive pass reinforces its residual
         // while an interception (negative) is skipped — the head learns aims that actually connect.
-        if let Some((features, residual, bend)) = pass.mpc_objective.as_ref() {
+        if let Some((features, residual, applied_bend)) = pass.mpc_objective.as_ref() {
             if features.len() == MPC_OBJECTIVE_FEATURE_DIM {
                 let forward = ((pass.intended_target.y - pass.origin.y) * pass.team.attack_dir()
                     / 20.0)
@@ -32776,7 +32776,7 @@ impl SoccerMatch {
                 self.mpc_objective_samples.push(MpcObjectiveSample {
                     features: features.clone(),
                     applied_residual: *residual,
-                    applied_bend: *bend,
+                    applied_bend: *applied_bend,
                     reward,
                 });
                 if self.mpc_objective_samples.len() > MPC_OBJECTIVE_SAMPLE_CAP {
