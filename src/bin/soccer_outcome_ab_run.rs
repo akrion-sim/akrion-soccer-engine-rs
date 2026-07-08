@@ -300,6 +300,48 @@ fn eval(candidate_path: &str, baseline_path: &str, games: usize, minutes: f64, h
     for reason in &verdict.reasons {
         println!("  - {reason}");
     }
+
+    // ---- Forward-pass advancement: the dense progressive-play climb metric ----
+    // Completed forward passes are frequent (dozens/game), directly measure ball progression, and
+    // can't be farmed the way shots can. On a PAIRED head-to-head sample this gives a tight
+    // confidence bound that detects a real climb the sparse goal margin would call a plateau.
+    let n = forward_pass_diffs.len();
+    if n > 0 {
+        let n_f = n as f64;
+        let mean_diff = forward_pass_diffs.iter().sum::<f64>() / n_f;
+        let variance = if n > 1 {
+            forward_pass_diffs
+                .iter()
+                .map(|d| (d - mean_diff).powi(2))
+                .sum::<f64>()
+                / (n_f - 1.0)
+        } else {
+            0.0
+        };
+        let std_error = (variance / n_f).sqrt();
+        // 95% normal lower confidence bound on the mean paired differential.
+        let lower_bound = mean_diff - 1.96 * std_error;
+        let candidate_per_game = candidate_forward_total as f64 / n_f;
+        let baseline_per_game = baseline_forward_total as f64 / n_f;
+        println!("\n===== FORWARD-PASS ADVANCEMENT (dense progressive-play climb metric) =====");
+        println!(
+            "completed forward passes/game: candidate {candidate_per_game:.1}  baseline {baseline_per_game:.1}  Δ {:+.2}/game",
+            candidate_per_game - baseline_per_game
+        );
+        println!(
+            "paired per-game Δ: mean {mean_diff:+.2}, 95% lower bound {lower_bound:+.2} over {n} games"
+        );
+        let advancement = if lower_bound > 0.0 {
+            "CLIMB — candidate significantly out-progresses the baseline (lower bound > 0)"
+        } else if mean_diff > 0.0 {
+            "directional climb — more forward passes on average, not yet significant (need more games)"
+        } else {
+            "no advancement on forward passes"
+        };
+        println!("ADVANCEMENT: {advancement}");
+    } else {
+        println!("\n[advancement] no completed fixtures to measure forward-pass progression");
+    }
 }
 
 fn main() {
