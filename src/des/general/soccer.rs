@@ -12731,7 +12731,19 @@ impl SoccerQPolicy {
             .as_ref()
             .and_then(|target| target.grid)
         {
-            let target_key = SoccerQTargetKey::from_state_action_grid(state, &action, grid);
+            // Credit the receiver-descriptor line when the trace carried one (learned-pass-receiver
+            // gate was on at decision time); otherwise Unspecified ⇒ grid-only key (parity).
+            let receiver_descriptor = transition
+                .action_target
+                .as_ref()
+                .and_then(|target| target.receiver_descriptor)
+                .unwrap_or(RECEIVER_DESCRIPTOR_UNSPECIFIED);
+            let target_key = SoccerQTargetKey::from_state_action_grid_receiver(
+                state,
+                &action,
+                grid,
+                receiver_descriptor,
+            );
             let old_target = self
                 .target_values
                 .get(&target_key)
