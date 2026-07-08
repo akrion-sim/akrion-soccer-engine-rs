@@ -13049,13 +13049,8 @@ impl SoccerMatch {
             neural_mcts_candidate_count: 0,
             neural_mcts_discretized_kick_candidate_count: 0,
             neural_mcts_root_discretized_kick_candidate_count: 0,
-<<<<<<< HEAD
             neural_mcts_dribble_candidate_count: 0,
             neural_mcts_root_dribble_candidate_count: 0,
-        })
-    }
-
-=======
         })
     }
 
