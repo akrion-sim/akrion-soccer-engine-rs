@@ -35585,6 +35585,28 @@ pub(crate) fn dd_soccer_enable_advantage_normalization() -> bool {
 /// can absorb it) and (b) dominates baseline-free heads (the keeper actor uses the raw
 /// reward as its advantage). Standardization removes the common-mode label and fixes the
 /// step scale, preserving only the realised win-vs-loss contrast. Off ⇒ byte-identical.
+/// STD-ONLY advantage normalization. The default standardization is **per-episode** zero-mean /
+/// unit-variance — but because the batch is a single game, subtracting the episode mean removes
+/// the whole-game outcome common-mode (the flat win/draw/loss label the terminal reward broadcasts
+/// onto every transition), so a won game's policy gradient is normalized to look identical to a
+/// lost one. That is a diagnosed root cause of the draw-ceiling plateau: the policy can reduce
+/// variance but never learns "win the game." When this gate is on, standardization divides by the
+/// batch std but does NOT subtract the mean, preserving the win-vs-loss common-mode (still scaled,
+/// so the step size stays bounded). Default-OFF ⇒ byte-identical zero-mean behaviour; opt-in via
+/// `DD_SOCCER_ENABLE_ADVANTAGE_STD_ONLY=1`. Read once per process.
+pub(crate) fn dd_soccer_enable_advantage_std_only() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_ADVANTAGE_STD_ONLY")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_ADVANTAGE_STD_ONLY"))
+    }
+}
+
 pub(crate) fn dd_soccer_standardize_policy_advantages() -> bool {
     dd_soccer_enable_advantage_normalization() || match_outcome_reward_enabled()
 }
