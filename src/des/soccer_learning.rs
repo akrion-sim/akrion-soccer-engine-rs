@@ -5456,6 +5456,7 @@ fn inject_policy_plateau_novelty_actions(
                 target_tactical_cell_id: -1,
                 target_macro_cell_id: -1,
                 target_root_cell_id: -1,
+                receiver_descriptor: RECEIVER_DESCRIPTOR_UNSPECIFIED,
             };
             if accumulators.contains_key(&novelty_key) {
                 continue;
