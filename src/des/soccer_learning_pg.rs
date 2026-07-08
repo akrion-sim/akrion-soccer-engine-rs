@@ -132,11 +132,13 @@ const SOCCER_PG_CONNECT_MAX_BACKOFF_MILLIS: u64 = 5_000;
 const SOCCER_POLICY_ENTRY_PAGE_SIZE: i64 = 4096;
 const SOCCER_POLICY_ENTRY_ON_CONFLICT_CLAUSE: &str =
     " on conflict (policy_version_id, team, entry_kind, state_hash, action, \
-target_fine_cell_id, target_tactical_cell_id, target_macro_cell_id, target_root_cell_id) \
+target_fine_cell_id, target_tactical_cell_id, target_macro_cell_id, target_root_cell_id, \
+receiver_descriptor) \
 do nothing";
 const SOCCER_RUN_DELTA_ON_CONFLICT_CLAUSE: &str =
     " on conflict (run_id, team, entry_kind, state_hash, action, \
-target_fine_cell_id, target_tactical_cell_id, target_macro_cell_id, target_root_cell_id) \
+target_fine_cell_id, target_tactical_cell_id, target_macro_cell_id, target_root_cell_id, \
+receiver_descriptor) \
 do nothing";
 const SOCCER_MOMENT_EMBEDDING_SEARCH_SQL: &str = "\
 select team, action, reward_micros, value_micros, tick, \
