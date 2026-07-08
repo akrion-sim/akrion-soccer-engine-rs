@@ -245,7 +245,11 @@ impl SoccerMpcObjectiveHead {
         } else {
             0.0
         };
-        let jitter = if noise.is_finite() { noise * sigma } else { 0.0 };
+        let jitter = if noise.is_finite() {
+            noise * sigma
+        } else {
+            0.0
+        };
         Some((base + jitter).clamp(-MPC_OBJECTIVE_MAX_BEND_YARDS, MPC_OBJECTIVE_MAX_BEND_YARDS))
     }
 
@@ -276,9 +280,7 @@ impl SoccerMpcObjectiveHead {
             } else {
                 vec![target_y, target_x]
             };
-            let _ = self
-                .network
-                .train_sample_clipped(&input, &targets, lr, 4.0);
+            let _ = self.network.train_sample_clipped(&input, &targets, lr, 4.0);
             self.training_steps += 1;
             trained += 1;
         }

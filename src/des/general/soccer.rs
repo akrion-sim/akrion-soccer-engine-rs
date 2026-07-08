@@ -59401,15 +59401,49 @@ fn goal_attack_shot_is_required(observation: &SoccerPomdpObservation, role: Play
     must_shoot_near_goal(observation, role) || striker_shot_window_is_qualified(observation, role)
 }
 
+fn forward_pass_climb_curriculum_enabled() -> bool {
+    soccer_env_flag_enabled("DD_SOCCER_FORWARD_PASS_CLIMB_CURRICULUM")
+}
+
+fn forward_pass_climb_curriculum_support(
+    observation: &SoccerPomdpObservation,
+    role: PlayerRole,
+) -> bool {
+    if role == PlayerRole::Goalkeeper || !forward_pass_climb_curriculum_enabled() {
+        return false;
+    }
+    if observation.yards_to_goal <= SUPPORT_RELAX_FORCED_SHOT_MIN_YARDS {
+        return false;
+    }
+    let quick_forward = observation.quick_forward_pass_target.is_some()
+        && observation.quick_forward_pass_value >= 0.35;
+    let forward_quality = observation
+        .best_forward_pass_option_quality
+        .max(observation.best_forward_pass_receiver_openness)
+        .max(observation.expected_pass_completion * 0.72)
+        .clamp(0.0, 1.0);
+    let lane_ok = observation.floor_pass_lane_score >= 0.24
+        || observation.expected_pass_completion >= 0.40
+        || quick_forward;
+    observation.visible_forward_pass_options > 0
+        && lane_ok
+        && (quick_forward || forward_quality >= 0.32)
+}
+
 fn goal_attack_shot_can_yield_to_support(
     observation: &SoccerPomdpObservation,
     role: PlayerRole,
 ) -> bool {
     if role == PlayerRole::Goalkeeper
         || !goal_attack_shot_is_required(observation, role)
-        || clean_twenty_yard_shot_is_qualified(observation, role)
         || observation.yards_to_goal <= SUPPORT_RELAX_FORCED_SHOT_MIN_YARDS
     {
+        return false;
+    }
+    if forward_pass_climb_curriculum_support(observation, role) {
+        return true;
+    }
+    if clean_twenty_yard_shot_is_qualified(observation, role) {
         return false;
     }
     let nearby_support = observation.open_support_outlets > 0
