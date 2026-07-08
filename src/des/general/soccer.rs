@@ -12961,6 +12961,26 @@ impl SoccerQPolicy {
         }
     }
 
+    /// As [`Self::set_target_value`] but for a specific encoded [`ReceiverDescriptor`] — the
+    /// learned-pass-receiver head's per-receiver value. Used to seed / test that line.
+    pub(crate) fn set_target_value_with_receiver(
+        &mut self,
+        state: SoccerQStateKey,
+        action: &str,
+        grid: PitchGridAddress,
+        receiver_descriptor: i32,
+        value: f64,
+    ) -> bool {
+        let key =
+            SoccerQTargetKey::from_state_action_grid_receiver(state, action, grid, receiver_descriptor);
+        if self.insert_target_value(key.clone(), value) {
+            self.target_visits.entry(key).or_insert(1);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn set_target_value_for_snapshot(
         &mut self,
         snapshot: &WorldSnapshot,
