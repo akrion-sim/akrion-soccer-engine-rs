@@ -10293,16 +10293,6 @@ impl SoccerMatch {
         let target_scale = self.config.neural_learning.sanitized_target_scale();
         let target_clip = self.config.neural_learning.sanitized_target_clip();
         let tick_rewards = soccer_marl_tick_rewards(transitions);
-<<<<<<< ours
-        let successor_indices = Self::neural_successor_indices(transitions);
-        transitions
-            .iter()
-            .enumerate()
-            .filter(|(_, transition)| !self.neural_team_frozen(transition.team))
-            .filter(|(_, transition)| team_filter.map_or(true, |team| transition.team == team))
-            .filter_map(|(transition_index, transition)| {
-                let adjusted_reward = soccer_marl_adjusted_reward(
-=======
         // Novelty exploration bonus (gate-two): count (abstract-state-bucket, action-family) pairs
         // in this batch so rarely-tried pairs get an optimism bonus, nudging the value — and thus
         // the value-ranked policy — to try under-explored actions instead of only analytic ones.
@@ -10313,12 +10303,14 @@ impl SoccerMatch {
         } else {
             (std::collections::HashMap::new(), 0usize, 0usize)
         };
+        // Frozen-team filter preserved from the base builder: a frozen team must not contribute
+        // training samples even under the novelty/self-bootstrap path.
         let mut samples: Vec<SoccerNeuralTrainingSample> = transitions
             .iter()
+            .filter(|transition| !self.neural_team_frozen(transition.team))
             .filter(|transition| team_filter.map_or(true, |team| transition.team == team))
             .filter_map(|transition| {
                 let mut adjusted_reward = soccer_marl_adjusted_reward(
->>>>>>> theirs
                     transition,
                     &tick_rewards,
                     &self.config.neural_learning,
