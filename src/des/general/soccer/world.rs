@@ -13288,6 +13288,45 @@ impl SoccerMatch {
                     target_point: snapshot.player_position(target_player),
                     mpc_replan: None,
                 });
+                // Pass-to-space variant (gated, Codex round-10 shape): same receiver, but the ball
+                // is led into the anticipated reception point ahead of them, so the CRITIC scores
+                // feet-vs-run-onto and owns that spatial choice. Keeps `target_player` bound so pass
+                // MPC/receipt/concede-veto logic is unchanged. Skipped when the lead coincides with
+                // the feet target (no distinct candidate to score). Default OFF ⇒ byte-identical.
+                if dd_soccer_enable_neural_pass_space() {
+                    if let (Some(passer), Some(receiver_position)) = (
+                        snapshot.players.iter().find(|p| p.id == player_id),
+                        snapshot.player_position(target_player),
+                    ) {
+                        let flight = pass_like_action_flight(prefix).unwrap_or(PassFlight::Floor);
+                        let passer_position =
+                            snapshot.player_position(player_id).unwrap_or(receiver_position);
+                        let is_cross = pass_would_be_cross(
+                            passer_position,
+                            receiver_position,
+                            team,
+                            snapshot.field_width,
+                            snapshot.field_length,
+                        );
+                        let nominal_speed =
+                            pass_speed_yps_from_power(0.68, flight, is_cross, &passer.skills);
+                        if let Some(space_point) = snapshot.anticipated_pass_reception_point(
+                            player_id,
+                            target_player,
+                            flight,
+                            nominal_speed,
+                        ) {
+                            if space_point.distance(receiver_position) > 1.0 {
+                                plans.push(SoccerLearnedPlan {
+                                    action: base_action.clone(),
+                                    target_player: Some(target_player),
+                                    target_point: Some(space_point),
+                                    mpc_replan: None,
+                                });
+                            }
+                        }
+                    }
+                }
                 if dd_soccer_enable_discretized_kick() {
                     let buckets = if prefix == "aerial-pass" {
                         &NEURAL_MCTS_AERIAL_KICK_POWER_BUCKETS[..]
