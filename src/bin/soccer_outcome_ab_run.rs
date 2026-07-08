@@ -40,6 +40,27 @@ fn parse_hex(s: Option<&String>, default: u32) -> u32 {
     .unwrap_or(default)
 }
 
+fn env_f64(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(default)
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
 /// Train a candidate by inline self-play carry-forward, honoring whatever env gates
 /// this process was launched with, and return the final value/actor snapshot.
 fn train(out_path: &str, games: usize, minutes: f64, seed_base: u32) {
@@ -49,13 +70,24 @@ fn train(out_path: &str, games: usize, minutes: f64, seed_base: u32) {
          match_outcome_reward={}",
         match_outcome_reward_enabled()
     );
-    let neural = SoccerNeuralLearningConfig {
+    let mut neural = SoccerNeuralLearningConfig {
         enabled: true,
         backend: SoccerNeuralLearningBackend::Inline,
         marl_algorithm: SoccerMarlAlgorithm::Mappo,
         mappo_team_reward_share: DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
         ..SoccerNeuralLearningConfig::default()
     };
+    // Value-target window / capacity overrides for the climb factorial. Default = unchanged, so
+    // an arm that sets none of these is byte-identical to before.
+    neural.target_scale = env_f64("SOCCER_NEURAL_TARGET_SCALE", neural.target_scale);
+    neural.target_clip = env_f64("SOCCER_NEURAL_TARGET_CLIP", neural.target_clip);
+    neural.target_popart_enabled =
+        env_bool("SOCCER_NEURAL_TARGET_POPART", neural.target_popart_enabled);
+    neural.hidden_units = env_usize("SOCCER_NEURAL_HIDDEN_UNITS", neural.hidden_units);
+    println!(
+        "[train] neural window: target_scale={} target_clip={} popart={} hidden_units={}",
+        neural.target_scale, neural.target_clip, neural.target_popart_enabled, neural.hidden_units
+    );
     let mut policies = Arc::new(SoccerTeamQPolicies::new(SoccerQPolicyOptions::default()));
     let mut snapshot: Option<SoccerNeuralNetworkSnapshot> = None;
     let started = Instant::now();

@@ -5569,6 +5569,15 @@ const MATCH_OUTCOME_WIN_REWARD_POINTS: f64 = 200.0;
 const MATCH_OUTCOME_DRAW_REWARD_POINTS: f64 = 0.0;
 const MATCH_OUTCOME_PER_GOAL_MARGIN_POINTS: f64 = 15.0;
 const MATCH_OUTCOME_MARGIN_CAP_GOALS: f64 = 5.0;
+/// Gate + sizing for the terminal CHANCE-QUALITY bonus folded into the match-outcome label.
+/// The diagnostic (`docs/how-to-climb-codex-conversation.md`) showed draws — 45% of games —
+/// carry a near-zero, non-monotonic learning signal w.r.t. chances created, so a chance-rich
+/// draw is indistinguishable from a sterile one. This zero-sum, capped shots-on-target
+/// differential gives draws (and wins/losses) a graded "created danger" gradient. Off ⇒ 0.0
+/// (byte-identical), so the existing score-only label is unchanged unless the gate is set.
+const MATCH_OUTCOME_CHANCE_QUALITY_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_CHANCE_QUALITY_REWARD";
+const MATCH_OUTCOME_CHANCE_QUALITY_POINTS_PER_SOT: f64 = 15.0;
+const MATCH_OUTCOME_CHANCE_QUALITY_SOT_CAP: f64 = 4.0;
 // INSTANTANEOUS (single-frame) player speed ceiling: 25mph ≈ 12.22yps, plus a hair of
 // numerical margin. A human sprints at most ~25mph in a moment.
 const SOCCER_PHYSICS_PLAYER_MAX_SPEED_YPS: f64 = 12.45;
@@ -14061,6 +14070,31 @@ impl MatchOutcomeReward {
             Team::Away => self.away,
         }
     }
+
+    /// Folds the gated zero-sum chance-quality bonus into the label:
+    /// `home += b`, `away -= b`, where `b = points_per_sot · clamp(home_sot − away_sot, ±cap)`.
+    /// Applied to every result (draws included). Gate off ⇒ `b = 0` ⇒ label unchanged.
+    fn with_chance_quality(mut self, sot_home: u32, sot_away: u32) -> Self {
+        let bonus = match_outcome_chance_quality_home_bonus(sot_home, sot_away);
+        self.home += bonus;
+        self.away -= bonus;
+        self
+    }
+}
+
+/// Home-perspective chance-quality bonus (see `MATCH_OUTCOME_CHANCE_QUALITY_*`). Reads the
+/// enable env once per call — invoked only once per finished game, off any hot path. The
+/// shots-on-target differential is capped so the bonus cannot dominate the ±200 win label or
+/// reward low-quality shot farming.
+fn match_outcome_chance_quality_home_bonus(sot_home: u32, sot_away: u32) -> f64 {
+    if !soccer_env_flag_enabled(MATCH_OUTCOME_CHANCE_QUALITY_ENABLE_ENV) {
+        return 0.0;
+    }
+    let diff = (f64::from(sot_home) - f64::from(sot_away)).clamp(
+        -MATCH_OUTCOME_CHANCE_QUALITY_SOT_CAP,
+        MATCH_OUTCOME_CHANCE_QUALITY_SOT_CAP,
+    );
+    MATCH_OUTCOME_CHANCE_QUALITY_POINTS_PER_SOT * diff
 }
 
 fn dd_soccer_enable_outcome_credit() -> bool {
@@ -18612,10 +18646,19 @@ impl MatchConfig {
             neural_blend: SoccerNeuralBlendConfig {
                 mode: SoccerNeuralBlendMode::Additive,
                 actor_critic: true,
-                mcts_enabled: true,
-                mcts_simulations: 8,
-                mcts_candidates: 4,
-                mcts_depth: 1,
+                // MCTS is DP-lookahead scored by the value net + analytic MPC priors — it can pull the
+                // net's choices back toward the analytic policy (entrenching parity). SOCCER_DISABLE_NEURAL_MCTS=1
+                // lets the raw actor-critic policy drive directly, to A/B whether MCTS helps or hurts the climb.
+                mcts_enabled: std::env::var("SOCCER_DISABLE_NEURAL_MCTS").ok().as_deref() != Some("1"),
+                // Env-tunable so we can A/B whether SOLVING MORE EXACTLY (deeper lookahead / more
+                // simulations / wider candidate set) climbs above parity — i.e. whether the plateau is
+                // a shallow-search approximation ceiling. Sanitizers clamp to [1,32]/[2,16]/[1,3].
+                mcts_simulations: std::env::var("SOCCER_MCTS_SIMULATIONS")
+                    .ok().and_then(|s| s.trim().parse().ok()).unwrap_or(8),
+                mcts_candidates: std::env::var("SOCCER_MCTS_CANDIDATES")
+                    .ok().and_then(|s| s.trim().parse().ok()).unwrap_or(4),
+                mcts_depth: std::env::var("SOCCER_MCTS_DEPTH")
+                    .ok().and_then(|s| s.trim().parse().ok()).unwrap_or(1),
                 ..SoccerNeuralBlendConfig::default()
             },
             mpc: SoccerMpcConfig {

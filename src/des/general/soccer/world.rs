@@ -2088,6 +2088,18 @@ fn dd_soccer_enable_bellman_terminals() -> bool {
     *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_BELLMAN_TERMINALS"))
 }
 
+/// MC critic target (default-OFF, Codex-designed anti-alias lever). When on, the value head trains on
+/// the REALIZED discounted return (summed forward along each player's successor chain) instead of the
+/// tabular-bootstrapped `reward + γ·best_value_hierarchical(next)`. This breaks the aliased-tabular
+/// fixed point the neural value otherwise inherits by construction — the leading suspect for the
+/// parity ceiling. Run with DD_SOCCER_ENABLE_BELLMAN_TERMINALS=0 so terminal reconstruction doesn't
+/// reintroduce a bootstrap into the return labels.
+fn dd_soccer_enable_mc_critic_target() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_MC_CRITIC_TARGET"))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SoccerTrajectoryExportDecision {
@@ -9550,6 +9562,13 @@ impl SoccerMatch {
         });
     }
 
+    /// Read-only world snapshot for external tooling (possession-chain / EPV export).
+    /// Constructs the same agent-decision snapshot the engine uses internally; pure read,
+    /// no mutation, so calling it is byte-identical to not calling it. Off any hot path.
+    pub fn export_world_snapshot(&self) -> WorldSnapshot {
+        WorldSnapshot::from_match_for_agent_decision(self)
+    }
+
     pub fn summary(&self) -> MatchSummary {
         // Include the still-open consecutive-pass chain (if any) so the final sequence of the
         // match is counted, without mutating live state — `summary` is a read-only view.
@@ -13412,6 +13431,51 @@ impl SoccerMatch {
         let target_clip = self.config.neural_learning.sanitized_target_clip();
         let tick_rewards = soccer_marl_tick_rewards(transitions);
         let successor_indices = Self::neural_successor_indices(transitions);
+        // MC critic target (gated, Codex anti-alias lever): realized discounted return per transition,
+        // accumulated BACKWARD along each player's successor chain, so the value head learns E[return]
+        // from real outcomes instead of regressing onto the aliased tabular Q(next). Empty ⇒ use the
+        // default tabular-bootstrapped target.
+        let mc_returns: Vec<f64> = if dd_soccer_enable_mc_critic_target() {
+            let n = transitions.len();
+            let mc_gamma = soccer_q_sanitized_gamma(SoccerQPolicyOptions::default().gamma);
+            let adj: Vec<f64> = transitions
+                .iter()
+                .map(|t| {
+                    finite_metric(soccer_marl_adjusted_reward(
+                        t,
+                        &tick_rewards,
+                        &self.config.neural_learning,
+                    ))
+                })
+                .collect();
+            let mut ret = vec![0.0f64; n];
+            for i in (0..n).rev() {
+                let future = if transitions[i].done {
+                    0.0
+                } else {
+                    match successor_indices.get(i).copied().flatten() {
+                        Some(s) if s < n => mc_gamma * ret[s],
+                        _ => 0.0,
+                    }
+                };
+                ret[i] = adj[i] + future;
+            }
+            // STANDARDIZE (PopArt-style): realized returns are goal-dominated (a scored possession is
+            // ~100+ while a quiet one is ~1), so the fixed target_scale/clip would saturate them into a
+            // near-binary signal. Normalizing to ~unit scale gives the critic a graded target — this is
+            // exactly how the external Burn solver (the only thing that beat parity) handles returns.
+            if n > 1 {
+                let mean = ret.iter().sum::<f64>() / n as f64;
+                let var = ret.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / n as f64;
+                let std = var.sqrt().max(1e-3);
+                for r in ret.iter_mut() {
+                    *r = (*r - mean) / std;
+                }
+            }
+            ret
+        } else {
+            Vec::new()
+        };
         transitions
             .iter()
             .enumerate()
@@ -13463,14 +13527,28 @@ impl SoccerMatch {
                     tabular_max_next,
                     target_scale,
                 );
-                let (target, priority) = soccer_neural_target_and_priority(
-                    adjusted_reward,
-                    gamma,
-                    max_next,
-                    transition.done,
-                    target_scale,
-                    target_clip,
-                );
+                let (target, priority) = if !mc_returns.is_empty() {
+                    // MC target: clip(realized_return / target_scale) — NO tabular bootstrap. This is
+                    // the alias-breaking label; `max_next`/`gamma` above are ignored on this path.
+                    let raw = mc_returns.get(transition_index).copied().unwrap_or(0.0);
+                    // Already standardized to ~unit scale in the precompute; clip to the same bound
+                    // (no /target_scale — that division is what saturated the goal-dominated returns).
+                    let scaled = if raw.is_finite() {
+                        raw.clamp(-target_clip, target_clip)
+                    } else {
+                        0.0
+                    };
+                    (scaled, scaled.abs().max(1e-6))
+                } else {
+                    soccer_neural_target_and_priority(
+                        adjusted_reward,
+                        gamma,
+                        max_next,
+                        transition.done,
+                        target_scale,
+                        target_clip,
+                    )
+                };
                 let sample = SoccerNeuralTrainingSample {
                     input: soccer_neural_transition_features(transition),
                     target,
@@ -13841,59 +13919,70 @@ impl SoccerMatch {
             }
         }
 
-        let mut samples: Vec<SoccerPolicySample> = replay
-            .iter()
-            .enumerate()
-            .filter_map(|(index, transition)| {
-                if self.neural_team_frozen(transition.team) {
-                    return None;
-                }
-                if !soccer_neural_authoritative_actor_training_transition_allowed(transition) {
-                    return None;
-                }
-                let rejected_counterexample =
-                    learned_mpc_rejected_action_counterexample(transition);
-                if !soccer_actor_policy_sample_allowed(transition) {
-                    return None;
-                }
-                let action_index = soccer_policy_action_index(&transition.action)?;
-                let advantage = if rejected_counterexample {
-                    reward_adv[index] - values[index]
-                } else {
-                    advantages[index]
-                };
-                let advantage =
-                    soccer_actor_advantage_with_planner_distillation(transition, advantage);
-                let mcts_distillation =
-                    soccer_actor_mcts_distillation_priority(transition, advantage);
-                let sample_weight = soccer_actor_priority_weight(transition, advantage);
-                let state_features = self.policy_state_features(transition);
-                let actor_probability = self
-                    .policy_head
-                    .as_ref()
-                    .and_then(|head| head.action_distribution(&state_features))
-                    .and_then(|probs| probs.get(action_index).copied());
-                // Stochastic top-k selection records the true behavior policy;
-                // older/deterministic rows keep their chosen-action probability
-                // before falling back to the actor head.
-                let old_action_probability = soccer_behavior_old_action_probability(
-                    transition
-                        .decision_context
-                        .behavior_policy_probability
-                        .filter(|probability| probability.is_finite() && *probability > 0.0)
-                        .or(Some(transition.decision_context.chosen_action_probability)),
-                    actor_probability,
-                );
-                advantage.is_finite().then(|| SoccerPolicySample {
-                    state_features,
-                    action_index,
-                    advantage,
-                    old_action_probability,
-                    sample_weight,
-                    mcts_distillation,
-                })
-            })
-            .collect();
+        // Diagnostic side-channel (gated): when `DD_SOCCER_DUMP_ADVANTAGE_DIAGNOSTIC` is set,
+        // record `(team, action_index, pre-standardization advantage)` aligned 1:1 with `samples`
+        // so an offline pass can see whether raw advantages separate chance-rich from sterile
+        // draws and whether batch standardization erases that separation. Off ⇒ byte-identical
+        // (the loop below is the exact filter_map that produced `samples` before, unchanged).
+        let diag_on = std::env::var("DD_SOCCER_DUMP_ADVANTAGE_DIAGNOSTIC").is_ok();
+        let mut diag_meta: Vec<(Team, usize, f64)> = Vec::new();
+        let mut samples: Vec<SoccerPolicySample> = Vec::new();
+        for (index, transition) in replay.iter().enumerate() {
+            if self.neural_team_frozen(transition.team) {
+                continue;
+            }
+            if !soccer_neural_authoritative_actor_training_transition_allowed(transition) {
+                continue;
+            }
+            let rejected_counterexample = learned_mpc_rejected_action_counterexample(transition);
+            if !soccer_actor_policy_sample_allowed(transition) {
+                continue;
+            }
+            let Some(action_index) = soccer_policy_action_index(&transition.action) else {
+                continue;
+            };
+            let advantage = if rejected_counterexample {
+                reward_adv[index] - values[index]
+            } else {
+                advantages[index]
+            };
+            let advantage =
+                soccer_actor_advantage_with_planner_distillation(transition, advantage);
+            let mcts_distillation =
+                soccer_actor_mcts_distillation_priority(transition, advantage);
+            let sample_weight = soccer_actor_priority_weight(transition, advantage);
+            let state_features = self.policy_state_features(transition);
+            let actor_probability = self
+                .policy_head
+                .as_ref()
+                .and_then(|head| head.action_distribution(&state_features))
+                .and_then(|probs| probs.get(action_index).copied());
+            // Stochastic top-k selection records the true behavior policy;
+            // older/deterministic rows keep their chosen-action probability
+            // before falling back to the actor head.
+            let old_action_probability = soccer_behavior_old_action_probability(
+                transition
+                    .decision_context
+                    .behavior_policy_probability
+                    .filter(|probability| probability.is_finite() && *probability > 0.0)
+                    .or(Some(transition.decision_context.chosen_action_probability)),
+                actor_probability,
+            );
+            if !advantage.is_finite() {
+                continue;
+            }
+            if diag_on {
+                diag_meta.push((transition.team, action_index, advantage));
+            }
+            samples.push(SoccerPolicySample {
+                state_features,
+                action_index,
+                advantage,
+                old_action_probability,
+                sample_weight,
+                mcts_distillation,
+            });
+        }
 
         // PPO/MAPPO advantage standardization (zero-mean / unit-variance over the batch):
         // the standard variance-reduction trick that keeps the policy-gradient step scale
@@ -13904,7 +13993,58 @@ impl SoccerMatch {
         if dd_soccer_standardize_policy_advantages() {
             soccer_standardize_actor_policy_sample_advantages(&mut samples);
         }
+        if diag_on {
+            self.dump_advantage_diagnostic(&diag_meta, &samples);
+        }
         samples
+    }
+
+    /// Appends per-sample advantage-diagnostic rows (JSONL) to `DD_SOCCER_DUMP_ADVANTAGE_DIAGNOSTIC`.
+    /// Offline-only instrumentation for the 0.53-ceiling investigation: for each actor training
+    /// sample it records the pre- and post-standardization advantage tagged with the game's final
+    /// result and shots-on-target differential, so we can test (a) whether the raw label separates
+    /// chance-rich from sterile draws [reward] and (b) whether batch standardization erases that
+    /// separation [gradient]. Never runs unless the env var is set.
+    fn dump_advantage_diagnostic(
+        &self,
+        meta: &[(Team, usize, f64)],
+        samples: &[SoccerPolicySample],
+    ) {
+        use std::io::Write;
+        let Ok(path) = std::env::var("DD_SOCCER_DUMP_ADVANTAGE_DIAGNOSTIC") else {
+            return;
+        };
+        let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
+            return;
+        };
+        let (score_home, score_away) = (self.score_home, self.score_away);
+        let (sot_home, sot_away) = (
+            self.stats.shots_on_target_home,
+            self.stats.shots_on_target_away,
+        );
+        for (i, &(team, action_index, raw_adv)) in meta.iter().enumerate() {
+            let std_adv = samples.get(i).map(|s| s.advantage).unwrap_or(raw_adv);
+            let (team_score, opp_score, team_sot, opp_sot) = match team {
+                Team::Home => (score_home, score_away, sot_home, sot_away),
+                Team::Away => (score_away, score_home, sot_away, sot_home),
+            };
+            let result = if team_score > opp_score {
+                "W"
+            } else if team_score < opp_score {
+                "L"
+            } else {
+                "D"
+            };
+            let family = SOCCER_POLICY_ACTIONS.get(action_index).copied().unwrap_or("?");
+            let sot_diff = team_sot as i64 - opp_sot as i64;
+            let _ = writeln!(
+                file,
+                "{{\"result\":\"{result}\",\"team\":\"{}\",\"family\":\"{family}\",\
+                 \"raw_adv\":{raw_adv:.5},\"std_adv\":{std_adv:.5},\
+                 \"team_sot\":{team_sot},\"opp_sot\":{opp_sot},\"sot_diff\":{sot_diff}}}",
+                team.label(),
+            );
+        }
     }
 
     fn ensure_policy_head(&mut self) {
@@ -14176,8 +14316,12 @@ impl SoccerMatch {
         self.full_game_learning_applied = true;
         // Terminal won-game reward (the "long" rung): label every transition with the
         // realised result when the gate is on. Off ⇒ `None`, byte-identical replay.
-        let match_outcome = match_outcome_reward_enabled()
-            .then(|| MatchOutcomeReward::from_score(self.score_home, self.score_away));
+        let match_outcome = match_outcome_reward_enabled().then(|| {
+            MatchOutcomeReward::from_score(self.score_home, self.score_away).with_chance_quality(
+                self.stats.shots_on_target_home,
+                self.stats.shots_on_target_away,
+            )
+        });
         let replay =
             soccer_full_game_replay_transitions(&self.episode_learning_transitions, match_outcome);
         self.full_game_learning_replay_transitions = replay.len();
