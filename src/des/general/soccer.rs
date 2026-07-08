@@ -25755,6 +25755,18 @@ fn soccer_analytic_difference_reward_enabled() -> bool {
     }
 }
 
+/// Gate for the COMA-style analytic ADVANTAGE (the principled "beat analytic" lever). When on, the
+/// PPO actor's advantage is the raw return MINUS a DETACHED tabular baseline
+/// `best_value_hierarchical(s)` — the analytic default's value, from the SEPARATE tabular policy, so
+/// there is no critic self-circularity. Policy-gradient then rewards the actor for choosing actions
+/// whose return EXCEEDS what analytic would score in that state, instead of regressing onto the
+/// analytic/tabular teacher (the value-imitation parity ceiling). OFF (default) ⇒ byte-identical.
+pub(crate) fn dd_soccer_enable_coma_analytic_advantage() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_COMA_ANALYTIC_ADVANTAGE"))
+}
+
 fn soccer_decision_trace_is_learned_policy(decision: &AgentDecisionTrace) -> bool {
     decision.neural_mcts_selected
         || decision.learned_mpc_replan.is_some()
