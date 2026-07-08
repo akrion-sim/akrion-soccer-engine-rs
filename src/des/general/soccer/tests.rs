@@ -37593,6 +37593,22 @@ fn skill_group_partitions_technical_families() {
         soccer_policy_skill_group_for_action_index(dribble_idx).map(|(g, _)| g),
         Some(SoccerSkillGroup::Dribble)
     );
+    for label in [
+        "vertical-attack",
+        "turnover-burst",
+        "hold-up-flank",
+        "open-passing-lane",
+        "open-pass-lane",
+        "runaround-dribble",
+        "round-goalkeeper",
+    ] {
+        let index = soccer_policy_action_index(label).expect("live dribble family");
+        assert_eq!(
+            soccer_policy_skill_group_for_action_index(index).map(|(g, _)| g),
+            Some(SoccerSkillGroup::Dribble),
+            "{label} should train through the dribble specialist head"
+        );
+    }
     let shot_idx = soccer_policy_action_index("shoot").expect("shoot family");
     assert_eq!(
         soccer_policy_skill_group_for_action_index(shot_idx).map(|(g, _)| g),

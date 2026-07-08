@@ -39467,11 +39467,14 @@ const SOCCER_SKILL_PASS_FAMILIES: &[&str] = &[
 ];
 const SOCCER_SKILL_DRIBBLE_FAMILIES: &[&str] = &[
     "dribble",
+    "vertical-attack",
+    "turnover-burst",
     "carry-forward",
     "carry-out-left",
     "carry-out-right",
     "protect-ball",
     "side-step",
+    "hold-up-flank",
     "left-cut",
     "right-cut",
     "nutmeg",
@@ -39479,6 +39482,9 @@ const SOCCER_SKILL_DRIBBLE_FAMILIES: &[&str] = &[
     "fake-right-cut-left",
     "xavi-turn",
     "round-goalkeeper",
+    "open-passing-lane",
+    "open-pass-lane",
+    "runaround-dribble",
 ];
 const SOCCER_SKILL_SHOT_FAMILIES: &[&str] = &[
     "shoot",
@@ -41940,11 +41946,14 @@ const SOCCER_POLICY_PASS_ACTIONS: &[&str] = &[
 
 const SOCCER_POLICY_DRIBBLE_ACTIONS: &[&str] = &[
     "dribble",
+    "vertical-attack",
+    "turnover-burst",
     "carry-forward",
     "carry-out-left",
     "carry-out-right",
     "protect-ball",
     "side-step",
+    "hold-up-flank",
     "left-cut",
     "right-cut",
     "nutmeg",
@@ -41952,6 +41961,9 @@ const SOCCER_POLICY_DRIBBLE_ACTIONS: &[&str] = &[
     "fake-right-cut-left",
     "xavi-turn",
     "round-goalkeeper",
+    "open-passing-lane",
+    "open-pass-lane",
+    "runaround-dribble",
 ];
 
 const SOCCER_POLICY_SHOT_ACTIONS: &[&str] = &[
