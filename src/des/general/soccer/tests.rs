@@ -2743,6 +2743,180 @@ fn learned_policy_selector_avoids_conceded_pass_target() {
     );
 }
 
+fn learned_pass_receiver_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[test]
+fn receiver_descriptor_encoding_is_distinct_and_bounded() {
+    // Every distinct (kind, role, lane, progression, openness) tuple must encode to a distinct,
+    // non-negative integer in range so it is a stable RDS key and Q-key dimension.
+    let mut seen = std::collections::HashSet::new();
+    for kind in [
+        ReceiverKind::Teammate,
+        ReceiverKind::Space,
+        ReceiverKind::Nobody,
+    ] {
+        for role_bucket in 0..4u8 {
+            for lane in 0..3u8 {
+                for progression in 0..3u8 {
+                    for openness in 0..3u8 {
+                        let code = ReceiverDescriptor {
+                            kind,
+                            role_bucket,
+                            lane,
+                            progression,
+                            openness,
+                        }
+                        .encode();
+                        assert!((0..=323).contains(&code), "descriptor {code} out of range");
+                        assert_ne!(
+                            code, RECEIVER_DESCRIPTOR_UNSPECIFIED,
+                            "a real descriptor must never collide with Unspecified(-1)"
+                        );
+                        assert!(seen.insert(code), "descriptor code {code} collided");
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(ReceiverDescriptor::role_bucket_for(PlayerRole::Goalkeeper), 0);
+    assert_eq!(ReceiverDescriptor::role_bucket_for(PlayerRole::Forward), 3);
+}
+
+#[test]
+fn pass_receiver_descriptor_reads_progression_and_kind() {
+    // A forward ball and a backward ball from the same passer decode to opposite progression
+    // buckets, and a teammate vs open-space target decode to different kinds.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 4242,
+        ..Default::default()
+    });
+    let passer = 7;
+    sim.players[passer].team = Team::Home; // Home attacks +y
+    sim.players[passer].position = Vec2::new(40.0, 50.0);
+    sim.ball.holder = Some(passer);
+    sim.ball.position = sim.players[passer].position;
+    let snapshot = WorldSnapshot::from_match(&sim);
+
+    let forward_point = Vec2::new(40.0, 72.0);
+    let backward_point = Vec2::new(40.0, 28.0);
+    let fwd = snapshot.pass_receiver_descriptor(passer, ReceiverKind::Teammate, forward_point, Some(PlayerRole::Forward));
+    let back = snapshot.pass_receiver_descriptor(passer, ReceiverKind::Teammate, backward_point, Some(PlayerRole::Forward));
+    assert_ne!(fwd, back, "forward vs backward ball must differ");
+    assert_ne!(fwd, RECEIVER_DESCRIPTOR_UNSPECIFIED);
+
+    let space = snapshot.pass_receiver_descriptor(passer, ReceiverKind::Space, forward_point, None);
+    assert_ne!(
+        fwd, space,
+        "teammate vs open-space target at the same point must decode to different kinds"
+    );
+}
+
+#[test]
+fn learned_pass_receiver_head_decides_who_over_heuristics() {
+    // With the gate on, the POMDP head decides WHO: a receiver the head learned is valuable is
+    // chosen even when the heuristic quality terms would favour the other teammate. With the gate
+    // off, the head's per-receiver value is ignored (parity), so the heuristic pick stands.
+    let _lock = learned_pass_receiver_env_lock();
+    let build = || {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            duration_seconds: 0.1,
+            seed: 7_777,
+            ..Default::default()
+        });
+        let passer = 7;
+        let a = 6;
+        let b = 9;
+        park_players_except(&mut sim, &[passer, a, b]);
+        sim.players[passer].team = Team::Home;
+        sim.players[passer].position = Vec2::new(40.0, 40.0);
+        sim.players[passer].facing_yaw = std::f64::consts::FRAC_PI_2;
+        sim.ball.holder = Some(passer);
+        sim.ball.position = sim.players[passer].position;
+        sim.players[a].team = Team::Home;
+        sim.players[a].role = PlayerRole::Midfielder;
+        sim.players[a].position = Vec2::new(48.0, 56.0);
+        sim.players[a].velocity = Vec2::zero();
+        sim.players[b].team = Team::Home;
+        sim.players[b].role = PlayerRole::Forward;
+        sim.players[b].position = Vec2::new(32.0, 56.0);
+        sim.players[b].velocity = Vec2::zero();
+        (sim, passer, a, b)
+    };
+
+    let (sim, passer, a, b) = build();
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let state = SoccerQStateKey::from_parts(
+        &snapshot.mdp_state_for_player(passer),
+        &snapshot.observation_for(passer),
+        Team::Home,
+        sim.players[passer].role,
+    );
+    // Seed a strong learned per-receiver value for teammate B's descriptor only.
+    let b_pos = sim.players[b].position;
+    let b_grid = pitch_grid_address(b_pos, snapshot.field_width, snapshot.field_length);
+    let b_descriptor = snapshot.pass_receiver_descriptor(
+        passer,
+        ReceiverKind::Teammate,
+        b_pos,
+        Some(sim.players[b].role),
+    );
+    let mut policy = SoccerQPolicy::default();
+    assert!(policy.set_target_value_with_receiver(state, "pass", b_grid, b_descriptor, 5.0));
+
+    let candidates = vec![a, b];
+
+    // Gate ON: the head's per-receiver value for B dominates → B is chosen.
+    {
+        let _guard = TestEnvVarGuard::set("DD_SOCCER_ENABLE_LEARNED_PASS_RECEIVER", "1");
+        let chosen = policy.best_pass_target_player_for_snapshot(
+            &snapshot,
+            passer,
+            "pass",
+            PassFlight::Floor,
+            &candidates,
+        );
+        assert_eq!(
+            chosen,
+            Some(b),
+            "gate on: the head must pass to the receiver it learned is valuable"
+        );
+        let ranked = policy.ranked_pass_teammates_for_snapshot(
+            &snapshot,
+            passer,
+            "pass",
+            PassFlight::Floor,
+            &candidates,
+        );
+        assert_eq!(
+            ranked.first().map(|r| r.player_id),
+            Some(b),
+            "ranked receivers must lead with the head's learned choice"
+        );
+    }
+
+    // Gate OFF: the per-receiver value is invisible (grid-only legacy lookup finds nothing for
+    // these teammates' cells), so selection falls back to the heuristic blend — and must NOT be
+    // forced to B by the receiver head.
+    {
+        std::env::remove_var("DD_SOCCER_ENABLE_LEARNED_PASS_RECEIVER");
+        let chosen_off = policy.best_pass_target_player_for_snapshot(
+            &snapshot,
+            passer,
+            "pass",
+            PassFlight::Floor,
+            &candidates,
+        );
+        assert!(
+            chosen_off.is_some(),
+            "gate off: legacy selector still returns a target"
+        );
+    }
+}
+
 #[test]
 fn aerial_pass_ranking_prices_direct_opponent_control_risk() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
