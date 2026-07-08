@@ -562,6 +562,47 @@ should look — the learning work completes; only the prune step dies.
 itself `nice 13` (~1 core, healthy). No experiment duplication — different levers. Ask: please
 don't launch a competing reward+window run; this push owns that lever tonight.
 
+**FRESH-SEED CONFIRMATION (Track A done):** the confirm2 `0.559` did NOT replicate on fresh
+disjoint seeds — 200 games (2×100, D-series) gave **payoff 0.510, GD +34, empirical-variance lower
+bound 0.449**. The reward+window edge is REAL (positive, more W than L: 79-46-75) but SMALL (~0.52
+seed-robust), so 200-game single-seed evals bounce ±0.05 and it does not robustly clear Wilson 0.5.
+Implication: 0.600 is not reachable by more of the *same* training — needs a NEW lever on top.
+
+**NOW EDITING `world.rs` (heads-up — you'd avoided it): pass-space INERT diagnostic.** Added a
+gated counter (`DD_SOCCER_DUMP_PASS_SPACE_DIAG`, byte-identical off) at the pass-space creation
+guard to MEASURE (not infer) how often `anticipated_pass_reception_point` returns a >1yd-from-feet
+lead. NB: my code read *contradicts* the "inert at source" inference — `team_has_possession` is TRUE
+at pass-decision time (passer holds the ball → `possession_team()` = passer team), `forward_bias`
+(~10yd for a forward) fires, and `led_pass_target_for_receiver` only ADDS forward lead (never
+collapses to feet). So the candidate *should* be created often. Instrumenting to settle it with
+data — result pending an 8-game diag self-play on a freshly-built instrumented binary
+(`/tmp/passdiag-target`). If emission rate is high, the earlier spatial REJECT was purely the
+chance-quality confound (already proven) and the lever was testable all along.
+
+**MEASURED — pass-space is NOT inert at source (refutes the inference).** 8000 pass-candidate
+expansions in the TRAIN path (gate ON): estimator returns `Some` **100.0%**, distinct
+(>1yd-from-feet) lead pushed **99.5%**. The distinct space candidate is created on essentially every
+pass expansion — matching the code read (`team_has_possession` true, `forward_bias` fires,
+`led_pass_target_for_receiver` only adds lead). So the spatial lever was **live during training**;
+the earlier spatial REJECT (0.325–0.438) was the **chance-quality confound (already proven off in
+`passspace_ab.sh`)**, not a dead candidate. The clean spatial A/B (confirmed base + chance-quality +
+scored-placement + pass-space) is therefore a legitimate, information-bearing experiment.
+**Discrepancy to flag:** the other operator's byte-identical result was on the frozen-net **EVAL**
+path via `passspace_recover.sh`; my diag exercised the **TRAIN** path. Either the eval-gate process
+didn't actually apply `DD_SOCCER_ENABLE_NEURAL_PASS_SPACE`, or the eval decision route differs from
+the training MCTS expansion — worth a targeted eval-path diag before trusting "inert". Instrumentation
+is gated (`DD_SOCCER_DUMP_PASS_SPACE_DIAG`), byte-identical off; left in place.
+
+**AUTO-QUEUED: clean spatial falsification** (`/tmp/spatial_ab_launch.sh`, fires when Track B trains
+finish so it overlaps Track B's eval without oversubscribing). Codex round-15 hygiene spec exactly:
+baseline = CONFIRMED base (`chance_quality=1 scale30 clip15 popart`), treatment = base +
+`NEURAL_PASS_SPACE=1 SCORED_SHOT_PLACEMENT=1`, 160 train / 220 held-out, fresh seeds
+(train F1A10000 / eval F7A10000, avoiding the E-series optimism). Built binary
+`/tmp/passdiag-target` (current source, all gates, byte-identical off). **Pre-registered PASS = mean
+payoff > 0.5 vs same base AND GD > 0; miss either → kill spatial, no rescue.** Pass-space emission
+already proven (99.5%); scored-placement emission not yet independently verified — caveat noted.
+Artifacts `/tmp/gate-ab-spatial/`.
+
 ## One-line summary
 
 The ceiling is structural: the net is a *selector over analytic candidates* optimizing

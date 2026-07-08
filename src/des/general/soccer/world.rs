@@ -14244,13 +14244,20 @@ impl SoccerMatch {
                         );
                         let nominal_speed =
                             pass_speed_yps_from_power(0.68, flight, is_cross, &passer.skills);
-                        if let Some(space_point) = snapshot.anticipated_pass_reception_point(
+                        let space_point = snapshot.anticipated_pass_reception_point(
                             player_id,
                             target_player,
                             flight,
                             nominal_speed,
-                        ) {
-                            if space_point.distance(receiver_position) > 1.0 {
+                        );
+                        let distinct = space_point
+                            .map(|sp| sp.distance(receiver_position) > 1.0)
+                            .unwrap_or(false);
+                        if pass_space_diag_enabled() {
+                            record_pass_space_diag(space_point.is_some(), distinct);
+                        }
+                        if let Some(space_point) = space_point {
+                            if distinct {
                                 plans.push(SoccerLearnedPlan {
                                     action: base_action.clone(),
                                     target_player: Some(target_player),
@@ -37010,6 +37017,43 @@ fn dd_soccer_enable_neural_pass_space() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_NEURAL_PASS_SPACE"))
+}
+
+/// Diagnostic-only (gated by `DD_SOCCER_DUMP_PASS_SPACE_DIAG`): counts, per pass-candidate
+/// expansion while the pass-space gate is on, how often the anticipated-reception estimator
+/// returns `Some` and how often that point is a distinct (>1yd-from-feet) lead — i.e. how often
+/// the space candidate is actually pushed. Resolves whether pass-space is inert at SOURCE with
+/// data instead of inference. No-op (byte-identical) unless the diag env is set.
+fn pass_space_diag_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DUMP_PASS_SPACE_DIAG").is_ok())
+}
+
+static PASS_SPACE_DIAG_REACHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PASS_SPACE_DIAG_SOME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PASS_SPACE_DIAG_DISTINCT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn record_pass_space_diag(estimator_some: bool, distinct: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let reached = PASS_SPACE_DIAG_REACHED.fetch_add(1, Relaxed) + 1;
+    if estimator_some {
+        PASS_SPACE_DIAG_SOME.fetch_add(1, Relaxed);
+    }
+    if distinct {
+        PASS_SPACE_DIAG_DISTINCT.fetch_add(1, Relaxed);
+    }
+    if reached % 2000 == 0 {
+        let some = PASS_SPACE_DIAG_SOME.load(Relaxed);
+        let dist = PASS_SPACE_DIAG_DISTINCT.load(Relaxed);
+        eprintln!(
+            "pass_space_diag reached={reached} estimator_some={some} distinct_gt1yd={dist} \
+             some_rate={:.3} distinct_rate={:.3}",
+            some as f64 / reached as f64,
+            dist as f64 / reached as f64,
+        );
+    }
 }
 
 /// Gives the goalkeeper a positive learning reward for stopping a shot
