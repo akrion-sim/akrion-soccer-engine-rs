@@ -70,8 +70,9 @@ const COMPLETED_PASS_LEARNING_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(5.0);
 const SHOT_OUTCOME_LEARNING_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(4.0);
 const DRIBBLE_BEAT_LEARNING_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(2.0);
 const LEARNED_MPC_REJECTED_ACTION_PENALTY_POINTS: f64 = 2.5;
-const SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_SAMPLE_RATE: f64 = 1.0;
-const SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_ADVANTAGE_SCALE: f64 = 1.0;
+const SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_SAMPLE_RATE: f64 = 0.35;
+const SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_ADVANTAGE_SCALE: f64 = 0.50;
+const SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_MAX_SAMPLE_WEIGHT: f64 = 1.60;
 const SOCCER_OPTION_SCORE_SAFETY_ANALYTIC_OPPONENT_MAX_SAMPLE_RATE: f64 = 0.05;
 const SOCCER_OPTION_SCORE_SAFETY_ANALYTIC_OPPONENT_MAX_ADVANTAGE_SCALE: f64 = 0.25;
 const SOCCER_OPTION_SCORE_SAFETY_ANALYTIC_OPPONENT_MAX_SAMPLE_WEIGHT: f64 = 1.25;
@@ -5486,6 +5487,25 @@ mod tests {
     }
 
     #[test]
+    fn option_score_safety_counterexample_defaults_are_bounded() {
+        let _env_lock = soccer_world_env_lock();
+        let _rate = set_test_env_var("SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_SAMPLE_RATE", "");
+        let _scale = set_test_env_var(
+            "SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_ADVANTAGE_SCALE",
+            "",
+        );
+        let _weight = set_test_env_var(
+            "SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_MAX_SAMPLE_WEIGHT",
+            "",
+        );
+        let _analytic = set_test_env_var("SOCCER_LEARNING_ANALYTIC_OPPONENT", "0");
+
+        assert!((option_score_safety_counterexample_sample_rate() - 0.35).abs() < 1e-9);
+        assert!((option_score_safety_counterexample_advantage_scale() - 0.50).abs() < 1e-9);
+        assert!((option_score_safety_counterexample_sample_weight(3.25) - 1.60).abs() < 1e-9);
+    }
+
+    #[test]
     fn analytic_opponent_caps_option_score_safety_counterexample_intensity() {
         let _env_lock = soccer_world_env_lock();
         let _rate = set_test_env_var(
@@ -5518,6 +5538,10 @@ mod tests {
                 "SOCCER_OPTION_SCORE_SAFETY_ANALYTIC_OPPONENT_MAX_SAMPLE_WEIGHT",
                 "3.25",
             );
+            let _base_max_weight = set_test_env_var(
+                "SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_MAX_SAMPLE_WEIGHT",
+                "3.25",
+            );
             assert!((option_score_safety_counterexample_sample_rate() - 1.0).abs() < 1e-9);
             assert!((option_score_safety_counterexample_advantage_scale() - 1.0).abs() < 1e-9);
             assert!((option_score_safety_counterexample_sample_weight(3.25) - 3.25).abs() < 1e-9);
@@ -5526,7 +5550,7 @@ mod tests {
         let _analytic = set_test_env_var("SOCCER_LEARNING_ANALYTIC_OPPONENT", "0");
         assert!((option_score_safety_counterexample_sample_rate() - 1.0).abs() < 1e-9);
         assert!((option_score_safety_counterexample_advantage_scale() - 1.0).abs() < 1e-9);
-        assert!((option_score_safety_counterexample_sample_weight(3.25) - 3.25).abs() < 1e-9);
+        assert!((option_score_safety_counterexample_sample_weight(3.25) - 1.60).abs() < 1e-9);
     }
 
     #[test]
@@ -8766,6 +8790,34 @@ mod tests {
     }
 
     #[test]
+    fn neural_mcts_pass_selection_with_mpc_prior_can_distill_without_replacement_trace() {
+        let mut transition = policy_test_transition_with_mcts(true);
+        transition.reward = 0.08;
+        transition.decision_context.pass_mpc_receipt_probability = 0.94;
+        transition.decision_context.pass_receipt_qp_accel_fit = 0.91;
+        transition.decision_context.chosen_action_mpc_feasibility = 0.93;
+        transition.decision_context.chosen_action_control_cost = 0.08;
+        transition
+            .decision_context
+            .pass_receipt_race_advantage_seconds = 0.80;
+        transition.decision_context.target_forward_yards = 18.0;
+
+        assert!(
+            neural_mcts_pass_mpc_candidate_bonus(&transition) > 0.0,
+            "fixture should have a positive MPC pass prior"
+        );
+        assert_eq!(
+            soccer_actor_advantage_with_planner_distillation(&transition, 0.01),
+            NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR,
+            "MCTS-selected executable passes should teach the actor even when no MPC replacement was needed"
+        );
+        assert_eq!(
+            soccer_actor_priority_weight(&transition, NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR),
+            NEURAL_MCTS_DISTILLATION_PRIORITY_WEIGHT
+        );
+    }
+
+    #[test]
     fn neural_mcts_technical_dribble_selection_can_distill_without_replacement_trace() {
         let mut transition = policy_test_transition_with_mcts(true);
         transition.action = "dribble".to_string();
@@ -9695,6 +9747,15 @@ fn option_score_safety_analytic_opponent_max_sample_weight() -> f64 {
     )
 }
 
+fn option_score_safety_counterexample_max_sample_weight() -> f64 {
+    learned_mpc_metric_env(
+        "SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_MAX_SAMPLE_WEIGHT",
+        SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_MAX_SAMPLE_WEIGHT,
+        1.0,
+        SOCCER_POLICY_PRIORITY_WEIGHT_MAX,
+    )
+}
+
 fn option_score_safety_counterexample_sample_rate() -> f64 {
     let sample_rate = learned_mpc_probability_env(
         "SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_SAMPLE_RATE",
@@ -9720,10 +9781,11 @@ fn option_score_safety_counterexample_advantage_scale() -> f64 {
 }
 
 fn option_score_safety_counterexample_sample_weight(sample_weight: f64) -> f64 {
+    let capped = sample_weight.min(option_score_safety_counterexample_max_sample_weight());
     if soccer_learning_analytic_opponent_env_enabled() {
-        sample_weight.min(option_score_safety_analytic_opponent_max_sample_weight())
+        capped.min(option_score_safety_analytic_opponent_max_sample_weight())
     } else {
-        sample_weight
+        capped
     }
 }
 
@@ -9779,7 +9841,8 @@ fn soccer_actor_mcts_distillation_candidate(
     let replacement_trace = soccer_actor_mcts_distillation_replacement_trace(transition);
     let discretized_kick_trace = soccer_actor_mcts_distillation_discretized_kick_trace(transition);
     let technical_trace = soccer_actor_mcts_distillation_technical_trace(transition);
-    if !replacement_trace && !discretized_kick_trace && !technical_trace {
+    let selected_trace = soccer_actor_mcts_distillation_selected_trace(transition);
+    if !replacement_trace && !discretized_kick_trace && !technical_trace && !selected_trace {
         return false;
     }
     if !soccer_actor_mcts_distillation_action_allowed(transition, replacement_trace) {
@@ -9820,6 +9883,16 @@ fn soccer_actor_mcts_distillation_technical_trace(transition: &SoccerLearningTra
             + feasibility * 0.12
             + low_cost * 0.06;
         return shot_fit >= 0.45;
+    }
+    false
+}
+
+fn soccer_actor_mcts_distillation_selected_trace(transition: &SoccerLearningTransition) -> bool {
+    if !transition.decision_context.neural_mcts_selected {
+        return false;
+    }
+    if pass_like_action_flight(&transition.action).is_some() {
+        return neural_mcts_pass_mpc_candidate_bonus(transition) > 0.0;
     }
     false
 }
