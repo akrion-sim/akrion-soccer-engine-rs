@@ -173,11 +173,28 @@ fn main() {
                 eprintln!("game {g}: failed to install snapshot: {e}");
             }
         }
+        // Install the carried executor head so this game's passes get the learned aim/lead residual
+        // (gated; a no-op unless DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE is set).
+        if let Some(head) = mpc_objective_head.as_ref() {
+            sim.set_mpc_objective_head(head.clone());
+        }
 
         for _ in 0..total_ticks {
             sim.run_time_step();
         }
         sim.drain_neural_learning(Duration::from_millis(100));
+
+        // Train the executor head on this game's captured (features, applied_residual, advantage)
+        // samples (RWR, 4 epochs), carried into the next game — the executor-head analog of the
+        // MAPPO/neural carry above.
+        let mpc_samples = sim.drain_mpc_objective_samples();
+        if !mpc_samples.is_empty() {
+            let head = mpc_objective_head
+                .get_or_insert_with(|| SoccerMpcObjectiveHead::new(seed_base.wrapping_add(g as u32)));
+            for _ in 0..4 {
+                head.train_rwr(&mpc_samples, 0.05);
+            }
+        }
 
         let summary = sim.summary();
         let st = &summary.stats;
