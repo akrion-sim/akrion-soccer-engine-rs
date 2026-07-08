@@ -6635,10 +6635,10 @@ mod tests {
         let mut target_sql = String::new();
         append_policy_entry_value_tuple(&mut target_sql, 1, true);
         target_sql.push_str(", ");
-        append_policy_entry_value_tuple(&mut target_sql, 14, true);
+        append_policy_entry_value_tuple(&mut target_sql, 15, true);
         assert_eq!(
             target_sql,
-            "($1::text::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::text::uuid), ($14::text::uuid, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26::text::uuid)"
+            "($1::text::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::text::uuid), ($15::text::uuid, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28::text::uuid)"
         );
     }
 
