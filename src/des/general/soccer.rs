@@ -1246,6 +1246,11 @@ const COMPLETED_FORWARD_PASS_BASE_REWARD_OWN_HALF: f64 = 3.0;
 const COMPLETED_FORWARD_PASS_BASE_REWARD_OPPONENT_HALF: f64 = 4.0;
 const COMPLETED_FORWARD_PASS_PROGRESS_REWARD_PER_YARD: f64 = 0.24;
 const COMPLETED_FORWARD_PASS_PROGRESS_REWARD_MAX_YARDS: f64 = 30.0;
+// Dense advancement shaping: every completed pass whose actual reception moved the ball forward
+// gets this count bonus. Yardage reward still ranks deeper progress; this separate term makes
+// completed-forward-pass count a frequent training signal instead of waiting for rare shots/goals.
+const COMPLETED_FORWARD_PASS_COUNT_BONUS_POINTS: f64 = 2.5;
+const COMPLETED_FORWARD_PASS_COUNT_MIN_YARDS: f64 = 1.25;
 const COMPLETED_FLANK_PASS_BONUS_POINTS: f64 = 2.4;
 const COMPLETED_FLANK_PASS_OWN_HALF_MULTIPLIER: f64 = 1.55;
 const OWN_HALF_FLANK_TACTICAL_REWARD_MULTIPLIER: f64 = 1.35;
@@ -23497,6 +23502,15 @@ fn completed_pass_reward_for_pitch(
         * forward_pass_reward_scale()
 }
 
+fn completed_forward_pass_count_bonus(team: Team, origin: Vec2, reception: Vec2) -> f64 {
+    let forward_yards = (reception.y - origin.y) * team.attack_dir();
+    if forward_yards >= COMPLETED_FORWARD_PASS_COUNT_MIN_YARDS {
+        COMPLETED_FORWARD_PASS_COUNT_BONUS_POINTS
+    } else {
+        0.0
+    }
+}
+
 fn completed_pass_reward(team: Team, origin: Vec2, target: Vec2, field_length: f64) -> f64 {
     completed_pass_reward_for_pitch(
         team,
@@ -36308,6 +36322,8 @@ pub struct SoccerLearningRewardContract {
     pub completed_forward_pass_base_reward_opponent_half: f64,
     pub completed_forward_pass_progress_reward_per_yard: f64,
     pub completed_forward_pass_progress_reward_max_yards: f64,
+    pub completed_forward_pass_count_bonus_points: f64,
+    pub completed_forward_pass_count_min_yards: f64,
     pub completed_killer_pass_bonus_points: f64,
     pub completed_killer_pass_max_bonus_points: f64,
     pub dense_forward_pass_progress_reward_per_yard: f64,
@@ -36472,6 +36488,8 @@ fn soccer_learning_reward_contract() -> SoccerLearningRewardContract {
             COMPLETED_FORWARD_PASS_PROGRESS_REWARD_PER_YARD,
         completed_forward_pass_progress_reward_max_yards:
             COMPLETED_FORWARD_PASS_PROGRESS_REWARD_MAX_YARDS,
+        completed_forward_pass_count_bonus_points: COMPLETED_FORWARD_PASS_COUNT_BONUS_POINTS,
+        completed_forward_pass_count_min_yards: COMPLETED_FORWARD_PASS_COUNT_MIN_YARDS,
         completed_killer_pass_bonus_points: COMPLETED_KILLER_PASS_BONUS_POINTS,
         completed_killer_pass_max_bonus_points: COMPLETED_KILLER_PASS_MAX_BONUS_POINTS,
         dense_forward_pass_progress_reward_per_yard: DENSE_FORWARD_PASS_PROGRESS_REWARD_PER_YARD,

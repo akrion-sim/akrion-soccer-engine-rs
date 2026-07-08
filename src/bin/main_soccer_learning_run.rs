@@ -1106,6 +1106,7 @@ struct NeuralPopulationCandidateBehavior {
     shots_on_target_for: u32,
     shots_on_target_against: u32,
     shots_after_pass_for: u32,
+    completed_forward_passes_for: u32,
     completed_pass_gain_yards_for: f64,
     pass_chain_gain_yards_for: f64,
     pass_chains_net_loss_for: u32,
@@ -1127,6 +1128,9 @@ impl NeuralPopulationCandidateBehavior {
         self.shots_after_pass_for = self
             .shots_after_pass_for
             .saturating_add(stats.shots_after_pass_home);
+        self.completed_forward_passes_for = self
+            .completed_forward_passes_for
+            .saturating_add(stats.passes_completed_forward_home);
         self.completed_pass_gain_yards_for += stats.completed_pass_gain_yards_home;
         self.pass_chain_gain_yards_for += stats.pass_chain_gain_yards_home;
         self.pass_chains_net_loss_for = self
@@ -1153,6 +1157,9 @@ impl NeuralPopulationCandidateBehavior {
             shots_after_pass_for: self
                 .shots_after_pass_for
                 .saturating_add(other.shots_after_pass_for),
+            completed_forward_passes_for: self
+                .completed_forward_passes_for
+                .saturating_add(other.completed_forward_passes_for),
             completed_pass_gain_yards_for: self.completed_pass_gain_yards_for
                 + other.completed_pass_gain_yards_for,
             pass_chain_gain_yards_for: self.pass_chain_gain_yards_for
@@ -1202,23 +1209,15 @@ fn neural_population_candidate_goal_margin(eval: &NeuralPopulationCandidateEval)
 fn neural_population_candidate_behavior_rank_bonus(eval: &NeuralPopulationCandidateEval) -> f64 {
     let games = (eval.wins + eval.draws + eval.losses).max(1) as f64;
     let behavior = eval.behavior;
-    let goal_margin = neural_population_candidate_goal_margin(eval);
-    let shot_margin = (f64::from(behavior.shots_for) - f64::from(behavior.shots_against)) / games;
-    let sot_margin = (f64::from(behavior.shots_on_target_for)
-        - f64::from(behavior.shots_on_target_against))
-        / games;
-    let worked_shots = f64::from(behavior.shots_after_pass_for) / games;
+    let completed_forward_passes = f64::from(behavior.completed_forward_passes_for) / games;
     let dribble_beats = f64::from(behavior.dribble_beats_for) / games;
     let route_one = f64::from(behavior.route_one_balls_for) / games;
     let chain_net_loss = f64::from(behavior.pass_chains_net_loss_for) / games;
     let pass_progress = (behavior.completed_pass_gain_yards_for / games).clamp(-60.0, 90.0);
     let chain_progress = (behavior.pass_chain_gain_yards_for / games).clamp(-60.0, 90.0);
 
-    0.20 * goal_margin
-        + 0.08 * sot_margin
-        + 0.03 * shot_margin
-        + 0.06 * worked_shots
-        + 0.18 * dribble_beats
+    0.10 * completed_forward_passes
+        + 0.04 * dribble_beats
         + 0.006 * pass_progress
         + 0.004 * chain_progress
         - 0.10 * chain_net_loss
@@ -1701,16 +1700,13 @@ fn maybe_run_neural_population_search(
                 let games = (candidate_eval.wins + candidate_eval.draws + candidate_eval.losses)
                     .max(1) as f64;
                 println!(
-                    "neural_population_candidate_eval index={} source={} fitness={:.4} rank_score={:.4} behavior_bonus={:.4} goal_margin={:.4} sot_margin={:.4} dribble_beats={:.4} pass_progress={:.2} record={}-{}-{} goals={}-{}",
+                    "neural_population_candidate_eval index={} source={} fitness={:.4} rank_score={:.4} behavior_bonus={:.4} forward_passes={:.4} dribble_beats={:.4} pass_progress={:.2} record={}-{}-{} goals={}-{}",
                     candidate_eval.index,
                     candidate_eval.source,
                     candidate_eval.fitness,
                     rank_score,
                     neural_population_candidate_behavior_rank_bonus(&candidate_eval),
-                    neural_population_candidate_goal_margin(&candidate_eval),
-                    (f64::from(candidate_eval.behavior.shots_on_target_for)
-                        - f64::from(candidate_eval.behavior.shots_on_target_against))
-                        / games,
+                    f64::from(candidate_eval.behavior.completed_forward_passes_for) / games,
                     f64::from(candidate_eval.behavior.dribble_beats_for) / games,
                     candidate_eval.behavior.completed_pass_gain_yards_for / games,
                     candidate_eval.wins,
@@ -12060,6 +12056,7 @@ mod tests {
             behavior: NeuralPopulationCandidateBehavior {
                 shots_on_target_for: 6,
                 dribble_beats_for: 2,
+                completed_forward_passes_for: 18,
                 completed_pass_gain_yards_for: 90.0,
                 ..NeuralPopulationCandidateBehavior::default()
             },
@@ -12077,6 +12074,7 @@ mod tests {
             behavior: NeuralPopulationCandidateBehavior {
                 shots_on_target_for: 1,
                 shots_on_target_against: 8,
+                completed_forward_passes_for: 4,
                 pass_chains_net_loss_for: 3,
                 ..NeuralPopulationCandidateBehavior::default()
             },
@@ -12095,6 +12093,7 @@ mod tests {
         assert_eq!(combined.goals_against, 16);
         assert_eq!(combined.behavior.shots_on_target_for, 7);
         assert_eq!(combined.behavior.dribble_beats_for, 2);
+        assert_eq!(combined.behavior.completed_forward_passes_for, 22);
         assert_eq!(combined.behavior.pass_chains_net_loss_for, 3);
         assert_eq!(promotion.sample_games, 24);
         assert!(
@@ -12437,9 +12436,9 @@ mod tests {
     #[test]
     fn guarded_training_step_snapshot_selection_rejects_bad_fresh_snapshot() {
         let mut games = vec![
-            completed_game_with_score_and_neural_steps(0, 3, 0, 100),
-            completed_game_with_score_and_neural_steps(1, 0, 1, 500),
-            completed_game_with_score_and_neural_steps(2, 0, 8, 900),
+            completed_game_with_forward_advancement_and_neural_steps(0, 24, 4, 100),
+            completed_game_with_forward_advancement_and_neural_steps(1, 4, 14, 500),
+            completed_game_with_forward_advancement_and_neural_steps(2, 2, 30, 900),
         ];
 
         let selection = select_batch_neural_snapshot(
@@ -12465,9 +12464,9 @@ mod tests {
     #[test]
     fn unguarded_training_step_snapshot_selection_can_pick_freshest_snapshot() {
         let mut games = vec![
-            completed_game_with_score_and_neural_steps(0, 3, 0, 100),
-            completed_game_with_score_and_neural_steps(1, 0, 1, 500),
-            completed_game_with_score_and_neural_steps(2, 0, 8, 900),
+            completed_game_with_forward_advancement_and_neural_steps(0, 24, 4, 100),
+            completed_game_with_forward_advancement_and_neural_steps(1, 4, 14, 500),
+            completed_game_with_forward_advancement_and_neural_steps(2, 2, 30, 900),
         ];
 
         let selection = select_batch_neural_snapshot(
@@ -12488,9 +12487,9 @@ mod tests {
     #[test]
     fn batch_neural_snapshot_selection_rejects_batch_below_min_fitness_floor() {
         let mut games = vec![
-            completed_game_with_score_and_neural_steps(0, 0, 1, 100),
-            completed_game_with_score_and_neural_steps(1, 0, 2, 500),
-            completed_game_with_score_and_neural_steps(2, 1, 3, 900),
+            completed_game_with_forward_advancement_and_neural_steps(0, 2, 18, 100),
+            completed_game_with_forward_advancement_and_neural_steps(1, 3, 22, 500),
+            completed_game_with_forward_advancement_and_neural_steps(2, 4, 26, 900),
         ];
 
         let selection = select_batch_neural_snapshot(
@@ -12512,9 +12511,9 @@ mod tests {
     #[test]
     fn batch_neural_snapshot_selection_rejects_positive_outlier_in_negative_batch() {
         let mut games = vec![
-            completed_game_with_score_and_neural_steps(0, 1, 0, 100),
-            completed_game_with_score_and_neural_steps(1, 0, 3, 500),
-            completed_game_with_score_and_neural_steps(2, 0, 3, 900),
+            completed_game_with_forward_advancement_and_neural_steps(0, 20, 4, 100),
+            completed_game_with_forward_advancement_and_neural_steps(1, 1, 28, 500),
+            completed_game_with_forward_advancement_and_neural_steps(2, 1, 28, 900),
         ];
         let mean = games
             .iter()
@@ -12547,9 +12546,9 @@ mod tests {
     #[test]
     fn batch_neural_snapshot_selection_rescues_strong_snapshot_from_noisy_batch() {
         let mut games = vec![
-            completed_game_with_score_and_neural_steps(0, 3, 0, 100),
-            completed_game_with_score_and_neural_steps(1, 0, 4, 500),
-            completed_game_with_score_and_neural_steps(2, 0, 4, 900),
+            completed_game_with_forward_advancement_and_neural_steps(0, 36, 2, 100),
+            completed_game_with_forward_advancement_and_neural_steps(1, 1, 30, 500),
+            completed_game_with_forward_advancement_and_neural_steps(2, 1, 30, 900),
         ];
         let mean = games
             .iter()
@@ -12631,9 +12630,9 @@ mod tests {
     #[test]
     fn trainer_carry_selector_rejects_negative_snapshot_when_publish_gate_rejects_batch() {
         let mut guarded_games = vec![
-            completed_game_with_score_and_neural_steps(0, 0, 1, 100),
-            completed_game_with_score_and_neural_steps(1, 0, 2, 500),
-            completed_game_with_score_and_neural_steps(2, 1, 3, 900),
+            completed_game_with_forward_advancement_and_neural_steps(0, 2, 18, 100),
+            completed_game_with_forward_advancement_and_neural_steps(1, 3, 22, 500),
+            completed_game_with_forward_advancement_and_neural_steps(2, 4, 26, 900),
         ];
         let guarded = select_batch_neural_snapshot(
             &mut guarded_games,
@@ -12650,9 +12649,9 @@ mod tests {
         );
 
         let mut carry_games = vec![
-            completed_game_with_score_and_neural_steps(0, 0, 1, 100),
-            completed_game_with_score_and_neural_steps(1, 0, 2, 500),
-            completed_game_with_score_and_neural_steps(2, 1, 3, 900),
+            completed_game_with_forward_advancement_and_neural_steps(0, 2, 18, 100),
+            completed_game_with_forward_advancement_and_neural_steps(1, 3, 22, 500),
+            completed_game_with_forward_advancement_and_neural_steps(2, 4, 26, 900),
         ];
         assert!(
             select_batch_neural_snapshot_for_training_carry(&mut carry_games, true, 0.0).is_none(),
@@ -12663,9 +12662,9 @@ mod tests {
     #[test]
     fn trainer_carry_selector_preserves_nonnegative_snapshot_when_publish_gate_rejects_batch() {
         let mut guarded_games = vec![
-            completed_game_with_score_and_neural_steps(0, 1, 0, 100),
-            completed_game_with_score_and_neural_steps(1, 0, 3, 500),
-            completed_game_with_score_and_neural_steps(2, 0, 3, 900),
+            completed_game_with_forward_advancement_and_neural_steps(0, 20, 4, 100),
+            completed_game_with_forward_advancement_and_neural_steps(1, 1, 28, 500),
+            completed_game_with_forward_advancement_and_neural_steps(2, 1, 28, 900),
         ];
         let guarded = select_batch_neural_snapshot(
             &mut guarded_games,
@@ -12682,9 +12681,9 @@ mod tests {
         );
 
         let mut carry_games = vec![
-            completed_game_with_score_and_neural_steps(0, 1, 0, 100),
-            completed_game_with_score_and_neural_steps(1, 0, 3, 500),
-            completed_game_with_score_and_neural_steps(2, 0, 3, 900),
+            completed_game_with_forward_advancement_and_neural_steps(0, 20, 4, 100),
+            completed_game_with_forward_advancement_and_neural_steps(1, 1, 28, 500),
+            completed_game_with_forward_advancement_and_neural_steps(2, 1, 28, 900),
         ];
         let carry = select_batch_neural_snapshot_for_training_carry(&mut carry_games, true, 0.0)
             .expect("trainer carry should keep a non-collapsed local candidate warm");
@@ -12698,40 +12697,67 @@ mod tests {
 
     #[test]
     fn analytic_opponent_objective_scores_home_neural_not_match_winner() {
-        let summary = soccer_engine::des::general::soccer::MatchSummary {
+        let mut summary = soccer_engine::des::general::soccer::MatchSummary {
             score_home: 3,
             score_away: 12,
             ticks: 10,
             simulated_seconds: 1.0,
             stats: Default::default(),
         };
+        summary.stats.passes_attempted_home = 8;
+        summary.stats.passes_completed_home = 5;
+        summary.stats.passes_completed_forward_home = 2;
+        summary.stats.completed_pass_gain_yards_home = 10.0;
+        summary.stats.pass_chain_gain_yards_home = 12.0;
+        summary.stats.passes_attempted_away = 38;
+        summary.stats.passes_completed_away = 31;
+        summary.stats.passes_completed_forward_away = 25;
+        summary.stats.completed_pass_gain_yards_away = 135.0;
+        summary.stats.pass_chain_gain_yards_away = 150.0;
 
         assert!(soccer_learning_objective_match_fitness(&summary, false) > 1.0);
         assert!(soccer_learning_objective_match_fitness(&summary, true) < 0.0);
     }
 
     #[test]
-    fn analytic_opponent_objective_uses_dense_home_shot_pressure() {
-        let mut active_stats = soccer_engine::des::general::soccer::MatchStats::default();
-        active_stats.shots_home = 10;
-        active_stats.shots_on_target_home = 6;
-        active_stats.shots_after_pass_home = 4;
-        let active = soccer_engine::des::general::soccer::MatchSummary {
+    fn analytic_opponent_objective_uses_completed_forward_pass_advancement() {
+        let mut progressive_stats = soccer_engine::des::general::soccer::MatchStats::default();
+        progressive_stats.passes_attempted_home = 36;
+        progressive_stats.passes_completed_home = 29;
+        progressive_stats.passes_completed_forward_home = 23;
+        progressive_stats.completed_pass_gain_yards_home = 126.0;
+        progressive_stats.pass_chain_gain_yards_home = 156.0;
+        let progressive = soccer_engine::des::general::soccer::MatchSummary {
             score_home: 0,
             score_away: 0,
             ticks: 10,
             simulated_seconds: 1.0,
-            stats: active_stats,
+            stats: progressive_stats,
         };
 
-        let mut exposed = active.clone();
-        exposed.stats.shots_away = 10;
-        exposed.stats.shots_on_target_away = 7;
-        exposed.stats.shots_after_pass_away = 4;
+        let mut shot_farming = progressive.clone();
+        shot_farming.stats = soccer_engine::des::general::soccer::MatchStats::default();
+        shot_farming.stats.shots_home = 12;
+        shot_farming.stats.shots_on_target_home = 7;
+        shot_farming.stats.shots_after_pass_home = 5;
+        shot_farming.stats.passes_attempted_home = 16;
+        shot_farming.stats.passes_completed_home = 10;
+        shot_farming.stats.passes_completed_forward_home = 2;
+
+        let mut matched = progressive.clone();
+        matched.stats.passes_attempted_away = 36;
+        matched.stats.passes_completed_away = 29;
+        matched.stats.passes_completed_forward_away = 23;
+        matched.stats.completed_pass_gain_yards_away = 126.0;
+        matched.stats.pass_chain_gain_yards_away = 156.0;
 
         assert!(
-            soccer_learning_objective_match_fitness(&active, true)
-                > soccer_learning_objective_match_fitness(&exposed, true) + 0.40
+            soccer_learning_objective_match_fitness(&progressive, true)
+                > soccer_learning_objective_match_fitness(&shot_farming, true) + 0.80
+        );
+        assert!(
+            soccer_learning_objective_match_fitness(&progressive, true)
+                > soccer_learning_objective_match_fitness(&matched, true) + 2.0
         );
     }
 
@@ -13284,6 +13310,28 @@ mod tests {
         game.episode_summary.summary.score_away = score_away;
         game.artifact.summary = game.episode_summary.summary.clone();
         game.neural_network = Some(test_neural_snapshot_with_training_steps(training_steps));
+        game
+    }
+
+    fn completed_game_with_forward_advancement_and_neural_steps(
+        episode: usize,
+        home_forward_completed: u32,
+        away_forward_completed: u32,
+        training_steps: usize,
+    ) -> CompletedGame {
+        let mut game = completed_game_with_score_and_neural_steps(episode, 0, 0, training_steps);
+        let stats = &mut game.episode_summary.summary.stats;
+        stats.passes_attempted_home = home_forward_completed.saturating_add(6);
+        stats.passes_completed_home = home_forward_completed.saturating_add(3);
+        stats.passes_completed_forward_home = home_forward_completed;
+        stats.completed_pass_gain_yards_home = f64::from(home_forward_completed) * 5.5;
+        stats.pass_chain_gain_yards_home = f64::from(home_forward_completed) * 6.0;
+        stats.passes_attempted_away = away_forward_completed.saturating_add(6);
+        stats.passes_completed_away = away_forward_completed.saturating_add(3);
+        stats.passes_completed_forward_away = away_forward_completed;
+        stats.completed_pass_gain_yards_away = f64::from(away_forward_completed) * 5.5;
+        stats.pass_chain_gain_yards_away = f64::from(away_forward_completed) * 6.0;
+        game.artifact.summary = game.episode_summary.summary.clone();
         game
     }
 

@@ -342,6 +342,68 @@ bigger effect (more training), not just more games.
 Both use `DD_SOCCER_ENABLE_CHANCE_QUALITY_REWARD=1 SOCCER_NEURAL_TARGET_SCALE=30
 SOCCER_NEURAL_TARGET_CLIP=15 SOCCER_NEURAL_TARGET_POPART=true`.
 
+## ROUNDS 9–13 — reward-scale falsified, pivot to STRUCTURAL spatial-target (2026-07-08)
+
+The reward+window climb (above) beats the *trained self-play field* but the frozen frontiers
+still **lose to the pure-analytic engine** (0.33–0.44), so the wall moved but didn't fall. The
+next rounds chase why.
+
+**Round 9–10 — un-crush-via-scale FALSIFIED.** Raising `SOCCER_NEURAL_TARGET_SCALE` to un-crush
+the critic window degraded the *policy*, not just the fit: scale=120, 202k steps, 200g vs analytic
+→ mean **0.432** (Wilson 0.366), GD **−61** — worse than baseline. Confound (Codex): the actor GAE
+path re-multiplies critic predictions by `target_scale` before subtracting, so scale≠a clean
+un-crush. Follow-up `clip=10, no-popart` (decoupled: magnitudes fixed, only the rail widens) also
+REJECTED — 200g vs analytic **0.393** (Wilson 0.327), l2 climbed to 5.8 (critic fighting the rail).
+**Verdict: reward-scale tuning is spent.**
+
+**Round 10 — Codex "GO STRUCTURAL".** Root blocker identified by code audit: the POMDP actor picks
+action **TYPE + POWER but not the SPATIAL TARGET**. Pass receiver = analytic shortlist (no
+pass-to-space); shot placement = analytic (`scored_shot_placement_x`; MCTS shot expansion hardcodes
+goal-center); only DRIBBLE is rich (critic scores 12 move variants). So on pass+shoot the net is
+blocked from the highest-information geometric choice. **Lever: gated, default-off spatial-target
+hardening.**
+
+**BUILT (committed, tree clean, byte-identical off):**
+- `DD_SOCCER_ENABLE_NEURAL_PASS_SPACE` (`world.rs:14005`) — adds a second same-receiver pass
+  candidate whose `target_point` is the anticipated lead/space reception point, so the CRITIC owns
+  the feet-vs-run-onto choice; `target_player` stays bound (pass MPC/receipt/concede-veto unchanged).
+  Pass MPC quality is scored against that point at `world.rs:16569`.
+- `DD_SOCCER_ENABLE_SCORED_SHOT_PLACEMENT` (`world.rs:36676`) — but note this is a **global
+  execution** change (`world.rs:26662`), so enabling it in eval also helps the analytic opponent.
+
+**Round 12 — eval-gate fix (committed):** `draw_aware_lower_bound` + `DD_SOCCER_ENABLE_DRAW_AWARE_WILSON`
+(`soccer_eval_gate.rs:74`, default-off). Empirical {1,0.5,0} variance instead of Bernoulli; flips
+the earlier 200-game 0.493-REJECT toward PASS on the same record.
+
+**Live runs (2026-07-08 ~20:00Z):**
+1. `climb-target` — mainline confirm of reward+window: `CHANCE_QUALITY=1`, `TARGET_SCALE=30 CLIP=15
+   POPART=true`, `hidden=128`, `RELATIONAL_ATTENTION=1`, entropy .05, authoritative λ=8,
+   `DRAW_AWARE_WILSON=1`. Frontier `/tmp/soccer-climb`.
+2. `newmain` — NEW forward-pass-primacy reward: `FORWARD_PASS_REWARD_SCALE=6`,
+   `SHOT_SHAPING_REWARD_SCALE=0.4`, λ=8. Shift buildup toward forward progression; dampen low-value
+   shots. Frontier `/tmp/neural-climb-local/fwdpass-frontier.json`.
+3. `passspace_long` — pass-space net resumed from 198710 steps, training longer.
+
+**Round 13 — Codex re-sync + the LOST verdict.** The pass-space A/B (`passspace_ab.sh`) trained 5
+rounds with the gate ON then ran a 100g gate-ON eval — but **captured no verdict**: the log grep
+missed it because `soccer_eval_gate_run` prints "Wilson lower bound" and **exits nonzero on REJECT**,
+so the filtered/pipefail'd capture swallowed the output. The only recorded eval of that net
+(`confirm_climb.log`, 0.325) ran it with the gate **OFF** → *not a valid lever test*. So pass-space
+is **unproven, not falsified.** Codex round-13 calls:
+- **Q1 — recover the pass-space verdict first** (higher-value uncertainty than the reward run):
+  gate-ON-vs-analytic and gate-OFF-vs-analytic on identical held-out seeds, **separate processes**
+  (gate is a process `OnceLock`), full `tee` capture. → `scripts`/`/tmp/passspace_recover.sh`.
+- **Q2 — pure analytic is the north star.** "0.546 vs trained field + 0.33–0.44 vs analytic" =
+  the neural field is too self-referential to be a promotion target; **analytic anchoring is
+  mandatory** in train/eval. Structural expression is unproven, *not* failed.
+- **Q3 — isolate the gates.** Pass-space alone, then scored-shot-placement alone; only stack them
+  as a later exploratory run. Don't pair (scored-shot-placement's global execution change confounds).
+
+**Housekeeping flagged:** `codex_heartbeat.sh` posts a **stale hardcoded** status ("~0.62 vs
+analytic", `idx8` from 07-05) every 4 min — ignore/repoint its `status_line()` at the live logs.
+Codex's own repo checkout reported **dirty** (`world.rs, player.rs, tests.rs, soccer_league_train.rs`
+modified) while this machine's tree is clean — possible un-synced work on the Codex side.
+
 ## One-line summary
 
 The ceiling is structural: the net is a *selector over analytic candidates* optimizing
