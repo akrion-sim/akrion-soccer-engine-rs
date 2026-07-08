@@ -317,6 +317,31 @@ now teach "create danger."
 corrected empirical-variance Wilson. Verdict pending. (Off-ball behavioral gate-flip A/B already
 REJECTED decisively — Δ−159 Elo — confirming gate-flipping is dead; EPV export+grid complete as v2.)
 
+## CLIMB FOUND — reward+window (2026-07-08, 3-arm cycle)
+
+Ran three A/Bs concurrently (fixed-73, 80 train / 140 held-out, treatment vs baseline), judged by
+the corrected empirical-variance Wilson:
+
+| arm | record | payoff | Elo Δ | GD | read |
+|---|---|---|---|---|---|
+| chance-quality reward alone | 53-36-51 | 0.507 | −26 | +2 | draw-rate 45%→**26%** (stalemate broken) but only more *aggressive*, not better |
+| **combined: reward + window** | **59-35-46** | **0.546** | **+63** | **+22** | **CLIMBS** — the value net can now grade the chances the reward rewards |
+| interface (pass cand 3→6, cull 0.55→0) | 49-37-54 | 0.482 | −22 | −7 | slightly worse — **ruled out** |
+
+**Decomposition:** the reward alone doesn't climb (0.507/Elo−26); adding the **un-crushed critic
+window** (`target_scale=30`, `target_clip=3→15`, `PopArt on`) swings it to 0.546/Elo+63 — a +0.04
+payoff and +90 Elo swing. The window-fix is doing real work: with the critic no longer saturated
+at the ±3 rail, the graded chance-quality reward propagates into genuinely better valuations and
+GD +22. This is the first configuration to measurably beat baseline. It doesn't yet *confidently*
+clear Wilson (corrected 0.487 at 140 games) — power math: at payoff 0.546 the corrected one-sided
+bound clears 0.5 at ~300 eval games; at 0.58 it clears at 140. So the robust confirmation is a
+bigger effect (more training), not just more games.
+
+**Cycle 2 running:** two high-power confirmations of the winning stack (reward+window, 160 train /
+220 held-out) — one at the original seeds, one seed-varied — to widen the edge and confirm robustly.
+Both use `DD_SOCCER_ENABLE_CHANCE_QUALITY_REWARD=1 SOCCER_NEURAL_TARGET_SCALE=30
+SOCCER_NEURAL_TARGET_CLIP=15 SOCCER_NEURAL_TARGET_POPART=true`.
+
 ## One-line summary
 
 The ceiling is structural: the net is a *selector over analytic candidates* optimizing

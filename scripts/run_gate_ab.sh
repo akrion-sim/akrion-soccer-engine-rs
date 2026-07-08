@@ -42,12 +42,12 @@ echo "=== build ok ==="
 echo "=== [$(date -u +%FT%TZ)] training both arms (train_games=$TRAIN_GAMES minutes=$MINUTES) ==="
 # Baseline: clean incumbent defaults; only the interface freeze is explicit.
 env -i PATH="$PATH" HOME="$HOME" DD_SOCCER_ENABLE_DISCRETIZED_KICK=0 \
-  nice -n 12 "$BIN" train "$OUT/baseline.json" "$TRAIN_GAMES" "$MINUTES" 71A10000 \
+  nice -n 12 "$BIN" train "$OUT/baseline.json" "$TRAIN_GAMES" "$MINUTES" "${TRAIN_SEED:-71A10000}" \
   > "$OUT/train_baseline.log" 2>&1 &
 PID_BASE=$!
 # Treatment: incumbent defaults + the unspent lever gates on.
 env -i PATH="$PATH" HOME="$HOME" DD_SOCCER_ENABLE_DISCRETIZED_KICK=0 $TREATMENT_ENV \
-  nice -n 12 "$BIN" train "$OUT/treatment.json" "$TRAIN_GAMES" "$MINUTES" 71A10000 \
+  nice -n 12 "$BIN" train "$OUT/treatment.json" "$TRAIN_GAMES" "$MINUTES" "${TRAIN_SEED:-71A10000}" \
   > "$OUT/train_treatment.log" 2>&1 &
 PID_TREAT=$!
 
@@ -58,7 +58,7 @@ echo "treatment: $(tail -1 "$OUT/train_treatment.log")"
 
 echo "=== [$(date -u +%FT%TZ)] held-out eval (lever-active world): treatment vs baseline, $EVAL_GAMES games ==="
 env -i PATH="$PATH" HOME="$HOME" DD_SOCCER_ENABLE_DISCRETIZED_KICK=0 $TREATMENT_ENV \
-  nice -n 12 "$BIN" eval "$OUT/treatment.json" "$OUT/baseline.json" "$EVAL_GAMES" "$MINUTES" E7A10000 \
+  nice -n 12 "$BIN" eval "$OUT/treatment.json" "$OUT/baseline.json" "$EVAL_GAMES" "$MINUTES" "${EVAL_SEED:-E7A10000}" \
   | tee "$OUT/verdict.log"
 
 echo ""
