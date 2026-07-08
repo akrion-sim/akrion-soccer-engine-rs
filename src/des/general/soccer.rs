@@ -12239,6 +12239,15 @@ pub(crate) fn dd_soccer_enable_learned_pass_receiver() -> bool {
 /// grid-only key. Stored verbatim in the `receiver_descriptor` RDS column (`default -1`).
 pub(crate) const RECEIVER_DESCRIPTOR_UNSPECIFIED: i32 = -1;
 
+/// Forward/backward dead-band (yards) for the receiver-descriptor `progression` axis: a pass
+/// whose along-attack advance is within ±this reads as "square".
+pub(crate) const SOCCER_RECEIVER_FORWARD_SQUARE_YARDS: f64 = 4.0;
+/// Nearest-opponent distance (yards) below which a receiver spot is "tight" (openness 0).
+pub(crate) const SOCCER_RECEIVER_TIGHT_YARDS: f64 = 3.0;
+/// Nearest-opponent distance (yards) at/above which a receiver spot is "open" (openness 2);
+/// between tight and this it is "contested" (openness 1).
+pub(crate) const SOCCER_RECEIVER_OPEN_YARDS: f64 = 7.0;
+
 /// Kind axis of a [`ReceiverDescriptor`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReceiverKind {
