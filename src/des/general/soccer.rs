@@ -37811,6 +37811,49 @@ pub fn learned_pass_completion_enabled() -> bool {
     }
 }
 
+/// Env flag enabling the learned MPC execution-objective head ([`SoccerMpcObjectiveHead`]): when a
+/// pass/shot/dribble is executed and the head is warm, it adds a hard-bounded (≤
+/// [`MPC_OBJECTIVE_MAX_RESIDUAL_YARDS`]) residual to the analytic aim/lead target before the
+/// existing pitch/onside/speed guards re-clamp it. Off ⇒ the pure analytic target stands alone
+/// (byte-identical to the pre-wiring behaviour). Read once per process. The policy still owns WHICH
+/// action and WHICH receiver — this only nudges the executor's aim within the guard envelope.
+pub fn learned_mpc_objective_enabled() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE"))
+    }
+}
+
+/// Exploration std-dev (yards) for the MPC-objective head's residual at capture time, overridable
+/// via `SOCCER_MPC_OBJECTIVE_EXPLORE_SIGMA` for A/B sweeps. Clamped to `[0, MAX_RESIDUAL]` so the
+/// jitter can never dominate the hard bound. Default = [`MPC_OBJECTIVE_EXPLORE_SIGMA_YARDS`].
+pub(crate) fn mpc_objective_explore_sigma_yards() -> f64 {
+    let read = || {
+        std::env::var("SOCCER_MPC_OBJECTIVE_EXPLORE_SIGMA")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.0, MPC_OBJECTIVE_MAX_RESIDUAL_YARDS))
+            .unwrap_or(MPC_OBJECTIVE_EXPLORE_SIGMA_YARDS)
+    };
+    #[cfg(test)]
+    {
+        read()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static SIGMA: OnceLock<f64> = OnceLock::new();
+        *SIGMA.get_or_init(read)
+    }
+}
+
 fn soccer_env_flag_enabled(name: &str) -> bool {
     std::env::var(name)
         .map(|raw| {
