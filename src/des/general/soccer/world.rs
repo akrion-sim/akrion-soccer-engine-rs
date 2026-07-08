@@ -1986,7 +1986,6 @@ fn soccer_novelty_bucket_counts(
         }
     }
     (counts, x_max, y_max)
->>>>>>> theirs
 }
 
 #[cfg(test)]
