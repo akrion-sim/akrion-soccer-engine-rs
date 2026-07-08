@@ -456,7 +456,6 @@ fn main() {
     if let Ok(raw) = std::env::var("SOCCER_NEURAL_ACTOR_CRITIC") {
         runner_config.base.neural_blend.actor_critic = matches!(raw.trim(), "1" | "true" | "TRUE" | "yes" | "on");
     }
->>>>>>> wip/coma-analytic-advantage
     // Keep the engine's designed independent-brain mode (per-team critic drives each side).
     let runner = EngineMatchRunner::new(runner_config);
 
