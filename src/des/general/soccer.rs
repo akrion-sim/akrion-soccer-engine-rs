@@ -2083,6 +2083,8 @@ const PASS_CHAIN_HISTORY_LIMIT: usize = 8;
 const PASS_CHAIN_MAX_CONTINUATION_SECONDS: f64 = 12.0;
 // Pass-chain event bonuses trimmed (7.5→2.5, 10→3.5) for the same reason as the forward-pass
 // base above: successive passing must stay a build-up MEANS, not an end that rivals a shot/goal.
+// (A "fast-signal" experiment explored boosting these to 30/40 to dominate the value target over
+// the slow win broadcast; NOT adopted — it directly contradicts main's outcome-dominant design.)
 const PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS: f64 = 2.5;
 const PASS_CHAIN_THREE_NET_FORWARD_EVENT_REWARD_POINTS: f64 = 3.5;
 /// Penalty (points, applied negative) for an isolated attacking carrier panicking a
@@ -5532,7 +5534,12 @@ const MAX_SOCCER_NEURAL_MAX_PENDING_BATCHES: usize = 256;
 const MAX_SOCCER_NEURAL_REPLAY_CAPACITY: usize = 50_000;
 const MAX_SOCCER_NEURAL_REPLAY_SAMPLES_PER_TICK: usize = 4096;
 const MAX_SOCCER_NEURAL_SNAPSHOT_EVERY_BATCHES: usize = 4096;
-const SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK: f64 = 0.995;
+// CREDIT-ASSIGNMENT fix (Jul 2026, GAE/n-step inspired): 0.995 credited a decision for everything
+// over the next ~9.2s (half-life 138 ticks) — near-Monte-Carlo, max variance, diffusing credit
+// across unrelated events (the research's λ=1 worst case). 0.98 = ~2.3s half-life: credits the
+// actual causal build-up (a 2-3 pass move into a shot) while cutting the noisy long tail, so the
+// fast signals (forward-pass chains, shots) get focused, low-variance, attributable credit.
+const SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK: f64 = 0.98;
 const SOCCER_FULL_GAME_RETURN_BLEND: f64 = 0.35;
 const SOCCER_FULL_GAME_RETURN_CLIP: f64 = 400.0;
 const DD_SOCCER_OUTCOME_CREDIT_ENV: &str = "DD_SOCCER_OUTCOME_CREDIT";
@@ -5567,6 +5574,9 @@ const SOCCER_OUTCOME_CREDIT_MILESTONE_REWARD_CAP: f64 = GOAL_REWARD_POINTS;
 // "beat the opponent" — not "play tidy" — is unambiguously what the value is optimizing (TiZero/
 // AlphaStar). Broadcast to every transition (clipped ±SOCCER_FULL_GAME_RETURN_CLIP). MUST still be
 // A/B'd through the promotion eval gate; do not tune on raw reward.
+// (A later "fast-signal" experiment argued the reverse — that ±200 on every transition drowns the
+// fast attributable pass-chain/shot signals ~8-30:1 and should be cut to a ~30 nudge; NOT adopted,
+// pending an eval-gate A/B, since it inverts this outcome-dominant design.)
 const MATCH_OUTCOME_WIN_REWARD_POINTS: f64 = 200.0;
 const MATCH_OUTCOME_DRAW_REWARD_POINTS: f64 = 0.0;
 const MATCH_OUTCOME_PER_GOAL_MARGIN_POINTS: f64 = 15.0;
@@ -14535,6 +14545,9 @@ fn soccer_full_game_replay_transitions(
     transitions: &[SoccerLearningTransition],
     match_outcome: Option<MatchOutcomeReward>,
 ) -> Vec<SoccerLearningTransition> {
+    if dd_soccer_enable_dp_bootstrap() {
+        return soccer_dp_bootstrapped_replay_transitions(transitions, match_outcome);
+    }
     if dd_soccer_enable_outcome_credit() {
         let outcome =
             match_outcome.or_else(|| soccer_outcome_match_reward_from_transitions(transitions));
@@ -14632,6 +14645,269 @@ fn soccer_correlated_full_game_replay_transitions(
     }
     replay.reverse();
     replay
+}
+
+/// Sample-based (fitted) value iteration over the abstract-state MDP. `samples` are
+/// `(bucket, reward, next_bucket)` tuples drawn from the replay; `next_bucket = None` marks a
+/// terminal step (bootstraps 0 — the flat outcome label is credited separately). Each Jacobi sweep
+/// sets `V(b) ← mean over samples from b of [r + γ·V(b')]`; the table is tiny so a few dozen sweeps
+/// propagate value across the whole abstract MDP. Values are clamped to the shared return clip.
+fn soccer_dp_value_iteration(
+    samples: &[(u32, f64, Option<u32>)],
+    gamma: f64,
+    sweeps: usize,
+) -> BTreeMap<u32, f64> {
+    let mut value: BTreeMap<u32, f64> = BTreeMap::new();
+    for _ in 0..sweeps {
+        let mut acc: BTreeMap<u32, (f64, usize)> = BTreeMap::new();
+        for (b, r, nb) in samples {
+            let boot = match nb {
+                Some(nb) => gamma * *value.get(nb).unwrap_or(&0.0),
+                None => 0.0,
+            };
+            let e = acc.entry(*b).or_insert((0.0, 0));
+            e.0 += *r + boot;
+            e.1 += 1;
+        }
+        for (b, (sum, count)) in acc {
+            if count > 0 {
+                value.insert(
+                    b,
+                    (sum / count as f64)
+                        .clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP),
+                );
+            }
+        }
+    }
+    value
+}
+
+/// n-step bootstrapped return starting at index `start` of one team's decision sequence `seq`
+/// (`(tick, reward, bucket)` tuples): `Σ_{k<h} γ^k r_{start+k} + γ^h V(b_{start+h})`. The horizon
+/// truncates the Monte-Carlo tail; when the sequence ends before the horizon fills, the tail
+/// bootstraps 0 (the outcome label is added by the caller). Clamped to the shared return clip.
+fn soccer_dp_nstep_return(
+    seq: &[(u64, f64, u32)],
+    start: usize,
+    horizon: usize,
+    gamma: f64,
+    value: &BTreeMap<u32, f64>,
+) -> f64 {
+    let mut ret = 0.0;
+    let mut disc = 1.0;
+    for k in 0..horizon {
+        let j = start + k;
+        if j >= seq.len() {
+            break;
+        }
+        ret += disc * seq[j].1;
+        disc *= gamma;
+        if k + 1 == horizon {
+            if let Some(nb) = seq.get(j + 1).map(|n| n.2) {
+                ret += disc * *value.get(&nb).unwrap_or(&0.0);
+            }
+        }
+    }
+    ret.clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP)
+}
+
+/// Compact, team-relative abstraction of the symbolic MDP state for the DP value table. From the
+/// acting team's perspective: attacking-third of the ball (x), lateral third (y), possession
+/// (us/them/loose), score sign (winning/level/losing), and a team-relative phase (our-build /
+/// our-attack / their-build / their-attack / kickoff / transition). Cardinality ≤ 3·3·3·3·6 = 486
+/// so a single game's transitions sample it densely. Away's attacking third is mirrored so that
+/// "in our attacking third" maps to the SAME bucket for both teams, pooling samples.
+fn soccer_dp_state_bucket(
+    state: &SoccerMdpState,
+    team: Team,
+    ball_x_max: usize,
+    ball_y_max: usize,
+) -> u32 {
+    let third = |z: usize, max: usize| -> u32 {
+        if max == 0 {
+            return 1;
+        }
+        ((z as u64 * 3 / (max as u64 + 1)) as u32).min(2)
+    };
+    let mut x_third = third(state.ball_zone_x, ball_x_max);
+    if team == Team::Away {
+        x_third = 2 - x_third;
+    }
+    let y_third = third(state.ball_zone_y, ball_y_max);
+    let poss = match state.possession_team {
+        Some(t) if t == team => 0u32,
+        Some(_) => 1,
+        None => 2,
+    };
+    let sd = match team {
+        Team::Home => state.score_diff_for_home,
+        Team::Away => -state.score_diff_for_home,
+    };
+    let score_sign = if sd > 0 {
+        2u32
+    } else if sd < 0 {
+        0
+    } else {
+        1
+    };
+    let phase = match (state.phase, team) {
+        (TacticalPhase::Kickoff, _) => 4u32,
+        (TacticalPhase::Transition, _) => 5,
+        (TacticalPhase::HomeBuildUp, Team::Home) | (TacticalPhase::AwayBuildUp, Team::Away) => 0,
+        (TacticalPhase::HomeAttack, Team::Home) | (TacticalPhase::AwayAttack, Team::Away) => 1,
+        (TacticalPhase::HomeBuildUp, Team::Away) | (TacticalPhase::AwayBuildUp, Team::Home) => 2,
+        (TacticalPhase::HomeAttack, Team::Away) | (TacticalPhase::AwayAttack, Team::Home) => 3,
+    };
+    (((x_third * 3 + y_third) * 3 + poss) * 3 + score_sign) * 6 + phase
+}
+
+/// Fitted-value-iteration replay (approximate dynamic programming). Replaces the pure Monte-Carlo
+/// correlated team return of `soccer_correlated_full_game_replay_transitions` with an **n-step
+/// return bootstrapped by a value-iterated abstract-state table**. The individual-reward blend,
+/// flat outcome label, clamps, and `done` flag are byte-identical to the MC path, so the gate is a
+/// clean A/B that changes ONLY the correlated-return quantity from full-MC to DP-bootstrapped.
+fn soccer_dp_bootstrapped_replay_transitions(
+    transitions: &[SoccerLearningTransition],
+    match_outcome: Option<MatchOutcomeReward>,
+) -> Vec<SoccerLearningTransition> {
+    if transitions.is_empty() {
+        return Vec::new();
+    }
+    let gamma = SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK;
+    let horizon = dd_soccer_dp_bootstrap_horizon();
+    let sweeps = dd_soccer_dp_bootstrap_sweeps();
+    let team_index = |team: Team| -> usize {
+        match team {
+            Team::Home => 0,
+            Team::Away => 1,
+        }
+    };
+
+    // Ball-zone extents for adaptive thirds.
+    let mut ball_x_max = 0usize;
+    let mut ball_y_max = 0usize;
+    for t in transitions {
+        ball_x_max = ball_x_max.max(t.state.ball_zone_x);
+        ball_y_max = ball_y_max.max(t.state.ball_zone_y);
+    }
+
+    // Per-team decision sequences (tick-sorted): mean team reward + abstract bucket at each tick.
+    let mut by_tick: BTreeMap<u64, [(f64, usize, u32); 2]> = BTreeMap::new();
+    for t in transitions {
+        let bucket = soccer_dp_state_bucket(&t.state, t.team, ball_x_max, ball_y_max);
+        let slot = &mut by_tick.entry(t.tick).or_insert([(0.0, 0, 0); 2])[team_index(t.team)];
+        slot.0 += finite_metric(t.reward);
+        slot.1 += 1;
+        slot.2 = bucket;
+    }
+    let mut seq: [Vec<(u64, f64, u32)>; 2] = [Vec::new(), Vec::new()];
+    for (tick, slots) in &by_tick {
+        for (ti, slot) in slots.iter().enumerate() {
+            let (sum, count, bucket) = *slot;
+            if count > 0 {
+                seq[ti].push((*tick, sum / count as f64, bucket));
+            }
+        }
+    }
+
+    // Sample-based value iteration over pooled (bucket, reward, next_bucket) tuples from both teams.
+    let mut samples: Vec<(u32, f64, Option<u32>)> = Vec::new();
+    for s in &seq {
+        for i in 0..s.len() {
+            samples.push((s[i].2, s[i].1, s.get(i + 1).map(|n| n.2)));
+        }
+    }
+    let value = soccer_dp_value_iteration(&samples, gamma, sweeps);
+
+    // n-step bootstrapped correlated return per (team, tick).
+    let mut correlated: BTreeMap<(usize, u64), f64> = BTreeMap::new();
+    for (ti, s) in seq.iter().enumerate() {
+        for i in 0..s.len() {
+            correlated.insert(
+                (ti, s[i].0),
+                soccer_dp_nstep_return(s, i, horizon, gamma, &value),
+            );
+        }
+    }
+
+    // Assemble replay: identical blend / outcome / clamp / done to the MC correlated path.
+    let mut replay = Vec::with_capacity(transitions.len());
+    for t in transitions {
+        let mut transition = t.clone();
+        let corr = correlated
+            .get(&(team_index(transition.team), transition.tick))
+            .copied()
+            .unwrap_or(0.0);
+        let blended = (1.0 - SOCCER_FULL_GAME_RETURN_BLEND) * finite_metric(transition.reward)
+            + SOCCER_FULL_GAME_RETURN_BLEND * corr;
+        let with_outcome = match match_outcome {
+            Some(outcome) => blended + outcome.for_team(transition.team),
+            None => blended,
+        };
+        transition.reward =
+            with_outcome.clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP);
+        transition.done = true;
+        replay.push(transition);
+    }
+    replay
+}
+
+#[cfg(test)]
+mod soccer_dp_bootstrap_tests {
+    use super::*;
+
+    #[test]
+    fn value_iteration_propagates_reward_backward_through_chain() {
+        // Chain 0 -> 1 -> 2, with reward 10 collected on the terminal step out of bucket 2.
+        // Fitted VI should give V(2)=10, V(1)=γ·10, V(0)=γ²·10 (monotone, all positive).
+        let samples = vec![
+            (0u32, 0.0, Some(1u32)),
+            (1u32, 0.0, Some(2u32)),
+            (2u32, 10.0, None),
+        ];
+        let gamma = 0.9;
+        let v = soccer_dp_value_iteration(&samples, gamma, 80);
+        let v0 = *v.get(&0).unwrap();
+        let v1 = *v.get(&1).unwrap();
+        let v2 = *v.get(&2).unwrap();
+        assert!((v2 - 10.0).abs() < 1e-6, "terminal-reward bucket = raw reward");
+        assert!((v1 - gamma * 10.0).abs() < 1e-6, "one step back discounts once");
+        assert!(
+            (v0 - gamma * gamma * 10.0).abs() < 1e-6,
+            "two steps back discounts twice"
+        );
+        assert!(v0 > 0.0 && v0 < v1 && v1 < v2, "value rises toward the reward");
+    }
+
+    #[test]
+    fn value_iteration_empty_is_empty() {
+        assert!(soccer_dp_value_iteration(&[], 0.98, 40).is_empty());
+    }
+
+    #[test]
+    fn nstep_return_truncates_horizon_and_bootstraps_value() {
+        // seq of (tick, reward, bucket); constant reward 1, all bucket 0; V(0)=5.
+        let seq = vec![(0u64, 1.0, 0u32), (1, 1.0, 0), (2, 1.0, 0), (3, 1.0, 0)];
+        let mut value = BTreeMap::new();
+        value.insert(0u32, 5.0);
+        let gamma = 0.9;
+        // horizon 2 from start 0: 1 + γ·1 + γ²·V(0) = 1 + 0.9 + 0.81·5 = 5.95.
+        let r = soccer_dp_nstep_return(&seq, 0, 2, gamma, &value);
+        assert!((r - 5.95).abs() < 1e-6, "n-step = discounted rewards + bootstrap, got {r}");
+        // At the tail (start 3) the window can't fill and has no successor ⇒ no bootstrap ⇒ just 1.0.
+        let tail = soccer_dp_nstep_return(&seq, 3, 2, gamma, &value);
+        assert!((tail - 1.0).abs() < 1e-6, "terminal tail bootstraps 0, got {tail}");
+    }
+
+    #[test]
+    fn nstep_return_without_value_table_is_plain_discounted_sum() {
+        // Empty value table ⇒ bootstrap term is 0 ⇒ pure n-step Monte-Carlo sum.
+        let seq = vec![(0u64, 2.0, 7u32), (1, 2.0, 7), (2, 2.0, 7)];
+        let empty = BTreeMap::new();
+        let r = soccer_dp_nstep_return(&seq, 0, 2, 0.5, &empty);
+        // 2 + 0.5·2 + 0.25·V(7=absent→0) = 3.0.
+        assert!((r - 3.0).abs() < 1e-9, "got {r}");
+    }
 }
 
 fn soccer_outcome_credit_replay_transitions(
@@ -21816,6 +22092,206 @@ pub(crate) fn dd_soccer_enable_pass_oob_penalty() -> bool {
     *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_PASS_OOB_PENALTY"))
 }
 
+/// Cached gate for the cross-tick deferred credit/penalty attribution fix (completed passes +
+/// turnover penalties back-dated to their decision transition). Cached in a `OnceLock` because it
+/// is read on the hot training path (per completed pass / per turnover) where a per-call
+/// `std::env::var` syscall would be wasteful. OFF (default) ⇒ byte-identical to baseline.
+pub(crate) fn dd_soccer_enable_deferred_pass_credit() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_DEFERRED_PASS_CREDIT"))
+}
+
+/// Gate for the **approximate-dynamic-programming bootstrap** of the full-game replay's correlated
+/// team return. OFF (default) leaves the return a pure Monte-Carlo backward accumulation over the
+/// whole game (`home_return = home_mean + γ·home_return`, `done=true` ⇒ no bootstrap), which is the
+/// highest-variance / worst credit-assignment target the authoritative value net can train on. ON
+/// replaces the full-MC team return with an **n-step return bootstrapped by a value-iterated
+/// abstract-state table** V(ball-zone × possession × score-sign × phase): value iteration over the
+/// game's own (s, r, s') tuples gives a low-variance DP value, and the n-step truncation stops the
+/// whole-game noise from swamping each decision. This is the "fitted value iteration from replay"
+/// bridge between pure neural learning and architecture changes — the net stays the function
+/// approximator, DP just supplies a better target. Byte-identical to baseline when OFF.
+pub(crate) fn dd_soccer_enable_dp_bootstrap() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_DP_BOOTSTRAP"))
+}
+
+/// n-step horizon (in decision ticks) for the DP-bootstrapped return. After this many ticks the
+/// return bootstraps off the value-iterated abstract table instead of continuing the Monte-Carlo
+/// sum. Small ⇒ low variance but leans hard on the DP value; large ⇒ closer to full MC. Default 16.
+pub(crate) fn dd_soccer_dp_bootstrap_horizon() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_DP_BOOTSTRAP_HORIZON")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|n| *n >= 1 && *n <= 4096)
+            .unwrap_or(16)
+    })
+}
+
+/// Number of value-iteration sweeps over the abstract-state table built from a single game's
+/// transitions. The table is tiny (≤ a few hundred buckets) so this is cheap; ~40 sweeps at
+/// γ=0.98 propagates value across the whole abstract MDP. Default 40.
+pub(crate) fn dd_soccer_dp_bootstrap_sweeps() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_DP_BOOTSTRAP_SWEEPS")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|n| *n >= 1 && *n <= 1000)
+            .unwrap_or(40)
+    })
+}
+
+/// Gate for **value-target standardization** (the fix for value-head collapse). The value net
+/// trains on `target = (r + γ·max_next) / target_scale` with a fixed `target_scale` (30), which
+/// shrinks whole-game returns to a near-constant ~0.04 cluster; predicting that constant is
+/// loss-optimal, so the output layer's weights decay toward zero and the value function goes FLAT
+/// (verified: `mean|W_out|≈0.005`, output std ≈0.05 across all states). A flat value can't rank
+/// actions, so the authoritative decision defaults to the analytic candidate order ⇒ parity.
+/// ON re-centers + rescales each training batch's targets to ~zero-mean / unit-variance, so
+/// "predict the mean" is no longer loss-optimal and the net is forced to encode state-dependent
+/// value (ranking is scale/shift-invariant, so decisions are unaffected by the rescale). OFF
+/// (default) is byte-identical. Complements the DP bootstrap: DP sharpens the target signal,
+/// standardization makes the net actually use it.
+pub(crate) fn dd_soccer_enable_target_standardization() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_TARGET_STANDARDIZATION"))
+}
+
+/// Env override for the neural-blend **candidate cap** — how many top tabular candidates the value
+/// net re-ranks per decision (the "action interface"). The default (4) bottlenecks even a perfectly
+/// un-collapsed value head to 4 tabular-selected actions, so it can match but not exceed a strong
+/// analytic engine. Widening it lets a discriminative value express a better policy over more
+/// options — the lever for the action-interface ceiling that sits *behind* the value collapse.
+/// `DD_SOCCER_NEURAL_BLEND_CANDIDATES` (clamped 2..=64) overrides the config value; unset ⇒ the
+/// config value is used unchanged (byte-identical).
+pub(crate) fn dd_soccer_neural_blend_candidates(config_value: usize) -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<Option<usize>> = OnceLock::new();
+    (*V.get_or_init(|| {
+        std::env::var("DD_SOCCER_NEURAL_BLEND_CANDIDATES")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .map(|n| n.clamp(2, 64))
+    }))
+    .unwrap_or(config_value)
+}
+
+/// Gate for the **count-based novelty exploration bonus** (gate-two lever). The un-collapsed value
+/// can rank states but only *matches* the analytic engine because it only ever sees analytic-quality
+/// candidate actions — exploration diversifies among *already-visited* actions rather than seeking
+/// novel ones. ON adds an optimism bonus `coef / sqrt(1 + count(bucket, action))` to each training
+/// transition's reward, where `count` is how often that (abstract-state-bucket, action-family) pair
+/// appears in the batch. Rarely-tried actions get a bonus → the value rates them higher → the policy
+/// (which ranks by value) tries them → they get explored and their true value learned (optimism in
+/// the face of uncertainty). The bonus self-decays as an action becomes common. Reuses the DP
+/// abstract-state bucket. OFF (default) ⇒ byte-identical.
+pub(crate) fn dd_soccer_enable_novelty_bonus() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_NOVELTY_BONUS"))
+}
+
+/// Coefficient (in reward points) for the novelty exploration bonus. Bonus =
+/// `coef / sqrt(1 + count)`, so a never-before-seen (bucket, action) gets ~`coef` and it decays
+/// toward 0 as the pair is repeated. Default 6.0 (~a completed-pass-scale nudge). Env
+/// `DD_SOCCER_NOVELTY_BONUS_COEF`.
+pub(crate) fn dd_soccer_novelty_bonus_coef() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_NOVELTY_BONUS_COEF")
+            .ok()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|c| c.is_finite() && *c >= 0.0 && *c <= 100.0)
+            .unwrap_or(6.0)
+    })
+}
+
+/// Gate for the **neural self-bootstrap value target** (Priority-1 Part C — the true
+/// policy-improvement lever). By default the neural value target's `max_next` comes from the
+/// **tabular** Q (`best_value_hierarchical`), so the net is trained to *match* the tabular/analytic
+/// policy's values — it can converge to but structurally not EXCEED analytic (imitation ceiling).
+/// ON blends the net's **own** predicted successor value into `max_next` at weight
+/// `dd_soccer_self_bootstrap_weight()`, turning the update into real neural TD/Q-learning: the value
+/// can now rate a policy *better* than tabular, which is the only thing here that can exceed
+/// analytic. (Main already ships a 0.65 blend behind `DD_SOCCER_ENABLE_NEURAL_VALUE_BOOTSTRAP`; this
+/// is the local equivalent so the /tmp tree can test it.) OFF (default) ⇒ byte-identical tabular
+/// target. Note: bootstrapping off the net's own value is the deadly triad — keep the weight < 1
+/// early and watch for divergence.
+pub(crate) fn dd_soccer_enable_neural_self_bootstrap() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_NEURAL_SELF_BOOTSTRAP"))
+}
+
+/// Blend weight for the neural self-bootstrap: `max_next = w·V_net(s') + (1-w)·tabular`. Default 0.7
+/// (near main's 0.65); env `DD_SOCCER_SELF_BOOTSTRAP_WEIGHT`, clamped [0,1]. 1.0 = pure neural
+/// self-bootstrap (most policy-improvement power, least stable).
+pub(crate) fn dd_soccer_self_bootstrap_weight() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_SELF_BOOTSTRAP_WEIGHT")
+            .ok()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|w| w.is_finite())
+            .map(|w| w.clamp(0.0, 1.0))
+            .unwrap_or(0.7)
+    })
+}
+
+/// The **max_a** upgrade of the self-bootstrap (the real policy-IMPROVEMENT lever). When the
+/// self-bootstrap is on, OFF (default) uses the observed-successor / state value `V(s')` — that is
+/// SARSA / policy *evaluation*, which accurately values the *current* (analytic-ish) policy and
+/// therefore lands at parity. ON evaluates `max_a V_net(s', a)` over a curated set of core action
+/// families — Q-learning / policy *improvement*: the target assumes the successor takes the BEST
+/// action, so the value can rate a policy *better* than the behavior policy and thus EXCEED analytic.
+/// Kept to a small in-distribution family set to avoid out-of-distribution/deadly-triad blowup.
+pub(crate) fn dd_soccer_enable_maxa_bootstrap() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_MAXA_BOOTSTRAP"))
+}
+
+/// Curated core action families for the `max_a` self-bootstrap. Deliberately the primary,
+/// high-frequency, almost-always-legal decisions the net has seen densely in training, so
+/// `V_net(s', family)` stays in-distribution (a full 73-family max would include rarely-seen /
+/// illegal families whose OOD value could spike the target and diverge).
+pub(crate) const SOCCER_MAXA_BOOTSTRAP_FAMILIES: &[&str] = &[
+    "hold",
+    "dribble",
+    "carry-forward",
+    "pass",
+    "aerial-pass",
+    "killer-pass",
+    "switch-play",
+    "clearance",
+    "shoot",
+    "vertical-attack",
+];
+
+/// Gate for interception-aware route-one / clearance training credit. OFF (the default) leaves the
+/// `soccer_goal_credit_transition_score` long-ball branch byte-identical to baseline, where a hoofed
+/// forward ball is credited purely on distance/pressure/urgency with NO interception or completion
+/// term — so self-play keeps rewarding 60-70yd balls that get picked off (passes straight to the
+/// opponent). ON prices aerial interception + OOB bounds the same way ordinary aerial passes are
+/// priced and gates the raw forward-distance credit behind expected completion, so an interceptable
+/// long ball no longer out-scores a retained shorter outlet. The own-goal urgency term is left
+/// intact, so a genuine clearance under pressure is still credited.
+pub(crate) fn dd_soccer_enable_route_one_interception_credit() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_ROUTE_ONE_INTERCEPTION_CREDIT"))
+}
+
 /// Gate for overload-weighted progression rewards (see the `OVERLOAD_*` constants). OFF (the
 /// default) forces every overload progression weight to 0.0, so the reward path is byte-identical.
 pub(crate) fn dd_soccer_enable_overload_weighted_progression() -> bool {
@@ -25753,6 +26229,18 @@ fn soccer_analytic_difference_reward_enabled() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_ANALYTIC_DIFFERENCE_REWARD"))
     }
+}
+
+/// Gate for the COMA-style analytic ADVANTAGE (the principled "beat analytic" lever). When on, the
+/// PPO actor's advantage is the raw return MINUS a DETACHED tabular baseline
+/// `best_value_hierarchical(s)` — the analytic default's value, from the SEPARATE tabular policy, so
+/// there is no critic self-circularity. Policy-gradient then rewards the actor for choosing actions
+/// whose return EXCEEDS what analytic would score in that state, instead of regressing onto the
+/// analytic/tabular teacher (the value-imitation parity ceiling). OFF (default) ⇒ byte-identical.
+pub(crate) fn dd_soccer_enable_coma_analytic_advantage() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_COMA_ANALYTIC_ADVANTAGE"))
 }
 
 fn soccer_decision_trace_is_learned_policy(decision: &AgentDecisionTrace) -> bool {

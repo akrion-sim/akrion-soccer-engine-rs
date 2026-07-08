@@ -7820,6 +7820,17 @@ fn run() -> Result<(), Box<dyn Error>> {
             pg_base_neural_network_fingerprint =
                 Some(soccer_neural_network_snapshot_fingerprint(&snapshot));
             initial_neural_network = Some(snapshot);
+        } else if let Ok(raw) = fs::read_to_string(resume_path) {
+            // LOCAL neural resume fallback: when there is no sidecar, the on-disk learned-params
+            // artifact may itself embed the trained neural snapshot (the fully-local, no-postgres
+            // co-training format). Pull it back in so a local run compounds the NETWORK across
+            // cycles, not just the tabular Q-table. Postgres (below) overrides this when configured.
+            if let Ok(params) = serde_json::from_str::<SoccerSelfPlayLearnedParams>(&raw) {
+                if params.neural_network.is_some() {
+                    println!("local_resume_neural_network=true path={resume_path}");
+                    initial_neural_network = params.neural_network;
+                }
+            }
         }
     }
     if let Some(store) = pg_store.as_mut() {

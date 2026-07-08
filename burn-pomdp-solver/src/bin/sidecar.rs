@@ -32,6 +32,16 @@ struct Resp {
     logits: Vec<f64>,
     value: f64,
     contract_version: u32,
+    // TRUE on-policy behavior probability of the returned action under the sampling policy
+    // (softmax over legal logits). The engine stamps this onto the decision so the offline
+    // trainer has a real old-policy prob for clipped-PPO importance weighting (Codex lever #1).
+    // None on the argmax/eval path (deterministic → engine falls back to 1.0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    behavior_policy_probability: Option<f64>,
+    // The action the sidecar actually chose (sampled). The engine prefers this (after a legality
+    // re-check) over re-deriving argmax, so the logged action == the one whose prob we report.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action_index: Option<usize>,
 }
 
 struct Server {
@@ -39,6 +49,8 @@ struct Server {
     dev: <B as burn::tensor::backend::Backend>::Device,
     belief: HashMap<usize, Tensor<B, 3>>, // per-agent GRU hidden
     n_actions: usize,
+    sample: bool, // SIDECAR_SAMPLE: stochastic (explore) for on-policy collection vs argmax for eval
+    rng: u64,
 }
 
 impl Server {
@@ -65,7 +77,39 @@ impl Server {
             }
         }
         let v = value.into_data().to_vec::<f32>().unwrap().first().copied().unwrap_or(0.0) as f64;
-        Resp { logits: lg, value: v, contract_version: 1 }
+        // Stochastic collection: sample a legal action from softmax(logits) and rewrite logits so the
+        // engine's argmax picks it. Gives on-policy EXPLORATION so fine-tuning can improve, not just
+        // entrench the deterministic policy. Eval leaves sample=false (argmax = best play).
+        // We also report the TRUE softmax probability of the chosen action + its index, so the engine
+        // can stamp a real old-policy prob on the decision (enables clipped-PPO importance weighting).
+        let (mut bpp, mut act_idx): (Option<f64>, Option<usize>) = (None, None);
+        if self.sample {
+            let legal: Vec<usize> = (0..lg.len()).filter(|&i| lg[i].is_finite()).collect();
+            if !legal.is_empty() {
+                let maxl = legal.iter().map(|&i| lg[i]).fold(f64::NEG_INFINITY, f64::max);
+                let exps: Vec<f64> = legal.iter().map(|&i| (lg[i] - maxl).exp()).collect();
+                let sum: f64 = exps.iter().sum::<f64>().max(1e-9);
+                self.rng = self.rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let u = ((self.rng >> 33) as f64 / (1u64 << 31) as f64) * sum;
+                let mut cum = 0.0;
+                let (mut chosen, mut chosen_k) = (*legal.last().unwrap(), legal.len() - 1);
+                for (k, &i) in legal.iter().enumerate() {
+                    cum += exps[k];
+                    if u <= cum {
+                        chosen = i;
+                        chosen_k = k;
+                        break;
+                    }
+                }
+                // p(chosen) under the sampling softmax over the LEGAL set = exps[k]/sum.
+                bpp = Some((exps[chosen_k] / sum).clamp(1e-6, 1.0));
+                act_idx = Some(chosen);
+                for (i, v) in lg.iter_mut().enumerate() {
+                    *v = if i == chosen { 0.0 } else { f64::NEG_INFINITY };
+                }
+            }
+        }
+        Resp { logits: lg, value: v, contract_version: 1, behavior_policy_probability: bpp, action_index: act_idx }
     }
 }
 
@@ -111,13 +155,21 @@ fn main() {
         .map(|u| u.trim_start_matches("http://").split('/').next().unwrap_or("127.0.0.1:8091").to_string())
         .unwrap_or_else(|| "127.0.0.1:8091".into());
     let listener = TcpListener::bind(&addr).expect("bind sidecar");
-    let mut srv = Server { net, dev, belief: HashMap::new(), n_actions };
+    let sample = std::env::var("SIDECAR_SAMPLE").ok().as_deref() == Some("1");
+    let mut srv = Server { net, dev, belief: HashMap::new(), n_actions, sample, rng: 0x1234_5678_9abc_def0 };
+    println!("  sample(explore)={sample}");
     println!("burn-pomdp sidecar listening on http://{addr}/infer  model={model}.bin  n_actions={n_actions}");
+    let mut nreq = 0usize;
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else { continue };
-        let resp = match read_body(&mut stream).and_then(|b| serde_json::from_str::<Req>(&b).ok()) {
+        let parsed = read_body(&mut stream).and_then(|b| serde_json::from_str::<Req>(&b).ok());
+        nreq += 1;
+        if nreq <= 3 || nreq % 500 == 0 {
+            eprintln!("SIDECAR_SERVER served {nreq} requests (parsed_ok={})", parsed.is_some());
+        }
+        let resp = match parsed {
             Some(req) => srv.infer(&req),
-            None => Resp { logits: vec![], value: 0.0, contract_version: 1 },
+            None => Resp { logits: vec![], value: 0.0, contract_version: 1, behavior_policy_probability: None, action_index: None },
         };
         let body = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into());
         let _ = write!(
