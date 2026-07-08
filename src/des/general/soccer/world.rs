@@ -2308,6 +2308,39 @@ pub fn soccer_trajectory_export_decisions(
         .collect()
 }
 
+<<<<<<< HEAD
+=======
+/// File-writer that was missing: consume the export rows and append them as JSONL to
+/// `DD_SOCCER_TRAJECTORY_EXPORT_PATH` (the on-policy data channel for the Burn POMDP-solver). The
+/// converter above only produced rows; nothing wrote them. Unset env ⇒ no-op. Mutex-serialised.
+pub fn soccer_trajectory_export_write(replay: &[SoccerLearningTransition]) {
+    use std::sync::OnceLock;
+    static WRITER: OnceLock<Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>> =
+        OnceLock::new();
+    let writer = WRITER.get_or_init(|| {
+        let path = std::env::var("DD_SOCCER_TRAJECTORY_EXPORT_PATH").ok()?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()?;
+        Some(std::sync::Mutex::new(std::io::BufWriter::new(file)))
+    });
+    let Some(writer) = writer.as_ref() else {
+        return;
+    };
+    use std::io::Write;
+    if let Ok(mut guard) = writer.lock() {
+        for row in soccer_trajectory_export_decisions(replay) {
+            if let Ok(line) = serde_json::to_string(&row) {
+                let _ = writeln!(guard, "{line}");
+            }
+        }
+        let _ = guard.flush();
+    }
+}
+
+>>>>>>> wip/sidecar-engine-hook
 #[derive(Clone, Debug)]
 struct SoccerExternalNnPomdpSidecarEndpoint {
     host: String,
@@ -2336,6 +2369,19 @@ struct SoccerExternalNnPomdpSidecarResponse {
     logits: Vec<f64>,
     #[serde(default)]
     value: Option<f64>,
+<<<<<<< HEAD
+=======
+    // True on-policy behavior probability of the returned action under the sidecar's sampling
+    // policy. When present (finite, >0) it is stamped onto the decision so the offline trainer
+    // has a real old-policy prob for clipped-PPO importance weighting. Absent → deterministic
+    // (falls back to 1.0).
+    #[serde(default)]
+    behavior_policy_probability: Option<f64>,
+    // The action the sidecar actually chose (sampled). Preferred over re-deriving argmax, after a
+    // legality re-check, so the logged action matches the one whose prob was reported.
+    #[serde(default)]
+    action_index: Option<usize>,
+>>>>>>> wip/sidecar-engine-hook
 }
 
 fn soccer_external_nn_pomdp_sidecar_enabled() -> bool {
@@ -12901,8 +12947,70 @@ impl SoccerMatch {
         if !soccer_external_nn_pomdp_sidecar_enabled() {
             return None;
         }
+<<<<<<< HEAD
         let player = snapshot.players.iter().find(|p| p.id == player_id)?;
         let legal_action_mask = soccer_policy_legal_action_mask_for_snapshot(snapshot, player_id)?;
+=======
+        // On-ball-only lever: let the strong analytic MPC keep off-ball positioning; the learned net
+        // only owns the ball-carrier's decision. Recovers score when the net's off-ball play is weak.
+        //
+        // SELECTIVE SUPPORT-OUTLET lever (gated SOCCER_BURN_SIDECAR_SUPPORT_OUTLET): in addition to
+        // the carrier, also let the net drive exactly ONE off-ball support runner when our side has
+        // possession — restricted (below) to support-family actions only. Everyone else stays MPC.
+        // Rationale: the on-ball policy can't CREATE a receiving option; one learned support runner
+        // changes the next on-ball decision surface, which the analytic pass machinery can exploit.
+        let is_carrier = snapshot.ball.holder == Some(player_id);
+        let mut support_only_mask = false;
+        if std::env::var("SOCCER_BURN_SIDECAR_ON_BALL_ONLY").ok().as_deref() == Some("1") && !is_carrier
+        {
+            let support_outlet =
+                std::env::var("SOCCER_BURN_SIDECAR_SUPPORT_OUTLET").ok().as_deref() == Some("1");
+            // MULTI-ROLE possession scope (Codex): drive the K nearest mid/fwd support runners
+            // (K = SOCCER_BURN_SIDECAR_SUPPORT_ACTORS, default 3), each support-masked — a coordinated
+            // receiver SET creates options for the carrier, where one runner (0.479) could not.
+            if support_outlet && self.designated_support_actor_set(snapshot).contains(&player_id) {
+                support_only_mask = true; // serve this actor, but support-family actions only
+            } else {
+                return None;
+            }
+        }
+        {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static N: AtomicUsize = AtomicUsize::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 3 || n % 250 == 0 {
+                eprintln!("SIDECAR_DBG reached={n} tick={} player={player_id}", snapshot.tick);
+            }
+        }
+        let player = snapshot.players.iter().find(|p| p.id == player_id)?;
+        let Some(mut legal_action_mask) = soccer_policy_legal_action_mask_for_snapshot(snapshot, player_id) else {
+            eprintln!("SIDECAR_DBG bail=mask_none player={player_id}");
+            return None;
+        };
+        if support_only_mask {
+            // Support runner learns timing/FAMILY only; analytic target-gen + shape/offside/spacing
+            // guards + MPC handle execution. Restrict its legal mask to support-family actions.
+            fn is_support_family(index: usize) -> bool {
+                matches!(
+                    SOCCER_POLICY_ACTIONS.get(index).copied(),
+                    Some("support-shape") | Some("support-roam") | Some("support-screen")
+                        | Some("check-to-ball") | Some("run-in-behind") | Some("exploit-space-run")
+                        | Some("wide-outlet") | Some("shot-creation-run") | Some("pinch-cross-arrival")
+                        | Some("overlap-run") | Some("one-two-run") | Some("support-push-up")
+                        | Some("hold-up-flank") | Some("wait-for-support") | Some("open-passing-lane")
+                        | Some("open-pass-lane") | Some("buildup-receive")
+                )
+            }
+            for (i, ok) in legal_action_mask.iter_mut().enumerate() {
+                if *ok && !is_support_family(i) {
+                    *ok = false;
+                }
+            }
+            if !legal_action_mask.iter().any(|&ok| ok) {
+                return None; // no legal support action this tick ⇒ fall back to MPC
+            }
+        }
+>>>>>>> wip/sidecar-engine-hook
         let entities = soccer_field_player_motion_block(snapshot, player_id, player.team);
         if entities.len() != SOCCER_NEURAL_FIELD_MOTION_DIM {
             return None;
@@ -12925,6 +13033,7 @@ impl SoccerMatch {
         let SoccerExternalNnPomdpSidecarResponse {
             logits,
             value: _value,
+<<<<<<< HEAD
         } = soccer_external_nn_pomdp_sidecar_infer(&request)?;
         let action_index =
             soccer_external_nn_pomdp_select_legal_argmax(&logits, &legal_action_mask)?;
@@ -12933,15 +13042,81 @@ impl SoccerMatch {
             label,
             plan: None,
             behavior_probability: 1.0,
+=======
+            behavior_policy_probability,
+            action_index: sidecar_action_index,
+        } = soccer_external_nn_pomdp_sidecar_infer(&request)?;
+        // Prefer the sidecar's OWN sampled action (so the logged action matches the reported prob),
+        // but only if it is legal for this snapshot; otherwise fall back to the legal argmax.
+        let action_index = sidecar_action_index
+            .filter(|&i| legal_action_mask.get(i).copied().unwrap_or(false))
+            .or_else(|| soccer_external_nn_pomdp_select_legal_argmax(&logits, &legal_action_mask))?;
+        let label = SOCCER_POLICY_ACTIONS.get(action_index)?.to_string();
+        // Stamp the TRUE sampled probability when the sidecar provided one (finite, >0); else 1.0
+        // (deterministic argmax). This gives the offline trainer a real old-policy prob for
+        // clipped-PPO importance weighting instead of a constant 1.0.
+        let behavior_probability = match behavior_policy_probability {
+            Some(p) => {
+                let p = finite_unit_interval(p);
+                if p > 0.0 { p } else { 1.0 }
+            }
+            None => 1.0,
+        };
+        Some(SoccerPolicyActionChoice {
+            label,
+            plan: None,
+            behavior_probability,
+>>>>>>> wip/sidecar-engine-hook
             neural_mcts_selected: false,
             neural_mcts_candidate_count: 0,
             neural_mcts_discretized_kick_candidate_count: 0,
             neural_mcts_root_discretized_kick_candidate_count: 0,
+<<<<<<< HEAD
             neural_mcts_dribble_candidate_count: 0,
             neural_mcts_root_dribble_candidate_count: 0,
         })
     }
 
+=======
+        })
+    }
+
+    /// The SET of off-ball support runners the net may drive under the multi-role support-outlet
+    /// lever: the K nearest Midfielder/Forward teammates to the ball carrier (K =
+    /// SOCCER_BURN_SIDECAR_SUPPORT_ACTORS, default 3, clamped 1..=4; excludes carrier + GK/defenders),
+    /// while our side has possession. Deterministic (distance-sorted, `total_cmp`). Empty ⇒ all-MPC.
+    fn designated_support_actor_set(&self, snapshot: &WorldSnapshot) -> Vec<usize> {
+        let Some(holder) = snapshot.ball.holder else {
+            return Vec::new();
+        };
+        let Some(carrier) = snapshot.players.iter().find(|p| p.id == holder) else {
+            return Vec::new();
+        };
+        let cpos = carrier.position;
+        let k = std::env::var("SOCCER_BURN_SIDECAR_SUPPORT_ACTORS")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(3)
+            .clamp(1, 4);
+        let mut cands: Vec<(usize, f64)> = snapshot
+            .players
+            .iter()
+            .filter(|p| {
+                p.team == carrier.team
+                    && p.id != holder
+                    && matches!(p.role, PlayerRole::Midfielder | PlayerRole::Forward)
+            })
+            .map(|p| {
+                let d = (p.position.x - cpos.x).powi(2) + (p.position.y - cpos.y).powi(2);
+                (p.id, d)
+            })
+            .collect();
+        cands.sort_by(|a, b| a.1.total_cmp(&b.1));
+        cands.truncate(k);
+        cands.into_iter().map(|(id, _)| id).collect()
+    }
+
+>>>>>>> wip/sidecar-engine-hook
     fn learned_action_for_player_with_context(
         &self,
         snapshot: &WorldSnapshot,
@@ -32309,6 +32484,7 @@ impl SoccerMatch {
                 transitions.push(transition);
             }
         }
+        soccer_trajectory_export_write(&transitions);
         transitions
     }
 }

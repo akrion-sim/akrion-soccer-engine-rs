@@ -2878,6 +2878,39 @@ fn mpc_reselects_candidate(
     mpc_reselect_rejection_probability(snapshot, player, action, action_label).is_some()
 }
 
+fn option_score_safety_possession_candidate_is_executable(
+    snapshot: &WorldSnapshot,
+    player: &PlayerAgent,
+    action: &SoccerAction,
+    action_label: &str,
+) -> bool {
+    let normalized = normalize_soccer_action_label(action_label);
+    if matches!(
+        action,
+        SoccerAction::Pass {
+            target_player: None,
+            ..
+        }
+    ) && pass_like_action_flight(normalized).is_some()
+    {
+        return false;
+    }
+    if mpc_reselect_rejection_probability(snapshot, player, action, action_label).is_some() {
+        return false;
+    }
+    let action_target = player.action_target_trace(action, snapshot);
+    let Some(estimate) =
+        direct_mpc_execution_estimate_for_candidate(snapshot, player, &action_target, action_label)
+    else {
+        return true;
+    };
+    estimate.reselect_reason.is_empty()
+        && estimate.execution_probability
+            >= tunables()
+                .decision_mpc
+                .reselect_min_ball_execution_probability
+}
+
 fn mpc_reselect_rejection_probability(
     snapshot: &WorldSnapshot,
     player: &PlayerAgent,
@@ -13955,14 +13988,18 @@ impl PlayerAgent {
             })
             .map(soccer_finite_option_score)
             .unwrap_or(0.0);
-        let best = options
+        let mut fallback_options = options
             .iter()
             .filter(|option| option.legal)
             .filter(|option| !learned_mpc_action_labels_match(&option.label, &chosen_key))
-            .max_by(|a, b| {
-                soccer_finite_option_score(a).total_cmp(&soccer_finite_option_score(b))
-            })?;
-        let best_score = soccer_finite_option_score(best);
+            .collect::<Vec<_>>();
+        fallback_options.sort_by(|a, b| {
+            soccer_finite_option_score(b).total_cmp(&soccer_finite_option_score(a))
+        });
+        let best_score = fallback_options
+            .first()
+            .map(|option| soccer_finite_option_score(option))
+            .unwrap_or(0.0);
         if !learned_policy_option_score_safety_trips(chosen_score, best_score) {
             return None;
         }
@@ -13972,42 +14009,67 @@ impl PlayerAgent {
                 best_score,
             );
 
-        if let Some((fallback_action, fallback_label)) = self
-            .learned_policy_option_score_safety_direct_action(&best.label, snapshot, observation)
-        {
-            if !observation.has_ball
-                || !mpc_reselects_candidate(snapshot, self, &fallback_action, &fallback_label)
+        for fallback_option in fallback_options {
+            let fallback_score = soccer_finite_option_score(fallback_option);
+            if !learned_policy_option_score_safety_trips(chosen_score, fallback_score) {
+                continue;
+            }
+
+            if let Some((fallback_action, fallback_label)) = self
+                .learned_policy_option_score_safety_direct_action(
+                    &fallback_option.label,
+                    snapshot,
+                    observation,
+                )
             {
-                return Some((
-                    fallback_action,
-                    fallback_label,
-                    rejected_execution_probability,
-                ));
+                if !observation.has_ball
+                    || option_score_safety_possession_candidate_is_executable(
+                        snapshot,
+                        self,
+                        &fallback_action,
+                        &fallback_label,
+                    )
+                {
+                    return Some((
+                        fallback_action,
+                        fallback_label,
+                        rejected_execution_probability,
+                    ));
+                }
+            }
+
+            let fallback_plan = SoccerLearnedPlan {
+                action: fallback_option.label.clone(),
+                target_player: None,
+                target_point: None,
+                mpc_replan: plan.mpc_replan.clone(),
+            };
+            if let Some((fallback_action, fallback_label)) =
+                self.action_from_learned_plan(&fallback_plan, snapshot, observation)
+            {
+                let trace_label =
+                    if learned_mpc_action_labels_match(&fallback_option.label, &fallback_label)
+                        || normalize_soccer_action_label(&fallback_option.label)
+                            == normalize_soccer_action_label(&fallback_label)
+                    {
+                        fallback_option.label.clone()
+                    } else {
+                        fallback_label
+                    };
+                if !observation.has_ball
+                    || option_score_safety_possession_candidate_is_executable(
+                        snapshot,
+                        self,
+                        &fallback_action,
+                        &trace_label,
+                    )
+                {
+                    return Some((fallback_action, trace_label, rejected_execution_probability));
+                }
             }
         }
 
-        let fallback_plan = SoccerLearnedPlan {
-            action: best.label.clone(),
-            target_player: None,
-            target_point: None,
-            mpc_replan: plan.mpc_replan.clone(),
-        };
-        self.action_from_learned_plan(&fallback_plan, snapshot, observation)
-            .map(|(fallback_action, fallback_label)| {
-                let trace_label = if learned_mpc_action_labels_match(&best.label, &fallback_label)
-                    || normalize_soccer_action_label(&best.label)
-                        == normalize_soccer_action_label(&fallback_label)
-                {
-                    best.label.clone()
-                } else {
-                    fallback_label
-                };
-                (fallback_action, trace_label, rejected_execution_probability)
-            })
-            .filter(|(fallback_action, fallback_label, _)| {
-                !observation.has_ball
-                    || !mpc_reselects_candidate(snapshot, self, fallback_action, fallback_label)
-            })
+        None
     }
 
     fn learned_policy_option_score_safety_direct_action(
@@ -14817,12 +14879,7 @@ pub struct SoccerLearnedPlan {
 
 #[cfg(test)]
 mod learned_policy_option_score_safety_tests {
-    use super::{
-        learned_policy_option_score_safety_rejected_execution_probability,
-        learned_policy_option_score_safety_replan_trace,
-        learned_policy_option_score_safety_trips_with_thresholds, AgentActionOptionTrace,
-        SoccerLearnedMpcReplanSource,
-    };
+    use super::*;
 
     #[test]
     fn learned_policy_option_score_safety_trips_on_catastrophic_gap() {
@@ -14880,6 +14937,129 @@ mod learned_policy_option_score_safety_tests {
         assert_eq!(trace.candidate_count, 2);
         assert!(
             learned_policy_option_score_safety_replan_trace("pass1", "pass1", 0.05, &[]).is_none()
+        );
+    }
+
+    #[test]
+    fn option_score_safety_walks_past_unusable_best_fallback() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            dt_seconds: 0.1,
+            seed: 94_501,
+            ..Default::default()
+        });
+        let holder = sim
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home holder")
+            .id;
+        let mate = sim
+            .players
+            .iter()
+            .find(|player| {
+                player.team == Team::Home
+                    && player.role != PlayerRole::Goalkeeper
+                    && player.id != holder
+            })
+            .expect("home teammate")
+            .id;
+        let width = sim.config.field_width_yards;
+        let holder_pos = Vec2::new(width * 0.50, 52.0);
+        let mate_pos = Vec2::new(width * 0.50, 66.0);
+        for player in sim.players.iter_mut() {
+            if player.team == Team::Home && player.id != holder && player.id != mate {
+                player.position = Vec2::new(width * 0.20, 28.0 + player.id as f64 * 0.1);
+                player.velocity = Vec2::zero();
+            } else if player.team == Team::Away {
+                player.position = Vec2::new(width * 0.88, 82.0 + player.id as f64 * 0.1);
+                player.velocity = Vec2::zero();
+            }
+        }
+        sim.players[holder].position = holder_pos;
+        sim.players[holder].velocity = Vec2::zero();
+        sim.players[mate].position = mate_pos;
+        sim.players[mate].velocity = Vec2::zero();
+        sim.ball.holder = Some(holder);
+        sim.ball.position = holder_pos;
+
+        let snapshot = WorldSnapshot::from_match(&sim);
+        assert_eq!(
+            snapshot.ranked_visible_pass_targets(holder, 11).first(),
+            Some(&mate),
+            "test setup should expose the intended first ranked pass target"
+        );
+        let observation = snapshot.observation_for(holder);
+        let holder_player = sim.players[holder].clone();
+        let learned_plan = SoccerLearnedPlan {
+            action: "xavi-turn".to_string(),
+            target_player: None,
+            target_point: None,
+            mpc_replan: None,
+        };
+        let options = vec![
+            AgentActionOptionTrace::new("unsupported-fallback", 18.0, true),
+            AgentActionOptionTrace::new("pass1", 17.0, true),
+            AgentActionOptionTrace::new("xavi-turn", 0.2, true),
+        ];
+
+        let (action, label, _) = holder_player
+            .learned_policy_option_score_safety_override(
+                &learned_plan,
+                &snapshot,
+                &observation,
+                &options,
+                "xavi-turn",
+            )
+            .expect("safety should walk down to the executable ranked pass");
+
+        assert_eq!(label, "pass1");
+        match action {
+            SoccerAction::Pass { target_player, .. } => assert_eq!(target_player, Some(mate)),
+            other => panic!("expected pass1 fallback, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn option_score_safety_uses_direct_mpc_without_local_guidance() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            local_mpc_enabled: false,
+            ..Default::default()
+        });
+        let holder = sim
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home holder")
+            .id;
+        let holder_pos = Vec2::new(sim.config.field_width_yards * 0.5, 52.0);
+        sim.players[holder].position = holder_pos;
+        sim.players[holder].velocity = Vec2::zero();
+        sim.ball.holder = Some(holder);
+        sim.ball.position = holder_pos;
+        let mut snapshot = WorldSnapshot::from_match(&sim);
+        snapshot
+            .formation_lp_guidance
+            .retain(|guidance| guidance.player_id != holder);
+        let holder_player = sim.players[holder].clone();
+        let targetless_pass = SoccerAction::Pass {
+            target_player: None,
+            power: 0.6,
+            flight: PassFlight::Floor,
+        };
+
+        assert_eq!(
+            mpc_reselect_rejection_probability(&snapshot, &holder_player, &targetless_pass, "pass"),
+            None,
+            "legacy neural-visible MPC rejection stays gated on local guidance"
+        );
+        assert!(
+            !option_score_safety_possession_candidate_is_executable(
+                &snapshot,
+                &holder_player,
+                &targetless_pass,
+                "pass"
+            ),
+            "option-score safety must still reject impossible possession fallbacks"
         );
     }
 }
