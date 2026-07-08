@@ -47,6 +47,11 @@ const SOCCER_POLICY_LOW_CEILING_FITNESS: f64 = 1.50;
 const SOCCER_POLICY_SEARCH_MAX_ADAPTED_POPULATION: usize = 128;
 const SOCCER_POLICY_SEARCH_MAX_ADAPTED_POPULATION_ENV: &str =
     "SOCCER_POLICY_SEARCH_MAX_ADAPTED_POPULATION";
+const SOCCER_PLATEAU_TRACTION_MIN_SAMPLES: usize = 4;
+const SOCCER_PLATEAU_TRACTION_FITNESS_SPREAD: f64 = 0.22;
+const SOCCER_PLATEAU_TRACTION_TARGET_GOALS_PER_GAME: f64 = 2.20;
+const SOCCER_PLATEAU_TRACTION_TARGET_SOT_PER_GAME: f64 = 6.0;
+const SOCCER_PLATEAU_TRACTION_TARGET_WORKED_SHOTS_PER_GAME: f64 = 3.0;
 static SOCCER_POLICY_SEARCH_MAX_ADAPTED_POPULATION_OVERRIDE: OnceLock<usize> = OnceLock::new();
 const SOCCER_POLICY_NOVELTY_MAX_STATES: usize = 256;
 const SOCCER_POLICY_NOVELTY_MAX_ACTIONS_PER_STATE: usize = 3;
@@ -544,6 +549,177 @@ pub struct SoccerLearningCurriculumEpisodeSpec {
     pub field_length_yards: f64,
     pub duration_seconds: f64,
     pub local_mpc_max_players_per_team: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SoccerLearningPlateauTractionProfile {
+    pub sample_games: usize,
+    pub pressure: f64,
+    pub fitness_plateau: f64,
+    pub score_parity: f64,
+    pub chance_stagnation: f64,
+    pub turnover_drag: f64,
+    pub pitch_multiplier: f64,
+    pub duration_multiplier: f64,
+    pub team_reward_share_multiplier: f64,
+    pub extra_local_mpc_players_per_team: usize,
+}
+
+impl SoccerLearningPlateauTractionProfile {
+    fn inactive(sample_games: usize) -> Self {
+        Self::from_pressure(sample_games, 0.0, 0.0, 0.0, 0.0, 0.0)
+    }
+
+    fn from_pressure(
+        sample_games: usize,
+        pressure: f64,
+        fitness_plateau: f64,
+        score_parity: f64,
+        chance_stagnation: f64,
+        turnover_drag: f64,
+    ) -> Self {
+        let pressure = pressure.clamp(0.0, 1.0);
+        Self {
+            sample_games,
+            pressure,
+            fitness_plateau: fitness_plateau.clamp(0.0, 1.0),
+            score_parity: score_parity.clamp(0.0, 1.0),
+            chance_stagnation: chance_stagnation.clamp(0.0, 1.0),
+            turnover_drag: turnover_drag.clamp(0.0, 1.0),
+            pitch_multiplier: 1.0 + pressure * 0.24,
+            duration_multiplier: 1.0 + pressure * 0.35,
+            team_reward_share_multiplier: 1.0 + pressure * 0.60,
+            extra_local_mpc_players_per_team: (pressure * 4.0).round() as usize,
+        }
+    }
+}
+
+pub fn soccer_learning_plateau_traction_profile(
+    summaries: &[&MatchSummary],
+) -> SoccerLearningPlateauTractionProfile {
+    let sample_games = summaries.len();
+    if sample_games < SOCCER_PLATEAU_TRACTION_MIN_SAMPLES {
+        return SoccerLearningPlateauTractionProfile::inactive(sample_games);
+    }
+
+    let mut finite_fitness = Vec::with_capacity(sample_games);
+    let mut total_goals = 0u32;
+    let mut total_abs_goal_margin = 0u32;
+    let mut total_shots_on_target = 0u32;
+    let mut total_worked_shots = 0u32;
+    let mut turnover_drag = 0.0;
+    for summary in summaries {
+        let fitness = soccer_learning_run_score(summary).match_fitness;
+        if fitness.is_finite() {
+            finite_fitness.push(fitness);
+        }
+        total_goals = total_goals
+            .saturating_add(summary.score_home)
+            .saturating_add(summary.score_away);
+        total_abs_goal_margin =
+            total_abs_goal_margin.saturating_add(summary.score_home.abs_diff(summary.score_away));
+        total_shots_on_target = total_shots_on_target
+            .saturating_add(summary.stats.shots_on_target_home)
+            .saturating_add(summary.stats.shots_on_target_away);
+        total_worked_shots = total_worked_shots
+            .saturating_add(summary.stats.shots_after_pass_home)
+            .saturating_add(summary.stats.shots_after_pass_away);
+        turnover_drag += soccer_learning_match_turnover_risk(summary);
+    }
+
+    let games = sample_games.max(1) as f64;
+    let (fitness_plateau, low_ceiling) = if finite_fitness.len() >= 2 {
+        let (best, worst) = finite_fitness.iter().fold(
+            (f64::NEG_INFINITY, f64::INFINITY),
+            |(best, worst), fitness| (best.max(*fitness), worst.min(*fitness)),
+        );
+        (
+            (1.0 - (best - worst).abs() / SOCCER_PLATEAU_TRACTION_FITNESS_SPREAD).clamp(0.0, 1.0),
+            (1.0 - best.max(0.0) / SOCCER_POLICY_LOW_CEILING_FITNESS).clamp(0.0, 1.0),
+        )
+    } else {
+        (0.0, 0.35)
+    };
+    let score_parity = (1.0 - (f64::from(total_abs_goal_margin) / games) / 1.35).clamp(0.0, 1.0);
+    let goals_stagnation = (1.0
+        - (f64::from(total_goals) / games) / SOCCER_PLATEAU_TRACTION_TARGET_GOALS_PER_GAME)
+        .clamp(0.0, 1.0);
+    let sot_stagnation = (1.0
+        - (f64::from(total_shots_on_target) / games) / SOCCER_PLATEAU_TRACTION_TARGET_SOT_PER_GAME)
+        .clamp(0.0, 1.0);
+    let worked_stagnation = (1.0
+        - (f64::from(total_worked_shots) / games)
+            / SOCCER_PLATEAU_TRACTION_TARGET_WORKED_SHOTS_PER_GAME)
+        .clamp(0.0, 1.0);
+    let chance_stagnation =
+        goals_stagnation * 0.42 + sot_stagnation * 0.40 + worked_stagnation * 0.18;
+    let turnover_drag = (turnover_drag / games).clamp(0.0, 1.0);
+    let sample_fit =
+        (sample_games as f64 / (SOCCER_PLATEAU_TRACTION_MIN_SAMPLES * 2) as f64).clamp(0.55, 1.0);
+    let pressure = ((fitness_plateau * (0.12 + low_ceiling * 0.22))
+        + score_parity * 0.20
+        + chance_stagnation * 0.34
+        + turnover_drag * 0.12)
+        * sample_fit;
+
+    SoccerLearningPlateauTractionProfile::from_pressure(
+        sample_games,
+        pressure,
+        fitness_plateau,
+        score_parity,
+        chance_stagnation,
+        turnover_drag,
+    )
+}
+
+pub fn apply_soccer_learning_plateau_traction_to_episode_config(
+    config: &mut MatchConfig,
+    profile: SoccerLearningPlateauTractionProfile,
+) {
+    if profile.pressure <= 0.05 {
+        return;
+    }
+
+    if config.field_width_yards.is_finite() && config.field_width_yards > 0.0 {
+        let ceiling = DEFAULT_FIELD_WIDTH_YARDS.max(config.field_width_yards);
+        config.field_width_yards = (config.field_width_yards * profile.pitch_multiplier)
+            .min(ceiling)
+            .max(config.field_width_yards);
+    }
+    if config.field_length_yards.is_finite() && config.field_length_yards > 0.0 {
+        let ceiling = DEFAULT_FIELD_LENGTH_YARDS.max(config.field_length_yards);
+        config.field_length_yards = (config.field_length_yards * profile.pitch_multiplier)
+            .min(ceiling)
+            .max(config.field_length_yards);
+    }
+
+    let scale_duration = |seconds: f64| -> f64 {
+        if seconds.is_finite() && seconds > 0.0 {
+            (seconds * profile.duration_multiplier).max(seconds)
+        } else {
+            seconds
+        }
+    };
+    config.duration_seconds = scale_duration(config.duration_seconds);
+    config.half_duration_seconds = scale_duration(config.half_duration_seconds);
+
+    if config.neural_learning.mappo_team_reward_share.is_finite() {
+        config.neural_learning.mappo_team_reward_share =
+            (config.neural_learning.mappo_team_reward_share * profile.team_reward_share_multiplier
+                + profile.pressure * 0.18)
+                .clamp(0.0, 1.0);
+    }
+    if profile.extra_local_mpc_players_per_team > 0 {
+        config.local_mpc_enabled = true;
+        config.local_mpc_max_players_per_team = config
+            .local_mpc_max_players_per_team
+            .saturating_add(profile.extra_local_mpc_players_per_team)
+            .clamp(1, SOCCER_CURRICULUM_FULL_PLAYERS_PER_TEAM);
+    }
+    if profile.pressure >= 0.72 {
+        config.formation_lp_enabled = true;
+    }
 }
 
 fn soccer_learning_curriculum_stage_players_per_team(
@@ -6429,6 +6605,97 @@ mod tests {
         assert_eq!(episode_config.local_mpc_max_players_per_team, 2);
         assert!((base.field_width_yards - 80.0).abs() < 1e-9);
         assert!((base.field_length_yards - 120.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn plateau_traction_profile_expands_stagnant_parity_drills() {
+        use crate::des::general::soccer::MatchStats;
+
+        let summaries = (0..SOCCER_PLATEAU_TRACTION_MIN_SAMPLES)
+            .map(|_| MatchSummary {
+                score_home: 0,
+                score_away: 0,
+                ticks: 100,
+                simulated_seconds: 90.0,
+                stats: MatchStats::default(),
+            })
+            .collect::<Vec<_>>();
+        let refs = summaries.iter().collect::<Vec<_>>();
+        let profile = soccer_learning_plateau_traction_profile(&refs);
+
+        assert!(
+            profile.pressure > 0.45,
+            "flat low-chance parity should create traction pressure: {profile:?}"
+        );
+        assert!(profile.extra_local_mpc_players_per_team >= 2);
+        assert!(profile.pitch_multiplier > 1.0);
+        assert!(profile.duration_multiplier > 1.0);
+
+        let curriculum = SoccerLearningCurriculumConfig::default();
+        let base = MatchConfig {
+            duration_seconds: 600.0,
+            half_duration_seconds: 300.0,
+            field_width_yards: 80.0,
+            field_length_yards: 120.0,
+            local_mpc_enabled: false,
+            local_mpc_max_players_per_team: 11,
+            ..MatchConfig::default()
+        };
+        let (mut episode_config, spec) =
+            soccer_learning_curriculum_episode_config(&base, 0, &curriculum);
+        assert_eq!(spec.stage, SoccerLearningCurriculumStage::Locomotion);
+        assert_eq!(episode_config.local_mpc_max_players_per_team, 2);
+        assert_eq!(episode_config.neural_learning.mappo_team_reward_share, 0.0);
+
+        apply_soccer_learning_plateau_traction_to_episode_config(&mut episode_config, profile);
+
+        assert!(episode_config.local_mpc_enabled);
+        assert!(
+            episode_config.local_mpc_max_players_per_team > spec.drill_players_per_team,
+            "plateau traction should widen controlled-player scope"
+        );
+        assert!(episode_config.field_width_yards > spec.field_width_yards);
+        assert!(episode_config.field_length_yards > spec.field_length_yards);
+        assert!(episode_config.effective_duration_seconds() > spec.duration_seconds);
+        assert!(
+            episode_config.neural_learning.mappo_team_reward_share > 0.0,
+            "solo drills should receive some team-return pressure when they plateau"
+        );
+    }
+
+    #[test]
+    fn plateau_traction_profile_stays_low_for_decisive_chance_creation() {
+        use crate::des::general::soccer::MatchStats;
+
+        let summaries = (0..SOCCER_PLATEAU_TRACTION_MIN_SAMPLES)
+            .map(|_| {
+                let mut stats = MatchStats::default();
+                stats.shots_home = 12;
+                stats.shots_away = 3;
+                stats.shots_on_target_home = 8;
+                stats.shots_on_target_away = 1;
+                stats.shots_after_pass_home = 5;
+                stats.assists_home = 2;
+                stats.passes_attempted_home = 34;
+                stats.passes_completed_home = 24;
+                stats.passes_completed_forward_home = 16;
+                stats.pass_chain_gain_yards_home = 120.0;
+                MatchSummary {
+                    score_home: 3,
+                    score_away: 0,
+                    ticks: 100,
+                    simulated_seconds: 90.0,
+                    stats,
+                }
+            })
+            .collect::<Vec<_>>();
+        let refs = summaries.iter().collect::<Vec<_>>();
+        let profile = soccer_learning_plateau_traction_profile(&refs);
+
+        assert!(
+            profile.pressure < 0.15,
+            "dominant chance creation should not trigger heavy plateau pressure: {profile:?}"
+        );
     }
 
     #[test]
