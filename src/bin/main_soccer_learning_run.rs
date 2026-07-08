@@ -18,6 +18,7 @@ use soccer_engine::des::general::soccer::{
     PassLaneYieldHead, ReceiveApproachHead, RunPredictionHead, SeparationFloorHead,
     ShotTriggerHead, SlipBreakHead, SoccerAuxiliaryHeadSnapshot, SoccerConfigMomentInsert,
     SoccerLearningTransition, SoccerMarlAlgorithm, SoccerMatch, SoccerMomentWindow,
+    SoccerMpcObjectiveHead, learned_mpc_objective_enabled,
     SoccerNeuralBlendMode, SoccerNeuralLayerSnapshot, SoccerNeuralLearningBackend,
     SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot, SoccerPassCompletionHead,
     SoccerPassLearningMetrics, SoccerPassOutcomeSample, SoccerPolicyHeadSnapshot,
@@ -5490,6 +5491,14 @@ static CARRIED_ONSIDE_SUPPORT_HEAD: std::sync::Mutex<Option<OnsideSupportHead>> 
 static CARRIED_PASS_COMPLETION_HEAD: std::sync::Mutex<Option<SoccerPassCompletionHead>> =
     std::sync::Mutex::new(None);
 
+/// In-memory MPC execution-objective head, carried + RWR-trained across games WITHIN a learner
+/// process (mirrors [`CARRIED_PASS_COMPLETION_HEAD`]). Unlike pass-completion — whose samples are
+/// captured head-independently — the executor head only captures when installed, so it is SEEDED
+/// at install time whenever `DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE` is on (else it stays `None`,
+/// byte-identical). Consumption + training both require the gate.
+static CARRIED_MPC_OBJECTIVE_HEAD: std::sync::Mutex<Option<SoccerMpcObjectiveHead>> =
+    std::sync::Mutex::new(None);
+
 /// In-memory attacking-spacing target head, carried + trained across games WITHIN a
 /// learner process, then installed into the next game so off-ball support and the LP
 /// spacing floor consume what was learned.
@@ -5687,6 +5696,14 @@ fn run_game(
     if let Some(head) = CARRIED_PASS_COMPLETION_HEAD.lock().unwrap().as_ref() {
         sim.set_pass_completion_head(head.clone());
     }
+    // Install the carried executor head so this game's on-ball execution gets the learned aim/lead
+    // residual. Seed-on-first-install when the gate is on (the residual must be applied for a sample
+    // to be captured — otherwise the head could never bootstrap); no-op + never seeded when off.
+    if learned_mpc_objective_enabled() {
+        let mut guard = CARRIED_MPC_OBJECTIVE_HEAD.lock().unwrap();
+        let head = guard.get_or_insert_with(|| SoccerMpcObjectiveHead::new(episode_seed as u32));
+        sim.set_mpc_objective_head(head.clone());
+    }
     // Install the carried attacking-spacing target head so off-ball support and the
     // formation LP consume the learned spacing band once trained.
     if let Some(head) = CARRIED_ATTACK_SPACING_HEAD.lock().unwrap().as_ref() {
@@ -5728,6 +5745,7 @@ fn run_game(
         .ok_or_else(|| "soccer learning produced no team policies".to_string())?;
     let config_moments = sim.config_moments();
     let pass_outcome_samples = sim.drain_pass_outcome_samples();
+    let mpc_objective_samples = sim.drain_mpc_objective_samples();
     // Gap 5: train the CARRIED line-depth head on this game's reward-weighted RL
     // corpus so it accumulates across games and the back-four line consumes it live
     // once trained. Empty + skipped unless a line-depth model is enabled
@@ -6104,6 +6122,22 @@ fn run_game(
             head.training_steps(),
             head.training_steps() >= PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS,
             final_loss
+        );
+    }
+    // Train the CARRIED executor head on this game's (features, applied_residual, advantage) RWR
+    // corpus so the aim/lead residual improves across games. Only accrues when the gate is on (the
+    // head is seeded + installed above), so this is a no-op in the default byte-identical path.
+    if !mpc_objective_samples.is_empty() {
+        let mut guard = CARRIED_MPC_OBJECTIVE_HEAD.lock().unwrap();
+        let head = guard.get_or_insert_with(|| SoccerMpcObjectiveHead::new(episode_seed as u32));
+        for _ in 0..4 {
+            head.train_rwr(&mpc_objective_samples, 0.05);
+        }
+        eprintln!(
+            "mpc_objective_training samples={} training_steps={} warm={}",
+            mpc_objective_samples.len(),
+            head.training_steps(),
+            head.is_warm(),
         );
     }
     let completed_world_model = sim
