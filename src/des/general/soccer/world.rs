@@ -1202,6 +1202,14 @@ pub struct SoccerMatch {
     /// (parity). Shared into each [`WorldSnapshot`] via an `Arc` clone, mirroring
     /// [`Self::line_depth_head`].
     pub(crate) pass_completion_head: Option<std::sync::Arc<SoccerPassCompletionHead>>,
+    /// Rolling window of MPC execution-objective training samples: the launch-time features + the
+    /// bounded aim/lead residual actually applied, labelled with the delayed outcome advantage when
+    /// the pass resolves. Drained by the learner to train [`SoccerMpcObjectiveHead`] (RWR).
+    pub(crate) mpc_objective_samples: Vec<MpcObjectiveSample>,
+    /// The learned MPC execution-objective head, when present (carried + trained across games).
+    /// When warm + gated on, it nudges the analytic aim/lead target by a hard-bounded residual so
+    /// pass/shot/dribble QUALITY becomes learnable; `None` ⇒ pure analytic target (parity).
+    pub(crate) mpc_objective_head: Option<std::sync::Arc<SoccerMpcObjectiveHead>>,
     /// The trained back-four line-depth head, when present. Set by the learner
     /// (carried + trained across games) so the line decision consumes it live; `None`
     /// ⇒ analytic seed. Shared into each [`WorldSnapshot`] via an `Arc` clone.
