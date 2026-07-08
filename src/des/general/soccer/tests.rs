@@ -9747,6 +9747,70 @@ fn first_touch_quick_forward_exception_executes_to_quick_outlet() {
 }
 
 #[test]
+fn possession_pass1_quick_forward_can_use_strategic_target_outside_top_three() {
+    let pass_targets = [8, 9, 10];
+    let strategic_targets = [8, 9, 10, 11];
+
+    assert_eq!(
+        possession_ranked_pass_target_for(0, &pass_targets, &strategic_targets, Some(11)),
+        Some(11),
+        "POMDP may name the quick-forward receiver even when MPC's compact pass list omits it"
+    );
+    assert_eq!(
+        possession_ranked_pass_target_for(1, &pass_targets, &strategic_targets, Some(11)),
+        Some(9),
+        "only the primary quick-release pass adopts the strategic quick-forward receiver"
+    );
+    assert_eq!(
+        possession_ranked_pass_target_for(0, &pass_targets, &pass_targets, Some(11)),
+        Some(8),
+        "MPC must fall back to the ranked receiver when the requested target is not executable"
+    );
+    assert_eq!(
+        possession_ranked_pass_target_for(0, &[], &strategic_targets, Some(11)),
+        None,
+        "no compact execution target still means no executable possession pass"
+    );
+}
+
+#[test]
+fn possession_curriculum_pass1_targets_strategic_forward_receiver() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 22_534,
+        ..Default::default()
+    });
+    let passer = 7;
+    let lateral = 8;
+    let short_forward = 9;
+    let best_forward = 10;
+    park_players_except(&mut sim, &[passer, lateral, short_forward, best_forward]);
+    sim.players[passer].position = Vec2::new(40.0, 55.0);
+    sim.players[lateral].position = Vec2::new(52.0, 55.4);
+    sim.players[short_forward].position = Vec2::new(43.0, 61.0);
+    sim.players[best_forward].position = Vec2::new(39.0, 68.0);
+    sim.ball.holder = Some(passer);
+    sim.ball.position = sim.players[passer].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    assert_eq!(
+        possession_curriculum_forward_pass_target_for(&snapshot, passer, &[lateral]),
+        None,
+        "near-lateral balls should not count as completed-forward-pass curriculum targets"
+    );
+    assert_eq!(
+        possession_curriculum_forward_pass_target_for(
+            &snapshot,
+            passer,
+            &[lateral, short_forward, best_forward],
+        ),
+        Some(best_forward),
+        "curriculum should pick the most forward executable strategic receiver"
+    );
+}
+
+#[test]
 fn short_upfield_ground_outlet_raises_early_pass_probability() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -84741,6 +84805,80 @@ fn not_shooting_inside_twenty_five_records_learning_penalty() {
             "non-shot should receive only the near-goal no-shot penalty: got {penalty_total}, expected {}",
             -penalty
         );
+}
+
+fn forward_pass_climb_curriculum_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[test]
+fn forward_pass_climb_curriculum_can_relax_forced_shot_for_support_pass() {
+    let _env = forward_pass_climb_curriculum_env_lock();
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 22_533,
+        ..Default::default()
+    });
+    let attacker = 8;
+    let outlet = 10;
+    let keeper = 11;
+    park_players_except(&mut sim, &[attacker, outlet, keeper]);
+    sim.players[attacker].role = PlayerRole::Midfielder;
+    sim.players[attacker].position = Vec2::new(40.0, 96.0);
+    sim.players[outlet].position = Vec2::new(58.0, 106.0);
+    sim.players[keeper].position = Vec2::new(40.0, 116.0);
+    sim.ball.holder = Some(attacker);
+    sim.ball.position = sim.players[attacker].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let mut observation = snapshot.observation_for(attacker);
+    observation.yards_to_goal = 24.0;
+    observation.shot_lane_open = true;
+    observation.shot_block_probability = 0.04;
+    observation.shot_on_frame_probability = 0.84;
+    observation.shot_beat_goalkeeper_probability = 0.72;
+    observation.open_support_outlets = 0;
+    observation.nearest_teammate_distance = 30.0;
+    observation.neural_extended.nearest_teammate_distance = 30.0;
+    observation.visible_forward_pass_options = 1;
+    observation.visible_pass_options = 1;
+    observation.best_forward_pass_option_quality = 0.42;
+    observation.best_forward_pass_receiver_openness = 0.42;
+    observation.floor_pass_lane_score = 0.28;
+    observation.expected_pass_completion = 0.56;
+    observation.quick_forward_pass_value = 0.0;
+    observation.quick_forward_pass_target = None;
+
+    assert!(goal_attack_shot_is_required(
+        &observation,
+        sim.players[attacker].role
+    ));
+
+    {
+        let _off = TestEnvVarGuard::set("DD_SOCCER_FORWARD_PASS_CLIMB_CURRICULUM", "0");
+        assert!(
+            !goal_attack_shot_can_yield_to_support(&observation, sim.players[attacker].role),
+            "default play should still force the shot when normal support criteria are absent"
+        );
+        assert!(goal_attack_shot_blocks_alternatives(
+            &observation,
+            sim.players[attacker].role
+        ));
+    }
+
+    {
+        let _on = TestEnvVarGuard::set("DD_SOCCER_FORWARD_PASS_CLIMB_CURRICULUM", "1");
+        assert!(
+            goal_attack_shot_can_yield_to_support(&observation, sim.players[attacker].role),
+            "curriculum should create forward-pass samples from credible support options"
+        );
+        assert!(!goal_attack_shot_blocks_alternatives(
+            &observation,
+            sim.players[attacker].role
+        ));
+    }
 }
 
 #[test]
