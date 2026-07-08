@@ -11071,9 +11071,11 @@ impl SoccerMatch {
             };
             self.pending_support_decisions.push(PendingSupportDecision {
                 team,
+                player_id: player.id,
                 features,
                 decision_territorial: territorial,
                 due_tick: tick + SUPPORT_MOVE_REWARD_WINDOW_TICKS,
+                outcome_accumulator: 0.0,
             });
         }
     }
