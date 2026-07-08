@@ -4247,7 +4247,7 @@ fn append_policy_entry_value_tuple(
     if include_target_cells {
         write!(
             sql,
-            "(${}::text::uuid, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}::text::uuid)",
+            "(${}::text::uuid, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}::text::uuid)",
             first_param,
             first_param + 1,
             first_param + 2,
@@ -4260,7 +4260,8 @@ fn append_policy_entry_value_tuple(
             first_param + 9,
             first_param + 10,
             first_param + 11,
-            first_param + 12
+            first_param + 12,
+            first_param + 13
         )
         .expect("write target policy entry tuple");
     } else {
