@@ -67536,6 +67536,7 @@ fn low_pressure_poor_pass_receives_learning_penalty_vs_carry() {
         )),
         facing: facing_bucket_from_vector(poor_lateral_target - sim.players[passer].position),
         dribble_touch: None,
+        receiver_descriptor: None,
     });
     let pass_context = soccer_decision_context_for(
         passer,
