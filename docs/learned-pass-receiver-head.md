@@ -68,5 +68,35 @@ Unspecified(-1) ⇒ key identical to today ⇒ parity.
    the existing action-level `mpc_reconciled_learned_plan`.
 
 Gate off ⇒ the legacy heuristic path runs unchanged.
+
+## RDS migration
+
+`schema.sql` in `k8s-cluster/remote/libs/pg-defs` is authoritative; migrations are diff-generated
+into `tmp/migrations/<env>/pg-defs-diff.sql` and human-applied. The diff tool auto-emits the
+`add column` + check constraint but **not** the unique-index recreation (adding a key column
+changes the index), so apply this reviewed, idempotent SQL to both tables:
+
+```sql
+-- des_soccer_learning_policy_entries  (repeat verbatim for des_soccer_learning_run_deltas)
+alter table des_soccer_learning_policy_entries
+  add column if not exists receiver_descriptor integer default -1 not null;
+alter table des_soccer_learning_policy_entries
+  add constraint des_soccer_learning_policy_entries_receiver_descriptor_chk
+  check (receiver_descriptor >= -1) not valid;
+alter table des_soccer_learning_policy_entries
+  validate constraint des_soccer_learning_policy_entries_receiver_descriptor_chk;
+drop index if exists des_soccer_learning_policy_entries_key_uq;
+create unique index if not exists des_soccer_learning_policy_entries_key_uq
+  on des_soccer_learning_policy_entries (
+    policy_version_id, team, entry_kind, state_hash, action,
+    target_fine_cell_id, target_tactical_cell_id, target_macro_cell_id, target_root_cell_id,
+    receiver_descriptor
+  );
+```
+
+Existing rows default to `-1` (Unspecified) — byte-compatible with the grid-only entries. Safe to
+apply before the code lands (the gate is default-OFF, so nothing writes a non-`-1` descriptor
+until an operator opts in).
+
 </content>
 </invoke>
