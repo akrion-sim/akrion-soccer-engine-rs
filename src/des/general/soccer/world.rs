@@ -25754,7 +25754,7 @@ impl SoccerMatch {
                     // every downstream guard (noisy-aim clamp, offside/receipt/replan gate), so the
                     // policy still owns WHO/WHETHER — this only refines WHERE within the guard envelope.
                     // Captured with its launch features + reinforced by the delayed pass outcome (RWR).
-                    let mpc_objective_sample: Option<(Vec<f32>, Vec2)> =
+                    let mpc_objective_sample: Option<(Vec<f32>, Vec2, f64)> =
                         if learned_mpc_objective_enabled() {
                             if let Some(head) = self.mpc_objective_head.clone() {
                                 let features = snapshot.mpc_objective_learn_features(
@@ -25782,12 +25782,31 @@ impl SoccerMatch {
                                         ),
                                     })
                                 };
+                                // Learned SIGNED BEND (yards), gated `DD_SOCCER_ENABLE_LEARNED_CURVE`
+                                // + head bend-enabled. Explored like the residual but APPLIED later
+                                // at the curve decision (not to `led_target`), so it steers the
+                                // curl, not the aim. Zero (⇒ analytic curl) when the axis is off.
+                                let learned_bend = if learned_curve_enabled() && head.bend_enabled() {
+                                    let bend_sigma = mpc_objective_bend_explore_sigma_yards();
+                                    let noise_bend = self.mpc_objective_bend_noise();
+                                    if head.is_warm() {
+                                        head.explore_bend(&features, bend_sigma, noise_bend)
+                                            .unwrap_or(0.0)
+                                    } else {
+                                        (noise_bend * bend_sigma).clamp(
+                                            -MPC_OBJECTIVE_MAX_BEND_YARDS,
+                                            MPC_OBJECTIVE_MAX_BEND_YARDS,
+                                        )
+                                    }
+                                } else {
+                                    0.0
+                                };
                                 residual.map(|r| {
                                     led_target = (led_target + r).clamp_to_pitch(
                                         self.config.field_width_yards,
                                         self.config.field_length_yards,
                                     );
-                                    (features, r)
+                                    (features, r, learned_bend)
                                 })
                             } else {
                                 None
