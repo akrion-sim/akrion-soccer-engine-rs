@@ -12941,10 +12941,6 @@ impl SoccerMatch {
         if !soccer_external_nn_pomdp_sidecar_enabled() {
             return None;
         }
-<<<<<<< HEAD
-        let player = snapshot.players.iter().find(|p| p.id == player_id)?;
-        let legal_action_mask = soccer_policy_legal_action_mask_for_snapshot(snapshot, player_id)?;
-=======
         // On-ball-only lever: let the strong analytic MPC keep off-ball positioning; the learned net
         // only owns the ball-carrier's decision. Recovers score when the net's off-ball play is weak.
         //
