@@ -55774,6 +55774,7 @@ fn dribble_and_shot_neural_features_include_mpc_accuracy_context() {
         )),
         facing: facing_bucket_from_vector(dribble_target - sim.players[holder].position),
         dribble_touch: Some(DribbleTouchDecision::new(4, 3.2)),
+        receiver_descriptor: None,
     };
     let dribble_context = soccer_decision_context_for(
         holder,
