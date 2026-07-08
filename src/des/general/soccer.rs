@@ -12979,6 +12979,7 @@ impl SoccerQPolicy {
                     target_tactical_cell_id: key.target_tactical_cell_id,
                     target_macro_cell_id: key.target_macro_cell_id,
                     target_root_cell_id: key.target_root_cell_id,
+                    receiver_descriptor: key.receiver_descriptor,
                     value,
                     visits: self.target_visits.get(key).copied().unwrap_or(0),
                 })
