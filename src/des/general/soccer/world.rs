@@ -58695,6 +58695,61 @@ impl WorldSnapshot {
         features
     }
 
+    /// Feature vector for [`SoccerMpcObjectiveHead`]: the 256-d whole-field config embedding
+    /// (weighted toward the `from`→`to` execution lane, exactly like `pass_completion_learn_features`
+    /// so the head emphasises the players who actually gate the outcome) followed by
+    /// [`MPC_OBJECTIVE_EXEC_FEATURES`] execution-context scalars — the family one-hot
+    /// (shot/pass/dribble), normalized target distance, the forward and lateral components of the
+    /// analytic target delta in team-canonical axes, the signed angle of that delta relative to the
+    /// straight-at-goal direction, and a pressure proxy. All bounded + slow-varying so the head
+    /// generalises across moments. The width is exactly [`MPC_OBJECTIVE_FEATURE_DIM`].
+    pub(crate) fn mpc_objective_learn_features(
+        &self,
+        team: Team,
+        family: MpcObjectiveFamily,
+        from: Vec2,
+        to: Vec2,
+        pressure: f64,
+    ) -> Vec<f32> {
+        let config = SoccerConfigVector::from_snapshot_with(
+            self,
+            team,
+            SoccerConfigComparison::PositionAgnostic,
+            ConfigWeightOptions {
+                ball_path: Some((from, to)),
+                ball_path_along_taper: 0.6,
+                ..ConfigWeightOptions::default()
+            },
+        );
+        let embedding = config.embedding();
+        let mut features: Vec<f32> = Vec::with_capacity(MPC_OBJECTIVE_FEATURE_DIM);
+        features.extend(embedding.iter().map(|&v| v as f32));
+        features.extend_from_slice(&family.one_hot());
+        let attack = team.attack_dir();
+        let distance = from.distance(to);
+        features.push((distance / 60.0).clamp(0.0, 1.5) as f32);
+        features.push((((to.y - from.y) * attack) / 40.0).clamp(-1.0, 1.5) as f32);
+        features.push(((to.x - from.x).abs() / 40.0).clamp(0.0, 1.0) as f32);
+        // Signed angle (rad, wrapped to [-pi, pi]) between the target delta and the straight line
+        // from the actor to the attacking goal centre — 0 means "aimed dead at goal", ±1 (after the
+        // /pi normalise) means square/backwards. Robust to a zero-length delta (atan2(0,0)=0).
+        let goal_x = self.field_width * 0.5;
+        let goal_y = if attack > 0.0 { self.field_length } else { 0.0 };
+        let angle_to_goal = (goal_y - from.y).atan2(goal_x - from.x);
+        let angle_to_target = (to.y - from.y).atan2(to.x - from.x);
+        let mut angle = angle_to_target - angle_to_goal;
+        while angle > std::f64::consts::PI {
+            angle -= 2.0 * std::f64::consts::PI;
+        }
+        while angle < -std::f64::consts::PI {
+            angle += 2.0 * std::f64::consts::PI;
+        }
+        features.push((angle / std::f64::consts::PI).clamp(-1.0, 1.0) as f32);
+        features.push(pressure.clamp(0.0, 1.0) as f32);
+        debug_assert_eq!(features.len(), MPC_OBJECTIVE_FEATURE_DIM);
+        features
+    }
+
     /// Forward-model the time (seconds) for a GROUND ball launched at `launch_speed` (yps) to roll
     /// `distance` yards under the live ball deceleration (drag + grass). `None` if it would stop
     /// short of the distance. This is the ball half of the MPC pass rendezvous — "when, if ever,
