@@ -33,6 +33,12 @@ const MPC_OBJECTIVE_HIDDEN_UNITS: usize = 32;
 /// Hard bound (yards) on the residual — the guardrail that keeps the executor inside the
 /// "policy owns WHERE" contract. Codex round-9: ~1.0–1.5 yd for a first cut.
 pub const MPC_OBJECTIVE_MAX_RESIDUAL_YARDS: f64 = 1.5;
+/// Default exploration std-dev (yards) added to the greedy residual at capture time. Without
+/// exploration the RWR loop only ever imitates the residual it already took, so it can never
+/// DISCOVER a better aim — the jitter is what gives the contextual bandit a gradient to climb.
+/// Kept below the hard bound so a jittered residual rarely rails. Decays toward 0 as the head
+/// warms (see the exec-side schedule); this is the un-warmed ceiling.
+pub const MPC_OBJECTIVE_EXPLORE_SIGMA_YARDS: f64 = 0.6;
 /// Live use falls back to the pure analytic target until the head has warmed this many steps
 /// (mirrors the support-scorer / pass-completion warm thresholds).
 pub const MPC_OBJECTIVE_MIN_TRAINING_STEPS: usize = 200;
