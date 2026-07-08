@@ -55484,6 +55484,7 @@ fn pass_neural_features_include_mpc_receipt_context() {
         )),
         facing: facing_bucket_from_vector(target_point - sim.players[passer].position),
         dribble_touch: None,
+        receiver_descriptor: None,
     };
     let context = soccer_decision_context_for(
         passer,
