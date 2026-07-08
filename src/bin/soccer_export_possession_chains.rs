@@ -149,15 +149,10 @@ fn main() -> std::io::Result<()> {
             } else {
                 None
             };
-            // Per-team deltas this tick for the currently-possessing team (attributed correctly).
-            let sot_for = |t: Team| match t {
-                Team::Home => sot.0 > prev_sot.0,
-                Team::Away => sot.1 > prev_sot.1,
-            };
-            let shot_for = |t: Team| match t {
-                Team::Home => shots.0 > prev_shots.0,
-                Team::Away => shots.1 > prev_shots.1,
-            };
+            // Per-team shot deltas this tick (attributed correctly), computed as values before we
+            // overwrite the prev_* trackers (Home, Away).
+            let sot_delta = (sot.0 > prev_sot.0, sot.1 > prev_sot.1);
+            let shot_delta = (shots.0 > prev_shots.0, shots.1 > prev_shots.1);
             prev_score = score;
             prev_shots = shots;
             prev_sot = sot;
