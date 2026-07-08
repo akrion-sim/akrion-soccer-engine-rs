@@ -3392,18 +3392,21 @@ impl SoccerLearningPgStore {
                       target_root_cell_id,
                       value_micros,
                       visits,
-                      state_hash
+                      state_hash,
+                      receiver_descriptor
                     from des_soccer_learning_policy_entries
                     where policy_version_id = $1::text::uuid
                       and (team, entry_kind, state_hash, action,
                            target_fine_cell_id, target_tactical_cell_id,
-                           target_macro_cell_id, target_root_cell_id)
+                           target_macro_cell_id, target_root_cell_id,
+                           receiver_descriptor)
                         > ($2::text, $3::text, $4::text, $5::text,
-                           $6::int, $7::int, $8::int, $9::int)
+                           $6::int, $7::int, $8::int, $9::int, $12::int)
                       and visits >= $11::int
                     order by team, entry_kind, state_hash, action,
                              target_fine_cell_id, target_tactical_cell_id,
-                             target_macro_cell_id, target_root_cell_id
+                             target_macro_cell_id, target_root_cell_id,
+                             receiver_descriptor
                     limit $10
                     "#,
                     &[
@@ -3418,6 +3421,7 @@ impl SoccerLearningPgStore {
                         &cursor_root,
                         &SOCCER_POLICY_ENTRY_PAGE_SIZE,
                         &min_visits,
+                        &cursor_receiver,
                     ],
                 )
                 .map_err(|err| format!("select soccer policy entries page: {err}"))?;
