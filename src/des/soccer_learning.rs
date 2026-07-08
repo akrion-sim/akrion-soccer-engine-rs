@@ -5211,6 +5211,7 @@ fn policy_entry_key(
         target_tactical_cell_id: value.target_tactical_cell_id,
         target_macro_cell_id: value.target_macro_cell_id,
         target_root_cell_id: value.target_root_cell_id,
+        receiver_descriptor: value.receiver_descriptor,
     }
 }
 
@@ -5226,6 +5227,7 @@ fn policy_delta_key(entry: &SoccerLearningPolicyDeltaEntry) -> PolicyEntryKey {
         target_tactical_cell_id: entry.target_tactical_cell_id,
         target_macro_cell_id: entry.target_macro_cell_id,
         target_root_cell_id: entry.target_root_cell_id,
+        receiver_descriptor: entry.receiver_descriptor,
     }
 }
 
