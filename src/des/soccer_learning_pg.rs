@@ -96,9 +96,9 @@ pub struct SoccerLearningPgMomentVectorRetentionPrune {
 
 const POSTGRES_MAX_QUERY_PARAMETERS: usize = 65_535;
 const SOCCER_COMPLETED_RUN_HEADER_PARAMETER_COUNT: usize = 22;
-const SOCCER_RUN_DELTA_PARAMETER_COUNT: usize = 16;
+const SOCCER_RUN_DELTA_PARAMETER_COUNT: usize = 17;
 const SOCCER_POLICY_ACTION_ENTRY_PARAMETER_COUNT: usize = 9;
-const SOCCER_POLICY_TARGET_ENTRY_PARAMETER_COUNT: usize = 13;
+const SOCCER_POLICY_TARGET_ENTRY_PARAMETER_COUNT: usize = 14;
 
 const SOCCER_POLICY_ENTRY_INSERT_BATCH_SIZE: usize = 1024;
 const SOCCER_RUN_DELTA_INSERT_BATCH_SIZE: usize = 1024;
@@ -131,11 +131,13 @@ const SOCCER_PG_CONNECT_MAX_BACKOFF_MILLIS: u64 = 5_000;
 const SOCCER_POLICY_ENTRY_PAGE_SIZE: i64 = 4096;
 const SOCCER_POLICY_ENTRY_ON_CONFLICT_CLAUSE: &str =
     " on conflict (policy_version_id, team, entry_kind, state_hash, action, \
-target_fine_cell_id, target_tactical_cell_id, target_macro_cell_id, target_root_cell_id) \
+target_fine_cell_id, target_tactical_cell_id, target_macro_cell_id, target_root_cell_id, \
+receiver_descriptor) \
 do nothing";
 const SOCCER_RUN_DELTA_ON_CONFLICT_CLAUSE: &str =
     " on conflict (run_id, team, entry_kind, state_hash, action, \
-target_fine_cell_id, target_tactical_cell_id, target_macro_cell_id, target_root_cell_id) \
+target_fine_cell_id, target_tactical_cell_id, target_macro_cell_id, target_root_cell_id, \
+receiver_descriptor) \
 do nothing";
 const SOCCER_MOMENT_EMBEDDING_SEARCH_SQL: &str = "\
 select team, action, reward_micros, value_micros, tick, \
@@ -2695,7 +2697,8 @@ impl SoccerLearningPgStore {
                   d.value_delta_micros,
                   d.visit_delta,
                   d.merge_weight_micros,
-                  d.effective_visit_micros
+                  d.effective_visit_micros,
+                  d.receiver_descriptor
                 from des_soccer_learning_run_deltas d
                 join des_soccer_learning_runs r on r.id = d.run_id
                 where r.experiment_id = $1::text::uuid
@@ -2705,7 +2708,8 @@ impl SoccerLearningPgStore {
                 order by r.created_at desc, r.id desc,
                          d.team, d.entry_kind, d.state_hash, d.action,
                          d.target_fine_cell_id, d.target_tactical_cell_id,
-                         d.target_macro_cell_id, d.target_root_cell_id
+                         d.target_macro_cell_id, d.target_root_cell_id,
+                         d.receiver_descriptor
                 limit $2
                 "#,
                 &[&experiment_id, &limit, &created_after_micros],
@@ -2740,6 +2744,7 @@ impl SoccerLearningPgStore {
                 target_tactical_cell_id: row.get(6),
                 target_macro_cell_id: row.get(7),
                 target_root_cell_id: row.get(8),
+                receiver_descriptor: row.get(15),
                 before_value: soccer_learning_from_micros(before_value_micros),
                 after_value: soccer_learning_from_micros(after_value_micros),
                 value_delta: soccer_learning_from_micros(value_delta_micros),
@@ -3372,6 +3377,7 @@ impl SoccerLearningPgStore {
         let mut cursor_tactical = i32::MIN;
         let mut cursor_macro = i32::MIN;
         let mut cursor_root = i32::MIN;
+        let mut cursor_receiver = i32::MIN;
         loop {
             let rows = self
                 .client
@@ -3388,18 +3394,21 @@ impl SoccerLearningPgStore {
                       target_root_cell_id,
                       value_micros,
                       visits,
-                      state_hash
+                      state_hash,
+                      receiver_descriptor
                     from des_soccer_learning_policy_entries
                     where policy_version_id = $1::text::uuid
                       and (team, entry_kind, state_hash, action,
                            target_fine_cell_id, target_tactical_cell_id,
-                           target_macro_cell_id, target_root_cell_id)
+                           target_macro_cell_id, target_root_cell_id,
+                           receiver_descriptor)
                         > ($2::text, $3::text, $4::text, $5::text,
-                           $6::int, $7::int, $8::int, $9::int)
+                           $6::int, $7::int, $8::int, $9::int, $12::int)
                       and visits >= $11::int
                     order by team, entry_kind, state_hash, action,
                              target_fine_cell_id, target_tactical_cell_id,
-                             target_macro_cell_id, target_root_cell_id
+                             target_macro_cell_id, target_root_cell_id,
+                             receiver_descriptor
                     limit $10
                     "#,
                     &[
@@ -3414,6 +3423,7 @@ impl SoccerLearningPgStore {
                         &cursor_root,
                         &SOCCER_POLICY_ENTRY_PAGE_SIZE,
                         &min_visits,
+                        &cursor_receiver,
                     ],
                 )
                 .map_err(|err| format!("select soccer policy entries page: {err}"))?;
@@ -3428,6 +3438,7 @@ impl SoccerLearningPgStore {
                 cursor_macro = last.get(6);
                 cursor_root = last.get(7);
                 cursor_hash = last.get(10);
+                cursor_receiver = last.get(11);
             }
 
             for row in &rows {
@@ -3448,6 +3459,7 @@ impl SoccerLearningPgStore {
                 let visits_i32: i32 = row.get(9);
                 let visits = visits_i32.max(0) as u32;
                 let value = soccer_learning_from_micros(value_micros);
+                let receiver_descriptor: i32 = row.get(11);
                 match (team.as_str(), entry_kind.as_str()) {
                     ("home", "action") => home_entries.push(SoccerQEntry {
                         state,
@@ -3468,6 +3480,7 @@ impl SoccerLearningPgStore {
                         target_tactical_cell_id: target_tactical_cell_id.max(0) as usize,
                         target_macro_cell_id: target_macro_cell_id.max(0) as usize,
                         target_root_cell_id: target_root_cell_id.max(0) as usize,
+                        receiver_descriptor,
                         value,
                         visits,
                     }),
@@ -3478,6 +3491,7 @@ impl SoccerLearningPgStore {
                         target_tactical_cell_id: target_tactical_cell_id.max(0) as usize,
                         target_macro_cell_id: target_macro_cell_id.max(0) as usize,
                         target_root_cell_id: target_root_cell_id.max(0) as usize,
+                        receiver_descriptor,
                         value,
                         visits,
                     }),
@@ -3886,6 +3900,7 @@ fn insert_run_delta_batch_rows(
                 target_tactical_cell_id,
                 target_macro_cell_id,
                 target_root_cell_id,
+                receiver_descriptor,
                 before_value_micros,
                 after_value_micros,
                 value_delta_micros,
@@ -3921,6 +3936,7 @@ fn insert_run_delta_batch_rows(
             params.push(&delta.target_tactical_cell_id);
             params.push(&delta.target_macro_cell_id);
             params.push(&delta.target_root_cell_id);
+            params.push(&delta.receiver_descriptor);
             params.push(&delta.before_value_micros);
             params.push(&delta.after_value_micros);
             params.push(&delta.value_delta_micros);
@@ -3956,6 +3972,7 @@ struct SoccerPolicyTargetEntryInsert {
     target_tactical_cell_id: i32,
     target_macro_cell_id: i32,
     target_root_cell_id: i32,
+    receiver_descriptor: i32,
     value_micros: i64,
     visits: i32,
 }
@@ -4016,6 +4033,7 @@ fn insert_policy_entries_for_team(
             target_tactical_cell_id: checked_i32(entry.target_tactical_cell_id),
             target_macro_cell_id: checked_i32(entry.target_macro_cell_id),
             target_root_cell_id: checked_i32(entry.target_root_cell_id),
+            receiver_descriptor: entry.receiver_descriptor,
             value_micros: soccer_learning_to_micros(entry.value),
             visits: checked_i32(entry.visits),
         });
@@ -4124,6 +4142,7 @@ fn insert_policy_target_entry_rows(
                 target_tactical_cell_id,
                 target_macro_cell_id,
                 target_root_cell_id,
+                receiver_descriptor,
                 value_micros,
                 visits,
                 source_run_id
@@ -4156,6 +4175,7 @@ fn insert_policy_target_entry_rows(
             params.push(&row.target_tactical_cell_id);
             params.push(&row.target_macro_cell_id);
             params.push(&row.target_root_cell_id);
+            params.push(&row.receiver_descriptor);
             params.push(&row.value_micros);
             params.push(&row.visits);
             params.push(&source_run_id);
@@ -4203,7 +4223,7 @@ fn append_completed_run_header_value_tuple(sql: &mut String, first_param: usize)
 fn append_run_delta_value_tuple(sql: &mut String, first_param: usize) {
     write!(
         sql,
-        "(${}::text::uuid, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+        "(${}::text::uuid, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
         first_param,
         first_param + 1,
         first_param + 2,
@@ -4219,7 +4239,8 @@ fn append_run_delta_value_tuple(sql: &mut String, first_param: usize) {
         first_param + 12,
         first_param + 13,
         first_param + 14,
-        first_param + 15
+        first_param + 15,
+        first_param + 16
     )
     .expect("write run delta tuple");
 }
@@ -4232,7 +4253,7 @@ fn append_policy_entry_value_tuple(
     if include_target_cells {
         write!(
             sql,
-            "(${}::text::uuid, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}::text::uuid)",
+            "(${}::text::uuid, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}::text::uuid)",
             first_param,
             first_param + 1,
             first_param + 2,
@@ -4245,7 +4266,8 @@ fn append_policy_entry_value_tuple(
             first_param + 9,
             first_param + 10,
             first_param + 11,
-            first_param + 12
+            first_param + 12,
+            first_param + 13
         )
         .expect("write target policy entry tuple");
     } else {
@@ -6601,10 +6623,10 @@ mod tests {
         let mut delta_sql = String::new();
         append_run_delta_value_tuple(&mut delta_sql, 1);
         delta_sql.push_str(", ");
-        append_run_delta_value_tuple(&mut delta_sql, 17);
+        append_run_delta_value_tuple(&mut delta_sql, 18);
         assert_eq!(
             delta_sql,
-            "($1::text::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16), ($17::text::uuid, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32)"
+            "($1::text::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17), ($18::text::uuid, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34)"
         );
 
         let mut action_sql = String::new();
@@ -6619,10 +6641,10 @@ mod tests {
         let mut target_sql = String::new();
         append_policy_entry_value_tuple(&mut target_sql, 1, true);
         target_sql.push_str(", ");
-        append_policy_entry_value_tuple(&mut target_sql, 14, true);
+        append_policy_entry_value_tuple(&mut target_sql, 15, true);
         assert_eq!(
             target_sql,
-            "($1::text::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::text::uuid), ($14::text::uuid, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26::text::uuid)"
+            "($1::text::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::text::uuid), ($15::text::uuid, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28::text::uuid)"
         );
     }
 

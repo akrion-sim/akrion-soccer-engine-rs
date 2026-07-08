@@ -18,6 +18,7 @@ use crate::des::general::soccer::{
     MatchConfig, MatchSummary, SoccerConfigMomentInsert, SoccerMatch, SoccerNeuralBlendConfig,
     SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot, SoccerPassOutcomeSample, SoccerQEntry,
     SoccerQPolicy, SoccerQPolicyOptions, SoccerQStateKey, SoccerQTargetEntry,
+    RECEIVER_DESCRIPTOR_UNSPECIFIED,
     SoccerSelfPlayEpisodeSummary, SoccerSelfPlayTrainingArtifact, SoccerTacticalLearningSummary,
     SoccerTacticalLearningWeights, SoccerTeamQPolicies, Team, DEFAULT_FIELD_LENGTH_YARDS,
     DEFAULT_FIELD_WIDTH_YARDS, MAX_SOCCER_NEURAL_LEARNING_RATE,
@@ -167,6 +168,7 @@ pub struct SoccerLearningPolicyDeltaEntry {
     pub target_tactical_cell_id: i32,
     pub target_macro_cell_id: i32,
     pub target_root_cell_id: i32,
+    pub receiver_descriptor: i32,
     pub before_value: f64,
     pub after_value: f64,
     pub value_delta: f64,
@@ -1596,6 +1598,7 @@ fn soccer_q_target_entry_fingerprint(entry: &SoccerQTargetEntry) -> u64 {
     soccer_learning_fingerprint_usize(&mut hash, entry.target_tactical_cell_id);
     soccer_learning_fingerprint_usize(&mut hash, entry.target_macro_cell_id);
     soccer_learning_fingerprint_usize(&mut hash, entry.target_root_cell_id);
+    soccer_learning_fingerprint_mix(&mut hash, u64::from(entry.receiver_descriptor as u32));
     soccer_learning_fingerprint_f64(&mut hash, entry.value);
     soccer_learning_fingerprint_mix(&mut hash, u64::from(entry.visits));
     hash
@@ -1889,6 +1892,7 @@ struct PolicyEntryKey {
     target_tactical_cell_id: i32,
     target_macro_cell_id: i32,
     target_root_cell_id: i32,
+    receiver_descriptor: i32,
 }
 
 #[derive(Clone, Debug)]
@@ -1901,6 +1905,7 @@ struct EntryValue {
     target_tactical_cell_id: i32,
     target_macro_cell_id: i32,
     target_root_cell_id: i32,
+    receiver_descriptor: i32,
 }
 
 #[derive(Clone, Debug)]
@@ -1914,6 +1919,7 @@ struct MergeAccumulator {
     target_tactical_cell_id: i32,
     target_macro_cell_id: i32,
     target_root_cell_id: i32,
+    receiver_descriptor: i32,
 }
 
 pub fn soccer_learning_to_micros(value: f64) -> i64 {
@@ -2516,6 +2522,7 @@ pub fn merge_soccer_policy_deltas(
                 target_tactical_cell_id: entry.target_tactical_cell_id,
                 target_macro_cell_id: entry.target_macro_cell_id,
                 target_root_cell_id: entry.target_root_cell_id,
+                receiver_descriptor: entry.receiver_descriptor,
             });
             item.weighted_value_sum += entry.after_value * effective_visits;
             item.effective_visits += effective_visits;
@@ -5308,6 +5315,7 @@ fn push_delta_entry(
         target_tactical_cell_id: value.target_tactical_cell_id,
         target_macro_cell_id: value.target_macro_cell_id,
         target_root_cell_id: value.target_root_cell_id,
+        receiver_descriptor: value.receiver_descriptor,
         before_value: before_q,
         after_value: value.value,
         value_delta: value.value - before_q,
@@ -5345,6 +5353,7 @@ fn action_entry_value(entry: SoccerQEntry) -> EntryValue {
         target_tactical_cell_id: -1,
         target_macro_cell_id: -1,
         target_root_cell_id: -1,
+        receiver_descriptor: RECEIVER_DESCRIPTOR_UNSPECIFIED,
     }
 }
 
@@ -5358,6 +5367,7 @@ fn target_entry_value(entry: SoccerQTargetEntry) -> EntryValue {
         target_tactical_cell_id: entry.target_tactical_cell_id as i32,
         target_macro_cell_id: entry.target_macro_cell_id as i32,
         target_root_cell_id: entry.target_root_cell_id as i32,
+        receiver_descriptor: entry.receiver_descriptor,
     }
 }
 
@@ -5378,6 +5388,7 @@ fn policy_entry_key(
         target_tactical_cell_id: value.target_tactical_cell_id,
         target_macro_cell_id: value.target_macro_cell_id,
         target_root_cell_id: value.target_root_cell_id,
+        receiver_descriptor: value.receiver_descriptor,
     }
 }
 
@@ -5393,6 +5404,7 @@ fn policy_delta_key(entry: &SoccerLearningPolicyDeltaEntry) -> PolicyEntryKey {
         target_tactical_cell_id: entry.target_tactical_cell_id,
         target_macro_cell_id: entry.target_macro_cell_id,
         target_root_cell_id: entry.target_root_cell_id,
+        receiver_descriptor: entry.receiver_descriptor,
     }
 }
 
@@ -5445,6 +5457,7 @@ fn seed_entry_accumulator(
         target_tactical_cell_id: entry.target_tactical_cell_id,
         target_macro_cell_id: entry.target_macro_cell_id,
         target_root_cell_id: entry.target_root_cell_id,
+        receiver_descriptor: entry.receiver_descriptor,
     });
     item.weighted_value_sum += entry.value * effective_visits;
     item.effective_visits += effective_visits;
@@ -5619,6 +5632,7 @@ fn inject_policy_plateau_novelty_actions(
                 target_tactical_cell_id: -1,
                 target_macro_cell_id: -1,
                 target_root_cell_id: -1,
+                receiver_descriptor: RECEIVER_DESCRIPTOR_UNSPECIFIED,
             };
             if accumulators.contains_key(&novelty_key) {
                 continue;
@@ -5637,6 +5651,7 @@ fn inject_policy_plateau_novelty_actions(
                     target_tactical_cell_id: -1,
                     target_macro_cell_id: -1,
                     target_root_cell_id: -1,
+                    receiver_descriptor: RECEIVER_DESCRIPTOR_UNSPECIFIED,
                 },
             );
             added += 1;
@@ -5843,6 +5858,7 @@ fn build_policies_from_accumulators(
             target_tactical_cell_id: accumulator.target_tactical_cell_id.max(0) as usize,
             target_macro_cell_id: accumulator.target_macro_cell_id.max(0) as usize,
             target_root_cell_id: accumulator.target_root_cell_id.max(0) as usize,
+            receiver_descriptor: accumulator.receiver_descriptor,
             value: accumulator.weighted_value_sum / accumulator.effective_visits,
             visits: accumulator.display_visits.max(1),
         };
