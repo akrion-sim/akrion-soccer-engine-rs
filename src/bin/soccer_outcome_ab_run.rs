@@ -395,6 +395,41 @@ fn eval(candidate_path: &str, baseline_path: &str, games: usize, minutes: f64, h
             "no advancement on forward passes"
         };
         println!("ADVANCEMENT: {advancement}");
+
+        // ---- Pass diagnosis: separate WHO/WHEN (POMDP selection) from HOW (MPC execution) ----
+        // completion rate = completed/attempted (low ⇒ passes fail in flight ⇒ execution/aim = MPC).
+        // forward share  = forward/completed (low ⇒ policy recycles laterally/back ⇒ selection = POMDP).
+        let pct = |num: u64, den: u64| if den > 0 { 100.0 * num as f64 / den as f64 } else { 0.0 };
+        let fwd_share = |fwd: u64, comp: u64| pct(fwd, comp);
+        println!("\n===== PASS DIAGNOSIS (WHO/WHEN vs HOW) =====");
+        println!(
+            "candidate: {:.1} att/g, {:.0}% completed, forward {:.0}% / lateral {:.0}% / back {:.0}% of completions",
+            cand_att as f64 / n_f,
+            pct(cand_comp, cand_att),
+            fwd_share(candidate_forward_total, cand_comp),
+            pct(cand_comp.saturating_sub(candidate_forward_total + cand_back), cand_comp),
+            pct(cand_back, cand_comp),
+        );
+        println!(
+            "baseline:  {:.1} att/g, {:.0}% completed, forward {:.0}% / lateral {:.0}% / back {:.0}% of completions",
+            base_att as f64 / n_f,
+            pct(base_comp, base_att),
+            fwd_share(baseline_forward_total, base_comp),
+            pct(base_comp.saturating_sub(baseline_forward_total + base_back), base_comp),
+            pct(base_back, base_comp),
+        );
+        let comp_rate = pct(cand_comp, cand_att);
+        let fshare = fwd_share(candidate_forward_total, cand_comp);
+        println!(
+            "READ: {}",
+            if comp_rate < 65.0 {
+                "LOW completion ⇒ passes fail in flight — bottleneck is EXECUTION (MPC aim/speed/curve)"
+            } else if fshare < 20.0 {
+                "HIGH completion but LOW forward share ⇒ the POMDP is CHOOSING safe (lateral/back) — bottleneck is SELECTION (WHO/WHEN)"
+            } else {
+                "completion healthy and forward share non-trivial — passing is being expressed; look elsewhere"
+            }
+        );
     } else {
         println!("\n[advancement] no completed fixtures to measure forward-pass progression");
     }
