@@ -10402,37 +10402,6 @@ fn soccer_trajectory_export_writer(
         .as_ref()
 }
 
-fn soccer_trajectory_export_decision(
-    before: &WorldSnapshot,
-    actor_id: usize,
-    team: Team,
-    action: &str,
-    reward: f64,
-    done: bool,
-) {
-    let Some(writer) = soccer_trajectory_export_writer() else {
-        return;
-    };
-    let Some(action_index) = soccer_policy_action_index(action) else {
-        return;
-    };
-    let block = soccer_field_player_motion_block(before, actor_id, team);
-    use std::io::Write;
-    if let Ok(mut guard) = writer.lock() {
-        let _ = write!(guard, "{{\"field_motion\":[");
-        for (index, value) in block.iter().enumerate() {
-            if index > 0 {
-                let _ = write!(guard, ",");
-            }
-            let _ = write!(guard, "{:.5}", value);
-        }
-        let _ = writeln!(
-            guard,
-            "],\"action\":{action_index},\"reward\":{reward:.5},\"done\":{done},\"agent\":{actor_id}}}"
-        );
-    }
-}
-
 fn soccer_actor_advantage_reward(
     transition: &SoccerLearningTransition,
     tick_rewards: &HashMap<u64, SoccerMarlTickReward>,
