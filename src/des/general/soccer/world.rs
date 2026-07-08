@@ -23462,6 +23462,54 @@ impl SoccerMatch {
                     );
                     let pass_skill =
                         pass_execution_skill(&self.players[player_id].skills, flight, is_cross);
+                    // Learned MPC execution-objective (gated `DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE`,
+                    // default-off ⇒ byte-identical). Nudge the analytic lead target by a hard-bounded
+                    // (≤`MPC_OBJECTIVE_MAX_RESIDUAL_YARDS`) residual so pass QUALITY (aim/lead) becomes
+                    // learnable. The residual is re-clamped to the pitch here and still passes through
+                    // every downstream guard (noisy-aim clamp, offside/receipt/replan gate), so the
+                    // policy still owns WHO/WHETHER — this only refines WHERE within the guard envelope.
+                    // Captured with its launch features + reinforced by the delayed pass outcome (RWR).
+                    let mpc_objective_sample: Option<(Vec<f32>, Vec2)> =
+                        if learned_mpc_objective_enabled() {
+                            if let Some(head) = self.mpc_objective_head.clone() {
+                                let features = snapshot.mpc_objective_learn_features(
+                                    player_team,
+                                    MpcObjectiveFamily::Pass,
+                                    player_pos,
+                                    led_target,
+                                    pressure,
+                                );
+                                let sigma = mpc_objective_explore_sigma_yards();
+                                let (noise_fwd, noise_lat) = self.mpc_objective_exploration_noise();
+                                let residual = if head.is_warm() {
+                                    head.explore_residual(&features, sigma, noise_fwd, noise_lat)
+                                } else {
+                                    // Cold start: explore around the ANALYTIC target (zero residual)
+                                    // so the head accrues training data before it is trusted live.
+                                    Some(Vec2 {
+                                        x: (noise_lat * sigma).clamp(
+                                            -MPC_OBJECTIVE_MAX_RESIDUAL_YARDS,
+                                            MPC_OBJECTIVE_MAX_RESIDUAL_YARDS,
+                                        ),
+                                        y: (noise_fwd * sigma).clamp(
+                                            -MPC_OBJECTIVE_MAX_RESIDUAL_YARDS,
+                                            MPC_OBJECTIVE_MAX_RESIDUAL_YARDS,
+                                        ),
+                                    })
+                                };
+                                residual.map(|r| {
+                                    led_target = (led_target + r).clamp_to_pitch(
+                                        self.config.field_width_yards,
+                                        self.config.field_length_yards,
+                                    );
+                                    (features, r)
+                                })
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
                     // Body-facing gate: you can only strike the ball with the slice of your
                     // range the body is turned toward. Evaluate the intended pass line against
                     // the carrier's CURRENT facing (this tick's body orientation, before the
