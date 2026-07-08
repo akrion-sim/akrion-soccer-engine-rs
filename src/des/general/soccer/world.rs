@@ -5315,6 +5315,61 @@ fn soccer_actor_advantage_tick_rewards(
     tick_rewards
 }
 
+/// Gated JSONL trajectory exporter for the external Burn POMDP-solver (Lock-2). When
+/// `DD_SOCCER_TRAJECTORY_EXPORT_PATH` is set, learned-policy decisions are appended as
+/// `{"field_motion":[184],"action":i,"reward":r,"done":b,"agent":id}` rows — the `adapter::Decision`
+/// contract. The field-motion block (23 entities × 8 channels) IS the entity tensor the attention
+/// encoder consumes. Unset ⇒ no-op (byte-identical). Mutex-serialised so parallel games interleave
+/// whole lines cleanly; `done` (game end) segments per-(agent,game) trajectories for the trainer.
+fn soccer_trajectory_export_writer(
+) -> Option<&'static std::sync::Mutex<std::io::BufWriter<std::fs::File>>> {
+    use std::sync::OnceLock;
+    static WRITER: OnceLock<Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>> =
+        OnceLock::new();
+    WRITER
+        .get_or_init(|| {
+            let path = std::env::var("DD_SOCCER_TRAJECTORY_EXPORT_PATH").ok()?;
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()?;
+            Some(std::sync::Mutex::new(std::io::BufWriter::new(file)))
+        })
+        .as_ref()
+}
+
+fn soccer_trajectory_export_decision(
+    before: &WorldSnapshot,
+    actor_id: usize,
+    team: Team,
+    action: &str,
+    reward: f64,
+    done: bool,
+) {
+    let Some(writer) = soccer_trajectory_export_writer() else {
+        return;
+    };
+    let Some(action_index) = soccer_policy_action_index(action) else {
+        return;
+    };
+    let block = soccer_field_player_motion_block(before, actor_id, team);
+    use std::io::Write;
+    if let Ok(mut guard) = writer.lock() {
+        let _ = write!(guard, "{{\"field_motion\":[");
+        for (index, value) in block.iter().enumerate() {
+            if index > 0 {
+                let _ = write!(guard, ",");
+            }
+            let _ = write!(guard, "{:.5}", value);
+        }
+        let _ = writeln!(
+            guard,
+            "],\"action\":{action_index},\"reward\":{reward:.5},\"done\":{done},\"agent\":{actor_id}}}"
+        );
+    }
+}
+
 fn soccer_actor_advantage_reward(
     transition: &SoccerLearningTransition,
     tick_rewards: &HashMap<u64, SoccerMarlTickReward>,
@@ -10077,7 +10132,32 @@ impl SoccerMatch {
                     return None;
                 }
                 let action_index = soccer_policy_action_index(&transition.action)?;
-                let advantage = if rejected_counterexample {
+                // COMA-analytic advantage (gated): reconstruct the raw return and subtract the
+                // DETACHED tabular baseline V_analytic(s) = best_value_hierarchical(current s) from
+                // the SEPARATE tabular policy, so policy-gradient rewards the actor for BEATING
+                // analytic rather than matching it (the escape from value-imitation parity). Raw
+                // reward units throughout (reward_adv / values are ×target_scale; tabular Q is raw),
+                // so no rescale. Gate off ⇒ the original SARSA-style advantage, byte-identical.
+                let advantage = if dd_soccer_enable_coma_analytic_advantage() {
+                    let mut adv = if rejected_counterexample {
+                        reward_adv[index]
+                    } else {
+                        advantages[index] + values[index]
+                    };
+                    let baseline = self.team_policies.as_ref().and_then(|policies| {
+                        let key = SoccerQStateKey::from_parts(
+                            &transition.state,
+                            &transition.observation,
+                            transition.team,
+                            transition.role,
+                        );
+                        policies.policy(transition.team).best_value_hierarchical(&key)
+                    });
+                    if let Some(baseline) = baseline.filter(|value| value.is_finite()) {
+                        adv -= baseline;
+                    }
+                    adv
+                } else if rejected_counterexample {
                     reward_adv[index] - values[index]
                 } else {
                     advantages[index]
@@ -24889,6 +24969,14 @@ impl SoccerMatch {
                 next_observation: after.observation_for(player.id),
                 done,
             };
+            soccer_trajectory_export_decision(
+                before,
+                player.id,
+                player.team,
+                &decision.action,
+                reward,
+                done,
+            );
             if let Some(rejected) = learned_mpc_rejected_action_transition(&transition) {
                 transitions.push(transition);
                 transitions.push(rejected);
