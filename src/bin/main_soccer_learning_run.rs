@@ -5695,6 +5695,14 @@ fn run_game(
     if let Some(head) = CARRIED_PASS_COMPLETION_HEAD.lock().unwrap().as_ref() {
         sim.set_pass_completion_head(head.clone());
     }
+    // Install the carried executor head so this game's on-ball execution gets the learned aim/lead
+    // residual. Seed-on-first-install when the gate is on (the residual must be applied for a sample
+    // to be captured — otherwise the head could never bootstrap); no-op + never seeded when off.
+    if learned_mpc_objective_enabled() {
+        let mut guard = CARRIED_MPC_OBJECTIVE_HEAD.lock().unwrap();
+        let head = guard.get_or_insert_with(|| SoccerMpcObjectiveHead::new(episode_seed as u32));
+        sim.set_mpc_objective_head(head.clone());
+    }
     // Install the carried attacking-spacing target head so off-ball support and the
     // formation LP consume the learned spacing band once trained.
     if let Some(head) = CARRIED_ATTACK_SPACING_HEAD.lock().unwrap().as_ref() {
