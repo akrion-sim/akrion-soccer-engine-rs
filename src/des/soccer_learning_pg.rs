@@ -16,6 +16,7 @@ use crate::des::general::soccer::{
     SoccerMomentEmbeddingInsert, SoccerNeuralNetworkSnapshot, SoccerPassLearningMetrics,
     SoccerPassOutcomeSample, SoccerQEntry, SoccerQPolicy, SoccerQPolicyOptions, SoccerQStateKey,
     SoccerQTargetEntry, SoccerSetPlayTrainingArtifact, SoccerTacticalLearningWeights,
+    RECEIVER_DESCRIPTOR_UNSPECIFIED,
     SoccerTeamQPolicies, Team, CONFIG_FEATURE_DIM, CONFIG_FEATURE_DIM_V1,
     SOCCER_MOMENT_EMBEDDING_DIM, SOCCER_PASS_COMPLETION_FEATURE_DIM,
     SOCCER_PASS_COMPLETION_FEATURE_DIM_V1,
