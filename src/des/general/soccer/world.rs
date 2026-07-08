@@ -7851,6 +7851,10 @@ mod tests {
         transition.decision_context.chosen_action_mpc_feasibility = 0.90;
         transition.decision_context.chosen_action_control_cost = 0.10;
 
+        assert!(
+            SoccerMatch::neural_mcts_transition_context_is_executable(&transition),
+            "MCTS-off authoritative selection should keep high-quality learned shot buckets"
+        );
         assert_eq!(
             soccer_actor_advantage_with_planner_distillation(&transition, 0.01),
             NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR,
@@ -7873,6 +7877,10 @@ mod tests {
         transition.decision_context.chosen_action_mpc_feasibility = 0.15;
         transition.decision_context.chosen_action_control_cost = 0.80;
 
+        assert!(
+            !SoccerMatch::neural_mcts_transition_context_is_executable(&transition),
+            "MCTS-off authoritative selection should reject low-quality learned shot buckets"
+        );
         assert_eq!(
             soccer_actor_advantage_with_planner_distillation(&transition, 0.01),
             0.01,
@@ -12277,6 +12285,11 @@ impl SoccerMatch {
                 }
             }
             return true;
+        }
+        if learned_discretized_kick_speed_bucket_for_action_label(&transition.action).is_some()
+            && matches!(label, "shoot" | "first-time-shot")
+        {
+            return neural_mcts_shot_mpc_candidate_bonus(transition) > 0.0;
         }
         true
     }
