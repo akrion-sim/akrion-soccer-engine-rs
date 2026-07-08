@@ -54,6 +54,30 @@ agent still gets pulled toward the state, but the pull cancels on exit, so it
 cannot farm the term. This is behaviour-changing for the *trained* policy, so it
 must be gated and A/B'd against the current learner, not flipped blind.
 
+## Forward-pass primacy knobs (2026-07-08, gated, default byte-identical)
+
+Operator lever: make **completed forward passes** the primary *dense* advancement signal instead of
+shots. Two `OnceLock` env knobs, default 1.0 (identical):
+- `DD_SOCCER_FORWARD_PASS_REWARD_SCALE` (0..20) — multiplies `completed_pass_reward_for_pitch`
+  (`forward_pass_reward_scale()`, soccer.rs:23444).
+- `DD_SOCCER_SHOT_SHAPING_REWARD_SCALE` (0..1) — dampens **only** the shot-TAKEN *shaping* proxy
+  (`SHOT_ON_TARGET_REWARD_POINTS`, soccer.rs:36473); the goal (100) and terminal-outcome rewards are
+  category-A and stay intact so finishing is never un-learned.
+
+**PBRS status:** the completed-forward-pass reward is a **category-C** per-visit term (a completion
+event, not a `Φ(s')−Φ(s)` delta), so scaling it up *is* increasing a farmable bias. At the DEFAULT
+scale the per-pass reward sits below `SHOT_ON_TARGET_REWARD_POINTS = 80` / `GOAL_REWARD_POINTS = 160`
+(soccer.rs:1167,1179), but the lever deliberately breaks that ordering: at `FWD_PASS_SCALE=6` a max
+forward/flank pass component reaches **≈83.5**, exceeding the shot-shaping proxy once
+`SHOT_SCALE=0.4` damps it to ≈32 (Codex r16). Goal (160) + terminal-outcome reward are **not** scaled
+and still dominate, so finishing is never un-learned, and regression guards hold in
+`soccer_learning.rs:9091` (analytic parity) and `:9105` (backward-recycle penalty). Because it is
+**not** policy-invariant and now *can* out-earn damped shot shaping, the sterile-possession
+discriminator (**held-out GD ≤ 0 while completed-forward-pass margin rises**) is mandatory in the
+A/B; gated vs the confirmed base, never flipped blind. The clean PBRS alternative (deferred) is a learned
+EPV potential routed through `potential_based_shaping`, which would value progression without the
+farm risk but needs a possession-chain export first.
+
 ## Follow-ups (deferred, each its own gated change)
 1. **Discount alignment.** B-terms (and pitch value) use `γ=1`; the returns use
    the learner's actual `γ` (`REWARD_SHAPING_DEFAULT_GAMMA = 0.99`). True
