@@ -1935,7 +1935,8 @@ fn train_soccer_policy_with_approx_dp(
             policy.train(replay);
         }
     }
-=======
+}
+
 /// Recenter + rescale a training batch's value targets to ~zero-mean / unit-variance. This is the
 /// fix for value-head collapse: with fixed `target_scale` the targets cluster near a constant, so
 /// the loss-optimal solution is a constant output (dead output layer / flat value). Standardizing
