@@ -13976,16 +13976,35 @@ impl SoccerMatch {
                 candidates
             };
             let flight = pass_like_action_flight(&normalized_action).unwrap_or(PassFlight::Floor);
-            plan.target_player = policy.best_pass_target_player_for_snapshot(
-                snapshot,
-                player_id,
-                &normalized_action,
-                flight,
-                &candidates,
-            );
-            plan.target_point = plan
-                .target_player
-                .and_then(|target| snapshot.player_position(target));
+            if dd_soccer_enable_learned_pass_receiver() {
+                // The head decides WHO (a ranked teammate) or open space; MPC feasibility is a
+                // legality mask that kicks an infeasible receiver back to the head for its next
+                // choice, rather than a heuristic silently overriding the head.
+                let (target_player, target_point) = Self::learned_pass_receiver_selection(
+                    policy,
+                    snapshot,
+                    player_id,
+                    &normalized_action,
+                    flight,
+                    &candidates,
+                );
+                plan.target_player = target_player;
+                plan.target_point = target_point.or_else(|| {
+                    plan.target_player
+                        .and_then(|target| snapshot.player_position(target))
+                });
+            } else {
+                plan.target_player = policy.best_pass_target_player_for_snapshot(
+                    snapshot,
+                    player_id,
+                    &normalized_action,
+                    flight,
+                    &candidates,
+                );
+                plan.target_point = plan
+                    .target_player
+                    .and_then(|target| snapshot.player_position(target));
+            }
         } else if let Some(kind) = dribble_move_kind_for_action_label(&normalized_action) {
             plan.target_point = learned_grid_target.take().or_else(|| {
                 let player = snapshot
