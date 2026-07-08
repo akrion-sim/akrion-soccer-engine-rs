@@ -59316,6 +59316,7 @@ fn goal_credit_scores_pass_into_stride_above_static_feet() {
             )),
             facing: facing_bucket_from_vector(target - sim.players[passer].position),
             dribble_touch: None,
+            receiver_descriptor: None,
         };
         SoccerLearningTransition {
             tick: before.tick,
