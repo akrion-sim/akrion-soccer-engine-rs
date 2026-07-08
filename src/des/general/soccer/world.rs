@@ -6213,6 +6213,57 @@ mod tests {
     }
 
     #[test]
+    fn disabled_neural_mcts_does_not_apply_pass_like_margin_gate() {
+        let _env_lock = soccer_world_env_lock();
+        let _margin = set_test_env_var("SOCCER_NEURAL_MCTS_PASS_LIKE_NON_PASS_MARGIN", "0.50");
+        let candidates = vec![
+            SoccerNeuralMctsCandidate {
+                label: "shoot".to_string(),
+                plan: None,
+                score: 1.20,
+                prior: 0.4,
+                q_visits: 1,
+            },
+            SoccerNeuralMctsCandidate {
+                label: "pass1-kp7".to_string(),
+                plan: None,
+                score: 1.40,
+                prior: 0.8,
+                q_visits: 1,
+            },
+        ];
+        let mut no_mcts = candidates.clone();
+        SoccerMatch::apply_neural_mcts_pass_like_margin_gate_for_blend(
+            SoccerNeuralBlendConfig {
+                mcts_enabled: false,
+                ..SoccerNeuralBlendConfig::default()
+            },
+            &mut no_mcts,
+        );
+        assert!(
+            no_mcts
+                .iter()
+                .any(|candidate| candidate.label == "pass1-kp7"),
+            "the DP/authoritative no-MCTS path must not prune pass-like candidates with an MCTS gate"
+        );
+
+        let mut with_mcts = candidates;
+        SoccerMatch::apply_neural_mcts_pass_like_margin_gate_for_blend(
+            SoccerNeuralBlendConfig {
+                mcts_enabled: true,
+                ..SoccerNeuralBlendConfig::default()
+            },
+            &mut with_mcts,
+        );
+        assert!(
+            !with_mcts
+                .iter()
+                .any(|candidate| candidate.label == "pass1-kp7"),
+            "actual MCTS still keeps the pass-like margin safeguard"
+        );
+    }
+
+    #[test]
     fn neural_mcts_pass_like_margin_gate_keeps_proven_or_pass_only_candidates() {
         let _env_lock = soccer_world_env_lock();
         let _margin = set_test_env_var("SOCCER_NEURAL_MCTS_PASS_LIKE_NON_PASS_MARGIN", "0.50");
@@ -11890,6 +11941,15 @@ impl SoccerMatch {
         });
     }
 
+    fn apply_neural_mcts_pass_like_margin_gate_for_blend(
+        blend: SoccerNeuralBlendConfig,
+        candidates: &mut Vec<SoccerNeuralMctsCandidate>,
+    ) {
+        if blend.mcts_enabled {
+            Self::apply_neural_mcts_pass_like_margin_gate(candidates);
+        }
+    }
+
     fn neural_mcts_action_from_candidates(
         blend: SoccerNeuralBlendConfig,
         candidates: &[SoccerNeuralMctsCandidate],
@@ -12963,7 +13023,7 @@ impl SoccerMatch {
                 push_scored_candidate(candidate, expanded_plan);
             }
         }
-        Self::apply_neural_mcts_pass_like_margin_gate(&mut scored_candidates);
+        Self::apply_neural_mcts_pass_like_margin_gate_for_blend(blend, &mut scored_candidates);
         scored_candidates.sort_by(|a, b| {
             b.score
                 .total_cmp(&a.score)
