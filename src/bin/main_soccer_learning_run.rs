@@ -125,6 +125,7 @@ const DEFAULT_SOCCER_NEURAL_BATCH_SNAPSHOT_CARRY_MIN_VALIDATION_FITNESS: f64 =
     SOCCER_LEARNING_OBJECTIVE_FITNESS_MIN;
 const DEFAULT_SOCCER_NEURAL_BATCH_SNAPSHOT_CARRY_MIN_VALIDATION_GOAL_MARGIN: f64 =
     SOCCER_LEARNING_OBJECTIVE_FITNESS_MIN;
+const DEFAULT_SOCCER_NEURAL_BATCH_SNAPSHOT_CARRY_NO_PUBLISHABLE_MIN_FITNESS: f64 = 0.0;
 
 fn env_value(name: &str) -> Option<String> {
     std::env::var(name)
@@ -323,6 +324,13 @@ fn env_batch_neural_snapshot_rescue_min_fitness() -> Result<f64, Box<dyn Error>>
     env_f64(
         "SOCCER_NEURAL_BATCH_SNAPSHOT_RESCUE_MIN_FITNESS",
         DEFAULT_SOCCER_NEURAL_BATCH_SNAPSHOT_RESCUE_MIN_FITNESS,
+    )
+}
+
+fn env_batch_neural_snapshot_carry_no_publishable_min_fitness() -> Result<f64, Box<dyn Error>> {
+    env_f64(
+        "SOCCER_NEURAL_BATCH_SNAPSHOT_CARRY_NO_PUBLISHABLE_MIN_FITNESS",
+        DEFAULT_SOCCER_NEURAL_BATCH_SNAPSHOT_CARRY_NO_PUBLISHABLE_MIN_FITNESS,
     )
 }
 
@@ -4016,13 +4024,14 @@ fn select_batch_neural_snapshot(
 fn select_batch_neural_snapshot_for_training_carry(
     completed_games: &mut [CompletedGame],
     analytic_neural_opponent: bool,
+    min_fitness: f64,
 ) -> Option<BatchNeuralSnapshotSelection> {
     select_batch_neural_snapshot(
         completed_games,
         BatchNeuralSnapshotSelectionMode::TrainingSteps,
         analytic_neural_opponent,
         SOCCER_LEARNING_OBJECTIVE_FITNESS_MAX - SOCCER_LEARNING_OBJECTIVE_FITNESS_MIN,
-        SOCCER_LEARNING_OBJECTIVE_FITNESS_MIN,
+        min_fitness,
         SOCCER_LEARNING_OBJECTIVE_FITNESS_MIN,
         SOCCER_LEARNING_OBJECTIVE_FITNESS_MIN,
     )
@@ -7201,6 +7210,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         "SOCCER_NEURAL_BATCH_SNAPSHOT_CARRY_NO_PUBLISHABLE",
         neural_batch_snapshot_carry_unvalidated,
     )?;
+    let neural_batch_snapshot_carry_no_publishable_min_fitness =
+        env_batch_neural_snapshot_carry_no_publishable_min_fitness()?;
     let neural_drain_timeout_ms = env_usize(
         "SOCCER_NEURAL_DRAIN_TIMEOUT_MS",
         DEFAULT_SOCCER_NEURAL_DRAIN_TIMEOUT_MS,
@@ -8188,7 +8199,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         tactical_learning.defense_compactness_score_weight,
     );
     println!(
-        "neural_learning enabled={} backend={} learning_rate={:.5} optimizer_momentum={:.3} batch_size={} train_every_ticks={} max_batches_per_tick={} hidden_units={} target_scale={:.3} max_pending_batches={} replay_capacity={} replay_samples_per_tick={} target_clip={:.3} target_popart={} snapshot_every_batches={} batch_snapshot_selection={} batch_snapshot_max_fitness_regression={:.3} batch_snapshot_min_fitness={:.3} batch_snapshot_min_batch_mean_fitness={:.3} batch_snapshot_rescue_min_fitness={:.3} batch_policy_merge_selected_only={} batch_snapshot_carry_unvalidated={} batch_snapshot_carry_no_publishable={}",
+        "neural_learning enabled={} backend={} learning_rate={:.5} optimizer_momentum={:.3} batch_size={} train_every_ticks={} max_batches_per_tick={} hidden_units={} target_scale={:.3} max_pending_batches={} replay_capacity={} replay_samples_per_tick={} target_clip={:.3} target_popart={} snapshot_every_batches={} batch_snapshot_selection={} batch_snapshot_max_fitness_regression={:.3} batch_snapshot_min_fitness={:.3} batch_snapshot_min_batch_mean_fitness={:.3} batch_snapshot_rescue_min_fitness={:.3} batch_policy_merge_selected_only={} batch_snapshot_carry_unvalidated={} batch_snapshot_carry_no_publishable={} batch_snapshot_carry_no_publishable_min_fitness={:.3}",
         neural_learning.enabled,
         neural_backend_label(neural_learning.backend),
         neural_learning.learning_rate,
@@ -8212,6 +8223,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         neural_batch_policy_merge_selected_only,
         neural_batch_snapshot_carry_unvalidated,
         neural_batch_snapshot_carry_no_publishable,
+        neural_batch_snapshot_carry_no_publishable_min_fitness,
     );
     println!(
         "neural_batch_snapshot_validation games={} candidates={} eval_minutes={:.2} objective=home_directional_learning_vs_analytic min_fitness={:.4} min_goal_margin={:.4} confirm_games={} confirm_min_fitness={:.4} confirm_min_goal_margin={:.4} carry_min_fitness={:.4} carry_min_goal_margin={:.4}",
@@ -8990,6 +9002,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             if let Some(carry_selection) = select_batch_neural_snapshot_for_training_carry(
                 &mut completed_games,
                 analytic_neural_opponent,
+                neural_batch_snapshot_carry_no_publishable_min_fitness,
             ) {
                 let BatchNeuralSnapshotSelection {
                     episode: carried_episode,
@@ -9016,10 +9029,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                 );
             } else if neural_batch_snapshot_count > 0 {
                 println!(
-                    "neural_batch_snapshot_carry_unvalidated_held episodes={}..{} snapshots={} reason=no_available_training_snapshot",
+                    "neural_batch_snapshot_carry_unvalidated_held episodes={}..{} snapshots={} min_carry_fitness={:.4} reason=no_available_training_snapshot",
                     batch_start_episode + 1,
                     batch_start_episode + batch_size,
                     neural_batch_snapshot_count,
+                    neural_batch_snapshot_carry_no_publishable_min_fitness,
                 );
             }
         }
@@ -12143,7 +12157,7 @@ mod tests {
     }
 
     #[test]
-    fn trainer_carry_selector_preserves_warm_snapshot_when_publish_gate_rejects_batch() {
+    fn trainer_carry_selector_rejects_negative_snapshot_when_publish_gate_rejects_batch() {
         let mut guarded_games = vec![
             completed_game_with_score_and_neural_steps(0, 0, 1, 100),
             completed_game_with_score_and_neural_steps(1, 0, 2, 500),
@@ -12168,13 +12182,45 @@ mod tests {
             completed_game_with_score_and_neural_steps(1, 0, 2, 500),
             completed_game_with_score_and_neural_steps(2, 1, 3, 900),
         ];
-        let carry = select_batch_neural_snapshot_for_training_carry(&mut carry_games, true)
-            .expect("trainer carry should preserve learning warmth");
-        assert_eq!(carry.episode, 3);
-        assert_eq!(carry.training_steps, 900);
         assert!(
-            carry.match_fitness < 0.0,
-            "carry may keep an unpublishable snapshot, but only for trainer memory"
+            select_batch_neural_snapshot_for_training_carry(&mut carry_games, true, 0.0).is_none(),
+            "trainer carry must not compound a collapsed no-publishable batch"
+        );
+    }
+
+    #[test]
+    fn trainer_carry_selector_preserves_nonnegative_snapshot_when_publish_gate_rejects_batch() {
+        let mut guarded_games = vec![
+            completed_game_with_score_and_neural_steps(0, 1, 0, 100),
+            completed_game_with_score_and_neural_steps(1, 0, 3, 500),
+            completed_game_with_score_and_neural_steps(2, 0, 3, 900),
+        ];
+        let guarded = select_batch_neural_snapshot(
+            &mut guarded_games,
+            BatchNeuralSnapshotSelectionMode::TrainingStepsGuarded,
+            true,
+            0.0,
+            0.0,
+            0.0,
+            DEFAULT_SOCCER_NEURAL_BATCH_SNAPSHOT_RESCUE_MIN_FITNESS,
+        );
+        assert!(
+            guarded.is_none(),
+            "publish/activation selector should still reject the weak batch"
+        );
+
+        let mut carry_games = vec![
+            completed_game_with_score_and_neural_steps(0, 1, 0, 100),
+            completed_game_with_score_and_neural_steps(1, 0, 3, 500),
+            completed_game_with_score_and_neural_steps(2, 0, 3, 900),
+        ];
+        let carry = select_batch_neural_snapshot_for_training_carry(&mut carry_games, true, 0.0)
+            .expect("trainer carry should keep a non-collapsed local candidate warm");
+        assert_eq!(carry.episode, 1);
+        assert!(
+            carry.match_fitness >= 0.0,
+            "carry fallback must require nonnegative match fitness, got {}",
+            carry.match_fitness
         );
     }
 
