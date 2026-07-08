@@ -139,9 +139,17 @@ fn main() {
         env_on("DD_SOCCER_ENABLE_ADVANTAGE_NORMALIZATION"),
     );
 
+    println!(
+        "gates: learned_mpc_objective={}",
+        learned_mpc_objective_enabled()
+    );
+
     // Carried across games within this process (the real learner's per-process pattern).
     let mut policies = Arc::new(SoccerTeamQPolicies::new(SoccerQPolicyOptions::default()));
     let mut snapshot: Option<SoccerNeuralNetworkSnapshot> = None;
+    // Learned MPC execution-objective head, carried + RWR-trained across games (mirrors the
+    // pass-completion head's per-process carry). Only exercised when the gate is on.
+    let mut mpc_objective_head: Option<SoccerMpcObjectiveHead> = None;
 
     let mut per_game: Vec<GameKpis> = Vec::with_capacity(games);
     let started = Instant::now();
