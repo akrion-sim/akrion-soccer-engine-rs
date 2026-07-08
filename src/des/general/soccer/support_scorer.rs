@@ -96,6 +96,29 @@ pub const SUPPORT_OUTCOME_REWARD_WEIGHT_DEFAULT: f64 = 0.05;
 /// but the deciding player owns their own touch outright.
 pub const SUPPORT_OUTCOME_TEAMMATE_DISCOUNT: f64 = 0.35;
 
+/// The mover-weighted + team-discounted contribution of a single outcome event (already reduced to
+/// its emitting player + team + normalized `weight`) to one pending move decision. Pure core of the
+/// credit model, factored out so the weighting is unit-testable without a live match: the deciding
+/// player's own event counts full; a teammate's counts at [`SUPPORT_OUTCOME_TEAMMATE_DISCOUNT`]; an
+/// opponent's counts 0 (a move is trained only from what its OWN team's play led to).
+pub(crate) fn support_outcome_decision_delta(
+    decision_team: Team,
+    decision_player: usize,
+    event_team: Team,
+    event_player: usize,
+    weight: f64,
+) -> f64 {
+    if event_team != decision_team {
+        return 0.0;
+    }
+    let factor = if event_player == decision_player {
+        1.0
+    } else {
+        SUPPORT_OUTCOME_TEAMMATE_DISCOUNT
+    };
+    weight * factor
+}
+
 /// Normalized, signed contribution of one reward-event `kind` to an off-ball move's outcome term.
 /// Decoupled from the engine's internal reward magnitudes (which live on a different scale than the
 /// territorial delta) so the blend is bounded and interpretable: a goal ≈ +1.0, a completed forward
