@@ -12,7 +12,8 @@
 //! the "policy owns WHERE" reconcile contract: the head may nudge the aim/lead a yard, never
 //! change the receiver, the action family, or send the actor to an unrelated point. Trained by
 //! reward-weighted regression (contextual bandit) on the delayed chance/outcome reward — the same
-//! terminal signal the chance-quality reward uses. Gated + default-off (byte-identical).
+//! terminal signal the chance-quality reward uses. Default-on in production once installed, with
+//! the gate's falsey values as the kill switch; tests stay env-explicit for parity.
 //!
 //! Mirrors [`super::SoccerPassCompletionHead`]: a shared `FeedForwardNetwork` over the config
 //! embedding, live net not serde (round-tripped through the neural-snapshot path for persistence).
