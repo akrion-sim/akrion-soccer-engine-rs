@@ -121,6 +121,7 @@ fn test_pending_pass(
         offside: None,
         offside_candidates: Vec::new(),
         learn_features: Vec::new(),
+        mpc_objective: None,
     }
 }
 
@@ -14143,6 +14144,7 @@ fn landed_aerial_pass_ball_is_controllable_not_run_over() {
         offside: None,
         offside_candidates: Vec::new(),
         learn_features: Vec::new(),
+        mpc_objective: None,
     });
     sim.pending_shot = None;
     // Sanity: the pass MODEL really does report this point as high in the air (so the test
@@ -19168,6 +19170,7 @@ fn unpressured_receiver_steps_toward_the_ball_to_control_it_early() {
         offside: None,
         offside_candidates: Vec::new(),
         learn_features: Vec::new(),
+        mpc_objective: None,
     });
 
     let snapshot = WorldSnapshot::from_match(&sim);
@@ -19229,6 +19232,7 @@ fn contested_receiver_approach_decision_reaches_mdp_pomdp_and_neural_features() 
         offside: None,
         offside_candidates: Vec::new(),
         learn_features: Vec::new(),
+        mpc_objective: None,
     });
 
     let snapshot = WorldSnapshot::from_match(&sim);
@@ -19745,6 +19749,7 @@ fn off_ball_no_chance_player_drops_goalside_of_anticipated_ball() {
         offside: None,
         offside_candidates: Vec::new(),
         learn_features: Vec::new(),
+        mpc_objective: None,
     });
     let snap = WorldSnapshot::from_match(&sim);
     // The brain wants to push upfield, ahead of where the ball is going.
@@ -19833,6 +19838,7 @@ fn lane_guard_preserves_goalside_drop_during_in_flight_pass() {
         offside: None,
         offside_candidates: Vec::new(),
         learn_features: Vec::new(),
+        mpc_objective: None,
     });
 
     let snapshot = WorldSnapshot::from_match(&sim);
@@ -33367,6 +33373,7 @@ fn staging_set_play_restart_clears_stale_live_ball_context() {
         offside: None,
         offside_candidates: Vec::new(),
         learn_features: Vec::new(),
+        mpc_objective: None,
     });
     sim.pending_shot = Some(PendingShot {
         team: Team::Home,
@@ -39105,6 +39112,7 @@ fn aerial_pass_interception_pressure_doubles_or_triples_near_landing() {
         offside: None,
         offside_candidates: Vec::new(),
         learn_features: Vec::new(),
+        mpc_objective: None,
     };
     let aerial = PendingPass {
         flight: PassFlight::Aerial,
@@ -39772,6 +39780,7 @@ fn pass_reach_interception_requires_defender_to_face_ball_path() {
         offside: None,
         offside_candidates: Vec::new(),
         learn_features: Vec::new(),
+        mpc_objective: None,
     };
     let previous_ball_pos = Vec2::new(40.0, 50.0);
     let ball_pos = Vec2::new(40.0, 60.0);
@@ -39872,6 +39881,7 @@ fn aerial_cross_reception_exposes_first_touch_header_and_control_choices() {
         offside: None,
         offside_candidates: Vec::new(),
         learn_features: Vec::new(),
+        mpc_objective: None,
     });
 
     sim.apply_ball_outcome(BallStepOutcome::Controlled {
@@ -59584,6 +59594,7 @@ fn completed_pass_reward_reinforces_passer_anticipating_receiver_stride() {
         offside: None,
         offside_candidates: Vec::new(),
         learn_features: Vec::new(),
+        mpc_objective: None,
     };
     let feet_pass = pending_for_target(receiver_position);
     let stride_pass = pending_for_target(stride_target);
@@ -61140,6 +61151,7 @@ fn off_target_pending_pass_receiver_sprints_to_ball() {
         offside: None,
         offside_candidates: Vec::new(),
         learn_features: Vec::new(),
+        mpc_objective: None,
     });
     sim.players[12].position = Vec2::new(36.0, 64.0);
 
@@ -61217,6 +61229,7 @@ fn pressured_pending_pass_receiver_prioritizes_early_intercept_margin() {
             offside: None,
             offside_candidates: Vec::new(),
             learn_features: Vec::new(),
+            mpc_objective: None,
         });
         sim
     };
@@ -61284,6 +61297,7 @@ fn intended_receiver_checks_run_when_unpressured_pass_arrives_behind_stride() {
         offside: None,
         offside_candidates: Vec::new(),
         learn_features: Vec::new(),
+        mpc_objective: None,
     });
 
     let snapshot = WorldSnapshot::from_match(&sim);
@@ -61356,6 +61370,7 @@ fn intended_pending_pass_target_uses_belief_urgency_floor() {
         offside: None,
         offside_candidates: Vec::new(),
         learn_features: Vec::new(),
+        mpc_objective: None,
     });
 
     let snapshot = WorldSnapshot::from_match(&sim);
@@ -61424,6 +61439,7 @@ fn intended_pending_pass_target_backs_off_for_clearly_closer_teammate() {
         offside: None,
         offside_candidates: Vec::new(),
         learn_features: Vec::new(),
+        mpc_objective: None,
     });
 
     let snapshot = WorldSnapshot::from_match(&sim);
@@ -61575,6 +61591,7 @@ fn pressured_pending_pass_recovery_is_learned_as_rewarded_state_action() {
         offside: None,
         offside_candidates: Vec::new(),
         learn_features: Vec::new(),
+        mpc_objective: None,
     });
 
     let before = WorldSnapshot::from_match(&sim);
@@ -75946,6 +75963,7 @@ fn a_pass_target_cannot_capture_the_ball_while_its_feet_are_out_of_reach() {
         offside: None,
         offside_candidates: Vec::new(),
         learn_features: Vec::new(),
+        mpc_objective: None,
     };
     let got = nearest_ball_controller_for_segment(
         1,
@@ -93169,6 +93187,7 @@ fn weak_long_aerial_does_not_float_in_the_air() {
             offside: None,
             offside_candidates: Vec::new(),
             learn_features: Vec::new(),
+            mpc_objective: None,
         };
         let flight_time = distance / speed;
         assert!(
@@ -93236,6 +93255,7 @@ fn scoop_pass_is_low_and_snappy_not_a_balloon() {
             offside: None,
             offside_candidates: Vec::new(),
             learn_features: Vec::new(),
+            mpc_objective: None,
         };
         let apex = pass_loft_apex_yards(&pass);
         let apex_feet = apex * 3.0;
@@ -93332,6 +93352,7 @@ fn scoop_land_at_target_kills_the_balloon_float() {
             offside: None,
             offside_candidates: Vec::new(),
             learn_features: Vec::new(),
+            mpc_objective: None,
         };
 
         // (1) apex flown == apex the launch speed was paced from (unit 0.5, deterministic).
