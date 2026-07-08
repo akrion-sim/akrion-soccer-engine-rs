@@ -227,7 +227,7 @@ fn play_holdout_fixture(
                 home_training_steps: o.home_training_steps,
                 away_training_steps: o.away_training_steps,
             };
-            Some((report, home_forward, away_forward))
+            Some((report, home_pass, away_pass))
         }
         Err(e) => {
             eprintln!("[eval] fixture error: {e}");
