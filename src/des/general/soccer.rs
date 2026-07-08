@@ -39763,6 +39763,79 @@ fn read_soccer_self_play_training_artifact(
         .map_err(|err| format!("parse self-play training artifact: {err}"))
 }
 
+fn read_soccer_self_play_learned_params(
+    path: &Path,
+) -> Result<SoccerSelfPlayLearnedParams, String> {
+    let raw =
+        fs::read_to_string(path).map_err(|err| format!("read learned params artifact: {err}"))?;
+    serde_json::from_str::<SoccerSelfPlayLearnedParams>(&raw)
+        .map_err(|err| format!("parse learned params artifact: {err}"))
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SoccerLeagueFrontierArtifact {
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    options: Option<SoccerQPolicyOptions>,
+    #[serde(default)]
+    home_options: Option<SoccerQPolicyOptions>,
+    #[serde(default)]
+    away_options: Option<SoccerQPolicyOptions>,
+    #[serde(default)]
+    episodes: usize,
+    #[serde(default)]
+    home_entries: Vec<SoccerQEntry>,
+    #[serde(default)]
+    home_target_entries: Vec<SoccerQTargetEntry>,
+    #[serde(default)]
+    away_entries: Vec<SoccerQEntry>,
+    #[serde(default)]
+    away_target_entries: Vec<SoccerQTargetEntry>,
+    #[serde(default)]
+    neural_network: Option<SoccerNeuralNetworkSnapshot>,
+}
+
+impl SoccerLeagueFrontierArtifact {
+    fn has_learning_payload(&self) -> bool {
+        !self.home_entries.is_empty()
+            || !self.home_target_entries.is_empty()
+            || !self.away_entries.is_empty()
+            || !self.away_target_entries.is_empty()
+            || self.neural_network.is_some()
+    }
+
+    fn home_options(&self) -> SoccerQPolicyOptions {
+        self.home_options
+            .clone()
+            .or_else(|| self.options.clone())
+            .unwrap_or_default()
+    }
+
+    fn away_options(&self) -> SoccerQPolicyOptions {
+        self.away_options
+            .clone()
+            .or_else(|| self.options.clone())
+            .unwrap_or_default()
+    }
+}
+
+fn read_soccer_league_frontier_artifact(
+    path: &Path,
+) -> Result<SoccerLeagueFrontierArtifact, String> {
+    let raw =
+        fs::read_to_string(path).map_err(|err| format!("read league frontier artifact: {err}"))?;
+    let artifact = serde_json::from_str::<SoccerLeagueFrontierArtifact>(&raw)
+        .map_err(|err| format!("parse league frontier artifact: {err}"))?;
+    if !artifact.has_learning_payload() {
+        return Err(
+            "parse league frontier artifact: missing learned entries or neuralNetwork".to_string(),
+        );
+    }
+    Ok(artifact)
+}
+
 // Champion–challenger via an APPEND-ONLY log: each save appends one policy version
 // tagged with its fitness, so an existing champion is never overwritten (a crash
 // mid-write at worst leaves a partial trailing line, which the reader skips). The
@@ -46955,6 +47028,85 @@ impl SoccerRealtimeSession {
         Ok(response)
     }
 
+    fn team_policy_disk_response_for_import(
+        &self,
+        path: &Path,
+        imported: SoccerTeamPolicyImportResponse,
+    ) -> SoccerTeamPolicyDiskResponse {
+        let learning = imported.learning;
+        SoccerTeamPolicyDiskResponse {
+            path: path.display().to_string(),
+            history_path: policy_history_disk_path(path).display().to_string(),
+            policy_probability: imported.policy_probability,
+            home_policy_entries: learning.home_policy_entries,
+            away_policy_entries: learning.away_policy_entries,
+            home_policy_target_entries: learning.home_policy_target_entries,
+            away_policy_target_entries: learning.away_policy_target_entries,
+            learning,
+        }
+    }
+
+    fn import_self_play_learned_params_from_path(
+        &mut self,
+        path: &Path,
+        params: SoccerSelfPlayLearnedParams,
+    ) -> Result<SoccerTeamPolicyDiskResponse, String> {
+        let policies = SoccerTeamQPolicies::from_learned_params(&params)?;
+        self.sim.config.tactical_learning = params.tactical_learning;
+        self.sim.tactical_summary = params.tactical_summary;
+        self.sim.team_policies = Some(policies);
+        if let Some(snapshot) = params.neural_network {
+            self.sim.set_neural_network_snapshot(snapshot)?;
+        }
+        let learning = self.sim.learning_stats_snapshot();
+        Ok(SoccerTeamPolicyDiskResponse {
+            path: path.display().to_string(),
+            history_path: policy_history_disk_path(path).display().to_string(),
+            policy_probability: self.sim.team_policy_probability_summary(),
+            home_policy_entries: learning.home_policy_entries,
+            away_policy_entries: learning.away_policy_entries,
+            home_policy_target_entries: learning.home_policy_target_entries,
+            away_policy_target_entries: learning.away_policy_target_entries,
+            learning,
+        })
+    }
+
+    fn import_league_frontier_artifact_from_path(
+        &mut self,
+        path: &Path,
+        artifact: SoccerLeagueFrontierArtifact,
+    ) -> Result<SoccerTeamPolicyDiskResponse, String> {
+        let home_policy = SoccerQPolicy::from_entries_with_targets(
+            artifact.home_options(),
+            &artifact.home_entries,
+            &artifact.home_target_entries,
+        )?;
+        let away_policy = SoccerQPolicy::from_entries_with_targets(
+            artifact.away_options(),
+            &artifact.away_entries,
+            &artifact.away_target_entries,
+        )?;
+        let neural_network = artifact.neural_network;
+        self.sim.team_policies = Some(SoccerTeamQPolicies {
+            home: home_policy,
+            away: away_policy,
+        });
+        if let Some(snapshot) = neural_network {
+            self.sim.set_neural_network_snapshot(snapshot)?;
+        }
+        let learning = self.sim.learning_stats_snapshot();
+        Ok(SoccerTeamPolicyDiskResponse {
+            path: path.display().to_string(),
+            history_path: policy_history_disk_path(path).display().to_string(),
+            policy_probability: self.sim.team_policy_probability_summary(),
+            home_policy_entries: learning.home_policy_entries,
+            away_policy_entries: learning.away_policy_entries,
+            home_policy_target_entries: learning.home_policy_target_entries,
+            away_policy_target_entries: learning.away_policy_target_entries,
+            learning,
+        })
+    }
+
     pub fn load_team_policy_artifact_from_path(
         &mut self,
         path: impl AsRef<Path>,
@@ -46962,22 +47114,25 @@ impl SoccerRealtimeSession {
         let path = path.as_ref();
         let mut response = match self.sim.load_team_policy_artifact_from_path(path) {
             Ok(response) => response,
-            Err(team_policy_err) => {
-                let artifact = read_soccer_self_play_training_artifact(path)
-                    .map_err(|training_err| format!("{team_policy_err}; {training_err}"))?;
-                let imported = self.sim.import_self_play_training_artifact(artifact)?;
-                let learning = imported.learning;
-                SoccerTeamPolicyDiskResponse {
-                    path: path.display().to_string(),
-                    history_path: policy_history_disk_path(path).display().to_string(),
-                    policy_probability: imported.policy_probability,
-                    home_policy_entries: learning.home_policy_entries,
-                    away_policy_entries: learning.away_policy_entries,
-                    home_policy_target_entries: learning.home_policy_target_entries,
-                    away_policy_target_entries: learning.away_policy_target_entries,
-                    learning,
+            Err(team_policy_err) => match read_soccer_self_play_training_artifact(path) {
+                Ok(artifact) => {
+                    let imported = self.sim.import_self_play_training_artifact(artifact)?;
+                    self.team_policy_disk_response_for_import(path, imported)
                 }
-            }
+                Err(training_err) => match read_soccer_self_play_learned_params(path) {
+                    Ok(params) => self.import_self_play_learned_params_from_path(path, params)?,
+                    Err(params_err) => match read_soccer_league_frontier_artifact(path) {
+                        Ok(frontier) => {
+                            self.import_league_frontier_artifact_from_path(path, frontier)?
+                        }
+                        Err(frontier_err) => {
+                            return Err(format!(
+                                "{team_policy_err}; {training_err}; {params_err}; {frontier_err}"
+                            ));
+                        }
+                    },
+                },
+            },
         };
         match read_soccer_neural_snapshot(path) {
             Ok(Some(snapshot)) => {

@@ -81880,6 +81880,116 @@ fn live_server_autoloads_team_policy_from_configured_json_path() {
 }
 
 #[test]
+fn live_server_autoloads_compact_league_frontier_with_targets_and_inline_neural() {
+    let policy_path = std::env::temp_dir().join(format!(
+        "soccer-league-frontier-autoload-test-{}.json",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&policy_path);
+
+    let mut source = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        learning_logging_enabled: false,
+        max_human_players: 0,
+        seed: 1591,
+        ..Default::default()
+    });
+    let player_id = 5;
+    let snapshot = WorldSnapshot::from_match(&source);
+    let player = snapshot
+        .players
+        .iter()
+        .find(|player| player.id == player_id)
+        .expect("policy player");
+    let state = SoccerQStateKey::from_parts(
+        &snapshot.mdp_state_for_player(player_id),
+        &snapshot.observation_for(player_id),
+        player.team,
+        player.role,
+    );
+    let target_grid = pitch_grid_address(
+        Vec2::new(42.0, 88.0),
+        snapshot.field_width,
+        snapshot.field_length,
+    );
+    let mut policies = SoccerTeamQPolicies::new(SoccerQPolicyOptions::default());
+    assert!(policies
+        .policy_mut(player.team)
+        .set_target_value(state, "pass", target_grid, 2.75));
+    source.set_team_policies(policies);
+    let source_artifact = source.team_policy_artifact();
+    assert_eq!(source_artifact.home_target_entries.len(), 1);
+
+    let mut neural_snapshot = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        max_human_players: 0,
+        neural_learning: SoccerNeuralLearningConfig {
+            enabled: true,
+            backend: SoccerNeuralLearningBackend::Inline,
+            hidden_units: 8,
+            ..Default::default()
+        },
+        seed: 1592,
+        ..Default::default()
+    })
+    .learning_snapshot()
+    .neural_network
+    .expect("source neural snapshot");
+    neural_snapshot.training_steps = 123;
+    neural_snapshot.average_loss = Some(0.25);
+    let expected_parameter_count = neural_snapshot.parameter_count;
+
+    let compact_frontier = serde_json::json!({
+        "version": 0,
+        "homeEntries": [],
+        "homeTargetEntries": source_artifact.home_target_entries,
+        "awayEntries": [],
+        "awayTargetEntries": [],
+        "episodes": 0,
+        "neuralNetwork": neural_snapshot,
+    });
+    std::fs::write(
+        &policy_path,
+        serde_json::to_string(&compact_frontier).expect("compact frontier json"),
+    )
+    .expect("write compact frontier");
+
+    let server = SoccerLiveServer::new(SoccerLiveServerConfig {
+        match_config: MatchConfig {
+            duration_seconds: 1.0,
+            max_human_players: 0,
+            neural_learning: SoccerNeuralLearningConfig {
+                enabled: true,
+                backend: SoccerNeuralLearningBackend::Inline,
+                hidden_units: 8,
+                ..Default::default()
+            },
+            seed: 1593,
+            ..Default::default()
+        },
+        http_worker_threads: 2,
+        policy_disk_path: policy_path.display().to_string(),
+        autoload_team_policy: true,
+        autosave_team_policy: true,
+        ..Default::default()
+    });
+    let state = server.session.lock().unwrap().state_response();
+
+    assert_eq!(state.learning.home_policy_entries, 0);
+    assert_eq!(state.learning.home_policy_target_entries, 1);
+    assert_eq!(state.learning.away_policy_target_entries, 0);
+    assert_eq!(state.learning.neural_learning_training_steps, 123);
+    assert_eq!(
+        state.learning.neural_learning_parameter_count,
+        expected_parameter_count
+    );
+    assert_eq!(state.learning.neural_learning_average_loss, Some(0.25));
+    assert!(state.policy_autosave.last_error.is_none());
+
+    let _ = std::fs::remove_file(policy_path);
+}
+
+#[test]
 fn live_server_bound_url_uses_actual_ephemeral_port_and_loopback_host() {
     let ipv4 = std::net::SocketAddr::new(
         std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),

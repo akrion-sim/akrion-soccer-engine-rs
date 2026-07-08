@@ -98,7 +98,10 @@ fn main() {
     let minutes: f64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2.0);
     let eval_games: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(10);
     let increments: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(8);
-    let seed_base: u32 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(0x5EED_0000);
+    let seed_base: u32 = args
+        .get(5)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0x5EED_0000);
     let eval_seed_base: u32 = seed_base ^ 0xE7A1_0000;
 
     let neural = SoccerNeuralLearningConfig {
@@ -114,7 +117,9 @@ fn main() {
         "increment_games={increment_games} minutes={minutes} eval_games={eval_games} \
          increments={increments} seed_base=0x{seed_base:08X}"
     );
-    println!("(eval = frozen candidate net vs the pure-analytic engine; payoff > 0.5 ⇒ beats analytic)");
+    println!(
+        "(eval = frozen candidate net vs the pure-analytic engine; payoff > 0.5 ⇒ beats analytic)"
+    );
 
     let mut policies = Arc::new(SoccerTeamQPolicies::new(SoccerQPolicyOptions::default()));
     let mut snapshot: Option<SoccerNeuralNetworkSnapshot> = None;

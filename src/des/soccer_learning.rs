@@ -4804,8 +4804,7 @@ fn clamp_soccer_tactical_learning_weights(
         .defensive_line_press_learning_weight
         .max(0.0)
         .min(2.0);
-    clamped.formation_lp_alignment_weight =
-        clamped.formation_lp_alignment_weight.max(0.0).min(5.0);
+    clamped.formation_lp_alignment_weight = clamped.formation_lp_alignment_weight.max(0.0).min(5.0);
     clamped
 }
 

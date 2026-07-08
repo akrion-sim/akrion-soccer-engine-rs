@@ -76,7 +76,9 @@ fn formation_nudge_env_f64(name: &str, default: f64) -> f64 {
 fn formation_nudge_base_weight() -> f64 {
     use std::sync::OnceLock;
     static V: OnceLock<f64> = OnceLock::new();
-    *V.get_or_init(|| formation_nudge_env_f64("DD_SOCCER_FORMATION_NUDGE_BASE_WEIGHT", 0.6).clamp(0.0, 1.0))
+    *V.get_or_init(|| {
+        formation_nudge_env_f64("DD_SOCCER_FORMATION_NUDGE_BASE_WEIGHT", 0.6).clamp(0.0, 1.0)
+    })
 }
 /// Hard cap (yards) on how far the nudge may displace a player from their own chosen destination —
 /// keeps it a nudge, never a yank, however far the LP target sits. Env `DD_SOCCER_FORMATION_NUDGE_MAX_YARDS`.
@@ -15643,7 +15645,10 @@ mod formation_nudge_tests {
         // Moves toward the LP target...
         assert!(out.x > own.x && out.x <= lp.x);
         // ...but never more than the max-yards cap, however far the LP sits.
-        assert!((out - own).len() <= 6.0 + 1e-9, "nudge must stay a bounded nudge: {out:?}");
+        assert!(
+            (out - own).len() <= 6.0 + 1e-9,
+            "nudge must stay a bounded nudge: {out:?}"
+        );
     }
 
     #[test]

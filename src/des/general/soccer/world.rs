@@ -10741,7 +10741,11 @@ fn soccer_standardize_actor_policy_sample_advantages(samples: &mut [SoccerPolicy
         .collect();
     if let Some((mean, std)) = policy_advantage_standardization(&advantages) {
         // Std-only mode zeroes the subtracted mean so the win/loss common-mode survives.
-        let mean = if dd_soccer_advantage_std_only() { 0.0 } else { mean };
+        let mean = if dd_soccer_advantage_std_only() {
+            0.0
+        } else {
+            mean
+        };
         for (sample, keep_positive) in samples.iter_mut().zip(positive_priority_floors.into_iter())
         {
             sample.advantage = (sample.advantage - mean) / (std + 1e-8);
@@ -15972,14 +15976,15 @@ impl SoccerMatch {
                 // The head decides WHO (a ranked teammate) or open space; MPC feasibility is a
                 // legality mask that kicks an infeasible receiver back to the head for its next
                 // choice, rather than a heuristic silently overriding the head.
-                let (target_player, target_point, receiver_replan) = Self::learned_pass_receiver_selection(
-                    policy,
-                    snapshot,
-                    player_id,
-                    &normalized_action,
-                    flight,
-                    &candidates,
-                );
+                let (target_player, target_point, receiver_replan) =
+                    Self::learned_pass_receiver_selection(
+                        policy,
+                        snapshot,
+                        player_id,
+                        &normalized_action,
+                        flight,
+                        &candidates,
+                    );
                 plan.target_player = target_player;
                 plan.target_point = target_point.or_else(|| {
                     plan.target_player
@@ -16139,15 +16144,16 @@ impl SoccerMatch {
             candidates,
         );
         let threshold = learned_mpc_replan_thresholds().pass_impossible_probability;
-        let execution_probability = |target_player: Option<usize>, target_point: Option<Vec2>| -> f64 {
-            let trial = SoccerLearnedPlan {
-                action: normalized_action.to_string(),
-                target_player,
-                target_point,
-                mpc_replan: None,
+        let execution_probability =
+            |target_player: Option<usize>, target_point: Option<Vec2>| -> f64 {
+                let trial = SoccerLearnedPlan {
+                    action: normalized_action.to_string(),
+                    target_player,
+                    target_point,
+                    mpc_replan: None,
+                };
+                Self::learned_pass_mpc_execution_probability(snapshot, player_id, &trial, flight)
             };
-            Self::learned_pass_mpc_execution_probability(snapshot, player_id, &trial, flight)
-        };
         let receiver_kickback_trace =
             |rejected_probability: f64, candidate_count: usize| SoccerLearnedMpcReplanTrace {
                 original_action: normalized_action.to_string(),
@@ -16182,10 +16188,9 @@ impl SoccerMatch {
             if space_beats {
                 let probability = execution_probability(None, Some(space_point));
                 if probability >= threshold {
-                    let replan = first_rejected_probability
-                        .map(|rejected_probability| {
-                            receiver_kickback_trace(rejected_probability, rejected_count)
-                        });
+                    let replan = first_rejected_probability.map(|rejected_probability| {
+                        receiver_kickback_trace(rejected_probability, rejected_count)
+                    });
                     return (None, Some(space_point), replan);
                 }
                 rejected_count = rejected_count.saturating_add(1);
@@ -17989,7 +17994,11 @@ impl SoccerMatch {
             let advantages: Vec<f64> = samples.iter().map(|s| s.advantage).collect();
             if let Some((mean, std)) = policy_advantage_standardization(&advantages) {
                 // Std-only mode zeroes the subtracted mean so the win/loss common-mode survives.
-                let mean = if dd_soccer_advantage_std_only() { 0.0 } else { mean };
+                let mean = if dd_soccer_advantage_std_only() {
+                    0.0
+                } else {
+                    mean
+                };
                 for sample in &mut samples {
                     sample.advantage = (sample.advantage - mean) / (std + 1e-8);
                 }

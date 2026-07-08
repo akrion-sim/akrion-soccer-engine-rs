@@ -26,7 +26,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use soccer_engine::des::general::soccer::{
-    SoccerNeuralNetworkSnapshot, SoccerQStateKey, SoccerQTargetEntry,
+    MatchSummary, SoccerNeuralNetworkSnapshot, SoccerQStateKey, SoccerQTargetEntry, Team,
 };
 use soccer_engine::des::general::tournament::{
     EngineMatchRunner, EngineMatchRunnerConfig, TeamBrain, TournamentMatchContext,
@@ -47,6 +47,194 @@ fn env_f64(k: &str, d: f64) -> f64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(d)
+}
+fn env_bool(k: &str, d: bool) -> bool {
+    std::env::var(k)
+        .ok()
+        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
+        .unwrap_or(d)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct LeagueMatchKpis {
+    goal_diff: i32,
+    goals_for: u32,
+    goals_against: u32,
+    shots_for: u32,
+    shots_against: u32,
+    shots_on_target_for: u32,
+    shots_on_target_against: u32,
+    shots_after_pass_for: u32,
+    passes_attempted_for: u32,
+    passes_completed_for: u32,
+    forward_passes_for: u32,
+    forward_passes_against: u32,
+    forward_pass_margin: i32,
+    backward_passes_for: u32,
+    dribble_beats_for: u32,
+    assists_for: u32,
+    crosses_completed_for: u32,
+    pass_chain_gain_yards_for: f64,
+    pass_chain_net_losses_for: u32,
+    objective_fitness: f64,
+    objective_fitness_margin: f64,
+}
+
+impl LeagueMatchKpis {
+    fn from_summary(summary: &MatchSummary, frontier_team: Team) -> Self {
+        let stats = &summary.stats;
+        match frontier_team {
+            Team::Home => LeagueMatchKpis {
+                goal_diff: summary.score_home as i32 - summary.score_away as i32,
+                goals_for: summary.score_home,
+                goals_against: summary.score_away,
+                shots_for: stats.shots_home,
+                shots_against: stats.shots_away,
+                shots_on_target_for: stats.shots_on_target_home,
+                shots_on_target_against: stats.shots_on_target_away,
+                shots_after_pass_for: stats.shots_after_pass_home,
+                passes_attempted_for: stats.passes_attempted_home,
+                passes_completed_for: stats.passes_completed_home,
+                forward_passes_for: stats.passes_completed_forward_home,
+                forward_passes_against: stats.passes_completed_forward_away,
+                forward_pass_margin: stats.passes_completed_forward_home as i32
+                    - stats.passes_completed_forward_away as i32,
+                backward_passes_for: stats.passes_completed_backward_home,
+                dribble_beats_for: stats.dribble_beats_home,
+                assists_for: stats.assists_home,
+                crosses_completed_for: stats.crosses_completed_home,
+                pass_chain_gain_yards_for: stats.pass_chain_gain_yards_home,
+                pass_chain_net_losses_for: stats.pass_chains_net_loss_home,
+                objective_fitness: stats.passes_completed_forward_home as f64,
+                objective_fitness_margin: stats.passes_completed_forward_home as f64
+                    - stats.passes_completed_forward_away as f64,
+            },
+            Team::Away => LeagueMatchKpis {
+                goal_diff: summary.score_away as i32 - summary.score_home as i32,
+                goals_for: summary.score_away,
+                goals_against: summary.score_home,
+                shots_for: stats.shots_away,
+                shots_against: stats.shots_home,
+                shots_on_target_for: stats.shots_on_target_away,
+                shots_on_target_against: stats.shots_on_target_home,
+                shots_after_pass_for: stats.shots_after_pass_away,
+                passes_attempted_for: stats.passes_attempted_away,
+                passes_completed_for: stats.passes_completed_away,
+                forward_passes_for: stats.passes_completed_forward_away,
+                forward_passes_against: stats.passes_completed_forward_home,
+                forward_pass_margin: stats.passes_completed_forward_away as i32
+                    - stats.passes_completed_forward_home as i32,
+                backward_passes_for: stats.passes_completed_backward_away,
+                dribble_beats_for: stats.dribble_beats_away,
+                assists_for: stats.assists_away,
+                crosses_completed_for: stats.crosses_completed_away,
+                pass_chain_gain_yards_for: stats.pass_chain_gain_yards_away,
+                pass_chain_net_losses_for: stats.pass_chains_net_loss_away,
+                objective_fitness: stats.passes_completed_forward_away as f64,
+                objective_fitness_margin: stats.passes_completed_forward_away as f64
+                    - stats.passes_completed_forward_home as f64,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct LeagueRoundKpis {
+    games: usize,
+    goal_diff: i32,
+    goals_for: u32,
+    goals_against: u32,
+    shots_for: u32,
+    shots_against: u32,
+    shots_on_target_for: u32,
+    shots_on_target_against: u32,
+    shots_after_pass_for: u32,
+    passes_attempted_for: u32,
+    passes_completed_for: u32,
+    forward_passes_for: u32,
+    forward_passes_against: u32,
+    forward_pass_margin: i32,
+    backward_passes_for: u32,
+    dribble_beats_for: u32,
+    assists_for: u32,
+    crosses_completed_for: u32,
+    pass_chain_gain_yards_for: f64,
+    pass_chain_net_losses_for: u32,
+    objective_fitness_sum: f64,
+    objective_fitness_margin_sum: f64,
+}
+
+impl LeagueRoundKpis {
+    fn add(&mut self, kpis: LeagueMatchKpis) {
+        self.games += 1;
+        self.goal_diff += kpis.goal_diff;
+        self.goals_for = self.goals_for.saturating_add(kpis.goals_for);
+        self.goals_against = self.goals_against.saturating_add(kpis.goals_against);
+        self.shots_for = self.shots_for.saturating_add(kpis.shots_for);
+        self.shots_against = self.shots_against.saturating_add(kpis.shots_against);
+        self.shots_on_target_for = self
+            .shots_on_target_for
+            .saturating_add(kpis.shots_on_target_for);
+        self.shots_on_target_against = self
+            .shots_on_target_against
+            .saturating_add(kpis.shots_on_target_against);
+        self.shots_after_pass_for = self
+            .shots_after_pass_for
+            .saturating_add(kpis.shots_after_pass_for);
+        self.passes_attempted_for = self
+            .passes_attempted_for
+            .saturating_add(kpis.passes_attempted_for);
+        self.passes_completed_for = self
+            .passes_completed_for
+            .saturating_add(kpis.passes_completed_for);
+        self.forward_passes_for = self
+            .forward_passes_for
+            .saturating_add(kpis.forward_passes_for);
+        self.forward_passes_against = self
+            .forward_passes_against
+            .saturating_add(kpis.forward_passes_against);
+        self.forward_pass_margin += kpis.forward_pass_margin;
+        self.backward_passes_for = self
+            .backward_passes_for
+            .saturating_add(kpis.backward_passes_for);
+        self.dribble_beats_for = self
+            .dribble_beats_for
+            .saturating_add(kpis.dribble_beats_for);
+        self.assists_for = self.assists_for.saturating_add(kpis.assists_for);
+        self.crosses_completed_for = self
+            .crosses_completed_for
+            .saturating_add(kpis.crosses_completed_for);
+        self.pass_chain_gain_yards_for += kpis.pass_chain_gain_yards_for;
+        self.pass_chain_net_losses_for = self
+            .pass_chain_net_losses_for
+            .saturating_add(kpis.pass_chain_net_losses_for);
+        self.objective_fitness_sum += kpis.objective_fitness;
+        self.objective_fitness_margin_sum += kpis.objective_fitness_margin;
+    }
+
+    fn mean_objective_fitness(&self) -> f64 {
+        if self.games == 0 {
+            0.0
+        } else {
+            self.objective_fitness_sum / self.games as f64
+        }
+    }
+
+    fn mean_objective_fitness_margin(&self) -> f64 {
+        if self.games == 0 {
+            0.0
+        } else {
+            self.objective_fitness_margin_sum / self.games as f64
+        }
+    }
+
+    fn mean_forward_pass_margin(&self) -> f64 {
+        if self.games == 0 {
+            0.0
+        } else {
+            self.forward_pass_margin as f64 / self.games as f64
+        }
+    }
 }
 
 /// Recompute parameter_count + l2_norm after mutating weights (the persistence validator
@@ -284,6 +472,12 @@ fn write_frontier(path: &str, brain: &TeamBrain) -> std::io::Result<()> {
     let Some(snap) = brain.neural.as_ref() else {
         return Ok(());
     };
+    if let Some(parent) = Path::new(path)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
     let v = serde_json::json!({
         "version": 0,
         "homeEntries": [],
@@ -333,7 +527,7 @@ fn play_and_carry(
     seed: u32,
     frontier_home: bool,
     opp_id: usize,
-) -> (TeamBrain, i32) {
+) -> (TeamBrain, Option<LeagueMatchKpis>) {
     // frontier LEARNS; opponent is FROZEN. Alternate sides so the edge isn't a home artifact.
     let (home_id, away_id, home_learns, away_learns) = if frontier_home {
         (0usize, opp_id, true, false)
@@ -359,21 +553,24 @@ fn play_and_carry(
     };
     match runner.play(&ctx, home, away) {
         Ok(o) => {
-            let gd = if frontier_home {
-                o.home_goals as i32 - o.away_goals as i32
+            let frontier_team = if frontier_home {
+                Team::Home
             } else {
-                o.away_goals as i32 - o.home_goals as i32
+                Team::Away
             };
             let trained = if frontier_home {
                 o.home_brain
             } else {
                 o.away_brain
             };
-            (trained, gd)
+            (
+                trained,
+                Some(LeagueMatchKpis::from_summary(&o.summary, frontier_team)),
+            )
         }
         Err(e) => {
             eprintln!("league_match_error: {e}");
-            (frontier, 0)
+            (frontier, None)
         }
     }
 }
@@ -390,6 +587,14 @@ fn main() {
     let fresh_opponents = env_usize("SOCCER_LEAGUE_FRESH_OPPONENTS", 2);
     let checkpoint_every = env_usize("SOCCER_LEAGUE_CHECKPOINT_EVERY_ROUNDS", 10).max(1);
     let max_target_entries_per_side = env_usize("SOCCER_LEAGUE_MAX_TARGET_ENTRIES_PER_SIDE", 4096);
+    let checkpoint_require_forward_pass_climb =
+        env_bool("SOCCER_LEAGUE_CHECKPOINT_REQUIRE_FORWARD_PASS_CLIMB", true);
+    let checkpoint_max_forward_pass_regression =
+        env_f64("SOCCER_LEAGUE_CHECKPOINT_MAX_FORWARD_PASS_REGRESSION", 0.0).max(0.0);
+    let checkpoint_min_forward_pass_margin = env_f64(
+        "SOCCER_LEAGUE_CHECKPOINT_MIN_FORWARD_PASS_MARGIN",
+        f64::NEG_INFINITY,
+    );
 
     let mut runner_config = EngineMatchRunnerConfig::default();
     runner_config.base.duration_seconds = minutes * 60.0;
@@ -482,9 +687,10 @@ fn main() {
 
     let train_seed_base: u32 = 0x5EED_0000;
     let mut round = 0u32;
+    let mut best_checkpoint_forward_pass_margin = f64::NEG_INFINITY;
     println!(
-        "league_train_started_at_utc={} games/opp={} minutes={} weight_decay={} fresh_opp={} checkpoint_every={} max_target_entries_per_side={} frontier={} archive={}",
-        chrono_now(), games_per_opp, minutes, weight_decay, fresh_opponents, checkpoint_every, max_target_entries_per_side, frontier_path, archive_dir
+        "league_train_started_at_utc={} games/opp={} minutes={} weight_decay={} fresh_opp={} checkpoint_every={} max_target_entries_per_side={} advancement_metric=completed_forward_passes checkpoint_require_forward_pass_climb={} checkpoint_max_forward_pass_regression={} checkpoint_min_forward_pass_margin={} frontier={} archive={}",
+        chrono_now(), games_per_opp, minutes, weight_decay, fresh_opponents, checkpoint_every, max_target_entries_per_side, checkpoint_require_forward_pass_climb, checkpoint_max_forward_pass_regression, checkpoint_min_forward_pass_margin, frontier_path, archive_dir
     );
 
     loop {
@@ -564,6 +770,7 @@ fn main() {
         let wins_a = std::sync::atomic::AtomicI32::new(0);
         let losses_a = std::sync::atomic::AtomicI32::new(0);
         let trained_brains = std::sync::Mutex::new(Vec::<TeamBrain>::new());
+        let match_kpis = std::sync::Mutex::new(Vec::<LeagueMatchKpis>::new());
         std::thread::scope(|scope| {
             for w in 0..workers {
                 let lo = w * chunk;
@@ -576,12 +783,13 @@ fn main() {
                 let wins_a = &wins_a;
                 let losses_a = &losses_a;
                 let trained_brains = &trained_brains;
+                let match_kpis = &match_kpis;
                 let mut runner = runner.clone();
                 let mut wf = frontier.clone();
                 scope.spawn(move || {
                     use std::sync::atomic::Ordering::Relaxed;
                     for fx in slice {
-                        let (t, gd) = play_and_carry(
+                        let (t, kpis) = play_and_carry(
                             &mut runner,
                             wf,
                             &opponents[fx.opp_idx],
@@ -590,10 +798,13 @@ fn main() {
                             fx.opp_id,
                         );
                         wf = t;
-                        if gd > 0 {
-                            wins_a.fetch_add(1, Relaxed);
-                        } else if gd < 0 {
-                            losses_a.fetch_add(1, Relaxed);
+                        if let Some(kpis) = kpis {
+                            if kpis.goal_diff > 0 {
+                                wins_a.fetch_add(1, Relaxed);
+                            } else if kpis.goal_diff < 0 {
+                                losses_a.fetch_add(1, Relaxed);
+                            }
+                            match_kpis.lock().unwrap().push(kpis);
                         }
                     }
                     trained_brains.lock().unwrap().push(wf);
@@ -603,6 +814,10 @@ fn main() {
         let wins = wins_a.load(std::sync::atomic::Ordering::Relaxed);
         let losses = losses_a.load(std::sync::atomic::Ordering::Relaxed);
         let trained_brains = trained_brains.into_inner().unwrap();
+        let mut round_kpis = LeagueRoundKpis::default();
+        for kpis in match_kpis.into_inner().unwrap() {
+            round_kpis.add(kpis);
+        }
         let trained_snapshots = trained_brains
             .iter()
             .filter_map(|brain| brain.neural.clone())
@@ -669,18 +884,79 @@ fn main() {
             }
         }
 
+        let kpi_games = round_kpis.games.max(1) as f64;
+        let pass_completion = if round_kpis.passes_attempted_for == 0 {
+            0.0
+        } else {
+            round_kpis.passes_completed_for as f64 / round_kpis.passes_attempted_for as f64
+        };
+        let mean_kpi_margin = round_kpis.mean_objective_fitness_margin();
+        let mean_forward_pass_margin = round_kpis.mean_forward_pass_margin();
+        println!(
+            "league_advancement round={round} metric=completed_forward_passes games={} forward_passes_for={} forward_passes_against={} forward_pass_margin={} forward_pass_margin_per_game={:.3}",
+            round_kpis.games,
+            round_kpis.forward_passes_for,
+            round_kpis.forward_passes_against,
+            round_kpis.forward_pass_margin,
+            mean_forward_pass_margin,
+        );
+        println!(
+            "league_kpi round={round} games={} advancement_metric=completed_forward_passes forward_pass_margin_per_game={:.3} objective={:.3} objective_margin={:.3} gd_total={} gd_per_game={:.2} goals_for={} goals_against={} shots_for={} shots_against={} sot_for={} sot_against={} shots_after_pass={} pass_completion={:.3} completed_passes={} forward_passes={} backward_passes={} dribble_beats={} assists={} crosses={} chain_gain_yards={:.1} chain_net_losses={}",
+            round_kpis.games,
+            mean_forward_pass_margin,
+            round_kpis.mean_objective_fitness(),
+            mean_kpi_margin,
+            round_kpis.goal_diff,
+            round_kpis.goal_diff as f64 / kpi_games,
+            round_kpis.goals_for,
+            round_kpis.goals_against,
+            round_kpis.shots_for,
+            round_kpis.shots_against,
+            round_kpis.shots_on_target_for,
+            round_kpis.shots_on_target_against,
+            round_kpis.shots_after_pass_for,
+            pass_completion,
+            round_kpis.passes_completed_for,
+            round_kpis.forward_passes_for,
+            round_kpis.backward_passes_for,
+            round_kpis.dribble_beats_for,
+            round_kpis.assists_for,
+            round_kpis.crosses_completed_for,
+            round_kpis.pass_chain_gain_yards_for,
+            round_kpis.pass_chain_net_losses_for,
+        );
+
         // Temporal checkpoint into the league (growing diversity of past selves).
         if round % (checkpoint_every as u32) == 0 {
             if frontier.neural.is_some() {
-                let cp = format!(
-                    "{}/league-r{:04}-{}.json",
-                    archive_dir.trim_end_matches('/'),
-                    round,
-                    chrono_stamp()
-                );
-                let _ = fs::create_dir_all(&archive_dir);
-                let _ = write_frontier(&cp, &frontier);
-                println!("league_checkpoint round={round} -> {cp}");
+                let prior_best = best_checkpoint_forward_pass_margin;
+                let passes_forward_pass_climb = !checkpoint_require_forward_pass_climb
+                    || !prior_best.is_finite()
+                    || mean_forward_pass_margin + checkpoint_max_forward_pass_regression
+                        >= prior_best;
+                let passes_forward_pass_floor =
+                    mean_forward_pass_margin >= checkpoint_min_forward_pass_margin;
+                if passes_forward_pass_climb && passes_forward_pass_floor {
+                    let cp = format!(
+                        "{}/league-r{:04}-{}.json",
+                        archive_dir.trim_end_matches('/'),
+                        round,
+                        chrono_stamp()
+                    );
+                    let _ = fs::create_dir_all(&archive_dir);
+                    let _ = write_frontier(&cp, &frontier);
+                    if mean_forward_pass_margin > best_checkpoint_forward_pass_margin {
+                        best_checkpoint_forward_pass_margin = mean_forward_pass_margin;
+                    }
+                    println!(
+                        "league_checkpoint round={round} metric=completed_forward_passes forward_pass_margin_per_game={mean_forward_pass_margin:.3} best_forward_pass_margin_per_game={best_checkpoint_forward_pass_margin:.3} -> {cp}"
+                    );
+                } else {
+                    println!(
+                        "league_checkpoint_held round={round} metric=completed_forward_passes forward_pass_margin_per_game={mean_forward_pass_margin:.3} best_forward_pass_margin_per_game={prior_best:.3} require_climb={} min_margin={checkpoint_min_forward_pass_margin:.3}",
+                        checkpoint_require_forward_pass_climb
+                    );
+                }
             }
         }
 
@@ -709,4 +985,39 @@ fn chrono_stamp() -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     format!("{secs}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soccer_engine::des::general::soccer::MatchStats;
+
+    #[test]
+    fn league_advancement_objective_uses_forward_passes_not_score_or_shots() {
+        let mut stats = MatchStats::default();
+        stats.shots_home = 1;
+        stats.shots_away = 18;
+        stats.shots_on_target_home = 0;
+        stats.shots_on_target_away = 9;
+        stats.passes_completed_forward_home = 14;
+        stats.passes_completed_forward_away = 5;
+
+        let summary = MatchSummary {
+            score_home: 0,
+            score_away: 4,
+            ticks: 0,
+            simulated_seconds: 0.0,
+            stats,
+        };
+
+        let home = LeagueMatchKpis::from_summary(&summary, Team::Home);
+        assert_eq!(home.objective_fitness, 14.0);
+        assert_eq!(home.objective_fitness_margin, 9.0);
+        assert_eq!(home.forward_pass_margin, 9);
+
+        let away = LeagueMatchKpis::from_summary(&summary, Team::Away);
+        assert_eq!(away.objective_fitness, 5.0);
+        assert_eq!(away.objective_fitness_margin, -9.0);
+        assert_eq!(away.forward_pass_margin, -9);
+    }
 }
