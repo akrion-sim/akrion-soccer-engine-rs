@@ -464,10 +464,14 @@ struct NeuralPopulationSearchConfig {
     min_fitness_delta: f64,
     min_accepted_fitness: f64,
     min_accepted_goal_margin: f64,
+    training_min_accepted_fitness: f64,
+    training_min_accepted_goal_margin: f64,
     confirm_games: usize,
     confirm_min_fitness_delta: f64,
     confirm_min_accepted_fitness: f64,
     confirm_min_accepted_goal_margin: f64,
+    training_confirm_min_accepted_fitness: f64,
+    training_confirm_min_accepted_goal_margin: f64,
     seed: u64,
 }
 
@@ -558,6 +562,26 @@ fn env_neural_population_search_config(
         )
         .into());
     }
+    let training_min_accepted_fitness = env_f64(
+        "SOCCER_NEURAL_POPULATION_TRAINING_MIN_ACCEPTED_FITNESS",
+        min_accepted_fitness,
+    )?;
+    if !training_min_accepted_fitness.is_finite() {
+        return Err(invalid_data(
+            "SOCCER_NEURAL_POPULATION_TRAINING_MIN_ACCEPTED_FITNESS must be finite",
+        )
+        .into());
+    }
+    let training_min_accepted_goal_margin = env_f64(
+        "SOCCER_NEURAL_POPULATION_TRAINING_MIN_ACCEPTED_GOAL_MARGIN",
+        min_accepted_goal_margin,
+    )?;
+    if !training_min_accepted_goal_margin.is_finite() {
+        return Err(invalid_data(
+            "SOCCER_NEURAL_POPULATION_TRAINING_MIN_ACCEPTED_GOAL_MARGIN must be finite",
+        )
+        .into());
+    }
     let confirm_games = env_usize(
         "SOCCER_NEURAL_POPULATION_CONFIRM_GAMES",
         DEFAULT_SOCCER_NEURAL_POPULATION_CONFIRM_GAMES,
@@ -592,6 +616,26 @@ fn env_neural_population_search_config(
         )
         .into());
     }
+    let training_confirm_min_accepted_fitness = env_f64(
+        "SOCCER_NEURAL_POPULATION_TRAINING_CONFIRM_MIN_ACCEPTED_FITNESS",
+        confirm_min_accepted_fitness,
+    )?;
+    if !training_confirm_min_accepted_fitness.is_finite() {
+        return Err(invalid_data(
+            "SOCCER_NEURAL_POPULATION_TRAINING_CONFIRM_MIN_ACCEPTED_FITNESS must be finite",
+        )
+        .into());
+    }
+    let training_confirm_min_accepted_goal_margin = env_f64(
+        "SOCCER_NEURAL_POPULATION_TRAINING_CONFIRM_MIN_ACCEPTED_GOAL_MARGIN",
+        confirm_min_accepted_goal_margin,
+    )?;
+    if !training_confirm_min_accepted_goal_margin.is_finite() {
+        return Err(invalid_data(
+            "SOCCER_NEURAL_POPULATION_TRAINING_CONFIRM_MIN_ACCEPTED_GOAL_MARGIN must be finite",
+        )
+        .into());
+    }
     let search_seed = env_u64(
         "SOCCER_NEURAL_POPULATION_SEED",
         seed ^ 0xA5A5_5A5A_D3C3_B4B4,
@@ -608,10 +652,14 @@ fn env_neural_population_search_config(
         min_fitness_delta,
         min_accepted_fitness,
         min_accepted_goal_margin,
+        training_min_accepted_fitness,
+        training_min_accepted_goal_margin,
         confirm_games,
         confirm_min_fitness_delta,
         confirm_min_accepted_fitness,
         confirm_min_accepted_goal_margin,
+        training_confirm_min_accepted_fitness,
+        training_confirm_min_accepted_goal_margin,
         seed: search_seed,
     })
 }
@@ -1423,7 +1471,7 @@ fn maybe_run_neural_population_search(
         completed_games,
     );
     println!(
-        "neural_population_search_start completed_games={} population={} eval_games={} eval_minutes={:.2} confirm_games={} objective=home_directional_learning_vs_analytic mutation_rate={:.4} mutation_scale={:.4} crossover_rate={:.4} min_fitness_delta={:.4} min_accepted_fitness={:.4} min_accepted_goal_margin={:.4} confirm_min_delta={:.4} confirm_min_accepted_fitness={:.4} confirm_min_accepted_goal_margin={:.4}",
+        "neural_population_search_start completed_games={} population={} eval_games={} eval_minutes={:.2} confirm_games={} objective=home_directional_learning_vs_analytic mutation_rate={:.4} mutation_scale={:.4} crossover_rate={:.4} min_fitness_delta={:.4} min_accepted_fitness={:.4} min_accepted_goal_margin={:.4} training_min_accepted_fitness={:.4} training_min_accepted_goal_margin={:.4} confirm_min_delta={:.4} confirm_min_accepted_fitness={:.4} confirm_min_accepted_goal_margin={:.4} training_confirm_min_accepted_fitness={:.4} training_confirm_min_accepted_goal_margin={:.4}",
         completed_games,
         candidates.len(),
         search_config.eval_games,
@@ -1435,9 +1483,13 @@ fn maybe_run_neural_population_search(
         search_config.min_fitness_delta,
         search_config.min_accepted_fitness,
         search_config.min_accepted_goal_margin,
+        search_config.training_min_accepted_fitness,
+        search_config.training_min_accepted_goal_margin,
         search_config.confirm_min_fitness_delta,
         search_config.confirm_min_accepted_fitness,
-        search_config.confirm_min_accepted_goal_margin
+        search_config.confirm_min_accepted_goal_margin,
+        search_config.training_confirm_min_accepted_fitness,
+        search_config.training_confirm_min_accepted_goal_margin
     );
     let mut handles = Vec::new();
     let eval_seed = neural_population_eval_seed(search_config.seed, completed_games);
@@ -1596,9 +1648,9 @@ fn maybe_run_neural_population_search(
         );
         return Ok(None);
     }
-    if best_eval.fitness < search_config.min_accepted_fitness {
+    if best_eval.fitness < search_config.training_min_accepted_fitness {
         println!(
-            "neural_population_search_held completed_games={} incumbent_fitness={:.4} training_reference_index={} training_reference_source={} training_reference_fitness={:.4} protected_reference_index={} protected_reference_source={} protected_reference_fitness={:.4} best_index={} best_source={} best_fitness={:.4} training_improvement={:.4} protected_improvement={:.4} min_accepted_fitness={:.4} reasons=below_min_accepted_fitness",
+            "neural_population_search_held completed_games={} incumbent_fitness={:.4} training_reference_index={} training_reference_source={} training_reference_fitness={:.4} protected_reference_index={} protected_reference_source={} protected_reference_fitness={:.4} best_index={} best_source={} best_fitness={:.4} training_improvement={:.4} protected_improvement={:.4} min_accepted_fitness={:.4} reasons=below_training_min_accepted_fitness",
             completed_games,
             incumbent_eval.fitness,
             training_reference_eval.index,
@@ -1612,14 +1664,14 @@ fn maybe_run_neural_population_search(
             best_eval.fitness,
             training_improvement,
             protected_improvement,
-            search_config.min_accepted_fitness
+            search_config.training_min_accepted_fitness
         );
         return Ok(None);
     }
     let best_goal_margin = neural_population_candidate_goal_margin(&best_eval);
-    if best_goal_margin < search_config.min_accepted_goal_margin {
+    if best_goal_margin < search_config.training_min_accepted_goal_margin {
         println!(
-            "neural_population_search_held completed_games={} incumbent_fitness={:.4} training_reference_index={} training_reference_source={} training_reference_fitness={:.4} protected_reference_index={} protected_reference_source={} protected_reference_fitness={:.4} best_index={} best_source={} best_fitness={:.4} training_improvement={:.4} protected_improvement={:.4} goals={}-{} goal_margin={:.4} min_accepted_goal_margin={:.4} reasons=below_min_accepted_goal_margin",
+            "neural_population_search_held completed_games={} incumbent_fitness={:.4} training_reference_index={} training_reference_source={} training_reference_fitness={:.4} protected_reference_index={} protected_reference_source={} protected_reference_fitness={:.4} best_index={} best_source={} best_fitness={:.4} training_improvement={:.4} protected_improvement={:.4} goals={}-{} goal_margin={:.4} min_accepted_goal_margin={:.4} reasons=below_training_min_accepted_goal_margin",
             completed_games,
             incumbent_eval.fitness,
             training_reference_eval.index,
@@ -1636,10 +1688,13 @@ fn maybe_run_neural_population_search(
             best_eval.goals_for,
             best_eval.goals_against,
             best_goal_margin,
-            search_config.min_accepted_goal_margin
+            search_config.training_min_accepted_goal_margin
         );
         return Ok(None);
     }
+    let primary_clears_local_best_floor = best_eval.fitness >= search_config.min_accepted_fitness
+        && best_goal_margin >= search_config.min_accepted_goal_margin;
+    let mut confirmation_clears_local_best_floor = search_config.confirm_games == 0;
     if search_config.confirm_games > 0 {
         let mut confirm_config = search_config;
         confirm_config.eval_games = search_config.confirm_games;
@@ -1719,9 +1774,12 @@ fn maybe_run_neural_population_search(
             );
             return Ok(None);
         }
-        if confirm_candidate.fitness < search_config.confirm_min_accepted_fitness {
+        confirmation_clears_local_best_floor = confirm_candidate.fitness
+            >= search_config.confirm_min_accepted_fitness
+            && confirm_goal_margin >= search_config.confirm_min_accepted_goal_margin;
+        if confirm_candidate.fitness < search_config.training_confirm_min_accepted_fitness {
             println!(
-                "neural_population_search_held completed_games={} incumbent_fitness={:.4} training_reference_index={} training_reference_source={} training_reference_fitness={:.4} protected_reference_index={} protected_reference_source={} protected_reference_fitness={:.4} best_index={} best_source={} best_fitness={:.4} confirmation_fitness={:.4} min_accepted_fitness={:.4} reasons=below_confirmation_min_accepted_fitness",
+                "neural_population_search_held completed_games={} incumbent_fitness={:.4} training_reference_index={} training_reference_source={} training_reference_fitness={:.4} protected_reference_index={} protected_reference_source={} protected_reference_fitness={:.4} best_index={} best_source={} best_fitness={:.4} confirmation_fitness={:.4} min_accepted_fitness={:.4} reasons=below_training_confirmation_min_accepted_fitness",
                 completed_games,
                 incumbent_eval.fitness,
                 training_reference_eval.index,
@@ -1734,13 +1792,13 @@ fn maybe_run_neural_population_search(
                 best_eval.source,
                 best_eval.fitness,
                 confirm_candidate.fitness,
-                search_config.confirm_min_accepted_fitness
+                search_config.training_confirm_min_accepted_fitness
             );
             return Ok(None);
         }
-        if confirm_goal_margin < search_config.confirm_min_accepted_goal_margin {
+        if confirm_goal_margin < search_config.training_confirm_min_accepted_goal_margin {
             println!(
-                "neural_population_search_held completed_games={} incumbent_fitness={:.4} training_reference_index={} training_reference_source={} training_reference_fitness={:.4} protected_reference_index={} protected_reference_source={} protected_reference_fitness={:.4} best_index={} best_source={} best_fitness={:.4} confirmation_fitness={:.4} confirmation_goal_margin={:.4} min_accepted_goal_margin={:.4} reasons=below_confirmation_min_goal_margin",
+                "neural_population_search_held completed_games={} incumbent_fitness={:.4} training_reference_index={} training_reference_source={} training_reference_fitness={:.4} protected_reference_index={} protected_reference_source={} protected_reference_fitness={:.4} best_index={} best_source={} best_fitness={:.4} confirmation_fitness={:.4} confirmation_goal_margin={:.4} min_accepted_goal_margin={:.4} reasons=below_training_confirmation_min_goal_margin",
                 completed_games,
                 incumbent_eval.fitness,
                 training_reference_eval.index,
@@ -1754,7 +1812,7 @@ fn maybe_run_neural_population_search(
                 best_eval.fitness,
                 confirm_candidate.fitness,
                 confirm_goal_margin,
-                search_config.confirm_min_accepted_goal_margin
+                search_config.training_confirm_min_accepted_goal_margin
             );
             return Ok(None);
         }
@@ -1765,7 +1823,8 @@ fn maybe_run_neural_population_search(
     let preserve_as_local_best = neural_population_improvement_clears_delta(
         protected_improvement,
         search_config.min_fitness_delta,
-    );
+    ) && primary_clears_local_best_floor
+        && confirmation_clears_local_best_floor;
     println!(
         "neural_population_search_accepted completed_games={} incumbent_fitness={:.4} training_reference_index={} training_reference_source={} training_reference_fitness={:.4} protected_reference_index={} protected_reference_source={} protected_reference_fitness={:.4} accepted_index={} accepted_source={} accepted_fitness={:.4} training_improvement={:.4} protected_improvement={:.4} preserve_as_local_best={} record={}-{}-{} goals={}-{} note=heldout_analytic_candidate_will_train_on_policy_next_batch",
         completed_games,
@@ -7919,7 +7978,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         evolution_options.seed
     );
     println!(
-        "neural_population_search enabled={} interval_games={} population_size={} eval_games={} eval_minutes={:.2} confirm_games={} confirm_min_delta={:.4} confirm_min_accepted_fitness={:.4} confirm_min_accepted_goal_margin={:.4} mutation_rate={:.4} mutation_scale={:.4} crossover_rate={:.4} min_fitness_delta={:.4} min_accepted_fitness={:.4} min_accepted_goal_margin={:.4} accept_freeze_games={} seed={}",
+        "neural_population_search enabled={} interval_games={} population_size={} eval_games={} eval_minutes={:.2} confirm_games={} confirm_min_delta={:.4} confirm_min_accepted_fitness={:.4} confirm_min_accepted_goal_margin={:.4} training_confirm_min_accepted_fitness={:.4} training_confirm_min_accepted_goal_margin={:.4} mutation_rate={:.4} mutation_scale={:.4} crossover_rate={:.4} min_fitness_delta={:.4} min_accepted_fitness={:.4} min_accepted_goal_margin={:.4} training_min_accepted_fitness={:.4} training_min_accepted_goal_margin={:.4} accept_freeze_games={} seed={}",
         neural_population_search_config.enabled,
         neural_population_search_config.interval_games,
         neural_population_search_config.population_size,
@@ -7929,12 +7988,16 @@ fn run() -> Result<(), Box<dyn Error>> {
         neural_population_search_config.confirm_min_fitness_delta,
         neural_population_search_config.confirm_min_accepted_fitness,
         neural_population_search_config.confirm_min_accepted_goal_margin,
+        neural_population_search_config.training_confirm_min_accepted_fitness,
+        neural_population_search_config.training_confirm_min_accepted_goal_margin,
         neural_population_search_config.mutation_rate,
         neural_population_search_config.mutation_scale,
         neural_population_search_config.crossover_rate,
         neural_population_search_config.min_fitness_delta,
         neural_population_search_config.min_accepted_fitness,
         neural_population_search_config.min_accepted_goal_margin,
+        neural_population_search_config.training_min_accepted_fitness,
+        neural_population_search_config.training_min_accepted_goal_margin,
         neural_population_accept_freeze_games,
         neural_population_search_config.seed
     );
@@ -10879,10 +10942,14 @@ mod tests {
             min_fitness_delta: 0.0,
             min_accepted_fitness: -8.0,
             min_accepted_goal_margin: -99.0,
+            training_min_accepted_fitness: -8.0,
+            training_min_accepted_goal_margin: -99.0,
             confirm_games: 0,
             confirm_min_fitness_delta: 0.0,
             confirm_min_accepted_fitness: -8.0,
             confirm_min_accepted_goal_margin: -99.0,
+            training_confirm_min_accepted_fitness: -8.0,
+            training_confirm_min_accepted_goal_margin: -99.0,
             seed: 99,
         }
     }
