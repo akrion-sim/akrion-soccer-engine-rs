@@ -260,6 +260,13 @@ fn eval(candidate_path: &str, baseline_path: &str, games: usize, minutes: f64, h
     let mut forward_pass_diffs: Vec<f64> = Vec::new();
     let mut candidate_forward_total: u64 = 0;
     let mut baseline_forward_total: u64 = 0;
+    // Full pass breakdown so we can diagnose WHO/WHEN (POMDP selection) vs HOW (MPC execution).
+    let mut cand_att: u64 = 0;
+    let mut cand_comp: u64 = 0;
+    let mut cand_back: u64 = 0;
+    let mut base_att: u64 = 0;
+    let mut base_comp: u64 = 0;
+    let mut base_back: u64 = 0;
     for g in 0..games {
         let seed = holdout_base.wrapping_add((g as u32).wrapping_mul(2_246_822_519));
         // Alternate home/away so the verdict isn't a home-field artifact.
