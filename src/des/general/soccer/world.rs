@@ -13022,16 +13022,6 @@ impl SoccerMatch {
         let SoccerExternalNnPomdpSidecarResponse {
             logits,
             value: _value,
-<<<<<<< HEAD
-        } = soccer_external_nn_pomdp_sidecar_infer(&request)?;
-        let action_index =
-            soccer_external_nn_pomdp_select_legal_argmax(&logits, &legal_action_mask)?;
-        let label = SOCCER_POLICY_ACTIONS.get(action_index)?.to_string();
-        Some(SoccerPolicyActionChoice {
-            label,
-            plan: None,
-            behavior_probability: 1.0,
-=======
             behavior_policy_probability,
             action_index: sidecar_action_index,
         } = soccer_external_nn_pomdp_sidecar_infer(&request)?;
