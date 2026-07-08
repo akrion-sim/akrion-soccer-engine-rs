@@ -5012,6 +5012,42 @@ mod tests {
     }
 
     #[test]
+    fn frozen_analytic_opponent_cannot_receive_learned_policy_inference() {
+        let config = MatchConfig::live_gameplay();
+        assert!(!config.learning_enabled);
+
+        let mut sim = SoccerMatch::default_11v11(config);
+        sim.set_team_policies(SoccerTeamQPolicies::new(SoccerQPolicyOptions::default()));
+        assert!(sim.learned_policy_inference_enabled_for_team(Team::Home));
+        assert!(sim.learned_policy_inference_enabled_for_team(Team::Away));
+
+        sim.disable_team_neural_brain(Team::Away);
+        assert!(sim.learned_policy_inference_enabled_for_team(Team::Home));
+        assert!(!sim.learned_policy_inference_enabled_for_team(Team::Away));
+
+        let away_player_id = sim
+            .players
+            .iter()
+            .find(|player| player.team == Team::Away && player.role != PlayerRole::Goalkeeper)
+            .map(|player| player.id)
+            .expect("away field player");
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let mdp_state = snapshot.mdp_state_for_player(away_player_id);
+        let observation = snapshot.observation_for(away_player_id);
+
+        assert!(
+            sim.learned_action_for_player_with_context(
+                &snapshot,
+                away_player_id,
+                &mdp_state,
+                &observation,
+            )
+            .is_none(),
+            "the frozen analytic opponent must not receive tabular/team-policy inference"
+        );
+    }
+
+    #[test]
     fn conceded_shot_on_target_queues_defensive_learning_penalties() {
         let mut sim = SoccerMatch::default_11v11(MatchConfig {
             duration_seconds: 0.1,
@@ -10012,6 +10048,13 @@ impl SoccerMatch {
             || self.learned_policy.is_some()
     }
 
+    fn learned_policy_inference_enabled_for_team(&self, team: Team) -> bool {
+        if self.neural_team_frozen(team) && self.neural_learner_for(team).is_none() {
+            return false;
+        }
+        self.learned_policy_inference_enabled()
+    }
+
     fn neural_blend_readiness_for_learner(&self, learner: &SoccerNeuralLearner) -> f64 {
         let readiness = self
             .neural_blend
@@ -11586,6 +11629,9 @@ impl SoccerMatch {
         observation: &SoccerPomdpObservation,
     ) -> Option<SoccerLearnedDecisionPlan> {
         let player = snapshot.players.iter().find(|p| p.id == player_id)?;
+        if !self.learned_policy_inference_enabled_for_team(player.team) {
+            return None;
+        }
         // Retrieval action prior for this player's team (empty/None unless the
         // consumer installed one and `decision_prior_enabled`). `Option<(&map, w)>`
         // is `Copy`, so the same prior is shared by both decision branches below.
@@ -14769,7 +14815,7 @@ impl SoccerMatch {
     fn neural_policy_training_samples(
         &self,
         replay: &[SoccerLearningTransition],
-    ) -> Vec<SoccerPolicySample> {
+    ) -> SoccerPolicyTrainingBatch {
         // The actor trains once at least one team brain can score states. Each
         // transition is later valued by its own team's critic.
         let home_ready = self
@@ -14781,7 +14827,7 @@ impl SoccerMatch {
             .map_or(false, |learner| learner.has_prediction_network())
             && !self.neural_team_frozen(Team::Away);
         if (!home_ready && !away_ready) || replay.is_empty() {
-            return Vec::new();
+            return SoccerPolicyTrainingBatch::default();
         }
         let target_scale = self.config.neural_learning.sanitized_target_scale();
         // Per-team discount: the critic bootstraps each team's value with that
@@ -14876,6 +14922,9 @@ impl SoccerMatch {
             }
         }
 
+        let mut option_score_safety_counterexample_candidates = 0usize;
+        let mut option_score_safety_counterexample_samples = 0usize;
+        let mut option_score_safety_counterexample_weight_sum = 0.0;
         let mut samples: Vec<SoccerPolicySample> = replay
             .iter()
             .enumerate()
@@ -14890,6 +14939,9 @@ impl SoccerMatch {
                     learned_mpc_rejected_action_counterexample(transition);
                 let option_score_safety_counterexample =
                     option_score_safety_rejected_action_counterexample(transition);
+                if option_score_safety_counterexample {
+                    option_score_safety_counterexample_candidates += 1;
+                }
                 if option_score_safety_counterexample
                     && !option_score_safety_counterexample_sample_allowed_with_rate(
                         transition,
@@ -14932,14 +14984,22 @@ impl SoccerMatch {
                         .or(Some(transition.decision_context.chosen_action_probability)),
                     actor_probability,
                 );
-                advantage.is_finite().then(|| SoccerPolicySample {
+                if !advantage.is_finite() {
+                    return None;
+                }
+                let sample = SoccerPolicySample {
                     state_features,
                     action_index,
                     advantage,
                     old_action_probability,
                     sample_weight,
                     mcts_distillation,
-                })
+                };
+                if option_score_safety_counterexample {
+                    option_score_safety_counterexample_samples += 1;
+                    option_score_safety_counterexample_weight_sum += sample.sanitized_weight();
+                }
+                Some(sample)
             })
             .collect();
 
@@ -14952,7 +15012,12 @@ impl SoccerMatch {
         if dd_soccer_standardize_policy_advantages() {
             soccer_standardize_actor_policy_sample_advantages(&mut samples);
         }
-        samples
+        SoccerPolicyTrainingBatch {
+            samples,
+            option_score_safety_counterexample_candidates,
+            option_score_safety_counterexample_samples,
+            option_score_safety_counterexample_weight_sum,
+        }
     }
 
     fn ensure_policy_head(&mut self) {
@@ -15320,12 +15385,23 @@ impl SoccerMatch {
         }
         // Actor (policy head): compute GAE advantages with the *current* critic
         // (before this episode's value update), then take a policy-gradient step.
-        let policy_samples =
+        let policy_training_batch =
             if self.neural_blend.actor_critic && self.config.neural_learning.enabled {
                 self.neural_policy_training_samples(&replay)
             } else {
-                Vec::new()
+                SoccerPolicyTrainingBatch::default()
             };
+        self.stats.option_score_safety_counterexample_candidates = policy_training_batch
+            .option_score_safety_counterexample_candidates
+            .min(u32::MAX as usize)
+            as u32;
+        self.stats.option_score_safety_counterexample_samples = policy_training_batch
+            .option_score_safety_counterexample_samples
+            .min(u32::MAX as usize)
+            as u32;
+        self.stats.option_score_safety_counterexample_weight_sum =
+            policy_training_batch.option_score_safety_counterexample_weight_sum;
+        let policy_samples = policy_training_batch.samples;
         // Dedicated goalkeeper head samples: keeper transitions only, one-step reward as advantage.
         let keeper_policy_samples = if self.neural_blend.actor_critic
             && self.config.neural_learning.enabled
@@ -16721,7 +16797,9 @@ impl SoccerMatch {
                         observation.human_input_queue_age_ms =
                             Some(input_frame.queue_age_ms.min(60_000));
                     }
-                    let learned_decision = if self.learned_policy_inference_enabled() {
+                    let learned_decision = if self
+                        .learned_policy_inference_enabled_for_team(self.players[actor].team)
+                    {
                         self.learned_action_for_player_with_context(
                             &snapshot,
                             scheduled.id,

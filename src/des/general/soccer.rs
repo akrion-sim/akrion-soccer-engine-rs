@@ -19001,6 +19001,12 @@ pub struct MatchStats {
     #[serde(default)]
     pub policy_priority_weight_sum: f64,
     #[serde(default)]
+    pub option_score_safety_counterexample_candidates: u32,
+    #[serde(default)]
+    pub option_score_safety_counterexample_samples: u32,
+    #[serde(default)]
+    pub option_score_safety_counterexample_weight_sum: f64,
+    #[serde(default)]
     pub neural_mcts_distillation_samples: u32,
     #[serde(default)]
     pub neural_mcts_distillation_weight_sum: f64,
@@ -19059,6 +19065,10 @@ pub struct SoccerPlanningValidationStats {
     pub policy_priority_samples: u32,
     pub policy_priority_sample_rate: f64,
     pub mean_policy_priority_weight: f64,
+    pub option_score_safety_counterexample_candidates: u32,
+    pub option_score_safety_counterexample_samples: u32,
+    pub option_score_safety_counterexample_sample_rate: f64,
+    pub mean_option_score_safety_counterexample_weight: f64,
     pub neural_mcts_distillation_samples: u32,
     pub neural_mcts_distillation_rate: f64,
     pub mean_neural_mcts_distillation_weight: f64,
@@ -19219,6 +19229,18 @@ impl MatchStats {
             policy_priority_sample_rate: self.policy_priority_samples as f64 / decisions as f64,
             mean_policy_priority_weight: self.policy_priority_weight_sum
                 / self.policy_priority_samples.max(1) as f64,
+            option_score_safety_counterexample_candidates: self
+                .option_score_safety_counterexample_candidates,
+            option_score_safety_counterexample_samples: self
+                .option_score_safety_counterexample_samples,
+            option_score_safety_counterexample_sample_rate: self
+                .option_score_safety_counterexample_samples as f64
+                / self
+                    .option_score_safety_counterexample_candidates
+                    .max(1) as f64,
+            mean_option_score_safety_counterexample_weight: self
+                .option_score_safety_counterexample_weight_sum
+                / self.option_score_safety_counterexample_samples.max(1) as f64,
             neural_mcts_distillation_samples: self.neural_mcts_distillation_samples,
             neural_mcts_distillation_rate: self.neural_mcts_distillation_samples as f64
                 / decisions as f64,
@@ -38865,6 +38887,14 @@ struct SoccerPolicySample {
     old_action_probability: Option<f64>,
     sample_weight: f64,
     mcts_distillation: bool,
+}
+
+#[derive(Clone, Default)]
+struct SoccerPolicyTrainingBatch {
+    samples: Vec<SoccerPolicySample>,
+    option_score_safety_counterexample_candidates: usize,
+    option_score_safety_counterexample_samples: usize,
+    option_score_safety_counterexample_weight_sum: f64,
 }
 
 impl SoccerPolicySample {
