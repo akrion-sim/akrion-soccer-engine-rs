@@ -193,9 +193,13 @@ fn main() -> std::io::Result<()> {
                 } else if scoring_team.is_some() {
                     // opponent scored during our nominal possession (own-goal / scramble): turnover
                     Some("turnover")
-                } else if sot_for(ct) {
+                } else if matches!(ct, Team::Home) && sot_delta.0
+                    || matches!(ct, Team::Away) && sot_delta.1
+                {
                     Some("shot_on_target")
-                } else if shot_for(ct) {
+                } else if matches!(ct, Team::Home) && shot_delta.0
+                    || matches!(ct, Team::Away) && shot_delta.1
+                {
                     Some("shot")
                 } else if poss.map_or(false, |t| t != ct) {
                     Some("turnover")
