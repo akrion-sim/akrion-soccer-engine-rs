@@ -64,6 +64,8 @@ fn test_decision_trace(
         neural_mcts_candidate_count: 0,
         neural_mcts_discretized_kick_candidate_count: 0,
         neural_mcts_root_discretized_kick_candidate_count: 0,
+        neural_mcts_dribble_candidate_count: 0,
+        neural_mcts_root_dribble_candidate_count: 0,
         action: action.to_string(),
     }
 }
@@ -1045,6 +1047,277 @@ fn push_stationary_mpc_guidance(snapshot: &mut WorldSnapshot, player_id: usize, 
             variable_count: 1,
             constraint_count: 1,
         });
+}
+
+fn push_live_local_mpc_guidance(
+    sim: &mut SoccerMatch,
+    player_id: usize,
+    target: Vec2,
+    target_velocity: Vec2,
+) {
+    let player = sim
+        .players
+        .iter()
+        .find(|player| player.id == player_id)
+        .expect("guided player")
+        .clone();
+    let guidance = SoccerFormationLpPlayerGuidance {
+        team: player.team,
+        player_id,
+        slot: player_id,
+        current: player.position,
+        target,
+        formation_anchor: player.home_position,
+        pressure_target: None,
+        recommended_move: target - player.position,
+        target_velocity,
+        target_acceleration: Vec2::zero(),
+        local_mpc_guidance: true,
+        recommended_move_yards: target.distance(player.position),
+        recommended_speed_yps: target_velocity.len(),
+        recommended_acceleration_yps2: 0.0,
+        formation_error_yards: target.distance(player.home_position),
+        movement_error_yards: target.distance(player.position),
+        pair_error_yards: 1.0,
+        role_line_error_yards: 0.0,
+        pressure_error_yards: 0.0,
+        fore_aft_speed_error_yps: 0.0,
+        pressure_weight: 1.0,
+        speed_match_weight: 1.0,
+        alignment_weight: 1.0,
+        reduced_cost_target_x: 0.0,
+        reduced_cost_target_y: 0.0,
+        solver_status: "optimal".to_string(),
+        solver_objective: 0.0,
+        solver_iterations: Some(1),
+        solver_elapsed_ms: 0.0,
+        variable_count: 1,
+        constraint_count: 1,
+    };
+    let guidance_store = match player.team {
+        Team::Home => &mut sim.central_brain.home_formation_lp.last_guidance,
+        Team::Away => &mut sim.central_brain.away_formation_lp.last_guidance,
+    };
+    guidance_store.retain(|entry| entry.player_id != player_id);
+    guidance_store.push(guidance);
+}
+
+fn off_ball_mpc_guidance_fixture(holder: usize, support: usize) -> SoccerMatch {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        formation_lp_enabled: true,
+        local_mpc_enabled: true,
+        mpc: SoccerMpcConfig {
+            tier2_player_enabled: true,
+            reconcile_enabled: true,
+            field_aware_enabled: false,
+            ..SoccerMpcConfig::default()
+        },
+        ..Default::default()
+    });
+    park_players_except(&mut sim, &[holder, support]);
+    sim.players[holder].team = Team::Home;
+    sim.players[holder].position = Vec2::new(40.0, 60.0);
+    sim.players[support].team = Team::Home;
+    sim.players[support].role = PlayerRole::Midfielder;
+    sim.players[support].position = Vec2::new(36.0, 59.0);
+    sim.players[support].home_position = sim.players[support].position;
+    sim.players[support].velocity = Vec2::zero();
+    sim.players[support].skills.acceleration = 9.0;
+    sim.players[support].skills.top_speed = 9.0;
+    sim.ball.holder = Some(holder);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim
+}
+
+#[test]
+fn off_ball_mpc_velocity_uses_lp_local_guidance() {
+    let support = 7usize;
+    let holder = 6usize;
+    let target = Vec2::new(36.0, 67.0);
+    let mut baseline = off_ball_mpc_guidance_fixture(holder, support);
+    let mut guided = off_ball_mpc_guidance_fixture(holder, support);
+    push_live_local_mpc_guidance(
+        &mut guided,
+        support,
+        Vec2::new(52.0, 67.0),
+        Vec2::new(8.0, 0.0),
+    );
+
+    let baseline_velocity = baseline
+        .mpc_desired_velocity(support, target, 7.5)
+        .expect("baseline off-ball MPC velocity");
+    let guided_velocity = guided
+        .mpc_desired_velocity(support, target, 7.5)
+        .expect("guided off-ball MPC velocity");
+
+    assert!(
+        guided_velocity.x > baseline_velocity.x + 0.03,
+        "LP-local guidance should bias off-ball MPC toward the refined slot velocity: baseline={baseline_velocity:?} guided={guided_velocity:?}"
+    );
+}
+
+#[test]
+fn off_ball_lp_mpc_reference_preserves_forward_support_depth() {
+    let support = 8usize;
+    let holder = 6usize;
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        formation_lp_enabled: true,
+        local_mpc_enabled: true,
+        ..Default::default()
+    });
+    park_players_except(&mut sim, &[holder, support]);
+    sim.players[holder].team = Team::Home;
+    sim.players[holder].position = Vec2::new(40.0, 60.0);
+    sim.players[support].team = Team::Home;
+    sim.players[support].role = PlayerRole::Midfielder;
+    sim.players[support].position = Vec2::new(38.0, 62.0);
+    sim.players[support].home_position = sim.players[support].position;
+    sim.ball.holder = Some(holder);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+    let forward_target = Vec2::new(38.0, 78.0);
+    push_live_local_mpc_guidance(
+        &mut sim,
+        support,
+        Vec2::new(46.0, 55.0),
+        Vec2::new(5.0, -2.0),
+    );
+
+    let (reference, velocity) = sim.mpc_off_ball_lp_reference(support, forward_target, 7.0);
+
+    assert!(
+        (reference.y - forward_target.y).abs() < 1e-9,
+        "LP should help off-ball MPC laterally/kinematically without dragging a forward support run backward: reference={reference:?}"
+    );
+    assert!(
+        velocity.is_some_and(|v| v.x > 0.0),
+        "the LP-refined velocity should still feed the off-ball MPC reference"
+    );
+}
+
+#[test]
+fn off_ball_lp_mpc_reference_pair_error_dampens_lateral_pull() {
+    let support = 8usize;
+    let holder = 6usize;
+    let policy_target = Vec2::new(38.0, 78.0);
+    let lp_target = Vec2::new(54.0, 78.0);
+
+    let mut clean_shape = off_ball_mpc_guidance_fixture(holder, support);
+    push_live_local_mpc_guidance(&mut clean_shape, support, lp_target, Vec2::new(5.0, 0.0));
+    if let Some(guidance) = clean_shape
+        .central_brain
+        .home_formation_lp
+        .last_guidance
+        .iter_mut()
+        .find(|guidance| guidance.player_id == support)
+    {
+        guidance.pair_error_yards = 0.0;
+    }
+    let (clean_reference, _) = clean_shape.mpc_off_ball_lp_reference(support, policy_target, 7.0);
+
+    let mut poor_shape = off_ball_mpc_guidance_fixture(holder, support);
+    push_live_local_mpc_guidance(&mut poor_shape, support, lp_target, Vec2::new(5.0, 0.0));
+    if let Some(guidance) = poor_shape
+        .central_brain
+        .home_formation_lp
+        .last_guidance
+        .iter_mut()
+        .find(|guidance| guidance.player_id == support)
+    {
+        guidance.pair_error_yards = 24.0;
+    }
+    let (poor_reference, _) = poor_shape.mpc_off_ball_lp_reference(support, policy_target, 7.0);
+
+    assert!(
+        clean_reference.x > poor_reference.x + 0.50,
+        "clean LP shape should pull the MPC reference laterally more than high pair-error guidance: clean={clean_reference:?} poor={poor_reference:?}"
+    );
+}
+
+#[test]
+fn off_ball_lp_mpc_reference_sanitizes_non_finite_guidance() {
+    let support = 8usize;
+    let holder = 6usize;
+    let policy_target = Vec2::new(38.0, 78.0);
+    let mut sim = off_ball_mpc_guidance_fixture(holder, support);
+    push_live_local_mpc_guidance(
+        &mut sim,
+        support,
+        Vec2::new(54.0, 78.0),
+        Vec2::new(f64::NAN, f64::INFINITY),
+    );
+    if let Some(guidance) = sim
+        .central_brain
+        .home_formation_lp
+        .last_guidance
+        .iter_mut()
+        .find(|guidance| guidance.player_id == support)
+    {
+        guidance.target = Vec2::new(f64::NAN, f64::INFINITY);
+        guidance.recommended_move_yards = f64::INFINITY;
+        guidance.recommended_speed_yps = f64::NAN;
+        guidance.pair_error_yards = f64::NAN;
+        guidance.pressure_weight = f64::NAN;
+        guidance.speed_match_weight = f64::NEG_INFINITY;
+        guidance.alignment_weight = f64::INFINITY;
+    }
+
+    let (reference, velocity) = sim.mpc_off_ball_lp_reference(support, policy_target, f64::NAN);
+
+    assert!(
+        reference.x.is_finite() && reference.y.is_finite(),
+        "non-finite LP guidance must never produce a non-finite MPC target: {reference:?}"
+    );
+    assert!(
+        velocity.is_none_or(|v| v.x.is_finite() && v.y.is_finite()),
+        "non-finite LP velocity guidance must sanitize before MPC reference construction: {velocity:?}"
+    );
+}
+
+#[test]
+fn off_ball_lp_mpc_reference_uses_same_team_guidance_when_duplicate_id_exists() {
+    let support = 8usize;
+    let holder = 6usize;
+    let policy_target = Vec2::new(36.0, 55.0);
+    let mut sim = off_ball_mpc_guidance_fixture(holder, support);
+    sim.players[holder].team = Team::Away;
+    sim.players[support].team = Team::Away;
+    sim.ball.holder = Some(holder);
+    sim.ball.last_touch_team = Some(Team::Away);
+    push_live_local_mpc_guidance(
+        &mut sim,
+        support,
+        Vec2::new(54.0, 55.0),
+        Vec2::new(4.0, 0.0),
+    );
+    let mut stale_home_duplicate = sim
+        .central_brain
+        .away_formation_lp
+        .last_guidance
+        .iter()
+        .find(|guidance| guidance.player_id == support)
+        .expect("valid away guidance")
+        .clone();
+    stale_home_duplicate.team = Team::Home;
+    stale_home_duplicate.local_mpc_guidance = false;
+    stale_home_duplicate.target = Vec2::new(5.0, 5.0);
+    sim.central_brain
+        .home_formation_lp
+        .last_guidance
+        .push(stale_home_duplicate);
+
+    let (reference, velocity) = sim.mpc_off_ball_lp_reference(support, policy_target, 7.0);
+
+    assert!(
+        reference.x > policy_target.x + 1.0,
+        "a stale wrong-team LP row must not shadow the valid same-team off-ball MPC guidance: reference={reference:?}"
+    );
+    assert!(
+        velocity.is_some_and(|v| v.x > 0.0),
+        "same-team LP velocity guidance should still reach the off-ball MPC reference"
+    );
 }
 
 #[test]
@@ -5523,6 +5796,86 @@ fn contested_pass_support_prefers_lp_in_position_runner() {
 }
 
 #[test]
+fn off_ball_support_option_scores_lift_lp_aligned_shape_targets() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let runner_index = sim
+        .players
+        .iter()
+        .position(|player| player.team == Team::Home && player.role == PlayerRole::Midfielder)
+        .expect("home midfielder");
+    let holder_index = sim
+        .players
+        .iter()
+        .position(|player| {
+            player.team == Team::Home
+                && player.id != sim.players[runner_index].id
+                && player.role != PlayerRole::Goalkeeper
+        })
+        .expect("home holder");
+    let runner_id = sim.players[runner_index].id;
+    let holder_id = sim.players[holder_index].id;
+    sim.players[runner_index].position = Vec2::new(35.0, 48.0);
+    sim.players[runner_index].home_position = Vec2::new(35.0, 50.0);
+    sim.players[holder_index].position = Vec2::new(40.0, 45.0);
+    sim.ball.holder = Some(holder_id);
+    sim.ball.position = sim.players[holder_index].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let support_target =
+        snapshot.open_space_for(runner_id, sim.players[runner_index].home_position);
+    let far_target_a = Vec2::new(2.0, 2.0);
+    let far_target_b = Vec2::new(snapshot.field_width - 2.0, snapshot.field_length - 2.0);
+    let far_target =
+        if support_target.distance(far_target_a) > support_target.distance(far_target_b) {
+            far_target_a
+        } else {
+            far_target_b
+        };
+
+    let mut aligned_snapshot = snapshot.clone();
+    push_stationary_mpc_guidance(&mut aligned_snapshot, runner_id, support_target);
+    if let Some(guidance) = aligned_snapshot
+        .formation_lp_guidance
+        .iter_mut()
+        .find(|guidance| guidance.player_id == runner_id)
+    {
+        guidance.speed_match_weight = 1.0;
+    }
+    let aligned_score = sim.players[runner_index]
+        .support_action_options(&aligned_snapshot)
+        .iter()
+        .find(|option| option.label == "support-shape")
+        .expect("support-shape option")
+        .score;
+
+    let mut misaligned_snapshot = snapshot;
+    push_stationary_mpc_guidance(&mut misaligned_snapshot, runner_id, far_target);
+    if let Some(guidance) = misaligned_snapshot
+        .formation_lp_guidance
+        .iter_mut()
+        .find(|guidance| guidance.player_id == runner_id)
+    {
+        guidance.local_mpc_guidance = false;
+        guidance.pair_error_yards = 12.0;
+        guidance.pressure_weight = 0.0;
+        guidance.speed_match_weight = 0.0;
+        guidance.alignment_weight = 0.0;
+    }
+    let misaligned_score = sim.players[runner_index]
+        .support_action_options(&misaligned_snapshot)
+        .iter()
+        .find(|option| option.label == "support-shape")
+        .expect("support-shape option")
+        .score;
+
+    assert!(
+        aligned_score > misaligned_score * 1.08,
+        "LP-aligned off-ball support shape should score higher: aligned={aligned_score:.3} misaligned={misaligned_score:.3}"
+    );
+}
+
+#[test]
 fn pass_anticipation_keeps_an_out_of_position_defender_in_shape() {
     // Same reachable defender, two different ideal positions. With an in-shape home it
     // jumps the pass; with an ideal far off the lane it declines so it is NOT dragged out
@@ -7851,6 +8204,8 @@ fn analytic_difference_reward_alignment_damps_bad_realized_dense_outcomes() {
         neural_mcts_candidate_count: 0,
         neural_mcts_discretized_kick_candidate_count: 0,
         neural_mcts_root_discretized_kick_candidate_count: 0,
+        neural_mcts_dribble_candidate_count: 0,
+        neural_mcts_root_dribble_candidate_count: 0,
         action: "pass2".to_string(),
     };
     let raw_positive = soccer_analytic_difference_reward(&decision);
@@ -24195,7 +24550,14 @@ fn defensive_line_gap_vs_ball_headless_sim() {
     } else {
         f64::NAN
     };
-    eprintln!("\nHALFWAY band [55,65): mean gap {hw_mean:.1}yd (n={hw_n})\n");
+    let hw_cmean = if hw_n > 0 {
+        hw_csum / hw_n as f64
+    } else {
+        f64::NAN
+    };
+    eprintln!(
+        "\nHALFWAY band [55,65): mean gap {hw_mean:.1}yd, central-two {hw_cmean:.1}yd (n={hw_n})\n"
+    );
 
     // The fix: at halfway the line must sit ~20-40yd from the ball, NOT ~45 (the
     // predicted-ball-collapse-onto-the-shelf bug). Allow live-play slack on the mean.
@@ -41616,6 +41978,65 @@ fn learning_context_splits_mdp_pomdp_idea_from_mpc_execution() {
     assert!(
         SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM)
     );
+}
+
+#[test]
+fn mpc_execution_quality_uses_action_specific_qp_signals() {
+    let poor_pass = SoccerDecisionContext {
+        chosen_action_mpc_feasibility: 0.90,
+        chosen_action_control_cost: 0.0,
+        pass_mpc_receipt_probability: 0.08,
+        pass_receipt_qp_accel_fit: 0.10,
+        pass_target_expected_completion: 0.16,
+        pass_lane_interception_risk: 0.92,
+        ..SoccerDecisionContext::default()
+    };
+    let good_pass = SoccerDecisionContext {
+        chosen_action_mpc_feasibility: 0.90,
+        chosen_action_control_cost: 0.10,
+        pass_mpc_receipt_probability: 0.88,
+        pass_receipt_qp_accel_fit: 0.85,
+        pass_target_expected_completion: 0.86,
+        pass_lane_interception_risk: 0.05,
+        ..SoccerDecisionContext::default()
+    };
+    let generic_feasible = SoccerDecisionContext {
+        chosen_action_mpc_feasibility: 0.90,
+        chosen_action_control_cost: 0.0,
+        ..SoccerDecisionContext::default()
+    };
+
+    let poor_quality = soccer_mpc_execution_quality_from_context("pass", &poor_pass);
+    let good_quality = soccer_mpc_execution_quality_from_context("pass", &good_pass);
+    let generic_quality = soccer_mpc_execution_quality_from_context("hold", &generic_feasible);
+
+    assert!(
+        poor_quality < 0.55,
+        "bad receipt/QP/lane signals should drag pass execution quality down: {poor_quality}"
+    );
+    assert!(
+        good_quality > poor_quality + 0.30,
+        "good pass execution signals should materially outrank bad ones: {poor_quality} vs {good_quality}"
+    );
+    assert!(
+        generic_quality > poor_quality + 0.25,
+        "action-specific pass quality must not collapse to coarse feasibility only"
+    );
+}
+
+#[test]
+fn decision_mpc_execution_horizon_is_long_enough_for_skill_quality() {
+    let default_horizon = decision_mpc_execution_horizon_seconds(DEFAULT_DT_SECONDS);
+    assert!(
+        (default_horizon - 2.0).abs() < 1e-9,
+        "default 30-tick decision MPC horizon should be about two seconds"
+    );
+    assert!(
+        default_horizon > 0.24,
+        "decision MPC horizon must not regress to the old two-tick cap"
+    );
+    assert!((decision_mpc_execution_horizon_seconds(0.01) - 0.80).abs() < 1e-9);
+    assert!((decision_mpc_execution_horizon_seconds(0.20) - 2.40).abs() < 1e-9);
 }
 
 #[test]
@@ -59486,6 +59907,8 @@ fn transition_reward_reinforces_completed_pass_into_future_stride() {
             neural_mcts_candidate_count: 0,
             neural_mcts_discretized_kick_candidate_count: 0,
             neural_mcts_root_discretized_kick_candidate_count: 0,
+            neural_mcts_dribble_candidate_count: 0,
+            neural_mcts_root_dribble_candidate_count: 0,
             action: "pass".to_string(),
         };
         soccer_transition_reward(

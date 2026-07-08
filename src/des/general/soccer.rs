@@ -8219,7 +8219,7 @@ pub struct SoccerDecisionContext {
     #[serde(default)]
     pub shot_mpc_goal_probability: f64,
     /// Whether learned MDP/POMDP picked a technical action that MPC deemed
-    /// effectively unexecutable and replaced with the best feasible candidate.
+    /// effectively unexecutable, returning control to a policy-ranked replacement.
     #[serde(default)]
     pub learned_mpc_replanned: bool,
     #[serde(default)]
@@ -8256,6 +8256,10 @@ pub struct SoccerDecisionContext {
     pub neural_mcts_discretized_kick_candidate_count: u32,
     #[serde(default)]
     pub neural_mcts_root_discretized_kick_candidate_count: u32,
+    #[serde(default)]
+    pub neural_mcts_dribble_candidate_count: u32,
+    #[serde(default)]
+    pub neural_mcts_root_dribble_candidate_count: u32,
     #[serde(default)]
     pub chosen_action_score: f64,
     #[serde(default)]
@@ -8401,6 +8405,10 @@ pub struct AgentDecisionTrace {
     pub neural_mcts_discretized_kick_candidate_count: u32,
     #[serde(default)]
     pub neural_mcts_root_discretized_kick_candidate_count: u32,
+    #[serde(default)]
+    pub neural_mcts_dribble_candidate_count: u32,
+    #[serde(default)]
+    pub neural_mcts_root_dribble_candidate_count: u32,
     pub action: String,
 }
 
@@ -8931,10 +8939,54 @@ fn soccer_mdp_pomdp_idea_quality_from_option_context(
     (best_fit * 0.54 + margin_fit * 0.28 + probability_fit * 0.18).clamp(0.0, 1.0)
 }
 
-fn soccer_mpc_execution_quality_from_context(context: &SoccerDecisionContext) -> f64 {
+fn soccer_mpc_execution_quality_from_context(action: &str, context: &SoccerDecisionContext) -> f64 {
+    let action_specific = soccer_action_mpc_execution_signal_from_context(action, context);
     let feasibility = finite_unit_interval(context.chosen_action_mpc_feasibility);
+    let traced_execution = if context.execution_mpc_guidance_present {
+        finite_unit_interval(context.execution_mpc_probability)
+    } else {
+        action_specific
+    };
     let low_cost_fit = 1.0 - finite_unit_interval(context.chosen_action_control_cost);
-    (feasibility * 0.70 + low_cost_fit * 0.30).clamp(0.0, 1.0)
+    let horizon_fit = if context.execution_mpc_guidance_present {
+        (soccer_finite_nonnegative_metric(context.execution_mpc_horizon_seconds) / 2.0)
+            .clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    ((feasibility * 0.38 + action_specific * 0.34 + traced_execution * 0.18 + low_cost_fit * 0.10)
+        * (0.82 + horizon_fit * 0.18))
+        .clamp(0.0, 1.0)
+}
+
+fn soccer_action_mpc_execution_signal_from_context(
+    action: &str,
+    context: &SoccerDecisionContext,
+) -> f64 {
+    let action = normalize_soccer_action_label(action);
+    if is_pass_like_action(action) {
+        let receipt = finite_unit_interval(context.pass_mpc_receipt_probability);
+        let qp_fit = finite_unit_interval(context.pass_receipt_qp_accel_fit);
+        let completion = finite_unit_interval(context.pass_target_expected_completion);
+        let lane_fit = 1.0 - finite_unit_interval(context.pass_lane_interception_risk);
+        (receipt * 0.46 + qp_fit * 0.22 + completion * 0.22 + lane_fit * 0.10).clamp(0.0, 1.0)
+    } else if is_dribble_action_label(action) {
+        let control = finite_unit_interval(context.dribble_mpc_control_probability);
+        let qp_fit = finite_unit_interval(context.dribble_mpc_qp_accel_fit);
+        let space_fit = (soccer_finite_nonnegative_metric(context.dribble_mpc_space_margin_yards)
+            / 8.0)
+            .clamp(0.0, 1.0);
+        (control * 0.64 + qp_fit * 0.24 + space_fit * 0.12).clamp(0.0, 1.0)
+    } else if matches!(action, "shoot" | "first-time-shot" | "first-time-header") {
+        let accuracy = finite_unit_interval(context.shot_mpc_accuracy_probability);
+        let qp_fit = finite_unit_interval(context.shot_mpc_qp_target_fit);
+        let goal = finite_unit_interval(context.shot_mpc_goal_probability);
+        (accuracy * 0.50 + qp_fit * 0.22 + goal * 0.28).clamp(0.0, 1.0)
+    } else if context.execution_mpc_guidance_present {
+        finite_unit_interval(context.execution_mpc_probability)
+    } else {
+        finite_unit_interval(context.chosen_action_mpc_feasibility)
+    }
 }
 
 fn soccer_update_idea_execution_attribution(context: &mut SoccerDecisionContext, available: bool) {
@@ -13263,7 +13315,6 @@ impl SoccerQPolicy {
                 };
                 let score = learned_score * learned_weight
                     + quality.expected_completion * 0.82
-                    + quality.mpc_receipt_probability * 0.52
                     + quality.stride_fit * 0.22
                     + quality.receiver_openness * 0.20;
                 let concedes = snapshot.pass_target_concedes_to_perceived_opponent(
@@ -18208,6 +18259,38 @@ fn finite_unit_interval(value: f64) -> f64 {
     }
 }
 
+pub(crate) fn formation_lp_support_target_fit(
+    guidance: &SoccerFormationLpPlayerGuidance,
+    target: Vec2,
+) -> f64 {
+    let target_fit = if target.x.is_finite()
+        && target.y.is_finite()
+        && guidance.target.x.is_finite()
+        && guidance.target.y.is_finite()
+    {
+        (1.0 - target.distance(guidance.target) / 16.0).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let pair_fit =
+        (1.0 - soccer_finite_nonnegative_metric(guidance.pair_error_yards) / 8.0).clamp(0.0, 1.0);
+    let pressure_fit = finite_unit_interval(guidance.pressure_weight);
+    let speed_fit = finite_unit_interval(guidance.speed_match_weight);
+    let alignment_fit = finite_unit_interval(guidance.alignment_weight / 1.6);
+    let local_mpc_fit = if guidance.local_mpc_guidance {
+        1.0
+    } else {
+        0.0
+    };
+    (target_fit * 0.46
+        + pair_fit * 0.16
+        + pressure_fit * 0.11
+        + speed_fit * 0.09
+        + local_mpc_fit * 0.12
+        + alignment_fit * 0.06)
+        .clamp(0.0, 1.0)
+}
+
 fn default_soccer_mpc_player_horizon() -> usize {
     // ~2.0 s of lookahead at the 15 Hz default tick (30 × 1/15). Long enough to
     // bend around nearby traffic and brake into a target, short enough that
@@ -18980,9 +19063,17 @@ pub struct MatchStats {
     #[serde(default)]
     pub neural_mcts_root_discretized_kick_candidates: u32,
     #[serde(default)]
+    pub neural_mcts_dribble_candidates: u32,
+    #[serde(default)]
+    pub neural_mcts_root_dribble_candidates: u32,
+    #[serde(default)]
     pub neural_mcts_discretized_kick_candidate_sets: u32,
     #[serde(default)]
     pub neural_mcts_root_discretized_kick_candidate_sets: u32,
+    #[serde(default)]
+    pub neural_mcts_dribble_candidate_sets: u32,
+    #[serde(default)]
+    pub neural_mcts_root_dribble_candidate_sets: u32,
     #[serde(default)]
     pub learned_mpc_replans: u32,
     #[serde(default)]
@@ -19065,12 +19156,20 @@ pub struct SoccerPlanningValidationStats {
     pub neural_mcts_candidates: u32,
     pub neural_mcts_discretized_kick_candidates: u32,
     pub neural_mcts_root_discretized_kick_candidates: u32,
+    pub neural_mcts_dribble_candidates: u32,
+    pub neural_mcts_root_dribble_candidates: u32,
     pub neural_mcts_discretized_kick_candidate_sets: u32,
     pub neural_mcts_root_discretized_kick_candidate_sets: u32,
+    pub neural_mcts_dribble_candidate_sets: u32,
+    pub neural_mcts_root_dribble_candidate_sets: u32,
     pub neural_mcts_discretized_kick_candidate_share: f64,
     pub neural_mcts_root_discretized_kick_candidate_share: f64,
+    pub neural_mcts_dribble_candidate_share: f64,
+    pub neural_mcts_root_dribble_candidate_share: f64,
     pub neural_mcts_discretized_kick_candidate_set_rate: f64,
     pub neural_mcts_root_discretized_kick_candidate_set_rate: f64,
+    pub neural_mcts_dribble_candidate_set_rate: f64,
+    pub neural_mcts_root_dribble_candidate_set_rate: f64,
     pub learned_mpc_replans: u32,
     pub learned_mpc_replan_rate: f64,
     pub learned_mpc_replans_mpc: u32,
@@ -19214,10 +19313,14 @@ impl MatchStats {
             neural_mcts_discretized_kick_candidates: self.neural_mcts_discretized_kick_candidates,
             neural_mcts_root_discretized_kick_candidates: self
                 .neural_mcts_root_discretized_kick_candidates,
+            neural_mcts_dribble_candidates: self.neural_mcts_dribble_candidates,
+            neural_mcts_root_dribble_candidates: self.neural_mcts_root_dribble_candidates,
             neural_mcts_discretized_kick_candidate_sets: self
                 .neural_mcts_discretized_kick_candidate_sets,
             neural_mcts_root_discretized_kick_candidate_sets: self
                 .neural_mcts_root_discretized_kick_candidate_sets,
+            neural_mcts_dribble_candidate_sets: self.neural_mcts_dribble_candidate_sets,
+            neural_mcts_root_dribble_candidate_sets: self.neural_mcts_root_dribble_candidate_sets,
             neural_mcts_discretized_kick_candidate_share: self
                 .neural_mcts_discretized_kick_candidates
                 as f64
@@ -19226,12 +19329,23 @@ impl MatchStats {
                 .neural_mcts_root_discretized_kick_candidates
                 as f64
                 / neural_mcts_candidates as f64,
+            neural_mcts_dribble_candidate_share: self.neural_mcts_dribble_candidates as f64
+                / neural_mcts_candidates as f64,
+            neural_mcts_root_dribble_candidate_share: self.neural_mcts_root_dribble_candidates
+                as f64
+                / neural_mcts_candidates as f64,
             neural_mcts_discretized_kick_candidate_set_rate: self
                 .neural_mcts_discretized_kick_candidate_sets
                 as f64
                 / neural_mcts_candidate_sets as f64,
             neural_mcts_root_discretized_kick_candidate_set_rate: self
                 .neural_mcts_root_discretized_kick_candidate_sets
+                as f64
+                / neural_mcts_candidate_sets as f64,
+            neural_mcts_dribble_candidate_set_rate: self.neural_mcts_dribble_candidate_sets as f64
+                / neural_mcts_candidate_sets as f64,
+            neural_mcts_root_dribble_candidate_set_rate: self
+                .neural_mcts_root_dribble_candidate_sets
                 as f64
                 / neural_mcts_candidate_sets as f64,
             learned_mpc_replans: self.learned_mpc_replans,
@@ -24168,6 +24282,8 @@ fn soccer_decision_context_for(
         neural_mcts_candidate_count: 0,
         neural_mcts_discretized_kick_candidate_count: 0,
         neural_mcts_root_discretized_kick_candidate_count: 0,
+        neural_mcts_dribble_candidate_count: 0,
+        neural_mcts_root_dribble_candidate_count: 0,
         chosen_action_score: 0.0,
         best_legal_action_score: 0.0,
         action_score_margin: 0.0,
@@ -24245,6 +24361,9 @@ fn soccer_decision_context_with_trace(
         decision.neural_mcts_discretized_kick_candidate_count;
     context.neural_mcts_root_discretized_kick_candidate_count =
         decision.neural_mcts_root_discretized_kick_candidate_count;
+    context.neural_mcts_dribble_candidate_count = decision.neural_mcts_dribble_candidate_count;
+    context.neural_mcts_root_dribble_candidate_count =
+        decision.neural_mcts_root_dribble_candidate_count;
     let option_context =
         soccer_action_option_learning_context(&decision.action, &decision.action_options);
     context.action_option_count = option_context.action_option_count;
@@ -24307,7 +24426,8 @@ fn soccer_decision_context_with_trace(
         option_context.action_option_count > 0 && option_context.legal_action_option_count > 0;
     context.mdp_pomdp_idea_quality =
         soccer_mdp_pomdp_idea_quality_from_option_context(&option_context);
-    context.mpc_execution_quality = soccer_mpc_execution_quality_from_context(&context);
+    context.mpc_execution_quality =
+        soccer_mpc_execution_quality_from_context(&decision.action, &context);
     soccer_update_idea_execution_attribution(&mut context, attribution_available);
     context
 }
@@ -52178,6 +52298,8 @@ pub fn soccer_tracking_dataset_to_learning_dataset(
                 neural_mcts_candidate_count: 0,
                 neural_mcts_discretized_kick_candidate_count: 0,
                 neural_mcts_root_discretized_kick_candidate_count: 0,
+                neural_mcts_dribble_candidate_count: 0,
+                neural_mcts_root_dribble_candidate_count: 0,
                 action,
             };
             let player_agent = player_agent_from_snapshot(player);
@@ -56137,6 +56259,8 @@ fn soccer_moment_replay_transition(
             neural_mcts_candidate_count: 0,
             neural_mcts_discretized_kick_candidate_count: 0,
             neural_mcts_root_discretized_kick_candidate_count: 0,
+            neural_mcts_dribble_candidate_count: 0,
+            neural_mcts_root_dribble_candidate_count: 0,
             action: action.clone(),
         },
         &before,

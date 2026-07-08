@@ -44,6 +44,9 @@ const NEURAL_MCTS_MIN_DRIBBLE_ROOT_CANDIDATES: usize = 0;
 const NEURAL_MCTS_FAMILY_FLOOR_MAX_SCORE_REGRESSION: f64 = 3.0;
 const NEURAL_MCTS_TECHNICAL_SELECTION_FLOOR: f64 = 0.0;
 const NEURAL_MCTS_TECHNICAL_SELECTION_MAX_SCORE_REGRESSION: f64 = 2.0;
+const NEURAL_MCTS_DRIBBLE_SELECTION_FLOOR: f64 = 0.0;
+const NEURAL_MCTS_DRIBBLE_SELECTION_MAX_SCORE_REGRESSION: f64 = 2.5;
+const NEURAL_MCTS_DRIBBLE_DIAGNOSTIC_INTERVAL: u64 = 0;
 const NEURAL_MCTS_PITCH_VALUE_CANDIDATE_WEIGHT: f64 = 1.50;
 const NEURAL_MCTS_PITCH_VALUE_COUNTER_WEIGHT: f64 = 0.85;
 const SOCCER_CENTERED_POLICY_BONUS_CLIP: f64 = 0.45;
@@ -378,6 +381,44 @@ fn neural_mcts_technical_selection_max_score_regression() -> f64 {
         0.0,
         16.0,
     )
+}
+
+fn neural_mcts_dribble_selection_floor() -> f64 {
+    learned_mpc_metric_env(
+        "SOCCER_NEURAL_MCTS_DRIBBLE_SELECTION_FLOOR",
+        NEURAL_MCTS_DRIBBLE_SELECTION_FLOOR,
+        0.0,
+        0.25,
+    )
+}
+
+fn neural_mcts_dribble_selection_max_score_regression() -> f64 {
+    learned_mpc_metric_env(
+        "SOCCER_NEURAL_MCTS_DRIBBLE_SELECTION_MAX_SCORE_REGRESSION",
+        NEURAL_MCTS_DRIBBLE_SELECTION_MAX_SCORE_REGRESSION,
+        0.0,
+        16.0,
+    )
+}
+
+fn neural_mcts_dribble_diagnostic_interval() -> u64 {
+    let read = || {
+        std::env::var("SOCCER_NEURAL_MCTS_DRIBBLE_DIAGNOSTIC_INTERVAL")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .unwrap_or(NEURAL_MCTS_DRIBBLE_DIAGNOSTIC_INTERVAL)
+            .min(1_000_000)
+    };
+    #[cfg(test)]
+    {
+        read()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<u64> = OnceLock::new();
+        *V.get_or_init(read)
+    }
 }
 
 fn neural_mcts_pitch_value_candidate_weight() -> f64 {
@@ -1803,6 +1844,8 @@ struct SoccerPolicyActionChoice {
     neural_mcts_candidate_count: u32,
     neural_mcts_discretized_kick_candidate_count: u32,
     neural_mcts_root_discretized_kick_candidate_count: u32,
+    neural_mcts_dribble_candidate_count: u32,
+    neural_mcts_root_dribble_candidate_count: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1814,6 +1857,8 @@ struct SoccerLearnedDecisionPlan {
     neural_mcts_candidate_count: u32,
     neural_mcts_discretized_kick_candidate_count: u32,
     neural_mcts_root_discretized_kick_candidate_count: u32,
+    neural_mcts_dribble_candidate_count: u32,
+    neural_mcts_root_dribble_candidate_count: u32,
 }
 
 fn soccer_policy_rank_draw(seed: u32, tick: u64, player_id: usize, salt: u64) -> f64 {
@@ -1988,6 +2033,8 @@ fn soccer_policy_uncertainty_weighted_ranked_action_choice(
             neural_mcts_candidate_count: 0,
             neural_mcts_discretized_kick_candidate_count: 0,
             neural_mcts_root_discretized_kick_candidate_count: 0,
+            neural_mcts_dribble_candidate_count: 0,
+            neural_mcts_root_dribble_candidate_count: 0,
         });
     }
     let mut threshold = draw.clamp(0.0, 1.0 - f64::EPSILON) * total;
@@ -2008,6 +2055,8 @@ fn soccer_policy_uncertainty_weighted_ranked_action_choice(
         neural_mcts_candidate_count: 0,
         neural_mcts_discretized_kick_candidate_count: 0,
         neural_mcts_root_discretized_kick_candidate_count: 0,
+        neural_mcts_dribble_candidate_count: 0,
+        neural_mcts_root_dribble_candidate_count: 0,
     })
 }
 
@@ -2564,6 +2613,58 @@ mod tests {
             backward_path_traffic_risk,
             long_aerial_bounds_risk,
             ..PassTargetQuality::default()
+        }
+    }
+
+    fn world_test_lp_guidance(
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        target: Vec2,
+        local_mpc_guidance: bool,
+        pair_error_yards: f64,
+        pressure_weight: f64,
+        speed_match_weight: f64,
+        alignment_weight: f64,
+    ) -> SoccerFormationLpPlayerGuidance {
+        let player = snapshot
+            .players
+            .iter()
+            .find(|player| player.id == player_id)
+            .expect("player for LP guidance");
+        let current = snapshot.player_snapshot_position(player);
+        let recommended_move = target - current;
+        SoccerFormationLpPlayerGuidance {
+            team: player.team,
+            player_id,
+            slot: player_id,
+            current,
+            target,
+            formation_anchor: player.home_position,
+            pressure_target: None,
+            recommended_move,
+            target_velocity: Vec2::zero(),
+            target_acceleration: Vec2::zero(),
+            local_mpc_guidance,
+            recommended_move_yards: recommended_move.len(),
+            recommended_speed_yps: 0.0,
+            recommended_acceleration_yps2: 0.0,
+            formation_error_yards: 0.0,
+            movement_error_yards: 0.0,
+            pair_error_yards,
+            role_line_error_yards: 0.0,
+            pressure_error_yards: 0.0,
+            fore_aft_speed_error_yps: 0.0,
+            pressure_weight,
+            speed_match_weight,
+            alignment_weight,
+            reduced_cost_target_x: 0.0,
+            reduced_cost_target_y: 0.0,
+            solver_status: "test".to_string(),
+            solver_objective: 0.0,
+            solver_iterations: Some(1),
+            solver_elapsed_ms: 0.0,
+            variable_count: 1,
+            constraint_count: 1,
         }
     }
 
@@ -4008,6 +4109,8 @@ mod tests {
             neural_mcts_candidate_count: 0,
             neural_mcts_discretized_kick_candidate_count: 0,
             neural_mcts_root_discretized_kick_candidate_count: 0,
+            neural_mcts_dribble_candidate_count: 0,
+            neural_mcts_root_dribble_candidate_count: 0,
             action: "pass".to_string(),
         };
 
@@ -4053,6 +4156,8 @@ mod tests {
             neural_mcts_candidate_count: 0,
             neural_mcts_discretized_kick_candidate_count: 0,
             neural_mcts_root_discretized_kick_candidate_count: 0,
+            neural_mcts_dribble_candidate_count: 0,
+            neural_mcts_root_dribble_candidate_count: 0,
             action: "pass2".to_string(),
         };
 
@@ -4143,7 +4248,7 @@ mod tests {
     }
 
     #[test]
-    fn neural_mcts_stamp_counts_only_the_executed_action_family() {
+    fn neural_mcts_stamp_keeps_candidates_visible_when_action_reconciles() {
         let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
         let snapshot = WorldSnapshot::from_match(&sim);
         let player = &sim.players[0];
@@ -4165,6 +4270,8 @@ mod tests {
             neural_mcts_candidate_count: 0,
             neural_mcts_discretized_kick_candidate_count: 0,
             neural_mcts_root_discretized_kick_candidate_count: 0,
+            neural_mcts_dribble_candidate_count: 0,
+            neural_mcts_root_dribble_candidate_count: 0,
             action: "aerial-pass".to_string(),
         });
 
@@ -4175,13 +4282,17 @@ mod tests {
             16,
             3,
             2,
+            4,
+            1,
         );
         let decision = sim.players[0]
             .last_decision
             .as_ref()
             .expect("decision trace");
         assert!(!decision.neural_mcts_selected);
-        assert_eq!(decision.neural_mcts_candidate_count, 0);
+        assert_eq!(decision.neural_mcts_candidate_count, 16);
+        assert_eq!(decision.neural_mcts_dribble_candidate_count, 4);
+        assert_eq!(decision.neural_mcts_root_dribble_candidate_count, 1);
 
         SoccerMatch::stamp_neural_mcts_selection(
             &mut sim.players[0],
@@ -4190,6 +4301,8 @@ mod tests {
             16,
             3,
             2,
+            4,
+            1,
         );
         let decision = sim.players[0]
             .last_decision
@@ -4202,6 +4315,8 @@ mod tests {
             decision.neural_mcts_root_discretized_kick_candidate_count,
             2
         );
+        assert_eq!(decision.neural_mcts_dribble_candidate_count, 4);
+        assert_eq!(decision.neural_mcts_root_dribble_candidate_count, 1);
     }
 
     #[test]
@@ -4217,6 +4332,430 @@ mod tests {
         assert!((pass2_context.chosen_action_score - 0.35).abs() < 1e-9);
         assert!(pass1_context.action_score_margin > 0.0);
         assert!(pass2_context.action_score_margin < 0.0);
+    }
+
+    #[test]
+    fn learned_plan_for_policy_preserves_ranked_pass_receiver_choice() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let actor = sim
+            .players
+            .iter()
+            .position(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home field player");
+        let actor_id = sim.players[actor].id;
+        sim.players[actor].position = Vec2::new(40.0, 44.0);
+        sim.ball.holder = Some(actor_id);
+        sim.ball.position = sim.players[actor].position;
+
+        for (slot, position) in [
+            Vec2::new(46.0, 55.0),
+            Vec2::new(34.0, 58.0),
+            Vec2::new(51.0, 64.0),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let teammate = sim
+                .players
+                .iter()
+                .enumerate()
+                .filter(|(_, player)| {
+                    player.team == Team::Home
+                        && player.id != actor_id
+                        && player.role != PlayerRole::Goalkeeper
+                })
+                .nth(slot)
+                .map(|(index, _)| index)
+                .expect("same-team pass target");
+            sim.players[teammate].position = *position;
+            sim.players[teammate].velocity = Vec2::zero();
+        }
+
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let ranked_targets = snapshot.ranked_visible_pass_targets(actor_id, 3);
+        assert!(
+            ranked_targets.len() >= 2,
+            "fixture needs at least two ranked pass targets, got {:?}",
+            ranked_targets
+        );
+        let expected_second = ranked_targets[1];
+        let policy = SoccerQPolicy::default();
+
+        let pass2 =
+            SoccerMatch::learned_plan_for_policy(&policy, &snapshot, actor_id, "pass2".to_string());
+        assert_eq!(pass2.target_player, Some(expected_second));
+        assert_eq!(
+            pass2.target_point,
+            snapshot.player_position(expected_second)
+        );
+
+        let pass2_bucket = SoccerMatch::learned_plan_for_policy(
+            &policy,
+            &snapshot,
+            actor_id,
+            "pass2-kp7".to_string(),
+        );
+        assert_eq!(pass2_bucket.target_player, Some(expected_second));
+        assert_eq!(
+            SoccerMatch::learned_ranked_pass_target_for_policy(
+                "aerial-pass3-kp7",
+                PassFlight::Aerial,
+                &[101, 202, 303],
+            ),
+            Some(303)
+        );
+    }
+
+    #[test]
+    fn mpc_replan_reselects_different_ranked_pass_target() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let actor = sim
+            .players
+            .iter()
+            .position(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home field player");
+        let actor_id = sim.players[actor].id;
+        sim.players[actor].position = Vec2::new(40.0, 52.0);
+        sim.ball.holder = Some(actor_id);
+        sim.ball.position = sim.players[actor].position;
+        sim.ball.last_touch_team = Some(Team::Home);
+        for (index, player) in sim.players.iter_mut().enumerate() {
+            player.velocity = Vec2::zero();
+            if player.team == Team::Away {
+                player.position = Vec2::new(6.0 + index as f64 * 0.4, 12.0);
+            }
+        }
+
+        let targets = sim
+            .players
+            .iter()
+            .enumerate()
+            .filter(|(_, player)| {
+                player.team == Team::Home
+                    && player.id != actor_id
+                    && player.role != PlayerRole::Goalkeeper
+            })
+            .map(|(index, _)| index)
+            .take(2)
+            .collect::<Vec<_>>();
+        assert_eq!(targets.len(), 2, "need two same-team pass targets");
+        for (slot, target) in targets.iter().copied().enumerate() {
+            sim.players[target].position = Vec2::new(36.0 + slot as f64 * 7.0, 58.0);
+        }
+
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let ranked_targets = snapshot.ranked_visible_pass_targets(actor_id, 3);
+        assert!(
+            ranked_targets.len() >= 2,
+            "fixture needs at least two ranked pass targets, got {:?}",
+            ranked_targets
+        );
+        let expected_replacement_target = ranked_targets[1];
+        let player = snapshot
+            .players
+            .iter()
+            .find(|player| player.id == actor_id)
+            .expect("actor snapshot");
+        let state = SoccerQStateKey::from_parts(
+            &snapshot.mdp_state_for_player(actor_id),
+            &snapshot.observation_for(actor_id),
+            player.team,
+            player.role,
+        );
+        let mut policy = SoccerQPolicy::default();
+        assert!(policy.insert_q_value(
+            SoccerQActionKey {
+                state: state.clone(),
+                action: "pass1".to_string(),
+            },
+            10.0,
+        ));
+        assert!(policy.insert_q_value(
+            SoccerQActionKey {
+                state: state.clone(),
+                action: "pass2".to_string(),
+            },
+            8.0,
+        ));
+        let replacement_plan =
+            SoccerMatch::learned_plan_for_policy(&policy, &snapshot, actor_id, "pass2".to_string());
+        assert_eq!(
+            replacement_plan.target_player,
+            Some(expected_replacement_target)
+        );
+        assert!(
+            !SoccerMatch::learned_plan_needs_mpc_replan(&snapshot, actor_id, &replacement_plan),
+            "fixture replacement pass should be executable enough for MPC"
+        );
+
+        let rejected_pass = SoccerLearnedPlan {
+            action: "pass1".to_string(),
+            target_player: None,
+            target_point: None,
+            mpc_replan: None,
+        };
+        assert!(
+            SoccerMatch::learned_plan_needs_mpc_replan(&snapshot, actor_id, &rejected_pass),
+            "an un-targeted pass decision must kick back from MPC"
+        );
+
+        let replanned =
+            SoccerMatch::mpc_reconciled_learned_plan(&policy, &snapshot, actor_id, rejected_pass);
+        assert_eq!(replanned.action, "pass2");
+        assert_eq!(
+            replanned.target_player,
+            Some(expected_replacement_target),
+            "MPC rejection should return to POMDP/ranked choice, not retry pass1"
+        );
+        let trace = replanned.mpc_replan.expect("replacement should be traced");
+        assert_eq!(trace.original_action, "pass1");
+        assert_eq!(trace.replacement_action, "pass2");
+        assert!(matches!(trace.source, SoccerLearnedMpcReplanSource::Mpc));
+        assert_eq!(trace.candidate_count, 1);
+    }
+
+    #[test]
+    fn goalkeeper_mpc_play_out_plan_keeps_preferred_receiver_exclusive() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            dt_seconds: 0.1,
+            seed: 94,
+            ..Default::default()
+        });
+        let keeper = sim
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home && player.role == PlayerRole::Goalkeeper)
+            .expect("home keeper")
+            .id;
+        let open_mate = sim
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home teammate")
+            .id;
+        let width = sim.config.field_width_yards;
+        let keeper_pos = Vec2::new(width * 0.5, 22.0);
+        let mate_pos = Vec2::new(width * 0.22, 39.0);
+        for player in sim.players.iter_mut() {
+            if player.team == Team::Home && player.role != PlayerRole::Goalkeeper {
+                player.position = Vec2::new(width * 0.5, 8.0 + player.id as f64 * 0.05);
+                player.velocity = Vec2::zero();
+            } else if player.team == Team::Away {
+                player.position = Vec2::new(width * 0.78, 96.0 + player.id as f64 * 0.05);
+                player.velocity = Vec2::zero();
+            }
+        }
+        sim.players[keeper].position = keeper_pos;
+        sim.players[open_mate].position = mate_pos;
+        sim.players[open_mate].velocity = Vec2::new(0.0, 1.0);
+        sim.ball.holder = Some(keeper);
+        sim.ball.position = keeper_pos;
+
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let preferred_plan = snapshot
+            .goalkeeper_mpc_play_out_plan(keeper, Some(open_mate))
+            .expect("open preferred teammate should be playable");
+        assert_eq!(preferred_plan.target_player, Some(open_mate));
+
+        let impossible_preferred = snapshot
+            .goalkeeper_mpc_play_out_plan(keeper, Some(keeper))
+            .expect(
+                "keeper should fall back to a clearance when the preferred receiver is invalid",
+            );
+        assert_eq!(impossible_preferred.target_player, None);
+        assert_eq!(impossible_preferred.label, "keeper-mpc-clearance");
+    }
+
+    #[test]
+    fn mpc_rejected_pomdp_pass_replans_through_pomdp_policy_action() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let actor = sim
+            .players
+            .iter()
+            .position(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home field player");
+        let actor_id = sim.players[actor].id;
+        let actor_team = sim.players[actor].team;
+        let actor_role = sim.players[actor].role;
+        let target_index = sim
+            .players
+            .iter()
+            .position(|player| {
+                player.team == actor_team
+                    && player.id != actor_id
+                    && player.role != PlayerRole::Goalkeeper
+            })
+            .expect("same-team pass target");
+        let target = sim.players[target_index].id;
+        let opponent_index = sim
+            .players
+            .iter()
+            .position(|player| player.team != actor_team)
+            .expect("opponent");
+        let actor_position = Vec2::new(40.0, 44.0);
+        let impossible_touch_point = actor_position + Vec2::new(0.4, 0.0);
+        sim.players[actor].position = actor_position;
+        sim.players[target_index].position = Vec2::new(12.0, 108.0);
+        sim.players[target_index].velocity = Vec2::zero();
+        sim.players[opponent_index].position = impossible_touch_point;
+        sim.players[opponent_index].velocity = Vec2::zero();
+        sim.ball.holder = Some(actor_id);
+        sim.ball.position = sim.players[actor].position;
+
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let state = SoccerQStateKey::from_parts(
+            &snapshot.mdp_state_for_player(actor_id),
+            &snapshot.observation_for(actor_id),
+            actor_team,
+            actor_role,
+        );
+        let mut policy = SoccerQPolicy::default();
+        let pass_key = SoccerQActionKey {
+            state: state.clone(),
+            action: "pass2".to_string(),
+        };
+        assert!(policy.insert_q_value(pass_key.clone(), 10.0));
+        policy.visits.insert(pass_key, 3);
+        let clearance_key = SoccerQActionKey {
+            state,
+            action: "clearance".to_string(),
+        };
+        assert!(policy.insert_q_value(clearance_key.clone(), 8.0));
+        policy.visits.insert(clearance_key, 2);
+
+        let impossible_pass = SoccerLearnedPlan {
+            action: "pass2".to_string(),
+            target_player: Some(target),
+            target_point: Some(impossible_touch_point),
+            mpc_replan: None,
+        };
+        assert!(
+            SoccerMatch::learned_plan_needs_mpc_replan(&snapshot, actor_id, &impossible_pass),
+            "MPC should reject the POMDP-selected receiver/point as unexecutable"
+        );
+
+        let reconciled =
+            SoccerMatch::mpc_reconciled_learned_plan(&policy, &snapshot, actor_id, impossible_pass);
+        assert_eq!(reconciled.action, "clearance");
+        assert_eq!(reconciled.target_player, None);
+        let replan = reconciled
+            .mpc_replan
+            .as_ref()
+            .expect("MPC rejection should be recorded as a replan trace");
+        assert_eq!(replan.original_action, "pass2");
+        assert_eq!(replan.replacement_action, "clearance");
+        assert_eq!(replan.source, SoccerLearnedMpcReplanSource::Mpc);
+    }
+
+    #[test]
+    fn mpc_rejected_pomdp_dribble_target_replans_through_pomdp_policy_action() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let actor = sim
+            .players
+            .iter()
+            .position(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home field player");
+        let actor_id = sim.players[actor].id;
+        let actor_team = sim.players[actor].team;
+        let actor_role = sim.players[actor].role;
+        let opponent_indices = sim
+            .players
+            .iter()
+            .enumerate()
+            .filter(|(_, player)| player.team != actor_team)
+            .map(|(index, _)| index)
+            .take(5)
+            .collect::<Vec<_>>();
+        assert_eq!(opponent_indices.len(), 5, "need dribble path blockers");
+
+        let actor_position = Vec2::new(40.0, 44.0);
+        let impossible_dribble_target = Vec2::new(40.0, 78.0);
+        for player in sim.players.iter_mut() {
+            player.velocity = Vec2::zero();
+        }
+        sim.players[actor].position = actor_position;
+        sim.players[actor].home_position = actor_position;
+        sim.players[actor].velocity = Vec2::zero();
+        sim.players[actor].fatigue = 1.0;
+        sim.players[actor].skills.dribbling = 0.0;
+        sim.players[actor].skills.first_touch = 0.0;
+        sim.players[actor].skills.acceleration = 0.0;
+        sim.players[actor].skills.top_speed = 0.0;
+        sim.players[actor].skills.stamina = 0.0;
+        sim.players[actor].skills.strength = 0.0;
+        for (index, position) in opponent_indices.iter().copied().zip([
+            actor_position + Vec2::new(0.1, 0.1),
+            actor_position + Vec2::new(0.0, 8.0),
+            actor_position + Vec2::new(0.0, 18.0),
+            actor_position + Vec2::new(0.0, 28.0),
+            impossible_dribble_target,
+        ]) {
+            sim.players[index].position = position;
+            sim.players[index].velocity = Vec2::zero();
+            sim.players[index].skills.acceleration = 9.8;
+            sim.players[index].skills.top_speed = 9.8;
+        }
+        sim.ball.holder = Some(actor_id);
+        sim.ball.position = actor_position;
+        sim.ball.last_touch_team = Some(actor_team);
+
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let state = SoccerQStateKey::from_parts(
+            &snapshot.mdp_state_for_player(actor_id),
+            &snapshot.observation_for(actor_id),
+            actor_team,
+            actor_role,
+        );
+        let mut policy = SoccerQPolicy::default();
+        let dribble_key = SoccerQActionKey {
+            state: state.clone(),
+            action: "carry-forward".to_string(),
+        };
+        assert!(policy.insert_q_value(dribble_key.clone(), 10.0));
+        policy.visits.insert(dribble_key, 3);
+        let clearance_key = SoccerQActionKey {
+            state,
+            action: "clearance".to_string(),
+        };
+        assert!(policy.insert_q_value(clearance_key.clone(), 8.0));
+        policy.visits.insert(clearance_key, 2);
+
+        let impossible_dribble = SoccerLearnedPlan {
+            action: "carry-forward".to_string(),
+            target_player: None,
+            target_point: Some(impossible_dribble_target),
+            mpc_replan: None,
+        };
+        let impossible_probability = SoccerMatch::learned_plan_mpc_execution_probability(
+            &snapshot,
+            actor_id,
+            &impossible_dribble,
+        )
+        .expect("dribble MPC execution probability");
+        assert!(
+            impossible_probability < LEARNED_MPC_DRIBBLE_IMPOSSIBLE_PROBABILITY,
+            "POMDP-selected dribble target should be rejected, got {impossible_probability:.3}"
+        );
+        assert!(
+            SoccerMatch::learned_plan_needs_mpc_replan(&snapshot, actor_id, &impossible_dribble),
+            "MPC should reject the POMDP-selected dribble target as unexecutable"
+        );
+
+        let reconciled = SoccerMatch::mpc_reconciled_learned_plan(
+            &policy,
+            &snapshot,
+            actor_id,
+            impossible_dribble,
+        );
+        assert_eq!(reconciled.action, "clearance");
+        assert_eq!(reconciled.target_player, None);
+        let replan = reconciled
+            .mpc_replan
+            .as_ref()
+            .expect("MPC rejection should be recorded as a replan trace");
+        assert_eq!(replan.original_action, "carry-forward");
+        assert_eq!(replan.replacement_action, "clearance");
+        assert_eq!(replan.source, SoccerLearnedMpcReplanSource::Mpc);
     }
 
     #[test]
@@ -4246,6 +4785,8 @@ mod tests {
             neural_mcts_candidate_count: 0,
             neural_mcts_discretized_kick_candidate_count: 0,
             neural_mcts_root_discretized_kick_candidate_count: 0,
+            neural_mcts_dribble_candidate_count: 0,
+            neural_mcts_root_dribble_candidate_count: 0,
             action: "pass2".to_string(),
         };
 
@@ -4287,6 +4828,8 @@ mod tests {
             neural_mcts_candidate_count: 0,
             neural_mcts_discretized_kick_candidate_count: 0,
             neural_mcts_root_discretized_kick_candidate_count: 0,
+            neural_mcts_dribble_candidate_count: 0,
+            neural_mcts_root_dribble_candidate_count: 0,
             action: "novel-action".to_string(),
         };
 
@@ -4629,6 +5172,98 @@ mod tests {
     }
 
     #[test]
+    fn learned_movement_mpc_rewards_lp_aligned_off_ball_support_targets() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let runner_index = sim
+            .players
+            .iter()
+            .position(|player| player.team == Team::Home && player.role == PlayerRole::Midfielder)
+            .expect("home midfielder");
+        let holder_index = sim
+            .players
+            .iter()
+            .position(|player| {
+                player.team == Team::Home
+                    && player.id != sim.players[runner_index].id
+                    && player.role != PlayerRole::Goalkeeper
+            })
+            .expect("home holder");
+        let runner_id = sim.players[runner_index].id;
+        let holder_id = sim.players[holder_index].id;
+        sim.players[runner_index].position = Vec2::new(34.0, 48.0);
+        sim.players[runner_index].home_position = Vec2::new(34.0, 50.0);
+        sim.players[holder_index].position = Vec2::new(40.0, 45.0);
+        sim.ball.holder = Some(holder_id);
+        sim.ball.position = sim.players[holder_index].position;
+        sim.ball.last_touch_team = Some(Team::Home);
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let support_target = snapshot
+            .attacking_support_movement_for(
+                runner_id,
+                sim.players[runner_index].home_position,
+                false,
+            )
+            .point;
+        let plan = SoccerLearnedPlan {
+            action: "support-shape".to_string(),
+            target_player: None,
+            target_point: Some(support_target),
+            mpc_replan: None,
+        };
+
+        let mut aligned_snapshot = snapshot.clone();
+        aligned_snapshot
+            .formation_lp_guidance
+            .retain(|guidance| guidance.player_id != runner_id);
+        aligned_snapshot
+            .formation_lp_guidance
+            .push(world_test_lp_guidance(
+                &aligned_snapshot,
+                runner_id,
+                support_target,
+                true,
+                0.0,
+                1.0,
+                1.0,
+                1.0,
+            ));
+        let aligned_probability = SoccerMatch::learned_movement_mpc_execution_probability(
+            &aligned_snapshot,
+            runner_id,
+            &plan,
+            "support-shape",
+        );
+
+        let mut misaligned_snapshot = snapshot;
+        misaligned_snapshot
+            .formation_lp_guidance
+            .retain(|guidance| guidance.player_id != runner_id);
+        misaligned_snapshot
+            .formation_lp_guidance
+            .push(world_test_lp_guidance(
+                &misaligned_snapshot,
+                runner_id,
+                Vec2::new(3.0, 3.0),
+                false,
+                12.0,
+                0.0,
+                0.0,
+                0.0,
+            ));
+        let misaligned_probability = SoccerMatch::learned_movement_mpc_execution_probability(
+            &misaligned_snapshot,
+            runner_id,
+            &plan,
+            "support-shape",
+        );
+
+        assert!(
+            aligned_probability > misaligned_probability + 0.08,
+            "LP-aligned off-ball MPC execution should be materially more credible: aligned={aligned_probability:.3} misaligned={misaligned_probability:.3}"
+        );
+    }
+
+    #[test]
     fn learned_mpc_replan_adds_counterexample_for_rejected_original_action() {
         let mut sim = SoccerMatch::default_11v11(MatchConfig {
             learning_enabled: true,
@@ -4667,6 +5302,8 @@ mod tests {
             neural_mcts_candidate_count: 0,
             neural_mcts_discretized_kick_candidate_count: 0,
             neural_mcts_root_discretized_kick_candidate_count: 0,
+            neural_mcts_dribble_candidate_count: 0,
+            neural_mcts_root_dribble_candidate_count: 0,
             action: "hold".to_string(),
         });
         let after = WorldSnapshot::from_match(&sim);
@@ -4749,6 +5386,8 @@ mod tests {
             neural_mcts_candidate_count: 0,
             neural_mcts_discretized_kick_candidate_count: 0,
             neural_mcts_root_discretized_kick_candidate_count: 0,
+            neural_mcts_dribble_candidate_count: 0,
+            neural_mcts_root_dribble_candidate_count: 0,
             action: "hold".to_string(),
         });
         let after = WorldSnapshot::from_match(&sim);
@@ -4805,6 +5444,8 @@ mod tests {
             neural_mcts_candidate_count: 0,
             neural_mcts_discretized_kick_candidate_count: 0,
             neural_mcts_root_discretized_kick_candidate_count: 0,
+            neural_mcts_dribble_candidate_count: 0,
+            neural_mcts_root_dribble_candidate_count: 0,
             action: "hold".to_string(),
         });
         let after = WorldSnapshot::from_match(&sim);
@@ -6463,6 +7104,198 @@ mod tests {
     }
 
     #[test]
+    fn learned_named_dribble_plan_preserves_pomdp_kind_near_goal() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let actor = sim
+            .players
+            .iter()
+            .position(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home field player");
+        let actor_id = sim.players[actor].id;
+        sim.players[actor].role = PlayerRole::Midfielder;
+        sim.players[actor].position = Vec2::new(40.0, 86.0);
+        sim.players[actor].home_position = sim.players[actor].position;
+        sim.players[actor].velocity = Vec2::zero();
+        sim.ball.holder = Some(actor_id);
+        sim.ball.position = sim.players[actor].position;
+        sim.ball.last_touch_team = Some(Team::Home);
+
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let mut observation = snapshot.observation_for(actor_id);
+        observation.has_ball = true;
+        observation.yards_to_goal = 34.0;
+        observation.shot_lane_open = false;
+        observation.shot_block_probability = 1.0;
+        observation.shot_on_frame_probability = 0.0;
+        observation.shot_beat_goalkeeper_probability = 0.0;
+        observation.forward_dribble_space_yards = 6.0;
+        observation.offensive_urgency = 0.42;
+        assert!(
+            goal_approach_forces_goalmouth_carry(&observation, sim.players[actor].role),
+            "fixture should exercise the old forced-carry rewrite path"
+        );
+
+        let learned_target = Vec2::new(36.0, 89.0);
+        let left_cut = SoccerLearnedPlan {
+            action: "left-cut".to_string(),
+            target_player: None,
+            target_point: Some(learned_target),
+            mpc_replan: None,
+        };
+        let (action, label) = sim.players[actor]
+            .action_from_learned_plan(&left_cut, &snapshot, &observation)
+            .expect("learned left-cut should execute");
+        assert_eq!(label, "left-cut");
+        let SoccerAction::DribbleMove { target, kind, .. } = action else {
+            panic!("learned left-cut should execute as a dribble move");
+        };
+        assert_eq!(kind, DribbleMoveKind::LeftCut);
+        assert_eq!(target, learned_target);
+
+        let hold_up = SoccerLearnedPlan {
+            action: "hold-up-flank".to_string(),
+            target_player: None,
+            target_point: Some(Vec2::new(44.0, 87.0)),
+            mpc_replan: None,
+        };
+        let (action, label) = sim.players[actor]
+            .action_from_learned_plan(&hold_up, &snapshot, &observation)
+            .expect("learned hold-up flank should execute");
+        assert_eq!(label, "hold-up-flank");
+        assert!(
+            matches!(action, SoccerAction::DribbleMove { .. }),
+            "learned hold-up flank should remain a dribble move"
+        );
+
+        let side_step_target = Vec2::new(42.5, 88.0);
+        let side_step = SoccerLearnedPlan {
+            action: "side-step".to_string(),
+            target_player: None,
+            target_point: Some(side_step_target),
+            mpc_replan: None,
+        };
+        let (action, label) = sim.players[actor]
+            .action_from_learned_plan(&side_step, &snapshot, &observation)
+            .expect("learned side-step should execute");
+        assert_eq!(label, "side-step");
+        let SoccerAction::DribbleMove { target, kind, .. } = action else {
+            panic!("learned side-step should execute as a dribble move");
+        };
+        assert!(
+            matches!(kind, DribbleMoveKind::LeftCut | DribbleMoveKind::RightCut),
+            "side-step execution can choose lateral mechanics but must keep the POMDP action label"
+        );
+        assert_eq!(target, side_step_target);
+    }
+
+    #[test]
+    fn learned_open_pass_lane_plan_preserves_pomdp_target_point() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let actor = sim
+            .players
+            .iter()
+            .position(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home field player");
+        let actor_id = sim.players[actor].id;
+        sim.players[actor].role = PlayerRole::Midfielder;
+        sim.players[actor].position = Vec2::new(40.0, 60.0);
+        sim.players[actor].home_position = sim.players[actor].position;
+        sim.players[actor].velocity = Vec2::zero();
+        let mut away_slot = 0usize;
+        for player in sim.players.iter_mut() {
+            if player.team == Team::Away {
+                player.position = Vec2::new(76.0, 12.0 + away_slot as f64 * 4.0);
+                player.home_position = player.position;
+                player.velocity = Vec2::zero();
+                away_slot += 1;
+            }
+        }
+        sim.ball.holder = Some(actor_id);
+        sim.ball.position = sim.players[actor].position;
+        sim.ball.last_touch_team = Some(Team::Home);
+
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let mut observation = snapshot.observation_for(actor_id);
+        observation.has_ball = true;
+        let learned_target = Vec2::new(42.3, 61.1);
+        let plan = SoccerLearnedPlan {
+            action: OPEN_PASS_LANE_ACTION_LABEL.to_string(),
+            target_player: None,
+            target_point: Some(learned_target),
+            mpc_replan: None,
+        };
+        let (action, label) = sim.players[actor]
+            .action_from_learned_plan(&plan, &snapshot, &observation)
+            .expect("learned open-pass-lane should execute");
+        assert_eq!(label, OPEN_PASS_LANE_ACTION_LABEL);
+        let SoccerAction::DribbleMove { target, .. } = action else {
+            panic!("learned open-pass-lane should execute as a dribble move");
+        };
+        assert_eq!(target, learned_target);
+    }
+
+    #[test]
+    fn learned_shot_bucket_plans_preserve_pomdp_shot_type_and_power() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let actor = sim
+            .players
+            .iter()
+            .position(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home field player");
+        let actor_id = sim.players[actor].id;
+        sim.players[actor].role = PlayerRole::Forward;
+        sim.players[actor].position = Vec2::new(40.0, 96.0);
+        sim.players[actor].home_position = sim.players[actor].position;
+        sim.players[actor].velocity = Vec2::zero();
+        sim.players[actor].skills.shooting = 8.0;
+        sim.players[actor].skills.first_touch = 8.0;
+        sim.players[actor].skills.right_foot_shot_power = 8.0;
+        sim.players[actor].skills.left_foot_shot_power = 7.0;
+        sim.ball.holder = Some(actor_id);
+        sim.ball.position = sim.players[actor].position;
+        sim.ball.last_touch_team = Some(Team::Home);
+
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let mut observation = snapshot.observation_for(actor_id);
+        observation.has_ball = true;
+        observation.yards_to_goal = 24.0;
+        observation.shot_lane_open = true;
+        observation.shot_block_probability = 0.05;
+        observation.shot_on_frame_probability = 0.82;
+        observation.shot_beat_goalkeeper_probability = 0.42;
+        observation.opponent_goal_angle_degrees = 36.0;
+        observation.first_touch_available = true;
+        observation.first_time_shot_score = 0.88;
+
+        for label in ["shoot-kp8", "first-time-shot-kp6"] {
+            let plan = SoccerLearnedPlan {
+                action: label.to_string(),
+                target_player: None,
+                target_point: None,
+                mpc_replan: None,
+            };
+            let (action, executed_label) = sim.players[actor]
+                .action_from_learned_plan(&plan, &snapshot, &observation)
+                .expect("learned shot bucket should execute");
+            assert_eq!(executed_label, label);
+            let SoccerAction::Shoot { power } = action else {
+                panic!("learned shot bucket should execute as a shot");
+            };
+            let expected_power =
+                learned_discretized_kick_power_for_action_label(label).expect("shot bucket power");
+            assert!(
+                (power - expected_power).abs() < 1e-9,
+                "shot bucket {label} should retain POMDP-selected power"
+            );
+            assert!(
+                SoccerMatch::learned_plan_mpc_execution_probability(&snapshot, actor_id, &plan)
+                    .is_some(),
+                "shot bucket {label} should have an MPC execution estimate"
+            );
+        }
+    }
+
+    #[test]
     fn neural_mcts_uses_priors_when_values_are_tied() {
         let blend = SoccerNeuralBlendConfig {
             mcts_enabled: true,
@@ -7321,6 +8154,104 @@ mod tests {
         ];
 
         assert_eq!(
+            SoccerMatch::neural_mcts_action_from_candidates(blend, &candidates, 0.0)
+                .as_ref()
+                .map(|choice| choice.label.as_str()),
+            Some("carry-forward")
+        );
+    }
+
+    #[test]
+    fn neural_mcts_dribble_selection_floor_preempts_generic_technical_floor() {
+        let _env_lock = soccer_world_env_lock();
+        let _dribble_floor = set_test_env_var("SOCCER_NEURAL_MCTS_DRIBBLE_SELECTION_FLOOR", "0.25");
+        let _dribble_max_regression = set_test_env_var(
+            "SOCCER_NEURAL_MCTS_DRIBBLE_SELECTION_MAX_SCORE_REGRESSION",
+            "2.0",
+        );
+        let _technical_floor =
+            set_test_env_var("SOCCER_NEURAL_MCTS_TECHNICAL_SELECTION_FLOOR", "0.25");
+        let _technical_max_regression = set_test_env_var(
+            "SOCCER_NEURAL_MCTS_TECHNICAL_SELECTION_MAX_SCORE_REGRESSION",
+            "2.0",
+        );
+        let blend = SoccerNeuralBlendConfig {
+            mcts_enabled: true,
+            mcts_simulations: 2,
+            mcts_candidates: 4,
+            ..SoccerNeuralBlendConfig::default()
+        };
+        let candidates = vec![
+            SoccerNeuralMctsCandidate {
+                label: "shoot".to_string(),
+                plan: None,
+                score: 1.0,
+                prior: 0.6,
+                q_visits: 1,
+            },
+            SoccerNeuralMctsCandidate {
+                label: "first-time-shot".to_string(),
+                plan: None,
+                score: 0.9,
+                prior: 0.4,
+                q_visits: 1,
+            },
+            SoccerNeuralMctsCandidate {
+                label: "carry-forward".to_string(),
+                plan: None,
+                score: 0.4,
+                prior: 0.2,
+                q_visits: 1,
+            },
+        ];
+
+        assert_eq!(
+            SoccerMatch::neural_mcts_action_from_candidates(blend, &candidates, 0.0)
+                .as_ref()
+                .map(|choice| choice.label.as_str()),
+            Some("carry-forward")
+        );
+    }
+
+    #[test]
+    fn neural_mcts_dribble_selection_floor_respects_score_regression() {
+        let _env_lock = soccer_world_env_lock();
+        let _dribble_floor = set_test_env_var("SOCCER_NEURAL_MCTS_DRIBBLE_SELECTION_FLOOR", "0.25");
+        let _dribble_max_regression = set_test_env_var(
+            "SOCCER_NEURAL_MCTS_DRIBBLE_SELECTION_MAX_SCORE_REGRESSION",
+            "0.10",
+        );
+        let blend = SoccerNeuralBlendConfig {
+            mcts_enabled: true,
+            mcts_simulations: 2,
+            mcts_candidates: 4,
+            ..SoccerNeuralBlendConfig::default()
+        };
+        let candidates = vec![
+            SoccerNeuralMctsCandidate {
+                label: "shoot".to_string(),
+                plan: None,
+                score: 1.0,
+                prior: 0.6,
+                q_visits: 1,
+            },
+            SoccerNeuralMctsCandidate {
+                label: "pass".to_string(),
+                plan: None,
+                score: 0.9,
+                prior: 0.3,
+                q_visits: 1,
+            },
+            SoccerNeuralMctsCandidate {
+                label: "carry-forward".to_string(),
+                plan: None,
+                score: -4.0,
+                prior: 0.2,
+                q_visits: 1,
+            },
+        ];
+
+        assert_ne!(
             SoccerMatch::neural_mcts_action_from_candidates(blend, &candidates, 0.0)
                 .as_ref()
                 .map(|choice| choice.label.as_str()),
@@ -11475,6 +12406,8 @@ impl SoccerMatch {
                 neural_mcts_candidate_count: 0,
                 neural_mcts_discretized_kick_candidate_count: 0,
                 neural_mcts_root_discretized_kick_candidate_count: 0,
+                neural_mcts_dribble_candidate_count: 0,
+                neural_mcts_root_dribble_candidate_count: 0,
             })
     }
 
@@ -11518,6 +12451,8 @@ impl SoccerMatch {
                 neural_mcts_candidate_count: 0,
                 neural_mcts_discretized_kick_candidate_count: 0,
                 neural_mcts_root_discretized_kick_candidate_count: 0,
+                neural_mcts_dribble_candidate_count: 0,
+                neural_mcts_root_dribble_candidate_count: 0,
             })
     }
 
@@ -11540,7 +12475,9 @@ impl SoccerMatch {
         })
     }
 
-    fn scored_candidate_counts(candidates: &[SoccerNeuralMctsCandidate]) -> (u32, u32, u32) {
+    fn scored_candidate_counts(
+        candidates: &[SoccerNeuralMctsCandidate],
+    ) -> (u32, u32, u32, u32, u32) {
         let candidate_count = candidates.len().min(u32::MAX as usize) as u32;
         let discretized_kick_candidate_count = candidates
             .iter()
@@ -11549,11 +12486,18 @@ impl SoccerMatch {
             })
             .count()
             .min(u32::MAX as usize) as u32;
+        let dribble_candidate_count = candidates
+            .iter()
+            .filter(|candidate| is_dribble_action_label(&candidate.label))
+            .count()
+            .min(u32::MAX as usize) as u32;
         // Outside tree-search, every scored candidate is a root candidate.
         (
             candidate_count,
             discretized_kick_candidate_count,
             discretized_kick_candidate_count,
+            dribble_candidate_count,
+            dribble_candidate_count,
         )
     }
 
@@ -11567,6 +12511,8 @@ impl SoccerMatch {
             neural_mcts_candidate_count,
             neural_mcts_discretized_kick_candidate_count,
             neural_mcts_root_discretized_kick_candidate_count,
+            neural_mcts_dribble_candidate_count,
+            neural_mcts_root_dribble_candidate_count,
         ) = Self::scored_candidate_counts(candidates);
         SoccerPolicyActionChoice {
             label: candidate.label.clone(),
@@ -11576,6 +12522,8 @@ impl SoccerMatch {
             neural_mcts_candidate_count,
             neural_mcts_discretized_kick_candidate_count,
             neural_mcts_root_discretized_kick_candidate_count,
+            neural_mcts_dribble_candidate_count,
+            neural_mcts_root_dribble_candidate_count,
         }
     }
 
@@ -11833,6 +12781,8 @@ impl SoccerMatch {
                         neural_mcts_candidate_count: 0,
                         neural_mcts_discretized_kick_candidate_count: 0,
                         neural_mcts_root_discretized_kick_candidate_count: 0,
+                        neural_mcts_dribble_candidate_count: 0,
+                        neural_mcts_root_dribble_candidate_count: 0,
                     })
             })
     }
@@ -11883,6 +12833,8 @@ impl SoccerMatch {
             neural_mcts_candidate_count: 0,
             neural_mcts_discretized_kick_candidate_count: 0,
             neural_mcts_root_discretized_kick_candidate_count: 0,
+            neural_mcts_dribble_candidate_count: 0,
+            neural_mcts_root_dribble_candidate_count: 0,
         })
     }
 
@@ -11959,6 +12911,8 @@ impl SoccerMatch {
                     neural_mcts_candidate_count,
                     neural_mcts_discretized_kick_candidate_count,
                     neural_mcts_root_discretized_kick_candidate_count,
+                    neural_mcts_dribble_candidate_count,
+                    neural_mcts_root_dribble_candidate_count,
                 } = choice;
                 let plan = plan.unwrap_or_else(|| {
                     Self::learned_plan_for_policy(policy, snapshot, player_id, label.clone())
@@ -11971,6 +12925,8 @@ impl SoccerMatch {
                     neural_mcts_candidate_count,
                     neural_mcts_discretized_kick_candidate_count,
                     neural_mcts_root_discretized_kick_candidate_count,
+                    neural_mcts_dribble_candidate_count,
+                    neural_mcts_root_dribble_candidate_count,
                 });
             }
         }
@@ -12023,6 +12979,8 @@ impl SoccerMatch {
                 neural_mcts_candidate_count,
                 neural_mcts_discretized_kick_candidate_count,
                 neural_mcts_root_discretized_kick_candidate_count,
+                neural_mcts_dribble_candidate_count,
+                neural_mcts_root_dribble_candidate_count,
             } = choice;
             let plan = plan.unwrap_or_else(|| {
                 Self::learned_plan_for_policy(learned_policy, snapshot, player_id, label.clone())
@@ -12035,6 +12993,8 @@ impl SoccerMatch {
                 neural_mcts_candidate_count,
                 neural_mcts_discretized_kick_candidate_count,
                 neural_mcts_root_discretized_kick_candidate_count,
+                neural_mcts_dribble_candidate_count,
+                neural_mcts_root_dribble_candidate_count,
             }
         })
     }
@@ -12056,6 +13016,8 @@ impl SoccerMatch {
         candidate_count: u32,
         discretized_kick_candidate_count: u32,
         root_discretized_kick_candidate_count: u32,
+        dribble_candidate_count: u32,
+        root_dribble_candidate_count: u32,
     ) {
         let Some(decision) = player.last_decision.as_mut() else {
             return;
@@ -12068,16 +13030,20 @@ impl SoccerMatch {
                 })
                 .unwrap_or(false);
         decision.neural_mcts_selected = selected_matches_executed;
-        if selected_matches_executed {
+        if candidate_count > 0 {
             decision.neural_mcts_candidate_count = candidate_count;
             decision.neural_mcts_discretized_kick_candidate_count =
                 discretized_kick_candidate_count;
             decision.neural_mcts_root_discretized_kick_candidate_count =
                 root_discretized_kick_candidate_count;
+            decision.neural_mcts_dribble_candidate_count = dribble_candidate_count;
+            decision.neural_mcts_root_dribble_candidate_count = root_dribble_candidate_count;
         } else {
             decision.neural_mcts_candidate_count = 0;
             decision.neural_mcts_discretized_kick_candidate_count = 0;
             decision.neural_mcts_root_discretized_kick_candidate_count = 0;
+            decision.neural_mcts_dribble_candidate_count = 0;
+            decision.neural_mcts_root_dribble_candidate_count = 0;
         }
     }
 
@@ -12543,8 +13509,9 @@ impl SoccerMatch {
         }
         let simulations = blend.sanitized_mcts_simulations();
         let exploration = blend.sanitized_mcts_exploration();
-        let neural_mcts_candidate_count = candidates.len().min(u32::MAX as usize) as u32;
-        let neural_mcts_discretized_kick_candidate_count = candidates
+        let all_candidates = candidates;
+        let neural_mcts_candidate_count = all_candidates.len().min(u32::MAX as usize) as u32;
+        let neural_mcts_discretized_kick_candidate_count = all_candidates
             .iter()
             .filter(|candidate| {
                 learned_discretized_kick_speed_bucket_for_action_label(&candidate.label).is_some()
@@ -12552,7 +13519,12 @@ impl SoccerMatch {
             .count()
             .min(u32::MAX as usize)
             as u32;
-        let candidates = Self::neural_mcts_root_candidates(candidates, candidate_count);
+        let neural_mcts_dribble_candidate_count = all_candidates
+            .iter()
+            .filter(|candidate| Self::neural_mcts_candidate_is_dribble_like(candidate))
+            .count()
+            .min(u32::MAX as usize) as u32;
+        let candidates = Self::neural_mcts_root_candidates(all_candidates, candidate_count);
         let neural_mcts_root_discretized_kick_candidate_count = candidates
             .iter()
             .filter(|candidate| {
@@ -12561,6 +13533,11 @@ impl SoccerMatch {
             .count()
             .min(u32::MAX as usize)
             as u32;
+        let neural_mcts_root_dribble_candidate_count = candidates
+            .iter()
+            .filter(|candidate| Self::neural_mcts_candidate_is_dribble_like(candidate))
+            .count()
+            .min(u32::MAX as usize) as u32;
         let min_score = candidates
             .iter()
             .map(|candidate| candidate.score)
@@ -12657,11 +13634,13 @@ impl SoccerMatch {
             return None;
         }
         let selection_floor = neural_mcts_discretized_kick_selection_floor();
+        let dribble_floor_rank = Self::dribble_selection_floor_rank(&nodes, candidate_count, draw);
         let discretized_floor_rank =
             Self::discretized_kick_selection_floor_rank(&nodes, candidate_count, draw);
         let technical_floor_rank =
             Self::technical_selection_floor_rank(&nodes, candidate_count, draw);
-        let selected_rank = discretized_floor_rank
+        let selected_rank = dribble_floor_rank
+            .or(discretized_floor_rank)
             .or(technical_floor_rank)
             .unwrap_or_else(|| {
                 let adjusted_draw = if selection_floor > 1e-9
@@ -12675,6 +13654,14 @@ impl SoccerMatch {
                 };
                 soccer_policy_weighted_rank_index(candidate_count, adjusted_draw)
             });
+        Self::maybe_log_neural_mcts_dribble_diagnostic(
+            all_candidates,
+            &candidates,
+            &nodes,
+            candidate_count,
+            dribble_floor_rank,
+            selected_rank,
+        );
         nodes.get(selected_rank).map(|node| {
             let mut plan = node.plan.clone();
             if selected_rank == 0 {
@@ -12699,8 +13686,174 @@ impl SoccerMatch {
                 neural_mcts_candidate_count,
                 neural_mcts_discretized_kick_candidate_count,
                 neural_mcts_root_discretized_kick_candidate_count,
+                neural_mcts_dribble_candidate_count,
+                neural_mcts_root_dribble_candidate_count,
             }
         })
+    }
+
+    fn maybe_log_neural_mcts_dribble_diagnostic(
+        all_candidates: &[SoccerNeuralMctsCandidate],
+        root_candidates: &[SoccerNeuralMctsCandidate],
+        nodes: &[SoccerNeuralMctsNode],
+        candidate_count: usize,
+        dribble_floor_rank: Option<usize>,
+        selected_rank: usize,
+    ) {
+        let interval = neural_mcts_dribble_diagnostic_interval();
+        if interval == 0 {
+            return;
+        }
+        #[cfg(not(test))]
+        let sample_index = {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static SAMPLE: AtomicU64 = AtomicU64::new(0);
+            SAMPLE.fetch_add(1, Ordering::Relaxed).saturating_add(1)
+        };
+        #[cfg(test)]
+        let sample_index = 1;
+        if sample_index != 1 && sample_index % interval != 0 {
+            return;
+        }
+
+        let best_score = root_candidates
+            .iter()
+            .filter_map(|candidate| candidate.score.is_finite().then_some(candidate.score))
+            .max_by(|a, b| a.total_cmp(b));
+        let best_dribble_score = all_candidates
+            .iter()
+            .filter(|candidate| Self::neural_mcts_candidate_is_dribble_like(candidate))
+            .filter_map(|candidate| candidate.score.is_finite().then_some(candidate.score))
+            .max_by(|a, b| a.total_cmp(b));
+        let best_root_dribble_score = root_candidates
+            .iter()
+            .filter(|candidate| Self::neural_mcts_candidate_is_dribble_like(candidate))
+            .filter_map(|candidate| candidate.score.is_finite().then_some(candidate.score))
+            .max_by(|a, b| a.total_cmp(b));
+        let max_regression = neural_mcts_dribble_selection_max_score_regression();
+        let eligible_root_dribbles = nodes
+            .iter()
+            .take(candidate_count.min(nodes.len()))
+            .filter(|node| {
+                best_score.is_some_and(|best| {
+                    Self::dribble_selection_floor_eligible_node(node, best, max_regression)
+                })
+            })
+            .count();
+        let selected_label = nodes
+            .get(selected_rank)
+            .map(|node| node.label.as_str())
+            .unwrap_or("none");
+        let selected_is_dribble =
+            is_dribble_action_label(normalize_soccer_action_label(selected_label));
+        let score_text = |score: Option<f64>| {
+            score
+                .map(|value| format!("{value:.4}"))
+                .unwrap_or_else(|| "none".to_string())
+        };
+        let dribble_gap = match (best_score, best_dribble_score) {
+            (Some(best), Some(dribble)) => format!("{:.4}", best - dribble),
+            _ => "none".to_string(),
+        };
+
+        println!(
+            "neural_mcts_dribble_diagnostic sample={} candidates={} dribble_candidates={} root_candidates={} root_dribble_candidates={} eligible_root_dribbles={} best_score={} best_dribble_score={} best_root_dribble_score={} dribble_score_gap={} dribble_floor_rank={} selected_rank={} selected_label={} selected_is_dribble={}",
+            sample_index,
+            all_candidates.len(),
+            all_candidates
+                .iter()
+                .filter(|candidate| Self::neural_mcts_candidate_is_dribble_like(candidate))
+                .count(),
+            root_candidates.len(),
+            root_candidates
+                .iter()
+                .filter(|candidate| Self::neural_mcts_candidate_is_dribble_like(candidate))
+                .count(),
+            eligible_root_dribbles,
+            score_text(best_score),
+            score_text(best_dribble_score),
+            score_text(best_root_dribble_score),
+            dribble_gap,
+            dribble_floor_rank
+                .map(|rank| rank.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            selected_rank,
+            selected_label,
+            selected_is_dribble as u8,
+        );
+    }
+
+    fn dribble_selection_floor_rank(
+        nodes: &[SoccerNeuralMctsNode],
+        candidate_count: usize,
+        draw: f64,
+    ) -> Option<usize> {
+        let floor = neural_mcts_dribble_selection_floor();
+        if floor <= 1e-9 || !draw.is_finite() || draw >= floor {
+            return None;
+        }
+        let candidate_count = candidate_count.min(nodes.len());
+        if candidate_count == 0 {
+            return None;
+        }
+        let best_score = nodes[..candidate_count]
+            .iter()
+            .map(|node| node.raw_score)
+            .fold(f64::NEG_INFINITY, f64::max);
+        if !best_score.is_finite() {
+            return None;
+        }
+        let max_regression = neural_mcts_dribble_selection_max_score_regression();
+        if max_regression <= 0.0 || !max_regression.is_finite() {
+            return None;
+        }
+        let rank_weights = soccer_policy_top_rank_weights();
+        let mut eligible = [(0usize, 0.0f64); POLICY_SELECTION_TOP_RANK_LIMIT];
+        let mut eligible_count = 0usize;
+        let mut total = 0.0;
+        for rank in 0..candidate_count
+            .min(nodes.len())
+            .min(POLICY_SELECTION_TOP_RANK_LIMIT)
+        {
+            let node = &nodes[rank];
+            if !Self::dribble_selection_floor_eligible_node(node, best_score, max_regression) {
+                continue;
+            }
+            let weight = rank_weights[rank].max(0.0);
+            if weight <= 0.0 {
+                continue;
+            }
+            eligible[eligible_count] = (rank, weight);
+            eligible_count += 1;
+            total += weight;
+        }
+        if eligible_count == 0 || !total.is_finite() || total <= 1e-9 {
+            return None;
+        }
+        let mut threshold = (draw / floor).clamp(0.0, 1.0 - f64::EPSILON) * total;
+        for (rank, weight) in eligible[..eligible_count].iter().copied() {
+            if threshold < weight {
+                return Some(rank);
+            }
+            threshold -= weight;
+        }
+        Some(eligible[eligible_count - 1].0)
+    }
+
+    fn dribble_selection_floor_eligible_node(
+        node: &SoccerNeuralMctsNode,
+        best_score: f64,
+        max_regression: f64,
+    ) -> bool {
+        if !node.raw_score.is_finite()
+            || !best_score.is_finite()
+            || !max_regression.is_finite()
+            || max_regression < 0.0
+            || node.raw_score + max_regression < best_score
+        {
+            return false;
+        }
+        is_dribble_action_label(normalize_soccer_action_label(&node.label))
     }
 
     fn technical_selection_floor_rank(
@@ -13895,6 +15048,28 @@ impl SoccerMatch {
         ))
     }
 
+    fn learned_ranked_pass_target_for_policy(
+        action: &str,
+        flight: PassFlight,
+        candidates: &[usize],
+    ) -> Option<usize> {
+        let action = action.trim();
+        let action = learned_discretized_kick_suffix_parts(action)
+            .map(|(base, _)| base)
+            .unwrap_or(action);
+        let family = if flight.is_aerial() {
+            "aerial-pass"
+        } else {
+            "pass"
+        };
+        let suffix = action.strip_prefix(family)?;
+        if suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let index = suffix.parse::<usize>().ok()?.checked_sub(1)?;
+        candidates.get(index).copied()
+    }
+
     fn learned_plan_for_policy(
         policy: &SoccerQPolicy,
         snapshot: &WorldSnapshot,
@@ -13936,13 +15111,17 @@ impl SoccerMatch {
                 candidates
             };
             let flight = pass_like_action_flight(&normalized_action).unwrap_or(PassFlight::Floor);
-            plan.target_player = policy.best_pass_target_player_for_snapshot(
-                snapshot,
-                player_id,
-                &normalized_action,
-                flight,
-                &candidates,
-            );
+            let ranked_target =
+                Self::learned_ranked_pass_target_for_policy(&plan.action, flight, &candidates);
+            plan.target_player = ranked_target.or_else(|| {
+                policy.best_pass_target_player_for_snapshot(
+                    snapshot,
+                    player_id,
+                    &normalized_action,
+                    flight,
+                    &candidates,
+                )
+            });
             plan.target_point = plan
                 .target_player
                 .and_then(|target| snapshot.player_position(target));
@@ -13997,23 +15176,53 @@ impl SoccerMatch {
             normalized_action.as_str(),
             "keeper-mpc-floor-pass" | "keeper-mpc-aerial-pass" | "keeper-mpc-clearance"
         ) {
-            if let Some(keeper_plan) = snapshot.goalkeeper_mpc_play_out_plan(player_id, None) {
-                let matches_requested = match normalized_action.as_str() {
-                    "keeper-mpc-floor-pass" => {
-                        keeper_plan.target_player.is_some()
-                            && keeper_plan.flight == PassFlight::Floor
-                    }
-                    "keeper-mpc-aerial-pass" => {
-                        keeper_plan.target_player.is_some()
-                            && keeper_plan.flight != PassFlight::Floor
-                    }
-                    "keeper-mpc-clearance" => keeper_plan.target_player.is_none(),
-                    _ => false,
-                };
-                if matches_requested {
-                    plan.target_player = keeper_plan.target_player;
-                    plan.target_point = Some(keeper_plan.target);
-                }
+            let keeper_pass = match normalized_action.as_str() {
+                "keeper-mpc-floor-pass" => Some((
+                    PassFlight::Floor,
+                    snapshot.ranked_visible_pass_targets(player_id, 11),
+                )),
+                "keeper-mpc-aerial-pass" => Some((
+                    PassFlight::Aerial,
+                    snapshot.ranked_visible_aerial_pass_targets(player_id, 11),
+                )),
+                _ => None,
+            };
+            if let Some((flight, candidates)) = keeper_pass {
+                plan.target_player = policy
+                    .best_pass_target_player_for_snapshot(
+                        snapshot,
+                        player_id,
+                        &plan.action,
+                        flight,
+                        &candidates,
+                    )
+                    .or_else(|| candidates.first().copied());
+                plan.target_point = plan.target_player.and_then(|target| {
+                    snapshot
+                        .goalkeeper_mpc_play_out_plan(player_id, Some(target))
+                        .filter(|keeper_plan| {
+                            keeper_plan.target_player == Some(target)
+                                && keeper_plan.flight == flight
+                        })
+                        .map(|keeper_plan| keeper_plan.target)
+                        .or_else(|| snapshot.player_position(target))
+                });
+            } else if let Some(player) = snapshot
+                .players
+                .iter()
+                .find(|player| player.id == player_id)
+            {
+                plan.target_point =
+                    snapshot
+                        .pressure_clearance_target_for(player_id)
+                        .or_else(|| {
+                            Some(clearance_target_for_player(
+                                player.team,
+                                snapshot.player_snapshot_position(player),
+                                snapshot.field_width,
+                                snapshot.field_length,
+                            ))
+                        });
             }
         }
         if plan.target_point.is_none() {
@@ -14179,7 +15388,7 @@ impl SoccerMatch {
         }
         if let Some(kind) = dribble_move_kind_for_action_label(label) {
             return Some(Self::learned_dribble_mpc_execution_probability(
-                snapshot, player_id, kind,
+                snapshot, player_id, plan, kind,
             ));
         }
         if matches!(label, "shoot" | "first-time-shot" | "first-time-header") {
@@ -14304,6 +15513,7 @@ impl SoccerMatch {
     fn learned_dribble_mpc_execution_probability(
         snapshot: &WorldSnapshot,
         player_id: usize,
+        plan: &SoccerLearnedPlan,
         kind: DribbleMoveKind,
     ) -> f64 {
         let Some(player) = snapshot
@@ -14320,8 +15530,17 @@ impl SoccerMatch {
             .player_velocity(player_id)
             .unwrap_or(player.velocity);
         let touch = snapshot.deterministic_dribble_touch_decision_for(player_id, kind);
-        let target =
+        let fallback_target =
             snapshot.dribble_move_target_for_touch(player_id, player.home_position, kind, touch);
+        let target = plan
+            .target_point
+            .unwrap_or(fallback_target)
+            .clamp_to_pitch(snapshot.field_width, snapshot.field_length);
+        let touch_distance_yards = if plan.target_point.is_some() {
+            position.distance(target)
+        } else {
+            touch.distance_yards
+        };
         dribble_mpc_control_estimate_for_snapshot(
             snapshot,
             player.id,
@@ -14332,7 +15551,7 @@ impl SoccerMatch {
             position,
             velocity,
             target,
-            touch.distance_yards,
+            touch_distance_yards,
         )
         .control_probability
         .clamp(0.0, 1.0)
@@ -14590,7 +15809,7 @@ impl SoccerMatch {
             .clamp_to_pitch(snapshot.field_width, snapshot.field_length);
         let target = Self::learned_movement_mpc_target(snapshot, player, plan, label);
         let dt = sane_dt_seconds(snapshot.dt_seconds, DEFAULT_DT_SECONDS).max(1e-6);
-        let horizon = (dt * 2.0).clamp(2.0 / 15.0, 0.24);
+        let horizon = decision_mpc_execution_horizon_seconds(dt);
         let velocity = snapshot
             .player_velocity(player_id)
             .unwrap_or(player.velocity);
@@ -14636,25 +15855,48 @@ impl SoccerMatch {
                     .max(1.0))
             .clamp(0.0, 1.0)
         };
+        let observation = snapshot.observation_for(player_id);
+        let off_ball_support_movement =
+            !observation.has_ball && is_attacking_support_action_label(label);
         let lp_alignment = snapshot
             .formation_lp_guidance_for(player_id)
             .map(|guidance| {
-                (1.0 - target.distance(guidance.target) / 16.0)
-                    .clamp(0.0, 1.0)
-                    .max(if guidance.local_mpc_guidance {
+                if off_ball_support_movement {
+                    formation_lp_support_target_fit(guidance, target)
+                } else {
+                    let target_fit = if target.x.is_finite()
+                        && target.y.is_finite()
+                        && guidance.target.x.is_finite()
+                        && guidance.target.y.is_finite()
+                    {
+                        (1.0 - target.distance(guidance.target) / 16.0).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    target_fit.max(if guidance.local_mpc_guidance {
                         0.35
                     } else {
                         0.0
                     })
+                }
             })
             .unwrap_or(0.72);
-        let observation = snapshot.observation_for(player_id);
+        let lp_execution_weight = if off_ball_support_movement {
+            0.18
+        } else {
+            0.08
+        };
         let decision_confidence = player_decision_confidence(&observation, &player.skills);
         (0.08
-            + distance_fit * 0.40
+            + distance_fit
+                * if off_ball_support_movement {
+                    0.34
+                } else {
+                    0.40
+                }
             + execution_skill * 0.26
             + decision_confidence * 0.18
-            + lp_alignment * 0.08)
+            + lp_alignment * lp_execution_weight)
             .clamp(0.0, 0.99)
     }
 
@@ -17168,6 +18410,8 @@ impl SoccerMatch {
                             learned_decision.neural_mcts_candidate_count,
                             learned_decision.neural_mcts_discretized_kick_candidate_count,
                             learned_decision.neural_mcts_root_discretized_kick_candidate_count,
+                            learned_decision.neural_mcts_dribble_candidate_count,
+                            learned_decision.neural_mcts_root_dribble_candidate_count,
                         );
                     }
                     let intent = self.players[actor]
@@ -22692,13 +23936,11 @@ impl SoccerMatch {
                                 && player.team == player_team
                         })
                     });
-                    // MPC determines the keeper's play-out: when the keeper is choosing freely
-                    // (no explicit target named), MPC picks which team-mate and which technique
-                    // (a ground roll vs a lofted throw/punt) the receding-horizon rendezvous can
-                    // best DELIVER, in place of the generic ranked target. An explicitly named
-                    // target (a learned plan / human input) is still honoured, and a restart he
-                    // is taking keeps its own goal-kick rules. The execution-layer MPC then sets
-                    // the launch pace below, so the whole play-out is MPC-driven.
+                    // Keeper play-out keeps receiver choice upstream: learned plans, human input,
+                    // and ranked pass labels name the teammate when available. Only a free keeper
+                    // release (no explicit target) asks the MPC distribution helper to propose a
+                    // receiver/flight pair. The execution-layer MPC then validates delivery and
+                    // sets launch pace without silently swapping an explicit POMDP target.
                     let keeper_mpc_distribution = if self.players[player_id].role
                         == PlayerRole::Goalkeeper
                         && self.restart_double_touch_guard != Some(player_id)
@@ -25421,6 +26663,94 @@ impl SoccerMatch {
         }
     }
 
+    fn live_formation_lp_guidance_for(
+        &self,
+        player_id: usize,
+        team: Team,
+    ) -> Option<&SoccerFormationLpPlayerGuidance> {
+        if !self.config.formation_lp_enabled {
+            return None;
+        }
+        let guidance_store = match team {
+            Team::Home => &self.central_brain.home_formation_lp.last_guidance,
+            Team::Away => &self.central_brain.away_formation_lp.last_guidance,
+        };
+        guidance_store
+            .iter()
+            .find(|guidance| guidance.player_id == player_id && guidance.team == team)
+    }
+
+    pub(crate) fn mpc_off_ball_lp_reference(
+        &self,
+        player_id: usize,
+        target: Vec2,
+        speed: f64,
+    ) -> (Vec2, Option<Vec2>) {
+        let Some(player) = self.players.get(player_id) else {
+            return (target, None);
+        };
+        if self.ball.holder == Some(player_id)
+            || player.role == PlayerRole::Goalkeeper
+            || self
+                .pending_pass
+                .as_ref()
+                .is_some_and(|pass| pass.target == Some(player_id))
+            || (self.ball.holder.is_none() && target.distance(self.ball.position) <= 3.5)
+        {
+            return (target, None);
+        }
+        let Some(guidance) = self.live_formation_lp_guidance_for(player_id, player.team) else {
+            return (target, None);
+        };
+        if !guidance.local_mpc_guidance {
+            return (target, None);
+        }
+        let (field_width, field_length) = sane_pitch_dimensions(
+            self.config.field_width_yards,
+            self.config.field_length_yards,
+        );
+        let current = finite_pitch_point(player.position, field_width, field_length, target);
+        let base_target = finite_pitch_point(target, field_width, field_length, current);
+        let lp_target = finite_pitch_point(guidance.target, field_width, field_length, base_target);
+        let lp_fit = formation_lp_support_target_fit(guidance, base_target);
+        let movement_fit = (soccer_finite_nonnegative_metric(guidance.recommended_move_yards)
+            / 10.0)
+            .clamp(0.0, 1.0);
+        let blend = (0.18 + lp_fit * 0.42 + movement_fit * 0.10).clamp(0.18, 0.70);
+        let mut reference_target = (base_target * (1.0 - blend) + lp_target * blend)
+            .clamp_to_pitch(field_width, field_length);
+        if self.controlled_possession_team_now() == Some(player.team) {
+            let attack = player.team.attack_dir();
+            let base_forward = (base_target.y - current.y) * attack;
+            let reference_forward = (reference_target.y - current.y) * attack;
+            if base_forward > 1.0 && reference_forward < base_forward {
+                reference_target.y = base_target.y;
+            }
+        }
+        let reference_target = reference_target.clamp_to_pitch(field_width, field_length);
+        let target_velocity = finite_vec2(guidance.target_velocity, Vec2::zero());
+        let reference_speed = soccer_finite_nonnegative_metric(speed)
+            .max(soccer_finite_nonnegative_metric(
+                guidance.recommended_speed_yps,
+            ))
+            .max(0.5);
+        let reference_velocity = if target_velocity.len() > 1e-6 {
+            Some(limit_vec2_len(target_velocity, reference_speed))
+        } else if guidance.recommended_move.len() > 1e-6
+            && soccer_finite_nonnegative_metric(guidance.recommended_speed_yps) > 1e-6
+        {
+            let recommended_speed =
+                soccer_finite_nonnegative_metric(guidance.recommended_speed_yps);
+            Some(limit_vec2_len(
+                guidance.recommended_move.normalized() * recommended_speed,
+                reference_speed,
+            ))
+        } else {
+            None
+        };
+        (reference_target, reference_velocity)
+    }
+
     pub(crate) fn mpc_field_obstacles(
         &self,
         player_id: usize,
@@ -25997,7 +27327,12 @@ impl SoccerMatch {
     /// can never exceed the player's fatigue/gait-limited top speed. The controller
     /// is created lazily and retained on the match so its warm start persists
     /// across ticks. `None` on degenerate input (caller falls back to the policy).
-    fn mpc_desired_velocity(&mut self, player_id: usize, target: Vec2, speed: f64) -> Option<Vec2> {
+    pub(crate) fn mpc_desired_velocity(
+        &mut self,
+        player_id: usize,
+        target: Vec2,
+        speed: f64,
+    ) -> Option<Vec2> {
         use crate::des::general::mpc_point_mass::{
             PlanarObstacle, PlanarPointMassMpc, PlanarReference, PlanarState,
         };
@@ -26011,7 +27346,9 @@ impl SoccerMatch {
         let dt = sane_dt_seconds(self.config.dt_seconds, DEFAULT_DT_SECONDS).max(1e-6);
         let horizon = self.config.mpc.player_horizon.max(1);
         let latent = self.mpc_latent_execution_objective(player_id, my_team);
-        let latent_target = self.mpc_latent_shaped_target(my_team, target, latent);
+        let (lp_reference_target, lp_reference_velocity) =
+            self.mpc_off_ball_lp_reference(player_id, target, speed);
+        let latent_target = self.mpc_latent_shaped_target(my_team, lp_reference_target, latent);
         let pitch_value_target = self.mpc_pitch_value_shaped_target(player_id, latent_target);
         // xT terminal-cost shaping (gated; identity when off): nudge the already pitch-value-shaped
         // reference up the control-weighted-threat gradient so an in-possession outfielder settles
@@ -26099,7 +27436,12 @@ impl SoccerMatch {
             Some(v) => {
                 PlanarReference::through([reference_target.x, reference_target.y], [v.x, v.y])
             }
-            None => PlanarReference::arrive([reference_target.x, reference_target.y]),
+            None => match lp_reference_velocity {
+                Some(v) => {
+                    PlanarReference::through([reference_target.x, reference_target.y], [v.x, v.y])
+                }
+                None => PlanarReference::arrive([reference_target.x, reference_target.y]),
+            },
         };
         let accel = controller.control_with_obstacles(state, &[reference], &obstacles);
         let next = Vec2::new(vel.x + accel[0] * dt, vel.y + accel[1] * dt);
@@ -29872,6 +31214,40 @@ impl SoccerMatch {
                             .neural_mcts_root_discretized_kick_candidate_sets
                             .saturating_add(1);
                     }
+                    self.stats.neural_mcts_dribble_candidates =
+                        self.stats.neural_mcts_dribble_candidates.saturating_add(
+                            transition
+                                .decision_context
+                                .neural_mcts_dribble_candidate_count,
+                        );
+                    if transition
+                        .decision_context
+                        .neural_mcts_dribble_candidate_count
+                        > 0
+                    {
+                        self.stats.neural_mcts_dribble_candidate_sets = self
+                            .stats
+                            .neural_mcts_dribble_candidate_sets
+                            .saturating_add(1);
+                    }
+                    self.stats.neural_mcts_root_dribble_candidates = self
+                        .stats
+                        .neural_mcts_root_dribble_candidates
+                        .saturating_add(
+                            transition
+                                .decision_context
+                                .neural_mcts_root_dribble_candidate_count,
+                        );
+                    if transition
+                        .decision_context
+                        .neural_mcts_root_dribble_candidate_count
+                        > 0
+                    {
+                        self.stats.neural_mcts_root_dribble_candidate_sets = self
+                            .stats
+                            .neural_mcts_root_dribble_candidate_sets
+                            .saturating_add(1);
+                    }
                 }
                 if transition.decision_context.neural_mcts_selected {
                     self.stats.neural_mcts_selections =
@@ -32447,17 +33823,23 @@ fn first_touch_shape_prior_for_snapshot(
     let shape_width = (team_shape.spread_yards / 24.0).clamp(0.0, 1.0);
     let lp = formation_lp_guidance
         .map(|guidance| {
-            let target_forward =
+            let target_forward = if guidance.target.y.is_finite() && guidance.current.y.is_finite()
+            {
                 ((guidance.target.y - guidance.current.y) * directive.team.attack_dir() / 8.0)
-                    .clamp(0.0, 1.0);
+                    .clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
             let local_mpc = if guidance.local_mpc_guidance {
                 1.0
             } else {
                 0.0
             };
-            let pressure_fit = guidance.pressure_weight.clamp(0.0, 1.0);
-            let speed_fit = guidance.speed_match_weight.clamp(0.0, 1.0);
-            let shape_clean = (1.0 - guidance.pair_error_yards / 8.0).clamp(0.0, 1.0);
+            let pressure_fit = finite_unit_interval(guidance.pressure_weight);
+            let speed_fit = finite_unit_interval(guidance.speed_match_weight);
+            let shape_clean = (1.0
+                - soccer_finite_nonnegative_metric(guidance.pair_error_yards) / 8.0)
+                .clamp(0.0, 1.0);
             (target_forward * 0.28
                 + local_mpc * 0.24
                 + pressure_fit * 0.16
@@ -41942,19 +43324,20 @@ impl WorldSnapshot {
         let mut candidates = Vec::new();
         if let Some(target_id) = preferred_target {
             candidates.push(target_id);
-        }
-        for target_id in
-            self.ranked_visible_pass_targets(keeper_id, GOALKEEPER_PLAY_OUT_MPC_CANDIDATES)
-        {
-            if !candidates.contains(&target_id) {
-                candidates.push(target_id);
+        } else {
+            for target_id in
+                self.ranked_visible_pass_targets(keeper_id, GOALKEEPER_PLAY_OUT_MPC_CANDIDATES)
+            {
+                if !candidates.contains(&target_id) {
+                    candidates.push(target_id);
+                }
             }
-        }
-        for target_id in
-            self.ranked_visible_aerial_pass_targets(keeper_id, GOALKEEPER_PLAY_OUT_MPC_CANDIDATES)
-        {
-            if !candidates.contains(&target_id) {
-                candidates.push(target_id);
+            for target_id in self
+                .ranked_visible_aerial_pass_targets(keeper_id, GOALKEEPER_PLAY_OUT_MPC_CANDIDATES)
+            {
+                if !candidates.contains(&target_id) {
+                    candidates.push(target_id);
+                }
             }
         }
 
@@ -48424,8 +49807,8 @@ impl WorldSnapshot {
             0.0
         };
         let confidence = (0.82
-            + guidance.alignment_weight.clamp(0.0, 1.0) * 0.08
-            + guidance.pressure_weight.clamp(0.0, 1.0) * 0.06
+            + finite_unit_interval(guidance.alignment_weight) * 0.08
+            + finite_unit_interval(guidance.pressure_weight) * 0.06
             + local_mpc_bonus)
             .clamp(0.82, 1.0);
         ((target_fit * 0.46 + anchor_fit * 0.20 + pressure_fit * 0.14 + clean_fit * 0.20)
@@ -49038,15 +50421,12 @@ impl WorldSnapshot {
         false
     }
 
-    /// MPC determines WHERE and HOW the keeper plays the ball out: among outfield team-mates
-    /// and the two delivery techniques (a ground roll vs a lofted throw/punt), pick the
-    /// (receiver, flight) the receding-horizon rendezvous can best DELIVER — the receiver wins
-    /// the meeting under bounded acceleration ahead of the nearest opponent (high MPC receipt),
-    /// the lane is physically open (a blocked ground lane is undeliverable; a loft may clear
-    /// it), and the receiver is unmarked — tie-broken toward the keeper's territorial flank
-    /// preference. Returns `None` when nothing is cleanly deliverable, so the caller falls back
-    /// to holding / clearing. The launch pace itself is then set by the execution-layer MPC
-    /// (`mpc_pass_execution`), so the whole play-out — receiver, technique and pace — is MPC.
+    /// Free keeper distribution helper for the no-explicit-target case. It proposes the
+    /// (receiver, flight) pair the receding-horizon rendezvous can best deliver: the receiver
+    /// wins the meeting under bounded acceleration ahead of the nearest opponent, the lane is
+    /// physically open, and the receiver is unmarked. When a learned plan / human input / ranked
+    /// label already names the receiver, that target is passed through `goalkeeper_mpc_play_out_plan`
+    /// and MPC validates delivery/pace without re-choosing the teammate.
     pub(crate) fn goalkeeper_mpc_distribution_for(
         &self,
         keeper_id: usize,
