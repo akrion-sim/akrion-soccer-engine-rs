@@ -342,6 +342,197 @@ bigger effect (more training), not just more games.
 Both use `DD_SOCCER_ENABLE_CHANCE_QUALITY_REWARD=1 SOCCER_NEURAL_TARGET_SCALE=30
 SOCCER_NEURAL_TARGET_CLIP=15 SOCCER_NEURAL_TARGET_POPART=true`.
 
+## ROUNDS 9–13 — reward-scale falsified, pivot to STRUCTURAL spatial-target (2026-07-08)
+
+The reward+window climb (above) beats the *trained self-play field* but the frozen frontiers
+still **lose to the pure-analytic engine** (0.33–0.44), so the wall moved but didn't fall. The
+next rounds chase why.
+
+**Round 9–10 — un-crush-via-scale FALSIFIED.** Raising `SOCCER_NEURAL_TARGET_SCALE` to un-crush
+the critic window degraded the *policy*, not just the fit: scale=120, 202k steps, 200g vs analytic
+→ mean **0.432** (Wilson 0.366), GD **−61** — worse than baseline. Confound (Codex): the actor GAE
+path re-multiplies critic predictions by `target_scale` before subtracting, so scale≠a clean
+un-crush. Follow-up `clip=10, no-popart` (decoupled: magnitudes fixed, only the rail widens) also
+REJECTED — 200g vs analytic **0.393** (Wilson 0.327), l2 climbed to 5.8 (critic fighting the rail).
+**Verdict: reward-scale tuning is spent.**
+
+**Round 10 — Codex "GO STRUCTURAL".** Root blocker identified by code audit: the POMDP actor picks
+action **TYPE + POWER but not the SPATIAL TARGET**. Pass receiver = analytic shortlist (no
+pass-to-space); shot placement = analytic (`scored_shot_placement_x`; MCTS shot expansion hardcodes
+goal-center); only DRIBBLE is rich (critic scores 12 move variants). So on pass+shoot the net is
+blocked from the highest-information geometric choice. **Lever: gated, default-off spatial-target
+hardening.**
+
+**BUILT (committed, tree clean, byte-identical off):**
+- `DD_SOCCER_ENABLE_NEURAL_PASS_SPACE` (`world.rs:14005`) — adds a second same-receiver pass
+  candidate whose `target_point` is the anticipated lead/space reception point, so the CRITIC owns
+  the feet-vs-run-onto choice; `target_player` stays bound (pass MPC/receipt/concede-veto unchanged).
+  Pass MPC quality is scored against that point at `world.rs:16569`.
+- `DD_SOCCER_ENABLE_SCORED_SHOT_PLACEMENT` (`world.rs:36676`) — but note this is a **global
+  execution** change (`world.rs:26662`), so enabling it in eval also helps the analytic opponent.
+
+**Round 12 — eval-gate fix (committed):** `draw_aware_lower_bound` + `DD_SOCCER_ENABLE_DRAW_AWARE_WILSON`
+(`soccer_eval_gate.rs:74`, default-off). Empirical {1,0.5,0} variance instead of Bernoulli; flips
+the earlier 200-game 0.493-REJECT toward PASS on the same record.
+
+**Live runs (2026-07-08 ~20:00Z):**
+1. `climb-target` — mainline confirm of reward+window: `CHANCE_QUALITY=1`, `TARGET_SCALE=30 CLIP=15
+   POPART=true`, `hidden=128`, `RELATIONAL_ATTENTION=1`, entropy .05, authoritative λ=8,
+   `DRAW_AWARE_WILSON=1`. Frontier `/tmp/soccer-climb`.
+2. `newmain` — NEW forward-pass-primacy reward: `FORWARD_PASS_REWARD_SCALE=6`,
+   `SHOT_SHAPING_REWARD_SCALE=0.4`, λ=8. Shift buildup toward forward progression; dampen low-value
+   shots. Frontier `/tmp/neural-climb-local/fwdpass-frontier.json`.
+3. `passspace_long` — pass-space net resumed from 198710 steps, training longer.
+
+**Round 13 — Codex re-sync + the LOST verdict.** The pass-space A/B (`passspace_ab.sh`) trained 5
+rounds with the gate ON then ran a 100g gate-ON eval — but **captured no verdict**: the log grep
+missed it because `soccer_eval_gate_run` prints "Wilson lower bound" and **exits nonzero on REJECT**,
+so the filtered/pipefail'd capture swallowed the output. The only recorded eval of that net
+(`confirm_climb.log`, 0.325) ran it with the gate **OFF** → *not a valid lever test*. So pass-space
+is **unproven, not falsified.** Codex round-13 calls:
+- **Q1 — recover the pass-space verdict first** (higher-value uncertainty than the reward run):
+  gate-ON-vs-analytic and gate-OFF-vs-analytic on identical held-out seeds, **separate processes**
+  (gate is a process `OnceLock`), full `tee` capture. → `scripts`/`/tmp/passspace_recover.sh`.
+- **Q2 — pure analytic is the north star.** "0.546 vs trained field + 0.33–0.44 vs analytic" =
+  the neural field is too self-referential to be a promotion target; **analytic anchoring is
+  mandatory** in train/eval. Structural expression is unproven, *not* failed.
+- **Q3 — isolate the gates.** Pass-space alone, then scored-shot-placement alone; only stack them
+  as a later exploratory run. Don't pair (scored-shot-placement's global execution change confounds).
+
+**Housekeeping flagged:** `codex_heartbeat.sh` posts a **stale hardcoded** status ("~0.62 vs
+analytic", `idx8` from 07-05) every 4 min — ignore/repoint its `status_line()` at the live logs.
+Codex's own repo checkout reported **dirty** (`world.rs, player.rs, tests.rs, soccer_league_train.rs`
+modified) while this machine's tree is clean — possible un-synced work on the Codex side.
+
+## STRUCTURAL LEVER — negative, but on a CONFOUNDED stack (2026-07-08, rounds 13–15)
+
+Built Codex's round-10 mainline (spatial-target hardening: goalmouth placement candidates in shot
+MCTS `soccer.rs:64626`, per-receiver + open-lane pass `target_point`s, shot lowering honors
+`plan.target_point`, tests green incl `world.rs:7664`, gate `DD_SOCCER_ENABLE_NEURAL_PASS_SPACE`).
+Also ran the parallel option-1 clip-uncrush. **Both came back negative:**
+
+| arm | games | mean | Wilson | Elo Δ | GD | decision |
+|---|---|---|---|---|---|---|
+| spatial-target (matched-gate) | 16 | 0.438 | 0.228 | −37 | −7 | REJECT |
+| spatial-target (confirm) | 20 | 0.325 | 0.151 | −86 | −14 (exploitable 0.25) | REJECT |
+| clip-uncrush (option 1, at power) | 200 | 0.393 | 0.327 | — | vs baseline 0.42 | REJECT |
+
+Spatial *degraded* behavior (negative GD) — same failure **shape** as scale-120, not merely flat.
+Train signature: critic `l2` 4.25→5.48, but `away_targets` only 45→342 (frozen-analytic opp barely
+trains → weak, non-diverse eval field).
+
+**Round 14 (Claude→Codex):** reported the scoreboard; hypothesized a **stack confound** — the arm
+may have trained WITHOUT the graded chance-quality reward that made reward+window climb to
+0.546/Elo+63, so the selector was handed richer geometry with no graded chance signal to value it.
+Fork: (1) one clean re-run stacked on the confirmed base, vs (2) lock reward+window as incumbent.
+
+**Round 14 (Codex→Claude): run (1) once as a strict falsification.** The confound is real: the
+spatial lever expands/reranks concrete targets and depends on the critic/head valuing them
+correctly; with chance-quality off, richer geometry is selected without the confirmed graded signal
+— not the same test as "does spatial add on top of reward+window?" Hygiene required:
+- compare **confirmed base vs confirmed base + spatial** (NOT old baseline);
+- explicit env `DD_SOCCER_ENABLE_CHANCE_QUALITY_REWARD=1 SOCCER_NEURAL_TARGET_SCALE=30
+  SOCCER_NEURAL_TARGET_CLIP=15 SOCCER_NEURAL_TARGET_POPART=true DD_SOCCER_ENABLE_NEURAL_PASS_SPACE=1`;
+- preflight-prove: `targetPopart` persisted, chance-quality gate logged on, pass-space candidates
+  AND shot-placement variants actually emitted;
+- 160 train / 220 held-out, draw-aware Wilson; if it fails mean/GD vs the same base, **kill spatial,
+  no third rescue.**
+- Nuance: the league log prints `popart` before applying the env, so `popart=false` in that line is
+  unreliable; trust `targetPopart` in the sampled JSON. Codex found no durable proof chance-quality
+  was on for the structural arm — "if someone can prove it was on, I flip to (2) immediately."
+
+**PROVEN — the confound is real (`/tmp/passspace_ab.sh:17-20`):** the structural training env sets
+ONLY `DD_SOCCER_ENABLE_NEURAL_PASS_SPACE=1` + `DD_SOCCER_NEURAL_AUTHORITATIVE_LAMBDA=8`. It does
+**NOT** set `DD_SOCCER_ENABLE_CHANCE_QUALITY_REWARD` nor the window trio. **Chance-quality was OFF;
+the graded signal was absent.** The negative-GD structural result is therefore a confounded test,
+not a refutation. Codex's (1) stands; (2) is not triggered. Next action: launch the clean
+falsification under Codex's hygiene spec — deferred to the driving operator to avoid core
+oversubscription with the live protected learner (the reason `passspace_ab.sh` waited on the
+clip-uncrush PID before starting).
+
+**Round 15 (Codex→Claude) — plan tightened + a gap caught. PRE-REGISTERED, ready to launch:**
+- (a) Preflight must ALSO directly prove the **reward gate**, not just popart+pass-space: a logged
+  `DD_SOCCER_ENABLE_CHANCE_QUALITY_REWARD=1` env/gate echo, or (stronger) a sampled nonzero
+  chance-quality contribution / changed terminal label. `targetPopart==true` + `>0` pass-space
+  emissions only prove the window + pass-space pieces.
+- **GAP CAUGHT — env was missing `DD_SOCCER_ENABLE_SCORED_SHOT_PLACEMENT=1`.** The `shoot-kp*`
+  power buckets are NOT placement proof — tests show they still target goal center. Real scored
+  placement is the separate `scored_shot_placement_x` path behind that flag. Without it the
+  "shot-placement" half of the lever is phantom geometry (the exact round-10 risk). **Corrected
+  clean-run env:** `DD_SOCCER_ENABLE_CHANCE_QUALITY_REWARD=1 SOCCER_NEURAL_TARGET_SCALE=30
+  SOCCER_NEURAL_TARGET_CLIP=15 SOCCER_NEURAL_TARGET_POPART=true DD_SOCCER_ENABLE_NEURAL_PASS_SPACE=1
+  DD_SOCCER_ENABLE_SCORED_SHOT_PLACEMENT=1`.
+- (b) **Pre-registered verdict (160 train / 220 held-out):** PASS = mean payoff **> 0.5 vs the same
+  confirmed base** AND **GD > 0**. Report draw-aware Wilson but do NOT require Wilson-lower > 0.5 at
+  220 (that's the follow-on power run, ~300 games). Miss either mean or GD vs that same base →
+  **kill spatial, no rescue arm.**
+
+## Round 15 — pre-registered rule LOCKED (2026-07-08)
+
+Claude→Codex proved the confound durably (`/tmp/passspace_ab.sh:17-20` set only
+`DD_SOCCER_ENABLE_NEURAL_PASS_SPACE=1` + `NEURAL_AUTHORITATIVE_LAMBDA=8` — chance-quality OFF), then
+asked to pre-register the falsification's decision rule and preflight.
+
+**Codex→Claude (r15):** approved, with two tightenings.
+- **(a) Preflight must prove the reward gate DIRECTLY**, not by inference. `targetPopart==true` + `>0`
+  pass-space emissions prove the window + pass-space pieces but **not** the chance-quality reward.
+  Accept either a logged echo of `DD_SOCCER_ENABLE_CHANCE_QUALITY_REWARD=1` or (stronger) a sampled
+  nonzero chance-quality contribution / changed terminal label. **Caveat:** `shoot-kp*` power buckets
+  are **not** shot-placement proof — they still target goal center; real placement is the separate
+  `scored_shot_placement_x` path behind `DD_SOCCER_ENABLE_SCORED_SHOT_PLACEMENT`. Since we keep that
+  gate OFF (global-execution confound, r13), the arm emits **pass-space candidates only** and the
+  "shot-placement variants emitted" preflight assertion is **dropped**, not satisfied via that gate.
+- **(b) PRE-REGISTERED PASS RULE:** at 160 train / 220 held-out, **PASS iff mean payoff > 0.5 vs the
+  SAME confirmed base AND GD > 0.** Report draw-aware Wilson but do **not** require Wilson-lower > 0.5
+  at 220 (that is the follow-on power run). Miss **either** mean or GD → **kill spatial, no rescue.**
+
+## Round 16 — fresh operator lever: FORWARD-PASS PRIMACY (2026-07-08)
+
+Operator directive (repeated): *measure/reward advancement by **completed forward passes**, not by
+shots taken or goals scored.* This is **reward shaping** (what to reward), distinct from the
+target-scaling representation that failed. Built as two isolated, default-identical env knobs — a
+**cleaner, cheaper attack on the "territory without conversion draws" plateau** than a learned EPV
+potential (no possession-chain export needed):
+
+| env knob | range / default | effect | code |
+|---|---|---|---|
+| `DD_SOCCER_FORWARD_PASS_REWARD_SCALE` | 0..20, dflt 1.0 | multiplies completed-pass shaping reward | `forward_pass_reward_scale()` soccer.rs:23444, applied :23502 |
+| `DD_SOCCER_SHOT_SHAPING_REWARD_SCALE` | 0..1, dflt 1.0 | dampens **only** shot-TAKEN shaping proxy (on/off-target pts) | `shot_shaping_reward_scale()` soccer.rs:23461, applied :36473 |
+
+Goal reward (100) and terminal-outcome reward are **untouched** — the net must still finish.
+Completed-pass rewards are structurally capped **below** shot(40)/goal(100)
+(`COMPLETED_FORWARD_PASS_*` consts, soccer.rs:1245-1260) so "pass forever" can't become optimal; the
+scale only tilts the **dense** gradient toward progressive build-up. Regression guards live in
+`soccer_learning.rs:9091` (analytic-parity) and `:9105` (backward-recycle penalty). A/B built
+(`FWD_PASS_SCALE=6`, `SHOT_SCALE=0.4`, `/tmp/fwdpass_ab.sh`) but **paused** (SIGSTOP, PID 34413/34417)
+to avoid core oversubscription with the live protected learner; not yet evaluated.
+
+**Codex→Claude (r16):**
+- **Run order: spatial falsification FIRST** (already locked, isolated, no rescue arm). Then
+  forward-pass primacy as its **own** independent falsification — same confirmed base, 160/220,
+  PASS iff mean payoff > 0.5 **and** GD > 0, Wilson reported only. If using the existing eval runner,
+  ignore its `DECISION` when the *only* failure is Wilson (`evaluate_promotion` still gates on Wilson).
+- **Forward-pass primacy is conditionally sound but CAN collapse into sterile territory.** Mandatory
+  pre-registered discriminator: **held-out GD ≤ 0 while the completed-forward-pass margin/payoff
+  rises** ⇒ more forward passing without conversion (relabelled territory) — that kills it.
+- **Correction (source-verified):** the "shot 40 / goal 100" cap comment was **stale**. Real consts
+  are `SHOT_ON_TARGET_REWARD_POINTS = 80`, `GOAL_REWARD_POINTS = 160` (soccer.rs:1167,1179). At
+  `FWD_PASS_SCALE=6` a max forward/flank pass component reaches **≈83.5**, and `SHOT_SCALE=0.4` damps
+  SOT shaping to **≈32** — so the lever is **not** structurally capped below shot shaping; it is a
+  real dense-gradient tilt. Goal(160)+terminal still dominate. *(Comment fixed in soccer.rs:1240; audit doc corrected.)*
+- **Preflight (chance-quality):** log the env echo **and** a nonzero terminal-label delta —
+  `with_chance_quality` only bites when `match_outcome_reward_enabled()` builds the terminal label
+  (world.rs:18346); PopArt/target-scale alone is not proof. Validate pass-space by the candidate's
+  `target_point` differing from receiver feet (NOT by a new label; `shoot-kp*` are power labels).
+- **Stacking:** forward-pass (build-up incentive) and chance-quality (terminal draw/chance
+  separation) are **potentially additive, not substitutes**. Only test `CQ+FWD` after each single arm
+  has an attributed result; call it additive only if the combo beats the **best single arm** on
+  mean/GD, not merely base.
+
+**Scoreboard (2026-07-08 ~15:00):** ratchet vs pure analytic holds at **best=0.500** (eval bounces
+0.417–0.500); still not clearing >0.5. Both spatial-target and forward-pass primacy are **unproven,
+not falsified.** Locked plan: run spatial falsification first, forward-pass second, combo last.
+
 ## One-line summary
 
 The ceiling is structural: the net is a *selector over analytic candidates* optimizing

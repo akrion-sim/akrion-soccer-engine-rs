@@ -1237,11 +1237,16 @@ const SHOT_OFF_TARGET_REWARD_POINTS: f64 = 4.0;
 const SHOT_OFF_TARGET_FORGIVENESS_YARDS: f64 = 0.5;
 const SHOT_OFF_TARGET_PENALTY_PER_YARD: f64 = 1.6;
 const SHOT_OFF_TARGET_MAX_PENALTY_POINTS: f64 = 14.0;
-// Base reward for a completed forward pass. Deliberately kept WELL BELOW the shot-on-target
-// (40) and goal (100) rewards so that a string of successive forward passes can never out-earn
-// shooting/scoring — otherwise "pass in succession forever" becomes the optimal POMDP policy.
-// A ~5-pass forward sequence now tops out ~30 pts < shot 40 < goal 100. Passes that actually
-// LEAD to a shot/goal are still credited richly via GOAL_CHAIN_REWARD_PATTERN / the shot pattern.
+// Base reward for a completed forward pass. At the DEFAULT scale (forward_pass_reward_scale()==1)
+// deliberately kept WELL BELOW the shot-on-target (SHOT_ON_TARGET_REWARD_POINTS = 80) and goal
+// (GOAL_REWARD_POINTS = 160) rewards so that a string of successive forward passes can never
+// out-earn shooting/scoring — otherwise "pass in succession forever" becomes the optimal POMDP
+// policy. NOTE: DD_SOCCER_FORWARD_PASS_REWARD_SCALE (0..20) intentionally breaks that ordering for
+// the forward-pass-primacy A/B — e.g. at scale=6 a max forward/flank pass component reaches ~83.5,
+// exceeding a shot-shaping proxy damped by DD_SOCCER_SHOT_SHAPING_REWARD_SCALE. That is the lever:
+// tilt the DENSE gradient toward build-up. Goal (160) + terminal-outcome reward are NOT scaled and
+// still dominate, so finishing is never un-learned. Passes that actually LEAD to a shot/goal are
+// credited richly via GOAL_CHAIN_REWARD_PATTERN / the shot pattern regardless.
 const COMPLETED_FORWARD_PASS_BASE_REWARD_OWN_HALF: f64 = 3.0;
 const COMPLETED_FORWARD_PASS_BASE_REWARD_OPPONENT_HALF: f64 = 4.0;
 const COMPLETED_FORWARD_PASS_PROGRESS_REWARD_PER_YARD: f64 = 0.24;
