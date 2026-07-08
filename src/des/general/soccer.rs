@@ -36449,8 +36449,13 @@ fn soccer_learning_reward_contract() -> SoccerLearningRewardContract {
     SoccerLearningRewardContract {
         goal_points: GOAL_REWARD_POINTS,
         goal_chain_pattern: GOAL_CHAIN_REWARD_PATTERN.to_vec(),
-        shot_on_target_points: SHOT_ON_TARGET_REWARD_POINTS,
-        shot_on_target_pattern: SHOT_ON_TARGET_REWARD_PATTERN.to_vec(),
+        // Shot-taken SHAPING dampener (forward-pass-primacy A/B). Scales only the on-target shot
+        // PROXY reward — `goal_points` above is left intact so finishing still pays. Default 1.0.
+        shot_on_target_points: SHOT_ON_TARGET_REWARD_POINTS * shot_shaping_reward_scale(),
+        shot_on_target_pattern: SHOT_ON_TARGET_REWARD_PATTERN
+            .iter()
+            .map(|points| points * shot_shaping_reward_scale())
+            .collect(),
         possession_progress_milestone_yards: POSSESSION_PROGRESS_MILESTONE_YARDS,
         possession_progress_points: POSSESSION_PROGRESS_REWARD_POINTS,
         possession_progress_reward_weights: POSSESSION_PROGRESS_REWARD_WEIGHTS.to_vec(),
