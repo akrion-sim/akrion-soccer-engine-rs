@@ -19552,6 +19552,10 @@ impl SoccerMatch {
                 self.record_match_result_rewards_at(tick_start_snapshot.tick);
             }
             learning_defense_elapsed += phase_started.elapsed();
+            // All of this tick's reward emitters have now run (turnovers included), so the
+            // finalized event slice can be folded into open support-move windows. Opt-in +
+            // byte-identical no-op unless `DD_SOCCER_ENABLE_SUPPORT_OUTCOME_REWARD` is set.
+            self.accumulate_support_outcome_rewards(&next_snapshot, reward_event_start);
             let tick_reward_events = &self.reward_events[reward_event_start..];
             let has_tick_reward_events = !tick_reward_events.is_empty();
             let has_significant_learning_event =
