@@ -17075,7 +17075,6 @@ impl SoccerMatch {
                 if !soccer_neural_authoritative_actor_training_transition_allowed(transition) {
                     return None;
                 }
-<<<<<<< HEAD
                 let rejected_counterexample =
                     learned_mpc_rejected_action_counterexample(transition);
                 let option_score_safety_counterexample =
@@ -17104,16 +17103,13 @@ impl SoccerMatch {
                     }
                     return None;
                 };
-                let mut advantage = if rejected_counterexample {
-=======
-                let action_index = soccer_policy_action_index(&transition.action)?;
                 // COMA-analytic advantage (gated): reconstruct the raw return and subtract the
                 // DETACHED tabular baseline V_analytic(s) = best_value_hierarchical(current s) from
                 // the SEPARATE tabular policy, so policy-gradient rewards the actor for BEATING
                 // analytic rather than matching it (the escape from value-imitation parity). Raw
                 // reward units throughout (reward_adv / values are ×target_scale; tabular Q is raw),
                 // so no rescale. Gate off ⇒ the original SARSA-style advantage, byte-identical.
-                let advantage = if dd_soccer_enable_coma_analytic_advantage() {
+                let mut advantage = if dd_soccer_enable_coma_analytic_advantage() {
                     let mut adv = if rejected_counterexample {
                         reward_adv[index]
                     } else {
@@ -17133,7 +17129,6 @@ impl SoccerMatch {
                     }
                     adv
                 } else if rejected_counterexample {
->>>>>>> wip/coma-analytic-advantage
                     reward_adv[index] - values[index]
                 } else {
                     advantages[index]
