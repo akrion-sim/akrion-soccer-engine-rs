@@ -11028,9 +11028,18 @@ impl SoccerMatch {
                 let decision = self.pending_support_decisions.swap_remove(i);
                 let now_territorial = territorial_advantage(snapshot, decision.team);
                 if now_territorial.is_finite() && decision.decision_territorial.is_finite() {
+                    let territorial_delta = now_territorial - decision.decision_territorial;
+                    // Dense territorial base + (opt-in) discrete-outcome shaping accumulated over
+                    // the window. Off ⇒ accumulator is 0 and the term vanishes ⇒ byte-identical.
+                    let reward = if support_outcome_reward_enabled() {
+                        territorial_delta
+                            + support_outcome_reward_weight() * decision.outcome_accumulator
+                    } else {
+                        territorial_delta
+                    };
                     self.support_move_samples.push(SupportMoveSample {
                         features: decision.features,
-                        reward: now_territorial - decision.decision_territorial,
+                        reward,
                     });
                     if self.support_move_samples.len() > SUPPORT_MOVE_SAMPLE_CAP {
                         let overflow = self.support_move_samples.len() - SUPPORT_MOVE_SAMPLE_CAP;
