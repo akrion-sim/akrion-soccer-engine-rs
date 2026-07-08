@@ -52,6 +52,79 @@ const SUPPORT_TERM_REF: f64 = 8.0;
 const SUPPORT_SCORER_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_LEARNED_SUPPORT_SCORER";
 const SUPPORT_SCORER_DISABLE_ENV: &str = "DD_SOCCER_DISABLE_LEARNED_SUPPORT_SCORER";
 
+/// Opt-in: fold discrete OUTCOME events (turnover / completed forward pass / shot-on-target /
+/// goal) that occur inside a support move's reward window into that move's training reward,
+/// on top of the dense territorial (pitch-control × xT) delta. Off (unset) ⇒ the reward is the
+/// pure territorial delta exactly as before, so the sample stream is byte-identical and this is
+/// a no-op. This is the seam that teaches the off-ball "where to move" decision from what the
+/// move actually *led to*, not just the space it gained. A/B-gated like the other learned heads.
+const SUPPORT_OUTCOME_REWARD_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_SUPPORT_OUTCOME_REWARD";
+/// Env override for the outcome-blend coefficient λ ([`support_outcome_reward_weight`]).
+const SUPPORT_OUTCOME_REWARD_WEIGHT_ENV: &str = "DD_SOCCER_SUPPORT_OUTCOME_REWARD_WEIGHT";
+
+/// Whether outcome events are folded into the support-move reward this process. Off by default;
+/// requires the scorer itself to be on to have any effect (it feeds the same sample stream).
+pub fn support_outcome_reward_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| support_env_flag(SUPPORT_OUTCOME_REWARD_ENABLE_ENV).unwrap_or(false))
+}
+
+/// Blend coefficient λ applied to a decision's accumulated outcome term before it is added to the
+/// territorial delta: `reward = territorial_delta + λ · outcome_accumulator`. The outcome term is
+/// bounded per [`support_outcome_event_weight`] (a goal contributes ≈ ±1.0 × team weight), so λ
+/// sets outcome shaping on the same order as the territorial base. Tunable via
+/// `DD_SOCCER_SUPPORT_OUTCOME_REWARD_WEIGHT` for A/B sweeps; the default is a deliberately
+/// conservative nudge (territorial stays the dominant dense signal).
+pub fn support_outcome_reward_weight() -> f64 {
+    use std::sync::OnceLock;
+    static WEIGHT: OnceLock<f64> = OnceLock::new();
+    *WEIGHT.get_or_init(|| {
+        std::env::var(SUPPORT_OUTCOME_REWARD_WEIGHT_ENV)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(SUPPORT_OUTCOME_REWARD_WEIGHT_DEFAULT)
+    })
+}
+
+/// Default λ for the outcome blend (see [`support_outcome_reward_weight`]).
+pub const SUPPORT_OUTCOME_REWARD_WEIGHT_DEFAULT: f64 = 0.05;
+/// A teammate's outcome event is credited to *this* off-ball mover's decision at this discount
+/// (the mover's OWN events count at full strength). Mirrors the recency/share philosophy of
+/// `BuildupChainCredit` — the whole in-possession unit shares credit for what the move enabled,
+/// but the deciding player owns their own touch outright.
+pub const SUPPORT_OUTCOME_TEAMMATE_DISCOUNT: f64 = 0.35;
+
+/// Normalized, signed contribution of one reward-event `kind` to an off-ball move's outcome term.
+/// Decoupled from the engine's internal reward magnitudes (which live on a different scale than the
+/// territorial delta) so the blend is bounded and interpretable: a goal ≈ +1.0, a completed forward
+/// pass ≈ +0.2, a turnover ≈ −0.6. Kinds not tied to a move's downstream outcome return 0.0.
+pub fn support_outcome_event_weight(kind: SoccerRewardEventKind) -> f64 {
+    match kind {
+        // Terminal / near-terminal attacking payoff.
+        SoccerRewardEventKind::Goal | SoccerRewardEventKind::HeaderGoalFromCross => 1.0,
+        SoccerRewardEventKind::ShotOnTarget => 0.4,
+        SoccerRewardEventKind::ShotAttempt => 0.12,
+        // Successful forward progression / retention of a threatening move.
+        SoccerRewardEventKind::ThreePassForwardNetGain => 0.28,
+        SoccerRewardEventKind::WallPassCombination => 0.22,
+        SoccerRewardEventKind::BuildupChainCredit => 0.20,
+        SoccerRewardEventKind::TwoForwardPasses => 0.18,
+        SoccerRewardEventKind::ReleaseLongInsideOwnHalf => 0.18,
+        SoccerRewardEventKind::ProgressiveCarryIntoAttack => 0.16,
+        // Turnovers / move-killing blunders (the penalties the move should learn to avoid setting up).
+        SoccerRewardEventKind::OverdribbleDispossession => -0.6,
+        SoccerRewardEventKind::BadPassChainPenalty => -0.5,
+        SoccerRewardEventKind::TurnoverChainBlame => -0.5,
+        SoccerRewardEventKind::OffsideInfraction => -0.35,
+        SoccerRewardEventKind::IsolatedCarrierPanicBackPass => -0.3,
+        SoccerRewardEventKind::UnpressuredBackwardPass => -0.2,
+        SoccerRewardEventKind::ShotOffTargetPenalty => -0.15,
+        _ => 0.0,
+    }
+}
+
 fn support_env_flag(name: &str) -> Option<bool> {
     std::env::var(name).ok().map(|raw| {
         let v = raw.trim().to_ascii_lowercase();
