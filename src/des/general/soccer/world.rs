@@ -16759,42 +16759,12 @@ impl SoccerMatch {
                         })
                     })
                     .unwrap_or((SoccerQPolicyOptions::default().gamma, 0.0));
-<<<<<<< HEAD
                 let successor = successor_indices.get(transition_index).and_then(|index| {
                     index.and_then(|successor_index| transitions.get(successor_index))
                 });
-                let max_next = self.blended_successor_bootstrap_value(
-                    transition,
-                    successor,
-                    tabular_max_next,
-                    target_scale,
-                );
-                let (target, priority) = if !mc_returns.is_empty() {
-                    // MC target: clip(realized_return / target_scale) — NO tabular bootstrap. This is
-                    // the alias-breaking label; `max_next`/`gamma` above are ignored on this path.
-                    let raw = mc_returns.get(transition_index).copied().unwrap_or(0.0);
-                    // Already standardized to ~unit scale in the precompute; clip to the same bound
-                    // (no /target_scale — that division is what saturated the goal-dominated returns).
-                    let scaled = if raw.is_finite() {
-                        raw.clamp(-target_clip, target_clip)
-                    } else {
-                        0.0
-                    };
-                    (scaled, scaled.abs().max(1e-6))
-                } else {
-                    soccer_neural_target_and_priority(
-                        adjusted_reward,
-                        gamma,
-                        max_next,
-                        transition.done,
-                        target_scale,
-                        target_clip,
-                    )
-                };
-=======
-                // Part C — neural self-bootstrap: blend the net's OWN predicted successor value into
-                // `max_next` instead of only the tabular teacher, so the target can rate a policy
-                // BETTER than tabular (true neural TD/Q-learning). Off ⇒ pure tabular (byte-identical).
+                // max_next: neural self-bootstrap (session concept) takes precedence when enabled —
+                // blend the net's OWN predicted (maxA or observed) successor value toward true neural
+                // TD/Q-learning; otherwise main's blended successor-bootstrap; otherwise tabular.
                 let max_next = if !transition.done && dd_soccer_enable_neural_self_bootstrap() {
                     let neural_raw = self
                         .neural_learner_for(transition.team)
@@ -16835,17 +16805,33 @@ impl SoccerMatch {
                         None => tabular_max_next,
                     }
                 } else {
-                    tabular_max_next
+                    self.blended_successor_bootstrap_value(
+                        transition,
+                        successor,
+                        tabular_max_next,
+                        target_scale,
+                    )
                 };
-                let (target, priority) = soccer_neural_target_and_priority(
-                    adjusted_reward,
-                    gamma,
-                    max_next,
-                    transition.done,
-                    target_scale,
-                    target_clip,
-                );
->>>>>>> wip/session-work-concepts
+                let (target, priority) = if !mc_returns.is_empty() {
+                    // MC target: clip(realized_return) — NO tabular bootstrap. This is the
+                    // alias-breaking label; `max_next`/`gamma` above are ignored on this path.
+                    let raw = mc_returns.get(transition_index).copied().unwrap_or(0.0);
+                    let scaled = if raw.is_finite() {
+                        raw.clamp(-target_clip, target_clip)
+                    } else {
+                        0.0
+                    };
+                    (scaled, scaled.abs().max(1e-6))
+                } else {
+                    soccer_neural_target_and_priority(
+                        adjusted_reward,
+                        gamma,
+                        max_next,
+                        transition.done,
+                        target_scale,
+                        target_clip,
+                    )
+                };
                 let sample = SoccerNeuralTrainingSample {
                     input: soccer_neural_transition_features(transition),
                     target,
