@@ -6123,6 +6123,22 @@ fn run_game(
             final_loss
         );
     }
+    // Train the CARRIED executor head on this game's (features, applied_residual, advantage) RWR
+    // corpus so the aim/lead residual improves across games. Only accrues when the gate is on (the
+    // head is seeded + installed above), so this is a no-op in the default byte-identical path.
+    if !mpc_objective_samples.is_empty() {
+        let mut guard = CARRIED_MPC_OBJECTIVE_HEAD.lock().unwrap();
+        let head = guard.get_or_insert_with(|| SoccerMpcObjectiveHead::new(episode_seed as u32));
+        for _ in 0..4 {
+            head.train_rwr(&mpc_objective_samples, 0.05);
+        }
+        eprintln!(
+            "mpc_objective_training samples={} training_steps={} warm={}",
+            mpc_objective_samples.len(),
+            head.training_steps(),
+            head.is_warm(),
+        );
+    }
     let completed_world_model = sim
         .config
         .neural_blend
