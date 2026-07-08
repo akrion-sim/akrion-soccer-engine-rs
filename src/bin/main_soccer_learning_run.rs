@@ -4947,6 +4947,46 @@ fn load_initial_policies(
     .into())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn fallback_rejected_resume_policy_to_checkpoint_artifact(
+    reason: &str,
+    resume_artifact: Option<&str>,
+    rejected_policy_path: &Path,
+    checkpoint_artifact_path: &Path,
+    options: &SoccerQPolicyOptions,
+    policies: &mut SoccerTeamQPolicies,
+    pg_base_policy_fingerprint: &mut Option<u64>,
+) -> Result<bool, Box<dyn Error>> {
+    if !resume_artifact
+        .map(|path| Path::new(path) == rejected_policy_path)
+        .unwrap_or(false)
+    {
+        return Ok(false);
+    }
+    if rejected_policy_path == checkpoint_artifact_path {
+        return Ok(false);
+    }
+    if !checkpoint_artifact_path.exists() {
+        println!(
+            "resume_policy_artifact_fallback_skipped rejected_artifact={} fallback_artifact={} reason={} fallback_missing=true",
+            rejected_policy_path.display(),
+            checkpoint_artifact_path.display(),
+            reason
+        );
+        return Ok(false);
+    }
+    let fallback_path = checkpoint_artifact_path.to_string_lossy().to_string();
+    *policies = load_initial_policies(Some(fallback_path.as_str()), options.clone())?;
+    *pg_base_policy_fingerprint = Some(soccer_team_q_policies_fingerprint(policies));
+    println!(
+        "resume_policy_artifact_fallback_to_checkpoint rejected_artifact={} fallback_artifact={} reason={}",
+        rejected_policy_path.display(),
+        checkpoint_artifact_path.display(),
+        reason
+    );
+    Ok(true)
+}
+
 /// Max fitness *regression* (relative to the incumbent active head) tolerated before
 /// a newer generation still goes `active`, resolved once from env at learner startup
 /// (`SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION`, or the `SOCCER_BATCH_…` alias) so
@@ -7679,6 +7719,15 @@ fn run() -> Result<(), Box<dyn Error>> {
                             metadata_objective,
                             LOCAL_POLICY_PROMOTION_OBJECTIVE_HOME_ANALYTIC,
                         );
+                        fallback_rejected_resume_policy_to_checkpoint_artifact(
+                            "metadata_objective_mismatch",
+                            resume_artifact.as_deref(),
+                            policy_path,
+                            &checkpoint_artifact_path,
+                            &options,
+                            &mut policies,
+                            &mut pg_base_policy_fingerprint,
+                        )?;
                         continue;
                     }
                     if analytic_neural_opponent
@@ -7693,6 +7742,38 @@ fn run() -> Result<(), Box<dyn Error>> {
                             metadata.mean_match_fitness,
                             metadata_objective,
                         );
+                        fallback_rejected_resume_policy_to_checkpoint_artifact(
+                            "metadata_sample_games_below_floor",
+                            resume_artifact.as_deref(),
+                            policy_path,
+                            &checkpoint_artifact_path,
+                            &options,
+                            &mut policies,
+                            &mut pg_base_policy_fingerprint,
+                        )?;
+                        continue;
+                    }
+                    if analytic_neural_opponent
+                        && (!metadata.mean_match_fitness.is_finite()
+                            || metadata.mean_match_fitness < 0.0)
+                    {
+                        println!(
+                            "local_policy_promotion_best_ignored path={} completed_games={} sample_games={} mean_match_fitness={:.4} objective={} reason=negative-or-nonfinite-mean-fitness",
+                            metadata_path.display(),
+                            metadata.completed_games,
+                            metadata.sample_games,
+                            metadata.mean_match_fitness,
+                            metadata_objective,
+                        );
+                        fallback_rejected_resume_policy_to_checkpoint_artifact(
+                            "metadata_negative_or_nonfinite_mean_fitness",
+                            resume_artifact.as_deref(),
+                            policy_path,
+                            &checkpoint_artifact_path,
+                            &options,
+                            &mut policies,
+                            &mut pg_base_policy_fingerprint,
+                        )?;
                         continue;
                     }
                     let loaded_baseline =
@@ -7747,6 +7828,15 @@ fn run() -> Result<(), Box<dyn Error>> {
                             "local_policy_promotion_best_ignored path={} reason=invalid-metadata",
                             metadata_path.display()
                         );
+                        fallback_rejected_resume_policy_to_checkpoint_artifact(
+                            "metadata_invalid",
+                            resume_artifact.as_deref(),
+                            policy_path,
+                            &checkpoint_artifact_path,
+                            &options,
+                            &mut policies,
+                            &mut pg_base_policy_fingerprint,
+                        )?;
                     }
                 }
                 Ok(None) => {}
