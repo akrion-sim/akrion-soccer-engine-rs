@@ -14,6 +14,11 @@ pub const N_ENTITIES: usize = 23; // 22 players + ball
 pub const ENTITY_DIM: usize = 8; // field-motion channels per entity
 pub const FIELD_MOTION_DIM: usize = N_ENTITIES * ENTITY_DIM; // 184
 
+/// Default logged behavior prob for legacy exports that predate the field (deterministic ⇒ 1.0).
+fn default_behavior_policy_probability() -> f32 {
+    1.0
+}
+
 /// One decision row — the engine exports this per learned-policy decision.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Decision {
@@ -25,6 +30,10 @@ pub struct Decision {
     pub reward: f32,
     /// Trajectory boundary — true at the last decision of a possession/agent trajectory.
     pub done: bool,
+    /// TRUE old-policy probability of `action` under the behavior (collection) policy — the engine
+    /// now stamps the sidecar's real sampled prob. Enables clipped-PPO importance weighting.
+    #[serde(default = "default_behavior_policy_probability")]
+    pub behavior_policy_probability: f32,
 }
 
 pub type Trajectory = Vec<Decision>;
@@ -74,6 +83,8 @@ pub struct FlatDecision {
     pub reward: f32,
     pub done: bool,
     pub agent: usize,
+    #[serde(default = "default_behavior_policy_probability")]
+    pub behavior_policy_probability: f32,
 }
 
 /// Load the engine's FLAT export (one `FlatDecision` per line, in emit order) and group into
@@ -107,6 +118,7 @@ pub fn load_flat_grouped(path: &str) -> std::io::Result<Vec<Trajectory>> {
             action: d.action,
             reward: d.reward,
             done: d.done,
+            behavior_policy_probability: d.behavior_policy_probability,
         });
         if done {
             if let Some(traj) = open.remove(&agent) {
