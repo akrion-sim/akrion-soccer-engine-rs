@@ -71,7 +71,6 @@ const SOCCER_POLICY_EXPLORATION_CANDIDATE_LIMIT: usize =
     } else {
         POLICY_SELECTION_TOP_RANK_LIMIT
     };
-<<<<<<< ours
 
 #[derive(Clone, Copy, Debug)]
 struct LearnedMpcReplanThresholds {
@@ -348,8 +347,6 @@ fn defensive_shot_on_target_history_actions() -> usize {
     })
 }
 
-=======
->>>>>>> theirs
 const SOCCER_POLICY_EXPLORATION_TAIL_MASS_LIMIT: f64 = 0.25;
 const SOCCER_POLICY_EXPLORATION_TAIL_RANK_DECAY: f64 = 0.85;
 const PASS_TARGET_MARK_HORIZON_TICKS: [f64; 5] = [0.0, 1.0, 2.0, 4.0, 8.0];
@@ -1804,7 +1801,6 @@ fn stamp_learned_policy_behavior_probability_on_decision(
     }];
 }
 
-<<<<<<< ours
 /// Extra Bellman sweeps over the whole-game replay before neural value training.
 ///
 /// The first pass preserves the historical online Q update order. Opt-in reverse/
@@ -1939,7 +1935,8 @@ fn train_soccer_policy_with_approx_dp(
             policy.train(replay);
         }
     }
-=======
+}
+
 /// Recenter + rescale a training batch's value targets to ~zero-mean / unit-variance. This is the
 /// fix for value-head collapse: with fixed `target_scale` the targets cluster near a constant, so
 /// the loss-optimal solution is a constant output (dead output layer / flat value). Standardizing
@@ -1989,7 +1986,6 @@ fn soccer_novelty_bucket_counts(
         }
     }
     (counts, x_max, y_max)
->>>>>>> theirs
 }
 
 #[cfg(test)]
@@ -10297,16 +10293,6 @@ impl SoccerMatch {
         let target_scale = self.config.neural_learning.sanitized_target_scale();
         let target_clip = self.config.neural_learning.sanitized_target_clip();
         let tick_rewards = soccer_marl_tick_rewards(transitions);
-<<<<<<< ours
-        let successor_indices = Self::neural_successor_indices(transitions);
-        transitions
-            .iter()
-            .enumerate()
-            .filter(|(_, transition)| !self.neural_team_frozen(transition.team))
-            .filter(|(_, transition)| team_filter.map_or(true, |team| transition.team == team))
-            .filter_map(|(transition_index, transition)| {
-                let adjusted_reward = soccer_marl_adjusted_reward(
-=======
         // Novelty exploration bonus (gate-two): count (abstract-state-bucket, action-family) pairs
         // in this batch so rarely-tried pairs get an optimism bonus, nudging the value — and thus
         // the value-ranked policy — to try under-explored actions instead of only analytic ones.
@@ -10317,12 +10303,14 @@ impl SoccerMatch {
         } else {
             (std::collections::HashMap::new(), 0usize, 0usize)
         };
+        // Frozen-team filter preserved from the base builder: a frozen team must not contribute
+        // training samples even under the novelty/self-bootstrap path.
         let mut samples: Vec<SoccerNeuralTrainingSample> = transitions
             .iter()
+            .filter(|transition| !self.neural_team_frozen(transition.team))
             .filter(|transition| team_filter.map_or(true, |team| transition.team == team))
             .filter_map(|transition| {
                 let mut adjusted_reward = soccer_marl_adjusted_reward(
->>>>>>> theirs
                     transition,
                     &tick_rewards,
                     &self.config.neural_learning,
@@ -10369,17 +10357,6 @@ impl SoccerMatch {
                         })
                     })
                     .unwrap_or((SoccerQPolicyOptions::default().gamma, 0.0));
-<<<<<<< ours
-                let successor = successor_indices.get(transition_index).and_then(|index| {
-                    index.and_then(|successor_index| transitions.get(successor_index))
-                });
-                let max_next = self.blended_successor_bootstrap_value(
-                    transition,
-                    successor,
-                    tabular_max_next,
-                    target_scale,
-                );
-=======
                 // Part C — neural self-bootstrap: blend the net's OWN predicted successor value into
                 // `max_next` instead of only the tabular teacher, so the target can rate a policy
                 // BETTER than tabular (true neural TD/Q-learning). Off ⇒ pure tabular (byte-identical).
@@ -10425,7 +10402,6 @@ impl SoccerMatch {
                 } else {
                     tabular_max_next
                 };
->>>>>>> theirs
                 let (target, priority) = soccer_neural_target_and_priority(
                     adjusted_reward,
                     gamma,
@@ -13962,8 +13938,9 @@ impl SoccerMatch {
             + self.completed_pass_and_move_forward_reward(pass)
             + progressive_pass_escape_reward(pass, self.ball.position)
             + self.overload_forward_pass_progression_bonus(pass, self.ball.position);
-<<<<<<< ours
-        self.record_reward_event(pass.from, amount);
+        // Back-date the completed-pass reward to the PASS DECISION tick (launch), not the reception
+        // tick, so the passer's actual decision transition gets credited (gated; off ⇒ current-tick).
+        self.record_reward_event_deferred(pass.launch_tick, pass.from, amount);
         self.queue_recent_outcome_learning_credit(
             pass.from,
             pass.team,
@@ -13972,11 +13949,6 @@ impl SoccerMatch {
             COMPLETED_PASS_LEARNING_CREDIT_MAX_AGE_TICKS,
             |action| is_pass_like_action(action) && action != "wall-return",
         );
-=======
-        // Back-date the completed-pass reward to the PASS DECISION tick (launch), not the reception
-        // tick, so the passer's actual decision transition gets credited (gated; off ⇒ current-tick).
-        self.record_reward_event_deferred(pass.launch_tick, pass.from, amount);
->>>>>>> theirs
         let completed_forward_yards =
             (self.ball.position.y - pass.origin.y) * pass.team.attack_dir();
         if completed_forward_yards >= PROGRESSIVE_CARRY_FORWARD_PASS_MIN_YARDS {
