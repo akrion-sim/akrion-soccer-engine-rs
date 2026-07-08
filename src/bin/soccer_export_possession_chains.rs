@@ -196,11 +196,11 @@ fn main() -> std::io::Result<()> {
                 let outcome = if scoring_team == Some(ct) {
                     Some("goal")
                 } else if scoring_team.is_some() {
-                    // opponent scored during our nominal possession (own-goal / scramble): close as turnover
+                    // opponent scored during our nominal possession (own-goal / scramble): turnover
                     Some("turnover")
-                } else if shot_sot > 0 {
+                } else if sot_for(ct) {
                     Some("shot_on_target")
-                } else if shot_att > 0 {
+                } else if shot_for(ct) {
                     Some("shot")
                 } else if poss.map_or(false, |t| t != ct) {
                     Some("turnover")
