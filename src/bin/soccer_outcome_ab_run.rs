@@ -21,10 +21,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use soccer_engine::des::general::soccer::{
-    enable_deterministic_formation_lp, match_outcome_reward_enabled, MatchConfig,
-    SoccerMarlAlgorithm, SoccerMatch, SoccerNeuralLearningBackend, SoccerNeuralLearningConfig,
-    SoccerNeuralNetworkSnapshot, SoccerQPolicyOptions, SoccerTeamQPolicies,
-    DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
+    enable_deterministic_formation_lp, learned_mpc_objective_enabled, match_outcome_reward_enabled,
+    MatchConfig, SoccerMarlAlgorithm, SoccerMatch, SoccerMpcObjectiveHead,
+    SoccerNeuralLearningBackend, SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot,
+    SoccerQPolicyOptions, SoccerTeamQPolicies, DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
 };
 use soccer_engine::des::general::soccer_eval_gate::{evaluate_promotion, PromotionThresholds};
 use soccer_engine::des::general::tournament::{
