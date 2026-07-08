@@ -12274,7 +12274,7 @@ impl ReceiverDescriptor {
         let lane = i32::from(self.lane.min(2));
         let progression = i32::from(self.progression.min(2));
         let openness = i32::from(self.openness.min(2));
-        ((((kind * 4 + role) * 3 + lane) * 3 + progression) * 3 + openness)
+        (((kind * 4 + role) * 3 + lane) * 3 + progression) * 3 + openness
     }
 
     /// Role bucket for a teammate receiver (GK 0 / DEF 1 / MID 2 / FWD 3).
