@@ -67590,6 +67590,7 @@ fn low_pressure_poor_pass_receives_learning_penalty_vs_carry() {
         )),
         facing: facing_bucket_from_vector(carry_target - sim.players[passer].position),
         dribble_touch: None,
+        receiver_descriptor: None,
     });
     let carry_reward = soccer_transition_reward(
         &sim.players[passer],
