@@ -1801,7 +1801,6 @@ fn stamp_learned_policy_behavior_probability_on_decision(
     }];
 }
 
-<<<<<<< ours
 /// Extra Bellman sweeps over the whole-game replay before neural value training.
 ///
 /// The first pass preserves the historical online Q update order. Opt-in reverse/
