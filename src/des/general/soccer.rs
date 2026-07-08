@@ -12352,6 +12352,11 @@ pub struct SoccerQTargetEntry {
     pub target_tactical_cell_id: usize,
     pub target_macro_cell_id: usize,
     pub target_root_cell_id: usize,
+    /// Encoded [`ReceiverDescriptor`] or [`RECEIVER_DESCRIPTOR_UNSPECIFIED`] (-1). Serde-defaults
+    /// so pre-migration artifacts / RDS rows without the `receiver_descriptor` column load as the
+    /// grid-only legacy entry.
+    #[serde(default = "receiver_descriptor_unspecified")]
+    pub receiver_descriptor: i32,
     pub value: f64,
     pub visits: u32,
 }
