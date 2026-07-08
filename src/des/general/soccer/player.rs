@@ -12414,9 +12414,15 @@ impl PlayerAgent {
                 snapshot
                     .formation_lp_guidance_for(self.id)
                     .map(|guidance| SupportMovementTarget {
+                        // Formation shape is a NUDGE the player's own support pick can override
+                        // (gated). Off ⇒ returns guidance.target ⇒ authoritative as before.
                         point: snapshot.clamp_to_role_position(
                             self.id,
-                            guidance.target,
+                            formation_nudged_target(
+                                self.decision_confidence,
+                                support_target.point,
+                                guidance.target,
+                            ),
                             self.home_position,
                             false,
                         ),
