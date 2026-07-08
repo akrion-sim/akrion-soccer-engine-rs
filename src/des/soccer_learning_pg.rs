@@ -4028,6 +4028,7 @@ fn insert_policy_entries_for_team(
             target_tactical_cell_id: checked_i32(entry.target_tactical_cell_id),
             target_macro_cell_id: checked_i32(entry.target_macro_cell_id),
             target_root_cell_id: checked_i32(entry.target_root_cell_id),
+            receiver_descriptor: entry.receiver_descriptor,
             value_micros: soccer_learning_to_micros(entry.value),
             visits: checked_i32(entry.visits),
         });
