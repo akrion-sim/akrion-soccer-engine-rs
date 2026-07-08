@@ -15605,3 +15605,41 @@ mod shot_foot_choice_tests {
         assert!(damp > 0.0 && damp < 1.0);
     }
 }
+
+#[cfg(test)]
+mod formation_nudge_tests {
+    use super::formation_nudge_blend;
+    use crate::des::general::soccer::Vec2;
+
+    #[test]
+    fn full_conviction_ignores_the_shape_signal() {
+        let own = Vec2::new(10.0, 20.0);
+        let lp = Vec2::new(40.0, 20.0);
+        // decision_confidence 1.0 ⇒ weight 0 ⇒ the player's own read fully overrides the nudge.
+        let out = formation_nudge_blend(1.0, own, lp, 0.6, 6.0);
+        assert!((out.x - own.x).abs() < 1e-9 && (out.y - own.y).abs() < 1e-9);
+    }
+
+    #[test]
+    fn zero_conviction_pulls_toward_shape_but_stays_bounded() {
+        let own = Vec2::new(0.0, 0.0);
+        let lp = Vec2::new(100.0, 0.0); // far away: exercises the yard cap
+        let out = formation_nudge_blend(0.0, own, lp, 0.6, 6.0);
+        // Moves toward the LP target...
+        assert!(out.x > own.x && out.x <= lp.x);
+        // ...but never more than the max-yards cap, however far the LP sits.
+        assert!((out - own).len() <= 6.0 + 1e-9, "nudge must stay a bounded nudge: {out:?}");
+    }
+
+    #[test]
+    fn confidence_monotonically_reduces_the_pull() {
+        let own = Vec2::new(0.0, 0.0);
+        let lp = Vec2::new(4.0, 0.0); // within the cap so weight (not the clamp) drives distance
+        let unsure = (formation_nudge_blend(0.2, own, lp, 0.6, 6.0) - own).len();
+        let confident = (formation_nudge_blend(0.8, own, lp, 0.6, 6.0) - own).len();
+        assert!(
+            unsure > confident,
+            "a more convinced player should follow the shape less: unsure={unsure} confident={confident}"
+        );
+    }
+}
