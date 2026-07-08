@@ -11080,6 +11080,60 @@ impl SoccerMatch {
         }
     }
 
+    /// Fold this tick's discrete OUTCOME events (turnover / completed forward pass / shot-on-target
+    /// / goal) into every still-open support-move decision's window. Opt-in via
+    /// `DD_SOCCER_ENABLE_SUPPORT_OUTCOME_REWARD`; a no-op and byte-identical when off or when
+    /// nothing is pending. MUST be called AFTER all of a tick's reward emitters have run (turnovers
+    /// in particular are emitted late in the step), reading the finalized
+    /// `reward_events[reward_event_start..]` slice.
+    ///
+    /// Credit model (mover-weighted + team-discounted): a decision accrues its OWN player's outcome
+    /// events at full strength and its teammates' at [`SUPPORT_OUTCOME_TEAMMATE_DISCOUNT`]. Opponent
+    /// events are ignored — a move is trained from what ITS team's play led to, with the reward /
+    /// penalty sign already carried by [`support_outcome_event_weight`].
+    pub(crate) fn accumulate_support_outcome_rewards(
+        &mut self,
+        snapshot: &WorldSnapshot,
+        reward_event_start: usize,
+    ) {
+        if !support_outcome_reward_enabled() || self.pending_support_decisions.is_empty() {
+            return;
+        }
+        // Resolve each nonzero-weight event to (emitting player, its team, normalized weight) once,
+        // skipping the many zero-weight kinds so the common (no-outcome) tick stays cheap.
+        let mut contributions: Vec<(usize, Team, f64)> = Vec::new();
+        for event in &self.reward_events[reward_event_start..] {
+            let weight = support_outcome_event_weight(event.kind);
+            if weight == 0.0 {
+                continue;
+            }
+            if let Some(team) = snapshot
+                .players
+                .iter()
+                .find(|p| p.id == event.player_id)
+                .map(|p| p.team)
+            {
+                contributions.push((event.player_id, team, weight));
+            }
+        }
+        if contributions.is_empty() {
+            return;
+        }
+        for decision in self.pending_support_decisions.iter_mut() {
+            for &(event_player, event_team, weight) in &contributions {
+                if event_team != decision.team {
+                    continue;
+                }
+                let factor = if event_player == decision.player_id {
+                    1.0
+                } else {
+                    SUPPORT_OUTCOME_TEAMMATE_DISCOUNT
+                };
+                decision.outcome_accumulator += weight * factor;
+            }
+        }
+    }
+
     /// Drain collected support-move RL samples for the learner.
     pub fn drain_support_move_samples(&mut self) -> Vec<SupportMoveSample> {
         std::mem::take(&mut self.support_move_samples)
