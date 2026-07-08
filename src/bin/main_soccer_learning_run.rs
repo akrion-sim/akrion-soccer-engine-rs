@@ -6127,7 +6127,7 @@ fn run_game(
             }
         }
         eprintln!(
-            "world_model_training episode={} enabled={} training_steps={} loss={:?} validation_loss={:?} planning_decisions={} neural_mcts_selection_rate={:.4} neural_mcts_discretized_kick_rate={:.4} neural_mcts_technical_action_rate={:.4} neural_mcts_discretized_kick_candidate_share={:.4} neural_mcts_root_discretized_kick_candidate_share={:.4} neural_mcts_discretized_kick_candidate_set_rate={:.4} neural_mcts_root_discretized_kick_candidate_set_rate={:.4} mpc_replan_rate={:.4} mpc_replan_mpc_rate={:.4} mpc_replan_option_score_safety_rate={:.4} mpc_replan_neural_mcts_rate={:.4} mpc_replans={} mpc_replans_mpc={} mpc_replans_option_score_safety={} mpc_replans_neural_mcts={} policy_priority_samples={} policy_priority_rate={:.4} policy_priority_mean_weight={:.3} option_score_safety_actor_samples={}/{} option_score_safety_actor_sample_rate={:.4} option_score_safety_actor_mean_weight={:.3} neural_mcts_distillation_samples={} neural_mcts_distillation_rate={:.4} neural_mcts_distillation_mean_weight={:.3} policy_entropy={:.4} learning_transitions_captured={} learning_transitions_trained={} learning_nonzero_reward_transitions={} learning_reward_events={} learning_deferred_reward_drained={} learning_deferred_reward_backlog={}",
+            "world_model_training episode={} enabled={} training_steps={} loss={:?} validation_loss={:?} planning_decisions={} neural_mcts_selection_rate={:.4} neural_mcts_discretized_kick_rate={:.4} neural_mcts_technical_action_rate={:.4} neural_mcts_discretized_kick_candidate_share={:.4} neural_mcts_root_discretized_kick_candidate_share={:.4} neural_mcts_discretized_kick_candidate_set_rate={:.4} neural_mcts_root_discretized_kick_candidate_set_rate={:.4} mpc_replan_rate={:.4} mpc_replan_mpc_rate={:.4} mpc_replan_option_score_safety_rate={:.4} mpc_replan_neural_mcts_rate={:.4} mpc_replans={} mpc_replans_mpc={} mpc_replans_option_score_safety={} mpc_replans_neural_mcts={} policy_priority_samples={} policy_priority_rate={:.4} policy_priority_mean_weight={:.3} option_score_safety_actor_samples={}/{} option_score_safety_actor_sample_rate={:.4} option_score_safety_actor_mean_weight={:.3} option_score_safety_actor_drops=throttle:{},actor:{},unindexed:{},nonfinite:{} neural_mcts_distillation_samples={} neural_mcts_distillation_rate={:.4} neural_mcts_distillation_mean_weight={:.3} policy_entropy={:.4} learning_transitions_captured={} learning_transitions_trained={} learning_nonzero_reward_transitions={} learning_reward_events={} learning_deferred_reward_drained={} learning_deferred_reward_backlog={}",
             episode + 1,
             world_model_stats.enabled,
             world_model_stats.training_steps,
@@ -6156,6 +6156,10 @@ fn run_game(
             planning_stats.option_score_safety_counterexample_candidates,
             planning_stats.option_score_safety_counterexample_sample_rate,
             planning_stats.mean_option_score_safety_counterexample_weight,
+            planning_stats.option_score_safety_counterexample_throttle_filtered,
+            planning_stats.option_score_safety_counterexample_actor_filtered,
+            planning_stats.option_score_safety_counterexample_unindexed_action,
+            planning_stats.option_score_safety_counterexample_nonfinite_advantage,
             planning_stats.neural_mcts_distillation_samples,
             planning_stats.neural_mcts_distillation_rate,
             planning_stats.mean_neural_mcts_distillation_weight,
@@ -9012,21 +9016,89 @@ fn run() -> Result<(), Box<dyn Error>> {
                     snapshot: carried_snapshot,
                     world_model: carried_world_model,
                 } = carry_selection;
-                let carried_world_model_steps =
-                    install_carried_world_model_snapshot(carried_world_model);
-                latest_neural_network = Some(carried_snapshot);
-                latest_neural_network_arc_cache = None;
-                carried_unvalidated_neural_snapshot_episode = Some(carried_episode);
-                println!(
-                    "neural_batch_snapshot_carried_unvalidated episodes={}..{} snapshots={} selection_mode=training_steps carried_episode={} carried_match_fitness={:.4} carried_training_steps={} carried_world_model_steps={} reason=no_publishable_snapshot publish_selected=false",
-                    batch_start_episode + 1,
-                    batch_start_episode + batch_size,
-                    carried_snapshot_count,
-                    carried_episode,
-                    carried_match_fitness,
-                    carried_training_steps,
-                    carried_world_model_steps,
-                );
+                let mut carry_validation_allowed = true;
+                let mut carry_validation_fitness = None::<f64>;
+                let mut carry_validation_goal_margin = None::<f64>;
+                let mut carry_validation_error = None::<String>;
+                if neural_batch_snapshot_validate_games > 0 {
+                    let mut validation_config = neural_population_search_config;
+                    validation_config.eval_games = neural_batch_snapshot_validate_games.max(1);
+                    validation_config.eval_minutes = neural_batch_snapshot_validate_minutes;
+                    let validation_seed = u64::from(effective_seed)
+                        ^ (carried_episode as u64).wrapping_mul(0xA8F2_D48B_7C51_3D2F)
+                        ^ ((batch_start_episode + batch_size) as u64)
+                            .wrapping_mul(0xC6BC_2796_92B5_CC83)
+                        ^ 0x51B7_1F7A_5B2E_62D1;
+                    let validation_candidate = NeuralPopulationCandidate {
+                        index: 0,
+                        source: format!("batch_no_publishable_carry_episode_{carried_episode}"),
+                        snapshot: carried_snapshot.clone(),
+                    };
+                    match evaluate_neural_population_candidate_against_analytic_home_learning_objective(
+                        validation_candidate,
+                        config.clone(),
+                        validation_config,
+                        validation_seed,
+                    ) {
+                        Ok(eval) => {
+                            let goal_margin = neural_population_candidate_goal_margin(&eval);
+                            carry_validation_fitness = Some(eval.fitness);
+                            carry_validation_goal_margin = Some(goal_margin);
+                            carry_validation_allowed = batch_neural_snapshot_validation_passes(
+                                &eval,
+                                neural_batch_snapshot_carry_min_validation_fitness,
+                                neural_batch_snapshot_carry_min_validation_goal_margin,
+                            );
+                        }
+                        Err(error) => {
+                            carry_validation_allowed = false;
+                            carry_validation_error = Some(error.replace(char::is_whitespace, "_"));
+                        }
+                    }
+                }
+                if carry_validation_allowed {
+                    let carried_world_model_steps =
+                        install_carried_world_model_snapshot(carried_world_model);
+                    latest_neural_network = Some(carried_snapshot);
+                    latest_neural_network_arc_cache = None;
+                    carried_unvalidated_neural_snapshot_episode = Some(carried_episode);
+                    println!(
+                        "neural_batch_snapshot_carried_unvalidated episodes={}..{} snapshots={} selection_mode=training_steps carried_episode={} carried_match_fitness={:.4} carried_training_steps={} carried_world_model_steps={} reason=no_publishable_snapshot validation_fitness={} validation_goal_margin={} publish_selected=false",
+                        batch_start_episode + 1,
+                        batch_start_episode + batch_size,
+                        carried_snapshot_count,
+                        carried_episode,
+                        carried_match_fitness,
+                        carried_training_steps,
+                        carried_world_model_steps,
+                        carry_validation_fitness
+                            .map(|fitness| format!("{fitness:.4}"))
+                            .unwrap_or_else(|| "disabled".to_string()),
+                        carry_validation_goal_margin
+                            .map(|goal_margin| format!("{goal_margin:.4}"))
+                            .unwrap_or_else(|| "disabled".to_string()),
+                    );
+                } else {
+                    println!(
+                        "neural_batch_snapshot_carry_unvalidated_held episodes={}..{} snapshots={} selection_mode=training_steps held_episode={} held_match_fitness={:.4} validation_fitness={} validation_goal_margin={} carry_min_fitness={:.4} carry_min_goal_margin={:.4} reason={} publish_selected=false",
+                        batch_start_episode + 1,
+                        batch_start_episode + batch_size,
+                        carried_snapshot_count,
+                        carried_episode,
+                        carried_match_fitness,
+                        carry_validation_fitness
+                            .map(|fitness| format!("{fitness:.4}"))
+                            .unwrap_or_else(|| "unavailable".to_string()),
+                        carry_validation_goal_margin
+                            .map(|goal_margin| format!("{goal_margin:.4}"))
+                            .unwrap_or_else(|| "unavailable".to_string()),
+                        neural_batch_snapshot_carry_min_validation_fitness,
+                        neural_batch_snapshot_carry_min_validation_goal_margin,
+                        carry_validation_error
+                            .map(|error| format!("no_publishable_validation_error:{error}"))
+                            .unwrap_or_else(|| "no_publishable_validation_floor".to_string()),
+                    );
+                }
             } else if neural_batch_snapshot_count > 0 {
                 println!(
                     "neural_batch_snapshot_carry_unvalidated_held episodes={}..{} snapshots={} min_carry_fitness={:.4} reason=no_available_training_snapshot",

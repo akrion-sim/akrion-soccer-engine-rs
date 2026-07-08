@@ -7860,8 +7860,7 @@ fn analytic_difference_reward_alignment_damps_bad_realized_dense_outcomes() {
             < 1e-12
     );
     assert!(
-        (soccer_realized_aligned_analytic_difference_reward(&decision, -1.0)
-            - raw_positive * 0.20)
+        (soccer_realized_aligned_analytic_difference_reward(&decision, -1.0) - raw_positive * 0.20)
             .abs()
             < 1e-12
     );

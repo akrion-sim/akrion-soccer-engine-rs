@@ -8302,6 +8302,15 @@ pub struct SoccerDecisionContext {
     pub wrong_idea_right_execution: bool,
     #[serde(default)]
     pub wrong_idea_wrong_execution: bool,
+    /// True when this transition is a replayed delayed outcome credit, not just
+    /// same-tick dense shaping. The actor uses this to keep realized
+    /// pass/dribble/shot/turnover outcomes from being drowned by dense rows.
+    #[serde(default)]
+    pub learning_outcome_credit: bool,
+    /// Sign of the replayed delayed outcome credit: +1 for success, -1 for
+    /// failure/turnover, 0 for ordinary same-tick shaping.
+    #[serde(default)]
+    pub learning_outcome_polarity: f64,
     #[serde(default)]
     pub human_teammate_intent_distance_yards: f64,
     #[serde(default)]
@@ -19007,6 +19016,14 @@ pub struct MatchStats {
     #[serde(default)]
     pub option_score_safety_counterexample_weight_sum: f64,
     #[serde(default)]
+    pub option_score_safety_counterexample_throttle_filtered: u32,
+    #[serde(default)]
+    pub option_score_safety_counterexample_actor_filtered: u32,
+    #[serde(default)]
+    pub option_score_safety_counterexample_unindexed_action: u32,
+    #[serde(default)]
+    pub option_score_safety_counterexample_nonfinite_advantage: u32,
+    #[serde(default)]
     pub neural_mcts_distillation_samples: u32,
     #[serde(default)]
     pub neural_mcts_distillation_weight_sum: f64,
@@ -19069,6 +19086,10 @@ pub struct SoccerPlanningValidationStats {
     pub option_score_safety_counterexample_samples: u32,
     pub option_score_safety_counterexample_sample_rate: f64,
     pub mean_option_score_safety_counterexample_weight: f64,
+    pub option_score_safety_counterexample_throttle_filtered: u32,
+    pub option_score_safety_counterexample_actor_filtered: u32,
+    pub option_score_safety_counterexample_unindexed_action: u32,
+    pub option_score_safety_counterexample_nonfinite_advantage: u32,
     pub neural_mcts_distillation_samples: u32,
     pub neural_mcts_distillation_rate: f64,
     pub mean_neural_mcts_distillation_weight: f64,
@@ -19234,13 +19255,20 @@ impl MatchStats {
             option_score_safety_counterexample_samples: self
                 .option_score_safety_counterexample_samples,
             option_score_safety_counterexample_sample_rate: self
-                .option_score_safety_counterexample_samples as f64
-                / self
-                    .option_score_safety_counterexample_candidates
-                    .max(1) as f64,
+                .option_score_safety_counterexample_samples
+                as f64
+                / self.option_score_safety_counterexample_candidates.max(1) as f64,
             mean_option_score_safety_counterexample_weight: self
                 .option_score_safety_counterexample_weight_sum
                 / self.option_score_safety_counterexample_samples.max(1) as f64,
+            option_score_safety_counterexample_throttle_filtered: self
+                .option_score_safety_counterexample_throttle_filtered,
+            option_score_safety_counterexample_actor_filtered: self
+                .option_score_safety_counterexample_actor_filtered,
+            option_score_safety_counterexample_unindexed_action: self
+                .option_score_safety_counterexample_unindexed_action,
+            option_score_safety_counterexample_nonfinite_advantage: self
+                .option_score_safety_counterexample_nonfinite_advantage,
             neural_mcts_distillation_samples: self.neural_mcts_distillation_samples,
             neural_mcts_distillation_rate: self.neural_mcts_distillation_samples as f64
                 / decisions as f64,
@@ -24161,6 +24189,8 @@ fn soccer_decision_context_for(
         right_idea_wrong_execution: false,
         wrong_idea_right_execution: false,
         wrong_idea_wrong_execution: false,
+        learning_outcome_credit: false,
+        learning_outcome_polarity: 0.0,
         human_teammate_intent_distance_yards: human_intent.distance_yards,
         human_teammate_has_ball: human_intent.has_ball,
         human_teammate_pressure: human_intent.pressure,
@@ -24990,8 +25020,8 @@ fn soccer_transition_reward_with_tactics(
             + separation_penalty,
         tunables().reward.dense_shaping_budget_points,
     ) - separation_penalty;
-    let mut reward = dense_reward
-        + soccer_realized_aligned_analytic_difference_reward(decision, dense_reward);
+    let mut reward =
+        dense_reward + soccer_realized_aligned_analytic_difference_reward(decision, dense_reward);
 
     if !infer_discrete_events {
         return reward;
@@ -38955,6 +38985,10 @@ struct SoccerPolicyTrainingBatch {
     option_score_safety_counterexample_candidates: usize,
     option_score_safety_counterexample_samples: usize,
     option_score_safety_counterexample_weight_sum: f64,
+    option_score_safety_counterexample_throttle_filtered: usize,
+    option_score_safety_counterexample_actor_filtered: usize,
+    option_score_safety_counterexample_unindexed_action: usize,
+    option_score_safety_counterexample_nonfinite_advantage: usize,
 }
 
 impl SoccerPolicySample {

@@ -59,6 +59,8 @@ const SOCCER_ACTOR_NEGATIVE_OUTCOME_PRIORITY_WEIGHT: f64 = 1.6;
 const SOCCER_ACTOR_ON_BALL_ACTION_PRIORITY_WEIGHT: f64 = 1.35;
 const SOCCER_ACTOR_ON_BALL_OUTCOME_PRIORITY_WEIGHT: f64 = 1.75;
 const SOCCER_ACTOR_ON_BALL_OUTCOME_ADVANTAGE_FLOOR: f64 = 0.25;
+const SOCCER_ACTOR_OUTCOME_CREDIT_PRIORITY_WEIGHT: f64 = 4.0;
+const SOCCER_ACTOR_OUTCOME_CREDIT_ADVANTAGE_FLOOR: f64 = NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR;
 const SOCCER_NEURAL_AUTHORITATIVE_TRAIN_DECISIVE_REWARD_FLOOR: f64 = 0.75;
 const SOCCER_NEURAL_AUTHORITATIVE_PASSIVE_OFF_BALL_CRITIC_SAMPLE_RATE: f64 = 0.12;
 const COMPLETED_PASS_LEARNING_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(5.0);
@@ -2869,6 +2871,8 @@ mod tests {
                     && transition.tick == 96
                     && normalize_soccer_action_label(&transition.action) == "pass"
                     && transition.reward > 0.0
+                    && transition.decision_context.learning_outcome_credit
+                    && transition.decision_context.learning_outcome_polarity > 0.0
                     && !transition.done
             }),
             "completed-pass reward must replay the original pass decision, got {added:?}"
@@ -4833,17 +4837,32 @@ mod tests {
             let _analytic = set_test_env_var("SOCCER_LEARNING_ANALYTIC_OPPONENT", "1");
             assert!((option_score_safety_counterexample_sample_rate() - 0.05).abs() < 1e-9);
             assert!((option_score_safety_counterexample_advantage_scale() - 0.25).abs() < 1e-9);
-            assert!(
-                (option_score_safety_counterexample_sample_weight(3.25) - 1.25).abs() < 1e-9
+            assert!((option_score_safety_counterexample_sample_weight(3.25) - 1.25).abs() < 1e-9);
+        }
+
+        {
+            let _analytic = set_test_env_var("SOCCER_LEARNING_ANALYTIC_OPPONENT", "1");
+            let _max_rate = set_test_env_var(
+                "SOCCER_OPTION_SCORE_SAFETY_ANALYTIC_OPPONENT_MAX_SAMPLE_RATE",
+                "1.0",
             );
+            let _max_scale = set_test_env_var(
+                "SOCCER_OPTION_SCORE_SAFETY_ANALYTIC_OPPONENT_MAX_ADVANTAGE_SCALE",
+                "1.0",
+            );
+            let _max_weight = set_test_env_var(
+                "SOCCER_OPTION_SCORE_SAFETY_ANALYTIC_OPPONENT_MAX_SAMPLE_WEIGHT",
+                "3.25",
+            );
+            assert!((option_score_safety_counterexample_sample_rate() - 1.0).abs() < 1e-9);
+            assert!((option_score_safety_counterexample_advantage_scale() - 1.0).abs() < 1e-9);
+            assert!((option_score_safety_counterexample_sample_weight(3.25) - 3.25).abs() < 1e-9);
         }
 
         let _analytic = set_test_env_var("SOCCER_LEARNING_ANALYTIC_OPPONENT", "0");
         assert!((option_score_safety_counterexample_sample_rate() - 1.0).abs() < 1e-9);
         assert!((option_score_safety_counterexample_advantage_scale() - 1.0).abs() < 1e-9);
-        assert!(
-            (option_score_safety_counterexample_sample_weight(3.25) - 3.25).abs() < 1e-9
-        );
+        assert!((option_score_safety_counterexample_sample_weight(3.25) - 3.25).abs() < 1e-9);
     }
 
     #[test]
@@ -8017,6 +8036,33 @@ mod tests {
     }
 
     #[test]
+    fn delayed_outcome_credit_gets_actor_priority_and_sign_floor() {
+        let mut positive = policy_test_transition_with_mcts(false);
+        positive.observation.has_ball = true;
+        positive.action = "shoot".to_string();
+        positive.reward = 0.05;
+        positive.decision_context.learning_outcome_credit = true;
+        positive.decision_context.learning_outcome_polarity = 1.0;
+
+        assert_eq!(
+            soccer_actor_priority_weight(&positive, -0.20),
+            SOCCER_ACTOR_OUTCOME_CREDIT_PRIORITY_WEIGHT
+        );
+        assert_eq!(
+            soccer_actor_outcome_credit_advantage(&positive, -0.20),
+            SOCCER_ACTOR_OUTCOME_CREDIT_ADVANTAGE_FLOOR
+        );
+
+        let mut negative = positive.clone();
+        negative.reward = -0.05;
+        negative.decision_context.learning_outcome_polarity = -1.0;
+        assert_eq!(
+            soccer_actor_outcome_credit_advantage(&negative, 0.20),
+            -SOCCER_ACTOR_OUTCOME_CREDIT_ADVANTAGE_FLOOR
+        );
+    }
+
+    #[test]
     fn on_ball_actor_actions_get_priority_without_overweighting_shape_noise() {
         let mut transition = policy_test_transition_with_mcts(false);
         transition.observation.has_ball = true;
@@ -8608,13 +8654,36 @@ fn soccer_learning_analytic_opponent_env_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn option_score_safety_analytic_opponent_max_sample_rate() -> f64 {
+    learned_mpc_probability_env(
+        "SOCCER_OPTION_SCORE_SAFETY_ANALYTIC_OPPONENT_MAX_SAMPLE_RATE",
+        SOCCER_OPTION_SCORE_SAFETY_ANALYTIC_OPPONENT_MAX_SAMPLE_RATE,
+    )
+}
+
+fn option_score_safety_analytic_opponent_max_advantage_scale() -> f64 {
+    learned_mpc_probability_env(
+        "SOCCER_OPTION_SCORE_SAFETY_ANALYTIC_OPPONENT_MAX_ADVANTAGE_SCALE",
+        SOCCER_OPTION_SCORE_SAFETY_ANALYTIC_OPPONENT_MAX_ADVANTAGE_SCALE,
+    )
+}
+
+fn option_score_safety_analytic_opponent_max_sample_weight() -> f64 {
+    learned_mpc_metric_env(
+        "SOCCER_OPTION_SCORE_SAFETY_ANALYTIC_OPPONENT_MAX_SAMPLE_WEIGHT",
+        SOCCER_OPTION_SCORE_SAFETY_ANALYTIC_OPPONENT_MAX_SAMPLE_WEIGHT,
+        1.0,
+        SOCCER_POLICY_PRIORITY_WEIGHT_MAX,
+    )
+}
+
 fn option_score_safety_counterexample_sample_rate() -> f64 {
     let sample_rate = learned_mpc_probability_env(
         "SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_SAMPLE_RATE",
         SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_SAMPLE_RATE,
     );
     if soccer_learning_analytic_opponent_env_enabled() {
-        sample_rate.min(SOCCER_OPTION_SCORE_SAFETY_ANALYTIC_OPPONENT_MAX_SAMPLE_RATE)
+        sample_rate.min(option_score_safety_analytic_opponent_max_sample_rate())
     } else {
         sample_rate
     }
@@ -8626,7 +8695,7 @@ fn option_score_safety_counterexample_advantage_scale() -> f64 {
         SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_ADVANTAGE_SCALE,
     );
     if soccer_learning_analytic_opponent_env_enabled() {
-        advantage_scale.min(SOCCER_OPTION_SCORE_SAFETY_ANALYTIC_OPPONENT_MAX_ADVANTAGE_SCALE)
+        advantage_scale.min(option_score_safety_analytic_opponent_max_advantage_scale())
     } else {
         advantage_scale
     }
@@ -8634,7 +8703,7 @@ fn option_score_safety_counterexample_advantage_scale() -> f64 {
 
 fn option_score_safety_counterexample_sample_weight(sample_weight: f64) -> f64 {
     if soccer_learning_analytic_opponent_env_enabled() {
-        sample_weight.min(SOCCER_OPTION_SCORE_SAFETY_ANALYTIC_OPPONENT_MAX_SAMPLE_WEIGHT)
+        sample_weight.min(option_score_safety_analytic_opponent_max_sample_weight())
     } else {
         sample_weight
     }
@@ -8873,7 +8942,8 @@ fn neural_mcts_shot_mpc_candidate_bonus(transition: &SoccerLearningTransition) -
 }
 
 fn neural_mcts_shot_bucket_has_quality_prior(transition: &SoccerLearningTransition) -> bool {
-    neural_mcts_shot_mpc_candidate_bonus(transition) >= neural_mcts_shot_bucket_min_candidate_bonus()
+    neural_mcts_shot_mpc_candidate_bonus(transition)
+        >= neural_mcts_shot_bucket_min_candidate_bonus()
 }
 
 fn neural_mcts_pitch_value_success_probability(transition: &SoccerLearningTransition) -> f64 {
@@ -9155,6 +9225,7 @@ fn soccer_actor_priority_weight(transition: &SoccerLearningTransition, advantage
     if soccer_actor_mcts_distillation_priority(transition, advantage) {
         weight = weight.max(NEURAL_MCTS_DISTILLATION_PRIORITY_WEIGHT);
     }
+    weight = weight.max(soccer_actor_outcome_credit_priority_weight(transition));
     weight = weight.max(soccer_actor_on_ball_action_priority_weight(
         transition, advantage,
     ));
@@ -9165,6 +9236,41 @@ fn soccer_actor_priority_weight(transition: &SoccerLearningTransition, advantage
         weight = weight.max(SOCCER_ACTOR_NEGATIVE_OUTCOME_PRIORITY_WEIGHT);
     }
     weight.clamp(1.0, SOCCER_POLICY_PRIORITY_WEIGHT_MAX)
+}
+
+fn soccer_actor_outcome_credit_priority_weight(transition: &SoccerLearningTransition) -> f64 {
+    if !transition.decision_context.learning_outcome_credit {
+        return 1.0;
+    }
+    learned_mpc_metric_env(
+        "SOCCER_ACTOR_OUTCOME_CREDIT_PRIORITY_WEIGHT",
+        SOCCER_ACTOR_OUTCOME_CREDIT_PRIORITY_WEIGHT,
+        1.0,
+        SOCCER_POLICY_PRIORITY_WEIGHT_MAX,
+    )
+}
+
+fn soccer_actor_outcome_credit_advantage(
+    transition: &SoccerLearningTransition,
+    advantage: f64,
+) -> f64 {
+    if !transition.decision_context.learning_outcome_credit || !advantage.is_finite() {
+        return advantage;
+    }
+    let floor = learned_mpc_metric_env(
+        "SOCCER_ACTOR_OUTCOME_CREDIT_ADVANTAGE_FLOOR",
+        SOCCER_ACTOR_OUTCOME_CREDIT_ADVANTAGE_FLOOR,
+        0.0,
+        2.0,
+    );
+    let polarity = transition.decision_context.learning_outcome_polarity;
+    if polarity > 0.0 {
+        advantage.max(floor)
+    } else if polarity < 0.0 {
+        advantage.min(-floor)
+    } else {
+        advantage
+    }
 }
 
 fn soccer_standardize_actor_policy_sample_advantages(samples: &mut [SoccerPolicySample]) {
@@ -13162,8 +13268,10 @@ impl SoccerMatch {
         label: &str,
     ) -> bool {
         if learned_discretized_kick_speed_bucket_for_action_label(label).is_some() {
-            let candidate_label = Self::neural_authoritative_candidate_label_for_policy_action(label);
-            legal.iter()
+            let candidate_label =
+                Self::neural_authoritative_candidate_label_for_policy_action(label);
+            legal
+                .iter()
                 .any(|candidate| learned_mpc_action_label_key(&candidate.label) == candidate_label)
         } else {
             let normalized = normalize_soccer_action_label(label);
@@ -15110,6 +15218,10 @@ impl SoccerMatch {
         let mut option_score_safety_counterexample_candidates = 0usize;
         let mut option_score_safety_counterexample_samples = 0usize;
         let mut option_score_safety_counterexample_weight_sum = 0.0;
+        let mut option_score_safety_counterexample_throttle_filtered = 0usize;
+        let mut option_score_safety_counterexample_actor_filtered = 0usize;
+        let mut option_score_safety_counterexample_unindexed_action = 0usize;
+        let mut option_score_safety_counterexample_nonfinite_advantage = 0usize;
         let option_score_safety_sample_rate = option_score_safety_counterexample_sample_rate();
         let option_score_safety_advantage_scale =
             option_score_safety_counterexample_advantage_scale();
@@ -15136,12 +15248,21 @@ impl SoccerMatch {
                         option_score_safety_sample_rate,
                     )
                 {
+                    option_score_safety_counterexample_throttle_filtered += 1;
                     return None;
                 }
                 if !soccer_actor_policy_sample_allowed(transition) {
+                    if option_score_safety_counterexample {
+                        option_score_safety_counterexample_actor_filtered += 1;
+                    }
                     return None;
                 }
-                let action_index = soccer_policy_action_index(&transition.action)?;
+                let Some(action_index) = soccer_policy_action_index(&transition.action) else {
+                    if option_score_safety_counterexample {
+                        option_score_safety_counterexample_unindexed_action += 1;
+                    }
+                    return None;
+                };
                 let mut advantage = if rejected_counterexample {
                     reward_adv[index] - values[index]
                 } else {
@@ -15152,12 +15273,12 @@ impl SoccerMatch {
                 }
                 let advantage =
                     soccer_actor_advantage_with_planner_distillation(transition, advantage);
+                let advantage = soccer_actor_outcome_credit_advantage(transition, advantage);
                 let mcts_distillation =
                     soccer_actor_mcts_distillation_priority(transition, advantage);
                 let mut sample_weight = soccer_actor_priority_weight(transition, advantage);
                 if option_score_safety_counterexample {
-                    sample_weight =
-                        option_score_safety_counterexample_sample_weight(sample_weight);
+                    sample_weight = option_score_safety_counterexample_sample_weight(sample_weight);
                 }
                 let state_features = self.policy_state_features(transition);
                 let actor_probability = self
@@ -15177,6 +15298,9 @@ impl SoccerMatch {
                     actor_probability,
                 );
                 if !advantage.is_finite() {
+                    if option_score_safety_counterexample {
+                        option_score_safety_counterexample_nonfinite_advantage += 1;
+                    }
                     return None;
                 }
                 let sample = SoccerPolicySample {
@@ -15209,6 +15333,10 @@ impl SoccerMatch {
             option_score_safety_counterexample_candidates,
             option_score_safety_counterexample_samples,
             option_score_safety_counterexample_weight_sum,
+            option_score_safety_counterexample_throttle_filtered,
+            option_score_safety_counterexample_actor_filtered,
+            option_score_safety_counterexample_unindexed_action,
+            option_score_safety_counterexample_nonfinite_advantage,
         }
     }
 
@@ -15593,6 +15721,25 @@ impl SoccerMatch {
             as u32;
         self.stats.option_score_safety_counterexample_weight_sum =
             policy_training_batch.option_score_safety_counterexample_weight_sum;
+        self.stats
+            .option_score_safety_counterexample_throttle_filtered = policy_training_batch
+            .option_score_safety_counterexample_throttle_filtered
+            .min(u32::MAX as usize)
+            as u32;
+        self.stats.option_score_safety_counterexample_actor_filtered = policy_training_batch
+            .option_score_safety_counterexample_actor_filtered
+            .min(u32::MAX as usize)
+            as u32;
+        self.stats
+            .option_score_safety_counterexample_unindexed_action = policy_training_batch
+            .option_score_safety_counterexample_unindexed_action
+            .min(u32::MAX as usize)
+            as u32;
+        self.stats
+            .option_score_safety_counterexample_nonfinite_advantage = policy_training_batch
+            .option_score_safety_counterexample_nonfinite_advantage
+            .min(u32::MAX as usize)
+            as u32;
         let policy_samples = policy_training_batch.samples;
         // Dedicated goalkeeper head samples: keeper transitions only, one-step reward as advantage.
         let keeper_policy_samples = if self.neural_blend.actor_critic
@@ -18740,6 +18887,9 @@ impl SoccerMatch {
         }
         transition.reward = amount;
         transition.done = false;
+        transition.decision_context.learning_outcome_credit = true;
+        transition.decision_context.learning_outcome_polarity =
+            if amount > 0.0 { 1.0 } else { -1.0 };
         if transition.tick != self.tick {
             self.record_reward_event_at_with_kind(
                 transition.tick,
