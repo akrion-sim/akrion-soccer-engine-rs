@@ -32245,6 +32245,7 @@ fn realtime_session_captures_goal_moment_windows() {
             )),
             facing: FacingBucket::North,
             dribble_touch: None,
+            receiver_descriptor: None,
         });
         let player = session
             .sim
