@@ -18,6 +18,7 @@ use soccer_engine::des::general::soccer::{
     PassLaneYieldHead, ReceiveApproachHead, RunPredictionHead, SeparationFloorHead,
     ShotTriggerHead, SlipBreakHead, SoccerAuxiliaryHeadSnapshot, SoccerConfigMomentInsert,
     SoccerLearningTransition, SoccerMarlAlgorithm, SoccerMatch, SoccerMomentWindow,
+    SoccerMpcObjectiveHead, learned_mpc_objective_enabled,
     SoccerNeuralBlendMode, SoccerNeuralLayerSnapshot, SoccerNeuralLearningBackend,
     SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot, SoccerPassCompletionHead,
     SoccerPassLearningMetrics, SoccerPassOutcomeSample, SoccerPolicyHeadSnapshot,
