@@ -7807,6 +7807,74 @@ fn action_option_tick_probabilities_are_event_gates_not_normalized_shares() {
     }
 }
 
+fn analytic_difference_reward_alignment_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[test]
+fn analytic_difference_reward_alignment_damps_bad_realized_dense_outcomes() {
+    let _env = analytic_difference_reward_alignment_env_lock();
+    let _difference_enabled =
+        TestEnvVarGuard::set("DD_SOCCER_ENABLE_ANALYTIC_DIFFERENCE_REWARD", "1");
+    let _alignment_enabled = TestEnvVarGuard::set(
+        "DD_SOCCER_ENABLE_ANALYTIC_DIFFERENCE_REWARD_REALIZED_ALIGNMENT",
+        "1",
+    );
+    let _floor = TestEnvVarGuard::set(
+        "SOCCER_ANALYTIC_DIFFERENCE_REWARD_NEGATIVE_DENSE_FLOOR",
+        "0.20",
+    );
+    let _scale = TestEnvVarGuard::set(
+        "SOCCER_ANALYTIC_DIFFERENCE_REWARD_NEGATIVE_DENSE_SCALE",
+        "1.0",
+    );
+    let sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let player = &sim.players[0];
+    let observation = snapshot.observation_for(player.id);
+    let mut decision = AgentDecisionTrace {
+        mdp_state: snapshot.mdp_state_for_player(player.id),
+        observation,
+        belief: belief_from_observation(&snapshot.observation_for(player.id)),
+        operation_order: vec!["learned-policy".to_string(), "pass2".to_string()],
+        scheduled_index: None,
+        action_options: vec![
+            AgentActionOptionTrace::new("pass1", 1.00, true),
+            AgentActionOptionTrace::new("pass2", 2.00, true),
+        ],
+        action_target: None,
+        mdp_mpc_comparison: None,
+        learned_mpc_replan: None,
+        behavior_policy_probability: None,
+        neural_mcts_selected: false,
+        neural_mcts_candidate_count: 0,
+        neural_mcts_discretized_kick_candidate_count: 0,
+        neural_mcts_root_discretized_kick_candidate_count: 0,
+        action: "pass2".to_string(),
+    };
+    let raw_positive = soccer_analytic_difference_reward(&decision);
+    assert!(raw_positive > 0.0);
+    assert!(
+        (soccer_realized_aligned_analytic_difference_reward(&decision, 0.25) - raw_positive).abs()
+            < 1e-12
+    );
+    assert!(
+        (soccer_realized_aligned_analytic_difference_reward(&decision, -1.0) - raw_positive * 0.20)
+            .abs()
+            < 1e-12
+    );
+
+    decision.action = "pass1".to_string();
+    let raw_negative = soccer_analytic_difference_reward(&decision);
+    assert!(raw_negative < 0.0);
+    assert!(
+        (soccer_realized_aligned_analytic_difference_reward(&decision, -1.0) - raw_negative).abs()
+            < 1e-12,
+        "bad counterfactual choices should keep their full penalty"
+    );
+}
+
 #[test]
 fn option_learning_context_sanitizes_non_finite_trace_values() {
     let options = vec![
@@ -37593,6 +37661,22 @@ fn skill_group_partitions_technical_families() {
         soccer_policy_skill_group_for_action_index(dribble_idx).map(|(g, _)| g),
         Some(SoccerSkillGroup::Dribble)
     );
+    for label in [
+        "vertical-attack",
+        "turnover-burst",
+        "hold-up-flank",
+        "open-passing-lane",
+        "open-pass-lane",
+        "runaround-dribble",
+        "round-goalkeeper",
+    ] {
+        let index = soccer_policy_action_index(label).expect("live dribble family");
+        assert_eq!(
+            soccer_policy_skill_group_for_action_index(index).map(|(g, _)| g),
+            Some(SoccerSkillGroup::Dribble),
+            "{label} should train through the dribble specialist head"
+        );
+    }
     let shot_idx = soccer_policy_action_index("shoot").expect("shoot family");
     assert_eq!(
         soccer_policy_skill_group_for_action_index(shot_idx).map(|(g, _)| g),

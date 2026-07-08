@@ -5578,6 +5578,17 @@ const MATCH_OUTCOME_MARGIN_CAP_GOALS: f64 = 5.0;
 const MATCH_OUTCOME_CHANCE_QUALITY_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_CHANCE_QUALITY_REWARD";
 const MATCH_OUTCOME_CHANCE_QUALITY_POINTS_PER_SOT: f64 = 15.0;
 const MATCH_OUTCOME_CHANCE_QUALITY_SOT_CAP: f64 = 4.0;
+/// Composite mode (Codex round-7): blend a worked-SOT (`shots_after_pass` ⊂ SOT) quality premium
+/// into the differential — `0.65·SOT_diff + 0.45·worked_SOT_diff`, so an unworked SOT is worth
+/// 0.65 units and a built-up (post-completed-pass) SOT is worth 1.10 — rewarding chance QUALITY
+/// rather than raw shot volume, without double-counting. `k`/`cap` are env-tunable for the
+/// amplifier sweep. Composite off ⇒ pure SOT-diff at the default k/cap (byte-identical).
+const MATCH_OUTCOME_CHANCE_QUALITY_COMPOSITE_ENV: &str =
+    "DD_SOCCER_ENABLE_CHANCE_QUALITY_COMPOSITE";
+const MATCH_OUTCOME_CHANCE_QUALITY_K_ENV: &str = "DD_SOCCER_CHANCE_QUALITY_K";
+const MATCH_OUTCOME_CHANCE_QUALITY_CAP_ENV: &str = "DD_SOCCER_CHANCE_QUALITY_CAP";
+const MATCH_OUTCOME_CHANCE_QUALITY_BASE_WEIGHT: f64 = 0.65;
+const MATCH_OUTCOME_CHANCE_QUALITY_WORKED_WEIGHT: f64 = 0.45;
 // INSTANTANEOUS (single-frame) player speed ceiling: 25mph ≈ 12.22yps, plus a hair of
 // numerical margin. A human sprints at most ~25mph in a moment.
 const SOCCER_PHYSICS_PLAYER_MAX_SPEED_YPS: f64 = 12.45;
@@ -8232,6 +8243,8 @@ pub struct SoccerDecisionContext {
     #[serde(default)]
     pub learned_mpc_replanned: bool,
     #[serde(default)]
+    pub learned_mpc_replan_source: SoccerLearnedMpcReplanSource,
+    #[serde(default)]
     pub learned_mpc_rejected_execution_probability: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub learned_mpc_original_action: Option<String>,
@@ -8309,6 +8322,15 @@ pub struct SoccerDecisionContext {
     pub wrong_idea_right_execution: bool,
     #[serde(default)]
     pub wrong_idea_wrong_execution: bool,
+    /// True when this transition is a replayed delayed outcome credit, not just
+    /// same-tick dense shaping. The actor uses this to keep realized
+    /// pass/dribble/shot/turnover outcomes from being drowned by dense rows.
+    #[serde(default)]
+    pub learning_outcome_credit: bool,
+    /// Sign of the replayed delayed outcome credit: +1 for success, -1 for
+    /// failure/turnover, 0 for ordinary same-tick shaping.
+    #[serde(default)]
+    pub learning_outcome_polarity: f64,
     #[serde(default)]
     pub human_teammate_intent_distance_yards: f64,
     #[serde(default)]
@@ -8337,11 +8359,27 @@ pub struct SoccerDecisionContext {
     pub defending_team_acceleration_yps2: f64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SoccerLearnedMpcReplanSource {
+    Mpc,
+    OptionScoreSafety,
+    NeuralMcts,
+}
+
+impl Default for SoccerLearnedMpcReplanSource {
+    fn default() -> Self {
+        Self::Mpc
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SoccerLearnedMpcReplanTrace {
     pub original_action: String,
     pub replacement_action: String,
+    #[serde(default)]
+    pub source: SoccerLearnedMpcReplanSource,
     #[serde(default)]
     pub rejected_execution_probability: f64,
     #[serde(default)]
@@ -19002,9 +19040,43 @@ pub struct MatchStats {
     #[serde(default)]
     pub learned_mpc_replans: u32,
     #[serde(default)]
+    pub learned_mpc_replans_mpc: u32,
+    #[serde(default)]
+    pub learned_mpc_replans_option_score_safety: u32,
+    #[serde(default)]
+    pub learned_mpc_replans_neural_mcts: u32,
+    #[serde(default)]
+    pub learned_policy_option_decisions: u32,
+    #[serde(default)]
+    pub learned_policy_multi_option_decisions: u32,
+    #[serde(default)]
+    pub learned_policy_legal_action_options: u32,
+    #[serde(default)]
+    pub analytic_difference_reward_events: u32,
+    #[serde(default)]
+    pub analytic_difference_reward_positive_events: u32,
+    #[serde(default)]
+    pub analytic_difference_reward_negative_events: u32,
+    #[serde(default)]
+    pub analytic_difference_reward_sum: f64,
+    #[serde(default)]
     pub policy_priority_samples: u32,
     #[serde(default)]
     pub policy_priority_weight_sum: f64,
+    #[serde(default)]
+    pub option_score_safety_counterexample_candidates: u32,
+    #[serde(default)]
+    pub option_score_safety_counterexample_samples: u32,
+    #[serde(default)]
+    pub option_score_safety_counterexample_weight_sum: f64,
+    #[serde(default)]
+    pub option_score_safety_counterexample_throttle_filtered: u32,
+    #[serde(default)]
+    pub option_score_safety_counterexample_actor_filtered: u32,
+    #[serde(default)]
+    pub option_score_safety_counterexample_unindexed_action: u32,
+    #[serde(default)]
+    pub option_score_safety_counterexample_nonfinite_advantage: u32,
     #[serde(default)]
     pub neural_mcts_distillation_samples: u32,
     #[serde(default)]
@@ -19055,9 +19127,23 @@ pub struct SoccerPlanningValidationStats {
     pub neural_mcts_root_discretized_kick_candidate_set_rate: f64,
     pub learned_mpc_replans: u32,
     pub learned_mpc_replan_rate: f64,
+    pub learned_mpc_replans_mpc: u32,
+    pub learned_mpc_replan_mpc_rate: f64,
+    pub learned_mpc_replans_option_score_safety: u32,
+    pub learned_mpc_replan_option_score_safety_rate: f64,
+    pub learned_mpc_replans_neural_mcts: u32,
+    pub learned_mpc_replan_neural_mcts_rate: f64,
     pub policy_priority_samples: u32,
     pub policy_priority_sample_rate: f64,
     pub mean_policy_priority_weight: f64,
+    pub option_score_safety_counterexample_candidates: u32,
+    pub option_score_safety_counterexample_samples: u32,
+    pub option_score_safety_counterexample_sample_rate: f64,
+    pub mean_option_score_safety_counterexample_weight: f64,
+    pub option_score_safety_counterexample_throttle_filtered: u32,
+    pub option_score_safety_counterexample_actor_filtered: u32,
+    pub option_score_safety_counterexample_unindexed_action: u32,
+    pub option_score_safety_counterexample_nonfinite_advantage: u32,
     pub neural_mcts_distillation_samples: u32,
     pub neural_mcts_distillation_rate: f64,
     pub mean_neural_mcts_distillation_weight: f64,
@@ -19204,10 +19290,39 @@ impl MatchStats {
                 / neural_mcts_candidate_sets as f64,
             learned_mpc_replans: self.learned_mpc_replans,
             learned_mpc_replan_rate: self.learned_mpc_replans as f64 / decisions as f64,
+            learned_mpc_replans_mpc: self.learned_mpc_replans_mpc,
+            learned_mpc_replan_mpc_rate: self.learned_mpc_replans_mpc as f64 / decisions as f64,
+            learned_mpc_replans_option_score_safety: self.learned_mpc_replans_option_score_safety,
+            learned_mpc_replan_option_score_safety_rate: self
+                .learned_mpc_replans_option_score_safety
+                as f64
+                / decisions as f64,
+            learned_mpc_replans_neural_mcts: self.learned_mpc_replans_neural_mcts,
+            learned_mpc_replan_neural_mcts_rate: self.learned_mpc_replans_neural_mcts as f64
+                / decisions as f64,
             policy_priority_samples: self.policy_priority_samples,
             policy_priority_sample_rate: self.policy_priority_samples as f64 / decisions as f64,
             mean_policy_priority_weight: self.policy_priority_weight_sum
                 / self.policy_priority_samples.max(1) as f64,
+            option_score_safety_counterexample_candidates: self
+                .option_score_safety_counterexample_candidates,
+            option_score_safety_counterexample_samples: self
+                .option_score_safety_counterexample_samples,
+            option_score_safety_counterexample_sample_rate: self
+                .option_score_safety_counterexample_samples
+                as f64
+                / self.option_score_safety_counterexample_candidates.max(1) as f64,
+            mean_option_score_safety_counterexample_weight: self
+                .option_score_safety_counterexample_weight_sum
+                / self.option_score_safety_counterexample_samples.max(1) as f64,
+            option_score_safety_counterexample_throttle_filtered: self
+                .option_score_safety_counterexample_throttle_filtered,
+            option_score_safety_counterexample_actor_filtered: self
+                .option_score_safety_counterexample_actor_filtered,
+            option_score_safety_counterexample_unindexed_action: self
+                .option_score_safety_counterexample_unindexed_action,
+            option_score_safety_counterexample_nonfinite_advantage: self
+                .option_score_safety_counterexample_nonfinite_advantage,
             neural_mcts_distillation_samples: self.neural_mcts_distillation_samples,
             neural_mcts_distillation_rate: self.neural_mcts_distillation_samples as f64
                 / decisions as f64,
@@ -24095,6 +24210,7 @@ fn soccer_decision_context_for(
         shot_mpc_qp_target_fit,
         shot_mpc_goal_probability,
         learned_mpc_replanned: false,
+        learned_mpc_replan_source: SoccerLearnedMpcReplanSource::Mpc,
         learned_mpc_rejected_execution_probability: 0.0,
         learned_mpc_original_action: None,
         learned_mpc_replacement_action: None,
@@ -24127,6 +24243,8 @@ fn soccer_decision_context_for(
         right_idea_wrong_execution: false,
         wrong_idea_right_execution: false,
         wrong_idea_wrong_execution: false,
+        learning_outcome_credit: false,
+        learning_outcome_polarity: 0.0,
         human_teammate_intent_distance_yards: human_intent.distance_yards,
         human_teammate_has_ball: human_intent.has_ball,
         human_teammate_pressure: human_intent.pressure,
@@ -24163,6 +24281,7 @@ fn soccer_decision_context_with_trace(
     );
     if let Some(replan) = decision.learned_mpc_replan.as_ref() {
         context.learned_mpc_replanned = true;
+        context.learned_mpc_replan_source = replan.source;
         context.learned_mpc_rejected_execution_probability =
             replan.rejected_execution_probability.clamp(0.0, 1.0);
         context.learned_mpc_original_action = Some(replan.original_action.clone());
@@ -24950,12 +25069,13 @@ fn soccer_transition_reward_with_tactics(
     // the +budget rail and swallow the crowding penalty, so the policy would never feel that
     // spacing was violated. Reward/learning-only; the clamp never affected physics to begin with.
     let separation_penalty = same_team_separation_reward_penalty(player, after);
-    let mut reward = apply_dense_shaping_budget(
+    let dense_reward = apply_dense_shaping_budget(
         dense_soccer_transition_reward(player, decision, before, after, action, tactical_learning)
             + separation_penalty,
         tunables().reward.dense_shaping_budget_points,
     ) - separation_penalty;
-    reward += soccer_analytic_difference_reward(decision);
+    let mut reward =
+        dense_reward + soccer_realized_aligned_analytic_difference_reward(decision, dense_reward);
 
     if !infer_discrete_events {
         return reward;
@@ -25182,6 +25302,8 @@ fn soccer_decision_option_control_reward(decision: &AgentDecisionTrace) -> f64 {
 const SOCCER_ANALYTIC_DIFFERENCE_REWARD_CAP_POINTS: f64 = 1.25;
 const SOCCER_ANALYTIC_DIFFERENCE_REWARD_WEIGHT: f64 = 1.0;
 const SOCCER_ANALYTIC_DIFFERENCE_REWARD_MIN_OPTIONS: usize = 2;
+const SOCCER_ANALYTIC_DIFFERENCE_REWARD_NEGATIVE_DENSE_FLOOR: f64 = 0.15;
+const SOCCER_ANALYTIC_DIFFERENCE_REWARD_NEGATIVE_DENSE_SCALE: f64 = 1.0;
 
 fn soccer_analytic_difference_reward_enabled() -> bool {
     #[cfg(test)]
@@ -25224,6 +25346,63 @@ fn soccer_analytic_difference_reward(decision: &AgentDecisionTrace) -> f64 {
         -SOCCER_ANALYTIC_DIFFERENCE_REWARD_CAP_POINTS,
         SOCCER_ANALYTIC_DIFFERENCE_REWARD_CAP_POINTS,
     )
+}
+
+fn soccer_analytic_difference_reward_realized_alignment_enabled() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_ANALYTIC_DIFFERENCE_REWARD_REALIZED_ALIGNMENT")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            gate_default_on("DD_SOCCER_ENABLE_ANALYTIC_DIFFERENCE_REWARD_REALIZED_ALIGNMENT")
+        })
+    }
+}
+
+fn soccer_analytic_difference_reward_negative_dense_floor() -> f64 {
+    use std::sync::OnceLock;
+    static VALUE: OnceLock<f64> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("SOCCER_ANALYTIC_DIFFERENCE_REWARD_NEGATIVE_DENSE_FLOOR")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .unwrap_or(SOCCER_ANALYTIC_DIFFERENCE_REWARD_NEGATIVE_DENSE_FLOOR)
+            .clamp(0.0, 1.0)
+    })
+}
+
+fn soccer_analytic_difference_reward_negative_dense_scale() -> f64 {
+    use std::sync::OnceLock;
+    static VALUE: OnceLock<f64> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("SOCCER_ANALYTIC_DIFFERENCE_REWARD_NEGATIVE_DENSE_SCALE")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .unwrap_or(SOCCER_ANALYTIC_DIFFERENCE_REWARD_NEGATIVE_DENSE_SCALE)
+            .clamp(1e-6, 25.0)
+    })
+}
+
+fn soccer_realized_aligned_analytic_difference_reward(
+    decision: &AgentDecisionTrace,
+    dense_reward: f64,
+) -> f64 {
+    let reward = soccer_analytic_difference_reward(decision);
+    if reward <= 0.0 || !soccer_analytic_difference_reward_realized_alignment_enabled() {
+        return reward;
+    }
+    let dense_reward = finite_metric(dense_reward);
+    if dense_reward >= 0.0 {
+        return reward;
+    }
+    let pressure =
+        (-dense_reward / soccer_analytic_difference_reward_negative_dense_scale()).clamp(0.0, 1.0);
+    let floor = soccer_analytic_difference_reward_negative_dense_floor();
+    reward * (1.0 - pressure * (1.0 - floor))
 }
 
 pub(crate) fn teammate_spacing_warning_pressure_from_distance(distance_yards: f64) -> f64 {
@@ -38854,6 +39033,18 @@ struct SoccerPolicySample {
     mcts_distillation: bool,
 }
 
+#[derive(Clone, Default)]
+struct SoccerPolicyTrainingBatch {
+    samples: Vec<SoccerPolicySample>,
+    option_score_safety_counterexample_candidates: usize,
+    option_score_safety_counterexample_samples: usize,
+    option_score_safety_counterexample_weight_sum: f64,
+    option_score_safety_counterexample_throttle_filtered: usize,
+    option_score_safety_counterexample_actor_filtered: usize,
+    option_score_safety_counterexample_unindexed_action: usize,
+    option_score_safety_counterexample_nonfinite_advantage: usize,
+}
+
 impl SoccerPolicySample {
     fn sanitized_weight(&self) -> f64 {
         if self.sample_weight.is_finite() {
@@ -39439,7 +39630,10 @@ mod soccer_policy_actor_capacity_tests {
             .expect("shooting specialist");
 
         assert_eq!(forward.network.output_dim, SOCCER_POLICY_ACTIONS.len());
-        assert_eq!(shooting.network.output_dim, SOCCER_POLICY_SHOT_ACTIONS.len());
+        assert_eq!(
+            shooting.network.output_dim,
+            SOCCER_POLICY_SHOT_ACTIONS.len()
+        );
         assert_eq!(
             soccer_policy_action_index("shoot-kp7"),
             SOCCER_POLICY_ACTIONS
@@ -39493,11 +39687,14 @@ const SOCCER_SKILL_PASS_FAMILIES: &[&str] = &[
 ];
 const SOCCER_SKILL_DRIBBLE_FAMILIES: &[&str] = &[
     "dribble",
+    "vertical-attack",
+    "turnover-burst",
     "carry-forward",
     "carry-out-left",
     "carry-out-right",
     "protect-ball",
     "side-step",
+    "hold-up-flank",
     "left-cut",
     "right-cut",
     "nutmeg",
@@ -39505,6 +39702,9 @@ const SOCCER_SKILL_DRIBBLE_FAMILIES: &[&str] = &[
     "fake-right-cut-left",
     "xavi-turn",
     "round-goalkeeper",
+    "open-passing-lane",
+    "open-pass-lane",
+    "runaround-dribble",
 ];
 const SOCCER_SKILL_SHOT_FAMILIES: &[&str] = &[
     "shoot",
@@ -41087,9 +41287,9 @@ fn widen_soccer_policy_snapshot_for_config(
         }
     }
     if snapshot.output_dim < expected_output_dim {
-        output_layer.weights.extend(
-            (snapshot.output_dim..expected_output_dim).map(|_| vec![0.0; target_hidden]),
-        );
+        output_layer
+            .weights
+            .extend((snapshot.output_dim..expected_output_dim).map(|_| vec![0.0; target_hidden]));
         output_layer.biases.resize(expected_output_dim, 0.0);
         snapshot.output_dim = expected_output_dim;
     }
@@ -41966,11 +42166,14 @@ const SOCCER_POLICY_PASS_ACTIONS: &[&str] = &[
 
 const SOCCER_POLICY_DRIBBLE_ACTIONS: &[&str] = &[
     "dribble",
+    "vertical-attack",
+    "turnover-burst",
     "carry-forward",
     "carry-out-left",
     "carry-out-right",
     "protect-ball",
     "side-step",
+    "hold-up-flank",
     "left-cut",
     "right-cut",
     "nutmeg",
@@ -41978,6 +42181,9 @@ const SOCCER_POLICY_DRIBBLE_ACTIONS: &[&str] = &[
     "fake-right-cut-left",
     "xavi-turn",
     "round-goalkeeper",
+    "open-passing-lane",
+    "open-pass-lane",
+    "runaround-dribble",
 ];
 
 const SOCCER_POLICY_SHOT_ACTIONS: &[&str] = &[
@@ -67511,10 +67717,7 @@ mod discretized_kick_scaffold_tests {
             soccer_policy_skill_group_for_action_index(shot_bucket_index)
                 .expect("shot bucket should train the shot skill policy head");
         assert_eq!(shot_bucket_group, SoccerSkillGroup::Shot);
-        assert_eq!(
-            SOCCER_SKILL_SHOT_FAMILIES[shot_bucket_local],
-            "shoot-kp7"
-        );
+        assert_eq!(SOCCER_SKILL_SHOT_FAMILIES[shot_bucket_local], "shoot-kp7");
         assert_ne!(
             soccer_policy_action_index(&shot),
             soccer_policy_action_index("shoot")
