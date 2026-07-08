@@ -155,7 +155,7 @@ fn suppress_mpc_reselected_action_option(
     candidate_label: &str,
 ) {
     for option in options {
-        if option.legal && learned_mpc_action_labels_match(&option.label, candidate_label) {
+        if option.legal && mpc_reselect_rejects_option_label(&option.label, candidate_label) {
             option.legal = false;
             option.score = 0.0;
             option.probability = 0.0;
@@ -2884,13 +2884,23 @@ fn mpc_reselect_rejection_probability(
     action: &SoccerAction,
     action_label: &str,
 ) -> Option<f64> {
-    let action_target = player.action_target_trace(action, snapshot);
     if !snapshot
         .formation_lp_guidance_for(player.id)
         .is_some_and(|guidance| guidance.local_mpc_guidance)
     {
         return None;
     }
+    if matches!(
+        action,
+        SoccerAction::Pass {
+            target_player: None,
+            ..
+        }
+    ) && pass_like_action_flight(normalize_soccer_action_label(action_label)).is_some()
+    {
+        return Some(0.0);
+    }
+    let action_target = player.action_target_trace(action, snapshot);
     if let Some(trace) =
         player_mdp_mpc_comparison_trace(snapshot, player, &action_target, action_label)
             .filter(|trace| trace.decision == "reselect-mdp-after-mpc-low-confidence")
@@ -10494,6 +10504,9 @@ impl PlayerAgent {
                 }
             }
             action_options = normalize_action_options(action_options);
+            if let Some(label) = learned_mpc_reselect_label.as_deref() {
+                suppress_mpc_reselected_action_option(&mut action_options, label);
+            }
             annotate_tick_probabilities_from_scores(&mut action_options, snapshot.dt_seconds);
             let mut weighted_ops = vec![
                 (
@@ -13491,17 +13504,16 @@ impl PlayerAgent {
                 } else {
                     self.open_pass_lane_dribble_plan_for(snapshot, observation, &lane_targets)
                 };
-                lane_plan
-                    .map(|lane_plan| {
-                        (
-                            SoccerAction::DribbleMove {
-                                target: lane_plan.target,
-                                kind: lane_plan.kind,
-                                touch: lane_plan.touch,
-                            },
-                            OPEN_PASS_LANE_ACTION_LABEL.to_string(),
-                        )
-                    })
+                lane_plan.map(|lane_plan| {
+                    (
+                        SoccerAction::DribbleMove {
+                            target: lane_plan.target,
+                            kind: lane_plan.kind,
+                            touch: lane_plan.touch,
+                        },
+                        OPEN_PASS_LANE_ACTION_LABEL.to_string(),
+                    )
+                })
             }
             "dribble"
             | "vertical-attack"
@@ -14873,7 +14885,10 @@ mod learned_policy_option_score_safety_tests {
 
 #[cfg(test)]
 mod mpc_reselect_tests {
-    use super::mpc_reselect_rejects_option_label;
+    use super::{
+        mpc_reselect_rejects_option_label, suppress_mpc_reselected_action_option,
+        AgentActionOptionTrace,
+    };
 
     #[test]
     fn mpc_reselect_veto_preserves_other_ranked_pass_targets() {
@@ -14895,6 +14910,25 @@ mod mpc_reselect_tests {
         );
         assert!(mpc_reselect_rejects_option_label("shoot", "shoot"));
         assert!(!mpc_reselect_rejects_option_label("pass1", "shoot"));
+    }
+
+    #[test]
+    fn suppress_mpc_reselected_option_preserves_alternate_ranked_targets() {
+        let mut options = vec![
+            AgentActionOptionTrace::new("pass1", 1.0, true),
+            AgentActionOptionTrace::new("pass2", 0.9, true),
+            AgentActionOptionTrace::new("xavi-turn", 0.8, true),
+        ];
+
+        suppress_mpc_reselected_action_option(&mut options, "pass1-kp7");
+        assert!(!options[0].legal);
+        assert_eq!(options[0].score, 0.0);
+        assert!(options[1].legal);
+        assert!(options[2].legal);
+
+        suppress_mpc_reselected_action_option(&mut options, "xavi-turn");
+        assert!(!options[2].legal);
+        assert_eq!(options[2].score, 0.0);
     }
 }
 

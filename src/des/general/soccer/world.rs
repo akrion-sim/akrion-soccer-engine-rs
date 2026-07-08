@@ -6770,6 +6770,70 @@ mod tests {
     }
 
     #[test]
+    fn neural_mcts_context_filter_requires_positive_pass_mpc_margin() {
+        let _env_lock = soccer_world_env_lock();
+        let _min_safe = set_test_env_var(
+            "SOCCER_NEURAL_MCTS_MIN_REPLAN_SAFE_EXECUTION_PROBABILITY",
+            "0.55",
+        );
+        let mut loose = policy_test_transition_with_mcts(true);
+        loose.action = "pass1-kp7".to_string();
+        loose.decision_context.chosen_action_mpc_feasibility = 0.70;
+        loose.decision_context.chosen_action_control_cost = 0.34;
+        loose.decision_context.pass_mpc_receipt_probability = 0.50;
+        loose.decision_context.pass_receipt_qp_accel_fit = 0.36;
+        loose.decision_context.pass_receipt_race_advantage_seconds = -0.20;
+        loose.decision_context.target_forward_yards = 18.0;
+
+        assert!(
+            !SoccerMatch::neural_mcts_transition_context_is_executable(&loose),
+            "MCTS should ask POMDP for a different pass when MPC receipt quality is marginal despite nominal feasibility"
+        );
+
+        let mut clean = loose.clone();
+        clean.decision_context.chosen_action_mpc_feasibility = 0.90;
+        clean.decision_context.chosen_action_control_cost = 0.08;
+        clean.decision_context.pass_mpc_receipt_probability = 0.88;
+        clean.decision_context.pass_receipt_qp_accel_fit = 0.82;
+        clean.decision_context.pass_receipt_race_advantage_seconds = 0.45;
+        clean.decision_context.target_forward_yards = 22.0;
+        assert!(
+            SoccerMatch::neural_mcts_transition_context_is_executable(&clean),
+            "clean progressive pass targets should remain MCTS-eligible"
+        );
+    }
+
+    #[test]
+    fn neural_mcts_context_filter_requires_executable_dribble_fit() {
+        let _env_lock = soccer_world_env_lock();
+        let _min_safe = set_test_env_var(
+            "SOCCER_NEURAL_MCTS_MIN_REPLAN_SAFE_EXECUTION_PROBABILITY",
+            "0.55",
+        );
+        let mut loose = policy_test_transition_with_mcts(true);
+        loose.action = "xavi-turn".to_string();
+        loose.decision_context.chosen_action_mpc_feasibility = 0.68;
+        loose.decision_context.chosen_action_control_cost = 0.86;
+        loose.decision_context.dribble_mpc_control_probability = 0.38;
+        loose.decision_context.dribble_mpc_qp_accel_fit = 0.28;
+
+        assert!(
+            !SoccerMatch::neural_mcts_transition_context_is_executable(&loose),
+            "MCTS should not keep low-control technical dribbles just because the coarse feasibility clears the soft replan floor"
+        );
+
+        let mut clean = loose.clone();
+        clean.decision_context.chosen_action_mpc_feasibility = 0.78;
+        clean.decision_context.chosen_action_control_cost = 0.10;
+        clean.decision_context.dribble_mpc_control_probability = 0.84;
+        clean.decision_context.dribble_mpc_qp_accel_fit = 0.78;
+        assert!(
+            SoccerMatch::neural_mcts_transition_context_is_executable(&clean),
+            "executable technical dribbles should remain available to MCTS"
+        );
+    }
+
+    #[test]
     fn neural_mcts_context_filter_rejects_low_feasibility_pass_transitions() {
         let _env_lock = soccer_world_env_lock();
         let _min_safe = set_test_env_var(
@@ -9784,10 +9848,18 @@ fn neural_mcts_pass_mpc_candidate_bonus(transition: &SoccerLearningTransition) -
     if weight <= 0.0 {
         return 0.0;
     }
+    neural_mcts_pass_mpc_candidate_margin(transition)
+        .unwrap_or(0.0)
+        .clamp(-0.40, 0.45)
+        * weight
+}
+
+fn neural_mcts_pass_mpc_candidate_margin(transition: &SoccerLearningTransition) -> Option<f64> {
+    pass_like_action_flight(&transition.action)?;
     let action = normalize_soccer_action_label(&transition.action);
     let context = &transition.decision_context;
     if action == "aerial-pass" && !neural_mcts_aerial_pass_has_breakthrough_context(transition) {
-        return -0.40 * weight;
+        return Some(-0.40);
     }
     let receipt = finite_unit_interval(context.pass_mpc_receipt_probability);
     let qp_fit = finite_unit_interval(context.pass_receipt_qp_accel_fit);
@@ -9817,7 +9889,7 @@ fn neural_mcts_pass_mpc_candidate_bonus(transition: &SoccerLearningTransition) -
     } else {
         (0.58, 0.0)
     };
-    (technical_fit - threshold + aerial_relief + territorial_fit).clamp(-0.40, 0.45) * weight
+    Some(technical_fit - threshold + aerial_relief + territorial_fit)
 }
 
 fn neural_mcts_aerial_pass_has_breakthrough_context(transition: &SoccerLearningTransition) -> bool {
@@ -13397,27 +13469,11 @@ impl SoccerMatch {
 
     fn neural_mcts_transition_context_is_executable(transition: &SoccerLearningTransition) -> bool {
         let label = normalize_soccer_action_label(&transition.action);
-        if pass_like_action_flight(label).is_some() || is_dribble_action_label(label) {
-            if !neural_mcts_replan_safe_execution_probability(
-                label,
-                transition.decision_context.chosen_action_mpc_feasibility,
-            ) {
-                return false;
-            }
-            if pass_like_action_flight(label).is_some()
-                && neural_mcts_pass_mpc_candidate_bonus(transition) < 0.0
-            {
-                return false;
-            }
-            if label == "aerial-pass" {
-                if !neural_mcts_aerial_pass_candidates_enabled() {
-                    return false;
-                }
-                if neural_mcts_pass_mpc_candidate_bonus(transition) <= 0.0 {
-                    return false;
-                }
-            }
-            return true;
+        if pass_like_action_flight(label).is_some() {
+            return Self::neural_mcts_pass_transition_context_is_executable(transition);
+        }
+        if is_dribble_action_label(label) {
+            return Self::neural_mcts_dribble_transition_context_is_executable(transition);
         }
         if learned_discretized_kick_speed_bucket_for_action_label(&transition.action).is_some()
             && matches!(label, "shoot" | "first-time-shot")
@@ -13425,6 +13481,38 @@ impl SoccerMatch {
             return neural_mcts_shot_bucket_has_quality_prior(transition);
         }
         true
+    }
+
+    fn neural_mcts_pass_transition_context_is_executable(
+        transition: &SoccerLearningTransition,
+    ) -> bool {
+        let label = normalize_soccer_action_label(&transition.action);
+        if !neural_mcts_replan_safe_execution_probability(
+            label,
+            transition.decision_context.chosen_action_mpc_feasibility,
+        ) {
+            return false;
+        }
+        if label == "aerial-pass" && !neural_mcts_aerial_pass_candidates_enabled() {
+            return false;
+        }
+        match neural_mcts_pass_mpc_candidate_margin(transition) {
+            Some(margin) => margin > 0.0,
+            None => false,
+        }
+    }
+
+    fn neural_mcts_dribble_transition_context_is_executable(
+        transition: &SoccerLearningTransition,
+    ) -> bool {
+        let label = normalize_soccer_action_label(&transition.action);
+        if !neural_mcts_replan_safe_execution_probability(
+            label,
+            transition.decision_context.chosen_action_mpc_feasibility,
+        ) {
+            return false;
+        }
+        soccer_actor_mcts_distillation_technical_trace(transition)
     }
 
     fn neural_mcts_candidate_is_pass_like(candidate: &SoccerNeuralMctsCandidate) -> bool {
