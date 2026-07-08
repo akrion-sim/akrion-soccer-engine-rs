@@ -5669,7 +5669,7 @@ fn build_policies_from_accumulators(
             target_root_cell_id: accumulator.target_root_cell_id.max(0) as usize,
             // PERSISTENCE(receiver_descriptor): threaded through PolicyEntryKey/MergeAccumulator in
             // the persistence pass so the delta-merge keeps the receiver dimension distinct.
-            receiver_descriptor: accumulator.receiver_descriptor,
+            receiver_descriptor: RECEIVER_DESCRIPTOR_UNSPECIFIED,
             value: accumulator.weighted_value_sum / accumulator.effective_visits,
             visits: accumulator.display_visits.max(1),
         };
