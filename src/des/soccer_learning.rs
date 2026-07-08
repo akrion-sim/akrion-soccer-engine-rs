@@ -163,6 +163,7 @@ pub struct SoccerLearningPolicyDeltaEntry {
     pub target_tactical_cell_id: i32,
     pub target_macro_cell_id: i32,
     pub target_root_cell_id: i32,
+    pub receiver_descriptor: i32,
     pub before_value: f64,
     pub after_value: f64,
     pub value_delta: f64,
