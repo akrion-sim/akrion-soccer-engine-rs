@@ -268,9 +268,17 @@ impl SoccerMpcObjectiveHead {
             let target_x =
                 (sample.applied_residual.x / MPC_OBJECTIVE_MAX_RESIDUAL_YARDS).clamp(-0.999, 0.999);
             let lr = (base_lr * weight).min(base_lr);
+            // Target vector matches the network's output_dim: 2 (aim only) or 3 (aim + bend).
+            let targets: Vec<f64> = if self.bend_enabled {
+                let target_bend =
+                    (sample.applied_bend / MPC_OBJECTIVE_MAX_BEND_YARDS).clamp(-0.999, 0.999);
+                vec![target_y, target_x, target_bend]
+            } else {
+                vec![target_y, target_x]
+            };
             let _ = self
                 .network
-                .train_sample_clipped(&input, &[target_y, target_x], lr, 4.0);
+                .train_sample_clipped(&input, &targets, lr, 4.0);
             self.training_steps += 1;
             trained += 1;
         }
