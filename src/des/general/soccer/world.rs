@@ -2308,8 +2308,6 @@ pub fn soccer_trajectory_export_decisions(
         .collect()
 }
 
-<<<<<<< HEAD
-=======
 /// File-writer that was missing: consume the export rows and append them as JSONL to
 /// `DD_SOCCER_TRAJECTORY_EXPORT_PATH` (the on-policy data channel for the Burn POMDP-solver). The
 /// converter above only produced rows; nothing wrote them. Unset env ⇒ no-op. Mutex-serialised.
