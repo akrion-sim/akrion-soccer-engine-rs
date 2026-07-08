@@ -100,7 +100,7 @@ pub const SUPPORT_OUTCOME_TEAMMATE_DISCOUNT: f64 = 0.35;
 /// Decoupled from the engine's internal reward magnitudes (which live on a different scale than the
 /// territorial delta) so the blend is bounded and interpretable: a goal ≈ +1.0, a completed forward
 /// pass ≈ +0.2, a turnover ≈ −0.6. Kinds not tied to a move's downstream outcome return 0.0.
-pub fn support_outcome_event_weight(kind: SoccerRewardEventKind) -> f64 {
+pub(crate) fn support_outcome_event_weight(kind: SoccerRewardEventKind) -> f64 {
     match kind {
         // Terminal / near-terminal attacking payoff.
         SoccerRewardEventKind::Goal | SoccerRewardEventKind::HeaderGoalFromCross => 1.0,
