@@ -4135,6 +4135,7 @@ fn insert_policy_target_entry_rows(
                 target_tactical_cell_id,
                 target_macro_cell_id,
                 target_root_cell_id,
+                receiver_descriptor,
                 value_micros,
                 visits,
                 source_run_id
