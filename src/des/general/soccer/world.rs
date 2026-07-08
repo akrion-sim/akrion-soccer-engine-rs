@@ -9569,6 +9569,22 @@ impl SoccerMatch {
         WorldSnapshot::from_match_for_agent_decision(self)
     }
 
+    /// This tick's `(shot_attempts, shots_on_target)` from the per-tick reward-event buffer,
+    /// for external export tooling (possession-chain / EPV). Read-only; the buffer is cleared
+    /// and repopulated each `run_time_step`, so read it right after stepping.
+    pub fn tick_shot_counts(&self) -> (u32, u32) {
+        let mut attempts = 0;
+        let mut on_target = 0;
+        for ev in &self.reward_events {
+            match ev.kind {
+                SoccerRewardEventKind::ShotAttempt => attempts += 1,
+                SoccerRewardEventKind::ShotOnTarget => on_target += 1,
+                _ => {}
+            }
+        }
+        (attempts, on_target)
+    }
+
     pub fn summary(&self) -> MatchSummary {
         // Include the still-open consecutive-pass chain (if any) so the final sequence of the
         // match is counted, without mutating live state — `summary` is a read-only view.
