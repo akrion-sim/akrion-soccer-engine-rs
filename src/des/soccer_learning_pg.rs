@@ -3931,6 +3931,7 @@ fn insert_run_delta_batch_rows(
             params.push(&delta.target_tactical_cell_id);
             params.push(&delta.target_macro_cell_id);
             params.push(&delta.target_root_cell_id);
+            params.push(&delta.receiver_descriptor);
             params.push(&delta.before_value_micros);
             params.push(&delta.after_value_micros);
             params.push(&delta.value_delta_micros);
