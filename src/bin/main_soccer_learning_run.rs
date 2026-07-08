@@ -120,6 +120,7 @@ const DEFAULT_SOCCER_NEURAL_BATCH_SNAPSHOT_VALIDATE_GAMES: usize = 0;
 const DEFAULT_SOCCER_NEURAL_BATCH_SNAPSHOT_VALIDATE_MIN_FITNESS: f64 =
     DEFAULT_SOCCER_NEURAL_POPULATION_MIN_ACCEPTED_FITNESS;
 const DEFAULT_SOCCER_NEURAL_BATCH_SNAPSHOT_VALIDATE_MIN_GOAL_MARGIN: f64 = 0.0;
+const DEFAULT_SOCCER_NEURAL_BATCH_SNAPSHOT_CONFIRM_GAMES: usize = 0;
 const DEFAULT_SOCCER_NEURAL_BATCH_SNAPSHOT_CARRY_MIN_VALIDATION_FITNESS: f64 =
     SOCCER_LEARNING_OBJECTIVE_FITNESS_MIN;
 const DEFAULT_SOCCER_NEURAL_BATCH_SNAPSHOT_CARRY_MIN_VALIDATION_GOAL_MARGIN: f64 =
@@ -1101,6 +1102,17 @@ fn neural_population_confirm_seed(search_seed: u64, completed_games: usize) -> u
     neural_population_eval_seed(search_seed, completed_games) ^ 0xD6E8_FD93_51E2_B37D
 }
 
+fn batch_neural_snapshot_confirm_seed(
+    effective_seed: u64,
+    selected_episode: usize,
+    batch_end_episode: usize,
+) -> u64 {
+    effective_seed
+        ^ (selected_episode as u64).wrapping_mul(0xE703_7ED1_A0B4_28DB)
+        ^ (batch_end_episode as u64).wrapping_mul(0x8EBC_6AF0_9C88_C6E3)
+        ^ 0x4F1B_BCDC_2D5E_9E19
+}
+
 fn neural_population_eval_game_seed(seed: u64, game_index: usize) -> u64 {
     seed ^ (game_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
@@ -1163,6 +1175,33 @@ fn batch_neural_snapshot_validation_passes(
 ) -> bool {
     eval.fitness + 1e-12 >= min_fitness
         && neural_population_candidate_goal_margin(eval) + 1e-12 >= min_goal_margin
+}
+
+fn combine_batch_neural_snapshot_validation_evals(
+    primary: &NeuralPopulationCandidateEval,
+    confirmation: &NeuralPopulationCandidateEval,
+) -> NeuralPopulationCandidateEval {
+    let primary_games = primary.wins + primary.draws + primary.losses;
+    let confirmation_games = confirmation.wins + confirmation.draws + confirmation.losses;
+    let total_games = primary_games + confirmation_games;
+    let fitness = if total_games == 0 {
+        f64::NEG_INFINITY
+    } else {
+        ((primary.fitness * primary_games as f64)
+            + (confirmation.fitness * confirmation_games as f64))
+            / total_games as f64
+    };
+    NeuralPopulationCandidateEval {
+        index: primary.index,
+        source: format!("{}+{}", primary.source, confirmation.source),
+        fitness,
+        wins: primary.wins + confirmation.wins,
+        draws: primary.draws + confirmation.draws,
+        losses: primary.losses + confirmation.losses,
+        goals_for: primary.goals_for + confirmation.goals_for,
+        goals_against: primary.goals_against + confirmation.goals_against,
+        snapshot: primary.snapshot.clone(),
+    }
 }
 
 fn push_unique_neural_parent(
@@ -7235,6 +7274,36 @@ fn run() -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
+    let neural_batch_snapshot_confirm_games = env_usize(
+        "SOCCER_NEURAL_BATCH_SNAPSHOT_CONFIRM_GAMES",
+        DEFAULT_SOCCER_NEURAL_BATCH_SNAPSHOT_CONFIRM_GAMES,
+    )?;
+    if neural_batch_snapshot_confirm_games > 0 && neural_batch_snapshot_validate_games == 0 {
+        return Err(invalid_data(
+            "SOCCER_NEURAL_BATCH_SNAPSHOT_CONFIRM_GAMES requires SOCCER_NEURAL_BATCH_SNAPSHOT_VALIDATE_GAMES > 0",
+        )
+        .into());
+    }
+    let neural_batch_snapshot_confirm_min_fitness = env_f64(
+        "SOCCER_NEURAL_BATCH_SNAPSHOT_CONFIRM_MIN_FITNESS",
+        neural_batch_snapshot_validate_min_fitness,
+    )?;
+    if !neural_batch_snapshot_confirm_min_fitness.is_finite() {
+        return Err(invalid_data(
+            "SOCCER_NEURAL_BATCH_SNAPSHOT_CONFIRM_MIN_FITNESS must be finite",
+        )
+        .into());
+    }
+    let neural_batch_snapshot_confirm_min_goal_margin = env_f64(
+        "SOCCER_NEURAL_BATCH_SNAPSHOT_CONFIRM_MIN_GOAL_MARGIN",
+        neural_batch_snapshot_validate_min_goal_margin,
+    )?;
+    if !neural_batch_snapshot_confirm_min_goal_margin.is_finite() {
+        return Err(invalid_data(
+            "SOCCER_NEURAL_BATCH_SNAPSHOT_CONFIRM_MIN_GOAL_MARGIN must be finite",
+        )
+        .into());
+    }
     let neural_batch_snapshot_carry_min_validation_fitness = env_f64(
         "SOCCER_NEURAL_BATCH_SNAPSHOT_CARRY_MIN_VALIDATION_FITNESS",
         DEFAULT_SOCCER_NEURAL_BATCH_SNAPSHOT_CARRY_MIN_VALIDATION_FITNESS,
@@ -8134,12 +8203,15 @@ fn run() -> Result<(), Box<dyn Error>> {
         neural_batch_snapshot_carry_no_publishable,
     );
     println!(
-        "neural_batch_snapshot_validation games={} candidates={} eval_minutes={:.2} objective=home_directional_learning_vs_analytic min_fitness={:.4} min_goal_margin={:.4} carry_min_fitness={:.4} carry_min_goal_margin={:.4}",
+        "neural_batch_snapshot_validation games={} candidates={} eval_minutes={:.2} objective=home_directional_learning_vs_analytic min_fitness={:.4} min_goal_margin={:.4} confirm_games={} confirm_min_fitness={:.4} confirm_min_goal_margin={:.4} carry_min_fitness={:.4} carry_min_goal_margin={:.4}",
         neural_batch_snapshot_validate_games,
         neural_batch_snapshot_validate_candidates,
         neural_batch_snapshot_validate_minutes,
         neural_batch_snapshot_validate_min_fitness,
         neural_batch_snapshot_validate_min_goal_margin,
+        neural_batch_snapshot_confirm_games,
+        neural_batch_snapshot_confirm_min_fitness,
+        neural_batch_snapshot_confirm_min_goal_margin,
         neural_batch_snapshot_carry_min_validation_fitness,
         neural_batch_snapshot_carry_min_validation_goal_margin,
     );
@@ -8658,12 +8730,108 @@ fn run() -> Result<(), Box<dyn Error>> {
                                 eval.goals_for,
                                 eval.goals_against,
                             );
-                            validation_promotion_evaluation =
-                                Some(policy_promotion_evaluation_from_candidate_validation(
-                                    &eval,
-                                    policy_promotion_gate,
-                                ));
-                            validation_eval = Some(eval);
+                            let mut accepted_eval = eval;
+                            if neural_batch_snapshot_confirm_games > 0 {
+                                let mut confirm_config = validation_config;
+                                confirm_config.eval_games =
+                                    neural_batch_snapshot_confirm_games.max(1);
+                                let confirmation_seed = batch_neural_snapshot_confirm_seed(
+                                    u64::from(effective_seed),
+                                    selected_episode,
+                                    batch_start_episode + batch_size,
+                                );
+                                let confirmation_candidate = NeuralPopulationCandidate {
+                                    index: 0,
+                                    source: format!(
+                                        "batch_snapshot_confirmation_episode_{selected_episode}"
+                                    ),
+                                    snapshot: selected_snapshot.clone(),
+                                };
+                                match evaluate_neural_population_candidate_against_analytic_home_learning_objective(
+                                    confirmation_candidate,
+                                    config.clone(),
+                                    confirm_config,
+                                    confirmation_seed,
+                                ) {
+                                    Ok(confirm_eval) => {
+                                        let confirm_goal_margin =
+                                            neural_population_candidate_goal_margin(&confirm_eval);
+                                        if batch_neural_snapshot_validation_passes(
+                                            &confirm_eval,
+                                            neural_batch_snapshot_confirm_min_fitness,
+                                            neural_batch_snapshot_confirm_min_goal_margin,
+                                        ) {
+                                            println!(
+                                                "neural_batch_snapshot_confirmation_passed episodes={}..{} selected_episode={} attempt={} confirm_games={} eval_minutes={:.2} fitness={:.4} goal_margin={:.4} min_fitness={:.4} min_goal_margin={:.4} record={}-{}-{} goals={}-{}",
+                                                batch_start_episode + 1,
+                                                batch_start_episode + batch_size,
+                                                selected_episode,
+                                                neural_batch_snapshot_attempts,
+                                                neural_batch_snapshot_confirm_games,
+                                                neural_batch_snapshot_validate_minutes,
+                                                confirm_eval.fitness,
+                                                confirm_goal_margin,
+                                                neural_batch_snapshot_confirm_min_fitness,
+                                                neural_batch_snapshot_confirm_min_goal_margin,
+                                                confirm_eval.wins,
+                                                confirm_eval.draws,
+                                                confirm_eval.losses,
+                                                confirm_eval.goals_for,
+                                                confirm_eval.goals_against,
+                                            );
+                                            accepted_eval =
+                                                combine_batch_neural_snapshot_validation_evals(
+                                                    &accepted_eval,
+                                                    &confirm_eval,
+                                                );
+                                        } else {
+                                            println!(
+                                                "neural_batch_snapshot_confirmation_held episodes={}..{} selected_episode={} attempt={} confirm_games={} eval_minutes={:.2} fitness={:.4} goal_margin={:.4} min_fitness={:.4} min_goal_margin={:.4} record={}-{}-{} goals={}-{}",
+                                                batch_start_episode + 1,
+                                                batch_start_episode + batch_size,
+                                                selected_episode,
+                                                neural_batch_snapshot_attempts,
+                                                neural_batch_snapshot_confirm_games,
+                                                neural_batch_snapshot_validate_minutes,
+                                                confirm_eval.fitness,
+                                                confirm_goal_margin,
+                                                neural_batch_snapshot_confirm_min_fitness,
+                                                neural_batch_snapshot_confirm_min_goal_margin,
+                                                confirm_eval.wins,
+                                                confirm_eval.draws,
+                                                confirm_eval.losses,
+                                                confirm_eval.goals_for,
+                                                confirm_eval.goals_against,
+                                            );
+                                            validation_carry_fitness = Some(confirm_eval.fitness);
+                                            validation_carry_goal_margin =
+                                                Some(confirm_goal_margin);
+                                            validation_carry_allowed = false;
+                                            validation_failed = true;
+                                        }
+                                    }
+                                    Err(error) => {
+                                        validation_carry_allowed = false;
+                                        validation_failed = true;
+                                        println!(
+                                            "neural_batch_snapshot_confirmation_error episodes={}..{} selected_episode={} attempt={} error={}",
+                                            batch_start_episode + 1,
+                                            batch_start_episode + batch_size,
+                                            selected_episode,
+                                            neural_batch_snapshot_attempts,
+                                            error.replace(char::is_whitespace, "_"),
+                                        );
+                                    }
+                                }
+                            }
+                            if !validation_failed {
+                                validation_promotion_evaluation =
+                                    Some(policy_promotion_evaluation_from_candidate_validation(
+                                        &accepted_eval,
+                                        policy_promotion_gate,
+                                    ));
+                                validation_eval = Some(accepted_eval);
+                            }
                         } else {
                             validation_carry_fitness = Some(eval.fitness);
                             validation_carry_goal_margin = Some(goal_margin);
@@ -11372,6 +11540,80 @@ mod tests {
             0.25,
             0.0
         ));
+    }
+
+    #[test]
+    fn batch_snapshot_confirmation_seed_uses_disjoint_fixture_block() {
+        let effective_seed = 119_360_457_335_638_248;
+        let selected_episode = 24usize;
+        let batch_end_episode = 24usize;
+        let primary_seed = effective_seed
+            ^ (selected_episode as u64).wrapping_mul(0xB492_B66F_BE98_F273)
+            ^ (batch_end_episode as u64).wrapping_mul(0x9AE1_6A3B_2F90_404F);
+        let confirmation_seed =
+            batch_neural_snapshot_confirm_seed(effective_seed, selected_episode, batch_end_episode);
+        let primary_block: Vec<u64> = (0..12)
+            .map(|game_index| neural_population_eval_game_seed(primary_seed, game_index))
+            .collect();
+        let confirmation_block: Vec<u64> = (0..12)
+            .map(|game_index| neural_population_eval_game_seed(confirmation_seed, game_index))
+            .collect();
+
+        assert_ne!(
+            primary_block, confirmation_block,
+            "batch snapshot confirmation must not reuse the lucky validation fixture block"
+        );
+    }
+
+    #[test]
+    fn batch_snapshot_combined_eval_dilutes_lucky_validation_windows() {
+        let primary = NeuralPopulationCandidateEval {
+            index: 0,
+            source: "batch_snapshot_episode_24".to_string(),
+            fitness: 1.1055,
+            wins: 8,
+            draws: 3,
+            losses: 1,
+            goals_for: 11,
+            goals_against: 2,
+            snapshot: neural_population_full_snapshot(2.0),
+        };
+        let confirmation = NeuralPopulationCandidateEval {
+            index: 0,
+            source: "batch_snapshot_confirmation_episode_24".to_string(),
+            fitness: -1.5494,
+            wins: 1,
+            draws: 4,
+            losses: 7,
+            goals_for: 2,
+            goals_against: 14,
+            snapshot: neural_population_full_snapshot(2.0),
+        };
+        let combined = combine_batch_neural_snapshot_validation_evals(&primary, &confirmation);
+        let promotion = policy_promotion_evaluation_from_candidate_validation(
+            &combined,
+            SoccerPolicyPromotionGateConfig::default(),
+        );
+
+        assert_eq!(combined.wins, 9);
+        assert_eq!(combined.draws, 7);
+        assert_eq!(combined.losses, 8);
+        assert_eq!(combined.goals_for, 13);
+        assert_eq!(combined.goals_against, 16);
+        assert_eq!(promotion.sample_games, 24);
+        assert!(
+            (combined.fitness - ((1.1055 - 1.5494) / 2.0)).abs() < 1e-12,
+            "combined fitness should be the game-weighted average of validation and confirmation"
+        );
+        assert!(
+            !validated_snapshot_can_update_resume_only_training_best(
+                true,
+                true,
+                false,
+                combined.fitness,
+            ),
+            "a lucky validation followed by a failed confirmation must not become durable resume memory"
+        );
     }
 
     #[test]
