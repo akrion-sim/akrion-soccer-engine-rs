@@ -10449,6 +10449,8 @@ fn soccer_standardize_actor_policy_sample_advantages(samples: &mut [SoccerPolicy
         .map(|sample| sample.sanitized_weight() > 1.0 + 1e-9 && sample.advantage > 0.0)
         .collect();
     if let Some((mean, std)) = policy_advantage_standardization(&advantages) {
+        // Std-only mode zeroes the subtracted mean so the win/loss common-mode survives.
+        let mean = if dd_soccer_advantage_std_only() { 0.0 } else { mean };
         for (sample, keep_positive) in samples.iter_mut().zip(positive_priority_floors.into_iter())
         {
             sample.advantage = (sample.advantage - mean) / (std + 1e-8);
