@@ -12248,6 +12248,10 @@ pub(crate) const SOCCER_RECEIVER_TIGHT_YARDS: f64 = 3.0;
 /// between tight and this it is "contested" (openness 1).
 pub(crate) const SOCCER_RECEIVER_OPEN_YARDS: f64 = 7.0;
 
+/// Max distance (yards) a teammate may be from a proposed "pass into open space" point for it to
+/// count as a runnable ball (a runner can plausibly get onto it) rather than a blind hoof.
+pub(crate) const SOCCER_SPACE_RUN_ONTO_YARDS: f64 = 12.0;
+
 /// Multiplier that makes the learned per-receiver value DOMINATE the heuristic quality terms
 /// when the learned-pass-receiver head is on: the head decides who, and completion/openness/MPC
 /// heuristics only tie-break equal or unseen receivers. Learned values are return-scale (a few
