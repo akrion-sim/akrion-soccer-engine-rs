@@ -21094,6 +21094,7 @@ impl SoccerMatch {
                 self.config.field_length_yards,
             )
             + killer_pass_reward
+            + completed_forward_pass_count_bonus(pass.team, pass.origin, self.ball.position)
             + self.completed_pass_and_move_forward_reward(pass)
             + progressive_pass_escape_reward(pass, self.ball.position)
             + self.overload_forward_pass_progression_bonus(pass, self.ball.position);

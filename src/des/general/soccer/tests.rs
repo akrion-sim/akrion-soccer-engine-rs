@@ -10652,6 +10652,23 @@ fn completed_pass_reward_prioritizes_forward_progression() {
 }
 
 #[test]
+fn completed_forward_pass_count_bonus_rewards_actual_forward_reception() {
+    let origin = Vec2::new(40.0, 40.0);
+    let forward = completed_forward_pass_count_bonus(Team::Home, origin, Vec2::new(40.0, 45.0));
+    let too_short = completed_forward_pass_count_bonus(Team::Home, origin, Vec2::new(40.0, 40.8));
+    let lateral = completed_forward_pass_count_bonus(Team::Home, origin, Vec2::new(46.0, 40.0));
+    let backward = completed_forward_pass_count_bonus(Team::Home, origin, Vec2::new(40.0, 36.0));
+    let away_forward =
+        completed_forward_pass_count_bonus(Team::Away, origin, Vec2::new(40.0, 35.0));
+
+    assert_eq!(forward, COMPLETED_FORWARD_PASS_COUNT_BONUS_POINTS);
+    assert_eq!(away_forward, COMPLETED_FORWARD_PASS_COUNT_BONUS_POINTS);
+    assert_eq!(too_short, 0.0);
+    assert_eq!(lateral, 0.0);
+    assert_eq!(backward, 0.0);
+}
+
+#[test]
 fn completed_pass_reward_values_flank_usage_more_in_own_half() {
     let field_width = 80.0;
     let field_length = 120.0;

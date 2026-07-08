@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use soccer_engine::des::general::soccer::SoccerMatch;
 use soccer_engine::des::general::soccer::{
-    enable_deterministic_formation_lp, MatchConfig, SoccerMarlAlgorithm,
+    enable_deterministic_formation_lp, MatchConfig, MatchSummary, SoccerMarlAlgorithm,
     SoccerNeuralLearningBackend, SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot,
     SoccerQPolicyOptions, SoccerQTargetEntry, SoccerTeamQPolicies,
     DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
@@ -173,51 +173,140 @@ fn brain_from_env_file(var: &str) -> Option<TeamBrain> {
     }
 }
 
-/// Load a candidate neural snapshot directly from a local `learned-params.json`
-/// artifact (the fully-local learner's durable policy file), via `SOCCER_EVAL_CANDIDATE_PATH`.
-/// This lets the gate score the REAL accumulated local policy against the frozen field
-/// (a held-out climb number over time) instead of only an inline-trained-from-fresh one.
-/// The learned-params artifact embeds the snapshot under the `neuralNetwork` key.
-fn snapshot_from_env_file(var: &str) -> Option<SoccerNeuralNetworkSnapshot> {
-    let path = std::env::var(var).ok()?;
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(raw) => raw,
-        Err(e) => {
-            eprintln!("eval_snapshot_read_failed var={var} path={path}: {e}");
-            return None;
+#[derive(Clone, Debug)]
+struct HoldoutReport {
+    report: MatchReport,
+    advancement: AdvancementFixture,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct AdvancementFixture {
+    candidate_forward_passes: u32,
+    opponent_forward_passes: u32,
+    candidate_completed_passes: u32,
+    opponent_completed_passes: u32,
+    candidate_pass_gain_yards: f64,
+    opponent_pass_gain_yards: f64,
+}
+
+impl AdvancementFixture {
+    fn from_summary(summary: &MatchSummary, candidate_home: bool) -> Self {
+        let stats = &summary.stats;
+        if candidate_home {
+            AdvancementFixture {
+                candidate_forward_passes: stats.passes_completed_forward_home,
+                opponent_forward_passes: stats.passes_completed_forward_away,
+                candidate_completed_passes: stats.passes_completed_home,
+                opponent_completed_passes: stats.passes_completed_away,
+                candidate_pass_gain_yards: finite_yards(stats.completed_pass_gain_yards_home),
+                opponent_pass_gain_yards: finite_yards(stats.completed_pass_gain_yards_away),
+            }
+        } else {
+            AdvancementFixture {
+                candidate_forward_passes: stats.passes_completed_forward_away,
+                opponent_forward_passes: stats.passes_completed_forward_home,
+                candidate_completed_passes: stats.passes_completed_away,
+                opponent_completed_passes: stats.passes_completed_home,
+                candidate_pass_gain_yards: finite_yards(stats.completed_pass_gain_yards_away),
+                opponent_pass_gain_yards: finite_yards(stats.completed_pass_gain_yards_home),
+            }
         }
-    };
-    let value: serde_json::Value = match serde_json::from_str(&raw) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("eval_snapshot_json_failed var={var} path={path}: {e}");
-            return None;
+    }
+
+    fn forward_pass_margin(&self) -> i32 {
+        self.candidate_forward_passes as i32 - self.opponent_forward_passes as i32
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct AdvancementRecord {
+    wins: u32,
+    draws: u32,
+    losses: u32,
+    candidate_forward_passes: u32,
+    opponent_forward_passes: u32,
+    candidate_completed_passes: u32,
+    opponent_completed_passes: u32,
+    candidate_pass_gain_yards: f64,
+    opponent_pass_gain_yards: f64,
+}
+
+impl AdvancementRecord {
+    fn from_fixtures(fixtures: &[HoldoutReport]) -> Self {
+        let mut record = AdvancementRecord::default();
+        for fixture in fixtures {
+            record.add(fixture.advancement);
         }
-    };
-    let nn = value.get("neuralNetwork")?.clone();
-    match serde_json::from_value::<SoccerNeuralNetworkSnapshot>(nn) {
-        Ok(s) => {
-            eprintln!("eval_snapshot_loaded_from_file var={var} path={path}");
-            Some(s)
+        record
+    }
+
+    fn add(&mut self, fixture: AdvancementFixture) {
+        match fixture
+            .candidate_forward_passes
+            .cmp(&fixture.opponent_forward_passes)
+        {
+            std::cmp::Ordering::Greater => self.wins += 1,
+            std::cmp::Ordering::Equal => self.draws += 1,
+            std::cmp::Ordering::Less => self.losses += 1,
         }
-        Err(e) => {
-            eprintln!("eval_snapshot_parse_failed var={var} path={path}: {e}");
-            None
+        self.candidate_forward_passes = self
+            .candidate_forward_passes
+            .saturating_add(fixture.candidate_forward_passes);
+        self.opponent_forward_passes = self
+            .opponent_forward_passes
+            .saturating_add(fixture.opponent_forward_passes);
+        self.candidate_completed_passes = self
+            .candidate_completed_passes
+            .saturating_add(fixture.candidate_completed_passes);
+        self.opponent_completed_passes = self
+            .opponent_completed_passes
+            .saturating_add(fixture.opponent_completed_passes);
+        self.candidate_pass_gain_yards += fixture.candidate_pass_gain_yards;
+        self.opponent_pass_gain_yards += fixture.opponent_pass_gain_yards;
+    }
+
+    fn games(&self) -> u32 {
+        self.wins + self.draws + self.losses
+    }
+
+    fn mean_score(&self) -> f64 {
+        let games = self.games();
+        if games == 0 {
+            0.0
+        } else {
+            (self.wins as f64 + 0.5 * self.draws as f64) / games as f64
         }
+    }
+
+    fn forward_pass_margin(&self) -> i32 {
+        self.candidate_forward_passes as i32 - self.opponent_forward_passes as i32
+    }
+
+    fn pass_gain_yards_margin(&self) -> f64 {
+        self.candidate_pass_gain_yards - self.opponent_pass_gain_yards
+    }
+}
+
+fn finite_yards(value: f64) -> f64 {
+    if value.is_finite() {
+        value
+    } else {
+        0.0
     }
 }
 
 /// A held-out frozen-vs-frozen fixture between two brains. Builds the context with
 /// learning OFF for both sides and a held-out seed, plays it, and returns the
-/// `MatchReport`.
+/// `HoldoutReport`.
 fn play_holdout_fixture(
     runner: &mut EngineMatchRunner,
     home_id: usize,
     away_id: usize,
     seed: u32,
+    candidate_home: bool,
     home: &TeamBrain,
     away: &TeamBrain,
-) -> Result<MatchReport, String> {
+) -> Result<HoldoutReport, String> {
     let ctx = TournamentMatchContext {
         stage: TournamentStage::Group,
         round_index: 0,
@@ -231,17 +320,21 @@ fn play_holdout_fixture(
         away_learns: false,
     };
     let outcome = runner.play(&ctx, home, away)?;
-    Ok(MatchReport {
-        stage: ctx.stage,
-        home_id,
-        away_id,
-        home_name: ctx.home_name,
-        away_name: ctx.away_name,
-        home_goals: outcome.home_goals,
-        away_goals: outcome.away_goals,
-        shootout_winner: None,
-        home_training_steps: outcome.home_training_steps,
-        away_training_steps: outcome.away_training_steps,
+    let advancement = AdvancementFixture::from_summary(&outcome.summary, candidate_home);
+    Ok(HoldoutReport {
+        report: MatchReport {
+            stage: ctx.stage,
+            home_id,
+            away_id,
+            home_name: ctx.home_name,
+            away_name: ctx.away_name,
+            home_goals: outcome.home_goals,
+            away_goals: outcome.away_goals,
+            shootout_winner: None,
+            home_training_steps: outcome.home_training_steps,
+            away_training_steps: outcome.away_training_steps,
+        },
+        advancement,
     })
 }
 
@@ -346,7 +439,7 @@ fn main() {
         .clamp(1, fixtures.len().max(1));
     eprintln!("eval_parallelism={workers} fixtures={}", fixtures.len());
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let collected = std::sync::Mutex::new(Vec::<(usize, MatchReport)>::new());
+    let collected = std::sync::Mutex::new(Vec::<(usize, HoldoutReport)>::new());
     std::thread::scope(|scope| {
         for _ in 0..workers {
             let next = &next;
@@ -365,6 +458,7 @@ fn main() {
                         candidate_id,
                         fx.opponent_id,
                         fx.seed,
+                        fx.candidate_home,
                         candidate_brain,
                         opponent,
                     )
@@ -374,6 +468,7 @@ fn main() {
                         fx.opponent_id,
                         candidate_id,
                         fx.seed,
+                        fx.candidate_home,
                         opponent,
                         candidate_brain,
                     )
@@ -381,12 +476,15 @@ fn main() {
                 match result {
                     Ok(report) => {
                         eprintln!(
-                            "  holdout {}v{} seed=0x{:08X} -> {}-{}",
-                            report.home_id,
-                            report.away_id,
+                            "  holdout {}v{} seed=0x{:08X} -> {}-{} forward_passes={}-{} margin={:+}",
+                            report.report.home_id,
+                            report.report.away_id,
                             fx.seed,
-                            report.home_goals,
-                            report.away_goals
+                            report.report.home_goals,
+                            report.report.away_goals,
+                            report.advancement.candidate_forward_passes,
+                            report.advancement.opponent_forward_passes,
+                            report.advancement.forward_pass_margin(),
                         );
                         collected.lock().unwrap().push((fx.index, report));
                     }
@@ -400,7 +498,12 @@ fn main() {
     // Sort back into the original fixture order so scoring is identical to the serial path.
     let mut collected = collected.into_inner().unwrap();
     collected.sort_by_key(|(i, _)| *i);
-    let reports: Vec<MatchReport> = collected.into_iter().map(|(_, r)| r).collect();
+    let holdout_reports: Vec<HoldoutReport> = collected.into_iter().map(|(_, r)| r).collect();
+    let advancement = AdvancementRecord::from_fixtures(&holdout_reports);
+    let reports: Vec<MatchReport> = holdout_reports
+        .iter()
+        .map(|holdout| holdout.report.clone())
+        .collect();
 
     let verdict = evaluate_promotion(
         &reports,
@@ -441,6 +544,19 @@ fn main() {
     );
     println!("Wilson lower bound: {:.3}", verdict.wilson_lower_bound);
     println!(
+        "advancement: {}W-{}D-{}L by completed_forward_passes  FP {}/{} (margin {:+}, payoff {:.3})  completed_passes {}/{}  pass_gain_yards_margin {:+.1}",
+        advancement.wins,
+        advancement.draws,
+        advancement.losses,
+        advancement.candidate_forward_passes,
+        advancement.opponent_forward_passes,
+        advancement.forward_pass_margin(),
+        advancement.mean_score(),
+        advancement.candidate_completed_passes,
+        advancement.opponent_completed_passes,
+        advancement.pass_gain_yards_margin(),
+    );
+    println!(
         "\nDECISION: {}",
         if verdict.promote { "PROMOTE" } else { "REJECT" }
     );
@@ -448,4 +564,54 @@ fn main() {
         println!("  - {reason}");
     }
     std::process::exit(i32::from(!verdict.promote));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soccer_engine::des::general::soccer::MatchStats;
+
+    #[test]
+    fn advancement_record_uses_completed_forward_passes_not_score_or_shots() {
+        let mut stats = MatchStats::default();
+        stats.shots_home = 1;
+        stats.shots_away = 18;
+        stats.shots_on_target_home = 0;
+        stats.shots_on_target_away = 9;
+        stats.passes_completed_home = 20;
+        stats.passes_completed_away = 40;
+        stats.passes_completed_forward_home = 12;
+        stats.passes_completed_forward_away = 4;
+        stats.completed_pass_gain_yards_home = 72.0;
+        stats.completed_pass_gain_yards_away = 24.0;
+        let summary = MatchSummary {
+            score_home: 0,
+            score_away: 5,
+            ticks: 100,
+            simulated_seconds: 90.0,
+            stats,
+        };
+        let fixture = AdvancementFixture::from_summary(&summary, true);
+        let report = HoldoutReport {
+            report: MatchReport {
+                stage: TournamentStage::Group,
+                home_id: 0,
+                away_id: 1,
+                home_name: "candidate".to_string(),
+                away_name: "baseline".to_string(),
+                home_goals: summary.score_home,
+                away_goals: summary.score_away,
+                shootout_winner: None,
+                home_training_steps: 0,
+                away_training_steps: 0,
+            },
+            advancement: fixture,
+        };
+
+        let record = AdvancementRecord::from_fixtures(&[report]);
+        assert_eq!(record.wins, 1);
+        assert_eq!(record.losses, 0);
+        assert_eq!(record.forward_pass_margin(), 8);
+        assert!((record.mean_score() - 1.0).abs() < 1e-12);
+    }
 }

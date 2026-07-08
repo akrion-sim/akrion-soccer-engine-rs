@@ -2080,58 +2080,81 @@ pub fn soccer_learning_team_score(
 }
 
 pub fn soccer_learning_directional_objective_fitness(team: Team, summary: &MatchSummary) -> f64 {
-    let goals_for = match team {
-        Team::Home => summary.score_home,
-        Team::Away => summary.score_away,
-    };
-    let goals_against = match team {
-        Team::Home => summary.score_away,
-        Team::Away => summary.score_home,
-    };
-    let base = soccer_learning_team_score(team, goals_for, goals_against).fitness;
-    let own_quality = soccer_learning_team_play_quality(team, summary);
-    let opp_quality = soccer_learning_team_play_quality(team.other(), summary);
     let stats = &summary.stats;
     let (
-        shots_for,
-        shots_against,
-        shots_on_target_for,
-        shots_on_target_against,
-        shots_after_pass_for,
-        shots_after_pass_against,
+        pass_attempts_for,
+        pass_attempts_against,
+        completed_for,
+        completed_against,
+        forward_completed_for,
+        forward_completed_against,
         backward_completed_for,
+        backward_completed_against,
+        completed_pass_gain_yards_for,
+        completed_pass_gain_yards_against,
+        chain_gain_yards_for,
+        chain_gain_yards_against,
         chain_losses_for,
+        chain_losses_against,
+        route_one_for,
     ) = match team {
         Team::Home => (
-            stats.shots_home,
-            stats.shots_away,
-            stats.shots_on_target_home,
-            stats.shots_on_target_away,
-            stats.shots_after_pass_home,
-            stats.shots_after_pass_away,
+            stats.passes_attempted_home,
+            stats.passes_attempted_away,
+            stats.passes_completed_home,
+            stats.passes_completed_away,
+            stats.passes_completed_forward_home,
+            stats.passes_completed_forward_away,
             stats.passes_completed_backward_home,
+            stats.passes_completed_backward_away,
+            stats.completed_pass_gain_yards_home,
+            stats.completed_pass_gain_yards_away,
+            stats.pass_chain_gain_yards_home,
+            stats.pass_chain_gain_yards_away,
             stats.pass_chains_net_loss_home,
+            stats.pass_chains_net_loss_away,
+            stats.route_one_balls_home,
         ),
         Team::Away => (
-            stats.shots_away,
-            stats.shots_home,
-            stats.shots_on_target_away,
-            stats.shots_on_target_home,
-            stats.shots_after_pass_away,
-            stats.shots_after_pass_home,
+            stats.passes_attempted_away,
+            stats.passes_attempted_home,
+            stats.passes_completed_away,
+            stats.passes_completed_home,
+            stats.passes_completed_forward_away,
+            stats.passes_completed_forward_home,
             stats.passes_completed_backward_away,
+            stats.passes_completed_backward_home,
+            stats.completed_pass_gain_yards_away,
+            stats.completed_pass_gain_yards_home,
+            stats.pass_chain_gain_yards_away,
+            stats.pass_chain_gain_yards_home,
             stats.pass_chains_net_loss_away,
+            stats.pass_chains_net_loss_home,
+            stats.route_one_balls_away,
         ),
     };
-    let shot_creation = soccer_learning_bounded_count(shots_on_target_for, 8.0) * 0.55
-        + soccer_learning_bounded_count(shots_for, 12.0) * 0.10
-        + soccer_learning_bounded_count(shots_after_pass_for, 8.0) * 0.18;
-    let shot_concession = soccer_learning_bounded_count(shots_on_target_against, 8.0) * 1.05
-        + soccer_learning_bounded_count(shots_against, 12.0) * 0.22
-        + soccer_learning_bounded_count(shots_after_pass_against, 8.0) * 0.30;
-    let recycle_penalty = soccer_learning_bounded_count(backward_completed_for, 18.0) * 0.12
-        + soccer_learning_bounded_count(chain_losses_for, 10.0) * 0.15;
-    (base + (own_quality - opp_quality) * 0.75 + shot_creation - shot_concession - recycle_penalty)
+    let forward_count_margin = soccer_learning_bounded_count(forward_completed_for, 42.0) * 4.0
+        - soccer_learning_bounded_count(forward_completed_against, 42.0) * 3.0;
+    let forward_yards_margin = soccer_learning_bounded_metric(completed_pass_gain_yards_for, 160.0)
+        * 1.7
+        - soccer_learning_bounded_metric(completed_pass_gain_yards_against, 160.0) * 1.2;
+    let chain_progress_margin = soccer_learning_bounded_metric(chain_gain_yards_for, 180.0) * 1.1
+        - soccer_learning_bounded_metric(chain_gain_yards_against, 180.0) * 0.8;
+    let productive_for = soccer_learning_ratio(completed_for, pass_attempts_for)
+        * soccer_learning_ratio(forward_completed_for, completed_for);
+    let productive_against = soccer_learning_ratio(completed_against, pass_attempts_against)
+        * soccer_learning_ratio(forward_completed_against, completed_against);
+    let productive_margin = (productive_for - productive_against) * 1.1;
+    let recycling_risk = soccer_learning_bounded_count(backward_completed_for, 18.0) * 0.45
+        + soccer_learning_bounded_count(chain_losses_for, 10.0) * 0.55
+        + soccer_learning_bounded_count(route_one_for, 8.0) * 0.20;
+    let opponent_recycling_credit = soccer_learning_bounded_count(backward_completed_against, 18.0)
+        * 0.18
+        + soccer_learning_bounded_count(chain_losses_against, 10.0) * 0.22;
+
+    (forward_count_margin + forward_yards_margin + chain_progress_margin + productive_margin
+        - recycling_risk
+        + opponent_recycling_credit)
         .clamp(
             SOCCER_DIRECTIONAL_OBJECTIVE_MIN,
             SOCCER_DIRECTIONAL_OBJECTIVE_MAX,
@@ -9013,59 +9036,73 @@ mod tests {
     }
 
     #[test]
-    fn directional_objective_rewards_sot_and_prevents_conceded_sot() {
-        let mut attacking_stats = MatchStats::default();
-        attacking_stats.shots_home = 10;
-        attacking_stats.shots_on_target_home = 6;
-        attacking_stats.shots_after_pass_home = 4;
-        attacking_stats.passes_attempted_home = 18;
-        attacking_stats.passes_completed_home = 12;
-        attacking_stats.passes_completed_forward_home = 8;
-        let attacking = MatchSummary {
+    fn directional_objective_rewards_completed_forward_advancement() {
+        let mut progressive_stats = MatchStats::default();
+        progressive_stats.passes_attempted_home = 36;
+        progressive_stats.passes_completed_home = 29;
+        progressive_stats.passes_completed_forward_home = 23;
+        progressive_stats.completed_pass_gain_yards_home = 126.0;
+        progressive_stats.pass_chain_gain_yards_home = 156.0;
+        let progressive = MatchSummary {
             score_home: 0,
             score_away: 0,
             ticks: 100,
             simulated_seconds: 90.0,
-            stats: attacking_stats,
+            stats: progressive_stats,
         };
 
-        let mut passive_stats = MatchStats::default();
-        passive_stats.passes_attempted_home = 60;
-        passive_stats.passes_completed_home = 54;
-        passive_stats.passes_completed_forward_home = 48;
-        passive_stats.pass_chain_gain_yards_home = 180.0;
-        let passive = MatchSummary {
+        let mut shot_farming_stats = MatchStats::default();
+        shot_farming_stats.shots_home = 14;
+        shot_farming_stats.shots_on_target_home = 7;
+        shot_farming_stats.shots_after_pass_home = 5;
+        shot_farming_stats.passes_attempted_home = 16;
+        shot_farming_stats.passes_completed_home = 11;
+        shot_farming_stats.passes_completed_forward_home = 2;
+        let shot_farming = MatchSummary {
             score_home: 0,
             score_away: 0,
             ticks: 100,
             simulated_seconds: 90.0,
-            stats: passive_stats,
+            stats: shot_farming_stats,
         };
 
-        let attacking_objective =
-            soccer_learning_directional_objective_fitness(Team::Home, &attacking);
-        let passive_objective = soccer_learning_directional_objective_fitness(Team::Home, &passive);
+        let progressive_objective =
+            soccer_learning_directional_objective_fitness(Team::Home, &progressive);
+        let shot_farming_objective =
+            soccer_learning_directional_objective_fitness(Team::Home, &shot_farming);
         assert!(
-            attacking_objective > passive_objective,
-            "shots on target should beat sterile pass chains: attacking={attacking_objective}, passive={passive_objective}"
+            progressive_objective > shot_farming_objective + 0.80,
+            "completed forward advancement should beat shot farming: progressive={progressive_objective}, shot_farming={shot_farming_objective}"
         );
 
-        let mut exposed_stats = attacking.stats.clone();
-        exposed_stats.shots_away = 10;
-        exposed_stats.shots_on_target_away = 7;
-        exposed_stats.shots_after_pass_away = 4;
-        let exposed = MatchSummary {
-            stats: exposed_stats,
-            ..attacking.clone()
+        let mut matched_stats = progressive.stats.clone();
+        matched_stats.passes_attempted_away = 36;
+        matched_stats.passes_completed_away = 29;
+        matched_stats.passes_completed_forward_away = 23;
+        matched_stats.completed_pass_gain_yards_away = 126.0;
+        matched_stats.pass_chain_gain_yards_away = 156.0;
+        let matched = MatchSummary {
+            stats: matched_stats,
+            ..progressive.clone()
         };
-        let exposed_objective = soccer_learning_directional_objective_fitness(Team::Home, &exposed);
+        let matched_objective = soccer_learning_directional_objective_fitness(Team::Home, &matched);
         assert!(
-            attacking_objective > exposed_objective + 0.80,
-            "conceded shots on target must lower the HOME objective: clean={attacking_objective}, exposed={exposed_objective}"
+            progressive_objective > matched_objective + 2.0,
+            "analytic parity in completed forward passes should erase the HOME advantage: progressive={progressive_objective}, matched={matched_objective}"
         );
+
+        let mut recycled_stats = progressive.stats.clone();
+        recycled_stats.passes_completed_backward_home = 28;
+        recycled_stats.pass_chains_net_loss_home = 8;
+        let recycled = MatchSummary {
+            stats: recycled_stats,
+            ..progressive.clone()
+        };
+        let recycled_objective =
+            soccer_learning_directional_objective_fitness(Team::Home, &recycled);
         assert!(
-            passive_objective > exposed_objective,
-            "a policy that concedes repeated shots on target should not beat sterile possession: passive={passive_objective}, exposed={exposed_objective}"
+            progressive_objective > recycled_objective + 0.60,
+            "forward-pass rewards must still penalize backward recycling: progressive={progressive_objective}, recycled={recycled_objective}"
         );
 
         let one_goal = MatchSummary {
@@ -9077,8 +9114,8 @@ mod tests {
         };
         let goal_objective = soccer_learning_directional_objective_fitness(Team::Home, &one_goal);
         assert!(
-            goal_objective > attacking_objective,
-            "a real goal should still dominate sterile scoreless shot pressure: goal={goal_objective}, attacking={attacking_objective}"
+            progressive_objective > goal_objective + 1.0,
+            "this analytic-opponent objective measures advancement, not goal-only noise: progressive={progressive_objective}, goal={goal_objective}"
         );
     }
 

@@ -591,10 +591,8 @@ fn main() {
         env_bool("SOCCER_LEAGUE_CHECKPOINT_REQUIRE_FORWARD_PASS_CLIMB", true);
     let checkpoint_max_forward_pass_regression =
         env_f64("SOCCER_LEAGUE_CHECKPOINT_MAX_FORWARD_PASS_REGRESSION", 0.0).max(0.0);
-    let checkpoint_min_forward_pass_margin = env_f64(
-        "SOCCER_LEAGUE_CHECKPOINT_MIN_FORWARD_PASS_MARGIN",
-        f64::NEG_INFINITY,
-    );
+    let checkpoint_min_forward_pass_margin =
+        env_f64("SOCCER_LEAGUE_CHECKPOINT_MIN_FORWARD_PASS_MARGIN", 0.0);
 
     let mut runner_config = EngineMatchRunnerConfig::default();
     runner_config.base.duration_seconds = minutes * 60.0;
@@ -935,7 +933,7 @@ fn main() {
                     || mean_forward_pass_margin + checkpoint_max_forward_pass_regression
                         >= prior_best;
                 let passes_forward_pass_floor =
-                    mean_forward_pass_margin >= checkpoint_min_forward_pass_margin;
+                    mean_forward_pass_margin > checkpoint_min_forward_pass_margin;
                 if passes_forward_pass_climb && passes_forward_pass_floor {
                     let cp = format!(
                         "{}/league-r{:04}-{}.json",
