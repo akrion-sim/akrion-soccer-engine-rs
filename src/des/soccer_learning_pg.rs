@@ -3436,6 +3436,7 @@ impl SoccerLearningPgStore {
                 cursor_macro = last.get(6);
                 cursor_root = last.get(7);
                 cursor_hash = last.get(10);
+                cursor_receiver = last.get(11);
             }
 
             for row in &rows {
