@@ -2346,6 +2346,7 @@ pub fn merge_soccer_policy_deltas(
                 target_tactical_cell_id: entry.target_tactical_cell_id,
                 target_macro_cell_id: entry.target_macro_cell_id,
                 target_root_cell_id: entry.target_root_cell_id,
+                receiver_descriptor: entry.receiver_descriptor,
             });
             item.weighted_value_sum += entry.after_value * effective_visits;
             item.effective_visits += effective_visits;
