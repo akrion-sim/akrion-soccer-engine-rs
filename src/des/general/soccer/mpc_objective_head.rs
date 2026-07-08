@@ -338,6 +338,47 @@ mod tests {
     }
 
     #[test]
+    fn bend_axis_only_present_when_enabled() {
+        // Default head has no bend axis: predict_bend is None, byte-identical 2-output behavior.
+        let plain = SoccerMpcObjectiveHead::new(21);
+        assert!(!plain.bend_enabled());
+        let features = vec![0.4f32; MPC_OBJECTIVE_FEATURE_DIM];
+        assert!(plain.predict_bend(&features).is_none());
+
+        // Bend-enabled head yields a hard-bounded signed bend.
+        let bent = SoccerMpcObjectiveHead::new_with_bend(21, true);
+        assert!(bent.bend_enabled());
+        let bend = bent.predict_bend(&features).expect("bend");
+        assert!(bend.abs() <= MPC_OBJECTIVE_MAX_BEND_YARDS + 1e-9);
+        // Explore stays inside the bound under absurd jitter.
+        let explored = bent
+            .explore_bend(&features, 100.0, 50.0)
+            .expect("explored bend");
+        assert!(explored.abs() <= MPC_OBJECTIVE_MAX_BEND_YARDS + 1e-9);
+    }
+
+    #[test]
+    fn rwr_trains_bend_axis_on_positive_advantage() {
+        let mut head = SoccerMpcObjectiveHead::new_with_bend(23, true);
+        let sample = MpcObjectiveSample {
+            features: vec![0.3f32; MPC_OBJECTIVE_FEATURE_DIM],
+            applied_residual: Vec2 { x: 0.5, y: 0.5 },
+            applied_bend: MPC_OBJECTIVE_MAX_BEND_YARDS * 0.8,
+            reward: 1.5,
+        };
+        let before = head.predict_bend(&sample.features).expect("bend before");
+        // Many RWR steps toward a strong positive bend should move the prediction that way.
+        for _ in 0..200 {
+            head.train_rwr(std::slice::from_ref(&sample), 0.1);
+        }
+        let after = head.predict_bend(&sample.features).expect("bend after");
+        assert!(
+            after > before,
+            "positive-advantage bend target should raise the predicted bend: {before} -> {after}"
+        );
+    }
+
+    #[test]
     fn explore_residual_nan_noise_falls_back_to_greedy() {
         let head = SoccerMpcObjectiveHead::new(13);
         let features = vec![0.4f32; MPC_OBJECTIVE_FEATURE_DIM];
