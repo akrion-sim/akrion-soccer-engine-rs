@@ -2698,7 +2698,8 @@ impl SoccerLearningPgStore {
                   d.value_delta_micros,
                   d.visit_delta,
                   d.merge_weight_micros,
-                  d.effective_visit_micros
+                  d.effective_visit_micros,
+                  d.receiver_descriptor
                 from des_soccer_learning_run_deltas d
                 join des_soccer_learning_runs r on r.id = d.run_id
                 where r.experiment_id = $1::text::uuid
@@ -2708,7 +2709,8 @@ impl SoccerLearningPgStore {
                 order by r.created_at desc, r.id desc,
                          d.team, d.entry_kind, d.state_hash, d.action,
                          d.target_fine_cell_id, d.target_tactical_cell_id,
-                         d.target_macro_cell_id, d.target_root_cell_id
+                         d.target_macro_cell_id, d.target_root_cell_id,
+                         d.receiver_descriptor
                 limit $2
                 "#,
                 &[&experiment_id, &limit, &created_after_micros],
