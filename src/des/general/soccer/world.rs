@@ -24124,6 +24124,7 @@ impl SoccerMatch {
                             receiver_openness,
                             flight,
                         ),
+                        mpc_objective: mpc_objective_sample,
                     });
                     // Slip-and-break-the-offside-trap execution: a firm forward GROUND ball slipped
                     // to an ONSIDE runner who timed his break into a two-defender seam. Detect the
