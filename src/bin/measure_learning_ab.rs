@@ -25,9 +25,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use soccer_engine::des::general::soccer::{
-    enable_deterministic_formation_lp, MatchConfig, SoccerMarlAlgorithm, SoccerMatch,
-    SoccerNeuralLearningBackend, SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot,
-    SoccerQPolicyOptions, SoccerTeamQPolicies, DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
+    enable_deterministic_formation_lp, learned_mpc_objective_enabled, MatchConfig,
+    SoccerMarlAlgorithm, SoccerMatch, SoccerMpcObjectiveHead, SoccerNeuralLearningBackend,
+    SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot, SoccerQPolicyOptions,
+    SoccerTeamQPolicies, DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
 };
 
 /// One game's measured offense KPIs (both teams summed — self-play is symmetric).
