@@ -14110,29 +14110,53 @@ impl MatchOutcomeReward {
     }
 
     /// Folds the gated zero-sum chance-quality bonus into the label:
-    /// `home += b`, `away -= b`, where `b = points_per_sot · clamp(home_sot − away_sot, ±cap)`.
-    /// Applied to every result (draws included). Gate off ⇒ `b = 0` ⇒ label unchanged.
-    fn with_chance_quality(mut self, sot_home: u32, sot_away: u32) -> Self {
-        let bonus = match_outcome_chance_quality_home_bonus(sot_home, sot_away);
+    /// `home += b`, `away -= b`, where `b = k · clamp(chance_diff, ±cap)` and `chance_diff` is the
+    /// SOT differential (or the composite worked-SOT blend). Applied to every result (draws
+    /// included). Gate off ⇒ `b = 0` ⇒ label unchanged.
+    fn with_chance_quality(
+        mut self,
+        sot_home: u32,
+        sot_away: u32,
+        worked_home: u32,
+        worked_away: u32,
+    ) -> Self {
+        let bonus =
+            match_outcome_chance_quality_home_bonus(sot_home, sot_away, worked_home, worked_away);
         self.home += bonus;
         self.away -= bonus;
         self
     }
 }
 
-/// Home-perspective chance-quality bonus (see `MATCH_OUTCOME_CHANCE_QUALITY_*`). Reads the
-/// enable env once per call — invoked only once per finished game, off any hot path. The
-/// shots-on-target differential is capped so the bonus cannot dominate the ±200 win label or
-/// reward low-quality shot farming.
-fn match_outcome_chance_quality_home_bonus(sot_home: u32, sot_away: u32) -> f64 {
+/// Home-perspective chance-quality bonus (see `MATCH_OUTCOME_CHANCE_QUALITY_*`). Reads env once
+/// per call — invoked only once per finished game, off any hot path. The differential is capped
+/// so the bonus cannot dominate the ±200 win label or reward low-quality shot farming.
+fn match_outcome_chance_quality_home_bonus(
+    sot_home: u32,
+    sot_away: u32,
+    worked_home: u32,
+    worked_away: u32,
+) -> f64 {
     if !soccer_env_flag_enabled(MATCH_OUTCOME_CHANCE_QUALITY_ENABLE_ENV) {
         return 0.0;
     }
-    let diff = (f64::from(sot_home) - f64::from(sot_away)).clamp(
-        -MATCH_OUTCOME_CHANCE_QUALITY_SOT_CAP,
-        MATCH_OUTCOME_CHANCE_QUALITY_SOT_CAP,
-    );
-    MATCH_OUTCOME_CHANCE_QUALITY_POINTS_PER_SOT * diff
+    let sot_diff = f64::from(sot_home) - f64::from(sot_away);
+    let units = if soccer_env_flag_enabled(MATCH_OUTCOME_CHANCE_QUALITY_COMPOSITE_ENV) {
+        let worked_diff = f64::from(worked_home) - f64::from(worked_away);
+        MATCH_OUTCOME_CHANCE_QUALITY_BASE_WEIGHT * sot_diff
+            + MATCH_OUTCOME_CHANCE_QUALITY_WORKED_WEIGHT * worked_diff
+    } else {
+        sot_diff
+    };
+    let cap = std::env::var(MATCH_OUTCOME_CHANCE_QUALITY_CAP_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(MATCH_OUTCOME_CHANCE_QUALITY_SOT_CAP);
+    let k = std::env::var(MATCH_OUTCOME_CHANCE_QUALITY_K_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(MATCH_OUTCOME_CHANCE_QUALITY_POINTS_PER_SOT);
+    k * units.clamp(-cap, cap)
 }
 
 fn dd_soccer_enable_outcome_credit() -> bool {

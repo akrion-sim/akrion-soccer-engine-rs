@@ -15293,72 +15293,6 @@ impl SoccerMatch {
             }
         }
 
-<<<<<<< HEAD
-        // Diagnostic side-channel (gated): when `DD_SOCCER_DUMP_ADVANTAGE_DIAGNOSTIC` is set,
-        // record `(team, action_index, pre-standardization advantage)` aligned 1:1 with `samples`
-        // so an offline pass can see whether raw advantages separate chance-rich from sterile
-        // draws and whether batch standardization erases that separation. Off ⇒ byte-identical
-        // (the loop below is the exact filter_map that produced `samples` before, unchanged).
-        let diag_on = std::env::var("DD_SOCCER_DUMP_ADVANTAGE_DIAGNOSTIC").is_ok();
-        let mut diag_meta: Vec<(Team, usize, f64)> = Vec::new();
-        let mut samples: Vec<SoccerPolicySample> = Vec::new();
-        for (index, transition) in replay.iter().enumerate() {
-            if self.neural_team_frozen(transition.team) {
-                continue;
-            }
-            if !soccer_neural_authoritative_actor_training_transition_allowed(transition) {
-                continue;
-            }
-            let rejected_counterexample = learned_mpc_rejected_action_counterexample(transition);
-            if !soccer_actor_policy_sample_allowed(transition) {
-                continue;
-            }
-            let Some(action_index) = soccer_policy_action_index(&transition.action) else {
-                continue;
-            };
-            let advantage = if rejected_counterexample {
-                reward_adv[index] - values[index]
-            } else {
-                advantages[index]
-            };
-            let advantage =
-                soccer_actor_advantage_with_planner_distillation(transition, advantage);
-            let mcts_distillation =
-                soccer_actor_mcts_distillation_priority(transition, advantage);
-            let sample_weight = soccer_actor_priority_weight(transition, advantage);
-            let state_features = self.policy_state_features(transition);
-            let actor_probability = self
-                .policy_head
-                .as_ref()
-                .and_then(|head| head.action_distribution(&state_features))
-                .and_then(|probs| probs.get(action_index).copied());
-            // Stochastic top-k selection records the true behavior policy;
-            // older/deterministic rows keep their chosen-action probability
-            // before falling back to the actor head.
-            let old_action_probability = soccer_behavior_old_action_probability(
-                transition
-                    .decision_context
-                    .behavior_policy_probability
-                    .filter(|probability| probability.is_finite() && *probability > 0.0)
-                    .or(Some(transition.decision_context.chosen_action_probability)),
-                actor_probability,
-            );
-            if !advantage.is_finite() {
-                continue;
-            }
-            if diag_on {
-                diag_meta.push((transition.team, action_index, advantage));
-            }
-            samples.push(SoccerPolicySample {
-                state_features,
-                action_index,
-                advantage,
-                old_action_probability,
-                sample_weight,
-                mcts_distillation,
-            });
-        }
-=======
         let mut option_score_safety_counterexample_candidates = 0usize;
         let mut option_score_safety_counterexample_samples = 0usize;
         let mut option_score_safety_counterexample_weight_sum = 0.0;
@@ -15369,6 +15303,14 @@ impl SoccerMatch {
         let option_score_safety_sample_rate = option_score_safety_counterexample_sample_rate();
         let option_score_safety_advantage_scale =
             option_score_safety_counterexample_advantage_scale();
+        // Diagnostic side-channel (gated): when `DD_SOCCER_DUMP_ADVANTAGE_DIAGNOSTIC` is set, record
+        // `(team, action_index, pre-standardization advantage)` aligned 1:1 with the kept `samples`
+        // so an offline pass can see whether raw advantages separate chance-rich from sterile draws
+        // and whether batch standardization erases that separation. Off ⇒ byte-identical. Note the
+        // recorded advantage is the FINAL per-sample advantage (post planner-distillation + outcome
+        // credit, pre batch-standardization) — the exact value that enters `SoccerPolicySample`.
+        let diag_on = std::env::var("DD_SOCCER_DUMP_ADVANTAGE_DIAGNOSTIC").is_ok();
+        let mut diag_meta: Vec<(Team, usize, f64)> = Vec::new();
         let mut samples: Vec<SoccerPolicySample> = replay
             .iter()
             .enumerate()
@@ -15447,6 +15389,9 @@ impl SoccerMatch {
                     }
                     return None;
                 }
+                if diag_on {
+                    diag_meta.push((transition.team, action_index, advantage));
+                }
                 let sample = SoccerPolicySample {
                     state_features,
                     action_index,
@@ -15462,7 +15407,6 @@ impl SoccerMatch {
                 Some(sample)
             })
             .collect();
->>>>>>> 8b129d9087743d8d8dad50e420d35a68e5224abd
 
         // PPO/MAPPO advantage standardization (zero-mean / unit-variance over the batch):
         // the standard variance-reduction trick that keeps the policy-gradient step scale
