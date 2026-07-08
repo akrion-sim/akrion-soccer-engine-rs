@@ -17,9 +17,8 @@
 //! Mirrors [`super::SoccerPassCompletionHead`]: a shared `FeedForwardNetwork` over the config
 //! embedding, live net not serde (round-tripped through the neural-snapshot path for persistence).
 
-use crate::des::general::neural_network::{
-    ActivationName, FeedForwardNetwork, NeuralNetworkLike, RandomNetworkSpec,
-};
+use crate::des::general::des_base::neural_network::NeuralNetworkLike;
+use crate::des::general::neural_network::{ActivationName, FeedForwardNetwork, RandomNetworkSpec};
 use crate::des::general::prng::mulberry32;
 
 use super::{Vec2, SOCCER_MOMENT_EMBEDDING_DIM};
