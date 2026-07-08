@@ -12154,6 +12154,26 @@ impl SoccerMatch {
             })?
             .clamp_to_pitch(snapshot.field_width, snapshot.field_length);
         let actor_position = snapshot.player_position(player_id).unwrap_or(point);
+        // Credit the learned pass-receiver head per-receiver only when the gate is on; otherwise
+        // leave it None so training folds in RECEIVER_DESCRIPTOR_UNSPECIFIED (grid-only parity).
+        let receiver_descriptor = if dd_soccer_enable_learned_pass_receiver()
+            && pass_like_action_flight(normalize_soccer_action_label(&plan.action)).is_some()
+        {
+            let (kind, role) = match plan.target_player {
+                Some(target_id) => (
+                    ReceiverKind::Teammate,
+                    snapshot
+                        .players
+                        .iter()
+                        .find(|p| p.id == target_id)
+                        .map(|p| p.role),
+                ),
+                None => (ReceiverKind::Space, None),
+            };
+            Some(snapshot.pass_receiver_descriptor(player_id, kind, point, role))
+        } else {
+            None
+        };
         Some(AgentActionTargetTrace {
             point: Some(point),
             player_id: plan.target_player,
@@ -12164,6 +12184,7 @@ impl SoccerMatch {
             )),
             facing: facing_bucket_from_vector(point - actor_position),
             dribble_touch: None,
+            receiver_descriptor,
         })
     }
 
