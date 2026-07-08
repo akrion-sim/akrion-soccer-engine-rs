@@ -289,16 +289,23 @@ fn eval(candidate_path: &str, baseline_path: &str, games: usize, minutes: f64, h
                 &candidate,
             )
         };
-        if let Some((r, home_forward, away_forward)) = report {
-            // Map the fixture's home/away forward-pass counts back to candidate/baseline
-            // regardless of this game's orientation.
-            let (candidate_forward, baseline_forward) = if r.home_id == candidate_id {
-                (home_forward, away_forward)
+        if let Some((r, home_pass, away_pass)) = report {
+            // Map the fixture's home/away breakdown back to candidate/baseline regardless of
+            // this game's orientation.
+            let (cand_pass, base_pass) = if r.home_id == candidate_id {
+                (home_pass, away_pass)
             } else {
-                (away_forward, home_forward)
+                (away_pass, home_pass)
             };
+            let (candidate_forward, baseline_forward) = (cand_pass.forward, base_pass.forward);
             candidate_forward_total += u64::from(candidate_forward);
             baseline_forward_total += u64::from(baseline_forward);
+            cand_att += u64::from(cand_pass.attempted);
+            cand_comp += u64::from(cand_pass.completed);
+            cand_back += u64::from(cand_pass.backward);
+            base_att += u64::from(base_pass.attempted);
+            base_comp += u64::from(base_pass.completed);
+            base_back += u64::from(base_pass.backward);
             forward_pass_diffs.push(f64::from(candidate_forward) - f64::from(baseline_forward));
             eprintln!(
                 "[eval] game {:>2}/{games} {}v{} -> {}-{}  fwd-passes cand/base {}/{} ({:.0}s)",
