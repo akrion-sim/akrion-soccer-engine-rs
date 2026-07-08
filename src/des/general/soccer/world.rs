@@ -29983,6 +29983,32 @@ impl SoccerMatch {
     /// embedding + pass features, labelled `completed`). Bounded rolling window; the cluster learner
     /// drains it to Postgres + the model. No-op when the launch features were not captured.
     fn record_pass_outcome_sample(&mut self, pass: &PendingPass, completed: bool, own_half: bool) {
+        // Executor-head (MPC-objective) sample: reinforce the applied aim/lead residual by the
+        // delayed outcome advantage. Recorded independently of the pass-completion corpus (works
+        // even when that head is off), so it sits BEFORE the `learn_features` guard below. RWR only
+        // trains on positive advantage, so a completed + progressive pass reinforces its residual
+        // while an interception (negative) is skipped — the head learns aims that actually connect.
+        if let Some((features, residual)) = pass.mpc_objective.as_ref() {
+            if features.len() == MPC_OBJECTIVE_FEATURE_DIM {
+                let forward = ((pass.intended_target.y - pass.origin.y) * pass.team.attack_dir()
+                    / 20.0)
+                    .clamp(-1.0, 1.0);
+                let reward = if completed {
+                    0.6 + 0.4 * forward.max(0.0)
+                } else {
+                    -1.0
+                };
+                self.mpc_objective_samples.push(MpcObjectiveSample {
+                    features: features.clone(),
+                    applied_residual: *residual,
+                    reward,
+                });
+                if self.mpc_objective_samples.len() > MPC_OBJECTIVE_SAMPLE_CAP {
+                    let overflow = self.mpc_objective_samples.len() - MPC_OBJECTIVE_SAMPLE_CAP;
+                    self.mpc_objective_samples.drain(0..overflow);
+                }
+            }
+        }
         if pass.learn_features.len() != SOCCER_PASS_COMPLETION_FEATURE_DIM {
             return;
         }
