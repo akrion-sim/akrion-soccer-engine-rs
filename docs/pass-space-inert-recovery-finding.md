@@ -1,9 +1,12 @@
-# Pass-space is INERT AT SOURCE — recovered A/B finding (2026-07-08 pm, recovery-A/B track)
+# Pass-space is INERT — `target_point` dropped at execution (2026-07-08 pm, recovery-A/B track)
 
 Companion to [how-to-climb-codex-conversation.md](how-to-climb-codex-conversation.md). This is the
-recovered pass-space verdict (the r13 "lost verdict"). It **directly tests the r16 pass-space
-preflight** ("validate by `target_point` differing from receiver feet, not a new label") and the
-answer is: **the preflight fails today — the distinct candidate is essentially never created.**
+recovered pass-space verdict (the r13 "lost verdict"). The A/B proves the `DD_SOCCER_ENABLE_NEURAL_
+PASS_SPACE` gate is a **no-op**; Codex then located the cause (repo-grounded): the distinct space
+candidate **is** created and scored (99.5% distinct >1yd), but its `target_point` is **dropped when
+the plan is lowered to `SoccerAction::Pass`** (no `target_point` field), so it never becomes a
+different pass. Fix = make `target_point` survive execution. (My initial "never created at source"
+read was wrong — corrected inline below.)
 
 ## The experiment
 
