@@ -13089,7 +13089,6 @@ impl SoccerMatch {
         cands.into_iter().map(|(id, _)| id).collect()
     }
 
->>>>>>> wip/sidecar-engine-hook
     fn learned_action_for_player_with_context(
         &self,
         snapshot: &WorldSnapshot,
