@@ -5490,6 +5490,14 @@ static CARRIED_ONSIDE_SUPPORT_HEAD: std::sync::Mutex<Option<OnsideSupportHead>> 
 static CARRIED_PASS_COMPLETION_HEAD: std::sync::Mutex<Option<SoccerPassCompletionHead>> =
     std::sync::Mutex::new(None);
 
+/// In-memory MPC execution-objective head, carried + RWR-trained across games WITHIN a learner
+/// process (mirrors [`CARRIED_PASS_COMPLETION_HEAD`]). Unlike pass-completion — whose samples are
+/// captured head-independently — the executor head only captures when installed, so it is SEEDED
+/// at install time whenever `DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE` is on (else it stays `None`,
+/// byte-identical). Consumption + training both require the gate.
+static CARRIED_MPC_OBJECTIVE_HEAD: std::sync::Mutex<Option<SoccerMpcObjectiveHead>> =
+    std::sync::Mutex::new(None);
+
 /// In-memory attacking-spacing target head, carried + trained across games WITHIN a
 /// learner process, then installed into the next game so off-ball support and the LP
 /// spacing floor consume what was learned.
