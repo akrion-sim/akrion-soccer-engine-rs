@@ -25745,7 +25745,6 @@ fn dense_soccer_transition_reward(
     // AND defence, every role (keepers included; the box exception covers legitimate goalmouth
     // congestion). GATED BEHIND A GRACE WINDOW (`same_team_proximity_penalty_past_grace` over the
     // player's nested dwell timers) so a brief, legitimate overlap costs nothing and only a
-<<<<<<< ours
     // SUSTAINED crowd is punished: 1.5s grace within 8yd, 1.0s within 6yd, 0.5s within 5yd. Gated
     // (default-on); OFF ⇒ this term vanishes (byte-identical A/B; the timers also stay 0). The
     // gated proximity check + penalty is encapsulated in `same_team_separation_reward_penalty`,
@@ -25753,25 +25752,6 @@ fn dense_soccer_transition_reward(
     // `soccer_transition_reward_with_tactics` so a big positive on-ball reward on the same tick
     // cannot dilute or clip the crowding penalty away.
     reward -= same_team_separation_reward_penalty(player, after);
-=======
-    // SUSTAINED crowd is punished: 3s grace within 7yd, 2s within 6yd, 1s within 5yd. Gated
-    // (default-on); OFF ⇒ this term vanishes (byte-identical A/B; the timers also stay 0).
-    if dd_soccer_enable_same_team_separation_floor() {
-        if let Some(nearest) = nearest_same_team_distance_for_floor(after, player.id, player.team) {
-            // Grace: 2s within 7yd, 1.5s within 6yd, 1s within 5yd — but 0s (INSTANT) at/inside
-            // the 4yd floor. `nearest_same_team_distance_for_floor` already waives teammates when
-            // BOTH are inside an 18yd box, so goalmouth congestion is exempt from all of this.
-            let past_grace = same_team_proximity_penalty_past_grace(
-                player.same_team_proximity_dwell_lt7_seconds,
-                player.same_team_proximity_dwell_lt6_seconds,
-                player.same_team_proximity_dwell_lt5_seconds,
-            );
-            if nearest <= SAME_TEAM_MIN_SEPARATION_YARDS || past_grace {
-                reward -= same_team_proximity_penalty_unit(nearest) * SAME_TEAM_PROXIMITY_PENALTY_POINTS;
-            }
-        }
-    }
->>>>>>> theirs
     // Off-ball support spacing: when a teammate already has the ball and the
     // direct passing lane is open, collapsing from a useful pocket into the
     // holder's feet is a decision-quality failure, not useful support.
