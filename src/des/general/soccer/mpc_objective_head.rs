@@ -62,6 +62,10 @@ pub const MPC_OBJECTIVE_SAMPLE_CAP: usize = 4096;
 pub struct MpcObjectiveSample {
     pub features: Vec<f32>,
     pub applied_residual: Vec2,
+    /// Signed bend (yards) actually applied at execution, or `0.0` when the head is not
+    /// bend-enabled. Trained as the 3rd output dim exactly like the aim residual: a completed pass
+    /// reinforces the bend taken, an interception is skipped (RWR keeps positive advantage only).
+    pub applied_bend: f64,
     pub reward: f64,
 }
 
