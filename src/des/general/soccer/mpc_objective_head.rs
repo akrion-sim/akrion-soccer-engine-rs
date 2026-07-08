@@ -224,4 +224,29 @@ mod tests {
         assert_eq!(trained, 1, "only the positive-advantage sample trains");
         assert!(head.training_steps() == 1);
     }
+
+    #[test]
+    fn explore_residual_stays_hard_bounded_under_large_jitter() {
+        let head = SoccerMpcObjectiveHead::new(11);
+        let features = vec![0.4f32; MPC_OBJECTIVE_FEATURE_DIM];
+        // Huge noise * huge sigma must still re-clamp inside the bound (never breach the contract).
+        let residual = head
+            .explore_residual(&features, 100.0, 50.0, -50.0)
+            .expect("residual");
+        assert!(residual.x.abs() <= MPC_OBJECTIVE_MAX_RESIDUAL_YARDS + 1e-9);
+        assert!(residual.y.abs() <= MPC_OBJECTIVE_MAX_RESIDUAL_YARDS + 1e-9);
+    }
+
+    #[test]
+    fn explore_residual_nan_noise_falls_back_to_greedy() {
+        let head = SoccerMpcObjectiveHead::new(13);
+        let features = vec![0.4f32; MPC_OBJECTIVE_FEATURE_DIM];
+        let greedy = head.predict_residual(&features).expect("greedy");
+        let explored = head
+            .explore_residual(&features, f64::NAN, f64::NAN, f64::NAN)
+            .expect("residual");
+        // Non-finite sigma/noise ⇒ zero jitter ⇒ identical to the greedy residual (no NaN target).
+        assert!((explored.x - greedy.x).abs() < 1e-9);
+        assert!((explored.y - greedy.y).abs() < 1e-9);
+    }
 }
