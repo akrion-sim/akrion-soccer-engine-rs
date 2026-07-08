@@ -15417,12 +15417,12 @@ impl SoccerMatch {
         if dd_soccer_standardize_policy_advantages() {
             soccer_standardize_actor_policy_sample_advantages(&mut samples);
         }
-<<<<<<< HEAD
+        // Diagnostic dump (gated) runs with the post-standardization `samples` alongside the
+        // pre-standardization `diag_meta` so the offline pass can compare both. It is a pure
+        // read-only side effect and does not affect the returned batch.
         if diag_on {
             self.dump_advantage_diagnostic(&diag_meta, &samples);
         }
-        samples
-=======
         SoccerPolicyTrainingBatch {
             samples,
             option_score_safety_counterexample_candidates,
@@ -15433,7 +15433,6 @@ impl SoccerMatch {
             option_score_safety_counterexample_unindexed_action,
             option_score_safety_counterexample_nonfinite_advantage,
         }
->>>>>>> 8b129d9087743d8d8dad50e420d35a68e5224abd
     }
 
     /// Appends per-sample advantage-diagnostic rows (JSONL) to `DD_SOCCER_DUMP_ADVANTAGE_DIAGNOSTIC`.
