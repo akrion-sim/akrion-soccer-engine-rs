@@ -11121,6 +11121,7 @@ fn transition_reward_infers_dangerous_completed_cross_bonus() {
             )),
             facing: facing_bucket_from_vector(target - origin),
             dribble_touch: None,
+            receiver_descriptor: None,
         });
         decision.observation.expected_aerial_pass_completion = 0.76;
         decision.observation.best_aerial_pass_receiver_openness = 0.72;
