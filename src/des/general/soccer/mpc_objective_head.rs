@@ -311,11 +311,13 @@ mod tests {
         let good = MpcObjectiveSample {
             features: vec![0.3f32; MPC_OBJECTIVE_FEATURE_DIM],
             applied_residual: Vec2 { x: 0.8, y: 1.0 },
+            applied_bend: 0.0,
             reward: 1.5,
         };
         let bad = MpcObjectiveSample {
             features: vec![0.3f32; MPC_OBJECTIVE_FEATURE_DIM],
             applied_residual: Vec2 { x: -0.8, y: -1.0 },
+            applied_bend: 0.0,
             reward: -1.5,
         };
         let trained = head.train_rwr(&[good, bad], 0.05);
