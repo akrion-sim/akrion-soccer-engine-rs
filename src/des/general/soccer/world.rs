@@ -66,6 +66,8 @@ const DRIBBLE_BEAT_LEARNING_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(2.0);
 const LEARNED_MPC_REJECTED_ACTION_PENALTY_POINTS: f64 = 2.5;
 const SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_SAMPLE_RATE: f64 = 1.0;
 const SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_ADVANTAGE_SCALE: f64 = 1.0;
+const SOCCER_OPTION_SCORE_SAFETY_ANALYTIC_OPPONENT_MAX_SAMPLE_RATE: f64 = 0.25;
+const SOCCER_OPTION_SCORE_SAFETY_ANALYTIC_OPPONENT_MAX_ADVANTAGE_SCALE: f64 = 0.50;
 const SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_SAMPLE_SALT: u64 = 0x4f50_5453_4146_4554;
 const NEURAL_DEFERRED_REWARD_DRAIN_PER_TICK: usize = 64;
 const NEURAL_DEFERRED_REWARD_DRAIN_PER_TICK_MAX: usize = 512;
@@ -4805,6 +4807,29 @@ mod tests {
     }
 
     #[test]
+    fn analytic_opponent_caps_option_score_safety_counterexample_intensity() {
+        let _env_lock = soccer_world_env_lock();
+        let _rate = set_test_env_var(
+            "SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_SAMPLE_RATE",
+            "1.0",
+        );
+        let _scale = set_test_env_var(
+            "SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_ADVANTAGE_SCALE",
+            "1.0",
+        );
+
+        {
+            let _analytic = set_test_env_var("SOCCER_LEARNING_ANALYTIC_OPPONENT", "1");
+            assert!((option_score_safety_counterexample_sample_rate() - 0.25).abs() < 1e-9);
+            assert!((option_score_safety_counterexample_advantage_scale() - 0.50).abs() < 1e-9);
+        }
+
+        let _analytic = set_test_env_var("SOCCER_LEARNING_ANALYTIC_OPPONENT", "0");
+        assert!((option_score_safety_counterexample_sample_rate() - 1.0).abs() < 1e-9);
+        assert!((option_score_safety_counterexample_advantage_scale() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn learned_mpc_replan_preserves_ranked_pass_target_counterexamples() {
         let sim = SoccerMatch::default_11v11(MatchConfig::default());
         let player = sim
@@ -8476,18 +8501,40 @@ fn option_score_safety_rejected_action_counterexample(
         )
 }
 
+fn soccer_learning_analytic_opponent_env_enabled() -> bool {
+    std::env::var("SOCCER_LEARNING_ANALYTIC_OPPONENT")
+        .ok()
+        .map(|raw| {
+            matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 fn option_score_safety_counterexample_sample_rate() -> f64 {
-    learned_mpc_probability_env(
+    let sample_rate = learned_mpc_probability_env(
         "SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_SAMPLE_RATE",
         SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_SAMPLE_RATE,
-    )
+    );
+    if soccer_learning_analytic_opponent_env_enabled() {
+        sample_rate.min(SOCCER_OPTION_SCORE_SAFETY_ANALYTIC_OPPONENT_MAX_SAMPLE_RATE)
+    } else {
+        sample_rate
+    }
 }
 
 fn option_score_safety_counterexample_advantage_scale() -> f64 {
-    learned_mpc_probability_env(
+    let advantage_scale = learned_mpc_probability_env(
         "SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_ADVANTAGE_SCALE",
         SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_ADVANTAGE_SCALE,
-    )
+    );
+    if soccer_learning_analytic_opponent_env_enabled() {
+        advantage_scale.min(SOCCER_OPTION_SCORE_SAFETY_ANALYTIC_OPPONENT_MAX_ADVANTAGE_SCALE)
+    } else {
+        advantage_scale
+    }
 }
 
 fn option_score_safety_counterexample_sample_allowed_with_rate(
@@ -14925,6 +14972,9 @@ impl SoccerMatch {
         let mut option_score_safety_counterexample_candidates = 0usize;
         let mut option_score_safety_counterexample_samples = 0usize;
         let mut option_score_safety_counterexample_weight_sum = 0.0;
+        let option_score_safety_sample_rate = option_score_safety_counterexample_sample_rate();
+        let option_score_safety_advantage_scale =
+            option_score_safety_counterexample_advantage_scale();
         let mut samples: Vec<SoccerPolicySample> = replay
             .iter()
             .enumerate()
@@ -14945,7 +14995,7 @@ impl SoccerMatch {
                 if option_score_safety_counterexample
                     && !option_score_safety_counterexample_sample_allowed_with_rate(
                         transition,
-                        option_score_safety_counterexample_sample_rate(),
+                        option_score_safety_sample_rate,
                     )
                 {
                     return None;
@@ -14960,7 +15010,7 @@ impl SoccerMatch {
                     advantages[index]
                 };
                 if option_score_safety_counterexample {
-                    advantage *= option_score_safety_counterexample_advantage_scale();
+                    advantage *= option_score_safety_advantage_scale;
                 }
                 let advantage =
                     soccer_actor_advantage_with_planner_distillation(transition, advantage);
