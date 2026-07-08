@@ -42283,6 +42283,90 @@ impl WorldSnapshot {
         self.ranked_pass_targets_filtered(player_id, limit, true, true)
     }
 
+    /// Attack-relative distance to the nearest opponent of `team` from `point` (yards).
+    /// Basis for the receiver-descriptor openness bucket; works for a teammate spot or open space.
+    fn nearest_opponent_distance_to_point(&self, team: Team, point: Vec2) -> f64 {
+        self.players
+            .iter()
+            .filter(|other| other.team != team)
+            .map(|other| {
+                let pos = self
+                    .player_position(other.id)
+                    .unwrap_or(other.position);
+                point.distance(pos)
+            })
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    /// Discretized [`ReceiverDescriptor`] for a pass from `passer_id` to a receiver of `kind` at
+    /// `target_point` (with `target_role` for a teammate). Attack-relative so both teams share
+    /// credit. Used identically at trace time (training credit) and inference time (head query)
+    /// so the learned `target_values[(state, action, grid, receiver_descriptor)]` line up.
+    /// Returns the encoded integer; [`RECEIVER_DESCRIPTOR_UNSPECIFIED`] if the passer is unknown.
+    pub(crate) fn pass_receiver_descriptor(
+        &self,
+        passer_id: usize,
+        kind: ReceiverKind,
+        target_point: Vec2,
+        target_role: Option<PlayerRole>,
+    ) -> i32 {
+        let Some(passer) = self.players.iter().find(|p| p.id == passer_id) else {
+            return RECEIVER_DESCRIPTOR_UNSPECIFIED;
+        };
+        let passer_position = self.player_position(passer_id).unwrap_or(passer.position);
+        let team = passer.team;
+        // Attack sign: Home attacks +y (goal_y = field_length), Away attacks -y (goal_y = 0).
+        let attack_sign = if team.goal_y(self.field_length) >= self.field_length * 0.5 {
+            1.0
+        } else {
+            -1.0
+        };
+        let forward = (target_point.y - passer_position.y) * attack_sign;
+        let progression = if forward > SOCCER_RECEIVER_FORWARD_SQUARE_YARDS {
+            2
+        } else if forward < -SOCCER_RECEIVER_FORWARD_SQUARE_YARDS {
+            0
+        } else {
+            1
+        };
+        // Attack-relative left/central/right by horizontal thirds (mirrored for the away team so
+        // "left" is the attacking team's left in both directions).
+        let width = self.field_width.max(1.0);
+        let mut lane_frac = (target_point.x / width).clamp(0.0, 1.0);
+        if attack_sign < 0.0 {
+            lane_frac = 1.0 - lane_frac;
+        }
+        let lane = if lane_frac < 1.0 / 3.0 {
+            0
+        } else if lane_frac < 2.0 / 3.0 {
+            1
+        } else {
+            2
+        };
+        let opponent_distance = self.nearest_opponent_distance_to_point(team, target_point);
+        let openness = if opponent_distance < SOCCER_RECEIVER_TIGHT_YARDS {
+            0
+        } else if opponent_distance < SOCCER_RECEIVER_OPEN_YARDS {
+            1
+        } else {
+            2
+        };
+        let role_bucket = match kind {
+            ReceiverKind::Teammate => {
+                target_role.map(ReceiverDescriptor::role_bucket_for).unwrap_or(0)
+            }
+            ReceiverKind::Space | ReceiverKind::Nobody => 0,
+        };
+        ReceiverDescriptor {
+            kind,
+            role_bucket,
+            lane,
+            progression,
+            openness,
+        }
+        .encode()
+    }
+
     /// Threaded/"killer"-pass candidates: visible + clear-ish + onside, but NOT filtered by the
     /// opponent-arrival race. A killer ball through a congested defence is risky by nature; that
     /// risk is priced into its score, not used to hide the option entirely.
