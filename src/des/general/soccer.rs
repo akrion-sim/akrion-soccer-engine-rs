@@ -20126,7 +20126,10 @@ pub(crate) struct PendingPass {
     /// actually applied to this pass's analytic lead target (the "action" for RWR). When the pass
     /// resolves it is emitted as an [`MpcObjectiveSample`] whose reward is the delayed
     /// completion/progression advantage. `None` ⇒ the head was off/absent at launch (no sample).
-    mpc_objective: Option<(Vec<f32>, Vec2)>,
+    /// The third element is the signed learned BEND (yards) applied to this pass's curl
+    /// (`DD_SOCCER_ENABLE_LEARNED_CURVE`); `0.0` when the bend axis is off, so the RWR credit still
+    /// matches the action actually taken.
+    mpc_objective: Option<(Vec<f32>, Vec2, f64)>,
 }
 
 /// A goal counts as assisted only when the setting-up completed pass landed within this many
