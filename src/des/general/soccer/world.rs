@@ -16126,25 +16126,44 @@ impl SoccerMatch {
                 .then_with(|| a.label.cmp(&b.label))
         });
         let rank_draw = self.policy_rank_selection_draw(snapshot, player_id, rank_salt);
-        if let Some(mcts_label) =
+        // Resolve the winner once (behavior-preserving refactor of the previous early-return
+        // chain: mcts -> {authoritative: dp-safe -> technical-floor -> top} | weighted) so the
+        // net-influence diagnostic can compare it against the tabular baseline before returning.
+        let choice = if let Some(mcts_label) =
             Self::neural_mcts_action_from_candidates(blend, &scored_candidates, rank_draw)
         {
-            return Some(mcts_label);
-        }
-        if blend.mode == SoccerNeuralBlendMode::Authoritative {
-            if let Some(dp_safe_choice) =
-                Self::neural_authoritative_dp_safety_choice(&scored_candidates, &legal)
-            {
-                return Some(dp_safe_choice);
+            Some(mcts_label)
+        } else if blend.mode == SoccerNeuralBlendMode::Authoritative {
+            Self::neural_authoritative_dp_safety_choice(&scored_candidates, &legal)
+                .or_else(|| {
+                    Self::technical_scored_candidate_floor_choice(&scored_candidates, rank_draw)
+                })
+                .or_else(|| Self::top_scored_candidate_choice(&scored_candidates))
+        } else {
+            Self::weighted_scored_candidate_choice(&scored_candidates, rank_draw)
+        };
+        if net_influence_diag_enabled() {
+            if let Some(ref selected) = choice {
+                // Baseline = the action plain tabular play would take (argmax tabular value over
+                // the legal set), before any neural blend/expansion. If the selected action
+                // differs, the net changed the decision.
+                let baseline_label = legal
+                    .iter()
+                    .max_by(|a, b| a.value.total_cmp(&b.value))
+                    .map(|action| action.label.as_str())
+                    .unwrap_or("");
+                let neural_active = value_active && lambda > 0.0 && scored_candidates.len() >= 2;
+                record_net_influence_diag(
+                    normalize_soccer_action_label(baseline_label),
+                    normalize_soccer_action_label(&selected.label),
+                    baseline_label,
+                    &selected.label,
+                    observation.has_ball,
+                    neural_active,
+                );
             }
-            if let Some(technical_choice) =
-                Self::technical_scored_candidate_floor_choice(&scored_candidates, rank_draw)
-            {
-                return Some(technical_choice);
-            }
-            return Self::top_scored_candidate_choice(&scored_candidates);
         }
-        Self::weighted_scored_candidate_choice(&scored_candidates, rank_draw)
+        choice
     }
 
     /// Per-team value-head forward-intent for this tick: for each outfield player,
