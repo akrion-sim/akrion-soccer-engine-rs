@@ -27,8 +27,8 @@ use std::path::Path;
 use std::time::Instant;
 
 use soccer_engine::des::general::soccer::{
-    learned_mpc_objective_enabled, FacingBucket, MatchSummary, SoccerNeuralNetworkSnapshot,
-    SoccerQStateKey, SoccerQTargetEntry, TacticalPhase, Team,
+    FacingBucket, MatchSummary, SoccerNeuralNetworkSnapshot, SoccerQStateKey, SoccerQTargetEntry,
+    TacticalPhase, Team,
 };
 use soccer_engine::des::general::tournament::{
     EngineMatchRunner, EngineMatchRunnerConfig, TeamBrain, TournamentMatchContext,
@@ -70,17 +70,6 @@ fn apply_league_neural_mcts_config(config: &mut EngineMatchRunnerConfig) -> bool
     enabled
 }
 
-fn league_worker_count(requested_workers: usize, fixture_count: usize) -> usize {
-    let capped = requested_workers.clamp(1, fixture_count.max(1));
-    let serial_for_mpc_objective =
-        learned_mpc_objective_enabled() && env_bool("SOCCER_LEAGUE_MPC_OBJECTIVE_SERIAL", true);
-    if serial_for_mpc_objective {
-        1
-    } else {
-        capped
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 struct LeagueMatchKpis {
     goal_diff: i32,
@@ -96,24 +85,12 @@ struct LeagueMatchKpis {
     forward_passes_for: u32,
     forward_passes_against: u32,
     forward_pass_margin: i32,
-    pass_turnovers_for: u32,
-    pass_turnovers_against: u32,
-    net_forward_passes_for: i32,
-    net_forward_passes_against: i32,
-    net_forward_pass_margin: i32,
     backward_passes_for: u32,
     dribble_beats_for: u32,
     assists_for: u32,
     crosses_completed_for: u32,
     pass_chain_gain_yards_for: f64,
     pass_chain_net_losses_for: u32,
-    learned_policy_option_decisions: u32,
-    learned_policy_multi_option_decisions: u32,
-    learned_policy_legal_action_options: u32,
-    learned_mpc_replans: u32,
-    learned_mpc_replans_mpc: u32,
-    learned_mpc_replans_option_score_safety: u32,
-    learned_mpc_replans_neural_mcts: u32,
     objective_fitness: f64,
     objective_fitness_margin: f64,
 }
@@ -121,10 +98,6 @@ struct LeagueMatchKpis {
 impl LeagueMatchKpis {
     fn from_summary(summary: &MatchSummary, frontier_team: Team) -> Self {
         let stats = &summary.stats;
-        let home_net_forward =
-            stats.passes_completed_forward_home as i32 - stats.interceptions_away as i32;
-        let away_net_forward =
-            stats.passes_completed_forward_away as i32 - stats.interceptions_home as i32;
         match frontier_team {
             Team::Home => LeagueMatchKpis {
                 goal_diff: summary.score_home as i32 - summary.score_away as i32,
@@ -141,27 +114,15 @@ impl LeagueMatchKpis {
                 forward_passes_against: stats.passes_completed_forward_away,
                 forward_pass_margin: stats.passes_completed_forward_home as i32
                     - stats.passes_completed_forward_away as i32,
-                pass_turnovers_for: stats.interceptions_away,
-                pass_turnovers_against: stats.interceptions_home,
-                net_forward_passes_for: home_net_forward,
-                net_forward_passes_against: away_net_forward,
-                net_forward_pass_margin: home_net_forward - away_net_forward,
                 backward_passes_for: stats.passes_completed_backward_home,
                 dribble_beats_for: stats.dribble_beats_home,
                 assists_for: stats.assists_home,
                 crosses_completed_for: stats.crosses_completed_home,
                 pass_chain_gain_yards_for: stats.pass_chain_gain_yards_home,
                 pass_chain_net_losses_for: stats.pass_chains_net_loss_home,
-                learned_policy_option_decisions: stats.learned_policy_option_decisions,
-                learned_policy_multi_option_decisions: stats.learned_policy_multi_option_decisions,
-                learned_policy_legal_action_options: stats.learned_policy_legal_action_options,
-                learned_mpc_replans: stats.learned_mpc_replans,
-                learned_mpc_replans_mpc: stats.learned_mpc_replans_mpc,
-                learned_mpc_replans_option_score_safety: stats
-                    .learned_mpc_replans_option_score_safety,
-                learned_mpc_replans_neural_mcts: stats.learned_mpc_replans_neural_mcts,
-                objective_fitness: home_net_forward as f64,
-                objective_fitness_margin: (home_net_forward - away_net_forward) as f64,
+                objective_fitness: stats.passes_completed_forward_home as f64,
+                objective_fitness_margin: stats.passes_completed_forward_home as f64
+                    - stats.passes_completed_forward_away as f64,
             },
             Team::Away => LeagueMatchKpis {
                 goal_diff: summary.score_away as i32 - summary.score_home as i32,
@@ -178,27 +139,15 @@ impl LeagueMatchKpis {
                 forward_passes_against: stats.passes_completed_forward_home,
                 forward_pass_margin: stats.passes_completed_forward_away as i32
                     - stats.passes_completed_forward_home as i32,
-                pass_turnovers_for: stats.interceptions_home,
-                pass_turnovers_against: stats.interceptions_away,
-                net_forward_passes_for: away_net_forward,
-                net_forward_passes_against: home_net_forward,
-                net_forward_pass_margin: away_net_forward - home_net_forward,
                 backward_passes_for: stats.passes_completed_backward_away,
                 dribble_beats_for: stats.dribble_beats_away,
                 assists_for: stats.assists_away,
                 crosses_completed_for: stats.crosses_completed_away,
                 pass_chain_gain_yards_for: stats.pass_chain_gain_yards_away,
                 pass_chain_net_losses_for: stats.pass_chains_net_loss_away,
-                learned_policy_option_decisions: stats.learned_policy_option_decisions,
-                learned_policy_multi_option_decisions: stats.learned_policy_multi_option_decisions,
-                learned_policy_legal_action_options: stats.learned_policy_legal_action_options,
-                learned_mpc_replans: stats.learned_mpc_replans,
-                learned_mpc_replans_mpc: stats.learned_mpc_replans_mpc,
-                learned_mpc_replans_option_score_safety: stats
-                    .learned_mpc_replans_option_score_safety,
-                learned_mpc_replans_neural_mcts: stats.learned_mpc_replans_neural_mcts,
-                objective_fitness: away_net_forward as f64,
-                objective_fitness_margin: (away_net_forward - home_net_forward) as f64,
+                objective_fitness: stats.passes_completed_forward_away as f64,
+                objective_fitness_margin: stats.passes_completed_forward_away as f64
+                    - stats.passes_completed_forward_home as f64,
             },
         }
     }
@@ -220,24 +169,12 @@ struct LeagueRoundKpis {
     forward_passes_for: u32,
     forward_passes_against: u32,
     forward_pass_margin: i32,
-    pass_turnovers_for: u32,
-    pass_turnovers_against: u32,
-    net_forward_passes_for: i32,
-    net_forward_passes_against: i32,
-    net_forward_pass_margin: i32,
     backward_passes_for: u32,
     dribble_beats_for: u32,
     assists_for: u32,
     crosses_completed_for: u32,
     pass_chain_gain_yards_for: f64,
     pass_chain_net_losses_for: u32,
-    learned_policy_option_decisions: u32,
-    learned_policy_multi_option_decisions: u32,
-    learned_policy_legal_action_options: u32,
-    learned_mpc_replans: u32,
-    learned_mpc_replans_mpc: u32,
-    learned_mpc_replans_option_score_safety: u32,
-    learned_mpc_replans_neural_mcts: u32,
     objective_fitness_sum: f64,
     objective_fitness_margin_sum: f64,
 }
@@ -272,15 +209,6 @@ impl LeagueRoundKpis {
             .forward_passes_against
             .saturating_add(kpis.forward_passes_against);
         self.forward_pass_margin += kpis.forward_pass_margin;
-        self.pass_turnovers_for = self
-            .pass_turnovers_for
-            .saturating_add(kpis.pass_turnovers_for);
-        self.pass_turnovers_against = self
-            .pass_turnovers_against
-            .saturating_add(kpis.pass_turnovers_against);
-        self.net_forward_passes_for += kpis.net_forward_passes_for;
-        self.net_forward_passes_against += kpis.net_forward_passes_against;
-        self.net_forward_pass_margin += kpis.net_forward_pass_margin;
         self.backward_passes_for = self
             .backward_passes_for
             .saturating_add(kpis.backward_passes_for);
@@ -295,27 +223,6 @@ impl LeagueRoundKpis {
         self.pass_chain_net_losses_for = self
             .pass_chain_net_losses_for
             .saturating_add(kpis.pass_chain_net_losses_for);
-        self.learned_policy_option_decisions = self
-            .learned_policy_option_decisions
-            .saturating_add(kpis.learned_policy_option_decisions);
-        self.learned_policy_multi_option_decisions = self
-            .learned_policy_multi_option_decisions
-            .saturating_add(kpis.learned_policy_multi_option_decisions);
-        self.learned_policy_legal_action_options = self
-            .learned_policy_legal_action_options
-            .saturating_add(kpis.learned_policy_legal_action_options);
-        self.learned_mpc_replans = self
-            .learned_mpc_replans
-            .saturating_add(kpis.learned_mpc_replans);
-        self.learned_mpc_replans_mpc = self
-            .learned_mpc_replans_mpc
-            .saturating_add(kpis.learned_mpc_replans_mpc);
-        self.learned_mpc_replans_option_score_safety = self
-            .learned_mpc_replans_option_score_safety
-            .saturating_add(kpis.learned_mpc_replans_option_score_safety);
-        self.learned_mpc_replans_neural_mcts = self
-            .learned_mpc_replans_neural_mcts
-            .saturating_add(kpis.learned_mpc_replans_neural_mcts);
         self.objective_fitness_sum += kpis.objective_fitness;
         self.objective_fitness_margin_sum += kpis.objective_fitness_margin;
     }
@@ -341,14 +248,6 @@ impl LeagueRoundKpis {
             0.0
         } else {
             self.forward_pass_margin as f64 / self.games as f64
-        }
-    }
-
-    fn mean_net_forward_pass_margin(&self) -> f64 {
-        if self.games == 0 {
-            0.0
-        } else {
-            self.net_forward_pass_margin as f64 / self.games as f64
         }
     }
 
@@ -883,13 +782,13 @@ fn play_checkpoint_validation(
             Ok(Ok(outcome)) => {
                 let kpis = LeagueMatchKpis::from_summary(&outcome.summary, candidate_team);
                 println!(
-                    "league_checkpoint_validation_game round={round} game={} candidate_home={} score={}-{} forward_pass_margin={} net_forward_pass_margin={}",
+                    "league_checkpoint_validation_game round={round} game={} candidate_home={} score={}-{} forward_pass_margin={} objective_margin={:.3}",
                     g,
                     candidate_home,
                     outcome.home_goals,
                     outcome.away_goals,
                     kpis.forward_pass_margin,
-                    kpis.net_forward_pass_margin,
+                    kpis.objective_fitness_margin,
                 );
                 validation.add(kpis);
             }
@@ -908,15 +807,15 @@ fn checkpoint_validation_passes(
     validation: Option<&LeagueRoundKpis>,
     expected_games: usize,
     min_forward_pass_margin: f64,
-    min_net_forward_pass_margin: f64,
+    min_objective_margin: f64,
     min_goal_diff_margin: f64,
 ) -> bool {
     match validation {
         Some(validation) => {
             validation.games == expected_games
                 && validation.mean_forward_pass_margin() > min_forward_pass_margin
-                && validation.mean_net_forward_pass_margin() > min_net_forward_pass_margin
-                && validation.mean_goal_diff() >= min_goal_diff_margin
+                && validation.mean_objective_fitness_margin() > min_objective_margin
+                && validation.mean_goal_diff() > min_goal_diff_margin
         }
         None => true,
     }
@@ -950,12 +849,9 @@ fn main() {
         "SOCCER_LEAGUE_CHECKPOINT_VALIDATE_MIN_FORWARD_PASS_MARGIN",
         0.0,
     );
-    let checkpoint_validate_min_net_forward_pass_margin = env_f64(
-        "SOCCER_LEAGUE_CHECKPOINT_VALIDATE_MIN_NET_FORWARD_PASS_MARGIN",
-        env_f64(
-            "SOCCER_LEAGUE_CHECKPOINT_VALIDATE_MIN_OBJECTIVE_MARGIN",
-            0.0,
-        ),
+    let checkpoint_validate_min_objective_margin = env_f64(
+        "SOCCER_LEAGUE_CHECKPOINT_VALIDATE_MIN_OBJECTIVE_MARGIN",
+        0.0,
     );
     let checkpoint_validate_min_goal_diff_margin = env_f64(
         "SOCCER_LEAGUE_CHECKPOINT_VALIDATE_MIN_GOAL_DIFF_MARGIN",
@@ -1001,6 +897,17 @@ fn main() {
         "SOCCER_NEURAL_TARGET_CLIP",
         runner_config.base.neural_learning.target_clip,
     );
+    // Team-reward share (MAPPO): the individual forward-pass reward is blended with the
+    // team-averaged reward at this weight — the learnable rest-defense / coordination lever.
+    // League training previously left this at the config default; expose it for A/Bs.
+    runner_config.base.neural_learning.mappo_team_reward_share = env_f64(
+        "SOCCER_MAPPO_TEAM_REWARD_SHARE",
+        runner_config.base.neural_learning.mappo_team_reward_share,
+    );
+    eprintln!(
+        "[league] mappo_team_reward_share={}",
+        runner_config.base.neural_learning.mappo_team_reward_share
+    );
     eprintln!(
         "[league] critic-target window: target_scale={} target_clip={} (raw-reward window +/-{}) popart={}",
         runner_config.base.neural_learning.target_scale,
@@ -1045,7 +952,7 @@ fn main() {
     let actor_critic_enabled = runner_config.base.neural_blend.actor_critic;
     let lp_coupling_enabled = runner_config.base.neural_learning.lp_coupling_enabled;
     // Keep the engine's designed independent-brain mode (per-team critic drives each side).
-    let mut runner = EngineMatchRunner::new(runner_config);
+    let runner = EngineMatchRunner::new(runner_config);
 
     let mut frontier = match load_brain(&frontier_path) {
         Some(brain) => {
@@ -1070,9 +977,9 @@ fn main() {
 
     let train_seed_base: u32 = 0x5EED_0000;
     let mut round = 0u32;
-    let mut best_checkpoint_net_forward_pass_margin = f64::NEG_INFINITY;
+    let mut best_checkpoint_forward_pass_margin = f64::NEG_INFINITY;
     println!(
-        "league_train_started_at_utc={} games/opp={} minutes={} weight_decay={} fresh_opp={} checkpoint_every={} max_rounds={} max_target_entries_per_side={} advancement_metric=completed_forward_passes net_metric=completed_forward_passes_minus_turnovers league_neural_mcts_enabled={} actor_critic_enabled={} lp_coupling_enabled={} target_standardization_enabled={} mc_critic_target_enabled={} neural_self_bootstrap_enabled={} maxa_bootstrap_enabled={} novelty_bonus_enabled={} forward_pass_climb_curriculum_enabled={} mpc_tier2_enabled={} mpc_reconcile_enabled={} mpc_field_aware_enabled={} mpc_latent_objective_enabled={} local_mpc_enabled={} checkpoint_require_forward_pass_climb={} checkpoint_max_forward_pass_regression={} checkpoint_min_forward_pass_margin={} checkpoint_validate_games={} checkpoint_validate_min_forward_pass_margin={} checkpoint_validate_min_net_forward_pass_margin={} checkpoint_validate_min_goal_diff_margin={} frontier={} candidate_frontier={} archive={}",
+        "league_train_started_at_utc={} games/opp={} minutes={} weight_decay={} fresh_opp={} checkpoint_every={} max_rounds={} max_target_entries_per_side={} advancement_metric=completed_forward_passes league_neural_mcts_enabled={} actor_critic_enabled={} lp_coupling_enabled={} target_standardization_enabled={} mc_critic_target_enabled={} neural_self_bootstrap_enabled={} maxa_bootstrap_enabled={} novelty_bonus_enabled={} forward_pass_climb_curriculum_enabled={} mpc_tier2_enabled={} mpc_reconcile_enabled={} mpc_field_aware_enabled={} mpc_latent_objective_enabled={} local_mpc_enabled={} checkpoint_require_forward_pass_climb={} checkpoint_max_forward_pass_regression={} checkpoint_min_forward_pass_margin={} checkpoint_validate_games={} checkpoint_validate_min_forward_pass_margin={} checkpoint_validate_min_objective_margin={} checkpoint_validate_min_goal_diff_margin={} frontier={} candidate_frontier={} archive={}",
         chrono_now(),
         games_per_opp,
         minutes,
@@ -1100,7 +1007,7 @@ fn main() {
         checkpoint_min_forward_pass_margin,
         checkpoint_validate_games,
         checkpoint_validate_min_forward_pass_margin,
-        checkpoint_validate_min_net_forward_pass_margin,
+        checkpoint_validate_min_objective_margin,
         checkpoint_validate_min_goal_diff_margin,
         frontier_path,
         candidate_frontier_path,
@@ -1175,100 +1082,64 @@ fn main() {
                 fixture += 1;
             }
         }
-        let requested_workers = env_usize("SOCCER_LEAGUE_PARALLELISM", 3);
-        let workers = league_worker_count(requested_workers, fixtures.len());
-        if workers < requested_workers.clamp(1, fixtures.len().max(1)) {
-            println!(
-                "league_parallelism_serialized_for_mpc_objective requested_workers={} active_workers={} fixtures={} opt_out_env=SOCCER_LEAGUE_MPC_OBJECTIVE_SERIAL=0",
-                requested_workers,
-                workers,
-                fixtures.len()
-            );
-        }
+        let workers = env_usize("SOCCER_LEAGUE_PARALLELISM", 3).clamp(1, fixtures.len().max(1));
         let base_steps = frontier
             .neural
             .as_ref()
             .map(|s| s.training_steps)
             .unwrap_or(0);
-        let mut round_kpis = LeagueRoundKpis::default();
-        let (wins, losses, trained_brains) = if workers == 1 {
-            let mut wins = 0i32;
-            let mut losses = 0i32;
-            for fx in &fixtures {
-                let (trained, kpis) = play_and_carry(
-                    &mut runner,
-                    frontier,
-                    &opponents[fx.opp_idx],
-                    fx.seed,
-                    fx.home,
-                    fx.opp_id,
-                );
-                frontier = trained;
-                if let Some(kpis) = kpis {
-                    if kpis.goal_diff > 0 {
-                        wins += 1;
-                    } else if kpis.goal_diff < 0 {
-                        losses += 1;
-                    }
-                    round_kpis.add(kpis);
+        let chunk = fixtures.len().div_ceil(workers);
+        let wins_a = std::sync::atomic::AtomicI32::new(0);
+        let losses_a = std::sync::atomic::AtomicI32::new(0);
+        let trained_brains = std::sync::Mutex::new(Vec::<TeamBrain>::new());
+        let match_kpis = std::sync::Mutex::new(Vec::<LeagueMatchKpis>::new());
+        std::thread::scope(|scope| {
+            for w in 0..workers {
+                let lo = w * chunk;
+                let hi = ((w + 1) * chunk).min(fixtures.len());
+                if lo >= hi {
+                    continue;
                 }
-            }
-            (wins, losses, vec![frontier.clone()])
-        } else {
-            let chunk = fixtures.len().div_ceil(workers);
-            let wins_a = std::sync::atomic::AtomicI32::new(0);
-            let losses_a = std::sync::atomic::AtomicI32::new(0);
-            let trained_brains = std::sync::Mutex::new(Vec::<TeamBrain>::new());
-            let match_kpis = std::sync::Mutex::new(Vec::<LeagueMatchKpis>::new());
-            std::thread::scope(|scope| {
-                for w in 0..workers {
-                    let lo = w * chunk;
-                    let hi = ((w + 1) * chunk).min(fixtures.len());
-                    if lo >= hi {
-                        continue;
-                    }
-                    let slice = &fixtures[lo..hi];
-                    let opponents = &opponents;
-                    let wins_a = &wins_a;
-                    let losses_a = &losses_a;
-                    let trained_brains = &trained_brains;
-                    let match_kpis = &match_kpis;
-                    let mut runner = runner.clone();
-                    let mut wf = frontier.clone();
-                    scope.spawn(move || {
-                        use std::sync::atomic::Ordering::Relaxed;
-                        for fx in slice {
-                            let (t, kpis) = play_and_carry(
-                                &mut runner,
-                                wf,
-                                &opponents[fx.opp_idx],
-                                fx.seed,
-                                fx.home,
-                                fx.opp_id,
-                            );
-                            wf = t;
-                            if let Some(kpis) = kpis {
-                                if kpis.goal_diff > 0 {
-                                    wins_a.fetch_add(1, Relaxed);
-                                } else if kpis.goal_diff < 0 {
-                                    losses_a.fetch_add(1, Relaxed);
-                                }
-                                match_kpis.lock().unwrap().push(kpis);
+                let slice = &fixtures[lo..hi];
+                let opponents = &opponents;
+                let wins_a = &wins_a;
+                let losses_a = &losses_a;
+                let trained_brains = &trained_brains;
+                let match_kpis = &match_kpis;
+                let mut runner = runner.clone();
+                let mut wf = frontier.clone();
+                scope.spawn(move || {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    for fx in slice {
+                        let (t, kpis) = play_and_carry(
+                            &mut runner,
+                            wf,
+                            &opponents[fx.opp_idx],
+                            fx.seed,
+                            fx.home,
+                            fx.opp_id,
+                        );
+                        wf = t;
+                        if let Some(kpis) = kpis {
+                            if kpis.goal_diff > 0 {
+                                wins_a.fetch_add(1, Relaxed);
+                            } else if kpis.goal_diff < 0 {
+                                losses_a.fetch_add(1, Relaxed);
                             }
+                            match_kpis.lock().unwrap().push(kpis);
                         }
-                        trained_brains.lock().unwrap().push(wf);
-                    });
-                }
-            });
-            for kpis in match_kpis.into_inner().unwrap() {
-                round_kpis.add(kpis);
+                    }
+                    trained_brains.lock().unwrap().push(wf);
+                });
             }
-            (
-                wins_a.load(std::sync::atomic::Ordering::Relaxed),
-                losses_a.load(std::sync::atomic::Ordering::Relaxed),
-                trained_brains.into_inner().unwrap(),
-            )
-        };
+        });
+        let wins = wins_a.load(std::sync::atomic::Ordering::Relaxed);
+        let losses = losses_a.load(std::sync::atomic::Ordering::Relaxed);
+        let trained_brains = trained_brains.into_inner().unwrap();
+        let mut round_kpis = LeagueRoundKpis::default();
+        for kpis in match_kpis.into_inner().unwrap() {
+            round_kpis.add(kpis);
+        }
         let trained_snapshots = trained_brains
             .iter()
             .filter_map(|brain| brain.neural.clone())
@@ -1351,35 +1222,22 @@ fn main() {
         } else {
             round_kpis.passes_completed_for as f64 / round_kpis.passes_attempted_for as f64
         };
+        let mean_kpi_margin = round_kpis.mean_objective_fitness_margin();
         let mean_forward_pass_margin = round_kpis.mean_forward_pass_margin();
-        let mean_net_forward_pass_margin = round_kpis.mean_net_forward_pass_margin();
-        let learned_mpc_replan_rate = if round_kpis.learned_policy_option_decisions == 0 {
-            0.0
-        } else {
-            round_kpis.learned_mpc_replans as f64
-                / round_kpis.learned_policy_option_decisions as f64
-        };
         println!(
-            "league_advancement round={round} metric=completed_forward_passes games={} forward_passes_for={} forward_passes_against={} forward_pass_margin={} forward_pass_margin_per_game={:.3} pass_turnovers_for={} pass_turnovers_against={} net_forward_passes_for={} net_forward_passes_against={} net_forward_pass_margin={} net_forward_pass_margin_per_game={:.3}",
+            "league_advancement round={round} metric=completed_forward_passes games={} forward_passes_for={} forward_passes_against={} forward_pass_margin={} forward_pass_margin_per_game={:.3}",
             round_kpis.games,
             round_kpis.forward_passes_for,
             round_kpis.forward_passes_against,
             round_kpis.forward_pass_margin,
             mean_forward_pass_margin,
-            round_kpis.pass_turnovers_for,
-            round_kpis.pass_turnovers_against,
-            round_kpis.net_forward_passes_for,
-            round_kpis.net_forward_passes_against,
-            round_kpis.net_forward_pass_margin,
-            mean_net_forward_pass_margin,
         );
         println!(
-            "league_kpi round={round} games={} advancement_metric=completed_forward_passes net_metric=completed_forward_passes_minus_turnovers forward_pass_margin_per_game={:.3} net_forward_pass_margin_per_game={:.3} objective_net_forward_passes={:.3} objective_net_forward_pass_margin={:.3} gd_total={} gd_per_game={:.2} goals_for={} goals_against={} shots_for={} shots_against={} sot_for={} sot_against={} shots_after_pass={} pass_completion={:.3} completed_passes={} forward_passes={} backward_passes={} dribble_beats={} assists={} crosses={} chain_gain_yards={:.1} chain_net_losses={} learned_policy_option_decisions={} learned_policy_multi_option_decisions={} learned_policy_legal_action_options={} learned_mpc_replans={} learned_mpc_replans_mpc={} learned_mpc_replans_option_score_safety={} learned_mpc_replans_neural_mcts={} learned_mpc_replan_rate={:.3}",
+            "league_kpi round={round} games={} advancement_metric=completed_forward_passes forward_pass_margin_per_game={:.3} objective={:.3} objective_margin={:.3} gd_total={} gd_per_game={:.2} goals_for={} goals_against={} shots_for={} shots_against={} sot_for={} sot_against={} shots_after_pass={} pass_completion={:.3} completed_passes={} forward_passes={} backward_passes={} dribble_beats={} assists={} crosses={} chain_gain_yards={:.1} chain_net_losses={}",
             round_kpis.games,
             mean_forward_pass_margin,
-            mean_net_forward_pass_margin,
             round_kpis.mean_objective_fitness(),
-            round_kpis.mean_objective_fitness_margin(),
+            mean_kpi_margin,
             round_kpis.goal_diff,
             round_kpis.goal_diff as f64 / kpi_games,
             round_kpis.goals_for,
@@ -1398,20 +1256,12 @@ fn main() {
             round_kpis.crosses_completed_for,
             round_kpis.pass_chain_gain_yards_for,
             round_kpis.pass_chain_net_losses_for,
-            round_kpis.learned_policy_option_decisions,
-            round_kpis.learned_policy_multi_option_decisions,
-            round_kpis.learned_policy_legal_action_options,
-            round_kpis.learned_mpc_replans,
-            round_kpis.learned_mpc_replans_mpc,
-            round_kpis.learned_mpc_replans_option_score_safety,
-            round_kpis.learned_mpc_replans_neural_mcts,
-            learned_mpc_replan_rate,
         );
 
         // Temporal checkpoint into the league (growing diversity of past selves).
         if round % (checkpoint_every as u32) == 0 {
             if frontier.neural.is_some() {
-                let prior_best = best_checkpoint_net_forward_pass_margin;
+                let prior_best = best_checkpoint_forward_pass_margin;
                 let validation = if checkpoint_validate_games > 0 {
                     let checkpoint_incumbent =
                         load_brain(&frontier_path).unwrap_or_else(|| checkpoint_baseline.clone());
@@ -1423,10 +1273,10 @@ fn main() {
                         checkpoint_validate_games,
                     );
                     println!(
-                        "league_checkpoint_validation round={round} games={} forward_pass_margin_per_game={:.3} net_forward_pass_margin_per_game={:.3} gd_total={} gd_per_game={:.3} shots_after_pass={} completed_passes={} pass_gain_yards={:.1}",
+                        "league_checkpoint_validation round={round} games={} forward_pass_margin_per_game={:.3} objective_margin={:.3} gd_total={} gd_per_game={:.3} shots_after_pass={} completed_passes={} pass_gain_yards={:.1}",
                         validation.games,
                         validation.mean_forward_pass_margin(),
-                        validation.mean_net_forward_pass_margin(),
+                        validation.mean_objective_fitness_margin(),
                         validation.goal_diff,
                         validation.mean_goal_diff(),
                         validation.shots_after_pass_for,
@@ -1439,33 +1289,22 @@ fn main() {
                 };
                 let validation_forward_pass_margin =
                     validation.as_ref().map(|v| v.mean_forward_pass_margin());
-                let validation_net_forward_pass_margin = validation
-                    .as_ref()
-                    .map(|v| v.mean_net_forward_pass_margin());
                 let gate_forward_pass_margin =
                     validation_forward_pass_margin.unwrap_or(mean_forward_pass_margin);
-                let gate_net_forward_pass_margin =
-                    validation_net_forward_pass_margin.unwrap_or(mean_net_forward_pass_margin);
                 let passes_forward_pass_climb = !checkpoint_require_forward_pass_climb
                     || !prior_best.is_finite()
-                    || gate_net_forward_pass_margin + checkpoint_max_forward_pass_regression
+                    || gate_forward_pass_margin + checkpoint_max_forward_pass_regression
                         >= prior_best;
                 let passes_forward_pass_floor =
                     gate_forward_pass_margin > checkpoint_min_forward_pass_margin;
-                let passes_net_forward_pass_floor =
-                    gate_net_forward_pass_margin > checkpoint_validate_min_net_forward_pass_margin;
                 let passes_validation = checkpoint_validation_passes(
                     validation.as_ref(),
                     checkpoint_validate_games,
                     checkpoint_validate_min_forward_pass_margin,
-                    checkpoint_validate_min_net_forward_pass_margin,
+                    checkpoint_validate_min_objective_margin,
                     checkpoint_validate_min_goal_diff_margin,
                 );
-                if passes_forward_pass_climb
-                    && passes_forward_pass_floor
-                    && passes_net_forward_pass_floor
-                    && passes_validation
-                {
+                if passes_forward_pass_climb && passes_forward_pass_floor && passes_validation {
                     let cp = format!(
                         "{}/league-r{:04}-{}.json",
                         archive_dir.trim_end_matches('/'),
@@ -1477,15 +1316,15 @@ fn main() {
                     if let Err(e) = write_frontier(&frontier_path, &frontier) {
                         eprintln!("league_publish_write_error: {e}");
                     }
-                    if gate_net_forward_pass_margin > best_checkpoint_net_forward_pass_margin {
-                        best_checkpoint_net_forward_pass_margin = gate_net_forward_pass_margin;
+                    if gate_forward_pass_margin > best_checkpoint_forward_pass_margin {
+                        best_checkpoint_forward_pass_margin = gate_forward_pass_margin;
                     }
                     println!(
-                        "league_checkpoint round={round} metric=completed_forward_passes net_metric=completed_forward_passes_minus_turnovers gate_forward_pass_margin_per_game={gate_forward_pass_margin:.3} gate_net_forward_pass_margin_per_game={gate_net_forward_pass_margin:.3} train_forward_pass_margin_per_game={mean_forward_pass_margin:.3} train_net_forward_pass_margin_per_game={mean_net_forward_pass_margin:.3} best_net_forward_pass_margin_per_game={best_checkpoint_net_forward_pass_margin:.3} -> {cp}"
+                        "league_checkpoint round={round} metric=completed_forward_passes gate_forward_pass_margin_per_game={gate_forward_pass_margin:.3} train_forward_pass_margin_per_game={mean_forward_pass_margin:.3} best_forward_pass_margin_per_game={best_checkpoint_forward_pass_margin:.3} -> {cp}"
                     );
                 } else {
                     println!(
-                        "league_checkpoint_held round={round} metric=completed_forward_passes net_metric=completed_forward_passes_minus_turnovers gate_forward_pass_margin_per_game={gate_forward_pass_margin:.3} gate_net_forward_pass_margin_per_game={gate_net_forward_pass_margin:.3} train_forward_pass_margin_per_game={mean_forward_pass_margin:.3} train_net_forward_pass_margin_per_game={mean_net_forward_pass_margin:.3} best_net_forward_pass_margin_per_game={prior_best:.3} require_climb={} raw_min_margin={checkpoint_min_forward_pass_margin:.3} net_min_margin={checkpoint_validate_min_net_forward_pass_margin:.3} validation_min_goal_diff_margin={checkpoint_validate_min_goal_diff_margin:.3} validation_passed={passes_validation} validation_games={}/{}",
+                        "league_checkpoint_held round={round} metric=completed_forward_passes gate_forward_pass_margin_per_game={gate_forward_pass_margin:.3} train_forward_pass_margin_per_game={mean_forward_pass_margin:.3} best_forward_pass_margin_per_game={prior_best:.3} require_climb={} min_margin={checkpoint_min_forward_pass_margin:.3} validation_passed={passes_validation} validation_games={}/{} validation_min_goal_diff_margin={checkpoint_validate_min_goal_diff_margin:.3}",
                         checkpoint_require_forward_pass_climb,
                         validation.as_ref().map(|validation| validation.games).unwrap_or(0),
                         checkpoint_validate_games,
@@ -1615,8 +1454,6 @@ mod tests {
         stats.shots_on_target_away = 9;
         stats.passes_completed_forward_home = 14;
         stats.passes_completed_forward_away = 5;
-        stats.interceptions_away = 3;
-        stats.interceptions_home = 1;
 
         let summary = MatchSummary {
             score_home: 0,
@@ -1627,33 +1464,23 @@ mod tests {
         };
 
         let home = LeagueMatchKpis::from_summary(&summary, Team::Home);
-        assert_eq!(home.objective_fitness, 11.0);
-        assert_eq!(home.objective_fitness_margin, 7.0);
+        assert_eq!(home.objective_fitness, 14.0);
+        assert_eq!(home.objective_fitness_margin, 9.0);
         assert_eq!(home.forward_pass_margin, 9);
-        assert_eq!(home.pass_turnovers_for, 3);
-        assert_eq!(home.pass_turnovers_against, 1);
-        assert_eq!(home.net_forward_passes_for, 11);
-        assert_eq!(home.net_forward_passes_against, 4);
-        assert_eq!(home.net_forward_pass_margin, 7);
 
         let away = LeagueMatchKpis::from_summary(&summary, Team::Away);
-        assert_eq!(away.objective_fitness, 4.0);
-        assert_eq!(away.objective_fitness_margin, -7.0);
+        assert_eq!(away.objective_fitness, 5.0);
+        assert_eq!(away.objective_fitness_margin, -9.0);
         assert_eq!(away.forward_pass_margin, -9);
-        assert_eq!(away.pass_turnovers_for, 1);
-        assert_eq!(away.pass_turnovers_against, 3);
-        assert_eq!(away.net_forward_passes_for, 4);
-        assert_eq!(away.net_forward_passes_against, 11);
-        assert_eq!(away.net_forward_pass_margin, -7);
     }
 
     #[test]
-    fn checkpoint_validation_requires_forward_net_and_scoreline() {
+    fn checkpoint_validation_blocks_forward_pass_smoke_without_positive_gd() {
         let mut validation = LeagueRoundKpis::default();
         validation.add(LeagueMatchKpis {
-            goal_diff: -3,
+            goal_diff: 0,
             forward_pass_margin: 5,
-            net_forward_pass_margin: 4,
+            objective_fitness_margin: 5.0,
             ..LeagueMatchKpis::default()
         });
 
@@ -1665,15 +1492,7 @@ mod tests {
             0.0,
         ));
 
-        assert!(!checkpoint_validation_passes(
-            Some(&validation),
-            1,
-            0.0,
-            4.0,
-            -99.0,
-        ));
-
-        validation.goal_diff = 0;
+        validation.goal_diff = 1;
         assert!(checkpoint_validation_passes(
             Some(&validation),
             1,
@@ -1808,24 +1627,6 @@ mod tests {
         assert!(config.base.mpc.reconcile_enabled);
         assert!(config.base.mpc.field_aware_enabled);
         assert!(config.base.mpc.latent_objective_enabled);
-    }
-
-    #[test]
-    fn league_trainer_serializes_parallelism_for_carried_mpc_objective() {
-        let _lock = env_lock().lock().unwrap();
-        let _mpc_guard = EnvVarGuard::set("DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE", "1");
-        let _serial_guard = EnvVarGuard::clear("SOCCER_LEAGUE_MPC_OBJECTIVE_SERIAL");
-
-        assert_eq!(league_worker_count(4, 8), 1);
-    }
-
-    #[test]
-    fn league_trainer_allows_parallel_mpc_objective_opt_out() {
-        let _lock = env_lock().lock().unwrap();
-        let _mpc_guard = EnvVarGuard::set("DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE", "1");
-        let _serial_guard = EnvVarGuard::set("SOCCER_LEAGUE_MPC_OBJECTIVE_SERIAL", "0");
-
-        assert_eq!(league_worker_count(4, 8), 4);
     }
 
     #[test]

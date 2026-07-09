@@ -109,14 +109,9 @@ spec:
               require_value DD_SOCCER_ENABLE_MAXA_BOOTSTRAP true
               require_value DD_SOCCER_ENABLE_NOVELTY_BONUS true
               require_value DD_SOCCER_FORWARD_PASS_CLIMB_CURRICULUM true
-              require_value DD_SOCCER_ENABLE_DEFERRED_PASS_CREDIT true
-              require_value DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE 1.0
               require_value SOCCER_NEURAL_ACTOR_CRITIC true
               require_value SOCCER_ENABLE_ACTOR_CRITIC true
               require_value SOCCER_NEURAL_LP_COUPLING_ENABLED true
-              require_value SOCCER_NEURAL_MCTS_ENABLED false
-              require_value SOCCER_NEURAL_MCTS_CANDIDATES 8
-              require_value SOCCER_NEURAL_MCTS_PASS_TARGET_CANDIDATES 8
               require_value DD_SOCCER_FORWARD_PASS_REWARD_SCALE 6
               require_value DD_SOCCER_SHOT_SHAPING_REWARD_SCALE 0.4
               require_value SOCCER_EVAL_REQUIRE_FORWARD_PASS_CLIMB true
@@ -152,14 +147,9 @@ spec:
               echo "maxa_bootstrap=${DD_SOCCER_ENABLE_MAXA_BOOTSTRAP}"
               echo "novelty_bonus=${DD_SOCCER_ENABLE_NOVELTY_BONUS}"
               echo "forward_pass_climb_curriculum=${DD_SOCCER_FORWARD_PASS_CLIMB_CURRICULUM}"
-              echo "deferred_pass_credit=${DD_SOCCER_ENABLE_DEFERRED_PASS_CREDIT}"
-              echo "quick_forward_release_reward_scale=${DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE}"
               echo "actor_critic=${SOCCER_NEURAL_ACTOR_CRITIC}"
               echo "actor_critic_legacy=${SOCCER_ENABLE_ACTOR_CRITIC}"
               echo "lp_coupling=${SOCCER_NEURAL_LP_COUPLING_ENABLED}"
-              echo "neural_mcts=${SOCCER_NEURAL_MCTS_ENABLED}"
-              echo "neural_mcts_candidates=${SOCCER_NEURAL_MCTS_CANDIDATES}"
-              echo "neural_mcts_pass_target_candidates=${SOCCER_NEURAL_MCTS_PASS_TARGET_CANDIDATES}"
               echo "forward_pass_reward_scale=${DD_SOCCER_FORWARD_PASS_REWARD_SCALE}"
               echo "shot_shaping_reward_scale=${DD_SOCCER_SHOT_SHAPING_REWARD_SCALE}"
               echo "eval_forward_pass_climb=${SOCCER_EVAL_REQUIRE_FORWARD_PASS_CLIMB}"
@@ -409,22 +399,12 @@ spec:
               value: "true"
             - name: DD_SOCCER_FORWARD_PASS_CLIMB_CURRICULUM
               value: "true"
-            - name: DD_SOCCER_ENABLE_DEFERRED_PASS_CREDIT
-              value: "true"
-            - name: DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE
-              value: "1.0"
             - name: SOCCER_NEURAL_ACTOR_CRITIC
               value: "true"
             - name: SOCCER_ENABLE_ACTOR_CRITIC
               value: "true"
             - name: SOCCER_NEURAL_LP_COUPLING_ENABLED
               value: "true"
-            - name: SOCCER_NEURAL_MCTS_ENABLED
-              value: "false"
-            - name: SOCCER_NEURAL_MCTS_CANDIDATES
-              value: "8"
-            - name: SOCCER_NEURAL_MCTS_PASS_TARGET_CANDIDATES
-              value: "8"
             - name: DD_SOCCER_FORWARD_PASS_REWARD_SCALE
               value: "6"
             - name: DD_SOCCER_SHOT_SHAPING_REWARD_SCALE
