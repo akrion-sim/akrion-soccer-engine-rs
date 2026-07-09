@@ -43536,6 +43536,10 @@ const SOCCER_POLICY_ACTIONS: &[&str] = &[
     "first-time-shot-kp7",
     "first-time-shot-kp8",
     "first-time-shot-kp9",
+    // Codex r24 interface lever (append-only): explicit forward-release pass. Gated + legal ONLY
+    // when a real forward option exists; executes to the visible/quick forward receiver. Puts the
+    // go-forward DECISION in the actor's learnable vocabulary instead of relying on reward shaping.
+    "forward-release-pass",
 ];
 
 const SOCCER_POLICY_PASS_ACTIONS: &[&str] = &[
