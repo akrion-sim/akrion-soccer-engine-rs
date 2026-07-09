@@ -3035,6 +3035,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn learning_team_install_allocates_enabled_specialist_sidecar() {
+        let _env_lock = soccer_world_env_lock();
+        let _skill_heads = set_test_env_var("DD_SOCCER_ENABLE_SKILL_POLICY_HEADS", "1");
+        let mut config = MatchConfig::default();
+        config.learning_enabled = true;
+        config.neural_learning.enabled = true;
+        config.neural_learning.backend = SoccerNeuralLearningBackend::Inline;
+        let mut sim = SoccerMatch::default_11v11(config);
+
+        sim.set_team_neural_brain(Team::Home, None, true)
+            .expect("install frozen home brain");
+        sim.set_team_neural_brain(Team::Away, None, false)
+            .expect("install learning away brain");
+
+        assert!(
+            sim.skill_policy_heads.is_none(),
+            "frozen home install should not allocate the shared/home specialist sidecar"
+        );
+        assert!(
+            sim.away_skill_policy_heads.is_some(),
+            "learning away install should allocate the dedicated away specialist sidecar"
+        );
+        assert!(sim.skill_policy_heads_for(Team::Away).is_some());
+    }
+
     fn pass_role_risk_test_quality(
         expected_completion: f64,
         lane_interception_risk: f64,
@@ -12526,6 +12552,9 @@ impl SoccerMatch {
                 self.away_neural_frozen = frozen;
                 self.away_skill_policy_heads = restored_skill_policy_heads;
             }
+        }
+        if !frozen && dd_soccer_enable_skill_policy_heads() {
+            self.ensure_skill_policy_heads_for_training(team);
         }
         Ok(())
     }
