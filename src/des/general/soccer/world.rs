@@ -37847,6 +37847,124 @@ fn maybe_log_pass_space_diag(sample_count: u64) {
     }
 }
 
+// ===== Net-influence diagnostic (Codex round-23) =====
+// Measures how often the neural blend actually CHANGES the selected action vs the tabular
+// baseline (the argmax-tabular-value legal candidate) at the `neural_blended_action` scorer.
+// This is the headline "does the net own play" number — if it is near zero, no reward or
+// interface lever can matter because the executed action rarely differs from what plain tabular
+// play would have chosen. Default-off (byte-identical) unless `DD_SOCCER_NET_INFLUENCE_DIAG` is
+// set; when unset `record_net_influence_diag` is a no-op and the counters never move.
+fn net_influence_diag_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_NET_INFLUENCE_DIAG").is_ok())
+}
+
+const NET_INFLUENCE_DIAG_DEFAULT_LOG_EVERY: u64 = 1000;
+
+static NET_INFLUENCE_DECISIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NET_INFLUENCE_FAMILY_CHANGED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static NET_INFLUENCE_EXACT_CHANGED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static NET_INFLUENCE_ONBALL_DECISIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static NET_INFLUENCE_ONBALL_CHANGED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+// "neural-active" = the subset where the value blend was live and there were >=2 scored
+// candidates, i.e. the net genuinely had a choice to make. Codex's higher threshold (>25-30%)
+// applies here; the all-decisions number is diluted by ticks where tabular had one option.
+static NET_INFLUENCE_ACTIVE_DECISIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static NET_INFLUENCE_ACTIVE_CHANGED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[allow(clippy::too_many_arguments)]
+fn record_net_influence_diag(
+    baseline_family: &str,
+    selected_family: &str,
+    baseline_label: &str,
+    selected_label: &str,
+    on_ball: bool,
+    neural_active: bool,
+) {
+    if !net_influence_diag_enabled() {
+        return;
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    let family_changed = baseline_family != selected_family;
+    let exact_changed = baseline_label != selected_label;
+    let count = NET_INFLUENCE_DECISIONS.fetch_add(1, Relaxed) + 1;
+    if family_changed {
+        NET_INFLUENCE_FAMILY_CHANGED.fetch_add(1, Relaxed);
+    }
+    if exact_changed {
+        NET_INFLUENCE_EXACT_CHANGED.fetch_add(1, Relaxed);
+    }
+    if on_ball {
+        NET_INFLUENCE_ONBALL_DECISIONS.fetch_add(1, Relaxed);
+        if family_changed {
+            NET_INFLUENCE_ONBALL_CHANGED.fetch_add(1, Relaxed);
+        }
+    }
+    if neural_active {
+        NET_INFLUENCE_ACTIVE_DECISIONS.fetch_add(1, Relaxed);
+        if family_changed {
+            NET_INFLUENCE_ACTIVE_CHANGED.fetch_add(1, Relaxed);
+        }
+    }
+    maybe_log_net_influence_diag(count);
+}
+
+fn maybe_log_net_influence_diag(sample_count: u64) {
+    use std::sync::OnceLock;
+    static LOG_EVERY: OnceLock<u64> = OnceLock::new();
+    let log_every = *LOG_EVERY.get_or_init(|| {
+        std::env::var("DD_SOCCER_NET_INFLUENCE_DIAG_LOG_EVERY")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(NET_INFLUENCE_DIAG_DEFAULT_LOG_EVERY)
+    });
+    if log_every > 0 && sample_count > 0 && sample_count % log_every == 0 {
+        log_net_influence_diag();
+    }
+}
+
+fn log_net_influence_diag() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let decisions = NET_INFLUENCE_DECISIONS.load(Relaxed);
+    if decisions == 0 {
+        return;
+    }
+    let family = NET_INFLUENCE_FAMILY_CHANGED.load(Relaxed);
+    let exact = NET_INFLUENCE_EXACT_CHANGED.load(Relaxed);
+    let on_ball = NET_INFLUENCE_ONBALL_DECISIONS.load(Relaxed);
+    let on_ball_changed = NET_INFLUENCE_ONBALL_CHANGED.load(Relaxed);
+    let active = NET_INFLUENCE_ACTIVE_DECISIONS.load(Relaxed);
+    let active_changed = NET_INFLUENCE_ACTIVE_CHANGED.load(Relaxed);
+    let off_ball = decisions - on_ball;
+    let off_ball_changed = family - on_ball_changed;
+    let pct = |n: u64, total: u64| -> f64 {
+        if total > 0 {
+            100.0 * n as f64 / total as f64
+        } else {
+            0.0
+        }
+    };
+    eprintln!(
+        "net_influence_diag decisions={decisions} \
+         family_changed={family} ({:.1}%) exact_changed={exact} ({:.1}%) \
+         on_ball={on_ball} on_ball_changed={on_ball_changed} ({:.1}%) \
+         off_ball={off_ball} off_ball_changed={off_ball_changed} ({:.1}%) \
+         neural_active_ge2cand={active} neural_active_changed={active_changed} ({:.1}%)",
+        pct(family, decisions),
+        pct(exact, decisions),
+        pct(on_ball_changed, on_ball),
+        pct(off_ball_changed, off_ball),
+        pct(active_changed, active),
+    );
+}
+
 fn record_pass_space_source_diag(estimator_some: bool, distinct: bool) {
     use std::sync::atomic::Ordering::Relaxed;
     let reached = PASS_SPACE_DIAG_SOURCE_REACHED.fetch_add(1, Relaxed) + 1;
