@@ -14117,6 +14117,32 @@ impl SoccerMatch {
                     neural_mcts_dribble_candidate_count,
                     neural_mcts_root_dribble_candidate_count,
                 } = choice;
+                if net_influence_diag_enabled() {
+                    // Net-influence (Codex-corrected baseline): the counterfactual is the ACTUAL
+                    // tabular-only decision path (rank-weighted + replan-safe filter, blend off),
+                    // not raw argmax. `label` is what the net/sidecar/exploration chain selected;
+                    // if it differs from the tabular choice, the neural stack flipped the decision
+                    // the engine would otherwise have committed. `neural_mcts_selected` marks the
+                    // subset where the neural MCTS actually owned the pick.
+                    if let Some(tabular) = self.weighted_policy_action_for_player(
+                        policy,
+                        snapshot,
+                        player_id,
+                        mdp_state,
+                        observation,
+                        retrieval_prior,
+                        SOCCER_POLICY_RANK_SALT_TEAM_TABULAR,
+                    ) {
+                        record_net_influence_diag(
+                            normalize_soccer_action_label(&tabular.label),
+                            normalize_soccer_action_label(&label),
+                            &tabular.label,
+                            &label,
+                            observation.has_ball,
+                            neural_mcts_selected,
+                        );
+                    }
+                }
                 let plan = plan.unwrap_or_else(|| {
                     Self::learned_plan_for_policy(policy, snapshot, player_id, label.clone())
                 });
