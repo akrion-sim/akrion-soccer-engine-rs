@@ -38780,6 +38780,7 @@ fn per_role_policy_heads_train_without_cross_role_gradient_bleed() {
             old_action_probability: None,
             sample_weight: 1.0,
             mcts_distillation: false,
+            forward_select_eligible: false,
         })
         .collect();
     head.train(&samples, None);
