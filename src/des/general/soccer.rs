@@ -40850,6 +40850,12 @@ pub(crate) struct SoccerPolicyHead {
     role_heads: Vec<SoccerPolicyRoleHead>,
     training_steps: usize,
     last_loss: Option<f64>,
+    /// Learned scalar that, under `DD_SOCCER_ENABLE_FORWARD_SELECT_LOGIT`, adds a pre-choice
+    /// additive bias to FORWARD pass candidates proportional to the visible forward-option quality
+    /// — isolating action SELECTION (the diagnosed bottleneck: the actor keeps choosing
+    /// lateral/safe). Baked per-net into the snapshot so eval is not env-confounded. 0.0 (the init /
+    /// restore-from-legacy default) ⇒ no effect, so the scored-candidate path is byte-identical.
+    forward_select_logit_weight: f64,
 }
 
 impl SoccerPolicyHead {
