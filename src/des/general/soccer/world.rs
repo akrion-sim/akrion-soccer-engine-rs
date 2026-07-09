@@ -16085,48 +16085,52 @@ impl SoccerMatch {
                 || threaded_goal_pass_can_override_forced_shot(observation, role))
         {
             forward_release_diag_bump(ForwardReleaseStage::Eligible);
-            // Best qualified forward receiver + its open value (production inline of the
-            // test-only `quick_forward_pass_value_for`: same ranked-visible + forward-support path).
+            // Cap B drops the forward pass the ANALYTIC ranks LOW (risky forward-into-space), NOT the
+            // best-OPEN forward (which is already exposed in the top-N — targeting that was inert). So
+            // search the Cap-B-EXCLUDED tail of the analytic-ranked visible passes for the best-ranked
+            // target that is genuinely FORWARD (>= 4 yd upfield of the passer, attack-relative) and
+            // force THAT into the critic's view. By construction it is past the cap, so never exposed —
+            // no dedup needed. `min_quality` intentionally unused here: the critic + bias judge quality,
+            // which is the whole point (the analytic already under-rated it).
             let forward_targets = snapshot.ranked_visible_pass_targets(player_id, 11);
-            let forward_ctx = snapshot.forward_support_context_for(player_id, &forward_targets);
-            if forward_ctx.best_quick_forward_open_value >= forward_release_min_quality() {
-                if let Some(target_player) = forward_ctx.best_quick_forward_target {
-                    // Dedup against the top-N that survive Cap B (borrow-free — cannot touch
-                    // `scored_candidates` while the `push_scored_candidate` closure holds it).
-                    let cap = neural_mcts_pass_target_candidate_limit();
-                    let already_exposed =
-                        forward_targets.iter().take(cap).any(|&t| t == target_player);
-                    if !already_exposed {
-                        if let Some(target_point) = snapshot.player_position(target_player) {
-                            let synthetic_trace = SoccerLearnedActionTrace {
-                                label: "pass".to_string(),
-                                value: dp_policy_value_center,
-                                visits: 0,
-                                probability: 0.0,
-                                legal: true,
-                                level: PitchGridLevel::WholePitch,
-                            };
-                            let synthetic_plan = SoccerLearnedPlan {
-                                action: "pass1".to_string(),
-                                target_player: Some(target_player),
-                                target_point: Some(target_point),
-                                mpc_replan: None,
-                            };
-                            push_scored_candidate(&synthetic_trace, synthetic_plan);
-                            // Bias ONLY the just-injected candidate. push appends at most one and this is
-                            // its last use, so the closure's &mut is released; if the plan landed it is the
-                            // LAST element with our exact (target, "pass1") identity. Checking last() — not
-                            // a rev-scan — avoids biasing an older same-target plan when push rejects it
-                            // (Codex review). The dedup above guarantees no other "pass1" to this target.
-                            if let Some(last) = scored_candidates.last_mut() {
-                                if last.plan.as_ref().map_or(false, |p| {
-                                    p.target_player == Some(target_player) && p.action == "pass1"
-                                }) {
-                                    last.score += forward_release_bias();
-                                    injected_forward_target = Some(target_player);
-                                    forward_release_diag_bump(ForwardReleaseStage::Pushed);
-                                }
-                            }
+            let cap = neural_mcts_pass_target_candidate_limit();
+            let passer_pos = snapshot.player_position(player_id);
+            let attack_dir = team.attack_dir();
+            let excluded_forward = passer_pos.and_then(|pp| {
+                forward_targets.iter().skip(cap).copied().find(|&tid| {
+                    snapshot
+                        .player_position(tid)
+                        .map_or(false, |tp| (tp.y - pp.y) * attack_dir >= 4.0)
+                })
+            });
+            if let Some(target_player) = excluded_forward {
+                if let Some(target_point) = snapshot.player_position(target_player) {
+                    let synthetic_trace = SoccerLearnedActionTrace {
+                        label: "pass".to_string(),
+                        value: dp_policy_value_center,
+                        visits: 0,
+                        probability: 0.0,
+                        legal: true,
+                        level: PitchGridLevel::WholePitch,
+                    };
+                    let synthetic_plan = SoccerLearnedPlan {
+                        action: "pass1".to_string(),
+                        target_player: Some(target_player),
+                        target_point: Some(target_point),
+                        mpc_replan: None,
+                    };
+                    push_scored_candidate(&synthetic_trace, synthetic_plan);
+                    // Bias ONLY the just-injected candidate. push appends at most one and this is its
+                    // last use, so the closure's &mut is released; if the plan landed it is the LAST
+                    // element with our exact (target, "pass1") identity. last() — not a rev-scan —
+                    // avoids biasing an older same-target plan if push rejects it (Codex review).
+                    if let Some(last) = scored_candidates.last_mut() {
+                        if last.plan.as_ref().map_or(false, |p| {
+                            p.target_player == Some(target_player) && p.action == "pass1"
+                        }) {
+                            last.score += forward_release_bias();
+                            injected_forward_target = Some(target_player);
+                            forward_release_diag_bump(ForwardReleaseStage::Pushed);
                         }
                     }
                 }
