@@ -1,7 +1,7 @@
 # Reward shaping audit (#8)
 
 The per-step learning reward (assembled in `soccer.rs`, the
-`reward += …` block beginning ~L19000) has accreted dozens of dense shaping
+`reward += …` block spanning ~L26463–28038) has accreted dozens of dense shaping
 shards. This audits them against the **potential-based reward shaping (PBRS)**
 criterion (Ng, Harada & Russell 1999): a shaping term is provably
 policy-invariant iff it can be written
