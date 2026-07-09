@@ -38115,7 +38115,6 @@ fn log_net_influence_commit_diag() {
         return;
     }
     let semantic = NET_INFLUENCE_COMMIT_SEMANTIC_CHANGED.load(Relaxed);
-    let concrete = NET_INFLUENCE_COMMIT_CONCRETE_CHANGED.load(Relaxed);
     let on_ball = NET_INFLUENCE_COMMIT_ONBALL_DECISIONS.load(Relaxed);
     let on_ball_semantic = NET_INFLUENCE_COMMIT_ONBALL_SEMANTIC_CHANGED.load(Relaxed);
     let pct = |n: u64, total: u64| -> f64 {
@@ -38127,10 +38126,9 @@ fn log_net_influence_commit_diag() {
     };
     eprintln!(
         "net_influence_commit decisions={decisions} \
-         semantic_changed={semantic} ({:.1}%) concrete_changed={concrete} ({:.1}%) \
+         semantic_changed={semantic} ({:.1}%) \
          on_ball={on_ball} on_ball_semantic_changed={on_ball_semantic} ({:.1}%)",
         pct(semantic, decisions),
-        pct(concrete, decisions),
         pct(on_ball_semantic, on_ball),
     );
 }
