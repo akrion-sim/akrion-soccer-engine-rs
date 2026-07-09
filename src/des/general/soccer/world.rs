@@ -33429,6 +33429,43 @@ impl SoccerMatch {
         }
     }
 
+    /// Emit a learned-MPC-objective (executor-head) training sample from a resolved SHOT — the shot
+    /// analogue of the MPC block inside [`Self::record_pass_outcome_sample`]. Reinforces the applied
+    /// aim-PLACEMENT residual by the delayed shot outcome, pushed into the SAME
+    /// `mpc_objective_samples` buffer the pass path uses (the shared head's SHOT-family rows are
+    /// separated by the family one-hot baked into `features`, so the learner needs no shot-specific
+    /// plumbing). No-op unless the shot armed the residual at launch (`shot.mpc_objective` is Some,
+    /// i.e. `dd_soccer_enable_learned_mpc_shot_objective()` was on + the head present) — so when the
+    /// shot gate is off this never pushes a sample and is fully behaviour-neutral.
+    ///
+    /// Reward mapping (magnitudes mirror the pass path: completed ≈ +0.6..+1.0, failed −1.0):
+    /// goal ⇒ +1.0, on-target rebound/parry ⇒ +0.6, held save ⇒ +0.3, off-target/blocked/OOB ⇒ −1.0.
+    /// RWR ([`SoccerMpcObjectiveHead::train_rwr`]) trains only on positive advantage, so the
+    /// goal/rebound/save samples reinforce their placement while the negative miss/block samples are
+    /// recorded (corpus parity with the pass path) but skipped in training.
+    fn record_shot_objective_sample(&mut self, shot: &PendingShot, outcome: ShotObjectiveOutcome) {
+        let reward = match outcome {
+            ShotObjectiveOutcome::Goal => 1.0,
+            ShotObjectiveOutcome::OnTargetRebound => 0.6,
+            ShotObjectiveOutcome::Saved => 0.3,
+            ShotObjectiveOutcome::Missed => -1.0,
+        };
+        if let Some((features, residual, applied_bend)) = shot.mpc_objective.as_ref() {
+            if features.len() == MPC_OBJECTIVE_FEATURE_DIM {
+                self.mpc_objective_samples.push(MpcObjectiveSample {
+                    features: features.clone(),
+                    applied_residual: *residual,
+                    applied_bend: *applied_bend,
+                    reward,
+                });
+                if self.mpc_objective_samples.len() > MPC_OBJECTIVE_SAMPLE_CAP {
+                    let overflow = self.mpc_objective_samples.len() - MPC_OBJECTIVE_SAMPLE_CAP;
+                    self.mpc_objective_samples.drain(0..overflow);
+                }
+            }
+        }
+    }
+
     /// Drain the accumulated pass-outcome samples (the cluster learner persists them to Postgres
     /// and trains [`SoccerPassCompletionHead`] on the pooled corpus).
     pub fn drain_pass_outcome_samples(&mut self) -> Vec<SoccerPassOutcomeSample> {
