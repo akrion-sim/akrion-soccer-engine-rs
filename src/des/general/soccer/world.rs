@@ -16083,6 +16083,16 @@ impl SoccerMatch {
             .iter()
             .filter(|candidate| pass_like_action_flight(&candidate.label).is_some())
             .count();
+        // Per-family exposure (dribble / shot) alongside pass — for the multi-POMDP-decision
+        // scorecard: which action families reach the neural scored set at all.
+        let n_dribble_scored = scored_candidates
+            .iter()
+            .filter(|candidate| is_dribble_action_label(&candidate.label))
+            .count();
+        let n_shot_scored = scored_candidates
+            .iter()
+            .filter(|candidate| soccer_label_is_shot(&candidate.label))
+            .count();
         let fwd_best_rank = scored_candidates
             .iter()
             .position(|candidate| {
