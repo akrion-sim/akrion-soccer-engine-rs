@@ -8,6 +8,19 @@
 > [`learnability-conversion-roadmap.md`](learnability-conversion-roadmap.md) Priority 1 (which the
 > repo itself flags as DORMANT / highest-ROI).
 
+> **⚠️ STATUS (verified against HEAD `be11b4d`, 2026-07-09): Parts A & B are now IMPLEMENTED (gated,
+> default-off) on this branch (`feature/action-param-features-and-capacity`).** Part A =
+> `SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM = 10` (soccer.rs:4644), wired into
+> `soccer_neural_transition_features_with_action` (soccer.rs:46111-46130), gate
+> `DD_SOCCER_ENABLE_ACTION_PARAM_FEATURES` (soccer.rs:63687). Part B = candidate assembly expands
+> pass/aerial targets into discretized kick-power-bucket variants the neural MCTS/critic ranks
+> (world.rs:14296, helpers world.rs:215-482, test `discretized_kick_gate_expands_pass_targets_into_power_bucket_candidates`
+> world.rs:6978), gate `DD_SOCCER_ENABLE_DISCRETIZED_KICK`. Both still need a **full retrain + eval**
+> to prove out (existing nets never saw them). **Part C (break tabular imitation) remains the open
+> structural piece.** Ceilings #1 and #3 below now describe the **gate-OFF / legacy** path; body line
+> refs have drifted (`AgentActionTargetTrace` soccer.rs:8067, action hash soccer.rs:43320, family bits
+> soccer.rs:43329).
+
 ## Why un-collapsing the value can't break parity
 
 Three compounding structural ceilings, all verified in code:
