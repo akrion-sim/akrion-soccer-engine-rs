@@ -48,9 +48,11 @@ learn "we won ⇒ every action I took was good," independent of quality.
 
 **F3 — Value-target saturation (pre-existing, flagged not fixed).** Targets are
 `reward/30` clipped to ±3.0, i.e. the critic cannot represent a return beyond ±90 raw,
-while the full-game return clips at ±250. High-magnitude games saturate the critic and
-bias the advantage baseline. The won-game label (±12.5 ⇒ ±0.42 in target space) stays
-well inside this, so it does not worsen F3, but the tension is worth tracking.
+while the full-game return clips at ±400. High-magnitude games saturate the critic and
+bias the advantage baseline. **The won-game label now makes this worse, not better:** at
+`MATCH_OUTCOME_WIN`=200 the label is 200/30 ≈ 6.67 in target space, which **exceeds** the
+±3.0 target clip — so the outcome label itself saturates the critic. (This corrects an earlier
+version of this note that assumed a ±12.5 label sitting safely inside the clip.)
 
 **F4 — Other reward-fed trainers are safe.** The tabular Q trainer takes a flat
 per-team label as a constant that cancels in per-team argmax; the value net clips (F3);
