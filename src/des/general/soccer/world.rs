@@ -12027,8 +12027,9 @@ impl SoccerMatch {
             rng: SeededRandom::new((rollout_seed ^ (rollout_seed >> 32)) as u32),
             // ROLLOUT hook
             rollout_forced_action: None,
-            // NULL: analytic base — no learned policy / heads / neural blend
+            // NULL: analytic base — no learned policy / heads / neural blend / DP critic cache
             learned_policy: None,
+            dp_value_table: None,
             team_policies: None,
             neural_learner: None,
             away_neural_learner: None,
