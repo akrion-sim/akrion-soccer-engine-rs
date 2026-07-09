@@ -4637,8 +4637,15 @@ const SOCCER_NEURAL_DECISION_CONTEXT_FEATURE_DIM: usize = 20;
 const SOCCER_NEURAL_PRE_DECISION_CONTEXT_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_SAME_TEAM_SEPARATION_FEATURE_DIM
         + SOCCER_NEURAL_SAME_TEAM_SEPARATION_FEATURE_DIM;
-const SOCCER_NEURAL_FEATURE_DIM: usize =
+/// Append-only structured action-param feature block. Replaces the opaque FNV action hash with
+/// structured information about the action's target point (dx/dy, distance, direction sin/cos,
+/// has-target) and fine-grained family flags (pass/shoot/dribble). Gated by
+/// `DD_SOCCER_ENABLE_ACTION_PARAM_FEATURES`; zero block when OFF ⇒ old nets zero-pad.
+const SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM: usize = 10;
+const SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_DECISION_CONTEXT_FEATURE_DIM + SOCCER_NEURAL_DECISION_CONTEXT_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_DIM: usize =
+    SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM + SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM;
 /// Fixed dimensionality of a persisted **moment embedding** (the vector stored
 /// in pgvector for similarity retrieval). Deliberately decoupled from — and
 /// larger than — `SOCCER_NEURAL_FEATURE_DIM`, which grows as features are added:
@@ -5216,6 +5223,27 @@ const SOCCER_NEURAL_FEATURE_FORWARD_ONSIDE_SUPPORT_CLAMP_DISTANCE: usize =
     SOCCER_NEURAL_FEATURE_FORWARD_ONSIDE_SUPPORT_LINE_GAP + 1;
 const SOCCER_NEURAL_FEATURE_FORWARD_ONSIDE_SUPPORT_PRESSURE: usize =
     SOCCER_NEURAL_FEATURE_FORWARD_ONSIDE_SUPPORT_CLAMP_DISTANCE + 1;
+// --- Action-param feature block indices (tail, gated) ---
+const SOCCER_NEURAL_FEATURE_ACTION_PARAM_HAS_TARGET: usize =
+    SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DX: usize =
+    SOCCER_NEURAL_FEATURE_ACTION_PARAM_HAS_TARGET + 1;
+const SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DY: usize =
+    SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DX + 1;
+const SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DIR_SIN: usize =
+    SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DY + 1;
+const SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DIR_COS: usize =
+    SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DIR_SIN + 1;
+const SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DISTANCE: usize =
+    SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DIR_COS + 1;
+const SOCCER_NEURAL_FEATURE_ACTION_PARAM_ACTION_SPEED: usize =
+    SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DISTANCE + 1;
+const SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_PASS: usize =
+    SOCCER_NEURAL_FEATURE_ACTION_PARAM_ACTION_SPEED + 1;
+const SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_SHOOT: usize =
+    SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_PASS + 1;
+const SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_DRIBBLE: usize =
+    SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_SHOOT + 1;
 const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     61,
     62,
@@ -5374,6 +5402,8 @@ const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     // Same schema with same-team separation-floor channels, before explicit
     // tactical decision-context channels.
     SOCCER_NEURAL_PRE_DECISION_CONTEXT_FEATURE_DIM,
+    // Same schema with decision-context channels, before structured action-param features.
+    SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM,
 ];
 const TEAM_SHAPE_NEAR_BALL_RADIUS_YARDS: f64 = 18.0;
 // Tight same-team congestion rings reported in the brain trace so a human can see
@@ -5390,7 +5420,7 @@ const DEFAULT_SOCCER_NEURAL_MAX_BATCHES_PER_TICK: usize = 2;
 const LIVE_GAMEPLAY_POLICY_LEARNING_INTERVAL_TICKS: usize = secs_to_ticks(0.5) as usize;
 const LIVE_GAMEPLAY_POLICY_TRAIN_MAX_TRANSITIONS_PER_TICK: usize = 8;
 const LIVE_GAMEPLAY_NEURAL_TRAIN_EVERY_TICKS: usize = secs_to_ticks(1.0) as usize;
-const DEFAULT_SOCCER_NEURAL_HIDDEN_UNITS: usize = 24;
+const DEFAULT_SOCCER_NEURAL_HIDDEN_UNITS: usize = 128;
 const DEFAULT_SOCCER_NEURAL_TARGET_SCALE: f64 = 30.0;
 const DEFAULT_SOCCER_NEURAL_MAX_PENDING_BATCHES: usize = 32;
 const DEFAULT_SOCCER_NEURAL_REPLAY_CAPACITY: usize = 512;
@@ -5442,7 +5472,7 @@ const SOCCER_POLICY_ASSIGNED_POSITION_DIM: usize = SOCCER_ASSIGNED_POSITION_COUN
 const SOCCER_POLICY_FEATURE_DIM: usize = SOCCER_NEURAL_FEATURE_DIM
     + SOCCER_POLICY_ROLE_EMBEDDING_DIM
     + SOCCER_POLICY_ASSIGNED_POSITION_DIM;
-const DEFAULT_SOCCER_POLICY_HIDDEN_UNITS: usize = 24;
+const DEFAULT_SOCCER_POLICY_HIDDEN_UNITS: usize = 128;
 const MIN_SOCCER_POLICY_HIDDEN_UNITS: usize = 8;
 const MAX_SOCCER_POLICY_HIDDEN_UNITS: usize = 512;
 const SOCCER_POLICY_LEARNING_RATE: f64 = 0.05;
@@ -46058,6 +46088,83 @@ fn soccer_neural_transition_features_with_action(
         soccer_neural_scaled(obs.forward_onside_support_clamp_distance_yards, 8.0);
     features[SOCCER_NEURAL_FEATURE_FORWARD_ONSIDE_SUPPORT_PRESSURE] =
         soccer_neural_unit(obs.forward_onside_support_pressure);
+    // Structured action-param feature block (append-only, gated by DD_SOCCER_ENABLE_ACTION_PARAM_FEATURES).
+    // When OFF the block is all-zeros and old nets zero-pad. When ON it replaces the opaque FNV hash
+    // with structured target geometry and fine-grained family flags the net can generalize over.
+    if dd_soccer_enable_action_param_features() {
+        let (is_pass, is_shoot, is_dribble) = match SoccerActionLabel::classify(action_label) {
+            Some(
+                SoccerActionLabel::Pass
+                | SoccerActionLabel::KillerPass
+                | SoccerActionLabel::AerialPass
+                | SoccerActionLabel::WallPass
+                | SoccerActionLabel::FlankLowCross
+                | SoccerActionLabel::FlankHighCross
+                | SoccerActionLabel::SwitchPlay
+                | SoccerActionLabel::SurprisePass
+                | SoccerActionLabel::FirstTimePass
+                | SoccerActionLabel::Clearance
+                | SoccerActionLabel::CornerFlagCross,
+            ) => (1.0, 0.0, 0.0),
+            Some(
+                SoccerActionLabel::Shoot
+                | SoccerActionLabel::FirstTimeShot
+                | SoccerActionLabel::FirstTimeHeader,
+            ) => (0.0, 1.0, 0.0),
+            Some(
+                SoccerActionLabel::Dribble
+                | SoccerActionLabel::CarryForward
+                | SoccerActionLabel::CarryOutLeft
+                | SoccerActionLabel::CarryOutRight
+                | SoccerActionLabel::SideStep
+                | SoccerActionLabel::LeftCut
+                | SoccerActionLabel::RightCut
+                | SoccerActionLabel::Nutmeg
+                | SoccerActionLabel::XaviTurn
+                | SoccerActionLabel::FakeLeftCutRight
+                | SoccerActionLabel::FakeRightCutLeft
+                | SoccerActionLabel::RoundGoalkeeper
+                | SoccerActionLabel::VerticalAttack
+                | SoccerActionLabel::TurnoverBurst,
+            ) => (0.0, 0.0, 1.0),
+            _ => (0.0, 0.0, 0.0),
+        };
+        let has_target = transition
+            .action_target
+            .as_ref()
+            .and_then(|t| t.point)
+            .is_some();
+        let (target_dx, target_dy, target_dir_sin, target_dir_cos) = transition
+            .action_target
+            .as_ref()
+            .and_then(|t| t.point)
+            .map(|target_pt| {
+                let offset = target_pt - context.ball_position;
+                let dist = (offset.x * offset.x + offset.y * offset.y).sqrt();
+                let dir_sin = if dist > 1e-6 { offset.y / dist } else { 0.0 };
+                let dir_cos = if dist > 1e-6 { offset.x / dist } else { 0.0 };
+                (
+                    soccer_neural_scaled(offset.x, DEFAULT_FIELD_WIDTH_YARDS),
+                    soccer_neural_scaled(offset.y, DEFAULT_FIELD_LENGTH_YARDS),
+                    dir_sin,
+                    dir_cos,
+                )
+            })
+            .unwrap_or((0.0, 0.0, 0.0, 0.0));
+        features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_HAS_TARGET] =
+            soccer_neural_bool(has_target);
+        features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DX] = target_dx;
+        features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DY] = target_dy;
+        features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DIR_SIN] = target_dir_sin;
+        features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DIR_COS] = target_dir_cos;
+        features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DISTANCE] =
+            soccer_neural_scaled(context.target_distance_yards, 60.0);
+        features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_ACTION_SPEED] =
+            soccer_neural_scaled(context.action_ball_speed_yps, 36.0);
+        features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_PASS] = is_pass;
+        features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_SHOOT] = is_shoot;
+        features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_DRIBBLE] = is_dribble;
+    }
     debug_assert_eq!(features.len(), SOCCER_NEURAL_FEATURE_DIM);
     features
 }
@@ -63549,6 +63656,24 @@ pub fn dd_soccer_enable_discretized_kick() -> bool {
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_DISCRETIZED_KICK"))
+    }
+}
+
+/// Gate for the structured action-param feature block (`SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM`).
+/// ON: encodes candidate target dx/dy, direction sin/cos, distance, has-target flag, and
+/// fine-grained family flags (pass/shoot/dribble). OFF (default): zero block ⇒ old nets
+/// zero-pad and remain byte-identical. Replaces the opaque FNV action hash with structure
+/// the net can generalize over, even for existing candidates.
+pub fn dd_soccer_enable_action_param_features() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_ACTION_PARAM_FEATURES")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_ACTION_PARAM_FEATURES"))
     }
 }
 
