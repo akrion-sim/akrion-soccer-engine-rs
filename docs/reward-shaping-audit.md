@@ -43,7 +43,7 @@ is a per-step bias the policy can accumulate by loitering in the rewarded state.
   `reward += 0.18 * role_multiplier * half_multiplier` (~L27378).
 - Fixed penalties not tied to an action outcome: `reward -= 0.42` (~L27381),
   `-= 0.22` (~L27455), `-= 0.16` (~L27489).
-- `EFFORT_REWARD_POINTS` / `LAZINESS_PENALTY_POINTS` (~L19016/19018) — effort
+- `EFFORT_REWARD_POINTS` / `LAZINESS_PENALTY_POINTS` (consts =2.6 at ~L467/468, applied ~L27155/27157) — effort
   bonuses; defensible as B if expressed as a *closing-distance delta*, a bias if
   flat per tick.
 
