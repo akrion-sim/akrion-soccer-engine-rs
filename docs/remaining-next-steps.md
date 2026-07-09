@@ -13,6 +13,23 @@ verify current learner/tournament status through the runbook, DB, and rollout ch
 - Offline-encoder **Step 1** (dataset export) and **Step 2a prototype** (numpy trainer,
   ~47% held-out gain) — `scripts/export_offline_dataset.sh`, `scripts/train_offline_head.py`.
 
+## P0 — Break the analytic-parity plateau (ACTIVE — top priority)
+The north star is a neural policy that beats the **pure-analytic engine**; it is stuck at
+~0.28–0.44 forward-pass payoff vs analytic (REJECT). Reward-shaping arms (spatial / forward-primacy
+/ de-timid) are falsified; the plateau is **structural**. Current working hypothesis (2026-07-09,
+Codex-adjudicated): the net may not **causally own the executed action** — exploration is off and the
+downstream analytic/execution layers may override it. **Plan (instrument-first) →
+[`climb-reframe-2026-07-09.md`](climb-reframe-2026-07-09.md):**
+1. Build the **net-influence instrument** (pure measurement, default-off): fraction of decisions on
+   which the net's score changes the executed action vs the tabular/heuristic argmax. Sites: scorer
+   `neural_blended_action` (world.rs:15659/15961) + final commit (world.rs:20126/20150). Report exact
+   vs family, on-/off-ball, chosen-candidate score entropy.
+2. Baseline it, then **flip exploration on** (`DD_SOCCER_ENABLE_STOCHASTIC_POLICY_TOPK=1` +
+   `policy_selection.boltzmann_temperature`>0, annealed) and remeasure.
+3. Only then **resume reward work** (the r19 carrot / learned receiver / target-point aim).
+See also the shipped-but-unevaluated capacity/action-space work on
+`feature/action-param-features-and-capacity` (`learning-breakthrough-priority1-action-space.md`).
+
 ## P1 — Offline distilled value head, productionized (`offline-encoder-step2-plan.md`)
 The prototype proved the data is learnable; turn it into a shippable, gated head.
 1. **Rust `soccer_offline_distill` bin.** Read the JSONL dataset → flatten features with the
