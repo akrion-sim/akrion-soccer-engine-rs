@@ -758,7 +758,7 @@ fn main() {
         advancement.pass_gain_yards_margin(),
     );
     if require_forward_pass_climb {
-        println!("scoreline gate: required along with forward-pass climb");
+        println!("scoreline gate: required with forward-pass climb");
         println!(
             "forward-pass gate: margin>{:+} net_margin>{:+} rate_margin>{:+.1}pp min_games={} min_goal_diff>{:+} -> {}",
             min_forward_pass_margin,
@@ -884,20 +884,24 @@ mod tests {
     }
 
     #[test]
-    fn forward_pass_mode_decision_requires_scoreline_verdict() {
+    fn forward_pass_mode_decision_requires_scoreline_and_advancement() {
         let advancement_reasons = Vec::new();
 
         assert!(
             !eval_gate_promotes(true, false, &advancement_reasons),
-            "forward-pass mode must not let WDL/Wilson failures promote"
+            "forward-pass mode must keep scoreline promotion as a hard veto"
         );
         assert!(
             eval_gate_promotes(true, true, &advancement_reasons),
-            "forward-pass mode should promote only when scoreline and advancement gates both pass"
+            "forward-pass mode should pass when scoreline and advancement gates pass"
         );
         assert!(
             !eval_gate_promotes(false, false, &advancement_reasons),
             "scoreline verdict remains authoritative when forward-pass climb is not required"
+        );
+        assert!(
+            !eval_gate_promotes(true, true, &["net regression".to_string()]),
+            "forward-pass mode must still reject advancement failures"
         );
     }
 

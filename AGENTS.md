@@ -149,18 +149,18 @@ Never run destructive or irreversible shell commands. To remove or move files,
 
 **Blacklisted — do NOT run:**
 - `rm`, `rm -rf`, `rmdir`, `unlink` — never delete via raw `rm`.
-- raw `mv` of tracked files; truncating a tracked file with `>`.
+- bulk / indirect deletion: `find … -delete`, `find … -exec rm …`, `xargs rm` — no bypasses of the `rm` ban.
+- raw `mv` of tracked files; truncating a tracked file with `>` or `truncate`.
 - `git reset --hard`, `git clean -fdx`, `git checkout -- .` / `git restore .` mass-discard.
+- `git stash` — **all forms** (not just `drop`/`clear`): this repo forbids stash entirely, see the no-stash rule above. Plus `git branch -D`, `git tag -d` — destroy unmerged work / refs; not on shared branches unless the operator explicitly asks.
 - `git push --force` / history rewrites on shared branches (esp. `main`).
-- `git stash` — banned outright (see "NEVER use `git stash`" above); it hides work and races.
-- `dd`, `mkfs`, `shred`, `find … -delete`, recursive `chmod -R`/`chown -R` on broad paths, fork bombs.
+- `dd`, `mkfs`, `shred`, recursive `chmod -R` / `chown -R` on broad paths, fork bombs.
 
 **Whitelisted — safe, prefer these:**
 - `git rm` / `git rm --cached` — remove files through git (recoverable via history).
 - `git mv` — rename/move through git.
-- `git restore <path>` (single file), `git revert` — reversible. (NOT `git stash`.)
-- Editing via the editor tools, `git add`, `git commit`.
-  (Do NOT `git switch -c` / create branches — this repo is main-only; see the top of this file.)
+- `git restore <path>` (single file), `git revert` — reversible. (No `git stash` in this repo — it is forbidden entirely; see the rule above.)
+- Editing via the editor tools, `git add`, `git commit`, `git switch -c`.
 
 If a genuinely destructive action seems unavoidable, **STOP and ask the operator
 first** — do not improvise around this rule.
