@@ -21417,6 +21417,17 @@ impl SoccerMatch {
         // Possession changed hands: reseed the carried-ball orbit from the new
         // carrier's geometry next tick (no winding carried over from the loser).
         self.ball.reset_carry_orbit();
+        // Drop a pending learned-MPC dribble aim-residual that belonged to a DIFFERENT carrier so a
+        // stale residual is never credited to whoever just received the ball. Only fires on an actual
+        // change of holder (a same-player re-collection keeps it; `apply_dribble_intent` overwrites it
+        // next tick anyway). This is the general possession-change clear; the dispossession resolve
+        // itself consumes the slot BEFORE this runs (it emits + takes the slot at the top of
+        // `complete_defensive_dispossession`, well before that fn calls `mark_ball_received`), so this
+        // never races the resolve read. No-op when the dribble gate is off (the slot is never
+        // written) or already `None`.
+        if matches!(&self.dribble_mpc_objective, Some((holder, ..)) if *holder != holder_id) {
+            self.dribble_mpc_objective = None;
+        }
     }
 
     fn record_reward_event(&mut self, player_id: usize, amount: f64) {
