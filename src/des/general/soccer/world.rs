@@ -27709,6 +27709,13 @@ impl SoccerMatch {
                         team: player_team,
                         shooter: player_id,
                         origin: player_pos,
+                        // Intended (post-residual, pre-noise) analytic aim: `base_goal_x` here is the
+                        // residual-shifted placement when the shot gate armed, else the pure analytic
+                        // aim. `goal_y` is the goal line. Behaviour-inert when `mpc_objective` is None.
+                        intended_target: Vec2::new(base_goal_x, goal_y),
+                        // Some(features, applied lateral residual (x, 0.0), bend=0.0) ONLY when the
+                        // shot gate armed AND the residual was applied; None otherwise (byte-identical).
+                        mpc_objective: mpc_shot_objective,
                     });
                     self.record_possession_touch(player_id);
                     self.stat_shot(player_team);
