@@ -19,7 +19,8 @@ risk pricing so braveness never becomes a loose square ball.
 Source of truth:
 - Gate + appetite model: `src/des/general/soccer.rs`
   - `dd_soccer_enable_role_pass_risk_appetite()` — env `DD_SOCCER_ENABLE_ROLE_PASS_RISK_APPETITE`,
-    **default-OFF, byte-identical when off** (env `is_ok()` in both `cfg(test)` and prod).
+    **now default-ON in production** (`gate_default_on`, soccer.rs:63420; `=0`/`off` disables);
+    **default-OFF and byte-identical only under `cfg(test)`**.
   - `PassRiskAppetite` + `pass_risk_appetite_for_passer()` (gated) → `pass_risk_appetite_table()` (pure).
 - Call sites: `src/des/general/soccer/world.rs` — `ranked_pass_targets_filtered_full`
   (floor) and `ranked_aerial_pass_targets_filtered_full` (aerial): the appetite scales the
