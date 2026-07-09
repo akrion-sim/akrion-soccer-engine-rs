@@ -14557,6 +14557,8 @@ fn dead_shot_ball_at_rest_is_controllable_not_locked_out() {
         team: Team::Home,
         shooter,
         origin: Vec2::new(40.0, 40.0),
+        intended_target: Vec2::zero(),
+        mpc_objective: None,
     });
     // A team-mate is right on the dead ball.
     sim.players[collector].position = Vec2::new(40.0, 70.3);
