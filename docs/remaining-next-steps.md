@@ -13,21 +13,6 @@ verify current learner/tournament status through the runbook, DB, and rollout ch
 - Offline-encoder **Step 1** (dataset export) and **Step 2a prototype** (numpy trainer,
   ~47% held-out gain) — `scripts/export_offline_dataset.sh`, `scripts/train_offline_head.py`.
 
-## P0 — Plateau instrumentation and frozen eval ladder
-Before changing PPO/MAPPO math or widening model capacity, add the diagnostics that prove the
-learned layer is causally changing play:
-
-1. `net_changed_action_rate`: executed action differs from the tabular/heuristic baseline.
-2. `confidence_gate_open_rate`: ConfidenceGated opened on the selected/executed candidate.
-3. `selected_kick_speed_bucket_entropy`: bucket choices stay diverse by family.
-4. PPO/MAPPO health: old-prob missing rate, ratio mean, clip fraction, entropy by role/family.
-5. Target/advantage health: raw/scaled target histograms, target clip fraction, advantage mean/std.
-6. Frozen eval ladder: analytic baseline, protected local best, past checkpoints, and
-   weaker/randomized opponents on held-out seeds.
-
-These are not current `world_model_training` fields; see
-[current-learning-state.md](current-learning-state.md).
-
 ## P1 — Offline distilled value head, productionized (`offline-encoder-step2-plan.md`)
 The prototype proved the data is learnable; turn it into a shippable, gated head.
 1. **Rust `soccer_offline_distill` bin.** Read the JSONL dataset → flatten features with the

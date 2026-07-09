@@ -429,7 +429,7 @@ fn merge_target_entries_inner(
     merged
 }
 
-fn rotate_pitch_cell_180(cell_id: usize, columns: usize, rows: usize) -> usize {
+fn mirror_pitch_cell_y(cell_id: usize, columns: usize, rows: usize) -> usize {
     if columns == 0 || rows == 0 {
         return cell_id;
     }
@@ -439,18 +439,10 @@ fn rotate_pitch_cell_180(cell_id: usize, columns: usize, rows: usize) -> usize {
     }
     let x = cell_id % columns;
     let y = cell_id / columns;
-    (rows - 1 - y) * columns + (columns - 1 - x)
+    (rows - 1 - y) * columns + x
 }
 
-fn rotate_axis_index_180(index: usize, len: usize) -> usize {
-    if len == 0 || index >= len {
-        index
-    } else {
-        len - 1 - index
-    }
-}
-
-fn rotate_tactical_phase_180(phase: TacticalPhase) -> TacticalPhase {
+fn mirror_tactical_phase_y(phase: TacticalPhase) -> TacticalPhase {
     match phase {
         TacticalPhase::HomeBuildUp => TacticalPhase::AwayBuildUp,
         TacticalPhase::AwayBuildUp => TacticalPhase::HomeBuildUp,
@@ -460,68 +452,63 @@ fn rotate_tactical_phase_180(phase: TacticalPhase) -> TacticalPhase {
     }
 }
 
-fn rotate_facing_180(facing: FacingBucket) -> FacingBucket {
+fn mirror_facing_y(facing: FacingBucket) -> FacingBucket {
     match facing {
         FacingBucket::North => FacingBucket::South,
-        FacingBucket::NorthEast => FacingBucket::SouthWest,
-        FacingBucket::East => FacingBucket::West,
-        FacingBucket::SouthEast => FacingBucket::NorthWest,
+        FacingBucket::NorthEast => FacingBucket::SouthEast,
+        FacingBucket::SouthEast => FacingBucket::NorthEast,
         FacingBucket::South => FacingBucket::North,
-        FacingBucket::SouthWest => FacingBucket::NorthEast,
-        FacingBucket::West => FacingBucket::East,
-        FacingBucket::NorthWest => FacingBucket::SouthEast,
+        FacingBucket::SouthWest => FacingBucket::NorthWest,
+        FacingBucket::NorthWest => FacingBucket::SouthWest,
         other => other,
     }
 }
 
-fn rotate_target_state_180(mut state: SoccerQStateKey) -> SoccerQStateKey {
-    state.phase = rotate_tactical_phase_180(state.phase);
-    state.ball_zone_x = rotate_axis_index_180(state.ball_zone_x, LEAGUE_TARGET_TACTICAL_COLUMNS);
-    state.ball_zone_y = rotate_axis_index_180(state.ball_zone_y, LEAGUE_TARGET_TACTICAL_ROWS);
-    state.ball_fine_lane =
-        rotate_axis_index_180(state.ball_fine_lane as usize, LEAGUE_TARGET_FINE_COLUMNS) as u8;
+fn mirror_target_state_y(mut state: SoccerQStateKey) -> SoccerQStateKey {
+    state.phase = mirror_tactical_phase_y(state.phase);
+    state.ball_zone_y = mirror_pitch_cell_y(state.ball_zone_y, 1, LEAGUE_TARGET_TACTICAL_ROWS);
     state.ball_fine_row =
-        rotate_axis_index_180(state.ball_fine_row as usize, LEAGUE_TARGET_FINE_ROWS) as u8;
-    state.receive_facing = rotate_facing_180(state.receive_facing);
-    state.action_facing = rotate_facing_180(state.action_facing);
+        mirror_pitch_cell_y(state.ball_fine_row as usize, 1, LEAGUE_TARGET_FINE_ROWS) as u8;
+    state.receive_facing = mirror_facing_y(state.receive_facing);
+    state.action_facing = mirror_facing_y(state.action_facing);
     state
 }
 
-fn rotate_target_entry_180(entry: &SoccerQTargetEntry) -> SoccerQTargetEntry {
-    let mut rotated = entry.clone();
-    rotated.state = rotate_target_state_180(rotated.state);
-    rotated.target_fine_cell_id = rotate_pitch_cell_180(
-        rotated.target_fine_cell_id,
+fn mirror_target_entry_y(entry: &SoccerQTargetEntry) -> SoccerQTargetEntry {
+    let mut mirrored = entry.clone();
+    mirrored.state = mirror_target_state_y(mirrored.state);
+    mirrored.target_fine_cell_id = mirror_pitch_cell_y(
+        mirrored.target_fine_cell_id,
         LEAGUE_TARGET_FINE_COLUMNS,
         LEAGUE_TARGET_FINE_ROWS,
     );
-    rotated.target_tactical_cell_id = rotate_pitch_cell_180(
-        rotated.target_tactical_cell_id,
+    mirrored.target_tactical_cell_id = mirror_pitch_cell_y(
+        mirrored.target_tactical_cell_id,
         LEAGUE_TARGET_TACTICAL_COLUMNS,
         LEAGUE_TARGET_TACTICAL_ROWS,
     );
-    rotated.target_macro_cell_id = rotate_pitch_cell_180(
-        rotated.target_macro_cell_id,
+    mirrored.target_macro_cell_id = mirror_pitch_cell_y(
+        mirrored.target_macro_cell_id,
         LEAGUE_TARGET_MACRO_COLUMNS,
         LEAGUE_TARGET_MACRO_ROWS,
     );
-    rotated
+    mirrored
 }
 
-fn rotated_target_entries_180(entries: &[SoccerQTargetEntry]) -> Vec<SoccerQTargetEntry> {
-    entries.iter().map(rotate_target_entry_180).collect()
+fn mirrored_target_entries(entries: &[SoccerQTargetEntry]) -> Vec<SoccerQTargetEntry> {
+    entries.iter().map(mirror_target_entry_y).collect()
 }
 
 fn with_bidirectional_target_entries(brain: &TeamBrain) -> TeamBrain {
     let mut next = brain.clone();
-    let rotated_away_to_home = rotated_target_entries_180(&brain.away_target_entries);
-    let rotated_home_to_away = rotated_target_entries_180(&brain.home_target_entries);
+    let mirrored_away_to_home = mirrored_target_entries(&brain.away_target_entries);
+    let mirrored_home_to_away = mirrored_target_entries(&brain.home_target_entries);
     next.home_target_entries = merge_target_entries_idempotent(
-        [brain.home_target_entries.clone(), rotated_away_to_home],
+        [brain.home_target_entries.clone(), mirrored_away_to_home],
         0,
     );
     next.away_target_entries = merge_target_entries_idempotent(
-        [brain.away_target_entries.clone(), rotated_home_to_away],
+        [brain.away_target_entries.clone(), mirrored_home_to_away],
         0,
     );
     next
@@ -1492,41 +1479,41 @@ mod tests {
     }
 
     #[test]
-    fn target_entry_rotation_flips_pitch_axes_and_home_away_phases() {
+    fn target_entry_mirror_flips_pitch_rows_and_home_away_phases() {
         assert_eq!(
-            rotate_tactical_phase_180(TacticalPhase::HomeAttack),
+            mirror_tactical_phase_y(TacticalPhase::HomeAttack),
             TacticalPhase::AwayAttack
         );
         assert_eq!(
-            rotate_tactical_phase_180(TacticalPhase::AwayBuildUp),
+            mirror_tactical_phase_y(TacticalPhase::AwayBuildUp),
             TacticalPhase::HomeBuildUp
         );
         assert_eq!(
-            rotate_facing_180(FacingBucket::NorthEast),
-            FacingBucket::SouthWest
+            mirror_facing_y(FacingBucket::NorthEast),
+            FacingBucket::SouthEast
         );
         assert_eq!(
-            rotate_facing_180(FacingBucket::SouthWest),
-            FacingBucket::NorthEast
+            mirror_facing_y(FacingBucket::SouthWest),
+            FacingBucket::NorthWest
         );
         assert_eq!(
-            rotate_pitch_cell_180(
+            mirror_pitch_cell_y(
                 20 * LEAGUE_TARGET_FINE_COLUMNS + 4,
                 LEAGUE_TARGET_FINE_COLUMNS,
                 LEAGUE_TARGET_FINE_ROWS,
             ),
-            3 * LEAGUE_TARGET_FINE_COLUMNS + 7
+            3 * LEAGUE_TARGET_FINE_COLUMNS + 4
         );
         assert_eq!(
-            rotate_pitch_cell_180(
+            mirror_pitch_cell_y(
                 6 * LEAGUE_TARGET_TACTICAL_COLUMNS + 2,
                 LEAGUE_TARGET_TACTICAL_COLUMNS,
                 LEAGUE_TARGET_TACTICAL_ROWS,
             ),
-            LEAGUE_TARGET_TACTICAL_COLUMNS + 3
+            LEAGUE_TARGET_TACTICAL_COLUMNS + 2
         );
         assert_eq!(
-            rotate_pitch_cell_180(
+            mirror_pitch_cell_y(
                 3 * LEAGUE_TARGET_MACRO_COLUMNS + 1,
                 LEAGUE_TARGET_MACRO_COLUMNS,
                 LEAGUE_TARGET_MACRO_ROWS,
@@ -1534,14 +1521,12 @@ mod tests {
             1
         );
 
-        let rotated = rotate_target_state_180(mirror_test_state());
-        assert_eq!(rotated.phase, TacticalPhase::AwayAttack);
-        assert_eq!(rotated.ball_zone_x, 3);
-        assert_eq!(rotated.ball_zone_y, 1);
-        assert_eq!(rotated.ball_fine_lane, 6);
-        assert_eq!(rotated.ball_fine_row, 3);
-        assert_eq!(rotated.receive_facing, FacingBucket::SouthWest);
-        assert_eq!(rotated.action_facing, FacingBucket::NorthEast);
+        let mirrored = mirror_target_state_y(mirror_test_state());
+        assert_eq!(mirrored.phase, TacticalPhase::AwayAttack);
+        assert_eq!(mirrored.ball_zone_y, 1);
+        assert_eq!(mirrored.ball_fine_row, 3);
+        assert_eq!(mirrored.receive_facing, FacingBucket::SouthEast);
+        assert_eq!(mirrored.action_facing, FacingBucket::NorthWest);
     }
 
     #[test]

@@ -63,7 +63,7 @@ to present chances.
   next step (`learnability-conversion-roadmap.md:57`).
 - Shot-quality ingredients exist (`shot_on_frame_probability`, `shot_beat_goalkeeper_probability`,
   `shot_block_probability`, `shot_quality`, `soccer.rs:7589`) but **no calibrated xG estimator**.
-- The interface is **113 actor labels, not 73** (`SOCCER_POLICY_ACTIONS`): first 73 are base families
+- The interface is **113 actor labels, not 73** (`soccer.rs:41785`): first 73 are base families
   through `support-push-up`; **73–112 are kick-power buckets**. A "fixed-interface" falsifier
   **must mask to the first 73**.
 - Support/run heads are installed **match-wide, not per-team** (`world.rs:9263`, `world.rs:54905`,

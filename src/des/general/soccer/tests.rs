@@ -42456,12 +42456,10 @@ fn learning_context_splits_mdp_pomdp_idea_from_mpc_execution() {
 
 #[test]
 fn action_param_feature_block_occupies_the_tail() {
-    // The 11 action-param slots are contiguous and sit at the very tail, immediately after
+    // The 7 action-param slots are contiguous and sit at the very tail, immediately after
     // the previous FEATURE_DIM, so pre-block nets zero-pad exactly these positions and the
-    // gate-off path (which never writes them) is byte-identical to the prior layout. The
-    // first 7 are the attack-relative aim geometry; the last 4 are the action identity/power
-    // (speed + pass/shoot/dribble one-hot).
-    assert_eq!(SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM, 11);
+    // gate-off path (which never writes them) is byte-identical to the prior layout.
+    assert_eq!(SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM, 7);
     let slots = [
         SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DX,
         SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DY,
@@ -42470,16 +42468,12 @@ fn action_param_feature_block_occupies_the_tail() {
         SOCCER_NEURAL_FEATURE_ACTION_PARAM_DIR_SIN,
         SOCCER_NEURAL_FEATURE_ACTION_PARAM_DIR_COS,
         SOCCER_NEURAL_FEATURE_ACTION_PARAM_HAS_TARGET,
-        SOCCER_NEURAL_FEATURE_ACTION_PARAM_ACTION_SPEED,
-        SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_PASS,
-        SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_SHOOT,
-        SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_DRIBBLE,
     ];
     for (i, slot) in slots.iter().enumerate() {
         assert_eq!(*slot, SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM + i);
     }
     assert_eq!(
-        SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_DRIBBLE,
+        SOCCER_NEURAL_FEATURE_ACTION_PARAM_HAS_TARGET,
         SOCCER_NEURAL_FEATURE_DIM - 1
     );
 }

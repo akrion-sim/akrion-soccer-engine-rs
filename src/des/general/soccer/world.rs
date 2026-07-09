@@ -199,6 +199,61 @@ fn neural_mcts_pass_target_candidate_limit() -> usize {
     })
 }
 
+/// Forward-release root-candidate injection (Codex fork verdict). Default OFF ⇒ byte-identical.
+/// When a *qualified* forward pass option is visible, the best forward receiver is injected into
+/// the neural-scored root even if the analytic top-3 pass-target cap (Cap B) would drop it — so the
+/// critic (with the action-param aim features) can actually SEE and learn to select it. This targets
+/// the empirically-confirmed SELECTION bottleneck (exposure widening alone moved forward-share 0.00).
+fn dd_soccer_enable_forward_release_root_candidate() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_FORWARD_RELEASE_ROOT_CANDIDATE"))
+}
+
+/// Minimum quick-forward-pass open value for the injected forward candidate to qualify (Codex: 0.50).
+fn forward_release_min_quality() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_FORWARD_RELEASE_MIN_QUALITY")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.50)
+            .clamp(0.0, 1.0)
+    })
+}
+
+/// Minimum expected pass completion for the injected forward candidate to qualify (Codex: 0.45).
+fn forward_release_min_completion() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_FORWARD_RELEASE_MIN_COMPLETION")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.45)
+            .clamp(0.0, 1.0)
+    })
+}
+
+/// Bounded, centered selection bias added to the injected forward candidate only (Codex: "must be
+/// considered, not taken"). A small positive nudge to surface it into the root; the critic value
+/// score can still outrank it — no forced argmax. Clamped to the shared centered-bonus clip.
+fn forward_release_bias() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_FORWARD_RELEASE_BIAS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.10)
+            .clamp(0.0, SOCCER_CENTERED_POLICY_BONUS_CLIP)
+    })
+}
+
 fn neural_mcts_kick_power_candidate_limit() -> usize {
     use std::sync::OnceLock;
     static V: OnceLock<usize> = OnceLock::new();
