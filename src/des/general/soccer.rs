@@ -23950,6 +23950,87 @@ fn quick_release_forward_pass_reward(
     QUICK_RELEASE_FORWARD_PASS_BONUS_POINTS * speed_fraction * (0.5 + 0.5 * forward_fraction)
 }
 
+/// Opportunity-conditioned "quick forward release" carrot (knob
+/// `DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE`; see [`quick_forward_release_reward_scale`]).
+/// Paid ONCE, at the moment a COMPLETED FORWARD PASS is credited, to reward the actor for CHOOSING
+/// to release a quick forward ball when a real forward opportunity existed — the fix for the policy
+/// under-selecting an available good forward pass. The shape is
+///
+/// ```text
+/// bonus = min(6.0, 4.0 * scale * timing_fit * gain_fit * opportunity_fit * completion_fit)
+/// ```
+///
+/// where every `*_fit` is in `[0, 1]`, `0` at its gate and rising to `1` as the signal strengthens.
+/// The bonus is `0` unless ALL gates hold, so it can never subsidize safe recycling:
+///  1. the pass actually COMPLETED to a teammate and was pass-like (NOT hold/dribble/shot) — this is
+///     guaranteed structurally by the call site (only reached when a pass-like action's ball is now
+///     held by a *different teammate*), so a loose ball / interception / immediate opponent control
+///     never reaches here;
+///  2. the real completed forward gain is ≥ [`QUICK_FORWARD_RELEASE_MIN_FORWARD_YARDS`] (a backward
+///     or lateral ball has `completed_forward_yards <= 0` and pays zero);
+///  3. the BEFORE state had a real forward opportunity: `visible_forward_pass_options > 0` AND
+///     `max(quick_forward_pass_value, best_forward_pass_option_quality) >=`
+///     [`QUICK_FORWARD_RELEASE_OPPORTUNITY_GATE`];
+///  4. expected completion was sane: `>=` [`QUICK_FORWARD_RELEASE_COMPLETION_GATE`].
+///
+/// `hold_seconds` is how long the passer had possessed the ball (drives the quick-release timing fit,
+/// reusing the existing 1.2s decay). Pure / RNG-free; default `scale = 0` ⇒ identically `0`. Per-agent
+/// ⇒ also shared via the MARL/MAPPO team component, like the other completed-pass shaping terms.
+#[allow(clippy::too_many_arguments)]
+fn quick_forward_release_bonus(
+    scale: f64,
+    completed_forward_yards: f64,
+    hold_seconds: f64,
+    visible_forward_pass_options: usize,
+    quick_forward_pass_value: f64,
+    best_forward_pass_option_quality: f64,
+    expected_pass_completion: f64,
+) -> f64 {
+    if !(scale > 0.0)
+        || !completed_forward_yards.is_finite()
+        || !hold_seconds.is_finite()
+        || hold_seconds < 0.0
+    {
+        return 0.0;
+    }
+    // Gate 2: real completed forward gain.
+    if completed_forward_yards < QUICK_FORWARD_RELEASE_MIN_FORWARD_YARDS {
+        return 0.0;
+    }
+    // Gate 3: the BEFORE state must have shown a genuine forward opportunity.
+    let opportunity = quick_forward_pass_value
+        .max(best_forward_pass_option_quality)
+        .clamp(0.0, 1.0);
+    if visible_forward_pass_options == 0 || opportunity < QUICK_FORWARD_RELEASE_OPPORTUNITY_GATE {
+        return 0.0;
+    }
+    // Gate 4: expected completion probability must be sane.
+    let completion = expected_pass_completion.clamp(0.0, 1.0);
+    if completion < QUICK_FORWARD_RELEASE_COMPLETION_GATE {
+        return 0.0;
+    }
+    // Component fits, each 0 at its gate and rising to 1 as the signal strengthens.
+    // Timing reuses the existing quick-release decay (largest for an instant/first-touch release,
+    // 0 by QUICK_RELEASE_MAX_HOLD_SECONDS).
+    let timing_fit = (1.0 - hold_seconds / QUICK_RELEASE_MAX_HOLD_SECONDS).clamp(0.0, 1.0);
+    let gain_fit = ((completed_forward_yards - QUICK_FORWARD_RELEASE_MIN_FORWARD_YARDS)
+        / (QUICK_RELEASE_FORWARD_REFERENCE_YARDS - QUICK_FORWARD_RELEASE_MIN_FORWARD_YARDS))
+        .clamp(0.0, 1.0);
+    let opportunity_fit = ((opportunity - QUICK_FORWARD_RELEASE_OPPORTUNITY_GATE)
+        / (1.0 - QUICK_FORWARD_RELEASE_OPPORTUNITY_GATE))
+        .clamp(0.0, 1.0);
+    let completion_fit = ((completion - QUICK_FORWARD_RELEASE_COMPLETION_GATE)
+        / (1.0 - QUICK_FORWARD_RELEASE_COMPLETION_GATE))
+        .clamp(0.0, 1.0);
+    (QUICK_FORWARD_RELEASE_BONUS_BASE_POINTS
+        * scale
+        * timing_fit
+        * gain_fit
+        * opportunity_fit
+        * completion_fit)
+        .min(QUICK_FORWARD_RELEASE_MAX_BONUS_POINTS)
+}
+
 fn intercepted_pass_passer_penalty(pass: &PendingPass, field_length: f64) -> f64 {
     let direction = pass_direction_bucket(pass.team, pass.origin, pass.intended_target);
     let own_half = pass_origin_in_own_half(pass.team, pass.origin, field_length);
