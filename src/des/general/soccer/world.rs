@@ -33569,6 +33569,50 @@ impl SoccerMatch {
         }
     }
 
+    /// Emit the pending learned-MPC DRIBBLE aim-residual RWR sample (the dribble analogue of the
+    /// MPC block in [`Self::record_pass_outcome_sample`] / [`Self::record_shot_objective_sample`])
+    /// and CLEAR the transient carry-slot. Pushed into the SAME `mpc_objective_samples` buffer the
+    /// pass/shot paths use — the shared head's DRIBBLE-family rows are separated by the family
+    /// one-hot baked into `features`, so the learner needs no dribble-specific plumbing.
+    ///
+    /// No-op unless the dribble gate is on AND the carry-slot belongs to `attacker_id` (the carrier
+    /// whose dribble is resolving). The holder guard is what stops a stale residual from a prior
+    /// carrier being credited to this outcome; the slot is CONSUMED (taken) so it cannot be
+    /// double-emitted. When the gate is off the slot is always `None`, so this is fully
+    /// behaviour-neutral (byte-identical-off).
+    ///
+    /// Reward mapping (magnitudes mirror the pass/shot paths — success ≈ +0.6..+1.0, failure −1.0):
+    /// the beat/advance caller passes a positive reward normalised from `kind.beat_reward_points()`
+    /// (see [`Self::record_dribble_beat_event`]); the turnover caller passes −1.0. RWR
+    /// ([`SoccerMpcObjectiveHead::train_rwr`]) trains only on positive advantage, so the beat sample
+    /// reinforces its residual while the turnover sample is recorded (corpus parity) but skipped.
+    fn emit_dribble_mpc_objective_sample(&mut self, attacker_id: usize, reward: f64) {
+        if !dd_soccer_enable_learned_mpc_dribble_objective() {
+            return;
+        }
+        let holder_matches = matches!(
+            self.dribble_mpc_objective.as_ref(),
+            Some((holder, ..)) if *holder == attacker_id
+        );
+        if !holder_matches {
+            return;
+        }
+        if let Some((_, features, residual, bend)) = self.dribble_mpc_objective.take() {
+            if features.len() == MPC_OBJECTIVE_FEATURE_DIM {
+                self.mpc_objective_samples.push(MpcObjectiveSample {
+                    features,
+                    applied_residual: residual,
+                    applied_bend: bend,
+                    reward,
+                });
+                if self.mpc_objective_samples.len() > MPC_OBJECTIVE_SAMPLE_CAP {
+                    let overflow = self.mpc_objective_samples.len() - MPC_OBJECTIVE_SAMPLE_CAP;
+                    self.mpc_objective_samples.drain(0..overflow);
+                }
+            }
+        }
+    }
+
     /// Drain the accumulated pass-outcome samples (the cluster learner persists them to Postgres
     /// and trains [`SoccerPassCompletionHead`] on the pooled corpus).
     pub fn drain_pass_outcome_samples(&mut self) -> Vec<SoccerPassOutcomeSample> {
