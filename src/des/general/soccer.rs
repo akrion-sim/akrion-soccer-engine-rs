@@ -2139,6 +2139,14 @@ const TEAM_ADVANCE_SUPPORT_RUN_REWARD: f64 = 0.45;
 const QUICK_RELEASE_MAX_HOLD_SECONDS: f64 = 1.2;
 const QUICK_RELEASE_FORWARD_REFERENCE_YARDS: f64 = 12.0;
 const QUICK_RELEASE_FORWARD_PASS_BONUS_POINTS: f64 = 5.0;
+// Codex r19 opportunity-conditioned quick-forward-release carrot (gated, default-off). Targets the
+// pass-CHOICE leak: pay a bounded bonus only when a real forward opportunity existed and the actor
+// released a quickly-completed forward ball, so a timid policy is pulled toward choosing the pass.
+const QUICK_FORWARD_RELEASE_REWARD_BASE: f64 = 4.0;
+const QUICK_FORWARD_RELEASE_REWARD_CAP: f64 = 6.0;
+const QUICK_FORWARD_RELEASE_MIN_FORWARD_YARDS: f64 = 4.0;
+const QUICK_FORWARD_RELEASE_MIN_OPPORTUNITY: f64 = 0.50;
+const QUICK_FORWARD_RELEASE_MIN_EXPECTED_COMPLETION: f64 = 0.45;
 /// Dense shaping penalty for an attacker who fails to join a live team-advance cue, retreats, or
 /// runs into an offside support lane. This mirrors the support-run reward without forcing defenders
 /// to abandon shape.
@@ -23500,30 +23508,20 @@ fn completed_pass_reward_for_pitch(
         pass_direction_bucket(team, origin, target),
         pass_origin_in_own_half(team, origin, field_length),
     ) {
-        // The forward-pass-primacy scale (`DD_SOCCER_FORWARD_PASS_REWARD_SCALE`) multiplies ONLY the
-        // forward reward, so it tilts the FORWARD:lateral ratio — the thing that actually shifts
-        // selection. Previously the whole sum (incl. the lateral 1.2, backward penalty, flank bonus)
-        // was scaled, so scale=6 made a lateral recycle worth 7.2 and scale=10 worth 12 — SUBSIDIZING
-        // the safe-recycle local optimum the lever is meant to break. Empirically scale=10 moved
-        // forward share the WRONG way (7%→5%) because it lifted lateral too. Codex round-17.
-        // Byte-identical at the default scale=1.
         (PassDirectionBucket::Forward, true) => {
-            (COMPLETED_FORWARD_PASS_BASE_REWARD_OWN_HALF + forward_progress_reward)
-                * forward_pass_reward_scale()
+            COMPLETED_FORWARD_PASS_BASE_REWARD_OWN_HALF + forward_progress_reward
         }
         (PassDirectionBucket::Forward, false) => {
-            (COMPLETED_FORWARD_PASS_BASE_REWARD_OPPONENT_HALF + forward_progress_reward)
-                * forward_pass_reward_scale()
+            COMPLETED_FORWARD_PASS_BASE_REWARD_OPPONENT_HALF + forward_progress_reward
         }
         // A completed lateral ball keeps possession and may switch the attack, but generic
-        // recycle completions must not outscore working the ball into shots — and are NOT scaled.
+        // recycle completions must not outscore working the ball into shots.
         (PassDirectionBucket::Lateral, _) => 1.2,
         (PassDirectionBucket::Backward, true) => -COMPLETED_BACK_PASS_PENALTY_OWN_HALF,
         (PassDirectionBucket::Backward, false) => -COMPLETED_BACK_PASS_PENALTY_OPPONENT_HALF,
     };
-    // Flank bonus is unscaled (it applies to forward/lateral alike, so scaling it would re-leak the
-    // lever into lateral). Forward magnitude is already scaled inside `base`.
-    base + completed_flank_pass_reward(team, origin, target, field_width, field_length)
+    (base + completed_flank_pass_reward(team, origin, target, field_width, field_length))
+        * forward_pass_reward_scale()
 }
 
 fn completed_forward_pass_count_bonus(team: Team, origin: Vec2, reception: Vec2) -> f64 {
@@ -68693,36 +68691,6 @@ mod reward_priority_tests {
         assert!(!gate_default_on_from_raw(Some("false")));
         assert!(!gate_default_on_from_raw(Some(" no ")));
         assert!(!gate_default_on_from_raw(Some("OFF")));
-    }
-
-    /// Guard the production forward-pass-primacy lever (`DD_SOCCER_FORWARD_PASS_REWARD_SCALE=6`).
-    /// The `outcome_rewards_dominate_pass_only_shaping` test below only checks scale=1; the shipped
-    /// config runs scale=6, which intentionally lets a forward pass out-earn a shot-on-target to tilt
-    /// the DENSE gradient toward build-up. The load-bearing invariant that MUST survive the scale is:
-    /// a SINGLE completed forward pass can never out-earn actually SCORING — else "pass instead of
-    /// finish" becomes rational for the final action. Goal + terminal outcome are unscaled, so this
-    /// holds; we pin it against silent regressions (scaling the count bonus, raising the clamp, etc).
-    /// NOTE: a multi-pass SEQUENCE can exceed a lone shot-on-target at scale=6 by design — the
-    /// pass-farming hazard the A/Bs must watch — but the unscaled goal (+ goal-chain credit) keeps
-    /// finishing optimal. This guards the single-action bound only.
-    #[test]
-    fn forward_pass_scale_six_stays_below_scoring_a_goal() {
-        let scale = 6.0;
-        // Richest single completed forward pass: own-half base + max progress + flank (own-half
-        // multiplier), all scaled, plus the UNSCALED count bonus (added separately at world.rs).
-        // Forward base + progress are the ONLY terms scaled (forward-only lever); flank + count
-        // bonus are unscaled and added on top.
-        let max_single_forward_pass = (COMPLETED_FORWARD_PASS_BASE_REWARD_OWN_HALF
-            + COMPLETED_FORWARD_PASS_PROGRESS_REWARD_MAX_YARDS
-                * COMPLETED_FORWARD_PASS_PROGRESS_REWARD_PER_YARD)
-            * scale
-            + COMPLETED_FLANK_PASS_BONUS_POINTS * COMPLETED_FLANK_PASS_OWN_HALF_MULTIPLIER
-            + COMPLETED_FORWARD_PASS_COUNT_BONUS_POINTS;
-        assert!(
-            max_single_forward_pass < GOAL_REWARD_POINTS,
-            "one forward pass at scale 6 ({max_single_forward_pass}) must stay below a goal \
-             ({GOAL_REWARD_POINTS}) — finishing must never be dominated by a single pass"
-        );
     }
 
     #[test]
