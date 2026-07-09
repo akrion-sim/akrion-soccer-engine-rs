@@ -1,9 +1,12 @@
-# Pass-space is INERT AT SOURCE — recovered A/B finding (2026-07-08 pm, recovery-A/B track)
+# Pass-space is INERT — `target_point` dropped at execution (2026-07-08 pm, recovery-A/B track)
 
 Companion to [how-to-climb-codex-conversation.md](how-to-climb-codex-conversation.md). This is the
-recovered pass-space verdict (the r13 "lost verdict"). It **directly tests the r16 pass-space
-preflight** ("validate by `target_point` differing from receiver feet, not a new label") and the
-answer is: **the preflight fails today — the distinct candidate is essentially never created.**
+recovered pass-space verdict (the r13 "lost verdict"). The A/B proves the `DD_SOCCER_ENABLE_NEURAL_
+PASS_SPACE` gate is a **no-op**; Codex then located the cause (repo-grounded): the distinct space
+candidate **is** created and scored (99.5% distinct >1yd), but its `target_point` is **dropped when
+the plan is lowered to `SoccerAction::Pass`** (no `target_point` field), so it never becomes a
+different pass. Fix = make `target_point` survive execution. (My initial "never created at source"
+read was wrong — corrected inline below.)
 
 ## The experiment
 
@@ -25,20 +28,35 @@ exits nonzero on REJECT and a pipefail'd grep swallowed it).
 - **NOT a selection/execution severance.** The winning MCTS node carries its plan
   (`world.rs:~14438`, `plan: candidate.plan.clone()`), so a chosen space `target_point` *would* reach
   execution. My first hypothesis (label collapse) is falsified.
-- For 120 games to be byte-identical — adding even one scored candidate perturbs PUCT priors/
-  normalization and cascades over ~162k ticks — the pass-space candidate must be **never created**.
-- Its only creation guard is `world.rs:14028-14041`: needs `anticipated_pass_reception_point(...)` =
-  `Some` **and** `space_point.distance(receiver_feet) > 1.0`. That precondition appears to essentially
-  never fire ⇒ the second (space) candidate is never pushed ⇒ **gate inert at SOURCE, not sink.**
+- My **first** guess (candidate never created at source) was **REFUTED by Codex in-repo** — see the
+  correction box below. The byte-identical *data* stands; the *mechanism* is at execution, not source.
 
-## Consequence for the locked r16 run order
+### CORRECTION (Codex, repo-grounded 2026-07-08 22:5x) — the null is at EXECUTION, not source
 
-The **spatial-falsification arm risks being null-by-construction**: training WITH a gate that never
-emits a distinct candidate tests nothing. Make the r16 preflight a **hard gate before that run**:
-instrument `anticipated_pass_reception_point` / the guard at `world.rs:14034` and prove it emits a
-`>1.0`-yd-from-feet point at a **nonzero rate** in real play. If it doesn't, the minimal fix is in the
-**reception-point estimator** (why is the anticipated lead point collapsing onto the receiver's
-feet?), not in the MCTS or the reward. Only after the candidate is provably distinct does a
+- The source **works**: the estimator (`world.rs:61773`) returns a real led point (forward/wide/
+  velocity lead, capped by run distance), and train-path diagnostics already recorded **8000
+  expansions, `Some` 100%, distinct `>1yd` 99.5%** (how-to-climb-codex-conversation.md:582). So the
+  distinct space candidate **is** created and scored. My "never created / estimator collapses to feet"
+  read was wrong.
+- The candidate dies at **lowering/execution**: `PlayerAgent::action_from_learned_plan`
+  (`player.rs:~13306`) lowers a pass plan to `SoccerAction::Pass { target_player, power, flight }` —
+  **the action enum carries no `target_point`**. The plan's `target_point` is used only as a fallback
+  to pick the nearest visible teammate, then **dropped**; the launch path (`world.rs:~25620`) sees
+  only `target_player/power/flight`. So a feet candidate and a same-receiver *lead* candidate execute
+  **identically** even though the winning MCTS node carried `plan.target_point`. That is the exact
+  cause of the byte-identical 120-game result.
+
+## Consequence + the fix (agreed with Codex)
+
+The **spatial-falsification arm is null-by-construction until `target_point` survives execution.**
+Minimal fix (Codex owns it on the canonical tree): make the selected `plan.target_point` survive
+lowering into the actual pass **aim point** (extend/route through `SoccerAction::Pass`), then a
+**hard preflight** asserting nonzero distinct rate not just at the source guard (`world.rs:~14229` in
+Codex's tree) but **after scoring AND at executed launch**. The *truer* strategic fix for "POMDP owns
+open-space target" is the receiverless path behind `DD_SOCCER_ENABLE_LEARNED_PASS_RECEIVER`
+(`soccer.rs:12289`, space selection `world.rs:16354`) — the current gate still binds
+`target_player: Some`, so it is not real open-space ownership. Only after the executed distinct rate
+is provably `>0` does a
 pass-space train/eval carry information.
 
 ## Second flag — MCTS selection noise (operator concern, open for Codex r14)
