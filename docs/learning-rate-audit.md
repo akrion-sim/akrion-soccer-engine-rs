@@ -19,7 +19,7 @@ surfaces learn). This doc is about *how fast and how safely* the nets move.
 | `SOCCER_POLICY_GAE_LAMBDA` | 0.95 | advantage trace decay |
 | `SOCCER_POLICY_ENTROPY_COEFF` | 0.01 | anti-collapse entropy bonus |
 | `DEFAULT_SOCCER_MAPPO_CLIP_EPSILON` | 0.20 | PPO/MAPPO ratio clip |
-| `SOCCER_FULL_GAME_RETURN_{DISCOUNT,BLEND,CLIP}` | 0.995/tick, 0.35, 250.0 | full-game return recursion |
+| `SOCCER_FULL_GAME_RETURN_{DISCOUNT,BLEND,CLIP}` | 0.98/tick, 0.35, 400.0 | full-game return recursion (discount 0.98 per the Jul-2026 credit-assignment fix, soccer.rs:5590; clip 400.0, soccer.rs:5592) |
 | advantage standardization | gated, default OFF | zero-mean/unit-variance over the policy batch ([world.rs](../src/des/general/soccer/world.rs)) |
 
 **Already-solid guards (no change needed):** LR clamped ≤ 0.25; three grad-norm
