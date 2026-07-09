@@ -16137,16 +16137,26 @@ impl SoccerMatch {
                     + retrieved_bonus
                     + model_bonus
                     + mpc_candidate_bonus;
-                // Learned FORWARD action-selection bias: add `weight * forward_option_quality` only
-                // when this candidate is a pass-like action whose target is geometrically FORWARD
-                // (NOT gated on the label — lateral/backward passes share the "pass" label).
-                // Applied as a CONDITIONAL add (not an always-added 0.0 term) so the gate-off /
-                // non-eligible path leaves `score` bit-for-bit unchanged — the candidate sort below
-                // uses `total_cmp`, which distinguishes -0.0 from +0.0.
-                let score = if forward_select_weight != 0.0
-                    && soccer_transition_forward_pass_selection_eligible(&transition)
-                {
-                    score + forward_select_weight * forward_select_feature
+                // Learned FORWARD action-selection bias. Eligibility: the bias is armed
+                // (`forward_select_weight != 0.0`, which folds in gate-off / no-policy-head), the
+                // candidate is pass-like (`pass_like_action_flight`), AND the candidate PLAN's target
+                // is geometrically FORWARD (`candidate_plan.target_point` vs the carrier, past the
+                // forward-yards deadband) — NOT gated on the label, since lateral/backward passes
+                // share the "pass"/"pass-kpN" label. The applied bonus is
+                // `weight * forward_option_quality` CLAMPED to ±SOCCER_FORWARD_SELECT_BONUS_ABS_MAX so
+                // a large learned weight nudges — rather than swamps — the sort. Added conditionally
+                // (never an always-added 0.0 term) so the gate-off / non-eligible path leaves `score`
+                // bit-for-bit unchanged — the sort below uses `total_cmp`, which separates -0.0/+0.0.
+                let forward_select_eligible = forward_select_weight != 0.0
+                    && pass_like_action_flight(&candidate_plan.action).is_some()
+                    && soccer_plan_target_forward_yards(&candidate_plan, snapshot, player_id, team)
+                        .is_some_and(|yards| yards > SOCCER_FORWARD_SELECT_MIN_FORWARD_YARDS);
+                let score = if forward_select_eligible {
+                    let bonus = (forward_select_weight * forward_select_feature).clamp(
+                        -SOCCER_FORWARD_SELECT_BONUS_ABS_MAX,
+                        SOCCER_FORWARD_SELECT_BONUS_ABS_MAX,
+                    );
+                    score + bonus
                 } else {
                     score
                 };
