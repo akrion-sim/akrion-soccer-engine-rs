@@ -38548,6 +38548,7 @@ fn skill_policy_heads_train_and_score_their_group() {
         old_action_probability: None,
         sample_weight: 1.0,
         mcts_distillation: false,
+        forward_select_eligible: false,
     };
     let samples = vec![
         sample("pass", 1.0),
