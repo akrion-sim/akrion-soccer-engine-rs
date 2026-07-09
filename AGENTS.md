@@ -225,37 +225,3 @@ Never run destructive or irreversible shell commands. To remove or move files,
 
 If a genuinely destructive action seems unavoidable, **STOP and ask the operator
 first** — do not improvise around this rule.
-=======
-The tunnel process dies if the bash tool kills its parent session; restart it each time
-you need it. To keep it alive across tool invocations, use `setsid` (not on macOS) or a
-persistent tmux/screen.
-3. Use kubectl with the tunnel:
-```
-kubectl --context dd-ec2-runtime --server https://localhost:16443 --insecure-skip-tls-verify get pods -A
-```
-4. The `dd-soccer-commit-watcher` deployment auto-redeploys the learner and launches
-   push-tournament jobs on new commits. If push tournaments are skipped with
-   `tournament_lock_noncanonical`, the commit-watcher needs
-   `SOCCER_TOURNAMENT_ALLOW_NONCANONICAL_LOCK=true` in its env.extend block (see
-   `launch_tournament()` function in its args). `aws ssm send-command` does NOT work
-   (no AWS-RunShellCommand doc on this acct).
-
-### RDS Postgres (soccer-learning-pg)
-
-Both clusters connect to the same RDS Postgres instance via `SOCCER_DATABASE_URL`
-(from k8s secret `dd-remote-rest-api-secrets.RDS_DATABASE_URL`). TLS is enabled but
-certificate verification is disabled (`SOCCER_PG_TLS_INSECURE=1`).
-
-Direct Postgres access from laptop: use the SSM tunnel (port 5432 → RDS):
-```
-nohup aws ssm start-session --target i-0cc2461a55d491af6 \
-  --document-name AWS-StartPortForwardingSession \
-  --parameters '{"portNumber":["5432"],"localPortNumber":["15432"]}' \
-  > /tmp/ssm_pg.log 2>&1 &
-psql "postgresql://$(kubectl get secret dd-remote-rest-api-secrets -o jsonpath='{.data.RDS_DATABASE_URL}' | base64 -d | sed 's/localhost/localhost:15432/')"
-```
-
-Key RDS tables:
-- `des_soccer_learning_runs` — per-game telemetry (payoff, policy-gen, eval vs analytic)
-- `soccer_policy_generations` — saved policy-net generations (what :5055 reads)
->>>>>>> feature/action-param-features-and-capacity
