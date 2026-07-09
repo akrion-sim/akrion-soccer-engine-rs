@@ -21,7 +21,7 @@ problem it is actually good at, rather than one big network:
 | **MPC** | one player | acceleration/velocity to reach the slot, bending around bodies | short receding horizon | no (model) | `WorldSnapshot::mpc_desired_velocity` (`PlanarPointMassMpc`) |
 | **MDP / POMDP** | one player | the action: pass / shoot / dribble / move / tackle | this decision | yes (Q + shaping) | `possession_action_options`, deferred reward transitions |
 | **Neural nets** | one player | scores/values for the options, plus aux predictions | per tick | yes (PPO / actor-critic) | `SoccerPolicyHead`, value critic, pass / line-depth heads, world model |
-| **Evolution / GA** | whole policy | which generation survives & promotes | across games / tournaments | yes (selection) | GA self-play (pop 16), `main_soccer_tournament_run`, promotion gate |
+| **Evolution / GA** | whole policy | which generation survives & promotes | across games / tournaments | yes (selection) | GA self-play (pop 6, max 16), `main_soccer_tournament_run`, promotion gate |
 | **Vectors / HNSW** | full field | nearest similar situations | n/a | embedding | config-similarity retrieval (22 + ball embedding) |
 
 > Rule of thumb: **LP/IPM decides the shape, MDP/POMDP (scored by neural nets)
