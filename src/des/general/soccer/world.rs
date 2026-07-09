@@ -24723,7 +24723,7 @@ impl SoccerMatch {
         }
     }
 
-    fn apply_dribble_intent(
+    pub(crate) fn apply_dribble_intent(
         &mut self,
         player_id: usize,
         target: Vec2,
