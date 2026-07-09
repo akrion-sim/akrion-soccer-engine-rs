@@ -21,8 +21,9 @@ distinguishing states.
 
 ## 2. Diagnosis: the value head collapsed to a near-constant, action-blind output
 
-Inspecting a trained net (`inputDim=610`, one hidden layer of 128 `tanh` units, linear scalar
-output) showed:
+Inspecting a trained net (`inputDim=610` — the pre-action-param subtotal
+`SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM`; the current `SOCCER_NEURAL_FEATURE_DIM` is 620, adding a
+10-dim action-param block — one hidden layer of 128 `tanh` units, linear scalar output) showed:
 
 | Measurement | Value | Meaning |
 |---|---|---|
