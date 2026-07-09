@@ -67,12 +67,19 @@ learning-quality problem, not a code defect. **No promotion code change is shipp
 
 ### 3b. Version-row / neural-blob retention (real bug — fixed)
 
-- The write+archive path inserts `metrics` (including `neuralNetwork`) for **every** version.
-- `full_entries_retained` only governs the tabular `policy_entries`, never the neural blob in
+- The write+archive path
+  ([`soccer_learning_pg.rs:1972`–`2166`](../src/des/soccer_learning_pg.rs#L1972)) inserts `metrics`
+  (including `neuralNetwork`) for **every** version, archived or not.
+- `full_entries_retained` (via `soccer_policy_version_retains_full_entries`,
+  [`soccer_learning_pg.rs:428`](../src/des/soccer_learning_pg.rs#L428)) only governs whether the
+  tabular `policy_entries` are written — it does **not** touch the neural blob in
   `policy_versions.metrics`.
-- The only pruning (`prune_superseded_branch_entries_batched`, env `SOCCER_PG_INLINE_POLICY_PRUNE`)
-  deletes from `policy_entries`, never from `policy_versions`. There is no `DELETE FROM
-  des_soccer_learning_policy_versions` anywhere, and nothing strips the archived blob.
+- The only pruning that exists (`prune_superseded_branch_entries_batched`,
+  [`soccer_learning_pg.rs:2176`](../src/des/soccer_learning_pg.rs#L2176); gated by
+  `SOCCER_PG_INLINE_POLICY_PRUNE`) deletes from `des_soccer_learning_policy_entries`, never from
+  `des_soccer_learning_policy_versions`. There is **no** `DELETE FROM
+  des_soccer_learning_policy_versions` anywhere in the tree, and no code path strips `neuralNetwork`
+  from an archived version's `metrics`.
 
 Net: archived candidates accumulate forever with full neural weights.
 
