@@ -26334,6 +26334,21 @@ fn soccer_transition_reward_with_tactics(
                         target,
                         before.ball_holder_possession_seconds,
                     );
+                    // Quick-forward-release carrot (default-OFF; byte-identical when scale=0). The
+                    // enclosing block already guarantees a pass-like action that COMPLETED to a
+                    // different teammate, so gates 1 (pass, not hold/dribble/shot) and completion-to-
+                    // teammate control are satisfied here. The remaining gates (real forward gain, a
+                    // genuine BEFORE-state forward opportunity, sane expected completion) are enforced
+                    // inside the bonus, which pays zero for any backward/lateral/low-opportunity ball.
+                    reward += quick_forward_release_bonus(
+                        quick_forward_release_reward_scale(),
+                        (target.y - origin.y) * player.team.attack_dir(),
+                        before.ball_holder_possession_seconds,
+                        decision.observation.visible_forward_pass_options,
+                        decision.observation.quick_forward_pass_value,
+                        decision.observation.best_forward_pass_option_quality,
+                        decision.observation.expected_pass_completion,
+                    );
                     reward += pass_and_move_forward_reward_from_parts(
                         player.team,
                         flight,
