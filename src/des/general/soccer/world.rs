@@ -14290,6 +14290,7 @@ impl SoccerMatch {
             if let Some(passer_pos) = snapshot.player_position(player_id) {
                 let dir = team.attack_dir();
                 let (mut fwd_pre, mut lat_pre, mut back_pre, mut fwd_post) = (0, 0, 0, 0);
+                let (mut fwd_open, mut fwd_marked) = (0, 0);
                 for (i, tp) in targets.iter().enumerate() {
                     if let Some(p) = snapshot.player_position(*tp) {
                         let forward = (p.y - passer_pos.y) * dir;
@@ -14298,6 +14299,20 @@ impl SoccerMatch {
                             if i < limit {
                                 fwd_post += 1;
                             }
+                            // Openness proxy: nearest opponent distance to the target's feet.
+                            // A marked forward target (defender within ~4yd) is a pass-to-feet trap;
+                            // an open one is a receivable progressive option. Codex round-20.
+                            let nearest_opp = snapshot
+                                .players
+                                .iter()
+                                .filter(|op| op.team != team)
+                                .filter_map(|op| snapshot.player_position(op.id))
+                                .fold(f64::INFINITY, |acc, opp| acc.min(p.distance(opp)));
+                            if nearest_opp >= 4.0 {
+                                fwd_open += 1;
+                            } else {
+                                fwd_marked += 1;
+                            }
                         } else if forward < -1.25 {
                             back_pre += 1;
                         } else {
@@ -14305,7 +14320,9 @@ impl SoccerMatch {
                         }
                     }
                 }
-                record_pass_candidate_diag(fwd_pre, lat_pre, back_pre, fwd_post);
+                record_pass_candidate_diag(
+                    fwd_pre, lat_pre, back_pre, fwd_post, fwd_open, fwd_marked,
+                );
             }
         }
         targets
