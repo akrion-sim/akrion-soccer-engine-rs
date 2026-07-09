@@ -169,7 +169,7 @@ the reference (clean 12-game Δ ≈ 0 at 128k), the net is genuinely deciding on
 **not** yet confidently beating the reference/analytic engine — the head-to-head is noisy at
 12 games and needs a bigger sample or a frozen eval pool to state the level precisely. Next
 levers to push past "competitive" toward "clearly better": **relational-attention over the
-entities** (biggest representational upgrade), **more capacity** (24 → 64/128 hidden units),
+entities** (biggest representational upgrade), **more capacity** (now at 128 hidden units; 256 next),
 keep exploiting the velocity/accel/jerk channels, and **embedding-space retrieval** for rare
 states — plus a **lower-variance eval** (frozen diverse pool, more games) so we stop chasing
 noisy single samples.
