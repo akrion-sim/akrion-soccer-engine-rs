@@ -78737,6 +78737,8 @@ fn keeper_save_is_agentic_and_updates_shot_stats() {
             team: Team::Home,
             shooter: 9,
             origin: Vec2::new(40.0, 80.0),
+            intended_target: Vec2::zero(),
+            mpc_objective: None,
         });
 
         for _ in 0..10 {
