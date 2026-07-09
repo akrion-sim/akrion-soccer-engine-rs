@@ -141,6 +141,7 @@ fn policy_head_trains_skill_specialists_independently() {
             old_action_probability: None,
             sample_weight: 1.0,
             mcts_distillation: false,
+            forward_select_eligible: false,
         }
     };
     let specialist_steps = |head: &SoccerPolicyHead, kind: SoccerPolicySpecialistKind| {
@@ -246,6 +247,7 @@ fn policy_head_snapshot_round_trips_role_heads_and_specialists() {
             old_action_probability: None,
             sample_weight: 1.0,
             mcts_distillation: false,
+            forward_select_eligible: false,
         }
     };
 
@@ -315,6 +317,68 @@ fn keeper_policy_actions_are_distinct_from_outfield_actions() {
 }
 
 #[test]
+fn shot_objective_sample_captured_on_terminal_outcome_with_expected_reward() {
+    // Learned-MPC shot-PLACEMENT sample: emitted at shot resolution whenever the shot armed the
+    // residual at launch (`mpc_objective` is Some) — independent of the env gate, which only governs
+    // whether the LAUNCH site sets `mpc_objective`. Verifies the terminal reward mapping (goal ⇒
+    // +1.0, off target ⇒ −1.0), the lateral-only / zero-bend capture convention, and the None-skip
+    // (byte-identical-off guarantee at the resolve site).
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        learning_enabled: true,
+        ..MatchConfig::default()
+    });
+    let shooter = sim
+        .players
+        .iter()
+        .find(|player| player.team == Team::Home && player.role == PlayerRole::Forward)
+        .expect("home forward")
+        .id;
+    let armed = |residual_x: f64| PendingShot {
+        team: Team::Home,
+        shooter,
+        origin: Vec2::new(40.0, 104.0),
+        intended_target: Vec2::new(41.0, 120.0),
+        mpc_objective: Some((vec![0.0f32; MPC_OBJECTIVE_FEATURE_DIM], Vec2::new(residual_x, 0.0), 0.0)),
+    };
+
+    // Goal ⇒ +1.0, and the sample carries exactly the applied lateral residual with zero bend.
+    sim.apply_ball_outcome(BallStepOutcome::Goal {
+        scoring_team: Team::Home,
+        shot: Some(armed(0.3)),
+    });
+    let goal_samples = sim.drain_mpc_objective_samples();
+    assert_eq!(goal_samples.len(), 1, "an armed shot emits exactly one placement sample on a goal");
+    assert!((goal_samples[0].reward - 1.0).abs() < 1e-9, "goal ⇒ +1.0 placement reward");
+    assert!((goal_samples[0].applied_residual.x - 0.3).abs() < 1e-9);
+    assert!(
+        goal_samples[0].applied_residual.y.abs() < 1e-9,
+        "shot placement residual is lateral-only (y captured as 0)"
+    );
+    assert!(goal_samples[0].applied_bend.abs() < 1e-9, "shot placement never applies bend");
+
+    // Off target ⇒ −1.0 (recorded for corpus parity; RWR skips negative advantage).
+    sim.apply_ball_outcome(BallStepOutcome::Miss { shot: armed(-0.5) });
+    let miss_samples = sim.drain_mpc_objective_samples();
+    assert_eq!(miss_samples.len(), 1);
+    assert!((miss_samples[0].reward + 1.0).abs() < 1e-9, "off-target ⇒ −1.0 placement reward");
+
+    // A shot that did NOT arm the residual (`mpc_objective: None`, i.e. gate off / no head at
+    // launch) emits NO sample — the behaviour-neutral / byte-identical-off guarantee at resolve.
+    let unarmed = PendingShot {
+        team: Team::Home,
+        shooter,
+        origin: Vec2::new(40.0, 104.0),
+        intended_target: Vec2::zero(),
+        mpc_objective: None,
+    };
+    sim.apply_ball_outcome(BallStepOutcome::Miss { shot: unarmed });
+    assert!(
+        sim.drain_mpc_objective_samples().is_empty(),
+        "an unarmed shot emits no placement sample"
+    );
+}
+
+#[test]
 fn save_outcome_credits_goalkeeper_recent_decision() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         learning_enabled: true,
@@ -362,6 +426,8 @@ fn save_outcome_credits_goalkeeper_recent_decision() {
             team: Team::Home,
             shooter,
             origin: sim.players[shooter].position,
+            intended_target: Vec2::zero(),
+            mpc_objective: None,
         },
         defending_team: Team::Away,
         keeper_id: keeper,
@@ -13985,6 +14051,8 @@ fn active_shot_flight_is_not_recontrolled_as_loose_ball() {
         team: Team::Home,
         shooter,
         origin: sim.ball.position,
+        intended_target: Vec2::zero(),
+        mpc_objective: None,
     });
 
     sim.integrate_ball();
@@ -14551,6 +14619,8 @@ fn dead_shot_ball_at_rest_is_controllable_not_locked_out() {
         team: Team::Home,
         shooter,
         origin: Vec2::new(40.0, 40.0),
+        intended_target: Vec2::zero(),
+        mpc_objective: None,
     });
     // A team-mate is right on the dead ball.
     sim.players[collector].position = Vec2::new(40.0, 70.3);
@@ -33972,6 +34042,8 @@ fn staging_set_play_restart_clears_stale_live_ball_context() {
         team: Team::Home,
         shooter: 5,
         origin: sim.players[5].position,
+        intended_target: Vec2::zero(),
+        mpc_objective: None,
     });
 
     sim.stage_set_play_restart(
@@ -38420,6 +38492,7 @@ fn curriculum_focused_phase_trains_only_its_specialist() {
         old_action_probability: None,
         sample_weight: 1.0,
         mcts_distillation: false,
+        forward_select_eligible: false,
     };
     let samples = vec![sample("pass"), sample("dribble"), sample("shoot")];
     let shoot_idx = soccer_policy_action_index("shoot").expect("shoot family");
@@ -38545,6 +38618,7 @@ fn skill_policy_heads_train_and_score_their_group() {
         old_action_probability: None,
         sample_weight: 1.0,
         mcts_distillation: false,
+        forward_select_eligible: false,
     };
     let samples = vec![
         sample("pass", 1.0),
@@ -38624,6 +38698,7 @@ fn policy_head_advantage_gradient_prefers_the_reinforced_family() {
                     old_action_probability: None,
                     sample_weight: 1.0,
                     mcts_distillation: false,
+                    forward_select_eligible: false,
                 },
                 SoccerPolicySample {
                     state_features: state,
@@ -38632,6 +38707,7 @@ fn policy_head_advantage_gradient_prefers_the_reinforced_family() {
                     old_action_probability: None,
                     sample_weight: 1.0,
                     mcts_distillation: false,
+                    forward_select_eligible: false,
                 },
             ]
         })
@@ -38672,6 +38748,7 @@ fn policy_head_mappo_clip_bounds_old_policy_ratio() {
         old_action_probability: Some(current_probability / 10.0),
         sample_weight: 1.0,
         mcts_distillation: false,
+        forward_select_eligible: false,
     };
     let positive = head
         .clipped_mappo_advantage(&positive_sample, 0.2)
@@ -38688,6 +38765,7 @@ fn policy_head_mappo_clip_bounds_old_policy_ratio() {
         old_action_probability: Some(current_probability * 10.0),
         sample_weight: 1.0,
         mcts_distillation: false,
+        forward_select_eligible: false,
     };
     let negative = head
         .clipped_mappo_advantage(&negative_sample, 0.2)
@@ -38713,6 +38791,7 @@ fn policy_head_mappo_clip_skips_missing_or_invalid_old_policy_probability() {
         old_action_probability,
         sample_weight: 1.0,
         mcts_distillation: false,
+        forward_select_eligible: false,
     };
 
     for old_action_probability in [None, Some(0.0), Some(f64::NAN), Some(f64::INFINITY)] {
@@ -38771,6 +38850,7 @@ fn per_role_policy_heads_train_without_cross_role_gradient_bleed() {
             old_action_probability: None,
             sample_weight: 1.0,
             mcts_distillation: false,
+            forward_select_eligible: false,
         })
         .collect();
     head.train(&samples, None);
@@ -45759,6 +45839,8 @@ fn out_of_play_missed_shot_records_attempt_and_accuracy_penalty() {
             team: Team::Home,
             shooter,
             origin: sim.players[shooter].position,
+            intended_target: Vec2::zero(),
+            mpc_objective: None,
         }),
         shot_off_target_yards: 8.0,
     });
@@ -66229,6 +66311,8 @@ fn endline_out_awards_goal_kick_or_corner() {
         team: Team::Home,
         shooter: 9,
         origin: Vec2::new(58.0, 100.0),
+        intended_target: Vec2::zero(),
+        mpc_objective: None,
     });
 
     goal_kick.integrate_ball();
@@ -66447,6 +66531,8 @@ fn defender_between_ball_and_goal_can_physically_block_shot() {
             team: Team::Home,
             shooter: attacker,
             origin: sim.players[attacker].position,
+            intended_target: Vec2::zero(),
+            mpc_objective: None,
         });
 
         sim.integrate_ball();
@@ -67022,6 +67108,8 @@ fn fast_shot_scores_from_goal_line_crossing_even_when_tick_overshoots() {
         team: Team::Home,
         shooter: 9,
         origin: sim.ball.position,
+        intended_target: Vec2::zero(),
+        mpc_objective: None,
     });
 
     sim.integrate_ball();
@@ -67058,6 +67146,8 @@ fn shot_crossing_outside_posts_is_not_goal() {
         team: Team::Home,
         shooter: 9,
         origin: sim.ball.position,
+        intended_target: Vec2::zero(),
+        mpc_objective: None,
     });
 
     sim.integrate_ball();
@@ -67104,6 +67194,8 @@ fn on_target_shot_past_keeper_is_a_goal_not_a_phantom_save_on_the_line() {
             team: Team::Home,
             shooter: 9,
             origin: sim.ball.position,
+            intended_target: Vec2::zero(),
+            mpc_objective: None,
         });
 
         // Resolve the shot over a couple of ticks.
@@ -67294,6 +67386,8 @@ fn shot_crossing_just_inside_configured_goalmouth_counts() {
         team: Team::Home,
         shooter: 9,
         origin: sim.ball.position,
+        intended_target: Vec2::zero(),
+        mpc_objective: None,
     });
 
     sim.integrate_ball();
@@ -78487,6 +78581,8 @@ fn keeper_parry_records_save_and_leaves_live_rebound() {
         team: Team::Home,
         shooter: 9,
         origin: Vec2::new(40.0, 104.0),
+        intended_target: Vec2::zero(),
+        mpc_objective: None,
     };
     sim.pending_shot = Some(shot.clone());
     sim.ball.holder = Some(keeper_id);
@@ -78563,6 +78659,8 @@ fn attacking_players_sprint_to_keeper_parry_rebound() {
         team: Team::Home,
         shooter: attacker,
         origin: Vec2::new(40.0, 104.0),
+        intended_target: Vec2::zero(),
+        mpc_objective: None,
     };
 
     sim.apply_ball_outcome(BallStepOutcome::KeeperParry {
@@ -78613,6 +78711,8 @@ fn defending_players_sprint_to_clear_keeper_parry_rebound() {
         team: Team::Home,
         shooter: attacker,
         origin: Vec2::new(40.0, 104.0),
+        intended_target: Vec2::zero(),
+        mpc_objective: None,
     };
 
     sim.apply_ball_outcome(BallStepOutcome::KeeperParry {
@@ -78699,6 +78799,8 @@ fn keeper_save_is_agentic_and_updates_shot_stats() {
             team: Team::Home,
             shooter: 9,
             origin: Vec2::new(40.0, 80.0),
+            intended_target: Vec2::zero(),
+            mpc_objective: None,
         });
 
         for _ in 0..10 {
@@ -84549,6 +84651,8 @@ fn blocked_shot_penalizes_shooter_and_rewards_blocker_for_learning() {
         team: Team::Home,
         shooter,
         origin: sim.players[shooter].position,
+        intended_target: Vec2::zero(),
+        mpc_objective: None,
     });
     let before = WorldSnapshot::from_match(&sim);
     sim.players[shooter].last_decision = Some(test_decision_trace(&before, shooter, "shoot"));
@@ -84560,6 +84664,8 @@ fn blocked_shot_penalizes_shooter_and_rewards_blocker_for_learning() {
             team: Team::Home,
             shooter,
             origin: before.ball.position,
+            intended_target: Vec2::zero(),
+            mpc_objective: None,
         },
         blocker_id: blocker,
         defending_team: Team::Away,
@@ -84623,6 +84729,8 @@ fn wide_block_deflection_does_not_award_an_instant_corner() {
             team: Team::Home,
             shooter,
             origin: sim.players[shooter].position,
+            intended_target: Vec2::zero(),
+            mpc_objective: None,
         },
         blocker_id: blocker,
         defending_team: Team::Away,
