@@ -36,7 +36,7 @@ The **discrete representation already exists but is constructed only in tests**:
 The decision path the wiring plugs into:
 `learned_action_for_player_with_context` ([world.rs:13924](../src/des/general/soccer/world.rs#L13924))
 → `neural_blended_action` ([world.rs:15614](../src/des/general/soccer/world.rs#L15614))
-→ `mpc_reconciled_learned_plan_for_policy` ([world.rs:5225](../src/des/general/soccer/world.rs#L5225))
+→ `mpc_reconciled_learned_plan_for_policy` ([world.rs:16595](../src/des/general/soccer/world.rs#L16595))
 → executed in `apply_player_intent` ([world.rs:11663](../src/des/general/soccer/world.rs#L11663)).
 
 The learnable-head pattern to mirror: `back_four_line.rs` —
