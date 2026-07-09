@@ -11726,6 +11726,7 @@ impl SoccerMatch {
             mpc_reconcile_stats: SoccerMpcReconcileStats::default(),
             opponent_press_belief: HashMap::new(),
             player_tick_carryover: HashMap::new(),
+            rollout_forced_action: None,
         };
         let center = Vec2::new(
             config.field_width_yards * 0.5,
