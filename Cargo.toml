@@ -114,7 +114,3 @@ required-features = ["live-server"]
 name = "main_soccer_live_5056"
 path = "src/bin/main_soccer_live_5056.rs"
 required-features = ["live-server"]
-
-[[bin]]
-name = "rollout_poc"
-path = "src/bin/rollout_poc.rs"

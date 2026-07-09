@@ -24,19 +24,19 @@ use soccer_engine::des::general::soccer::{
     SoccerPassLearningMetrics, SoccerPassOutcomeSample, SoccerPolicyHeadSnapshot,
     SoccerPolicyRoleHeadSnapshot, SoccerPolicySpecialistHeadSnapshot, SoccerQEntry, SoccerQPolicy,
     SoccerQPolicyOptions, SoccerQTargetEntry, SoccerSelfPlayEpisodeSummary,
-    SoccerSelfPlayLearnedParams, SoccerSelfPlayTrainingArtifact, SoccerTacticalLearningSummary,
-    SoccerTacticalLearningWeights, SoccerTeamPolicyArtifact, SoccerTeamQPolicies, SoccerWorldModel,
-    SupportScorerHead, Team, WingerPinchHead, ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS,
-    CRASH_BOX_HEAD_MIN_TRAINING_STEPS, DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
-    DEFAULT_SOCCER_PASS_COMPLETION_LEARNING_RATE, GIVE_AND_GO_HEAD_MIN_TRAINING_STEPS,
-    GOAL_SIDE_RECOVERY_HEAD_MIN_TRAINING_STEPS, HEAD_SCAN_HEAD_MIN_TRAINING_STEPS,
-    LANE_AFFINITY_HEAD_MIN_TRAINING_STEPS, LONG_PASS_RUN_HEAD_MIN_TRAINING_STEPS,
-    LOOSE_BALL_COMMIT_HEAD_MIN_TRAINING_STEPS, ONSIDE_SUPPORT_HEAD_MIN_TRAINING_STEPS,
-    PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS, PASS_LANE_YIELD_HEAD_MIN_TRAINING_STEPS,
-    RECEIVE_APPROACH_HEAD_MIN_TRAINING_STEPS, RUN_PREDICTION_HEAD_MIN_TRAINING_STEPS,
-    SEPARATION_FLOOR_HEAD_MIN_TRAINING_STEPS, SHOT_TRIGGER_HEAD_MIN_TRAINING_STEPS,
-    SLIP_BREAK_HEAD_MIN_TRAINING_STEPS, SUPPORT_SCORER_HEAD_MIN_TRAINING_STEPS,
-    WINGER_PINCH_HEAD_MIN_TRAINING_STEPS,
+    SoccerSelfPlayLearnedParams, SoccerSelfPlayTrainingArtifact, SoccerSkillPolicyHeadSnapshot,
+    SoccerSkillPolicyHeadsSnapshot, SoccerTacticalLearningSummary, SoccerTacticalLearningWeights,
+    SoccerTeamPolicyArtifact, SoccerTeamQPolicies, SoccerWorldModel, SupportScorerHead, Team,
+    WingerPinchHead, ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS, CRASH_BOX_HEAD_MIN_TRAINING_STEPS,
+    DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE, DEFAULT_SOCCER_PASS_COMPLETION_LEARNING_RATE,
+    GIVE_AND_GO_HEAD_MIN_TRAINING_STEPS, GOAL_SIDE_RECOVERY_HEAD_MIN_TRAINING_STEPS,
+    HEAD_SCAN_HEAD_MIN_TRAINING_STEPS, LANE_AFFINITY_HEAD_MIN_TRAINING_STEPS,
+    LONG_PASS_RUN_HEAD_MIN_TRAINING_STEPS, LOOSE_BALL_COMMIT_HEAD_MIN_TRAINING_STEPS,
+    ONSIDE_SUPPORT_HEAD_MIN_TRAINING_STEPS, PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS,
+    PASS_LANE_YIELD_HEAD_MIN_TRAINING_STEPS, RECEIVE_APPROACH_HEAD_MIN_TRAINING_STEPS,
+    RUN_PREDICTION_HEAD_MIN_TRAINING_STEPS, SEPARATION_FLOOR_HEAD_MIN_TRAINING_STEPS,
+    SHOT_TRIGGER_HEAD_MIN_TRAINING_STEPS, SLIP_BREAK_HEAD_MIN_TRAINING_STEPS,
+    SUPPORT_SCORER_HEAD_MIN_TRAINING_STEPS, WINGER_PINCH_HEAD_MIN_TRAINING_STEPS,
 };
 use soccer_engine::des::general::soccer_eval_gate::{
     evaluate_promotion, PromotionThresholds, PromotionVerdict,
@@ -923,6 +923,9 @@ fn refresh_neural_snapshot_norm_recursive(
     if let Some(policy_head) = snapshot.policy_head.as_mut() {
         refresh_policy_head_snapshot_norm(policy_head, depth + 1);
     }
+    if let Some(skill_policy_heads) = snapshot.skill_policy_heads.as_mut() {
+        refresh_skill_policy_heads_snapshot_norm(skill_policy_heads, depth + 1);
+    }
     if let Some(line_depth_head) = snapshot.line_depth_head.as_mut() {
         refresh_auxiliary_head_snapshot_norm(line_depth_head, depth + 1);
     }
@@ -940,6 +943,19 @@ fn refresh_specialist_head_snapshot_norm(
     depth: usize,
 ) {
     refresh_neural_snapshot_norm_recursive(&mut head.network, depth + 1);
+}
+
+fn refresh_skill_policy_head_snapshot_norm(head: &mut SoccerSkillPolicyHeadSnapshot, depth: usize) {
+    refresh_neural_snapshot_norm_recursive(&mut head.network, depth + 1);
+}
+
+fn refresh_skill_policy_heads_snapshot_norm(
+    heads: &mut SoccerSkillPolicyHeadsSnapshot,
+    depth: usize,
+) {
+    for head in &mut heads.heads {
+        refresh_skill_policy_head_snapshot_norm(head, depth + 1);
+    }
 }
 
 fn refresh_role_head_snapshot_norm(head: &mut SoccerPolicyRoleHeadSnapshot, depth: usize) {
@@ -996,6 +1012,9 @@ fn mutate_neural_snapshot_recursive(
         if let Some(policy_head) = snapshot.policy_head.as_mut() {
             mutate_policy_head_snapshot(policy_head, rng, config, depth + 1);
         }
+        if let Some(skill_policy_heads) = snapshot.skill_policy_heads.as_mut() {
+            mutate_skill_policy_heads_snapshot(skill_policy_heads, rng, config, depth + 1);
+        }
         if let Some(line_depth_head) = snapshot.line_depth_head.as_mut() {
             mutate_auxiliary_head_snapshot(line_depth_head, rng, config, depth + 1);
         }
@@ -1025,6 +1044,27 @@ fn mutate_specialist_head_snapshot(
 ) {
     let network = std::mem::take(&mut head.network);
     head.network = mutate_neural_snapshot_recursive(network, rng, config, depth + 1);
+}
+
+fn mutate_skill_policy_head_snapshot(
+    head: &mut SoccerSkillPolicyHeadSnapshot,
+    rng: &mut NeuralPopulationRng,
+    config: NeuralPopulationSearchConfig,
+    depth: usize,
+) {
+    let network = std::mem::take(&mut head.network);
+    head.network = mutate_neural_snapshot_recursive(network, rng, config, depth + 1);
+}
+
+fn mutate_skill_policy_heads_snapshot(
+    heads: &mut SoccerSkillPolicyHeadsSnapshot,
+    rng: &mut NeuralPopulationRng,
+    config: NeuralPopulationSearchConfig,
+    depth: usize,
+) {
+    for head in &mut heads.heads {
+        mutate_skill_policy_head_snapshot(head, rng, config, depth + 1);
+    }
 }
 
 fn mutate_role_head_snapshot(
@@ -1106,6 +1146,15 @@ fn crossover_neural_snapshot_recursive(
         } else if child.policy_head.is_none() && b.policy_head.is_some() && rng.coin() {
             child.policy_head = b.policy_head.clone();
         }
+        if let (Some(child_head), Some(b_head)) = (
+            child.skill_policy_heads.as_mut(),
+            b.skill_policy_heads.as_ref(),
+        ) {
+            crossover_skill_policy_heads_snapshot(child_head, b_head, rng, depth + 1);
+        } else if child.skill_policy_heads.is_none() && b.skill_policy_heads.is_some() && rng.coin()
+        {
+            child.skill_policy_heads = b.skill_policy_heads.clone();
+        }
         if let (Some(child_head), Some(b_head)) =
             (child.line_depth_head.as_mut(), b.line_depth_head.as_ref())
         {
@@ -1150,6 +1199,46 @@ fn crossover_specialist_head_snapshot(
     }
     let current = std::mem::take(&mut child.network);
     child.network = crossover_neural_snapshot_recursive(&current, &b.network, rng, depth + 1);
+}
+
+fn crossover_skill_policy_head_snapshot(
+    child: &mut SoccerSkillPolicyHeadSnapshot,
+    b: &SoccerSkillPolicyHeadSnapshot,
+    rng: &mut NeuralPopulationRng,
+    depth: usize,
+) {
+    if child.group != b.group && rng.coin() {
+        *child = b.clone();
+        refresh_skill_policy_head_snapshot_norm(child, depth + 1);
+        return;
+    }
+    let current = std::mem::take(&mut child.network);
+    child.network = crossover_neural_snapshot_recursive(&current, &b.network, rng, depth + 1);
+}
+
+fn crossover_skill_policy_heads_snapshot(
+    child: &mut SoccerSkillPolicyHeadsSnapshot,
+    b: &SoccerSkillPolicyHeadsSnapshot,
+    rng: &mut NeuralPopulationRng,
+    depth: usize,
+) {
+    for (index, child_head) in child.heads.iter_mut().enumerate() {
+        if let Some(b_head) = b
+            .heads
+            .iter()
+            .find(|head| head.group == child_head.group)
+            .or_else(|| b.heads.get(index))
+        {
+            crossover_skill_policy_head_snapshot(child_head, b_head, rng, depth + 1);
+        }
+    }
+    if child.heads.len() < b.heads.len() {
+        for b_head in b.heads.iter().skip(child.heads.len()) {
+            if rng.unit() < 0.25 {
+                child.heads.push(b_head.clone());
+            }
+        }
+    }
 }
 
 fn crossover_role_head_snapshot(
@@ -2766,6 +2855,7 @@ fn apply_policy_promotion_incumbent_gate(
     let Some(incumbent) = incumbent else {
         return;
     };
+    const EPSILON: f64 = 1e-9;
     let mean_fitness_floor = incumbent.mean_match_fitness + min_mean_fitness_delta.max(0.0)
         - max_mean_fitness_regression.max(0.0);
     let play_quality_floor =
@@ -2779,7 +2869,19 @@ fn apply_policy_promotion_incumbent_gate(
             max_mean_fitness_regression.max(0.0)
         ));
     }
-    if evaluation.mean_play_quality < play_quality_floor {
+    // "Fitness first": the incumbent-RELATIVE play-quality floor is a soft, noisy secondary guard
+    // (empirically ~0.29 correlation with match fitness; the per-8-game-mean spread is ~ the 0.05
+    // regression threshold, so a single eval can trip it). Do NOT let a noisy style regression veto a
+    // candidate that delivers a REAL mean-fitness gain over the incumbent — mirroring
+    // `policy_promotion_evaluation_regresses_from_local_best`, which only weighs play-quality
+    // regression when fitness is not better. Base eligibility still enforces the ABSOLUTE
+    // `min_mean_play_quality` floor in `evaluate_soccer_policy_promotion_gate` before this runs, so a
+    // genuinely low-quality candidate is already rejected; operators wanting a hard style floor
+    // should tighten `SOCCER_POLICY_PROMOTION_MIN_MEAN_PLAY_QUALITY` rather than rely on this
+    // incumbent-relative veto. Candidates WITHOUT a real fitness gain are still held to the floor.
+    let real_mean_fitness_gain = evaluation.mean_match_fitness
+        > incumbent.mean_match_fitness + min_mean_fitness_delta.max(0.0) + EPSILON;
+    if !real_mean_fitness_gain && evaluation.mean_play_quality < play_quality_floor {
         evaluation.rejection_reasons.push(format!(
             "incumbent_mean_play_quality {:.4} below incumbent {:.4} - regression {:.4}",
             evaluation.mean_play_quality,
@@ -12242,6 +12344,14 @@ mod tests {
             }],
             forward_select_logit_weight: 0.0,
         }));
+        snapshot.skill_policy_heads = Some(Box::new(SoccerSkillPolicyHeadsSnapshot {
+            heads: vec![SoccerSkillPolicyHeadSnapshot {
+                group: "pass".to_string(),
+                network: neural_population_network(base + 45.0),
+                training_steps: 9,
+                average_loss: Some(0.3125),
+            }],
+        }));
         snapshot.line_depth_head = Some(Box::new(SoccerAuxiliaryHeadSnapshot {
             network: neural_population_network(base + 50.0),
             training_steps: 13,
@@ -12275,6 +12385,11 @@ mod tests {
                 for specialist in &role_head.specialist_heads {
                     collect_neural_population_values(&specialist.network, values);
                 }
+            }
+        }
+        if let Some(skill_policy_heads) = snapshot.skill_policy_heads.as_ref() {
+            for head in &skill_policy_heads.heads {
+                collect_neural_population_values(&head.network, values);
             }
         }
         if let Some(line_depth_head) = snapshot.line_depth_head.as_ref() {
@@ -12321,6 +12436,14 @@ mod tests {
             neural_population_first_weight(&original.line_depth_head.as_ref().unwrap().network),
             neural_population_first_weight(&mutated.line_depth_head.as_ref().unwrap().network)
         );
+        assert_ne!(
+            neural_population_first_weight(
+                &original.skill_policy_heads.as_ref().unwrap().heads[0].network
+            ),
+            neural_population_first_weight(
+                &mutated.skill_policy_heads.as_ref().unwrap().heads[0].network
+            )
+        );
         assert!(mutated.l2_norm.is_finite());
         assert_eq!(mutated.parameter_count, 6);
     }
@@ -12338,6 +12461,7 @@ mod tests {
                 child.policy_head.as_ref().unwrap().role_heads.len(),
                 a.policy_head.as_ref().unwrap().role_heads.len()
             );
+            assert!(child.skill_policy_heads.is_some());
             assert!(child.line_depth_head.is_some());
             let mut child_values = Vec::new();
             let mut b_values = Vec::new();
@@ -13769,6 +13893,18 @@ mod tests {
             Some("true")
         );
         assert_eq!(
+            continuous_manifest_env_value("DD_SOCCER_ENABLE_DP_BOOTSTRAP"),
+            Some("true")
+        );
+        assert_eq!(
+            continuous_manifest_env_value("DD_SOCCER_DP_BOOTSTRAP_HORIZON"),
+            Some("64")
+        );
+        assert_eq!(
+            continuous_manifest_env_value("DD_SOCCER_DP_BOOTSTRAP_SWEEPS"),
+            Some("200")
+        );
+        assert_eq!(
             continuous_manifest_env_value("DD_SOCCER_ENABLE_NEURAL_SELF_BOOTSTRAP"),
             Some("true")
         );
@@ -13802,7 +13938,7 @@ mod tests {
         );
         assert_eq!(
             continuous_manifest_env_value("SOCCER_NEURAL_MCTS_ENABLED"),
-            Some("true")
+            Some("false")
         );
         assert_eq!(
             continuous_manifest_env_value("SOCCER_NEURAL_MCTS_CANDIDATES"),
@@ -13883,6 +14019,9 @@ mod tests {
             "require_value DD_SOCCER_ENABLE_TARGET_STANDARDIZATION true",
         );
         assert_continuous_manifest_contains("require_value DD_SOCCER_ENABLE_MC_CRITIC_TARGET true");
+        assert_continuous_manifest_contains("require_value DD_SOCCER_ENABLE_DP_BOOTSTRAP true");
+        assert_continuous_manifest_contains("require_value DD_SOCCER_DP_BOOTSTRAP_HORIZON 64");
+        assert_continuous_manifest_contains("require_value DD_SOCCER_DP_BOOTSTRAP_SWEEPS 200");
         assert_continuous_manifest_contains(
             "require_value DD_SOCCER_ENABLE_NEURAL_SELF_BOOTSTRAP true",
         );
@@ -13897,7 +14036,7 @@ mod tests {
         assert_continuous_manifest_contains("require_value SOCCER_NEURAL_ACTOR_CRITIC true");
         assert_continuous_manifest_contains("require_value SOCCER_ENABLE_ACTOR_CRITIC true");
         assert_continuous_manifest_contains("require_value SOCCER_NEURAL_LP_COUPLING_ENABLED true");
-        assert_continuous_manifest_contains("require_value SOCCER_NEURAL_MCTS_ENABLED true");
+        assert_continuous_manifest_contains("require_value SOCCER_NEURAL_MCTS_ENABLED false");
         assert_continuous_manifest_contains("require_value SOCCER_NEURAL_MCTS_CANDIDATES 8");
         assert_continuous_manifest_contains(
             "require_value SOCCER_NEURAL_MCTS_PASS_TARGET_CANDIDATES 8",
@@ -13949,7 +14088,7 @@ mod tests {
 
     #[test]
     fn continuous_manifest_batches_postgres_writes_by_parallel_wave() {
-        assert_eq!(continuous_manifest_env_value("SOCCER_GAMES"), Some("100"));
+        assert_eq!(continuous_manifest_env_value("SOCCER_GAMES"), Some("8"));
         assert_eq!(
             continuous_manifest_env_value("SOCCER_PARALLEL_GAMES"),
             Some("1")
@@ -13975,11 +14114,11 @@ mod tests {
         );
         assert_eq!(
             continuous_manifest_env_value("SOCCER_MAX_POLICY_ENTRIES_PER_TEAM"),
-            Some("250000")
+            Some("120000")
         );
         assert_eq!(
             continuous_manifest_env_value("SOCCER_MAX_POLICY_TARGET_ENTRIES_PER_TEAM"),
-            Some("250000")
+            Some("120000")
         );
     }
 
@@ -13987,7 +14126,7 @@ mod tests {
     fn continuous_manifest_uses_restart_safe_source_checkout() {
         assert_eq!(
             continuous_manifest_env_value("SOCCER_SOURCE_REPO"),
-            Some("https://github.com/ORESoftware/soccer-sim-game-engine.rs.git")
+            Some("https://github.com/akrion-sim/akrion-soccer-engine-rs.git")
         );
         assert_eq!(
             continuous_manifest_env_value("SOCCER_SOURCE_REF"),
@@ -14065,7 +14204,7 @@ mod tests {
         assert_continuous_manifest_contains("touch \"${ready_file}\"");
         assert_continuous_manifest_contains("readinessProbe:");
         assert_continuous_manifest_contains(
-            "test -f \"/tmp/codex-soccer-learning-overnight-ready-${HOSTNAME:-pod}\"",
+            "test -f \"/tmp/${SOCCER_RUN_ID_PREFIX:-codex-soccer-learning-continuous}-ready-${HOSTNAME:-pod}\"",
         );
         assert_continuous_manifest_contains("progressDeadlineSeconds: 1200");
         assert_continuous_manifest_contains("revisionHistoryLimit: 2");
@@ -14225,6 +14364,7 @@ mod tests {
             average_loss: Some(0.1),
             target_popart: None,
             policy_head: None,
+            skill_policy_heads: None,
             line_depth_head: None,
             mpc_objective_head: None,
         }
@@ -14809,6 +14949,71 @@ mod tests {
     }
 
     #[test]
+    fn incumbent_play_quality_veto_yields_to_real_fitness_gain() {
+        let incumbent = PolicyPromotionIncumbentBaseline {
+            sample_games: 8,
+            mean_match_fitness: 1.00,
+            best_match_fitness: 2.00,
+            mean_play_quality: 0.44,
+        };
+        let make =
+            |mean_match_fitness: f64, mean_play_quality: f64| SoccerPolicyPromotionGateEvaluation {
+                enabled: true,
+                eligible: true,
+                sample_games: 8,
+                min_sample_games: 8,
+                mean_match_fitness,
+                best_match_fitness: mean_match_fitness,
+                mean_play_quality,
+                mean_conceded_goals: 0.0,
+                mean_goal_margin: 0.0,
+                mean_chain_net_loss: 0.0,
+                rejection_reasons: Vec::new(),
+            };
+
+        // Real mean-fitness gain over the incumbent: a play-quality regression must NOT veto it.
+        let mut fitness_gain = make(1.20, 0.30);
+        apply_policy_promotion_incumbent_gate(
+            &mut fitness_gain,
+            Some(incumbent),
+            true,
+            0.001,
+            0.0,
+            0.05,
+        );
+        assert!(
+            fitness_gain.eligible,
+            "a real fitness gain should not be vetoed by a play-quality regression: {:?}",
+            fitness_gain.rejection_reasons
+        );
+
+        // No fitness gain (flat, within the regression tolerance) + play-quality regression: still vetoed.
+        let mut flat = make(1.00, 0.30);
+        apply_policy_promotion_incumbent_gate(&mut flat, Some(incumbent), true, 0.001, 0.05, 0.05);
+        assert!(!flat.eligible);
+        assert!(flat
+            .rejection_reasons
+            .iter()
+            .any(|reason| reason.starts_with("incumbent_mean_play_quality")));
+
+        // A match-fitness regression beyond tolerance is still rejected regardless of style.
+        let mut fitness_regressed = make(0.50, 0.60);
+        apply_policy_promotion_incumbent_gate(
+            &mut fitness_regressed,
+            Some(incumbent),
+            true,
+            0.001,
+            0.05,
+            0.05,
+        );
+        assert!(!fitness_regressed.eligible);
+        assert!(fitness_regressed
+            .rejection_reasons
+            .iter()
+            .any(|reason| reason.starts_with("incumbent_mean_match_fitness")));
+    }
+
+    #[test]
     fn postgres_refresh_clears_batch_evolution_sample_window() {
         let mut flank_weights = SoccerTacticalLearningWeights::default();
         flank_weights.attack_flank_lane_weight = 1.75;
@@ -15051,6 +15256,7 @@ mod tests {
             average_loss: None,
             target_popart: None,
             policy_head: None,
+            skill_policy_heads: None,
             line_depth_head: None,
             mpc_objective_head: None,
         };

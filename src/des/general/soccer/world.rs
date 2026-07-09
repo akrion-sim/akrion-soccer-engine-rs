@@ -209,6 +209,117 @@ fn neural_mcts_pass_target_candidate_limit() -> usize {
     })
 }
 
+/// Forward-release root-candidate injection (Codex fork verdict). Default OFF ⇒ byte-identical.
+/// When a *qualified* forward pass option is visible, the best forward receiver is injected into
+/// the neural-scored root even if the analytic top-3 pass-target cap (Cap B) would drop it — so the
+/// critic (with the action-param aim features) can actually SEE and learn to select it. This targets
+/// the empirically-confirmed SELECTION bottleneck (exposure widening alone moved forward-share 0.00).
+fn dd_soccer_enable_forward_release_root_candidate() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_FORWARD_RELEASE_ROOT_CANDIDATE"))
+}
+
+/// Minimum quick-forward-pass open value for the injected forward candidate to qualify (Codex: 0.50).
+fn forward_release_min_quality() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_FORWARD_RELEASE_MIN_QUALITY")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.50)
+            .clamp(0.0, 1.0)
+    })
+}
+
+/// Minimum expected pass completion for the injected forward candidate to qualify (Codex: 0.45).
+fn forward_release_min_completion() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_FORWARD_RELEASE_MIN_COMPLETION")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.45)
+            .clamp(0.0, 1.0)
+    })
+}
+
+/// Bounded, centered selection bias added to the injected forward candidate only (Codex: "must be
+/// considered, not taken"). A small positive nudge to surface it into the root; the critic value
+/// score can still outrank it — no forced argmax. Clamped to the shared centered-bonus clip.
+fn forward_release_bias() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_FORWARD_RELEASE_BIAS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            // 0.25 (not 0.10): the pass-like margin gate (default 0.55) runs AFTER injection, so a
+            // 0.10 bias is too small to keep a below-best forward pass from being pruned (Codex review).
+            .unwrap_or(0.25)
+            .clamp(0.0, SOCCER_CENTERED_POLICY_BONUS_CLIP)
+    })
+}
+
+/// Which stage of the forward-release injection funnel to count (diag only).
+#[derive(Clone, Copy)]
+enum ForwardReleaseStage {
+    Eligible,
+    Pushed,
+    SurvivedMarginGate,
+}
+
+/// Gated diagnostic funnel counters (DD_SOCCER_DUMP_FORWARD_RELEASE_DIAG) proving the injection is
+/// not inert (like pass-space was): how often the gate is eligible, the candidate is pushed, and it
+/// survives the pass-like margin gate. Prints the running triple to stderr every 5000 eligible ticks.
+fn forward_release_diag_bump(stage: ForwardReleaseStage) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    static DIAG: OnceLock<bool> = OnceLock::new();
+    if !*DIAG.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_DUMP_FORWARD_RELEASE_DIAG")) {
+        return;
+    }
+    static ELIGIBLE: AtomicU64 = AtomicU64::new(0);
+    static PUSHED: AtomicU64 = AtomicU64::new(0);
+    static SURVIVED: AtomicU64 = AtomicU64::new(0);
+    let emit = |tag: &str| {
+        eprintln!(
+            "forward_release_diag[{}] eligible={} pushed={} survived_margin_gate={}",
+            tag,
+            ELIGIBLE.load(Ordering::Relaxed),
+            PUSHED.load(Ordering::Relaxed),
+            SURVIVED.load(Ordering::Relaxed),
+        );
+    };
+    match stage {
+        // Eligible is the frequent event — sample it. Pushed/survived are the meaningful, rarer
+        // events (injection actually landed / cleared the margin gate) — print them eagerly so a
+        // short run reveals whether the injection works, not just a long training run.
+        ForwardReleaseStage::Eligible => {
+            if ELIGIBLE.fetch_add(1, Ordering::Relaxed) + 1 == 1 {
+                emit("first-eligible");
+            }
+        }
+        ForwardReleaseStage::Pushed => {
+            let p = PUSHED.fetch_add(1, Ordering::Relaxed) + 1;
+            if p == 1 || p % 25 == 0 {
+                emit("pushed");
+            }
+        }
+        ForwardReleaseStage::SurvivedMarginGate => {
+            let s = SURVIVED.fetch_add(1, Ordering::Relaxed) + 1;
+            if s == 1 || s % 25 == 0 {
+                emit("survived");
+            }
+        }
+    }
+}
+
 fn neural_mcts_kick_power_candidate_limit() -> usize {
     use std::sync::OnceLock;
     static V: OnceLock<usize> = OnceLock::new();
@@ -1159,10 +1270,14 @@ pub struct SoccerMatch {
     /// advantage policy-gradient from the critic (the value head). Present only when
     /// the run opts into actor-critic (`neural_blend.actor_critic` + neural learning enabled).
     pub(crate) policy_head: Option<SoccerPolicyHead>,
-    /// Independent pass/dribble/shot specialist actors over the shared actor features. Present
-    /// only when the actor is active AND `DD_SOCCER_ENABLE_SKILL_POLICY_HEADS` is set; their
-    /// log-probabilities refine technical action selection on top of the joint actor.
+    /// HOME/shared independent pass/dribble/shot specialist actors over the shared actor features.
+    /// Present only when the actor is active AND `DD_SOCCER_ENABLE_SKILL_POLICY_HEADS` is set; their
+    /// log-probabilities refine technical action selection on top of the joint actor. Away uses this
+    /// only in the historical single-brain mode; dedicated away brains carry their own sidecar below.
     pub(crate) skill_policy_heads: Option<SoccerSkillPolicyHeads>,
+    /// Dedicated AWAY-team skill-policy sidecar. This mirrors `away_neural_learner` so head-to-head
+    /// frozen eval cannot inherit or overwrite the other arm's pass/dribble/shot heads.
+    pub(crate) away_skill_policy_heads: Option<SoccerSkillPolicyHeads>,
     /// Dedicated goalkeeper actor over the keeper action vocabulary, biasing the keeper's
     /// come-for-the-ball decision. Present only when the actor is active AND
     /// `DD_SOCCER_ENABLE_KEEPER_POLICY_HEAD` is set.
@@ -2009,9 +2124,10 @@ fn soccer_plan_target_forward_yards(
     player_id: usize,
     team: Team,
 ) -> Option<f64> {
-    let target = plan
-        .target_point
-        .or_else(|| plan.target_player.and_then(|id| snapshot.player_position(id)))?;
+    let target = plan.target_point.or_else(|| {
+        plan.target_player
+            .and_then(|id| snapshot.player_position(id))
+    })?;
     let carrier = snapshot.player_position(player_id)?;
     Some((target.y - carrier.y) * team.attack_dir())
 }
@@ -2023,9 +2139,12 @@ fn soccer_plan_target_forward_yards(
 /// lateral/backward balls (switch-play, recycle/reset) — and reads the same
 /// `(target.y - carrier.y) * attack_dir` measure that `soccer_plan_target_forward_yards` computes at
 /// score time, so both sites share ONE definition of "forward".
-fn soccer_transition_forward_pass_selection_eligible(transition: &SoccerLearningTransition) -> bool {
+fn soccer_transition_forward_pass_selection_eligible(
+    transition: &SoccerLearningTransition,
+) -> bool {
     pass_like_action_flight(&transition.action).is_some()
-        && transition.decision_context.target_forward_yards > SOCCER_FORWARD_SELECT_MIN_FORWARD_YARDS
+        && transition.decision_context.target_forward_yards
+            > SOCCER_FORWARD_SELECT_MIN_FORWARD_YARDS
 }
 
 fn soccer_policy_rank_probability_for_label(
@@ -2313,14 +2432,36 @@ fn stamp_learned_policy_behavior_probability_on_decision(
 /// forward passes make this approximate dynamic programming: delayed rewards from
 /// goals, shots, turnovers, and completed actions can propagate backward through
 /// the abstract Q buckets before the neural critic builds its Bellman targets.
+/// Forward-pass climb profiles default to the full existing sweep budget because
+/// that objective depends on delayed pass/turnover/conversion credit.
+fn soccer_approx_dp_replay_default_passes(
+    forward_pass_climb_curriculum: bool,
+    promotion_forward_pass_primary: bool,
+    eval_require_forward_pass_climb: bool,
+) -> usize {
+    if forward_pass_climb_curriculum
+        || promotion_forward_pass_primary
+        || eval_require_forward_pass_climb
+    {
+        8
+    } else {
+        1
+    }
+}
+
 fn soccer_approx_dp_replay_passes() -> usize {
     use std::sync::OnceLock;
     static V: OnceLock<usize> = OnceLock::new();
     *V.get_or_init(|| {
+        let default_passes = soccer_approx_dp_replay_default_passes(
+            soccer_env_flag_enabled("DD_SOCCER_FORWARD_PASS_CLIMB_CURRICULUM"),
+            soccer_env_flag_enabled("SOCCER_POLICY_PROMOTION_FORWARD_PASS_PRIMARY"),
+            soccer_env_flag_enabled("SOCCER_EVAL_REQUIRE_FORWARD_PASS_CLIMB"),
+        );
         std::env::var("SOCCER_APPROX_DP_REPLAY_PASSES")
             .ok()
             .and_then(|raw| raw.trim().parse::<usize>().ok())
-            .unwrap_or(1)
+            .unwrap_or(default_passes)
             .clamp(1, 8)
     })
 }
@@ -2851,6 +2992,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn away_learning_specialist_training_uses_dedicated_away_sidecar() {
+        let mut config = MatchConfig::default();
+        config.learning_enabled = true;
+        config.neural_learning.enabled = true;
+        config.neural_learning.backend = SoccerNeuralLearningBackend::Inline;
+        config.neural_blend.actor_critic = true;
+        let mut sim = SoccerMatch::default_11v11(config);
+
+        sim.set_team_neural_brain(Team::Home, None, true)
+            .expect("install frozen home brain");
+        sim.set_team_neural_brain(Team::Away, None, false)
+            .expect("install learning away brain");
+
+        assert_eq!(sim.skill_policy_training_team(), Team::Away);
+        sim.ensure_skill_policy_heads_for_training(sim.skill_policy_training_team());
+        assert!(
+            sim.skill_policy_heads.is_none(),
+            "away-learning matches must not train the home/shared skill sidecar"
+        );
+        assert!(
+            sim.away_skill_policy_heads.is_some(),
+            "away-learning matches need a dedicated skill sidecar to export"
+        );
+    }
+
     fn pass_role_risk_test_quality(
         expected_completion: f64,
         lane_interception_risk: f64,
@@ -2950,6 +3117,26 @@ mod tests {
             next_observation: observation,
             done: false,
         }
+    }
+
+    #[test]
+    fn approx_dp_default_replay_passes_arm_climb_profiles() {
+        assert_eq!(
+            soccer_approx_dp_replay_default_passes(false, false, false),
+            1
+        );
+        assert_eq!(
+            soccer_approx_dp_replay_default_passes(true, false, false),
+            8
+        );
+        assert_eq!(
+            soccer_approx_dp_replay_default_passes(false, true, false),
+            8
+        );
+        assert_eq!(
+            soccer_approx_dp_replay_default_passes(false, false, true),
+            8
+        );
     }
 
     #[test]
@@ -11430,255 +11617,6 @@ fn movement_gait_for_physical_speed(
     movement_gait_for_physical_tier(template, tier)
 }
 
-/// Result of one rollout arm in the Rollout PoC harness (see
-/// `docs/rollout-poc-harness-spec.md`). Additive / inert — nothing in the live
-/// engine reads it; it exists so the separate-crate driver bin can evaluate arms
-/// through `pub` methods (the rollout/pending internals are `pub(crate)`).
-#[derive(Clone, Debug, Default)]
-pub struct PocArmResult {
-    /// EPV-aware leaf value: `expected_threat(end) + 0.30*retained - 0.60*turnover`.
-    pub leaf: f64,
-    /// expected_threat at the ball's ending position (carrier team's perspective).
-    pub epv_end: f64,
-    /// Carrier's team controls the ball at the end of the roll.
-    pub possession_retained: bool,
-    /// The OTHER team controls the ball at the end of the roll.
-    pub turnover: bool,
-    /// Carrier team's completed_forward_pass count gained over the roll (diagnostic).
-    pub completed_fwd_delta: i64,
-    /// Ticks actually simulated before the event-aligned stop / horizon cap.
-    pub ticks_run: u32,
-    /// Whether the forced action actually reached the carrier (guards silent no-ops):
-    /// true iff a forced action was queued AND was consumed by the carrier's decision.
-    pub forced_action_fired: bool,
-}
-
-impl SoccerMatch {
-    /// The on-ball ball carrier if it's a FIELD player (not a keeper), else None.
-    /// (Rollout PoC harness — see `docs/rollout-poc-harness-spec.md`.)
-    pub fn poc_on_ball_field_carrier(&self) -> Option<usize> {
-        let id = self.ball.holder?;
-        let p = self.players.iter().find(|p| p.id == id)?;
-        if p.role == PlayerRole::Goalkeeper {
-            None
-        } else {
-            Some(id)
-        }
-    }
-
-    /// expected_threat at the ball's CURRENT position for `carrier`'s team (the
-    /// pre-roll EPV baseline the driver uses to classify "nat already forward").
-    pub fn poc_epv_now(&self, carrier: usize) -> Option<f64> {
-        let team = self.players.iter().find(|p| p.id == carrier)?.team;
-        Some(crate::des::general::soccer::pitch_value::expected_threat(
-            team,
-            self.ball.position,
-            self.config.field_width_yards,
-            self.config.field_length_yards,
-        ))
-    }
-
-    /// The +/- y sign that INCREASES expected_threat for `carrier`'s team at the
-    /// carrier's position (the attacking / "forward" direction along the goal-to-goal
-    /// axis). Derived by probing et a few yards either way in y, so it stays
-    /// self-consistent with the leaf's EPV rather than assuming an orientation.
-    pub fn poc_carrier_forward_ysign(&self, carrier: usize) -> Option<f64> {
-        let p = self.players.iter().find(|p| p.id == carrier)?;
-        let team = p.team;
-        let pos = p.position;
-        let fw = self.config.field_width_yards;
-        let fl = self.config.field_length_yards;
-        let et = |y: f64| {
-            crate::des::general::soccer::pitch_value::expected_threat(
-                team,
-                Vec2::new(pos.x, y),
-                fw,
-                fl,
-            )
-        };
-        let probe = 5.0;
-        Some(if et(pos.y + probe) >= et(pos.y - probe) {
-            1.0
-        } else {
-            -1.0
-        })
-    }
-
-    /// A forward dribble target `yards` up-field (in the et-increasing y direction)
-    /// from the carrier's position. Feeds the driver's dribble arm.
-    pub fn poc_dribble_forward_target(&self, carrier: usize, yards: f64) -> Option<Vec2> {
-        let pos = self.players.iter().find(|p| p.id == carrier)?.position;
-        let sign = self.poc_carrier_forward_ysign(carrier)?;
-        Some(Vec2::new(pos.x, pos.y + sign * yards))
-    }
-
-    /// Up to `k` forward, open teammate positions for `carrier`, ranked by
-    /// expected_threat desc. "forward" = et strictly higher than the carrier's own
-    /// cell (+ `MARGIN`); "open" = nearest opponent farther than `open_yds`.
-    pub fn poc_forward_pass_targets(&self, carrier: usize, k: usize, open_yds: f64) -> Vec<Vec2> {
-        const MARGIN: f64 = 0.05;
-        let carrier_p = match self.players.iter().find(|p| p.id == carrier) {
-            Some(p) => p,
-            None => return Vec::new(),
-        };
-        let team = carrier_p.team;
-        let fw = self.config.field_width_yards;
-        let fl = self.config.field_length_yards;
-        let et = |p: Vec2| {
-            crate::des::general::soccer::pitch_value::expected_threat(team, p, fw, fl)
-        };
-        let carrier_et = et(carrier_p.position);
-        let mut candidates: Vec<(f64, Vec2)> = Vec::new();
-        for tm in self.players.iter() {
-            if tm.team != team || tm.id == carrier || tm.role == PlayerRole::Goalkeeper {
-                continue;
-            }
-            let tm_et = et(tm.position);
-            if tm_et <= carrier_et + MARGIN {
-                continue;
-            }
-            let mut nearest_opp = f64::INFINITY;
-            for opp in self.players.iter() {
-                if opp.team == team.other() {
-                    let d = opp.position.distance(tm.position);
-                    if d < nearest_opp {
-                        nearest_opp = d;
-                    }
-                }
-            }
-            if nearest_opp <= open_yds {
-                continue;
-            }
-            candidates.push((tm_et, tm.position));
-        }
-        candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        candidates.into_iter().take(k).map(|(_, p)| p).collect()
-    }
-
-    /// True iff a pass / shot / rebound is currently in flight or otherwise
-    /// unresolved (encapsulates the `pub(crate)` pending fields for the driver).
-    pub fn poc_has_pending_ball_event(&self) -> bool {
-        self.pending_pass.is_some()
-            || self.pending_shot.is_some()
-            || self.pending_rebound.is_some()
-    }
-
-    /// Queue a forced action on `player_id`'s next decision inside a rollout fork.
-    /// (Sets the `pub(crate)` rollout hook; consumed on the carrier's next decision.)
-    pub fn set_rollout_forced_action(
-        &mut self,
-        player_id: usize,
-        action: String,
-        target: Option<Vec2>,
-    ) {
-        self.rollout_forced_action = Some((player_id, action, target));
-    }
-
-    /// If a pass launched by `carrier` is currently pending, return its intended
-    /// target POINT (reads the `pub(crate)` `pending_pass` for the driver).
-    pub fn poc_pending_pass_target_for(&self, carrier: usize) -> Option<Vec2> {
-        let pass = self.pending_pass.as_ref()?;
-        if pass.from == carrier {
-            Some(pass.intended_target)
-        } else {
-            None
-        }
-    }
-
-    /// PARITY control (gating): fork, run ONE natural tick, and if the carrier
-    /// launched a pass on that tick return its target point — so the driver can
-    /// force ("pass", that_target) from the same pre-state/seed and confirm the
-    /// injection reproduces natural within CRN noise. `None` ⇒ the carrier did not
-    /// pass on the first tick (parity is only defined when its first act is a pass).
-    pub fn poc_natural_pass_target(&self, carrier: usize, seed: u64) -> Option<Vec2> {
-        let mut w = self.fork_for_rollout(seed);
-        w.run_time_step();
-        w.poc_pending_pass_target_for(carrier)
-    }
-
-    /// One rollout arm: fork → (optionally force `(action, target)` on the carrier's
-    /// next decision) → roll under the analytic base until the play's immediate
-    /// outcome settles (event-aligned) or `max_h` ticks → return the EPV-aware leaf.
-    /// `forced == None` = the NATURAL arm (analytic plays its own pick).
-    pub fn poc_rollout_arm(
-        &self,
-        carrier: usize,
-        forced: Option<(String, Option<Vec2>)>,
-        seed: u64,
-        max_h: u32,
-    ) -> PocArmResult {
-        const POSSESSION_BONUS: f64 = 0.30;
-        const TURNOVER_PENALTY: f64 = 0.60;
-        let mut w = self.fork_for_rollout(seed);
-        let team = match self.players.iter().find(|p| p.id == carrier).map(|p| p.team) {
-            Some(t) => t,
-            None => return PocArmResult::default(),
-        };
-        let field_w = self.config.field_width_yards;
-        let field_l = self.config.field_length_yards;
-        let fwd_count = |m: &SoccerMatch| -> u32 {
-            match team {
-                Team::Home => m.stats.passes_completed_forward_home,
-                Team::Away => m.stats.passes_completed_forward_away,
-            }
-        };
-        let fwd0 = fwd_count(&w);
-        let forced_was_set = forced.is_some();
-        if let Some((action, target)) = forced {
-            w.set_rollout_forced_action(carrier, action, target);
-        }
-        let mut had_pending = false;
-        let mut ticks = 0u32;
-        loop {
-            let pending_before = w.poc_has_pending_ball_event();
-            w.run_time_step();
-            ticks += 1;
-            if pending_before {
-                had_pending = true;
-            }
-            let holder_team = w
-                .ball
-                .holder
-                .and_then(|h| w.players.iter().find(|p| p.id == h).map(|p| p.team));
-            // Turnover: the OTHER team now controls the ball.
-            let settled_other = holder_team == Some(team.other());
-            // A pass/shot that went in flight during the roll has resolved to a holder.
-            let resolved =
-                had_pending && !w.poc_has_pending_ball_event() && w.ball.holder.is_some();
-            if settled_other || resolved || ticks >= max_h {
-                break;
-            }
-        }
-        let epv_end = crate::des::general::soccer::pitch_value::expected_threat(
-            team,
-            w.ball.position,
-            field_w,
-            field_l,
-        );
-        let holder_team_end = w
-            .ball
-            .holder
-            .and_then(|h| w.players.iter().find(|p| p.id == h).map(|p| p.team));
-        let possession_retained = holder_team_end == Some(team);
-        let turnover = holder_team_end == Some(team.other());
-        let fwd1 = fwd_count(&w);
-        let leaf = epv_end + POSSESSION_BONUS * (possession_retained as i32 as f64)
-            - TURNOVER_PENALTY * (turnover as i32 as f64);
-        // The forced action fired iff we queued one and it was consumed by the
-        // carrier's decision (fork zeroes the hook; it only clears on consumption).
-        let forced_action_fired = forced_was_set && w.rollout_forced_action.is_none();
-        PocArmResult {
-            leaf,
-            epv_end,
-            possession_retained,
-            turnover,
-            completed_fwd_delta: fwd1 as i64 - fwd0 as i64,
-            ticks_run: ticks,
-            forced_action_fired,
-        }
-    }
-}
-
 impl SoccerMatch {
     /// Make every player identical — all 0–10 skill ratings maxed, uniform
     /// physique and decision-noise, and identical proclivities — so learning
@@ -11826,6 +11764,7 @@ impl SoccerMatch {
             neural_blend: config.neural_blend,
             policy_head: None,
             skill_policy_heads: None,
+            away_skill_policy_heads: None,
             keeper_policy_head: None,
             specialist_curriculum_round: 0,
             world_model: None,
@@ -12075,6 +12014,7 @@ impl SoccerMatch {
             neural_blend: SoccerNeuralBlendConfig::default(),
             policy_head: None,
             skill_policy_heads: None,
+            away_skill_policy_heads: None,
             keeper_policy_head: None,
             specialist_curriculum_round: 0,
             world_model: None,
@@ -12404,6 +12344,16 @@ impl SoccerMatch {
         } else {
             None
         };
+        self.skill_policy_heads =
+            if let Some(skill_policy_heads) = snapshot.skill_policy_heads.as_deref() {
+                Some(soccer_skill_policy_heads_from_snapshot(
+                    skill_policy_heads,
+                    self.config.seed,
+                )?)
+            } else {
+                None
+            };
+        self.away_skill_policy_heads = None;
         self.line_depth_head = if let Some(line_depth_head) = snapshot.line_depth_head.as_deref() {
             Some(std::sync::Arc::new(BackFourLineHead::from_snapshot(
                 line_depth_head,
@@ -12455,6 +12405,24 @@ impl SoccerMatch {
         }
     }
 
+    /// Skill heads follow the same home/shared vs. dedicated-away serving shape as the neural
+    /// learner. In single-brain mode Away falls back to the shared Home sidecar; once Away is
+    /// dedicated or explicitly frozen, missing Away heads mean "no specialist", not "borrow Home".
+    fn skill_policy_heads_for(&self, team: Team) -> Option<&SoccerSkillPolicyHeads> {
+        match team {
+            Team::Home => self.skill_policy_heads.as_ref(),
+            Team::Away => {
+                if self.away_neural_learner.is_some() || self.away_neural_frozen {
+                    self.away_skill_policy_heads.as_ref()
+                } else {
+                    self.away_skill_policy_heads
+                        .as_ref()
+                        .or(self.skill_policy_heads.as_ref())
+                }
+            }
+        }
+    }
+
     fn neural_team_frozen(&self, team: Team) -> bool {
         match team {
             Team::Home => self.home_neural_frozen,
@@ -12469,6 +12437,8 @@ impl SoccerMatch {
         self.away_neural_learner = None;
         self.home_neural_frozen = false;
         self.away_neural_frozen = false;
+        self.skill_policy_heads = None;
+        self.away_skill_policy_heads = None;
     }
 
     /// True when this match runs distinct per-team neural brains (the away team
@@ -12498,6 +12468,11 @@ impl SoccerMatch {
                 snapshot.average_loss = learner.average_loss();
                 if let Some(policy_head) = &self.policy_head {
                     snapshot.policy_head = Some(Box::new(soccer_policy_head_snapshot(policy_head)));
+                }
+                if let Some(skill_policy_heads) = self.skill_policy_heads_for(team) {
+                    snapshot.skill_policy_heads = Some(Box::new(
+                        soccer_skill_policy_heads_snapshot(skill_policy_heads),
+                    ));
                 }
                 if let Some(line_depth_head) = &self.line_depth_head {
                     snapshot.line_depth_head = Some(Box::new(line_depth_head.to_snapshot()));
@@ -12667,8 +12642,13 @@ impl SoccerMatch {
                 Team::Home => self.neural_learner = None,
                 Team::Away => self.away_neural_learner = None,
             }
+            match team {
+                Team::Home => self.skill_policy_heads = None,
+                Team::Away => self.away_skill_policy_heads = None,
+            }
             return Ok(());
         }
+        let mut restored_skill_policy_heads = None;
         let learner = match snapshot {
             Some(snapshot) => {
                 let network = build_soccer_neural_network_from_snapshot(&snapshot)?;
@@ -12683,13 +12663,29 @@ impl SoccerMatch {
                         self.config.seed,
                     )?);
                 }
+                restored_skill_policy_heads = if let Some(skill_policy_heads_snapshot) =
+                    snapshot.skill_policy_heads.as_deref()
+                {
+                    Some(soccer_skill_policy_heads_from_snapshot(
+                        skill_policy_heads_snapshot,
+                        self.config.seed,
+                    )?)
+                } else {
+                    None
+                };
                 SoccerNeuralLearner::from_pretrained_snapshot(&self.config, network, &snapshot)
             }
             None if self.config.learning_enabled => SoccerNeuralLearner::new(&self.config),
             None => {
                 match team {
-                    Team::Home => self.neural_learner = None,
-                    Team::Away => self.away_neural_learner = None,
+                    Team::Home => {
+                        self.neural_learner = None;
+                        self.skill_policy_heads = None;
+                    }
+                    Team::Away => {
+                        self.away_neural_learner = None;
+                        self.away_skill_policy_heads = None;
+                    }
                 }
                 return Ok(());
             }
@@ -12698,10 +12694,12 @@ impl SoccerMatch {
             Team::Home => {
                 self.neural_learner = Some(learner);
                 self.home_neural_frozen = frozen;
+                self.skill_policy_heads = restored_skill_policy_heads;
             }
             Team::Away => {
                 self.away_neural_learner = Some(learner);
                 self.away_neural_frozen = frozen;
+                self.away_skill_policy_heads = restored_skill_policy_heads;
             }
         }
         Ok(())
@@ -12714,10 +12712,12 @@ impl SoccerMatch {
             Team::Home => {
                 self.neural_learner = None;
                 self.home_neural_frozen = true;
+                self.skill_policy_heads = None;
             }
             Team::Away => {
                 self.away_neural_learner = None;
                 self.away_neural_frozen = true;
+                self.away_skill_policy_heads = None;
             }
         }
     }
@@ -16360,8 +16360,7 @@ impl SoccerMatch {
                     .map(|dist| dist.iter().map(|&p| p.max(1e-8).ln()).collect());
                 // Specialist skill log-probs (pass/dribble/shot) over the same shared features.
                 let skill = if dd_soccer_enable_skill_policy_heads() {
-                    self.skill_policy_heads
-                        .as_ref()
+                    self.skill_policy_heads_for(team)
                         .map(|heads| heads.log_probs(&state_features))
                 } else {
                     None
@@ -16663,7 +16662,84 @@ impl SoccerMatch {
                 push_scored_candidate(candidate, expanded_plan);
             }
         }
+        // --- Forward-release root-candidate injection (DD_SOCCER_ENABLE_FORWARD_RELEASE_ROOT_CANDIDATE,
+        // default OFF ⇒ byte-identical). Targets the empirically-confirmed SELECTION bottleneck: exposure
+        // widening alone moved forward-share 0.00, because a qualified forward receiver ranked below the
+        // analytic top-3 (Cap B) never reaches the critic. When a qualified forward option is visible,
+        // inject the best forward receiver into the scored root regardless of Cap B, score it through the
+        // critic (with the action-param aim features), and add a bounded bias so it is CONSIDERED — the
+        // critic value can still outrank it (no forced argmax). Suppressed in forced-shot/killer-pass
+        // contexts unless a threaded goal pass overrides.
+        let mut injected_forward_target: Option<usize> = None;
+        if dd_soccer_enable_forward_release_root_candidate()
+            && observation.visible_forward_pass_options > 0
+            && observation.expected_pass_completion >= forward_release_min_completion()
+            && (!goal_attack_shot_is_required(observation, role)
+                || threaded_goal_pass_can_override_forced_shot(observation, role))
+        {
+            forward_release_diag_bump(ForwardReleaseStage::Eligible);
+            // Cap B drops the forward pass the ANALYTIC ranks LOW (risky forward-into-space), NOT the
+            // best-OPEN forward (which is already exposed in the top-N — targeting that was inert). So
+            // search the Cap-B-EXCLUDED tail of the analytic-ranked visible passes for the best-ranked
+            // target that is genuinely FORWARD (>= 4 yd upfield of the passer, attack-relative) and
+            // force THAT into the critic's view. By construction it is past the cap, so never exposed —
+            // no dedup needed. `min_quality` intentionally unused here: the critic + bias judge quality,
+            // which is the whole point (the analytic already under-rated it).
+            let forward_targets = snapshot.ranked_visible_pass_targets(player_id, 11);
+            let cap = neural_mcts_pass_target_candidate_limit();
+            let passer_pos = snapshot.player_position(player_id);
+            let attack_dir = team.attack_dir();
+            let excluded_forward = passer_pos.and_then(|pp| {
+                forward_targets.iter().skip(cap).copied().find(|&tid| {
+                    snapshot
+                        .player_position(tid)
+                        .map_or(false, |tp| (tp.y - pp.y) * attack_dir >= 4.0)
+                })
+            });
+            if let Some(target_player) = excluded_forward {
+                if let Some(target_point) = snapshot.player_position(target_player) {
+                    let synthetic_trace = SoccerLearnedActionTrace {
+                        label: "pass".to_string(),
+                        value: dp_policy_value_center,
+                        visits: 0,
+                        probability: 0.0,
+                        legal: true,
+                        level: PitchGridLevel::WholePitch,
+                    };
+                    let synthetic_plan = SoccerLearnedPlan {
+                        action: "pass1".to_string(),
+                        target_player: Some(target_player),
+                        target_point: Some(target_point),
+                        mpc_replan: None,
+                    };
+                    push_scored_candidate(&synthetic_trace, synthetic_plan);
+                    // Bias ONLY the just-injected candidate. push appends at most one and this is its
+                    // last use, so the closure's &mut is released; if the plan landed it is the LAST
+                    // element with our exact (target, "pass1") identity. last() — not a rev-scan —
+                    // avoids biasing an older same-target plan if push rejects it (Codex review).
+                    if let Some(last) = scored_candidates.last_mut() {
+                        if last.plan.as_ref().map_or(false, |p| {
+                            p.target_player == Some(target_player) && p.action == "pass1"
+                        }) {
+                            last.score += forward_release_bias();
+                            injected_forward_target = Some(target_player);
+                            forward_release_diag_bump(ForwardReleaseStage::Pushed);
+                        }
+                    }
+                }
+            }
+        }
         Self::apply_neural_mcts_pass_like_margin_gate_for_blend(blend, &mut scored_candidates);
+        if let Some(target_player) = injected_forward_target {
+            // Did the injected forward pass survive the pass-like margin gate (default 0.55)? This is
+            // exactly where a too-small bias silently prunes the treatment into inertness (Codex).
+            if scored_candidates
+                .iter()
+                .any(|c| c.plan.as_ref().and_then(|p| p.target_player) == Some(target_player))
+            {
+                forward_release_diag_bump(ForwardReleaseStage::SurvivedMarginGate);
+            }
+        }
         scored_candidates.sort_by(|a, b| {
             b.score
                 .total_cmp(&a.score)
@@ -19155,6 +19231,38 @@ impl SoccerMatch {
         }
     }
 
+    fn ensure_skill_policy_heads_for_training(&mut self, team: Team) {
+        match team {
+            Team::Home => self.ensure_skill_policy_heads(),
+            Team::Away => {
+                if self.away_skill_policy_heads.is_none() {
+                    self.away_skill_policy_heads = Some(SoccerSkillPolicyHeads::new(
+                        self.config.seed.wrapping_add(0xA11CE),
+                    ));
+                }
+            }
+        }
+    }
+
+    fn skill_policy_heads_for_training_mut(
+        &mut self,
+        team: Team,
+    ) -> Option<&mut SoccerSkillPolicyHeads> {
+        match team {
+            Team::Home => self.skill_policy_heads.as_mut(),
+            Team::Away => self.away_skill_policy_heads.as_mut(),
+        }
+    }
+
+    fn skill_policy_training_team(&self) -> Team {
+        if self.away_neural_learner.is_some() && self.home_neural_frozen && !self.away_neural_frozen
+        {
+            Team::Away
+        } else {
+            Team::Home
+        }
+    }
+
     fn ensure_keeper_policy_head(&mut self) {
         if self.keeper_policy_head.is_none() {
             self.keeper_policy_head = Some(SoccerKeeperPolicyHead::new(self.config.seed));
@@ -19625,9 +19733,10 @@ impl SoccerMatch {
             // by skill with balanced sizes and separate (unclipped) losses. Gated, default off.
             // Under the curriculum, a focused phase trains only the matching specialist.
             if dd_soccer_enable_skill_policy_heads() {
-                self.ensure_skill_policy_heads();
+                let training_team = self.skill_policy_training_team();
+                self.ensure_skill_policy_heads_for_training(training_team);
                 let focus = self.specialist_curriculum_focus();
-                if let Some(skill_heads) = &mut self.skill_policy_heads {
+                if let Some(skill_heads) = self.skill_policy_heads_for_training_mut(training_team) {
                     skill_heads.train_focused(&policy_samples, focus);
                 }
             }
@@ -22430,7 +22539,20 @@ impl SoccerMatch {
             + completed_forward_pass_count_bonus(pass.team, pass.origin, self.ball.position)
             + self.completed_pass_and_move_forward_reward(pass)
             + progressive_pass_escape_reward(pass, self.ball.position)
-            + self.overload_forward_pass_progression_bonus(pass, self.ball.position);
+            + self.overload_forward_pass_progression_bonus(pass, self.ball.position)
+            // Learned-EPV conversion bonus (DD_SOCCER_ENABLE_LEARNED_EPV): reward the completed pass by
+            // the DANGER it created — Φ_epv(reception) − Φ_epv(origin), scaled — scored on the ACTUAL
+            // reception point (`self.ball.position`), not the intended target, so underhit/deflected
+            // completions are not paid for danger they did not create (Codex). 0.0 when the grid/gate
+            // is off ⇒ byte-identical. Direct fix for "forward passes → territory + draws, not conversion".
+            + learned_epv_reward_scale()
+                * learned_epv_pass_delta(
+                    pass.team,
+                    pass.origin,
+                    self.ball.position,
+                    self.config.field_width_yards,
+                    self.config.field_length_yards,
+                );
         // Back-date the completed-pass reward to the PASS DECISION tick (launch), not the reception
         // tick, so the passer's actual decision transition gets credited (gated; off ⇒ current-tick).
         self.record_reward_event_deferred(pass.launch_tick, pass.from, amount);
