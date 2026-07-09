@@ -660,8 +660,14 @@ mod tests {
         assert_eq!(cfg.match_config.neural_learning.snapshot_every_batches, 8);
         assert!(cfg.match_config.neural_learning.target_popart_enabled);
         assert!(cfg.match_config.neural_learning.lp_coupling_enabled);
-        assert_eq!(cfg.match_config.neural_learning.mappo_team_reward_share, 0.6);
-        assert_eq!(cfg.match_config.neural_learning.marl_team_reward_weight, 0.55);
+        assert_eq!(
+            cfg.match_config.neural_learning.mappo_team_reward_share,
+            0.6
+        );
+        assert_eq!(
+            cfg.match_config.neural_learning.marl_team_reward_weight,
+            0.55
+        );
         assert_eq!(
             cfg.match_config
                 .neural_learning
