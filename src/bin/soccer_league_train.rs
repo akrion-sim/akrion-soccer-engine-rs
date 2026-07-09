@@ -27,8 +27,8 @@ use std::path::Path;
 use std::time::Instant;
 
 use soccer_engine::des::general::soccer::{
-    FacingBucket, MatchSummary, SoccerNeuralNetworkSnapshot, SoccerQStateKey, SoccerQTargetEntry,
-    TacticalPhase, Team,
+    learned_mpc_objective_enabled, FacingBucket, MatchSummary, SoccerNeuralNetworkSnapshot,
+    SoccerQStateKey, SoccerQTargetEntry, TacticalPhase, Team,
 };
 use soccer_engine::des::general::tournament::{
     EngineMatchRunner, EngineMatchRunnerConfig, TeamBrain, TournamentMatchContext,
@@ -70,6 +70,17 @@ fn apply_league_neural_mcts_config(config: &mut EngineMatchRunnerConfig) -> bool
     enabled
 }
 
+fn league_worker_count(requested_workers: usize, fixture_count: usize) -> usize {
+    let capped = requested_workers.clamp(1, fixture_count.max(1));
+    let serial_for_mpc_objective =
+        learned_mpc_objective_enabled() && env_bool("SOCCER_LEAGUE_MPC_OBJECTIVE_SERIAL", true);
+    if serial_for_mpc_objective {
+        1
+    } else {
+        capped
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct LeagueMatchKpis {
     goal_diff: i32,
@@ -96,6 +107,13 @@ struct LeagueMatchKpis {
     crosses_completed_for: u32,
     pass_chain_gain_yards_for: f64,
     pass_chain_net_losses_for: u32,
+    learned_policy_option_decisions: u32,
+    learned_policy_multi_option_decisions: u32,
+    learned_policy_legal_action_options: u32,
+    learned_mpc_replans: u32,
+    learned_mpc_replans_mpc: u32,
+    learned_mpc_replans_option_score_safety: u32,
+    learned_mpc_replans_neural_mcts: u32,
     objective_fitness: f64,
     objective_fitness_margin: f64,
 }
@@ -134,6 +152,14 @@ impl LeagueMatchKpis {
                 crosses_completed_for: stats.crosses_completed_home,
                 pass_chain_gain_yards_for: stats.pass_chain_gain_yards_home,
                 pass_chain_net_losses_for: stats.pass_chains_net_loss_home,
+                learned_policy_option_decisions: stats.learned_policy_option_decisions,
+                learned_policy_multi_option_decisions: stats.learned_policy_multi_option_decisions,
+                learned_policy_legal_action_options: stats.learned_policy_legal_action_options,
+                learned_mpc_replans: stats.learned_mpc_replans,
+                learned_mpc_replans_mpc: stats.learned_mpc_replans_mpc,
+                learned_mpc_replans_option_score_safety: stats
+                    .learned_mpc_replans_option_score_safety,
+                learned_mpc_replans_neural_mcts: stats.learned_mpc_replans_neural_mcts,
                 objective_fitness: home_net_forward as f64,
                 objective_fitness_margin: (home_net_forward - away_net_forward) as f64,
             },
@@ -163,6 +189,14 @@ impl LeagueMatchKpis {
                 crosses_completed_for: stats.crosses_completed_away,
                 pass_chain_gain_yards_for: stats.pass_chain_gain_yards_away,
                 pass_chain_net_losses_for: stats.pass_chains_net_loss_away,
+                learned_policy_option_decisions: stats.learned_policy_option_decisions,
+                learned_policy_multi_option_decisions: stats.learned_policy_multi_option_decisions,
+                learned_policy_legal_action_options: stats.learned_policy_legal_action_options,
+                learned_mpc_replans: stats.learned_mpc_replans,
+                learned_mpc_replans_mpc: stats.learned_mpc_replans_mpc,
+                learned_mpc_replans_option_score_safety: stats
+                    .learned_mpc_replans_option_score_safety,
+                learned_mpc_replans_neural_mcts: stats.learned_mpc_replans_neural_mcts,
                 objective_fitness: away_net_forward as f64,
                 objective_fitness_margin: (away_net_forward - home_net_forward) as f64,
             },
@@ -197,6 +231,13 @@ struct LeagueRoundKpis {
     crosses_completed_for: u32,
     pass_chain_gain_yards_for: f64,
     pass_chain_net_losses_for: u32,
+    learned_policy_option_decisions: u32,
+    learned_policy_multi_option_decisions: u32,
+    learned_policy_legal_action_options: u32,
+    learned_mpc_replans: u32,
+    learned_mpc_replans_mpc: u32,
+    learned_mpc_replans_option_score_safety: u32,
+    learned_mpc_replans_neural_mcts: u32,
     objective_fitness_sum: f64,
     objective_fitness_margin_sum: f64,
 }
@@ -254,6 +295,27 @@ impl LeagueRoundKpis {
         self.pass_chain_net_losses_for = self
             .pass_chain_net_losses_for
             .saturating_add(kpis.pass_chain_net_losses_for);
+        self.learned_policy_option_decisions = self
+            .learned_policy_option_decisions
+            .saturating_add(kpis.learned_policy_option_decisions);
+        self.learned_policy_multi_option_decisions = self
+            .learned_policy_multi_option_decisions
+            .saturating_add(kpis.learned_policy_multi_option_decisions);
+        self.learned_policy_legal_action_options = self
+            .learned_policy_legal_action_options
+            .saturating_add(kpis.learned_policy_legal_action_options);
+        self.learned_mpc_replans = self
+            .learned_mpc_replans
+            .saturating_add(kpis.learned_mpc_replans);
+        self.learned_mpc_replans_mpc = self
+            .learned_mpc_replans_mpc
+            .saturating_add(kpis.learned_mpc_replans_mpc);
+        self.learned_mpc_replans_option_score_safety = self
+            .learned_mpc_replans_option_score_safety
+            .saturating_add(kpis.learned_mpc_replans_option_score_safety);
+        self.learned_mpc_replans_neural_mcts = self
+            .learned_mpc_replans_neural_mcts
+            .saturating_add(kpis.learned_mpc_replans_neural_mcts);
         self.objective_fitness_sum += kpis.objective_fitness;
         self.objective_fitness_margin_sum += kpis.objective_fitness_margin;
     }
@@ -983,7 +1045,7 @@ fn main() {
     let actor_critic_enabled = runner_config.base.neural_blend.actor_critic;
     let lp_coupling_enabled = runner_config.base.neural_learning.lp_coupling_enabled;
     // Keep the engine's designed independent-brain mode (per-team critic drives each side).
-    let runner = EngineMatchRunner::new(runner_config);
+    let mut runner = EngineMatchRunner::new(runner_config);
 
     let mut frontier = match load_brain(&frontier_path) {
         Some(brain) => {
@@ -1113,64 +1175,100 @@ fn main() {
                 fixture += 1;
             }
         }
-        let workers = env_usize("SOCCER_LEAGUE_PARALLELISM", 3).clamp(1, fixtures.len().max(1));
+        let requested_workers = env_usize("SOCCER_LEAGUE_PARALLELISM", 3);
+        let workers = league_worker_count(requested_workers, fixtures.len());
+        if workers < requested_workers.clamp(1, fixtures.len().max(1)) {
+            println!(
+                "league_parallelism_serialized_for_mpc_objective requested_workers={} active_workers={} fixtures={} opt_out_env=SOCCER_LEAGUE_MPC_OBJECTIVE_SERIAL=0",
+                requested_workers,
+                workers,
+                fixtures.len()
+            );
+        }
         let base_steps = frontier
             .neural
             .as_ref()
             .map(|s| s.training_steps)
             .unwrap_or(0);
-        let chunk = fixtures.len().div_ceil(workers);
-        let wins_a = std::sync::atomic::AtomicI32::new(0);
-        let losses_a = std::sync::atomic::AtomicI32::new(0);
-        let trained_brains = std::sync::Mutex::new(Vec::<TeamBrain>::new());
-        let match_kpis = std::sync::Mutex::new(Vec::<LeagueMatchKpis>::new());
-        std::thread::scope(|scope| {
-            for w in 0..workers {
-                let lo = w * chunk;
-                let hi = ((w + 1) * chunk).min(fixtures.len());
-                if lo >= hi {
-                    continue;
-                }
-                let slice = &fixtures[lo..hi];
-                let opponents = &opponents;
-                let wins_a = &wins_a;
-                let losses_a = &losses_a;
-                let trained_brains = &trained_brains;
-                let match_kpis = &match_kpis;
-                let mut runner = runner.clone();
-                let mut wf = frontier.clone();
-                scope.spawn(move || {
-                    use std::sync::atomic::Ordering::Relaxed;
-                    for fx in slice {
-                        let (t, kpis) = play_and_carry(
-                            &mut runner,
-                            wf,
-                            &opponents[fx.opp_idx],
-                            fx.seed,
-                            fx.home,
-                            fx.opp_id,
-                        );
-                        wf = t;
-                        if let Some(kpis) = kpis {
-                            if kpis.goal_diff > 0 {
-                                wins_a.fetch_add(1, Relaxed);
-                            } else if kpis.goal_diff < 0 {
-                                losses_a.fetch_add(1, Relaxed);
-                            }
-                            match_kpis.lock().unwrap().push(kpis);
-                        }
-                    }
-                    trained_brains.lock().unwrap().push(wf);
-                });
-            }
-        });
-        let wins = wins_a.load(std::sync::atomic::Ordering::Relaxed);
-        let losses = losses_a.load(std::sync::atomic::Ordering::Relaxed);
-        let trained_brains = trained_brains.into_inner().unwrap();
         let mut round_kpis = LeagueRoundKpis::default();
-        for kpis in match_kpis.into_inner().unwrap() {
-            round_kpis.add(kpis);
-        }
+        let (wins, losses, trained_brains) = if workers == 1 {
+            let mut wins = 0i32;
+            let mut losses = 0i32;
+            for fx in &fixtures {
+                let (trained, kpis) = play_and_carry(
+                    &mut runner,
+                    frontier,
+                    &opponents[fx.opp_idx],
+                    fx.seed,
+                    fx.home,
+                    fx.opp_id,
+                );
+                frontier = trained;
+                if let Some(kpis) = kpis {
+                    if kpis.goal_diff > 0 {
+                        wins += 1;
+                    } else if kpis.goal_diff < 0 {
+                        losses += 1;
+                    }
+                    round_kpis.add(kpis);
+                }
+            }
+            (wins, losses, vec![frontier.clone()])
+        } else {
+            let chunk = fixtures.len().div_ceil(workers);
+            let wins_a = std::sync::atomic::AtomicI32::new(0);
+            let losses_a = std::sync::atomic::AtomicI32::new(0);
+            let trained_brains = std::sync::Mutex::new(Vec::<TeamBrain>::new());
+            let match_kpis = std::sync::Mutex::new(Vec::<LeagueMatchKpis>::new());
+            std::thread::scope(|scope| {
+                for w in 0..workers {
+                    let lo = w * chunk;
+                    let hi = ((w + 1) * chunk).min(fixtures.len());
+                    if lo >= hi {
+                        continue;
+                    }
+                    let slice = &fixtures[lo..hi];
+                    let opponents = &opponents;
+                    let wins_a = &wins_a;
+                    let losses_a = &losses_a;
+                    let trained_brains = &trained_brains;
+                    let match_kpis = &match_kpis;
+                    let mut runner = runner.clone();
+                    let mut wf = frontier.clone();
+                    scope.spawn(move || {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        for fx in slice {
+                            let (t, kpis) = play_and_carry(
+                                &mut runner,
+                                wf,
+                                &opponents[fx.opp_idx],
+                                fx.seed,
+                                fx.home,
+                                fx.opp_id,
+                            );
+                            wf = t;
+                            if let Some(kpis) = kpis {
+                                if kpis.goal_diff > 0 {
+                                    wins_a.fetch_add(1, Relaxed);
+                                } else if kpis.goal_diff < 0 {
+                                    losses_a.fetch_add(1, Relaxed);
+                                }
+                                match_kpis.lock().unwrap().push(kpis);
+                            }
+                        }
+                        trained_brains.lock().unwrap().push(wf);
+                    });
+                }
+            });
+            for kpis in match_kpis.into_inner().unwrap() {
+                round_kpis.add(kpis);
+            }
+            (
+                wins_a.load(std::sync::atomic::Ordering::Relaxed),
+                losses_a.load(std::sync::atomic::Ordering::Relaxed),
+                trained_brains.into_inner().unwrap(),
+            )
+        };
         let trained_snapshots = trained_brains
             .iter()
             .filter_map(|brain| brain.neural.clone())
@@ -1255,6 +1353,12 @@ fn main() {
         };
         let mean_forward_pass_margin = round_kpis.mean_forward_pass_margin();
         let mean_net_forward_pass_margin = round_kpis.mean_net_forward_pass_margin();
+        let learned_mpc_replan_rate = if round_kpis.learned_policy_option_decisions == 0 {
+            0.0
+        } else {
+            round_kpis.learned_mpc_replans as f64
+                / round_kpis.learned_policy_option_decisions as f64
+        };
         println!(
             "league_advancement round={round} metric=completed_forward_passes games={} forward_passes_for={} forward_passes_against={} forward_pass_margin={} forward_pass_margin_per_game={:.3} pass_turnovers_for={} pass_turnovers_against={} net_forward_passes_for={} net_forward_passes_against={} net_forward_pass_margin={} net_forward_pass_margin_per_game={:.3}",
             round_kpis.games,
@@ -1270,7 +1374,7 @@ fn main() {
             mean_net_forward_pass_margin,
         );
         println!(
-            "league_kpi round={round} games={} advancement_metric=completed_forward_passes net_metric=completed_forward_passes_minus_turnovers forward_pass_margin_per_game={:.3} net_forward_pass_margin_per_game={:.3} objective_net_forward_passes={:.3} objective_net_forward_pass_margin={:.3} gd_total={} gd_per_game={:.2} goals_for={} goals_against={} shots_for={} shots_against={} sot_for={} sot_against={} shots_after_pass={} pass_completion={:.3} completed_passes={} forward_passes={} backward_passes={} dribble_beats={} assists={} crosses={} chain_gain_yards={:.1} chain_net_losses={}",
+            "league_kpi round={round} games={} advancement_metric=completed_forward_passes net_metric=completed_forward_passes_minus_turnovers forward_pass_margin_per_game={:.3} net_forward_pass_margin_per_game={:.3} objective_net_forward_passes={:.3} objective_net_forward_pass_margin={:.3} gd_total={} gd_per_game={:.2} goals_for={} goals_against={} shots_for={} shots_against={} sot_for={} sot_against={} shots_after_pass={} pass_completion={:.3} completed_passes={} forward_passes={} backward_passes={} dribble_beats={} assists={} crosses={} chain_gain_yards={:.1} chain_net_losses={} learned_policy_option_decisions={} learned_policy_multi_option_decisions={} learned_policy_legal_action_options={} learned_mpc_replans={} learned_mpc_replans_mpc={} learned_mpc_replans_option_score_safety={} learned_mpc_replans_neural_mcts={} learned_mpc_replan_rate={:.3}",
             round_kpis.games,
             mean_forward_pass_margin,
             mean_net_forward_pass_margin,
@@ -1294,6 +1398,14 @@ fn main() {
             round_kpis.crosses_completed_for,
             round_kpis.pass_chain_gain_yards_for,
             round_kpis.pass_chain_net_losses_for,
+            round_kpis.learned_policy_option_decisions,
+            round_kpis.learned_policy_multi_option_decisions,
+            round_kpis.learned_policy_legal_action_options,
+            round_kpis.learned_mpc_replans,
+            round_kpis.learned_mpc_replans_mpc,
+            round_kpis.learned_mpc_replans_option_score_safety,
+            round_kpis.learned_mpc_replans_neural_mcts,
+            learned_mpc_replan_rate,
         );
 
         // Temporal checkpoint into the league (growing diversity of past selves).
@@ -1696,6 +1808,24 @@ mod tests {
         assert!(config.base.mpc.reconcile_enabled);
         assert!(config.base.mpc.field_aware_enabled);
         assert!(config.base.mpc.latent_objective_enabled);
+    }
+
+    #[test]
+    fn league_trainer_serializes_parallelism_for_carried_mpc_objective() {
+        let _lock = env_lock().lock().unwrap();
+        let _mpc_guard = EnvVarGuard::set("DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE", "1");
+        let _serial_guard = EnvVarGuard::clear("SOCCER_LEAGUE_MPC_OBJECTIVE_SERIAL");
+
+        assert_eq!(league_worker_count(4, 8), 1);
+    }
+
+    #[test]
+    fn league_trainer_allows_parallel_mpc_objective_opt_out() {
+        let _lock = env_lock().lock().unwrap();
+        let _mpc_guard = EnvVarGuard::set("DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE", "1");
+        let _serial_guard = EnvVarGuard::set("SOCCER_LEAGUE_MPC_OBJECTIVE_SERIAL", "0");
+
+        assert_eq!(league_worker_count(4, 8), 4);
     }
 
     #[test]
