@@ -31171,6 +31171,9 @@ impl SoccerMatch {
                 self.ball.untargeted_long_ball_flight = None;
                 self.ball.untargeted_long_ball_launcher = None;
                 if let Some(shot) = shot {
+                    // Learned-MPC shot-placement credit: shot left play off target (−1.0). Emitted
+                    // before `shot` moves into the miss recorder.
+                    self.record_shot_objective_sample(&shot, ShotObjectiveOutcome::Missed);
                     self.record_missed_shot_outcome(shot, Some(shot_off_target_yards));
                 }
                 let restart_kind = restart.kind;
