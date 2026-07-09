@@ -42982,6 +42982,11 @@ fn soccer_policy_head_from_snapshot(
             .fold((0.0, 0usize), |(sum, count), loss| (sum + loss, count + 1));
         (count > 0).then_some(sum / count as f64)
     });
+    head.forward_select_logit_weight = if snapshot.forward_select_logit_weight.is_finite() {
+        snapshot.forward_select_logit_weight
+    } else {
+        0.0
+    };
     Ok(head)
 }
 
