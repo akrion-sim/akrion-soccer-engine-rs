@@ -39,10 +39,10 @@ form; the only latent issue is `γ=1` vs the learner's true discount (see
 ### C. Flat state-conditioned bonuses — NOT potential-based (review)
 Constant reward for being in a state, with no canceling `−Φ(s)` on exit. Each
 is a per-step bias the policy can accumulate by loitering in the rewarded state.
-- `reward += 0.09` for a pass-state condition (~L19065), `reward += 0.08` (~L19233),
-  `reward += 0.18 * role_multiplier * half_multiplier` (~L19205).
-- Fixed penalties not tied to an action outcome: `reward -= 0.42` (~L19208),
-  `-= 0.22` (~L19244), `-= 0.16` (~L19278).
+- `reward += 0.09` for a pass-state condition (~L27204), `reward += 0.08` (~L27444),
+  `reward += 0.18 * role_multiplier * half_multiplier` (~L27378).
+- Fixed penalties not tied to an action outcome: `reward -= 0.42` (~L27381),
+  `-= 0.22` (~L27455), `-= 0.16` (~L27489).
 - `EFFORT_REWARD_POINTS` / `LAZINESS_PENALTY_POINTS` (~L19016/19018) — effort
   bonuses; defensible as B if expressed as a *closing-distance delta*, a bias if
   flat per tick.
