@@ -353,7 +353,7 @@ fn main() {
     // --- PARITY GATE (validated FIRST) ---
     println!("\n--- PARITY GATE (natural pass re-forced must ≈ natural) ---");
     let parity_mean = mean(&parity_deltas);
-    let (p_lo, p_hi) = bootstrap_ci(&parity_deltas, 4000, 5.0, 95.0, 0xPAR1TY ^ 0);
+    let (p_lo, p_hi) = bootstrap_ci(&parity_deltas, 4000, 5.0, 95.0, 0x9A17_C0DE);
     let parity_has_samples = !parity_deltas.is_empty();
     println!(
         "parity_states={parity_states} parity_seed_pairs={} mean|forced_nat - natural| = {parity_mean:.5}  90% CI [{p_lo:.5}, {p_hi:.5}]  (tol={PARITY_TOL})",
