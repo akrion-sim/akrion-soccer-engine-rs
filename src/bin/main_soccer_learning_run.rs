@@ -3833,6 +3833,7 @@ fn maybe_apply_latest_postgres_neural_snapshot(
     next_episode: usize,
     store: &mut SoccerLearningPgStore,
     experiment_id: &str,
+    active_policy_version_id: Option<&str>,
     latest_neural_network: &mut Option<SoccerNeuralNetworkSnapshot>,
     active_neural_network_fingerprint: &mut Option<u64>,
 ) -> Result<bool, Box<dyn Error>> {
@@ -3845,6 +3846,17 @@ fn maybe_apply_latest_postgres_neural_snapshot(
     let Some(snapshot) = metadata.neural_network else {
         return Ok(false);
     };
+    if active_policy_version_id.is_some_and(|policy_version_id| policy_version_id != metadata.id) {
+        println!(
+            "{}_skipped next_episode={} policy_version={} active_policy_version={} generation={} reason=different-policy-version",
+            event_label,
+            next_episode,
+            metadata.id,
+            active_policy_version_id.unwrap_or("none"),
+            metadata.generation
+        );
+        return Ok(false);
+    }
     let fingerprint = soccer_neural_network_snapshot_fingerprint(&snapshot);
     if Some(fingerprint) == *active_neural_network_fingerprint {
         return Ok(false);
@@ -3974,18 +3986,19 @@ fn refresh_postgres_policy_for_next_sim(
             )
             .map_err(invalid_data)?
         {
-            let version_neural_network_fingerprint = version
+            let mut version = version;
+            let mut version_neural_network_fingerprint = version
                 .neural_network
                 .as_ref()
                 .map(soccer_neural_network_snapshot_fingerprint);
-            let version_policy_fingerprint = version
+            let mut version_policy_fingerprint = version
                 .policy_fingerprint
                 .or_else(|| Some(soccer_team_q_policies_fingerprint(&version.policies)));
-            let version_tactical_learning_fingerprint = version
+            let mut version_tactical_learning_fingerprint = version
                 .tactical_learning
                 .as_ref()
                 .map(soccer_tactical_learning_weights_fingerprint);
-            let version_policy_promotion_baseline =
+            let mut version_policy_promotion_baseline =
                 policy_promotion_incumbent_baseline_from_search_metadata(
                     version.search_metadata.as_ref(),
                 );
@@ -3997,6 +4010,47 @@ fn refresh_postgres_policy_for_next_sim(
                     policy_promotion_baseline_lookback_generations,
                     policy_promotion_gate_min_sample_games,
                 )?;
+            if let Some((pg_baseline, _)) = strongest_policy_promotion_baseline.as_ref() {
+                if pg_baseline.policy_version_id != version.id {
+                    if let Some(strongest_version) = store
+                        .load_policy_version_with_min_visits(
+                            &pg_baseline.policy_version_id,
+                            options.clone(),
+                            options.clone(),
+                            resume_min_visits(),
+                        )
+                        .map_err(invalid_data)?
+                    {
+                        println!(
+                            "postgres_refresh_policy_switched_to_strongest_baseline next_episode={} latest_policy_version={} latest_generation={} strongest_policy_version={} strongest_generation={} sample_games={} mean_match_fitness={:.4} mean_play_quality={:.4}",
+                            next_episode,
+                            version.id,
+                            version.generation,
+                            pg_baseline.policy_version_id,
+                            pg_baseline.generation,
+                            pg_baseline.sample_games,
+                            pg_baseline.mean_match_fitness,
+                            pg_baseline.mean_play_quality
+                        );
+                        version = strongest_version;
+                        version_neural_network_fingerprint = version
+                            .neural_network
+                            .as_ref()
+                            .map(soccer_neural_network_snapshot_fingerprint);
+                        version_policy_fingerprint = version.policy_fingerprint.or_else(|| {
+                            Some(soccer_team_q_policies_fingerprint(&version.policies))
+                        });
+                        version_tactical_learning_fingerprint = version
+                            .tactical_learning
+                            .as_ref()
+                            .map(soccer_tactical_learning_weights_fingerprint);
+                        version_policy_promotion_baseline =
+                            policy_promotion_incumbent_baseline_from_search_metadata(
+                                version.search_metadata.as_ref(),
+                            );
+                    }
+                }
+            }
             let version_refresh_decision =
                 soccer_postgres_policy_refresh_decision(SoccerPostgresPolicyRefreshCheck {
                     current_policy_version_id: pg_base_policy_version_id.as_deref(),
@@ -4080,6 +4134,7 @@ fn refresh_postgres_policy_for_next_sim(
         next_episode,
         store,
         experiment_id,
+        pg_base_policy_version_id.as_deref(),
         latest_neural_network,
         pg_base_neural_network_fingerprint,
     )? {
@@ -4168,10 +4223,11 @@ fn reset_policy_to_strongest_promotion_baseline(
         pg_baseline.mean_match_fitness,
         pg_baseline.mean_play_quality
     );
+    let reset_policy_version_id = version.id.clone();
     *policies = version.policies;
     *latest_neural_network = version.neural_network;
-    *pg_base_policy_version_id = Some(version.id.clone());
-    *pg_last_policy_version_id = Some(version.id);
+    *pg_base_policy_version_id = Some(reset_policy_version_id.clone());
+    *pg_last_policy_version_id = Some(reset_policy_version_id.clone());
     *pg_generation = version.generation;
     *pg_base_policy_version_updated_at_micros = version.updated_at_micros;
     *pg_base_policy_fingerprint = version_policy_fingerprint;
@@ -4184,6 +4240,7 @@ fn reset_policy_to_strongest_promotion_baseline(
         completed_games,
         store,
         experiment_id,
+        Some(reset_policy_version_id.as_str()),
         latest_neural_network,
         pg_base_neural_network_fingerprint,
     )?;
@@ -8725,6 +8782,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                         0,
                         store,
                         &experiment_id,
+                        Some(resumed_policy_version_id.as_str()),
                         &mut initial_neural_network,
                         &mut pg_base_neural_network_fingerprint,
                     )?;

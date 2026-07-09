@@ -231,6 +231,128 @@ where
     ) {
         cfg.match_config.neural_learning.backend = backend;
     }
+    if let Some(learning_rate) = env_positive_f64(
+        &lookup,
+        "SOCCER_LIVE_NEURAL_LEARNING_RATE",
+        "SOCCER_NEURAL_LEARNING_RATE",
+    ) {
+        cfg.match_config.neural_learning.learning_rate = learning_rate;
+    }
+    if let Some(batch_size) = env_positive_usize(
+        &lookup,
+        "SOCCER_LIVE_NEURAL_BATCH_SIZE",
+        "SOCCER_NEURAL_BATCH_SIZE",
+    ) {
+        cfg.match_config.neural_learning.batch_size = batch_size;
+    }
+    if let Some(train_every_ticks) = env_positive_usize(
+        &lookup,
+        "SOCCER_LIVE_NEURAL_TRAIN_EVERY_TICKS",
+        "SOCCER_NEURAL_TRAIN_EVERY_TICKS",
+    ) {
+        cfg.match_config.neural_learning.train_every_ticks = train_every_ticks;
+    }
+    if let Some(max_batches_per_tick) = env_positive_usize(
+        &lookup,
+        "SOCCER_LIVE_NEURAL_MAX_BATCHES_PER_TICK",
+        "SOCCER_NEURAL_MAX_BATCHES_PER_TICK",
+    ) {
+        cfg.match_config.neural_learning.max_batches_per_tick = max_batches_per_tick;
+    }
+    if let Some(hidden_units) = env_positive_usize(
+        &lookup,
+        "SOCCER_LIVE_NEURAL_HIDDEN_UNITS",
+        "SOCCER_NEURAL_HIDDEN_UNITS",
+    ) {
+        cfg.match_config.neural_learning.hidden_units = hidden_units;
+    }
+    if let Some(target_scale) = env_positive_f64(
+        &lookup,
+        "SOCCER_LIVE_NEURAL_TARGET_SCALE",
+        "SOCCER_NEURAL_TARGET_SCALE",
+    ) {
+        cfg.match_config.neural_learning.target_scale = target_scale;
+    }
+    if let Some(target_clip) = env_positive_f64(
+        &lookup,
+        "SOCCER_LIVE_NEURAL_TARGET_CLIP",
+        "SOCCER_NEURAL_TARGET_CLIP",
+    ) {
+        cfg.match_config.neural_learning.target_clip = target_clip;
+    }
+    if let Some(max_pending_batches) = env_positive_usize(
+        &lookup,
+        "SOCCER_LIVE_NEURAL_MAX_PENDING_BATCHES",
+        "SOCCER_NEURAL_MAX_PENDING_BATCHES",
+    ) {
+        cfg.match_config.neural_learning.max_pending_batches = max_pending_batches;
+    }
+    if let Some(replay_capacity) = env_positive_usize(
+        &lookup,
+        "SOCCER_LIVE_NEURAL_REPLAY_CAPACITY",
+        "SOCCER_NEURAL_REPLAY_CAPACITY",
+    ) {
+        cfg.match_config.neural_learning.replay_capacity = replay_capacity;
+    }
+    if let Some(replay_samples_per_tick) = env_positive_usize(
+        &lookup,
+        "SOCCER_LIVE_NEURAL_REPLAY_SAMPLES_PER_TICK",
+        "SOCCER_NEURAL_REPLAY_SAMPLES_PER_TICK",
+    ) {
+        cfg.match_config.neural_learning.replay_samples_per_tick = replay_samples_per_tick;
+    }
+    if let Some(snapshot_every_batches) = env_positive_usize(
+        &lookup,
+        "SOCCER_LIVE_NEURAL_SNAPSHOT_EVERY_BATCHES",
+        "SOCCER_NEURAL_SNAPSHOT_EVERY_BATCHES",
+    ) {
+        cfg.match_config.neural_learning.snapshot_every_batches = snapshot_every_batches;
+    }
+    if let Some(target_popart) = env_bool(
+        &lookup,
+        "SOCCER_LIVE_NEURAL_TARGET_POPART",
+        "SOCCER_NEURAL_TARGET_POPART",
+    ) {
+        cfg.match_config.neural_learning.target_popart_enabled = target_popart;
+    }
+    if let Some(lp_coupling) = env_bool(
+        &lookup,
+        "SOCCER_LIVE_NEURAL_LP_COUPLING_ENABLED",
+        "SOCCER_NEURAL_LP_COUPLING_ENABLED",
+    ) {
+        cfg.match_config.neural_learning.lp_coupling_enabled = lp_coupling;
+    }
+    if let Some(mappo_team_reward_share) = env_nonnegative_f64(
+        &lookup,
+        "SOCCER_LIVE_MAPPO_TEAM_REWARD_SHARE",
+        "SOCCER_MAPPO_TEAM_REWARD_SHARE",
+    ) {
+        cfg.match_config.neural_learning.mappo_team_reward_share =
+            mappo_team_reward_share.clamp(0.0, 1.0);
+    }
+    if let Some(marl_team_reward_weight) = env_nonnegative_f64(
+        &lookup,
+        "SOCCER_LIVE_MARL_TEAM_REWARD_WEIGHT",
+        "SOCCER_MARL_TEAM_REWARD_WEIGHT",
+    ) {
+        cfg.match_config.neural_learning.marl_team_reward_weight = marl_team_reward_weight;
+    }
+    if let Some(marl_intermediate_reward_weight) = env_nonnegative_f64(
+        &lookup,
+        "SOCCER_LIVE_MARL_INTERMEDIATE_REWARD_WEIGHT",
+        "SOCCER_MARL_INTERMEDIATE_REWARD_WEIGHT",
+    ) {
+        cfg.match_config
+            .neural_learning
+            .marl_intermediate_reward_weight = marl_intermediate_reward_weight;
+    }
+    if let Some(mappo_clip_epsilon) = env_nonnegative_f64(
+        &lookup,
+        "SOCCER_LIVE_MAPPO_CLIP_EPSILON",
+        "SOCCER_MAPPO_CLIP_EPSILON",
+    ) {
+        cfg.match_config.neural_learning.mappo_clip_epsilon = mappo_clip_epsilon;
+    }
     if let Some(mode) = env_neural_blend_mode(
         &lookup,
         "SOCCER_LIVE_NEURAL_BLEND_MODE",
@@ -265,6 +387,13 @@ where
         "SOCCER_NEURAL_ACTOR_CRITIC",
     ) {
         cfg.match_config.neural_blend.actor_critic = actor_critic;
+    }
+    if let Some(world_model) = env_bool(
+        &lookup,
+        "SOCCER_LIVE_NEURAL_WORLD_MODEL",
+        "SOCCER_NEURAL_WORLD_MODEL",
+    ) {
+        cfg.match_config.neural_blend.world_model = world_model;
     }
     if let Some(mcts_enabled) = env_bool(
         &lookup,
@@ -473,12 +602,30 @@ mod tests {
             ("SOCCER_LIVE_HTTP_WORKERS", "6"),
             ("SOCCER_LIVE_NEURAL_LEARNING_ENABLED", "1"),
             ("SOCCER_LIVE_NEURAL_LEARNING_BACKEND", "threaded"),
+            ("SOCCER_LIVE_NEURAL_LEARNING_RATE", "0.035"),
+            ("SOCCER_LIVE_NEURAL_BATCH_SIZE", "64"),
+            ("SOCCER_LIVE_NEURAL_TRAIN_EVERY_TICKS", "1"),
+            ("SOCCER_LIVE_NEURAL_MAX_BATCHES_PER_TICK", "6"),
+            ("SOCCER_LIVE_NEURAL_HIDDEN_UNITS", "128"),
+            ("SOCCER_LIVE_NEURAL_TARGET_SCALE", "8"),
+            ("SOCCER_LIVE_NEURAL_TARGET_CLIP", "8"),
+            ("SOCCER_LIVE_NEURAL_MAX_PENDING_BATCHES", "128"),
+            ("SOCCER_LIVE_NEURAL_REPLAY_CAPACITY", "8192"),
+            ("SOCCER_LIVE_NEURAL_REPLAY_SAMPLES_PER_TICK", "128"),
+            ("SOCCER_LIVE_NEURAL_SNAPSHOT_EVERY_BATCHES", "8"),
+            ("SOCCER_LIVE_NEURAL_TARGET_POPART", "1"),
+            ("SOCCER_LIVE_NEURAL_LP_COUPLING_ENABLED", "1"),
             ("SOCCER_LIVE_NEURAL_BLEND_MODE", "authoritative"),
             ("SOCCER_LIVE_NEURAL_BLEND_LAMBDA", "1.25"),
             ("SOCCER_LIVE_NEURAL_BLEND_WARMUP_STEPS", "0"),
             ("SOCCER_LIVE_NEURAL_BLEND_CANDIDATES", "12"),
             ("SOCCER_LIVE_NEURAL_ACTOR_CRITIC", "1"),
+            ("SOCCER_LIVE_NEURAL_WORLD_MODEL", "1"),
             ("SOCCER_LIVE_NEURAL_MCTS_ENABLED", "0"),
+            ("SOCCER_LIVE_MAPPO_TEAM_REWARD_SHARE", "0.6"),
+            ("SOCCER_LIVE_MARL_TEAM_REWARD_WEIGHT", "0.55"),
+            ("SOCCER_LIVE_MARL_INTERMEDIATE_REWARD_WEIGHT", "1.0"),
+            ("SOCCER_LIVE_MAPPO_CLIP_EPSILON", "0.15"),
             ("SOCCER_LIVE_ADVERSARIAL_EMBEDDING_ENABLED", "yes"),
             ("SOCCER_LIVE_POLICY_AUTOLOAD_MAX_BYTES", "123456"),
         ]);
@@ -497,6 +644,37 @@ mod tests {
             cfg.match_config.neural_learning.backend,
             SoccerNeuralLearningBackend::Threaded
         );
+        assert_eq!(cfg.match_config.neural_learning.learning_rate, 0.035);
+        assert_eq!(cfg.match_config.neural_learning.batch_size, 64);
+        assert_eq!(cfg.match_config.neural_learning.train_every_ticks, 1);
+        assert_eq!(cfg.match_config.neural_learning.max_batches_per_tick, 6);
+        assert_eq!(cfg.match_config.neural_learning.hidden_units, 128);
+        assert_eq!(cfg.match_config.neural_learning.target_scale, 8.0);
+        assert_eq!(cfg.match_config.neural_learning.target_clip, 8.0);
+        assert_eq!(cfg.match_config.neural_learning.max_pending_batches, 128);
+        assert_eq!(cfg.match_config.neural_learning.replay_capacity, 8192);
+        assert_eq!(
+            cfg.match_config.neural_learning.replay_samples_per_tick,
+            128
+        );
+        assert_eq!(cfg.match_config.neural_learning.snapshot_every_batches, 8);
+        assert!(cfg.match_config.neural_learning.target_popart_enabled);
+        assert!(cfg.match_config.neural_learning.lp_coupling_enabled);
+        assert_eq!(
+            cfg.match_config.neural_learning.mappo_team_reward_share,
+            0.6
+        );
+        assert_eq!(
+            cfg.match_config.neural_learning.marl_team_reward_weight,
+            0.55
+        );
+        assert_eq!(
+            cfg.match_config
+                .neural_learning
+                .marl_intermediate_reward_weight,
+            1.0
+        );
+        assert_eq!(cfg.match_config.neural_learning.mappo_clip_epsilon, 0.15);
         assert_eq!(
             cfg.match_config.neural_blend.mode,
             SoccerNeuralBlendMode::Authoritative
@@ -505,6 +683,7 @@ mod tests {
         assert_eq!(cfg.match_config.neural_blend.warmup_steps, 0);
         assert_eq!(cfg.match_config.neural_blend.candidates, 12);
         assert!(cfg.match_config.neural_blend.actor_critic);
+        assert!(cfg.match_config.neural_blend.world_model);
         assert!(!cfg.match_config.neural_blend.mcts_enabled);
         assert!(cfg.match_config.adversarial_embedding_exploitation_enabled);
     }
