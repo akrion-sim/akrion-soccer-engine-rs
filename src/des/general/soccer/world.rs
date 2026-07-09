@@ -25330,6 +25330,12 @@ impl SoccerMatch {
         if self.keeper_handling_holder() == Some(attacker_id) {
             return;
         }
+        // Learned-MPC dribble-objective NEGATIVE outcome: the carrier just lost the ball, so credit
+        // the last dribble aim residual it applied with the pass-parity failure reward (−1.0). Done
+        // HERE, at the top (holder is still `attacker_id`; the swap happens below), so the slot is
+        // consumed BEFORE this fn's later `mark_ball_received(defender_id)` possession-change clear
+        // could touch it. No-op when the dribble gate is off or the slot is not this carrier's.
+        self.emit_dribble_mpc_objective_sample(attacker_id, -1.0);
         let defender_team = self.players[defender_id].team;
         let defender_name = self.players[defender_id].name.clone();
         let attacker_name = self.players[attacker_id].name.clone();
