@@ -4638,14 +4638,22 @@ const SOCCER_NEURAL_PRE_DECISION_CONTEXT_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_SAME_TEAM_SEPARATION_FEATURE_DIM
         + SOCCER_NEURAL_SAME_TEAM_SEPARATION_FEATURE_DIM;
 /// Append-only structured action-parameter block (Part A of the priority-1 action-space
-/// fix). Encodes the candidate action's AIM — target dx/dy relative to the ball, aim
+/// fix). Encodes the candidate action's AIM — target dx (lateral) relative to the ball, aim
 /// distance, attack-relative forward-ness, and the aim direction as an attack-relative
-/// unit vector (sin/cos) — plus a has-target flag. Gives the value head geometric
-/// structure it can GENERALIZE over (nearby kick targets now share nearby features),
-/// instead of leaning on the opaque FNV `soccer_neural_action_hash` where `pass|spd:6`
-/// and `pass|spd:7` map to unrelated scalars. Gate `DD_SOCCER_ENABLE_ACTION_PARAM_FEATURES`;
-/// OFF (default) ⇒ the 7 slots stay 0.0 ⇒ byte-identical, and pre-block nets zero-pad.
-const SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM: usize = 7;
+/// unit vector (sin/cos) — plus a has-target flag, AND the action's identity/power:
+/// launch speed and a pass/shoot/dribble family one-hot. The aim geometry lets the value
+/// head GENERALIZE over nearby kick targets (nearby targets → nearby features); the
+/// speed + family flags tell it WHAT the action is and how hard, which pure aim geometry
+/// cannot. Together they replace the opaque FNV `soccer_neural_action_hash` where
+/// `pass|spd:6` and `pass|spd:7` map to unrelated scalars. Gate
+/// `DD_SOCCER_ENABLE_ACTION_PARAM_FEATURES`; OFF (default) ⇒ the 10 slots stay 0.0 ⇒
+/// byte-identical, and pre-block nets zero-pad. (Conceptual merge of two variants: the
+/// attack-relative aim geometry from `plateau-net` — the side-invariant representation —
+/// plus the launch-speed and pass/shoot/dribble family one-hot from
+/// `feature/action-param-features-and-capacity`. The absolute longitudinal `target_dy` was
+/// deliberately dropped: it is a team-conditioned duplicate of the attack-relative `forward`
+/// slot and reintroduces the side-dependence that `forward` removes — Codex review, r-merge.)
+const SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM: usize = 10;
 const SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_DECISION_CONTEXT_FEATURE_DIM + SOCCER_NEURAL_DECISION_CONTEXT_FEATURE_DIM;
 const SOCCER_NEURAL_FEATURE_DIM: usize =
@@ -5230,10 +5238,10 @@ const SOCCER_NEURAL_FEATURE_FORWARD_ONSIDE_SUPPORT_PRESSURE: usize =
 // Action-parameter block slot indices (seeded from the old FEATURE_DIM tail).
 const SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DX: usize =
     SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM;
-const SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DY: usize =
-    SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DX + 1;
+// NOTE: no absolute `target_dy` slot — the attack-relative `forward` slot below carries the
+// longitudinal component side-invariantly; an absolute dy would just duplicate it per team.
 const SOCCER_NEURAL_FEATURE_ACTION_PARAM_DISTANCE: usize =
-    SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DY + 1;
+    SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DX + 1;
 const SOCCER_NEURAL_FEATURE_ACTION_PARAM_FORWARD: usize =
     SOCCER_NEURAL_FEATURE_ACTION_PARAM_DISTANCE + 1;
 const SOCCER_NEURAL_FEATURE_ACTION_PARAM_DIR_SIN: usize =
@@ -5242,6 +5250,17 @@ const SOCCER_NEURAL_FEATURE_ACTION_PARAM_DIR_COS: usize =
     SOCCER_NEURAL_FEATURE_ACTION_PARAM_DIR_SIN + 1;
 const SOCCER_NEURAL_FEATURE_ACTION_PARAM_HAS_TARGET: usize =
     SOCCER_NEURAL_FEATURE_ACTION_PARAM_DIR_COS + 1;
+// Action identity/power slots (from feature/action-param-features-and-capacity): the
+// action's launch speed and a pass/shoot/dribble family one-hot — target-independent, so
+// they are written even when the action has no aim point.
+const SOCCER_NEURAL_FEATURE_ACTION_PARAM_ACTION_SPEED: usize =
+    SOCCER_NEURAL_FEATURE_ACTION_PARAM_HAS_TARGET + 1;
+const SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_PASS: usize =
+    SOCCER_NEURAL_FEATURE_ACTION_PARAM_ACTION_SPEED + 1;
+const SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_SHOOT: usize =
+    SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_PASS + 1;
+const SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_DRIBBLE: usize =
+    SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_SHOOT + 1;
 const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     61,
     62,
@@ -22259,10 +22278,12 @@ pub(crate) fn dd_soccer_enable_target_standardization() -> bool {
 }
 
 /// Append-only structured action-parameter feature block (priority-1 Part A): fills the
-/// 7 tail slots with the candidate action's aim geometry (target dx/dy vs the ball, aim
-/// distance, attack-relative forward-ness, aim direction sin/cos, has-target) so the value
-/// head can generalize over similar kick targets instead of memorizing the opaque action
-/// hash. OFF (default) ⇒ the slots stay 0.0 ⇒ byte-identical; pre-block nets zero-pad.
+/// 10 tail slots with the candidate action's aim geometry (target dx vs the ball, aim
+/// distance, attack-relative forward-ness, aim direction sin/cos, has-target) AND its
+/// identity/power (launch speed + pass/shoot/dribble one-hot) so the value head can
+/// generalize over similar kick targets and action families instead of memorizing the
+/// opaque action hash. OFF (default) ⇒ the slots stay 0.0 ⇒ byte-identical; pre-block nets
+/// zero-pad.
 pub(crate) fn dd_soccer_enable_action_param_features() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
@@ -23508,6 +23529,24 @@ pub(crate) fn forward_pass_reward_scale() -> f64 {
     static V: OnceLock<f64> = OnceLock::new();
     *V.get_or_init(|| {
         std::env::var("DD_SOCCER_FORWARD_PASS_REWARD_SCALE")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.0, 20.0))
+            .unwrap_or(1.0)
+    })
+}
+
+/// Scale for the CONSECUTIVE-forward-pass (build-up chain) event rewards
+/// (`PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS` / `..THREE_NET_FORWARD..`). These fire only for
+/// strings of forward passes, so amplifying them rewards sustained progression (build-up) rather
+/// than single hopeful forward balls — a quality signal complementary to deferred credit. Env
+/// `DD_SOCCER_PASS_CHAIN_REWARD_SCALE`, clamped [0,20], default 1.0 => byte-identical.
+pub(crate) fn pass_chain_reward_scale() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_PASS_CHAIN_REWARD_SCALE")
             .ok()
             .and_then(|raw| raw.trim().parse::<f64>().ok())
             .filter(|v| v.is_finite())
@@ -42911,6 +42950,52 @@ fn soccer_neural_signed_unit(value: f64) -> f64 {
     }
 }
 
+/// Pure aim-geometry features for the structured action-param block, extracted so they are
+/// unit-testable without building a full transition. Returns
+/// `(dx, distance, forward, dir_sin, dir_cos)` for an aim `target` relative to `ball`, in the
+/// attacking frame (`attack_dir` = ±1). `dx` is the lateral (sideline) offset; `forward` and
+/// `dir_cos` are attack-relative (side-invariant): + points at the attacking goal, `dir_sin` is
+/// the lateral component. When the target coincides with the ball (`dist ≈ 0`) the direction unit
+/// vector is `(0, 0)`. RNG-free. There is deliberately NO absolute longitudinal `dy` — `forward`
+/// carries that side-invariantly (Codex review, r-merge).
+fn soccer_action_param_aim_features(
+    target: Vec2,
+    ball: Vec2,
+    attack_dir: f64,
+) -> (f64, f64, f64, f64, f64) {
+    let rel_x = target.x - ball.x;
+    let rel_y = target.y - ball.y;
+    let dist = (rel_x * rel_x + rel_y * rel_y).sqrt();
+    let dx = soccer_neural_signed_unit(rel_x / 40.0);
+    let distance = soccer_neural_scaled(dist, 60.0);
+    let forward = soccer_neural_signed_unit(rel_y * attack_dir / 50.0);
+    let (dir_sin, dir_cos) = if dist > 1e-3 {
+        (
+            (rel_x / dist).clamp(-1.0, 1.0),
+            (rel_y * attack_dir / dist).clamp(-1.0, 1.0),
+        )
+    } else {
+        (0.0, 0.0)
+    };
+    (dx, distance, forward, dir_sin, dir_cos)
+}
+
+/// Pure action identity/power features for the structured action-param block:
+/// `(speed, is_pass, is_shoot, is_dribble)`. Reuses main's canonical family helpers so the label
+/// taxonomy is not duplicated. The one-hot is NOT strictly mutually exclusive — an action outside
+/// all three families yields all zeros, the intended "unknown family" encoding. RNG-free.
+fn soccer_action_param_identity_features(
+    action_label: &str,
+    action_ball_speed_yps: f64,
+) -> (f64, f64, f64, f64) {
+    (
+        soccer_neural_scaled(action_ball_speed_yps, 36.0),
+        soccer_neural_bool(is_pass_like_action(action_label)),
+        soccer_neural_bool(soccer_frame_liveness_action_is_shot(action_label)),
+        soccer_neural_bool(is_dribble_action_label(action_label)),
+    )
+}
+
 /// Whether the relational attention readout block carries signal this process. OFF (default)
 /// leaves the block all-zeros, so the appended channels are byte-identical to the pre-block schema
 /// and a freshly trained net simply never learns from them — a clean on/off A/B.
@@ -46098,32 +46183,31 @@ fn soccer_neural_transition_features_with_action(
         soccer_neural_scaled(obs.forward_onside_support_clamp_distance_yards, 8.0);
     features[SOCCER_NEURAL_FEATURE_FORWARD_ONSIDE_SUPPORT_PRESSURE] =
         soccer_neural_unit(obs.forward_onside_support_pressure);
-    // Append-only structured action-parameter block (priority-1 Part A). OFF (default) or
-    // no aim ⇒ the 7 slots stay 0.0 (byte-identical). When on with a target, the value head
-    // sees the candidate's aim geometry so it can generalize across similar kick targets
-    // instead of relying on the opaque `soccer_neural_action_hash` scalar written above.
+    // Append-only structured action-parameter block. OFF (default) ⇒ the 10 slots stay 0.0
+    // (byte-identical). When ON, the value head sees the candidate's aim geometry (so it can
+    // generalize across similar kick targets) AND the action's identity/power (launch speed +
+    // pass/shoot/dribble family), replacing the opaque `soccer_neural_action_hash` scalar
+    // written above. Aim geometry (attack-relative) only when a target exists; the identity
+    // slots are written whenever the block is on, since they do not need an aim point. The
+    // per-slot math lives in pure helpers so it is unit-testable without a full transition.
     if dd_soccer_enable_action_param_features() {
+        let (speed, is_pass, is_shoot, is_dribble) =
+            soccer_action_param_identity_features(action_label, context.action_ball_speed_yps);
+        features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_ACTION_SPEED] = speed;
+        features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_PASS] = is_pass;
+        features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_SHOOT] = is_shoot;
+        features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_DRIBBLE] = is_dribble;
         if let Some(target) = context.target_point {
-            let rel_x = target.x - context.ball_position.x;
-            let rel_y = target.y - context.ball_position.y;
-            let dist = (rel_x * rel_x + rel_y * rel_y).sqrt();
-            let attack_dir = transition.team.attack_dir();
-            features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DX] =
-                soccer_neural_signed_unit(rel_x / 40.0);
-            features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DY] =
-                soccer_neural_signed_unit(rel_y / 50.0);
-            features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_DISTANCE] =
-                soccer_neural_scaled(dist, 60.0);
-            // Attack-relative forward-ness and aim direction as an attack-relative unit
-            // vector: +cos points at the attacking goal, sin is the lateral component.
-            features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_FORWARD] =
-                soccer_neural_signed_unit(rel_y * attack_dir / 50.0);
-            if dist > 1e-3 {
-                features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_DIR_SIN] =
-                    (rel_x / dist).clamp(-1.0, 1.0);
-                features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_DIR_COS] =
-                    (rel_y * attack_dir / dist).clamp(-1.0, 1.0);
-            }
+            let (dx, distance, forward, dir_sin, dir_cos) = soccer_action_param_aim_features(
+                target,
+                context.ball_position,
+                transition.team.attack_dir(),
+            );
+            features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DX] = dx;
+            features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_DISTANCE] = distance;
+            features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_FORWARD] = forward;
+            features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_DIR_SIN] = dir_sin;
+            features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_DIR_COS] = dir_cos;
             features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_HAS_TARGET] = 1.0;
         }
     }
