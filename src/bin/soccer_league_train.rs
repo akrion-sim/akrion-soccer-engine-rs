@@ -79,6 +79,14 @@ fn env_default_bool(k: &str, d: bool) -> bool {
     enabled
 }
 
+fn env_default_usize(k: &str, d: usize) -> usize {
+    let value = env_usize(k, d);
+    if std::env::var(k).is_err() {
+        std::env::set_var(k, value.to_string());
+    }
+    value
+}
+
 fn apply_league_neural_mcts_config(config: &mut EngineMatchRunnerConfig) -> bool {
     let enabled = env_bool("SOCCER_LEAGUE_NEURAL_MCTS_ENABLED", false);
     config.base.neural_blend.mcts_enabled = enabled;
@@ -1061,6 +1069,18 @@ fn main() {
     let novelty_bonus_enabled = env_default_bool("DD_SOCCER_ENABLE_NOVELTY_BONUS", true);
     let forward_pass_climb_curriculum_enabled =
         env_default_bool("DD_SOCCER_FORWARD_PASS_CLIMB_CURRICULUM", true);
+    let dp_bootstrap_enabled = env_default_bool(
+        "DD_SOCCER_ENABLE_DP_BOOTSTRAP",
+        forward_pass_climb_curriculum_enabled,
+    );
+    let dp_bootstrap_horizon = env_default_usize(
+        "DD_SOCCER_DP_BOOTSTRAP_HORIZON",
+        if dp_bootstrap_enabled { 64 } else { 16 },
+    );
+    let dp_bootstrap_sweeps = env_default_usize(
+        "DD_SOCCER_DP_BOOTSTRAP_SWEEPS",
+        if dp_bootstrap_enabled { 200 } else { 40 },
+    );
     runner_config.base.neural_learning.lp_coupling_enabled =
         env_bool("SOCCER_NEURAL_LP_COUPLING_ENABLED", true);
     // POLICY-IMPROVEMENT LEVER: opt the fresh net into the actor-critic path. When on, the neural
@@ -1107,7 +1127,7 @@ fn main() {
     let mut best_checkpoint_net_forward_pass_margin = f64::NEG_INFINITY;
     let mut archived_step_buckets: BTreeSet<usize> = BTreeSet::new();
     println!(
-        "league_train_started_at_utc={} games/opp={} minutes={} weight_decay={} fresh_opp={} checkpoint_every={} max_rounds={} max_training_steps={} max_target_entries_per_side={} advancement_metric=completed_forward_passes net_metric=completed_forward_passes_minus_turnovers league_neural_mcts_enabled={} actor_critic_enabled={} lp_coupling_enabled={} target_standardization_enabled={} mc_critic_target_enabled={} neural_self_bootstrap_enabled={} maxa_bootstrap_enabled={} novelty_bonus_enabled={} forward_pass_climb_curriculum_enabled={} mpc_tier2_enabled={} mpc_reconcile_enabled={} mpc_field_aware_enabled={} mpc_latent_objective_enabled={} local_mpc_enabled={} checkpoint_require_forward_pass_climb={} checkpoint_max_forward_pass_regression={} checkpoint_min_forward_pass_margin={} checkpoint_validate_games={} checkpoint_validate_min_forward_pass_margin={} checkpoint_validate_min_net_forward_pass_margin={} checkpoint_validate_min_goal_diff_margin={} frontier={} candidate_frontier={} archive={} step_archive_dir={} step_archive_buckets={:?}",
+        "league_train_started_at_utc={} games/opp={} minutes={} weight_decay={} fresh_opp={} checkpoint_every={} max_rounds={} max_training_steps={} max_target_entries_per_side={} advancement_metric=completed_forward_passes net_metric=completed_forward_passes_minus_turnovers league_neural_mcts_enabled={} actor_critic_enabled={} lp_coupling_enabled={} target_standardization_enabled={} mc_critic_target_enabled={} neural_self_bootstrap_enabled={} maxa_bootstrap_enabled={} novelty_bonus_enabled={} forward_pass_climb_curriculum_enabled={} dp_bootstrap_enabled={} dp_bootstrap_horizon={} dp_bootstrap_sweeps={} mpc_tier2_enabled={} mpc_reconcile_enabled={} mpc_field_aware_enabled={} mpc_latent_objective_enabled={} local_mpc_enabled={} checkpoint_require_forward_pass_climb={} checkpoint_max_forward_pass_regression={} checkpoint_min_forward_pass_margin={} checkpoint_validate_games={} checkpoint_validate_min_forward_pass_margin={} checkpoint_validate_min_net_forward_pass_margin={} checkpoint_validate_min_goal_diff_margin={} frontier={} candidate_frontier={} archive={} step_archive_dir={} step_archive_buckets={:?}",
         chrono_now(),
         games_per_opp,
         minutes,
@@ -1126,6 +1146,9 @@ fn main() {
         maxa_bootstrap_enabled,
         novelty_bonus_enabled,
         forward_pass_climb_curriculum_enabled,
+        dp_bootstrap_enabled,
+        dp_bootstrap_horizon,
+        dp_bootstrap_sweeps,
         mpc_tier2_enabled,
         mpc_reconcile_enabled,
         mpc_field_aware_enabled,

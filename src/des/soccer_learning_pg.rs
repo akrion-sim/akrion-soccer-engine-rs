@@ -5896,9 +5896,9 @@ mod tests {
             average_loss: None,
             target_popart: None,
             policy_head: None,
+            skill_policy_heads: None,
             mpc_objective_head: None,
             line_depth_head: None,
-            mpc_objective_head: None,
         }
     }
 
@@ -6664,9 +6664,7 @@ mod tests {
         );
     }
 
-    fn policy_version_metrics_with_neural_and_promotion_status(
-        promotion_status: &str,
-    ) -> Value {
+    fn policy_version_metrics_with_neural_and_promotion_status(promotion_status: &str) -> Value {
         let snapshot = tiny_neural_snapshot();
         let base = soccer_policy_version_metrics(
             "evolution",
