@@ -46098,6 +46098,35 @@ fn soccer_neural_transition_features_with_action(
         soccer_neural_scaled(obs.forward_onside_support_clamp_distance_yards, 8.0);
     features[SOCCER_NEURAL_FEATURE_FORWARD_ONSIDE_SUPPORT_PRESSURE] =
         soccer_neural_unit(obs.forward_onside_support_pressure);
+    // Append-only structured action-parameter block (priority-1 Part A). OFF (default) or
+    // no aim ⇒ the 7 slots stay 0.0 (byte-identical). When on with a target, the value head
+    // sees the candidate's aim geometry so it can generalize across similar kick targets
+    // instead of relying on the opaque `soccer_neural_action_hash` scalar written above.
+    if dd_soccer_enable_action_param_features() {
+        if let Some(target) = context.target_point {
+            let rel_x = target.x - context.ball_position.x;
+            let rel_y = target.y - context.ball_position.y;
+            let dist = (rel_x * rel_x + rel_y * rel_y).sqrt();
+            let attack_dir = transition.team.attack_dir();
+            features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DX] =
+                soccer_neural_signed_unit(rel_x / 40.0);
+            features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DY] =
+                soccer_neural_signed_unit(rel_y / 50.0);
+            features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_DISTANCE] =
+                soccer_neural_scaled(dist, 60.0);
+            // Attack-relative forward-ness and aim direction as an attack-relative unit
+            // vector: +cos points at the attacking goal, sin is the lateral component.
+            features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_FORWARD] =
+                soccer_neural_signed_unit(rel_y * attack_dir / 50.0);
+            if dist > 1e-3 {
+                features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_DIR_SIN] =
+                    (rel_x / dist).clamp(-1.0, 1.0);
+                features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_DIR_COS] =
+                    (rel_y * attack_dir / dist).clamp(-1.0, 1.0);
+            }
+            features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_HAS_TARGET] = 1.0;
+        }
+    }
     debug_assert_eq!(features.len(), SOCCER_NEURAL_FEATURE_DIM);
     features
 }
