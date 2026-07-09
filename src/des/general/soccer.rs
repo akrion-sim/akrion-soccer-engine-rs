@@ -23626,6 +23626,22 @@ pub(crate) fn shot_shaping_reward_scale() -> f64 {
     })
 }
 
+/// Scale on the learned-EPV conversion bonus for completed passes (DD_SOCCER_LEARNED_EPV_REWARD_SCALE).
+/// Default 20: the fitted Φ_epv spans ~[-0.15, 0.20], so a strong danger-creating pass (ΔΦ ≈ 0.3) earns
+/// ~6 — comparable to the base forward-pass reward — while a square/backward ball earns ~0 or negative.
+pub(crate) fn learned_epv_reward_scale() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_LEARNED_EPV_REWARD_SCALE")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .unwrap_or(20.0)
+            .clamp(0.0, 200.0)
+    })
+}
+
 fn completed_pass_reward_for_pitch(
     team: Team,
     origin: Vec2,
@@ -23664,7 +23680,14 @@ fn completed_pass_reward_for_pitch(
     };
     // Flank bonus is unscaled (it applies to forward/lateral alike, so scaling it would re-leak the
     // lever into lateral). Forward magnitude is already scaled inside `base`.
-    base + completed_flank_pass_reward(team, origin, target, field_width, field_length)
+    // Learned-EPV conversion bonus (DD_SOCCER_ENABLE_LEARNED_EPV): reward the pass by the DANGER it
+    // creates — Φ_epv(target) − Φ_epv(origin), scaled — so a ball into a chance-creating cell scores
+    // far above a square territory pass. Direct fix for "forward passes → territory + draws, not
+    // conversion": it values passing by expected possession value, not raw yards. `learned_epv_pass_delta`
+    // returns 0.0 when the grid/gate is off ⇒ byte-identical, so this is added unconditionally.
+    let learned_epv_bonus = learned_epv_reward_scale()
+        * learned_epv_pass_delta(team, origin, target, field_width, field_length);
+    base + completed_flank_pass_reward(team, origin, target, field_width, field_length) + learned_epv_bonus
 }
 
 fn completed_forward_pass_count_bonus(team: Team, origin: Vec2, reception: Vec2) -> f64 {
