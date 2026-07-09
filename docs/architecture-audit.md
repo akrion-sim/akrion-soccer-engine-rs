@@ -60,7 +60,7 @@ graph/recurrent/tree-search cost."
 4. **Lean into the CTDE you already have.** Strengthen the centralized critic *offline*
    (MAPPO team reward already wired); runtime stays decentralized per-player.
 5. **New-variable discipline (already-correct pattern).** Append features at the tail and
-   zero-pad old neural snapshots (engine already migrates this way — soccer.rs:3675/3685).
+   zero-pad old neural snapshots (engine already migrates this way — soccer.rs:4401 (block 4401-4643)).
    Keep new variables OUT of the tabular `state_key` (`soccer_policy_postgres_state_key`)
    unless you are prepared to re-accumulate that experiment, because changing the key
    encoding orphans existing tabular entries.
