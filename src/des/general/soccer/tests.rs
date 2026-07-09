@@ -78583,6 +78583,8 @@ fn attacking_players_sprint_to_keeper_parry_rebound() {
         team: Team::Home,
         shooter: attacker,
         origin: Vec2::new(40.0, 104.0),
+        intended_target: Vec2::zero(),
+        mpc_objective: None,
     };
 
     sim.apply_ball_outcome(BallStepOutcome::KeeperParry {
@@ -78633,6 +78635,8 @@ fn defending_players_sprint_to_clear_keeper_parry_rebound() {
         team: Team::Home,
         shooter: attacker,
         origin: Vec2::new(40.0, 104.0),
+        intended_target: Vec2::zero(),
+        mpc_objective: None,
     };
 
     sim.apply_ball_outcome(BallStepOutcome::KeeperParry {
