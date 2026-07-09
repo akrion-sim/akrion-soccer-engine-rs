@@ -15494,6 +15494,11 @@ pub(crate) fn scoop_completion_viability(observation: &SoccerPomdpObservation) -
 
 fn pass_like_action_flight(action: &str) -> Option<PassFlight> {
     use SoccerActionLabel::*;
+    // Codex r24 forward-release action is a floor pass for all flight/reward/MPC classification;
+    // it stays a distinct label only for legality + execution-target routing.
+    if normalize_soccer_action_label(action) == "forward-release-pass" {
+        return Some(PassFlight::Floor);
+    }
     match SoccerActionLabel::classify(normalize_soccer_action_label(action))? {
         Pass | FirstTimePass | FlankLowCross | WallPass | WallReturn | CornerFlagCross
         | SurprisePass | KillerPass | SwitchPlay | RecycleReset => Some(PassFlight::Floor),
