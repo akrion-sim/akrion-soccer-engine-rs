@@ -3206,6 +3206,13 @@ impl SoccerLearningPgStore {
             retention_kind,
             full_entries_retained,
         );
+        // Bloat control: gate-archived, non-loadable versions persist WITHOUT the heavy
+        // neuralNetwork blob (the active head keeps it — see the merge path above).
+        let metrics = soccer_policy_version_strip_neural_snapshot_if_archived(
+            metrics,
+            effective_status,
+            soccer_policy_version_retain_archived_neural_snapshot(),
+        );
 
         if effective_status == SOCCER_POLICY_STATUS_ACTIVE {
             // Serialize active-policy promotions PER EXPERIMENT so the
