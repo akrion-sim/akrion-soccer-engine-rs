@@ -40,9 +40,15 @@ implemented yet.
   curriculum. Receiver selection also has a net-forward quality floor through
   `SOCCER_LEARNED_PASS_RECEIVER_MIN_NET_FORWARD_QUALITY`, so a high receipt-only
   turnover trap does not win just because the ball can arrive.
+- `DD_SOCCER_ENABLE_DEFERRED_PASS_CREDIT` is implemented and enabled by the
+  all-gates/continuous training path. When on, delayed pass completion and
+  turnover credit is back-dated to the decision transition that launched the pass
+  instead of being assigned only to the later reception/interception tick.
 - Pass-target MCTS pruning can be inspected with `DD_SOCCER_DUMP_MCTS_PASS_TARGET_DIAG`.
   The diagnostic reports whether the first forward target was inside the configured
   target cap, pruned by the cap, or absent.
+- `DD_SOCCER_DUMP_PASS_CAND_DIAG` separately reports pass candidate availability,
+  cap survival, and a nearest-defender openness proxy before value/MPC selection.
 
 ## Missing Diagnostics
 

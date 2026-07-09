@@ -167,6 +167,7 @@ Diagnostics:
 
 - `SOCCER_NEURAL_MCTS_DRIBBLE_DIAGNOSTIC_INTERVAL`
 - `DD_SOCCER_DUMP_MCTS_PASS_TARGET_DIAG`
+- `DD_SOCCER_DUMP_PASS_CAND_DIAG`
 
 ## Telemetry to Watch
 
@@ -238,6 +239,20 @@ MCTS is not refusing forward passing; it is never seeing the forward receiver.
 If `forward_inside_cap` is high but forward passes still do not execute, inspect
 policy score gaps, safety/MPC reconciliation, and action-outcome credit next.
 
+The `pass_cand_diag` line is a broader candidate-availability read. It reports:
+
+- `any_fwd_precap`: decisions where any ranked target is forward before the cap.
+- `any_fwd_postcap`: decisions where a forward target survives into expansion.
+- `any_fwd_OPEN`: decisions where at least one forward target has no opponent within
+  the nearest-defender openness proxy.
+- target mix percentages for forward, lateral, and backward targets.
+- open-vs-marked percentages among forward targets.
+
+Use `pass_cand_diag` to decide whether the bottleneck is off-ball availability,
+candidate exposure, or target marking. Use `mcts_pass_target_diag` when the question
+is specifically whether the first forward receiver rank falls inside the configured
+`SOCCER_NEURAL_MCTS_PASS_TARGET_CANDIDATES` cap.
+
 ## Current Local Plateau Use
 
 For the local plateau-resolution runs, MCTS is intentionally a secondary
@@ -298,8 +313,8 @@ Keep it on when:
 1. Confirm the current launcher logs `soccer_local_training_mcts_gate`.
 2. Confirm `SOCCER_NEURAL_MCTS_ENABLED=1` only for MCTS-on experiments.
 3. Confirm `world_model_training` includes dribble/root-dribble candidate shares.
-4. Inspect `neural_mcts_dribble_diagnostic` and `mcts_pass_target_diag` for
-   generation vs pruning vs scoring failures.
+4. Inspect `neural_mcts_dribble_diagnostic`, `pass_cand_diag`, and
+   `mcts_pass_target_diag` for generation vs pruning vs scoring failures.
 5. Compare `learning_action_outcomes` against MCTS telemetry. Candidate presence
    without action outcomes means execution or labeling is still blocking the
    learning signal.

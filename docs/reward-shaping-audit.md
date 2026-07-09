@@ -84,6 +84,9 @@ the normal scoreline/WDL/Wilson promotion verdict, positive held-out goal differ
 ranks/checkpoints on net forward passes (`completed_forward_passes - pass_turnovers`) while
 validation also requires non-negative goal difference by default
 (`SOCCER_LEAGUE_CHECKPOINT_VALIDATE_MIN_GOAL_DIFF_MARGIN=0.0`).
+The active all-gates/continuous path also enables `DD_SOCCER_ENABLE_DEFERRED_PASS_CREDIT`,
+which back-dates delayed completion/interception/turnover reward onto the launch decision
+transition instead of only rewarding the later ball event.
 
 ## Follow-ups (deferred, each its own gated change)
 1. **Discount alignment.** B-terms (and pitch value) use `γ=1`; the returns use
