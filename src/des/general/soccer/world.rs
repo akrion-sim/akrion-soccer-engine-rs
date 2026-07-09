@@ -27525,7 +27525,7 @@ impl SoccerMatch {
                         observation.opponent_goal_angle_degrees,
                     );
                     let use_curl = curl_probability >= 0.46;
-                    let base_goal_x = if use_curl {
+                    let mut base_goal_x = if use_curl {
                         let keeper_x = snapshot
                             .goalkeeper_for(player_team.other())
                             .and_then(|keeper_id| snapshot.player_position(keeper_id))
