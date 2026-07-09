@@ -14286,6 +14286,45 @@ impl SoccerMatch {
             _ => return Vec::new(),
         };
         let limit = neural_mcts_pass_target_candidate_limit();
+        if pass_cand_diag_enabled() {
+            if let Some(passer_pos) = snapshot.player_position(player_id) {
+                let dir = team.attack_dir();
+                let (mut fwd_pre, mut lat_pre, mut back_pre, mut fwd_post) = (0, 0, 0, 0);
+                let (mut fwd_open, mut fwd_marked) = (0, 0);
+                for (i, tp) in targets.iter().enumerate() {
+                    if let Some(p) = snapshot.player_position(*tp) {
+                        let forward = (p.y - passer_pos.y) * dir;
+                        if forward > 1.25 {
+                            fwd_pre += 1;
+                            if i < limit {
+                                fwd_post += 1;
+                            }
+                            // Openness proxy: nearest opponent distance to the target's feet.
+                            // A marked forward target (defender within ~4yd) is a pass-to-feet trap;
+                            // an open one is a receivable progressive option. Codex round-20.
+                            let nearest_opp = snapshot
+                                .players
+                                .iter()
+                                .filter(|op| op.team != team)
+                                .filter_map(|op| snapshot.player_position(op.id))
+                                .fold(f64::INFINITY, |acc, opp| acc.min(p.distance(opp)));
+                            if nearest_opp >= 4.0 {
+                                fwd_open += 1;
+                            } else {
+                                fwd_marked += 1;
+                            }
+                        } else if forward < -1.25 {
+                            back_pre += 1;
+                        } else {
+                            lat_pre += 1;
+                        }
+                    }
+                }
+                record_pass_candidate_diag(
+                    fwd_pre, lat_pre, back_pre, fwd_post, fwd_open, fwd_marked,
+                );
+            }
+        }
         targets
             .into_iter()
             .take(limit)
@@ -37256,6 +37295,81 @@ fn pass_space_diag_enabled() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DUMP_PASS_SPACE_DIAG").is_ok())
+}
+
+/// Diagnostic (gated `DD_SOCCER_DUMP_PASS_CAND_DIAG`, byte-identical off): per pass-candidate
+/// expansion, classify the RANKED teammate targets forward/lateral/back (by feet vs the passer
+/// along attack dir) and count how often a forward target (a) EXISTS in the ranked list at all
+/// (pre-cap) vs (b) SURVIVES into the top-`limit` expanded set (post-cap). This disambiguates the
+/// forward-passing bottleneck: low any-forward-pre-cap ⇒ AVAILABILITY (no forward runners to pass
+/// to — off-ball problem); high pre-cap but low post-cap ⇒ EXPOSURE (forward options pruned by the
+/// candidate cap). Codex round-19.
+fn pass_cand_diag_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DUMP_PASS_CAND_DIAG").is_ok())
+}
+
+static PASS_CAND_DECISIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PASS_CAND_ANY_FWD_PRECAP: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static PASS_CAND_ANY_FWD_POSTCAP: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static PASS_CAND_FWD_TARGETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PASS_CAND_LAT_TARGETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PASS_CAND_BACK_TARGETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PASS_CAND_FWD_OPEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PASS_CAND_FWD_MARKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PASS_CAND_ANY_FWD_OPEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn record_pass_candidate_diag(
+    fwd_pre: usize,
+    lat_pre: usize,
+    back_pre: usize,
+    fwd_post: usize,
+    fwd_open: usize,
+    fwd_marked: usize,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let d = PASS_CAND_DECISIONS.fetch_add(1, Relaxed) + 1;
+    if fwd_pre > 0 {
+        PASS_CAND_ANY_FWD_PRECAP.fetch_add(1, Relaxed);
+    }
+    if fwd_post > 0 {
+        PASS_CAND_ANY_FWD_POSTCAP.fetch_add(1, Relaxed);
+    }
+    if fwd_open > 0 {
+        PASS_CAND_ANY_FWD_OPEN.fetch_add(1, Relaxed);
+    }
+    PASS_CAND_FWD_TARGETS.fetch_add(fwd_pre as u64, Relaxed);
+    PASS_CAND_LAT_TARGETS.fetch_add(lat_pre as u64, Relaxed);
+    PASS_CAND_BACK_TARGETS.fetch_add(back_pre as u64, Relaxed);
+    PASS_CAND_FWD_OPEN.fetch_add(fwd_open as u64, Relaxed);
+    PASS_CAND_FWD_MARKED.fetch_add(fwd_marked as u64, Relaxed);
+    if d % 2000 == 0 {
+        let anyfwd_pre = PASS_CAND_ANY_FWD_PRECAP.load(Relaxed);
+        let anyfwd_post = PASS_CAND_ANY_FWD_POSTCAP.load(Relaxed);
+        let anyfwd_open = PASS_CAND_ANY_FWD_OPEN.load(Relaxed);
+        let f = PASS_CAND_FWD_TARGETS.load(Relaxed);
+        let l = PASS_CAND_LAT_TARGETS.load(Relaxed);
+        let b = PASS_CAND_BACK_TARGETS.load(Relaxed);
+        let fo = PASS_CAND_FWD_OPEN.load(Relaxed);
+        let fm = PASS_CAND_FWD_MARKED.load(Relaxed);
+        let tot = (f + l + b).max(1);
+        let ftot = (fo + fm).max(1);
+        eprintln!(
+            "pass_cand_diag decisions={d} any_fwd_precap={:.1}% any_fwd_OPEN={:.1}% any_fwd_postcap={:.1}% | \
+             targets fwd={:.1}% lat={:.1}% back={:.1}% | of-fwd: OPEN={:.1}% marked={:.1}%",
+            100.0 * anyfwd_pre as f64 / d as f64,
+            100.0 * anyfwd_open as f64 / d as f64,
+            100.0 * anyfwd_post as f64 / d as f64,
+            100.0 * f as f64 / tot as f64,
+            100.0 * l as f64 / tot as f64,
+            100.0 * b as f64 / tot as f64,
+            100.0 * fo as f64 / ftot as f64,
+            100.0 * fm as f64 / ftot as f64,
+        );
+    }
 }
 
 const PASS_SPACE_DIAG_DEFAULT_LOG_EVERY: u64 = 200;
