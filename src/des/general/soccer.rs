@@ -5248,6 +5248,17 @@ const SOCCER_NEURAL_FEATURE_ACTION_PARAM_DIR_COS: usize =
     SOCCER_NEURAL_FEATURE_ACTION_PARAM_DIR_SIN + 1;
 const SOCCER_NEURAL_FEATURE_ACTION_PARAM_HAS_TARGET: usize =
     SOCCER_NEURAL_FEATURE_ACTION_PARAM_DIR_COS + 1;
+// Action identity/power slots (from feature/action-param-features-and-capacity): the
+// action's launch speed and a pass/shoot/dribble family one-hot — target-independent, so
+// they are written even when the action has no aim point.
+const SOCCER_NEURAL_FEATURE_ACTION_PARAM_ACTION_SPEED: usize =
+    SOCCER_NEURAL_FEATURE_ACTION_PARAM_HAS_TARGET + 1;
+const SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_PASS: usize =
+    SOCCER_NEURAL_FEATURE_ACTION_PARAM_ACTION_SPEED + 1;
+const SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_SHOOT: usize =
+    SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_PASS + 1;
+const SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_DRIBBLE: usize =
+    SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_SHOOT + 1;
 const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     61,
     62,
