@@ -38695,6 +38695,7 @@ fn policy_head_mappo_clip_bounds_old_policy_ratio() {
         old_action_probability: Some(current_probability * 10.0),
         sample_weight: 1.0,
         mcts_distillation: false,
+        forward_select_eligible: false,
     };
     let negative = head
         .clipped_mappo_advantage(&negative_sample, 0.2)
