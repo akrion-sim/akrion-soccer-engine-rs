@@ -84602,6 +84602,8 @@ fn blocked_shot_penalizes_shooter_and_rewards_blocker_for_learning() {
             team: Team::Home,
             shooter,
             origin: before.ball.position,
+            intended_target: Vec2::zero(),
+            mpc_objective: None,
         },
         blocker_id: blocker,
         defending_team: Team::Away,
