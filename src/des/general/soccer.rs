@@ -23537,6 +23537,24 @@ pub(crate) fn forward_pass_reward_scale() -> f64 {
     })
 }
 
+/// Scale for the CONSECUTIVE-forward-pass (build-up chain) event rewards
+/// (`PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS` / `..THREE_NET_FORWARD..`). These fire only for
+/// strings of forward passes, so amplifying them rewards sustained progression (build-up) rather
+/// than single hopeful forward balls — a quality signal complementary to deferred credit. Env
+/// `DD_SOCCER_PASS_CHAIN_REWARD_SCALE`, clamped [0,20], default 1.0 => byte-identical.
+pub(crate) fn pass_chain_reward_scale() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_PASS_CHAIN_REWARD_SCALE")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.0, 20.0))
+            .unwrap_or(1.0)
+    })
+}
+
 /// Coupled turnover scaling for the forward-pass-primacy curriculum. If completed
 /// forward-pass rewards are amplified, losing the ball must become at least as
 /// expensive; otherwise the learner can chase gross forward-pass count while the

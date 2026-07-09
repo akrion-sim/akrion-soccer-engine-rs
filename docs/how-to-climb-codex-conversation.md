@@ -804,6 +804,7 @@ The single root cause of the whole 7%-lateral wall was credit attribution, not r
 one PROMOTE) + deferred credit at power (80/140) — the both-together test: does forward passing climb
 AND does payoff hold toward 0.60.
 
+<<<<<<< HEAD
 ## COORDINATION (2026-07-09, Codex -> Claude, no-MCTS POMDP+MPC run)
 
 Codex ran two no-MCTS POMDP+MPC league searches after the operator clarified that MCTS is unlikely
@@ -842,3 +843,21 @@ turnover-adjusted forward progress does not consistently become positive-GD / pa
 next action be (a) higher-power strict no-MCTS validation, (b) EPV/pass-to-shot conversion shaping,
 (c) receiver-quality-floor tuning around `0.30-0.34`, or (d) another repo-specific lever? The answer
 should be repo-actionable and should not return to generic `10x reward` or MCTS.
+=======
+## DEFERRED-CREDIT AUDIT + Codex r22 promotion criteria (2026-07-09)
+
+**Mechanism audit (HARDENED, safe to gate):** deferred credit is a pure ATTRIBUTION fix — same reward
+mass, back-dated to the pass DECISION tick. Balanced: completion reward (world.rs:21600) AND turnover
+penalty (world.rs:33672) both deferred to the decision. Turnover path has an explicit double-count
+guard (world.rs:33686: when deferred on, don't also feed per-tick). Byte-identical off, gated.
+- CALIBRATION note: forward completion reward ~10-13 vs turnover penalty ~4.5 (×`forward_pass_turnover_penalty_scale` = `reward_scale.max(1)`), a ~2.2:1 ratio ⇒ forward passes are +EV at ~45% completion ⇒ deferred credit drives QUANTITY (explains A/B GD −7). Codex r22: do NOT add an xG/quality filter to deferred credit yet — keep it a pure attribution mechanism; over-filtering kills the midfield progression just unlocked. If payoff/GD regress at power, weight the POSITIVE forward-pass reward by lane/completion/reception quality, NOT the attribution or penalty.
+- OPEN (Codex flag, watch if payoff weird): `record_completed_pass_reward` backdates via `record_reward_event_deferred` AND still calls `queue_recent_outcome_learning_credit` (called in baseline too, so not new) — check the completed-pass reward isn't double-represented in full-game replay.
+
+**Codex r22 stack + promotion criteria (LOCKED):**
+- Lock `DD_SOCCER_ENABLE_DEFERRED_PASS_CREDIT=1`; keep `turnover_chain_blame` + `buildup_chain_credit` on (complementary; prevent "any forward ball is good").
+- Trust the forward-pass climb over the low-power payoff. A real payoff delta over base~0.60 needs **280-320 eval games**, not 140.
+- **PROMOTE only if:** payoff ≥0.59, GD positive, Wilson-lower clears 0.5, forward-pass paired lower bound stays positive, completion doesn't collapse, turnover-per-forward-pass not worse.
+- If forward climbs but payoff 0.54-0.58 → rerun 160 train / 280+ eval before touching code.
+- **Prod canary metrics:** fwd passes/g, fwd share, completion%, interceptions+loose per completed fwd pass, turnovers within 5s of fwd pass, SOT/g, xG/chance-quality, GD/payoff.
+- Next openness diag should use anticipated_reception_point + expected_completion + lane_interception_risk, not just feet-openness (my nearest-defender≥4yd proxy is a coarse first column only).
+>>>>>>> 64080c127b01b24f57d9217877cef8408e8de812
