@@ -16147,7 +16147,7 @@ impl SoccerMatch {
             Team::Away => "away",
         };
         let line = format!(
-            "{{\"tick\":{},\"player\":{},\"team\":\"{}\",\"vis_fwd\":{},\"quality\":{:.4},\"exp_compl\":{:.4},\"qualifies\":{},\"n_scored\":{},\"n_pass_scored\":{},\"n_fwd_scored\":{},\"e_scored\":{},\"e_root\":{},\"fwd_best_rank\":{},\"root_cap\":{},\"s_net_changed\":{},\"pick_is_fwd\":{},\"pick_is_pass\":{},\"tabular_argmax_is_fwd\":{},\"mcts_enabled\":{}}}",
+            "{{\"tick\":{},\"player\":{},\"team\":\"{}\",\"vis_fwd\":{},\"quality\":{:.4},\"exp_compl\":{:.4},\"qualifies\":{},\"n_scored\":{},\"n_pass_scored\":{},\"n_dribble_scored\":{},\"n_shot_scored\":{},\"n_fwd_scored\":{},\"e_scored\":{},\"e_root\":{},\"fwd_best_rank\":{},\"root_cap\":{},\"s_net_changed\":{},\"pick_is_fwd\":{},\"pick_is_pass\":{},\"pick_is_dribble\":{},\"pick_is_shot\":{},\"tabular_argmax_is_fwd\":{},\"mcts_enabled\":{}}}",
             snapshot.tick,
             player_id,
             team_label,
@@ -16157,6 +16157,8 @@ impl SoccerMatch {
             qualifies,
             n_scored,
             n_pass_scored,
+            n_dribble_scored,
+            n_shot_scored,
             n_fwd_scored,
             e_scored,
             e_root,
@@ -16165,6 +16167,8 @@ impl SoccerMatch {
             s_net_changed,
             pick_is_fwd,
             pick_is_pass,
+            pick_is_dribble,
+            pick_is_shot,
             tabular_argmax_is_fwd,
             blend.mcts_enabled,
         );
