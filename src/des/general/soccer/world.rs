@@ -16880,10 +16880,10 @@ impl SoccerMatch {
         let Some(plan) = candidate.plan.as_ref() else {
             return false;
         };
-        let Some(target) = plan
-            .target_point
-            .or_else(|| plan.target_player.and_then(|id| snapshot.player_position(id)))
-        else {
+        let Some(target) = plan.target_point.or_else(|| {
+            plan.target_player
+                .and_then(|id| snapshot.player_position(id))
+        }) else {
             return false;
         };
         matches!(
