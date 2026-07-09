@@ -33980,6 +33980,8 @@ fn staging_set_play_restart_clears_stale_live_ball_context() {
         team: Team::Home,
         shooter: 5,
         origin: sim.players[5].position,
+        intended_target: Vec2::zero(),
+        mpc_objective: None,
     });
 
     sim.stage_set_play_restart(
