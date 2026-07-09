@@ -26290,6 +26290,22 @@ fn soccer_transition_reward_with_tactics(
                         target,
                         before.ball_holder_possession_seconds,
                     );
+                    // Codex r19 opportunity-conditioned carrot (default-off). Uses the before-state
+                    // forward opportunity (visible options + best forward option / quick-forward
+                    // value) and expected completion so it only pays a quick, completed forward ball
+                    // that a timid policy would otherwise have declined.
+                    reward += quick_forward_release_opportunity_reward(
+                        player.team,
+                        origin,
+                        target,
+                        before.ball_holder_possession_seconds,
+                        decision.observation.visible_forward_pass_options,
+                        decision
+                            .observation
+                            .quick_forward_pass_value
+                            .max(decision.observation.best_forward_pass_option_quality),
+                        decision.observation.expected_pass_completion,
+                    );
                     reward += pass_and_move_forward_reward_from_parts(
                         player.team,
                         flight,
