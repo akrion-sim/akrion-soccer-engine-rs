@@ -68710,11 +68710,13 @@ mod reward_priority_tests {
         let scale = 6.0;
         // Richest single completed forward pass: own-half base + max progress + flank (own-half
         // multiplier), all scaled, plus the UNSCALED count bonus (added separately at world.rs).
+        // Forward base + progress are the ONLY terms scaled (forward-only lever); flank + count
+        // bonus are unscaled and added on top.
         let max_single_forward_pass = (COMPLETED_FORWARD_PASS_BASE_REWARD_OWN_HALF
             + COMPLETED_FORWARD_PASS_PROGRESS_REWARD_MAX_YARDS
-                * COMPLETED_FORWARD_PASS_PROGRESS_REWARD_PER_YARD
-            + COMPLETED_FLANK_PASS_BONUS_POINTS * COMPLETED_FLANK_PASS_OWN_HALF_MULTIPLIER)
+                * COMPLETED_FORWARD_PASS_PROGRESS_REWARD_PER_YARD)
             * scale
+            + COMPLETED_FLANK_PASS_BONUS_POINTS * COMPLETED_FLANK_PASS_OWN_HALF_MULTIPLIER
             + COMPLETED_FORWARD_PASS_COUNT_BONUS_POINTS;
         assert!(
             max_single_forward_pass < GOAL_REWARD_POINTS,
