@@ -42932,6 +42932,52 @@ fn soccer_neural_signed_unit(value: f64) -> f64 {
     }
 }
 
+/// Pure aim-geometry features for the structured action-param block, extracted so they are
+/// unit-testable without building a full transition. Returns
+/// `(dx, distance, forward, dir_sin, dir_cos)` for an aim `target` relative to `ball`, in the
+/// attacking frame (`attack_dir` = ±1). `dx` is the lateral (sideline) offset; `forward` and
+/// `dir_cos` are attack-relative (side-invariant): + points at the attacking goal, `dir_sin` is
+/// the lateral component. When the target coincides with the ball (`dist ≈ 0`) the direction unit
+/// vector is `(0, 0)`. RNG-free. There is deliberately NO absolute longitudinal `dy` — `forward`
+/// carries that side-invariantly (Codex review, r-merge).
+fn soccer_action_param_aim_features(
+    target: Vec2,
+    ball: Vec2,
+    attack_dir: f64,
+) -> (f64, f64, f64, f64, f64) {
+    let rel_x = target.x - ball.x;
+    let rel_y = target.y - ball.y;
+    let dist = (rel_x * rel_x + rel_y * rel_y).sqrt();
+    let dx = soccer_neural_signed_unit(rel_x / 40.0);
+    let distance = soccer_neural_scaled(dist, 60.0);
+    let forward = soccer_neural_signed_unit(rel_y * attack_dir / 50.0);
+    let (dir_sin, dir_cos) = if dist > 1e-3 {
+        (
+            (rel_x / dist).clamp(-1.0, 1.0),
+            (rel_y * attack_dir / dist).clamp(-1.0, 1.0),
+        )
+    } else {
+        (0.0, 0.0)
+    };
+    (dx, distance, forward, dir_sin, dir_cos)
+}
+
+/// Pure action identity/power features for the structured action-param block:
+/// `(speed, is_pass, is_shoot, is_dribble)`. Reuses main's canonical family helpers so the label
+/// taxonomy is not duplicated. The one-hot is NOT strictly mutually exclusive — an action outside
+/// all three families yields all zeros, the intended "unknown family" encoding. RNG-free.
+fn soccer_action_param_identity_features(
+    action_label: &str,
+    action_ball_speed_yps: f64,
+) -> (f64, f64, f64, f64) {
+    (
+        soccer_neural_scaled(action_ball_speed_yps, 36.0),
+        soccer_neural_bool(is_pass_like_action(action_label)),
+        soccer_neural_bool(soccer_frame_liveness_action_is_shot(action_label)),
+        soccer_neural_bool(is_dribble_action_label(action_label)),
+    )
+}
+
 /// Whether the relational attention readout block carries signal this process. OFF (default)
 /// leaves the block all-zeros, so the appended channels are byte-identical to the pre-block schema
 /// and a freshly trained net simply never learns from them — a clean on/off A/B.
