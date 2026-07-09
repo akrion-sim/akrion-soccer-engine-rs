@@ -10795,6 +10795,41 @@ fn completed_forward_pass_count_bonus_rewards_actual_forward_reception() {
 }
 
 #[test]
+fn quick_forward_release_bonus_gates_and_ramps_from_zero_at_threshold() {
+    // scale=0 (the default) pays nothing regardless of inputs => byte-identical when the knob is off.
+    assert_eq!(quick_forward_release_bonus_value(0.0, 10.0, 0.0, 2, 0.9, 0.9), 0.0);
+    // A clearly-good quick forward release into a real opportunity earns a positive, capped bonus.
+    let good = quick_forward_release_bonus_value(1.0, 10.0, 0.0, 2, 0.9, 0.9);
+    assert!(
+        good > 0.0 && good <= QUICK_FORWARD_RELEASE_REWARD_CAP,
+        "good bonus in range: {good}"
+    );
+    // Codex r19 spec: each fit is 0 AT its gate threshold, so a barely-qualifying pass pays ~0.
+    let at_gate = quick_forward_release_bonus_value(
+        1.0,
+        QUICK_FORWARD_RELEASE_MIN_FORWARD_YARDS,
+        0.0,
+        1,
+        QUICK_FORWARD_RELEASE_MIN_OPPORTUNITY,
+        QUICK_FORWARD_RELEASE_MIN_EXPECTED_COMPLETION,
+    );
+    assert_eq!(at_gate, 0.0, "at-threshold pays 0 (0-at-gate fits)");
+    // Any failed gate (backward/short, no visible option, weak opportunity, poor completion) pays 0.
+    assert_eq!(quick_forward_release_bonus_value(1.0, 3.9, 0.0, 2, 0.9, 0.9), 0.0);
+    assert_eq!(quick_forward_release_bonus_value(1.0, 10.0, 0.0, 0, 0.9, 0.9), 0.0);
+    assert_eq!(quick_forward_release_bonus_value(1.0, 10.0, 0.0, 2, 0.49, 0.9), 0.0);
+    assert_eq!(quick_forward_release_bonus_value(1.0, 10.0, 0.0, 2, 0.9, 0.44), 0.0);
+    // Held past the 1.2s quick-release cap => timing_fit 0 => no bonus even if other gates pass.
+    assert_eq!(quick_forward_release_bonus_value(1.0, 10.0, 2.0, 2, 0.9, 0.9), 0.0);
+    // The cap holds even with max scale and saturated signals.
+    let capped = quick_forward_release_bonus_value(2.0, 100.0, 0.0, 5, 1.0, 1.0);
+    assert!(
+        (capped - QUICK_FORWARD_RELEASE_REWARD_CAP).abs() < 1e-9,
+        "bonus capped: {capped}"
+    );
+}
+
+#[test]
 fn completed_pass_reward_values_flank_usage_more_in_own_half() {
     let field_width = 80.0;
     let field_length = 120.0;
