@@ -22,7 +22,10 @@ use crate::des::general::des_base::neural_network::NeuralNetworkLike;
 use crate::des::general::neural_network::{ActivationName, FeedForwardNetwork, RandomNetworkSpec};
 use crate::des::general::prng::mulberry32;
 
-use super::{Vec2, SOCCER_MOMENT_EMBEDDING_DIM};
+use super::{
+    build_soccer_feed_forward_network_from_snapshot, soccer_neural_network_snapshot,
+    SoccerAuxiliaryHeadSnapshot, Vec2, SOCCER_MOMENT_EMBEDDING_DIM,
+};
 
 /// Execution-context scalars appended to the 256-d field embedding: action-family flags
 /// (shot/pass/dribble), normalized distance-to-target, forward/lateral components of the analytic
@@ -147,6 +150,46 @@ impl SoccerMpcObjectiveHead {
 
     pub fn last_loss(&self) -> Option<f64> {
         self.last_loss
+    }
+
+    /// Persist the learned executor objective alongside the main neural snapshot.
+    pub fn to_snapshot(&self) -> SoccerAuxiliaryHeadSnapshot {
+        let mut network = soccer_neural_network_snapshot(&self.network);
+        network.training_steps = self.training_steps;
+        network.average_loss = self.last_loss;
+        SoccerAuxiliaryHeadSnapshot {
+            network,
+            training_steps: self.training_steps,
+            average_loss: self.last_loss,
+        }
+    }
+
+    /// Restore a persisted executor objective head. Output dim 2 is the legacy aim/lead
+    /// head; output dim 3 carries the learned bend axis.
+    pub fn from_snapshot(snapshot: &SoccerAuxiliaryHeadSnapshot) -> Result<Self, String> {
+        let output_dim = snapshot.network.output_dim;
+        let bend_enabled = match output_dim {
+            2 => false,
+            3 => true,
+            _ => {
+                return Err(format!(
+                    "mpc objective snapshot output_dim {output_dim} must be 2 or 3"
+                ));
+            }
+        };
+        let network = build_soccer_feed_forward_network_from_snapshot(
+            &snapshot.network,
+            MPC_OBJECTIVE_FEATURE_DIM,
+            output_dim,
+            &[],
+            "mpc objective",
+        )?;
+        Ok(SoccerMpcObjectiveHead {
+            network,
+            training_steps: snapshot.training_steps.max(snapshot.network.training_steps),
+            last_loss: snapshot.average_loss.or(snapshot.network.average_loss),
+            bend_enabled,
+        })
     }
 
     /// Whether the head is warm enough for live use (else callers keep the pure analytic target).
@@ -379,6 +422,25 @@ mod tests {
             after > before,
             "positive-advantage bend target should raise the predicted bend: {before} -> {after}"
         );
+    }
+
+    #[test]
+    fn snapshot_roundtrip_preserves_training_progress_and_shape() {
+        let mut head = SoccerMpcObjectiveHead::new_with_bend(29, true);
+        let sample = MpcObjectiveSample {
+            features: vec![0.2f32; MPC_OBJECTIVE_FEATURE_DIM],
+            applied_residual: Vec2 { x: 0.25, y: 0.75 },
+            applied_bend: MPC_OBJECTIVE_MAX_BEND_YARDS * 0.25,
+            reward: 1.0,
+        };
+        head.train_rwr(&[sample], 0.05);
+
+        let snapshot = head.to_snapshot();
+        let restored = SoccerMpcObjectiveHead::from_snapshot(&snapshot).expect("restore");
+
+        assert!(restored.bend_enabled());
+        assert_eq!(restored.training_steps(), head.training_steps());
+        assert_eq!(snapshot.network.output_dim, 3);
     }
 
     #[test]

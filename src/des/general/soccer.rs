@@ -23468,6 +23468,15 @@ pub(crate) fn forward_pass_reward_scale() -> f64 {
     })
 }
 
+/// Coupled turnover scaling for the forward-pass-primacy curriculum. If completed
+/// forward-pass rewards are amplified, losing the ball must become at least as
+/// expensive; otherwise the learner can chase gross forward-pass count while the
+/// net-of-turnovers gate correctly rejects it. Never drops below 1.0 so low/zero
+/// forward-pass reward ablations do not make giveaways cheaper than baseline.
+pub(crate) fn forward_pass_turnover_penalty_scale() -> f64 {
+    forward_pass_reward_scale().max(1.0)
+}
+
 /// Companion dampener for the shot-TAKEN shaping proxy (on-/off-target reward, NOT the goal or
 /// terminal-outcome reward, which stay intact — the net must still finish). Lets a forward-pass-
 /// primacy A/B stop the net shooting early instead of building up. Env
@@ -23935,11 +23944,12 @@ fn intercepted_pass_passer_penalty(pass: &PendingPass, field_length: f64) -> f64
     );
     // Backward interceptions are exactly doubled; forward and lateral interceptions share the
     // ordinary bad-lane penalty so the learner gets a clean, testable directional signal.
-    if matches!(direction, PassDirectionBucket::Backward) {
+    let directional_penalty = if matches!(direction, PassDirectionBucket::Backward) {
         ordinary_interception_penalty * BACKWARD_INTERCEPTED_PASS_PENALTY_MULTIPLIER
     } else {
         ordinary_interception_penalty
-    }
+    };
+    directional_penalty * forward_pass_turnover_penalty_scale()
 }
 
 /// A pass is a "backheel" when its direction is substantially behind where the player
@@ -38581,6 +38591,11 @@ pub struct SoccerNeuralNetworkSnapshot {
     /// localhost/live server can consume the same push/drop head the learner warmed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line_depth_head: Option<Box<SoccerAuxiliaryHeadSnapshot>>,
+    /// Optional carried learned MPC execution-objective head. This is the aim/lead
+    /// residual head consumed by MPC at execution time; carrying it in the same
+    /// neural sidecar keeps eval/live loads in sync with the trainer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mpc_objective_head: Option<Box<SoccerAuxiliaryHeadSnapshot>>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -42539,6 +42554,7 @@ fn soccer_neural_network_snapshot(network: &FeedForwardNetwork) -> SoccerNeuralN
         target_popart: None,
         policy_head: None,
         line_depth_head: None,
+        mpc_objective_head: None,
     }
 }
 

@@ -27,7 +27,8 @@ use std::path::Path;
 use std::time::Instant;
 
 use soccer_engine::des::general::soccer::{
-    MatchSummary, SoccerNeuralNetworkSnapshot, SoccerQStateKey, SoccerQTargetEntry, Team,
+    FacingBucket, MatchSummary, SoccerNeuralNetworkSnapshot, SoccerQStateKey, SoccerQTargetEntry,
+    TacticalPhase, Team,
 };
 use soccer_engine::des::general::tournament::{
     EngineMatchRunner, EngineMatchRunnerConfig, TeamBrain, TournamentMatchContext,
@@ -53,6 +54,14 @@ fn env_bool(k: &str, d: bool) -> bool {
         .ok()
         .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
         .unwrap_or(d)
+}
+
+fn env_default_bool(k: &str, d: bool) -> bool {
+    let enabled = env_bool(k, d);
+    if std::env::var(k).is_err() {
+        std::env::set_var(k, if enabled { "1" } else { "0" });
+    }
+    enabled
 }
 
 fn apply_league_neural_mcts_config(config: &mut EngineMatchRunnerConfig) -> bool {
@@ -241,6 +250,14 @@ impl LeagueRoundKpis {
             self.forward_pass_margin as f64 / self.games as f64
         }
     }
+
+    fn mean_goal_diff(&self) -> f64 {
+        if self.games == 0 {
+            0.0
+        } else {
+            self.goal_diff as f64 / self.games as f64
+        }
+    }
 }
 
 /// Recompute parameter_count + l2_norm after mutating weights (the persistence validator
@@ -327,7 +344,14 @@ fn perturb_weights(s: &mut SoccerNeuralNetworkSnapshot, scale: f64, frac: f64, s
     recompute_norm(s);
 }
 
-type TargetEntryKey = (SoccerQStateKey, String, usize, usize, usize, usize);
+type TargetEntryKey = (SoccerQStateKey, String, usize, usize, usize, usize, i32);
+
+const LEAGUE_TARGET_FINE_COLUMNS: usize = 12;
+const LEAGUE_TARGET_FINE_ROWS: usize = 24;
+const LEAGUE_TARGET_TACTICAL_COLUMNS: usize = 6;
+const LEAGUE_TARGET_TACTICAL_ROWS: usize = 8;
+const LEAGUE_TARGET_MACRO_COLUMNS: usize = 3;
+const LEAGUE_TARGET_MACRO_ROWS: usize = 4;
 
 fn target_entry_key(entry: &SoccerQTargetEntry) -> TargetEntryKey {
     (
@@ -337,6 +361,7 @@ fn target_entry_key(entry: &SoccerQTargetEntry) -> TargetEntryKey {
         entry.target_tactical_cell_id,
         entry.target_macro_cell_id,
         entry.target_root_cell_id,
+        entry.receiver_descriptor,
     )
 }
 
@@ -353,6 +378,25 @@ fn merge_target_entries(
     entry_sets: impl IntoIterator<Item = Vec<SoccerQTargetEntry>>,
     max_entries: usize,
 ) -> Vec<SoccerQTargetEntry> {
+    merge_target_entries_inner(entry_sets, max_entries, false)
+}
+
+fn merge_target_entries_idempotent(
+    entry_sets: impl IntoIterator<Item = Vec<SoccerQTargetEntry>>,
+    max_entries: usize,
+) -> Vec<SoccerQTargetEntry> {
+    merge_target_entries_inner(entry_sets, max_entries, true)
+}
+
+fn same_target_entry_payload(a: &SoccerQTargetEntry, b: &SoccerQTargetEntry) -> bool {
+    a.visits == b.visits && a.value.to_bits() == b.value.to_bits()
+}
+
+fn merge_target_entries_inner(
+    entry_sets: impl IntoIterator<Item = Vec<SoccerQTargetEntry>>,
+    max_entries: usize,
+    idempotent_duplicates: bool,
+) -> Vec<SoccerQTargetEntry> {
     let mut by_key: HashMap<TargetEntryKey, SoccerQTargetEntry> = HashMap::new();
     for entries in entry_sets {
         for entry in entries {
@@ -363,6 +407,9 @@ fn merge_target_entries(
             by_key
                 .entry(key)
                 .and_modify(|existing| {
+                    if idempotent_duplicates && same_target_entry_payload(existing, &entry) {
+                        return;
+                    }
                     let existing_visits = existing.visits.max(1) as f64;
                     let entry_visits = entry.visits.max(1) as f64;
                     let total_visits = existing_visits + entry_visits;
@@ -380,6 +427,91 @@ fn merge_target_entries(
         merged.truncate(max_entries);
     }
     merged
+}
+
+fn mirror_pitch_cell_y(cell_id: usize, columns: usize, rows: usize) -> usize {
+    if columns == 0 || rows == 0 {
+        return cell_id;
+    }
+    let cell_count = columns.saturating_mul(rows);
+    if cell_id >= cell_count {
+        return cell_id;
+    }
+    let x = cell_id % columns;
+    let y = cell_id / columns;
+    (rows - 1 - y) * columns + x
+}
+
+fn mirror_tactical_phase_y(phase: TacticalPhase) -> TacticalPhase {
+    match phase {
+        TacticalPhase::HomeBuildUp => TacticalPhase::AwayBuildUp,
+        TacticalPhase::AwayBuildUp => TacticalPhase::HomeBuildUp,
+        TacticalPhase::HomeAttack => TacticalPhase::AwayAttack,
+        TacticalPhase::AwayAttack => TacticalPhase::HomeAttack,
+        other => other,
+    }
+}
+
+fn mirror_facing_y(facing: FacingBucket) -> FacingBucket {
+    match facing {
+        FacingBucket::North => FacingBucket::South,
+        FacingBucket::NorthEast => FacingBucket::SouthEast,
+        FacingBucket::SouthEast => FacingBucket::NorthEast,
+        FacingBucket::South => FacingBucket::North,
+        FacingBucket::SouthWest => FacingBucket::NorthWest,
+        FacingBucket::NorthWest => FacingBucket::SouthWest,
+        other => other,
+    }
+}
+
+fn mirror_target_state_y(mut state: SoccerQStateKey) -> SoccerQStateKey {
+    state.phase = mirror_tactical_phase_y(state.phase);
+    state.ball_zone_y = mirror_pitch_cell_y(state.ball_zone_y, 1, LEAGUE_TARGET_TACTICAL_ROWS);
+    state.ball_fine_row =
+        mirror_pitch_cell_y(state.ball_fine_row as usize, 1, LEAGUE_TARGET_FINE_ROWS) as u8;
+    state.receive_facing = mirror_facing_y(state.receive_facing);
+    state.action_facing = mirror_facing_y(state.action_facing);
+    state
+}
+
+fn mirror_target_entry_y(entry: &SoccerQTargetEntry) -> SoccerQTargetEntry {
+    let mut mirrored = entry.clone();
+    mirrored.state = mirror_target_state_y(mirrored.state);
+    mirrored.target_fine_cell_id = mirror_pitch_cell_y(
+        mirrored.target_fine_cell_id,
+        LEAGUE_TARGET_FINE_COLUMNS,
+        LEAGUE_TARGET_FINE_ROWS,
+    );
+    mirrored.target_tactical_cell_id = mirror_pitch_cell_y(
+        mirrored.target_tactical_cell_id,
+        LEAGUE_TARGET_TACTICAL_COLUMNS,
+        LEAGUE_TARGET_TACTICAL_ROWS,
+    );
+    mirrored.target_macro_cell_id = mirror_pitch_cell_y(
+        mirrored.target_macro_cell_id,
+        LEAGUE_TARGET_MACRO_COLUMNS,
+        LEAGUE_TARGET_MACRO_ROWS,
+    );
+    mirrored
+}
+
+fn mirrored_target_entries(entries: &[SoccerQTargetEntry]) -> Vec<SoccerQTargetEntry> {
+    entries.iter().map(mirror_target_entry_y).collect()
+}
+
+fn with_bidirectional_target_entries(brain: &TeamBrain) -> TeamBrain {
+    let mut next = brain.clone();
+    let mirrored_away_to_home = mirrored_target_entries(&brain.away_target_entries);
+    let mirrored_home_to_away = mirrored_target_entries(&brain.home_target_entries);
+    next.home_target_entries = merge_target_entries_idempotent(
+        [brain.home_target_entries.clone(), mirrored_away_to_home],
+        0,
+    );
+    next.away_target_entries = merge_target_entries_idempotent(
+        [brain.away_target_entries.clone(), mirrored_home_to_away],
+        0,
+    );
+    next
 }
 
 fn load_target_entries(value: &serde_json::Value, key: &str) -> Vec<SoccerQTargetEntry> {
@@ -570,10 +702,12 @@ fn play_and_carry(
         home_learns,
         away_learns,
     };
+    let frontier = with_bidirectional_target_entries(&frontier);
+    let opponent = with_bidirectional_target_entries(opponent);
     let (home, away) = if frontier_home {
-        (&frontier, opponent)
+        (&frontier, &opponent)
     } else {
-        (opponent, &frontier)
+        (&opponent, &frontier)
     };
     match runner.play(&ctx, home, away) {
         Ok(o) => {
@@ -656,6 +790,24 @@ fn play_checkpoint_validation(
     validation
 }
 
+fn checkpoint_validation_passes(
+    validation: Option<&LeagueRoundKpis>,
+    expected_games: usize,
+    min_forward_pass_margin: f64,
+    min_objective_margin: f64,
+    min_goal_diff_margin: f64,
+) -> bool {
+    match validation {
+        Some(validation) => {
+            validation.games == expected_games
+                && validation.mean_forward_pass_margin() > min_forward_pass_margin
+                && validation.mean_objective_fitness_margin() > min_objective_margin
+                && validation.mean_goal_diff() > min_goal_diff_margin
+        }
+        None => true,
+    }
+}
+
 fn main() {
     let frontier_path = env_str(
         "SOCCER_LEAGUE_FRONTIER",
@@ -686,6 +838,10 @@ fn main() {
     );
     let checkpoint_validate_min_objective_margin = env_f64(
         "SOCCER_LEAGUE_CHECKPOINT_VALIDATE_MIN_OBJECTIVE_MARGIN",
+        0.0,
+    );
+    let checkpoint_validate_min_goal_diff_margin = env_f64(
+        "SOCCER_LEAGUE_CHECKPOINT_VALIDATE_MIN_GOAL_DIFF_MARGIN",
         0.0,
     );
     let max_rounds = env_usize("SOCCER_LEAGUE_MAX_ROUNDS", 0);
@@ -745,22 +901,32 @@ fn main() {
             .ok()
             .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
             .unwrap_or(runner_config.base.neural_learning.target_popart_enabled);
+    let target_standardization_enabled =
+        env_default_bool("DD_SOCCER_ENABLE_TARGET_STANDARDIZATION", true);
+    let mc_critic_target_enabled = env_default_bool("DD_SOCCER_ENABLE_MC_CRITIC_TARGET", true);
+    let neural_self_bootstrap_enabled =
+        env_default_bool("DD_SOCCER_ENABLE_NEURAL_SELF_BOOTSTRAP", true);
+    let maxa_bootstrap_enabled = env_default_bool("DD_SOCCER_ENABLE_MAXA_BOOTSTRAP", true);
+    let novelty_bonus_enabled = env_default_bool("DD_SOCCER_ENABLE_NOVELTY_BONUS", true);
+    let forward_pass_climb_curriculum_enabled =
+        env_default_bool("DD_SOCCER_FORWARD_PASS_CLIMB_CURRICULUM", true);
+    runner_config.base.neural_learning.lp_coupling_enabled =
+        env_bool("SOCCER_NEURAL_LP_COUPLING_ENABLED", true);
     // POLICY-IMPROVEMENT LEVER: opt the fresh net into the actor-critic path. When on, the neural
     // ACTOR π(family|s) is trained by advantage policy-gradient and biases action selection on top
     // of the value blend — the "close the policy-improvement loop" escape from value-imitation
     // parity (policy gradient optimizes RETURN directly, not tabular-matching). Pair with a lower
     // DD_SOCCER_NEURAL_AUTHORITATIVE_LAMBDA (more actor influence) + SOCCER_POLICY_ENTROPY_COEFF
     // (keep exploring) so the actor can actually leave the analytic mode. Off ⇒ current behaviour.
-    if let Ok(raw) = std::env::var("SOCCER_NEURAL_ACTOR_CRITIC") {
-        runner_config.base.neural_blend.actor_critic =
-            matches!(raw.trim(), "1" | "true" | "TRUE" | "yes" | "on");
-    }
+    runner_config.base.neural_blend.actor_critic = env_bool("SOCCER_NEURAL_ACTOR_CRITIC", true);
     let league_neural_mcts_enabled = apply_league_neural_mcts_config(&mut runner_config);
     let mpc_tier2_enabled = runner_config.base.mpc.tier2_player_enabled;
     let mpc_reconcile_enabled = runner_config.base.mpc.reconcile_enabled;
     let mpc_field_aware_enabled = runner_config.base.mpc.field_aware_enabled;
     let mpc_latent_objective_enabled = runner_config.base.mpc.latent_objective_enabled;
     let local_mpc_enabled = runner_config.base.local_mpc_enabled;
+    let actor_critic_enabled = runner_config.base.neural_blend.actor_critic;
+    let lp_coupling_enabled = runner_config.base.neural_learning.lp_coupling_enabled;
     // Keep the engine's designed independent-brain mode (per-team critic drives each side).
     let runner = EngineMatchRunner::new(runner_config);
 
@@ -789,8 +955,39 @@ fn main() {
     let mut round = 0u32;
     let mut best_checkpoint_forward_pass_margin = f64::NEG_INFINITY;
     println!(
-        "league_train_started_at_utc={} games/opp={} minutes={} weight_decay={} fresh_opp={} checkpoint_every={} max_rounds={} max_target_entries_per_side={} advancement_metric=completed_forward_passes league_neural_mcts_enabled={} mpc_tier2_enabled={} mpc_reconcile_enabled={} mpc_field_aware_enabled={} mpc_latent_objective_enabled={} local_mpc_enabled={} checkpoint_require_forward_pass_climb={} checkpoint_max_forward_pass_regression={} checkpoint_min_forward_pass_margin={} checkpoint_validate_games={} checkpoint_validate_min_forward_pass_margin={} checkpoint_validate_min_objective_margin={} frontier={} candidate_frontier={} archive={}",
-        chrono_now(), games_per_opp, minutes, weight_decay, fresh_opponents, checkpoint_every, max_rounds, max_target_entries_per_side, league_neural_mcts_enabled, mpc_tier2_enabled, mpc_reconcile_enabled, mpc_field_aware_enabled, mpc_latent_objective_enabled, local_mpc_enabled, checkpoint_require_forward_pass_climb, checkpoint_max_forward_pass_regression, checkpoint_min_forward_pass_margin, checkpoint_validate_games, checkpoint_validate_min_forward_pass_margin, checkpoint_validate_min_objective_margin, frontier_path, candidate_frontier_path, archive_dir
+        "league_train_started_at_utc={} games/opp={} minutes={} weight_decay={} fresh_opp={} checkpoint_every={} max_rounds={} max_target_entries_per_side={} advancement_metric=completed_forward_passes league_neural_mcts_enabled={} actor_critic_enabled={} lp_coupling_enabled={} target_standardization_enabled={} mc_critic_target_enabled={} neural_self_bootstrap_enabled={} maxa_bootstrap_enabled={} novelty_bonus_enabled={} forward_pass_climb_curriculum_enabled={} mpc_tier2_enabled={} mpc_reconcile_enabled={} mpc_field_aware_enabled={} mpc_latent_objective_enabled={} local_mpc_enabled={} checkpoint_require_forward_pass_climb={} checkpoint_max_forward_pass_regression={} checkpoint_min_forward_pass_margin={} checkpoint_validate_games={} checkpoint_validate_min_forward_pass_margin={} checkpoint_validate_min_objective_margin={} checkpoint_validate_min_goal_diff_margin={} frontier={} candidate_frontier={} archive={}",
+        chrono_now(),
+        games_per_opp,
+        minutes,
+        weight_decay,
+        fresh_opponents,
+        checkpoint_every,
+        max_rounds,
+        max_target_entries_per_side,
+        league_neural_mcts_enabled,
+        actor_critic_enabled,
+        lp_coupling_enabled,
+        target_standardization_enabled,
+        mc_critic_target_enabled,
+        neural_self_bootstrap_enabled,
+        maxa_bootstrap_enabled,
+        novelty_bonus_enabled,
+        forward_pass_climb_curriculum_enabled,
+        mpc_tier2_enabled,
+        mpc_reconcile_enabled,
+        mpc_field_aware_enabled,
+        mpc_latent_objective_enabled,
+        local_mpc_enabled,
+        checkpoint_require_forward_pass_climb,
+        checkpoint_max_forward_pass_regression,
+        checkpoint_min_forward_pass_margin,
+        checkpoint_validate_games,
+        checkpoint_validate_min_forward_pass_margin,
+        checkpoint_validate_min_objective_margin,
+        checkpoint_validate_min_goal_diff_margin,
+        frontier_path,
+        candidate_frontier_path,
+        archive_dir
     );
 
     loop {
@@ -939,6 +1136,15 @@ fn main() {
                     .map(|brain| brain.away_target_entries.clone()),
                 max_target_entries_per_side,
             );
+            frontier = with_bidirectional_target_entries(&frontier);
+            if max_target_entries_per_side > 0 {
+                frontier
+                    .home_target_entries
+                    .truncate(max_target_entries_per_side);
+                frontier
+                    .away_target_entries
+                    .truncate(max_target_entries_per_side);
+            }
         }
 
         // Weight decay to keep the net in the trainable regime.
@@ -1043,11 +1249,12 @@ fn main() {
                         checkpoint_validate_games,
                     );
                     println!(
-                        "league_checkpoint_validation round={round} games={} forward_pass_margin_per_game={:.3} objective_margin={:.3} gd_total={} shots_after_pass={} completed_passes={} pass_gain_yards={:.1}",
+                        "league_checkpoint_validation round={round} games={} forward_pass_margin_per_game={:.3} objective_margin={:.3} gd_total={} gd_per_game={:.3} shots_after_pass={} completed_passes={} pass_gain_yards={:.1}",
                         validation.games,
                         validation.mean_forward_pass_margin(),
                         validation.mean_objective_fitness_margin(),
                         validation.goal_diff,
+                        validation.mean_goal_diff(),
                         validation.shots_after_pass_for,
                         validation.passes_completed_for,
                         validation.pass_chain_gain_yards_for,
@@ -1066,16 +1273,13 @@ fn main() {
                         >= prior_best;
                 let passes_forward_pass_floor =
                     gate_forward_pass_margin > checkpoint_min_forward_pass_margin;
-                let passes_validation = match validation.as_ref() {
-                    Some(validation) => {
-                        validation.games == checkpoint_validate_games
-                            && validation.mean_forward_pass_margin()
-                                > checkpoint_validate_min_forward_pass_margin
-                            && validation.mean_objective_fitness_margin()
-                                > checkpoint_validate_min_objective_margin
-                    }
-                    None => true,
-                };
+                let passes_validation = checkpoint_validation_passes(
+                    validation.as_ref(),
+                    checkpoint_validate_games,
+                    checkpoint_validate_min_forward_pass_margin,
+                    checkpoint_validate_min_objective_margin,
+                    checkpoint_validate_min_goal_diff_margin,
+                );
                 if passes_forward_pass_climb && passes_forward_pass_floor && passes_validation {
                     let cp = format!(
                         "{}/league-r{:04}-{}.json",
@@ -1096,7 +1300,7 @@ fn main() {
                     );
                 } else {
                     println!(
-                        "league_checkpoint_held round={round} metric=completed_forward_passes gate_forward_pass_margin_per_game={gate_forward_pass_margin:.3} train_forward_pass_margin_per_game={mean_forward_pass_margin:.3} best_forward_pass_margin_per_game={prior_best:.3} require_climb={} min_margin={checkpoint_min_forward_pass_margin:.3} validation_passed={passes_validation} validation_games={}/{}",
+                        "league_checkpoint_held round={round} metric=completed_forward_passes gate_forward_pass_margin_per_game={gate_forward_pass_margin:.3} train_forward_pass_margin_per_game={mean_forward_pass_margin:.3} best_forward_pass_margin_per_game={prior_best:.3} require_climb={} min_margin={checkpoint_min_forward_pass_margin:.3} validation_passed={passes_validation} validation_games={}/{} validation_min_goal_diff_margin={checkpoint_validate_min_goal_diff_margin:.3}",
                         checkpoint_require_forward_pass_climb,
                         validation.as_ref().map(|validation| validation.games).unwrap_or(0),
                         checkpoint_validate_games,
@@ -1145,6 +1349,48 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn mirror_test_state() -> SoccerQStateKey {
+        serde_json::from_value(serde_json::json!({
+            "phase": "HomeAttack",
+            "role": "Midfielder",
+            "possessionRelative": 1,
+            "ballZoneX": 2,
+            "ballZoneY": 6,
+            "ballFineLane": 5,
+            "ballFineRow": 20,
+            "receiveFacing": "NorthEast",
+            "actionFacing": "SouthWest",
+            "scoreDiffBucket": 0,
+            "hasBall": true,
+            "visibleBall": true,
+            "shotLaneOpen": false,
+            "visiblePassOptionsBin": 2,
+            "ballDistanceBin": 2,
+            "yardsToGoalBin": 3,
+            "pressureBin": 1,
+            "openSpaceBin": 4
+        }))
+        .expect("compact test Q-state should deserialize")
+    }
+
+    fn mirror_test_target_entry(
+        receiver_descriptor: i32,
+        value: f64,
+        visits: u32,
+    ) -> SoccerQTargetEntry {
+        SoccerQTargetEntry {
+            state: mirror_test_state(),
+            action: "pass".to_string(),
+            target_fine_cell_id: 20 * LEAGUE_TARGET_FINE_COLUMNS + 4,
+            target_tactical_cell_id: 6 * LEAGUE_TARGET_TACTICAL_COLUMNS + 2,
+            target_macro_cell_id: 3 * LEAGUE_TARGET_MACRO_COLUMNS + 1,
+            target_root_cell_id: 0,
+            receiver_descriptor,
+            value,
+            visits,
+        }
     }
 
     struct EnvVarGuard {
@@ -1202,6 +1448,130 @@ mod tests {
         assert_eq!(away.objective_fitness, 5.0);
         assert_eq!(away.objective_fitness_margin, -9.0);
         assert_eq!(away.forward_pass_margin, -9);
+    }
+
+    #[test]
+    fn checkpoint_validation_blocks_forward_pass_smoke_without_positive_gd() {
+        let mut validation = LeagueRoundKpis::default();
+        validation.add(LeagueMatchKpis {
+            goal_diff: 0,
+            forward_pass_margin: 5,
+            objective_fitness_margin: 5.0,
+            ..LeagueMatchKpis::default()
+        });
+
+        assert!(!checkpoint_validation_passes(
+            Some(&validation),
+            1,
+            0.0,
+            0.0,
+            0.0,
+        ));
+
+        validation.goal_diff = 1;
+        assert!(checkpoint_validation_passes(
+            Some(&validation),
+            1,
+            0.0,
+            0.0,
+            0.0,
+        ));
+    }
+
+    #[test]
+    fn target_entry_mirror_flips_pitch_rows_and_home_away_phases() {
+        assert_eq!(
+            mirror_tactical_phase_y(TacticalPhase::HomeAttack),
+            TacticalPhase::AwayAttack
+        );
+        assert_eq!(
+            mirror_tactical_phase_y(TacticalPhase::AwayBuildUp),
+            TacticalPhase::HomeBuildUp
+        );
+        assert_eq!(
+            mirror_facing_y(FacingBucket::NorthEast),
+            FacingBucket::SouthEast
+        );
+        assert_eq!(
+            mirror_facing_y(FacingBucket::SouthWest),
+            FacingBucket::NorthWest
+        );
+        assert_eq!(
+            mirror_pitch_cell_y(
+                20 * LEAGUE_TARGET_FINE_COLUMNS + 4,
+                LEAGUE_TARGET_FINE_COLUMNS,
+                LEAGUE_TARGET_FINE_ROWS,
+            ),
+            3 * LEAGUE_TARGET_FINE_COLUMNS + 4
+        );
+        assert_eq!(
+            mirror_pitch_cell_y(
+                6 * LEAGUE_TARGET_TACTICAL_COLUMNS + 2,
+                LEAGUE_TARGET_TACTICAL_COLUMNS,
+                LEAGUE_TARGET_TACTICAL_ROWS,
+            ),
+            LEAGUE_TARGET_TACTICAL_COLUMNS + 2
+        );
+        assert_eq!(
+            mirror_pitch_cell_y(
+                3 * LEAGUE_TARGET_MACRO_COLUMNS + 1,
+                LEAGUE_TARGET_MACRO_COLUMNS,
+                LEAGUE_TARGET_MACRO_ROWS,
+            ),
+            1
+        );
+
+        let mirrored = mirror_target_state_y(mirror_test_state());
+        assert_eq!(mirrored.phase, TacticalPhase::AwayAttack);
+        assert_eq!(mirrored.ball_zone_y, 1);
+        assert_eq!(mirrored.ball_fine_row, 3);
+        assert_eq!(mirrored.receive_facing, FacingBucket::SouthEast);
+        assert_eq!(mirrored.action_facing, FacingBucket::NorthWest);
+    }
+
+    #[test]
+    fn target_entry_merge_preserves_receiver_descriptor_dimension() {
+        let merged = merge_target_entries(
+            [vec![
+                mirror_test_target_entry(-1, 1.0, 3),
+                mirror_test_target_entry(42, 4.0, 5),
+            ]],
+            0,
+        );
+
+        assert_eq!(merged.len(), 2);
+        let mut descriptors = merged
+            .iter()
+            .map(|entry| entry.receiver_descriptor)
+            .collect::<Vec<_>>();
+        descriptors.sort_unstable();
+        assert_eq!(descriptors, vec![-1, 42]);
+    }
+
+    #[test]
+    fn bidirectional_target_entries_are_idempotent() {
+        let mut brain = TeamBrain::fresh();
+        brain.home_target_entries = vec![mirror_test_target_entry(7, 2.5, 11)];
+
+        let once = with_bidirectional_target_entries(&brain);
+        let twice = with_bidirectional_target_entries(&once);
+
+        assert_eq!(once.home_target_entries.len(), 1);
+        assert_eq!(once.away_target_entries.len(), 1);
+        assert_eq!(twice.home_target_entries.len(), 1);
+        assert_eq!(twice.away_target_entries.len(), 1);
+        assert_eq!(once.home_target_entries[0].visits, 11);
+        assert_eq!(once.away_target_entries[0].visits, 11);
+        assert_eq!(twice.home_target_entries[0].visits, 11);
+        assert_eq!(twice.away_target_entries[0].visits, 11);
+        assert_eq!(
+            target_entry_key(&once.home_target_entries[0]),
+            target_entry_key(&twice.home_target_entries[0])
+        );
+        assert_eq!(
+            target_entry_key(&once.away_target_entries[0]),
+            target_entry_key(&twice.away_target_entries[0])
+        );
     }
 
     #[test]

@@ -6835,11 +6835,7 @@ mod tests {
         assert!(expanded[0].target_point.is_some());
         assert!(pass2_plan.target_point.is_some());
         let scored_ranked = sim.neural_decision_transition_for_plan(
-            &base,
-            &snapshot,
-            actor_id,
-            actor_team,
-            pass2_plan,
+            &base, &snapshot, actor_id, actor_team, pass2_plan,
         );
         assert_eq!(scored_ranked.action, "pass2");
         assert_eq!(
@@ -11801,6 +11797,14 @@ impl SoccerMatch {
         } else {
             None
         };
+        self.mpc_objective_head =
+            if let Some(mpc_objective_head) = snapshot.mpc_objective_head.as_deref() {
+                Some(std::sync::Arc::new(SoccerMpcObjectiveHead::from_snapshot(
+                    mpc_objective_head,
+                )?))
+            } else {
+                None
+            };
         Ok(())
     }
 
@@ -11883,6 +11887,9 @@ impl SoccerMatch {
                 }
                 if let Some(line_depth_head) = &self.line_depth_head {
                     snapshot.line_depth_head = Some(Box::new(line_depth_head.to_snapshot()));
+                }
+                if let Some(mpc_objective_head) = &self.mpc_objective_head {
+                    snapshot.mpc_objective_head = Some(Box::new(mpc_objective_head.to_snapshot()));
                 }
                 snapshot
             })
@@ -33618,8 +33625,9 @@ impl SoccerMatch {
             );
             let mut penalized_transition = transition.clone();
             let stale_dribble_penalty = stale_dribble_steal_turnover_penalty_points(transition);
-            let penalty =
-                (TURNOVER_WINDOW_PENALTY_POINTS + stale_dribble_penalty) * recency * severity;
+            let turnover_window_penalty =
+                TURNOVER_WINDOW_PENALTY_POINTS * forward_pass_turnover_penalty_scale();
+            let penalty = (turnover_window_penalty + stale_dribble_penalty) * recency * severity;
             penalized_transition.reward = (penalized_transition.reward - penalty).min(-penalty);
             penalized.push(penalized_transition);
             deferred_turnover_credits.push((transition.tick, transition.player_id, -penalty));
