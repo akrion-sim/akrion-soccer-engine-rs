@@ -20539,10 +20539,17 @@ impl SoccerMatch {
                             .as_ref()
                             .map(|decision| decision.action.as_str())
                             .unwrap_or("");
+                        // The net's FRESH pick this tick (the assembler's chosen label), before the
+                        // refractory/discipline possibly reverted it to the held action.
+                        let net_pick = learned_decision
+                            .as_ref()
+                            .map(|decision| decision.label.as_str())
+                            .unwrap_or("");
                         let on_ball = self.ball.holder == Some(scheduled.id);
                         record_net_influence_commit_diag(
                             normalize_soccer_action_label(baseline),
                             normalize_soccer_action_label(semantic),
+                            normalize_soccer_action_label(net_pick),
                             on_ball,
                         );
                     }
