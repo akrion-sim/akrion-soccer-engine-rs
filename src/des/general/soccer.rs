@@ -40942,6 +40942,44 @@ impl SoccerPolicyHead {
             self.training_steps = self.training_steps.saturating_add(applied);
             self.last_loss = Some(loss_sum / applied as f64);
         }
+        self.train_forward_select_logit_weight(samples);
+    }
+
+    /// Policy-gradient update for the per-net FORWARD action-selection bias scalar. Accumulates an
+    /// advantage-weighted, forward-option-quality-gated gradient (`Σ advantage · feature` over the
+    /// samples flagged `forward_select_eligible` — i.e. that were forward passes into a good forward
+    /// option), steps the weight with the existing policy LR, and clamps to `[0, MAX]`. Gated by
+    /// `DD_SOCCER_ENABLE_FORWARD_SELECT_LOGIT` (default OFF), so the default path never touches the
+    /// weight: it stays 0.0 and the scored-candidate bonus is 0 ⇒ byte-identical. Kept separate from
+    /// the role-head PG loop above so that update is undisturbed.
+    ///
+    /// `feature` is read from `state_features[SOCCER_NEURAL_FEATURE_FORWARD_OPTION_QUALITY]`, which
+    /// (via `soccer_neural_unit`) holds exactly the same clamped
+    /// `best_forward_pass_option_quality.max(best_forward_pass_receiver_openness)` used to size the
+    /// score-time bonus, keeping the training signal and the applied bias on the same feature.
+    fn train_forward_select_logit_weight(&mut self, samples: &[SoccerPolicySample]) {
+        if !dd_soccer_enable_forward_select_logit() {
+            return;
+        }
+        let mut gradient = 0.0;
+        for sample in samples {
+            if !sample.forward_select_eligible {
+                continue;
+            }
+            let feature = sample.state_features[SOCCER_NEURAL_FEATURE_FORWARD_OPTION_QUALITY];
+            let term = sample.advantage * feature;
+            if term.is_finite() {
+                gradient += term;
+            }
+        }
+        if gradient == 0.0 || !gradient.is_finite() {
+            return;
+        }
+        let updated = self.forward_select_logit_weight + SOCCER_POLICY_LEARNING_RATE * gradient;
+        if updated.is_finite() {
+            self.forward_select_logit_weight =
+                updated.clamp(0.0, SOCCER_FORWARD_SELECT_LOGIT_WEIGHT_MAX);
+        }
     }
 }
 
