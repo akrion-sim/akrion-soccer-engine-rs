@@ -26,10 +26,11 @@
 Three compounding structural ceilings, all verified in code:
 
 1. **The net ranks heuristic actions with heuristic *parameters*.** The learnable factored action
-   space (`DiscretizedKickAction` — actor owns kick power/direction/curve) exists and is unit-tested
-   but is only used at the **execution/lowering** layer ([world.rs:14650](../src/des/general/soccer/world.rs#L14650),
-   gated `DD_SOCCER_ENABLE_DISCRETIZED_KICK`) — *never as candidates the net ranks*. Pass/shoot
-   params are a continuous power × ~72-site heuristic scan.
+   space (`DiscretizedKickAction` — actor owns kick power/direction/curve) exists and is unit-tested;
+   with the gate **off** it is only used at the **execution/lowering** layer
+   (`DiscretizedKickAction::from_power_direction`, world.rs:26742) — *not as candidates the net ranks*.
+   **Part B (above) now injects them as ranked candidates when `DD_SOCCER_ENABLE_DISCRETIZED_KICK` is
+   on.** With the gate off, pass/shoot params remain a continuous power × ~72-site heuristic scan.
 2. **The value regresses onto the *tabular* Q.** Target = `r + γ·max_next` with `max_next =`
    tabular `best_value_hierarchical` ([world.rs](../src/des/general/soccer/world.rs)). A value
    trained to match the tabular Q **cannot exceed the analytic ceiling** — it's imitation, not
