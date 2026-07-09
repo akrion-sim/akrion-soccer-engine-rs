@@ -14286,6 +14286,28 @@ impl SoccerMatch {
             _ => return Vec::new(),
         };
         let limit = neural_mcts_pass_target_candidate_limit();
+        if pass_cand_diag_enabled() {
+            if let Some(passer_pos) = snapshot.player_position(player_id) {
+                let dir = team.attack_dir();
+                let (mut fwd_pre, mut lat_pre, mut back_pre, mut fwd_post) = (0, 0, 0, 0);
+                for (i, tp) in targets.iter().enumerate() {
+                    if let Some(p) = snapshot.player_position(*tp) {
+                        let forward = (p.y - passer_pos.y) * dir;
+                        if forward > 1.25 {
+                            fwd_pre += 1;
+                            if i < limit {
+                                fwd_post += 1;
+                            }
+                        } else if forward < -1.25 {
+                            back_pre += 1;
+                        } else {
+                            lat_pre += 1;
+                        }
+                    }
+                }
+                record_pass_candidate_diag(fwd_pre, lat_pre, back_pre, fwd_post);
+            }
+        }
         targets
             .into_iter()
             .take(limit)
