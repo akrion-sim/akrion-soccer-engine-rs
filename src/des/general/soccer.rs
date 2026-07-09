@@ -42887,6 +42887,7 @@ fn soccer_policy_head_snapshot(head: &SoccerPolicyHead) -> SoccerPolicyHeadSnaps
             .iter()
             .map(soccer_policy_role_head_snapshot)
             .collect(),
+        forward_select_logit_weight: head.forward_select_logit_weight,
     }
 }
 
