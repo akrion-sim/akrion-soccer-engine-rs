@@ -1286,6 +1286,20 @@ pub struct SoccerMatch {
     /// When warm + gated on, it nudges the analytic aim/lead target by a hard-bounded residual so
     /// pass/shot/dribble QUALITY becomes learnable; `None` ⇒ pure analytic target (parity).
     pub(crate) mpc_objective_head: Option<std::sync::Arc<SoccerMpcObjectiveHead>>,
+    /// Transient carry-slot for the learned MPC DRIBBLE aim-residual (gated, default-OFF via
+    /// [`dd_soccer_enable_learned_mpc_dribble_objective`]). Dribble is a SUSTAINED per-tick action
+    /// whose reward (beat man / turnover) is DELAYED, so — unlike the discrete pass/shot
+    /// `Pending{Pass,Shot}` launch→resolve that carries `(features, residual, bend)` to a single
+    /// resolve — there is no `Pending` to hang the sample on. Instead `apply_dribble_intent`
+    /// OVERWRITES this each tick with `(holder player_id, launch features, applied 2-D residual,
+    /// applied bend)`; the LAST value before the outcome is what the beat/dispossession resolve
+    /// credits (a deliberate approximation of the delayed-credit model — its risk is that a residual
+    /// applied several ticks before the outcome, or one held through a non-dribble tick, is credited
+    /// as if it caused the outcome). Cleared on any change of holder (`mark_ball_received`) so a
+    /// stale residual is never credited to a different carrier, and CONSUMED (taken) when a sample is
+    /// emitted. `None` ⇒ nothing pending; when the gate is off it is never written, so the two resolve
+    /// hooks are no-ops and behaviour is byte-identical.
+    pub(crate) dribble_mpc_objective: Option<(usize, Vec<f32>, Vec2, f64)>,
     /// The trained back-four line-depth head, when present. Set by the learner
     /// (carried + trained across games) so the line decision consumes it live; `None`
     /// ⇒ analytic seed. Shared into each [`WorldSnapshot`] via an `Arc` clone.
