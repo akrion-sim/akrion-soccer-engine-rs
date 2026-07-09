@@ -508,26 +508,6 @@ fn default_evolution_window_games(
     evolution_interval_games.max(evolution_elite_games).max(1)
 }
 
-/// The evolution sample window is the pool of recent games a candidate is scored over, and its
-/// occupancy is what lands in `metrics.learningProvenance.searchParameters.promotion.gate.sampleGames`.
-/// When the promotion gate is enabled that window MUST be able to reach the gate's
-/// `min_sample_games`; otherwise every would-be-`active` candidate is force-archived by the
-/// persistence-layer sample floor (`soccer_policy_version_status_after_promotion_sample_floor`) and
-/// promotion stalls permanently. Operator overrides via `SOCCER_EVOLUTION_WINDOW_GAMES` are honoured
-/// — this only raises a structurally-too-small window up to the floor, and only when the gate is on;
-/// it never lowers a larger operator-chosen window and does not touch the elite breeding count.
-fn evolution_window_games_floored_for_promotion_gate(
-    configured_window_games: usize,
-    promotion_gate_enabled: bool,
-    min_sample_games: usize,
-) -> usize {
-    if promotion_gate_enabled {
-        configured_window_games.max(min_sample_games)
-    } else {
-        configured_window_games
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 struct NeuralPopulationSearchConfig {
     enabled: bool,
@@ -7806,14 +7786,6 @@ fn run() -> Result<(), Box<dyn Error>> {
     };
     validate_soccer_policy_promotion_gate_config_for_learning_run(&policy_promotion_gate)
         .map_err(invalid_data)?;
-    // Align the evolution sample window with the promotion sample floor: a candidate can only
-    // promote if it is scored over at least `min_sample_games` games, so a smaller window would
-    // guarantee a permanent promotion stall. Honours the operator-chosen window; only raises it.
-    let evolution_window_games = evolution_window_games_floored_for_promotion_gate(
-        evolution_window_games,
-        policy_promotion_gate.enabled,
-        policy_promotion_gate.min_sample_games,
-    );
     // Anti-regression ratchet for activation (see `active_max_fitness_regression`):
     // how much fitness a newer generation may lose vs the incumbent and still go
     // `active`. Configmap-tunable so the operator can tighten it (→ 0.0 = "no
@@ -15183,31 +15155,6 @@ mod tests {
         assert_eq!(default_evolution_interval_games(0), 10);
         assert_eq!(default_evolution_interval_games(4), 10);
         assert_eq!(default_evolution_interval_games(16), 16);
-    }
-
-    #[test]
-    fn evolution_window_floors_at_promotion_sample_floor_when_gate_enabled() {
-        // A too-small window (the promotion-stall signature) is raised to the sample floor so a
-        // candidate can actually accumulate enough games to clear the gate.
-        assert_eq!(
-            evolution_window_games_floored_for_promotion_gate(3, true, 8),
-            8
-        );
-        // A larger operator-chosen window is honoured, never lowered.
-        assert_eq!(
-            evolution_window_games_floored_for_promotion_gate(25, true, 8),
-            25
-        );
-        // Exactly at the floor is unchanged.
-        assert_eq!(
-            evolution_window_games_floored_for_promotion_gate(8, true, 8),
-            8
-        );
-        // With the gate disabled there is no sample floor, so the window is left as configured.
-        assert_eq!(
-            evolution_window_games_floored_for_promotion_gate(3, false, 8),
-            3
-        );
     }
 
     #[test]
