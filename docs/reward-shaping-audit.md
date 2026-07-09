@@ -1,7 +1,7 @@
 # Reward shaping audit (#8)
 
 The per-step learning reward (assembled in `soccer.rs`, the
-`reward += …` block spanning ~L26463–28038) has accreted dozens of dense shaping
+`reward += …` block beginning ~L19000) has accreted dozens of dense shaping
 shards. This audits them against the **potential-based reward shaping (PBRS)**
 criterion (Ng, Harada & Russell 1999): a shaping term is provably
 policy-invariant iff it can be written
@@ -32,18 +32,18 @@ form; the only latent issue is `γ=1` vs the learner's true discount (see
 "Follow-ups").
 - **Pitch value** — `territorial_advantage(after) − territorial_advantage(before)`.
   ✅ Now routed through `potential_based_shaping` (this change) as the template.
-- Yards-to-goal progress — `(before.yards_to_goal − after.yards_to_goal)` (~L27318).
-- Ball-forward delta — `ball_forward.clamp(...)` measured as a positional change (~L27237/27239).
+- Yards-to-goal progress — `(before.yards_to_goal − after.yards_to_goal)` (~L19159).
+- Ball-forward delta — `ball_forward.clamp(...)` measured as a positional change (~L19085/19087).
 - Carry progress, spacing deltas (`spacing_delta.*`) — differences of a shape potential.
 
 ### C. Flat state-conditioned bonuses — NOT potential-based (review)
 Constant reward for being in a state, with no canceling `−Φ(s)` on exit. Each
 is a per-step bias the policy can accumulate by loitering in the rewarded state.
-- `reward += 0.09` for a pass-state condition (~L27204), `reward += 0.08` (~L27444),
-  `reward += 0.18 * role_multiplier * half_multiplier` (~L27378).
-- Fixed penalties not tied to an action outcome: `reward -= 0.42` (~L27381),
-  `-= 0.22` (~L27455), `-= 0.16` (~L27489).
-- `EFFORT_REWARD_POINTS` / `LAZINESS_PENALTY_POINTS` (consts =2.6 at ~L467/468, applied ~L27155/27157) — effort
+- `reward += 0.09` for a pass-state condition (~L19065), `reward += 0.08` (~L19233),
+  `reward += 0.18 * role_multiplier * half_multiplier` (~L19205).
+- Fixed penalties not tied to an action outcome: `reward -= 0.42` (~L19208),
+  `-= 0.22` (~L19244), `-= 0.16` (~L19278).
+- `EFFORT_REWARD_POINTS` / `LAZINESS_PENALTY_POINTS` (~L19016/19018) — effort
   bonuses; defensible as B if expressed as a *closing-distance delta*, a bias if
   flat per tick.
 
@@ -58,10 +58,10 @@ must be gated and A/B'd against the current learner, not flipped blind.
 
 Operator lever: make **completed forward passes** the primary *dense* advancement signal instead of
 shots. Two `OnceLock` env knobs, default 1.0 (identical):
-- `DD_SOCCER_FORWARD_PASS_REWARD_SCALE` (0..20) — multiplies **only the forward branch** of `completed_pass_reward_for_pitch`
-  (post Round-17 fix; `forward_pass_reward_scale()`, soccer.rs:23495; applied :23558/:23562; comment :23549).
+- `DD_SOCCER_FORWARD_PASS_REWARD_SCALE` (0..20) — multiplies `completed_pass_reward_for_pitch`
+  (`forward_pass_reward_scale()`, soccer.rs:23444).
 - `DD_SOCCER_SHOT_SHAPING_REWARD_SCALE` (0..1) — dampens **only** the shot-TAKEN *shaping* proxy
-  (`SHOT_ON_TARGET_REWARD_POINTS`, soccer.rs:1179; `* shot_shaping_reward_scale()` dampening applied :36667); the goal (100) and terminal-outcome rewards are
+  (`SHOT_ON_TARGET_REWARD_POINTS`, soccer.rs:36473); the goal (100) and terminal-outcome rewards are
   category-A and stay intact so finishing is never un-learned.
 
 **PBRS status:** the completed-forward-pass reward is a **category-C** per-visit term (a completion
@@ -79,12 +79,9 @@ EPV potential routed through `potential_based_shaping`, which would value progre
 farm risk but needs a possession-chain export first.
 
 ## Follow-ups (deferred, each its own gated change)
-1. **Discount alignment — IMPLEMENTED (default-ON).** Pitch value now routes through
-   `potential_based_shaping(disciplined_gamma(), before, after)`, so the shaping γ matches the
-   learner's actual `γ` (`REWARD_SHAPING_DEFAULT_GAMMA = 0.99`); `disciplined_gamma()`
-   (reward_shaping.rs:91) is promoted to default-ON in production (gate note
-   reward_shaping.rs:82). γ=1.0 only when the shaping-discipline gate is off. Remaining
-   B-terms still migrate one at a time.
+1. **Discount alignment.** B-terms (and pitch value) use `γ=1`; the returns use
+   the learner's actual `γ` (`REWARD_SHAPING_DEFAULT_GAMMA = 0.99`). True
+   invariance needs them to match. Low-risk but non-identical → gate + A/B.
 2. **Convert the C-terms** to potential form one at a time behind a gate,
    measuring win-rate / Elo (#7), not raw reward.
 3. **Single shaping budget.** Sum of |shaping| per step currently uncapped; a
@@ -93,8 +90,6 @@ farm risk but needs a possession-chain export first.
 ## What this change lands
 - `reward_shaping` module: the PBRS primitive + invariance tests (telescoping to
   a constant over a returning trajectory; non-finite neutralisation).
-- Pitch value routes through `potential_based_shaping(disciplined_gamma(), before, after) * scale`
-  (soccer.rs:15053); the discount-alignment discipline is shipped and **default-ON** (γ=0.99), so
-  γ=1.0 applies only when the shaping-discipline gate is off.
+- Pitch-value reward routed through it (γ=1.0, byte-identical) as the template.
 - This audit. The C→potential conversions are intentionally **not** applied
   blind; they are the gated follow-up work.

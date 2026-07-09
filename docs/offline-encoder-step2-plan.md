@@ -27,7 +27,7 @@ value head** distilled into the engine's `FeedForwardNetwork`, with **identical 
    (`DenseLayerConfig`, activations) so the trained weights serialize into the existing
    neural-snapshot format and load unchanged at runtime (one dense forward pass).
 4. **Integrate behind a default-OFF gate** (`DD_SOCCER_ENABLE_OFFLINE_DISTILLED_HEAD`).
-   Append channels at the tail; zero-pad old snapshots (already supported, soccer.rs:4401).
+   Append channels at the tail; zero-pad old snapshots (already supported, soccer.rs:3675).
 5. **A/B before promotion** with the existing `soccer_eval_gate` (held-out Elo / cross-play /
    Wilson / exploitability). Promote only on a positive verdict.
 

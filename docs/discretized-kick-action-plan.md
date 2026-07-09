@@ -12,32 +12,32 @@ seed as cold-start, the net earns its blend**, and each phase is promoted only o
 held-out win-rate verdict from the eval gate ([learning-rate-audit.md](learning-rate-audit.md)
 companion infra: `soccer_eval_gate_run` / `scripts/run_outcome_ab.sh`).
 
-## Current state (verified against `main`, 2026-07-09)
+## Current state (verified against `main`)
 
 The execution substrate is **already in place and shared** — passes and shots both
 lower a `KickReleaseSpec` through `kick_release_clamped_to_pitch` into a
 `LoweredKickRelease` (velocity + curl + altitude) that sets `ball.velocity`:
-- Pass: [world.rs:26761](../src/des/general/soccer/world.rs#L26761) — builds the spec
-  from a heuristic `aimed_target`, `speed` (`modulated_pass_speed_yps`, world.rs:26002), `curve`,
+- Pass: [world.rs:12603](../src/des/general/soccer/world.rs#L12603) — builds the spec
+  from a heuristic `aimed_target`, `speed` (`modulated_pass_speed_yps`), `curve`,
   `curve_bend_yards`, and `flight`.
-- Shot: [world.rs:27221](../src/des/general/soccer/world.rs#L27221) — `speed` from
-  `shot_speed_yps_from_power` (world.rs:27190), same `kick_release_clamped_to_pitch` path.
+- Shot: [world.rs ~12799](../src/des/general/soccer/world.rs) — `speed` from
+  `shot_speed_yps_from_power`, same `kick_release_clamped_to_pitch` path.
 
 The **discrete representation already exists but is constructed only in tests**:
-- `DiscretizedKickAction { speed_bucket: u8 (10), direction_bucket: u8 (36), curve, technique, elevation }`
-  ([soccer.rs:63788](../src/des/general/soccer.rs#L63788)) with bucket↔value mappings.
+- `DiscretizedKickAction { speed_bucket: u8 (10), direction_bucket: u8 (36), curve, elevation }`
+  ([soccer.rs:54822](../src/des/general/soccer.rs#L54822)) with bucket↔value mappings.
 - `lower_discretized_kick_release(origin, action, min_speed, max_speed, ref_distance, bend, dither)`
-  → `LoweredKickRelease` ([soccer.rs:64092](../src/des/general/soccer.rs#L64092)) — the
+  → `LoweredKickRelease` ([soccer.rs:55073](../src/des/general/soccer.rs#L55073)) — the
   exact lowering the wiring needs. **Its only callers are in `#[cfg(test)]`**
-  ([soccer.rs:69143-69177](../src/des/general/soccer.rs#L69143)).
+  ([soccer.rs:59200+](../src/des/general/soccer.rs#L59200)).
 - `DiscretizedKickDither::sample` is currently a no-op (returns zero offsets) — a
   stub awaiting a learned/stochastic source.
 
 The decision path the wiring plugs into:
-`learned_action_for_player_with_context` ([world.rs:13924](../src/des/general/soccer/world.rs#L13924))
-→ `neural_blended_action` ([world.rs:15614](../src/des/general/soccer/world.rs#L15614))
-→ `mpc_reconciled_learned_plan_for_policy` ([world.rs:16595](../src/des/general/soccer/world.rs#L16595))
-→ executed in `apply_player_intent` ([world.rs:25489](../src/des/general/soccer/world.rs#L25489)).
+`learned_action_for_player_with_context` ([world.rs:4366](../src/des/general/soccer/world.rs#L4366))
+→ `neural_blended_action` ([world.rs:4689](../src/des/general/soccer/world.rs#L4689))
+→ `mpc_reconciled_learned_plan_for_policy` ([world.rs:5225](../src/des/general/soccer/world.rs#L5225))
+→ executed in `apply_player_intent` ([world.rs:11663](../src/des/general/soccer/world.rs#L11663)).
 
 The learnable-head pattern to mirror: `back_four_line.rs` —
 `Inputs → to_features() → FeedForwardNetwork → analytic seed → MIN_TRAINING_STEPS

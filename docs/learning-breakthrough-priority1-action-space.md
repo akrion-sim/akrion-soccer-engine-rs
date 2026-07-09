@@ -8,29 +8,15 @@
 > [`learnability-conversion-roadmap.md`](learnability-conversion-roadmap.md) Priority 1 (which the
 > repo itself flags as DORMANT / highest-ROI).
 
-> **⚠️ STATUS (verified against HEAD `be11b4d`, 2026-07-09): Parts A & B are now IMPLEMENTED (gated,
-> default-off) on this branch (`feature/action-param-features-and-capacity`).** Part A =
-> `SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM = 10` (soccer.rs:4644), wired into
-> `soccer_neural_transition_features_with_action` (soccer.rs:46111-46130), gate
-> `DD_SOCCER_ENABLE_ACTION_PARAM_FEATURES` (soccer.rs:63687). Part B = candidate assembly expands
-> pass/aerial targets into discretized kick-power-bucket variants the neural MCTS/critic ranks
-> (world.rs:14296, helpers world.rs:215-482, test `discretized_kick_gate_expands_pass_targets_into_power_bucket_candidates`
-> world.rs:6978), gate `DD_SOCCER_ENABLE_DISCRETIZED_KICK`. Both still need a **full retrain + eval**
-> to prove out (existing nets never saw them). **Part C (break tabular imitation) remains the open
-> structural piece.** Ceilings #1 and #3 below now describe the **gate-OFF / legacy** path; body line
-> refs have drifted (`AgentActionTargetTrace` soccer.rs:8067, action hash soccer.rs:43320, family bits
-> soccer.rs:43329).
-
 ## Why un-collapsing the value can't break parity
 
 Three compounding structural ceilings, all verified in code:
 
 1. **The net ranks heuristic actions with heuristic *parameters*.** The learnable factored action
-   space (`DiscretizedKickAction` — actor owns kick power/direction/curve) exists and is unit-tested;
-   with the gate **off** it is only used at the **execution/lowering** layer
-   (`DiscretizedKickAction::from_power_direction`, world.rs:26742) — *not as candidates the net ranks*.
-   **Part B (above) now injects them as ranked candidates when `DD_SOCCER_ENABLE_DISCRETIZED_KICK` is
-   on.** With the gate off, pass/shoot params remain a continuous power × ~72-site heuristic scan.
+   space (`DiscretizedKickAction` — actor owns kick power/direction/curve) exists and is unit-tested
+   but is only used at the **execution/lowering** layer ([world.rs:14650](../src/des/general/soccer/world.rs#L14650),
+   gated `DD_SOCCER_ENABLE_DISCRETIZED_KICK`) — *never as candidates the net ranks*. Pass/shoot
+   params are a continuous power × ~72-site heuristic scan.
 2. **The value regresses onto the *tabular* Q.** Target = `r + γ·max_next` with `max_next =`
    tabular `best_value_hierarchical` ([world.rs](../src/des/general/soccer/world.rs)). A value
    trained to match the tabular Q **cannot exceed the analytic ceiling** — it's imitation, not
@@ -48,9 +34,9 @@ blindside, magnus, dribble, press) + gated tactical features. The core learnable
 and learned reward (P2) stayed dormant. **The engine got better at analytic play — raising the bar
 the net must beat — while the net was never given the tools to beat it.**
 
-## The fix — three parts (A & B now implemented behind gates; need a retrain to evaluate)
+## The fix — three parts (all real, needs a retrain to evaluate)
 
-### Part A — structured action-param feature block (append-only) — ✅ IMPLEMENTED (gate `DD_SOCCER_ENABLE_ACTION_PARAM_FEATURES`)
+### Part A — structured action-param feature block (append-only)
 Add a `SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM` block (append-only, so old nets zero-pad — the
 established migration pattern, see [soccer.rs:4505](../src/des/general/soccer.rs#L4505)) encoding the
 candidate's **aim**, from `AgentActionTargetTrace.point` ([soccer.rs:7805](../src/des/general/soccer.rs#L7805))
@@ -59,8 +45,8 @@ goal), direction sin/cos, has-target. Gate `DD_SOCCER_ENABLE_ACTION_PARAM_FEATUR
 block ⇒ byte-identical). **This replaces the opaque hash with structure the net can generalize
 over** — even for existing candidates.
 
-### Part B — discretized-kick variant candidates — ✅ IMPLEMENTED (gate `DD_SOCCER_ENABLE_DISCRETIZED_KICK`)
-In the candidate assembly (now at [world.rs:14296](../src/des/general/soccer/world.rs#L14296), where legal
+### Part B — discretized-kick variant candidates
+In the candidate assembly ([world.rs:5623](../src/des/general/soccer/world.rs#L5623), where legal
 `SOCCER_POLICY_ACTIONS` are injected), for kick families (pass/shoot/cross) generate a *spread* of
 `DiscretizedKickAction` variants over the speed/direction buckets toward plausible targets, each
 carrying its Part-A param features. The net ranks them; the chosen variant's params are lowered via

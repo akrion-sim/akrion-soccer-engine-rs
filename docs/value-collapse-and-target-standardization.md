@@ -11,9 +11,8 @@
 ## 1. Symptom: a hard parity plateau with healthy-looking loss
 
 The learner runs **neural-authoritative**: each decision ranks the analytic engine's candidate
-actions by the neural value head `V_net(s, a)` (`Q_eff = candidate.value + λ·V_net`; λ=8 in this experiment dominates, so the tabular
-candidate value is a negligible tie-break floor; the env var `DD_SOCCER_NEURAL_AUTHORITATIVE_LAMBDA`
-defaults to 0.0). Against the analytic engine it scored ~0.53 (parity)
+actions by the neural value head `V_net(s, a)` (`Q_eff = λ·V_net + 1e-6·Q_tab`,
+`DD_SOCCER_NEURAL_AUTHORITATIVE_LAMBDA=8`). Against the analytic engine it scored ~0.53 (parity)
 and never climbed, while `averageLoss` sat at ~0.0006 — i.e. training *looked* converged and fine.
 
 That combination (flat metric + tiny loss) is the classic signature of a critic that has stopped
@@ -21,9 +20,8 @@ distinguishing states.
 
 ## 2. Diagnosis: the value head collapsed to a near-constant, action-blind output
 
-Inspecting a trained net (`inputDim=610` — the pre-action-param subtotal
-`SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM`; the current `SOCCER_NEURAL_FEATURE_DIM` is 620, adding a
-10-dim action-param block — one hidden layer of 128 `tanh` units, linear scalar output) showed:
+Inspecting a trained net (`inputDim=610`, one hidden layer of 128 `tanh` units, linear scalar
+output) showed:
 
 | Measurement | Value | Meaning |
 |---|---|---|
@@ -98,7 +96,7 @@ The neural value head is the **whole point** of this architecture, and remains s
   **restores** the net's ability to discriminate states — it does not move away from neural learning.
 - **What's "later":** once the value discriminates states, the next (milder-than-feared) ceiling is
   the **action interface**. Note the interface is *not* a hard top-4 cap: when a learner exists the
-  decision **injects every legal `SOCCER_POLICY_ACTIONS` macro family (113-entry table)** as a candidate
+  decision **injects every legal `SOCCER_POLICY_ACTIONS` macro family (~73)** as a candidate
   ([world.rs](../src/des/general/soccer/world.rs) ~L5623), so the net's *macro policy* is
   expressive. Only the **specific factored tabular candidates** (a concrete
   `pass|tgt:7|spd:7|dir:135…`) are capped at 4 (`default_soccer_neural_blend_candidates`, now

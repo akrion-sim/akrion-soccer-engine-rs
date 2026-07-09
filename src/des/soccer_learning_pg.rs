@@ -106,6 +106,13 @@ const SOCCER_COMPLETED_RUN_INSERT_BATCH_SIZE: usize = 512;
 const SOCCER_POLICY_RETENTION_BRANCH_TIP: &str = "branch_tip";
 const SOCCER_POLICY_INLINE_PRUNE_ENV: &str = "SOCCER_PG_INLINE_POLICY_PRUNE";
 const SOCCER_POLICY_RETAIN_ARCHIVED_ENTRIES_ENV: &str = "SOCCER_PG_RETAIN_ARCHIVED_POLICY_ENTRIES";
+/// Escape hatch to keep the heavy `neuralNetwork` blob in `metrics` for versions the promotion
+/// gate has already archived. Defaults OFF: archived, gate-rejected non-loadable versions are
+/// persisted WITHOUT the ~0.4 MB neural blob to stop the policy-versions table growing ~0.5 GB/day
+/// (see [`soccer_policy_version_metrics_retains_neural_snapshot`]). Operators can set it to keep
+/// the blobs for offline debugging.
+const SOCCER_POLICY_RETAIN_ARCHIVED_NEURAL_ENV: &str =
+    "SOCCER_PG_RETAIN_ARCHIVED_POLICY_VERSION_NEURAL";
 const SOCCER_POLICY_VERSION_FULL_ENTRIES_ENV: &str = "SOCCER_PG_POLICY_VERSION_FULL_ENTRIES";
 const SOCCER_PG_PERSIST_RUN_DELTAS_ENV: &str = "SOCCER_PG_PERSIST_RUN_DELTAS";
 const SOCCER_PG_RESUME_MAX_POLICY_ENTRIES_ENV: &str = "SOCCER_PG_RESUME_MAX_POLICY_ENTRIES";
