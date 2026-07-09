@@ -22152,7 +22152,20 @@ impl SoccerMatch {
             + completed_forward_pass_count_bonus(pass.team, pass.origin, self.ball.position)
             + self.completed_pass_and_move_forward_reward(pass)
             + progressive_pass_escape_reward(pass, self.ball.position)
-            + self.overload_forward_pass_progression_bonus(pass, self.ball.position);
+            + self.overload_forward_pass_progression_bonus(pass, self.ball.position)
+            // Learned-EPV conversion bonus (DD_SOCCER_ENABLE_LEARNED_EPV): reward the completed pass by
+            // the DANGER it created — Φ_epv(reception) − Φ_epv(origin), scaled — scored on the ACTUAL
+            // reception point (`self.ball.position`), not the intended target, so underhit/deflected
+            // completions are not paid for danger they did not create (Codex). 0.0 when the grid/gate
+            // is off ⇒ byte-identical. Direct fix for "forward passes → territory + draws, not conversion".
+            + learned_epv_reward_scale()
+                * learned_epv_pass_delta(
+                    pass.team,
+                    pass.origin,
+                    self.ball.position,
+                    self.config.field_width_yards,
+                    self.config.field_length_yards,
+                );
         // Back-date the completed-pass reward to the PASS DECISION tick (launch), not the reception
         // tick, so the passer's actual decision transition gets credited (gated; off ⇒ current-tick).
         self.record_reward_event_deferred(pass.launch_tick, pass.from, amount);
