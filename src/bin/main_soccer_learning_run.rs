@@ -113,7 +113,6 @@ const DEFAULT_SOCCER_NEURAL_POPULATION_REQUIRE_FORWARD_PASS_CLIMB: bool = false;
 const DEFAULT_SOCCER_NEURAL_POPULATION_MIN_FORWARD_PASS_MARGIN: f64 = 0.0;
 const DEFAULT_SOCCER_NEURAL_POPULATION_MIN_NET_FORWARD_PASS_MARGIN: f64 = 0.0;
 const DEFAULT_SOCCER_NEURAL_POPULATION_MIN_FORWARD_PASS_RATE_MARGIN: f64 = 0.0;
-const DEFAULT_SOCCER_NEURAL_POPULATION_MIN_GOAL_DIFF_MARGIN: f64 = 0.0;
 const SOCCER_LEARNING_LOCAL_MPC_MAX_PLAYERS_PER_TEAM_LIMIT: usize = 11;
 const SOCCER_POLICY_SOURCE_MERGE: &str = "merge";
 const SOCCER_POLICY_SOURCE_EVOLUTION: &str = "mutation";
@@ -360,9 +359,21 @@ fn soccer_learning_objective_match_fitness(
     summary: &MatchSummary,
     analytic_neural_opponent: bool,
 ) -> f64 {
+    soccer_learning_objective_match_fitness_with_forward_pass_mode(
+        summary,
+        analytic_neural_opponent,
+        soccer_forward_pass_climb_objective_enabled(),
+    )
+}
+
+fn soccer_learning_objective_match_fitness_with_forward_pass_mode(
+    summary: &MatchSummary,
+    analytic_neural_opponent: bool,
+    forward_pass_climb_objective: bool,
+) -> f64 {
     let score = soccer_learning_run_score(summary);
-    if soccer_forward_pass_climb_objective_enabled() {
-        return soccer_learning_completed_forward_pass_margin(Team::Home, summary).clamp(
+    if forward_pass_climb_objective {
+        return soccer_learning_net_forward_pass_margin(Team::Home, summary).clamp(
             SOCCER_LEARNING_OBJECTIVE_FITNESS_MIN,
             SOCCER_LEARNING_OBJECTIVE_FITNESS_MAX,
         );
@@ -383,19 +394,25 @@ fn soccer_forward_pass_climb_objective_enabled() -> bool {
         || env_flag_enabled_lossy("SOCCER_POLICY_PROMOTION_FORWARD_PASS_PRIMARY")
 }
 
-fn soccer_learning_completed_forward_pass_margin(team: Team, summary: &MatchSummary) -> f64 {
+fn soccer_learning_net_forward_pass_margin(team: Team, summary: &MatchSummary) -> f64 {
     let stats = &summary.stats;
-    let (forward_for, forward_against) = match team {
+    let (forward_for, forward_against, turnovers_for, turnovers_against) = match team {
         Team::Home => (
             stats.passes_completed_forward_home,
             stats.passes_completed_forward_away,
+            stats.interceptions_away,
+            stats.interceptions_home,
         ),
         Team::Away => (
             stats.passes_completed_forward_away,
             stats.passes_completed_forward_home,
+            stats.interceptions_home,
+            stats.interceptions_away,
         ),
     };
-    forward_for as f64 - forward_against as f64
+    let net_for = forward_for as i64 - turnovers_for as i64;
+    let net_against = forward_against as i64 - turnovers_against as i64;
+    (net_for - net_against) as f64
 }
 
 fn evaluate_soccer_policy_promotion_gate_for_learning_objective(
@@ -403,15 +420,33 @@ fn evaluate_soccer_policy_promotion_gate_for_learning_objective(
     config: SoccerPolicyPromotionGateConfig,
     analytic_neural_opponent: bool,
 ) -> SoccerPolicyPromotionGateEvaluation {
+    evaluate_soccer_policy_promotion_gate_for_learning_objective_with_forward_pass_mode(
+        summaries,
+        config,
+        analytic_neural_opponent,
+        soccer_forward_pass_climb_objective_enabled(),
+    )
+}
+
+fn evaluate_soccer_policy_promotion_gate_for_learning_objective_with_forward_pass_mode(
+    summaries: &[&MatchSummary],
+    config: SoccerPolicyPromotionGateConfig,
+    analytic_neural_opponent: bool,
+    forward_pass_climb_objective: bool,
+) -> SoccerPolicyPromotionGateEvaluation {
     let mut evaluation = evaluate_soccer_policy_promotion_gate(summaries.iter().copied(), config);
-    if !analytic_neural_opponent && !soccer_forward_pass_climb_objective_enabled() {
+    if !analytic_neural_opponent && !forward_pass_climb_objective {
         return evaluation;
     }
     let mut sum = 0.0;
     let mut best = f64::NEG_INFINITY;
     let mut non_finite = 0usize;
     for summary in summaries {
-        let fitness = soccer_learning_objective_match_fitness(summary, analytic_neural_opponent);
+        let fitness = soccer_learning_objective_match_fitness_with_forward_pass_mode(
+            summary,
+            analytic_neural_opponent,
+            forward_pass_climb_objective,
+        );
         if fitness.is_finite() {
             sum += fitness;
             best = best.max(fitness);
@@ -536,7 +571,6 @@ struct NeuralPopulationSearchConfig {
     min_forward_pass_margin: f64,
     min_net_forward_pass_margin: f64,
     min_forward_pass_rate_margin: f64,
-    min_goal_diff_margin: f64,
     seed: u64,
 }
 
@@ -751,15 +785,6 @@ fn env_neural_population_search_config(
         )
         .into());
     }
-    let min_goal_diff_margin = env_f64(
-        "SOCCER_NEURAL_POPULATION_MIN_GOAL_DIFF_MARGIN",
-        DEFAULT_SOCCER_NEURAL_POPULATION_MIN_GOAL_DIFF_MARGIN,
-    )?;
-    if !min_goal_diff_margin.is_finite() {
-        return Err(
-            invalid_data("SOCCER_NEURAL_POPULATION_MIN_GOAL_DIFF_MARGIN must be finite").into(),
-        );
-    }
     let search_seed = env_u64(
         "SOCCER_NEURAL_POPULATION_SEED",
         seed ^ 0xA5A5_5A5A_D3C3_B4B4,
@@ -790,7 +815,6 @@ fn env_neural_population_search_config(
         min_forward_pass_margin,
         min_net_forward_pass_margin,
         min_forward_pass_rate_margin,
-        min_goal_diff_margin,
         seed: search_seed,
     })
 }
@@ -1458,10 +1482,10 @@ fn neural_population_forward_pass_climb_reasons(
             search_config.min_forward_pass_rate_margin * 100.0
         ));
     }
-    if goal_margin <= search_config.min_goal_diff_margin {
+    if goal_margin + 1e-12 < search_config.min_accepted_goal_margin {
         reasons.push(format!(
-            "goal_diff_margin {goal_margin:+.3} <= required {:+.3}",
-            search_config.min_goal_diff_margin
+            "goal_diff_margin {goal_margin:+.3} < required {:+.3}",
+            search_config.min_accepted_goal_margin
         ));
     }
     reasons
@@ -12169,7 +12193,6 @@ mod tests {
             min_forward_pass_margin: 0.0,
             min_net_forward_pass_margin: 0.0,
             min_forward_pass_rate_margin: 0.0,
-            min_goal_diff_margin: 0.0,
             seed: 99,
         }
     }
@@ -13365,8 +13388,7 @@ mod tests {
     }
 
     #[test]
-    fn analytic_opponent_objective_uses_completed_forward_pass_advancement() {
-        let _guard = EnvVarGuard::set("DD_SOCCER_FORWARD_PASS_CLIMB_CURRICULUM", "1");
+    fn analytic_opponent_objective_uses_net_forward_pass_advancement() {
         let mut progressive_stats = soccer_engine::des::general::soccer::MatchStats::default();
         progressive_stats.passes_attempted_home = 36;
         progressive_stats.passes_completed_home = 29;
@@ -13398,31 +13420,61 @@ mod tests {
         matched.stats.pass_chain_gain_yards_away = 156.0;
 
         assert_eq!(
-            soccer_learning_objective_match_fitness(&progressive, true),
+            soccer_learning_objective_match_fitness_with_forward_pass_mode(
+                &progressive,
+                true,
+                true
+            ),
             12.0
         );
         assert_eq!(
-            soccer_learning_objective_match_fitness(&progressive, false),
+            soccer_learning_objective_match_fitness_with_forward_pass_mode(
+                &progressive,
+                false,
+                true
+            ),
             12.0
         );
         assert_eq!(
-            soccer_learning_objective_match_fitness(&shot_farming, true),
+            soccer_learning_objective_match_fitness_with_forward_pass_mode(
+                &shot_farming,
+                true,
+                true
+            ),
             2.0
         );
         assert_eq!(
-            soccer_learning_objective_match_fitness(&shot_farming, false),
+            soccer_learning_objective_match_fitness_with_forward_pass_mode(
+                &shot_farming,
+                false,
+                true
+            ),
             2.0
         );
-        assert_eq!(soccer_learning_objective_match_fitness(&matched, true), 0.0);
         assert_eq!(
-            soccer_learning_objective_match_fitness(&matched, false),
+            soccer_learning_objective_match_fitness_with_forward_pass_mode(&matched, true, true),
             0.0
+        );
+        assert_eq!(
+            soccer_learning_objective_match_fitness_with_forward_pass_mode(&matched, false, true),
+            0.0
+        );
+
+        let mut risky = progressive.clone();
+        risky.stats.interceptions_away = 15;
+        assert_eq!(
+            soccer_learning_objective_match_fitness_with_forward_pass_mode(&risky, true, true),
+            8.0,
+            "turnovers against the candidate must reduce the forward-pass objective"
+        );
+        assert_eq!(
+            soccer_learning_objective_match_fitness_with_forward_pass_mode(&risky, false, true),
+            8.0
         );
     }
 
     #[test]
     fn forward_pass_primary_promotion_gate_rejects_scoreline_only_self_play() {
-        let _guard = EnvVarGuard::set("DD_SOCCER_FORWARD_PASS_CLIMB_CURRICULUM", "1");
         let mut summary = soccer_engine::des::general::soccer::MatchSummary {
             score_home: 5,
             score_away: 0,
@@ -13435,16 +13487,19 @@ mod tests {
         summary.stats.passes_completed_away = 20;
         summary.stats.passes_completed_forward_away = 6;
         let summaries = [&summary];
-        let evaluation = evaluate_soccer_policy_promotion_gate_for_learning_objective(
-            &summaries,
-            SoccerPolicyPromotionGateConfig {
-                min_sample_games: 1,
-                min_mean_match_fitness: 0.0,
-                min_best_match_fitness: 0.0,
-                ..Default::default()
-            },
-            false,
-        );
+        let evaluation =
+            evaluate_soccer_policy_promotion_gate_for_learning_objective_with_forward_pass_mode(
+                &summaries,
+                SoccerPolicyPromotionGateConfig {
+                    enabled: true,
+                    min_sample_games: 1,
+                    min_mean_match_fitness: 0.0,
+                    min_best_match_fitness: 0.0,
+                    ..Default::default()
+                },
+                false,
+                true,
+            );
 
         assert!(
             !evaluation.eligible,
@@ -13479,12 +13534,6 @@ mod tests {
         fn clear(key: &'static str) -> Self {
             let previous = std::env::var(key).ok();
             std::env::remove_var(key);
-            Self { key, previous }
-        }
-
-        fn set(key: &'static str, value: &'static str) -> Self {
-            let previous = std::env::var(key).ok();
-            std::env::set_var(key, value);
             Self { key, previous }
         }
     }
@@ -13735,6 +13784,10 @@ mod tests {
             Some("true")
         );
         assert_eq!(
+            continuous_manifest_env_value("DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE"),
+            Some("1.0")
+        );
+        assert_eq!(
             continuous_manifest_env_value("SOCCER_NEURAL_ACTOR_CRITIC"),
             Some("true")
         );
@@ -13745,6 +13798,18 @@ mod tests {
         assert_eq!(
             continuous_manifest_env_value("SOCCER_NEURAL_LP_COUPLING_ENABLED"),
             Some("true")
+        );
+        assert_eq!(
+            continuous_manifest_env_value("SOCCER_NEURAL_MCTS_ENABLED"),
+            Some("true")
+        );
+        assert_eq!(
+            continuous_manifest_env_value("SOCCER_NEURAL_MCTS_CANDIDATES"),
+            Some("8")
+        );
+        assert_eq!(
+            continuous_manifest_env_value("SOCCER_NEURAL_MCTS_PASS_TARGET_CANDIDATES"),
+            Some("8")
         );
         assert_eq!(
             continuous_manifest_env_value("DD_SOCCER_FORWARD_PASS_REWARD_SCALE"),
@@ -13825,9 +13890,17 @@ mod tests {
         assert_continuous_manifest_contains(
             "require_value DD_SOCCER_FORWARD_PASS_CLIMB_CURRICULUM true",
         );
+        assert_continuous_manifest_contains(
+            "require_value DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE 1.0",
+        );
         assert_continuous_manifest_contains("require_value SOCCER_NEURAL_ACTOR_CRITIC true");
         assert_continuous_manifest_contains("require_value SOCCER_ENABLE_ACTOR_CRITIC true");
         assert_continuous_manifest_contains("require_value SOCCER_NEURAL_LP_COUPLING_ENABLED true");
+        assert_continuous_manifest_contains("require_value SOCCER_NEURAL_MCTS_ENABLED true");
+        assert_continuous_manifest_contains("require_value SOCCER_NEURAL_MCTS_CANDIDATES 8");
+        assert_continuous_manifest_contains(
+            "require_value SOCCER_NEURAL_MCTS_PASS_TARGET_CANDIDATES 8",
+        );
         assert_continuous_manifest_contains("require_value DD_SOCCER_FORWARD_PASS_REWARD_SCALE 6");
         assert_continuous_manifest_contains(
             "require_value DD_SOCCER_SHOT_SHAPING_REWARD_SCALE 0.4",
@@ -14208,7 +14281,7 @@ mod tests {
             crossover_rate: 0.0,
             min_fitness_delta: 0.0,
             min_accepted_fitness: SOCCER_LEARNING_OBJECTIVE_FITNESS_MIN,
-            min_accepted_goal_margin: SOCCER_LEARNING_OBJECTIVE_FITNESS_MIN,
+            min_accepted_goal_margin: 0.0,
             training_min_accepted_fitness: SOCCER_LEARNING_OBJECTIVE_FITNESS_MIN,
             training_min_accepted_goal_margin: SOCCER_LEARNING_OBJECTIVE_FITNESS_MIN,
             confirm_games: 0,
@@ -14223,7 +14296,6 @@ mod tests {
             min_forward_pass_margin: 0.0,
             min_net_forward_pass_margin: 0.0,
             min_forward_pass_rate_margin: 0.0,
-            min_goal_diff_margin: 0.0,
             seed: 1,
         }
     }
@@ -14278,20 +14350,21 @@ mod tests {
             reasons
                 .iter()
                 .any(|reason| reason.contains("goal_diff_margin")),
-            "losing forward-pass smoke must not pass the population gate: {reasons:?}"
+            "forward-pass population gate must reject losing candidates: {reasons:?}"
         );
         assert!(
             neural_population_candidate_forward_pass_rank_score(&candidate)
                 > neural_population_candidate_forward_pass_rank_score(&reference),
-            "forward-pass ranking must not collapse to goal or fitness ranking"
+            "forward-pass ranking must remain an advancement rank, not goal or fitness rank"
         );
 
         let winning_candidate =
-            neural_population_eval_for_forward_gate_test(2, "candidate", -0.50, 5, 4, 24, 9, 1);
+            neural_population_eval_for_forward_gate_test(3, "candidate", -0.50, 4, 0, 24, 9, 1);
+        let winning_reasons =
+            neural_population_forward_pass_climb_reasons(&winning_candidate, &reference, config);
         assert!(
-            neural_population_forward_pass_climb_reasons(&winning_candidate, &reference, config)
-                .is_empty(),
-            "positive goal margin plus direct forward-pass count/rate/net climb should pass"
+            winning_reasons.is_empty(),
+            "same forward-pass climb should pass once scoreline is protected: {winning_reasons:?}"
         );
     }
 

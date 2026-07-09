@@ -29,6 +29,20 @@ implemented yet.
 - The current `world_model_training` line reports planning decisions, MCTS selection
   and candidate-family shares, MPC replan rates, priority-sample rates, distillation
   rates, and policy entropy.
+- Forward-pass climb is not judged by raw volume alone. The active eval/league path
+  tracks completed forward passes, pass turnovers, and net forward passes
+  (`completed_forward_passes - pass_turnovers`). Promotion still requires scoreline
+  protection: the eval gate requires the normal WDL/Wilson verdict plus a positive
+  held-out goal-difference floor by default, and the league checkpoint validation
+  requires non-negative validation goal difference by default.
+- `DD_SOCCER_FORWARD_PASS_CLIMB_CURRICULUM` keeps executable learned pass choices
+  from being replaced by the option-score safety override during the forward-pass
+  curriculum. Receiver selection also has a net-forward quality floor through
+  `SOCCER_LEARNED_PASS_RECEIVER_MIN_NET_FORWARD_QUALITY`, so a high receipt-only
+  turnover trap does not win just because the ball can arrive.
+- Pass-target MCTS pruning can be inspected with `DD_SOCCER_DUMP_MCTS_PASS_TARGET_DIAG`.
+  The diagnostic reports whether the first forward target was inside the configured
+  target cap, pruned by the cap, or absent.
 
 ## Missing Diagnostics
 

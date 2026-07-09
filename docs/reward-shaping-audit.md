@@ -78,6 +78,13 @@ A/B; gated vs the confirmed base, never flipped blind. The clean PBRS alternativ
 EPV potential routed through `potential_based_shaping`, which would value progression without the
 farm risk but needs a possession-chain export first.
 
+Current code enforces that discriminator in the promotion paths. `soccer_eval_gate_run` requires
+the normal scoreline/WDL/Wilson promotion verdict, positive held-out goal difference by default
+(`SOCCER_EVAL_MIN_GOAL_DIFF_MARGIN=0`), and forward-pass advancement. `soccer_league_train`
+ranks/checkpoints on net forward passes (`completed_forward_passes - pass_turnovers`) while
+validation also requires non-negative goal difference by default
+(`SOCCER_LEAGUE_CHECKPOINT_VALIDATE_MIN_GOAL_DIFF_MARGIN=0.0`).
+
 ## Follow-ups (deferred, each its own gated change)
 1. **Discount alignment.** B-terms (and pitch value) use `γ=1`; the returns use
    the learner's actual `γ` (`REWARD_SHAPING_DEFAULT_GAMMA = 0.99`). True

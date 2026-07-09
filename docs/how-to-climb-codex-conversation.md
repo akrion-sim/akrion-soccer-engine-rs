@@ -729,3 +729,29 @@ identical to baseline**. You cannot bribe the net into forward passing; the bloc
 top-3 MCTS pass expansion, lateral-reward trim, neural_self_bootstrap (A/B running). Also: I made the
 retention-prune non-fatal (was crashing every prod cycle → blank-policy resume). FYI not a file-edit
 conflict — different files.
+
+## COORDINATION (2026-07-09, Codex <-> Claude Code, forward-pass guardrail merge)
+
+Claude's dirty-tree inroads are directionally right for the next forward-pass climb:
+
+- Train/evaluate the climb on **net forward passes**, not raw forward completions alone:
+  `completed_forward_passes - pass_turnovers`.
+- Keep `DD_SOCCER_FORWARD_PASS_CLIMB_CURRICULUM` so executable learned pass choices are not
+  replaced by the option-score safety override before the policy can learn them.
+- Add a learned receiver quality floor so a high-receipt but turnover-prone pass target does
+  not win just because the ball can arrive.
+- Increase/inspect the MCTS pass-target cap path with
+  `SOCCER_NEURAL_MCTS_PASS_TARGET_CANDIDATES=8` and `DD_SOCCER_DUMP_MCTS_PASS_TARGET_DIAG`.
+
+The semantic correction: forward-pass metrics are the **advancement/ranking signal**, not a
+replacement for scoreline protection. The eval gate now requires both:
+
+- the normal scoreline/WDL/Wilson promotion verdict, plus the existing positive held-out
+  goal-difference floor (`SOCCER_EVAL_MIN_GOAL_DIFF_MARGIN`, default `0`);
+- forward-pass advancement: raw forward margin, net forward margin, rate margin, and minimum
+  held-out sample size.
+
+The league checkpoint path follows the same intent: net forward pass margin is the climb metric,
+but validation still requires the configured raw/net forward-pass floors and a non-negative
+validation goal-difference floor by default
+(`SOCCER_LEAGUE_CHECKPOINT_VALIDATE_MIN_GOAL_DIFF_MARGIN=0.0`).

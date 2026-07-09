@@ -63,6 +63,11 @@ families use MPC execution probability. Shot buckets require finite shot-quality
 priors. This is deliberate: MCTS may propose bolder choices, but MPC is still the
 physical guardrail.
 
+Pass-target expansion is capped by `SOCCER_NEURAL_MCTS_PASS_TARGET_CANDIDATES`.
+The current forward-pass climb work uses `8` in the strict launcher/continuous
+manifest. This is not an unbounded receiver search; if a forward target ranks
+below the cap, MCTS never sees it unless the candidate generator or cap changes.
+
 ## How Selection Works
 
 `neural_mcts_action_from_candidates` does a shallow PUCT-style rerank:
@@ -161,6 +166,7 @@ MPC and scoring priors:
 Diagnostics:
 
 - `SOCCER_NEURAL_MCTS_DRIBBLE_DIAGNOSTIC_INTERVAL`
+- `DD_SOCCER_DUMP_MCTS_PASS_TARGET_DIAG`
 
 ## Telemetry to Watch
 
@@ -217,6 +223,20 @@ Use these rows to classify failures:
   preferred another family.
 - `selected_is_dribble=1` but action outcomes show no dribble execution:
   reconciliation, MPC, or final action labeling swallowed the selected plan.
+
+The `mcts_pass_target_diag` line reports the target-cap path for pass receivers:
+
+- `reached`: number of diagnostic call sites reached.
+- `forward_inside_cap`: a forward target existed inside the active target cap.
+- `forward_pruned_by_cap`: a forward target existed, but only after the cap.
+- `no_forward_candidate`: no forward target was found in the ranked target list.
+- `avg_best_forward_rank_1based`: average rank of the first forward target when present.
+- `cap`: the active `SOCCER_NEURAL_MCTS_PASS_TARGET_CANDIDATES` limit.
+
+Use this row before blaming value learning. If `forward_pruned_by_cap` is high,
+MCTS is not refusing forward passing; it is never seeing the forward receiver.
+If `forward_inside_cap` is high but forward passes still do not execute, inspect
+policy score gaps, safety/MPC reconciliation, and action-outcome credit next.
 
 ## Current Local Plateau Use
 
@@ -278,8 +298,8 @@ Keep it on when:
 1. Confirm the current launcher logs `soccer_local_training_mcts_gate`.
 2. Confirm `SOCCER_NEURAL_MCTS_ENABLED=1` only for MCTS-on experiments.
 3. Confirm `world_model_training` includes dribble/root-dribble candidate shares.
-4. Inspect `neural_mcts_dribble_diagnostic` for generation vs pruning vs scoring
-   failures.
+4. Inspect `neural_mcts_dribble_diagnostic` and `mcts_pass_target_diag` for
+   generation vs pruning vs scoring failures.
 5. Compare `learning_action_outcomes` against MCTS telemetry. Candidate presence
    without action outcomes means execution or labeling is still blocking the
    learning signal.

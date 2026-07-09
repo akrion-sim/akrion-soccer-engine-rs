@@ -129,6 +129,7 @@ const SOCCER_POLICY_EXPLORATION_CANDIDATE_LIMIT: usize =
     } else {
         POLICY_SELECTION_TOP_RANK_LIMIT
     };
+const LEARNED_PASS_RECEIVER_MIN_NET_FORWARD_QUALITY: f64 = 0.26;
 
 #[derive(Clone, Copy, Debug)]
 struct LearnedMpcReplanThresholds {
@@ -165,6 +166,15 @@ fn neural_mcts_shot_bucket_min_candidate_bonus() -> f64 {
         NEURAL_MCTS_SHOT_BUCKET_MIN_CANDIDATE_BONUS,
         0.0,
         0.45,
+    )
+}
+
+fn learned_pass_receiver_min_net_forward_quality() -> f64 {
+    learned_mpc_metric_env(
+        "SOCCER_LEARNED_PASS_RECEIVER_MIN_NET_FORWARD_QUALITY",
+        LEARNED_PASS_RECEIVER_MIN_NET_FORWARD_QUALITY,
+        0.0,
+        1.0,
     )
 }
 
@@ -3061,6 +3071,80 @@ mod tests {
     }
 
     #[test]
+    fn learned_receiver_net_forward_quality_rejects_receipt_only_turnover_trap() {
+        let _env_lock = soccer_world_env_lock();
+        let _quality_floor = set_test_env_var(
+            "SOCCER_LEARNED_PASS_RECEIVER_MIN_NET_FORWARD_QUALITY",
+            "0.26",
+        );
+        let passer = Vec2::new(40.0, 52.0);
+        let floor = learned_pass_receiver_min_net_forward_quality();
+        let receipt_only_trap = PassTargetQuality {
+            expected_completion: 0.22,
+            lane_interception_risk: 0.88,
+            mpc_receipt_probability: 0.86,
+            mpc_receipt_race_advantage_seconds: -0.45,
+            mpc_receipt_qp_accel_fit: 0.35,
+            ..PassTargetQuality::default()
+        };
+        let clean_forward = PassTargetQuality {
+            expected_completion: 0.72,
+            lane_interception_risk: 0.08,
+            mpc_receipt_probability: 0.72,
+            mpc_receipt_race_advantage_seconds: 0.22,
+            mpc_receipt_qp_accel_fit: 0.68,
+            ..PassTargetQuality::default()
+        };
+        let safe_recycle = PassTargetQuality {
+            expected_completion: 0.92,
+            lane_interception_risk: 0.04,
+            mpc_receipt_probability: 0.90,
+            mpc_receipt_race_advantage_seconds: 0.0,
+            mpc_receipt_qp_accel_fit: 0.80,
+            ..PassTargetQuality::default()
+        };
+
+        let trap_score = SoccerMatch::learned_pass_receiver_net_forward_quality_from_quality(
+            Team::Home,
+            passer,
+            Vec2::new(42.0, 64.0),
+            &receipt_only_trap,
+            PassFlight::Floor,
+        );
+        let clean_score = SoccerMatch::learned_pass_receiver_net_forward_quality_from_quality(
+            Team::Home,
+            passer,
+            Vec2::new(42.0, 62.0),
+            &clean_forward,
+            PassFlight::Floor,
+        );
+        let recycle_score = SoccerMatch::learned_pass_receiver_net_forward_quality_from_quality(
+            Team::Home,
+            passer,
+            Vec2::new(39.0, 50.0),
+            &safe_recycle,
+            PassFlight::Floor,
+        );
+
+        assert!(
+            trap_score < floor,
+            "high receipt alone must not pass the learned receiver gate: {trap_score}"
+        );
+        assert!(
+            clean_score >= floor,
+            "clean progressive receiver should clear net-forward quality floor: {clean_score}"
+        );
+        assert!(
+            recycle_score >= floor,
+            "safe recycle should survive the quality gate when it is genuinely clean: {recycle_score}"
+        );
+        assert!(
+            clean_score > trap_score + 0.25,
+            "composite should separate clean forward target from turnover trap: clean={clean_score}, trap={trap_score}"
+        );
+    }
+
+    #[test]
     fn own_half_lane_risk_scores_costlier_than_attacking_half() {
         let attacking_half = pass_lane_dynamic_risk_score_penalty(0.58, 1.0, false);
         let own_half = pass_lane_dynamic_risk_score_penalty(0.58, 1.0, true);
@@ -3245,6 +3329,42 @@ mod tests {
             },
         ]));
         assert!(!SoccerRewardEventKind::ForwardPassAttempt.is_positive_team_outcome());
+    }
+
+    #[test]
+    fn mcts_forward_target_rank_bucket_finds_pruned_forward_options() {
+        let origin = Vec2::new(30.0, 42.0);
+        let ranks = [
+            Some(Vec2::new(25.0, 41.0)),
+            Some(Vec2::new(32.0, 43.5)),
+            None,
+            Some(Vec2::new(34.0, 49.5)),
+        ];
+        let best_rank = first_mcts_forward_target_rank(Team::Home, origin, ranks);
+        assert_eq!(best_rank, Some(3));
+        assert_eq!(
+            mcts_forward_target_rank_bucket(best_rank, 3),
+            MctsForwardTargetRankBucket::PrunedByCap
+        );
+        assert_eq!(
+            mcts_forward_target_rank_bucket(best_rank, 4),
+            MctsForwardTargetRankBucket::InsideCap
+        );
+
+        let away_origin = Vec2::new(30.0, 58.0);
+        let away_ranks = [
+            Some(Vec2::new(32.0, 56.0)),
+            Some(Vec2::new(30.0, 53.0)),
+            Some(Vec2::new(28.0, 51.5)),
+        ];
+        assert_eq!(
+            first_mcts_forward_target_rank(Team::Away, away_origin, away_ranks),
+            Some(2)
+        );
+        assert_eq!(
+            mcts_forward_target_rank_bucket(None, 11),
+            MctsForwardTargetRankBucket::NoForwardCandidate
+        );
     }
 
     #[test]
@@ -14286,6 +14406,7 @@ impl SoccerMatch {
             _ => return Vec::new(),
         };
         let limit = neural_mcts_pass_target_candidate_limit();
+        record_mcts_pass_target_diag(snapshot, player_id, team, prefix, &targets, limit);
         targets
             .into_iter()
             .take(limit)
@@ -16461,17 +16582,25 @@ impl SoccerMatch {
             flight,
             candidates,
         );
-        let threshold = learned_mpc_replan_thresholds().pass_impossible_probability;
-        let execution_probability =
-            |target_player: Option<usize>, target_point: Option<Vec2>| -> f64 {
-                let trial = SoccerLearnedPlan {
-                    action: normalized_action.to_string(),
-                    target_player,
-                    target_point,
-                    mpc_replan: None,
-                };
-                Self::learned_pass_mpc_execution_probability(snapshot, player_id, &trial, flight)
+        let raw_receipt_threshold = learned_mpc_replan_thresholds().pass_impossible_probability;
+        let net_forward_quality_threshold =
+            learned_pass_receiver_min_net_forward_quality().max(raw_receipt_threshold);
+        let acceptance_probability = |target_player: Option<usize>,
+                                      target_point: Option<Vec2>|
+         -> f64 {
+            let trial = SoccerLearnedPlan {
+                action: normalized_action.to_string(),
+                target_player,
+                target_point,
+                mpc_replan: None,
             };
+            let raw_receipt =
+                Self::learned_pass_mpc_execution_probability(snapshot, player_id, &trial, flight);
+            if raw_receipt < raw_receipt_threshold {
+                return raw_receipt;
+            }
+            Self::learned_pass_receiver_net_forward_quality(snapshot, player_id, &trial, flight)
+        };
         let receiver_kickback_trace =
             |rejected_probability: f64, candidate_count: usize| SoccerLearnedMpcReplanTrace {
                 original_action: normalized_action.to_string(),
@@ -16490,8 +16619,8 @@ impl SoccerMatch {
         let mut first_rejected_probability: Option<f64> = None;
         for entry in &ranked {
             let position = snapshot.player_position(entry.player_id);
-            let probability = execution_probability(Some(entry.player_id), position);
-            if probability >= threshold {
+            let probability = acceptance_probability(Some(entry.player_id), position);
+            if probability >= net_forward_quality_threshold {
                 best_feasible = Some((entry.head_score, Some(entry.player_id), position));
                 break;
             }
@@ -16504,8 +16633,8 @@ impl SoccerMatch {
                 .map(|(score, _, _)| space_score > *score)
                 .unwrap_or(true);
             if space_beats {
-                let probability = execution_probability(None, Some(space_point));
-                if probability >= threshold {
+                let probability = acceptance_probability(None, Some(space_point));
+                if probability >= net_forward_quality_threshold {
                     let replan = first_rejected_probability.map(|rejected_probability| {
                         receiver_kickback_trace(rejected_probability, rejected_count)
                     });
@@ -16911,6 +17040,131 @@ impl SoccerMatch {
             &keeper_clearance_plan,
             "clearance",
         )
+    }
+
+    fn learned_pass_receiver_net_forward_quality(
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        plan: &SoccerLearnedPlan,
+        flight: PassFlight,
+    ) -> f64 {
+        let Some(passer) = snapshot
+            .players
+            .iter()
+            .find(|player| player.id == player_id)
+        else {
+            return 0.0;
+        };
+        let passer_position = snapshot
+            .player_position(player_id)
+            .unwrap_or(passer.position);
+        if plan.target_player.is_none() {
+            let Some(space_point) = plan.target_point else {
+                return 0.0;
+            };
+            return snapshot
+                .players
+                .iter()
+                .filter(|target| target.team == passer.team && target.id != passer.id)
+                .filter_map(|target| {
+                    let runner_position = snapshot
+                        .player_position(target.id)
+                        .unwrap_or(target.position);
+                    let runner_distance = runner_position.distance(space_point);
+                    if runner_distance > SOCCER_SPACE_RUN_ONTO_YARDS {
+                        return None;
+                    }
+                    let run_fit = (1.0 - runner_distance / SOCCER_SPACE_RUN_ONTO_YARDS.max(1.0))
+                        .clamp(0.0, 1.0);
+                    let quality = pass_target_quality_for_snapshot(
+                        snapshot,
+                        passer,
+                        passer_position,
+                        target,
+                        space_point,
+                        flight,
+                    );
+                    Some(
+                        Self::learned_pass_receiver_net_forward_quality_from_quality(
+                            passer.team,
+                            passer_position,
+                            space_point,
+                            &quality,
+                            flight,
+                        ) * (0.45 + run_fit * 0.55),
+                    )
+                })
+                .fold(0.0, f64::max)
+                .clamp(0.0, 1.0);
+        }
+        let Some(target_id) = plan.target_player else {
+            return 0.0;
+        };
+        let Some(target) = snapshot
+            .players
+            .iter()
+            .find(|player| player.id == target_id)
+        else {
+            return 0.0;
+        };
+        if target.team != passer.team {
+            return 0.0;
+        }
+        let target_position = plan
+            .target_point
+            .or_else(|| snapshot.player_position(target_id))
+            .unwrap_or(target.position);
+        let quality = pass_target_quality_for_snapshot(
+            snapshot,
+            passer,
+            passer_position,
+            target,
+            target_position,
+            flight,
+        );
+        Self::learned_pass_receiver_net_forward_quality_from_quality(
+            passer.team,
+            passer_position,
+            target_position,
+            &quality,
+            flight,
+        )
+    }
+
+    fn learned_pass_receiver_net_forward_quality_from_quality(
+        team: Team,
+        passer_position: Vec2,
+        target_position: Vec2,
+        quality: &PassTargetQuality,
+        flight: PassFlight,
+    ) -> f64 {
+        let receipt = pass_quality_unit_interval(quality.mpc_receipt_probability);
+        let completion = pass_quality_unit_interval(quality.expected_completion);
+        let lane_safety = 1.0 - pass_quality_unit_interval(quality.lane_interception_risk);
+        let qp_fit = pass_quality_unit_interval(quality.mpc_receipt_qp_accel_fit);
+        let race_fit = ((quality.mpc_receipt_race_advantage_seconds + 0.35) / 1.70).clamp(0.0, 1.0);
+        let forward_yards = (target_position.y - passer_position.y) * team.attack_dir();
+        let forward_fit = (forward_yards / 30.0).clamp(0.0, 1.0);
+        let distance_fit = if forward_yards > 0.0 {
+            quick_forward_pass_band_fit(passer_position.distance(target_position))
+        } else {
+            0.0
+        };
+        let backward_penalty = if forward_yards < -3.0 {
+            ((-forward_yards - 3.0) / 18.0).clamp(0.0, 1.0) * 0.14
+        } else {
+            0.0
+        };
+        let aerial_relief = if matches!(flight, PassFlight::Aerial) && forward_yards >= 8.0 {
+            0.04
+        } else {
+            0.0
+        };
+        let technical_fit =
+            receipt * (completion * 0.45 + lane_safety * 0.35 + race_fit * 0.12 + qp_fit * 0.08);
+        (technical_fit + forward_fit * 0.08 + distance_fit * forward_fit * 0.06 + aerial_relief
+            - backward_penalty)
+            .clamp(0.0, 1.0)
     }
 
     fn learned_pass_mpc_execution_probability(
@@ -37247,6 +37501,163 @@ fn forward_pass_attempt_reward_points(pass: &PendingPass, expected_completion: f
         * openness_multiplier
         * aerial_multiplier)
         .clamp(0.0, FORWARD_PASS_ATTEMPT_REWARD_MAX_POINTS)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MctsForwardTargetRankBucket {
+    NoForwardCandidate,
+    InsideCap,
+    PrunedByCap,
+}
+
+fn first_mcts_forward_target_rank<I>(team: Team, origin: Vec2, target_positions: I) -> Option<usize>
+where
+    I: IntoIterator<Item = Option<Vec2>>,
+{
+    target_positions
+        .into_iter()
+        .enumerate()
+        .find_map(|(rank, target_position)| {
+            let target_position = target_position?;
+            let forward_yards = (target_position.y - origin.y) * team.attack_dir();
+            (forward_yards >= FORWARD_PASS_ATTEMPT_REWARD_MIN_FORWARD_YARDS).then_some(rank)
+        })
+}
+
+fn mcts_forward_target_rank_bucket(
+    best_forward_rank: Option<usize>,
+    limit: usize,
+) -> MctsForwardTargetRankBucket {
+    match best_forward_rank {
+        Some(rank) if rank < limit => MctsForwardTargetRankBucket::InsideCap,
+        Some(_) => MctsForwardTargetRankBucket::PrunedByCap,
+        None => MctsForwardTargetRankBucket::NoForwardCandidate,
+    }
+}
+
+/// Diagnostic-only (`DD_SOCCER_DUMP_MCTS_PASS_TARGET_DIAG`): before the MCTS pass-target cap is
+/// applied, report whether the first viable forward receiver is inside the cap, pruned by it, or
+/// absent. This separates an enumeration/interface bottleneck from downstream value/reward issues.
+fn mcts_pass_target_diag_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DUMP_MCTS_PASS_TARGET_DIAG").is_ok())
+}
+
+const MCTS_PASS_TARGET_DIAG_DEFAULT_LOG_EVERY: u64 = 200;
+
+static MCTS_PASS_TARGET_DIAG_REACHED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static MCTS_PASS_TARGET_DIAG_FLOOR: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static MCTS_PASS_TARGET_DIAG_AERIAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static MCTS_PASS_TARGET_DIAG_HAS_FORWARD: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static MCTS_PASS_TARGET_DIAG_NO_FORWARD: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static MCTS_PASS_TARGET_DIAG_FORWARD_INSIDE_CAP: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static MCTS_PASS_TARGET_DIAG_FORWARD_PRUNED_BY_CAP: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static MCTS_PASS_TARGET_DIAG_FORWARD_RANK_SUM: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn mcts_pass_target_diag_rate(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
+fn log_mcts_pass_target_diag(limit: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let reached = MCTS_PASS_TARGET_DIAG_REACHED.load(Relaxed);
+    let floor = MCTS_PASS_TARGET_DIAG_FLOOR.load(Relaxed);
+    let aerial = MCTS_PASS_TARGET_DIAG_AERIAL.load(Relaxed);
+    let has_forward = MCTS_PASS_TARGET_DIAG_HAS_FORWARD.load(Relaxed);
+    let no_forward = MCTS_PASS_TARGET_DIAG_NO_FORWARD.load(Relaxed);
+    let inside_cap = MCTS_PASS_TARGET_DIAG_FORWARD_INSIDE_CAP.load(Relaxed);
+    let pruned_by_cap = MCTS_PASS_TARGET_DIAG_FORWARD_PRUNED_BY_CAP.load(Relaxed);
+    let rank_sum = MCTS_PASS_TARGET_DIAG_FORWARD_RANK_SUM.load(Relaxed);
+    let avg_best_forward_rank = if has_forward == 0 {
+        0.0
+    } else {
+        rank_sum as f64 / has_forward as f64
+    };
+    eprintln!(
+        "mcts_pass_target_diag reached={reached} floor={floor} aerial={aerial} \
+         has_forward={has_forward} no_forward={no_forward} \
+         forward_inside_cap={inside_cap} forward_pruned_by_cap={pruned_by_cap} \
+         forward_inside_rate={:.3} forward_pruned_rate={:.3} no_forward_rate={:.3} \
+         avg_best_forward_rank_1based={avg_best_forward_rank:.2} cap={limit}",
+        mcts_pass_target_diag_rate(inside_cap, has_forward),
+        mcts_pass_target_diag_rate(pruned_by_cap, has_forward),
+        mcts_pass_target_diag_rate(no_forward, reached),
+    );
+}
+
+fn maybe_log_mcts_pass_target_diag(sample_count: u64, limit: usize) {
+    use std::sync::OnceLock;
+    static LOG_EVERY: OnceLock<u64> = OnceLock::new();
+    let log_every = *LOG_EVERY.get_or_init(|| {
+        std::env::var("DD_SOCCER_MCTS_PASS_TARGET_DIAG_LOG_EVERY")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(MCTS_PASS_TARGET_DIAG_DEFAULT_LOG_EVERY)
+    });
+    if log_every > 0 && sample_count > 0 && sample_count % log_every == 0 {
+        log_mcts_pass_target_diag(limit);
+    }
+}
+
+fn record_mcts_pass_target_diag(
+    snapshot: &WorldSnapshot,
+    player_id: usize,
+    team: Team,
+    prefix: &str,
+    targets: &[usize],
+    limit: usize,
+) {
+    if !mcts_pass_target_diag_enabled() {
+        return;
+    }
+    let Some(origin) = snapshot.player_position(player_id) else {
+        return;
+    };
+    use std::sync::atomic::Ordering::Relaxed;
+    let sample_count = MCTS_PASS_TARGET_DIAG_REACHED.fetch_add(1, Relaxed) + 1;
+    if prefix == "aerial-pass" {
+        MCTS_PASS_TARGET_DIAG_AERIAL.fetch_add(1, Relaxed);
+    } else {
+        MCTS_PASS_TARGET_DIAG_FLOOR.fetch_add(1, Relaxed);
+    }
+    let best_forward_rank = first_mcts_forward_target_rank(
+        team,
+        origin,
+        targets
+            .iter()
+            .map(|target_id| snapshot.player_position(*target_id)),
+    );
+    match mcts_forward_target_rank_bucket(best_forward_rank, limit) {
+        MctsForwardTargetRankBucket::NoForwardCandidate => {
+            MCTS_PASS_TARGET_DIAG_NO_FORWARD.fetch_add(1, Relaxed);
+        }
+        MctsForwardTargetRankBucket::InsideCap => {
+            MCTS_PASS_TARGET_DIAG_HAS_FORWARD.fetch_add(1, Relaxed);
+            MCTS_PASS_TARGET_DIAG_FORWARD_INSIDE_CAP.fetch_add(1, Relaxed);
+            MCTS_PASS_TARGET_DIAG_FORWARD_RANK_SUM
+                .fetch_add(best_forward_rank.unwrap_or(0) as u64 + 1, Relaxed);
+        }
+        MctsForwardTargetRankBucket::PrunedByCap => {
+            MCTS_PASS_TARGET_DIAG_HAS_FORWARD.fetch_add(1, Relaxed);
+            MCTS_PASS_TARGET_DIAG_FORWARD_PRUNED_BY_CAP.fetch_add(1, Relaxed);
+            MCTS_PASS_TARGET_DIAG_FORWARD_RANK_SUM
+                .fetch_add(best_forward_rank.unwrap_or(0) as u64 + 1, Relaxed);
+        }
+    }
+    maybe_log_mcts_pass_target_diag(sample_count, limit);
 }
 
 /// Diagnostic-only (gated by `DD_SOCCER_DUMP_PASS_SPACE_DIAG`): counts pass-space survival at
