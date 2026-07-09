@@ -10797,7 +10797,10 @@ fn completed_forward_pass_count_bonus_rewards_actual_forward_reception() {
 #[test]
 fn quick_forward_release_bonus_gates_and_ramps_from_zero_at_threshold() {
     // scale=0 (the default) pays nothing regardless of inputs => byte-identical when the knob is off.
-    assert_eq!(quick_forward_release_bonus_value(0.0, 10.0, 0.0, 2, 0.9, 0.9), 0.0);
+    assert_eq!(
+        quick_forward_release_bonus_value(0.0, 10.0, 0.0, 2, 0.9, 0.9),
+        0.0
+    );
     // A clearly-good quick forward release into a real opportunity earns a positive, capped bonus.
     let good = quick_forward_release_bonus_value(1.0, 10.0, 0.0, 2, 0.9, 0.9);
     assert!(
@@ -10815,12 +10818,27 @@ fn quick_forward_release_bonus_gates_and_ramps_from_zero_at_threshold() {
     );
     assert_eq!(at_gate, 0.0, "at-threshold pays 0 (0-at-gate fits)");
     // Any failed gate (backward/short, no visible option, weak opportunity, poor completion) pays 0.
-    assert_eq!(quick_forward_release_bonus_value(1.0, 3.9, 0.0, 2, 0.9, 0.9), 0.0);
-    assert_eq!(quick_forward_release_bonus_value(1.0, 10.0, 0.0, 0, 0.9, 0.9), 0.0);
-    assert_eq!(quick_forward_release_bonus_value(1.0, 10.0, 0.0, 2, 0.49, 0.9), 0.0);
-    assert_eq!(quick_forward_release_bonus_value(1.0, 10.0, 0.0, 2, 0.9, 0.44), 0.0);
+    assert_eq!(
+        quick_forward_release_bonus_value(1.0, 3.9, 0.0, 2, 0.9, 0.9),
+        0.0
+    );
+    assert_eq!(
+        quick_forward_release_bonus_value(1.0, 10.0, 0.0, 0, 0.9, 0.9),
+        0.0
+    );
+    assert_eq!(
+        quick_forward_release_bonus_value(1.0, 10.0, 0.0, 2, 0.49, 0.9),
+        0.0
+    );
+    assert_eq!(
+        quick_forward_release_bonus_value(1.0, 10.0, 0.0, 2, 0.9, 0.44),
+        0.0
+    );
     // Held past the 1.2s quick-release cap => timing_fit 0 => no bonus even if other gates pass.
-    assert_eq!(quick_forward_release_bonus_value(1.0, 10.0, 2.0, 2, 0.9, 0.9), 0.0);
+    assert_eq!(
+        quick_forward_release_bonus_value(1.0, 10.0, 2.0, 2, 0.9, 0.9),
+        0.0
+    );
     // The cap holds even with max scale and saturated signals.
     let capped = quick_forward_release_bonus_value(2.0, 100.0, 0.0, 5, 1.0, 1.0);
     assert!(
@@ -16851,8 +16869,12 @@ fn pomdp_q_state_and_player_decision_use_front_behind_field_context() {
             + SOCCER_NEURAL_SAME_TEAM_SEPARATION_FEATURE_DIM
     );
     assert_eq!(
-        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM,
         SOCCER_NEURAL_PRE_DECISION_CONTEXT_FEATURE_DIM + SOCCER_NEURAL_DECISION_CONTEXT_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM + SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM
     );
 
     let mut stale_observation = observation.clone();
@@ -42430,8 +42452,12 @@ fn learning_context_splits_mdp_pomdp_idea_from_mpc_execution() {
             + SOCCER_NEURAL_SAME_TEAM_SEPARATION_FEATURE_DIM
     );
     assert_eq!(
-        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM,
         SOCCER_NEURAL_PRE_DECISION_CONTEXT_FEATURE_DIM + SOCCER_NEURAL_DECISION_CONTEXT_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM + SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM
     );
     assert!(
         SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_IDEA_EXECUTION_FEATURE_DIM)
@@ -42439,6 +42465,96 @@ fn learning_context_splits_mdp_pomdp_idea_from_mpc_execution() {
     assert!(
         SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM)
     );
+    // The pre-action-param width (the old FEATURE_DIM) must be a recognized legacy width so
+    // nets trained before the action-param block migrate forward by zero-padding the tail.
+    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM));
+}
+
+#[test]
+fn action_param_feature_block_occupies_the_tail() {
+    // The 10 action-param slots are contiguous and sit at the very tail, immediately after
+    // the previous FEATURE_DIM, so pre-block nets zero-pad exactly these positions and the
+    // gate-off path (which never writes them) is byte-identical to the prior layout. The
+    // first 6 are the attack-relative aim geometry (no absolute dy — forward carries it
+    // side-invariantly); the last 4 are the action identity/power (speed + pass/shoot/dribble
+    // one-hot).
+    assert_eq!(SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM, 10);
+    let slots = [
+        SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DX,
+        SOCCER_NEURAL_FEATURE_ACTION_PARAM_DISTANCE,
+        SOCCER_NEURAL_FEATURE_ACTION_PARAM_FORWARD,
+        SOCCER_NEURAL_FEATURE_ACTION_PARAM_DIR_SIN,
+        SOCCER_NEURAL_FEATURE_ACTION_PARAM_DIR_COS,
+        SOCCER_NEURAL_FEATURE_ACTION_PARAM_HAS_TARGET,
+        SOCCER_NEURAL_FEATURE_ACTION_PARAM_ACTION_SPEED,
+        SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_PASS,
+        SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_SHOOT,
+        SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_DRIBBLE,
+    ];
+    for (i, slot) in slots.iter().enumerate() {
+        assert_eq!(*slot, SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM + i);
+    }
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_DRIBBLE,
+        SOCCER_NEURAL_FEATURE_DIM - 1
+    );
+}
+
+#[test]
+fn action_param_aim_and_identity_features_encode_expected_content() {
+    // Gate-ON CONTENT test (Codex review): exercise the pure helpers the encoder delegates to,
+    // so we cover the actual per-slot math without building a full transition.
+    //
+    // Aim geometry is attack-relative. A target 30yd toward the ATTACKING goal for Home
+    // (attack_dir = +1, +y is the attack direction here) and 12yd to the side:
+    let ball = Vec2 { x: 40.0, y: 50.0 };
+    let target = Vec2 {
+        x: ball.x + 12.0,
+        y: ball.y + 30.0,
+    };
+    let attack_dir = Team::Home.attack_dir();
+    let (dx, distance, forward, dir_sin, dir_cos) =
+        soccer_action_param_aim_features(target, ball, attack_dir);
+    assert_eq!(dx, soccer_neural_signed_unit(12.0 / 40.0));
+    let dist = (12.0f64 * 12.0 + 30.0 * 30.0).sqrt();
+    assert_eq!(distance, soccer_neural_scaled(dist, 60.0));
+    // Forward is + when the target is toward the attacking goal.
+    assert!(forward > 0.0, "toward-goal aim must read positive forward");
+    assert_eq!(forward, soccer_neural_signed_unit(30.0 * attack_dir / 50.0));
+    assert!((dir_sin - (12.0 / dist)).abs() < 1e-9);
+    assert!((dir_cos - (30.0 * attack_dir / dist)).abs() < 1e-9);
+
+    // Side-invariance: the SAME on-pitch geometry mirrored for the Away team (which attacks
+    // -y) must produce the SAME forward-ness and dir_cos — the whole point of dropping the
+    // absolute dy. Away target 30yd toward ITS goal = ball.y - 30.
+    let away_target = Vec2 {
+        x: ball.x + 12.0,
+        y: ball.y - 30.0,
+    };
+    let (_dx_a, _dist_a, forward_a, _sin_a, dir_cos_a) =
+        soccer_action_param_aim_features(away_target, ball, Team::Away.attack_dir());
+    assert!(
+        (forward - forward_a).abs() < 1e-9,
+        "attack-relative forward must be side-invariant: {forward} vs {forward_a}"
+    );
+    assert!((dir_cos - dir_cos_a).abs() < 1e-9);
+
+    // Degenerate aim (target == ball): distance 0, direction unit vector (0, 0).
+    let (_dx0, distance0, _fwd0, sin0, cos0) =
+        soccer_action_param_aim_features(ball, ball, attack_dir);
+    assert_eq!(distance0, soccer_neural_scaled(0.0, 60.0));
+    assert_eq!((sin0, cos0), (0.0, 0.0));
+
+    // Identity/power one-hot: a pass, a shot, and a dribble each light exactly their own flag;
+    // speed is scaled. (Reuses main's family helpers, so this also pins that wiring.)
+    let (pass_speed, is_pass, is_shoot, is_dribble) =
+        soccer_action_param_identity_features("pass", 18.0);
+    assert_eq!(pass_speed, soccer_neural_scaled(18.0, 36.0));
+    assert_eq!((is_pass, is_shoot, is_dribble), (1.0, 0.0, 0.0));
+    let (_s, p, sh, dr) = soccer_action_param_identity_features("shoot", 30.0);
+    assert_eq!((p, sh, dr), (0.0, 1.0, 0.0));
+    let (_s2, p2, sh2, dr2) = soccer_action_param_identity_features("dribble", 6.0);
+    assert_eq!((p2, sh2, dr2), (0.0, 0.0, 1.0));
 }
 
 #[test]
@@ -55875,8 +55991,12 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
         SOCCER_NEURAL_PRE_SOLO_CARRIER_FEATURE_DIM + SOCCER_NEURAL_SOLO_CARRIER_FEATURE_DIM
     );
     assert_eq!(
-        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_SAME_TEAM_SEPARATION_FEATURE_DIM,
         SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM + SOCCER_NEURAL_EXECUTION_MPC_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM + SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM
     );
     assert_eq!(
         SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM,
@@ -56090,8 +56210,12 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
         SOCCER_NEURAL_PRE_IDEA_EXECUTION_FEATURE_DIM + SOCCER_NEURAL_IDEA_EXECUTION_FEATURE_DIM
     );
     assert_eq!(
-        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_SAME_TEAM_SEPARATION_FEATURE_DIM,
         SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM + SOCCER_NEURAL_EXECUTION_MPC_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM + SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM
     );
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&170));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&177));
@@ -75764,8 +75888,12 @@ fn first_touch_escape_lateral_neural_block_is_appended_and_migration_safe() {
         SOCCER_NEURAL_PRE_SOLO_CARRIER_FEATURE_DIM + SOCCER_NEURAL_SOLO_CARRIER_FEATURE_DIM
     );
     assert_eq!(
-        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_SAME_TEAM_SEPARATION_FEATURE_DIM,
         SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM + SOCCER_NEURAL_EXECUTION_MPC_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM + SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM
     );
     assert_eq!(
         SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM,
@@ -75935,7 +76063,7 @@ fn first_touch_escape_lateral_neural_block_is_appended_and_migration_safe() {
     );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_EXECUTION_MPC_RECOMMENDED_SPEED + 1,
-        SOCCER_NEURAL_FEATURE_DIM
+        SOCCER_NEURAL_PRE_SAME_TEAM_SEPARATION_FEATURE_DIM
     );
     assert!(SOCCER_NEURAL_FEATURE_DEFENSIVE_PRESS_ACTION < SOCCER_NEURAL_FEATURE_DIM);
     assert!(SOCCER_NEURAL_FEATURE_DEFENSIVE_CONTAIN_RISK < SOCCER_NEURAL_FEATURE_DIM);

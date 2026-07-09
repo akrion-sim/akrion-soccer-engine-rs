@@ -17,6 +17,18 @@ Before changing docs, verify claims against the code or live system when they in
 
 Prefer current constants, env names, inspect endpoints, and DB queries over dated examples.
 
+## State of record
+
+Docs in this directory mix three kinds of material:
+
+- **Implemented now** - code-backed behavior verified against `main`.
+- **Diagnostic gaps** - counters, eval views, or runbook checks the code does not yet emit.
+- **Future work** - roadmap ideas that must stay gated, measured, and clearly separated from
+  live behavior.
+
+[current-learning-state.md](current-learning-state.md) is the compact source-backed snapshot for
+the current learning/planning surface and the immediate missing diagnostics.
+
 ## Start here
 
 - [learning-architecture.md](learning-architecture.md) - end-to-end self-play, learner,

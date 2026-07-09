@@ -63,6 +63,10 @@ Do this before changing knobs:
    serve protected promoted weights, not every exploratory candidate.
 5. Keep behavior metrics next to fitness: score, shots, shots on target, goals conceded,
    backward-pass turnovers, pass-chain net loss, progressive carries, and goal-entry actions.
+6. Separate current telemetry from missing diagnostics. Today the trainer reports MCTS
+   selection/candidate shares, MPC replans, priority samples, distillation, and policy entropy.
+   It does not yet prove whether the net changed the executed action, whether ConfidenceGated
+   opened on that selected action, or whether selected kick-power buckets retained entropy.
 
 Minimum local report:
 
@@ -73,10 +77,18 @@ Minimum local report:
 | Mean play quality | Catches "winning ugly" or reward hacks | Stable or rising |
 | Shots / shots on target | Verifies attacking intent | Rising SOT without conceding more |
 | Backward-pass interceptions | Verifies bad-pass discipline | Falling, especially in own half |
+| Net-changed action rate | Proves learned scoring changes executed behavior | Nonzero and rising in learning arms |
+| ConfidenceGate selected-open rate | Proves low-visit actions can use the net | Nonzero when ConfidenceGated is the blend |
+| Selected kick-bucket entropy | Detects early collapse into one power bucket | Stable/diverse by family before annealing |
+| Old-prob missing / PPO clip rate | Checks PPO/MAPPO denominator health | Low missing rate; sane ratio and clip stats |
 | World-model validation loss | Whether learned lookahead is trustworthy | Stable/down before increasing MCTS budget |
 | Neural-MCTS selection rate | Whether planning affects choices | Nonzero but not overriding everything blindly |
 | MPC replan rate | Whether feasibility guard is repairing plans | Low/moderate; spikes mean planner is proposing infeasible futures |
 | Publish count | Whether localhost should visibly improve | Protected local-best publish after held-out win |
+
+The net-changed, gate-open, bucket-entropy, and PPO-ratio rows are required diagnostics, not
+current `world_model_training` fields. Add them before declaring that an MCTS or bucket change
+caused the policy to climb.
 
 ## Root Causes And Fixes
 
@@ -231,13 +243,17 @@ When the learner is flat or regressing, follow this order:
 4. Confirm dense rewards reach the value net.
 5. Confirm the reward ceiling values goals/SOT/high-xG actions above pass chains.
 6. Train against frozen analytic/anchor opponents.
-7. Turn on learned world-model training.
-8. Turn on trainer-side shallow neural MCTS/lookahead.
-9. Watch validation metrics before increasing planning budget.
-10. Add controlled action exploration.
-11. Use population perturbation only when gradient/on-policy windows are flat.
-12. Promote only if held-out local-best gates pass.
-13. If still flat, increase representation/capacity and add embedding retrieval.
+7. Add or inspect the missing causality counters: net-changed action rate, selected
+   ConfidenceGate-open rate, selected kick-power bucket entropy, old-prob missing rate,
+   PPO/MAPPO ratio and clip stats, and target/advantage histograms.
+8. Turn on learned world-model training.
+9. Turn on trainer-side shallow neural MCTS/lookahead.
+10. Run paired MCTS-on/off ablations over the same fixed seeds before increasing planning budget.
+11. Add controlled action exploration, preferably bucket sampling/temperature/entropy rather than
+   relying on `DiscretizedKickDither` (currently zero-offset).
+12. Use population perturbation only when gradient/on-policy windows are flat.
+13. Promote only if held-out local-best gates pass.
+14. If still flat, increase representation/capacity and add embedding retrieval.
 
 ## Current Local Interpretation
 
