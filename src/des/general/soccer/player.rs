@@ -3011,9 +3011,6 @@ fn option_score_safety_possession_candidate_is_executable(
     if mpc_reselect_rejection_probability(snapshot, player, action, action_label).is_some() {
         return false;
     }
-    if pass_like_action_flight(normalized).is_some() {
-        return true;
-    }
     let action_target = player.action_target_trace(action, snapshot);
     let Some(estimate) =
         direct_mpc_execution_estimate_for_candidate(snapshot, player, &action_target, action_label)
@@ -10271,7 +10268,6 @@ impl PlayerAgent {
                             plan,
                             snapshot,
                             &observation,
-                            &action,
                             &concrete_action_options,
                             &action_label,
                         )
@@ -14225,7 +14221,6 @@ impl PlayerAgent {
         plan: &SoccerLearnedPlan,
         snapshot: &WorldSnapshot,
         observation: &SoccerPomdpObservation,
-        chosen_action: &SoccerAction,
         options: &[AgentActionOptionTrace],
         action_label: &str,
     ) -> Option<(SoccerAction, String, f64)> {
@@ -14253,23 +14248,6 @@ impl PlayerAgent {
             .map(|option| soccer_finite_option_score(option))
             .unwrap_or(0.0);
         if !learned_policy_option_score_safety_trips(chosen_score, best_score) {
-            return None;
-        }
-        let chosen_family = normalize_soccer_action_label(&chosen_key);
-        if forward_pass_climb_curriculum_enabled()
-            && observation.has_ball
-            && pass_like_action_flight(chosen_family).is_some()
-            && matches!(
-                chosen_action,
-                SoccerAction::Pass {
-                    target_player: Some(_),
-                    ..
-                } | SoccerAction::Pass {
-                    target_point: Some(_),
-                    ..
-                }
-            )
-        {
             return None;
         }
         let rejected_execution_probability =
@@ -15166,29 +15144,6 @@ pub struct SoccerLearnedPlan {
 mod learned_policy_option_score_safety_tests {
     use super::*;
 
-    struct ScopedEnvVar {
-        key: &'static str,
-        previous: Option<String>,
-    }
-
-    impl ScopedEnvVar {
-        fn set(key: &'static str, value: &'static str) -> Self {
-            let previous = std::env::var(key).ok();
-            std::env::set_var(key, value);
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for ScopedEnvVar {
-        fn drop(&mut self) {
-            if let Some(value) = &self.previous {
-                std::env::set_var(self.key, value);
-            } else {
-                std::env::remove_var(self.key);
-            }
-        }
-    }
-
     #[test]
     fn learned_policy_option_score_safety_trips_on_catastrophic_gap() {
         assert!(learned_policy_option_score_safety_trips_with_thresholds(
@@ -15309,18 +15264,12 @@ mod learned_policy_option_score_safety_tests {
             AgentActionOptionTrace::new("pass1", 17.0, true),
             AgentActionOptionTrace::new("xavi-turn", 0.2, true),
         ];
-        let chosen_action = SoccerAction::DribbleMove {
-            target: holder_pos,
-            kind: DribbleMoveKind::ProtectBall,
-            touch: DribbleTouchDecision::new(0, 1.0),
-        };
 
         let (action, label, _) = holder_player
             .learned_policy_option_score_safety_override(
                 &learned_plan,
                 &snapshot,
                 &observation,
-                &chosen_action,
                 &options,
                 "xavi-turn",
             )
@@ -15331,74 +15280,6 @@ mod learned_policy_option_score_safety_tests {
             SoccerAction::Pass { target_player, .. } => assert_eq!(target_player, Some(mate)),
             other => panic!("expected pass1 fallback, got {:?}", other),
         }
-    }
-
-    #[test]
-    fn forward_pass_curriculum_preserves_executable_pass_choice() {
-        let _guard = ScopedEnvVar::set("DD_SOCCER_FORWARD_PASS_CLIMB_CURRICULUM", "1");
-        let mut sim = SoccerMatch::default_11v11(MatchConfig {
-            dt_seconds: 0.1,
-            seed: 94_503,
-            ..Default::default()
-        });
-        let holder = sim
-            .players
-            .iter()
-            .find(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
-            .expect("home holder")
-            .id;
-        let mate = sim
-            .players
-            .iter()
-            .find(|player| {
-                player.team == Team::Home
-                    && player.role != PlayerRole::Goalkeeper
-                    && player.id != holder
-            })
-            .expect("home teammate")
-            .id;
-        let holder_pos = Vec2::new(sim.config.field_width_yards * 0.50, 52.0);
-        let mate_pos = Vec2::new(sim.config.field_width_yards * 0.50, 65.0);
-        sim.players[holder].position = holder_pos;
-        sim.players[holder].velocity = Vec2::zero();
-        sim.players[mate].position = mate_pos;
-        sim.players[mate].velocity = Vec2::zero();
-        sim.ball.holder = Some(holder);
-        sim.ball.position = holder_pos;
-
-        let snapshot = WorldSnapshot::from_match(&sim);
-        let observation = snapshot.observation_for(holder);
-        let holder_player = sim.players[holder].clone();
-        let learned_plan = SoccerLearnedPlan {
-            action: "pass1".to_string(),
-            target_player: Some(mate),
-            target_point: Some(mate_pos),
-            mpc_replan: None,
-        };
-        let pass_action = SoccerAction::Pass {
-            target_player: Some(mate),
-            target_point: Some(mate_pos),
-            power: 0.68,
-            flight: PassFlight::Floor,
-        };
-        let options = vec![
-            AgentActionOptionTrace::new("hold", 18.0, true),
-            AgentActionOptionTrace::new("pass1", 0.2, true),
-        ];
-
-        let override_action = holder_player.learned_policy_option_score_safety_override(
-            &learned_plan,
-            &snapshot,
-            &observation,
-            &pass_action,
-            &options,
-            "pass1",
-        );
-
-        assert!(
-            override_action.is_none(),
-            "forward-pass curriculum should let executable pass choices reach receiver/MPC learning"
-        );
     }
 
     #[test]

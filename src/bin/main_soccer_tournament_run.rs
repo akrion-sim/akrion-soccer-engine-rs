@@ -1162,7 +1162,6 @@ mod tests {
             average_loss: None,
             target_popart: None,
             policy_head: None,
-            mpc_objective_head: None,
             line_depth_head: None,
         };
         refresh_snapshot_norm(&mut snapshot);
