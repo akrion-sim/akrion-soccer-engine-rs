@@ -46115,11 +46115,23 @@ fn soccer_neural_transition_features_with_action(
         soccer_neural_scaled(obs.forward_onside_support_clamp_distance_yards, 8.0);
     features[SOCCER_NEURAL_FEATURE_FORWARD_ONSIDE_SUPPORT_PRESSURE] =
         soccer_neural_unit(obs.forward_onside_support_pressure);
-    // Append-only structured action-parameter block (priority-1 Part A). OFF (default) or
-    // no aim ⇒ the 7 slots stay 0.0 (byte-identical). When on with a target, the value head
-    // sees the candidate's aim geometry so it can generalize across similar kick targets
-    // instead of relying on the opaque `soccer_neural_action_hash` scalar written above.
+    // Append-only structured action-parameter block. OFF (default) ⇒ the 11 slots stay 0.0
+    // (byte-identical). When ON, the value head sees the candidate's aim geometry (so it can
+    // generalize across similar kick targets) AND the action's identity/power (launch speed +
+    // pass/shoot/dribble family), replacing the opaque `soccer_neural_action_hash` scalar
+    // written above. Aim geometry (attack-relative) only when a target exists; the identity
+    // slots are written whenever the block is on, since they do not need an aim point.
     if dd_soccer_enable_action_param_features() {
+        // Action identity + power (target-independent). Reuse main's canonical family helpers
+        // rather than re-deriving the label taxonomy.
+        features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_ACTION_SPEED] =
+            soccer_neural_scaled(context.action_ball_speed_yps, 36.0);
+        features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_PASS] =
+            soccer_neural_bool(is_pass_like_action(action_label));
+        features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_SHOOT] =
+            soccer_neural_bool(soccer_frame_liveness_action_is_shot(action_label));
+        features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_DRIBBLE] =
+            soccer_neural_bool(is_dribble_action_label(action_label));
         if let Some(target) = context.target_point {
             let rel_x = target.x - context.ball_position.x;
             let rel_y = target.y - context.ball_position.y;
