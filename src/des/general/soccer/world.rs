@@ -22413,7 +22413,8 @@ impl SoccerMatch {
             self.record_significant_pass_chain_rewards(
                 &chain[..2],
                 PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS
-                    * self.overload_pass_chain_event_multiplier(pass.team),
+                    * self.overload_pass_chain_event_multiplier(pass.team)
+                    * pass_chain_reward_scale(),
                 SoccerRewardEventKind::TwoForwardPasses,
             );
             self.settle_turnover_outcome_if_danger(
