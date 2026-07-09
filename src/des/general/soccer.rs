@@ -46119,44 +46119,31 @@ fn soccer_neural_transition_features_with_action(
         soccer_neural_scaled(obs.forward_onside_support_clamp_distance_yards, 8.0);
     features[SOCCER_NEURAL_FEATURE_FORWARD_ONSIDE_SUPPORT_PRESSURE] =
         soccer_neural_unit(obs.forward_onside_support_pressure);
-    // Append-only structured action-parameter block. OFF (default) ⇒ the 11 slots stay 0.0
+    // Append-only structured action-parameter block. OFF (default) ⇒ the 10 slots stay 0.0
     // (byte-identical). When ON, the value head sees the candidate's aim geometry (so it can
     // generalize across similar kick targets) AND the action's identity/power (launch speed +
     // pass/shoot/dribble family), replacing the opaque `soccer_neural_action_hash` scalar
     // written above. Aim geometry (attack-relative) only when a target exists; the identity
-    // slots are written whenever the block is on, since they do not need an aim point.
+    // slots are written whenever the block is on, since they do not need an aim point. The
+    // per-slot math lives in pure helpers so it is unit-testable without a full transition.
     if dd_soccer_enable_action_param_features() {
-        // Action identity + power (target-independent). Reuse main's canonical family helpers
-        // rather than re-deriving the label taxonomy.
-        features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_ACTION_SPEED] =
-            soccer_neural_scaled(context.action_ball_speed_yps, 36.0);
-        features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_PASS] =
-            soccer_neural_bool(is_pass_like_action(action_label));
-        features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_SHOOT] =
-            soccer_neural_bool(soccer_frame_liveness_action_is_shot(action_label));
-        features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_DRIBBLE] =
-            soccer_neural_bool(is_dribble_action_label(action_label));
+        let (speed, is_pass, is_shoot, is_dribble) =
+            soccer_action_param_identity_features(action_label, context.action_ball_speed_yps);
+        features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_ACTION_SPEED] = speed;
+        features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_PASS] = is_pass;
+        features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_SHOOT] = is_shoot;
+        features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_DRIBBLE] = is_dribble;
         if let Some(target) = context.target_point {
-            let rel_x = target.x - context.ball_position.x;
-            let rel_y = target.y - context.ball_position.y;
-            let dist = (rel_x * rel_x + rel_y * rel_y).sqrt();
-            let attack_dir = transition.team.attack_dir();
-            features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DX] =
-                soccer_neural_signed_unit(rel_x / 40.0);
-            features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DY] =
-                soccer_neural_signed_unit(rel_y / 50.0);
-            features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_DISTANCE] =
-                soccer_neural_scaled(dist, 60.0);
-            // Attack-relative forward-ness and aim direction as an attack-relative unit
-            // vector: +cos points at the attacking goal, sin is the lateral component.
-            features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_FORWARD] =
-                soccer_neural_signed_unit(rel_y * attack_dir / 50.0);
-            if dist > 1e-3 {
-                features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_DIR_SIN] =
-                    (rel_x / dist).clamp(-1.0, 1.0);
-                features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_DIR_COS] =
-                    (rel_y * attack_dir / dist).clamp(-1.0, 1.0);
-            }
+            let (dx, distance, forward, dir_sin, dir_cos) = soccer_action_param_aim_features(
+                target,
+                context.ball_position,
+                transition.team.attack_dir(),
+            );
+            features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DX] = dx;
+            features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_DISTANCE] = distance;
+            features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_FORWARD] = forward;
+            features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_DIR_SIN] = dir_sin;
+            features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_DIR_COS] = dir_cos;
             features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_HAS_TARGET] = 1.0;
         }
     }
