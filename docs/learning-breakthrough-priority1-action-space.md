@@ -58,8 +58,8 @@ goal), direction sin/cos, has-target. Gate `DD_SOCCER_ENABLE_ACTION_PARAM_FEATUR
 block ⇒ byte-identical). **This replaces the opaque hash with structure the net can generalize
 over** — even for existing candidates.
 
-### Part B — discretized-kick variant candidates
-In the candidate assembly ([world.rs:5623](../src/des/general/soccer/world.rs#L5623), where legal
+### Part B — discretized-kick variant candidates — ✅ IMPLEMENTED (gate `DD_SOCCER_ENABLE_DISCRETIZED_KICK`)
+In the candidate assembly (now at [world.rs:14296](../src/des/general/soccer/world.rs#L14296), where legal
 `SOCCER_POLICY_ACTIONS` are injected), for kick families (pass/shoot/cross) generate a *spread* of
 `DiscretizedKickAction` variants over the speed/direction buckets toward plausible targets, each
 carrying its Part-A param features. The net ranks them; the chosen variant's params are lowered via
