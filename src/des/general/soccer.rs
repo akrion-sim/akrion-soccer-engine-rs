@@ -23626,6 +23626,22 @@ pub(crate) fn shot_shaping_reward_scale() -> f64 {
     })
 }
 
+/// Scale on the learned-EPV conversion bonus for completed passes (DD_SOCCER_LEARNED_EPV_REWARD_SCALE).
+/// Default 20: the fitted Φ_epv spans ~[-0.15, 0.20], so a strong danger-creating pass (ΔΦ ≈ 0.3) earns
+/// ~6 — comparable to the base forward-pass reward — while a square/backward ball earns ~0 or negative.
+pub(crate) fn learned_epv_reward_scale() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_LEARNED_EPV_REWARD_SCALE")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .unwrap_or(20.0)
+            .clamp(0.0, 200.0)
+    })
+}
+
 fn completed_pass_reward_for_pitch(
     team: Team,
     origin: Vec2,
