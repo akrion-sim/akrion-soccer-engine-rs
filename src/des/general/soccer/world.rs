@@ -1978,30 +1978,6 @@ fn soccer_policy_mixed_behavior_probability(
     (epsilon * exploration_probability + (1.0 - epsilon) * fallback_probability).clamp(0.0, 1.0)
 }
 
-/// Whether a transition is a FORWARD pass by GEOMETRY (not merely by its action label): a pass-like
-/// action whose resolved target point lies forward of the carrier along the team's attacking
-/// direction by at least [`SOCCER_FORWARD_SELECT_MIN_FORWARD_YARDS`].
-///
-/// This deliberately does NOT trust the `"pass"` / `"pass-kpN"` label alone — those labels also
-/// cover lateral and backward balls (switch-play, recycle/reset), so label-gating would just
-/// re-lift the stuck lateral choices. Forwardness is `(target.y - carrier.y) * attack_dir`, the
-/// canonical pass-progress measure used across the engine. Carrier position comes from the
-/// transition's decision context (at score time this equals `snapshot.player_position(player_id)`;
-/// at training time it is the position recorded when the action was taken), so the learned
-/// forward-select bias shares ONE definition of "forward" at both its score-time application and
-/// its training-time eligibility.
-fn soccer_transition_forward_pass_selection_eligible(transition: &SoccerLearningTransition) -> bool {
-    if pass_like_action_flight(&transition.action).is_none() {
-        return false;
-    }
-    let Some(target) = transition.action_target.as_ref().and_then(|trace| trace.point) else {
-        return false;
-    };
-    let forward_yards =
-        (target.y - transition.decision_context.actor_position.y) * transition.team.attack_dir();
-    forward_yards.is_finite() && forward_yards > SOCCER_FORWARD_SELECT_MIN_FORWARD_YARDS
-}
-
 fn soccer_policy_rank_probability_for_label(
     ranked: &[SoccerLearnedActionTrace],
     label: &str,
@@ -9882,7 +9858,6 @@ mod tests {
             old_action_probability: None,
             sample_weight: soccer_actor_priority_weight(&transition, -0.5),
             mcts_distillation: false,
-            forward_select_eligible: false,
         };
 
         assert_eq!(
@@ -10072,7 +10047,6 @@ mod tests {
             old_action_probability: None,
             sample_weight,
             mcts_distillation: sample_weight >= NEURAL_MCTS_DISTILLATION_PRIORITY_WEIGHT - 1e-9,
-            forward_select_eligible: false,
         };
         let mut samples = vec![
             sample(0.01, NEURAL_MCTS_DISTILLATION_PRIORITY_WEIGHT),
@@ -16015,23 +15989,6 @@ impl SoccerMatch {
         let pass_target_candidate_limit = neural_mcts_pass_target_candidate_limit();
         let mut scored_candidates =
             Vec::with_capacity(legal.len() + legal.len() * pass_target_candidate_limit);
-        // Learned per-net FORWARD action-selection bias. Precomputed once (state-constant across
-        // candidates): the weight is 0.0 unless the gate is on AND a policy head exists, and the
-        // feature is the visible forward-option quality. Captured as plain f64 copies so the
-        // closure does not additionally borrow `self.policy_head`. When the weight is 0.0 the
-        // per-candidate bonus below is 0 ⇒ the scored-candidate path is byte-identical.
-        let forward_select_weight = if dd_soccer_enable_forward_select_logit() {
-            self.policy_head
-                .as_ref()
-                .map(|head| head.forward_select_logit_weight)
-                .unwrap_or(0.0)
-        } else {
-            0.0
-        };
-        let forward_select_feature = observation
-            .best_forward_pass_option_quality
-            .max(observation.best_forward_pass_receiver_openness)
-            .clamp(0.0, 1.0);
         let mut push_scored_candidate =
             |candidate: &SoccerLearnedActionTrace, candidate_plan: SoccerLearnedPlan| {
                 if !Self::neural_mcts_candidate_plan_is_executable(
@@ -16124,25 +16081,12 @@ impl SoccerMatch {
                 } else {
                     0.0
                 };
-                // Learned FORWARD action-selection bias: add `weight * forward_option_quality` only
-                // when this candidate is a pass-like action whose target is geometrically FORWARD
-                // (NOT gated on the label — lateral/backward passes share the "pass" label). The
-                // weight is 0.0 on the default (gate-off / cold) path, so `forward_select_bonus` is
-                // 0 and `score` is byte-identical.
-                let forward_select_bonus = if forward_select_weight != 0.0
-                    && soccer_transition_forward_pass_selection_eligible(&transition)
-                {
-                    forward_select_weight * forward_select_feature
-                } else {
-                    0.0
-                };
                 let score = value_score
                     + actor_bonus
                     + dp_policy_bonus
                     + retrieved_bonus
                     + model_bonus
-                    + mpc_candidate_bonus
-                    + forward_select_bonus;
+                    + mpc_candidate_bonus;
                 if !score.is_finite() {
                     return;
                 }
@@ -16182,25 +16126,25 @@ impl SoccerMatch {
                 .then_with(|| a.label.cmp(&b.label))
         });
         let rank_draw = self.policy_rank_selection_draw(snapshot, player_id, rank_salt);
-        if let Some(mcts_label) =
+        // Resolve the winner once (behavior-preserving refactor of the previous early-return
+        // chain: mcts -> {authoritative: dp-safe -> technical-floor -> top} | weighted) so the
+        // net-influence diagnostic can compare it against the tabular baseline before returning.
+        let choice = if let Some(mcts_label) =
             Self::neural_mcts_action_from_candidates(blend, &scored_candidates, rank_draw)
         {
-            return Some(mcts_label);
-        }
-        if blend.mode == SoccerNeuralBlendMode::Authoritative {
-            if let Some(dp_safe_choice) =
-                Self::neural_authoritative_dp_safety_choice(&scored_candidates, &legal)
-            {
-                return Some(dp_safe_choice);
-            }
-            if let Some(technical_choice) =
-                Self::technical_scored_candidate_floor_choice(&scored_candidates, rank_draw)
-            {
-                return Some(technical_choice);
-            }
-            return Self::top_scored_candidate_choice(&scored_candidates);
-        }
-        Self::weighted_scored_candidate_choice(&scored_candidates, rank_draw)
+            Some(mcts_label)
+        } else if blend.mode == SoccerNeuralBlendMode::Authoritative {
+            Self::neural_authoritative_dp_safety_choice(&scored_candidates, &legal)
+                .or_else(|| {
+                    Self::technical_scored_candidate_floor_choice(&scored_candidates, rank_draw)
+                })
+                .or_else(|| Self::top_scored_candidate_choice(&scored_candidates))
+        } else {
+            Self::weighted_scored_candidate_choice(&scored_candidates, rank_draw)
+        };
+        // Net-influence is measured at the decision assembler (learned_action_for_player_with_context)
+        // against the real tabular-only counterfactual, per Codex; see record_net_influence_diag there.
+        choice
     }
 
     /// Per-team value-head forward-intent for this tick: for each outfield player,
@@ -18550,11 +18494,6 @@ impl SoccerMatch {
                 if diag_on {
                     diag_meta.push((transition.team, action_index, advantage));
                 }
-                // Eligibility for the per-net forward-select scalar's gradient: the taken action
-                // was a forward pass into a good forward option (same geometry as the score-time
-                // bias). In-memory only; irrelevant unless the forward-select gate is on.
-                let forward_select_eligible =
-                    soccer_transition_forward_pass_selection_eligible(transition);
                 let sample = SoccerPolicySample {
                     state_features,
                     action_index,
@@ -18562,7 +18501,6 @@ impl SoccerMatch {
                     old_action_probability,
                     sample_weight,
                     mcts_distillation,
-                    forward_select_eligible,
                 };
                 if option_score_safety_counterexample {
                     option_score_safety_counterexample_samples += 1;
@@ -37907,6 +37845,124 @@ fn maybe_log_pass_space_diag(sample_count: u64) {
     if log_every > 0 && sample_count > 0 && sample_count % log_every == 0 {
         log_pass_space_diag();
     }
+}
+
+// ===== Net-influence diagnostic (Codex round-23) =====
+// Measures how often the neural blend actually CHANGES the selected action vs the tabular
+// baseline (the argmax-tabular-value legal candidate) at the `neural_blended_action` scorer.
+// This is the headline "does the net own play" number — if it is near zero, no reward or
+// interface lever can matter because the executed action rarely differs from what plain tabular
+// play would have chosen. Default-off (byte-identical) unless `DD_SOCCER_NET_INFLUENCE_DIAG` is
+// set; when unset `record_net_influence_diag` is a no-op and the counters never move.
+fn net_influence_diag_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_NET_INFLUENCE_DIAG").is_ok())
+}
+
+const NET_INFLUENCE_DIAG_DEFAULT_LOG_EVERY: u64 = 1000;
+
+static NET_INFLUENCE_DECISIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NET_INFLUENCE_FAMILY_CHANGED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static NET_INFLUENCE_EXACT_CHANGED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static NET_INFLUENCE_ONBALL_DECISIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static NET_INFLUENCE_ONBALL_CHANGED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+// "neural-active" = the subset where the value blend was live and there were >=2 scored
+// candidates, i.e. the net genuinely had a choice to make. Codex's higher threshold (>25-30%)
+// applies here; the all-decisions number is diluted by ticks where tabular had one option.
+static NET_INFLUENCE_ACTIVE_DECISIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static NET_INFLUENCE_ACTIVE_CHANGED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[allow(clippy::too_many_arguments)]
+fn record_net_influence_diag(
+    baseline_family: &str,
+    selected_family: &str,
+    baseline_label: &str,
+    selected_label: &str,
+    on_ball: bool,
+    neural_active: bool,
+) {
+    if !net_influence_diag_enabled() {
+        return;
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    let family_changed = baseline_family != selected_family;
+    let exact_changed = baseline_label != selected_label;
+    let count = NET_INFLUENCE_DECISIONS.fetch_add(1, Relaxed) + 1;
+    if family_changed {
+        NET_INFLUENCE_FAMILY_CHANGED.fetch_add(1, Relaxed);
+    }
+    if exact_changed {
+        NET_INFLUENCE_EXACT_CHANGED.fetch_add(1, Relaxed);
+    }
+    if on_ball {
+        NET_INFLUENCE_ONBALL_DECISIONS.fetch_add(1, Relaxed);
+        if family_changed {
+            NET_INFLUENCE_ONBALL_CHANGED.fetch_add(1, Relaxed);
+        }
+    }
+    if neural_active {
+        NET_INFLUENCE_ACTIVE_DECISIONS.fetch_add(1, Relaxed);
+        if family_changed {
+            NET_INFLUENCE_ACTIVE_CHANGED.fetch_add(1, Relaxed);
+        }
+    }
+    maybe_log_net_influence_diag(count);
+}
+
+fn maybe_log_net_influence_diag(sample_count: u64) {
+    use std::sync::OnceLock;
+    static LOG_EVERY: OnceLock<u64> = OnceLock::new();
+    let log_every = *LOG_EVERY.get_or_init(|| {
+        std::env::var("DD_SOCCER_NET_INFLUENCE_DIAG_LOG_EVERY")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(NET_INFLUENCE_DIAG_DEFAULT_LOG_EVERY)
+    });
+    if log_every > 0 && sample_count > 0 && sample_count % log_every == 0 {
+        log_net_influence_diag();
+    }
+}
+
+fn log_net_influence_diag() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let decisions = NET_INFLUENCE_DECISIONS.load(Relaxed);
+    if decisions == 0 {
+        return;
+    }
+    let family = NET_INFLUENCE_FAMILY_CHANGED.load(Relaxed);
+    let exact = NET_INFLUENCE_EXACT_CHANGED.load(Relaxed);
+    let on_ball = NET_INFLUENCE_ONBALL_DECISIONS.load(Relaxed);
+    let on_ball_changed = NET_INFLUENCE_ONBALL_CHANGED.load(Relaxed);
+    let active = NET_INFLUENCE_ACTIVE_DECISIONS.load(Relaxed);
+    let active_changed = NET_INFLUENCE_ACTIVE_CHANGED.load(Relaxed);
+    let off_ball = decisions - on_ball;
+    let off_ball_changed = family - on_ball_changed;
+    let pct = |n: u64, total: u64| -> f64 {
+        if total > 0 {
+            100.0 * n as f64 / total as f64
+        } else {
+            0.0
+        }
+    };
+    eprintln!(
+        "net_influence_diag decisions={decisions} \
+         family_changed={family} ({:.1}%) exact_changed={exact} ({:.1}%) \
+         on_ball={on_ball} on_ball_changed={on_ball_changed} ({:.1}%) \
+         off_ball={off_ball} off_ball_changed={off_ball_changed} ({:.1}%) \
+         neural_active_ge2cand={active} neural_active_changed={active_changed} ({:.1}%)",
+        pct(family, decisions),
+        pct(exact, decisions),
+        pct(on_ball_changed, on_ball),
+        pct(off_ball_changed, off_ball),
+        pct(active_changed, active),
+    );
 }
 
 fn record_pass_space_source_diag(estimator_some: bool, distinct: bool) {

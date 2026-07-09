@@ -12240,7 +12240,6 @@ mod tests {
                     average_loss: Some(0.75),
                 }],
             }],
-            forward_select_logit_weight: 0.0,
         }));
         snapshot.line_depth_head = Some(Box::new(SoccerAuxiliaryHeadSnapshot {
             network: neural_population_network(base + 50.0),
