@@ -106,6 +106,13 @@ const SOCCER_COMPLETED_RUN_INSERT_BATCH_SIZE: usize = 512;
 const SOCCER_POLICY_RETENTION_BRANCH_TIP: &str = "branch_tip";
 const SOCCER_POLICY_INLINE_PRUNE_ENV: &str = "SOCCER_PG_INLINE_POLICY_PRUNE";
 const SOCCER_POLICY_RETAIN_ARCHIVED_ENTRIES_ENV: &str = "SOCCER_PG_RETAIN_ARCHIVED_POLICY_ENTRIES";
+/// Escape hatch to keep the heavy `neuralNetwork` blob in `metrics` for versions the promotion
+/// gate has already archived. Defaults OFF: archived, gate-rejected non-loadable versions are
+/// persisted WITHOUT the ~0.4 MB neural blob to stop the policy-versions table growing ~0.5 GB/day
+/// (see [`soccer_policy_version_metrics_retains_neural_snapshot`]). Operators can set it to keep
+/// the blobs for offline debugging.
+const SOCCER_POLICY_RETAIN_ARCHIVED_NEURAL_ENV: &str =
+    "SOCCER_PG_RETAIN_ARCHIVED_POLICY_VERSION_NEURAL";
 const SOCCER_POLICY_VERSION_FULL_ENTRIES_ENV: &str = "SOCCER_PG_POLICY_VERSION_FULL_ENTRIES";
 const SOCCER_PG_PERSIST_RUN_DELTAS_ENV: &str = "SOCCER_PG_PERSIST_RUN_DELTAS";
 const SOCCER_PG_RESUME_MAX_POLICY_ENTRIES_ENV: &str = "SOCCER_PG_RESUME_MAX_POLICY_ENTRIES";
@@ -362,6 +369,84 @@ fn soccer_policy_version_metrics_with_retention(
         "fullEntriesRetained": full_entries_retained,
     });
     metrics
+}
+
+/// True when the promotion gate recorded in `metrics` has already archived this version, i.e.
+/// `learningProvenance.searchParameters.promotion.status == "archived"`. This is the ONLY signal
+/// that both live loaders (`load_latest_policy_metadata` with `include_unpromoted`, and
+/// `load_latest_neural_policy_metadata`) use to exclude a non-active version, so it is the safe
+/// discriminator for when the neural blob is guaranteed unreachable.
+fn soccer_policy_version_promotion_gate_archived(metrics: &Value) -> bool {
+    metrics
+        .get("learningProvenance")
+        .and_then(|provenance| provenance.get("searchParameters"))
+        .and_then(|search_parameters| search_parameters.get("promotion"))
+        .and_then(|promotion| promotion.get("status"))
+        .and_then(Value::as_str)
+        == Some(SOCCER_POLICY_STATUS_ARCHIVED)
+}
+
+/// Whether a version's persisted `metrics` must keep its heavy `neuralNetwork` blob.
+///
+/// The blob is the ~0.4 MB driver of policy-version table bloat, so it is stripped from versions
+/// no live loader will ever read again. A version stays readable — and therefore MUST keep its
+/// blob — when ANY of these holds:
+///   * the operator opted back into full retention (`retain_archived_neural_override`);
+///   * it is the `active` head (the authoritative live `:5055` neural net, loaded by
+///     `load_latest_policy_metadata`); or
+///   * the promotion gate has NOT archived it, so the `include_unpromoted` resume loader and the
+///     `load_latest_neural_policy_metadata` warm-start loader can still select it.
+///
+/// The only versions this returns `false` for are non-active rows the promotion gate itself
+/// archived — exactly the population of losing candidates that drives the bloat.
+fn soccer_policy_version_metrics_retains_neural_snapshot(
+    effective_status: &str,
+    metrics: &Value,
+    retain_archived_neural_override: bool,
+) -> bool {
+    if retain_archived_neural_override {
+        return true;
+    }
+    if effective_status == SOCCER_POLICY_STATUS_ACTIVE {
+        return true;
+    }
+    !soccer_policy_version_promotion_gate_archived(metrics)
+}
+
+/// Strip the `neuralNetwork` blob from `metrics` when the version is guaranteed unreachable by the
+/// live loaders (see [`soccer_policy_version_metrics_retains_neural_snapshot`]). Lightweight
+/// provenance/fitness/tactical fields are preserved; only the heavy weights blob is removed, and
+/// the provenance/retention flags are updated so downstream readers see it is no longer persisted.
+fn soccer_policy_version_strip_neural_snapshot_if_archived(
+    mut metrics: Value,
+    effective_status: &str,
+    retain_archived_neural_override: bool,
+) -> Value {
+    if soccer_policy_version_metrics_retains_neural_snapshot(
+        effective_status,
+        &metrics,
+        retain_archived_neural_override,
+    ) {
+        return metrics;
+    }
+    let removed = metrics
+        .as_object_mut()
+        .and_then(|object| object.remove("neuralNetwork"))
+        .is_some();
+    if removed {
+        metrics["learningProvenance"]["neuralNetworkSnapshotPersisted"] = json!(false);
+        if let Some(retention) = metrics
+            .get_mut("postgresRetention")
+            .and_then(Value::as_object_mut)
+        {
+            retention.insert("neuralSnapshotStripped".to_string(), json!(true));
+        }
+    }
+    metrics
+}
+
+fn soccer_policy_version_retain_archived_neural_snapshot() -> bool {
+    soccer_learning_pg_env_flag(SOCCER_POLICY_RETAIN_ARCHIVED_NEURAL_ENV)
 }
 
 fn soccer_policy_version_neural_network_from_metrics(
@@ -2006,6 +2091,14 @@ impl SoccerLearningPgStore {
             retention_kind,
             full_entries_retained,
         );
+        // Bloat control: gate-archived, non-loadable versions persist WITHOUT the heavy
+        // neuralNetwork blob. The active head keeps it (the live loader reads the active version's
+        // neural net), so this never removes the blob the `:5055` loader depends on.
+        let metrics = soccer_policy_version_strip_neural_snapshot_if_archived(
+            metrics,
+            effective_status,
+            soccer_policy_version_retain_archived_neural_snapshot(),
+        );
 
         if effective_status == SOCCER_POLICY_STATUS_ACTIVE {
             // Serialize active-policy promotions PER EXPERIMENT so the
@@ -3112,6 +3205,13 @@ impl SoccerLearningPgStore {
             &branch_key,
             retention_kind,
             full_entries_retained,
+        );
+        // Bloat control: gate-archived, non-loadable versions persist WITHOUT the heavy
+        // neuralNetwork blob (the active head keeps it — see the merge path above).
+        let metrics = soccer_policy_version_strip_neural_snapshot_if_archived(
+            metrics,
+            effective_status,
+            soccer_policy_version_retain_archived_neural_snapshot(),
         );
 
         if effective_status == SOCCER_POLICY_STATUS_ACTIVE {
@@ -5797,6 +5897,7 @@ mod tests {
             target_popart: None,
             policy_head: None,
             line_depth_head: None,
+            mpc_objective_head: None,
         }
     }
 
@@ -6560,6 +6661,126 @@ mod tests {
             ),
             SOCCER_POLICY_STATUS_ACTIVE
         );
+    }
+
+    fn policy_version_metrics_with_neural_and_promotion_status(
+        promotion_status: &str,
+    ) -> Value {
+        let snapshot = tiny_neural_snapshot();
+        let base = soccer_policy_version_metrics(
+            "evolution",
+            1.0,
+            Some(&snapshot),
+            None,
+            Some(&json!({
+                "promotion": {
+                    "status": promotion_status,
+                    "gate": { "sampleGames": 12, "minSampleGames": 8 }
+                }
+            })),
+        )
+        .expect("metrics");
+        soccer_policy_version_metrics_with_retention(
+            base,
+            "aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa",
+            "bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb",
+            SOCCER_POLICY_RETENTION_BRANCH_TIP,
+            false,
+        )
+    }
+
+    #[test]
+    fn policy_version_strips_neural_snapshot_only_for_gate_archived_non_active() {
+        // Active head: blob is the live loader's authoritative neural net — always kept.
+        let active = soccer_policy_version_strip_neural_snapshot_if_archived(
+            policy_version_metrics_with_neural_and_promotion_status(SOCCER_POLICY_STATUS_ACTIVE),
+            SOCCER_POLICY_STATUS_ACTIVE,
+            false,
+        );
+        assert!(active.get("neuralNetwork").is_some());
+        assert_eq!(
+            active["learningProvenance"]["neuralNetworkSnapshotPersisted"],
+            json!(true)
+        );
+
+        // Gate-archived, non-active: unreachable by every loader, so the blob is stripped while
+        // the lightweight provenance/fitness/search fields stay intact.
+        let archived = soccer_policy_version_strip_neural_snapshot_if_archived(
+            policy_version_metrics_with_neural_and_promotion_status(SOCCER_POLICY_STATUS_ARCHIVED),
+            SOCCER_POLICY_STATUS_ARCHIVED,
+            false,
+        );
+        assert!(archived.get("neuralNetwork").is_none());
+        assert_eq!(
+            archived["learningProvenance"]["neuralNetworkSnapshotPersisted"],
+            json!(false)
+        );
+        assert_eq!(
+            archived["postgresRetention"]["neuralSnapshotStripped"],
+            json!(true)
+        );
+        assert_eq!(archived["fitness"], json!(1.0));
+        assert_eq!(
+            archived["learningProvenance"]["searchParameters"]["promotion"]["gate"]["sampleGames"],
+            json!(12)
+        );
+
+        // Non-active but NOT gate-archived (e.g. downgraded purely by the sample floor while its
+        // promotion.status is still active): the resume / neural loaders can still select it, so
+        // the blob MUST survive.
+        let sample_floor_downgrade = soccer_policy_version_strip_neural_snapshot_if_archived(
+            policy_version_metrics_with_neural_and_promotion_status(SOCCER_POLICY_STATUS_ACTIVE),
+            SOCCER_POLICY_STATUS_ARCHIVED,
+            false,
+        );
+        assert!(sample_floor_downgrade.get("neuralNetwork").is_some());
+
+        // Operator override keeps the blob even for a gate-archived version.
+        let retained = soccer_policy_version_strip_neural_snapshot_if_archived(
+            policy_version_metrics_with_neural_and_promotion_status(SOCCER_POLICY_STATUS_ARCHIVED),
+            SOCCER_POLICY_STATUS_ARCHIVED,
+            true,
+        );
+        assert!(retained.get("neuralNetwork").is_some());
+    }
+
+    #[test]
+    fn policy_version_retains_neural_snapshot_mirrors_loader_reachability() {
+        let gate_archived =
+            policy_version_metrics_with_neural_and_promotion_status(SOCCER_POLICY_STATUS_ARCHIVED);
+        let promotion_active =
+            policy_version_metrics_with_neural_and_promotion_status(SOCCER_POLICY_STATUS_ACTIVE);
+
+        // Active head always retained.
+        assert!(soccer_policy_version_metrics_retains_neural_snapshot(
+            SOCCER_POLICY_STATUS_ACTIVE,
+            &gate_archived,
+            false
+        ));
+        // Non-active + gate-archived is the only strip case.
+        assert!(!soccer_policy_version_metrics_retains_neural_snapshot(
+            SOCCER_POLICY_STATUS_ARCHIVED,
+            &gate_archived,
+            false
+        ));
+        // Non-active but still promotable-by-metadata stays retained (loader safety).
+        assert!(soccer_policy_version_metrics_retains_neural_snapshot(
+            SOCCER_POLICY_STATUS_ARCHIVED,
+            &promotion_active,
+            false
+        ));
+        // Override always retains.
+        assert!(soccer_policy_version_metrics_retains_neural_snapshot(
+            SOCCER_POLICY_STATUS_ARCHIVED,
+            &gate_archived,
+            true
+        ));
+        // No promotion metadata (gate disabled) => not gate-archived => retained.
+        assert!(soccer_policy_version_metrics_retains_neural_snapshot(
+            SOCCER_POLICY_STATUS_ARCHIVED,
+            &json!({ "fitness": 1.0 }),
+            false
+        ));
     }
 
     #[test]
