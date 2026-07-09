@@ -34,7 +34,7 @@ The **discrete representation already exists but is constructed only in tests**:
   stub awaiting a learned/stochastic source.
 
 The decision path the wiring plugs into:
-`learned_action_for_player_with_context` ([world.rs:4366](../src/des/general/soccer/world.rs#L4366))
+`learned_action_for_player_with_context` ([world.rs:13924](../src/des/general/soccer/world.rs#L13924))
 → `neural_blended_action` ([world.rs:4689](../src/des/general/soccer/world.rs#L4689))
 → `mpc_reconciled_learned_plan_for_policy` ([world.rs:5225](../src/des/general/soccer/world.rs#L5225))
 → executed in `apply_player_intent` ([world.rs:11663](../src/des/general/soccer/world.rs#L11663)).
