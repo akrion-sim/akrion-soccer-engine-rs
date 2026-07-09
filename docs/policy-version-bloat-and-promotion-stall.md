@@ -121,6 +121,12 @@ These are env changes on the learner Deployment (`main_soccer_learning_run`,
 - The active row and the current branch tip(s) must be preserved, plus the 1 archived row referenced
   by a survivor (§2).
 
+**Measured reclaim (read-only dry-run, 2026-07-08):** stripping `neuralNetwork` from archived,
+non-tip versions (keeping the newest tip per branch and the 1 archived row referenced by a survivor)
+covers **6986 rows / ~4.2 GB of uncompressed JSON text** — i.e. essentially the whole table minus a
+handful of live rows. On-disk reclaim after `VACUUM` is a large fraction of the current 3.2 GB
+(TOAST is compressed, so the freed disk is less than the raw JSON figure but still dominant).
+
 **Recommended reclaim = strip the blob, keep the row** (preserves lineage, fitness, provenance;
 sidesteps the FK entirely; reclaims ~95% of the bytes):
 
