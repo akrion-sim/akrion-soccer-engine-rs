@@ -16065,12 +16065,14 @@ impl SoccerMatch {
         // critic (with the action-param aim features), and add a bounded bias so it is CONSIDERED — the
         // critic value can still outrank it (no forced argmax). Suppressed in forced-shot/killer-pass
         // contexts unless a threaded goal pass overrides.
+        let mut injected_forward_target: Option<usize> = None;
         if dd_soccer_enable_forward_release_root_candidate()
             && observation.visible_forward_pass_options > 0
             && observation.expected_pass_completion >= forward_release_min_completion()
             && (!goal_attack_shot_is_required(observation, role)
                 || threaded_goal_pass_can_override_forced_shot(observation, role))
         {
+            forward_release_diag_bump(ForwardReleaseStage::Eligible);
             // Best qualified forward receiver + its open value (production inline of the
             // test-only `quick_forward_pass_value_for`: same ranked-visible + forward-support path).
             let forward_targets = snapshot.ranked_visible_pass_targets(player_id, 11);
@@ -16099,18 +16101,19 @@ impl SoccerMatch {
                                 mpc_replan: None,
                             };
                             push_scored_candidate(&synthetic_trace, synthetic_plan);
-                            // The `push_scored_candidate` closure's &mut borrow releases after its last
-                            // use (the push above), so `scored_candidates` can be touched directly now.
-                            // push may drop the candidate via the executability masks, so find it by
-                            // target rather than assume it landed; bias only if present.
-                            if let Some(injected) = scored_candidates
-                                .iter_mut()
-                                .rev()
-                                .find(|c| {
-                                    c.plan.as_ref().and_then(|p| p.target_player) == Some(target_player)
-                                })
-                            {
-                                injected.score += forward_release_bias();
+                            // Bias ONLY the just-injected candidate. push appends at most one and this is
+                            // its last use, so the closure's &mut is released; if the plan landed it is the
+                            // LAST element with our exact (target, "pass1") identity. Checking last() — not
+                            // a rev-scan — avoids biasing an older same-target plan when push rejects it
+                            // (Codex review). The dedup above guarantees no other "pass1" to this target.
+                            if let Some(last) = scored_candidates.last_mut() {
+                                if last.plan.as_ref().map_or(false, |p| {
+                                    p.target_player == Some(target_player) && p.action == "pass1"
+                                }) {
+                                    last.score += forward_release_bias();
+                                    injected_forward_target = Some(target_player);
+                                    forward_release_diag_bump(ForwardReleaseStage::Pushed);
+                                }
                             }
                         }
                     }
@@ -16118,6 +16121,16 @@ impl SoccerMatch {
             }
         }
         Self::apply_neural_mcts_pass_like_margin_gate_for_blend(blend, &mut scored_candidates);
+        if let Some(target_player) = injected_forward_target {
+            // Did the injected forward pass survive the pass-like margin gate (default 0.55)? This is
+            // exactly where a too-small bias silently prunes the treatment into inertness (Codex).
+            if scored_candidates
+                .iter()
+                .any(|c| c.plan.as_ref().and_then(|p| p.target_player) == Some(target_player))
+            {
+                forward_release_diag_bump(ForwardReleaseStage::SurvivedMarginGate);
+            }
+        }
         scored_candidates.sort_by(|a, b| {
             b.score
                 .total_cmp(&a.score)
