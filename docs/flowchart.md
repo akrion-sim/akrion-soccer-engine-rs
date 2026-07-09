@@ -91,8 +91,8 @@ flowchart LR
     end
 
     subgraph OUTER["OUTER LOOP · evolution (slow, gradient-free)"]
-        POP["Population (pop 16)"]
-        GA["GA self-play — every 5 games<br/>mutate / crossover / elite"]
+        POP["Population (pop 6, max 16)"]
+        GA["GA self-play — every 10 games<br/>mutate / crossover / elite"]
         TOUR["Tournament farm<br/>main_soccer_tournament_run<br/>bracket selection"]
         POP --> GA --> TOUR --> POP
     end
