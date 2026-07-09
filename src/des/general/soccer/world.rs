@@ -1723,6 +1723,14 @@ pub struct SoccerMatch {
     /// player's previous MDP state, belief summary, chosen action, action target, and MPC
     /// reconciliation summary without depending on transient `WorldSnapshot` instances.
     pub(crate) player_tick_carryover: HashMap<usize, SoccerPlayerTickCarryover>,
+    /// Cached DP value-iterated abstract-state table, populated by
+    /// [`apply_full_game_learning_if_ready`] when the
+    /// `DD_SOCCER_ENABLE_DP_CRITIC_TARGET` gate is on. `(V, ball_x_max, ball_y_max)`.
+    /// Consumed by [`neural_training_samples_filtered`] to bootstrap the critic target
+    /// from `V_DP(b')` instead of the tabular Q's `best_value_hierarchical(next)`.
+    /// `None` when the gate is off or before end-of-game — the existing tabular path
+    /// runs unchanged.
+    pub(crate) dp_value_table: Option<(BTreeMap<u32, f64>, usize, usize)>,
 }
 
 /// A just-completed dispossession, retained only long enough to suppress an
@@ -2477,6 +2485,20 @@ fn dd_soccer_enable_mc_critic_target() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_MC_CRITIC_TARGET"))
+}
+
+/// Gate for the **DP-bootstrapped critic target**. When ON, the neural critic
+/// target uses `V_DP(b(s'))` (the value-iterated abstract-state table) instead
+/// of the tabular Q's `best_value_hierarchical(next)`, breaking the dependency
+/// chain that caps the critic at the tabular Q's ceiling. The DP table is
+/// computed from the raw episode transitions after deferred reward credits,
+/// stored on [`SoccerMatch::dp_value_table`], and consumed by
+/// [`SoccerMatch::neural_training_samples_filtered`]. OFF (default) — the
+/// existing tabular Q bootstrap path runs byte-identical.
+fn dd_soccer_enable_dp_critic_target() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_DP_CRITIC_TARGET"))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -11909,6 +11931,7 @@ impl SoccerMatch {
             mpc_reconcile_stats: SoccerMpcReconcileStats::default(),
             opponent_press_belief: HashMap::new(),
             player_tick_carryover: HashMap::new(),
+            dp_value_table: None,
         };
         let center = Vec2::new(
             config.field_width_yards * 0.5,
@@ -18332,33 +18355,56 @@ impl SoccerMatch {
                     adjusted_reward += novelty_coef / ((1 + count) as f64).sqrt();
                 }
                 let next_state = SoccerQStateKey::from_next_transition(transition);
-                let (gamma, tabular_max_next) = self
-                    .team_policies
-                    .as_ref()
-                    .map(|policies| {
-                        let policy = policies.policy(transition.team);
-                        (
-                            soccer_q_sanitized_gamma(policy.options.gamma),
-                            if transition.done {
-                                0.0
-                            } else {
-                                policy.best_value_hierarchical(&next_state).unwrap_or(0.0)
-                            },
-                        )
-                    })
-                    .or_else(|| {
-                        self.learned_policy.as_ref().map(|policy| {
-                            (
-                                soccer_q_sanitized_gamma(policy.options.gamma),
-                                if transition.done {
-                                    0.0
-                                } else {
-                                    policy.best_value_hierarchical(&next_state).unwrap_or(0.0)
-                                },
-                            )
-                        })
-                    })
-                    .unwrap_or((SoccerQPolicyOptions::default().gamma, 0.0));
+                let (gamma, tabular_max_next) =
+                    if dd_soccer_enable_dp_critic_target()
+                        && !transition.done
+                        && self.dp_value_table.is_some()
+                    {
+                        // DP-bootstrapped critic target: use V_DP(b(s')) instead of the
+                        // tabular Q's best_value_hierarchical(next). This breaks the
+                        // dependency chain that would otherwise cap the neural critic at
+                        // the tabular Q's ceiling. V_DP is computed from raw transitions
+                        // (after deferred credits, before the replay blend) via
+                        // value iteration over the 486-bucket abstract MCD state.
+                        let (dp_table, bx, by) = self.dp_value_table.as_ref().unwrap();
+                        let next_bucket = soccer_dp_state_bucket(
+                            &transition.next_state,
+                            transition.team,
+                            *bx,
+                            *by,
+                        );
+                        let dp_v = dp_table.get(&next_bucket).copied().unwrap_or(0.0);
+                        (SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK, dp_v)
+                    } else {
+                        self.team_policies
+                            .as_ref()
+                            .map(|policies| {
+                                let policy = policies.policy(transition.team);
+                                (
+                                    soccer_q_sanitized_gamma(policy.options.gamma),
+                                    if transition.done {
+                                        0.0
+                                    } else {
+                                        policy.best_value_hierarchical(&next_state).unwrap_or(0.0)
+                                    },
+                                )
+                            })
+                            .or_else(|| {
+                                self.learned_policy.as_ref().map(|policy| {
+                                    (
+                                        soccer_q_sanitized_gamma(policy.options.gamma),
+                                        if transition.done {
+                                            0.0
+                                        } else {
+                                            policy
+                                                .best_value_hierarchical(&next_state)
+                                                .unwrap_or(0.0)
+                                        },
+                                    )
+                                })
+                            })
+                            .unwrap_or((SoccerQPolicyOptions::default().gamma, 0.0))
+                    };
                 let successor = successor_indices.get(transition_index).and_then(|index| {
                     index.and_then(|successor_index| transitions.get(successor_index))
                 });
@@ -19369,6 +19415,48 @@ impl SoccerMatch {
         // tick) onto the episode transitions BEFORE the replay blend, so the pass/shot decision that
         // earned the outcome is credited. No-op unless the deferred gate is on.
         self.apply_deferred_reward_credits();
+        // Cache the DP value-iterated abstract-state table for the critic target
+        // (gate ON). Computed from the RAW episode transitions (after deferred
+        // credits but before the full-game replay blend flattens the rewards), so
+        // V_DP(b) is independent of the tabular Q and the processed replay.
+        if dd_soccer_enable_dp_critic_target() && !self.episode_learning_transitions.is_empty() {
+            let gamma = SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK;
+            let sweeps = dd_soccer_dp_bootstrap_sweeps();
+            let mut ball_x_max = 0usize;
+            let mut ball_y_max = 0usize;
+            for t in &self.episode_learning_transitions {
+                ball_x_max = ball_x_max.max(t.state.ball_zone_x);
+                ball_y_max = ball_y_max.max(t.state.ball_zone_y);
+            }
+            let team_index = |team: Team| -> usize { match team { Team::Home => 0, Team::Away => 1 } };
+            let mut by_tick: BTreeMap<u64, [(f64, usize, u32); 2]> = BTreeMap::new();
+            for t in &self.episode_learning_transitions {
+                let bucket = soccer_dp_state_bucket(&t.state, t.team, ball_x_max, ball_y_max);
+                let slot = &mut by_tick.entry(t.tick).or_insert([(0.0, 0, 0); 2])[team_index(t.team)];
+                slot.0 += finite_metric(t.reward);
+                slot.1 += 1;
+                slot.2 = bucket;
+            }
+            let mut seq: [Vec<(u64, f64, u32)>; 2] = [Vec::new(), Vec::new()];
+            for (tick, slots) in &by_tick {
+                for (ti, slot) in slots.iter().enumerate() {
+                    let (sum, count, bucket) = *slot;
+                    if count > 0 {
+                        seq[ti].push((*tick, sum / count as f64, bucket));
+                    }
+                }
+            }
+            let mut samples: Vec<(u32, f64, Option<u32>)> = Vec::new();
+            for s in &seq {
+                for i in 0..s.len() {
+                    samples.push((s[i].2, s[i].1, s.get(i + 1).map(|n| n.2)));
+                }
+            }
+            let value = soccer_dp_value_iteration(&samples, gamma, sweeps);
+            self.dp_value_table = Some((value, ball_x_max, ball_y_max));
+        } else {
+            self.dp_value_table = None;
+        }
         // Terminal won-game reward (the "long" rung): label every transition with the
         // realised result when the gate is on. Off ⇒ `None`, byte-identical replay.
         let match_outcome = match_outcome_reward_enabled().then(|| {
