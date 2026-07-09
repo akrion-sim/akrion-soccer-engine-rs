@@ -40851,6 +40851,7 @@ impl SoccerPolicyHead {
                 .collect(),
             training_steps: 0,
             last_loss: None,
+            forward_select_logit_weight: 0.0,
         }
     }
 
