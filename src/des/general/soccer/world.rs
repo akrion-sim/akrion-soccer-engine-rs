@@ -15966,25 +15966,188 @@ impl SoccerMatch {
                 .then_with(|| a.label.cmp(&b.label))
         });
         let rank_draw = self.policy_rank_selection_draw(snapshot, player_id, rank_salt);
-        if let Some(mcts_label) =
-            Self::neural_mcts_action_from_candidates(blend, &scored_candidates, rank_draw)
+        // Logically identical to the original early-return cascade (mcts → [authoritative:
+        // dp-safety → technical → top] | weighted); rebound so the forward-pass measurement
+        // trace can observe the final pick before returning. No behaviour change.
+        let choice = Self::neural_mcts_action_from_candidates(blend, &scored_candidates, rank_draw)
+            .or_else(|| {
+                if blend.mode == SoccerNeuralBlendMode::Authoritative {
+                    Self::neural_authoritative_dp_safety_choice(&scored_candidates, &legal)
+                        .or_else(|| {
+                            Self::technical_scored_candidate_floor_choice(
+                                &scored_candidates,
+                                rank_draw,
+                            )
+                        })
+                        .or_else(|| Self::top_scored_candidate_choice(&scored_candidates))
+                } else {
+                    Self::weighted_scored_candidate_choice(&scored_candidates, rank_draw)
+                }
+            });
+        self.maybe_emit_fwd_trace(
+            snapshot,
+            player_id,
+            team,
+            observation,
+            &legal,
+            &scored_candidates,
+            blend,
+            choice.as_ref(),
+        );
+        choice
+    }
+
+    /// Cached `DD_SOCCER_FWD_TRACE` output path (measurement-only trace sink).
+    /// `None` (unset / empty) ⇒ the forward-pass trace is a no-op / byte-identical.
+    fn soccer_fwd_trace_path() -> Option<&'static str> {
+        static PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        PATH.get_or_init(|| {
+            std::env::var("DD_SOCCER_FWD_TRACE")
+                .ok()
+                .filter(|value| !value.is_empty())
+        })
+        .as_deref()
+    }
+
+    /// True iff this candidate is a pass-family action whose plan target is a
+    /// *forward* ball (measurement helper for [`maybe_emit_fwd_trace`]).
+    fn soccer_candidate_is_forward_pass(
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        team: Team,
+        candidate: &SoccerNeuralMctsCandidate,
+    ) -> bool {
+        if pass_like_action_flight(&candidate.label).is_none() {
+            return false;
+        }
+        let Some(origin) = snapshot.player_position(player_id) else {
+            return false;
+        };
+        let Some(plan) = candidate.plan.as_ref() else {
+            return false;
+        };
+        let Some(target) = plan
+            .target_point
+            .or_else(|| plan.target_player.and_then(|id| snapshot.player_position(id)))
+        else {
+            return false;
+        };
+        matches!(
+            pass_direction_bucket(team, origin, target),
+            PassDirectionBucket::Forward
+        )
+    }
+
+    /// Measurement-only forward-pass exposure / selection trace (default-OFF).
+    /// One JSONL row per on-ball neural decision when `DD_SOCCER_FWD_TRACE` holds a
+    /// path; a no-op otherwise. Answers the r23/FP "candidate-exposure vs selection
+    /// vs credit" fork: `e_scored`/`e_root` = does a forward-pass candidate survive
+    /// scoring / reach the MCTS root; `s_net_changed` = the net moved the pick off
+    /// the tabular argmax; `pick_is_fwd` = the net selected a forward pass;
+    /// `qualifies` = has-ball with a real visible forward option (the denominator).
+    fn maybe_emit_fwd_trace(
+        &self,
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        team: Team,
+        observation: &SoccerPomdpObservation,
+        legal: &[SoccerLearnedActionTrace],
+        scored_candidates: &[SoccerNeuralMctsCandidate],
+        blend: SoccerNeuralBlendConfig,
+        choice: Option<&SoccerPolicyActionChoice>,
+    ) {
+        use std::io::Write;
+        let Some(path) = Self::soccer_fwd_trace_path() else {
+            return;
+        };
+        // On-ball decisions only (the forward-pass denominator is has-ball).
+        if !observation.has_ball {
+            return;
+        }
+        let vis_fwd = observation.visible_forward_pass_options;
+        let quality = observation.best_forward_pass_option_quality;
+        let exp_compl = observation.expected_pass_completion;
+        let qualifies = vis_fwd > 0 && quality >= 0.50 && exp_compl >= 0.45;
+
+        let n_scored = scored_candidates.len();
+        let n_fwd_scored = scored_candidates
+            .iter()
+            .filter(|candidate| {
+                Self::soccer_candidate_is_forward_pass(snapshot, player_id, team, candidate)
+            })
+            .count();
+        let e_scored = n_fwd_scored > 0;
+        let fwd_best_rank = scored_candidates
+            .iter()
+            .position(|candidate| {
+                Self::soccer_candidate_is_forward_pass(snapshot, player_id, team, candidate)
+            })
+            .map(|rank| rank as i64)
+            .unwrap_or(-1);
+
+        // E_root: does a forward pass survive into the natural top-K MCTS root set
+        // (pre family-floor rescue — so this reads whether forward passes rank high
+        // enough on their own merit).
+        let root_cap = blend.sanitized_mcts_candidates().min(n_scored);
+        let e_root = if blend.mcts_enabled && root_cap >= 2 {
+            Self::neural_mcts_root_candidates(scored_candidates, root_cap)
+                .iter()
+                .any(|candidate| {
+                    Self::soccer_candidate_is_forward_pass(snapshot, player_id, team, candidate)
+                })
+        } else {
+            fwd_best_rank >= 0 && (fwd_best_rank as usize) < root_cap.max(1)
+        };
+
+        let tabular_argmax = legal
+            .iter()
+            .max_by(|a, b| a.value.total_cmp(&b.value))
+            .map(|action| normalize_soccer_action_label(&action.label).to_string());
+        let pick = choice.map(|choice| normalize_soccer_action_label(&choice.label).to_string());
+        let s_net_changed = matches!((&tabular_argmax, &pick), (Some(t), Some(p)) if t != p);
+        let label_is_fwd = |label: &str| -> bool {
+            scored_candidates
+                .iter()
+                .find(|candidate| normalize_soccer_action_label(&candidate.label) == label)
+                .map(|candidate| {
+                    Self::soccer_candidate_is_forward_pass(snapshot, player_id, team, candidate)
+                })
+                .unwrap_or(false)
+        };
+        let pick_is_fwd = pick.as_deref().map(label_is_fwd).unwrap_or(false);
+        let tabular_argmax_is_fwd = tabular_argmax.as_deref().map(label_is_fwd).unwrap_or(false);
+
+        let team_label = match team {
+            Team::Home => "home",
+            Team::Away => "away",
+        };
+        let line = format!(
+            "{{\"tick\":{},\"player\":{},\"team\":\"{}\",\"vis_fwd\":{},\"quality\":{:.4},\"exp_compl\":{:.4},\"qualifies\":{},\"n_scored\":{},\"n_fwd_scored\":{},\"e_scored\":{},\"e_root\":{},\"fwd_best_rank\":{},\"root_cap\":{},\"s_net_changed\":{},\"pick_is_fwd\":{},\"tabular_argmax_is_fwd\":{},\"mcts_enabled\":{}}}",
+            snapshot.tick,
+            player_id,
+            team_label,
+            vis_fwd,
+            quality,
+            exp_compl,
+            qualifies,
+            n_scored,
+            n_fwd_scored,
+            e_scored,
+            e_root,
+            fwd_best_rank,
+            root_cap,
+            s_net_changed,
+            pick_is_fwd,
+            tabular_argmax_is_fwd,
+            blend.mcts_enabled,
+        );
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
         {
-            return Some(mcts_label);
+            let _ = writeln!(file, "{}", line);
         }
-        if blend.mode == SoccerNeuralBlendMode::Authoritative {
-            if let Some(dp_safe_choice) =
-                Self::neural_authoritative_dp_safety_choice(&scored_candidates, &legal)
-            {
-                return Some(dp_safe_choice);
-            }
-            if let Some(technical_choice) =
-                Self::technical_scored_candidate_floor_choice(&scored_candidates, rank_draw)
-            {
-                return Some(technical_choice);
-            }
-            return Self::top_scored_candidate_choice(&scored_candidates);
-        }
-        Self::weighted_scored_candidate_choice(&scored_candidates, rank_draw)
     }
 
     /// Per-team value-head forward-intent for this tick: for each outfield player,
