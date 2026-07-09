@@ -16122,12 +16122,25 @@ impl SoccerMatch {
                 } else {
                     0.0
                 };
+                // Learned FORWARD action-selection bias: add `weight * forward_option_quality` only
+                // when this candidate is a pass-like action whose target is geometrically FORWARD
+                // (NOT gated on the label — lateral/backward passes share the "pass" label). The
+                // weight is 0.0 on the default (gate-off / cold) path, so `forward_select_bonus` is
+                // 0 and `score` is byte-identical.
+                let forward_select_bonus = if forward_select_weight != 0.0
+                    && soccer_transition_forward_pass_selection_eligible(&transition)
+                {
+                    forward_select_weight * forward_select_feature
+                } else {
+                    0.0
+                };
                 let score = value_score
                     + actor_bonus
                     + dp_policy_bonus
                     + retrieved_bonus
                     + model_bonus
-                    + mpc_candidate_bonus;
+                    + mpc_candidate_bonus
+                    + forward_select_bonus;
                 if !score.is_finite() {
                     return;
                 }
