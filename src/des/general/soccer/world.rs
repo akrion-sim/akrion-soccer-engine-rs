@@ -11623,6 +11623,7 @@ impl SoccerMatch {
             pass_completion_head: None,
             mpc_objective_samples: Vec::new(),
             mpc_objective_head: None,
+            dribble_mpc_objective: None,
             line_depth_head: None,
             line_depth_samples: Vec::new(),
             pending_line_depth: Vec::new(),
