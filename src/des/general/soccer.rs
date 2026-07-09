@@ -22258,6 +22258,17 @@ pub(crate) fn dd_soccer_enable_target_standardization() -> bool {
     *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_TARGET_STANDARDIZATION"))
 }
 
+/// Append-only structured action-parameter feature block (priority-1 Part A): fills the
+/// 7 tail slots with the candidate action's aim geometry (target dx/dy vs the ball, aim
+/// distance, attack-relative forward-ness, aim direction sin/cos, has-target) so the value
+/// head can generalize over similar kick targets instead of memorizing the opaque action
+/// hash. OFF (default) ⇒ the slots stay 0.0 ⇒ byte-identical; pre-block nets zero-pad.
+pub(crate) fn dd_soccer_enable_action_param_features() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_ACTION_PARAM_FEATURES"))
+}
+
 /// Env override for the neural-blend **candidate cap** — how many top tabular candidates the value
 /// net re-ranks per decision (the "action interface"). The default (4) bottlenecks even a perfectly
 /// un-collapsed value head to 4 tabular-selected actions, so it can match but not exceed a strong
