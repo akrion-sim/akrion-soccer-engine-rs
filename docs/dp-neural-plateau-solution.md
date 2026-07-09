@@ -108,6 +108,8 @@ The local training setup should keep these active:
 - DP-bootstrapped replay returns for the climb stack:
   `DD_SOCCER_ENABLE_DP_BOOTSTRAP=1`, `DD_SOCCER_DP_BOOTSTRAP_HORIZON=64`, and
   `DD_SOCCER_DP_BOOTSTRAP_SWEEPS=200`;
+- bounded DP/Q policy prior in authoritative neural scoring:
+  `SOCCER_APPROX_DP_POLICY_PRIOR_WEIGHT=0.5`;
 - neural world model, with neural MCTS optional/non-primary;
 - local MPC with field-aware, reconcile, and latent-objective gates;
 - guarded snapshot propagation, so newest weights are used only when they are

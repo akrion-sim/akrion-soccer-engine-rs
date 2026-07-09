@@ -109,10 +109,8 @@ spec:
               require_value DD_SOCCER_DP_BOOTSTRAP_HORIZON 64
               require_value DD_SOCCER_DP_BOOTSTRAP_SWEEPS 200
               require_value SOCCER_APPROX_DP_REPLAY_PASSES 8
+              require_value SOCCER_APPROX_DP_POLICY_PRIOR_WEIGHT 0.5
               require_value DD_SOCCER_ENABLE_MC_CRITIC_TARGET true
-              require_value DD_SOCCER_ENABLE_DP_BOOTSTRAP true
-              require_value DD_SOCCER_DP_BOOTSTRAP_HORIZON 64
-              require_value DD_SOCCER_DP_BOOTSTRAP_SWEEPS 200
               require_value DD_SOCCER_ENABLE_NEURAL_SELF_BOOTSTRAP true
               require_value DD_SOCCER_ENABLE_MAXA_BOOTSTRAP true
               require_value DD_SOCCER_ENABLE_NOVELTY_BONUS true
@@ -166,10 +164,8 @@ spec:
               echo "dp_bootstrap_horizon=${DD_SOCCER_DP_BOOTSTRAP_HORIZON}"
               echo "dp_bootstrap_sweeps=${DD_SOCCER_DP_BOOTSTRAP_SWEEPS}"
               echo "approx_dp_replay_passes=${SOCCER_APPROX_DP_REPLAY_PASSES}"
+              echo "approx_dp_policy_prior_weight=${SOCCER_APPROX_DP_POLICY_PRIOR_WEIGHT}"
               echo "mc_critic_target=${DD_SOCCER_ENABLE_MC_CRITIC_TARGET}"
-              echo "dp_bootstrap=${DD_SOCCER_ENABLE_DP_BOOTSTRAP}"
-              echo "dp_bootstrap_horizon=${DD_SOCCER_DP_BOOTSTRAP_HORIZON}"
-              echo "dp_bootstrap_sweeps=${DD_SOCCER_DP_BOOTSTRAP_SWEEPS}"
               echo "neural_self_bootstrap=${DD_SOCCER_ENABLE_NEURAL_SELF_BOOTSTRAP}"
               echo "maxa_bootstrap=${DD_SOCCER_ENABLE_MAXA_BOOTSTRAP}"
               echo "novelty_bonus=${DD_SOCCER_ENABLE_NOVELTY_BONUS}"
@@ -231,7 +227,8 @@ spec:
               export DD_SOCCER_DP_BOOTSTRAP_HORIZON=64
               export DD_SOCCER_DP_BOOTSTRAP_SWEEPS=200
               export SOCCER_APPROX_DP_REPLAY_PASSES=8
-              echo "deferred_credit_stack_final discretized_kick=${DD_SOCCER_ENABLE_DISCRETIZED_KICK} chance_quality_reward=${DD_SOCCER_ENABLE_CHANCE_QUALITY_REWARD} specialist_curriculum=${DD_SOCCER_ENABLE_SPECIALIST_CURRICULUM} keeper_policy_head=${DD_SOCCER_ENABLE_KEEPER_POLICY_HEAD} skill_policy_heads=${DD_SOCCER_ENABLE_SKILL_POLICY_HEADS} target_scale=${SOCCER_NEURAL_TARGET_SCALE} target_clip=${SOCCER_NEURAL_TARGET_CLIP} target_popart=${SOCCER_NEURAL_TARGET_POPART} dp_bootstrap=${DD_SOCCER_ENABLE_DP_BOOTSTRAP} dp_horizon=${DD_SOCCER_DP_BOOTSTRAP_HORIZON} dp_sweeps=${DD_SOCCER_DP_BOOTSTRAP_SWEEPS} approx_dp_replay_passes=${SOCCER_APPROX_DP_REPLAY_PASSES}"
+              export SOCCER_APPROX_DP_POLICY_PRIOR_WEIGHT=0.5
+              echo "deferred_credit_stack_final discretized_kick=${DD_SOCCER_ENABLE_DISCRETIZED_KICK} chance_quality_reward=${DD_SOCCER_ENABLE_CHANCE_QUALITY_REWARD} specialist_curriculum=${DD_SOCCER_ENABLE_SPECIALIST_CURRICULUM} keeper_policy_head=${DD_SOCCER_ENABLE_KEEPER_POLICY_HEAD} skill_policy_heads=${DD_SOCCER_ENABLE_SKILL_POLICY_HEADS} target_scale=${SOCCER_NEURAL_TARGET_SCALE} target_clip=${SOCCER_NEURAL_TARGET_CLIP} target_popart=${SOCCER_NEURAL_TARGET_POPART} dp_bootstrap=${DD_SOCCER_ENABLE_DP_BOOTSTRAP} dp_horizon=${DD_SOCCER_DP_BOOTSTRAP_HORIZON} dp_sweeps=${DD_SOCCER_DP_BOOTSTRAP_SWEEPS} approx_dp_replay_passes=${SOCCER_APPROX_DP_REPLAY_PASSES} approx_dp_policy_prior_weight=${SOCCER_APPROX_DP_POLICY_PRIOR_WEIGHT}"
               actual_commit="$(git rev-parse HEAD)"
               engine_commit="$(git -C "${engine}" rev-parse HEAD)"
               echo "source_commit_actual=${actual_commit}"
@@ -360,6 +357,8 @@ spec:
               value: "200"
             - name: SOCCER_APPROX_DP_REPLAY_PASSES
               value: "8"
+            - name: SOCCER_APPROX_DP_POLICY_PRIOR_WEIGHT
+              value: "0.5"
             - name: SOCCER_NEURAL_SNAPSHOT_EVERY_BATCHES
               value: "8"
             - name: SOCCER_NEURAL_DRAIN_TIMEOUT_MS
@@ -466,6 +465,8 @@ spec:
               value: "64"
             - name: DD_SOCCER_DP_BOOTSTRAP_SWEEPS
               value: "200"
+            - name: SOCCER_APPROX_DP_POLICY_PRIOR_WEIGHT
+              value: "0.5"
             - name: DD_SOCCER_ENABLE_NEURAL_SELF_BOOTSTRAP
               value: "true"
             - name: DD_SOCCER_ENABLE_MAXA_BOOTSTRAP
