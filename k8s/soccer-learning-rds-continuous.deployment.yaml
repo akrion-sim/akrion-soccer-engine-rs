@@ -103,12 +103,27 @@ spec:
               require_value DD_SOCCER_ENABLE_NEURAL_PASS_SPACE true
               require_value DD_SOCCER_ENABLE_DISCRETIZED_KICK true
               require_value DD_SOCCER_ENABLE_SCORED_SHOT_PLACEMENT true
+              require_value DD_SOCCER_ENABLE_TARGET_STANDARDIZATION true
+              require_value DD_SOCCER_ENABLE_MC_CRITIC_TARGET true
+              require_value DD_SOCCER_ENABLE_NEURAL_SELF_BOOTSTRAP true
+              require_value DD_SOCCER_ENABLE_MAXA_BOOTSTRAP true
+              require_value DD_SOCCER_ENABLE_NOVELTY_BONUS true
+              require_value DD_SOCCER_FORWARD_PASS_CLIMB_CURRICULUM true
+              require_value SOCCER_NEURAL_ACTOR_CRITIC true
+              require_value SOCCER_ENABLE_ACTOR_CRITIC true
+              require_value SOCCER_NEURAL_LP_COUPLING_ENABLED true
               require_value DD_SOCCER_FORWARD_PASS_REWARD_SCALE 6
               require_value DD_SOCCER_SHOT_SHAPING_REWARD_SCALE 0.4
               require_value SOCCER_EVAL_REQUIRE_FORWARD_PASS_CLIMB true
               require_value SOCCER_EVAL_MIN_FORWARD_PASS_MARGIN 0
               require_value SOCCER_EVAL_MIN_NET_FORWARD_PASS_MARGIN 0
               require_value SOCCER_EVAL_MIN_FORWARD_PASS_RATE_MARGIN 0.0
+              require_value SOCCER_NEURAL_POPULATION_REQUIRE_FORWARD_PASS_CLIMB true
+              require_value SOCCER_NEURAL_POPULATION_MIN_FORWARD_PASS_MARGIN 0
+              require_value SOCCER_NEURAL_POPULATION_MIN_NET_FORWARD_PASS_MARGIN 0
+              require_value SOCCER_NEURAL_POPULATION_MIN_FORWARD_PASS_RATE_MARGIN 0.0
+              require_value SOCCER_LEARNING_ANALYTIC_OPPONENT true
+              require_value SOCCER_ANCHOR_PROMOTION_GATE_ENABLED true
 
               echo "continuous_started_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
               echo "postgres_required=${SOCCER_REQUIRE_POSTGRES}"
@@ -126,12 +141,27 @@ spec:
               echo "neural_pass_space=${DD_SOCCER_ENABLE_NEURAL_PASS_SPACE}"
               echo "discretized_kick=${DD_SOCCER_ENABLE_DISCRETIZED_KICK}"
               echo "scored_shot_placement=${DD_SOCCER_ENABLE_SCORED_SHOT_PLACEMENT}"
+              echo "target_standardization=${DD_SOCCER_ENABLE_TARGET_STANDARDIZATION}"
+              echo "mc_critic_target=${DD_SOCCER_ENABLE_MC_CRITIC_TARGET}"
+              echo "neural_self_bootstrap=${DD_SOCCER_ENABLE_NEURAL_SELF_BOOTSTRAP}"
+              echo "maxa_bootstrap=${DD_SOCCER_ENABLE_MAXA_BOOTSTRAP}"
+              echo "novelty_bonus=${DD_SOCCER_ENABLE_NOVELTY_BONUS}"
+              echo "forward_pass_climb_curriculum=${DD_SOCCER_FORWARD_PASS_CLIMB_CURRICULUM}"
+              echo "actor_critic=${SOCCER_NEURAL_ACTOR_CRITIC}"
+              echo "actor_critic_legacy=${SOCCER_ENABLE_ACTOR_CRITIC}"
+              echo "lp_coupling=${SOCCER_NEURAL_LP_COUPLING_ENABLED}"
               echo "forward_pass_reward_scale=${DD_SOCCER_FORWARD_PASS_REWARD_SCALE}"
               echo "shot_shaping_reward_scale=${DD_SOCCER_SHOT_SHAPING_REWARD_SCALE}"
               echo "eval_forward_pass_climb=${SOCCER_EVAL_REQUIRE_FORWARD_PASS_CLIMB}"
               echo "eval_forward_pass_margin=${SOCCER_EVAL_MIN_FORWARD_PASS_MARGIN}"
               echo "eval_net_forward_pass_margin=${SOCCER_EVAL_MIN_NET_FORWARD_PASS_MARGIN}"
               echo "eval_forward_pass_rate_margin=${SOCCER_EVAL_MIN_FORWARD_PASS_RATE_MARGIN}"
+              echo "population_forward_pass_climb=${SOCCER_NEURAL_POPULATION_REQUIRE_FORWARD_PASS_CLIMB}"
+              echo "population_forward_pass_margin=${SOCCER_NEURAL_POPULATION_MIN_FORWARD_PASS_MARGIN}"
+              echo "population_net_forward_pass_margin=${SOCCER_NEURAL_POPULATION_MIN_NET_FORWARD_PASS_MARGIN}"
+              echo "population_forward_pass_rate_margin=${SOCCER_NEURAL_POPULATION_MIN_FORWARD_PASS_RATE_MARGIN}"
+              echo "learning_analytic_opponent=${SOCCER_LEARNING_ANALYTIC_OPPONENT}"
+              echo "anchor_promotion_gate=${SOCCER_ANCHOR_PROMOTION_GATE_ENABLED}"
               echo "source_ref=${source_ref}"
               echo "engine_ref=${engine_ref}"
 
@@ -357,6 +387,24 @@ spec:
               value: "true"
             - name: DD_SOCCER_ENABLE_SCORED_SHOT_PLACEMENT
               value: "true"
+            - name: DD_SOCCER_ENABLE_TARGET_STANDARDIZATION
+              value: "true"
+            - name: DD_SOCCER_ENABLE_MC_CRITIC_TARGET
+              value: "true"
+            - name: DD_SOCCER_ENABLE_NEURAL_SELF_BOOTSTRAP
+              value: "true"
+            - name: DD_SOCCER_ENABLE_MAXA_BOOTSTRAP
+              value: "true"
+            - name: DD_SOCCER_ENABLE_NOVELTY_BONUS
+              value: "true"
+            - name: DD_SOCCER_FORWARD_PASS_CLIMB_CURRICULUM
+              value: "true"
+            - name: SOCCER_NEURAL_ACTOR_CRITIC
+              value: "true"
+            - name: SOCCER_ENABLE_ACTOR_CRITIC
+              value: "true"
+            - name: SOCCER_NEURAL_LP_COUPLING_ENABLED
+              value: "true"
             - name: DD_SOCCER_FORWARD_PASS_REWARD_SCALE
               value: "6"
             - name: DD_SOCCER_SHOT_SHAPING_REWARD_SCALE
@@ -369,6 +417,18 @@ spec:
               value: "0"
             - name: SOCCER_EVAL_MIN_FORWARD_PASS_RATE_MARGIN
               value: "0.0"
+            - name: SOCCER_NEURAL_POPULATION_REQUIRE_FORWARD_PASS_CLIMB
+              value: "true"
+            - name: SOCCER_NEURAL_POPULATION_MIN_FORWARD_PASS_MARGIN
+              value: "0"
+            - name: SOCCER_NEURAL_POPULATION_MIN_NET_FORWARD_PASS_MARGIN
+              value: "0"
+            - name: SOCCER_NEURAL_POPULATION_MIN_FORWARD_PASS_RATE_MARGIN
+              value: "0.0"
+            - name: SOCCER_LEARNING_ANALYTIC_OPPONENT
+              value: "true"
+            - name: SOCCER_ANCHOR_PROMOTION_GATE_ENABLED
+              value: "true"
             - name: SOCCER_PG_PASS_COMPLETION_SAMPLE_LIMIT
               value: "50000"
             - name: SOCCER_PG_PASS_COMPLETION_EPOCHS

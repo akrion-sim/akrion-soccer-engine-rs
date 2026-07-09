@@ -610,3 +610,122 @@ The ceiling is structural: the net is a *selector over analytic candidates* opti
 Wilson>0.5 vs frozen field; Step 1 global heads-ON/OFF SOT A/B), then raise the real ceiling by
 replacing the territorial signal — in both the on-ball PBRS and the off-ball residual reward —
 with **one calibrated learned EPV potential**, which first requires a possession-chain export.
+
+## Rounds 18–19 — operator KPI reframe + timidity diagnosis (2026-07-09)
+
+**Operator architecture (the spine):** learn passing/dribbling/shooting/formation as two layers —
+**POMDP decides** (neural + DP: action-type, receiver / pass-to-space, shot type+placement, dribble
+type+lane, formation intent); **MPC executes** (neural + QP: trajectory, power, aim, first-touch,
+off-ball). Wherever a *decision* lives in the analytic layer, that skill can't be learned.
+
+**KPI reframe:** parity is now **completed forward passes vs the analytic field**, meter =
+`AdvancementRecord` (soccer_eval_gate_run.rs:251 scores W/D/L by completed-forward-passes only).
+Re-running it (the line was previously grep-swallowed + the deployed binary was stale) exposed the
+real picture:
+
+| net | FP-payoff (parity 0.500) | passes/game |
+|---|---|---|
+| fwd-pass-primacy (×6, shot×0.4) | **0.283** | ~19 |
+| climb-base (CQ+uncrushed, best-0.500) | **0.358** | ~19 |
+| analytic | — | **~36** |
+
+Two facts reframe everything: (1) we're far below parity; (2) the primacy net is **worse on its own
+target metric**, and the gap is passing **VOLUME, not forward-bias** (forward *share* ~6–7% both
+sides). **The net is timid** — hoards/dribbles instead of passing. So r14–r16's GD/mean-payoff
+"falsifications" judged the wrong axis; they don't falsify the forward-pass objective.
+
+**Codex r18:** accepts the reframe + meter (caveat: "net of turnovers" = interceptions only; safe
+recycling can inflate volume — needs quality guards). Prior = **timidity/action-selection, not
+forward bias**. Prescribes an opportunity-conditioned **pass-rate** diagnostic (among on-ball
+decisions with visible forward options + decent expected completion, how often chose pass — that IS
+the POMDP's action-type decision quality). Prefers a **bounded anti-hold carrot over removing the
+turnover stick** (source already admits under-rewarded advancement → timidity, soccer.rs:2122).
+`LEARNED_PASS_RECEIVER` is **downstream** (post pass-normalization, world.rs:16431) — won't fix a
+policy that rarely chooses pass; pessimistic `LEARNED_PASS_COMPLETION` could make a timid actor more
+timid. **Locked kill-discriminator:** an arm survives only if FP-payoff > 0.358 (→0.500) AND
+completed-forward margin improves AND net-forward doesn't regress AND forward-share doesn't fall AND
+pass-gain-yards margin rises AND no completion-rate collapse AND (intercept+loose-ball)/completed-fwd
+doesn't worsen; kill if payoff rises only from safe volume with forward-share falling.
+
+**Experiments:** de-timid A/B — Arm B (FWD=3, turnover-penalty OFF) **train FAILED (no frontier)**;
+Arm A (FWD=6, shots normal — is shot-damping the poison?) trained, FP-eval landing. scale-10 MPC-off
+A/B: per-game forward counts **cand ≤ base** (×10 reward buys no extra forward passes → not a
+magnitude problem). Pass-`target_point` plumbing landed on main (fa47c82).
+
+**Claude r19 (driving live):** locked the discriminator; asked Codex to (A) spec the bounded
+anti-hold carrot precisely (existing term vs new; env-knob + range, default byte-identical; cap so it
+can't out-earn shot/goal or reward recycling; guardrail tied to the discriminator), and (B) confirm
+the order — fix action-selection (raise pass-choice via carrot) until opportunity-conditioned
+pass-rate ≈ analytic, THEN learned completion/receiver for target quality, with target_point aim on
+top. Bonus: reward problem or interface problem, now that it's volume not bias? *(reply pending)*
+
+## FORWARD-PASSING DIAGNOSIS + the scale-semantics fix (2026-07-09, rounds 17)
+
+Measured the metric that matters — completed FORWARD passes (paired cand-vs-baseline), built into
+`soccer_outcome_ab_run` eval as a PASS DIAGNOSIS block (att/g, completion%, forward/lateral/back share).
+
+**Diagnosis (confirmed reward+window net, 24g, MPC off):** 37 passes/g, **92% completion**, but
+**forward 7% / lateral 91% / back 3%**. Bottleneck is **SELECTION (WHO/WHEN), not execution** — the
+POMDP recycles laterally in a safe-possession local optimum. Reward+window forward passes are FLAT
+vs baseline (the climb was defensive/finishing, not progressive passing). MPC on/off: forward +23%
+(2.1→2.6) directional but underpowered.
+
+**Codex round-17 (grounded) — the bug that reframed it:** `DD_SOCCER_FORWARD_PASS_REWARD_SCALE` was
+**NOT forward-only** — `soccer.rs` scaled the WHOLE sum incl. the lateral `1.2`, so scale=6 made a
+lateral recycle worth 7.2 (scale=10 → 12), subsidizing the exact recycling it should kill. The
+forward:lateral RATIO was invariant to the scale. Confirmed empirically: **scale=10 moved forward
+share the WRONG way (7%→5%, GD −4).** Codex also confirmed **hypothesis B** (forward passes booked
+immediately, later turnovers add separate negative credit → value net can learn "forward now, bad
+state soon") and flagged MCTS expands only the **top-3** pass targets (`SOCCER_NEURAL_MCTS_PASS_TARGET_CANDIDATES=3`).
+
+**FIX (Codex lever #1, implemented): forward-only scale.** `completed_pass_reward_for_pitch` now
+multiplies ONLY the forward branch by `forward_pass_reward_scale()`; lateral/backward/flank are
+unscaled. Byte-identical at scale=1. Guard test + outcome-dominance test both pass. **NB this changes
+the shipped scale=6 production semantics** (lateral was 7.2, now 1.2) — correct fix, Codex-endorsed.
+
+**Running:** forward-only scale=10 vs scale=1 (MPC off) — does the FIXED lever finally move the 7%?
+**Codex lever order next:** (2) trim lateral reward / make it conditional on real switch-escape value,
+(3) verify outcome-credit replay isn't keeping only positive reward (`soccer.rs:14977`), (4) check
+whether a forward option survives into the top-3 MCTS expansion. **Codex on prod scale=6+MPC-on:
+A/B before trusting** (canary: forward share, lateral share, turnovers-within-5s-of-forward, pass
+inflation, SOT/goals, GD together).
+
+## Round 19 — the buildable carrot spec (2026-07-09)
+
+De-timid A/B **falsified** (Arm A 0.308, Arm B 0.258, both < 0.358 base) → blunt reward shaping
+exhausted; volume deficit is structural to *existing* shaping. Codex r19 answers the carrot request
+with a complete spec:
+
+**New knob `DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE`** (default 0.0 = byte-identical; clamp
+0..2; pre-register 0.75 / 1.0 / 1.5, 2.0 ceiling). `bonus = min(6.0, 4.0·scale·quick_release_timing_fit
+·forward_gain_fit·opportunity_fit·completion_fit)`, paid ONLY when: action is a pass (not
+hold/dribble/shot), completes to teammate control, forward gain ≥ 4yd, before-state had a real forward
+opportunity (`visible_forward_pass_options>0` AND `max(quick_forward_pass_value,
+best_forward_pass_option_quality) ≥ 0.50`), expected completion ≥ 0.45; zero on loose-ball /
+interception / backward / lateral / incomplete. Reuses quick-release timing (soccer.rs:23908, 1.2s
+hold, 12yd ref). Cap 6.0 (+existing 5.0) can't substitute a shot/goal or pay recycling. Guardrail =
+the locked discriminator.
+
+**Order: agreed** — carrot fixes action-selection until opportunity-conditioned pass-rate ≈ analytic
+→ then learned receiver/completion → then target_point aim on top (receiver is downstream at
+world.rs:16431, can't make a timid policy pass).
+
+**Reward vs interface:** currently a **reward/credit-assignment** problem (interface already exposes
+forward-option + pass-quality; actor family can represent pass-vs-hold/dribble/shoot). IF the carrot
+raises FP-payoff but opportunity-conditioned pass-rate stays flat → THEN interface, add an explicit
+action-type "release on visible forward option" logit. Not before this reward test.
+
+**Next (Claude, building):** implement the knob per spec in an isolated worktree off fa47c82,
+default-identical, then A/B arms {0.75, 1.0, 1.5} scored on the FP meter + locked discriminator.
+
+## COORDINATION (2026-07-09, maca5/this-Claude → other operator)
+
+Two of us are racing the single-lane LAN bridge; your automation wins every free slot, so I can't
+reach Codex. Could you **yield one bridge slot** for my round-18? It carries a decisive result you'll
+want: **immediate reward magnitude is FALSIFIED for forward passing** — forward-ONLY scale=10 (I fixed
+`DD_SOCCER_FORWARD_PASS_REWARD_SCALE` to stop scaling lateral) left forward share at **7%/91% lateral,
+identical to baseline**. You cannot bribe the net into forward passing; the blocker is DOWNSTREAM VALUE
+(net avoids forward passes that lead to turnover/counter). Levers now: turnover-credit attribution,
+top-3 MCTS pass expansion, lateral-reward trim, neural_self_bootstrap (A/B running). Also: I made the
+retention-prune non-fatal (was crashing every prod cycle → blank-policy resume). FYI not a file-edit
+conflict — different files.

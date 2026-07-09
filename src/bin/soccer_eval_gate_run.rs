@@ -123,6 +123,9 @@ fn load_neural_snapshot(
     if let Some(neural) = neural_snapshot_from_value(value) {
         return Some(neural);
     }
+    if let Ok(neural) = serde_json::from_value::<SoccerNeuralNetworkSnapshot>(value.clone()) {
+        return Some(neural);
+    }
     let sidecar = neural_sidecar_path(path)?;
     let raw = std::fs::read_to_string(&sidecar).ok()?;
     let sidecar_value: serde_json::Value = serde_json::from_str(&raw).ok()?;
@@ -367,6 +370,30 @@ fn forward_pass_gate_reasons(
     reasons
 }
 
+fn forward_pass_sample_reasons(advancement: &AdvancementRecord, min_games: usize) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if (advancement.games() as usize) < min_games {
+        reasons.push(format!(
+            "insufficient forward-pass evidence: {} held-out games < min {}",
+            advancement.games(),
+            min_games,
+        ));
+    }
+    reasons
+}
+
+fn eval_gate_promotes(
+    require_forward_pass_climb: bool,
+    scoreline_promote: bool,
+    advancement_reasons: &[String],
+) -> bool {
+    if require_forward_pass_climb {
+        advancement_reasons.is_empty()
+    } else {
+        scoreline_promote
+    }
+}
+
 fn finite_yards(value: f64) -> f64 {
     if value.is_finite() {
         value
@@ -391,6 +418,13 @@ fn env_i32(key: &str, default: i32) -> i32 {
     std::env::var(key)
         .ok()
         .and_then(|value| value.trim().parse::<i32>().ok())
+        .unwrap_or(default)
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
         .unwrap_or(default)
 }
 
@@ -466,9 +500,17 @@ fn main() {
 
     // Candidate brain (id 0): prefer a local learned-params file (the fully-local learner's
     // accumulated policy) when SOCCER_EVAL_CANDIDATE_PATH is set; otherwise inline self-play train.
-    let candidate_brain = brain_from_env_file("SOCCER_EVAL_CANDIDATE_PATH")
-        .or_else(|| train_candidate_brain(train_games, minutes, train_seed_base))
-        .unwrap_or_else(|| TeamBrain::fresh_with_seed(0xCA11_D1DA, candidate_id));
+    let candidate_brain = if std::env::var_os("SOCCER_EVAL_CANDIDATE_PATH").is_some() {
+        brain_from_env_file("SOCCER_EVAL_CANDIDATE_PATH").unwrap_or_else(|| {
+            eprintln!(
+                "eval_candidate_load_required_failed var=SOCCER_EVAL_CANDIDATE_PATH; aborting"
+            );
+            std::process::exit(2);
+        })
+    } else {
+        train_candidate_brain(train_games, minutes, train_seed_base)
+            .unwrap_or_else(|| TeamBrain::fresh_with_seed(0xCA11_D1DA, candidate_id))
+    };
 
     // Frozen field (ids 1..pool): distinct-genome fresh brains, the incumbent +
     // diverse opponents the candidate must beat without being countered.
@@ -479,7 +521,11 @@ fn main() {
         .collect();
     // SOCCER_EVAL_BASELINE_PATH: replace the incumbent (id 1 == pool[0]) with a champion loaded
     // from a local learned-params file, making the fixtures a direct candidate-vs-champion gate.
-    if let Some(brain) = brain_from_env_file("SOCCER_EVAL_BASELINE_PATH") {
+    if std::env::var_os("SOCCER_EVAL_BASELINE_PATH").is_some() {
+        let brain = brain_from_env_file("SOCCER_EVAL_BASELINE_PATH").unwrap_or_else(|| {
+            eprintln!("eval_baseline_load_required_failed var=SOCCER_EVAL_BASELINE_PATH; aborting");
+            std::process::exit(2);
+        });
         if let Some(first) = pool.first_mut() {
             *first = brain;
             eprintln!("eval_baseline_replaced_with_champion id={baseline_id}");
@@ -621,18 +667,28 @@ fn main() {
     let min_forward_pass_margin = env_i32("SOCCER_EVAL_MIN_FORWARD_PASS_MARGIN", 0);
     let min_net_forward_pass_margin = env_i32("SOCCER_EVAL_MIN_NET_FORWARD_PASS_MARGIN", 0);
     let min_forward_pass_rate_margin = env_f64("SOCCER_EVAL_MIN_FORWARD_PASS_RATE_MARGIN", 0.0);
+    let min_forward_pass_games = env_usize("SOCCER_EVAL_MIN_FORWARD_PASS_GAMES", 8);
     let advancement_reasons = if require_forward_pass_climb {
-        forward_pass_gate_reasons(
+        let mut reasons = forward_pass_gate_reasons(
             &advancement,
             min_forward_pass_margin,
             min_net_forward_pass_margin,
             min_forward_pass_rate_margin,
-        )
+        );
+        reasons.extend(forward_pass_sample_reasons(
+            &advancement,
+            min_forward_pass_games,
+        ));
+        reasons
     } else {
         Vec::new()
     };
     let advancement_promote = !require_forward_pass_climb || advancement_reasons.is_empty();
-    let promote = verdict.promote && advancement_promote;
+    let promote = eval_gate_promotes(
+        require_forward_pass_climb,
+        verdict.promote,
+        &advancement_reasons,
+    );
 
     println!(
         "\n----- verdict ({} held-out games, {:.1}s) -----",
@@ -687,11 +743,13 @@ fn main() {
         advancement.pass_gain_yards_margin(),
     );
     if require_forward_pass_climb {
+        println!("scoreline gate: diagnostic only while forward-pass climb is required");
         println!(
-            "forward-pass gate: margin>{:+} net_margin>{:+} rate_margin>{:+.1}pp -> {}",
+            "forward-pass gate: margin>{:+} net_margin>{:+} rate_margin>{:+.1}pp min_games={} -> {}",
             min_forward_pass_margin,
             min_net_forward_pass_margin,
             min_forward_pass_rate_margin * 100.0,
+            min_forward_pass_games,
             if advancement_promote {
                 "PASS"
             } else {
@@ -700,8 +758,10 @@ fn main() {
         );
     }
     println!("\nDECISION: {}", if promote { "PROMOTE" } else { "REJECT" });
-    for reason in &verdict.reasons {
-        println!("  - {reason}");
+    if !require_forward_pass_climb {
+        for reason in &verdict.reasons {
+            println!("  - {reason}");
+        }
     }
     for reason in &advancement_reasons {
         println!("  - {reason}");
@@ -806,6 +866,20 @@ mod tests {
         assert!(
             forward_pass_gate_reasons(&record, 0, 0, 0.0).is_empty(),
             "direct forward-pass totals should pass without a fixture-WDL veto"
+        );
+    }
+
+    #[test]
+    fn forward_pass_mode_decision_ignores_scoreline_verdict() {
+        let advancement_reasons = Vec::new();
+
+        assert!(
+            eval_gate_promotes(true, false, &advancement_reasons),
+            "forward-pass mode should not let WDL/Wilson veto a clean forward-pass climb"
+        );
+        assert!(
+            !eval_gate_promotes(false, false, &advancement_reasons),
+            "scoreline verdict remains authoritative when forward-pass climb is not required"
         );
     }
 

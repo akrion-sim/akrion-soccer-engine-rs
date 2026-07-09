@@ -11,6 +11,26 @@ If a throwaway worktree is ever unavoidable, it MUST live under `tmp/worktrees/`
 worktree in the repo root or any other in-tree path: `git add -A` then stages it as an
 embedded gitlink/submodule (the `adding embedded git repository` warning). System `/tmp`
 is also fine, but `tmp/worktrees/` is the convention here.
+
+NEVER use `git stash`. It silently hides work off to the side, and when multiple agents
+(or an autosaver) touch the same tree, a stash/pop races and clobbers in-progress edits —
+a `git stash pop` landing mid-merge can drop conflict resolutions, and a background
+autosaver stashing your working tree makes any merge non-deterministic. Keep changes
+either committed on `main` or live in the working tree — never stashed. To set work aside,
+COMMIT it (a `wip:` commit is fine): durable, visible in history, and rebase/merge-safe.
+Do not add tooling that runs `git stash` (no "autosaver"). If you find a stash, reconstruct
+it into a commit and drop it; do not leave work hidden in the stash list.
+
+MERGE CONCEPTUALLY — never merely pick a side. When reconciling divergent work (branches,
+worktrees, reconstructed stashes) into `main`, integrate the IDEAS: keep every distinct
+concept from both sides. Resolve a conflict wholesale to one side ONLY after verifying that
+side is a strict superset (the other is an older snapshot, a pure reformat, or already
+contained) — and STATE that justification in the commit message. If both sides carry a real,
+different idea (e.g. two implementations of one feature, or one has a test/doc/insight the
+other lacks), COMBINE them — take the spec-faithful implementation AND the other's test and
+documentation. A blind "take theirs / take ours" without that superset check is a bug, not a
+merge.
+
 x is sideline-to-sideline (width) dimension, y is goal-to-goal (length) dimension
 MDP = markov decision process
 MPC = model predictive control

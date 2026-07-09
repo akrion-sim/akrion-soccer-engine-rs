@@ -5,3 +5,5 @@ tmp
 
 # local per-worktree cargo target dirs
 .cargo-target-*/
+
+.claude/worktrees/

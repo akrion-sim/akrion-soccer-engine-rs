@@ -2139,17 +2139,14 @@ const TEAM_ADVANCE_SUPPORT_RUN_REWARD: f64 = 0.45;
 const QUICK_RELEASE_MAX_HOLD_SECONDS: f64 = 1.2;
 const QUICK_RELEASE_FORWARD_REFERENCE_YARDS: f64 = 12.0;
 const QUICK_RELEASE_FORWARD_PASS_BONUS_POINTS: f64 = 5.0;
-// Quick-forward-release carrot (`DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE`, default-OFF). An
-// opportunity-conditioned bonus paid ONCE when a COMPLETED FORWARD PASS is credited, to reward the
-// actor for CHOOSING to release a quick forward ball when a real forward opportunity existed. Gates:
-// the completed forward gain must clear MIN_FORWARD_YARDS, the BEFORE state must have shown a genuine
-// forward opportunity clearing OPPORTUNITY_GATE, and the expected completion must clear COMPLETION_GATE.
-// The bonus is hard-capped at MAX_BONUS_POINTS so it can never rival the shot/goal reward.
+// Codex r19 opportunity-conditioned quick-forward-release carrot (gated, default-off). Targets the
+// pass-CHOICE leak: pay a bounded bonus only when a real forward opportunity existed and the actor
+// released a quickly-completed forward ball, so a timid policy is pulled toward choosing the pass.
+const QUICK_FORWARD_RELEASE_REWARD_BASE: f64 = 4.0;
+const QUICK_FORWARD_RELEASE_REWARD_CAP: f64 = 6.0;
 const QUICK_FORWARD_RELEASE_MIN_FORWARD_YARDS: f64 = 4.0;
-const QUICK_FORWARD_RELEASE_OPPORTUNITY_GATE: f64 = 0.50;
-const QUICK_FORWARD_RELEASE_COMPLETION_GATE: f64 = 0.45;
-const QUICK_FORWARD_RELEASE_BONUS_BASE_POINTS: f64 = 4.0;
-const QUICK_FORWARD_RELEASE_MAX_BONUS_POINTS: f64 = 6.0;
+const QUICK_FORWARD_RELEASE_MIN_OPPORTUNITY: f64 = 0.50;
+const QUICK_FORWARD_RELEASE_MIN_EXPECTED_COMPLETION: f64 = 0.45;
 /// Dense shaping penalty for an attacker who fails to join a live team-advance cue, retreats, or
 /// runs into an offside support lane. This mirrors the support-run reward without forcing defenders
 /// to abandon shape.
@@ -23479,6 +23476,15 @@ pub(crate) fn forward_pass_reward_scale() -> f64 {
     })
 }
 
+/// Coupled turnover scaling for the forward-pass-primacy curriculum. If completed
+/// forward-pass rewards are amplified, losing the ball must become at least as
+/// expensive; otherwise the learner can chase gross forward-pass count while the
+/// net-of-turnovers gate correctly rejects it. Never drops below 1.0 so low/zero
+/// forward-pass reward ablations do not make giveaways cheaper than baseline.
+pub(crate) fn forward_pass_turnover_penalty_scale() -> f64 {
+    forward_pass_reward_scale().max(1.0)
+}
+
 /// Companion dampener for the shot-TAKEN shaping proxy (on-/off-target reward, NOT the goal or
 /// terminal-outcome reward, which stay intact — the net must still finish). Lets a forward-pass-
 /// primacy A/B stop the net shooting early instead of building up. Env
@@ -23493,25 +23499,6 @@ pub(crate) fn shot_shaping_reward_scale() -> f64 {
             .filter(|v| v.is_finite())
             .map(|v| v.clamp(0.0, 1.0))
             .unwrap_or(1.0)
-    })
-}
-
-/// Quick-forward-release shaping (action-SELECTION fix). Rewards the actor for CHOOSING to complete
-/// a quick FORWARD pass WHEN a real forward opportunity existed — targeting the leak where the neural
-/// policy under-selects an available good forward ball. Env
-/// `DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE` (clamped 0.0..=2.0), default `0.0` ⇒ the term is
-/// identically zero, so the reward is BYTE-IDENTICAL to today when unset or set to 0 (no behavior or
-/// serialization change). See [`quick_forward_release_bonus`] for the bonus shape and its gates.
-pub(crate) fn quick_forward_release_reward_scale() -> f64 {
-    use std::sync::OnceLock;
-    static V: OnceLock<f64> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE")
-            .ok()
-            .and_then(|raw| raw.trim().parse::<f64>().ok())
-            .filter(|v| v.is_finite())
-            .map(|v| v.clamp(0.0, 2.0))
-            .unwrap_or(0.0)
     })
 }
 
@@ -23530,20 +23517,30 @@ fn completed_pass_reward_for_pitch(
         pass_direction_bucket(team, origin, target),
         pass_origin_in_own_half(team, origin, field_length),
     ) {
+        // The forward-pass-primacy scale (`DD_SOCCER_FORWARD_PASS_REWARD_SCALE`) multiplies ONLY the
+        // forward reward, so it tilts the FORWARD:lateral ratio — the thing that actually shifts
+        // selection. Previously the whole sum (incl. the lateral 1.2, backward penalty, flank bonus)
+        // was scaled, so scale=6 made a lateral recycle worth 7.2 and scale=10 worth 12 — SUBSIDIZING
+        // the safe-recycle local optimum the lever is meant to break. Empirically scale=10 moved
+        // forward share the WRONG way (7%→5%) because it lifted lateral too. Codex round-17.
+        // Byte-identical at the default scale=1.
         (PassDirectionBucket::Forward, true) => {
-            COMPLETED_FORWARD_PASS_BASE_REWARD_OWN_HALF + forward_progress_reward
+            (COMPLETED_FORWARD_PASS_BASE_REWARD_OWN_HALF + forward_progress_reward)
+                * forward_pass_reward_scale()
         }
         (PassDirectionBucket::Forward, false) => {
-            COMPLETED_FORWARD_PASS_BASE_REWARD_OPPONENT_HALF + forward_progress_reward
+            (COMPLETED_FORWARD_PASS_BASE_REWARD_OPPONENT_HALF + forward_progress_reward)
+                * forward_pass_reward_scale()
         }
         // A completed lateral ball keeps possession and may switch the attack, but generic
-        // recycle completions must not outscore working the ball into shots.
+        // recycle completions must not outscore working the ball into shots — and are NOT scaled.
         (PassDirectionBucket::Lateral, _) => 1.2,
         (PassDirectionBucket::Backward, true) => -COMPLETED_BACK_PASS_PENALTY_OWN_HALF,
         (PassDirectionBucket::Backward, false) => -COMPLETED_BACK_PASS_PENALTY_OPPONENT_HALF,
     };
-    (base + completed_flank_pass_reward(team, origin, target, field_width, field_length))
-        * forward_pass_reward_scale()
+    // Flank bonus is unscaled (it applies to forward/lateral alike, so scaling it would re-leak the
+    // lever into lateral). Forward magnitude is already scaled inside `base`.
+    base + completed_flank_pass_reward(team, origin, target, field_width, field_length)
 }
 
 fn completed_forward_pass_count_bonus(team: Team, origin: Vec2, reception: Vec2) -> f64 {
@@ -23950,85 +23947,63 @@ fn quick_release_forward_pass_reward(
     QUICK_RELEASE_FORWARD_PASS_BONUS_POINTS * speed_fraction * (0.5 + 0.5 * forward_fraction)
 }
 
-/// Opportunity-conditioned "quick forward release" carrot (knob
-/// `DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE`; see [`quick_forward_release_reward_scale`]).
-/// Paid ONCE, at the moment a COMPLETED FORWARD PASS is credited, to reward the actor for CHOOSING
-/// to release a quick forward ball when a real forward opportunity existed — the fix for the policy
-/// under-selecting an available good forward pass. The shape is
-///
-/// ```text
-/// bonus = min(6.0, 4.0 * scale * timing_fit * gain_fit * opportunity_fit * completion_fit)
-/// ```
-///
-/// where every `*_fit` is in `[0, 1]`, `0` at its gate and rising to `1` as the signal strengthens.
-/// The bonus is `0` unless ALL gates hold, so it can never subsidize safe recycling:
-///  1. the pass actually COMPLETED to a teammate and was pass-like (NOT hold/dribble/shot) — this is
-///     guaranteed structurally by the call site (only reached when a pass-like action's ball is now
-///     held by a *different teammate*), so a loose ball / interception / immediate opponent control
-///     never reaches here;
-///  2. the real completed forward gain is ≥ [`QUICK_FORWARD_RELEASE_MIN_FORWARD_YARDS`] (a backward
-///     or lateral ball has `completed_forward_yards <= 0` and pays zero);
-///  3. the BEFORE state had a real forward opportunity: `visible_forward_pass_options > 0` AND
-///     `max(quick_forward_pass_value, best_forward_pass_option_quality) >=`
-///     [`QUICK_FORWARD_RELEASE_OPPORTUNITY_GATE`];
-///  4. expected completion was sane: `>=` [`QUICK_FORWARD_RELEASE_COMPLETION_GATE`].
-///
-/// `hold_seconds` is how long the passer had possessed the ball (drives the quick-release timing fit,
-/// reusing the existing 1.2s decay). Pure / RNG-free; default `scale = 0` ⇒ identically `0`. Per-agent
-/// ⇒ also shared via the MARL/MAPPO team component, like the other completed-pass shaping terms.
+/// Scale for the opportunity-conditioned quick-forward-release carrot (Codex r19). Env
+/// `DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE` (clamped 0..2), default **0.0** ⇒ byte-identical
+/// (the whole term is a no-op unless explicitly enabled). Pre-registered A/B arms: 0.75, 1.0, 1.5.
+pub(crate) fn quick_forward_release_reward_scale() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.0, 2.0))
+            .unwrap_or(0.0)
+    })
+}
+
+/// Codex r19 carrot: bounded, opportunity-conditioned reward for a completed forward pass that was
+/// released quickly INTO a real forward opportunity. Only fires on the completed-pass path (so
+/// loose-ball / interception / immediate-opponent-control implicitly pay zero), and returns 0 unless
+/// EVERY gate holds — backward/lateral (`forward_yards < MIN`), no visible forward option, weak
+/// opportunity, or poor expected completion all yield nothing, so it cannot pay safe recycling.
+/// Capped at `QUICK_FORWARD_RELEASE_REWARD_CAP` so it can't substitute for a shot/goal. Pure/RNG-free.
 #[allow(clippy::too_many_arguments)]
-fn quick_forward_release_bonus(
-    scale: f64,
-    completed_forward_yards: f64,
+fn quick_forward_release_opportunity_reward(
+    team: Team,
+    origin: Vec2,
+    target: Vec2,
     hold_seconds: f64,
     visible_forward_pass_options: usize,
-    quick_forward_pass_value: f64,
-    best_forward_pass_option_quality: f64,
-    expected_pass_completion: f64,
+    forward_opportunity_quality: f64,
+    expected_completion: f64,
 ) -> f64 {
-    if !(scale > 0.0)
-        || !completed_forward_yards.is_finite()
+    let scale = quick_forward_release_reward_scale();
+    if scale <= 0.0 {
+        return 0.0;
+    }
+    let forward_yards = (target.y - origin.y) * team.attack_dir();
+    if forward_yards < QUICK_FORWARD_RELEASE_MIN_FORWARD_YARDS
+        || visible_forward_pass_options == 0
+        || forward_opportunity_quality < QUICK_FORWARD_RELEASE_MIN_OPPORTUNITY
+        || expected_completion < QUICK_FORWARD_RELEASE_MIN_EXPECTED_COMPLETION
         || !hold_seconds.is_finite()
         || hold_seconds < 0.0
     {
         return 0.0;
     }
-    // Gate 2: real completed forward gain.
-    if completed_forward_yards < QUICK_FORWARD_RELEASE_MIN_FORWARD_YARDS {
-        return 0.0;
-    }
-    // Gate 3: the BEFORE state must have shown a genuine forward opportunity.
-    let opportunity = quick_forward_pass_value
-        .max(best_forward_pass_option_quality)
-        .clamp(0.0, 1.0);
-    if visible_forward_pass_options == 0 || opportunity < QUICK_FORWARD_RELEASE_OPPORTUNITY_GATE {
-        return 0.0;
-    }
-    // Gate 4: expected completion probability must be sane.
-    let completion = expected_pass_completion.clamp(0.0, 1.0);
-    if completion < QUICK_FORWARD_RELEASE_COMPLETION_GATE {
-        return 0.0;
-    }
-    // Component fits, each 0 at its gate and rising to 1 as the signal strengthens.
-    // Timing reuses the existing quick-release decay (largest for an instant/first-touch release,
-    // 0 by QUICK_RELEASE_MAX_HOLD_SECONDS).
     let timing_fit = (1.0 - hold_seconds / QUICK_RELEASE_MAX_HOLD_SECONDS).clamp(0.0, 1.0);
-    let gain_fit = ((completed_forward_yards - QUICK_FORWARD_RELEASE_MIN_FORWARD_YARDS)
-        / (QUICK_RELEASE_FORWARD_REFERENCE_YARDS - QUICK_FORWARD_RELEASE_MIN_FORWARD_YARDS))
-        .clamp(0.0, 1.0);
-    let opportunity_fit = ((opportunity - QUICK_FORWARD_RELEASE_OPPORTUNITY_GATE)
-        / (1.0 - QUICK_FORWARD_RELEASE_OPPORTUNITY_GATE))
-        .clamp(0.0, 1.0);
-    let completion_fit = ((completion - QUICK_FORWARD_RELEASE_COMPLETION_GATE)
-        / (1.0 - QUICK_FORWARD_RELEASE_COMPLETION_GATE))
-        .clamp(0.0, 1.0);
-    (QUICK_FORWARD_RELEASE_BONUS_BASE_POINTS
+    let forward_gain_fit = (forward_yards / QUICK_RELEASE_FORWARD_REFERENCE_YARDS).clamp(0.0, 1.0);
+    let opportunity_fit = forward_opportunity_quality.clamp(0.0, 1.0);
+    let completion_fit = expected_completion.clamp(0.0, 1.0);
+    (QUICK_FORWARD_RELEASE_REWARD_BASE
         * scale
         * timing_fit
-        * gain_fit
+        * forward_gain_fit
         * opportunity_fit
         * completion_fit)
-        .min(QUICK_FORWARD_RELEASE_MAX_BONUS_POINTS)
+        .min(QUICK_FORWARD_RELEASE_REWARD_CAP)
 }
 
 fn intercepted_pass_passer_penalty(pass: &PendingPass, field_length: f64) -> f64 {
@@ -24046,11 +24021,12 @@ fn intercepted_pass_passer_penalty(pass: &PendingPass, field_length: f64) -> f64
     );
     // Backward interceptions are exactly doubled; forward and lateral interceptions share the
     // ordinary bad-lane penalty so the learner gets a clean, testable directional signal.
-    if matches!(direction, PassDirectionBucket::Backward) {
+    let directional_penalty = if matches!(direction, PassDirectionBucket::Backward) {
         ordinary_interception_penalty * BACKWARD_INTERCEPTED_PASS_PENALTY_MULTIPLIER
     } else {
         ordinary_interception_penalty
-    }
+    };
+    directional_penalty * forward_pass_turnover_penalty_scale()
 }
 
 /// A pass is a "backheel" when its direction is substantially behind where the player
@@ -26334,19 +26310,20 @@ fn soccer_transition_reward_with_tactics(
                         target,
                         before.ball_holder_possession_seconds,
                     );
-                    // Quick-forward-release carrot (default-OFF; byte-identical when scale=0). The
-                    // enclosing block already guarantees a pass-like action that COMPLETED to a
-                    // different teammate, so gates 1 (pass, not hold/dribble/shot) and completion-to-
-                    // teammate control are satisfied here. The remaining gates (real forward gain, a
-                    // genuine BEFORE-state forward opportunity, sane expected completion) are enforced
-                    // inside the bonus, which pays zero for any backward/lateral/low-opportunity ball.
-                    reward += quick_forward_release_bonus(
-                        quick_forward_release_reward_scale(),
-                        (target.y - origin.y) * player.team.attack_dir(),
+                    // Codex r19 opportunity-conditioned carrot (default-off). Uses the before-state
+                    // forward opportunity (visible options + best forward option / quick-forward
+                    // value) and expected completion so it only pays a quick, completed forward ball
+                    // that a timid policy would otherwise have declined.
+                    reward += quick_forward_release_opportunity_reward(
+                        player.team,
+                        origin,
+                        target,
                         before.ball_holder_possession_seconds,
                         decision.observation.visible_forward_pass_options,
-                        decision.observation.quick_forward_pass_value,
-                        decision.observation.best_forward_pass_option_quality,
+                        decision
+                            .observation
+                            .quick_forward_pass_value
+                            .max(decision.observation.best_forward_pass_option_quality),
                         decision.observation.expected_pass_completion,
                     );
                     reward += pass_and_move_forward_reward_from_parts(
@@ -38707,6 +38684,11 @@ pub struct SoccerNeuralNetworkSnapshot {
     /// localhost/live server can consume the same push/drop head the learner warmed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line_depth_head: Option<Box<SoccerAuxiliaryHeadSnapshot>>,
+    /// Optional carried learned MPC execution-objective head. This is the aim/lead
+    /// residual head consumed by MPC at execution time; carrying it in the same
+    /// neural sidecar keeps eval/live loads in sync with the trainer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mpc_objective_head: Option<Box<SoccerAuxiliaryHeadSnapshot>>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -42665,6 +42647,7 @@ fn soccer_neural_network_snapshot(network: &FeedForwardNetwork) -> SoccerNeuralN
         target_popart: None,
         policy_head: None,
         line_depth_head: None,
+        mpc_objective_head: None,
     }
 }
 
@@ -68809,6 +68792,36 @@ mod reward_priority_tests {
         assert!(!gate_default_on_from_raw(Some("false")));
         assert!(!gate_default_on_from_raw(Some(" no ")));
         assert!(!gate_default_on_from_raw(Some("OFF")));
+    }
+
+    /// Guard the production forward-pass-primacy lever (`DD_SOCCER_FORWARD_PASS_REWARD_SCALE=6`).
+    /// The `outcome_rewards_dominate_pass_only_shaping` test below only checks scale=1; the shipped
+    /// config runs scale=6, which intentionally lets a forward pass out-earn a shot-on-target to tilt
+    /// the DENSE gradient toward build-up. The load-bearing invariant that MUST survive the scale is:
+    /// a SINGLE completed forward pass can never out-earn actually SCORING — else "pass instead of
+    /// finish" becomes rational for the final action. Goal + terminal outcome are unscaled, so this
+    /// holds; we pin it against silent regressions (scaling the count bonus, raising the clamp, etc).
+    /// NOTE: a multi-pass SEQUENCE can exceed a lone shot-on-target at scale=6 by design — the
+    /// pass-farming hazard the A/Bs must watch — but the unscaled goal (+ goal-chain credit) keeps
+    /// finishing optimal. This guards the single-action bound only.
+    #[test]
+    fn forward_pass_scale_six_stays_below_scoring_a_goal() {
+        let scale = 6.0;
+        // Richest single completed forward pass: own-half base + max progress + flank (own-half
+        // multiplier), all scaled, plus the UNSCALED count bonus (added separately at world.rs).
+        // Forward base + progress are the ONLY terms scaled (forward-only lever); flank + count
+        // bonus are unscaled and added on top.
+        let max_single_forward_pass = (COMPLETED_FORWARD_PASS_BASE_REWARD_OWN_HALF
+            + COMPLETED_FORWARD_PASS_PROGRESS_REWARD_MAX_YARDS
+                * COMPLETED_FORWARD_PASS_PROGRESS_REWARD_PER_YARD)
+            * scale
+            + COMPLETED_FLANK_PASS_BONUS_POINTS * COMPLETED_FLANK_PASS_OWN_HALF_MULTIPLIER
+            + COMPLETED_FORWARD_PASS_COUNT_BONUS_POINTS;
+        assert!(
+            max_single_forward_pass < GOAL_REWARD_POINTS,
+            "one forward pass at scale 6 ({max_single_forward_pass}) must stay below a goal \
+             ({GOAL_REWARD_POINTS}) — finishing must never be dominated by a single pass"
+        );
     }
 
     #[test]
