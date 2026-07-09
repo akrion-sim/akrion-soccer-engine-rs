@@ -66249,6 +66249,8 @@ fn endline_out_awards_goal_kick_or_corner() {
         team: Team::Home,
         shooter: 9,
         origin: Vec2::new(58.0, 100.0),
+        intended_target: Vec2::zero(),
+        mpc_objective: None,
     });
 
     goal_kick.integrate_ball();
