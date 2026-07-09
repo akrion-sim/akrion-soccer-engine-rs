@@ -20437,6 +20437,36 @@ pub(crate) struct PendingShot {
     team: Team,
     shooter: usize,
     origin: Vec2,
+    /// The INTENDED analytic shot aim (post-residual, pre-execution-noise) captured at launch — the
+    /// goal-mouth point `(base_goal_x, goal_y)` the shot was placed at AFTER the learned MPC
+    /// shot-placement residual (when armed) shifted it, and BEFORE `noisy_shot_target_x` added
+    /// execution noise. Mirrors [`PendingPass::intended_target`]. When the shot gate is off this is
+    /// simply the pure analytic aim (the residual is not applied), and it is behaviour-inert — no
+    /// sample is emitted, so nothing reads it.
+    intended_target: Vec2,
+    /// Captured AT LAUNCH for the learned MPC execution-objective head, exactly like
+    /// [`PendingPass::mpc_objective`]: the [`MPC_OBJECTIVE_FEATURE_DIM`] feature vector, the bounded
+    /// aim-PLACEMENT residual actually applied to this shot (the RWR "action" — a shot's placement is
+    /// lateral, so this is `(residual_x, 0.0)`), and `0.0` for the bend axis (shot placement shapes
+    /// AIM only, never curl/power). When the shot resolves it is emitted as an [`MpcObjectiveSample`]
+    /// whose reward is the delayed goal/save/miss outcome. `None` ⇒ the shot gate was off or the head
+    /// was absent at launch (no sample), so a `None` here is fully behaviour-neutral.
+    mpc_objective: Option<(Vec<f32>, Vec2, f64)>,
+}
+
+/// Terminal outcome of a resolved shot, used only to attribute the learned-MPC shot-PLACEMENT
+/// reward in [`SoccerMatch::record_shot_objective_sample`]. Separate from the many analytic shot
+/// reward paths — this is purely the RWR credit for the executor head's aim residual.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ShotObjectiveOutcome {
+    /// The shot scored — maximal placement success.
+    Goal,
+    /// On target but parried into a live rebound — beat the keeper's line, not the net.
+    OnTargetRebound,
+    /// On target but the keeper held it — reachable placement.
+    Saved,
+    /// Off target, blocked (terminally), or out of play — the placement failure.
+    Missed,
 }
 
 #[derive(Clone, Debug)]
