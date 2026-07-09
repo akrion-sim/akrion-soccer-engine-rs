@@ -78515,6 +78515,8 @@ fn keeper_parry_records_save_and_leaves_live_rebound() {
         team: Team::Home,
         shooter: 9,
         origin: Vec2::new(40.0, 104.0),
+        intended_target: Vec2::zero(),
+        mpc_objective: None,
     };
     sim.pending_shot = Some(shot.clone());
     sim.ball.holder = Some(keeper_id);
