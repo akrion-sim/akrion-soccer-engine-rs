@@ -199,6 +199,105 @@ fn neural_mcts_pass_target_candidate_limit() -> usize {
     })
 }
 
+/// Forward-release root-candidate injection (Codex fork verdict). Default OFF ⇒ byte-identical.
+/// When a *qualified* forward pass option is visible, the best forward receiver is injected into
+/// the neural-scored root even if the analytic top-3 pass-target cap (Cap B) would drop it — so the
+/// critic (with the action-param aim features) can actually SEE and learn to select it. This targets
+/// the empirically-confirmed SELECTION bottleneck (exposure widening alone moved forward-share 0.00).
+fn dd_soccer_enable_forward_release_root_candidate() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_FORWARD_RELEASE_ROOT_CANDIDATE"))
+}
+
+/// Minimum quick-forward-pass open value for the injected forward candidate to qualify (Codex: 0.50).
+fn forward_release_min_quality() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_FORWARD_RELEASE_MIN_QUALITY")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.50)
+            .clamp(0.0, 1.0)
+    })
+}
+
+/// Minimum expected pass completion for the injected forward candidate to qualify (Codex: 0.45).
+fn forward_release_min_completion() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_FORWARD_RELEASE_MIN_COMPLETION")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.45)
+            .clamp(0.0, 1.0)
+    })
+}
+
+/// Bounded, centered selection bias added to the injected forward candidate only (Codex: "must be
+/// considered, not taken"). A small positive nudge to surface it into the root; the critic value
+/// score can still outrank it — no forced argmax. Clamped to the shared centered-bonus clip.
+fn forward_release_bias() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_FORWARD_RELEASE_BIAS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            // 0.25 (not 0.10): the pass-like margin gate (default 0.55) runs AFTER injection, so a
+            // 0.10 bias is too small to keep a below-best forward pass from being pruned (Codex review).
+            .unwrap_or(0.25)
+            .clamp(0.0, SOCCER_CENTERED_POLICY_BONUS_CLIP)
+    })
+}
+
+/// Which stage of the forward-release injection funnel to count (diag only).
+#[derive(Clone, Copy)]
+enum ForwardReleaseStage {
+    Eligible,
+    Pushed,
+    SurvivedMarginGate,
+}
+
+/// Gated diagnostic funnel counters (DD_SOCCER_DUMP_FORWARD_RELEASE_DIAG) proving the injection is
+/// not inert (like pass-space was): how often the gate is eligible, the candidate is pushed, and it
+/// survives the pass-like margin gate. Prints the running triple to stderr every 5000 eligible ticks.
+fn forward_release_diag_bump(stage: ForwardReleaseStage) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    static DIAG: OnceLock<bool> = OnceLock::new();
+    if !*DIAG.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_DUMP_FORWARD_RELEASE_DIAG")) {
+        return;
+    }
+    static ELIGIBLE: AtomicU64 = AtomicU64::new(0);
+    static PUSHED: AtomicU64 = AtomicU64::new(0);
+    static SURVIVED: AtomicU64 = AtomicU64::new(0);
+    match stage {
+        ForwardReleaseStage::Eligible => {
+            let e = ELIGIBLE.fetch_add(1, Ordering::Relaxed) + 1;
+            if e % 5000 == 0 {
+                eprintln!(
+                    "forward_release_diag eligible={} pushed={} survived_margin_gate={}",
+                    e,
+                    PUSHED.load(Ordering::Relaxed),
+                    SURVIVED.load(Ordering::Relaxed),
+                );
+            }
+        }
+        ForwardReleaseStage::Pushed => {
+            PUSHED.fetch_add(1, Ordering::Relaxed);
+        }
+        ForwardReleaseStage::SurvivedMarginGate => {
+            SURVIVED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 fn neural_mcts_kick_power_candidate_limit() -> usize {
     use std::sync::OnceLock;
     static V: OnceLock<usize> = OnceLock::new();
@@ -15956,6 +16055,66 @@ impl SoccerMatch {
                 &candidate.label,
             ) {
                 push_scored_candidate(candidate, expanded_plan);
+            }
+        }
+        // --- Forward-release root-candidate injection (DD_SOCCER_ENABLE_FORWARD_RELEASE_ROOT_CANDIDATE,
+        // default OFF ⇒ byte-identical). Targets the empirically-confirmed SELECTION bottleneck: exposure
+        // widening alone moved forward-share 0.00, because a qualified forward receiver ranked below the
+        // analytic top-3 (Cap B) never reaches the critic. When a qualified forward option is visible,
+        // inject the best forward receiver into the scored root regardless of Cap B, score it through the
+        // critic (with the action-param aim features), and add a bounded bias so it is CONSIDERED — the
+        // critic value can still outrank it (no forced argmax). Suppressed in forced-shot/killer-pass
+        // contexts unless a threaded goal pass overrides.
+        if dd_soccer_enable_forward_release_root_candidate()
+            && observation.visible_forward_pass_options > 0
+            && observation.expected_pass_completion >= forward_release_min_completion()
+            && (!goal_attack_shot_is_required(observation, role)
+                || threaded_goal_pass_can_override_forced_shot(observation, role))
+        {
+            // Best qualified forward receiver + its open value (production inline of the
+            // test-only `quick_forward_pass_value_for`: same ranked-visible + forward-support path).
+            let forward_targets = snapshot.ranked_visible_pass_targets(player_id, 11);
+            let forward_ctx = snapshot.forward_support_context_for(player_id, &forward_targets);
+            if forward_ctx.best_quick_forward_open_value >= forward_release_min_quality() {
+                if let Some(target_player) = forward_ctx.best_quick_forward_target {
+                    // Dedup against the top-N that survive Cap B (borrow-free — cannot touch
+                    // `scored_candidates` while the `push_scored_candidate` closure holds it).
+                    let cap = neural_mcts_pass_target_candidate_limit();
+                    let already_exposed =
+                        forward_targets.iter().take(cap).any(|&t| t == target_player);
+                    if !already_exposed {
+                        if let Some(target_point) = snapshot.player_position(target_player) {
+                            let synthetic_trace = SoccerLearnedActionTrace {
+                                label: "pass".to_string(),
+                                value: dp_policy_value_center,
+                                visits: 0,
+                                probability: 0.0,
+                                legal: true,
+                                level: PitchGridLevel::WholePitch,
+                            };
+                            let synthetic_plan = SoccerLearnedPlan {
+                                action: "pass1".to_string(),
+                                target_player: Some(target_player),
+                                target_point: Some(target_point),
+                                mpc_replan: None,
+                            };
+                            push_scored_candidate(&synthetic_trace, synthetic_plan);
+                            // The `push_scored_candidate` closure's &mut borrow releases after its last
+                            // use (the push above), so `scored_candidates` can be touched directly now.
+                            // push may drop the candidate via the executability masks, so find it by
+                            // target rather than assume it landed; bias only if present.
+                            if let Some(injected) = scored_candidates
+                                .iter_mut()
+                                .rev()
+                                .find(|c| {
+                                    c.plan.as_ref().and_then(|p| p.target_player) == Some(target_player)
+                                })
+                            {
+                                injected.score += forward_release_bias();
+                            }
+                        }
+                    }
+                }
             }
         }
         Self::apply_neural_mcts_pass_like_margin_gate_for_blend(blend, &mut scored_candidates);
