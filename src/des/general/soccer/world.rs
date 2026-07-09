@@ -20530,6 +20530,24 @@ impl SoccerMatch {
                     }
                     let intent = self.players[actor]
                         .apply_post_decision_movement_discipline(&snapshot, self, intent);
+                    if let Some(baseline) = net_influence_baseline.as_ref() {
+                        // Headline = semantic committed action (last_decision.action, post-refractory)
+                        // vs tabular baseline; concrete = post-discipline intent family (collapses
+                        // off-ball to "move", so a secondary diagnostic per Codex).
+                        let semantic = self.players[actor]
+                            .last_decision
+                            .as_ref()
+                            .map(|decision| decision.action.as_str())
+                            .unwrap_or("");
+                        let concrete = intent.action.label();
+                        let on_ball = self.ball.holder == Some(scheduled.id);
+                        record_net_influence_commit_diag(
+                            normalize_soccer_action_label(baseline),
+                            normalize_soccer_action_label(semantic),
+                            normalize_soccer_action_label(&concrete),
+                            on_ball,
+                        );
+                    }
                     let player_decision_elapsed = phase_started.elapsed();
                     field_player_decision_elapsed += player_decision_elapsed;
                     match decision_context {
