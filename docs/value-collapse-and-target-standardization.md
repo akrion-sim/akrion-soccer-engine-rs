@@ -98,7 +98,7 @@ The neural value head is the **whole point** of this architecture, and remains s
   **restores** the net's ability to discriminate states — it does not move away from neural learning.
 - **What's "later":** once the value discriminates states, the next (milder-than-feared) ceiling is
   the **action interface**. Note the interface is *not* a hard top-4 cap: when a learner exists the
-  decision **injects every legal `SOCCER_POLICY_ACTIONS` macro family (~73)** as a candidate
+  decision **injects every legal `SOCCER_POLICY_ACTIONS` macro family (113-entry table)** as a candidate
   ([world.rs](../src/des/general/soccer/world.rs) ~L5623), so the net's *macro policy* is
   expressive. Only the **specific factored tabular candidates** (a concrete
   `pass|tgt:7|spd:7|dir:135…`) are capped at 4 (`default_soccer_neural_blend_candidates`, now
