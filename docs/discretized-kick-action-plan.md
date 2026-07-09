@@ -27,7 +27,7 @@ The **discrete representation already exists but is constructed only in tests**:
 - `DiscretizedKickAction { speed_bucket: u8 (10), direction_bucket: u8 (36), curve, technique, elevation }`
   ([soccer.rs:63788](../src/des/general/soccer.rs#L63788)) with bucket↔value mappings.
 - `lower_discretized_kick_release(origin, action, min_speed, max_speed, ref_distance, bend, dither)`
-  → `LoweredKickRelease` ([soccer.rs:55073](../src/des/general/soccer.rs#L55073)) — the
+  → `LoweredKickRelease` ([soccer.rs:64092](../src/des/general/soccer.rs#L64092)) — the
   exact lowering the wiring needs. **Its only callers are in `#[cfg(test)]`**
   ([soccer.rs:59200+](../src/des/general/soccer.rs#L59200)).
 - `DiscretizedKickDither::sample` is currently a no-op (returns zero offsets) — a
