@@ -25,7 +25,7 @@ surfaces learn). This doc is about *how fast and how safely* the nets move.
 **Already-solid guards (no change needed):** LR clamped ≤ 0.25; three grad-norm
 ceilings; the non-finite-gradient guard in `FeedForwardNetwork::train_sample_clipped`
 drops poisoned steps so a NaN can't reach live play; value targets bounded to ±3.0;
-actor samples filter `advantage.is_finite()`; full-game return clamped to ±250.
+actor samples filter `advantage.is_finite()`; full-game return clamped to ±400.
 
 ## Findings
 
