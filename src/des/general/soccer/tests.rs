@@ -10795,6 +10795,71 @@ fn completed_forward_pass_count_bonus_rewards_actual_forward_reception() {
 }
 
 #[test]
+fn quick_forward_release_bonus_pays_only_when_all_gates_pass() {
+    // A strong, quick, well-anticipated forward release into a real opportunity.
+    // scale, completed_forward_yards, hold_seconds, visible_forward_pass_options,
+    // quick_forward_pass_value, best_forward_pass_option_quality, expected_pass_completion.
+    let strong = quick_forward_release_bonus(1.0, 12.0, 0.0, 2, 0.9, 0.8, 0.9);
+
+    // Default-off: scale = 0 pays nothing, no matter how good the pass.
+    assert_eq!(
+        quick_forward_release_bonus(0.0, 12.0, 0.0, 2, 0.9, 0.8, 0.9),
+        0.0,
+        "scale=0 (default-off) must pay nothing"
+    );
+
+    // A genuine, quick, opportunity-backed forward release earns a positive bonus.
+    assert!(
+        strong > 0.0,
+        "a quick forward release into a real opportunity should pay a positive bonus: {strong}"
+    );
+    // Hard cap: even a maxed-out signal at the top clamp never exceeds the 6.0 ceiling.
+    let maxed = quick_forward_release_bonus(2.0, 100.0, 0.0, 5, 1.0, 1.0, 1.0);
+    assert!(
+        maxed <= QUICK_FORWARD_RELEASE_MAX_BONUS_POINTS + 1e-9,
+        "bonus must be hard-capped at {QUICK_FORWARD_RELEASE_MAX_BONUS_POINTS}: {maxed}"
+    );
+    assert!((maxed - QUICK_FORWARD_RELEASE_MAX_BONUS_POINTS).abs() < 1e-9);
+
+    // Backward ball (negative forward gain) pays zero — cannot reward safe recycling.
+    assert_eq!(
+        quick_forward_release_bonus(1.0, -6.0, 0.0, 2, 0.9, 0.8, 0.9),
+        0.0,
+        "a backward pass must pay zero"
+    );
+    // Below the 4.0yd forward-gain gate pays zero.
+    assert_eq!(
+        quick_forward_release_bonus(1.0, 3.5, 0.0, 2, 0.9, 0.8, 0.9),
+        0.0,
+        "a sub-threshold forward gain must pay zero"
+    );
+    // No visible forward option in the BEFORE state pays zero even if the ball went forward.
+    assert_eq!(
+        quick_forward_release_bonus(1.0, 12.0, 0.0, 0, 0.9, 0.8, 0.9),
+        0.0,
+        "no forward opportunity ⇒ zero"
+    );
+    // Opportunity quality below the 0.50 gate pays zero.
+    assert_eq!(
+        quick_forward_release_bonus(1.0, 12.0, 0.0, 2, 0.40, 0.30, 0.9),
+        0.0,
+        "low forward-opportunity quality ⇒ zero"
+    );
+    // Expected completion below the 0.45 gate pays zero (insane/unlikely pass).
+    assert_eq!(
+        quick_forward_release_bonus(1.0, 12.0, 0.0, 2, 0.9, 0.8, 0.40),
+        0.0,
+        "sub-sane expected completion ⇒ zero"
+    );
+    // Held past the quick-release cap ⇒ timing fit is 0 ⇒ zero (not a quick release).
+    assert_eq!(
+        quick_forward_release_bonus(1.0, 12.0, QUICK_RELEASE_MAX_HOLD_SECONDS, 2, 0.9, 0.8, 0.9),
+        0.0,
+        "a ball held past the quick-release cap is not a quick release"
+    );
+}
+
+#[test]
 fn completed_pass_reward_values_flank_usage_more_in_own_half() {
     let field_width = 80.0;
     let field_length = 120.0;
