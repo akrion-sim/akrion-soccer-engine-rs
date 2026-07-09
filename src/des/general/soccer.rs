@@ -41061,6 +41061,28 @@ mod soccer_policy_actor_capacity_tests {
     }
 
     #[test]
+    fn forward_select_logit_weight_round_trips_and_defaults_to_zero() {
+        let _lock = env_lock();
+        // Fresh head: the scalar initializes to 0.0 (the disabled / byte-identical default).
+        let mut head = SoccerPolicyHead::new(21);
+        assert_eq!(head.forward_select_logit_weight, 0.0);
+
+        // A trained value survives snapshot -> restore.
+        head.forward_select_logit_weight = 2.5;
+        let snapshot = soccer_policy_head_snapshot(&head);
+        assert_eq!(snapshot.forward_select_logit_weight, 2.5);
+        let restored = soccer_policy_head_from_snapshot(&snapshot, 21).expect("restore policy");
+        assert_eq!(restored.forward_select_logit_weight, 2.5);
+
+        // A non-finite stored weight (e.g. corrupt / legacy) restores to the 0.0 default.
+        let mut corrupt = soccer_policy_head_snapshot(&SoccerPolicyHead::new(21));
+        corrupt.forward_select_logit_weight = f64::NAN;
+        let restored_corrupt =
+            soccer_policy_head_from_snapshot(&corrupt, 21).expect("restore corrupt policy");
+        assert_eq!(restored_corrupt.forward_select_logit_weight, 0.0);
+    }
+
+    #[test]
     fn policy_actor_snapshot_widens_appended_action_outputs() {
         let _lock = env_lock();
         let _policy_units = set_test_env_var("SOCCER_POLICY_HIDDEN_UNITS", "24");
