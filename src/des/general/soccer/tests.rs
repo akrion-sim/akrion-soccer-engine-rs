@@ -38721,6 +38721,7 @@ fn policy_head_mappo_clip_skips_missing_or_invalid_old_policy_probability() {
         old_action_probability,
         sample_weight: 1.0,
         mcts_distillation: false,
+        forward_select_eligible: false,
     };
 
     for old_action_probability in [None, Some(0.0), Some(f64::NAN), Some(f64::INFINITY)] {
