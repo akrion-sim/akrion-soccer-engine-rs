@@ -47,9 +47,9 @@ blindside, magnus, dribble, press) + gated tactical features. The core learnable
 and learned reward (P2) stayed dormant. **The engine got better at analytic play — raising the bar
 the net must beat — while the net was never given the tools to beat it.**
 
-## The fix — three parts (all real, needs a retrain to evaluate)
+## The fix — three parts (A & B now implemented behind gates; need a retrain to evaluate)
 
-### Part A — structured action-param feature block (append-only)
+### Part A — structured action-param feature block (append-only) — ✅ IMPLEMENTED (gate `DD_SOCCER_ENABLE_ACTION_PARAM_FEATURES`)
 Add a `SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM` block (append-only, so old nets zero-pad — the
 established migration pattern, see [soccer.rs:4505](../src/des/general/soccer.rs#L4505)) encoding the
 candidate's **aim**, from `AgentActionTargetTrace.point` ([soccer.rs:7805](../src/des/general/soccer.rs#L7805))
