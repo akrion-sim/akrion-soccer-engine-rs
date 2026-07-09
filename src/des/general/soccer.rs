@@ -2139,6 +2139,14 @@ const TEAM_ADVANCE_SUPPORT_RUN_REWARD: f64 = 0.45;
 const QUICK_RELEASE_MAX_HOLD_SECONDS: f64 = 1.2;
 const QUICK_RELEASE_FORWARD_REFERENCE_YARDS: f64 = 12.0;
 const QUICK_RELEASE_FORWARD_PASS_BONUS_POINTS: f64 = 5.0;
+// Codex r19 opportunity-conditioned quick-forward-release carrot (gated, default-off). Targets the
+// pass-CHOICE leak: pay a bounded bonus only when a real forward opportunity existed and the actor
+// released a quickly-completed forward ball, so a timid policy is pulled toward choosing the pass.
+const QUICK_FORWARD_RELEASE_REWARD_BASE: f64 = 4.0;
+const QUICK_FORWARD_RELEASE_REWARD_CAP: f64 = 6.0;
+const QUICK_FORWARD_RELEASE_MIN_FORWARD_YARDS: f64 = 4.0;
+const QUICK_FORWARD_RELEASE_MIN_OPPORTUNITY: f64 = 0.50;
+const QUICK_FORWARD_RELEASE_MIN_EXPECTED_COMPLETION: f64 = 0.45;
 /// Dense shaping penalty for an attacker who fails to join a live team-advance cue, retreats, or
 /// runs into an offside support lane. This mirrors the support-run reward without forcing defenders
 /// to abandon shape.
@@ -23939,6 +23947,65 @@ fn quick_release_forward_pass_reward(
     QUICK_RELEASE_FORWARD_PASS_BONUS_POINTS * speed_fraction * (0.5 + 0.5 * forward_fraction)
 }
 
+/// Scale for the opportunity-conditioned quick-forward-release carrot (Codex r19). Env
+/// `DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE` (clamped 0..2), default **0.0** ⇒ byte-identical
+/// (the whole term is a no-op unless explicitly enabled). Pre-registered A/B arms: 0.75, 1.0, 1.5.
+pub(crate) fn quick_forward_release_reward_scale() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.0, 2.0))
+            .unwrap_or(0.0)
+    })
+}
+
+/// Codex r19 carrot: bounded, opportunity-conditioned reward for a completed forward pass that was
+/// released quickly INTO a real forward opportunity. Only fires on the completed-pass path (so
+/// loose-ball / interception / immediate-opponent-control implicitly pay zero), and returns 0 unless
+/// EVERY gate holds — backward/lateral (`forward_yards < MIN`), no visible forward option, weak
+/// opportunity, or poor expected completion all yield nothing, so it cannot pay safe recycling.
+/// Capped at `QUICK_FORWARD_RELEASE_REWARD_CAP` so it can't substitute for a shot/goal. Pure/RNG-free.
+#[allow(clippy::too_many_arguments)]
+fn quick_forward_release_opportunity_reward(
+    team: Team,
+    origin: Vec2,
+    target: Vec2,
+    hold_seconds: f64,
+    visible_forward_pass_options: usize,
+    forward_opportunity_quality: f64,
+    expected_completion: f64,
+) -> f64 {
+    let scale = quick_forward_release_reward_scale();
+    if scale <= 0.0 {
+        return 0.0;
+    }
+    let forward_yards = (target.y - origin.y) * team.attack_dir();
+    if forward_yards < QUICK_FORWARD_RELEASE_MIN_FORWARD_YARDS
+        || visible_forward_pass_options == 0
+        || forward_opportunity_quality < QUICK_FORWARD_RELEASE_MIN_OPPORTUNITY
+        || expected_completion < QUICK_FORWARD_RELEASE_MIN_EXPECTED_COMPLETION
+        || !hold_seconds.is_finite()
+        || hold_seconds < 0.0
+    {
+        return 0.0;
+    }
+    let timing_fit = (1.0 - hold_seconds / QUICK_RELEASE_MAX_HOLD_SECONDS).clamp(0.0, 1.0);
+    let forward_gain_fit = (forward_yards / QUICK_RELEASE_FORWARD_REFERENCE_YARDS).clamp(0.0, 1.0);
+    let opportunity_fit = forward_opportunity_quality.clamp(0.0, 1.0);
+    let completion_fit = expected_completion.clamp(0.0, 1.0);
+    (QUICK_FORWARD_RELEASE_REWARD_BASE
+        * scale
+        * timing_fit
+        * forward_gain_fit
+        * opportunity_fit
+        * completion_fit)
+        .min(QUICK_FORWARD_RELEASE_REWARD_CAP)
+}
+
 fn intercepted_pass_passer_penalty(pass: &PendingPass, field_length: f64) -> f64 {
     let direction = pass_direction_bucket(pass.team, pass.origin, pass.intended_target);
     let own_half = pass_origin_in_own_half(pass.team, pass.origin, field_length);
@@ -26242,6 +26309,22 @@ fn soccer_transition_reward_with_tactics(
                         origin,
                         target,
                         before.ball_holder_possession_seconds,
+                    );
+                    // Codex r19 opportunity-conditioned carrot (default-off). Uses the before-state
+                    // forward opportunity (visible options + best forward option / quick-forward
+                    // value) and expected completion so it only pays a quick, completed forward ball
+                    // that a timid policy would otherwise have declined.
+                    reward += quick_forward_release_opportunity_reward(
+                        player.team,
+                        origin,
+                        target,
+                        before.ball_holder_possession_seconds,
+                        decision.observation.visible_forward_pass_options,
+                        decision
+                            .observation
+                            .quick_forward_pass_value
+                            .max(decision.observation.best_forward_pass_option_quality),
+                        decision.observation.expected_pass_completion,
                     );
                     reward += pass_and_move_forward_reward_from_parts(
                         player.team,
