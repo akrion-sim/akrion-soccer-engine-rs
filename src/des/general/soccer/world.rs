@@ -30606,6 +30606,8 @@ impl SoccerMatch {
         self.pending_pass = None;
         self.pending_shot = None;
         self.recent_dispossession = None;
+        // The ball is genuinely loose: no carrier owns a pending dribble residual any more.
+        self.dribble_mpc_objective = None;
         self.possession_swaps.clear();
         self.ball_stationary_ticks = 0;
         self.ball_stuck_anchor = self.ball.position;
