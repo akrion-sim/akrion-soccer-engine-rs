@@ -1,7 +1,7 @@
 # Plan: fix the policy `visits` i32 overflow
 
 ## Problem (grounded)
-- In-memory `visits` is `u32` (`soccer_learning.rs:1676`, `PolicyEntry`).
+- In-memory `visits` is `u32` (`soccer_learning.rs:1902`).
 - The PG column `des_soccer_learning_policy_entries.visits` is `integer` (**i32**,
   max 2,147,483,647). The merge accumulates visits across runs/generations.
 - Hot states (e.g. `Midfielder / BuildUp`, visited ~every game over 300+ generations ×
