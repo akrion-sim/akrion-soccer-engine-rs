@@ -18548,6 +18548,11 @@ impl SoccerMatch {
                 if diag_on {
                     diag_meta.push((transition.team, action_index, advantage));
                 }
+                // Eligibility for the per-net forward-select scalar's gradient: the taken action
+                // was a forward pass into a good forward option (same geometry as the score-time
+                // bias). In-memory only; irrelevant unless the forward-select gate is on.
+                let forward_select_eligible =
+                    soccer_transition_forward_pass_selection_eligible(transition);
                 let sample = SoccerPolicySample {
                     state_features,
                     action_index,
@@ -18555,6 +18560,7 @@ impl SoccerMatch {
                     old_action_probability,
                     sample_weight,
                     mcts_distillation,
+                    forward_select_eligible,
                 };
                 if option_score_safety_counterexample {
                     option_score_safety_counterexample_samples += 1;
