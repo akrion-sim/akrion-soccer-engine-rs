@@ -88,8 +88,10 @@ off-policy. Fix all three and dense-reward RL climbs steeply on its own.
 
 The state the net conditions on is the **whole-field moment**: for all 22 players + the ball,
 the actor-relative canonical **(position, velocity, acceleration, jerk)** — 8 numbers/entity,
-23 entities = a 184-dim motion block inside the 610-dim feature vector (`inputDim=610`,
-`FIELD_MOTION_PER_PLAYER=8`). This is the right raw signal. Here is how to use it well.
+23 entities = a 184-dim motion block inside the 620-dim feature vector
+(`SOCCER_NEURAL_FEATURE_DIM=620`, `FIELD_MOTION_PER_PLAYER=8`; the earlier 610 was the subtotal
+before the final 10-dim action-param block was appended). This is the right raw signal. Here is
+how to use it well.
 
 ### Why neural nets are the right tool for it
 
