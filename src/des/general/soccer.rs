@@ -40835,6 +40835,11 @@ pub(crate) struct SoccerPolicyHead {
     role_heads: Vec<SoccerPolicyRoleHead>,
     training_steps: usize,
     last_loss: Option<f64>,
+    /// Learned scalar selection bias toward a genuinely-forward pass when a good
+    /// forward option is visible (applied at score time in `neural_blended_action`).
+    /// Per-net / snapshot-carried; init 0.0 so a fresh or gate-off net is byte-identical.
+    /// Only trained/applied under `DD_SOCCER_ENABLE_FORWARD_SELECT_LOGIT`.
+    forward_select_logit_weight: f64,
 }
 
 impl SoccerPolicyHead {
