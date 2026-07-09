@@ -1449,6 +1449,7 @@ fn mpc_pass_execution_prices_lane_and_ball_recipe() {
     let player = sim.players[passer].clone();
     let action = SoccerAction::Pass {
         target_player: Some(receiver),
+        target_point: None,
         power: 0.58,
         flight: PassFlight::Floor,
     };
@@ -2086,6 +2087,7 @@ fn executed_receiver_pass_respects_mpc_speed_floor_despite_bad_momentum() {
         player_id: passer,
         action: SoccerAction::Pass {
             target_player: Some(receiver),
+            target_point: None,
             power: 0.68,
             flight: PassFlight::Floor,
         },
@@ -2133,6 +2135,7 @@ fn severe_momentum_mismatch_holds_instead_of_releasing_underhit_receiver_pass() 
         player_id: passer,
         action: SoccerAction::Pass {
             target_player: Some(receiver),
+            target_point: None,
             power: 0.68,
             flight: PassFlight::Floor,
         },
@@ -2443,6 +2446,7 @@ fn holder_cannot_strike_ball_during_first_touch_settle() {
 
     let pass = SoccerAction::Pass {
         target_player: Some(receiver),
+        target_point: None,
         power: 0.7,
         flight: PassFlight::Floor,
     };
@@ -2547,6 +2551,7 @@ fn pass_release_pulls_opponent_aimed_floor_ball_back_to_receiver() {
         player_id: passer,
         action: SoccerAction::Pass {
             target_player: Some(receiver),
+            target_point: None,
             power,
             flight: PassFlight::Floor,
         },
@@ -4116,6 +4121,7 @@ fn mpc_bouncing_ball_urgency_reprices_pass_execution_window() {
 
     let action = SoccerAction::Pass {
         target_player: Some(receiver),
+        target_point: None,
         power: 0.58,
         flight: PassFlight::Floor,
     };
@@ -6947,6 +6953,7 @@ fn pass_launch_sanitizes_explicit_opponent_target_to_teammate() {
     park_players_except(&mut sim, &[passer, teammate, opponent]);
     sim.players[passer].position = Vec2::new(40.0, 60.0);
     sim.players[passer].velocity = Vec2::new(4.0, 0.0);
+    sim.players[passer].facing_yaw = 0.0;
     sim.players[passer].action_facing = FacingBucket::East;
     sim.players[passer].receive_facing = FacingBucket::East;
     sim.players[passer].skills.passing_completion_rate = 8.8;
@@ -6971,6 +6978,7 @@ fn pass_launch_sanitizes_explicit_opponent_target_to_teammate() {
         player_id: passer,
         action: SoccerAction::Pass {
             target_player: Some(opponent),
+            target_point: None,
             power: 0.68,
             flight: PassFlight::Floor,
         },
@@ -6991,6 +6999,57 @@ fn pass_launch_sanitizes_explicit_opponent_target_to_teammate() {
                 .distance(sim.players[opponent].position),
         "sanitized pass should aim nearer the teammate than the opponent: target={:?}",
         pass.intended_target
+    );
+}
+
+#[test]
+fn pass_launch_honors_explicit_target_point() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 41_210,
+        ..Default::default()
+    });
+    let passer = 6usize;
+    let receiver = 7usize;
+    park_players_except(&mut sim, &[passer, receiver]);
+    sim.players[passer].position = Vec2::new(40.0, 60.0);
+    sim.players[passer].velocity = Vec2::zero();
+    sim.players[passer].facing_yaw = std::f64::consts::FRAC_PI_2;
+    sim.players[passer].action_facing = FacingBucket::North;
+    sim.players[passer].receive_facing = FacingBucket::North;
+    sim.players[passer].skills.passing_completion_rate = 9.0;
+    sim.players[passer].skills.passing = 9.0;
+    sim.players[receiver].position = Vec2::new(40.0, 72.0);
+    sim.players[receiver].velocity = Vec2::zero();
+    sim.ball.holder = Some(passer);
+    sim.ball.position = sim.players[passer].position;
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+    let explicit_target = Vec2::new(40.0, 82.0);
+
+    sim.apply_player_intent(PlayerIntent {
+        player_id: passer,
+        action: SoccerAction::Pass {
+            target_player: Some(receiver),
+            target_point: Some(explicit_target),
+            power: 0.70,
+            flight: PassFlight::Floor,
+        },
+        sprint: false,
+    });
+
+    let pass = sim.pending_pass.as_ref().expect("pass launched");
+    assert_eq!(pass.target, Some(receiver));
+    assert!(
+        pass.intended_target.distance(explicit_target) < 1e-6,
+        "explicit target point should survive to PendingPass.intended_target: {:?}",
+        pass.intended_target
+    );
+    assert!(
+        pass.intended_target
+            .distance(sim.players[receiver].position)
+            > 1.0,
+        "fixture must prove the launch target is distinct from receiver feet"
     );
 }
 
@@ -7043,6 +7102,7 @@ fn one_two_give_is_aimed_at_the_wall_partners_feet_and_binds_the_partner() {
             player_id: passer,
             action: SoccerAction::Pass {
                 target_player: Some(partner),
+                target_point: None,
                 power: 0.58,
                 flight: PassFlight::Floor,
             },
@@ -7122,6 +7182,7 @@ fn targeted_floor_pass_noise_does_not_pull_aim_into_opponent() {
             player_id: passer,
             action: SoccerAction::Pass {
                 target_player: Some(teammate),
+                target_point: None,
                 power: 0.68,
                 flight: PassFlight::Floor,
             },
@@ -8181,6 +8242,7 @@ fn blocked_final_third_attacker_falls_back_to_killer_pass() {
     match intent.action {
         SoccerAction::Pass {
             target_player,
+            target_point: _,
             power,
             flight,
         } => {
@@ -12772,6 +12834,7 @@ fn aerial_pass_requires_enough_body_power_to_release() {
         player_id: passer,
         action: SoccerAction::Pass {
             target_player: Some(receiver),
+            target_point: None,
             power: 0.74,
             flight: PassFlight::Aerial,
         },
@@ -13197,6 +13260,7 @@ fn goalkeeper_handling_holds_for_open_outlet_then_distributes() {
         player_id: keeper,
         action: SoccerAction::Pass {
             target_player: Some(mate),
+            target_point: None,
             power: 0.6,
             flight: PassFlight::Floor,
         },
@@ -13216,6 +13280,7 @@ fn goalkeeper_handling_holds_for_open_outlet_then_distributes() {
         player_id: keeper,
         action: SoccerAction::Pass {
             target_player: Some(mate),
+            target_point: None,
             power: 0.6,
             flight: PassFlight::Floor,
         },
@@ -32291,6 +32356,7 @@ fn human_input_action_can_thread_killer_pass_to_goal_runner() {
 
     let SoccerAction::Pass {
         target_player: Some(target),
+        target_point: _,
         flight: PassFlight::Floor,
         power,
     } = intent.action
@@ -33899,6 +33965,7 @@ fn set_play_release_sanitizes_bad_target_and_power() {
     match release.0 {
         SoccerAction::Pass {
             target_player,
+            target_point: _,
             power,
             flight: PassFlight::Aerial,
         } => {
@@ -36982,6 +37049,7 @@ fn pass_and_shot_preserve_release_facing_after_recovery_movement() {
         player_id: passer,
         action: SoccerAction::Pass {
             target_player: Some(receiver),
+            target_point: None,
             power: 0.64,
             flight: PassFlight::Floor,
         },
@@ -39607,6 +39675,7 @@ fn aerial_pass_targeting_can_bypass_blocked_floor_lane() {
         player_id: passer,
         action: SoccerAction::Pass {
             target_player: Some(target),
+            target_point: None,
             power: 0.85,
             flight: PassFlight::Aerial,
         },
@@ -40773,7 +40842,7 @@ fn learned_policy_biases_agent_decision_when_legal() {
     );
 
     let decision = player.last_decision.as_ref().expect("player decision");
-    assert_eq!(decision.action, "pass");
+    assert_eq!(normalize_soccer_action_label(&decision.action), "pass");
     assert_eq!(decision.operation_order[0], "learned-policy");
     assert!(matches!(
         intent.action,
@@ -45009,7 +45078,7 @@ fn team_learned_policy_biases_matching_team_decision() {
     );
 
     let decision = player.last_decision.as_ref().expect("player decision");
-    assert_eq!(decision.action, "pass");
+    assert_eq!(normalize_soccer_action_label(&decision.action), "pass");
     assert_eq!(decision.operation_order[0], "learned-policy");
     assert!(matches!(
         intent.action,
@@ -51027,6 +51096,7 @@ fn direct_goal_kick_pass_is_exempt_from_offside() {
         player_id: passer,
         action: SoccerAction::Pass {
             target_player: Some(runner),
+            target_point: None,
             power: 1.0,
             flight: PassFlight::Aerial,
         },
@@ -51170,6 +51240,7 @@ fn completed_pass_to_offside_runner_awards_defensive_restart() {
         player_id: 5,
         action: SoccerAction::Pass {
             target_player: Some(9),
+            target_point: None,
             power: 1.0,
             flight: PassFlight::Floor,
         },
@@ -51221,6 +51292,7 @@ fn pending_pass_frames_expose_offside_interference_phase() {
         player_id: passer,
         action: SoccerAction::Pass {
             target_player: Some(runner),
+            target_point: None,
             power: 1.0,
             flight: PassFlight::Floor,
         },
@@ -51279,6 +51351,7 @@ fn offside_runner_within_three_yards_of_loose_ball_is_flagged() {
         player_id: 5,
         action: SoccerAction::Pass {
             target_player: Some(9),
+            target_point: None,
             power: 1.0,
             flight: PassFlight::Floor,
         },
@@ -51325,6 +51398,7 @@ fn offside_runner_near_ball_path_is_flagged_before_later_control_touch() {
         player_id: passer,
         action: SoccerAction::Pass {
             target_player: Some(runner),
+            target_point: None,
             power: 1.0,
             flight: PassFlight::Floor,
         },
@@ -51379,6 +51453,7 @@ fn teammate_touch_before_offside_runner_involvement_resets_pending_offside() {
         player_id: passer,
         action: SoccerAction::Pass {
             target_player: Some(runner),
+            target_point: None,
             power: 1.0,
             flight: PassFlight::Floor,
         },
@@ -51440,6 +51515,7 @@ fn non_target_attacker_in_offside_position_is_flagged_when_it_gets_involved() {
         player_id: passer,
         action: SoccerAction::Pass {
             target_player: Some(intended),
+            target_point: None,
             power: 1.0,
             flight: PassFlight::Floor,
         },
@@ -51485,6 +51561,7 @@ fn deliberate_defender_control_resets_pending_offside_phase() {
         player_id: passer,
         action: SoccerAction::Pass {
             target_player: Some(runner),
+            target_point: None,
             power: 1.0,
             flight: PassFlight::Floor,
         },
@@ -51532,6 +51609,7 @@ fn deliberate_defender_header_resets_pending_offside_phase() {
         player_id: passer,
         action: SoccerAction::Pass {
             target_player: Some(runner),
+            target_point: None,
             power: 1.0,
             flight: PassFlight::Aerial,
         },
@@ -57918,6 +57996,7 @@ fn pass_decision_target_records_receiver_stride_not_static_feet() {
         .expect("anticipated receiver stride");
     let action = SoccerAction::Pass {
         target_player: Some(winger),
+        target_point: None,
         power: 0.72,
         flight: PassFlight::Floor,
     };
@@ -57934,6 +58013,43 @@ fn pass_decision_target_records_receiver_stride_not_static_feet() {
     assert!(
         target.distance(sim.players[winger].position) > 0.5,
         "pass target should lead the receiver, not target static feet: {target:?}"
+    );
+}
+
+#[test]
+fn pass_decision_target_prefers_explicit_target_point() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let passer = 6;
+    let winger = 8;
+    sim.ball.holder = Some(passer);
+    sim.ball.position = Vec2::new(40.0, 56.0);
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.players[passer].position = sim.ball.position;
+    sim.players[winger].position = Vec2::new(63.0, 57.0);
+    sim.players[winger].velocity = Vec2::new(1.8, 4.2);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let explicit_target = Vec2::new(58.0, 76.0);
+    let action = SoccerAction::Pass {
+        target_player: Some(winger),
+        target_point: Some(explicit_target),
+        power: 0.72,
+        flight: PassFlight::Floor,
+    };
+    let target = sim.players[passer]
+        .action_target_trace(&action, &snapshot)
+        .expect("pass action target")
+        .point
+        .expect("pass target point");
+
+    assert!(
+        target.distance(explicit_target) < 1e-9,
+        "decision trace should record the explicit pass target: target={target:?}, explicit={explicit_target:?}"
+    );
+    assert!(
+        target.distance(sim.players[winger].position) > 1.0,
+        "fixture must prove the explicit trace target is distinct from receiver feet: {target:?}"
     );
 }
 
@@ -68032,6 +68148,7 @@ fn clean_targeted_floor_pass_completes_through_ball_agent_loop() {
         player_id: passer,
         action: SoccerAction::Pass {
             target_player: Some(receiver),
+            target_point: None,
             power: 0.45,
             flight: PassFlight::Floor,
         },
@@ -68131,6 +68248,7 @@ fn targeted_pass_completed_with_receiver_pressure(seed: u32, marked: bool) -> bo
         player_id: passer,
         action: SoccerAction::Pass {
             target_player: Some(receiver),
+            target_point: None,
             power: 0.70,
             flight: PassFlight::Floor,
         },
@@ -77014,6 +77132,7 @@ fn own_half_tiny_short_pass_is_illegal_without_upfield_outlet() {
         player_id: holder,
         action: SoccerAction::Pass {
             target_player: Some(tiny_tap),
+            target_point: None,
             power: 0.68,
             flight: PassFlight::Floor,
         },
@@ -84789,6 +84908,7 @@ fn not_shooting_inside_twenty_five_records_learning_penalty() {
         player_id: attacker,
         action: SoccerAction::Pass {
             target_player: Some(outlet),
+            target_point: None,
             power: 0.62,
             flight: PassFlight::Floor,
         },
@@ -87121,6 +87241,7 @@ fn killer_pass_over_top_clears_back_four_and_reaches_learning_surfaces() {
         player_id: attacker,
         action: SoccerAction::Pass {
             target_player: Some(runner),
+            target_point: None,
             power: 0.82,
             flight: PassFlight::OverTop,
         },
@@ -87380,6 +87501,7 @@ fn slip_break_offside_trap_ground_pass_releases_after_runner_starts() {
         player_id: passer,
         action: SoccerAction::Pass {
             target_player: Some(runner),
+            target_point: None,
             power: 0.72,
             flight: PassFlight::Floor,
         },

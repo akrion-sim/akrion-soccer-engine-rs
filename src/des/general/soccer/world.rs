@@ -80,6 +80,13 @@ const COMPLETED_PASS_LEARNING_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(5.0);
 const SHOT_OUTCOME_LEARNING_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(4.0);
 const DRIBBLE_BEAT_LEARNING_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(2.0);
 const LEARNED_MPC_REJECTED_ACTION_PENALTY_POINTS: f64 = 2.5;
+const FORWARD_PASS_ATTEMPT_REWARD_MIN_FORWARD_YARDS: f64 = 6.0;
+const FORWARD_PASS_ATTEMPT_REWARD_FULL_FORWARD_YARDS: f64 = 18.0;
+const FORWARD_PASS_ATTEMPT_REWARD_MIN_EXPECTED_COMPLETION: f64 = 0.47;
+const FORWARD_PASS_ATTEMPT_REWARD_MIN_RECEIVER_OPENNESS: f64 = 0.28;
+const FORWARD_PASS_ATTEMPT_REWARD_BASE_POINTS: f64 = 0.45;
+const FORWARD_PASS_ATTEMPT_REWARD_PROGRESS_POINTS: f64 = 1.35;
+const FORWARD_PASS_ATTEMPT_REWARD_MAX_POINTS: f64 = 2.2;
 const SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_SAMPLE_RATE: f64 = 0.35;
 const SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_ADVANTAGE_SCALE: f64 = 0.50;
 const SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_MAX_SAMPLE_WEIGHT: f64 = 1.60;
@@ -3175,6 +3182,69 @@ mod tests {
                 }),
             "full-game replay must also see delayed completed-pass credit"
         );
+    }
+
+    #[test]
+    fn forward_pass_attempt_reward_is_dense_but_quality_gated() {
+        let base = PendingPass {
+            team: Team::Home,
+            from: 1,
+            target: Some(2),
+            flight: PassFlight::Floor,
+            is_cross: false,
+            launch_tick: 12,
+            origin: Vec2::new(34.0, 42.0),
+            intended_target: Vec2::new(38.0, 56.0),
+            distance_yards: 14.56,
+            receiver_openness: 0.82,
+            passer_skill: 0.75,
+            launch_speed_yps: 17.0,
+            receiver_position_at_launch: Some(Vec2::new(38.0, 56.0)),
+            receiver_velocity_at_launch: Some(Vec2::zero()),
+            offside: None,
+            offside_candidates: Vec::new(),
+            learn_features: Vec::new(),
+            mpc_objective: None,
+        };
+
+        let good = forward_pass_attempt_reward_points(&base, 0.76);
+        assert!(
+            good > 0.9 && good < FORWARD_PASS_ATTEMPT_REWARD_MAX_POINTS,
+            "good forward-pass attempt should earn bounded dense credit, got {good}"
+        );
+
+        let mut low_completion = base.clone();
+        assert_eq!(
+            forward_pass_attempt_reward_points(&low_completion, 0.32),
+            0.0
+        );
+        low_completion.receiver_openness = 0.12;
+        assert_eq!(
+            forward_pass_attempt_reward_points(&low_completion, 0.85),
+            0.0
+        );
+
+        let mut to_nobody = base.clone();
+        to_nobody.target = None;
+        assert_eq!(forward_pass_attempt_reward_points(&to_nobody, 0.85), 0.0);
+
+        let mut backward = base.clone();
+        backward.intended_target = Vec2::new(38.0, 39.0);
+        assert_eq!(forward_pass_attempt_reward_points(&backward, 0.85), 0.0);
+
+        let mut cross = base.clone();
+        cross.is_cross = true;
+        assert_eq!(forward_pass_attempt_reward_points(&cross, 0.85), 0.0);
+
+        assert!(SoccerMatch::has_significant_learning_event(&[
+            SoccerRewardEvent {
+                tick: 12,
+                player_id: 1,
+                amount: good,
+                kind: SoccerRewardEventKind::ForwardPassAttempt,
+            },
+        ]));
+        assert!(!SoccerRewardEventKind::ForwardPassAttempt.is_positive_team_outcome());
     }
 
     #[test]
@@ -6757,16 +6827,19 @@ mod tests {
             "neural MCTS should score multiple concrete pass targets"
         );
         assert_eq!(expanded[0].action, "pass1");
-        assert_eq!(expanded[1].action, "pass2");
-        assert_ne!(expanded[0].target_player, expanded[1].target_player);
+        let pass2_plan = expanded
+            .iter()
+            .find(|plan| plan.action == "pass2")
+            .expect("second ranked pass target should remain available");
+        assert_ne!(expanded[0].target_player, pass2_plan.target_player);
         assert!(expanded[0].target_point.is_some());
-        assert!(expanded[1].target_point.is_some());
+        assert!(pass2_plan.target_point.is_some());
         let scored_ranked = sim.neural_decision_transition_for_plan(
             &base,
             &snapshot,
             actor_id,
             actor_team,
-            &expanded[1],
+            pass2_plan,
         );
         assert_eq!(scored_ranked.action, "pass2");
         assert_eq!(
@@ -6774,10 +6847,10 @@ mod tests {
                 .action_target
                 .as_ref()
                 .and_then(|target| target.player_id),
-            expanded[1].target_player
+            pass2_plan.target_player
         );
         let (_, executed_label) = sim.players[actor]
-            .action_from_learned_plan(&expanded[1], &snapshot, &observation)
+            .action_from_learned_plan(pass2_plan, &snapshot, &observation)
             .expect("target-specific learned pass should execute");
         assert_eq!(executed_label, "pass2");
     }
@@ -13920,9 +13993,11 @@ impl SoccerMatch {
                 let plan = plan.unwrap_or_else(|| {
                     Self::learned_plan_for_policy(policy, snapshot, player_id, label.clone())
                 });
+                let plan = Self::mpc_reconciled_learned_plan(policy, snapshot, player_id, plan);
+                record_pass_space_scored_plan_diag(snapshot, &plan);
                 return Some(SoccerLearnedDecisionPlan {
                     label,
-                    plan: Self::mpc_reconciled_learned_plan(policy, snapshot, player_id, plan),
+                    plan,
                     behavior_probability,
                     neural_mcts_selected,
                     neural_mcts_candidate_count,
@@ -13988,9 +14063,11 @@ impl SoccerMatch {
             let plan = plan.unwrap_or_else(|| {
                 Self::learned_plan_for_policy(learned_policy, snapshot, player_id, label.clone())
             });
+            let plan = Self::mpc_reconciled_learned_plan(learned_policy, snapshot, player_id, plan);
+            record_pass_space_scored_plan_diag(snapshot, &plan);
             SoccerLearnedDecisionPlan {
                 label,
-                plan: Self::mpc_reconciled_learned_plan(learned_policy, snapshot, player_id, plan),
+                plan,
                 behavior_probability,
                 neural_mcts_selected,
                 neural_mcts_candidate_count,
@@ -14254,7 +14331,7 @@ impl SoccerMatch {
                             .map(|sp| sp.distance(receiver_position) > 1.0)
                             .unwrap_or(false);
                         if pass_space_diag_enabled() {
-                            record_pass_space_diag(space_point.is_some(), distinct);
+                            record_pass_space_source_diag(space_point.is_some(), distinct);
                         }
                         if let Some(space_point) = space_point {
                             if distinct {
@@ -21388,6 +21465,55 @@ impl SoccerMatch {
         )
     }
 
+    fn forward_pass_attempt_expected_completion(&self, pass: &PendingPass, pressure: f64) -> f64 {
+        let lane_radius = if pass.flight.is_aerial() { 1.25 } else { 1.8 };
+        let nearest_lane_opponent = self
+            .players
+            .iter()
+            .filter(|player| player.team == pass.team.other())
+            .map(|opponent| {
+                segment_distance_to_point(pass.origin, pass.intended_target, opponent.position)
+            })
+            .fold(f64::INFINITY, f64::min);
+        let lane_safety = if nearest_lane_opponent.is_finite() {
+            ((nearest_lane_opponent - lane_radius) / 5.0).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let distance = soccer_finite_nonnegative_metric(pass.distance_yards);
+        let distance_fit = (1.0 - ((distance - 24.0) / 36.0).clamp(0.0, 0.55)).clamp(0.45, 1.0);
+        let travel_seconds = distance / pass.launch_speed_yps.max(1.0);
+        let speed_fit = (1.0 - ((travel_seconds - 1.35).abs() / 2.4)).clamp(0.35, 1.0);
+        let pressure_fit = (1.0 - pressure.clamp(0.0, 1.0) * 0.28).clamp(0.55, 1.0);
+        let openness = pass.receiver_openness.clamp(0.0, 1.0);
+        let skill = pass.passer_skill.clamp(0.0, 1.0);
+        (0.06
+            + openness * 0.30
+            + lane_safety * 0.32
+            + skill * 0.20
+            + speed_fit * 0.07
+            + distance_fit * 0.05)
+            .clamp(0.0, 1.0)
+            * pressure_fit
+    }
+
+    fn record_forward_pass_attempt_reward(&mut self, pass: &PendingPass, pressure: f64) {
+        if !dd_soccer_enable_forward_pass_attempt_reward() {
+            return;
+        }
+        let expected_completion = self.forward_pass_attempt_expected_completion(pass, pressure);
+        let amount = forward_pass_attempt_reward_points(pass, expected_completion);
+        if amount <= 1e-9 || !amount.is_finite() {
+            return;
+        }
+        self.record_reward_event_at_with_kind(
+            pass.launch_tick,
+            pass.from,
+            amount,
+            SoccerRewardEventKind::ForwardPassAttempt,
+        );
+    }
+
     pub(crate) fn record_completed_pass_reward(&mut self, pass: &PendingPass, receiver: usize) {
         let Some(passer) = self.players.get(pass.from) else {
             return;
@@ -24146,8 +24272,16 @@ impl SoccerMatch {
             | SoccerAction::Dribble(target)
             | SoccerAction::DribbleMove { target, .. }
             | SoccerAction::ControlTouch { target } => Some(*target),
-            SoccerAction::Pass { target_player, .. } => target_player
-                .and_then(|target_id| self.players.get(target_id).map(|target| target.position)),
+            SoccerAction::Pass {
+                target_player,
+                target_point,
+                ..
+            } => target_point.as_ref().copied().or_else(|| {
+                target_player
+                    .as_ref()
+                    .copied()
+                    .and_then(|target_id| self.players.get(target_id).map(|target| target.position))
+            }),
             SoccerAction::Clearance { target, .. } | SoccerAction::RouteOne { target, .. } => {
                 Some(*target)
             }
@@ -25619,6 +25753,7 @@ impl SoccerMatch {
             }
             SoccerAction::Pass {
                 target_player,
+                target_point,
                 mut power,
                 flight,
             } => {
@@ -25633,6 +25768,14 @@ impl SoccerMatch {
                                 && player.team == player_team
                         })
                     });
+                    let explicit_target_point = target_point
+                        .filter(|point| point.x.is_finite() && point.y.is_finite())
+                        .map(|point| {
+                            point.clamp_to_pitch(
+                                self.config.field_width_yards,
+                                self.config.field_length_yards,
+                            )
+                        });
                     // Keeper play-out keeps receiver choice upstream: learned plans, human input,
                     // and ranked pass labels name the teammate when available. Only a free keeper
                     // release (no explicit target) asks the MPC distribution helper to propose a
@@ -25678,7 +25821,7 @@ impl SoccerMatch {
                         *target_id = receiver;
                         point
                     };
-                    let mut target = match target_id {
+                    let mut target = explicit_target_point.unwrap_or_else(|| match target_id {
                         Some(id) => {
                             let aerial_point = if flight.is_aerial() {
                                 snapshot.projected_in_behind_pass_point(player_id, id)
@@ -25692,13 +25835,14 @@ impl SoccerMatch {
                                 .unwrap_or_else(|| resolve_outlet(&mut target_id))
                         }
                         None => resolve_outlet(&mut target_id),
+                    });
+                    let goalkeeper_play_out_plan = if explicit_target_point.is_none()
+                        && self.players[player_id].role == PlayerRole::Goalkeeper
+                    {
+                        snapshot.goalkeeper_mpc_play_out_plan(player_id, target_id)
+                    } else {
+                        None
                     };
-                    let goalkeeper_play_out_plan =
-                        if self.players[player_id].role == PlayerRole::Goalkeeper {
-                            snapshot.goalkeeper_mpc_play_out_plan(player_id, target_id)
-                        } else {
-                            None
-                        };
                     // Calm keeper distribution: a keeper holding in his hands inside his
                     // box is unstealable, so he is in no hurry. Rather than rolling/throwing
                     // the ball straight back to a nearby presser (e.g. the player who just
@@ -25807,13 +25951,14 @@ impl SoccerMatch {
                             slip_break_profile = SlipBreakOffsideTrapProfile::default();
                         }
                     }
-                    let over_top_killer_aim = if flight.is_over_top() {
-                        target_id.and_then(|id| {
-                            snapshot.killer_pass_over_top_aim_point_for(player_id, id)
-                        })
-                    } else {
-                        None
-                    };
+                    let over_top_killer_aim =
+                        if explicit_target_point.is_none() && flight.is_over_top() {
+                            target_id.and_then(|id| {
+                                snapshot.killer_pass_over_top_aim_point_for(player_id, id)
+                            })
+                        } else {
+                            None
+                        };
                     if let Some(aim) = over_top_killer_aim {
                         target = aim.clamp_to_pitch(
                             self.config.field_width_yards,
@@ -25884,6 +26029,11 @@ impl SoccerMatch {
                             self.config.field_width_yards,
                             self.config.field_length_yards,
                         )
+                    } else if let Some(point) = explicit_target_point {
+                        point.clamp_to_pitch(
+                            self.config.field_width_yards,
+                            self.config.field_length_yards,
+                        )
                     } else {
                         target_id
                             .and_then(|id| {
@@ -25920,6 +26070,7 @@ impl SoccerMatch {
                         && !flight.is_aerial()
                         && !is_one_two_give
                         && !slip_break_profile.available
+                        && explicit_target_point.is_none()
                     {
                         if let Some(id) = target_id {
                             if let Some((aim, v)) = snapshot.mpc_pass_execution(
@@ -26083,7 +26234,7 @@ impl SoccerMatch {
                     // the guard envelope.
                     // Captured with its launch features + reinforced by the delayed pass outcome (RWR).
                     let mpc_objective_sample: Option<(Vec<f32>, Vec2, f64)> =
-                        if learned_mpc_objective_enabled() {
+                        if learned_mpc_objective_enabled() && explicit_target_point.is_none() {
                             if let Some(head) = self.mpc_objective_head.clone() {
                                 let features = snapshot.mpc_objective_learn_features(
                                     player_team,
@@ -26293,24 +26444,26 @@ impl SoccerMatch {
                         speed
                     };
                     let mut distance = player_pos.distance(led_target);
-                    let mut aimed_target =
-                        if flight.is_over_top() || slip_break_profile.available {
-                            led_target
-                        } else {
-                            noisy_pass_target_with_receiver_openness(
-                                player_pos,
-                                led_target,
-                                effective_pass_skill,
-                                pressure,
-                                distance,
-                                receiver_openness,
-                                &mut self.rng,
-                            )
-                        }
-                        .clamp_to_pitch(
-                            self.config.field_width_yards,
-                            self.config.field_length_yards,
-                        );
+                    let mut aimed_target = if explicit_target_point.is_some()
+                        || flight.is_over_top()
+                        || slip_break_profile.available
+                    {
+                        led_target
+                    } else {
+                        noisy_pass_target_with_receiver_openness(
+                            player_pos,
+                            led_target,
+                            effective_pass_skill,
+                            pressure,
+                            distance,
+                            receiver_openness,
+                            &mut self.rng,
+                        )
+                    }
+                    .clamp_to_pitch(
+                        self.config.field_width_yards,
+                        self.config.field_length_yards,
+                    );
                     if !slip_break_profile.available {
                         if let Some(receiver_position) = target_id.and_then(|target| {
                             self.players
@@ -26723,6 +26876,15 @@ impl SoccerMatch {
                                 .map(|player| player.position)
                         })
                     });
+                    if pass_space_diag_enabled() && dd_soccer_enable_neural_pass_space() {
+                        if let Some(receiver_position) =
+                            receiver_position_at_launch.as_ref().copied()
+                        {
+                            record_pass_space_executed_diag(
+                                release_target.distance(receiver_position) > 1.0,
+                            );
+                        }
+                    }
                     let receiver_velocity_at_launch = target_id.and_then(|target| {
                         snapshot.player_velocity(target).or_else(|| {
                             self.players
@@ -26731,7 +26893,7 @@ impl SoccerMatch {
                                 .map(|player| player.velocity)
                         })
                     });
-                    self.pending_pass = Some(PendingPass {
+                    let pending_pass = PendingPass {
                         team: player_team,
                         from: player_id,
                         target: target_id,
@@ -26758,7 +26920,9 @@ impl SoccerMatch {
                             flight,
                         ),
                         mpc_objective: mpc_objective_sample,
-                    });
+                    };
+                    self.record_forward_pass_attempt_reward(&pending_pass, pressure);
+                    self.pending_pass = Some(pending_pass);
                     // Slip-and-break-the-offside-trap execution: a firm forward GROUND ball slipped
                     // to an ONSIDE runner who timed his break into a two-defender seam. Detect the
                     // opportunity once (the actual pass target IS the breaking runner) and use it
@@ -37021,40 +37185,173 @@ fn dd_soccer_enable_neural_pass_space() -> bool {
     *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_NEURAL_PASS_SPACE"))
 }
 
-/// Diagnostic-only (gated by `DD_SOCCER_DUMP_PASS_SPACE_DIAG`): counts, per pass-candidate
-/// expansion while the pass-space gate is on, how often the anticipated-reception estimator
-/// returns `Some` and how often that point is a distinct (>1yd-from-feet) lead — i.e. how often
-/// the space candidate is actually pushed. Resolves whether pass-space is inert at SOURCE with
-/// data instead of inference. No-op (byte-identical) unless the diag env is set.
+/// Forward-pass attempt shaping. Default-ON in prod because this is the anti-plateau learning
+/// bridge: the selector gets a small, dense reward for choosing a good forward-pass picture before
+/// sparse completion credit arrives. Default-OFF under tests to preserve parity unless a test opts
+/// in. `DD_SOCCER_ENABLE_FORWARD_PASS_ATTEMPT_REWARD=0` is the production kill switch.
+fn dd_soccer_enable_forward_pass_attempt_reward() -> bool {
+    #[cfg(test)]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_FORWARD_PASS_ATTEMPT_REWARD"))
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_FORWARD_PASS_ATTEMPT_REWARD"))
+    }
+}
+
+fn forward_pass_attempt_reward_points(pass: &PendingPass, expected_completion: f64) -> f64 {
+    if pass.target.is_none() || pass.is_cross || pass.offside.is_some() {
+        return 0.0;
+    }
+    let forward_yards = (pass.intended_target.y - pass.origin.y) * pass.team.attack_dir();
+    if forward_yards < FORWARD_PASS_ATTEMPT_REWARD_MIN_FORWARD_YARDS {
+        return 0.0;
+    }
+    let expected_completion = expected_completion.clamp(0.0, 1.0);
+    let receiver_openness = pass.receiver_openness.clamp(0.0, 1.0);
+    if expected_completion < FORWARD_PASS_ATTEMPT_REWARD_MIN_EXPECTED_COMPLETION
+        || receiver_openness < FORWARD_PASS_ATTEMPT_REWARD_MIN_RECEIVER_OPENNESS
+    {
+        return 0.0;
+    }
+    let progress = ((forward_yards - FORWARD_PASS_ATTEMPT_REWARD_MIN_FORWARD_YARDS)
+        / (FORWARD_PASS_ATTEMPT_REWARD_FULL_FORWARD_YARDS
+            - FORWARD_PASS_ATTEMPT_REWARD_MIN_FORWARD_YARDS)
+            .max(1.0))
+    .clamp(0.0, 1.0);
+    let aerial_multiplier = if pass.flight.is_aerial() { 0.65 } else { 1.0 };
+    let quality_multiplier = 0.35 + expected_completion * 0.65;
+    let openness_multiplier = 0.80 + receiver_openness * 0.20;
+    ((FORWARD_PASS_ATTEMPT_REWARD_BASE_POINTS
+        + progress * FORWARD_PASS_ATTEMPT_REWARD_PROGRESS_POINTS)
+        * quality_multiplier
+        * openness_multiplier
+        * aerial_multiplier)
+        .clamp(0.0, FORWARD_PASS_ATTEMPT_REWARD_MAX_POINTS)
+}
+
+/// Diagnostic-only (gated by `DD_SOCCER_DUMP_PASS_SPACE_DIAG`): counts pass-space survival at
+/// SOURCE candidate expansion, SCORED winning-plan selection, and EXECUTED launch. No-op
+/// (byte-identical) unless the diag env is set.
 fn pass_space_diag_enabled() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DUMP_PASS_SPACE_DIAG").is_ok())
 }
 
-static PASS_SPACE_DIAG_REACHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static PASS_SPACE_DIAG_SOME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static PASS_SPACE_DIAG_DISTINCT: std::sync::atomic::AtomicU64 =
+const PASS_SPACE_DIAG_DEFAULT_LOG_EVERY: u64 = 200;
+
+static PASS_SPACE_DIAG_SOURCE_REACHED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static PASS_SPACE_DIAG_SOURCE_SOME: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static PASS_SPACE_DIAG_SOURCE_DISTINCT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static PASS_SPACE_DIAG_SCORED_REACHED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static PASS_SPACE_DIAG_SCORED_DISTINCT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static PASS_SPACE_DIAG_EXECUTED_REACHED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static PASS_SPACE_DIAG_EXECUTED_DISTINCT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-fn record_pass_space_diag(estimator_some: bool, distinct: bool) {
+fn pass_space_diag_rate(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
+fn log_pass_space_diag() {
     use std::sync::atomic::Ordering::Relaxed;
-    let reached = PASS_SPACE_DIAG_REACHED.fetch_add(1, Relaxed) + 1;
+    let source_reached = PASS_SPACE_DIAG_SOURCE_REACHED.load(Relaxed);
+    let source_some = PASS_SPACE_DIAG_SOURCE_SOME.load(Relaxed);
+    let source_distinct = PASS_SPACE_DIAG_SOURCE_DISTINCT.load(Relaxed);
+    let scored_reached = PASS_SPACE_DIAG_SCORED_REACHED.load(Relaxed);
+    let scored_distinct = PASS_SPACE_DIAG_SCORED_DISTINCT.load(Relaxed);
+    let executed_reached = PASS_SPACE_DIAG_EXECUTED_REACHED.load(Relaxed);
+    let executed_distinct = PASS_SPACE_DIAG_EXECUTED_DISTINCT.load(Relaxed);
+    eprintln!(
+        "pass_space_diag source_reached={source_reached} source_estimator_some={source_some} \
+         source_distinct_gt1yd={source_distinct} source_some_rate={:.3} \
+         source_distinct_rate={:.3} scored_reached={scored_reached} \
+         scored_distinct_gt1yd={scored_distinct} scored_distinct_rate={:.3} \
+         executed_reached={executed_reached} executed_distinct_gt1yd={executed_distinct} \
+         executed_distinct_rate={:.3}",
+        pass_space_diag_rate(source_some, source_reached),
+        pass_space_diag_rate(source_distinct, source_reached),
+        pass_space_diag_rate(scored_distinct, scored_reached),
+        pass_space_diag_rate(executed_distinct, executed_reached),
+    );
+}
+
+fn maybe_log_pass_space_diag(sample_count: u64) {
+    use std::sync::OnceLock;
+    static LOG_EVERY: OnceLock<u64> = OnceLock::new();
+    let log_every = *LOG_EVERY.get_or_init(|| {
+        std::env::var("DD_SOCCER_PASS_SPACE_DIAG_LOG_EVERY")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(PASS_SPACE_DIAG_DEFAULT_LOG_EVERY)
+    });
+    if log_every > 0 && sample_count > 0 && sample_count % log_every == 0 {
+        log_pass_space_diag();
+    }
+}
+
+fn record_pass_space_source_diag(estimator_some: bool, distinct: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let reached = PASS_SPACE_DIAG_SOURCE_REACHED.fetch_add(1, Relaxed) + 1;
     if estimator_some {
-        PASS_SPACE_DIAG_SOME.fetch_add(1, Relaxed);
+        PASS_SPACE_DIAG_SOURCE_SOME.fetch_add(1, Relaxed);
     }
     if distinct {
-        PASS_SPACE_DIAG_DISTINCT.fetch_add(1, Relaxed);
+        PASS_SPACE_DIAG_SOURCE_DISTINCT.fetch_add(1, Relaxed);
     }
-    if reached % 2000 == 0 {
-        let some = PASS_SPACE_DIAG_SOME.load(Relaxed);
-        let dist = PASS_SPACE_DIAG_DISTINCT.load(Relaxed);
-        eprintln!(
-            "pass_space_diag reached={reached} estimator_some={some} distinct_gt1yd={dist} \
-             some_rate={:.3} distinct_rate={:.3}",
-            some as f64 / reached as f64,
-            dist as f64 / reached as f64,
-        );
+    maybe_log_pass_space_diag(reached);
+}
+
+fn record_pass_space_scored_diag(distinct: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let reached = PASS_SPACE_DIAG_SCORED_REACHED.fetch_add(1, Relaxed) + 1;
+    if distinct {
+        PASS_SPACE_DIAG_SCORED_DISTINCT.fetch_add(1, Relaxed);
+    }
+    maybe_log_pass_space_diag(reached);
+}
+
+fn record_pass_space_executed_diag(distinct: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let reached = PASS_SPACE_DIAG_EXECUTED_REACHED.fetch_add(1, Relaxed) + 1;
+    if distinct {
+        PASS_SPACE_DIAG_EXECUTED_DISTINCT.fetch_add(1, Relaxed);
+    }
+    maybe_log_pass_space_diag(reached);
+}
+
+fn record_pass_space_scored_plan_diag(snapshot: &WorldSnapshot, plan: &SoccerLearnedPlan) {
+    if !pass_space_diag_enabled() || !dd_soccer_enable_neural_pass_space() {
+        return;
+    }
+    if pass_like_action_flight(normalize_soccer_action_label(&plan.action)).is_none() {
+        return;
+    }
+    let Some(target_id) = plan.target_player else {
+        return;
+    };
+    if let Some(receiver_position) = snapshot.player_position(target_id) {
+        let distinct = plan
+            .target_point
+            .map(|point| point.distance(receiver_position) > 1.0)
+            .unwrap_or(false);
+        record_pass_space_scored_diag(distinct);
     }
 }
 
@@ -38691,6 +38988,7 @@ impl WorldSnapshot {
             SoccerSetPlayReleaseKind::Pass => match resolve_floor_receiver() {
                 Some(id) => SoccerAction::Pass {
                     target_player: Some(id),
+                    target_point: None,
                     power: release_power,
                     flight: PassFlight::Floor,
                 },
@@ -38699,6 +38997,7 @@ impl WorldSnapshot {
             SoccerSetPlayReleaseKind::AerialPass => match resolve_aerial_receiver() {
                 Some(id) => SoccerAction::Pass {
                     target_player: Some(id),
+                    target_point: None,
                     power: release_power,
                     flight: PassFlight::Aerial,
                 },

@@ -99,8 +99,16 @@ spec:
               require_value DD_SOCCER_ENABLE_LOOSE_BALL_COMMIT_MODEL true
               require_value DD_SOCCER_ENABLE_LEARNED_SPACING_TARGET true
               require_value DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE true
+              require_value DD_SOCCER_ENABLE_LEARNED_PASS_RECEIVER true
+              require_value DD_SOCCER_ENABLE_NEURAL_PASS_SPACE true
+              require_value DD_SOCCER_ENABLE_DISCRETIZED_KICK true
+              require_value DD_SOCCER_ENABLE_SCORED_SHOT_PLACEMENT true
               require_value DD_SOCCER_FORWARD_PASS_REWARD_SCALE 6
               require_value DD_SOCCER_SHOT_SHAPING_REWARD_SCALE 0.4
+              require_value SOCCER_EVAL_REQUIRE_FORWARD_PASS_CLIMB true
+              require_value SOCCER_EVAL_MIN_FORWARD_PASS_MARGIN 0
+              require_value SOCCER_EVAL_MIN_NET_FORWARD_PASS_MARGIN 0
+              require_value SOCCER_EVAL_MIN_FORWARD_PASS_RATE_MARGIN 0.0
 
               echo "continuous_started_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
               echo "postgres_required=${SOCCER_REQUIRE_POSTGRES}"
@@ -114,8 +122,16 @@ spec:
               echo "flush_before_new_sim=${SOCCER_POSTGRES_FLUSH_POLICY_VERSIONS_BEFORE_NEW_SIM}"
               echo "refresh_with_resume=${SOCCER_POSTGRES_REFRESH_WITH_RESUME_ARTIFACT}"
               echo "learned_mpc_objective=${DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE}"
+              echo "learned_pass_receiver=${DD_SOCCER_ENABLE_LEARNED_PASS_RECEIVER}"
+              echo "neural_pass_space=${DD_SOCCER_ENABLE_NEURAL_PASS_SPACE}"
+              echo "discretized_kick=${DD_SOCCER_ENABLE_DISCRETIZED_KICK}"
+              echo "scored_shot_placement=${DD_SOCCER_ENABLE_SCORED_SHOT_PLACEMENT}"
               echo "forward_pass_reward_scale=${DD_SOCCER_FORWARD_PASS_REWARD_SCALE}"
               echo "shot_shaping_reward_scale=${DD_SOCCER_SHOT_SHAPING_REWARD_SCALE}"
+              echo "eval_forward_pass_climb=${SOCCER_EVAL_REQUIRE_FORWARD_PASS_CLIMB}"
+              echo "eval_forward_pass_margin=${SOCCER_EVAL_MIN_FORWARD_PASS_MARGIN}"
+              echo "eval_net_forward_pass_margin=${SOCCER_EVAL_MIN_NET_FORWARD_PASS_MARGIN}"
+              echo "eval_forward_pass_rate_margin=${SOCCER_EVAL_MIN_FORWARD_PASS_RATE_MARGIN}"
               echo "source_ref=${source_ref}"
               echo "engine_ref=${engine_ref}"
 
@@ -333,10 +349,26 @@ spec:
               value: "true"
             - name: DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE
               value: "true"
+            - name: DD_SOCCER_ENABLE_LEARNED_PASS_RECEIVER
+              value: "true"
+            - name: DD_SOCCER_ENABLE_NEURAL_PASS_SPACE
+              value: "true"
+            - name: DD_SOCCER_ENABLE_DISCRETIZED_KICK
+              value: "true"
+            - name: DD_SOCCER_ENABLE_SCORED_SHOT_PLACEMENT
+              value: "true"
             - name: DD_SOCCER_FORWARD_PASS_REWARD_SCALE
               value: "6"
             - name: DD_SOCCER_SHOT_SHAPING_REWARD_SCALE
               value: "0.4"
+            - name: SOCCER_EVAL_REQUIRE_FORWARD_PASS_CLIMB
+              value: "true"
+            - name: SOCCER_EVAL_MIN_FORWARD_PASS_MARGIN
+              value: "0"
+            - name: SOCCER_EVAL_MIN_NET_FORWARD_PASS_MARGIN
+              value: "0"
+            - name: SOCCER_EVAL_MIN_FORWARD_PASS_RATE_MARGIN
+              value: "0.0"
             - name: SOCCER_PG_PASS_COMPLETION_SAMPLE_LIMIT
               value: "50000"
             - name: SOCCER_PG_PASS_COMPLETION_EPOCHS

@@ -610,3 +610,51 @@ The ceiling is structural: the net is a *selector over analytic candidates* opti
 Wilson>0.5 vs frozen field; Step 1 global heads-ON/OFF SOT A/B), then raise the real ceiling by
 replacing the territorial signal — in both the on-ball PBRS and the off-ball residual reward —
 with **one calibrated learned EPV potential**, which first requires a possession-chain export.
+
+## Rounds 18–19 — operator KPI reframe + timidity diagnosis (2026-07-09)
+
+**Operator architecture (the spine):** learn passing/dribbling/shooting/formation as two layers —
+**POMDP decides** (neural + DP: action-type, receiver / pass-to-space, shot type+placement, dribble
+type+lane, formation intent); **MPC executes** (neural + QP: trajectory, power, aim, first-touch,
+off-ball). Wherever a *decision* lives in the analytic layer, that skill can't be learned.
+
+**KPI reframe:** parity is now **completed forward passes vs the analytic field**, meter =
+`AdvancementRecord` (soccer_eval_gate_run.rs:251 scores W/D/L by completed-forward-passes only).
+Re-running it (the line was previously grep-swallowed + the deployed binary was stale) exposed the
+real picture:
+
+| net | FP-payoff (parity 0.500) | passes/game |
+|---|---|---|
+| fwd-pass-primacy (×6, shot×0.4) | **0.283** | ~19 |
+| climb-base (CQ+uncrushed, best-0.500) | **0.358** | ~19 |
+| analytic | — | **~36** |
+
+Two facts reframe everything: (1) we're far below parity; (2) the primacy net is **worse on its own
+target metric**, and the gap is passing **VOLUME, not forward-bias** (forward *share* ~6–7% both
+sides). **The net is timid** — hoards/dribbles instead of passing. So r14–r16's GD/mean-payoff
+"falsifications" judged the wrong axis; they don't falsify the forward-pass objective.
+
+**Codex r18:** accepts the reframe + meter (caveat: "net of turnovers" = interceptions only; safe
+recycling can inflate volume — needs quality guards). Prior = **timidity/action-selection, not
+forward bias**. Prescribes an opportunity-conditioned **pass-rate** diagnostic (among on-ball
+decisions with visible forward options + decent expected completion, how often chose pass — that IS
+the POMDP's action-type decision quality). Prefers a **bounded anti-hold carrot over removing the
+turnover stick** (source already admits under-rewarded advancement → timidity, soccer.rs:2122).
+`LEARNED_PASS_RECEIVER` is **downstream** (post pass-normalization, world.rs:16431) — won't fix a
+policy that rarely chooses pass; pessimistic `LEARNED_PASS_COMPLETION` could make a timid actor more
+timid. **Locked kill-discriminator:** an arm survives only if FP-payoff > 0.358 (→0.500) AND
+completed-forward margin improves AND net-forward doesn't regress AND forward-share doesn't fall AND
+pass-gain-yards margin rises AND no completion-rate collapse AND (intercept+loose-ball)/completed-fwd
+doesn't worsen; kill if payoff rises only from safe volume with forward-share falling.
+
+**Experiments:** de-timid A/B — Arm B (FWD=3, turnover-penalty OFF) **train FAILED (no frontier)**;
+Arm A (FWD=6, shots normal — is shot-damping the poison?) trained, FP-eval landing. scale-10 MPC-off
+A/B: per-game forward counts **cand ≤ base** (×10 reward buys no extra forward passes → not a
+magnitude problem). Pass-`target_point` plumbing landed on main (fa47c82).
+
+**Claude r19 (driving live):** locked the discriminator; asked Codex to (A) spec the bounded
+anti-hold carrot precisely (existing term vs new; env-knob + range, default byte-identical; cap so it
+can't out-earn shot/goal or reward recycling; guardrail tied to the discriminator), and (B) confirm
+the order — fix action-selection (raise pass-choice via carrot) until opportunity-conditioned
+pass-rate ≈ analytic, THEN learned completion/receiver for target quality, with target_point aim on
+top. Bonus: reward problem or interface problem, now that it's volume not bias? *(reply pending)*

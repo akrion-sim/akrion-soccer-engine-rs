@@ -22,6 +22,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::time::Instant;
 
@@ -607,6 +608,7 @@ fn play_checkpoint_validation(
 ) -> LeagueRoundKpis {
     let mut validation = LeagueRoundKpis::default();
     let mut runner = runner.clone();
+    println!("league_checkpoint_validation_start round={round} games={games}");
     for g in 0..games {
         let candidate_home = g % 2 == 0;
         let seed = 0xC1A0_0000u32
@@ -629,15 +631,25 @@ fn play_checkpoint_validation(
             home_learns: false,
             away_learns: false,
         };
-        match runner.play(&ctx, home, away) {
-            Ok(outcome) => {
-                validation.add(LeagueMatchKpis::from_summary(
-                    &outcome.summary,
-                    candidate_team,
-                ));
+        match std::panic::catch_unwind(AssertUnwindSafe(|| runner.play(&ctx, home, away))) {
+            Ok(Ok(outcome)) => {
+                let kpis = LeagueMatchKpis::from_summary(&outcome.summary, candidate_team);
+                println!(
+                    "league_checkpoint_validation_game round={round} game={} candidate_home={} score={}-{} forward_pass_margin={} objective_margin={:.3}",
+                    g,
+                    candidate_home,
+                    outcome.home_goals,
+                    outcome.away_goals,
+                    kpis.forward_pass_margin,
+                    kpis.objective_fitness_margin,
+                );
+                validation.add(kpis);
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 eprintln!("league_checkpoint_validation_error round={round} game={g}: {err}");
+            }
+            Err(_) => {
+                eprintln!("league_checkpoint_validation_panic round={round} game={g}");
             }
         }
     }
@@ -676,6 +688,7 @@ fn main() {
         "SOCCER_LEAGUE_CHECKPOINT_VALIDATE_MIN_OBJECTIVE_MARGIN",
         0.0,
     );
+    let max_rounds = env_usize("SOCCER_LEAGUE_MAX_ROUNDS", 0);
 
     let mut runner_config = EngineMatchRunnerConfig::default();
     runner_config.base.duration_seconds = minutes * 60.0;
@@ -776,8 +789,8 @@ fn main() {
     let mut round = 0u32;
     let mut best_checkpoint_forward_pass_margin = f64::NEG_INFINITY;
     println!(
-        "league_train_started_at_utc={} games/opp={} minutes={} weight_decay={} fresh_opp={} checkpoint_every={} max_target_entries_per_side={} advancement_metric=completed_forward_passes league_neural_mcts_enabled={} mpc_tier2_enabled={} mpc_reconcile_enabled={} mpc_field_aware_enabled={} mpc_latent_objective_enabled={} local_mpc_enabled={} checkpoint_require_forward_pass_climb={} checkpoint_max_forward_pass_regression={} checkpoint_min_forward_pass_margin={} checkpoint_validate_games={} checkpoint_validate_min_forward_pass_margin={} checkpoint_validate_min_objective_margin={} frontier={} candidate_frontier={} archive={}",
-        chrono_now(), games_per_opp, minutes, weight_decay, fresh_opponents, checkpoint_every, max_target_entries_per_side, league_neural_mcts_enabled, mpc_tier2_enabled, mpc_reconcile_enabled, mpc_field_aware_enabled, mpc_latent_objective_enabled, local_mpc_enabled, checkpoint_require_forward_pass_climb, checkpoint_max_forward_pass_regression, checkpoint_min_forward_pass_margin, checkpoint_validate_games, checkpoint_validate_min_forward_pass_margin, checkpoint_validate_min_objective_margin, frontier_path, candidate_frontier_path, archive_dir
+        "league_train_started_at_utc={} games/opp={} minutes={} weight_decay={} fresh_opp={} checkpoint_every={} max_rounds={} max_target_entries_per_side={} advancement_metric=completed_forward_passes league_neural_mcts_enabled={} mpc_tier2_enabled={} mpc_reconcile_enabled={} mpc_field_aware_enabled={} mpc_latent_objective_enabled={} local_mpc_enabled={} checkpoint_require_forward_pass_climb={} checkpoint_max_forward_pass_regression={} checkpoint_min_forward_pass_margin={} checkpoint_validate_games={} checkpoint_validate_min_forward_pass_margin={} checkpoint_validate_min_objective_margin={} frontier={} candidate_frontier={} archive={}",
+        chrono_now(), games_per_opp, minutes, weight_decay, fresh_opponents, checkpoint_every, max_rounds, max_target_entries_per_side, league_neural_mcts_enabled, mpc_tier2_enabled, mpc_reconcile_enabled, mpc_field_aware_enabled, mpc_latent_objective_enabled, local_mpc_enabled, checkpoint_require_forward_pass_climb, checkpoint_max_forward_pass_regression, checkpoint_min_forward_pass_margin, checkpoint_validate_games, checkpoint_validate_min_forward_pass_margin, checkpoint_validate_min_objective_margin, frontier_path, candidate_frontier_path, archive_dir
     );
 
     loop {
@@ -1019,17 +1032,13 @@ fn main() {
         if round % (checkpoint_every as u32) == 0 {
             if frontier.neural.is_some() {
                 let prior_best = best_checkpoint_forward_pass_margin;
-                let passes_forward_pass_climb = !checkpoint_require_forward_pass_climb
-                    || !prior_best.is_finite()
-                    || mean_forward_pass_margin + checkpoint_max_forward_pass_regression
-                        >= prior_best;
-                let passes_forward_pass_floor =
-                    mean_forward_pass_margin > checkpoint_min_forward_pass_margin;
                 let validation = if checkpoint_validate_games > 0 {
+                    let checkpoint_incumbent =
+                        load_brain(&frontier_path).unwrap_or_else(|| checkpoint_baseline.clone());
                     let validation = play_checkpoint_validation(
                         &runner,
                         &frontier,
-                        &checkpoint_baseline,
+                        &checkpoint_incumbent,
                         round,
                         checkpoint_validate_games,
                     );
@@ -1047,10 +1056,21 @@ fn main() {
                 } else {
                     None
                 };
+                let validation_forward_pass_margin =
+                    validation.as_ref().map(|v| v.mean_forward_pass_margin());
+                let gate_forward_pass_margin =
+                    validation_forward_pass_margin.unwrap_or(mean_forward_pass_margin);
+                let passes_forward_pass_climb = !checkpoint_require_forward_pass_climb
+                    || !prior_best.is_finite()
+                    || gate_forward_pass_margin + checkpoint_max_forward_pass_regression
+                        >= prior_best;
+                let passes_forward_pass_floor =
+                    gate_forward_pass_margin > checkpoint_min_forward_pass_margin;
                 let passes_validation = match validation.as_ref() {
                     Some(validation) => {
-                        validation.mean_forward_pass_margin()
-                            > checkpoint_validate_min_forward_pass_margin
+                        validation.games == checkpoint_validate_games
+                            && validation.mean_forward_pass_margin()
+                                > checkpoint_validate_min_forward_pass_margin
                             && validation.mean_objective_fitness_margin()
                                 > checkpoint_validate_min_objective_margin
                     }
@@ -1068,16 +1088,18 @@ fn main() {
                     if let Err(e) = write_frontier(&frontier_path, &frontier) {
                         eprintln!("league_publish_write_error: {e}");
                     }
-                    if mean_forward_pass_margin > best_checkpoint_forward_pass_margin {
-                        best_checkpoint_forward_pass_margin = mean_forward_pass_margin;
+                    if gate_forward_pass_margin > best_checkpoint_forward_pass_margin {
+                        best_checkpoint_forward_pass_margin = gate_forward_pass_margin;
                     }
                     println!(
-                        "league_checkpoint round={round} metric=completed_forward_passes forward_pass_margin_per_game={mean_forward_pass_margin:.3} best_forward_pass_margin_per_game={best_checkpoint_forward_pass_margin:.3} -> {cp}"
+                        "league_checkpoint round={round} metric=completed_forward_passes gate_forward_pass_margin_per_game={gate_forward_pass_margin:.3} train_forward_pass_margin_per_game={mean_forward_pass_margin:.3} best_forward_pass_margin_per_game={best_checkpoint_forward_pass_margin:.3} -> {cp}"
                     );
                 } else {
                     println!(
-                        "league_checkpoint_held round={round} metric=completed_forward_passes forward_pass_margin_per_game={mean_forward_pass_margin:.3} best_forward_pass_margin_per_game={prior_best:.3} require_climb={} min_margin={checkpoint_min_forward_pass_margin:.3} validation_passed={passes_validation}",
-                        checkpoint_require_forward_pass_climb
+                        "league_checkpoint_held round={round} metric=completed_forward_passes gate_forward_pass_margin_per_game={gate_forward_pass_margin:.3} train_forward_pass_margin_per_game={mean_forward_pass_margin:.3} best_forward_pass_margin_per_game={prior_best:.3} require_climb={} min_margin={checkpoint_min_forward_pass_margin:.3} validation_passed={passes_validation} validation_games={}/{}",
+                        checkpoint_require_forward_pass_climb,
+                        validation.as_ref().map(|validation| validation.games).unwrap_or(0),
+                        checkpoint_validate_games,
                     );
                 }
             }
@@ -1091,6 +1113,10 @@ fn main() {
             frontier.away_target_entries.len(),
             started.elapsed().as_secs_f64()
         );
+        if max_rounds > 0 && round as usize >= max_rounds {
+            println!("league_train_stopped max_rounds={max_rounds} rounds_completed={round}");
+            break;
+        }
     }
 }
 

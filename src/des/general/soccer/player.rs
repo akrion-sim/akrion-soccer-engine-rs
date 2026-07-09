@@ -44,6 +44,12 @@ fn dd_soccer_disable_first_touch_escape() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_FIRST_TOUCH_ESCAPE").is_ok())
 }
+
+fn dd_soccer_enable_neural_pass_space() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_NEURAL_PASS_SPACE"))
+}
 /// Gate (default-ON) for the crowded won-ball escape floor: a player who has just won possession in
 /// traffic gets a probability floor on the break-into-space action family so it accelerates AWAY
 /// from the nearest presser into the open lane instead of settling into a shield/recycle. Set
@@ -7873,6 +7879,7 @@ impl PlayerAgent {
             SoccerAction::DribbleMove { target, touch, .. } => (*target, None, Some(*touch)),
             SoccerAction::Pass {
                 target_player,
+                target_point,
                 power,
                 flight,
                 ..
@@ -7887,21 +7894,23 @@ impl PlayerAgent {
                     })
                     .or_else(|| snapshot.best_pass_target(self.id));
                 let passer_position = snapshot.player_position(self.id).unwrap_or(self.position);
-                let point = resolved_target
-                    .and_then(|id| {
-                        let target_position = snapshot.player_position(id)?;
-                        let is_cross = pass_would_be_cross(
-                            passer_position,
-                            target_position,
-                            self.team,
-                            snapshot.field_width,
-                            snapshot.field_length,
-                        );
-                        let speed =
-                            pass_speed_yps_from_power(*power, *flight, is_cross, &self.skills);
-                        snapshot
-                            .anticipated_pass_reception_point(self.id, id, *flight, speed)
-                            .or(Some(target_position))
+                let point = (*target_point)
+                    .or_else(|| {
+                        resolved_target.and_then(|id| {
+                            let target_position = snapshot.player_position(id)?;
+                            let is_cross = pass_would_be_cross(
+                                passer_position,
+                                target_position,
+                                self.team,
+                                snapshot.field_width,
+                                snapshot.field_length,
+                            );
+                            let speed =
+                                pass_speed_yps_from_power(*power, *flight, is_cross, &self.skills);
+                            snapshot
+                                .anticipated_pass_reception_point(self.id, id, *flight, speed)
+                                .or(Some(target_position))
+                        })
                     })
                     .unwrap_or_else(|| {
                         Vec2::new(
@@ -8048,6 +8057,7 @@ impl PlayerAgent {
             Some(id) => Some((
                 SoccerAction::Pass {
                     target_player: Some(id),
+                    target_point: None,
                     power,
                     flight,
                 },
@@ -8350,6 +8360,7 @@ impl PlayerAgent {
             return (
                 SoccerAction::Pass {
                     target_player: Some(target),
+                    target_point: None,
                     power,
                     flight,
                 },
@@ -8822,6 +8833,7 @@ impl PlayerAgent {
                         (
                             SoccerAction::Pass {
                                 target_player: input.target_player,
+                                target_point: None,
                                 power: if restart_label == "throw-in" {
                                     0.58
                                 } else {
@@ -9182,6 +9194,7 @@ impl PlayerAgent {
                     let action = if let Some(target_player) = plan.target_player {
                         SoccerAction::Pass {
                             target_player: Some(target_player),
+                            target_point: None,
                             power: plan.power,
                             flight: plan.flight,
                         }
@@ -9316,6 +9329,7 @@ impl PlayerAgent {
                 // logic was turning most chosen wall passes into unrelated possessions.
                 let action = SoccerAction::Pass {
                     target_player: Some(runner),
+                    target_point: None,
                     power: WALL_PASS_GIVE_POWER + 0.22 * ability01(self.skills.passing),
                     flight: PassFlight::Floor,
                 };
@@ -9343,6 +9357,7 @@ impl PlayerAgent {
                 if give_and_go_strategy && plan.quality >= WALL_PASS_STRATEGY_COMMIT_MIN_QUALITY {
                     let action = SoccerAction::Pass {
                         target_player: Some(plan.wall_partner),
+                        target_point: None,
                         power: WALL_PASS_GIVE_POWER + 0.20 * passing_skill,
                         flight: PassFlight::Floor,
                     };
@@ -9503,6 +9518,7 @@ impl PlayerAgent {
                             let candidate_label = "killer-pass".to_string();
                             let candidate_action = SoccerAction::Pass {
                                 target_player: Some(target),
+                                target_point: None,
                                 power: 0.66
                                     + 0.24 * passing_skill.max(ability01(self.skills.vision)),
                                 flight: snapshot.killer_pass_flight_for(self.id, &pass_targets),
@@ -9533,6 +9549,7 @@ impl PlayerAgent {
                         let candidate_label = "first-time-pass".to_string();
                         let candidate_action = SoccerAction::Pass {
                             target_player: Some(target),
+                            target_point: None,
                             power: 0.54 + 0.30 * passing_skill,
                             flight: PassFlight::Floor,
                         };
@@ -9557,6 +9574,7 @@ impl PlayerAgent {
                         let candidate_label = "flick-on".to_string();
                         let candidate_action = SoccerAction::Pass {
                             target_player: Some(target),
+                            target_point: None,
                             power: 0.46
                                 + 0.26
                                     * aerial_duel_skill_from_agent(self)
@@ -9880,6 +9898,7 @@ impl PlayerAgent {
                     ) {
                         let action = SoccerAction::Pass {
                             target_player: Some(target),
+                            target_point: None,
                             power: 0.80 + 0.14 * crossing.max(passing_skill),
                             flight: PassFlight::Aerial,
                         };
@@ -11275,6 +11294,7 @@ impl PlayerAgent {
                                 chosen = Some((
                                     SoccerAction::Pass {
                                         target_player: Some(target),
+                                        target_point: None,
                                         power: 0.60 + 0.26 * crossing.max(passing_skill),
                                         flight: PassFlight::Floor,
                                     },
@@ -11300,6 +11320,7 @@ impl PlayerAgent {
                                 chosen = Some((
                                     SoccerAction::Pass {
                                         target_player: Some(target),
+                                        target_point: None,
                                         power: 0.64 + 0.28 * crossing.max(passing_skill),
                                         flight: PassFlight::Aerial,
                                     },
@@ -11326,6 +11347,7 @@ impl PlayerAgent {
                                 chosen = Some((
                                     SoccerAction::Pass {
                                         target_player: Some(target),
+                                        target_point: None,
                                         power: 0.62 + 0.28 * crossing.max(passing_skill),
                                         flight: PassFlight::Floor,
                                     },
@@ -11336,6 +11358,7 @@ impl PlayerAgent {
                                 chosen = Some((
                                     SoccerAction::Pass {
                                         target_player: Some(target),
+                                        target_point: None,
                                         power: 0.66 + 0.28 * crossing.max(passing_skill),
                                         flight: PassFlight::Aerial,
                                     },
@@ -11360,6 +11383,7 @@ impl PlayerAgent {
                                 chosen = Some((
                                     SoccerAction::Pass {
                                         target_player: Some(target),
+                                        target_point: None,
                                         power: 0.66
                                             + 0.24
                                                 * passing_skill.max(ability01(self.skills.vision)),
@@ -11387,6 +11411,7 @@ impl PlayerAgent {
                                 chosen = Some((
                                     SoccerAction::Pass {
                                         target_player: Some(target),
+                                        target_point: None,
                                         power: 0.46 + 0.22 * passing_skill,
                                         flight: PassFlight::Floor,
                                     },
@@ -11411,6 +11436,7 @@ impl PlayerAgent {
                                 chosen = Some((
                                     SoccerAction::Pass {
                                         target_player: Some(target),
+                                        target_point: None,
                                         power: 0.62
                                             + 0.24
                                                 * passing_skill
@@ -11436,6 +11462,7 @@ impl PlayerAgent {
                                 chosen = Some((
                                     SoccerAction::Pass {
                                         target_player: Some(scoop_target),
+                                        target_point: None,
                                         power: 0.5,
                                         flight: PassFlight::Scoop,
                                     },
@@ -11458,6 +11485,7 @@ impl PlayerAgent {
                                 chosen = Some((
                                     SoccerAction::Pass {
                                         target_player: Some(target),
+                                        target_point: None,
                                         power: 0.50
                                             + 0.22
                                                 * passing_skill
@@ -11483,6 +11511,7 @@ impl PlayerAgent {
                                 chosen = Some((
                                     SoccerAction::Pass {
                                         target_player: Some(target),
+                                        target_point: None,
                                         power: 0.46
                                             + 0.26
                                                 * aerial_duel_skill_from_agent(self)
@@ -11509,6 +11538,7 @@ impl PlayerAgent {
                                 chosen = Some((
                                     SoccerAction::Pass {
                                         target_player: Some(plan.wall_partner),
+                                        target_point: None,
                                         power: WALL_PASS_GIVE_POWER + 0.20 * passing_skill,
                                         flight: PassFlight::Floor,
                                     },
@@ -11649,6 +11679,7 @@ impl PlayerAgent {
                             chosen = Some((
                                 SoccerAction::Pass {
                                     target_player: Some(target),
+                                    target_point: None,
                                     power: 0.58 + 0.32 * passing_skill,
                                     flight: PassFlight::Floor,
                                 },
@@ -11681,6 +11712,7 @@ impl PlayerAgent {
                             chosen = Some((
                                 SoccerAction::Pass {
                                     target_player: Some(target),
+                                    target_point: None,
                                     power: 0.56 + 0.28 * crossing.max(passing_skill),
                                     flight: PassFlight::Aerial,
                                 },
@@ -11743,6 +11775,7 @@ impl PlayerAgent {
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
+                            target_point: None,
                             power: 0.66 + 0.24 * passing_skill.max(ability01(self.skills.vision)),
                             flight: snapshot.killer_pass_flight_for(self.id, &pass_targets),
                         },
@@ -11761,6 +11794,7 @@ impl PlayerAgent {
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
+                            target_point: None,
                             power: 0.66 + 0.24 * passing_skill.max(ability01(self.skills.vision)),
                             flight: snapshot.killer_pass_flight_for(self.id, &pass_targets),
                         },
@@ -11829,6 +11863,7 @@ impl PlayerAgent {
                     (
                         SoccerAction::Pass {
                             target_player: Some(*target),
+                            target_point: None,
                             power: 0.58 + 0.32 * passing_skill,
                             flight: PassFlight::Floor,
                         },
@@ -11902,6 +11937,7 @@ impl PlayerAgent {
                                     (
                                         SoccerAction::Pass {
                                             target_player: Some(target),
+                                            target_point: None,
                                             power: 0.58 + 0.32 * passing_skill,
                                             flight: PassFlight::Floor,
                                         },
@@ -11924,6 +11960,7 @@ impl PlayerAgent {
                                     (
                                         SoccerAction::Pass {
                                             target_player: Some(target),
+                                            target_point: None,
                                             power: 0.56 + 0.28 * crossing.max(passing_skill),
                                             flight: PassFlight::Aerial,
                                         },
@@ -11937,6 +11974,7 @@ impl PlayerAgent {
                                     (
                                         SoccerAction::Pass {
                                             target_player: Some(target),
+                                            target_point: None,
                                             power: 0.66
                                                 + 0.24
                                                     * passing_skill
@@ -11953,6 +11991,7 @@ impl PlayerAgent {
                                     (
                                         SoccerAction::Pass {
                                             target_player: Some(target),
+                                            target_point: None,
                                             power: 0.46 + 0.22 * passing_skill,
                                             flight: PassFlight::Floor,
                                         },
@@ -11965,6 +12004,7 @@ impl PlayerAgent {
                                     (
                                         SoccerAction::Pass {
                                             target_player: Some(target),
+                                            target_point: None,
                                             power: 0.62
                                                 + 0.24
                                                     * passing_skill
@@ -11981,6 +12021,7 @@ impl PlayerAgent {
                                 (
                                     SoccerAction::Pass {
                                         target_player: Some(target),
+                                        target_point: None,
                                         power: 0.60 + 0.26 * crossing.max(passing_skill),
                                         flight: PassFlight::Floor,
                                     },
@@ -11995,6 +12036,7 @@ impl PlayerAgent {
                                     (
                                         SoccerAction::Pass {
                                             target_player: Some(target),
+                                            target_point: None,
                                             power: 0.64 + 0.28 * crossing.max(passing_skill),
                                             flight: PassFlight::Aerial,
                                         },
@@ -12012,6 +12054,7 @@ impl PlayerAgent {
                                     (
                                         SoccerAction::Pass {
                                             target_player: Some(target),
+                                            target_point: None,
                                             power: 0.62 + 0.28 * crossing.max(passing_skill),
                                             flight: PassFlight::Floor,
                                         },
@@ -12028,6 +12071,7 @@ impl PlayerAgent {
                                         (
                                             SoccerAction::Pass {
                                                 target_player: Some(target),
+                                                target_point: None,
                                                 power: 0.66 + 0.28 * crossing.max(passing_skill),
                                                 flight: PassFlight::Aerial,
                                             },
@@ -12039,6 +12083,7 @@ impl PlayerAgent {
                                 (
                                     SoccerAction::Pass {
                                         target_player: Some(target),
+                                        target_point: None,
                                         power: 0.5,
                                         flight: PassFlight::Scoop,
                                     },
@@ -12049,6 +12094,7 @@ impl PlayerAgent {
                                 (
                                     SoccerAction::Pass {
                                         target_player: Some(target),
+                                        target_point: None,
                                         power: 0.50
                                             + 0.22
                                                 * passing_skill
@@ -12062,6 +12108,7 @@ impl PlayerAgent {
                                 (
                                     SoccerAction::Pass {
                                         target_player: Some(target),
+                                        target_point: None,
                                         power: 0.46
                                             + 0.26
                                                 * aerial_duel_skill_from_agent(self)
@@ -13014,6 +13061,14 @@ impl PlayerAgent {
         observation: &SoccerPomdpObservation,
     ) -> Option<(SoccerAction, String)> {
         let label = normalize_soccer_action_label(&plan.action);
+        let learned_pass_target_point = |target: usize| {
+            if dd_soccer_enable_neural_pass_space() && plan.target_player == Some(target) {
+                plan.target_point
+                    .map(|point| point.clamp_to_pitch(snapshot.field_width, snapshot.field_length))
+            } else {
+                None
+            }
+        };
         if !observation.has_ball
             && snapshot.controlled_possession_team() == Some(self.team.other())
             && !matches!(
@@ -13107,6 +13162,7 @@ impl PlayerAgent {
                     (
                         SoccerAction::Pass {
                             target_player: Some(plan.wall_partner),
+                            target_point: None,
                             power: WALL_PASS_GIVE_POWER
                                 + 0.20 * ability01(self.skills.passing_completion_rate),
                             flight: PassFlight::Floor,
@@ -13120,6 +13176,7 @@ impl PlayerAgent {
                     (
                         SoccerAction::Pass {
                             target_player: Some(runner),
+                            target_point: None,
                             power: WALL_PASS_GIVE_POWER + 0.22 * ability01(self.skills.passing),
                             flight: PassFlight::Floor,
                         },
@@ -13138,6 +13195,7 @@ impl PlayerAgent {
                         (
                             SoccerAction::Pass {
                                 target_player: Some(target),
+                                target_point: None,
                                 power: 0.62
                                     + 0.28
                                         * crossing
@@ -13155,6 +13213,7 @@ impl PlayerAgent {
                                 (
                                     SoccerAction::Pass {
                                         target_player: Some(target),
+                                        target_point: None,
                                         power: 0.66
                                             + 0.28
                                                 * crossing.max(ability01(
@@ -13196,6 +13255,7 @@ impl PlayerAgent {
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
+                            target_point: None,
                             power: 0.60
                                 + 0.26
                                     * crossing.max(ability01(self.skills.passing_completion_rate)),
@@ -13217,6 +13277,7 @@ impl PlayerAgent {
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
+                            target_point: None,
                             power: 0.64
                                 + 0.28
                                     * crossing.max(ability01(self.skills.passing_completion_rate)),
@@ -13237,6 +13298,7 @@ impl PlayerAgent {
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
+                            target_point: None,
                             power: 0.62
                                 + 0.24
                                     * ability01(self.skills.passing_completion_rate)
@@ -13260,6 +13322,7 @@ impl PlayerAgent {
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
+                            target_point: None,
                             power: 0.46 + 0.22 * ability01(self.skills.passing_completion_rate),
                             flight: PassFlight::Floor,
                         },
@@ -13272,6 +13335,7 @@ impl PlayerAgent {
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
+                            target_point: None,
                             power: 0.5,
                             flight: PassFlight::Scoop,
                         },
@@ -13288,6 +13352,7 @@ impl PlayerAgent {
                         (
                             SoccerAction::Pass {
                                 target_player: Some(target),
+                                target_point: None,
                                 power: 0.50
                                     + 0.22
                                         * ability01(self.skills.passing_completion_rate)
@@ -13313,6 +13378,7 @@ impl PlayerAgent {
                     return Some((
                         SoccerAction::Pass {
                             target_player: Some(target),
+                            target_point: learned_pass_target_point(target),
                             power,
                             flight: PassFlight::Floor,
                         },
@@ -13329,6 +13395,7 @@ impl PlayerAgent {
                         return Some((
                             SoccerAction::Pass {
                                 target_player: Some(target),
+                                target_point: None,
                                 power: 0.66
                                     + 0.24
                                         * ability01(self.skills.passing_completion_rate)
@@ -13371,6 +13438,7 @@ impl PlayerAgent {
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
+                            target_point: learned_pass_target_point(target),
                             power: learned_kick_power.unwrap_or_else(|| {
                                 0.58 + 0.32 * ability01(self.skills.passing_completion_rate)
                             }),
@@ -13407,6 +13475,7 @@ impl PlayerAgent {
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
+                            target_point: None,
                             power: 0.66
                                 + 0.24
                                     * ability01(self.skills.passing_completion_rate)
@@ -13434,6 +13503,7 @@ impl PlayerAgent {
                     return Some((
                         SoccerAction::Pass {
                             target_player: Some(target),
+                            target_point: learned_pass_target_point(target),
                             power,
                             flight: PassFlight::Aerial,
                         },
@@ -13457,6 +13527,7 @@ impl PlayerAgent {
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
+                            target_point: learned_pass_target_point(target),
                             power: learned_kick_power.unwrap_or_else(|| {
                                 0.56 + 0.28
                                     * crossing.max(ability01(self.skills.passing_completion_rate))
@@ -13476,6 +13547,7 @@ impl PlayerAgent {
                         (
                             SoccerAction::Pass {
                                 target_player: Some(target),
+                                target_point: None,
                                 power: 0.46
                                     + 0.26
                                         * aerial_duel_skill_from_agent(self)
@@ -13522,6 +13594,7 @@ impl PlayerAgent {
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
+                            target_point: None,
                             power: 0.54 + 0.30 * ability01(self.skills.passing_completion_rate),
                             flight: PassFlight::Floor,
                         },
@@ -14334,6 +14407,7 @@ impl PlayerAgent {
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
+                            target_point: None,
                             power: 0.58 + 0.32 * passing_skill,
                             flight: PassFlight::Floor,
                         },
@@ -14355,6 +14429,7 @@ impl PlayerAgent {
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
+                            target_point: None,
                             power: 0.56 + 0.28 * crossing.max(passing_skill),
                             flight: PassFlight::Aerial,
                         },
@@ -14373,6 +14448,7 @@ impl PlayerAgent {
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
+                            target_point: None,
                             power: 0.58 + 0.32 * passing_skill,
                             flight: PassFlight::Floor,
                         },
@@ -14389,6 +14465,7 @@ impl PlayerAgent {
                         (
                             SoccerAction::Pass {
                                 target_player: Some(target),
+                                target_point: None,
                                 power: 0.56 + 0.28 * crossing.max(passing_skill),
                                 flight: PassFlight::Aerial,
                             },
@@ -14404,6 +14481,7 @@ impl PlayerAgent {
                         (
                             SoccerAction::Pass {
                                 target_player: Some(target),
+                                target_point: None,
                                 power: 0.66
                                     + 0.24 * passing_skill.max(ability01(self.skills.vision)),
                                 flight: snapshot.killer_pass_flight_for(self.id, &pass_targets),
@@ -14717,6 +14795,7 @@ impl PlayerAgent {
                 return Some((
                     SoccerAction::Pass {
                         target_player: Some(target),
+                        target_point: None,
                         power: 0.58 + 0.30 * ability01(self.skills.passing_completion_rate),
                         flight: PassFlight::Floor,
                     },
@@ -14822,6 +14901,7 @@ impl PlayerAgent {
             return Some((
                 SoccerAction::Pass {
                     target_player: Some(target),
+                    target_point: None,
                     power: 0.60 + 0.30 * ability01(self.skills.passing_completion_rate),
                     flight: PassFlight::Floor,
                 },
@@ -14841,6 +14921,7 @@ impl PlayerAgent {
             return Some((
                 SoccerAction::Pass {
                     target_player: Some(target),
+                    target_point: None,
                     power: 0.62
                         + 0.28
                             * ability01(
@@ -14898,6 +14979,8 @@ pub enum SoccerAction {
     },
     Pass {
         target_player: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_point: Option<Vec2>,
         power: f64,
         #[serde(default)]
         flight: PassFlight,
@@ -15223,6 +15306,7 @@ mod learned_policy_option_score_safety_tests {
         let holder_player = sim.players[holder].clone();
         let targetless_pass = SoccerAction::Pass {
             target_player: None,
+            target_point: None,
             power: 0.6,
             flight: PassFlight::Floor,
         };
@@ -15510,6 +15594,7 @@ mod learned_mpc_reselect_tests {
         push_test_mpc_guidance(&mut snapshot, player);
         let impossible_pass = SoccerAction::Pass {
             target_player: None,
+            target_point: None,
             power: 0.5,
             flight: PassFlight::Floor,
         };

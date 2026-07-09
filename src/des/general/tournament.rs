@@ -23,9 +23,9 @@
 //! always produce the same bracket and champion.
 
 use crate::des::general::soccer::{
-    MatchConfig, MatchStats, MatchSummary, SoccerMatch, SoccerNeuralLearningBackend,
-    SoccerNeuralNetworkSnapshot, SoccerQPolicy, SoccerQPolicyOptions, SoccerQTargetEntry,
-    SoccerTeamQPolicies, Team,
+    MatchConfig, MatchStats, MatchSummary, SoccerMatch, SoccerMpcObjectiveHead,
+    SoccerNeuralLearningBackend, SoccerNeuralNetworkSnapshot, SoccerQPolicy, SoccerQPolicyOptions,
+    SoccerQTargetEntry, SoccerTeamQPolicies, Team,
 };
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -1436,6 +1436,10 @@ pub struct EngineMatchRunnerConfig {
     /// aborted: the current score is recorded, pre-match brains are carried
     /// forward, and the tournament keeps moving.
     pub match_wall_time_limit: Option<Duration>,
+    /// Optional learned MPC execution-objective head. When present, the real
+    /// runner installs it into each match so held-out gates exercise the same
+    /// aim/lead refinement used by training rollouts.
+    pub mpc_objective_head: Option<SoccerMpcObjectiveHead>,
 }
 
 impl Default for EngineMatchRunnerConfig {
@@ -1458,6 +1462,7 @@ impl Default for EngineMatchRunnerConfig {
         EngineMatchRunnerConfig {
             base,
             match_wall_time_limit: None,
+            mpc_objective_head: None,
         }
     }
 }
@@ -1487,6 +1492,10 @@ impl EngineMatchRunner {
 
     pub fn with_defaults() -> Self {
         EngineMatchRunner::new(EngineMatchRunnerConfig::default())
+    }
+
+    pub fn set_mpc_objective_head(&mut self, head: Option<SoccerMpcObjectiveHead>) {
+        self.config.mpc_objective_head = head;
     }
 }
 
@@ -1521,6 +1530,9 @@ impl TournamentMatchRunner for EngineMatchRunner {
         let mut sim = SoccerMatch::default_11v11(config).with_team_policies(team_policies);
         if engine_match_uniform_elite_players_enabled() {
             sim.set_uniform_elite_players();
+        }
+        if let Some(head) = self.config.mpc_objective_head.clone() {
+            sim.set_mpc_objective_head(head);
         }
 
         // Install each side's brain. `frozen = !learns` so a non-learning side
@@ -2268,6 +2280,7 @@ mod tests {
         let mut runner = EngineMatchRunner::new(EngineMatchRunnerConfig {
             base,
             match_wall_time_limit: None,
+            mpc_objective_head: None,
         });
 
         let report = tournament.run(&mut runner).expect("engine tournament runs");
@@ -2316,6 +2329,7 @@ mod tests {
         let mut runner = EngineMatchRunner::new(EngineMatchRunnerConfig {
             base,
             match_wall_time_limit: Some(Duration::ZERO),
+            mpc_objective_head: None,
         });
 
         let outcome = runner

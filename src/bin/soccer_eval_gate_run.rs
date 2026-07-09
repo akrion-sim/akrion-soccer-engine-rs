@@ -185,6 +185,8 @@ struct AdvancementFixture {
     opponent_forward_passes: u32,
     candidate_completed_passes: u32,
     opponent_completed_passes: u32,
+    candidate_turnovers: u32,
+    opponent_turnovers: u32,
     candidate_pass_gain_yards: f64,
     opponent_pass_gain_yards: f64,
 }
@@ -198,6 +200,8 @@ impl AdvancementFixture {
                 opponent_forward_passes: stats.passes_completed_forward_away,
                 candidate_completed_passes: stats.passes_completed_home,
                 opponent_completed_passes: stats.passes_completed_away,
+                candidate_turnovers: stats.interceptions_away,
+                opponent_turnovers: stats.interceptions_home,
                 candidate_pass_gain_yards: finite_yards(stats.completed_pass_gain_yards_home),
                 opponent_pass_gain_yards: finite_yards(stats.completed_pass_gain_yards_away),
             }
@@ -207,6 +211,8 @@ impl AdvancementFixture {
                 opponent_forward_passes: stats.passes_completed_forward_home,
                 candidate_completed_passes: stats.passes_completed_away,
                 opponent_completed_passes: stats.passes_completed_home,
+                candidate_turnovers: stats.interceptions_home,
+                opponent_turnovers: stats.interceptions_away,
                 candidate_pass_gain_yards: finite_yards(stats.completed_pass_gain_yards_away),
                 opponent_pass_gain_yards: finite_yards(stats.completed_pass_gain_yards_home),
             }
@@ -227,6 +233,8 @@ struct AdvancementRecord {
     opponent_forward_passes: u32,
     candidate_completed_passes: u32,
     opponent_completed_passes: u32,
+    candidate_turnovers: u32,
+    opponent_turnovers: u32,
     candidate_pass_gain_yards: f64,
     opponent_pass_gain_yards: f64,
 }
@@ -261,6 +269,12 @@ impl AdvancementRecord {
         self.opponent_completed_passes = self
             .opponent_completed_passes
             .saturating_add(fixture.opponent_completed_passes);
+        self.candidate_turnovers = self
+            .candidate_turnovers
+            .saturating_add(fixture.candidate_turnovers);
+        self.opponent_turnovers = self
+            .opponent_turnovers
+            .saturating_add(fixture.opponent_turnovers);
         self.candidate_pass_gain_yards += fixture.candidate_pass_gain_yards;
         self.opponent_pass_gain_yards += fixture.opponent_pass_gain_yards;
     }
@@ -282,9 +296,75 @@ impl AdvancementRecord {
         self.candidate_forward_passes as i32 - self.opponent_forward_passes as i32
     }
 
+    fn candidate_forward_pass_rate(&self) -> f64 {
+        ratio(
+            self.candidate_forward_passes,
+            self.candidate_completed_passes,
+        )
+    }
+
+    fn opponent_forward_pass_rate(&self) -> f64 {
+        ratio(self.opponent_forward_passes, self.opponent_completed_passes)
+    }
+
+    fn forward_pass_rate_margin(&self) -> f64 {
+        self.candidate_forward_pass_rate() - self.opponent_forward_pass_rate()
+    }
+
+    fn candidate_net_forward_passes(&self) -> i32 {
+        self.candidate_forward_passes as i32 - self.candidate_turnovers as i32
+    }
+
+    fn opponent_net_forward_passes(&self) -> i32 {
+        self.opponent_forward_passes as i32 - self.opponent_turnovers as i32
+    }
+
+    fn net_forward_pass_margin(&self) -> i32 {
+        self.candidate_net_forward_passes() - self.opponent_net_forward_passes()
+    }
+
     fn pass_gain_yards_margin(&self) -> f64 {
         self.candidate_pass_gain_yards - self.opponent_pass_gain_yards
     }
+}
+
+fn ratio(numerator: u32, denominator: u32) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
+fn forward_pass_gate_reasons(
+    advancement: &AdvancementRecord,
+    min_forward_pass_margin: i32,
+    min_net_forward_pass_margin: i32,
+    min_forward_pass_rate_margin: f64,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if advancement.forward_pass_margin() <= min_forward_pass_margin {
+        reasons.push(format!(
+            "forward-pass margin {:+} <= required {:+}",
+            advancement.forward_pass_margin(),
+            min_forward_pass_margin,
+        ));
+    }
+    if advancement.net_forward_pass_margin() <= min_net_forward_pass_margin {
+        reasons.push(format!(
+            "net forward-pass margin {:+} <= required {:+}",
+            advancement.net_forward_pass_margin(),
+            min_net_forward_pass_margin,
+        ));
+    }
+    if advancement.forward_pass_rate_margin() <= min_forward_pass_rate_margin {
+        reasons.push(format!(
+            "forward-pass rate margin {:+.1}pp <= required {:+.1}pp",
+            advancement.forward_pass_rate_margin() * 100.0,
+            min_forward_pass_rate_margin * 100.0,
+        ));
+    }
+    reasons
 }
 
 fn finite_yards(value: f64) -> f64 {
@@ -293,6 +373,32 @@ fn finite_yards(value: f64) -> f64 {
     } else {
         0.0
     }
+}
+
+fn env_bool(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(default)
+}
+
+fn env_i32(key: &str, default: i32) -> i32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<i32>().ok())
+        .unwrap_or(default)
+}
+
+fn env_f64(key: &str, default: f64) -> f64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .unwrap_or(default)
 }
 
 /// A held-out frozen-vs-frozen fixture between two brains. Builds the context with
@@ -511,6 +617,22 @@ fn main() {
         baseline_id,
         PromotionThresholds::default(),
     );
+    let require_forward_pass_climb = env_bool("SOCCER_EVAL_REQUIRE_FORWARD_PASS_CLIMB", false);
+    let min_forward_pass_margin = env_i32("SOCCER_EVAL_MIN_FORWARD_PASS_MARGIN", 0);
+    let min_net_forward_pass_margin = env_i32("SOCCER_EVAL_MIN_NET_FORWARD_PASS_MARGIN", 0);
+    let min_forward_pass_rate_margin = env_f64("SOCCER_EVAL_MIN_FORWARD_PASS_RATE_MARGIN", 0.0);
+    let advancement_reasons = if require_forward_pass_climb {
+        forward_pass_gate_reasons(
+            &advancement,
+            min_forward_pass_margin,
+            min_net_forward_pass_margin,
+            min_forward_pass_rate_margin,
+        )
+    } else {
+        Vec::new()
+    };
+    let advancement_promote = !require_forward_pass_climb || advancement_reasons.is_empty();
+    let promote = verdict.promote && advancement_promote;
 
     println!(
         "\n----- verdict ({} held-out games, {:.1}s) -----",
@@ -544,7 +666,7 @@ fn main() {
     );
     println!("Wilson lower bound: {:.3}", verdict.wilson_lower_bound);
     println!(
-        "advancement: {}W-{}D-{}L by completed_forward_passes  FP {}/{} (margin {:+}, payoff {:.3})  completed_passes {}/{}  pass_gain_yards_margin {:+.1}",
+        "advancement: {}W-{}D-{}L by completed_forward_passes  FP {}/{} (margin {:+}, fixture_score {:.3})  net_forward {}/{} (margin {:+})  forward_share {:.1}%/{:.1}% (margin {:+.1}pp)  completed_passes {}/{}  turnovers {}/{}  pass_gain_yards_margin {:+.1}",
         advancement.wins,
         advancement.draws,
         advancement.losses,
@@ -552,18 +674,39 @@ fn main() {
         advancement.opponent_forward_passes,
         advancement.forward_pass_margin(),
         advancement.mean_score(),
+        advancement.candidate_net_forward_passes(),
+        advancement.opponent_net_forward_passes(),
+        advancement.net_forward_pass_margin(),
+        advancement.candidate_forward_pass_rate() * 100.0,
+        advancement.opponent_forward_pass_rate() * 100.0,
+        advancement.forward_pass_rate_margin() * 100.0,
         advancement.candidate_completed_passes,
         advancement.opponent_completed_passes,
+        advancement.candidate_turnovers,
+        advancement.opponent_turnovers,
         advancement.pass_gain_yards_margin(),
     );
-    println!(
-        "\nDECISION: {}",
-        if verdict.promote { "PROMOTE" } else { "REJECT" }
-    );
+    if require_forward_pass_climb {
+        println!(
+            "forward-pass gate: margin>{:+} net_margin>{:+} rate_margin>{:+.1}pp -> {}",
+            min_forward_pass_margin,
+            min_net_forward_pass_margin,
+            min_forward_pass_rate_margin * 100.0,
+            if advancement_promote {
+                "PASS"
+            } else {
+                "REJECT"
+            },
+        );
+    }
+    println!("\nDECISION: {}", if promote { "PROMOTE" } else { "REJECT" });
     for reason in &verdict.reasons {
         println!("  - {reason}");
     }
-    std::process::exit(i32::from(!verdict.promote));
+    for reason in &advancement_reasons {
+        println!("  - {reason}");
+    }
+    std::process::exit(i32::from(!promote));
 }
 
 #[cfg(test)]
@@ -582,6 +725,8 @@ mod tests {
         stats.passes_completed_away = 40;
         stats.passes_completed_forward_home = 12;
         stats.passes_completed_forward_away = 4;
+        stats.interceptions_home = 3;
+        stats.interceptions_away = 1;
         stats.completed_pass_gain_yards_home = 72.0;
         stats.completed_pass_gain_yards_away = 24.0;
         let summary = MatchSummary {
@@ -612,6 +757,80 @@ mod tests {
         assert_eq!(record.wins, 1);
         assert_eq!(record.losses, 0);
         assert_eq!(record.forward_pass_margin(), 8);
+        assert_eq!(record.net_forward_pass_margin(), 10);
+        assert!((record.forward_pass_rate_margin() - 0.5).abs() < 1e-12);
         assert!((record.mean_score() - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn forward_pass_gate_uses_totals_not_fixture_score() {
+        let mut record = AdvancementRecord::default();
+        record.add(AdvancementFixture {
+            candidate_forward_passes: 0,
+            opponent_forward_passes: 1,
+            candidate_completed_passes: 10,
+            opponent_completed_passes: 1,
+            candidate_turnovers: 0,
+            opponent_turnovers: 0,
+            candidate_pass_gain_yards: 0.0,
+            opponent_pass_gain_yards: 4.0,
+        });
+        record.add(AdvancementFixture {
+            candidate_forward_passes: 20,
+            opponent_forward_passes: 2,
+            candidate_completed_passes: 20,
+            opponent_completed_passes: 20,
+            candidate_turnovers: 0,
+            opponent_turnovers: 0,
+            candidate_pass_gain_yards: 120.0,
+            opponent_pass_gain_yards: 12.0,
+        });
+        record.add(AdvancementFixture {
+            candidate_forward_passes: 0,
+            opponent_forward_passes: 1,
+            candidate_completed_passes: 10,
+            opponent_completed_passes: 1,
+            candidate_turnovers: 0,
+            opponent_turnovers: 0,
+            candidate_pass_gain_yards: 0.0,
+            opponent_pass_gain_yards: 4.0,
+        });
+
+        assert!(
+            record.mean_score() < 0.5,
+            "fixture score is intentionally below parity"
+        );
+        assert!(record.forward_pass_margin() > 0);
+        assert!(record.net_forward_pass_margin() > 0);
+        assert!(record.forward_pass_rate_margin() > 0.0);
+        assert!(
+            forward_pass_gate_reasons(&record, 0, 0, 0.0).is_empty(),
+            "direct forward-pass totals should pass without a fixture-WDL veto"
+        );
+    }
+
+    #[test]
+    fn forward_pass_gate_rejects_turnover_net_regression() {
+        let mut record = AdvancementRecord::default();
+        record.add(AdvancementFixture {
+            candidate_forward_passes: 12,
+            opponent_forward_passes: 8,
+            candidate_completed_passes: 24,
+            opponent_completed_passes: 24,
+            candidate_turnovers: 8,
+            opponent_turnovers: 0,
+            candidate_pass_gain_yards: 72.0,
+            opponent_pass_gain_yards: 48.0,
+        });
+
+        assert!(record.forward_pass_margin() > 0);
+        assert!(record.net_forward_pass_margin() < 0);
+        let reasons = forward_pass_gate_reasons(&record, 0, 0, 0.0);
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("net forward-pass margin")),
+            "turnovers must count against the forward-pass climb gate: {reasons:?}"
+        );
     }
 }
