@@ -317,6 +317,68 @@ fn keeper_policy_actions_are_distinct_from_outfield_actions() {
 }
 
 #[test]
+fn shot_objective_sample_captured_on_terminal_outcome_with_expected_reward() {
+    // Learned-MPC shot-PLACEMENT sample: emitted at shot resolution whenever the shot armed the
+    // residual at launch (`mpc_objective` is Some) — independent of the env gate, which only governs
+    // whether the LAUNCH site sets `mpc_objective`. Verifies the terminal reward mapping (goal ⇒
+    // +1.0, off target ⇒ −1.0), the lateral-only / zero-bend capture convention, and the None-skip
+    // (byte-identical-off guarantee at the resolve site).
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        learning_enabled: true,
+        ..MatchConfig::default()
+    });
+    let shooter = sim
+        .players
+        .iter()
+        .find(|player| player.team == Team::Home && player.role == PlayerRole::Forward)
+        .expect("home forward")
+        .id;
+    let armed = |residual_x: f64| PendingShot {
+        team: Team::Home,
+        shooter,
+        origin: Vec2::new(40.0, 104.0),
+        intended_target: Vec2::new(41.0, 120.0),
+        mpc_objective: Some((vec![0.0f32; MPC_OBJECTIVE_FEATURE_DIM], Vec2::new(residual_x, 0.0), 0.0)),
+    };
+
+    // Goal ⇒ +1.0, and the sample carries exactly the applied lateral residual with zero bend.
+    sim.apply_ball_outcome(BallStepOutcome::Goal {
+        scoring_team: Team::Home,
+        shot: Some(armed(0.3)),
+    });
+    let goal_samples = sim.drain_mpc_objective_samples();
+    assert_eq!(goal_samples.len(), 1, "an armed shot emits exactly one placement sample on a goal");
+    assert!((goal_samples[0].reward - 1.0).abs() < 1e-9, "goal ⇒ +1.0 placement reward");
+    assert!((goal_samples[0].applied_residual.x - 0.3).abs() < 1e-9);
+    assert!(
+        goal_samples[0].applied_residual.y.abs() < 1e-9,
+        "shot placement residual is lateral-only (y captured as 0)"
+    );
+    assert!(goal_samples[0].applied_bend.abs() < 1e-9, "shot placement never applies bend");
+
+    // Off target ⇒ −1.0 (recorded for corpus parity; RWR skips negative advantage).
+    sim.apply_ball_outcome(BallStepOutcome::Miss { shot: armed(-0.5) });
+    let miss_samples = sim.drain_mpc_objective_samples();
+    assert_eq!(miss_samples.len(), 1);
+    assert!((miss_samples[0].reward + 1.0).abs() < 1e-9, "off-target ⇒ −1.0 placement reward");
+
+    // A shot that did NOT arm the residual (`mpc_objective: None`, i.e. gate off / no head at
+    // launch) emits NO sample — the behaviour-neutral / byte-identical-off guarantee at resolve.
+    let unarmed = PendingShot {
+        team: Team::Home,
+        shooter,
+        origin: Vec2::new(40.0, 104.0),
+        intended_target: Vec2::zero(),
+        mpc_objective: None,
+    };
+    sim.apply_ball_outcome(BallStepOutcome::Miss { shot: unarmed });
+    assert!(
+        sim.drain_mpc_objective_samples().is_empty(),
+        "an unarmed shot emits no placement sample"
+    );
+}
+
+#[test]
 fn save_outcome_credits_goalkeeper_recent_decision() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         learning_enabled: true,
