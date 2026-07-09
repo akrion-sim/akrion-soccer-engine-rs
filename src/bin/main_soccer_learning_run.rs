@@ -14703,6 +14703,72 @@ mod tests {
     }
 
     #[test]
+    fn incumbent_play_quality_veto_yields_to_real_fitness_gain() {
+        let incumbent = PolicyPromotionIncumbentBaseline {
+            sample_games: 8,
+            mean_match_fitness: 1.00,
+            best_match_fitness: 2.00,
+            mean_play_quality: 0.44,
+        };
+        let make = |mean_match_fitness: f64, mean_play_quality: f64| {
+            SoccerPolicyPromotionGateEvaluation {
+                enabled: true,
+                eligible: true,
+                sample_games: 8,
+                min_sample_games: 8,
+                mean_match_fitness,
+                best_match_fitness: mean_match_fitness,
+                mean_play_quality,
+                mean_conceded_goals: 0.0,
+                mean_goal_margin: 0.0,
+                mean_chain_net_loss: 0.0,
+                rejection_reasons: Vec::new(),
+            }
+        };
+
+        // Real mean-fitness gain over the incumbent: a play-quality regression must NOT veto it.
+        let mut fitness_gain = make(1.20, 0.30);
+        apply_policy_promotion_incumbent_gate(
+            &mut fitness_gain,
+            Some(incumbent),
+            true,
+            0.001,
+            0.0,
+            0.05,
+        );
+        assert!(
+            fitness_gain.eligible,
+            "a real fitness gain should not be vetoed by a play-quality regression: {:?}",
+            fitness_gain.rejection_reasons
+        );
+
+        // No fitness gain (flat, within the regression tolerance) + play-quality regression: still vetoed.
+        let mut flat = make(1.00, 0.30);
+        apply_policy_promotion_incumbent_gate(&mut flat, Some(incumbent), true, 0.001, 0.05, 0.05);
+        assert!(!flat.eligible);
+        assert!(flat
+            .rejection_reasons
+            .iter()
+            .any(|reason| reason.starts_with("incumbent_mean_play_quality")));
+
+        // A match-fitness regression beyond tolerance is still rejected regardless of style.
+        let mut fitness_regressed = make(0.50, 0.60);
+        apply_policy_promotion_incumbent_gate(
+            &mut fitness_regressed,
+            Some(incumbent),
+            true,
+            0.001,
+            0.05,
+            0.05,
+        );
+        assert!(!fitness_regressed.eligible);
+        assert!(fitness_regressed
+            .rejection_reasons
+            .iter()
+            .any(|reason| reason.starts_with("incumbent_mean_match_fitness")));
+    }
+
+    #[test]
     fn postgres_refresh_clears_batch_evolution_sample_window() {
         let mut flank_weights = SoccerTacticalLearningWeights::default();
         flank_weights.attack_flank_lane_weight = 1.75;
