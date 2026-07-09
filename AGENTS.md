@@ -37,6 +37,17 @@ other lacks), COMBINE them — take the spec-faithful implementation AND the oth
 documentation. A blind "take theirs / take ours" without that superset check is a bug, not a
 merge.
 
+CHECK CONTAINMENT BY CONCEPT, NOT BY TEXT. Before merging any branch/worktree/reconstructed
+stash, verify whether its IDEAS are already in `main` — semantically, not by literal diff or
+symbol name. A textual diff or reverse-apply (`git apply -R --check`) is unreliable here:
+context drift on an old base makes already-present code look "unmerged," and a later RENAME or
+REFACTOR in `main` hides an already-landed feature (e.g. `quick_forward_release_bonus` was
+merged and then evolved into `quick_forward_release_bonus_value` + `_opportunity_reward`; a
+grep for the old names falsely reports it MISSING). So: read the actual added code, find the
+concept in `main` by behavior (constants/gates/env knob/call site/test), and only merge the
+part that is truly absent. If the whole thing is already present in evolved form, merge NOTHING
+and drop the source — re-adding it would duplicate a better implementation.
+
 x is sideline-to-sideline (width) dimension, y is goal-to-goal (length) dimension
 MDP = markov decision process
 MPC = model predictive control
