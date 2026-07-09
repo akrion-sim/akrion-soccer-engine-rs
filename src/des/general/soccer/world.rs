@@ -1978,28 +1978,35 @@ fn soccer_policy_mixed_behavior_probability(
     (epsilon * exploration_probability + (1.0 - epsilon) * fallback_probability).clamp(0.0, 1.0)
 }
 
-/// Whether a transition is a FORWARD pass by GEOMETRY (not merely by its action label): a pass-like
-/// action whose resolved target point lies forward of the carrier along the team's attacking
-/// direction by at least [`SOCCER_FORWARD_SELECT_MIN_FORWARD_YARDS`].
-///
-/// This deliberately does NOT trust the `"pass"` / `"pass-kpN"` label alone — those labels also
-/// cover lateral and backward balls (switch-play, recycle/reset), so label-gating would just
-/// re-lift the stuck lateral choices. Forwardness is `(target.y - carrier.y) * attack_dir`, the
-/// canonical pass-progress measure used across the engine. Carrier position comes from the
-/// transition's decision context (at score time this equals `snapshot.player_position(player_id)`;
-/// at training time it is the position recorded when the action was taken), so the learned
-/// forward-select bias shares ONE definition of "forward" at both its score-time application and
-/// its training-time eligibility.
+/// Forward progress (yards, in the attacking direction) of a learned plan's resolved target
+/// relative to the carrier — the SCORE-TIME analogue of `SoccerDecisionContext::target_forward_yards`,
+/// computed straight from `candidate_plan.target_point` (falling back to the target teammate's
+/// position, as the engine resolves pass targets elsewhere). `None` when the plan carries no target
+/// or the carrier position is unknown. Forwardness is `(target.y - carrier.y) * attack_dir`, the
+/// canonical pass-progress measure used across the engine.
+fn soccer_plan_target_forward_yards(
+    plan: &SoccerLearnedPlan,
+    snapshot: &WorldSnapshot,
+    player_id: usize,
+    team: Team,
+) -> Option<f64> {
+    let target = plan
+        .target_point
+        .or_else(|| plan.target_player.and_then(|id| snapshot.player_position(id)))?;
+    let carrier = snapshot.player_position(player_id)?;
+    Some((target.y - carrier.y) * team.attack_dir())
+}
+
+/// Whether a REPLAYED transition was a FORWARD pass by GEOMETRY (not by its action label): a
+/// pass-like action whose recorded `SoccerDecisionContext::target_forward_yards` clears the forward
+/// deadband. This is the TRAINING-TIME eligibility for the learned forward-select scalar. It
+/// deliberately does NOT trust the `"pass"` / `"pass-kpN"` label alone — those also cover
+/// lateral/backward balls (switch-play, recycle/reset) — and reads the same
+/// `(target.y - carrier.y) * attack_dir` measure that `soccer_plan_target_forward_yards` computes at
+/// score time, so both sites share ONE definition of "forward".
 fn soccer_transition_forward_pass_selection_eligible(transition: &SoccerLearningTransition) -> bool {
-    if pass_like_action_flight(&transition.action).is_none() {
-        return false;
-    }
-    let Some(target) = transition.action_target.as_ref().and_then(|trace| trace.point) else {
-        return false;
-    };
-    let forward_yards =
-        (target.y - transition.decision_context.actor_position.y) * transition.team.attack_dir();
-    forward_yards.is_finite() && forward_yards > SOCCER_FORWARD_SELECT_MIN_FORWARD_YARDS
+    pass_like_action_flight(&transition.action).is_some()
+        && transition.decision_context.target_forward_yards > SOCCER_FORWARD_SELECT_MIN_FORWARD_YARDS
 }
 
 fn soccer_policy_rank_probability_for_label(
