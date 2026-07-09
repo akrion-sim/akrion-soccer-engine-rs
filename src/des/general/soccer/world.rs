@@ -31009,6 +31009,8 @@ impl SoccerMatch {
                 self.ball.last_touch_team = Some(defending_team);
                 self.stat_shot_on_target(shot.team);
                 self.record_shot_on_target_rewards(shot.team, shot.shooter);
+                // Learned-MPC shot-placement credit: on target, parried into a live rebound (+0.6).
+                self.record_shot_objective_sample(&shot, ShotObjectiveOutcome::OnTargetRebound);
                 self.stat_save(defending_team);
                 // A parry denied the goal but conceded a live rebound — a less secure stop than
                 // a clean catch, so it earns a fraction of the full save reward.
