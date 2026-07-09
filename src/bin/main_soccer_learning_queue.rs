@@ -953,6 +953,7 @@ fn apply_policy_promotion_incumbent_gate(
     let Some(incumbent) = incumbent else {
         return;
     };
+    const EPSILON: f64 = 1e-9;
     let mean_fitness_floor = incumbent.mean_match_fitness + min_mean_fitness_delta.max(0.0)
         - max_mean_fitness_regression.max(0.0);
     let play_quality_floor =
@@ -966,7 +967,14 @@ fn apply_policy_promotion_incumbent_gate(
             max_mean_fitness_regression.max(0.0)
         ));
     }
-    if evaluation.mean_play_quality < play_quality_floor {
+    // "Fitness first" (mirrors the run path and `policy_promotion_evaluation_regresses_from_local
+    // _best`): do not let the soft, noisy incumbent-RELATIVE play-quality floor veto a candidate
+    // that posts a REAL mean-fitness gain over the incumbent. Base eligibility still enforces the
+    // ABSOLUTE `min_mean_play_quality` floor before this runs, so a genuinely low-quality candidate
+    // is already rejected; candidates without a real fitness gain remain held to the veto.
+    let real_mean_fitness_gain = evaluation.mean_match_fitness
+        > incumbent.mean_match_fitness + min_mean_fitness_delta.max(0.0) + EPSILON;
+    if !real_mean_fitness_gain && evaluation.mean_play_quality < play_quality_floor {
         evaluation.rejection_reasons.push(format!(
             "incumbent_mean_play_quality {:.4} below incumbent {:.4} - regression {:.4}",
             evaluation.mean_play_quality,

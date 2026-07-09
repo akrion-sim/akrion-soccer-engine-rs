@@ -2766,6 +2766,7 @@ fn apply_policy_promotion_incumbent_gate(
     let Some(incumbent) = incumbent else {
         return;
     };
+    const EPSILON: f64 = 1e-9;
     let mean_fitness_floor = incumbent.mean_match_fitness + min_mean_fitness_delta.max(0.0)
         - max_mean_fitness_regression.max(0.0);
     let play_quality_floor =
@@ -2779,7 +2780,19 @@ fn apply_policy_promotion_incumbent_gate(
             max_mean_fitness_regression.max(0.0)
         ));
     }
-    if evaluation.mean_play_quality < play_quality_floor {
+    // "Fitness first": the incumbent-RELATIVE play-quality floor is a soft, noisy secondary guard
+    // (empirically ~0.29 correlation with match fitness; the per-8-game-mean spread is ~ the 0.05
+    // regression threshold, so a single eval can trip it). Do NOT let a noisy style regression veto a
+    // candidate that delivers a REAL mean-fitness gain over the incumbent — mirroring
+    // `policy_promotion_evaluation_regresses_from_local_best`, which only weighs play-quality
+    // regression when fitness is not better. Base eligibility still enforces the ABSOLUTE
+    // `min_mean_play_quality` floor in `evaluate_soccer_policy_promotion_gate` before this runs, so a
+    // genuinely low-quality candidate is already rejected; operators wanting a hard style floor
+    // should tighten `SOCCER_POLICY_PROMOTION_MIN_MEAN_PLAY_QUALITY` rather than rely on this
+    // incumbent-relative veto. Candidates WITHOUT a real fitness gain are still held to the floor.
+    let real_mean_fitness_gain = evaluation.mean_match_fitness
+        > incumbent.mean_match_fitness + min_mean_fitness_delta.max(0.0) + EPSILON;
+    if !real_mean_fitness_gain && evaluation.mean_play_quality < play_quality_floor {
         evaluation.rejection_reasons.push(format!(
             "incumbent_mean_play_quality {:.4} below incumbent {:.4} - regression {:.4}",
             evaluation.mean_play_quality,
@@ -14805,6 +14818,72 @@ mod tests {
             .rejection_reasons
             .iter()
             .any(|reason| reason.contains("mean_play_quality")));
+    }
+
+    #[test]
+    fn incumbent_play_quality_veto_yields_to_real_fitness_gain() {
+        let incumbent = PolicyPromotionIncumbentBaseline {
+            sample_games: 8,
+            mean_match_fitness: 1.00,
+            best_match_fitness: 2.00,
+            mean_play_quality: 0.44,
+        };
+        let make = |mean_match_fitness: f64, mean_play_quality: f64| {
+            SoccerPolicyPromotionGateEvaluation {
+                enabled: true,
+                eligible: true,
+                sample_games: 8,
+                min_sample_games: 8,
+                mean_match_fitness,
+                best_match_fitness: mean_match_fitness,
+                mean_play_quality,
+                mean_conceded_goals: 0.0,
+                mean_goal_margin: 0.0,
+                mean_chain_net_loss: 0.0,
+                rejection_reasons: Vec::new(),
+            }
+        };
+
+        // Real mean-fitness gain over the incumbent: a play-quality regression must NOT veto it.
+        let mut fitness_gain = make(1.20, 0.30);
+        apply_policy_promotion_incumbent_gate(
+            &mut fitness_gain,
+            Some(incumbent),
+            true,
+            0.001,
+            0.0,
+            0.05,
+        );
+        assert!(
+            fitness_gain.eligible,
+            "a real fitness gain should not be vetoed by a play-quality regression: {:?}",
+            fitness_gain.rejection_reasons
+        );
+
+        // No fitness gain (flat, within the regression tolerance) + play-quality regression: still vetoed.
+        let mut flat = make(1.00, 0.30);
+        apply_policy_promotion_incumbent_gate(&mut flat, Some(incumbent), true, 0.001, 0.05, 0.05);
+        assert!(!flat.eligible);
+        assert!(flat
+            .rejection_reasons
+            .iter()
+            .any(|reason| reason.starts_with("incumbent_mean_play_quality")));
+
+        // A match-fitness regression beyond tolerance is still rejected regardless of style.
+        let mut fitness_regressed = make(0.50, 0.60);
+        apply_policy_promotion_incumbent_gate(
+            &mut fitness_regressed,
+            Some(incumbent),
+            true,
+            0.001,
+            0.05,
+            0.05,
+        );
+        assert!(!fitness_regressed.eligible);
+        assert!(fitness_regressed
+            .rejection_reasons
+            .iter()
+            .any(|reason| reason.starts_with("incumbent_mean_match_fitness")));
     }
 
     #[test]
