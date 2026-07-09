@@ -17,11 +17,11 @@ companion infra: `soccer_eval_gate_run` / `scripts/run_outcome_ab.sh`).
 The execution substrate is **already in place and shared** — passes and shots both
 lower a `KickReleaseSpec` through `kick_release_clamped_to_pitch` into a
 `LoweredKickRelease` (velocity + curl + altitude) that sets `ball.velocity`:
-- Pass: [world.rs:12603](../src/des/general/soccer/world.rs#L12603) — builds the spec
-  from a heuristic `aimed_target`, `speed` (`modulated_pass_speed_yps`), `curve`,
+- Pass: [world.rs:26761](../src/des/general/soccer/world.rs#L26761) — builds the spec
+  from a heuristic `aimed_target`, `speed` (`modulated_pass_speed_yps`, world.rs:26002), `curve`,
   `curve_bend_yards`, and `flight`.
-- Shot: [world.rs ~12799](../src/des/general/soccer/world.rs) — `speed` from
-  `shot_speed_yps_from_power`, same `kick_release_clamped_to_pitch` path.
+- Shot: [world.rs:27221](../src/des/general/soccer/world.rs#L27221) — `speed` from
+  `shot_speed_yps_from_power` (world.rs:27190), same `kick_release_clamped_to_pitch` path.
 
 The **discrete representation already exists but is constructed only in tests**:
 - `DiscretizedKickAction { speed_bucket: u8 (10), direction_bucket: u8 (36), curve, technique, elevation }`
