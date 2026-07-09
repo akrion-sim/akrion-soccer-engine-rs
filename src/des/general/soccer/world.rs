@@ -16013,6 +16013,23 @@ impl SoccerMatch {
         let pass_target_candidate_limit = neural_mcts_pass_target_candidate_limit();
         let mut scored_candidates =
             Vec::with_capacity(legal.len() + legal.len() * pass_target_candidate_limit);
+        // Learned per-net FORWARD action-selection bias. Precomputed once (state-constant across
+        // candidates): the weight is 0.0 unless the gate is on AND a policy head exists, and the
+        // feature is the visible forward-option quality. Captured as plain f64 copies so the
+        // closure does not additionally borrow `self.policy_head`. When the weight is 0.0 the
+        // per-candidate bonus below is 0 ⇒ the scored-candidate path is byte-identical.
+        let forward_select_weight = if dd_soccer_enable_forward_select_logit() {
+            self.policy_head
+                .as_ref()
+                .map(|head| head.forward_select_logit_weight)
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        let forward_select_feature = observation
+            .best_forward_pass_option_quality
+            .max(observation.best_forward_pass_receiver_openness)
+            .clamp(0.0, 1.0);
         let mut push_scored_candidate =
             |candidate: &SoccerLearnedActionTrace, candidate_plan: SoccerLearnedPlan| {
                 if !Self::neural_mcts_candidate_plan_is_executable(
