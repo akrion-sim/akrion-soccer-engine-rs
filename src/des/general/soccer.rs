@@ -5238,10 +5238,10 @@ const SOCCER_NEURAL_FEATURE_FORWARD_ONSIDE_SUPPORT_PRESSURE: usize =
 // Action-parameter block slot indices (seeded from the old FEATURE_DIM tail).
 const SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DX: usize =
     SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM;
-const SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DY: usize =
-    SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DX + 1;
+// NOTE: no absolute `target_dy` slot — the attack-relative `forward` slot below carries the
+// longitudinal component side-invariantly; an absolute dy would just duplicate it per team.
 const SOCCER_NEURAL_FEATURE_ACTION_PARAM_DISTANCE: usize =
-    SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DY + 1;
+    SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DX + 1;
 const SOCCER_NEURAL_FEATURE_ACTION_PARAM_FORWARD: usize =
     SOCCER_NEURAL_FEATURE_ACTION_PARAM_DISTANCE + 1;
 const SOCCER_NEURAL_FEATURE_ACTION_PARAM_DIR_SIN: usize =
