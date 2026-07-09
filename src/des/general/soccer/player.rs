@@ -13602,7 +13602,18 @@ impl PlayerAgent {
                 let target = observation
                     .quick_forward_pass_target
                     .filter(|id| visible.contains(id))
-                    .or_else(|| visible.iter().copied().find(is_forward));
+                    .or_else(|| {
+                        // Codex r26: only take the fallback forward receiver when the best forward
+                        // option genuinely clears the quality floor (0.50, matching the opportunity
+                        // gate); otherwise DECLINE (None) so the actor picks a different action
+                        // rather than forcing a poor-quality forward pass. Prevents the v1 failure
+                        // mode (low-quality forward passes → worse pass-gain + more turnovers).
+                        if observation.best_forward_pass_option_quality >= 0.50 {
+                            visible.iter().copied().find(is_forward)
+                        } else {
+                            None
+                        }
+                    });
                 target.map(|target| {
                     (
                         SoccerAction::Pass {
