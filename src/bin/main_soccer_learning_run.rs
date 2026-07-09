@@ -13758,6 +13758,10 @@ mod tests {
             Some("true")
         );
         assert_eq!(
+            continuous_manifest_env_value("DD_SOCCER_ENABLE_CHANCE_QUALITY_REWARD"),
+            Some("true")
+        );
+        assert_eq!(
             continuous_manifest_env_value("DD_SOCCER_ENABLE_LEARNED_PASS_RECEIVER"),
             Some("true")
         );
@@ -13767,7 +13771,7 @@ mod tests {
         );
         assert_eq!(
             continuous_manifest_env_value("DD_SOCCER_ENABLE_DISCRETIZED_KICK"),
-            Some("true")
+            Some("false")
         );
         assert_eq!(
             continuous_manifest_env_value("DD_SOCCER_ENABLE_SCORED_SHOT_PLACEMENT"),
@@ -13794,12 +13798,32 @@ mod tests {
             Some("true")
         );
         assert_eq!(
+            continuous_manifest_env_value("DD_SOCCER_ENABLE_SPECIALIST_CURRICULUM"),
+            Some("true")
+        );
+        assert_eq!(
             continuous_manifest_env_value("DD_SOCCER_FORWARD_PASS_CLIMB_CURRICULUM"),
+            Some("true")
+        );
+        assert_eq!(
+            continuous_manifest_env_value("DD_SOCCER_ENABLE_DEFERRED_PASS_CREDIT"),
             Some("true")
         );
         assert_eq!(
             continuous_manifest_env_value("DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE"),
             Some("1.0")
+        );
+        assert_eq!(
+            continuous_manifest_env_value("SOCCER_NEURAL_TARGET_SCALE"),
+            Some("30")
+        );
+        assert_eq!(
+            continuous_manifest_env_value("SOCCER_NEURAL_TARGET_CLIP"),
+            Some("15")
+        );
+        assert_eq!(
+            continuous_manifest_env_value("SOCCER_NEURAL_TARGET_POPART"),
+            Some("true")
         );
         assert_eq!(
             continuous_manifest_env_value("SOCCER_NEURAL_ACTOR_CRITIC"),
@@ -13815,7 +13839,7 @@ mod tests {
         );
         assert_eq!(
             continuous_manifest_env_value("SOCCER_NEURAL_MCTS_ENABLED"),
-            Some("true")
+            Some("false")
         );
         assert_eq!(
             continuous_manifest_env_value("SOCCER_NEURAL_MCTS_CANDIDATES"),
@@ -13824,6 +13848,14 @@ mod tests {
         assert_eq!(
             continuous_manifest_env_value("SOCCER_NEURAL_MCTS_PASS_TARGET_CANDIDATES"),
             Some("8")
+        );
+        assert_eq!(
+            continuous_manifest_env_value("DD_SOCCER_ENABLE_KEEPER_POLICY_HEAD"),
+            Some("true")
+        );
+        assert_eq!(
+            continuous_manifest_env_value("DD_SOCCER_ENABLE_SKILL_POLICY_HEADS"),
+            Some("true")
         );
         assert_eq!(
             continuous_manifest_env_value("DD_SOCCER_FORWARD_PASS_REWARD_SCALE"),
@@ -13883,12 +13915,17 @@ mod tests {
             "require_value DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE true",
         );
         assert_continuous_manifest_contains(
+            "require_value DD_SOCCER_ENABLE_CHANCE_QUALITY_REWARD true",
+        );
+        assert_continuous_manifest_contains(
             "require_value DD_SOCCER_ENABLE_LEARNED_PASS_RECEIVER true",
         );
         assert_continuous_manifest_contains(
             "require_value DD_SOCCER_ENABLE_NEURAL_PASS_SPACE true",
         );
-        assert_continuous_manifest_contains("require_value DD_SOCCER_ENABLE_DISCRETIZED_KICK true");
+        assert_continuous_manifest_contains(
+            "require_value DD_SOCCER_ENABLE_DISCRETIZED_KICK false",
+        );
         assert_continuous_manifest_contains(
             "require_value DD_SOCCER_ENABLE_SCORED_SHOT_PLACEMENT true",
         );
@@ -13902,18 +13939,33 @@ mod tests {
         assert_continuous_manifest_contains("require_value DD_SOCCER_ENABLE_MAXA_BOOTSTRAP true");
         assert_continuous_manifest_contains("require_value DD_SOCCER_ENABLE_NOVELTY_BONUS true");
         assert_continuous_manifest_contains(
+            "require_value DD_SOCCER_ENABLE_SPECIALIST_CURRICULUM true",
+        );
+        assert_continuous_manifest_contains(
             "require_value DD_SOCCER_FORWARD_PASS_CLIMB_CURRICULUM true",
+        );
+        assert_continuous_manifest_contains(
+            "require_value DD_SOCCER_ENABLE_DEFERRED_PASS_CREDIT true",
         );
         assert_continuous_manifest_contains(
             "require_value DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE 1.0",
         );
+        assert_continuous_manifest_contains("require_value SOCCER_NEURAL_TARGET_SCALE 30");
+        assert_continuous_manifest_contains("require_value SOCCER_NEURAL_TARGET_CLIP 15");
+        assert_continuous_manifest_contains("require_value SOCCER_NEURAL_TARGET_POPART true");
         assert_continuous_manifest_contains("require_value SOCCER_NEURAL_ACTOR_CRITIC true");
         assert_continuous_manifest_contains("require_value SOCCER_ENABLE_ACTOR_CRITIC true");
         assert_continuous_manifest_contains("require_value SOCCER_NEURAL_LP_COUPLING_ENABLED true");
-        assert_continuous_manifest_contains("require_value SOCCER_NEURAL_MCTS_ENABLED true");
+        assert_continuous_manifest_contains("require_value SOCCER_NEURAL_MCTS_ENABLED false");
         assert_continuous_manifest_contains("require_value SOCCER_NEURAL_MCTS_CANDIDATES 8");
         assert_continuous_manifest_contains(
             "require_value SOCCER_NEURAL_MCTS_PASS_TARGET_CANDIDATES 8",
+        );
+        assert_continuous_manifest_contains(
+            "require_value DD_SOCCER_ENABLE_KEEPER_POLICY_HEAD true",
+        );
+        assert_continuous_manifest_contains(
+            "require_value DD_SOCCER_ENABLE_SKILL_POLICY_HEADS true",
         );
         assert_continuous_manifest_contains("require_value DD_SOCCER_FORWARD_PASS_REWARD_SCALE 6");
         assert_continuous_manifest_contains(
@@ -14238,6 +14290,8 @@ mod tests {
             average_loss: Some(0.1),
             target_popart: None,
             policy_head: None,
+            skill_policy_heads: None,
+            keeper_policy_head: None,
             line_depth_head: None,
             mpc_objective_head: None,
         }
@@ -14829,8 +14883,8 @@ mod tests {
             best_match_fitness: 2.00,
             mean_play_quality: 0.44,
         };
-        let make = |mean_match_fitness: f64, mean_play_quality: f64| {
-            SoccerPolicyPromotionGateEvaluation {
+        let make =
+            |mean_match_fitness: f64, mean_play_quality: f64| SoccerPolicyPromotionGateEvaluation {
                 enabled: true,
                 eligible: true,
                 sample_games: 8,
@@ -14842,8 +14896,7 @@ mod tests {
                 mean_goal_margin: 0.0,
                 mean_chain_net_loss: 0.0,
                 rejection_reasons: Vec::new(),
-            }
-        };
+            };
 
         // Real mean-fitness gain over the incumbent: a play-quality regression must NOT veto it.
         let mut fitness_gain = make(1.20, 0.30);
@@ -15130,6 +15183,8 @@ mod tests {
             average_loss: None,
             target_popart: None,
             policy_head: None,
+            skill_policy_heads: None,
+            keeper_policy_head: None,
             line_depth_head: None,
             mpc_objective_head: None,
         };

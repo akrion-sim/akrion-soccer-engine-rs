@@ -2115,9 +2115,10 @@ fn soccer_plan_target_forward_yards(
     player_id: usize,
     team: Team,
 ) -> Option<f64> {
-    let target = plan
-        .target_point
-        .or_else(|| plan.target_player.and_then(|id| snapshot.player_position(id)))?;
+    let target = plan.target_point.or_else(|| {
+        plan.target_player
+            .and_then(|id| snapshot.player_position(id))
+    })?;
     let carrier = snapshot.player_position(player_id)?;
     Some((target.y - carrier.y) * team.attack_dir())
 }
@@ -2129,9 +2130,12 @@ fn soccer_plan_target_forward_yards(
 /// lateral/backward balls (switch-play, recycle/reset) — and reads the same
 /// `(target.y - carrier.y) * attack_dir` measure that `soccer_plan_target_forward_yards` computes at
 /// score time, so both sites share ONE definition of "forward".
-fn soccer_transition_forward_pass_selection_eligible(transition: &SoccerLearningTransition) -> bool {
+fn soccer_transition_forward_pass_selection_eligible(
+    transition: &SoccerLearningTransition,
+) -> bool {
     pass_like_action_flight(&transition.action).is_some()
-        && transition.decision_context.target_forward_yards > SOCCER_FORWARD_SELECT_MIN_FORWARD_YARDS
+        && transition.decision_context.target_forward_yards
+            > SOCCER_FORWARD_SELECT_MIN_FORWARD_YARDS
 }
 
 fn soccer_policy_rank_probability_for_label(
@@ -12069,6 +12073,24 @@ impl SoccerMatch {
         } else {
             None
         };
+        self.skill_policy_heads =
+            if let Some(skill_policy_heads) = snapshot.skill_policy_heads.as_deref() {
+                Some(soccer_skill_policy_heads_from_snapshot(
+                    skill_policy_heads,
+                    self.config.seed,
+                )?)
+            } else {
+                None
+            };
+        self.keeper_policy_head =
+            if let Some(keeper_policy_head) = snapshot.keeper_policy_head.as_deref() {
+                Some(soccer_keeper_policy_head_from_snapshot(
+                    keeper_policy_head,
+                    self.config.seed,
+                )?)
+            } else {
+                None
+            };
         self.line_depth_head = if let Some(line_depth_head) = snapshot.line_depth_head.as_deref() {
             Some(std::sync::Arc::new(BackFourLineHead::from_snapshot(
                 line_depth_head,
@@ -12163,6 +12185,16 @@ impl SoccerMatch {
                 snapshot.average_loss = learner.average_loss();
                 if let Some(policy_head) = &self.policy_head {
                     snapshot.policy_head = Some(Box::new(soccer_policy_head_snapshot(policy_head)));
+                }
+                if let Some(skill_policy_heads) = &self.skill_policy_heads {
+                    snapshot.skill_policy_heads = Some(Box::new(
+                        soccer_skill_policy_heads_snapshot(skill_policy_heads),
+                    ));
+                }
+                if let Some(keeper_policy_head) = &self.keeper_policy_head {
+                    snapshot.keeper_policy_head = Some(Box::new(
+                        soccer_keeper_policy_head_snapshot(keeper_policy_head),
+                    ));
                 }
                 if let Some(line_depth_head) = &self.line_depth_head {
                     snapshot.line_depth_head = Some(Box::new(line_depth_head.to_snapshot()));
@@ -12345,6 +12377,18 @@ impl SoccerMatch {
                 if let Some(policy_head_snapshot) = snapshot.policy_head.as_deref() {
                     self.policy_head = Some(soccer_policy_head_from_snapshot(
                         policy_head_snapshot,
+                        self.config.seed,
+                    )?);
+                }
+                if let Some(skill_policy_heads_snapshot) = snapshot.skill_policy_heads.as_deref() {
+                    self.skill_policy_heads = Some(soccer_skill_policy_heads_from_snapshot(
+                        skill_policy_heads_snapshot,
+                        self.config.seed,
+                    )?);
+                }
+                if let Some(keeper_policy_head_snapshot) = snapshot.keeper_policy_head.as_deref() {
+                    self.keeper_policy_head = Some(soccer_keeper_policy_head_from_snapshot(
+                        keeper_policy_head_snapshot,
                         self.config.seed,
                     )?);
                 }

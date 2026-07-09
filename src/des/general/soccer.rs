@@ -38830,6 +38830,15 @@ pub struct SoccerNeuralNetworkSnapshot {
     /// trained passing/dribbling/shooting/GK specialists across episodes and persisted runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_head: Option<Box<SoccerPolicyHeadSnapshot>>,
+    /// Optional legacy per-skill actors (`DD_SOCCER_ENABLE_SKILL_POLICY_HEADS`). These sit outside
+    /// the newer role-aware policy head; carrying them keeps specialist-curriculum A/B evals from
+    /// silently replacing trained pass/dribble/shot heads with fresh random ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_policy_heads: Option<Box<SoccerSkillPolicyHeadsSnapshot>>,
+    /// Optional dedicated goalkeeper actor (`DD_SOCCER_ENABLE_KEEPER_POLICY_HEAD`) for sweep/claim/
+    /// set/distribution decisions. Persisted separately from the outfield skill heads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keeper_policy_head: Option<Box<SoccerKeeperPolicyHeadSnapshot>>,
     /// Optional carried back-four line-depth head. It is trained from the group-of-four
     /// line-depth MDP/POMDP samples and restored with the value/actor snapshot so a
     /// localhost/live server can consume the same push/drop head the learner warmed.
@@ -38897,6 +38906,34 @@ pub struct SoccerPolicyHeadSnapshot {
     /// snapshots without the field restore to 0.0 (the disabled / byte-identical default).
     #[serde(default)]
     pub forward_select_logit_weight: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SoccerSkillPolicyHeadSnapshot {
+    pub group: String,
+    pub network: SoccerNeuralNetworkSnapshot,
+    #[serde(default)]
+    pub training_steps: usize,
+    #[serde(default)]
+    pub average_loss: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SoccerSkillPolicyHeadsSnapshot {
+    #[serde(default)]
+    pub heads: Vec<SoccerSkillPolicyHeadSnapshot>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SoccerKeeperPolicyHeadSnapshot {
+    pub network: SoccerNeuralNetworkSnapshot,
+    #[serde(default)]
+    pub training_steps: usize,
+    #[serde(default)]
+    pub average_loss: Option<f64>,
 }
 
 /// Legacy pass-specific scalar feature count: distance, forward progress, lateral, passer pressure,
@@ -41327,6 +41364,23 @@ impl SoccerSkillGroup {
         SoccerSkillGroup::Shot,
     ];
 
+    fn as_str(self) -> &'static str {
+        match self {
+            SoccerSkillGroup::Pass => "pass",
+            SoccerSkillGroup::Dribble => "dribble",
+            SoccerSkillGroup::Shot => "shot",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "pass" => Some(SoccerSkillGroup::Pass),
+            "dribble" => Some(SoccerSkillGroup::Dribble),
+            "shot" => Some(SoccerSkillGroup::Shot),
+            _ => None,
+        }
+    }
+
     fn families(self) -> &'static [&'static str] {
         match self {
             SoccerSkillGroup::Pass => SOCCER_SKILL_PASS_FAMILIES,
@@ -42932,6 +42986,8 @@ fn soccer_neural_network_snapshot(network: &FeedForwardNetwork) -> SoccerNeuralN
         average_loss: None,
         target_popart: None,
         policy_head: None,
+        skill_policy_heads: None,
+        keeper_policy_head: None,
         line_depth_head: None,
         mpc_objective_head: None,
     }
@@ -43102,6 +43158,100 @@ fn soccer_policy_head_from_snapshot(
     } else {
         0.0
     };
+    Ok(head)
+}
+
+fn soccer_skill_policy_head_snapshot(
+    head: &SoccerSkillPolicyHead,
+) -> SoccerSkillPolicyHeadSnapshot {
+    let mut network = soccer_neural_network_snapshot(&head.network);
+    network.training_steps = head.training_steps;
+    network.average_loss = head.last_loss;
+    SoccerSkillPolicyHeadSnapshot {
+        group: head.group.as_str().to_string(),
+        network,
+        training_steps: head.training_steps,
+        average_loss: head.last_loss,
+    }
+}
+
+fn soccer_skill_policy_heads_snapshot(
+    heads: &SoccerSkillPolicyHeads,
+) -> SoccerSkillPolicyHeadsSnapshot {
+    SoccerSkillPolicyHeadsSnapshot {
+        heads: vec![
+            soccer_skill_policy_head_snapshot(&heads.pass),
+            soccer_skill_policy_head_snapshot(&heads.dribble),
+            soccer_skill_policy_head_snapshot(&heads.shot),
+        ],
+    }
+}
+
+fn restore_soccer_skill_policy_head_from_snapshot(
+    head: &mut SoccerSkillPolicyHead,
+    snapshot: &SoccerSkillPolicyHeadSnapshot,
+) -> Result<(), String> {
+    let Some(group) = SoccerSkillGroup::from_str(&snapshot.group) else {
+        return Ok(());
+    };
+    if head.group != group {
+        return Ok(());
+    }
+    let network = build_soccer_policy_network_from_snapshot(
+        &snapshot.network,
+        group.families().len(),
+        group.as_str(),
+    )?;
+    head.network = network;
+    head.training_steps = snapshot.training_steps.max(snapshot.network.training_steps);
+    head.last_loss = snapshot.average_loss.or(snapshot.network.average_loss);
+    Ok(())
+}
+
+fn soccer_skill_policy_heads_from_snapshot(
+    snapshot: &SoccerSkillPolicyHeadsSnapshot,
+    seed: u32,
+) -> Result<SoccerSkillPolicyHeads, String> {
+    let mut heads = SoccerSkillPolicyHeads::new(seed);
+    for head_snapshot in &snapshot.heads {
+        let Some(group) = SoccerSkillGroup::from_str(&head_snapshot.group) else {
+            continue;
+        };
+        let target = match group {
+            SoccerSkillGroup::Pass => &mut heads.pass,
+            SoccerSkillGroup::Dribble => &mut heads.dribble,
+            SoccerSkillGroup::Shot => &mut heads.shot,
+        };
+        restore_soccer_skill_policy_head_from_snapshot(target, head_snapshot)?;
+    }
+    Ok(heads)
+}
+
+fn soccer_keeper_policy_head_snapshot(
+    head: &SoccerKeeperPolicyHead,
+) -> SoccerKeeperPolicyHeadSnapshot {
+    let mut network = soccer_neural_network_snapshot(&head.network);
+    network.training_steps = head.training_steps;
+    network.average_loss = head.last_loss;
+    SoccerKeeperPolicyHeadSnapshot {
+        network,
+        training_steps: head.training_steps,
+        average_loss: head.last_loss,
+    }
+}
+
+fn soccer_keeper_policy_head_from_snapshot(
+    snapshot: &SoccerKeeperPolicyHeadSnapshot,
+    seed: u32,
+) -> Result<SoccerKeeperPolicyHead, String> {
+    let mut head = SoccerKeeperPolicyHead::new(seed);
+    head.network = build_soccer_policy_network_from_snapshot(
+        &snapshot.network,
+        SOCCER_KEEPER_ACTIONS.len(),
+        "keeper",
+    )?;
+    head.training_steps = snapshot.training_steps.max(snapshot.network.training_steps);
+    head.last_loss = snapshot.average_loss.or(snapshot.network.average_loss);
     Ok(head)
 }
 

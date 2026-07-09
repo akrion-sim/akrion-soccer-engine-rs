@@ -5892,13 +5892,7 @@ mod tests {
                 weights: vec![vec![0.25, -0.25]],
                 biases: vec![0.125],
             }],
-            training_steps: 0,
-            average_loss: None,
-            target_popart: None,
-            policy_head: None,
-            mpc_objective_head: None,
-            line_depth_head: None,
-            mpc_objective_head: None,
+            ..Default::default()
         }
     }
 
@@ -6664,9 +6658,7 @@ mod tests {
         );
     }
 
-    fn policy_version_metrics_with_neural_and_promotion_status(
-        promotion_status: &str,
-    ) -> Value {
+    fn policy_version_metrics_with_neural_and_promotion_status(promotion_status: &str) -> Value {
         let snapshot = tiny_neural_snapshot();
         let base = soccer_policy_version_metrics(
             "evolution",
