@@ -38847,6 +38847,10 @@ pub struct SoccerPolicyHeadSnapshot {
     pub specialist_heads: Vec<SoccerPolicySpecialistHeadSnapshot>,
     #[serde(default)]
     pub role_heads: Vec<SoccerPolicyRoleHeadSnapshot>,
+    /// Learned forward-select selection-bias scalar (per-net). `#[serde(default)]` = 0.0
+    /// keeps pre-existing snapshots byte-identical on load.
+    #[serde(default)]
+    pub forward_select_logit_weight: f64,
 }
 
 /// Legacy pass-specific scalar feature count: distance, forward progress, lateral, passer pressure,
