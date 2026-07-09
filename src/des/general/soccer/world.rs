@@ -31074,6 +31074,9 @@ impl SoccerMatch {
                 self.score_goal(scoring_team);
             }
             BallStepOutcome::Miss { shot } => {
+                // Learned-MPC shot-placement credit: off target (−1.0). Emitted before `shot` moves
+                // into the miss recorder.
+                self.record_shot_objective_sample(&shot, ShotObjectiveOutcome::Missed);
                 self.record_missed_shot_outcome(shot, None);
                 self.pending_shot = None;
                 self.pending_rebound = None;
