@@ -68701,6 +68701,34 @@ mod reward_priority_tests {
         assert!(!gate_default_on_from_raw(Some("OFF")));
     }
 
+    /// Guard the production forward-pass-primacy lever (`DD_SOCCER_FORWARD_PASS_REWARD_SCALE=6`).
+    /// The `outcome_rewards_dominate_pass_only_shaping` test below only checks scale=1; the shipped
+    /// config runs scale=6, which intentionally lets a forward pass out-earn a shot-on-target to tilt
+    /// the DENSE gradient toward build-up. The load-bearing invariant that MUST survive the scale is:
+    /// a SINGLE completed forward pass can never out-earn actually SCORING — else "pass instead of
+    /// finish" becomes rational for the final action. Goal + terminal outcome are unscaled, so this
+    /// holds; we pin it against silent regressions (scaling the count bonus, raising the clamp, etc).
+    /// NOTE: a multi-pass SEQUENCE can exceed a lone shot-on-target at scale=6 by design — the
+    /// pass-farming hazard the A/Bs must watch — but the unscaled goal (+ goal-chain credit) keeps
+    /// finishing optimal. This guards the single-action bound only.
+    #[test]
+    fn forward_pass_scale_six_stays_below_scoring_a_goal() {
+        let scale = 6.0;
+        // Richest single completed forward pass: own-half base + max progress + flank (own-half
+        // multiplier), all scaled, plus the UNSCALED count bonus (added separately at world.rs).
+        let max_single_forward_pass = (COMPLETED_FORWARD_PASS_BASE_REWARD_OWN_HALF
+            + COMPLETED_FORWARD_PASS_PROGRESS_REWARD_MAX_YARDS
+                * COMPLETED_FORWARD_PASS_PROGRESS_REWARD_PER_YARD
+            + COMPLETED_FLANK_PASS_BONUS_POINTS * COMPLETED_FLANK_PASS_OWN_HALF_MULTIPLIER)
+            * scale
+            + COMPLETED_FORWARD_PASS_COUNT_BONUS_POINTS;
+        assert!(
+            max_single_forward_pass < GOAL_REWARD_POINTS,
+            "one forward pass at scale 6 ({max_single_forward_pass}) must stay below a goal \
+             ({GOAL_REWARD_POINTS}) — finishing must never be dominated by a single pass"
+        );
+    }
+
     #[test]
     fn outcome_rewards_dominate_pass_only_shaping() {
         let max_completed_forward_pass = (COMPLETED_FORWARD_PASS_BASE_REWARD_OWN_HALF

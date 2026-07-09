@@ -7233,14 +7233,26 @@ fn flush_postgres_completed_runs(
         }
     }
     if completed_run_retention_games > 0 {
-        let prune = store
-            .prune_completed_runs_for_experiment(experiment_id, completed_run_retention_games)
-            .map_err(invalid_data)?;
-        if prune.deleted_runs > 0 || prune.deleted_delta_rows > 0 {
-            println!(
-                "postgres_completed_run_retention keep_latest_runs={} deleted_runs={} deleted_delta_rows={}",
-                completed_run_retention_games, prune.deleted_runs, prune.deleted_delta_rows
-            );
+        // Retention pruning is best-effort CLEANUP of old completed-run deltas — it must never abort
+        // the learning cycle. Previously this used `?`, so a prune DB error failed the whole run
+        // (status=1) AFTER learning, which blocked policy-version promotion/persistence and left the
+        // next resume loading the empty base version (the "zero entries / blank policy" loop). Treat
+        // it non-fatally, exactly like the pass-metrics upsert above, so the cycle still commits.
+        match store.prune_completed_runs_for_experiment(experiment_id, completed_run_retention_games)
+        {
+            Ok(prune) => {
+                if prune.deleted_runs > 0 || prune.deleted_delta_rows > 0 {
+                    println!(
+                        "postgres_completed_run_retention keep_latest_runs={} deleted_runs={} deleted_delta_rows={}",
+                        completed_run_retention_games, prune.deleted_runs, prune.deleted_delta_rows
+                    );
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "soccer-learning: completed-run retention prune failed (non-fatal): {err}"
+                );
+            }
         }
     }
     if let (Some(first), Some(last), Some(first_run_id), Some(last_run_id)) = (

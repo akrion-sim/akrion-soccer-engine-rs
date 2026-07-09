@@ -166,6 +166,17 @@ fn load_snapshot(path: &str) -> SoccerNeuralNetworkSnapshot {
     serde_json::from_str(&json).unwrap_or_else(|e| panic!("parse {path}: {e}"))
 }
 
+/// Per-team pass breakdown for one match, so the eval can separate WHO/WHEN (the POMDP chooses to
+/// pass forward) from HOW (MPC executes it): completion rate = completed/attempted (low ⇒ execution
+/// failing), forward share = forward/completed (low ⇒ the policy recycles instead of progressing).
+#[derive(Clone, Copy, Default)]
+struct PassBreak {
+    attempted: u32,
+    completed: u32,
+    forward: u32,
+    backward: u32,
+}
+
 fn play_holdout_fixture(
     runner: &mut EngineMatchRunner,
     home_id: usize,
@@ -173,7 +184,7 @@ fn play_holdout_fixture(
     seed: u32,
     home: &TeamBrain,
     away: &TeamBrain,
-) -> Option<(MatchReport, u32, u32)> {
+) -> Option<(MatchReport, PassBreak, PassBreak)> {
     let ctx = TournamentMatchContext {
         stage: TournamentStage::Group,
         round_index: 0,
@@ -191,8 +202,19 @@ fn play_holdout_fixture(
             // Dense advancement signal: completed FORWARD passes per team this match (already
             // counted in MatchStats, surfaced via the outcome summary). Returned alongside the
             // score so the caller can measure progression, not just the rare goal outcome.
-            let home_forward = o.summary.stats.passes_completed_forward_home;
-            let away_forward = o.summary.stats.passes_completed_forward_away;
+            let st = &o.summary.stats;
+            let home_pass = PassBreak {
+                attempted: st.passes_attempted_home,
+                completed: st.passes_completed_home,
+                forward: st.passes_completed_forward_home,
+                backward: st.passes_completed_backward_home,
+            };
+            let away_pass = PassBreak {
+                attempted: st.passes_attempted_away,
+                completed: st.passes_completed_away,
+                forward: st.passes_completed_forward_away,
+                backward: st.passes_completed_backward_away,
+            };
             let report = MatchReport {
                 stage: ctx.stage,
                 home_id,
@@ -205,7 +227,7 @@ fn play_holdout_fixture(
                 home_training_steps: o.home_training_steps,
                 away_training_steps: o.away_training_steps,
             };
-            Some((report, home_forward, away_forward))
+            Some((report, home_pass, away_pass))
         }
         Err(e) => {
             eprintln!("[eval] fixture error: {e}");
@@ -238,6 +260,13 @@ fn eval(candidate_path: &str, baseline_path: &str, games: usize, minutes: f64, h
     let mut forward_pass_diffs: Vec<f64> = Vec::new();
     let mut candidate_forward_total: u64 = 0;
     let mut baseline_forward_total: u64 = 0;
+    // Full pass breakdown so we can diagnose WHO/WHEN (POMDP selection) vs HOW (MPC execution).
+    let mut cand_att: u64 = 0;
+    let mut cand_comp: u64 = 0;
+    let mut cand_back: u64 = 0;
+    let mut base_att: u64 = 0;
+    let mut base_comp: u64 = 0;
+    let mut base_back: u64 = 0;
     for g in 0..games {
         let seed = holdout_base.wrapping_add((g as u32).wrapping_mul(2_246_822_519));
         // Alternate home/away so the verdict isn't a home-field artifact.
@@ -260,16 +289,23 @@ fn eval(candidate_path: &str, baseline_path: &str, games: usize, minutes: f64, h
                 &candidate,
             )
         };
-        if let Some((r, home_forward, away_forward)) = report {
-            // Map the fixture's home/away forward-pass counts back to candidate/baseline
-            // regardless of this game's orientation.
-            let (candidate_forward, baseline_forward) = if r.home_id == candidate_id {
-                (home_forward, away_forward)
+        if let Some((r, home_pass, away_pass)) = report {
+            // Map the fixture's home/away breakdown back to candidate/baseline regardless of
+            // this game's orientation.
+            let (cand_pass, base_pass) = if r.home_id == candidate_id {
+                (home_pass, away_pass)
             } else {
-                (away_forward, home_forward)
+                (away_pass, home_pass)
             };
+            let (candidate_forward, baseline_forward) = (cand_pass.forward, base_pass.forward);
             candidate_forward_total += u64::from(candidate_forward);
             baseline_forward_total += u64::from(baseline_forward);
+            cand_att += u64::from(cand_pass.attempted);
+            cand_comp += u64::from(cand_pass.completed);
+            cand_back += u64::from(cand_pass.backward);
+            base_att += u64::from(base_pass.attempted);
+            base_comp += u64::from(base_pass.completed);
+            base_back += u64::from(base_pass.backward);
             forward_pass_diffs.push(f64::from(candidate_forward) - f64::from(baseline_forward));
             eprintln!(
                 "[eval] game {:>2}/{games} {}v{} -> {}-{}  fwd-passes cand/base {}/{} ({:.0}s)",
@@ -359,6 +395,41 @@ fn eval(candidate_path: &str, baseline_path: &str, games: usize, minutes: f64, h
             "no advancement on forward passes"
         };
         println!("ADVANCEMENT: {advancement}");
+
+        // ---- Pass diagnosis: separate WHO/WHEN (POMDP selection) from HOW (MPC execution) ----
+        // completion rate = completed/attempted (low ⇒ passes fail in flight ⇒ execution/aim = MPC).
+        // forward share  = forward/completed (low ⇒ policy recycles laterally/back ⇒ selection = POMDP).
+        let pct = |num: u64, den: u64| if den > 0 { 100.0 * num as f64 / den as f64 } else { 0.0 };
+        let fwd_share = |fwd: u64, comp: u64| pct(fwd, comp);
+        println!("\n===== PASS DIAGNOSIS (WHO/WHEN vs HOW) =====");
+        println!(
+            "candidate: {:.1} att/g, {:.0}% completed, forward {:.0}% / lateral {:.0}% / back {:.0}% of completions",
+            cand_att as f64 / n_f,
+            pct(cand_comp, cand_att),
+            fwd_share(candidate_forward_total, cand_comp),
+            pct(cand_comp.saturating_sub(candidate_forward_total + cand_back), cand_comp),
+            pct(cand_back, cand_comp),
+        );
+        println!(
+            "baseline:  {:.1} att/g, {:.0}% completed, forward {:.0}% / lateral {:.0}% / back {:.0}% of completions",
+            base_att as f64 / n_f,
+            pct(base_comp, base_att),
+            fwd_share(baseline_forward_total, base_comp),
+            pct(base_comp.saturating_sub(baseline_forward_total + base_back), base_comp),
+            pct(base_back, base_comp),
+        );
+        let comp_rate = pct(cand_comp, cand_att);
+        let fshare = fwd_share(candidate_forward_total, cand_comp);
+        println!(
+            "READ: {}",
+            if comp_rate < 65.0 {
+                "LOW completion ⇒ passes fail in flight — bottleneck is EXECUTION (MPC aim/speed/curve)"
+            } else if fshare < 20.0 {
+                "HIGH completion but LOW forward share ⇒ the POMDP is CHOOSING safe (lateral/back) — bottleneck is SELECTION (WHO/WHEN)"
+            } else {
+                "completion healthy and forward share non-trivial — passing is being expressed; look elsewhere"
+            }
+        );
     } else {
         println!("\n[advancement] no completed fixtures to measure forward-pass progression");
     }
