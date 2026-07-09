@@ -334,3 +334,79 @@ Prereq facts (verified 2026-07-09): sim = 15 Hz (`DEFAULT_DT_SECONDS = 1/15`, `s
 `SeededRandom` all `#[derive(Clone)]`; `run_time_step` self-contained (no external RNG/queue/sink);
 RNG seeded + in-struct (fork does not perturb main stream); analytic per-player decision already
 runs on an isolated `&WorldSnapshot` in tests (`tests.rs:13470`).
+
+---
+
+## 9. How rollout composes with the nets (DP ⨯ NN — the flywheel)
+
+The question isn't "rollout OR net" — it's how they couple. There are **three learners that feed
+each other**, and the coupling is what escapes the plateau:
+
+```
+   ┌─────────────────────────────────────────────────────────────┐
+   │  NET (actor+critic)  ──prior π + leaf value V──▶  ROLLOUT     │
+   │        ▲                                            │         │
+   │        │  distill: regress to rollout's            │ plays   │
+   │        │  chosen action + Q̂ + returns              ▼ (un-gated│
+   │        └──────────────────────────  search-improved decisions│
+   │                                                    │ actions) │
+   │   EPV GRID (DP value)  ◀──possession chains────────┘         │
+   │        └──fit by value iteration──▶ leaf value for rollout    │
+   └─────────────────────────────────────────────────────────────┘
+```
+
+- **Net → rollout:** the net supplies the candidate *prior* (which actions to simulate / weight) and
+  the *leaf value*, so the rollout can be shallow + cheap.
+- **Rollout → net:** the rollout, run over the **un-gated** action set, exposes + correctly values
+  forward passes (via the simulator), and its chosen action + per-candidate `Q̂` + realized returns
+  become the net's *supervised training target*. The net learns to *propose* what the rollout chose.
+- **Rollout → EPV → rollout:** rollout generates possession chains → EPV grid re-fit by DP → better
+  leaf → better rollout. Closed loop; the leaf value keeps the horizon short.
+
+**Why this specifically breaks the wall:** the exposure wall and the cost wall solve *each other*.
+The net can't expose forward passes on its own (empirically diagnosed — 30 rounds); rollout+sim can.
+Rollout is too expensive on its own (prod runs MCTS off); the net's prior+leaf make it shallow.
+Distillation transfers the rollout's exposure + valuation into the net's *priors*, so over iterations
+the net's own proposals shift forward — the thing reward-shaping never moved.
+
+### The right merge vs. the wrong merge
+
+- ✅ **Hierarchical (play the search, distill it back).** The net lives *inside* the rollout as
+  prior+value; the action you PLAY is the rollout's; you then regress the net toward it. This is the
+  provably-sound composition (a policy-improvement operator wrapped around function approximation =
+  AlphaZero).
+- ✅ **Best-of-two as *promotion*, not blending.** Run the rollout-policy and the net-policy as
+  distinct league entrants, arbitrate on the locked eval-gate discriminator, promote the winner to be
+  the next base. This is the OUTER loop and **the infra already exists** (`soccer_league_train`,
+  `soccer_eval_gate_run`, Elo/champion promotion). The winner becomes the next rollout's prior + next
+  PG seed.
+- ❌ **Averaging/blending two policies' outputs** (mixture of the net's and rollout's action
+  distributions, or logit-blending). This is *not* a convex operation on returns — the blend is
+  routinely worse than either parent. There is direct local evidence: `NEURAL_PASS_SPACE` "blend
+  toward net" and pass-space+MC both *added worse choices* (climb log). Do not merge this way.
+
+### Distillation target (flat rollout gives a *richer* signal than AlphaZero's visit counts)
+
+Flat rollout yields calibrated action-values `Q̂(s,a)` for every candidate — more than a visit
+distribution. Train:
+- **actor** → cross-entropy toward `softmax(Q̂/τ)` (or one-hot argmax) over the candidate set;
+- **critic** → the rollout return (low-variance thanks to CRN + base-policy rollout);
+- **EPV grid** → the same possession chains by DP.
+Plumbing exists: `SoccerPolicySample` (`soccer.rs:40418`), `neural_policy_training_samples`
+(`world.rs:18261`), `SoccerPolicyHead::train` (add a supervised-to-search term beside the PG term).
+
+### Strategic fork: additive vs. AlphaZero-pure
+
+- **A (additive, low-risk, fits infra):** keep the PG self-play league; add rollout as (i) a
+  decision-time booster proving exposure+guarantee on the eval gate, and (ii) another league entrant.
+  Net still trains by PG (which plateaus), rollout is a parallel track, league promotes the winner.
+- **B (AlphaZero-pure, higher-reward):** the net's ONLY learning signal becomes "regress to the
+  rollout's search target" — no PG advantage at all. Sidesteps the sparse-return PG plateau entirely,
+  because the target is now a dense, high-quality search decision at every on-ball tick. Rollout is
+  regenerated each iteration from the latest net.
+
+**Recommended:** A first (cheap, validates the premise on the locked discriminator), then graduate to
+B if the rollout-policy beats parity — distilling the expensive rollout into a fast net is also how
+you make it *deployable* (prod needs a cheap forward pass, not a live simulator). The league (g) is
+the arbiter throughout; "create a new base off the best of the two" = champion promotion = the outer
+loop of the same flywheel.
