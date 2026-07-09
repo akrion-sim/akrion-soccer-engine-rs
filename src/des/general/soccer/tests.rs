@@ -84583,6 +84583,8 @@ fn blocked_shot_penalizes_shooter_and_rewards_blocker_for_learning() {
         team: Team::Home,
         shooter,
         origin: sim.players[shooter].position,
+        intended_target: Vec2::zero(),
+        mpc_objective: None,
     });
     let before = WorldSnapshot::from_match(&sim);
     sim.players[shooter].last_decision = Some(test_decision_trace(&before, shooter, "shoot"));
