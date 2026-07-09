@@ -141,6 +141,7 @@ fn policy_head_trains_skill_specialists_independently() {
             old_action_probability: None,
             sample_weight: 1.0,
             mcts_distillation: false,
+            forward_select_eligible: false,
         }
     };
     let specialist_steps = |head: &SoccerPolicyHead, kind: SoccerPolicySpecialistKind| {
@@ -246,6 +247,7 @@ fn policy_head_snapshot_round_trips_role_heads_and_specialists() {
             old_action_probability: None,
             sample_weight: 1.0,
             mcts_distillation: false,
+            forward_select_eligible: false,
         }
     };
 
@@ -315,6 +317,68 @@ fn keeper_policy_actions_are_distinct_from_outfield_actions() {
 }
 
 #[test]
+fn shot_objective_sample_captured_on_terminal_outcome_with_expected_reward() {
+    // Learned-MPC shot-PLACEMENT sample: emitted at shot resolution whenever the shot armed the
+    // residual at launch (`mpc_objective` is Some) — independent of the env gate, which only governs
+    // whether the LAUNCH site sets `mpc_objective`. Verifies the terminal reward mapping (goal ⇒
+    // +1.0, off target ⇒ −1.0), the lateral-only / zero-bend capture convention, and the None-skip
+    // (byte-identical-off guarantee at the resolve site).
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        learning_enabled: true,
+        ..MatchConfig::default()
+    });
+    let shooter = sim
+        .players
+        .iter()
+        .find(|player| player.team == Team::Home && player.role == PlayerRole::Forward)
+        .expect("home forward")
+        .id;
+    let armed = |residual_x: f64| PendingShot {
+        team: Team::Home,
+        shooter,
+        origin: Vec2::new(40.0, 104.0),
+        intended_target: Vec2::new(41.0, 120.0),
+        mpc_objective: Some((vec![0.0f32; MPC_OBJECTIVE_FEATURE_DIM], Vec2::new(residual_x, 0.0), 0.0)),
+    };
+
+    // Goal ⇒ +1.0, and the sample carries exactly the applied lateral residual with zero bend.
+    sim.apply_ball_outcome(BallStepOutcome::Goal {
+        scoring_team: Team::Home,
+        shot: Some(armed(0.3)),
+    });
+    let goal_samples = sim.drain_mpc_objective_samples();
+    assert_eq!(goal_samples.len(), 1, "an armed shot emits exactly one placement sample on a goal");
+    assert!((goal_samples[0].reward - 1.0).abs() < 1e-9, "goal ⇒ +1.0 placement reward");
+    assert!((goal_samples[0].applied_residual.x - 0.3).abs() < 1e-9);
+    assert!(
+        goal_samples[0].applied_residual.y.abs() < 1e-9,
+        "shot placement residual is lateral-only (y captured as 0)"
+    );
+    assert!(goal_samples[0].applied_bend.abs() < 1e-9, "shot placement never applies bend");
+
+    // Off target ⇒ −1.0 (recorded for corpus parity; RWR skips negative advantage).
+    sim.apply_ball_outcome(BallStepOutcome::Miss { shot: armed(-0.5) });
+    let miss_samples = sim.drain_mpc_objective_samples();
+    assert_eq!(miss_samples.len(), 1);
+    assert!((miss_samples[0].reward + 1.0).abs() < 1e-9, "off-target ⇒ −1.0 placement reward");
+
+    // A shot that did NOT arm the residual (`mpc_objective: None`, i.e. gate off / no head at
+    // launch) emits NO sample — the behaviour-neutral / byte-identical-off guarantee at resolve.
+    let unarmed = PendingShot {
+        team: Team::Home,
+        shooter,
+        origin: Vec2::new(40.0, 104.0),
+        intended_target: Vec2::zero(),
+        mpc_objective: None,
+    };
+    sim.apply_ball_outcome(BallStepOutcome::Miss { shot: unarmed });
+    assert!(
+        sim.drain_mpc_objective_samples().is_empty(),
+        "an unarmed shot emits no placement sample"
+    );
+}
+
+#[test]
 fn save_outcome_credits_goalkeeper_recent_decision() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         learning_enabled: true,
@@ -362,6 +426,8 @@ fn save_outcome_credits_goalkeeper_recent_decision() {
             team: Team::Home,
             shooter,
             origin: sim.players[shooter].position,
+            intended_target: Vec2::zero(),
+            mpc_objective: None,
         },
         defending_team: Team::Away,
         keeper_id: keeper,
@@ -10797,7 +10863,10 @@ fn completed_forward_pass_count_bonus_rewards_actual_forward_reception() {
 #[test]
 fn quick_forward_release_bonus_gates_and_ramps_from_zero_at_threshold() {
     // scale=0 (the default) pays nothing regardless of inputs => byte-identical when the knob is off.
-    assert_eq!(quick_forward_release_bonus_value(0.0, 10.0, 0.0, 2, 0.9, 0.9), 0.0);
+    assert_eq!(
+        quick_forward_release_bonus_value(0.0, 10.0, 0.0, 2, 0.9, 0.9),
+        0.0
+    );
     // A clearly-good quick forward release into a real opportunity earns a positive, capped bonus.
     let good = quick_forward_release_bonus_value(1.0, 10.0, 0.0, 2, 0.9, 0.9);
     assert!(
@@ -10815,12 +10884,27 @@ fn quick_forward_release_bonus_gates_and_ramps_from_zero_at_threshold() {
     );
     assert_eq!(at_gate, 0.0, "at-threshold pays 0 (0-at-gate fits)");
     // Any failed gate (backward/short, no visible option, weak opportunity, poor completion) pays 0.
-    assert_eq!(quick_forward_release_bonus_value(1.0, 3.9, 0.0, 2, 0.9, 0.9), 0.0);
-    assert_eq!(quick_forward_release_bonus_value(1.0, 10.0, 0.0, 0, 0.9, 0.9), 0.0);
-    assert_eq!(quick_forward_release_bonus_value(1.0, 10.0, 0.0, 2, 0.49, 0.9), 0.0);
-    assert_eq!(quick_forward_release_bonus_value(1.0, 10.0, 0.0, 2, 0.9, 0.44), 0.0);
+    assert_eq!(
+        quick_forward_release_bonus_value(1.0, 3.9, 0.0, 2, 0.9, 0.9),
+        0.0
+    );
+    assert_eq!(
+        quick_forward_release_bonus_value(1.0, 10.0, 0.0, 0, 0.9, 0.9),
+        0.0
+    );
+    assert_eq!(
+        quick_forward_release_bonus_value(1.0, 10.0, 0.0, 2, 0.49, 0.9),
+        0.0
+    );
+    assert_eq!(
+        quick_forward_release_bonus_value(1.0, 10.0, 0.0, 2, 0.9, 0.44),
+        0.0
+    );
     // Held past the 1.2s quick-release cap => timing_fit 0 => no bonus even if other gates pass.
-    assert_eq!(quick_forward_release_bonus_value(1.0, 10.0, 2.0, 2, 0.9, 0.9), 0.0);
+    assert_eq!(
+        quick_forward_release_bonus_value(1.0, 10.0, 2.0, 2, 0.9, 0.9),
+        0.0
+    );
     // The cap holds even with max scale and saturated signals.
     let capped = quick_forward_release_bonus_value(2.0, 100.0, 0.0, 5, 1.0, 1.0);
     assert!(
@@ -13967,6 +14051,8 @@ fn active_shot_flight_is_not_recontrolled_as_loose_ball() {
         team: Team::Home,
         shooter,
         origin: sim.ball.position,
+        intended_target: Vec2::zero(),
+        mpc_objective: None,
     });
 
     sim.integrate_ball();
@@ -14533,6 +14619,8 @@ fn dead_shot_ball_at_rest_is_controllable_not_locked_out() {
         team: Team::Home,
         shooter,
         origin: Vec2::new(40.0, 40.0),
+        intended_target: Vec2::zero(),
+        mpc_objective: None,
     });
     // A team-mate is right on the dead ball.
     sim.players[collector].position = Vec2::new(40.0, 70.3);
@@ -16851,8 +16939,12 @@ fn pomdp_q_state_and_player_decision_use_front_behind_field_context() {
             + SOCCER_NEURAL_SAME_TEAM_SEPARATION_FEATURE_DIM
     );
     assert_eq!(
-        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM,
         SOCCER_NEURAL_PRE_DECISION_CONTEXT_FEATURE_DIM + SOCCER_NEURAL_DECISION_CONTEXT_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM + SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM
     );
 
     let mut stale_observation = observation.clone();
@@ -33950,6 +34042,8 @@ fn staging_set_play_restart_clears_stale_live_ball_context() {
         team: Team::Home,
         shooter: 5,
         origin: sim.players[5].position,
+        intended_target: Vec2::zero(),
+        mpc_objective: None,
     });
 
     sim.stage_set_play_restart(
@@ -38398,6 +38492,7 @@ fn curriculum_focused_phase_trains_only_its_specialist() {
         old_action_probability: None,
         sample_weight: 1.0,
         mcts_distillation: false,
+        forward_select_eligible: false,
     };
     let samples = vec![sample("pass"), sample("dribble"), sample("shoot")];
     let shoot_idx = soccer_policy_action_index("shoot").expect("shoot family");
@@ -38523,6 +38618,7 @@ fn skill_policy_heads_train_and_score_their_group() {
         old_action_probability: None,
         sample_weight: 1.0,
         mcts_distillation: false,
+        forward_select_eligible: false,
     };
     let samples = vec![
         sample("pass", 1.0),
@@ -38602,6 +38698,7 @@ fn policy_head_advantage_gradient_prefers_the_reinforced_family() {
                     old_action_probability: None,
                     sample_weight: 1.0,
                     mcts_distillation: false,
+                    forward_select_eligible: false,
                 },
                 SoccerPolicySample {
                     state_features: state,
@@ -38610,6 +38707,7 @@ fn policy_head_advantage_gradient_prefers_the_reinforced_family() {
                     old_action_probability: None,
                     sample_weight: 1.0,
                     mcts_distillation: false,
+                    forward_select_eligible: false,
                 },
             ]
         })
@@ -38650,6 +38748,7 @@ fn policy_head_mappo_clip_bounds_old_policy_ratio() {
         old_action_probability: Some(current_probability / 10.0),
         sample_weight: 1.0,
         mcts_distillation: false,
+        forward_select_eligible: false,
     };
     let positive = head
         .clipped_mappo_advantage(&positive_sample, 0.2)
@@ -38666,6 +38765,7 @@ fn policy_head_mappo_clip_bounds_old_policy_ratio() {
         old_action_probability: Some(current_probability * 10.0),
         sample_weight: 1.0,
         mcts_distillation: false,
+        forward_select_eligible: false,
     };
     let negative = head
         .clipped_mappo_advantage(&negative_sample, 0.2)
@@ -38691,6 +38791,7 @@ fn policy_head_mappo_clip_skips_missing_or_invalid_old_policy_probability() {
         old_action_probability,
         sample_weight: 1.0,
         mcts_distillation: false,
+        forward_select_eligible: false,
     };
 
     for old_action_probability in [None, Some(0.0), Some(f64::NAN), Some(f64::INFINITY)] {
@@ -38749,6 +38850,7 @@ fn per_role_policy_heads_train_without_cross_role_gradient_bleed() {
             old_action_probability: None,
             sample_weight: 1.0,
             mcts_distillation: false,
+            forward_select_eligible: false,
         })
         .collect();
     head.train(&samples, None);
@@ -42430,8 +42532,12 @@ fn learning_context_splits_mdp_pomdp_idea_from_mpc_execution() {
             + SOCCER_NEURAL_SAME_TEAM_SEPARATION_FEATURE_DIM
     );
     assert_eq!(
-        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM,
         SOCCER_NEURAL_PRE_DECISION_CONTEXT_FEATURE_DIM + SOCCER_NEURAL_DECISION_CONTEXT_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM + SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM
     );
     assert!(
         SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_IDEA_EXECUTION_FEATURE_DIM)
@@ -42439,6 +42545,96 @@ fn learning_context_splits_mdp_pomdp_idea_from_mpc_execution() {
     assert!(
         SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM)
     );
+    // The pre-action-param width (the old FEATURE_DIM) must be a recognized legacy width so
+    // nets trained before the action-param block migrate forward by zero-padding the tail.
+    assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM));
+}
+
+#[test]
+fn action_param_feature_block_occupies_the_tail() {
+    // The 10 action-param slots are contiguous and sit at the very tail, immediately after
+    // the previous FEATURE_DIM, so pre-block nets zero-pad exactly these positions and the
+    // gate-off path (which never writes them) is byte-identical to the prior layout. The
+    // first 6 are the attack-relative aim geometry (no absolute dy — forward carries it
+    // side-invariantly); the last 4 are the action identity/power (speed + pass/shoot/dribble
+    // one-hot).
+    assert_eq!(SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM, 10);
+    let slots = [
+        SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DX,
+        SOCCER_NEURAL_FEATURE_ACTION_PARAM_DISTANCE,
+        SOCCER_NEURAL_FEATURE_ACTION_PARAM_FORWARD,
+        SOCCER_NEURAL_FEATURE_ACTION_PARAM_DIR_SIN,
+        SOCCER_NEURAL_FEATURE_ACTION_PARAM_DIR_COS,
+        SOCCER_NEURAL_FEATURE_ACTION_PARAM_HAS_TARGET,
+        SOCCER_NEURAL_FEATURE_ACTION_PARAM_ACTION_SPEED,
+        SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_PASS,
+        SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_SHOOT,
+        SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_DRIBBLE,
+    ];
+    for (i, slot) in slots.iter().enumerate() {
+        assert_eq!(*slot, SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM + i);
+    }
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_DRIBBLE,
+        SOCCER_NEURAL_FEATURE_DIM - 1
+    );
+}
+
+#[test]
+fn action_param_aim_and_identity_features_encode_expected_content() {
+    // Gate-ON CONTENT test (Codex review): exercise the pure helpers the encoder delegates to,
+    // so we cover the actual per-slot math without building a full transition.
+    //
+    // Aim geometry is attack-relative. A target 30yd toward the ATTACKING goal for Home
+    // (attack_dir = +1, +y is the attack direction here) and 12yd to the side:
+    let ball = Vec2 { x: 40.0, y: 50.0 };
+    let target = Vec2 {
+        x: ball.x + 12.0,
+        y: ball.y + 30.0,
+    };
+    let attack_dir = Team::Home.attack_dir();
+    let (dx, distance, forward, dir_sin, dir_cos) =
+        soccer_action_param_aim_features(target, ball, attack_dir);
+    assert_eq!(dx, soccer_neural_signed_unit(12.0 / 40.0));
+    let dist = (12.0f64 * 12.0 + 30.0 * 30.0).sqrt();
+    assert_eq!(distance, soccer_neural_scaled(dist, 60.0));
+    // Forward is + when the target is toward the attacking goal.
+    assert!(forward > 0.0, "toward-goal aim must read positive forward");
+    assert_eq!(forward, soccer_neural_signed_unit(30.0 * attack_dir / 50.0));
+    assert!((dir_sin - (12.0 / dist)).abs() < 1e-9);
+    assert!((dir_cos - (30.0 * attack_dir / dist)).abs() < 1e-9);
+
+    // Side-invariance: the SAME on-pitch geometry mirrored for the Away team (which attacks
+    // -y) must produce the SAME forward-ness and dir_cos — the whole point of dropping the
+    // absolute dy. Away target 30yd toward ITS goal = ball.y - 30.
+    let away_target = Vec2 {
+        x: ball.x + 12.0,
+        y: ball.y - 30.0,
+    };
+    let (_dx_a, _dist_a, forward_a, _sin_a, dir_cos_a) =
+        soccer_action_param_aim_features(away_target, ball, Team::Away.attack_dir());
+    assert!(
+        (forward - forward_a).abs() < 1e-9,
+        "attack-relative forward must be side-invariant: {forward} vs {forward_a}"
+    );
+    assert!((dir_cos - dir_cos_a).abs() < 1e-9);
+
+    // Degenerate aim (target == ball): distance 0, direction unit vector (0, 0).
+    let (_dx0, distance0, _fwd0, sin0, cos0) =
+        soccer_action_param_aim_features(ball, ball, attack_dir);
+    assert_eq!(distance0, soccer_neural_scaled(0.0, 60.0));
+    assert_eq!((sin0, cos0), (0.0, 0.0));
+
+    // Identity/power one-hot: a pass, a shot, and a dribble each light exactly their own flag;
+    // speed is scaled. (Reuses main's family helpers, so this also pins that wiring.)
+    let (pass_speed, is_pass, is_shoot, is_dribble) =
+        soccer_action_param_identity_features("pass", 18.0);
+    assert_eq!(pass_speed, soccer_neural_scaled(18.0, 36.0));
+    assert_eq!((is_pass, is_shoot, is_dribble), (1.0, 0.0, 0.0));
+    let (_s, p, sh, dr) = soccer_action_param_identity_features("shoot", 30.0);
+    assert_eq!((p, sh, dr), (0.0, 1.0, 0.0));
+    let (_s2, p2, sh2, dr2) = soccer_action_param_identity_features("dribble", 6.0);
+    assert_eq!((p2, sh2, dr2), (0.0, 0.0, 1.0));
 }
 
 #[test]
@@ -45643,6 +45839,8 @@ fn out_of_play_missed_shot_records_attempt_and_accuracy_penalty() {
             team: Team::Home,
             shooter,
             origin: sim.players[shooter].position,
+            intended_target: Vec2::zero(),
+            mpc_objective: None,
         }),
         shot_off_target_yards: 8.0,
     });
@@ -55875,8 +56073,12 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
         SOCCER_NEURAL_PRE_SOLO_CARRIER_FEATURE_DIM + SOCCER_NEURAL_SOLO_CARRIER_FEATURE_DIM
     );
     assert_eq!(
-        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_SAME_TEAM_SEPARATION_FEATURE_DIM,
         SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM + SOCCER_NEURAL_EXECUTION_MPC_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM + SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM
     );
     assert_eq!(
         SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM,
@@ -56090,8 +56292,12 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
         SOCCER_NEURAL_PRE_IDEA_EXECUTION_FEATURE_DIM + SOCCER_NEURAL_IDEA_EXECUTION_FEATURE_DIM
     );
     assert_eq!(
-        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_SAME_TEAM_SEPARATION_FEATURE_DIM,
         SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM + SOCCER_NEURAL_EXECUTION_MPC_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM + SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM
     );
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&170));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&177));
@@ -66105,6 +66311,8 @@ fn endline_out_awards_goal_kick_or_corner() {
         team: Team::Home,
         shooter: 9,
         origin: Vec2::new(58.0, 100.0),
+        intended_target: Vec2::zero(),
+        mpc_objective: None,
     });
 
     goal_kick.integrate_ball();
@@ -66323,6 +66531,8 @@ fn defender_between_ball_and_goal_can_physically_block_shot() {
             team: Team::Home,
             shooter: attacker,
             origin: sim.players[attacker].position,
+            intended_target: Vec2::zero(),
+            mpc_objective: None,
         });
 
         sim.integrate_ball();
@@ -66898,6 +67108,8 @@ fn fast_shot_scores_from_goal_line_crossing_even_when_tick_overshoots() {
         team: Team::Home,
         shooter: 9,
         origin: sim.ball.position,
+        intended_target: Vec2::zero(),
+        mpc_objective: None,
     });
 
     sim.integrate_ball();
@@ -66934,6 +67146,8 @@ fn shot_crossing_outside_posts_is_not_goal() {
         team: Team::Home,
         shooter: 9,
         origin: sim.ball.position,
+        intended_target: Vec2::zero(),
+        mpc_objective: None,
     });
 
     sim.integrate_ball();
@@ -66980,6 +67194,8 @@ fn on_target_shot_past_keeper_is_a_goal_not_a_phantom_save_on_the_line() {
             team: Team::Home,
             shooter: 9,
             origin: sim.ball.position,
+            intended_target: Vec2::zero(),
+            mpc_objective: None,
         });
 
         // Resolve the shot over a couple of ticks.
@@ -67170,6 +67386,8 @@ fn shot_crossing_just_inside_configured_goalmouth_counts() {
         team: Team::Home,
         shooter: 9,
         origin: sim.ball.position,
+        intended_target: Vec2::zero(),
+        mpc_objective: None,
     });
 
     sim.integrate_ball();
@@ -75764,8 +75982,12 @@ fn first_touch_escape_lateral_neural_block_is_appended_and_migration_safe() {
         SOCCER_NEURAL_PRE_SOLO_CARRIER_FEATURE_DIM + SOCCER_NEURAL_SOLO_CARRIER_FEATURE_DIM
     );
     assert_eq!(
-        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_SAME_TEAM_SEPARATION_FEATURE_DIM,
         SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM + SOCCER_NEURAL_EXECUTION_MPC_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM + SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM
     );
     assert_eq!(
         SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM,
@@ -75935,7 +76157,7 @@ fn first_touch_escape_lateral_neural_block_is_appended_and_migration_safe() {
     );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_EXECUTION_MPC_RECOMMENDED_SPEED + 1,
-        SOCCER_NEURAL_FEATURE_DIM
+        SOCCER_NEURAL_PRE_SAME_TEAM_SEPARATION_FEATURE_DIM
     );
     assert!(SOCCER_NEURAL_FEATURE_DEFENSIVE_PRESS_ACTION < SOCCER_NEURAL_FEATURE_DIM);
     assert!(SOCCER_NEURAL_FEATURE_DEFENSIVE_CONTAIN_RISK < SOCCER_NEURAL_FEATURE_DIM);
@@ -78359,6 +78581,8 @@ fn keeper_parry_records_save_and_leaves_live_rebound() {
         team: Team::Home,
         shooter: 9,
         origin: Vec2::new(40.0, 104.0),
+        intended_target: Vec2::zero(),
+        mpc_objective: None,
     };
     sim.pending_shot = Some(shot.clone());
     sim.ball.holder = Some(keeper_id);
@@ -78435,6 +78659,8 @@ fn attacking_players_sprint_to_keeper_parry_rebound() {
         team: Team::Home,
         shooter: attacker,
         origin: Vec2::new(40.0, 104.0),
+        intended_target: Vec2::zero(),
+        mpc_objective: None,
     };
 
     sim.apply_ball_outcome(BallStepOutcome::KeeperParry {
@@ -78485,6 +78711,8 @@ fn defending_players_sprint_to_clear_keeper_parry_rebound() {
         team: Team::Home,
         shooter: attacker,
         origin: Vec2::new(40.0, 104.0),
+        intended_target: Vec2::zero(),
+        mpc_objective: None,
     };
 
     sim.apply_ball_outcome(BallStepOutcome::KeeperParry {
@@ -78571,6 +78799,8 @@ fn keeper_save_is_agentic_and_updates_shot_stats() {
             team: Team::Home,
             shooter: 9,
             origin: Vec2::new(40.0, 80.0),
+            intended_target: Vec2::zero(),
+            mpc_objective: None,
         });
 
         for _ in 0..10 {
@@ -84421,6 +84651,8 @@ fn blocked_shot_penalizes_shooter_and_rewards_blocker_for_learning() {
         team: Team::Home,
         shooter,
         origin: sim.players[shooter].position,
+        intended_target: Vec2::zero(),
+        mpc_objective: None,
     });
     let before = WorldSnapshot::from_match(&sim);
     sim.players[shooter].last_decision = Some(test_decision_trace(&before, shooter, "shoot"));
@@ -84432,6 +84664,8 @@ fn blocked_shot_penalizes_shooter_and_rewards_blocker_for_learning() {
             team: Team::Home,
             shooter,
             origin: before.ball.position,
+            intended_target: Vec2::zero(),
+            mpc_objective: None,
         },
         blocker_id: blocker,
         defending_team: Team::Away,
@@ -84495,6 +84729,8 @@ fn wide_block_deflection_does_not_award_an_instant_corner() {
             team: Team::Home,
             shooter,
             origin: sim.players[shooter].position,
+            intended_target: Vec2::zero(),
+            mpc_objective: None,
         },
         blocker_id: blocker,
         defending_team: Team::Away,

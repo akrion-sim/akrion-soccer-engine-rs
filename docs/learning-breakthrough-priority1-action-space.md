@@ -12,20 +12,20 @@
 
 Three compounding structural ceilings, all verified in code:
 
-1. **The net ranks heuristic actions with heuristic *parameters*.** The learnable factored action
-   space (`DiscretizedKickAction` — actor owns kick power/direction/curve) exists and is unit-tested
-   but is only used at the **execution/lowering** layer ([world.rs:14650](../src/des/general/soccer/world.rs#L14650),
-   gated `DD_SOCCER_ENABLE_DISCRETIZED_KICK`) — *never as candidates the net ranks*. Pass/shoot
-   params are a continuous power × ~72-site heuristic scan.
+1. **The net now has a partial learned parameter surface, but not the whole one.**
+   Kick-power bucket labels are present in `SOCCER_POLICY_ACTIONS` and MCTS can expand pass,
+   aerial-pass, shot, and first-time-shot bucket variants behind `DD_SOCCER_ENABLE_DISCRETIZED_KICK`.
+   That fixes the older "never reaches candidates" diagnosis for speed buckets. Direction, curve,
+   elevation, and bounded aim are still mostly analytic, and bucket selection still needs entropy
+   telemetry/proof.
 2. **The value regresses onto the *tabular* Q.** Target = `r + γ·max_next` with `max_next =`
    tabular `best_value_hierarchical` ([world.rs](../src/des/general/soccer/world.rs)). A value
    trained to match the tabular Q **cannot exceed the analytic ceiling** — it's imitation, not
    policy improvement.
-3. **The action encoding has no structured params.** In `soccer_neural_transition_features_with_action`
-   the action is encoded as **3 family bits** (`soccer_neural_action_family_features`) **+ one opaque
-   FNV hash** ([soccer.rs:40402](../src/des/general/soccer.rs#L40402)). The hash lets the net
-   *distinguish* labels but has no structure — `pass|spd:6` and `pass|spd:7` map to unrelated
-   scalars, so the net **cannot learn "this kick speed/direction is better here."**
+3. **The action encoding is still not fully structured.** Labels such as `pass-kp7` let the actor
+   distinguish bucket choices, and the transition context can expose selected kick power, but the
+   broader parameter space is not yet a clean structured block for direction/curve/elevation/aim.
+   Do not treat the landed power labels as a complete factored action representation.
 
 ## The drift that produced this
 
@@ -38,20 +38,21 @@ the net must beat — while the net was never given the tools to beat it.**
 
 ### Part A — structured action-param feature block (append-only)
 Add a `SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM` block (append-only, so old nets zero-pad — the
-established migration pattern, see [soccer.rs:4505](../src/des/general/soccer.rs#L4505)) encoding the
-candidate's **aim**, from `AgentActionTargetTrace.point` ([soccer.rs:7805](../src/des/general/soccer.rs#L7805))
+established migration pattern) encoding the candidate's **aim**, from `AgentActionTargetTrace.point`
 relative to the ball/actor: target dx/dy (normalized), distance, forward-ness (toward attacking
 goal), direction sin/cos, has-target. Gate `DD_SOCCER_ENABLE_ACTION_PARAM_FEATURES` (off ⇒ zero
 block ⇒ byte-identical). **This replaces the opaque hash with structure the net can generalize
 over** — even for existing candidates.
 
 ### Part B — discretized-kick variant candidates
-In the candidate assembly ([world.rs:5623](../src/des/general/soccer/world.rs#L5623), where legal
-`SOCCER_POLICY_ACTIONS` are injected), for kick families (pass/shoot/cross) generate a *spread* of
-`DiscretizedKickAction` variants over the speed/direction buckets toward plausible targets, each
-carrying its Part-A param features. The net ranks them; the chosen variant's params are lowered via
-the existing `DiscretizedKickAction::from_power_direction` path. **Now the policy's output space
-matches the trainable action set** — it can express kicks the heuristic scan can't.
+The first slice of this is already implemented for speed: the actor vocabulary has `40` kick-power
+bucket labels and MCTS can add bucket variants when `DD_SOCCER_ENABLE_DISCRETIZED_KICK` is on.
+The remaining work is to add the missing structured dimensions:
+
+- direction/aim as a bounded offset around the current target, not a free absolute 36-way choice;
+- curve and elevation as small masked heads;
+- selected-bucket entropy and net-changed-action telemetry, so the code proves the bucket path
+  changes behavior instead of only changing labels.
 
 ### Part C — true policy improvement (break tabular imitation)
 Either (i) bootstrap the value off *its own* successor value (real neural n-step / Q-learning) so it
@@ -70,6 +71,7 @@ Each part is gated (off ⇒ byte-identical). The action-space change (A+B) needs
 from a fresh net to be meaningful (existing nets have no param features / never saw the variants).
 Success bar unchanged: sustained > 0.55 vs the analytic field with Wilson lower bound > 0.5.
 
-**Bottom line:** the breakthrough is not a new optimizer or bonus — it's **wiring the learnable
-action space (A+B) and closing the policy-improvement loop (C)** that the team built but left
-dormant. That is what lets learning *exceed* the analytic engine instead of converging to it.
+**Bottom line:** the breakthrough is not a new optimizer or bonus. The speed-bucket slice of the
+learnable action space is now wired; the remaining breakthrough is to make bucket exploration and
+causal influence measurable, then finish the structured direction/curve/elevation/aim surfaces and
+close the policy-improvement loop (C).
