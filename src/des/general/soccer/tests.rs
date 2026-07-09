@@ -13989,6 +13989,8 @@ fn active_shot_flight_is_not_recontrolled_as_loose_ball() {
         team: Team::Home,
         shooter,
         origin: sim.ball.position,
+        intended_target: Vec2::zero(),
+        mpc_objective: None,
     });
 
     sim.integrate_ball();
