@@ -702,6 +702,7 @@ pub struct SoccerLearningPgStore {
     /// can be rebuilt — `connect_with_retry` originally covered only the first connect.
     database_url: String,
     policy_retention_schema_ready: bool,
+    policy_receiver_schema_ready: bool,
 }
 
 impl SoccerLearningPgStore {
@@ -718,6 +719,7 @@ impl SoccerLearningPgStore {
         )?;
         self.client = rebuilt.client;
         self.policy_retention_schema_ready = rebuilt.policy_retention_schema_ready;
+        self.policy_receiver_schema_ready = rebuilt.policy_receiver_schema_ready;
         Ok(())
     }
 
@@ -756,6 +758,28 @@ impl SoccerLearningPgStore {
         Ok(())
     }
 
+    fn ensure_policy_receiver_schema_ready(&mut self) -> Result<(), String> {
+        if self.policy_receiver_schema_ready {
+            return Ok(());
+        }
+        if self.policy_receiver_columns_present()? {
+            self.policy_receiver_schema_ready = true;
+            return Ok(());
+        }
+        self.with_transient_retry("ensure soccer policy receiver descriptor schema", |store| {
+            let mut tx = store.client.transaction().map_err(|err| {
+                format!("begin soccer policy receiver descriptor schema transaction: {err}")
+            })?;
+            ensure_soccer_learning_policy_receiver_descriptor_schema(&mut tx)?;
+            tx.commit().map_err(|err| {
+                format!("commit soccer policy receiver descriptor schema transaction: {err}")
+            })?;
+            Ok(())
+        })?;
+        self.policy_receiver_schema_ready = true;
+        Ok(())
+    }
+
     fn policy_retention_columns_present(&mut self) -> Result<bool, String> {
         self.with_transient_retry("check soccer policy retention columns", |store| {
             let row = store
@@ -776,6 +800,42 @@ impl SoccerLearningPgStore {
                     &[],
                 )
                 .map_err(|err| format!("check soccer policy retention columns: {err}"))?;
+            Ok(row.get(0))
+        })
+    }
+
+    fn policy_receiver_columns_present(&mut self) -> Result<bool, String> {
+        self.with_transient_retry("check soccer policy receiver descriptor columns", |store| {
+            let row = store
+                .client
+                .query_one(
+                    r#"
+                    with receiver_columns as (
+                      select count(*) = 2 as ready
+                      from information_schema.columns
+                      where table_schema = current_schema()
+                        and column_name = 'receiver_descriptor'
+                        and table_name in (
+                          'des_soccer_learning_policy_entries',
+                          'des_soccer_learning_run_deltas'
+                        )
+                    ),
+                    receiver_indexes as (
+                      select count(*) = 2 as ready
+                      from pg_indexes
+                      where schemaname = current_schema()
+                        and indexname in (
+                          'des_soccer_learning_policy_entries_key_uq',
+                          'des_soccer_learning_run_deltas_key_uq'
+                        )
+                        and indexdef like '%receiver_descriptor%'
+                    )
+                    select receiver_columns.ready and receiver_indexes.ready
+                    from receiver_columns, receiver_indexes
+                    "#,
+                    &[],
+                )
+                .map_err(|err| format!("check soccer policy receiver descriptor columns: {err}"))?;
             Ok(row.get(0))
         })
     }
@@ -907,6 +967,7 @@ impl SoccerLearningPgStore {
                         client,
                         database_url: database_url.to_string(),
                         policy_retention_schema_ready: false,
+                        policy_receiver_schema_ready: false,
                     });
                 }
                 Err(err) => {
@@ -2037,6 +2098,7 @@ impl SoccerLearningPgStore {
         search_metadata: Option<&Value>,
     ) -> Result<(), String> {
         self.ensure_connected()?;
+        self.ensure_policy_receiver_schema_ready()?;
         let config_json =
             serde_json::to_value(config).map_err(|err| format!("serialize match config: {err}"))?;
         let options_json = json!({
@@ -2376,6 +2438,7 @@ impl SoccerLearningPgStore {
         game: &SoccerLearningCompletedGame,
     ) -> Result<String, String> {
         self.ensure_connected()?;
+        self.ensure_policy_receiver_schema_ready()?;
         if !game.config_moments.is_empty() {
             validate_config_moments(&game.config_moments)?;
         }
@@ -2691,6 +2754,7 @@ impl SoccerLearningPgStore {
             return Ok(Vec::new());
         }
         self.ensure_connected()?;
+        self.ensure_policy_receiver_schema_ready()?;
         let has_config_moments = runs.iter().any(|run| !run.game.config_moments.is_empty());
         let has_pass_outcome_samples = runs
             .iter()
@@ -3446,6 +3510,7 @@ impl SoccerLearningPgStore {
         // the full multi-million-row policy. See `load_latest_active_policy_with_min_visits`.
         min_visits: i32,
     ) -> Result<SoccerTeamQPolicies, String> {
+        self.ensure_policy_receiver_schema_ready()?;
         let max_policy_entries = soccer_pg_resume_max_policy_entries();
         if max_policy_entries == Some(0) {
             println!(
@@ -4460,6 +4525,75 @@ fn ensure_soccer_learning_policy_retention_columns(
         "#,
     )
     .map_err(|err| format!("ensure soccer policy retention columns: {err}"))?;
+    Ok(())
+}
+
+fn ensure_soccer_learning_policy_receiver_descriptor_schema(
+    tx: &mut postgres::Transaction<'_>,
+) -> Result<(), String> {
+    tx.batch_execute(
+        r#"
+        set local statement_timeout = 0;
+
+        alter table des_soccer_learning_policy_entries
+          add column if not exists receiver_descriptor integer default -1 not null;
+        alter table des_soccer_learning_run_deltas
+          add column if not exists receiver_descriptor integer default -1 not null;
+
+        do $$
+        begin
+          if not exists (
+            select 1
+            from pg_constraint
+            where conname = 'des_soccer_learning_policy_entries_receiver_descriptor_chk'
+          ) then
+            alter table des_soccer_learning_policy_entries
+              add constraint des_soccer_learning_policy_entries_receiver_descriptor_chk
+              check (receiver_descriptor >= -1) not valid;
+          end if;
+          if not exists (
+            select 1
+            from pg_constraint
+            where conname = 'des_soccer_learning_run_deltas_receiver_descriptor_chk'
+          ) then
+            alter table des_soccer_learning_run_deltas
+              add constraint des_soccer_learning_run_deltas_receiver_descriptor_chk
+              check (receiver_descriptor >= -1) not valid;
+          end if;
+        end $$;
+
+        drop index if exists des_soccer_learning_policy_entries_key_uq;
+        create unique index if not exists des_soccer_learning_policy_entries_key_uq
+          on des_soccer_learning_policy_entries (
+            policy_version_id,
+            team,
+            entry_kind,
+            state_hash,
+            action,
+            target_fine_cell_id,
+            target_tactical_cell_id,
+            target_macro_cell_id,
+            target_root_cell_id,
+            receiver_descriptor
+          );
+
+        drop index if exists des_soccer_learning_run_deltas_key_uq;
+        create unique index if not exists des_soccer_learning_run_deltas_key_uq
+          on des_soccer_learning_run_deltas (
+            run_id,
+            team,
+            entry_kind,
+            state_hash,
+            action,
+            target_fine_cell_id,
+            target_tactical_cell_id,
+            target_macro_cell_id,
+            target_root_cell_id,
+            receiver_descriptor
+          );
+        "#,
+    )
+    .map_err(|err| format!("ensure soccer policy receiver descriptor schema: {err}"))?;
     Ok(())
 }
 
