@@ -4640,18 +4640,12 @@ const SOCCER_NEURAL_PRE_DECISION_CONTEXT_FEATURE_DIM: usize =
 /// Append-only structured action-parameter block (Part A of the priority-1 action-space
 /// fix). Encodes the candidate action's AIM — target dx/dy relative to the ball, aim
 /// distance, attack-relative forward-ness, and the aim direction as an attack-relative
-/// unit vector (sin/cos) — plus a has-target flag, AND the action's identity/power:
-/// launch speed and a pass/shoot/dribble family one-hot. The aim geometry lets the value
-/// head GENERALIZE over nearby kick targets (nearby targets → nearby features); the
-/// speed + family flags tell it WHAT the action is and how hard, which pure aim geometry
-/// cannot. Together they replace the opaque FNV `soccer_neural_action_hash` where
-/// `pass|spd:6` and `pass|spd:7` map to unrelated scalars. Gate
-/// `DD_SOCCER_ENABLE_ACTION_PARAM_FEATURES`; OFF (default) ⇒ the 11 slots stay 0.0 ⇒
-/// byte-identical, and pre-block nets zero-pad. (Conceptual merge of two variants: the
-/// attack-relative aim geometry from `plateau-net` — the side-invariant representation —
-/// plus the launch-speed and pass/shoot/dribble family one-hot from
-/// `feature/action-param-features-and-capacity`.)
-const SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM: usize = 11;
+/// unit vector (sin/cos) — plus a has-target flag. Gives the value head geometric
+/// structure it can GENERALIZE over (nearby kick targets now share nearby features),
+/// instead of leaning on the opaque FNV `soccer_neural_action_hash` where `pass|spd:6`
+/// and `pass|spd:7` map to unrelated scalars. Gate `DD_SOCCER_ENABLE_ACTION_PARAM_FEATURES`;
+/// OFF (default) ⇒ the 7 slots stay 0.0 ⇒ byte-identical, and pre-block nets zero-pad.
+const SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM: usize = 7;
 const SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_DECISION_CONTEXT_FEATURE_DIM + SOCCER_NEURAL_DECISION_CONTEXT_FEATURE_DIM;
 const SOCCER_NEURAL_FEATURE_DIM: usize =
@@ -5248,17 +5242,6 @@ const SOCCER_NEURAL_FEATURE_ACTION_PARAM_DIR_COS: usize =
     SOCCER_NEURAL_FEATURE_ACTION_PARAM_DIR_SIN + 1;
 const SOCCER_NEURAL_FEATURE_ACTION_PARAM_HAS_TARGET: usize =
     SOCCER_NEURAL_FEATURE_ACTION_PARAM_DIR_COS + 1;
-// Action identity/power slots (from feature/action-param-features-and-capacity): the
-// action's launch speed and a pass/shoot/dribble family one-hot — target-independent, so
-// they are written even when the action has no aim point.
-const SOCCER_NEURAL_FEATURE_ACTION_PARAM_ACTION_SPEED: usize =
-    SOCCER_NEURAL_FEATURE_ACTION_PARAM_HAS_TARGET + 1;
-const SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_PASS: usize =
-    SOCCER_NEURAL_FEATURE_ACTION_PARAM_ACTION_SPEED + 1;
-const SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_SHOOT: usize =
-    SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_PASS + 1;
-const SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_DRIBBLE: usize =
-    SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_SHOOT + 1;
 const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     61,
     62,
@@ -15494,11 +15477,6 @@ pub(crate) fn scoop_completion_viability(observation: &SoccerPomdpObservation) -
 
 fn pass_like_action_flight(action: &str) -> Option<PassFlight> {
     use SoccerActionLabel::*;
-    // Codex r24 forward-release action is a floor pass for all flight/reward/MPC classification;
-    // it stays a distinct label only for legality + execution-target routing.
-    if normalize_soccer_action_label(action) == "forward-release-pass" {
-        return Some(PassFlight::Floor);
-    }
     match SoccerActionLabel::classify(normalize_soccer_action_label(action))? {
         Pass | FirstTimePass | FlankLowCross | WallPass | WallReturn | CornerFlagCross
         | SurprisePass | KillerPass | SwitchPlay | RecycleReset => Some(PassFlight::Floor),
@@ -24012,31 +23990,6 @@ fn quick_release_forward_pass_reward(
 /// Scale for the opportunity-conditioned quick-forward-release carrot (Codex r19). Env
 /// `DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE` (clamped 0..2), default **0.0** ⇒ byte-identical
 /// (the whole term is a no-op unless explicitly enabled). Pre-registered A/B arms: 0.75, 1.0, 1.5.
-/// Codex r24 interface lever: gate for the explicit `forward-release-pass` actor action. Default
-/// OFF ⇒ the action never legalizes and never executes, so behavior is unchanged (the vocab entry
-/// is present but inert). ON ⇒ the actor may choose an explicit "release forward" pass whenever a
-/// real forward option exists, executing to the visible/quick forward receiver.
-pub(crate) fn forward_release_action_enabled() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("DD_SOCCER_ENABLE_FORWARD_RELEASE_ACTION")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
-}
-
-/// Shared opportunity gate for the `forward-release-pass` action: a real forward option must exist
-/// in the before-state (mirrors the carrot's opportunity condition, Codex r19/r24).
-fn forward_release_opportunity_present(observation: &SoccerPomdpObservation) -> bool {
-    observation.has_ball
-        && observation.visible_forward_pass_options > 0
-        && observation
-            .best_forward_pass_option_quality
-            .max(observation.quick_forward_pass_value)
-            >= 0.50
-}
-
 pub(crate) fn quick_forward_release_reward_scale() -> f64 {
     use std::sync::OnceLock;
     static V: OnceLock<f64> = OnceLock::new();
@@ -43541,10 +43494,6 @@ const SOCCER_POLICY_ACTIONS: &[&str] = &[
     "first-time-shot-kp7",
     "first-time-shot-kp8",
     "first-time-shot-kp9",
-    // Codex r24 interface lever (append-only): explicit forward-release pass. Gated + legal ONLY
-    // when a real forward option exists; executes to the visible/quick forward receiver. Puts the
-    // go-forward DECISION in the actor's learnable vocabulary instead of relying on reward shaping.
-    "forward-release-pass",
 ];
 
 const SOCCER_POLICY_PASS_ACTIONS: &[&str] = &[
@@ -46149,23 +46098,11 @@ fn soccer_neural_transition_features_with_action(
         soccer_neural_scaled(obs.forward_onside_support_clamp_distance_yards, 8.0);
     features[SOCCER_NEURAL_FEATURE_FORWARD_ONSIDE_SUPPORT_PRESSURE] =
         soccer_neural_unit(obs.forward_onside_support_pressure);
-    // Append-only structured action-parameter block. OFF (default) ⇒ the 11 slots stay 0.0
-    // (byte-identical). When ON, the value head sees the candidate's aim geometry (so it can
-    // generalize across similar kick targets) AND the action's identity/power (launch speed +
-    // pass/shoot/dribble family), replacing the opaque `soccer_neural_action_hash` scalar
-    // written above. Aim geometry (attack-relative) only when a target exists; the identity
-    // slots are written whenever the block is on, since they do not need an aim point.
+    // Append-only structured action-parameter block (priority-1 Part A). OFF (default) or
+    // no aim ⇒ the 7 slots stay 0.0 (byte-identical). When on with a target, the value head
+    // sees the candidate's aim geometry so it can generalize across similar kick targets
+    // instead of relying on the opaque `soccer_neural_action_hash` scalar written above.
     if dd_soccer_enable_action_param_features() {
-        // Action identity + power (target-independent). Reuse main's canonical family helpers
-        // rather than re-deriving the label taxonomy.
-        features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_ACTION_SPEED] =
-            soccer_neural_scaled(context.action_ball_speed_yps, 36.0);
-        features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_PASS] =
-            soccer_neural_bool(is_pass_like_action(action_label));
-        features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_SHOOT] =
-            soccer_neural_bool(soccer_frame_liveness_action_is_shot(action_label));
-        features[SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_DRIBBLE] =
-            soccer_neural_bool(is_dribble_action_label(action_label));
         if let Some(target) = context.target_point {
             let rel_x = target.x - context.ball_position.x;
             let rel_y = target.y - context.ball_position.y;
@@ -66968,12 +66905,6 @@ fn learned_action_label_is_legal_for_observation(
                     ))
         }
         "pass" => observation.has_ball && snapshot.best_visible_pass_target(player_id).is_some(),
-        // Codex r24 interface lever: legal ONLY with the gate on AND a real forward option present.
-        "forward-release-pass" => {
-            forward_release_action_enabled()
-                && forward_release_opportunity_present(&observation)
-                && snapshot.best_visible_pass_target(player_id).is_some()
-        }
         "wall-pass" => observation.has_ball && snapshot.wall_pass_option_for(player_id).is_some(),
         "wall-return" => {
             observation.has_ball && snapshot.wall_return_pass_target_for(player_id).is_some()
