@@ -1520,6 +1520,7 @@ fn neural_population_eval_runner_config(
         match_wall_time_limit: Some(Duration::from_secs_f64(
             (config.eval_minutes * 60.0 * 4.0).max(20.0),
         )),
+        mpc_objective_head: None,
     }
 }
 
@@ -1533,6 +1534,7 @@ fn run_home_neural_against_analytic_learning_eval_match(
     let EngineMatchRunnerConfig {
         base: mut config,
         match_wall_time_limit,
+        mpc_objective_head: _,
     } = neural_population_eval_runner_config(base_config, search_config);
     config.seed = seed as u32;
     let mut sim = SoccerMatch::default_11v11(config);
@@ -5525,6 +5527,12 @@ fn apply_anchor_promotion_gate_with_decision(
         runner_config.base.duration_seconds = cfg.minutes * 60.0;
         EngineMatchRunner::new(runner_config)
     });
+    let carried_mpc_head = if learned_mpc_objective_enabled() {
+        CARRIED_MPC_OBJECTIVE_HEAD.lock().unwrap().as_ref().cloned()
+    } else {
+        None
+    };
+    runner.set_mpc_objective_head(carried_mpc_head);
     match anchor_promotion_gate_verdict(
         runner,
         candidate_neural,
@@ -12997,12 +13005,44 @@ mod tests {
             Some("true")
         );
         assert_eq!(
+            continuous_manifest_env_value("DD_SOCCER_ENABLE_LEARNED_PASS_RECEIVER"),
+            Some("true")
+        );
+        assert_eq!(
+            continuous_manifest_env_value("DD_SOCCER_ENABLE_NEURAL_PASS_SPACE"),
+            Some("true")
+        );
+        assert_eq!(
+            continuous_manifest_env_value("DD_SOCCER_ENABLE_DISCRETIZED_KICK"),
+            Some("true")
+        );
+        assert_eq!(
+            continuous_manifest_env_value("DD_SOCCER_ENABLE_SCORED_SHOT_PLACEMENT"),
+            Some("true")
+        );
+        assert_eq!(
             continuous_manifest_env_value("DD_SOCCER_FORWARD_PASS_REWARD_SCALE"),
             Some("6")
         );
         assert_eq!(
             continuous_manifest_env_value("DD_SOCCER_SHOT_SHAPING_REWARD_SCALE"),
             Some("0.4")
+        );
+        assert_eq!(
+            continuous_manifest_env_value("SOCCER_EVAL_REQUIRE_FORWARD_PASS_CLIMB"),
+            Some("true")
+        );
+        assert_eq!(
+            continuous_manifest_env_value("SOCCER_EVAL_MIN_FORWARD_PASS_MARGIN"),
+            Some("0")
+        );
+        assert_eq!(
+            continuous_manifest_env_value("SOCCER_EVAL_MIN_NET_FORWARD_PASS_MARGIN"),
+            Some("0")
+        );
+        assert_eq!(
+            continuous_manifest_env_value("SOCCER_EVAL_MIN_FORWARD_PASS_RATE_MARGIN"),
+            Some("0.0")
         );
         assert_continuous_manifest_contains(
             "require_value DD_SOCCER_ENABLE_LOOSE_BALL_COMMIT_MODEL true",
@@ -13013,9 +13053,29 @@ mod tests {
         assert_continuous_manifest_contains(
             "require_value DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE true",
         );
+        assert_continuous_manifest_contains(
+            "require_value DD_SOCCER_ENABLE_LEARNED_PASS_RECEIVER true",
+        );
+        assert_continuous_manifest_contains(
+            "require_value DD_SOCCER_ENABLE_NEURAL_PASS_SPACE true",
+        );
+        assert_continuous_manifest_contains("require_value DD_SOCCER_ENABLE_DISCRETIZED_KICK true");
+        assert_continuous_manifest_contains(
+            "require_value DD_SOCCER_ENABLE_SCORED_SHOT_PLACEMENT true",
+        );
         assert_continuous_manifest_contains("require_value DD_SOCCER_FORWARD_PASS_REWARD_SCALE 6");
         assert_continuous_manifest_contains(
             "require_value DD_SOCCER_SHOT_SHAPING_REWARD_SCALE 0.4",
+        );
+        assert_continuous_manifest_contains(
+            "require_value SOCCER_EVAL_REQUIRE_FORWARD_PASS_CLIMB true",
+        );
+        assert_continuous_manifest_contains("require_value SOCCER_EVAL_MIN_FORWARD_PASS_MARGIN 0");
+        assert_continuous_manifest_contains(
+            "require_value SOCCER_EVAL_MIN_NET_FORWARD_PASS_MARGIN 0",
+        );
+        assert_continuous_manifest_contains(
+            "require_value SOCCER_EVAL_MIN_FORWARD_PASS_RATE_MARGIN 0.0",
         );
         assert_eq!(
             continuous_manifest_env_value("SOCCER_GAME_ARTIFACT_MODE"),

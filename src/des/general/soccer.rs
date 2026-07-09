@@ -20534,6 +20534,10 @@ pub(crate) enum SoccerRewardEventKind {
     DefensiveDispossession,
     TwoForwardPasses,
     ThreePassForwardNetGain,
+    /// Positive but bounded: a meaningfully forward pass was selected into a decent completion
+    /// picture. This gives WHO/WHEN a dense launch-side signal before the sparse completion reward
+    /// arrives, but it is not a completed team outcome on its own.
+    ForwardPassAttempt,
     ShotAttempt,
     /// PENALTY (negative): a shot missed the frame by more than the forgiveness margin. This is
     /// separate from [`ShotAttempt`](SoccerRewardEventKind::ShotAttempt) so a poor attempt never
@@ -20648,6 +20652,7 @@ impl SoccerRewardEventKind {
                 | SoccerRewardEventKind::DefensiveDispossession
                 | SoccerRewardEventKind::TwoForwardPasses
                 | SoccerRewardEventKind::ThreePassForwardNetGain
+                | SoccerRewardEventKind::ForwardPassAttempt
                 | SoccerRewardEventKind::ShotAttempt
                 | SoccerRewardEventKind::ShotOffTargetPenalty
                 | SoccerRewardEventKind::ShotOnTarget
