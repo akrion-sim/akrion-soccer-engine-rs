@@ -42447,6 +42447,11 @@ fn learning_context_splits_mdp_pomdp_idea_from_mpc_execution() {
     assert!(
         SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM)
     );
+    // The pre-action-param width (the old FEATURE_DIM) must be a recognized legacy width so
+    // nets trained before the action-param block migrate forward by zero-padding the tail.
+    assert!(
+        SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM)
+    );
 }
 
 #[test]
