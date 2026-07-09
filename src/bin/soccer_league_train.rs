@@ -1043,6 +1043,17 @@ fn main() {
         "SOCCER_NEURAL_TARGET_CLIP",
         runner_config.base.neural_learning.target_clip,
     );
+    // Team-reward share (MAPPO): the individual forward-pass reward is blended with the
+    // team-averaged reward at this weight — the learnable rest-defense / coordination lever.
+    // League training previously left this at the config default; expose it for A/Bs.
+    runner_config.base.neural_learning.mappo_team_reward_share = env_f64(
+        "SOCCER_MAPPO_TEAM_REWARD_SHARE",
+        runner_config.base.neural_learning.mappo_team_reward_share,
+    );
+    eprintln!(
+        "[league] mappo_team_reward_share={}",
+        runner_config.base.neural_learning.mappo_team_reward_share
+    );
     eprintln!(
         "[league] critic-target window: target_scale={} target_clip={} (raw-reward window +/-{}) popart={}",
         runner_config.base.neural_learning.target_scale,
