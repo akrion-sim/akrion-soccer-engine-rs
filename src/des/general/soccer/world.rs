@@ -16081,12 +16081,50 @@ impl SoccerMatch {
                 } else {
                     0.0
                 };
+                // Forward-select selection bias (default OFF; weight 0.0 => byte-identical).
+                // A per-net LEARNED scalar nudges selection toward a genuinely-FORWARD pass
+                // (judged by TARGET GEOMETRY, not the label, so lateral/backward passes are
+                // excluded) when a good forward option is visible. Isolates ACTION SELECTION:
+                // no reward, execution, or pass-target-ranking change.
+                let forward_select_bonus = {
+                    // Genuinely-forward = target this many yards up-pitch along the attack dir.
+                    const MIN_FORWARD_YARDS: f64 = 2.0;
+                    self.policy_head
+                        .as_ref()
+                        .map(|head| head.forward_select_logit_weight)
+                        .filter(|weight| {
+                            *weight != 0.0 && dd_soccer_enable_forward_select_logit()
+                        })
+                        .and_then(|weight| {
+                            if !is_pass_like_action(normalize_soccer_action_label(&candidate_label))
+                            {
+                                return None;
+                            }
+                            let target = candidate_plan.target_point?;
+                            let origin = snapshot
+                                .players
+                                .iter()
+                                .find(|player| player.id == player_id)?
+                                .position;
+                            let forward_yards = (target.y - origin.y) * team.attack_dir();
+                            if forward_yards < MIN_FORWARD_YARDS {
+                                return None;
+                            }
+                            let quality = observation
+                                .best_forward_pass_option_quality
+                                .max(observation.best_forward_pass_receiver_openness)
+                                .clamp(0.0, 1.0);
+                            Some(weight * quality)
+                        })
+                        .unwrap_or(0.0)
+                };
                 let score = value_score
                     + actor_bonus
                     + dp_policy_bonus
                     + retrieved_bonus
                     + model_bonus
-                    + mpc_candidate_bonus;
+                    + mpc_candidate_bonus
+                    + forward_select_bonus;
                 if !score.is_finite() {
                     return;
                 }
