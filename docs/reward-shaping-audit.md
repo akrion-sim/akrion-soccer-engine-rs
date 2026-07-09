@@ -79,9 +79,12 @@ EPV potential routed through `potential_based_shaping`, which would value progre
 farm risk but needs a possession-chain export first.
 
 ## Follow-ups (deferred, each its own gated change)
-1. **Discount alignment.** B-terms (and pitch value) use `γ=1`; the returns use
-   the learner's actual `γ` (`REWARD_SHAPING_DEFAULT_GAMMA = 0.99`). True
-   invariance needs them to match. Low-risk but non-identical → gate + A/B.
+1. **Discount alignment — IMPLEMENTED (default-ON).** Pitch value now routes through
+   `potential_based_shaping(disciplined_gamma(), before, after)`, so the shaping γ matches the
+   learner's actual `γ` (`REWARD_SHAPING_DEFAULT_GAMMA = 0.99`); `disciplined_gamma()`
+   (reward_shaping.rs:91) is promoted to default-ON in production (gate note
+   reward_shaping.rs:82). γ=1.0 only when the shaping-discipline gate is off. Remaining
+   B-terms still migrate one at a time.
 2. **Convert the C-terms** to potential form one at a time behind a gate,
    measuring win-rate / Elo (#7), not raw reward.
 3. **Single shaping budget.** Sum of |shaping| per step currently uncapped; a
