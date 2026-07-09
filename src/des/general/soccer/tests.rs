@@ -38422,6 +38422,7 @@ fn curriculum_focused_phase_trains_only_its_specialist() {
         old_action_probability: None,
         sample_weight: 1.0,
         mcts_distillation: false,
+        forward_select_eligible: false,
     };
     let samples = vec![sample("pass"), sample("dribble"), sample("shoot")];
     let shoot_idx = soccer_policy_action_index("shoot").expect("shoot family");
