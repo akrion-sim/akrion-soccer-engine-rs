@@ -12014,6 +12014,7 @@ impl SoccerMatch {
             neural_blend: SoccerNeuralBlendConfig::default(),
             policy_head: None,
             skill_policy_heads: None,
+            away_skill_policy_heads: None,
             keeper_policy_head: None,
             specialist_curriculum_round: 0,
             world_model: None,
