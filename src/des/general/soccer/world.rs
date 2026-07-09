@@ -25514,6 +25514,16 @@ impl SoccerMatch {
         ) {
             return;
         }
+        // Learned-MPC dribble-objective POSITIVE outcome: a validated beat reinforces the last
+        // dribble aim residual this carrier applied. Emitted AFTER the geometry guard so a rejected
+        // (invalid) contest never credits a residual. The dribble-points reward (2.52..7.0 across
+        // kinds, max = a nutmeg) is NORMALISED into the pass-parity magnitude band [+0.6, +1.0] as
+        // `0.6 + 0.4 * (beat_points / NUTMEG_BEAT_REWARD_POINTS)`: a full-value beat/nutmeg ⇒ ~+1.0,
+        // a plain carry ⇒ ~+0.85, all comfortably above the +0.6 success floor — same 0.6-base +
+        // 0.4-quality shape as `record_pass_outcome_sample`. No-op when the dribble gate is off.
+        let dribble_mpc_reward =
+            0.6 + 0.4 * (kind.beat_reward_points() / NUTMEG_BEAT_REWARD_POINTS).clamp(0.0, 1.0);
+        self.emit_dribble_mpc_objective_sample(attacker_id, dribble_mpc_reward);
         let attacker_lead = carried_ball_lead(&self.players[attacker_id]);
 
         self.ball.holder = Some(attacker_id);
