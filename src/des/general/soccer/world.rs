@@ -9882,6 +9882,7 @@ mod tests {
             old_action_probability: None,
             sample_weight: soccer_actor_priority_weight(&transition, -0.5),
             mcts_distillation: false,
+            forward_select_eligible: false,
         };
 
         assert_eq!(
