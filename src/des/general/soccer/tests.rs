@@ -67132,6 +67132,8 @@ fn on_target_shot_past_keeper_is_a_goal_not_a_phantom_save_on_the_line() {
             team: Team::Home,
             shooter: 9,
             origin: sim.ball.position,
+            intended_target: Vec2::zero(),
+            mpc_objective: None,
         });
 
         // Resolve the shot over a couple of ticks.
