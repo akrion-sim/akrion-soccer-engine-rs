@@ -24007,6 +24007,31 @@ fn quick_release_forward_pass_reward(
 /// Scale for the opportunity-conditioned quick-forward-release carrot (Codex r19). Env
 /// `DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE` (clamped 0..2), default **0.0** ⇒ byte-identical
 /// (the whole term is a no-op unless explicitly enabled). Pre-registered A/B arms: 0.75, 1.0, 1.5.
+/// Codex r24 interface lever: gate for the explicit `forward-release-pass` actor action. Default
+/// OFF ⇒ the action never legalizes and never executes, so behavior is unchanged (the vocab entry
+/// is present but inert). ON ⇒ the actor may choose an explicit "release forward" pass whenever a
+/// real forward option exists, executing to the visible/quick forward receiver.
+pub(crate) fn forward_release_action_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_ENABLE_FORWARD_RELEASE_ACTION")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+/// Shared opportunity gate for the `forward-release-pass` action: a real forward option must exist
+/// in the before-state (mirrors the carrot's opportunity condition, Codex r19/r24).
+fn forward_release_opportunity_present(observation: &SoccerPomdpObservation) -> bool {
+    observation.has_ball
+        && observation.visible_forward_pass_options > 0
+        && observation
+            .best_forward_pass_option_quality
+            .max(observation.quick_forward_pass_value)
+            >= 0.50
+}
+
 pub(crate) fn quick_forward_release_reward_scale() -> f64 {
     use std::sync::OnceLock;
     static V: OnceLock<f64> = OnceLock::new();
