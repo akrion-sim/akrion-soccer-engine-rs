@@ -13913,6 +13913,18 @@ mod tests {
             Some("true")
         );
         assert_eq!(
+            continuous_manifest_env_value("DD_SOCCER_ENABLE_DP_BOOTSTRAP"),
+            Some("true")
+        );
+        assert_eq!(
+            continuous_manifest_env_value("DD_SOCCER_DP_BOOTSTRAP_HORIZON"),
+            Some("64")
+        );
+        assert_eq!(
+            continuous_manifest_env_value("DD_SOCCER_DP_BOOTSTRAP_SWEEPS"),
+            Some("200")
+        );
+        assert_eq!(
             continuous_manifest_env_value("DD_SOCCER_ENABLE_NEURAL_SELF_BOOTSTRAP"),
             Some("true")
         );
@@ -14064,6 +14076,9 @@ mod tests {
         assert_continuous_manifest_contains("require_value DD_SOCCER_DP_BOOTSTRAP_SWEEPS 200");
         assert_continuous_manifest_contains("require_value SOCCER_APPROX_DP_REPLAY_PASSES 8");
         assert_continuous_manifest_contains("require_value DD_SOCCER_ENABLE_MC_CRITIC_TARGET true");
+        assert_continuous_manifest_contains("require_value DD_SOCCER_ENABLE_DP_BOOTSTRAP true");
+        assert_continuous_manifest_contains("require_value DD_SOCCER_DP_BOOTSTRAP_HORIZON 64");
+        assert_continuous_manifest_contains("require_value DD_SOCCER_DP_BOOTSTRAP_SWEEPS 200");
         assert_continuous_manifest_contains(
             "require_value DD_SOCCER_ENABLE_NEURAL_SELF_BOOTSTRAP true",
         );
@@ -14145,7 +14160,7 @@ mod tests {
 
     #[test]
     fn continuous_manifest_batches_postgres_writes_by_parallel_wave() {
-        assert_eq!(continuous_manifest_env_value("SOCCER_GAMES"), Some("100"));
+        assert_eq!(continuous_manifest_env_value("SOCCER_GAMES"), Some("8"));
         assert_eq!(
             continuous_manifest_env_value("SOCCER_PARALLEL_GAMES"),
             Some("1")
@@ -14171,11 +14186,11 @@ mod tests {
         );
         assert_eq!(
             continuous_manifest_env_value("SOCCER_MAX_POLICY_ENTRIES_PER_TEAM"),
-            Some("250000")
+            Some("120000")
         );
         assert_eq!(
             continuous_manifest_env_value("SOCCER_MAX_POLICY_TARGET_ENTRIES_PER_TEAM"),
-            Some("250000")
+            Some("120000")
         );
     }
 
@@ -14183,7 +14198,7 @@ mod tests {
     fn continuous_manifest_uses_restart_safe_source_checkout() {
         assert_eq!(
             continuous_manifest_env_value("SOCCER_SOURCE_REPO"),
-            Some("https://github.com/ORESoftware/soccer-sim-game-engine.rs.git")
+            Some("https://github.com/akrion-sim/akrion-soccer-engine-rs.git")
         );
         assert_eq!(
             continuous_manifest_env_value("SOCCER_SOURCE_REF"),
@@ -14261,7 +14276,7 @@ mod tests {
         assert_continuous_manifest_contains("touch \"${ready_file}\"");
         assert_continuous_manifest_contains("readinessProbe:");
         assert_continuous_manifest_contains(
-            "test -f \"/tmp/codex-soccer-learning-overnight-ready-${HOSTNAME:-pod}\"",
+            "test -f \"/tmp/${SOCCER_RUN_ID_PREFIX:-codex-soccer-learning-continuous}-ready-${HOSTNAME:-pod}\"",
         );
         assert_continuous_manifest_contains("progressDeadlineSeconds: 1200");
         assert_continuous_manifest_contains("revisionHistoryLimit: 2");

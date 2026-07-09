@@ -2427,14 +2427,36 @@ fn stamp_learned_policy_behavior_probability_on_decision(
 /// forward passes make this approximate dynamic programming: delayed rewards from
 /// goals, shots, turnovers, and completed actions can propagate backward through
 /// the abstract Q buckets before the neural critic builds its Bellman targets.
+/// Forward-pass climb profiles default to the full existing sweep budget because
+/// that objective depends on delayed pass/turnover/conversion credit.
+fn soccer_approx_dp_replay_default_passes(
+    forward_pass_climb_curriculum: bool,
+    promotion_forward_pass_primary: bool,
+    eval_require_forward_pass_climb: bool,
+) -> usize {
+    if forward_pass_climb_curriculum
+        || promotion_forward_pass_primary
+        || eval_require_forward_pass_climb
+    {
+        8
+    } else {
+        1
+    }
+}
+
 fn soccer_approx_dp_replay_passes() -> usize {
     use std::sync::OnceLock;
     static V: OnceLock<usize> = OnceLock::new();
     *V.get_or_init(|| {
+        let default_passes = soccer_approx_dp_replay_default_passes(
+            soccer_env_flag_enabled("DD_SOCCER_FORWARD_PASS_CLIMB_CURRICULUM"),
+            soccer_env_flag_enabled("SOCCER_POLICY_PROMOTION_FORWARD_PASS_PRIMARY"),
+            soccer_env_flag_enabled("SOCCER_EVAL_REQUIRE_FORWARD_PASS_CLIMB"),
+        );
         std::env::var("SOCCER_APPROX_DP_REPLAY_PASSES")
             .ok()
             .and_then(|raw| raw.trim().parse::<usize>().ok())
-            .unwrap_or(1)
+            .unwrap_or(default_passes)
             .clamp(1, 8)
     })
 }
@@ -2965,6 +2987,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn away_learning_specialist_training_uses_dedicated_away_sidecar() {
+        let mut config = MatchConfig::default();
+        config.learning_enabled = true;
+        config.neural_learning.enabled = true;
+        config.neural_learning.backend = SoccerNeuralLearningBackend::Inline;
+        config.neural_blend.actor_critic = true;
+        let mut sim = SoccerMatch::default_11v11(config);
+
+        sim.set_team_neural_brain(Team::Home, None, true)
+            .expect("install frozen home brain");
+        sim.set_team_neural_brain(Team::Away, None, false)
+            .expect("install learning away brain");
+
+        assert_eq!(sim.skill_policy_training_team(), Team::Away);
+        sim.ensure_skill_policy_heads_for_training(sim.skill_policy_training_team());
+        assert!(
+            sim.skill_policy_heads.is_none(),
+            "away-learning matches must not train the home/shared skill sidecar"
+        );
+        assert!(
+            sim.away_skill_policy_heads.is_some(),
+            "away-learning matches need a dedicated skill sidecar to export"
+        );
+    }
+
     fn pass_role_risk_test_quality(
         expected_completion: f64,
         lane_interception_risk: f64,
@@ -3064,6 +3112,26 @@ mod tests {
             next_observation: observation,
             done: false,
         }
+    }
+
+    #[test]
+    fn approx_dp_default_replay_passes_arm_climb_profiles() {
+        assert_eq!(
+            soccer_approx_dp_replay_default_passes(false, false, false),
+            1
+        );
+        assert_eq!(
+            soccer_approx_dp_replay_default_passes(true, false, false),
+            8
+        );
+        assert_eq!(
+            soccer_approx_dp_replay_default_passes(false, true, false),
+            8
+        );
+        assert_eq!(
+            soccer_approx_dp_replay_default_passes(false, false, true),
+            8
+        );
     }
 
     #[test]
@@ -18985,6 +19053,38 @@ impl SoccerMatch {
         }
     }
 
+    fn ensure_skill_policy_heads_for_training(&mut self, team: Team) {
+        match team {
+            Team::Home => self.ensure_skill_policy_heads(),
+            Team::Away => {
+                if self.away_skill_policy_heads.is_none() {
+                    self.away_skill_policy_heads = Some(SoccerSkillPolicyHeads::new(
+                        self.config.seed.wrapping_add(0xA11CE),
+                    ));
+                }
+            }
+        }
+    }
+
+    fn skill_policy_heads_for_training_mut(
+        &mut self,
+        team: Team,
+    ) -> Option<&mut SoccerSkillPolicyHeads> {
+        match team {
+            Team::Home => self.skill_policy_heads.as_mut(),
+            Team::Away => self.away_skill_policy_heads.as_mut(),
+        }
+    }
+
+    fn skill_policy_training_team(&self) -> Team {
+        if self.away_neural_learner.is_some() && self.home_neural_frozen && !self.away_neural_frozen
+        {
+            Team::Away
+        } else {
+            Team::Home
+        }
+    }
+
     fn ensure_keeper_policy_head(&mut self) {
         if self.keeper_policy_head.is_none() {
             self.keeper_policy_head = Some(SoccerKeeperPolicyHead::new(self.config.seed));
@@ -19455,9 +19555,10 @@ impl SoccerMatch {
             // by skill with balanced sizes and separate (unclipped) losses. Gated, default off.
             // Under the curriculum, a focused phase trains only the matching specialist.
             if dd_soccer_enable_skill_policy_heads() {
-                self.ensure_skill_policy_heads();
+                let training_team = self.skill_policy_training_team();
+                self.ensure_skill_policy_heads_for_training(training_team);
                 let focus = self.specialist_curriculum_focus();
-                if let Some(skill_heads) = &mut self.skill_policy_heads {
+                if let Some(skill_heads) = self.skill_policy_heads_for_training_mut(training_team) {
                     skill_heads.train_focused(&policy_samples, focus);
                 }
             }
@@ -22240,7 +22341,20 @@ impl SoccerMatch {
             + completed_forward_pass_count_bonus(pass.team, pass.origin, self.ball.position)
             + self.completed_pass_and_move_forward_reward(pass)
             + progressive_pass_escape_reward(pass, self.ball.position)
-            + self.overload_forward_pass_progression_bonus(pass, self.ball.position);
+            + self.overload_forward_pass_progression_bonus(pass, self.ball.position)
+            // Learned-EPV conversion bonus (DD_SOCCER_ENABLE_LEARNED_EPV): reward the completed pass by
+            // the DANGER it created — Φ_epv(reception) − Φ_epv(origin), scaled — scored on the ACTUAL
+            // reception point (`self.ball.position`), not the intended target, so underhit/deflected
+            // completions are not paid for danger they did not create (Codex). 0.0 when the grid/gate
+            // is off ⇒ byte-identical. Direct fix for "forward passes → territory + draws, not conversion".
+            + learned_epv_reward_scale()
+                * learned_epv_pass_delta(
+                    pass.team,
+                    pass.origin,
+                    self.ball.position,
+                    self.config.field_width_yards,
+                    self.config.field_length_yards,
+                );
         // Back-date the completed-pass reward to the PASS DECISION tick (launch), not the reception
         // tick, so the passer's actual decision transition gets credited (gated; off ⇒ current-tick).
         self.record_reward_event_deferred(pass.launch_tick, pass.from, amount);

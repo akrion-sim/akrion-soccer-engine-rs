@@ -23626,6 +23626,22 @@ pub(crate) fn shot_shaping_reward_scale() -> f64 {
     })
 }
 
+/// Scale on the learned-EPV conversion bonus for completed passes (DD_SOCCER_LEARNED_EPV_REWARD_SCALE).
+/// Default 20: the fitted Φ_epv spans ~[-0.15, 0.20], so a strong danger-creating pass (ΔΦ ≈ 0.3) earns
+/// ~6 — comparable to the base forward-pass reward — while a square/backward ball earns ~0 or negative.
+pub(crate) fn learned_epv_reward_scale() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_LEARNED_EPV_REWARD_SCALE")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .unwrap_or(20.0)
+            .clamp(0.0, 200.0)
+    })
+}
+
 fn completed_pass_reward_for_pitch(
     team: Team,
     origin: Vec2,
@@ -23664,6 +23680,9 @@ fn completed_pass_reward_for_pitch(
     };
     // Flank bonus is unscaled (it applies to forward/lateral alike, so scaling it would re-leak the
     // lever into lateral). Forward magnitude is already scaled inside `base`.
+    // NB: the learned-EPV conversion bonus is applied at the call site (record_completed_pass_reward)
+    // on the ACTUAL reception point, not here on the intended target — an underhit/deflected-but-
+    // completed pass must not be paid for danger it did not create (Codex).
     base + completed_flank_pass_reward(team, origin, target, field_width, field_length)
 }
 
