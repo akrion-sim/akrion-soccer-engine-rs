@@ -115,93 +115,32 @@ upstream/learning...HEAD`). My default-on gates need no all-gates-on.sh edit, bu
 there anyway for an unambiguous lineage. (Engine changes that DON'T touch FEATURE_DIM are safe
 to CONTINUE training from the current gen.)
 
-## Remote cluster access (~/.ssh + ~/.aws)
-
-### Hetzner (ssh, 95.217.171.250 cp / 167.233.100.88 bastion)
-
-SSH config from `~/.ssh/config`:
-```
-Host hetzner-cp
-  HostName 95.217.171.250
-  User root
-  IdentityFile ~/.ssh/id_hetzner
-
-Host hetzner-k8s-bastion dd-k8s-fsn1-public
-  HostName 167.233.100.88
-  User root
-  IdentityFile ~/.ssh/id_hetzner
-  ServerAliveInterval 30
-```
-
-Both are sometimes unreachable (firewall / downtime). Try `hetzner-cp` first; if it fails,
-the bastion at `167.233.100.88` may be up. If both time out, the cluster is unreachable from here.
-
-Once connected, k3s kubectl is available immediately:
-```
-kubectl scale deploy dd-soccer-learning-rds-continuous --replicas=1
-kubectl rollout restart deploy/dd-soccer-learning-rds-continuous
-```
+Hetzner (use the ~/.ssh alias): `ssh hetzner-k8s-bastion` runs `kubectl` (k3s; transient
+`TLS handshake timeout` to one API VIP — just retry). `kubectl scale deploy
+dd-soccer-learning-rds-continuous --replicas=1` then `kubectl rollout restart deploy/...`.
 If Pending with `Insufficient memory` (requests, not usage), lower it:
-```
-kubectl set resources deploy/dd-soccer-learning-rds-continuous --requests=memory=8Gi --limits=memory=60Gi
-kubectl scale deploy dd-soccer-learning-all-gates-on --replicas=0
-```
-Confirm code: `kubectl logs <pod> | grep source_commit_actual` (must equal pushed SHA).
+`kubectl set resources deploy/dd-soccer-learning-rds-continuous --requests=memory=8Gi
+--limits=memory=60Gi`, and `kubectl scale deploy dd-soccer-learning-all-gates-on --replicas=0`
+(that one chronically CrashLoopBackOffs and reserves 16Gi). Confirm code: `kubectl logs <pod> |
+grep source_commit_actual` (must equal your pushed SHA).
 
-### AWS EC2 k8s (SSM tunnel via ~/.aws)
-
-The k8s API (https://98.90.186.114:6443, context `dd-ec2-runtime`) is firewalled from the laptop,
-reachable only through an **SSM port-forward**. AWS CLI uses `my-cli-user` (acct 710156900967,
-us-east-1, creds in `~/.aws/credentials`).
-
-1. Install session-manager-plugin (one-time, user-space):
+AWS EC2 k8s — the API (https://98.90.186.114:6443, context `dd-ec2-runtime`) is firewalled
+from the laptop, BUT it IS reachable via an **SSM port-forward** (aws CLI = user `my-cli-user`,
+acct 710156900967, us-east-1; the lone SSM-Online instance is `i-0cc2461a55d491af6`). The only
+missing piece is `session-manager-plugin`; install it USER-SPACE (no sudo):
 ```
-curl -so /tmp/smb.zip https://s3.amazonaws.com/session-manager-downloads/plugin/latest/mac_arm64/sessionmanager-bundle.zip
-unzip -oq /tmp/smb.zip -d /tmp && xattr -dr com.apple.quarantine /tmp/sessionmanager-bundle/bin/session-manager-plugin
-export PATH="/tmp/sessionmanager-bundle/bin:$PATH"
-```
-2. Start the SSM tunnel (runs in background; port 16443 → k8s API 6443):
-```
+ARCH=$(uname -m)  # arm64 on this Mac
+curl -so smb.zip https://s3.amazonaws.com/session-manager-downloads/plugin/latest/mac_arm64/sessionmanager-bundle.zip
+unzip -oq smb.zip && xattr -dr com.apple.quarantine sessionmanager-bundle/bin/session-manager-plugin
+export PATH="$PWD/sessionmanager-bundle/bin:$PATH"
 nohup aws ssm start-session --target i-0cc2461a55d491af6 \
   --document-name AWS-StartPortForwardingSession \
-  --parameters '{"portNumber":["6443"],"localPortNumber":["16443"]}' \
-  > /tmp/ssm_pf.log 2>&1 &
+  --parameters '{"portNumber":["6443"],"localPortNumber":["16443"]}' >/tmp/ssm_pf.log 2>&1 &
+kubectl --context dd-ec2-runtime --server https://localhost:16443 --insecure-skip-tls-verify get deploy -A
 ```
-The tunnel process dies if the bash tool kills its parent session; restart it each time
-you need it. To keep it alive across tool invocations, use `setsid` (not on macOS) or a
-persistent tmux/screen.
-3. Use kubectl with the tunnel:
-```
-kubectl --context dd-ec2-runtime --server https://localhost:16443 --insecure-skip-tls-verify get pods -A
-```
-4. The `dd-soccer-commit-watcher` deployment auto-redeploys the learner and launches
-   push-tournament jobs on new commits. If push tournaments are skipped with
-   `tournament_lock_noncanonical`, the commit-watcher needs
-   `SOCCER_TOURNAMENT_ALLOW_NONCANONICAL_LOCK=true` in its env.extend block (see
-   `launch_tournament()` function in its args).
-
-It is the same `dd-soccer-learning-rds-continuous` learner, same `learning` ref, and same
-RDS experiment; the commit-watcher there auto-redeploys on new pushes. `aws ssm send-command`
+Then it's normal kubectl (same `dd-soccer-learning-rds-continuous` learner, same `learning` ref,
+same RDS experiment; a commit-watcher there auto-redeploys on new pushes). `aws ssm send-command`
 does NOT work (no AWS-RunShellCommand doc on this acct) — use the port-forward, not send-command.
-
-### RDS Postgres (soccer-learning-pg)
-
-Both clusters connect to the same RDS Postgres instance via `SOCCER_DATABASE_URL`
-(from k8s secret `dd-remote-rest-api-secrets.RDS_DATABASE_URL`). TLS is enabled but
-certificate verification is disabled (`SOCCER_PG_TLS_INSECURE=1`).
-
-Direct Postgres access from laptop: use the SSM tunnel (port 5432 → RDS):
-```
-nohup aws ssm start-session --target i-0cc2461a55d491af6 \
-  --document-name AWS-StartPortForwardingSession \
-  --parameters '{"portNumber":["5432"],"localPortNumber":["15432"]}' \
-  > /tmp/ssm_pg.log 2>&1 &
-psql "postgresql://$(kubectl get secret dd-remote-rest-api-secrets -o jsonpath='{.data.RDS_DATABASE_URL}' | base64 -d | sed 's/localhost/localhost:15432/')"
-```
-
-Key RDS tables:
-- `des_soccer_learning_runs` — per-game telemetry (payoff, policy-gen, eval vs analytic)
-- `soccer_policy_generations` — saved policy-net generations (what :5055 reads)
 
 ## Command safety — STRICT (all agents MUST follow)
 

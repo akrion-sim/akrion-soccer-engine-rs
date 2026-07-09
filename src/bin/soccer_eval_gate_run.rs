@@ -398,7 +398,7 @@ fn eval_gate_promotes(
     advancement_reasons: &[String],
 ) -> bool {
     if require_forward_pass_climb {
-        scoreline_promote && advancement_reasons.is_empty()
+        advancement_reasons.is_empty()
     } else {
         scoreline_promote
     }
@@ -678,6 +678,8 @@ fn main() {
     let min_net_forward_pass_margin = env_i32("SOCCER_EVAL_MIN_NET_FORWARD_PASS_MARGIN", 0);
     let min_forward_pass_rate_margin = env_f64("SOCCER_EVAL_MIN_FORWARD_PASS_RATE_MARGIN", 0.0);
     let min_forward_pass_games = env_usize("SOCCER_EVAL_MIN_FORWARD_PASS_GAMES", 8);
+    let require_goal_diff_for_forward_pass =
+        env_bool("SOCCER_EVAL_REQUIRE_GOAL_DIFF_FOR_FORWARD_PASS", false);
     let min_goal_diff_margin = env_i32("SOCCER_EVAL_MIN_GOAL_DIFF_MARGIN", 0);
     let advancement_reasons = if require_forward_pass_climb {
         let mut reasons = forward_pass_gate_reasons(
@@ -690,10 +692,12 @@ fn main() {
             &advancement,
             min_forward_pass_games,
         ));
-        reasons.extend(goal_diff_gate_reasons(
-            verdict.record.goal_difference(),
-            min_goal_diff_margin,
-        ));
+        if require_goal_diff_for_forward_pass {
+            reasons.extend(goal_diff_gate_reasons(
+                verdict.record.goal_difference(),
+                min_goal_diff_margin,
+            ));
+        }
         reasons
     } else {
         Vec::new()
@@ -758,14 +762,18 @@ fn main() {
         advancement.pass_gain_yards_margin(),
     );
     if require_forward_pass_climb {
-        println!("scoreline gate: required with forward-pass climb");
+        println!("scoreline gate: diagnostic only with forward-pass climb");
         println!(
-            "forward-pass gate: margin>{:+} net_margin>{:+} rate_margin>{:+.1}pp min_games={} min_goal_diff>{:+} -> {}",
+            "forward-pass gate: margin>{:+} net_margin>{:+} rate_margin>{:+.1}pp min_games={} goal_diff_floor={} -> {}",
             min_forward_pass_margin,
             min_net_forward_pass_margin,
             min_forward_pass_rate_margin * 100.0,
             min_forward_pass_games,
-            min_goal_diff_margin,
+            if require_goal_diff_for_forward_pass {
+                format!(">{min_goal_diff_margin:+}")
+            } else {
+                "off".to_string()
+            },
             if advancement_promote {
                 "PASS"
             } else {
@@ -775,7 +783,11 @@ fn main() {
     }
     println!("\nDECISION: {}", if promote { "PROMOTE" } else { "REJECT" });
     for reason in &verdict.reasons {
-        println!("  - {reason}");
+        if require_forward_pass_climb {
+            println!("  - scoreline diagnostic: {reason}");
+        } else {
+            println!("  - {reason}");
+        }
     }
     for reason in &advancement_reasons {
         println!("  - {reason}");
@@ -884,16 +896,16 @@ mod tests {
     }
 
     #[test]
-    fn forward_pass_mode_decision_requires_scoreline_and_advancement() {
+    fn forward_pass_mode_decision_uses_advancement_not_scoreline() {
         let advancement_reasons = Vec::new();
 
         assert!(
-            !eval_gate_promotes(true, false, &advancement_reasons),
-            "forward-pass mode must keep scoreline promotion as a hard veto"
+            eval_gate_promotes(true, false, &advancement_reasons),
+            "forward-pass mode should use the dense advancement scoreboard, not scoreline"
         );
         assert!(
             eval_gate_promotes(true, true, &advancement_reasons),
-            "forward-pass mode should pass when scoreline and advancement gates pass"
+            "forward-pass mode should pass when advancement gates pass"
         );
         assert!(
             !eval_gate_promotes(false, false, &advancement_reasons),
@@ -906,13 +918,13 @@ mod tests {
     }
 
     #[test]
-    fn forward_pass_gate_rejects_nonpositive_goal_difference() {
+    fn goal_diff_gate_reasons_can_enforce_optional_floor() {
         let reasons = goal_diff_gate_reasons(0, 0);
         assert!(
             reasons
                 .iter()
                 .any(|reason| reason.contains("goal difference")),
-            "forward-pass climb must not pass with sterile GD: {reasons:?}"
+            "optional goal-difference floor should still be available when explicitly enabled: {reasons:?}"
         );
         assert!(goal_diff_gate_reasons(1, 0).is_empty());
     }
