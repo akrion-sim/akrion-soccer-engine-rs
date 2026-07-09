@@ -249,9 +249,53 @@ fn forward_release_bias() -> f64 {
             .ok()
             .and_then(|raw| raw.trim().parse::<f64>().ok())
             .filter(|v| v.is_finite())
-            .unwrap_or(0.10)
+            // 0.25 (not 0.10): the pass-like margin gate (default 0.55) runs AFTER injection, so a
+            // 0.10 bias is too small to keep a below-best forward pass from being pruned (Codex review).
+            .unwrap_or(0.25)
             .clamp(0.0, SOCCER_CENTERED_POLICY_BONUS_CLIP)
     })
+}
+
+/// Which stage of the forward-release injection funnel to count (diag only).
+#[derive(Clone, Copy)]
+enum ForwardReleaseStage {
+    Eligible,
+    Pushed,
+    SurvivedMarginGate,
+}
+
+/// Gated diagnostic funnel counters (DD_SOCCER_DUMP_FORWARD_RELEASE_DIAG) proving the injection is
+/// not inert (like pass-space was): how often the gate is eligible, the candidate is pushed, and it
+/// survives the pass-like margin gate. Prints the running triple to stderr every 5000 eligible ticks.
+fn forward_release_diag_bump(stage: ForwardReleaseStage) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    static DIAG: OnceLock<bool> = OnceLock::new();
+    if !*DIAG.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_DUMP_FORWARD_RELEASE_DIAG")) {
+        return;
+    }
+    static ELIGIBLE: AtomicU64 = AtomicU64::new(0);
+    static PUSHED: AtomicU64 = AtomicU64::new(0);
+    static SURVIVED: AtomicU64 = AtomicU64::new(0);
+    match stage {
+        ForwardReleaseStage::Eligible => {
+            let e = ELIGIBLE.fetch_add(1, Ordering::Relaxed) + 1;
+            if e % 5000 == 0 {
+                eprintln!(
+                    "forward_release_diag eligible={} pushed={} survived_margin_gate={}",
+                    e,
+                    PUSHED.load(Ordering::Relaxed),
+                    SURVIVED.load(Ordering::Relaxed),
+                );
+            }
+        }
+        ForwardReleaseStage::Pushed => {
+            PUSHED.fetch_add(1, Ordering::Relaxed);
+        }
+        ForwardReleaseStage::SurvivedMarginGate => {
+            SURVIVED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 fn neural_mcts_kick_power_candidate_limit() -> usize {
@@ -16021,12 +16065,14 @@ impl SoccerMatch {
         // critic (with the action-param aim features), and add a bounded bias so it is CONSIDERED — the
         // critic value can still outrank it (no forced argmax). Suppressed in forced-shot/killer-pass
         // contexts unless a threaded goal pass overrides.
+        let mut injected_forward_target: Option<usize> = None;
         if dd_soccer_enable_forward_release_root_candidate()
             && observation.visible_forward_pass_options > 0
             && observation.expected_pass_completion >= forward_release_min_completion()
             && (!goal_attack_shot_is_required(observation, role)
                 || threaded_goal_pass_can_override_forced_shot(observation, role))
         {
+            forward_release_diag_bump(ForwardReleaseStage::Eligible);
             // Best qualified forward receiver + its open value (production inline of the
             // test-only `quick_forward_pass_value_for`: same ranked-visible + forward-support path).
             let forward_targets = snapshot.ranked_visible_pass_targets(player_id, 11);
@@ -16055,18 +16101,19 @@ impl SoccerMatch {
                                 mpc_replan: None,
                             };
                             push_scored_candidate(&synthetic_trace, synthetic_plan);
-                            // The `push_scored_candidate` closure's &mut borrow releases after its last
-                            // use (the push above), so `scored_candidates` can be touched directly now.
-                            // push may drop the candidate via the executability masks, so find it by
-                            // target rather than assume it landed; bias only if present.
-                            if let Some(injected) = scored_candidates
-                                .iter_mut()
-                                .rev()
-                                .find(|c| {
-                                    c.plan.as_ref().and_then(|p| p.target_player) == Some(target_player)
-                                })
-                            {
-                                injected.score += forward_release_bias();
+                            // Bias ONLY the just-injected candidate. push appends at most one and this is
+                            // its last use, so the closure's &mut is released; if the plan landed it is the
+                            // LAST element with our exact (target, "pass1") identity. Checking last() — not
+                            // a rev-scan — avoids biasing an older same-target plan when push rejects it
+                            // (Codex review). The dedup above guarantees no other "pass1" to this target.
+                            if let Some(last) = scored_candidates.last_mut() {
+                                if last.plan.as_ref().map_or(false, |p| {
+                                    p.target_player == Some(target_player) && p.action == "pass1"
+                                }) {
+                                    last.score += forward_release_bias();
+                                    injected_forward_target = Some(target_player);
+                                    forward_release_diag_bump(ForwardReleaseStage::Pushed);
+                                }
                             }
                         }
                     }
@@ -16074,6 +16121,16 @@ impl SoccerMatch {
             }
         }
         Self::apply_neural_mcts_pass_like_margin_gate_for_blend(blend, &mut scored_candidates);
+        if let Some(target_player) = injected_forward_target {
+            // Did the injected forward pass survive the pass-like margin gate (default 0.55)? This is
+            // exactly where a too-small bias silently prunes the treatment into inertness (Codex).
+            if scored_candidates
+                .iter()
+                .any(|c| c.plan.as_ref().and_then(|p| p.target_player) == Some(target_player))
+            {
+                forward_release_diag_bump(ForwardReleaseStage::SurvivedMarginGate);
+            }
+        }
         scored_candidates.sort_by(|a, b| {
             b.score
                 .total_cmp(&a.score)
