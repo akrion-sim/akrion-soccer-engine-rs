@@ -575,6 +575,25 @@ mod tests {
     static PITCH_VALUE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
+    fn threat_potential_off_is_byte_identical_seed() {
+        // Move 1a safety: with the potential gate unset (the default / CI path), the
+        // territorial potential MUST be bit-for-bit the closed-form `expected_threat`
+        // seed — routing the learned-EPV grid in is opt-in and byte-identical off.
+        let _g = PITCH_VALUE_ENV_LOCK.lock().unwrap();
+        assert!(std::env::var("DD_SOCCER_ENABLE_LEARNED_EPV_POTENTIAL").is_err());
+        for &(fx, fy) in &[(0.5, 0.08), (0.3, 0.5), (0.5, 0.85), (0.5, 0.97), (0.02, 0.9)] {
+            let p = Vec2::new(W * fx, L * fy);
+            for team in [Team::Home, Team::Away] {
+                assert_eq!(
+                    threat_potential(team, p, W, L),
+                    expected_threat(team, p, W, L),
+                    "gate-off must equal the seed at ({fx},{fy}) for {team:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn expected_threat_rises_toward_opponent_goal() {
         // Home attacks toward y = L. A central point near the away goal must be
         // worth more than one near the home goal.
