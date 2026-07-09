@@ -141,3 +141,26 @@ kubectl --context dd-ec2-runtime --server https://localhost:16443 --insecure-ski
 Then it's normal kubectl (same `dd-soccer-learning-rds-continuous` learner, same `learning` ref,
 same RDS experiment; a commit-watcher there auto-redeploys on new pushes). `aws ssm send-command`
 does NOT work (no AWS-RunShellCommand doc on this acct) — use the port-forward, not send-command.
+
+## Command safety — STRICT (all agents MUST follow)
+
+Never run destructive or irreversible shell commands. To remove or move files,
+**always go through git** so the change is tracked and recoverable.
+
+**Blacklisted — do NOT run:**
+- `rm`, `rm -rf`, `rmdir`, `unlink` — never delete via raw `rm`.
+- raw `mv` of tracked files; truncating a tracked file with `>`.
+- `git reset --hard`, `git clean -fdx`, `git checkout -- .` / `git restore .` mass-discard.
+- `git push --force` / history rewrites on shared branches (esp. `main`).
+- `git stash` — banned outright (see "NEVER use `git stash`" above); it hides work and races.
+- `dd`, `mkfs`, `shred`, `find … -delete`, recursive `chmod -R`/`chown -R` on broad paths, fork bombs.
+
+**Whitelisted — safe, prefer these:**
+- `git rm` / `git rm --cached` — remove files through git (recoverable via history).
+- `git mv` — rename/move through git.
+- `git restore <path>` (single file), `git revert` — reversible. (NOT `git stash`.)
+- Editing via the editor tools, `git add`, `git commit`.
+  (Do NOT `git switch -c` / create branches — this repo is main-only; see the top of this file.)
+
+If a genuinely destructive action seems unavoidable, **STOP and ask the operator
+first** — do not improvise around this rule.
