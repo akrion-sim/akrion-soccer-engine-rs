@@ -107,9 +107,10 @@ The real cause is **distribution shift** (a classic RL failure):
 Run the trainer in authoritative mode **during training**, so the net **drives its own
 training games**. Now it observes the states *it* creates and the dense per-action rewards
 correct it *in the distribution it actually plays in* (forward passes good, turnovers bad,
-on-policy). The current local launcher uses hidden units 64, `train_every_ticks=1`,
-replay-sample training, MAPPO team reward sharing, and best-only checkpoint publishing so a
-bad candidate cannot overwrite the live local-best weights.
+on-policy). The current local launcher uses hidden units 128
+(`DEFAULT_SOCCER_NEURAL_HIDDEN_UNITS`, soccer.rs:5423; the 64 this doc originally cited has since
+been raised), `train_every_ticks=1`, replay-sample training, MAPPO team reward sharing, and
+best-only checkpoint publishing so a bad candidate cannot overwrite the live local-best weights.
 
 ---
 
