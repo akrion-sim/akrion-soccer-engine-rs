@@ -24755,6 +24755,62 @@ impl SoccerMatch {
                 }
             }
         }
+        // Learned MPC dribble-objective (gated `DD_SOCCER_ENABLE_LEARNED_MPC_DRIBBLE_OBJECTIVE`,
+        // DEFAULT-OFF). Dribble is a SUSTAINED per-tick action, so instead of a discrete `Pending`
+        // launch→resolve we nudge THIS tick's carry `target` by a hard-bounded
+        // (≤`MPC_OBJECTIVE_MAX_RESIDUAL_YARDS`) FULL 2-D aim residual and stash it in the transient
+        // carry-slot; the delayed beat/turnover outcome credits the LAST residual applied before it
+        // (see `dribble_mpc_objective`). Placed AFTER the shield-escape velocity push so the learned
+        // residual only refines the final carry point, not the escape push. FULL 2-D residual (a
+        // dribble target is a free pitch point, unlike a shot which is x-only).
+        //
+        // BYTE-IDENTICAL-OFF: when the gate is off the entire block is skipped BEFORE any head
+        // clone, feature build, or `mpc_objective_exploration_noise()` RNG draw — so `self.rng` is
+        // untouched and `target` is never reassigned, leaving `to_dribble_target` /
+        // `move_player_towards` (and every derived quantity) bit-for-bit unchanged. The RNG draw and
+        // head clone live strictly INSIDE the gate for exactly this reason (a live pass A/B runs on
+        // this code).
+        if dd_soccer_enable_learned_mpc_dribble_objective() {
+            if let Some(head) = self.mpc_objective_head.clone() {
+                let features = snapshot.mpc_objective_learn_features(
+                    player_team,
+                    MpcObjectiveFamily::Dribble,
+                    player_pos,
+                    target,
+                    pressure,
+                );
+                let sigma = mpc_objective_explore_sigma_yards();
+                // Two standard-normal draws consumed UNCONDITIONALLY here (warm + cold both use
+                // them) so the RNG cadence is identical to the pass path's capture block.
+                let (noise_fwd, noise_lat) = self.mpc_objective_exploration_noise();
+                let residual = if head.is_warm() {
+                    head.explore_residual(&features, sigma, noise_fwd, noise_lat)
+                } else {
+                    // Cold start: explore around the ANALYTIC carry target (zero residual) so the
+                    // head accrues training data before it is trusted live — mirrors the pass path.
+                    Some(Vec2 {
+                        x: (noise_lat * sigma).clamp(
+                            -MPC_OBJECTIVE_MAX_RESIDUAL_YARDS,
+                            MPC_OBJECTIVE_MAX_RESIDUAL_YARDS,
+                        ),
+                        y: (noise_fwd * sigma).clamp(
+                            -MPC_OBJECTIVE_MAX_RESIDUAL_YARDS,
+                            MPC_OBJECTIVE_MAX_RESIDUAL_YARDS,
+                        ),
+                    })
+                };
+                if let Some(r) = residual {
+                    target = (target + r).clamp_to_pitch(
+                        self.config.field_width_yards,
+                        self.config.field_length_yards,
+                    );
+                    // OVERWRITE each tick: the last-applied residual before the delayed outcome is
+                    // what the resolve credits. A dribble carry applies NO curl, so `applied_bend`
+                    // is 0.0 (no bend action is taken — the head's bend axis is unused for dribble).
+                    self.dribble_mpc_objective = Some((player_id, features, r, 0.0));
+                }
+            }
+        }
         let to_dribble_target = target - player_pos;
         let dribble_dir = to_dribble_target.normalized();
         let attacking_dribble_kind = matches!(
