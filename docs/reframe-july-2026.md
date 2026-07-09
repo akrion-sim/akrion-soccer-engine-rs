@@ -170,10 +170,20 @@ Wilson-bounded, both snapshots confirmed loaded).
 
 ## Next steps
 
-1. **Per-team authoritative flag** so we can eval neural-authoritative vs pure-analytic head
-   to head and state definitively whether it beats the hand-built engine.
-2. **Keep on-policy training running** and track the authoritative-vs-reference Δ every 20 min
-   — watch whether it keeps climbing past +105 or plateaus (capacity/compute ceiling).
-3. If it plateaus below the analytic engine: **bigger network** (64 → 128 hidden units is the
-   next lever) and/or model-based look-ahead (the engine has a world model + MuZero-style
-   planning) for sample efficiency.
+> **Status update (2026-07-09):** items 1 and 3 are now done; the vs-analytic verdict came back
+> **below parity**, which led to the 2026-07-09 causal-ownership reframe —
+> [`climb-reframe-2026-07-09.md`](climb-reframe-2026-07-09.md).
+
+1. ✅ **Per-team / asymmetric analytic eval** — landed: `SOCCER_EVAL_ANALYTIC_FIELD=1` +
+   `SOCCER_EVAL_CANDIDATE_PATH` score a candidate net vs the pure-analytic field. Verdict: still
+   **below parity** (forward-pass payoff ~0.28–0.44 vs analytic), REJECT — the net does **not**
+   yet beat the hand-built engine.
+2. **Keep on-policy training running** and track the authoritative-vs-reference Δ — done
+   continuously; it plateaus below the analytic engine (the structural plateau).
+3. ✅ **Bigger network** — done: 64 → **128** hidden units (`DEFAULT_SOCCER_NEURAL_HIDDEN_UNITS`,
+   soccer.rs:5423) on this branch, plus a 10-dim action-param feature block and discretized-kick
+   candidates (`feature/action-param-features-and-capacity`). 256 is the next capacity lever.
+4. **→ The binding constraint is now under investigation as a *causal-ownership* question:** does
+   the net's score change the *executed* action at all, or do the downstream analytic/execution
+   layers put the ball back where the heuristics wanted it? Instrument-first plan in
+   [`climb-reframe-2026-07-09.md`](climb-reframe-2026-07-09.md).
