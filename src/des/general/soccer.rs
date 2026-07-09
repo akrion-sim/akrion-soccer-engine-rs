@@ -5494,16 +5494,21 @@ const DEFAULT_SOCCER_POLICY_HIDDEN_UNITS: usize = 24;
 const MIN_SOCCER_POLICY_HIDDEN_UNITS: usize = 8;
 const MAX_SOCCER_POLICY_HIDDEN_UNITS: usize = 512;
 const SOCCER_POLICY_LEARNING_RATE: f64 = 0.05;
-/// Upper clamp for the learned per-net forward action-selection bias weight
-/// ([`SoccerPolicyHead::forward_select_logit_weight`]). Keeps the additive selection bonus in a
-/// sane range so a runaway advantage signal cannot dominate candidate scoring. Lower clamp is 0.0
-/// (the bias only ever nudges TOWARD forward, never away).
+/// Learnable range for the per-net forward action-selection bias WEIGHT
+/// ([`SoccerPolicyHead::forward_select_logit_weight`]): the policy-gradient update clamps the weight
+/// to `[0, MAX]` (the bias only ever nudges TOWARD forward, never away). The *applied* bias is
+/// bounded separately by [`SOCCER_FORWARD_SELECT_BONUS_ABS_MAX`], so a large learned weight can keep
+/// pushing the gradient without letting the bonus swamp candidate scoring.
 const SOCCER_FORWARD_SELECT_LOGIT_WEIGHT_MAX: f64 = 8.0;
+/// Absolute cap on the *applied* forward-select bonus term (`weight * forward_option_quality`). Held
+/// comparable in magnitude to the centered actor bonus (~±0.25, cf. `SOCCER_CENTERED_POLICY_BONUS_CLIP`)
+/// so it NUDGES — rather than dominates — the candidate sort against `value_score` / `actor_bonus`.
+const SOCCER_FORWARD_SELECT_BONUS_ABS_MAX: f64 = 0.25;
 /// Minimum forward progress (yards, along the attacking direction) for a pass TARGET to count as
-/// geometrically FORWARD for the forward-select bias. A small positive deadband so lateral balls
-/// (~0 forward progress) and backward balls do NOT qualify — the whole point of the bias is to
-/// isolate genuinely forward SELECTIONS, not the stuck lateral/backward ones.
-const SOCCER_FORWARD_SELECT_MIN_FORWARD_YARDS: f64 = 1.0;
+/// geometrically FORWARD for the forward-select bias. Matches the engine's existing forward deadband
+/// so lateral jitter (~0 forward progress) and backward balls do NOT qualify — the whole point of the
+/// bias is to isolate genuinely forward SELECTIONS, not the stuck lateral/backward ones.
+const SOCCER_FORWARD_SELECT_MIN_FORWARD_YARDS: f64 = 1.25;
 /// Default entropy bonus — keeps the actor from collapsing onto one family too early.
 /// Override with `SOCCER_POLICY_ENTROPY_COEFF` when local runs show policy entropy
 /// falling into a safe-action plateau.
