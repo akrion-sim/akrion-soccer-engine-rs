@@ -19,13 +19,7 @@ autosaver stashing your working tree makes any merge non-deterministic. Keep cha
 either committed on `main` or live in the working tree — never stashed. To set work aside,
 COMMIT it (a `wip:` commit is fine): durable, visible in history, and rebase/merge-safe.
 Do not add tooling that runs `git stash` (no "autosaver"). If you find a stash, reconstruct
-it into a commit and drop it; do not leave work hidden in the stash list. Past stash misuse
-also leaves ORPHANED stash commits that no longer show in `git stash list` but linger as
-unreachable objects (`git fsck --unreachable | grep commit`, subjects like `WIP on ...`,
-`index on ...`, `On <branch>: ...`). Treat these the same way: before resurrecting one, run
-the semantic-containment check below — most are snapshots of work that already landed. Only
-reconstruct+merge the genuinely-unmerged remainder; drop the rest (let git gc reclaim them),
-do NOT re-merge already-landed work (that creates duplicates).
+it into a commit and drop it; do not leave work hidden in the stash list.
 
 MERGE CONCEPTUALLY — never merely pick a side. When reconciling divergent work (branches,
 worktrees, reconstructed stashes) into `main`, integrate the IDEAS: keep every distinct
@@ -36,17 +30,6 @@ different idea (e.g. two implementations of one feature, or one has a test/doc/i
 other lacks), COMBINE them — take the spec-faithful implementation AND the other's test and
 documentation. A blind "take theirs / take ours" without that superset check is a bug, not a
 merge.
-
-CHECK CONTAINMENT BY CONCEPT, NOT BY TEXT. Before merging any branch/worktree/reconstructed
-stash, verify whether its IDEAS are already in `main` — semantically, not by literal diff or
-symbol name. A textual diff or reverse-apply (`git apply -R --check`) is unreliable here:
-context drift on an old base makes already-present code look "unmerged," and a later RENAME or
-REFACTOR in `main` hides an already-landed feature (e.g. `quick_forward_release_bonus` was
-merged and then evolved into `quick_forward_release_bonus_value` + `_opportunity_reward`; a
-grep for the old names falsely reports it MISSING). So: read the actual added code, find the
-concept in `main` by behavior (constants/gates/env knob/call site/test), and only merge the
-part that is truly absent. If the whole thing is already present in evolved form, merge NOTHING
-and drop the source — re-adding it would duplicate a better implementation.
 
 x is sideline-to-sideline (width) dimension, y is goal-to-goal (length) dimension
 MDP = markov decision process
@@ -141,26 +124,3 @@ kubectl --context dd-ec2-runtime --server https://localhost:16443 --insecure-ski
 Then it's normal kubectl (same `dd-soccer-learning-rds-continuous` learner, same `learning` ref,
 same RDS experiment; a commit-watcher there auto-redeploys on new pushes). `aws ssm send-command`
 does NOT work (no AWS-RunShellCommand doc on this acct) — use the port-forward, not send-command.
-
-## Command safety — STRICT (all agents MUST follow)
-
-Never run destructive or irreversible shell commands. To remove or move files,
-**always go through git** so the change is tracked and recoverable.
-
-**Blacklisted — do NOT run:**
-- `rm`, `rm -rf`, `rmdir`, `unlink` — never delete via raw `rm`.
-- bulk / indirect deletion: `find … -delete`, `find … -exec rm …`, `xargs rm` — no bypasses of the `rm` ban.
-- raw `mv` of tracked files; truncating a tracked file with `>` or `truncate`.
-- `git reset --hard`, `git clean -fdx`, `git checkout -- .` / `git restore .` mass-discard.
-- `git stash drop` / `git stash clear`, `git branch -D`, `git tag -d` — destroy unmerged work / refs; not on shared branches unless the operator explicitly asks.
-- `git push --force` / history rewrites on shared branches (esp. `main`).
-- `dd`, `mkfs`, `shred`, recursive `chmod -R` / `chown -R` on broad paths, fork bombs.
-
-**Whitelisted — safe, prefer these:**
-- `git rm` / `git rm --cached` — remove files through git (recoverable via history).
-- `git mv` — rename/move through git.
-- `git restore <path>` (single file), `git revert`, `git stash` (push) — reversible.
-- Editing via the editor tools, `git add`, `git commit`, `git switch -c`.
-
-If a genuinely destructive action seems unavoidable, **STOP and ask the operator
-first** — do not improvise around this rule.
