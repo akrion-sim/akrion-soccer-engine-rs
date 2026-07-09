@@ -84,7 +84,7 @@ the fitness test. Both feed one promotion gate and one Postgres store.
 flowchart LR
     subgraph INNER["INNER LOOP · gradient (fast, in-match)"]
         TRANS["Transitions<br/>(state, action, reward)"]
-        NEU["Neural learner (threaded)<br/>actor-critic + GAE advantage<br/>PPO clip, multi-epoch<br/>replay 2048 / batch 32 / lr 0.015 / hidden 24"]
+        NEU["Neural learner (threaded)<br/>actor-critic + GAE advantage<br/>PPO clip, multi-epoch<br/>replay 512 / batch 16 / lr 0.015 / hidden 128"]
         AUX["Auxiliary heads<br/>value critic · pass-completion ·<br/>back-four / midfield line-depth · world model"]
         TRANS --> NEU
         TRANS --> AUX
