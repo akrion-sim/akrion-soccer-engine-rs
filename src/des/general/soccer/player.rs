@@ -13581,6 +13581,40 @@ impl PlayerAgent {
                 };
                 Some((SoccerAction::Shoot { power }, learned_label))
             }
+            "forward-release-pass"
+                if forward_release_action_enabled() && observation.has_ball =>
+            {
+                let visible = snapshot.ranked_visible_pass_targets(self.id, 11);
+                // Codex r24/r25: COMMIT forward, to the highest-QUALITY forward receiver. Prefer the
+                // quick-forward teammate; else the FIRST (best-ranked) visible receiver that is
+                // forward. `ranked_visible_pass_targets` is already ordered best-first, so this picks
+                // a high-quality forward option rather than the most-DISTANT one (v1's distance-max
+                // fallback chose far/covered receivers → worse pass-gain, the observed v1 failure).
+                // Never fall back to a lateral/backward target or a generic analytic lead.
+                let attack_dir = self.team.attack_dir();
+                let my_pos = snapshot.player_position(self.id).unwrap_or(self.position);
+                let is_forward = |id: &usize| {
+                    snapshot
+                        .player_position(*id)
+                        .map(|p| (p.y - my_pos.y) * attack_dir > 0.0)
+                        .unwrap_or(false)
+                };
+                let target = observation
+                    .quick_forward_pass_target
+                    .filter(|id| visible.contains(id))
+                    .or_else(|| visible.iter().copied().find(is_forward));
+                target.map(|target| {
+                    (
+                        SoccerAction::Pass {
+                            target_player: Some(target),
+                            target_point: None,
+                            power: 0.54 + 0.30 * ability01(self.skills.passing_completion_rate),
+                            flight: PassFlight::Floor,
+                        },
+                        "forward-release-pass".to_string(),
+                    )
+                })
+            }
             "first-time-pass" if observation.has_ball && observation.first_touch_available => {
                 let visible = snapshot.ranked_visible_pass_targets(self.id, 11);
                 // Prefer the quick forward (5-15 yd, open, advanced) teammate when one is on —
