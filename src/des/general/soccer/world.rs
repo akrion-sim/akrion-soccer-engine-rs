@@ -31100,6 +31100,13 @@ impl SoccerMatch {
                 } else {
                     None
                 };
+                // Learned-MPC shot-placement credit: a TERMINAL block is a placement failure (−1.0).
+                // When `keep_shot_active` the shot stays live (its captured `mpc_objective` rides
+                // along in the cloned `PendingShot`) and will be sampled at its eventual terminal
+                // outcome, so we do NOT emit here — that avoids crediting one shot twice.
+                if !keep_shot_active {
+                    self.record_shot_objective_sample(&shot, ShotObjectiveOutcome::Missed);
+                }
                 self.ball.position = position;
                 self.ball.velocity = velocity;
                 self.ball.holder = None;
