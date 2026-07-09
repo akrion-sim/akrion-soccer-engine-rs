@@ -172,17 +172,30 @@ struct LearnedEpvGrid {
 }
 
 pub(crate) fn dd_soccer_enable_learned_epv() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        matches!(
+    #[cfg(test)]
+    {
+        return matches!(
             std::env::var("DD_SOCCER_ENABLE_LEARNED_EPV")
                 .ok()
                 .as_deref()
                 .map(str::trim),
             Some("1") | Some("true") | Some("yes") | Some("on")
-        )
-    })
+        );
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| {
+            matches!(
+                std::env::var("DD_SOCCER_ENABLE_LEARNED_EPV")
+                    .ok()
+                    .as_deref()
+                    .map(str::trim),
+                Some("1") | Some("true") | Some("yes") | Some("on")
+            )
+        })
+    }
 }
 
 fn learned_epv_grid() -> Option<&'static LearnedEpvGrid> {
@@ -236,6 +249,15 @@ pub(crate) fn learned_epv_pass_delta(
         (Some(t), Some(o)) => t - o,
         _ => 0.0,
     }
+}
+
+/// Outcome-grounded value surface for pitch-control potentials. The learned EPV
+/// grid is the primary surface when enabled and available; the closed-form xT seed
+/// remains the deterministic fallback so old runs stay byte-identical.
+fn pitch_value_surface_value(team: Team, p: Vec2, field_width: f64, field_length: f64) -> f64 {
+    learned_epv(team, p, field_width, field_length)
+        .filter(|v| v.is_finite())
+        .unwrap_or_else(|| expected_threat(team, p, field_width, field_length))
 }
 
 /// Modeled top speed (yd/s) for a snapshot player, floored so the arrival-time
@@ -323,9 +345,11 @@ pub fn pitch_control_home(players: &[PlayerSnapshot], cell: Vec2) -> f64 {
     }
 }
 
-/// Integral of `control(team) × expected_threat(team)` over the grid — a single
-/// scalar for how much **dangerous space the team currently controls**. Averaged
-/// over cells, so it is bounded on the same scale as [`expected_threat`].
+/// Integral of `control(team) × value(team)` over the grid — a single scalar for
+/// how much **dangerous space the team currently controls**. The value surface is
+/// learned EPV when `DD_SOCCER_ENABLE_LEARNED_EPV` has a grid, otherwise the
+/// deterministic closed-form [`expected_threat`] seed. Averaged over cells, so it
+/// is bounded on the same scale as the active value surface.
 pub fn team_expected_threat(snapshot: &WorldSnapshot, team: Team) -> f64 {
     let field_width = snapshot.field_width;
     let field_length = snapshot.field_length;
@@ -350,7 +374,7 @@ pub fn team_expected_threat(snapshot: &WorldSnapshot, team: Team) -> f64 {
                 Team::Home => home_control,
                 Team::Away => 1.0 - home_control,
             };
-            let threat = expected_threat(team, cell, field_width, field_length);
+            let threat = pitch_value_surface_value(team, cell, field_width, field_length);
             total += control * threat;
         }
     }
@@ -404,18 +428,18 @@ fn pitch_control_home_points(points: &[XtControlPoint], cell: Vec2) -> f64 {
     }
 }
 
-/// Control-weighted threat **value** of `team` arriving at `p`: the closed-form
-/// [`expected_threat`] gated by the probability `team` actually controls that
-/// point (the time-to-arrive race). This is the cost-to-go surface the xT
-/// terminal shaping ascends — a player is only pulled toward valuable space it
-/// can realistically grip, not toward unreachable danger zones.
+/// Control-weighted threat **value** of `team` arriving at `p`: the active pitch
+/// value surface gated by the probability `team` actually controls that point
+/// (the time-to-arrive race). This is the cost-to-go surface the terminal shaping
+/// ascends — a player is only pulled toward valuable space it can realistically
+/// grip, not toward unreachable danger zones.
 fn control_weighted_threat(points: &[XtControlPoint], team: Team, p: Vec2, w: f64, l: f64) -> f64 {
     let home_control = pitch_control_home_points(points, p);
     let control = match team {
         Team::Home => home_control,
         Team::Away => 1.0 - home_control,
     };
-    control * expected_threat(team, p, w, l)
+    control * pitch_value_surface_value(team, p, w, l)
 }
 
 /// xT **terminal-cost** shaping of a per-player MPC reference point (the AV
@@ -642,6 +666,57 @@ mod tests {
         assert!(
             high > deep,
             "advancing should raise threat: {deep} -> {high}"
+        );
+    }
+
+    #[test]
+    fn learned_epv_replaces_xt_seed_inside_team_potential_when_enabled() {
+        let _lock = PITCH_VALUE_ENV_LOCK.lock().expect("pitch value env lock");
+        let make = |home_y: f64| {
+            snapshot_with(
+                vec![
+                    player_at(0, Team::Home, Vec2::new(W * 0.5, home_y), Vec2::zero()),
+                    player_at(1, Team::Away, Vec2::new(W * 0.5, L * 0.5), Vec2::zero()),
+                ],
+                Vec2::new(W * 0.5, home_y),
+            )
+        };
+        let deep = make(L * 0.30);
+        let high = make(L * 0.85);
+
+        std::env::remove_var("DD_SOCCER_ENABLE_LEARNED_EPV");
+        std::env::remove_var("DD_SOCCER_LEARNED_EPV_GRID_PATH");
+        let seed_deep = team_expected_threat(&deep, Team::Home);
+        let seed_high = team_expected_threat(&high, Team::Home);
+        assert!(
+            seed_high > seed_deep,
+            "closed-form xT seed should value advanced control: {seed_deep} -> {seed_high}"
+        );
+
+        let grid: Vec<Vec<f64>> = (0..PITCH_VALUE_GRID_ROWS)
+            .map(|r| vec![(PITCH_VALUE_GRID_ROWS - r) as f64; PITCH_VALUE_GRID_COLS])
+            .collect();
+        let raw = serde_json::json!({
+            "rows": PITCH_VALUE_GRID_ROWS,
+            "cols": PITCH_VALUE_GRID_COLS,
+            "grid": grid
+        });
+        let grid_path = std::env::temp_dir().join(format!(
+            "akrion-test-learned-epv-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&grid_path, raw.to_string()).expect("write test EPV grid");
+
+        std::env::set_var("DD_SOCCER_ENABLE_LEARNED_EPV", "1");
+        std::env::set_var("DD_SOCCER_LEARNED_EPV_GRID_PATH", &grid_path);
+        let learned_deep = team_expected_threat(&deep, Team::Home);
+        let learned_high = team_expected_threat(&high, Team::Home);
+        std::env::remove_var("DD_SOCCER_ENABLE_LEARNED_EPV");
+        std::env::remove_var("DD_SOCCER_LEARNED_EPV_GRID_PATH");
+
+        assert!(
+            learned_deep > learned_high,
+            "learned EPV grid must drive the potential when enabled: {learned_deep} vs {learned_high}"
         );
     }
 

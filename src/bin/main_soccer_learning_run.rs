@@ -14095,6 +14095,10 @@ mod tests {
             Some("true")
         );
         assert_eq!(
+            continuous_manifest_env_value("SOCCER_LEAGUE_ANALYTIC_OPPONENTS"),
+            Some("true")
+        );
+        assert_eq!(
             continuous_manifest_env_value("SOCCER_ANCHOR_PROMOTION_GATE_ENABLED"),
             Some("true")
         );
@@ -14195,6 +14199,7 @@ mod tests {
             "require_value SOCCER_NEURAL_POPULATION_MIN_FORWARD_PASS_RATE_MARGIN 0.0",
         );
         assert_continuous_manifest_contains("require_value SOCCER_LEARNING_ANALYTIC_OPPONENT true");
+        assert_continuous_manifest_contains("require_value SOCCER_LEAGUE_ANALYTIC_OPPONENTS true");
         assert_continuous_manifest_contains(
             "require_value SOCCER_ANCHOR_PROMOTION_GATE_ENABLED true",
         );

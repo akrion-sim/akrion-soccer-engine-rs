@@ -141,6 +141,7 @@ spec:
               require_value SOCCER_NEURAL_POPULATION_MIN_NET_FORWARD_PASS_MARGIN 0
               require_value SOCCER_NEURAL_POPULATION_MIN_FORWARD_PASS_RATE_MARGIN 0.0
               require_value SOCCER_LEARNING_ANALYTIC_OPPONENT true
+              require_value SOCCER_LEAGUE_ANALYTIC_OPPONENTS true
               require_value SOCCER_ANCHOR_PROMOTION_GATE_ENABLED true
 
               echo "continuous_started_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -197,6 +198,7 @@ spec:
               echo "population_net_forward_pass_margin=${SOCCER_NEURAL_POPULATION_MIN_NET_FORWARD_PASS_MARGIN}"
               echo "population_forward_pass_rate_margin=${SOCCER_NEURAL_POPULATION_MIN_FORWARD_PASS_RATE_MARGIN}"
               echo "learning_analytic_opponent=${SOCCER_LEARNING_ANALYTIC_OPPONENT}"
+              echo "league_analytic_opponents=${SOCCER_LEAGUE_ANALYTIC_OPPONENTS}"
               echo "anchor_promotion_gate=${SOCCER_ANCHOR_PROMOTION_GATE_ENABLED}"
               echo "source_ref=${source_ref}"
               echo "engine_ref=${engine_ref}"
@@ -525,6 +527,8 @@ spec:
             - name: SOCCER_NEURAL_POPULATION_MIN_FORWARD_PASS_RATE_MARGIN
               value: "0.0"
             - name: SOCCER_LEARNING_ANALYTIC_OPPONENT
+              value: "true"
+            - name: SOCCER_LEAGUE_ANALYTIC_OPPONENTS
               value: "true"
             - name: SOCCER_ANCHOR_PROMOTION_GATE_ENABLED
               value: "true"
