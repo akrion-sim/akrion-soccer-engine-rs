@@ -1286,20 +1286,6 @@ pub struct SoccerMatch {
     /// When warm + gated on, it nudges the analytic aim/lead target by a hard-bounded residual so
     /// pass/shot/dribble QUALITY becomes learnable; `None` ⇒ pure analytic target (parity).
     pub(crate) mpc_objective_head: Option<std::sync::Arc<SoccerMpcObjectiveHead>>,
-    /// Transient carry-slot for the learned MPC DRIBBLE aim-residual (gated, default-OFF via
-    /// [`dd_soccer_enable_learned_mpc_dribble_objective`]). Dribble is a SUSTAINED per-tick action
-    /// whose reward (beat man / turnover) is DELAYED, so — unlike the discrete pass/shot
-    /// `Pending{Pass,Shot}` launch→resolve that carries `(features, residual, bend)` to a single
-    /// resolve — there is no `Pending` to hang the sample on. Instead `apply_dribble_intent`
-    /// OVERWRITES this each tick with `(holder player_id, launch features, applied 2-D residual,
-    /// applied bend)`; the LAST value before the outcome is what the beat/dispossession resolve
-    /// credits (a deliberate approximation of the delayed-credit model — its risk is that a residual
-    /// applied several ticks before the outcome, or one held through a non-dribble tick, is credited
-    /// as if it caused the outcome). Cleared on any change of holder (`mark_ball_received`) so a
-    /// stale residual is never credited to a different carrier, and CONSUMED (taken) when a sample is
-    /// emitted. `None` ⇒ nothing pending; when the gate is off it is never written, so the two resolve
-    /// hooks are no-ops and behaviour is byte-identical.
-    pub(crate) dribble_mpc_objective: Option<(usize, Vec<f32>, Vec2, f64)>,
     /// The trained back-four line-depth head, when present. Set by the learner
     /// (carried + trained across games) so the line decision consumes it live; `None`
     /// ⇒ analytic seed. Shared into each [`WorldSnapshot`] via an `Arc` clone.
@@ -1990,37 +1976,6 @@ fn soccer_policy_mixed_behavior_probability(
     let exploration_probability = finite_unit_interval(exploration_probability);
     let fallback_probability = finite_unit_interval(fallback_probability);
     (epsilon * exploration_probability + (1.0 - epsilon) * fallback_probability).clamp(0.0, 1.0)
-}
-
-/// Forward progress (yards, in the attacking direction) of a learned plan's resolved target
-/// relative to the carrier — the SCORE-TIME analogue of `SoccerDecisionContext::target_forward_yards`,
-/// computed straight from `candidate_plan.target_point` (falling back to the target teammate's
-/// position, as the engine resolves pass targets elsewhere). `None` when the plan carries no target
-/// or the carrier position is unknown. Forwardness is `(target.y - carrier.y) * attack_dir`, the
-/// canonical pass-progress measure used across the engine.
-fn soccer_plan_target_forward_yards(
-    plan: &SoccerLearnedPlan,
-    snapshot: &WorldSnapshot,
-    player_id: usize,
-    team: Team,
-) -> Option<f64> {
-    let target = plan
-        .target_point
-        .or_else(|| plan.target_player.and_then(|id| snapshot.player_position(id)))?;
-    let carrier = snapshot.player_position(player_id)?;
-    Some((target.y - carrier.y) * team.attack_dir())
-}
-
-/// Whether a REPLAYED transition was a FORWARD pass by GEOMETRY (not by its action label): a
-/// pass-like action whose recorded `SoccerDecisionContext::target_forward_yards` clears the forward
-/// deadband. This is the TRAINING-TIME eligibility for the learned forward-select scalar. It
-/// deliberately does NOT trust the `"pass"` / `"pass-kpN"` label alone — those also cover
-/// lateral/backward balls (switch-play, recycle/reset) — and reads the same
-/// `(target.y - carrier.y) * attack_dir` measure that `soccer_plan_target_forward_yards` computes at
-/// score time, so both sites share ONE definition of "forward".
-fn soccer_transition_forward_pass_selection_eligible(transition: &SoccerLearningTransition) -> bool {
-    pass_like_action_flight(&transition.action).is_some()
-        && transition.decision_context.target_forward_yards > SOCCER_FORWARD_SELECT_MIN_FORWARD_YARDS
 }
 
 fn soccer_policy_rank_probability_for_label(
@@ -9903,7 +9858,6 @@ mod tests {
             old_action_probability: None,
             sample_weight: soccer_actor_priority_weight(&transition, -0.5),
             mcts_distillation: false,
-            forward_select_eligible: false,
         };
 
         assert_eq!(
@@ -10093,7 +10047,6 @@ mod tests {
             old_action_probability: None,
             sample_weight,
             mcts_distillation: sample_weight >= NEURAL_MCTS_DISTILLATION_PRIORITY_WEIGHT - 1e-9,
-            forward_select_eligible: false,
         };
         let mut samples = vec![
             sample(0.01, NEURAL_MCTS_DISTILLATION_PRIORITY_WEIGHT),
@@ -11623,7 +11576,6 @@ impl SoccerMatch {
             pass_completion_head: None,
             mpc_objective_samples: Vec::new(),
             mpc_objective_head: None,
-            dribble_mpc_objective: None,
             line_depth_head: None,
             line_depth_samples: Vec::new(),
             pending_line_depth: Vec::new(),
@@ -12226,17 +12178,6 @@ impl SoccerMatch {
         let learner = match snapshot {
             Some(snapshot) => {
                 let network = build_soccer_neural_network_from_snapshot(&snapshot)?;
-                // Symmetric with `set_neural_network_snapshot`: also restore the actor policy-head
-                // sidecar (including the learned `forward_select_logit_weight`) so eval paths that
-                // install nets via THIS setter (tournaments / other eval) aren't left with an
-                // inert/absent actor. Only overwrites when the snapshot actually carries a policy
-                // head — it never clears a previously-installed one.
-                if let Some(policy_head_snapshot) = snapshot.policy_head.as_deref() {
-                    self.policy_head = Some(soccer_policy_head_from_snapshot(
-                        policy_head_snapshot,
-                        self.config.seed,
-                    )?);
-                }
                 SoccerNeuralLearner::from_pretrained_snapshot(&self.config, network, &snapshot)
             }
             None if self.config.learning_enabled => SoccerNeuralLearner::new(&self.config),
@@ -14176,6 +14117,32 @@ impl SoccerMatch {
                     neural_mcts_dribble_candidate_count,
                     neural_mcts_root_dribble_candidate_count,
                 } = choice;
+                if net_influence_diag_enabled() {
+                    // Net-influence (Codex-corrected baseline): the counterfactual is the ACTUAL
+                    // tabular-only decision path (rank-weighted + replan-safe filter, blend off),
+                    // not raw argmax. `label` is what the net/sidecar/exploration chain selected;
+                    // if it differs from the tabular choice, the neural stack flipped the decision
+                    // the engine would otherwise have committed. `neural_mcts_selected` marks the
+                    // subset where the neural MCTS actually owned the pick.
+                    if let Some(tabular) = self.weighted_policy_action_for_player(
+                        policy,
+                        snapshot,
+                        player_id,
+                        mdp_state,
+                        observation,
+                        retrieval_prior,
+                        SOCCER_POLICY_RANK_SALT_TEAM_TABULAR,
+                    ) {
+                        record_net_influence_diag(
+                            normalize_soccer_action_label(&tabular.label),
+                            normalize_soccer_action_label(&label),
+                            &tabular.label,
+                            &label,
+                            observation.has_ball,
+                            neural_mcts_selected,
+                        );
+                    }
+                }
                 let plan = plan.unwrap_or_else(|| {
                     Self::learned_plan_for_policy(policy, snapshot, player_id, label.clone())
                 });
@@ -16048,23 +16015,6 @@ impl SoccerMatch {
         let pass_target_candidate_limit = neural_mcts_pass_target_candidate_limit();
         let mut scored_candidates =
             Vec::with_capacity(legal.len() + legal.len() * pass_target_candidate_limit);
-        // Learned per-net FORWARD action-selection bias. Precomputed once (state-constant across
-        // candidates): the weight is 0.0 unless the gate is on AND a policy head exists, and the
-        // feature is the visible forward-option quality. Captured as plain f64 copies so the
-        // closure does not additionally borrow `self.policy_head`. When the weight is 0.0 the
-        // per-candidate bonus below is 0 ⇒ the scored-candidate path is byte-identical.
-        let forward_select_weight = if dd_soccer_enable_forward_select_logit() {
-            self.policy_head
-                .as_ref()
-                .map(|head| head.forward_select_logit_weight)
-                .unwrap_or(0.0)
-        } else {
-            0.0
-        };
-        let forward_select_feature = observation
-            .best_forward_pass_option_quality
-            .max(observation.best_forward_pass_receiver_openness)
-            .clamp(0.0, 1.0);
         let mut push_scored_candidate =
             |candidate: &SoccerLearnedActionTrace, candidate_plan: SoccerLearnedPlan| {
                 if !Self::neural_mcts_candidate_plan_is_executable(
@@ -16163,29 +16113,6 @@ impl SoccerMatch {
                     + retrieved_bonus
                     + model_bonus
                     + mpc_candidate_bonus;
-                // Learned FORWARD action-selection bias. Eligibility: the bias is armed
-                // (`forward_select_weight != 0.0`, which folds in gate-off / no-policy-head), the
-                // candidate is pass-like (`pass_like_action_flight`), AND the candidate PLAN's target
-                // is geometrically FORWARD (`candidate_plan.target_point` vs the carrier, past the
-                // forward-yards deadband) — NOT gated on the label, since lateral/backward passes
-                // share the "pass"/"pass-kpN" label. The applied bonus is
-                // `weight * forward_option_quality` CLAMPED to ±SOCCER_FORWARD_SELECT_BONUS_ABS_MAX so
-                // a large learned weight nudges — rather than swamps — the sort. Added conditionally
-                // (never an always-added 0.0 term) so the gate-off / non-eligible path leaves `score`
-                // bit-for-bit unchanged — the sort below uses `total_cmp`, which separates -0.0/+0.0.
-                let forward_select_eligible = forward_select_weight != 0.0
-                    && pass_like_action_flight(&candidate_plan.action).is_some()
-                    && soccer_plan_target_forward_yards(&candidate_plan, snapshot, player_id, team)
-                        .is_some_and(|yards| yards > SOCCER_FORWARD_SELECT_MIN_FORWARD_YARDS);
-                let score = if forward_select_eligible {
-                    let bonus = (forward_select_weight * forward_select_feature).clamp(
-                        -SOCCER_FORWARD_SELECT_BONUS_ABS_MAX,
-                        SOCCER_FORWARD_SELECT_BONUS_ABS_MAX,
-                    );
-                    score + bonus
-                } else {
-                    score
-                };
                 if !score.is_finite() {
                     return;
                 }
@@ -16225,25 +16152,72 @@ impl SoccerMatch {
                 .then_with(|| a.label.cmp(&b.label))
         });
         let rank_draw = self.policy_rank_selection_draw(snapshot, player_id, rank_salt);
-        if let Some(mcts_label) =
+        // Resolve the winner once (behavior-preserving refactor of the previous early-return
+        // chain: mcts -> {authoritative: dp-safe -> technical-floor -> top} | weighted) so the
+        // net-influence diagnostic can compare it against the tabular baseline before returning.
+        let choice = if let Some(mcts_label) =
             Self::neural_mcts_action_from_candidates(blend, &scored_candidates, rank_draw)
         {
-            return Some(mcts_label);
-        }
-        if blend.mode == SoccerNeuralBlendMode::Authoritative {
-            if let Some(dp_safe_choice) =
-                Self::neural_authoritative_dp_safety_choice(&scored_candidates, &legal)
-            {
-                return Some(dp_safe_choice);
-            }
-            if let Some(technical_choice) =
-                Self::technical_scored_candidate_floor_choice(&scored_candidates, rank_draw)
-            {
-                return Some(technical_choice);
-            }
-            return Self::top_scored_candidate_choice(&scored_candidates);
-        }
-        Self::weighted_scored_candidate_choice(&scored_candidates, rank_draw)
+            Some(mcts_label)
+        } else if blend.mode == SoccerNeuralBlendMode::Authoritative {
+            Self::neural_authoritative_dp_safety_choice(&scored_candidates, &legal)
+                .or_else(|| {
+                    Self::technical_scored_candidate_floor_choice(&scored_candidates, rank_draw)
+                })
+                .or_else(|| Self::top_scored_candidate_choice(&scored_candidates))
+        } else {
+            Self::weighted_scored_candidate_choice(&scored_candidates, rank_draw)
+        };
+        // Net-influence is measured at the decision assembler (learned_action_for_player_with_context)
+        // against the real tabular-only counterfactual, per Codex; see record_net_influence_diag there.
+        choice
+    }
+
+    /// The action label the ACTUAL blend-off tabular path would commit for `player_id` — the
+    /// net-influence counterfactual. Mirrors the decision assembler's tabular fallback (same
+    /// policy, retrieval prior, TABULAR salt), so "committed action != this" means the neural
+    /// stack (net/sidecar/exploration + downstream discipline) changed the decision the engine
+    /// would otherwise have made. Pure/read-only; only called when the diag env is set.
+    fn net_influence_tabular_baseline_label(
+        &self,
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        mdp_state: &SoccerMdpState,
+        observation: &SoccerPomdpObservation,
+    ) -> Option<String> {
+        let player = snapshot
+            .players
+            .iter()
+            .find(|candidate| candidate.id == player_id)?;
+        let retrieval_prior = if self.config.retrieval.decision_prior_enabled {
+            self.retrieval_action_prior
+                .get(&player.team)
+                .filter(|map| !map.is_empty())
+                .map(|map| (map, self.config.retrieval.prior_weight))
+        } else {
+            None
+        };
+        let (policy, salt) = if let Some(team_policies) = &self.team_policies {
+            (
+                team_policies.policy(player.team),
+                SOCCER_POLICY_RANK_SALT_TEAM_TABULAR,
+            )
+        } else {
+            (
+                self.learned_policy.as_ref()?,
+                SOCCER_POLICY_RANK_SALT_SHARED_TABULAR,
+            )
+        };
+        self.weighted_policy_action_for_player(
+            policy,
+            snapshot,
+            player_id,
+            mdp_state,
+            observation,
+            retrieval_prior,
+            salt,
+        )
+        .map(|choice| choice.label)
     }
 
     /// Per-team value-head forward-intent for this tick: for each outfield player,
@@ -18593,11 +18567,6 @@ impl SoccerMatch {
                 if diag_on {
                     diag_meta.push((transition.team, action_index, advantage));
                 }
-                // Eligibility for the per-net forward-select scalar's gradient: the taken action
-                // was a forward pass into a good forward option (same geometry as the score-time
-                // bias). In-memory only; irrelevant unless the forward-select gate is on.
-                let forward_select_eligible =
-                    soccer_transition_forward_pass_selection_eligible(transition);
                 let sample = SoccerPolicySample {
                     state_features,
                     action_index,
@@ -18605,7 +18574,6 @@ impl SoccerMatch {
                     old_action_probability,
                     sample_weight,
                     mcts_distillation,
-                    forward_select_eligible,
                 };
                 if option_score_safety_counterexample {
                     option_score_safety_counterexample_samples += 1;
@@ -20521,6 +20489,21 @@ impl SoccerMatch {
                     } else {
                         None
                     };
+                    // Net-influence commit-level baseline (Codex): the tabular-only choice for this
+                    // FRESH decision, captured before run_time_step_with_context consumes mdp_state/
+                    // observation. Compared post-discipline against the actually-committed action.
+                    // This block is only reached on fresh-decision ticks (the decision-cadence replay
+                    // path never runs the planning pass), so it excludes the outer replay per Codex.
+                    let net_influence_baseline = if net_influence_diag_enabled() {
+                        self.net_influence_tabular_baseline_label(
+                            &snapshot,
+                            scheduled.id,
+                            &mdp_state,
+                            &observation,
+                        )
+                    } else {
+                        None
+                    };
                     let intent = self.players[actor].run_time_step_with_context(
                         &snapshot,
                         mdp_state,
@@ -20547,6 +20530,22 @@ impl SoccerMatch {
                     }
                     let intent = self.players[actor]
                         .apply_post_decision_movement_discipline(&snapshot, self, intent);
+                    if let Some(baseline) = net_influence_baseline.as_ref() {
+                        // Headline = semantic committed action (last_decision.action, post-refractory)
+                        // vs tabular baseline; concrete = post-discipline intent family (collapses
+                        // off-ball to "move", so a secondary diagnostic per Codex).
+                        let semantic = self.players[actor]
+                            .last_decision
+                            .as_ref()
+                            .map(|decision| decision.action.as_str())
+                            .unwrap_or("");
+                        let on_ball = self.ball.holder == Some(scheduled.id);
+                        record_net_influence_commit_diag(
+                            normalize_soccer_action_label(baseline),
+                            normalize_soccer_action_label(semantic),
+                            on_ball,
+                        );
+                    }
                     let player_decision_elapsed = phase_started.elapsed();
                     field_player_decision_elapsed += player_decision_elapsed;
                     match decision_context {
@@ -21417,17 +21416,6 @@ impl SoccerMatch {
         // Possession changed hands: reseed the carried-ball orbit from the new
         // carrier's geometry next tick (no winding carried over from the loser).
         self.ball.reset_carry_orbit();
-        // Drop a pending learned-MPC dribble aim-residual that belonged to a DIFFERENT carrier so a
-        // stale residual is never credited to whoever just received the ball. Only fires on an actual
-        // change of holder (a same-player re-collection keeps it; `apply_dribble_intent` overwrites it
-        // next tick anyway). This is the general possession-change clear; the dispossession resolve
-        // itself consumes the slot BEFORE this runs (it emits + takes the slot at the top of
-        // `complete_defensive_dispossession`, well before that fn calls `mark_ball_received`), so this
-        // never races the resolve read. No-op when the dribble gate is off (the slot is never
-        // written) or already `None`.
-        if matches!(&self.dribble_mpc_objective, Some((holder, ..)) if *holder != holder_id) {
-            self.dribble_mpc_objective = None;
-        }
     }
 
     fn record_reward_event(&mut self, player_id: usize, amount: f64) {
@@ -24723,7 +24711,7 @@ impl SoccerMatch {
         }
     }
 
-    pub(crate) fn apply_dribble_intent(
+    fn apply_dribble_intent(
         &mut self,
         player_id: usize,
         target: Vec2,
@@ -24752,7 +24740,7 @@ impl SoccerMatch {
             .or_else(|| {
                 snapshot.dribble_away_from_pressure_target_for(player_id, requested_target, kind)
             });
-        let mut target = stationary_escape_target.unwrap_or(requested_target);
+        let target = stationary_escape_target.unwrap_or(requested_target);
         let pressured_shield_escape = stationary_escape_target.is_some()
             && matches!(kind, Some(DribbleMoveKind::ProtectBall))
             && target.distance(requested_target) > 0.10;
@@ -24763,62 +24751,6 @@ impl SoccerMatch {
                 if velocity_along_escape < STATIONARY_HOLDER_ESCAPE_INITIAL_PUSH_YPS {
                     self.players[player_id].velocity += escape
                         * (STATIONARY_HOLDER_ESCAPE_INITIAL_PUSH_YPS - velocity_along_escape);
-                }
-            }
-        }
-        // Learned MPC dribble-objective (gated `DD_SOCCER_ENABLE_LEARNED_MPC_DRIBBLE_OBJECTIVE`,
-        // DEFAULT-OFF). Dribble is a SUSTAINED per-tick action, so instead of a discrete `Pending`
-        // launch→resolve we nudge THIS tick's carry `target` by a hard-bounded
-        // (≤`MPC_OBJECTIVE_MAX_RESIDUAL_YARDS`) FULL 2-D aim residual and stash it in the transient
-        // carry-slot; the delayed beat/turnover outcome credits the LAST residual applied before it
-        // (see `dribble_mpc_objective`). Placed AFTER the shield-escape velocity push so the learned
-        // residual only refines the final carry point, not the escape push. FULL 2-D residual (a
-        // dribble target is a free pitch point, unlike a shot which is x-only).
-        //
-        // BYTE-IDENTICAL-OFF: when the gate is off the entire block is skipped BEFORE any head
-        // clone, feature build, or `mpc_objective_exploration_noise()` RNG draw — so `self.rng` is
-        // untouched and `target` is never reassigned, leaving `to_dribble_target` /
-        // `move_player_towards` (and every derived quantity) bit-for-bit unchanged. The RNG draw and
-        // head clone live strictly INSIDE the gate for exactly this reason (a live pass A/B runs on
-        // this code).
-        if dd_soccer_enable_learned_mpc_dribble_objective() {
-            if let Some(head) = self.mpc_objective_head.clone() {
-                let features = snapshot.mpc_objective_learn_features(
-                    player_team,
-                    MpcObjectiveFamily::Dribble,
-                    player_pos,
-                    target,
-                    pressure,
-                );
-                let sigma = mpc_objective_explore_sigma_yards();
-                // Two standard-normal draws consumed UNCONDITIONALLY here (warm + cold both use
-                // them) so the RNG cadence is identical to the pass path's capture block.
-                let (noise_fwd, noise_lat) = self.mpc_objective_exploration_noise();
-                let residual = if head.is_warm() {
-                    head.explore_residual(&features, sigma, noise_fwd, noise_lat)
-                } else {
-                    // Cold start: explore around the ANALYTIC carry target (zero residual) so the
-                    // head accrues training data before it is trusted live — mirrors the pass path.
-                    Some(Vec2 {
-                        x: (noise_lat * sigma).clamp(
-                            -MPC_OBJECTIVE_MAX_RESIDUAL_YARDS,
-                            MPC_OBJECTIVE_MAX_RESIDUAL_YARDS,
-                        ),
-                        y: (noise_fwd * sigma).clamp(
-                            -MPC_OBJECTIVE_MAX_RESIDUAL_YARDS,
-                            MPC_OBJECTIVE_MAX_RESIDUAL_YARDS,
-                        ),
-                    })
-                };
-                if let Some(r) = residual {
-                    target = (target + r).clamp_to_pitch(
-                        self.config.field_width_yards,
-                        self.config.field_length_yards,
-                    );
-                    // OVERWRITE each tick: the last-applied residual before the delayed outcome is
-                    // what the resolve credits. A dribble carry applies NO curl, so `applied_bend`
-                    // is 0.0 (no bend action is taken — the head's bend axis is unused for dribble).
-                    self.dribble_mpc_objective = Some((player_id, features, r, 0.0));
                 }
             }
         }
@@ -25330,12 +25262,6 @@ impl SoccerMatch {
         if self.keeper_handling_holder() == Some(attacker_id) {
             return;
         }
-        // Learned-MPC dribble-objective NEGATIVE outcome: the carrier just lost the ball, so credit
-        // the last dribble aim residual it applied with the pass-parity failure reward (−1.0). Done
-        // HERE, at the top (holder is still `attacker_id`; the swap happens below), so the slot is
-        // consumed BEFORE this fn's later `mark_ball_received(defender_id)` possession-change clear
-        // could touch it. No-op when the dribble gate is off or the slot is not this carrier's.
-        self.emit_dribble_mpc_objective_sample(attacker_id, -1.0);
         let defender_team = self.players[defender_id].team;
         let defender_name = self.players[defender_id].name.clone();
         let attacker_name = self.players[attacker_id].name.clone();
@@ -25514,16 +25440,6 @@ impl SoccerMatch {
         ) {
             return;
         }
-        // Learned-MPC dribble-objective POSITIVE outcome: a validated beat reinforces the last
-        // dribble aim residual this carrier applied. Emitted AFTER the geometry guard so a rejected
-        // (invalid) contest never credits a residual. The dribble-points reward (2.52..7.0 across
-        // kinds, max = a nutmeg) is NORMALISED into the pass-parity magnitude band [+0.6, +1.0] as
-        // `0.6 + 0.4 * (beat_points / NUTMEG_BEAT_REWARD_POINTS)`: a full-value beat/nutmeg ⇒ ~+1.0,
-        // a plain carry ⇒ ~+0.85, all comfortably above the +0.6 success floor — same 0.6-base +
-        // 0.4-quality shape as `record_pass_outcome_sample`. No-op when the dribble gate is off.
-        let dribble_mpc_reward =
-            0.6 + 0.4 * (kind.beat_reward_points() / NUTMEG_BEAT_REWARD_POINTS).clamp(0.0, 1.0);
-        self.emit_dribble_mpc_objective_sample(attacker_id, dribble_mpc_reward);
         let attacker_lead = carried_ball_lead(&self.players[attacker_id]);
 
         self.ball.holder = Some(attacker_id);
@@ -27623,7 +27539,7 @@ impl SoccerMatch {
                         observation.opponent_goal_angle_degrees,
                     );
                     let use_curl = curl_probability >= 0.46;
-                    let mut base_goal_x = if use_curl {
+                    let base_goal_x = if use_curl {
                         let keeper_x = snapshot
                             .goalkeeper_for(player_team.other())
                             .and_then(|keeper_id| snapshot.player_position(keeper_id))
@@ -27655,66 +27571,6 @@ impl SoccerMatch {
                     } else {
                         goal_center_x
                     };
-                    // Learned MPC execution-objective residual for SHOT PLACEMENT — the shot analogue
-                    // of the pass-lead nudge in the pass launch path (see the `led_target` residual
-                    // above). Gated on the SEPARATE, default-OFF
-                    // `DD_SOCCER_ENABLE_LEARNED_MPC_SHOT_OBJECTIVE` (NOT the default-ON pass gate) so
-                    // shots stay byte-identical / A/B-clean until deliberately enabled. Shot placement
-                    // is inherently LATERAL — the ball must cross the goal line at the fixed `goal_y`,
-                    // and the whole downstream pipeline (`noisy_shot_target_x`, the goal-mouth clamp)
-                    // only touches x — so we apply ONLY the residual's lateral (x) component to the
-                    // analytic aim `base_goal_x` (the mean placement AFTER curl/scored-placement),
-                    // BEFORE `noisy_shot_target_x` adds execution noise, exactly mirroring how the pass
-                    // path shifts the intended `led_target` before its own aim noise. The shifted aim
-                    // then flows through the SAME `.clamp(goal_center_x ± half_goal*1.25)` goal-mouth
-                    // guard below, so the residual can never breach the posts. The captured
-                    // `applied_residual` is `(x, 0.0)` so the RWR target matches what was applied (a
-                    // shot has no forward placement DOF); the bend axis is `0.0` (aim only — power and
-                    // when-to-shoot stay with their own heads, per the shot-placement scope).
-                    let mpc_shot_objective: Option<(Vec<f32>, Vec2, f64)> =
-                        if dd_soccer_enable_learned_mpc_shot_objective() {
-                            if let Some(head) = self.mpc_objective_head.clone() {
-                                let features = snapshot.mpc_objective_learn_features(
-                                    player_team,
-                                    MpcObjectiveFamily::Shot,
-                                    player_pos,
-                                    Vec2::new(base_goal_x, goal_y),
-                                    pressure,
-                                );
-                                let sigma = mpc_objective_explore_sigma_yards();
-                                let (noise_fwd, noise_lat) = self.mpc_objective_exploration_noise();
-                                let residual = if head.is_warm() {
-                                    head.explore_residual(&features, sigma, noise_fwd, noise_lat)
-                                } else {
-                                    // Cold start: explore around the ANALYTIC aim (zero residual) so
-                                    // the head accrues shot-family training data before it is trusted
-                                    // live — identical shape to the pass cold-start jitter.
-                                    Some(Vec2 {
-                                        x: (noise_lat * sigma).clamp(
-                                            -MPC_OBJECTIVE_MAX_RESIDUAL_YARDS,
-                                            MPC_OBJECTIVE_MAX_RESIDUAL_YARDS,
-                                        ),
-                                        y: (noise_fwd * sigma).clamp(
-                                            -MPC_OBJECTIVE_MAX_RESIDUAL_YARDS,
-                                            MPC_OBJECTIVE_MAX_RESIDUAL_YARDS,
-                                        ),
-                                    })
-                                };
-                                residual.map(|r| {
-                                    // Apply the lateral component only; re-clamp to the goal-mouth
-                                    // bounds already used at this site (posts ± execution slack).
-                                    base_goal_x = (base_goal_x + r.x).clamp(
-                                        goal_center_x - half_goal * 1.25,
-                                        goal_center_x + half_goal * 1.25,
-                                    );
-                                    (features, Vec2 { x: r.x, y: 0.0 }, 0.0)
-                                })
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        };
                     let goal = Vec2::new(
                         noisy_shot_target_x(
                             base_goal_x,
@@ -27807,13 +27663,6 @@ impl SoccerMatch {
                         team: player_team,
                         shooter: player_id,
                         origin: player_pos,
-                        // Intended (post-residual, pre-noise) analytic aim: `base_goal_x` here is the
-                        // residual-shifted placement when the shot gate armed, else the pure analytic
-                        // aim. `goal_y` is the goal line. Behaviour-inert when `mpc_objective` is None.
-                        intended_target: Vec2::new(base_goal_x, goal_y),
-                        // Some(features, applied lateral residual (x, 0.0), bend=0.0) ONLY when the
-                        // shot gate armed AND the residual was applied; None otherwise (byte-identical).
-                        mpc_objective: mpc_shot_objective,
                     });
                     self.record_possession_touch(player_id);
                     self.stat_shot(player_team);
@@ -30622,8 +30471,6 @@ impl SoccerMatch {
         self.pending_pass = None;
         self.pending_shot = None;
         self.recent_dispossession = None;
-        // The ball is genuinely loose: no carrier owns a pending dribble residual any more.
-        self.dribble_mpc_objective = None;
         self.possession_swaps.clear();
         self.ball_stationary_ticks = 0;
         self.ball_stuck_anchor = self.ball.position;
@@ -31037,8 +30884,6 @@ impl SoccerMatch {
                 self.stat_shot_on_target(shot.team);
                 self.record_shot_on_target_rewards(shot.team, shot.shooter);
                 self.record_goalkeeper_save_reward(&shot, keeper_id);
-                // Learned-MPC shot-placement credit: on target but the keeper held it (+0.3).
-                self.record_shot_objective_sample(&shot, ShotObjectiveOutcome::Saved);
                 self.stat_save(defending_team);
                 // A secured save (the keeper holds/claims it) is the most valuable stop.
                 self.record_keeper_save_reward(keeper_id, shot.origin, defending_team, 1.0);
@@ -31109,8 +30954,6 @@ impl SoccerMatch {
                 self.ball.last_touch_team = Some(defending_team);
                 self.stat_shot_on_target(shot.team);
                 self.record_shot_on_target_rewards(shot.team, shot.shooter);
-                // Learned-MPC shot-placement credit: on target, parried into a live rebound (+0.6).
-                self.record_shot_objective_sample(&shot, ShotObjectiveOutcome::OnTargetRebound);
                 self.stat_save(defending_team);
                 // A parry denied the goal but conceded a live rebound — a less secure stop than
                 // a clean catch, so it earns a fraction of the full save reward.
@@ -31160,8 +31003,6 @@ impl SoccerMatch {
                 self.pending_rebound = None;
                 if let Some(shot) = shot.as_ref() {
                     self.record_shot_on_target_rewards(shot.team, shot.shooter);
-                    // Learned-MPC shot-placement credit: the placement scored (+1.0).
-                    self.record_shot_objective_sample(shot, ShotObjectiveOutcome::Goal);
                 }
                 self.record_goal_rewards(scoring_team, shot.as_ref().map(|shot| shot.shooter));
                 self.ball.altitude_yards = 0.0;
@@ -31174,9 +31015,6 @@ impl SoccerMatch {
                 self.score_goal(scoring_team);
             }
             BallStepOutcome::Miss { shot } => {
-                // Learned-MPC shot-placement credit: off target (−1.0). Emitted before `shot` moves
-                // into the miss recorder.
-                self.record_shot_objective_sample(&shot, ShotObjectiveOutcome::Missed);
                 self.record_missed_shot_outcome(shot, None);
                 self.pending_shot = None;
                 self.pending_rebound = None;
@@ -31200,13 +31038,6 @@ impl SoccerMatch {
                 } else {
                     None
                 };
-                // Learned-MPC shot-placement credit: a TERMINAL block is a placement failure (−1.0).
-                // When `keep_shot_active` the shot stays live (its captured `mpc_objective` rides
-                // along in the cloned `PendingShot`) and will be sampled at its eventual terminal
-                // outcome, so we do NOT emit here — that avoids crediting one shot twice.
-                if !keep_shot_active {
-                    self.record_shot_objective_sample(&shot, ShotObjectiveOutcome::Missed);
-                }
                 self.ball.position = position;
                 self.ball.velocity = velocity;
                 self.ball.holder = None;
@@ -31271,9 +31102,6 @@ impl SoccerMatch {
                 self.ball.untargeted_long_ball_flight = None;
                 self.ball.untargeted_long_ball_launcher = None;
                 if let Some(shot) = shot {
-                    // Learned-MPC shot-placement credit: shot left play off target (−1.0). Emitted
-                    // before `shot` moves into the miss recorder.
-                    self.record_shot_objective_sample(&shot, ShotObjectiveOutcome::Missed);
                     self.record_missed_shot_outcome(shot, Some(shot_off_target_yards));
                 }
                 let restart_kind = restart.kind;
@@ -33545,87 +33373,6 @@ impl SoccerMatch {
         if self.pass_outcome_samples.len() > SOCCER_PASS_OUTCOME_SAMPLE_CAP {
             let overflow = self.pass_outcome_samples.len() - SOCCER_PASS_OUTCOME_SAMPLE_CAP;
             self.pass_outcome_samples.drain(0..overflow);
-        }
-    }
-
-    /// Emit a learned-MPC-objective (executor-head) training sample from a resolved SHOT — the shot
-    /// analogue of the MPC block inside [`Self::record_pass_outcome_sample`]. Reinforces the applied
-    /// aim-PLACEMENT residual by the delayed shot outcome, pushed into the SAME
-    /// `mpc_objective_samples` buffer the pass path uses (the shared head's SHOT-family rows are
-    /// separated by the family one-hot baked into `features`, so the learner needs no shot-specific
-    /// plumbing). No-op unless the shot armed the residual at launch (`shot.mpc_objective` is Some,
-    /// i.e. `dd_soccer_enable_learned_mpc_shot_objective()` was on + the head present) — so when the
-    /// shot gate is off this never pushes a sample and is fully behaviour-neutral.
-    ///
-    /// Reward mapping (magnitudes mirror the pass path: completed ≈ +0.6..+1.0, failed −1.0):
-    /// goal ⇒ +1.0, on-target rebound/parry ⇒ +0.6, held save ⇒ +0.3, off-target/blocked/OOB ⇒ −1.0.
-    /// RWR ([`SoccerMpcObjectiveHead::train_rwr`]) trains only on positive advantage, so the
-    /// goal/rebound/save samples reinforce their placement while the negative miss/block samples are
-    /// recorded (corpus parity with the pass path) but skipped in training.
-    fn record_shot_objective_sample(&mut self, shot: &PendingShot, outcome: ShotObjectiveOutcome) {
-        let reward = match outcome {
-            ShotObjectiveOutcome::Goal => 1.0,
-            ShotObjectiveOutcome::OnTargetRebound => 0.6,
-            ShotObjectiveOutcome::Saved => 0.3,
-            ShotObjectiveOutcome::Missed => -1.0,
-        };
-        if let Some((features, residual, applied_bend)) = shot.mpc_objective.as_ref() {
-            if features.len() == MPC_OBJECTIVE_FEATURE_DIM {
-                self.mpc_objective_samples.push(MpcObjectiveSample {
-                    features: features.clone(),
-                    applied_residual: *residual,
-                    applied_bend: *applied_bend,
-                    reward,
-                });
-                if self.mpc_objective_samples.len() > MPC_OBJECTIVE_SAMPLE_CAP {
-                    let overflow = self.mpc_objective_samples.len() - MPC_OBJECTIVE_SAMPLE_CAP;
-                    self.mpc_objective_samples.drain(0..overflow);
-                }
-            }
-        }
-    }
-
-    /// Emit the pending learned-MPC DRIBBLE aim-residual RWR sample (the dribble analogue of the
-    /// MPC block in [`Self::record_pass_outcome_sample`] / [`Self::record_shot_objective_sample`])
-    /// and CLEAR the transient carry-slot. Pushed into the SAME `mpc_objective_samples` buffer the
-    /// pass/shot paths use — the shared head's DRIBBLE-family rows are separated by the family
-    /// one-hot baked into `features`, so the learner needs no dribble-specific plumbing.
-    ///
-    /// No-op unless the dribble gate is on AND the carry-slot belongs to `attacker_id` (the carrier
-    /// whose dribble is resolving). The holder guard is what stops a stale residual from a prior
-    /// carrier being credited to this outcome; the slot is CONSUMED (taken) so it cannot be
-    /// double-emitted. When the gate is off the slot is always `None`, so this is fully
-    /// behaviour-neutral (byte-identical-off).
-    ///
-    /// Reward mapping (magnitudes mirror the pass/shot paths — success ≈ +0.6..+1.0, failure −1.0):
-    /// the beat/advance caller passes a positive reward normalised from `kind.beat_reward_points()`
-    /// (see [`Self::record_dribble_beat_event`]); the turnover caller passes −1.0. RWR
-    /// ([`SoccerMpcObjectiveHead::train_rwr`]) trains only on positive advantage, so the beat sample
-    /// reinforces its residual while the turnover sample is recorded (corpus parity) but skipped.
-    fn emit_dribble_mpc_objective_sample(&mut self, attacker_id: usize, reward: f64) {
-        if !dd_soccer_enable_learned_mpc_dribble_objective() {
-            return;
-        }
-        let holder_matches = matches!(
-            self.dribble_mpc_objective.as_ref(),
-            Some((holder, ..)) if *holder == attacker_id
-        );
-        if !holder_matches {
-            return;
-        }
-        if let Some((_, features, residual, bend)) = self.dribble_mpc_objective.take() {
-            if features.len() == MPC_OBJECTIVE_FEATURE_DIM {
-                self.mpc_objective_samples.push(MpcObjectiveSample {
-                    features,
-                    applied_residual: residual,
-                    applied_bend: bend,
-                    reward,
-                });
-                if self.mpc_objective_samples.len() > MPC_OBJECTIVE_SAMPLE_CAP {
-                    let overflow = self.mpc_objective_samples.len() - MPC_OBJECTIVE_SAMPLE_CAP;
-                    self.mpc_objective_samples.drain(0..overflow);
-                }
-            }
         }
     }
 
@@ -38202,6 +37949,203 @@ fn maybe_log_pass_space_diag(sample_count: u64) {
     if log_every > 0 && sample_count > 0 && sample_count % log_every == 0 {
         log_pass_space_diag();
     }
+}
+
+// ===== Net-influence diagnostic (Codex round-23) =====
+// Measures how often the neural blend actually CHANGES the selected action vs the tabular
+// baseline (the argmax-tabular-value legal candidate) at the `neural_blended_action` scorer.
+// This is the headline "does the net own play" number — if it is near zero, no reward or
+// interface lever can matter because the executed action rarely differs from what plain tabular
+// play would have chosen. Default-off (byte-identical) unless `DD_SOCCER_NET_INFLUENCE_DIAG` is
+// set; when unset `record_net_influence_diag` is a no-op and the counters never move.
+fn net_influence_diag_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_NET_INFLUENCE_DIAG").is_ok())
+}
+
+const NET_INFLUENCE_DIAG_DEFAULT_LOG_EVERY: u64 = 1000;
+
+static NET_INFLUENCE_DECISIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NET_INFLUENCE_FAMILY_CHANGED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static NET_INFLUENCE_EXACT_CHANGED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static NET_INFLUENCE_ONBALL_DECISIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static NET_INFLUENCE_ONBALL_CHANGED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+// "neural-active" = the subset where the value blend was live and there were >=2 scored
+// candidates, i.e. the net genuinely had a choice to make. Codex's higher threshold (>25-30%)
+// applies here; the all-decisions number is diluted by ticks where tabular had one option.
+static NET_INFLUENCE_ACTIVE_DECISIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static NET_INFLUENCE_ACTIVE_CHANGED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[allow(clippy::too_many_arguments)]
+fn record_net_influence_diag(
+    baseline_family: &str,
+    selected_family: &str,
+    baseline_label: &str,
+    selected_label: &str,
+    on_ball: bool,
+    neural_active: bool,
+) {
+    if !net_influence_diag_enabled() {
+        return;
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    let family_changed = baseline_family != selected_family;
+    let exact_changed = baseline_label != selected_label;
+    let count = NET_INFLUENCE_DECISIONS.fetch_add(1, Relaxed) + 1;
+    if family_changed {
+        NET_INFLUENCE_FAMILY_CHANGED.fetch_add(1, Relaxed);
+    }
+    if exact_changed {
+        NET_INFLUENCE_EXACT_CHANGED.fetch_add(1, Relaxed);
+    }
+    if on_ball {
+        NET_INFLUENCE_ONBALL_DECISIONS.fetch_add(1, Relaxed);
+        if family_changed {
+            NET_INFLUENCE_ONBALL_CHANGED.fetch_add(1, Relaxed);
+        }
+    }
+    if neural_active {
+        NET_INFLUENCE_ACTIVE_DECISIONS.fetch_add(1, Relaxed);
+        if family_changed {
+            NET_INFLUENCE_ACTIVE_CHANGED.fetch_add(1, Relaxed);
+        }
+    }
+    maybe_log_net_influence_diag(count);
+}
+
+fn maybe_log_net_influence_diag(sample_count: u64) {
+    use std::sync::OnceLock;
+    static LOG_EVERY: OnceLock<u64> = OnceLock::new();
+    let log_every = *LOG_EVERY.get_or_init(|| {
+        std::env::var("DD_SOCCER_NET_INFLUENCE_DIAG_LOG_EVERY")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(NET_INFLUENCE_DIAG_DEFAULT_LOG_EVERY)
+    });
+    if log_every > 0 && sample_count > 0 && sample_count % log_every == 0 {
+        log_net_influence_diag();
+    }
+}
+
+fn log_net_influence_diag() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let decisions = NET_INFLUENCE_DECISIONS.load(Relaxed);
+    if decisions == 0 {
+        return;
+    }
+    let family = NET_INFLUENCE_FAMILY_CHANGED.load(Relaxed);
+    let exact = NET_INFLUENCE_EXACT_CHANGED.load(Relaxed);
+    let on_ball = NET_INFLUENCE_ONBALL_DECISIONS.load(Relaxed);
+    let on_ball_changed = NET_INFLUENCE_ONBALL_CHANGED.load(Relaxed);
+    let active = NET_INFLUENCE_ACTIVE_DECISIONS.load(Relaxed);
+    let active_changed = NET_INFLUENCE_ACTIVE_CHANGED.load(Relaxed);
+    let off_ball = decisions - on_ball;
+    let off_ball_changed = family - on_ball_changed;
+    let pct = |n: u64, total: u64| -> f64 {
+        if total > 0 {
+            100.0 * n as f64 / total as f64
+        } else {
+            0.0
+        }
+    };
+    eprintln!(
+        "net_influence_diag decisions={decisions} \
+         family_changed={family} ({:.1}%) exact_changed={exact} ({:.1}%) \
+         on_ball={on_ball} on_ball_changed={on_ball_changed} ({:.1}%) \
+         off_ball={off_ball} off_ball_changed={off_ball_changed} ({:.1}%) \
+         neural_active_ge2cand={active} neural_active_changed={active_changed} ({:.1}%)",
+        pct(family, decisions),
+        pct(exact, decisions),
+        pct(on_ball_changed, on_ball),
+        pct(off_ball_changed, off_ball),
+        pct(active_changed, active),
+    );
+    log_net_influence_commit_diag();
+}
+
+// Commit-level net-influence (Codex): tabular baseline vs the ACTUALLY-committed action, after
+// run_time_step_with_context + refractory + post-decision movement discipline. Compared to the
+// assembler-level number this isolates downstream suppression: if the committed SEMANTIC action
+// still differs from tabular about as often as the assembler chose to, the net drives EXECUTION
+// (=> the lateral tendency is a value/credit/preference problem, not interface); if it collapses,
+// the shield strips it. CONCRETE (post-discipline intent.label()) below SEMANTIC ⇒ discipline is
+// flattening the label (e.g. off-ball target changed without changing the action family).
+static NET_INFLUENCE_COMMIT_DECISIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static NET_INFLUENCE_COMMIT_SEMANTIC_CHANGED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static NET_INFLUENCE_COMMIT_ONBALL_DECISIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static NET_INFLUENCE_COMMIT_ONBALL_SEMANTIC_CHANGED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+// On-ball pass INTENT: how often the net's FRESH pick was a pass vs how often the COMMITTED action
+// was a pass. NET_PASS >> COMMITTED_PASS ⇒ the refractory/discipline is dropping the net's on-ball
+// PASS intent for a held (hold/dribble) action — the timidity mechanism, measured directly. This is
+// the smoking-gun for "the net wants to pass forward on the ball but the pipeline holds the ball".
+static NET_INFLUENCE_COMMIT_ONBALL_NET_PASS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static NET_INFLUENCE_COMMIT_ONBALL_COMMITTED_PASS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn record_net_influence_commit_diag(
+    baseline_family: &str,
+    committed_semantic_family: &str,
+    net_pick_family: &str,
+    on_ball: bool,
+) {
+    if !net_influence_diag_enabled() {
+        return;
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    let semantic_changed = baseline_family != committed_semantic_family;
+    NET_INFLUENCE_COMMIT_DECISIONS.fetch_add(1, Relaxed);
+    if semantic_changed {
+        NET_INFLUENCE_COMMIT_SEMANTIC_CHANGED.fetch_add(1, Relaxed);
+    }
+    if on_ball {
+        NET_INFLUENCE_COMMIT_ONBALL_DECISIONS.fetch_add(1, Relaxed);
+        if semantic_changed {
+            NET_INFLUENCE_COMMIT_ONBALL_SEMANTIC_CHANGED.fetch_add(1, Relaxed);
+        }
+        if net_pick_family == "pass" {
+            NET_INFLUENCE_COMMIT_ONBALL_NET_PASS.fetch_add(1, Relaxed);
+        }
+        if committed_semantic_family == "pass" {
+            NET_INFLUENCE_COMMIT_ONBALL_COMMITTED_PASS.fetch_add(1, Relaxed);
+        }
+    }
+}
+
+fn log_net_influence_commit_diag() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let decisions = NET_INFLUENCE_COMMIT_DECISIONS.load(Relaxed);
+    if decisions == 0 {
+        return;
+    }
+    let semantic = NET_INFLUENCE_COMMIT_SEMANTIC_CHANGED.load(Relaxed);
+    let on_ball = NET_INFLUENCE_COMMIT_ONBALL_DECISIONS.load(Relaxed);
+    let on_ball_semantic = NET_INFLUENCE_COMMIT_ONBALL_SEMANTIC_CHANGED.load(Relaxed);
+    let pct = |n: u64, total: u64| -> f64 {
+        if total > 0 {
+            100.0 * n as f64 / total as f64
+        } else {
+            0.0
+        }
+    };
+    eprintln!(
+        "net_influence_commit decisions={decisions} \
+         semantic_changed={semantic} ({:.1}%) \
+         on_ball={on_ball} on_ball_semantic_changed={on_ball_semantic} ({:.1}%)",
+        pct(semantic, decisions),
+        pct(on_ball_semantic, on_ball),
+    );
 }
 
 fn record_pass_space_source_diag(estimator_some: bool, distinct: bool) {
