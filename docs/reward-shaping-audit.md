@@ -32,8 +32,8 @@ form; the only latent issue is `γ=1` vs the learner's true discount (see
 "Follow-ups").
 - **Pitch value** — `territorial_advantage(after) − territorial_advantage(before)`.
   ✅ Now routed through `potential_based_shaping` (this change) as the template.
-- Yards-to-goal progress — `(before.yards_to_goal − after.yards_to_goal)` (~L19159).
-- Ball-forward delta — `ball_forward.clamp(...)` measured as a positional change (~L19085/19087).
+- Yards-to-goal progress — `(before.yards_to_goal − after.yards_to_goal)` (~L27318).
+- Ball-forward delta — `ball_forward.clamp(...)` measured as a positional change (~L27237/27239).
 - Carry progress, spacing deltas (`spacing_delta.*`) — differences of a shape potential.
 
 ### C. Flat state-conditioned bonuses — NOT potential-based (review)
