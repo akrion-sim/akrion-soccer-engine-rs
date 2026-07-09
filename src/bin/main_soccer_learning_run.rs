@@ -24,19 +24,19 @@ use soccer_engine::des::general::soccer::{
     SoccerPassLearningMetrics, SoccerPassOutcomeSample, SoccerPolicyHeadSnapshot,
     SoccerPolicyRoleHeadSnapshot, SoccerPolicySpecialistHeadSnapshot, SoccerQEntry, SoccerQPolicy,
     SoccerQPolicyOptions, SoccerQTargetEntry, SoccerSelfPlayEpisodeSummary,
-    SoccerSelfPlayLearnedParams, SoccerSelfPlayTrainingArtifact, SoccerTacticalLearningSummary,
-    SoccerTacticalLearningWeights, SoccerTeamPolicyArtifact, SoccerTeamQPolicies, SoccerWorldModel,
-    SupportScorerHead, Team, WingerPinchHead, ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS,
-    CRASH_BOX_HEAD_MIN_TRAINING_STEPS, DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
-    DEFAULT_SOCCER_PASS_COMPLETION_LEARNING_RATE, GIVE_AND_GO_HEAD_MIN_TRAINING_STEPS,
-    GOAL_SIDE_RECOVERY_HEAD_MIN_TRAINING_STEPS, HEAD_SCAN_HEAD_MIN_TRAINING_STEPS,
-    LANE_AFFINITY_HEAD_MIN_TRAINING_STEPS, LONG_PASS_RUN_HEAD_MIN_TRAINING_STEPS,
-    LOOSE_BALL_COMMIT_HEAD_MIN_TRAINING_STEPS, ONSIDE_SUPPORT_HEAD_MIN_TRAINING_STEPS,
-    PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS, PASS_LANE_YIELD_HEAD_MIN_TRAINING_STEPS,
-    RECEIVE_APPROACH_HEAD_MIN_TRAINING_STEPS, RUN_PREDICTION_HEAD_MIN_TRAINING_STEPS,
-    SEPARATION_FLOOR_HEAD_MIN_TRAINING_STEPS, SHOT_TRIGGER_HEAD_MIN_TRAINING_STEPS,
-    SLIP_BREAK_HEAD_MIN_TRAINING_STEPS, SUPPORT_SCORER_HEAD_MIN_TRAINING_STEPS,
-    WINGER_PINCH_HEAD_MIN_TRAINING_STEPS,
+    SoccerSelfPlayLearnedParams, SoccerSelfPlayTrainingArtifact, SoccerSkillPolicyHeadSnapshot,
+    SoccerSkillPolicyHeadsSnapshot, SoccerTacticalLearningSummary, SoccerTacticalLearningWeights,
+    SoccerTeamPolicyArtifact, SoccerTeamQPolicies, SoccerWorldModel, SupportScorerHead, Team,
+    WingerPinchHead, ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS, CRASH_BOX_HEAD_MIN_TRAINING_STEPS,
+    DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE, DEFAULT_SOCCER_PASS_COMPLETION_LEARNING_RATE,
+    GIVE_AND_GO_HEAD_MIN_TRAINING_STEPS, GOAL_SIDE_RECOVERY_HEAD_MIN_TRAINING_STEPS,
+    HEAD_SCAN_HEAD_MIN_TRAINING_STEPS, LANE_AFFINITY_HEAD_MIN_TRAINING_STEPS,
+    LONG_PASS_RUN_HEAD_MIN_TRAINING_STEPS, LOOSE_BALL_COMMIT_HEAD_MIN_TRAINING_STEPS,
+    ONSIDE_SUPPORT_HEAD_MIN_TRAINING_STEPS, PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS,
+    PASS_LANE_YIELD_HEAD_MIN_TRAINING_STEPS, RECEIVE_APPROACH_HEAD_MIN_TRAINING_STEPS,
+    RUN_PREDICTION_HEAD_MIN_TRAINING_STEPS, SEPARATION_FLOOR_HEAD_MIN_TRAINING_STEPS,
+    SHOT_TRIGGER_HEAD_MIN_TRAINING_STEPS, SLIP_BREAK_HEAD_MIN_TRAINING_STEPS,
+    SUPPORT_SCORER_HEAD_MIN_TRAINING_STEPS, WINGER_PINCH_HEAD_MIN_TRAINING_STEPS,
 };
 use soccer_engine::des::general::soccer_eval_gate::{
     evaluate_promotion, PromotionThresholds, PromotionVerdict,
@@ -923,6 +923,9 @@ fn refresh_neural_snapshot_norm_recursive(
     if let Some(policy_head) = snapshot.policy_head.as_mut() {
         refresh_policy_head_snapshot_norm(policy_head, depth + 1);
     }
+    if let Some(skill_policy_heads) = snapshot.skill_policy_heads.as_mut() {
+        refresh_skill_policy_heads_snapshot_norm(skill_policy_heads, depth + 1);
+    }
     if let Some(line_depth_head) = snapshot.line_depth_head.as_mut() {
         refresh_auxiliary_head_snapshot_norm(line_depth_head, depth + 1);
     }
@@ -940,6 +943,19 @@ fn refresh_specialist_head_snapshot_norm(
     depth: usize,
 ) {
     refresh_neural_snapshot_norm_recursive(&mut head.network, depth + 1);
+}
+
+fn refresh_skill_policy_head_snapshot_norm(head: &mut SoccerSkillPolicyHeadSnapshot, depth: usize) {
+    refresh_neural_snapshot_norm_recursive(&mut head.network, depth + 1);
+}
+
+fn refresh_skill_policy_heads_snapshot_norm(
+    heads: &mut SoccerSkillPolicyHeadsSnapshot,
+    depth: usize,
+) {
+    for head in &mut heads.heads {
+        refresh_skill_policy_head_snapshot_norm(head, depth + 1);
+    }
 }
 
 fn refresh_role_head_snapshot_norm(head: &mut SoccerPolicyRoleHeadSnapshot, depth: usize) {
@@ -996,6 +1012,9 @@ fn mutate_neural_snapshot_recursive(
         if let Some(policy_head) = snapshot.policy_head.as_mut() {
             mutate_policy_head_snapshot(policy_head, rng, config, depth + 1);
         }
+        if let Some(skill_policy_heads) = snapshot.skill_policy_heads.as_mut() {
+            mutate_skill_policy_heads_snapshot(skill_policy_heads, rng, config, depth + 1);
+        }
         if let Some(line_depth_head) = snapshot.line_depth_head.as_mut() {
             mutate_auxiliary_head_snapshot(line_depth_head, rng, config, depth + 1);
         }
@@ -1025,6 +1044,27 @@ fn mutate_specialist_head_snapshot(
 ) {
     let network = std::mem::take(&mut head.network);
     head.network = mutate_neural_snapshot_recursive(network, rng, config, depth + 1);
+}
+
+fn mutate_skill_policy_head_snapshot(
+    head: &mut SoccerSkillPolicyHeadSnapshot,
+    rng: &mut NeuralPopulationRng,
+    config: NeuralPopulationSearchConfig,
+    depth: usize,
+) {
+    let network = std::mem::take(&mut head.network);
+    head.network = mutate_neural_snapshot_recursive(network, rng, config, depth + 1);
+}
+
+fn mutate_skill_policy_heads_snapshot(
+    heads: &mut SoccerSkillPolicyHeadsSnapshot,
+    rng: &mut NeuralPopulationRng,
+    config: NeuralPopulationSearchConfig,
+    depth: usize,
+) {
+    for head in &mut heads.heads {
+        mutate_skill_policy_head_snapshot(head, rng, config, depth + 1);
+    }
 }
 
 fn mutate_role_head_snapshot(
@@ -1106,6 +1146,15 @@ fn crossover_neural_snapshot_recursive(
         } else if child.policy_head.is_none() && b.policy_head.is_some() && rng.coin() {
             child.policy_head = b.policy_head.clone();
         }
+        if let (Some(child_head), Some(b_head)) = (
+            child.skill_policy_heads.as_mut(),
+            b.skill_policy_heads.as_ref(),
+        ) {
+            crossover_skill_policy_heads_snapshot(child_head, b_head, rng, depth + 1);
+        } else if child.skill_policy_heads.is_none() && b.skill_policy_heads.is_some() && rng.coin()
+        {
+            child.skill_policy_heads = b.skill_policy_heads.clone();
+        }
         if let (Some(child_head), Some(b_head)) =
             (child.line_depth_head.as_mut(), b.line_depth_head.as_ref())
         {
@@ -1150,6 +1199,46 @@ fn crossover_specialist_head_snapshot(
     }
     let current = std::mem::take(&mut child.network);
     child.network = crossover_neural_snapshot_recursive(&current, &b.network, rng, depth + 1);
+}
+
+fn crossover_skill_policy_head_snapshot(
+    child: &mut SoccerSkillPolicyHeadSnapshot,
+    b: &SoccerSkillPolicyHeadSnapshot,
+    rng: &mut NeuralPopulationRng,
+    depth: usize,
+) {
+    if child.group != b.group && rng.coin() {
+        *child = b.clone();
+        refresh_skill_policy_head_snapshot_norm(child, depth + 1);
+        return;
+    }
+    let current = std::mem::take(&mut child.network);
+    child.network = crossover_neural_snapshot_recursive(&current, &b.network, rng, depth + 1);
+}
+
+fn crossover_skill_policy_heads_snapshot(
+    child: &mut SoccerSkillPolicyHeadsSnapshot,
+    b: &SoccerSkillPolicyHeadsSnapshot,
+    rng: &mut NeuralPopulationRng,
+    depth: usize,
+) {
+    for (index, child_head) in child.heads.iter_mut().enumerate() {
+        if let Some(b_head) = b
+            .heads
+            .iter()
+            .find(|head| head.group == child_head.group)
+            .or_else(|| b.heads.get(index))
+        {
+            crossover_skill_policy_head_snapshot(child_head, b_head, rng, depth + 1);
+        }
+    }
+    if child.heads.len() < b.heads.len() {
+        for b_head in b.heads.iter().skip(child.heads.len()) {
+            if rng.unit() < 0.25 {
+                child.heads.push(b_head.clone());
+            }
+        }
+    }
 }
 
 fn crossover_role_head_snapshot(
@@ -12255,6 +12344,14 @@ mod tests {
             }],
             forward_select_logit_weight: 0.0,
         }));
+        snapshot.skill_policy_heads = Some(Box::new(SoccerSkillPolicyHeadsSnapshot {
+            heads: vec![SoccerSkillPolicyHeadSnapshot {
+                group: "pass".to_string(),
+                network: neural_population_network(base + 45.0),
+                training_steps: 9,
+                average_loss: Some(0.3125),
+            }],
+        }));
         snapshot.line_depth_head = Some(Box::new(SoccerAuxiliaryHeadSnapshot {
             network: neural_population_network(base + 50.0),
             training_steps: 13,
@@ -12288,6 +12385,11 @@ mod tests {
                 for specialist in &role_head.specialist_heads {
                     collect_neural_population_values(&specialist.network, values);
                 }
+            }
+        }
+        if let Some(skill_policy_heads) = snapshot.skill_policy_heads.as_ref() {
+            for head in &skill_policy_heads.heads {
+                collect_neural_population_values(&head.network, values);
             }
         }
         if let Some(line_depth_head) = snapshot.line_depth_head.as_ref() {
@@ -12334,6 +12436,14 @@ mod tests {
             neural_population_first_weight(&original.line_depth_head.as_ref().unwrap().network),
             neural_population_first_weight(&mutated.line_depth_head.as_ref().unwrap().network)
         );
+        assert_ne!(
+            neural_population_first_weight(
+                &original.skill_policy_heads.as_ref().unwrap().heads[0].network
+            ),
+            neural_population_first_weight(
+                &mutated.skill_policy_heads.as_ref().unwrap().heads[0].network
+            )
+        );
         assert!(mutated.l2_norm.is_finite());
         assert_eq!(mutated.parameter_count, 6);
     }
@@ -12351,6 +12461,7 @@ mod tests {
                 child.policy_head.as_ref().unwrap().role_heads.len(),
                 a.policy_head.as_ref().unwrap().role_heads.len()
             );
+            assert!(child.skill_policy_heads.is_some());
             assert!(child.line_depth_head.is_some());
             let mut child_values = Vec::new();
             let mut b_values = Vec::new();
@@ -13782,6 +13893,22 @@ mod tests {
             Some("true")
         );
         assert_eq!(
+            continuous_manifest_env_value("DD_SOCCER_ENABLE_DP_BOOTSTRAP"),
+            Some("true")
+        );
+        assert_eq!(
+            continuous_manifest_env_value("DD_SOCCER_DP_BOOTSTRAP_HORIZON"),
+            Some("64")
+        );
+        assert_eq!(
+            continuous_manifest_env_value("DD_SOCCER_DP_BOOTSTRAP_SWEEPS"),
+            Some("200")
+        );
+        assert_eq!(
+            continuous_manifest_env_value("SOCCER_APPROX_DP_REPLAY_PASSES"),
+            Some("8")
+        );
+        assert_eq!(
             continuous_manifest_env_value("DD_SOCCER_ENABLE_MC_CRITIC_TARGET"),
             Some("true")
         );
@@ -13932,6 +14059,10 @@ mod tests {
         assert_continuous_manifest_contains(
             "require_value DD_SOCCER_ENABLE_TARGET_STANDARDIZATION true",
         );
+        assert_continuous_manifest_contains("require_value DD_SOCCER_ENABLE_DP_BOOTSTRAP true");
+        assert_continuous_manifest_contains("require_value DD_SOCCER_DP_BOOTSTRAP_HORIZON 64");
+        assert_continuous_manifest_contains("require_value DD_SOCCER_DP_BOOTSTRAP_SWEEPS 200");
+        assert_continuous_manifest_contains("require_value SOCCER_APPROX_DP_REPLAY_PASSES 8");
         assert_continuous_manifest_contains("require_value DD_SOCCER_ENABLE_MC_CRITIC_TARGET true");
         assert_continuous_manifest_contains(
             "require_value DD_SOCCER_ENABLE_NEURAL_SELF_BOOTSTRAP true",
