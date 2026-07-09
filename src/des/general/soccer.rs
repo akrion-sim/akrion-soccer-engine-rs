@@ -38857,6 +38857,11 @@ pub struct SoccerPolicyHeadSnapshot {
     pub specialist_heads: Vec<SoccerPolicySpecialistHeadSnapshot>,
     #[serde(default)]
     pub role_heads: Vec<SoccerPolicyRoleHeadSnapshot>,
+    /// Per-net learned FORWARD action-selection bias weight (see
+    /// [`SoccerPolicyHead::forward_select_logit_weight`]). `#[serde(default)]` ⇒ pre-existing
+    /// snapshots without the field restore to 0.0 (the disabled / byte-identical default).
+    #[serde(default)]
+    pub forward_select_logit_weight: f64,
 }
 
 /// Legacy pass-specific scalar feature count: distance, forward progress, lateral, passer pressure,
