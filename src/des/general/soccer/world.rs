@@ -20717,12 +20717,32 @@ impl SoccerMatch {
                     } else {
                         None
                     };
+                    // ROLLOUT: on the first tick after a fork, force the flagged player's
+                    // action, then self-clear so the remaining horizon follows the base policy.
+                    let forced_rollout_plan: Option<SoccerLearnedPlan> =
+                        match self.rollout_forced_action.take() {
+                            Some((pid, action, target)) if pid == scheduled.id => {
+                                Some(SoccerLearnedPlan {
+                                    action,
+                                    target_player: None,
+                                    target_point: target,
+                                    mpc_replan: None,
+                                })
+                            }
+                            Some(other) => {
+                                self.rollout_forced_action = Some(other);
+                                None
+                            }
+                            None => None,
+                        };
                     let intent = self.players[actor].run_time_step_with_context(
                         &snapshot,
                         mdp_state,
                         observation,
                         input_frame.as_ref().map(|frame| &frame.input),
-                        learned_decision.as_ref().map(|decision| &decision.plan),
+                        forced_rollout_plan
+                            .as_ref()
+                            .or_else(|| learned_decision.as_ref().map(|decision| &decision.plan)),
                         &mut self.rng,
                     );
                     if let Some(learned_decision) = learned_decision.as_ref() {
