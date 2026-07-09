@@ -38081,8 +38081,6 @@ static NET_INFLUENCE_COMMIT_DECISIONS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 static NET_INFLUENCE_COMMIT_SEMANTIC_CHANGED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
-static NET_INFLUENCE_COMMIT_CONCRETE_CHANGED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
 static NET_INFLUENCE_COMMIT_ONBALL_DECISIONS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 static NET_INFLUENCE_COMMIT_ONBALL_SEMANTIC_CHANGED: std::sync::atomic::AtomicU64 =
@@ -38091,7 +38089,6 @@ static NET_INFLUENCE_COMMIT_ONBALL_SEMANTIC_CHANGED: std::sync::atomic::AtomicU6
 fn record_net_influence_commit_diag(
     baseline_family: &str,
     committed_semantic_family: &str,
-    committed_concrete_family: &str,
     on_ball: bool,
 ) {
     if !net_influence_diag_enabled() {
@@ -38099,13 +38096,9 @@ fn record_net_influence_commit_diag(
     }
     use std::sync::atomic::Ordering::Relaxed;
     let semantic_changed = baseline_family != committed_semantic_family;
-    let concrete_changed = baseline_family != committed_concrete_family;
     NET_INFLUENCE_COMMIT_DECISIONS.fetch_add(1, Relaxed);
     if semantic_changed {
         NET_INFLUENCE_COMMIT_SEMANTIC_CHANGED.fetch_add(1, Relaxed);
-    }
-    if concrete_changed {
-        NET_INFLUENCE_COMMIT_CONCRETE_CHANGED.fetch_add(1, Relaxed);
     }
     if on_ball {
         NET_INFLUENCE_COMMIT_ONBALL_DECISIONS.fetch_add(1, Relaxed);
