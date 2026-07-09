@@ -38132,6 +38132,8 @@ fn log_net_influence_commit_diag() {
     let semantic = NET_INFLUENCE_COMMIT_SEMANTIC_CHANGED.load(Relaxed);
     let on_ball = NET_INFLUENCE_COMMIT_ONBALL_DECISIONS.load(Relaxed);
     let on_ball_semantic = NET_INFLUENCE_COMMIT_ONBALL_SEMANTIC_CHANGED.load(Relaxed);
+    let net_pass = NET_INFLUENCE_COMMIT_ONBALL_NET_PASS.load(Relaxed);
+    let committed_pass = NET_INFLUENCE_COMMIT_ONBALL_COMMITTED_PASS.load(Relaxed);
     let pct = |n: u64, total: u64| -> f64 {
         if total > 0 {
             100.0 * n as f64 / total as f64
@@ -38142,9 +38144,12 @@ fn log_net_influence_commit_diag() {
     eprintln!(
         "net_influence_commit decisions={decisions} \
          semantic_changed={semantic} ({:.1}%) \
-         on_ball={on_ball} on_ball_semantic_changed={on_ball_semantic} ({:.1}%)",
+         on_ball={on_ball} on_ball_semantic_changed={on_ball_semantic} ({:.1}%) \
+         on_ball_NET_pass={net_pass} ({:.1}%) on_ball_COMMITTED_pass={committed_pass} ({:.1}%)",
         pct(semantic, decisions),
         pct(on_ball_semantic, on_ball),
+        pct(net_pass, on_ball),
+        pct(committed_pass, on_ball),
     );
 }
 
