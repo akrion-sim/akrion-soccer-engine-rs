@@ -13599,21 +13599,32 @@ impl PlayerAgent {
                         .map(|p| (p.y - my_pos.y) * attack_dir > 0.0)
                         .unwrap_or(false)
                 };
-                let target = observation
+                // Codex r26: quick-forward teammate, else best-ranked forward receiver, but only if
+                // the best forward option clears the 0.50 quality floor; otherwise DECLINE so the
+                // actor picks another action rather than forcing a poor forward pass (the v1 failure).
+                let quick = observation
                     .quick_forward_pass_target
-                    .filter(|id| visible.contains(id))
-                    .or_else(|| {
-                        // Codex r26: only take the fallback forward receiver when the best forward
-                        // option genuinely clears the quality floor (0.50, matching the opportunity
-                        // gate); otherwise DECLINE (None) so the actor picks a different action
-                        // rather than forcing a poor-quality forward pass. Prevents the v1 failure
-                        // mode (low-quality forward passes → worse pass-gain + more turnovers).
-                        if observation.best_forward_pass_option_quality >= 0.50 {
-                            visible.iter().copied().find(is_forward)
-                        } else {
-                            None
-                        }
-                    });
+                    .filter(|id| visible.contains(id));
+                let (target, fwdrel_src) = if let Some(q) = quick {
+                    (Some(q), "quick")
+                } else if observation.best_forward_pass_option_quality >= 0.50 {
+                    (visible.iter().copied().find(is_forward), "fallback")
+                } else {
+                    (None, "decline")
+                };
+                // Target-health telemetry (Codex r25/r26 bet #1), env-gated so default behavior is
+                // byte-identical. Reveals quick-hit vs fallback vs decline rate + forward yards.
+                if std::env::var("DD_SOCCER_FWDREL_DIAG").is_ok() {
+                    let fy = target
+                        .and_then(|t| snapshot.player_position(t))
+                        .map(|p| (p.y - my_pos.y) * attack_dir)
+                        .unwrap_or(-1.0);
+                    eprintln!(
+                        "FWDREL src={fwdrel_src} fy={fy:.1} q={:.2} exp={:.2}",
+                        observation.best_forward_pass_option_quality,
+                        observation.expected_pass_completion
+                    );
+                }
                 target.map(|target| {
                     (
                         SoccerAction::Pass {
