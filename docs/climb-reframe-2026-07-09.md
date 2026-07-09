@@ -35,7 +35,7 @@ The July-4 reframe correctly diagnosed *"the net trains but nothing changes on s
 an **architecture** problem (the net was a bounded `Additive` nudge, λ=0.5, structurally
 forbidden from driving) and fixed it by making the neural **authoritative**:
 
-- Live server defaults to `authoritative`, λ=1.25 ([main_soccer_live.rs:476](../src/des/general/soccer/../main_soccer_live.rs)).
+- Live server defaults to `authoritative`, λ=1.25 ([main_soccer_live.rs:476](../src/des/main_soccer_live.rs)).
 - On-policy authoritative training climbed **Δ−109 → Δ+105 (+214 Elo)** vs a *fixed
   reference net* — but **never vs the pure analytic engine** (explicitly caveated in that doc).
 - Its "Next steps" are now largely **done**: the per-team/asymmetric analytic eval path exists
