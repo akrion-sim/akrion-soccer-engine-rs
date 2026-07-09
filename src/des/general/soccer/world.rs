@@ -11811,8 +11811,9 @@ impl SoccerMatch {
             possession_swaps: self.possession_swaps.clone(),
             opponent_press_belief: self.opponent_press_belief.clone(),
             player_tick_carryover: self.player_tick_carryover.clone(),
-            // RESEED
-            rng: SeededRandom::new(rollout_seed),
+            // RESEED: SeededRandom::new takes u32; XOR-fold the u64 seed's halves so the
+            // full range influences the stream without truncation collisions or a panic.
+            rng: SeededRandom::new((rollout_seed ^ (rollout_seed >> 32)) as u32),
             // ROLLOUT hook
             rollout_forced_action: None,
             // NULL: analytic base — no learned policy / heads / neural blend
