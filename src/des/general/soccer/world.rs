@@ -1286,20 +1286,6 @@ pub struct SoccerMatch {
     /// When warm + gated on, it nudges the analytic aim/lead target by a hard-bounded residual so
     /// pass/shot/dribble QUALITY becomes learnable; `None` ⇒ pure analytic target (parity).
     pub(crate) mpc_objective_head: Option<std::sync::Arc<SoccerMpcObjectiveHead>>,
-    /// Transient carry-slot for the learned MPC DRIBBLE aim-residual (gated, default-OFF via
-    /// [`dd_soccer_enable_learned_mpc_dribble_objective`]). Dribble is a SUSTAINED per-tick action
-    /// whose reward (beat man / turnover) is DELAYED, so — unlike the discrete pass/shot
-    /// `Pending{Pass,Shot}` launch→resolve that carries `(features, residual, bend)` to a single
-    /// resolve — there is no `Pending` to hang the sample on. Instead `apply_dribble_intent`
-    /// OVERWRITES this each tick with `(holder player_id, launch features, applied 2-D residual,
-    /// applied bend)`; the LAST value before the outcome is what the beat/dispossession resolve
-    /// credits (a deliberate approximation of the delayed-credit model — its risk is that a residual
-    /// applied several ticks before the outcome, or one held through a non-dribble tick, is credited
-    /// as if it caused the outcome). Cleared on any change of holder (`mark_ball_received`) so a
-    /// stale residual is never credited to a different carrier, and CONSUMED (taken) when a sample is
-    /// emitted. `None` ⇒ nothing pending; when the gate is off it is never written, so the two resolve
-    /// hooks are no-ops and behaviour is byte-identical.
-    pub(crate) dribble_mpc_objective: Option<(usize, Vec<f32>, Vec2, f64)>,
     /// The trained back-four line-depth head, when present. Set by the learner
     /// (carried + trained across games) so the line decision consumes it live; `None`
     /// ⇒ analytic seed. Shared into each [`WorldSnapshot`] via an `Arc` clone.
@@ -1608,11 +1594,6 @@ pub struct SoccerMatch {
     /// player's previous MDP state, belief summary, chosen action, action target, and MPC
     /// reconciliation summary without depending on transient `WorldSnapshot` instances.
     pub(crate) player_tick_carryover: HashMap<usize, SoccerPlayerTickCarryover>,
-    /// ROLLOUT-only: forces `(player_id, action_label, target_point)` on the NEXT
-    /// `run_time_step`, then self-clears (see the field loop). `None` in all normal
-    /// play ⇒ byte-identical. Set on a `fork_for_rollout` clone to evaluate one
-    /// candidate action, after which the horizon follows the base policy.
-    pub(crate) rollout_forced_action: Option<(usize, String, Option<Vec2>)>,
 }
 
 /// A just-completed dispossession, retained only long enough to suppress an
@@ -1995,37 +1976,6 @@ fn soccer_policy_mixed_behavior_probability(
     let exploration_probability = finite_unit_interval(exploration_probability);
     let fallback_probability = finite_unit_interval(fallback_probability);
     (epsilon * exploration_probability + (1.0 - epsilon) * fallback_probability).clamp(0.0, 1.0)
-}
-
-/// Forward progress (yards, in the attacking direction) of a learned plan's resolved target
-/// relative to the carrier — the SCORE-TIME analogue of `SoccerDecisionContext::target_forward_yards`,
-/// computed straight from `candidate_plan.target_point` (falling back to the target teammate's
-/// position, as the engine resolves pass targets elsewhere). `None` when the plan carries no target
-/// or the carrier position is unknown. Forwardness is `(target.y - carrier.y) * attack_dir`, the
-/// canonical pass-progress measure used across the engine.
-fn soccer_plan_target_forward_yards(
-    plan: &SoccerLearnedPlan,
-    snapshot: &WorldSnapshot,
-    player_id: usize,
-    team: Team,
-) -> Option<f64> {
-    let target = plan
-        .target_point
-        .or_else(|| plan.target_player.and_then(|id| snapshot.player_position(id)))?;
-    let carrier = snapshot.player_position(player_id)?;
-    Some((target.y - carrier.y) * team.attack_dir())
-}
-
-/// Whether a REPLAYED transition was a FORWARD pass by GEOMETRY (not by its action label): a
-/// pass-like action whose recorded `SoccerDecisionContext::target_forward_yards` clears the forward
-/// deadband. This is the TRAINING-TIME eligibility for the learned forward-select scalar. It
-/// deliberately does NOT trust the `"pass"` / `"pass-kpN"` label alone — those also cover
-/// lateral/backward balls (switch-play, recycle/reset) — and reads the same
-/// `(target.y - carrier.y) * attack_dir` measure that `soccer_plan_target_forward_yards` computes at
-/// score time, so both sites share ONE definition of "forward".
-fn soccer_transition_forward_pass_selection_eligible(transition: &SoccerLearningTransition) -> bool {
-    pass_like_action_flight(&transition.action).is_some()
-        && transition.decision_context.target_forward_yards > SOCCER_FORWARD_SELECT_MIN_FORWARD_YARDS
 }
 
 fn soccer_policy_rank_probability_for_label(
@@ -9908,7 +9858,6 @@ mod tests {
             old_action_probability: None,
             sample_weight: soccer_actor_priority_weight(&transition, -0.5),
             mcts_distillation: false,
-            forward_select_eligible: false,
         };
 
         assert_eq!(
@@ -10098,7 +10047,6 @@ mod tests {
             old_action_probability: None,
             sample_weight,
             mcts_distillation: sample_weight >= NEURAL_MCTS_DISTILLATION_PRIORITY_WEIGHT - 1e-9,
-            forward_select_eligible: false,
         };
         let mut samples = vec![
             sample(0.01, NEURAL_MCTS_DISTILLATION_PRIORITY_WEIGHT),
@@ -11628,7 +11576,6 @@ impl SoccerMatch {
             pass_completion_head: None,
             mpc_objective_samples: Vec::new(),
             mpc_objective_head: None,
-            dribble_mpc_objective: None,
             line_depth_head: None,
             line_depth_samples: Vec::new(),
             pending_line_depth: Vec::new(),
@@ -11726,7 +11673,6 @@ impl SoccerMatch {
             mpc_reconcile_stats: SoccerMpcReconcileStats::default(),
             opponent_press_belief: HashMap::new(),
             player_tick_carryover: HashMap::new(),
-            rollout_forced_action: None,
         };
         let center = Vec2::new(
             config.field_width_yards * 0.5,
@@ -11747,197 +11693,6 @@ impl SoccerMatch {
             .central_brain
             .prime_formation_lp(&prime_snapshot);
         soccer_match
-    }
-
-    /// A physics/decision-faithful shallow copy of the match for decision-time ROLLOUT.
-    /// Clones the state `run_time_step` needs to advance play; nulls every learner,
-    /// head, training corpus, replay buffer, and telemetry sink; and reseeds the RNG so
-    /// the rollout forks the stochastic stream (the source match is untouched, and
-    /// candidates can share Common Random Numbers). Runs the pure ANALYTIC base policy
-    /// (no learned policy / heads / neural blend) — the base whose rollout carries the
-    /// improvement guarantee.
-    pub fn fork_for_rollout(&self, rollout_seed: u64) -> SoccerMatch {
-        SoccerMatch {
-            // KEEP: physics + within-play decision state
-            config: self.config.clone(),
-            tick: self.tick,
-            clock_seconds: self.clock_seconds,
-            players: self.players.clone(),
-            officials: self.officials.clone(),
-            ball: self.ball.clone(),
-            shared_positions: self.shared_positions.clone(),
-            score_home: self.score_home,
-            score_away: self.score_away,
-            home_genome: self.home_genome.clone(),
-            away_genome: self.away_genome.clone(),
-            gk_handling_since_clock: self.gk_handling_since_clock,
-            goal_celebration_remaining_ticks: self.goal_celebration_remaining_ticks,
-            goal_celebration_kickoff_team: self.goal_celebration_kickoff_team,
-            central_brain: self.central_brain.clone(),
-            active_set_play: self.active_set_play.clone(),
-            pending_pass: self.pending_pass.clone(),
-            suppress_generic_oob_turnover: self.suppress_generic_oob_turnover,
-            pending_shot: self.pending_shot.clone(),
-            pending_rebound: self.pending_rebound.clone(),
-            flank_crash_box_cross: self.flank_crash_box_cross.clone(),
-            pending_aerial_finish: self.pending_aerial_finish,
-            coach_set_play_hints: self.coach_set_play_hints.clone(),
-            possession_chain: self.possession_chain.clone(),
-            possession_chain_previous_touch_team: self.possession_chain_previous_touch_team,
-            home_mpc_latent_objective: self.home_mpc_latent_objective.clone(),
-            away_mpc_latent_objective: self.away_mpc_latent_objective.clone(),
-            forward_carry_tracker: self.forward_carry_tracker.clone(),
-            last_touch_player: self.last_touch_player,
-            ball_stationary_ticks: self.ball_stationary_ticks,
-            ball_stuck_anchor: self.ball_stuck_anchor,
-            restart_double_touch_guard: self.restart_double_touch_guard,
-            goal_kick_must_clear_box: self.goal_kick_must_clear_box.clone(),
-            possession_progress_tracker: self.possession_progress_tracker.clone(),
-            back_four_line_latch: self.back_four_line_latch.clone(),
-            loose_ball_uncontested_since_tick: self.loose_ball_uncontested_since_tick,
-            defensive_delay_clocks: self.defensive_delay_clocks.clone(),
-            defensive_beat_clocks: self.defensive_beat_clocks.clone(),
-            offside_clocks: self.offside_clocks.clone(),
-            teammate_proximity_seconds: self.teammate_proximity_seconds.clone(),
-            teammate_spacing_notices: self.teammate_spacing_notices.clone(),
-            back_four_anchor_pivots: self.back_four_anchor_pivots.clone(),
-            teammate_spacing_near_clocks: self.teammate_spacing_near_clocks.clone(),
-            teammate_spacing_far_clocks: self.teammate_spacing_far_clocks.clone(),
-            teammate_spacing_yield: self.teammate_spacing_yield.clone(),
-            defensive_clear_hold_trackers: self.defensive_clear_hold_trackers.clone(),
-            recent_dispossession: self.recent_dispossession,
-            last_controlled_possession_team: self.last_controlled_possession_team,
-            coach_position_hints: self.coach_position_hints.clone(),
-            possession_swaps: self.possession_swaps.clone(),
-            opponent_press_belief: self.opponent_press_belief.clone(),
-            player_tick_carryover: self.player_tick_carryover.clone(),
-            // RESEED: SeededRandom::new takes u32; XOR-fold the u64 seed's halves so the
-            // full range influences the stream without truncation collisions or a panic.
-            rng: SeededRandom::new((rollout_seed ^ (rollout_seed >> 32)) as u32),
-            // ROLLOUT hook
-            rollout_forced_action: None,
-            // NULL: analytic base — no learned policy / heads / neural blend
-            learned_policy: None,
-            team_policies: None,
-            neural_learner: None,
-            away_neural_learner: None,
-            home_neural_frozen: false,
-            away_neural_frozen: false,
-            neural_blend: SoccerNeuralBlendConfig::default(),
-            policy_head: None,
-            skill_policy_heads: None,
-            keeper_policy_head: None,
-            specialist_curriculum_round: 0,
-            world_model: None,
-            // NULL: human control (fresh, not shared with the source)
-            human_inputs: SharedHumanInputs::new(),
-            latched_human_inputs: HashMap::new(),
-            pending_human_control: None,
-            // NULL: MPC warm-start cache (cold solves reconverge)
-            mpc_player_controllers: HashMap::new(),
-            // NULL: all learned predictor heads
-            pass_completion_head: None,
-            mpc_objective_head: None,
-            dribble_mpc_objective: None,
-            line_depth_head: None,
-            defender_line_head: None,
-            loose_ball_commit_head: None,
-            attack_spacing_head: None,
-            support_scorer_head: None,
-            receive_approach_head: None,
-            lane_affinity_head: None,
-            goal_side_recovery_head: None,
-            winger_pinch_head: None,
-            separation_floor_head: None,
-            pass_lane_yield_head: None,
-            head_scan_head: None,
-            crash_box_head: None,
-            run_prediction_head: None,
-            slip_break_head: None,
-            onside_support_head: None,
-            long_pass_run_head: None,
-            give_and_go_head: None,
-            aerial_reception_head: None,
-            shot_trigger_head: None,
-            // NULL: RL sample corpora + open-decision buffers
-            pass_outcome_samples: Vec::new(),
-            mpc_objective_samples: Vec::new(),
-            line_depth_samples: Vec::new(),
-            pending_line_depth: Vec::new(),
-            defender_line_samples: Vec::new(),
-            pending_defender_line: Vec::new(),
-            loose_ball_commit_samples: Vec::new(),
-            pending_loose_ball_commit: Vec::new(),
-            receive_approach_samples: Vec::new(),
-            pending_receive_approach: Vec::new(),
-            lane_affinity_samples: Vec::new(),
-            pending_lane_affinity: Vec::new(),
-            goal_side_recovery_samples: Vec::new(),
-            pending_goal_side_recovery: Vec::new(),
-            winger_pinch_samples: Vec::new(),
-            pending_winger_pinch: Vec::new(),
-            separation_floor_samples: Vec::new(),
-            pending_separation_floor: Vec::new(),
-            pass_lane_yield_samples: Vec::new(),
-            pending_pass_lane_yield: Vec::new(),
-            head_scan_samples: Vec::new(),
-            pending_head_scan: Vec::new(),
-            crash_box_samples: Vec::new(),
-            pending_crash_box: Vec::new(),
-            run_prediction_samples: Vec::new(),
-            pending_run_prediction: Vec::new(),
-            slip_break_samples: Vec::new(),
-            pending_slip_break: Vec::new(),
-            onside_support_samples: Vec::new(),
-            pending_onside_support: Vec::new(),
-            long_pass_run_samples: Vec::new(),
-            pending_long_pass_run: Vec::new(),
-            give_and_go_samples: Vec::new(),
-            pending_give_and_go: Vec::new(),
-            aerial_reception_samples: Vec::new(),
-            pending_aerial_reception: Vec::new(),
-            shot_trigger_samples: Vec::new(),
-            pending_shot_trigger: Vec::new(),
-            attack_spacing_samples: Vec::new(),
-            pending_attack_spacing: Vec::new(),
-            support_move_samples: Vec::new(),
-            pending_support_decisions: Vec::new(),
-            // NULL: learning transitions / replay / deferred credit
-            learning_transitions: Vec::new(),
-            episode_learning_transitions: Vec::new(),
-            episode_config_captures: Vec::new(),
-            retrieval_action_prior: HashMap::new(),
-            full_game_learning_applied: false,
-            full_game_learning_replay_transitions: 0,
-            recent_learning_history: VecDeque::new(),
-            deferred_reward_transitions: Vec::new(),
-            deferred_reward_credits: Vec::new(),
-            reward_events: Vec::new(),
-            turnover_penalty_history: VecDeque::new(),
-            last_turnover_penalty_tick: None,
-            pending_turnover_outcome: None,
-            wasted_energy_history: VecDeque::new(),
-            player_last_ball_interaction_tick: HashMap::new(),
-            team_last_positive_outcome_tick: [None, None],
-            completed_pass_chain: VecDeque::new(),
-            pass_chain_meter: PassChainMeter::default(),
-            // NULL: retrieval + telemetry
-            adversarial_moment_memory: VecDeque::new(),
-            adversarial_moment_index_cache: std::cell::RefCell::new(None),
-            adversarial_embedding_signal_cache: std::cell::RefCell::new(None),
-            retrieved_action_prior_cache: std::cell::RefCell::new(
-                SoccerRetrievedActionPriorCache::default(),
-            ),
-            last_agent_schedule: Vec::new(),
-            controller_yield_stats: ControllerYieldStats::default(),
-            step_timing_stats: SoccerStepTimingStats::default(),
-            mpc_reconcile_stats: SoccerMpcReconcileStats::default(),
-            decision_trace_capture_enabled: false,
-            decision_trace_by_player: BTreeMap::new(),
-            stats: MatchStats::default(),
-            events: Vec::new(),
-            tactical_summary: SoccerTacticalLearningSummary::default(),
-        }
     }
 
     pub fn with_human_inputs(mut self, human_inputs: SharedHumanInputs) -> Self {
@@ -12423,17 +12178,6 @@ impl SoccerMatch {
         let learner = match snapshot {
             Some(snapshot) => {
                 let network = build_soccer_neural_network_from_snapshot(&snapshot)?;
-                // Symmetric with `set_neural_network_snapshot`: also restore the actor policy-head
-                // sidecar (including the learned `forward_select_logit_weight`) so eval paths that
-                // install nets via THIS setter (tournaments / other eval) aren't left with an
-                // inert/absent actor. Only overwrites when the snapshot actually carries a policy
-                // head — it never clears a previously-installed one.
-                if let Some(policy_head_snapshot) = snapshot.policy_head.as_deref() {
-                    self.policy_head = Some(soccer_policy_head_from_snapshot(
-                        policy_head_snapshot,
-                        self.config.seed,
-                    )?);
-                }
                 SoccerNeuralLearner::from_pretrained_snapshot(&self.config, network, &snapshot)
             }
             None if self.config.learning_enabled => SoccerNeuralLearner::new(&self.config),
@@ -16245,23 +15989,6 @@ impl SoccerMatch {
         let pass_target_candidate_limit = neural_mcts_pass_target_candidate_limit();
         let mut scored_candidates =
             Vec::with_capacity(legal.len() + legal.len() * pass_target_candidate_limit);
-        // Learned per-net FORWARD action-selection bias. Precomputed once (state-constant across
-        // candidates): the weight is 0.0 unless the gate is on AND a policy head exists, and the
-        // feature is the visible forward-option quality. Captured as plain f64 copies so the
-        // closure does not additionally borrow `self.policy_head`. When the weight is 0.0 the
-        // per-candidate bonus below is 0 ⇒ the scored-candidate path is byte-identical.
-        let forward_select_weight = if dd_soccer_enable_forward_select_logit() {
-            self.policy_head
-                .as_ref()
-                .map(|head| head.forward_select_logit_weight)
-                .unwrap_or(0.0)
-        } else {
-            0.0
-        };
-        let forward_select_feature = observation
-            .best_forward_pass_option_quality
-            .max(observation.best_forward_pass_receiver_openness)
-            .clamp(0.0, 1.0);
         let mut push_scored_candidate =
             |candidate: &SoccerLearnedActionTrace, candidate_plan: SoccerLearnedPlan| {
                 if !Self::neural_mcts_candidate_plan_is_executable(
@@ -16360,29 +16087,6 @@ impl SoccerMatch {
                     + retrieved_bonus
                     + model_bonus
                     + mpc_candidate_bonus;
-                // Learned FORWARD action-selection bias. Eligibility: the bias is armed
-                // (`forward_select_weight != 0.0`, which folds in gate-off / no-policy-head), the
-                // candidate is pass-like (`pass_like_action_flight`), AND the candidate PLAN's target
-                // is geometrically FORWARD (`candidate_plan.target_point` vs the carrier, past the
-                // forward-yards deadband) — NOT gated on the label, since lateral/backward passes
-                // share the "pass"/"pass-kpN" label. The applied bonus is
-                // `weight * forward_option_quality` CLAMPED to ±SOCCER_FORWARD_SELECT_BONUS_ABS_MAX so
-                // a large learned weight nudges — rather than swamps — the sort. Added conditionally
-                // (never an always-added 0.0 term) so the gate-off / non-eligible path leaves `score`
-                // bit-for-bit unchanged — the sort below uses `total_cmp`, which separates -0.0/+0.0.
-                let forward_select_eligible = forward_select_weight != 0.0
-                    && pass_like_action_flight(&candidate_plan.action).is_some()
-                    && soccer_plan_target_forward_yards(&candidate_plan, snapshot, player_id, team)
-                        .is_some_and(|yards| yards > SOCCER_FORWARD_SELECT_MIN_FORWARD_YARDS);
-                let score = if forward_select_eligible {
-                    let bonus = (forward_select_weight * forward_select_feature).clamp(
-                        -SOCCER_FORWARD_SELECT_BONUS_ABS_MAX,
-                        SOCCER_FORWARD_SELECT_BONUS_ABS_MAX,
-                    );
-                    score + bonus
-                } else {
-                    score
-                };
                 if !score.is_finite() {
                     return;
                 }
@@ -18790,11 +18494,6 @@ impl SoccerMatch {
                 if diag_on {
                     diag_meta.push((transition.team, action_index, advantage));
                 }
-                // Eligibility for the per-net forward-select scalar's gradient: the taken action
-                // was a forward pass into a good forward option (same geometry as the score-time
-                // bias). In-memory only; irrelevant unless the forward-select gate is on.
-                let forward_select_eligible =
-                    soccer_transition_forward_pass_selection_eligible(transition);
                 let sample = SoccerPolicySample {
                     state_features,
                     action_index,
@@ -18802,7 +18501,6 @@ impl SoccerMatch {
                     old_action_probability,
                     sample_weight,
                     mcts_distillation,
-                    forward_select_eligible,
                 };
                 if option_score_safety_counterexample {
                     option_score_safety_counterexample_samples += 1;
@@ -20718,32 +20416,12 @@ impl SoccerMatch {
                     } else {
                         None
                     };
-                    // ROLLOUT: on the first tick after a fork, force the flagged player's
-                    // action, then self-clear so the remaining horizon follows the base policy.
-                    let forced_rollout_plan: Option<SoccerLearnedPlan> =
-                        match self.rollout_forced_action.take() {
-                            Some((pid, action, target)) if pid == scheduled.id => {
-                                Some(SoccerLearnedPlan {
-                                    action,
-                                    target_player: None,
-                                    target_point: target,
-                                    mpc_replan: None,
-                                })
-                            }
-                            Some(other) => {
-                                self.rollout_forced_action = Some(other);
-                                None
-                            }
-                            None => None,
-                        };
                     let intent = self.players[actor].run_time_step_with_context(
                         &snapshot,
                         mdp_state,
                         observation,
                         input_frame.as_ref().map(|frame| &frame.input),
-                        forced_rollout_plan
-                            .as_ref()
-                            .or_else(|| learned_decision.as_ref().map(|decision| &decision.plan)),
+                        learned_decision.as_ref().map(|decision| &decision.plan),
                         &mut self.rng,
                     );
                     if let Some(learned_decision) = learned_decision.as_ref() {
@@ -21634,17 +21312,6 @@ impl SoccerMatch {
         // Possession changed hands: reseed the carried-ball orbit from the new
         // carrier's geometry next tick (no winding carried over from the loser).
         self.ball.reset_carry_orbit();
-        // Drop a pending learned-MPC dribble aim-residual that belonged to a DIFFERENT carrier so a
-        // stale residual is never credited to whoever just received the ball. Only fires on an actual
-        // change of holder (a same-player re-collection keeps it; `apply_dribble_intent` overwrites it
-        // next tick anyway). This is the general possession-change clear; the dispossession resolve
-        // itself consumes the slot BEFORE this runs (it emits + takes the slot at the top of
-        // `complete_defensive_dispossession`, well before that fn calls `mark_ball_received`), so this
-        // never races the resolve read. No-op when the dribble gate is off (the slot is never
-        // written) or already `None`.
-        if matches!(&self.dribble_mpc_objective, Some((holder, ..)) if *holder != holder_id) {
-            self.dribble_mpc_objective = None;
-        }
     }
 
     fn record_reward_event(&mut self, player_id: usize, amount: f64) {
@@ -24940,7 +24607,7 @@ impl SoccerMatch {
         }
     }
 
-    pub(crate) fn apply_dribble_intent(
+    fn apply_dribble_intent(
         &mut self,
         player_id: usize,
         target: Vec2,
@@ -24969,7 +24636,7 @@ impl SoccerMatch {
             .or_else(|| {
                 snapshot.dribble_away_from_pressure_target_for(player_id, requested_target, kind)
             });
-        let mut target = stationary_escape_target.unwrap_or(requested_target);
+        let target = stationary_escape_target.unwrap_or(requested_target);
         let pressured_shield_escape = stationary_escape_target.is_some()
             && matches!(kind, Some(DribbleMoveKind::ProtectBall))
             && target.distance(requested_target) > 0.10;
@@ -24980,62 +24647,6 @@ impl SoccerMatch {
                 if velocity_along_escape < STATIONARY_HOLDER_ESCAPE_INITIAL_PUSH_YPS {
                     self.players[player_id].velocity += escape
                         * (STATIONARY_HOLDER_ESCAPE_INITIAL_PUSH_YPS - velocity_along_escape);
-                }
-            }
-        }
-        // Learned MPC dribble-objective (gated `DD_SOCCER_ENABLE_LEARNED_MPC_DRIBBLE_OBJECTIVE`,
-        // DEFAULT-OFF). Dribble is a SUSTAINED per-tick action, so instead of a discrete `Pending`
-        // launch→resolve we nudge THIS tick's carry `target` by a hard-bounded
-        // (≤`MPC_OBJECTIVE_MAX_RESIDUAL_YARDS`) FULL 2-D aim residual and stash it in the transient
-        // carry-slot; the delayed beat/turnover outcome credits the LAST residual applied before it
-        // (see `dribble_mpc_objective`). Placed AFTER the shield-escape velocity push so the learned
-        // residual only refines the final carry point, not the escape push. FULL 2-D residual (a
-        // dribble target is a free pitch point, unlike a shot which is x-only).
-        //
-        // BYTE-IDENTICAL-OFF: when the gate is off the entire block is skipped BEFORE any head
-        // clone, feature build, or `mpc_objective_exploration_noise()` RNG draw — so `self.rng` is
-        // untouched and `target` is never reassigned, leaving `to_dribble_target` /
-        // `move_player_towards` (and every derived quantity) bit-for-bit unchanged. The RNG draw and
-        // head clone live strictly INSIDE the gate for exactly this reason (a live pass A/B runs on
-        // this code).
-        if dd_soccer_enable_learned_mpc_dribble_objective() {
-            if let Some(head) = self.mpc_objective_head.clone() {
-                let features = snapshot.mpc_objective_learn_features(
-                    player_team,
-                    MpcObjectiveFamily::Dribble,
-                    player_pos,
-                    target,
-                    pressure,
-                );
-                let sigma = mpc_objective_explore_sigma_yards();
-                // Two standard-normal draws consumed UNCONDITIONALLY here (warm + cold both use
-                // them) so the RNG cadence is identical to the pass path's capture block.
-                let (noise_fwd, noise_lat) = self.mpc_objective_exploration_noise();
-                let residual = if head.is_warm() {
-                    head.explore_residual(&features, sigma, noise_fwd, noise_lat)
-                } else {
-                    // Cold start: explore around the ANALYTIC carry target (zero residual) so the
-                    // head accrues training data before it is trusted live — mirrors the pass path.
-                    Some(Vec2 {
-                        x: (noise_lat * sigma).clamp(
-                            -MPC_OBJECTIVE_MAX_RESIDUAL_YARDS,
-                            MPC_OBJECTIVE_MAX_RESIDUAL_YARDS,
-                        ),
-                        y: (noise_fwd * sigma).clamp(
-                            -MPC_OBJECTIVE_MAX_RESIDUAL_YARDS,
-                            MPC_OBJECTIVE_MAX_RESIDUAL_YARDS,
-                        ),
-                    })
-                };
-                if let Some(r) = residual {
-                    target = (target + r).clamp_to_pitch(
-                        self.config.field_width_yards,
-                        self.config.field_length_yards,
-                    );
-                    // OVERWRITE each tick: the last-applied residual before the delayed outcome is
-                    // what the resolve credits. A dribble carry applies NO curl, so `applied_bend`
-                    // is 0.0 (no bend action is taken — the head's bend axis is unused for dribble).
-                    self.dribble_mpc_objective = Some((player_id, features, r, 0.0));
                 }
             }
         }
@@ -25547,12 +25158,6 @@ impl SoccerMatch {
         if self.keeper_handling_holder() == Some(attacker_id) {
             return;
         }
-        // Learned-MPC dribble-objective NEGATIVE outcome: the carrier just lost the ball, so credit
-        // the last dribble aim residual it applied with the pass-parity failure reward (−1.0). Done
-        // HERE, at the top (holder is still `attacker_id`; the swap happens below), so the slot is
-        // consumed BEFORE this fn's later `mark_ball_received(defender_id)` possession-change clear
-        // could touch it. No-op when the dribble gate is off or the slot is not this carrier's.
-        self.emit_dribble_mpc_objective_sample(attacker_id, -1.0);
         let defender_team = self.players[defender_id].team;
         let defender_name = self.players[defender_id].name.clone();
         let attacker_name = self.players[attacker_id].name.clone();
@@ -25731,16 +25336,6 @@ impl SoccerMatch {
         ) {
             return;
         }
-        // Learned-MPC dribble-objective POSITIVE outcome: a validated beat reinforces the last
-        // dribble aim residual this carrier applied. Emitted AFTER the geometry guard so a rejected
-        // (invalid) contest never credits a residual. The dribble-points reward (2.52..7.0 across
-        // kinds, max = a nutmeg) is NORMALISED into the pass-parity magnitude band [+0.6, +1.0] as
-        // `0.6 + 0.4 * (beat_points / NUTMEG_BEAT_REWARD_POINTS)`: a full-value beat/nutmeg ⇒ ~+1.0,
-        // a plain carry ⇒ ~+0.85, all comfortably above the +0.6 success floor — same 0.6-base +
-        // 0.4-quality shape as `record_pass_outcome_sample`. No-op when the dribble gate is off.
-        let dribble_mpc_reward =
-            0.6 + 0.4 * (kind.beat_reward_points() / NUTMEG_BEAT_REWARD_POINTS).clamp(0.0, 1.0);
-        self.emit_dribble_mpc_objective_sample(attacker_id, dribble_mpc_reward);
         let attacker_lead = carried_ball_lead(&self.players[attacker_id]);
 
         self.ball.holder = Some(attacker_id);
@@ -27840,7 +27435,7 @@ impl SoccerMatch {
                         observation.opponent_goal_angle_degrees,
                     );
                     let use_curl = curl_probability >= 0.46;
-                    let mut base_goal_x = if use_curl {
+                    let base_goal_x = if use_curl {
                         let keeper_x = snapshot
                             .goalkeeper_for(player_team.other())
                             .and_then(|keeper_id| snapshot.player_position(keeper_id))
@@ -27872,66 +27467,6 @@ impl SoccerMatch {
                     } else {
                         goal_center_x
                     };
-                    // Learned MPC execution-objective residual for SHOT PLACEMENT — the shot analogue
-                    // of the pass-lead nudge in the pass launch path (see the `led_target` residual
-                    // above). Gated on the SEPARATE, default-OFF
-                    // `DD_SOCCER_ENABLE_LEARNED_MPC_SHOT_OBJECTIVE` (NOT the default-ON pass gate) so
-                    // shots stay byte-identical / A/B-clean until deliberately enabled. Shot placement
-                    // is inherently LATERAL — the ball must cross the goal line at the fixed `goal_y`,
-                    // and the whole downstream pipeline (`noisy_shot_target_x`, the goal-mouth clamp)
-                    // only touches x — so we apply ONLY the residual's lateral (x) component to the
-                    // analytic aim `base_goal_x` (the mean placement AFTER curl/scored-placement),
-                    // BEFORE `noisy_shot_target_x` adds execution noise, exactly mirroring how the pass
-                    // path shifts the intended `led_target` before its own aim noise. The shifted aim
-                    // then flows through the SAME `.clamp(goal_center_x ± half_goal*1.25)` goal-mouth
-                    // guard below, so the residual can never breach the posts. The captured
-                    // `applied_residual` is `(x, 0.0)` so the RWR target matches what was applied (a
-                    // shot has no forward placement DOF); the bend axis is `0.0` (aim only — power and
-                    // when-to-shoot stay with their own heads, per the shot-placement scope).
-                    let mpc_shot_objective: Option<(Vec<f32>, Vec2, f64)> =
-                        if dd_soccer_enable_learned_mpc_shot_objective() {
-                            if let Some(head) = self.mpc_objective_head.clone() {
-                                let features = snapshot.mpc_objective_learn_features(
-                                    player_team,
-                                    MpcObjectiveFamily::Shot,
-                                    player_pos,
-                                    Vec2::new(base_goal_x, goal_y),
-                                    pressure,
-                                );
-                                let sigma = mpc_objective_explore_sigma_yards();
-                                let (noise_fwd, noise_lat) = self.mpc_objective_exploration_noise();
-                                let residual = if head.is_warm() {
-                                    head.explore_residual(&features, sigma, noise_fwd, noise_lat)
-                                } else {
-                                    // Cold start: explore around the ANALYTIC aim (zero residual) so
-                                    // the head accrues shot-family training data before it is trusted
-                                    // live — identical shape to the pass cold-start jitter.
-                                    Some(Vec2 {
-                                        x: (noise_lat * sigma).clamp(
-                                            -MPC_OBJECTIVE_MAX_RESIDUAL_YARDS,
-                                            MPC_OBJECTIVE_MAX_RESIDUAL_YARDS,
-                                        ),
-                                        y: (noise_fwd * sigma).clamp(
-                                            -MPC_OBJECTIVE_MAX_RESIDUAL_YARDS,
-                                            MPC_OBJECTIVE_MAX_RESIDUAL_YARDS,
-                                        ),
-                                    })
-                                };
-                                residual.map(|r| {
-                                    // Apply the lateral component only; re-clamp to the goal-mouth
-                                    // bounds already used at this site (posts ± execution slack).
-                                    base_goal_x = (base_goal_x + r.x).clamp(
-                                        goal_center_x - half_goal * 1.25,
-                                        goal_center_x + half_goal * 1.25,
-                                    );
-                                    (features, Vec2 { x: r.x, y: 0.0 }, 0.0)
-                                })
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        };
                     let goal = Vec2::new(
                         noisy_shot_target_x(
                             base_goal_x,
@@ -28024,13 +27559,6 @@ impl SoccerMatch {
                         team: player_team,
                         shooter: player_id,
                         origin: player_pos,
-                        // Intended (post-residual, pre-noise) analytic aim: `base_goal_x` here is the
-                        // residual-shifted placement when the shot gate armed, else the pure analytic
-                        // aim. `goal_y` is the goal line. Behaviour-inert when `mpc_objective` is None.
-                        intended_target: Vec2::new(base_goal_x, goal_y),
-                        // Some(features, applied lateral residual (x, 0.0), bend=0.0) ONLY when the
-                        // shot gate armed AND the residual was applied; None otherwise (byte-identical).
-                        mpc_objective: mpc_shot_objective,
                     });
                     self.record_possession_touch(player_id);
                     self.stat_shot(player_team);
@@ -30839,8 +30367,6 @@ impl SoccerMatch {
         self.pending_pass = None;
         self.pending_shot = None;
         self.recent_dispossession = None;
-        // The ball is genuinely loose: no carrier owns a pending dribble residual any more.
-        self.dribble_mpc_objective = None;
         self.possession_swaps.clear();
         self.ball_stationary_ticks = 0;
         self.ball_stuck_anchor = self.ball.position;
@@ -31254,8 +30780,6 @@ impl SoccerMatch {
                 self.stat_shot_on_target(shot.team);
                 self.record_shot_on_target_rewards(shot.team, shot.shooter);
                 self.record_goalkeeper_save_reward(&shot, keeper_id);
-                // Learned-MPC shot-placement credit: on target but the keeper held it (+0.3).
-                self.record_shot_objective_sample(&shot, ShotObjectiveOutcome::Saved);
                 self.stat_save(defending_team);
                 // A secured save (the keeper holds/claims it) is the most valuable stop.
                 self.record_keeper_save_reward(keeper_id, shot.origin, defending_team, 1.0);
@@ -31326,8 +30850,6 @@ impl SoccerMatch {
                 self.ball.last_touch_team = Some(defending_team);
                 self.stat_shot_on_target(shot.team);
                 self.record_shot_on_target_rewards(shot.team, shot.shooter);
-                // Learned-MPC shot-placement credit: on target, parried into a live rebound (+0.6).
-                self.record_shot_objective_sample(&shot, ShotObjectiveOutcome::OnTargetRebound);
                 self.stat_save(defending_team);
                 // A parry denied the goal but conceded a live rebound — a less secure stop than
                 // a clean catch, so it earns a fraction of the full save reward.
@@ -31377,8 +30899,6 @@ impl SoccerMatch {
                 self.pending_rebound = None;
                 if let Some(shot) = shot.as_ref() {
                     self.record_shot_on_target_rewards(shot.team, shot.shooter);
-                    // Learned-MPC shot-placement credit: the placement scored (+1.0).
-                    self.record_shot_objective_sample(shot, ShotObjectiveOutcome::Goal);
                 }
                 self.record_goal_rewards(scoring_team, shot.as_ref().map(|shot| shot.shooter));
                 self.ball.altitude_yards = 0.0;
@@ -31391,9 +30911,6 @@ impl SoccerMatch {
                 self.score_goal(scoring_team);
             }
             BallStepOutcome::Miss { shot } => {
-                // Learned-MPC shot-placement credit: off target (−1.0). Emitted before `shot` moves
-                // into the miss recorder.
-                self.record_shot_objective_sample(&shot, ShotObjectiveOutcome::Missed);
                 self.record_missed_shot_outcome(shot, None);
                 self.pending_shot = None;
                 self.pending_rebound = None;
@@ -31417,13 +30934,6 @@ impl SoccerMatch {
                 } else {
                     None
                 };
-                // Learned-MPC shot-placement credit: a TERMINAL block is a placement failure (−1.0).
-                // When `keep_shot_active` the shot stays live (its captured `mpc_objective` rides
-                // along in the cloned `PendingShot`) and will be sampled at its eventual terminal
-                // outcome, so we do NOT emit here — that avoids crediting one shot twice.
-                if !keep_shot_active {
-                    self.record_shot_objective_sample(&shot, ShotObjectiveOutcome::Missed);
-                }
                 self.ball.position = position;
                 self.ball.velocity = velocity;
                 self.ball.holder = None;
@@ -31488,9 +30998,6 @@ impl SoccerMatch {
                 self.ball.untargeted_long_ball_flight = None;
                 self.ball.untargeted_long_ball_launcher = None;
                 if let Some(shot) = shot {
-                    // Learned-MPC shot-placement credit: shot left play off target (−1.0). Emitted
-                    // before `shot` moves into the miss recorder.
-                    self.record_shot_objective_sample(&shot, ShotObjectiveOutcome::Missed);
                     self.record_missed_shot_outcome(shot, Some(shot_off_target_yards));
                 }
                 let restart_kind = restart.kind;
@@ -33762,87 +33269,6 @@ impl SoccerMatch {
         if self.pass_outcome_samples.len() > SOCCER_PASS_OUTCOME_SAMPLE_CAP {
             let overflow = self.pass_outcome_samples.len() - SOCCER_PASS_OUTCOME_SAMPLE_CAP;
             self.pass_outcome_samples.drain(0..overflow);
-        }
-    }
-
-    /// Emit a learned-MPC-objective (executor-head) training sample from a resolved SHOT — the shot
-    /// analogue of the MPC block inside [`Self::record_pass_outcome_sample`]. Reinforces the applied
-    /// aim-PLACEMENT residual by the delayed shot outcome, pushed into the SAME
-    /// `mpc_objective_samples` buffer the pass path uses (the shared head's SHOT-family rows are
-    /// separated by the family one-hot baked into `features`, so the learner needs no shot-specific
-    /// plumbing). No-op unless the shot armed the residual at launch (`shot.mpc_objective` is Some,
-    /// i.e. `dd_soccer_enable_learned_mpc_shot_objective()` was on + the head present) — so when the
-    /// shot gate is off this never pushes a sample and is fully behaviour-neutral.
-    ///
-    /// Reward mapping (magnitudes mirror the pass path: completed ≈ +0.6..+1.0, failed −1.0):
-    /// goal ⇒ +1.0, on-target rebound/parry ⇒ +0.6, held save ⇒ +0.3, off-target/blocked/OOB ⇒ −1.0.
-    /// RWR ([`SoccerMpcObjectiveHead::train_rwr`]) trains only on positive advantage, so the
-    /// goal/rebound/save samples reinforce their placement while the negative miss/block samples are
-    /// recorded (corpus parity with the pass path) but skipped in training.
-    fn record_shot_objective_sample(&mut self, shot: &PendingShot, outcome: ShotObjectiveOutcome) {
-        let reward = match outcome {
-            ShotObjectiveOutcome::Goal => 1.0,
-            ShotObjectiveOutcome::OnTargetRebound => 0.6,
-            ShotObjectiveOutcome::Saved => 0.3,
-            ShotObjectiveOutcome::Missed => -1.0,
-        };
-        if let Some((features, residual, applied_bend)) = shot.mpc_objective.as_ref() {
-            if features.len() == MPC_OBJECTIVE_FEATURE_DIM {
-                self.mpc_objective_samples.push(MpcObjectiveSample {
-                    features: features.clone(),
-                    applied_residual: *residual,
-                    applied_bend: *applied_bend,
-                    reward,
-                });
-                if self.mpc_objective_samples.len() > MPC_OBJECTIVE_SAMPLE_CAP {
-                    let overflow = self.mpc_objective_samples.len() - MPC_OBJECTIVE_SAMPLE_CAP;
-                    self.mpc_objective_samples.drain(0..overflow);
-                }
-            }
-        }
-    }
-
-    /// Emit the pending learned-MPC DRIBBLE aim-residual RWR sample (the dribble analogue of the
-    /// MPC block in [`Self::record_pass_outcome_sample`] / [`Self::record_shot_objective_sample`])
-    /// and CLEAR the transient carry-slot. Pushed into the SAME `mpc_objective_samples` buffer the
-    /// pass/shot paths use — the shared head's DRIBBLE-family rows are separated by the family
-    /// one-hot baked into `features`, so the learner needs no dribble-specific plumbing.
-    ///
-    /// No-op unless the dribble gate is on AND the carry-slot belongs to `attacker_id` (the carrier
-    /// whose dribble is resolving). The holder guard is what stops a stale residual from a prior
-    /// carrier being credited to this outcome; the slot is CONSUMED (taken) so it cannot be
-    /// double-emitted. When the gate is off the slot is always `None`, so this is fully
-    /// behaviour-neutral (byte-identical-off).
-    ///
-    /// Reward mapping (magnitudes mirror the pass/shot paths — success ≈ +0.6..+1.0, failure −1.0):
-    /// the beat/advance caller passes a positive reward normalised from `kind.beat_reward_points()`
-    /// (see [`Self::record_dribble_beat_event`]); the turnover caller passes −1.0. RWR
-    /// ([`SoccerMpcObjectiveHead::train_rwr`]) trains only on positive advantage, so the beat sample
-    /// reinforces its residual while the turnover sample is recorded (corpus parity) but skipped.
-    fn emit_dribble_mpc_objective_sample(&mut self, attacker_id: usize, reward: f64) {
-        if !dd_soccer_enable_learned_mpc_dribble_objective() {
-            return;
-        }
-        let holder_matches = matches!(
-            self.dribble_mpc_objective.as_ref(),
-            Some((holder, ..)) if *holder == attacker_id
-        );
-        if !holder_matches {
-            return;
-        }
-        if let Some((_, features, residual, bend)) = self.dribble_mpc_objective.take() {
-            if features.len() == MPC_OBJECTIVE_FEATURE_DIM {
-                self.mpc_objective_samples.push(MpcObjectiveSample {
-                    features,
-                    applied_residual: residual,
-                    applied_bend: bend,
-                    reward,
-                });
-                if self.mpc_objective_samples.len() > MPC_OBJECTIVE_SAMPLE_CAP {
-                    let overflow = self.mpc_objective_samples.len() - MPC_OBJECTIVE_SAMPLE_CAP;
-                    self.mpc_objective_samples.drain(0..overflow);
-                }
-            }
         }
     }
 

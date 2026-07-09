@@ -399,13 +399,7 @@ fn eval(candidate_path: &str, baseline_path: &str, games: usize, minutes: f64, h
         // ---- Pass diagnosis: separate WHO/WHEN (POMDP selection) from HOW (MPC execution) ----
         // completion rate = completed/attempted (low ⇒ passes fail in flight ⇒ execution/aim = MPC).
         // forward share  = forward/completed (low ⇒ policy recycles laterally/back ⇒ selection = POMDP).
-        let pct = |num: u64, den: u64| {
-            if den > 0 {
-                100.0 * num as f64 / den as f64
-            } else {
-                0.0
-            }
-        };
+        let pct = |num: u64, den: u64| if den > 0 { 100.0 * num as f64 / den as f64 } else { 0.0 };
         let fwd_share = |fwd: u64, comp: u64| pct(fwd, comp);
         println!("\n===== PASS DIAGNOSIS (WHO/WHEN vs HOW) =====");
         println!(

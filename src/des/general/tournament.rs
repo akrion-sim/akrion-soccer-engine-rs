@@ -23,9 +23,9 @@
 //! always produce the same bracket and champion.
 
 use crate::des::general::soccer::{
-    learned_mpc_objective_enabled, MatchConfig, MatchStats, MatchSummary, MpcObjectiveSample,
-    SoccerMatch, SoccerMpcObjectiveHead, SoccerNeuralLearningBackend, SoccerNeuralNetworkSnapshot,
-    SoccerQPolicy, SoccerQPolicyOptions, SoccerQTargetEntry, SoccerTeamQPolicies, Team,
+    MatchConfig, MatchStats, MatchSummary, SoccerMatch, SoccerMpcObjectiveHead,
+    SoccerNeuralLearningBackend, SoccerNeuralNetworkSnapshot, SoccerQPolicy, SoccerQPolicyOptions,
+    SoccerQTargetEntry, SoccerTeamQPolicies, Team,
 };
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -1485,45 +1485,6 @@ fn engine_match_uniform_elite_players_enabled() -> bool {
         .unwrap_or(false)
 }
 
-const ENGINE_MATCH_MPC_OBJECTIVE_TRAIN_PASSES: usize = 4;
-const ENGINE_MATCH_MPC_OBJECTIVE_BASE_LR: f64 = 0.05;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct EngineMpcObjectiveTrainingReport {
-    samples: usize,
-    trained_steps: usize,
-    training_steps: usize,
-    warm: bool,
-}
-
-fn engine_match_trains_mpc_objective(ctx: &TournamentMatchContext) -> bool {
-    learned_mpc_objective_enabled() && (ctx.home_learns || ctx.away_learns)
-}
-
-fn train_engine_match_mpc_objective_head(
-    config: &mut EngineMatchRunnerConfig,
-    samples: &[MpcObjectiveSample],
-    seed: u32,
-) -> Option<EngineMpcObjectiveTrainingReport> {
-    if !learned_mpc_objective_enabled() || samples.is_empty() {
-        return None;
-    }
-    let head = config
-        .mpc_objective_head
-        .get_or_insert_with(|| SoccerMpcObjectiveHead::new(seed));
-    let mut trained_steps = 0usize;
-    for _ in 0..ENGINE_MATCH_MPC_OBJECTIVE_TRAIN_PASSES {
-        trained_steps = trained_steps
-            .saturating_add(head.train_rwr(samples, ENGINE_MATCH_MPC_OBJECTIVE_BASE_LR));
-    }
-    Some(EngineMpcObjectiveTrainingReport {
-        samples: samples.len(),
-        trained_steps,
-        training_steps: head.training_steps(),
-        warm: head.is_warm(),
-    })
-}
-
 impl EngineMatchRunner {
     pub fn new(config: EngineMatchRunnerConfig) -> Self {
         EngineMatchRunner { config }
@@ -1545,9 +1506,6 @@ impl TournamentMatchRunner for EngineMatchRunner {
         home: &TeamBrain,
         away: &TeamBrain,
     ) -> Result<MatchOutcome, String> {
-        if engine_match_trains_mpc_objective(ctx) && self.config.mpc_objective_head.is_none() {
-            self.config.mpc_objective_head = Some(SoccerMpcObjectiveHead::new(ctx.seed));
-        }
         let mut config = self.config.base.clone();
         config.seed = ctx.seed;
 
@@ -1670,16 +1628,6 @@ impl TournamentMatchRunner for EngineMatchRunner {
         }
         // Flush any in-flight neural training so extracted brains are current.
         sim.drain_neural_learning(Duration::from_millis(500));
-        let mpc_objective_samples = if engine_match_trains_mpc_objective(ctx) {
-            sim.drain_mpc_objective_samples()
-        } else {
-            Vec::new()
-        };
-        let mpc_objective_training = train_engine_match_mpc_objective_head(
-            &mut self.config,
-            &mpc_objective_samples,
-            ctx.seed,
-        );
 
         let home_goals = sim.score_home;
         let away_goals = sim.score_away;
@@ -1703,17 +1651,6 @@ impl TournamentMatchRunner for EngineMatchRunner {
             home_training_steps,
             away_training_steps
         );
-        if let Some(report) = mpc_objective_training {
-            eprintln!(
-                "tournament_mpc_objective_training home={} away={} samples={} trained_steps={} training_steps={} warm={}",
-                ctx.home_id,
-                ctx.away_id,
-                report.samples,
-                report.trained_steps,
-                report.training_steps,
-                report.warm
-            );
-        }
 
         // Carry forward each side's (possibly updated) brain.
         let home_brain = carry_brain(
@@ -1781,35 +1718,6 @@ fn carry_brain(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::des::general::soccer::{Vec2, MPC_OBJECTIVE_FEATURE_DIM};
-    use std::sync::{Mutex, OnceLock};
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &'static str) -> Self {
-            let previous = std::env::var(key).ok();
-            std::env::set_var(key, value);
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(previous) => std::env::set_var(self.key, previous),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
 
     fn fresh_teams(count: usize, seed: u32) -> Vec<TournamentTeam> {
         (0..count)
@@ -1839,33 +1747,6 @@ mod tests {
             crate::des::general::soccer::DEFAULT_DT_SECONDS
         );
         assert_eq!(config.base.total_ticks(), 18_000);
-    }
-
-    #[test]
-    fn engine_runner_trains_carried_mpc_objective_head_from_match_samples() {
-        let _lock = env_lock().lock().unwrap();
-        let _guard = EnvVarGuard::set("DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE", "1");
-        let mut config = EngineMatchRunnerConfig::default();
-        let sample = MpcObjectiveSample {
-            features: vec![0.3f32; MPC_OBJECTIVE_FEATURE_DIM],
-            applied_residual: Vec2 { x: 0.75, y: 1.0 },
-            applied_bend: 0.0,
-            reward: 1.25,
-        };
-
-        let report = train_engine_match_mpc_objective_head(&mut config, &[sample], 91)
-            .expect("enabled MPC objective samples should train the carried head");
-
-        assert!(config.mpc_objective_head.is_some());
-        assert_eq!(report.samples, 1);
-        assert_eq!(
-            report.trained_steps,
-            ENGINE_MATCH_MPC_OBJECTIVE_TRAIN_PASSES
-        );
-        assert_eq!(
-            report.training_steps,
-            ENGINE_MATCH_MPC_OBJECTIVE_TRAIN_PASSES
-        );
     }
 
     fn small_format() -> TournamentFormat {
