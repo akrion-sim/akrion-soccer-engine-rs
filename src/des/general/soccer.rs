@@ -5494,6 +5494,21 @@ const DEFAULT_SOCCER_POLICY_HIDDEN_UNITS: usize = 24;
 const MIN_SOCCER_POLICY_HIDDEN_UNITS: usize = 8;
 const MAX_SOCCER_POLICY_HIDDEN_UNITS: usize = 512;
 const SOCCER_POLICY_LEARNING_RATE: f64 = 0.05;
+/// Learnable range for the per-net forward action-selection bias WEIGHT
+/// ([`SoccerPolicyHead::forward_select_logit_weight`]): the policy-gradient update clamps the weight
+/// to `[0, MAX]` (the bias only ever nudges TOWARD forward, never away). The *applied* bias is
+/// bounded separately by [`SOCCER_FORWARD_SELECT_BONUS_ABS_MAX`], so a large learned weight can keep
+/// pushing the gradient without letting the bonus swamp candidate scoring.
+const SOCCER_FORWARD_SELECT_LOGIT_WEIGHT_MAX: f64 = 8.0;
+/// Absolute cap on the *applied* forward-select bonus term (`weight * forward_option_quality`). Held
+/// comparable in magnitude to the centered actor bonus (~±0.25, cf. `SOCCER_CENTERED_POLICY_BONUS_CLIP`)
+/// so it NUDGES — rather than dominates — the candidate sort against `value_score` / `actor_bonus`.
+const SOCCER_FORWARD_SELECT_BONUS_ABS_MAX: f64 = 0.25;
+/// Minimum forward progress (yards, along the attacking direction) for a pass TARGET to count as
+/// geometrically FORWARD for the forward-select bias. Matches the engine's existing forward deadband
+/// so lateral jitter (~0 forward progress) and backward balls do NOT qualify — the whole point of the
+/// bias is to isolate genuinely forward SELECTIONS, not the stuck lateral/backward ones.
+const SOCCER_FORWARD_SELECT_MIN_FORWARD_YARDS: f64 = 1.25;
 /// Default entropy bonus — keeps the actor from collapsing onto one family too early.
 /// Override with `SOCCER_POLICY_ENTROPY_COEFF` when local runs show policy entropy
 /// falling into a safe-action plateau.
@@ -20422,6 +20437,36 @@ pub(crate) struct PendingShot {
     team: Team,
     shooter: usize,
     origin: Vec2,
+    /// The INTENDED analytic shot aim (post-residual, pre-execution-noise) captured at launch — the
+    /// goal-mouth point `(base_goal_x, goal_y)` the shot was placed at AFTER the learned MPC
+    /// shot-placement residual (when armed) shifted it, and BEFORE `noisy_shot_target_x` added
+    /// execution noise. Mirrors [`PendingPass::intended_target`]. When the shot gate is off this is
+    /// simply the pure analytic aim (the residual is not applied), and it is behaviour-inert — no
+    /// sample is emitted, so nothing reads it.
+    intended_target: Vec2,
+    /// Captured AT LAUNCH for the learned MPC execution-objective head, exactly like
+    /// [`PendingPass::mpc_objective`]: the [`MPC_OBJECTIVE_FEATURE_DIM`] feature vector, the bounded
+    /// aim-PLACEMENT residual actually applied to this shot (the RWR "action" — a shot's placement is
+    /// lateral, so this is `(residual_x, 0.0)`), and `0.0` for the bend axis (shot placement shapes
+    /// AIM only, never curl/power). When the shot resolves it is emitted as an [`MpcObjectiveSample`]
+    /// whose reward is the delayed goal/save/miss outcome. `None` ⇒ the shot gate was off or the head
+    /// was absent at launch (no sample), so a `None` here is fully behaviour-neutral.
+    mpc_objective: Option<(Vec<f32>, Vec2, f64)>,
+}
+
+/// Terminal outcome of a resolved shot, used only to attribute the learned-MPC shot-PLACEMENT
+/// reward in [`SoccerMatch::record_shot_objective_sample`]. Separate from the many analytic shot
+/// reward paths — this is purely the RWR credit for the executor head's aim residual.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ShotObjectiveOutcome {
+    /// The shot scored — maximal placement success.
+    Goal,
+    /// On target but parried into a live rebound — beat the keeper's line, not the net.
+    OnTargetRebound,
+    /// On target but the keeper held it — reachable placement.
+    Saved,
+    /// Off target, blocked (terminally), or out of play — the placement failure.
+    Missed,
 }
 
 #[derive(Clone, Debug)]
@@ -38847,6 +38892,11 @@ pub struct SoccerPolicyHeadSnapshot {
     pub specialist_heads: Vec<SoccerPolicySpecialistHeadSnapshot>,
     #[serde(default)]
     pub role_heads: Vec<SoccerPolicyRoleHeadSnapshot>,
+    /// Per-net learned FORWARD action-selection bias weight (see
+    /// [`SoccerPolicyHead::forward_select_logit_weight`]). `#[serde(default)]` ⇒ pre-existing
+    /// snapshots without the field restore to 0.0 (the disabled / byte-identical default).
+    #[serde(default)]
+    pub forward_select_logit_weight: f64,
 }
 
 /// Legacy pass-specific scalar feature count: distance, forward progress, lateral, passer pressure,
@@ -39051,6 +39101,64 @@ pub fn learned_mpc_objective_enabled() -> bool {
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE"))
+    }
+}
+
+/// Env flag enabling the learned MPC execution-objective head for SHOT PLACEMENT specifically — the
+/// shot analogue of the pass wiring behind [`learned_mpc_objective_enabled`]. When on (and the head
+/// is present) a bounded (≤[`MPC_OBJECTIVE_MAX_RESIDUAL_YARDS`]) LATERAL aim residual nudges the
+/// analytic shot placement (`base_goal_x`) along the goal mouth BEFORE `noisy_shot_target_x` adds
+/// execution noise, and the delayed shot outcome trains the SHARED head's SHOT-family rows via RWR
+/// (the family one-hot in `mpc_objective_learn_features` separates shot from pass rows).
+///
+/// PLAIN env-flag semantics, DEFAULT-OFF (this is NOT a [`gate_default_on`] gate): opt-in via
+/// `DD_SOCCER_ENABLE_LEARNED_MPC_SHOT_OBJECTIVE=1|true|yes|on`. Deliberately SEPARATE from the
+/// (default-ON) pass gate [`learned_mpc_objective_enabled`]: reusing that gate would silently turn
+/// shot placement on in production and break the byte-identical-off / clean-A/B contract. Off ⇒ no
+/// residual is applied and no shot MPC sample is captured, so shot aim + ball velocity are unchanged.
+pub(crate) fn dd_soccer_enable_learned_mpc_shot_objective() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_LEARNED_MPC_SHOT_OBJECTIVE")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED
+            .get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_LEARNED_MPC_SHOT_OBJECTIVE"))
+    }
+}
+
+/// Env flag enabling the learned MPC execution-objective head for DRIBBLE CARRY specifically — the
+/// dribble analogue of the pass/shot wiring. When on (and the head is present) a bounded
+/// (≤[`MPC_OBJECTIVE_MAX_RESIDUAL_YARDS`]) FULL 2-D aim residual nudges the analytic dribble carry
+/// target each tick (dribble is a SUSTAINED per-tick action, not a discrete launch→resolve), and the
+/// delayed carry outcome — beating a man / advancing vs. being dispossessed — trains the SHARED
+/// head's DRIBBLE-family rows via RWR (the family one-hot in `mpc_objective_learn_features` separates
+/// dribble from pass/shot rows). Because the outcome is delayed and per-tick, the applied residual is
+/// stashed in a transient carry-slot (`SoccerMatch::dribble_mpc_objective`) OVERWRITTEN each tick;
+/// the last residual before the outcome is what gets credited (a deliberate delayed-credit approx).
+///
+/// PLAIN env-flag semantics, DEFAULT-OFF (this is NOT a [`gate_default_on`] gate): opt-in via
+/// `DD_SOCCER_ENABLE_LEARNED_MPC_DRIBBLE_OBJECTIVE=1|true|yes|on`. Deliberately SEPARATE from the
+/// (default-ON) pass gate [`learned_mpc_objective_enabled`] and the (default-OFF) shot gate
+/// [`dd_soccer_enable_learned_mpc_shot_objective`]: reusing either would silently turn dribble
+/// refinement on and break the byte-identical-off / clean-A/B contract. Off ⇒ no residual is applied,
+/// the carry-slot is never written (stays `None`), and no dribble MPC sample is captured — the carry
+/// target, the RNG stream, and all ball/player motion are bit-for-bit unchanged.
+pub(crate) fn dd_soccer_enable_learned_mpc_dribble_objective() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_LEARNED_MPC_DRIBBLE_OBJECTIVE")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            soccer_env_flag_enabled("DD_SOCCER_ENABLE_LEARNED_MPC_DRIBBLE_OBJECTIVE")
+        })
     }
 }
 
@@ -40440,6 +40548,11 @@ struct SoccerPolicySample {
     old_action_probability: Option<f64>,
     sample_weight: f64,
     mcts_distillation: bool,
+    /// In-memory only (not serialized): the sampled action was a FORWARD pass into a good forward
+    /// option — a pass-like transition whose target is geometrically forward of the carrier (same
+    /// definition as the score-time forward-select bias). Trains the per-net
+    /// `forward_select_logit_weight`; irrelevant when that gate is off.
+    forward_select_eligible: bool,
 }
 
 #[derive(Clone, Default)]
@@ -40835,6 +40948,12 @@ pub(crate) struct SoccerPolicyHead {
     role_heads: Vec<SoccerPolicyRoleHead>,
     training_steps: usize,
     last_loss: Option<f64>,
+    /// Learned scalar that, under `DD_SOCCER_ENABLE_FORWARD_SELECT_LOGIT`, adds a pre-choice
+    /// additive bias to FORWARD pass candidates proportional to the visible forward-option quality
+    /// — isolating action SELECTION (the diagnosed bottleneck: the actor keeps choosing
+    /// lateral/safe). Baked per-net into the snapshot so eval is not env-confounded. 0.0 (the init /
+    /// restore-from-legacy default) ⇒ no effect, so the scored-candidate path is byte-identical.
+    forward_select_logit_weight: f64,
 }
 
 impl SoccerPolicyHead {
@@ -40846,6 +40965,7 @@ impl SoccerPolicyHead {
                 .collect(),
             training_steps: 0,
             last_loss: None,
+            forward_select_logit_weight: 0.0,
         }
     }
 
@@ -40920,6 +41040,44 @@ impl SoccerPolicyHead {
             self.training_steps = self.training_steps.saturating_add(applied);
             self.last_loss = Some(loss_sum / applied as f64);
         }
+        self.train_forward_select_logit_weight(samples);
+    }
+
+    /// Policy-gradient update for the per-net FORWARD action-selection bias scalar. Accumulates an
+    /// advantage-weighted, forward-option-quality-gated gradient (`Σ advantage · feature` over the
+    /// samples flagged `forward_select_eligible` — i.e. that were forward passes into a good forward
+    /// option), steps the weight with the existing policy LR, and clamps to `[0, MAX]`. Gated by
+    /// `DD_SOCCER_ENABLE_FORWARD_SELECT_LOGIT` (default OFF), so the default path never touches the
+    /// weight: it stays 0.0 and the scored-candidate bonus is 0 ⇒ byte-identical. Kept separate from
+    /// the role-head PG loop above so that update is undisturbed.
+    ///
+    /// `feature` is read from `state_features[SOCCER_NEURAL_FEATURE_FORWARD_OPTION_QUALITY]`, which
+    /// (via `soccer_neural_unit`) holds exactly the same clamped
+    /// `best_forward_pass_option_quality.max(best_forward_pass_receiver_openness)` used to size the
+    /// score-time bonus, keeping the training signal and the applied bias on the same feature.
+    fn train_forward_select_logit_weight(&mut self, samples: &[SoccerPolicySample]) {
+        if !dd_soccer_enable_forward_select_logit() {
+            return;
+        }
+        let mut gradient = 0.0;
+        for sample in samples {
+            if !sample.forward_select_eligible {
+                continue;
+            }
+            let feature = sample.state_features[SOCCER_NEURAL_FEATURE_FORWARD_OPTION_QUALITY];
+            let term = sample.advantage * feature;
+            if term.is_finite() {
+                gradient += term;
+            }
+        }
+        if gradient == 0.0 || !gradient.is_finite() {
+            return;
+        }
+        let updated = self.forward_select_logit_weight + SOCCER_POLICY_LEARNING_RATE * gradient;
+        if updated.is_finite() {
+            self.forward_select_logit_weight =
+                updated.clamp(0.0, SOCCER_FORWARD_SELECT_LOGIT_WEIGHT_MAX);
+        }
     }
 }
 
@@ -40993,6 +41151,28 @@ mod soccer_policy_actor_capacity_tests {
             64
         );
         assert_eq!(forward.network.layers.last().unwrap().weights[0].len(), 64);
+    }
+
+    #[test]
+    fn forward_select_logit_weight_round_trips_and_defaults_to_zero() {
+        let _lock = env_lock();
+        // Fresh head: the scalar initializes to 0.0 (the disabled / byte-identical default).
+        let mut head = SoccerPolicyHead::new(21);
+        assert_eq!(head.forward_select_logit_weight, 0.0);
+
+        // A trained value survives snapshot -> restore.
+        head.forward_select_logit_weight = 2.5;
+        let snapshot = soccer_policy_head_snapshot(&head);
+        assert_eq!(snapshot.forward_select_logit_weight, 2.5);
+        let restored = soccer_policy_head_from_snapshot(&snapshot, 21).expect("restore policy");
+        assert_eq!(restored.forward_select_logit_weight, 2.5);
+
+        // A non-finite stored weight (e.g. corrupt / legacy) restores to the 0.0 default.
+        let mut corrupt = soccer_policy_head_snapshot(&SoccerPolicyHead::new(21));
+        corrupt.forward_select_logit_weight = f64::NAN;
+        let restored_corrupt =
+            soccer_policy_head_from_snapshot(&corrupt, 21).expect("restore corrupt policy");
+        assert_eq!(restored_corrupt.forward_select_logit_weight, 0.0);
     }
 
     #[test]
@@ -42822,6 +43002,7 @@ fn soccer_policy_head_snapshot(head: &SoccerPolicyHead) -> SoccerPolicyHeadSnaps
             .iter()
             .map(soccer_policy_role_head_snapshot)
             .collect(),
+        forward_select_logit_weight: head.forward_select_logit_weight,
     }
 }
 
@@ -42916,6 +43097,11 @@ fn soccer_policy_head_from_snapshot(
             .fold((0.0, 0usize), |(sum, count), loss| (sum + loss, count + 1));
         (count > 0).then_some(sum / count as f64)
     });
+    head.forward_select_logit_weight = if snapshot.forward_select_logit_weight.is_finite() {
+        snapshot.forward_select_logit_weight
+    } else {
+        0.0
+    };
     Ok(head)
 }
 
@@ -63421,6 +63607,26 @@ pub(crate) fn dd_soccer_enable_forward_option_recognition() -> bool {
         use std::sync::OnceLock;
         static V: OnceLock<bool> = OnceLock::new();
         *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_FORWARD_OPTION_RECOGNITION"))
+    }
+}
+
+/// LEARNED FORWARD ACTION-SELECTION BIAS. When on, the trained per-net scalar
+/// [`SoccerPolicyHead::forward_select_logit_weight`] adds a pre-choice additive bias to *forward*
+/// pass candidates (proportional to the visible forward-option quality) at candidate-scoring time,
+/// and the same scalar is trained by an advantage-weighted policy gradient over forward-pass
+/// samples. PLAIN env-flag semantics, DEFAULT-OFF (this is NOT a `gate_default_on` gate): opt-in
+/// via `DD_SOCCER_ENABLE_FORWARD_SELECT_LOGIT=1|true|yes|on`. Off (and/or weight 0.0) ⇒ the bonus
+/// term is 0 and the weight is never updated, so scoring and training are byte-identical to today.
+pub(crate) fn dd_soccer_enable_forward_select_logit() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_FORWARD_SELECT_LOGIT")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_FORWARD_SELECT_LOGIT"))
     }
 }
 
