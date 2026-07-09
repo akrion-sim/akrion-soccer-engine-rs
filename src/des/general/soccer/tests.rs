@@ -67036,6 +67036,8 @@ fn fast_shot_scores_from_goal_line_crossing_even_when_tick_overshoots() {
         team: Team::Home,
         shooter: 9,
         origin: sim.ball.position,
+        intended_target: Vec2::zero(),
+        mpc_objective: None,
     });
 
     sim.integrate_ball();
@@ -67072,6 +67074,8 @@ fn shot_crossing_outside_posts_is_not_goal() {
         team: Team::Home,
         shooter: 9,
         origin: sim.ball.position,
+        intended_target: Vec2::zero(),
+        mpc_objective: None,
     });
 
     sim.integrate_ball();
@@ -67308,6 +67312,8 @@ fn shot_crossing_just_inside_configured_goalmouth_counts() {
         team: Team::Home,
         shooter: 9,
         origin: sim.ball.position,
+        intended_target: Vec2::zero(),
+        mpc_objective: None,
     });
 
     sim.integrate_ball();
