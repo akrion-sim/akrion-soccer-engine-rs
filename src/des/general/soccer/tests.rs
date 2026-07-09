@@ -42456,15 +42456,15 @@ fn learning_context_splits_mdp_pomdp_idea_from_mpc_execution() {
 
 #[test]
 fn action_param_feature_block_occupies_the_tail() {
-    // The 11 action-param slots are contiguous and sit at the very tail, immediately after
+    // The 10 action-param slots are contiguous and sit at the very tail, immediately after
     // the previous FEATURE_DIM, so pre-block nets zero-pad exactly these positions and the
     // gate-off path (which never writes them) is byte-identical to the prior layout. The
-    // first 7 are the attack-relative aim geometry; the last 4 are the action identity/power
-    // (speed + pass/shoot/dribble one-hot).
-    assert_eq!(SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM, 11);
+    // first 6 are the attack-relative aim geometry (no absolute dy — forward carries it
+    // side-invariantly); the last 4 are the action identity/power (speed + pass/shoot/dribble
+    // one-hot).
+    assert_eq!(SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM, 10);
     let slots = [
         SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DX,
-        SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DY,
         SOCCER_NEURAL_FEATURE_ACTION_PARAM_DISTANCE,
         SOCCER_NEURAL_FEATURE_ACTION_PARAM_FORWARD,
         SOCCER_NEURAL_FEATURE_ACTION_PARAM_DIR_SIN,
@@ -42482,6 +42482,63 @@ fn action_param_feature_block_occupies_the_tail() {
         SOCCER_NEURAL_FEATURE_ACTION_PARAM_IS_DRIBBLE,
         SOCCER_NEURAL_FEATURE_DIM - 1
     );
+}
+
+#[test]
+fn action_param_aim_and_identity_features_encode_expected_content() {
+    // Gate-ON CONTENT test (Codex review): exercise the pure helpers the encoder delegates to,
+    // so we cover the actual per-slot math without building a full transition.
+    //
+    // Aim geometry is attack-relative. A target 30yd toward the ATTACKING goal for Home
+    // (attack_dir = +1, +y is the attack direction here) and 12yd to the side:
+    let ball = Vec2 { x: 40.0, y: 50.0 };
+    let target = Vec2 {
+        x: ball.x + 12.0,
+        y: ball.y + 30.0,
+    };
+    let attack_dir = Team::Home.attack_dir();
+    let (dx, distance, forward, dir_sin, dir_cos) =
+        soccer_action_param_aim_features(target, ball, attack_dir);
+    assert_eq!(dx, soccer_neural_signed_unit(12.0 / 40.0));
+    let dist = (12.0f64 * 12.0 + 30.0 * 30.0).sqrt();
+    assert_eq!(distance, soccer_neural_scaled(dist, 60.0));
+    // Forward is + when the target is toward the attacking goal.
+    assert!(forward > 0.0, "toward-goal aim must read positive forward");
+    assert_eq!(forward, soccer_neural_signed_unit(30.0 * attack_dir / 50.0));
+    assert!((dir_sin - (12.0 / dist)).abs() < 1e-9);
+    assert!((dir_cos - (30.0 * attack_dir / dist)).abs() < 1e-9);
+
+    // Side-invariance: the SAME on-pitch geometry mirrored for the Away team (which attacks
+    // -y) must produce the SAME forward-ness and dir_cos — the whole point of dropping the
+    // absolute dy. Away target 30yd toward ITS goal = ball.y - 30.
+    let away_target = Vec2 {
+        x: ball.x + 12.0,
+        y: ball.y - 30.0,
+    };
+    let (_dx_a, _dist_a, forward_a, _sin_a, dir_cos_a) =
+        soccer_action_param_aim_features(away_target, ball, Team::Away.attack_dir());
+    assert!(
+        (forward - forward_a).abs() < 1e-9,
+        "attack-relative forward must be side-invariant: {forward} vs {forward_a}"
+    );
+    assert!((dir_cos - dir_cos_a).abs() < 1e-9);
+
+    // Degenerate aim (target == ball): distance 0, direction unit vector (0, 0).
+    let (_dx0, distance0, _fwd0, sin0, cos0) =
+        soccer_action_param_aim_features(ball, ball, attack_dir);
+    assert_eq!(distance0, soccer_neural_scaled(0.0, 60.0));
+    assert_eq!((sin0, cos0), (0.0, 0.0));
+
+    // Identity/power one-hot: a pass, a shot, and a dribble each light exactly their own flag;
+    // speed is scaled. (Reuses main's family helpers, so this also pins that wiring.)
+    let (pass_speed, is_pass, is_shoot, is_dribble) =
+        soccer_action_param_identity_features("pass", 18.0);
+    assert_eq!(pass_speed, soccer_neural_scaled(18.0, 36.0));
+    assert_eq!((is_pass, is_shoot, is_dribble), (1.0, 0.0, 0.0));
+    let (_s, p, sh, dr) = soccer_action_param_identity_features("shoot", 30.0);
+    assert_eq!((p, sh, dr), (0.0, 1.0, 0.0));
+    let (_s2, p2, sh2, dr2) = soccer_action_param_identity_features("dribble", 6.0);
+    assert_eq!((p2, sh2, dr2), (0.0, 0.0, 1.0));
 }
 
 #[test]
