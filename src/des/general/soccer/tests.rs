@@ -16851,8 +16851,12 @@ fn pomdp_q_state_and_player_decision_use_front_behind_field_context() {
             + SOCCER_NEURAL_SAME_TEAM_SEPARATION_FEATURE_DIM
     );
     assert_eq!(
-        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM,
         SOCCER_NEURAL_PRE_DECISION_CONTEXT_FEATURE_DIM + SOCCER_NEURAL_DECISION_CONTEXT_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM + SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM
     );
 
     let mut stale_observation = observation.clone();
@@ -42430,14 +42434,47 @@ fn learning_context_splits_mdp_pomdp_idea_from_mpc_execution() {
             + SOCCER_NEURAL_SAME_TEAM_SEPARATION_FEATURE_DIM
     );
     assert_eq!(
-        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM,
         SOCCER_NEURAL_PRE_DECISION_CONTEXT_FEATURE_DIM + SOCCER_NEURAL_DECISION_CONTEXT_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM + SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM
     );
     assert!(
         SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_IDEA_EXECUTION_FEATURE_DIM)
     );
     assert!(
         SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM)
+    );
+    // The pre-action-param width (the old FEATURE_DIM) must be a recognized legacy width so
+    // nets trained before the action-param block migrate forward by zero-padding the tail.
+    assert!(
+        SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM)
+    );
+}
+
+#[test]
+fn action_param_feature_block_occupies_the_tail() {
+    // The 7 action-param slots are contiguous and sit at the very tail, immediately after
+    // the previous FEATURE_DIM, so pre-block nets zero-pad exactly these positions and the
+    // gate-off path (which never writes them) is byte-identical to the prior layout.
+    assert_eq!(SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM, 7);
+    let slots = [
+        SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DX,
+        SOCCER_NEURAL_FEATURE_ACTION_PARAM_TARGET_DY,
+        SOCCER_NEURAL_FEATURE_ACTION_PARAM_DISTANCE,
+        SOCCER_NEURAL_FEATURE_ACTION_PARAM_FORWARD,
+        SOCCER_NEURAL_FEATURE_ACTION_PARAM_DIR_SIN,
+        SOCCER_NEURAL_FEATURE_ACTION_PARAM_DIR_COS,
+        SOCCER_NEURAL_FEATURE_ACTION_PARAM_HAS_TARGET,
+    ];
+    for (i, slot) in slots.iter().enumerate() {
+        assert_eq!(*slot, SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM + i);
+    }
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_ACTION_PARAM_HAS_TARGET,
+        SOCCER_NEURAL_FEATURE_DIM - 1
     );
 }
 
@@ -55875,8 +55912,12 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
         SOCCER_NEURAL_PRE_SOLO_CARRIER_FEATURE_DIM + SOCCER_NEURAL_SOLO_CARRIER_FEATURE_DIM
     );
     assert_eq!(
-        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_SAME_TEAM_SEPARATION_FEATURE_DIM,
         SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM + SOCCER_NEURAL_EXECUTION_MPC_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM + SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM
     );
     assert_eq!(
         SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM,
@@ -56090,8 +56131,12 @@ fn neural_feature_and_qstate_encode_sustained_overlap() {
         SOCCER_NEURAL_PRE_IDEA_EXECUTION_FEATURE_DIM + SOCCER_NEURAL_IDEA_EXECUTION_FEATURE_DIM
     );
     assert_eq!(
-        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_SAME_TEAM_SEPARATION_FEATURE_DIM,
         SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM + SOCCER_NEURAL_EXECUTION_MPC_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM + SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM
     );
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&170));
     assert!(SOCCER_NEURAL_LEGACY_FEATURE_DIMS.contains(&177));
@@ -75764,8 +75809,12 @@ fn first_touch_escape_lateral_neural_block_is_appended_and_migration_safe() {
         SOCCER_NEURAL_PRE_SOLO_CARRIER_FEATURE_DIM + SOCCER_NEURAL_SOLO_CARRIER_FEATURE_DIM
     );
     assert_eq!(
-        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_SAME_TEAM_SEPARATION_FEATURE_DIM,
         SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM + SOCCER_NEURAL_EXECUTION_MPC_FEATURE_DIM
+    );
+    assert_eq!(
+        SOCCER_NEURAL_FEATURE_DIM,
+        SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM + SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM
     );
     assert_eq!(
         SOCCER_NEURAL_PRE_EXECUTION_MPC_FEATURE_DIM,
@@ -75935,7 +75984,7 @@ fn first_touch_escape_lateral_neural_block_is_appended_and_migration_safe() {
     );
     assert_eq!(
         SOCCER_NEURAL_FEATURE_EXECUTION_MPC_RECOMMENDED_SPEED + 1,
-        SOCCER_NEURAL_FEATURE_DIM
+        SOCCER_NEURAL_PRE_SAME_TEAM_SEPARATION_FEATURE_DIM
     );
     assert!(SOCCER_NEURAL_FEATURE_DEFENSIVE_PRESS_ACTION < SOCCER_NEURAL_FEATURE_DIM);
     assert!(SOCCER_NEURAL_FEATURE_DEFENSIVE_CONTAIN_RISK < SOCCER_NEURAL_FEATURE_DIM);
