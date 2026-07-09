@@ -15483,6 +15483,24 @@ pub(crate) fn dd_soccer_enable_scoop_completion_gate() -> bool {
     }
 }
 
+/// `DD_SOCCER_ENABLE_FORWARD_SELECT_LOGIT` (default OFF). When on, a net's learned
+/// [`SoccerPolicyHead::forward_select_logit_weight`] adds a per-candidate selection bias
+/// toward genuinely-FORWARD passes (judged by target geometry, NOT the label) at score
+/// time in `neural_blended_action`. Plain env-flag semantics (NOT `gate_default_on`);
+/// default-off + weight init 0.0 => past and gate-off runs stay byte-identical.
+pub(crate) fn dd_soccer_enable_forward_select_logit() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_FORWARD_SELECT_LOGIT")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_FORWARD_SELECT_LOGIT"))
+    }
+}
+
 /// Viability factor in `[0, 1]` for a lofted scoop pass: high only when the ball is both likely
 /// to reach the target (`expected_aerial_pass_completion`) AND not sitting in a cuttable flight
 /// lane (`aerial_pass_interception_risk`). A receiver can be wide open yet a defender cuts the
