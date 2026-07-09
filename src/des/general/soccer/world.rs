@@ -30937,6 +30937,8 @@ impl SoccerMatch {
                 self.stat_shot_on_target(shot.team);
                 self.record_shot_on_target_rewards(shot.team, shot.shooter);
                 self.record_goalkeeper_save_reward(&shot, keeper_id);
+                // Learned-MPC shot-placement credit: on target but the keeper held it (+0.3).
+                self.record_shot_objective_sample(&shot, ShotObjectiveOutcome::Saved);
                 self.stat_save(defending_team);
                 // A secured save (the keeper holds/claims it) is the most valuable stop.
                 self.record_keeper_save_reward(keeper_id, shot.origin, defending_team, 1.0);
