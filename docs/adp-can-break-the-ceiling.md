@@ -170,6 +170,7 @@ fastest test.
 
 ```
 DD_SOCCER_ENABLE_DP_BOOTSTRAP=1
+DD_SOCCER_ENABLE_DP_CRITIC_TARGET=1     # use V_DP(b') as critic bootstrap
 DD_SOCCER_DP_BOOTSTRAP_HORIZON=64       # longer n-step (was 16)
 DD_SOCCER_DP_BOOTSTRAP_SWEEPS=200       # more VI sweeps (was 40)
 SOCCER_APPROX_DP_REPLAY_PASSES=8        # multi-pass Q training (was 1)
@@ -183,8 +184,9 @@ but forward-pass climb profiles now default this replay budget to 8 when any of
 `SOCCER_EVAL_REQUIRE_FORWARD_PASS_CLIMB` is active. Non-climb runs keep the old
 default of 1 replay pass. The local league trainer and continuous RDS climb
 manifest now also arm the Tier 1 DP bootstrap profile by default/preflight:
-`DD_SOCCER_ENABLE_DP_BOOTSTRAP=1`, `DD_SOCCER_DP_BOOTSTRAP_HORIZON=64`, and
-`DD_SOCCER_DP_BOOTSTRAP_SWEEPS=200`. The serious climb profile also sets
+`DD_SOCCER_ENABLE_DP_BOOTSTRAP=1`, `DD_SOCCER_ENABLE_DP_CRITIC_TARGET=1`,
+`DD_SOCCER_DP_BOOTSTRAP_HORIZON=64`, and `DD_SOCCER_DP_BOOTSTRAP_SWEEPS=200`.
+The serious climb profile also sets
 `SOCCER_APPROX_DP_POLICY_PRIOR_WEIGHT=0.5`, which lets authoritative neural
 scoring consult the Bellman-swept Q prior as a bounded, centered nudge rather
 than replacing the neural policy.
@@ -282,12 +284,13 @@ neural net remains the deployable generalizer for full continuous POMDP state.
 
 ## Recommendation
 
-**Start with Tier 1**: enable `DD_SOCCER_ENABLE_DP_BOOTSTRAP=1` with longer
-horizon (64) and more sweeps (200). In forward-pass climb mode, the replay pass
-budget now defaults to 8; set `SOCCER_APPROX_DP_REPLAY_PASSES=8` explicitly when
-running outside that profile or when you want the manifest/logs to make the
-choice obvious. Use `SOCCER_APPROX_DP_POLICY_PRIOR_WEIGHT=0.5` for the bounded
-DP/Q decision prior. Run as the next experiment with W=0.7, 32 training games.
+**Start with Tier 1**: enable `DD_SOCCER_ENABLE_DP_BOOTSTRAP=1` and
+`DD_SOCCER_ENABLE_DP_CRITIC_TARGET=1` with longer horizon (64) and more sweeps
+(200). In forward-pass climb mode, the replay pass budget now defaults to 8; set
+`SOCCER_APPROX_DP_REPLAY_PASSES=8` explicitly when running outside that profile
+or when you want the manifest/logs to make the choice obvious. Use
+`SOCCER_APPROX_DP_POLICY_PRIOR_WEIGHT=0.5` for the bounded DP/Q decision prior.
+Run as the next experiment with W=0.7, 32 training games.
 
 If Tier 1 shows a measurable improvement (payoff +0.01 to +0.02), the DP signal is
 reaching the neural net and Tier 2 is justified. If Tier 1 shows nothing, the

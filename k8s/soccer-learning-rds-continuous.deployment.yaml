@@ -106,6 +106,7 @@ spec:
               require_value DD_SOCCER_ENABLE_SCORED_SHOT_PLACEMENT true
               require_value DD_SOCCER_ENABLE_TARGET_STANDARDIZATION true
               require_value DD_SOCCER_ENABLE_DP_BOOTSTRAP true
+              require_value DD_SOCCER_ENABLE_DP_CRITIC_TARGET true
               require_value DD_SOCCER_DP_BOOTSTRAP_HORIZON 64
               require_value DD_SOCCER_DP_BOOTSTRAP_SWEEPS 200
               require_value SOCCER_APPROX_DP_REPLAY_PASSES 8
@@ -161,6 +162,7 @@ spec:
               echo "scored_shot_placement=${DD_SOCCER_ENABLE_SCORED_SHOT_PLACEMENT}"
               echo "target_standardization=${DD_SOCCER_ENABLE_TARGET_STANDARDIZATION}"
               echo "dp_bootstrap=${DD_SOCCER_ENABLE_DP_BOOTSTRAP}"
+              echo "dp_critic_target=${DD_SOCCER_ENABLE_DP_CRITIC_TARGET}"
               echo "dp_bootstrap_horizon=${DD_SOCCER_DP_BOOTSTRAP_HORIZON}"
               echo "dp_bootstrap_sweeps=${DD_SOCCER_DP_BOOTSTRAP_SWEEPS}"
               echo "approx_dp_replay_passes=${SOCCER_APPROX_DP_REPLAY_PASSES}"
@@ -224,11 +226,12 @@ spec:
               export SOCCER_NEURAL_TARGET_CLIP=15
               export SOCCER_NEURAL_TARGET_POPART=true
               export DD_SOCCER_ENABLE_DP_BOOTSTRAP=true
+              export DD_SOCCER_ENABLE_DP_CRITIC_TARGET=true
               export DD_SOCCER_DP_BOOTSTRAP_HORIZON=64
               export DD_SOCCER_DP_BOOTSTRAP_SWEEPS=200
               export SOCCER_APPROX_DP_REPLAY_PASSES=8
               export SOCCER_APPROX_DP_POLICY_PRIOR_WEIGHT=0.5
-              echo "deferred_credit_stack_final discretized_kick=${DD_SOCCER_ENABLE_DISCRETIZED_KICK} chance_quality_reward=${DD_SOCCER_ENABLE_CHANCE_QUALITY_REWARD} specialist_curriculum=${DD_SOCCER_ENABLE_SPECIALIST_CURRICULUM} keeper_policy_head=${DD_SOCCER_ENABLE_KEEPER_POLICY_HEAD} skill_policy_heads=${DD_SOCCER_ENABLE_SKILL_POLICY_HEADS} target_scale=${SOCCER_NEURAL_TARGET_SCALE} target_clip=${SOCCER_NEURAL_TARGET_CLIP} target_popart=${SOCCER_NEURAL_TARGET_POPART} dp_bootstrap=${DD_SOCCER_ENABLE_DP_BOOTSTRAP} dp_horizon=${DD_SOCCER_DP_BOOTSTRAP_HORIZON} dp_sweeps=${DD_SOCCER_DP_BOOTSTRAP_SWEEPS} approx_dp_replay_passes=${SOCCER_APPROX_DP_REPLAY_PASSES} approx_dp_policy_prior_weight=${SOCCER_APPROX_DP_POLICY_PRIOR_WEIGHT}"
+              echo "deferred_credit_stack_final discretized_kick=${DD_SOCCER_ENABLE_DISCRETIZED_KICK} chance_quality_reward=${DD_SOCCER_ENABLE_CHANCE_QUALITY_REWARD} specialist_curriculum=${DD_SOCCER_ENABLE_SPECIALIST_CURRICULUM} keeper_policy_head=${DD_SOCCER_ENABLE_KEEPER_POLICY_HEAD} skill_policy_heads=${DD_SOCCER_ENABLE_SKILL_POLICY_HEADS} target_scale=${SOCCER_NEURAL_TARGET_SCALE} target_clip=${SOCCER_NEURAL_TARGET_CLIP} target_popart=${SOCCER_NEURAL_TARGET_POPART} dp_bootstrap=${DD_SOCCER_ENABLE_DP_BOOTSTRAP} dp_critic_target=${DD_SOCCER_ENABLE_DP_CRITIC_TARGET} dp_horizon=${DD_SOCCER_DP_BOOTSTRAP_HORIZON} dp_sweeps=${DD_SOCCER_DP_BOOTSTRAP_SWEEPS} approx_dp_replay_passes=${SOCCER_APPROX_DP_REPLAY_PASSES} approx_dp_policy_prior_weight=${SOCCER_APPROX_DP_POLICY_PRIOR_WEIGHT}"
               actual_commit="$(git rev-parse HEAD)"
               engine_commit="$(git -C "${engine}" rev-parse HEAD)"
               echo "source_commit_actual=${actual_commit}"
@@ -351,6 +354,8 @@ spec:
               value: "true"
             - name: DD_SOCCER_ENABLE_DP_BOOTSTRAP
               value: "true"
+            - name: DD_SOCCER_ENABLE_DP_CRITIC_TARGET
+              value: "true"
             - name: DD_SOCCER_DP_BOOTSTRAP_HORIZON
               value: "64"
             - name: DD_SOCCER_DP_BOOTSTRAP_SWEEPS
@@ -460,6 +465,8 @@ spec:
             - name: DD_SOCCER_ENABLE_MC_CRITIC_TARGET
               value: "true"
             - name: DD_SOCCER_ENABLE_DP_BOOTSTRAP
+              value: "true"
+            - name: DD_SOCCER_ENABLE_DP_CRITIC_TARGET
               value: "true"
             - name: DD_SOCCER_DP_BOOTSTRAP_HORIZON
               value: "64"

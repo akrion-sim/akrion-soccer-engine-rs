@@ -13897,6 +13897,10 @@ mod tests {
             Some("true")
         );
         assert_eq!(
+            continuous_manifest_env_value("DD_SOCCER_ENABLE_DP_CRITIC_TARGET"),
+            Some("true")
+        );
+        assert_eq!(
             continuous_manifest_env_value("DD_SOCCER_DP_BOOTSTRAP_HORIZON"),
             Some("64")
         );
@@ -14064,10 +14068,13 @@ mod tests {
             "require_value DD_SOCCER_ENABLE_TARGET_STANDARDIZATION true",
         );
         assert_continuous_manifest_contains("require_value DD_SOCCER_ENABLE_DP_BOOTSTRAP true");
+        assert_continuous_manifest_contains("require_value DD_SOCCER_ENABLE_DP_CRITIC_TARGET true");
         assert_continuous_manifest_contains("require_value DD_SOCCER_DP_BOOTSTRAP_HORIZON 64");
         assert_continuous_manifest_contains("require_value DD_SOCCER_DP_BOOTSTRAP_SWEEPS 200");
         assert_continuous_manifest_contains("require_value SOCCER_APPROX_DP_REPLAY_PASSES 8");
-        assert_continuous_manifest_contains("require_value SOCCER_APPROX_DP_POLICY_PRIOR_WEIGHT 0.5");
+        assert_continuous_manifest_contains(
+            "require_value SOCCER_APPROX_DP_POLICY_PRIOR_WEIGHT 0.5",
+        );
         assert_continuous_manifest_contains("require_value DD_SOCCER_ENABLE_MC_CRITIC_TARGET true");
         assert_continuous_manifest_contains(
             "require_value DD_SOCCER_ENABLE_NEURAL_SELF_BOOTSTRAP true",
