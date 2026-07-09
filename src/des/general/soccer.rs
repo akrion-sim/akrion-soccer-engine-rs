@@ -22278,10 +22278,12 @@ pub(crate) fn dd_soccer_enable_target_standardization() -> bool {
 }
 
 /// Append-only structured action-parameter feature block (priority-1 Part A): fills the
-/// 7 tail slots with the candidate action's aim geometry (target dx/dy vs the ball, aim
-/// distance, attack-relative forward-ness, aim direction sin/cos, has-target) so the value
-/// head can generalize over similar kick targets instead of memorizing the opaque action
-/// hash. OFF (default) ⇒ the slots stay 0.0 ⇒ byte-identical; pre-block nets zero-pad.
+/// 10 tail slots with the candidate action's aim geometry (target dx vs the ball, aim
+/// distance, attack-relative forward-ness, aim direction sin/cos, has-target) AND its
+/// identity/power (launch speed + pass/shoot/dribble one-hot) so the value head can
+/// generalize over similar kick targets and action families instead of memorizing the
+/// opaque action hash. OFF (default) ⇒ the slots stay 0.0 ⇒ byte-identical; pre-block nets
+/// zero-pad.
 pub(crate) fn dd_soccer_enable_action_param_features() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
