@@ -42927,6 +42927,24 @@ fn soccer_policy_head_from_snapshot(
             .fold((0.0, 0usize), |(sum, count), loss| (sum + loss, count + 1));
         (count > 0).then_some(sum / count as f64)
     });
+    // Restore the learned forward-select selection-bias scalar (per-net); non-finite => 0.0.
+    head.forward_select_logit_weight = if snapshot.forward_select_logit_weight.is_finite() {
+        snapshot.forward_select_logit_weight
+    } else {
+        0.0
+    };
+    // Diagnostic-only: with the gate on, `DD_SOCCER_FORWARD_SELECT_LOGIT_WEIGHT` bakes a FIXED
+    // per-net weight at LOAD time (never read in the scoring hot path), so the inference bias
+    // can be smoke-tested / fixed-weight-A/B'd before the learned update lands. Unset => no-op.
+    if dd_soccer_enable_forward_select_logit() {
+        if let Ok(raw) = std::env::var("DD_SOCCER_FORWARD_SELECT_LOGIT_WEIGHT") {
+            if let Ok(value) = raw.trim().parse::<f64>() {
+                if value.is_finite() {
+                    head.forward_select_logit_weight = value.clamp(-8.0, 8.0);
+                }
+            }
+        }
+    }
     Ok(head)
 }
 
