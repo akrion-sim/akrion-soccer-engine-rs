@@ -392,7 +392,8 @@ pub fn team_expected_threat(snapshot: &WorldSnapshot, team: Team) -> f64 {
                 Team::Home => home_control,
                 Team::Away => 1.0 - home_control,
             };
-            let threat = expected_threat(team, cell, field_width, field_length);
+            // Outcome-grounded EPV when the potential gate is on, else the closed-form seed.
+            let threat = threat_potential(team, cell, field_width, field_length);
             total += control * threat;
         }
     }
