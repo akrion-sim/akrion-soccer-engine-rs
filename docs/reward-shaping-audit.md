@@ -61,7 +61,7 @@ shots. Two `OnceLock` env knobs, default 1.0 (identical):
 - `DD_SOCCER_FORWARD_PASS_REWARD_SCALE` (0..20) — multiplies **only the forward branch** of `completed_pass_reward_for_pitch`
   (post Round-17 fix; `forward_pass_reward_scale()`, soccer.rs:23495; applied :23558/:23562; comment :23549).
 - `DD_SOCCER_SHOT_SHAPING_REWARD_SCALE` (0..1) — dampens **only** the shot-TAKEN *shaping* proxy
-  (`SHOT_ON_TARGET_REWARD_POINTS`, soccer.rs:36473); the goal (100) and terminal-outcome rewards are
+  (`SHOT_ON_TARGET_REWARD_POINTS`, soccer.rs:1179; `* shot_shaping_reward_scale()` dampening applied :36667); the goal (100) and terminal-outcome rewards are
   category-A and stay intact so finishing is never un-learned.
 
 **PBRS status:** the completed-forward-pass reward is a **category-C** per-visit term (a completion
