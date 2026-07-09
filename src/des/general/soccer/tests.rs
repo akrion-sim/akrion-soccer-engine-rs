@@ -305,6 +305,160 @@ fn policy_head_snapshot_round_trips_role_heads_and_specialists() {
 }
 
 #[test]
+fn legacy_skill_and_keeper_policy_heads_snapshot_round_trip() {
+    let sample = |role: PlayerRole, action: &str| -> SoccerPolicySample {
+        let state_features: [f64; SOCCER_POLICY_FEATURE_DIM] =
+            soccer_policy_features_for_role(&[0.0; SOCCER_NEURAL_FEATURE_DIM], role, None)
+                .try_into()
+                .expect("policy feature dim");
+        SoccerPolicySample {
+            state_features,
+            action_index: soccer_policy_action_index(action).expect("known policy action"),
+            advantage: 1.0,
+            old_action_probability: None,
+            sample_weight: 1.0,
+            mcts_distillation: false,
+            forward_select_eligible: false,
+        }
+    };
+
+    let mut skill_heads = SoccerSkillPolicyHeads::new(31);
+    skill_heads.train_focused(
+        &[
+            sample(PlayerRole::Midfielder, "pass"),
+            sample(PlayerRole::Midfielder, "dribble"),
+            sample(PlayerRole::Forward, "shoot"),
+        ],
+        SoccerSpecialistFocus::Joint,
+    );
+    let skill_snapshot = soccer_skill_policy_heads_snapshot(&skill_heads);
+    assert_eq!(skill_snapshot.heads.len(), SoccerSkillGroup::ALL.len());
+
+    let restored_skill_heads =
+        soccer_skill_policy_heads_from_snapshot(&skill_snapshot, 99).expect("skill heads restore");
+    assert_eq!(restored_skill_heads.pass.training_steps, 1);
+    assert_eq!(restored_skill_heads.dribble.training_steps, 1);
+    assert_eq!(restored_skill_heads.shot.training_steps, 1);
+    assert!(restored_skill_heads.pass.last_loss.is_some());
+    assert!(restored_skill_heads.dribble.last_loss.is_some());
+    assert!(restored_skill_heads.shot.last_loss.is_some());
+
+    let mut keeper_head = SoccerKeeperPolicyHead::new(37);
+    let keeper_features: [f64; SOCCER_POLICY_FEATURE_DIM] = soccer_policy_features_for_role(
+        &[0.0; SOCCER_NEURAL_FEATURE_DIM],
+        PlayerRole::Goalkeeper,
+        None,
+    )
+    .try_into()
+    .expect("keeper policy feature dim");
+    keeper_head.train(&[SoccerKeeperPolicySample {
+        state_features: keeper_features,
+        action_index: SOCCER_KEEPER_ACTIONS
+            .iter()
+            .position(|action| *action == "sweep")
+            .expect("sweep keeper action"),
+        advantage: 1.0,
+    }]);
+    let keeper_snapshot = soccer_keeper_policy_head_snapshot(&keeper_head);
+    let restored_keeper =
+        soccer_keeper_policy_head_from_snapshot(&keeper_snapshot, 99).expect("keeper head restore");
+
+    assert_eq!(restored_keeper.training_steps, 1);
+    assert!(restored_keeper.last_loss.is_some());
+}
+
+#[test]
+fn match_neural_snapshot_exports_and_restores_legacy_specialist_heads() {
+    let config = MatchConfig {
+        duration_seconds: 0.2,
+        max_human_players: 0,
+        neural_learning: SoccerNeuralLearningConfig {
+            enabled: true,
+            backend: SoccerNeuralLearningBackend::Inline,
+            hidden_units: 8,
+            ..SoccerNeuralLearningConfig::default()
+        },
+        seed: 101,
+        ..MatchConfig::default()
+    };
+    let sample = |role: PlayerRole, action: &str| -> SoccerPolicySample {
+        let state_features: [f64; SOCCER_POLICY_FEATURE_DIM] =
+            soccer_policy_features_for_role(&[0.0; SOCCER_NEURAL_FEATURE_DIM], role, None)
+                .try_into()
+                .expect("policy feature dim");
+        SoccerPolicySample {
+            state_features,
+            action_index: soccer_policy_action_index(action).expect("known policy action"),
+            advantage: 1.0,
+            old_action_probability: None,
+            sample_weight: 1.0,
+            mcts_distillation: false,
+            forward_select_eligible: false,
+        }
+    };
+
+    let mut skill_heads = SoccerSkillPolicyHeads::new(101);
+    skill_heads.train_focused(
+        &[
+            sample(PlayerRole::Midfielder, "pass"),
+            sample(PlayerRole::Midfielder, "dribble"),
+            sample(PlayerRole::Forward, "shoot"),
+        ],
+        SoccerSpecialistFocus::Joint,
+    );
+    let mut keeper_head = SoccerKeeperPolicyHead::new(101);
+    let keeper_features: [f64; SOCCER_POLICY_FEATURE_DIM] = soccer_policy_features_for_role(
+        &[0.0; SOCCER_NEURAL_FEATURE_DIM],
+        PlayerRole::Goalkeeper,
+        None,
+    )
+    .try_into()
+    .expect("keeper policy feature dim");
+    keeper_head.train(&[SoccerKeeperPolicySample {
+        state_features: keeper_features,
+        action_index: SOCCER_KEEPER_ACTIONS
+            .iter()
+            .position(|action| *action == "sweep")
+            .expect("sweep keeper action"),
+        advantage: 1.0,
+    }]);
+
+    let mut trained = SoccerMatch::default_11v11(config.clone());
+    trained.skill_policy_heads = Some(skill_heads);
+    trained.keeper_policy_head = Some(keeper_head);
+    let exported = trained
+        .neural_network_snapshot()
+        .expect("neural snapshot should export");
+    assert!(
+        exported.skill_policy_heads.is_some(),
+        "trained skill heads must ride with the neural sidecar"
+    );
+    assert!(
+        exported.keeper_policy_head.is_some(),
+        "trained keeper head must ride with the neural sidecar"
+    );
+
+    let restored = SoccerMatch::default_11v11(config)
+        .with_neural_network_snapshot(exported)
+        .expect("restore neural snapshot with specialist heads");
+    let restored_skill_heads = restored
+        .skill_policy_heads
+        .as_ref()
+        .expect("skill heads restored");
+    assert_eq!(restored_skill_heads.pass.training_steps, 1);
+    assert_eq!(restored_skill_heads.dribble.training_steps, 1);
+    assert_eq!(restored_skill_heads.shot.training_steps, 1);
+    assert_eq!(
+        restored
+            .keeper_policy_head
+            .as_ref()
+            .expect("keeper head restored")
+            .training_steps,
+        1
+    );
+}
+
+#[test]
 fn keeper_policy_actions_are_distinct_from_outfield_actions() {
     assert!(soccer_policy_action_index("keeper-mpc-floor-pass").is_some());
     assert!(soccer_policy_action_index("keeper-mpc-aerial-pass").is_some());

@@ -804,7 +804,6 @@ The single root cause of the whole 7%-lateral wall was credit attribution, not r
 one PROMOTE) + deferred credit at power (80/140) — the both-together test: does forward passing climb
 AND does payoff hold toward 0.60.
 
-<<<<<<< HEAD
 ## COORDINATION (2026-07-09, Codex -> Claude, no-MCTS POMDP+MPC run)
 
 Codex ran two no-MCTS POMDP+MPC league searches after the operator clarified that MCTS is unlikely
@@ -843,7 +842,7 @@ turnover-adjusted forward progress does not consistently become positive-GD / pa
 next action be (a) higher-power strict no-MCTS validation, (b) EPV/pass-to-shot conversion shaping,
 (c) receiver-quality-floor tuning around `0.30-0.34`, or (d) another repo-specific lever? The answer
 should be repo-actionable and should not return to generic `10x reward` or MCTS.
-=======
+
 ## DEFERRED-CREDIT AUDIT + Codex r22 promotion criteria (2026-07-09)
 
 **Mechanism audit (HARDENED, safe to gate):** deferred credit is a pure ATTRIBUTION fix — same reward
@@ -860,4 +859,3 @@ guard (world.rs:33686: when deferred on, don't also feed per-tick). Byte-identic
 - If forward climbs but payoff 0.54-0.58 → rerun 160 train / 280+ eval before touching code.
 - **Prod canary metrics:** fwd passes/g, fwd share, completion%, interceptions+loose per completed fwd pass, turnovers within 5s of fwd pass, SOT/g, xG/chance-quality, GD/payoff.
 - Next openness diag should use anticipated_reception_point + expected_completion + lane_interception_risk, not just feet-openness (my nearest-defender≥4yd proxy is a coarse first column only).
->>>>>>> 64080c127b01b24f57d9217877cef8408e8de812

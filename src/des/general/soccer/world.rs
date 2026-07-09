@@ -1723,6 +1723,11 @@ pub struct SoccerMatch {
     /// player's previous MDP state, belief summary, chosen action, action target, and MPC
     /// reconciliation summary without depending on transient `WorldSnapshot` instances.
     pub(crate) player_tick_carryover: HashMap<usize, SoccerPlayerTickCarryover>,
+    /// ROLLOUT-only: forces `(player_id, action_label, target_point)` on the NEXT
+    /// `run_time_step`, then self-clears (see the field loop). `None` in all normal
+    /// play ⇒ byte-identical. Set on a `fork_for_rollout` clone to evaluate one
+    /// candidate action, after which the horizon follows the base policy.
+    pub(crate) rollout_forced_action: Option<(usize, String, Option<Vec2>)>,
     /// Cached DP value-iterated abstract-state table, populated by
     /// [`apply_full_game_learning_if_ready`] when the
     /// `DD_SOCCER_ENABLE_DP_CRITIC_TARGET` gate is on. `(V, ball_x_max, ball_y_max)`.
@@ -11957,6 +11962,7 @@ impl SoccerMatch {
             mpc_reconcile_stats: SoccerMpcReconcileStats::default(),
             opponent_press_belief: HashMap::new(),
             player_tick_carryover: HashMap::new(),
+            rollout_forced_action: None,
             dp_value_table: None,
         };
         let center = Vec2::new(
@@ -11978,6 +11984,199 @@ impl SoccerMatch {
             .central_brain
             .prime_formation_lp(&prime_snapshot);
         soccer_match
+    }
+
+    /// A physics/decision-faithful shallow copy of the match for decision-time ROLLOUT.
+    /// Clones the state `run_time_step` needs to advance play; nulls every learner,
+    /// head, training corpus, replay buffer, and telemetry sink; and reseeds the RNG so
+    /// the rollout forks the stochastic stream (the source match is untouched, and
+    /// candidates can share Common Random Numbers). Runs the pure ANALYTIC base policy
+    /// (no learned policy / heads / neural blend) — the base whose rollout carries the
+    /// improvement guarantee.
+    pub fn fork_for_rollout(&self, rollout_seed: u64) -> SoccerMatch {
+        SoccerMatch {
+            // KEEP: physics + within-play decision state
+            config: self.config.clone(),
+            tick: self.tick,
+            clock_seconds: self.clock_seconds,
+            players: self.players.clone(),
+            officials: self.officials.clone(),
+            ball: self.ball.clone(),
+            shared_positions: self.shared_positions.clone(),
+            score_home: self.score_home,
+            score_away: self.score_away,
+            home_genome: self.home_genome.clone(),
+            away_genome: self.away_genome.clone(),
+            gk_handling_since_clock: self.gk_handling_since_clock,
+            goal_celebration_remaining_ticks: self.goal_celebration_remaining_ticks,
+            goal_celebration_kickoff_team: self.goal_celebration_kickoff_team,
+            central_brain: self.central_brain.clone(),
+            active_set_play: self.active_set_play.clone(),
+            pending_pass: self.pending_pass.clone(),
+            suppress_generic_oob_turnover: self.suppress_generic_oob_turnover,
+            pending_shot: self.pending_shot.clone(),
+            pending_rebound: self.pending_rebound.clone(),
+            flank_crash_box_cross: self.flank_crash_box_cross.clone(),
+            pending_aerial_finish: self.pending_aerial_finish,
+            coach_set_play_hints: self.coach_set_play_hints.clone(),
+            possession_chain: self.possession_chain.clone(),
+            possession_chain_previous_touch_team: self.possession_chain_previous_touch_team,
+            home_mpc_latent_objective: self.home_mpc_latent_objective.clone(),
+            away_mpc_latent_objective: self.away_mpc_latent_objective.clone(),
+            forward_carry_tracker: self.forward_carry_tracker.clone(),
+            last_touch_player: self.last_touch_player,
+            ball_stationary_ticks: self.ball_stationary_ticks,
+            ball_stuck_anchor: self.ball_stuck_anchor,
+            restart_double_touch_guard: self.restart_double_touch_guard,
+            goal_kick_must_clear_box: self.goal_kick_must_clear_box.clone(),
+            possession_progress_tracker: self.possession_progress_tracker.clone(),
+            back_four_line_latch: self.back_four_line_latch.clone(),
+            loose_ball_uncontested_since_tick: self.loose_ball_uncontested_since_tick,
+            defensive_delay_clocks: self.defensive_delay_clocks.clone(),
+            defensive_beat_clocks: self.defensive_beat_clocks.clone(),
+            offside_clocks: self.offside_clocks.clone(),
+            teammate_proximity_seconds: self.teammate_proximity_seconds.clone(),
+            teammate_spacing_notices: self.teammate_spacing_notices.clone(),
+            back_four_anchor_pivots: self.back_four_anchor_pivots.clone(),
+            teammate_spacing_near_clocks: self.teammate_spacing_near_clocks.clone(),
+            teammate_spacing_far_clocks: self.teammate_spacing_far_clocks.clone(),
+            teammate_spacing_yield: self.teammate_spacing_yield.clone(),
+            defensive_clear_hold_trackers: self.defensive_clear_hold_trackers.clone(),
+            recent_dispossession: self.recent_dispossession,
+            last_controlled_possession_team: self.last_controlled_possession_team,
+            coach_position_hints: self.coach_position_hints.clone(),
+            possession_swaps: self.possession_swaps.clone(),
+            opponent_press_belief: self.opponent_press_belief.clone(),
+            player_tick_carryover: self.player_tick_carryover.clone(),
+            // RESEED: SeededRandom::new takes u32; XOR-fold the u64 seed's halves so the
+            // full range influences the stream without truncation collisions or a panic.
+            rng: SeededRandom::new((rollout_seed ^ (rollout_seed >> 32)) as u32),
+            // ROLLOUT hook
+            rollout_forced_action: None,
+            // NULL: analytic base — no learned policy / heads / neural blend / DP critic cache
+            learned_policy: None,
+            dp_value_table: None,
+            team_policies: None,
+            neural_learner: None,
+            away_neural_learner: None,
+            home_neural_frozen: false,
+            away_neural_frozen: false,
+            neural_blend: SoccerNeuralBlendConfig::default(),
+            policy_head: None,
+            skill_policy_heads: None,
+            away_skill_policy_heads: None,
+            keeper_policy_head: None,
+            specialist_curriculum_round: 0,
+            world_model: None,
+            // NULL: human control (fresh, not shared with the source)
+            human_inputs: SharedHumanInputs::new(),
+            latched_human_inputs: HashMap::new(),
+            pending_human_control: None,
+            // NULL: MPC warm-start cache (cold solves reconverge)
+            mpc_player_controllers: HashMap::new(),
+            // NULL: all learned predictor heads
+            pass_completion_head: None,
+            mpc_objective_head: None,
+            dribble_mpc_objective: None,
+            line_depth_head: None,
+            defender_line_head: None,
+            loose_ball_commit_head: None,
+            attack_spacing_head: None,
+            support_scorer_head: None,
+            receive_approach_head: None,
+            lane_affinity_head: None,
+            goal_side_recovery_head: None,
+            winger_pinch_head: None,
+            separation_floor_head: None,
+            pass_lane_yield_head: None,
+            head_scan_head: None,
+            crash_box_head: None,
+            run_prediction_head: None,
+            slip_break_head: None,
+            onside_support_head: None,
+            long_pass_run_head: None,
+            give_and_go_head: None,
+            aerial_reception_head: None,
+            shot_trigger_head: None,
+            // NULL: RL sample corpora + open-decision buffers
+            pass_outcome_samples: Vec::new(),
+            mpc_objective_samples: Vec::new(),
+            line_depth_samples: Vec::new(),
+            pending_line_depth: Vec::new(),
+            defender_line_samples: Vec::new(),
+            pending_defender_line: Vec::new(),
+            loose_ball_commit_samples: Vec::new(),
+            pending_loose_ball_commit: Vec::new(),
+            receive_approach_samples: Vec::new(),
+            pending_receive_approach: Vec::new(),
+            lane_affinity_samples: Vec::new(),
+            pending_lane_affinity: Vec::new(),
+            goal_side_recovery_samples: Vec::new(),
+            pending_goal_side_recovery: Vec::new(),
+            winger_pinch_samples: Vec::new(),
+            pending_winger_pinch: Vec::new(),
+            separation_floor_samples: Vec::new(),
+            pending_separation_floor: Vec::new(),
+            pass_lane_yield_samples: Vec::new(),
+            pending_pass_lane_yield: Vec::new(),
+            head_scan_samples: Vec::new(),
+            pending_head_scan: Vec::new(),
+            crash_box_samples: Vec::new(),
+            pending_crash_box: Vec::new(),
+            run_prediction_samples: Vec::new(),
+            pending_run_prediction: Vec::new(),
+            slip_break_samples: Vec::new(),
+            pending_slip_break: Vec::new(),
+            onside_support_samples: Vec::new(),
+            pending_onside_support: Vec::new(),
+            long_pass_run_samples: Vec::new(),
+            pending_long_pass_run: Vec::new(),
+            give_and_go_samples: Vec::new(),
+            pending_give_and_go: Vec::new(),
+            aerial_reception_samples: Vec::new(),
+            pending_aerial_reception: Vec::new(),
+            shot_trigger_samples: Vec::new(),
+            pending_shot_trigger: Vec::new(),
+            attack_spacing_samples: Vec::new(),
+            pending_attack_spacing: Vec::new(),
+            support_move_samples: Vec::new(),
+            pending_support_decisions: Vec::new(),
+            // NULL: learning transitions / replay / deferred credit
+            learning_transitions: Vec::new(),
+            episode_learning_transitions: Vec::new(),
+            episode_config_captures: Vec::new(),
+            retrieval_action_prior: HashMap::new(),
+            full_game_learning_applied: false,
+            full_game_learning_replay_transitions: 0,
+            recent_learning_history: VecDeque::new(),
+            deferred_reward_transitions: Vec::new(),
+            deferred_reward_credits: Vec::new(),
+            reward_events: Vec::new(),
+            turnover_penalty_history: VecDeque::new(),
+            last_turnover_penalty_tick: None,
+            pending_turnover_outcome: None,
+            wasted_energy_history: VecDeque::new(),
+            player_last_ball_interaction_tick: HashMap::new(),
+            team_last_positive_outcome_tick: [None, None],
+            completed_pass_chain: VecDeque::new(),
+            pass_chain_meter: PassChainMeter::default(),
+            // NULL: retrieval + telemetry
+            adversarial_moment_memory: VecDeque::new(),
+            adversarial_moment_index_cache: std::cell::RefCell::new(None),
+            adversarial_embedding_signal_cache: std::cell::RefCell::new(None),
+            retrieved_action_prior_cache: std::cell::RefCell::new(
+                SoccerRetrievedActionPriorCache::default(),
+            ),
+            last_agent_schedule: Vec::new(),
+            controller_yield_stats: ControllerYieldStats::default(),
+            step_timing_stats: SoccerStepTimingStats::default(),
+            mpc_reconcile_stats: SoccerMpcReconcileStats::default(),
+            decision_trace_capture_enabled: false,
+            decision_trace_by_player: BTreeMap::new(),
+            stats: MatchStats::default(),
+            events: Vec::new(),
+            tactical_summary: SoccerTacticalLearningSummary::default(),
+        }
     }
 
     pub fn with_human_inputs(mut self, human_inputs: SharedHumanInputs) -> Self {
@@ -12204,6 +12403,15 @@ impl SoccerMatch {
             } else {
                 None
             };
+        self.keeper_policy_head =
+            if let Some(keeper_policy_head) = snapshot.keeper_policy_head.as_deref() {
+                Some(soccer_keeper_policy_head_from_snapshot(
+                    keeper_policy_head,
+                    self.config.seed,
+                )?)
+            } else {
+                None
+            };
         self.away_skill_policy_heads = None;
         self.line_depth_head = if let Some(line_depth_head) = snapshot.line_depth_head.as_deref() {
             Some(std::sync::Arc::new(BackFourLineHead::from_snapshot(
@@ -12323,6 +12531,11 @@ impl SoccerMatch {
                 if let Some(skill_policy_heads) = self.skill_policy_heads_for(team) {
                     snapshot.skill_policy_heads = Some(Box::new(
                         soccer_skill_policy_heads_snapshot(skill_policy_heads),
+                    ));
+                }
+                if let Some(keeper_policy_head) = &self.keeper_policy_head {
+                    snapshot.keeper_policy_head = Some(Box::new(
+                        soccer_keeper_policy_head_snapshot(keeper_policy_head),
                     ));
                 }
                 if let Some(line_depth_head) = &self.line_depth_head {
@@ -12511,6 +12724,12 @@ impl SoccerMatch {
                 if let Some(policy_head_snapshot) = snapshot.policy_head.as_deref() {
                     self.policy_head = Some(soccer_policy_head_from_snapshot(
                         policy_head_snapshot,
+                        self.config.seed,
+                    )?);
+                }
+                if let Some(keeper_policy_head_snapshot) = snapshot.keeper_policy_head.as_deref() {
+                    self.keeper_policy_head = Some(soccer_keeper_policy_head_from_snapshot(
+                        keeper_policy_head_snapshot,
                         self.config.seed,
                     )?);
                 }
@@ -18364,31 +18583,37 @@ impl SoccerMatch {
                     adjusted_reward += novelty_coef / ((1 + count) as f64).sqrt();
                 }
                 let next_state = SoccerQStateKey::from_next_transition(transition);
-                let (gamma, tabular_max_next) =
-                    if dd_soccer_enable_dp_critic_target()
-                        && !transition.done
-                        && self.dp_value_table.is_some()
-                    {
-                        // DP-bootstrapped critic target: use V_DP(b(s')) instead of the
-                        // tabular Q's best_value_hierarchical(next). This breaks the
-                        // dependency chain that would otherwise cap the neural critic at
-                        // the tabular Q's ceiling. V_DP is computed from raw transitions
-                        // (after deferred credits, before the replay blend) via
-                        // value iteration over the 486-bucket abstract MCD state.
-                        let (dp_table, bx, by) = self.dp_value_table.as_ref().unwrap();
-                        let next_bucket = soccer_dp_state_bucket(
-                            &transition.next_state,
-                            transition.team,
-                            *bx,
-                            *by,
-                        );
-                        let dp_v = dp_table.get(&next_bucket).copied().unwrap_or(0.0);
-                        (SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK, dp_v)
-                    } else {
-                        self.team_policies
-                            .as_ref()
-                            .map(|policies| {
-                                let policy = policies.policy(transition.team);
+                let (gamma, tabular_max_next) = if dd_soccer_enable_dp_critic_target()
+                    && !transition.done
+                    && self.dp_value_table.is_some()
+                {
+                    // DP-bootstrapped critic target: use V_DP(b(s')) instead of the
+                    // tabular Q's best_value_hierarchical(next). This breaks the
+                    // dependency chain that would otherwise cap the neural critic at
+                    // the tabular Q's ceiling. V_DP is computed from raw transitions
+                    // (after deferred credits, before the replay blend) via
+                    // value iteration over the 486-bucket abstract MCD state.
+                    let (dp_table, bx, by) = self.dp_value_table.as_ref().unwrap();
+                    let next_bucket =
+                        soccer_dp_state_bucket(&transition.next_state, transition.team, *bx, *by);
+                    let dp_v = dp_table.get(&next_bucket).copied().unwrap_or(0.0);
+                    (SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK, dp_v)
+                } else {
+                    self.team_policies
+                        .as_ref()
+                        .map(|policies| {
+                            let policy = policies.policy(transition.team);
+                            (
+                                soccer_q_sanitized_gamma(policy.options.gamma),
+                                if transition.done {
+                                    0.0
+                                } else {
+                                    policy.best_value_hierarchical(&next_state).unwrap_or(0.0)
+                                },
+                            )
+                        })
+                        .or_else(|| {
+                            self.learned_policy.as_ref().map(|policy| {
                                 (
                                     soccer_q_sanitized_gamma(policy.options.gamma),
                                     if transition.done {
@@ -18398,22 +18623,9 @@ impl SoccerMatch {
                                     },
                                 )
                             })
-                            .or_else(|| {
-                                self.learned_policy.as_ref().map(|policy| {
-                                    (
-                                        soccer_q_sanitized_gamma(policy.options.gamma),
-                                        if transition.done {
-                                            0.0
-                                        } else {
-                                            policy
-                                                .best_value_hierarchical(&next_state)
-                                                .unwrap_or(0.0)
-                                        },
-                                    )
-                                })
-                            })
-                            .unwrap_or((SoccerQPolicyOptions::default().gamma, 0.0))
-                    };
+                        })
+                        .unwrap_or((SoccerQPolicyOptions::default().gamma, 0.0))
+                };
                 let successor = successor_indices.get(transition_index).and_then(|index| {
                     index.and_then(|successor_index| transitions.get(successor_index))
                 });
@@ -19437,11 +19649,17 @@ impl SoccerMatch {
                 ball_x_max = ball_x_max.max(t.state.ball_zone_x);
                 ball_y_max = ball_y_max.max(t.state.ball_zone_y);
             }
-            let team_index = |team: Team| -> usize { match team { Team::Home => 0, Team::Away => 1 } };
+            let team_index = |team: Team| -> usize {
+                match team {
+                    Team::Home => 0,
+                    Team::Away => 1,
+                }
+            };
             let mut by_tick: BTreeMap<u64, [(f64, usize, u32); 2]> = BTreeMap::new();
             for t in &self.episode_learning_transitions {
                 let bucket = soccer_dp_state_bucket(&t.state, t.team, ball_x_max, ball_y_max);
-                let slot = &mut by_tick.entry(t.tick).or_insert([(0.0, 0, 0); 2])[team_index(t.team)];
+                let slot =
+                    &mut by_tick.entry(t.tick).or_insert([(0.0, 0, 0); 2])[team_index(t.team)];
                 slot.0 += finite_metric(t.reward);
                 slot.1 += 1;
                 slot.2 = bucket;
@@ -20995,12 +21213,32 @@ impl SoccerMatch {
                     } else {
                         None
                     };
+                    // ROLLOUT: on the first tick after a fork, force the flagged player's
+                    // action, then self-clear so the remaining horizon follows the base policy.
+                    let forced_rollout_plan: Option<SoccerLearnedPlan> =
+                        match self.rollout_forced_action.take() {
+                            Some((pid, action, target)) if pid == scheduled.id => {
+                                Some(SoccerLearnedPlan {
+                                    action,
+                                    target_player: None,
+                                    target_point: target,
+                                    mpc_replan: None,
+                                })
+                            }
+                            Some(other) => {
+                                self.rollout_forced_action = Some(other);
+                                None
+                            }
+                            None => None,
+                        };
                     let intent = self.players[actor].run_time_step_with_context(
                         &snapshot,
                         mdp_state,
                         observation,
                         input_frame.as_ref().map(|frame| &frame.input),
-                        learned_decision.as_ref().map(|decision| &decision.plan),
+                        forced_rollout_plan
+                            .as_ref()
+                            .or_else(|| learned_decision.as_ref().map(|decision| &decision.plan)),
                         &mut self.rng,
                     );
                     if let Some(learned_decision) = learned_decision.as_ref() {

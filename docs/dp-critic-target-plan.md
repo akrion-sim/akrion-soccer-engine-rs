@@ -73,6 +73,8 @@ target = adjusted_reward + gamma * V_DP(b')
 
 `DD_SOCCER_ENABLE_DP_CRITIC_TARGET` — default OFF, `soccer_env_flag_enabled`.
 When OFF the code path is byte-identical to current main.
+The serious forward-pass climb profile arms this gate explicitly so the DP table
+can contribute to neural critic targets without making it a global default.
 
 ### Why this should work
 

@@ -5892,13 +5892,7 @@ mod tests {
                 weights: vec![vec![0.25, -0.25]],
                 biases: vec![0.125],
             }],
-            training_steps: 0,
-            average_loss: None,
-            target_popart: None,
-            policy_head: None,
-            skill_policy_heads: None,
-            mpc_objective_head: None,
-            line_depth_head: None,
+            ..Default::default()
         }
     }
 
