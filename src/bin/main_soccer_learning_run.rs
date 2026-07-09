@@ -7786,14 +7786,6 @@ fn run() -> Result<(), Box<dyn Error>> {
     };
     validate_soccer_policy_promotion_gate_config_for_learning_run(&policy_promotion_gate)
         .map_err(invalid_data)?;
-    // Align the evolution sample window with the promotion sample floor: a candidate can only
-    // promote if it is scored over at least `min_sample_games` games, so a smaller window would
-    // guarantee a permanent promotion stall. Honours the operator-chosen window; only raises it.
-    let evolution_window_games = evolution_window_games_floored_for_promotion_gate(
-        evolution_window_games,
-        policy_promotion_gate.enabled,
-        policy_promotion_gate.min_sample_games,
-    );
     // Anti-regression ratchet for activation (see `active_max_fitness_regression`):
     // how much fitness a newer generation may lose vs the incumbent and still go
     // `active`. Configmap-tunable so the operator can tighten it (→ 0.0 = "no
