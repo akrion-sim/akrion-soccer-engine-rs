@@ -5494,6 +5494,16 @@ const DEFAULT_SOCCER_POLICY_HIDDEN_UNITS: usize = 24;
 const MIN_SOCCER_POLICY_HIDDEN_UNITS: usize = 8;
 const MAX_SOCCER_POLICY_HIDDEN_UNITS: usize = 512;
 const SOCCER_POLICY_LEARNING_RATE: f64 = 0.05;
+/// Upper clamp for the learned per-net forward action-selection bias weight
+/// ([`SoccerPolicyHead::forward_select_logit_weight`]). Keeps the additive selection bonus in a
+/// sane range so a runaway advantage signal cannot dominate candidate scoring. Lower clamp is 0.0
+/// (the bias only ever nudges TOWARD forward, never away).
+const SOCCER_FORWARD_SELECT_LOGIT_WEIGHT_MAX: f64 = 8.0;
+/// Minimum forward progress (yards, along the attacking direction) for a pass TARGET to count as
+/// geometrically FORWARD for the forward-select bias. A small positive deadband so lateral balls
+/// (~0 forward progress) and backward balls do NOT qualify — the whole point of the bias is to
+/// isolate genuinely forward SELECTIONS, not the stuck lateral/backward ones.
+const SOCCER_FORWARD_SELECT_MIN_FORWARD_YARDS: f64 = 1.0;
 /// Default entropy bonus — keeps the actor from collapsing onto one family too early.
 /// Override with `SOCCER_POLICY_ENTROPY_COEFF` when local runs show policy entropy
 /// falling into a safe-action plateau.
@@ -15480,24 +15490,6 @@ pub(crate) fn dd_soccer_enable_scoop_completion_gate() -> bool {
         use std::sync::OnceLock;
         static V: OnceLock<bool> = OnceLock::new();
         *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_SCOOP_COMPLETION_GATE"))
-    }
-}
-
-/// `DD_SOCCER_ENABLE_FORWARD_SELECT_LOGIT` (default OFF). When on, a net's learned
-/// [`SoccerPolicyHead::forward_select_logit_weight`] adds a per-candidate selection bias
-/// toward genuinely-FORWARD passes (judged by target geometry, NOT the label) at score
-/// time in `neural_blended_action`. Plain env-flag semantics (NOT `gate_default_on`);
-/// default-off + weight init 0.0 => past and gate-off runs stay byte-identical.
-pub(crate) fn dd_soccer_enable_forward_select_logit() -> bool {
-    #[cfg(test)]
-    {
-        soccer_env_flag_enabled("DD_SOCCER_ENABLE_FORWARD_SELECT_LOGIT")
-    }
-    #[cfg(not(test))]
-    {
-        use std::sync::OnceLock;
-        static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_FORWARD_SELECT_LOGIT"))
     }
 }
 
@@ -38865,10 +38857,6 @@ pub struct SoccerPolicyHeadSnapshot {
     pub specialist_heads: Vec<SoccerPolicySpecialistHeadSnapshot>,
     #[serde(default)]
     pub role_heads: Vec<SoccerPolicyRoleHeadSnapshot>,
-    /// Learned forward-select selection-bias scalar (per-net). `#[serde(default)]` = 0.0
-    /// keeps pre-existing snapshots byte-identical on load.
-    #[serde(default)]
-    pub forward_select_logit_weight: f64,
 }
 
 /// Legacy pass-specific scalar feature count: distance, forward progress, lateral, passer pressure,
@@ -40857,11 +40845,6 @@ pub(crate) struct SoccerPolicyHead {
     role_heads: Vec<SoccerPolicyRoleHead>,
     training_steps: usize,
     last_loss: Option<f64>,
-    /// Learned scalar selection bias toward a genuinely-forward pass when a good
-    /// forward option is visible (applied at score time in `neural_blended_action`).
-    /// Per-net / snapshot-carried; init 0.0 so a fresh or gate-off net is byte-identical.
-    /// Only trained/applied under `DD_SOCCER_ENABLE_FORWARD_SELECT_LOGIT`.
-    forward_select_logit_weight: f64,
 }
 
 impl SoccerPolicyHead {
@@ -40873,7 +40856,6 @@ impl SoccerPolicyHead {
                 .collect(),
             training_steps: 0,
             last_loss: None,
-            forward_select_logit_weight: 0.0,
         }
     }
 
@@ -42850,7 +42832,6 @@ fn soccer_policy_head_snapshot(head: &SoccerPolicyHead) -> SoccerPolicyHeadSnaps
             .iter()
             .map(soccer_policy_role_head_snapshot)
             .collect(),
-        forward_select_logit_weight: head.forward_select_logit_weight,
     }
 }
 
@@ -42945,24 +42926,6 @@ fn soccer_policy_head_from_snapshot(
             .fold((0.0, 0usize), |(sum, count), loss| (sum + loss, count + 1));
         (count > 0).then_some(sum / count as f64)
     });
-    // Restore the learned forward-select selection-bias scalar (per-net); non-finite => 0.0.
-    head.forward_select_logit_weight = if snapshot.forward_select_logit_weight.is_finite() {
-        snapshot.forward_select_logit_weight
-    } else {
-        0.0
-    };
-    // Diagnostic-only: with the gate on, `DD_SOCCER_FORWARD_SELECT_LOGIT_WEIGHT` bakes a FIXED
-    // per-net weight at LOAD time (never read in the scoring hot path), so the inference bias
-    // can be smoke-tested / fixed-weight-A/B'd before the learned update lands. Unset => no-op.
-    if dd_soccer_enable_forward_select_logit() {
-        if let Ok(raw) = std::env::var("DD_SOCCER_FORWARD_SELECT_LOGIT_WEIGHT") {
-            if let Ok(value) = raw.trim().parse::<f64>() {
-                if value.is_finite() {
-                    head.forward_select_logit_weight = value.clamp(-8.0, 8.0);
-                }
-            }
-        }
-    }
     Ok(head)
 }
 
