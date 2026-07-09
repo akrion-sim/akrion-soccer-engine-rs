@@ -23680,7 +23680,14 @@ fn completed_pass_reward_for_pitch(
     };
     // Flank bonus is unscaled (it applies to forward/lateral alike, so scaling it would re-leak the
     // lever into lateral). Forward magnitude is already scaled inside `base`.
-    base + completed_flank_pass_reward(team, origin, target, field_width, field_length)
+    // Learned-EPV conversion bonus (DD_SOCCER_ENABLE_LEARNED_EPV): reward the pass by the DANGER it
+    // creates — Φ_epv(target) − Φ_epv(origin), scaled — so a ball into a chance-creating cell scores
+    // far above a square territory pass. Direct fix for "forward passes → territory + draws, not
+    // conversion": it values passing by expected possession value, not raw yards. `learned_epv_pass_delta`
+    // returns 0.0 when the grid/gate is off ⇒ byte-identical, so this is added unconditionally.
+    let learned_epv_bonus = learned_epv_reward_scale()
+        * learned_epv_pass_delta(team, origin, target, field_width, field_length);
+    base + completed_flank_pass_reward(team, origin, target, field_width, field_length) + learned_epv_bonus
 }
 
 fn completed_forward_pass_count_bonus(team: Team, origin: Vec2, reception: Vec2) -> f64 {
