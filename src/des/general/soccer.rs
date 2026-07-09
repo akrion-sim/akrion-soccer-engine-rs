@@ -63495,6 +63495,26 @@ pub(crate) fn dd_soccer_enable_forward_option_recognition() -> bool {
     }
 }
 
+/// LEARNED FORWARD ACTION-SELECTION BIAS. When on, the trained per-net scalar
+/// [`SoccerPolicyHead::forward_select_logit_weight`] adds a pre-choice additive bias to *forward*
+/// pass candidates (proportional to the visible forward-option quality) at candidate-scoring time,
+/// and the same scalar is trained by an advantage-weighted policy gradient over forward-pass
+/// samples. PLAIN env-flag semantics, DEFAULT-OFF (this is NOT a `gate_default_on` gate): opt-in
+/// via `DD_SOCCER_ENABLE_FORWARD_SELECT_LOGIT=1|true|yes|on`. Off (and/or weight 0.0) ⇒ the bonus
+/// term is 0 and the weight is never updated, so scoring and training are byte-identical to today.
+pub(crate) fn dd_soccer_enable_forward_select_logit() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_FORWARD_SELECT_LOGIT")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_FORWARD_SELECT_LOGIT"))
+    }
+}
+
 /// Role-aware pass risk/safety appetite. The MPC/POMDP lane-interception risk
 /// (`pass_lane_interception_risk`, a 2-second lookahead — see
 /// [`PASS_LANE_DECISION_LOOKAHEAD_SECONDS`]) already QUANTIFIES how dangerous a pass is; this
