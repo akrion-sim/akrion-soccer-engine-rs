@@ -40455,6 +40455,11 @@ struct SoccerPolicySample {
     old_action_probability: Option<f64>,
     sample_weight: f64,
     mcts_distillation: bool,
+    /// In-memory only (not serialized): the sampled action was a FORWARD pass into a good forward
+    /// option — a pass-like transition whose target is geometrically forward of the carrier (same
+    /// definition as the score-time forward-select bias). Trains the per-net
+    /// `forward_select_logit_weight`; irrelevant when that gate is off.
+    forward_select_eligible: bool,
 }
 
 #[derive(Clone, Default)]
