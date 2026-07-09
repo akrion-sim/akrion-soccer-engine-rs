@@ -63,7 +63,7 @@ to present chances.
   next step (`learnability-conversion-roadmap.md:57`).
 - Shot-quality ingredients exist (`shot_on_frame_probability`, `shot_beat_goalkeeper_probability`,
   `shot_block_probability`, `shot_quality`, `soccer.rs:7589`) but **no calibrated xG estimator**.
-- The interface is **113 actor labels, not 73** (`soccer.rs:41785`): first 73 are base families
+- The interface is **113 actor labels, not 73** (`SOCCER_POLICY_ACTIONS`): first 73 are base families
   through `support-push-up`; **73–112 are kick-power buckets**. A "fixed-interface" falsifier
   **must mask to the first 73**.
 - Support/run heads are installed **match-wide, not per-team** (`world.rs:9263`, `world.rs:54905`,
@@ -729,3 +729,25 @@ identical to baseline**. You cannot bribe the net into forward passing; the bloc
 top-3 MCTS pass expansion, lateral-reward trim, neural_self_bootstrap (A/B running). Also: I made the
 retention-prune non-fatal (was crashing every prod cycle → blank-policy resume). FYI not a file-edit
 conflict — different files.
+
+## FIRST ROBUST CLIMB — value-layer stack at power (2026-07-09, CLIMB-600)
+
+After proving reward-magnitude is dead for forward passing (forward-only 10x flat) and that the fast
+30-game A/Bs are too underpowered to detect a climb (all ~0.5), ran ONE powered run:
+**reward+window + self-bootstrap + MPC-on, 160 train / dual-seed eval**, vs the confirmed reward+window base.
+
+**Result — robust, NOT the 0.55-then-0.51 fragility:**
+- seed A2D9 (120g): payoff **0.579**, Wilson 0.490, GD +45
+- seed C7F9 (100g): payoff **0.615**, Wilson **0.517 → PROMOTE**, GD +29, Elo +48.6
+
+Both seeds ≥0.58 (mean ~0.60); seed3 is the FIRST config to clear the Wilson floor. The value-layer
+stack robustly beats the confirmed base. **Codex r18 caveat:** self-bootstrap is already-on + MC-critic-
+bypassed in prod, so the driver is almost certainly **MPC-at-power** (executor head warm) + 160-game
+training depth, NOT self-boot. **Forward passing is STILL flat (7%/91% lateral both arms)** — the climb
+is finishing/overall-play, not build-up. Codex's forward-share lever (widen MCTS top-4 pass candidate
+exposure + deferred-pass/turnover credit) remains the separate, unsolved passing dimension.
+
+**Next:** vs-analytic-field eval of the treatment net (the true 0.600-vs-field test), + Codex's
+candidate-exposure lever for forward passing. NB found a sim bug: certain eval seeds produce a
+non-terminating match (100% CPU, never completes) — silently stalled several wall-clock evals; wall
+limit not catching it.

@@ -37258,6 +37258,59 @@ fn pass_space_diag_enabled() -> bool {
     *V.get_or_init(|| std::env::var("DD_SOCCER_DUMP_PASS_SPACE_DIAG").is_ok())
 }
 
+/// Diagnostic (gated `DD_SOCCER_DUMP_PASS_CAND_DIAG`, byte-identical off): per pass-candidate
+/// expansion, classify the RANKED teammate targets forward/lateral/back (by feet vs the passer
+/// along attack dir) and count how often a forward target (a) EXISTS in the ranked list at all
+/// (pre-cap) vs (b) SURVIVES into the top-`limit` expanded set (post-cap). This disambiguates the
+/// forward-passing bottleneck: low any-forward-pre-cap ⇒ AVAILABILITY (no forward runners to pass
+/// to — off-ball problem); high pre-cap but low post-cap ⇒ EXPOSURE (forward options pruned by the
+/// candidate cap). Codex round-19.
+fn pass_cand_diag_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DUMP_PASS_CAND_DIAG").is_ok())
+}
+
+static PASS_CAND_DECISIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PASS_CAND_ANY_FWD_PRECAP: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static PASS_CAND_ANY_FWD_POSTCAP: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static PASS_CAND_FWD_TARGETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PASS_CAND_LAT_TARGETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PASS_CAND_BACK_TARGETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn record_pass_candidate_diag(fwd_pre: usize, lat_pre: usize, back_pre: usize, fwd_post: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let d = PASS_CAND_DECISIONS.fetch_add(1, Relaxed) + 1;
+    if fwd_pre > 0 {
+        PASS_CAND_ANY_FWD_PRECAP.fetch_add(1, Relaxed);
+    }
+    if fwd_post > 0 {
+        PASS_CAND_ANY_FWD_POSTCAP.fetch_add(1, Relaxed);
+    }
+    PASS_CAND_FWD_TARGETS.fetch_add(fwd_pre as u64, Relaxed);
+    PASS_CAND_LAT_TARGETS.fetch_add(lat_pre as u64, Relaxed);
+    PASS_CAND_BACK_TARGETS.fetch_add(back_pre as u64, Relaxed);
+    if d % 2000 == 0 {
+        let anyfwd_pre = PASS_CAND_ANY_FWD_PRECAP.load(Relaxed);
+        let anyfwd_post = PASS_CAND_ANY_FWD_POSTCAP.load(Relaxed);
+        let f = PASS_CAND_FWD_TARGETS.load(Relaxed);
+        let l = PASS_CAND_LAT_TARGETS.load(Relaxed);
+        let b = PASS_CAND_BACK_TARGETS.load(Relaxed);
+        let tot = (f + l + b).max(1);
+        eprintln!(
+            "pass_cand_diag decisions={d} any_fwd_precap={:.1}% any_fwd_postcap={:.1}% | \
+             ranked-targets fwd={:.1}% lat={:.1}% back={:.1}%",
+            100.0 * anyfwd_pre as f64 / d as f64,
+            100.0 * anyfwd_post as f64 / d as f64,
+            100.0 * f as f64 / tot as f64,
+            100.0 * l as f64 / tot as f64,
+            100.0 * b as f64 / tot as f64,
+        );
+    }
+}
+
 const PASS_SPACE_DIAG_DEFAULT_LOG_EVERY: u64 = 200;
 
 static PASS_SPACE_DIAG_SOURCE_REACHED: std::sync::atomic::AtomicU64 =
