@@ -11,8 +11,9 @@
 ## 1. Symptom: a hard parity plateau with healthy-looking loss
 
 The learner runs **neural-authoritative**: each decision ranks the analytic engine's candidate
-actions by the neural value head `V_net(s, a)` (`Q_eff = λ·V_net + 1e-6·Q_tab`,
-`DD_SOCCER_NEURAL_AUTHORITATIVE_LAMBDA=8`). Against the analytic engine it scored ~0.53 (parity)
+actions by the neural value head `V_net(s, a)` (`Q_eff = candidate.value + λ·V_net`; λ=8 in this experiment dominates, so the tabular
+candidate value is a negligible tie-break floor; the env var `DD_SOCCER_NEURAL_AUTHORITATIVE_LAMBDA`
+defaults to 0.0). Against the analytic engine it scored ~0.53 (parity)
 and never climbed, while `averageLoss` sat at ~0.0006 — i.e. training *looked* converged and fine.
 
 That combination (flat metric + tiny loss) is the classic signature of a critic that has stopped
