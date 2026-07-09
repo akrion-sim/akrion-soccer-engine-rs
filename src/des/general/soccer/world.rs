@@ -16027,14 +16027,17 @@ impl SoccerMatch {
             && (!goal_attack_shot_is_required(observation, role)
                 || threaded_goal_pass_can_override_forced_shot(observation, role))
         {
-            let (fwd_value, fwd_target) = snapshot.quick_forward_pass_value_for(player_id);
-            if fwd_value >= forward_release_min_quality() {
-                if let Some(target_player) = fwd_target {
+            // Best qualified forward receiver + its open value (production inline of the
+            // test-only `quick_forward_pass_value_for`: same ranked-visible + forward-support path).
+            let forward_targets = snapshot.ranked_visible_pass_targets(player_id, 11);
+            let forward_ctx = snapshot.forward_support_context_for(player_id, &forward_targets);
+            if forward_ctx.best_quick_forward_open_value >= forward_release_min_quality() {
+                if let Some(target_player) = forward_ctx.best_quick_forward_target {
                     // Dedup against the top-N that survive Cap B (borrow-free — cannot touch
                     // `scored_candidates` while the `push_scored_candidate` closure holds it).
-                    let already_exposed = snapshot
-                        .ranked_visible_pass_targets(player_id, neural_mcts_pass_target_candidate_limit())
-                        .contains(&target_player);
+                    let cap = neural_mcts_pass_target_candidate_limit();
+                    let already_exposed =
+                        forward_targets.iter().take(cap).any(|&t| t == target_player);
                     if !already_exposed {
                         if let Some(target_point) = snapshot.player_position(target_player) {
                             let synthetic_trace = SoccerLearnedActionTrace {
