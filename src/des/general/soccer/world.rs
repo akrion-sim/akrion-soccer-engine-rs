@@ -16054,13 +16054,19 @@ impl SoccerMatch {
                                 target_point: Some(target_point),
                                 mpc_replan: None,
                             };
-                            let before = scored_candidates.len();
                             push_scored_candidate(&synthetic_trace, synthetic_plan);
-                            // push may drop the candidate via the executability masks / non-finite score;
-                            // only bias when it actually landed.
-                            if scored_candidates.len() > before {
-                                let injected = scored_candidates.len() - 1;
-                                scored_candidates[injected].score += forward_release_bias();
+                            // The `push_scored_candidate` closure's &mut borrow releases after its last
+                            // use (the push above), so `scored_candidates` can be touched directly now.
+                            // push may drop the candidate via the executability masks, so find it by
+                            // target rather than assume it landed; bias only if present.
+                            if let Some(injected) = scored_candidates
+                                .iter_mut()
+                                .rev()
+                                .find(|c| {
+                                    c.plan.as_ref().and_then(|p| p.target_player) == Some(target_player)
+                                })
+                            {
+                                injected.score += forward_release_bias();
                             }
                         }
                     }
