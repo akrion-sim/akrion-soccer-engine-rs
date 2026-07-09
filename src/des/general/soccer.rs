@@ -23979,11 +23979,32 @@ fn quick_forward_release_opportunity_reward(
     forward_opportunity_quality: f64,
     expected_completion: f64,
 ) -> f64 {
-    let scale = quick_forward_release_reward_scale();
+    let forward_yards = (target.y - origin.y) * team.attack_dir();
+    quick_forward_release_bonus_value(
+        quick_forward_release_reward_scale(),
+        forward_yards,
+        hold_seconds,
+        visible_forward_pass_options,
+        forward_opportunity_quality,
+        expected_completion,
+    )
+}
+
+/// Pure, RNG-free bonus math for [`quick_forward_release_opportunity_reward`], extracted so it is
+/// unit-testable independent of the `OnceLock`-cached env scale. Returns 0 unless the scale is >0 AND
+/// every gate holds; each `*_fit` is 0 AT its gate threshold and ramps to 1 (Codex r19), so a
+/// barely-qualifying pass pays ~0. Capped at `QUICK_FORWARD_RELEASE_REWARD_CAP`.
+fn quick_forward_release_bonus_value(
+    scale: f64,
+    forward_yards: f64,
+    hold_seconds: f64,
+    visible_forward_pass_options: usize,
+    forward_opportunity_quality: f64,
+    expected_completion: f64,
+) -> f64 {
     if scale <= 0.0 {
         return 0.0;
     }
-    let forward_yards = (target.y - origin.y) * team.attack_dir();
     if forward_yards < QUICK_FORWARD_RELEASE_MIN_FORWARD_YARDS
         || visible_forward_pass_options == 0
         || forward_opportunity_quality < QUICK_FORWARD_RELEASE_MIN_OPPORTUNITY
@@ -23993,9 +24014,6 @@ fn quick_forward_release_opportunity_reward(
     {
         return 0.0;
     }
-    // Codex r19 requires each fit to be 0 AT its gate threshold and ramp to 1 as the signal
-    // strengthens — so a barely-qualifying pass pays ~0 and only a clearly-good forward release
-    // earns the bonus (raw-clamp fits would pay half the bonus at the gate, blunting the lever).
     let timing_fit = (1.0 - hold_seconds / QUICK_RELEASE_MAX_HOLD_SECONDS).clamp(0.0, 1.0);
     let forward_gain_fit = ((forward_yards - QUICK_FORWARD_RELEASE_MIN_FORWARD_YARDS)
         / (QUICK_RELEASE_FORWARD_REFERENCE_YARDS - QUICK_FORWARD_RELEASE_MIN_FORWARD_YARDS))
