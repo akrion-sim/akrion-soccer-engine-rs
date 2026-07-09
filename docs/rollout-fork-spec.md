@@ -288,26 +288,48 @@ Per on-ball decision: `C` candidates × `M` seeds × `H` ticks `run_time_step` c
 At 15 Hz, `H = horizon_seconds × 15` (2 s → 30 ticks; 3 s → 45 ticks). Example `C=8, M=4, H=30` →
 **960 `run_time_step` calls per decision.**
 
-The unknown is the per-tick wall-clock, dominated by the `central_brain` LP (Clarabel) + per-player
-MPC solves. **Measure it before building the full rollout** — if 960× per decision is too slow for the
-target regime, we pivot to offline-only (training/eval) or degrade fidelity.
+### MEASURED (2026-07-09, prebuilt `main_soccer_profile`, `match` mode, this laptop)
 
-Measurement plan (cheap, no rollout needed):
-1. There is already a per-step timer: `step_timing_stats` / `SoccerStepTimingStats` (accessor
-   `world.rs:19219`). Run an existing headless bin (`measure_offense.rs`, `main_soccer.rs`) and read
-   mean per-tick µs, split by phase (LP vs MPC vs decision) if the struct breaks it down.
-2. Back-of-envelope: time a full headless match (≈ 90 min × 15 Hz ≈ 81k ticks) wall-clock; per-tick ≈
-   total / 81k. If per-tick ≈ 100 µs → 960× ≈ **~100 ms/decision** — fine offline and for live
-   *on-ball-only* (one agent, a few decisions/sec), too slow for all-22 live.
+| config | ms/tick | ticks/s | notes |
+|---|---:|---:|---|
+| **analytic, NO learning** (the fork regime) | **13.9** | 72 | 5000 ticks / 69.5 s |
+| analytic + learning | ~23.8 | 42 | learning phase = 6.7 ms (28%) — **nulled in the fork** ✓ |
+| live-http preset (MPC/neural as-configured) | ~17.8 | 56 | only +4 ms over analytic ⇒ MPC-on fidelity is affordable offline |
 
-Speed levers if needed (each trades fidelity, §6): freeze the formation LP for the horizon (re-solve
-once, not per tick); cap MPC iterations in the fork; shrink `H` and lean on the EPV leaf (shallow
-search + strong leaf = the whole point); reduce `M` (CRN already minimizes it); parallelize candidates
-(rollouts are independent — `rayon`).
+Per-tick phase split (analytic tick): `field_player_decision` **6.8 ms (49%)**, of which the **on-ball
+possession decision is ~4.2 ms** (the single dominant component — the pass-lane/MPC candidate
+machinery); off-ball (support+defense+loose) ~2.6 ms; ball ~0.005 ms; formation LP + snapshot fold
+into the remaining ~5 ms. `max_step` tail 68–95 ms. Learning is cleanly separable and disappears in
+the fork.
 
-**Decision gate:** if per-decision cost ≤ ~a few ms → viable live on-ball. If ~10–100 ms → offline
-eval/training-distillation only (still valuable: rollout as an *expert* to distill into the cheap net,
-AlphaZero-style). If ≫ 100 ms even after LP-freeze → reconsider.
+### Per-decision rollout cost (at 14 ms/tick)
+
+| C (cands) | M (seeds) | H (ticks) | horizon | traj-ticks | **wall/decision** |
+|---:|---:|---:|---:|---:|---:|
+| 8 | 4 | 30 | 2.0 s | 960 | **~13.4 s** |
+| 6 | 2 | 15 | 1.0 s | 180 | **~2.5 s** |
+| 6 | 2 | 8 (EPV leaf) | 0.5 s | 96 | **~1.3 s** |
+| 4 | 2 | 8 (EPV leaf, prior-pruned) | 0.5 s | 64 | **~0.9 s** |
+
+### Verdict: OFFLINE TEACHER (path B). Live on-ball rollout is ruled out.
+
+The live per-decision budget is the on-ball player's tick slice ≈ **4 ms** (the whole 22-player tick is
+~14 ms). The cheapest useful rollout is ~0.9 s — **~200× over budget**, and the full-fidelity one is
+~3000×. No amount of the fidelity-preserving levers closes a 200× gap at 15 Hz. **So the rollout cannot
+be a live booster; it is an offline expert that generates training targets to distill into the net,
+which is the cheap artifact that runs live.** (This is how AlphaZero deploys anyway: search at
+training time, distilled net at play time.)
+
+Offline viability is fine: ~1–3 s/target with shallow-H + EPV leaf + prior-pruned candidates, and
+rollouts are **embarrassingly parallel** (independent per candidate/seed/decision) → fan out across
+laptop cores and the Hetzner/AWS cluster. Practical notes:
+- **Do NOT compute a rollout target inline for every on-ball decision** during self-play — at ~1–3 s
+  vs the current ~4 ms that's a 250–750× slowdown on those ticks. Generate targets as a **separate,
+  subsampled, parallel offline pass** over saved game states (e.g. K on-ball decisions/game).
+- MPC-on fidelity costs only +30% (17.8 vs 13.9) — the offline rollout can afford to match live
+  dynamics.
+- Cost-reduction levers, biggest first: **shallow H + EPV leaf** (H 30→8 ≈ 4×); **prior-prune C**
+  (net proposes top-K to simulate, 8→4 ≈ 2×); keep **M** small via CRN (§5); **parallelize**.
 
 ---
 
