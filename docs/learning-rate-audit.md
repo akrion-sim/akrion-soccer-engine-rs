@@ -41,8 +41,9 @@ can be large ∝ trajectory length.
 
 **F2 — The keeper head is baseline-free and unnormalized.** `neural_keeper_policy_training_samples`
 sets `advantage = transition.reward` directly — no critic baseline, no standardization
-([world.rs](../src/des/general/soccer/world.rs)). The flat won-game label (±8–12.5)
-then *dominates* the keeper's own shaping rewards (a save is ~4–8), so the keeper would
+([world.rs](../src/des/general/soccer/world.rs)). The flat won-game label (≈±200:
+`MATCH_OUTCOME_WIN_REWARD_POINTS`=200 plus a goal-margin bonus of 15/goal capped at 5 goals,
+soccer.rs:5628-5631) then *dominates* the keeper's own shaping rewards, so the keeper would
 learn "we won ⇒ every action I took was good," independent of quality.
 
 **F3 — Value-target saturation (pre-existing, flagged not fixed).** Targets are
