@@ -24,7 +24,7 @@ lower a `KickReleaseSpec` through `kick_release_clamped_to_pitch` into a
   `shot_speed_yps_from_power`, same `kick_release_clamped_to_pitch` path.
 
 The **discrete representation already exists but is constructed only in tests**:
-- `DiscretizedKickAction { speed_bucket: u8 (10), direction_bucket: u8 (36), curve, elevation }`
+- `DiscretizedKickAction { speed_bucket: u8 (10), direction_bucket: u8 (36), curve, technique, elevation }`
   ([soccer.rs:54822](../src/des/general/soccer.rs#L54822)) with bucket↔value mappings.
 - `lower_discretized_kick_release(origin, action, min_speed, max_speed, ref_distance, bend, dither)`
   → `LoweredKickRelease` ([soccer.rs:55073](../src/des/general/soccer.rs#L55073)) — the
