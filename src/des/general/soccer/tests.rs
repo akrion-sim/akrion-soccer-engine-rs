@@ -141,6 +141,7 @@ fn policy_head_trains_skill_specialists_independently() {
             old_action_probability: None,
             sample_weight: 1.0,
             mcts_distillation: false,
+            forward_select_eligible: false,
         }
     };
     let specialist_steps = |head: &SoccerPolicyHead, kind: SoccerPolicySpecialistKind| {
@@ -246,6 +247,7 @@ fn policy_head_snapshot_round_trips_role_heads_and_specialists() {
             old_action_probability: None,
             sample_weight: 1.0,
             mcts_distillation: false,
+            forward_select_eligible: false,
         }
     };
 
