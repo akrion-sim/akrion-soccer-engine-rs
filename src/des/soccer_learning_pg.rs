@@ -542,6 +542,20 @@ fn soccer_policy_version_status_after_promotion_sample_floor<'a>(
     if sample_games.is_some_and(|sample_games| sample_games >= min_sample_games) {
         requested_status
     } else {
+        // A candidate the runner's gate deemed promotable is being force-archived solely because
+        // its evaluation window is below the sample floor. This is the mechanical promotion-stall
+        // signature: if it recurs every generation, the evolution sample window
+        // (SOCCER_EVOLUTION_WINDOW_GAMES) is structurally below
+        // SOCCER_POLICY_PROMOTION_MIN_SAMPLE_GAMES and no candidate can ever promote. The runner
+        // now floors that window at the sample floor; this log surfaces any residual mismatch.
+        eprintln!(
+            "soccer policy promotion: force-archiving would-be-active candidate due to sample floor \
+             (sample_games={} < min_sample_games={min_sample_games}); a strong candidate cannot \
+             promote until it is evaluated over at least {min_sample_games} games",
+            sample_games
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+        );
         SOCCER_POLICY_STATUS_ARCHIVED
     }
 }
