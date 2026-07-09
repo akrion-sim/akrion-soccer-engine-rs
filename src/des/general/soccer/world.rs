@@ -20539,12 +20539,10 @@ impl SoccerMatch {
                             .as_ref()
                             .map(|decision| decision.action.as_str())
                             .unwrap_or("");
-                        let concrete = intent.action.label();
                         let on_ball = self.ball.holder == Some(scheduled.id);
                         record_net_influence_commit_diag(
                             normalize_soccer_action_label(baseline),
                             normalize_soccer_action_label(semantic),
-                            normalize_soccer_action_label(&concrete),
                             on_ball,
                         );
                     }
