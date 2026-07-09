@@ -150,8 +150,9 @@ without a database.)
    the relational-attention block already exists to build on.
 2. **Keep the actor-relative canonical frame + per-channel normalisation** (done) — it's what
    makes "same situation" look the same.
-3. **Grow network capacity if it plateaus** — the local run is already at 64 hidden units on
-   a 610-dim input; 128 is the next lever once on-policy training flattens.
+3. **Grow network capacity if it plateaus** — the local run is now at 128 hidden units
+   (`DEFAULT_SOCCER_NEURAL_HIDDEN_UNITS = 128`, soccer.rs:5423) on a 620-dim input; 256 is the
+   next capacity lever once on-policy training flattens.
 4. **Use the velocity/acceleration/jerk channels, not just position** — they let the value
    head reason about *where play is going*, not just where it is; the block already carries
    them (V2 added jerk over V1).
