@@ -1,206 +1,166 @@
-# Policy-version bloat + promotion stall (experiment `soccer-self-play-k8s-overnight`)
+# Policy-version bloat + promotion "stall" (experiment `soccer-self-play-k8s-overnight`)
 
-**Status:** diagnosed 2026-07-08. Read-optimizing index already applied to RDS (see §6.3). Code
-fixes for the promotion stall (§3a → §4) and the neural-blob bloat at source (§6.1) are
-**implemented on this branch** (`promotion-bloat-fix`) — not merged, not deployed. The one-time
-reclaim of existing rows (§5) remains a **draft pending operator sign-off**; nothing in §5 has been
-run and no rows have been deleted.
+**Status:** diagnosed 2026-07-08, **corrected 2026-07-09 after an audit against RDS**. One code fix
+is implemented on branch `promotion-bloat-fix`: the **neural-blob bloat** strip (§3b → §6.1). The
+originally-drafted promotion fix (flooring the evolution sample window at the gate) was **reverted** —
+the audit showed the "promotion stall" is the genuine **plateau**, not a mechanical sample-count bug
+(see §3a). The one-time RDS reclaim (§5) is a **draft pending operator sign-off**; nothing in §5 has
+been run and no rows deleted.
 
-> **Implementation note / correction to §3a.** Tracing the code showed `gate.sampleGames` is the
-> **occupancy of the evolution sample window** (`evolution_search_samples`, capped by
-> `SOCCER_EVOLUTION_WINDOW_GAMES`) — one `sample_games` per `MatchSummary` — **not** `eliteGames`
-> directly (`eliteGames` is the breeding-elite count). So the true fix floors the effective evolution
-> *window* at the gate's `min_sample_games` when the gate is enabled, leaving breeding dynamics
-> (`SOCCER_EVOLUTION_ELITE_GAMES`) untouched. Implemented as
-> `evolution_window_games_floored_for_promotion_gate` in `src/bin/main_soccer_learning_run.rs`, plus a
-> guard log in `soccer_policy_version_status_after_promotion_sample_floor` when a would-be-active
-> candidate is force-archived purely by the floor. Change B (bloat) strips `neuralNetwork` from
-> persisted `metrics` only for versions that are **non-active AND `promotion.status == "archived"`** —
-> exactly the rows every live loader already excludes, so the `:5055`/resume/neural load paths never
-> lose the net they actually read. Gated by `SOCCER_PG_RETAIN_ARCHIVED_POLICY_VERSION_NEURAL`
-> (defaults to safe stripping). Commit on branch `promotion-bloat-fix`.
+> **Correction (why the promotion fix was reverted).** My first pass claimed the sample floor
+> (`min_sample_games`=8) archived every candidate because the evolution window was ~3. The RDS
+> provenance disproves that: candidates that go through the FULL promotion gate carry
+> `gate.minSampleGames=8`, `sampleGames=8`, and **67 of them are `eligible:true`** (59 at gen ≥456).
+> So candidates ARE evaluated over 8 games and CAN pass the gate. The active is still frozen at gen
+> 456 because, on the honest 8-game evaluation, later candidates **regress** vs the incumbent —
+> rejection reasons are dominated by `incumbent_mean_match_fitness … below incumbent …` and
+> `incumbent_mean_play_quality … regression 0.0500`. The ~2.88M "fitness" that looked promotable was
+> the **3-game tactical-search self-play score** (noisy, overfit); the same candidates score ~0.31–0.45
+> mean_match_fitness over 8 games vs the incumbent's ~0.78–1.18. **This is the plateau, and the
+> anti-regression gate is working as designed.** No promotion *code* change is warranted; the lever is
+> the climb work (search/objective/capacity — see `docs/fix-plateau.md`, `docs/climbing.md`).
 
 ## 1. Summary
 
-Two independent problems, one shared symptom (the local `:5055` viewer could not load learned
-weights because a probe query had to detoast ~2 GB of JSONB per call):
-
-- **Promotion stall (behavioural).** The evolutionary tactical search evaluates each candidate over a
-  sample window that is smaller than the promotion gate's `sampleGames >= 8` requirement, so every
-  would-be promotion is force-downgraded to `archived`. The active policy has been frozen at
-  **gen 456** since 2026-07-03, while the generation counter cycles within **gens 457–460**.
-- **Unbounded version-row retention (operational).** Every archived candidate row keeps its full
-  `neuralNetwork` blob in `metrics` (~400 KB each). Nothing ever deletes a *version* row or strips
-  its neural blob — the only existing pruning targets the separate `policy_entries` (tabular) table.
-  The `des_soccer_learning_policy_versions` table is now **~3.2 GB** and grows **~0.5 GB/day**.
-
-The plateau itself (best self-play fitness flat at ~2.88M for 6 days) is expected RL behaviour and is
-tracked separately (see `docs/fix-plateau.md`, `docs/climbing.md`). This doc is about the two
-*mechanical* bugs above.
+- **Version-row bloat (operational bug — FIXED on this branch).** Every archived candidate keeps its
+  full `neuralNetwork` blob in `metrics` (~400 KB). Nothing ever deletes a version row or strips its
+  neural blob (the only pruning targets the separate `policy_entries` table). The
+  `des_soccer_learning_policy_versions` table is ~3.2 GB and grows ~0.5 GB/day. This is a real bug and
+  is what forced the `:5055` neural probe to detoast ~2 GB per call.
+- **Promotion "stall" (NOT a bug — the plateau).** The active policy has been frozen at gen 456 since
+  2026-07-03 while the evolution search churns ~1000+ candidates/day that never beat the incumbent on
+  the real 8-game evaluation. The gate correctly rejects regressions. Addressed by learning work, not
+  a patch.
 
 ## 2. Evidence (read-only, RDS)
 
-Rows per day for the experiment — note the regime change on ~Jul 2–4 (rows explode while distinct
-generations collapse to ~4/day, i.e. generation advancement stalls):
+Rows/day show a regime change ~Jul 2–4 (rows explode, distinct generations collapse to ~4/day):
+Jun 21–Jul 1 ≈ 1 version/gen (healthy); Jul 4–9 ≈ 1000–1400 versions/day across only 4 generations
+(457–460). Gens 457–460 = 6256 rows, **all `status='archived'`**, `source_kind` merge 4319 / mutation
+1919 / replay 18, one `branch_key`, every row keeps a `neuralNetwork` blob (avg 422 KB),
+`full_entries_pruned_at` NULL for all. Table `pg_total_relation_size = 3194 MB`.
 
-| day | rows | distinct gens |
-|---|---|---|
-| …Jun 21–Jul 1 | 1–98/day | ≈ rows (1 version/gen — healthy) |
-| Jul 2 | 171 | 87 |
-| Jul 3 | 410 | 17 |
-| Jul 4 | 1206 | **4** |
-| Jul 5 | 1350 | **4** |
-| Jul 6 | 1148 | **4** |
-| Jul 7 | 1402 | **4** |
-| Jul 8 | 604 | **4** |
-| Jul 9 | 291 | **4** |
+Promotion provenance (the corrected part):
+- Active row = gen 456, `…-neural-checkpoint`, `source_kind=replay`, force-activated as a checkpoint;
+  its own gate shows `eligible:false` with `rejectionReasons:["incumbent_mean_play_quality 0.3823
+  below incumbent 0.4380 - regression 0.0500"]`.
+- Full-gate rows (`minSampleGames=8`): **67 `eligible:true`** (gens 372–459, 59 at gen ≥456); the
+  `eligible:false` majority is rejected for match-fitness and/or play-quality regression vs incumbent.
+- Evolution branch-tips (gens 457–460) carry a *looser* internal gate (`minSampleGames=1`,
+  `promotion.status='active'`) but are written as branch tips and immediately superseded → row
+  `status='archived'`. They never reach the real active-promotion path. (All 7310 rows whose evolution
+  gate says `promotion.status='active'` are row-`archived`.)
 
-Per-generation snapshot (gens 457–460): 6256 rows, **all `status='archived'`**, `source_kind` ∈
-{`merge` 4319, `mutation` 1919, `replay` 18}, **one** `branch_key`, 4257 distinct parents, every row
-retains a `neuralNetwork` blob (avg 422 KB), `full_entries_pruned_at` NULL for all. The single
-`active` row is gen 456 (`…-neural-checkpoint`, fitness 1.26M). Best archived fitness ~2.88M
-(measured on ~3 games — noisy) has not improved since Jul 3.
+## 3. Root causes
 
-Table footprint: `pg_total_relation_size = 3194 MB`; 6987 of 6988 experiment rows are archived rows
-carrying a neural blob. Only **1** archived row is referenced as a `parent_policy_version_id` by a
-surviving (non-archived) row.
+### 3a. Promotion — NOT a mechanical bug (the plateau)
 
-## 3. Root causes (code)
+The persistence sample floor `soccer_policy_version_status_after_promotion_sample_floor`
+(`src/des/soccer_learning_pg.rs`) does downgrade a would-be-`active` version to `archived` when
+`gate.sampleGames < max(gate.minSampleGames, SOCCER_POLICY_PROMOTION_MIN_SAMPLE_GAMES)`. **But the
+data shows this is not the current blocker:** full-gate candidates have `sampleGames=8` and pass the
+floor, and 59 are `eligible:true` at gen ≥456 yet the active never advanced. The binding constraint is
+the **anti-regression ratchet** (`active_max_fitness_regression` / play-quality regression): later
+candidates genuinely lose vs the strong incumbent (gen 456) on the 8-game evaluation. That is the
+plateau, tracked in `docs/fix-plateau.md` / `docs/climbing.md` and [[akrion-climb-state]] — a
+learning-quality problem, not a code defect. **No promotion code change is shipped.**
 
-### 3a. Promotion sample-floor vs. evolution sample window
+### 3b. Version-row / neural-blob retention (real bug — fixed)
 
-`soccer_policy_version_status_after_promotion_sample_floor` (`src/des/soccer_learning_pg.rs`)
-downgrades any version requested as `active` to `archived` when `gate.sampleGames < min_sample_games`:
-
-```rust
-let min_sample_games = gate.get("minSampleGames")…    // default from …
-    .max(configured_min_sample_games);                 // soccer_neural_snapshot_min_sample_games()
-if sample_games.is_some_and(|s| s >= min_sample_games) { requested_status }
-else { SOCCER_POLICY_STATUS_ARCHIVED }
-```
-
-- `min_sample_games` default = **8** — `soccer_neural_snapshot_min_sample_games()` (env
-  `SOCCER_POLICY_PROMOTION_MIN_SAMPLE_GAMES`).
-- `gate.sampleGames` = the number of `MatchSummary` samples in the evolution window
-  (`evolution_search_samples`, capped by `SOCCER_EVOLUTION_WINDOW_GAMES`), populated via
-  `run_evolution_search_metadata` → `policy_promotion_search_metadata` →
-  `evaluate_soccer_policy_promotion_gate`. Observed **3** live. (`eliteGames`,
-  `DEFAULT_SOCCER_EVOLUTION_ELITE_GAMES = 4`, is the *breeding-elite* count — a red herring for the
-  gate, though it is what surfaced first in the metrics.)
-
-**window occupancy (3) < gate (8), structurally, so no candidate can satisfy the gate.** Promotion is
-impossible by construction; the active policy is frozen.
-
-### 3b. No retention on version rows / neural blobs
-
-- The write+archive path (`insert_policy_version_with_id_inner` and neighbours,
-  `src/des/soccer_learning_pg.rs`) inserts `metrics` (including `neuralNetwork`) for **every** version,
-  archived or not.
-- `full_entries_retained` (via `soccer_policy_version_retains_full_entries`) only governs whether the
-  **tabular `policy_entries`** are written — it does **not** touch the neural blob in
+- The write+archive path inserts `metrics` (including `neuralNetwork`) for **every** version.
+- `full_entries_retained` only governs the tabular `policy_entries`, never the neural blob in
   `policy_versions.metrics`.
-- The only pruning that exists (`prune_superseded_branch_entries_batched`; gated by
-  `SOCCER_PG_INLINE_POLICY_PRUNE`) deletes from `des_soccer_learning_policy_entries`, never from
-  `des_soccer_learning_policy_versions`.
-- There is **no** `DELETE FROM des_soccer_learning_policy_versions` anywhere in the tree, and no code
-  path strips `neuralNetwork` from an archived version's `metrics`.
+- The only pruning (`prune_superseded_branch_entries_batched`, env `SOCCER_PG_INLINE_POLICY_PRUNE`)
+  deletes from `policy_entries`, never from `policy_versions`. There is no `DELETE FROM
+  des_soccer_learning_policy_versions` anywhere, and nothing strips the archived blob.
 
 Net: archived candidates accumulate forever with full neural weights.
 
-## 4. Fix — Part 1: promotion reachable (IMPLEMENTED, config-safe)
+## 4. Fix — Part 1: promotion (NO code change)
 
-Make candidates *able* to promote, which unblocks the plateau's promotion path and stops the per-day
-churn from being pointless.
-
-**Implemented:** `evolution_window_games_floored_for_promotion_gate(window, gate_enabled, min_sample_games)`
-floors the effective evolution window at `min_sample_games` **only when the gate is enabled**, never
-lowering a larger operator-set window. Breeding (`SOCCER_EVOLUTION_ELITE_GAMES`) and the gate itself
-are untouched (the gate exists to avoid promoting on 3-game noise). A guard log fires when a
-would-be-active candidate is force-archived purely by the sample floor, so the failure is visible
-instead of silent.
-
-Env levers still honoured: `SOCCER_EVOLUTION_WINDOW_GAMES`, `SOCCER_EVOLUTION_ELITE_GAMES`,
-`SOCCER_POLICY_PROMOTION_MIN_SAMPLE_GAMES`. No data is modified. Reversible by reverting the branch.
-
-> This alone does **not** shrink the table — it stops future waste and lets the active advance.
+Reverted the drafted window-floor. The promotion freeze is the plateau; the levers are learning-side
+(evolution objective is optimising match fitness while play quality regresses; incumbent gen 456 is a
+strong checkpoint nothing has beaten on 8-game eval). Operator knobs that exist if a *policy* decision
+is wanted (not shipped, judgment calls): `SOCCER_BATCH_POLICY_ACTIVE_MAX_FITNESS_REGRESSION` /
+`SOCCER_POLICY_ACTIVE_MAX_FITNESS_REGRESSION` (loosen the ratchet — invites quality regressions),
+`SOCCER_POLICY_PROMOTION_MIN_SAMPLE_GAMES`. The real work is in `docs/fix-plateau.md`.
 
 ## 5. Fix — Part 2: reclaim the ~3.2 GB (DRAFT — guarded, staged, reversible-with-backup)
 
-**Constraints that make naive deletion unsafe:**
+**Constraints.** Self-referencing FK `parent_policy_version_id → id` (no `ON DELETE`) — a row that is
+another row's parent can't be deleted without handling the child. Preserve the active row, current
+branch tip(s), and the 1 archived row referenced by a survivor.
 
-- Self-referencing FK `des_soccer_learning_policy_versio_parent_policy_version_id_fkey`
-  (`parent_policy_version_id → id`, no `ON DELETE`), so a row that is any other row's parent cannot be
-  deleted without first handling the child (delete leaves-first, or `NULL` the child's parent).
-- The active row and the current branch tip(s) must be preserved, plus the 1 archived row referenced
-  by a survivor (§2).
+**Measured reclaim (read-only dry-run, 2026-07-08):** stripping `neuralNetwork` from archived, non-tip
+versions covers **6986 rows / ~4.2 GB of uncompressed JSON text**. On-disk reclaim after `VACUUM` is a
+large fraction of the 3.2 GB (TOAST compressed).
 
-**Measured reclaim (read-only dry-run, 2026-07-08):** stripping `neuralNetwork` from archived,
-non-tip versions (keeping the newest tip per branch and the 1 archived row referenced by a survivor)
-covers **6986 rows / ~4.2 GB of uncompressed JSON text** — essentially the whole table minus a handful
-of live rows. On-disk reclaim after `VACUUM` is a large fraction of the current 3.2 GB (TOAST is
-compressed, so the freed disk is less than the raw JSON figure but still dominant).
-
-**Recommended reclaim = strip the blob, keep the row** (preserves lineage, fitness, provenance;
-sidesteps the FK entirely):
+**Recommended = strip the blob, keep the row** (preserves lineage/fitness/provenance; sidesteps FK):
 
 ```sql
--- DRY RUN: rows / bytes reclaimable
+-- DRY RUN
 select count(*), pg_size_pretty(sum(length(metrics::text))::bigint)
 from des_soccer_learning_policy_versions
 where experiment_id = '7c7e2f5a-a2d5-49f7-b9c0-339d8853b23b'
-  and status = 'archived' and metrics ? 'neuralNetwork'
+  and status='archived' and metrics ? 'neuralNetwork'
   and id not in ( /* safety-keep: newest tip per branch_key + parents-of-survivors */ );
 
--- APPLY (only after sign-off + backup), batched; repeat until 0 rows; each batch its own txn:
+-- APPLY (after sign-off + backup), batched; repeat until 0 rows; each batch its own txn:
 with victims as (
   select id from des_soccer_learning_policy_versions
-  where experiment_id = '7c7e2f5a-…' and status='archived' and metrics ? 'neuralNetwork'
-    and id not in ( /* safety-keep set */ )
-  limit 500
+  where experiment_id='7c7e2f5a-…' and status='archived' and metrics ? 'neuralNetwork'
+    and id not in ( /* safety-keep set */ ) limit 500
 )
-update des_soccer_learning_policy_versions v
-set metrics = v.metrics - 'neuralNetwork'
+update des_soccer_learning_policy_versions v set metrics = v.metrics - 'neuralNetwork'
 from victims where v.id = victims.id;
 ```
 
-Safety rails: **back up first** (`pg_dump -t … --where="experiment_id=…"` or a snapshot table); run
-~500-row batches with a short `statement_timeout`; **`VACUUM` (or `pg_repack`) afterward** to return
-space to the OS; do it while the learner is briefly paused / off-peak. **Alternative (row delete)**
-only if the row count itself matters: delete archived non-tip rows leaves-first, or `NULL` survivors'
-`parent_policy_version_id` into the victim set first — more moving parts than the strip.
+Rails: back up first (`pg_dump -t … --where`); ~500-row batches, short `statement_timeout`; `VACUUM` /
+`pg_repack` after; run off-peak / learner paused. Once §6.1 is deployed, this catch-up never repeats.
 
-Note: once §6.1 (strip-on-archive) is deployed, this one-time catch-up never needs repeating.
+## 6. Fix — Part 3: durable
 
-## 6. Fix — Part 3: make it durable
-
-1. **Strip on archive (IMPLEMENTED).** In the write path, when a version is non-active AND its
-   `promotion.status == "archived"`, persist `metrics` **without** `neuralNetwork` (lightweight
-   provenance/fitness/tactical fields preserved; `postgresRetention.neuralSnapshotStripped` recorded).
-   The active head and any still-promotable version keep their blob, so the `:5055`/resume/neural
-   loaders never lose the net they read. Gated by `SOCCER_PG_RETAIN_ARCHIVED_POLICY_VERSION_NEURAL`
-   (defaults to safe stripping).
-2. **Version retention window (NOT implemented — out of scope).** A follow-up could cap archived tips
-   per branch or last M days in the same best-effort post-commit maintenance that prunes entries
-   (`SOCCER_PG_INLINE_POLICY_PRUNE`). Superseded *old actives* still keep their blob (one per
-   promotion — not the per-generation population bloat, which §6.1 fixes).
+1. **Strip on archive (IMPLEMENTED, this branch).** When a version is non-active AND its
+   `promotion.status == "archived"`, persist `metrics` **without** `neuralNetwork`
+   (`postgresRetention.neuralSnapshotStripped` recorded; lightweight fields kept). Gated by
+   `SOCCER_PG_RETAIN_ARCHIVED_POLICY_VERSION_NEURAL` (defaults to safe stripping). **Audited safe
+   across every loader** (see below); the active head and any non-gate-archived version always keep
+   their blob.
+2. **Version retention window (NOT implemented).** Follow-up: cap archived tips per branch / last M
+   days in the post-commit maintenance. Superseded old *actives* still keep their blob (one per
+   promotion — negligible vs the population bloat §6.1 fixes).
 3. **Index (already applied to RDS).** `des_soccer_learning_policy_versions_neural_gen_idx` on
-   `(experiment_id, generation DESC)` lets the live `:5055` neural probe do a bounded index scan
-   instead of a full-table detoast (query 2 min → 2 ms). The live viewer also runs with
-   `SOCCER_POLICY_PROMOTION_BASELINE_LOOKBACK_GENERATIONS=0` so its candidate window stays on the
-   latest generation (see `~/bin/soccer-live-5055.sh`, `docs/live-runner-weights.md`).
+   `(experiment_id, generation DESC)` → `:5055` neural probe 2 min → 2 ms. Viewer also runs with
+   `SOCCER_POLICY_PROMOTION_BASELINE_LOOKBACK_GENERATIONS=0`.
+
+### §6.1 loader-safety audit (2026-07-09)
+
+Strip removes the blob ONLY for non-active rows with `promotion.status=="archived"`. Every path that
+reads a version's neural net excludes exactly those rows:
+- `load_latest_policy_metadata` (incl. `_with_min_visits`) — WHERE excludes `promotion.status='archived'`.
+- `load_latest_neural_policy_metadata` — WHERE requires `status='active'` OR (`promotion.status!='archived'`
+  AND `anchorPromotion.status!='archived'` AND no checkpoint reason).
+- `load_policy_version_with_min_visits` (by-id, used by resume at `main_soccer_learning_run.rs:4002,8513`)
+  — the id is always `pg_baseline.policy_version_id` from `load_strongest_recent_policy_promotion_baseline`,
+  whose WHERE requires `promotion.status='active'`.
+- `load_strongest_recent_policy_promotion_baseline` — reads only gate scalars, no neural.
+- `load_latest_tournament_elite_neural_pool` — reads a different table (`des_soccer_tournament_team_brains`).
+- `load_latest_active_policy*` — active only.
+
+No loader can select a stripped version. Direction is conservative (keeps more than strictly needed —
+e.g. anchor-archived-but-promotion-active rows keep their blob). Verified by
+`policy_version_strips_neural_snapshot_only_for_gate_archived_non_active` and
+`policy_version_retains_neural_snapshot_mirrors_loader_reachability`.
 
 ## 7. Suggested order of operations
 
-1. Deploy §4 + §6.1 (this branch) to the learner (stops waste, unblocks promotion, self-limits the
-   table).
-2. Confirm the active policy starts advancing past gen 456 (watch for a new `status='active'`).
-3. §5 dry-run → operator sign-off + backup → batched strip → `VACUUM` for the one-time backlog.
+1. Deploy §6.1 (this branch) — stops the table self-bloating.
+2. §5 dry-run → sign-off + backup → batched strip → `VACUUM` for the backlog.
+3. Promotion/plateau: separate track (`docs/fix-plateau.md`), not this branch.
 
 ## 8. Open questions for the operator
 
-- Is the ~3-game evaluation window intended, with the 8-game gate a leftover default? (§4 floors the
-  window up to the gate; if instead the gate should drop, set `SOCCER_POLICY_PROMOTION_MIN_SAMPLE_GAMES`.)
-- Are archived candidate **weights** needed for any offline analysis, or is fitness+provenance enough?
-  (If disposable, §5 strip is clearly correct.)
-- Should generation numbering advance per accepted candidate rather than cycling 457–460? (Surface
-  signal that promotion is stuck; separate from bloat.)
+- Is the incumbent gen-456 checkpoint (itself gate-`ineligible`, force-activated) the right baseline,
+  or should the ratchet/anchor be re-based? (Plateau track.)
+- Are archived candidate **weights** needed for offline analysis, or is fitness+provenance enough? (If
+  disposable, §5 strip is clearly correct.)
