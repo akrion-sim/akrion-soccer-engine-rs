@@ -245,16 +245,37 @@ pub(crate) fn dd_soccer_enable_learned_epv_potential() -> bool {
     })
 }
 
+/// Multiplier applied to the learned-EPV grid value when it feeds the territorial potential.
+/// The fitted EPV grid spans a much narrower range (~[-0.15, 1.0]) than the closed-form
+/// `expected_threat` seed (~[0, 1.8]), so a raw swap would silently shrink the territorial
+/// reward gradient ~10× and drown it under the other dense terms. This knob rescales EPV to a
+/// comparable magnitude so the A/B isolates the potential's SHAPE (outcome-grounded vs raw
+/// territory), not its scale. Default 1.0; clamped to a sane [0, 100]. Only consulted when the
+/// potential gate is on, so the default process stays byte-identical.
+pub(crate) fn learned_epv_potential_scale() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_LEARNED_EPV_POTENTIAL_SCALE")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .unwrap_or(1.0)
+            .clamp(0.0, 100.0)
+    })
+}
+
 /// Per-cell threat value used to build the territorial **potential** Φ. With the potential
-/// gate on and a grid loaded this is the outcome-grounded learned EPV — a cell near the
-/// opponent box (chains that end in shots/goals) scores high, a turnover-prone deep cell
-/// scores low or negative — so the telescoping PBRS term `γΦ(s') − Φ(s)` finally rewards
-/// *chance creation* rather than raw territory. Falls back to (and is byte-identical with)
-/// the closed-form [`expected_threat`] seed when the gate is off or no grid is present.
+/// gate on and a grid loaded this is the outcome-grounded learned EPV (scaled by
+/// [`learned_epv_potential_scale`]) — a cell near the opponent box (chains that end in
+/// shots/goals) scores high, a turnover-prone deep cell scores low or negative — so the
+/// telescoping PBRS term `γΦ(s') − Φ(s)` finally rewards *chance creation* rather than raw
+/// territory. Falls back to (and is byte-identical with) the closed-form [`expected_threat`]
+/// seed when the gate is off or no grid is present.
 pub(crate) fn threat_potential(team: Team, p: Vec2, field_width: f64, field_length: f64) -> f64 {
     if dd_soccer_enable_learned_epv_potential() {
         if let Some(v) = learned_epv_lookup(team, p, field_width, field_length) {
-            return v;
+            return v * learned_epv_potential_scale();
         }
     }
     expected_threat(team, p, field_width, field_length)
