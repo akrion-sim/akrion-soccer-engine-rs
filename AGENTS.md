@@ -159,7 +159,7 @@ Never run destructive or irreversible shell commands. To remove or move files,
 **Whitelisted — safe, prefer these:**
 - `git rm` / `git rm --cached` — remove files through git (recoverable via history).
 - `git mv` — rename/move through git.
-- `git restore <path>` (single file), `git revert`, `git stash` (push) — reversible.
+- `git restore <path>` (single file), `git revert` — reversible. (No `git stash` in this repo — it is forbidden entirely; see the rule above.)
 - Editing via the editor tools, `git add`, `git commit`, `git switch -c`.
 
 If a genuinely destructive action seems unavoidable, **STOP and ask the operator
