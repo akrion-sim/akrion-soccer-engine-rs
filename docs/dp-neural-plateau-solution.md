@@ -31,7 +31,7 @@ So the solution is not "DP instead of neural nets." It is:
 cross-tick measurement
   -> Bellman / approximate DP propagation
   -> neural value + actor learning over full field context
-  -> short learned-model/MCTS lookahead
+  -> short learned-model lookahead, with neural MCTS optional
   -> MPC feasibility and execution
   -> strict held-out promotion
 ```
@@ -76,7 +76,7 @@ That is why the neural net remains central:
 - it consumes the high-dimensional field vector;
 - it generalizes between similar but not identical situations;
 - it estimates value for states never seen exactly before;
-- it lets learned MPC/MCTS score candidate futures;
+- it lets learned MPC and optional neural MCTS score candidate futures;
 - it supports MAPPO/MARL style team credit beyond one player's immediate reward.
 
 The neural net should learn from DP-improved targets. It should not be forced to
@@ -89,7 +89,7 @@ discover all delayed credit from scratch.
 | Cross-tick measurement | Detect pass, dribble, shot, turnover, and conceded-danger outcomes across multiple `run_time_step` calls | Yes, for reward truth |
 | Approximate DP / Bellman replay | Propagate delayed outcomes backward through the trajectory | Yes, for target quality |
 | Neural actor/value | Generalize value and action preference over the full field vector | Yes, for learning and decisions |
-| Learned world model / neural MCTS | Score short candidate futures and teach better action targets | Yes, as a planner/teacher |
+| Learned world model / optional neural MCTS | Score short candidate futures and teach better action targets | Yes for the world model; MCTS is optional/non-primary |
 | MPC | Make the selected intent physically feasible and field-aware | Yes, as executor/guard |
 | Population perturbation | Escape local optima when the neural policy stalls | No, only as plateau escape |
 | League/tournament evolution | Broad ranking and exploration | No, not while debugging this plateau |
@@ -103,8 +103,12 @@ The local training setup should keep these active:
 - MAPPO/MARL team reward sharing;
 - full 22-player plus ball motion vector;
 - analytic opponent for held-out pressure;
-- approximate DP replay passes;
-- neural world model and small neural MCTS;
+- approximate DP replay passes (forward-pass climb profiles now default to the
+  full 8-pass replay budget unless `SOCCER_APPROX_DP_REPLAY_PASSES` overrides);
+- DP-bootstrapped replay returns for the climb stack:
+  `DD_SOCCER_ENABLE_DP_BOOTSTRAP=1`, `DD_SOCCER_DP_BOOTSTRAP_HORIZON=64`, and
+  `DD_SOCCER_DP_BOOTSTRAP_SWEEPS=200`;
+- neural world model, with neural MCTS optional/non-primary;
 - local MPC with field-aware, reconcile, and latent-objective gates;
 - guarded snapshot propagation, so newest weights are used only when they are
   not much worse than the batch's best HOME objective;
@@ -169,7 +173,7 @@ The immediate solution is therefore hybrid:
 measure outcomes correctly across ticks
 use approximate DP to propagate delayed credit
 train neural actor/value on the corrected trajectory
-let learned model/MCTS propose short-horizon improvements
+let the learned model propose short-horizon improvements, with MCTS optional
 let MPC execute safely
 promote only through strict held-out gates
 ```
