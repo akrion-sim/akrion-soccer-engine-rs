@@ -1163,6 +1163,7 @@ mod tests {
             target_popart: None,
             policy_head: None,
             skill_policy_heads: None,
+            keeper_policy_head: None,
             mpc_objective_head: None,
             line_depth_head: None,
         };
