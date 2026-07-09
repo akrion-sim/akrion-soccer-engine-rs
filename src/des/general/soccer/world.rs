@@ -27557,6 +27557,66 @@ impl SoccerMatch {
                     } else {
                         goal_center_x
                     };
+                    // Learned MPC execution-objective residual for SHOT PLACEMENT — the shot analogue
+                    // of the pass-lead nudge in the pass launch path (see the `led_target` residual
+                    // above). Gated on the SEPARATE, default-OFF
+                    // `DD_SOCCER_ENABLE_LEARNED_MPC_SHOT_OBJECTIVE` (NOT the default-ON pass gate) so
+                    // shots stay byte-identical / A/B-clean until deliberately enabled. Shot placement
+                    // is inherently LATERAL — the ball must cross the goal line at the fixed `goal_y`,
+                    // and the whole downstream pipeline (`noisy_shot_target_x`, the goal-mouth clamp)
+                    // only touches x — so we apply ONLY the residual's lateral (x) component to the
+                    // analytic aim `base_goal_x` (the mean placement AFTER curl/scored-placement),
+                    // BEFORE `noisy_shot_target_x` adds execution noise, exactly mirroring how the pass
+                    // path shifts the intended `led_target` before its own aim noise. The shifted aim
+                    // then flows through the SAME `.clamp(goal_center_x ± half_goal*1.25)` goal-mouth
+                    // guard below, so the residual can never breach the posts. The captured
+                    // `applied_residual` is `(x, 0.0)` so the RWR target matches what was applied (a
+                    // shot has no forward placement DOF); the bend axis is `0.0` (aim only — power and
+                    // when-to-shoot stay with their own heads, per the shot-placement scope).
+                    let mpc_shot_objective: Option<(Vec<f32>, Vec2, f64)> =
+                        if dd_soccer_enable_learned_mpc_shot_objective() {
+                            if let Some(head) = self.mpc_objective_head.clone() {
+                                let features = snapshot.mpc_objective_learn_features(
+                                    player_team,
+                                    MpcObjectiveFamily::Shot,
+                                    player_pos,
+                                    Vec2::new(base_goal_x, goal_y),
+                                    pressure,
+                                );
+                                let sigma = mpc_objective_explore_sigma_yards();
+                                let (noise_fwd, noise_lat) = self.mpc_objective_exploration_noise();
+                                let residual = if head.is_warm() {
+                                    head.explore_residual(&features, sigma, noise_fwd, noise_lat)
+                                } else {
+                                    // Cold start: explore around the ANALYTIC aim (zero residual) so
+                                    // the head accrues shot-family training data before it is trusted
+                                    // live — identical shape to the pass cold-start jitter.
+                                    Some(Vec2 {
+                                        x: (noise_lat * sigma).clamp(
+                                            -MPC_OBJECTIVE_MAX_RESIDUAL_YARDS,
+                                            MPC_OBJECTIVE_MAX_RESIDUAL_YARDS,
+                                        ),
+                                        y: (noise_fwd * sigma).clamp(
+                                            -MPC_OBJECTIVE_MAX_RESIDUAL_YARDS,
+                                            MPC_OBJECTIVE_MAX_RESIDUAL_YARDS,
+                                        ),
+                                    })
+                                };
+                                residual.map(|r| {
+                                    // Apply the lateral component only; re-clamp to the goal-mouth
+                                    // bounds already used at this site (posts ± execution slack).
+                                    base_goal_x = (base_goal_x + r.x).clamp(
+                                        goal_center_x - half_goal * 1.25,
+                                        goal_center_x + half_goal * 1.25,
+                                    );
+                                    (features, Vec2 { x: r.x, y: 0.0 }, 0.0)
+                                })
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
                     let goal = Vec2::new(
                         noisy_shot_target_x(
                             base_goal_x,
