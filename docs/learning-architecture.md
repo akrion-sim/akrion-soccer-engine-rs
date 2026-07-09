@@ -50,7 +50,7 @@ flowchart TB
 
     subgraph LEARN["Update / optimization"]
         NEU["Neural learner (threaded)<br/>actor-critic + GAE advantage, PPO clip (multi-epoch)<br/>replay 512, batch 16, lr 0.015, hidden 128"]
-        GA["Evolution / GA self-play<br/>every 5 games: mutate / crossover / elite (pop 16)"]
+        GA["Evolution / GA self-play<br/>every 10 games: mutate / crossover / elite (pop 6, max 16)"]
         GATE["Policy promotion gate<br/>min fitness, max conceded, play quality"]
     end
 
