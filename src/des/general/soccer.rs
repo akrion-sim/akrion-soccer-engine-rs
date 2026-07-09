@@ -23509,20 +23509,30 @@ fn completed_pass_reward_for_pitch(
         pass_direction_bucket(team, origin, target),
         pass_origin_in_own_half(team, origin, field_length),
     ) {
+        // The forward-pass-primacy scale (`DD_SOCCER_FORWARD_PASS_REWARD_SCALE`) multiplies ONLY the
+        // forward reward, so it tilts the FORWARD:lateral ratio — the thing that actually shifts
+        // selection. Previously the whole sum (incl. the lateral 1.2, backward penalty, flank bonus)
+        // was scaled, so scale=6 made a lateral recycle worth 7.2 and scale=10 worth 12 — SUBSIDIZING
+        // the safe-recycle local optimum the lever is meant to break. Empirically scale=10 moved
+        // forward share the WRONG way (7%→5%) because it lifted lateral too. Codex round-17.
+        // Byte-identical at the default scale=1.
         (PassDirectionBucket::Forward, true) => {
-            COMPLETED_FORWARD_PASS_BASE_REWARD_OWN_HALF + forward_progress_reward
+            (COMPLETED_FORWARD_PASS_BASE_REWARD_OWN_HALF + forward_progress_reward)
+                * forward_pass_reward_scale()
         }
         (PassDirectionBucket::Forward, false) => {
-            COMPLETED_FORWARD_PASS_BASE_REWARD_OPPONENT_HALF + forward_progress_reward
+            (COMPLETED_FORWARD_PASS_BASE_REWARD_OPPONENT_HALF + forward_progress_reward)
+                * forward_pass_reward_scale()
         }
         // A completed lateral ball keeps possession and may switch the attack, but generic
-        // recycle completions must not outscore working the ball into shots.
+        // recycle completions must not outscore working the ball into shots — and are NOT scaled.
         (PassDirectionBucket::Lateral, _) => 1.2,
         (PassDirectionBucket::Backward, true) => -COMPLETED_BACK_PASS_PENALTY_OWN_HALF,
         (PassDirectionBucket::Backward, false) => -COMPLETED_BACK_PASS_PENALTY_OPPONENT_HALF,
     };
-    (base + completed_flank_pass_reward(team, origin, target, field_width, field_length))
-        * forward_pass_reward_scale()
+    // Flank bonus is unscaled (it applies to forward/lateral alike, so scaling it would re-leak the
+    // lever into lateral). Forward magnitude is already scaled inside `base`.
+    base + completed_flank_pass_reward(team, origin, target, field_width, field_length)
 }
 
 fn completed_forward_pass_count_bonus(team: Team, origin: Vec2, reception: Vec2) -> f64 {
@@ -68716,11 +68726,13 @@ mod reward_priority_tests {
         let scale = 6.0;
         // Richest single completed forward pass: own-half base + max progress + flank (own-half
         // multiplier), all scaled, plus the UNSCALED count bonus (added separately at world.rs).
+        // Forward base + progress are the ONLY terms scaled (forward-only lever); flank + count
+        // bonus are unscaled and added on top.
         let max_single_forward_pass = (COMPLETED_FORWARD_PASS_BASE_REWARD_OWN_HALF
             + COMPLETED_FORWARD_PASS_PROGRESS_REWARD_MAX_YARDS
-                * COMPLETED_FORWARD_PASS_PROGRESS_REWARD_PER_YARD
-            + COMPLETED_FLANK_PASS_BONUS_POINTS * COMPLETED_FLANK_PASS_OWN_HALF_MULTIPLIER)
+                * COMPLETED_FORWARD_PASS_PROGRESS_REWARD_PER_YARD)
             * scale
+            + COMPLETED_FLANK_PASS_BONUS_POINTS * COMPLETED_FLANK_PASS_OWN_HALF_MULTIPLIER
             + COMPLETED_FORWARD_PASS_COUNT_BONUS_POINTS;
         assert!(
             max_single_forward_pass < GOAL_REWARD_POINTS,
