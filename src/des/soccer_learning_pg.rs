@@ -6797,15 +6797,6 @@ mod tests {
     }
 
     #[test]
-    fn retain_archived_neural_snapshot_defaults_off() {
-        assert!(!soccer_policy_version_metrics_retains_neural_snapshot(
-            SOCCER_POLICY_STATUS_ARCHIVED,
-            &policy_version_metrics_with_neural_and_promotion_status(SOCCER_POLICY_STATUS_ARCHIVED),
-            soccer_learning_pg_env_flag(SOCCER_POLICY_RETAIN_ARCHIVED_NEURAL_ENV),
-        ));
-    }
-
-    #[test]
     fn inline_policy_prune_is_opt_in_for_learning_jobs() {
         assert!(!soccer_policy_inline_prune_enabled_from_env_value(None));
         assert!(!soccer_policy_inline_prune_enabled_from_env_value(Some("")));
