@@ -16121,6 +16121,9 @@ impl SoccerMatch {
                 .unwrap_or(false)
         };
         let pick_is_fwd = pick.as_deref().map(label_is_fwd).unwrap_or(false);
+        let pick_is_pass = choice
+            .map(|choice| pass_like_action_flight(&choice.label).is_some())
+            .unwrap_or(false);
         let tabular_argmax_is_fwd = tabular_argmax.as_deref().map(label_is_fwd).unwrap_or(false);
 
         let team_label = match team {
