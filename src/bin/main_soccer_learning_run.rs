@@ -508,6 +508,26 @@ fn default_evolution_window_games(
     evolution_interval_games.max(evolution_elite_games).max(1)
 }
 
+/// The evolution sample window is the pool of recent games a candidate is scored over, and its
+/// occupancy is what lands in `metrics.learningProvenance.searchParameters.promotion.gate.sampleGames`.
+/// When the promotion gate is enabled that window MUST be able to reach the gate's
+/// `min_sample_games`; otherwise every would-be-`active` candidate is force-archived by the
+/// persistence-layer sample floor (`soccer_policy_version_status_after_promotion_sample_floor`) and
+/// promotion stalls permanently. Operator overrides via `SOCCER_EVOLUTION_WINDOW_GAMES` are honoured
+/// — this only raises a structurally-too-small window up to the floor, and only when the gate is on;
+/// it never lowers a larger operator-chosen window and does not touch the elite breeding count.
+fn evolution_window_games_floored_for_promotion_gate(
+    configured_window_games: usize,
+    promotion_gate_enabled: bool,
+    min_sample_games: usize,
+) -> usize {
+    if promotion_gate_enabled {
+        configured_window_games.max(min_sample_games)
+    } else {
+        configured_window_games
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct NeuralPopulationSearchConfig {
     enabled: bool,
