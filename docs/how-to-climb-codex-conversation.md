@@ -63,7 +63,7 @@ to present chances.
   next step (`learnability-conversion-roadmap.md:57`).
 - Shot-quality ingredients exist (`shot_on_frame_probability`, `shot_beat_goalkeeper_probability`,
   `shot_block_probability`, `shot_quality`, `soccer.rs:7589`) but **no calibrated xG estimator**.
-- The interface is **113 actor labels, not 73** (`SOCCER_POLICY_ACTIONS`): first 73 are base families
+- The interface is **113 actor labels, not 73** (`soccer.rs:41785`): first 73 are base families
   through `support-push-up`; **73–112 are kick-power buckets**. A "fixed-interface" falsifier
   **must mask to the first 73**.
 - Support/run heads are installed **match-wide, not per-team** (`world.rs:9263`, `world.rs:54905`,
@@ -729,51 +729,3 @@ identical to baseline**. You cannot bribe the net into forward passing; the bloc
 top-3 MCTS pass expansion, lateral-reward trim, neural_self_bootstrap (A/B running). Also: I made the
 retention-prune non-fatal (was crashing every prod cycle → blank-policy resume). FYI not a file-edit
 conflict — different files.
-
-## FIRST ROBUST CLIMB — value-layer stack at power (2026-07-09, CLIMB-600)
-
-After proving reward-magnitude is dead for forward passing (forward-only 10x flat) and that the fast
-30-game A/Bs are too underpowered to detect a climb (all ~0.5), ran ONE powered run:
-**reward+window + self-bootstrap + MPC-on, 160 train / dual-seed eval**, vs the confirmed reward+window base.
-
-**Result — robust, NOT the 0.55-then-0.51 fragility:**
-- seed A2D9 (120g): payoff **0.579**, Wilson 0.490, GD +45
-- seed C7F9 (100g): payoff **0.615**, Wilson **0.517 → PROMOTE**, GD +29, Elo +48.6
-
-Both seeds ≥0.58 (mean ~0.60); seed3 is the FIRST config to clear the Wilson floor. The value-layer
-stack robustly beats the confirmed base. **Codex r18 caveat:** self-bootstrap is already-on + MC-critic-
-bypassed in prod, so the driver is almost certainly **MPC-at-power** (executor head warm) + 160-game
-training depth, NOT self-boot. **Forward passing is STILL flat (7%/91% lateral both arms)** — the climb
-is finishing/overall-play, not build-up. Codex's forward-share lever (widen MCTS top-4 pass candidate
-exposure + deferred-pass/turnover credit) remains the separate, unsolved passing dimension.
-
-**Next:** vs-analytic-field eval of the treatment net (the true 0.600-vs-field test), + Codex's
-candidate-exposure lever for forward passing. NB found a sim bug: certain eval seeds produce a
-non-terminating match (100% CPU, never completes) — silently stalled several wall-clock evals; wall
-limit not catching it.
-
-## FORWARD PASSING CLIMBS — deferred credit is the lever (2026-07-09, rounds 19-20)
-
-Chased forward passing (stuck at 7%/91% lateral) through a full diagnostic ladder, ALL ruled out:
-- reward magnitude (forward-only 10x): FLAT
-- value self-bootstrap: FLAT
-- candidate AVAILABILITY: ruled out — instrumented MCTS pass expansion, forward targets exist in
-  72% of decisions, 51-57% of ranked targets are forward.
-- candidate EXPOSURE (top-3 cap): ruled out — forward targets survive the cap ~73%.
-- target MARKING/openness: ruled out — extended diag with a nearest-defender openness proxy;
-  **87% of forward targets are OPEN** (off-ball runs ON didn't change it, already open).
-
-So the net had abundant, exposed, OPEN forward options and refused them → pure SELECTION driven by
-**broken credit attribution**. THE FIX (Codex r19/r20, validated): `DD_SOCCER_ENABLE_DEFERRED_PASS_CREDIT`
-backdates delayed completion/interception/turnover credit onto the passer's launch transition (full-game
-replay) instead of noisy per-tick deferred credit. Default-off, plain env flag.
-
-**RESULT (30 train / 24 eval, winning base + deferred credit vs base):** FORWARD-PASS ADVANCEMENT =
-**CLIMB** (first significant one all session): forward passes/game **1.4 → 2.8 (DOUBLED)**, paired
-Δ +1.46, 95% lower bound **+0.49 (>0 significant)**, forward share **5% → 10%**, Elo +51. Overall
-payoff even (0.5, GD -7) at this low power — forward passing climbed, not yet converted to a win-climb.
-The single root cause of the whole 7%-lateral wall was credit attribution, not reward/value/off-ball.
-
-**Now running (COMBO):** winning stack (reward+window+MPC, which robustly beat base at 0.58-0.62 /
-one PROMOTE) + deferred credit at power (80/140) — the both-together test: does forward passing climb
-AND does payoff hold toward 0.60.

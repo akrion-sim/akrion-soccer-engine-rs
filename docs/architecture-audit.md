@@ -4,10 +4,8 @@ Grounded in the actual `soccer-sim-game-engine.rs` code (not a generic guess). T
 trigger was an external design audit that assumed a "vanilla feedforward NN mapping
 snapshot → action scores." That premise is **out of date for this engine**: the NN is
 not the solver. The engine is a **hybrid heuristic + tabular-RL + feedforward-neural-head**
-system in which the learned layer ranks legal options from an append-only actor vocabulary and
-bounded candidate expansions, then per-player MPC executes or reconciles the selected intent.
-At this snapshot `SOCCER_POLICY_ACTIONS` has `113` labels, including `40` kick-power bucket
-labels, but the engine still avoids a free continuous action search in the live loop.
+system in which the learned layer **re-ranks a small heuristic candidate set**
+(`SOCCER_RETRIEVAL_PRIOR_RERANK_LIMIT = 12`, stochastic top-k), executed by MPC.
 
 ## What the engine already has (vs the 8 audit checkpoints)
 
@@ -31,12 +29,6 @@ labels, but the engine still avoids a free continuous action search in the live 
 2. **Richer learned-model search.** The engine now has a shallow, capped neural MCTS/PUCT
    reranker over already-legal candidates. What is still missing is MuZero/POMCP-style full-state
    belief search or a deep learned transition rollout over the whole match state.
-3. **Causal-influence telemetry.** Current planning telemetry reports MCTS selections,
-   candidate-family shares, MPC replans, priority samples, distillation, and policy entropy. It
-   does **not** yet report whether the net changed the executed action vs the tabular/heuristic
-   baseline, whether ConfidenceGated opened on the selected candidate, or the entropy of selected
-   kick-power buckets. Treat those as missing diagnostics, not existing proof of behavioral
-   influence.
 
 ## The reality check the external audit missed (decisive here)
 
@@ -82,8 +74,6 @@ graph/recurrent/tree-search cost."
 - Older live-generation examples in this file may drift quickly. For current generation health,
   query `des_soccer_learning_policy_versions` / `des_soccer_learning_runs` for the active
   experiment instead of trusting a dated snapshot.
-- See [current-learning-state.md](current-learning-state.md) for the current implemented vs
-  future split. Do not use roadmap bullets as evidence that the telemetry already exists.
 
 ## Offline distilled-encoder harness — status
 

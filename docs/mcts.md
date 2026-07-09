@@ -180,17 +180,6 @@ The trainer's `world_model_training` line reports:
 - `mpc_replan_neural_mcts_rate`
 - `neural_mcts_distillation_rate`
 
-It does **not** yet report the causality counters needed to prove that the learned/planning layer
-is changing play rather than only observing candidates. Add these before using MCTS telemetry as a
-plateau diagnosis:
-
-- `net_changed_action_rate` - selected/executed action differed from the tabular/heuristic
-  baseline.
-- `confidence_gate_open_rate` - ConfidenceGated opened for the candidate that survived to
-  execution.
-- `selected_kick_speed_bucket_entropy` - selected kick-power buckets stayed diverse instead of
-  collapsing into one bucket/family.
-
 The sampled `neural_mcts_dribble_diagnostic` line reports:
 
 - total candidates
@@ -242,14 +231,12 @@ MCTS is useful when it helps answer:
 MCTS is harmful if it hides those answers, over-selects safe analytic-looking
 actions, or turns into a noisy second policy that the actor never learns to
 imitate. If climb stalls with MCTS enabled, run a paired ablation with
-`SOCCER_NEURAL_MCTS_ENABLED=0` or `SOCCER_DISABLE_NEURAL_MCTS=1` over the same fixed seeds
-and compare:
+`SOCCER_NEURAL_MCTS_ENABLED=0` over the same fixed seeds and compare:
 
 - HOME-vs-analytic fitness
 - score/shots/SOT
 - policy entropy
 - action-family distribution
-- selected kick-power bucket distribution
 - dribble/pass/shot delayed outcome rewards
 - MPC replan rates
 - world-model validation loss
@@ -283,9 +270,6 @@ Keep it on when:
 5. Compare `learning_action_outcomes` against MCTS telemetry. Candidate presence
    without action outcomes means execution or labeling is still blocking the
    learning signal.
-6. If diagnosing a plateau, add or inspect the missing causality counters:
-   net-changed action rate, ConfidenceGated selected-candidate open rate, and selected
-   kick-power bucket entropy. Without them, MCTS can look busy while the executed policy
-   remains analytic.
-7. Do not promote based on an MCTS training spike alone. Promotion still needs
+6. Do not promote based on an MCTS training spike alone. Promotion still needs
    held-out HOME-vs-analytic confirmation.
+

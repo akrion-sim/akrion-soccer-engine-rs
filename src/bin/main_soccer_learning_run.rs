@@ -113,7 +113,6 @@ const DEFAULT_SOCCER_NEURAL_POPULATION_REQUIRE_FORWARD_PASS_CLIMB: bool = false;
 const DEFAULT_SOCCER_NEURAL_POPULATION_MIN_FORWARD_PASS_MARGIN: f64 = 0.0;
 const DEFAULT_SOCCER_NEURAL_POPULATION_MIN_NET_FORWARD_PASS_MARGIN: f64 = 0.0;
 const DEFAULT_SOCCER_NEURAL_POPULATION_MIN_FORWARD_PASS_RATE_MARGIN: f64 = 0.0;
-const DEFAULT_SOCCER_NEURAL_POPULATION_MIN_GOAL_DIFF_MARGIN: f64 = 0.0;
 const SOCCER_LEARNING_LOCAL_MPC_MAX_PLAYERS_PER_TEAM_LIMIT: usize = 11;
 const SOCCER_POLICY_SOURCE_MERGE: &str = "merge";
 const SOCCER_POLICY_SOURCE_EVOLUTION: &str = "mutation";
@@ -536,7 +535,6 @@ struct NeuralPopulationSearchConfig {
     min_forward_pass_margin: f64,
     min_net_forward_pass_margin: f64,
     min_forward_pass_rate_margin: f64,
-    min_goal_diff_margin: f64,
     seed: u64,
 }
 
@@ -751,15 +749,6 @@ fn env_neural_population_search_config(
         )
         .into());
     }
-    let min_goal_diff_margin = env_f64(
-        "SOCCER_NEURAL_POPULATION_MIN_GOAL_DIFF_MARGIN",
-        DEFAULT_SOCCER_NEURAL_POPULATION_MIN_GOAL_DIFF_MARGIN,
-    )?;
-    if !min_goal_diff_margin.is_finite() {
-        return Err(
-            invalid_data("SOCCER_NEURAL_POPULATION_MIN_GOAL_DIFF_MARGIN must be finite").into(),
-        );
-    }
     let search_seed = env_u64(
         "SOCCER_NEURAL_POPULATION_SEED",
         seed ^ 0xA5A5_5A5A_D3C3_B4B4,
@@ -790,7 +779,6 @@ fn env_neural_population_search_config(
         min_forward_pass_margin,
         min_net_forward_pass_margin,
         min_forward_pass_rate_margin,
-        min_goal_diff_margin,
         seed: search_seed,
     })
 }
@@ -1437,7 +1425,6 @@ fn neural_population_forward_pass_climb_reasons(
         - neural_population_candidate_net_forward_passes_per_game(reference);
     let rate_margin = neural_population_candidate_forward_pass_rate(candidate)
         - neural_population_candidate_forward_pass_rate(reference);
-    let goal_margin = neural_population_candidate_goal_margin(candidate);
     let mut reasons = Vec::new();
     if forward_margin <= search_config.min_forward_pass_margin {
         reasons.push(format!(
@@ -1456,12 +1443,6 @@ fn neural_population_forward_pass_climb_reasons(
             "forward_pass_rate_margin {:+.1}pp <= required {:+.1}pp",
             rate_margin * 100.0,
             search_config.min_forward_pass_rate_margin * 100.0
-        ));
-    }
-    if goal_margin <= search_config.min_goal_diff_margin {
-        reasons.push(format!(
-            "goal_diff_margin {goal_margin:+.3} <= required {:+.3}",
-            search_config.min_goal_diff_margin
         ));
     }
     reasons
@@ -5720,8 +5701,9 @@ struct AnchorPromotionGateConfig {
     interval_writes: usize,
     /// Held-out promote/reject thresholds (Wilson floor, worst-case floor, min games).
     thresholds: PromotionThresholds,
-    /// When enabled, anchor promotion must satisfy both the held-out scoreline gate
-    /// and the completed-forward-pass climb gate.
+    /// When enabled, anchor promotion is decided by completed forward passes, net
+    /// of turnovers, rather than scoreline/Wilson. The scoreline verdict remains
+    /// diagnostic metadata.
     require_forward_pass_climb: bool,
     min_forward_pass_margin: f64,
     min_net_forward_pass_margin: f64,
@@ -5816,21 +5798,6 @@ fn anchor_forward_pass_verdict(
     verdict.reasons = anchor_forward_pass_reasons(&verdict, cfg);
     verdict.promote = verdict.reasons.is_empty();
     verdict
-}
-
-fn anchor_promotion_gate_promotes(
-    scoreline: &PromotionVerdict,
-    forward_pass_verdict: Option<&AnchorForwardPassVerdict>,
-    cfg: &AnchorPromotionGateConfig,
-) -> bool {
-    if cfg.require_forward_pass_climb {
-        scoreline.promote
-            && forward_pass_verdict
-                .map(|verdict| verdict.promote)
-                .unwrap_or(false)
-    } else {
-        scoreline.promote
-    }
 }
 
 fn anchor_promotion_verdict_search_metadata(verdict: &PromotionVerdict) -> serde_json::Value {
@@ -6060,8 +6027,11 @@ fn apply_anchor_promotion_gate_with_decision(
                 .as_ref()
                 .map(|verdict| verdict.promote)
                 .unwrap_or(false);
-            let promotes =
-                anchor_promotion_gate_promotes(&verdict, forward_pass_verdict.as_ref(), cfg);
+            let promotes = if cfg.require_forward_pass_climb {
+                forward_pass_promotes
+            } else {
+                verdict.promote
+            };
             if promotes {
                 *anchor_neural = candidate_neural.cloned();
                 println!(
@@ -7268,8 +7238,7 @@ fn flush_postgres_completed_runs(
         // (status=1) AFTER learning, which blocked policy-version promotion/persistence and left the
         // next resume loading the empty base version (the "zero entries / blank policy" loop). Treat
         // it non-fatally, exactly like the pass-metrics upsert above, so the cycle still commits.
-        match store
-            .prune_completed_runs_for_experiment(experiment_id, completed_run_retention_games)
+        match store.prune_completed_runs_for_experiment(experiment_id, completed_run_retention_games)
         {
             Ok(prune) => {
                 if prune.deleted_runs > 0 || prune.deleted_delta_rows > 0 {
@@ -7817,6 +7786,14 @@ fn run() -> Result<(), Box<dyn Error>> {
     };
     validate_soccer_policy_promotion_gate_config_for_learning_run(&policy_promotion_gate)
         .map_err(invalid_data)?;
+    // Align the evolution sample window with the promotion sample floor: a candidate can only
+    // promote if it is scored over at least `min_sample_games` games, so a smaller window would
+    // guarantee a permanent promotion stall. Honours the operator-chosen window; only raises it.
+    let evolution_window_games = evolution_window_games_floored_for_promotion_gate(
+        evolution_window_games,
+        policy_promotion_gate.enabled,
+        policy_promotion_gate.min_sample_games,
+    );
     // Anti-regression ratchet for activation (see `active_max_fitness_regression`):
     // how much fitness a newer generation may lose vs the incumbent and still go
     // `active`. Configmap-tunable so the operator can tighten it (→ 0.0 = "no
@@ -12008,7 +11985,6 @@ mod tests {
     use soccer_engine::des::general::soccer::{
         PlayerRole, Team, CONFIG_FEATURE_DIM, SOCCER_MOMENT_EMBEDDING_DIM,
     };
-    use soccer_engine::des::general::soccer_eval_gate::CandidateRecord;
     use std::sync::Mutex;
 
     static SOCCER_RUN_PG_ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -12169,7 +12145,6 @@ mod tests {
             min_forward_pass_margin: 0.0,
             min_net_forward_pass_margin: 0.0,
             min_forward_pass_rate_margin: 0.0,
-            min_goal_diff_margin: 0.0,
             seed: 99,
         }
     }
@@ -14223,7 +14198,6 @@ mod tests {
             min_forward_pass_margin: 0.0,
             min_net_forward_pass_margin: 0.0,
             min_forward_pass_rate_margin: 0.0,
-            min_goal_diff_margin: 0.0,
             seed: 1,
         }
     }
@@ -14258,7 +14232,7 @@ mod tests {
     }
 
     #[test]
-    fn population_forward_pass_gate_requires_goal_margin_with_forward_signal() {
+    fn population_forward_pass_gate_uses_forward_passes_not_goals() {
         let config = neural_population_search_config_for_forward_gate_test();
         let reference = neural_population_eval_for_forward_gate_test(
             1,
@@ -14273,25 +14247,14 @@ mod tests {
         let candidate =
             neural_population_eval_for_forward_gate_test(2, "candidate", -0.50, 0, 4, 24, 9, 1);
 
-        let reasons = neural_population_forward_pass_climb_reasons(&candidate, &reference, config);
         assert!(
-            reasons
-                .iter()
-                .any(|reason| reason.contains("goal_diff_margin")),
-            "losing forward-pass smoke must not pass the population gate: {reasons:?}"
+            neural_population_forward_pass_climb_reasons(&candidate, &reference, config).is_empty(),
+            "candidate should pass direct forward-pass count/rate/net gate"
         );
         assert!(
             neural_population_candidate_forward_pass_rank_score(&candidate)
                 > neural_population_candidate_forward_pass_rank_score(&reference),
             "forward-pass ranking must not collapse to goal or fitness ranking"
-        );
-
-        let winning_candidate =
-            neural_population_eval_for_forward_gate_test(2, "candidate", -0.50, 5, 4, 24, 9, 1);
-        assert!(
-            neural_population_forward_pass_climb_reasons(&winning_candidate, &reference, config)
-                .is_empty(),
-            "positive goal margin plus direct forward-pass count/rate/net climb should pass"
         );
     }
 
@@ -15203,6 +15166,31 @@ mod tests {
     }
 
     #[test]
+    fn evolution_window_floors_at_promotion_sample_floor_when_gate_enabled() {
+        // A too-small window (the promotion-stall signature) is raised to the sample floor so a
+        // candidate can actually accumulate enough games to clear the gate.
+        assert_eq!(
+            evolution_window_games_floored_for_promotion_gate(3, true, 8),
+            8
+        );
+        // A larger operator-chosen window is honoured, never lowered.
+        assert_eq!(
+            evolution_window_games_floored_for_promotion_gate(25, true, 8),
+            25
+        );
+        // Exactly at the floor is unchanged.
+        assert_eq!(
+            evolution_window_games_floored_for_promotion_gate(8, true, 8),
+            8
+        );
+        // With the gate disabled there is no sample floor, so the window is left as configured.
+        assert_eq!(
+            evolution_window_games_floored_for_promotion_gate(3, false, 8),
+            3
+        );
+    }
+
+    #[test]
     fn postgres_policy_sources_name_evolutionary_search() {
         let label = soccer_learning_pg_version_label_with_suffix("run-a", 2, 4, "evolution");
         let long_checkpoint_label = soccer_learning_pg_version_label_with_suffix(
@@ -15285,64 +15273,6 @@ mod tests {
             min_forward_pass_rate_margin: 0.0,
             seed_base: 0xE7A1_0000,
         }
-    }
-
-    fn anchor_promotion_verdict_for_test(promote: bool) -> PromotionVerdict {
-        PromotionVerdict {
-            promote,
-            candidate_elo: 1500.0,
-            baseline_elo: 1500.0,
-            elo_delta: 0.0,
-            mean_payoff_vs_field: Some(if promote { 1.0 } else { 0.0 }),
-            payoff_vs_baseline: Some(if promote { 1.0 } else { 0.0 }),
-            worst_case: Some((1, if promote { 1.0 } else { 0.0 })),
-            wilson_lower_bound: if promote { 1.0 } else { 0.0 },
-            record: CandidateRecord {
-                wins: if promote { 8 } else { 0 },
-                draws: 0,
-                losses: if promote { 0 } else { 8 },
-                goals_for: if promote { 8 } else { 0 },
-                goals_against: if promote { 0 } else { 8 },
-            },
-            reasons: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn anchor_gate_forward_pass_mode_requires_scoreline_verdict() {
-        let mut cfg = anchor_gate_config(true);
-        cfg.require_forward_pass_climb = true;
-        let forward_pass = AnchorForwardPassVerdict {
-            games: 8,
-            candidate: NeuralPopulationCandidateBehavior {
-                completed_passes_for: 24,
-                completed_forward_passes_for: 12,
-                interceptions_for: 0,
-                ..NeuralPopulationCandidateBehavior::default()
-            },
-            anchor: NeuralPopulationCandidateBehavior {
-                completed_passes_for: 24,
-                completed_forward_passes_for: 4,
-                interceptions_for: 0,
-                ..NeuralPopulationCandidateBehavior::default()
-            },
-            promote: true,
-            reasons: Vec::new(),
-        };
-
-        assert!(
-            !anchor_promotion_gate_promotes(
-                &anchor_promotion_verdict_for_test(false),
-                Some(&forward_pass),
-                &cfg
-            ),
-            "forward-pass climb alone must not advance a losing held-out scoreline"
-        );
-        assert!(anchor_promotion_gate_promotes(
-            &anchor_promotion_verdict_for_test(true),
-            Some(&forward_pass),
-            &cfg
-        ));
     }
 
     #[test]
