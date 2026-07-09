@@ -66968,6 +66968,12 @@ fn learned_action_label_is_legal_for_observation(
                     ))
         }
         "pass" => observation.has_ball && snapshot.best_visible_pass_target(player_id).is_some(),
+        // Codex r24 interface lever: legal ONLY with the gate on AND a real forward option present.
+        "forward-release-pass" => {
+            forward_release_action_enabled()
+                && forward_release_opportunity_present(&observation)
+                && snapshot.best_visible_pass_target(player_id).is_some()
+        }
         "wall-pass" => observation.has_ball && snapshot.wall_pass_option_for(player_id).is_some(),
         "wall-return" => {
             observation.has_ball && snapshot.wall_return_pass_target_for(player_id).is_some()
