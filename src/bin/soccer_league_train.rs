@@ -20,7 +20,7 @@
 //!      SOCCER_LEAGUE_FRESH_OPPONENTS (usize, default 2)
 //!      SOCCER_LEAGUE_CHECKPOINT_EVERY_ROUNDS (usize, default 10 — add frontier to league)
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
@@ -42,6 +42,21 @@ fn env_usize(k: &str, d: usize) -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(d)
+}
+fn env_usize_list(k: &str) -> Vec<usize> {
+    let mut values: Vec<usize> = std::env::var(k)
+        .ok()
+        .into_iter()
+        .flat_map(|raw| {
+            raw.split(|ch: char| ch == ',' || ch == ';' || ch.is_whitespace())
+                .filter_map(|part| part.trim().parse::<usize>().ok())
+                .filter(|value| *value > 0)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    values.sort_unstable();
+    values.dedup();
+    values
 }
 fn env_f64(k: &str, d: f64) -> f64 {
     std::env::var(k)
@@ -779,6 +794,21 @@ fn candidate_frontier_path(frontier_path: &str) -> String {
         .into_owned()
 }
 
+fn step_bucket_archive_path(
+    step_archive_dir: &str,
+    bucket: usize,
+    round: u32,
+    training_steps: usize,
+) -> String {
+    format!(
+        "{}/league-step-b{:08}-r{:04}-s{}.json",
+        step_archive_dir.trim_end_matches('/'),
+        bucket,
+        round,
+        training_steps
+    )
+}
+
 /// Load the frozen champion league from the archive dir (each is a learned-params.json).
 fn load_league(dir: &str) -> Vec<TeamBrain> {
     let mut out = Vec::new();
@@ -970,6 +1000,10 @@ fn main() {
         0.0,
     );
     let max_rounds = env_usize("SOCCER_LEAGUE_MAX_ROUNDS", 0);
+    let max_training_steps = env_usize("SOCCER_LEAGUE_MAX_TRAINING_STEPS", 0);
+    let step_archive_buckets = env_usize_list("SOCCER_LEAGUE_STEP_ARCHIVE_BUCKETS");
+    let step_archive_dir_default = format!("{}/step-buckets", archive_dir.trim_end_matches('/'));
+    let step_archive_dir = env_str("SOCCER_LEAGUE_STEP_ARCHIVE_DIR", &step_archive_dir_default);
 
     let mut runner_config = EngineMatchRunnerConfig::default();
     runner_config.base.duration_seconds = minutes * 60.0;
@@ -1091,8 +1125,9 @@ fn main() {
     let train_seed_base: u32 = 0x5EED_0000;
     let mut round = 0u32;
     let mut best_checkpoint_net_forward_pass_margin = f64::NEG_INFINITY;
+    let mut archived_step_buckets: BTreeSet<usize> = BTreeSet::new();
     println!(
-        "league_train_started_at_utc={} games/opp={} minutes={} weight_decay={} fresh_opp={} checkpoint_every={} max_rounds={} max_target_entries_per_side={} advancement_metric=completed_forward_passes net_metric=completed_forward_passes_minus_turnovers league_neural_mcts_enabled={} actor_critic_enabled={} lp_coupling_enabled={} target_standardization_enabled={} mc_critic_target_enabled={} neural_self_bootstrap_enabled={} maxa_bootstrap_enabled={} novelty_bonus_enabled={} forward_pass_climb_curriculum_enabled={} dp_bootstrap_enabled={} dp_bootstrap_horizon={} dp_bootstrap_sweeps={} mpc_tier2_enabled={} mpc_reconcile_enabled={} mpc_field_aware_enabled={} mpc_latent_objective_enabled={} local_mpc_enabled={} checkpoint_require_forward_pass_climb={} checkpoint_max_forward_pass_regression={} checkpoint_min_forward_pass_margin={} checkpoint_validate_games={} checkpoint_validate_min_forward_pass_margin={} checkpoint_validate_min_net_forward_pass_margin={} checkpoint_validate_min_goal_diff_margin={} frontier={} candidate_frontier={} archive={}",
+        "league_train_started_at_utc={} games/opp={} minutes={} weight_decay={} fresh_opp={} checkpoint_every={} max_rounds={} max_training_steps={} max_target_entries_per_side={} advancement_metric=completed_forward_passes net_metric=completed_forward_passes_minus_turnovers league_neural_mcts_enabled={} actor_critic_enabled={} lp_coupling_enabled={} target_standardization_enabled={} mc_critic_target_enabled={} neural_self_bootstrap_enabled={} maxa_bootstrap_enabled={} novelty_bonus_enabled={} forward_pass_climb_curriculum_enabled={} dp_bootstrap_enabled={} dp_bootstrap_horizon={} dp_bootstrap_sweeps={} mpc_tier2_enabled={} mpc_reconcile_enabled={} mpc_field_aware_enabled={} mpc_latent_objective_enabled={} local_mpc_enabled={} checkpoint_require_forward_pass_climb={} checkpoint_max_forward_pass_regression={} checkpoint_min_forward_pass_margin={} checkpoint_validate_games={} checkpoint_validate_min_forward_pass_margin={} checkpoint_validate_min_net_forward_pass_margin={} checkpoint_validate_min_goal_diff_margin={} frontier={} candidate_frontier={} archive={} step_archive_dir={} step_archive_buckets={:?}",
         chrono_now(),
         games_per_opp,
         minutes,
@@ -1100,6 +1135,7 @@ fn main() {
         fresh_opponents,
         checkpoint_every,
         max_rounds,
+        max_training_steps,
         max_target_entries_per_side,
         league_neural_mcts_enabled,
         actor_critic_enabled,
@@ -1127,7 +1163,9 @@ fn main() {
         checkpoint_validate_min_goal_diff_margin,
         frontier_path,
         candidate_frontier_path,
-        archive_dir
+        archive_dir,
+        step_archive_dir,
+        step_archive_buckets,
     );
 
     loop {
@@ -1366,6 +1404,21 @@ fn main() {
             if let Err(e) = write_frontier(&candidate_frontier_path, &frontier) {
                 eprintln!("league_candidate_write_error: {e}");
             }
+            for bucket in &step_archive_buckets {
+                if steps >= *bucket && archived_step_buckets.insert(*bucket) {
+                    let path = step_bucket_archive_path(&step_archive_dir, *bucket, round, steps);
+                    match write_frontier(&path, &frontier) {
+                        Ok(()) => println!(
+                            "league_step_archive bucket={} round={round} training_steps={steps} -> {path}",
+                            bucket
+                        ),
+                        Err(e) => eprintln!(
+                            "league_step_archive_write_error bucket={} round={round} training_steps={steps}: {e}",
+                            bucket
+                        ),
+                    }
+                }
+            }
         }
 
         let kpi_games = round_kpis.games.max(1) as f64;
@@ -1525,6 +1578,12 @@ fn main() {
             frontier.away_target_entries.len(),
             started.elapsed().as_secs_f64()
         );
+        if max_training_steps > 0 && steps >= max_training_steps {
+            println!(
+                "league_train_stopped max_training_steps={max_training_steps} reached_steps={steps} rounds_completed={round}"
+            );
+            break;
+        }
         if max_rounds > 0 && round as usize >= max_rounds {
             println!("league_train_stopped max_rounds={max_rounds} rounds_completed={round}");
             break;
@@ -1860,6 +1919,28 @@ mod tests {
         assert_eq!(
             candidate_frontier_path("/tmp/run/frontier"),
             "/tmp/run/frontier.candidate"
+        );
+    }
+
+    #[test]
+    fn step_archive_bucket_env_parses_sorted_unique_positive_values() {
+        let _lock = env_lock().lock().unwrap();
+        let _guard = EnvVarGuard::set(
+            "SOCCER_LEAGUE_STEP_ARCHIVE_BUCKETS",
+            "100000, 25000;0 bad 100000 50000",
+        );
+
+        assert_eq!(
+            env_usize_list("SOCCER_LEAGUE_STEP_ARCHIVE_BUCKETS"),
+            vec![25000, 50000, 100000]
+        );
+    }
+
+    #[test]
+    fn step_bucket_archive_path_encodes_bucket_round_and_steps() {
+        assert_eq!(
+            step_bucket_archive_path("/tmp/run/step-buckets/", 25000, 7, 25120),
+            "/tmp/run/step-buckets/league-step-b00025000-r0007-s25120.json"
         );
     }
 
