@@ -138,7 +138,7 @@ flowchart LR
 4. **Reward** — event rewards (goals, passes, shots, chains) + tactical-learning
    shaping, with an **optional** dense pitch-control × xT territorial term.
 5. **Update** — the **neural learner** does actor-critic + GAE with PPO-clipped
-   multi-epoch updates over a replay buffer; **GA evolution** (every 5 games)
+   multi-epoch updates over a replay buffer; **GA evolution** (every 10 games)
    mutates/crosses/selects the population.
 6. **Promotion gate** — a candidate policy is promoted to a new **generation**
    only if it clears fitness / goals-conceded / play-quality thresholds.
