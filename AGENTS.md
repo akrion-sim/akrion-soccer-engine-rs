@@ -19,7 +19,13 @@ autosaver stashing your working tree makes any merge non-deterministic. Keep cha
 either committed on `main` or live in the working tree — never stashed. To set work aside,
 COMMIT it (a `wip:` commit is fine): durable, visible in history, and rebase/merge-safe.
 Do not add tooling that runs `git stash` (no "autosaver"). If you find a stash, reconstruct
-it into a commit and drop it; do not leave work hidden in the stash list.
+it into a commit and drop it; do not leave work hidden in the stash list. Past stash misuse
+also leaves ORPHANED stash commits that no longer show in `git stash list` but linger as
+unreachable objects (`git fsck --unreachable | grep commit`, subjects like `WIP on ...`,
+`index on ...`, `On <branch>: ...`). Treat these the same way: before resurrecting one, run
+the semantic-containment check below — most are snapshots of work that already landed. Only
+reconstruct+merge the genuinely-unmerged remainder; drop the rest (let git gc reclaim them),
+do NOT re-merge already-landed work (that creates duplicates).
 
 MERGE CONCEPTUALLY — never merely pick a side. When reconciling divergent work (branches,
 worktrees, reconstructed stashes) into `main`, integrate the IDEAS: keep every distinct
