@@ -93,6 +93,8 @@ farm risk but needs a possession-chain export first.
 ## What this change lands
 - `reward_shaping` module: the PBRS primitive + invariance tests (telescoping to
   a constant over a returning trajectory; non-finite neutralisation).
-- Pitch-value reward routed through it (γ=1.0, byte-identical) as the template.
+- Pitch value routes through `potential_based_shaping(disciplined_gamma(), before, after) * scale`
+  (soccer.rs:15053); the discount-alignment discipline is shipped and **default-ON** (γ=0.99), so
+  γ=1.0 applies only when the shaping-discipline gate is off.
 - This audit. The C→potential conversions are intentionally **not** applied
   blind; they are the gated follow-up work.
