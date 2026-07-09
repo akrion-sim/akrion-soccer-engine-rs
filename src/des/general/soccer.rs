@@ -5400,6 +5400,9 @@ const SOCCER_NEURAL_LEGACY_FEATURE_DIMS: &[usize] = &[
     // Same schema with same-team separation-floor channels, before explicit
     // tactical decision-context channels.
     SOCCER_NEURAL_PRE_DECISION_CONTEXT_FEATURE_DIM,
+    // Full decision-context schema, before the appended structured action-parameter
+    // (aim geometry) block — nets at this width zero-pad the 7 new tail slots.
+    SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM,
 ];
 const TEAM_SHAPE_NEAR_BALL_RADIUS_YARDS: f64 = 18.0;
 // Tight same-team congestion rings reported in the brain trace so a human can see
