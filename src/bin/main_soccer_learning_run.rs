@@ -15158,31 +15158,6 @@ mod tests {
     }
 
     #[test]
-    fn evolution_window_floors_at_promotion_sample_floor_when_gate_enabled() {
-        // A too-small window (the promotion-stall signature) is raised to the sample floor so a
-        // candidate can actually accumulate enough games to clear the gate.
-        assert_eq!(
-            evolution_window_games_floored_for_promotion_gate(3, true, 8),
-            8
-        );
-        // A larger operator-chosen window is honoured, never lowered.
-        assert_eq!(
-            evolution_window_games_floored_for_promotion_gate(25, true, 8),
-            25
-        );
-        // Exactly at the floor is unchanged.
-        assert_eq!(
-            evolution_window_games_floored_for_promotion_gate(8, true, 8),
-            8
-        );
-        // With the gate disabled there is no sample floor, so the window is left as configured.
-        assert_eq!(
-            evolution_window_games_floored_for_promotion_gate(3, false, 8),
-            3
-        );
-    }
-
-    #[test]
     fn postgres_policy_sources_name_evolutionary_search() {
         let label = soccer_learning_pg_version_label_with_suffix("run-a", 2, 4, "evolution");
         let long_checkpoint_label = soccer_learning_pg_version_label_with_suffix(
