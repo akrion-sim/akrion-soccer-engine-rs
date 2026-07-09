@@ -16173,6 +16173,53 @@ impl SoccerMatch {
         choice
     }
 
+    /// The action label the ACTUAL blend-off tabular path would commit for `player_id` — the
+    /// net-influence counterfactual. Mirrors the decision assembler's tabular fallback (same
+    /// policy, retrieval prior, TABULAR salt), so "committed action != this" means the neural
+    /// stack (net/sidecar/exploration + downstream discipline) changed the decision the engine
+    /// would otherwise have made. Pure/read-only; only called when the diag env is set.
+    fn net_influence_tabular_baseline_label(
+        &self,
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        mdp_state: &SoccerMdpState,
+        observation: &SoccerPomdpObservation,
+    ) -> Option<String> {
+        let player = snapshot
+            .players
+            .iter()
+            .find(|candidate| candidate.id == player_id)?;
+        let retrieval_prior = if self.config.retrieval.decision_prior_enabled {
+            self.retrieval_action_prior
+                .get(&player.team)
+                .filter(|map| !map.is_empty())
+                .map(|map| (map, self.config.retrieval.prior_weight))
+        } else {
+            None
+        };
+        let (policy, salt) = if let Some(team_policies) = &self.team_policies {
+            (
+                team_policies.policy(player.team),
+                SOCCER_POLICY_RANK_SALT_TEAM_TABULAR,
+            )
+        } else {
+            (
+                self.learned_policy.as_ref()?,
+                SOCCER_POLICY_RANK_SALT_SHARED_TABULAR,
+            )
+        };
+        self.weighted_policy_action_for_player(
+            policy,
+            snapshot,
+            player_id,
+            mdp_state,
+            observation,
+            retrieval_prior,
+            salt,
+        )
+        .map(|choice| choice.label)
+    }
+
     /// Per-team value-head forward-intent for this tick: for each outfield player,
     /// how much more value the net assigns to advancing (`dribble`) than to
     /// holding shape (`hold`), averaged per team and squashed into opposing
