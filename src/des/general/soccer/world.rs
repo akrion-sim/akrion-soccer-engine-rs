@@ -31060,6 +31060,8 @@ impl SoccerMatch {
                 self.pending_rebound = None;
                 if let Some(shot) = shot.as_ref() {
                     self.record_shot_on_target_rewards(shot.team, shot.shooter);
+                    // Learned-MPC shot-placement credit: the placement scored (+1.0).
+                    self.record_shot_objective_sample(shot, ShotObjectiveOutcome::Goal);
                 }
                 self.record_goal_rewards(scoring_team, shot.as_ref().map(|shot| shot.shooter));
                 self.ball.altitude_yards = 0.0;
