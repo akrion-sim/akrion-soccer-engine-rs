@@ -85,7 +85,8 @@ Local helper: **`~/bin/soccer-live-5055.sh`**. UI: **http://localhost:5055/socce
 
 ## Caveats (why a correctly-loaded runner can still look unintelligent)
 
-- **Model maturity dominates.** `hidden_units = 24` is a tiny value net, and the tabular is
+- **Model maturity dominates.** `hidden_units = 128` (`DEFAULT_SOCCER_NEURAL_HIDDEN_UNITS`,
+  soccer.rs:5423; raised from 24) is still a modest value net, and the tabular is
   sparse. An under-trained generation looks basic no matter how correctly it's loaded. Real
   quality comes from many more training generations (and, longer-term, a bigger net).
 - **Don't load the tabular to "fix" behaviour** — it's a weak/sparse prior at this state-dim.
