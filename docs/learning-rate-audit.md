@@ -86,7 +86,8 @@ advantage/keeper/actor/mappo suites.
 1. **Enable advantage normalization in trained runs** (`DD_SOCCER_ENABLE_ADVANTAGE_NORMALIZATION=1`)
    so the effective LR is reward-scale-invariant even without the won-game reward; A/B
    held-out Elo via `soccer_eval_gate_run` before making it the default.
-2. **A/B the won-game magnitudes** (`MATCH_OUTCOME_WIN`=8.0, margin 1.5, cap 4) on
-   held-out win-rate — the eval gate is the instrument.
+2. **A/B the won-game magnitudes** (`MATCH_OUTCOME_WIN`=200.0, margin 15.0, cap 5) on
+   held-out win-rate — the eval gate is the instrument. (Given F3, also consider lifting
+   `target_clip` in tandem so the ±6.67 outcome label isn't clipped flat.)
 3. **Track F3**: if high-scoring self-play games become common, lift `target_clip` or
    the return clip together so the critic baseline isn't saturated.
