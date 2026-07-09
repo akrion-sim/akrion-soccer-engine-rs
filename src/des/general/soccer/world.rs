@@ -35635,6 +35635,12 @@ fn forward_floor_outlet_assessment(
         && completion_or_stride_fit
         && quality_fit >= GOOD_FORWARD_OUTLET_MIN_QUALITY_FIT;
 
+    if std::env::var("DBG_OUTLET").is_ok() && forward_yards > 10.0 && forward_yards < 14.0 {
+        eprintln!("DBG_OUTLET fwd={forward_yards:.2} dist={distance_yards:.2} open={:.3} compl={:.3} lane_risk={:.3} stride={:.3} | lane_safe={lane_safe} half_open={half_open_forward} progressive={progressive_floor_outlet} open_for_score={receiver_openness_for_score:.3}>=0.30?{} compl_or_stride={completion_or_stride_fit} quality_fit={quality_fit:.3}>=0.34?{} => actionable={actionable}",
+            quality.receiver_openness, quality.expected_completion, quality.lane_interception_risk, quality.stride_fit,
+            receiver_openness_for_score >= HALF_OPEN_FORWARD_PASS_MIN_OPENNESS,
+            quality_fit >= GOOD_FORWARD_OUTLET_MIN_QUALITY_FIT);
+    }
     ForwardFloorOutletAssessment {
         actionable,
         receiver_openness_for_score,
