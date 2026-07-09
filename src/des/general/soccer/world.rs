@@ -20489,6 +20489,21 @@ impl SoccerMatch {
                     } else {
                         None
                     };
+                    // Net-influence commit-level baseline (Codex): the tabular-only choice for this
+                    // FRESH decision, captured before run_time_step_with_context consumes mdp_state/
+                    // observation. Compared post-discipline against the actually-committed action.
+                    // This block is only reached on fresh-decision ticks (the decision-cadence replay
+                    // path never runs the planning pass), so it excludes the outer replay per Codex.
+                    let net_influence_baseline = if net_influence_diag_enabled() {
+                        self.net_influence_tabular_baseline_label(
+                            &snapshot,
+                            scheduled.id,
+                            &mdp_state,
+                            &observation,
+                        )
+                    } else {
+                        None
+                    };
                     let intent = self.players[actor].run_time_step_with_context(
                         &snapshot,
                         mdp_state,
