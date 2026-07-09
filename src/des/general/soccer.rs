@@ -23496,6 +23496,25 @@ pub(crate) fn shot_shaping_reward_scale() -> f64 {
     })
 }
 
+/// Quick-forward-release shaping (action-SELECTION fix). Rewards the actor for CHOOSING to complete
+/// a quick FORWARD pass WHEN a real forward opportunity existed — targeting the leak where the neural
+/// policy under-selects an available good forward ball. Env
+/// `DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE` (clamped 0.0..=2.0), default `0.0` ⇒ the term is
+/// identically zero, so the reward is BYTE-IDENTICAL to today when unset or set to 0 (no behavior or
+/// serialization change). See [`quick_forward_release_bonus`] for the bonus shape and its gates.
+pub(crate) fn quick_forward_release_reward_scale() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.0, 2.0))
+            .unwrap_or(0.0)
+    })
+}
+
 fn completed_pass_reward_for_pitch(
     team: Team,
     origin: Vec2,
