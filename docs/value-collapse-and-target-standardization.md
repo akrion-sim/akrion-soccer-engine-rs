@@ -94,18 +94,15 @@ The neural value head is the **whole point** of this architecture, and remains s
   condition on the **full canonical 22-player + ball motion vector**, which the tabular key cannot.
 - The collapse made the neural net *behave* like a constant, throwing that advantage away. The fix
   **restores** the net's ability to discriminate states — it does not move away from neural learning.
-- **What's "later":** once the value discriminates states, the next (milder-than-feared) ceiling is
-  the **action interface**. Note the interface is *not* a hard top-4 cap: when a learner exists the
-  decision **injects every legal `SOCCER_POLICY_ACTIONS` macro family (~73)** as a candidate
-  ([world.rs](../src/des/general/soccer/world.rs) ~L5623), so the net's *macro policy* is
-  expressive. Only the **specific factored tabular candidates** (a concrete
-  `pass|tgt:7|spd:7|dir:135…`) are capped at 4 (`default_soccer_neural_blend_candidates`, now
-  env-tunable via `DD_SOCCER_NEURAL_BLEND_CANDIDATES`), and the *fine execution* of a freshly-chosen
-  macro comes from MPC/analytic. So the residual gap is "net chooses the family; execution stays
-  analytic," plus exploration to fill the tabular set with better-than-analytic factored actions
-  (curiosity/novelty). Beyond that, a real permutation-invariant encoder (GNN / self-attention over
-  the 23 entities, replacing the hand-crafted "relational attention readout") is the larger upgrade.
-  All *more* neural, not less.
+- **What's "later":** once the value discriminates states, the next ceiling is the **action
+  interface**. The interface is no longer just broad macro families: `SOCCER_POLICY_ACTIONS`
+  currently has `113` labels, including `40` kick-power bucket labels. MCTS can offer
+  pass/aerial/shot bucket variants behind `DD_SOCCER_ENABLE_DISCRETIZED_KICK`, so the speed-bucket
+  slice is partially wired. The residual gap is now narrower: prove bucket choices causally change
+  executed behavior, add entropy/softmax exploration so buckets do not fossilize, and finish the
+  structured direction/curve/elevation/aim surfaces. Beyond that, a real permutation-invariant
+  encoder (GNN / self-attention over the 23 entities, replacing the hand-crafted "relational
+  attention readout") is the larger upgrade. All *more* neural, not less.
 
 ## 7. Status & how to run
 
