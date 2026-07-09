@@ -66469,6 +66469,8 @@ fn defender_between_ball_and_goal_can_physically_block_shot() {
             team: Team::Home,
             shooter: attacker,
             origin: sim.players[attacker].position,
+            intended_target: Vec2::zero(),
+            mpc_objective: None,
         });
 
         sim.integrate_ball();
