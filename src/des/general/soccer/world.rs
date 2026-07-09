@@ -12211,6 +12211,17 @@ impl SoccerMatch {
         let learner = match snapshot {
             Some(snapshot) => {
                 let network = build_soccer_neural_network_from_snapshot(&snapshot)?;
+                // Symmetric with `set_neural_network_snapshot`: also restore the actor policy-head
+                // sidecar (including the learned `forward_select_logit_weight`) so eval paths that
+                // install nets via THIS setter (tournaments / other eval) aren't left with an
+                // inert/absent actor. Only overwrites when the snapshot actually carries a policy
+                // head — it never clears a previously-installed one.
+                if let Some(policy_head_snapshot) = snapshot.policy_head.as_deref() {
+                    self.policy_head = Some(soccer_policy_head_from_snapshot(
+                        policy_head_snapshot,
+                        self.config.seed,
+                    )?);
+                }
                 SoccerNeuralLearner::from_pretrained_snapshot(&self.config, network, &snapshot)
             }
             None if self.config.learning_enabled => SoccerNeuralLearner::new(&self.config),
