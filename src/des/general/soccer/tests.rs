@@ -38628,6 +38628,7 @@ fn policy_head_advantage_gradient_prefers_the_reinforced_family() {
                     old_action_probability: None,
                     sample_weight: 1.0,
                     mcts_distillation: false,
+                    forward_select_eligible: false,
                 },
                 SoccerPolicySample {
                     state_features: state,
@@ -38636,6 +38637,7 @@ fn policy_head_advantage_gradient_prefers_the_reinforced_family() {
                     old_action_probability: None,
                     sample_weight: 1.0,
                     mcts_distillation: false,
+                    forward_select_eligible: false,
                 },
             ]
         })
