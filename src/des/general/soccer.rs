@@ -15503,6 +15503,16 @@ fn pass_like_action_flight(action: &str) -> Option<PassFlight> {
     }
 }
 
+/// True iff the action label is a SHOT family (measurement helper for the per-family
+/// forward-pass/dribble/shot exposure trace).
+pub(crate) fn soccer_label_is_shot(action: &str) -> bool {
+    use SoccerActionLabel::*;
+    matches!(
+        SoccerActionLabel::classify(normalize_soccer_action_label(action)),
+        Some(Shoot) | Some(FirstTimeShot)
+    )
+}
+
 fn flank_cross_context_score(
     observation: &SoccerPomdpObservation,
     player_position: Vec2,
