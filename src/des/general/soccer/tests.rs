@@ -141,6 +141,7 @@ fn policy_head_trains_skill_specialists_independently() {
             old_action_probability: None,
             sample_weight: 1.0,
             mcts_distillation: false,
+            forward_select_eligible: false,
         }
     };
     let specialist_steps = |head: &SoccerPolicyHead, kind: SoccerPolicySpecialistKind| {
@@ -246,6 +247,7 @@ fn policy_head_snapshot_round_trips_role_heads_and_specialists() {
             old_action_probability: None,
             sample_weight: 1.0,
             mcts_distillation: false,
+            forward_select_eligible: false,
         }
     };
 
@@ -38420,6 +38422,7 @@ fn curriculum_focused_phase_trains_only_its_specialist() {
         old_action_probability: None,
         sample_weight: 1.0,
         mcts_distillation: false,
+        forward_select_eligible: false,
     };
     let samples = vec![sample("pass"), sample("dribble"), sample("shoot")];
     let shoot_idx = soccer_policy_action_index("shoot").expect("shoot family");
@@ -38545,6 +38548,7 @@ fn skill_policy_heads_train_and_score_their_group() {
         old_action_probability: None,
         sample_weight: 1.0,
         mcts_distillation: false,
+        forward_select_eligible: false,
     };
     let samples = vec![
         sample("pass", 1.0),
@@ -38624,6 +38628,7 @@ fn policy_head_advantage_gradient_prefers_the_reinforced_family() {
                     old_action_probability: None,
                     sample_weight: 1.0,
                     mcts_distillation: false,
+                    forward_select_eligible: false,
                 },
                 SoccerPolicySample {
                     state_features: state,
@@ -38632,6 +38637,7 @@ fn policy_head_advantage_gradient_prefers_the_reinforced_family() {
                     old_action_probability: None,
                     sample_weight: 1.0,
                     mcts_distillation: false,
+                    forward_select_eligible: false,
                 },
             ]
         })
@@ -38672,6 +38678,7 @@ fn policy_head_mappo_clip_bounds_old_policy_ratio() {
         old_action_probability: Some(current_probability / 10.0),
         sample_weight: 1.0,
         mcts_distillation: false,
+        forward_select_eligible: false,
     };
     let positive = head
         .clipped_mappo_advantage(&positive_sample, 0.2)
@@ -38688,6 +38695,7 @@ fn policy_head_mappo_clip_bounds_old_policy_ratio() {
         old_action_probability: Some(current_probability * 10.0),
         sample_weight: 1.0,
         mcts_distillation: false,
+        forward_select_eligible: false,
     };
     let negative = head
         .clipped_mappo_advantage(&negative_sample, 0.2)
@@ -38713,6 +38721,7 @@ fn policy_head_mappo_clip_skips_missing_or_invalid_old_policy_probability() {
         old_action_probability,
         sample_weight: 1.0,
         mcts_distillation: false,
+        forward_select_eligible: false,
     };
 
     for old_action_probability in [None, Some(0.0), Some(f64::NAN), Some(f64::INFINITY)] {
@@ -38771,6 +38780,7 @@ fn per_role_policy_heads_train_without_cross_role_gradient_bleed() {
             old_action_probability: None,
             sample_weight: 1.0,
             mcts_distillation: false,
+            forward_select_eligible: false,
         })
         .collect();
     head.train(&samples, None);
