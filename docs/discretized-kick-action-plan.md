@@ -29,7 +29,7 @@ The **discrete representation already exists but is constructed only in tests**:
 - `lower_discretized_kick_release(origin, action, min_speed, max_speed, ref_distance, bend, dither)`
   → `LoweredKickRelease` ([soccer.rs:64092](../src/des/general/soccer.rs#L64092)) — the
   exact lowering the wiring needs. **Its only callers are in `#[cfg(test)]`**
-  ([soccer.rs:59200+](../src/des/general/soccer.rs#L59200)).
+  ([soccer.rs:69143-69177](../src/des/general/soccer.rs#L69143)).
 - `DiscretizedKickDither::sample` is currently a no-op (returns zero offsets) — a
   stub awaiting a learned/stochastic source.
 
