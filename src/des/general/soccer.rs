@@ -4637,8 +4637,19 @@ const SOCCER_NEURAL_DECISION_CONTEXT_FEATURE_DIM: usize = 20;
 const SOCCER_NEURAL_PRE_DECISION_CONTEXT_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_SAME_TEAM_SEPARATION_FEATURE_DIM
         + SOCCER_NEURAL_SAME_TEAM_SEPARATION_FEATURE_DIM;
-const SOCCER_NEURAL_FEATURE_DIM: usize =
+/// Append-only structured action-parameter block (Part A of the priority-1 action-space
+/// fix). Encodes the candidate action's AIM — target dx/dy relative to the ball, aim
+/// distance, attack-relative forward-ness, and the aim direction as an attack-relative
+/// unit vector (sin/cos) — plus a has-target flag. Gives the value head geometric
+/// structure it can GENERALIZE over (nearby kick targets now share nearby features),
+/// instead of leaning on the opaque FNV `soccer_neural_action_hash` where `pass|spd:6`
+/// and `pass|spd:7` map to unrelated scalars. Gate `DD_SOCCER_ENABLE_ACTION_PARAM_FEATURES`;
+/// OFF (default) ⇒ the 7 slots stay 0.0 ⇒ byte-identical, and pre-block nets zero-pad.
+const SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM: usize = 7;
+const SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_DECISION_CONTEXT_FEATURE_DIM + SOCCER_NEURAL_DECISION_CONTEXT_FEATURE_DIM;
+const SOCCER_NEURAL_FEATURE_DIM: usize =
+    SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM + SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM;
 /// Fixed dimensionality of a persisted **moment embedding** (the vector stored
 /// in pgvector for similarity retrieval). Deliberately decoupled from — and
 /// larger than — `SOCCER_NEURAL_FEATURE_DIM`, which grows as features are added:
