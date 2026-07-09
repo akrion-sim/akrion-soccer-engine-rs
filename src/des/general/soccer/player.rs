@@ -13609,6 +13609,9 @@ impl PlayerAgent {
                             .map(|(id, _)| id)
                     });
                 target.map(|target| {
+                    if std::env::var("DD_SOCCER_FWDREL_SMOKE").is_ok() {
+                        eprintln!("FWDREL_FIRED player={} target={target}", self.id);
+                    }
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
