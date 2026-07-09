@@ -338,7 +338,11 @@ fn shot_objective_sample_captured_on_terminal_outcome_with_expected_reward() {
         shooter,
         origin: Vec2::new(40.0, 104.0),
         intended_target: Vec2::new(41.0, 120.0),
-        mpc_objective: Some((vec![0.0f32; MPC_OBJECTIVE_FEATURE_DIM], Vec2::new(residual_x, 0.0), 0.0)),
+        mpc_objective: Some((
+            vec![0.0f32; MPC_OBJECTIVE_FEATURE_DIM],
+            Vec2::new(residual_x, 0.0),
+            0.0,
+        )),
     };
 
     // Goal ⇒ +1.0, and the sample carries exactly the applied lateral residual with zero bend.
@@ -347,20 +351,33 @@ fn shot_objective_sample_captured_on_terminal_outcome_with_expected_reward() {
         shot: Some(armed(0.3)),
     });
     let goal_samples = sim.drain_mpc_objective_samples();
-    assert_eq!(goal_samples.len(), 1, "an armed shot emits exactly one placement sample on a goal");
-    assert!((goal_samples[0].reward - 1.0).abs() < 1e-9, "goal ⇒ +1.0 placement reward");
+    assert_eq!(
+        goal_samples.len(),
+        1,
+        "an armed shot emits exactly one placement sample on a goal"
+    );
+    assert!(
+        (goal_samples[0].reward - 1.0).abs() < 1e-9,
+        "goal ⇒ +1.0 placement reward"
+    );
     assert!((goal_samples[0].applied_residual.x - 0.3).abs() < 1e-9);
     assert!(
         goal_samples[0].applied_residual.y.abs() < 1e-9,
         "shot placement residual is lateral-only (y captured as 0)"
     );
-    assert!(goal_samples[0].applied_bend.abs() < 1e-9, "shot placement never applies bend");
+    assert!(
+        goal_samples[0].applied_bend.abs() < 1e-9,
+        "shot placement never applies bend"
+    );
 
     // Off target ⇒ −1.0 (recorded for corpus parity; RWR skips negative advantage).
     sim.apply_ball_outcome(BallStepOutcome::Miss { shot: armed(-0.5) });
     let miss_samples = sim.drain_mpc_objective_samples();
     assert_eq!(miss_samples.len(), 1);
-    assert!((miss_samples[0].reward + 1.0).abs() < 1e-9, "off-target ⇒ −1.0 placement reward");
+    assert!(
+        (miss_samples[0].reward + 1.0).abs() < 1e-9,
+        "off-target ⇒ −1.0 placement reward"
+    );
 
     // A shot that did NOT arm the residual (`mpc_objective: None`, i.e. gate off / no head at
     // launch) emits NO sample — the behaviour-neutral / byte-identical-off guarantee at resolve.
@@ -38645,6 +38662,52 @@ fn skill_policy_heads_train_and_score_their_group() {
 }
 
 #[test]
+fn skill_policy_heads_snapshot_round_trips_trained_heads() {
+    let mut heads = SoccerSkillPolicyHeads::new(7);
+    let state = soccer_policy_features_for_role(
+        &[0.1f64; SOCCER_NEURAL_FEATURE_DIM],
+        PlayerRole::Forward,
+        None,
+    );
+    let sample = |label: &str, advantage: f64| SoccerPolicySample {
+        state_features: state,
+        action_index: soccer_policy_action_index(label).expect("family"),
+        advantage,
+        old_action_probability: None,
+        sample_weight: 1.0,
+        mcts_distillation: false,
+        forward_select_eligible: false,
+    };
+    let samples = vec![
+        sample("pass", 1.0),
+        sample("dribble", 1.0),
+        sample("shoot", 1.5),
+    ];
+    heads.train(&samples);
+
+    let snapshot = soccer_skill_policy_heads_snapshot(&heads);
+    let restored = soccer_skill_policy_heads_from_snapshot(&snapshot, 99)
+        .expect("skill policy heads snapshot should restore");
+    let shoot_idx = soccer_policy_action_index("shoot").expect("shoot family");
+    assert_eq!(restored.pass.training_steps, heads.pass.training_steps);
+    assert_eq!(
+        restored.dribble.training_steps,
+        heads.dribble.training_steps
+    );
+    assert_eq!(restored.shot.training_steps, heads.shot.training_steps);
+    assert_eq!(
+        restored
+            .log_probs(&state)
+            .log_prob_for_action_index(shoot_idx)
+            .expect("restored shot log-prob"),
+        heads
+            .log_probs(&state)
+            .log_prob_for_action_index(shoot_idx)
+            .expect("original shot log-prob")
+    );
+}
+
+#[test]
 fn policy_head_fails_closed_on_malformed_actor_features() {
     let mut head = SoccerPolicyHead::new(11);
     let critic_state = [0.0f64; SOCCER_NEURAL_FEATURE_DIM];
@@ -41929,6 +41992,156 @@ fn frozen_away_brain_serves_predictions_but_never_trains() {
         0,
         "frozen away brain must not take gradient steps"
     );
+}
+
+fn trained_test_skill_policy_heads(seed: u32, rounds: usize) -> SoccerSkillPolicyHeads {
+    let mut heads = SoccerSkillPolicyHeads::new(seed);
+    let state = soccer_policy_features_for_role(
+        &[0.1f64; SOCCER_NEURAL_FEATURE_DIM],
+        PlayerRole::Forward,
+        None,
+    );
+    let sample = |label: &str, advantage: f64| SoccerPolicySample {
+        state_features: state,
+        action_index: soccer_policy_action_index(label).expect("policy family"),
+        advantage,
+        old_action_probability: None,
+        sample_weight: 1.0,
+        mcts_distillation: false,
+        forward_select_eligible: false,
+    };
+    let samples = [
+        sample("pass", 1.0),
+        sample("dribble", 1.0),
+        sample("shoot", 1.5),
+    ];
+    for _ in 0..rounds {
+        heads.train(&samples);
+    }
+    heads
+}
+
+#[test]
+fn set_team_neural_brain_restores_skill_policy_heads_from_snapshot() {
+    let mut sim = per_team_brain_match(20261);
+    let heads = trained_test_skill_policy_heads(17, 1);
+    assert_eq!(heads.pass.training_steps, 1);
+    assert_eq!(heads.dribble.training_steps, 1);
+    assert_eq!(heads.shot.training_steps, 1);
+
+    let mut snapshot = sim
+        .neural_network_snapshot_for(Team::Home)
+        .expect("home neural snapshot");
+    snapshot.skill_policy_heads = Some(Box::new(soccer_skill_policy_heads_snapshot(&heads)));
+    sim.skill_policy_heads = None;
+    sim.away_skill_policy_heads = None;
+
+    sim.set_team_neural_brain(Team::Away, Some(snapshot), true)
+        .expect("install away snapshot with skill heads");
+    assert!(
+        sim.skill_policy_heads.is_none(),
+        "away install must not populate the home/shared skill heads"
+    );
+    let restored = sim
+        .away_skill_policy_heads
+        .as_ref()
+        .expect("away skill heads restored onto match");
+    assert_eq!(restored.pass.training_steps, 1);
+    assert_eq!(restored.dribble.training_steps, 1);
+    assert_eq!(restored.shot.training_steps, 1);
+    assert!(restored.pass.last_loss.is_some());
+    assert!(restored.dribble.last_loss.is_some());
+    assert!(restored.shot.last_loss.is_some());
+
+    let exported = sim
+        .neural_network_snapshot_for(Team::Away)
+        .expect("away neural snapshot");
+    let exported_heads = exported
+        .skill_policy_heads
+        .as_deref()
+        .expect("away snapshot carries skill heads");
+    assert_eq!(exported_heads.heads.len(), SoccerSkillGroup::ALL.len());
+    assert!(exported_heads
+        .heads
+        .iter()
+        .all(|head| head.training_steps == 1 && head.average_loss.is_some()));
+}
+
+#[test]
+fn set_team_neural_brain_does_not_leak_home_skill_policy_heads_to_away_without_snapshot_heads() {
+    let mut sim = per_team_brain_match(20262);
+    let heads = trained_test_skill_policy_heads(23, 1);
+    let mut home_snapshot = sim
+        .neural_network_snapshot_for(Team::Home)
+        .expect("home neural snapshot");
+    let mut away_snapshot = home_snapshot.clone();
+    home_snapshot.skill_policy_heads = Some(Box::new(soccer_skill_policy_heads_snapshot(&heads)));
+    away_snapshot.skill_policy_heads = None;
+
+    sim.set_team_neural_brain(Team::Home, Some(home_snapshot), true)
+        .expect("install home snapshot with skill heads");
+    sim.set_team_neural_brain(Team::Away, Some(away_snapshot), true)
+        .expect("install away snapshot without skill heads");
+
+    assert!(
+        sim.skill_policy_heads.is_some(),
+        "home side should keep its restored skill heads"
+    );
+    assert!(
+        sim.away_skill_policy_heads.is_none(),
+        "away side must not inherit home skill heads when its snapshot lacks them"
+    );
+    assert!(sim
+        .neural_network_snapshot_for(Team::Home)
+        .expect("home exported snapshot")
+        .skill_policy_heads
+        .is_some());
+    assert!(sim
+        .neural_network_snapshot_for(Team::Away)
+        .expect("away exported snapshot")
+        .skill_policy_heads
+        .is_none());
+}
+
+#[test]
+fn set_team_neural_brain_keeps_distinct_skill_policy_heads_per_team() {
+    let mut sim = per_team_brain_match(20263);
+    let home_heads = trained_test_skill_policy_heads(31, 1);
+    let away_heads = trained_test_skill_policy_heads(37, 2);
+    let mut home_snapshot = sim
+        .neural_network_snapshot_for(Team::Home)
+        .expect("home neural snapshot");
+    let mut away_snapshot = home_snapshot.clone();
+    home_snapshot.skill_policy_heads =
+        Some(Box::new(soccer_skill_policy_heads_snapshot(&home_heads)));
+    away_snapshot.skill_policy_heads =
+        Some(Box::new(soccer_skill_policy_heads_snapshot(&away_heads)));
+
+    sim.set_team_neural_brain(Team::Home, Some(home_snapshot), true)
+        .expect("install home snapshot with skill heads");
+    sim.set_team_neural_brain(Team::Away, Some(away_snapshot), true)
+        .expect("install away snapshot with skill heads");
+
+    let home_export = sim
+        .neural_network_snapshot_for(Team::Home)
+        .expect("home exported snapshot");
+    let away_export = sim
+        .neural_network_snapshot_for(Team::Away)
+        .expect("away exported snapshot");
+    assert!(home_export
+        .skill_policy_heads
+        .as_deref()
+        .expect("home exported skill heads")
+        .heads
+        .iter()
+        .all(|head| head.training_steps == 1));
+    assert!(away_export
+        .skill_policy_heads
+        .as_deref()
+        .expect("away exported skill heads")
+        .heads
+        .iter()
+        .all(|head| head.training_steps == 2));
 }
 
 #[test]

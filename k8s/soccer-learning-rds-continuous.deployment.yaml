@@ -105,6 +105,9 @@ spec:
               require_value DD_SOCCER_ENABLE_SCORED_SHOT_PLACEMENT true
               require_value DD_SOCCER_ENABLE_TARGET_STANDARDIZATION true
               require_value DD_SOCCER_ENABLE_MC_CRITIC_TARGET true
+              require_value DD_SOCCER_ENABLE_DP_BOOTSTRAP true
+              require_value DD_SOCCER_DP_BOOTSTRAP_HORIZON 64
+              require_value DD_SOCCER_DP_BOOTSTRAP_SWEEPS 200
               require_value DD_SOCCER_ENABLE_NEURAL_SELF_BOOTSTRAP true
               require_value DD_SOCCER_ENABLE_MAXA_BOOTSTRAP true
               require_value DD_SOCCER_ENABLE_NOVELTY_BONUS true
@@ -148,6 +151,9 @@ spec:
               echo "scored_shot_placement=${DD_SOCCER_ENABLE_SCORED_SHOT_PLACEMENT}"
               echo "target_standardization=${DD_SOCCER_ENABLE_TARGET_STANDARDIZATION}"
               echo "mc_critic_target=${DD_SOCCER_ENABLE_MC_CRITIC_TARGET}"
+              echo "dp_bootstrap=${DD_SOCCER_ENABLE_DP_BOOTSTRAP}"
+              echo "dp_bootstrap_horizon=${DD_SOCCER_DP_BOOTSTRAP_HORIZON}"
+              echo "dp_bootstrap_sweeps=${DD_SOCCER_DP_BOOTSTRAP_SWEEPS}"
               echo "neural_self_bootstrap=${DD_SOCCER_ENABLE_NEURAL_SELF_BOOTSTRAP}"
               echo "maxa_bootstrap=${DD_SOCCER_ENABLE_MAXA_BOOTSTRAP}"
               echo "novelty_bonus=${DD_SOCCER_ENABLE_NOVELTY_BONUS}"
@@ -401,6 +407,12 @@ spec:
               value: "true"
             - name: DD_SOCCER_ENABLE_MC_CRITIC_TARGET
               value: "true"
+            - name: DD_SOCCER_ENABLE_DP_BOOTSTRAP
+              value: "true"
+            - name: DD_SOCCER_DP_BOOTSTRAP_HORIZON
+              value: "64"
+            - name: DD_SOCCER_DP_BOOTSTRAP_SWEEPS
+              value: "200"
             - name: DD_SOCCER_ENABLE_NEURAL_SELF_BOOTSTRAP
               value: "true"
             - name: DD_SOCCER_ENABLE_MAXA_BOOTSTRAP

@@ -162,10 +162,10 @@ of future rewards from being in this bucket?
 
 ## Implementation paths (three tiers)
 
-### Tier 1 — Zero code change: enable and tune `DD_SOCCER_ENABLE_DP_BOOTSTRAP`
+### Tier 1 — Enable the existing ADP path and tune `DD_SOCCER_ENABLE_DP_BOOTSTRAP`
 
-Just set env vars and run the existing treatment with DP ON. The effect is indirect
-(DP helps the tabular Q, which feeds the neural bootstrap target), but it's the
+Set env vars and run the existing treatment with DP ON. The effect is indirect
+(DP helps the tabular Q, which feeds the neural bootstrap target), but it is the
 fastest test.
 
 ```
@@ -174,6 +174,16 @@ DD_SOCCER_DP_BOOTSTRAP_HORIZON=64       # longer n-step (was 16)
 DD_SOCCER_DP_BOOTSTRAP_SWEEPS=200       # more VI sweeps (was 40)
 SOCCER_APPROX_DP_REPLAY_PASSES=8        # multi-pass Q training (was 1)
 ```
+
+Implementation note: `SOCCER_APPROX_DP_REPLAY_PASSES` still overrides explicitly,
+but forward-pass climb profiles now default this replay budget to 8 when any of
+`DD_SOCCER_FORWARD_PASS_CLIMB_CURRICULUM`,
+`SOCCER_POLICY_PROMOTION_FORWARD_PASS_PRIMARY`, or
+`SOCCER_EVAL_REQUIRE_FORWARD_PASS_CLIMB` is active. Non-climb runs keep the old
+default of 1 replay pass. The local league trainer and continuous RDS climb
+manifest now also arm the Tier 1 DP bootstrap profile by default/preflight:
+`DD_SOCCER_ENABLE_DP_BOOTSTRAP=1`, `DD_SOCCER_DP_BOOTSTRAP_HORIZON=64`, and
+`DD_SOCCER_DP_BOOTSTRAP_SWEEPS=200`.
 
 Run with W=0.7, 32 train, 90 eval. If payoff climbs from 0.522 to 0.545+, DP is
 helping. If not, the indirect path is too weak.
@@ -246,11 +256,33 @@ the neural net provides the fine-grained corrections.
 
 ---
 
+## Promotion rule: best-of, not blended
+
+The right way to include approximate DP alongside neural nets is:
+
+1. **Inside learning**: let ADP/Bellman replay improve Q targets and provide the
+   replay-backed prior that neural-authoritative scoring can consult.
+2. **At promotion**: evaluate candidate artifacts through the same held-out
+   HOME-vs-analytic / local-best gate and keep the stronger promoted artifact,
+   whether the gain came mostly from neural weights, DP-improved Q tables, or the
+   hybrid of both.
+3. **Avoid action-distribution averaging**: do not average DP and neural actions
+   at decision time. That can be worse than either parent. The gate should choose
+   the winner for the next stage/promotion; the neural net can then learn from the
+   DP-improved trajectory targets.
+
+This keeps DP as a credit/target stabilizer and promotion contender, while the
+neural net remains the deployable generalizer for full continuous POMDP state.
+
+---
+
 ## Recommendation
 
-**Start with Tier 1** (zero code): enable `DD_SOCCER_ENABLE_DP_BOOTSTRAP=1` with
-longer horizon (64) and more sweeps (200), plus `SOCCER_APPROX_DP_REPLAY_PASSES=8`.
-Run as the next experiment with W=0.7, 32 training games.
+**Start with Tier 1**: enable `DD_SOCCER_ENABLE_DP_BOOTSTRAP=1` with longer
+horizon (64) and more sweeps (200). In forward-pass climb mode, the replay pass
+budget now defaults to 8; set `SOCCER_APPROX_DP_REPLAY_PASSES=8` explicitly when
+running outside that profile or when you want the manifest/logs to make the
+choice obvious. Run as the next experiment with W=0.7, 32 training games.
 
 If Tier 1 shows a measurable improvement (payoff +0.01 to +0.02), the DP signal is
 reaching the neural net and Tier 2 is justified. If Tier 1 shows nothing, the
