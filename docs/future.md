@@ -49,8 +49,6 @@ Near-term ideas:
 
 - Add telemetry for MCTS candidate count, simulations, selected action, prior
   source, and whether MCTS changed the top neural-blend action.
-- Add explicit causality counters: net-changed executed action rate,
-  ConfidenceGated selected-candidate open rate, and selected kick-power bucket entropy.
 - Add a runtime/env override for the live MCTS budget, with hard caps preserved
   in `SoccerNeuralBlendConfig`.
 - Feed MCTS trace data into the inspector snapshot so a live debugging tool can
@@ -107,23 +105,6 @@ Candidate expansions:
   long retreat ball so short 3-5 yard resets can win without hard-banning longer
   recycling.
 
-## Action Confidence And Exploration
-
-Kick-power bucket labels are now part of the actor vocabulary, but the confidence and
-exploration story is still unfinished.
-
-Future work:
-
-- Compute ConfidenceGated trust on a coarser action key when the fine factored label fragments
-  visits, while keeping the fine label and parameter features for the neural model.
-- Sample candidate buckets with an annealed softmax or epsilon schedule, then log selected-bucket
-  entropy by family. Do not rely on `DiscretizedKickDither`; it is currently a zero-offset
-  placeholder and does not explore other buckets.
-- Add an entropy bonus or minimum-diversity guard for bucket labels during plateau phases, then
-  anneal only after held-out eval confirms that bucket ownership helps.
-- Keep any unshielded or reduced-shield training lane paired against the normal shielded lane on
-  fixed seeds, with promotion still gated by held-out play quality.
-
 ## Training Uses
 
 MCTS may be more valuable during learning than during live play. Training can use
@@ -140,11 +121,6 @@ Ideas:
   which priors and critic values drove the decision.
 - Compare learned policy improvement from plain self-play versus MCTS-augmented
   self-play over the same seeds and wall-clock budget.
-- Maintain a frozen evaluation ladder: pure analytic baseline, protected local best,
-  past checkpoints, and weaker/randomized opponents. Mirror self-play parity should never be the
-  only learning curve.
-- Add small-sided or high-event curricula when full 11v11 runs are too draw-heavy/noisy to verify
-  the credit loop quickly.
 
 ## Learned Role-Band Average-Y Models
 
