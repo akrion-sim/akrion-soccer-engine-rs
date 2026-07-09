@@ -24741,7 +24741,7 @@ impl SoccerMatch {
             .or_else(|| {
                 snapshot.dribble_away_from_pressure_target_for(player_id, requested_target, kind)
             });
-        let target = stationary_escape_target.unwrap_or(requested_target);
+        let mut target = stationary_escape_target.unwrap_or(requested_target);
         let pressured_shield_escape = stationary_escape_target.is_some()
             && matches!(kind, Some(DribbleMoveKind::ProtectBall))
             && target.distance(requested_target) > 0.10;
