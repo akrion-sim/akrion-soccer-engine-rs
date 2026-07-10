@@ -34,7 +34,8 @@ use soccer_engine::des::general::soccer::{
     SoccerTeamQPolicies, DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
 };
 use soccer_engine::des::general::tournament::{
-    EngineMatchRunner, EngineMatchRunnerConfig, TeamBrain, TournamentMatchContext, TournamentStage,
+    EngineMatchRunner, EngineMatchRunnerConfig, TeamBrain, TournamentMatchContext,
+    TournamentMatchRunner, TournamentStage,
 };
 
 fn parse_hex(s: Option<&String>, default: u32) -> u32 {
