@@ -907,11 +907,16 @@ impl World {
     }
 
     /// Spacing shaping for Team A's outfielders (indices 1..N), averaged over
-    /// pairs. Penalize < 3 units apart, reward > 5 apart, cap the reward at 8 —
-    /// so players spread out and passing lanes open. Gated to A possession so it
-    /// rewards good shape while attacking, not just standing spread doing nothing.
+    /// pairs. Penalize < 2 units apart, neutral 2–4 (leaves room for a short
+    /// passing outlet), reward > 4 apart, cap the reward at 8. Applied whenever
+    /// the ball is in play near/for Team A (not only in possession) so players
+    /// keep shape while attacking AND while pushing up — not just clustering.
     pub fn spacing_term_a(&self) -> f32 {
-        if !matches!(self.owner, Some(o) if matches!(o.team, Team::A)) {
+        // Skip only when Team B is settled in possession deep — there, A defends
+        // and legitimately compresses. Otherwise (A possession or a loose ball)
+        // reward good shape.
+        let b_has = matches!(self.owner, Some(o) if matches!(o.team, Team::B));
+        if b_has {
             return 0.0;
         }
         let mut sum = 0.0f32;
@@ -919,12 +924,12 @@ impl World {
         for i in 1..N {
             for j in (i + 1)..N {
                 let d = self.a[i].pos.sub(self.a[j].pos).len();
-                let v = if d < 3.0 {
-                    -(3.0 - d) // too close: penalty, growing as they overlap
-                } else if d <= 5.0 {
-                    0.0 // acceptable gap
+                let v = if d < 2.0 {
+                    -(2.0 - d) // too close: penalty, growing as they overlap
+                } else if d <= 4.0 {
+                    0.0 // acceptable gap — a short outlet is fine here
                 } else {
-                    d.min(8.0) - 5.0 // spread out: reward, flat beyond 8
+                    d.min(8.0) - 4.0 // spread out: reward, flat beyond 8
                 };
                 sum += v;
                 n += 1.0;
