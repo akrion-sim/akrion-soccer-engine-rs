@@ -41,7 +41,7 @@ use soccer_engine::des::general::soccer::{
     enable_deterministic_formation_lp, learned_mpc_objective_enabled, AttackSpacingHead,
     MatchConfig, MatchStats, SoccerMarlAlgorithm, SoccerMatch, SoccerMpcObjectiveHead,
     SoccerNeuralLearningBackend, SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot,
-    SoccerPassCompletionHead, SoccerQPolicyOptions, SoccerTeamQPolicies, SupportScorerHead,
+    SoccerPassCompletionHead, SoccerQPolicyOptions, SoccerTeamQPolicies, SupportScorerHead, Team,
     ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS, DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
     DEFAULT_SOCCER_PASS_COMPLETION_LEARNING_RATE, PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS,
     SUPPORT_SCORER_HEAD_MIN_TRAINING_STEPS,
@@ -98,15 +98,6 @@ fn proof_neural_config() -> SoccerNeuralLearningConfig {
     neural.target_popart_enabled =
         env_bool("SOCCER_NEURAL_TARGET_POPART", neural.target_popart_enabled);
     neural.hidden_units = env_usize("SOCCER_NEURAL_HIDDEN_UNITS", neural.hidden_units);
-    // LEARN-TO-LEARN speed levers: LR (step size), max_batches_per_tick (gradient updates/tick),
-    // batch_size, replay_samples_per_tick (sample reuse). Default = unchanged. Amplify these
-    // (with PopArt+target-clip stabilizing) to raise the learning RATE (climb per generation).
-    neural.learning_rate = env_f64("SOCCER_NEURAL_LEARNING_RATE", neural.learning_rate);
-    neural.batch_size = env_usize("SOCCER_NEURAL_BATCH_SIZE", neural.batch_size);
-    neural.max_batches_per_tick =
-        env_usize("SOCCER_NEURAL_MAX_BATCHES_PER_TICK", neural.max_batches_per_tick);
-    neural.replay_samples_per_tick =
-        env_usize("SOCCER_NEURAL_REPLAY_SAMPLES_PER_TICK", neural.replay_samples_per_tick);
     neural
 }
 
