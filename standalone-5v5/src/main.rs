@@ -271,8 +271,8 @@ fn run_training(iters: usize) {
                 best_iter = it;
             }
             println!(
-                "{:>5} | {:>+10.3} | {:>8.3} | {:>6.2} {:>6.2} | sp {:>4.1} | {:>7.3} | {:>9.4}",
-                it, d, wr, ga, gb, sp, stats.entropy, stats.value_loss
+                "{:>5} | {:>+10.3} | {:>8.3} | {:>6.2} {:>6.2} | sp {:>4.1} | bunch {:>3.0}% | ent {:>5.2}",
+                it, d, wr, ga, gb, sp, bunch * 100.0, stats.entropy
             );
             let _ = writeln!(
                 csv,
