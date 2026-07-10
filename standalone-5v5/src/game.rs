@@ -740,6 +740,7 @@ impl World {
             A_SHOOT => {
                 if team == Team::A {
                     self.ev_shot_attempt_a = true;
+                    self.pass_streak_a = 0; // buildup consumed by the shot
                 }
                 self.set_vel(team, idx, V2::default());
                 // MPC-lite finishing: enumerate aim points across the mouth and
