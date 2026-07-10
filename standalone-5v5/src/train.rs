@@ -127,8 +127,8 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
 
     // GAE per player (same team reward broadcast to all 5).
     let t = rew_buf.len();
-    let mut samples = Vec::with_capacity(t * N);
-    for i in 0..N {
+    let mut samples = Vec::with_capacity(t * (N - 1));
+    for i in 1..N {
         let mut adv = 0.0f32;
         let mut next_v = 0.0f32; // bootstrap 0 at horizon end
         for s in (0..t).rev() {
