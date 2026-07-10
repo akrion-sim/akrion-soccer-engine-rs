@@ -198,6 +198,30 @@
   </section>
 
   <section>
+    <div class="section-head">
+      <h2>Match analytics</h2>
+      <span class="note">trained model, 300-game average</span>
+    </div>
+    <div class="statgrid" id="statgrid"></div>
+    <div class="analytics2">
+      <div class="curvecard">
+        <div class="mini-h">Pass mix</div>
+        <div class="passbar" id="passbar"></div>
+        <div class="legend" id="passbar-legend"></div>
+      </div>
+      <div class="curvecard">
+        <div class="mini-h">Rates over training</div>
+        <canvas id="rates"></canvas>
+        <div class="legend">
+          <span class="sw"><i style="background:var(--accent)"></i>pass completion %</span>
+          <span class="sw"><i style="background:var(--good)"></i>shot conversion %</span>
+          <span class="sw"><i style="background:var(--ink-dim)"></i>possession %</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
     <div class="section-head"><h2>What's under the hood</h2></div>
     <div class="facts" id="facts"></div>
   </section>
