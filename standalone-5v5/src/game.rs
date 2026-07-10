@@ -616,6 +616,7 @@ impl World {
                 if pp.team == Team::A {
                     if o.team == Team::A {
                         self.ev_pass_completed_a = true; // A pass reached an A player
+                        self.last_pass_gain_a = self.ball.x - self.pass_kick_x;
                     } else {
                         self.ev_turnover_a = true; // A pass intercepted by B
                     }
