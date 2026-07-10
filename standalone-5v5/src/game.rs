@@ -674,6 +674,7 @@ impl World {
         if let Some((o, _)) = best {
             let prev_touch = self.last_touch;
             self.owner = Some(o);
+            self.a_shot_flag = false; // shot resolved into possession
             // Team-A reward events. pending_pass.team is the PASSING team.
             if let Some(pp) = self.pending_pass {
                 if pp.team == Team::A {
