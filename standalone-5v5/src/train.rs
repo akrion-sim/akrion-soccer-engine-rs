@@ -191,7 +191,8 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
         let mut next_v = 0.0f32; // bootstrap 0 at horizon end
         for s in (0..t).rev() {
             let v = val_buf[s][i];
-            let delta = rew_buf[s] + GAMMA * next_v - v;
+            // team reward (shared) + this player's OWN spacing reward
+            let delta = rew_buf[s] + space_buf[s][i] + GAMMA * next_v - v;
             adv = delta + GAMMA * LAMBDA * adv;
             let ret = adv + v;
             next_v = v;
