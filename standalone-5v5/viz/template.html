@@ -131,12 +131,14 @@
 
   <header>
     <div class="eyebrow"><span class="dot"></span> standalone 5-a-side · reinforcement learning · zero deps</div>
-    <h1>The policy learned to <span class="em">actually play soccer.</span></h1>
-    <p class="lede">A hermetic 5v5 sim — no formation LP/IPM, no POMDP feature stack, just the macro
-      families <b>pass · dribble · shoot · clear · hold</b> and <b>chase · support · spread · mark</b>,
-      with movement driven purely by possession and open space. A shared-weight policy (PPO + GAE,
-      hand-rolled MLP) trains against a scripted analytic baseline. Same opening kickoff below —
-      watch what changes.</p>
+    <h1>Watch a policy learn to <span class="em">pass, dribble, and finish.</span></h1>
+    <p class="lede">A hermetic 5-a-side sim — <b>goalkeepers</b>, a <b>~7m net</b>, no formation LP/IPM and
+      no POMDP feature stack. The four outfielders learn only the macro families
+      <b>pass · dribble · shoot · clear · hold</b> and <b>chase · support · spread · mark</b>;
+      movement is pure possession + open-space, and shooting uses a short-horizon
+      <b>aim optimizer</b> that places the ball at the corner away from the keeper. A shared-weight
+      policy (PPO + GAE, hand-rolled MLP) trains against a scripted baseline. Same kickoff on both
+      pitches below — watch the <em>quality of play</em> change.</p>
   </header>
 
   <div class="result" id="result"></div>
