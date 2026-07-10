@@ -25,22 +25,16 @@
 
 Three compounding structural ceilings, all verified in code:
 
-<<<<<<< ours
 1. **The net now has a partial learned parameter surface, but not the whole one.**
    Kick-power bucket labels are present in `SOCCER_POLICY_ACTIONS` and MCTS can expand pass,
    aerial-pass, shot, and first-time-shot bucket variants behind `DD_SOCCER_ENABLE_DISCRETIZED_KICK`.
-   That fixes the older "never reaches candidates" diagnosis for speed buckets. With the gate off,
-   pass/shoot parameters still come from the continuous heuristic scan; with the gate on, the net can
-   rank speed-bucket variants. Direction, curve, elevation, and bounded aim are still mostly analytic,
-   and bucket selection still needs entropy/causal-change telemetry.
-=======
-1. **The net ranks heuristic actions with heuristic *parameters*.** The learnable factored action
-   space (`DiscretizedKickAction` — actor owns kick power/direction/curve) exists and is unit-tested;
-   with the gate **off** it is only used at the **execution/lowering** layer
-   (`DiscretizedKickAction::from_power_direction`, world.rs:26742) — *not as candidates the net ranks*.
-   **Part B (above) now injects them as ranked candidates when `DD_SOCCER_ENABLE_DISCRETIZED_KICK` is
-   on.** With the gate off, pass/shoot params remain a continuous power × ~72-site heuristic scan.
->>>>>>> theirs
+   That fixes the older "never reaches candidates" diagnosis for speed buckets. With the gate **off**,
+   the factored `DiscretizedKickAction` (actor owns kick power/direction/curve, unit-tested) is only
+   used at the **execution/lowering** layer (`DiscretizedKickAction::from_power_direction`,
+   world.rs:26742) — *not as candidates the net ranks* — and pass/shoot parameters still come from the
+   continuous power × ~72-site heuristic scan. With the gate **on**, the net can rank speed-bucket
+   variants. Direction, curve, elevation, and bounded aim are still mostly analytic, and bucket
+   selection still needs entropy/causal-change telemetry.
 2. **The value regresses onto the *tabular* Q.** Target = `r + γ·max_next` with `max_next =`
    tabular `best_value_hierarchical` ([world.rs](../src/des/general/soccer/world.rs)). A value
    trained to match the tabular Q **cannot exceed the analytic ceiling** — it's imitation, not
