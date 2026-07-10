@@ -78,7 +78,7 @@ def main():
     tpl = tpl.replace("/*__CURVE__*/ null", json.dumps(curve))
     tpl = tpl.replace("/*__META__*/ null", json.dumps(meta, ensure_ascii=False))
 
-    out_path = os.path.join(HERE, "demo.html")
+    out_path = os.path.join(HERE, "index.html")
     with open(out_path, "w") as f:
         f.write(tpl)
     print("wrote", out_path, f"({len(tpl)//1024} KB)")
