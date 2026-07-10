@@ -925,6 +925,9 @@ impl World {
                         self.pending_passer = idx as i32;
                         let is_return = idx as i32 == self.lp_to && ti as i32 == self.lp_from;
                         if is_return {
+                            if self.return_streak_a == 0 {
+                                self.return_start_x = self.ball.x; // sequence begins here
+                            }
                             self.return_streak_a += 1;
                         } else {
                             self.return_streak_a = 0;
