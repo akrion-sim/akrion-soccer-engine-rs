@@ -669,7 +669,8 @@ impl World {
                     }
                 }
                 let aim = V2::new(goal_x, best_y);
-                if team == Team::A && goal.sub(me).len() < 32.0 {
+                // only credit a "good shot" when taken from a worked-up position
+                if team == Team::A && goal.sub(me).len() < 15.0 && best_score > GOAL_HALF {
                     self.ev_shot_on_a = true;
                 }
                 Some((owner, aim.sub(me), SHOT_SPEED, false))
