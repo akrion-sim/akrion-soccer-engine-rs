@@ -4233,6 +4233,38 @@ pub(crate) fn ball_recovery_reward_scale() -> f64 {
             .unwrap_or(1.0)
     })
 }
+/// Amplify the terminal GOAL / finishing reward family so sparse scoring can DOMINATE the dense
+/// possession/completion shaping (root cause of the possession-safe collapse: goals ~1/game at 160pts
+/// get drowned by per-tick shaping). Env `DD_SOCCER_GOAL_REWARD_SCALE` (default 1.0), clamped [1, 16].
+/// Respects the learn-via-rewards method — it reweights the signal, it does not hard-force finishing.
+pub(crate) fn goal_reward_scale() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_GOAL_REWARD_SCALE")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(1.0, 16.0))
+            .unwrap_or(1.0)
+    })
+}
+
+/// DAMPEN the dense possession-progress shaping so it stops drowning sparse goals. Env
+/// `DD_SOCCER_POSSESSION_SHAPING_SCALE` (default 1.0 = unchanged), clamped [0, 1]. Lower = less
+/// reward for merely retaining/advancing possession, which discourages the degenerate sideways-hold.
+pub(crate) fn possession_shaping_scale() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_POSSESSION_SHAPING_SCALE")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.0, 1.0))
+            .unwrap_or(1.0)
+    })
+}
 const OUTSIDE_MID_TAKEON_ISOLATION_REWARD: f64 = 0.14;
 // Defensive recovery: a contestable ball within this many yards of our back line
 // (2nd-to-last defender) demands max sprint effort; above this recovery effort the
@@ -37099,7 +37131,7 @@ fn soccer_learning_reward_contract() -> SoccerLearningRewardContract {
             .map(|points| points * shot_shaping_reward_scale())
             .collect(),
         possession_progress_milestone_yards: POSSESSION_PROGRESS_MILESTONE_YARDS,
-        possession_progress_points: POSSESSION_PROGRESS_REWARD_POINTS,
+        possession_progress_points: POSSESSION_PROGRESS_REWARD_POINTS * poss_scale,
         possession_progress_reward_weights: POSSESSION_PROGRESS_REWARD_WEIGHTS.to_vec(),
         possession_stall_pass_threshold: POSSESSION_STALL_PASS_THRESHOLD,
         possession_stall_min_gain_yards: POSSESSION_STALL_MIN_GAIN_YARDS,
