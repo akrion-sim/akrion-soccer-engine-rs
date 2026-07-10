@@ -21,6 +21,7 @@ Codex-adjudicated): the net may not **causally own the executed action** — exp
 downstream analytic/execution layers may override it. **Plan (instrument-first) →
 [`climb-reframe-2026-07-09.md`](climb-reframe-2026-07-09.md):**
 1. Build the **net-influence instrument** (pure measurement, default-off): fraction of decisions on
+<<<<<<< ours
    which the net's score changes the executed action vs the tabular/heuristic argmax. Report exact
    vs family, on-/off-ball, chosen-candidate score entropy, and selected kick-speed-bucket entropy.
 2. Baseline it, then **flip exploration on** (`DD_SOCCER_ENABLE_STOCHASTIC_POLICY_TOPK=1` +
@@ -31,6 +32,14 @@ downstream analytic/execution layers may override it. **Plan (instrument-first) 
 4. Keep a frozen eval ladder: analytic baseline, protected local best, past checkpoints, and
    weaker/randomized opponents on held-out seeds.
 5. Only then **resume reward work** (the r19 carrot / learned receiver / target-point aim).
+=======
+   which the net's score changes the executed action vs the tabular/heuristic argmax. Sites: scorer
+   `neural_blended_action` (world.rs:15659/15961) + final commit (world.rs:20126/20150). Report exact
+   vs family, on-/off-ball, chosen-candidate score entropy.
+2. Baseline it, then **flip exploration on** (`DD_SOCCER_ENABLE_STOCHASTIC_POLICY_TOPK=1` +
+   `policy_selection.boltzmann_temperature`>0, annealed) and remeasure.
+3. Only then **resume reward work** (the r19 carrot / learned receiver / target-point aim).
+>>>>>>> theirs
 See also the shipped-but-unevaluated capacity/action-space work on
 `feature/action-param-features-and-capacity` (`learning-breakthrough-priority1-action-space.md`).
 

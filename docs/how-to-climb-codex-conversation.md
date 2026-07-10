@@ -859,6 +859,8 @@ guard (world.rs:33686: when deferred on, don't also feed per-tick). Byte-identic
 - If forward climbs but payoff 0.54-0.58 → rerun 160 train / 280+ eval before touching code.
 - **Prod canary metrics:** fwd passes/g, fwd share, completion%, interceptions+loose per completed fwd pass, turnovers within 5s of fwd pass, SOT/g, xG/chance-quality, GD/payoff.
 - Next openness diag should use anticipated_reception_point + expected_completion + lane_interception_risk, not just feet-openness (my nearest-defender≥4yd proxy is a coarse first column only).
+=======
+>>>>>>> theirs
 ## Round 23 — the causal-ownership reframe (2026-07-09)
 
 An external analysis (repo-comment-grounded, not current-state-grounded) argued the plateau is a

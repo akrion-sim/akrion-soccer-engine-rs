@@ -17,6 +17,7 @@ companion infra: `soccer_eval_gate_run` / `scripts/run_outcome_ab.sh`).
 The execution substrate is **already in place and shared** — passes and shots both
 lower a `KickReleaseSpec` through `kick_release_clamped_to_pitch` into a
 `LoweredKickRelease` (velocity + curl + altitude) that sets `ball.velocity`:
+<<<<<<< ours
 - Passes still build from a target, speed envelope, curve/bend, and flight.
 - Shots still build from shot power and the same release path.
 
@@ -40,12 +41,37 @@ The **full factored kick action** is still not a learned head:
 - `DiscretizedKickAction { speed_bucket, direction_bucket, curve, elevation }` and the
   lowering helpers exist, but live candidate expansion currently uses speed-bucket labels
   around plausible pass/shot targets, not a full learned direction/curve/elevation/aim head.
-- `DiscretizedKickDither::sample` returns zero offsets. It is a bounded placeholder, not
-  exploration and not extra credit assignment.
+- `DiscretizedKickDither::sample` returns bounded inside-bucket offsets, and production
+  pass release uses it only when `DD_SOCCER_ENABLE_DISCRETIZED_KICK_DITHER` is enabled.
+  This provides local release exploration/robustness, not a learned bucket-choice head
+  or extra credit assignment.
 
 The decision path the wiring plugs into remains:
 `learned_action_for_player_with_context` -> `neural_blended_action` ->
 `mpc_reconciled_learned_plan_for_policy` -> `apply_player_intent`.
+=======
+- Pass: [world.rs:26761](../src/des/general/soccer/world.rs#L26761) — builds the spec
+  from a heuristic `aimed_target`, `speed` (`modulated_pass_speed_yps`, world.rs:26002), `curve`,
+  `curve_bend_yards`, and `flight`.
+- Shot: [world.rs:27221](../src/des/general/soccer/world.rs#L27221) — `speed` from
+  `shot_speed_yps_from_power` (world.rs:27190), same `kick_release_clamped_to_pitch` path.
+
+The **discrete representation already exists but is constructed only in tests**:
+- `DiscretizedKickAction { speed_bucket: u8 (10), direction_bucket: u8 (36), curve, technique, elevation }`
+  ([soccer.rs:63788](../src/des/general/soccer.rs#L63788)) with bucket↔value mappings.
+- `lower_discretized_kick_release(origin, action, min_speed, max_speed, ref_distance, bend, dither)`
+  → `LoweredKickRelease` ([soccer.rs:64092](../src/des/general/soccer.rs#L64092)) — the
+  exact lowering the wiring needs. **Its only callers are in `#[cfg(test)]`**
+  ([soccer.rs:69143-69177](../src/des/general/soccer.rs#L69143)).
+- `DiscretizedKickDither::sample` is currently a no-op (returns zero offsets) — a
+  stub awaiting a learned/stochastic source.
+
+The decision path the wiring plugs into:
+`learned_action_for_player_with_context` ([world.rs:13924](../src/des/general/soccer/world.rs#L13924))
+→ `neural_blended_action` ([world.rs:15614](../src/des/general/soccer/world.rs#L15614))
+→ `mpc_reconciled_learned_plan_for_policy` ([world.rs:16595](../src/des/general/soccer/world.rs#L16595))
+→ executed in `apply_player_intent` ([world.rs:25489](../src/des/general/soccer/world.rs#L25489)).
+>>>>>>> theirs
 
 The learnable-head pattern to mirror: `back_four_line.rs` —
 `Inputs → to_features() → FeedForwardNetwork → analytic seed → MIN_TRAINING_STEPS
@@ -61,6 +87,12 @@ The remaining gap is narrower but still important: direction, curve, elevation, 
 are still mostly analytic after the selected family/target. Bucket selection is also not yet a
 stochastic learned exploration policy with entropy pressure, so early low-scored buckets can still
 starve unless MCTS expansion, rank draw, or future bucket sampling keeps them alive.
+The ceiling-break proof profile also enables
+`DD_SOCCER_ENABLE_FORWARD_RELEASE_ROOT_CANDIDATE` plus
+`SOCCER_NEURAL_MCTS_MIN_PASS_LIKE_ROOT_CANDIDATES=1`, so forward pass targets that the analytic
+pass-target cap would hide can reach the neural scorer with the same pass-space and
+kick-power variants as ordinary pass targets, then be measured in `DD_SOCCER_FWD_TRACE`
+before any default-on promotion.
 
 ## Design
 
@@ -172,9 +204,9 @@ for the won-game reward), do not ship a neutral default.
   output — explicitly deferred to a *bounded offset* in Phase 4.
 - **Reward sparsity for curve/aim** (rare events) ⇒ slow learning; expect Phase 3–4
   to need more samples, and accept gated-off if the A/B is null.
-- **`DiscretizedKickDither` is a zero-offset stub** — do not describe it as exploration.
-  If future work uses it, it must stay within +/- half a bucket and the learner must still
-  credit the selected bucket explicitly.
+- **`DiscretizedKickDither` is inside-bucket only** — do not describe it as stochastic
+  bucket selection or a learned parameter head. It must stay within +/- half a bucket,
+  and the learner must still credit the selected bucket explicitly.
 - **Concurrent automation on `main`** (parallel-feature collisions have happened) —
   keep each phase a small, self-contained commit; verify combined-green after any merge.
 - **MPC pass execution** (`mpc_predicted_receiver_path`, off by default) is a separate

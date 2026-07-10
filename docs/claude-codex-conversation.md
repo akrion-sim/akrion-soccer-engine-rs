@@ -51,6 +51,20 @@ GET  /outbox?since=<id>
 POST /outbox
 ```
 
+For the local Codex bridge implementation in
+[`scripts/claude_codex_bridge.py`](../scripts/claude_codex_bridge.py), the short
+operator endpoints are also supported:
+
+```text
+GET  /codex?since=<id>   # alias for /messages, backed by /tmp/codex_claude_inbox.jsonl
+POST /codex              # alias for /messages
+GET  /claude?since=<id>  # alias for /outbox, backed by /tmp/codex_claude_outbox.jsonl
+POST /claude             # alias for /outbox
+```
+
+On the Codex machine, Claude should normally post to `/codex` or `/messages` and
+poll `/claude` or `/outbox`.
+
 The outbox model is useful when one agent's sandbox can receive local writes but
 cannot make outbound LAN requests. In that case:
 
@@ -73,6 +87,10 @@ the repo, for example:
 ```text
 CODEX_CLAUDE_BRIDGE_TOKEN=<shared-random-token>
 ```
+
+The repo bridge script also accepts `CODEX_CLAUDE_BRIDGE_TOKEN_FILE`. If neither
+is set, it creates `/tmp/codex_claude_bridge_token` with mode `0600`; share that
+token out of band with the other machine. `GET /health` must not reveal it.
 
 `GET /health` should not require auth. It should return only service identity,
 host, port, and endpoint names. It must not return the token.
@@ -127,6 +145,65 @@ curl -sS --max-time 5 \
   -H "Content-Type: application/json" \
   --data '{"from":"codex","topic":"plateau","prompt":"Please review this diagnosis."}'
 ```
+
+## Launching the Codex Bridge
+
+Run bridge servers from a normal host Terminal, not from a sandbox that cannot
+bind listening sockets. From the repo root:
+
+```bash
+python3 scripts/claude_codex_bridge.py --check
+nohup python3 scripts/claude_codex_bridge.py --host 0.0.0.0 --port 8765 --role codex-inbox > /tmp/codex_claude_bridge_8765.log 2>&1 &
+nohup python3 scripts/claude_codex_bridge.py --host 0.0.0.0 --port 8767 --role codex-outbox > /tmp/codex_claude_bridge_8767.log 2>&1 &
+```
+
+Expected local checks:
+
+```bash
+curl -sS --max-time 5 http://127.0.0.1:8765/health
+curl -sS --max-time 5 http://127.0.0.1:8767/health
+```
+
+Expected WiFi/LAN checks from the Codex machine itself and from Claude's Mac:
+
+```bash
+curl -sS --max-time 5 http://<codex-lan-ip>:8765/health
+curl -sS --max-time 5 http://<codex-lan-ip>:8767/health
+```
+
+Authenticated alias checks:
+
+```bash
+TOKEN="$(cat /tmp/codex_claude_bridge_token)"
+curl -sS --max-time 5 -H "Authorization: Bearer $TOKEN" "http://<codex-lan-ip>:8765/codex?since=0"
+curl -sS --max-time 5 -X POST "http://<codex-lan-ip>:8767/claude" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"from":"codex","topic":"bridge-health","prompt":"Codex bridge POST /claude test."}'
+```
+
+If `lsof -nP -iTCP:8765 -iTCP:8767 -sTCP:LISTEN` shows a listener but
+`/health` refuses connections, treat that process as stale only after confirming
+its command/cwd with `lsof -nP -p <pid>`. Stop the stale process from the
+terminal that owns it, or use `kill <pid>` only after confirming it is the broken
+bridge and not another useful service.
+
+## NordVPN and LAN Routing
+
+A NordVPN dedicated public IP, including a Houston endpoint, is not the bridge
+address for two Macs on the same WiFi. Use the local WiFi address from
+`ipconfig getifaddr en0`, such as `192.168.100.19`, for Claude-to-Codex traffic.
+
+The VPN should leave the local subnet route on `en0`:
+
+```bash
+netstat -rn -f inet
+```
+
+Look for a route like `192.168.100 link#... en0`. If Claude cannot reach
+`http://<codex-lan-ip>:8765/health` while localhost works, check NordVPN's LAN
+visibility/local-network setting, macOS Firewall, and whether the bridge is bound
+to `0.0.0.0` or the LAN IP rather than `127.0.0.1`.
 
 ## One-Way Network Failure
 

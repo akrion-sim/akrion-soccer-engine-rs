@@ -4707,6 +4707,14 @@ const SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_DECISION_CONTEXT_FEATURE_DIM + SOCCER_NEURAL_DECISION_CONTEXT_FEATURE_DIM;
 const SOCCER_NEURAL_FEATURE_DIM: usize =
     SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM + SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM;
+const SOCCER_NEURAL_COMPACT_FEATURE_DIM: usize = 100;
+const SOCCER_NEURAL_COMPACT_CORE_PREFIX_DIM: usize = 90;
+const SOCCER_NEURAL_COMPACT_ACTION_OFFSET: usize = SOCCER_NEURAL_COMPACT_CORE_PREFIX_DIM;
+const SOCCER_NEURAL_COMPACT_INPUTS_ENV: &str = "SOCCER_NEURAL_COMPACT_INPUTS";
+const DD_SOCCER_NEURAL_COMPACT_INPUTS_ENV: &str = "DD_SOCCER_NEURAL_COMPACT_INPUTS";
+const DEFAULT_SOCCER_NEURAL_BOTTLENECK_DIM: usize = 100;
+const SOCCER_NEURAL_BOTTLENECK_DIM_ENV: &str = "SOCCER_NEURAL_BOTTLENECK_DIM";
+const DD_SOCCER_NEURAL_BOTTLENECK_DIM_ENV: &str = "DD_SOCCER_NEURAL_BOTTLENECK_DIM";
 /// Fixed dimensionality of a persisted **moment embedding** (the vector stored
 /// in pgvector for similarity retrieval). Deliberately decoupled from — and
 /// larger than — `SOCCER_NEURAL_FEATURE_DIM`, which grows as features are added:
@@ -40872,6 +40880,146 @@ pub(crate) struct SoccerNeuralTrainingSample {
     priority: f64,
 }
 
+fn soccer_neural_compact_inputs_enabled() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled(SOCCER_NEURAL_COMPACT_INPUTS_ENV)
+            || soccer_env_flag_enabled(DD_SOCCER_NEURAL_COMPACT_INPUTS_ENV)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            soccer_env_flag_enabled(SOCCER_NEURAL_COMPACT_INPUTS_ENV)
+                || soccer_env_flag_enabled(DD_SOCCER_NEURAL_COMPACT_INPUTS_ENV)
+        })
+    }
+}
+
+fn soccer_neural_configured_input_dim() -> usize {
+    if soccer_neural_compact_inputs_enabled() {
+        SOCCER_NEURAL_COMPACT_FEATURE_DIM
+    } else {
+        SOCCER_NEURAL_FEATURE_DIM
+    }
+}
+
+fn soccer_neural_bottleneck_dim_env_value(name: &str) -> Option<usize> {
+    let raw = std::env::var(name).ok()?;
+    match raw.trim().parse::<usize>() {
+        Ok(0) => None,
+        Ok(value) => Some(value.clamp(2, MAX_SOCCER_NEURAL_HIDDEN_UNITS)),
+        Err(_) => {
+            eprintln!(
+                "soccer: invalid {name} {:?}; use 0 to disable or a positive bottleneck dim",
+                raw
+            );
+            None
+        }
+    }
+}
+
+fn soccer_neural_bottleneck_dim_from_env() -> Option<usize> {
+    soccer_neural_bottleneck_dim_env_value(SOCCER_NEURAL_BOTTLENECK_DIM_ENV)
+        .or_else(|| soccer_neural_bottleneck_dim_env_value(DD_SOCCER_NEURAL_BOTTLENECK_DIM_ENV))
+}
+
+fn soccer_neural_bottleneck_dim() -> Option<usize> {
+    #[cfg(test)]
+    {
+        soccer_neural_bottleneck_dim_from_env()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static DIM: OnceLock<Option<usize>> = OnceLock::new();
+        *DIM.get_or_init(soccer_neural_bottleneck_dim_from_env)
+    }
+}
+
+fn soccer_neural_hidden_layers(config: &SoccerNeuralLearningConfig) -> Vec<usize> {
+    let hidden = config.sanitized_hidden_units();
+    if let Some(bottleneck) = soccer_neural_bottleneck_dim() {
+        vec![bottleneck, hidden]
+    } else {
+        vec![hidden]
+    }
+}
+
+fn soccer_neural_compact_features(
+    features: &[f64; SOCCER_NEURAL_FEATURE_DIM],
+) -> [f64; SOCCER_NEURAL_COMPACT_FEATURE_DIM] {
+    let mut compact = [0.0; SOCCER_NEURAL_COMPACT_FEATURE_DIM];
+    compact[..SOCCER_NEURAL_COMPACT_CORE_PREFIX_DIM]
+        .copy_from_slice(&features[..SOCCER_NEURAL_COMPACT_CORE_PREFIX_DIM]);
+    compact[SOCCER_NEURAL_COMPACT_ACTION_OFFSET
+        ..SOCCER_NEURAL_COMPACT_ACTION_OFFSET + SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM]
+        .copy_from_slice(
+            &features[SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM
+                ..SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM
+                    + SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM],
+        );
+    compact
+}
+
+fn soccer_neural_input_for_network<'a>(
+    features: &'a [f64; SOCCER_NEURAL_FEATURE_DIM],
+    input_dim: usize,
+    compact: &'a mut [f64; SOCCER_NEURAL_COMPACT_FEATURE_DIM],
+) -> Option<&'a [f64]> {
+    match input_dim {
+        SOCCER_NEURAL_FEATURE_DIM => Some(&features[..]),
+        SOCCER_NEURAL_COMPACT_FEATURE_DIM => {
+            *compact = soccer_neural_compact_features(features);
+            Some(&compact[..])
+        }
+        _ => None,
+    }
+}
+
+fn soccer_neural_train_value_batch(
+    network: &mut FeedForwardNetwork,
+    samples: &[SoccerNeuralTrainingSample],
+    targets: &[f64],
+    learning_rate: f64,
+    optimizer_momentum: f64,
+    optimizer_state: &mut FeedForwardMomentumState,
+) -> f64 {
+    if samples.len() != targets.len() {
+        return f64::NAN;
+    }
+    match network.input_dim {
+        SOCCER_NEURAL_FEATURE_DIM => network.train_batch_slices_clipped_with_momentum(
+            samples
+                .iter()
+                .zip(targets.iter())
+                .map(|(sample, target)| (&sample.input[..], std::slice::from_ref(target))),
+            learning_rate,
+            SOCCER_NEURAL_GRAD_CLIP_NORM,
+            optimizer_momentum,
+            optimizer_state,
+        ),
+        SOCCER_NEURAL_COMPACT_FEATURE_DIM => {
+            let compact_inputs = samples
+                .iter()
+                .map(|sample| soccer_neural_compact_features(&sample.input))
+                .collect::<Vec<_>>();
+            network.train_batch_slices_clipped_with_momentum(
+                compact_inputs
+                    .iter()
+                    .zip(targets.iter())
+                    .map(|(input, target)| (&input[..], std::slice::from_ref(target))),
+                learning_rate,
+                SOCCER_NEURAL_GRAD_CLIP_NORM,
+                optimizer_momentum,
+                optimizer_state,
+            )
+        }
+        _ => f64::NAN,
+    }
+}
+
 #[derive(Clone, Debug)]
 struct SoccerNeuralTrainingResult {
     batches: usize,
@@ -42636,13 +42784,15 @@ impl SoccerNeuralLearner {
             .inline_network
             .as_ref()
             .or(self.prediction_network.as_ref())?;
-        if network.input_dim != SOCCER_NEURAL_FEATURE_DIM || network.output_dim != 1 {
+        if network.output_dim != 1 {
             return None;
         }
         if !features.iter().all(|value| value.is_finite()) {
             return None;
         }
-        let output = network.predict(&features[..]);
+        let mut compact = [0.0; SOCCER_NEURAL_COMPACT_FEATURE_DIM];
+        let input = soccer_neural_input_for_network(features, network.input_dim, &mut compact)?;
+        let output = network.predict(input);
         let value = *output.first()?;
         let value = self
             .target_popart
@@ -42885,12 +43035,11 @@ impl SoccerNeuralLearner {
                                     .unwrap_or(sample.target)
                             })
                             .collect::<Vec<_>>();
-                        let loss = network.train_batch_slices_clipped_with_momentum(
-                            batch.iter().zip(targets.iter()).map(|(sample, target)| {
-                                (&sample.input[..], std::slice::from_ref(target))
-                            }),
+                        let loss = soccer_neural_train_value_batch(
+                            network,
+                            batch,
+                            &targets,
                             learning_rate,
-                            SOCCER_NEURAL_GRAD_CLIP_NORM,
                             self.optimizer_momentum,
                             &mut self.optimizer_state,
                         );
@@ -43069,12 +43218,11 @@ fn spawn_soccer_neural_learning_worker(
                                     .unwrap_or(sample.target)
                             })
                             .collect::<Vec<_>>();
-                        let loss = network.train_batch_slices_clipped_with_momentum(
-                            samples.iter().zip(targets.iter()).map(|(sample, target)| {
-                                (&sample.input[..], std::slice::from_ref(target))
-                            }),
+                        let loss = soccer_neural_train_value_batch(
+                            &mut network,
+                            &samples,
+                            &targets,
                             learning_rate,
-                            SOCCER_NEURAL_GRAD_CLIP_NORM,
                             optimizer_momentum,
                             &mut optimizer_state,
                         );
@@ -43152,8 +43300,8 @@ fn build_soccer_neural_network(
     let mut rng = mulberry32(seed ^ 0x5A17_5EED);
     FeedForwardNetwork::random(
         &RandomNetworkSpec {
-            input_dim: SOCCER_NEURAL_FEATURE_DIM,
-            hidden_layers: vec![config.sanitized_hidden_units()],
+            input_dim: soccer_neural_configured_input_dim(),
+            hidden_layers: soccer_neural_hidden_layers(config),
             output_dim: 1,
             hidden_activation: ActivationName::Tanh,
             output_activation: ActivationName::Linear,
@@ -43322,11 +43470,21 @@ fn build_soccer_feed_forward_network_from_snapshot(
 fn build_soccer_neural_network_from_snapshot(
     snapshot: &SoccerNeuralNetworkSnapshot,
 ) -> Result<FeedForwardNetwork, String> {
+    let expected_input_dim = if snapshot.input_dim == SOCCER_NEURAL_COMPACT_FEATURE_DIM {
+        SOCCER_NEURAL_COMPACT_FEATURE_DIM
+    } else {
+        SOCCER_NEURAL_FEATURE_DIM
+    };
+    let legacy_input_dims = if expected_input_dim == SOCCER_NEURAL_FEATURE_DIM {
+        SOCCER_NEURAL_LEGACY_FEATURE_DIMS
+    } else {
+        &[]
+    };
     build_soccer_feed_forward_network_from_snapshot(
         snapshot,
-        SOCCER_NEURAL_FEATURE_DIM,
+        expected_input_dim,
         1,
-        &SOCCER_NEURAL_LEGACY_FEATURE_DIMS,
+        legacy_input_dims,
         "soccer neural",
     )
 }
@@ -45847,6 +46005,187 @@ mod grid_neural_feature_tests {
                 ),
             )
         );
+    }
+}
+
+#[cfg(test)]
+mod neural_compact_input_tests {
+    use super::*;
+
+    struct TestEnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for TestEnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn set_test_env_var(key: &'static str, value: &str) -> TestEnvVarGuard {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        TestEnvVarGuard { key, previous }
+    }
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().expect("test poison compact neural env lock")
+    }
+
+    #[test]
+    fn compact_projection_keeps_core_and_action_param_features() {
+        let mut features = [0.0; SOCCER_NEURAL_FEATURE_DIM];
+        for (index, value) in features.iter_mut().enumerate() {
+            *value = index as f64 + 0.25;
+        }
+
+        let compact = soccer_neural_compact_features(&features);
+
+        assert_eq!(compact.len(), SOCCER_NEURAL_COMPACT_FEATURE_DIM);
+        assert_eq!(
+            compact[..SOCCER_NEURAL_COMPACT_CORE_PREFIX_DIM],
+            features[..SOCCER_NEURAL_COMPACT_CORE_PREFIX_DIM]
+        );
+        assert_eq!(
+            compact[SOCCER_NEURAL_COMPACT_ACTION_OFFSET
+                ..SOCCER_NEURAL_COMPACT_ACTION_OFFSET + SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM],
+            features[SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM
+                ..SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM
+                    + SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM]
+        );
+    }
+
+    #[test]
+    fn compact_gate_builds_100_input_value_network() {
+        let _lock = env_lock();
+        let _compact = set_test_env_var(SOCCER_NEURAL_COMPACT_INPUTS_ENV, "1");
+        let config = SoccerNeuralLearningConfig {
+            enabled: true,
+            hidden_units: 8,
+            ..SoccerNeuralLearningConfig::default()
+        };
+
+        let network = build_soccer_neural_network(&config, 17);
+
+        assert_eq!(network.input_dim, SOCCER_NEURAL_COMPACT_FEATURE_DIM);
+        assert_eq!(network.output_dim, 1);
+        assert!(
+            network.num_parameters()
+                < (SOCCER_NEURAL_FEATURE_DIM * config.sanitized_hidden_units()),
+            "compact network should materially reduce first-layer parameters"
+        );
+    }
+
+    #[test]
+    fn bottleneck_dim_builds_full_input_100_latent_value_network() {
+        let _lock = env_lock();
+        let _bottleneck = set_test_env_var(
+            SOCCER_NEURAL_BOTTLENECK_DIM_ENV,
+            &DEFAULT_SOCCER_NEURAL_BOTTLENECK_DIM.to_string(),
+        );
+        let config = SoccerNeuralLearningConfig {
+            enabled: true,
+            hidden_units: 8,
+            ..SoccerNeuralLearningConfig::default()
+        };
+
+        let network = build_soccer_neural_network(&config, 31);
+
+        assert_eq!(network.input_dim, SOCCER_NEURAL_FEATURE_DIM);
+        assert_eq!(network.output_dim, 1);
+        assert_eq!(network.layers.len(), 3);
+        assert_eq!(
+            network.layers[0].biases.len(),
+            DEFAULT_SOCCER_NEURAL_BOTTLENECK_DIM
+        );
+        assert_eq!(
+            network.layers[1].biases.len(),
+            config.sanitized_hidden_units()
+        );
+        assert_eq!(network.layers[2].biases.len(), 1);
+    }
+
+    #[test]
+    fn bottleneck_snapshot_round_trips_with_full_input_dim() {
+        let _lock = env_lock();
+        let _bottleneck = set_test_env_var(
+            SOCCER_NEURAL_BOTTLENECK_DIM_ENV,
+            &DEFAULT_SOCCER_NEURAL_BOTTLENECK_DIM.to_string(),
+        );
+        let config = SoccerNeuralLearningConfig {
+            enabled: true,
+            hidden_units: 6,
+            ..SoccerNeuralLearningConfig::default()
+        };
+        let network = build_soccer_neural_network(&config, 43);
+        let snapshot = soccer_neural_network_snapshot(&network);
+
+        let restored =
+            build_soccer_neural_network_from_snapshot(&snapshot).expect("restore bottleneck net");
+
+        assert_eq!(restored.input_dim, SOCCER_NEURAL_FEATURE_DIM);
+        assert_eq!(restored.output_dim, 1);
+        assert_eq!(restored.layers.len(), 3);
+        assert_eq!(
+            restored.layers[0].biases.len(),
+            DEFAULT_SOCCER_NEURAL_BOTTLENECK_DIM
+        );
+        assert_eq!(
+            restored.layers[1].biases.len(),
+            config.sanitized_hidden_units()
+        );
+    }
+
+    #[test]
+    fn compact_value_batch_trains_from_canonical_samples() {
+        let _lock = env_lock();
+        let _compact = set_test_env_var(SOCCER_NEURAL_COMPACT_INPUTS_ENV, "1");
+        let config = SoccerNeuralLearningConfig {
+            enabled: true,
+            hidden_units: 4,
+            ..SoccerNeuralLearningConfig::default()
+        };
+        let mut network = build_soccer_neural_network(&config, 29);
+        let mut optimizer_state = FeedForwardMomentumState::default();
+        let sample = |offset: f64, target: f64| {
+            let mut input = [0.0; SOCCER_NEURAL_FEATURE_DIM];
+            for (index, value) in input.iter_mut().enumerate() {
+                *value = (((index % 13) as f64) - 6.0 + offset) / 12.0;
+            }
+            SoccerNeuralTrainingSample {
+                input,
+                target,
+                priority: 1.0,
+            }
+        };
+        let samples = vec![sample(0.0, 0.25), sample(1.0, -0.20)];
+        let targets = samples
+            .iter()
+            .map(|sample| sample.target)
+            .collect::<Vec<_>>();
+
+        let loss = soccer_neural_train_value_batch(
+            &mut network,
+            &samples,
+            &targets,
+            0.01,
+            0.0,
+            &mut optimizer_state,
+        );
+
+        assert!(loss.is_finite(), "compact training loss should be finite");
+        let mut compact = [0.0; SOCCER_NEURAL_COMPACT_FEATURE_DIM];
+        let projected =
+            soccer_neural_input_for_network(&samples[0].input, network.input_dim, &mut compact)
+                .expect("compact projection");
+        assert_eq!(projected.len(), SOCCER_NEURAL_COMPACT_FEATURE_DIM);
+        assert_eq!(network.predict(projected).len(), 1);
     }
 }
 
@@ -64785,10 +65124,11 @@ impl DiscretizedKickDither {
     }
 
     fn sample(rng: &mut SeededRandom) -> Self {
-        let _ = rng;
+        let half_power_bucket = 0.5 / f64::from(DISCRETIZED_KICK_SPEED_BUCKETS);
+        let half_direction_bucket = DISCRETIZED_KICK_DIRECTION_BUCKET_DEGREES * 0.5;
         DiscretizedKickDither {
-            speed_power_offset: 0.0,
-            direction_degrees_offset: 0.0,
+            speed_power_offset: (2.0 * rng.next_float() - 1.0) * half_power_bucket,
+            direction_degrees_offset: (2.0 * rng.next_float() - 1.0) * half_direction_bucket,
         }
     }
 
@@ -64809,6 +65149,27 @@ impl DiscretizedKickDither {
                 0.0
             },
         }
+    }
+}
+
+fn discretized_kick_dither_enabled() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_DISCRETIZED_KICK_DITHER")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_DISCRETIZED_KICK_DITHER"))
+    }
+}
+
+pub(crate) fn discretized_kick_dither_for_release(rng: &mut SeededRandom) -> DiscretizedKickDither {
+    if discretized_kick_dither_enabled() {
+        DiscretizedKickDither::sample(rng)
+    } else {
+        DiscretizedKickDither::none()
     }
 }
 
@@ -70011,6 +70372,38 @@ mod reward_priority_tests {
 mod discretized_kick_scaffold_tests {
     use super::*;
 
+    struct TestEnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for TestEnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn set_test_env_var(key: &'static str, value: &str) -> TestEnvVarGuard {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        TestEnvVarGuard { key, previous }
+    }
+
+    fn clear_test_env_var(key: &'static str) -> TestEnvVarGuard {
+        let previous = std::env::var_os(key);
+        std::env::remove_var(key);
+        TestEnvVarGuard { key, previous }
+    }
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().expect("test poison discretized kick env lock")
+    }
+
     fn assert_close(actual: f64, expected: f64, tolerance: f64) {
         assert!(
             (actual - expected).abs() <= tolerance,
@@ -70049,13 +70442,19 @@ mod discretized_kick_scaffold_tests {
     #[test]
     fn discretized_kick_dither_stays_inside_bucket() {
         let mut rng = SeededRandom::new(42);
+        let mut saw_speed_dither = false;
+        let mut saw_direction_dither = false;
         for _ in 0..128 {
             let dither = DiscretizedKickDither::sample(&mut rng);
             assert!(dither.speed_power_offset.abs() <= 0.050_000_1);
             assert!(dither.direction_degrees_offset.abs() <= 5.000_001);
+            saw_speed_dither |= dither.speed_power_offset.abs() > 1e-9;
+            saw_direction_dither |= dither.direction_degrees_offset.abs() > 1e-9;
             let power = discretized_kick_power_for_bucket(4, dither);
             assert!((0.40..=0.50).contains(&power));
         }
+        assert!(saw_speed_dither);
+        assert!(saw_direction_dither);
 
         let sanitized = DiscretizedKickDither {
             speed_power_offset: 9.0,
@@ -70064,6 +70463,21 @@ mod discretized_kick_scaffold_tests {
         .sanitized();
         assert_eq!(sanitized.speed_power_offset, 0.05);
         assert_eq!(sanitized.direction_degrees_offset, -5.0);
+    }
+
+    #[test]
+    fn discretized_kick_dither_release_helper_is_gated() {
+        let _lock = env_lock();
+        let _clear = clear_test_env_var("DD_SOCCER_ENABLE_DISCRETIZED_KICK_DITHER");
+        let mut rng = SeededRandom::new(42);
+        let disabled = discretized_kick_dither_for_release(&mut rng);
+        assert_eq!(disabled, DiscretizedKickDither::none());
+
+        let _gate = set_test_env_var("DD_SOCCER_ENABLE_DISCRETIZED_KICK_DITHER", "1");
+        let enabled = discretized_kick_dither_for_release(&mut rng);
+        assert_ne!(enabled, DiscretizedKickDither::none());
+        assert!(enabled.speed_power_offset.abs() <= 0.050_000_1);
+        assert!(enabled.direction_degrees_offset.abs() <= 5.000_001);
     }
 
     #[test]
