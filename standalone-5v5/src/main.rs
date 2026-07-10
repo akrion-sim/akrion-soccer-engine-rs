@@ -307,14 +307,26 @@ fn run_training(iters: usize) {
     println!("saved policy -> out/actor.txt, out/critic.txt");
 
     // Final richer evaluation.
-    let (d, wr, ga, gb, passes, spacing, bunch) = train::evaluate(&policy, 300, &mut rng);
+    let f = train::evaluate(&policy, 300, &mut rng);
+    // append the FINAL row so the viz has the trained model's full stat line
+    csv.push_str(&csv_row(best_iter, &f, 0.0, 0.0));
+    fs::write("out/learning_curve.csv", &csv).ok();
     println!(
         "\nFINAL (300 games): goal_diff={:+.3}  winrate={:.3}  goals {:.2}-{:.2}  passes/game {:.1}  spacing={:.1}  bunch={:.0}%",
-        d, wr, ga, gb, passes, spacing, bunch * 100.0
+        f.goal_diff, f.winrate, f.ga, f.gb, f.pass_cmp, f.spacing, f.bunch * 100.0
     );
-    if d > 0.0 {
+    println!(
+        "  pass: {:.1} att, {:.0}% complete ({:.0}% fwd / {:.0}% lat / {:.0}% back) | shots {:.1}, {:.0}% converted | poss {:.0}% | turnovers {:.1} | balls won {:.1}",
+        f.pass_att, f.pass_completion() * 100.0,
+        if f.pass_att>0.0 {f.pass_fwd/f.pass_att*100.0} else {0.0},
+        if f.pass_att>0.0 {f.pass_lat/f.pass_att*100.0} else {0.0},
+        if f.pass_att>0.0 {f.pass_back/f.pass_att*100.0} else {0.0},
+        f.shots, f.conversion()*100.0, f.possession*100.0, f.turnovers, f.wins_won
+    );
+    if f.goal_diff > 0.0 {
         println!(">>> The learned policy BEATS the scripted analytic baseline. <<<");
     }
+    let (d, wr, ga, gb, passes, spacing, bunch) = (f.goal_diff, f.winrate, f.ga, f.gb, f.pass_cmp, f.spacing, f.bunch);
 
     // Pick a display seed that showcases GOOD PLAY, not a blowout: the trained
     // side should win by a sensible margin while dominating possession and
