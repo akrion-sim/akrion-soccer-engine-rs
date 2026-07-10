@@ -489,6 +489,10 @@ impl World {
                 // remember intended receiver (BOTH teams) so the reception radius
                 // applies symmetrically. pending_pass.team == the passing team.
                 self.pending_pass = self.intended_receiver;
+                if kicker.team == Team::A {
+                    // A attacks +x, so ball.x IS attack-frame forward progress.
+                    self.pass_kick_x = self.player(kicker).pos.x;
+                }
             }
         } else if let Some(o) = self.owner {
             // carry: ball glued just ahead of the owner in their attack direction.
