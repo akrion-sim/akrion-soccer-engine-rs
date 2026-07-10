@@ -326,7 +326,6 @@ fn run_training(iters: usize) {
     if f.goal_diff > 0.0 {
         println!(">>> The learned policy BEATS the scripted analytic baseline. <<<");
     }
-    let (d, wr, ga, gb, passes, spacing, bunch) = (f.goal_diff, f.winrate, f.ga, f.gb, f.pass_cmp, f.spacing, f.bunch);
 
     // Pick a display seed that showcases GOOD PLAY, not a blowout: the trained
     // side should win by a sensible margin while dominating possession and
