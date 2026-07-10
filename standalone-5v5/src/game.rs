@@ -626,9 +626,14 @@ impl World {
                         self.ev_turnover_a = true; // A pass intercepted by B
                     }
                 }
-                // a B pass intercepted by A is a good steal — no A penalty
+                // a B pass intercepted by A is a good steal
+                if pp.team == Team::B && o.team == Team::A {
+                    self.ev_win_ball_a = true;
+                }
             } else if matches!(prev_touch, Some(Team::A)) && o.team == Team::B {
                 self.ev_turnover_a = true;
+            } else if matches!(prev_touch, Some(Team::B)) && o.team == Team::A {
+                self.ev_win_ball_a = true; // won a loose ball off B
             }
             self.last_touch = Some(o.team);
             self.pending_pass = None;
