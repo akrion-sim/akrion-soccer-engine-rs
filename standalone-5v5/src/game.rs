@@ -1,0 +1,698 @@
+//! 5-a-side soccer sim: continuous 2D physics, discrete macro actions, NO
+//! formation-shape LP/IPM and NO POMDP feature stack. Both teams run under
+//! identical rules; the learner controls Team A, the scripted baseline Team B.
+
+use crate::rng::Rng;
+
+// ---- Field / rules ----------------------------------------------------------
+pub const FIELD_L: f32 = 105.0;
+pub const FIELD_W: f32 = 68.0;
+pub const GOAL_HALF: f32 = 7.32; // half goal-mouth width in y
+pub const N: usize = 5; // players per team
+pub const DT: f32 = 0.1; // seconds per decision tick
+pub const STEPS: usize = 300; // ticks per game (~30s)
+
+const PLAYER_SPEED: f32 = 7.0;
+const CONTROL_RADIUS: f32 = 1.7;
+const TACKLE_RADIUS: f32 = 1.6;
+const TACKLE_PROB: f32 = 0.22;
+const BALL_FRICTION: f32 = 0.94; // per tick multiplicative decay
+const PASS_SPEED: f32 = 20.0;
+const SHOT_SPEED: f32 = 30.0;
+const CLEAR_SPEED: f32 = 24.0;
+const CAPTURE_MAX_BALL_SPEED: f32 = 34.0;
+
+// ---- Action space -----------------------------------------------------------
+pub const NA: usize = 13;
+pub const A_SHOOT: usize = 0;
+pub const A_PASS_A: usize = 1;
+pub const A_PASS_B: usize = 2;
+pub const A_DRIB_FWD: usize = 3;
+pub const A_DRIB_LEFT: usize = 4;
+pub const A_DRIB_RIGHT: usize = 5;
+pub const A_CLEAR: usize = 6;
+pub const A_HOLD: usize = 7;
+pub const A_CHASE: usize = 8;
+pub const A_SUPPORT: usize = 9;
+pub const A_SPREAD: usize = 10;
+pub const A_MARK: usize = 11;
+pub const A_STAY: usize = 12;
+
+pub const OBS_DIM: usize = 34;
+
+#[derive(Clone, Copy, Default)]
+pub struct V2 {
+    pub x: f32,
+    pub y: f32,
+}
+impl V2 {
+    pub fn new(x: f32, y: f32) -> Self {
+        V2 { x, y }
+    }
+    pub fn add(self, o: V2) -> V2 {
+        V2::new(self.x + o.x, self.y + o.y)
+    }
+    pub fn sub(self, o: V2) -> V2 {
+        V2::new(self.x - o.x, self.y - o.y)
+    }
+    pub fn scale(self, s: f32) -> V2 {
+        V2::new(self.x * s, self.y * s)
+    }
+    pub fn len(self) -> f32 {
+        (self.x * self.x + self.y * self.y).sqrt()
+    }
+    pub fn unit(self) -> V2 {
+        let l = self.len();
+        if l < 1e-6 {
+            V2::new(0.0, 0.0)
+        } else {
+            V2::new(self.x / l, self.y / l)
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct Player {
+    pub pos: V2,
+    pub vel: V2,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum Team {
+    A,
+    B,
+}
+impl Team {
+    fn other(self) -> Team {
+        match self {
+            Team::A => Team::B,
+            Team::B => Team::A,
+        }
+    }
+    /// Attack direction on the x-axis: A attacks +x (goal at FIELD_L), B attacks -x.
+    fn sx(self) -> f32 {
+        match self {
+            Team::A => 1.0,
+            Team::B => -1.0,
+        }
+    }
+    /// Center of the goal this team attacks.
+    fn target_goal(self) -> V2 {
+        match self {
+            Team::A => V2::new(FIELD_L, FIELD_W / 2.0),
+            Team::B => V2::new(0.0, FIELD_W / 2.0),
+        }
+    }
+    fn own_goal(self) -> V2 {
+        self.other().target_goal()
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct Owner {
+    pub team: Team,
+    pub idx: usize,
+}
+
+pub struct World {
+    pub a: [Player; N],
+    pub b: [Player; N],
+    pub ball: V2,
+    pub ball_vel: V2,
+    pub owner: Option<Owner>,
+    pub last_touch: Option<Team>,
+    last_kicker: Option<Owner>,
+    kick_timer: i32,
+    pub goals_a: u32,
+    pub goals_b: u32,
+    // event flags consumed by the reward function each tick:
+    pub ev_goal_a: bool,
+    pub ev_goal_b: bool,
+    pub ev_pass_completed_a: bool,
+    pub ev_turnover_a: bool, // Team A lost possession to B
+    pub ev_shot_on_a: bool,  // Team A took a shot on target
+    pending_pass: Option<Owner>, // intended receiver of an in-flight A pass
+}
+
+fn players(team: Team, w: &World) -> &[Player; N] {
+    match team {
+        Team::A => &w.a,
+        Team::B => &w.b,
+    }
+}
+
+impl World {
+    pub fn new() -> Self {
+        let mut w = World {
+            a: [Player { pos: V2::default(), vel: V2::default() }; N],
+            b: [Player { pos: V2::default(), vel: V2::default() }; N],
+            ball: V2::new(FIELD_L / 2.0, FIELD_W / 2.0),
+            ball_vel: V2::default(),
+            owner: None,
+            last_touch: None,
+            last_kicker: None,
+            kick_timer: 0,
+            goals_a: 0,
+            goals_b: 0,
+            ev_goal_a: false,
+            ev_goal_b: false,
+            ev_pass_completed_a: false,
+            ev_turnover_a: false,
+            ev_shot_on_a: false,
+            pending_pass: None,
+        };
+        w.kickoff(Team::A);
+        w
+    }
+
+    /// Place both teams in a simple spread formation; give the ball to `to`.
+    pub fn kickoff(&mut self, to: Team) {
+        // Formation columns (as fraction of field length from own goal) and y bands.
+        let ys = [0.5, 0.22, 0.78, 0.35, 0.65];
+        let xs = [0.08, 0.30, 0.30, 0.55, 0.55];
+        for i in 0..N {
+            self.a[i].pos = V2::new(xs[i] * FIELD_L, ys[i] * FIELD_W);
+            self.a[i].vel = V2::default();
+            // Mirror for B (attacks -x): x' = L - x.
+            self.b[i].pos = V2::new(FIELD_L - xs[i] * FIELD_L, ys[i] * FIELD_W);
+            self.b[i].vel = V2::default();
+        }
+        self.ball = V2::new(FIELD_L / 2.0, FIELD_W / 2.0);
+        self.ball_vel = V2::default();
+        // Nearest attacker of `to` takes the ball at center.
+        let idx = self.nearest_player(to, self.ball).0;
+        self.owner = Some(Owner { team: to, idx });
+        self.last_touch = Some(to);
+        self.last_kicker = None;
+        self.kick_timer = 0;
+        self.pending_pass = None;
+    }
+
+    fn player(&self, o: Owner) -> Player {
+        match o.team {
+            Team::A => self.a[o.idx],
+            Team::B => self.b[o.idx],
+        }
+    }
+    fn player_mut(&mut self, o: Owner) -> &mut Player {
+        match o.team {
+            Team::A => &mut self.a[o.idx],
+            Team::B => &mut self.b[o.idx],
+        }
+    }
+
+    fn nearest_player(&self, team: Team, p: V2) -> (usize, f32) {
+        let ps = players(team, self);
+        let mut bi = 0;
+        let mut bd = f32::INFINITY;
+        for i in 0..N {
+            let d = ps[i].pos.sub(p).len();
+            if d < bd {
+                bd = d;
+                bi = i;
+            }
+        }
+        (bi, bd)
+    }
+
+    fn nearest_opponent(&self, team: Team, p: V2) -> (usize, f32) {
+        self.nearest_player(team.other(), p)
+    }
+
+    // -- pass-target ranking: pick two candidate teammates for the possessor ---
+    // Score favors forward progress (toward attacked goal) and openness.
+    fn pass_candidates(&self, team: Team, from_idx: usize) -> [Option<(usize, f32)>; 2] {
+        let ps = players(team, self);
+        let from = ps[from_idx].pos;
+        let sx = team.sx();
+        let mut scored: Vec<(usize, f32)> = Vec::new();
+        for i in 0..N {
+            if i == from_idx {
+                continue;
+            }
+            let tp = ps[i].pos;
+            let fwd = (tp.x - from.x) * sx; // positive = ahead
+            let (_, opp_d) = self.nearest_opponent(team, tp); // openness
+            let dist = tp.sub(from).len();
+            if dist < 2.0 {
+                continue;
+            }
+            // reward forward + open, penalize very long/backward balls
+            let score = fwd * 0.6 + opp_d.min(15.0) * 0.8 - (dist * 0.05).max(0.0);
+            scored.push((i, score));
+        }
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let mut out = [None, None];
+        if !scored.is_empty() {
+            out[0] = Some(scored[0]);
+        }
+        if scored.len() > 1 {
+            out[1] = Some(scored[1]);
+        }
+        out
+    }
+
+    /// Fraction of the shot lane to goal that is clear of opponents (0..1).
+    fn shot_clearness(&self, team: Team, from: V2) -> f32 {
+        let goal = team.target_goal();
+        let dir = goal.sub(from);
+        let dist = dir.len();
+        if dist < 1e-3 {
+            return 0.0;
+        }
+        let u = dir.unit();
+        let opp = players(team.other(), self);
+        let mut min_clear = 1.0f32;
+        for i in 0..N {
+            let rel = opp[i].pos.sub(from);
+            let t = rel.x * u.x + rel.y * u.y; // projection along shot
+            if t <= 0.5 || t >= dist {
+                continue;
+            }
+            // perpendicular distance from lane
+            let perp = (rel.x * (-u.y) + rel.y * u.x).abs();
+            let clear = (perp / 3.0).min(1.0); // within 3m blocks the lane
+            if clear < min_clear {
+                min_clear = clear;
+            }
+        }
+        min_clear
+    }
+
+    // ---------------------------------------------------------------------
+    // Observation for one player, in that player's *attack frame* (x flipped
+    // for Team B) so a single shared policy is symmetric across sides.
+    // ---------------------------------------------------------------------
+    pub fn observe(&self, team: Team, idx: usize) -> [f32; OBS_DIM] {
+        let sx = team.sx();
+        let me = players(team, self)[idx];
+        let mir = |p: V2| -> V2 {
+            // attack-frame: x grows toward attacked goal, y unchanged
+            V2::new(if sx > 0.0 { p.x } else { FIELD_L - p.x }, p.y)
+        };
+        let mirv = |v: V2| -> V2 { V2::new(v.x * sx, v.y) };
+        let nx = FIELD_L;
+        let ny = FIELD_W;
+        let nv = 10.0;
+
+        let mp = mir(me.pos);
+        let mvel = mirv(me.vel);
+        let bp = mir(self.ball);
+        let bvel = mirv(self.ball_vel);
+        let goal = mir(team.target_goal());
+        let own = mir(team.own_goal());
+
+        let has_ball = matches!(self.owner, Some(o) if o.team == team && o.idx == idx);
+        let team_ball = matches!(self.owner, Some(o) if o.team == team);
+        let opp_ball = matches!(self.owner, Some(o) if o.team != team);
+        let free_ball = self.owner.is_none();
+
+        let cands = self.pass_candidates(team, idx);
+        let cand_feat = |c: Option<(usize, f32)>| -> (f32, f32, f32, f32) {
+            match c {
+                Some((ti, sc)) => {
+                    let tp = mir(players(team, self)[ti].pos);
+                    let rel = tp.sub(mp);
+                    let open = (sc / 15.0).clamp(-1.0, 1.0);
+                    (rel.x / nx, rel.y / ny, open, rel.len() / nx)
+                }
+                None => (0.0, 0.0, -1.0, 1.0),
+            }
+        };
+        let (ax, ay, aopen, adist) = cand_feat(cands[0]);
+        let (bx, by, bopen, bdist) = cand_feat(cands[1]);
+
+        let (_, nopp_d) = self.nearest_opponent(team, me.pos);
+        let nopp = players(team.other(), self)[self.nearest_opponent(team, me.pos).0];
+        let nopp_rel = mir(nopp.pos).sub(mp);
+        let shot_clear = self.shot_clearness(team, me.pos);
+        let shot_dist = goal.sub(mp).len();
+        let ball_rel = bp.sub(mp);
+
+        let f = [
+            has_ball as u8 as f32,
+            team_ball as u8 as f32,
+            opp_ball as u8 as f32,
+            free_ball as u8 as f32,
+            mp.x / nx * 2.0 - 1.0,
+            mp.y / ny * 2.0 - 1.0,
+            mvel.x / nv,
+            mvel.y / nv,
+            ball_rel.x / nx,
+            ball_rel.y / ny,
+            ball_rel.len() / nx,
+            bvel.x / nv,
+            bvel.y / nv,
+            (goal.x - mp.x) / nx,
+            (goal.y - mp.y) / ny,
+            shot_dist / nx,
+            (own.x - mp.x) / nx,
+            (own.y - mp.y) / ny,
+            mp.x / nx * 2.0 - 1.0, // x-progress in attack frame
+            ax,
+            ay,
+            aopen,
+            adist,
+            bx,
+            by,
+            bopen,
+            bdist,
+            nopp_rel.x / nx,
+            nopp_rel.y / ny,
+            nopp_d / nx,
+            1.0 / (1.0 + nopp_d),
+            shot_clear,
+            shot_dist / nx,
+            1.0, // bias
+        ];
+        f
+    }
+
+    /// Legal-action mask for one player (on-ball vs off-ball families).
+    pub fn legal_mask(&self, team: Team, idx: usize) -> [bool; NA] {
+        let has_ball = matches!(self.owner, Some(o) if o.team == team && o.idx == idx);
+        let mut m = [false; NA];
+        if has_ball {
+            for a in A_SHOOT..=A_HOLD {
+                m[a] = true;
+            }
+            // PASS_B only legal if a 2nd candidate exists.
+            if self.pass_candidates(team, idx)[1].is_none() {
+                m[A_PASS_B] = false;
+            }
+        } else {
+            for a in A_CHASE..=A_STAY {
+                m[a] = true;
+            }
+        }
+        m
+    }
+
+    // ---------------------------------------------------------------------
+    // Step: apply one action per player of both teams, advance physics.
+    // `act_a` / `act_b` are indexed [player] -> action id.
+    // ---------------------------------------------------------------------
+    pub fn step(&mut self, act_a: &[usize; N], act_b: &[usize; N], rng: &mut Rng) {
+        self.ev_goal_a = false;
+        self.ev_goal_b = false;
+        self.ev_pass_completed_a = false;
+        self.ev_turnover_a = false;
+        self.ev_shot_on_a = false;
+
+        let ball_x_before = self.ball.x;
+
+        // 1. Desired velocities + kicks. Kicks are resolved after movement so a
+        //    player dribbles then releases within the same tick cleanly.
+        let mut kick: Option<(Owner, V2, f32, bool)> = None; // (kicker, dir, speed, is_pass)
+        for team in [Team::A, Team::B] {
+            let acts = if team == Team::A { act_a } else { act_b };
+            for i in 0..N {
+                let a = acts[i];
+                let is_owner = matches!(self.owner, Some(o) if o.team == team && o.idx == i);
+                if is_owner {
+                    if let Some(k) = self.apply_on_ball(team, i, a, rng) {
+                        kick = Some(k);
+                    }
+                } else {
+                    self.apply_off_ball(team, i, a);
+                }
+            }
+        }
+
+        // 2. Integrate player motion + clamp to field.
+        for i in 0..N {
+            integrate(&mut self.a[i]);
+            integrate(&mut self.b[i]);
+        }
+
+        // 3. Resolve a kick (frees the ball) or carry it with the owner.
+        if let Some((kicker, dir, speed, is_pass)) = kick {
+            let ang = rng.normal(0.0, 0.04); // execution dither
+            let d = rotate(dir.unit(), ang);
+            self.ball_vel = d.scale(speed);
+            let kp = self.player(kicker).pos;
+            self.ball = kp.add(d.scale(1.0));
+            self.owner = None;
+            self.last_touch = Some(kicker.team);
+            self.last_kicker = Some(kicker);
+            self.kick_timer = 3;
+            self.pending_pass = None;
+            if is_pass && kicker.team == Team::A {
+                // remember intended receiver for completion detection
+                self.pending_pass = self.intended_receiver;
+            }
+        } else if let Some(o) = self.owner {
+            // carry: ball glued just ahead of the owner in their attack direction.
+            let p = self.player(o);
+            let ahead = V2::new(o.team.sx(), 0.0).scale(0.8);
+            self.ball = p.pos.add(ahead);
+            self.ball_vel = p.vel;
+        }
+
+        // 4. Advance a free ball + friction, walls, goals, capture.
+        if self.owner.is_none() {
+            self.ball = self.ball.add(self.ball_vel.scale(DT));
+            self.ball_vel = self.ball_vel.scale(BALL_FRICTION);
+
+            // reflect off side-lines (y walls) to keep play flowing
+            if self.ball.y < 0.0 {
+                self.ball.y = -self.ball.y;
+                self.ball_vel.y = -self.ball_vel.y;
+            } else if self.ball.y > FIELD_W {
+                self.ball.y = 2.0 * FIELD_W - self.ball.y;
+                self.ball_vel.y = -self.ball_vel.y;
+            }
+
+            let gy0 = FIELD_W / 2.0 - GOAL_HALF;
+            let gy1 = FIELD_W / 2.0 + GOAL_HALF;
+            if self.ball.x >= FIELD_L {
+                if self.ball.y > gy0 && self.ball.y < gy1 {
+                    self.goals_a += 1;
+                    self.ev_goal_a = true;
+                    self.kickoff(Team::B);
+                } else {
+                    self.goal_kick(Team::B); // B restarts from its own line
+                }
+            } else if self.ball.x <= 0.0 {
+                if self.ball.y > gy0 && self.ball.y < gy1 {
+                    self.goals_b += 1;
+                    self.ev_goal_b = true;
+                    self.kickoff(Team::A);
+                } else {
+                    self.goal_kick(Team::A);
+                }
+            } else {
+                self.try_capture();
+            }
+        } else {
+            // 5. Owned ball: opponents can tackle if adjacent.
+            self.try_tackle(rng);
+        }
+
+        let _ = ball_x_before; // reward layer reads positions directly
+    }
+
+    fn goal_kick(&mut self, to: Team) {
+        let gx = if to == Team::A { 6.0 } else { FIELD_L - 6.0 };
+        self.ball = V2::new(gx, FIELD_W / 2.0);
+        self.ball_vel = V2::default();
+        let idx = self.nearest_player(to, self.ball).0;
+        self.owner = Some(Owner { team: to, idx });
+        self.last_touch = Some(to);
+        self.last_kicker = None;
+        self.kick_timer = 0;
+        if to == Team::B && matches!(self.last_touch, Some(Team::A)) {
+            // A conceded possession going out — mild turnover already implied
+        }
+    }
+
+    fn try_capture(&mut self) {
+        if self.ball_vel.len() > CAPTURE_MAX_BALL_SPEED {
+            self.kick_timer -= 1;
+            return;
+        }
+        // nearest player of either team within control radius takes it.
+        let mut best: Option<(Owner, f32)> = None;
+        for team in [Team::A, Team::B] {
+            for i in 0..N {
+                if self.kick_timer > 0 {
+                    if let Some(lk) = self.last_kicker {
+                        if lk.team == team && lk.idx == i {
+                            continue; // kicker can't recapture instantly
+                        }
+                    }
+                }
+                let d = players(team, self)[i].pos.sub(self.ball).len();
+                if d < CONTROL_RADIUS && best.map_or(true, |(_, bd)| d < bd) {
+                    best = Some((Owner { team, idx: i }, d));
+                }
+            }
+        }
+        if let Some((o, _)) = best {
+            let prev_touch = self.last_touch;
+            self.owner = Some(o);
+            // pass completion / interception bookkeeping for Team A.
+            if let Some(pp) = self.pending_pass {
+                if o.team == Team::A {
+                    self.ev_pass_completed_a = true; // A pass reached an A player
+                } else {
+                    self.ev_turnover_a = true; // intercepted
+                }
+                let _ = pp;
+            } else if matches!(prev_touch, Some(Team::A)) && o.team == Team::B {
+                self.ev_turnover_a = true;
+            }
+            self.last_touch = Some(o.team);
+            self.pending_pass = None;
+        }
+        self.kick_timer -= 1;
+    }
+
+    fn try_tackle(&mut self, rng: &mut Rng) {
+        let o = match self.owner {
+            Some(o) => o,
+            None => return,
+        };
+        let op = self.player(o).pos;
+        let (oi, od) = self.nearest_opponent(o.team, op);
+        if od < TACKLE_RADIUS && rng.f01() < TACKLE_PROB {
+            let stealer = Owner { team: o.team.other(), idx: oi };
+            if o.team == Team::A {
+                self.ev_turnover_a = true;
+            }
+            self.owner = Some(stealer);
+            self.last_touch = Some(stealer.team);
+            self.kick_timer = 2;
+            self.last_kicker = Some(stealer);
+            self.pending_pass = None;
+        }
+    }
+
+    // scratch used across step to remember a pass's intended receiver
+    // (set inside apply_on_ball, consumed in step()).
+    // Stored as a field to avoid threading through return types.
+    // ---------------------------------------------------------------------
+    fn apply_on_ball(
+        &mut self,
+        team: Team,
+        idx: usize,
+        a: usize,
+        _rng: &mut Rng,
+    ) -> Option<(Owner, V2, f32, bool)> {
+        let me = players(team, self)[idx].pos;
+        let sx = team.sx();
+        let goal = team.target_goal();
+        let owner = Owner { team, idx };
+        self.intended_receiver = None;
+        match a {
+            A_SHOOT => {
+                self.set_vel(team, idx, V2::default());
+                if team == Team::A && self.shot_clearness(Team::A, me) > 0.35 {
+                    self.ev_shot_on_a = true;
+                }
+                Some((owner, goal.sub(me), SHOT_SPEED, false))
+            }
+            A_PASS_A | A_PASS_B => {
+                let cands = self.pass_candidates(team, idx);
+                let pick = if a == A_PASS_A { cands[0] } else { cands[1] };
+                if let Some((ti, _)) = pick {
+                    // lead the pass slightly ahead of the receiver's forward run
+                    let tp = players(team, self)[ti].pos;
+                    let lead = tp.add(V2::new(sx * 2.0, 0.0));
+                    self.intended_receiver = Some(Owner { team, idx: ti });
+                    self.set_vel(team, idx, V2::default());
+                    Some((owner, lead.sub(me), PASS_SPEED, true))
+                } else {
+                    // no valid target: dribble forward instead
+                    self.set_vel(team, idx, V2::new(sx, 0.0).scale(PLAYER_SPEED));
+                    None
+                }
+            }
+            A_DRIB_FWD => {
+                self.set_vel(team, idx, V2::new(sx, 0.0).scale(PLAYER_SPEED));
+                None
+            }
+            A_DRIB_LEFT => {
+                self.set_vel(team, idx, V2::new(0.0, -1.0).scale(PLAYER_SPEED));
+                None
+            }
+            A_DRIB_RIGHT => {
+                self.set_vel(team, idx, V2::new(0.0, 1.0).scale(PLAYER_SPEED));
+                None
+            }
+            A_CLEAR => {
+                self.set_vel(team, idx, V2::default());
+                // hoof toward attacked goal with lateral scatter
+                let dir = goal.sub(me);
+                Some((owner, dir, CLEAR_SPEED, false))
+            }
+            _ => {
+                // HOLD: shield — drift gently away from nearest opponent.
+                let (oi, _) = self.nearest_opponent(team, me);
+                let away = me.sub(players(team.other(), self)[oi].pos).unit();
+                self.set_vel(team, idx, away.scale(PLAYER_SPEED * 0.3));
+                None
+            }
+        }
+    }
+
+    fn apply_off_ball(&mut self, team: Team, idx: usize, a: usize) {
+        let me = players(team, self)[idx].pos;
+        let sx = team.sx();
+        let target = match a {
+            A_CHASE => self.ball,
+            A_SUPPORT => {
+                // ahead of the ball toward the attacked goal
+                let g = team.target_goal();
+                self.ball.add(g.sub(self.ball).unit().scale(14.0))
+            }
+            A_SPREAD => {
+                // move toward the nearest open lateral wing at own attacking third
+                let wing_y = if me.y < FIELD_W / 2.0 { 6.0 } else { FIELD_W - 6.0 };
+                let fwd_x = (me.x + sx * 12.0).clamp(4.0, FIELD_L - 4.0);
+                V2::new(fwd_x, wing_y)
+            }
+            A_MARK => {
+                let (oi, _) = self.nearest_opponent(team, me);
+                let opp = players(team.other(), self)[oi].pos;
+                // stand goal-side of the marked opponent
+                let own_goal = team.own_goal();
+                opp.add(own_goal.sub(opp).unit().scale(2.5))
+            }
+            _ => me, // STAY
+        };
+        let dir = target.sub(me);
+        let v = if dir.len() < 0.3 {
+            V2::default()
+        } else {
+            dir.unit().scale(PLAYER_SPEED)
+        };
+        self.set_vel(team, idx, v);
+    }
+
+    fn set_vel(&mut self, team: Team, idx: usize, v: V2) {
+        match team {
+            Team::A => self.a[idx].vel = v,
+            Team::B => self.b[idx].vel = v,
+        }
+    }
+}
+
+fn integrate(p: &mut Player) {
+    p.pos = p.pos.add(p.vel.scale(DT));
+    p.pos.x = p.pos.x.clamp(-1.0, FIELD_L + 1.0);
+    p.pos.y = p.pos.y.clamp(0.0, FIELD_W);
+}
+
+fn rotate(v: V2, ang: f32) -> V2 {
+    let (s, c) = ang.sin_cos();
+    V2::new(v.x * c - v.y * s, v.x * s + v.y * c)
+}
+
+// A scratch field on World for the intended pass receiver. Declared here via a
+// second impl block that only adds the field would be impossible in Rust, so it
+// lives in the struct — see note. (Added to struct above.)
+impl World {
+    #[allow(dead_code)]
+    fn _touch(&self) {}
+}
