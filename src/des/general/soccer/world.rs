@@ -11171,13 +11171,13 @@ fn neural_mcts_pitch_value_candidate_bonus(
     {
         return 0.0;
     }
-    let before = expected_threat(
+    let before = threat_at(
         transition.team,
         current,
         snapshot.field_width,
         snapshot.field_length,
     );
-    let after = expected_threat(
+    let after = threat_at(
         transition.team,
         target,
         snapshot.field_width,
@@ -11197,7 +11197,7 @@ fn neural_mcts_pitch_value_candidate_bonus(
     };
     let counter_weight = neural_mcts_pitch_value_counter_weight();
     let counter_exposure = neural_mcts_counter_exposure(snapshot, transition.team, target);
-    let opponent_threat = expected_threat(
+    let opponent_threat = threat_at(
         transition.team.other(),
         target,
         snapshot.field_width,
@@ -30586,12 +30586,12 @@ impl SoccerMatch {
         );
         let gain = match self.controlled_possession_team_now() {
             Some(team) if team == player.team => {
-                expected_threat(player.team, target, field_width, field_length)
-                    - expected_threat(player.team, current, field_width, field_length)
+                threat_at(player.team, target, field_width, field_length)
+                    - threat_at(player.team, current, field_width, field_length)
             }
             Some(team) => {
-                expected_threat(team, current, field_width, field_length)
-                    - expected_threat(team, target, field_width, field_length)
+                threat_at(team, current, field_width, field_length)
+                    - threat_at(team, target, field_width, field_length)
             }
             None => 0.0,
         };
@@ -30613,7 +30613,7 @@ impl SoccerMatch {
             self.config.field_width_yards,
             self.config.field_length_yards,
         );
-        let base_value = expected_threat(player.team, target, field_width, field_length);
+        let base_value = threat_at(player.team, target, field_width, field_length);
         let attack = Vec2::new(0.0, player.team.attack_dir());
         let lateral_home = (player.home_position.x - target.x).clamp(
             -MPC_PITCH_VALUE_REFERENCE_PROBE_YARDS,
@@ -30641,7 +30641,7 @@ impl SoccerMatch {
         for probe in probes {
             let candidate = probe.clamp_to_pitch(field_width, field_length);
             let value_gain =
-                expected_threat(player.team, candidate, field_width, field_length) - base_value;
+                threat_at(player.team, candidate, field_width, field_length) - base_value;
             if value_gain <= MPC_PITCH_VALUE_REFERENCE_MIN_GAIN {
                 continue;
             }
@@ -51228,8 +51228,8 @@ impl WorldSnapshot {
         let space = (self.space_score_at(target, player.team) / 18.0).clamp(0.0, 1.0);
         let shape = self.movement_target_shape_score(player, target);
         let pitch_value_gain =
-            (expected_threat(player.team, target, self.field_width, self.field_length)
-                - expected_threat(player.team, current, self.field_width, self.field_length))
+            (threat_at(player.team, target, self.field_width, self.field_length)
+                - threat_at(player.team, current, self.field_width, self.field_length))
             .clamp(-0.25, 0.55);
         let holder_visibility = self
             .ball
