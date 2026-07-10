@@ -205,6 +205,11 @@ impl World {
             last_pass_gain_a: 0.0,
             pass_streak_a: 0,
             a_shot_flag: false,
+            lp_from: -1,
+            lp_to: -1,
+            pending_passer: -1,
+            return_streak_a: 0,
+            ev_return_pass_a: false,
         };
         w.kickoff(Team::A);
         w
