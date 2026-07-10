@@ -27,23 +27,32 @@ def main():
     before = rd("match_before.json").strip()
     after = rd("match_after.json").strip()
 
-    # ---- learning curve ----
-    curve = []
-    rows = rd("learning_curve.csv").strip().splitlines()[1:]
-    for r in rows:
+    # ---- learning curve + full analytics (header-driven) ----
+    lines = rd("learning_curve.csv").strip().splitlines()
+    header = lines[0].split(",")
+    def to_dict(r):
         c = r.split(",")
-        curve.append({
-            "iter": int(c[0]),
-            "diff": num(c[1]),
-            "wr": num(c[2]),
-            "ga": num(c[3]),
-            "gb": num(c[4]),
-        })
-    # Early stopping: show the curve to the best checkpoint (PPO over-trains after).
+        d = {}
+        for k, name in enumerate(header):
+            d[name] = int(c[0]) if k == 0 else num(c[k])
+        return d
+    data = [to_dict(r) for r in lines[1:]]
     log_txt = rd("../out_train.log") if os.path.exists(os.path.join(OUT, "..", "out_train.log")) else ""
     mb = re.search(r"best policy at iter (\d+)", log_txt)
-    best_iter = int(mb.group(1)) if mb else curve[-1]["iter"]
-    curve = [p for p in curve if p["iter"] <= best_iter]
+    best_iter = int(mb.group(1)) if mb else data[-1]["iter"]
+    # last row is the appended FINAL 300-game stat line; the rest are per-iter
+    final = data[-1]
+    per_iter = data[:-1] if len(data) > 1 else data
+    g = lambda d, k: d.get(k) if d.get(k) is not None else 0.0
+    curve = [{
+        "iter": d["iter"], "diff": g(d, "avg_goal_diff"), "wr": g(d, "winrate"),
+        "ga": g(d, "goals_a"), "gb": g(d, "goals_b"),
+        "passcmp": g(d, "pass_cmp"), "passcomp": g(d, "pass_completion"),
+        "fwd": g(d, "pass_fwd"), "lat": g(d, "pass_lat"), "back": g(d, "pass_back"),
+        "shots": g(d, "shots"), "conv": g(d, "conversion"), "poss": g(d, "possession"),
+        "bunch": g(d, "bunch"), "spacing": g(d, "spacing"),
+        "turnovers": g(d, "turnovers"), "won": g(d, "balls_won"),
+    } for d in per_iter if d["iter"] <= best_iter]
 
     # ---- headline meta, parsed from the training log ----
     log = rd("../out_train.log") if os.path.exists(os.path.join(OUT, "..", "out_train.log")) else ""
