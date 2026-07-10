@@ -842,6 +842,16 @@ impl World {
                         } else {
                             0
                         };
+                        // ping-pong detection: passing back to the teammate who
+                        // just gave me the ball (I am lp_to, target is lp_from).
+                        self.pending_passer = idx as i32;
+                        let is_return = idx as i32 == self.lp_to && ti as i32 == self.lp_from;
+                        if is_return {
+                            self.return_streak_a += 1;
+                        } else {
+                            self.return_streak_a = 0;
+                        }
+                        self.ev_return_pass_a = is_return;
                     }
                     Some((owner, lead.sub(me), PASS_SPEED, true))
                 } else {
