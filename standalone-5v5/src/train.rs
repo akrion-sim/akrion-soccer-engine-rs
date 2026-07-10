@@ -78,7 +78,8 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
         let mut logp_t = [0.0f32; N];
         let mut val_t = [0.0f32; N];
 
-        for i in 0..N {
+        for i in 1..N {
+            // policy controls the 4 outfielders; GK (index 0) is rule-based.
             let obs = w.observe(Team::A, i);
             let mask = w.legal_mask(Team::A, i);
             let logits = policy.actor.predict(&obs);
