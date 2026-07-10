@@ -237,7 +237,7 @@ const META   = /*__META__*/ null;
     {k:'Learner + algo',v:'4 outfielders, <b>PPO</b>+<b>GAE</b>, <b>0</b> deps (own MLP/backprop)'},
   ];
   document.getElementById('facts').innerHTML=facts.map(f=>`<div class="fact"><div class="k">${f.k}</div><div class="v">${f.v}</div></div>`).join('');
-  document.getElementById('foot').innerHTML='Isolated git worktree · <code>cargo run --release -- train</code> · same opening seed for both matches so the contrast is the policy, not the dice.';
+  document.getElementById('foot').innerHTML='Isolated git worktree · <code>cargo run --release -- train</code> · same opening seed for both matches so the contrast is the policy, not the dice. The emergent style is direct — coordinated multi-pass build-up is the open frontier (stronger positional defense / self-play).';
 })();
 
 // ---------- pitch renderer ----------
