@@ -15,15 +15,15 @@ pub const DT: f32 = 0.1; // seconds per decision tick
 pub const STEPS: usize = 400; // ticks per game (~40s)
 
 const PLAYER_SPEED: f32 = 6.5;
-const CONTROL_RADIUS: f32 = 1.4;
-const TACKLE_RADIUS: f32 = 1.4;
-const TACKLE_PROB: f32 = 0.18;
+const CONTROL_RADIUS: f32 = 1.8; // easier to secure a received ball -> longer possessions
+const TACKLE_RADIUS: f32 = 1.3;
+const TACKLE_PROB: f32 = 0.11; // fewer instant steals -> passing sequences can develop
 const BALL_FRICTION: f32 = 0.93; // per tick multiplicative decay
-const PASS_SPEED: f32 = 16.0;
+const PASS_SPEED: f32 = 15.0;
 const SHOT_SPEED: f32 = 24.0;
 const CLEAR_SPEED: f32 = 20.0;
 const CAPTURE_MAX_BALL_SPEED: f32 = 26.0;
-const KEEPER_REACH: f32 = 1.9; // keeper can smother/save within this radius (even fast shots)
+const KEEPER_REACH: f32 = 2.2; // keeper saves long-range spam; only worked/placed shots beat it
 const KEEPER_SPEED: f32 = 6.0;
 
 // ---- Action space -----------------------------------------------------------
