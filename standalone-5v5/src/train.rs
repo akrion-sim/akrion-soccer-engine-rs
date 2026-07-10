@@ -166,23 +166,25 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
             r += (w.last_pass_gain_a.max(0.0) * 0.12).min(0.8);
         }
         if w.ev_turnover_a {
-            r -= 0.6; // giving the ball to the other team hurts more now
+            r -= 0.35; // harsher than before (was 0.25) but not so harsh passing dies
         }
-        // Shot on target: small reward — the GOAL is the prize, not the shot.
+        // Shot on target: modest — the GOAL (+8) is the prize, not the shot — but
+        // enough that once built up + in range, shooting beats another pass.
         if w.ev_shot_on_a {
-            r += 0.3 + 0.3 * w.last_shot_quality_a;
+            r += 0.5 + 0.4 * w.last_shot_quality_a;
         }
         // reward winning the ball back (pressing / interceptions / tackles)
         if w.ev_win_ball_a {
             r += 0.3;
         }
-        // dribbling = possessing the ball (less pinball): forward pays well,
-        // lateral a little; losing it while dribbling is penalised extra.
+        // dribbling = possessing the ball (less pinball): forward pays, lateral a
+        // little. SMALL per-tick — it fires every tick you carry, so a big value
+        // accumulates into ball-hoarding that dwarfs goals.
         if w.ev_dribble_fwd_a {
-            r += 0.08;
+            r += 0.03;
         }
         if w.ev_dribble_lat_a {
-            r += 0.03;
+            r += 0.01;
         }
         if w.ev_turnover_a && (w.ev_dribble_fwd_a || w.ev_dribble_lat_a) {
             r -= 0.4; // dispossessed while dribbling
