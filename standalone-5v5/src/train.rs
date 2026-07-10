@@ -16,6 +16,7 @@ const MINIBATCH: usize = 1024;
 const W_SHAPE: f32 = 2.0;
 const ENT_BETA0: f32 = 0.02;
 
+#[derive(Clone)]
 pub struct Policy {
     pub actor: Mlp,
     pub critic: Mlp,
