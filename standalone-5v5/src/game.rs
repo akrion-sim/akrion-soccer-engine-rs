@@ -975,6 +975,76 @@ impl World {
         }
     }
 
+    /// Resolve player-player overlaps by pushing apart any pair closer than the
+    /// minimum separation. Several relaxation passes for stability.
+    fn separate(&mut self) {
+        for _ in 0..3 {
+            // teammates (both teams), incl. GK
+            for team in [Team::A, Team::B] {
+                for i in 0..N {
+                    for j in (i + 1)..N {
+                        self.push_pair(team, i, team, j, SEP_TEAM);
+                    }
+                }
+            }
+            // opponents
+            for i in 0..N {
+                for j in 0..N {
+                    self.push_pair(Team::A, i, Team::B, j, SEP_OPP);
+                }
+            }
+        }
+        for i in 0..N {
+            clamp_pos(&mut self.a[i]);
+            clamp_pos(&mut self.b[i]);
+        }
+    }
+
+    fn push_pair(&mut self, ta: Team, ia: usize, tb: Team, ib: usize, sep: f32) {
+        let pa = players(ta, self)[ia].pos;
+        let pb = players(tb, self)[ib].pos;
+        let del = pa.sub(pb);
+        let d = del.len();
+        if d < sep {
+            // if exactly coincident, pick a deterministic direction from indices
+            let dir = if d > 1e-3 {
+                del.unit()
+            } else {
+                let ang = (ia * 3 + ib * 7) as f32;
+                V2::new(ang.cos(), ang.sin())
+            };
+            let m = (sep - d) * 0.5;
+            let push = dir.scale(m);
+            match ta {
+                Team::A => self.a[ia].pos = self.a[ia].pos.add(push),
+                Team::B => self.b[ia].pos = self.b[ia].pos.add(push),
+            }
+            match tb {
+                Team::A => self.a[ib].pos = self.a[ib].pos.sub(push),
+                Team::B => self.b[ib].pos = self.b[ib].pos.sub(push),
+            }
+        }
+    }
+
+    /// Closest teammate-pair distance among Team A's outfielders (the true
+    /// "are any two stacked?" signal, which an average would hide).
+    pub fn closest_pair_a(&self) -> f32 {
+        let mut m = f32::INFINITY;
+        for i in 1..N {
+            for j in (i + 1)..N {
+                let d = self.a[i].pos.sub(self.a[j].pos).len();
+                if d < m {
+                    m = d;
+                }
+            }
+        }
+        if m.is_finite() {
+            m
+        } else {
+            0.0
+        }
+    }
+
     /// Average nearest-teammate distance among Team A's outfielders (1..N).
     /// Used to measure how spread out the attack is.
     pub fn avg_nearest_teammate_a(&self) -> f32 {
