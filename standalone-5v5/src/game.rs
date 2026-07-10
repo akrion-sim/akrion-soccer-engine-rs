@@ -743,6 +743,10 @@ impl World {
         let goal = team.target_goal();
         let owner = Owner { team, idx };
         self.intended_receiver = None;
+        // any A on-ball action clears the shot flag; only A_SHOOT re-sets it.
+        if team == Team::A {
+            self.a_shot_flag = false;
+        }
         match a {
             A_SHOOT => {
                 if team == Team::A {
