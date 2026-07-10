@@ -17,9 +17,12 @@ companion infra: `soccer_eval_gate_run` / `scripts/run_outcome_ab.sh`).
 The execution substrate is **already in place and shared** — passes and shots both
 lower a `KickReleaseSpec` through `kick_release_clamped_to_pitch` into a
 `LoweredKickRelease` (velocity + curl + altitude) that sets `ball.velocity`:
-<<<<<<< ours
-- Passes still build from a target, speed envelope, curve/bend, and flight.
-- Shots still build from shot power and the same release path.
+- Passes still build from a target, speed envelope, curve/bend, and flight
+  ([world.rs:26761](../src/des/general/soccer/world.rs#L26761) — spec from a heuristic
+  `aimed_target`, `speed` via `modulated_pass_speed_yps`, `curve`, `curve_bend_yards`, `flight`).
+- Shots still build from shot power and the same release path
+  ([world.rs:27221](../src/des/general/soccer/world.rs#L27221) — `speed` via
+  `shot_speed_yps_from_power`, same `kick_release_clamped_to_pitch` path).
 
 The **kick-power bucket slice is now live**, not only a scaffold:
 
