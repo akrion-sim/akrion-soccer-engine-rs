@@ -645,6 +645,9 @@ impl World {
         self.kick_timer = 0;
         self.pass_streak_a = 0;
         self.a_shot_flag = false;
+        self.lp_from = -1;
+        self.lp_to = -1;
+        self.return_streak_a = 0;
     }
 
     fn try_capture(&mut self) {
