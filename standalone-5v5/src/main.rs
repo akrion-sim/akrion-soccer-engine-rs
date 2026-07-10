@@ -80,12 +80,23 @@ fn run_training(iters: usize) {
     );
     println!("{}", "-".repeat(72));
 
+    // Keep the BEST policy by eval goal-diff, not the last — PPO can over-train
+    // and collapse, so we snapshot the peak and showcase that.
+    let mut best_policy = policy.clone();
+    let mut best_diff = f32::NEG_INFINITY;
+    let mut best_iter = 0usize;
+
     for it in 1..=iters {
         let beta = train::ent_beta_at(it, iters);
         let stats = train::train_iter(&mut policy, games_per_iter, beta, &mut rng);
 
         if it % eval_every == 0 || it == iters {
             let (d, wr, ga, gb) = train::evaluate(&policy, 60, &mut rng);
+            if d > best_diff {
+                best_diff = d;
+                best_policy = policy.clone();
+                best_iter = it;
+            }
             println!(
                 "{:>5} | {:>+10.3} | {:>8.3} | {:>6.2} {:>6.2} | {:>7.3} | {:>9.4}",
                 it, d, wr, ga, gb, stats.entropy, stats.value_loss
