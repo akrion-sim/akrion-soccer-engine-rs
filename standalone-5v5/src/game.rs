@@ -170,6 +170,8 @@ impl World {
             ev_pass_completed_a: false,
             ev_turnover_a: false,
             ev_shot_on_a: false,
+            ev_win_ball_a: false,
+            last_shot_quality_a: 0.0,
             pending_pass: None,
             intended_receiver: None,
             pass_kick_x: 0.0,
