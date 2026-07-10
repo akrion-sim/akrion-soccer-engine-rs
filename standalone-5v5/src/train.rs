@@ -14,6 +14,7 @@ const LR_CRITIC: f32 = 1e-3;
 const EPOCHS: usize = 4;
 const MINIBATCH: usize = 1024;
 const W_SHAPE: f32 = 1.6; // potential shaping (per-tick): stronger pull toward goal
+const W_SYNC: f32 = 0.03; // possession-synced push-up / drop-back (team coordination)
 const ENT_BETA0: f32 = 0.02;
 
 // Teammate-spacing reward weight. Overridable via SPACING_W env for tuning.
