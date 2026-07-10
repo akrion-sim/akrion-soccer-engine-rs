@@ -77,9 +77,11 @@ fn inspect(seed: u64) {
 
     let mut jsonl = String::new();
     let mut bunch_ticks = 0u32;
+    let mut overlap_ticks = 0u32;
     let mut sum_closest = 0.0f32;
     let mut sum_avg = 0.0f32;
     const BUNCH_THRESH: f32 = 2.5;
+    const OVERLAP_THRESH: f32 = 1.5;
 
     println!("== inspect: greedy game, seed {} ==", seed);
     println!("{:>4} | {:>7} | own | closest_pair | avg_near | bunch | score", "t", "ball_x");
