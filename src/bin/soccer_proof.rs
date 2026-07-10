@@ -301,6 +301,7 @@ fn paired_stat(diffs: &[f64]) -> Stat {
 }
 
 fn eval(cand_spec: &str, base_spec: &str, games: usize, minutes: f64, holdout: u32) {
+    use std::io::Write;
     enable_deterministic_formation_lp();
     let cand = load_brain(cand_spec);
     let base = load_brain(base_spec);
