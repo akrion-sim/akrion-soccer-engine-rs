@@ -91,18 +91,24 @@ fn run_training(iters: usize) {
         let stats = train::train_iter(&mut policy, games_per_iter, beta, &mut rng);
 
         if it % eval_every == 0 || it == iters {
-            let (d, wr, ga, gb, passes, _sp) = train::evaluate(&policy, 60, &mut rng);
-            // Snapshot on a winning+passing blend: reward goal-diff, plus a
-            // passing bonus once the policy is actually winning (d > 0.3).
-            let quality = d + if d > 0.3 { (passes * 0.02).min(1.0) } else { 0.0 };
+            let (d, wr, ga, gb, passes, sp) = train::evaluate(&policy, 60, &mut rng);
+            // Snapshot the checkpoint that WINS and is SPREAD OUT: once winning
+            // (d > 0.2), add a passing bonus plus a strong spacing bonus so the
+            // chosen model actually spaces its teammates (toward the 5-8 target).
+            let quality = d
+                + if d > 0.2 {
+                    (passes * 0.01).min(0.4) + sp.min(7.0) * 0.15
+                } else {
+                    0.0
+                };
             if quality > best_diff {
                 best_diff = quality;
                 best_policy = policy.clone();
                 best_iter = it;
             }
             println!(
-                "{:>5} | {:>+10.3} | {:>8.3} | {:>6.2} {:>6.2} | {:>7.3} | {:>9.4}",
-                it, d, wr, ga, gb, stats.entropy, stats.value_loss
+                "{:>5} | {:>+10.3} | {:>8.3} | {:>6.2} {:>6.2} | sp {:>4.1} | {:>7.3} | {:>9.4}",
+                it, d, wr, ga, gb, sp, stats.entropy, stats.value_loss
             );
             let _ = writeln!(
                 csv,
