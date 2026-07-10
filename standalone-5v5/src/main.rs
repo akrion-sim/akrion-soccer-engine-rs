@@ -62,6 +62,10 @@ fn run_training(iters: usize) {
     );
     println!("training for {} iterations (8 games/iter)...\n", iters);
 
+    // Record a "before" match with the UNTRAINED policy for the visual demo.
+    // Use a fixed seed so before/after share the same opening for a fair contrast.
+    record_match(&policy, &mut Rng::new(777), "out/match_before.json");
+
     let mut csv = String::new();
     csv.push_str("iter,avg_goal_diff,winrate,goals_a,goals_b,entropy,value_loss,train_reward\n");
     let _ = writeln!(csv, "0,{:.4},{:.4},{:.4},{:.4},,,", d0, w0, ga0, gb0);
