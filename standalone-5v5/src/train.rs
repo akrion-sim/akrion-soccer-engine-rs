@@ -298,6 +298,9 @@ pub fn evaluate_scripted_vs_scripted(games: usize, rng: &mut Rng) -> (f32, f32, 
     let (mut ga, mut gb) = (0.0f32, 0.0f32);
     for _ in 0..games {
         let mut w = World::new();
+        if rng.f01() < 0.5 {
+            w.kickoff(Team::B);
+        }
         for _ in 0..STEPS {
             let act_a = w.scripted_actions(Team::A);
             let act_b = w.scripted_actions(Team::B);
