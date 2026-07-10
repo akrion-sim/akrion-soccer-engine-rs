@@ -332,6 +332,21 @@ impl World {
         bpos // uncatchable — head to where it ends up
     }
 
+    /// Dribble direction that veers AWAY from a close defender (shielding) while
+    /// keeping the intended direction when there's space.
+    fn shielded_dribble_dir(&self, team: Team, me: V2, intended: V2) -> V2 {
+        let intended = intended.unit();
+        let (oi, od) = self.nearest_opponent(team, me);
+        if od < 4.0 {
+            let away = me.sub(players(team.other(), self)[oi].pos).unit();
+            let blend = ((4.0 - od) / 4.0).clamp(0.0, 1.0); // 1 when defender is on top
+            let d = intended.scale(1.0 - 0.7 * blend).add(away.scale(blend));
+            d.unit()
+        } else {
+            intended
+        }
+    }
+
     pub fn lane_clearness(&self, team: Team, from: V2, to: V2) -> f32 {
         let dir = to.sub(from);
         let dist = dir.len();
