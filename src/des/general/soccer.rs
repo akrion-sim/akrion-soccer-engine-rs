@@ -15091,9 +15091,7 @@ fn soccer_replay_pitch_value_potential(state: &SoccerMdpState, team: Team) -> f6
         return 0.0;
     };
     let point = soccer_replay_ball_grid_center(state);
-    // Outcome-grounded EPV when the potential gate is on, else the closed-form seed —
-    // keeps the replay credit potential aligned with the live territorial potential.
-    let threat = threat_potential(
+    let threat = expected_threat(
         possession_team,
         point,
         DEFAULT_FIELD_WIDTH_YARDS,
