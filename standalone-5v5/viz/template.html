@@ -120,6 +120,23 @@
   /* ---- setup strip ---- */
   .facts{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
   @media (max-width:760px){ .facts{grid-template-columns:1fr 1fr} }
+
+  /* match analytics */
+  .statgrid{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin-bottom:16px}
+  @media (max-width:760px){ .statgrid{grid-template-columns:repeat(3,1fr)} }
+  .stat{background:linear-gradient(180deg,var(--panel),var(--panel-2));border:1px solid var(--line);
+    border-radius:12px;padding:14px;box-shadow:var(--shadow)}
+  .stat .v{font-family:system-ui,-apple-system,sans-serif;font-weight:800;font-size:clamp(20px,3vw,28px);
+    letter-spacing:-.02em;font-variant-numeric:tabular-nums;line-height:1}
+  .stat .k{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-dim);margin-top:6px}
+  .stat .sub{font-size:11px;color:var(--ink-dim);margin-top:2px}
+  .analytics2{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  @media (max-width:760px){ .analytics2{grid-template-columns:1fr} }
+  .mini-h{font-family:system-ui,sans-serif;font-weight:700;font-size:14px;margin-bottom:12px}
+  .passbar{display:flex;height:26px;border-radius:8px;overflow:hidden;border:1px solid var(--line)}
+  .passbar .seg{display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;
+    color:#0b140e;font-variant-numeric:tabular-nums;min-width:0}
+  .passbar .seg.small{color:var(--ink)}
   .fact{background:var(--panel-2);border:1px solid var(--line);border-radius:12px;padding:14px}
   .fact .k{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-dim)}
   .fact .v{font-size:14px;margin-top:4px}
