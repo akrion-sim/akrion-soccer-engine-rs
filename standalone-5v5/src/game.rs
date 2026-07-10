@@ -54,7 +54,7 @@ pub const OBS_DIM: usize = 70;
 // possession, shared by all agents. 2N*4 players + 4 ball + 3 possession + 1 bias.
 pub const GLOBAL_DIM: usize = 2 * N * 4 + 4 + 3 + 1; // = 40 + 4 + 3 + 1 = 48
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug)]
 pub struct V2 {
     pub x: f32,
     pub y: f32,
