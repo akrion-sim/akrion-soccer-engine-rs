@@ -14,7 +14,9 @@ const LR_CRITIC: f32 = 1e-3;
 const EPOCHS: usize = 4;
 const MINIBATCH: usize = 1024;
 const W_SHAPE: f32 = 1.6; // potential shaping (per-tick): stronger pull toward goal
-const W_SYNC: f32 = 0.03; // possession-synced push-up / drop-back (team coordination)
+const W_ADVANCE: f32 = 0.05; // OFFENSE: off-ball teammates advance upfield
+const W_OPEN: f32 = 0.04; // OFFENSE: open up into space to receive a pass
+const W_GOALSIDE: f32 = 0.06; // DEFENSE: get goalside of the ball
 const ENT_BETA0: f32 = 0.02;
 
 // Teammate-spacing reward weight. Overridable via SPACING_W env for tuning.
