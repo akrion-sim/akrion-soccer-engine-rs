@@ -204,6 +204,7 @@ def main():
         "git": manifest.get("git_commit", "unknown"),
         "gate": "cleared" if selection.get("best_cleared_hardening_gates") else "not cleared",
         "display_seed": selection.get("display_seed"),
+        "display_matched": bool(selection.get("display_seed_matched_filter", True)),
     }
 
     tpl = rd_tpl()
