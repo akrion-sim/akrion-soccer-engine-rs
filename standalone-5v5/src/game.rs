@@ -898,7 +898,7 @@ impl World {
         let (_, opp_d) = self.nearest_opponent(team, me);
 
         // in range and lane reasonably open -> shoot
-        if shot_dist < 30.0 && clear > 0.35 {
+        if shot_dist < 20.0 && clear > 0.3 {
             return A_SHOOT;
         }
         let cands = self.pass_candidates(team, idx);
