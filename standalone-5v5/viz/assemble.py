@@ -76,6 +76,7 @@ def main():
         "after_score": f"{after_a:.1f}–{after_b:.1f} · {passes:.0f} passes/gm",
         "swing": fmt_diff(after_diff - before_diff),
         "passes": round(passes, 1),
+        "spacing": round(spacing, 1),
         "iters": iters,
         "minutes": "~3 min on a laptop",
     }
