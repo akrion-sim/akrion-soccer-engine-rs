@@ -25,22 +25,16 @@
 
 Three compounding structural ceilings, all verified in code:
 
-<<<<<<< ours
 1. **The net now has a partial learned parameter surface, but not the whole one.**
    Kick-power bucket labels are present in `SOCCER_POLICY_ACTIONS` and MCTS can expand pass,
    aerial-pass, shot, and first-time-shot bucket variants behind `DD_SOCCER_ENABLE_DISCRETIZED_KICK`.
-   That fixes the older "never reaches candidates" diagnosis for speed buckets. With the gate off,
-   pass/shoot parameters still come from the continuous heuristic scan; with the gate on, the net can
-   rank speed-bucket variants. Direction, curve, elevation, and bounded aim are still mostly analytic,
-   and bucket selection still needs entropy/causal-change telemetry.
-=======
-1. **The net ranks heuristic actions with heuristic *parameters*.** The learnable factored action
-   space (`DiscretizedKickAction` — actor owns kick power/direction/curve) exists and is unit-tested;
-   with the gate **off** it is only used at the **execution/lowering** layer
-   (`DiscretizedKickAction::from_power_direction`, world.rs:26742) — *not as candidates the net ranks*.
-   **Part B (above) now injects them as ranked candidates when `DD_SOCCER_ENABLE_DISCRETIZED_KICK` is
-   on.** With the gate off, pass/shoot params remain a continuous power × ~72-site heuristic scan.
->>>>>>> theirs
+   That fixes the older "never reaches candidates" diagnosis for speed buckets. With the gate **off**,
+   the factored `DiscretizedKickAction` (actor owns kick power/direction/curve, unit-tested) is only
+   used at the **execution/lowering** layer (`DiscretizedKickAction::from_power_direction`,
+   world.rs:26742) — *not as candidates the net ranks* — and pass/shoot parameters still come from the
+   continuous power × ~72-site heuristic scan. With the gate **on**, the net can rank speed-bucket
+   variants. Direction, curve, elevation, and bounded aim are still mostly analytic, and bucket
+   selection still needs entropy/causal-change telemetry.
 2. **The value regresses onto the *tabular* Q.** Target = `r + γ·max_next` with `max_next =`
    tabular `best_value_hierarchical` ([world.rs](../src/des/general/soccer/world.rs)). A value
    trained to match the tabular Q **cannot exceed the analytic ceiling** — it's imitation, not
@@ -67,12 +61,19 @@ goal), direction sin/cos, has-target. Gate `DD_SOCCER_ENABLE_ACTION_PARAM_FEATUR
 block ⇒ byte-identical). **This replaces the opaque hash with structure the net can generalize
 over** — even for existing candidates.
 
-<<<<<<< ours
-### Part B — discretized-kick variant candidates
-The first slice of this is already implemented for speed: the actor vocabulary has `40` kick-power
-bucket labels and MCTS can add pass/aerial-pass/shot/first-time-shot bucket variants when
-`DD_SOCCER_ENABLE_DISCRETIZED_KICK` is on. The remaining work is to prove the selected buckets change
-behavior and then add the missing structured dimensions:
+### Part B — discretized-kick variant candidates — ✅ SPEED SLICE IMPLEMENTED (gate `DD_SOCCER_ENABLE_DISCRETIZED_KICK`)
+**How it's wired:** in the candidate assembly (now at
+[world.rs:14296](../src/des/general/soccer/world.rs#L14296), where legal `SOCCER_POLICY_ACTIONS` are
+injected), for kick families (pass/shoot/cross) generate a *spread* of `DiscretizedKickAction` variants
+over the speed buckets toward plausible targets, each carrying its Part-A param features. The net ranks
+them; the chosen variant's params are lowered via the existing
+`DiscretizedKickAction::from_power_direction` path. The actor vocabulary has `40` kick-power bucket
+labels and MCTS can add pass/aerial-pass/shot/first-time-shot bucket variants.
+
+**What is actually landed vs still open:** only the *speed* slice is live — direction/curve/elevation
+remain analytic, so the policy's output space does **not** yet fully match the trainable action set.
+The remaining work is to prove the selected buckets change behavior and then add the missing structured
+dimensions:
 
 - direction/aim as a bounded offset around the current target, not a free absolute 36-way choice;
 - curve and elevation as small masked heads;
@@ -80,15 +81,6 @@ behavior and then add the missing structured dimensions:
   plus `scripts/fwd_trace_report.py` now report net-changed-action and selected-bucket
   entropy so proof runs can tell whether the bucket path changes behavior instead of only
   changing labels.
-=======
-### Part B — discretized-kick variant candidates — ✅ IMPLEMENTED (gate `DD_SOCCER_ENABLE_DISCRETIZED_KICK`)
-In the candidate assembly (now at [world.rs:14296](../src/des/general/soccer/world.rs#L14296), where legal
-`SOCCER_POLICY_ACTIONS` are injected), for kick families (pass/shoot/cross) generate a *spread* of
-`DiscretizedKickAction` variants over the speed/direction buckets toward plausible targets, each
-carrying its Part-A param features. The net ranks them; the chosen variant's params are lowered via
-the existing `DiscretizedKickAction::from_power_direction` path. **Now the policy's output space
-matches the trainable action set** — it can express kicks the heuristic scan can't.
->>>>>>> theirs
 
 ### Part C — true policy improvement (break tabular imitation)
 Either (i) bootstrap the value off *its own* successor value (real neural n-step / Q-learning) so it

@@ -710,7 +710,11 @@ fn main() {
 
     // Disjoint seed spaces: training never sees an eval seed.
     let train_seed_base: u32 = 0x71A1_0000;
-    let holdout_seed_base: u32 = 0xE7A1_0000;
+    // Holdout seed base env-overridable so replication can eval on disjoint held-out game sets.
+    let holdout_seed_base: u32 = std::env::var("SOCCER_EVAL_HOLDOUT_SEED")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0xE7A1_0000);
     let candidate_id = 0usize;
     let baseline_id = 1usize;
 
