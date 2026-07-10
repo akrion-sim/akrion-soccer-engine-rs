@@ -502,7 +502,7 @@ function render(){P0.draw(fi);P1.draw(fi);updateScores();}
 function loop(t){
   if(playing){
     if(!last)last=t;
-    fi += (t-last)/1000*FPS; last=t;
+    fi += (t-last)/1000*HZ*speed; last=t;
     if(fi>=NF-1){fi=NF-1; render(); playing=false; playBtn.textContent='Replay'; requestAnimationFrame(loop); return;}
     render();
   } else last=0;
