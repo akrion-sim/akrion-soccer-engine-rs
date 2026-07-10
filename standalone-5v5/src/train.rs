@@ -181,8 +181,10 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
         // ball (ping-pong): 2x small, 3x bigger, 4x huge, 5x mega. return_streak_a
         // counts consecutive return passes (1 = the first back-pass).
         if w.ev_return_pass_a {
+            // escalating but bounded: -0.3, -0.6, -1.2, -2.4, ... capped at -4 so
+            // it discourages ping-pong without scaring the policy off passing.
             let k = w.return_streak_a.max(1);
-            r -= (0.5 * 3f32.powi((k - 1) as i32)).min(14.0);
+            r -= (0.3 * 2f32.powi((k - 1) as i32)).min(4.0);
         }
 
         // Possession PHASE (covers ball-in-flight during our build-up, not just
