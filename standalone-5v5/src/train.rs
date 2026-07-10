@@ -150,10 +150,10 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
         phi_prev = phi;
         let mut r = W_SHAPE * shaping;
         if w.ev_goal_a {
-            r += 5.0;
+            r += 8.0; // GOALS are the prize — rewarded well above shots
         }
         if w.ev_goal_b {
-            r -= 5.0;
+            r -= 6.0;
         }
         // Only a tiny nudge for a completed pass (prefer it to a loose turnover);
         // forward progress is rewarded by the potential shaping above, and goals
