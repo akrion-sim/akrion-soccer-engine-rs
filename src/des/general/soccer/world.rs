@@ -32396,6 +32396,7 @@ impl SoccerMatch {
                             self.stat_pass_intercepted_half(own_half);
                             if pass.target.is_some_and(|target| target != pass.from) {
                                 self.stat_intentional_pass_intercepted_half(own_half);
+                                self.stat_intentional_pass_intercepted_team(pass.team);
                             }
                             self.record_pass_outcome_sample(pass, false, own_half);
                         }
@@ -34956,6 +34957,13 @@ impl SoccerMatch {
             self.stats.intentional_pass_interceptions_own_half += 1;
         } else {
             self.stats.intentional_pass_interceptions_opp_half += 1;
+        }
+    }
+
+    fn stat_intentional_pass_intercepted_team(&mut self, team: Team) {
+        match team {
+            Team::Home => self.stats.intentional_pass_interceptions_home += 1,
+            Team::Away => self.stats.intentional_pass_interceptions_away += 1,
         }
     }
 

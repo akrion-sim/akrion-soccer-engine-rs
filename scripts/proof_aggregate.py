@@ -194,6 +194,12 @@ def add_totals(total: Dict[str, float], row: Dict[str, object], prefix: str) -> 
         "fwd",
         "back",
         "yards",
+        "ipatt",
+        "ipcomp",
+        "ipfwd",
+        "ipback",
+        "ipyards",
+        "ipto",
         "chains",
         "sap",
         "assist",
@@ -228,47 +234,69 @@ def verdict_for(
     route_one: Stat,
     pass_turnover_rate_improvement: Stat,
     proof_rows: int,
+    strict_net_fwd: Stat,
+    strict_turnover_rate_improvement: Stat,
 ) -> str:
     yards_not_collapsed = yards_per_pass.bootstrap_lb95 > -0.25
     route_one_not_rising = route_one.mean <= 0.10
-    pass_turnovers_available = pass_turnover_rate_improvement.n == proof_rows
+    strict_available = (
+        strict_net_fwd.n == proof_rows
+        and strict_turnover_rate_improvement.n == proof_rows
+    )
+    headline_fwd = strict_net_fwd if strict_available else fwd
+    headline_label = (
+        "strict net-forward intentional passes"
+        if strict_available
+        else "completed forward passes"
+    )
+    turnover_guard = (
+        strict_turnover_rate_improvement
+        if strict_available
+        else pass_turnover_rate_improvement
+    )
+    pass_turnovers_available = turnover_guard.n == proof_rows
     pass_turnovers_not_rising = (
         pass_turnovers_available
-        and pass_turnover_rate_improvement.mean >= 0.0
+        and turnover_guard.mean >= 0.0
     )
     if (
-        fwd.support_9999()
+        headline_fwd.support_9999()
         and completion_rate.support_9999()
         and yards_not_collapsed
         and route_one_not_rising
         and pass_turnovers_not_rising
     ):
         return (
-            "PROVEN@99.99% - completed forward passes and pass completion rate "
+            f"PROVEN@99.99% - {headline_label} and pass completion rate "
             "both pass normal+bootstrap+sign-test, with yards/pass, route-one, and pass-turnover guards intact"
         )
     if (
-        fwd.support_9999()
+        headline_fwd.support_9999()
         and completion_rate.mean >= 0.0
         and yards_not_collapsed
         and route_one_not_rising
         and pass_turnovers_not_rising
     ):
         return (
-            "FORWARD-PASS-PROVEN@99.99% - forward passing passes triple-stat proof, "
+            f"FORWARD-PASS-PROVEN@99.99% - {headline_label} passes triple-stat proof, "
             "with pass-turnover guard intact, but pass-completion-rate proof is not independently positive"
         )
-    if fwd.support_95() and completion_rate.normal_lb95 >= 0.0 and yards_not_collapsed and pass_turnovers_not_rising:
+    if (
+        headline_fwd.support_95()
+        and completion_rate.normal_lb95 >= 0.0
+        and yards_not_collapsed
+        and pass_turnovers_not_rising
+    ):
         return (
-            "CLIMB@95% - forward passing is statistically positive and completion "
+            f"CLIMB@95% - {headline_label} is statistically positive and completion "
             "does not regress at 95%, with pass-turnover guard intact; more held-out games or a stronger candidate needed for 99.99%"
         )
     if not pass_turnovers_available:
         return "anti-gaming guard unavailable - rerun eval so every row has c_pto/b_pto JSONL fields"
     if not pass_turnovers_not_rising:
         return "anti-gaming guard failed - candidate increased pass-turnover rate"
-    if fwd.mean > 0.0 or completion_rate.mean > 0.0:
-        return "directional only - movement exists but proof gates do not clear"
+    if headline_fwd.mean > 0.0 or completion_rate.mean > 0.0:
+        return f"directional only - {headline_label} movement exists but proof gates do not clear"
     return "no passing advancement"
 
 
@@ -284,6 +312,9 @@ def main() -> int:
     d_yards_per_pass: List[float] = []
     d_route_one: List[float] = []
     d_pass_turnover_rate_improvement: List[float] = []
+    d_strict_fwd: List[float] = []
+    d_strict_net_fwd: List[float] = []
+    d_strict_turnover_rate_improvement: List[float] = []
     d_goals: List[float] = []
     d_sot: List[float] = []
     d_drib: List[float] = []
@@ -298,6 +329,12 @@ def main() -> int:
             "fwd",
             "back",
             "yards",
+            "ipatt",
+            "ipcomp",
+            "ipfwd",
+            "ipback",
+            "ipyards",
+            "ipto",
             "chains",
             "sap",
             "assist",
@@ -330,6 +367,25 @@ def main() -> int:
         has_pto = "c_pto" in row and "b_pto" in row
         c_pto = f(row, "c_pto") if has_pto else 0.0
         b_pto = f(row, "b_pto") if has_pto else 0.0
+        has_strict = all(
+            key in row
+            for key in (
+                "c_ipatt",
+                "b_ipatt",
+                "c_ipcomp",
+                "b_ipcomp",
+                "c_ipfwd",
+                "b_ipfwd",
+                "c_ipto",
+                "b_ipto",
+            )
+        )
+        c_ipatt = f(row, "c_ipatt") if has_strict else 0.0
+        b_ipatt = f(row, "b_ipatt") if has_strict else 0.0
+        c_ipfwd = f(row, "c_ipfwd") if has_strict else 0.0
+        b_ipfwd = f(row, "b_ipfwd") if has_strict else 0.0
+        c_ipto = f(row, "c_ipto") if has_strict else 0.0
+        b_ipto = f(row, "b_ipto") if has_strict else 0.0
 
         d_completed.append(c_comp - b_comp)
         d_completion_rate.append(safe_ratio(c_comp, c_att) - safe_ratio(b_comp, b_att))
@@ -341,6 +397,12 @@ def main() -> int:
         if has_pto:
             d_pass_turnover_rate_improvement.append(
                 safe_ratio(b_pto, b_att) - safe_ratio(c_pto, c_att)
+            )
+        if has_strict:
+            d_strict_fwd.append(c_ipfwd - b_ipfwd)
+            d_strict_net_fwd.append((c_ipfwd - c_ipto) - (b_ipfwd - b_ipto))
+            d_strict_turnover_rate_improvement.append(
+                safe_ratio(b_ipto, b_ipatt) - safe_ratio(c_ipto, c_ipatt)
             )
         d_goals.append(f(row, "c_goals") - f(row, "b_goals"))
         d_sot.append(f(row, "c_sot") - f(row, "b_sot"))
@@ -362,9 +424,14 @@ def main() -> int:
         "yards_per_pass": paired_stat(d_yards_per_pass, 6),
         "route_one": paired_stat(d_route_one, 7),
         "pass_turnover_rate_improvement": paired_stat(d_pass_turnover_rate_improvement, 8),
-        "goals": paired_stat(d_goals, 9),
-        "sot": paired_stat(d_sot, 10),
-        "drib": paired_stat(d_drib, 11),
+        "strict_fwd": paired_stat(d_strict_fwd, 9),
+        "strict_net_fwd": paired_stat(d_strict_net_fwd, 10),
+        "strict_turnover_rate_improvement": paired_stat(
+            d_strict_turnover_rate_improvement, 11
+        ),
+        "goals": paired_stat(d_goals, 12),
+        "sot": paired_stat(d_sot, 13),
+        "drib": paired_stat(d_drib, 14),
     }
     nf = float(rows)
 
@@ -400,6 +467,38 @@ def main() -> int:
         f"base {pct(base['fwd'], base['comp']):.2f}%"
     )
     print(fmt_metric("forward share", stats["forward_share"], 100.0, "pp"))
+    if stats["strict_fwd"].n == rows:
+        print(
+            f"strict intentional passes:     cand {cand['ipcomp'] / nf:.2f}/g  "
+            f"base {base['ipcomp'] / nf:.2f}/g"
+        )
+        print(
+            f"strict FORWARD passes/game:    cand {cand['ipfwd'] / nf:.2f}  "
+            f"base {base['ipfwd'] / nf:.2f}"
+        )
+        print(fmt_metric("strict forward passes/game", stats["strict_fwd"]))
+        print(
+            f"strict NET forward/game:       cand {(cand['ipfwd'] - cand['ipto']) / nf:.2f}  "
+            f"base {(base['ipfwd'] - base['ipto']) / nf:.2f}"
+        )
+        print(fmt_metric("strict net forward/game", stats["strict_net_fwd"]))
+        print(
+            f"strict pass turnover rate:     cand {pct(cand['ipto'], cand['ipatt']):.2f}%  "
+            f"base {pct(base['ipto'], base['ipatt']):.2f}%"
+        )
+        print(
+            fmt_metric(
+                "strict turnover improvement",
+                stats["strict_turnover_rate_improvement"],
+                100.0,
+                "pp",
+            )
+        )
+    else:
+        print(
+            "strict intentional passes:     unavailable "
+            f"({stats['strict_fwd'].n}/{rows} rows have c_ip*/b_ip*)"
+        )
 
     print("\n----- anti-gaming guardrails -----")
     print(
@@ -460,6 +559,8 @@ def main() -> int:
             stats["route_one"],
             stats["pass_turnover_rate_improvement"],
             rows,
+            stats["strict_net_fwd"],
+            stats["strict_turnover_rate_improvement"],
         )
     )
     return 0

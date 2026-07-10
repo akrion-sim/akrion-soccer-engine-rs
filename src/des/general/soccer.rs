@@ -19806,6 +19806,10 @@ pub struct MatchStats {
     #[serde(default)]
     pub intentional_pass_interceptions_opp_half: u32,
     #[serde(default)]
+    pub intentional_pass_interceptions_home: u32,
+    #[serde(default)]
+    pub intentional_pass_interceptions_away: u32,
+    #[serde(default)]
     pub clearances_home: u32,
     #[serde(default)]
     pub clearances_away: u32,
