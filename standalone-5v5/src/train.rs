@@ -166,37 +166,38 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
             r += (w.last_pass_gain_a.max(0.0) * 0.12).min(0.8);
         }
         if w.ev_turnover_a {
-            r -= 0.25;
+            r -= 0.6; // giving the ball to the other team hurts more now
         }
-        // In-range shot AFTER the 2-pass rule is cleared (ev_shot_on_a can only
-        // fire then, and only within range) is rewarded ABOVE the best pass
-        // (max pass nudge ≈ 0.8) so, once built up and in range, shooting wins.
+        // Shot on target: small reward — the GOAL is the prize, not the shot.
         if w.ev_shot_on_a {
-            r += 1.2 + 1.0 * w.last_shot_quality_a;
+            r += 0.3 + 0.3 * w.last_shot_quality_a;
         }
         // reward winning the ball back (pressing / interceptions / tackles)
         if w.ev_win_ball_a {
             r += 0.3;
         }
-        // dribbling: forward pays, lateral pays a little, backward has no action;
-        // losing the ball WHILE dribbling is penalised extra.
+        // dribbling = possessing the ball (less pinball): forward pays well,
+        // lateral a little; losing it while dribbling is penalised extra.
         if w.ev_dribble_fwd_a {
-            r += 0.04;
+            r += 0.08;
         }
         if w.ev_dribble_lat_a {
-            r += 0.015;
+            r += 0.03;
         }
         if w.ev_turnover_a && (w.ev_dribble_fwd_a || w.ev_dribble_lat_a) {
             r -= 0.4; // dispossessed while dribbling
         }
-        // ESCALATING penalty for passing back to the teammate who just gave you the
-        // ball (ping-pong): 2x small, 3x bigger, 4x huge, 5x mega. return_streak_a
-        // counts consecutive return passes (1 = the first back-pass).
-        if w.ev_return_pass_a {
-            // escalating but bounded: -0.3, -0.6, -1.2, -2.4, ... capped at -4 so
-            // it discourages ping-pong without scaring the policy off passing.
-            let k = w.return_streak_a.max(1);
-            r -= (0.3 * 2f32.powi((k - 1) as i32)).min(4.0);
+        // Ping-pong: A→B→A (one return, streak 1) is FINE. It only becomes a
+        // problem from the SECOND return (A→B→A→B, streak 2), and worse each time.
+        // 5x heavier than before, and heavier still if the exchange hasn't
+        // advanced the ball 5+ yards upfield (pointless tapping in place).
+        if w.ev_return_pass_a && w.return_streak_a >= 2 {
+            let k = w.return_streak_a;
+            let mut pen = 1.5 * 2f32.powi((k - 2) as i32); // 1.5, 3, 6, 12, ...
+            if w.ball.x - w.return_start_x < 5.0 {
+                pen *= 1.5; // no upfield progress -> heavier
+            }
+            r -= pen.min(24.0);
         }
 
         // Possession PHASE (covers ball-in-flight during our build-up, not just
