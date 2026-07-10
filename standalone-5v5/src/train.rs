@@ -160,10 +160,10 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
         if w.ev_turnover_a {
             r -= 0.25;
         }
-        // shot reward scaled by MPC-finish placement quality: rewards taking a
-        // shot when a good corner exists AND placing it well.
+        // shot reward scaled by MPC-finish placement quality: make shooting from a
+        // good position clearly worthwhile so the policy doesn't just hoard passes.
         if w.ev_shot_on_a {
-            r += 0.15 + 0.5 * w.last_shot_quality_a;
+            r += 0.4 + 0.7 * w.last_shot_quality_a;
         }
         // reward winning the ball back (pressing / interceptions / tackles)
         if w.ev_win_ball_a {
