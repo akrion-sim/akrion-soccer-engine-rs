@@ -484,9 +484,13 @@ const NF=Math.min(BEFORE.frames.length,AFTER.frames.length);
 
 // ---------- playback ----------
 let fi=0, playing=!reduce, last=0;
-const FPS=(AFTER.hz||BEFORE.hz||10); // REAL-TIME: advance sim frames at the sim's own Hz (1x)
+const HZ=(AFTER.hz||BEFORE.hz||10);       // sim ticks/sec (1x = real-time)
+let speed=0.5;                            // default half-speed so it's watchable
 const playBtn=document.getElementById('play');
+const speedSel=document.getElementById('speed');
+if(speedSel){ speedSel.value='0.5'; speedSel.onchange=()=>{speed=parseFloat(speedSel.value);}; }
 const scrub=document.getElementById('scrub'); scrub.max=NF-1;
+const FPS=HZ; // kept for the clock (fi/HZ = real seconds regardless of playback speed)
 function updateScores(){
   const b=BEFORE.frames[fi|0], a=AFTER.frames[fi|0];
   document.getElementById('sa0').textContent=b.ga; document.getElementById('sb0').textContent=b.gb;
