@@ -150,7 +150,7 @@ fn game_score(policy: &train::Policy, seed: u64) -> (u32, u32) {
     let mut w = World::new();
     for _ in 0..STEPS {
         let mut act_a = [A_STAY; N];
-        for i in 0..N {
+        for i in 1..N {
             let obs = w.observe(Team::A, i);
             let mask = w.legal_mask(Team::A, i);
             act_a[i] = policy.act_greedy(&obs, &mask);
