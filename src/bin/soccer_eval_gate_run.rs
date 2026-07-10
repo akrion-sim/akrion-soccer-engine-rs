@@ -205,6 +205,8 @@ impl AdvancementFixture {
                 opponent_forward_passes: stats.passes_completed_forward_away,
                 candidate_completed_passes: stats.passes_completed_home,
                 opponent_completed_passes: stats.passes_completed_away,
+                candidate_attempted_passes: stats.passes_attempted_home,
+                opponent_attempted_passes: stats.passes_attempted_away,
                 candidate_turnovers: stats.interceptions_away,
                 opponent_turnovers: stats.interceptions_home,
                 candidate_pass_gain_yards: finite_yards(stats.completed_pass_gain_yards_home),
