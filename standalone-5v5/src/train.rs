@@ -192,26 +192,30 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
         mask_buf.push(mask_t);
         act_buf.push(act_a);
         logp_buf.push(logp_t);
-        val_buf.push(val_t);
+        val_buf.push(v_central);
+        gstate_buf.push(gstate);
         rew_buf.push(r);
         space_buf.push(sp_t);
     }
 
-    // GAE per player (same team reward broadcast to all 5).
+    // GAE per agent, baselined by the SHARED centralized value V(global_state).
+    // Each agent's per-tick reward = team reward + its own spacing reward; the
+    // centralized critic is trained (below) to predict these returns from the
+    // global state — a valid, lower-variance baseline (MAPPO/CTDE).
     let t = rew_buf.len();
     let mut samples = Vec::with_capacity(t * (N - 1));
     for i in 1..N {
         let mut adv = 0.0f32;
         let mut next_v = 0.0f32; // bootstrap 0 at horizon end
         for s in (0..t).rev() {
-            let v = val_buf[s][i];
-            // team reward (shared) + this player's OWN spacing reward
+            let v = val_buf[s]; // shared centralized value
             let delta = rew_buf[s] + space_buf[s][i] + GAMMA * next_v - v;
             adv = delta + GAMMA * LAMBDA * adv;
             let ret = adv + v;
             next_v = v;
             samples.push(Sample {
                 obs: obs_buf[s][i],
+                gstate: gstate_buf[s],
                 mask: mask_buf[s][i],
                 action: act_buf[s][i],
                 old_logp: logp_buf[s][i],
