@@ -245,8 +245,16 @@ fn run_training(iters: usize) {
     let untrained = policy.clone();
 
     let mut csv = String::new();
-    csv.push_str("iter,avg_goal_diff,winrate,goals_a,goals_b,entropy,value_loss,train_reward\n");
-    let _ = writeln!(csv, "0,{:.4},{:.4},{:.4},{:.4},,,", d0, w0, ga0, gb0);
+    csv.push_str("iter,avg_goal_diff,winrate,goals_a,goals_b,spacing,bunch,possession,pass_att,pass_cmp,pass_completion,pass_fwd,pass_lat,pass_back,shots,shots_scored,conversion,turnovers,balls_won,entropy,value_loss\n");
+    let csv_row = |iter: usize, s: &train::Stats, ent: f32, vloss: f32| -> String {
+        format!(
+            "{},{:.4},{:.4},{:.4},{:.4},{:.3},{:.4},{:.4},{:.3},{:.3},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.4},{:.3},{:.3},{:.4},{:.4}\n",
+            iter, s.goal_diff, s.winrate, s.ga, s.gb, s.spacing, s.bunch, s.possession,
+            s.pass_att, s.pass_cmp, s.pass_completion(), s.pass_fwd, s.pass_lat, s.pass_back,
+            s.shots, s.shots_scored, s.conversion(), s.turnovers, s.wins_won, ent, vloss
+        )
+    };
+    csv.push_str(&csv_row(0, &s0, 0.0, 0.0));
 
     let games_per_iter = 8;
     let eval_every = 5;
