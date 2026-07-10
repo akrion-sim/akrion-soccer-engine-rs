@@ -215,17 +215,15 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
                 sp_t[i] = w_spacing_coeff * spacing_reward(nd);
             }
             if our_phase {
-                // advance upfield (attack frame +x) + be open (space from markers)
+                // advance upfield (attack frame +x)
                 let advance = pos.x / FIELD_L - 0.45;
-                let mut nopp = f32::INFINITY;
-                for k in 0..N {
-                    let d = w.b[k].pos.sub(pos).len();
-                    if d < nopp {
-                        nopp = d;
-                    }
-                }
-                let open = (nopp / 8.0).min(1.0) - 0.4; // reward getting free of a marker
-                sp_t[i] += W_ADVANCE * advance + W_OPEN * open;
+                // OPEN = a CLEAR passing lane from the ball to me (no defender in
+                // between). NOT merely far from a marker — a player inline behind a
+                // defender is NOT open.
+                let open = w.lane_clearness(Team::A, w.ball, pos) - 0.5;
+                // WIDTH: stretch the pitch (get away from the central lane)
+                let width = (pos.y - FIELD_W / 2.0).abs() / (FIELD_W / 2.0) - 0.4;
+                sp_t[i] += W_ADVANCE * advance + W_OPEN * open + W_WIDTH * width;
             } else if their_phase {
                 // goalside of the ball: our goal is at x=0, so reward being at a
                 // LOWER x than the ball (between ball and own goal).
