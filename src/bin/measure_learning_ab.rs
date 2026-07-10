@@ -138,6 +138,13 @@ fn env_f64(name: &str) -> f64 {
         .unwrap_or(0.0)
 }
 
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
 fn ratio(numerator: f64, denominator: f64) -> f64 {
     if denominator.abs() > 1e-9 {
         numerator / denominator
@@ -167,6 +174,8 @@ fn main() {
         .get(3)
         .and_then(|s| s.parse().ok())
         .unwrap_or(0x5EED_0000);
+    let warmup_games = env_usize("DD_SOCCER_AB_WARMUP_GAMES", 0).min(256);
+    let total_games = warmup_games.saturating_add(games);
 
     // Inline backend keeps neural training synchronous (deterministic); MAPPO actor on so the
     // trained policy actually drives play.
@@ -180,7 +189,8 @@ fn main() {
 
     println!("===== LEARNING A/B HARNESS =====");
     println!(
-        "games={games} minutes={minutes} seed_base=0x{seed_base:08X} \
+        "games={games} warmup_games={warmup_games} total_games={total_games} \
+         minutes={minutes} seed_base=0x{seed_base:08X} \
          backend=Inline marl=Mappo team_reward_share={:.3}",
         neural.mappo_team_reward_share
     );
@@ -199,7 +209,8 @@ fn main() {
     println!(
         "gates: dp_critic_target={} dp_bootstrap={} learned_epv={} learned_pass_completion={} \
          deferred_pass_credit={} neural_mcts={} league_neural_mcts={} xt_terminal_cost={} \
-         mpc_pass={} pass_completion_score_weight={:.2} pass_turnover_penalty_scale={:.2}",
+         mpc_pass={} pass_completion_score_weight={:.2} pass_turnover_penalty_scale={:.2} \
+         pass_target_completion_primary_scale={:.2} learned_curve={} mpc_objective_epochs={}",
         env_on("DD_SOCCER_ENABLE_DP_CRITIC_TARGET"),
         env_on("DD_SOCCER_ENABLE_DP_BOOTSTRAP"),
         env_on("DD_SOCCER_ENABLE_LEARNED_EPV"),
@@ -211,6 +222,9 @@ fn main() {
         env_on("DD_SOCCER_ENABLE_MPC_PASS"),
         env_f64("DD_SOCCER_PASS_COMPLETION_SCORE_WEIGHT"),
         env_f64("DD_SOCCER_PASS_TURNOVER_PENALTY_SCALE"),
+        env_f64("DD_SOCCER_PASS_TARGET_COMPLETION_PRIMARY_SCALE"),
+        env_on("DD_SOCCER_ENABLE_LEARNED_CURVE"),
+        env_usize("DD_SOCCER_MPC_OBJECTIVE_EPOCHS", 4),
     );
 
     // Carried across games within this process (the real learner's per-process pattern).
@@ -231,7 +245,7 @@ fn main() {
     let mut per_game: Vec<GameKpis> = Vec::with_capacity(games);
     let started = Instant::now();
 
-    for g in 0..games {
+    for g in 0..total_games {
         let mut config = MatchConfig {
             duration_seconds: minutes * 60.0,
             learning_enabled: true,
@@ -301,9 +315,18 @@ fn main() {
             let head = mpc_objective_head.get_or_insert_with(|| {
                 SoccerMpcObjectiveHead::new(seed_base.wrapping_add(g as u32))
             });
-            for _ in 0..4 {
-                head.train_rwr(&mpc_samples, 0.05);
+            let epochs = env_usize("DD_SOCCER_MPC_OBJECTIVE_EPOCHS", 4).clamp(1, 32);
+            let mut trained_steps = 0usize;
+            for _ in 0..epochs {
+                trained_steps += head.train_rwr(&mpc_samples, 0.05);
             }
+            eprintln!(
+                "mpc_objective_training game={} samples={} epochs={} trained_steps={}",
+                g + 1,
+                mpc_samples.len(),
+                epochs,
+                trained_steps
+            );
         }
 
         let summary = sim.summary();
@@ -330,7 +353,10 @@ fn main() {
             dribble_beats: f64::from(st.dribble_beats_home + st.dribble_beats_away),
             dribble_decisions: game_dribble_decision_ticks as f64,
         };
-        per_game.push(kpis);
+        let measured_game = g >= warmup_games;
+        if measured_game {
+            per_game.push(kpis);
+        }
 
         // Carry the trained policy + neural net into the next game.
         if let Some(p) = sim.team_policies() {
@@ -341,8 +367,11 @@ fn main() {
         }
 
         eprintln!(
-            "game {:>2}/{games} seed=0x{:08X} score {}-{} chains={} chain_gain_yds={:.1}",
+            "game {:>2}/{total_games} phase={} measured={}/{} seed=0x{:08X} score {}-{} chains={} chain_gain_yds={:.1}",
             g + 1,
+            if measured_game { "eval" } else { "warmup" },
+            per_game.len(),
+            games,
             seed_base.wrapping_add(g as u32),
             summary.score_home,
             summary.score_away,
@@ -370,7 +399,7 @@ fn main() {
     }
 
     println!(
-        "\n----- per-game averages ({games} games, {:.1}s elapsed) -----",
+        "\n----- measured per-game averages ({games} eval games after {warmup_games} warmup, {:.1}s elapsed) -----",
         started.elapsed().as_secs_f64()
     );
     overall.scaled(1.0 / n).print_row("OVERALL");

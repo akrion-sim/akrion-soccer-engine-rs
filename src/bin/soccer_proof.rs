@@ -373,6 +373,14 @@ fn eval(cand_spec: &str, base_spec: &str, games: usize, minutes: f64, holdout: u
     let base = load_brain(base_spec);
     let mut cfg = EngineMatchRunnerConfig::default();
     cfg.base.duration_seconds = minutes * 60.0;
+    // The runner defaults to critic-only (actor_critic=false) so a SHARED actor can't blur a
+    // neural-vs-neural A/B. But when exactly one side is a net (neural-vs-analytic), the shared
+    // actor IS that net's own actor, so enabling it captures the FULL trained policy (actor +
+    // critic) — where pass-SELECTION learning lives. Opt in via SOCCER_PROOF_EVAL_ACTOR_CRITIC=1.
+    if env_bool("SOCCER_PROOF_EVAL_ACTOR_CRITIC", false) {
+        cfg.base.neural_blend.actor_critic = true;
+        println!("[eval] actor_critic=ON (full policy; valid only for neural-vs-analytic)");
+    }
     let mut runner = EngineMatchRunner::new(cfg);
 
     let jsonl_path = std::env::var("PROOF_JSONL").ok();
