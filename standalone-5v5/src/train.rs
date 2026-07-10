@@ -27,22 +27,24 @@ fn w_spacing() -> f32 {
 /// all phases — so bunching is directly attributable and can't hide in a shared
 /// team average.
 fn spacing_reward(d: f32) -> f32 {
-    // Peak reward at 5 units (optimal), steep penalties for bunching, and a
-    // penalty for being too far (7+). ~5 is a stable optimum on both sides.
+    // The ball is a major attractor, but only the closest player should chase;
+    // 2 going in to CONTEST is fine, stacking is not. So:
+    //   < 1.5  : MAJOR penalty (overlap zone — sickening bunching)
+    //   1.5-3  : mild penalty that still holds (2 can contest, but discouraged)
+    //   ~5     : peak reward (optimal spacing)
+    //   > 7    : penalty (too far to be useful)
     if d < 1.0 {
-        -50.0
-    } else if d < 2.0 {
-        -20.0
+        -80.0
+    } else if d < 1.5 {
+        -40.0
     } else if d < 3.0 {
-        -10.0
-    } else if d < 4.0 {
         -3.0
-    } else if d <= 5.0 {
-        5.0 - (5.0 - d) * 2.5 // rising to the +5 peak at exactly 5
-    } else if d <= 7.0 {
-        5.0 - (d - 5.0) * 2.5 // falling from the peak: +5 at 5 -> 0 at 7
+    } else if d < 5.0 {
+        (d - 3.0) * 4.0 // 0 at 3 -> +8 peak at 5
+    } else if d < 7.0 {
+        8.0 - (d - 5.0) * 4.0 // +8 at 5 -> 0 at 7
     } else {
-        -(d - 7.0) * 5.0 // 7+ units apart: penalty, escalating
+        -(d - 7.0) * 5.0 // 7+ : escalating penalty
     }
 }
 
