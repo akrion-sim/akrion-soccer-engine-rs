@@ -178,6 +178,17 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
         if w.ev_win_ball_a {
             r += 0.3;
         }
+        // dribbling: forward pays, lateral pays a little, backward has no action;
+        // losing the ball WHILE dribbling is penalised extra.
+        if w.ev_dribble_fwd_a {
+            r += 0.04;
+        }
+        if w.ev_dribble_lat_a {
+            r += 0.015;
+        }
+        if w.ev_turnover_a && (w.ev_dribble_fwd_a || w.ev_dribble_lat_a) {
+            r -= 0.4; // dispossessed while dribbling
+        }
         // ESCALATING penalty for passing back to the teammate who just gave you the
         // ball (ping-pong): 2x small, 3x bigger, 4x huge, 5x mega. return_streak_a
         // counts consecutive return passes (1 = the first back-pass).
