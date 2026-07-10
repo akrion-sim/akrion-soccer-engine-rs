@@ -161,6 +161,8 @@ pub struct World {
     pending_passer: i32,              // passer index of the in-flight A pass
     pub return_streak_a: u32,         // consecutive "pass back to the giver" (ping-pong) count
     pub ev_return_pass_a: bool,       // this tick's A pass went back to the giver (ping-pong)
+    pub ev_dribble_fwd_a: bool,       // A carrier dribbled forward this tick
+    pub ev_dribble_lat_a: bool,       // A carrier dribbled laterally this tick
 }
 
 fn players(team: Team, w: &World) -> &[Player; N] {
