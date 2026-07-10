@@ -906,6 +906,37 @@ impl World {
         acts
     }
 
+    /// Spacing shaping for Team A's outfielders (indices 1..N), averaged over
+    /// pairs. Penalize < 3 units apart, reward > 5 apart, cap the reward at 8 —
+    /// so players spread out and passing lanes open. Gated to A possession so it
+    /// rewards good shape while attacking, not just standing spread doing nothing.
+    pub fn spacing_term_a(&self) -> f32 {
+        if !matches!(self.owner, Some(o) if matches!(o.team, Team::A)) {
+            return 0.0;
+        }
+        let mut sum = 0.0f32;
+        let mut n = 0.0f32;
+        for i in 1..N {
+            for j in (i + 1)..N {
+                let d = self.a[i].pos.sub(self.a[j].pos).len();
+                let v = if d < 3.0 {
+                    -(3.0 - d) // too close: penalty, growing as they overlap
+                } else if d <= 5.0 {
+                    0.0 // acceptable gap
+                } else {
+                    d.min(8.0) - 5.0 // spread out: reward, flat beyond 8
+                };
+                sum += v;
+                n += 1.0;
+            }
+        }
+        if n > 0.0 {
+            sum / n
+        } else {
+            0.0
+        }
+    }
+
     /// Potential Φ from Team A's perspective, in [-1, 1]. Used for
     /// policy-invariant potential-based reward shaping (γΦ' − Φ).
     pub fn potential_a(&self) -> f32 {
