@@ -28231,13 +28231,14 @@ fn loose_ball_contest_learning_reward(
 
     match after.controlled_possession_team() {
         Some(team) if team == player.team => {
-            reward += if after.ball.holder == Some(player.id) {
-                0.88 + race_urgency * 0.44
-                    + player_time_fit * 0.24
-                    + unclaimed_pressure * LOOSE_BALL_UNCLAIMED_RECOVERY_DENSE_REWARD_POINTS
-            } else {
-                0.34 + race_urgency * 0.22
-            };
+            reward += ball_recovery_reward_scale()
+                * if after.ball.holder == Some(player.id) {
+                    0.88 + race_urgency * 0.44
+                        + player_time_fit * 0.24
+                        + unclaimed_pressure * LOOSE_BALL_UNCLAIMED_RECOVERY_DENSE_REWARD_POINTS
+                } else {
+                    0.34 + race_urgency * 0.22
+                };
         }
         Some(team) if team == player.team.other() => {
             let favored_loss = if time_advantage > 0.12 {
