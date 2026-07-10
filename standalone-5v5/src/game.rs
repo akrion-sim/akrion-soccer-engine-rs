@@ -1011,6 +1011,35 @@ impl World {
         }
     }
 
+    /// GLOBAL state for the MAPPO centralized critic (CTDE): the entire field in
+    /// one canonical Team-A-attack frame, identical for all agents at a tick.
+    /// Every player's position+velocity, the ball, and possession.
+    pub fn global_state(&self) -> [f32; GLOBAL_DIM] {
+        let nx = FIELD_L;
+        let ny = FIELD_W;
+        let nv = 10.0;
+        let mut f = Vec::with_capacity(GLOBAL_DIM);
+        for team in [Team::A, Team::B] {
+            let ps = players(team, self);
+            for i in 0..N {
+                f.push(ps[i].pos.x / nx * 2.0 - 1.0);
+                f.push(ps[i].pos.y / ny * 2.0 - 1.0);
+                f.push(ps[i].vel.x / nv);
+                f.push(ps[i].vel.y / nv);
+            }
+        }
+        f.push(self.ball.x / nx * 2.0 - 1.0);
+        f.push(self.ball.y / ny * 2.0 - 1.0);
+        f.push(self.ball_vel.x / nv);
+        f.push(self.ball_vel.y / nv);
+        // possession one-hot: A / B / free
+        f.push(matches!(self.owner, Some(o) if matches!(o.team, Team::A)) as u8 as f32);
+        f.push(matches!(self.owner, Some(o) if matches!(o.team, Team::B)) as u8 as f32);
+        f.push(self.owner.is_none() as u8 as f32);
+        f.push(1.0); // bias
+        f.try_into().unwrap()
+    }
+
     /// Closest teammate-pair distance among Team A's outfielders (the true
     /// "are any two stacked?" signal, which an average would hide).
     pub fn closest_pair_a(&self) -> f32 {
