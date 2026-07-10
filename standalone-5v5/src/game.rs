@@ -170,6 +170,8 @@ impl World {
             ev_shot_on_a: false,
             pending_pass: None,
             intended_receiver: None,
+            pass_kick_x: 0.0,
+            last_pass_gain_a: 0.0,
         };
         w.kickoff(Team::A);
         w
