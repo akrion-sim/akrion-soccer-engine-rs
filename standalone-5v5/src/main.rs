@@ -110,9 +110,9 @@ fn run_training(iters: usize) {
         println!(">>> The learned policy BEATS the scripted analytic baseline. <<<");
     }
 
-    // Record one sample match (greedy policy vs scripted) for visualization.
-    record_match(&policy, &mut rng, "out/match.json");
-    println!("wrote out/match.json (sample match trace)");
+    // Record an "after" match with the TRAINED policy, same fixed opening seed.
+    record_match(&policy, &mut Rng::new(777), "out/match_after.json");
+    println!("wrote out/match_before.json + out/match_after.json (visual demo traces)");
 }
 
 /// Play one greedy game and dump per-tick positions to a compact JSON for the
