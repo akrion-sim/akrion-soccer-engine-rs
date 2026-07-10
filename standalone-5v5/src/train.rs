@@ -164,10 +164,11 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
         if w.ev_turnover_a {
             r -= 0.25;
         }
-        // shot reward scaled by MPC-finish placement quality: make shooting from a
-        // good position clearly worthwhile so the policy doesn't just hoard passes.
+        // In-range shot AFTER the 2-pass rule is cleared (ev_shot_on_a can only
+        // fire then, and only within range) is rewarded ABOVE the best pass
+        // (max pass nudge ≈ 0.8) so, once built up and in range, shooting wins.
         if w.ev_shot_on_a {
-            r += 0.4 + 0.7 * w.last_shot_quality_a;
+            r += 1.2 + 1.0 * w.last_shot_quality_a;
         }
         // reward winning the ball back (pressing / interceptions / tackles)
         if w.ev_win_ball_a {

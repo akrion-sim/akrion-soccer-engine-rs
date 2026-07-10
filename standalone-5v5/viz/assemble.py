@@ -6,7 +6,7 @@ publish as an Artifact. Zero third-party deps — stdlib only."""
 import json, os
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUT = os.path.join(HERE, "..", "out")
+OUT = os.environ.get("FIVEASIDE_OUT", os.path.join(HERE, "..", "out"))
 
 
 def rd(name):
