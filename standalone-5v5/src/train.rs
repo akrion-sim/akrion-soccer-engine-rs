@@ -353,6 +353,9 @@ pub fn evaluate(policy: &Policy, games: usize, rng: &mut Rng) -> (f32, f32, f32,
             // measure spacing on EVERY tick (all phases) to validate the whole match
             space_sum += w.avg_nearest_teammate_a();
             space_ticks += 1.0;
+            if w.closest_pair_a() < 2.5 {
+                bunch_ticks += 1.0; // any two outfielders too close this tick
+            }
         }
         let d = w.goals_a as f32 - w.goals_b as f32;
         diff += d;
