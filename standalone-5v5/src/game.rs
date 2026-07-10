@@ -11,8 +11,9 @@ pub const FIELD_W: f32 = 28.0;
 pub const GOAL_HALF: f32 = 3.5; // half goal-mouth width in y (~7m net)
 pub const N: usize = 5; // players per team (index 0 == goalkeeper)
 pub const GK: usize = 0; // goalkeeper index; controlled by a fixed rule, not the policy
-pub const DT: f32 = 0.1; // seconds per decision tick
-pub const STEPS: usize = 400; // ticks per game (~40s)
+pub const DT: f32 = 0.05; // seconds per decision tick -> 20 Hz sim (real-time 20 fps)
+pub const HZ: f32 = 1.0 / DT; // ticks per second (for real-time viewer playback)
+pub const STEPS: usize = 600; // ticks per game (~30s at 20 Hz)
 
 const PLAYER_SPEED: f32 = 6.5;
 const DRIBBLE_SPEED: f32 = 4.6; // carrying the ball is slower than a pass or a run

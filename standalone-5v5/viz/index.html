@@ -263,7 +263,19 @@ function makePitch(canvasId, data){
   function X(x){return pad + (x/L)*(pitchW-2*pad);}
   function Y(y){return pad + (y/W)*(pitchH-2*pad);}
   function draw(fi){
-    const f=data.frames[Math.max(0,Math.min(data.frames.length-1,fi|0))];
+    // interpolate between sim frames so 10 Hz renders smoothly at display refresh
+    const N=data.frames.length;
+    const i0=Math.max(0,Math.min(N-1,Math.floor(fi)));
+    const i1=Math.min(N-1,i0+1);
+    const t=Math.max(0,Math.min(1,fi-i0));
+    const A=data.frames[i0], B=data.frames[i1];
+    const lp=(pa,pb)=>[pa[0]+(pb[0]-pa[0])*t, pa[1]+(pb[1]-pa[1])*t];
+    const f={
+      a:A.a.map((p,k)=>lp(p,B.a[k])),
+      b:A.b.map((p,k)=>lp(p,B.b[k])),
+      ball:lp(A.ball,B.ball),
+      own:A.own, oi:A.oi, ga:A.ga, gb:A.gb
+    };
     ctx.clearRect(0,0,pitchW,pitchH);
     // pitch
     ctx.fillStyle=css('--pitch'); roundRect(ctx,pad-4,pad-4,pitchW-2*pad+8,pitchH-2*pad+8,8); ctx.fill();
@@ -331,14 +343,14 @@ const NF=Math.min(BEFORE.frames.length,AFTER.frames.length);
 
 // ---------- playback ----------
 let fi=0, playing=!reduce, last=0;
-const FPS=22; // frames advanced per second (DT=0.1s real -> ~2.2x)
+const FPS=(AFTER.hz||BEFORE.hz||10); // REAL-TIME: advance sim frames at the sim's own Hz (1x)
 const playBtn=document.getElementById('play');
 const scrub=document.getElementById('scrub'); scrub.max=NF-1;
 function updateScores(){
   const b=BEFORE.frames[fi|0], a=AFTER.frames[fi|0];
   document.getElementById('sa0').textContent=b.ga; document.getElementById('sb0').textContent=b.gb;
   document.getElementById('sa1').textContent=a.ga; document.getElementById('sb1').textContent=a.gb;
-  document.getElementById('clock').textContent=((fi/10)).toFixed(1).padStart(4,'0')+'s';
+  document.getElementById('clock').textContent=((fi/FPS)).toFixed(1).padStart(4,'0')+'s';
   scrub.value=fi|0;
 }
 function render(){P0.draw(fi);P1.draw(fi);updateScores();}
