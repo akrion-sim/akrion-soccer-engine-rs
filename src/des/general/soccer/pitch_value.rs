@@ -196,6 +196,41 @@ pub(crate) fn dd_soccer_enable_learned_epv() -> bool {
     })
 }
 
+/// Move 1a gate: use the learned EPV grid as the PBRS territorial POTENTIAL (`expected_threat`),
+/// replacing the hand-built xT seed. Independent of the per-pass `DD_SOCCER_ENABLE_LEARNED_EPV` bonus.
+pub(crate) fn dd_soccer_enable_learned_epv_potential() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        matches!(
+            std::env::var("DD_SOCCER_ENABLE_LEARNED_EPV_POTENTIAL")
+                .ok()
+                .as_deref()
+                .map(str::trim),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    })
+}
+
+/// Grid floor (own-half / high-turnover cells) — shift the learned EPV by this so the resulting
+/// potential is >= 0 and on a scale comparable to the closed-form `expected_threat` ([0, ~1.8]).
+const LEARNED_EPV_POTENTIAL_MIN: f64 = -0.15;
+
+/// Scale mapping learned-EPV units (~[-0.15, 0.20]) to the closed-form potential range. Default 5.0
+/// gives ~[0, 1.75]. Env `DD_SOCCER_LEARNED_EPV_POTENTIAL_SCALE`.
+fn learned_epv_potential_scale() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_LEARNED_EPV_POTENTIAL_SCALE")
+            .ok()
+            .and_then(|r| r.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(5.0)
+            .clamp(0.1, 100.0)
+    })
+}
+
 fn learned_epv_grid() -> Option<&'static LearnedEpvGrid> {
     use std::sync::OnceLock;
     static GRID: OnceLock<Option<LearnedEpvGrid>> = OnceLock::new();
