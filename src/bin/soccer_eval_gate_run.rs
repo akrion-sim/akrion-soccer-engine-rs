@@ -188,6 +188,8 @@ struct AdvancementFixture {
     opponent_forward_passes: u32,
     candidate_completed_passes: u32,
     opponent_completed_passes: u32,
+    candidate_attempted_passes: u32,
+    opponent_attempted_passes: u32,
     candidate_turnovers: u32,
     opponent_turnovers: u32,
     candidate_pass_gain_yards: f64,
@@ -203,6 +205,8 @@ impl AdvancementFixture {
                 opponent_forward_passes: stats.passes_completed_forward_away,
                 candidate_completed_passes: stats.passes_completed_home,
                 opponent_completed_passes: stats.passes_completed_away,
+                candidate_attempted_passes: stats.passes_attempted_home,
+                opponent_attempted_passes: stats.passes_attempted_away,
                 candidate_turnovers: stats.interceptions_away,
                 opponent_turnovers: stats.interceptions_home,
                 candidate_pass_gain_yards: finite_yards(stats.completed_pass_gain_yards_home),
@@ -214,6 +218,8 @@ impl AdvancementFixture {
                 opponent_forward_passes: stats.passes_completed_forward_home,
                 candidate_completed_passes: stats.passes_completed_away,
                 opponent_completed_passes: stats.passes_completed_home,
+                candidate_attempted_passes: stats.passes_attempted_away,
+                opponent_attempted_passes: stats.passes_attempted_home,
                 candidate_turnovers: stats.interceptions_home,
                 opponent_turnovers: stats.interceptions_away,
                 candidate_pass_gain_yards: finite_yards(stats.completed_pass_gain_yards_away),
@@ -236,6 +242,8 @@ struct AdvancementRecord {
     opponent_forward_passes: u32,
     candidate_completed_passes: u32,
     opponent_completed_passes: u32,
+    candidate_attempted_passes: u32,
+    opponent_attempted_passes: u32,
     candidate_turnovers: u32,
     opponent_turnovers: u32,
     candidate_pass_gain_yards: f64,
@@ -272,6 +280,12 @@ impl AdvancementRecord {
         self.opponent_completed_passes = self
             .opponent_completed_passes
             .saturating_add(fixture.opponent_completed_passes);
+        self.candidate_attempted_passes = self
+            .candidate_attempted_passes
+            .saturating_add(fixture.candidate_attempted_passes);
+        self.opponent_attempted_passes = self
+            .opponent_attempted_passes
+            .saturating_add(fixture.opponent_attempted_passes);
         self.candidate_turnovers = self
             .candidate_turnovers
             .saturating_add(fixture.candidate_turnovers);
@@ -312,6 +326,18 @@ impl AdvancementRecord {
 
     fn forward_pass_rate_margin(&self) -> f64 {
         self.candidate_forward_pass_rate() - self.opponent_forward_pass_rate()
+    }
+
+    fn candidate_completion_rate(&self) -> f64 {
+        ratio(self.candidate_completed_passes, self.candidate_attempted_passes)
+    }
+
+    fn opponent_completion_rate(&self) -> f64 {
+        ratio(self.opponent_completed_passes, self.opponent_attempted_passes)
+    }
+
+    fn completion_rate_margin(&self) -> f64 {
+        self.candidate_completion_rate() - self.opponent_completion_rate()
     }
 
     fn candidate_net_forward_passes(&self) -> i32 {
@@ -760,6 +786,16 @@ fn main() {
         advancement.candidate_turnovers,
         advancement.opponent_turnovers,
         advancement.pass_gain_yards_margin(),
+    );
+    println!(
+        "completion_rate cand={:.4} opp={:.4} margin={:+.4} (cand {}/{} opp {}/{})",
+        advancement.candidate_completion_rate(),
+        advancement.opponent_completion_rate(),
+        advancement.completion_rate_margin(),
+        advancement.candidate_completed_passes,
+        advancement.candidate_attempted_passes,
+        advancement.opponent_completed_passes,
+        advancement.opponent_attempted_passes,
     );
     if require_forward_pass_climb {
         println!("scoreline gate: diagnostic only with forward-pass climb");
