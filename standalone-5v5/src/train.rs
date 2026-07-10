@@ -175,19 +175,32 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
         if w.ev_win_ball_a {
             r += 0.3;
         }
-        // PER-PLAYER teammate spacing (all phases): each outfielder is rewarded
-        // for its OWN nearest-teammate distance, so bunching is directly credited.
-        // TEAM SYNC (MARL coordination): each outfielder is also rewarded for being
-        // FORWARD when we have the ball and DROPPED BACK when the opponent does —
-        // all four share the possession signal, so they shift up/down as a unit.
+        // ESCALATING penalty for passing back to the teammate who just gave you the
+        // ball (ping-pong): 2x small, 3x bigger, 4x huge, 5x mega. return_streak_a
+        // counts consecutive return passes (1 = the first back-pass).
+        if w.ev_return_pass_a {
+            let k = w.return_streak_a.max(1);
+            r -= (0.5 * 3f32.powi((k - 1) as i32)).min(14.0);
+        }
+
+        // Possession PHASE (covers ball-in-flight during our build-up, not just
+        // strict ownership): our phase = we own OR loose ball we last touched.
         let a_owns = matches!(w.owner, Some(o) if matches!(o.team, Team::A));
         let b_owns = matches!(w.owner, Some(o) if matches!(o.team, Team::B));
+        let our_phase = a_owns || (w.owner.is_none() && matches!(w.last_touch, Some(Team::A)));
+        let their_phase = b_owns || (w.owner.is_none() && matches!(w.last_touch, Some(Team::B)));
+
+        // PER-PLAYER coordination (MARL): teammate spacing (anti-bunch) PLUS a
+        // possession-conditioned positioning reward —
+        //   OFFENSE: advance UPFIELD and OPEN UP into space to receive a pass.
+        //   DEFENSE: get GOALSIDE of the ball (between the ball and our own goal).
         let mut sp_t = [0.0f32; N];
         for i in 1..N {
+            let pos = w.a[i].pos;
             let mut nd = f32::INFINITY;
             for j in 1..N {
                 if i != j {
-                    let d = w.a[i].pos.sub(w.a[j].pos).len();
+                    let d = w.a[j].pos.sub(pos).len();
                     if d < nd {
                         nd = d;
                     }
@@ -196,16 +209,24 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
             if nd.is_finite() {
                 sp_t[i] = w_spacing_coeff * spacing_reward(nd);
             }
-            // possession-synced vertical position (attack frame: +x = upfield)
-            let x_att = (w.a[i].pos.x / FIELD_L).clamp(0.0, 1.0);
-            let sync = if a_owns {
-                x_att - 0.5 // push up to attack
-            } else if b_owns {
-                0.5 - x_att // drop back to defend
-            } else {
-                0.0
-            };
-            sp_t[i] += W_SYNC * sync;
+            if our_phase {
+                // advance upfield (attack frame +x) + be open (space from markers)
+                let advance = pos.x / FIELD_L - 0.45;
+                let mut nopp = f32::INFINITY;
+                for k in 0..N {
+                    let d = w.b[k].pos.sub(pos).len();
+                    if d < nopp {
+                        nopp = d;
+                    }
+                }
+                let open = (nopp / 8.0).min(1.0) - 0.4; // reward getting free of a marker
+                sp_t[i] += W_ADVANCE * advance + W_OPEN * open;
+            } else if their_phase {
+                // goalside of the ball: our goal is at x=0, so reward being at a
+                // LOWER x than the ball (between ball and own goal).
+                let goalside = ((w.ball.x - pos.x) / 8.0).clamp(-1.0, 1.0);
+                sp_t[i] += W_GOALSIDE * goalside;
+            }
         }
 
         obs_buf.push(obs_t);
