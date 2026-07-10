@@ -649,6 +649,43 @@ impl World {
         }
     }
 
+    /// Goalkeeper controller (rule-based, both teams). Off the ball it stays on
+    /// the ball→goal line inside its box, narrowing the angle; on the ball it
+    /// distributes to the best outfield outlet (or clears under pressure).
+    fn apply_keeper(&mut self, team: Team) -> Option<(Owner, V2, f32, bool)> {
+        let me = players(team, self)[GK].pos;
+        let sx = team.sx();
+        let owns = matches!(self.owner, Some(o) if o.team == team && o.idx == GK);
+        if owns {
+            self.intended_receiver = None;
+            let cands = self.pass_candidates(team, GK);
+            if let Some((ti, _)) = cands[0] {
+                let tp = players(team, self)[ti].pos;
+                let lead = tp.add(V2::new(sx * 2.0, 0.0));
+                self.intended_receiver = Some(Owner { team, idx: ti });
+                self.set_vel(team, GK, V2::default());
+                return Some((Owner { team, idx: GK }, lead.sub(me), PASS_SPEED, true));
+            }
+            self.set_vel(team, GK, V2::default());
+            return Some((Owner { team, idx: GK }, team.target_goal().sub(me), CLEAR_SPEED, false));
+        }
+        // position on the ball→own-goal line, a few metres off the line
+        let c = team.own_goal();
+        let to_ball = self.ball.sub(c);
+        let out = (to_ball.len() * 0.35).min(6.0);
+        let mut target = c.add(to_ball.unit().scale(out));
+        target.x = if sx > 0.0 {
+            target.x.clamp(0.5, 8.0)
+        } else {
+            target.x.clamp(FIELD_L - 8.0, FIELD_L - 0.5)
+        };
+        target.y = target.y.clamp(FIELD_W / 2.0 - GOAL_HALF - 1.5, FIELD_W / 2.0 + GOAL_HALF + 1.5);
+        let dir = target.sub(me);
+        let v = if dir.len() < 0.2 { V2::default() } else { dir.unit().scale(KEEPER_SPEED) };
+        self.set_vel(team, GK, v);
+        None
+    }
+
     fn apply_off_ball(&mut self, team: Team, idx: usize, a: usize) {
         let me = players(team, self)[idx].pos;
         let team_owns = matches!(self.owner, Some(o) if o.team == team);
