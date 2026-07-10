@@ -600,10 +600,34 @@ impl World {
         match a {
             A_SHOOT => {
                 self.set_vel(team, idx, V2::default());
-                if team == Team::A && self.shot_clearness(Team::A, me) > 0.35 {
+                // MPC-lite finishing: enumerate aim points across the mouth and
+                // pick the one that maximizes clearance from the keeper and any
+                // defender in the shot lane — i.e. shoot to the open corner.
+                let goal_x = goal.x;
+                let cy = FIELD_W / 2.0;
+                let gk = players(team.other(), self)[GK].pos;
+                let margin = GOAL_HALF - 0.35;
+                let mut best_y = cy;
+                let mut best_score = f32::NEG_INFINITY;
+                for k in 0..7 {
+                    let y = cy - margin + 2.0 * margin * (k as f32 / 6.0);
+                    let aim = V2::new(goal_x, y);
+                    // keeper distance to the aim point (predict a small step of
+                    // keeper travel toward the aim along its constrained line)
+                    let keeper_gap = gk.sub(aim).len();
+                    // penalize a defender sitting on the shot lane to this aim
+                    let lane_clear = self.lane_clearness(team, me, aim);
+                    let score = keeper_gap + 3.0 * lane_clear;
+                    if score > best_score {
+                        best_score = score;
+                        best_y = y;
+                    }
+                }
+                let aim = V2::new(goal_x, best_y);
+                if team == Team::A && goal.sub(me).len() < 32.0 {
                     self.ev_shot_on_a = true;
                 }
-                Some((owner, goal.sub(me), SHOT_SPEED, false))
+                Some((owner, aim.sub(me), SHOT_SPEED, false))
             }
             A_PASS_A | A_PASS_B => {
                 let cands = self.pass_candidates(team, idx);
