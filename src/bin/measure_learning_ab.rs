@@ -25,11 +25,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use soccer_engine::des::general::soccer::{
-    enable_deterministic_formation_lp, learned_mpc_objective_enabled, MatchConfig,
-    SoccerMarlAlgorithm, SoccerMatch, SoccerMpcObjectiveHead, SoccerNeuralLearningBackend,
-    SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot, SoccerPassCompletionHead,
-    SoccerQPolicyOptions, SoccerTeamQPolicies, DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
-    PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS,
+    enable_deterministic_formation_lp, learned_mpc_objective_enabled, AttackSpacingHead,
+    MatchConfig, SoccerMarlAlgorithm, SoccerMatch, SoccerMpcObjectiveHead,
+    SoccerNeuralLearningBackend, SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot,
+    SoccerPassCompletionHead, SoccerQPolicyOptions, SoccerTeamQPolicies, SupportScorerHead,
+    ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS, DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
+    PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS, SUPPORT_SCORER_HEAD_MIN_TRAINING_STEPS,
 };
 
 /// One game's measured offense KPIs (both teams summed — self-play is symmetric).
@@ -42,10 +43,13 @@ struct GameKpis {
     passes_attempted: f64,
     passes_completed: f64,
     passes_forward: f64,
+    passes_backward: f64,
+    completed_pass_gain_yards: f64,
     pass_turnovers: f64,
     intentional_passes_attempted: f64,
     intentional_passes_completed: f64,
     intentional_passes_forward: f64,
+    intentional_passes_backward: f64,
     intentional_pass_turnovers: f64,
     intentional_pass_gain_yards: f64,
     pass_chains: f64,
@@ -65,10 +69,13 @@ impl GameKpis {
         self.passes_attempted += other.passes_attempted;
         self.passes_completed += other.passes_completed;
         self.passes_forward += other.passes_forward;
+        self.passes_backward += other.passes_backward;
+        self.completed_pass_gain_yards += other.completed_pass_gain_yards;
         self.pass_turnovers += other.pass_turnovers;
         self.intentional_passes_attempted += other.intentional_passes_attempted;
         self.intentional_passes_completed += other.intentional_passes_completed;
         self.intentional_passes_forward += other.intentional_passes_forward;
+        self.intentional_passes_backward += other.intentional_passes_backward;
         self.intentional_pass_turnovers += other.intentional_pass_turnovers;
         self.intentional_pass_gain_yards += other.intentional_pass_gain_yards;
         self.pass_chains += other.pass_chains;
@@ -88,10 +95,13 @@ impl GameKpis {
             passes_attempted: self.passes_attempted * inv,
             passes_completed: self.passes_completed * inv,
             passes_forward: self.passes_forward * inv,
+            passes_backward: self.passes_backward * inv,
+            completed_pass_gain_yards: self.completed_pass_gain_yards * inv,
             pass_turnovers: self.pass_turnovers * inv,
             intentional_passes_attempted: self.intentional_passes_attempted * inv,
             intentional_passes_completed: self.intentional_passes_completed * inv,
             intentional_passes_forward: self.intentional_passes_forward * inv,
+            intentional_passes_backward: self.intentional_passes_backward * inv,
             intentional_pass_turnovers: self.intentional_pass_turnovers * inv,
             intentional_pass_gain_yards: self.intentional_pass_gain_yards * inv,
             pass_chains: self.pass_chains * inv,
@@ -113,10 +123,23 @@ impl GameKpis {
         let net_forward = self.passes_forward - self.pass_turnovers;
         let intentional_net_forward =
             self.intentional_passes_forward - self.intentional_pass_turnovers;
+        let passes_lateral =
+            (self.passes_completed - self.passes_forward - self.passes_backward).max(0.0);
+        let intentional_passes_lateral = (self.intentional_passes_completed
+            - self.intentional_passes_forward
+            - self.intentional_passes_backward)
+            .max(0.0);
+        let completed_gain_per_pass = ratio(self.completed_pass_gain_yards, self.passes_completed);
+        let intentional_gain_per_pass = ratio(
+            self.intentional_pass_gain_yards,
+            self.intentional_passes_completed,
+        );
         let dribble_beat_per_100 = ratio(self.dribble_beats * 100.0, self.dribble_decisions);
         println!(
             "{label:<14} pass_completion={:.3} passes={:.0}/{:.0} fwd_passes={:.0} \
+             back_passes={:.0} lat_passes={:.0} completed_gain_yds={:.1} gain_per_pass={:.2} \
              intentional_completion={:.3} intentional_passes={:.0}/{:.0} intentional_fwd={:.0} \
+             intentional_back={:.0} intentional_lat={:.0} intentional_gain_per_pass={:.2} \
              intentional_turnovers={:.1} intentional_net_forward={:.1} intentional_gain_yds={:.1} \
              pass_turnovers={:.1} net_forward={:.1} goals={:.2} shots={:.1} \
              on_target={:.1} shot_acc={:.3} shot_after_pass={:.1} dribble_beats={:.1} \
@@ -126,10 +149,17 @@ impl GameKpis {
             self.passes_completed,
             self.passes_attempted,
             self.passes_forward,
+            self.passes_backward,
+            passes_lateral,
+            self.completed_pass_gain_yards,
+            completed_gain_per_pass,
             intentional_completion,
             self.intentional_passes_completed,
             self.intentional_passes_attempted,
             self.intentional_passes_forward,
+            self.intentional_passes_backward,
+            intentional_passes_lateral,
+            intentional_gain_per_pass,
             self.intentional_pass_turnovers,
             intentional_net_forward,
             self.intentional_pass_gain_yards,
@@ -283,6 +313,8 @@ fn main() {
     let mut policies = Arc::new(SoccerTeamQPolicies::new(SoccerQPolicyOptions::default()));
     let mut snapshot: Option<SoccerNeuralNetworkSnapshot> = None;
     let mut pass_completion_head: Option<SoccerPassCompletionHead> = None;
+    let mut attack_spacing_head: Option<AttackSpacingHead> = None;
+    let mut support_scorer_head: Option<SupportScorerHead> = None;
     // Learned MPC execution-objective head, carried + RWR-trained across games (mirrors the
     // pass-completion head's per-process carry). Seeded up-front when the gate is on so game 1
     // already captures cold-exploration samples (the head must exist for the residual to apply);
@@ -323,6 +355,12 @@ fn main() {
         // (gated; a no-op only when DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE is falsey).
         if let Some(head) = mpc_objective_head.as_ref() {
             sim.set_mpc_objective_head(head.clone());
+        }
+        if let Some(head) = attack_spacing_head.as_ref() {
+            sim.set_attack_spacing_head(head.clone());
+        }
+        if let Some(head) = support_scorer_head.as_ref() {
+            sim.set_support_scorer_head(head.clone());
         }
 
         let mut game_dribble_decision_ticks = 0_u64;
@@ -381,6 +419,42 @@ fn main() {
             );
         }
 
+        let attack_spacing_samples = sim.drain_attack_spacing_samples();
+        if !attack_spacing_samples.is_empty() {
+            let head = attack_spacing_head
+                .get_or_insert_with(|| AttackSpacingHead::new(seed_base.wrapping_add(g as u32)));
+            let mut final_loss = 0.0;
+            for _ in 0..4 {
+                final_loss = head.train(&attack_spacing_samples, 0.02);
+            }
+            eprintln!(
+                "attack_spacing_training game={} samples={} training_steps={} consumed={} final_loss={:.5}",
+                g + 1,
+                attack_spacing_samples.len(),
+                head.training_steps(),
+                head.training_steps() >= ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS,
+                final_loss
+            );
+        }
+
+        let support_move_samples = sim.drain_support_move_samples();
+        if !support_move_samples.is_empty() {
+            let head = support_scorer_head
+                .get_or_insert_with(|| SupportScorerHead::new(seed_base.wrapping_add(g as u32)));
+            let mut final_loss = 0.0;
+            for _ in 0..4 {
+                final_loss = head.train(&support_move_samples, 0.02);
+            }
+            eprintln!(
+                "support_scorer_training game={} samples={} training_steps={} consumed={} final_loss={:.5}",
+                g + 1,
+                support_move_samples.len(),
+                head.training_steps(),
+                head.training_steps() >= SUPPORT_SCORER_HEAD_MIN_TRAINING_STEPS,
+                final_loss
+            );
+        }
+
         let summary = sim.summary();
         let st = &summary.stats;
         let kpis = GameKpis {
@@ -393,6 +467,11 @@ fn main() {
             passes_forward: f64::from(
                 st.passes_completed_forward_home + st.passes_completed_forward_away,
             ),
+            passes_backward: f64::from(
+                st.passes_completed_backward_home + st.passes_completed_backward_away,
+            ),
+            completed_pass_gain_yards: st.completed_pass_gain_yards_home
+                + st.completed_pass_gain_yards_away,
             pass_turnovers: f64::from(
                 st.pass_interceptions_own_half + st.pass_interceptions_opp_half,
             ),
@@ -405,6 +484,10 @@ fn main() {
             intentional_passes_forward: f64::from(
                 st.intentional_passes_completed_forward_home
                     + st.intentional_passes_completed_forward_away,
+            ),
+            intentional_passes_backward: f64::from(
+                st.intentional_passes_completed_backward_home
+                    + st.intentional_passes_completed_backward_away,
             ),
             intentional_pass_turnovers: f64::from(
                 st.intentional_pass_interceptions_own_half

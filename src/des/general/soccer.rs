@@ -4021,6 +4021,8 @@ const WALL_PASS_GIVE_POWER: f64 = 0.58;
 /// The carrier only *waits* when calm: the nearest opponent must be at least this far away
 /// (it is patience, not a pressured shield — pressured retention is the protect-ball option).
 const HOLD_FOR_SUPPORT_MIN_SPACE_YARDS: f64 = 4.5;
+const HOLD_FOR_SUPPORT_PRESSURED_MIN_SPACE_YARDS: f64 = 1.4;
+const HOLD_FOR_SUPPORT_PRESSURED_MAX_DRIBBLE_SPACE_YARDS: f64 = 5.0;
 /// A teammate already ahead with a clean lane and at least this much space is a forward
 /// outlet NOW — so there is nothing to wait for and the gate declines (the carrier passes).
 const HOLD_FOR_SUPPORT_OUTLET_OPEN_YARDS: f64 = 3.0;
@@ -4194,6 +4196,36 @@ pub(crate) fn offball_support_reward_scale() -> f64 {
     static V: OnceLock<f64> = OnceLock::new();
     *V.get_or_init(|| {
         std::env::var("SOCCER_OFFBALL_SUPPORT_REWARD_SCALE")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(1.0, 10.0))
+            .unwrap_or(1.0)
+    })
+}
+
+/// Amplify DRIBBLING / progressive ball-CARRYING rewards (beat defenders, drive into space).
+/// Env `DD_SOCCER_CARRY_REWARD_SCALE` (default 1.0), clamped [1, 10].
+pub(crate) fn carry_reward_scale() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_CARRY_REWARD_SCALE")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(1.0, 10.0))
+            .unwrap_or(1.0)
+    })
+}
+
+/// Amplify DEFENSIVE ball-RECOVERY / press rewards (win the ball back after a loss).
+/// Env `DD_SOCCER_RECOVERY_REWARD_SCALE` (default 1.0), clamped [1, 10].
+pub(crate) fn ball_recovery_reward_scale() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_RECOVERY_REWARD_SCALE")
             .ok()
             .and_then(|raw| raw.trim().parse::<f64>().ok())
             .filter(|v| v.is_finite())
@@ -12472,6 +12504,18 @@ impl ReceiverDescriptor {
         (((kind * 4 + role) * 3 + lane) * 3 + progression) * 3 + openness
     }
 
+    pub(crate) fn kind_from_encoded(code: i32) -> Option<ReceiverKind> {
+        if code < 0 {
+            return None;
+        }
+        match code / (4 * 3 * 3 * 3) {
+            0 => Some(ReceiverKind::Teammate),
+            1 => Some(ReceiverKind::Space),
+            2 => Some(ReceiverKind::Nobody),
+            _ => None,
+        }
+    }
+
     /// Role bucket for a teammate receiver (GK 0 / DEF 1 / MID 2 / FWD 3).
     pub(crate) fn role_bucket_for(role: PlayerRole) -> u8 {
         match role {
@@ -13445,17 +13489,48 @@ impl SoccerQPolicy {
         state: &SoccerQStateKey,
         action: &str,
     ) -> Option<SoccerQTargetEntry> {
-        self.best_target_grid_for_state_action_with_context(state, action, false)
-            .or_else(|| self.best_target_grid_for_state_action_with_context(state, action, true))
+        self.best_target_grid_for_state_action_filtered(state, action, None)
+    }
+
+    pub(crate) fn best_target_grid_for_state_action_receiver_kind(
+        &self,
+        state: &SoccerQStateKey,
+        action: &str,
+        receiver_kind: ReceiverKind,
+    ) -> Option<SoccerQTargetEntry> {
+        self.best_target_grid_for_state_action_filtered(state, action, Some(receiver_kind))
+    }
+
+    fn best_target_grid_for_state_action_filtered(
+        &self,
+        state: &SoccerQStateKey,
+        action: &str,
+        receiver_kind: Option<ReceiverKind>,
+    ) -> Option<SoccerQTargetEntry> {
+        self.best_target_grid_for_state_action_with_context(state, action, receiver_kind, false)
+            .or_else(|| {
+                self.best_target_grid_for_state_action_with_context(
+                    state,
+                    action,
+                    receiver_kind,
+                    true,
+                )
+            })
     }
 
     fn best_target_grid_for_state_action_with_context(
         &self,
         state: &SoccerQStateKey,
         action: &str,
+        receiver_kind: Option<ReceiverKind>,
         relaxed: bool,
     ) -> Option<SoccerQTargetEntry> {
         let action = normalize_soccer_action_label(action);
+        let descriptor_kind_matches = |key: &SoccerQTargetKey| -> bool {
+            receiver_kind.map_or(true, |kind| {
+                ReceiverDescriptor::kind_from_encoded(key.receiver_descriptor) == Some(kind)
+            })
+        };
         let mut best: Option<(&SoccerQTargetKey, f64, u32)> = None;
         if relaxed {
             for source in Self::relaxed_query_keys(state) {
@@ -13470,7 +13545,10 @@ impl SoccerQPolicy {
                     let Some(key) = self.target_index_keys.get(*key_id) else {
                         continue;
                     };
-                    if key.action != action || !key.state.matches_relaxed_learning_context(state) {
+                    if key.action != action
+                        || !key.state.matches_relaxed_learning_context(state)
+                        || !descriptor_kind_matches(key)
+                    {
                         continue;
                     }
                     update_best_target_grid_candidate(self, &mut best, key);
@@ -13489,7 +13567,10 @@ impl SoccerQPolicy {
                     let Some(key) = self.target_index_keys.get(*key_id) else {
                         continue;
                     };
-                    if key.action != action || !key.state.matches_learning_context(state) {
+                    if key.action != action
+                        || !key.state.matches_learning_context(state)
+                        || !descriptor_kind_matches(key)
+                    {
                         continue;
                     }
                     update_best_target_grid_candidate(self, &mut best, key);
@@ -20699,6 +20780,11 @@ pub(crate) enum SoccerRewardEventKind {
     GoalkeeperSave,
     DribbleBeat,
     DefensiveDispossession,
+    /// Positive: a single same-team pass was actually completed forward. This is distinct from
+    /// launch-side [`ForwardPassAttempt`](SoccerRewardEventKind::ForwardPassAttempt) and from
+    /// chain-level [`TwoForwardPasses`](SoccerRewardEventKind::TwoForwardPasses), so support runners
+    /// can learn from the first completed forward outlet they create.
+    CompletedForwardPass,
     TwoForwardPasses,
     ThreePassForwardNetGain,
     /// Positive but bounded: a meaningfully forward pass was selected into a decent completion
@@ -20817,6 +20903,7 @@ impl SoccerRewardEventKind {
             SoccerRewardEventKind::GoalkeeperSave
                 | SoccerRewardEventKind::DribbleBeat
                 | SoccerRewardEventKind::DefensiveDispossession
+                | SoccerRewardEventKind::CompletedForwardPass
                 | SoccerRewardEventKind::TwoForwardPasses
                 | SoccerRewardEventKind::ThreePassForwardNetGain
                 | SoccerRewardEventKind::ForwardPassAttempt
@@ -20856,6 +20943,7 @@ impl SoccerRewardEventKind {
             self,
             SoccerRewardEventKind::DribbleBeat
                 | SoccerRewardEventKind::DefensiveDispossession
+                | SoccerRewardEventKind::CompletedForwardPass
                 | SoccerRewardEventKind::TwoForwardPasses
                 | SoccerRewardEventKind::ThreePassForwardNetGain
                 | SoccerRewardEventKind::ShotAttempt
@@ -27627,7 +27715,8 @@ fn dense_soccer_transition_reward(
                     * DENSE_FORWARD_CARRY_PROGRESS_REWARD_PER_YARD
                     * role_multiplier
                     * pressure_multiplier
-                    * half_multiplier;
+                    * half_multiplier
+                    * carry_reward_scale();
                 if carry_progress >= 6.0 {
                     reward += 0.18 * role_multiplier * half_multiplier;
                 }
@@ -28144,13 +28233,14 @@ fn loose_ball_contest_learning_reward(
 
     match after.controlled_possession_team() {
         Some(team) if team == player.team => {
-            reward += if after.ball.holder == Some(player.id) {
-                0.88 + race_urgency * 0.44
-                    + player_time_fit * 0.24
-                    + unclaimed_pressure * LOOSE_BALL_UNCLAIMED_RECOVERY_DENSE_REWARD_POINTS
-            } else {
-                0.34 + race_urgency * 0.22
-            };
+            reward += ball_recovery_reward_scale()
+                * if after.ball.holder == Some(player.id) {
+                    0.88 + race_urgency * 0.44
+                        + player_time_fit * 0.24
+                        + unclaimed_pressure * LOOSE_BALL_UNCLAIMED_RECOVERY_DENSE_REWARD_POINTS
+                } else {
+                    0.34 + race_urgency * 0.22
+                };
         }
         Some(team) if team == player.team.other() => {
             let favored_loss = if time_advantage > 0.12 {
@@ -29910,6 +30000,10 @@ fn attacking_shape_support_urgency(snapshot: &WorldSnapshot, team: Team) -> f64 
 
 const OPEN_SUPPORT_OUTLET_RADIUS_YARDS: f64 = 18.0;
 
+fn pressured_support_outlet_urgency_enabled() -> bool {
+    soccer_env_flag_enabled("DD_SOCCER_ENABLE_PRESSURED_SUPPORT_OUTLET_URGENCY")
+}
+
 fn open_support_outlet_count(
     snapshot: &WorldSnapshot,
     team: Team,
@@ -29934,6 +30028,54 @@ fn open_support_outlet_count(
         })
         .take(3)
         .count()
+}
+
+fn holder_pass_outlet_picture_quality(
+    snapshot: &WorldSnapshot,
+    holder: &PlayerSnapshot,
+    holder_position: Vec2,
+) -> (f64, f64) {
+    let mut best_any = 0.0_f64;
+    let mut best_forward = 0.0_f64;
+    for target_id in snapshot.ranked_visible_pass_targets(holder.id, 6) {
+        let Some(target) = snapshot
+            .players
+            .iter()
+            .find(|player| player.id == target_id)
+        else {
+            continue;
+        };
+        if target.team != holder.team || target.role == PlayerRole::Goalkeeper {
+            continue;
+        }
+        let target_position = snapshot
+            .player_position(target.id)
+            .unwrap_or(target.position);
+        let distance = holder_position.distance(target_position);
+        let forward_yards = (target_position.y - holder_position.y) * holder.team.attack_dir();
+        let openness = pass_receiver_openness_for_snapshots_with_teammates(
+            &snapshot.players,
+            holder.team,
+            target_position,
+            Some(target.id),
+        );
+        let lane_fit =
+            if snapshot.clear_line(holder_position, target_position, holder.team.other(), 2.0) {
+                1.0
+            } else {
+                0.0
+            };
+        let distance_fit = (1.0 - (distance - 14.0).abs() / 30.0).clamp(0.0, 1.0);
+        let forward_fit = (forward_yards / 12.0).clamp(0.0, 1.0);
+        let quality =
+            (openness * 0.42 + lane_fit * 0.32 + distance_fit * 0.16 + forward_fit * 0.10)
+                .clamp(0.0, 1.0);
+        best_any = best_any.max(quality);
+        if forward_yards >= 4.0 {
+            best_forward = best_forward.max(quality);
+        }
+    }
+    (best_any, best_forward)
 }
 
 fn holder_pressure_support_urgency(snapshot: &WorldSnapshot, team: Team) -> f64 {
@@ -29975,7 +30117,24 @@ fn holder_pressure_support_urgency(snapshot: &WorldSnapshot, team: Team) -> f64 
         OPEN_SUPPORT_OUTLET_RADIUS_YARDS,
     );
     let open_outlet_shortage = ((3.0 - open_outlets as f64) / 3.0).clamp(0.0, 1.0);
-    (pressure * 0.42 + crowding * 0.24 + open_outlet_shortage * 0.34).clamp(0.0, 1.0)
+    let mut urgency =
+        (pressure * 0.42 + crowding * 0.24 + open_outlet_shortage * 0.34).clamp(0.0, 1.0);
+    if pressured_support_outlet_urgency_enabled() {
+        let (best_any_outlet, best_forward_outlet) =
+            holder_pass_outlet_picture_quality(snapshot, holder, holder_position);
+        let outlet_picture_shortage = ((0.54 - best_any_outlet) / 0.54).clamp(0.0, 1.0);
+        let forward_outlet_shortage = ((0.48 - best_forward_outlet) / 0.48).clamp(0.0, 1.0);
+        let pressure_fit = pressure.max(crowding).clamp(0.0, 1.0);
+        let severe_pressure_fit = ((pressure_fit - 0.58) / 0.28).clamp(0.0, 1.0);
+        let poor_outlet_fit = outlet_picture_shortage
+            .max(forward_outlet_shortage)
+            .max(open_outlet_shortage * 0.72);
+        let quality_lift = severe_pressure_fit
+            * poor_outlet_fit
+            * (outlet_picture_shortage * 0.08 + forward_outlet_shortage * 0.14);
+        urgency = (urgency + quality_lift).clamp(0.0, 1.0);
+    }
+    urgency
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -39218,9 +39377,13 @@ impl SoccerPassCompletionHead {
             };
             let input: Vec<f64> = normalized.iter().map(|&v| v as f64).collect();
             let target = [if sample.completed { 1.0 } else { 0.0 }];
-            let result = self
-                .network
-                .train_sample_clipped(&input, &target, learning_rate, 4.0);
+            let sample_weight = pass_completion_training_sample_weight(sample);
+            let result = self.network.train_sample_clipped(
+                &input,
+                &target,
+                learning_rate * sample_weight,
+                4.0,
+            );
             if result.applied && result.loss.is_finite() {
                 total += result.loss;
                 applied += 1;
@@ -39285,6 +39448,66 @@ impl SoccerPassCompletionHead {
             correct as f64 / scored as f64
         }
     }
+}
+
+fn pass_completion_forward_weighting_enabled() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_PASS_COMPLETION_FORWARD_WEIGHTING")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            soccer_env_flag_enabled("DD_SOCCER_ENABLE_PASS_COMPLETION_FORWARD_WEIGHTING")
+        })
+    }
+}
+
+pub(crate) fn pass_completion_training_sample_weight_for(
+    sample: &SoccerPassOutcomeSample,
+    enabled: bool,
+) -> f64 {
+    if !enabled {
+        return 1.0;
+    }
+    let pass_offset = SOCCER_MOMENT_EMBEDDING_DIM;
+    let Some(distance_feature) = sample.features.get(pass_offset) else {
+        return 1.0;
+    };
+    let Some(forward_feature) = sample.features.get(pass_offset + 1) else {
+        return 1.0;
+    };
+    let distance_yards = (*distance_feature as f64 * 60.0).clamp(0.0, 90.0);
+    let forward_yards = (*forward_feature as f64 * 40.0).clamp(-40.0, 60.0);
+    let pressure = sample
+        .features
+        .get(pass_offset + 3)
+        .map(|value| (*value as f64).clamp(0.0, 1.0))
+        .unwrap_or(0.0);
+    let forward_fit =
+        ((forward_yards - COMPLETED_FORWARD_PASS_COUNT_MIN_YARDS) / 18.0).clamp(0.0, 1.0);
+    let long_forward_fit = ((forward_yards - 12.0) / 28.0).clamp(0.0, 1.0);
+    let distance_fit = ((distance_yards - 8.0) / 34.0).clamp(0.0, 1.0);
+    let mut weight = if sample.completed {
+        1.0 + forward_fit * 0.55 + long_forward_fit * 0.15
+    } else {
+        1.0 + forward_fit * 0.85
+            + long_forward_fit * 0.25
+            + distance_fit * 0.20
+            + pressure * forward_fit * 0.25
+    };
+    if sample.completed && forward_yards < -COMPLETED_FORWARD_PASS_COUNT_MIN_YARDS {
+        let backward_fit =
+            ((-forward_yards - COMPLETED_FORWARD_PASS_COUNT_MIN_YARDS) / 12.0).clamp(0.0, 1.0);
+        weight -= backward_fit * 0.22;
+    }
+    weight.clamp(0.65, 2.5)
+}
+
+fn pass_completion_training_sample_weight(sample: &SoccerPassOutcomeSample) -> f64 {
+    pass_completion_training_sample_weight_for(sample, pass_completion_forward_weighting_enabled())
 }
 
 /// Minimum SGD steps a [`SoccerPassCompletionHead`] must have taken before the live pass-quality

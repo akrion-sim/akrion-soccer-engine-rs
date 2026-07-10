@@ -131,6 +131,7 @@ pub(crate) fn support_outcome_event_weight(kind: SoccerRewardEventKind) -> f64 {
         SoccerRewardEventKind::ShotAttempt => 0.12,
         // Successful forward progression / retention of a threatening move.
         SoccerRewardEventKind::ThreePassForwardNetGain => 0.28,
+        SoccerRewardEventKind::CompletedForwardPass => 0.22,
         SoccerRewardEventKind::WallPassCombination => 0.22,
         SoccerRewardEventKind::BuildupChainCredit => 0.20,
         SoccerRewardEventKind::TwoForwardPasses => 0.18,
@@ -640,10 +641,12 @@ mod tests {
         // and turnovers are strictly negative. Neutral/unrelated kinds contribute nothing.
         let goal = support_outcome_event_weight(SoccerRewardEventKind::Goal);
         let shot = support_outcome_event_weight(SoccerRewardEventKind::ShotOnTarget);
-        let pass = support_outcome_event_weight(SoccerRewardEventKind::TwoForwardPasses);
+        let pass = support_outcome_event_weight(SoccerRewardEventKind::CompletedForwardPass);
+        let chain = support_outcome_event_weight(SoccerRewardEventKind::TwoForwardPasses);
         let turnover =
             support_outcome_event_weight(SoccerRewardEventKind::OverdribbleDispossession);
         assert!(goal > shot && shot > pass && pass > 0.0);
+        assert!(chain > 0.0);
         assert!(turnover < 0.0);
         assert_eq!(
             support_outcome_event_weight(SoccerRewardEventKind::HeaderGoalFromCross),

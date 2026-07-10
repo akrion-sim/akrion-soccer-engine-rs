@@ -3342,6 +3342,91 @@ fn pass_receiver_descriptor_reads_progression_and_kind() {
         fwd, space,
         "teammate vs open-space target at the same point must decode to different kinds"
     );
+    assert_eq!(
+        ReceiverDescriptor::kind_from_encoded(fwd),
+        Some(ReceiverKind::Teammate)
+    );
+    assert_eq!(
+        ReceiverDescriptor::kind_from_encoded(space),
+        Some(ReceiverKind::Space)
+    );
+    assert_eq!(ReceiverDescriptor::kind_from_encoded(-1), None);
+}
+
+#[test]
+fn q_policy_target_grid_lookup_can_filter_space_receiver_kind() {
+    // The pass-space option must not pick the generic best target grid if that value belongs to a
+    // teammate descriptor. It needs the best Space descriptor so learned same-team run-onto passes
+    // can be offered instead of dying at no_space_receiver_value.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 9_144,
+        ..Default::default()
+    });
+    let passer = 7;
+    let receiver = 9;
+    sim.ball.holder = Some(passer);
+    sim.players[passer].team = Team::Home;
+    sim.players[passer].role = PlayerRole::Midfielder;
+    sim.players[passer].position = Vec2::new(40.0, 50.0);
+    sim.players[receiver].team = Team::Home;
+    sim.players[receiver].role = PlayerRole::Forward;
+    sim.players[receiver].position = Vec2::new(38.0, 64.0);
+    sim.ball.position = sim.players[passer].position;
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let state = SoccerQStateKey::from_parts(
+        &snapshot.mdp_state_for_player(passer),
+        &snapshot.observation_for(passer),
+        Team::Home,
+        sim.players[passer].role,
+    );
+    let teammate_point = sim.players[receiver].position;
+    let space_point = Vec2::new(40.0, 72.0);
+    let teammate_grid =
+        pitch_grid_address(teammate_point, snapshot.field_width, snapshot.field_length);
+    let space_grid = pitch_grid_address(space_point, snapshot.field_width, snapshot.field_length);
+    let teammate_descriptor = snapshot.pass_receiver_descriptor(
+        passer,
+        ReceiverKind::Teammate,
+        teammate_point,
+        Some(sim.players[receiver].role),
+    );
+    let space_descriptor =
+        snapshot.pass_receiver_descriptor(passer, ReceiverKind::Space, space_point, None);
+    let mut policy = SoccerQPolicy::default();
+    assert!(policy.set_target_value_with_receiver(
+        state.clone(),
+        "pass",
+        teammate_grid,
+        teammate_descriptor,
+        5.0,
+    ));
+    assert!(policy.set_target_value_with_receiver(
+        state.clone(),
+        "pass",
+        space_grid,
+        space_descriptor,
+        3.0,
+    ));
+
+    let generic = policy
+        .best_target_grid_for_state_action(&state, "pass")
+        .expect("generic best target");
+    assert_eq!(generic.target_fine_cell_id, teammate_grid.fine.id);
+    assert_eq!(
+        ReceiverDescriptor::kind_from_encoded(generic.receiver_descriptor),
+        Some(ReceiverKind::Teammate)
+    );
+
+    let space_only = policy
+        .best_target_grid_for_state_action_receiver_kind(&state, "pass", ReceiverKind::Space)
+        .expect("space-kind target");
+    assert_eq!(space_only.target_fine_cell_id, space_grid.fine.id);
+    assert_eq!(
+        ReceiverDescriptor::kind_from_encoded(space_only.receiver_descriptor),
+        Some(ReceiverKind::Space)
+    );
 }
 
 #[test]
@@ -6767,7 +6852,14 @@ fn long_forward_release_guard_blocks_low_quality_floor_and_degraded_killer_aeria
         ..Default::default()
     };
     assert!(
-        !long_forward_pass_release_guard_fails(false, PassFlight::Floor, 29.0, good_long_floor),
+        !long_forward_pass_release_guard_fails(
+            false,
+            PassFlight::Floor,
+            29.0,
+            31.0,
+            0.0,
+            good_long_floor
+        ),
         "a genuinely safe completed-forward candidate should stay legal"
     );
 
@@ -6781,16 +6873,53 @@ fn long_forward_release_guard_blocks_low_quality_floor_and_degraded_killer_aeria
         false,
         PassFlight::Floor,
         29.0,
+        31.0,
+        0.0,
         low_completion_floor
     ));
     assert!(
         !long_forward_pass_release_guard_fails(
             false,
             PassFlight::Floor,
-            24.0,
+            10.0,
+            14.0,
+            0.0,
             low_completion_floor
         ),
-        "the stricter cutoff is only for long forward launches"
+        "a short pass below the medium-forward window keeps the old release envelope"
+    );
+    assert!(
+        long_forward_pass_release_guard_fails(
+            false,
+            PassFlight::Floor,
+            20.0,
+            22.0,
+            0.0,
+            low_completion_floor
+        ),
+        "medium-forward floor passes now need enough completion quality"
+    );
+    assert!(
+        long_forward_pass_release_guard_fails(
+            false,
+            PassFlight::Floor,
+            15.0,
+            16.0,
+            9.0,
+            low_completion_floor
+        ),
+        "a led medium floor pass needs enough completion quality even below 18 yards"
+    );
+    assert!(
+        long_forward_pass_release_guard_fails(
+            false,
+            PassFlight::Floor,
+            12.0,
+            31.0,
+            0.0,
+            low_completion_floor
+        ),
+        "a 25+ yard diagonal floor pass still needs long-pass completion quality"
     );
 
     let risky_lane_floor = PassTargetQuality {
@@ -6803,8 +6932,28 @@ fn long_forward_release_guard_blocks_low_quality_floor_and_degraded_killer_aeria
         false,
         PassFlight::Floor,
         29.0,
+        31.0,
+        0.0,
         risky_lane_floor
     ));
+
+    let good_aerial = PassTargetQuality {
+        expected_completion: 0.72,
+        lane_interception_risk: 0.12,
+        mpc_receipt_probability: 0.66,
+        ..Default::default()
+    };
+    assert!(
+        !long_forward_pass_release_guard_fails(
+            false,
+            PassFlight::Aerial,
+            18.0,
+            24.0,
+            9.0,
+            good_aerial
+        ),
+        "a high-quality ordinary aerial progression should stay legal"
+    );
 
     let degraded_killer_aerial = PassTargetQuality {
         expected_completion: 0.49,
@@ -6816,22 +6965,44 @@ fn long_forward_release_guard_blocks_low_quality_floor_and_degraded_killer_aeria
         true,
         PassFlight::Aerial,
         31.0,
+        31.0,
+        0.0,
+        degraded_killer_aerial
+    ));
+    assert!(long_forward_pass_release_guard_fails(
+        true,
+        PassFlight::OverTop,
+        18.0,
+        31.0,
+        0.0,
+        degraded_killer_aerial
+    ));
+    assert!(long_forward_pass_release_guard_fails(
+        false,
+        PassFlight::Aerial,
+        18.0,
+        24.0,
+        9.0,
         degraded_killer_aerial
     ));
     assert!(
-        !long_forward_pass_release_guard_fails(
+        long_forward_pass_release_guard_fails(
             false,
             PassFlight::Aerial,
             31.0,
+            31.0,
+            0.0,
             degraded_killer_aerial
         ),
-        "the aerial cutoff is only for degraded killer-pass launches"
+        "ordinary long aerial progressions also need enough release quality"
     );
     assert!(
         !long_forward_pass_release_guard_fails(
             true,
             PassFlight::Scoop,
             31.0,
+            31.0,
+            0.0,
             degraded_killer_aerial
         ),
         "scoop/over-top variants keep their dedicated viability gates"
@@ -10017,6 +10188,115 @@ fn first_touch_options_keep_quick_forward_exception_for_one_touch_pass() {
 }
 
 #[test]
+fn first_touch_completion_guard_blocks_open_but_low_completion_floor_pass() {
+    let (quality, safe_floor, multiplier) =
+        first_touch_completion_guard_values(true, true, 0.10, 0.92);
+    assert!(
+        quality < 0.50,
+        "openness must not masquerade as a safe first-touch floor pass: quality={quality}"
+    );
+    assert!(
+        !safe_floor,
+        "low concrete completion must block floor lifts"
+    );
+    assert!(
+        multiplier < 0.36,
+        "low concrete completion should damp the base score hard enough: {multiplier}"
+    );
+}
+
+#[test]
+fn first_touch_completion_guard_preserves_clean_quick_forward_floor_pass() {
+    let (quality, safe_floor, multiplier) =
+        first_touch_completion_guard_values(true, true, 0.74, 0.92);
+    assert!(
+        quality >= 0.74,
+        "clean completion should remain high-quality: {quality}"
+    );
+    assert!(
+        safe_floor,
+        "clean same-team completion should keep floor lifts"
+    );
+    assert_eq!(multiplier, 1.0);
+}
+
+#[test]
+fn forward_pass_risk_gate_damps_speculative_first_touch_pass() {
+    let _env = pass_risk_gate_env_lock();
+    let _gate = TestEnvVarGuard::set("DD_SOCCER_ENABLE_FORWARD_PASS_TURNOVER_RISK_GATE", "1");
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 22_519,
+        ..Default::default()
+    });
+    let receiver = 7;
+    let outlet = 9;
+    park_players_except(&mut sim, &[receiver, outlet]);
+    sim.players[receiver].role = PlayerRole::Midfielder;
+    sim.players[receiver].position = Vec2::new(40.0, 58.0);
+    sim.players[outlet].team = Team::Home;
+    sim.players[outlet].role = PlayerRole::Forward;
+    sim.players[outlet].position = Vec2::new(43.0, 68.0);
+    sim.ball.holder = Some(receiver);
+    sim.ball.position = sim.players[receiver].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.players[receiver].incoming_ball = Some(IncomingBallContext {
+        from_player: Some(6),
+        target_player: Some(receiver),
+        team: Some(Team::Home),
+        kind: IncomingBallKind::GroundPass,
+        origin: Some(Vec2::new(38.0, 42.0)),
+        intended_target: Some(sim.players[receiver].position),
+        speed_yps: 12.0,
+        distance_yards: 18.0,
+        received_tick: sim.tick,
+        is_cross: false,
+        is_aerial: false,
+    });
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let mut risky = snapshot.observation_for(receiver);
+    assert!(risky.first_touch_available);
+    risky.has_ball = true;
+    risky.first_time_pass_score = 0.98;
+    risky.control_touch_score = 0.42;
+    risky.first_time_pass_field_feasibility = 0.74;
+    risky.one_touch_pass_feasibility = 0.86;
+    risky.visible_pass_options = 1;
+    risky.visible_forward_pass_options = 1;
+    risky.expected_pass_completion = 0.08;
+    risky.expected_aerial_pass_completion = 0.42;
+    risky.best_pass_receiver_openness = 0.36;
+    risky.best_forward_pass_receiver_openness = 0.46;
+    risky.best_forward_pass_option_quality = 0.46;
+    risky.aerial_pass_interception_risk = 0.74;
+    risky.immediate_dispossession_risk = 0.42;
+
+    let mut clean = risky.clone();
+    clean.expected_pass_completion = 0.82;
+    clean.expected_aerial_pass_completion = 0.74;
+    clean.best_pass_receiver_openness = 0.86;
+    clean.best_forward_pass_receiver_openness = 0.90;
+    clean.best_forward_pass_option_quality = 0.90;
+    clean.aerial_pass_interception_risk = 0.18;
+    clean.immediate_dispossession_risk = 0.14;
+
+    let risky_options = sim.players[receiver].first_touch_action_options(&risky, 1, 0);
+    let clean_options = sim.players[receiver].first_touch_action_options(&clean, 1, 0);
+    let risky_first_time = action_option_score(&risky_options, "first-time-pass");
+    let clean_first_time = action_option_score(&clean_options, "first-time-pass");
+    let risky_control = action_option_score(&risky_options, "control-touch");
+    assert!(
+        clean_first_time > risky_first_time * 2.5,
+        "clean first-time outlet should survive while risky speculative one is damped: clean={clean_first_time} risky={risky_first_time}"
+    );
+    assert!(
+        risky_control > risky_first_time,
+        "risky first-touch pass should yield to controlling the ball: control={risky_control} pass={risky_first_time} options={risky_options:?}"
+    );
+}
+
+#[test]
 fn first_touch_quick_forward_exception_executes_to_quick_outlet() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -10486,6 +10766,71 @@ fn safe_progressive_pass_score_bonus_requires_completion_and_progress() {
     assert!(
         marginal_progress > 0.0 && marginal_progress < safe_ten_yard_ball,
         "a barely-progressive safe pass should count, but less than a useful 10yd ball: marginal={marginal_progress}, ten={safe_ten_yard_ball}"
+    );
+}
+
+#[test]
+fn retained_forward_target_utility_rewards_only_plausibly_retained_forward_targets() {
+    let _scale = TestEnvVarGuard::set("DD_SOCCER_RETAINED_FORWARD_TARGET_UTILITY_SCALE", "2.0");
+    let clean_forward = PassTargetQuality {
+        expected_completion: 0.62,
+        mpc_receipt_probability: 0.72,
+        lane_interception_risk: 0.24,
+        ..PassTargetQuality::default()
+    };
+    let risky_forward = PassTargetQuality {
+        expected_completion: 0.32,
+        mpc_receipt_probability: 0.40,
+        lane_interception_risk: 0.72,
+        ..PassTargetQuality::default()
+    };
+
+    let bonus = retained_forward_target_utility_bonus(&clean_forward, 10.0, 10.0);
+    assert!(
+        bonus > 0.25,
+        "safe retained forward targets should get a modest positive target-ordering bonus: {bonus}"
+    );
+    assert_eq!(
+        retained_forward_target_utility_bonus(&clean_forward, -4.0, 10.0),
+        0.0
+    );
+    assert_eq!(
+        retained_forward_target_utility_bonus(&risky_forward, 14.0, 14.0),
+        0.0
+    );
+}
+
+#[test]
+fn forward_option_lateral_demotion_only_prices_wasteful_square_recycling() {
+    assert_eq!(
+        forward_option_lateral_demotion_penalty(0.25, 0.94, 0.20, 0.76, 10.0, 62.0, 120.0, false),
+        0.0
+    );
+    let penalty =
+        forward_option_lateral_demotion_penalty(0.25, 0.94, 0.20, 0.76, 10.0, 62.0, 120.0, true);
+    assert!(
+        penalty > 1.3,
+        "square recycling should be demoted when a high-quality forward option exists: {penalty}"
+    );
+    assert_eq!(
+        forward_option_lateral_demotion_penalty(3.0, 0.94, 0.20, 0.76, 10.0, 62.0, 120.0, true),
+        0.0,
+        "actual forward targets must not get the lateral demotion"
+    );
+    assert_eq!(
+        forward_option_lateral_demotion_penalty(0.25, 0.55, 0.20, 0.76, 10.0, 62.0, 120.0, true),
+        0.0,
+        "mediocre forward pictures should not force square balls away"
+    );
+    assert_eq!(
+        forward_option_lateral_demotion_penalty(0.25, 0.94, 0.82, 0.78, 8.0, 62.0, 120.0, true),
+        0.0,
+        "a high-completion square pressure escape is still a valid possession action"
+    );
+    assert_eq!(
+        forward_option_lateral_demotion_penalty(0.25, 0.94, 0.20, 0.70, 8.0, 24.0, 120.0, true),
+        0.0,
+        "short final-third combinations should keep their tactical relief"
     );
 }
 
@@ -61668,6 +62013,114 @@ fn pressured_holder_gives_check_to_ball_support_a_probability_floor() {
 }
 
 #[test]
+fn bad_forward_outlet_picture_lifts_pressured_check_to_ball_support() {
+    let _env = support_outlet_env_lock();
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let holder = 6;
+    let runner = 9;
+    let square_left = 7;
+    let square_right = 8;
+    let marker = 15;
+    let pressure = [12, 13, 14];
+    park_players_except(
+        &mut sim,
+        &[
+            holder,
+            runner,
+            square_left,
+            square_right,
+            marker,
+            pressure[0],
+            pressure[1],
+            pressure[2],
+        ],
+    );
+    sim.ball.holder = Some(holder);
+    sim.ball.position = Vec2::new(40.0, 58.0);
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.players[holder].position = sim.ball.position;
+    sim.players[runner].position = Vec2::new(31.0, 74.0);
+    sim.players[square_left].position = Vec2::new(34.0, 54.0);
+    sim.players[square_right].position = Vec2::new(46.0, 54.0);
+    sim.players[marker].position = Vec2::new(32.0, 74.0);
+    sim.players[pressure[0]].position = Vec2::new(43.0, 58.0);
+    sim.players[pressure[1]].position = Vec2::new(41.5, 55.5);
+    sim.players[pressure[2]].position = Vec2::new(43.0, 60.0);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let off_urgency = holder_pressure_support_urgency(&snapshot, Team::Home);
+    let off_check_probability = sim.players[runner]
+        .support_action_options(&snapshot)
+        .into_iter()
+        .find(|option| option.label == "check-to-ball")
+        .map(|option| option.probability)
+        .unwrap_or(0.0);
+
+    let _gate = TestEnvVarGuard::set("DD_SOCCER_ENABLE_PRESSURED_SUPPORT_OUTLET_URGENCY", "1");
+    let on_urgency = holder_pressure_support_urgency(&snapshot, Team::Home);
+    let on_options = sim.players[runner].support_action_options(&snapshot);
+    let on_check = on_options
+        .iter()
+        .find(|option| option.label == "check-to-ball")
+        .expect("runner should expose check-to-ball support");
+
+    assert!(
+        on_urgency > off_urgency + 0.06,
+        "bad forward outlet picture should lift pressured support urgency: off={off_urgency:.3} on={on_urgency:.3}"
+    );
+    assert!(
+        on_check.probability > off_check_probability,
+        "bad forward outlet picture should make checking to the ball more likely: off={off_check_probability:.3} on={on_check:?}; options={on_options:?}"
+    );
+}
+
+#[test]
+fn bad_forward_outlet_picture_does_not_lift_unpressured_support() {
+    let _env = support_outlet_env_lock();
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let holder = 6;
+    let runner = 9;
+    let square_left = 7;
+    let square_right = 8;
+    let marker = 15;
+    let pressure = [12, 13, 14];
+    park_players_except(
+        &mut sim,
+        &[
+            holder,
+            runner,
+            square_left,
+            square_right,
+            marker,
+            pressure[0],
+            pressure[1],
+            pressure[2],
+        ],
+    );
+    sim.ball.holder = Some(holder);
+    sim.ball.position = Vec2::new(40.0, 58.0);
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.players[holder].position = sim.ball.position;
+    sim.players[runner].position = Vec2::new(31.0, 74.0);
+    sim.players[square_left].position = Vec2::new(34.0, 54.0);
+    sim.players[square_right].position = Vec2::new(46.0, 54.0);
+    sim.players[marker].position = Vec2::new(32.0, 74.0);
+    sim.players[pressure[0]].position = Vec2::new(49.0, 58.0);
+    sim.players[pressure[1]].position = Vec2::new(50.0, 56.0);
+    sim.players[pressure[2]].position = Vec2::new(50.0, 60.0);
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let off_urgency = holder_pressure_support_urgency(&snapshot, Team::Home);
+    let _gate = TestEnvVarGuard::set("DD_SOCCER_ENABLE_PRESSURED_SUPPORT_OUTLET_URGENCY", "1");
+    let on_urgency = holder_pressure_support_urgency(&snapshot, Team::Home);
+
+    assert!(
+        on_urgency <= off_urgency + 0.025,
+        "bad forward outlets should not lift check-to-ball support unless holder pressure is severe: off={off_urgency:.3} on={on_urgency:.3}"
+    );
+}
+
+#[test]
 fn marked_nearby_teammates_do_not_reduce_holder_support_urgency() {
     let setup = |marked_outlets: bool| {
         let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
@@ -69747,6 +70200,206 @@ fn pressured_holder_good_outlet_reduces_carry_scores() {
 }
 
 #[test]
+fn forward_pass_risk_gate_caps_overscored_low_completion_passes() {
+    let _env = pass_risk_gate_env_lock();
+    let _gate = TestEnvVarGuard::set("DD_SOCCER_ENABLE_FORWARD_PASS_TURNOVER_RISK_GATE", "1");
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 26_103,
+        ..Default::default()
+    });
+    let holder = 6;
+    sim.ball.holder = Some(holder);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.players[holder].role = PlayerRole::Midfielder;
+    sim.players[holder].skills.passing_completion_rate = 7.8;
+    sim.players[holder].preferences.pass_bias = 1.0;
+    sim.players[holder].preferences.dribble_bias = 1.0;
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let mut risky = snapshot.observation_for(holder);
+    risky.has_ball = true;
+    risky.visible_pass_options = 1;
+    risky.visible_aerial_pass_options = 1;
+    risky.visible_forward_pass_options = 1;
+    risky.expected_pass_completion = 0.04;
+    risky.expected_aerial_pass_completion = 0.50;
+    risky.best_pass_receiver_openness = 0.44;
+    risky.best_forward_pass_receiver_openness = 0.48;
+    risky.best_forward_pass_option_quality = 0.48;
+    risky.best_aerial_pass_receiver_openness = 0.55;
+    risky.aerial_pass_interception_risk = 0.58;
+    risky.perceived_pressure = 0.42;
+    risky.pressure_urgency = 0.48;
+    risky.immediate_dispossession_risk = 0.52;
+    risky.forward_dribble_space_yards = 4.0;
+    risky.yards_to_goal = 48.0;
+    risky.yards_to_own_goal = 72.0;
+
+    let mut clean = risky.clone();
+    clean.expected_pass_completion = 0.84;
+    clean.expected_aerial_pass_completion = 0.76;
+    clean.best_pass_receiver_openness = 0.88;
+    clean.best_forward_pass_receiver_openness = 0.90;
+    clean.best_forward_pass_option_quality = 0.90;
+    clean.best_aerial_pass_receiver_openness = 0.82;
+    clean.aerial_pass_interception_risk = 0.20;
+    clean.perceived_pressure = 0.20;
+    clean.pressure_urgency = 0.18;
+    clean.immediate_dispossession_risk = 0.18;
+
+    let player = sim.players[holder].clone();
+    let directive = TeamTacticalDirective::neutral(
+        Team::Home,
+        DEFAULT_FIELD_WIDTH_YARDS,
+        DEFAULT_FIELD_LENGTH_YARDS,
+    );
+    let risky_options = player.possession_action_options(
+        &risky,
+        &directive,
+        1,
+        1,
+        false,
+        0.1,
+        DEFAULT_FIELD_WIDTH_YARDS,
+    );
+    let clean_options = player.possession_action_options(
+        &clean,
+        &directive,
+        1,
+        1,
+        false,
+        0.1,
+        DEFAULT_FIELD_WIDTH_YARDS,
+    );
+    let risky_pass = action_option_score(&risky_options, "pass1");
+    let clean_pass = action_option_score(&clean_options, "pass1");
+    let risky_escape = action_option_score(&risky_options, "protect-ball")
+        .max(action_option_score(&risky_options, "side-step"))
+        .max(action_option_score(&risky_options, "carry-forward"));
+    assert!(
+        risky_pass <= 8.0,
+        "low-completion high-risk forward pass should be capped into normal option range: pass={risky_pass} options={risky_options:?}"
+    );
+    assert!(
+        clean_pass > risky_pass * 3.0,
+        "clean same-team outlet should survive the risk gate: clean={clean_pass} risky={risky_pass} risky_options={risky_options:?} clean_options={clean_options:?}"
+    );
+    assert!(
+        risky_escape > risky_pass * 0.45,
+        "escape/retain options must be competitive with the capped speculative pass: escape={risky_escape} pass={risky_pass} options={risky_options:?}"
+    );
+}
+
+#[test]
+fn severe_forward_pass_score_cap_tames_live_trace_like_panic_pass() {
+    let _env = pass_risk_gate_env_lock();
+    let gate = TestEnvVarGuard::set("DD_SOCCER_ENABLE_SEVERE_FORWARD_PASS_SCORE_CAP", "1");
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 26_104,
+        ..Default::default()
+    });
+    let holder = 6;
+    sim.ball.holder = Some(holder);
+    sim.ball.position = sim.players[holder].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.players[holder].role = PlayerRole::Midfielder;
+    sim.players[holder].skills.passing_completion_rate = 8.2;
+    sim.players[holder].preferences.pass_bias = 1.0;
+    sim.players[holder].preferences.dribble_bias = 1.0;
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let mut risky = snapshot.observation_for(holder);
+    risky.has_ball = true;
+    risky.visible_pass_options = 1;
+    risky.visible_aerial_pass_options = 1;
+    risky.visible_forward_pass_options = 1;
+    risky.expected_pass_completion = 0.18;
+    risky.expected_aerial_pass_completion = 0.62;
+    risky.best_pass_receiver_openness = 0.42;
+    risky.best_forward_pass_receiver_openness = 0.48;
+    risky.best_forward_pass_option_quality = 0.48;
+    risky.best_aerial_pass_receiver_openness = 0.55;
+    risky.aerial_pass_interception_risk = 0.60;
+    risky.perceived_pressure = 0.87;
+    risky.pressure_urgency = 0.84;
+    risky.immediate_dispossession_risk = 0.69;
+    risky.forward_dribble_space_yards = 4.0;
+    risky.yards_to_goal = 48.0;
+    risky.yards_to_own_goal = 72.0;
+
+    let mut clean = risky.clone();
+    clean.expected_pass_completion = 0.82;
+    clean.expected_aerial_pass_completion = 0.78;
+    clean.best_pass_receiver_openness = 0.88;
+    clean.best_forward_pass_receiver_openness = 0.90;
+    clean.best_forward_pass_option_quality = 0.90;
+    clean.best_aerial_pass_receiver_openness = 0.84;
+    clean.aerial_pass_interception_risk = 0.18;
+    clean.perceived_pressure = 0.24;
+    clean.pressure_urgency = 0.22;
+    clean.immediate_dispossession_risk = 0.18;
+
+    let player = sim.players[holder].clone();
+    let directive = TeamTacticalDirective::neutral(
+        Team::Home,
+        DEFAULT_FIELD_WIDTH_YARDS,
+        DEFAULT_FIELD_LENGTH_YARDS,
+    );
+    let risky_options = player.possession_action_options(
+        &risky,
+        &directive,
+        1,
+        1,
+        false,
+        0.1,
+        DEFAULT_FIELD_WIDTH_YARDS,
+    );
+    let clean_options = player.possession_action_options(
+        &clean,
+        &directive,
+        1,
+        1,
+        false,
+        0.1,
+        DEFAULT_FIELD_WIDTH_YARDS,
+    );
+    let risky_pass = action_option_score(&risky_options, "pass1");
+    let clean_pass = action_option_score(&clean_options, "pass1");
+    let risky_escape = action_option_score(&risky_options, "protect-ball")
+        .max(action_option_score(&risky_options, "side-step"))
+        .max(action_option_score(&risky_options, "carry-forward"));
+    drop(gate);
+    let off_gate = TestEnvVarGuard::set("DD_SOCCER_ENABLE_SEVERE_FORWARD_PASS_SCORE_CAP", "0");
+    let clean_without_gate = player.possession_action_options(
+        &clean,
+        &directive,
+        1,
+        1,
+        false,
+        0.1,
+        DEFAULT_FIELD_WIDTH_YARDS,
+    );
+    let clean_pass_without_gate = action_option_score(&clean_without_gate, "pass1");
+    drop(off_gate);
+
+    assert!(
+        risky_pass <= 5.8,
+        "live-trace-like low-completion panic pass should be capped: pass={risky_pass} options={risky_options:?}"
+    );
+    assert!(
+        (clean_pass - clean_pass_without_gate).abs() < 1e-9,
+        "clean same-team outlet must not be flattened by the severe cap: clean={clean_pass} without_gate={clean_pass_without_gate}"
+    );
+    assert!(
+        risky_escape > risky_pass * 0.35,
+        "retain/escape choices should compete after the panic-pass cap: escape={risky_escape} pass={risky_pass}"
+    );
+}
+
+#[test]
 fn pressured_bad_outlet_prefers_escape_over_panic_release_or_bad_shot() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -71571,6 +72224,8 @@ fn unpressured_holder_with_clean_pass_throws_fewer_feints() {
 
 #[test]
 fn pressured_holder_without_good_outlet_prefers_escape_over_panic_pass() {
+    let _env = pass_risk_gate_env_lock();
+    let _gate = TestEnvVarGuard::set("DD_SOCCER_ENABLE_BAD_OUTLET_ESCAPE_PANIC_CAP", "1");
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
         seed: 26_136,
@@ -95595,6 +96250,48 @@ fn pass_completion_head_accepts_legacy_six_feature_samples() {
 }
 
 #[test]
+fn pass_completion_forward_weighting_emphasizes_forward_risk_region() {
+    let sample = |forward_yards: f32, pressure: f32, completed: bool| {
+        let mut features = vec![0.0f32; SOCCER_PASS_COMPLETION_FEATURE_DIM];
+        features[SOCCER_MOMENT_EMBEDDING_DIM] = 18.0 / 60.0;
+        features[SOCCER_MOMENT_EMBEDDING_DIM + 1] = forward_yards / 40.0;
+        features[SOCCER_MOMENT_EMBEDDING_DIM + 3] = pressure;
+        SoccerPassOutcomeSample {
+            features,
+            completed,
+            own_half: true,
+        }
+    };
+    let safe_completed = sample(0.0, 0.10, true);
+    let forward_completed = sample(16.0, 0.30, true);
+    let forward_failed = sample(16.0, 0.85, false);
+    let backward_completed = sample(-10.0, 0.10, true);
+
+    assert_eq!(
+        pass_completion_training_sample_weight_for(&forward_failed, false),
+        1.0
+    );
+    let safe_weight = pass_completion_training_sample_weight_for(&safe_completed, true);
+    let forward_completed_weight =
+        pass_completion_training_sample_weight_for(&forward_completed, true);
+    let forward_failed_weight = pass_completion_training_sample_weight_for(&forward_failed, true);
+    let backward_weight = pass_completion_training_sample_weight_for(&backward_completed, true);
+
+    assert!(
+        forward_completed_weight > safe_weight,
+        "completed forward passes should have more influence than safe square completions: {forward_completed_weight} <= {safe_weight}"
+    );
+    assert!(
+        forward_failed_weight > forward_completed_weight,
+        "failed pressured forward passes should be strongest for calibration: {forward_failed_weight} <= {forward_completed_weight}"
+    );
+    assert!(
+        backward_weight < safe_weight,
+        "backward completions should not dominate the forward-completion curriculum: {backward_weight} >= {safe_weight}"
+    );
+}
+
+#[test]
 fn pass_completion_corpus_loaded_from_postgres_trains_a_usable_head() {
     // Item: "get the training data to load from postgres." The pass-outcome corpus that
     // `SoccerStore::load_pass_outcome_samples` returns must actually feed training. Mirror that
@@ -97521,6 +98218,16 @@ fn team_advance_upfield_space_qualifies_truth_table() {
 }
 
 fn team_advance_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn pass_risk_gate_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn support_outlet_env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
