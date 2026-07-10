@@ -982,7 +982,10 @@ impl World {
         let me = players(team, self)[idx].pos;
         let team_owns = matches!(self.owner, Some(o) if o.team == team);
         let target = match a {
-            A_CHASE => self.ball,
+            // CHASE: anticipate. If the ball is moving (a pass/loose ball), aim at
+            // the INTERCEPT point on its trajectory — where the defender can meet
+            // it — rather than its current spot; otherwise go to the carrier.
+            A_CHASE => self.intercept_point(me),
             // SUPPORT: push UPFIELD into open space (attacking run).
             A_SUPPORT => self.open_space_target(team, idx, 1.2),
             // SPREAD: find open space; drift up/down field per possession.
