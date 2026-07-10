@@ -191,6 +191,7 @@ impl World {
             intended_receiver: None,
             pass_kick_x: 0.0,
             last_pass_gain_a: 0.0,
+            pass_streak_a: 0,
         };
         w.kickoff(Team::A);
         w
