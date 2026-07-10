@@ -138,15 +138,6 @@ fn forward_fraction(team: Team, p: Vec2, field_length: f64) -> f64 {
     (0.5 + team.attack_dir() * centered).clamp(0.0, 1.0)
 }
 
-/// Threat surface entry point for territorial potentials and xT terminal shaping.
-/// With `DD_SOCCER_ENABLE_LEARNED_EPV_POTENTIAL` and a loaded grid it uses the
-/// outcome-grounded learned-EPV surface; otherwise it falls back to the closed-form
-/// [`expected_threat`] seed. The per-pass EPV bonus remains separately gated by
-/// `DD_SOCCER_ENABLE_LEARNED_EPV`.
-pub fn threat_at(team: Team, p: Vec2, field_width: f64, field_length: f64) -> f64 {
-    threat_potential(team, p, field_width, field_length)
-}
-
 /// Closed-form **expected threat** of possessing the ball at `p` for `team`,
 /// oriented to that team's attacking direction. Bounded to roughly `[0, 1.8]`;
 /// only relative values matter (the reward uses differences).
@@ -209,10 +200,12 @@ fn learned_epv_grid() -> Option<&'static LearnedEpvGrid> {
     .as_ref()
 }
 
-/// Gate-free grid lookup: the calibrated EPV of holding the ball at `p` for `team`, or
-/// `None` when no grid is loaded. Shared by the pass-bonus gate ([`learned_epv`]) and the
-/// potential gate ([`threat_potential`]) so each can be enabled independently.
-fn learned_epv_lookup(team: Team, p: Vec2, field_width: f64, field_length: f64) -> Option<f64> {
+/// Learned expected-possession-value of holding the ball at `p` for `team`, from the fitted grid.
+/// `None` when the gate is off or no grid is loaded (callers fall back to the closed-form seed).
+pub(crate) fn learned_epv(team: Team, p: Vec2, field_width: f64, field_length: f64) -> Option<f64> {
+    if !dd_soccer_enable_learned_epv() {
+        return None;
+    }
     let g = learned_epv_grid()?;
     let fwd = forward_fraction(team, p, field_length); // 0 = own goal .. 1 = opponent goal
     let lat = if field_width > 0.0 && field_width.is_finite() && p.x.is_finite() {
@@ -223,73 +216,6 @@ fn learned_epv_lookup(team: Team, p: Vec2, field_width: f64, field_length: f64) 
     let row = ((fwd * g.rows as f64) as usize).min(g.rows.saturating_sub(1));
     let col = ((lat * g.cols as f64) as usize).min(g.cols.saturating_sub(1));
     g.grid.get(row).and_then(|r| r.get(col)).copied()
-}
-
-/// Learned expected-possession-value of holding the ball at `p` for `team`, from the fitted grid.
-/// `None` when the gate is off or no grid is loaded (callers fall back to the closed-form seed).
-pub(crate) fn learned_epv(team: Team, p: Vec2, field_width: f64, field_length: f64) -> Option<f64> {
-    if !dd_soccer_enable_learned_epv() {
-        return None;
-    }
-    learned_epv_lookup(team, p, field_width, field_length)
-}
-
-/// Independent gate for routing the learned-EPV grid into the territorial **potential**
-/// `team_expected_threat` (and the replay-credit potential), replacing the closed-form
-/// `expected_threat` seed. Deliberately separate from `DD_SOCCER_ENABLE_LEARNED_EPV` (which
-/// only feeds the per-completed-pass bonus) so the "outcome-grounded potential" lever — the
-/// fix for territory-without-conversion — can be A/B'd in isolation. Default-off ⇒ the
-/// process is byte-identical to the closed-form seed.
-pub(crate) fn dd_soccer_enable_learned_epv_potential() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        matches!(
-            std::env::var("DD_SOCCER_ENABLE_LEARNED_EPV_POTENTIAL")
-                .ok()
-                .as_deref()
-                .map(str::trim),
-            Some("1") | Some("true") | Some("yes") | Some("on")
-        )
-    })
-}
-
-/// Grid floor for own-half/high-turnover cells. Shifting by this value keeps the
-/// learned potential non-negative and comparable to the closed-form `[0, ~1.8]`
-/// seed after scaling.
-const LEARNED_EPV_POTENTIAL_MIN: f64 = -0.15;
-
-/// Multiplier applied to the shifted learned-EPV grid when it feeds the territorial
-/// potential. The deploy grid spans roughly `[-0.15, 0.205]`; default 5.0 maps that
-/// to about `[0, 1.775]`, so the A/B isolates the potential's shape
-/// (outcome-grounded vs raw territory) rather than silently shrinking reward scale.
-pub(crate) fn learned_epv_potential_scale() -> f64 {
-    use std::sync::OnceLock;
-    static V: OnceLock<f64> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("DD_SOCCER_LEARNED_EPV_POTENTIAL_SCALE")
-            .ok()
-            .and_then(|v| v.trim().parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v > 0.0)
-            .unwrap_or(5.0)
-            .clamp(0.1, 100.0)
-    })
-}
-
-/// Per-cell threat value used to build the territorial **potential** Φ. With the potential
-/// gate on and a grid loaded this is the shifted/scaled outcome-grounded learned
-/// EPV — a cell near the opponent box (chains that end in shots/goals) scores
-/// high, a turnover-prone deep cell scores low — so the telescoping PBRS term
-/// `γΦ(s') − Φ(s)` rewards chance creation rather than raw territory. Falls back
-/// to the closed-form [`expected_threat`] seed when the gate is off or no grid is
-/// present.
-pub(crate) fn threat_potential(team: Team, p: Vec2, field_width: f64, field_length: f64) -> f64 {
-    if dd_soccer_enable_learned_epv_potential() {
-        if let Some(v) = learned_epv_lookup(team, p, field_width, field_length) {
-            return (v - LEARNED_EPV_POTENTIAL_MIN) * learned_epv_potential_scale();
-        }
-    }
-    expected_threat(team, p, field_width, field_length)
 }
 
 /// ΔEPV of a pass from `origin` to `target` for `team`: how much learned possession value (danger)
@@ -424,7 +350,7 @@ pub fn team_expected_threat(snapshot: &WorldSnapshot, team: Team) -> f64 {
                 Team::Home => home_control,
                 Team::Away => 1.0 - home_control,
             };
-            let threat = threat_at(team, cell, field_width, field_length);
+            let threat = expected_threat(team, cell, field_width, field_length);
             total += control * threat;
         }
     }
@@ -478,19 +404,18 @@ fn pitch_control_home_points(points: &[XtControlPoint], cell: Vec2) -> f64 {
     }
 }
 
-/// Control-weighted threat **value** of `team` arriving at `p`: the
-/// [`threat_at`] surface (learned EPV when available, else closed-form xT)
-/// gated by the probability `team` actually controls that point (the
-/// time-to-arrive race). This is the cost-to-go surface the xT terminal
-/// shaping ascends — a player is only pulled toward valuable space it can
-/// realistically grip, not toward unreachable danger zones.
+/// Control-weighted threat **value** of `team` arriving at `p`: the closed-form
+/// [`expected_threat`] gated by the probability `team` actually controls that
+/// point (the time-to-arrive race). This is the cost-to-go surface the xT
+/// terminal shaping ascends — a player is only pulled toward valuable space it
+/// can realistically grip, not toward unreachable danger zones.
 fn control_weighted_threat(points: &[XtControlPoint], team: Team, p: Vec2, w: f64, l: f64) -> f64 {
     let home_control = pitch_control_home_points(points, p);
     let control = match team {
         Team::Home => home_control,
         Team::Away => 1.0 - home_control,
     };
-    control * threat_at(team, p, w, l)
+    control * expected_threat(team, p, w, l)
 }
 
 /// xT **terminal-cost** shaping of a per-player MPC reference point (the AV
@@ -584,31 +509,6 @@ mod tests {
     const W: f64 = DEFAULT_FIELD_WIDTH_YARDS;
     const L: f64 = DEFAULT_FIELD_LENGTH_YARDS;
     static PITCH_VALUE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[test]
-    fn threat_potential_off_is_byte_identical_seed() {
-        // Move 1a safety: with the potential gate unset (the default / CI path), the
-        // territorial potential MUST be bit-for-bit the closed-form `expected_threat`
-        // seed — routing the learned-EPV grid in is opt-in and byte-identical off.
-        let _g = PITCH_VALUE_ENV_LOCK.lock().unwrap();
-        assert!(std::env::var("DD_SOCCER_ENABLE_LEARNED_EPV_POTENTIAL").is_err());
-        for &(fx, fy) in &[
-            (0.5, 0.08),
-            (0.3, 0.5),
-            (0.5, 0.85),
-            (0.5, 0.97),
-            (0.02, 0.9),
-        ] {
-            let p = Vec2::new(W * fx, L * fy);
-            for team in [Team::Home, Team::Away] {
-                assert_eq!(
-                    threat_potential(team, p, W, L),
-                    expected_threat(team, p, W, L),
-                    "gate-off must equal the seed at ({fx},{fy}) for {team:?}"
-                );
-            }
-        }
-    }
 
     #[test]
     fn expected_threat_rises_toward_opponent_goal() {

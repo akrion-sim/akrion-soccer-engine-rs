@@ -154,7 +154,7 @@ alone cannot predict.
   passes `Some(..)` from the final score only when the gate is on.
 - **Gate:** `DD_SOCCER_ENABLE_MATCH_OUTCOME_REWARD` (`match_outcome_reward_enabled()`),
   default-OFF ⇒ `None` ⇒ byte-identical replay.
-- **Magnitudes** (`WIN=200.0`, `PER_GOAL_MARGIN=15.0`, `MARGIN_CAP=5`) are a starting point
+- **Magnitudes** (`WIN=8.0`, `PER_GOAL_MARGIN=1.5`, `MARGIN_CAP=4`) are a starting point
   and **must be A/B'd through the promotion eval gate below**, never tuned on raw reward.
 
 ### Promotion eval gate — held-out Elo / cross-play / exploitability (pure, always-on tool)

@@ -118,7 +118,3 @@ required-features = ["live-server"]
 [[bin]]
 name = "measure_pass_completion"
 path = "src/bin/measure_pass_completion.rs"
-
-[[bin]]
-name = "rollout_poc"
-path = "src/bin/rollout_poc.rs"

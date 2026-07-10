@@ -8,19 +8,6 @@
 > [`learnability-conversion-roadmap.md`](learnability-conversion-roadmap.md) Priority 1 (which the
 > repo itself flags as DORMANT / highest-ROI).
 
-> **⚠️ STATUS (verified against HEAD `be11b4d`, 2026-07-09): Parts A & B are now IMPLEMENTED (gated,
-> default-off) on this branch (`feature/action-param-features-and-capacity`).** Part A =
-> `SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM = 10` (soccer.rs:4644), wired into
-> `soccer_neural_transition_features_with_action` (soccer.rs:46111-46130), gate
-> `DD_SOCCER_ENABLE_ACTION_PARAM_FEATURES` (soccer.rs:63687). Part B = candidate assembly expands
-> pass/aerial targets into discretized kick-power-bucket variants the neural MCTS/critic ranks
-> (world.rs:14296, helpers world.rs:215-482, test `discretized_kick_gate_expands_pass_targets_into_power_bucket_candidates`
-> world.rs:6978), gate `DD_SOCCER_ENABLE_DISCRETIZED_KICK`. Both still need a **full retrain + eval**
-> to prove out (existing nets never saw them). **Part C (break tabular imitation) remains the open
-> structural piece.** Ceilings #1 and #3 below now describe the **gate-OFF / legacy** path; body line
-> refs have drifted (`AgentActionTargetTrace` soccer.rs:8067, action hash soccer.rs:43320, family bits
-> soccer.rs:43329).
-
 ## Why un-collapsing the value can't break parity
 
 Three compounding structural ceilings, all verified in code:
@@ -28,10 +15,9 @@ Three compounding structural ceilings, all verified in code:
 1. **The net now has a partial learned parameter surface, but not the whole one.**
    Kick-power bucket labels are present in `SOCCER_POLICY_ACTIONS` and MCTS can expand pass,
    aerial-pass, shot, and first-time-shot bucket variants behind `DD_SOCCER_ENABLE_DISCRETIZED_KICK`.
-   That fixes the older "never reaches candidates" diagnosis for speed buckets. With the gate off,
-   pass/shoot parameters still come from the continuous heuristic scan; with the gate on, the net can
-   rank speed-bucket variants. Direction, curve, elevation, and bounded aim are still mostly analytic,
-   and bucket selection still needs entropy/causal-change telemetry.
+   That fixes the older "never reaches candidates" diagnosis for speed buckets. Direction, curve,
+   elevation, and bounded aim are still mostly analytic, and bucket selection still needs entropy
+   telemetry/proof.
 2. **The value regresses onto the *tabular* Q.** Target = `r + γ·max_next` with `max_next =`
    tabular `best_value_hierarchical` ([world.rs](../src/des/general/soccer/world.rs)). A value
    trained to match the tabular Q **cannot exceed the analytic ceiling** — it's imitation, not
@@ -48,9 +34,9 @@ blindside, magnus, dribble, press) + gated tactical features. The core learnable
 and learned reward (P2) stayed dormant. **The engine got better at analytic play — raising the bar
 the net must beat — while the net was never given the tools to beat it.**
 
-## The fix — three parts (A & B now implemented behind gates; need a retrain to evaluate)
+## The fix — three parts (all real, needs a retrain to evaluate)
 
-### Part A — structured action-param feature block (append-only) — ✅ IMPLEMENTED (gate `DD_SOCCER_ENABLE_ACTION_PARAM_FEATURES`)
+### Part A — structured action-param feature block (append-only)
 Add a `SOCCER_NEURAL_ACTION_PARAM_FEATURE_DIM` block (append-only, so old nets zero-pad — the
 established migration pattern) encoding the candidate's **aim**, from `AgentActionTargetTrace.point`
 relative to the ball/actor: target dx/dy (normalized), distance, forward-ness (toward attacking
@@ -60,9 +46,8 @@ over** — even for existing candidates.
 
 ### Part B — discretized-kick variant candidates
 The first slice of this is already implemented for speed: the actor vocabulary has `40` kick-power
-bucket labels and MCTS can add pass/aerial-pass/shot/first-time-shot bucket variants when
-`DD_SOCCER_ENABLE_DISCRETIZED_KICK` is on. The remaining work is to prove the selected buckets change
-behavior and then add the missing structured dimensions:
+bucket labels and MCTS can add bucket variants when `DD_SOCCER_ENABLE_DISCRETIZED_KICK` is on.
+The remaining work is to add the missing structured dimensions:
 
 - direction/aim as a bounded offset around the current target, not a free absolute 36-way choice;
 - curve and elevation as small masked heads;

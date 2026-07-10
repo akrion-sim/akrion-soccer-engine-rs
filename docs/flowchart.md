@@ -21,7 +21,7 @@ problem it is actually good at, rather than one big network:
 | **MPC** | one player | acceleration/velocity to reach the slot, bending around bodies | short receding horizon | no (model) | `WorldSnapshot::mpc_desired_velocity` (`PlanarPointMassMpc`) |
 | **MDP / POMDP** | one player | the action: pass / shoot / dribble / move / tackle | this decision | yes (Q + shaping) | `possession_action_options`, deferred reward transitions |
 | **Neural nets** | one player | scores/values for the options, plus aux predictions | per tick | yes (PPO / actor-critic) | `SoccerPolicyHead`, value critic, pass / line-depth heads, world model |
-| **Evolution / GA** | whole policy | which generation survives & promotes | across games / tournaments | yes (selection) | GA self-play (pop 6, max 16), `main_soccer_tournament_run`, promotion gate |
+| **Evolution / GA** | whole policy | which generation survives & promotes | across games / tournaments | yes (selection) | GA self-play (pop 16), `main_soccer_tournament_run`, promotion gate |
 | **Vectors / HNSW** | full field | nearest similar situations | n/a | embedding | config-similarity retrieval (22 + ball embedding) |
 
 > Rule of thumb: **LP/IPM decides the shape, MDP/POMDP (scored by neural nets)
@@ -84,15 +84,15 @@ the fitness test. Both feed one promotion gate and one Postgres store.
 flowchart LR
     subgraph INNER["INNER LOOP · gradient (fast, in-match)"]
         TRANS["Transitions<br/>(state, action, reward)"]
-        NEU["Neural learner (threaded)<br/>actor-critic + GAE advantage<br/>PPO clip, multi-epoch<br/>replay 512 / batch 16 / lr 0.015 / hidden 128"]
+        NEU["Neural learner (threaded)<br/>actor-critic + GAE advantage<br/>PPO clip, multi-epoch<br/>replay 2048 / batch 32 / lr 0.015 / hidden 24"]
         AUX["Auxiliary heads<br/>value critic · pass-completion ·<br/>back-four / midfield line-depth · world model"]
         TRANS --> NEU
         TRANS --> AUX
     end
 
     subgraph OUTER["OUTER LOOP · evolution (slow, gradient-free)"]
-        POP["Population (pop 6, max 16)"]
-        GA["GA self-play — every 10 games<br/>mutate / crossover / elite"]
+        POP["Population (pop 16)"]
+        GA["GA self-play — every 5 games<br/>mutate / crossover / elite"]
         TOUR["Tournament farm<br/>main_soccer_tournament_run<br/>bracket selection"]
         POP --> GA --> TOUR --> POP
     end

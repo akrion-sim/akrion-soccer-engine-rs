@@ -27,9 +27,8 @@ use std::time::{Duration, Instant};
 use soccer_engine::des::general::soccer::{
     enable_deterministic_formation_lp, learned_mpc_objective_enabled, MatchConfig,
     SoccerMarlAlgorithm, SoccerMatch, SoccerMpcObjectiveHead, SoccerNeuralLearningBackend,
-    SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot, SoccerPassCompletionHead,
-    SoccerQPolicyOptions, SoccerTeamQPolicies, DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
-    PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS,
+    SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot, SoccerQPolicyOptions,
+    SoccerTeamQPolicies, DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
 };
 
 /// One game's measured offense KPIs (both teams summed — self-play is symmetric).
@@ -39,16 +38,12 @@ struct GameKpis {
     shots: f64,
     shots_on_target: f64,
     shots_after_pass: f64,
-    passes_attempted: f64,
     passes_completed: f64,
     passes_forward: f64,
-    pass_turnovers: f64,
     pass_chains: f64,
     pass_chain_gain_yards: f64,
     pass_chains_net_loss: f64,
     crosses_completed: f64,
-    dribble_beats: f64,
-    dribble_decisions: f64,
 }
 
 impl GameKpis {
@@ -57,16 +52,12 @@ impl GameKpis {
         self.shots += other.shots;
         self.shots_on_target += other.shots_on_target;
         self.shots_after_pass += other.shots_after_pass;
-        self.passes_attempted += other.passes_attempted;
         self.passes_completed += other.passes_completed;
         self.passes_forward += other.passes_forward;
-        self.pass_turnovers += other.pass_turnovers;
         self.pass_chains += other.pass_chains;
         self.pass_chain_gain_yards += other.pass_chain_gain_yards;
         self.pass_chains_net_loss += other.pass_chains_net_loss;
         self.crosses_completed += other.crosses_completed;
-        self.dribble_beats += other.dribble_beats;
-        self.dribble_decisions += other.dribble_decisions;
     }
 
     fn scaled(&self, inv: f64) -> GameKpis {
@@ -75,44 +66,26 @@ impl GameKpis {
             shots: self.shots * inv,
             shots_on_target: self.shots_on_target * inv,
             shots_after_pass: self.shots_after_pass * inv,
-            passes_attempted: self.passes_attempted * inv,
             passes_completed: self.passes_completed * inv,
             passes_forward: self.passes_forward * inv,
-            pass_turnovers: self.pass_turnovers * inv,
             pass_chains: self.pass_chains * inv,
             pass_chain_gain_yards: self.pass_chain_gain_yards * inv,
             pass_chains_net_loss: self.pass_chains_net_loss * inv,
             crosses_completed: self.crosses_completed * inv,
-            dribble_beats: self.dribble_beats * inv,
-            dribble_decisions: self.dribble_decisions * inv,
         }
     }
 
     fn print_row(&self, label: &str) {
-        let pass_completion = ratio(self.passes_completed, self.passes_attempted);
-        let shot_accuracy = ratio(self.shots_on_target, self.shots);
-        let net_forward = self.passes_forward - self.pass_turnovers;
-        let dribble_beat_per_100 = ratio(self.dribble_beats * 100.0, self.dribble_decisions);
         println!(
-            "{label:<14} pass_completion={:.3} passes={:.0}/{:.0} fwd_passes={:.0} \
-             pass_turnovers={:.1} net_forward={:.1} goals={:.2} shots={:.1} \
-             on_target={:.1} shot_acc={:.3} shot_after_pass={:.1} dribble_beats={:.1} \
-             dribble_decisions={:.0} dribble_beats_per_100_decisions={:.2} chains={:.1} \
-             chain_gain_yds={:.1} chain_net_loss={:.2} crosses={:.1}",
-            pass_completion,
-            self.passes_completed,
-            self.passes_attempted,
-            self.passes_forward,
-            self.pass_turnovers,
-            net_forward,
+            "{label:<14} goals={:.2} shots={:.1} on_target={:.1} shot_after_pass={:.1} \
+             passes={:.0} fwd_passes={:.0} chains={:.1} chain_gain_yds={:.1} \
+             chain_net_loss={:.2} crosses={:.1}",
             self.goals,
             self.shots,
             self.shots_on_target,
-            shot_accuracy,
             self.shots_after_pass,
-            self.dribble_beats,
-            self.dribble_decisions,
-            dribble_beat_per_100,
+            self.passes_completed,
+            self.passes_forward,
             self.pass_chains,
             self.pass_chain_gain_yards,
             self.pass_chains_net_loss,
@@ -130,47 +103,6 @@ fn env_on(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn env_f64(name: &str) -> f64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<f64>().ok())
-        .filter(|value| value.is_finite())
-        .unwrap_or(0.0)
-}
-
-fn env_f64_or(name: &str, default: f64) -> f64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<f64>().ok())
-        .filter(|value| value.is_finite())
-        .unwrap_or(default)
-}
-
-fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .unwrap_or(default)
-}
-
-fn ratio(numerator: f64, denominator: f64) -> f64 {
-    if denominator.abs() > 1e-9 {
-        numerator / denominator
-    } else {
-        0.0
-    }
-}
-
-fn is_dribble_decision(action: &str) -> bool {
-    let compact = action.trim().to_ascii_lowercase();
-    compact == "dribble"
-        || compact.starts_with("dribble-")
-        || compact == "carry-forward"
-        || compact == "carry-out-left"
-        || compact == "carry-out-right"
-        || compact == "open-pass-lane"
-}
-
 fn main() {
     // Reproducible A/B: deterministic formation LP so the same seed yields the same match.
     enable_deterministic_formation_lp();
@@ -182,8 +114,6 @@ fn main() {
         .get(3)
         .and_then(|s| s.parse().ok())
         .unwrap_or(0x5EED_0000);
-    let warmup_games = env_usize("DD_SOCCER_AB_WARMUP_GAMES", 0).min(256);
-    let total_games = warmup_games.saturating_add(games);
 
     // Inline backend keeps neural training synchronous (deterministic); MAPPO actor on so the
     // trained policy actually drives play.
@@ -197,8 +127,7 @@ fn main() {
 
     println!("===== LEARNING A/B HARNESS =====");
     println!(
-        "games={games} warmup_games={warmup_games} total_games={total_games} \
-         minutes={minutes} seed_base=0x{seed_base:08X} \
+        "games={games} minutes={minutes} seed_base=0x{seed_base:08X} \
          backend=Inline marl=Mappo team_reward_share={:.3}",
         neural.mappo_team_reward_share
     );
@@ -214,43 +143,10 @@ fn main() {
         "gates: learned_mpc_objective={}",
         learned_mpc_objective_enabled()
     );
-    println!(
-        "gates: dp_critic_target={} dp_bootstrap={} learned_epv={} learned_pass_completion={} \
-         learned_pass_receiver={} learned_pass_receiver_strict={} neural_pass_space={} \
-         deferred_pass_credit={} neural_mcts={} league_neural_mcts={} xt_terminal_cost={} mpc_pass={} \
-         pass_completion_score_weight={:.2} pass_turnover_penalty_scale={:.2} \
-         pass_target_completion_primary_scale={:.2} learned_curve={} mpc_objective_epochs={}",
-        env_on("DD_SOCCER_ENABLE_DP_CRITIC_TARGET"),
-        env_on("DD_SOCCER_ENABLE_DP_BOOTSTRAP"),
-        env_on("DD_SOCCER_ENABLE_LEARNED_EPV"),
-        env_on("DD_SOCCER_ENABLE_LEARNED_PASS_COMPLETION"),
-        env_on("DD_SOCCER_ENABLE_LEARNED_PASS_RECEIVER"),
-        env_on("DD_SOCCER_ENABLE_LEARNED_PASS_RECEIVER_STRICT_FALLBACK"),
-        env_on("DD_SOCCER_ENABLE_NEURAL_PASS_SPACE"),
-        env_on("DD_SOCCER_ENABLE_DEFERRED_PASS_CREDIT"),
-        env_on("SOCCER_NEURAL_MCTS_ENABLED"),
-        env_on("SOCCER_LEAGUE_NEURAL_MCTS_ENABLED"),
-        env_on("DD_SOCCER_ENABLE_XT_TERMINAL_COST"),
-        env_on("DD_SOCCER_ENABLE_MPC_PASS"),
-        env_f64("DD_SOCCER_PASS_COMPLETION_SCORE_WEIGHT"),
-        env_f64("DD_SOCCER_PASS_TURNOVER_PENALTY_SCALE"),
-        env_f64("DD_SOCCER_PASS_TARGET_COMPLETION_PRIMARY_SCALE"),
-        env_on("DD_SOCCER_ENABLE_LEARNED_CURVE"),
-        env_usize("DD_SOCCER_MPC_OBJECTIVE_EPOCHS", 4),
-    );
-    println!(
-        "knobs: learned_receiver_min_net_forward_quality={:.2} \
-         learned_mpc_pass_impossible_probability={:.2} \
-         pass_completion_primary_score_weight={:.2}",
-        env_f64_or("SOCCER_LEARNED_PASS_RECEIVER_MIN_NET_FORWARD_QUALITY", 0.26),
-        env_f64_or("SOCCER_LEARNED_MPC_PASS_IMPOSSIBLE_PROBABILITY", 0.18),
-        env_f64_or("DD_SOCCER_PASS_COMPLETION_SCORE_WEIGHT", 0.0),
-    );
 
     // Carried across games within this process (the real learner's per-process pattern).
     let mut policies = Arc::new(SoccerTeamQPolicies::new(SoccerQPolicyOptions::default()));
     let mut snapshot: Option<SoccerNeuralNetworkSnapshot> = None;
-    let mut pass_completion_head: Option<SoccerPassCompletionHead> = None;
     // Learned MPC execution-objective head, carried + RWR-trained across games (mirrors the
     // pass-completion head's per-process carry). Seeded up-front when the gate is on so game 1
     // already captures cold-exploration samples (the head must exist for the residual to apply);
@@ -265,7 +161,7 @@ fn main() {
     let mut per_game: Vec<GameKpis> = Vec::with_capacity(games);
     let started = Instant::now();
 
-    for g in 0..total_games {
+    for g in 0..games {
         let mut config = MatchConfig {
             duration_seconds: minutes * 60.0,
             learning_enabled: true,
@@ -284,48 +180,16 @@ fn main() {
                 eprintln!("game {g}: failed to install snapshot: {e}");
             }
         }
-        if let Some(head) = pass_completion_head.as_ref() {
-            sim.set_pass_completion_head(head.clone());
-        }
         // Install the carried executor head so this game's passes get the learned aim/lead residual
         // (gated; a no-op only when DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE is falsey).
         if let Some(head) = mpc_objective_head.as_ref() {
             sim.set_mpc_objective_head(head.clone());
         }
 
-        let mut game_dribble_decision_ticks = 0_u64;
         for _ in 0..total_ticks {
             sim.run_time_step();
-            for player in &sim.players {
-                if let Some(decision) = player.last_decision.as_ref() {
-                    if is_dribble_decision(&decision.action) {
-                        game_dribble_decision_ticks = game_dribble_decision_ticks.saturating_add(1);
-                    }
-                }
-            }
         }
         sim.drain_neural_learning(Duration::from_millis(100));
-
-        // Mirror the real learner: train the carried pass-completion head on this game's resolved
-        // pass outcomes, then install it into subsequent games once it clears the live blend floor.
-        let pass_outcome_samples = sim.drain_pass_outcome_samples();
-        if !pass_outcome_samples.is_empty() {
-            let head = pass_completion_head.get_or_insert_with(|| {
-                SoccerPassCompletionHead::new(seed_base.wrapping_add(g as u32))
-            });
-            let mut final_loss = 0.0;
-            for _ in 0..4 {
-                final_loss = head.train(&pass_outcome_samples, 0.05);
-            }
-            eprintln!(
-                "pass_completion_training game={} samples={} training_steps={} consumed={} final_loss={:.5}",
-                g + 1,
-                pass_outcome_samples.len(),
-                head.training_steps(),
-                head.training_steps() >= PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS,
-                final_loss
-            );
-        }
 
         // Train the executor head on this game's captured (features, applied_residual, advantage)
         // samples (RWR, 4 epochs), carried into the next game — the executor-head analog of the
@@ -335,18 +199,9 @@ fn main() {
             let head = mpc_objective_head.get_or_insert_with(|| {
                 SoccerMpcObjectiveHead::new(seed_base.wrapping_add(g as u32))
             });
-            let epochs = env_usize("DD_SOCCER_MPC_OBJECTIVE_EPOCHS", 4).clamp(1, 32);
-            let mut trained_steps = 0usize;
-            for _ in 0..epochs {
-                trained_steps += head.train_rwr(&mpc_samples, 0.05);
+            for _ in 0..4 {
+                head.train_rwr(&mpc_samples, 0.05);
             }
-            eprintln!(
-                "mpc_objective_training game={} samples={} epochs={} trained_steps={}",
-                g + 1,
-                mpc_samples.len(),
-                epochs,
-                trained_steps
-            );
         }
 
         let summary = sim.summary();
@@ -356,13 +211,9 @@ fn main() {
             shots: f64::from(st.shots_home + st.shots_away),
             shots_on_target: f64::from(st.shots_on_target_home + st.shots_on_target_away),
             shots_after_pass: f64::from(st.shots_after_pass_home + st.shots_after_pass_away),
-            passes_attempted: f64::from(st.passes_attempted_home + st.passes_attempted_away),
             passes_completed: f64::from(st.passes_completed_home + st.passes_completed_away),
             passes_forward: f64::from(
                 st.passes_completed_forward_home + st.passes_completed_forward_away,
-            ),
-            pass_turnovers: f64::from(
-                st.pass_interceptions_own_half + st.pass_interceptions_opp_half,
             ),
             pass_chains: f64::from(st.pass_chains_home + st.pass_chains_away),
             pass_chain_gain_yards: st.pass_chain_gain_yards_home + st.pass_chain_gain_yards_away,
@@ -370,13 +221,8 @@ fn main() {
                 st.pass_chains_net_loss_home + st.pass_chains_net_loss_away,
             ),
             crosses_completed: f64::from(st.crosses_completed_home + st.crosses_completed_away),
-            dribble_beats: f64::from(st.dribble_beats_home + st.dribble_beats_away),
-            dribble_decisions: game_dribble_decision_ticks as f64,
         };
-        let measured_game = g >= warmup_games;
-        if measured_game {
-            per_game.push(kpis);
-        }
+        per_game.push(kpis);
 
         // Carry the trained policy + neural net into the next game.
         if let Some(p) = sim.team_policies() {
@@ -387,11 +233,8 @@ fn main() {
         }
 
         eprintln!(
-            "game {:>2}/{total_games} phase={} measured={}/{} seed=0x{:08X} score {}-{} chains={} chain_gain_yds={:.1}",
+            "game {:>2}/{games} seed=0x{:08X} score {}-{} chains={} chain_gain_yds={:.1}",
             g + 1,
-            if measured_game { "eval" } else { "warmup" },
-            per_game.len(),
-            games,
             seed_base.wrapping_add(g as u32),
             summary.score_home,
             summary.score_away,
@@ -419,7 +262,7 @@ fn main() {
     }
 
     println!(
-        "\n----- measured per-game averages ({games} eval games after {warmup_games} warmup, {:.1}s elapsed) -----",
+        "\n----- per-game averages ({games} games, {:.1}s elapsed) -----",
         started.elapsed().as_secs_f64()
     );
     overall.scaled(1.0 / n).print_row("OVERALL");

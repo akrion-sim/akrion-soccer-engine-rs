@@ -1,12 +1,12 @@
 # Plan: fix the policy `visits` i32 overflow
 
 ## Problem (grounded)
-- In-memory `visits` is `u32` (`soccer_learning.rs:1902`).
+- In-memory `visits` is `u32` (`soccer_learning.rs:1676`, `PolicyEntry`).
 - The PG column `des_soccer_learning_policy_entries.visits` is `integer` (**i32**,
   max 2,147,483,647). The merge accumulates visits across runs/generations.
 - Hot states (e.g. `Midfielder / BuildUp`, visited ~every game over 300+ generations ×
   thousands of games) exceed i32::MAX and **clamp to 2147483647** on write; read back as
-  `i32` (`soccer_learning_pg.rs:3459-3460`, `:3963`/`:3977`, `:4001` `checked_i32`: `row.get::<_, i32>(…).max(0) as u32`).
+  `i32` (`soccer_learning_pg.rs:2293`, `:2964`: `row.get::<_, i32>(…).max(0) as u32`).
 - Consequence: **median `visits` = 2147483647** across the gen-308 tip (1.32M entries),
   so `SOCCER_LIVE_POLICY_MIN_VISITS` cannot rank/trim — every local load pulls the full
   1.3M rows (the slow WAN load), and "load the most-trained N states" is impossible.

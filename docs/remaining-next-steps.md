@@ -13,26 +13,20 @@ verify current learner/tournament status through the runbook, DB, and rollout ch
 - Offline-encoder **Step 1** (dataset export) and **Step 2a prototype** (numpy trainer,
   ~47% held-out gain) — `scripts/export_offline_dataset.sh`, `scripts/train_offline_head.py`.
 
-## P0 — Break the analytic-parity plateau (ACTIVE — top priority)
-The north star is a neural policy that beats the **pure-analytic engine**; it is stuck at
-~0.28–0.44 forward-pass payoff vs analytic (REJECT). Reward-shaping arms (spatial / forward-primacy
-/ de-timid) are falsified; the plateau is **structural**. Current working hypothesis (2026-07-09,
-Codex-adjudicated): the net may not **causally own the executed action** — exploration is off and the
-downstream analytic/execution layers may override it. **Plan (instrument-first) →
-[`climb-reframe-2026-07-09.md`](climb-reframe-2026-07-09.md):**
-1. Build the **net-influence instrument** (pure measurement, default-off): fraction of decisions on
-   which the net's score changes the executed action vs the tabular/heuristic argmax. Report exact
-   vs family, on-/off-ball, chosen-candidate score entropy, and selected kick-speed-bucket entropy.
-2. Baseline it, then **flip exploration on** (`DD_SOCCER_ENABLE_STOCHASTIC_POLICY_TOPK=1` +
-   `policy_selection.boltzmann_temperature`>0, annealed) and remeasure.
-3. Add the adjacent health counters before changing PPO/MAPPO math or widening capacity:
-   `confidence_gate_open_rate`, old-prob missing rate, ratio mean, clip fraction, entropy by
-   role/family, raw/scaled target histograms, target clip fraction, and advantage mean/std.
-4. Keep a frozen eval ladder: analytic baseline, protected local best, past checkpoints, and
+## P0 — Plateau instrumentation and frozen eval ladder
+Before changing PPO/MAPPO math or widening model capacity, add the diagnostics that prove the
+learned layer is causally changing play:
+
+1. `net_changed_action_rate`: executed action differs from the tabular/heuristic baseline.
+2. `confidence_gate_open_rate`: ConfidenceGated opened on the selected/executed candidate.
+3. `selected_kick_speed_bucket_entropy`: bucket choices stay diverse by family.
+4. PPO/MAPPO health: old-prob missing rate, ratio mean, clip fraction, entropy by role/family.
+5. Target/advantage health: raw/scaled target histograms, target clip fraction, advantage mean/std.
+6. Frozen eval ladder: analytic baseline, protected local best, past checkpoints, and
    weaker/randomized opponents on held-out seeds.
-5. Only then **resume reward work** (the r19 carrot / learned receiver / target-point aim).
-See also the shipped-but-unevaluated capacity/action-space work on
-`feature/action-param-features-and-capacity` (`learning-breakthrough-priority1-action-space.md`).
+
+These are not current `world_model_training` fields; see
+[current-learning-state.md](current-learning-state.md).
 
 ## P1 — Offline distilled value head, productionized (`offline-encoder-step2-plan.md`)
 The prototype proved the data is learnable; turn it into a shippable, gated head.

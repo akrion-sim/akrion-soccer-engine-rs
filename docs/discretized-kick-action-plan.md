@@ -12,7 +12,7 @@ seed as cold-start, the net earns its blend**, and each phase is promoted only o
 held-out win-rate verdict from the eval gate ([learning-rate-audit.md](learning-rate-audit.md)
 companion infra: `soccer_eval_gate_run` / `scripts/run_outcome_ab.sh`).
 
-## Current state (verified against `main`, 2026-07-09)
+## Current state (verified against `main`)
 
 The execution substrate is **already in place and shared** — passes and shots both
 lower a `KickReleaseSpec` through `kick_release_clamped_to_pitch` into a
@@ -38,8 +38,8 @@ The **kick-power bucket slice is now live**, not only a scaffold:
 The **full factored kick action** is still not a learned head:
 
 - `DiscretizedKickAction { speed_bucket, direction_bucket, curve, elevation }` and the
-  lowering helpers exist, but live candidate expansion currently uses speed-bucket labels
-  around plausible pass/shot targets, not a full learned direction/curve/elevation/aim head.
+  lowering helpers exist, but live candidate expansion currently uses the speed bucket labels,
+  not a full learned direction/curve/elevation/aim head.
 - `DiscretizedKickDither::sample` returns zero offsets. It is a bounded placeholder, not
   exploration and not extra credit assignment.
 
