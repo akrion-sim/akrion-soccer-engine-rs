@@ -192,6 +192,12 @@
       <button class="ctl" id="play">Pause</button>
       <button class="ctl ghost" id="restart">Restart</button>
       <span class="clock" id="clock">00.0s</span>
+      <select class="ctl ghost" id="speed" aria-label="playback speed" style="padding:8px 10px">
+        <option value="0.25">0.25×</option>
+        <option value="0.5" selected>0.5×</option>
+        <option value="1">1× real-time</option>
+        <option value="2">2×</option>
+      </select>
       <input type="range" id="scrub" min="0" max="100" value="0" aria-label="scrub match">
       <div class="legend">
         <span class="sw"><i style="background:var(--teamA)"></i>learner</span>
