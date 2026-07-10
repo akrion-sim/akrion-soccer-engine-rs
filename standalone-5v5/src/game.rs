@@ -519,6 +519,7 @@ impl World {
         self.ev_win_ball_a = false;
         self.ev_pass_attempt_a = false;
         self.ev_shot_attempt_a = false;
+        self.ev_return_pass_a = false;
 
         let ball_x_before = self.ball.x;
 
