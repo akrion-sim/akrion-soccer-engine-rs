@@ -48760,14 +48760,21 @@ impl WorldSnapshot {
             .clamp(over_top.min_distance_yards, over_top.max_distance_yards);
         let goal_y = me.team.goal_y(self.field_length);
         let byline_margin = over_top.byline_margin_yards;
-        let mut aim_y = me_position.y + attack_dir * forward_yards;
-        aim_y = if attack_dir > 0.0 {
-            aim_y.min(goal_y - byline_margin)
+        let raw_aim_y = me_position.y + attack_dir * forward_yards;
+        let aim_y = if attack_dir > 0.0 {
+            raw_aim_y.min(goal_y - byline_margin)
         } else {
-            aim_y.max(goal_y + byline_margin)
+            raw_aim_y.max(goal_y + byline_margin)
         };
+        let byline_limited = (raw_aim_y - aim_y).abs() > KILLER_PASS_OVER_TOP_NUMERIC_EPSILON;
         forward_yards = (aim_y - me_position.y) * attack_dir;
-        if !(over_top.min_distance_yards..=over_top.max_distance_yards).contains(&forward_yards) {
+        let min_forward_yards = if byline_limited {
+            (over_top.min_distance_yards - over_top.lateral_offset_yards * 2.0)
+                .max(KILLER_PASS_MIN_FORWARD_YARDS)
+        } else {
+            over_top.min_distance_yards
+        };
+        if !(min_forward_yards..=over_top.max_distance_yards).contains(&forward_yards) {
             return None;
         }
 
@@ -48816,7 +48823,12 @@ impl WorldSnapshot {
             .clamp(touch_margin, self.field_width - touch_margin);
         let aim_point = Vec2::new(aim_x, aim_y).clamp_to_pitch(self.field_width, self.field_length);
         let distance_yards = me_position.distance(aim_point);
-        if !(over_top.min_distance_yards..=over_top.max_distance_yards).contains(&distance_yards) {
+        let min_distance_yards = if byline_limited {
+            (over_top.min_distance_yards - over_top.lateral_offset_yards).max(min_forward_yards)
+        } else {
+            over_top.min_distance_yards
+        };
+        if !(min_distance_yards..=over_top.max_distance_yards).contains(&distance_yards) {
             return None;
         }
         let back_line_clearance_yards = (aim_point.y - back_line_y) * attack_dir;
@@ -48951,19 +48963,32 @@ impl WorldSnapshot {
                 } else {
                     (PassFlight::Floor, 0.18)
                 };
+                // Threaded variant: a killer ball is risky by nature, so don't let the dynamic
+                // lane-interception-risk gate crush its completion below the floor below (which
+                // would hide the option). Risk is priced into the killer-pass score instead.
+                let quality = pass_target_quality_for_snapshot_threaded(
+                    self,
+                    me,
+                    me_position,
+                    target,
+                    target_position,
+                    flight,
+                );
                 // A killer ball threads RISK into space (that race is priced into the score, not
                 // hidden), but it must never be a gross concession — the ball arriving at an
-                // opponent's feet, or forced into a tightly-marked man the passer can see. The
-                // generic ranker/selector enforce this for ordinary passes; the threaded pool is
-                // un-gated, so re-apply the same perception-gated concede veto here. A runner
-                // breaking into clear space has no opponent within the mark radius of the
-                // reception, so genuine killer balls are untouched; only a pass landing on a
-                // reachable defender is dropped (the carrier then keeps/shields/clears instead).
+                // opponent's feet, or forced into a tightly-marked man the passer can see. For a
+                // lifted over-top runner, the static "nearest to landing" veto is too conservative:
+                // the intended receiver is sprinting into the landing, so let MPC receipt quality
+                // decide whether the runner actually wins the race.
                 let over_top_conceded = over_top_aim
                     .map(|aim| {
                         let over_top_speed =
                             pass_speed_yps_from_power(0.82, PassFlight::OverTop, false, &me.skills);
-                        self.pass_point_directly_favors_opponent(
+                        let opponent_at_feet = self.nearest_opponent_distance_at(
+                            me.team,
+                            aim.aim_point,
+                        ) <= PASS_RECEPTION_CONCEDE_AT_FEET_RADIUS_YARDS;
+                        let static_concede = self.pass_point_directly_favors_opponent(
                             me.team,
                             target_position,
                             aim.aim_point,
@@ -48974,7 +48999,12 @@ impl WorldSnapshot {
                             aim.aim_point,
                             over_top_speed,
                             self.attacker_pressure_on_point(me.team, me_position),
-                        )
+                        );
+                        let runner_wins_lifted_race = quality.expected_completion
+                            >= KILLER_PASS_MIN_THREADED_EXPECTED_COMPLETION
+                            && quality.mpc_receipt_probability >= 0.50
+                            && quality.lane_interception_risk <= 0.18;
+                        opponent_at_feet || (static_concede && !runner_wins_lifted_race)
                     })
                     .unwrap_or(false);
                 if !slip_break.available
@@ -48988,17 +49018,6 @@ impl WorldSnapshot {
                 {
                     return None;
                 }
-                // Threaded variant: a killer ball is risky by nature, so don't let the dynamic
-                // lane-interception-risk gate crush its completion below the floor below (which
-                // would hide the option). Risk is priced into the killer-pass score instead.
-                let quality = pass_target_quality_for_snapshot_threaded(
-                    self,
-                    me,
-                    me_position,
-                    target,
-                    target_position,
-                    flight,
-                );
                 let near_goal_completion_floor_multiplier = if receiver_yards_to_goal <= 8.0 {
                     0.55
                 } else if receiver_yards_to_goal <= 18.0 {
