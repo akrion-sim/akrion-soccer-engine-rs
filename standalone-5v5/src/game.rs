@@ -780,6 +780,12 @@ impl World {
     }
 
     fn try_tackle(&mut self, rng: &mut Rng) {
+        // Immunity window right after possession changed hands, so the ball can't
+        // instantly ping back and forth (the tackle/dispossession "black hole").
+        if self.kick_timer > 0 {
+            self.kick_timer -= 1;
+            return;
+        }
         let o = match self.owner {
             Some(o) => o,
             None => return,
