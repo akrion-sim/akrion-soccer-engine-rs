@@ -39,6 +39,11 @@ def main():
             "ga": num(c[3]),
             "gb": num(c[4]),
         })
+    # Early stopping: show the curve to the best checkpoint (PPO over-trains after).
+    log_txt = rd("../out_train.log") if os.path.exists(os.path.join(OUT, "..", "out_train.log")) else ""
+    mb = re.search(r"best policy at iter (\d+)", log_txt)
+    best_iter = int(mb.group(1)) if mb else curve[-1]["iter"]
+    curve = [p for p in curve if p["iter"] <= best_iter]
 
     # ---- headline meta, parsed from the training log ----
     log = rd("../out_train.log") if os.path.exists(os.path.join(OUT, "..", "out_train.log")) else ""
