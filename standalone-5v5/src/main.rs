@@ -202,8 +202,8 @@ fn record_match(policy: &train::Policy, rng: &mut Rng, path: &str) {
         }
         let _ = write!(
             frames,
-            "],\"ball\":[{:.1},{:.1}],\"own\":{},\"ga\":{},\"gb\":{}}}",
-            w.ball.x, w.ball.y, owner_code, w.goals_a, w.goals_b
+            "],\"ball\":[{:.1},{:.1}],\"own\":{},\"oi\":{},\"ga\":{},\"gb\":{}}}",
+            w.ball.x, w.ball.y, owner_code, owner_idx, w.goals_a, w.goals_b
         );
     }
     frames.push(']');
