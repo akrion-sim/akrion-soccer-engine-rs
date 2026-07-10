@@ -26,7 +26,7 @@ fn main() {
     match cmd {
         "sanity" => sanity(),
         _ => {
-            let iters: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(300);
+            let iters: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(100);
             run_training(iters);
         }
     }
