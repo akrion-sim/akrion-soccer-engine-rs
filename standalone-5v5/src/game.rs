@@ -374,6 +374,37 @@ impl World {
         let shot_dist = goal.sub(mp).len();
         let ball_rel = bp.sub(mp);
 
+        // NEAREST TEAMMATE perception — without this the policy cannot see how
+        // close it is to a teammate and so cannot learn to un-bunch. Considers
+        // the other outfielders (1..N), which are the ones the spacing reward
+        // penalizes. nt_pressure spikes as a teammate crowds in; crowd counts
+        // how many are within the ~5-unit optimum.
+        let tps = players(team, self);
+        let mut nt_d = f32::INFINITY;
+        let mut nt_idx = idx;
+        let mut crowd = 0.0f32;
+        for k in 1..N {
+            if k == idx {
+                continue;
+            }
+            let d = tps[k].pos.sub(me.pos).len();
+            if d < 5.0 {
+                crowd += 1.0;
+            }
+            if d < nt_d {
+                nt_d = d;
+                nt_idx = k;
+            }
+        }
+        let nt_rel = if nt_d.is_finite() {
+            mir(tps[nt_idx].pos).sub(mp)
+        } else {
+            V2::new(0.0, 0.0)
+        };
+        let nt_dist = if nt_d.is_finite() { nt_d } else { nx };
+        let nt_pressure = 1.0 / (1.0 + nt_dist); // high when a teammate is on top of me
+        let crowd_frac = crowd / (N as f32 - 1.0);
+
         let f = [
             has_ball as u8 as f32,
             team_ball as u8 as f32,
