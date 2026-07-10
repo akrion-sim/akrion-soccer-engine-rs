@@ -59,7 +59,11 @@ fn main() {
     let n = per_match_rate.len().max(1) as f64;
     let rate = comp as f64 / att.max(1) as f64;
     let mean_pm = per_match_rate.iter().sum::<f64>() / n;
-    let var = per_match_rate.iter().map(|r| (r - mean_pm).powi(2)).sum::<f64>() / n;
+    let var = per_match_rate
+        .iter()
+        .map(|r| (r - mean_pm).powi(2))
+        .sum::<f64>()
+        / n;
     let sd = var.sqrt();
     let se = sd / n.sqrt();
     println!(

@@ -329,11 +329,17 @@ impl AdvancementRecord {
     }
 
     fn candidate_completion_rate(&self) -> f64 {
-        ratio(self.candidate_completed_passes, self.candidate_attempted_passes)
+        ratio(
+            self.candidate_completed_passes,
+            self.candidate_attempted_passes,
+        )
     }
 
     fn opponent_completion_rate(&self) -> f64 {
-        ratio(self.opponent_completed_passes, self.opponent_attempted_passes)
+        ratio(
+            self.opponent_completed_passes,
+            self.opponent_attempted_passes,
+        )
     }
 
     fn completion_rate_margin(&self) -> f64 {

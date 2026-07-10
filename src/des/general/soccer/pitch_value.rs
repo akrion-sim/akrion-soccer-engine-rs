@@ -592,7 +592,13 @@ mod tests {
         // seed — routing the learned-EPV grid in is opt-in and byte-identical off.
         let _g = PITCH_VALUE_ENV_LOCK.lock().unwrap();
         assert!(std::env::var("DD_SOCCER_ENABLE_LEARNED_EPV_POTENTIAL").is_err());
-        for &(fx, fy) in &[(0.5, 0.08), (0.3, 0.5), (0.5, 0.85), (0.5, 0.97), (0.02, 0.9)] {
+        for &(fx, fy) in &[
+            (0.5, 0.08),
+            (0.3, 0.5),
+            (0.5, 0.85),
+            (0.5, 0.97),
+            (0.02, 0.9),
+        ] {
             let p = Vec2::new(W * fx, L * fy);
             for team in [Team::Home, Team::Away] {
                 assert_eq!(

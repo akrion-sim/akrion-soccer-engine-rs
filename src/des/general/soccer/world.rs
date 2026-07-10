@@ -11759,9 +11759,8 @@ impl SoccerMatch {
         let team = carrier_p.team;
         let fw = self.config.field_width_yards;
         let fl = self.config.field_length_yards;
-        let et = |p: Vec2| {
-            crate::des::general::soccer::pitch_value::expected_threat(team, p, fw, fl)
-        };
+        let et =
+            |p: Vec2| crate::des::general::soccer::pitch_value::expected_threat(team, p, fw, fl);
         let carrier_et = et(carrier_p.position);
         let mut candidates: Vec<(f64, Vec2)> = Vec::new();
         for tm in self.players.iter() {
@@ -11793,9 +11792,7 @@ impl SoccerMatch {
     /// True iff a pass / shot / rebound is currently in flight or otherwise
     /// unresolved (encapsulates the `pub(crate)` pending fields for the driver).
     pub fn poc_has_pending_ball_event(&self) -> bool {
-        self.pending_pass.is_some()
-            || self.pending_shot.is_some()
-            || self.pending_rebound.is_some()
+        self.pending_pass.is_some() || self.pending_shot.is_some() || self.pending_rebound.is_some()
     }
 
     /// Queue a forced action on `player_id`'s next decision inside a rollout fork.
@@ -11845,7 +11842,12 @@ impl SoccerMatch {
         const POSSESSION_BONUS: f64 = 0.30;
         const TURNOVER_PENALTY: f64 = 0.60;
         let mut w = self.fork_for_rollout(seed);
-        let team = match self.players.iter().find(|p| p.id == carrier).map(|p| p.team) {
+        let team = match self
+            .players
+            .iter()
+            .find(|p| p.id == carrier)
+            .map(|p| p.team)
+        {
             Some(t) => t,
             None => return PocArmResult::default(),
         };

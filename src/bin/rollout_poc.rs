@@ -285,8 +285,12 @@ fn main() {
             nat_h.push(nr.leaf);
             diag_nat.push(&nr);
 
-            let fr =
-                sim.poc_rollout_arm(carrier, Some(("pass".to_string(), Some(best_fwd_target))), s, max_h);
+            let fr = sim.poc_rollout_arm(
+                carrier,
+                Some(("pass".to_string(), Some(best_fwd_target))),
+                s,
+                max_h,
+            );
             pass_arm_evals += 1;
             if fr.forced_action_fired {
                 pass_arm_fired += 1;
@@ -365,7 +369,9 @@ fn main() {
     } else if parity_pass {
         println!("  PARITY: PASS - forced injection reproduces natural within CRN noise");
     } else {
-        println!("  PARITY: FAIL - injection/fork is BIASED; do NOT over-interpret the arm comparison");
+        println!(
+            "  PARITY: FAIL - injection/fork is BIASED; do NOT over-interpret the arm comparison"
+        );
     }
 
     // --- Denominator ---
@@ -402,12 +408,23 @@ fn main() {
     println!("by zone (thirds by ball y vs attack dir):");
     for z in 0..3 {
         let m = mean(&strat_zone[z]);
-        println!("  {:<10} n={:<4} mean_delta={m:.5}", zone_name[z], strat_zone[z].len());
+        println!(
+            "  {:<10} n={:<4} mean_delta={m:.5}",
+            zone_name[z],
+            strat_zone[z].len()
+        );
     }
     println!("by natural-already-forward (epv gain>0 & retained):");
-    for (idx, label) in ["nat-NOT-already-fwd", "nat-already-fwd"].iter().enumerate() {
+    for (idx, label) in ["nat-NOT-already-fwd", "nat-already-fwd"]
+        .iter()
+        .enumerate()
+    {
         let m = mean(&strat_natfwd[idx]);
-        println!("  {:<20} n={:<4} mean_delta={m:.5}", label, strat_natfwd[idx].len());
+        println!(
+            "  {:<20} n={:<4} mean_delta={m:.5}",
+            label,
+            strat_natfwd[idx].len()
+        );
     }
 
     // --- VERDICT ---
