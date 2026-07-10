@@ -180,11 +180,12 @@ fn record_match(policy: &train::Policy, rng: &mut Rng, path: &str) {
         let act_b = w.scripted_actions(Team::B);
         w.step(&act_a, &act_b, rng);
 
-        let owner_code = match w.owner {
-            Some(o) if matches!(o.team, Team::A) => 0i32,
-            Some(_) => 1,
-            None => -1,
+        let (owner_code, owner_team, owner_idx) = match w.owner {
+            Some(o) if matches!(o.team, Team::A) => (0i32, 0i32, o.idx as i32),
+            Some(o) => (1i32, 1i32, o.idx as i32),
+            None => (-1i32, -1i32, -1i32),
         };
+        let _ = owner_team;
         frames.push_str("{\"a\":[");
         for i in 0..N {
             if i > 0 {
