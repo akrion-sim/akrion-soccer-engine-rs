@@ -78,7 +78,7 @@ def main():
         "passes": round(passes, 1),
         "spacing": round(spacing, 1),
         "iters": iters,
-        "minutes": "~3 min on a laptop",
+        "minutes": "~6 min on a laptop",
     }
 
     tpl = rd_tpl()
