@@ -300,7 +300,8 @@ const META   = /*__META__*/ null;
     {k:'Learner + algo',v:'4 outfielders, <b>PPO</b>+<b>GAE</b>, <b>0</b> deps (own MLP/backprop)'},
   ];
   document.getElementById('facts').innerHTML=facts.map(f=>`<div class="fact"><div class="k">${f.k}</div><div class="v">${f.v}</div></div>`).join('');
-  document.getElementById('foot').innerHTML='Isolated git worktree · <code>cargo run --release -- train</code> · run metadata comes from <code>out/run_manifest.json</code> · display seed '+META.display_seed+' uses the same opening seed for both matches so the contrast is the policy, not the dice.';
+  document.getElementById('foot').innerHTML='Isolated git worktree · <code>cargo run --release -- train</code> · run metadata comes from <code>out/run_manifest.json</code> · display seed '+META.display_seed+' uses the same opening seed for both matches so the contrast is the policy, not the dice.'
+    + (META.display_matched===false ? ' <b>Note:</b> no seed matched the showcase filter (win-by-1..4 with a losing/level untrained side), so this is a <b>fallback</b> game — it may not be representative of the average result; trust the 300-game stats above, not this single match.' : '');
 })();
 
 // ---------- match analytics ----------
