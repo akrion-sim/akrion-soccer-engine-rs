@@ -4184,6 +4184,22 @@ const ATTACK_SUPPORT_SPACING_MAX_YARDS: f64 = 16.0;
 const ATTACK_SUPPORT_SPACING_FAR_DECAY_YARDS: f64 = 10.0;
 const ATTACK_SUPPORT_SPACING_SHAPE_REWARD: f64 = 0.32;
 pub(crate) const OUTSIDE_MID_TAKEON_COVER_CLEAR_YARDS: f64 = 10.0;
+
+/// Amplify the dense OFF-BALL "make a supporting run / move to space" rewards so teammates learn
+/// to get open — creating safe passing options and cutting the hoof-and-give-away turnovers.
+/// Env `SOCCER_OFFBALL_SUPPORT_REWARD_SCALE` (default 1.0 = byte-identical), clamped [1, 10].
+pub(crate) fn offball_support_reward_scale() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("SOCCER_OFFBALL_SUPPORT_REWARD_SCALE")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(1.0, 10.0))
+            .unwrap_or(1.0)
+    })
+}
 const OUTSIDE_MID_TAKEON_ISOLATION_REWARD: f64 = 0.14;
 // Defensive recovery: a contestable ball within this many yards of our back line
 // (2nd-to-last defender) demands max sprint effort; above this recovery effort the
@@ -15091,7 +15107,7 @@ fn soccer_replay_pitch_value_potential(state: &SoccerMdpState, team: Team) -> f6
         return 0.0;
     };
     let point = soccer_replay_ball_grid_center(state);
-    let threat = expected_threat(
+    let threat = threat_at(
         possession_team,
         point,
         DEFAULT_FIELD_WIDTH_YARDS,
@@ -20223,6 +20239,18 @@ pub(crate) struct PendingPass {
     mpc_objective: Option<(Vec<f32>, Vec2, f64)>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct PendingPassLaunchDiag {
+    pub(crate) action_label: String,
+    pub(crate) from: usize,
+    pub(crate) launch_tick: u64,
+    pub(crate) explicit_target_point: bool,
+    pub(crate) target_point_receiver_distance_yards: f64,
+    pub(crate) forward_yards: f64,
+    pub(crate) distance_yards: f64,
+    pub(crate) flight: PassFlight,
+}
+
 /// A goal counts as assisted only when the setting-up completed pass landed within this many
 /// seconds of the goal (so a stale earlier ball isn't credited).
 const ASSIST_RECENCY_SECONDS: f64 = 6.0;
@@ -23616,7 +23644,19 @@ pub(crate) fn pass_chain_reward_scale() -> f64 {
 /// net-of-turnovers gate correctly rejects it. Never drops below 1.0 so low/zero
 /// forward-pass reward ablations do not make giveaways cheaper than baseline.
 pub(crate) fn forward_pass_turnover_penalty_scale() -> f64 {
-    forward_pass_reward_scale().max(1.0)
+    use std::sync::OnceLock;
+    static COMPLETION_PRIMARY_SCALE: OnceLock<f64> = OnceLock::new();
+    let completion_primary_scale = *COMPLETION_PRIMARY_SCALE.get_or_init(|| {
+        std::env::var("DD_SOCCER_PASS_TURNOVER_PENALTY_SCALE")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(1.0, 20.0))
+            .unwrap_or(1.0)
+    });
+    forward_pass_reward_scale()
+        .max(completion_primary_scale)
+        .max(1.0)
 }
 
 /// Companion dampener for the shot-TAKEN shaping proxy (on-/off-target reward, NOT the goal or
@@ -43311,6 +43351,19 @@ fn soccer_policy_head_from_snapshot(
     } else {
         0.0
     };
+    // Diagnostic-only: with the gate on, allow a fixed load-time forward-select
+    // weight for smoke/A-B runs. It is baked into the per-net field once here and
+    // obeys the same nonnegative clamp as training.
+    if dd_soccer_enable_forward_select_logit() {
+        if let Ok(raw) = std::env::var("DD_SOCCER_FORWARD_SELECT_LOGIT_WEIGHT") {
+            if let Ok(value) = raw.trim().parse::<f64>() {
+                if value.is_finite() {
+                    head.forward_select_logit_weight =
+                        value.clamp(0.0, SOCCER_FORWARD_SELECT_LOGIT_WEIGHT_MAX);
+                }
+            }
+        }
+    }
     Ok(head)
 }
 

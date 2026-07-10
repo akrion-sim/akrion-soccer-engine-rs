@@ -1,5 +1,17 @@
 # Pass-space is INERT — `target_point` dropped at execution (2026-07-08 pm, recovery-A/B track)
 
+> **⚠️ SUPERSEDED (verified against HEAD `be11b4d`, 2026-07-09).** The fix this doc proposed has
+> LANDED: `SoccerAction::Pass` now carries `target_point: Option<Vec2>` (player.rs:14983);
+> `action_from_learned_plan` populates it under `DD_SOCCER_ENABLE_NEURAL_PASS_SPACE`
+> (player.rs:13064-13071, set at player.rs:13381/13441/13506/13530) and `facing_for_player_action`
+> aims at it (`target_point.or_else(receiver feet)`, world.rs:24282-24291). The source/scored/executed
+> distinct-rate diagnostics also exist (`record_pass_space_{source,scored,executed}_diag`,
+> world.rs:37323/37335/37344). The gate itself is still default-OFF (world.rs:37199). So the
+> byte-identical 120-game null below was valid at doc time but the "no-op / null-by-construction"
+> verdict no longer holds — **re-run the A/B before citing it.** (The `~Lxxxx` refs in the body have
+> also drifted; `action_from_learned_plan` is now player.rs:13057.) The rest of this doc is preserved
+> as the historical trace.
+
 Companion to [how-to-climb-codex-conversation.md](how-to-climb-codex-conversation.md). This is the
 recovered pass-space verdict (the r13 "lost verdict"). The A/B proves the `DD_SOCCER_ENABLE_NEURAL_
 PASS_SPACE` gate is a **no-op**; Codex then located the cause (repo-grounded): the distinct space

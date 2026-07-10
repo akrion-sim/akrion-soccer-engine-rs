@@ -1133,11 +1133,7 @@ fn main() {
         }
     };
 
-    // Seed base env-overridable for independent-seed-family replication (default byte-identical).
-    let train_seed_base: u32 = std::env::var("SOCCER_LEAGUE_SEED")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(0x5EED_0000);
+    let train_seed_base: u32 = 0x5EED_0000;
     let mut round = 0u32;
     let mut best_checkpoint_net_forward_pass_margin = f64::NEG_INFINITY;
     let mut archived_step_buckets: BTreeSet<usize> = BTreeSet::new();

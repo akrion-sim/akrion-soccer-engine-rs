@@ -49,8 +49,8 @@ flowchart TB
     TICK --> REW
 
     subgraph LEARN["Update / optimization"]
-        NEU["Neural learner (threaded)<br/>actor-critic + GAE advantage, PPO clip (multi-epoch)<br/>replay 2048, batch 32, lr 0.015, hidden 24"]
-        GA["Evolution / GA self-play<br/>every 5 games: mutate / crossover / elite (pop 16)"]
+        NEU["Neural learner (threaded)<br/>actor-critic + GAE advantage, PPO clip (multi-epoch)<br/>replay 512, batch 16, lr 0.015, hidden 128"]
+        GA["Evolution / GA self-play<br/>every 10 games: mutate / crossover / elite (pop 6, max 16)"]
         GATE["Policy promotion gate<br/>min fitness, max conceded, play quality"]
     end
 
@@ -138,7 +138,7 @@ flowchart LR
 4. **Reward** — event rewards (goals, passes, shots, chains) + tactical-learning
    shaping, with an **optional** dense pitch-control × xT territorial term.
 5. **Update** — the **neural learner** does actor-critic + GAE with PPO-clipped
-   multi-epoch updates over a replay buffer; **GA evolution** (every 5 games)
+   multi-epoch updates over a replay buffer; **GA evolution** (every 10 games)
    mutates/crosses/selects the population.
 6. **Promotion gate** — a candidate policy is promoted to a new **generation**
    only if it clears fitness / goals-conceded / play-quality thresholds.

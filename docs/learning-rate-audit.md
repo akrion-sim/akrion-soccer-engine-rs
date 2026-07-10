@@ -19,13 +19,13 @@ surfaces learn). This doc is about *how fast and how safely* the nets move.
 | `SOCCER_POLICY_GAE_LAMBDA` | 0.95 | advantage trace decay |
 | `SOCCER_POLICY_ENTROPY_COEFF` | 0.01 | anti-collapse entropy bonus |
 | `DEFAULT_SOCCER_MAPPO_CLIP_EPSILON` | 0.20 | PPO/MAPPO ratio clip |
-| `SOCCER_FULL_GAME_RETURN_{DISCOUNT,BLEND,CLIP}` | 0.995/tick, 0.35, 250.0 | full-game return recursion |
+| `SOCCER_FULL_GAME_RETURN_{DISCOUNT,BLEND,CLIP}` | 0.98/tick, 0.35, 400.0 | full-game return recursion (discount 0.98 per the Jul-2026 credit-assignment fix, soccer.rs:5590; clip 400.0, soccer.rs:5592) |
 | advantage standardization | gated, default OFF | zero-mean/unit-variance over the policy batch ([world.rs](../src/des/general/soccer/world.rs)) |
 
 **Already-solid guards (no change needed):** LR clamped ≤ 0.25; three grad-norm
 ceilings; the non-finite-gradient guard in `FeedForwardNetwork::train_sample_clipped`
 drops poisoned steps so a NaN can't reach live play; value targets bounded to ±3.0;
-actor samples filter `advantage.is_finite()`; full-game return clamped to ±250.
+actor samples filter `advantage.is_finite()`; full-game return clamped to ±400.
 
 ## Findings
 
@@ -41,15 +41,18 @@ can be large ∝ trajectory length.
 
 **F2 — The keeper head is baseline-free and unnormalized.** `neural_keeper_policy_training_samples`
 sets `advantage = transition.reward` directly — no critic baseline, no standardization
-([world.rs](../src/des/general/soccer/world.rs)). The flat won-game label (±8–12.5)
-then *dominates* the keeper's own shaping rewards (a save is ~4–8), so the keeper would
+([world.rs](../src/des/general/soccer/world.rs)). The flat won-game label (≈±200:
+`MATCH_OUTCOME_WIN_REWARD_POINTS`=200 plus a goal-margin bonus of 15/goal capped at 5 goals,
+soccer.rs:5628-5631) then *dominates* the keeper's own shaping rewards, so the keeper would
 learn "we won ⇒ every action I took was good," independent of quality.
 
 **F3 — Value-target saturation (pre-existing, flagged not fixed).** Targets are
 `reward/30` clipped to ±3.0, i.e. the critic cannot represent a return beyond ±90 raw,
-while the full-game return clips at ±250. High-magnitude games saturate the critic and
-bias the advantage baseline. The won-game label (±12.5 ⇒ ±0.42 in target space) stays
-well inside this, so it does not worsen F3, but the tension is worth tracking.
+while the full-game return clips at ±400. High-magnitude games saturate the critic and
+bias the advantage baseline. **The won-game label now makes this worse, not better:** at
+`MATCH_OUTCOME_WIN`=200 the label is 200/30 ≈ 6.67 in target space, which **exceeds** the
+±3.0 target clip — so the outcome label itself saturates the critic. (This corrects an earlier
+version of this note that assumed a ±12.5 label sitting safely inside the clip.)
 
 **F4 — Other reward-fed trainers are safe.** The tabular Q trainer takes a flat
 per-team label as a constant that cancels in per-team argmax; the value net clips (F3);
@@ -83,7 +86,8 @@ advantage/keeper/actor/mappo suites.
 1. **Enable advantage normalization in trained runs** (`DD_SOCCER_ENABLE_ADVANTAGE_NORMALIZATION=1`)
    so the effective LR is reward-scale-invariant even without the won-game reward; A/B
    held-out Elo via `soccer_eval_gate_run` before making it the default.
-2. **A/B the won-game magnitudes** (`MATCH_OUTCOME_WIN`=8.0, margin 1.5, cap 4) on
-   held-out win-rate — the eval gate is the instrument.
+2. **A/B the won-game magnitudes** (`MATCH_OUTCOME_WIN`=200.0, margin 15.0, cap 5) on
+   held-out win-rate — the eval gate is the instrument. (Given F3, also consider lifting
+   `target_clip` in tandem so the ±6.67 outcome label isn't clipped flat.)
 3. **Track F3**: if high-scoring self-play games become common, lift `target_clip` or
    the return clip together so the critic baseline isn't saturated.

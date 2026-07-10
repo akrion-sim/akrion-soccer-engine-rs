@@ -46,9 +46,16 @@ fn dd_soccer_disable_first_touch_escape() -> bool {
 }
 
 fn dd_soccer_enable_neural_pass_space() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_NEURAL_PASS_SPACE"))
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_NEURAL_PASS_SPACE")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_NEURAL_PASS_SPACE"))
+    }
 }
 /// Gate (default-ON) for the crowded won-ball escape floor: a player who has just won possession in
 /// traffic gets a probability floor on the break-into-space action family so it accelerates AWAY
@@ -1461,6 +1468,71 @@ fn soccer_pressured_contested_pass_damp_enabled() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_PRESSURED_PASS_DAMP").is_err())
+}
+
+fn pass_completion_primary_score_weight() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_PASS_COMPLETION_SCORE_WEIGHT")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|value| value.is_finite())
+            .unwrap_or(0.0)
+            .clamp(0.0, 3.0)
+    })
+}
+
+fn pass_completion_primary_multiplier(completion: f64, weight: f64) -> f64 {
+    if weight <= 1e-9 {
+        return 1.0;
+    }
+    let completion = completion.clamp(0.0, 1.0);
+    (1.0 + (completion - 0.72) * weight).clamp(0.25, 1.35)
+}
+
+fn apply_pass_completion_primary_scores(
+    options: &mut [AgentActionOptionTrace],
+    observation: &SoccerPomdpObservation,
+) {
+    let weight = pass_completion_primary_score_weight();
+    if weight <= 1e-9 {
+        return;
+    }
+    let floor_multiplier =
+        pass_completion_primary_multiplier(observation.expected_pass_completion, weight);
+    let aerial_multiplier = pass_completion_primary_multiplier(
+        observation
+            .expected_aerial_pass_completion
+            .max(observation.expected_pass_completion * 0.72),
+        weight,
+    );
+    let killer_multiplier = pass_completion_primary_multiplier(
+        observation
+            .threaded_goal_pass_expected_completion
+            .max(observation.expected_pass_completion),
+        weight * 0.65,
+    );
+    for option in options.iter_mut().filter(|option| option.legal) {
+        let label = normalize_soccer_action_label(&option.label);
+        let multiplier = if label == "pass"
+            || matches!(
+                option.label.as_str(),
+                "recycle-reset" | "switch-play" | "surprise-pass" | "wall-pass"
+            ) {
+            floor_multiplier
+        } else if matches!(
+            option.label.as_str(),
+            "route-one" | "flank-high-cross" | "scoop-pass" | "flick-on"
+        ) {
+            aerial_multiplier
+        } else if matches!(option.label.as_str(), "killer-pass" | "flank-low-cross") {
+            killer_multiplier.max(floor_multiplier * 0.82)
+        } else {
+            continue;
+        };
+        option.score *= multiplier;
+    }
 }
 
 fn mpc_reselect_candidate_label(label: &str) -> bool {
@@ -6577,6 +6649,7 @@ impl PlayerAgent {
                 runway_floor,
             );
         }
+        apply_pass_completion_primary_scores(&mut options, observation);
         let mut options = normalize_action_options(options);
         annotate_tick_probabilities_from_scores(&mut options, dt_seconds);
         options
@@ -13066,12 +13139,37 @@ impl PlayerAgent {
     ) -> Option<(SoccerAction, String)> {
         let label = normalize_soccer_action_label(&plan.action);
         let learned_pass_target_point = |target: usize| {
-            if dd_soccer_enable_neural_pass_space() && plan.target_player == Some(target) {
-                plan.target_point
-                    .map(|point| point.clamp_to_pitch(snapshot.field_width, snapshot.field_length))
-            } else {
-                None
+            if !dd_soccer_enable_neural_pass_space() {
+                return None;
             }
+            let point = plan
+                .target_point?
+                .clamp_to_pitch(snapshot.field_width, snapshot.field_length);
+            if plan.target_player == Some(target) {
+                return Some(point);
+            }
+            let target_position = snapshot.player_position(target)?;
+            (plan.target_player.is_none()
+                && target_position.distance(point) <= SOCCER_SPACE_RUN_ONTO_YARDS)
+                .then_some(point)
+        };
+        let learned_space_runner_target = |targets: &[usize]| {
+            if !dd_soccer_enable_neural_pass_space() || plan.target_player.is_some() {
+                return None;
+            }
+            let point = plan
+                .target_point?
+                .clamp_to_pitch(snapshot.field_width, snapshot.field_length);
+            targets
+                .iter()
+                .copied()
+                .filter_map(|target| {
+                    let position = snapshot.player_position(target)?;
+                    let distance = position.distance(point);
+                    (distance <= SOCCER_SPACE_RUN_ONTO_YARDS).then_some((target, distance))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(target, _)| target)
         };
         if !observation.has_ball
             && snapshot.controlled_possession_team() == Some(self.team.other())
@@ -13199,7 +13297,7 @@ impl PlayerAgent {
                         (
                             SoccerAction::Pass {
                                 target_player: Some(target),
-                                target_point: None,
+                                target_point: learned_pass_target_point(target),
                                 power: 0.62
                                     + 0.28
                                         * crossing
@@ -13217,7 +13315,7 @@ impl PlayerAgent {
                                 (
                                     SoccerAction::Pass {
                                         target_player: Some(target),
-                                        target_point: None,
+                                        target_point: learned_pass_target_point(target),
                                         power: 0.66
                                             + 0.28
                                                 * crossing.max(ability01(
@@ -13235,6 +13333,7 @@ impl PlayerAgent {
                 let target = plan
                     .target_player
                     .filter(|target| visible_targets.contains(target))
+                    .or_else(|| learned_space_runner_target(&visible_targets))
                     .or_else(|| {
                         plan.target_point.and_then(|point| {
                             visible_targets.iter().copied().min_by(|a, b| {
@@ -13259,7 +13358,7 @@ impl PlayerAgent {
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
-                            target_point: None,
+                            target_point: learned_pass_target_point(target),
                             power: 0.60
                                 + 0.26
                                     * crossing.max(ability01(self.skills.passing_completion_rate)),
@@ -13274,6 +13373,7 @@ impl PlayerAgent {
                 let target = plan
                     .target_player
                     .filter(|target| visible_targets.contains(target))
+                    .or_else(|| learned_space_runner_target(&visible_targets))
                     .or_else(|| visible_targets.first().copied());
                 target.map(|target| {
                     let crossing =
@@ -13281,7 +13381,7 @@ impl PlayerAgent {
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
-                            target_point: None,
+                            target_point: learned_pass_target_point(target),
                             power: 0.64
                                 + 0.28
                                     * crossing.max(ability01(self.skills.passing_completion_rate)),
@@ -13302,7 +13402,7 @@ impl PlayerAgent {
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
-                            target_point: None,
+                            target_point: learned_pass_target_point(target),
                             power: 0.62
                                 + 0.24
                                     * ability01(self.skills.passing_completion_rate)
@@ -13326,7 +13426,7 @@ impl PlayerAgent {
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
-                            target_point: None,
+                            target_point: learned_pass_target_point(target),
                             power: 0.46 + 0.22 * ability01(self.skills.passing_completion_rate),
                             flight: PassFlight::Floor,
                         },
@@ -13356,7 +13456,7 @@ impl PlayerAgent {
                         (
                             SoccerAction::Pass {
                                 target_player: Some(target),
-                                target_point: None,
+                                target_point: learned_pass_target_point(target),
                                 power: 0.50
                                     + 0.22
                                         * ability01(self.skills.passing_completion_rate)
@@ -13479,7 +13579,7 @@ impl PlayerAgent {
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
-                            target_point: None,
+                            target_point: learned_pass_target_point(target),
                             power: 0.66
                                 + 0.24
                                     * ability01(self.skills.passing_completion_rate)
@@ -13551,7 +13651,7 @@ impl PlayerAgent {
                         (
                             SoccerAction::Pass {
                                 target_player: Some(target),
-                                target_point: None,
+                                target_point: learned_pass_target_point(target),
                                 power: 0.46
                                     + 0.26
                                         * aerial_duel_skill_from_agent(self)
@@ -13590,15 +13690,21 @@ impl PlayerAgent {
                 // Prefer the quick forward (5-15 yd, open, advanced) teammate when one is on —
                 // played first-time and delivered through the MPC pass path. None when the gate
                 // is off ⇒ falls back to the top-ranked visible target (unchanged).
-                let target = observation
-                    .quick_forward_pass_target
-                    .filter(|id| visible.contains(id))
+                let target = plan
+                    .target_player
+                    .filter(|target| visible.contains(target))
+                    .or_else(|| learned_space_runner_target(&visible))
+                    .or_else(|| {
+                        observation
+                            .quick_forward_pass_target
+                            .filter(|id| visible.contains(id))
+                    })
                     .or_else(|| visible.first().copied());
                 target.map(|target| {
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
-                            target_point: None,
+                            target_point: learned_pass_target_point(target),
                             power: 0.54 + 0.30 * ability01(self.skills.passing_completion_rate),
                             flight: PassFlight::Floor,
                         },
@@ -15399,6 +15505,152 @@ mod learned_policy_option_score_safety_tests {
             override_action.is_none(),
             "forward-pass curriculum should let executable pass choices reach receiver/MPC learning"
         );
+    }
+
+    #[test]
+    fn learned_space_pass_binds_reachable_runner_to_explicit_target_point() {
+        let _guard = ScopedEnvVar::set("DD_SOCCER_ENABLE_NEURAL_PASS_SPACE", "1");
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            dt_seconds: 0.1,
+            seed: 94_504,
+            ..Default::default()
+        });
+        let holder = sim
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home holder")
+            .id;
+        let runner = sim
+            .players
+            .iter()
+            .find(|player| {
+                player.team == Team::Home
+                    && player.role != PlayerRole::Goalkeeper
+                    && player.id != holder
+            })
+            .expect("home runner")
+            .id;
+        let width = sim.config.field_width_yards;
+        let holder_pos = Vec2::new(width * 0.50, 52.0);
+        let runner_pos = Vec2::new(width * 0.50, 61.0);
+        let learned_space = Vec2::new(width * 0.50, 66.0);
+        for player in sim.players.iter_mut() {
+            player.velocity = Vec2::zero();
+            if player.team == Team::Home && player.id != holder && player.id != runner {
+                player.position = Vec2::new(width * 0.12, 20.0 + player.id as f64 * 0.1);
+            } else if player.team == Team::Away {
+                player.position = Vec2::new(width * 0.88, 92.0 + player.id as f64 * 0.1);
+            }
+        }
+        sim.players[holder].position = holder_pos;
+        sim.players[runner].position = runner_pos;
+        sim.ball.holder = Some(holder);
+        sim.ball.position = holder_pos;
+
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let observation = snapshot.observation_for(holder);
+        let learned_plan = SoccerLearnedPlan {
+            action: "pass".to_string(),
+            target_player: None,
+            target_point: Some(learned_space),
+            mpc_replan: None,
+        };
+
+        let (action, label) = sim.players[holder]
+            .action_from_learned_plan(&learned_plan, &snapshot, &observation)
+            .expect("reachable learned space pass should execute");
+
+        assert_eq!(label, "pass");
+        match action {
+            SoccerAction::Pass {
+                target_player,
+                target_point,
+                ..
+            } => {
+                assert_eq!(target_player, Some(runner));
+                let target_point = target_point.expect("learned space point should be preserved");
+                assert!(
+                    target_point.distance(learned_space) < 1e-9,
+                    "executed pass should aim at learned space, got {target_point:?}"
+                );
+            }
+            other => panic!("expected learned space pass, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn learned_space_cross_preserves_explicit_target_point() {
+        let _guard = ScopedEnvVar::set("DD_SOCCER_ENABLE_NEURAL_PASS_SPACE", "1");
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            dt_seconds: 0.1,
+            seed: 94_505,
+            ..Default::default()
+        });
+        let holder = sim
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home holder")
+            .id;
+        let runner = sim
+            .players
+            .iter()
+            .find(|player| {
+                player.team == Team::Home
+                    && player.role != PlayerRole::Goalkeeper
+                    && player.id != holder
+            })
+            .expect("home runner")
+            .id;
+        let width = sim.config.field_width_yards;
+        let holder_pos = Vec2::new(width * 0.18, 78.0);
+        let runner_pos = Vec2::new(width * 0.52, 86.0);
+        let learned_space = Vec2::new(width * 0.54, 91.0);
+        for player in sim.players.iter_mut() {
+            player.velocity = Vec2::zero();
+            if player.team == Team::Home && player.id != holder && player.id != runner {
+                player.position = Vec2::new(width * 0.10, 22.0 + player.id as f64 * 0.1);
+            } else if player.team == Team::Away {
+                player.position = Vec2::new(width * 0.90, 94.0 + player.id as f64 * 0.1);
+            }
+        }
+        sim.players[holder].position = holder_pos;
+        sim.players[runner].position = runner_pos;
+        sim.ball.holder = Some(holder);
+        sim.ball.position = holder_pos;
+
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let observation = snapshot.observation_for(holder);
+        let learned_plan = SoccerLearnedPlan {
+            action: "flank-low-cross".to_string(),
+            target_player: None,
+            target_point: Some(learned_space),
+            mpc_replan: None,
+        };
+
+        let (action, label) = sim.players[holder]
+            .action_from_learned_plan(&learned_plan, &snapshot, &observation)
+            .expect("reachable learned space cross should execute");
+
+        assert_eq!(label, "flank-low-cross");
+        match action {
+            SoccerAction::Pass {
+                target_player,
+                target_point,
+                flight,
+                ..
+            } => {
+                assert_eq!(target_player, Some(runner));
+                assert_eq!(flight, PassFlight::Floor);
+                let target_point = target_point.expect("learned cross point should be preserved");
+                assert!(
+                    target_point.distance(learned_space) < 1e-9,
+                    "executed cross should aim at learned space, got {target_point:?}"
+                );
+            }
+            other => panic!("expected learned space cross, got {:?}", other),
+        }
     }
 
     #[test]
