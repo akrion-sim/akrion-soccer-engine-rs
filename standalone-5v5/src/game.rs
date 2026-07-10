@@ -673,18 +673,23 @@ impl World {
                     if o.team == Team::A {
                         self.ev_pass_completed_a = true; // A pass reached an A player
                         self.last_pass_gain_a = self.ball.x - self.pass_kick_x;
+                        self.pass_streak_a += 1; // toward the 2-pass rule
                     } else {
                         self.ev_turnover_a = true; // A pass intercepted by B
+                        self.pass_streak_a = 0;
                     }
                 }
                 // a B pass intercepted by A is a good steal
                 if pp.team == Team::B && o.team == Team::A {
                     self.ev_win_ball_a = true;
+                    self.pass_streak_a = 0; // fresh possession
                 }
             } else if matches!(prev_touch, Some(Team::A)) && o.team == Team::B {
                 self.ev_turnover_a = true;
+                self.pass_streak_a = 0;
             } else if matches!(prev_touch, Some(Team::B)) && o.team == Team::A {
                 self.ev_win_ball_a = true; // won a loose ball off B
+                self.pass_streak_a = 0;
             }
             self.last_touch = Some(o.team);
             self.pending_pass = None;
