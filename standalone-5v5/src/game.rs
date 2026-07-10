@@ -702,20 +702,20 @@ impl World {
                     Some((owner, lead.sub(me), PASS_SPEED, true))
                 } else {
                     // no valid target: dribble forward instead
-                    self.set_vel(team, idx, V2::new(sx, 0.0).scale(PLAYER_SPEED));
+                    self.set_vel(team, idx, V2::new(sx, 0.0).scale(DRIBBLE_SPEED));
                     None
                 }
             }
             A_DRIB_FWD => {
-                self.set_vel(team, idx, V2::new(sx, 0.0).scale(PLAYER_SPEED));
+                self.set_vel(team, idx, V2::new(sx, 0.0).scale(DRIBBLE_SPEED));
                 None
             }
             A_DRIB_LEFT => {
-                self.set_vel(team, idx, V2::new(0.0, -1.0).scale(PLAYER_SPEED));
+                self.set_vel(team, idx, V2::new(0.0, -1.0).scale(DRIBBLE_SPEED));
                 None
             }
             A_DRIB_RIGHT => {
-                self.set_vel(team, idx, V2::new(0.0, 1.0).scale(PLAYER_SPEED));
+                self.set_vel(team, idx, V2::new(0.0, 1.0).scale(DRIBBLE_SPEED));
                 None
             }
             A_CLEAR => {
