@@ -73,21 +73,37 @@ def main():
     after_a = float(m_fin.group(3)) if m_fin else curve[-1]["ga"]
     after_b = float(m_fin.group(4)) if m_fin else curve[-1]["gb"]
 
-    passes = float(m_fin.group(5)) if (m_fin and m_fin.group(5)) else 0.0
-    spacing = float(m_fin.group(6)) if (m_fin and m_fin.group(6)) else 0.0
-    bunch = float(m_fin.group(7)) if (m_fin and m_fin.group(7)) else 0.0
-    iters = curve[-1]["iter"]
+    # Prefer the accurate FINAL 300-game CSV row for all trained-model stats.
+    fg = lambda k, d=0.0: (final.get(k) if final.get(k) is not None else d)
+    passes = fg("pass_cmp")
+    spacing = fg("spacing")
+    bunch = fg("bunch") * 100.0
+    pa = fg("pass_att")
+    pct = lambda x: (100.0 * x / pa) if pa > 0 else 0.0
+    iters = best_iter
     meta = {
         "before_diff": fmt_diff(before_diff),
         "before_wr": before_wr,
         "before_score": f"{before_a:.1f}–{before_b:.1f} goals",
-        "after_diff": fmt_diff(after_diff),
-        "after_wr": after_wr,
-        "after_score": f"{after_a:.1f}–{after_b:.1f} · {passes:.0f} passes/gm",
-        "swing": fmt_diff(after_diff - before_diff),
+        "after_diff": fmt_diff(fg("avg_goal_diff", after_diff)),
+        "after_wr": fg("winrate", after_wr),
+        "after_score": f"{fg('goals_a', after_a):.1f}–{fg('goals_b', after_b):.1f} · {passes:.0f} passes/gm",
+        "swing": fmt_diff(fg("avg_goal_diff", after_diff) - before_diff),
         "passes": round(passes, 1),
         "spacing": round(spacing, 1),
         "bunch": round(bunch, 0),
+        # richer analytics (trained model, 300-game average)
+        "pass_att": round(pa, 1),
+        "pass_completion": round(fg("pass_completion") * 100.0, 0),
+        "pass_fwd_pct": round(pct(fg("pass_fwd")), 0),
+        "pass_lat_pct": round(pct(fg("pass_lat")), 0),
+        "pass_back_pct": round(pct(fg("pass_back")), 0),
+        "shots": round(fg("shots"), 1),
+        "shots_scored": round(fg("shots_scored"), 1),
+        "conversion": round(fg("conversion") * 100.0, 0),
+        "possession": round(fg("possession") * 100.0, 0),
+        "turnovers": round(fg("turnovers"), 1),
+        "balls_won": round(fg("balls_won"), 1),
         "iters": iters,
         "minutes": "~6 min on a laptop",
     }
