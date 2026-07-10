@@ -640,24 +640,20 @@ impl World {
 
     fn apply_off_ball(&mut self, team: Team, idx: usize, a: usize) {
         let me = players(team, self)[idx].pos;
-        let sx = team.sx();
+        let team_owns = matches!(self.owner, Some(o) if o.team == team);
         let target = match a {
             A_CHASE => self.ball,
-            A_SUPPORT => {
-                // ahead of the ball toward the attacked goal
-                let g = team.target_goal();
-                self.ball.add(g.sub(self.ball).unit().scale(14.0))
-            }
+            // SUPPORT: push UPFIELD into open space (attacking run).
+            A_SUPPORT => self.open_space_target(team, idx, 1.2),
+            // SPREAD: find open space; drift up/down field per possession.
             A_SPREAD => {
-                // move toward the nearest open lateral wing at own attacking third
-                let wing_y = if me.y < FIELD_W / 2.0 { 6.0 } else { FIELD_W - 6.0 };
-                let fwd_x = (me.x + sx * 12.0).clamp(4.0, FIELD_L - 4.0);
-                V2::new(fwd_x, wing_y)
+                let bias = if team_owns { 0.4 } else { -0.4 };
+                self.open_space_target(team, idx, bias)
             }
+            // MARK: drop DOWNFIELD, goal-side of the nearest opponent (defend).
             A_MARK => {
                 let (oi, _) = self.nearest_opponent(team, me);
                 let opp = players(team.other(), self)[oi].pos;
-                // stand goal-side of the marked opponent
                 let own_goal = team.own_goal();
                 opp.add(own_goal.sub(opp).unit().scale(2.5))
             }
@@ -670,6 +666,51 @@ impl World {
             dir.unit().scale(PLAYER_SPEED)
         };
         self.set_vel(team, idx, v);
+    }
+
+    /// "Move where there is space." Samples a ring of candidate points around
+    /// the player and returns the one that maximizes distance to every other
+    /// player, plus an up/down-field bias (positive = upfield toward the
+    /// attacked goal, negative = downfield to defend). No formation, no shape
+    /// LP — purely possession- and space-driven, as a real 5-a-side plays.
+    fn open_space_target(&self, team: Team, idx: usize, field_bias: f32) -> V2 {
+        let me = players(team, self)[idx].pos;
+        let sx = team.sx();
+        let radii = [7.0f32, 14.0, 21.0];
+        let ndir = 8usize;
+        let mut best = me;
+        let mut best_score = f32::NEG_INFINITY;
+        for &r in &radii {
+            for k in 0..ndir {
+                let ang = (k as f32) / (ndir as f32) * std::f32::consts::TAU;
+                let cand = V2::new(
+                    (me.x + ang.cos() * r).clamp(3.0, FIELD_L - 3.0),
+                    (me.y + ang.sin() * r).clamp(3.0, FIELD_W - 3.0),
+                );
+                // openness = distance to nearest OTHER player (either team)
+                let mut min_d = f32::INFINITY;
+                for t in [Team::A, Team::B] {
+                    for j in 0..N {
+                        if t == team && j == idx {
+                            continue;
+                        }
+                        let d = players(t, self)[j].pos.sub(cand).len();
+                        if d < min_d {
+                            min_d = d;
+                        }
+                    }
+                }
+                let fwd = (cand.x - me.x) * sx; // upfield progress in attack frame
+                // stay loosely connected to the ball's vertical lane
+                let lane = -(cand.y - self.ball.y).abs() * 0.08;
+                let score = min_d + field_bias * fwd + lane;
+                if score > best_score {
+                    best_score = score;
+                    best = cand;
+                }
+            }
+        }
+        best
     }
 
     fn set_vel(&mut self, team: Team, idx: usize, v: V2) {
