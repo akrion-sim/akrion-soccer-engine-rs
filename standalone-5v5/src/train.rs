@@ -95,6 +95,7 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
     let mut logp_buf: Vec<[f32; N]> = Vec::with_capacity(STEPS);
     let mut val_buf: Vec<[f32; N]> = Vec::with_capacity(STEPS);
     let mut rew_buf: Vec<f32> = Vec::with_capacity(STEPS);
+    let mut space_buf: Vec<[f32; N]> = Vec::with_capacity(STEPS); // per-player spacing reward
 
     let mut phi_prev = w.potential_a();
 
