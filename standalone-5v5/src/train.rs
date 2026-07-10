@@ -13,7 +13,7 @@ const LR_ACTOR: f32 = 3e-4;
 const LR_CRITIC: f32 = 1e-3;
 const EPOCHS: usize = 4;
 const MINIBATCH: usize = 1024;
-const W_SHAPE: f32 = 1.0; // potential shaping (per-tick) halved for 20 Hz
+const W_SHAPE: f32 = 1.6; // potential shaping (per-tick): stronger pull toward goal
 const ENT_BETA0: f32 = 0.02;
 
 // Teammate-spacing reward weight. Overridable via SPACING_W env for tuning.
