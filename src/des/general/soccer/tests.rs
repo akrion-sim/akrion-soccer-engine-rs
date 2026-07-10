@@ -68781,6 +68781,7 @@ fn clean_targeted_floor_pass_completes_through_ball_agent_loop() {
     assert_eq!(pending.flight, PassFlight::Floor);
     assert_eq!(sim.ball.holder, None);
     assert_eq!(sim.stats.passes_attempted_home, 1);
+    assert_eq!(sim.stats.intentional_passes_attempted_home, 1);
     sim.players[passer].position = Vec2::new(34.0, 36.0);
     sim.players[passer].home_position = sim.players[passer].position;
     sim.players[passer].velocity = Vec2::zero();
@@ -68809,6 +68810,8 @@ fn clean_targeted_floor_pass_completes_through_ball_agent_loop() {
     assert_eq!(sim.ball.last_touch_team, Some(Team::Home));
     assert!(sim.pending_pass.is_none());
     assert_eq!(sim.stats.passes_completed_home, 1);
+    assert_eq!(sim.stats.intentional_passes_completed_home, 1);
+    assert_eq!(sim.stats.intentional_passes_completed_forward_home, 1);
     assert_eq!(
         sim.ball
             .last_decision

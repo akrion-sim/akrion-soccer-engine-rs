@@ -4184,6 +4184,22 @@ const ATTACK_SUPPORT_SPACING_MAX_YARDS: f64 = 16.0;
 const ATTACK_SUPPORT_SPACING_FAR_DECAY_YARDS: f64 = 10.0;
 const ATTACK_SUPPORT_SPACING_SHAPE_REWARD: f64 = 0.32;
 pub(crate) const OUTSIDE_MID_TAKEON_COVER_CLEAR_YARDS: f64 = 10.0;
+
+/// Amplify the dense OFF-BALL "make a supporting run / move to space" rewards so teammates learn
+/// to get open — creating safe passing options and cutting the hoof-and-give-away turnovers.
+/// Env `SOCCER_OFFBALL_SUPPORT_REWARD_SCALE` (default 1.0 = byte-identical), clamped [1, 10].
+pub(crate) fn offball_support_reward_scale() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("SOCCER_OFFBALL_SUPPORT_REWARD_SCALE")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(1.0, 10.0))
+            .unwrap_or(1.0)
+    })
+}
 const OUTSIDE_MID_TAKEON_ISOLATION_REWARD: f64 = 0.14;
 // Defensive recovery: a contestable ball within this many yards of our back line
 // (2nd-to-last defender) demands max sprint effort; above this recovery effort the
@@ -19696,6 +19712,17 @@ pub struct MatchStats {
     pub passes_attempted_away: u32,
     pub passes_completed_home: u32,
     pub passes_completed_away: u32,
+    // Strict pass KPIs: only targeted passes to a distinct teammate. These exclude
+    // loose clearances and same-player recovery/bookkeeping effects, so proof runs
+    // can track real pass learning separately from broad live pass activity.
+    #[serde(default)]
+    pub intentional_passes_attempted_home: u32,
+    #[serde(default)]
+    pub intentional_passes_attempted_away: u32,
+    #[serde(default)]
+    pub intentional_passes_completed_home: u32,
+    #[serde(default)]
+    pub intentional_passes_completed_away: u32,
     // Completed passes split by direction (forward vs backward relative to the
     // attacking goal). Lets us see how much of the high completion rate is safe
     // backward/square recycling vs genuine forward progression.
@@ -19707,12 +19734,24 @@ pub struct MatchStats {
     pub passes_completed_backward_home: u32,
     #[serde(default)]
     pub passes_completed_backward_away: u32,
+    #[serde(default)]
+    pub intentional_passes_completed_forward_home: u32,
+    #[serde(default)]
+    pub intentional_passes_completed_forward_away: u32,
+    #[serde(default)]
+    pub intentional_passes_completed_backward_home: u32,
+    #[serde(default)]
+    pub intentional_passes_completed_backward_away: u32,
     // Learning-progress pass metrics. Sum of per-pass forward yards over COMPLETED passes
     // (can be negative); divide by passes_completed for the average yards gained per pass.
     #[serde(default)]
     pub completed_pass_gain_yards_home: f64,
     #[serde(default)]
     pub completed_pass_gain_yards_away: f64,
+    #[serde(default)]
+    pub intentional_completed_pass_gain_yards_home: f64,
+    #[serde(default)]
+    pub intentional_completed_pass_gain_yards_away: f64,
     // Consecutive-completed-pass chains (>= 2 passes by the same team without a turnover):
     // how many, their total gained yards, and how many ended in a NET yards loss (the
     // "avoid sequences that go backwards" signal).
@@ -19762,6 +19801,10 @@ pub struct MatchStats {
     pub pass_interceptions_own_half: u32,
     #[serde(default)]
     pub pass_interceptions_opp_half: u32,
+    #[serde(default)]
+    pub intentional_pass_interceptions_own_half: u32,
+    #[serde(default)]
+    pub intentional_pass_interceptions_opp_half: u32,
     #[serde(default)]
     pub clearances_home: u32,
     #[serde(default)]
@@ -20221,6 +20264,18 @@ pub(crate) struct PendingPass {
     /// (`DD_SOCCER_ENABLE_LEARNED_CURVE`); `0.0` when the bend axis is off, so the RWR credit still
     /// matches the action actually taken.
     mpc_objective: Option<(Vec<f32>, Vec2, f64)>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PendingPassLaunchDiag {
+    pub(crate) action_label: String,
+    pub(crate) from: usize,
+    pub(crate) launch_tick: u64,
+    pub(crate) explicit_target_point: bool,
+    pub(crate) target_point_receiver_distance_yards: f64,
+    pub(crate) forward_yards: f64,
+    pub(crate) distance_yards: f64,
+    pub(crate) flight: PassFlight,
 }
 
 /// A goal counts as assisted only when the setting-up completed pass landed within this many
@@ -26940,7 +26995,9 @@ fn dense_soccer_transition_reward(
     {
         let before_fit = attacking_support_shape_fit(before_obs);
         let after_fit = attacking_support_shape_fit(&after_obs);
-        reward += (after_fit - before_fit).clamp(-1.0, 1.0) * ATTACK_SUPPORT_SPACING_SHAPE_REWARD;
+        reward += (after_fit - before_fit).clamp(-1.0, 1.0)
+            * ATTACK_SUPPORT_SPACING_SHAPE_REWARD
+            * offball_support_reward_scale();
     }
     // TEAM UPFIELD ADVANCE (MARL / MAPPO): when we control the ball and the carrier has space to
     // advance into, reward the WHOLE team for pushing forward as a unit — the carrier for driving
@@ -26975,7 +27032,8 @@ fn dense_soccer_transition_reward(
             let offside_forward_run = offside_support && player_forward > 0.0;
             if player_forward > 0.0 && !offside_support {
                 reward += (player_forward / TEAM_ADVANCE_REWARD_REFERENCE_YARDS).clamp(0.0, 1.0)
-                    * TEAM_ADVANCE_SUPPORT_RUN_REWARD;
+                    * TEAM_ADVANCE_SUPPORT_RUN_REWARD
+                    * offball_support_reward_scale();
             } else if offside_forward_run {
                 reward -= TEAM_ADVANCE_SUPPORT_FAILURE_PENALTY;
             } else if !offside_support && (player_forward < -0.25 || moved_yards < 0.10) {
