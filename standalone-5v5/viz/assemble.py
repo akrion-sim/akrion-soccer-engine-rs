@@ -66,6 +66,7 @@ def main():
 
     passes = float(m_fin.group(5)) if (m_fin and m_fin.group(5)) else 0.0
     spacing = float(m_fin.group(6)) if (m_fin and m_fin.group(6)) else 0.0
+    bunch = float(m_fin.group(7)) if (m_fin and m_fin.group(7)) else 0.0
     iters = curve[-1]["iter"]
     meta = {
         "before_diff": fmt_diff(before_diff),
