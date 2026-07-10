@@ -470,6 +470,11 @@ impl World {
             if self.pass_candidates(team, idx)[1].is_none() {
                 m[A_PASS_B] = false;
             }
+            // 2-PASS RULE (Team A): no shooting until 2 completed passes this
+            // possession — forces build-up play, not solo dribble-and-shoot.
+            if team == Team::A && self.pass_streak_a < 2 {
+                m[A_SHOOT] = false;
+            }
         } else {
             for a in A_CHASE..=A_STAY {
                 m[a] = true;
