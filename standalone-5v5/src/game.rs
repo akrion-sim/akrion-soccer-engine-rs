@@ -156,6 +156,11 @@ pub struct World {
     pub last_pass_gain_a: f32,        // forward metres gained by the last completed A pass
     pub pass_streak_a: u32,           // completed A passes in the current possession (2-pass rule)
     a_shot_flag: bool,                // the current free ball came from a Team-A shot (gates goals)
+    lp_from: i32,                     // passer index of the last completed A pass
+    lp_to: i32,                       // receiver index of the last completed A pass
+    pending_passer: i32,              // passer index of the in-flight A pass
+    pub return_streak_a: u32,         // consecutive "pass back to the giver" (ping-pong) count
+    pub ev_return_pass_a: bool,       // this tick's A pass went back to the giver (ping-pong)
 }
 
 fn players(team: Team, w: &World) -> &[Player; N] {
