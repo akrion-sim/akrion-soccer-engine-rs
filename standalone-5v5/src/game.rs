@@ -364,6 +364,9 @@ impl World {
         }
     }
 
+    /// Fraction of the lane from `from` to `to` clear of outfield opponents
+    /// (0..1, 1 = fully clear). The keeper is excluded — it is scored separately
+    /// in finishing. Used to define a truly OPEN receiver (clear passing lane).
     pub fn lane_clearness(&self, team: Team, from: V2, to: V2) -> f32 {
         let dir = to.sub(from);
         let dist = dir.len();
