@@ -26968,7 +26968,9 @@ fn dense_soccer_transition_reward(
     {
         let before_fit = attacking_support_shape_fit(before_obs);
         let after_fit = attacking_support_shape_fit(&after_obs);
-        reward += (after_fit - before_fit).clamp(-1.0, 1.0) * ATTACK_SUPPORT_SPACING_SHAPE_REWARD;
+        reward += (after_fit - before_fit).clamp(-1.0, 1.0)
+            * ATTACK_SUPPORT_SPACING_SHAPE_REWARD
+            * offball_support_reward_scale();
     }
     // TEAM UPFIELD ADVANCE (MARL / MAPPO): when we control the ball and the carrier has space to
     // advance into, reward the WHOLE team for pushing forward as a unit — the carrier for driving
