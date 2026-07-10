@@ -227,7 +227,7 @@ fn run_training(iters: usize) {
     // Baseline reference: how does the *scripted* team fare vs itself, and how
     // does an UNTRAINED (random) policy fare vs scripted?
     let (svs, sga, sgb) = train::evaluate_scripted_vs_scripted(100, &mut rng);
-    let (d0, w0, ga0, gb0, _p0, sp0, _b0) = train::evaluate(&policy, 100, &mut rng);
+    let s0 = train::evaluate(&policy, 100, &mut rng);
     println!("=== 5-a-side standalone learning demo ===");
     println!(
         "scripted-vs-scripted:   goal_diff={:+.2}  (A {:.2} / B {:.2})",
@@ -235,7 +235,7 @@ fn run_training(iters: usize) {
     );
     println!(
         "untrained-vs-scripted:  goal_diff={:+.2}  winrate={:.2}  (A {:.2} / B {:.2})  spacing={:.1}",
-        d0, w0, ga0, gb0, sp0
+        s0.goal_diff, s0.winrate, s0.ga, s0.gb, s0.spacing
     );
     println!("training for {} iterations (8 games/iter)...\n", iters);
 
