@@ -120,10 +120,10 @@ fn run_training(iters: usize) {
     let policy = best_policy;
 
     // Final richer evaluation.
-    let (d, wr, ga, gb, passes) = train::evaluate(&policy, 300, &mut rng);
+    let (d, wr, ga, gb, passes, spacing) = train::evaluate(&policy, 300, &mut rng);
     println!(
-        "\nFINAL (300 games): goal_diff={:+.3}  winrate={:.3}  goals {:.2}-{:.2}  passes/game {:.1}",
-        d, wr, ga, gb, passes
+        "\nFINAL (300 games): goal_diff={:+.3}  winrate={:.3}  goals {:.2}-{:.2}  passes/game {:.1}  spacing={:.1}",
+        d, wr, ga, gb, passes, spacing
     );
     if d > 0.0 {
         println!(">>> The learned policy BEATS the scripted analytic baseline. <<<");
