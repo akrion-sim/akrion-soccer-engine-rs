@@ -575,6 +575,11 @@ fn main() {
             let ckpt = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(5);
             train_ckpt(prefix, games, minutes, seed, ckpt);
         }
+        Some("fresh") => {
+            let out = args.get(2).expect("usage: fresh <out.json> [seed_hex]");
+            let seed = parse_hex(args.get(3), 0x0F1E_5100);
+            fresh_snapshot(out, seed);
+        }
         Some("eval") => {
             let cand = args.get(2).expect("usage: eval <candidate|analytic> <baseline|analytic> <games> <minutes> <holdout_hex>");
             let base = args
