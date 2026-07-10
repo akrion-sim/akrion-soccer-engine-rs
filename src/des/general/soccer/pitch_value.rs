@@ -181,17 +181,30 @@ struct LearnedEpvGrid {
 }
 
 pub(crate) fn dd_soccer_enable_learned_epv() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        matches!(
+    #[cfg(test)]
+    {
+        return matches!(
             std::env::var("DD_SOCCER_ENABLE_LEARNED_EPV")
                 .ok()
                 .as_deref()
                 .map(str::trim),
             Some("1") | Some("true") | Some("yes") | Some("on")
-        )
-    })
+        );
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| {
+            matches!(
+                std::env::var("DD_SOCCER_ENABLE_LEARNED_EPV")
+                    .ok()
+                    .as_deref()
+                    .map(str::trim),
+                Some("1") | Some("true") | Some("yes") | Some("on")
+            )
+        })
+    }
 }
 
 fn learned_epv_grid() -> Option<&'static LearnedEpvGrid> {
@@ -397,9 +410,11 @@ pub fn pitch_control_home(players: &[PlayerSnapshot], cell: Vec2) -> f64 {
     }
 }
 
-/// Integral of `control(team) × expected_threat(team)` over the grid — a single
-/// scalar for how much **dangerous space the team currently controls**. Averaged
-/// over cells, so it is bounded on the same scale as [`expected_threat`].
+/// Integral of `control(team) × value(team)` over the grid — a single scalar for
+/// how much **dangerous space the team currently controls**. The value surface is
+/// learned EPV when `DD_SOCCER_ENABLE_LEARNED_EPV` has a grid, otherwise the
+/// deterministic closed-form [`expected_threat`] seed. Averaged over cells, so it
+/// is bounded on the same scale as the active value surface.
 pub fn team_expected_threat(snapshot: &WorldSnapshot, team: Team) -> f64 {
     let field_width = snapshot.field_width;
     let field_length = snapshot.field_length;
@@ -742,6 +757,57 @@ mod tests {
         assert!(
             high > deep,
             "advancing should raise threat: {deep} -> {high}"
+        );
+    }
+
+    #[test]
+    fn learned_epv_replaces_xt_seed_inside_team_potential_when_enabled() {
+        let _lock = PITCH_VALUE_ENV_LOCK.lock().expect("pitch value env lock");
+        let make = |home_y: f64| {
+            snapshot_with(
+                vec![
+                    player_at(0, Team::Home, Vec2::new(W * 0.5, home_y), Vec2::zero()),
+                    player_at(1, Team::Away, Vec2::new(W * 0.5, L * 0.5), Vec2::zero()),
+                ],
+                Vec2::new(W * 0.5, home_y),
+            )
+        };
+        let deep = make(L * 0.30);
+        let high = make(L * 0.85);
+
+        std::env::remove_var("DD_SOCCER_ENABLE_LEARNED_EPV");
+        std::env::remove_var("DD_SOCCER_LEARNED_EPV_GRID_PATH");
+        let seed_deep = team_expected_threat(&deep, Team::Home);
+        let seed_high = team_expected_threat(&high, Team::Home);
+        assert!(
+            seed_high > seed_deep,
+            "closed-form xT seed should value advanced control: {seed_deep} -> {seed_high}"
+        );
+
+        let grid: Vec<Vec<f64>> = (0..PITCH_VALUE_GRID_ROWS)
+            .map(|r| vec![(PITCH_VALUE_GRID_ROWS - r) as f64; PITCH_VALUE_GRID_COLS])
+            .collect();
+        let raw = serde_json::json!({
+            "rows": PITCH_VALUE_GRID_ROWS,
+            "cols": PITCH_VALUE_GRID_COLS,
+            "grid": grid
+        });
+        let grid_path = std::env::temp_dir().join(format!(
+            "akrion-test-learned-epv-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&grid_path, raw.to_string()).expect("write test EPV grid");
+
+        std::env::set_var("DD_SOCCER_ENABLE_LEARNED_EPV", "1");
+        std::env::set_var("DD_SOCCER_LEARNED_EPV_GRID_PATH", &grid_path);
+        let learned_deep = team_expected_threat(&deep, Team::Home);
+        let learned_high = team_expected_threat(&high, Team::Home);
+        std::env::remove_var("DD_SOCCER_ENABLE_LEARNED_EPV");
+        std::env::remove_var("DD_SOCCER_LEARNED_EPV_GRID_PATH");
+
+        assert!(
+            learned_deep > learned_high,
+            "learned EPV grid must drive the potential when enabled: {learned_deep} vs {learned_high}"
         );
     }
 

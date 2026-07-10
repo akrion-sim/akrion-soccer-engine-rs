@@ -19712,6 +19712,17 @@ pub struct MatchStats {
     pub passes_attempted_away: u32,
     pub passes_completed_home: u32,
     pub passes_completed_away: u32,
+    // Strict pass KPIs: only targeted passes to a distinct teammate. These exclude
+    // loose clearances and same-player recovery/bookkeeping effects, so proof runs
+    // can track real pass learning separately from broad live pass activity.
+    #[serde(default)]
+    pub intentional_passes_attempted_home: u32,
+    #[serde(default)]
+    pub intentional_passes_attempted_away: u32,
+    #[serde(default)]
+    pub intentional_passes_completed_home: u32,
+    #[serde(default)]
+    pub intentional_passes_completed_away: u32,
     // Completed passes split by direction (forward vs backward relative to the
     // attacking goal). Lets us see how much of the high completion rate is safe
     // backward/square recycling vs genuine forward progression.
@@ -19723,12 +19734,24 @@ pub struct MatchStats {
     pub passes_completed_backward_home: u32,
     #[serde(default)]
     pub passes_completed_backward_away: u32,
+    #[serde(default)]
+    pub intentional_passes_completed_forward_home: u32,
+    #[serde(default)]
+    pub intentional_passes_completed_forward_away: u32,
+    #[serde(default)]
+    pub intentional_passes_completed_backward_home: u32,
+    #[serde(default)]
+    pub intentional_passes_completed_backward_away: u32,
     // Learning-progress pass metrics. Sum of per-pass forward yards over COMPLETED passes
     // (can be negative); divide by passes_completed for the average yards gained per pass.
     #[serde(default)]
     pub completed_pass_gain_yards_home: f64,
     #[serde(default)]
     pub completed_pass_gain_yards_away: f64,
+    #[serde(default)]
+    pub intentional_completed_pass_gain_yards_home: f64,
+    #[serde(default)]
+    pub intentional_completed_pass_gain_yards_away: f64,
     // Consecutive-completed-pass chains (>= 2 passes by the same team without a turnover):
     // how many, their total gained yards, and how many ended in a NET yards loss (the
     // "avoid sequences that go backwards" signal).
@@ -19778,6 +19801,10 @@ pub struct MatchStats {
     pub pass_interceptions_own_half: u32,
     #[serde(default)]
     pub pass_interceptions_opp_half: u32,
+    #[serde(default)]
+    pub intentional_pass_interceptions_own_half: u32,
+    #[serde(default)]
+    pub intentional_pass_interceptions_opp_half: u32,
     #[serde(default)]
     pub clearances_home: u32,
     #[serde(default)]
@@ -38917,11 +38944,27 @@ pub struct SoccerNeuralNetworkSnapshot {
     /// localhost/live server can consume the same push/drop head the learner warmed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line_depth_head: Option<Box<SoccerAuxiliaryHeadSnapshot>>,
+    /// Optional carried learned pass-completion head. This is the execution-side
+    /// P(complete) model consumed by `pass_target_quality_for_snapshot`; carrying it
+    /// in frozen neural artifacts lets eval/live serve learned completion rather than
+    /// falling back to the analytic completion scaffold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass_completion_head: Option<Box<SoccerAuxiliaryHeadSnapshot>>,
     /// Optional carried learned MPC execution-objective head. This is the aim/lead
     /// residual head consumed by MPC at execution time; carrying it in the same
     /// neural sidecar keeps eval/live loads in sync with the trainer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mpc_objective_head: Option<Box<SoccerAuxiliaryHeadSnapshot>>,
+    /// Optional carried attacking-spacing target head. This is the learned formation
+    /// spacing band consumed by off-ball support and formation LP, so proof/live loads
+    /// can deploy what the learner discovered about keeping teammates in useful space.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attack_spacing_head: Option<Box<SoccerAuxiliaryHeadSnapshot>>,
+    /// Optional carried support-candidate scorer. This preserves the learned
+    /// destination-value model behind `open_space_for` so same-team runs can improve
+    /// across checkpoints instead of reverting to the analytic candidate surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub support_scorer_head: Option<Box<SoccerAuxiliaryHeadSnapshot>>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -39116,6 +39159,32 @@ impl SoccerPassCompletionHead {
         self.training_steps
     }
 
+    pub(crate) fn to_snapshot(&self) -> SoccerAuxiliaryHeadSnapshot {
+        let mut network = soccer_neural_network_snapshot(&self.network);
+        network.training_steps = self.training_steps;
+        network.average_loss = self.last_loss;
+        SoccerAuxiliaryHeadSnapshot {
+            network,
+            training_steps: self.training_steps,
+            average_loss: self.last_loss,
+        }
+    }
+
+    pub fn from_snapshot(snapshot: &SoccerAuxiliaryHeadSnapshot) -> Result<Self, String> {
+        let network = build_soccer_feed_forward_network_from_snapshot(
+            &snapshot.network,
+            SOCCER_PASS_COMPLETION_FEATURE_DIM,
+            1,
+            &[SOCCER_PASS_COMPLETION_FEATURE_DIM_V1],
+            "pass-completion head",
+        )?;
+        Ok(SoccerPassCompletionHead {
+            network,
+            training_steps: snapshot.training_steps.max(snapshot.network.training_steps),
+            last_loss: snapshot.average_loss.or(snapshot.network.average_loss),
+        })
+    }
+
     /// Mean prediction accuracy over `samples` at a 0.5 decision threshold — a quick read on
     /// whether the head has actually learned the corpus (used by the training report).
     pub(crate) fn accuracy(&self, samples: &[SoccerPassOutcomeSample]) -> f64 {
@@ -39145,6 +39214,23 @@ pub const PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS: usize = 200;
 /// Weight given to the learned head's P(complete) when blended with the analytic completion
 /// estimate (the rest stays analytic). Conservative: the head nudges, it does not replace.
 const PASS_COMPLETION_HEAD_BLEND_WEIGHT: f64 = 0.5;
+/// Learned completion is allowed to veto/reduce any pass, but uplift above the analytic scaffold
+/// ramps in only once the target is usefully progressive. This keeps a binary P(complete) head from
+/// farming tiny forward pokes that lift volume while collapsing yards/completed-pass.
+const PASS_COMPLETION_HEAD_UPLIFT_MIN_FORWARD_YARDS: f64 = 4.0;
+const PASS_COMPLETION_HEAD_UPLIFT_FULL_FORWARD_YARDS: f64 = 9.0;
+const PASS_COMPLETION_HEAD_UPLIFT_RUN_EVIDENCE_SECONDS: f64 = 1.0;
+
+fn pass_completion_head_progressive_uplift_weight(target_forward_yards: f64) -> f64 {
+    if !target_forward_yards.is_finite() {
+        return 0.0;
+    }
+    ((target_forward_yards - PASS_COMPLETION_HEAD_UPLIFT_MIN_FORWARD_YARDS)
+        / (PASS_COMPLETION_HEAD_UPLIFT_FULL_FORWARD_YARDS
+            - PASS_COMPLETION_HEAD_UPLIFT_MIN_FORWARD_YARDS)
+            .max(1e-6))
+    .clamp(0.0, 1.0)
+}
 
 fn pass_completion_head_blend_weight() -> f64 {
     #[cfg(test)]
@@ -43134,7 +43220,10 @@ fn soccer_neural_network_snapshot(network: &FeedForwardNetwork) -> SoccerNeuralN
         skill_policy_heads: None,
         keeper_policy_head: None,
         line_depth_head: None,
+        pass_completion_head: None,
         mpc_objective_head: None,
+        attack_spacing_head: None,
+        support_scorer_head: None,
     }
 }
 
@@ -63390,8 +63479,23 @@ fn pass_target_quality_for_snapshot_uncached(
                 );
                 if let Some(learned) = head.predict(&features) {
                     let blend_weight = pass_completion_head_blend_weight();
-                    expected_completion = expected_completion * (1.0 - blend_weight)
-                        + learned.clamp(0.0, 1.0) * blend_weight;
+                    let learned = learned.clamp(0.0, 1.0);
+                    let blended =
+                        expected_completion * (1.0 - blend_weight) + learned * blend_weight;
+                    if blended <= expected_completion {
+                        expected_completion = blended;
+                    } else {
+                        let receiver_current_forward =
+                            (target_position.y - passer_position.y) * passer.team.attack_dir();
+                        let receiver_run_forward = (target_velocity.y * passer.team.attack_dir())
+                            .max(0.0)
+                            * PASS_COMPLETION_HEAD_UPLIFT_RUN_EVIDENCE_SECONDS;
+                        let uplift_forward =
+                            target_forward.min(receiver_current_forward + receiver_run_forward);
+                        let uplift_weight =
+                            pass_completion_head_progressive_uplift_weight(uplift_forward);
+                        expected_completion += (blended - expected_completion) * uplift_weight;
+                    }
                 }
             }
         }

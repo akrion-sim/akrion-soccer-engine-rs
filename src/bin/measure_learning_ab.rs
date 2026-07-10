@@ -43,6 +43,11 @@ struct GameKpis {
     passes_completed: f64,
     passes_forward: f64,
     pass_turnovers: f64,
+    intentional_passes_attempted: f64,
+    intentional_passes_completed: f64,
+    intentional_passes_forward: f64,
+    intentional_pass_turnovers: f64,
+    intentional_pass_gain_yards: f64,
     pass_chains: f64,
     pass_chain_gain_yards: f64,
     pass_chains_net_loss: f64,
@@ -61,6 +66,11 @@ impl GameKpis {
         self.passes_completed += other.passes_completed;
         self.passes_forward += other.passes_forward;
         self.pass_turnovers += other.pass_turnovers;
+        self.intentional_passes_attempted += other.intentional_passes_attempted;
+        self.intentional_passes_completed += other.intentional_passes_completed;
+        self.intentional_passes_forward += other.intentional_passes_forward;
+        self.intentional_pass_turnovers += other.intentional_pass_turnovers;
+        self.intentional_pass_gain_yards += other.intentional_pass_gain_yards;
         self.pass_chains += other.pass_chains;
         self.pass_chain_gain_yards += other.pass_chain_gain_yards;
         self.pass_chains_net_loss += other.pass_chains_net_loss;
@@ -79,6 +89,11 @@ impl GameKpis {
             passes_completed: self.passes_completed * inv,
             passes_forward: self.passes_forward * inv,
             pass_turnovers: self.pass_turnovers * inv,
+            intentional_passes_attempted: self.intentional_passes_attempted * inv,
+            intentional_passes_completed: self.intentional_passes_completed * inv,
+            intentional_passes_forward: self.intentional_passes_forward * inv,
+            intentional_pass_turnovers: self.intentional_pass_turnovers * inv,
+            intentional_pass_gain_yards: self.intentional_pass_gain_yards * inv,
             pass_chains: self.pass_chains * inv,
             pass_chain_gain_yards: self.pass_chain_gain_yards * inv,
             pass_chains_net_loss: self.pass_chains_net_loss * inv,
@@ -90,11 +105,19 @@ impl GameKpis {
 
     fn print_row(&self, label: &str) {
         let pass_completion = ratio(self.passes_completed, self.passes_attempted);
+        let intentional_completion = ratio(
+            self.intentional_passes_completed,
+            self.intentional_passes_attempted,
+        );
         let shot_accuracy = ratio(self.shots_on_target, self.shots);
         let net_forward = self.passes_forward - self.pass_turnovers;
+        let intentional_net_forward =
+            self.intentional_passes_forward - self.intentional_pass_turnovers;
         let dribble_beat_per_100 = ratio(self.dribble_beats * 100.0, self.dribble_decisions);
         println!(
             "{label:<14} pass_completion={:.3} passes={:.0}/{:.0} fwd_passes={:.0} \
+             intentional_completion={:.3} intentional_passes={:.0}/{:.0} intentional_fwd={:.0} \
+             intentional_turnovers={:.1} intentional_net_forward={:.1} intentional_gain_yds={:.1} \
              pass_turnovers={:.1} net_forward={:.1} goals={:.2} shots={:.1} \
              on_target={:.1} shot_acc={:.3} shot_after_pass={:.1} dribble_beats={:.1} \
              dribble_decisions={:.0} dribble_beats_per_100_decisions={:.2} chains={:.1} \
@@ -103,6 +126,13 @@ impl GameKpis {
             self.passes_completed,
             self.passes_attempted,
             self.passes_forward,
+            intentional_completion,
+            self.intentional_passes_completed,
+            self.intentional_passes_attempted,
+            self.intentional_passes_forward,
+            self.intentional_pass_turnovers,
+            intentional_net_forward,
+            self.intentional_pass_gain_yards,
             self.pass_turnovers,
             net_forward,
             self.goals,
@@ -217,7 +247,7 @@ fn main() {
     println!(
         "gates: dp_critic_target={} dp_bootstrap={} learned_epv={} learned_pass_completion={} \
          learned_pass_receiver={} learned_pass_receiver_strict={} neural_pass_space={} \
-         pass_aim_offset_guard={} deferred_pass_credit={} neural_mcts={} league_neural_mcts={} xt_terminal_cost={} mpc_pass={} \
+         pass_aim_offset_guard={} speculative_killer_guard={} deferred_pass_credit={} neural_mcts={} league_neural_mcts={} xt_terminal_cost={} mpc_pass={} \
          pass_completion_score_weight={:.2} pass_turnover_penalty_scale={:.2} \
          pass_target_completion_primary_scale={:.2} learned_curve={} mpc_objective_epochs={}",
         env_on("DD_SOCCER_ENABLE_DP_CRITIC_TARGET"),
@@ -228,6 +258,7 @@ fn main() {
         env_on("DD_SOCCER_ENABLE_LEARNED_PASS_RECEIVER_STRICT_FALLBACK"),
         env_on("DD_SOCCER_ENABLE_NEURAL_PASS_SPACE"),
         env_on("DD_SOCCER_ENABLE_PASS_AIM_OFFSET_COMPLETION_GUARD"),
+        env_on("DD_SOCCER_ENABLE_SPECULATIVE_KILLER_PASS_COMPLETION_GUARD"),
         env_on("DD_SOCCER_ENABLE_DEFERRED_PASS_CREDIT"),
         env_on("SOCCER_NEURAL_MCTS_ENABLED"),
         env_on("SOCCER_LEAGUE_NEURAL_MCTS_ENABLED"),
@@ -365,6 +396,22 @@ fn main() {
             pass_turnovers: f64::from(
                 st.pass_interceptions_own_half + st.pass_interceptions_opp_half,
             ),
+            intentional_passes_attempted: f64::from(
+                st.intentional_passes_attempted_home + st.intentional_passes_attempted_away,
+            ),
+            intentional_passes_completed: f64::from(
+                st.intentional_passes_completed_home + st.intentional_passes_completed_away,
+            ),
+            intentional_passes_forward: f64::from(
+                st.intentional_passes_completed_forward_home
+                    + st.intentional_passes_completed_forward_away,
+            ),
+            intentional_pass_turnovers: f64::from(
+                st.intentional_pass_interceptions_own_half
+                    + st.intentional_pass_interceptions_opp_half,
+            ),
+            intentional_pass_gain_yards: st.intentional_completed_pass_gain_yards_home
+                + st.intentional_completed_pass_gain_yards_away,
             pass_chains: f64::from(st.pass_chains_home + st.pass_chains_away),
             pass_chain_gain_yards: st.pass_chain_gain_yards_home + st.pass_chain_gain_yards_away,
             pass_chains_net_loss: f64::from(

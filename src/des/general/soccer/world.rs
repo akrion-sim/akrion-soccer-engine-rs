@@ -61,6 +61,17 @@ const NEURAL_MCTS_DRIBBLE_SELECTION_FLOOR: f64 = 0.0;
 const NEURAL_MCTS_DRIBBLE_SELECTION_MAX_SCORE_REGRESSION: f64 = 2.5;
 const NEURAL_MCTS_DRIBBLE_DIAGNOSTIC_INTERVAL: u64 = 0;
 const NEURAL_MCTS_PITCH_VALUE_CANDIDATE_WEIGHT: f64 = 1.50;
+const LONG_BALL_TARGET_MIN_COMPLETION: f64 = 0.46;
+const LONG_BALL_TARGET_MIN_OPENNESS: f64 = 0.32;
+const LONG_BALL_TARGET_MAX_LANE_RISK: f64 = 0.50;
+const LONG_BALL_MIDFIELD_TARGET_MIN_COMPLETION: f64 = 0.56;
+const LONG_BALL_MIDFIELD_TARGET_MAX_LANE_RISK: f64 = 0.34;
+const LONG_BALL_MIDFIELD_TARGET_MIN_SPACE_SCORE: f64 = 7.5;
+const KILLER_PASS_MEDIUM_DISTANCE_YARDS: f64 = 15.0;
+const KILLER_PASS_LONG_DISTANCE_YARDS: f64 = 25.0;
+const KILLER_PASS_IMMEDIATE_GOAL_WINDOW_YARDS: f64 = 18.0;
+const KILLER_PASS_MEDIUM_MIN_COMPLETION: f64 = 0.40;
+const KILLER_PASS_LONG_MIN_COMPLETION: f64 = 0.54;
 
 fn pass_target_completion_primary_scale() -> f64 {
     use std::sync::OnceLock;
@@ -127,6 +138,14 @@ fn pass_aim_offset_completion_guard_enabled() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_PASS_AIM_OFFSET_COMPLETION_GUARD").is_ok())
+}
+
+fn speculative_killer_pass_completion_guard_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_ENABLE_SPECULATIVE_KILLER_PASS_COMPLETION_GUARD").is_ok()
+    })
 }
 const NEURAL_MCTS_PITCH_VALUE_COUNTER_WEIGHT: f64 = 0.85;
 const SOCCER_CENTERED_POLICY_BONUS_CLIP: f64 = 0.45;
@@ -996,6 +1015,13 @@ const OWN_HALF_TINY_PASS_FORWARD_RELIEF_YARDS: f64 = 4.0;
 const PROGRESSIVE_FLOOR_OUTLET_MIN_FORWARD_YARDS: f64 = 4.0;
 const PROGRESSIVE_FLOOR_OUTLET_MIN_DISTANCE_YARDS: f64 = 4.0;
 const PROGRESSIVE_FLOOR_OUTLET_SCORE_BONUS: f64 = 2.2;
+const PASS_COMPLETION_PRIMARY_SCORE_FLOOR: f64 = 0.72;
+const PASS_COMPLETION_PRIMARY_MAX_SCORE_PENALTY: f64 = 4.0;
+const PASS_COMPLETION_PRIMARY_FINAL_THIRD_RELIEF: f64 = 0.55;
+const SAFE_PROGRESSIVE_PASS_COMPLETION_FLOOR: f64 = 0.68;
+const SAFE_PROGRESSIVE_PASS_COMPLETION_FULL: f64 = 0.88;
+const SAFE_PROGRESSIVE_PASS_FORWARD_FULL_YARDS: f64 = 12.0;
+const SAFE_PROGRESSIVE_PASS_SCORE_BONUS: f64 = 2.6;
 const GOOD_FORWARD_OUTLET_MIN_QUALITY_FIT: f64 = 0.34;
 const GOOD_FORWARD_OUTLET_MIN_RAW_COMPLETION: f64 = 0.30;
 const GOOD_FORWARD_OUTLET_MIN_STRIDE_FIT: f64 = 0.26;
@@ -1060,6 +1086,7 @@ const OPEN_FORWARD_RECEIVE_RUN_MAX_FORWARD_YARDS: f64 = 18.0;
 const OPEN_FORWARD_RECEIVE_RUN_MAX_PASS_YARDS: f64 = 36.0;
 const OPEN_FORWARD_RECEIVE_RUN_LANE_RADIUS_YARDS: f64 = 2.0;
 const OPEN_FORWARD_RECEIVE_RUN_MIN_SPACE_SCORE: f64 = 5.0;
+const OPEN_FORWARD_RECEIVE_RUN_ESCAPE_MARK_BONUS: f64 = 1.6;
 const OFF_BALL_POSSESSION_MIN_FORWARD_YARDS: f64 = 0.75;
 const OFF_BALL_POSSESSION_MIN_UPFIELD_PER_LATERAL_YARD: f64 = 0.20;
 /// Off-ball "arrival settle" (hold shape). An off-ball player with nothing urgent to
@@ -12780,10 +12807,34 @@ impl SoccerMatch {
         } else {
             None
         };
+        self.pass_completion_head =
+            if let Some(pass_completion_head) = snapshot.pass_completion_head.as_deref() {
+                Some(std::sync::Arc::new(
+                    SoccerPassCompletionHead::from_snapshot(pass_completion_head)?,
+                ))
+            } else {
+                None
+            };
         self.mpc_objective_head =
             if let Some(mpc_objective_head) = snapshot.mpc_objective_head.as_deref() {
                 Some(std::sync::Arc::new(SoccerMpcObjectiveHead::from_snapshot(
                     mpc_objective_head,
+                )?))
+            } else {
+                None
+            };
+        self.attack_spacing_head =
+            if let Some(attack_spacing_head) = snapshot.attack_spacing_head.as_deref() {
+                Some(std::sync::Arc::new(AttackSpacingHead::from_snapshot(
+                    attack_spacing_head,
+                )?))
+            } else {
+                None
+            };
+        self.support_scorer_head =
+            if let Some(support_scorer_head) = snapshot.support_scorer_head.as_deref() {
+                Some(std::sync::Arc::new(SupportScorerHead::from_snapshot(
+                    support_scorer_head,
                 )?))
             } else {
                 None
@@ -12858,6 +12909,7 @@ impl SoccerMatch {
         self.away_neural_frozen = false;
         self.skill_policy_heads = None;
         self.away_skill_policy_heads = None;
+        self.pass_completion_head = None;
     }
 
     /// True when this match runs distinct per-team neural brains (the away team
@@ -12901,8 +12953,18 @@ impl SoccerMatch {
                 if let Some(line_depth_head) = &self.line_depth_head {
                     snapshot.line_depth_head = Some(Box::new(line_depth_head.to_snapshot()));
                 }
+                if let Some(pass_completion_head) = &self.pass_completion_head {
+                    snapshot.pass_completion_head =
+                        Some(Box::new(pass_completion_head.to_snapshot()));
+                }
                 if let Some(mpc_objective_head) = &self.mpc_objective_head {
                     snapshot.mpc_objective_head = Some(Box::new(mpc_objective_head.to_snapshot()));
+                }
+                if let Some(attack_spacing_head) = &self.attack_spacing_head {
+                    snapshot.attack_spacing_head = Some(Box::new(attack_spacing_head.to_snapshot()));
+                }
+                if let Some(support_scorer_head) = &self.support_scorer_head {
+                    snapshot.support_scorer_head = Some(Box::new(support_scorer_head.to_snapshot()));
                 }
                 snapshot
             })
@@ -28750,6 +28812,9 @@ impl SoccerMatch {
                         distance_yards: release_distance,
                         flight,
                     });
+                    let intentional_distinct_target = pending_pass
+                        .target
+                        .is_some_and(|target| target != player_id);
                     self.record_forward_pass_attempt_reward(&pending_pass, pressure);
                     self.pending_pass = Some(pending_pass);
                     // Slip-and-break-the-offside-trap execution: a firm forward GROUND ball slipped
@@ -28807,6 +28872,9 @@ impl SoccerMatch {
                     self.pending_shot = None;
                     self.record_possession_touch(player_id);
                     self.stat_pass_attempt(player_team);
+                    if intentional_distinct_target {
+                        self.stat_intentional_pass_attempt(player_team);
+                    }
                     let attempt_own_half = self.pass_from_own_half(player_team, player_pos);
                     self.stat_pass_attempt_half(attempt_own_half);
                     // PENALTY: an isolated attacking carrier who panicked a backward/square ball
@@ -32307,6 +32375,10 @@ impl SoccerMatch {
                                 .unwrap_or(self.ball.position.y);
                             let forward_yards = (reception_y - pass.origin.y) * team.attack_dir();
                             self.stat_pass_completed_direction(team, forward_yards);
+                            if pass.target.is_some_and(|target| target != pass.from) {
+                                self.stat_intentional_pass_completed_direction(team, forward_yards);
+                                self.stat_intentional_pass_completed(team);
+                            }
                             let own_half = self.pass_from_own_half(pass.team, pass.origin);
                             self.stat_pass_completed_half(own_half);
                             self.record_pass_outcome_sample(pass, true, own_half);
@@ -32320,6 +32392,9 @@ impl SoccerMatch {
                             // not the intercepting team, so the by-half rate matches attempts.
                             let own_half = self.pass_from_own_half(pass.team, pass.origin);
                             self.stat_pass_intercepted_half(own_half);
+                            if pass.target.is_some_and(|target| target != pass.from) {
+                                self.stat_intentional_pass_intercepted_half(own_half);
+                            }
                             self.record_pass_outcome_sample(pass, false, own_half);
                         }
                         self.record_interception_reward(holder, pending_pass_for_reward.as_ref());
@@ -34723,10 +34798,24 @@ impl SoccerMatch {
         }
     }
 
+    fn stat_intentional_pass_attempt(&mut self, team: Team) {
+        match team {
+            Team::Home => self.stats.intentional_passes_attempted_home += 1,
+            Team::Away => self.stats.intentional_passes_attempted_away += 1,
+        }
+    }
+
     fn stat_pass_completed(&mut self, team: Team) {
         match team {
             Team::Home => self.stats.passes_completed_home += 1,
             Team::Away => self.stats.passes_completed_away += 1,
+        }
+    }
+
+    fn stat_intentional_pass_completed(&mut self, team: Team) {
+        match team {
+            Team::Home => self.stats.intentional_passes_completed_home += 1,
+            Team::Away => self.stats.intentional_passes_completed_away += 1,
         }
     }
 
@@ -34746,6 +34835,24 @@ impl SoccerMatch {
             }
         }
         self.accumulate_pass_chain_metrics(team, forward_yards);
+    }
+
+    fn stat_intentional_pass_completed_direction(&mut self, team: Team, forward_yards: f64) {
+        if forward_yards > 1.25 {
+            match team {
+                Team::Home => self.stats.intentional_passes_completed_forward_home += 1,
+                Team::Away => self.stats.intentional_passes_completed_forward_away += 1,
+            }
+        } else if forward_yards < -1.25 {
+            match team {
+                Team::Home => self.stats.intentional_passes_completed_backward_home += 1,
+                Team::Away => self.stats.intentional_passes_completed_backward_away += 1,
+            }
+        }
+        match team {
+            Team::Home => self.stats.intentional_completed_pass_gain_yards_home += forward_yards,
+            Team::Away => self.stats.intentional_completed_pass_gain_yards_away += forward_yards,
+        }
     }
 
     /// Fold one COMPLETED pass into the learning-progress metrics: add its forward yards to the
@@ -34839,6 +34946,14 @@ impl SoccerMatch {
             self.stats.pass_interceptions_own_half += 1;
         } else {
             self.stats.pass_interceptions_opp_half += 1;
+        }
+    }
+
+    fn stat_intentional_pass_intercepted_half(&mut self, own_half: bool) {
+        if own_half {
+            self.stats.intentional_pass_interceptions_own_half += 1;
+        } else {
+            self.stats.intentional_pass_interceptions_opp_half += 1;
         }
     }
 
@@ -37594,6 +37709,49 @@ pub(crate) fn quick_forward_pass_band_fit(distance_yards: f64) -> f64 {
     let overshoot = (distance_yards - QUICK_FORWARD_PASS_MAX_YARDS).max(0.0);
     let outside = shortfall.max(overshoot);
     (1.0 - outside / QUICK_FORWARD_PASS_BAND_FALLOFF_YARDS).clamp(0.0, 1.0)
+}
+
+pub(crate) fn pass_completion_primary_score_penalty(
+    expected_completion: f64,
+    forward_yards: f64,
+    yards_to_goal: f64,
+    field_length: f64,
+) -> f64 {
+    let completion = expected_completion.clamp(0.0, 1.0);
+    let shortfall = (PASS_COMPLETION_PRIMARY_SCORE_FLOOR - completion).max(0.0);
+    if shortfall <= 0.0 {
+        return 0.0;
+    }
+    let final_third_forward =
+        forward_yards > 1.25 && yards_to_goal <= (field_length / 3.0).max(1.0);
+    let relief = if final_third_forward {
+        PASS_COMPLETION_PRIMARY_FINAL_THIRD_RELIEF
+    } else {
+        1.0
+    };
+    (shortfall / PASS_COMPLETION_PRIMARY_SCORE_FLOOR.max(1e-6))
+        * PASS_COMPLETION_PRIMARY_MAX_SCORE_PENALTY
+        * relief
+}
+
+pub(crate) fn safe_progressive_pass_score_bonus(
+    expected_completion: f64,
+    forward_yards: f64,
+    distance_yards: f64,
+) -> f64 {
+    let completion_fit = ((expected_completion.clamp(0.0, 1.0)
+        - SAFE_PROGRESSIVE_PASS_COMPLETION_FLOOR)
+        / (SAFE_PROGRESSIVE_PASS_COMPLETION_FULL - SAFE_PROGRESSIVE_PASS_COMPLETION_FLOOR)
+            .max(1e-6))
+    .clamp(0.0, 1.0);
+    let forward_fit = ((forward_yards - PROGRESSIVE_FLOOR_OUTLET_MIN_FORWARD_YARDS)
+        / (SAFE_PROGRESSIVE_PASS_FORWARD_FULL_YARDS - PROGRESSIVE_FLOOR_OUTLET_MIN_FORWARD_YARDS)
+            .max(1e-6))
+    .clamp(0.0, 1.0);
+    completion_fit
+        * forward_fit
+        * quick_forward_pass_band_fit(distance_yards)
+        * SAFE_PROGRESSIVE_PASS_SCORE_BONUS
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -48600,14 +48758,21 @@ impl WorldSnapshot {
             .clamp(over_top.min_distance_yards, over_top.max_distance_yards);
         let goal_y = me.team.goal_y(self.field_length);
         let byline_margin = over_top.byline_margin_yards;
-        let mut aim_y = me_position.y + attack_dir * forward_yards;
-        aim_y = if attack_dir > 0.0 {
-            aim_y.min(goal_y - byline_margin)
+        let raw_aim_y = me_position.y + attack_dir * forward_yards;
+        let aim_y = if attack_dir > 0.0 {
+            raw_aim_y.min(goal_y - byline_margin)
         } else {
-            aim_y.max(goal_y + byline_margin)
+            raw_aim_y.max(goal_y + byline_margin)
         };
+        let byline_limited = (raw_aim_y - aim_y).abs() > KILLER_PASS_OVER_TOP_NUMERIC_EPSILON;
         forward_yards = (aim_y - me_position.y) * attack_dir;
-        if !(over_top.min_distance_yards..=over_top.max_distance_yards).contains(&forward_yards) {
+        let min_forward_yards = if byline_limited {
+            (over_top.min_distance_yards - over_top.lateral_offset_yards * 2.0)
+                .max(KILLER_PASS_MIN_FORWARD_YARDS)
+        } else {
+            over_top.min_distance_yards
+        };
+        if !(min_forward_yards..=over_top.max_distance_yards).contains(&forward_yards) {
             return None;
         }
 
@@ -48656,7 +48821,12 @@ impl WorldSnapshot {
             .clamp(touch_margin, self.field_width - touch_margin);
         let aim_point = Vec2::new(aim_x, aim_y).clamp_to_pitch(self.field_width, self.field_length);
         let distance_yards = me_position.distance(aim_point);
-        if !(over_top.min_distance_yards..=over_top.max_distance_yards).contains(&distance_yards) {
+        let min_distance_yards = if byline_limited {
+            (over_top.min_distance_yards - over_top.lateral_offset_yards).max(min_forward_yards)
+        } else {
+            over_top.min_distance_yards
+        };
+        if !(min_distance_yards..=over_top.max_distance_yards).contains(&distance_yards) {
             return None;
         }
         let back_line_clearance_yards = (aim_point.y - back_line_y) * attack_dir;
@@ -48848,6 +49018,21 @@ impl WorldSnapshot {
                 };
                 let min_threaded_completion = KILLER_PASS_MIN_THREADED_EXPECTED_COMPLETION
                     * near_goal_completion_floor_multiplier;
+                let pass_distance_yards = me_position.distance(scoring_reception);
+                let distance_completion_floor = if !speculative_killer_pass_completion_guard_enabled()
+                    || slip_break.available
+                    || receiver_yards_to_goal <= KILLER_PASS_IMMEDIATE_GOAL_WINDOW_YARDS
+                {
+                    0.0
+                } else if pass_distance_yards >= KILLER_PASS_LONG_DISTANCE_YARDS {
+                    KILLER_PASS_LONG_MIN_COMPLETION
+                } else if pass_distance_yards >= KILLER_PASS_MEDIUM_DISTANCE_YARDS {
+                    KILLER_PASS_MEDIUM_MIN_COMPLETION
+                } else {
+                    0.0
+                };
+                let min_threaded_completion =
+                    min_threaded_completion.max(distance_completion_floor);
                 if (quality.expected_completion < min_threaded_completion && !slip_break.available)
                     || lane_fit < KILLER_PASS_MIN_LANE_FIT
                 {
@@ -49983,6 +50168,14 @@ impl WorldSnapshot {
                     &pass_quality,
                     directive.risk_tolerance,
                 );
+                let completion_primary_penalty = pass_completion_primary_score_penalty(
+                    expected_completion_for_score,
+                    forward,
+                    (me.team.goal_y(self.field_length) - pass_point.y).abs(),
+                    self.field_length,
+                );
+                let safe_progression_bonus =
+                    safe_progressive_pass_score_bonus(expected_completion_for_score, forward, dist);
                 let completion_primary_adjustment =
                     pass_target_completion_primary_adjustment(&pass_quality, forward, own_half);
                 // Forward-option recognition: when a genuinely good forward ball exists,
@@ -50008,6 +50201,7 @@ impl WorldSnapshot {
                     - anticipation_penalty
                     - reception_teammate_penalty
                     - reception_congestion_penalty
+                    - completion_primary_penalty
                     - direct_opponent_aim_penalty
                     - direct_opponent_aim_veto
                     - marked_receiver_penalty
@@ -50026,6 +50220,7 @@ impl WorldSnapshot {
                     + own_box_play_out_adjustment
                     + role_risk.safety_bonus
                     + role_risk.forward_risk_bonus * pass_target_learning
+                    + safe_progression_bonus * pass_target_learning
                     + completion_primary_adjustment
                     + forward_open_bonus * pass_target_learning
                     + progressive_floor_outlet_bonus * pass_target_learning
@@ -52011,11 +52206,7 @@ impl WorldSnapshot {
             return None;
         }
         let current = self.player_snapshot_position(me);
-        if self.nearest_opponent_distance_at(me.team, current)
-            < OPEN_FORWARD_RECEIVE_RUN_UNMARKED_YARDS
-        {
-            return None;
-        }
+        let current_opponent_distance = self.nearest_opponent_distance_at(me.team, current);
         let holder_position = self.player_snapshot_position(holder);
         let attack = me.team.attack_dir();
         let lateral_offsets = [
@@ -52078,11 +52269,18 @@ impl WorldSnapshot {
                 let line_penalty = self.role_line_penalty_for_player_target(me, target, relief);
                 let pass_range_fit =
                     (1.0 - pass_distance / OPEN_FORWARD_RECEIVE_RUN_MAX_PASS_YARDS).clamp(0.0, 1.0);
+                let escape_mark_bonus = ((OPEN_FORWARD_RECEIVE_RUN_UNMARKED_YARDS
+                    - current_opponent_distance)
+                    / OPEN_FORWARD_RECEIVE_RUN_UNMARKED_YARDS.max(1.0))
+                .clamp(0.0, 1.0)
+                    * (opponent_distance / OPEN_FORWARD_RECEIVE_RUN_UNMARKED_YARDS).clamp(1.0, 2.0)
+                    * OPEN_FORWARD_RECEIVE_RUN_ESCAPE_MARK_BONUS;
                 let score = occupancy.open_space_score * 0.46
                     + opponent_distance.min(18.0) * 0.20
                     + target_forward.min(OPEN_FORWARD_RECEIVE_RUN_MAX_FORWARD_YARDS) * 0.24
                     + holder_forward.max(0.0).min(24.0) * 0.14
                     + pass_range_fit * 1.4
+                    + escape_mark_bonus
                     - current.distance(target) * 0.030
                     - teammate_penalty
                     - lane_penalty * 0.32
@@ -52481,20 +52679,42 @@ impl WorldSnapshot {
             .filter(|p| matches!(p.role, PlayerRole::Forward | PlayerRole::Midfielder))
             .filter_map(|target| {
                 let pass_point = self.projected_in_behind_pass_point(passer.id, target.id)?;
-                let target_position = self.player_snapshot_position(target);
                 let forward = (pass_point.y - passer_position.y) * passer.team.attack_dir();
                 if forward <= 12.0 {
                     return None;
                 }
-                let line_bonus = if self.clear_line(
+                let quality = pass_target_quality_for_snapshot(
+                    self,
+                    passer,
                     passer_position,
-                    target_position,
-                    passer.team.other(),
-                    2.5,
-                ) {
-                    0.0
-                } else {
-                    1.2
+                    target,
+                    pass_point,
+                    PassFlight::Aerial,
+                );
+                if quality.expected_completion < LONG_BALL_TARGET_MIN_COMPLETION
+                    || quality.receiver_openness < LONG_BALL_TARGET_MIN_OPENNESS
+                    || quality.lane_interception_risk > LONG_BALL_TARGET_MAX_LANE_RISK
+                {
+                    return None;
+                }
+                let space_score = self.space_score_at(pass_point, passer.team);
+                if target.role == PlayerRole::Midfielder
+                    && (quality.expected_completion < LONG_BALL_MIDFIELD_TARGET_MIN_COMPLETION
+                        || quality.lane_interception_risk > LONG_BALL_MIDFIELD_TARGET_MAX_LANE_RISK
+                        || space_score < LONG_BALL_MIDFIELD_TARGET_MIN_SPACE_SCORE)
+                {
+                    return None;
+                }
+                let line_bonus =
+                    if self.clear_line(passer_position, pass_point, passer.team.other(), 2.5) {
+                        0.25
+                    } else {
+                        -0.35
+                    };
+                let role_bonus = match target.role {
+                    PlayerRole::Forward => 1.35,
+                    PlayerRole::Midfielder => 0.15,
+                    PlayerRole::Defender | PlayerRole::Goalkeeper => 0.0,
                 };
                 // Prefer the keeper-avoidant over-the-top ball: one angled into the runner's
                 // channel beats one dropping dead-central onto the sweeping keeper. Gated with the
@@ -52505,9 +52725,14 @@ impl WorldSnapshot {
                     self.over_the_top_keeper_avoidance_fit(passer.team, pass_point)
                         * OVER_TOP_KEEPER_AVOID_SCORE_WEIGHT
                 };
-                let score = forward * 0.10 + self.space_score_at(pass_point, passer.team) * 0.06
+                let score = forward * 0.10
+                    + space_score * 0.06
+                    + quality.expected_completion * 1.6
+                    + quality.receiver_openness * 0.9
+                    - quality.lane_interception_risk * 1.4
                     - passer_position.distance(pass_point) * 0.010
                     + line_bonus
+                    + role_bonus
                     + keeper_avoid;
                 Some((target.id, score))
             })

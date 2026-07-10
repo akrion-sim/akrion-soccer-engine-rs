@@ -10376,6 +10376,40 @@ fn quick_forward_pass_band_fit_peaks_in_five_to_fifteen_yard_band() {
 }
 
 #[test]
+fn pass_completion_primary_score_penalty_protects_completion_rate() {
+    assert_eq!(
+        pass_completion_primary_score_penalty(0.80, 10.0, 55.0, 120.0),
+        0.0
+    );
+    let buildup_risk = pass_completion_primary_score_penalty(0.54, 10.0, 55.0, 120.0);
+    let final_third_risk = pass_completion_primary_score_penalty(0.54, 10.0, 25.0, 120.0);
+    assert!(
+        buildup_risk > 0.9,
+        "low-probability build-up pass should carry a meaningful completion-primary penalty: {buildup_risk}"
+    );
+    assert!(
+        final_third_risk > 0.0 && final_third_risk < buildup_risk,
+        "final-third forward balls get tactical relief, not a free completion-rate pass: build={buildup_risk}, final={final_third_risk}"
+    );
+}
+
+#[test]
+fn safe_progressive_pass_score_bonus_requires_completion_and_progress() {
+    assert_eq!(safe_progressive_pass_score_bonus(0.90, 3.0, 8.0), 0.0);
+    assert_eq!(safe_progressive_pass_score_bonus(0.55, 10.0, 8.0), 0.0);
+    let safe_ten_yard_ball = safe_progressive_pass_score_bonus(0.86, 10.0, 10.0);
+    let marginal_progress = safe_progressive_pass_score_bonus(0.86, 5.0, 5.0);
+    assert!(
+        safe_ten_yard_ball > 1.0,
+        "a high-completion 10yd forward ball should get a coupled safe-progress bonus: {safe_ten_yard_ball}"
+    );
+    assert!(
+        marginal_progress > 0.0 && marginal_progress < safe_ten_yard_ball,
+        "a barely-progressive safe pass should count, but less than a useful 10yd ball: marginal={marginal_progress}, ten={safe_ten_yard_ball}"
+    );
+}
+
+#[test]
 fn quick_forward_pass_values_open_advanced_teammate_and_stays_inert_when_gated_off() {
     let receiver = 7;
     let outlet = 9;
@@ -61886,6 +61920,71 @@ fn unmarked_receiver_gets_forward_receive_run_pomdp_option() {
 }
 
 #[test]
+fn marked_receiver_escapes_into_forward_receive_space() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let holder = 6;
+    let receiver = 8;
+    let marker = 12;
+    park_players_except(&mut sim, &[holder, receiver, marker]);
+    sim.ball.holder = Some(holder);
+    sim.ball.position = Vec2::new(40.0, 60.0);
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.players[holder].role = PlayerRole::Midfielder;
+    sim.players[holder].position = sim.ball.position;
+    sim.players[holder].home_position = sim.ball.position;
+    sim.players[receiver].role = PlayerRole::Midfielder;
+    sim.players[receiver].position = Vec2::new(44.0, 58.0);
+    sim.players[receiver].home_position = Vec2::new(44.0, 42.0);
+    sim.players[receiver].preferences.open_space_bias = 1.0;
+    sim.players[receiver].preferences.offensive_mindedness = 0.86;
+    sim.players[receiver].preferences.defensive_mindedness = 0.18;
+    sim.players[marker].position = Vec2::new(49.4, 58.0);
+    sim.players[marker].velocity = Vec2::zero();
+    for away in 11..22 {
+        if away != marker {
+            sim.players[away].position = Vec2::new(66.0, 96.0 + (away - 11) as f64 * 0.5);
+        }
+    }
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let current = sim.players[receiver].position;
+    assert!(
+        snapshot.nearest_opponent_distance_at(Team::Home, current) < 6.0,
+        "receiver should start marked in the fixture"
+    );
+    let forward_receive = snapshot
+        .open_forward_receive_run_target_for(receiver, sim.players[receiver].home_position)
+        .expect("marked receiver should be allowed to escape into open receiving space");
+    let forward_yards = (forward_receive.y - current.y) * Team::Home.attack_dir();
+    assert!(
+        forward_yards >= 4.0,
+        "marked receiver's escape target must move upfield: target={forward_receive:?} current={current:?}"
+    );
+    assert!(
+        snapshot.nearest_opponent_distance_at(Team::Home, forward_receive) >= 6.0,
+        "escape target should create separation from the marker: {forward_receive:?}"
+    );
+    assert!(
+        snapshot.clear_line(
+            sim.players[holder].position,
+            forward_receive,
+            Team::Away,
+            2.0
+        ),
+        "holder should have a clear passing lane into the escape run"
+    );
+
+    let support_target =
+        snapshot.positional_open_space_for(receiver, sim.players[receiver].home_position, false);
+    let support_forward = (support_target.y - current.y) * Team::Home.attack_dir();
+    assert!(
+        support_forward >= 4.0,
+        "support movement should use the forward escape run, not remain marked: target={support_target:?}"
+    );
+}
+
+#[test]
 fn attacking_support_spacing_learning_prefers_forward_empty_space_band() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let holder = 6;
@@ -68781,6 +68880,7 @@ fn clean_targeted_floor_pass_completes_through_ball_agent_loop() {
     assert_eq!(pending.flight, PassFlight::Floor);
     assert_eq!(sim.ball.holder, None);
     assert_eq!(sim.stats.passes_attempted_home, 1);
+    assert_eq!(sim.stats.intentional_passes_attempted_home, 1);
     sim.players[passer].position = Vec2::new(34.0, 36.0);
     sim.players[passer].home_position = sim.players[passer].position;
     sim.players[passer].velocity = Vec2::zero();
@@ -68809,6 +68909,8 @@ fn clean_targeted_floor_pass_completes_through_ball_agent_loop() {
     assert_eq!(sim.ball.last_touch_team, Some(Team::Home));
     assert!(sim.pending_pass.is_none());
     assert_eq!(sim.stats.passes_completed_home, 1);
+    assert_eq!(sim.stats.intentional_passes_completed_home, 1);
+    assert_eq!(sim.stats.intentional_passes_completed_forward_home, 1);
     assert_eq!(
         sim.ball
             .last_decision
@@ -95402,6 +95504,330 @@ fn pass_completion_head_installs_on_match_and_propagates_to_snapshot() {
     assert!(
         after.pass_completion_head.is_some(),
         "installed head must propagate into the per-tick snapshot"
+    );
+}
+
+#[test]
+fn pass_completion_head_uplift_only_boosts_progressive_targets() {
+    let _env = team_advance_env_lock();
+    let _enabled = TestEnvVarGuard::set("DD_SOCCER_ENABLE_LEARNED_PASS_COMPLETION", "1");
+    let _blend = TestEnvVarGuard::set("SOCCER_PASS_COMPLETION_HEAD_BLEND_WEIGHT", "1.0");
+    let _dd_blend = TestEnvVarGuard::set("DD_SOCCER_PASS_COMPLETION_HEAD_BLEND_WEIGHT", "1.0");
+
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let passer = 6usize;
+    let backward_receiver = 7usize;
+    let short_forward_receiver = 8usize;
+    let forward_receiver = 9usize;
+    park_players_except(
+        &mut sim,
+        &[
+            passer,
+            backward_receiver,
+            short_forward_receiver,
+            forward_receiver,
+        ],
+    );
+    let passer_pos = Vec2::new(40.0, 60.0);
+    let backward_pos = Vec2::new(36.0, 54.0);
+    let short_forward_pos = Vec2::new(42.0, 63.0);
+    let forward_pos = Vec2::new(44.0, 74.0);
+    sim.ball.holder = Some(passer);
+    sim.ball.position = passer_pos;
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.players[passer].role = PlayerRole::Midfielder;
+    sim.players[passer].position = passer_pos;
+    sim.players[passer].home_position = passer_pos;
+    sim.players[passer].velocity = Vec2::zero();
+    sim.players[passer].skills.passing = 8.0;
+    sim.players[passer].skills.passing_completion_rate = 8.0;
+    sim.players[passer].skills.vision = 8.0;
+    sim.players[backward_receiver].role = PlayerRole::Midfielder;
+    sim.players[backward_receiver].position = backward_pos;
+    sim.players[backward_receiver].home_position = backward_pos;
+    sim.players[backward_receiver].velocity = Vec2::zero();
+    sim.players[short_forward_receiver].role = PlayerRole::Midfielder;
+    sim.players[short_forward_receiver].position = short_forward_pos;
+    sim.players[short_forward_receiver].home_position = short_forward_pos;
+    sim.players[short_forward_receiver].velocity = Vec2::zero();
+    sim.players[forward_receiver].role = PlayerRole::Forward;
+    sim.players[forward_receiver].position = forward_pos;
+    sim.players[forward_receiver].home_position = forward_pos;
+    sim.players[forward_receiver].velocity = Vec2::zero();
+
+    let base_snapshot = WorldSnapshot::from_match(&sim);
+    let passer_snapshot = base_snapshot
+        .players
+        .iter()
+        .find(|player| player.id == passer)
+        .expect("passer");
+    let backward_snapshot = base_snapshot
+        .players
+        .iter()
+        .find(|player| player.id == backward_receiver)
+        .expect("backward receiver");
+    let short_forward_snapshot = base_snapshot
+        .players
+        .iter()
+        .find(|player| player.id == short_forward_receiver)
+        .expect("short forward receiver");
+    let forward_snapshot = base_snapshot
+        .players
+        .iter()
+        .find(|player| player.id == forward_receiver)
+        .expect("forward receiver");
+    let base_backward = pass_target_quality_for_snapshot(
+        &base_snapshot,
+        passer_snapshot,
+        passer_pos,
+        backward_snapshot,
+        backward_pos,
+        PassFlight::Floor,
+    );
+    let base_short_forward = pass_target_quality_for_snapshot(
+        &base_snapshot,
+        passer_snapshot,
+        passer_pos,
+        short_forward_snapshot,
+        short_forward_pos,
+        PassFlight::Floor,
+    );
+    let base_forward = pass_target_quality_for_snapshot(
+        &base_snapshot,
+        passer_snapshot,
+        passer_pos,
+        forward_snapshot,
+        forward_pos,
+        PassFlight::Floor,
+    );
+    let passer_pressure = pressure_from_nearest_distance(
+        base_snapshot.nearest_opponent_distance_at(Team::Home, passer_pos),
+    );
+    let backward_speed =
+        pass_speed_yps_from_power(0.68, PassFlight::Floor, false, &passer_snapshot.skills);
+    let backward_target = base_snapshot
+        .anticipated_pass_reception_point(
+            passer,
+            backward_receiver,
+            PassFlight::Floor,
+            backward_speed,
+        )
+        .unwrap_or(backward_pos);
+    let short_forward_speed =
+        pass_speed_yps_from_power(0.68, PassFlight::Floor, false, &passer_snapshot.skills);
+    let short_forward_target = base_snapshot
+        .anticipated_pass_reception_point(
+            passer,
+            short_forward_receiver,
+            PassFlight::Floor,
+            short_forward_speed,
+        )
+        .unwrap_or(short_forward_pos);
+    let forward_speed =
+        pass_speed_yps_from_power(0.68, PassFlight::Floor, false, &passer_snapshot.skills);
+    let forward_target = base_snapshot
+        .anticipated_pass_reception_point(
+            passer,
+            forward_receiver,
+            PassFlight::Floor,
+            forward_speed,
+        )
+        .unwrap_or(forward_pos);
+    let backward_features = base_snapshot.pass_completion_learn_features(
+        Team::Home,
+        passer_pos,
+        backward_target,
+        passer_pos.distance(backward_target),
+        passer_pressure,
+        base_backward.receiver_openness,
+        PassFlight::Floor,
+    );
+    let short_forward_features = base_snapshot.pass_completion_learn_features(
+        Team::Home,
+        passer_pos,
+        short_forward_target,
+        passer_pos.distance(short_forward_target),
+        passer_pressure,
+        base_short_forward.receiver_openness,
+        PassFlight::Floor,
+    );
+    let forward_features = base_snapshot.pass_completion_learn_features(
+        Team::Home,
+        passer_pos,
+        forward_target,
+        passer_pos.distance(forward_target),
+        passer_pressure,
+        base_forward.receiver_openness,
+        PassFlight::Floor,
+    );
+
+    let mut samples = Vec::new();
+    for _ in 0..128 {
+        samples.push(SoccerPassOutcomeSample {
+            features: backward_features.clone(),
+            completed: true,
+            own_half: false,
+        });
+        samples.push(SoccerPassOutcomeSample {
+            features: short_forward_features.clone(),
+            completed: true,
+            own_half: false,
+        });
+        samples.push(SoccerPassOutcomeSample {
+            features: forward_features.clone(),
+            completed: true,
+            own_half: false,
+        });
+    }
+    let mut head = SoccerPassCompletionHead::new(23);
+    for _ in 0..5 {
+        head.train(&samples, 0.08);
+    }
+    assert!(
+        head.training_steps() >= PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS,
+        "test head should be warm enough for live consumption"
+    );
+    let backward_prediction = head.predict(&backward_features).expect("backward p");
+    let short_forward_prediction = head
+        .predict(&short_forward_features)
+        .expect("short forward p");
+    let forward_prediction = head.predict(&forward_features).expect("forward p");
+    assert!(
+        backward_prediction > base_backward.expected_completion + 0.10,
+        "fixture needs a bad learned uplift for the backward target: prediction={backward_prediction:.3}, base={:.3}",
+        base_backward.expected_completion
+    );
+    assert!(
+        short_forward_prediction > base_short_forward.expected_completion + 0.10,
+        "fixture needs a bad learned uplift for the tiny forward target: prediction={short_forward_prediction:.3}, base={:.3}",
+        base_short_forward.expected_completion
+    );
+    assert!(
+        forward_prediction > base_forward.expected_completion + 0.10,
+        "fixture needs learned uplift for the forward target: prediction={forward_prediction:.3}, base={:.3}",
+        base_forward.expected_completion
+    );
+
+    sim.set_pass_completion_head(head);
+    let learned_snapshot = WorldSnapshot::from_match(&sim);
+    let learned_passer = learned_snapshot
+        .players
+        .iter()
+        .find(|player| player.id == passer)
+        .expect("passer");
+    let learned_backward_receiver = learned_snapshot
+        .players
+        .iter()
+        .find(|player| player.id == backward_receiver)
+        .expect("backward receiver");
+    let learned_short_forward_receiver = learned_snapshot
+        .players
+        .iter()
+        .find(|player| player.id == short_forward_receiver)
+        .expect("short forward receiver");
+    let learned_forward_receiver = learned_snapshot
+        .players
+        .iter()
+        .find(|player| player.id == forward_receiver)
+        .expect("forward receiver");
+    let learned_backward = pass_target_quality_for_snapshot(
+        &learned_snapshot,
+        learned_passer,
+        passer_pos,
+        learned_backward_receiver,
+        backward_pos,
+        PassFlight::Floor,
+    );
+    let learned_short_forward = pass_target_quality_for_snapshot(
+        &learned_snapshot,
+        learned_passer,
+        passer_pos,
+        learned_short_forward_receiver,
+        short_forward_pos,
+        PassFlight::Floor,
+    );
+    let learned_forward = pass_target_quality_for_snapshot(
+        &learned_snapshot,
+        learned_passer,
+        passer_pos,
+        learned_forward_receiver,
+        forward_pos,
+        PassFlight::Floor,
+    );
+
+    assert!(
+        learned_backward.expected_completion <= base_backward.expected_completion + 1e-9,
+        "learned completion must not inflate non-progressive/backward pass scaffolding: base={base_backward:?}, learned={learned_backward:?}"
+    );
+    assert!(
+        learned_short_forward.expected_completion <= base_short_forward.expected_completion + 1e-9,
+        "learned completion must not inflate tiny forward pass scaffolding: base={base_short_forward:?}, learned={learned_short_forward:?}"
+    );
+    assert!(
+        learned_forward.expected_completion > base_forward.expected_completion + 0.05,
+        "learned completion should still be allowed to improve progressive targets: base={base_forward:?}, learned={learned_forward:?}"
+    );
+}
+
+#[test]
+fn neural_snapshot_round_trips_pass_completion_head() {
+    let mut head = SoccerPassCompletionHead::new(3);
+    let sample = SoccerPassOutcomeSample {
+        features: vec![0.25; SOCCER_PASS_COMPLETION_FEATURE_DIM],
+        completed: true,
+        own_half: false,
+    };
+    head.train(&[sample], DEFAULT_SOCCER_PASS_COMPLETION_LEARNING_RATE);
+    assert!(head.training_steps() > 0);
+
+    let mut source = SoccerMatch::default_11v11(MatchConfig {
+        seed: 11,
+        learning_enabled: true,
+        neural_learning: SoccerNeuralLearningConfig {
+            enabled: true,
+            backend: SoccerNeuralLearningBackend::Inline,
+            hidden_units: 8,
+            ..SoccerNeuralLearningConfig::default()
+        },
+        ..MatchConfig::default()
+    });
+    source.set_pass_completion_head(head);
+    for _ in 0..2 {
+        source.run_time_step();
+    }
+    let exported = source
+        .neural_network_snapshot()
+        .expect("learning-enabled match should expose neural snapshot");
+    assert!(
+        exported.pass_completion_head.is_some(),
+        "exported neural snapshot must carry the learned pass-completion head"
+    );
+
+    let mut restored = SoccerMatch::default_11v11(MatchConfig {
+        seed: 12,
+        learning_enabled: true,
+        neural_learning: SoccerNeuralLearningConfig {
+            enabled: true,
+            backend: SoccerNeuralLearningBackend::Inline,
+            hidden_units: 8,
+            ..SoccerNeuralLearningConfig::default()
+        },
+        ..MatchConfig::default()
+    });
+    restored
+        .set_neural_network_snapshot(exported)
+        .expect("snapshot with pass-completion sidecar should restore");
+    let restored_snapshot = restored
+        .neural_network_snapshot()
+        .expect("restored match should re-export neural snapshot");
+    let restored_head = restored_snapshot
+        .pass_completion_head
+        .as_ref()
+        .expect("restored snapshot should preserve pass-completion sidecar");
+    assert!(
+        restored_head.training_steps > 0,
+        "pass-completion sidecar should preserve training progress"
     );
 }
 

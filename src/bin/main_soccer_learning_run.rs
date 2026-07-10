@@ -6528,6 +6528,29 @@ fn run_game(
                         }
                     }
                 }
+                if let Some(pass_completion_snapshot) = snapshot.pass_completion_head.as_deref() {
+                    match SoccerPassCompletionHead::from_snapshot(pass_completion_snapshot) {
+                        Ok(restored_head) => {
+                            let restored_steps = restored_head.training_steps();
+                            let mut guard = CARRIED_PASS_COMPLETION_HEAD.lock().unwrap();
+                            let should_replace = guard
+                                .as_ref()
+                                .map(|head| head.training_steps() < restored_steps)
+                                .unwrap_or(true);
+                            if should_replace {
+                                *guard = Some(restored_head);
+                                eprintln!(
+                                    "soccer warm-start: carried pass-completion head restored training_steps={restored_steps}"
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "soccer warm-start: dropping incompatible pass-completion snapshot ({err})"
+                            );
+                        }
+                    }
+                }
                 if let Some(mpc_objective_snapshot) = snapshot.mpc_objective_head.as_deref() {
                     match SoccerMpcObjectiveHead::from_snapshot(mpc_objective_snapshot) {
                         Ok(restored_head) => {
@@ -6547,6 +6570,52 @@ fn run_game(
                         Err(err) => {
                             eprintln!(
                                 "soccer warm-start: dropping incompatible mpc-objective snapshot ({err})"
+                            );
+                        }
+                    }
+                }
+                if let Some(attack_spacing_snapshot) = snapshot.attack_spacing_head.as_deref() {
+                    match AttackSpacingHead::from_snapshot(attack_spacing_snapshot) {
+                        Ok(restored_head) => {
+                            let restored_steps = restored_head.training_steps();
+                            let mut guard = CARRIED_ATTACK_SPACING_HEAD.lock().unwrap();
+                            let should_replace = guard
+                                .as_ref()
+                                .map(|head| head.training_steps() < restored_steps)
+                                .unwrap_or(true);
+                            if should_replace {
+                                *guard = Some(restored_head);
+                                eprintln!(
+                                    "soccer warm-start: carried attack-spacing head restored training_steps={restored_steps}"
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "soccer warm-start: dropping incompatible attack-spacing snapshot ({err})"
+                            );
+                        }
+                    }
+                }
+                if let Some(support_scorer_snapshot) = snapshot.support_scorer_head.as_deref() {
+                    match SupportScorerHead::from_snapshot(support_scorer_snapshot) {
+                        Ok(restored_head) => {
+                            let restored_steps = restored_head.training_steps();
+                            let mut guard = CARRIED_SUPPORT_SCORER_HEAD.lock().unwrap();
+                            let should_replace = guard
+                                .as_ref()
+                                .map(|head| head.training_steps() < restored_steps)
+                                .unwrap_or(true);
+                            if should_replace {
+                                *guard = Some(restored_head);
+                                eprintln!(
+                                    "soccer warm-start: carried support-scorer head restored training_steps={restored_steps}"
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "soccer warm-start: dropping incompatible support-scorer snapshot ({err})"
                             );
                         }
                     }
@@ -14095,6 +14164,10 @@ mod tests {
             Some("true")
         );
         assert_eq!(
+            continuous_manifest_env_value("SOCCER_LEAGUE_ANALYTIC_OPPONENTS"),
+            Some("true")
+        );
+        assert_eq!(
             continuous_manifest_env_value("SOCCER_ANCHOR_PROMOTION_GATE_ENABLED"),
             Some("true")
         );
@@ -14195,6 +14268,7 @@ mod tests {
             "require_value SOCCER_NEURAL_POPULATION_MIN_FORWARD_PASS_RATE_MARGIN 0.0",
         );
         assert_continuous_manifest_contains("require_value SOCCER_LEARNING_ANALYTIC_OPPONENT true");
+        assert_continuous_manifest_contains("require_value SOCCER_LEAGUE_ANALYTIC_OPPONENTS true");
         assert_continuous_manifest_contains(
             "require_value SOCCER_ANCHOR_PROMOTION_GATE_ENABLED true",
         );

@@ -404,6 +404,32 @@ impl SupportScorerHead {
         mean
     }
 
+    pub fn from_snapshot(snapshot: &SoccerAuxiliaryHeadSnapshot) -> Result<Self, String> {
+        let network = build_soccer_feed_forward_network_from_snapshot(
+            &snapshot.network,
+            SUPPORT_CANDIDATE_FEATURE_DIM,
+            1,
+            &[],
+            "support-scorer head",
+        )?;
+        Ok(SupportScorerHead {
+            network,
+            training_steps: snapshot.training_steps.max(snapshot.network.training_steps),
+            last_loss: snapshot.average_loss.or(snapshot.network.average_loss),
+        })
+    }
+
+    pub(crate) fn to_snapshot(&self) -> SoccerAuxiliaryHeadSnapshot {
+        let mut network = soccer_neural_network_snapshot(&self.network);
+        network.training_steps = self.training_steps;
+        network.average_loss = self.last_loss;
+        SoccerAuxiliaryHeadSnapshot {
+            network,
+            training_steps: self.training_steps,
+            average_loss: self.last_loss,
+        }
+    }
+
     pub fn training_steps(&self) -> usize {
         self.training_steps
     }
