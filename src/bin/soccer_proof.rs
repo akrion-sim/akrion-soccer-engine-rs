@@ -181,7 +181,7 @@ struct TeamMetrics {
 
 fn home_metrics(st: &MatchStats) -> TeamMetrics {
     TeamMetrics {
-        goals: st.shots_home as f64 * 0.0 + f64::from(0u32), // placeholder replaced below
+        goals: 0.0, // set from o.home_goals in play_fixture
         shots: f64::from(st.shots_home),
         sot: f64::from(st.shots_on_target_home),
         att: f64::from(st.passes_attempted_home),
