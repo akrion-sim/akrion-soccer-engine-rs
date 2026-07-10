@@ -15,6 +15,7 @@ pub const DT: f32 = 0.1; // seconds per decision tick
 pub const STEPS: usize = 400; // ticks per game (~40s)
 
 const PLAYER_SPEED: f32 = 6.5;
+const DRIBBLE_SPEED: f32 = 4.6; // carrying the ball is slower than a pass or a run
 const CONTROL_RADIUS: f32 = 1.5; // secure a received ball -> possessions can develop
 const RECEIVE_RADIUS: f32 = 2.8; // intended pass receiver collects from further out
 const TACKLE_RADIUS: f32 = 1.5;
