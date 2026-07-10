@@ -458,6 +458,9 @@ impl World {
             nt_dist / nx,
             nt_pressure,
             crowd_frac,
+            // role perception (who chases vs holds shape)
+            is_closest,
+            ball_rank,
             1.0, // bias
         ];
         f
