@@ -260,12 +260,12 @@ fn run_training(iters: usize) {
             // Snapshot the checkpoint that WINS and is SPREAD OUT: once winning
             // (d > 0.2), add a passing bonus plus a strong spacing bonus so the
             // chosen model actually spaces its teammates (toward the 5-8 target).
-            // Select on the HONEST bunch% first (average spacing hides a glued
-            // pair), then winning, then passing. A checkpoint that scores well but
-            // bunches must not be chosen.
+            // Balance: reward real soccer (winning + passing) AND penalize the
+            // HONEST bunch% (average spacing hides a glued pair). Neither term
+            // alone dominates — we want a checkpoint that plays well with low bunch.
             let _ = sp;
             let quality =
-                -3.0 * bunch + 0.5 * d.min(3.0) + (passes * 0.02).min(0.4);
+                d.min(3.0) + (passes * 0.03).min(0.6) - 1.6 * bunch;
             if quality > best_diff {
                 best_diff = quality;
                 best_policy = policy.clone();
