@@ -1,5 +1,15 @@
 # Role-aware pass risk/safety appetite: validation & A/B plan
 
+> **⚠️ STATUS UPDATE (verified against HEAD `be11b4d`, 2026-07-09): PROMOTED.** The gate is now
+> **default-ON in production** — `dd_soccer_enable_role_pass_risk_appetite()` uses
+> `gate_default_on("DD_SOCCER_ENABLE_ROLE_PASS_RISK_APPETITE")` in the `#[cfg(not(test))]` branch
+> (soccer.rs:63420; doc-comment "Default-ON in production now … default-OFF under test",
+> soccer.rs:63408-63410). `=0`/`off` is the kill switch; still default-OFF under `cfg(test)` so unit
+> tests stay byte-identical. **Section 7's "DO NOT PROMOTE" verdict and the Section 8 "if promote"
+> checkbox are superseded** — the promote action was taken. The A/B plan below is preserved as the
+> validation record. (Also landed: `SOCCER_SEED_VARIED_SKILLS` addresses next-step #1 match
+> perturbation, soccer.rs:63424-63427.)
+
 The feature (local, uncommitted) quantifies the risk/safety of a pass and prices it by **who
 is on the ball and where**: defenders price the (already-computed) MPC/POMDP lane-interception
 risk *higher* (lean safe), forwards price it *lower for a forward ball* and get a forward-
@@ -9,7 +19,8 @@ risk pricing so braveness never becomes a loose square ball.
 Source of truth:
 - Gate + appetite model: `src/des/general/soccer.rs`
   - `dd_soccer_enable_role_pass_risk_appetite()` — env `DD_SOCCER_ENABLE_ROLE_PASS_RISK_APPETITE`,
-    **default-OFF, byte-identical when off** (env `is_ok()` in both `cfg(test)` and prod).
+    **now default-ON in production** (`gate_default_on`, soccer.rs:63420; `=0`/`off` disables);
+    **default-OFF and byte-identical only under `cfg(test)`**.
   - `PassRiskAppetite` + `pass_risk_appetite_for_passer()` (gated) → `pass_risk_appetite_table()` (pure).
 - Call sites: `src/des/general/soccer/world.rs` — `ranked_pass_targets_filtered_full`
   (floor) and `ranked_aerial_pass_targets_filtered_full` (aerial): the appetite scales the

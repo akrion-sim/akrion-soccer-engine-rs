@@ -11,8 +11,9 @@
 ## 1. Symptom: a hard parity plateau with healthy-looking loss
 
 The learner runs **neural-authoritative**: each decision ranks the analytic engine's candidate
-actions by the neural value head `V_net(s, a)` (`Q_eff = λ·V_net + 1e-6·Q_tab`,
-`DD_SOCCER_NEURAL_AUTHORITATIVE_LAMBDA=8`). Against the analytic engine it scored ~0.53 (parity)
+actions by the neural value head `V_net(s, a)` (`Q_eff = candidate.value + λ·V_net`; λ=8 in this experiment dominates, so the tabular
+candidate value is a negligible tie-break floor; the env var `DD_SOCCER_NEURAL_AUTHORITATIVE_LAMBDA`
+defaults to 0.0). Against the analytic engine it scored ~0.53 (parity)
 and never climbed, while `averageLoss` sat at ~0.0006 — i.e. training *looked* converged and fine.
 
 That combination (flat metric + tiny loss) is the classic signature of a critic that has stopped
@@ -20,8 +21,9 @@ distinguishing states.
 
 ## 2. Diagnosis: the value head collapsed to a near-constant, action-blind output
 
-Inspecting a trained net (`inputDim=610`, one hidden layer of 128 `tanh` units, linear scalar
-output) showed:
+Inspecting a trained net (`inputDim=610` — the pre-action-param subtotal
+`SOCCER_NEURAL_PRE_ACTION_PARAM_FEATURE_DIM`; the current `SOCCER_NEURAL_FEATURE_DIM` is 620, adding a
+10-dim action-param block — one hidden layer of 128 `tanh` units, linear scalar output) showed:
 
 | Measurement | Value | Meaning |
 |---|---|---|
@@ -95,12 +97,15 @@ The neural value head is the **whole point** of this architecture, and remains s
 - The collapse made the neural net *behave* like a constant, throwing that advantage away. The fix
   **restores** the net's ability to discriminate states — it does not move away from neural learning.
 - **What's "later":** once the value discriminates states, the next ceiling is the **action
-  interface**. The interface is no longer just broad macro families: `SOCCER_POLICY_ACTIONS`
-  currently has `113` labels, including `40` kick-power bucket labels. MCTS can offer
-  pass/aerial/shot bucket variants behind `DD_SOCCER_ENABLE_DISCRETIZED_KICK`, so the speed-bucket
-  slice is partially wired. The residual gap is now narrower: prove bucket choices causally change
-  executed behavior, add entropy/softmax exploration so buckets do not fossilize, and finish the
-  structured direction/curve/elevation/aim surfaces. Beyond that, a real permutation-invariant
+- **What's "later":** once the value discriminates states, the next ceiling is the **action
+  interface**, but it is narrower than the old "top-4 macro cap" diagnosis. When a learner exists,
+  the decision path injects every legal `SOCCER_POLICY_ACTIONS` macro-family label (`113` entries),
+  including `40` kick-power bucket labels; only the specific factored/tabular candidates are capped
+  by the neural blend candidate limit. MCTS can offer pass/aerial/shot/first-time-shot speed-bucket
+  variants behind `DD_SOCCER_ENABLE_DISCRETIZED_KICK`, so the speed-bucket slice is partially wired.
+  The residual gap is now: prove bucket choices causally change executed behavior, add entropy/softmax
+  exploration so buckets do not fossilize, and finish the structured direction/curve/elevation/aim
+  surfaces while fine execution remains MPC/analytic. Beyond that, a real permutation-invariant
   encoder (GNN / self-attention over the 23 entities, replacing the hand-crafted "relational
   attention readout") is the larger upgrade. All *more* neural, not less.
 

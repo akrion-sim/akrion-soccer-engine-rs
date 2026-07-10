@@ -43,6 +43,11 @@ struct GameKpis {
     passes_completed: f64,
     passes_forward: f64,
     pass_turnovers: f64,
+    intentional_passes_attempted: f64,
+    intentional_passes_completed: f64,
+    intentional_passes_forward: f64,
+    intentional_pass_turnovers: f64,
+    intentional_pass_gain_yards: f64,
     pass_chains: f64,
     pass_chain_gain_yards: f64,
     pass_chains_net_loss: f64,
@@ -61,6 +66,11 @@ impl GameKpis {
         self.passes_completed += other.passes_completed;
         self.passes_forward += other.passes_forward;
         self.pass_turnovers += other.pass_turnovers;
+        self.intentional_passes_attempted += other.intentional_passes_attempted;
+        self.intentional_passes_completed += other.intentional_passes_completed;
+        self.intentional_passes_forward += other.intentional_passes_forward;
+        self.intentional_pass_turnovers += other.intentional_pass_turnovers;
+        self.intentional_pass_gain_yards += other.intentional_pass_gain_yards;
         self.pass_chains += other.pass_chains;
         self.pass_chain_gain_yards += other.pass_chain_gain_yards;
         self.pass_chains_net_loss += other.pass_chains_net_loss;
@@ -79,6 +89,11 @@ impl GameKpis {
             passes_completed: self.passes_completed * inv,
             passes_forward: self.passes_forward * inv,
             pass_turnovers: self.pass_turnovers * inv,
+            intentional_passes_attempted: self.intentional_passes_attempted * inv,
+            intentional_passes_completed: self.intentional_passes_completed * inv,
+            intentional_passes_forward: self.intentional_passes_forward * inv,
+            intentional_pass_turnovers: self.intentional_pass_turnovers * inv,
+            intentional_pass_gain_yards: self.intentional_pass_gain_yards * inv,
             pass_chains: self.pass_chains * inv,
             pass_chain_gain_yards: self.pass_chain_gain_yards * inv,
             pass_chains_net_loss: self.pass_chains_net_loss * inv,
@@ -90,11 +105,19 @@ impl GameKpis {
 
     fn print_row(&self, label: &str) {
         let pass_completion = ratio(self.passes_completed, self.passes_attempted);
+        let intentional_completion = ratio(
+            self.intentional_passes_completed,
+            self.intentional_passes_attempted,
+        );
         let shot_accuracy = ratio(self.shots_on_target, self.shots);
         let net_forward = self.passes_forward - self.pass_turnovers;
+        let intentional_net_forward =
+            self.intentional_passes_forward - self.intentional_pass_turnovers;
         let dribble_beat_per_100 = ratio(self.dribble_beats * 100.0, self.dribble_decisions);
         println!(
             "{label:<14} pass_completion={:.3} passes={:.0}/{:.0} fwd_passes={:.0} \
+             intentional_completion={:.3} intentional_passes={:.0}/{:.0} intentional_fwd={:.0} \
+             intentional_turnovers={:.1} intentional_net_forward={:.1} intentional_gain_yds={:.1} \
              pass_turnovers={:.1} net_forward={:.1} goals={:.2} shots={:.1} \
              on_target={:.1} shot_acc={:.3} shot_after_pass={:.1} dribble_beats={:.1} \
              dribble_decisions={:.0} dribble_beats_per_100_decisions={:.2} chains={:.1} \
@@ -103,6 +126,13 @@ impl GameKpis {
             self.passes_completed,
             self.passes_attempted,
             self.passes_forward,
+            intentional_completion,
+            self.intentional_passes_completed,
+            self.intentional_passes_attempted,
+            self.intentional_passes_forward,
+            self.intentional_pass_turnovers,
+            intentional_net_forward,
+            self.intentional_pass_gain_yards,
             self.pass_turnovers,
             net_forward,
             self.goals,
@@ -138,6 +168,21 @@ fn env_f64(name: &str) -> f64 {
         .unwrap_or(0.0)
 }
 
+fn env_f64_or(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(default)
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
 fn ratio(numerator: f64, denominator: f64) -> f64 {
     if denominator.abs() > 1e-9 {
         numerator / denominator
@@ -167,6 +212,8 @@ fn main() {
         .get(3)
         .and_then(|s| s.parse().ok())
         .unwrap_or(0x5EED_0000);
+    let warmup_games = env_usize("DD_SOCCER_AB_WARMUP_GAMES", 0).min(256);
+    let total_games = warmup_games.saturating_add(games);
 
     // Inline backend keeps neural training synchronous (deterministic); MAPPO actor on so the
     // trained policy actually drives play.
@@ -180,7 +227,8 @@ fn main() {
 
     println!("===== LEARNING A/B HARNESS =====");
     println!(
-        "games={games} minutes={minutes} seed_base=0x{seed_base:08X} \
+        "games={games} warmup_games={warmup_games} total_games={total_games} \
+         minutes={minutes} seed_base=0x{seed_base:08X} \
          backend=Inline marl=Mappo team_reward_share={:.3}",
         neural.mappo_team_reward_share
     );
@@ -198,12 +246,19 @@ fn main() {
     );
     println!(
         "gates: dp_critic_target={} dp_bootstrap={} learned_epv={} learned_pass_completion={} \
-         deferred_pass_credit={} neural_mcts={} league_neural_mcts={} xt_terminal_cost={} \
-         mpc_pass={} pass_completion_score_weight={:.2} pass_turnover_penalty_scale={:.2}",
+         learned_pass_receiver={} learned_pass_receiver_strict={} neural_pass_space={} \
+         pass_aim_offset_guard={} speculative_killer_guard={} deferred_pass_credit={} neural_mcts={} league_neural_mcts={} xt_terminal_cost={} mpc_pass={} \
+         pass_completion_score_weight={:.2} pass_turnover_penalty_scale={:.2} \
+         pass_target_completion_primary_scale={:.2} learned_curve={} mpc_objective_epochs={}",
         env_on("DD_SOCCER_ENABLE_DP_CRITIC_TARGET"),
         env_on("DD_SOCCER_ENABLE_DP_BOOTSTRAP"),
         env_on("DD_SOCCER_ENABLE_LEARNED_EPV"),
         env_on("DD_SOCCER_ENABLE_LEARNED_PASS_COMPLETION"),
+        env_on("DD_SOCCER_ENABLE_LEARNED_PASS_RECEIVER"),
+        env_on("DD_SOCCER_ENABLE_LEARNED_PASS_RECEIVER_STRICT_FALLBACK"),
+        env_on("DD_SOCCER_ENABLE_NEURAL_PASS_SPACE"),
+        env_on("DD_SOCCER_ENABLE_PASS_AIM_OFFSET_COMPLETION_GUARD"),
+        env_on("DD_SOCCER_ENABLE_SPECULATIVE_KILLER_PASS_COMPLETION_GUARD"),
         env_on("DD_SOCCER_ENABLE_DEFERRED_PASS_CREDIT"),
         env_on("SOCCER_NEURAL_MCTS_ENABLED"),
         env_on("SOCCER_LEAGUE_NEURAL_MCTS_ENABLED"),
@@ -211,6 +266,17 @@ fn main() {
         env_on("DD_SOCCER_ENABLE_MPC_PASS"),
         env_f64("DD_SOCCER_PASS_COMPLETION_SCORE_WEIGHT"),
         env_f64("DD_SOCCER_PASS_TURNOVER_PENALTY_SCALE"),
+        env_f64("DD_SOCCER_PASS_TARGET_COMPLETION_PRIMARY_SCALE"),
+        env_on("DD_SOCCER_ENABLE_LEARNED_CURVE"),
+        env_usize("DD_SOCCER_MPC_OBJECTIVE_EPOCHS", 4),
+    );
+    println!(
+        "knobs: learned_receiver_min_net_forward_quality={:.2} \
+         learned_mpc_pass_impossible_probability={:.2} \
+         pass_completion_primary_score_weight={:.2}",
+        env_f64_or("SOCCER_LEARNED_PASS_RECEIVER_MIN_NET_FORWARD_QUALITY", 0.26),
+        env_f64_or("SOCCER_LEARNED_MPC_PASS_IMPOSSIBLE_PROBABILITY", 0.18),
+        env_f64_or("DD_SOCCER_PASS_COMPLETION_SCORE_WEIGHT", 0.0),
     );
 
     // Carried across games within this process (the real learner's per-process pattern).
@@ -231,7 +297,7 @@ fn main() {
     let mut per_game: Vec<GameKpis> = Vec::with_capacity(games);
     let started = Instant::now();
 
-    for g in 0..games {
+    for g in 0..total_games {
         let mut config = MatchConfig {
             duration_seconds: minutes * 60.0,
             learning_enabled: true,
@@ -301,9 +367,18 @@ fn main() {
             let head = mpc_objective_head.get_or_insert_with(|| {
                 SoccerMpcObjectiveHead::new(seed_base.wrapping_add(g as u32))
             });
-            for _ in 0..4 {
-                head.train_rwr(&mpc_samples, 0.05);
+            let epochs = env_usize("DD_SOCCER_MPC_OBJECTIVE_EPOCHS", 4).clamp(1, 32);
+            let mut trained_steps = 0usize;
+            for _ in 0..epochs {
+                trained_steps += head.train_rwr(&mpc_samples, 0.05);
             }
+            eprintln!(
+                "mpc_objective_training game={} samples={} epochs={} trained_steps={}",
+                g + 1,
+                mpc_samples.len(),
+                epochs,
+                trained_steps
+            );
         }
 
         let summary = sim.summary();
@@ -321,6 +396,22 @@ fn main() {
             pass_turnovers: f64::from(
                 st.pass_interceptions_own_half + st.pass_interceptions_opp_half,
             ),
+            intentional_passes_attempted: f64::from(
+                st.intentional_passes_attempted_home + st.intentional_passes_attempted_away,
+            ),
+            intentional_passes_completed: f64::from(
+                st.intentional_passes_completed_home + st.intentional_passes_completed_away,
+            ),
+            intentional_passes_forward: f64::from(
+                st.intentional_passes_completed_forward_home
+                    + st.intentional_passes_completed_forward_away,
+            ),
+            intentional_pass_turnovers: f64::from(
+                st.intentional_pass_interceptions_own_half
+                    + st.intentional_pass_interceptions_opp_half,
+            ),
+            intentional_pass_gain_yards: st.intentional_completed_pass_gain_yards_home
+                + st.intentional_completed_pass_gain_yards_away,
             pass_chains: f64::from(st.pass_chains_home + st.pass_chains_away),
             pass_chain_gain_yards: st.pass_chain_gain_yards_home + st.pass_chain_gain_yards_away,
             pass_chains_net_loss: f64::from(
@@ -330,7 +421,10 @@ fn main() {
             dribble_beats: f64::from(st.dribble_beats_home + st.dribble_beats_away),
             dribble_decisions: game_dribble_decision_ticks as f64,
         };
-        per_game.push(kpis);
+        let measured_game = g >= warmup_games;
+        if measured_game {
+            per_game.push(kpis);
+        }
 
         // Carry the trained policy + neural net into the next game.
         if let Some(p) = sim.team_policies() {
@@ -341,8 +435,11 @@ fn main() {
         }
 
         eprintln!(
-            "game {:>2}/{games} seed=0x{:08X} score {}-{} chains={} chain_gain_yds={:.1}",
+            "game {:>2}/{total_games} phase={} measured={}/{} seed=0x{:08X} score {}-{} chains={} chain_gain_yds={:.1}",
             g + 1,
+            if measured_game { "eval" } else { "warmup" },
+            per_game.len(),
+            games,
             seed_base.wrapping_add(g as u32),
             summary.score_home,
             summary.score_away,
@@ -370,7 +467,7 @@ fn main() {
     }
 
     println!(
-        "\n----- per-game averages ({games} games, {:.1}s elapsed) -----",
+        "\n----- measured per-game averages ({games} eval games after {warmup_games} warmup, {:.1}s elapsed) -----",
         started.elapsed().as_secs_f64()
     );
     overall.scaled(1.0 / n).print_row("OVERALL");

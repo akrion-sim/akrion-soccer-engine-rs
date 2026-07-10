@@ -15,7 +15,7 @@ labels, but the engine still avoids a free continuous action search in the live 
 |---|---|---|---|
 | 1 | Stateless NN (no POMDP belief)? | **Belief exists** (analytic, not recurrent): opponent press beliefs, FOV vision-gating + Kalman confidence, perception-noise / occlusion (gated), intended-pass-target belief | `update_opponent_press_beliefs`, `opponent_belief_enabled`, `INTENDED_PASS_TARGET_BELIEF_CONFIDENCE` (world.rs) |
 | 2 | Probs vs Q-values? | Both + tabular value: `FeedForwardNetwork` policy/value heads over a tabular `value_micros` retrieval prior | soccer.rs neural heads + `des_soccer_learning_policy_entries` |
-| 3 | Behavior prob stored for PPO? | **Yes** — `old_action_probability`, comment: *"PPO/MAPPO importance weighting must use THIS as the behaviour [prob]"* | soccer.rs:6744, 34136 |
+| 3 | Behavior prob stored for PPO? | **Yes** — `old_action_probability`, comment: *"PPO/MAPPO importance weighting must use THIS as the behaviour [prob]"* | soccer.rs:40411 (field), :8328 (comment) |
 | 4 | Reward too sparse? | **No — densely shaped**: `PITCH_VALUE` (xT-like), `REWARD_PER_YARD`, half-field weighting, `REWARD_MIN_PRESSURE`, possession progression, `EFFORT_REWARD`, shot/pass ladders | soccer.rs reward consts |
 | 5 | 11 independent NNs? | **No — MARL/MAPPO**: team reward weight 0.35 / intermediate 1.0, centralized lane-discipline, balanced-team component, MAPPO feature channels | `DEFAULT_SOCCER_MARL_TEAM_REWARD_WEIGHT`, `field_numbers` |
 | 6 | Player relationships modeled? | **Engineered, not learned**: 22-body `field_numbers` vector, relational shape (neighbors), lane affinity, nearest-opponent/marking | `mod field_numbers`, `RELATIONAL_SHAPE_NEIGHBORS` |
@@ -68,7 +68,7 @@ graph/recurrent/tree-search cost."
 4. **Lean into the CTDE you already have.** Strengthen the centralized critic *offline*
    (MAPPO team reward already wired); runtime stays decentralized per-player.
 5. **New-variable discipline (already-correct pattern).** Append features at the tail and
-   zero-pad old neural snapshots (engine already migrates this way — soccer.rs:3675/3685).
+   zero-pad old neural snapshots (engine already migrates this way — soccer.rs:4401 (block 4401-4643)).
    Keep new variables OUT of the tabular `state_key` (`soccer_policy_postgres_state_key`)
    unless you are prepared to re-accumulate that experiment, because changing the key
    encoding orphans existing tabular entries.

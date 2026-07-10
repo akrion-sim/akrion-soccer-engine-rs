@@ -958,6 +958,16 @@ fn main() {
         advancement_confidence.pass_completion_rate_margin.mean * 100.0,
         advancement_confidence.pass_completion_rate_margin.lb9999 * 100.0,
     );
+    println!(
+        "completion_rate cand={:.4} opp={:.4} margin={:+.4} (cand {}/{} opp {}/{})",
+        advancement.candidate_pass_completion_rate(),
+        advancement.opponent_pass_completion_rate(),
+        advancement.pass_completion_rate_margin(),
+        advancement.candidate_completed_passes,
+        advancement.candidate_passes_attempted,
+        advancement.opponent_completed_passes,
+        advancement.opponent_passes_attempted,
+    );
     if require_forward_pass_climb {
         println!("scoreline gate: diagnostic only with forward-pass climb");
         println!(
