@@ -230,10 +230,10 @@ const META   = /*__META__*/ null;
 // ---------- facts ----------
 (function(){
   const facts=[
-    {k:'Format',v:'<b>5 v 5</b>, continuous 2D, ~40s games'},
+    {k:'Format',v:'<b>5 v 5</b> with keepers, ~7m net, ~40s games'},
     {k:'No shape machinery',v:'zero <b>LP / IPM</b>, no formation — space + possession only'},
-    {k:'Algorithm',v:'<b>PPO</b> (clip) + <b>GAE</b>, shared-weight actor/critic'},
-    {k:'Dependencies',v:'<b>0</b> crates — own PRNG, own MLP, own backprop'},
+    {k:'Finishing',v:'short-horizon <b>aim optimizer</b> places shots past the keeper'},
+    {k:'Learner + algo',v:'4 outfielders, <b>PPO</b>+<b>GAE</b>, <b>0</b> deps (own MLP/backprop)'},
   ];
   document.getElementById('facts').innerHTML=facts.map(f=>`<div class="fact"><div class="k">${f.k}</div><div class="v">${f.v}</div></div>`).join('');
   document.getElementById('foot').innerHTML='Isolated git worktree · <code>cargo run --release -- train</code> · same opening seed for both matches so the contrast is the policy, not the dice.';
