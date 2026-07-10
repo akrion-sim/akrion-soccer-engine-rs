@@ -103,7 +103,8 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
     let mut mask_buf: Vec<[[bool; NA]; N]> = Vec::with_capacity(STEPS);
     let mut act_buf: Vec<[usize; N]> = Vec::with_capacity(STEPS);
     let mut logp_buf: Vec<[f32; N]> = Vec::with_capacity(STEPS);
-    let mut val_buf: Vec<[f32; N]> = Vec::with_capacity(STEPS);
+    let mut val_buf: Vec<f32> = Vec::with_capacity(STEPS); // CENTRALIZED value (one per tick)
+    let mut gstate_buf: Vec<[f32; GLOBAL_DIM]> = Vec::with_capacity(STEPS);
     let mut rew_buf: Vec<f32> = Vec::with_capacity(STEPS);
     let mut space_buf: Vec<[f32; N]> = Vec::with_capacity(STEPS); // per-player spacing reward
 
