@@ -144,6 +144,23 @@ fn run_training(iters: usize) {
     println!("wrote out/match_before.json + out/match_after.json (visual demo traces)");
 }
 
+/// Final score (goals_a, goals_b) of one greedy game vs scripted at `seed`.
+fn game_score(policy: &train::Policy, seed: u64) -> (u32, u32) {
+    let mut rng = Rng::new(seed);
+    let mut w = World::new();
+    for _ in 0..STEPS {
+        let mut act_a = [A_STAY; N];
+        for i in 0..N {
+            let obs = w.observe(Team::A, i);
+            let mask = w.legal_mask(Team::A, i);
+            act_a[i] = policy.act_greedy(&obs, &mask);
+        }
+        let act_b = w.scripted_actions(Team::B);
+        w.step(&act_a, &act_b, &mut rng);
+    }
+    (w.goals_a, w.goals_b)
+}
+
 /// Play one greedy game and dump per-tick positions to a compact JSON for the
 /// HTML viewer. Hand-rolled JSON — no serde, keeping the crate dependency-free.
 fn record_match(policy: &train::Policy, rng: &mut Rng, path: &str) {
