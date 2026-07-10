@@ -107,19 +107,17 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
         if w.ev_goal_b {
             r -= 5.0;
         }
+        // Only a tiny nudge for a completed pass (prefer it to a loose turnover);
+        // forward progress is rewarded by the potential shaping above, and goals
+        // dominate — so passing stays INSTRUMENTAL and the policy still attacks.
         if w.ev_pass_completed_a {
-            r += 0.6; // reward keeping the ball through a completed pass
+            r += 0.08;
         }
         if w.ev_turnover_a {
-            r -= 0.3;
+            r -= 0.25;
         }
         if w.ev_shot_on_a {
-            r += 0.4;
-        }
-        // small per-tick possession reward -> favors keeping the ball over
-        // the loose-ball counter style, so passing sequences emerge.
-        if matches!(w.owner, Some(o) if matches!(o.team, Team::A)) {
-            r += 0.02;
+            r += 0.3;
         }
 
         obs_buf.push(obs_t);
