@@ -37131,7 +37131,7 @@ fn soccer_learning_reward_contract() -> SoccerLearningRewardContract {
             .map(|points| points * shot_shaping_reward_scale())
             .collect(),
         possession_progress_milestone_yards: POSSESSION_PROGRESS_MILESTONE_YARDS,
-        possession_progress_points: POSSESSION_PROGRESS_REWARD_POINTS * poss_scale,
+        possession_progress_points: POSSESSION_PROGRESS_REWARD_POINTS,
         possession_progress_reward_weights: POSSESSION_PROGRESS_REWARD_WEIGHTS.to_vec(),
         possession_stall_pass_threshold: POSSESSION_STALL_PASS_THRESHOLD,
         possession_stall_min_gain_yards: POSSESSION_STALL_MIN_GAIN_YARDS,
