@@ -1539,4 +1539,85 @@ mod tests {
         assert_eq!(w.pending_passer, -1);
         assert_eq!(w.return_streak_a, 0);
     }
+
+    #[test]
+    fn reset_a_pass_memory_clears_return_start_x() {
+        let mut w = World::new();
+        w.return_start_x = 17.5;
+        w.return_streak_a = 3;
+        w.reset_a_pass_memory();
+        assert_eq!(w.return_start_x, 0.0);
+        assert_eq!(w.return_streak_a, 0);
+    }
+
+    #[test]
+    fn first_return_records_start_x_and_streak_one() {
+        // A→B→A: the FIRST return (streak 0→1) must be recorded but is "fine"
+        // (the reward only penalises from streak >= 2).
+        let mut w = World::new();
+        arrange_return_pass_candidates(&mut w);
+        w.owner = Some(Owner { team: Team::A, idx: 2 });
+        w.ball = V2::new(20.0, 14.0);
+        w.lp_from = 1; // player 1 gave the ball to player 2
+        w.lp_to = 2;
+        w.return_streak_a = 0;
+        let _ = w.apply_on_ball(Team::A, 2, A_PASS_A, &mut Rng::new(3));
+        assert!(w.ev_return_pass_a);
+        assert_eq!(w.return_streak_a, 1);
+        assert_eq!(w.return_start_x, 20.0); // sequence origin recorded
+    }
+
+    #[test]
+    fn shielded_dribble_veers_away_from_close_defender() {
+        // Defender directly ahead: forward intent must bend AWAY (−x here).
+        let mut w = World::new();
+        let me = V2::new(20.0, 14.0);
+        w.a[1].pos = me;
+        w.b[0].pos = V2::new(50.0, 14.0); // keep GK far
+        w.b[1].pos = V2::new(21.0, 14.0); // 1 unit ahead of the carrier
+        let dir = w.shielded_dribble_dir(Team::A, me, V2::new(1.0, 0.0));
+        assert!(dir.x < 0.0, "should steer away from the defender, got {:?}", dir);
+    }
+
+    #[test]
+    fn note_dribble_classifies_by_final_direction() {
+        // A shielded direction that is actually backward must NOT be credited as a
+        // forward dribble (the P2 fix: reward reflects real movement).
+        let mut w = World::new();
+        w.note_dribble(Team::A, V2::new(-1.0, 0.0), 1.0); // backward (x·sx < −0.3)
+        assert!(!w.ev_dribble_fwd_a && !w.ev_dribble_lat_a);
+        w.note_dribble(Team::A, V2::new(1.0, 0.0), 1.0); // forward
+        assert!(w.ev_dribble_fwd_a);
+        let mut w2 = World::new();
+        w2.note_dribble(Team::A, V2::new(0.0, 1.0), 1.0); // lateral
+        assert!(w2.ev_dribble_lat_a && !w2.ev_dribble_fwd_a);
+    }
+
+    #[test]
+    fn intercept_point_leads_a_moving_ball() {
+        // For a ball moving in +x, a defender ahead should be sent to a point on
+        // the trajectory (>= current ball x), not the current spot.
+        let mut w = World::new();
+        w.owner = None;
+        w.ball = V2::new(10.0, 14.0);
+        w.ball_vel = V2::new(18.0, 0.0);
+        let p = w.intercept_point(V2::new(25.0, 14.0));
+        assert!(p.x >= w.ball.x, "intercept should lead the ball, got {:?}", p);
+        // a stationary ball just returns the ball itself
+        w.ball_vel = V2::default();
+        assert_eq!(w.intercept_point(V2::new(25.0, 14.0)).x, w.ball.x);
+    }
+
+    #[test]
+    fn dribble_forward_action_sets_forward_event_in_the_clear() {
+        // With no defender near, A_DRIB_FWD keeps forward intent -> forward event.
+        let mut w = World::new();
+        w.a[1].pos = V2::new(20.0, 14.0);
+        w.owner = Some(Owner { team: Team::A, idx: 1 });
+        for i in 0..N {
+            w.b[i].pos = V2::new(41.0, 14.0); // all defenders far away
+        }
+        let _ = w.apply_on_ball(Team::A, 1, A_DRIB_FWD, &mut Rng::new(1));
+        assert!(w.ev_dribble_fwd_a);
+    }
 }
