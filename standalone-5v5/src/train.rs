@@ -123,6 +123,8 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
         if w.ev_shot_on_a {
             r += 0.3;
         }
+        // teammate spacing: spread out to open passing lanes (see spacing_term_a)
+        r += W_SPACING * w.spacing_term_a();
 
         obs_buf.push(obs_t);
         mask_buf.push(mask_t);
