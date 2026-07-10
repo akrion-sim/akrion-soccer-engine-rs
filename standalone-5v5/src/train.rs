@@ -369,7 +369,8 @@ pub fn evaluate(policy: &Policy, games: usize, rng: &mut Rng) -> (f32, f32, f32,
     }
     let g = games.max(1) as f32;
     let spacing = if space_ticks > 0.0 { space_sum / space_ticks } else { 0.0 };
-    (diff / g, wins / g, ga / g, gb / g, passes / g, spacing)
+    let bunch = if space_ticks > 0.0 { bunch_ticks / space_ticks } else { 0.0 };
+    (diff / g, wins / g, ga / g, gb / g, passes / g, spacing, bunch)
 }
 
 /// Baseline sanity check: scripted-vs-scripted goal difference (should be ~0).
