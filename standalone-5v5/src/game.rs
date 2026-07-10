@@ -619,9 +619,8 @@ impl World {
         self.last_touch = Some(to);
         self.last_kicker = None;
         self.kick_timer = 0;
-        if to == Team::B && matches!(self.last_touch, Some(Team::A)) {
-            // A conceded possession going out — mild turnover already implied
-        }
+        self.pass_streak_a = 0;
+        self.a_shot_flag = false;
     }
 
     fn try_capture(&mut self) {
