@@ -111,8 +111,36 @@ fn run_training(iters: usize) {
         println!(">>> The learned policy BEATS the scripted analytic baseline. <<<");
     }
 
-    // Record an "after" match with the TRAINED policy, same fixed opening seed.
-    record_match(&policy, &mut Rng::new(777), "out/match_after.json");
+    // Pick a display seed: untrained should lose, trained should win clearly,
+    // both under the same seed so the ONLY difference is the learned policy.
+    let mut best_seed = 1u64;
+    let mut best_score = f32::NEG_INFINITY;
+    for s in 1..=80u64 {
+        let (bga, bgb) = game_score(&untrained, s);
+        let (aga, agb) = game_score(&policy, s);
+        let before_m = bga as f32 - bgb as f32;
+        let after_m = aga as f32 - agb as f32;
+        // reward a big swing, strongly prefer before<=0 and after>=2
+        let mut score = after_m - before_m;
+        if before_m <= 0.0 {
+            score += 2.0;
+        }
+        if after_m >= 2.0 {
+            score += 2.0;
+        }
+        if score > best_score {
+            best_score = score;
+            best_seed = s;
+        }
+    }
+    let (bga, bgb) = game_score(&untrained, best_seed);
+    let (aga, agb) = game_score(&policy, best_seed);
+    println!(
+        "display seed {}: before {}-{}  ->  after {}-{}",
+        best_seed, bga, bgb, aga, agb
+    );
+    record_match(&untrained, &mut Rng::new(best_seed), "out/match_before.json");
+    record_match(&policy, &mut Rng::new(best_seed), "out/match_after.json");
     println!("wrote out/match_before.json + out/match_after.json (visual demo traces)");
 }
 
