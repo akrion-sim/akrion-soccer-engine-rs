@@ -482,11 +482,9 @@ impl World {
             integrate(&mut self.b[i]);
         }
 
-        // 2b. Collision/separation: players have bodies and cannot overlap. A
-        // few relaxation passes push apart any pair closer than the minimum
-        // separation (larger for teammates). This is why the reward alone left
-        // players stacked — nothing physically stopped them.
-        self.separate();
+        // (No physics separation — spacing is left entirely to the learned
+        // policy via the per-player spacing reward. The policy is given
+        // nearest-teammate perception in its observation so it CAN learn it.)
 
         // 3. Resolve a kick (frees the ball) or carry it with the owner.
         if let Some((kicker, dir, speed, is_pass)) = kick {
