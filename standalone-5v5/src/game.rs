@@ -27,8 +27,10 @@ const CLEAR_SPEED: f32 = 20.0;
 const CAPTURE_MAX_BALL_SPEED: f32 = 26.0;
 const KEEPER_REACH: f32 = 1.9; // keeper saves spam; well-placed shots still beat it
 const KEEPER_SPEED: f32 = 6.0;
-const SEP_TEAM: f32 = 2.0; // teammates physically cannot be closer than this
+const SEP_TEAM: f32 = 2.0; // hard floor: teammates cannot be closer than this
 const SEP_OPP: f32 = 1.2; // opponents can close in to contest, but not overlap
+const TEAM_TARGET: f32 = 5.0; // soft target spacing for outfield teammates (optimal)
+const TEAM_SOFT_K: f32 = 0.35; // soft-separation strength per relaxation pass
 
 // ---- Action space -----------------------------------------------------------
 pub const NA: usize = 13;
