@@ -14,6 +14,7 @@ const LR_CRITIC: f32 = 1e-3;
 const EPOCHS: usize = 4;
 const MINIBATCH: usize = 1024;
 const W_SHAPE: f32 = 2.0;
+const W_SPACING: f32 = 0.02; // small: nudge teammate spacing without dominating goals
 const ENT_BETA0: f32 = 0.02;
 
 #[derive(Clone)]
