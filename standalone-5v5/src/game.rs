@@ -413,6 +413,13 @@ impl World {
         for team in [Team::A, Team::B] {
             let acts = if team == Team::A { act_a } else { act_b };
             for i in 0..N {
+                // Goalkeeper is a fixed rule (both teams), never policy-driven.
+                if i == GK {
+                    if let Some(k) = self.apply_keeper(team) {
+                        kick = Some(k);
+                    }
+                    continue;
+                }
                 let a = acts[i];
                 let is_owner = matches!(self.owner, Some(o) if o.team == team && o.idx == i);
                 if is_owner {
