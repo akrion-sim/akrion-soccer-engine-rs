@@ -131,14 +131,15 @@
 
   <header>
     <div class="eyebrow"><span class="dot"></span> standalone 5-a-side · reinforcement learning · zero deps</div>
-    <h1>Watch a policy learn to <span class="em">pass, dribble, and finish.</span></h1>
+    <h1>Watch a policy learn to <span class="em">win the ball, drive, and finish.</span></h1>
     <p class="lede">A hermetic 5-a-side sim — <b>goalkeepers</b>, a <b>~7m net</b>, no formation LP/IPM and
       no POMDP feature stack. The four outfielders learn only the macro families
       <b>pass · dribble · shoot · clear · hold</b> and <b>chase · support · spread · mark</b>;
       movement is pure possession + open-space, and shooting uses a short-horizon
       <b>aim optimizer</b> that places the ball at the corner away from the keeper. A shared-weight
-      policy (PPO + GAE, hand-rolled MLP) trains against a scripted baseline. Same kickoff on both
-      pitches below — watch the <em>quality of play</em> change.</p>
+      policy (PPO + GAE, hand-rolled MLP) trains against a scripted baseline. It goes from flailing
+      to a coherent <em>win-it-back, carry, and place-the-shot</em> game. Same kickoff on both
+      pitches below.</p>
   </header>
 
   <div class="result" id="result"></div>
