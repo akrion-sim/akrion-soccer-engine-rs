@@ -759,7 +759,7 @@ mod tests {
         let (ctx, _held) = snapshot
             .attack_spacing_team_context(Team::Home)
             .expect("team spacing context");
-        let analytic = snapshot.resolved_attack_spacing_target(&ctx);
+        let analytic = snapshot.resolved_attack_spacing_target(Team::Home, &ctx);
         let samples: Vec<AttackSpacingSample> = (0..ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS)
             .map(|_| AttackSpacingSample {
                 context: ctx,
@@ -777,7 +777,7 @@ mod tests {
 
         sim.set_attack_spacing_head(head);
         let learned_snapshot = WorldSnapshot::from_match(&sim);
-        let learned = learned_snapshot.resolved_attack_spacing_target(&ctx);
+        let learned = learned_snapshot.resolved_attack_spacing_target(Team::Home, &ctx);
         assert!(
             learned.ideal > analytic.ideal + 0.25,
             "warm installed head should move the served band: analytic={analytic:?} learned={learned:?}"

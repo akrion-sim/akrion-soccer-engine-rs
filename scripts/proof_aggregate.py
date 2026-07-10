@@ -204,10 +204,17 @@ def add_totals(total: Dict[str, float], row: Dict[str, object], prefix: str) -> 
         "sap",
         "assist",
         "drib",
+        "drib_to",
         "route1",
         "int",
         "int_won",
         "pto",
+        "tackles",
+        "lbr",
+        "team_up",
+        "team_near",
+        "chase_adv",
+        "def_chase",
     ):
         if key == "int_won" and f"{prefix}_int_won" not in row:
             total[key] += f(row, f"{prefix}_int")
@@ -318,6 +325,17 @@ def main() -> int:
     d_goals: List[float] = []
     d_sot: List[float] = []
     d_drib: List[float] = []
+    d_sot_rate: List[float] = []
+    d_goal_per_shot: List[float] = []
+    d_goal_per_sot: List[float] = []
+    d_worked_sot_share: List[float] = []
+    d_dribble_success_rate: List[float] = []
+    d_loose_ball_recoveries: List[float] = []
+    d_tackles: List[float] = []
+    d_teamwork_upfield: List[float] = []
+    d_teamwork_near_ball: List[float] = []
+    d_chase_advantage: List[float] = []
+    d_defensive_chase_load: List[float] = []
     cand = {
         key: 0.0
         for key in (
@@ -339,10 +357,17 @@ def main() -> int:
             "sap",
             "assist",
             "drib",
+            "drib_to",
             "route1",
             "int",
             "int_won",
             "pto",
+            "tackles",
+            "lbr",
+            "team_up",
+            "team_near",
+            "chase_adv",
+            "def_chase",
         )
     }
     base = cand.copy()
@@ -364,9 +389,22 @@ def main() -> int:
         b_yards = f(row, "b_yards")
         c_route = f(row, "c_route1")
         b_route = f(row, "b_route1")
+        c_goals = f(row, "c_goals")
+        b_goals = f(row, "b_goals")
+        c_shots = f(row, "c_shots")
+        b_shots = f(row, "b_shots")
+        c_sot = f(row, "c_sot")
+        b_sot = f(row, "b_sot")
+        c_sap = f(row, "c_sap")
+        b_sap = f(row, "b_sap")
         has_pto = "c_pto" in row and "b_pto" in row
         c_pto = f(row, "c_pto") if has_pto else 0.0
         b_pto = f(row, "b_pto") if has_pto else 0.0
+        has_dribble_turnovers = "c_drib_to" in row and "b_drib_to" in row
+        c_drib = f(row, "c_drib")
+        b_drib = f(row, "b_drib")
+        c_drib_to = f(row, "c_drib_to") if has_dribble_turnovers else 0.0
+        b_drib_to = f(row, "b_drib_to") if has_dribble_turnovers else 0.0
         has_strict = all(
             key in row
             for key in (
@@ -404,9 +442,26 @@ def main() -> int:
             d_strict_turnover_rate_improvement.append(
                 safe_ratio(b_ipto, b_ipatt) - safe_ratio(c_ipto, c_ipatt)
             )
-        d_goals.append(f(row, "c_goals") - f(row, "b_goals"))
-        d_sot.append(f(row, "c_sot") - f(row, "b_sot"))
-        d_drib.append(f(row, "c_drib") - f(row, "b_drib"))
+        d_goals.append(c_goals - b_goals)
+        d_sot.append(c_sot - b_sot)
+        d_drib.append(c_drib - b_drib)
+        d_sot_rate.append(safe_ratio(c_sot, c_shots) - safe_ratio(b_sot, b_shots))
+        d_goal_per_shot.append(
+            safe_ratio(c_goals, c_shots) - safe_ratio(b_goals, b_shots)
+        )
+        d_goal_per_sot.append(safe_ratio(c_goals, c_sot) - safe_ratio(b_goals, b_sot))
+        d_worked_sot_share.append(safe_ratio(c_sap, c_sot) - safe_ratio(b_sap, b_sot))
+        if has_dribble_turnovers:
+            d_dribble_success_rate.append(
+                safe_ratio(c_drib, c_drib + c_drib_to)
+                - safe_ratio(b_drib, b_drib + b_drib_to)
+            )
+        d_loose_ball_recoveries.append(f(row, "c_lbr") - f(row, "b_lbr"))
+        d_tackles.append(f(row, "c_tackles") - f(row, "b_tackles"))
+        d_teamwork_upfield.append(f(row, "c_team_up") - f(row, "b_team_up"))
+        d_teamwork_near_ball.append(f(row, "c_team_near") - f(row, "b_team_near"))
+        d_chase_advantage.append(f(row, "c_chase_adv") - f(row, "b_chase_adv"))
+        d_defensive_chase_load.append(f(row, "c_def_chase") - f(row, "b_def_chase"))
         add_totals(cand, row, "c")
         add_totals(base, row, "b")
 
@@ -432,6 +487,17 @@ def main() -> int:
         "goals": paired_stat(d_goals, 12),
         "sot": paired_stat(d_sot, 13),
         "drib": paired_stat(d_drib, 14),
+        "sot_rate": paired_stat(d_sot_rate, 15),
+        "goal_per_shot": paired_stat(d_goal_per_shot, 16),
+        "goal_per_sot": paired_stat(d_goal_per_sot, 17),
+        "worked_sot_share": paired_stat(d_worked_sot_share, 18),
+        "dribble_success_rate": paired_stat(d_dribble_success_rate, 19),
+        "loose_ball_recoveries": paired_stat(d_loose_ball_recoveries, 20),
+        "tackles": paired_stat(d_tackles, 21),
+        "teamwork_upfield": paired_stat(d_teamwork_upfield, 22),
+        "teamwork_near_ball": paired_stat(d_teamwork_near_ball, 23),
+        "chase_advantage": paired_stat(d_chase_advantage, 24),
+        "defensive_chase_load": paired_stat(d_defensive_chase_load, 25),
     }
     nf = float(rows)
 
@@ -542,13 +608,71 @@ def main() -> int:
     print("\n----- secondary guardrails -----")
     print(fmt_metric("goals/game", stats["goals"]))
     print(fmt_metric("shots-on-target/game", stats["sot"]))
+    print(
+        f"SOT rate:     {pct(cand['sot'], cand['shots']):.2f}% vs "
+        f"{pct(base['sot'], base['shots']):.2f}%"
+    )
+    print(fmt_metric("SOT rate", stats["sot_rate"], 100.0, "pp"))
+    print(
+        f"goals/shot:   {pct(cand['goals'], cand['shots']):.2f}% vs "
+        f"{pct(base['goals'], base['shots']):.2f}% | "
+        f"goals/SOT: {pct(cand['goals'], cand['sot']):.2f}% vs "
+        f"{pct(base['goals'], base['sot']):.2f}%"
+    )
+    print(fmt_metric("goals/shot", stats["goal_per_shot"], 100.0, "pp"))
+    print(fmt_metric("goals/SOT", stats["goal_per_sot"], 100.0, "pp"))
+    print(
+        f"worked SOT share: {pct(cand['sap'], cand['sot']):.2f}% vs "
+        f"{pct(base['sap'], base['sot']):.2f}%"
+    )
+    print(fmt_metric("worked SOT share", stats["worked_sot_share"], 100.0, "pp"))
     print(fmt_metric("dribble beats/game", stats["drib"]))
+    if stats["dribble_success_rate"].n == rows:
+        print(
+            f"dribble contest success:    "
+            f"{pct(cand['drib'], cand['drib'] + cand['drib_to']):.2f}% vs "
+            f"{pct(base['drib'], base['drib'] + base['drib_to']):.2f}% | "
+            f"turnovers/game {cand['drib_to'] / nf:.2f} vs {base['drib_to'] / nf:.2f}"
+        )
+        print(
+            fmt_metric(
+                "dribble success rate",
+                stats["dribble_success_rate"],
+                100.0,
+                "pp",
+            )
+        )
+    else:
+        print(
+            "dribble contest success:    unavailable "
+            f"({stats['dribble_success_rate'].n}/{rows} rows have c_drib_to/b_drib_to)"
+        )
     print(
         f"shots:        {cand['shots'] / nf:.2f} vs {base['shots'] / nf:.2f} | "
         f"shots-after-pass: {cand['sap'] / nf:.2f} vs {base['sap'] / nf:.2f} | "
         f"assists: {cand['assist'] / nf:.2f} vs {base['assist'] / nf:.2f} | "
         f"interceptions won: {cand['int_won'] / nf:.2f} vs {base['int_won'] / nf:.2f}"
     )
+    print(
+        f"recoveries/tackles: {cand['lbr'] / nf:.2f}/{cand['tackles'] / nf:.2f} vs "
+        f"{base['lbr'] / nf:.2f}/{base['tackles'] / nf:.2f}"
+    )
+    print(fmt_metric("loose-ball recoveries/game", stats["loose_ball_recoveries"]))
+    print(fmt_metric("tackles/game", stats["tackles"]))
+    print(
+        f"teamwork upfield/near-ball: "
+        f"{cand['team_up'] / nf:.2f}/{cand['team_near'] / nf:.2f} vs "
+        f"{base['team_up'] / nf:.2f}/{base['team_near'] / nf:.2f}"
+    )
+    print(fmt_metric("teamwork upfield/game", stats["teamwork_upfield"]))
+    print(fmt_metric("teamwork near-ball/game", stats["teamwork_near_ball"]))
+    print(
+        f"chase advantage/defensive load: "
+        f"{cand['chase_adv'] / nf:.2f}/{cand['def_chase'] / nf:.2f} vs "
+        f"{base['chase_adv'] / nf:.2f}/{base['def_chase'] / nf:.2f}"
+    )
+    print(fmt_metric("possession chase advantage/game", stats["chase_advantage"]))
+    print(fmt_metric("defensive chase load/game", stats["defensive_chase_load"]))
 
     print(
         "\nVERDICT: "

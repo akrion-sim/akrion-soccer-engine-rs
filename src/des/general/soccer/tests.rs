@@ -42209,6 +42209,20 @@ fn trained_test_skill_policy_heads(seed: u32, rounds: usize) -> SoccerSkillPolic
     heads
 }
 
+fn trained_test_pass_completion_head(seed: u32, rounds: usize) -> SoccerPassCompletionHead {
+    let mut head = SoccerPassCompletionHead::new(seed);
+    let sample = SoccerPassOutcomeSample {
+        features: vec![0.25; SOCCER_PASS_COMPLETION_FEATURE_DIM],
+        completed: true,
+        own_half: false,
+    };
+    for _ in 0..rounds {
+        head.train(std::slice::from_ref(&sample), 0.05);
+    }
+    assert_eq!(head.training_steps(), rounds);
+    head
+}
+
 #[test]
 fn set_team_neural_brain_restores_skill_policy_heads_from_snapshot() {
     let mut sim = per_team_brain_match(20261);
@@ -42330,6 +42344,58 @@ fn set_team_neural_brain_keeps_distinct_skill_policy_heads_per_team() {
         .heads
         .iter()
         .all(|head| head.training_steps == 2));
+}
+
+#[test]
+fn set_team_neural_brain_keeps_distinct_auxiliary_heads_per_team() {
+    let mut sim = per_team_brain_match(20264);
+    let home_head = trained_test_pass_completion_head(41, 1);
+    let away_head = trained_test_pass_completion_head(43, 2);
+    let mut home_snapshot = sim
+        .neural_network_snapshot_for(Team::Home)
+        .expect("home neural snapshot");
+    let mut away_snapshot = home_snapshot.clone();
+    home_snapshot.pass_completion_head = Some(Box::new(home_head.to_snapshot()));
+    away_snapshot.pass_completion_head = Some(Box::new(away_head.to_snapshot()));
+
+    sim.set_team_neural_brain(Team::Home, Some(home_snapshot), true)
+        .expect("install home snapshot with pass head");
+    sim.set_team_neural_brain(Team::Away, Some(away_snapshot), true)
+        .expect("install away snapshot with pass head");
+
+    let snapshot = WorldSnapshot::from_match_for_agent_decision(&sim);
+    assert_eq!(
+        snapshot
+            .pass_completion_head_for(Team::Home)
+            .expect("home pass head")
+            .training_steps(),
+        1
+    );
+    assert_eq!(
+        snapshot
+            .pass_completion_head_for(Team::Away)
+            .expect("away pass head")
+            .training_steps(),
+        2
+    );
+    assert_eq!(
+        sim.neural_network_snapshot_for(Team::Home)
+            .expect("home exported snapshot")
+            .pass_completion_head
+            .as_deref()
+            .expect("home exported pass head")
+            .training_steps,
+        1
+    );
+    assert_eq!(
+        sim.neural_network_snapshot_for(Team::Away)
+            .expect("away exported snapshot")
+            .pass_completion_head
+            .as_deref()
+            .expect("away exported pass head")
+            .training_steps,
+        2
+    );
 }
 
 #[test]

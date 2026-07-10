@@ -19823,6 +19823,10 @@ pub struct MatchStats {
     pub dribble_beats_home: u32,
     #[serde(default)]
     pub dribble_beats_away: u32,
+    #[serde(default)]
+    pub dribble_turnovers_home: u32,
+    #[serde(default)]
+    pub dribble_turnovers_away: u32,
     pub loose_ball_recoveries_home: u32,
     pub loose_ball_recoveries_away: u32,
     pub offsides_home: u32,
@@ -57011,6 +57015,8 @@ fn tracking_frame_to_world_snapshot(
         defender_line_head: None,
         back_four_line_latch_centre_depth: [None, None],
         pass_completion_head: None,
+        away_pass_completion_head: None,
+        away_auxiliary_heads_dedicated: false,
         loose_ball_commit_head: None,
         receive_approach_head: None,
         lane_affinity_head: None,
@@ -57026,7 +57032,9 @@ fn tracking_frame_to_world_snapshot(
         long_pass_run_head: None,
         give_and_go_head: None,
         attack_spacing_head: None,
+        away_attack_spacing_head: None,
         support_scorer_head: None,
+        away_support_scorer_head: None,
         aerial_reception_head: None,
         shot_trigger_head: None,
         loose_ball_uncontested_since_tick: None,
@@ -63467,7 +63475,7 @@ fn pass_target_quality_for_snapshot_uncached(
     // pressure derived from the nearest opponent (the snapshot analogue of the POMDP
     // `perceived_pressure` used at launch).
     if learned_pass_completion_enabled() {
-        if let Some(head) = snapshot.pass_completion_head.as_ref() {
+        if let Some(head) = snapshot.pass_completion_head_for(passer.team) {
             if head.training_steps() >= PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS {
                 let passer_pressure = pressure_from_nearest_distance(
                     snapshot.nearest_opponent_distance_at(passer.team, passer_position),

@@ -586,7 +586,7 @@ mod tests {
         let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
         let cold_snapshot = WorldSnapshot::from_match(&sim);
         assert!(
-            (cold_snapshot.support_candidate_score(&features) - analytic).abs() < 1e-9,
+            (cold_snapshot.support_candidate_score(Team::Home, &features) - analytic).abs() < 1e-9,
             "no installed head should fall back to analytic seed"
         );
 
@@ -604,7 +604,7 @@ mod tests {
 
         sim.set_support_scorer_head(head);
         let learned_snapshot = WorldSnapshot::from_match(&sim);
-        let learned = learned_snapshot.support_candidate_score(&features);
+        let learned = learned_snapshot.support_candidate_score(Team::Home, &features);
         std::env::remove_var(SUPPORT_SCORER_ENABLE_ENV);
         assert!(
             (learned - analytic).abs() > 0.10,

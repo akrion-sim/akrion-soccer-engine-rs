@@ -1506,6 +1506,9 @@ pub struct SoccerMatch {
     /// (parity). Shared into each [`WorldSnapshot`] via an `Arc` clone, mirroring
     /// [`Self::line_depth_head`].
     pub(crate) pass_completion_head: Option<std::sync::Arc<SoccerPassCompletionHead>>,
+    /// Dedicated Away pass-completion head for per-team eval/tournament matches. `None` means Away
+    /// falls back to the shared Home head only in legacy single-net mode.
+    pub(crate) away_pass_completion_head: Option<std::sync::Arc<SoccerPassCompletionHead>>,
     /// Rolling window of MPC execution-objective training samples: the launch-time features + the
     /// bounded aim/lead residual actually applied, labelled with the delayed outcome advantage when
     /// the pass resolves. Drained by the learner to train [`SoccerMpcObjectiveHead`] (RWR).
@@ -1514,6 +1517,8 @@ pub struct SoccerMatch {
     /// When warm + gated on, it nudges the analytic aim/lead target by a hard-bounded residual so
     /// pass/shot/dribble QUALITY becomes learnable; `None` ⇒ pure analytic target (parity).
     pub(crate) mpc_objective_head: Option<std::sync::Arc<SoccerMpcObjectiveHead>>,
+    /// Dedicated Away MPC execution-objective head for per-team eval/tournament matches.
+    pub(crate) away_mpc_objective_head: Option<std::sync::Arc<SoccerMpcObjectiveHead>>,
     /// Transient carry-slot for the learned MPC DRIBBLE aim-residual (gated, default-OFF via
     /// [`dd_soccer_enable_learned_mpc_dribble_objective`]). Dribble is a SUSTAINED per-tick action
     /// whose reward (beat man / turnover) is DELAYED, so — unlike the discrete pass/shot
@@ -1566,11 +1571,15 @@ pub struct SoccerMatch {
     /// [`WorldSnapshot`] via an `Arc` clone so the off-ball ranker and LP floor read
     /// the same learned band.
     pub(crate) attack_spacing_head: Option<std::sync::Arc<AttackSpacingHead>>,
+    /// Dedicated Away attacking-spacing head for per-team eval/tournament matches.
+    pub(crate) away_attack_spacing_head: Option<std::sync::Arc<AttackSpacingHead>>,
     /// The trained off-ball support candidate scorer, when present. Carried + trained
     /// across games by the learner; `None` ⇒ analytic open-space seed. Shared into each
     /// [`WorldSnapshot`] via an `Arc` clone so support destinations can remain a
     /// predilection with learnable candidate choice.
     pub(crate) support_scorer_head: Option<std::sync::Arc<SupportScorerHead>>,
+    /// Dedicated Away support-candidate scorer for per-team eval/tournament matches.
+    pub(crate) away_support_scorer_head: Option<std::sync::Arc<SupportScorerHead>>,
     /// Rolling RL corpus for the loose-ball commit head: per-candidate state + the
     /// commit action taken + the windowed possession/territorial reward. Collected
     /// only while the commit model is enabled; empty + untouched in the default process.
@@ -4420,11 +4429,37 @@ mod tests {
         }
         sim.recent_learning_history
             .push_back(world_test_transition(&sim, attacker, "dribble", 238));
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let observation = snapshot.observation_for(attacker);
+        sim.players[attacker].last_decision = Some(AgentDecisionTrace {
+            mdp_state: snapshot.mdp_state_for_player(attacker),
+            observation: observation.clone(),
+            belief: belief_from_observation(&observation),
+            operation_order: vec!["learned-policy".to_string(), "dribble".to_string()],
+            scheduled_index: None,
+            action_options: single_action_option("dribble"),
+            action_target: None,
+            mdp_mpc_comparison: None,
+            learned_mpc_replan: None,
+            behavior_policy_probability: None,
+            neural_mcts_selected: false,
+            neural_mcts_candidate_count: 0,
+            neural_mcts_discretized_kick_candidate_count: 0,
+            neural_mcts_root_discretized_kick_candidate_count: 0,
+            neural_mcts_dribble_candidate_count: 0,
+            neural_mcts_root_dribble_candidate_count: 0,
+            action: "dribble".to_string(),
+        });
 
         let deferred_start = sim.deferred_reward_transitions.len();
         let episode_start = sim.episode_learning_transitions.len();
+        let dribble_turnover_start = sim.stats.dribble_turnovers_home;
         sim.complete_defensive_dispossession(defender, attacker, "tackle");
 
+        assert_eq!(
+            sim.stats.dribble_turnovers_home,
+            dribble_turnover_start + 1
+        );
         let added = &sim.deferred_reward_transitions[deferred_start..];
         assert!(
             added.iter().any(|transition| {
@@ -12248,8 +12283,10 @@ impl SoccerMatch {
             deferred_reward_transitions: Vec::new(),
             pass_outcome_samples: Vec::new(),
             pass_completion_head: None,
+            away_pass_completion_head: None,
             mpc_objective_samples: Vec::new(),
             mpc_objective_head: None,
+            away_mpc_objective_head: None,
             dribble_mpc_objective: None,
             line_depth_head: None,
             line_depth_samples: Vec::new(),
@@ -12260,7 +12297,9 @@ impl SoccerMatch {
             back_four_line_latch: [None, None],
             loose_ball_commit_head: None,
             attack_spacing_head: None,
+            away_attack_spacing_head: None,
             support_scorer_head: None,
+            away_support_scorer_head: None,
             loose_ball_commit_samples: Vec::new(),
             pending_loose_ball_commit: Vec::new(),
             receive_approach_head: None,
@@ -12463,13 +12502,17 @@ impl SoccerMatch {
             mpc_player_controllers: HashMap::new(),
             // NULL: all learned predictor heads
             pass_completion_head: None,
+            away_pass_completion_head: None,
             mpc_objective_head: None,
+            away_mpc_objective_head: None,
             dribble_mpc_objective: None,
             line_depth_head: None,
             defender_line_head: None,
             loose_ball_commit_head: None,
             attack_spacing_head: None,
+            away_attack_spacing_head: None,
             support_scorer_head: None,
+            away_support_scorer_head: None,
             receive_approach_head: None,
             lane_affinity_head: None,
             goal_side_recovery_head: None,
@@ -12839,6 +12882,81 @@ impl SoccerMatch {
             } else {
                 None
             };
+        self.away_pass_completion_head = None;
+        self.away_mpc_objective_head = None;
+        self.away_attack_spacing_head = None;
+        self.away_support_scorer_head = None;
+        Ok(())
+    }
+
+    fn clear_auxiliary_heads_for(&mut self, team: Team) {
+        match team {
+            Team::Home => {
+                self.pass_completion_head = None;
+                self.mpc_objective_head = None;
+                self.attack_spacing_head = None;
+                self.support_scorer_head = None;
+            }
+            Team::Away => {
+                self.away_pass_completion_head = None;
+                self.away_mpc_objective_head = None;
+                self.away_attack_spacing_head = None;
+                self.away_support_scorer_head = None;
+            }
+        }
+    }
+
+    fn restore_auxiliary_heads_for(
+        &mut self,
+        team: Team,
+        snapshot: &SoccerNeuralNetworkSnapshot,
+    ) -> Result<(), String> {
+        let pass_completion_head =
+            if let Some(pass_completion_head) = snapshot.pass_completion_head.as_deref() {
+                Some(std::sync::Arc::new(
+                    SoccerPassCompletionHead::from_snapshot(pass_completion_head)?,
+                ))
+            } else {
+                None
+            };
+        let mpc_objective_head =
+            if let Some(mpc_objective_head) = snapshot.mpc_objective_head.as_deref() {
+                Some(std::sync::Arc::new(SoccerMpcObjectiveHead::from_snapshot(
+                    mpc_objective_head,
+                )?))
+            } else {
+                None
+            };
+        let attack_spacing_head =
+            if let Some(attack_spacing_head) = snapshot.attack_spacing_head.as_deref() {
+                Some(std::sync::Arc::new(AttackSpacingHead::from_snapshot(
+                    attack_spacing_head,
+                )?))
+            } else {
+                None
+            };
+        let support_scorer_head =
+            if let Some(support_scorer_head) = snapshot.support_scorer_head.as_deref() {
+                Some(std::sync::Arc::new(SupportScorerHead::from_snapshot(
+                    support_scorer_head,
+                )?))
+            } else {
+                None
+            };
+        match team {
+            Team::Home => {
+                self.pass_completion_head = pass_completion_head;
+                self.mpc_objective_head = mpc_objective_head;
+                self.attack_spacing_head = attack_spacing_head;
+                self.support_scorer_head = support_scorer_head;
+            }
+            Team::Away => {
+                self.away_pass_completion_head = pass_completion_head;
+                self.away_mpc_objective_head = mpc_objective_head;
+                self.away_attack_spacing_head = attack_spacing_head;
+                self.away_support_scorer_head = support_scorer_head;
+            }
+        }
         Ok(())
     }
 
@@ -12893,6 +13011,75 @@ impl SoccerMatch {
         }
     }
 
+    fn pass_completion_head_for_team(
+        &self,
+        team: Team,
+    ) -> Option<std::sync::Arc<SoccerPassCompletionHead>> {
+        match team {
+            Team::Home => self.pass_completion_head.clone(),
+            Team::Away => {
+                if self.away_neural_learner.is_some() || self.away_neural_frozen {
+                    self.away_pass_completion_head.clone()
+                } else {
+                    self.away_pass_completion_head
+                        .clone()
+                        .or_else(|| self.pass_completion_head.clone())
+                }
+            }
+        }
+    }
+
+    fn mpc_objective_head_for(&self, team: Team) -> Option<std::sync::Arc<SoccerMpcObjectiveHead>> {
+        match team {
+            Team::Home => self.mpc_objective_head.clone(),
+            Team::Away => {
+                if self.away_neural_learner.is_some() || self.away_neural_frozen {
+                    self.away_mpc_objective_head.clone()
+                } else {
+                    self.away_mpc_objective_head
+                        .clone()
+                        .or_else(|| self.mpc_objective_head.clone())
+                }
+            }
+        }
+    }
+
+    fn attack_spacing_head_for_team(
+        &self,
+        team: Team,
+    ) -> Option<std::sync::Arc<AttackSpacingHead>> {
+        match team {
+            Team::Home => self.attack_spacing_head.clone(),
+            Team::Away => {
+                if self.away_neural_learner.is_some() || self.away_neural_frozen {
+                    self.away_attack_spacing_head.clone()
+                } else {
+                    self.away_attack_spacing_head
+                        .clone()
+                        .or_else(|| self.attack_spacing_head.clone())
+                }
+            }
+        }
+    }
+
+    fn support_scorer_head_for_team(
+        &self,
+        team: Team,
+    ) -> Option<std::sync::Arc<SupportScorerHead>> {
+        match team {
+            Team::Home => self.support_scorer_head.clone(),
+            Team::Away => {
+                if self.away_neural_learner.is_some() || self.away_neural_frozen {
+                    self.away_support_scorer_head.clone()
+                } else {
+                    self.away_support_scorer_head
+                        .clone()
+                        .or_else(|| self.support_scorer_head.clone())
+                }
+            }
+        }
+    }
+
     fn neural_team_frozen(&self, team: Team) -> bool {
         match team {
             Team::Home => self.home_neural_frozen,
@@ -12909,7 +13096,8 @@ impl SoccerMatch {
         self.away_neural_frozen = false;
         self.skill_policy_heads = None;
         self.away_skill_policy_heads = None;
-        self.pass_completion_head = None;
+        self.clear_auxiliary_heads_for(Team::Home);
+        self.clear_auxiliary_heads_for(Team::Away);
     }
 
     /// True when this match runs distinct per-team neural brains (the away team
@@ -12953,21 +13141,18 @@ impl SoccerMatch {
                 if let Some(line_depth_head) = &self.line_depth_head {
                     snapshot.line_depth_head = Some(Box::new(line_depth_head.to_snapshot()));
                 }
-                if let Some(pass_completion_head) = &self.pass_completion_head {
-                    snapshot.pass_completion_head =
-                        Some(Box::new(pass_completion_head.to_snapshot()));
-                }
-                if let Some(mpc_objective_head) = &self.mpc_objective_head {
-                    snapshot.mpc_objective_head = Some(Box::new(mpc_objective_head.to_snapshot()));
-                }
-                if let Some(attack_spacing_head) = &self.attack_spacing_head {
-                    snapshot.attack_spacing_head =
-                        Some(Box::new(attack_spacing_head.to_snapshot()));
-                }
-                if let Some(support_scorer_head) = &self.support_scorer_head {
-                    snapshot.support_scorer_head =
-                        Some(Box::new(support_scorer_head.to_snapshot()));
-                }
+                snapshot.pass_completion_head = self
+                    .pass_completion_head_for_team(team)
+                    .map(|head| Box::new(head.to_snapshot()));
+                snapshot.mpc_objective_head = self
+                    .mpc_objective_head_for(team)
+                    .map(|head| Box::new(head.to_snapshot()));
+                snapshot.attack_spacing_head = self
+                    .attack_spacing_head_for_team(team)
+                    .map(|head| Box::new(head.to_snapshot()));
+                snapshot.support_scorer_head = self
+                    .support_scorer_head_for_team(team)
+                    .map(|head| Box::new(head.to_snapshot()));
                 snapshot
             })
         })
@@ -13157,6 +13342,7 @@ impl SoccerMatch {
                         self.config.seed,
                     )?);
                 }
+                self.restore_auxiliary_heads_for(team, &snapshot)?;
                 restored_skill_policy_heads = if let Some(skill_policy_heads_snapshot) =
                     snapshot.skill_policy_heads.as_deref()
                 {
@@ -13169,16 +13355,21 @@ impl SoccerMatch {
                 };
                 SoccerNeuralLearner::from_pretrained_snapshot(&self.config, network, &snapshot)
             }
-            None if self.config.learning_enabled => SoccerNeuralLearner::new(&self.config),
+            None if self.config.learning_enabled => {
+                self.clear_auxiliary_heads_for(team);
+                SoccerNeuralLearner::new(&self.config)
+            }
             None => {
                 match team {
                     Team::Home => {
                         self.neural_learner = None;
                         self.skill_policy_heads = None;
+                        self.clear_auxiliary_heads_for(Team::Home);
                     }
                     Team::Away => {
                         self.away_neural_learner = None;
                         self.away_skill_policy_heads = None;
+                        self.clear_auxiliary_heads_for(Team::Away);
                     }
                 }
                 return Ok(());
@@ -13210,11 +13401,13 @@ impl SoccerMatch {
                 self.neural_learner = None;
                 self.home_neural_frozen = true;
                 self.skill_policy_heads = None;
+                self.clear_auxiliary_heads_for(Team::Home);
             }
             Team::Away => {
                 self.away_neural_learner = None;
                 self.away_neural_frozen = true;
                 self.away_skill_policy_heads = None;
+                self.clear_auxiliary_heads_for(Team::Away);
             }
         }
     }
@@ -26128,7 +26321,7 @@ impl SoccerMatch {
         // head clone live strictly INSIDE the gate for exactly this reason (a live pass A/B runs on
         // this code).
         if dd_soccer_enable_learned_mpc_dribble_objective() {
-            if let Some(head) = self.mpc_objective_head.clone() {
+            if let Some(head) = self.mpc_objective_head_for(player_team) {
                 let features = snapshot.mpc_objective_learn_features(
                     player_team,
                     MpcObjectiveFamily::Dribble,
@@ -26704,6 +26897,16 @@ impl SoccerMatch {
         // active SET PLAY (a dead-ball walk-up isn't open-play dribbling) — mirroring the
         // excessive-hold and backward-pass discipline guards.
         let carrier_is_keeper = self.players[attacker_id].role == PlayerRole::Goalkeeper;
+        let lost_from_dribble_action = self.players[attacker_id]
+            .last_decision
+            .as_ref()
+            .is_some_and(|decision| {
+                let action = normalize_soccer_action_label(&decision.action);
+                is_dribble_action_label(action.as_ref())
+            });
+        if lost_from_dribble_action {
+            self.stat_dribble_turnover(attacker_team);
+        }
         if overdribble_penalty_enabled() && !carrier_is_keeper && self.active_set_play.is_none() {
             let hold_seconds = self.holder_possession_seconds(attacker_id);
             let carrier_pos = self.players[attacker_id].position;
@@ -28076,7 +28279,7 @@ impl SoccerMatch {
                     // Captured with its launch features + reinforced by the delayed pass outcome (RWR).
                     let mpc_objective_sample: Option<(Vec<f32>, Vec2, f64)> =
                         if learned_mpc_objective_enabled() && explicit_target_point.is_none() {
-                            if let Some(head) = self.mpc_objective_head.clone() {
+                            if let Some(head) = self.mpc_objective_head_for(player_team) {
                                 let features = snapshot.mpc_objective_learn_features(
                                     player_team,
                                     MpcObjectiveFamily::Pass,
@@ -29082,7 +29285,7 @@ impl SoccerMatch {
                     // when-to-shoot stay with their own heads, per the shot-placement scope).
                     let mpc_shot_objective: Option<(Vec<f32>, Vec2, f64)> =
                         if dd_soccer_enable_learned_mpc_shot_objective() {
-                            if let Some(head) = self.mpc_objective_head.clone() {
+                            if let Some(head) = self.mpc_objective_head_for(player_team) {
                                 let features = snapshot.mpc_objective_learn_features(
                                     player_team,
                                     MpcObjectiveFamily::Shot,
@@ -35246,6 +35449,13 @@ impl SoccerMatch {
         }
     }
 
+    fn stat_dribble_turnover(&mut self, team: Team) {
+        match team {
+            Team::Home => self.stats.dribble_turnovers_home += 1,
+            Team::Away => self.stats.dribble_turnovers_away += 1,
+        }
+    }
+
     fn stat_loose_ball_recovery(&mut self, team: Team) {
         match team {
             Team::Home => self.stats.loose_ball_recoveries_home += 1,
@@ -37357,6 +37567,13 @@ pub struct WorldSnapshot {
     /// Skipped by serde (an internal decision aid; Default = None).
     #[serde(skip)]
     pub(crate) pass_completion_head: Option<std::sync::Arc<SoccerPassCompletionHead>>,
+    /// Dedicated Away pass-completion head copied from the match for per-team evals.
+    #[serde(skip)]
+    pub(crate) away_pass_completion_head: Option<std::sync::Arc<SoccerPassCompletionHead>>,
+    /// Whether Away has a dedicated/frozen neural brain and therefore must not borrow Home/shared
+    /// auxiliary heads when its own sidecar is absent.
+    #[serde(skip)]
+    pub(crate) away_auxiliary_heads_dedicated: bool,
     /// The trained loose-ball commit head, carried from the match for live
     /// consumption in the retriever election. `None` ⇒ analytic seed (parity).
     /// Skipped by serde (an internal decision aid; Default = None).
@@ -37424,11 +37641,17 @@ pub struct WorldSnapshot {
     /// Default = None).
     #[serde(skip)]
     pub(crate) attack_spacing_head: Option<std::sync::Arc<AttackSpacingHead>>,
+    /// Dedicated Away attacking-spacing head copied from the match for per-team evals.
+    #[serde(skip)]
+    pub(crate) away_attack_spacing_head: Option<std::sync::Arc<AttackSpacingHead>>,
     /// The trained support-candidate value head, carried from the match for live
     /// consumption by `open_space_for`. `None` ⇒ analytic seed (parity). Skipped by
     /// serde (internal decision aid; Default = None).
     #[serde(skip)]
     pub(crate) support_scorer_head: Option<std::sync::Arc<SupportScorerHead>>,
+    /// Dedicated Away support-candidate scorer copied from the match for per-team evals.
+    #[serde(skip)]
+    pub(crate) away_support_scorer_head: Option<std::sync::Arc<SupportScorerHead>>,
     /// Carried from the match for live consumption in the aerial-reception decision: how
     /// high to attack a dropping lofted ball. `None` ⇒ analytic seed (parity). Skipped by
     /// serde (an internal decision aid; Default = None).
@@ -40440,6 +40663,51 @@ impl WorldSnapshot {
         }
     }
 
+    pub(crate) fn pass_completion_head_for(&self, team: Team) -> Option<&SoccerPassCompletionHead> {
+        match team {
+            Team::Home => self.pass_completion_head.as_deref(),
+            Team::Away => {
+                if self.away_auxiliary_heads_dedicated {
+                    self.away_pass_completion_head.as_deref()
+                } else {
+                    self.away_pass_completion_head
+                        .as_deref()
+                        .or_else(|| self.pass_completion_head.as_deref())
+                }
+            }
+        }
+    }
+
+    fn attack_spacing_head_for(&self, team: Team) -> Option<&AttackSpacingHead> {
+        match team {
+            Team::Home => self.attack_spacing_head.as_deref(),
+            Team::Away => {
+                if self.away_auxiliary_heads_dedicated {
+                    self.away_attack_spacing_head.as_deref()
+                } else {
+                    self.away_attack_spacing_head
+                        .as_deref()
+                        .or_else(|| self.attack_spacing_head.as_deref())
+                }
+            }
+        }
+    }
+
+    fn support_scorer_head_for(&self, team: Team) -> Option<&SupportScorerHead> {
+        match team {
+            Team::Home => self.support_scorer_head.as_deref(),
+            Team::Away => {
+                if self.away_auxiliary_heads_dedicated {
+                    self.away_support_scorer_head.as_deref()
+                } else {
+                    self.away_support_scorer_head
+                        .as_deref()
+                        .or_else(|| self.support_scorer_head.as_deref())
+                }
+            }
+        }
+    }
+
     pub(crate) fn from_match_for_agent_decision(m: &SoccerMatch) -> Self {
         Self::from_match_with_options(m, WorldSnapshotOptions::AGENT_DECISION)
     }
@@ -40688,6 +40956,8 @@ impl WorldSnapshot {
                 m.back_four_line_latch[1].map(|l| l.centre_depth),
             ],
             pass_completion_head: m.pass_completion_head.clone(),
+            away_pass_completion_head: m.away_pass_completion_head.clone(),
+            away_auxiliary_heads_dedicated: m.away_neural_learner.is_some() || m.away_neural_frozen,
             loose_ball_commit_head: m.loose_ball_commit_head.clone(),
             receive_approach_head: m.receive_approach_head.clone(),
             lane_affinity_head: m.lane_affinity_head.clone(),
@@ -40703,7 +40973,9 @@ impl WorldSnapshot {
             long_pass_run_head: m.long_pass_run_head.clone(),
             give_and_go_head: m.give_and_go_head.clone(),
             attack_spacing_head: m.attack_spacing_head.clone(),
+            away_attack_spacing_head: m.away_attack_spacing_head.clone(),
             support_scorer_head: m.support_scorer_head.clone(),
+            away_support_scorer_head: m.away_support_scorer_head.clone(),
             aerial_reception_head: m.aerial_reception_head.clone(),
             shot_trigger_head: m.shot_trigger_head.clone(),
             loose_ball_uncontested_since_tick: m.loose_ball_uncontested_since_tick,
@@ -61848,7 +62120,7 @@ impl WorldSnapshot {
             nearest_teammate_yards: nearest_teammate,
             width_shortage: width_shortage.clamp(0.0, 1.0),
         };
-        Some(self.resolved_attack_spacing_target(&ctx))
+        Some(self.resolved_attack_spacing_target(team, &ctx))
     }
 
     /// The team-level attacking-spacing context (the centroid is "self") plus the
@@ -61930,27 +62202,30 @@ impl WorldSnapshot {
             return None;
         }
         let (ctx, _held) = self.attack_spacing_team_context(team)?;
-        Some(self.resolved_attack_spacing_target(&ctx).min)
+        Some(self.resolved_attack_spacing_target(team, &ctx).min)
     }
 
     pub(crate) fn resolved_attack_spacing_target(
         &self,
+        team: Team,
         ctx: &AttackSpacingContext,
     ) -> AttackSpacingTarget {
         let head = self
-            .attack_spacing_head
-            .as_deref()
+            .attack_spacing_head_for(team)
             .filter(|head| head.training_steps() >= ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS);
         resolve_attack_spacing_target(ctx, head)
     }
 
-    pub(crate) fn support_candidate_score(&self, features: &SupportCandidateFeatures) -> f64 {
+    pub(crate) fn support_candidate_score(
+        &self,
+        team: Team,
+        features: &SupportCandidateFeatures,
+    ) -> f64 {
         let analytic = analytic_candidate_score(features);
         if !support_scorer_enabled() {
             return analytic;
         }
-        self.support_scorer_head
-            .as_deref()
+        self.support_scorer_head_for(team)
             .filter(|head| head.training_steps() >= SUPPORT_SCORER_HEAD_MIN_TRAINING_STEPS)
             .and_then(|head| head.predict(features))
             .filter(|score| score.is_finite())
@@ -62476,7 +62751,7 @@ impl WorldSnapshot {
                     teammate_occupation_penalty,
                     line_shape_penalty,
                 };
-                let score = self.support_candidate_score(&support_features);
+                let score = self.support_candidate_score(me.team, &support_features);
                 Self::push_open_space_hypothesis(&mut open_space_hypotheses, p, score);
                 if collect_run_modes && score.is_finite() {
                     scored_candidates.push((p, score));

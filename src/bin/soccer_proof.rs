@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! `soccer_proof` — a rigorous, self-contained learnability proof for the neural + DP +
 //! POMDP + MPC passing stack.
 //!
@@ -328,9 +330,16 @@ struct TeamMetrics {
     shots_after_pass: f64,
     assists: f64,
     dribble_beats: f64,
+    dribble_turnovers: f64,
     route_one: f64,
     interceptions_won: f64,
     pass_turnovers: f64,
+    tackles: f64,
+    loose_ball_recoveries: f64,
+    teamwork_upfield: f64,
+    teamwork_near_ball: f64,
+    possession_chase_advantage: f64,
+    defensive_chase_load: f64,
 }
 
 fn home_metrics(st: &MatchStats) -> TeamMetrics {
@@ -353,9 +362,16 @@ fn home_metrics(st: &MatchStats) -> TeamMetrics {
         shots_after_pass: f64::from(st.shots_after_pass_home),
         assists: f64::from(st.assists_home),
         dribble_beats: f64::from(st.dribble_beats_home),
+        dribble_turnovers: f64::from(st.dribble_turnovers_home),
         route_one: f64::from(st.route_one_balls_home),
         interceptions_won: f64::from(st.interceptions_home),
         pass_turnovers: f64::from(st.interceptions_away),
+        tackles: f64::from(st.tackles_home),
+        loose_ball_recoveries: f64::from(st.loose_ball_recoveries_home),
+        teamwork_upfield: st.teamwork_upfield_progress_home,
+        teamwork_near_ball: st.teamwork_near_ball_progress_home,
+        possession_chase_advantage: st.possession_chase_advantage_home,
+        defensive_chase_load: st.defensive_chase_load_home,
     }
 }
 fn away_metrics(st: &MatchStats) -> TeamMetrics {
@@ -378,9 +394,16 @@ fn away_metrics(st: &MatchStats) -> TeamMetrics {
         shots_after_pass: f64::from(st.shots_after_pass_away),
         assists: f64::from(st.assists_away),
         dribble_beats: f64::from(st.dribble_beats_away),
+        dribble_turnovers: f64::from(st.dribble_turnovers_away),
         route_one: f64::from(st.route_one_balls_away),
         interceptions_won: f64::from(st.interceptions_away),
         pass_turnovers: f64::from(st.interceptions_home),
+        tackles: f64::from(st.tackles_away),
+        loose_ball_recoveries: f64::from(st.loose_ball_recoveries_away),
+        teamwork_upfield: st.teamwork_upfield_progress_away,
+        teamwork_near_ball: st.teamwork_near_ball_progress_away,
+        possession_chase_advantage: st.possession_chase_advantage_away,
+        defensive_chase_load: st.defensive_chase_load_away,
     }
 }
 
@@ -590,9 +613,16 @@ fn eval(cand_spec: &str, base_spec: &str, games: usize, minutes: f64, holdout: u
             shots_after_pass,
             assists,
             dribble_beats,
+            dribble_turnovers,
             route_one,
             interceptions_won,
-            pass_turnovers
+            pass_turnovers,
+            tackles,
+            loose_ball_recoveries,
+            teamwork_upfield,
+            teamwork_near_ball,
+            possession_chase_advantage,
+            defensive_chase_load
         );
         acc!(
             b,
@@ -615,25 +645,83 @@ fn eval(cand_spec: &str, base_spec: &str, games: usize, minutes: f64, holdout: u
             shots_after_pass,
             assists,
             dribble_beats,
+            dribble_turnovers,
             route_one,
             interceptions_won,
-            pass_turnovers
+            pass_turnovers,
+            tackles,
+            loose_ball_recoveries,
+            teamwork_upfield,
+            teamwork_near_ball,
+            possession_chase_advantage,
+            defensive_chase_load
         );
         if let Some(w) = jsonl.as_mut() {
             let _ = writeln!(
                 w,
-                "{{\"seed\":{},\"cand_home\":{},\"c_goals\":{},\"b_goals\":{},\"c_shots\":{},\"b_shots\":{},\"c_sot\":{},\"b_sot\":{},\"c_att\":{},\"b_att\":{},\"c_comp\":{},\"b_comp\":{},\"c_fwd\":{},\"b_fwd\":{},\"c_back\":{},\"b_back\":{},\"c_yards\":{:.3},\"b_yards\":{:.3},\"c_ipatt\":{},\"b_ipatt\":{},\"c_ipcomp\":{},\"b_ipcomp\":{},\"c_ipfwd\":{},\"b_ipfwd\":{},\"c_ipback\":{},\"b_ipback\":{},\"c_ipyards\":{:.3},\"b_ipyards\":{:.3},\"c_ipto\":{},\"b_ipto\":{},\"c_chains\":{},\"b_chains\":{},\"c_sap\":{},\"b_sap\":{},\"c_assist\":{},\"b_assist\":{},\"c_drib\":{},\"b_drib\":{},\"c_route1\":{},\"b_route1\":{},\"c_int\":{},\"b_int\":{},\"c_int_won\":{},\"b_int_won\":{},\"c_pto\":{},\"b_pto\":{}}}",
-                seed, cand_home,
-                cm.goals, bm.goals, cm.shots, bm.shots, cm.sot, bm.sot, cm.att, bm.att,
-                cm.comp, bm.comp, cm.fwd, bm.fwd, cm.back, bm.back, cm.gain_yards, bm.gain_yards,
-                cm.strict_att, bm.strict_att, cm.strict_comp, bm.strict_comp, cm.strict_fwd, bm.strict_fwd,
-                cm.strict_back, bm.strict_back, cm.strict_gain_yards, bm.strict_gain_yards,
-                cm.strict_pass_turnovers, bm.strict_pass_turnovers,
-                cm.chains, bm.chains, cm.shots_after_pass, bm.shots_after_pass, cm.assists, bm.assists,
-                cm.dribble_beats, bm.dribble_beats, cm.route_one, bm.route_one,
-                cm.interceptions_won, bm.interceptions_won,
-                cm.interceptions_won, bm.interceptions_won,
-                cm.pass_turnovers, bm.pass_turnovers
+                "{}",
+                serde_json::json!({
+                    "seed": seed,
+                    "cand_home": cand_home,
+                    "c_goals": cm.goals,
+                    "b_goals": bm.goals,
+                    "c_shots": cm.shots,
+                    "b_shots": bm.shots,
+                    "c_sot": cm.sot,
+                    "b_sot": bm.sot,
+                    "c_att": cm.att,
+                    "b_att": bm.att,
+                    "c_comp": cm.comp,
+                    "b_comp": bm.comp,
+                    "c_fwd": cm.fwd,
+                    "b_fwd": bm.fwd,
+                    "c_back": cm.back,
+                    "b_back": bm.back,
+                    "c_yards": cm.gain_yards,
+                    "b_yards": bm.gain_yards,
+                    "c_ipatt": cm.strict_att,
+                    "b_ipatt": bm.strict_att,
+                    "c_ipcomp": cm.strict_comp,
+                    "b_ipcomp": bm.strict_comp,
+                    "c_ipfwd": cm.strict_fwd,
+                    "b_ipfwd": bm.strict_fwd,
+                    "c_ipback": cm.strict_back,
+                    "b_ipback": bm.strict_back,
+                    "c_ipyards": cm.strict_gain_yards,
+                    "b_ipyards": bm.strict_gain_yards,
+                    "c_ipto": cm.strict_pass_turnovers,
+                    "b_ipto": bm.strict_pass_turnovers,
+                    "c_chains": cm.chains,
+                    "b_chains": bm.chains,
+                    "c_sap": cm.shots_after_pass,
+                    "b_sap": bm.shots_after_pass,
+                    "c_assist": cm.assists,
+                    "b_assist": bm.assists,
+                    "c_drib": cm.dribble_beats,
+                    "b_drib": bm.dribble_beats,
+                    "c_drib_to": cm.dribble_turnovers,
+                    "b_drib_to": bm.dribble_turnovers,
+                    "c_route1": cm.route_one,
+                    "b_route1": bm.route_one,
+                    "c_int": cm.interceptions_won,
+                    "b_int": bm.interceptions_won,
+                    "c_int_won": cm.interceptions_won,
+                    "b_int_won": bm.interceptions_won,
+                    "c_pto": cm.pass_turnovers,
+                    "b_pto": bm.pass_turnovers,
+                    "c_tackles": cm.tackles,
+                    "b_tackles": bm.tackles,
+                    "c_lbr": cm.loose_ball_recoveries,
+                    "b_lbr": bm.loose_ball_recoveries,
+                    "c_team_up": cm.teamwork_upfield,
+                    "b_team_up": bm.teamwork_upfield,
+                    "c_team_near": cm.teamwork_near_ball,
+                    "b_team_near": bm.teamwork_near_ball,
+                    "c_chase_adv": cm.possession_chase_advantage,
+                    "b_chase_adv": bm.possession_chase_advantage,
+                    "c_def_chase": cm.defensive_chase_load,
+                    "b_def_chase": bm.defensive_chase_load
+                })
             );
             let _ = w.flush(); // durable per-game so killed workers keep data & progress is monitorable
         }
@@ -829,9 +917,21 @@ fn eval(cand_spec: &str, base_spec: &str, games: usize, minutes: f64, holdout: u
     println!("shots:        {:.2} vs {:.2}", c.shots / nf, b.shots / nf);
     println!("shots on tgt: {:.2} vs {:.2}", c.sot / nf, b.sot / nf);
     println!(
+        "SOT rate:     {:.2}% vs {:.2}%   goals/shot {:.2}% vs {:.2}%",
+        safe_ratio(c.sot, c.shots) * 100.0,
+        safe_ratio(b.sot, b.shots) * 100.0,
+        safe_ratio(c.goals, c.shots) * 100.0,
+        safe_ratio(b.goals, b.shots) * 100.0
+    );
+    println!(
         "shots-after-pass: {:.2} vs {:.2}",
         c.shots_after_pass / nf,
         b.shots_after_pass / nf
+    );
+    println!(
+        "worked SOT share:{:.2}% vs {:.2}%",
+        safe_ratio(c.shots_after_pass, c.sot) * 100.0,
+        safe_ratio(b.shots_after_pass, b.sot) * 100.0
     );
     println!(
         "assists:      {:.2} vs {:.2}",
@@ -842,6 +942,13 @@ fn eval(cand_spec: &str, base_spec: &str, games: usize, minutes: f64, holdout: u
         "dribble beats:{:.2} vs {:.2}",
         c.dribble_beats / nf,
         b.dribble_beats / nf
+    );
+    println!(
+        "dribble contest success:{:.2}% vs {:.2}%   turnovers {:.2} vs {:.2}",
+        safe_ratio(c.dribble_beats, c.dribble_beats + c.dribble_turnovers) * 100.0,
+        safe_ratio(b.dribble_beats, b.dribble_beats + b.dribble_turnovers) * 100.0,
+        c.dribble_turnovers / nf,
+        b.dribble_turnovers / nf
     );
     println!(
         "route-one:    {:.2} vs {:.2}   (lower=better; long-ball regression guard)",
@@ -862,6 +969,27 @@ fn eval(cand_spec: &str, base_spec: &str, games: usize, minutes: f64, holdout: u
         "interceptions won:{:.2} vs {:.2}",
         c.interceptions_won / nf,
         b.interceptions_won / nf
+    );
+    println!(
+        "recoveries/tackles:{:.2}/{:.2} vs {:.2}/{:.2}",
+        c.loose_ball_recoveries / nf,
+        c.tackles / nf,
+        b.loose_ball_recoveries / nf,
+        b.tackles / nf
+    );
+    println!(
+        "teamwork upfield/near-ball:{:.2}/{:.2} vs {:.2}/{:.2}",
+        c.teamwork_upfield / nf,
+        c.teamwork_near_ball / nf,
+        b.teamwork_upfield / nf,
+        b.teamwork_near_ball / nf
+    );
+    println!(
+        "chase advantage/defensive load:{:.2}/{:.2} vs {:.2}/{:.2}",
+        c.possession_chase_advantage / nf,
+        c.defensive_chase_load / nf,
+        b.possession_chase_advantage / nf,
+        b.defensive_chase_load / nf
     );
     println!("\n[eval] done in {:.0}s", started.elapsed().as_secs_f64());
 }
