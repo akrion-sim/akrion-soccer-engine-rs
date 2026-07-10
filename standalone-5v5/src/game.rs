@@ -943,13 +943,18 @@ impl World {
         for i in 1..N {
             for j in (i + 1)..N {
                 let d = self.a[i].pos.sub(self.a[j].pos).len();
-                // Target ~5 units (a short-pass distance): penalty when < 2,
-                // reward peaking at 5, decaying to 0 by 8, flat 0 beyond — so
-                // teammates settle at passing distance rather than drifting apart.
+                // MEDIUM spacing (2–5 units, a short-pass distance): penalty when
+                // < 2 (bunched), full reward across the 2–5 band, decaying to 0 by
+                // 8, flat beyond. Keeps teammates at passing distance — not on top
+                // of each other, not drifted too far to connect a pass.
                 let v = if d < 2.0 {
                     -(2.0 - d)
+                } else if d <= 5.0 {
+                    1.0
+                } else if d < 8.0 {
+                    1.0 - (d - 5.0) / 3.0
                 } else {
-                    (1.5 - (d - 5.0).abs() * 0.5).max(0.0)
+                    0.0
                 };
                 sum += v;
                 n += 1.0;
