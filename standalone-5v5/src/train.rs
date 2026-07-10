@@ -307,8 +307,8 @@ pub fn train_iter(policy: &mut Policy, games: usize, ent_beta: f32, rng: &mut Rn
                 }
                 policy.actor.backward(&acts, &d_logits);
 
-                // ---- critic (MSE to GAE return) ----
-                let cacts = policy.critic.forward(&s.obs);
+                // ---- centralized critic (MSE to GAE return), on GLOBAL state ----
+                let cacts = policy.critic.forward(&s.gstate);
                 let v = cacts.last().unwrap()[0];
                 let dv = v - s.ret; // dL/dv for 0.5*(v-ret)^2
                 policy.critic.backward(&cacts, &[dv]);
