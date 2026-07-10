@@ -132,6 +132,7 @@ pub struct World {
     pub ev_turnover_a: bool, // Team A lost possession to B
     pub ev_shot_on_a: bool,  // Team A took a shot on target
     pending_pass: Option<Owner>, // intended receiver of an in-flight A pass
+    intended_receiver: Option<Owner>, // scratch set during apply_on_ball
 }
 
 fn players(team: Team, w: &World) -> &[Player; N] {
