@@ -137,6 +137,8 @@ pub struct World {
     pub ev_pass_completed_a: bool,
     pub ev_turnover_a: bool, // Team A lost possession to B
     pub ev_shot_on_a: bool,  // Team A took a shot on target
+    pub ev_win_ball_a: bool, // Team A won possession off Team B (interception/tackle)
+    pub last_shot_quality_a: f32, // placement quality of A's last shot, ~[0,1] (MPC finish)
     pending_pass: Option<Owner>, // intended receiver of an in-flight pass
     intended_receiver: Option<Owner>, // scratch set during apply_on_ball
     pass_kick_x: f32,            // ball x when Team A last released a pass
