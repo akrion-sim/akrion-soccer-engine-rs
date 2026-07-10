@@ -115,7 +115,10 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
         let mut mask_t = [[false; NA]; N];
         let mut act_a = [A_STAY; N];
         let mut logp_t = [0.0f32; N];
-        let mut val_t = [0.0f32; N];
+
+        // CENTRALIZED critic: one value for the whole global state this tick.
+        let gstate = w.global_state();
+        let v_central = policy.critic.predict(&gstate)[0];
 
         for i in 1..N {
             // policy controls the 4 outfielders; GK (index 0) is rule-based.
@@ -129,7 +132,6 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
             mask_t[i] = mask;
             act_a[i] = a;
             logp_t[i] = p.ln();
-            val_t[i] = policy.critic.predict(&obs)[0];
         }
 
         let act_b = w.scripted_actions(Team::B);
