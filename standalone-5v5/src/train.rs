@@ -111,7 +111,7 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
         // forward progress is rewarded by the potential shaping above, and goals
         // dominate — so passing stays INSTRUMENTAL and the policy still attacks.
         if w.ev_pass_completed_a {
-            r += 0.08;
+            r += 0.15; // safe to reward: under double-team pressure you can't hoard
         }
         if w.ev_turnover_a {
             r -= 0.25;
