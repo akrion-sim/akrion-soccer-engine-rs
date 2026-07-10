@@ -57,6 +57,9 @@ struct Sample {
 /// Collect one game of Team-A experience (5 players) vs the scripted baseline.
 fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
     let mut w = World::new();
+    if rng.f01() < 0.5 {
+        w.kickoff(Team::B); // randomize opening possession to remove kickoff bias
+    }
     // per-player trajectory buffers
     let mut obs_buf: Vec<[[f32; OBS_DIM]; N]> = Vec::with_capacity(STEPS);
     let mut mask_buf: Vec<[[bool; NA]; N]> = Vec::with_capacity(STEPS);
