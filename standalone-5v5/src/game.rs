@@ -45,9 +45,14 @@ pub const A_SPREAD: usize = 10;
 pub const A_MARK: usize = 11;
 pub const A_STAY: usize = 12;
 
-// Full relational field vector: 8 self/global + 5 ball + 5 goals + 5 role/cues
-// + (N-1)*5 teammates + N*5 opponents + 1 bias = 8+5+5+5+20+25+1 = 69.
+// Full relational field vector (per-agent actor observation): 8 self/global +
+// 5 ball + 5 goals + 5 role/cues + (N-1)*5 teammates + N*5 opponents + 1 bias.
 pub const OBS_DIM: usize = 69;
+
+// Centralized-critic GLOBAL state (MAPPO / CTDE): the whole field in a single
+// canonical (Team-A attack) frame — every player's pos+vel + ball pos+vel +
+// possession, shared by all agents. 2N*4 players + 4 ball + 3 possession + 1 bias.
+pub const GLOBAL_DIM: usize = 2 * N * 4 + 4 + 3 + 1; // = 40 + 4 + 3 + 1 = 48
 
 #[derive(Clone, Copy, Default)]
 pub struct V2 {
