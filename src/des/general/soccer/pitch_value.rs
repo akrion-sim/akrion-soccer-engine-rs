@@ -252,6 +252,12 @@ pub(crate) fn learned_epv(team: Team, p: Vec2, field_width: f64, field_length: f
     if !dd_soccer_enable_learned_epv() {
         return None;
     }
+    learned_epv_raw(team, p, field_width, field_length)
+}
+
+/// Raw fitted-EPV grid lookup with NO gate — the caller applies its own gate (per-pass bonus vs the
+/// PBRS potential). `None` if no grid is loaded.
+fn learned_epv_raw(team: Team, p: Vec2, field_width: f64, field_length: f64) -> Option<f64> {
     let g = learned_epv_grid()?;
     let fwd = forward_fraction(team, p, field_length); // 0 = own goal .. 1 = opponent goal
     let lat = if field_width > 0.0 && field_width.is_finite() && p.x.is_finite() {
