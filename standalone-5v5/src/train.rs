@@ -82,7 +82,8 @@ impl Policy {
 }
 
 struct Sample {
-    obs: [f32; OBS_DIM],
+    obs: [f32; OBS_DIM],        // decentralized actor observation
+    gstate: [f32; GLOBAL_DIM],  // centralized critic global state
     mask: [bool; NA],
     action: usize,
     old_logp: f32,
