@@ -133,8 +133,10 @@
   <header>
     <div class="eyebrow"><span class="dot"></span> standalone 5-a-side · reinforcement learning · zero deps</div>
     <h1>Watch a policy learn to <span class="em">pass, carry, and finish.</span></h1>
-    <p class="lede">A hermetic 5-a-side sim — <b>goalkeepers</b>, a <b>~7m net</b>, no formation LP/IPM and
-      no POMDP feature stack. The four outfielders learn only the macro families
+    <p class="lede">A hermetic 5-a-side sim — <b>goalkeepers</b>, a <b>~7m net</b>, no formation LP/IPM.
+      It's still a <b>POMDP</b> — each outfielder acts on a lean <b>~34-dim partial, egocentric
+      observation</b> (not the engine's ~129-dim feature stack) with a reactive, memoryless policy.
+      The four outfielders learn only the macro families
       <b>pass · dribble · shoot · clear · hold</b> and <b>chase · support · spread · mark</b>;
       off-ball players run into <b>open space</b> and the ball-carrier <b>passes to the teammate in space</b>,
       then shooting uses a short-horizon <b>aim optimizer</b> that places the ball at the corner away
