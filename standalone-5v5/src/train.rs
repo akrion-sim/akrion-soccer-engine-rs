@@ -335,17 +335,41 @@ pub fn ent_beta_at(iter: usize, total: usize) -> f32 {
     ENT_BETA0 * frac.max(0.1)
 }
 
-/// Evaluate greedy policy vs scripted over `games`. Returns
-/// (avg_goal_diff, win_rate, avg_goals_a, avg_goals_b, avg_completed_passes_a,
-///  avg_nearest_teammate_dist_during_A_possession).
-pub fn evaluate(policy: &Policy, games: usize, rng: &mut Rng) -> (f32, f32, f32, f32, f32, f32, f32) {
-    let mut diff = 0.0f32;
-    let mut wins = 0.0f32;
-    let mut ga = 0.0f32;
-    let mut gb = 0.0f32;
-    let mut passes = 0.0f32;
+/// Rich per-evaluation analytics (all averaged per game unless noted).
+#[derive(Clone, Default)]
+pub struct Stats {
+    pub goal_diff: f32,
+    pub winrate: f32,
+    pub ga: f32,
+    pub gb: f32,
+    pub spacing: f32,        // avg nearest-teammate distance (all ticks)
+    pub bunch: f32,          // fraction of ticks a pair < 2.5
+    pub possession: f32,     // fraction of ticks Team A holds the ball
+    pub pass_att: f32,       // pass attempts / game
+    pub pass_cmp: f32,       // completed passes / game
+    pub pass_fwd: f32,       // forward pass attempts / game
+    pub pass_lat: f32,       // lateral pass attempts / game
+    pub pass_back: f32,      // backward pass attempts / game
+    pub shots: f32,          // shot attempts / game
+    pub shots_scored: f32,   // goals (proxy for converted shots) / game
+    pub turnovers: f32,      // A turnovers / game
+    pub wins_won: f32,       // balls won / game (press/intercept/tackle)
+}
+impl Stats {
+    pub fn pass_completion(&self) -> f32 {
+        if self.pass_att > 0.0 { self.pass_cmp / self.pass_att } else { 0.0 }
+    }
+    pub fn conversion(&self) -> f32 {
+        if self.shots > 0.0 { self.shots_scored / self.shots } else { 0.0 }
+    }
+}
+
+/// Evaluate greedy policy vs scripted over `games`, collecting full analytics.
+pub fn evaluate(policy: &Policy, games: usize, rng: &mut Rng) -> Stats {
+    let mut s = Stats::default();
     let mut space_sum = 0.0f32;
-    let mut space_ticks = 0.0f32;
+    let mut ticks = 0.0f32;
+    let mut poss_ticks = 0.0f32;
     let mut bunch_ticks = 0.0f32;
     for _ in 0..games {
         let mut w = World::new();
@@ -362,29 +386,57 @@ pub fn evaluate(policy: &Policy, games: usize, rng: &mut Rng) -> (f32, f32, f32,
             let act_b = w.scripted_actions(Team::B);
             w.step(&act_a, &act_b, rng);
             if w.ev_pass_completed_a {
-                passes += 1.0;
+                s.pass_cmp += 1.0;
             }
-            // measure spacing on EVERY tick (all phases) to validate the whole match
+            if w.ev_pass_attempt_a {
+                s.pass_att += 1.0;
+                match w.pass_dir_a {
+                    1 => s.pass_fwd += 1.0,
+                    -1 => s.pass_back += 1.0,
+                    _ => s.pass_lat += 1.0,
+                }
+            }
+            if w.ev_shot_attempt_a {
+                s.shots += 1.0;
+            }
+            if w.ev_turnover_a {
+                s.turnovers += 1.0;
+            }
+            if w.ev_win_ball_a {
+                s.wins_won += 1.0;
+            }
             space_sum += w.avg_nearest_teammate_a();
-            space_ticks += 1.0;
+            ticks += 1.0;
+            if matches!(w.owner, Some(o) if matches!(o.team, Team::A)) {
+                poss_ticks += 1.0;
+            }
             if w.closest_pair_a() < 2.5 {
-                bunch_ticks += 1.0; // any two outfielders too close this tick
+                bunch_ticks += 1.0;
             }
         }
         let d = w.goals_a as f32 - w.goals_b as f32;
-        diff += d;
-        ga += w.goals_a as f32;
-        gb += w.goals_b as f32;
+        s.goal_diff += d;
+        s.ga += w.goals_a as f32;
+        s.gb += w.goals_b as f32;
+        s.shots_scored += w.goals_a as f32; // proxy: goals as converted shots
         if d > 0.0 {
-            wins += 1.0;
+            s.winrate += 1.0;
         } else if d == 0.0 {
-            wins += 0.5;
+            s.winrate += 0.5;
         }
     }
     let g = games.max(1) as f32;
-    let spacing = if space_ticks > 0.0 { space_sum / space_ticks } else { 0.0 };
-    let bunch = if space_ticks > 0.0 { bunch_ticks / space_ticks } else { 0.0 };
-    (diff / g, wins / g, ga / g, gb / g, passes / g, spacing, bunch)
+    for v in [
+        &mut s.goal_diff, &mut s.winrate, &mut s.ga, &mut s.gb, &mut s.pass_att,
+        &mut s.pass_cmp, &mut s.pass_fwd, &mut s.pass_lat, &mut s.pass_back,
+        &mut s.shots, &mut s.shots_scored, &mut s.turnovers, &mut s.wins_won,
+    ] {
+        *v /= g;
+    }
+    s.spacing = if ticks > 0.0 { space_sum / ticks } else { 0.0 };
+    s.bunch = if ticks > 0.0 { bunch_ticks / ticks } else { 0.0 };
+    s.possession = if ticks > 0.0 { poss_ticks / ticks } else { 0.0 };
+    s
 }
 
 /// Baseline sanity check: scripted-vs-scripted goal difference (should be ~0).
