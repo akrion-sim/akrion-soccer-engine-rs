@@ -123,6 +123,10 @@ fn run_training(iters: usize) {
 
     // Everything below showcases the BEST snapshot, not the collapsed final.
     let policy = best_policy;
+    // Persist the trained policy so `inspect` can load and trace it.
+    policy.actor.save("out/actor.txt").ok();
+    policy.critic.save("out/critic.txt").ok();
+    println!("saved policy -> out/actor.txt, out/critic.txt");
 
     // Final richer evaluation.
     let (d, wr, ga, gb, passes, spacing) = train::evaluate(&policy, 300, &mut rng);
