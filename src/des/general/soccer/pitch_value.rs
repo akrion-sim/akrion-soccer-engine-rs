@@ -138,6 +138,18 @@ fn forward_fraction(team: Team, p: Vec2, field_length: f64) -> f64 {
     (0.5 + team.attack_dir() * centered).clamp(0.0, 1.0)
 }
 
+/// Threat surface entry point: prefers the fitted [`learned_epv`] grid when
+/// available and finite (gated on `DD_SOCCER_ENABLE_LEARNED_EPV` + a loaded
+/// grid), falls back to the closed-form [`expected_threat`] seed. This is the
+/// single call site the PBRS potential and xT terminal shaping share, so
+/// swapping the underlying grid automatically upgrades both the reward potential
+/// and the MPC cost-to-go.
+pub fn threat_at(team: Team, p: Vec2, field_width: f64, field_length: f64) -> f64 {
+    learned_epv(team, p, field_width, field_length)
+        .filter(|v| v.is_finite())
+        .unwrap_or_else(|| expected_threat(team, p, field_width, field_length))
+}
+
 /// Closed-form **expected threat** of possessing the ball at `p` for `team`,
 /// oriented to that team's attacking direction. Bounded to roughly `[0, 1.8]`;
 /// only relative values matter (the reward uses differences).
@@ -249,15 +261,6 @@ pub(crate) fn learned_epv_pass_delta(
         (Some(t), Some(o)) => t - o,
         _ => 0.0,
     }
-}
-
-/// Outcome-grounded value surface for pitch-control potentials. The learned EPV
-/// grid is the primary surface when enabled and available; the closed-form xT seed
-/// remains the deterministic fallback so old runs stay byte-identical.
-fn pitch_value_surface_value(team: Team, p: Vec2, field_width: f64, field_length: f64) -> f64 {
-    learned_epv(team, p, field_width, field_length)
-        .filter(|v| v.is_finite())
-        .unwrap_or_else(|| expected_threat(team, p, field_width, field_length))
 }
 
 /// Modeled top speed (yd/s) for a snapshot player, floored so the arrival-time
@@ -374,7 +377,7 @@ pub fn team_expected_threat(snapshot: &WorldSnapshot, team: Team) -> f64 {
                 Team::Home => home_control,
                 Team::Away => 1.0 - home_control,
             };
-            let threat = pitch_value_surface_value(team, cell, field_width, field_length);
+            let threat = threat_at(team, cell, field_width, field_length);
             total += control * threat;
         }
     }
@@ -428,18 +431,19 @@ fn pitch_control_home_points(points: &[XtControlPoint], cell: Vec2) -> f64 {
     }
 }
 
-/// Control-weighted threat **value** of `team` arriving at `p`: the active pitch
-/// value surface gated by the probability `team` actually controls that point
-/// (the time-to-arrive race). This is the cost-to-go surface the terminal shaping
-/// ascends — a player is only pulled toward valuable space it can realistically
-/// grip, not toward unreachable danger zones.
+/// Control-weighted threat **value** of `team` arriving at `p`: the
+/// [`threat_at`] surface (learned EPV when available, else closed-form xT)
+/// gated by the probability `team` actually controls that point (the
+/// time-to-arrive race). This is the cost-to-go surface the xT terminal
+/// shaping ascends — a player is only pulled toward valuable space it can
+/// realistically grip, not toward unreachable danger zones.
 fn control_weighted_threat(points: &[XtControlPoint], team: Team, p: Vec2, w: f64, l: f64) -> f64 {
     let home_control = pitch_control_home_points(points, p);
     let control = match team {
         Team::Home => home_control,
         Team::Away => 1.0 - home_control,
     };
-    control * pitch_value_surface_value(team, p, w, l)
+    control * threat_at(team, p, w, l)
 }
 
 /// xT **terminal-cost** shaping of a per-player MPC reference point (the AV

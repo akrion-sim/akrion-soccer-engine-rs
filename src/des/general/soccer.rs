@@ -15091,7 +15091,7 @@ fn soccer_replay_pitch_value_potential(state: &SoccerMdpState, team: Team) -> f6
         return 0.0;
     };
     let point = soccer_replay_ball_grid_center(state);
-    let threat = expected_threat(
+    let threat = threat_at(
         possession_team,
         point,
         DEFAULT_FIELD_WIDTH_YARDS,
@@ -23616,7 +23616,19 @@ pub(crate) fn pass_chain_reward_scale() -> f64 {
 /// net-of-turnovers gate correctly rejects it. Never drops below 1.0 so low/zero
 /// forward-pass reward ablations do not make giveaways cheaper than baseline.
 pub(crate) fn forward_pass_turnover_penalty_scale() -> f64 {
-    forward_pass_reward_scale().max(1.0)
+    use std::sync::OnceLock;
+    static COMPLETION_PRIMARY_SCALE: OnceLock<f64> = OnceLock::new();
+    let completion_primary_scale = *COMPLETION_PRIMARY_SCALE.get_or_init(|| {
+        std::env::var("DD_SOCCER_PASS_TURNOVER_PENALTY_SCALE")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(1.0, 20.0))
+            .unwrap_or(1.0)
+    });
+    forward_pass_reward_scale()
+        .max(completion_primary_scale)
+        .max(1.0)
 }
 
 /// Companion dampener for the shot-TAKEN shaping proxy (on-/off-target reward, NOT the goal or
