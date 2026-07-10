@@ -6759,6 +6759,86 @@ fn occluded_floor_pass_lane_drops_behind_clean_outlet() {
 }
 
 #[test]
+fn long_forward_release_guard_blocks_low_quality_floor_and_degraded_killer_aerial() {
+    let good_long_floor = PassTargetQuality {
+        expected_completion: 0.72,
+        lane_interception_risk: 0.12,
+        mpc_receipt_probability: 0.66,
+        ..Default::default()
+    };
+    assert!(
+        !long_forward_pass_release_guard_fails(false, PassFlight::Floor, 29.0, good_long_floor),
+        "a genuinely safe completed-forward candidate should stay legal"
+    );
+
+    let low_completion_floor = PassTargetQuality {
+        expected_completion: 0.55,
+        lane_interception_risk: 0.12,
+        mpc_receipt_probability: 0.66,
+        ..Default::default()
+    };
+    assert!(long_forward_pass_release_guard_fails(
+        false,
+        PassFlight::Floor,
+        29.0,
+        low_completion_floor
+    ));
+    assert!(
+        !long_forward_pass_release_guard_fails(
+            false,
+            PassFlight::Floor,
+            24.0,
+            low_completion_floor
+        ),
+        "the stricter cutoff is only for long forward launches"
+    );
+
+    let risky_lane_floor = PassTargetQuality {
+        expected_completion: 0.72,
+        lane_interception_risk: 0.42,
+        mpc_receipt_probability: 0.66,
+        ..Default::default()
+    };
+    assert!(long_forward_pass_release_guard_fails(
+        false,
+        PassFlight::Floor,
+        29.0,
+        risky_lane_floor
+    ));
+
+    let degraded_killer_aerial = PassTargetQuality {
+        expected_completion: 0.49,
+        lane_interception_risk: 0.18,
+        mpc_receipt_probability: 0.58,
+        ..Default::default()
+    };
+    assert!(long_forward_pass_release_guard_fails(
+        true,
+        PassFlight::Aerial,
+        31.0,
+        degraded_killer_aerial
+    ));
+    assert!(
+        !long_forward_pass_release_guard_fails(
+            false,
+            PassFlight::Aerial,
+            31.0,
+            degraded_killer_aerial
+        ),
+        "the aerial cutoff is only for degraded killer-pass launches"
+    );
+    assert!(
+        !long_forward_pass_release_guard_fails(
+            true,
+            PassFlight::Scoop,
+            31.0,
+            degraded_killer_aerial
+        ),
+        "scoop/over-top variants keep their dedicated viability gates"
+    );
+}
+
+#[test]
 fn aerial_pass_in_bounds_launch_speed_caps_overcooked_loft_toward_touchline() {
     let field_width = 80.0;
     let field_length = 115.0;
@@ -11063,6 +11143,92 @@ fn completed_forward_pass_count_bonus_rewards_actual_forward_reception() {
     assert_eq!(too_short, 0.0);
     assert_eq!(lateral, 0.0);
     assert_eq!(backward, 0.0);
+}
+
+#[test]
+fn sparse_pass_reward_only_credits_same_team_forward_completions() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 11_053,
+        ..Default::default()
+    });
+    let passer = 6;
+    let teammate = 9;
+    let opponent = 16;
+    let origin = Vec2::new(40.0, 60.0);
+    sim.players[passer].position = origin;
+    sim.players[passer].home_position = origin;
+    sim.players[teammate].position = Vec2::new(40.0, 74.0);
+    sim.players[opponent].position = Vec2::new(40.0, 74.0);
+    sim.ball.holder = Some(passer);
+    sim.ball.position = origin;
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+    let before = WorldSnapshot::from_match(&sim);
+
+    let after_with_holder = |holder: usize, position: Vec2| {
+        let mut after = before.clone();
+        after.ball.holder = Some(holder);
+        after.ball.position = position;
+        after.ball.last_touch_team = after
+            .players
+            .iter()
+            .find(|player| player.id == holder)
+            .map(|player| player.team);
+        after.set_player_position(holder, position);
+        after
+    };
+    let reward_for = |after: &WorldSnapshot, target_player: Option<usize>, point: Vec2| {
+        let mut decision = test_decision_trace(&before, passer, "pass");
+        decision.action_target = Some(AgentActionTargetTrace {
+            point: Some(point),
+            player_id: target_player,
+            grid: Some(pitch_grid_address(
+                point,
+                before.field_width,
+                before.field_length,
+            )),
+            facing: facing_bucket_from_vector(point - origin),
+            dribble_touch: None,
+            receiver_descriptor: None,
+        });
+        decision.observation.expected_pass_completion = 0.84;
+        decision.observation.best_pass_receiver_openness = 0.82;
+        decision.observation.floor_pass_lane_score = 0.86;
+        soccer_transition_reward(
+            &sim.players[passer],
+            &decision,
+            &before,
+            after,
+            0,
+            0,
+            0,
+            0,
+            true,
+        )
+    };
+
+    let forward_point = Vec2::new(40.0, 74.0);
+    let lateral_point = Vec2::new(52.0, 60.0);
+    let same_forward = after_with_holder(teammate, forward_point);
+    let same_lateral = after_with_holder(teammate, lateral_point);
+    let opponent_forward = after_with_holder(opponent, forward_point);
+
+    assert!(completed_same_team_pass_receiver(&sim.players[passer], &same_forward).is_some());
+    assert!(completed_same_team_pass_receiver(&sim.players[passer], &opponent_forward).is_none());
+
+    let same_forward_reward = reward_for(&same_forward, Some(teammate), forward_point);
+    let same_lateral_reward = reward_for(&same_lateral, Some(teammate), lateral_point);
+    let opponent_reward = reward_for(&opponent_forward, Some(teammate), forward_point);
+
+    assert!(
+        same_forward_reward > same_lateral_reward + COMPLETED_FORWARD_PASS_COUNT_BONUS_POINTS,
+        "same-team forward completion must beat lateral completion: forward={same_forward_reward} lateral={same_lateral_reward}"
+    );
+    assert!(
+        opponent_reward < 0.0 && same_forward_reward > opponent_reward + 12.0,
+        "opponent-controlled pass must be a turnover, not a completion: forward={same_forward_reward} opponent={opponent_reward}"
+    );
 }
 
 #[test]
@@ -88704,125 +88870,6 @@ fn blocked_goal_approach_killer_pass_probability_ramps_toward_goal() {
             pass_targets.contains(&runner),
             "runner should stay visible for the threaded pass: y={y} targets={pass_targets:?}"
         );
-        if y == 94.0 {
-            let me = snapshot
-                .players
-                .iter()
-                .find(|player| player.id == attacker)
-                .expect("attacker snapshot");
-            let target = snapshot
-                .players
-                .iter()
-                .find(|player| player.id == runner)
-                .expect("runner snapshot");
-            let me_position = snapshot.player_position(attacker).unwrap_or(me.position);
-            let target_position = snapshot.player_position(runner).unwrap_or(target.position);
-            let nominal_speed =
-                pass_speed_yps_from_power(0.82, PassFlight::Floor, false, &me.skills);
-            let reception = snapshot
-                .anticipated_pass_reception_point(attacker, runner, PassFlight::Floor, nominal_speed)
-                .unwrap_or(target_position);
-            let over_top = tunables().killer_pass_over_top;
-            let attack_dir = me.team.attack_dir();
-            let mut defender_ys: Vec<f64> = snapshot
-                .players
-                .iter()
-                .filter(|player| player.team == me.team.other() && player.role == PlayerRole::Defender)
-                .map(|player| snapshot.player_position(player.id).unwrap_or(player.position).y)
-                .filter(|y| y.is_finite())
-                .collect();
-            if attack_dir > 0.0 {
-                defender_ys.sort_by(|a, b| b.total_cmp(a));
-            } else {
-                defender_ys.sort_by(|a, b| a.total_cmp(b));
-            }
-            let defenders_used = defender_ys.len().min(4);
-            let back_line_y =
-                defender_ys.iter().take(defenders_used).copied().sum::<f64>() / defenders_used as f64;
-            let line_forward = (back_line_y - me_position.y) * attack_dir;
-            let target_line_gap = (reception.y - back_line_y) * attack_dir;
-            let forward_to_clear = line_forward + over_top.back_line_margin_yards;
-            let mut forward_yards = over_top
-                .target_distance_yards
-                .max(forward_to_clear)
-                .clamp(over_top.min_distance_yards, over_top.max_distance_yards);
-            let goal_y = me.team.goal_y(snapshot.field_length);
-            let raw_aim_y = me_position.y + attack_dir * forward_yards;
-            let aim_y = if attack_dir > 0.0 {
-                raw_aim_y.min(goal_y - over_top.byline_margin_yards)
-            } else {
-                raw_aim_y.max(goal_y + over_top.byline_margin_yards)
-            };
-            let byline_limited =
-                (raw_aim_y - aim_y).abs() > KILLER_PASS_OVER_TOP_NUMERIC_EPSILON;
-            forward_yards = (aim_y - me_position.y) * attack_dir;
-            let min_forward_yards = if byline_limited {
-                (over_top.min_distance_yards - over_top.lateral_offset_yards * 2.0)
-                    .max(KILLER_PASS_MIN_FORWARD_YARDS)
-            } else {
-                over_top.min_distance_yards
-            };
-            let center_x = snapshot.field_width * 0.5;
-            let touch_margin = over_top
-                .touchline_margin_yards
-                .min(snapshot.field_width * KILLER_PASS_OVER_TOP_PITCH_MARGIN_CAP_FACTOR);
-            let direct_x = (reception.x
-                + (target.velocity.x * over_top.target_lateral_velocity_projection_seconds)
-                    .clamp(
-                        -over_top.target_lateral_velocity_cap_yards,
-                        over_top.target_lateral_velocity_cap_yards,
-                    ))
-            .clamp(touch_margin, snapshot.field_width - touch_margin);
-            let keeper_position = snapshot
-                .players
-                .iter()
-                .find(|player| player.team == me.team.other() && player.role == PlayerRole::Goalkeeper)
-                .map(|keeper| snapshot.player_position(keeper.id).unwrap_or(keeper.position))
-                .unwrap_or_else(|| Vec2::new(center_x, goal_y));
-            let mut side_basis = direct_x - keeper_position.x;
-            if side_basis.abs() < over_top.side_basis_epsilon_yards {
-                side_basis = direct_x - center_x;
-            }
-            if side_basis.abs() < over_top.side_basis_epsilon_yards {
-                side_basis = reception.x - center_x;
-            }
-            if side_basis.abs() < over_top.side_basis_epsilon_yards {
-                side_basis = me_position.x - center_x;
-            }
-            let side_sign = if side_basis.abs() >= over_top.side_basis_epsilon_yards {
-                side_basis.signum()
-            } else if target.id % 2 == 0 {
-                -1.0
-            } else {
-                1.0
-            };
-            let keeper_gap = (direct_x - keeper_position.x).abs();
-            let central_gap = (direct_x - center_x).abs();
-            let lateral_nudge = if keeper_gap < over_top.keeper_avoid_radius_yards
-                || central_gap
-                    < over_top.keeper_avoid_radius_yards * over_top.central_gap_keeper_radius_factor
-            {
-                over_top.lateral_offset_yards
-            } else {
-                over_top.lateral_offset_yards * over_top.secondary_lateral_offset_factor
-            };
-            let aim_x = (direct_x + side_sign * lateral_nudge)
-                .clamp(touch_margin, snapshot.field_width - touch_margin);
-            let aim_point =
-                Vec2::new(aim_x, aim_y).clamp_to_pitch(snapshot.field_width, snapshot.field_length);
-            let distance_yards = me_position.distance(aim_point);
-            let min_distance_yards = if byline_limited {
-                (over_top.min_distance_yards - over_top.lateral_offset_yards).max(min_forward_yards)
-            } else {
-                over_top.min_distance_yards
-            };
-            let back_line_clearance_yards = (aim_point.y - back_line_y) * attack_dir;
-            let goalkeeper_avoidance_yards = (aim_point.x - keeper_position.x).abs();
-            eprintln!(
-                "over-top diag line_forward={line_forward:.3} target_line_gap={target_line_gap:.3} forward_to_clear={forward_to_clear:.3} raw_aim_y={raw_aim_y:.3} aim_y={aim_y:.3} byline_limited={byline_limited} forward={forward_yards:.3} min_forward={min_forward_yards:.3} direct_x={direct_x:.3} aim={aim_point:?} dist={distance_yards:.3} min_dist={min_distance_yards:.3} back_clear={back_line_clearance_yards:.3} gk_avoid={goalkeeper_avoidance_yards:.3} over_top={:?}",
-                snapshot.killer_pass_over_top_aim_point_for(attacker, runner)
-            );
-        }
         assert_eq!(
             snapshot.killer_pass_target_for(attacker, &pass_targets),
             Some(runner),
