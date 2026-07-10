@@ -885,8 +885,9 @@ impl World {
                 let rank = order.iter().position(|&(j, _)| j == i).unwrap();
                 acts[i] = if rank <= 1 { A_SUPPORT } else if rank == N - 1 { A_MARK } else { A_SPREAD };
             } else {
-                // defend: nearest to ball chases, rest mark.
-                acts[i] = if order[0].0 == i { A_CHASE } else { A_MARK };
+                // defend: the two nearest press the ball (double-team the
+                // carrier), the rest mark — solo dribbling gets swarmed.
+                acts[i] = if order[0].0 == i || order[1].0 == i { A_CHASE } else { A_MARK };
             }
         }
         acts
