@@ -480,8 +480,9 @@ impl World {
             self.last_kicker = Some(kicker);
             self.kick_timer = 3;
             self.pending_pass = None;
-            if is_pass && kicker.team == Team::A {
-                // remember intended receiver for completion detection
+            if is_pass {
+                // remember intended receiver (BOTH teams) so the reception radius
+                // applies symmetrically. pending_pass.team == the passing team.
                 self.pending_pass = self.intended_receiver;
             }
         } else if let Some(o) = self.owner {
