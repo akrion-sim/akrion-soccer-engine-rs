@@ -26621,7 +26621,10 @@ fn soccer_transition_reward_with_tactics(
         ),
     };
     let reward_cfg = &tunables().reward;
-    reward += (after_for as f64 - before_for as f64) * reward_cfg.goal_scored_points;
+    // Amplify the sparse terminal GOAL reward so it dominates the dense possession/completion shaping
+    // (root cause of the possession-safe collapse). Env DD_SOCCER_GOAL_REWARD_SCALE, default 1.0.
+    reward +=
+        (after_for as f64 - before_for as f64) * reward_cfg.goal_scored_points * goal_reward_scale();
     if after_against > before_against {
         // The concede STICK, mirror of the goal CARROT above. By default it is deliberately
         // light (8/2 vs a +100 goal). The concede-symmetry rebalance (gated, default-OFF) swaps
