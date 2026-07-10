@@ -567,7 +567,11 @@ impl World {
             }
         }
         // Outfield players only control a ball that isn't screaming past them.
+        // The intended pass receiver gets a larger reception radius and a small
+        // anticipation edge, so passes actually CONNECT instead of going loose —
+        // unless an opponent is genuinely closer and intercepts.
         if best.is_none() && !ball_fast {
+            let mut best_eff = f32::INFINITY;
             for team in [Team::A, Team::B] {
                 for i in 0..N {
                     if i == GK {
@@ -580,8 +584,15 @@ impl World {
                             }
                         }
                     }
+                    let is_recv = matches!(self.pending_pass, Some(r) if r.team == team && r.idx == i);
+                    let radius = if is_recv { RECEIVE_RADIUS } else { CONTROL_RADIUS };
                     let d = players(team, self)[i].pos.sub(self.ball).len();
-                    if d < CONTROL_RADIUS && best.map_or(true, |(_, bd)| d < bd) {
+                    if d >= radius {
+                        continue;
+                    }
+                    let eff = d - if is_recv { 0.9 } else { 0.0 };
+                    if eff < best_eff {
+                        best_eff = eff;
                         best = Some((Owner { team, idx: i }, d));
                     }
                 }
