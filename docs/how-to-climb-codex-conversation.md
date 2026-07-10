@@ -859,8 +859,43 @@ guard (world.rs:33686: when deferred on, don't also feed per-tick). Byte-identic
 - If forward climbs but payoff 0.54-0.58 → rerun 160 train / 280+ eval before touching code.
 - **Prod canary metrics:** fwd passes/g, fwd share, completion%, interceptions+loose per completed fwd pass, turnovers within 5s of fwd pass, SOT/g, xG/chance-quality, GD/payoff.
 - Next openness diag should use anticipated_reception_point + expected_completion + lane_interception_risk, not just feet-openness (my nearest-defender≥4yd proxy is a coarse first column only).
-=======
->>>>>>> theirs
+
+## Round 23 — the causal-ownership reframe (2026-07-09)
+
+An external analysis (repo-comment-grounded, not current-state-grounded) argued the plateau is a
+**causal-ownership** problem: the net is damped before it can own the outcome (dead exploration +
+analytic shield + confidence gate). I cross-checked every claim against HEAD and put the reframe to
+Codex. Full working log: [`climb-reframe-2026-07-09.md`](climb-reframe-2026-07-09.md).
+
+**What survived the cross-check (actionable):** (1) exploration is effectively OFF — the value-weighted
+softmax exists but is gated off twice (`DD_SOCCER_ENABLE_STOCHASTIC_POLICY_TOPK` off + `boltzmann_temperature=0`,
+policy_select.rs:47 / tunables.rs:280); (2) there is **no net-influence instrument** — nothing measures
+the fraction of decisions on which the net's score changes the executed action; (3) the analytic
+disciplines plausibly do the playing.
+
+**What was stale/wrong:** "build softmax" (already built), "coarsen the action key" (backwards — see
+below), "team share defaults 0.0" (training uses 0.25), "add DISABLE_* toggles / eval vs heuristic"
+(both already exist), "~300-tick trajectory-gap truncation" (it's 0.3 s).
+
+**Codex r23 verdict:** (a) my gate reading is right — coarsening `SoccerQActionKey` would make rows
+cross `min_confidence_visits` sooner and **reduce** net authority (ConfidenceGated blends *toward* the
+net on under-visited rows, world.rs:15869); and the default blend is `Additive`/live is `authoritative`
+anyway, so the gate is largely moot. **Action-key coarsening rejected.** (b) The real shield is
+**downstream** of the blend — executable-plan filters, MCTS margin filtering, MPC reconciliation,
+player-layer viability vetoes (world.rs:15833 / 15961 / 16605, player.rs:10129). (c) **Sequencing
+endorsed:** pause carrot → instrument first → baseline → flip exploration → resume reward. (d) Caution:
+the learned-policy path has its own deterministic top-k chooser separate from `policy_select.rs`, so one
+env flip won't exercise every path; instrumentation must tag the selection *source*.
+
+**Instrument sites + thresholds (Codex):** scorer-level in `neural_blended_action` (world.rs:15659 /
+15961) capturing the tabular baseline label before neural vocab expansion vs the selected candidate
+after sort; headline causal metric at final commit (world.rs:20126 / 20150) baseline-vs-executed
+(`stamp_neural_mcts_selection` at world.rs:14099 is the pattern). Family-level net influence: `<1–2%`
+dead, `2–5%` very weak, `5–15%` material-but-insufficient, `>15–20%` high overall, `>25–30%` high on the
+neural-active subset. Report exact vs family, on-ball vs off-ball, plus chosen-candidate score entropy.
+
+**Falsification:** high net-influence yet still at parity ⇒ thesis wrong, back to reward/credit; ~0
+net-influence ⇒ thesis confirmed, binding constraint is exploration + downstream shield.
 ## Round 23 — the causal-ownership reframe (2026-07-09)
 
 An external analysis (repo-comment-grounded, not current-state-grounded) argued the plateau is a
