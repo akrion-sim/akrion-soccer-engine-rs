@@ -75,10 +75,10 @@ fn run_training(iters: usize) {
     let eval_every = 5;
 
     println!(
-        "{:>5} | {:>10} | {:>8} | {:>6} {:>6} | {:>7} | {:>9}",
-        "iter", "goal_diff", "winrate", "gA", "gB", "entropy", "val_loss"
+        "{:>5} | {:>10} | {:>8} | {:>6} {:>6} | {:>6} | {:>7} | {:>9}",
+        "iter", "goal_diff", "winrate", "gA", "gB", "space", "entropy", "val_loss"
     );
-    println!("{}", "-".repeat(72));
+    println!("{}", "-".repeat(80));
 
     // Keep the BEST policy by eval goal-diff, not the last — PPO can over-train
     // and collapse, so we snapshot the peak and showcase that.
