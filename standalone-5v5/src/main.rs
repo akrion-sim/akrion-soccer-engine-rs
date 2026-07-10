@@ -103,6 +103,9 @@ fn inspect(seed: u64) {
         if bunched {
             bunch_ticks += 1;
         }
+        if closest < OVERLAP_THRESH {
+            overlap_ticks += 1;
+        }
         sum_closest += closest;
         sum_avg += avg;
 
