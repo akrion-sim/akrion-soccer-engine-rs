@@ -23,7 +23,7 @@ const PASS_SPEED: f32 = 16.0;
 const SHOT_SPEED: f32 = 24.0;
 const CLEAR_SPEED: f32 = 20.0;
 const CAPTURE_MAX_BALL_SPEED: f32 = 26.0;
-const KEEPER_REACH: f32 = 2.6; // keeper can smother/save within this radius (even fast shots)
+const KEEPER_REACH: f32 = 1.9; // keeper can smother/save within this radius (even fast shots)
 const KEEPER_SPEED: f32 = 6.0;
 
 // ---- Action space -----------------------------------------------------------
