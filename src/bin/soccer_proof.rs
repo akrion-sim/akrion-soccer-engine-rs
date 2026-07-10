@@ -2,12 +2,15 @@
 //! POMDP + MPC passing stack.
 //!
 //! It answers one question with statistics: does training with the neural/DP learning stack
-//! *cause* passing to improve — measured primarily by COMPLETED FORWARD PASSES and YARDS
-//! GAINED PER PASS (progression that cannot be farmed by short safe pokes), with completion
-//! rate, shots-on-target, and dribble success as guardrails — against a FROZEN opponent so
-//! there is no self-play moving-target confound.
+//! *cause* passing to improve — measured primarily by PASS COMPLETION RATE and
+//! completed forward passes, with yards/completed-pass, route-one, shots-on-target,
+//! and dribble success as guardrails — against a FROZEN opponent so there is no
+//! self-play moving-target confound.
 //!
 //! Subcommands:
+//!   fresh <out.json> <seed_hex>
+//!       Writes a zero-gradient neural snapshot with the same env-controlled architecture as
+//!       `train-ckpt`. Use this as the gen0/untrained anchor.
 //!   train-ckpt <out_prefix> <games> <minutes> <seed_hex> <ckpt_every>
 //!       Inline self-play carry-forward honoring env gates. Writes `<out_prefix>.gen{K}.json`
 //!       every `ckpt_every` games and a final `<out_prefix>.genFINAL.json`. The learning-curve
@@ -23,15 +26,23 @@
 //! (DP_CRITIC_TARGET / DP_BOOTSTRAP / DEFERRED_PASS_CREDIT) are TRAINING-ONLY, so eval of frozen
 //! brains is identical regardless of them — toggling them across two `train-ckpt` runs is a
 //! clean causal test on the trained policy.
+//!
+//! Compatibility: set `SOCCER_PROOF_STRIP_AUX_HEADS=1` only when a legacy snapshot's carried
+//! side actors (policy/specialist/keeper/line-depth/MPC heads) have stale feature dimensions and
+//! you need a value/critic-only proof run. Leave it unset for full-stack proof.
 
+use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use soccer_engine::des::general::soccer::{
-    enable_deterministic_formation_lp, learned_mpc_objective_enabled, MatchConfig, MatchStats,
-    SoccerMarlAlgorithm, SoccerMatch, SoccerMpcObjectiveHead, SoccerNeuralLearningBackend,
-    SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot, SoccerQPolicyOptions,
-    SoccerTeamQPolicies, DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
+    enable_deterministic_formation_lp, learned_mpc_objective_enabled, AttackSpacingHead,
+    MatchConfig, MatchStats, SoccerMarlAlgorithm, SoccerMatch, SoccerMpcObjectiveHead,
+    SoccerNeuralLearningBackend, SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot,
+    SoccerPassCompletionHead, SoccerQPolicyOptions, SoccerTeamQPolicies, SupportScorerHead,
+    ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS, DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
+    DEFAULT_SOCCER_PASS_COMPLETION_LEARNING_RATE, PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS,
+    SUPPORT_SCORER_HEAD_MIN_TRAINING_STEPS,
 };
 use soccer_engine::des::general::tournament::{
     EngineMatchRunner, EngineMatchRunnerConfig, TeamBrain, TournamentMatchContext,
@@ -72,8 +83,7 @@ const SEED_STRIDE: u32 = 2_246_822_519;
 
 /// Train a candidate by inline self-play carry-forward, honoring whatever env gates this process
 /// was launched with, writing a checkpoint snapshot every `ckpt_every` games.
-fn train_ckpt(out_prefix: &str, games: usize, minutes: f64, seed_base: u32, ckpt_every: usize) {
-    enable_deterministic_formation_lp();
+fn proof_neural_config() -> SoccerNeuralLearningConfig {
     let mut neural = SoccerNeuralLearningConfig {
         enabled: true,
         backend: SoccerNeuralLearningBackend::Inline,
@@ -86,6 +96,58 @@ fn train_ckpt(out_prefix: &str, games: usize, minutes: f64, seed_base: u32, ckpt
     neural.target_popart_enabled =
         env_bool("SOCCER_NEURAL_TARGET_POPART", neural.target_popart_enabled);
     neural.hidden_units = env_usize("SOCCER_NEURAL_HIDDEN_UNITS", neural.hidden_units);
+    neural
+}
+
+fn write_snapshot(path: &str, snap: &SoccerNeuralNetworkSnapshot) {
+    let json = serde_json::to_string(snap).unwrap_or_else(|e| panic!("serialize {path}: {e}"));
+    std::fs::write(path, json).unwrap_or_else(|e| panic!("write {path}: {e}"));
+}
+
+fn fresh_snapshot(out_path: &str, seed_base: u32) {
+    enable_deterministic_formation_lp();
+    let neural = proof_neural_config();
+    let mut config = MatchConfig {
+        duration_seconds: 0.0,
+        learning_enabled: true,
+        neural_learning: neural.clone(),
+        seed: seed_base,
+        ..MatchConfig::default()
+    };
+    config.neural_blend.actor_critic = true;
+    let mut sim = SoccerMatch::default_11v11(config);
+    sim.set_uniform_elite_players();
+    if env_bool("DD_SOCCER_ENABLE_LEARNED_PASS_COMPLETION", false) {
+        sim.set_pass_completion_head(SoccerPassCompletionHead::new(seed_base));
+    }
+    if learned_mpc_objective_enabled() {
+        sim.set_mpc_objective_head(SoccerMpcObjectiveHead::new(seed_base));
+    }
+    if std::env::var("DD_SOCCER_ENABLE_LEARNED_SPACING_TARGET").is_ok() {
+        sim.set_attack_spacing_head(AttackSpacingHead::new(seed_base));
+    }
+    if !env_bool("DD_SOCCER_DISABLE_LEARNED_SUPPORT_SCORER", false) {
+        sim.set_support_scorer_head(SupportScorerHead::new(seed_base));
+    }
+    let snapshot = sim
+        .neural_network_snapshot()
+        .unwrap_or_else(|| panic!("fresh neural snapshot was not initialized for {out_path}"));
+    write_snapshot(out_path, &snapshot);
+    println!(
+        "[fresh] wrote {out_path} seed=0x{seed_base:08X} target_scale={} target_clip={} popart={} hidden={} training_steps={}",
+        neural.target_scale,
+        neural.target_clip,
+        neural.target_popart_enabled,
+        neural.hidden_units,
+        snapshot.training_steps
+    );
+}
+
+/// Train a candidate by inline self-play carry-forward, honoring whatever env gates this process
+/// was launched with, writing a checkpoint snapshot every `ckpt_every` games.
+fn train_ckpt(out_prefix: &str, games: usize, minutes: f64, seed_base: u32, ckpt_every: usize) {
+    enable_deterministic_formation_lp();
+    let neural = proof_neural_config();
     println!(
         "[train-ckpt] prefix={out_prefix} games={games} minutes={minutes} seed=0x{seed_base:08X} \
          ckpt_every={ckpt_every} target_scale={} target_clip={} popart={} hidden={}",
@@ -94,7 +156,10 @@ fn train_ckpt(out_prefix: &str, games: usize, minutes: f64, seed_base: u32, ckpt
 
     let mut policies = Arc::new(SoccerTeamQPolicies::new(SoccerQPolicyOptions::default()));
     let mut snapshot: Option<SoccerNeuralNetworkSnapshot> = None;
+    let mut pass_completion_head: Option<SoccerPassCompletionHead> = None;
     let mut mpc_head: Option<SoccerMpcObjectiveHead> = None;
+    let mut attack_spacing_head: Option<AttackSpacingHead> = None;
+    let mut support_scorer_head: Option<SupportScorerHead> = None;
     let started = Instant::now();
 
     let write_ckpt = |snap: &SoccerNeuralNetworkSnapshot, tag: &str| {
@@ -128,21 +193,87 @@ fn train_ckpt(out_prefix: &str, games: usize, minutes: f64, seed_base: u32, ckpt
                 eprintln!("[train-ckpt] game {g}: snapshot install failed: {e}");
             }
         }
+        if let Some(head) = pass_completion_head.as_ref() {
+            sim.set_pass_completion_head(head.clone());
+        }
         if learned_mpc_objective_enabled() {
             let head = mpc_head.get_or_insert_with(|| SoccerMpcObjectiveHead::new(seed_base));
             sim.set_mpc_objective_head(head.clone());
+        }
+        if let Some(head) = attack_spacing_head.as_ref() {
+            sim.set_attack_spacing_head(head.clone());
+        }
+        if let Some(head) = support_scorer_head.as_ref() {
+            sim.set_support_scorer_head(head.clone());
         }
         for _ in 0..total_ticks {
             sim.run_time_step();
         }
         sim.drain_neural_learning(Duration::from_millis(100));
+        let pass_samples = sim.drain_pass_outcome_samples();
+        if !pass_samples.is_empty() {
+            let head = pass_completion_head.get_or_insert_with(|| {
+                SoccerPassCompletionHead::new(seed_base.wrapping_add(g as u32))
+            });
+            let mut final_loss = 0.0;
+            for _ in 0..4 {
+                final_loss =
+                    head.train(&pass_samples, DEFAULT_SOCCER_PASS_COMPLETION_LEARNING_RATE);
+            }
+            sim.set_pass_completion_head(head.clone());
+            eprintln!(
+                "[train-ckpt] pass-completion game={} samples={} training_steps={} consumed={} final_loss={:.5}",
+                g + 1,
+                pass_samples.len(),
+                head.training_steps(),
+                head.training_steps() >= PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS,
+                final_loss
+            );
+        }
         if learned_mpc_objective_enabled() {
             let samples = sim.drain_mpc_objective_samples();
             if !samples.is_empty() {
                 if let Some(head) = mpc_head.as_mut() {
                     head.train_rwr(&samples, 0.05);
+                    sim.set_mpc_objective_head(head.clone());
                 }
             }
+        }
+        let attack_spacing_samples = sim.drain_attack_spacing_samples();
+        if !attack_spacing_samples.is_empty() {
+            let head = attack_spacing_head
+                .get_or_insert_with(|| AttackSpacingHead::new(seed_base.wrapping_add(g as u32)));
+            let mut final_loss = 0.0;
+            for _ in 0..4 {
+                final_loss = head.train(&attack_spacing_samples, 0.02);
+            }
+            sim.set_attack_spacing_head(head.clone());
+            eprintln!(
+                "[train-ckpt] attack-spacing game={} samples={} training_steps={} consumed={} final_loss={:.5}",
+                g + 1,
+                attack_spacing_samples.len(),
+                head.training_steps(),
+                head.training_steps() >= ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS,
+                final_loss
+            );
+        }
+        let support_move_samples = sim.drain_support_move_samples();
+        if !support_move_samples.is_empty() {
+            let head = support_scorer_head
+                .get_or_insert_with(|| SupportScorerHead::new(seed_base.wrapping_add(g as u32)));
+            let mut final_loss = 0.0;
+            for _ in 0..4 {
+                final_loss = head.train(&support_move_samples, 0.02);
+            }
+            sim.set_support_scorer_head(head.clone());
+            eprintln!(
+                "[train-ckpt] support-scorer game={} samples={} training_steps={} consumed={} final_loss={:.5}",
+                g + 1,
+                support_move_samples.len(),
+                head.training_steps(),
+                head.training_steps() >= SUPPORT_SCORER_HEAD_MIN_TRAINING_STEPS,
+                final_loss
+            );
         }
         if let Some(p) = sim.team_policies() {
             policies = Arc::new(p.clone());
@@ -239,8 +370,21 @@ fn load_brain(spec: &str) -> TeamBrain {
         TeamBrain::fresh()
     } else {
         let json = std::fs::read_to_string(spec).unwrap_or_else(|e| panic!("read {spec}: {e}"));
-        let snap: SoccerNeuralNetworkSnapshot =
+        let mut snap: SoccerNeuralNetworkSnapshot =
             serde_json::from_str(&json).unwrap_or_else(|e| panic!("parse {spec}: {e}"));
+        if env_bool("SOCCER_PROOF_STRIP_AUX_HEADS", false) {
+            eprintln!(
+                "[load] SOCCER_PROOF_STRIP_AUX_HEADS=1: evaluating value/critic net only for {spec}"
+            );
+            snap.policy_head = None;
+            snap.skill_policy_heads = None;
+            snap.keeper_policy_head = None;
+            snap.line_depth_head = None;
+            snap.pass_completion_head = None;
+            snap.mpc_objective_head = None;
+            snap.attack_spacing_head = None;
+            snap.support_scorer_head = None;
+        }
         TeamBrain::from_snapshot(snap)
     }
 }
@@ -328,8 +472,15 @@ fn paired_stat(diffs: &[f64]) -> Stat {
     }
 }
 
+fn safe_ratio(numerator: f64, denominator: f64) -> f64 {
+    if denominator.abs() > 1e-9 {
+        numerator / denominator
+    } else {
+        0.0
+    }
+}
+
 fn eval(cand_spec: &str, base_spec: &str, games: usize, minutes: f64, holdout: u32) {
-    use std::io::Write;
     enable_deterministic_formation_lp();
     let cand = load_brain(cand_spec);
     let base = load_brain(base_spec);
@@ -339,7 +490,6 @@ fn eval(cand_spec: &str, base_spec: &str, games: usize, minutes: f64, holdout: u
 
     let jsonl_path = std::env::var("PROOF_JSONL").ok();
     let mut jsonl = jsonl_path.as_ref().map(|p| {
-        use std::io::Write;
         let f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -353,7 +503,9 @@ fn eval(cand_spec: &str, base_spec: &str, games: usize, minutes: f64, holdout: u
     );
     let started = Instant::now();
 
-    // Accumulators for the two headline PROGRESSION metrics (paired per game).
+    // Accumulators for the headline passing metrics and anti-gaming guards.
+    let mut d_completed: Vec<f64> = Vec::with_capacity(games);
+    let mut d_completion_rate: Vec<f64> = Vec::with_capacity(games);
     let mut d_fwd: Vec<f64> = Vec::with_capacity(games);
     let mut d_yards: Vec<f64> = Vec::with_capacity(games);
     // Totals for rate/guardrail reporting.
@@ -370,6 +522,8 @@ fn eval(cand_spec: &str, base_spec: &str, games: usize, minutes: f64, holdout: u
             continue;
         };
         n_done += 1;
+        d_completed.push(cm.comp - bm.comp);
+        d_completion_rate.push(safe_ratio(cm.comp, cm.att) - safe_ratio(bm.comp, bm.att));
         d_fwd.push(cm.fwd - bm.fwd);
         d_yards.push(cm.gain_yards - bm.gain_yards);
         acc!(
@@ -435,27 +589,62 @@ fn eval(cand_spec: &str, base_spec: &str, games: usize, minutes: f64, holdout: u
         return;
     }
     let nf = n_done as f64;
-    let pct = |num: f64, den: f64| if den > 0.0 { 100.0 * num / den } else { 0.0 };
+    let pct = |num: f64, den: f64| 100.0 * safe_ratio(num, den);
+    let completed_stat = paired_stat(&d_completed);
+    let completion_rate_stat = paired_stat(&d_completion_rate);
     let fwd_stat = paired_stat(&d_fwd);
     let yards_stat = paired_stat(&d_yards);
+    let cand_yards_per_pass = safe_ratio(c.gain_yards, c.comp);
+    let base_yards_per_pass = safe_ratio(b.gain_yards, b.comp);
+    let yards_per_pass_delta = cand_yards_per_pass - base_yards_per_pass;
+    let route_one_delta_pg = (c.route_one - b.route_one) / nf;
+    let yards_guard_floor = env_f64("SOCCER_PROOF_MIN_YARDS_PER_PASS_DELTA", -0.25);
+    let route_one_guard_max = env_f64("SOCCER_PROOF_MAX_ROUTE_ONE_DELTA_PER_GAME", 0.10);
+    let yards_guard_ok = yards_per_pass_delta >= yards_guard_floor;
+    let route_one_guard_ok = route_one_delta_pg <= route_one_guard_max;
 
     println!("\n===== PASSING PROGRESSION PROOF (candidate − baseline, paired over {n_done} held-out games) =====");
     println!(
-        "completed FORWARD passes/game: cand {:.2}  base {:.2}  Δ {:+.2}  [95% LB {:+.2}]  [99.99% LB {:+.2}]",
-        c.fwd / nf, b.fwd / nf, fwd_stat.mean, fwd_stat.lb95, fwd_stat.lb9999
+        "completed passes/game:         cand {:.2}  base {:.2}  Δ {:+.2}  [95% LB {:+.2}]  [99.99% LB {:+.2}]  n={}",
+        c.comp / nf, b.comp / nf, completed_stat.mean, completed_stat.lb95, completed_stat.lb9999, completed_stat.n
     );
     println!(
-        "forward YARDS gained/game:     cand {:.1}  base {:.1}  Δ {:+.1}  [95% LB {:+.2}]  [99.99% LB {:+.2}]",
-        c.gain_yards / nf, b.gain_yards / nf, yards_stat.mean, yards_stat.lb95, yards_stat.lb9999
+        "pass completion rate:          cand {:.2}%  base {:.2}%  Δ {:+.2}pp  [95% LB {:+.2}pp]  [99.99% LB {:+.2}pp]  n={}",
+        pct(c.comp, c.att),
+        pct(b.comp, b.att),
+        completion_rate_stat.mean * 100.0,
+        completion_rate_stat.lb95 * 100.0,
+        completion_rate_stat.lb9999 * 100.0,
+        completion_rate_stat.n
     );
-    let headline = if fwd_stat.lb9999 > 0.0 && yards_stat.lb9999 > 0.0 {
-        "PROVEN@99.99% — candidate out-progresses baseline on forward passes AND yards (both 99.99% LB > 0)"
-    } else if fwd_stat.lb95 > 0.0 {
-        "CLIMB@95% — significant at 95% on forward passes; need more games for 99.99%"
-    } else if fwd_stat.mean > 0.0 {
-        "directional — more forward passes on average, not yet significant"
+    println!(
+        "completed FORWARD passes/game: cand {:.2}  base {:.2}  Δ {:+.2}  [95% LB {:+.2}]  [99.99% LB {:+.2}]  n={}",
+        c.fwd / nf, b.fwd / nf, fwd_stat.mean, fwd_stat.lb95, fwd_stat.lb9999, fwd_stat.n
+    );
+    println!(
+        "forward YARDS gained/game:     cand {:.1}  base {:.1}  Δ {:+.1}  [95% LB {:+.2}]  [99.99% LB {:+.2}]  n={}",
+        c.gain_yards / nf, b.gain_yards / nf, yards_stat.mean, yards_stat.lb95, yards_stat.lb9999, yards_stat.n
+    );
+    let headline = if completion_rate_stat.lb9999 > 0.0
+        && fwd_stat.lb9999 > 0.0
+        && yards_guard_ok
+        && route_one_guard_ok
+    {
+        "PROVEN@99.99% — pass completion rate and completed forward passes have 99.99% lower bounds above zero, with yards/pass and route-one guards intact"
+    } else if completion_rate_stat.lb95 > 0.0
+        && fwd_stat.lb95 > 0.0
+        && yards_guard_ok
+        && route_one_guard_ok
+    {
+        "CLIMB@95% — completion rate and completed forward passes are significant at 95%; need more held-out games for 99.99%"
+    } else if completion_rate_stat.mean > 0.0 && fwd_stat.mean > 0.0 && yards_guard_ok {
+        "directional — completion rate and forward passing improved on average, not yet significant"
+    } else if fwd_stat.lb95 > 0.0 && yards_guard_ok {
+        "progression-only climb — forward progression is significant, but pass-completion-rate proof is incomplete"
+    } else if fwd_stat.mean > 0.0 || completion_rate_stat.mean > 0.0 {
+        "partial directional movement — more held-out games or a better candidate are needed"
     } else {
-        "no forward-pass advancement"
+        "no passing advancement"
     };
     println!("VERDICT: {headline}");
 
@@ -466,11 +655,7 @@ fn eval(cand_spec: &str, base_spec: &str, games: usize, minutes: f64, holdout: u
         pct(c.comp, c.att),
         pct(c.fwd, c.comp),
         pct(c.back, c.comp),
-        if c.comp > 0.0 {
-            c.gain_yards / c.comp
-        } else {
-            0.0
-        },
+        cand_yards_per_pass,
         c.chains / nf
     );
     println!(
@@ -479,12 +664,12 @@ fn eval(cand_spec: &str, base_spec: &str, games: usize, minutes: f64, holdout: u
         pct(b.comp, b.att),
         pct(b.fwd, b.comp),
         pct(b.back, b.comp),
-        if b.comp > 0.0 {
-            b.gain_yards / b.comp
-        } else {
-            0.0
-        },
+        base_yards_per_pass,
         b.chains / nf
+    );
+    println!(
+        "guards: yards/pass delta {:+.2} (floor {:+.2}) route-one delta/g {:+.2} (max {:+.2})",
+        yards_per_pass_delta, yards_guard_floor, route_one_delta_pg, route_one_guard_max
     );
 
     println!("\n----- guardrails (candidate vs baseline per game) -----");
@@ -527,6 +712,11 @@ fn eval(cand_spec: &str, base_spec: &str, games: usize, minutes: f64, holdout: u
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        Some("fresh") => {
+            let out = args.get(2).expect("usage: fresh <out.json> <seed_hex>");
+            let seed = parse_hex(args.get(3), 0x71A1_0000);
+            fresh_snapshot(out, seed);
+        }
         Some("train-ckpt") => {
             let prefix = args
                 .get(2)
@@ -549,7 +739,8 @@ fn main() {
         }
         _ => {
             eprintln!(
-                "usage:\n  soccer_proof train-ckpt <out_prefix> <games> <minutes> <seed_hex> <ckpt_every>\n  \
+                "usage:\n  soccer_proof fresh <out.json> <seed_hex>\n  \
+                 soccer_proof train-ckpt <out_prefix> <games> <minutes> <seed_hex> <ckpt_every>\n  \
                  soccer_proof eval <candidate|analytic> <baseline|analytic> <games> <minutes> <holdout_hex>\n  \
                  (set $PROOF_JSONL to append per-game rows; run several evals over disjoint holdouts in parallel)"
             );

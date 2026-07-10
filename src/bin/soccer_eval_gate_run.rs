@@ -186,6 +186,8 @@ struct HoldoutReport {
 struct AdvancementFixture {
     candidate_forward_passes: u32,
     opponent_forward_passes: u32,
+    candidate_passes_attempted: u32,
+    opponent_passes_attempted: u32,
     candidate_completed_passes: u32,
     opponent_completed_passes: u32,
     candidate_turnovers: u32,
@@ -201,6 +203,8 @@ impl AdvancementFixture {
             AdvancementFixture {
                 candidate_forward_passes: stats.passes_completed_forward_home,
                 opponent_forward_passes: stats.passes_completed_forward_away,
+                candidate_passes_attempted: stats.passes_attempted_home,
+                opponent_passes_attempted: stats.passes_attempted_away,
                 candidate_completed_passes: stats.passes_completed_home,
                 opponent_completed_passes: stats.passes_completed_away,
                 candidate_turnovers: stats.interceptions_away,
@@ -212,6 +216,8 @@ impl AdvancementFixture {
             AdvancementFixture {
                 candidate_forward_passes: stats.passes_completed_forward_away,
                 opponent_forward_passes: stats.passes_completed_forward_home,
+                candidate_passes_attempted: stats.passes_attempted_away,
+                opponent_passes_attempted: stats.passes_attempted_home,
                 candidate_completed_passes: stats.passes_completed_away,
                 opponent_completed_passes: stats.passes_completed_home,
                 candidate_turnovers: stats.interceptions_home,
@@ -225,6 +231,28 @@ impl AdvancementFixture {
     fn forward_pass_margin(&self) -> i32 {
         self.candidate_forward_passes as i32 - self.opponent_forward_passes as i32
     }
+
+    fn net_forward_pass_margin(&self) -> i32 {
+        (self.candidate_forward_passes as i32 - self.candidate_turnovers as i32)
+            - (self.opponent_forward_passes as i32 - self.opponent_turnovers as i32)
+    }
+
+    fn forward_pass_rate_margin(&self) -> f64 {
+        ratio(
+            self.candidate_forward_passes,
+            self.candidate_completed_passes,
+        ) - ratio(self.opponent_forward_passes, self.opponent_completed_passes)
+    }
+
+    fn pass_completion_rate_margin(&self) -> f64 {
+        ratio(
+            self.candidate_completed_passes,
+            self.candidate_passes_attempted,
+        ) - ratio(
+            self.opponent_completed_passes,
+            self.opponent_passes_attempted,
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -234,6 +262,8 @@ struct AdvancementRecord {
     losses: u32,
     candidate_forward_passes: u32,
     opponent_forward_passes: u32,
+    candidate_passes_attempted: u32,
+    opponent_passes_attempted: u32,
     candidate_completed_passes: u32,
     opponent_completed_passes: u32,
     candidate_turnovers: u32,
@@ -266,6 +296,12 @@ impl AdvancementRecord {
         self.opponent_forward_passes = self
             .opponent_forward_passes
             .saturating_add(fixture.opponent_forward_passes);
+        self.candidate_passes_attempted = self
+            .candidate_passes_attempted
+            .saturating_add(fixture.candidate_passes_attempted);
+        self.opponent_passes_attempted = self
+            .opponent_passes_attempted
+            .saturating_add(fixture.opponent_passes_attempted);
         self.candidate_completed_passes = self
             .candidate_completed_passes
             .saturating_add(fixture.candidate_completed_passes);
@@ -314,6 +350,24 @@ impl AdvancementRecord {
         self.candidate_forward_pass_rate() - self.opponent_forward_pass_rate()
     }
 
+    fn candidate_pass_completion_rate(&self) -> f64 {
+        ratio(
+            self.candidate_completed_passes,
+            self.candidate_passes_attempted,
+        )
+    }
+
+    fn opponent_pass_completion_rate(&self) -> f64 {
+        ratio(
+            self.opponent_completed_passes,
+            self.opponent_passes_attempted,
+        )
+    }
+
+    fn pass_completion_rate_margin(&self) -> f64 {
+        self.candidate_pass_completion_rate() - self.opponent_pass_completion_rate()
+    }
+
     fn candidate_net_forward_passes(&self) -> i32 {
         self.candidate_forward_passes as i32 - self.candidate_turnovers as i32
     }
@@ -336,6 +390,72 @@ fn ratio(numerator: u32, denominator: u32) -> f64 {
         0.0
     } else {
         numerator as f64 / denominator as f64
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PairedStat {
+    n: usize,
+    mean: f64,
+    lb95: f64,
+    lb9999: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct AdvancementConfidence {
+    forward_margin: PairedStat,
+    net_forward_margin: PairedStat,
+    forward_rate_margin: PairedStat,
+    pass_completion_rate_margin: PairedStat,
+}
+
+fn paired_stat(values: &[f64]) -> PairedStat {
+    let n = values.len();
+    if n == 0 {
+        return PairedStat::default();
+    }
+    let nf = n as f64;
+    let mean = values.iter().sum::<f64>() / nf;
+    let variance = if n > 1 {
+        values
+            .iter()
+            .map(|value| (value - mean).powi(2))
+            .sum::<f64>()
+            / (nf - 1.0)
+    } else {
+        0.0
+    };
+    let se = (variance / nf).sqrt();
+    PairedStat {
+        n,
+        mean,
+        lb95: mean - 1.959_964 * se,
+        lb9999: mean - 3.719_016 * se,
+    }
+}
+
+fn advancement_confidence(fixtures: &[HoldoutReport]) -> AdvancementConfidence {
+    let forward_margin: Vec<f64> = fixtures
+        .iter()
+        .map(|fixture| fixture.advancement.forward_pass_margin() as f64)
+        .collect();
+    let net_forward_margin: Vec<f64> = fixtures
+        .iter()
+        .map(|fixture| fixture.advancement.net_forward_pass_margin() as f64)
+        .collect();
+    let forward_rate_margin: Vec<f64> = fixtures
+        .iter()
+        .map(|fixture| fixture.advancement.forward_pass_rate_margin())
+        .collect();
+    let pass_completion_rate_margin: Vec<f64> = fixtures
+        .iter()
+        .map(|fixture| fixture.advancement.pass_completion_rate_margin())
+        .collect();
+    AdvancementConfidence {
+        forward_margin: paired_stat(&forward_margin),
+        net_forward_margin: paired_stat(&net_forward_margin),
+        forward_rate_margin: paired_stat(&forward_rate_margin),
+        pass_completion_rate_margin: paired_stat(&pass_completion_rate_margin),
     }
 }
 
@@ -365,6 +485,49 @@ fn forward_pass_gate_reasons(
             "forward-pass rate margin {:+.1}pp <= required {:+.1}pp",
             advancement.forward_pass_rate_margin() * 100.0,
             min_forward_pass_rate_margin * 100.0,
+        ));
+    }
+    reasons
+}
+
+fn forward_pass_confidence_reasons(
+    confidence: &AdvancementConfidence,
+    require_forward_lb9999: bool,
+    require_pass_completion_lb9999: bool,
+    min_forward_pass_margin: i32,
+    min_net_forward_pass_margin: i32,
+    min_forward_pass_rate_margin: f64,
+    min_pass_completion_rate_margin: f64,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if require_forward_lb9999 {
+        if confidence.forward_margin.lb9999 <= min_forward_pass_margin as f64 {
+            reasons.push(format!(
+                "forward-pass 99.99% LB {:+.3} <= required {:+.3}",
+                confidence.forward_margin.lb9999, min_forward_pass_margin as f64,
+            ));
+        }
+        if confidence.net_forward_margin.lb9999 <= min_net_forward_pass_margin as f64 {
+            reasons.push(format!(
+                "net forward-pass 99.99% LB {:+.3} <= required {:+.3}",
+                confidence.net_forward_margin.lb9999, min_net_forward_pass_margin as f64,
+            ));
+        }
+        if confidence.forward_rate_margin.lb9999 <= min_forward_pass_rate_margin {
+            reasons.push(format!(
+                "forward-pass-rate 99.99% LB {:+.1}pp <= required {:+.1}pp",
+                confidence.forward_rate_margin.lb9999 * 100.0,
+                min_forward_pass_rate_margin * 100.0,
+            ));
+        }
+    }
+    if require_pass_completion_lb9999
+        && confidence.pass_completion_rate_margin.lb9999 <= min_pass_completion_rate_margin
+    {
+        reasons.push(format!(
+            "pass-completion-rate 99.99% LB {:+.1}pp <= required {:+.1}pp",
+            confidence.pass_completion_rate_margin.lb9999 * 100.0,
+            min_pass_completion_rate_margin * 100.0,
         ));
     }
     reasons
@@ -662,6 +825,7 @@ fn main() {
     collected.sort_by_key(|(i, _)| *i);
     let holdout_reports: Vec<HoldoutReport> = collected.into_iter().map(|(_, r)| r).collect();
     let advancement = AdvancementRecord::from_fixtures(&holdout_reports);
+    let advancement_confidence = advancement_confidence(&holdout_reports);
     let reports: Vec<MatchReport> = holdout_reports
         .iter()
         .map(|holdout| holdout.report.clone())
@@ -677,6 +841,11 @@ fn main() {
     let min_forward_pass_margin = env_i32("SOCCER_EVAL_MIN_FORWARD_PASS_MARGIN", 0);
     let min_net_forward_pass_margin = env_i32("SOCCER_EVAL_MIN_NET_FORWARD_PASS_MARGIN", 0);
     let min_forward_pass_rate_margin = env_f64("SOCCER_EVAL_MIN_FORWARD_PASS_RATE_MARGIN", 0.0);
+    let min_pass_completion_rate_margin =
+        env_f64("SOCCER_EVAL_MIN_PASS_COMPLETION_RATE_MARGIN", 0.0);
+    let require_forward_pass_lb9999 = env_bool("SOCCER_EVAL_REQUIRE_FORWARD_PASS_LB9999", false);
+    let require_pass_completion_lb9999 =
+        env_bool("SOCCER_EVAL_REQUIRE_PASS_COMPLETION_LB9999", false);
     let min_forward_pass_games = env_usize("SOCCER_EVAL_MIN_FORWARD_PASS_GAMES", 8);
     let require_goal_diff_for_forward_pass =
         env_bool("SOCCER_EVAL_REQUIRE_GOAL_DIFF_FOR_FORWARD_PASS", false);
@@ -691,6 +860,15 @@ fn main() {
         reasons.extend(forward_pass_sample_reasons(
             &advancement,
             min_forward_pass_games,
+        ));
+        reasons.extend(forward_pass_confidence_reasons(
+            &advancement_confidence,
+            require_forward_pass_lb9999,
+            require_pass_completion_lb9999,
+            min_forward_pass_margin,
+            min_net_forward_pass_margin,
+            min_forward_pass_rate_margin,
+            min_pass_completion_rate_margin,
         ));
         if require_goal_diff_for_forward_pass {
             reasons.extend(goal_diff_gate_reasons(
@@ -741,7 +919,7 @@ fn main() {
     );
     println!("Wilson lower bound: {:.3}", verdict.wilson_lower_bound);
     println!(
-        "advancement: {}W-{}D-{}L by completed_forward_passes  FP {}/{} (margin {:+}, fixture_score {:.3})  net_forward {}/{} (margin {:+})  forward_share {:.1}%/{:.1}% (margin {:+.1}pp)  completed_passes {}/{}  turnovers {}/{}  pass_gain_yards_margin {:+.1}",
+        "advancement: {}W-{}D-{}L by completed_forward_passes  FP {}/{} (margin {:+}, fixture_score {:.3})  net_forward {}/{} (margin {:+})  forward_share {:.1}%/{:.1}% (margin {:+.1}pp)  pass_completion {:.1}%/{:.1}% (margin {:+.1}pp)  completed_passes {}/{} attempts {}/{}  turnovers {}/{}  pass_gain_yards_margin {:+.1}",
         advancement.wins,
         advancement.draws,
         advancement.losses,
@@ -755,20 +933,42 @@ fn main() {
         advancement.candidate_forward_pass_rate() * 100.0,
         advancement.opponent_forward_pass_rate() * 100.0,
         advancement.forward_pass_rate_margin() * 100.0,
+        advancement.candidate_pass_completion_rate() * 100.0,
+        advancement.opponent_pass_completion_rate() * 100.0,
+        advancement.pass_completion_rate_margin() * 100.0,
         advancement.candidate_completed_passes,
         advancement.opponent_completed_passes,
+        advancement.candidate_passes_attempted,
+        advancement.opponent_passes_attempted,
         advancement.candidate_turnovers,
         advancement.opponent_turnovers,
         advancement.pass_gain_yards_margin(),
     );
+    println!(
+        "advancement confidence: FP mean {:+.3}/g [95% LB {:+.3}] [99.99% LB {:+.3}] n={} | net mean {:+.3}/g [95% LB {:+.3}] [99.99% LB {:+.3}] | forward_share mean {:+.1}pp [99.99% LB {:+.1}pp] | pass_completion mean {:+.1}pp [99.99% LB {:+.1}pp]",
+        advancement_confidence.forward_margin.mean,
+        advancement_confidence.forward_margin.lb95,
+        advancement_confidence.forward_margin.lb9999,
+        advancement_confidence.forward_margin.n,
+        advancement_confidence.net_forward_margin.mean,
+        advancement_confidence.net_forward_margin.lb95,
+        advancement_confidence.net_forward_margin.lb9999,
+        advancement_confidence.forward_rate_margin.mean * 100.0,
+        advancement_confidence.forward_rate_margin.lb9999 * 100.0,
+        advancement_confidence.pass_completion_rate_margin.mean * 100.0,
+        advancement_confidence.pass_completion_rate_margin.lb9999 * 100.0,
+    );
     if require_forward_pass_climb {
         println!("scoreline gate: diagnostic only with forward-pass climb");
         println!(
-            "forward-pass gate: margin>{:+} net_margin>{:+} rate_margin>{:+.1}pp min_games={} goal_diff_floor={} -> {}",
+            "forward-pass gate: margin>{:+} net_margin>{:+} rate_margin>{:+.1}pp pass_completion_rate>{:+.1}pp min_games={} lb9999_forward={} lb9999_completion={} goal_diff_floor={} -> {}",
             min_forward_pass_margin,
             min_net_forward_pass_margin,
             min_forward_pass_rate_margin * 100.0,
+            min_pass_completion_rate_margin * 100.0,
             min_forward_pass_games,
+            require_forward_pass_lb9999,
+            require_pass_completion_lb9999,
             if require_goal_diff_for_forward_pass {
                 format!(">{min_goal_diff_margin:+}")
             } else {
@@ -854,6 +1054,8 @@ mod tests {
         record.add(AdvancementFixture {
             candidate_forward_passes: 0,
             opponent_forward_passes: 1,
+            candidate_passes_attempted: 10,
+            opponent_passes_attempted: 1,
             candidate_completed_passes: 10,
             opponent_completed_passes: 1,
             candidate_turnovers: 0,
@@ -864,6 +1066,8 @@ mod tests {
         record.add(AdvancementFixture {
             candidate_forward_passes: 20,
             opponent_forward_passes: 2,
+            candidate_passes_attempted: 20,
+            opponent_passes_attempted: 20,
             candidate_completed_passes: 20,
             opponent_completed_passes: 20,
             candidate_turnovers: 0,
@@ -874,6 +1078,8 @@ mod tests {
         record.add(AdvancementFixture {
             candidate_forward_passes: 0,
             opponent_forward_passes: 1,
+            candidate_passes_attempted: 10,
+            opponent_passes_attempted: 1,
             candidate_completed_passes: 10,
             opponent_completed_passes: 1,
             candidate_turnovers: 0,
@@ -935,6 +1141,8 @@ mod tests {
         record.add(AdvancementFixture {
             candidate_forward_passes: 12,
             opponent_forward_passes: 8,
+            candidate_passes_attempted: 24,
+            opponent_passes_attempted: 24,
             candidate_completed_passes: 24,
             opponent_completed_passes: 24,
             candidate_turnovers: 8,
@@ -951,6 +1159,40 @@ mod tests {
                 .iter()
                 .any(|reason| reason.contains("net forward-pass margin")),
             "turnovers must count against the forward-pass climb gate: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn forward_pass_lb9999_gate_rejects_directional_but_unproven_margin() {
+        let directional_margins = [
+            -2.0, 2.0, 2.0, -1.0, 0.0, -1.0, -1.0, 0.0, -2.0, 3.0, -2.0, 0.0, 1.0, 0.0, -1.0, -1.0,
+            -1.0, 0.0, 0.0, -1.0, 1.0, 2.0, 0.0, 3.0, 0.0, -2.0, 0.0, 1.0, -3.0, 2.0, -1.0, 0.0,
+            0.0, 2.0, 0.0, 2.0, 1.0, 1.0, 2.0, 0.0, -1.0, -1.0, 1.0, 1.0, -1.0, 1.0, -2.0, 2.0,
+            1.0, 2.0, -1.0, 0.0, 0.0, 2.0, 2.0, 1.0, 0.0, 2.0, 0.0, -2.0,
+        ];
+        let confidence = AdvancementConfidence {
+            forward_margin: paired_stat(&directional_margins),
+            net_forward_margin: PairedStat {
+                lb9999: 1.0,
+                ..PairedStat::default()
+            },
+            forward_rate_margin: PairedStat {
+                lb9999: 1.0,
+                ..PairedStat::default()
+            },
+            pass_completion_rate_margin: PairedStat::default(),
+        };
+
+        assert!(
+            confidence.forward_margin.mean > 0.0,
+            "test fixture should have a positive mean"
+        );
+        let reasons = forward_pass_confidence_reasons(&confidence, true, false, 0, 0, 0.0, 0.0);
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("forward-pass 99.99% LB")),
+            "directional totals must not pass a 99.99 proof gate: {reasons:?}"
         );
     }
 }

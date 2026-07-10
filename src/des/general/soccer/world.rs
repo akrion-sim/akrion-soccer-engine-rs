@@ -911,6 +911,13 @@ const OWN_HALF_TINY_PASS_FORWARD_RELIEF_YARDS: f64 = 4.0;
 const PROGRESSIVE_FLOOR_OUTLET_MIN_FORWARD_YARDS: f64 = 4.0;
 const PROGRESSIVE_FLOOR_OUTLET_MIN_DISTANCE_YARDS: f64 = 4.0;
 const PROGRESSIVE_FLOOR_OUTLET_SCORE_BONUS: f64 = 2.2;
+const PASS_COMPLETION_PRIMARY_SCORE_FLOOR: f64 = 0.72;
+const PASS_COMPLETION_PRIMARY_MAX_SCORE_PENALTY: f64 = 4.0;
+const PASS_COMPLETION_PRIMARY_FINAL_THIRD_RELIEF: f64 = 0.55;
+const SAFE_PROGRESSIVE_PASS_COMPLETION_FLOOR: f64 = 0.68;
+const SAFE_PROGRESSIVE_PASS_COMPLETION_FULL: f64 = 0.88;
+const SAFE_PROGRESSIVE_PASS_FORWARD_FULL_YARDS: f64 = 12.0;
+const SAFE_PROGRESSIVE_PASS_SCORE_BONUS: f64 = 2.6;
 const GOOD_FORWARD_OUTLET_MIN_QUALITY_FIT: f64 = 0.34;
 const GOOD_FORWARD_OUTLET_MIN_RAW_COMPLETION: f64 = 0.30;
 const GOOD_FORWARD_OUTLET_MIN_STRIDE_FIT: f64 = 0.26;
@@ -975,6 +982,7 @@ const OPEN_FORWARD_RECEIVE_RUN_MAX_FORWARD_YARDS: f64 = 18.0;
 const OPEN_FORWARD_RECEIVE_RUN_MAX_PASS_YARDS: f64 = 36.0;
 const OPEN_FORWARD_RECEIVE_RUN_LANE_RADIUS_YARDS: f64 = 2.0;
 const OPEN_FORWARD_RECEIVE_RUN_MIN_SPACE_SCORE: f64 = 5.0;
+const OPEN_FORWARD_RECEIVE_RUN_ESCAPE_MARK_BONUS: f64 = 1.6;
 const OFF_BALL_POSSESSION_MIN_FORWARD_YARDS: f64 = 0.75;
 const OFF_BALL_POSSESSION_MIN_UPFIELD_PER_LATERAL_YARD: f64 = 0.20;
 /// Off-ball "arrival settle" (hold shape). An off-ball player with nothing urgent to
@@ -12420,10 +12428,34 @@ impl SoccerMatch {
         } else {
             None
         };
+        self.pass_completion_head =
+            if let Some(pass_completion_head) = snapshot.pass_completion_head.as_deref() {
+                Some(std::sync::Arc::new(
+                    SoccerPassCompletionHead::from_snapshot(pass_completion_head)?,
+                ))
+            } else {
+                None
+            };
         self.mpc_objective_head =
             if let Some(mpc_objective_head) = snapshot.mpc_objective_head.as_deref() {
                 Some(std::sync::Arc::new(SoccerMpcObjectiveHead::from_snapshot(
                     mpc_objective_head,
+                )?))
+            } else {
+                None
+            };
+        self.attack_spacing_head =
+            if let Some(attack_spacing_head) = snapshot.attack_spacing_head.as_deref() {
+                Some(std::sync::Arc::new(AttackSpacingHead::from_snapshot(
+                    attack_spacing_head,
+                )?))
+            } else {
+                None
+            };
+        self.support_scorer_head =
+            if let Some(support_scorer_head) = snapshot.support_scorer_head.as_deref() {
+                Some(std::sync::Arc::new(SupportScorerHead::from_snapshot(
+                    support_scorer_head,
                 )?))
             } else {
                 None
@@ -12498,6 +12530,7 @@ impl SoccerMatch {
         self.away_neural_frozen = false;
         self.skill_policy_heads = None;
         self.away_skill_policy_heads = None;
+        self.pass_completion_head = None;
     }
 
     /// True when this match runs distinct per-team neural brains (the away team
@@ -12541,8 +12574,18 @@ impl SoccerMatch {
                 if let Some(line_depth_head) = &self.line_depth_head {
                     snapshot.line_depth_head = Some(Box::new(line_depth_head.to_snapshot()));
                 }
+                if let Some(pass_completion_head) = &self.pass_completion_head {
+                    snapshot.pass_completion_head =
+                        Some(Box::new(pass_completion_head.to_snapshot()));
+                }
                 if let Some(mpc_objective_head) = &self.mpc_objective_head {
                     snapshot.mpc_objective_head = Some(Box::new(mpc_objective_head.to_snapshot()));
+                }
+                if let Some(attack_spacing_head) = &self.attack_spacing_head {
+                    snapshot.attack_spacing_head = Some(Box::new(attack_spacing_head.to_snapshot()));
+                }
+                if let Some(support_scorer_head) = &self.support_scorer_head {
+                    snapshot.support_scorer_head = Some(Box::new(support_scorer_head.to_snapshot()));
                 }
                 snapshot
             })
@@ -37155,6 +37198,49 @@ pub(crate) fn quick_forward_pass_band_fit(distance_yards: f64) -> f64 {
     (1.0 - outside / QUICK_FORWARD_PASS_BAND_FALLOFF_YARDS).clamp(0.0, 1.0)
 }
 
+pub(crate) fn pass_completion_primary_score_penalty(
+    expected_completion: f64,
+    forward_yards: f64,
+    yards_to_goal: f64,
+    field_length: f64,
+) -> f64 {
+    let completion = expected_completion.clamp(0.0, 1.0);
+    let shortfall = (PASS_COMPLETION_PRIMARY_SCORE_FLOOR - completion).max(0.0);
+    if shortfall <= 0.0 {
+        return 0.0;
+    }
+    let final_third_forward =
+        forward_yards > 1.25 && yards_to_goal <= (field_length / 3.0).max(1.0);
+    let relief = if final_third_forward {
+        PASS_COMPLETION_PRIMARY_FINAL_THIRD_RELIEF
+    } else {
+        1.0
+    };
+    (shortfall / PASS_COMPLETION_PRIMARY_SCORE_FLOOR.max(1e-6))
+        * PASS_COMPLETION_PRIMARY_MAX_SCORE_PENALTY
+        * relief
+}
+
+pub(crate) fn safe_progressive_pass_score_bonus(
+    expected_completion: f64,
+    forward_yards: f64,
+    distance_yards: f64,
+) -> f64 {
+    let completion_fit = ((expected_completion.clamp(0.0, 1.0)
+        - SAFE_PROGRESSIVE_PASS_COMPLETION_FLOOR)
+        / (SAFE_PROGRESSIVE_PASS_COMPLETION_FULL - SAFE_PROGRESSIVE_PASS_COMPLETION_FLOOR)
+            .max(1e-6))
+    .clamp(0.0, 1.0);
+    let forward_fit = ((forward_yards - PROGRESSIVE_FLOOR_OUTLET_MIN_FORWARD_YARDS)
+        / (SAFE_PROGRESSIVE_PASS_FORWARD_FULL_YARDS - PROGRESSIVE_FLOOR_OUTLET_MIN_FORWARD_YARDS)
+            .max(1e-6))
+    .clamp(0.0, 1.0);
+    completion_fit
+        * forward_fit
+        * quick_forward_pass_band_fit(distance_yards)
+        * SAFE_PROGRESSIVE_PASS_SCORE_BONUS
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct ForwardFloorOutletAssessment {
     actionable: bool,
@@ -49536,6 +49622,14 @@ impl WorldSnapshot {
                     &pass_quality,
                     directive.risk_tolerance,
                 );
+                let completion_primary_penalty = pass_completion_primary_score_penalty(
+                    expected_completion_for_score,
+                    forward,
+                    (me.team.goal_y(self.field_length) - pass_point.y).abs(),
+                    self.field_length,
+                );
+                let safe_progression_bonus =
+                    safe_progressive_pass_score_bonus(expected_completion_for_score, forward, dist);
                 // Forward-option recognition: when a genuinely good forward ball exists,
                 // demote a backward/square target so the carrier plays the open forward man
                 // instead of recycling backward (the reported blunder). Gated; the precomputed
@@ -49559,6 +49653,7 @@ impl WorldSnapshot {
                     - anticipation_penalty
                     - reception_teammate_penalty
                     - reception_congestion_penalty
+                    - completion_primary_penalty
                     - direct_opponent_aim_penalty
                     - direct_opponent_aim_veto
                     - marked_receiver_penalty
@@ -49577,6 +49672,7 @@ impl WorldSnapshot {
                     + own_box_play_out_adjustment
                     + role_risk.safety_bonus
                     + role_risk.forward_risk_bonus * pass_target_learning
+                    + safe_progression_bonus * pass_target_learning
                     + forward_open_bonus * pass_target_learning
                     + progressive_floor_outlet_bonus * pass_target_learning
                     + wing_overload_bonus * pass_target_learning
@@ -51561,11 +51657,7 @@ impl WorldSnapshot {
             return None;
         }
         let current = self.player_snapshot_position(me);
-        if self.nearest_opponent_distance_at(me.team, current)
-            < OPEN_FORWARD_RECEIVE_RUN_UNMARKED_YARDS
-        {
-            return None;
-        }
+        let current_opponent_distance = self.nearest_opponent_distance_at(me.team, current);
         let holder_position = self.player_snapshot_position(holder);
         let attack = me.team.attack_dir();
         let lateral_offsets = [
@@ -51628,11 +51720,18 @@ impl WorldSnapshot {
                 let line_penalty = self.role_line_penalty_for_player_target(me, target, relief);
                 let pass_range_fit =
                     (1.0 - pass_distance / OPEN_FORWARD_RECEIVE_RUN_MAX_PASS_YARDS).clamp(0.0, 1.0);
+                let escape_mark_bonus = ((OPEN_FORWARD_RECEIVE_RUN_UNMARKED_YARDS
+                    - current_opponent_distance)
+                    / OPEN_FORWARD_RECEIVE_RUN_UNMARKED_YARDS.max(1.0))
+                .clamp(0.0, 1.0)
+                    * (opponent_distance / OPEN_FORWARD_RECEIVE_RUN_UNMARKED_YARDS).clamp(1.0, 2.0)
+                    * OPEN_FORWARD_RECEIVE_RUN_ESCAPE_MARK_BONUS;
                 let score = occupancy.open_space_score * 0.46
                     + opponent_distance.min(18.0) * 0.20
                     + target_forward.min(OPEN_FORWARD_RECEIVE_RUN_MAX_FORWARD_YARDS) * 0.24
                     + holder_forward.max(0.0).min(24.0) * 0.14
                     + pass_range_fit * 1.4
+                    + escape_mark_bonus
                     - current.distance(target) * 0.030
                     - teammate_penalty
                     - lane_penalty * 0.32
