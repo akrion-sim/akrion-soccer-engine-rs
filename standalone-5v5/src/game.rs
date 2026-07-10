@@ -602,14 +602,16 @@ impl World {
         if let Some((o, _)) = best {
             let prev_touch = self.last_touch;
             self.owner = Some(o);
-            // pass completion / interception bookkeeping for Team A.
+            // Team-A reward events. pending_pass.team is the PASSING team.
             if let Some(pp) = self.pending_pass {
-                if o.team == Team::A {
-                    self.ev_pass_completed_a = true; // A pass reached an A player
-                } else {
-                    self.ev_turnover_a = true; // intercepted
+                if pp.team == Team::A {
+                    if o.team == Team::A {
+                        self.ev_pass_completed_a = true; // A pass reached an A player
+                    } else {
+                        self.ev_turnover_a = true; // A pass intercepted by B
+                    }
                 }
-                let _ = pp;
+                // a B pass intercepted by A is a good steal — no A penalty
             } else if matches!(prev_touch, Some(Team::A)) && o.team == Team::B {
                 self.ev_turnover_a = true;
             }
