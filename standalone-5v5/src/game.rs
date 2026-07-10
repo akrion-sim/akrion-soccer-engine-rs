@@ -582,7 +582,8 @@ impl World {
             let gy0 = FIELD_W / 2.0 - GOAL_HALF;
             let gy1 = FIELD_W / 2.0 + GOAL_HALF;
             if self.ball.x >= FIELD_L {
-                if self.ball.y > gy0 && self.ball.y < gy1 {
+                if self.ball.y > gy0 && self.ball.y < gy1 && self.a_shot_flag {
+                    // valid goal: came from an A shot, which required 2 passes
                     self.goals_a += 1;
                     self.ev_goal_a = true;
                     self.kickoff(Team::B);
