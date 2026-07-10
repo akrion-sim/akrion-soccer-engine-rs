@@ -131,10 +131,17 @@ fn inspect(seed: u64) {
     println!("  closest-pair distance: mean {:.1}", sum_closest / n);
     println!("  avg nearest-teammate:  mean {:.1}", sum_avg / n);
     println!(
-        "  frames with a pair < {:.1}: {:.0}%  ({}/{})",
+        "  frames with a pair < {:.1} (bunched): {:.0}%  ({}/{})",
         BUNCH_THRESH,
         100.0 * bunch_ticks as f32 / n,
         bunch_ticks,
+        STEPS
+    );
+    println!(
+        "  frames with a pair < {:.1} (OVERLAP/major): {:.0}%  ({}/{})",
+        OVERLAP_THRESH,
+        100.0 * overlap_ticks as f32 / n,
+        overlap_ticks,
         STEPS
     );
     println!("  full per-tick trace -> out/trace.jsonl ({} frames)", STEPS);
