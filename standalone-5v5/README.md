@@ -12,8 +12,13 @@ from the surrounding cargo workspace so it builds in complete isolation.
 - **No formation LP / IPM / shape machinery.** Off-ball movement is pure
   *possession + open-space*: run upfield to attack, drop to defend, drift to the
   most open point on the pitch. Possession is tracked (`World.owner`).
-- **No POMDP feature stack, no DB, no server.** A ~34-dim egocentric observation
-  in the player's attack frame, and a 13-action masked macro space.
+- **No DB, no server, and none of the engine's ~129-dim POMDP feature stack.**
+  It *is* still a POMDP — each outfielder acts on a **partial, egocentric ~34-dim
+  observation** in its own attack frame (ball/goal/teammate/opponent relatives,
+  pass-candidate openness, shot-lane clearness, pressure), hidden from it are
+  opponent intent and teammates' exact future runs. The policy is **reactive /
+  memoryless** (no belief-state or RNN) — the standard approximation, not the
+  full feature-builder + masking + tabular-Q-blend machinery of the big engine.
 
 ## What IS here
 - **5 v 5 with goalkeepers** and a realistic ~7 m net on a small (42×28) pitch.
