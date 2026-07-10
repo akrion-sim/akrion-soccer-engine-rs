@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! `soccer_proof` — a rigorous, self-contained learnability proof for the neural + DP +
 //! POMDP + MPC passing stack.
 //!
@@ -318,13 +320,26 @@ struct TeamMetrics {
     fwd: f64,
     back: f64,
     gain_yards: f64, // sum of forward yards over completed passes (can be negative)
+    strict_att: f64,
+    strict_comp: f64,
+    strict_fwd: f64,
+    strict_back: f64,
+    strict_gain_yards: f64,
+    strict_pass_turnovers: f64,
     chains: f64,
     shots_after_pass: f64,
     assists: f64,
     dribble_beats: f64,
+    dribble_turnovers: f64,
     route_one: f64,
     interceptions_won: f64,
     pass_turnovers: f64,
+    tackles: f64,
+    loose_ball_recoveries: f64,
+    teamwork_upfield: f64,
+    teamwork_near_ball: f64,
+    possession_chase_advantage: f64,
+    defensive_chase_load: f64,
 }
 
 fn home_metrics(st: &MatchStats) -> TeamMetrics {
@@ -337,13 +352,26 @@ fn home_metrics(st: &MatchStats) -> TeamMetrics {
         fwd: f64::from(st.passes_completed_forward_home),
         back: f64::from(st.passes_completed_backward_home),
         gain_yards: st.completed_pass_gain_yards_home,
+        strict_att: f64::from(st.intentional_passes_attempted_home),
+        strict_comp: f64::from(st.intentional_passes_completed_home),
+        strict_fwd: f64::from(st.intentional_passes_completed_forward_home),
+        strict_back: f64::from(st.intentional_passes_completed_backward_home),
+        strict_gain_yards: st.intentional_completed_pass_gain_yards_home,
+        strict_pass_turnovers: f64::from(st.intentional_pass_interceptions_home),
         chains: f64::from(st.pass_chains_home),
         shots_after_pass: f64::from(st.shots_after_pass_home),
         assists: f64::from(st.assists_home),
         dribble_beats: f64::from(st.dribble_beats_home),
+        dribble_turnovers: f64::from(st.dribble_turnovers_home),
         route_one: f64::from(st.route_one_balls_home),
         interceptions_won: f64::from(st.interceptions_home),
         pass_turnovers: f64::from(st.interceptions_away),
+        tackles: f64::from(st.tackles_home),
+        loose_ball_recoveries: f64::from(st.loose_ball_recoveries_home),
+        teamwork_upfield: st.teamwork_upfield_progress_home,
+        teamwork_near_ball: st.teamwork_near_ball_progress_home,
+        possession_chase_advantage: st.possession_chase_advantage_home,
+        defensive_chase_load: st.defensive_chase_load_home,
     }
 }
 fn away_metrics(st: &MatchStats) -> TeamMetrics {
@@ -356,13 +384,26 @@ fn away_metrics(st: &MatchStats) -> TeamMetrics {
         fwd: f64::from(st.passes_completed_forward_away),
         back: f64::from(st.passes_completed_backward_away),
         gain_yards: st.completed_pass_gain_yards_away,
+        strict_att: f64::from(st.intentional_passes_attempted_away),
+        strict_comp: f64::from(st.intentional_passes_completed_away),
+        strict_fwd: f64::from(st.intentional_passes_completed_forward_away),
+        strict_back: f64::from(st.intentional_passes_completed_backward_away),
+        strict_gain_yards: st.intentional_completed_pass_gain_yards_away,
+        strict_pass_turnovers: f64::from(st.intentional_pass_interceptions_away),
         chains: f64::from(st.pass_chains_away),
         shots_after_pass: f64::from(st.shots_after_pass_away),
         assists: f64::from(st.assists_away),
         dribble_beats: f64::from(st.dribble_beats_away),
+        dribble_turnovers: f64::from(st.dribble_turnovers_away),
         route_one: f64::from(st.route_one_balls_away),
         interceptions_won: f64::from(st.interceptions_away),
         pass_turnovers: f64::from(st.interceptions_home),
+        tackles: f64::from(st.tackles_away),
+        loose_ball_recoveries: f64::from(st.loose_ball_recoveries_away),
+        teamwork_upfield: st.teamwork_upfield_progress_away,
+        teamwork_near_ball: st.teamwork_near_ball_progress_away,
+        possession_chase_advantage: st.possession_chase_advantage_away,
+        defensive_chase_load: st.defensive_chase_load_away,
     }
 }
 
@@ -520,6 +561,9 @@ fn eval(cand_spec: &str, base_spec: &str, games: usize, minutes: f64, holdout: u
     let mut d_fwd: Vec<f64> = Vec::with_capacity(games);
     let mut d_yards: Vec<f64> = Vec::with_capacity(games);
     let mut d_pass_turnover_rate_improvement: Vec<f64> = Vec::with_capacity(games);
+    let mut d_strict_fwd: Vec<f64> = Vec::with_capacity(games);
+    let mut d_strict_net_fwd: Vec<f64> = Vec::with_capacity(games);
+    let mut d_strict_pass_turnover_rate_improvement: Vec<f64> = Vec::with_capacity(games);
     // Totals for rate/guardrail reporting.
     let mut c = TeamMetrics::default();
     let mut b = TeamMetrics::default();
@@ -540,6 +584,14 @@ fn eval(cand_spec: &str, base_spec: &str, games: usize, minutes: f64, holdout: u
         d_yards.push(cm.gain_yards - bm.gain_yards);
         d_pass_turnover_rate_improvement
             .push(safe_ratio(bm.pass_turnovers, bm.att) - safe_ratio(cm.pass_turnovers, cm.att));
+        d_strict_fwd.push(cm.strict_fwd - bm.strict_fwd);
+        d_strict_net_fwd.push(
+            (cm.strict_fwd - cm.strict_pass_turnovers) - (bm.strict_fwd - bm.strict_pass_turnovers),
+        );
+        d_strict_pass_turnover_rate_improvement.push(
+            safe_ratio(bm.strict_pass_turnovers, bm.strict_att)
+                - safe_ratio(cm.strict_pass_turnovers, cm.strict_att),
+        );
         acc!(
             c,
             cm,
@@ -551,13 +603,26 @@ fn eval(cand_spec: &str, base_spec: &str, games: usize, minutes: f64, holdout: u
             fwd,
             back,
             gain_yards,
+            strict_att,
+            strict_comp,
+            strict_fwd,
+            strict_back,
+            strict_gain_yards,
+            strict_pass_turnovers,
             chains,
             shots_after_pass,
             assists,
             dribble_beats,
+            dribble_turnovers,
             route_one,
             interceptions_won,
-            pass_turnovers
+            pass_turnovers,
+            tackles,
+            loose_ball_recoveries,
+            teamwork_upfield,
+            teamwork_near_ball,
+            possession_chase_advantage,
+            defensive_chase_load
         );
         acc!(
             b,
@@ -570,26 +635,93 @@ fn eval(cand_spec: &str, base_spec: &str, games: usize, minutes: f64, holdout: u
             fwd,
             back,
             gain_yards,
+            strict_att,
+            strict_comp,
+            strict_fwd,
+            strict_back,
+            strict_gain_yards,
+            strict_pass_turnovers,
             chains,
             shots_after_pass,
             assists,
             dribble_beats,
+            dribble_turnovers,
             route_one,
             interceptions_won,
-            pass_turnovers
+            pass_turnovers,
+            tackles,
+            loose_ball_recoveries,
+            teamwork_upfield,
+            teamwork_near_ball,
+            possession_chase_advantage,
+            defensive_chase_load
         );
         if let Some(w) = jsonl.as_mut() {
             let _ = writeln!(
                 w,
-                "{{\"seed\":{},\"cand_home\":{},\"c_goals\":{},\"b_goals\":{},\"c_shots\":{},\"b_shots\":{},\"c_sot\":{},\"b_sot\":{},\"c_att\":{},\"b_att\":{},\"c_comp\":{},\"b_comp\":{},\"c_fwd\":{},\"b_fwd\":{},\"c_back\":{},\"b_back\":{},\"c_yards\":{:.3},\"b_yards\":{:.3},\"c_chains\":{},\"b_chains\":{},\"c_sap\":{},\"b_sap\":{},\"c_assist\":{},\"b_assist\":{},\"c_drib\":{},\"b_drib\":{},\"c_route1\":{},\"b_route1\":{},\"c_int\":{},\"b_int\":{},\"c_int_won\":{},\"b_int_won\":{},\"c_pto\":{},\"b_pto\":{}}}",
-                seed, cand_home,
-                cm.goals, bm.goals, cm.shots, bm.shots, cm.sot, bm.sot, cm.att, bm.att,
-                cm.comp, bm.comp, cm.fwd, bm.fwd, cm.back, bm.back, cm.gain_yards, bm.gain_yards,
-                cm.chains, bm.chains, cm.shots_after_pass, bm.shots_after_pass, cm.assists, bm.assists,
-                cm.dribble_beats, bm.dribble_beats, cm.route_one, bm.route_one,
-                cm.interceptions_won, bm.interceptions_won,
-                cm.interceptions_won, bm.interceptions_won,
-                cm.pass_turnovers, bm.pass_turnovers
+                "{}",
+                serde_json::json!({
+                    "seed": seed,
+                    "cand_home": cand_home,
+                    "c_goals": cm.goals,
+                    "b_goals": bm.goals,
+                    "c_shots": cm.shots,
+                    "b_shots": bm.shots,
+                    "c_sot": cm.sot,
+                    "b_sot": bm.sot,
+                    "c_att": cm.att,
+                    "b_att": bm.att,
+                    "c_comp": cm.comp,
+                    "b_comp": bm.comp,
+                    "c_fwd": cm.fwd,
+                    "b_fwd": bm.fwd,
+                    "c_back": cm.back,
+                    "b_back": bm.back,
+                    "c_yards": cm.gain_yards,
+                    "b_yards": bm.gain_yards,
+                    "c_ipatt": cm.strict_att,
+                    "b_ipatt": bm.strict_att,
+                    "c_ipcomp": cm.strict_comp,
+                    "b_ipcomp": bm.strict_comp,
+                    "c_ipfwd": cm.strict_fwd,
+                    "b_ipfwd": bm.strict_fwd,
+                    "c_ipback": cm.strict_back,
+                    "b_ipback": bm.strict_back,
+                    "c_ipyards": cm.strict_gain_yards,
+                    "b_ipyards": bm.strict_gain_yards,
+                    "c_ipto": cm.strict_pass_turnovers,
+                    "b_ipto": bm.strict_pass_turnovers,
+                    "c_chains": cm.chains,
+                    "b_chains": bm.chains,
+                    "c_sap": cm.shots_after_pass,
+                    "b_sap": bm.shots_after_pass,
+                    "c_assist": cm.assists,
+                    "b_assist": bm.assists,
+                    "c_drib": cm.dribble_beats,
+                    "b_drib": bm.dribble_beats,
+                    "c_drib_to": cm.dribble_turnovers,
+                    "b_drib_to": bm.dribble_turnovers,
+                    "c_route1": cm.route_one,
+                    "b_route1": bm.route_one,
+                    "c_int": cm.interceptions_won,
+                    "b_int": bm.interceptions_won,
+                    "c_int_won": cm.interceptions_won,
+                    "b_int_won": bm.interceptions_won,
+                    "c_pto": cm.pass_turnovers,
+                    "b_pto": bm.pass_turnovers,
+                    "c_tackles": cm.tackles,
+                    "b_tackles": bm.tackles,
+                    "c_lbr": cm.loose_ball_recoveries,
+                    "b_lbr": bm.loose_ball_recoveries,
+                    "c_team_up": cm.teamwork_upfield,
+                    "b_team_up": bm.teamwork_upfield,
+                    "c_team_near": cm.teamwork_near_ball,
+                    "b_team_near": bm.teamwork_near_ball,
+                    "c_chase_adv": cm.possession_chase_advantage,
+                    "b_chase_adv": bm.possession_chase_advantage,
+                    "c_def_chase": cm.defensive_chase_load,
+                    "b_def_chase": bm.defensive_chase_load
+                })
             );
             let _ = w.flush(); // durable per-game so killed workers keep data & progress is monitorable
         }
@@ -615,19 +747,30 @@ fn eval(cand_spec: &str, base_spec: &str, games: usize, minutes: f64, holdout: u
     let fwd_stat = paired_stat(&d_fwd);
     let yards_stat = paired_stat(&d_yards);
     let pass_turnover_rate_improvement_stat = paired_stat(&d_pass_turnover_rate_improvement);
+    let strict_fwd_stat = paired_stat(&d_strict_fwd);
+    let strict_net_fwd_stat = paired_stat(&d_strict_net_fwd);
+    let strict_pass_turnover_rate_improvement_stat =
+        paired_stat(&d_strict_pass_turnover_rate_improvement);
     let cand_yards_per_pass = safe_ratio(c.gain_yards, c.comp);
     let base_yards_per_pass = safe_ratio(b.gain_yards, b.comp);
+    let cand_strict_yards_per_pass = safe_ratio(c.strict_gain_yards, c.strict_comp);
+    let base_strict_yards_per_pass = safe_ratio(b.strict_gain_yards, b.strict_comp);
     let yards_per_pass_delta = cand_yards_per_pass - base_yards_per_pass;
     let route_one_delta_pg = (c.route_one - b.route_one) / nf;
     let cand_pass_turnover_rate = safe_ratio(c.pass_turnovers, c.att);
     let base_pass_turnover_rate = safe_ratio(b.pass_turnovers, b.att);
+    let cand_strict_pass_turnover_rate = safe_ratio(c.strict_pass_turnovers, c.strict_att);
+    let base_strict_pass_turnover_rate = safe_ratio(b.strict_pass_turnovers, b.strict_att);
     let pass_turnover_rate_delta = cand_pass_turnover_rate - base_pass_turnover_rate;
+    let strict_pass_turnover_rate_delta =
+        cand_strict_pass_turnover_rate - base_strict_pass_turnover_rate;
     let yards_guard_floor = env_f64("SOCCER_PROOF_MIN_YARDS_PER_PASS_DELTA", -0.25);
     let route_one_guard_max = env_f64("SOCCER_PROOF_MAX_ROUTE_ONE_DELTA_PER_GAME", 0.10);
     let pass_turnover_rate_guard_max = env_f64("SOCCER_PROOF_MAX_PASS_TURNOVER_RATE_DELTA", 0.0);
     let yards_guard_ok = yards_per_pass_delta >= yards_guard_floor;
     let route_one_guard_ok = route_one_delta_pg <= route_one_guard_max;
-    let pass_turnover_guard_ok = pass_turnover_rate_delta <= pass_turnover_rate_guard_max;
+    let strict_pass_turnover_guard_ok =
+        strict_pass_turnover_rate_delta <= pass_turnover_rate_guard_max;
 
     println!("\n===== PASSING PROGRESSION PROOF (candidate − baseline, paired over {n_done} held-out games) =====");
     println!(
@@ -660,31 +803,58 @@ fn eval(cand_spec: &str, base_spec: &str, games: usize, minutes: f64, holdout: u
         pass_turnover_rate_improvement_stat.lb9999 * 100.0,
         pass_turnover_rate_improvement_stat.n
     );
+    println!(
+        "strict FORWARD passes/game:    cand {:.2}  base {:.2}  Δ {:+.2}  [95% LB {:+.2}]  [99.99% LB {:+.2}]  n={}",
+        c.strict_fwd / nf,
+        b.strict_fwd / nf,
+        strict_fwd_stat.mean,
+        strict_fwd_stat.lb95,
+        strict_fwd_stat.lb9999,
+        strict_fwd_stat.n
+    );
+    println!(
+        "strict NET forward/game:       cand {:.2}  base {:.2}  Δ {:+.2}  [95% LB {:+.2}]  [99.99% LB {:+.2}]  n={}",
+        (c.strict_fwd - c.strict_pass_turnovers) / nf,
+        (b.strict_fwd - b.strict_pass_turnovers) / nf,
+        strict_net_fwd_stat.mean,
+        strict_net_fwd_stat.lb95,
+        strict_net_fwd_stat.lb9999,
+        strict_net_fwd_stat.n
+    );
+    println!(
+        "strict pass turnover rate:     cand {:.2}%  base {:.2}%  improvement {:+.2}pp  [95% LB {:+.2}pp]  [99.99% LB {:+.2}pp]  n={}",
+        cand_strict_pass_turnover_rate * 100.0,
+        base_strict_pass_turnover_rate * 100.0,
+        strict_pass_turnover_rate_improvement_stat.mean * 100.0,
+        strict_pass_turnover_rate_improvement_stat.lb95 * 100.0,
+        strict_pass_turnover_rate_improvement_stat.lb9999 * 100.0,
+        strict_pass_turnover_rate_improvement_stat.n
+    );
     let headline = if completion_rate_stat.lb9999 > 0.0
-        && fwd_stat.lb9999 > 0.0
+        && strict_net_fwd_stat.lb9999 > 0.0
         && yards_guard_ok
         && route_one_guard_ok
-        && pass_turnover_guard_ok
+        && strict_pass_turnover_guard_ok
     {
-        "PROVEN@99.99% — pass completion rate and completed forward passes have 99.99% lower bounds above zero, with yards/pass, route-one, and pass-turnover guards intact"
+        "PROVEN@99.99% — pass completion rate and strict net-forward intentional passes have 99.99% lower bounds above zero, with yards/pass, route-one, and strict pass-turnover guards intact"
     } else if completion_rate_stat.lb95 > 0.0
-        && fwd_stat.lb95 > 0.0
+        && strict_net_fwd_stat.lb95 > 0.0
         && yards_guard_ok
         && route_one_guard_ok
-        && pass_turnover_guard_ok
+        && strict_pass_turnover_guard_ok
     {
-        "CLIMB@95% — completion rate and completed forward passes are significant at 95%, with pass-turnover guard intact; need more held-out games for 99.99%"
+        "CLIMB@95% — completion rate and strict net-forward intentional passes are significant at 95%, with strict pass-turnover guard intact; need more held-out games for 99.99%"
     } else if completion_rate_stat.mean > 0.0
-        && fwd_stat.mean > 0.0
+        && strict_net_fwd_stat.mean > 0.0
         && yards_guard_ok
-        && pass_turnover_guard_ok
+        && strict_pass_turnover_guard_ok
     {
-        "directional — completion rate and forward passing improved on average, not yet significant"
-    } else if fwd_stat.lb95 > 0.0 && yards_guard_ok && pass_turnover_guard_ok {
-        "progression-only climb — forward progression is significant, but pass-completion-rate proof is incomplete"
-    } else if !pass_turnover_guard_ok {
-        "anti-gaming guard failed — candidate increased pass turnovers conceded to the opponent"
-    } else if fwd_stat.mean > 0.0 || completion_rate_stat.mean > 0.0 {
+        "directional — completion rate and strict net-forward intentional passing improved on average, not yet significant"
+    } else if strict_net_fwd_stat.lb95 > 0.0 && yards_guard_ok && strict_pass_turnover_guard_ok {
+        "progression-only climb — strict net-forward intentional progression is significant, but pass-completion-rate proof is incomplete"
+    } else if !strict_pass_turnover_guard_ok {
+        "anti-gaming guard failed — candidate increased strict intentional pass-turnover rate"
+    } else if strict_net_fwd_stat.mean > 0.0 || completion_rate_stat.mean > 0.0 {
         "partial directional movement — more held-out games or a better candidate are needed"
     } else {
         "no passing advancement"
@@ -711,12 +881,29 @@ fn eval(cand_spec: &str, base_spec: &str, games: usize, minutes: f64, holdout: u
         b.chains / nf
     );
     println!(
-        "guards: yards/pass delta {:+.2} (floor {:+.2}) route-one delta/g {:+.2} (max {:+.2}) pass-turnover rate delta {:+.2}pp (max {:+.2}pp)",
+        "strict cand: {:.1} att/g  {:.1}% comp  fwd {:.1}%  back {:.1}%  yards/pass {:.2}",
+        c.strict_att / nf,
+        pct(c.strict_comp, c.strict_att),
+        pct(c.strict_fwd, c.strict_comp),
+        pct(c.strict_back, c.strict_comp),
+        cand_strict_yards_per_pass
+    );
+    println!(
+        "strict base: {:.1} att/g  {:.1}% comp  fwd {:.1}%  back {:.1}%  yards/pass {:.2}",
+        b.strict_att / nf,
+        pct(b.strict_comp, b.strict_att),
+        pct(b.strict_fwd, b.strict_comp),
+        pct(b.strict_back, b.strict_comp),
+        base_strict_yards_per_pass
+    );
+    println!(
+        "guards: yards/pass delta {:+.2} (floor {:+.2}) route-one delta/g {:+.2} (max {:+.2}) pass-turnover rate delta {:+.2}pp strict {:+.2}pp (max {:+.2}pp)",
         yards_per_pass_delta,
         yards_guard_floor,
         route_one_delta_pg,
         route_one_guard_max,
         pass_turnover_rate_delta * 100.0,
+        strict_pass_turnover_rate_delta * 100.0,
         pass_turnover_rate_guard_max * 100.0
     );
 
@@ -730,9 +917,21 @@ fn eval(cand_spec: &str, base_spec: &str, games: usize, minutes: f64, holdout: u
     println!("shots:        {:.2} vs {:.2}", c.shots / nf, b.shots / nf);
     println!("shots on tgt: {:.2} vs {:.2}", c.sot / nf, b.sot / nf);
     println!(
+        "SOT rate:     {:.2}% vs {:.2}%   goals/shot {:.2}% vs {:.2}%",
+        safe_ratio(c.sot, c.shots) * 100.0,
+        safe_ratio(b.sot, b.shots) * 100.0,
+        safe_ratio(c.goals, c.shots) * 100.0,
+        safe_ratio(b.goals, b.shots) * 100.0
+    );
+    println!(
         "shots-after-pass: {:.2} vs {:.2}",
         c.shots_after_pass / nf,
         b.shots_after_pass / nf
+    );
+    println!(
+        "worked SOT share:{:.2}% vs {:.2}%",
+        safe_ratio(c.shots_after_pass, c.sot) * 100.0,
+        safe_ratio(b.shots_after_pass, b.sot) * 100.0
     );
     println!(
         "assists:      {:.2} vs {:.2}",
@@ -745,6 +944,13 @@ fn eval(cand_spec: &str, base_spec: &str, games: usize, minutes: f64, holdout: u
         b.dribble_beats / nf
     );
     println!(
+        "dribble contest success:{:.2}% vs {:.2}%   turnovers {:.2} vs {:.2}",
+        safe_ratio(c.dribble_beats, c.dribble_beats + c.dribble_turnovers) * 100.0,
+        safe_ratio(b.dribble_beats, b.dribble_beats + b.dribble_turnovers) * 100.0,
+        c.dribble_turnovers / nf,
+        b.dribble_turnovers / nf
+    );
+    println!(
         "route-one:    {:.2} vs {:.2}   (lower=better; long-ball regression guard)",
         c.route_one / nf,
         b.route_one / nf
@@ -755,9 +961,35 @@ fn eval(cand_spec: &str, base_spec: &str, games: usize, minutes: f64, holdout: u
         b.pass_turnovers / nf
     );
     println!(
+        "strict pass turnovers:{:.2} vs {:.2}   (lower=better; intentional pass interceptions)",
+        c.strict_pass_turnovers / nf,
+        b.strict_pass_turnovers / nf
+    );
+    println!(
         "interceptions won:{:.2} vs {:.2}",
         c.interceptions_won / nf,
         b.interceptions_won / nf
+    );
+    println!(
+        "recoveries/tackles:{:.2}/{:.2} vs {:.2}/{:.2}",
+        c.loose_ball_recoveries / nf,
+        c.tackles / nf,
+        b.loose_ball_recoveries / nf,
+        b.tackles / nf
+    );
+    println!(
+        "teamwork upfield/near-ball:{:.2}/{:.2} vs {:.2}/{:.2}",
+        c.teamwork_upfield / nf,
+        c.teamwork_near_ball / nf,
+        b.teamwork_upfield / nf,
+        b.teamwork_near_ball / nf
+    );
+    println!(
+        "chase advantage/defensive load:{:.2}/{:.2} vs {:.2}/{:.2}",
+        c.possession_chase_advantage / nf,
+        c.defensive_chase_load / nf,
+        b.possession_chase_advantage / nf,
+        b.defensive_chase_load / nf
     );
     println!("\n[eval] done in {:.0}s", started.elapsed().as_secs_f64());
 }
