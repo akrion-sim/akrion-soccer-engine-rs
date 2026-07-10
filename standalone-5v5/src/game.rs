@@ -633,10 +633,16 @@ impl World {
                 self.reset_a_pass_memory();
             }
         } else if let Some(o) = self.owner {
-            // carry: ball glued just ahead of the owner in their attack direction.
+            // carry: normally glued just ahead; but if a defender is close, SHIELD
+            // the ball — hold it on the far side of the body from the defender.
             let p = self.player(o);
-            let ahead = V2::new(o.team.sx(), 0.0).scale(0.8);
-            self.ball = p.pos.add(ahead);
+            let (oi, od) = self.nearest_opponent(o.team, p.pos);
+            let offset = if od < 3.0 {
+                p.pos.sub(players(o.team.other(), self)[oi].pos).unit().scale(0.8)
+            } else {
+                V2::new(o.team.sx(), 0.0).scale(0.8)
+            };
+            self.ball = p.pos.add(offset);
             self.ball_vel = p.vel;
         }
 
