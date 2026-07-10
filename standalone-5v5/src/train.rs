@@ -273,13 +273,16 @@ pub fn ent_beta_at(iter: usize, total: usize) -> f32 {
 }
 
 /// Evaluate greedy policy vs scripted over `games`. Returns
-/// (avg_goal_diff, win_rate, avg_goals_a, avg_goals_b, avg_completed_passes_a).
-pub fn evaluate(policy: &Policy, games: usize, rng: &mut Rng) -> (f32, f32, f32, f32, f32) {
+/// (avg_goal_diff, win_rate, avg_goals_a, avg_goals_b, avg_completed_passes_a,
+///  avg_nearest_teammate_dist_during_A_possession).
+pub fn evaluate(policy: &Policy, games: usize, rng: &mut Rng) -> (f32, f32, f32, f32, f32, f32) {
     let mut diff = 0.0f32;
     let mut wins = 0.0f32;
     let mut ga = 0.0f32;
     let mut gb = 0.0f32;
     let mut passes = 0.0f32;
+    let mut space_sum = 0.0f32;
+    let mut space_ticks = 0.0f32;
     for _ in 0..games {
         let mut w = World::new();
         if rng.f01() < 0.5 {
@@ -297,6 +300,10 @@ pub fn evaluate(policy: &Policy, games: usize, rng: &mut Rng) -> (f32, f32, f32,
             if w.ev_pass_completed_a {
                 passes += 1.0;
             }
+            if matches!(w.owner, Some(o) if matches!(o.team, Team::A)) {
+                space_sum += w.avg_nearest_teammate_a();
+                space_ticks += 1.0;
+            }
         }
         let d = w.goals_a as f32 - w.goals_b as f32;
         diff += d;
@@ -309,7 +316,8 @@ pub fn evaluate(policy: &Policy, games: usize, rng: &mut Rng) -> (f32, f32, f32,
         }
     }
     let g = games.max(1) as f32;
-    (diff / g, wins / g, ga / g, gb / g, passes / g)
+    let spacing = if space_ticks > 0.0 { space_sum / space_ticks } else { 0.0 };
+    (diff / g, wins / g, ga / g, gb / g, passes / g, spacing)
 }
 
 /// Baseline sanity check: scripted-vs-scripted goal difference (should be ~0).
