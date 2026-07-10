@@ -3342,6 +3342,91 @@ fn pass_receiver_descriptor_reads_progression_and_kind() {
         fwd, space,
         "teammate vs open-space target at the same point must decode to different kinds"
     );
+    assert_eq!(
+        ReceiverDescriptor::kind_from_encoded(fwd),
+        Some(ReceiverKind::Teammate)
+    );
+    assert_eq!(
+        ReceiverDescriptor::kind_from_encoded(space),
+        Some(ReceiverKind::Space)
+    );
+    assert_eq!(ReceiverDescriptor::kind_from_encoded(-1), None);
+}
+
+#[test]
+fn q_policy_target_grid_lookup_can_filter_space_receiver_kind() {
+    // The pass-space option must not pick the generic best target grid if that value belongs to a
+    // teammate descriptor. It needs the best Space descriptor so learned same-team run-onto passes
+    // can be offered instead of dying at no_space_receiver_value.
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 9_144,
+        ..Default::default()
+    });
+    let passer = 7;
+    let receiver = 9;
+    sim.ball.holder = Some(passer);
+    sim.players[passer].team = Team::Home;
+    sim.players[passer].role = PlayerRole::Midfielder;
+    sim.players[passer].position = Vec2::new(40.0, 50.0);
+    sim.players[receiver].team = Team::Home;
+    sim.players[receiver].role = PlayerRole::Forward;
+    sim.players[receiver].position = Vec2::new(38.0, 64.0);
+    sim.ball.position = sim.players[passer].position;
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let state = SoccerQStateKey::from_parts(
+        &snapshot.mdp_state_for_player(passer),
+        &snapshot.observation_for(passer),
+        Team::Home,
+        sim.players[passer].role,
+    );
+    let teammate_point = sim.players[receiver].position;
+    let space_point = Vec2::new(40.0, 72.0);
+    let teammate_grid =
+        pitch_grid_address(teammate_point, snapshot.field_width, snapshot.field_length);
+    let space_grid = pitch_grid_address(space_point, snapshot.field_width, snapshot.field_length);
+    let teammate_descriptor = snapshot.pass_receiver_descriptor(
+        passer,
+        ReceiverKind::Teammate,
+        teammate_point,
+        Some(sim.players[receiver].role),
+    );
+    let space_descriptor =
+        snapshot.pass_receiver_descriptor(passer, ReceiverKind::Space, space_point, None);
+    let mut policy = SoccerQPolicy::default();
+    assert!(policy.set_target_value_with_receiver(
+        state.clone(),
+        "pass",
+        teammate_grid,
+        teammate_descriptor,
+        5.0,
+    ));
+    assert!(policy.set_target_value_with_receiver(
+        state.clone(),
+        "pass",
+        space_grid,
+        space_descriptor,
+        3.0,
+    ));
+
+    let generic = policy
+        .best_target_grid_for_state_action(&state, "pass")
+        .expect("generic best target");
+    assert_eq!(generic.target_fine_cell_id, teammate_grid.fine.id);
+    assert_eq!(
+        ReceiverDescriptor::kind_from_encoded(generic.receiver_descriptor),
+        Some(ReceiverKind::Teammate)
+    );
+
+    let space_only = policy
+        .best_target_grid_for_state_action_receiver_kind(&state, "pass", ReceiverKind::Space)
+        .expect("space-kind target");
+    assert_eq!(space_only.target_fine_cell_id, space_grid.fine.id);
+    assert_eq!(
+        ReceiverDescriptor::kind_from_encoded(space_only.receiver_descriptor),
+        Some(ReceiverKind::Space)
+    );
 }
 
 #[test]
@@ -6756,6 +6841,172 @@ fn occluded_floor_pass_lane_drops_behind_clean_outlet() {
             "clean outlet must outrank the occluded lane: ranked={ranked:?}"
         );
     }
+}
+
+#[test]
+fn long_forward_release_guard_blocks_low_quality_floor_and_degraded_killer_aerial() {
+    let good_long_floor = PassTargetQuality {
+        expected_completion: 0.72,
+        lane_interception_risk: 0.12,
+        mpc_receipt_probability: 0.66,
+        ..Default::default()
+    };
+    assert!(
+        !long_forward_pass_release_guard_fails(
+            false,
+            PassFlight::Floor,
+            29.0,
+            31.0,
+            0.0,
+            good_long_floor
+        ),
+        "a genuinely safe completed-forward candidate should stay legal"
+    );
+
+    let low_completion_floor = PassTargetQuality {
+        expected_completion: 0.55,
+        lane_interception_risk: 0.12,
+        mpc_receipt_probability: 0.66,
+        ..Default::default()
+    };
+    assert!(long_forward_pass_release_guard_fails(
+        false,
+        PassFlight::Floor,
+        29.0,
+        31.0,
+        0.0,
+        low_completion_floor
+    ));
+    assert!(
+        !long_forward_pass_release_guard_fails(
+            false,
+            PassFlight::Floor,
+            10.0,
+            14.0,
+            0.0,
+            low_completion_floor
+        ),
+        "a short pass below the medium-forward window keeps the old release envelope"
+    );
+    assert!(
+        long_forward_pass_release_guard_fails(
+            false,
+            PassFlight::Floor,
+            20.0,
+            22.0,
+            0.0,
+            low_completion_floor
+        ),
+        "medium-forward floor passes now need enough completion quality"
+    );
+    assert!(
+        long_forward_pass_release_guard_fails(
+            false,
+            PassFlight::Floor,
+            15.0,
+            16.0,
+            9.0,
+            low_completion_floor
+        ),
+        "a led medium floor pass needs enough completion quality even below 18 yards"
+    );
+    assert!(
+        long_forward_pass_release_guard_fails(
+            false,
+            PassFlight::Floor,
+            12.0,
+            31.0,
+            0.0,
+            low_completion_floor
+        ),
+        "a 25+ yard diagonal floor pass still needs long-pass completion quality"
+    );
+
+    let risky_lane_floor = PassTargetQuality {
+        expected_completion: 0.72,
+        lane_interception_risk: 0.42,
+        mpc_receipt_probability: 0.66,
+        ..Default::default()
+    };
+    assert!(long_forward_pass_release_guard_fails(
+        false,
+        PassFlight::Floor,
+        29.0,
+        31.0,
+        0.0,
+        risky_lane_floor
+    ));
+
+    let good_aerial = PassTargetQuality {
+        expected_completion: 0.72,
+        lane_interception_risk: 0.12,
+        mpc_receipt_probability: 0.66,
+        ..Default::default()
+    };
+    assert!(
+        !long_forward_pass_release_guard_fails(
+            false,
+            PassFlight::Aerial,
+            18.0,
+            24.0,
+            9.0,
+            good_aerial
+        ),
+        "a high-quality ordinary aerial progression should stay legal"
+    );
+
+    let degraded_killer_aerial = PassTargetQuality {
+        expected_completion: 0.49,
+        lane_interception_risk: 0.18,
+        mpc_receipt_probability: 0.58,
+        ..Default::default()
+    };
+    assert!(long_forward_pass_release_guard_fails(
+        true,
+        PassFlight::Aerial,
+        31.0,
+        31.0,
+        0.0,
+        degraded_killer_aerial
+    ));
+    assert!(long_forward_pass_release_guard_fails(
+        true,
+        PassFlight::OverTop,
+        18.0,
+        31.0,
+        0.0,
+        degraded_killer_aerial
+    ));
+    assert!(long_forward_pass_release_guard_fails(
+        false,
+        PassFlight::Aerial,
+        18.0,
+        24.0,
+        9.0,
+        degraded_killer_aerial
+    ));
+    assert!(
+        long_forward_pass_release_guard_fails(
+            false,
+            PassFlight::Aerial,
+            31.0,
+            31.0,
+            0.0,
+            degraded_killer_aerial
+        ),
+        "ordinary long aerial progressions also need enough release quality"
+    );
+    assert!(
+        !long_forward_pass_release_guard_fails(
+            true,
+            PassFlight::Scoop,
+            31.0,
+            31.0,
+            0.0,
+            degraded_killer_aerial
+        ),
+        "scoop/over-top variants keep their dedicated viability gates"
+    );
 }
 
 #[test]
@@ -11063,6 +11314,92 @@ fn completed_forward_pass_count_bonus_rewards_actual_forward_reception() {
     assert_eq!(too_short, 0.0);
     assert_eq!(lateral, 0.0);
     assert_eq!(backward, 0.0);
+}
+
+#[test]
+fn sparse_pass_reward_only_credits_same_team_forward_completions() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 11_053,
+        ..Default::default()
+    });
+    let passer = 6;
+    let teammate = 9;
+    let opponent = 16;
+    let origin = Vec2::new(40.0, 60.0);
+    sim.players[passer].position = origin;
+    sim.players[passer].home_position = origin;
+    sim.players[teammate].position = Vec2::new(40.0, 74.0);
+    sim.players[opponent].position = Vec2::new(40.0, 74.0);
+    sim.ball.holder = Some(passer);
+    sim.ball.position = origin;
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.last_touch_team = Some(Team::Home);
+    let before = WorldSnapshot::from_match(&sim);
+
+    let after_with_holder = |holder: usize, position: Vec2| {
+        let mut after = before.clone();
+        after.ball.holder = Some(holder);
+        after.ball.position = position;
+        after.ball.last_touch_team = after
+            .players
+            .iter()
+            .find(|player| player.id == holder)
+            .map(|player| player.team);
+        after.set_player_position(holder, position);
+        after
+    };
+    let reward_for = |after: &WorldSnapshot, target_player: Option<usize>, point: Vec2| {
+        let mut decision = test_decision_trace(&before, passer, "pass");
+        decision.action_target = Some(AgentActionTargetTrace {
+            point: Some(point),
+            player_id: target_player,
+            grid: Some(pitch_grid_address(
+                point,
+                before.field_width,
+                before.field_length,
+            )),
+            facing: facing_bucket_from_vector(point - origin),
+            dribble_touch: None,
+            receiver_descriptor: None,
+        });
+        decision.observation.expected_pass_completion = 0.84;
+        decision.observation.best_pass_receiver_openness = 0.82;
+        decision.observation.floor_pass_lane_score = 0.86;
+        soccer_transition_reward(
+            &sim.players[passer],
+            &decision,
+            &before,
+            after,
+            0,
+            0,
+            0,
+            0,
+            true,
+        )
+    };
+
+    let forward_point = Vec2::new(40.0, 74.0);
+    let lateral_point = Vec2::new(52.0, 60.0);
+    let same_forward = after_with_holder(teammate, forward_point);
+    let same_lateral = after_with_holder(teammate, lateral_point);
+    let opponent_forward = after_with_holder(opponent, forward_point);
+
+    assert!(completed_same_team_pass_receiver(&sim.players[passer], &same_forward).is_some());
+    assert!(completed_same_team_pass_receiver(&sim.players[passer], &opponent_forward).is_none());
+
+    let same_forward_reward = reward_for(&same_forward, Some(teammate), forward_point);
+    let same_lateral_reward = reward_for(&same_lateral, Some(teammate), lateral_point);
+    let opponent_reward = reward_for(&opponent_forward, Some(teammate), forward_point);
+
+    assert!(
+        same_forward_reward > same_lateral_reward + COMPLETED_FORWARD_PASS_COUNT_BONUS_POINTS,
+        "same-team forward completion must beat lateral completion: forward={same_forward_reward} lateral={same_lateral_reward}"
+    );
+    assert!(
+        opponent_reward < 0.0 && same_forward_reward > opponent_reward + 12.0,
+        "opponent-controlled pass must be a turnover, not a completion: forward={same_forward_reward} opponent={opponent_reward}"
+    );
 }
 
 #[test]

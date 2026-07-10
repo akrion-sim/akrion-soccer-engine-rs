@@ -25,11 +25,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use soccer_engine::des::general::soccer::{
-    enable_deterministic_formation_lp, learned_mpc_objective_enabled, MatchConfig,
-    SoccerMarlAlgorithm, SoccerMatch, SoccerMpcObjectiveHead, SoccerNeuralLearningBackend,
-    SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot, SoccerPassCompletionHead,
-    SoccerQPolicyOptions, SoccerTeamQPolicies, DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
-    PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS,
+    enable_deterministic_formation_lp, learned_mpc_objective_enabled, AttackSpacingHead,
+    MatchConfig, SoccerMarlAlgorithm, SoccerMatch, SoccerMpcObjectiveHead,
+    SoccerNeuralLearningBackend, SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot,
+    SoccerPassCompletionHead, SoccerQPolicyOptions, SoccerTeamQPolicies, SupportScorerHead,
+    ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS, DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
+    PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS, SUPPORT_SCORER_HEAD_MIN_TRAINING_STEPS,
 };
 
 /// One game's measured offense KPIs (both teams summed — self-play is symmetric).
@@ -283,6 +284,8 @@ fn main() {
     let mut policies = Arc::new(SoccerTeamQPolicies::new(SoccerQPolicyOptions::default()));
     let mut snapshot: Option<SoccerNeuralNetworkSnapshot> = None;
     let mut pass_completion_head: Option<SoccerPassCompletionHead> = None;
+    let mut attack_spacing_head: Option<AttackSpacingHead> = None;
+    let mut support_scorer_head: Option<SupportScorerHead> = None;
     // Learned MPC execution-objective head, carried + RWR-trained across games (mirrors the
     // pass-completion head's per-process carry). Seeded up-front when the gate is on so game 1
     // already captures cold-exploration samples (the head must exist for the residual to apply);
@@ -323,6 +326,12 @@ fn main() {
         // (gated; a no-op only when DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE is falsey).
         if let Some(head) = mpc_objective_head.as_ref() {
             sim.set_mpc_objective_head(head.clone());
+        }
+        if let Some(head) = attack_spacing_head.as_ref() {
+            sim.set_attack_spacing_head(head.clone());
+        }
+        if let Some(head) = support_scorer_head.as_ref() {
+            sim.set_support_scorer_head(head.clone());
         }
 
         let mut game_dribble_decision_ticks = 0_u64;
@@ -378,6 +387,42 @@ fn main() {
                 mpc_samples.len(),
                 epochs,
                 trained_steps
+            );
+        }
+
+        let attack_spacing_samples = sim.drain_attack_spacing_samples();
+        if !attack_spacing_samples.is_empty() {
+            let head = attack_spacing_head
+                .get_or_insert_with(|| AttackSpacingHead::new(seed_base.wrapping_add(g as u32)));
+            let mut final_loss = 0.0;
+            for _ in 0..4 {
+                final_loss = head.train(&attack_spacing_samples, 0.02);
+            }
+            eprintln!(
+                "attack_spacing_training game={} samples={} training_steps={} consumed={} final_loss={:.5}",
+                g + 1,
+                attack_spacing_samples.len(),
+                head.training_steps(),
+                head.training_steps() >= ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS,
+                final_loss
+            );
+        }
+
+        let support_move_samples = sim.drain_support_move_samples();
+        if !support_move_samples.is_empty() {
+            let head = support_scorer_head
+                .get_or_insert_with(|| SupportScorerHead::new(seed_base.wrapping_add(g as u32)));
+            let mut final_loss = 0.0;
+            for _ in 0..4 {
+                final_loss = head.train(&support_move_samples, 0.02);
+            }
+            eprintln!(
+                "support_scorer_training game={} samples={} training_steps={} consumed={} final_loss={:.5}",
+                g + 1,
+                support_move_samples.len(),
+                head.training_steps(),
+                head.training_steps() >= SUPPORT_SCORER_HEAD_MIN_TRAINING_STEPS,
+                final_loss
             );
         }
 

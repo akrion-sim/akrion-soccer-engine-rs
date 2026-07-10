@@ -200,8 +200,13 @@ def add_totals(total: Dict[str, float], row: Dict[str, object], prefix: str) -> 
         "drib",
         "route1",
         "int",
+        "int_won",
+        "pto",
     ):
-        total[key] += f(row, f"{prefix}_{key}")
+        if key == "int_won" and f"{prefix}_int_won" not in row:
+            total[key] += f(row, f"{prefix}_int")
+        else:
+            total[key] += f(row, f"{prefix}_{key}")
 
 
 def fmt_metric(label: str, stat: Stat, scale: float = 1.0, unit: str = "") -> str:
@@ -221,24 +226,47 @@ def verdict_for(
     completion_rate: Stat,
     yards_per_pass: Stat,
     route_one: Stat,
+    pass_turnover_rate_improvement: Stat,
+    proof_rows: int,
 ) -> str:
     yards_not_collapsed = yards_per_pass.bootstrap_lb95 > -0.25
     route_one_not_rising = route_one.mean <= 0.10
-    if fwd.support_9999() and completion_rate.support_9999() and yards_not_collapsed and route_one_not_rising:
+    pass_turnovers_available = pass_turnover_rate_improvement.n == proof_rows
+    pass_turnovers_not_rising = (
+        pass_turnovers_available
+        and pass_turnover_rate_improvement.mean >= 0.0
+    )
+    if (
+        fwd.support_9999()
+        and completion_rate.support_9999()
+        and yards_not_collapsed
+        and route_one_not_rising
+        and pass_turnovers_not_rising
+    ):
         return (
             "PROVEN@99.99% - completed forward passes and pass completion rate "
-            "both pass normal+bootstrap+sign-test, with yards/pass and route-one guards intact"
+            "both pass normal+bootstrap+sign-test, with yards/pass, route-one, and pass-turnover guards intact"
         )
-    if fwd.support_9999() and completion_rate.mean >= 0.0 and yards_not_collapsed and route_one_not_rising:
+    if (
+        fwd.support_9999()
+        and completion_rate.mean >= 0.0
+        and yards_not_collapsed
+        and route_one_not_rising
+        and pass_turnovers_not_rising
+    ):
         return (
             "FORWARD-PASS-PROVEN@99.99% - forward passing passes triple-stat proof, "
-            "but pass-completion-rate proof is not independently positive"
+            "with pass-turnover guard intact, but pass-completion-rate proof is not independently positive"
         )
-    if fwd.support_95() and completion_rate.normal_lb95 >= 0.0 and yards_not_collapsed:
+    if fwd.support_95() and completion_rate.normal_lb95 >= 0.0 and yards_not_collapsed and pass_turnovers_not_rising:
         return (
             "CLIMB@95% - forward passing is statistically positive and completion "
-            "does not regress at 95%; more held-out games or a stronger candidate needed for 99.99%"
+            "does not regress at 95%, with pass-turnover guard intact; more held-out games or a stronger candidate needed for 99.99%"
         )
+    if not pass_turnovers_available:
+        return "anti-gaming guard unavailable - rerun eval so every row has c_pto/b_pto JSONL fields"
+    if not pass_turnovers_not_rising:
+        return "anti-gaming guard failed - candidate increased pass-turnover rate"
     if fwd.mean > 0.0 or completion_rate.mean > 0.0:
         return "directional only - movement exists but proof gates do not clear"
     return "no passing advancement"
@@ -255,6 +283,7 @@ def main() -> int:
     d_yards: List[float] = []
     d_yards_per_pass: List[float] = []
     d_route_one: List[float] = []
+    d_pass_turnover_rate_improvement: List[float] = []
     d_goals: List[float] = []
     d_sot: List[float] = []
     d_drib: List[float] = []
@@ -275,6 +304,8 @@ def main() -> int:
             "drib",
             "route1",
             "int",
+            "int_won",
+            "pto",
         )
     }
     base = cand.copy()
@@ -296,6 +327,9 @@ def main() -> int:
         b_yards = f(row, "b_yards")
         c_route = f(row, "c_route1")
         b_route = f(row, "b_route1")
+        has_pto = "c_pto" in row and "b_pto" in row
+        c_pto = f(row, "c_pto") if has_pto else 0.0
+        b_pto = f(row, "b_pto") if has_pto else 0.0
 
         d_completed.append(c_comp - b_comp)
         d_completion_rate.append(safe_ratio(c_comp, c_att) - safe_ratio(b_comp, b_att))
@@ -304,6 +338,10 @@ def main() -> int:
         d_yards.append(c_yards - b_yards)
         d_yards_per_pass.append(safe_ratio(c_yards, c_comp) - safe_ratio(b_yards, b_comp))
         d_route_one.append(c_route - b_route)
+        if has_pto:
+            d_pass_turnover_rate_improvement.append(
+                safe_ratio(b_pto, b_att) - safe_ratio(c_pto, c_att)
+            )
         d_goals.append(f(row, "c_goals") - f(row, "b_goals"))
         d_sot.append(f(row, "c_sot") - f(row, "b_sot"))
         d_drib.append(f(row, "c_drib") - f(row, "b_drib"))
@@ -323,9 +361,10 @@ def main() -> int:
         "yards": paired_stat(d_yards, 5),
         "yards_per_pass": paired_stat(d_yards_per_pass, 6),
         "route_one": paired_stat(d_route_one, 7),
-        "goals": paired_stat(d_goals, 8),
-        "sot": paired_stat(d_sot, 9),
-        "drib": paired_stat(d_drib, 10),
+        "pass_turnover_rate_improvement": paired_stat(d_pass_turnover_rate_improvement, 8),
+        "goals": paired_stat(d_goals, 9),
+        "sot": paired_stat(d_sot, 10),
+        "drib": paired_stat(d_drib, 11),
     }
     nf = float(rows)
 
@@ -378,6 +417,28 @@ def main() -> int:
         f"base {base['route1'] / nf:.2f}  (lower is better)"
     )
     print(fmt_metric("route-one/game", stats["route_one"]))
+    if stats["pass_turnover_rate_improvement"].n == rows:
+        print(
+            f"pass turnovers/game:           cand {cand['pto'] / nf:.2f}  "
+            f"base {base['pto'] / nf:.2f}  (lower is better)"
+        )
+        print(
+            f"pass turnover rate:            cand {pct(cand['pto'], cand['att']):.2f}%  "
+            f"base {pct(base['pto'], base['att']):.2f}%"
+        )
+        print(
+            fmt_metric(
+                "pass turnover rate improvement",
+                stats["pass_turnover_rate_improvement"],
+                100.0,
+                "pp",
+            )
+        )
+    else:
+        print(
+            "pass turnovers/game:           unavailable "
+            f"({stats['pass_turnover_rate_improvement'].n}/{rows} rows have c_pto/b_pto)"
+        )
 
     print("\n----- secondary guardrails -----")
     print(fmt_metric("goals/game", stats["goals"]))
@@ -387,7 +448,7 @@ def main() -> int:
         f"shots:        {cand['shots'] / nf:.2f} vs {base['shots'] / nf:.2f} | "
         f"shots-after-pass: {cand['sap'] / nf:.2f} vs {base['sap'] / nf:.2f} | "
         f"assists: {cand['assist'] / nf:.2f} vs {base['assist'] / nf:.2f} | "
-        f"interceptions: {cand['int'] / nf:.2f} vs {base['int'] / nf:.2f}"
+        f"interceptions won: {cand['int_won'] / nf:.2f} vs {base['int_won'] / nf:.2f}"
     )
 
     print(
@@ -397,6 +458,8 @@ def main() -> int:
             stats["completion_rate"],
             stats["yards_per_pass"],
             stats["route_one"],
+            stats["pass_turnover_rate_improvement"],
+            rows,
         )
     )
     return 0

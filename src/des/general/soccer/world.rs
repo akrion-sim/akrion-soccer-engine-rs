@@ -72,6 +72,163 @@ const KILLER_PASS_LONG_DISTANCE_YARDS: f64 = 25.0;
 const KILLER_PASS_IMMEDIATE_GOAL_WINDOW_YARDS: f64 = 18.0;
 const KILLER_PASS_MEDIUM_MIN_COMPLETION: f64 = 0.40;
 const KILLER_PASS_LONG_MIN_COMPLETION: f64 = 0.54;
+const LONG_FORWARD_RELEASE_GUARD_MIN_FORWARD_YARDS: f64 = 25.0;
+const LONG_FLOOR_RELEASE_GUARD_MIN_DISTANCE_YARDS: f64 = 25.0;
+const LONG_FLOOR_RELEASE_GUARD_MIN_FORWARD_YARDS: f64 = 1.0;
+const LONG_FORWARD_FLOOR_RELEASE_MIN_COMPLETION: f64 = 0.62;
+const LONG_FORWARD_FLOOR_RELEASE_MAX_LANE_RISK: f64 = 0.30;
+const LONG_FORWARD_FLOOR_RELEASE_MIN_RECEIPT: f64 = 0.50;
+const LONG_DIAGONAL_FLOOR_RELEASE_MIN_COMPLETION: f64 = 0.70;
+const LONG_DIAGONAL_FLOOR_RELEASE_MAX_LANE_RISK: f64 = 0.24;
+const LONG_DIAGONAL_FLOOR_RELEASE_MIN_RECEIPT: f64 = 0.58;
+const MEDIUM_FORWARD_FLOOR_RELEASE_GUARD_MIN_DISTANCE_YARDS: f64 = 18.0;
+const MEDIUM_FORWARD_FLOOR_RELEASE_GUARD_MIN_FORWARD_YARDS: f64 = 12.0;
+const MEDIUM_LEAD_FLOOR_RELEASE_GUARD_MIN_DISTANCE_YARDS: f64 = 10.0;
+const MEDIUM_LEAD_FLOOR_RELEASE_GUARD_MIN_FORWARD_YARDS: f64 = 8.0;
+const MEDIUM_LEAD_FLOOR_RELEASE_GUARD_MIN_LEAD_YARDS: f64 = 8.0;
+const MEDIUM_FORWARD_FLOOR_RELEASE_MIN_COMPLETION: f64 = 0.66;
+const MEDIUM_FORWARD_FLOOR_RELEASE_MAX_LANE_RISK: f64 = 0.28;
+const MEDIUM_FORWARD_FLOOR_RELEASE_MIN_RECEIPT: f64 = 0.54;
+const MEDIUM_LEAD_FLOOR_RELEASE_MIN_COMPLETION: f64 = 0.68;
+const MEDIUM_LEAD_FLOOR_RELEASE_MAX_LANE_RISK: f64 = 0.26;
+const MEDIUM_LEAD_FLOOR_RELEASE_MIN_RECEIPT: f64 = 0.56;
+const LONG_FORWARD_KILLER_AERIAL_RELEASE_MAX_LANE_RISK: f64 = 0.32;
+const AERIAL_RELEASE_GUARD_MIN_DISTANCE_YARDS: f64 = 18.0;
+const AERIAL_RELEASE_GUARD_MIN_FORWARD_YARDS: f64 = 5.0;
+const AERIAL_LEAD_RELEASE_GUARD_MIN_DISTANCE_YARDS: f64 = 10.0;
+const AERIAL_LEAD_RELEASE_GUARD_MIN_FORWARD_YARDS: f64 = 5.0;
+const AERIAL_LEAD_RELEASE_GUARD_MIN_LEAD_YARDS: f64 = 8.0;
+const AERIAL_RELEASE_MIN_COMPLETION: f64 = 0.62;
+const AERIAL_RELEASE_MAX_LANE_RISK: f64 = 0.34;
+const AERIAL_RELEASE_MIN_RECEIPT: f64 = 0.54;
+const AERIAL_LEAD_RELEASE_MIN_COMPLETION: f64 = 0.66;
+const AERIAL_LEAD_RELEASE_MAX_LANE_RISK: f64 = 0.30;
+const AERIAL_LEAD_RELEASE_MIN_RECEIPT: f64 = 0.58;
+
+pub(crate) fn long_forward_pass_release_guard_fails(
+    is_killer_pass: bool,
+    flight: PassFlight,
+    forward_yards: f64,
+    distance_yards: f64,
+    target_receiver_distance_yards: f64,
+    quality: PassTargetQuality,
+) -> bool {
+    let deep_forward = forward_yards >= LONG_FORWARD_RELEASE_GUARD_MIN_FORWARD_YARDS;
+    let long_floor_progression = flight == PassFlight::Floor
+        && distance_yards >= LONG_FLOOR_RELEASE_GUARD_MIN_DISTANCE_YARDS
+        && forward_yards >= LONG_FLOOR_RELEASE_GUARD_MIN_FORWARD_YARDS;
+    let medium_forward_floor = flight == PassFlight::Floor
+        && distance_yards >= MEDIUM_FORWARD_FLOOR_RELEASE_GUARD_MIN_DISTANCE_YARDS
+        && forward_yards >= MEDIUM_FORWARD_FLOOR_RELEASE_GUARD_MIN_FORWARD_YARDS;
+    let medium_lead_floor = flight == PassFlight::Floor
+        && distance_yards >= MEDIUM_LEAD_FLOOR_RELEASE_GUARD_MIN_DISTANCE_YARDS
+        && forward_yards >= MEDIUM_LEAD_FLOOR_RELEASE_GUARD_MIN_FORWARD_YARDS
+        && target_receiver_distance_yards >= MEDIUM_LEAD_FLOOR_RELEASE_GUARD_MIN_LEAD_YARDS;
+    let aerial_progression = flight == PassFlight::Aerial
+        && distance_yards >= AERIAL_RELEASE_GUARD_MIN_DISTANCE_YARDS
+        && forward_yards >= AERIAL_RELEASE_GUARD_MIN_FORWARD_YARDS;
+    let aerial_lead_progression = flight == PassFlight::Aerial
+        && distance_yards >= AERIAL_LEAD_RELEASE_GUARD_MIN_DISTANCE_YARDS
+        && forward_yards >= AERIAL_LEAD_RELEASE_GUARD_MIN_FORWARD_YARDS
+        && target_receiver_distance_yards >= AERIAL_LEAD_RELEASE_GUARD_MIN_LEAD_YARDS;
+    let long_killer_lift = is_killer_pass
+        && matches!(flight, PassFlight::Aerial | PassFlight::OverTop)
+        && distance_yards >= KILLER_PASS_LONG_DISTANCE_YARDS
+        && forward_yards >= 8.0;
+    if !deep_forward
+        && !long_floor_progression
+        && !medium_forward_floor
+        && !medium_lead_floor
+        && !aerial_progression
+        && !aerial_lead_progression
+        && !long_killer_lift
+    {
+        return false;
+    }
+    match flight {
+        PassFlight::Floor => {
+            let diagonal_long = long_floor_progression && !deep_forward;
+            let min_completion = if diagonal_long {
+                LONG_DIAGONAL_FLOOR_RELEASE_MIN_COMPLETION
+            } else if medium_lead_floor {
+                MEDIUM_LEAD_FLOOR_RELEASE_MIN_COMPLETION
+            } else if medium_forward_floor {
+                MEDIUM_FORWARD_FLOOR_RELEASE_MIN_COMPLETION
+            } else {
+                LONG_FORWARD_FLOOR_RELEASE_MIN_COMPLETION
+            };
+            let max_lane_risk = if diagonal_long {
+                LONG_DIAGONAL_FLOOR_RELEASE_MAX_LANE_RISK
+            } else if medium_lead_floor {
+                MEDIUM_LEAD_FLOOR_RELEASE_MAX_LANE_RISK
+            } else if medium_forward_floor {
+                MEDIUM_FORWARD_FLOOR_RELEASE_MAX_LANE_RISK
+            } else {
+                LONG_FORWARD_FLOOR_RELEASE_MAX_LANE_RISK
+            };
+            let min_receipt = if diagonal_long {
+                LONG_DIAGONAL_FLOOR_RELEASE_MIN_RECEIPT
+            } else if medium_lead_floor {
+                MEDIUM_LEAD_FLOOR_RELEASE_MIN_RECEIPT
+            } else if medium_forward_floor {
+                MEDIUM_FORWARD_FLOOR_RELEASE_MIN_RECEIPT
+            } else {
+                LONG_FORWARD_FLOOR_RELEASE_MIN_RECEIPT
+            };
+            quality.expected_completion < min_completion
+                || quality.lane_interception_risk > max_lane_risk
+                || quality.mpc_receipt_probability < min_receipt
+        }
+        PassFlight::Aerial | PassFlight::OverTop if is_killer_pass => {
+            let min_completion = if matches!(flight, PassFlight::Aerial) && aerial_lead_progression
+            {
+                AERIAL_LEAD_RELEASE_MIN_COMPLETION
+            } else if matches!(flight, PassFlight::Aerial) && aerial_progression {
+                AERIAL_RELEASE_MIN_COMPLETION
+            } else {
+                KILLER_PASS_LONG_MIN_COMPLETION
+            };
+            let max_lane_risk = if matches!(flight, PassFlight::Aerial) && aerial_lead_progression {
+                AERIAL_LEAD_RELEASE_MAX_LANE_RISK
+            } else if matches!(flight, PassFlight::Aerial) && aerial_progression {
+                AERIAL_RELEASE_MAX_LANE_RISK
+            } else {
+                LONG_FORWARD_KILLER_AERIAL_RELEASE_MAX_LANE_RISK
+            };
+            let min_receipt = if matches!(flight, PassFlight::Aerial) && aerial_lead_progression {
+                AERIAL_LEAD_RELEASE_MIN_RECEIPT
+            } else if matches!(flight, PassFlight::Aerial) && aerial_progression {
+                AERIAL_RELEASE_MIN_RECEIPT
+            } else {
+                0.0
+            };
+            quality.expected_completion < min_completion
+                || quality.lane_interception_risk > max_lane_risk
+                || quality.mpc_receipt_probability < min_receipt
+        }
+        PassFlight::Aerial => {
+            let min_completion = if aerial_lead_progression {
+                AERIAL_LEAD_RELEASE_MIN_COMPLETION
+            } else {
+                AERIAL_RELEASE_MIN_COMPLETION
+            };
+            let max_lane_risk = if aerial_lead_progression {
+                AERIAL_LEAD_RELEASE_MAX_LANE_RISK
+            } else {
+                AERIAL_RELEASE_MAX_LANE_RISK
+            };
+            let min_receipt = if aerial_lead_progression {
+                AERIAL_LEAD_RELEASE_MIN_RECEIPT
+            } else {
+                AERIAL_RELEASE_MIN_RECEIPT
+            };
+            quality.expected_completion < min_completion
+                || quality.lane_interception_risk > max_lane_risk
+                || quality.mpc_receipt_probability < min_receipt
+        }
+        _ => false,
+    }
+}
 
 fn pass_target_completion_primary_scale() -> f64 {
     use std::sync::OnceLock;
@@ -279,6 +436,31 @@ fn learned_pass_receiver_strict_fallback_enabled() -> bool {
         *V.get_or_init(|| {
             soccer_env_flag_enabled("DD_SOCCER_ENABLE_LEARNED_PASS_RECEIVER_STRICT_FALLBACK")
         })
+    }
+}
+
+fn learned_pass_receiver_diag_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_DUMP_LEARNED_RECEIVER_DIAG").is_ok())
+}
+
+fn log_learned_pass_space_diag(
+    action: &str,
+    reason: &str,
+    value: Option<f64>,
+    forward_yards: Option<f64>,
+    runner_distance: Option<f64>,
+) {
+    if learned_pass_receiver_diag_enabled() {
+        eprintln!(
+            "learned_space_diag action={} reason={} value={:.3} forward_yards={:.2} runner_distance={:.2}",
+            action,
+            reason,
+            value.unwrap_or(f64::NAN),
+            forward_yards.unwrap_or(f64::NAN),
+            runner_distance.unwrap_or(f64::NAN),
+        );
     }
 }
 
@@ -5093,6 +5275,83 @@ mod tests {
         );
         assert_eq!(decision.neural_mcts_dribble_candidate_count, 4);
         assert_eq!(decision.neural_mcts_root_dribble_candidate_count, 1);
+    }
+
+    #[test]
+    fn learned_pass_descriptor_stamp_marks_same_team_lead_point_as_space() {
+        let _env_lock = soccer_world_env_lock();
+        let _receiver_gate = set_test_env_var("DD_SOCCER_ENABLE_LEARNED_PASS_RECEIVER", "1");
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let holder = sim
+            .players
+            .iter()
+            .position(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home holder");
+        let runner = sim
+            .players
+            .iter()
+            .position(|player| {
+                player.team == Team::Home
+                    && player.role != PlayerRole::Goalkeeper
+                    && player.id != sim.players[holder].id
+            })
+            .expect("home runner");
+        let holder_id = sim.players[holder].id;
+        let runner_id = sim.players[runner].id;
+        let holder_pos = Vec2::new(40.0, 52.0);
+        let runner_pos = Vec2::new(42.0, 62.0);
+        let lead_point = Vec2::new(42.0, 68.0);
+        sim.players[holder].position = holder_pos;
+        sim.players[runner].position = runner_pos;
+        sim.ball.holder = Some(holder_id);
+        sim.ball.position = holder_pos;
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let observation = snapshot.observation_for(holder_id);
+        let mdp_state = snapshot.mdp_state_for_player(holder_id);
+        let belief = belief_from_observation(&observation);
+        sim.players[holder].last_decision = Some(AgentDecisionTrace {
+            mdp_state,
+            observation,
+            belief,
+            operation_order: vec!["learned-policy".to_string(), "pass".to_string()],
+            scheduled_index: None,
+            action_options: single_action_option("pass"),
+            action_target: Some(AgentActionTargetTrace {
+                point: Some(lead_point),
+                player_id: Some(runner_id),
+                grid: Some(pitch_grid_address(
+                    lead_point,
+                    snapshot.field_width,
+                    snapshot.field_length,
+                )),
+                facing: facing_bucket_from_vector(lead_point - holder_pos),
+                dribble_touch: None,
+                receiver_descriptor: None,
+            }),
+            mdp_mpc_comparison: None,
+            learned_mpc_replan: None,
+            behavior_policy_probability: None,
+            neural_mcts_selected: false,
+            neural_mcts_candidate_count: 0,
+            neural_mcts_discretized_kick_candidate_count: 0,
+            neural_mcts_root_discretized_kick_candidate_count: 0,
+            neural_mcts_dribble_candidate_count: 0,
+            neural_mcts_root_dribble_candidate_count: 0,
+            action: "pass".to_string(),
+        });
+
+        SoccerMatch::stamp_learned_pass_receiver_descriptor(&mut sim.players[holder], &snapshot);
+
+        let descriptor = sim.players[holder]
+            .last_decision
+            .as_ref()
+            .and_then(|decision| decision.action_target.as_ref())
+            .and_then(|target| target.receiver_descriptor)
+            .expect("learned pass target should be receiver-described");
+        assert_eq!(
+            ReceiverDescriptor::kind_from_encoded(descriptor),
+            Some(ReceiverKind::Space)
+        );
     }
 
     #[test]
@@ -12961,10 +13220,12 @@ impl SoccerMatch {
                     snapshot.mpc_objective_head = Some(Box::new(mpc_objective_head.to_snapshot()));
                 }
                 if let Some(attack_spacing_head) = &self.attack_spacing_head {
-                    snapshot.attack_spacing_head = Some(Box::new(attack_spacing_head.to_snapshot()));
+                    snapshot.attack_spacing_head =
+                        Some(Box::new(attack_spacing_head.to_snapshot()));
                 }
                 if let Some(support_scorer_head) = &self.support_scorer_head {
-                    snapshot.support_scorer_head = Some(Box::new(support_scorer_head.to_snapshot()));
+                    snapshot.support_scorer_head =
+                        Some(Box::new(support_scorer_head.to_snapshot()));
                 }
                 snapshot
             })
@@ -15254,6 +15515,44 @@ impl SoccerMatch {
         }
     }
 
+    fn stamp_learned_pass_receiver_descriptor(player: &mut PlayerAgent, snapshot: &WorldSnapshot) {
+        if !dd_soccer_enable_learned_pass_receiver() {
+            return;
+        }
+        let Some(decision) = player.last_decision.as_mut() else {
+            return;
+        };
+        let normalized_action = normalize_soccer_action_label(&decision.action);
+        if pass_like_action_flight(&normalized_action).is_none() {
+            return;
+        }
+        let Some(action_target) = decision.action_target.as_mut() else {
+            return;
+        };
+        let Some(point) = action_target.point else {
+            return;
+        };
+        let Some(target_id) = action_target.player_id else {
+            return;
+        };
+        let Some(target) = snapshot.players.iter().find(|p| p.id == target_id) else {
+            return;
+        };
+        if target.team != player.team {
+            return;
+        }
+        let receiver_position = snapshot
+            .player_position(target_id)
+            .unwrap_or(target.position);
+        let kind = if point.distance(receiver_position) > 1.0 {
+            ReceiverKind::Space
+        } else {
+            ReceiverKind::Teammate
+        };
+        action_target.receiver_descriptor =
+            Some(snapshot.pass_receiver_descriptor(player.id, kind, point, Some(target.role)));
+    }
+
     /// Build a feature-only decision-time transition: the player's real
     /// state/observation/team/role, with neutral defaults for the post-action
     /// fields the value-head feature builder reads (those sit at the same
@@ -15314,14 +15613,21 @@ impl SoccerMatch {
             && pass_like_action_flight(normalize_soccer_action_label(&plan.action)).is_some()
         {
             let (kind, role) = match plan.target_player {
-                Some(target_id) => (
-                    ReceiverKind::Teammate,
-                    snapshot
-                        .players
-                        .iter()
-                        .find(|p| p.id == target_id)
-                        .map(|p| p.role),
-                ),
+                Some(target_id) => {
+                    let target = snapshot.players.iter().find(|p| p.id == target_id);
+                    let receiver_position = target
+                        .and_then(|p| snapshot.player_position(p.id))
+                        .or_else(|| target.map(|p| p.position));
+                    let kind = if receiver_position
+                        .map(|receiver_position| point.distance(receiver_position) > 1.0)
+                        .unwrap_or(false)
+                    {
+                        ReceiverKind::Space
+                    } else {
+                        ReceiverKind::Teammate
+                    };
+                    (kind, target.map(|p| p.role))
+                }
                 None => (ReceiverKind::Space, None),
             };
             Some(snapshot.pass_receiver_descriptor(player_id, kind, point, role))
@@ -17697,6 +18003,34 @@ impl SoccerMatch {
         ))
     }
 
+    fn learned_target_grid_point_for_policy_receiver_kind(
+        policy: &SoccerQPolicy,
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        action: &str,
+        receiver_kind: ReceiverKind,
+    ) -> Option<(Vec2, f64)> {
+        let player = snapshot.players.iter().find(|p| p.id == player_id)?;
+        let state = SoccerQStateKey::from_parts(
+            &snapshot.mdp_state_for_player(player_id),
+            &snapshot.observation_for(player_id),
+            player.team,
+            player.role,
+        );
+        let target = policy.best_target_grid_for_state_action_receiver_kind(
+            &state,
+            action,
+            receiver_kind,
+        )?;
+        if target.visits < LEARNED_TARGET_GRID_MIN_VISITS || !target.value.is_finite() {
+            return None;
+        }
+        Some((
+            Self::target_grid_entry_center_for_snapshot(&target, snapshot),
+            target.value,
+        ))
+    }
+
     fn learned_ranked_pass_target_for_policy(
         action: &str,
         flight: PassFlight,
@@ -17963,40 +18297,80 @@ impl SoccerMatch {
         let space = Self::learned_pass_space_option(policy, snapshot, player_id, normalized_action);
         // Walk the head's ranking; commit the first MPC-feasible receiver. Prefer the space ball
         // ahead of a teammate only when the head scores it higher (already reflected in its rank).
-        let mut best_feasible: Option<(f64, Option<usize>, Option<Vec2>)> = None;
+        let mut best_feasible: Option<(f64, f64, Option<usize>, Option<Vec2>)> = None;
         let mut rejected_count = 0usize;
         let mut first_rejected_probability: Option<f64> = None;
         for entry in &ranked {
             let position = snapshot.player_position(entry.player_id);
             let probability = acceptance_probability(Some(entry.player_id), position);
             if probability >= net_forward_quality_threshold {
-                best_feasible = Some((entry.head_score, Some(entry.player_id), position));
+                best_feasible = Some((
+                    entry.head_score,
+                    probability,
+                    Some(entry.player_id),
+                    position,
+                ));
                 break;
             }
             rejected_count = rejected_count.saturating_add(1);
             first_rejected_probability.get_or_insert(probability);
         }
-        if let Some((space_score, space_point)) = space {
+        let log_receiver_selection =
+            |selected: &str,
+             selected_probability: f64,
+             first_rejected: Option<f64>,
+             final_rejected_count: usize| {
+                if learned_pass_receiver_diag_enabled() {
+                    eprintln!(
+                        "learned_receiver_diag action={} flight={:?} ranked={} rejected={} \
+                     threshold={:.3} raw_receipt_threshold={:.3} first_rejected={:.3} \
+                     space_offered={} selected={} selected_quality={:.3}",
+                        normalized_action,
+                        flight,
+                        ranked.len(),
+                        final_rejected_count,
+                        net_forward_quality_threshold,
+                        raw_receipt_threshold,
+                        first_rejected.unwrap_or(-1.0),
+                        space.is_some(),
+                        selected,
+                        selected_probability.clamp(0.0, 1.0),
+                    );
+                }
+            };
+        if let Some((space_score, space_runner, space_point)) = space {
             let space_beats = best_feasible
                 .as_ref()
-                .map(|(score, _, _)| space_score > *score)
+                .map(|(score, _, _, _)| space_score > *score)
                 .unwrap_or(true);
             if space_beats {
-                let probability = acceptance_probability(None, Some(space_point));
+                let probability = acceptance_probability(Some(space_runner), Some(space_point));
                 if probability >= net_forward_quality_threshold {
                     let replan = first_rejected_probability.map(|rejected_probability| {
                         receiver_kickback_trace(rejected_probability, rejected_count)
                     });
-                    return (None, Some(space_point), replan);
+                    log_receiver_selection(
+                        "space_runner",
+                        probability,
+                        first_rejected_probability,
+                        rejected_count,
+                    );
+                    return (Some(space_runner), Some(space_point), replan);
                 }
                 rejected_count = rejected_count.saturating_add(1);
                 first_rejected_probability.get_or_insert(probability);
             }
         }
-        if let Some((_, target_player, target_point)) = best_feasible {
+        if let Some((_, probability, target_player, target_point)) = best_feasible {
             let replan = first_rejected_probability.map(|rejected_probability| {
                 receiver_kickback_trace(rejected_probability, rejected_count)
             });
+            log_receiver_selection(
+                "teammate",
+                probability,
+                first_rejected_probability,
+                rejected_count,
+            );
             return (target_player, target_point, replan);
         }
         // Nothing MPC-feasible: hand back the head's top choice so the action-level replan can
@@ -18008,41 +18382,83 @@ impl SoccerMatch {
             receiver_kickback_trace(rejected_probability, rejected_count)
         });
         if learned_pass_receiver_strict_fallback_enabled() && replan.is_some() {
+            log_receiver_selection(
+                "strict_none",
+                0.0,
+                first_rejected_probability,
+                rejected_count,
+            );
             return (None, None, replan);
         }
+        log_receiver_selection(
+            if fallback.is_some() {
+                "fallback"
+            } else {
+                "none"
+            },
+            first_rejected_probability.unwrap_or(0.0),
+            first_rejected_probability,
+            rejected_count,
+        );
         (fallback, fallback_point, replan)
     }
 
     /// The head's "pass into open space" option: its preferred target grid point (min-visits
     /// gated) when a teammate is close enough to run onto it and the point is forward of the
     /// passer, scored by the learned Space-descriptor value. `None` when the head has no
-    /// confident space preference or no runner can reach it.
+    /// confident space preference or no runner can reach it. The runner is returned so the
+    /// pass is still bound to a same-team receiver while aiming at the learned space point.
     fn learned_pass_space_option(
         policy: &SoccerQPolicy,
         snapshot: &WorldSnapshot,
         player_id: usize,
         normalized_action: &str,
-    ) -> Option<(f64, Vec2)> {
-        let space_point = Self::learned_target_grid_point_for_policy(
-            policy,
-            snapshot,
-            player_id,
-            normalized_action,
-        )?;
-        let passer = snapshot.players.iter().find(|p| p.id == player_id)?;
+    ) -> Option<(f64, usize, Vec2)> {
+        let Some((space_point, space_value)) =
+            Self::learned_target_grid_point_for_policy_receiver_kind(
+                policy,
+                snapshot,
+                player_id,
+                normalized_action,
+                ReceiverKind::Space,
+            )
+        else {
+            log_learned_pass_space_diag(normalized_action, "no_grid", None, None, None);
+            return None;
+        };
+        let Some(passer) = snapshot.players.iter().find(|p| p.id == player_id) else {
+            log_learned_pass_space_diag(normalized_action, "no_passer", None, None, None);
+            return None;
+        };
         let passer_position = snapshot
             .player_position(player_id)
             .unwrap_or(passer.position);
         // A runner must be able to reach the space, otherwise it is a blind ball out of play.
-        let runner_close = snapshot
+        let closest_runner = snapshot
             .players
             .iter()
             .filter(|p| p.team == passer.team && p.id != player_id)
-            .filter_map(|p| snapshot.player_position(p.id))
-            .any(|pos| pos.distance(space_point) <= SOCCER_SPACE_RUN_ONTO_YARDS);
-        if !runner_close {
+            .filter_map(|p| {
+                let pos = snapshot.player_position(p.id)?;
+                Some((p.id, pos.distance(space_point)))
+            })
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        let closest_runner_distance = closest_runner
+            .map(|(_, distance)| distance)
+            .unwrap_or(f64::INFINITY);
+        if closest_runner_distance > SOCCER_SPACE_RUN_ONTO_YARDS {
+            log_learned_pass_space_diag(
+                normalized_action,
+                "no_runner",
+                None,
+                None,
+                closest_runner_distance
+                    .is_finite()
+                    .then_some(closest_runner_distance),
+            );
             return None;
         }
+        let space_runner = closest_runner.map(|(id, _)| id)?;
         let descriptor =
             snapshot.pass_receiver_descriptor(player_id, ReceiverKind::Space, space_point, None);
         // Only forward space is worth breaking shape for; a "space" ball behind the passer is a
@@ -18053,8 +18469,15 @@ impl SoccerMatch {
             } else {
                 -1.0
             };
-        if (space_point.y - passer_position.y) * attack_sign <= SOCCER_RECEIVER_FORWARD_SQUARE_YARDS
-        {
+        let forward_yards = (space_point.y - passer_position.y) * attack_sign;
+        if forward_yards <= SOCCER_RECEIVER_FORWARD_SQUARE_YARDS {
+            log_learned_pass_space_diag(
+                normalized_action,
+                "not_forward",
+                None,
+                Some(forward_yards),
+                Some(closest_runner_distance),
+            );
             return None;
         }
         let grid = pitch_grid_address(space_point, snapshot.field_width, snapshot.field_length);
@@ -18064,13 +18487,21 @@ impl SoccerMatch {
             passer.team,
             passer.role,
         );
-        let value = policy.target_preference_for_grid_and_receiver(
-            &state,
+        let value = policy
+            .target_preference_for_grid_and_receiver(&state, normalized_action, &grid, descriptor)
+            .unwrap_or(space_value);
+        log_learned_pass_space_diag(
             normalized_action,
-            &grid,
-            descriptor,
-        )?;
-        Some((value * LEARNED_RECEIVER_HEAD_DOMINANCE, space_point))
+            "offered_receiver",
+            Some(value),
+            Some(forward_yards),
+            Some(closest_runner_distance),
+        );
+        Some((
+            value * LEARNED_RECEIVER_HEAD_DOMINANCE,
+            space_runner,
+            space_point,
+        ))
     }
 
     fn mpc_reconciled_learned_plan_for_policy(
@@ -21875,6 +22306,10 @@ impl SoccerMatch {
                             learned_decision.neural_mcts_dribble_candidate_count,
                             learned_decision.neural_mcts_root_dribble_candidate_count,
                         );
+                        Self::stamp_learned_pass_receiver_descriptor(
+                            &mut self.players[actor],
+                            &snapshot,
+                        );
                     }
                     let intent = self.players[actor]
                         .apply_post_decision_movement_discipline(&snapshot, self, intent);
@@ -22770,15 +23205,30 @@ impl SoccerMatch {
     /// to the matching `episode_learning_transitions` entry at end-of-game. Gated
     /// `DD_SOCCER_ENABLE_DEFERRED_PASS_CREDIT`; when off, falls back to the current-tick event
     /// (byte-identical to baseline).
-    fn record_reward_event_deferred(&mut self, decision_tick: u64, player_id: usize, amount: f64) {
+    fn record_reward_event_deferred_with_kind(
+        &mut self,
+        decision_tick: u64,
+        player_id: usize,
+        amount: f64,
+        kind: SoccerRewardEventKind,
+    ) {
         if dd_soccer_enable_deferred_pass_credit() {
             if amount.is_finite() && amount != 0.0 {
                 self.deferred_reward_credits
                     .push((decision_tick, player_id, amount));
             }
         } else {
-            self.record_reward_event(player_id, amount);
+            self.record_reward_event_with_kind(player_id, amount, kind);
         }
+    }
+
+    fn record_reward_event_deferred(&mut self, decision_tick: u64, player_id: usize, amount: f64) {
+        self.record_reward_event_deferred_with_kind(
+            decision_tick,
+            player_id,
+            amount,
+            SoccerRewardEventKind::Routine,
+        );
     }
 
     /// Apply all deferred cross-tick credits onto the decision transitions that earned them, by
@@ -23278,6 +23728,13 @@ impl SoccerMatch {
             self.config.field_width_yards,
             self.config.field_length_yards,
         );
+        let completed_forward_yards =
+            (self.ball.position.y - pass.origin.y) * pass.team.attack_dir();
+        let reward_kind = if completed_forward_yards >= COMPLETED_FORWARD_PASS_COUNT_MIN_YARDS {
+            SoccerRewardEventKind::CompletedForwardPass
+        } else {
+            SoccerRewardEventKind::Routine
+        };
         let amount = completed_pass_reward_for_pitch(
             pass.team,
             pass.origin,
@@ -23293,6 +23750,12 @@ impl SoccerMatch {
             )
             + killer_pass_reward
             + completed_forward_pass_count_bonus(pass.team, pass.origin, self.ball.position)
+            + completed_forward_pass_goal_proximity_bonus(
+                pass.team,
+                pass.origin,
+                self.ball.position,
+                self.config.field_length_yards,
+            )
             + self.completed_pass_and_move_forward_reward(pass)
             + progressive_pass_escape_reward(pass, self.ball.position)
             + self.overload_forward_pass_progression_bonus(pass, self.ball.position)
@@ -23311,17 +23774,20 @@ impl SoccerMatch {
                 );
         // Back-date the completed-pass reward to the PASS DECISION tick (launch), not the reception
         // tick, so the passer's actual decision transition gets credited (gated; off ⇒ current-tick).
-        self.record_reward_event_deferred(pass.launch_tick, pass.from, amount);
+        self.record_reward_event_deferred_with_kind(
+            pass.launch_tick,
+            pass.from,
+            amount,
+            reward_kind,
+        );
         self.queue_recent_outcome_learning_credit(
             pass.from,
             pass.team,
             amount,
-            SoccerRewardEventKind::Routine,
+            reward_kind,
             COMPLETED_PASS_LEARNING_CREDIT_MAX_AGE_TICKS,
             |action| is_pass_like_action(action) && action != "wall-return",
         );
-        let completed_forward_yards =
-            (self.ball.position.y - pass.origin.y) * pass.team.attack_dir();
         if completed_forward_yards >= PROGRESSIVE_CARRY_FORWARD_PASS_MIN_YARDS {
             self.record_progressive_carry_outcome_reward(
                 pass.from,
@@ -27597,6 +28063,8 @@ impl SoccerMatch {
                 flight,
             } => {
                 let mut release_facing = action_facing;
+                let intent_is_killer_pass = SoccerActionLabel::classify(&intent_action_label)
+                    == Some(SoccerActionLabel::KillerPass);
                 if self.ball.holder == Some(player_id) {
                     let snapshot = WorldSnapshot::from_match(self);
                     let observation = snapshot.observation_for(player_id);
@@ -27804,6 +28272,16 @@ impl SoccerMatch {
                             self.config.field_length_yards,
                         );
                     } else if flight.is_over_top() {
+                        if intent_is_killer_pass && explicit_target_point.is_none() {
+                            let look = target - player_pos;
+                            if look.len() > 1e-6 {
+                                let face = facing_bucket_from_vector(look);
+                                if face != FacingBucket::Unknown {
+                                    self.players[player_id].action_facing = face;
+                                }
+                            }
+                            return;
+                        }
                         flight = PassFlight::Aerial;
                     }
                     let initial_is_cross = pass_would_be_cross(
@@ -28346,6 +28824,61 @@ impl SoccerMatch {
                                             < feet_completion
                                     {
                                         aimed_target = receiver_position;
+                                    }
+                                }
+                            }
+                            if pass_aim_offset_completion_guard_enabled() {
+                                let release_quality_at =
+                                    |point: Vec2| -> Option<PassTargetQuality> {
+                                        let passer =
+                                            snapshot.players.iter().find(|p| p.id == player_id)?;
+                                        let target = target_id.and_then(|tid| {
+                                            snapshot.players.iter().find(|p| p.id == tid)
+                                        })?;
+                                        Some(pass_target_quality_for_snapshot(
+                                            &snapshot, passer, player_pos, target, point, flight,
+                                        ))
+                                    };
+                                if let Some(quality) = release_quality_at(aimed_target) {
+                                    let forward =
+                                        (aimed_target.y - player_pos.y) * player_team.attack_dir();
+                                    let target_receiver_distance =
+                                        aimed_target.distance(receiver_position);
+                                    if long_forward_pass_release_guard_fails(
+                                        intent_is_killer_pass,
+                                        flight,
+                                        forward,
+                                        player_pos.distance(aimed_target),
+                                        target_receiver_distance,
+                                        quality,
+                                    ) {
+                                        let receiver_forward = (receiver_position.y - player_pos.y)
+                                            * player_team.attack_dir();
+                                        let receiver_feet_safe = release_quality_at(
+                                            receiver_position,
+                                        )
+                                        .is_some_and(|receiver_quality| {
+                                            !long_forward_pass_release_guard_fails(
+                                                intent_is_killer_pass,
+                                                flight,
+                                                receiver_forward,
+                                                player_pos.distance(receiver_position),
+                                                0.0,
+                                                receiver_quality,
+                                            )
+                                        });
+                                        if receiver_feet_safe {
+                                            aimed_target = receiver_position;
+                                        } else {
+                                            let look = led_target - player_pos;
+                                            if look.len() > 1e-6 {
+                                                let face = facing_bucket_from_vector(look);
+                                                if face != FacingBucket::Unknown {
+                                                    self.players[player_id].action_facing = face;
+                                                }
+                                            }
+                                            return;
+                                        }
                                     }
                                 }
                             }
@@ -39364,9 +39897,16 @@ fn dd_soccer_enable_scored_shot_placement() -> bool {
 /// pass MPC/receipt/concede-veto logic still applies. Default OFF ⇒ byte-identical (feet-only
 /// candidate as before).
 fn dd_soccer_enable_neural_pass_space() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_NEURAL_PASS_SPACE"))
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_NEURAL_PASS_SPACE")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_NEURAL_PASS_SPACE"))
+    }
 }
 
 /// Forward-pass attempt shaping. Default-ON in prod because this is the anti-plateau learning
@@ -48053,7 +48593,6 @@ impl WorldSnapshot {
                 {
                     continue;
                 }
-
                 let (aim, launch_speed_yps) = if flight.is_aerial() {
                     (analytic_target, None)
                 } else {
@@ -48961,19 +49500,31 @@ impl WorldSnapshot {
                 } else {
                     (PassFlight::Floor, 0.18)
                 };
+                // Threaded variant: a killer ball is risky by nature, so don't let the dynamic
+                // lane-interception-risk gate crush its completion below the floor below (which
+                // would hide the option). Risk is priced into the killer-pass score instead.
+                let quality = pass_target_quality_for_snapshot_threaded(
+                    self,
+                    me,
+                    me_position,
+                    target,
+                    target_position,
+                    flight,
+                );
                 // A killer ball threads RISK into space (that race is priced into the score, not
                 // hidden), but it must never be a gross concession — the ball arriving at an
-                // opponent's feet, or forced into a tightly-marked man the passer can see. The
-                // generic ranker/selector enforce this for ordinary passes; the threaded pool is
-                // un-gated, so re-apply the same perception-gated concede veto here. A runner
-                // breaking into clear space has no opponent within the mark radius of the
-                // reception, so genuine killer balls are untouched; only a pass landing on a
-                // reachable defender is dropped (the carrier then keeps/shields/clears instead).
+                // opponent's feet, or forced into a tightly-marked man the passer can see. For a
+                // lifted over-top runner, the static "nearest to landing" veto is too conservative:
+                // the intended receiver is sprinting into the landing, so let MPC receipt quality
+                // decide whether the runner actually wins the race.
                 let over_top_conceded = over_top_aim
                     .map(|aim| {
                         let over_top_speed =
                             pass_speed_yps_from_power(0.82, PassFlight::OverTop, false, &me.skills);
-                        self.pass_point_directly_favors_opponent(
+                        let opponent_at_feet = self
+                            .nearest_opponent_distance_at(me.team, aim.aim_point)
+                            <= PASS_RECEPTION_CONCEDE_AT_FEET_RADIUS_YARDS;
+                        let static_concede = self.pass_point_directly_favors_opponent(
                             me.team,
                             target_position,
                             aim.aim_point,
@@ -48984,7 +49535,12 @@ impl WorldSnapshot {
                             aim.aim_point,
                             over_top_speed,
                             self.attacker_pressure_on_point(me.team, me_position),
-                        )
+                        );
+                        let runner_wins_lifted_race = quality.expected_completion
+                            >= KILLER_PASS_MIN_THREADED_EXPECTED_COMPLETION
+                            && quality.mpc_receipt_probability >= 0.50
+                            && quality.lane_interception_risk <= 0.18;
+                        opponent_at_feet || (static_concede && !runner_wins_lifted_race)
                     })
                     .unwrap_or(false);
                 if !slip_break.available
@@ -48998,17 +49554,6 @@ impl WorldSnapshot {
                 {
                     return None;
                 }
-                // Threaded variant: a killer ball is risky by nature, so don't let the dynamic
-                // lane-interception-risk gate crush its completion below the floor below (which
-                // would hide the option). Risk is priced into the killer-pass score instead.
-                let quality = pass_target_quality_for_snapshot_threaded(
-                    self,
-                    me,
-                    me_position,
-                    target,
-                    target_position,
-                    flight,
-                );
                 let near_goal_completion_floor_multiplier = if receiver_yards_to_goal <= 8.0 {
                     0.55
                 } else if receiver_yards_to_goal <= 18.0 {
@@ -49019,18 +49564,19 @@ impl WorldSnapshot {
                 let min_threaded_completion = KILLER_PASS_MIN_THREADED_EXPECTED_COMPLETION
                     * near_goal_completion_floor_multiplier;
                 let pass_distance_yards = me_position.distance(scoring_reception);
-                let distance_completion_floor = if !speculative_killer_pass_completion_guard_enabled()
-                    || slip_break.available
-                    || receiver_yards_to_goal <= KILLER_PASS_IMMEDIATE_GOAL_WINDOW_YARDS
-                {
-                    0.0
-                } else if pass_distance_yards >= KILLER_PASS_LONG_DISTANCE_YARDS {
-                    KILLER_PASS_LONG_MIN_COMPLETION
-                } else if pass_distance_yards >= KILLER_PASS_MEDIUM_DISTANCE_YARDS {
-                    KILLER_PASS_MEDIUM_MIN_COMPLETION
-                } else {
-                    0.0
-                };
+                let distance_completion_floor =
+                    if !speculative_killer_pass_completion_guard_enabled()
+                        || slip_break.available
+                        || receiver_yards_to_goal <= KILLER_PASS_IMMEDIATE_GOAL_WINDOW_YARDS
+                    {
+                        0.0
+                    } else if pass_distance_yards >= KILLER_PASS_LONG_DISTANCE_YARDS {
+                        KILLER_PASS_LONG_MIN_COMPLETION
+                    } else if pass_distance_yards >= KILLER_PASS_MEDIUM_DISTANCE_YARDS {
+                        KILLER_PASS_MEDIUM_MIN_COMPLETION
+                    } else {
+                        0.0
+                    };
                 let min_threaded_completion =
                     min_threaded_completion.max(distance_completion_floor);
                 if (quality.expected_completion < min_threaded_completion && !slip_break.available)

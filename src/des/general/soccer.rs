@@ -1256,6 +1256,7 @@ const COMPLETED_FORWARD_PASS_PROGRESS_REWARD_MAX_YARDS: f64 = 30.0;
 // completed-forward-pass count a frequent training signal instead of waiting for rare shots/goals.
 const COMPLETED_FORWARD_PASS_COUNT_BONUS_POINTS: f64 = 2.5;
 const COMPLETED_FORWARD_PASS_COUNT_MIN_YARDS: f64 = 1.25;
+const COMPLETED_FORWARD_PASS_GOAL_PROXIMITY_BONUS_POINTS: f64 = 0.90;
 const COMPLETED_FLANK_PASS_BONUS_POINTS: f64 = 2.4;
 const COMPLETED_FLANK_PASS_OWN_HALF_MULTIPLIER: f64 = 1.55;
 const OWN_HALF_FLANK_TACTICAL_REWARD_MULTIPLIER: f64 = 1.35;
@@ -4193,6 +4194,36 @@ pub(crate) fn offball_support_reward_scale() -> f64 {
     static V: OnceLock<f64> = OnceLock::new();
     *V.get_or_init(|| {
         std::env::var("SOCCER_OFFBALL_SUPPORT_REWARD_SCALE")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(1.0, 10.0))
+            .unwrap_or(1.0)
+    })
+}
+
+/// Amplify DRIBBLING / progressive ball-CARRYING rewards (beat defenders, drive into space).
+/// Env `DD_SOCCER_CARRY_REWARD_SCALE` (default 1.0), clamped [1, 10].
+pub(crate) fn carry_reward_scale() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_CARRY_REWARD_SCALE")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(1.0, 10.0))
+            .unwrap_or(1.0)
+    })
+}
+
+/// Amplify DEFENSIVE ball-RECOVERY / press rewards (win the ball back after a loss).
+/// Env `DD_SOCCER_RECOVERY_REWARD_SCALE` (default 1.0), clamped [1, 10].
+pub(crate) fn ball_recovery_reward_scale() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_RECOVERY_REWARD_SCALE")
             .ok()
             .and_then(|raw| raw.trim().parse::<f64>().ok())
             .filter(|v| v.is_finite())
@@ -12471,6 +12502,18 @@ impl ReceiverDescriptor {
         (((kind * 4 + role) * 3 + lane) * 3 + progression) * 3 + openness
     }
 
+    pub(crate) fn kind_from_encoded(code: i32) -> Option<ReceiverKind> {
+        if code < 0 {
+            return None;
+        }
+        match code / (4 * 3 * 3 * 3) {
+            0 => Some(ReceiverKind::Teammate),
+            1 => Some(ReceiverKind::Space),
+            2 => Some(ReceiverKind::Nobody),
+            _ => None,
+        }
+    }
+
     /// Role bucket for a teammate receiver (GK 0 / DEF 1 / MID 2 / FWD 3).
     pub(crate) fn role_bucket_for(role: PlayerRole) -> u8 {
         match role {
@@ -13444,17 +13487,48 @@ impl SoccerQPolicy {
         state: &SoccerQStateKey,
         action: &str,
     ) -> Option<SoccerQTargetEntry> {
-        self.best_target_grid_for_state_action_with_context(state, action, false)
-            .or_else(|| self.best_target_grid_for_state_action_with_context(state, action, true))
+        self.best_target_grid_for_state_action_filtered(state, action, None)
+    }
+
+    pub(crate) fn best_target_grid_for_state_action_receiver_kind(
+        &self,
+        state: &SoccerQStateKey,
+        action: &str,
+        receiver_kind: ReceiverKind,
+    ) -> Option<SoccerQTargetEntry> {
+        self.best_target_grid_for_state_action_filtered(state, action, Some(receiver_kind))
+    }
+
+    fn best_target_grid_for_state_action_filtered(
+        &self,
+        state: &SoccerQStateKey,
+        action: &str,
+        receiver_kind: Option<ReceiverKind>,
+    ) -> Option<SoccerQTargetEntry> {
+        self.best_target_grid_for_state_action_with_context(state, action, receiver_kind, false)
+            .or_else(|| {
+                self.best_target_grid_for_state_action_with_context(
+                    state,
+                    action,
+                    receiver_kind,
+                    true,
+                )
+            })
     }
 
     fn best_target_grid_for_state_action_with_context(
         &self,
         state: &SoccerQStateKey,
         action: &str,
+        receiver_kind: Option<ReceiverKind>,
         relaxed: bool,
     ) -> Option<SoccerQTargetEntry> {
         let action = normalize_soccer_action_label(action);
+        let descriptor_kind_matches = |key: &SoccerQTargetKey| -> bool {
+            receiver_kind.map_or(true, |kind| {
+                ReceiverDescriptor::kind_from_encoded(key.receiver_descriptor) == Some(kind)
+            })
+        };
         let mut best: Option<(&SoccerQTargetKey, f64, u32)> = None;
         if relaxed {
             for source in Self::relaxed_query_keys(state) {
@@ -13469,7 +13543,10 @@ impl SoccerQPolicy {
                     let Some(key) = self.target_index_keys.get(*key_id) else {
                         continue;
                     };
-                    if key.action != action || !key.state.matches_relaxed_learning_context(state) {
+                    if key.action != action
+                        || !key.state.matches_relaxed_learning_context(state)
+                        || !descriptor_kind_matches(key)
+                    {
                         continue;
                     }
                     update_best_target_grid_candidate(self, &mut best, key);
@@ -13488,7 +13565,10 @@ impl SoccerQPolicy {
                     let Some(key) = self.target_index_keys.get(*key_id) else {
                         continue;
                     };
-                    if key.action != action || !key.state.matches_learning_context(state) {
+                    if key.action != action
+                        || !key.state.matches_learning_context(state)
+                        || !descriptor_kind_matches(key)
+                    {
                         continue;
                     }
                     update_best_target_grid_candidate(self, &mut best, key);
@@ -20698,6 +20778,11 @@ pub(crate) enum SoccerRewardEventKind {
     GoalkeeperSave,
     DribbleBeat,
     DefensiveDispossession,
+    /// Positive: a single same-team pass was actually completed forward. This is distinct from
+    /// launch-side [`ForwardPassAttempt`](SoccerRewardEventKind::ForwardPassAttempt) and from
+    /// chain-level [`TwoForwardPasses`](SoccerRewardEventKind::TwoForwardPasses), so support runners
+    /// can learn from the first completed forward outlet they create.
+    CompletedForwardPass,
     TwoForwardPasses,
     ThreePassForwardNetGain,
     /// Positive but bounded: a meaningfully forward pass was selected into a decent completion
@@ -20816,6 +20901,7 @@ impl SoccerRewardEventKind {
             SoccerRewardEventKind::GoalkeeperSave
                 | SoccerRewardEventKind::DribbleBeat
                 | SoccerRewardEventKind::DefensiveDispossession
+                | SoccerRewardEventKind::CompletedForwardPass
                 | SoccerRewardEventKind::TwoForwardPasses
                 | SoccerRewardEventKind::ThreePassForwardNetGain
                 | SoccerRewardEventKind::ForwardPassAttempt
@@ -20855,6 +20941,7 @@ impl SoccerRewardEventKind {
             self,
             SoccerRewardEventKind::DribbleBeat
                 | SoccerRewardEventKind::DefensiveDispossession
+                | SoccerRewardEventKind::CompletedForwardPass
                 | SoccerRewardEventKind::TwoForwardPasses
                 | SoccerRewardEventKind::ThreePassForwardNetGain
                 | SoccerRewardEventKind::ShotAttempt
@@ -23772,6 +23859,62 @@ fn completed_forward_pass_count_bonus(team: Team, origin: Vec2, reception: Vec2)
     }
 }
 
+fn completed_forward_pass_goal_proximity_bonus(
+    team: Team,
+    origin: Vec2,
+    reception: Vec2,
+    field_length: f64,
+) -> f64 {
+    let forward_yards = (reception.y - origin.y) * team.attack_dir();
+    if forward_yards < COMPLETED_FORWARD_PASS_COUNT_MIN_YARDS {
+        return 0.0;
+    }
+    let target_yards_to_goal = (team.goal_y(field_length) - reception.y).abs();
+    let proximity_fit =
+        (1.0 - target_yards_to_goal / KILLER_PASS_MAX_YARDS_TO_GOAL).clamp(0.0, 1.0);
+    let forward_fit = (forward_yards / 18.0).clamp(0.0, 1.0);
+    COMPLETED_FORWARD_PASS_GOAL_PROXIMITY_BONUS_POINTS * proximity_fit * forward_fit
+}
+
+fn completed_same_team_pass_receiver<'a>(
+    passer: &PlayerAgent,
+    after: &'a WorldSnapshot,
+) -> Option<&'a PlayerSnapshot> {
+    let holder = after.ball.holder?;
+    if holder == passer.id {
+        return None;
+    }
+    after
+        .players
+        .iter()
+        .find(|candidate| candidate.id == holder && candidate.team == passer.team)
+}
+
+fn resolved_pass_turnover_penalty(
+    team: Team,
+    origin: Vec2,
+    target: Vec2,
+    flight: PassFlight,
+    receiver_openness: f64,
+    field_length: f64,
+) -> f64 {
+    let direction = pass_direction_bucket(team, origin, target);
+    let own_half = pass_origin_in_own_half(team, origin, field_length);
+    let openness_cost = (1.0 - receiver_openness.clamp(0.0, 1.0)) * 10.0;
+    let own_half_cost = if own_half { 3.0 } else { 1.0 };
+    let aerial_cost = if flight.is_aerial() { 1.5 } else { 0.0 };
+    let ordinary_penalty = (7.0 + openness_cost + own_half_cost + aerial_cost).clamp(
+        INTERCEPTED_PASS_BASE_PENALTY_MIN_POINTS,
+        INTERCEPTED_PASS_BASE_PENALTY_MAX_POINTS,
+    );
+    let directional_penalty = if matches!(direction, PassDirectionBucket::Backward) {
+        ordinary_penalty * BACKWARD_INTERCEPTED_PASS_PENALTY_MULTIPLIER
+    } else {
+        ordinary_penalty
+    };
+    directional_penalty * forward_pass_turnover_penalty_scale()
+}
+
 fn completed_pass_reward(team: Team, origin: Vec2, target: Vec2, field_length: f64) -> f64 {
     completed_pass_reward_for_pitch(
         team,
@@ -26466,157 +26609,181 @@ fn soccer_transition_reward_with_tactics(
     }
 
     if is_pass_like_action(action) {
-        if let Some(holder) = after.ball.holder {
-            if holder != player.id {
-                if let Some(receiver_player) = after
-                    .players
-                    .iter()
-                    .find(|candidate| candidate.id == holder && candidate.team == player.team)
+        if let Some(receiver_player) = completed_same_team_pass_receiver(player, after) {
+            let target = after
+                .player_position(receiver_player.id)
+                .unwrap_or(after.ball.position);
+            let origin = before
+                .player_position(player.id)
+                .unwrap_or(before.ball.position);
+            reward += completed_pass_reward_for_pitch(
+                player.team,
+                origin,
+                target,
+                before.field_width,
+                before.field_length,
+            );
+            reward += completed_forward_pass_count_bonus(player.team, origin, target);
+            reward += completed_forward_pass_goal_proximity_bonus(
+                player.team,
+                origin,
+                target,
+                before.field_length,
+            );
+            let flight = pass_like_action_flight(action).unwrap_or(PassFlight::Floor);
+            let is_cross = matches!(
+                SoccerActionLabel::classify(action),
+                Some(SoccerActionLabel::FlankLowCross | SoccerActionLabel::FlankHighCross)
+            ) || pass_would_be_cross(
+                origin,
+                target,
+                player.team,
+                before.field_width,
+                before.field_length,
+            );
+            reward += completed_cross_reward_from_parts(
+                player.team,
+                flight,
+                is_cross,
+                origin,
+                target,
+                receiver_player.role,
+                &receiver_player.skills,
+                before.field_width,
+                before.field_length,
+            );
+            let action_context = soccer_decision_context_for(
+                player.id,
+                player.team,
+                &decision.action,
+                decision.action_target.as_ref(),
+                before,
+                after,
+            );
+            let receiver_openness = pass_receiver_openness_for_snapshots_with_teammates(
+                &after.players,
+                player.team,
+                target,
+                decision
+                    .action_target
+                    .as_ref()
+                    .and_then(|target| target.player_id),
+            );
+            reward += completed_pass_anticipation_reward_from_context(
+                &action_context,
+                player.team,
+                receiver_openness,
+            );
+            reward += completed_killer_pass_reward_from_parts(
+                player.team,
+                flight,
+                is_cross,
+                origin,
+                target,
+                receiver_player.role,
+                &receiver_player.skills,
+                before.field_width,
+                before.field_length,
+                receiver_openness,
+                pass_into_stride_fit_for_context(&action_context, player.team),
+            );
+            reward += completed_first_time_forward_pass_reward_from_parts(
+                action,
+                player.team,
+                flight,
+                is_cross,
+                origin,
+                target,
+                receiver_openness,
+                pass_into_stride_fit_for_context(&action_context, player.team),
+            );
+            reward += quick_release_forward_pass_reward(
+                player.team,
+                origin,
+                target,
+                before.ball_holder_possession_seconds,
+            );
+            // Codex r19 opportunity-conditioned carrot (default-off). Uses the before-state
+            // forward opportunity (visible options + best forward option / quick-forward
+            // value) and expected completion so it only pays a quick, completed forward ball
+            // that a timid policy would otherwise have declined.
+            reward += quick_forward_release_opportunity_reward(
+                player.team,
+                origin,
+                target,
+                before.ball_holder_possession_seconds,
+                decision.observation.visible_forward_pass_options,
+                decision
+                    .observation
+                    .quick_forward_pass_value
+                    .max(decision.observation.best_forward_pass_option_quality),
+                decision.observation.expected_pass_completion,
+            );
+            reward += pass_and_move_forward_reward_from_parts(
+                player.team,
+                flight,
+                is_cross,
+                origin,
+                target,
+                receiver_openness,
+                decision.observation.pass_and_move_numbers_advantage,
+                decision.observation.pass_and_move_run_lane_score,
+            );
+            if flight == PassFlight::Floor && !is_cross {
+                let target_forward_yards = (target.y - origin.y) * player.team.attack_dir();
+                let target_yards_to_goal =
+                    (player.team.goal_y(before.field_length) - target.y).abs();
+                let target_goal_channel =
+                    (1.0 - target_yards_to_goal / TEAMMATE_MUST_SHOOT_YARDS).clamp(0.0, 1.0);
+                let receiver_finish_tool = (ability01(receiver_player.skills.first_touch) * 0.34
+                    + ability01(receiver_player.skills.shooting) * 0.32
+                    + ability01(receiver_player.skills.top_speed) * 0.18
+                    + ability01(receiver_player.skills.dribbling) * 0.16)
+                    .clamp(0.0, 1.0);
+                let stride_fit = pass_into_stride_fit_for_context(&action_context, player.team);
+                if target_forward_yards >= KILLER_PASS_MIN_FORWARD_YARDS
+                    && target_goal_channel > 0.0
                 {
-                    let target = after.player_position(holder).unwrap_or(after.ball.position);
+                    reward += target_goal_channel
+                        * (2.40
+                            + receiver_openness.clamp(0.0, 1.0) * 0.34
+                            + stride_fit.clamp(0.0, 1.0) * 0.30
+                            + receiver_finish_tool * 0.28);
+                }
+            }
+        } else if after.pending_pass.is_none() {
+            if let Some(holder) = after.ball.holder {
+                let opponent_controls = after.players.iter().any(|candidate| {
+                    candidate.id == holder && candidate.team == player.team.other()
+                });
+                if opponent_controls {
                     let origin = before
                         .player_position(player.id)
                         .unwrap_or(before.ball.position);
-                    reward += completed_pass_reward_for_pitch(
-                        player.team,
-                        origin,
-                        target,
-                        before.field_width,
-                        before.field_length,
-                    );
+                    let target = after.player_position(holder).unwrap_or(after.ball.position);
                     let flight = pass_like_action_flight(action).unwrap_or(PassFlight::Floor);
-                    let is_cross = matches!(
-                        SoccerActionLabel::classify(action),
-                        Some(SoccerActionLabel::FlankLowCross | SoccerActionLabel::FlankHighCross)
-                    ) || pass_would_be_cross(
+                    let receiver_openness = if flight.is_aerial() {
+                        decision.observation.best_aerial_pass_receiver_openness
+                    } else {
+                        decision.observation.best_pass_receiver_openness
+                    };
+                    reward -= resolved_pass_turnover_penalty(
+                        player.team,
                         origin,
                         target,
-                        player.team,
-                        before.field_width,
+                        flight,
+                        receiver_openness,
                         before.field_length,
                     );
-                    reward += completed_cross_reward_from_parts(
-                        player.team,
-                        flight,
-                        is_cross,
-                        origin,
-                        target,
-                        receiver_player.role,
-                        &receiver_player.skills,
-                        before.field_width,
-                        before.field_length,
-                    );
-                    let action_context = soccer_decision_context_for(
-                        player.id,
-                        player.team,
-                        &decision.action,
-                        decision.action_target.as_ref(),
-                        before,
-                        after,
-                    );
-                    let receiver_openness = pass_receiver_openness_for_snapshots_with_teammates(
-                        &after.players,
-                        player.team,
-                        target,
-                        decision
-                            .action_target
-                            .as_ref()
-                            .and_then(|target| target.player_id),
-                    );
-                    reward += completed_pass_anticipation_reward_from_context(
-                        &action_context,
-                        player.team,
-                        receiver_openness,
-                    );
-                    reward += completed_killer_pass_reward_from_parts(
-                        player.team,
-                        flight,
-                        is_cross,
-                        origin,
-                        target,
-                        receiver_player.role,
-                        &receiver_player.skills,
-                        before.field_width,
-                        before.field_length,
-                        receiver_openness,
-                        pass_into_stride_fit_for_context(&action_context, player.team),
-                    );
-                    reward += completed_first_time_forward_pass_reward_from_parts(
-                        action,
-                        player.team,
-                        flight,
-                        is_cross,
-                        origin,
-                        target,
-                        receiver_openness,
-                        pass_into_stride_fit_for_context(&action_context, player.team),
-                    );
-                    reward += quick_release_forward_pass_reward(
-                        player.team,
-                        origin,
-                        target,
-                        before.ball_holder_possession_seconds,
-                    );
-                    // Codex r19 opportunity-conditioned carrot (default-off). Uses the before-state
-                    // forward opportunity (visible options + best forward option / quick-forward
-                    // value) and expected completion so it only pays a quick, completed forward ball
-                    // that a timid policy would otherwise have declined.
-                    reward += quick_forward_release_opportunity_reward(
-                        player.team,
-                        origin,
-                        target,
-                        before.ball_holder_possession_seconds,
-                        decision.observation.visible_forward_pass_options,
-                        decision
-                            .observation
-                            .quick_forward_pass_value
-                            .max(decision.observation.best_forward_pass_option_quality),
-                        decision.observation.expected_pass_completion,
-                    );
-                    reward += pass_and_move_forward_reward_from_parts(
-                        player.team,
-                        flight,
-                        is_cross,
-                        origin,
-                        target,
-                        receiver_openness,
-                        decision.observation.pass_and_move_numbers_advantage,
-                        decision.observation.pass_and_move_run_lane_score,
-                    );
-                    if flight == PassFlight::Floor && !is_cross {
-                        let target_forward_yards = (target.y - origin.y) * player.team.attack_dir();
-                        let target_yards_to_goal =
-                            (player.team.goal_y(before.field_length) - target.y).abs();
-                        let target_goal_channel = (1.0
-                            - target_yards_to_goal / TEAMMATE_MUST_SHOOT_YARDS)
-                            .clamp(0.0, 1.0);
-                        let receiver_finish_tool = (ability01(receiver_player.skills.first_touch)
-                            * 0.34
-                            + ability01(receiver_player.skills.shooting) * 0.32
-                            + ability01(receiver_player.skills.top_speed) * 0.18
-                            + ability01(receiver_player.skills.dribbling) * 0.16)
-                            .clamp(0.0, 1.0);
-                        let stride_fit =
-                            pass_into_stride_fit_for_context(&action_context, player.team);
-                        if target_forward_yards >= KILLER_PASS_MIN_FORWARD_YARDS
-                            && target_goal_channel > 0.0
-                        {
-                            reward += target_goal_channel
-                                * (2.40
-                                    + receiver_openness.clamp(0.0, 1.0) * 0.34
-                                    + stride_fit.clamp(0.0, 1.0) * 0.30
-                                    + receiver_finish_tool * 0.28);
-                        }
-                    }
                 }
             }
-            assert!(
-                (135.0..=225.0).contains(&player.skills.weight_pounds),
-                "{} body weight out of range: {}",
-                player.name,
-                player.skills.weight_pounds
-            );
         }
+        assert!(
+            (135.0..=225.0).contains(&player.skills.weight_pounds),
+            "{} body weight out of range: {}",
+            player.name,
+            player.skills.weight_pounds
+        );
     }
 
     if before.possession_team() == Some(player.team.other()) && after.ball.holder == Some(player.id)

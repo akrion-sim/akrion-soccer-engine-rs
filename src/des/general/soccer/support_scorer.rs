@@ -131,6 +131,7 @@ pub(crate) fn support_outcome_event_weight(kind: SoccerRewardEventKind) -> f64 {
         SoccerRewardEventKind::ShotAttempt => 0.12,
         // Successful forward progression / retention of a threatening move.
         SoccerRewardEventKind::ThreePassForwardNetGain => 0.28,
+        SoccerRewardEventKind::CompletedForwardPass => 0.22,
         SoccerRewardEventKind::WallPassCombination => 0.22,
         SoccerRewardEventKind::BuildupChainCredit => 0.20,
         SoccerRewardEventKind::TwoForwardPasses => 0.18,
@@ -613,15 +614,39 @@ mod tests {
     }
 
     #[test]
+    fn support_scorer_head_round_trips_through_snapshot() {
+        let features = baseline_features();
+        let mut head = SupportScorerHead::new(23);
+        let samples = vec![SupportMoveSample {
+            features: features.clone(),
+            reward: 1.0,
+        }];
+        head.train(&samples, 0.02);
+        let before = head.predict(&features).expect("prediction before snapshot");
+        let snapshot = head.to_snapshot();
+        let restored = SupportScorerHead::from_snapshot(&snapshot).expect("restore snapshot");
+        let after = restored
+            .predict(&features)
+            .expect("prediction after snapshot");
+        assert_eq!(restored.training_steps(), head.training_steps());
+        assert!(
+            (before - after).abs() < 1e-9,
+            "snapshot should preserve support-scorer prediction: before={before} after={after}"
+        );
+    }
+
+    #[test]
     fn outcome_event_weights_rank_goal_over_pass_over_zero_over_turnover() {
         // The ladder the off-ball move learns from: scoring ≫ a completed forward pass > neutral,
         // and turnovers are strictly negative. Neutral/unrelated kinds contribute nothing.
         let goal = support_outcome_event_weight(SoccerRewardEventKind::Goal);
         let shot = support_outcome_event_weight(SoccerRewardEventKind::ShotOnTarget);
-        let pass = support_outcome_event_weight(SoccerRewardEventKind::TwoForwardPasses);
+        let pass = support_outcome_event_weight(SoccerRewardEventKind::CompletedForwardPass);
+        let chain = support_outcome_event_weight(SoccerRewardEventKind::TwoForwardPasses);
         let turnover =
             support_outcome_event_weight(SoccerRewardEventKind::OverdribbleDispossession);
         assert!(goal > shot && shot > pass && pass > 0.0);
+        assert!(chain > 0.0);
         assert!(turnover < 0.0);
         assert_eq!(
             support_outcome_event_weight(SoccerRewardEventKind::HeaderGoalFromCross),
