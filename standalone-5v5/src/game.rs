@@ -934,21 +934,24 @@ impl World {
                 if team == Team::A {
                     self.ev_dribble_fwd_a = true;
                 }
-                self.set_vel(team, idx, V2::new(sx, 0.0).scale(DRIBBLE_SPEED));
+                let dir = self.shielded_dribble_dir(team, me, V2::new(sx, 0.0));
+                self.set_vel(team, idx, dir.scale(DRIBBLE_SPEED));
                 None
             }
             A_DRIB_LEFT => {
                 if team == Team::A {
                     self.ev_dribble_lat_a = true;
                 }
-                self.set_vel(team, idx, V2::new(0.0, -1.0).scale(DRIBBLE_SPEED));
+                let dir = self.shielded_dribble_dir(team, me, V2::new(0.0, -1.0));
+                self.set_vel(team, idx, dir.scale(DRIBBLE_SPEED));
                 None
             }
             A_DRIB_RIGHT => {
                 if team == Team::A {
                     self.ev_dribble_lat_a = true;
                 }
-                self.set_vel(team, idx, V2::new(0.0, 1.0).scale(DRIBBLE_SPEED));
+                let dir = self.shielded_dribble_dir(team, me, V2::new(0.0, 1.0));
+                self.set_vel(team, idx, dir.scale(DRIBBLE_SPEED));
                 None
             }
             A_CLEAR => {
