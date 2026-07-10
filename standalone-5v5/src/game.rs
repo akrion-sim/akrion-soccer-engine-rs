@@ -722,6 +722,16 @@ impl World {
         acts
     }
 
+    /// Potential Φ from Team A's perspective, in [-1, 1]. Used for
+    /// policy-invariant potential-based reward shaping (γΦ' − Φ).
+    pub fn potential_a(&self) -> f32 {
+        match self.owner {
+            Some(o) if o.team == Team::A => self.ball.x / FIELD_L,
+            Some(_) => -((FIELD_L - self.ball.x) / FIELD_L),
+            None => 0.0,
+        }
+    }
+
     fn scripted_on_ball(&self, team: Team, idx: usize, me: V2) -> usize {
         let sx = team.sx();
         let goal = team.target_goal();
