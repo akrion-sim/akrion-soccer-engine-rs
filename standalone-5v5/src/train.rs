@@ -18,7 +18,7 @@ const ENT_BETA0: f32 = 0.02;
 
 // Teammate-spacing reward weight. Overridable via SPACING_W env for tuning.
 fn w_spacing() -> f32 {
-    std::env::var("SPACING_W").ok().and_then(|s| s.parse().ok()).unwrap_or(0.02)
+    std::env::var("SPACING_W").ok().and_then(|s| s.parse().ok()).unwrap_or(0.004)
 }
 
 /// PER-PLAYER spacing reward as a function of a player's nearest-teammate
