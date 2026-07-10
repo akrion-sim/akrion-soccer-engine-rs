@@ -213,6 +213,7 @@ impl World {
             pending_passer: -1,
             return_streak_a: 0,
             ev_return_pass_a: false,
+            return_start_x: 0.0,
             ev_dribble_fwd_a: false,
             ev_dribble_lat_a: false,
         };
