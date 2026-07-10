@@ -190,10 +190,26 @@ fn train_ckpt(out_prefix: &str, games: usize, minutes: f64, seed_base: u32, ckpt
         let total_ticks = config.total_ticks();
         let mut sim = SoccerMatch::default_11v11(config).with_team_policies((*policies).clone());
         sim.set_uniform_elite_players();
+        // ESCAPE SELF-PLAY PARITY (raise the ceiling): for a fraction of games, install the net
+        // only on HOME (which learns) and leave AWAY as PURE ANALYTIC — so the net trains to BEAT
+        // the analytic engine (an external "better") instead of only tying itself. Set via
+        // SOCCER_PROOF_ANALYTIC_OPPONENT_FRAC (0=pure self-play, 1=always vs analytic).
+        let analytic_frac = env_f64("SOCCER_PROOF_ANALYTIC_OPPONENT_FRAC", 0.0);
+        let vs_analytic = analytic_frac > 0.0
+            && (analytic_frac >= 1.0 || g % ((1.0 / analytic_frac).round() as usize).max(1) == 0);
         if let Some(s) = snapshot.as_ref() {
-            if let Err(e) = sim.set_neural_network_snapshot(s.clone()) {
-                eprintln!("[train-ckpt] game {g}: snapshot install failed: {e}");
+            let installed = if vs_analytic {
+                sim.set_team_neural_brain(Team::Home, Some(s.clone()), false)
+                    .and_then(|_| sim.set_team_neural_brain(Team::Away, None, true))
+            } else {
+                sim.set_neural_network_snapshot(s.clone())
+            };
+            if let Err(e) = installed {
+                eprintln!("[train-ckpt] game {g}: brain install failed: {e}");
             }
+        } else if vs_analytic {
+            // Cold start vs analytic: fresh net on Home, analytic Away.
+            let _ = sim.set_team_neural_brain(Team::Away, None, true);
         }
         if let Some(head) = pass_completion_head.as_ref() {
             sim.set_pass_completion_head(head.clone());
