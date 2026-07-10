@@ -937,6 +937,34 @@ impl World {
         }
     }
 
+    /// Average nearest-teammate distance among Team A's outfielders (1..N).
+    /// Used to measure how spread out the attack is.
+    pub fn avg_nearest_teammate_a(&self) -> f32 {
+        let mut sum = 0.0f32;
+        let mut n = 0.0f32;
+        for i in 1..N {
+            let mut nd = f32::INFINITY;
+            for j in 1..N {
+                if i == j {
+                    continue;
+                }
+                let d = self.a[i].pos.sub(self.a[j].pos).len();
+                if d < nd {
+                    nd = d;
+                }
+            }
+            if nd.is_finite() {
+                sum += nd;
+                n += 1.0;
+            }
+        }
+        if n > 0.0 {
+            sum / n
+        } else {
+            0.0
+        }
+    }
+
     /// Potential Φ from Team A's perspective, in [-1, 1]. Used for
     /// policy-invariant potential-based reward shaping (γΦ' − Φ).
     pub fn potential_a(&self) -> f32 {
