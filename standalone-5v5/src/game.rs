@@ -765,6 +765,9 @@ impl World {
                 self.ev_win_ball_a = true; // A tackled the ball off B
             }
             self.pass_streak_a = 0; // possession changed hands
+            self.lp_from = -1;
+            self.lp_to = -1;
+            self.return_streak_a = 0;
             self.owner = Some(stealer);
             self.last_touch = Some(stealer.team);
             self.kick_timer = 4;
