@@ -312,8 +312,6 @@ impl World {
         out
     }
 
-    /// Fraction of the lane from `from` to `to` clear of outfield opponents
-    /// (0..1). The keeper is excluded — it is scored separately in finishing.
     /// Where a defender at `from` should move to INTERCEPT the ball: simulate the
     /// ball's future trajectory (with friction) and return the earliest point the
     /// defender can physically reach — anticipation, so passes get cut out. For a
