@@ -199,7 +199,8 @@ fn main() {
     println!(
         "gates: dp_critic_target={} dp_bootstrap={} learned_epv={} learned_pass_completion={} \
          deferred_pass_credit={} neural_mcts={} league_neural_mcts={} xt_terminal_cost={} \
-         mpc_pass={} pass_completion_score_weight={:.2} pass_turnover_penalty_scale={:.2}",
+         mpc_pass={} pass_completion_score_weight={:.2} pass_turnover_penalty_scale={:.2} \
+         pass_target_completion_primary_scale={:.2}",
         env_on("DD_SOCCER_ENABLE_DP_CRITIC_TARGET"),
         env_on("DD_SOCCER_ENABLE_DP_BOOTSTRAP"),
         env_on("DD_SOCCER_ENABLE_LEARNED_EPV"),
@@ -211,6 +212,7 @@ fn main() {
         env_on("DD_SOCCER_ENABLE_MPC_PASS"),
         env_f64("DD_SOCCER_PASS_COMPLETION_SCORE_WEIGHT"),
         env_f64("DD_SOCCER_PASS_TURNOVER_PENALTY_SCALE"),
+        env_f64("DD_SOCCER_PASS_TARGET_COMPLETION_PRIMARY_SCALE"),
     );
 
     // Carried across games within this process (the real learner's per-process pattern).

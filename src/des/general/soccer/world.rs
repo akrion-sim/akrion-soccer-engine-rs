@@ -58,6 +58,45 @@ const NEURAL_MCTS_DRIBBLE_SELECTION_FLOOR: f64 = 0.0;
 const NEURAL_MCTS_DRIBBLE_SELECTION_MAX_SCORE_REGRESSION: f64 = 2.5;
 const NEURAL_MCTS_DRIBBLE_DIAGNOSTIC_INTERVAL: u64 = 0;
 const NEURAL_MCTS_PITCH_VALUE_CANDIDATE_WEIGHT: f64 = 1.50;
+
+fn pass_target_completion_primary_scale() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_PASS_TARGET_COMPLETION_PRIMARY_SCALE")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|value| value.is_finite())
+            .unwrap_or(0.0)
+            .clamp(0.0, 20.0)
+    })
+}
+
+fn pass_target_completion_primary_adjustment(
+    quality: &PassTargetQuality,
+    forward_yards: f64,
+    own_half: bool,
+) -> f64 {
+    let scale = pass_target_completion_primary_scale();
+    if scale <= 1e-9 {
+        return 0.0;
+    }
+    let completion = quality.expected_completion.clamp(0.0, 1.0);
+    let receipt = quality.mpc_receipt_probability.clamp(0.0, 1.0);
+    let safe_receipt = completion * 0.70 + receipt * 0.30;
+    let target = if forward_yards > 1.25 {
+        0.70
+    } else if own_half {
+        0.78
+    } else {
+        0.74
+    };
+    let shortfall = (target - safe_receipt).max(0.0);
+    let surplus = (safe_receipt - target).max(0.0);
+    let forward_relief = if forward_yards > 1.25 { 0.72 } else { 1.0 };
+    let own_half_multiplier = if own_half { 1.35 } else { 1.0 };
+    scale * (surplus * 0.75 - shortfall * shortfall * 4.0 * forward_relief * own_half_multiplier)
+}
 const NEURAL_MCTS_PITCH_VALUE_COUNTER_WEIGHT: f64 = 0.85;
 const SOCCER_CENTERED_POLICY_BONUS_CLIP: f64 = 0.45;
 const SOCCER_CENTERED_SKILL_POLICY_BONUS_CLIP: f64 = 0.30;
@@ -49787,6 +49826,8 @@ impl WorldSnapshot {
                     &pass_quality,
                     directive.risk_tolerance,
                 );
+                let completion_primary_adjustment =
+                    pass_target_completion_primary_adjustment(&pass_quality, forward, own_half);
                 // Forward-option recognition: when a genuinely good forward ball exists,
                 // demote a backward/square target so the carrier plays the open forward man
                 // instead of recycling backward (the reported blunder). Gated; the precomputed
@@ -49828,6 +49869,7 @@ impl WorldSnapshot {
                     + own_box_play_out_adjustment
                     + role_risk.safety_bonus
                     + role_risk.forward_risk_bonus * pass_target_learning
+                    + completion_primary_adjustment
                     + forward_open_bonus * pass_target_learning
                     + progressive_floor_outlet_bonus * pass_target_learning
                     + wing_overload_bonus * pass_target_learning
