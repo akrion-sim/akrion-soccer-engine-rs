@@ -13426,6 +13426,32 @@ impl SoccerMatch {
                 } else {
                     None
                 };
+                // Symmetric with `set_neural_network_snapshot`: install the serialized EXECUTION /
+                // auxiliary heads so frozen-eval brains loaded via THIS setter (tournaments / eval
+                // gate / soccer_proof) actually APPLY the trained mpc-objective aim, pass-completion,
+                // attack-spacing and support-scorer — not just the critic. Without this the heads
+                // are dropped at eval and head-ON/OFF is byte-identical. Never clears an existing
+                // head when the snapshot lacks one.
+                if let Some(pass_completion_head) = snapshot.pass_completion_head.as_deref() {
+                    self.pass_completion_head = Some(std::sync::Arc::new(
+                        SoccerPassCompletionHead::from_snapshot(pass_completion_head)?,
+                    ));
+                }
+                if let Some(mpc_objective_head) = snapshot.mpc_objective_head.as_deref() {
+                    self.mpc_objective_head = Some(std::sync::Arc::new(
+                        SoccerMpcObjectiveHead::from_snapshot(mpc_objective_head)?,
+                    ));
+                }
+                if let Some(attack_spacing_head) = snapshot.attack_spacing_head.as_deref() {
+                    self.attack_spacing_head = Some(std::sync::Arc::new(
+                        AttackSpacingHead::from_snapshot(attack_spacing_head)?,
+                    ));
+                }
+                if let Some(support_scorer_head) = snapshot.support_scorer_head.as_deref() {
+                    self.support_scorer_head = Some(std::sync::Arc::new(
+                        SupportScorerHead::from_snapshot(support_scorer_head)?,
+                    ));
+                }
                 SoccerNeuralLearner::from_pretrained_snapshot(&self.config, network, &snapshot)
             }
             None if self.config.learning_enabled => SoccerNeuralLearner::new(&self.config),
