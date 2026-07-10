@@ -1,27 +1,26 @@
 === 5-a-side standalone learning demo ===
 scripted-vs-scripted:   goal_diff=+0.06  (A 1.38 / B 1.32)
-untrained-vs-scripted:  goal_diff=-1.27  winrate=0.19  (A 0.00 / B 1.27)  spacing=6.1
+untrained-vs-scripted:  goal_diff=-1.27  winrate=0.19  (A 0.00 / B 1.27)  spacing=7.7
 training for 60 iterations (8 games/iter)...
 
  iter |  goal_diff |  winrate |     gA     gB |  space | entropy |  val_loss
 --------------------------------------------------------------------------------
-    5 |     -0.883 |    0.208 |   0.40   1.28 | sp  3.0 |   1.573 |    0.5334
-   10 |     +0.600 |    0.642 |   2.17   1.57 | sp  2.0 |   1.563 |    0.5855
-   15 |     +0.150 |    0.550 |   1.20   1.05 | sp  2.9 |   1.511 |    0.6797
-   20 |     +0.567 |    0.625 |   2.10   1.53 | sp  2.2 |   1.473 |    0.9891
-   25 |     +0.317 |    0.550 |   1.92   1.60 | sp  2.7 |   1.397 |    1.0851
-   30 |     +0.583 |    0.600 |   2.55   1.97 | sp  3.1 |   1.443 |    1.0749
-   35 |     +0.817 |    0.675 |   2.50   1.68 | sp  2.5 |   1.429 |    1.1815
-   40 |     -0.533 |    0.333 |   1.55   2.08 | sp  1.7 |   1.371 |    1.1889
-   45 |     +0.767 |    0.683 |   1.78   1.02 | sp  2.1 |   1.348 |    1.5293
-   50 |     +0.700 |    0.650 |   2.07   1.37 | sp  2.4 |   1.298 |    1.1426
-   55 |     -0.617 |    0.292 |   1.37   1.98 | sp  2.2 |   1.279 |    1.5754
-   60 |     +1.067 |    0.758 |   2.47   1.40 | sp  2.2 |   1.188 |    1.5994
+    5 |     -0.383 |    0.375 |   0.00   0.38 | sp 12.7 |   1.463 |    1.6153
+   10 |     -0.667 |    0.317 |   0.00   0.67 | sp 12.9 |   1.461 |    1.2468
+   15 |     -0.050 |    0.517 |   0.20   0.25 | sp 15.3 |   1.524 |    1.7264
+   20 |     -0.933 |    0.250 |   0.45   1.38 | sp 16.8 |   1.501 |    0.6239
+   25 |     -0.117 |    0.467 |   0.23   0.35 | sp 11.4 |   1.492 |    1.4447
+   30 |     +0.083 |    0.550 |   0.22   0.13 | sp 10.5 |   1.484 |    1.4091
+   35 |     -0.200 |    0.458 |   0.28   0.48 | sp  9.5 |   1.507 |    1.0340
+   40 |     -0.200 |    0.433 |   0.28   0.48 | sp  8.6 |   1.457 |    1.6812
+   45 |     -0.200 |    0.433 |   0.37   0.57 | sp  7.7 |   1.468 |    1.1545
+   50 |     -0.067 |    0.508 |   0.18   0.25 | sp 10.0 |   1.475 |    0.9161
+   55 |     -0.783 |    0.300 |   0.48   1.27 | sp  5.7 |   1.431 |    2.6838
+   60 |     -0.050 |    0.517 |   0.20   0.25 | sp  8.3 |   1.393 |    1.2731
 
 wrote out/learning_curve.csv
-best policy at iter 60 (eval goal_diff +1.698)
+best policy at iter 30 (eval goal_diff +0.083)
 
-FINAL (300 games): goal_diff=+1.017  winrate=0.745  goals 2.27-1.26  passes/game 27.1  spacing=2.1
->>> The learned policy BEATS the scripted analytic baseline. <<<
-display seed 5: before 0-5 (poss 31)  ->  after 1-0 (poss 73, passes 62)
+FINAL (300 games): goal_diff=-0.063  winrate=0.507  goals 0.26-0.32  passes/game 0.0  spacing=10.6
+display seed 16: before 0-0 (poss 1)  ->  after 1-0 (poss 0, passes 0)
 wrote out/match_before.json + out/match_after.json (visual demo traces)

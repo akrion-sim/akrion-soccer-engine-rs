@@ -36,9 +36,12 @@ fn spacing_reward(d: f32) -> f32 {
     } else if d < 4.0 {
         -3.0
     } else if d <= 6.0 {
-        10.0 // ~5 units = optimal spacing
+        0.0 // ~5 units = optimal: NEUTRAL, so good spacing doesn't pay an
+            // accumulating bonus that dwarfs goals (that caused corner-camping).
+    } else if d < 8.0 {
+        -(d - 6.0) * 3.0 // too far is also penalized -> ~5 is a STABLE optimum
     } else {
-        (10.0 - (d - 6.0) * 3.0).max(0.0) // decay past 6 so they don't over-spread
+        -6.0
     }
 }
 
