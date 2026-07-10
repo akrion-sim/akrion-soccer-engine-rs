@@ -27,6 +27,8 @@ fn w_spacing() -> f32 {
 /// all phases — so bunching is directly attributable and can't hide in a shared
 /// team average.
 fn spacing_reward(d: f32) -> f32 {
+    // Peak reward at 5 units (optimal), steep penalties for bunching, and a
+    // penalty for being too far (7+). ~5 is a stable optimum on both sides.
     if d < 1.0 {
         -50.0
     } else if d < 2.0 {
@@ -35,13 +37,12 @@ fn spacing_reward(d: f32) -> f32 {
         -10.0
     } else if d < 4.0 {
         -3.0
-    } else if d <= 6.0 {
-        0.0 // ~5 units = optimal: NEUTRAL, so good spacing doesn't pay an
-            // accumulating bonus that dwarfs goals (that caused corner-camping).
-    } else if d < 8.0 {
-        -(d - 6.0) * 3.0 // too far is also penalized -> ~5 is a STABLE optimum
+    } else if d <= 5.0 {
+        5.0 - (5.0 - d) * 2.5 // rising to the +5 peak at exactly 5
+    } else if d <= 7.0 {
+        5.0 - (d - 5.0) * 2.5 // falling from the peak: +5 at 5 -> 0 at 7
     } else {
-        -6.0
+        -(d - 7.0) * 5.0 // 7+ units apart: penalty, escalating
     }
 }
 
