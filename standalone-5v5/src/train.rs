@@ -152,10 +152,10 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
         // forward progress is rewarded by the potential shaping above, and goals
         // dominate — so passing stays INSTRUMENTAL and the policy still attacks.
         if w.ev_pass_completed_a {
-            // Reward passing mostly by FORWARD progress, not for connecting at all
-            // — a big flat base makes lateral/backward hoarding pay (reward hacking,
-            // 0 shots). Tiny base (prefer completion over turnover) + forward bonus.
-            r += 0.05 + (w.last_pass_gain_a.max(0.0) * 0.18).min(1.8);
+            // Reward completing a pass (the 2-pass rule REQUIRES it, so no hoarding
+            // risk — shooting unlocks after 2 and the goal drive takes over), with
+            // a strong bonus for FORWARD progress so build-up goes toward goal.
+            r += 0.2 + (w.last_pass_gain_a.max(0.0) * 0.3).min(2.5);
         }
         if w.ev_turnover_a {
             r -= 0.25;
