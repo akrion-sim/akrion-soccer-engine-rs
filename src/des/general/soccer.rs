@@ -4233,22 +4233,6 @@ pub(crate) fn ball_recovery_reward_scale() -> f64 {
             .unwrap_or(1.0)
     })
 }
-/// Amplify the terminal GOAL / finishing reward family so sparse scoring can DOMINATE the dense
-/// possession/completion shaping (root cause of the possession-safe collapse: goals ~1/game at 160pts
-/// get drowned by per-tick shaping). Env `DD_SOCCER_GOAL_REWARD_SCALE` (default 1.0), clamped [1, 16].
-/// Respects the learn-via-rewards method — it reweights the signal, it does not hard-force finishing.
-pub(crate) fn goal_reward_scale() -> f64 {
-    use std::sync::OnceLock;
-    static V: OnceLock<f64> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("DD_SOCCER_GOAL_REWARD_SCALE")
-            .ok()
-            .and_then(|raw| raw.trim().parse::<f64>().ok())
-            .filter(|v| v.is_finite())
-            .map(|v| v.clamp(1.0, 16.0))
-            .unwrap_or(1.0)
-    })
-}
 const OUTSIDE_MID_TAKEON_ISOLATION_REWARD: f64 = 0.14;
 // Defensive recovery: a contestable ball within this many yards of our back line
 // (2nd-to-last defender) demands max sprint effort; above this recovery effort the
@@ -26621,10 +26605,7 @@ fn soccer_transition_reward_with_tactics(
         ),
     };
     let reward_cfg = &tunables().reward;
-    // Amplify the sparse terminal GOAL reward so it dominates the dense possession/completion shaping
-    // (root cause of the possession-safe collapse). Env DD_SOCCER_GOAL_REWARD_SCALE, default 1.0.
-    reward +=
-        (after_for as f64 - before_for as f64) * reward_cfg.goal_scored_points * goal_reward_scale();
+    reward += (after_for as f64 - before_for as f64) * reward_cfg.goal_scored_points;
     if after_against > before_against {
         // The concede STICK, mirror of the goal CARROT above. By default it is deliberately
         // light (8/2 vs a +100 goal). The concede-symmetry rebalance (gated, default-OFF) swaps
