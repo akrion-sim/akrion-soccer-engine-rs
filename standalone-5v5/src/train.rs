@@ -265,6 +265,9 @@ pub fn evaluate(policy: &Policy, games: usize, rng: &mut Rng) -> (f32, f32, f32,
     let mut gb = 0.0f32;
     for _ in 0..games {
         let mut w = World::new();
+        if rng.f01() < 0.5 {
+            w.kickoff(Team::B);
+        }
         for _ in 0..STEPS {
             let mut act_a = [A_STAY; N];
             for i in 0..N {
