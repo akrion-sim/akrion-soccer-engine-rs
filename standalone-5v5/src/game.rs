@@ -979,68 +979,6 @@ impl World {
         }
     }
 
-    /// Separation physics: (a) a SOFT force that actively holds outfield
-    /// teammates near the ~5-unit optimum every tick, and (b) a HARD anti-overlap
-    /// backstop (teammates ≥2, opponents ≥1.2). The soft force is what keeps the
-    /// shape spread — the reward alone couldn't fight the ball-attraction.
-    fn separate(&mut self) {
-        for _ in 0..2 {
-            // (a) soft: outfield teammates (1..N) drift toward TEAM_TARGET apart
-            for team in [Team::A, Team::B] {
-                for i in 1..N {
-                    for j in (i + 1)..N {
-                        self.push_pair(team, i, team, j, TEAM_TARGET, TEAM_SOFT_K);
-                    }
-                }
-            }
-            // (b) hard anti-overlap — nobody stacks (incl. GK)
-            for team in [Team::A, Team::B] {
-                for i in 0..N {
-                    for j in (i + 1)..N {
-                        self.push_pair(team, i, team, j, SEP_TEAM, 1.0);
-                    }
-                }
-            }
-            for i in 0..N {
-                for j in 0..N {
-                    self.push_pair(Team::A, i, Team::B, j, SEP_OPP, 1.0);
-                }
-            }
-        }
-        for i in 0..N {
-            clamp_pos(&mut self.a[i]);
-            clamp_pos(&mut self.b[i]);
-        }
-    }
-
-    /// Push a pair apart to `sep` if closer, correcting `frac` of the deficit
-    /// (frac=1.0 = hard, <1.0 = soft spring).
-    fn push_pair(&mut self, ta: Team, ia: usize, tb: Team, ib: usize, sep: f32, frac: f32) {
-        let pa = players(ta, self)[ia].pos;
-        let pb = players(tb, self)[ib].pos;
-        let del = pa.sub(pb);
-        let d = del.len();
-        if d < sep {
-            // if exactly coincident, pick a deterministic direction from indices
-            let dir = if d > 1e-3 {
-                del.unit()
-            } else {
-                let ang = (ia * 3 + ib * 7) as f32;
-                V2::new(ang.cos(), ang.sin())
-            };
-            let m = (sep - d) * 0.5 * frac;
-            let push = dir.scale(m);
-            match ta {
-                Team::A => self.a[ia].pos = self.a[ia].pos.add(push),
-                Team::B => self.b[ia].pos = self.b[ia].pos.add(push),
-            }
-            match tb {
-                Team::A => self.a[ib].pos = self.a[ib].pos.sub(push),
-                Team::B => self.b[ib].pos = self.b[ib].pos.sub(push),
-            }
-        }
-    }
-
     /// Closest teammate-pair distance among Team A's outfielders (the true
     /// "are any two stacked?" signal, which an average would hide).
     pub fn closest_pair_a(&self) -> f32 {
