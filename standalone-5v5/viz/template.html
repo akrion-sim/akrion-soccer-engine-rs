@@ -284,6 +284,54 @@ const META   = /*__META__*/ null;
   document.getElementById('foot').innerHTML='Isolated git worktree · <code>cargo run --release -- train</code> · same opening seed for both matches so the contrast is the policy, not the dice. Curve shown to the best checkpoint (early stopping — PPO over-trains past the peak).';
 })();
 
+// ---------- match analytics ----------
+(function(){
+  const tiles=[
+    {v:META.pass_completion+'%', k:'Pass completion', sub:META.pass_att+' att/game'},
+    {v:META.conversion+'%', k:'Shot conversion', sub:META.shots+' shots · '+META.shots_scored+' scored'},
+    {v:META.possession+'%', k:'Possession', sub:'share of ticks'},
+    {v:META.passes, k:'Passes / game', sub:'completed'},
+    {v:META.balls_won, k:'Balls won / game', sub:'press · tackle · intercept'},
+    {v:META.turnovers, k:'Turnovers / game', sub:'possession lost'},
+  ];
+  document.getElementById('statgrid').innerHTML=tiles.map(t=>
+    `<div class="stat"><div class="v">${t.v}</div><div class="k">${t.k}</div><div class="sub">${t.sub}</div></div>`).join('');
+
+  // pass mix bar (forward / lateral / backward)
+  const mix=[
+    {label:'forward', pct:META.pass_fwd_pct, col:'var(--teamA)'},
+    {label:'lateral', pct:META.pass_lat_pct, col:'var(--ink-dim)'},
+    {label:'backward', pct:META.pass_back_pct, col:'var(--teamB)'},
+  ];
+  document.getElementById('passbar').innerHTML=mix.map(m=>
+    m.pct>0?`<div class="seg${m.pct<12?' small':''}" style="flex:${m.pct};background:${m.col}">${m.pct>=8?m.pct+'%':''}</div>`:'').join('');
+  document.getElementById('passbar-legend').innerHTML=mix.map(m=>
+    `<span class="sw"><i style="background:${m.col}"></i>${m.label} ${m.pct}%</span>`).join('');
+
+  // rates over training (pass completion %, shot conversion %, possession %)
+  const cv=document.getElementById('rates');const ctx=cv.getContext('2d');
+  function resize(){const w=cv.clientWidth||420;const dpr=Math.min(2,window.devicePixelRatio||1);
+    cv.width=w*dpr;cv.height=Math.round(w*0.5)*dpr;cv.style.height=Math.round(w*0.5)+'px';ctx.setTransform(dpr,0,0,dpr,0,0);draw(w,Math.round(w*0.5));}
+  function css(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim();}
+  function draw(w,h){
+    ctx.clearRect(0,0,w,h);const padL=34,padR=12,padT=12,padB=22;
+    const xs=CURVE.map(p=>p.iter),maxI=Math.max(...xs,1);
+    const X=i=>padL+(i/maxI)*(w-padL-padR), Y=v=>padT+(1-v/100)*(h-padT-padB);
+    ctx.strokeStyle=css('--grid');ctx.fillStyle=css('--ink-dim');ctx.font='10px ui-monospace,monospace';
+    ctx.textAlign='right';ctx.textBaseline='middle';
+    for(let g=0;g<=100;g+=25){const y=Y(g);ctx.beginPath();ctx.moveTo(padL,y);ctx.lineTo(w-padR,y);ctx.stroke();ctx.fillText(g,padL-6,y);}
+    const line=(key,mul,color)=>{ctx.strokeStyle=color;ctx.lineWidth=2;ctx.lineJoin='round';ctx.beginPath();
+      CURVE.forEach((p,i)=>{const y=Y((p[key]||0)*mul);i?ctx.lineTo(X(p.iter),y):ctx.moveTo(X(p.iter),y);});ctx.stroke();};
+    line('passcomp',100,css('--accent'));   // pass completion (0..1 -> %)
+    line('conv',100,css('--good'));          // shot conversion
+    line('poss',100,css('--ink-dim'));       // possession
+    ctx.textAlign='center';ctx.textBaseline='top';
+    [0,Math.round(maxI/2),maxI].forEach(i=>ctx.fillText(i,X(i),h-padB+6));
+  }
+  resize();window.addEventListener('resize',resize);
+  new MutationObserver(resize).observe(document.documentElement,{attributes:true,attributeFilter:['data-theme']});
+})();
+
 // ---------- pitch renderer ----------
 const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 function css(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim();}
