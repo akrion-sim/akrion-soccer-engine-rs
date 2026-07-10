@@ -4249,22 +4249,6 @@ pub(crate) fn goal_reward_scale() -> f64 {
             .unwrap_or(1.0)
     })
 }
-
-/// DAMPEN the dense possession-progress shaping so it stops drowning sparse goals. Env
-/// `DD_SOCCER_POSSESSION_SHAPING_SCALE` (default 1.0 = unchanged), clamped [0, 1]. Lower = less
-/// reward for merely retaining/advancing possession, which discourages the degenerate sideways-hold.
-pub(crate) fn possession_shaping_scale() -> f64 {
-    use std::sync::OnceLock;
-    static V: OnceLock<f64> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("DD_SOCCER_POSSESSION_SHAPING_SCALE")
-            .ok()
-            .and_then(|raw| raw.trim().parse::<f64>().ok())
-            .filter(|v| v.is_finite())
-            .map(|v| v.clamp(0.0, 1.0))
-            .unwrap_or(1.0)
-    })
-}
 const OUTSIDE_MID_TAKEON_ISOLATION_REWARD: f64 = 0.14;
 // Defensive recovery: a contestable ball within this many yards of our back line
 // (2nd-to-last defender) demands max sprint effort; above this recovery effort the
