@@ -27005,7 +27005,8 @@ fn dense_soccer_transition_reward(
             let offside_forward_run = offside_support && player_forward > 0.0;
             if player_forward > 0.0 && !offside_support {
                 reward += (player_forward / TEAM_ADVANCE_REWARD_REFERENCE_YARDS).clamp(0.0, 1.0)
-                    * TEAM_ADVANCE_SUPPORT_RUN_REWARD;
+                    * TEAM_ADVANCE_SUPPORT_RUN_REWARD
+                    * offball_support_reward_scale();
             } else if offside_forward_run {
                 reward -= TEAM_ADVANCE_SUPPORT_FAILURE_PENALTY;
             } else if !offside_support && (player_forward < -0.25 || moved_yards < 0.10) {
