@@ -549,24 +549,40 @@ impl World {
     }
 
     fn try_capture(&mut self) {
-        if self.ball_vel.len() > CAPTURE_MAX_BALL_SPEED {
-            self.kick_timer -= 1;
-            return;
-        }
-        // nearest player of either team within control radius takes it.
+        let ball_fast = self.ball_vel.len() > CAPTURE_MAX_BALL_SPEED;
         let mut best: Option<(Owner, f32)> = None;
+        // Keepers first: they can smother/save even fast shots within reach.
         for team in [Team::A, Team::B] {
-            for i in 0..N {
-                if self.kick_timer > 0 {
-                    if let Some(lk) = self.last_kicker {
-                        if lk.team == team && lk.idx == i {
-                            continue; // kicker can't recapture instantly
-                        }
+            if self.kick_timer > 0 {
+                if let Some(lk) = self.last_kicker {
+                    if lk.team == team && lk.idx == GK {
+                        continue;
                     }
                 }
-                let d = players(team, self)[i].pos.sub(self.ball).len();
-                if d < CONTROL_RADIUS && best.map_or(true, |(_, bd)| d < bd) {
-                    best = Some((Owner { team, idx: i }, d));
+            }
+            let d = players(team, self)[GK].pos.sub(self.ball).len();
+            if d < KEEPER_REACH && best.map_or(true, |(_, bd)| d < bd) {
+                best = Some((Owner { team, idx: GK }, d));
+            }
+        }
+        // Outfield players only control a ball that isn't screaming past them.
+        if best.is_none() && !ball_fast {
+            for team in [Team::A, Team::B] {
+                for i in 0..N {
+                    if i == GK {
+                        continue;
+                    }
+                    if self.kick_timer > 0 {
+                        if let Some(lk) = self.last_kicker {
+                            if lk.team == team && lk.idx == i {
+                                continue; // kicker can't recapture instantly
+                            }
+                        }
+                    }
+                    let d = players(team, self)[i].pos.sub(self.ball).len();
+                    if d < CONTROL_RADIUS && best.map_or(true, |(_, bd)| d < bd) {
+                        best = Some((Owner { team, idx: i }, d));
+                    }
                 }
             }
         }
