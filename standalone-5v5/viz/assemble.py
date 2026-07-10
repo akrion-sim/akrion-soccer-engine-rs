@@ -78,6 +78,7 @@ def main():
         "swing": fmt_diff(after_diff - before_diff),
         "passes": round(passes, 1),
         "spacing": round(spacing, 1),
+        "bunch": round(bunch, 0),
         "iters": iters,
         "minutes": "~6 min on a laptop",
     }
