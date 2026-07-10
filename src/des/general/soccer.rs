@@ -27713,7 +27713,8 @@ fn dense_soccer_transition_reward(
                     * DENSE_FORWARD_CARRY_PROGRESS_REWARD_PER_YARD
                     * role_multiplier
                     * pressure_multiplier
-                    * half_multiplier;
+                    * half_multiplier
+                    * carry_reward_scale();
                 if carry_progress >= 6.0 {
                     reward += 0.18 * role_multiplier * half_multiplier;
                 }
