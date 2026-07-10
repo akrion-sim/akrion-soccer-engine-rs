@@ -443,6 +443,7 @@ impl World {
         self.ev_pass_completed_a = false;
         self.ev_turnover_a = false;
         self.ev_shot_on_a = false;
+        self.ev_win_ball_a = false;
 
         let ball_x_before = self.ball.x;
 
