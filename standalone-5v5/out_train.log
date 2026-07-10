@@ -1,0 +1,66 @@
+=== 5-a-side standalone learning demo ===
+scripted-vs-scripted:   goal_diff=-0.17  (A 0.78 / B 0.95)
+untrained-vs-scripted:  goal_diff=-0.85  winrate=0.20  (A 0.04 / B 0.89)  spacing=5.2
+training for 250 iterations (8 games/iter)...
+
+ iter |  goal_diff |  winrate |     gA     gB |  space | entropy |  val_loss
+--------------------------------------------------------------------------------
+    5 |     -0.967 |    0.242 |   0.18   1.15 | sp  5.3 | bunch  57% | pass 15.8 (60%) | shot 2.9
+   10 |     -0.933 |    0.200 |   0.03   0.97 | sp  7.8 | bunch  18% | pass 69.1 (58%) | shot 0.8
+   15 |     -1.067 |    0.158 |   0.12   1.18 | sp  9.4 | bunch   6% | pass 33.2 (57%) | shot 1.0
+   20 |     -0.217 |    0.425 |   1.07   1.28 | sp  6.1 | bunch  24% | pass 38.2 (51%) | shot 6.5
+   25 |     -0.067 |    0.475 |   0.48   0.55 | sp  5.1 | bunch  47% | pass  9.1 (68%) | shot 3.3
+   30 |     -0.283 |    0.400 |   1.17   1.45 | sp  5.7 | bunch  18% | pass 46.1 (53%) | shot 5.4
+   35 |     -0.733 |    0.225 |   0.02   0.75 | sp  4.8 | bunch  44% | pass 68.6 (80%) | shot 0.1
+   40 |     -0.817 |    0.217 |   0.12   0.93 | sp  4.4 | bunch  54% | pass 67.8 (82%) | shot 0.5
+   45 |     -1.533 |    0.108 |   0.02   1.55 | sp  4.8 | bunch  31% | pass 115.4 (73%) | shot 0.1
+   50 |     -1.050 |    0.167 |   0.00   1.05 | sp  5.0 | bunch  31% | pass 76.6 (73%) | shot 0.0
+   55 |     -0.867 |    0.192 |   0.00   0.87 | sp  4.8 | bunch  29% | pass 73.1 (79%) | shot 0.0
+   60 |     -0.550 |    0.283 |   0.00   0.55 | sp  5.1 | bunch  25% | pass 68.8 (86%) | shot 0.0
+   65 |     -0.450 |    0.308 |   0.00   0.45 | sp  4.8 | bunch  27% | pass 54.1 (87%) | shot 0.0
+   70 |     -0.600 |    0.275 |   0.00   0.60 | sp  4.5 | bunch  32% | pass 54.2 (85%) | shot 0.0
+   75 |     -0.600 |    0.242 |   0.00   0.60 | sp  4.5 | bunch  34% | pass 59.3 (81%) | shot 0.0
+   80 |     -0.567 |    0.283 |   0.00   0.57 | sp  4.6 | bunch  29% | pass 70.1 (85%) | shot 0.0
+   85 |     -0.417 |    0.350 |   0.00   0.42 | sp  5.0 | bunch  33% | pass 40.9 (83%) | shot 0.0
+   90 |     -0.200 |    0.417 |   0.00   0.20 | sp  5.0 | bunch  40% | pass 22.2 (91%) | shot 0.0
+   95 |     -0.233 |    0.408 |   0.00   0.23 | sp  5.1 | bunch  24% | pass 32.7 (94%) | shot 0.0
+  100 |     -0.350 |    0.333 |   0.00   0.35 | sp  4.8 | bunch  27% | pass 32.3 (93%) | shot 0.0
+  105 |     -0.317 |    0.350 |   0.00   0.32 | sp  4.9 | bunch  19% | pass 32.4 (95%) | shot 0.0
+  110 |     -0.317 |    0.350 |   0.00   0.32 | sp  4.7 | bunch  21% | pass 35.0 (94%) | shot 0.0
+  115 |     -0.233 |    0.392 |   0.00   0.23 | sp  5.1 | bunch  19% | pass 53.2 (93%) | shot 0.0
+  120 |     -0.267 |    0.383 |   0.00   0.27 | sp  5.3 | bunch  32% | pass 46.8 (95%) | shot 0.0
+  125 |     -0.300 |    0.375 |   0.00   0.30 | sp  5.1 | bunch  19% | pass 56.8 (92%) | shot 0.0
+  130 |     -0.150 |    0.425 |   0.00   0.15 | sp  5.2 | bunch  20% | pass 45.6 (94%) | shot 0.0
+  135 |     +0.000 |    0.500 |   0.00   0.00 | sp  5.7 | bunch  11% | pass 24.9 (94%) | shot 0.0
+  140 |     -0.033 |    0.483 |   0.00   0.03 | sp  5.5 | bunch  15% | pass 19.8 (93%) | shot 0.0
+  145 |     -0.050 |    0.475 |   0.00   0.05 | sp  5.1 | bunch  23% | pass 30.3 (92%) | shot 0.0
+  150 |     -0.050 |    0.475 |   0.00   0.05 | sp  4.8 | bunch  70% | pass 20.4 (91%) | shot 0.0
+  155 |     -0.033 |    0.483 |   0.00   0.03 | sp  4.5 | bunch  74% | pass 17.5 (91%) | shot 0.0
+  160 |     -0.050 |    0.475 |   0.00   0.05 | sp  5.7 | bunch  36% | pass 28.7 (87%) | shot 0.0
+  165 |     -0.033 |    0.483 |   0.00   0.03 | sp  5.8 | bunch  25% | pass 24.1 (87%) | shot 0.0
+  170 |     -0.033 |    0.483 |   0.00   0.03 | sp  4.3 | bunch  58% | pass 23.1 (87%) | shot 0.0
+  175 |     -0.150 |    0.425 |   0.00   0.15 | sp  4.4 | bunch  45% | pass 45.4 (87%) | shot 0.0
+  180 |     -0.017 |    0.492 |   0.00   0.02 | sp  5.1 | bunch  71% | pass 41.4 (82%) | shot 0.0
+  185 |     -0.017 |    0.492 |   0.00   0.02 | sp  4.8 | bunch  48% | pass 32.6 (83%) | shot 0.0
+  190 |     -0.033 |    0.483 |   0.00   0.03 | sp  4.8 | bunch  52% | pass 30.1 (88%) | shot 0.0
+  195 |     +0.000 |    0.500 |   0.00   0.00 | sp  5.1 | bunch  43% | pass 30.3 (91%) | shot 0.0
+  200 |     +0.000 |    0.500 |   0.00   0.00 | sp  5.0 | bunch  47% | pass 21.1 (88%) | shot 0.0
+  205 |     +0.000 |    0.500 |   0.00   0.00 | sp  5.6 | bunch  15% | pass 23.6 (87%) | shot 0.0
+  210 |     +0.000 |    0.500 |   0.00   0.00 | sp  4.9 | bunch  15% | pass 30.8 (85%) | shot 0.0
+  215 |     -0.017 |    0.492 |   0.00   0.02 | sp  5.2 | bunch   9% | pass 21.2 (83%) | shot 0.0
+  220 |     +0.000 |    0.500 |   0.00   0.00 | sp  5.8 | bunch  14% | pass 32.8 (87%) | shot 0.0
+  225 |     -0.217 |    0.392 |   0.00   0.22 | sp  4.1 | bunch  43% | pass 97.8 (84%) | shot 0.0
+  230 |     -0.033 |    0.483 |   0.00   0.03 | sp  4.3 | bunch  63% | pass 40.1 (85%) | shot 0.0
+  235 |     -0.017 |    0.492 |   0.00   0.02 | sp  4.9 | bunch  14% | pass 29.1 (85%) | shot 0.0
+  240 |     -0.017 |    0.492 |   0.00   0.02 | sp  5.8 | bunch  15% | pass 47.9 (84%) | shot 0.0
+  245 |     +0.000 |    0.500 |   0.00   0.00 | sp  5.2 | bunch  10% | pass 23.0 (85%) | shot 0.0
+  250 |     -0.017 |    0.492 |   0.00   0.02 | sp  5.0 | bunch  18% | pass 48.0 (81%) | shot 0.0
+
+wrote out/learning_curve.csv
+best policy at iter 135 (eval goal_diff +0.425)
+saved policy -> out/actor.txt, out/critic.txt
+
+FINAL (300 games): goal_diff=-0.017  winrate=0.492  goals 0.00-0.02  passes/game 20.7  spacing=5.8  bunch=9%
+  pass: 22.2 att, 93% complete (23% fwd / 55% lat / 22% back) | shots 0.0, 0% converted | poss 4% | turnovers 2.2 | balls won 1.4
+display seed 1: before 0-1 (poss 125)  ->  after 0-0 (poss 16, passes 15)
+wrote out/match_before.json + out/match_after.json (visual demo traces)
