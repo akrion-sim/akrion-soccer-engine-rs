@@ -5,22 +5,26 @@
 use crate::rng::Rng;
 
 // ---- Field / rules ----------------------------------------------------------
-pub const FIELD_L: f32 = 105.0;
-pub const FIELD_W: f32 = 68.0;
-pub const GOAL_HALF: f32 = 7.32; // half goal-mouth width in y
-pub const N: usize = 5; // players per team
+// Small-sided pitch (roughly a 5-a-side / futsal court, not a full field).
+pub const FIELD_L: f32 = 42.0;
+pub const FIELD_W: f32 = 28.0;
+pub const GOAL_HALF: f32 = 3.0; // half goal-mouth width in y (~6m net)
+pub const N: usize = 5; // players per team (index 0 == goalkeeper)
+pub const GK: usize = 0; // goalkeeper index; controlled by a fixed rule, not the policy
 pub const DT: f32 = 0.1; // seconds per decision tick
 pub const STEPS: usize = 400; // ticks per game (~40s)
 
-const PLAYER_SPEED: f32 = 7.0;
-const CONTROL_RADIUS: f32 = 1.7;
-const TACKLE_RADIUS: f32 = 1.6;
-const TACKLE_PROB: f32 = 0.22;
-const BALL_FRICTION: f32 = 0.94; // per tick multiplicative decay
-const PASS_SPEED: f32 = 20.0;
-const SHOT_SPEED: f32 = 30.0;
-const CLEAR_SPEED: f32 = 24.0;
-const CAPTURE_MAX_BALL_SPEED: f32 = 34.0;
+const PLAYER_SPEED: f32 = 6.5;
+const CONTROL_RADIUS: f32 = 1.4;
+const TACKLE_RADIUS: f32 = 1.4;
+const TACKLE_PROB: f32 = 0.18;
+const BALL_FRICTION: f32 = 0.93; // per tick multiplicative decay
+const PASS_SPEED: f32 = 16.0;
+const SHOT_SPEED: f32 = 24.0;
+const CLEAR_SPEED: f32 = 20.0;
+const CAPTURE_MAX_BALL_SPEED: f32 = 26.0;
+const KEEPER_REACH: f32 = 2.6; // keeper can smother/save within this radius (even fast shots)
+const KEEPER_SPEED: f32 = 6.0;
 
 // ---- Action space -----------------------------------------------------------
 pub const NA: usize = 13;
