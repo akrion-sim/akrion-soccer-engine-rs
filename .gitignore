@@ -7,3 +7,6 @@ tmp
 .cargo-target-*/
 
 .claude/worktrees/
+
+__pycache__/
+*.pyc

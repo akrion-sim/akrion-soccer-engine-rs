@@ -4642,10 +4642,7 @@ mod tests {
         let dribble_turnover_start = sim.stats.dribble_turnovers_home;
         sim.complete_defensive_dispossession(defender, attacker, "tackle");
 
-        assert_eq!(
-            sim.stats.dribble_turnovers_home,
-            dribble_turnover_start + 1
-        );
+        assert_eq!(sim.stats.dribble_turnovers_home, dribble_turnover_start + 1);
         let added = &sim.deferred_reward_transitions[deferred_start..];
         assert!(
             added.iter().any(|transition| {
@@ -8168,6 +8165,67 @@ mod tests {
         assert!(
             (power - learned_power).abs() < 1e-9,
             "execution must carry the selected discretized kick power bucket"
+        );
+    }
+
+    #[test]
+    fn forward_release_injection_expands_receiver_into_power_bucket_candidates() {
+        let _env_lock = soccer_world_env_lock();
+        let _env = set_test_env_var("DD_SOCCER_ENABLE_DISCRETIZED_KICK", "1");
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            learning_enabled: true,
+            ..MatchConfig::default()
+        });
+        let actor = sim
+            .players
+            .iter()
+            .position(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home field player");
+        let actor_id = sim.players[actor].id;
+        let actor_team = sim.players[actor].team;
+        sim.players[actor].position = Vec2::new(40.0, 44.0);
+        sim.ball.holder = Some(actor_id);
+        sim.ball.position = sim.players[actor].position;
+
+        let target = sim
+            .players
+            .iter()
+            .position(|player| {
+                player.team == actor_team
+                    && player.id != actor_id
+                    && player.role != PlayerRole::Goalkeeper
+            })
+            .expect("same-team pass target");
+        let target_id = sim.players[target].id;
+        sim.players[target].position = Vec2::new(48.0, 64.0);
+        let snapshot = WorldSnapshot::from_match(&sim);
+
+        let plans = SoccerMatch::neural_mcts_pass_target_candidate_plans(
+            &snapshot,
+            actor_id,
+            actor_team,
+            "pass",
+            "pass1".to_string(),
+            target_id,
+        );
+        let labels = plans
+            .iter()
+            .map(|plan| plan.action.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(
+            labels.contains(&"pass1"),
+            "forward release keeps a plain feet pass candidate"
+        );
+        assert!(
+            labels.iter().any(|label| label.starts_with("pass1-kp")),
+            "forward release must expose learned kick-power variants, not only a plain pass"
+        );
+        assert!(
+            plans
+                .iter()
+                .all(|plan| plan.target_player == Some(target_id)),
+            "all injected forward-release variants should stay bound to the cap-excluded receiver"
         );
     }
 
@@ -16232,92 +16290,110 @@ impl SoccerMatch {
             .enumerate()
             .flat_map(|(index, target_player)| {
                 let base_action = format!("{}{}", prefix, index + 1);
-                let mut plans = Vec::with_capacity(
-                    1 + if dd_soccer_enable_discretized_kick() {
-                        neural_mcts_kick_power_candidate_limit()
-                    } else {
-                        0
-                    },
-                );
-                plans.push(SoccerLearnedPlan {
-                    action: base_action.clone(),
-                    target_player: Some(target_player),
-                    target_point: snapshot.player_position(target_player),
-                    mpc_replan: None,
-                });
-                // Pass-to-space variant (gated, Codex round-10 shape): same receiver, but the ball
-                // is led into the anticipated reception point ahead of them, so the CRITIC scores
-                // feet-vs-run-onto and owns that spatial choice. Keeps `target_player` bound so pass
-                // MPC/receipt/concede-veto logic is unchanged. Skipped when the lead coincides with
-                // the feet target (no distinct candidate to score). Default OFF ⇒ byte-identical.
-                if dd_soccer_enable_neural_pass_space() {
-                    if let (Some(passer), Some(receiver_position)) = (
-                        snapshot.players.iter().find(|p| p.id == player_id),
-                        snapshot.player_position(target_player),
-                    ) {
-                        let flight = pass_like_action_flight(prefix).unwrap_or(PassFlight::Floor);
-                        let passer_position = snapshot
-                            .player_position(player_id)
-                            .unwrap_or(receiver_position);
-                        let is_cross = pass_would_be_cross(
-                            passer_position,
-                            receiver_position,
-                            team,
-                            snapshot.field_width,
-                            snapshot.field_length,
-                        );
-                        let nominal_speed =
-                            pass_speed_yps_from_power(0.68, flight, is_cross, &passer.skills);
-                        let space_point = snapshot.anticipated_pass_reception_point(
-                            player_id,
-                            target_player,
-                            flight,
-                            nominal_speed,
-                        );
-                        let distinct = space_point
-                            .map(|sp| sp.distance(receiver_position) > 1.0)
-                            .unwrap_or(false);
-                        if pass_space_diag_enabled() {
-                            record_pass_space_source_diag(space_point.is_some(), distinct);
-                        }
-                        if let Some(space_point) = space_point {
-                            if distinct {
-                                plans.push(SoccerLearnedPlan {
-                                    action: base_action.clone(),
-                                    target_player: Some(target_player),
-                                    target_point: Some(space_point),
-                                    mpc_replan: None,
-                                });
-                            }
-                        }
-                    }
-                }
-                if dd_soccer_enable_discretized_kick() {
-                    let buckets = if prefix == "aerial-pass" {
-                        &NEURAL_MCTS_AERIAL_KICK_POWER_BUCKETS[..]
-                    } else {
-                        &NEURAL_MCTS_FLOOR_KICK_POWER_BUCKETS[..]
-                    };
-                    plans.extend(
-                        buckets
-                            .iter()
-                            .copied()
-                            .take(neural_mcts_kick_power_candidate_limit())
-                            .filter_map(|bucket| {
-                                learned_discretized_kick_candidate_label(&base_action, bucket).map(
-                                    |action| SoccerLearnedPlan {
-                                        action,
-                                        target_player: Some(target_player),
-                                        target_point: snapshot.player_position(target_player),
-                                        mpc_replan: None,
-                                    },
-                                )
-                            }),
-                    );
-                }
-                plans
+                Self::neural_mcts_pass_target_candidate_plans(
+                    snapshot,
+                    player_id,
+                    team,
+                    prefix,
+                    base_action,
+                    target_player,
+                )
             })
             .collect()
+    }
+
+    fn neural_mcts_pass_target_candidate_plans(
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        team: Team,
+        prefix: &str,
+        base_action: String,
+        target_player: usize,
+    ) -> Vec<SoccerLearnedPlan> {
+        let mut plans = Vec::with_capacity(
+            1 + if dd_soccer_enable_discretized_kick() {
+                neural_mcts_kick_power_candidate_limit()
+            } else {
+                0
+            },
+        );
+        plans.push(SoccerLearnedPlan {
+            action: base_action.clone(),
+            target_player: Some(target_player),
+            target_point: snapshot.player_position(target_player),
+            mpc_replan: None,
+        });
+        // Pass-to-space variant (gated, Codex round-10 shape): same receiver, but the ball
+        // is led into the anticipated reception point ahead of them, so the CRITIC scores
+        // feet-vs-run-onto and owns that spatial choice. Keeps `target_player` bound so pass
+        // MPC/receipt/concede-veto logic is unchanged. Skipped when the lead coincides with
+        // the feet target (no distinct candidate to score). Default OFF ⇒ byte-identical.
+        if dd_soccer_enable_neural_pass_space() {
+            if let (Some(passer), Some(receiver_position)) = (
+                snapshot.players.iter().find(|p| p.id == player_id),
+                snapshot.player_position(target_player),
+            ) {
+                let flight = pass_like_action_flight(prefix).unwrap_or(PassFlight::Floor);
+                let passer_position = snapshot
+                    .player_position(player_id)
+                    .unwrap_or(receiver_position);
+                let is_cross = pass_would_be_cross(
+                    passer_position,
+                    receiver_position,
+                    team,
+                    snapshot.field_width,
+                    snapshot.field_length,
+                );
+                let nominal_speed =
+                    pass_speed_yps_from_power(0.68, flight, is_cross, &passer.skills);
+                let space_point = snapshot.anticipated_pass_reception_point(
+                    player_id,
+                    target_player,
+                    flight,
+                    nominal_speed,
+                );
+                let distinct = space_point
+                    .map(|sp| sp.distance(receiver_position) > 1.0)
+                    .unwrap_or(false);
+                if pass_space_diag_enabled() {
+                    record_pass_space_source_diag(space_point.is_some(), distinct);
+                }
+                if let Some(space_point) = space_point {
+                    if distinct {
+                        plans.push(SoccerLearnedPlan {
+                            action: base_action.clone(),
+                            target_player: Some(target_player),
+                            target_point: Some(space_point),
+                            mpc_replan: None,
+                        });
+                    }
+                }
+            }
+        }
+        if dd_soccer_enable_discretized_kick() {
+            let buckets = if prefix == "aerial-pass" {
+                &NEURAL_MCTS_AERIAL_KICK_POWER_BUCKETS[..]
+            } else {
+                &NEURAL_MCTS_FLOOR_KICK_POWER_BUCKETS[..]
+            };
+            plans.extend(
+                buckets
+                    .iter()
+                    .copied()
+                    .take(neural_mcts_kick_power_candidate_limit())
+                    .filter_map(|bucket| {
+                        learned_discretized_kick_candidate_label(&base_action, bucket).map(
+                            |action| SoccerLearnedPlan {
+                                action,
+                                target_player: Some(target_player),
+                                target_point: snapshot.player_position(target_player),
+                                mpc_replan: None,
+                            },
+                        )
+                    }),
+            );
+        }
+        plans
     }
 
     fn neural_mcts_dribble_variant_candidate_plans(
@@ -17785,156 +17861,156 @@ impl SoccerMatch {
             .best_forward_pass_option_quality
             .max(observation.best_forward_pass_receiver_openness)
             .clamp(0.0, 1.0);
-        let mut push_scored_candidate =
-            |candidate: &SoccerLearnedActionTrace, candidate_plan: SoccerLearnedPlan| {
-                if !Self::neural_mcts_candidate_plan_is_executable(
-                    snapshot,
-                    player_id,
-                    &candidate_plan,
-                ) {
-                    return;
+        let mut push_scored_candidate = |candidate: &SoccerLearnedActionTrace,
+                                         candidate_plan: SoccerLearnedPlan,
+                                         extra_score_bias: f64|
+         -> bool {
+            if !Self::neural_mcts_candidate_plan_is_executable(snapshot, player_id, &candidate_plan)
+            {
+                return false;
+            }
+            let transition = self.neural_decision_transition_for_plan(
+                &base,
+                snapshot,
+                player_id,
+                team,
+                &candidate_plan,
+            );
+            let candidate_label = transition.action.clone();
+            if !Self::neural_mcts_transition_context_is_executable(&transition) {
+                return false;
+            }
+            let discretized_kick_candidate =
+                learned_discretized_kick_speed_bucket_for_action_label(&candidate_label).is_some();
+            let neural_value = neural_q(&transition);
+            // Value contribution (0-weighted when the value blend is off/cold).
+            let value_score = match blend.mode {
+                SoccerNeuralBlendMode::Off => candidate.value,
+                SoccerNeuralBlendMode::Additive => {
+                    candidate.value + lambda * neural_value.unwrap_or(0.0)
                 }
-                let transition = self.neural_decision_transition_for_plan(
-                    &base,
-                    snapshot,
-                    player_id,
-                    team,
-                    &candidate_plan,
-                );
-                let candidate_label = transition.action.clone();
-                if !Self::neural_mcts_transition_context_is_executable(&transition) {
-                    return;
+                SoccerNeuralBlendMode::TieBreak => {
+                    if best_tabular - candidate.value > blend.tie_epsilon {
+                        // Outside the tie window — not a candidate for re-ranking.
+                        return false;
+                    }
+                    candidate.value + lambda * neural_value.unwrap_or(0.0)
                 }
-                let discretized_kick_candidate =
-                    learned_discretized_kick_speed_bucket_for_action_label(&candidate_label)
-                        .is_some();
-                let neural_value = neural_q(&transition);
-                // Value contribution (0-weighted when the value blend is off/cold).
-                let value_score = match blend.mode {
-                    SoccerNeuralBlendMode::Off => candidate.value,
-                    SoccerNeuralBlendMode::Additive => {
-                        candidate.value + lambda * neural_value.unwrap_or(0.0)
+                SoccerNeuralBlendMode::ConfidenceGated => {
+                    if candidate.visits < blend.min_confidence_visits {
+                        // Tabular is blind here — blend toward the net's estimate.
+                        let weight = lambda.min(1.0);
+                        let nv = neural_value.unwrap_or(candidate.value);
+                        (1.0 - weight) * candidate.value + weight * nv
+                    } else {
+                        candidate.value
                     }
-                    SoccerNeuralBlendMode::TieBreak => {
-                        if best_tabular - candidate.value > blend.tie_epsilon {
-                            // Outside the tie window — not a candidate for re-ranking.
-                            return;
-                        }
-                        candidate.value + lambda * neural_value.unwrap_or(0.0)
-                    }
-                    SoccerNeuralBlendMode::ConfidenceGated => {
-                        if candidate.visits < blend.min_confidence_visits {
-                            // Tabular is blind here — blend toward the net's estimate.
-                            let weight = lambda.min(1.0);
-                            let nv = neural_value.unwrap_or(candidate.value);
-                            (1.0 - weight) * candidate.value + weight * nv
-                        } else {
-                            candidate.value
-                        }
-                    }
-                    SoccerNeuralBlendMode::Authoritative => {
-                        let neural = neural_value.unwrap_or(0.0);
-                        let base_value_weight = if discretized_kick_candidate {
-                            neural_mcts_discretized_kick_base_value_weight()
-                        } else {
-                            1.0e-6
-                        };
-                        lambda * neural + candidate.value * base_value_weight
-                    }
-                };
-                // Actor bias: nudge toward the family the learned policy prefers.
-                let actor_bonus = policy_bonus(&candidate_label);
-                // Approximate-DP bridge: authoritative neural scoring used to all but ignore
-                // the Bellman-swept tabular value (`candidate.value * 1e-6`). Keep neural in
-                // charge, but let the learned DP/Q prior reward actions whose replay-backed value
-                // is above this candidate set's center and suppress actions below it.
-                let dp_policy_bonus =
-                    soccer_approx_dp_policy_prior_bonus(candidate.value, dp_policy_value_center);
-                let retrieved_bonus = if blend.mode == SoccerNeuralBlendMode::Authoritative {
-                    0.0
-                } else {
-                    retrieval_bonus(&candidate_label)
-                };
-                let model_bonus = if blend.mcts_enabled && mcts_model_weight > 0.0 {
-                    mcts_model_weight
-                        * self.neural_mcts_model_rollout_value(
-                            learner,
-                            &transition,
-                            target_scale,
-                            mcts_depth,
-                            gamma,
-                        )
-                } else {
-                    0.0
-                };
-                let mpc_candidate_bonus = if blend.mcts_enabled {
-                    Self::neural_mcts_candidate_mpc_bonus(
-                        snapshot,
-                        player_id,
-                        &candidate_plan,
-                        &transition,
-                    )
-                } else {
-                    0.0
-                };
-                let score = value_score
-                    + actor_bonus
-                    + dp_policy_bonus
-                    + retrieved_bonus
-                    + model_bonus
-                    + mpc_candidate_bonus;
-                // Learned FORWARD action-selection bias. Eligibility: the bias is armed
-                // (`forward_select_weight != 0.0`, which folds in gate-off / no-policy-head), the
-                // candidate is pass-like (`pass_like_action_flight`), AND the candidate PLAN's target
-                // is geometrically FORWARD (`candidate_plan.target_point` vs the carrier, past the
-                // forward-yards deadband) — NOT gated on the label, since lateral/backward passes
-                // share the "pass"/"pass-kpN" label. The applied bonus is
-                // `weight * forward_option_quality` CLAMPED to ±SOCCER_FORWARD_SELECT_BONUS_ABS_MAX so
-                // a large learned weight nudges — rather than swamps — the sort. Added conditionally
-                // (never an always-added 0.0 term) so the gate-off / non-eligible path leaves `score`
-                // bit-for-bit unchanged — the sort below uses `total_cmp`, which separates -0.0/+0.0.
-                let forward_select_eligible = forward_select_weight != 0.0
-                    && pass_like_action_flight(&candidate_plan.action).is_some()
-                    && soccer_plan_target_forward_yards(&candidate_plan, snapshot, player_id, team)
-                        .is_some_and(|yards| yards > SOCCER_FORWARD_SELECT_MIN_FORWARD_YARDS);
-                let score = if forward_select_eligible {
-                    let bonus = (forward_select_weight * forward_select_feature).clamp(
-                        -SOCCER_FORWARD_SELECT_BONUS_ABS_MAX,
-                        SOCCER_FORWARD_SELECT_BONUS_ABS_MAX,
-                    );
-                    score + bonus
-                } else {
-                    score
-                };
-                if !score.is_finite() {
-                    return;
                 }
-                let actor_prior = policy_log_probs
-                    .as_ref()
-                    .and_then(|log_probs| {
-                        soccer_policy_action_index(&candidate_label).and_then(|i| log_probs.get(i))
-                    })
-                    .map(|log_p| log_p.exp())
-                    .unwrap_or(0.0);
-                scored_candidates.push(SoccerNeuralMctsCandidate {
-                    label: candidate_label,
-                    plan: Some(candidate_plan),
-                    score,
-                    prior: actor_prior + retrieved_bonus.max(0.0) + mpc_candidate_bonus.max(0.0),
-                    q_visits: candidate.visits,
-                });
+                SoccerNeuralBlendMode::Authoritative => {
+                    let neural = neural_value.unwrap_or(0.0);
+                    let base_value_weight = if discretized_kick_candidate {
+                        neural_mcts_discretized_kick_base_value_weight()
+                    } else {
+                        1.0e-6
+                    };
+                    lambda * neural + candidate.value * base_value_weight
+                }
             };
+            // Actor bias: nudge toward the family the learned policy prefers.
+            let actor_bonus = policy_bonus(&candidate_label);
+            // Approximate-DP bridge: authoritative neural scoring used to all but ignore
+            // the Bellman-swept tabular value (`candidate.value * 1e-6`). Keep neural in
+            // charge, but let the learned DP/Q prior reward actions whose replay-backed value
+            // is above this candidate set's center and suppress actions below it.
+            let dp_policy_bonus =
+                soccer_approx_dp_policy_prior_bonus(candidate.value, dp_policy_value_center);
+            let retrieved_bonus = if blend.mode == SoccerNeuralBlendMode::Authoritative {
+                0.0
+            } else {
+                retrieval_bonus(&candidate_label)
+            };
+            let model_bonus = if blend.mcts_enabled && mcts_model_weight > 0.0 {
+                mcts_model_weight
+                    * self.neural_mcts_model_rollout_value(
+                        learner,
+                        &transition,
+                        target_scale,
+                        mcts_depth,
+                        gamma,
+                    )
+            } else {
+                0.0
+            };
+            let mpc_candidate_bonus = if blend.mcts_enabled {
+                Self::neural_mcts_candidate_mpc_bonus(
+                    snapshot,
+                    player_id,
+                    &candidate_plan,
+                    &transition,
+                )
+            } else {
+                0.0
+            };
+            let score = value_score
+                + actor_bonus
+                + dp_policy_bonus
+                + retrieved_bonus
+                + model_bonus
+                + mpc_candidate_bonus;
+            // Learned FORWARD action-selection bias. Eligibility: the bias is armed
+            // (`forward_select_weight != 0.0`, which folds in gate-off / no-policy-head), the
+            // candidate is pass-like (`pass_like_action_flight`), AND the candidate PLAN's target
+            // is geometrically FORWARD (`candidate_plan.target_point` vs the carrier, past the
+            // forward-yards deadband) — NOT gated on the label, since lateral/backward passes
+            // share the "pass"/"pass-kpN" label. The applied bonus is
+            // `weight * forward_option_quality` CLAMPED to ±SOCCER_FORWARD_SELECT_BONUS_ABS_MAX so
+            // a large learned weight nudges — rather than swamps — the sort. Added conditionally
+            // (never an always-added 0.0 term) so the gate-off / non-eligible path leaves `score`
+            // bit-for-bit unchanged — the sort below uses `total_cmp`, which separates -0.0/+0.0.
+            let forward_select_eligible = forward_select_weight != 0.0
+                && pass_like_action_flight(&candidate_plan.action).is_some()
+                && soccer_plan_target_forward_yards(&candidate_plan, snapshot, player_id, team)
+                    .is_some_and(|yards| yards > SOCCER_FORWARD_SELECT_MIN_FORWARD_YARDS);
+            let score = if forward_select_eligible {
+                let bonus = (forward_select_weight * forward_select_feature).clamp(
+                    -SOCCER_FORWARD_SELECT_BONUS_ABS_MAX,
+                    SOCCER_FORWARD_SELECT_BONUS_ABS_MAX,
+                );
+                score + bonus
+            } else {
+                score
+            };
+            let score = score + extra_score_bias;
+            if !score.is_finite() {
+                return false;
+            }
+            let actor_prior = policy_log_probs
+                .as_ref()
+                .and_then(|log_probs| {
+                    soccer_policy_action_index(&candidate_label).and_then(|i| log_probs.get(i))
+                })
+                .map(|log_p| log_p.exp())
+                .unwrap_or(0.0);
+            scored_candidates.push(SoccerNeuralMctsCandidate {
+                label: candidate_label,
+                plan: Some(candidate_plan),
+                score,
+                prior: actor_prior + retrieved_bonus.max(0.0) + mpc_candidate_bonus.max(0.0),
+                q_visits: candidate.visits,
+            });
+            true
+        };
         for candidate in legal.iter() {
             let candidate_plan =
                 Self::learned_plan_for_policy(policy, snapshot, player_id, candidate.label.clone());
-            push_scored_candidate(candidate, candidate_plan);
+            push_scored_candidate(candidate, candidate_plan, 0.0);
             for expanded_plan in Self::neural_mcts_expanded_candidate_plans(
                 snapshot,
                 player_id,
                 team,
                 &candidate.label,
             ) {
-                push_scored_candidate(candidate, expanded_plan);
+                push_scored_candidate(candidate, expanded_plan, 0.0);
             }
         }
         // --- Forward-release root-candidate injection (DD_SOCCER_ENABLE_FORWARD_RELEASE_ROOT_CANDIDATE,
@@ -17973,7 +18049,7 @@ impl SoccerMatch {
                 })
             });
             if let Some(target_player) = excluded_forward {
-                if let Some(target_point) = snapshot.player_position(target_player) {
+                if snapshot.player_position(target_player).is_some() {
                     let synthetic_trace = SoccerLearnedActionTrace {
                         label: "pass".to_string(),
                         value: dp_policy_value_center,
@@ -17982,25 +18058,27 @@ impl SoccerMatch {
                         legal: true,
                         level: PitchGridLevel::WholePitch,
                     };
-                    let synthetic_plan = SoccerLearnedPlan {
-                        action: "pass1".to_string(),
-                        target_player: Some(target_player),
-                        target_point: Some(target_point),
-                        mpc_replan: None,
-                    };
-                    push_scored_candidate(&synthetic_trace, synthetic_plan);
-                    // Bias ONLY the just-injected candidate. push appends at most one and this is its
-                    // last use, so the closure's &mut is released; if the plan landed it is the LAST
-                    // element with our exact (target, "pass1") identity. last() — not a rev-scan —
-                    // avoids biasing an older same-target plan if push rejects it (Codex review).
-                    if let Some(last) = scored_candidates.last_mut() {
-                        if last.plan.as_ref().map_or(false, |p| {
-                            p.target_player == Some(target_player) && p.action == "pass1"
-                        }) {
-                            last.score += forward_release_bias();
-                            injected_forward_target = Some(target_player);
-                            forward_release_diag_bump(ForwardReleaseStage::Pushed);
+                    let injected_plans = Self::neural_mcts_pass_target_candidate_plans(
+                        snapshot,
+                        player_id,
+                        team,
+                        "pass",
+                        "pass1".to_string(),
+                        target_player,
+                    );
+                    let mut injected_any = false;
+                    for synthetic_plan in injected_plans {
+                        if push_scored_candidate(
+                            &synthetic_trace,
+                            synthetic_plan,
+                            forward_release_bias(),
+                        ) {
+                            injected_any = true;
                         }
+                    }
+                    if injected_any {
+                        injected_forward_target = Some(target_player);
+                        forward_release_diag_bump(ForwardReleaseStage::Pushed);
                     }
                 }
             }
@@ -18050,6 +18128,7 @@ impl SoccerMatch {
             &scored_candidates,
             blend,
             choice.as_ref(),
+            injected_forward_target,
         );
         choice
     }
@@ -18112,6 +18191,7 @@ impl SoccerMatch {
         scored_candidates: &[SoccerNeuralMctsCandidate],
         blend: SoccerNeuralBlendConfig,
         choice: Option<&SoccerPolicyActionChoice>,
+        injected_forward_target: Option<usize>,
     ) {
         use std::io::Write;
         let Some(path) = Self::soccer_fwd_trace_path() else {
@@ -18172,22 +18252,35 @@ impl SoccerMatch {
             fwd_best_rank >= 0 && (fwd_best_rank as usize) < root_cap.max(1)
         };
 
-        let tabular_argmax = legal
+        let tabular_argmax_label = legal
             .iter()
             .max_by(|a, b| a.value.total_cmp(&b.value))
-            .map(|action| normalize_soccer_action_label(&action.label).to_string());
-        let pick = choice.map(|choice| normalize_soccer_action_label(&choice.label).to_string());
+            .map(|action| action.label.as_str());
+        let tabular_argmax =
+            tabular_argmax_label.map(|label| normalize_soccer_action_label(label).to_string());
+        let pick_label = choice.map(|choice| choice.label.as_str());
+        let pick = pick_label.map(|label| normalize_soccer_action_label(label).to_string());
         let s_net_changed = matches!((&tabular_argmax, &pick), (Some(t), Some(p)) if t != p);
+        let s_label_changed =
+            matches!((tabular_argmax_label, pick_label), (Some(t), Some(p)) if t != p);
         let label_is_fwd = |label: &str| -> bool {
             scored_candidates
                 .iter()
-                .find(|candidate| normalize_soccer_action_label(&candidate.label) == label)
+                .find(|candidate| candidate.label == label)
+                .or_else(|| {
+                    scored_candidates
+                        .iter()
+                        .find(|candidate| normalize_soccer_action_label(&candidate.label) == label)
+                })
                 .map(|candidate| {
                     Self::soccer_candidate_is_forward_pass(snapshot, player_id, team, candidate)
                 })
                 .unwrap_or(false)
         };
-        let pick_is_fwd = pick.as_deref().map(label_is_fwd).unwrap_or(false);
+        let pick_is_fwd = pick_label
+            .or(pick.as_deref())
+            .map(label_is_fwd)
+            .unwrap_or(false);
         let pick_is_pass = choice
             .map(|choice| pass_like_action_flight(&choice.label).is_some())
             .unwrap_or(false);
@@ -18197,38 +18290,73 @@ impl SoccerMatch {
         let pick_is_shot = choice
             .map(|choice| soccer_label_is_shot(&choice.label))
             .unwrap_or(false);
-        let tabular_argmax_is_fwd = tabular_argmax.as_deref().map(label_is_fwd).unwrap_or(false);
+        let tabular_argmax_is_fwd = tabular_argmax_label
+            .or(tabular_argmax.as_deref())
+            .map(label_is_fwd)
+            .unwrap_or(false);
+        let pick_kick_bucket = pick_label
+            .and_then(learned_discretized_kick_speed_bucket_for_action_label)
+            .map(i64::from)
+            .unwrap_or(-1);
+        let tabular_argmax_kick_bucket = tabular_argmax_label
+            .and_then(learned_discretized_kick_speed_bucket_for_action_label)
+            .map(i64::from)
+            .unwrap_or(-1);
+        let injected_forward_survived = injected_forward_target.is_some_and(|target| {
+            scored_candidates.iter().any(|candidate| {
+                candidate.plan.as_ref().and_then(|plan| plan.target_player) == Some(target)
+            })
+        });
+        let injected_forward_selected = injected_forward_target.is_some_and(|target| {
+            choice
+                .and_then(|choice| choice.plan.as_ref())
+                .and_then(|plan| plan.target_player)
+                == Some(target)
+        });
 
         let team_label = match team {
             Team::Home => "home",
             Team::Away => "away",
         };
-        let line = format!(
-            "{{\"tick\":{},\"player\":{},\"team\":\"{}\",\"vis_fwd\":{},\"quality\":{:.4},\"exp_compl\":{:.4},\"qualifies\":{},\"n_scored\":{},\"n_pass_scored\":{},\"n_dribble_scored\":{},\"n_shot_scored\":{},\"n_fwd_scored\":{},\"e_scored\":{},\"e_root\":{},\"fwd_best_rank\":{},\"root_cap\":{},\"s_net_changed\":{},\"pick_is_fwd\":{},\"pick_is_pass\":{},\"pick_is_dribble\":{},\"pick_is_shot\":{},\"tabular_argmax_is_fwd\":{},\"mcts_enabled\":{}}}",
-            snapshot.tick,
-            player_id,
-            team_label,
-            vis_fwd,
-            quality,
-            exp_compl,
-            qualifies,
-            n_scored,
-            n_pass_scored,
-            n_dribble_scored,
-            n_shot_scored,
-            n_fwd_scored,
-            e_scored,
-            e_root,
-            fwd_best_rank,
-            root_cap,
-            s_net_changed,
-            pick_is_fwd,
-            pick_is_pass,
-            pick_is_dribble,
-            pick_is_shot,
-            tabular_argmax_is_fwd,
-            blend.mcts_enabled,
-        );
+        let row = serde_json::json!({
+            "tick": snapshot.tick,
+            "player": player_id,
+            "team": team_label,
+            "vis_fwd": vis_fwd,
+            "quality": quality,
+            "exp_compl": exp_compl,
+            "qualifies": qualifies,
+            "n_scored": n_scored,
+            "n_pass_scored": n_pass_scored,
+            "n_dribble_scored": n_dribble_scored,
+            "n_shot_scored": n_shot_scored,
+            "n_fwd_scored": n_fwd_scored,
+            "e_scored": e_scored,
+            "e_root": e_root,
+            "fwd_best_rank": fwd_best_rank,
+            "root_cap": root_cap,
+            "s_net_changed": s_net_changed,
+            "s_label_changed": s_label_changed,
+            "pick_label": pick_label.unwrap_or(""),
+            "pick_family": pick.as_deref().unwrap_or(""),
+            "pick_kick_bucket": pick_kick_bucket,
+            "pick_is_fwd": pick_is_fwd,
+            "pick_is_pass": pick_is_pass,
+            "pick_is_dribble": pick_is_dribble,
+            "pick_is_shot": pick_is_shot,
+            "tabular_argmax_label": tabular_argmax_label.unwrap_or(""),
+            "tabular_argmax_family": tabular_argmax.as_deref().unwrap_or(""),
+            "tabular_argmax_kick_bucket": tabular_argmax_kick_bucket,
+            "tabular_argmax_is_fwd": tabular_argmax_is_fwd,
+            "forward_injected": injected_forward_target.is_some(),
+            "forward_injected_survived": injected_forward_survived,
+            "forward_injected_selected": injected_forward_selected,
+            "forward_injected_target": injected_forward_target.map(|target| target as i64).unwrap_or(-1),
+            "mcts_enabled": blend.mcts_enabled,
+        });
+        let Ok(line) = serde_json::to_string(&row) else {
+            return;
+        };
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -29644,6 +29772,7 @@ impl SoccerMatch {
                             curve_technique,
                             elevation,
                         );
+                        let dither = discretized_kick_dither_for_release(&mut self.rng);
                         discretized_kick_release_clamped_to_pitch(
                             player_pos,
                             action,
@@ -29651,7 +29780,7 @@ impl SoccerMatch {
                             envelope_max,
                             distance,
                             curve_bend_yards,
-                            DiscretizedKickDither::none(),
+                            dither,
                             self.config.field_width_yards,
                             self.config.field_length_yards,
                         )

@@ -22,6 +22,9 @@
 //!       home/away. `candidate`/`baseline` may be a snapshot path or the literal `analytic`
 //!       (a net-less pure-analytic brain). Emits one JSON object per game to $PROOF_JSONL (if
 //!       set) and prints a paired-difference summary with 95% AND 99.99% lower bounds.
+//!       Snapshot specs may append a quoted per-side ablation suffix such as
+//!       `full.genFINAL.json#strip=mpc,support,spacing` to remove trained execution/off-ball
+//!       heads from only that side while keeping the same critic/policy net.
 //!
 //! Parallelism: run several `eval` processes over DISJOINT holdout ranges and concatenate their
 //! JSONL; `scripts/proof_aggregate.py` folds them into one paired verdict. DP gates
@@ -72,6 +75,85 @@ fn env_bool(name: &str, default: bool) -> bool {
         })
         .unwrap_or(default)
 }
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct BrainStripOptions {
+    legacy_actor_and_aux: bool,
+    pass_completion: bool,
+    mpc_objective: bool,
+    attack_spacing: bool,
+    support_scorer: bool,
+}
+
+impl BrainStripOptions {
+    fn all_aux() -> Self {
+        Self {
+            legacy_actor_and_aux: true,
+            pass_completion: true,
+            mpc_objective: true,
+            attack_spacing: true,
+            support_scorer: true,
+        }
+    }
+
+    fn any(self) -> bool {
+        self.legacy_actor_and_aux
+            || self.pass_completion
+            || self.mpc_objective
+            || self.attack_spacing
+            || self.support_scorer
+    }
+
+    fn apply_token(&mut self, token: &str) {
+        match token.trim().to_ascii_lowercase().as_str() {
+            "" => {}
+            "all" | "aux" | "auxiliary" | "legacy" | "value-only" | "critic-only" => {
+                *self = Self::all_aux();
+            }
+            "pass" | "pass-completion" | "pass_completion" | "receiver" | "completion" => {
+                self.pass_completion = true;
+            }
+            "mpc" | "mpc-objective" | "mpc_objective" | "execution" => {
+                self.mpc_objective = true;
+            }
+            "spacing" | "attack-spacing" | "attack_spacing" | "shape" | "formation" => {
+                self.attack_spacing = true;
+            }
+            "support" | "support-scorer" | "support_scorer" | "offball" | "off-ball" => {
+                self.support_scorer = true;
+            }
+            other => panic!(
+                "unknown soccer_proof strip token '{other}'. Use all, pass, mpc, spacing, support"
+            ),
+        }
+    }
+}
+
+fn parse_brain_spec(spec: &str) -> (&str, BrainStripOptions) {
+    let Some((path, raw_suffix)) = spec.split_once('#') else {
+        return (spec, BrainStripOptions::default());
+    };
+    let mut strip = BrainStripOptions::default();
+    for clause in raw_suffix.split('&') {
+        let clause = clause.trim();
+        let Some(tokens) = clause
+            .strip_prefix("strip=")
+            .or_else(|| clause.strip_prefix("strip:"))
+        else {
+            if clause.is_empty() {
+                continue;
+            }
+            panic!(
+                "unknown soccer_proof snapshot suffix '#{clause}'. Use '#strip=pass,mpc,spacing,support'"
+            );
+        };
+        for token in tokens.split(',') {
+            strip.apply_token(token);
+        }
+    }
+    (path, strip)
+}
+
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -93,6 +175,23 @@ fn proof_neural_config() -> SoccerNeuralLearningConfig {
         mappo_team_reward_share: DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
         ..SoccerNeuralLearningConfig::default()
     };
+    neural.learning_rate = env_f64("SOCCER_NEURAL_LEARNING_RATE", neural.learning_rate);
+    neural.batch_size = env_usize("SOCCER_NEURAL_BATCH_SIZE", neural.batch_size);
+    neural.train_every_ticks =
+        env_usize("SOCCER_NEURAL_TRAIN_EVERY_TICKS", neural.train_every_ticks);
+    neural.max_batches_per_tick = env_usize(
+        "SOCCER_NEURAL_MAX_BATCHES_PER_TICK",
+        neural.max_batches_per_tick,
+    );
+    neural.max_pending_batches = env_usize(
+        "SOCCER_NEURAL_MAX_PENDING_BATCHES",
+        neural.max_pending_batches,
+    );
+    neural.replay_capacity = env_usize("SOCCER_NEURAL_REPLAY_CAPACITY", neural.replay_capacity);
+    neural.replay_samples_per_tick = env_usize(
+        "SOCCER_NEURAL_REPLAY_SAMPLES_PER_TICK",
+        neural.replay_samples_per_tick,
+    );
     neural.target_scale = env_f64("SOCCER_NEURAL_TARGET_SCALE", neural.target_scale);
     neural.target_clip = env_f64("SOCCER_NEURAL_TARGET_CLIP", neural.target_clip);
     neural.target_popart_enabled =
@@ -136,7 +235,12 @@ fn fresh_snapshot(out_path: &str, seed_base: u32) {
         .unwrap_or_else(|| panic!("fresh neural snapshot was not initialized for {out_path}"));
     write_snapshot(out_path, &snapshot);
     println!(
-        "[fresh] wrote {out_path} seed=0x{seed_base:08X} target_scale={} target_clip={} popart={} hidden={} training_steps={}",
+        "[fresh] wrote {out_path} seed=0x{seed_base:08X} lr={} batch={} train_every={} max_batches={} replay_samples={} target_scale={} target_clip={} popart={} hidden={} training_steps={}",
+        neural.learning_rate,
+        neural.batch_size,
+        neural.train_every_ticks,
+        neural.max_batches_per_tick,
+        neural.replay_samples_per_tick,
         neural.target_scale,
         neural.target_clip,
         neural.target_popart_enabled,
@@ -152,8 +256,17 @@ fn train_ckpt(out_prefix: &str, games: usize, minutes: f64, seed_base: u32, ckpt
     let neural = proof_neural_config();
     println!(
         "[train-ckpt] prefix={out_prefix} games={games} minutes={minutes} seed=0x{seed_base:08X} \
-         ckpt_every={ckpt_every} target_scale={} target_clip={} popart={} hidden={}",
-        neural.target_scale, neural.target_clip, neural.target_popart_enabled, neural.hidden_units
+         ckpt_every={ckpt_every} lr={} batch={} train_every={} max_batches={} replay_samples={} \
+         target_scale={} target_clip={} popart={} hidden={}",
+        neural.learning_rate,
+        neural.batch_size,
+        neural.train_every_ticks,
+        neural.max_batches_per_tick,
+        neural.replay_samples_per_tick,
+        neural.target_scale,
+        neural.target_clip,
+        neural.target_popart_enabled,
+        neural.hidden_units
     );
 
     let mut policies = Arc::new(SoccerTeamQPolicies::new(SoccerQPolicyOptions::default()));
@@ -413,20 +526,32 @@ fn load_brain(spec: &str) -> TeamBrain {
         // engine decides. This is the honest frozen "target" the learner must climb toward.
         TeamBrain::fresh()
     } else {
-        let json = std::fs::read_to_string(spec).unwrap_or_else(|e| panic!("read {spec}: {e}"));
-        let mut snap: SoccerNeuralNetworkSnapshot =
-            serde_json::from_str(&json).unwrap_or_else(|e| panic!("parse {spec}: {e}"));
+        let (path, mut strip) = parse_brain_spec(spec);
         if env_bool("SOCCER_PROOF_STRIP_AUX_HEADS", false) {
-            eprintln!(
-                "[load] SOCCER_PROOF_STRIP_AUX_HEADS=1: evaluating value/critic net only for {spec}"
-            );
+            strip = BrainStripOptions::all_aux();
+        }
+        let json = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let mut snap: SoccerNeuralNetworkSnapshot =
+            serde_json::from_str(&json).unwrap_or_else(|e| panic!("parse {path}: {e}"));
+        if strip.any() {
+            eprintln!("[load] stripping {:?} for {path}", strip);
+        }
+        if strip.legacy_actor_and_aux {
             snap.policy_head = None;
             snap.skill_policy_heads = None;
             snap.keeper_policy_head = None;
             snap.line_depth_head = None;
+        }
+        if strip.pass_completion {
             snap.pass_completion_head = None;
+        }
+        if strip.mpc_objective {
             snap.mpc_objective_head = None;
+        }
+        if strip.attack_spacing {
             snap.attack_spacing_head = None;
+        }
+        if strip.support_scorer {
             snap.support_scorer_head = None;
         }
         TeamBrain::from_snapshot(snap)
@@ -1027,9 +1152,34 @@ fn main() {
                 "usage:\n  soccer_proof fresh <out.json> <seed_hex>\n  \
                  soccer_proof train-ckpt <out_prefix> <games> <minutes> <seed_hex> <ckpt_every>\n  \
                  soccer_proof eval <candidate|analytic> <baseline|analytic> <games> <minutes> <holdout_hex>\n  \
+                 snapshot ablation suffix: '<path>#strip=pass,mpc,spacing,support'\n  \
                  (set $PROOF_JSONL to append per-game rows; run several evals over disjoint holdouts in parallel)"
             );
             std::process::exit(2);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_brain_spec_supports_per_head_ablation_suffix() {
+        let (path, strip) = parse_brain_spec("full.genFINAL.json#strip=mpc,support,spacing");
+
+        assert_eq!(path, "full.genFINAL.json");
+        assert!(!strip.legacy_actor_and_aux);
+        assert!(!strip.pass_completion);
+        assert!(strip.mpc_objective);
+        assert!(strip.attack_spacing);
+        assert!(strip.support_scorer);
+    }
+
+    #[test]
+    fn parse_brain_spec_all_preserves_legacy_value_only_mode() {
+        let (_path, strip) = parse_brain_spec("full.genFINAL.json#strip=all");
+
+        assert_eq!(strip, BrainStripOptions::all_aux());
     }
 }

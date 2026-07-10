@@ -17,8 +17,10 @@ implemented yet.
   `DD_SOCCER_ENABLE_DISCRETIZED_KICK` and the `SOCCER_NEURAL_MCTS_*KICK*` knobs. The
   selected bucket is preserved in labels such as `pass1-kp7`, and scoring/execution can
   use the bucket's power.
-- `DiscretizedKickDither::sample` currently returns zero offsets. It is a bounded
-  placeholder, not exploration and not a source of bucket-crossing credit.
+- `DiscretizedKickDither::sample` now produces bounded inside-bucket release offsets,
+  and production pass release uses it only when
+  `DD_SOCCER_ENABLE_DISCRETIZED_KICK_DITHER` is enabled. This is release robustness
+  and local exploration inside the chosen bucket, not a separate bucket-choice policy.
 - `SoccerNeuralBlendMode::ConfidenceGated` blends toward the neural estimate only when
   the candidate's visit count is below `min_confidence_visits`; otherwise it keeps the
   tabular/analytic value for that candidate.
@@ -49,17 +51,27 @@ implemented yet.
   target cap, pruned by the cap, or absent.
 - `DD_SOCCER_DUMP_PASS_CAND_DIAG` separately reports pass candidate availability,
   cap survival, and a nearest-defender openness proxy before value/MPC selection.
+- `DD_SOCCER_FWD_TRACE` emits per-decision forward-pass action-causality rows:
+  candidate exposure, root survival, net-changed family/label, selected family,
+  selected kick bucket, forward-root injection survival/selection, and tabular
+  argmax comparison. `scripts/fwd_trace_report.py` summarizes these into forward
+  exposure, injection, selection, action-change, and selected kick-bucket entropy
+  rates for proof artifacts.
+- Dimensionality experiments are now explicit and mutually separable. The hard
+  projection gate `SOCCER_NEURAL_COMPACT_INPUTS=1` / `DD_SOCCER_NEURAL_COMPACT_INPUTS=1`
+  trains a 100-input value critic from the first 90 core features plus the 10
+  action-parameter features, and is only a destructive diagnostic. The learned
+  bottleneck gate `SOCCER_NEURAL_BOTTLENECK_DIM=100` keeps the full current critic
+  input and adds a learned 100-unit latent before the normal hidden/value layer,
+  matching the cheap `620 -> 100 -> hidden -> value` compression experiment Claude
+  recommended after finding no near-dead critic inputs.
 
 ## Missing Diagnostics
 
 These are useful next counters, but they are not current telemetry:
 
-- `net_changed_action_rate`: how often the learned/planner score changed the executed
-  action compared with the tabular/heuristic baseline.
 - `confidence_gate_open_rate`: how often ConfidenceGated actually opened for the
   candidate that survived to execution.
-- `selected_kick_speed_bucket_entropy`: whether selected kick-power buckets collapse
-  early or remain diverse by family.
 - behavior-probability diagnostics such as missing-rate, mean old probability,
   PPO/MAPPO ratio mean, ratio clip fraction, and entropy by role/action family.
 - target and advantage diagnostics such as raw/scaled target histograms, clip fraction,
@@ -72,11 +84,28 @@ These are useful next counters, but they are not current telemetry:
 - Coarsen confidence for action keys where the current factored labels fragment visits,
   while keeping fine parameters in neural features and labels.
 - Add stochastic bucket sampling or temperature/epsilon exploration over candidate buckets,
-  plus entropy regularization and bucket-entropy telemetry. Do not describe dither as this
-  mechanism; it is not.
+  plus entropy regularization and bucket-entropy telemetry. The current dither jitters
+  only the release inside a selected bucket; it does not replace bucket-choice exploration.
 - Use paired MCTS-on/off ablations (`SOCCER_NEURAL_MCTS_ENABLED=0` or
   `SOCCER_DISABLE_NEURAL_MCTS=1`, depending on the runner path) to test whether MCTS is
   exposing useful actions or hiding actor causality behind analytic-looking choices.
+- Run the ceiling-break proof profile with
+  `DD_SOCCER_ENABLE_FORWARD_RELEASE_ROOT_CANDIDATE=1` and
+  `SOCCER_NEURAL_MCTS_MIN_PASS_LIKE_ROOT_CANDIDATES=1` so forward options hidden
+  behind the analytic pass-target cap reach the same neural-scored pass-space and
+  kick-power candidate surface as ordinary pass targets, then are measured by the
+  forward trace.
+- Keep `RUN_ANALYTIC_EVAL=1` in the overnight proof harness. The ceiling-break
+  verdict must include `full-vs-analytic.aggregate.txt` and its forward trace, not
+  only `full-vs-fresh`; beating a fresh net is not the same as escaping analytic
+  parity.
+- Compare `BOTTLENECK_INPUT_PROFILE=1` against the full-input and
+  `COMPACT_INPUT_PROFILE=1` proof arms on the same held-out seeds before claiming
+  anything about input reduction. These are optional diagnostics, not the main
+  ceiling-break path. The expected useful signal is not raw parameter count; it is
+  whether the learned 100-d latent improves or preserves forward-pass, turnover,
+  shots-on-frame, dribble, and goal guardrails better than the destructive compact
+  projection.
 - Train and evaluate against a pool of frozen checkpoints so mirror self-play parity does
   not hide absolute improvement.
 - Add small-sided or high-event curriculum lanes if full 11v11 reward remains too sparse

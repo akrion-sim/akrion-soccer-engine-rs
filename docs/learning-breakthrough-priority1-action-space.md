@@ -66,8 +66,10 @@ behavior and then add the missing structured dimensions:
 
 - direction/aim as a bounded offset around the current target, not a free absolute 36-way choice;
 - curve and elevation as small masked heads;
-- selected-bucket entropy and net-changed-action telemetry, so the code proves the bucket path
-  changes behavior instead of only changing labels.
+- bucket-choice exploration/heads beyond the current trace telemetry. `DD_SOCCER_FWD_TRACE`
+  plus `scripts/fwd_trace_report.py` now report net-changed-action and selected-bucket
+  entropy so proof runs can tell whether the bucket path changes behavior instead of only
+  changing labels.
 
 ### Part C — true policy improvement (break tabular imitation)
 Either (i) bootstrap the value off *its own* successor value (real neural n-step / Q-learning) so it
