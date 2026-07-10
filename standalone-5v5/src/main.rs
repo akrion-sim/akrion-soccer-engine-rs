@@ -172,7 +172,7 @@ fn record_match(policy: &train::Policy, rng: &mut Rng, path: &str) {
             frames.push(',');
         }
         let mut act_a = [A_STAY; N];
-        for i in 0..N {
+        for i in 1..N {
             let obs = w.observe(Team::A, i);
             let mask = w.legal_mask(Team::A, i);
             act_a[i] = policy.act_greedy(&obs, &mask);
