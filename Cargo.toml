@@ -114,3 +114,7 @@ required-features = ["live-server"]
 name = "main_soccer_live_5056"
 path = "src/bin/main_soccer_live_5056.rs"
 required-features = ["live-server"]
+
+[[bin]]
+name = "measure_pass_completion"
+path = "src/bin/measure_pass_completion.rs"

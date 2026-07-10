@@ -142,7 +142,6 @@ spec:
               require_value SOCCER_NEURAL_POPULATION_MIN_FORWARD_PASS_RATE_MARGIN 0.0
               require_value SOCCER_LEARNING_ANALYTIC_OPPONENT true
               require_value SOCCER_ANCHOR_PROMOTION_GATE_ENABLED true
-              require_value DD_SOCCER_ENABLE_LEARNED_EPV true
 
               echo "continuous_started_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
               echo "postgres_required=${SOCCER_REQUIRE_POSTGRES}"
@@ -199,8 +198,6 @@ spec:
               echo "population_forward_pass_rate_margin=${SOCCER_NEURAL_POPULATION_MIN_FORWARD_PASS_RATE_MARGIN}"
               echo "learning_analytic_opponent=${SOCCER_LEARNING_ANALYTIC_OPPONENT}"
               echo "anchor_promotion_gate=${SOCCER_ANCHOR_PROMOTION_GATE_ENABLED}"
-              echo "learned_epv=${DD_SOCCER_ENABLE_LEARNED_EPV}"
-              echo "learned_epv_grid_path=${DD_SOCCER_LEARNED_EPV_GRID_PATH:-unset}"
               echo "source_ref=${source_ref}"
               echo "engine_ref=${engine_ref}"
 
@@ -234,15 +231,7 @@ spec:
               export DD_SOCCER_DP_BOOTSTRAP_SWEEPS=200
               export SOCCER_APPROX_DP_REPLAY_PASSES=8
               export SOCCER_APPROX_DP_POLICY_PRIOR_WEIGHT=0.5
-              # Move 1a: learned EPV potential — swap the hand-built xT seed inside the
-              # PBRS territorial reward with a fitted-from-outcomes EPV grid. The grid is
-              # committed to scripts/epv_grid.json and copied to a stable path here.
-              export DD_SOCCER_ENABLE_LEARNED_EPV=true
-              if [ -f scripts/epv_grid.json ]; then
-                cp scripts/epv_grid.json /tmp/epv_grid.json
-                export DD_SOCCER_LEARNED_EPV_GRID_PATH=/tmp/epv_grid.json
-              fi
-              echo "deferred_credit_stack_final discretized_kick=${DD_SOCCER_ENABLE_DISCRETIZED_KICK} chance_quality_reward=${DD_SOCCER_ENABLE_CHANCE_QUALITY_REWARD} specialist_curriculum=${DD_SOCCER_ENABLE_SPECIALIST_CURRICULUM} keeper_policy_head=${DD_SOCCER_ENABLE_KEEPER_POLICY_HEAD} skill_policy_heads=${DD_SOCCER_ENABLE_SKILL_POLICY_HEADS} target_scale=${SOCCER_NEURAL_TARGET_SCALE} target_clip=${SOCCER_NEURAL_TARGET_CLIP} target_popart=${SOCCER_NEURAL_TARGET_POPART} dp_bootstrap=${DD_SOCCER_ENABLE_DP_BOOTSTRAP} dp_critic_target=${DD_SOCCER_ENABLE_DP_CRITIC_TARGET} dp_horizon=${DD_SOCCER_DP_BOOTSTRAP_HORIZON} dp_sweeps=${DD_SOCCER_DP_BOOTSTRAP_SWEEPS} approx_dp_replay_passes=${SOCCER_APPROX_DP_REPLAY_PASSES} approx_dp_policy_prior_weight=${SOCCER_APPROX_DP_POLICY_PRIOR_WEIGHT} learned_epv=${DD_SOCCER_ENABLE_LEARNED_EPV}"
+              echo "deferred_credit_stack_final discretized_kick=${DD_SOCCER_ENABLE_DISCRETIZED_KICK} chance_quality_reward=${DD_SOCCER_ENABLE_CHANCE_QUALITY_REWARD} specialist_curriculum=${DD_SOCCER_ENABLE_SPECIALIST_CURRICULUM} keeper_policy_head=${DD_SOCCER_ENABLE_KEEPER_POLICY_HEAD} skill_policy_heads=${DD_SOCCER_ENABLE_SKILL_POLICY_HEADS} target_scale=${SOCCER_NEURAL_TARGET_SCALE} target_clip=${SOCCER_NEURAL_TARGET_CLIP} target_popart=${SOCCER_NEURAL_TARGET_POPART} dp_bootstrap=${DD_SOCCER_ENABLE_DP_BOOTSTRAP} dp_critic_target=${DD_SOCCER_ENABLE_DP_CRITIC_TARGET} dp_horizon=${DD_SOCCER_DP_BOOTSTRAP_HORIZON} dp_sweeps=${DD_SOCCER_DP_BOOTSTRAP_SWEEPS} approx_dp_replay_passes=${SOCCER_APPROX_DP_REPLAY_PASSES} approx_dp_policy_prior_weight=${SOCCER_APPROX_DP_POLICY_PRIOR_WEIGHT}"
               actual_commit="$(git rev-parse HEAD)"
               engine_commit="$(git -C "${engine}" rev-parse HEAD)"
               echo "source_commit_actual=${actual_commit}"
@@ -538,8 +527,6 @@ spec:
             - name: SOCCER_LEARNING_ANALYTIC_OPPONENT
               value: "true"
             - name: SOCCER_ANCHOR_PROMOTION_GATE_ENABLED
-              value: "true"
-            - name: DD_SOCCER_ENABLE_LEARNED_EPV
               value: "true"
             - name: SOCCER_PG_PASS_COMPLETION_SAMPLE_LIMIT
               value: "50000"
