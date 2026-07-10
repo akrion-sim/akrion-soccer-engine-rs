@@ -218,6 +218,7 @@ impl World {
         self.last_kicker = None;
         self.kick_timer = 0;
         self.pending_pass = None;
+        self.pass_streak_a = 0;
     }
 
     fn player(&self, o: Owner) -> Player {
