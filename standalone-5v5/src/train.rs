@@ -156,8 +156,23 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
         if w.ev_win_ball_a {
             r += 0.3;
         }
-        // teammate spacing: spread out to open passing lanes (see spacing_term_a)
-        r += w_spacing_coeff * w.spacing_term_a();
+        // PER-PLAYER teammate spacing (all phases): each outfielder is rewarded
+        // for its OWN nearest-teammate distance, so bunching is directly credited.
+        let mut sp_t = [0.0f32; N];
+        for i in 1..N {
+            let mut nd = f32::INFINITY;
+            for j in 1..N {
+                if i != j {
+                    let d = w.a[i].pos.sub(w.a[j].pos).len();
+                    if d < nd {
+                        nd = d;
+                    }
+                }
+            }
+            if nd.is_finite() {
+                sp_t[i] = w_spacing_coeff * spacing_reward(nd);
+            }
+        }
 
         obs_buf.push(obs_t);
         mask_buf.push(mask_t);
@@ -165,6 +180,7 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
         logp_buf.push(logp_t);
         val_buf.push(val_t);
         rew_buf.push(r);
+        space_buf.push(sp_t);
     }
 
     // GAE per player (same team reward broadcast to all 5).
