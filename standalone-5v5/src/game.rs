@@ -328,13 +328,16 @@ impl World {
     // Observation for one player, in that player's *attack frame* (x flipped
     // for Team B) so a single shared policy is symmetric across sides.
     // ---------------------------------------------------------------------
+    // FULL RELATIONAL FIELD VECTOR: every player observes the WHOLE field —
+    // self, ball, both goals, plus ALL teammates and ALL opponents (position,
+    // velocity, distance), sorted by proximity, in its own attack frame. This is
+    // the 5-a-side analogue of the 22-man engine's field vector: the policy can
+    // reason about overall shape (spacing, support, pressure), not just nearest
+    // neighbours. Proving it's learnable here is the point.
     pub fn observe(&self, team: Team, idx: usize) -> [f32; OBS_DIM] {
         let sx = team.sx();
         let me = players(team, self)[idx];
-        let mir = |p: V2| -> V2 {
-            // attack-frame: x grows toward attacked goal, y unchanged
-            V2::new(if sx > 0.0 { p.x } else { FIELD_L - p.x }, p.y)
-        };
+        let mir = |p: V2| -> V2 { V2::new(if sx > 0.0 { p.x } else { FIELD_L - p.x }, p.y) };
         let mirv = |v: V2| -> V2 { V2::new(v.x * sx, v.y) };
         let nx = FIELD_L;
         let ny = FIELD_W;
@@ -346,124 +349,96 @@ impl World {
         let bvel = mirv(self.ball_vel);
         let goal = mir(team.target_goal());
         let own = mir(team.own_goal());
+        let ball_rel = bp.sub(mp);
 
         let has_ball = matches!(self.owner, Some(o) if o.team == team && o.idx == idx);
         let team_ball = matches!(self.owner, Some(o) if o.team == team);
         let opp_ball = matches!(self.owner, Some(o) if o.team != team);
         let free_ball = self.owner.is_none();
 
-        let cands = self.pass_candidates(team, idx);
-        let cand_feat = |c: Option<(usize, f32)>| -> (f32, f32, f32, f32) {
-            match c {
-                Some((ti, sc)) => {
-                    let tp = mir(players(team, self)[ti].pos);
-                    let rel = tp.sub(mp);
-                    let open = (sc / 15.0).clamp(-1.0, 1.0);
-                    (rel.x / nx, rel.y / ny, open, rel.len() / nx)
-                }
-                None => (0.0, 0.0, -1.0, 1.0),
-            }
-        };
-        let (ax, ay, aopen, adist) = cand_feat(cands[0]);
-        let (bx, by, bopen, bdist) = cand_feat(cands[1]);
-
-        let (_, nopp_d) = self.nearest_opponent(team, me.pos);
-        let nopp = players(team.other(), self)[self.nearest_opponent(team, me.pos).0];
-        let nopp_rel = mir(nopp.pos).sub(mp);
+        // derived cues kept for action semantics: shot lane + best-pass openness
         let shot_clear = self.shot_clearness(team, me.pos);
-        let shot_dist = goal.sub(mp).len();
-        let ball_rel = bp.sub(mp);
+        let cands = self.pass_candidates(team, idx);
+        let open_of = |c: Option<(usize, f32)>| c.map(|(_, s)| (s / 15.0).clamp(-1.0, 1.0)).unwrap_or(-1.0);
+        let (aopen, bopen) = (open_of(cands[0]), open_of(cands[1]));
 
-        // NEAREST TEAMMATE perception — without this the policy cannot see how
-        // close it is to a teammate and so cannot learn to un-bunch. Considers
-        // the other outfielders (1..N), which are the ones the spacing reward
-        // penalizes. nt_pressure spikes as a teammate crowds in; crowd counts
-        // how many are within the ~5-unit optimum.
-        let tps = players(team, self);
-        let mut nt_d = f32::INFINITY;
-        let mut nt_idx = idx;
-        let mut crowd = 0.0f32;
-        for k in 1..N {
-            if k == idx {
-                continue;
-            }
-            let d = tps[k].pos.sub(me.pos).len();
-            if d < 5.0 {
-                crowd += 1.0;
-            }
-            if d < nt_d {
-                nt_d = d;
-                nt_idx = k;
-            }
-        }
-        let nt_rel = if nt_d.is_finite() {
-            mir(tps[nt_idx].pos).sub(mp)
-        } else {
-            V2::new(0.0, 0.0)
-        };
-        let nt_dist = if nt_d.is_finite() { nt_d } else { nx };
-        let nt_pressure = 1.0 / (1.0 + nt_dist); // high when a teammate is on top of me
-        let crowd_frac = crowd / (N as f32 - 1.0);
-
-        // ROLE signal: is this player the closest outfielder to the ball, and its
-        // rank by ball-distance. Lets the policy learn "only the closest chases;
-        // the rest hold shape" — so players don't all pile onto the ball and bunch.
+        // role: is this the closest outfielder to the ball, and its ball-distance rank
         let my_ball_d = me.pos.sub(self.ball).len();
         let mut closer = 0usize;
         for k in 1..N {
-            if k != idx && tps[k].pos.sub(self.ball).len() < my_ball_d {
+            if k != idx && players(team, self)[k].pos.sub(self.ball).len() < my_ball_d {
                 closer += 1;
             }
         }
         let is_closest = if closer == 0 { 1.0 } else { 0.0 };
-        let ball_rank = closer as f32 / (N as f32 - 2.0).max(1.0); // 0=closest .. 1=farthest
+        let ball_rank = closer as f32 / (N as f32 - 2.0).max(1.0);
 
-        let f = [
-            has_ball as u8 as f32,
-            team_ball as u8 as f32,
-            opp_ball as u8 as f32,
-            free_ball as u8 as f32,
-            mp.x / nx * 2.0 - 1.0,
-            mp.y / ny * 2.0 - 1.0,
-            mvel.x / nv,
-            mvel.y / nv,
-            ball_rel.x / nx,
-            ball_rel.y / ny,
-            ball_rel.len() / nx,
-            bvel.x / nv,
-            bvel.y / nv,
-            (goal.x - mp.x) / nx,
-            (goal.y - mp.y) / ny,
-            shot_dist / nx,
-            (own.x - mp.x) / nx,
-            (own.y - mp.y) / ny,
-            mp.x / nx * 2.0 - 1.0, // x-progress in attack frame
-            ax,
-            ay,
-            aopen,
-            adist,
-            bx,
-            by,
-            bopen,
-            bdist,
-            nopp_rel.x / nx,
-            nopp_rel.y / ny,
-            nopp_d / nx,
-            1.0 / (1.0 + nopp_d),
-            shot_clear,
-            shot_dist / nx,
-            // nearest-teammate perception (for learning to space out)
-            nt_rel.x / nx,
-            nt_rel.y / ny,
-            nt_dist / nx,
-            nt_pressure,
-            crowd_frac,
-            // role perception (who chases vs holds shape)
-            is_closest,
-            ball_rank,
-            1.0, // bias
-        ];
-        f
+        // teammates (all others incl. GK) and opponents, each sorted by distance to me
+        let mut tm: Vec<usize> = (0..N).filter(|&k| k != idx).collect();
+        tm.sort_by(|&a, &b| {
+            players(team, self)[a].pos.sub(me.pos).len()
+                .partial_cmp(&players(team, self)[b].pos.sub(me.pos).len())
+                .unwrap()
+        });
+        let opp = players(team.other(), self);
+        let mut op: Vec<usize> = (0..N).collect();
+        op.sort_by(|&a, &b| {
+            opp[a].pos.sub(me.pos).len().partial_cmp(&opp[b].pos.sub(me.pos).len()).unwrap()
+        });
+
+        let mut f: Vec<f32> = Vec::with_capacity(OBS_DIM);
+        // self / global (8)
+        f.push(has_ball as u8 as f32);
+        f.push(team_ball as u8 as f32);
+        f.push(opp_ball as u8 as f32);
+        f.push(free_ball as u8 as f32);
+        f.push(mp.x / nx * 2.0 - 1.0);
+        f.push(mp.y / ny * 2.0 - 1.0);
+        f.push(mvel.x / nv);
+        f.push(mvel.y / nv);
+        // ball (5)
+        f.push(ball_rel.x / nx);
+        f.push(ball_rel.y / ny);
+        f.push(ball_rel.len() / nx);
+        f.push(bvel.x / nv);
+        f.push(bvel.y / nv);
+        // goals (5)
+        f.push((goal.x - mp.x) / nx);
+        f.push((goal.y - mp.y) / ny);
+        f.push(goal.sub(mp).len() / nx);
+        f.push((own.x - mp.x) / nx);
+        f.push((own.y - mp.y) / ny);
+        // role + action cues (5)
+        f.push(is_closest);
+        f.push(ball_rank);
+        f.push(shot_clear);
+        f.push(aopen);
+        f.push(bopen);
+        // ALL teammates, nearest-first (N-1 = 4 × 5 = 20)
+        for &k in &tm {
+            let p = players(team, self)[k];
+            let rp = mir(p.pos).sub(mp);
+            let rv = mirv(p.vel);
+            f.push(rp.x / nx);
+            f.push(rp.y / ny);
+            f.push(rv.x / nv);
+            f.push(rv.y / nv);
+            f.push(rp.len() / nx);
+        }
+        // ALL opponents, nearest-first (N = 5 × 5 = 25)
+        for &k in &op {
+            let p = opp[k];
+            let rp = mir(p.pos).sub(mp);
+            let rv = mirv(p.vel);
+            f.push(rp.x / nx);
+            f.push(rp.y / ny);
+            f.push(rv.x / nv);
+            f.push(rv.y / nv);
+            f.push(rp.len() / nx);
+        }
+        f.push(1.0); // bias
+        debug_assert_eq!(f.len(), OBS_DIM);
+        f.try_into().unwrap()
     }
 
     /// Legal-action mask for one player (on-ball vs off-ball families).
