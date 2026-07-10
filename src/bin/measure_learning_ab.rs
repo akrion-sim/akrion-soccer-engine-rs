@@ -43,10 +43,13 @@ struct GameKpis {
     passes_attempted: f64,
     passes_completed: f64,
     passes_forward: f64,
+    passes_backward: f64,
+    completed_pass_gain_yards: f64,
     pass_turnovers: f64,
     intentional_passes_attempted: f64,
     intentional_passes_completed: f64,
     intentional_passes_forward: f64,
+    intentional_passes_backward: f64,
     intentional_pass_turnovers: f64,
     intentional_pass_gain_yards: f64,
     pass_chains: f64,
@@ -66,10 +69,13 @@ impl GameKpis {
         self.passes_attempted += other.passes_attempted;
         self.passes_completed += other.passes_completed;
         self.passes_forward += other.passes_forward;
+        self.passes_backward += other.passes_backward;
+        self.completed_pass_gain_yards += other.completed_pass_gain_yards;
         self.pass_turnovers += other.pass_turnovers;
         self.intentional_passes_attempted += other.intentional_passes_attempted;
         self.intentional_passes_completed += other.intentional_passes_completed;
         self.intentional_passes_forward += other.intentional_passes_forward;
+        self.intentional_passes_backward += other.intentional_passes_backward;
         self.intentional_pass_turnovers += other.intentional_pass_turnovers;
         self.intentional_pass_gain_yards += other.intentional_pass_gain_yards;
         self.pass_chains += other.pass_chains;
@@ -89,10 +95,13 @@ impl GameKpis {
             passes_attempted: self.passes_attempted * inv,
             passes_completed: self.passes_completed * inv,
             passes_forward: self.passes_forward * inv,
+            passes_backward: self.passes_backward * inv,
+            completed_pass_gain_yards: self.completed_pass_gain_yards * inv,
             pass_turnovers: self.pass_turnovers * inv,
             intentional_passes_attempted: self.intentional_passes_attempted * inv,
             intentional_passes_completed: self.intentional_passes_completed * inv,
             intentional_passes_forward: self.intentional_passes_forward * inv,
+            intentional_passes_backward: self.intentional_passes_backward * inv,
             intentional_pass_turnovers: self.intentional_pass_turnovers * inv,
             intentional_pass_gain_yards: self.intentional_pass_gain_yards * inv,
             pass_chains: self.pass_chains * inv,
@@ -114,10 +123,23 @@ impl GameKpis {
         let net_forward = self.passes_forward - self.pass_turnovers;
         let intentional_net_forward =
             self.intentional_passes_forward - self.intentional_pass_turnovers;
+        let passes_lateral =
+            (self.passes_completed - self.passes_forward - self.passes_backward).max(0.0);
+        let intentional_passes_lateral = (self.intentional_passes_completed
+            - self.intentional_passes_forward
+            - self.intentional_passes_backward)
+            .max(0.0);
+        let completed_gain_per_pass = ratio(self.completed_pass_gain_yards, self.passes_completed);
+        let intentional_gain_per_pass = ratio(
+            self.intentional_pass_gain_yards,
+            self.intentional_passes_completed,
+        );
         let dribble_beat_per_100 = ratio(self.dribble_beats * 100.0, self.dribble_decisions);
         println!(
             "{label:<14} pass_completion={:.3} passes={:.0}/{:.0} fwd_passes={:.0} \
+             back_passes={:.0} lat_passes={:.0} completed_gain_yds={:.1} gain_per_pass={:.2} \
              intentional_completion={:.3} intentional_passes={:.0}/{:.0} intentional_fwd={:.0} \
+             intentional_back={:.0} intentional_lat={:.0} intentional_gain_per_pass={:.2} \
              intentional_turnovers={:.1} intentional_net_forward={:.1} intentional_gain_yds={:.1} \
              pass_turnovers={:.1} net_forward={:.1} goals={:.2} shots={:.1} \
              on_target={:.1} shot_acc={:.3} shot_after_pass={:.1} dribble_beats={:.1} \
@@ -127,10 +149,17 @@ impl GameKpis {
             self.passes_completed,
             self.passes_attempted,
             self.passes_forward,
+            self.passes_backward,
+            passes_lateral,
+            self.completed_pass_gain_yards,
+            completed_gain_per_pass,
             intentional_completion,
             self.intentional_passes_completed,
             self.intentional_passes_attempted,
             self.intentional_passes_forward,
+            self.intentional_passes_backward,
+            intentional_passes_lateral,
+            intentional_gain_per_pass,
             self.intentional_pass_turnovers,
             intentional_net_forward,
             self.intentional_pass_gain_yards,
@@ -438,6 +467,11 @@ fn main() {
             passes_forward: f64::from(
                 st.passes_completed_forward_home + st.passes_completed_forward_away,
             ),
+            passes_backward: f64::from(
+                st.passes_completed_backward_home + st.passes_completed_backward_away,
+            ),
+            completed_pass_gain_yards: st.completed_pass_gain_yards_home
+                + st.completed_pass_gain_yards_away,
             pass_turnovers: f64::from(
                 st.pass_interceptions_own_half + st.pass_interceptions_opp_half,
             ),
@@ -450,6 +484,10 @@ fn main() {
             intentional_passes_forward: f64::from(
                 st.intentional_passes_completed_forward_home
                     + st.intentional_passes_completed_forward_away,
+            ),
+            intentional_passes_backward: f64::from(
+                st.intentional_passes_completed_backward_home
+                    + st.intentional_passes_completed_backward_away,
             ),
             intentional_pass_turnovers: f64::from(
                 st.intentional_pass_interceptions_own_half

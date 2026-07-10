@@ -340,6 +340,10 @@ const SOCCER_OPTION_SCORE_SAFETY_ANALYTIC_OPPONENT_MAX_SAMPLE_RATE: f64 = 0.05;
 const SOCCER_OPTION_SCORE_SAFETY_ANALYTIC_OPPONENT_MAX_ADVANTAGE_SCALE: f64 = 0.25;
 const SOCCER_OPTION_SCORE_SAFETY_ANALYTIC_OPPONENT_MAX_SAMPLE_WEIGHT: f64 = 1.25;
 const SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_SAMPLE_SALT: u64 = 0x4f50_5453_4146_4554;
+const SOCCER_OPTION_SCORE_SAFETY_REPLACEMENT_HARD_FAILURE_REWARD: f64 = -1.10;
+const SOCCER_OPTION_SCORE_SAFETY_REPLACEMENT_MIN_ADVANTAGE: f64 =
+    NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR;
+const SOCCER_OPTION_SCORE_SAFETY_REPLACEMENT_MAX_ADVANTAGE: f64 = 0.42;
 const NEURAL_DEFERRED_REWARD_DRAIN_PER_TICK: usize = 64;
 const NEURAL_DEFERRED_REWARD_DRAIN_PER_TICK_MAX: usize = 512;
 const LEARNED_TARGET_GRID_MIN_VISITS: u32 = 1;
@@ -1688,6 +1692,9 @@ pub struct SoccerMatch {
     /// (parity). Shared into each [`WorldSnapshot`] via an `Arc` clone, mirroring
     /// [`Self::line_depth_head`].
     pub(crate) pass_completion_head: Option<std::sync::Arc<SoccerPassCompletionHead>>,
+    /// Dedicated Away pass-completion head for per-team eval/tournament matches. `None` means Away
+    /// falls back to the shared Home head only in legacy single-net mode.
+    pub(crate) away_pass_completion_head: Option<std::sync::Arc<SoccerPassCompletionHead>>,
     /// Rolling window of MPC execution-objective training samples: the launch-time features + the
     /// bounded aim/lead residual actually applied, labelled with the delayed outcome advantage when
     /// the pass resolves. Drained by the learner to train [`SoccerMpcObjectiveHead`] (RWR).
@@ -1696,6 +1703,8 @@ pub struct SoccerMatch {
     /// When warm + gated on, it nudges the analytic aim/lead target by a hard-bounded residual so
     /// pass/shot/dribble QUALITY becomes learnable; `None` ⇒ pure analytic target (parity).
     pub(crate) mpc_objective_head: Option<std::sync::Arc<SoccerMpcObjectiveHead>>,
+    /// Dedicated Away MPC execution-objective head for per-team eval/tournament matches.
+    pub(crate) away_mpc_objective_head: Option<std::sync::Arc<SoccerMpcObjectiveHead>>,
     /// Transient carry-slot for the learned MPC DRIBBLE aim-residual (gated, default-OFF via
     /// [`dd_soccer_enable_learned_mpc_dribble_objective`]). Dribble is a SUSTAINED per-tick action
     /// whose reward (beat man / turnover) is DELAYED, so — unlike the discrete pass/shot
@@ -1748,11 +1757,15 @@ pub struct SoccerMatch {
     /// [`WorldSnapshot`] via an `Arc` clone so the off-ball ranker and LP floor read
     /// the same learned band.
     pub(crate) attack_spacing_head: Option<std::sync::Arc<AttackSpacingHead>>,
+    /// Dedicated Away attacking-spacing head for per-team eval/tournament matches.
+    pub(crate) away_attack_spacing_head: Option<std::sync::Arc<AttackSpacingHead>>,
     /// The trained off-ball support candidate scorer, when present. Carried + trained
     /// across games by the learner; `None` ⇒ analytic open-space seed. Shared into each
     /// [`WorldSnapshot`] via an `Arc` clone so support destinations can remain a
     /// predilection with learnable candidate choice.
     pub(crate) support_scorer_head: Option<std::sync::Arc<SupportScorerHead>>,
+    /// Dedicated Away support-candidate scorer for per-team eval/tournament matches.
+    pub(crate) away_support_scorer_head: Option<std::sync::Arc<SupportScorerHead>>,
     /// Rolling RL corpus for the loose-ball commit head: per-candidate state + the
     /// commit action taken + the windowed possession/territorial reward. Collected
     /// only while the commit model is enabled; empty + untouched in the default process.
@@ -4602,11 +4615,37 @@ mod tests {
         }
         sim.recent_learning_history
             .push_back(world_test_transition(&sim, attacker, "dribble", 238));
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let observation = snapshot.observation_for(attacker);
+        sim.players[attacker].last_decision = Some(AgentDecisionTrace {
+            mdp_state: snapshot.mdp_state_for_player(attacker),
+            observation: observation.clone(),
+            belief: belief_from_observation(&observation),
+            operation_order: vec!["learned-policy".to_string(), "dribble".to_string()],
+            scheduled_index: None,
+            action_options: single_action_option("dribble"),
+            action_target: None,
+            mdp_mpc_comparison: None,
+            learned_mpc_replan: None,
+            behavior_policy_probability: None,
+            neural_mcts_selected: false,
+            neural_mcts_candidate_count: 0,
+            neural_mcts_discretized_kick_candidate_count: 0,
+            neural_mcts_root_discretized_kick_candidate_count: 0,
+            neural_mcts_dribble_candidate_count: 0,
+            neural_mcts_root_dribble_candidate_count: 0,
+            action: "dribble".to_string(),
+        });
 
         let deferred_start = sim.deferred_reward_transitions.len();
         let episode_start = sim.episode_learning_transitions.len();
+        let dribble_turnover_start = sim.stats.dribble_turnovers_home;
         sim.complete_defensive_dispossession(defender, attacker, "tackle");
 
+        assert_eq!(
+            sim.stats.dribble_turnovers_home,
+            dribble_turnover_start + 1
+        );
         let added = &sim.deferred_reward_transitions[deferred_start..];
         assert!(
             added.iter().any(|transition| {
@@ -7096,6 +7135,171 @@ mod tests {
         assert!(
             !soccer_actor_policy_sample_allowed(&realized),
             "hard impossible-action fallbacks remain excluded from actor imitation"
+        );
+    }
+
+    #[test]
+    fn option_score_safety_hard_replan_trains_toward_planner_replacement() {
+        let sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let player = snapshot
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home field player");
+        let state = snapshot.mdp_state_for_player(player.id);
+        let observation = snapshot.observation_for(player.id);
+        let mut realized = SoccerLearningTransition {
+            tick: snapshot.tick,
+            player_id: player.id,
+            team: player.team,
+            role: player.role,
+            state: state.clone(),
+            observation: observation.clone(),
+            belief: belief_from_observation(&observation),
+            action: "pass".to_string(),
+            action_target: None,
+            decision_context: soccer_decision_context_for(
+                player.id,
+                player.team,
+                "pass",
+                None,
+                &snapshot,
+                &snapshot,
+            ),
+            tactical_trace: SoccerTacticalLearningTrace::default(),
+            reward: -0.35,
+            next_state: state,
+            next_observation: observation,
+            done: false,
+        };
+        realized.decision_context.learned_mpc_replanned = true;
+        realized.decision_context.learned_mpc_replan_source =
+            SoccerLearnedMpcReplanSource::OptionScoreSafety;
+        realized.decision_context.learned_mpc_original_action = Some("dribble".to_string());
+        realized.decision_context.learned_mpc_replacement_action = Some("pass".to_string());
+        realized
+            .decision_context
+            .learned_mpc_rejected_execution_probability =
+            LEARNED_MPC_SOFT_REPLAN_MIN_ORIGINAL_PROBABILITY * 0.5;
+        realized.decision_context.pass_target_expected_completion = 0.82;
+        realized.decision_context.pass_mpc_receipt_probability = 0.78;
+        realized.decision_context.pass_lane_interception_risk = 0.08;
+        realized.decision_context.target_forward_yards = 14.0;
+
+        assert!(
+            option_score_safety_replacement_distillation_candidate(&realized),
+            "option-score safety replacements are supervised targets even below the generic soft-replan threshold"
+        );
+        assert!(
+            soccer_actor_policy_sample_allowed(&realized),
+            "option-score safety replacement should train the actor toward the safer scored option"
+        );
+        let advantage = option_score_safety_replacement_distillation_advantage(
+            &realized,
+            -0.30,
+            option_score_safety_counterexample_advantage_scale(),
+        );
+        assert!(
+            advantage > 0.0,
+            "non-failed safety replacement should get a positive distillation floor, got {advantage}"
+        );
+
+        realized.decision_context.learned_mpc_replan_source = SoccerLearnedMpcReplanSource::Mpc;
+        assert!(
+            !soccer_actor_policy_sample_allowed(&realized),
+            "generic hard MPC fallbacks remain excluded from actor imitation"
+        );
+    }
+
+    #[test]
+    fn option_score_safety_replacement_and_rejected_original_enter_actor_batch() {
+        let _env_lock = soccer_world_env_lock();
+        let _rate = set_test_env_var(
+            "SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_SAMPLE_RATE",
+            "1.0",
+        );
+        let mut config = MatchConfig {
+            learning_enabled: true,
+            ..MatchConfig::default()
+        };
+        config.neural_learning.enabled = true;
+        let mut sim = SoccerMatch::default_11v11(config.clone());
+        sim.neural_blend.actor_critic = true;
+        sim.neural_learner = Some(SoccerNeuralLearner::new(&config));
+
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let player = snapshot
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home field player");
+        let state = snapshot.mdp_state_for_player(player.id);
+        let observation = snapshot.observation_for(player.id);
+        let mut realized = SoccerLearningTransition {
+            tick: snapshot.tick,
+            player_id: player.id,
+            team: player.team,
+            role: player.role,
+            state: state.clone(),
+            observation: observation.clone(),
+            belief: belief_from_observation(&observation),
+            action: "pass".to_string(),
+            action_target: None,
+            decision_context: soccer_decision_context_for(
+                player.id,
+                player.team,
+                "pass",
+                None,
+                &snapshot,
+                &snapshot,
+            ),
+            tactical_trace: SoccerTacticalLearningTrace::default(),
+            reward: -0.35,
+            next_state: state,
+            next_observation: observation,
+            done: false,
+        };
+        realized.decision_context.learned_mpc_replanned = true;
+        realized.decision_context.learned_mpc_replan_source =
+            SoccerLearnedMpcReplanSource::OptionScoreSafety;
+        realized.decision_context.learned_mpc_original_action = Some("dribble".to_string());
+        realized.decision_context.learned_mpc_replacement_action = Some("pass".to_string());
+        realized
+            .decision_context
+            .learned_mpc_rejected_execution_probability = 0.02;
+        realized.decision_context.pass_target_expected_completion = 0.82;
+        realized.decision_context.pass_mpc_receipt_probability = 0.78;
+        realized.decision_context.pass_lane_interception_risk = 0.08;
+        realized.decision_context.target_forward_yards = 14.0;
+        let rejected = learned_mpc_rejected_action_transition(&realized)
+            .expect("rejected original action transition");
+
+        let batch = sim.neural_policy_training_samples(&[realized, rejected]);
+        assert_eq!(batch.option_score_safety_counterexample_candidates, 2);
+        assert_eq!(batch.option_score_safety_counterexample_samples, 2);
+        let pass_index = soccer_policy_action_index("pass").expect("pass action index");
+        let dribble_index = soccer_policy_action_index("dribble").expect("dribble action index");
+        let pass_sample = batch
+            .samples
+            .iter()
+            .find(|sample| sample.action_index == pass_index)
+            .expect("replacement pass sample");
+        let dribble_sample = batch
+            .samples
+            .iter()
+            .find(|sample| sample.action_index == dribble_index)
+            .expect("rejected dribble sample");
+
+        assert!(
+            pass_sample.advantage > 0.0,
+            "replacement pass should be a positive actor target: {:?}",
+            pass_sample.advantage
+        );
+        assert!(
+            dribble_sample.advantage < 0.0,
+            "rejected original dribble should stay negative: {:?}",
+            dribble_sample.advantage
         );
     }
 
@@ -11161,6 +11365,91 @@ fn option_score_safety_rejected_action_counterexample(
         )
 }
 
+fn option_score_safety_replacement_distillation_candidate(
+    transition: &SoccerLearningTransition,
+) -> bool {
+    let context = &transition.decision_context;
+    if !context.learned_mpc_replanned
+        || !matches!(
+            context.learned_mpc_replan_source,
+            SoccerLearnedMpcReplanSource::OptionScoreSafety
+        )
+        || learned_mpc_rejected_action_counterexample(transition)
+    {
+        return false;
+    }
+    let Some(original_action) = context.learned_mpc_original_action.as_deref() else {
+        return false;
+    };
+    if learned_mpc_action_labels_match(original_action, &transition.action) {
+        return false;
+    }
+    context
+        .learned_mpc_replacement_action
+        .as_deref()
+        .map(|replacement| learned_mpc_action_labels_match(replacement, &transition.action))
+        .unwrap_or(true)
+}
+
+fn option_score_safety_replacement_technical_quality(transition: &SoccerLearningTransition) -> f64 {
+    let action = normalize_soccer_action_label(&transition.action);
+    let context = &transition.decision_context;
+    if pass_like_action_flight(action).is_some() {
+        let expected = finite_unit_interval(context.pass_target_expected_completion);
+        let receipt = finite_unit_interval(context.pass_mpc_receipt_probability);
+        let lane_safety = 1.0 - finite_unit_interval(context.pass_lane_interception_risk);
+        let forward = (context.target_forward_yards / 24.0).clamp(0.0, 1.0);
+        return (expected * 0.36 + receipt * 0.28 + lane_safety * 0.24 + forward * 0.12)
+            .clamp(0.0, 1.0);
+    }
+    if is_dribble_action_label(action) {
+        let control = finite_unit_interval(context.dribble_mpc_control_probability);
+        let qp_fit = finite_unit_interval(context.dribble_mpc_qp_accel_fit);
+        let margin = finite_unit_interval(context.dribble_mpc_space_margin_yards / 8.0);
+        let feasibility = finite_unit_interval(context.chosen_action_mpc_feasibility);
+        return (control * 0.36 + qp_fit * 0.24 + margin * 0.20 + feasibility * 0.20)
+            .clamp(0.0, 1.0);
+    }
+    if matches!(action, "shoot" | "first-time-shot" | "first-time-header") {
+        let accuracy = finite_unit_interval(context.shot_mpc_accuracy_probability);
+        let fit = finite_unit_interval(context.shot_mpc_qp_target_fit);
+        let goal = finite_unit_interval(context.shot_mpc_goal_probability);
+        let feasibility = finite_unit_interval(context.chosen_action_mpc_feasibility);
+        return (accuracy * 0.34 + fit * 0.20 + goal * 0.26 + feasibility * 0.20).clamp(0.0, 1.0);
+    }
+    0.45
+}
+
+fn option_score_safety_replacement_distillation_advantage(
+    transition: &SoccerLearningTransition,
+    advantage: f64,
+    advantage_scale: f64,
+) -> f64 {
+    if !option_score_safety_replacement_distillation_candidate(transition)
+        || !advantage.is_finite()
+        || transition.reward <= SOCCER_OPTION_SCORE_SAFETY_REPLACEMENT_HARD_FAILURE_REWARD
+    {
+        return advantage;
+    }
+    let rejection_confidence = 1.0
+        - finite_unit_interval(
+            transition
+                .decision_context
+                .learned_mpc_rejected_execution_probability,
+        );
+    let quality = option_score_safety_replacement_technical_quality(transition);
+    let scale = if advantage_scale.is_finite() {
+        advantage_scale.clamp(0.10, 1.0)
+    } else {
+        SOCCER_OPTION_SCORE_SAFETY_COUNTEREXAMPLE_ADVANTAGE_SCALE
+    };
+    let floor = (0.05 + rejection_confidence * 0.16 + quality * 0.25) * scale;
+    advantage.max(floor.clamp(
+        SOCCER_OPTION_SCORE_SAFETY_REPLACEMENT_MIN_ADVANTAGE,
+        SOCCER_OPTION_SCORE_SAFETY_REPLACEMENT_MAX_ADVANTAGE,
+    ))
+}
+
 fn soccer_learning_analytic_opponent_env_enabled() -> bool {
     std::env::var("SOCCER_LEARNING_ANALYTIC_OPPONENT")
         .ok()
@@ -11257,6 +11546,7 @@ fn option_score_safety_counterexample_sample_allowed_with_rate(
 fn soccer_actor_policy_sample_allowed(transition: &SoccerLearningTransition) -> bool {
     !transition.decision_context.learned_mpc_replanned
         || learned_mpc_rejected_action_counterexample(transition)
+        || option_score_safety_replacement_distillation_candidate(transition)
         || (transition
             .decision_context
             .learned_mpc_rejected_execution_probability
@@ -12507,8 +12797,10 @@ impl SoccerMatch {
             deferred_reward_transitions: Vec::new(),
             pass_outcome_samples: Vec::new(),
             pass_completion_head: None,
+            away_pass_completion_head: None,
             mpc_objective_samples: Vec::new(),
             mpc_objective_head: None,
+            away_mpc_objective_head: None,
             dribble_mpc_objective: None,
             line_depth_head: None,
             line_depth_samples: Vec::new(),
@@ -12519,7 +12811,9 @@ impl SoccerMatch {
             back_four_line_latch: [None, None],
             loose_ball_commit_head: None,
             attack_spacing_head: None,
+            away_attack_spacing_head: None,
             support_scorer_head: None,
+            away_support_scorer_head: None,
             loose_ball_commit_samples: Vec::new(),
             pending_loose_ball_commit: Vec::new(),
             receive_approach_head: None,
@@ -12722,13 +13016,17 @@ impl SoccerMatch {
             mpc_player_controllers: HashMap::new(),
             // NULL: all learned predictor heads
             pass_completion_head: None,
+            away_pass_completion_head: None,
             mpc_objective_head: None,
+            away_mpc_objective_head: None,
             dribble_mpc_objective: None,
             line_depth_head: None,
             defender_line_head: None,
             loose_ball_commit_head: None,
             attack_spacing_head: None,
+            away_attack_spacing_head: None,
             support_scorer_head: None,
+            away_support_scorer_head: None,
             receive_approach_head: None,
             lane_affinity_head: None,
             goal_side_recovery_head: None,
@@ -13098,6 +13396,81 @@ impl SoccerMatch {
             } else {
                 None
             };
+        self.away_pass_completion_head = None;
+        self.away_mpc_objective_head = None;
+        self.away_attack_spacing_head = None;
+        self.away_support_scorer_head = None;
+        Ok(())
+    }
+
+    fn clear_auxiliary_heads_for(&mut self, team: Team) {
+        match team {
+            Team::Home => {
+                self.pass_completion_head = None;
+                self.mpc_objective_head = None;
+                self.attack_spacing_head = None;
+                self.support_scorer_head = None;
+            }
+            Team::Away => {
+                self.away_pass_completion_head = None;
+                self.away_mpc_objective_head = None;
+                self.away_attack_spacing_head = None;
+                self.away_support_scorer_head = None;
+            }
+        }
+    }
+
+    fn restore_auxiliary_heads_for(
+        &mut self,
+        team: Team,
+        snapshot: &SoccerNeuralNetworkSnapshot,
+    ) -> Result<(), String> {
+        let pass_completion_head =
+            if let Some(pass_completion_head) = snapshot.pass_completion_head.as_deref() {
+                Some(std::sync::Arc::new(
+                    SoccerPassCompletionHead::from_snapshot(pass_completion_head)?,
+                ))
+            } else {
+                None
+            };
+        let mpc_objective_head =
+            if let Some(mpc_objective_head) = snapshot.mpc_objective_head.as_deref() {
+                Some(std::sync::Arc::new(SoccerMpcObjectiveHead::from_snapshot(
+                    mpc_objective_head,
+                )?))
+            } else {
+                None
+            };
+        let attack_spacing_head =
+            if let Some(attack_spacing_head) = snapshot.attack_spacing_head.as_deref() {
+                Some(std::sync::Arc::new(AttackSpacingHead::from_snapshot(
+                    attack_spacing_head,
+                )?))
+            } else {
+                None
+            };
+        let support_scorer_head =
+            if let Some(support_scorer_head) = snapshot.support_scorer_head.as_deref() {
+                Some(std::sync::Arc::new(SupportScorerHead::from_snapshot(
+                    support_scorer_head,
+                )?))
+            } else {
+                None
+            };
+        match team {
+            Team::Home => {
+                self.pass_completion_head = pass_completion_head;
+                self.mpc_objective_head = mpc_objective_head;
+                self.attack_spacing_head = attack_spacing_head;
+                self.support_scorer_head = support_scorer_head;
+            }
+            Team::Away => {
+                self.away_pass_completion_head = pass_completion_head;
+                self.away_mpc_objective_head = mpc_objective_head;
+                self.away_attack_spacing_head = attack_spacing_head;
+                self.away_support_scorer_head = support_scorer_head;
+            }
+        }
         Ok(())
     }
 
@@ -13152,6 +13525,75 @@ impl SoccerMatch {
         }
     }
 
+    fn pass_completion_head_for_team(
+        &self,
+        team: Team,
+    ) -> Option<std::sync::Arc<SoccerPassCompletionHead>> {
+        match team {
+            Team::Home => self.pass_completion_head.clone(),
+            Team::Away => {
+                if self.away_neural_learner.is_some() || self.away_neural_frozen {
+                    self.away_pass_completion_head.clone()
+                } else {
+                    self.away_pass_completion_head
+                        .clone()
+                        .or_else(|| self.pass_completion_head.clone())
+                }
+            }
+        }
+    }
+
+    fn mpc_objective_head_for(&self, team: Team) -> Option<std::sync::Arc<SoccerMpcObjectiveHead>> {
+        match team {
+            Team::Home => self.mpc_objective_head.clone(),
+            Team::Away => {
+                if self.away_neural_learner.is_some() || self.away_neural_frozen {
+                    self.away_mpc_objective_head.clone()
+                } else {
+                    self.away_mpc_objective_head
+                        .clone()
+                        .or_else(|| self.mpc_objective_head.clone())
+                }
+            }
+        }
+    }
+
+    fn attack_spacing_head_for_team(
+        &self,
+        team: Team,
+    ) -> Option<std::sync::Arc<AttackSpacingHead>> {
+        match team {
+            Team::Home => self.attack_spacing_head.clone(),
+            Team::Away => {
+                if self.away_neural_learner.is_some() || self.away_neural_frozen {
+                    self.away_attack_spacing_head.clone()
+                } else {
+                    self.away_attack_spacing_head
+                        .clone()
+                        .or_else(|| self.attack_spacing_head.clone())
+                }
+            }
+        }
+    }
+
+    fn support_scorer_head_for_team(
+        &self,
+        team: Team,
+    ) -> Option<std::sync::Arc<SupportScorerHead>> {
+        match team {
+            Team::Home => self.support_scorer_head.clone(),
+            Team::Away => {
+                if self.away_neural_learner.is_some() || self.away_neural_frozen {
+                    self.away_support_scorer_head.clone()
+                } else {
+                    self.away_support_scorer_head
+                        .clone()
+                        .or_else(|| self.support_scorer_head.clone())
+                }
+            }
+        }
+    }
+
     fn neural_team_frozen(&self, team: Team) -> bool {
         match team {
             Team::Home => self.home_neural_frozen,
@@ -13168,7 +13610,8 @@ impl SoccerMatch {
         self.away_neural_frozen = false;
         self.skill_policy_heads = None;
         self.away_skill_policy_heads = None;
-        self.pass_completion_head = None;
+        self.clear_auxiliary_heads_for(Team::Home);
+        self.clear_auxiliary_heads_for(Team::Away);
     }
 
     /// True when this match runs distinct per-team neural brains (the away team
@@ -13212,21 +13655,18 @@ impl SoccerMatch {
                 if let Some(line_depth_head) = &self.line_depth_head {
                     snapshot.line_depth_head = Some(Box::new(line_depth_head.to_snapshot()));
                 }
-                if let Some(pass_completion_head) = &self.pass_completion_head {
-                    snapshot.pass_completion_head =
-                        Some(Box::new(pass_completion_head.to_snapshot()));
-                }
-                if let Some(mpc_objective_head) = &self.mpc_objective_head {
-                    snapshot.mpc_objective_head = Some(Box::new(mpc_objective_head.to_snapshot()));
-                }
-                if let Some(attack_spacing_head) = &self.attack_spacing_head {
-                    snapshot.attack_spacing_head =
-                        Some(Box::new(attack_spacing_head.to_snapshot()));
-                }
-                if let Some(support_scorer_head) = &self.support_scorer_head {
-                    snapshot.support_scorer_head =
-                        Some(Box::new(support_scorer_head.to_snapshot()));
-                }
+                snapshot.pass_completion_head = self
+                    .pass_completion_head_for_team(team)
+                    .map(|head| Box::new(head.to_snapshot()));
+                snapshot.mpc_objective_head = self
+                    .mpc_objective_head_for(team)
+                    .map(|head| Box::new(head.to_snapshot()));
+                snapshot.attack_spacing_head = self
+                    .attack_spacing_head_for_team(team)
+                    .map(|head| Box::new(head.to_snapshot()));
+                snapshot.support_scorer_head = self
+                    .support_scorer_head_for_team(team)
+                    .map(|head| Box::new(head.to_snapshot()));
                 snapshot
             })
         })
@@ -13416,6 +13856,7 @@ impl SoccerMatch {
                         self.config.seed,
                     )?);
                 }
+                self.restore_auxiliary_heads_for(team, &snapshot)?;
                 restored_skill_policy_heads = if let Some(skill_policy_heads_snapshot) =
                     snapshot.skill_policy_heads.as_deref()
                 {
@@ -13454,16 +13895,21 @@ impl SoccerMatch {
                 }
                 SoccerNeuralLearner::from_pretrained_snapshot(&self.config, network, &snapshot)
             }
-            None if self.config.learning_enabled => SoccerNeuralLearner::new(&self.config),
+            None if self.config.learning_enabled => {
+                self.clear_auxiliary_heads_for(team);
+                SoccerNeuralLearner::new(&self.config)
+            }
             None => {
                 match team {
                     Team::Home => {
                         self.neural_learner = None;
                         self.skill_policy_heads = None;
+                        self.clear_auxiliary_heads_for(Team::Home);
                     }
                     Team::Away => {
                         self.away_neural_learner = None;
                         self.away_skill_policy_heads = None;
+                        self.clear_auxiliary_heads_for(Team::Away);
                     }
                 }
                 return Ok(());
@@ -13495,11 +13941,13 @@ impl SoccerMatch {
                 self.neural_learner = None;
                 self.home_neural_frozen = true;
                 self.skill_policy_heads = None;
+                self.clear_auxiliary_heads_for(Team::Home);
             }
             Team::Away => {
                 self.away_neural_learner = None;
                 self.away_neural_frozen = true;
                 self.away_skill_policy_heads = None;
+                self.clear_auxiliary_heads_for(Team::Away);
             }
         }
     }
@@ -17500,6 +17948,7 @@ impl SoccerMatch {
         let mut injected_forward_target: Option<usize> = None;
         if dd_soccer_enable_forward_release_root_candidate()
             && observation.visible_forward_pass_options > 0
+            && observation.best_forward_pass_option_quality >= forward_release_min_quality()
             && observation.expected_pass_completion >= forward_release_min_completion()
             && (!goal_attack_shot_is_required(observation, role)
                 || threaded_goal_pass_can_override_forced_shot(observation, role))
@@ -20186,10 +20635,14 @@ impl SoccerMatch {
                     learned_mpc_rejected_action_counterexample(transition);
                 let option_score_safety_counterexample =
                     option_score_safety_rejected_action_counterexample(transition);
-                if option_score_safety_counterexample {
+                let option_score_safety_replacement =
+                    option_score_safety_replacement_distillation_candidate(transition);
+                let option_score_safety_actor_sample =
+                    option_score_safety_counterexample || option_score_safety_replacement;
+                if option_score_safety_actor_sample {
                     option_score_safety_counterexample_candidates += 1;
                 }
-                if option_score_safety_counterexample
+                if option_score_safety_actor_sample
                     && !option_score_safety_counterexample_sample_allowed_with_rate(
                         transition,
                         option_score_safety_sample_rate,
@@ -20199,13 +20652,13 @@ impl SoccerMatch {
                     return None;
                 }
                 if !soccer_actor_policy_sample_allowed(transition) {
-                    if option_score_safety_counterexample {
+                    if option_score_safety_actor_sample {
                         option_score_safety_counterexample_actor_filtered += 1;
                     }
                     return None;
                 }
                 let Some(action_index) = soccer_policy_action_index(&transition.action) else {
-                    if option_score_safety_counterexample {
+                    if option_score_safety_actor_sample {
                         option_score_safety_counterexample_unindexed_action += 1;
                     }
                     return None;
@@ -20248,10 +20701,15 @@ impl SoccerMatch {
                 let advantage =
                     soccer_actor_advantage_with_planner_distillation(transition, advantage);
                 let advantage = soccer_actor_outcome_credit_advantage(transition, advantage);
+                let advantage = option_score_safety_replacement_distillation_advantage(
+                    transition,
+                    advantage,
+                    option_score_safety_advantage_scale,
+                );
                 let mcts_distillation =
                     soccer_actor_mcts_distillation_priority(transition, advantage);
                 let mut sample_weight = soccer_actor_priority_weight(transition, advantage);
-                if option_score_safety_counterexample {
+                if option_score_safety_actor_sample {
                     sample_weight = option_score_safety_counterexample_sample_weight(sample_weight);
                 }
                 let state_features = self.policy_state_features(transition);
@@ -20272,7 +20730,7 @@ impl SoccerMatch {
                     actor_probability,
                 );
                 if !advantage.is_finite() {
-                    if option_score_safety_counterexample {
+                    if option_score_safety_actor_sample {
                         option_score_safety_counterexample_nonfinite_advantage += 1;
                     }
                     return None;
@@ -20294,7 +20752,7 @@ impl SoccerMatch {
                     mcts_distillation,
                     forward_select_eligible,
                 };
-                if option_score_safety_counterexample {
+                if option_score_safety_actor_sample {
                     option_score_safety_counterexample_samples += 1;
                     option_score_safety_counterexample_weight_sum += sample.sanitized_weight();
                 }
@@ -26618,7 +27076,7 @@ impl SoccerMatch {
         // head clone live strictly INSIDE the gate for exactly this reason (a live pass A/B runs on
         // this code).
         if dd_soccer_enable_learned_mpc_dribble_objective() {
-            if let Some(head) = self.mpc_objective_head.clone() {
+            if let Some(head) = self.mpc_objective_head_for(player_team) {
                 let features = snapshot.mpc_objective_learn_features(
                     player_team,
                     MpcObjectiveFamily::Dribble,
@@ -27194,6 +27652,16 @@ impl SoccerMatch {
         // active SET PLAY (a dead-ball walk-up isn't open-play dribbling) — mirroring the
         // excessive-hold and backward-pass discipline guards.
         let carrier_is_keeper = self.players[attacker_id].role == PlayerRole::Goalkeeper;
+        let lost_from_dribble_action = self.players[attacker_id]
+            .last_decision
+            .as_ref()
+            .is_some_and(|decision| {
+                let action = normalize_soccer_action_label(&decision.action);
+                is_dribble_action_label(action.as_ref())
+            });
+        if lost_from_dribble_action {
+            self.stat_dribble_turnover(attacker_team);
+        }
         if overdribble_penalty_enabled() && !carrier_is_keeper && self.active_set_play.is_none() {
             let hold_seconds = self.holder_possession_seconds(attacker_id);
             let carrier_pos = self.players[attacker_id].position;
@@ -28578,7 +29046,7 @@ impl SoccerMatch {
                     // Captured with its launch features + reinforced by the delayed pass outcome (RWR).
                     let mpc_objective_sample: Option<(Vec<f32>, Vec2, f64)> =
                         if learned_mpc_objective_enabled() && explicit_target_point.is_none() {
-                            if let Some(head) = self.mpc_objective_head.clone() {
+                            if let Some(head) = self.mpc_objective_head_for(player_team) {
                                 let features = snapshot.mpc_objective_learn_features(
                                     player_team,
                                     MpcObjectiveFamily::Pass,
@@ -29639,7 +30107,7 @@ impl SoccerMatch {
                     // when-to-shoot stay with their own heads, per the shot-placement scope).
                     let mpc_shot_objective: Option<(Vec<f32>, Vec2, f64)> =
                         if dd_soccer_enable_learned_mpc_shot_objective() {
-                            if let Some(head) = self.mpc_objective_head.clone() {
+                            if let Some(head) = self.mpc_objective_head_for(player_team) {
                                 let features = snapshot.mpc_objective_learn_features(
                                     player_team,
                                     MpcObjectiveFamily::Shot,
@@ -32953,6 +33421,7 @@ impl SoccerMatch {
                             self.stat_pass_intercepted_half(own_half);
                             if pass.target.is_some_and(|target| target != pass.from) {
                                 self.stat_intentional_pass_intercepted_half(own_half);
+                                self.stat_intentional_pass_intercepted_team(pass.team);
                             }
                             self.record_pass_outcome_sample(pass, false, own_half);
                         }
@@ -35516,6 +35985,13 @@ impl SoccerMatch {
         }
     }
 
+    fn stat_intentional_pass_intercepted_team(&mut self, team: Team) {
+        match team {
+            Team::Home => self.stats.intentional_pass_interceptions_home += 1,
+            Team::Away => self.stats.intentional_pass_interceptions_away += 1,
+        }
+    }
+
     /// Emit a learned-pass-completion training sample from a resolved pass (the launch-time config
     /// embedding + pass features, labelled `completed`). Bounded rolling window; the cluster learner
     /// drains it to Postgres + the model. No-op when the launch features were not captured.
@@ -35792,6 +36268,13 @@ impl SoccerMatch {
         match team {
             Team::Home => self.stats.dribble_beats_home += 1,
             Team::Away => self.stats.dribble_beats_away += 1,
+        }
+    }
+
+    fn stat_dribble_turnover(&mut self, team: Team) {
+        match team {
+            Team::Home => self.stats.dribble_turnovers_home += 1,
+            Team::Away => self.stats.dribble_turnovers_away += 1,
         }
     }
 
@@ -37906,6 +38389,13 @@ pub struct WorldSnapshot {
     /// Skipped by serde (an internal decision aid; Default = None).
     #[serde(skip)]
     pub(crate) pass_completion_head: Option<std::sync::Arc<SoccerPassCompletionHead>>,
+    /// Dedicated Away pass-completion head copied from the match for per-team evals.
+    #[serde(skip)]
+    pub(crate) away_pass_completion_head: Option<std::sync::Arc<SoccerPassCompletionHead>>,
+    /// Whether Away has a dedicated/frozen neural brain and therefore must not borrow Home/shared
+    /// auxiliary heads when its own sidecar is absent.
+    #[serde(skip)]
+    pub(crate) away_auxiliary_heads_dedicated: bool,
     /// The trained loose-ball commit head, carried from the match for live
     /// consumption in the retriever election. `None` ⇒ analytic seed (parity).
     /// Skipped by serde (an internal decision aid; Default = None).
@@ -37973,11 +38463,17 @@ pub struct WorldSnapshot {
     /// Default = None).
     #[serde(skip)]
     pub(crate) attack_spacing_head: Option<std::sync::Arc<AttackSpacingHead>>,
+    /// Dedicated Away attacking-spacing head copied from the match for per-team evals.
+    #[serde(skip)]
+    pub(crate) away_attack_spacing_head: Option<std::sync::Arc<AttackSpacingHead>>,
     /// The trained support-candidate value head, carried from the match for live
     /// consumption by `open_space_for`. `None` ⇒ analytic seed (parity). Skipped by
     /// serde (internal decision aid; Default = None).
     #[serde(skip)]
     pub(crate) support_scorer_head: Option<std::sync::Arc<SupportScorerHead>>,
+    /// Dedicated Away support-candidate scorer copied from the match for per-team evals.
+    #[serde(skip)]
+    pub(crate) away_support_scorer_head: Option<std::sync::Arc<SupportScorerHead>>,
     /// Carried from the match for live consumption in the aerial-reception decision: how
     /// high to attack a dropping lofted ball. `None` ⇒ analytic seed (parity). Skipped by
     /// serde (an internal decision aid; Default = None).
@@ -38311,6 +38807,112 @@ pub(crate) fn safe_progressive_pass_score_bonus(
         * forward_fit
         * quick_forward_pass_band_fit(distance_yards)
         * SAFE_PROGRESSIVE_PASS_SCORE_BONUS
+}
+
+fn retained_forward_target_utility_scale() -> f64 {
+    #[cfg(test)]
+    {
+        retained_forward_target_utility_scale_from_env()
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<f64> = OnceLock::new();
+        *V.get_or_init(retained_forward_target_utility_scale_from_env)
+    }
+}
+
+fn retained_forward_target_utility_scale_from_env() -> f64 {
+    std::env::var("DD_SOCCER_RETAINED_FORWARD_TARGET_UTILITY_SCALE")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.0)
+        .clamp(0.0, 8.0)
+}
+
+pub(crate) fn retained_forward_target_utility_bonus(
+    quality: &PassTargetQuality,
+    forward_yards: f64,
+    distance_yards: f64,
+) -> f64 {
+    let scale = retained_forward_target_utility_scale();
+    if scale <= 1e-9 || forward_yards <= COMPLETED_FORWARD_PASS_COUNT_MIN_YARDS {
+        return 0.0;
+    }
+    let completion = quality.expected_completion.clamp(0.0, 1.0);
+    let receipt = quality.mpc_receipt_probability.clamp(0.0, 1.0);
+    let safe_receipt = completion * 0.68 + receipt * 0.32;
+    let retention_fit = ((safe_receipt - 0.44) / 0.34).clamp(0.0, 1.0);
+    if retention_fit <= 0.0 {
+        return 0.0;
+    }
+    let lane_safety = (1.0 - quality.lane_interception_risk.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+    let lane_fit = ((lane_safety - 0.34) / 0.46).clamp(0.0, 1.0);
+    if lane_fit <= 0.0 {
+        return 0.0;
+    }
+    let forward_fit =
+        ((forward_yards - COMPLETED_FORWARD_PASS_COUNT_MIN_YARDS) / 16.0).clamp(0.0, 1.0);
+    let distance_fit = quick_forward_pass_band_fit(distance_yards)
+        .max((1.0 - ((distance_yards - 18.0).max(0.0) / 28.0)).clamp(0.0, 0.75));
+    scale * forward_fit * retention_fit * lane_fit * distance_fit
+}
+
+const FORWARD_OPTION_RECOGNITION_LATERAL_THRESHOLD: f64 = 0.58;
+const FORWARD_OPTION_RECOGNITION_LATERAL_DEMOTION: f64 = 4.0;
+const FORWARD_OPTION_LATERAL_PRESSURE_ESCAPE_MIN_PRESSURE: f64 = 0.70;
+const FORWARD_OPTION_LATERAL_PRESSURE_ESCAPE_MIN_COMPLETION: f64 = 0.72;
+const FORWARD_OPTION_LATERAL_PRESSURE_ESCAPE_MAX_DISTANCE: f64 = 14.0;
+const FORWARD_OPTION_LATERAL_FINAL_THIRD_MAX_DISTANCE: f64 = 10.0;
+const FORWARD_OPTION_LATERAL_FINAL_THIRD_MIN_COMPLETION: f64 = 0.66;
+
+fn forward_option_lateral_demotion_enabled() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_FORWARD_OPTION_RECOGNITION_LATERAL_DEMOTION")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| {
+            soccer_env_flag_enabled("DD_SOCCER_ENABLE_FORWARD_OPTION_RECOGNITION_LATERAL_DEMOTION")
+        })
+    }
+}
+
+pub(crate) fn forward_option_lateral_demotion_penalty(
+    forward_yards: f64,
+    best_forward_option_quality: f64,
+    passer_pressure: f64,
+    expected_completion: f64,
+    distance_yards: f64,
+    yards_to_goal: f64,
+    field_length: f64,
+    enabled: bool,
+) -> f64 {
+    if !enabled
+        || !forward_yards.is_finite()
+        || forward_yards.abs() > COMPLETED_FORWARD_PASS_COUNT_MIN_YARDS
+        || best_forward_option_quality < FORWARD_OPTION_RECOGNITION_LATERAL_THRESHOLD
+    {
+        return 0.0;
+    }
+    let pressure_escape = passer_pressure >= FORWARD_OPTION_LATERAL_PRESSURE_ESCAPE_MIN_PRESSURE
+        && expected_completion >= FORWARD_OPTION_LATERAL_PRESSURE_ESCAPE_MIN_COMPLETION
+        && distance_yards <= FORWARD_OPTION_LATERAL_PRESSURE_ESCAPE_MAX_DISTANCE;
+    if pressure_escape {
+        return 0.0;
+    }
+    let final_third_combination = yards_to_goal <= field_length / 3.0
+        && distance_yards <= FORWARD_OPTION_LATERAL_FINAL_THIRD_MAX_DISTANCE
+        && expected_completion >= FORWARD_OPTION_LATERAL_FINAL_THIRD_MIN_COMPLETION;
+    if final_third_combination {
+        return 0.0;
+    }
+    (best_forward_option_quality - FORWARD_OPTION_RECOGNITION_LATERAL_THRESHOLD)
+        * FORWARD_OPTION_RECOGNITION_LATERAL_DEMOTION
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -40543,6 +41145,16 @@ fn dd_soccer_disable_hold_for_support() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_HOLD_FOR_SUPPORT").is_ok())
 }
+fn dd_soccer_enable_pressured_hold_for_support() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_PRESSURED_HOLD_FOR_SUPPORT")
+    }
+    #[cfg(not(test))]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_PRESSURED_HOLD_FOR_SUPPORT")
+    }
+}
 /// Disables the "drive into open space instead of waiting" guard, restoring the prior
 /// hold-for-support gate (which let a calm carrier stand on the ball even with clear grass
 /// ahead). Default-off: the guard is ON so unpressured carriers attack the space.
@@ -40996,6 +41608,51 @@ impl WorldSnapshot {
         }
     }
 
+    pub(crate) fn pass_completion_head_for(&self, team: Team) -> Option<&SoccerPassCompletionHead> {
+        match team {
+            Team::Home => self.pass_completion_head.as_deref(),
+            Team::Away => {
+                if self.away_auxiliary_heads_dedicated {
+                    self.away_pass_completion_head.as_deref()
+                } else {
+                    self.away_pass_completion_head
+                        .as_deref()
+                        .or_else(|| self.pass_completion_head.as_deref())
+                }
+            }
+        }
+    }
+
+    fn attack_spacing_head_for(&self, team: Team) -> Option<&AttackSpacingHead> {
+        match team {
+            Team::Home => self.attack_spacing_head.as_deref(),
+            Team::Away => {
+                if self.away_auxiliary_heads_dedicated {
+                    self.away_attack_spacing_head.as_deref()
+                } else {
+                    self.away_attack_spacing_head
+                        .as_deref()
+                        .or_else(|| self.attack_spacing_head.as_deref())
+                }
+            }
+        }
+    }
+
+    fn support_scorer_head_for(&self, team: Team) -> Option<&SupportScorerHead> {
+        match team {
+            Team::Home => self.support_scorer_head.as_deref(),
+            Team::Away => {
+                if self.away_auxiliary_heads_dedicated {
+                    self.away_support_scorer_head.as_deref()
+                } else {
+                    self.away_support_scorer_head
+                        .as_deref()
+                        .or_else(|| self.support_scorer_head.as_deref())
+                }
+            }
+        }
+    }
+
     pub(crate) fn from_match_for_agent_decision(m: &SoccerMatch) -> Self {
         Self::from_match_with_options(m, WorldSnapshotOptions::AGENT_DECISION)
     }
@@ -41244,6 +41901,8 @@ impl WorldSnapshot {
                 m.back_four_line_latch[1].map(|l| l.centre_depth),
             ],
             pass_completion_head: m.pass_completion_head.clone(),
+            away_pass_completion_head: m.away_pass_completion_head.clone(),
+            away_auxiliary_heads_dedicated: m.away_neural_learner.is_some() || m.away_neural_frozen,
             loose_ball_commit_head: m.loose_ball_commit_head.clone(),
             receive_approach_head: m.receive_approach_head.clone(),
             lane_affinity_head: m.lane_affinity_head.clone(),
@@ -41259,7 +41918,9 @@ impl WorldSnapshot {
             long_pass_run_head: m.long_pass_run_head.clone(),
             give_and_go_head: m.give_and_go_head.clone(),
             attack_spacing_head: m.attack_spacing_head.clone(),
+            away_attack_spacing_head: m.away_attack_spacing_head.clone(),
             support_scorer_head: m.support_scorer_head.clone(),
+            away_support_scorer_head: m.away_support_scorer_head.clone(),
             aerial_reception_head: m.aerial_reception_head.clone(),
             shot_trigger_head: m.shot_trigger_head.clone(),
             loose_ball_uncontested_since_tick: m.loose_ball_uncontested_since_tick,
@@ -50748,6 +51409,8 @@ impl WorldSnapshot {
                 );
                 let safe_progression_bonus =
                     safe_progressive_pass_score_bonus(expected_completion_for_score, forward, dist);
+                let retained_forward_utility_bonus =
+                    retained_forward_target_utility_bonus(&pass_quality, forward, dist);
                 let completion_primary_adjustment =
                     pass_target_completion_primary_adjustment(&pass_quality, forward, own_half);
                 // Forward-option recognition: when a genuinely good forward ball exists,
@@ -50763,11 +51426,23 @@ impl WorldSnapshot {
                 } else {
                     0.0
                 };
+                let lateral_when_forward_available_penalty =
+                    forward_option_lateral_demotion_penalty(
+                        forward,
+                        best_forward_option_quality,
+                        passer_pressure,
+                        expected_completion_for_score,
+                        dist,
+                        (me.team.goal_y(self.field_length) - pass_point.y).abs(),
+                        self.field_length,
+                        forward_option_lateral_demotion_enabled(),
+                    );
                 let score = score + low_cross_policy_bonus
                     - blind_backward_penalty
                     - long_backward_penalty
                     - backward_pressure_release_penalty
                     - backward_when_forward_available_penalty
+                    - lateral_when_forward_available_penalty
                     - backward_path_traffic_penalty
                     - lateral_penalty
                     - anticipation_penalty
@@ -50793,6 +51468,7 @@ impl WorldSnapshot {
                     + role_risk.safety_bonus
                     + role_risk.forward_risk_bonus * pass_target_learning
                     + safe_progression_bonus * pass_target_learning
+                    + retained_forward_utility_bonus * pass_target_learning
                     + completion_primary_adjustment
                     + forward_open_bonus * pass_target_learning
                     + progressive_floor_outlet_bonus * pass_target_learning
@@ -54042,7 +54718,11 @@ impl WorldSnapshot {
             .nearest_opponent_at(carrier.team, carrier_pos)
             .map(|(_, _, dist)| dist)
             .unwrap_or(f64::INFINITY);
-        if nearest_opp_dist < HOLD_FOR_SUPPORT_MIN_SPACE_YARDS {
+        let forward_dribble_space = self.forward_dribble_space_yards(carrier_id);
+        let pressured_trapped_wait = dd_soccer_enable_pressured_hold_for_support()
+            && nearest_opp_dist >= HOLD_FOR_SUPPORT_PRESSURED_MIN_SPACE_YARDS
+            && forward_dribble_space <= HOLD_FOR_SUPPORT_PRESSURED_MAX_DRIBBLE_SPACE_YARDS;
+        if nearest_opp_dist < HOLD_FOR_SUPPORT_MIN_SPACE_YARDS && !pressured_trapped_wait {
             return None;
         }
         let opp = carrier.team.other();
@@ -54071,8 +54751,7 @@ impl WorldSnapshot {
         // blocked picture (no forward lane to carry into AND no clean outlet). Gated so the prior
         // behaviour can be restored for A/B with `DD_SOCCER_DISABLE_HOLD_DRIVE_INTO_SPACE=1`.
         if !dd_soccer_disable_hold_drive_into_space()
-            && self.forward_dribble_space_yards(carrier_id)
-                >= HOLD_FOR_SUPPORT_DRIVE_INTO_SPACE_YARDS
+            && forward_dribble_space >= HOLD_FOR_SUPPORT_DRIVE_INTO_SPACE_YARDS
         {
             return None;
         }
@@ -54157,7 +54836,14 @@ impl WorldSnapshot {
         let best_space = candidates.first().map(|(_, s)| *s).unwrap_or(0.0);
         let depth =
             (candidates.len() as f64 / HOLD_FOR_SUPPORT_MAX_SUMMONED as f64).clamp(0.0, 1.0);
-        let calm = ((nearest_opp_dist - HOLD_FOR_SUPPORT_MIN_SPACE_YARDS) / 6.0).clamp(0.0, 1.0);
+        let calm = if pressured_trapped_wait {
+            ((nearest_opp_dist - HOLD_FOR_SUPPORT_PRESSURED_MIN_SPACE_YARDS)
+                / (HOLD_FOR_SUPPORT_MIN_SPACE_YARDS - HOLD_FOR_SUPPORT_PRESSURED_MIN_SPACE_YARDS)
+                    .max(1e-6))
+            .clamp(0.0, 0.45)
+        } else {
+            ((nearest_opp_dist - HOLD_FOR_SUPPORT_MIN_SPACE_YARDS) / 6.0).clamp(0.0, 1.0)
+        };
         let quality = (best_space * 0.50 + depth * 0.28 + calm * 0.22).clamp(0.0, 1.0);
         let summoned: Vec<usize> = candidates.into_iter().map(|(id, _)| id).collect();
         Some(HoldForSupportPlan {
@@ -62402,7 +63088,7 @@ impl WorldSnapshot {
             nearest_teammate_yards: nearest_teammate,
             width_shortage: width_shortage.clamp(0.0, 1.0),
         };
-        Some(self.resolved_attack_spacing_target(&ctx))
+        Some(self.resolved_attack_spacing_target(team, &ctx))
     }
 
     /// The team-level attacking-spacing context (the centroid is "self") plus the
@@ -62484,27 +63170,30 @@ impl WorldSnapshot {
             return None;
         }
         let (ctx, _held) = self.attack_spacing_team_context(team)?;
-        Some(self.resolved_attack_spacing_target(&ctx).min)
+        Some(self.resolved_attack_spacing_target(team, &ctx).min)
     }
 
     pub(crate) fn resolved_attack_spacing_target(
         &self,
+        team: Team,
         ctx: &AttackSpacingContext,
     ) -> AttackSpacingTarget {
         let head = self
-            .attack_spacing_head
-            .as_deref()
+            .attack_spacing_head_for(team)
             .filter(|head| head.training_steps() >= ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS);
         resolve_attack_spacing_target(ctx, head)
     }
 
-    pub(crate) fn support_candidate_score(&self, features: &SupportCandidateFeatures) -> f64 {
+    pub(crate) fn support_candidate_score(
+        &self,
+        team: Team,
+        features: &SupportCandidateFeatures,
+    ) -> f64 {
         let analytic = analytic_candidate_score(features);
         if !support_scorer_enabled() {
             return analytic;
         }
-        self.support_scorer_head
-            .as_deref()
+        self.support_scorer_head_for(team)
             .filter(|head| head.training_steps() >= SUPPORT_SCORER_HEAD_MIN_TRAINING_STEPS)
             .and_then(|head| head.predict(features))
             .filter(|score| score.is_finite())
@@ -63030,7 +63719,7 @@ impl WorldSnapshot {
                     teammate_occupation_penalty,
                     line_shape_penalty,
                 };
-                let score = self.support_candidate_score(&support_features);
+                let score = self.support_candidate_score(me.team, &support_features);
                 Self::push_open_space_hypothesis(&mut open_space_hypotheses, p, score);
                 if collect_run_modes && score.is_finite() {
                     scored_candidates.push((p, score));

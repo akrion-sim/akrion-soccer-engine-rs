@@ -4021,6 +4021,8 @@ const WALL_PASS_GIVE_POWER: f64 = 0.58;
 /// The carrier only *waits* when calm: the nearest opponent must be at least this far away
 /// (it is patience, not a pressured shield — pressured retention is the protect-ball option).
 const HOLD_FOR_SUPPORT_MIN_SPACE_YARDS: f64 = 4.5;
+const HOLD_FOR_SUPPORT_PRESSURED_MIN_SPACE_YARDS: f64 = 1.4;
+const HOLD_FOR_SUPPORT_PRESSURED_MAX_DRIBBLE_SPACE_YARDS: f64 = 5.0;
 /// A teammate already ahead with a clean lane and at least this much space is a forward
 /// outlet NOW — so there is nothing to wait for and the gate declines (the carrier passes).
 const HOLD_FOR_SUPPORT_OUTLET_OPEN_YARDS: f64 = 3.0;
@@ -19886,6 +19888,10 @@ pub struct MatchStats {
     #[serde(default)]
     pub intentional_pass_interceptions_opp_half: u32,
     #[serde(default)]
+    pub intentional_pass_interceptions_home: u32,
+    #[serde(default)]
+    pub intentional_pass_interceptions_away: u32,
+    #[serde(default)]
     pub clearances_home: u32,
     #[serde(default)]
     pub clearances_away: u32,
@@ -19899,6 +19905,10 @@ pub struct MatchStats {
     pub dribble_beats_home: u32,
     #[serde(default)]
     pub dribble_beats_away: u32,
+    #[serde(default)]
+    pub dribble_turnovers_home: u32,
+    #[serde(default)]
+    pub dribble_turnovers_away: u32,
     pub loose_ball_recoveries_home: u32,
     pub loose_ball_recoveries_away: u32,
     pub offsides_home: u32,
@@ -29998,6 +30008,10 @@ fn attacking_shape_support_urgency(snapshot: &WorldSnapshot, team: Team) -> f64 
 
 const OPEN_SUPPORT_OUTLET_RADIUS_YARDS: f64 = 18.0;
 
+fn pressured_support_outlet_urgency_enabled() -> bool {
+    soccer_env_flag_enabled("DD_SOCCER_ENABLE_PRESSURED_SUPPORT_OUTLET_URGENCY")
+}
+
 fn open_support_outlet_count(
     snapshot: &WorldSnapshot,
     team: Team,
@@ -30022,6 +30036,54 @@ fn open_support_outlet_count(
         })
         .take(3)
         .count()
+}
+
+fn holder_pass_outlet_picture_quality(
+    snapshot: &WorldSnapshot,
+    holder: &PlayerSnapshot,
+    holder_position: Vec2,
+) -> (f64, f64) {
+    let mut best_any = 0.0_f64;
+    let mut best_forward = 0.0_f64;
+    for target_id in snapshot.ranked_visible_pass_targets(holder.id, 6) {
+        let Some(target) = snapshot
+            .players
+            .iter()
+            .find(|player| player.id == target_id)
+        else {
+            continue;
+        };
+        if target.team != holder.team || target.role == PlayerRole::Goalkeeper {
+            continue;
+        }
+        let target_position = snapshot
+            .player_position(target.id)
+            .unwrap_or(target.position);
+        let distance = holder_position.distance(target_position);
+        let forward_yards = (target_position.y - holder_position.y) * holder.team.attack_dir();
+        let openness = pass_receiver_openness_for_snapshots_with_teammates(
+            &snapshot.players,
+            holder.team,
+            target_position,
+            Some(target.id),
+        );
+        let lane_fit =
+            if snapshot.clear_line(holder_position, target_position, holder.team.other(), 2.0) {
+                1.0
+            } else {
+                0.0
+            };
+        let distance_fit = (1.0 - (distance - 14.0).abs() / 30.0).clamp(0.0, 1.0);
+        let forward_fit = (forward_yards / 12.0).clamp(0.0, 1.0);
+        let quality =
+            (openness * 0.42 + lane_fit * 0.32 + distance_fit * 0.16 + forward_fit * 0.10)
+                .clamp(0.0, 1.0);
+        best_any = best_any.max(quality);
+        if forward_yards >= 4.0 {
+            best_forward = best_forward.max(quality);
+        }
+    }
+    (best_any, best_forward)
 }
 
 fn holder_pressure_support_urgency(snapshot: &WorldSnapshot, team: Team) -> f64 {
@@ -30063,7 +30125,24 @@ fn holder_pressure_support_urgency(snapshot: &WorldSnapshot, team: Team) -> f64 
         OPEN_SUPPORT_OUTLET_RADIUS_YARDS,
     );
     let open_outlet_shortage = ((3.0 - open_outlets as f64) / 3.0).clamp(0.0, 1.0);
-    (pressure * 0.42 + crowding * 0.24 + open_outlet_shortage * 0.34).clamp(0.0, 1.0)
+    let mut urgency =
+        (pressure * 0.42 + crowding * 0.24 + open_outlet_shortage * 0.34).clamp(0.0, 1.0);
+    if pressured_support_outlet_urgency_enabled() {
+        let (best_any_outlet, best_forward_outlet) =
+            holder_pass_outlet_picture_quality(snapshot, holder, holder_position);
+        let outlet_picture_shortage = ((0.54 - best_any_outlet) / 0.54).clamp(0.0, 1.0);
+        let forward_outlet_shortage = ((0.48 - best_forward_outlet) / 0.48).clamp(0.0, 1.0);
+        let pressure_fit = pressure.max(crowding).clamp(0.0, 1.0);
+        let severe_pressure_fit = ((pressure_fit - 0.58) / 0.28).clamp(0.0, 1.0);
+        let poor_outlet_fit = outlet_picture_shortage
+            .max(forward_outlet_shortage)
+            .max(open_outlet_shortage * 0.72);
+        let quality_lift = severe_pressure_fit
+            * poor_outlet_fit
+            * (outlet_picture_shortage * 0.08 + forward_outlet_shortage * 0.14);
+        urgency = (urgency + quality_lift).clamp(0.0, 1.0);
+    }
+    urgency
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -39306,9 +39385,13 @@ impl SoccerPassCompletionHead {
             };
             let input: Vec<f64> = normalized.iter().map(|&v| v as f64).collect();
             let target = [if sample.completed { 1.0 } else { 0.0 }];
-            let result = self
-                .network
-                .train_sample_clipped(&input, &target, learning_rate, 4.0);
+            let sample_weight = pass_completion_training_sample_weight(sample);
+            let result = self.network.train_sample_clipped(
+                &input,
+                &target,
+                learning_rate * sample_weight,
+                4.0,
+            );
             if result.applied && result.loss.is_finite() {
                 total += result.loss;
                 applied += 1;
@@ -39373,6 +39456,66 @@ impl SoccerPassCompletionHead {
             correct as f64 / scored as f64
         }
     }
+}
+
+fn pass_completion_forward_weighting_enabled() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_PASS_COMPLETION_FORWARD_WEIGHTING")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            soccer_env_flag_enabled("DD_SOCCER_ENABLE_PASS_COMPLETION_FORWARD_WEIGHTING")
+        })
+    }
+}
+
+pub(crate) fn pass_completion_training_sample_weight_for(
+    sample: &SoccerPassOutcomeSample,
+    enabled: bool,
+) -> f64 {
+    if !enabled {
+        return 1.0;
+    }
+    let pass_offset = SOCCER_MOMENT_EMBEDDING_DIM;
+    let Some(distance_feature) = sample.features.get(pass_offset) else {
+        return 1.0;
+    };
+    let Some(forward_feature) = sample.features.get(pass_offset + 1) else {
+        return 1.0;
+    };
+    let distance_yards = (*distance_feature as f64 * 60.0).clamp(0.0, 90.0);
+    let forward_yards = (*forward_feature as f64 * 40.0).clamp(-40.0, 60.0);
+    let pressure = sample
+        .features
+        .get(pass_offset + 3)
+        .map(|value| (*value as f64).clamp(0.0, 1.0))
+        .unwrap_or(0.0);
+    let forward_fit =
+        ((forward_yards - COMPLETED_FORWARD_PASS_COUNT_MIN_YARDS) / 18.0).clamp(0.0, 1.0);
+    let long_forward_fit = ((forward_yards - 12.0) / 28.0).clamp(0.0, 1.0);
+    let distance_fit = ((distance_yards - 8.0) / 34.0).clamp(0.0, 1.0);
+    let mut weight = if sample.completed {
+        1.0 + forward_fit * 0.55 + long_forward_fit * 0.15
+    } else {
+        1.0 + forward_fit * 0.85
+            + long_forward_fit * 0.25
+            + distance_fit * 0.20
+            + pressure * forward_fit * 0.25
+    };
+    if sample.completed && forward_yards < -COMPLETED_FORWARD_PASS_COUNT_MIN_YARDS {
+        let backward_fit =
+            ((-forward_yards - COMPLETED_FORWARD_PASS_COUNT_MIN_YARDS) / 12.0).clamp(0.0, 1.0);
+        weight -= backward_fit * 0.22;
+    }
+    weight.clamp(0.65, 2.5)
+}
+
+fn pass_completion_training_sample_weight(sample: &SoccerPassOutcomeSample) -> f64 {
+    pass_completion_training_sample_weight_for(sample, pass_completion_forward_weighting_enabled())
 }
 
 /// Minimum SGD steps a [`SoccerPassCompletionHead`] must have taken before the live pass-quality
@@ -57176,6 +57319,8 @@ fn tracking_frame_to_world_snapshot(
         defender_line_head: None,
         back_four_line_latch_centre_depth: [None, None],
         pass_completion_head: None,
+        away_pass_completion_head: None,
+        away_auxiliary_heads_dedicated: false,
         loose_ball_commit_head: None,
         receive_approach_head: None,
         lane_affinity_head: None,
@@ -57191,7 +57336,9 @@ fn tracking_frame_to_world_snapshot(
         long_pass_run_head: None,
         give_and_go_head: None,
         attack_spacing_head: None,
+        away_attack_spacing_head: None,
         support_scorer_head: None,
+        away_support_scorer_head: None,
         aerial_reception_head: None,
         shot_trigger_head: None,
         loose_ball_uncontested_since_tick: None,
@@ -63632,7 +63779,7 @@ fn pass_target_quality_for_snapshot_uncached(
     // pressure derived from the nearest opponent (the snapshot analogue of the POMDP
     // `perceived_pressure` used at launch).
     if learned_pass_completion_enabled() {
-        if let Some(head) = snapshot.pass_completion_head.as_ref() {
+        if let Some(head) = snapshot.pass_completion_head_for(passer.team) {
             if head.training_steps() >= PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS {
                 let passer_pressure = pressure_from_nearest_distance(
                     snapshot.nearest_opponent_distance_at(passer.team, passer_position),
