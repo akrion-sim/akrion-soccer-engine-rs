@@ -8,7 +8,7 @@ use crate::rng::Rng;
 // Small-sided pitch (roughly a 5-a-side / futsal court, not a full field).
 pub const FIELD_L: f32 = 42.0;
 pub const FIELD_W: f32 = 28.0;
-pub const GOAL_HALF: f32 = 3.0; // half goal-mouth width in y (~6m net)
+pub const GOAL_HALF: f32 = 3.5; // half goal-mouth width in y (~7m net)
 pub const N: usize = 5; // players per team (index 0 == goalkeeper)
 pub const GK: usize = 0; // goalkeeper index; controlled by a fixed rule, not the policy
 pub const DT: f32 = 0.1; // seconds per decision tick
