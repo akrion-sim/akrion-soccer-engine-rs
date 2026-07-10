@@ -320,6 +320,12 @@ const SOCCER_ACTOR_ON_BALL_OUTCOME_PRIORITY_WEIGHT: f64 = 1.75;
 const SOCCER_ACTOR_ON_BALL_OUTCOME_ADVANTAGE_FLOOR: f64 = 0.25;
 const SOCCER_ACTOR_OUTCOME_CREDIT_PRIORITY_WEIGHT: f64 = 4.0;
 const SOCCER_ACTOR_OUTCOME_CREDIT_ADVANTAGE_FLOOR: f64 = NEURAL_MCTS_DISTILLATION_ADVANTAGE_FLOOR;
+const SOCCER_ACTOR_PASS_TURNOVER_PRIORITY_WEIGHT: f64 = 4.0;
+const SOCCER_ACTOR_PASS_TURNOVER_ADVANTAGE_FLOOR: f64 = 0.35;
+const SOCCER_ACTOR_PASS_TURNOVER_LOW_COMPLETION_THRESHOLD: f64 = 0.55;
+const SOCCER_ACTOR_PASS_TURNOVER_HIGH_RISK_THRESHOLD: f64 = 0.35;
+const SOCCER_ACTOR_FORWARD_COMPLETION_PRIORITY_WEIGHT: f64 = 4.0;
+const SOCCER_ACTOR_FORWARD_COMPLETION_ADVANTAGE_FLOOR: f64 = 0.18;
 const SOCCER_NEURAL_AUTHORITATIVE_TRAIN_DECISIVE_REWARD_FLOOR: f64 = 0.75;
 const SOCCER_NEURAL_AUTHORITATIVE_PASSIVE_OFF_BALL_CRITIC_SAMPLE_RATE: f64 = 0.12;
 const COMPLETED_PASS_LEARNING_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(5.0);
@@ -7851,6 +7857,95 @@ mod tests {
     }
 
     #[test]
+    fn neural_mcts_policy_expansion_surfaces_learned_space_candidate() {
+        let _env_lock = soccer_world_env_lock();
+        let _space_gate = set_test_env_var("DD_SOCCER_ENABLE_NEURAL_PASS_SPACE", "1");
+        let _receiver_gate = set_test_env_var("DD_SOCCER_ENABLE_LEARNED_PASS_RECEIVER", "1");
+
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            learning_enabled: true,
+            ..MatchConfig::default()
+        });
+        let actor = sim
+            .players
+            .iter()
+            .position(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home field player");
+        let actor_id = sim.players[actor].id;
+        let actor_team = sim.players[actor].team;
+        let actor_role = sim.players[actor].role;
+        sim.players[actor].position = Vec2::new(40.0, 50.0);
+        sim.ball.holder = Some(actor_id);
+        sim.ball.position = sim.players[actor].position;
+
+        let runner = sim
+            .players
+            .iter()
+            .position(|player| {
+                player.team == actor_team
+                    && player.id != actor_id
+                    && player.role != PlayerRole::Goalkeeper
+            })
+            .expect("same-team runner");
+        let runner_id = sim.players[runner].id;
+        sim.players[runner].position = Vec2::new(39.0, 61.0);
+        let learned_space = Vec2::new(30.0, 67.0);
+
+        let snapshot = WorldSnapshot::from_match(&sim);
+        assert!(
+            snapshot.player_position(runner_id).is_some_and(|position| {
+                position.distance(learned_space) <= SOCCER_SPACE_RUN_ONTO_YARDS
+            }),
+            "fixture must leave the learned space runnable"
+        );
+        let state = SoccerQStateKey::from_parts(
+            &snapshot.mdp_state_for_player(actor_id),
+            &snapshot.observation_for(actor_id),
+            actor_team,
+            actor_role,
+        );
+        let descriptor =
+            snapshot.pass_receiver_descriptor(actor_id, ReceiverKind::Space, learned_space, None);
+        let mut policy = SoccerQPolicy::default();
+        assert!(policy.set_target_value_with_receiver(
+            state,
+            "pass",
+            pitch_grid_address(learned_space, snapshot.field_width, snapshot.field_length),
+            descriptor,
+            3.0,
+        ));
+        let (_, space_runner, offered_space) =
+            SoccerMatch::learned_pass_space_option(&policy, &snapshot, actor_id, "pass")
+                .expect("seeded Space target-grid entry should be offered");
+        assert_eq!(
+            pitch_grid_address(offered_space, snapshot.field_width, snapshot.field_length)
+                .fine
+                .id,
+            pitch_grid_address(learned_space, snapshot.field_width, snapshot.field_length)
+                .fine
+                .id
+        );
+
+        let expanded = SoccerMatch::neural_mcts_expanded_candidate_plans_for_policy(
+            &policy,
+            &snapshot,
+            actor_id,
+            actor_team,
+            "pass",
+        );
+        assert!(
+            expanded.iter().any(|plan| {
+                plan.action == "pass"
+                    && plan.target_player == Some(space_runner)
+                    && plan
+                        .target_point
+                        .is_some_and(|point| point.distance(learned_space) <= 1.0)
+            }),
+            "learned Space target-grid cell must become a concrete neural-MCTS pass candidate"
+        );
+    }
+
+    #[test]
     fn neural_mcts_expands_dribble_into_targeted_technical_candidates() {
         let mut sim = SoccerMatch::default_11v11(MatchConfig {
             learning_enabled: true,
@@ -10843,6 +10938,197 @@ mod tests {
     }
 
     #[test]
+    fn pass_turnover_outcome_credit_gets_stronger_actor_floor() {
+        let _env_lock = soccer_world_env_lock();
+        let _gate = set_test_env_var("DD_SOCCER_ENABLE_PASS_OUTCOME_PRIORITY_LEARNING", "1");
+        let _turnover_floor =
+            set_test_env_var("SOCCER_ACTOR_PASS_TURNOVER_ADVANTAGE_FLOOR", "0.35");
+        let _turnover_weight =
+            set_test_env_var("SOCCER_ACTOR_PASS_TURNOVER_PRIORITY_WEIGHT", "4.0");
+        let mut transition = policy_test_transition_with_mcts(false);
+        transition.observation.has_ball = true;
+        transition.action = "pass1-kp7".to_string();
+        transition.reward = -0.05;
+        transition.decision_context.learning_outcome_credit = true;
+        transition.decision_context.learning_outcome_polarity = -1.0;
+        transition.decision_context.target_forward_yards = 12.0;
+        transition.decision_context.pass_target_expected_completion = 0.70;
+        transition.decision_context.pass_lane_interception_risk = 0.10;
+
+        assert_eq!(
+            soccer_actor_priority_weight(&transition, 0.20),
+            SOCCER_ACTOR_PASS_TURNOVER_PRIORITY_WEIGHT
+        );
+        let signed = soccer_actor_outcome_credit_advantage(&transition, 0.20);
+        assert_eq!(signed, -SOCCER_ACTOR_OUTCOME_CREDIT_ADVANTAGE_FLOOR);
+        assert_eq!(
+            soccer_actor_pass_outcome_priority_advantage(&transition, signed),
+            -SOCCER_ACTOR_PASS_TURNOVER_ADVANTAGE_FLOOR
+        );
+    }
+
+    #[test]
+    fn risky_failed_pass_gets_turnover_priority_without_delayed_credit() {
+        let _env_lock = soccer_world_env_lock();
+        let _gate = set_test_env_var("DD_SOCCER_ENABLE_PASS_OUTCOME_PRIORITY_LEARNING", "1");
+        let _turnover_floor =
+            set_test_env_var("SOCCER_ACTOR_PASS_TURNOVER_ADVANTAGE_FLOOR", "0.35");
+        let mut transition = policy_test_transition_with_mcts(false);
+        transition.observation.has_ball = true;
+        transition.action = "pass".to_string();
+        transition.reward = -0.30;
+        transition.decision_context.pass_target_expected_completion = 0.32;
+        transition.decision_context.pass_lane_interception_risk = 0.48;
+
+        assert_eq!(
+            soccer_actor_priority_weight(&transition, -0.10),
+            SOCCER_ACTOR_PASS_TURNOVER_PRIORITY_WEIGHT
+        );
+        assert_eq!(
+            soccer_actor_pass_outcome_priority_advantage(&transition, -0.10),
+            -SOCCER_ACTOR_PASS_TURNOVER_ADVANTAGE_FLOOR
+        );
+
+        transition.decision_context.pass_target_expected_completion = 0.78;
+        transition.decision_context.pass_lane_interception_risk = 0.08;
+        assert_eq!(
+            soccer_actor_priority_weight(&transition, -0.10),
+            SOCCER_ACTOR_ON_BALL_OUTCOME_PRIORITY_WEIGHT,
+            "ordinary on-ball negatives keep their existing priority unless the pass lane was bad"
+        );
+    }
+
+    #[test]
+    fn forward_completed_pass_outcome_credit_gets_positive_floor() {
+        let _env_lock = soccer_world_env_lock();
+        let _gate = set_test_env_var("DD_SOCCER_ENABLE_PASS_OUTCOME_PRIORITY_LEARNING", "1");
+        let _forward_floor =
+            set_test_env_var("SOCCER_ACTOR_FORWARD_COMPLETION_ADVANTAGE_FLOOR", "0.18");
+        let _forward_weight =
+            set_test_env_var("SOCCER_ACTOR_FORWARD_COMPLETION_PRIORITY_WEIGHT", "4.0");
+        let mut transition = policy_test_transition_with_mcts(false);
+        transition.observation.has_ball = true;
+        transition.action = "pass".to_string();
+        transition.reward = 0.05;
+        transition.decision_context.learning_outcome_credit = true;
+        transition.decision_context.learning_outcome_polarity = 1.0;
+        transition.decision_context.target_forward_yards = 14.0;
+
+        assert_eq!(
+            soccer_actor_priority_weight(&transition, -0.20),
+            SOCCER_ACTOR_FORWARD_COMPLETION_PRIORITY_WEIGHT
+        );
+        let signed = soccer_actor_outcome_credit_advantage(&transition, -0.20);
+        assert_eq!(signed, SOCCER_ACTOR_OUTCOME_CREDIT_ADVANTAGE_FLOOR);
+        assert_eq!(
+            soccer_actor_pass_outcome_priority_advantage(&transition, signed),
+            SOCCER_ACTOR_FORWARD_COMPLETION_ADVANTAGE_FLOOR
+        );
+
+        transition.decision_context.target_forward_yards = 0.5;
+        assert_eq!(
+            soccer_actor_pass_outcome_priority_advantage(&transition, signed),
+            signed,
+            "same-team lateral completions remain credited, but only forward completions get the extra actor floor"
+        );
+    }
+
+    #[test]
+    fn actor_samples_wait_for_critic_without_fast_reward_fallback() {
+        let _env_lock = soccer_world_env_lock();
+        let _pass_priority =
+            set_test_env_var("DD_SOCCER_ENABLE_PASS_OUTCOME_PRIORITY_LEARNING", "0");
+        let _fast_actor = set_test_env_var("DD_SOCCER_ENABLE_FAST_ACTOR_REWARD_FALLBACK", "0");
+        let sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let mut transition = policy_test_transition_with_mcts(false);
+        transition.observation.has_ball = true;
+        transition.action = "pass".to_string();
+        transition.reward = -0.30;
+
+        let batch = sim.neural_policy_training_samples(&[transition]);
+
+        assert!(
+            batch.samples.is_empty(),
+            "policy-head training should stay critic-gated until the fast reward fallback is explicitly enabled"
+        );
+    }
+
+    #[test]
+    fn pass_outcome_priority_does_not_enable_fast_actor_fallback_by_itself() {
+        let _env_lock = soccer_world_env_lock();
+        let _pass_priority =
+            set_test_env_var("DD_SOCCER_ENABLE_PASS_OUTCOME_PRIORITY_LEARNING", "1");
+        let _fast_actor = set_test_env_var("DD_SOCCER_ENABLE_FAST_ACTOR_REWARD_FALLBACK", "0");
+        let sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let mut transition = policy_test_transition_with_mcts(false);
+        transition.observation.has_ball = true;
+        transition.action = "pass".to_string();
+        transition.reward = -0.05;
+        transition.decision_context.learning_outcome_credit = true;
+        transition.decision_context.learning_outcome_polarity = -1.0;
+
+        let batch = sim.neural_policy_training_samples(&[transition]);
+
+        assert!(
+            batch.samples.is_empty(),
+            "pass-outcome priority should weight actor samples when actor training is active, not silently turn on critic-less interval actor training"
+        );
+    }
+
+    #[test]
+    fn fast_actor_reward_fallback_trains_pass_turnover_without_critic() {
+        let _env_lock = soccer_world_env_lock();
+        let _gate = set_test_env_var("DD_SOCCER_ENABLE_PASS_OUTCOME_PRIORITY_LEARNING", "1");
+        let _fast_actor = set_test_env_var("DD_SOCCER_ENABLE_FAST_ACTOR_REWARD_FALLBACK", "1");
+        let _turnover_floor =
+            set_test_env_var("SOCCER_ACTOR_PASS_TURNOVER_ADVANTAGE_FLOOR", "0.35");
+        let sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let mut transition = policy_test_transition_with_mcts(false);
+        transition.observation.has_ball = true;
+        transition.action = "pass".to_string();
+        transition.reward = -0.05;
+        transition.decision_context.learning_outcome_credit = true;
+        transition.decision_context.learning_outcome_polarity = -1.0;
+        transition.decision_context.target_forward_yards = 10.0;
+
+        let batch = sim.neural_policy_training_samples(&[transition]);
+
+        assert_eq!(batch.samples.len(), 1);
+        let sample = &batch.samples[0];
+        assert_eq!(
+            sample.sanitized_weight(),
+            SOCCER_ACTOR_PASS_TURNOVER_PRIORITY_WEIGHT
+        );
+        assert!(
+            sample.advantage <= -SOCCER_ACTOR_PASS_TURNOVER_ADVANTAGE_FLOOR,
+            "fallback actor sample should carry the stronger pass-turnover floor, got {}",
+            sample.advantage
+        );
+    }
+
+    #[test]
+    fn fast_actor_reward_fallback_filters_nonpriority_rows_without_critic() {
+        let _env_lock = soccer_world_env_lock();
+        let _pass_priority =
+            set_test_env_var("DD_SOCCER_ENABLE_PASS_OUTCOME_PRIORITY_LEARNING", "0");
+        let _fast_actor = set_test_env_var("DD_SOCCER_ENABLE_FAST_ACTOR_REWARD_FALLBACK", "1");
+        let sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let mut transition = policy_test_transition_with_mcts(false);
+        transition.observation.has_ball = true;
+        transition.action = "pass".to_string();
+        transition.reward = 0.05;
+        transition.decision_context.pass_target_expected_completion = 0.82;
+        transition.decision_context.pass_lane_interception_risk = 0.04;
+
+        let batch = sim.neural_policy_training_samples(&[transition]);
+
+        assert!(
+            batch.samples.is_empty(),
+            "critic-less fast actor fallback should train only explicit priority/counterexample rows"
+        );
+    }
+
+    #[test]
     fn on_ball_actor_actions_get_priority_without_overweighting_shape_noise() {
         let mut transition = policy_test_transition_with_mcts(false);
         transition.observation.has_ball = true;
@@ -12116,12 +12402,80 @@ fn soccer_actor_on_ball_action_priority_weight(
     weight
 }
 
+fn pass_outcome_priority_learning_enabled() -> bool {
+    soccer_env_flag_enabled("DD_SOCCER_ENABLE_PASS_OUTCOME_PRIORITY_LEARNING")
+}
+
+fn fast_actor_reward_fallback_enabled() -> bool {
+    soccer_env_flag_enabled("DD_SOCCER_ENABLE_FAST_ACTOR_REWARD_FALLBACK")
+}
+
+fn soccer_actor_pass_priority_action(transition: &SoccerLearningTransition) -> bool {
+    if !transition.observation.has_ball {
+        return false;
+    }
+    is_pass_like_action(normalize_soccer_action_label(&transition.action))
+}
+
+fn soccer_actor_pass_turnover_counterexample(
+    transition: &SoccerLearningTransition,
+    advantage: f64,
+) -> bool {
+    if !pass_outcome_priority_learning_enabled() || !soccer_actor_pass_priority_action(transition) {
+        return false;
+    }
+    let outcome_credit = transition.decision_context.learning_outcome_credit
+        && transition.decision_context.learning_outcome_polarity < 0.0;
+    if outcome_credit {
+        return true;
+    }
+    let poor_lane = transition.decision_context.pass_target_expected_completion
+        <= SOCCER_ACTOR_PASS_TURNOVER_LOW_COMPLETION_THRESHOLD
+        || transition.decision_context.pass_lane_interception_risk
+            >= SOCCER_ACTOR_PASS_TURNOVER_HIGH_RISK_THRESHOLD;
+    poor_lane && (transition.reward <= -0.25 || advantage <= -0.25)
+}
+
+fn soccer_actor_forward_completion_counterexample(transition: &SoccerLearningTransition) -> bool {
+    pass_outcome_priority_learning_enabled()
+        && soccer_actor_pass_priority_action(transition)
+        && transition.decision_context.learning_outcome_credit
+        && transition.decision_context.learning_outcome_polarity > 0.0
+        && transition.decision_context.target_forward_yards > 1.25
+}
+
+fn soccer_actor_pass_outcome_priority_weight(
+    transition: &SoccerLearningTransition,
+    advantage: f64,
+) -> f64 {
+    if soccer_actor_pass_turnover_counterexample(transition, advantage) {
+        return learned_mpc_metric_env(
+            "SOCCER_ACTOR_PASS_TURNOVER_PRIORITY_WEIGHT",
+            SOCCER_ACTOR_PASS_TURNOVER_PRIORITY_WEIGHT,
+            1.0,
+            SOCCER_POLICY_PRIORITY_WEIGHT_MAX,
+        );
+    }
+    if soccer_actor_forward_completion_counterexample(transition) {
+        return learned_mpc_metric_env(
+            "SOCCER_ACTOR_FORWARD_COMPLETION_PRIORITY_WEIGHT",
+            SOCCER_ACTOR_FORWARD_COMPLETION_PRIORITY_WEIGHT,
+            1.0,
+            SOCCER_POLICY_PRIORITY_WEIGHT_MAX,
+        );
+    }
+    1.0
+}
+
 fn soccer_actor_priority_weight(transition: &SoccerLearningTransition, advantage: f64) -> f64 {
     let mut weight: f64 = 1.0;
     if soccer_actor_mcts_distillation_priority(transition, advantage) {
         weight = weight.max(NEURAL_MCTS_DISTILLATION_PRIORITY_WEIGHT);
     }
     weight = weight.max(soccer_actor_outcome_credit_priority_weight(transition));
+    weight = weight.max(soccer_actor_pass_outcome_priority_weight(
+        transition, advantage,
+    ));
     weight = weight.max(soccer_actor_on_ball_action_priority_weight(
         transition, advantage,
     ));
@@ -12167,6 +12521,34 @@ fn soccer_actor_outcome_credit_advantage(
     } else {
         advantage
     }
+}
+
+fn soccer_actor_pass_outcome_priority_advantage(
+    transition: &SoccerLearningTransition,
+    advantage: f64,
+) -> f64 {
+    if !advantage.is_finite() {
+        return advantage;
+    }
+    if soccer_actor_pass_turnover_counterexample(transition, advantage) {
+        let floor = learned_mpc_metric_env(
+            "SOCCER_ACTOR_PASS_TURNOVER_ADVANTAGE_FLOOR",
+            SOCCER_ACTOR_PASS_TURNOVER_ADVANTAGE_FLOOR,
+            0.0,
+            2.0,
+        );
+        return advantage.min(-floor);
+    }
+    if soccer_actor_forward_completion_counterexample(transition) {
+        let floor = learned_mpc_metric_env(
+            "SOCCER_ACTOR_FORWARD_COMPLETION_ADVANTAGE_FLOOR",
+            SOCCER_ACTOR_FORWARD_COMPLETION_ADVANTAGE_FLOOR,
+            0.0,
+            2.0,
+        );
+        return advantage.max(floor);
+    }
+    advantage
 }
 
 fn soccer_standardize_actor_policy_sample_advantages(samples: &mut [SoccerPolicySample]) {
@@ -16396,6 +16778,51 @@ impl SoccerMatch {
         plans
     }
 
+    fn neural_mcts_expanded_candidate_plans_for_policy(
+        policy: &SoccerQPolicy,
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        team: Team,
+        candidate_label: &str,
+    ) -> Vec<SoccerLearnedPlan> {
+        let mut plans =
+            Self::neural_mcts_expanded_candidate_plans(snapshot, player_id, team, candidate_label);
+        if !dd_soccer_enable_neural_pass_space() {
+            return plans;
+        }
+        let normalized = normalize_soccer_action_label(candidate_label);
+        let Some(flight) = pass_like_action_flight(normalized) else {
+            return plans;
+        };
+        let Some((_, runner, space_point)) =
+            Self::learned_pass_space_option(policy, snapshot, player_id, normalized)
+        else {
+            return plans;
+        };
+        let duplicate = plans.iter().any(|plan| {
+            plan.target_player == Some(runner)
+                && plan
+                    .target_point
+                    .is_some_and(|point| point.distance(space_point) <= 1.0)
+        });
+        if duplicate {
+            return plans;
+        }
+        let action = if flight.is_aerial() {
+            "aerial-pass"
+        } else {
+            "pass"
+        }
+        .to_string();
+        plans.push(SoccerLearnedPlan {
+            action,
+            target_player: Some(runner),
+            target_point: Some(space_point),
+            mpc_replan: None,
+        });
+        plans
+    }
+
     fn neural_mcts_dribble_variant_candidate_plans(
         snapshot: &WorldSnapshot,
         player_id: usize,
@@ -18004,7 +18431,8 @@ impl SoccerMatch {
             let candidate_plan =
                 Self::learned_plan_for_policy(policy, snapshot, player_id, candidate.label.clone());
             push_scored_candidate(candidate, candidate_plan, 0.0);
-            for expanded_plan in Self::neural_mcts_expanded_candidate_plans(
+            for expanded_plan in Self::neural_mcts_expanded_candidate_plans_for_policy(
+                policy,
                 snapshot,
                 player_id,
                 team,
@@ -20620,21 +21048,25 @@ impl SoccerMatch {
     /// (the same zero-sum shaping the adversarial Q update uses), the critic's
     /// value per transition, and a **GAE(λ)** advantage accumulated backward along
     /// each agent's own trajectory. Only emits samples for actions inside the
-    /// policy vocabulary. Empty unless the critic has a usable network.
+    /// policy vocabulary. Normally waits for a usable critic; the fast actor fallback
+    /// can train from reward/outcome-credit advantages while the critic is unavailable.
     fn neural_policy_training_samples(
         &self,
         replay: &[SoccerLearningTransition],
     ) -> SoccerPolicyTrainingBatch {
         // The actor trains once at least one team brain can score states. Each
         // transition is later valued by its own team's critic.
-        let home_ready = self
+        let reward_fallback_ready = fast_actor_reward_fallback_enabled();
+        let home_critic_ready = self
             .neural_learner_for(Team::Home)
-            .map_or(false, |learner| learner.has_prediction_network())
-            && !self.neural_team_frozen(Team::Home);
-        let away_ready = self
+            .map_or(false, |learner| learner.has_prediction_network());
+        let away_critic_ready = self
             .neural_learner_for(Team::Away)
-            .map_or(false, |learner| learner.has_prediction_network())
-            && !self.neural_team_frozen(Team::Away);
+            .map_or(false, |learner| learner.has_prediction_network());
+        let home_ready =
+            (home_critic_ready || reward_fallback_ready) && !self.neural_team_frozen(Team::Home);
+        let away_ready =
+            (away_critic_ready || reward_fallback_ready) && !self.neural_team_frozen(Team::Away);
         if (!home_ready && !away_ready) || replay.is_empty() {
             return SoccerPolicyTrainingBatch::default();
         }
@@ -20829,6 +21261,7 @@ impl SoccerMatch {
                 let advantage =
                     soccer_actor_advantage_with_planner_distillation(transition, advantage);
                 let advantage = soccer_actor_outcome_credit_advantage(transition, advantage);
+                let advantage = soccer_actor_pass_outcome_priority_advantage(transition, advantage);
                 let advantage = option_score_safety_replacement_distillation_advantage(
                     transition,
                     advantage,
@@ -20839,6 +21272,18 @@ impl SoccerMatch {
                 let mut sample_weight = soccer_actor_priority_weight(transition, advantage);
                 if option_score_safety_actor_sample {
                     sample_weight = option_score_safety_counterexample_sample_weight(sample_weight);
+                }
+                let critic_ready = match transition.team {
+                    Team::Home => home_critic_ready,
+                    Team::Away => away_critic_ready,
+                };
+                let reward_fallback_priority_sample =
+                    soccer_actor_pass_turnover_counterexample(transition, advantage)
+                        || soccer_actor_forward_completion_counterexample(transition)
+                        || option_score_safety_actor_sample
+                        || mcts_distillation;
+                if reward_fallback_ready && !critic_ready && !reward_fallback_priority_sample {
+                    return None;
                 }
                 let state_features = self.policy_state_features(transition);
                 let actor_probability = self
@@ -20968,6 +21413,100 @@ impl SoccerMatch {
                 team.label(),
             );
         }
+    }
+
+    fn train_actor_policy_head_from_batch(
+        &mut self,
+        policy_training_batch: SoccerPolicyTrainingBatch,
+    ) -> bool {
+        self.stats.option_score_safety_counterexample_candidates = policy_training_batch
+            .option_score_safety_counterexample_candidates
+            .min(u32::MAX as usize)
+            as u32;
+        self.stats.option_score_safety_counterexample_samples = policy_training_batch
+            .option_score_safety_counterexample_samples
+            .min(u32::MAX as usize)
+            as u32;
+        self.stats.option_score_safety_counterexample_weight_sum =
+            policy_training_batch.option_score_safety_counterexample_weight_sum;
+        self.stats
+            .option_score_safety_counterexample_throttle_filtered = policy_training_batch
+            .option_score_safety_counterexample_throttle_filtered
+            .min(u32::MAX as usize)
+            as u32;
+        self.stats.option_score_safety_counterexample_actor_filtered = policy_training_batch
+            .option_score_safety_counterexample_actor_filtered
+            .min(u32::MAX as usize)
+            as u32;
+        self.stats
+            .option_score_safety_counterexample_unindexed_action = policy_training_batch
+            .option_score_safety_counterexample_unindexed_action
+            .min(u32::MAX as usize)
+            as u32;
+        self.stats
+            .option_score_safety_counterexample_nonfinite_advantage = policy_training_batch
+            .option_score_safety_counterexample_nonfinite_advantage
+            .min(u32::MAX as usize)
+            as u32;
+
+        let policy_samples = policy_training_batch.samples;
+        if policy_samples.is_empty() {
+            return false;
+        }
+
+        let priority_samples = policy_samples
+            .iter()
+            .filter(|sample| sample.sanitized_weight() > 1.0 + 1e-9)
+            .count();
+        let priority_weight_sum: f64 = policy_samples
+            .iter()
+            .filter_map(|sample| {
+                let weight = sample.sanitized_weight();
+                (weight > 1.0 + 1e-9).then_some(weight)
+            })
+            .sum();
+        let mcts_distillation_samples = policy_samples
+            .iter()
+            .filter(|sample| sample.mcts_distillation)
+            .count();
+        let mcts_distillation_weight_sum: f64 = policy_samples
+            .iter()
+            .filter_map(|sample| {
+                let weight = sample.sanitized_weight();
+                sample.mcts_distillation.then_some(weight)
+            })
+            .sum();
+        self.stats.policy_priority_samples = priority_samples.min(u32::MAX as usize) as u32;
+        self.stats.policy_priority_weight_sum = priority_weight_sum;
+        self.stats.neural_mcts_distillation_samples =
+            mcts_distillation_samples.min(u32::MAX as usize) as u32;
+        self.stats.neural_mcts_distillation_weight_sum = mcts_distillation_weight_sum;
+
+        self.ensure_policy_head();
+        let mappo_clip_epsilon = self
+            .config
+            .neural_learning
+            .mappo_enabled()
+            .then(|| self.config.neural_learning.sanitized_mappo_clip_epsilon());
+        if let Some(policy_head) = &mut self.policy_head {
+            let epochs = if mappo_clip_epsilon.is_some() {
+                soccer_mappo_epochs()
+            } else {
+                1
+            };
+            for _ in 0..epochs {
+                policy_head.train(&policy_samples, mappo_clip_epsilon);
+            }
+        }
+        if dd_soccer_enable_skill_policy_heads() {
+            let training_team = self.skill_policy_training_team();
+            self.ensure_skill_policy_heads_for_training(training_team);
+            let focus = self.specialist_curriculum_focus();
+            if let Some(skill_heads) = self.skill_policy_heads_for_training_mut(training_team) {
+                skill_heads.train_focused(&policy_samples, focus);
+            }
+        }
+        true
     }
 
     fn ensure_policy_head(&mut self) {
@@ -21437,36 +21976,6 @@ impl SoccerMatch {
             } else {
                 SoccerPolicyTrainingBatch::default()
             };
-        self.stats.option_score_safety_counterexample_candidates = policy_training_batch
-            .option_score_safety_counterexample_candidates
-            .min(u32::MAX as usize)
-            as u32;
-        self.stats.option_score_safety_counterexample_samples = policy_training_batch
-            .option_score_safety_counterexample_samples
-            .min(u32::MAX as usize)
-            as u32;
-        self.stats.option_score_safety_counterexample_weight_sum =
-            policy_training_batch.option_score_safety_counterexample_weight_sum;
-        self.stats
-            .option_score_safety_counterexample_throttle_filtered = policy_training_batch
-            .option_score_safety_counterexample_throttle_filtered
-            .min(u32::MAX as usize)
-            as u32;
-        self.stats.option_score_safety_counterexample_actor_filtered = policy_training_batch
-            .option_score_safety_counterexample_actor_filtered
-            .min(u32::MAX as usize)
-            as u32;
-        self.stats
-            .option_score_safety_counterexample_unindexed_action = policy_training_batch
-            .option_score_safety_counterexample_unindexed_action
-            .min(u32::MAX as usize)
-            as u32;
-        self.stats
-            .option_score_safety_counterexample_nonfinite_advantage = policy_training_batch
-            .option_score_safety_counterexample_nonfinite_advantage
-            .min(u32::MAX as usize)
-            as u32;
-        let policy_samples = policy_training_batch.samples;
         // Dedicated goalkeeper head samples: keeper transitions only, one-step reward as advantage.
         let keeper_policy_samples = if self.neural_blend.actor_critic
             && self.config.neural_learning.enabled
@@ -21477,69 +21986,7 @@ impl SoccerMatch {
             Vec::new()
         };
         self.train_neural_value_models(&bellman_replay);
-        if !policy_samples.is_empty() {
-            let priority_samples = policy_samples
-                .iter()
-                .filter(|sample| sample.sanitized_weight() > 1.0 + 1e-9)
-                .count();
-            let priority_weight_sum: f64 = policy_samples
-                .iter()
-                .filter_map(|sample| {
-                    let weight = sample.sanitized_weight();
-                    (weight > 1.0 + 1e-9).then_some(weight)
-                })
-                .sum();
-            let mcts_distillation_samples = policy_samples
-                .iter()
-                .filter(|sample| sample.mcts_distillation)
-                .count();
-            let mcts_distillation_weight_sum: f64 = policy_samples
-                .iter()
-                .filter_map(|sample| {
-                    let weight = sample.sanitized_weight();
-                    sample.mcts_distillation.then_some(weight)
-                })
-                .sum();
-            self.stats.policy_priority_samples = priority_samples.min(u32::MAX as usize) as u32;
-            self.stats.policy_priority_weight_sum = priority_weight_sum;
-            self.stats.neural_mcts_distillation_samples =
-                mcts_distillation_samples.min(u32::MAX as usize) as u32;
-            self.stats.neural_mcts_distillation_weight_sum = mcts_distillation_weight_sum;
-            self.ensure_policy_head();
-            let mappo_clip_epsilon = self
-                .config
-                .neural_learning
-                .mappo_enabled()
-                .then(|| self.config.neural_learning.sanitized_mappo_clip_epsilon());
-            if let Some(policy_head) = &mut self.policy_head {
-                // PPO/MAPPO sample reuse: take K clipped epochs over the same frozen
-                // batch (`policy_samples` — `old_action_probability` baked in once, from
-                // the behavior policy that played the game). Epoch 1's ratio ≈ 1 (clip
-                // is a no-op); epochs 2..K compute the ratio against that frozen old-prob,
-                // so the clipped surrogate enforces the trust region. Multi-epoch only
-                // when the clip is active — re-iterating an unclipped batch would just
-                // overfit it. `SOCCER_MAPPO_EPOCHS=1` ⇒ prior single-pass behavior.
-                let epochs = if mappo_clip_epsilon.is_some() {
-                    soccer_mappo_epochs()
-                } else {
-                    1
-                };
-                for _ in 0..epochs {
-                    policy_head.train(&policy_samples, mappo_clip_epsilon);
-                }
-            }
-            // Specialist pass/dribble/shot heads: trained on the same frozen batch but bucketed
-            // by skill with balanced sizes and separate (unclipped) losses. Gated, default off.
-            // Under the curriculum, a focused phase trains only the matching specialist.
-            if dd_soccer_enable_skill_policy_heads() {
-                let training_team = self.skill_policy_training_team();
-                self.ensure_skill_policy_heads_for_training(training_team);
-                let focus = self.specialist_curriculum_focus();
-                if let Some(skill_heads) = self.skill_policy_heads_for_training_mut(training_team) {
-                    skill_heads.train_focused(&policy_samples, focus);
-                }
-            }
-        }
+        let policy_samples_trained = self.train_actor_policy_head_from_batch(policy_training_batch);
         // Dedicated goalkeeper head: trained on the keeper's own transitions (gate checked when
         // the samples were built, so a non-empty batch already implies the gate is on). Under the
         // curriculum, the keeper only trains in its focused phase or the joint phase.
@@ -21558,7 +22005,7 @@ impl SoccerMatch {
         }
         // Advance the curriculum round once per actor training pass (only meaningful when the
         // curriculum is enabled; harmless otherwise).
-        if !policy_samples.is_empty() || !keeper_policy_samples.is_empty() {
+        if policy_samples_trained || !keeper_policy_samples.is_empty() {
             self.specialist_curriculum_round = self.specialist_curriculum_round.saturating_add(1);
         }
         // World model: predict-next-state pairs from the *current* features
@@ -23326,7 +23773,20 @@ impl SoccerMatch {
                                 .stats
                                 .learning_deferred_reward_transitions_drained
                                 .saturating_add(deferred_drained);
+                            let actor_training_batch = if self.neural_blend.actor_critic
+                                && fast_actor_reward_fallback_enabled()
+                            {
+                                Some(self.neural_policy_training_samples(&train_transitions))
+                            } else {
+                                None
+                            };
                             self.train_neural_value_models(&train_transitions);
+                            if let Some(batch) = actor_training_batch {
+                                if self.train_actor_policy_head_from_batch(batch) {
+                                    self.specialist_curriculum_round =
+                                        self.specialist_curriculum_round.saturating_add(1);
+                                }
+                            }
                             if self.neural_blend.world_model {
                                 let world_model_replay = self
                                     .recent_learning_history

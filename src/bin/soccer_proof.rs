@@ -44,7 +44,7 @@ use soccer_engine::des::general::soccer::{
     enable_deterministic_formation_lp, learned_mpc_objective_enabled, AttackSpacingHead,
     MatchConfig, MatchStats, SoccerMarlAlgorithm, SoccerMatch, SoccerMpcObjectiveHead,
     SoccerNeuralLearningBackend, SoccerNeuralLearningConfig, SoccerNeuralNetworkSnapshot,
-    SoccerPassCompletionHead, SoccerQPolicyOptions, SoccerTeamQPolicies, SupportScorerHead,
+    SoccerPassCompletionHead, SoccerQPolicyOptions, SoccerTeamQPolicies, SupportScorerHead, Team,
     ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS, DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
     DEFAULT_SOCCER_PASS_COMPLETION_LEARNING_RATE, PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS,
     SUPPORT_SCORER_HEAD_MIN_TRAINING_STEPS,
@@ -75,7 +75,6 @@ fn env_bool(name: &str, default: bool) -> bool {
         })
         .unwrap_or(default)
 }
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct BrainStripOptions {
     legacy_actor_and_aux: bool,
@@ -154,6 +153,18 @@ fn parse_brain_spec(spec: &str) -> (&str, BrainStripOptions) {
     (path, strip)
 }
 
+fn env_bool_any(names: &[&str], default: bool) -> bool {
+    names
+        .iter()
+        .find_map(|name| std::env::var(name).ok())
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(default)
+}
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -198,6 +209,67 @@ fn proof_neural_config() -> SoccerNeuralLearningConfig {
         env_bool("SOCCER_NEURAL_TARGET_POPART", neural.target_popart_enabled);
     neural.hidden_units = env_usize("SOCCER_NEURAL_HIDDEN_UNITS", neural.hidden_units);
     neural
+}
+
+fn proof_analytic_opponent_fraction() -> f64 {
+    let raw = std::env::var("SOCCER_PROOF_ANALYTIC_OPPONENT_FRAC")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or_else(|| {
+            if env_bool_any(
+                &[
+                    "SOCCER_LEARNING_ANALYTIC_OPPONENT",
+                    "SOCCER_ANALYTIC_OPPONENT",
+                    "SOCCER_PROOF_ANALYTIC_OPPONENT",
+                ],
+                false,
+            ) {
+                1.0
+            } else {
+                0.0
+            }
+        });
+    if raw.is_finite() {
+        raw.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn proof_analytic_opponent_game_enabled(game_index: usize, fraction: f64) -> bool {
+    let fraction = if fraction.is_finite() {
+        fraction.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    if fraction <= 0.0 {
+        return false;
+    }
+    if fraction >= 1.0 {
+        return true;
+    }
+    let before = ((game_index as f64) * fraction).floor();
+    let after = (((game_index + 1) as f64) * fraction).floor();
+    after > before
+}
+
+fn install_train_ckpt_brains(
+    sim: &mut SoccerMatch,
+    snapshot: Option<&SoccerNeuralNetworkSnapshot>,
+    vs_analytic: bool,
+) -> Result<(), String> {
+    if vs_analytic {
+        match snapshot {
+            Some(s) => sim.set_team_neural_brain(Team::Home, Some(s.clone()), false)?,
+            None => sim.set_team_neural_brain(Team::Home, None, false)?,
+        }
+        sim.disable_team_neural_brain(Team::Away);
+        Ok(())
+    } else if let Some(s) = snapshot {
+        sim.set_neural_network_snapshot(s.clone())
+    } else {
+        Ok(())
+    }
 }
 
 fn write_snapshot(path: &str, snap: &SoccerNeuralNetworkSnapshot) {
@@ -275,6 +347,7 @@ fn train_ckpt(out_prefix: &str, games: usize, minutes: f64, seed_base: u32, ckpt
     let mut mpc_head: Option<SoccerMpcObjectiveHead> = None;
     let mut attack_spacing_head: Option<AttackSpacingHead> = None;
     let mut support_scorer_head: Option<SupportScorerHead> = None;
+    let analytic_opponent_fraction = proof_analytic_opponent_fraction();
     let started = Instant::now();
 
     let write_ckpt = |snap: &SoccerNeuralNetworkSnapshot, tag: &str| {
@@ -303,10 +376,12 @@ fn train_ckpt(out_prefix: &str, games: usize, minutes: f64, seed_base: u32, ckpt
         let total_ticks = config.total_ticks();
         let mut sim = SoccerMatch::default_11v11(config).with_team_policies((*policies).clone());
         sim.set_uniform_elite_players();
-        if let Some(s) = snapshot.as_ref() {
-            if let Err(e) = sim.set_neural_network_snapshot(s.clone()) {
-                eprintln!("[train-ckpt] game {g}: snapshot install failed: {e}");
-            }
+        // Escape mirror self-play: train Home's net against an analytic Away side. The standard
+        // learner gate (SOCCER_LEARNING_ANALYTIC_OPPONENT) means "always"; the proof-only fraction
+        // lets us interleave analytic-opponent games with self-play when doing ceiling probes.
+        let vs_analytic = proof_analytic_opponent_game_enabled(g, analytic_opponent_fraction);
+        if let Err(e) = install_train_ckpt_brains(&mut sim, snapshot.as_ref(), vs_analytic) {
+            eprintln!("[train-ckpt] game {g}: brain install failed: {e}");
         }
         if let Some(head) = pass_completion_head.as_ref() {
             sim.set_pass_completion_head(head.clone());
@@ -1163,6 +1238,38 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proof_analytic_opponent_fraction_is_evenly_scheduled() {
+        assert!(!proof_analytic_opponent_game_enabled(0, 0.0));
+        assert!(proof_analytic_opponent_game_enabled(0, 1.0));
+        assert!(proof_analytic_opponent_game_enabled(9, 1.0));
+
+        let enabled: Vec<usize> = (0..8)
+            .filter(|&game| proof_analytic_opponent_game_enabled(game, 0.25))
+            .collect();
+        assert_eq!(enabled, vec![3, 7]);
+    }
+
+    #[test]
+    fn train_ckpt_analytic_install_leaves_away_pure_analytic() {
+        let mut config = MatchConfig::default();
+        config.learning_enabled = true;
+        config.neural_learning.enabled = true;
+        let mut sim = SoccerMatch::default_11v11(config);
+
+        install_train_ckpt_brains(&mut sim, None, true)
+            .expect("analytic-opponent install should succeed");
+
+        assert!(
+            sim.neural_training_steps_for(Team::Home) == 0,
+            "home starts a trainable fresh learner"
+        );
+        assert!(
+            sim.neural_network_snapshot_for(Team::Away).is_none(),
+            "away should be pure analytic, not a frozen fresh neural opponent"
+        );
+    }
 
     #[test]
     fn parse_brain_spec_supports_per_head_ablation_suffix() {
