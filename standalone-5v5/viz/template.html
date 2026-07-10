@@ -290,12 +290,25 @@ function makePitch(canvasId, data){
     ctx.beginPath();ctx.arc(bx,by,3.1,0,7);ctx.fillStyle=css('--ball');ctx.fill();
     ctx.lineWidth=1;ctx.strokeStyle=ring;ctx.stroke();
   }
-  function drawDots(f,alpha,r,label){
+  function drawDots(f,alpha,r,main){
+    for(let i=0;i<f.a.length;i++) drawPlayer(f.a[i],i,0,f,alpha,r,main);
+    for(let i=0;i<f.b.length;i++) drawPlayer(f.b[i],i,1,f,alpha,r,main);
+    ctx.globalAlpha=1;
+  }
+  function drawPlayer(p,idx,team,f,alpha,r,main){
+    const x=X(p[0]),y=Y(p[1]);
+    const col= team===0?css('--teamA'):css('--teamB');
+    const isGK= idx===0;
+    // ball-carrier highlight ring (only on the live frame)
+    if(main && f.own===team && f.oi===idx){
+      ctx.globalAlpha=alpha;ctx.beginPath();ctx.arc(x,y,r+4,0,7);
+      ctx.strokeStyle=css('--ball');ctx.lineWidth=2;ctx.stroke();
+    }
     ctx.globalAlpha=alpha;
-    ctx.fillStyle=css('--teamA');
-    f.a.forEach(p=>{ctx.beginPath();ctx.arc(X(p[0]),Y(p[1]),r,0,7);ctx.fill();});
-    ctx.fillStyle=css('--teamB');
-    f.b.forEach(p=>{ctx.beginPath();ctx.arc(X(p[0]),Y(p[1]),r,0,7);ctx.fill();});
+    ctx.beginPath();ctx.arc(x,y,isGK?r+1:r,0,7);
+    if(isGK){ ctx.fillStyle=css('--panel');ctx.fill();
+      ctx.lineWidth=2;ctx.strokeStyle=col;ctx.stroke(); }   // keeper = hollow ring
+    else { ctx.fillStyle=col;ctx.fill(); }
     ctx.globalAlpha=1;
   }
   resize();
