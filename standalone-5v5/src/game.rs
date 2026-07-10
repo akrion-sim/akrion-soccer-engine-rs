@@ -44,7 +44,7 @@ pub const A_SPREAD: usize = 10;
 pub const A_MARK: usize = 11;
 pub const A_STAY: usize = 12;
 
-pub const OBS_DIM: usize = 34;
+pub const OBS_DIM: usize = 39; // 34 base + 5 nearest-teammate perception features
 
 #[derive(Clone, Copy, Default)]
 pub struct V2 {
