@@ -18,7 +18,28 @@ const ENT_BETA0: f32 = 0.02;
 
 // Teammate-spacing reward weight. Overridable via SPACING_W env for tuning.
 fn w_spacing() -> f32 {
-    std::env::var("SPACING_W").ok().and_then(|s| s.parse().ok()).unwrap_or(0.05)
+    std::env::var("SPACING_W").ok().and_then(|s| s.parse().ok()).unwrap_or(0.02)
+}
+
+/// PER-PLAYER spacing reward as a function of a player's nearest-teammate
+/// distance `d`. Steep penalties for bunching (the user's curve), reward around
+/// the ~5-unit optimum. Applied to EACH outfielder individually, every tick, in
+/// all phases — so bunching is directly attributable and can't hide in a shared
+/// team average.
+fn spacing_reward(d: f32) -> f32 {
+    if d < 1.0 {
+        -50.0
+    } else if d < 2.0 {
+        -20.0
+    } else if d < 3.0 {
+        -10.0
+    } else if d < 4.0 {
+        -3.0
+    } else if d <= 6.0 {
+        10.0 // ~5 units = optimal spacing
+    } else {
+        (10.0 - (d - 6.0) * 3.0).max(0.0) // decay past 6 so they don't over-spread
+    }
 }
 
 #[derive(Clone)]
