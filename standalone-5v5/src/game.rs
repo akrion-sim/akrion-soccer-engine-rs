@@ -10,7 +10,7 @@ pub const FIELD_W: f32 = 68.0;
 pub const GOAL_HALF: f32 = 7.32; // half goal-mouth width in y
 pub const N: usize = 5; // players per team
 pub const DT: f32 = 0.1; // seconds per decision tick
-pub const STEPS: usize = 300; // ticks per game (~30s)
+pub const STEPS: usize = 400; // ticks per game (~40s)
 
 const PLAYER_SPEED: f32 = 7.0;
 const CONTROL_RADIUS: f32 = 1.7;
