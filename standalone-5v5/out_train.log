@@ -57,10 +57,9 @@ training for 250 iterations (8 games/iter)...
   250 |     +0.117 |    0.558 |   0.28   0.17 | sp  4.9 | bunch   0% | ent  0.56
 
 wrote out/learning_curve.csv
-best policy at iter 15 (eval goal_diff +0.300)
+best policy at iter 105 (eval goal_diff +0.133)
 saved policy -> out/actor.txt, out/critic.txt
 
-FINAL (300 games): goal_diff=+0.317  winrate=0.542  goals 2.13-1.81  passes/game 1.7  spacing=4.6  bunch=71%
->>> The learned policy BEATS the scripted analytic baseline. <<<
-display seed 35: before 0-1 (poss 3)  ->  after 3-2 (poss 31, passes 6)
+FINAL (300 games): goal_diff=-0.123  winrate=0.503  goals 0.25-0.37  passes/game 0.0  spacing=5.2  bunch=0%
+display seed 107: before 0-1 (poss 7)  ->  after 1-0 (poss 3, passes 0)
 wrote out/match_before.json + out/match_after.json (visual demo traces)

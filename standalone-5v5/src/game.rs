@@ -405,6 +405,19 @@ impl World {
         let nt_pressure = 1.0 / (1.0 + nt_dist); // high when a teammate is on top of me
         let crowd_frac = crowd / (N as f32 - 1.0);
 
+        // ROLE signal: is this player the closest outfielder to the ball, and its
+        // rank by ball-distance. Lets the policy learn "only the closest chases;
+        // the rest hold shape" — so players don't all pile onto the ball and bunch.
+        let my_ball_d = me.pos.sub(self.ball).len();
+        let mut closer = 0usize;
+        for k in 1..N {
+            if k != idx && tps[k].pos.sub(self.ball).len() < my_ball_d {
+                closer += 1;
+            }
+        }
+        let is_closest = if closer == 0 { 1.0 } else { 0.0 };
+        let ball_rank = closer as f32 / (N as f32 - 2.0).max(1.0); // 0=closest .. 1=farthest
+
         let f = [
             has_ball as u8 as f32,
             team_ball as u8 as f32,
