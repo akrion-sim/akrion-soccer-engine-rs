@@ -651,7 +651,9 @@ impl World {
         if od < TACKLE_RADIUS && rng.f01() < TACKLE_PROB {
             let stealer = Owner { team: o.team.other(), idx: oi };
             if o.team == Team::A {
-                self.ev_turnover_a = true;
+                self.ev_turnover_a = true; // A dispossessed
+            } else {
+                self.ev_win_ball_a = true; // A tackled the ball off B
             }
             self.owner = Some(stealer);
             self.last_touch = Some(stealer.team);
