@@ -523,7 +523,7 @@ impl World {
             self.owner = None;
             self.last_touch = Some(kicker.team);
             self.last_kicker = Some(kicker);
-            self.kick_timer = 3;
+            self.kick_timer = 6;
             self.pending_pass = None;
             if is_pass {
                 // remember intended receiver (BOTH teams) so the reception radius
@@ -692,7 +692,7 @@ impl World {
             }
             self.owner = Some(stealer);
             self.last_touch = Some(stealer.team);
-            self.kick_timer = 2;
+            self.kick_timer = 4;
             self.last_kicker = Some(stealer);
             self.pending_pass = None;
         }

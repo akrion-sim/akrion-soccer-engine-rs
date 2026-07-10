@@ -6,19 +6,20 @@ use crate::game::*;
 use crate::nn::{masked_softmax, Mlp};
 use crate::rng::Rng;
 
-const GAMMA: f32 = 0.99;
+const GAMMA: f32 = 0.995; // per-tick discount retuned for 20 Hz (same per-second horizon)
 const LAMBDA: f32 = 0.95;
 const CLIP: f32 = 0.2;
 const LR_ACTOR: f32 = 3e-4;
 const LR_CRITIC: f32 = 1e-3;
 const EPOCHS: usize = 4;
 const MINIBATCH: usize = 1024;
-const W_SHAPE: f32 = 2.0;
+const W_SHAPE: f32 = 1.0; // potential shaping (per-tick) halved for 20 Hz
 const ENT_BETA0: f32 = 0.02;
 
 // Teammate-spacing reward weight. Overridable via SPACING_W env for tuning.
+// Default halved from the 10 Hz value (per-tick reward now fires twice as often).
 fn w_spacing() -> f32 {
-    std::env::var("SPACING_W").ok().and_then(|s| s.parse().ok()).unwrap_or(0.004)
+    std::env::var("SPACING_W").ok().and_then(|s| s.parse().ok()).unwrap_or(0.003)
 }
 
 /// PER-PLAYER spacing reward as a function of a player's nearest-teammate
