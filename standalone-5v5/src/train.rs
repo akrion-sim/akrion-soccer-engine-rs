@@ -345,10 +345,9 @@ pub fn evaluate(policy: &Policy, games: usize, rng: &mut Rng) -> (f32, f32, f32,
             if w.ev_pass_completed_a {
                 passes += 1.0;
             }
-            if matches!(w.owner, Some(o) if matches!(o.team, Team::A)) {
-                space_sum += w.avg_nearest_teammate_a();
-                space_ticks += 1.0;
-            }
+            // measure spacing on EVERY tick (all phases) to validate the whole match
+            space_sum += w.avg_nearest_teammate_a();
+            space_ticks += 1.0;
         }
         let d = w.goals_a as f32 - w.goals_b as f32;
         diff += d;
