@@ -44,7 +44,9 @@ pub const A_SPREAD: usize = 10;
 pub const A_MARK: usize = 11;
 pub const A_STAY: usize = 12;
 
-pub const OBS_DIM: usize = 41; // 34 base + 5 nearest-teammate + 2 role (chase/hold) features
+// Full relational field vector: 8 self/global + 5 ball + 5 goals + 5 role/cues
+// + (N-1)*5 teammates + N*5 opponents + 1 bias = 8+5+5+5+20+25+1 = 69.
+pub const OBS_DIM: usize = 69;
 
 #[derive(Clone, Copy, Default)]
 pub struct V2 {
