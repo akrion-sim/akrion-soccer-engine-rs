@@ -265,12 +265,13 @@ pub fn ent_beta_at(iter: usize, total: usize) -> f32 {
 }
 
 /// Evaluate greedy policy vs scripted over `games`. Returns
-/// (avg_goal_diff, win_rate, avg_goals_a, avg_goals_b).
-pub fn evaluate(policy: &Policy, games: usize, rng: &mut Rng) -> (f32, f32, f32, f32) {
+/// (avg_goal_diff, win_rate, avg_goals_a, avg_goals_b, avg_completed_passes_a).
+pub fn evaluate(policy: &Policy, games: usize, rng: &mut Rng) -> (f32, f32, f32, f32, f32) {
     let mut diff = 0.0f32;
     let mut wins = 0.0f32;
     let mut ga = 0.0f32;
     let mut gb = 0.0f32;
+    let mut passes = 0.0f32;
     for _ in 0..games {
         let mut w = World::new();
         if rng.f01() < 0.5 {
@@ -285,6 +286,9 @@ pub fn evaluate(policy: &Policy, games: usize, rng: &mut Rng) -> (f32, f32, f32,
             }
             let act_b = w.scripted_actions(Team::B);
             w.step(&act_a, &act_b, rng);
+            if w.ev_pass_completed_a {
+                passes += 1.0;
+            }
         }
         let d = w.goals_a as f32 - w.goals_b as f32;
         diff += d;
@@ -297,7 +301,7 @@ pub fn evaluate(policy: &Policy, games: usize, rng: &mut Rng) -> (f32, f32, f32,
         }
     }
     let g = games.max(1) as f32;
-    (diff / g, wins / g, ga / g, gb / g)
+    (diff / g, wins / g, ga / g, gb / g, passes / g)
 }
 
 /// Baseline sanity check: scripted-vs-scripted goal difference (should be ~0).
