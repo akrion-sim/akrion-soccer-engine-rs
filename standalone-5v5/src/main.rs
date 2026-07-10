@@ -276,30 +276,22 @@ fn run_training(iters: usize) {
         let stats = train::train_iter(&mut policy, games_per_iter, beta, &mut rng);
 
         if it % eval_every == 0 || it == iters {
-            let (d, wr, ga, gb, passes, sp, bunch) = train::evaluate(&policy, 60, &mut rng);
-            // Snapshot the checkpoint that WINS and is SPREAD OUT: once winning
-            // (d > 0.2), add a passing bonus plus a strong spacing bonus so the
-            // chosen model actually spaces its teammates (toward the 5-8 target).
+            let st = train::evaluate(&policy, 60, &mut rng);
             // Balance: reward real soccer (winning + passing) AND penalize the
-            // HONEST bunch% (average spacing hides a glued pair). Neither term
-            // alone dominates — we want a checkpoint that plays well with low bunch.
-            let _ = sp;
+            // HONEST bunch% (average spacing hides a glued pair).
             let quality =
-                d.min(3.0) + (passes * 0.03).min(0.6) - 1.6 * bunch;
+                st.goal_diff.min(3.0) + (st.pass_cmp * 0.03).min(0.6) - 1.6 * st.bunch;
             if quality > best_diff {
                 best_diff = quality;
                 best_policy = policy.clone();
                 best_iter = it;
             }
             println!(
-                "{:>5} | {:>+10.3} | {:>8.3} | {:>6.2} {:>6.2} | sp {:>4.1} | bunch {:>3.0}% | ent {:>5.2}",
-                it, d, wr, ga, gb, sp, bunch * 100.0, stats.entropy
+                "{:>5} | {:>+10.3} | {:>8.3} | {:>6.2} {:>6.2} | sp {:>4.1} | bunch {:>3.0}% | pass {:>4.1} ({:.0}%) | shot {:>3.1}",
+                it, st.goal_diff, st.winrate, st.ga, st.gb, st.spacing, st.bunch * 100.0,
+                st.pass_att, st.pass_completion() * 100.0, st.shots
             );
-            let _ = writeln!(
-                csv,
-                "{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4}",
-                it, d, wr, ga, gb, stats.entropy, stats.value_loss, stats.avg_reward
-            );
+            csv.push_str(&csv_row(it, &st, stats.entropy, stats.value_loss));
         }
     }
 
