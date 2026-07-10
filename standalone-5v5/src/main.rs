@@ -91,9 +91,12 @@ fn run_training(iters: usize) {
         let stats = train::train_iter(&mut policy, games_per_iter, beta, &mut rng);
 
         if it % eval_every == 0 || it == iters {
-            let (d, wr, ga, gb) = train::evaluate(&policy, 60, &mut rng);
-            if d > best_diff {
-                best_diff = d;
+            let (d, wr, ga, gb, passes) = train::evaluate(&policy, 60, &mut rng);
+            // Snapshot on a winning+passing blend: reward goal-diff, plus a
+            // passing bonus once the policy is actually winning (d > 0.3).
+            let quality = d + if d > 0.3 { (passes * 0.02).min(1.0) } else { 0.0 };
+            if quality > best_diff {
+                best_diff = quality;
                 best_policy = policy.clone();
                 best_iter = it;
             }
