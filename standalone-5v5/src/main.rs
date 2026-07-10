@@ -66,6 +66,10 @@ fn run() -> AppResult<()> {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("train");
     match cmd {
+        "train" => {
+            let cfg = parse_run_config(&args)?;
+            run_training(&cfg)?;
+        }
         "sanity" => sanity(),
         "inspect" => {
             let seed: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(7);
@@ -73,10 +77,7 @@ fn run() -> AppResult<()> {
             inspect(seed, &out_dir)?;
         }
         "help" | "--help" | "-h" => print_usage(),
-        _ => {
-            let cfg = parse_run_config(&args)?;
-            run_training(&cfg)?;
-        }
+        other => return Err(format!("unknown command: {other}; run with --help for usage").into()),
     }
     Ok(())
 }
@@ -208,7 +209,7 @@ fn inspect(seed: u64, out_dir: &Path) -> AppResult<()> {
     let policy = train::Policy {
         actor,
         critic: nn::Mlp::load(&critic_path)
-            .unwrap_or_else(|_| nn::Mlp::new(&[GLOBAL_DIM, 128, 64, 1], &mut Rng::new(0))),
+            .map_err(|err| format!("failed to load critic at {}: {err}", critic_path.display()))?,
     };
     let mut rng = Rng::new(seed);
     let mut w = World::new();
@@ -532,7 +533,7 @@ fn run_training(cfg: &RunConfig) -> AppResult<()> {
     // Pick a display seed that showcases GOOD PLAY, not a blowout: the trained
     // side should win by a sensible margin while dominating possession and
     // stringing passes; the untrained side (same seed) should be clearly worse.
-    let mut best_seed = 1u64;
+    let mut best_seed = None;
     let mut best_score = f32::NEG_INFINITY;
     for s in 1..=cfg.display_seed_max {
         let (bga, bgb, ba_poss, _) = game_stats(&untrained, s);
@@ -548,14 +549,33 @@ fn run_training(cfg: &RunConfig) -> AppResult<()> {
             aa_poss as f32 * 0.02 + a_pass as f32 * 0.4 + (aa_poss as f32 - ba_poss as f32) * 0.01;
         if score > best_score {
             best_score = score;
-            best_seed = s;
+            best_seed = Some(s);
         }
     }
+    let display_seed_matched_filter = best_seed.is_some();
+    let best_seed = best_seed.unwrap_or_else(|| {
+        eprintln!(
+            "warning: no display seed matched the showcase filter; using seed 1 as a fallback"
+        );
+        1
+    });
     let (bga, bgb, bposs, _) = game_stats(&untrained, best_seed);
     let (aga, agb, aposs, apass) = game_stats(&policy, best_seed);
     println!(
-        "display seed {}: before {}-{} (poss {})  ->  after {}-{} (poss {}, passes {})",
-        best_seed, bga, bgb, bposs, aga, agb, aposs, apass
+        "display seed {}{}: before {}-{} (poss {})  ->  after {}-{} (poss {}, passes {})",
+        best_seed,
+        if display_seed_matched_filter {
+            ""
+        } else {
+            " (fallback)"
+        },
+        bga,
+        bgb,
+        bposs,
+        aga,
+        agb,
+        aposs,
+        apass
     );
     let before_path = cfg.out_dir.join("match_before.json");
     let after_path = cfg.out_dir.join("match_after.json");
@@ -575,6 +595,7 @@ fn run_training(cfg: &RunConfig) -> AppResult<()> {
         best_quality,
         best_cleared_gates,
         best_seed,
+        display_seed_matched_filter,
         (svs, sga, sgb),
         &s0,
         &f,
@@ -723,6 +744,7 @@ fn write_run_manifest(
     best_quality: f32,
     best_cleared_gates: bool,
     display_seed: u64,
+    display_seed_matched_filter: bool,
     scripted: (f32, f32, f32),
     untrained: &train::Stats,
     final_stats: &train::Stats,
@@ -755,7 +777,7 @@ fn write_run_manifest(
             "  \"git_commit\": {},\n",
             "  \"config\": {{\"iters\":{},\"seed\":{},\"games_per_iter\":{},\"eval_every\":{},\"eval_games\":{},\"final_games\":{},\"display_seed_max\":{},\"out_dir\":{}}},\n",
             "  \"env\": {{\"SPACING_W\": {}}},\n",
-            "  \"selection\": {{\"best_iter\":{},\"best_quality\":{:.6},\"best_cleared_hardening_gates\":{},\"display_seed\":{}}},\n",
+            "  \"selection\": {{\"best_iter\":{},\"best_quality\":{:.6},\"best_cleared_hardening_gates\":{},\"display_seed\":{},\"display_seed_matched_filter\":{}}},\n",
             "  \"scripted_vs_scripted\": {{\"goal_diff\":{:.6},\"goals_a\":{:.6},\"goals_b\":{:.6}}},\n",
             "  \"untrained\": {},\n",
             "  \"final\": {},\n",
@@ -777,6 +799,7 @@ fn write_run_manifest(
         best_quality,
         best_cleared_gates,
         display_seed,
+        display_seed_matched_filter,
         scripted.0,
         scripted.1,
         scripted.2,

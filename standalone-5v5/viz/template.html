@@ -338,6 +338,11 @@ const META   = /*__META__*/ null;
     const dpr=Math.min(2,window.devicePixelRatio||1);
     cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+'px'; ctx.setTransform(dpr,0,0,dpr,0,0);
     ctx.clearRect(0,0,w,h);
+    if(!Array.isArray(CURVE)||CURVE.length===0){
+      ctx.fillStyle=css('--ink-dim');ctx.font='11px ui-monospace,monospace';ctx.textAlign='center';ctx.textBaseline='middle';
+      ctx.fillText('no data',w/2,h/2);
+      return;
+    }
     const padL=30,padR=10,padT=10,padB=18;
     const maxI=Math.max(...CURVE.map(p=>p.iter),1);
     let lo=0,hi=1;

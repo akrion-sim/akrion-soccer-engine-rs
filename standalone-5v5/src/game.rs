@@ -238,8 +238,13 @@ impl World {
         self.pending_pass = None;
         self.pass_streak_a = 0;
         self.a_shot_flag = false;
+        self.reset_a_pass_memory();
+    }
+
+    fn reset_a_pass_memory(&mut self) {
         self.lp_from = -1;
         self.lp_to = -1;
+        self.pending_passer = -1;
         self.return_streak_a = 0;
     }
 
@@ -578,9 +583,12 @@ impl World {
                 // applies symmetrically. pending_pass.team == the passing team.
                 self.pending_pass = self.intended_receiver;
                 if kicker.team == Team::A {
+                    self.pending_passer = kicker.idx as i32;
                     // A attacks +x, so ball.x IS attack-frame forward progress.
                     self.pass_kick_x = self.player(kicker).pos.x;
                 }
+            } else if kicker.team == Team::A {
+                self.reset_a_pass_memory();
             }
         } else if let Some(o) = self.owner {
             // carry: ball glued just ahead of the owner in their attack direction.
@@ -645,9 +653,7 @@ impl World {
         self.kick_timer = 0;
         self.pass_streak_a = 0;
         self.a_shot_flag = false;
-        self.lp_from = -1;
-        self.lp_to = -1;
-        self.return_streak_a = 0;
+        self.reset_a_pass_memory();
     }
 
     fn try_capture(&mut self) {
@@ -715,37 +721,30 @@ impl World {
                         self.ev_pass_completed_a = true; // A pass reached an A player
                         self.last_pass_gain_a = self.ball.x - self.pass_kick_x;
                         self.pass_streak_a += 1; // toward the 2-pass rule
-                        // record the passer->receiver of this completed A pass
+                                                 // record the passer->receiver of this completed A pass
                         self.lp_from = self.pending_passer;
                         self.lp_to = o.idx as i32;
+                        self.pending_passer = -1;
                     } else {
                         self.ev_turnover_a = true; // A pass intercepted by B
                         self.pass_streak_a = 0;
-                        self.lp_from = -1;
-                        self.lp_to = -1;
-                        self.return_streak_a = 0;
+                        self.reset_a_pass_memory();
                     }
                 }
                 // a B pass intercepted by A is a good steal
                 if pp.team == Team::B && o.team == Team::A {
                     self.ev_win_ball_a = true;
                     self.pass_streak_a = 0; // fresh possession
-                    self.lp_from = -1;
-                    self.lp_to = -1;
-                    self.return_streak_a = 0;
+                    self.reset_a_pass_memory();
                 }
             } else if matches!(prev_touch, Some(Team::A)) && o.team == Team::B {
                 self.ev_turnover_a = true;
                 self.pass_streak_a = 0;
-                self.lp_from = -1;
-                self.lp_to = -1;
-                self.return_streak_a = 0;
+                self.reset_a_pass_memory();
             } else if matches!(prev_touch, Some(Team::B)) && o.team == Team::A {
                 self.ev_win_ball_a = true; // won a loose ball off B
                 self.pass_streak_a = 0;
-                self.lp_from = -1;
-                self.lp_to = -1;
-                self.return_streak_a = 0;
+                self.reset_a_pass_memory();
             }
             self.last_touch = Some(o.team);
             self.pending_pass = None;
@@ -771,9 +770,7 @@ impl World {
                 self.ev_win_ball_a = true; // A tackled the ball off B
             }
             self.pass_streak_a = 0; // possession changed hands
-            self.lp_from = -1;
-            self.lp_to = -1;
-            self.return_streak_a = 0;
+            self.reset_a_pass_memory();
             self.owner = Some(stealer);
             self.last_touch = Some(stealer.team);
             self.kick_timer = 4;
@@ -808,6 +805,7 @@ impl World {
                     self.ev_shot_attempt_a = true;
                     self.pass_streak_a = 0; // buildup consumed by the shot
                     self.a_shot_flag = true; // this free ball is a valid (2-pass) shot
+                    self.reset_a_pass_memory();
                 }
                 self.set_vel(team, idx, V2::default());
                 // MPC-lite finishing: enumerate aim points across the mouth and
@@ -899,6 +897,7 @@ impl World {
             A_CLEAR => {
                 if team == Team::A {
                     self.pass_streak_a = 0; // clearing gives up the buildup
+                    self.reset_a_pass_memory();
                 }
                 self.set_vel(team, idx, V2::default());
                 // hoof toward attacked goal with lateral scatter
@@ -1291,6 +1290,16 @@ mod tests {
         [A_STAY; N]
     }
 
+    fn arrange_return_pass_candidates(w: &mut World) {
+        w.a[1].pos = V2::new(24.0, 14.0);
+        w.a[2].pos = V2::new(30.0, 14.0);
+        w.a[3].pos = V2::new(6.0, 4.0);
+        w.a[4].pos = V2::new(7.0, 24.0);
+        for i in 0..N {
+            w.b[i].pos = V2::new(40.0, if i % 2 == 0 { 1.0 } else { 27.0 });
+        }
+    }
+
     #[test]
     fn observations_and_global_state_are_finite() {
         let w = World::new();
@@ -1374,13 +1383,74 @@ mod tests {
             idx: 2,
         });
         w.pass_kick_x = 10.0;
+        w.pending_passer = 1;
         w.ball = w.a[2].pos;
         w.ball_vel = V2::default();
         w.kick_timer = -1;
         w.try_capture();
         assert!(w.ev_pass_completed_a);
         assert_eq!(w.pass_streak_a, 1);
+        assert_eq!(w.lp_from, 1);
+        assert_eq!(w.lp_to, 2);
+        assert_eq!(w.pending_passer, -1);
         assert!(w.last_pass_gain_a.is_finite());
         assert!(matches!(w.owner, Some(o) if o.team == Team::A && o.idx == 2));
+    }
+
+    #[test]
+    fn return_pass_to_previous_giver_sets_event_and_streak() {
+        let mut w = World::new();
+        arrange_return_pass_candidates(&mut w);
+        w.owner = Some(Owner {
+            team: Team::A,
+            idx: 2,
+        });
+        w.lp_from = 1;
+        w.lp_to = 2;
+        w.return_streak_a = 1;
+
+        let kick = w.apply_on_ball(Team::A, 2, A_PASS_A, &mut Rng::new(3));
+
+        assert!(kick.is_some());
+        assert!(matches!(w.intended_receiver, Some(o) if o.team == Team::A && o.idx == 1));
+        assert!(w.ev_return_pass_a);
+        assert_eq!(w.return_streak_a, 2);
+        assert_eq!(w.pending_passer, 2);
+    }
+
+    #[test]
+    fn non_return_pass_resets_return_streak() {
+        let mut w = World::new();
+        arrange_return_pass_candidates(&mut w);
+        w.owner = Some(Owner {
+            team: Team::A,
+            idx: 2,
+        });
+        w.lp_from = 3;
+        w.lp_to = 2;
+        w.return_streak_a = 2;
+
+        let kick = w.apply_on_ball(Team::A, 2, A_PASS_A, &mut Rng::new(4));
+
+        assert!(kick.is_some());
+        assert!(matches!(w.intended_receiver, Some(o) if o.team == Team::A && o.idx == 1));
+        assert!(!w.ev_return_pass_a);
+        assert_eq!(w.return_streak_a, 0);
+    }
+
+    #[test]
+    fn kickoff_clears_return_pass_memory() {
+        let mut w = World::new();
+        w.lp_from = 1;
+        w.lp_to = 2;
+        w.pending_passer = 2;
+        w.return_streak_a = 3;
+
+        w.kickoff(Team::B);
+
+        assert_eq!(w.lp_from, -1);
+        assert_eq!(w.lp_to, -1);
+        assert_eq!(w.pending_passer, -1);
+        assert_eq!(w.return_streak_a, 0);
     }
 }
