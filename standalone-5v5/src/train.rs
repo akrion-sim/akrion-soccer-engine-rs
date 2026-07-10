@@ -108,13 +108,18 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
             r -= 5.0;
         }
         if w.ev_pass_completed_a {
-            r += 0.3;
+            r += 0.6; // reward keeping the ball through a completed pass
         }
         if w.ev_turnover_a {
             r -= 0.3;
         }
         if w.ev_shot_on_a {
             r += 0.4;
+        }
+        // small per-tick possession reward -> favors keeping the ball over
+        // the loose-ball counter style, so passing sequences emerge.
+        if matches!(w.owner, Some(o) if matches!(o.team, Team::A)) {
+            r += 0.02;
         }
 
         obs_buf.push(obs_t);
