@@ -778,6 +778,12 @@ impl World {
                     let lead = tp.add(V2::new(sx * 2.0, 0.0));
                     self.intended_receiver = Some(Owner { team, idx: ti });
                     self.set_vel(team, idx, V2::default());
+                    if team == Team::A {
+                        self.ev_pass_attempt_a = true;
+                        // classify by forward progress toward the attacked goal
+                        let fwd = (tp.x - me.x) * sx;
+                        self.pass_dir_a = if fwd > 2.0 { 1 } else if fwd < -2.0 { -1 } else { 0 };
+                    }
                     Some((owner, lead.sub(me), PASS_SPEED, true))
                 } else {
                     // no valid target: dribble forward instead
