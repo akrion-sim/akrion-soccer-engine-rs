@@ -151,6 +151,44 @@ impl Mlp {
     }
 }
 
+impl Mlp {
+    /// Persist weights to a simple text file: line 1 = sizes; then per layer a
+    /// weights line and a biases line (space-separated f32). Zero deps.
+    pub fn save(&self, path: &str) -> std::io::Result<()> {
+        let mut s = String::new();
+        s.push_str(
+            &self.sizes.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" "),
+        );
+        s.push('\n');
+        for l in 0..self.w.len() {
+            s.push_str(&self.w[l].iter().map(|x| format!("{}", x)).collect::<Vec<_>>().join(" "));
+            s.push('\n');
+            s.push_str(&self.b[l].iter().map(|x| format!("{}", x)).collect::<Vec<_>>().join(" "));
+            s.push('\n');
+        }
+        std::fs::write(path, s)
+    }
+
+    /// Load weights saved by `save` (fresh Mlp; Adam state reset).
+    pub fn load(path: &str) -> std::io::Result<Self> {
+        let txt = std::fs::read_to_string(path)?;
+        let mut lines = txt.lines();
+        let sizes: Vec<usize> =
+            lines.next().unwrap().split_whitespace().map(|x| x.parse().unwrap()).collect();
+        let mut seed = Rng::new(0);
+        let mut m = Mlp::new(&sizes, &mut seed);
+        for l in 0..m.w.len() {
+            let wl: Vec<f32> =
+                lines.next().unwrap().split_whitespace().map(|x| x.parse().unwrap()).collect();
+            let bl: Vec<f32> =
+                lines.next().unwrap().split_whitespace().map(|x| x.parse().unwrap()).collect();
+            m.w[l] = wl;
+            m.b[l] = bl;
+        }
+        Ok(m)
+    }
+}
+
 /// Numerically stable masked softmax. Masked entries get probability 0.
 pub fn masked_softmax(logits: &[f32], mask: &[bool]) -> Vec<f32> {
     let mut m = f32::NEG_INFINITY;
