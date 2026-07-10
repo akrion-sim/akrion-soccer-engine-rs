@@ -111,7 +111,10 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
         // forward progress is rewarded by the potential shaping above, and goals
         // dominate — so passing stays INSTRUMENTAL and the policy still attacks.
         if w.ev_pass_completed_a {
-            r += 0.15; // safe to reward: under double-team pressure you can't hoard
+            // reward completing a pass, weighted by how much it advanced the ball
+            // toward goal — line-breaking forward passes pay, lateral hoarding
+            // doesn't. Small base keeps a completed pass better than a turnover.
+            r += 0.1 + (w.last_pass_gain_a.max(0.0) * 0.12).min(1.2);
         }
         if w.ev_turnover_a {
             r -= 0.25;
