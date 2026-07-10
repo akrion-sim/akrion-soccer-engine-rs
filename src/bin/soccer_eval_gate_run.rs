@@ -280,6 +280,12 @@ impl AdvancementRecord {
         self.opponent_completed_passes = self
             .opponent_completed_passes
             .saturating_add(fixture.opponent_completed_passes);
+        self.candidate_attempted_passes = self
+            .candidate_attempted_passes
+            .saturating_add(fixture.candidate_attempted_passes);
+        self.opponent_attempted_passes = self
+            .opponent_attempted_passes
+            .saturating_add(fixture.opponent_attempted_passes);
         self.candidate_turnovers = self
             .candidate_turnovers
             .saturating_add(fixture.candidate_turnovers);
