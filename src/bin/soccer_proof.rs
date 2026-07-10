@@ -363,44 +363,6 @@ fn away_metrics(st: &MatchStats) -> TeamMetrics {
     }
 }
 
-/// Produce a FRESH, untrained neural snapshot (random init, zero gradient steps) for the
-/// "learning is real" baseline: the net exists and re-ranks the analytic candidates but has
-/// learned nothing. We build the sim exactly as training does and play the match to force lazy
-/// net creation, but NEVER call `drain_neural_learning` — so no gradient is ever applied and the
-/// extracted weights are the random initialization.
-fn fresh_snapshot(out_path: &str, seed: u32) {
-    enable_deterministic_formation_lp();
-    let neural = SoccerNeuralLearningConfig {
-        enabled: true,
-        backend: SoccerNeuralLearningBackend::Inline,
-        marl_algorithm: SoccerMarlAlgorithm::Mappo,
-        mappo_team_reward_share: DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
-        ..SoccerNeuralLearningConfig::default()
-    };
-    let policies = Arc::new(SoccerTeamQPolicies::new(SoccerQPolicyOptions::default()));
-    let mut config = MatchConfig {
-        duration_seconds: 120.0,
-        learning_enabled: true,
-        neural_learning: neural,
-        seed,
-        ..MatchConfig::default()
-    };
-    config.neural_blend.actor_critic = true;
-    let total_ticks = config.total_ticks();
-    let mut sim = SoccerMatch::default_11v11(config).with_team_policies((*policies).clone());
-    sim.set_uniform_elite_players();
-    // Play so the net is created and exercised, but do NOT drain -> zero gradient updates.
-    for _ in 0..total_ticks {
-        sim.run_time_step();
-    }
-    let snap = sim
-        .neural_network_snapshot()
-        .expect("fresh net snapshot (net should exist after play)");
-    let json = serde_json::to_string(&snap).expect("serialize fresh snapshot");
-    std::fs::write(out_path, json).expect("write fresh snapshot");
-    println!("[fresh] wrote untrained snapshot {out_path} (0 gradient steps, seed 0x{seed:08X})");
-}
-
 fn load_brain(spec: &str) -> TeamBrain {
     if spec.eq_ignore_ascii_case("analytic") {
         // Net-less brain => the authoritative-neural branch is skipped => the hand-built analytic
@@ -773,11 +735,6 @@ fn main() {
             let seed = parse_hex(args.get(5), 0x71A1_0000);
             let ckpt = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(5);
             train_ckpt(prefix, games, minutes, seed, ckpt);
-        }
-        Some("fresh") => {
-            let out = args.get(2).expect("usage: fresh <out.json> [seed_hex]");
-            let seed = parse_hex(args.get(3), 0x0F1E_5100);
-            fresh_snapshot(out, seed);
         }
         Some("eval") => {
             let cand = args.get(2).expect("usage: eval <candidate|analytic> <baseline|analytic> <games> <minutes> <holdout_hex>");

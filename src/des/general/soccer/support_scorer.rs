@@ -613,6 +613,28 @@ mod tests {
     }
 
     #[test]
+    fn support_scorer_head_round_trips_through_snapshot() {
+        let features = baseline_features();
+        let mut head = SupportScorerHead::new(23);
+        let samples = vec![SupportMoveSample {
+            features: features.clone(),
+            reward: 1.0,
+        }];
+        head.train(&samples, 0.02);
+        let before = head.predict(&features).expect("prediction before snapshot");
+        let snapshot = head.to_snapshot();
+        let restored = SupportScorerHead::from_snapshot(&snapshot).expect("restore snapshot");
+        let after = restored
+            .predict(&features)
+            .expect("prediction after snapshot");
+        assert_eq!(restored.training_steps(), head.training_steps());
+        assert!(
+            (before - after).abs() < 1e-9,
+            "snapshot should preserve support-scorer prediction: before={before} after={after}"
+        );
+    }
+
+    #[test]
     fn outcome_event_weights_rank_goal_over_pass_over_zero_over_turnover() {
         // The ladder the off-ball move learns from: scoring ≫ a completed forward pass > neutral,
         // and turnovers are strictly negative. Neutral/unrelated kinds contribute nothing.

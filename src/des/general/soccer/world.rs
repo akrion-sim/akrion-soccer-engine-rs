@@ -12961,10 +12961,12 @@ impl SoccerMatch {
                     snapshot.mpc_objective_head = Some(Box::new(mpc_objective_head.to_snapshot()));
                 }
                 if let Some(attack_spacing_head) = &self.attack_spacing_head {
-                    snapshot.attack_spacing_head = Some(Box::new(attack_spacing_head.to_snapshot()));
+                    snapshot.attack_spacing_head =
+                        Some(Box::new(attack_spacing_head.to_snapshot()));
                 }
                 if let Some(support_scorer_head) = &self.support_scorer_head {
-                    snapshot.support_scorer_head = Some(Box::new(support_scorer_head.to_snapshot()));
+                    snapshot.support_scorer_head =
+                        Some(Box::new(support_scorer_head.to_snapshot()));
                 }
                 snapshot
             })
