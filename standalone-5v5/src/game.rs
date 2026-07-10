@@ -334,6 +334,22 @@ impl World {
         bpos // uncatchable — head to where it ends up
     }
 
+    /// Classify a Team-A dribble by the FINAL (post-shielding) direction, so the
+    /// forward-dribble reward reflects actual movement — a shield that bends the
+    /// carry sideways/backward is NOT credited as forward. Forward = x·sx > 0.3,
+    /// lateral = within ±0.3, backward = < −0.3 (no event → no reward).
+    fn note_dribble(&mut self, team: Team, dir: V2, sx: f32) {
+        if team != Team::A {
+            return;
+        }
+        let fwd = dir.x * sx;
+        if fwd > 0.3 {
+            self.ev_dribble_fwd_a = true;
+        } else if fwd > -0.3 {
+            self.ev_dribble_lat_a = true;
+        }
+    }
+
     /// Dribble direction that veers AWAY from a close defender (shielding) while
     /// keeping the intended direction when there's space.
     fn shielded_dribble_dir(&self, team: Team, me: V2, intended: V2) -> V2 {
