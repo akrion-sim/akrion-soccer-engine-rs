@@ -320,28 +320,56 @@ const META   = /*__META__*/ null;
   document.getElementById('passbar-legend').innerHTML=mix.map(m=>
     `<span class="sw"><i style="background:${m.col}"></i>${m.label} ${m.pct}%</span>`).join('');
 
-  // rates over training (pass completion %, shot conversion %, possession %)
-  const cv=document.getElementById('rates');const ctx=cv.getContext('2d');
-  function resize(){const w=cv.clientWidth||420;const dpr=Math.min(2,window.devicePixelRatio||1);
-    cv.width=w*dpr;cv.height=Math.round(w*0.5)*dpr;cv.style.height=Math.round(w*0.5)+'px';ctx.setTransform(dpr,0,0,dpr,0,0);draw(w,Math.round(w*0.5));}
+  // ---- generic training-trend mini charts (every metric, over iterations) ----
   function css(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim();}
-  function draw(w,h){
-    ctx.clearRect(0,0,w,h);const padL=34,padR=12,padT=12,padB=22;
-    const xs=CURVE.map(p=>p.iter),maxI=Math.max(...xs,1);
-    const X=i=>padL+(i/maxI)*(w-padL-padR), Y=v=>padT+(1-v/100)*(h-padT-padB);
-    ctx.strokeStyle=css('--grid');ctx.fillStyle=css('--ink-dim');ctx.font='10px ui-monospace,monospace';
-    ctx.textAlign='right';ctx.textBaseline='middle';
-    for(let g=0;g<=100;g+=25){const y=Y(g);ctx.beginPath();ctx.moveTo(padL,y);ctx.lineTo(w-padR,y);ctx.stroke();ctx.fillText(g,padL-6,y);}
-    const line=(key,mul,color)=>{ctx.strokeStyle=color;ctx.lineWidth=2;ctx.lineJoin='round';ctx.beginPath();
-      CURVE.forEach((p,i)=>{const y=Y((p[key]||0)*mul);i?ctx.lineTo(X(p.iter),y):ctx.moveTo(X(p.iter),y);});ctx.stroke();};
-    line('passcomp',100,css('--accent'));   // pass completion (0..1 -> %)
-    line('conv',100,css('--good'));          // shot conversion
-    line('poss',100,css('--ink-dim'));       // possession
-    ctx.textAlign='center';ctx.textBaseline='top';
-    [0,Math.round(maxI/2),maxI].forEach(i=>ctx.fillText(i,X(i),h-padB+6));
+  const charts=[];
+  function trend(id, series, opts){
+    opts=opts||{};
+    const cv=document.getElementById(id); if(!cv) return;
+    charts.push({cv, ctx:cv.getContext('2d'), series, opts});
+    if(opts.legendId){
+      const lg=document.getElementById(opts.legendId);
+      if(lg) lg.innerHTML=series.map(s=>`<span class="sw"><i style="background:var(${s.cvar})"></i>${s.label}</span>`).join('');
+    }
   }
-  resize();window.addEventListener('resize',resize);
-  new MutationObserver(resize).observe(document.documentElement,{attributes:true,attributeFilter:['data-theme']});
+  function drawChart(c){
+    const {cv,ctx,series,opts}=c;
+    const w=cv.clientWidth||300, h=Math.round((cv.clientWidth||300)*0.62);
+    const dpr=Math.min(2,window.devicePixelRatio||1);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+'px'; ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,w,h);
+    const padL=30,padR=10,padT=10,padB=18;
+    const maxI=Math.max(...CURVE.map(p=>p.iter),1);
+    let lo=0,hi=1;
+    if(opts.pct){lo=0;hi=100;}
+    else{ hi=-1e9; lo=0; series.forEach(s=>CURVE.forEach(p=>{const v=s.get(p)||0; if(v>hi)hi=v; if(v<lo)lo=v;}));
+      hi = hi>0 ? hi*1.12 : 1; if(lo<0) lo*=1.12; }
+    const X=i=>padL+(i/maxI)*(w-padL-padR), Y=v=>padT+(1-(v-lo)/((hi-lo)||1))*(h-padT-padB);
+    ctx.strokeStyle=css('--grid');ctx.fillStyle=css('--ink-dim');ctx.font='9px ui-monospace,monospace';
+    ctx.textAlign='right';ctx.textBaseline='middle';ctx.lineWidth=1;
+    const ticks= opts.pct?[0,50,100]:[lo,(lo+hi)/2,hi];
+    ticks.forEach(g=>{const y=Y(g);ctx.beginPath();ctx.moveTo(padL,y);ctx.lineTo(w-padR,y);ctx.stroke();
+      ctx.fillText(opts.pct?g:(Math.round(g*10)/10),padL-4,y);});
+    series.forEach(s=>{ctx.strokeStyle=css(s.cvar);ctx.lineWidth=1.8;ctx.lineJoin='round';ctx.beginPath();
+      CURVE.forEach((p,i)=>{const y=Y(s.get(p)||0);i?ctx.lineTo(X(p.iter),y):ctx.moveTo(X(p.iter),y);});ctx.stroke();
+      const last=CURVE[CURVE.length-1]; ctx.fillStyle=css(s.cvar);
+      ctx.beginPath();ctx.arc(X(last.iter),Y(s.get(last)||0),2.4,0,7);ctx.fill();});
+    ctx.textAlign='center';ctx.textBaseline='top';ctx.fillStyle=css('--ink-dim');
+    [0,maxI].forEach(i=>ctx.fillText(i,X(i),h-padB+5));
+  }
+  trend('t_pass',[{label:'attempts',cvar:'--accent',get:p=>(p.fwd||0)+(p.lat||0)+(p.back||0)},{label:'completed',cvar:'--good',get:p=>p.passcmp}],{legendId:'t_pass_lg'});
+  trend('t_comp',[{label:'completion',cvar:'--accent',get:p=>p.passcomp*100}],{pct:true});
+  trend('t_dir',[{label:'forward',cvar:'--teamA',get:p=>p.fwd},{label:'lateral',cvar:'--ink-dim',get:p=>p.lat},{label:'backward',cvar:'--teamB',get:p=>p.back}],{legendId:'t_dir_lg'});
+  trend('t_shots',[{label:'taken',cvar:'--accent',get:p=>p.shots},{label:'scored',cvar:'--good',get:p=>(p.shots||0)*(p.conv||0)}],{legendId:'t_shots_lg'});
+  trend('t_conv',[{label:'conversion',cvar:'--good',get:p=>p.conv*100}],{pct:true});
+  trend('t_poss',[{label:'possession',cvar:'--accent',get:p=>p.poss*100},{label:'bunch',cvar:'--bad',get:p=>p.bunch*100}],{legendId:'t_poss_lg',pct:true});
+  trend('t_wr',[{label:'winrate',cvar:'--accent',get:p=>p.wr*100}],{pct:true});
+  trend('t_tovwon',[{label:'turnovers',cvar:'--teamB',get:p=>p.turnovers},{label:'balls won',cvar:'--teamA',get:p=>p.won}],{legendId:'t_tovwon_lg'});
+  trend('t_spacing',[{label:'spacing',cvar:'--accent',get:p=>p.spacing}],{});
+  function drawAll(){charts.forEach(drawChart);}
+  drawAll();
+  window.addEventListener('resize',drawAll);
+  new MutationObserver(drawAll).observe(document.documentElement,{attributes:true,attributeFilter:['data-theme']});
 })();
 
 // ---------- pitch renderer ----------
