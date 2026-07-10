@@ -256,7 +256,7 @@ fn run_training(iters: usize) {
         let stats = train::train_iter(&mut policy, games_per_iter, beta, &mut rng);
 
         if it % eval_every == 0 || it == iters {
-            let (d, wr, ga, gb, passes, sp) = train::evaluate(&policy, 60, &mut rng);
+            let (d, wr, ga, gb, passes, sp, _bunch) = train::evaluate(&policy, 60, &mut rng);
             // Snapshot the checkpoint that WINS and is SPREAD OUT: once winning
             // (d > 0.2), add a passing bonus plus a strong spacing bonus so the
             // chosen model actually spaces its teammates (toward the 5-8 target).
