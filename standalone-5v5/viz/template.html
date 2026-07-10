@@ -350,7 +350,7 @@ function updateScores(){
   const b=BEFORE.frames[fi|0], a=AFTER.frames[fi|0];
   document.getElementById('sa0').textContent=b.ga; document.getElementById('sb0').textContent=b.gb;
   document.getElementById('sa1').textContent=a.ga; document.getElementById('sb1').textContent=a.gb;
-  document.getElementById('clock').textContent=((fi/10)).toFixed(1).padStart(4,'0')+'s';
+  document.getElementById('clock').textContent=((fi/FPS)).toFixed(1).padStart(4,'0')+'s';
   scrub.value=fi|0;
 }
 function render(){P0.draw(fi);P1.draw(fi);updateScores();}
