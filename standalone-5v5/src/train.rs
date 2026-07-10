@@ -63,6 +63,7 @@ struct Sample {
 /// Collect one game of Team-A experience (5 players) vs the scripted baseline.
 fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
     let mut w = World::new();
+    let w_spacing_coeff = w_spacing();
     if rng.f01() < 0.5 {
         w.kickoff(Team::B); // randomize opening possession to remove kickoff bias
     }
