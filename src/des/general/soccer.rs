@@ -43323,6 +43323,19 @@ fn soccer_policy_head_from_snapshot(
     } else {
         0.0
     };
+    // Diagnostic-only: with the gate on, allow a fixed load-time forward-select
+    // weight for smoke/A-B runs. It is baked into the per-net field once here and
+    // obeys the same nonnegative clamp as training.
+    if dd_soccer_enable_forward_select_logit() {
+        if let Ok(raw) = std::env::var("DD_SOCCER_FORWARD_SELECT_LOGIT_WEIGHT") {
+            if let Ok(value) = raw.trim().parse::<f64>() {
+                if value.is_finite() {
+                    head.forward_select_logit_weight =
+                        value.clamp(0.0, SOCCER_FORWARD_SELECT_LOGIT_WEIGHT_MAX);
+                }
+            }
+        }
+    }
     Ok(head)
 }
 
