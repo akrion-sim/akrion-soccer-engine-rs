@@ -61,12 +61,19 @@ goal), direction sin/cos, has-target. Gate `DD_SOCCER_ENABLE_ACTION_PARAM_FEATUR
 block ⇒ byte-identical). **This replaces the opaque hash with structure the net can generalize
 over** — even for existing candidates.
 
-<<<<<<< ours
-### Part B — discretized-kick variant candidates
-The first slice of this is already implemented for speed: the actor vocabulary has `40` kick-power
-bucket labels and MCTS can add pass/aerial-pass/shot/first-time-shot bucket variants when
-`DD_SOCCER_ENABLE_DISCRETIZED_KICK` is on. The remaining work is to prove the selected buckets change
-behavior and then add the missing structured dimensions:
+### Part B — discretized-kick variant candidates — ✅ SPEED SLICE IMPLEMENTED (gate `DD_SOCCER_ENABLE_DISCRETIZED_KICK`)
+**How it's wired:** in the candidate assembly (now at
+[world.rs:14296](../src/des/general/soccer/world.rs#L14296), where legal `SOCCER_POLICY_ACTIONS` are
+injected), for kick families (pass/shoot/cross) generate a *spread* of `DiscretizedKickAction` variants
+over the speed buckets toward plausible targets, each carrying its Part-A param features. The net ranks
+them; the chosen variant's params are lowered via the existing
+`DiscretizedKickAction::from_power_direction` path. The actor vocabulary has `40` kick-power bucket
+labels and MCTS can add pass/aerial-pass/shot/first-time-shot bucket variants.
+
+**What is actually landed vs still open:** only the *speed* slice is live — direction/curve/elevation
+remain analytic, so the policy's output space does **not** yet fully match the trainable action set.
+The remaining work is to prove the selected buckets change behavior and then add the missing structured
+dimensions:
 
 - direction/aim as a bounded offset around the current target, not a free absolute 36-way choice;
 - curve and elevation as small masked heads;
@@ -74,15 +81,6 @@ behavior and then add the missing structured dimensions:
   plus `scripts/fwd_trace_report.py` now report net-changed-action and selected-bucket
   entropy so proof runs can tell whether the bucket path changes behavior instead of only
   changing labels.
-=======
-### Part B — discretized-kick variant candidates — ✅ IMPLEMENTED (gate `DD_SOCCER_ENABLE_DISCRETIZED_KICK`)
-In the candidate assembly (now at [world.rs:14296](../src/des/general/soccer/world.rs#L14296), where legal
-`SOCCER_POLICY_ACTIONS` are injected), for kick families (pass/shoot/cross) generate a *spread* of
-`DiscretizedKickAction` variants over the speed/direction buckets toward plausible targets, each
-carrying its Part-A param features. The net ranks them; the chosen variant's params are lowered via
-the existing `DiscretizedKickAction::from_power_direction` path. **Now the policy's output space
-matches the trainable action set** — it can express kicks the heuristic scan can't.
->>>>>>> theirs
 
 ### Part C — true policy improvement (break tabular imitation)
 Either (i) bootstrap the value off *its own* successor value (real neural n-step / Q-learning) so it
