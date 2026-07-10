@@ -892,6 +892,10 @@ impl World {
 
 fn integrate(p: &mut Player) {
     p.pos = p.pos.add(p.vel.scale(DT));
+    clamp_pos(p);
+}
+
+fn clamp_pos(p: &mut Player) {
     p.pos.x = p.pos.x.clamp(-1.0, FIELD_L + 1.0);
     p.pos.y = p.pos.y.clamp(0.0, FIELD_W);
 }
