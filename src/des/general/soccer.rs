@@ -37120,9 +37120,14 @@ fn soccer_playback_agent_contract() -> SoccerPlaybackAgentContract {
 }
 
 fn soccer_learning_reward_contract() -> SoccerLearningRewardContract {
+    let goal_scale = goal_reward_scale();
+    let poss_scale = possession_shaping_scale();
     SoccerLearningRewardContract {
-        goal_points: GOAL_REWARD_POINTS,
-        goal_chain_pattern: GOAL_CHAIN_REWARD_PATTERN.to_vec(),
+        goal_points: GOAL_REWARD_POINTS * goal_scale,
+        goal_chain_pattern: GOAL_CHAIN_REWARD_PATTERN
+            .iter()
+            .map(|points| points * goal_scale)
+            .collect(),
         // Shot-taken SHAPING dampener (forward-pass-primacy A/B). Scales only the on-target shot
         // PROXY reward — `goal_points` above is left intact so finishing still pays. Default 1.0.
         shot_on_target_points: SHOT_ON_TARGET_REWARD_POINTS * shot_shaping_reward_scale(),
