@@ -25,11 +25,176 @@ fn main() {
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("train");
     match cmd {
         "sanity" => sanity(),
+        "inspect" => {
+            let seed: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(7);
+            inspect(seed);
+        }
         _ => {
             let iters: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(100);
             run_training(iters);
         }
     }
+}
+
+fn action_name(a: usize) -> &'static str {
+    match a {
+        A_SHOOT => "shoot",
+        A_PASS_A => "pass_a",
+        A_PASS_B => "pass_b",
+        A_DRIB_FWD => "dribble_fwd",
+        A_DRIB_LEFT => "dribble_left",
+        A_DRIB_RIGHT => "dribble_right",
+        A_CLEAR => "clear",
+        A_HOLD => "hold",
+        A_CHASE => "chase",
+        A_SUPPORT => "support",
+        A_SPREAD => "spread",
+        A_MARK => "mark",
+        _ => "stay",
+    }
+}
+
+/// Introspection API: load the trained policy and play one game, emitting the
+/// FULL per-tick state as JSON Lines to out/trace.jsonl (positions, velocities,
+/// possession, each player's chosen action, per-player nearest-teammate /
+/// nearest-opponent distances, closest-pair, bunch flag, events, score) plus a
+/// live per-second console trace and an end-of-game bunching summary.
+///
+///   cargo run --release -- inspect [seed]
+///   # then: jq -c '{t,cp:.closest_pair_a,bunch}' out/trace.jsonl | head
+fn inspect(seed: u64) {
+    let actor = match nn::Mlp::load("out/actor.txt") {
+        Ok(m) => m,
+        Err(_) => {
+            eprintln!("no trained policy found — run `train` first (writes out/actor.txt)");
+            return;
+        }
+    };
+    let policy = train::Policy { actor, critic: nn::Mlp::load("out/critic.txt").unwrap_or_else(|_| nn::Mlp::new(&[OBS_DIM, 64, 64, 1], &mut Rng::new(0))) };
+    let mut rng = Rng::new(seed);
+    let mut w = World::new();
+    fs::create_dir_all("out").ok();
+
+    let mut jsonl = String::new();
+    let mut bunch_ticks = 0u32;
+    let mut sum_closest = 0.0f32;
+    let mut sum_avg = 0.0f32;
+    const BUNCH_THRESH: f32 = 2.5;
+
+    println!("== inspect: greedy game, seed {} ==", seed);
+    println!("{:>4} | {:>7} | own | closest_pair | avg_near | bunch | score", "t", "ball_x");
+
+    for t in 0..STEPS {
+        // choose actions (record them for the trace)
+        let mut act_a = [A_STAY; N];
+        for i in 1..N {
+            let obs = w.observe(Team::A, i);
+            let mask = w.legal_mask(Team::A, i);
+            act_a[i] = policy.act_greedy(&obs, &mask);
+        }
+        let act_b = w.scripted_actions(Team::B);
+        w.step(&act_a, &act_b, &mut rng);
+
+        let closest = w.closest_pair_a();
+        let avg = w.avg_nearest_teammate_a();
+        let bunched = closest < BUNCH_THRESH;
+        if bunched {
+            bunch_ticks += 1;
+        }
+        sum_closest += closest;
+        sum_avg += avg;
+
+        jsonl.push_str(&frame_json(&w, t, &act_a, &act_b, closest, avg, bunched));
+        jsonl.push('\n');
+
+        if t % 10 == 0 {
+            let own = match w.owner {
+                Some(o) if matches!(o.team, Team::A) => "A ",
+                Some(_) => "B ",
+                None => "- ",
+            };
+            println!(
+                "{:>4} | {:>7.1} | {}  | {:>12.1} | {:>8.1} | {:>5} | {}-{}",
+                t, w.ball.x, own, closest, avg, if bunched { "YES" } else { "no" }, w.goals_a, w.goals_b
+            );
+        }
+    }
+
+    fs::write("out/trace.jsonl", &jsonl).ok();
+    let n = STEPS as f32;
+    println!("\n-- bunching summary (Team A outfielders) --");
+    println!("  closest-pair distance: mean {:.1}", sum_closest / n);
+    println!("  avg nearest-teammate:  mean {:.1}", sum_avg / n);
+    println!(
+        "  frames with a pair < {:.1}: {:.0}%  ({}/{})",
+        BUNCH_THRESH,
+        100.0 * bunch_ticks as f32 / n,
+        bunch_ticks,
+        STEPS
+    );
+    println!("  full per-tick trace -> out/trace.jsonl ({} frames)", STEPS);
+}
+
+/// One frame of the introspection trace as a JSON object (hand-rolled).
+fn frame_json(
+    w: &World,
+    t: usize,
+    act_a: &[usize; N],
+    act_b: &[usize; N],
+    closest: f32,
+    avg: f32,
+    bunched: bool,
+) -> String {
+    let (own, oi) = match w.owner {
+        Some(o) if matches!(o.team, Team::A) => (0i32, o.idx as i32),
+        Some(o) => (1i32, o.idx as i32),
+        None => (-1i32, -1i32),
+    };
+    let mut s = String::new();
+    let _ = write!(
+        s,
+        "{{\"t\":{},\"ball\":[{:.2},{:.2}],\"ball_vel\":[{:.2},{:.2}],\"own\":{},\"oi\":{},\"ga\":{},\"gb\":{},\"closest_pair_a\":{:.2},\"avg_near_a\":{:.2},\"bunch\":{},\"players\":[",
+        t, w.ball.x, w.ball.y, w.ball_vel.x, w.ball_vel.y, own, oi, w.goals_a, w.goals_b, closest, avg, bunched
+    );
+    let mut first = true;
+    for (team, code, acts) in [(Team::A, 0i32, act_a), (Team::B, 1i32, act_b)] {
+        for i in 0..N {
+            if !first {
+                s.push(',');
+            }
+            first = false;
+            let p = match team {
+                Team::A => w.a[i],
+                Team::B => w.b[i],
+            };
+            // nearest teammate + nearest opponent (outfielders only for teammate)
+            let team_arr = if code == 0 { &w.a } else { &w.b };
+            let opp_arr = if code == 0 { &w.b } else { &w.a };
+            let mut nt = f32::INFINITY;
+            for j in 0..N {
+                if j != i {
+                    let d = team_arr[j].pos.sub(p.pos).len();
+                    if d < nt {
+                        nt = d;
+                    }
+                }
+            }
+            let mut no = f32::INFINITY;
+            for j in 0..N {
+                let d = opp_arr[j].pos.sub(p.pos).len();
+                if d < no {
+                    no = d;
+                }
+            }
+            let _ = write!(
+                s,
+                "{{\"team\":{},\"idx\":{},\"gk\":{},\"x\":{:.2},\"y\":{:.2},\"vx\":{:.2},\"vy\":{:.2},\"action\":\"{}\",\"near_team\":{:.2},\"near_opp\":{:.2}}}",
+                code, i, i == GK, p.pos.x, p.pos.y, p.vel.x, p.vel.y, action_name(acts[i]), nt, no
+            );
+        }
+    }
+    s.push_str("]}");
+    s
 }
 
 fn sanity() {
