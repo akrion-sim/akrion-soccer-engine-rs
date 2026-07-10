@@ -58,8 +58,10 @@ pub struct Policy {
 impl Policy {
     pub fn new(rng: &mut Rng) -> Self {
         Policy {
+            // decentralized actor (per-agent field vector) + CENTRALIZED critic
+            // (global state) = MAPPO / CTDE.
             actor: Mlp::new(&[OBS_DIM, 64, 64, NA], rng),
-            critic: Mlp::new(&[OBS_DIM, 64, 64, 1], rng),
+            critic: Mlp::new(&[GLOBAL_DIM, 128, 64, 1], rng),
         }
     }
 
