@@ -49009,18 +49009,19 @@ impl WorldSnapshot {
                 let min_threaded_completion = KILLER_PASS_MIN_THREADED_EXPECTED_COMPLETION
                     * near_goal_completion_floor_multiplier;
                 let pass_distance_yards = me_position.distance(scoring_reception);
-                let distance_completion_floor = if !speculative_killer_pass_completion_guard_enabled()
-                    || slip_break.available
-                    || receiver_yards_to_goal <= KILLER_PASS_IMMEDIATE_GOAL_WINDOW_YARDS
-                {
-                    0.0
-                } else if pass_distance_yards >= KILLER_PASS_LONG_DISTANCE_YARDS {
-                    KILLER_PASS_LONG_MIN_COMPLETION
-                } else if pass_distance_yards >= KILLER_PASS_MEDIUM_DISTANCE_YARDS {
-                    KILLER_PASS_MEDIUM_MIN_COMPLETION
-                } else {
-                    0.0
-                };
+                let distance_completion_floor =
+                    if !speculative_killer_pass_completion_guard_enabled()
+                        || slip_break.available
+                        || receiver_yards_to_goal <= KILLER_PASS_IMMEDIATE_GOAL_WINDOW_YARDS
+                    {
+                        0.0
+                    } else if pass_distance_yards >= KILLER_PASS_LONG_DISTANCE_YARDS {
+                        KILLER_PASS_LONG_MIN_COMPLETION
+                    } else if pass_distance_yards >= KILLER_PASS_MEDIUM_DISTANCE_YARDS {
+                        KILLER_PASS_MEDIUM_MIN_COMPLETION
+                    } else {
+                        0.0
+                    };
                 let min_threaded_completion =
                     min_threaded_completion.max(distance_completion_floor);
                 if (quality.expected_completion < min_threaded_completion && !slip_break.available)
