@@ -52,7 +52,7 @@ def main():
         return m if m else default
 
     m_unt = grab(r"untrained-vs-scripted:\s*goal_diff=([-+\d.]+)\s+winrate=([\d.]+)\s+\(A ([\d.]+) / B ([\d.]+)\)")
-    m_fin = grab(r"FINAL \(\d+ games\): goal_diff=([-+\d.]+)\s+winrate=([\d.]+)\s+goals ([\d.]+)-([\d.]+)(?:\s+passes/game ([\d.]+))?(?:\s+spacing=([\d.]+))?")
+    m_fin = grab(r"FINAL \(\d+ games\): goal_diff=([-+\d.]+)\s+winrate=([\d.]+)\s+goals ([\d.]+)-([\d.]+)(?:\s+passes/game ([\d.]+))?(?:\s+spacing=([\d.]+))?(?:\s+bunch=([\d.]+)%)?")
     m_seed = grab(r"display seed \d+: before (\d+)-(\d+)\s+->\s+after (\d+)-(\d+)")
 
     before_diff = float(m_unt.group(1)) if m_unt else curve[0]["diff"]
