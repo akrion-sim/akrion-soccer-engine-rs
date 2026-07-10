@@ -311,7 +311,28 @@ impl World {
 
     /// Fraction of the lane from `from` to `to` clear of outfield opponents
     /// (0..1). The keeper is excluded — it is scored separately in finishing.
-    fn lane_clearness(&self, team: Team, from: V2, to: V2) -> f32 {
+    /// Where a defender at `from` should move to INTERCEPT the ball: simulate the
+    /// ball's future trajectory (with friction) and return the earliest point the
+    /// defender can physically reach — anticipation, so passes get cut out. For a
+    /// slow/owned ball it just returns the ball (go challenge the carrier).
+    pub fn intercept_point(&self, from: V2) -> V2 {
+        if self.ball_vel.len() < 3.0 {
+            return self.ball;
+        }
+        let mut bpos = self.ball;
+        let mut bvel = self.ball_vel;
+        for step in 1..40 {
+            bpos = bpos.add(bvel.scale(DT));
+            bvel = bvel.scale(BALL_FRICTION);
+            let reach = PLAYER_SPEED * (step as f32 * DT) + CONTROL_RADIUS;
+            if from.sub(bpos).len() <= reach {
+                return bpos; // can meet the ball here
+            }
+        }
+        bpos // uncatchable — head to where it ends up
+    }
+
+    pub fn lane_clearness(&self, team: Team, from: V2, to: V2) -> f32 {
         let dir = to.sub(from);
         let dist = dir.len();
         if dist < 1e-3 {
