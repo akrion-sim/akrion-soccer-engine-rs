@@ -233,8 +233,8 @@ impl World {
         let sx = team.sx();
         let mut scored: Vec<(usize, f32)> = Vec::new();
         for i in 0..N {
-            if i == from_idx {
-                continue;
+            if i == from_idx || i == GK {
+                continue; // don't pass to self or (as an outlet) the keeper
             }
             let tp = ps[i].pos;
             let fwd = (tp.x - from.x) * sx; // positive = ahead
