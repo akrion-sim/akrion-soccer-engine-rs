@@ -216,25 +216,32 @@
 
   <section>
     <div class="section-head">
+      <h2>Tracked over training</h2>
+      <span class="note">every metric, per training iteration (to the best checkpoint)</span>
+    </div>
+    <div class="trendgrid">
+      <div class="curvecard"><div class="mini-h">Passes / game</div><canvas id="t_pass"></canvas><div class="legend" id="t_pass_lg"></div></div>
+      <div class="curvecard"><div class="mini-h">Pass completion %</div><canvas id="t_comp"></canvas></div>
+      <div class="curvecard"><div class="mini-h">Pass direction / game</div><canvas id="t_dir"></canvas><div class="legend" id="t_dir_lg"></div></div>
+      <div class="curvecard"><div class="mini-h">Shots / game</div><canvas id="t_shots"></canvas><div class="legend" id="t_shots_lg"></div></div>
+      <div class="curvecard"><div class="mini-h">Shot conversion %</div><canvas id="t_conv"></canvas></div>
+      <div class="curvecard"><div class="mini-h">Possession % & bunch %</div><canvas id="t_poss"></canvas><div class="legend" id="t_poss_lg"></div></div>
+      <div class="curvecard"><div class="mini-h">Winrate %</div><canvas id="t_wr"></canvas></div>
+      <div class="curvecard"><div class="mini-h">Turnovers & balls won / game</div><canvas id="t_tovwon"></canvas><div class="legend" id="t_tovwon_lg"></div></div>
+      <div class="curvecard"><div class="mini-h">Teammate spacing (units)</div><canvas id="t_spacing"></canvas></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
       <h2>Match analytics</h2>
       <span class="note">trained model, 300-game average</span>
     </div>
     <div class="statgrid" id="statgrid"></div>
-    <div class="analytics2">
-      <div class="curvecard">
-        <div class="mini-h">Pass mix</div>
-        <div class="passbar" id="passbar"></div>
-        <div class="legend" id="passbar-legend"></div>
-      </div>
-      <div class="curvecard">
-        <div class="mini-h">Rates over training</div>
-        <canvas id="rates"></canvas>
-        <div class="legend">
-          <span class="sw"><i style="background:var(--accent)"></i>pass completion %</span>
-          <span class="sw"><i style="background:var(--good)"></i>shot conversion %</span>
-          <span class="sw"><i style="background:var(--ink-dim)"></i>possession %</span>
-        </div>
-      </div>
+    <div class="curvecard">
+      <div class="mini-h">Pass mix (trained model)</div>
+      <div class="passbar" id="passbar"></div>
+      <div class="legend" id="passbar-legend"></div>
     </div>
   </section>
 
