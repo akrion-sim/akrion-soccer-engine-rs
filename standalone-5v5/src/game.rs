@@ -161,6 +161,7 @@ impl World {
             ev_turnover_a: false,
             ev_shot_on_a: false,
             pending_pass: None,
+            intended_receiver: None,
         };
         w.kickoff(Team::A);
         w
