@@ -11171,13 +11171,13 @@ fn neural_mcts_pitch_value_candidate_bonus(
     {
         return 0.0;
     }
-    let before = expected_threat(
+    let before = threat_at(
         transition.team,
         current,
         snapshot.field_width,
         snapshot.field_length,
     );
-    let after = expected_threat(
+    let after = threat_at(
         transition.team,
         target,
         snapshot.field_width,
@@ -11197,7 +11197,7 @@ fn neural_mcts_pitch_value_candidate_bonus(
     };
     let counter_weight = neural_mcts_pitch_value_counter_weight();
     let counter_exposure = neural_mcts_counter_exposure(snapshot, transition.team, target);
-    let opponent_threat = expected_threat(
+    let opponent_threat = threat_at(
         transition.team.other(),
         target,
         snapshot.field_width,
@@ -11663,6 +11663,257 @@ fn movement_gait_for_physical_speed(
         committed
     };
     movement_gait_for_physical_tier(template, tier)
+}
+
+/// Result of one rollout arm in the Rollout PoC harness (see
+/// `docs/rollout-poc-harness-spec.md`). Additive / inert - nothing in the live
+/// engine reads it; it exists so the separate-crate driver bin can evaluate arms
+/// through `pub` methods (the rollout/pending internals are `pub(crate)`).
+#[derive(Clone, Debug, Default)]
+pub struct PocArmResult {
+    /// EPV-aware leaf value: `expected_threat(end) + 0.30*retained - 0.60*turnover`.
+    pub leaf: f64,
+    /// expected_threat at the ball's ending position (carrier team's perspective).
+    pub epv_end: f64,
+    /// Carrier's team controls the ball at the end of the roll.
+    pub possession_retained: bool,
+    /// The OTHER team controls the ball at the end of the roll.
+    pub turnover: bool,
+    /// Carrier team's completed_forward_pass count gained over the roll (diagnostic).
+    pub completed_fwd_delta: i64,
+    /// Ticks actually simulated before the event-aligned stop / horizon cap.
+    pub ticks_run: u32,
+    /// Whether the forced action actually reached the carrier (guards silent no-ops):
+    /// true iff a forced action was queued AND was consumed by the carrier's decision.
+    pub forced_action_fired: bool,
+}
+
+impl SoccerMatch {
+    /// The on-ball ball carrier if it's a FIELD player (not a keeper), else None.
+    /// (Rollout PoC harness - see `docs/rollout-poc-harness-spec.md`.)
+    pub fn poc_on_ball_field_carrier(&self) -> Option<usize> {
+        let id = self.ball.holder?;
+        let p = self.players.iter().find(|p| p.id == id)?;
+        if p.role == PlayerRole::Goalkeeper {
+            None
+        } else {
+            Some(id)
+        }
+    }
+
+    /// expected_threat at the ball's CURRENT position for `carrier`'s team (the
+    /// pre-roll EPV baseline the driver uses to classify "nat already forward").
+    pub fn poc_epv_now(&self, carrier: usize) -> Option<f64> {
+        let team = self.players.iter().find(|p| p.id == carrier)?.team;
+        Some(crate::des::general::soccer::pitch_value::expected_threat(
+            team,
+            self.ball.position,
+            self.config.field_width_yards,
+            self.config.field_length_yards,
+        ))
+    }
+
+    /// The +/- y sign that INCREASES expected_threat for `carrier`'s team at the
+    /// carrier's position (the attacking / "forward" direction along the goal-to-goal
+    /// axis). Derived by probing et a few yards either way in y, so it stays
+    /// self-consistent with the leaf's EPV rather than assuming an orientation.
+    pub fn poc_carrier_forward_ysign(&self, carrier: usize) -> Option<f64> {
+        let p = self.players.iter().find(|p| p.id == carrier)?;
+        let team = p.team;
+        let pos = p.position;
+        let fw = self.config.field_width_yards;
+        let fl = self.config.field_length_yards;
+        let et = |y: f64| {
+            crate::des::general::soccer::pitch_value::expected_threat(
+                team,
+                Vec2::new(pos.x, y),
+                fw,
+                fl,
+            )
+        };
+        let probe = 5.0;
+        Some(if et(pos.y + probe) >= et(pos.y - probe) {
+            1.0
+        } else {
+            -1.0
+        })
+    }
+
+    /// A forward dribble target `yards` up-field (in the et-increasing y direction)
+    /// from the carrier's position. Feeds the driver's dribble arm.
+    pub fn poc_dribble_forward_target(&self, carrier: usize, yards: f64) -> Option<Vec2> {
+        let pos = self.players.iter().find(|p| p.id == carrier)?.position;
+        let sign = self.poc_carrier_forward_ysign(carrier)?;
+        Some(Vec2::new(pos.x, pos.y + sign * yards))
+    }
+
+    /// Up to `k` forward, open teammate positions for `carrier`, ranked by
+    /// expected_threat desc. "forward" = et strictly higher than the carrier's own
+    /// cell (+ `MARGIN`); "open" = nearest opponent farther than `open_yds`.
+    pub fn poc_forward_pass_targets(&self, carrier: usize, k: usize, open_yds: f64) -> Vec<Vec2> {
+        const MARGIN: f64 = 0.05;
+        let carrier_p = match self.players.iter().find(|p| p.id == carrier) {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
+        let team = carrier_p.team;
+        let fw = self.config.field_width_yards;
+        let fl = self.config.field_length_yards;
+        let et =
+            |p: Vec2| crate::des::general::soccer::pitch_value::expected_threat(team, p, fw, fl);
+        let carrier_et = et(carrier_p.position);
+        let mut candidates: Vec<(f64, Vec2)> = Vec::new();
+        for tm in self.players.iter() {
+            if tm.team != team || tm.id == carrier || tm.role == PlayerRole::Goalkeeper {
+                continue;
+            }
+            let tm_et = et(tm.position);
+            if tm_et <= carrier_et + MARGIN {
+                continue;
+            }
+            let mut nearest_opp = f64::INFINITY;
+            for opp in self.players.iter() {
+                if opp.team == team.other() {
+                    let d = opp.position.distance(tm.position);
+                    if d < nearest_opp {
+                        nearest_opp = d;
+                    }
+                }
+            }
+            if nearest_opp <= open_yds {
+                continue;
+            }
+            candidates.push((tm_et, tm.position));
+        }
+        candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.into_iter().take(k).map(|(_, p)| p).collect()
+    }
+
+    /// True iff a pass / shot / rebound is currently in flight or otherwise
+    /// unresolved (encapsulates the `pub(crate)` pending fields for the driver).
+    pub fn poc_has_pending_ball_event(&self) -> bool {
+        self.pending_pass.is_some() || self.pending_shot.is_some() || self.pending_rebound.is_some()
+    }
+
+    /// Queue a forced action on `player_id`'s next decision inside a rollout fork.
+    /// (Sets the `pub(crate)` rollout hook; consumed on the carrier's next decision.)
+    pub fn set_rollout_forced_action(
+        &mut self,
+        player_id: usize,
+        action: String,
+        target: Option<Vec2>,
+    ) {
+        self.rollout_forced_action = Some((player_id, action, target));
+    }
+
+    /// If a pass launched by `carrier` is currently pending, return its intended
+    /// target POINT (reads the `pub(crate)` `pending_pass` for the driver).
+    pub fn poc_pending_pass_target_for(&self, carrier: usize) -> Option<Vec2> {
+        let pass = self.pending_pass.as_ref()?;
+        if pass.from == carrier {
+            Some(pass.intended_target)
+        } else {
+            None
+        }
+    }
+
+    /// PARITY control (gating): fork, run ONE natural tick, and if the carrier
+    /// launched a pass on that tick return its target point - so the driver can
+    /// force ("pass", that_target) from the same pre-state/seed and confirm the
+    /// injection reproduces natural within CRN noise. `None` => the carrier did not
+    /// pass on the first tick (parity is only defined when its first act is a pass).
+    pub fn poc_natural_pass_target(&self, carrier: usize, seed: u64) -> Option<Vec2> {
+        let mut w = self.fork_for_rollout(seed);
+        w.run_time_step();
+        w.poc_pending_pass_target_for(carrier)
+    }
+
+    /// One rollout arm: fork -> (optionally force `(action, target)` on the carrier's
+    /// next decision) -> roll under the analytic base until the play's immediate
+    /// outcome settles (event-aligned) or `max_h` ticks -> return the EPV-aware leaf.
+    /// `forced == None` = the NATURAL arm (analytic plays its own pick).
+    pub fn poc_rollout_arm(
+        &self,
+        carrier: usize,
+        forced: Option<(String, Option<Vec2>)>,
+        seed: u64,
+        max_h: u32,
+    ) -> PocArmResult {
+        const POSSESSION_BONUS: f64 = 0.30;
+        const TURNOVER_PENALTY: f64 = 0.60;
+        let mut w = self.fork_for_rollout(seed);
+        let team = match self
+            .players
+            .iter()
+            .find(|p| p.id == carrier)
+            .map(|p| p.team)
+        {
+            Some(t) => t,
+            None => return PocArmResult::default(),
+        };
+        let field_w = self.config.field_width_yards;
+        let field_l = self.config.field_length_yards;
+        let fwd_count = |m: &SoccerMatch| -> u32 {
+            match team {
+                Team::Home => m.stats.passes_completed_forward_home,
+                Team::Away => m.stats.passes_completed_forward_away,
+            }
+        };
+        let fwd0 = fwd_count(&w);
+        let forced_was_set = forced.is_some();
+        if let Some((action, target)) = forced {
+            w.set_rollout_forced_action(carrier, action, target);
+        }
+        let mut had_pending = false;
+        let mut ticks = 0u32;
+        loop {
+            let pending_before = w.poc_has_pending_ball_event();
+            w.run_time_step();
+            ticks += 1;
+            if pending_before {
+                had_pending = true;
+            }
+            let holder_team = w
+                .ball
+                .holder
+                .and_then(|h| w.players.iter().find(|p| p.id == h).map(|p| p.team));
+            // Turnover: the OTHER team now controls the ball.
+            let settled_other = holder_team == Some(team.other());
+            // A pass/shot that went in flight during the roll has resolved to a holder.
+            let resolved =
+                had_pending && !w.poc_has_pending_ball_event() && w.ball.holder.is_some();
+            if settled_other || resolved || ticks >= max_h {
+                break;
+            }
+        }
+        let epv_end = crate::des::general::soccer::pitch_value::expected_threat(
+            team,
+            w.ball.position,
+            field_w,
+            field_l,
+        );
+        let holder_team_end = w
+            .ball
+            .holder
+            .and_then(|h| w.players.iter().find(|p| p.id == h).map(|p| p.team));
+        let possession_retained = holder_team_end == Some(team);
+        let turnover = holder_team_end == Some(team.other());
+        let fwd1 = fwd_count(&w);
+        let leaf = epv_end + POSSESSION_BONUS * (possession_retained as i32 as f64)
+            - TURNOVER_PENALTY * (turnover as i32 as f64);
+        // The forced action fired iff we queued one and it was consumed by the
+        // carrier's decision (fork zeroes the hook; it only clears on consumption).
+        let forced_action_fired = forced_was_set && w.rollout_forced_action.is_none();
+        PocArmResult {
+            leaf,
+            epv_end,
+            possession_retained,
+            turnover,
+            completed_fwd_delta: fwd1 as i64 - fwd0 as i64,
+            ticks_run: ticks,
+            forced_action_fired,
+        }
+    }
 }
 
 impl SoccerMatch {
@@ -30586,12 +30837,12 @@ impl SoccerMatch {
         );
         let gain = match self.controlled_possession_team_now() {
             Some(team) if team == player.team => {
-                expected_threat(player.team, target, field_width, field_length)
-                    - expected_threat(player.team, current, field_width, field_length)
+                threat_at(player.team, target, field_width, field_length)
+                    - threat_at(player.team, current, field_width, field_length)
             }
             Some(team) => {
-                expected_threat(team, current, field_width, field_length)
-                    - expected_threat(team, target, field_width, field_length)
+                threat_at(team, current, field_width, field_length)
+                    - threat_at(team, target, field_width, field_length)
             }
             None => 0.0,
         };
@@ -30613,7 +30864,7 @@ impl SoccerMatch {
             self.config.field_width_yards,
             self.config.field_length_yards,
         );
-        let base_value = expected_threat(player.team, target, field_width, field_length);
+        let base_value = threat_at(player.team, target, field_width, field_length);
         let attack = Vec2::new(0.0, player.team.attack_dir());
         let lateral_home = (player.home_position.x - target.x).clamp(
             -MPC_PITCH_VALUE_REFERENCE_PROBE_YARDS,
@@ -30641,7 +30892,7 @@ impl SoccerMatch {
         for probe in probes {
             let candidate = probe.clamp_to_pitch(field_width, field_length);
             let value_gain =
-                expected_threat(player.team, candidate, field_width, field_length) - base_value;
+                threat_at(player.team, candidate, field_width, field_length) - base_value;
             if value_gain <= MPC_PITCH_VALUE_REFERENCE_MIN_GAIN {
                 continue;
             }
@@ -51228,8 +51479,8 @@ impl WorldSnapshot {
         let space = (self.space_score_at(target, player.team) / 18.0).clamp(0.0, 1.0);
         let shape = self.movement_target_shape_score(player, target);
         let pitch_value_gain =
-            (expected_threat(player.team, target, self.field_width, self.field_length)
-                - expected_threat(player.team, current, self.field_width, self.field_length))
+            (threat_at(player.team, target, self.field_width, self.field_length)
+                - threat_at(player.team, current, self.field_width, self.field_length))
             .clamp(-0.25, 0.55);
         let holder_visibility = self
             .ball

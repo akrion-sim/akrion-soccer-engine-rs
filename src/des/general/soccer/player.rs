@@ -1463,6 +1463,71 @@ fn soccer_pressured_contested_pass_damp_enabled() -> bool {
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_PRESSURED_PASS_DAMP").is_err())
 }
 
+fn pass_completion_primary_score_weight() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_PASS_COMPLETION_SCORE_WEIGHT")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|value| value.is_finite())
+            .unwrap_or(0.0)
+            .clamp(0.0, 3.0)
+    })
+}
+
+fn pass_completion_primary_multiplier(completion: f64, weight: f64) -> f64 {
+    if weight <= 1e-9 {
+        return 1.0;
+    }
+    let completion = completion.clamp(0.0, 1.0);
+    (1.0 + (completion - 0.72) * weight).clamp(0.25, 1.35)
+}
+
+fn apply_pass_completion_primary_scores(
+    options: &mut [AgentActionOptionTrace],
+    observation: &SoccerPomdpObservation,
+) {
+    let weight = pass_completion_primary_score_weight();
+    if weight <= 1e-9 {
+        return;
+    }
+    let floor_multiplier =
+        pass_completion_primary_multiplier(observation.expected_pass_completion, weight);
+    let aerial_multiplier = pass_completion_primary_multiplier(
+        observation
+            .expected_aerial_pass_completion
+            .max(observation.expected_pass_completion * 0.72),
+        weight,
+    );
+    let killer_multiplier = pass_completion_primary_multiplier(
+        observation
+            .threaded_goal_pass_expected_completion
+            .max(observation.expected_pass_completion),
+        weight * 0.65,
+    );
+    for option in options.iter_mut().filter(|option| option.legal) {
+        let label = normalize_soccer_action_label(&option.label);
+        let multiplier = if label == "pass"
+            || matches!(
+                option.label.as_str(),
+                "recycle-reset" | "switch-play" | "surprise-pass" | "wall-pass"
+            ) {
+            floor_multiplier
+        } else if matches!(
+            option.label.as_str(),
+            "route-one" | "flank-high-cross" | "scoop-pass" | "flick-on"
+        ) {
+            aerial_multiplier
+        } else if matches!(option.label.as_str(), "killer-pass" | "flank-low-cross") {
+            killer_multiplier.max(floor_multiplier * 0.82)
+        } else {
+            continue;
+        };
+        option.score *= multiplier;
+    }
+}
+
 fn mpc_reselect_candidate_label(label: &str) -> bool {
     matches!(
         label,
@@ -6577,6 +6642,7 @@ impl PlayerAgent {
                 runway_floor,
             );
         }
+        apply_pass_completion_primary_scores(&mut options, observation);
         let mut options = normalize_action_options(options);
         annotate_tick_probabilities_from_scores(&mut options, dt_seconds);
         options
