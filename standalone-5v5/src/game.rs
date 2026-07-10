@@ -155,6 +155,7 @@ pub struct World {
     pass_kick_x: f32,            // ball x when Team A last released a pass
     pub last_pass_gain_a: f32,   // forward metres gained by the last completed A pass
     pub pass_streak_a: u32,      // completed A passes in the current possession (2-pass rule)
+    a_shot_flag: bool,           // the current free ball came from a Team-A shot (gates goals)
 }
 
 fn players(team: Team, w: &World) -> &[Player; N] {
