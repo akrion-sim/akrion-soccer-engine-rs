@@ -252,6 +252,7 @@ impl World {
         self.lp_to = -1;
         self.pending_passer = -1;
         self.return_streak_a = 0;
+        self.return_start_x = 0.0;
     }
 
     fn player(&self, o: Owner) -> Player {
