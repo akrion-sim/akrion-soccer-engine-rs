@@ -111,33 +111,33 @@ fn run_training(iters: usize) {
         println!(">>> The learned policy BEATS the scripted analytic baseline. <<<");
     }
 
-    // Pick a display seed: untrained should lose, trained should win clearly,
-    // both under the same seed so the ONLY difference is the learned policy.
+    // Pick a display seed that showcases GOOD PLAY, not a blowout: the trained
+    // side should win by a sensible margin while dominating possession and
+    // stringing passes; the untrained side (same seed) should be clearly worse.
     let mut best_seed = 1u64;
     let mut best_score = f32::NEG_INFINITY;
-    for s in 1..=80u64 {
-        let (bga, bgb) = game_score(&untrained, s);
-        let (aga, agb) = game_score(&policy, s);
+    for s in 1..=120u64 {
+        let (bga, bgb, ba_poss, _) = game_stats(&untrained, s);
+        let (aga, agb, aa_poss, a_pass) = game_stats(&policy, s);
         let before_m = bga as f32 - bgb as f32;
         let after_m = aga as f32 - agb as f32;
-        // reward a big swing, strongly prefer before<=0 and after>=2
-        let mut score = after_m - before_m;
-        if before_m <= 0.0 {
-            score += 2.0;
+        // hard filter: trained wins by 1..=4, untrained doesn't win
+        if before_m > 0.0 || after_m < 1.0 || after_m > 4.0 {
+            continue;
         }
-        if after_m >= 2.0 {
-            score += 2.0;
-        }
+        // reward possession dominance + completed passes + possession swing
+        let score = aa_poss as f32 * 0.02 + a_pass as f32 * 0.4
+            + (aa_poss as f32 - ba_poss as f32) * 0.01;
         if score > best_score {
             best_score = score;
             best_seed = s;
         }
     }
-    let (bga, bgb) = game_score(&untrained, best_seed);
-    let (aga, agb) = game_score(&policy, best_seed);
+    let (bga, bgb, bposs, _) = game_stats(&untrained, best_seed);
+    let (aga, agb, aposs, apass) = game_stats(&policy, best_seed);
     println!(
-        "display seed {}: before {}-{}  ->  after {}-{}",
-        best_seed, bga, bgb, aga, agb
+        "display seed {}: before {}-{} (poss {})  ->  after {}-{} (poss {}, passes {})",
+        best_seed, bga, bgb, bposs, aga, agb, aposs, apass
     );
     record_match(&untrained, &mut Rng::new(best_seed), "out/match_before.json");
     record_match(&policy, &mut Rng::new(best_seed), "out/match_after.json");
