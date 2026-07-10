@@ -57,8 +57,8 @@ fn run_training(iters: usize) {
         svs, sga, sgb
     );
     println!(
-        "untrained-vs-scripted:  goal_diff={:+.2}  winrate={:.2}  (A {:.2} / B {:.2})",
-        d0, w0, ga0, gb0
+        "untrained-vs-scripted:  goal_diff={:+.2}  winrate={:.2}  (A {:.2} / B {:.2})  spacing={:.1}",
+        d0, w0, ga0, gb0, sp0
     );
     println!("training for {} iterations (8 games/iter)...\n", iters);
 
