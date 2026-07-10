@@ -242,6 +242,8 @@ struct AdvancementRecord {
     opponent_forward_passes: u32,
     candidate_completed_passes: u32,
     opponent_completed_passes: u32,
+    candidate_attempted_passes: u32,
+    opponent_attempted_passes: u32,
     candidate_turnovers: u32,
     opponent_turnovers: u32,
     candidate_pass_gain_yards: f64,
