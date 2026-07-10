@@ -324,7 +324,7 @@ pub fn ent_beta_at(iter: usize, total: usize) -> f32 {
 /// Evaluate greedy policy vs scripted over `games`. Returns
 /// (avg_goal_diff, win_rate, avg_goals_a, avg_goals_b, avg_completed_passes_a,
 ///  avg_nearest_teammate_dist_during_A_possession).
-pub fn evaluate(policy: &Policy, games: usize, rng: &mut Rng) -> (f32, f32, f32, f32, f32, f32) {
+pub fn evaluate(policy: &Policy, games: usize, rng: &mut Rng) -> (f32, f32, f32, f32, f32, f32, f32) {
     let mut diff = 0.0f32;
     let mut wins = 0.0f32;
     let mut ga = 0.0f32;
@@ -332,6 +332,7 @@ pub fn evaluate(policy: &Policy, games: usize, rng: &mut Rng) -> (f32, f32, f32,
     let mut passes = 0.0f32;
     let mut space_sum = 0.0f32;
     let mut space_ticks = 0.0f32;
+    let mut bunch_ticks = 0.0f32;
     for _ in 0..games {
         let mut w = World::new();
         if rng.f01() < 0.5 {
