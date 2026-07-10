@@ -125,7 +125,13 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
         if w.ev_turnover_a {
             r -= 0.25;
         }
+        // shot reward scaled by MPC-finish placement quality: rewards taking a
+        // shot when a good corner exists AND placing it well.
         if w.ev_shot_on_a {
+            r += 0.15 + 0.5 * w.last_shot_quality_a;
+        }
+        // reward winning the ball back (pressing / interceptions / tackles)
+        if w.ev_win_ball_a {
             r += 0.3;
         }
         // teammate spacing: spread out to open passing lanes (see spacing_term_a)
