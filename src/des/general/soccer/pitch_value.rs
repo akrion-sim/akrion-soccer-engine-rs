@@ -142,6 +142,17 @@ fn forward_fraction(team: Team, p: Vec2, field_length: f64) -> f64 {
 /// oriented to that team's attacking direction. Bounded to roughly `[0, 1.8]`;
 /// only relative values matter (the reward uses differences).
 pub fn expected_threat(team: Team, p: Vec2, field_width: f64, field_length: f64) -> f64 {
+    // Move 1a (Anchor-3 cut): when DD_SOCCER_ENABLE_LEARNED_EPV_POTENTIAL is on, the PBRS potential
+    // becomes the OUTCOME-GROUNDED learned EPV (rescaled to the closed-form range) instead of the
+    // hand-built xT seed. Advancing into a historically-converting cell is then worth more than sterile
+    // territory, and the potential no longer telescopes to ~zero over an unconverted possession —
+    // directly attacking "territory without conversion". Falls back to the closed-form seed when the
+    // gate is off or no grid is loaded.
+    if dd_soccer_enable_learned_epv_potential() {
+        if let Some(epv) = learned_epv_raw(team, p, field_width, field_length) {
+            return (epv - LEARNED_EPV_POTENTIAL_MIN) * learned_epv_potential_scale();
+        }
+    }
     let fwd = forward_fraction(team, p, field_length);
     let territorial = fwd.powf(EXPECTED_THREAT_FORWARD_EXPONENT);
     // Central-ness in [0,1]: 1 on the spine of the pitch, 0 at the touchline.
@@ -185,6 +196,41 @@ pub(crate) fn dd_soccer_enable_learned_epv() -> bool {
     })
 }
 
+/// Move 1a gate: use the learned EPV grid as the PBRS territorial POTENTIAL (`expected_threat`),
+/// replacing the hand-built xT seed. Independent of the per-pass `DD_SOCCER_ENABLE_LEARNED_EPV` bonus.
+pub(crate) fn dd_soccer_enable_learned_epv_potential() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        matches!(
+            std::env::var("DD_SOCCER_ENABLE_LEARNED_EPV_POTENTIAL")
+                .ok()
+                .as_deref()
+                .map(str::trim),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    })
+}
+
+/// Grid floor (own-half / high-turnover cells) — shift the learned EPV by this so the resulting
+/// potential is >= 0 and on a scale comparable to the closed-form `expected_threat` ([0, ~1.8]).
+const LEARNED_EPV_POTENTIAL_MIN: f64 = -0.15;
+
+/// Scale mapping learned-EPV units (~[-0.15, 0.20]) to the closed-form potential range. Default 5.0
+/// gives ~[0, 1.75]. Env `DD_SOCCER_LEARNED_EPV_POTENTIAL_SCALE`.
+fn learned_epv_potential_scale() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_LEARNED_EPV_POTENTIAL_SCALE")
+            .ok()
+            .and_then(|r| r.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(5.0)
+            .clamp(0.1, 100.0)
+    })
+}
+
 fn learned_epv_grid() -> Option<&'static LearnedEpvGrid> {
     use std::sync::OnceLock;
     static GRID: OnceLock<Option<LearnedEpvGrid>> = OnceLock::new();
@@ -206,6 +252,12 @@ pub(crate) fn learned_epv(team: Team, p: Vec2, field_width: f64, field_length: f
     if !dd_soccer_enable_learned_epv() {
         return None;
     }
+    learned_epv_raw(team, p, field_width, field_length)
+}
+
+/// Raw fitted-EPV grid lookup with NO gate — the caller applies its own gate (per-pass bonus vs the
+/// PBRS potential). `None` if no grid is loaded.
+fn learned_epv_raw(team: Team, p: Vec2, field_width: f64, field_length: f64) -> Option<f64> {
     let g = learned_epv_grid()?;
     let fwd = forward_fraction(team, p, field_length); // 0 = own goal .. 1 = opponent goal
     let lat = if field_width > 0.0 && field_width.is_finite() && p.x.is_finite() {
