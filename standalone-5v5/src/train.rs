@@ -176,6 +176,11 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
         }
         // PER-PLAYER teammate spacing (all phases): each outfielder is rewarded
         // for its OWN nearest-teammate distance, so bunching is directly credited.
+        // TEAM SYNC (MARL coordination): each outfielder is also rewarded for being
+        // FORWARD when we have the ball and DROPPED BACK when the opponent does —
+        // all four share the possession signal, so they shift up/down as a unit.
+        let a_owns = matches!(w.owner, Some(o) if matches!(o.team, Team::A));
+        let b_owns = matches!(w.owner, Some(o) if matches!(o.team, Team::B));
         let mut sp_t = [0.0f32; N];
         for i in 1..N {
             let mut nd = f32::INFINITY;
@@ -190,6 +195,16 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
             if nd.is_finite() {
                 sp_t[i] = w_spacing_coeff * spacing_reward(nd);
             }
+            // possession-synced vertical position (attack frame: +x = upfield)
+            let x_att = (w.a[i].pos.x / FIELD_L).clamp(0.0, 1.0);
+            let sync = if a_owns {
+                x_att - 0.5 // push up to attack
+            } else if b_owns {
+                0.5 - x_att // drop back to defend
+            } else {
+                0.0
+            };
+            sp_t[i] += W_SYNC * sync;
         }
 
         obs_buf.push(obs_t);
