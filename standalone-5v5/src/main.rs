@@ -423,8 +423,8 @@ fn record_match(policy: &train::Policy, rng: &mut Rng, path: &str) {
     frames.push(']');
 
     let meta = format!(
-        "{{\"field\":[{},{}],\"goal_half\":{},\"n\":{},\"frames\":{}}}",
-        FIELD_L, FIELD_W, GOAL_HALF, N, frames
+        "{{\"field\":[{},{}],\"goal_half\":{},\"n\":{},\"hz\":{},\"frames\":{}}}",
+        FIELD_L, FIELD_W, GOAL_HALF, N, HZ, frames
     );
     fs::write(path, meta).ok();
 }
