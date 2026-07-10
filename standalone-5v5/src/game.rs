@@ -407,7 +407,7 @@ impl World {
         });
 
         let mut f: Vec<f32> = Vec::with_capacity(OBS_DIM);
-        // self / global (8)
+        // self / global (9)
         f.push(has_ball as u8 as f32);
         f.push(team_ball as u8 as f32);
         f.push(opp_ball as u8 as f32);
@@ -416,6 +416,8 @@ impl World {
         f.push(mp.y / ny * 2.0 - 1.0);
         f.push(mvel.x / nv);
         f.push(mvel.y / nv);
+        // 2-pass rule state: how many passes made (0, 0.5, 1.0 = can shoot)
+        f.push((self.pass_streak_a.min(2) as f32) / 2.0);
         // ball (5)
         f.push(ball_rel.x / nx);
         f.push(ball_rel.y / ny);
