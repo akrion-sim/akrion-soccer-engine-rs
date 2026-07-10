@@ -111,6 +111,10 @@ fn run_training(iters: usize) {
 
     fs::write("out/learning_curve.csv", &csv).ok();
     println!("\nwrote out/learning_curve.csv");
+    println!("best policy at iter {} (eval goal_diff {:+.3})", best_iter, best_diff);
+
+    // Everything below showcases the BEST snapshot, not the collapsed final.
+    let policy = best_policy;
 
     // Final richer evaluation.
     let (d, wr, ga, gb) = train::evaluate(&policy, 300, &mut rng);
