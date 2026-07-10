@@ -96,11 +96,8 @@ fn run_training(iters: usize) {
             // (d > 0.2), add a passing bonus plus a strong spacing bonus so the
             // chosen model actually spaces its teammates (toward the 5-8 target).
             let quality = d
-                + if d > 0.2 {
-                    (passes * 0.01).min(0.4) + sp.min(7.0) * 0.15
-                } else {
-                    0.0
-                };
+                + if d > 0.2 { (passes * 0.01).min(0.4) } else { 0.0 }
+                + if d > 0.4 { (sp.clamp(0.0, 6.0) - 3.0) * 0.12 } else { 0.0 };
             if quality > best_diff {
                 best_diff = quality;
                 best_policy = policy.clone();
