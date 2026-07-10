@@ -67,7 +67,7 @@ fn run_training(iters: usize) {
     let _ = writeln!(csv, "0,{:.4},{:.4},{:.4},{:.4},,,", d0, w0, ga0, gb0);
 
     let games_per_iter = 8;
-    let eval_every = 10;
+    let eval_every = 5;
 
     println!(
         "{:>5} | {:>10} | {:>8} | {:>6} {:>6} | {:>7} | {:>9}",
