@@ -439,6 +439,12 @@ impl World {
             1.0 / (1.0 + nopp_d),
             shot_clear,
             shot_dist / nx,
+            // nearest-teammate perception (for learning to space out)
+            nt_rel.x / nx,
+            nt_rel.y / ny,
+            nt_dist / nx,
+            nt_pressure,
+            crowd_frac,
             1.0, // bias
         ];
         f
