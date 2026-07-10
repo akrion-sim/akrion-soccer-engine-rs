@@ -258,6 +258,35 @@ impl World {
         out
     }
 
+    /// Fraction of the lane from `from` to `to` clear of outfield opponents
+    /// (0..1). The keeper is excluded — it is scored separately in finishing.
+    fn lane_clearness(&self, team: Team, from: V2, to: V2) -> f32 {
+        let dir = to.sub(from);
+        let dist = dir.len();
+        if dist < 1e-3 {
+            return 0.0;
+        }
+        let u = dir.unit();
+        let opp = players(team.other(), self);
+        let mut min_clear = 1.0f32;
+        for i in 0..N {
+            if i == GK {
+                continue;
+            }
+            let rel = opp[i].pos.sub(from);
+            let t = rel.x * u.x + rel.y * u.y;
+            if t <= 0.5 || t >= dist {
+                continue;
+            }
+            let perp = (rel.x * (-u.y) + rel.y * u.x).abs();
+            let clear = (perp / 3.0).min(1.0);
+            if clear < min_clear {
+                min_clear = clear;
+            }
+        }
+        min_clear
+    }
+
     /// Fraction of the shot lane to goal that is clear of opponents (0..1).
     fn shot_clearness(&self, team: Team, from: V2) -> f32 {
         let goal = team.target_goal();
