@@ -138,6 +138,14 @@ fn env_f64(name: &str) -> f64 {
         .unwrap_or(0.0)
 }
 
+fn env_f64_or(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(default)
+}
+
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -208,13 +216,17 @@ fn main() {
     );
     println!(
         "gates: dp_critic_target={} dp_bootstrap={} learned_epv={} learned_pass_completion={} \
-         deferred_pass_credit={} neural_mcts={} league_neural_mcts={} xt_terminal_cost={} \
-         mpc_pass={} pass_completion_score_weight={:.2} pass_turnover_penalty_scale={:.2} \
+         learned_pass_receiver={} learned_pass_receiver_strict={} neural_pass_space={} \
+         deferred_pass_credit={} neural_mcts={} league_neural_mcts={} xt_terminal_cost={} mpc_pass={} \
+         pass_completion_score_weight={:.2} pass_turnover_penalty_scale={:.2} \
          pass_target_completion_primary_scale={:.2} learned_curve={} mpc_objective_epochs={}",
         env_on("DD_SOCCER_ENABLE_DP_CRITIC_TARGET"),
         env_on("DD_SOCCER_ENABLE_DP_BOOTSTRAP"),
         env_on("DD_SOCCER_ENABLE_LEARNED_EPV"),
         env_on("DD_SOCCER_ENABLE_LEARNED_PASS_COMPLETION"),
+        env_on("DD_SOCCER_ENABLE_LEARNED_PASS_RECEIVER"),
+        env_on("DD_SOCCER_ENABLE_LEARNED_PASS_RECEIVER_STRICT_FALLBACK"),
+        env_on("DD_SOCCER_ENABLE_NEURAL_PASS_SPACE"),
         env_on("DD_SOCCER_ENABLE_DEFERRED_PASS_CREDIT"),
         env_on("SOCCER_NEURAL_MCTS_ENABLED"),
         env_on("SOCCER_LEAGUE_NEURAL_MCTS_ENABLED"),
@@ -225,6 +237,14 @@ fn main() {
         env_f64("DD_SOCCER_PASS_TARGET_COMPLETION_PRIMARY_SCALE"),
         env_on("DD_SOCCER_ENABLE_LEARNED_CURVE"),
         env_usize("DD_SOCCER_MPC_OBJECTIVE_EPOCHS", 4),
+    );
+    println!(
+        "knobs: learned_receiver_min_net_forward_quality={:.2} \
+         learned_mpc_pass_impossible_probability={:.2} \
+         pass_completion_primary_score_weight={:.2}",
+        env_f64_or("SOCCER_LEARNED_PASS_RECEIVER_MIN_NET_FORWARD_QUALITY", 0.26),
+        env_f64_or("SOCCER_LEARNED_MPC_PASS_IMPOSSIBLE_PROBABILITY", 0.18),
+        env_f64_or("DD_SOCCER_PASS_COMPLETION_SCORE_WEIGHT", 0.0),
     );
 
     // Carried across games within this process (the real learner's per-process pattern).

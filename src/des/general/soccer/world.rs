@@ -217,6 +217,21 @@ fn learned_pass_receiver_min_net_forward_quality() -> f64 {
     )
 }
 
+fn learned_pass_receiver_strict_fallback_enabled() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_LEARNED_PASS_RECEIVER_STRICT_FALLBACK")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| {
+            soccer_env_flag_enabled("DD_SOCCER_ENABLE_LEARNED_PASS_RECEIVER_STRICT_FALLBACK")
+        })
+    }
+}
+
 fn neural_mcts_distillation_advantage_noise_tolerance() -> f64 {
     learned_mpc_metric_env(
         "SOCCER_NEURAL_MCTS_DISTILLATION_ADVANTAGE_NOISE_TOLERANCE",
@@ -5503,6 +5518,27 @@ mod tests {
         assert_eq!(replan.source, SoccerLearnedMpcReplanSource::Mpc);
         assert_eq!(replan.candidate_count, 2);
         assert!((replan.rejected_execution_probability - first_probability).abs() < 1e-12);
+
+        let _strict_gate = set_test_env_var(
+            "DD_SOCCER_ENABLE_LEARNED_PASS_RECEIVER_STRICT_FALLBACK",
+            "1",
+        );
+        let (target_player, target_point, replan) = SoccerMatch::learned_pass_receiver_selection(
+            &policy,
+            &snapshot,
+            actor_id,
+            "pass",
+            PassFlight::Floor,
+            &[first_target, second_target],
+        );
+        assert_eq!(target_player, None);
+        assert_eq!(target_point, None);
+        let replan =
+            replan.expect("strict fallback should keep the receiver rejection trace visible");
+        assert_eq!(replan.original_action, "pass");
+        assert_eq!(replan.replacement_action, "pass");
+        assert_eq!(replan.source, SoccerLearnedMpcReplanSource::Mpc);
+        assert_eq!(replan.candidate_count, 2);
     }
 
     #[test]
@@ -17875,6 +17911,9 @@ impl SoccerMatch {
         let replan = first_rejected_probability.map(|rejected_probability| {
             receiver_kickback_trace(rejected_probability, rejected_count)
         });
+        if learned_pass_receiver_strict_fallback_enabled() && replan.is_some() {
+            return (None, None, replan);
+        }
         (fallback, fallback_point, replan)
     }
 

@@ -464,6 +464,7 @@ fn eval(cand_spec: &str, base_spec: &str, games: usize, minutes: f64, holdout: u
                 cm.chains, bm.chains, cm.shots_after_pass, bm.shots_after_pass, cm.assists, bm.assists,
                 cm.dribble_beats, bm.dribble_beats, cm.route_one, bm.route_one, cm.interceptions, bm.interceptions
             );
+            let _ = w.flush(); // durable per-game so killed workers keep data & progress is monitorable
         }
         if (g + 1) % 10 == 0 || g + 1 == games {
             eprintln!(
