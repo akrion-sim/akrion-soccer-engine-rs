@@ -343,7 +343,7 @@ const NF=Math.min(BEFORE.frames.length,AFTER.frames.length);
 
 // ---------- playback ----------
 let fi=0, playing=!reduce, last=0;
-const FPS=22; // frames advanced per second (DT=0.1s real -> ~2.2x)
+const FPS=(AFTER.hz||BEFORE.hz||10); // REAL-TIME: advance sim frames at the sim's own Hz (1x)
 const playBtn=document.getElementById('play');
 const scrub=document.getElementById('scrub'); scrub.max=NF-1;
 function updateScores(){
