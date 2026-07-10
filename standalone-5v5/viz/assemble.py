@@ -64,15 +64,17 @@ def main():
     after_a = float(m_fin.group(3)) if m_fin else curve[-1]["ga"]
     after_b = float(m_fin.group(4)) if m_fin else curve[-1]["gb"]
 
+    passes = float(m_fin.group(5)) if (m_fin and m_fin.group(5)) else 0.0
     iters = curve[-1]["iter"]
     meta = {
         "before_diff": fmt_diff(before_diff),
         "before_wr": before_wr,
-        "before_score": f"{before_a:.1f}–{before_b:.1f} avg",
+        "before_score": f"{before_a:.1f}–{before_b:.1f} goals",
         "after_diff": fmt_diff(after_diff),
         "after_wr": after_wr,
-        "after_score": f"{after_a:.1f}–{after_b:.1f} avg",
+        "after_score": f"{after_a:.1f}–{after_b:.1f} · {passes:.0f} passes/gm",
         "swing": fmt_diff(after_diff - before_diff),
+        "passes": round(passes, 1),
         "iters": iters,
         "minutes": "~3 min on a laptop",
     }
