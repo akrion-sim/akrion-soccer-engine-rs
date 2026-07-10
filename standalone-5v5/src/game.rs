@@ -699,8 +699,15 @@ impl World {
                     }
                 }
                 let aim = V2::new(goal_x, best_y);
-                if team == Team::A && goal.sub(me).len() < 22.0 {
-                    self.ev_shot_on_a = true;
+                if team == Team::A {
+                    // MPC-finish quality: how open the chosen corner is (keeper gap
+                    // + clear lane), normalized ~[0,1]. Rewards placing the shot AND
+                    // shooting from a position where a good placement exists.
+                    let q = (best_score / 12.0).clamp(0.0, 1.0);
+                    self.last_shot_quality_a = q;
+                    if goal.sub(me).len() < 24.0 {
+                        self.ev_shot_on_a = true;
+                    }
                 }
                 Some((owner, aim.sub(me), SHOT_SPEED, false))
             }
