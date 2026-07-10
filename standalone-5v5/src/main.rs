@@ -70,7 +70,7 @@ fn inspect(seed: u64) {
             return;
         }
     };
-    let policy = train::Policy { actor, critic: nn::Mlp::load("out/critic.txt").unwrap_or_else(|_| nn::Mlp::new(&[OBS_DIM, 64, 64, 1], &mut Rng::new(0))) };
+    let policy = train::Policy { actor, critic: nn::Mlp::load("out/critic.txt").unwrap_or_else(|_| nn::Mlp::new(&[GLOBAL_DIM, 128, 64, 1], &mut Rng::new(0))) };
     let mut rng = Rng::new(seed);
     let mut w = World::new();
     fs::create_dir_all("out").ok();
