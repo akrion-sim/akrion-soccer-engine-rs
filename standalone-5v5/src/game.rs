@@ -729,6 +729,9 @@ impl World {
         self.intended_receiver = None;
         match a {
             A_SHOOT => {
+                if team == Team::A {
+                    self.ev_shot_attempt_a = true;
+                }
                 self.set_vel(team, idx, V2::default());
                 // MPC-lite finishing: enumerate aim points across the mouth and
                 // pick the one that maximizes clearance from the keeper and any
