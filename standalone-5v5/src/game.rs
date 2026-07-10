@@ -814,6 +814,9 @@ impl World {
                 None
             }
             A_CLEAR => {
+                if team == Team::A {
+                    self.pass_streak_a = 0; // clearing gives up the buildup
+                }
                 self.set_vel(team, idx, V2::default());
                 // hoof toward attacked goal with lateral scatter
                 let dir = goal.sub(me);
