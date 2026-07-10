@@ -43,6 +43,7 @@ impl Rng {
 
     /// Uniform f32 in [lo, hi).
     #[inline]
+    #[allow(dead_code)]
     pub fn range(&mut self, lo: f32, hi: f32) -> f32 {
         lo + (hi - lo) * self.f01()
     }
@@ -55,7 +56,7 @@ impl Rng {
             s += self.f01();
         }
         // sum of 6 uniforms has mean 3, var 6/12=0.5 -> std ~0.707
-        mean + std * (s - 3.0) / 0.7071
+        mean + std * (s - 3.0) / std::f32::consts::FRAC_1_SQRT_2
     }
 
     /// Sample an index from a probability distribution (must sum ~1).
@@ -70,5 +71,35 @@ impl Rng {
             }
         }
         probs.len() - 1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_seed_replays_same_stream() {
+        let mut a = Rng::new(123);
+        let mut b = Rng::new(123);
+        for _ in 0..64 {
+            assert_eq!(a.next_u64(), b.next_u64());
+        }
+    }
+
+    #[test]
+    fn f01_stays_in_half_open_unit_interval() {
+        let mut rng = Rng::new(456);
+        for _ in 0..2048 {
+            let v = rng.f01();
+            assert!((0.0..1.0).contains(&v), "f01 returned {v}");
+        }
+    }
+
+    #[test]
+    fn categorical_falls_back_to_last_index_after_roundoff() {
+        let mut rng = Rng::new(789);
+        let idx = rng.sample_categorical(&[0.0, 0.0, 0.0]);
+        assert_eq!(idx, 2);
     }
 }

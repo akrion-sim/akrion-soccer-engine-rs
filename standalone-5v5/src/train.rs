@@ -19,7 +19,10 @@ const ENT_BETA0: f32 = 0.02;
 // Teammate-spacing reward weight. Overridable via SPACING_W env for tuning.
 // Default halved from the 10 Hz value (per-tick reward now fires twice as often).
 fn w_spacing() -> f32 {
-    std::env::var("SPACING_W").ok().and_then(|s| s.parse().ok()).unwrap_or(0.003)
+    std::env::var("SPACING_W")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.003)
 }
 
 /// PER-PLAYER spacing reward as a function of a player's nearest-teammate
@@ -82,8 +85,8 @@ impl Policy {
 }
 
 struct Sample {
-    obs: [f32; OBS_DIM],        // decentralized actor observation
-    gstate: [f32; GLOBAL_DIM],  // centralized critic global state
+    obs: [f32; OBS_DIM],       // decentralized actor observation
+    gstate: [f32; GLOBAL_DIM], // centralized critic global state
     mask: [bool; NA],
     action: usize,
     old_logp: f32,
@@ -152,10 +155,11 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
         // forward progress is rewarded by the potential shaping above, and goals
         // dominate — so passing stays INSTRUMENTAL and the policy still attacks.
         if w.ev_pass_completed_a {
-            // Reward completing a pass (the 2-pass rule REQUIRES it, so no hoarding
-            // risk — shooting unlocks after 2 and the goal drive takes over), with
-            // a strong bonus for FORWARD progress so build-up goes toward goal.
-            r += 0.2 + (w.last_pass_gain_a.max(0.0) * 0.3).min(2.5);
+            // The 2-pass RULE already forces passing, so passing needs almost no
+            // reward — a flat base just causes endless hoarding (0 shots). Keep
+            // ONLY a small FORWARD-progress nudge so the forced passes go toward
+            // goal; the goal (+5) and shot rewards are the real prize.
+            r += (w.last_pass_gain_a.max(0.0) * 0.12).min(0.8);
         }
         if w.ev_turnover_a {
             r -= 0.25;
@@ -341,25 +345,33 @@ pub struct Stats {
     pub winrate: f32,
     pub ga: f32,
     pub gb: f32,
-    pub spacing: f32,        // avg nearest-teammate distance (all ticks)
-    pub bunch: f32,          // fraction of ticks a pair < 2.5
-    pub possession: f32,     // fraction of ticks Team A holds the ball
-    pub pass_att: f32,       // pass attempts / game
-    pub pass_cmp: f32,       // completed passes / game
-    pub pass_fwd: f32,       // forward pass attempts / game
-    pub pass_lat: f32,       // lateral pass attempts / game
-    pub pass_back: f32,      // backward pass attempts / game
-    pub shots: f32,          // shot attempts / game
-    pub shots_scored: f32,   // goals (proxy for converted shots) / game
-    pub turnovers: f32,      // A turnovers / game
-    pub wins_won: f32,       // balls won / game (press/intercept/tackle)
+    pub spacing: f32,      // avg nearest-teammate distance (all ticks)
+    pub bunch: f32,        // fraction of ticks a pair < 2.5
+    pub possession: f32,   // fraction of ticks Team A holds the ball
+    pub pass_att: f32,     // pass attempts / game
+    pub pass_cmp: f32,     // completed passes / game
+    pub pass_fwd: f32,     // forward pass attempts / game
+    pub pass_lat: f32,     // lateral pass attempts / game
+    pub pass_back: f32,    // backward pass attempts / game
+    pub shots: f32,        // shot attempts / game
+    pub shots_scored: f32, // goals (proxy for converted shots) / game
+    pub turnovers: f32,    // A turnovers / game
+    pub wins_won: f32,     // balls won / game (press/intercept/tackle)
 }
 impl Stats {
     pub fn pass_completion(&self) -> f32 {
-        if self.pass_att > 0.0 { self.pass_cmp / self.pass_att } else { 0.0 }
+        if self.pass_att > 0.0 {
+            self.pass_cmp / self.pass_att
+        } else {
+            0.0
+        }
     }
     pub fn conversion(&self) -> f32 {
-        if self.shots > 0.0 { self.shots_scored / self.shots } else { 0.0 }
+        if self.shots > 0.0 {
+            self.shots_scored / self.shots
+        } else {
+            0.0
+        }
     }
 }
 
@@ -426,14 +438,28 @@ pub fn evaluate(policy: &Policy, games: usize, rng: &mut Rng) -> Stats {
     }
     let g = games.max(1) as f32;
     for v in [
-        &mut s.goal_diff, &mut s.winrate, &mut s.ga, &mut s.gb, &mut s.pass_att,
-        &mut s.pass_cmp, &mut s.pass_fwd, &mut s.pass_lat, &mut s.pass_back,
-        &mut s.shots, &mut s.shots_scored, &mut s.turnovers, &mut s.wins_won,
+        &mut s.goal_diff,
+        &mut s.winrate,
+        &mut s.ga,
+        &mut s.gb,
+        &mut s.pass_att,
+        &mut s.pass_cmp,
+        &mut s.pass_fwd,
+        &mut s.pass_lat,
+        &mut s.pass_back,
+        &mut s.shots,
+        &mut s.shots_scored,
+        &mut s.turnovers,
+        &mut s.wins_won,
     ] {
         *v /= g;
     }
     s.spacing = if ticks > 0.0 { space_sum / ticks } else { 0.0 };
-    s.bunch = if ticks > 0.0 { bunch_ticks / ticks } else { 0.0 };
+    s.bunch = if ticks > 0.0 {
+        bunch_ticks / ticks
+    } else {
+        0.0
+    };
     s.possession = if ticks > 0.0 { poss_ticks / ticks } else { 0.0 };
     s
 }
@@ -464,5 +490,38 @@ fn shuffle(v: &mut [usize], rng: &mut Rng) {
     for i in (1..v.len()).rev() {
         let j = (rng.next_u64() % (i as u64 + 1)) as usize;
         v.swap(i, j);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spacing_reward_penalizes_overlap_and_prefers_useful_distance() {
+        assert!(spacing_reward(0.8) < spacing_reward(2.0));
+        assert!(spacing_reward(5.0) > spacing_reward(3.0));
+        assert!(spacing_reward(8.0) < spacing_reward(5.0));
+    }
+
+    #[test]
+    fn scripted_vs_scripted_is_seed_reproducible() {
+        let mut a = Rng::new(1234);
+        let mut b = Rng::new(1234);
+        let left = evaluate_scripted_vs_scripted(8, &mut a);
+        let right = evaluate_scripted_vs_scripted(8, &mut b);
+        assert_eq!(left, right);
+    }
+
+    #[test]
+    fn untrained_evaluation_metrics_stay_in_bounds() {
+        let mut rng = Rng::new(99);
+        let policy = Policy::new(&mut rng);
+        let stats = evaluate(&policy, 2, &mut rng);
+        assert!((0.0..=1.0).contains(&stats.winrate));
+        assert!((0.0..=1.0).contains(&stats.bunch));
+        assert!((0.0..=1.0).contains(&stats.possession));
+        assert!(stats.pass_completion().is_finite());
+        assert!(stats.conversion().is_finite());
     }
 }

@@ -3,14 +3,17 @@
 
 Produces a fully self-contained viz/demo.html (no external assets), suitable to
 publish as an Artifact. Zero third-party deps — stdlib only."""
-import json, re, sys, os
+import json, os
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "..", "out")
 
 
 def rd(name):
-    with open(os.path.join(OUT, name)) as f:
+    path = os.path.join(OUT, name)
+    if not os.path.exists(path):
+        raise SystemExit(f"missing {path}; run `cargo run --release -- train` first")
+    with open(path) as f:
         return f.read()
 
 
@@ -24,6 +27,7 @@ def fmt_diff(v):
 
 
 def main():
+    manifest = json.loads(rd("run_manifest.json"))
     before = rd("match_before.json").strip()
     after = rd("match_after.json").strip()
 
@@ -37,9 +41,7 @@ def main():
             d[name] = int(c[0]) if k == 0 else num(c[k])
         return d
     data = [to_dict(r) for r in lines[1:]]
-    log_txt = rd("../out_train.log") if os.path.exists(os.path.join(OUT, "..", "out_train.log")) else ""
-    mb = re.search(r"best policy at iter (\d+)", log_txt)
-    best_iter = int(mb.group(1)) if mb else data[-1]["iter"]
+    best_iter = int(manifest["selection"]["best_iter"])
     # last row is the appended FINAL 300-game stat line; the rest are per-iter
     final = data[-1]
     per_iter = data[:-1] if len(data) > 1 else data
@@ -54,24 +56,18 @@ def main():
         "turnovers": g(d, "turnovers"), "won": g(d, "balls_won"),
     } for d in per_iter if d["iter"] <= best_iter]
 
-    # ---- headline meta, parsed from the training log ----
-    log = rd("../out_train.log") if os.path.exists(os.path.join(OUT, "..", "out_train.log")) else ""
-    def grab(pat, default=None):
-        m = re.search(pat, log)
-        return m if m else default
-
-    m_unt = grab(r"untrained-vs-scripted:\s*goal_diff=([-+\d.]+)\s+winrate=([\d.]+)\s+\(A ([\d.]+) / B ([\d.]+)\)")
-    m_fin = grab(r"FINAL \(\d+ games\): goal_diff=([-+\d.]+)\s+winrate=([\d.]+)\s+goals ([\d.]+)-([\d.]+)(?:\s+passes/game ([\d.]+))?(?:\s+spacing=([\d.]+))?(?:\s+bunch=([\d.]+)%)?")
-    m_seed = grab(r"display seed \d+: before (\d+)-(\d+)\s+->\s+after (\d+)-(\d+)")
-
-    before_diff = float(m_unt.group(1)) if m_unt else curve[0]["diff"]
-    before_wr = float(m_unt.group(2)) if m_unt else curve[0]["wr"]
-    before_a = float(m_unt.group(3)) if m_unt else curve[0]["ga"]
-    before_b = float(m_unt.group(4)) if m_unt else curve[0]["gb"]
-    after_diff = float(m_fin.group(1)) if m_fin else curve[-1]["diff"]
-    after_wr = float(m_fin.group(2)) if m_fin else curve[-1]["wr"]
-    after_a = float(m_fin.group(3)) if m_fin else curve[-1]["ga"]
-    after_b = float(m_fin.group(4)) if m_fin else curve[-1]["gb"]
+    # ---- headline meta from manifest, not from stale console logs ----
+    untrained = manifest["untrained"]
+    selection = manifest["selection"]
+    cfg = manifest["config"]
+    before_diff = float(untrained["goal_diff"])
+    before_wr = float(untrained["winrate"])
+    before_a = float(untrained["goals_a"])
+    before_b = float(untrained["goals_b"])
+    after_diff = float(manifest["final"]["goal_diff"])
+    after_wr = float(manifest["final"]["winrate"])
+    after_a = float(manifest["final"]["goals_a"])
+    after_b = float(manifest["final"]["goals_b"])
 
     # Prefer the accurate FINAL 300-game CSV row for all trained-model stats.
     fg = lambda k, d=0.0: (final.get(k) if final.get(k) is not None else d)
@@ -105,7 +101,10 @@ def main():
         "turnovers": round(fg("turnovers"), 1),
         "balls_won": round(fg("balls_won"), 1),
         "iters": iters,
-        "minutes": "~6 min on a laptop",
+        "minutes": f"seed {cfg['seed']}",
+        "git": manifest.get("git_commit", "unknown"),
+        "gate": "cleared" if selection.get("best_cleared_hardening_gates") else "not cleared",
+        "display_seed": selection.get("display_seed"),
     }
 
     tpl = rd_tpl()

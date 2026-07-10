@@ -143,19 +143,19 @@ pub struct World {
     pub ev_goal_a: bool,
     pub ev_goal_b: bool,
     pub ev_pass_completed_a: bool,
-    pub ev_turnover_a: bool, // Team A lost possession to B
-    pub ev_shot_on_a: bool,  // Team A took a shot on target
-    pub ev_win_ball_a: bool, // Team A won possession off Team B (interception/tackle)
-    pub ev_pass_attempt_a: bool, // Team A attempted a pass this tick
-    pub pass_dir_a: i32,     // direction of that pass: 1 forward, 0 lateral, -1 backward
-    pub ev_shot_attempt_a: bool, // Team A took a shot this tick
-    pub last_shot_quality_a: f32, // placement quality of A's last shot, ~[0,1] (MPC finish)
-    pending_pass: Option<Owner>, // intended receiver of an in-flight pass
+    pub ev_turnover_a: bool,          // Team A lost possession to B
+    pub ev_shot_on_a: bool,           // Team A took a shot on target
+    pub ev_win_ball_a: bool,          // Team A won possession off Team B (interception/tackle)
+    pub ev_pass_attempt_a: bool,      // Team A attempted a pass this tick
+    pub pass_dir_a: i32,              // direction of that pass: 1 forward, 0 lateral, -1 backward
+    pub ev_shot_attempt_a: bool,      // Team A took a shot this tick
+    pub last_shot_quality_a: f32,     // placement quality of A's last shot, ~[0,1] (MPC finish)
+    pending_pass: Option<Owner>,      // intended receiver of an in-flight pass
     intended_receiver: Option<Owner>, // scratch set during apply_on_ball
-    pass_kick_x: f32,            // ball x when Team A last released a pass
-    pub last_pass_gain_a: f32,   // forward metres gained by the last completed A pass
-    pub pass_streak_a: u32,      // completed A passes in the current possession (2-pass rule)
-    a_shot_flag: bool,           // the current free ball came from a Team-A shot (gates goals)
+    pass_kick_x: f32,                 // ball x when Team A last released a pass
+    pub last_pass_gain_a: f32,        // forward metres gained by the last completed A pass
+    pub pass_streak_a: u32,           // completed A passes in the current possession (2-pass rule)
+    a_shot_flag: bool,                // the current free ball came from a Team-A shot (gates goals)
 }
 
 fn players(team: Team, w: &World) -> &[Player; N] {
@@ -168,8 +168,14 @@ fn players(team: Team, w: &World) -> &[Player; N] {
 impl World {
     pub fn new() -> Self {
         let mut w = World {
-            a: [Player { pos: V2::default(), vel: V2::default() }; N],
-            b: [Player { pos: V2::default(), vel: V2::default() }; N],
+            a: [Player {
+                pos: V2::default(),
+                vel: V2::default(),
+            }; N],
+            b: [Player {
+                pos: V2::default(),
+                vel: V2::default(),
+            }; N],
             ball: V2::new(FIELD_L / 2.0, FIELD_W / 2.0),
             ball_vel: V2::default(),
             owner: None,
@@ -230,13 +236,6 @@ impl World {
             Team::B => self.b[o.idx],
         }
     }
-    fn player_mut(&mut self, o: Owner) -> &mut Player {
-        match o.team {
-            Team::A => &mut self.a[o.idx],
-            Team::B => &mut self.b[o.idx],
-        }
-    }
-
     fn nearest_player(&self, team: Team, p: V2) -> (usize, f32) {
         let ps = players(team, self);
         let mut bi = 0;
@@ -379,7 +378,8 @@ impl World {
         // derived cues kept for action semantics: shot lane + best-pass openness
         let shot_clear = self.shot_clearness(team, me.pos);
         let cands = self.pass_candidates(team, idx);
-        let open_of = |c: Option<(usize, f32)>| c.map(|(_, s)| (s / 15.0).clamp(-1.0, 1.0)).unwrap_or(-1.0);
+        let open_of =
+            |c: Option<(usize, f32)>| c.map(|(_, s)| (s / 15.0).clamp(-1.0, 1.0)).unwrap_or(-1.0);
         let (aopen, bopen) = (open_of(cands[0]), open_of(cands[1]));
 
         // role: is this the closest outfielder to the ball, and its ball-distance rank
@@ -396,14 +396,22 @@ impl World {
         // teammates (all others incl. GK) and opponents, each sorted by distance to me
         let mut tm: Vec<usize> = (0..N).filter(|&k| k != idx).collect();
         tm.sort_by(|&a, &b| {
-            players(team, self)[a].pos.sub(me.pos).len()
+            players(team, self)[a]
+                .pos
+                .sub(me.pos)
+                .len()
                 .partial_cmp(&players(team, self)[b].pos.sub(me.pos).len())
                 .unwrap()
         });
         let opp = players(team.other(), self);
         let mut op: Vec<usize> = (0..N).collect();
         op.sort_by(|&a, &b| {
-            opp[a].pos.sub(me.pos).len().partial_cmp(&opp[b].pos.sub(me.pos).len()).unwrap()
+            opp[a]
+                .pos
+                .sub(me.pos)
+                .len()
+                .partial_cmp(&opp[b].pos.sub(me.pos).len())
+                .unwrap()
         });
 
         let mut f: Vec<f32> = Vec::with_capacity(OBS_DIM);
@@ -638,7 +646,7 @@ impl World {
                 }
             }
             let d = players(team, self)[GK].pos.sub(self.ball).len();
-            if d < KEEPER_REACH && best.map_or(true, |(_, bd)| d < bd) {
+            if d < KEEPER_REACH && best.is_none_or(|(_, bd)| d < bd) {
                 best = Some((Owner { team, idx: GK }, d));
             }
         }
@@ -660,8 +668,13 @@ impl World {
                             }
                         }
                     }
-                    let is_recv = matches!(self.pending_pass, Some(r) if r.team == team && r.idx == i);
-                    let radius = if is_recv { RECEIVE_RADIUS } else { CONTROL_RADIUS };
+                    let is_recv =
+                        matches!(self.pending_pass, Some(r) if r.team == team && r.idx == i);
+                    let radius = if is_recv {
+                        RECEIVE_RADIUS
+                    } else {
+                        CONTROL_RADIUS
+                    };
                     let d = players(team, self)[i].pos.sub(self.ball).len();
                     if d >= radius {
                         continue;
@@ -678,7 +691,7 @@ impl World {
             let prev_touch = self.last_touch;
             self.owner = Some(o);
             self.a_shot_flag = false; // shot resolved into possession
-            // Team-A reward events. pending_pass.team is the PASSING team.
+                                      // Team-A reward events. pending_pass.team is the PASSING team.
             if let Some(pp) = self.pending_pass {
                 if pp.team == Team::A {
                     if o.team == Team::A {
@@ -716,7 +729,10 @@ impl World {
         let op = self.player(o).pos;
         let (oi, od) = self.nearest_opponent(o.team, op);
         if od < TACKLE_RADIUS && rng.f01() < TACKLE_PROB {
-            let stealer = Owner { team: o.team.other(), idx: oi };
+            let stealer = Owner {
+                team: o.team.other(),
+                idx: oi,
+            };
             if o.team == Team::A {
                 self.ev_turnover_a = true; // A dispossessed
             } else {
@@ -808,7 +824,13 @@ impl World {
                         self.ev_pass_attempt_a = true;
                         // classify by forward progress toward the attacked goal
                         let fwd = (tp.x - me.x) * sx;
-                        self.pass_dir_a = if fwd > 2.0 { 1 } else if fwd < -2.0 { -1 } else { 0 };
+                        self.pass_dir_a = if fwd > 2.0 {
+                            1
+                        } else if fwd < -2.0 {
+                            -1
+                        } else {
+                            0
+                        };
                     }
                     Some((owner, lead.sub(me), PASS_SPEED, true))
                 } else {
@@ -866,7 +888,12 @@ impl World {
                 return Some((Owner { team, idx: GK }, lead.sub(me), PASS_SPEED, true));
             }
             self.set_vel(team, GK, V2::default());
-            return Some((Owner { team, idx: GK }, team.target_goal().sub(me), CLEAR_SPEED, false));
+            return Some((
+                Owner { team, idx: GK },
+                team.target_goal().sub(me),
+                CLEAR_SPEED,
+                false,
+            ));
         }
         // position on the ball→own-goal line, a few metres off the line
         let c = team.own_goal();
@@ -878,9 +905,16 @@ impl World {
         } else {
             target.x.clamp(FIELD_L - 8.0, FIELD_L - 0.5)
         };
-        target.y = target.y.clamp(FIELD_W / 2.0 - GOAL_HALF - 1.5, FIELD_W / 2.0 + GOAL_HALF + 1.5);
+        target.y = target.y.clamp(
+            FIELD_W / 2.0 - GOAL_HALF - 1.5,
+            FIELD_W / 2.0 + GOAL_HALF + 1.5,
+        );
         let dir = target.sub(me);
-        let v = if dir.len() < 0.2 { V2::default() } else { dir.unit().scale(KEEPER_SPEED) };
+        let v = if dir.len() < 0.2 {
+            V2::default()
+        } else {
+            dir.unit().scale(KEEPER_SPEED)
+        };
         self.set_vel(team, GK, v);
         None
     }
@@ -948,7 +982,7 @@ impl World {
                     }
                 }
                 let fwd = (cand.x - me.x) * sx; // upfield progress in attack frame
-                // stay loosely connected to the ball's vertical lane
+                                                // stay loosely connected to the ball's vertical lane
                 let lane = -(cand.y - self.ball.y).abs() * 0.08;
                 let score = min_d + field_bias * fwd + lane;
                 if score > best_score {
@@ -993,8 +1027,9 @@ impl World {
         let owner = self.owner;
         let team_owns = matches!(owner, Some(o) if o.team == team);
         // rank teammates by distance to ball for role assignment
-        let mut order: Vec<(usize, f32)> =
-            (0..N).map(|i| (i, players(team, self)[i].pos.sub(self.ball).len())).collect();
+        let mut order: Vec<(usize, f32)> = (0..N)
+            .map(|i| (i, players(team, self)[i].pos.sub(self.ball).len()))
+            .collect();
         order.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
 
         for i in 0..N {
@@ -1005,11 +1040,21 @@ impl World {
             } else if team_owns {
                 // supporters: the closest non-owner pushes up; others spread; deepest holds.
                 let rank = order.iter().position(|&(j, _)| j == i).unwrap();
-                acts[i] = if rank <= 1 { A_SUPPORT } else if rank == N - 1 { A_MARK } else { A_SPREAD };
+                acts[i] = if rank <= 1 {
+                    A_SUPPORT
+                } else if rank == N - 1 {
+                    A_MARK
+                } else {
+                    A_SPREAD
+                };
             } else {
                 // defend: the two nearest press the ball (double-team the
                 // carrier), the rest mark — solo dribbling gets swarmed.
-                acts[i] = if order[0].0 == i || order[1].0 == i { A_CHASE } else { A_MARK };
+                acts[i] = if order[0].0 == i || order[1].0 == i {
+                    A_CHASE
+                } else {
+                    A_MARK
+                };
             }
         }
         acts
@@ -1020,6 +1065,7 @@ impl World {
     /// passing outlet), reward > 4 apart, cap the reward at 8. Applied whenever
     /// the ball is in play near/for Team A (not only in possession) so players
     /// keep shape while attacking AND while pushing up — not just clustering.
+    #[allow(dead_code)]
     pub fn spacing_term_a(&self) -> f32 {
         // Skip only when Team B is settled in possession deep — there, A defends
         // and legitimately compresses. Otherwise (A possession or a loose ball)
@@ -1171,15 +1217,125 @@ impl World {
             // dribble away from the nearest opponent laterally
             let (oi, _) = self.nearest_opponent(team, me);
             let opp = players(team.other(), self)[oi].pos;
-            return if opp.y > me.y { A_DRIB_LEFT } else { A_DRIB_RIGHT };
+            return if opp.y > me.y {
+                A_DRIB_LEFT
+            } else {
+                A_DRIB_RIGHT
+            };
         }
         // unpressured: is an opponent directly ahead in my forward cone?
         let (oi, od) = self.nearest_opponent(team, me);
         let opp = players(team.other(), self)[oi].pos;
         let ahead = (opp.x - me.x) * sx;
         if od < 8.0 && ahead > 0.0 && (opp.y - me.y).abs() < 4.0 {
-            return if opp.y > me.y { A_DRIB_LEFT } else { A_DRIB_RIGHT };
+            return if opp.y > me.y {
+                A_DRIB_LEFT
+            } else {
+                A_DRIB_RIGHT
+            };
         }
         A_DRIB_FWD
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stays() -> [usize; N] {
+        [A_STAY; N]
+    }
+
+    #[test]
+    fn observations_and_global_state_are_finite() {
+        let w = World::new();
+        for team in [Team::A, Team::B] {
+            for idx in 1..N {
+                let obs = w.observe(team, idx);
+                assert_eq!(obs.len(), OBS_DIM);
+                assert!(obs.iter().all(|v| v.is_finite()));
+            }
+        }
+        let global = w.global_state();
+        assert_eq!(global.len(), GLOBAL_DIM);
+        assert!(global.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn legal_mask_partitions_on_ball_and_off_ball_actions() {
+        let mut w = World::new();
+        w.owner = Some(Owner {
+            team: Team::A,
+            idx: 1,
+        });
+        w.pass_streak_a = 0;
+        let on_ball = w.legal_mask(Team::A, 1);
+        assert!(
+            !on_ball[A_SHOOT],
+            "A cannot shoot before two completed passes"
+        );
+        assert!(on_ball[A_PASS_A]);
+        assert!(on_ball[A_HOLD]);
+        assert!(!on_ball[A_CHASE]);
+
+        w.pass_streak_a = 2;
+        let after_buildup = w.legal_mask(Team::A, 1);
+        assert!(
+            after_buildup[A_SHOOT],
+            "two completed passes unlock shooting"
+        );
+
+        let off_ball = w.legal_mask(Team::A, 2);
+        assert!(!off_ball[A_PASS_A]);
+        assert!(off_ball[A_CHASE]);
+        assert!(off_ball[A_STAY]);
+    }
+
+    #[test]
+    fn unflagged_ball_through_goal_is_goal_kick_not_a_goal() {
+        let mut w = World::new();
+        w.owner = None;
+        w.ball = V2::new(FIELD_L - 0.01, FIELD_W / 2.0);
+        w.ball_vel = V2::new(5.0, 0.0);
+        w.a_shot_flag = false;
+        w.step(&stays(), &stays(), &mut Rng::new(1));
+        assert_eq!(w.goals_a, 0);
+        assert!(!w.ev_goal_a);
+        assert!(matches!(w.owner, Some(o) if o.team == Team::B));
+    }
+
+    #[test]
+    fn valid_a_shot_through_goal_scores_and_resets_buildup() {
+        let mut w = World::new();
+        w.owner = None;
+        w.ball = V2::new(FIELD_L - 0.01, FIELD_W / 2.0);
+        w.ball_vel = V2::new(5.0, 0.0);
+        w.pass_streak_a = 2;
+        w.a_shot_flag = true;
+        w.step(&stays(), &stays(), &mut Rng::new(2));
+        assert_eq!(w.goals_a, 1);
+        assert!(w.ev_goal_a);
+        assert_eq!(w.pass_streak_a, 0);
+        assert!(matches!(w.owner, Some(o) if o.team == Team::B));
+    }
+
+    #[test]
+    fn completed_a_pass_increments_streak_and_records_gain() {
+        let mut w = World::new();
+        w.owner = None;
+        w.last_touch = Some(Team::A);
+        w.pending_pass = Some(Owner {
+            team: Team::A,
+            idx: 2,
+        });
+        w.pass_kick_x = 10.0;
+        w.ball = w.a[2].pos;
+        w.ball_vel = V2::default();
+        w.kick_timer = -1;
+        w.try_capture();
+        assert!(w.ev_pass_completed_a);
+        assert_eq!(w.pass_streak_a, 1);
+        assert!(w.last_pass_gain_a.is_finite());
+        assert!(matches!(w.owner, Some(o) if o.team == Team::A && o.idx == 2));
     }
 }

@@ -10,6 +10,8 @@
 //!   cargo run --release -- sanity          # scripted-vs-scripted sanity check
 //!   cargo run --release -- eval            # (re)train briefly and print eval
 
+#![allow(clippy::needless_range_loop)]
+
 mod game;
 mod nn;
 mod rng;
@@ -17,23 +19,155 @@ mod train;
 
 use game::*;
 use rng::Rng;
+use std::error::Error;
 use std::fmt::Write as _;
 use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+type AppResult<T> = Result<T, Box<dyn Error>>;
+
+#[derive(Clone)]
+struct RunConfig {
+    iters: usize,
+    seed: u64,
+    games_per_iter: usize,
+    eval_every: usize,
+    eval_games: usize,
+    final_games: usize,
+    display_seed_max: u64,
+    out_dir: PathBuf,
+}
+
+impl Default for RunConfig {
+    fn default() -> Self {
+        Self {
+            iters: 100,
+            seed: 20260710,
+            games_per_iter: 8,
+            eval_every: 5,
+            eval_games: 60,
+            final_games: 300,
+            display_seed_max: 120,
+            out_dir: PathBuf::from("out"),
+        }
+    }
+}
 
 fn main() {
+    if let Err(err) = run() {
+        eprintln!("error: {err}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> AppResult<()> {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("train");
     match cmd {
         "sanity" => sanity(),
         "inspect" => {
             let seed: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(7);
-            inspect(seed);
+            let out_dir = parse_out_dir(&args, 3)?;
+            inspect(seed, &out_dir)?;
         }
+        "help" | "--help" | "-h" => print_usage(),
         _ => {
-            let iters: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(100);
-            run_training(iters);
+            let cfg = parse_run_config(&args)?;
+            run_training(&cfg)?;
         }
     }
+    Ok(())
+}
+
+fn print_usage() {
+    println!("usage:");
+    println!("  cargo run --release -- train [iters] [--seed N] [--games-per-iter N] [--eval-every N] [--eval-games N] [--final-games N] [--display-seed-max N] [--out-dir DIR]");
+    println!("  cargo run --release -- inspect [seed] [--out-dir DIR]");
+    println!("  cargo run --release -- sanity");
+}
+
+fn parse_run_config(args: &[String]) -> AppResult<RunConfig> {
+    let mut cfg = RunConfig::default();
+    let mut i = 2usize;
+    if let Some(raw) = args.get(i) {
+        if !raw.starts_with("--") {
+            cfg.iters = raw
+                .parse()
+                .map_err(|_| format!("invalid iteration count: {raw}"))?;
+            i += 1;
+        }
+    }
+    while i < args.len() {
+        let flag = args[i].as_str();
+        let value = args
+            .get(i + 1)
+            .ok_or_else(|| format!("missing value for {flag}"))?;
+        match flag {
+            "--seed" => {
+                cfg.seed = value
+                    .parse()
+                    .map_err(|_| format!("invalid seed: {value}"))?
+            }
+            "--games-per-iter" => {
+                cfg.games_per_iter = value
+                    .parse()
+                    .map_err(|_| format!("invalid games-per-iter: {value}"))?
+            }
+            "--eval-every" => {
+                cfg.eval_every = value
+                    .parse()
+                    .map_err(|_| format!("invalid eval-every: {value}"))?
+            }
+            "--eval-games" => {
+                cfg.eval_games = value
+                    .parse()
+                    .map_err(|_| format!("invalid eval-games: {value}"))?
+            }
+            "--final-games" => {
+                cfg.final_games = value
+                    .parse()
+                    .map_err(|_| format!("invalid final-games: {value}"))?
+            }
+            "--display-seed-max" => {
+                cfg.display_seed_max = value
+                    .parse()
+                    .map_err(|_| format!("invalid display-seed-max: {value}"))?
+            }
+            "--out-dir" => cfg.out_dir = PathBuf::from(value),
+            other => return Err(format!("unknown option: {other}").into()),
+        }
+        i += 2;
+    }
+    if cfg.iters == 0 {
+        return Err("iters must be > 0".into());
+    }
+    if cfg.games_per_iter == 0 || cfg.eval_every == 0 || cfg.eval_games == 0 || cfg.final_games == 0
+    {
+        return Err("games/eval counts must be > 0".into());
+    }
+    if cfg.display_seed_max == 0 {
+        return Err("display-seed-max must be > 0".into());
+    }
+    Ok(cfg)
+}
+
+fn parse_out_dir(args: &[String], start: usize) -> AppResult<PathBuf> {
+    let mut out_dir = PathBuf::from("out");
+    let mut i = start;
+    while i < args.len() {
+        let flag = args[i].as_str();
+        let value = args
+            .get(i + 1)
+            .ok_or_else(|| format!("missing value for {flag}"))?;
+        match flag {
+            "--out-dir" => out_dir = PathBuf::from(value),
+            other => return Err(format!("unknown option for inspect: {other}").into()),
+        }
+        i += 2;
+    }
+    Ok(out_dir)
 }
 
 fn action_name(a: usize) -> &'static str {
@@ -62,18 +196,23 @@ fn action_name(a: usize) -> &'static str {
 ///
 ///   cargo run --release -- inspect [seed]
 ///   # then: jq -c '{t,cp:.closest_pair_a,bunch}' out/trace.jsonl | head
-fn inspect(seed: u64) {
-    let actor = match nn::Mlp::load("out/actor.txt") {
+fn inspect(seed: u64, out_dir: &Path) -> AppResult<()> {
+    let actor_path = out_dir.join("actor.txt");
+    let critic_path = out_dir.join("critic.txt");
+    let actor = match nn::Mlp::load(&actor_path) {
         Ok(m) => m,
         Err(_) => {
-            eprintln!("no trained policy found — run `train` first (writes out/actor.txt)");
-            return;
+            return Err(format!("no trained policy found at {}", actor_path.display()).into());
         }
     };
-    let policy = train::Policy { actor, critic: nn::Mlp::load("out/critic.txt").unwrap_or_else(|_| nn::Mlp::new(&[GLOBAL_DIM, 128, 64, 1], &mut Rng::new(0))) };
+    let policy = train::Policy {
+        actor,
+        critic: nn::Mlp::load(&critic_path)
+            .unwrap_or_else(|_| nn::Mlp::new(&[GLOBAL_DIM, 128, 64, 1], &mut Rng::new(0))),
+    };
     let mut rng = Rng::new(seed);
     let mut w = World::new();
-    fs::create_dir_all("out").ok();
+    fs::create_dir_all(out_dir)?;
 
     let mut jsonl = String::new();
     let mut bunch_ticks = 0u32;
@@ -84,7 +223,10 @@ fn inspect(seed: u64) {
     const OVERLAP_THRESH: f32 = 1.5;
 
     println!("== inspect: greedy game, seed {} ==", seed);
-    println!("{:>4} | {:>7} | own | closest_pair | avg_near | bunch | score", "t", "ball_x");
+    println!(
+        "{:>4} | {:>7} | own | closest_pair | avg_near | bunch | score",
+        "t", "ball_x"
+    );
 
     for t in 0..STEPS {
         // choose actions (record them for the trace)
@@ -120,12 +262,20 @@ fn inspect(seed: u64) {
             };
             println!(
                 "{:>4} | {:>7.1} | {}  | {:>12.1} | {:>8.1} | {:>5} | {}-{}",
-                t, w.ball.x, own, closest, avg, if bunched { "YES" } else { "no" }, w.goals_a, w.goals_b
+                t,
+                w.ball.x,
+                own,
+                closest,
+                avg,
+                if bunched { "YES" } else { "no" },
+                w.goals_a,
+                w.goals_b
             );
         }
     }
 
-    fs::write("out/trace.jsonl", &jsonl).ok();
+    let trace_path = out_dir.join("trace.jsonl");
+    write_atomic(&trace_path, &jsonl)?;
     let n = STEPS as f32;
     println!("\n-- bunching summary (Team A outfielders) --");
     println!("  closest-pair distance: mean {:.1}", sum_closest / n);
@@ -144,7 +294,12 @@ fn inspect(seed: u64) {
         overlap_ticks,
         STEPS
     );
-    println!("  full per-tick trace -> out/trace.jsonl ({} frames)", STEPS);
+    println!(
+        "  full per-tick trace -> {} ({} frames)",
+        trace_path.display(),
+        STEPS
+    );
+    Ok(())
 }
 
 /// One frame of the introspection trace as a JSON object (hand-rolled).
@@ -213,16 +368,18 @@ fn sanity() {
     let mut rng = Rng::new(1234);
     let (diff, ga, gb) = train::evaluate_scripted_vs_scripted(200, &mut rng);
     println!("scripted vs scripted over 200 games:");
-    println!("  avg goal diff = {:+.3}  (should be ~0.0 — symmetric baseline)", diff);
+    println!(
+        "  avg goal diff = {:+.3}  (should be ~0.0 — symmetric baseline)",
+        diff
+    );
     println!("  avg goals A = {:.3}, avg goals B = {:.3}", ga, gb);
 }
 
-fn run_training(iters: usize) {
-    let seed = 20260710;
-    let mut rng = Rng::new(seed);
+fn run_training(cfg: &RunConfig) -> AppResult<()> {
+    let mut rng = Rng::new(cfg.seed);
     let mut policy = train::Policy::new(&mut rng);
 
-    fs::create_dir_all("out").ok();
+    fs::create_dir_all(&cfg.out_dir)?;
 
     // Baseline reference: how does the *scripted* team fare vs itself, and how
     // does an UNTRAINED (random) policy fare vs scripted?
@@ -237,7 +394,10 @@ fn run_training(iters: usize) {
         "untrained-vs-scripted:  goal_diff={:+.2}  winrate={:.2}  (A {:.2} / B {:.2})  spacing={:.1}",
         s0.goal_diff, s0.winrate, s0.ga, s0.gb, s0.spacing
     );
-    println!("training for {} iterations (8 games/iter)...\n", iters);
+    println!(
+        "training for {} iterations ({} games/iter, seed {})...\n",
+        cfg.iters, cfg.games_per_iter, cfg.seed
+    );
 
     // Keep the untrained policy so we can later pick a display game where the
     // before/after contrast is representative (before loses, after wins) under
@@ -245,75 +405,117 @@ fn run_training(iters: usize) {
     let untrained = policy.clone();
 
     let mut csv = String::new();
-    csv.push_str("iter,avg_goal_diff,winrate,goals_a,goals_b,spacing,bunch,possession,pass_att,pass_cmp,pass_completion,pass_fwd,pass_lat,pass_back,shots,shots_scored,conversion,turnovers,balls_won,entropy,value_loss\n");
-    let csv_row = |iter: usize, s: &train::Stats, ent: f32, vloss: f32| -> String {
+    csv.push_str("iter,avg_goal_diff,winrate,goals_a,goals_b,spacing,bunch,possession,pass_att,pass_cmp,pass_completion,pass_fwd,pass_lat,pass_back,shots,shots_scored,conversion,turnovers,balls_won,avg_reward,entropy,value_loss\n");
+    let csv_row = |iter: usize,
+                   s: &train::Stats,
+                   avg_reward: f32,
+                   ent: f32,
+                   vloss: f32|
+     -> String {
         format!(
-            "{},{:.4},{:.4},{:.4},{:.4},{:.3},{:.4},{:.4},{:.3},{:.3},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.4},{:.3},{:.3},{:.4},{:.4}\n",
+            "{},{:.4},{:.4},{:.4},{:.4},{:.3},{:.4},{:.4},{:.3},{:.3},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.4},{:.3},{:.3},{:.4},{:.4},{:.4}\n",
             iter, s.goal_diff, s.winrate, s.ga, s.gb, s.spacing, s.bunch, s.possession,
             s.pass_att, s.pass_cmp, s.pass_completion(), s.pass_fwd, s.pass_lat, s.pass_back,
-            s.shots, s.shots_scored, s.conversion(), s.turnovers, s.wins_won, ent, vloss
+            s.shots, s.shots_scored, s.conversion(), s.turnovers, s.wins_won, avg_reward, ent, vloss
         )
     };
-    csv.push_str(&csv_row(0, &s0, 0.0, 0.0));
-
-    let games_per_iter = 8;
-    let eval_every = 5;
+    csv.push_str(&csv_row(0, &s0, 0.0, 0.0, 0.0));
 
     println!(
-        "{:>5} | {:>10} | {:>8} | {:>6} {:>6} | {:>6} | {:>7} | {:>9}",
-        "iter", "goal_diff", "winrate", "gA", "gB", "space", "entropy", "val_loss"
+        "{:>5} | {:>10} | {:>8} | {:>6} {:>6} | {:>6} | {:>6} | {:>7} | {:>9}",
+        "iter", "goal_diff", "winrate", "gA", "gB", "space", "gate", "entropy", "val_loss"
     );
     println!("{}", "-".repeat(80));
 
-    // Keep the BEST policy by eval goal-diff, not the last — PPO can over-train
-    // and collapse, so we snapshot the peak and showcase that.
-    let mut best_policy = policy.clone();
-    let mut best_diff = f32::NEG_INFINITY;
-    let mut best_iter = 0usize;
+    // Keep the best behaviorally-valid checkpoint, not the last. If no checkpoint
+    // clears the gates we still persist the best observed model, but the manifest
+    // makes that fact explicit so stale demos cannot masquerade as proof.
+    let mut best_any_policy = policy.clone();
+    let mut best_any_quality = f32::NEG_INFINITY;
+    let mut best_any_iter = 0usize;
+    let mut best_gated: Option<(train::Policy, usize, f32)> = None;
 
-    for it in 1..=iters {
-        let beta = train::ent_beta_at(it, iters);
-        let stats = train::train_iter(&mut policy, games_per_iter, beta, &mut rng);
+    for it in 1..=cfg.iters {
+        let beta = train::ent_beta_at(it, cfg.iters);
+        let stats = train::train_iter(&mut policy, cfg.games_per_iter, beta, &mut rng);
 
-        if it % eval_every == 0 || it == iters {
-            let st = train::evaluate(&policy, 60, &mut rng);
-            // Balance: reward real soccer (winning + passing) AND penalize the
-            // HONEST bunch% (average spacing hides a glued pair).
-            let quality =
-                st.goal_diff.min(3.0) + (st.pass_cmp * 0.03).min(0.6) - 1.6 * st.bunch;
-            if quality > best_diff {
-                best_diff = quality;
-                best_policy = policy.clone();
-                best_iter = it;
+        if it % cfg.eval_every == 0 || it == cfg.iters {
+            let st = train::evaluate(&policy, cfg.eval_games, &mut rng);
+            let quality = checkpoint_quality(&st);
+            let gated = checkpoint_clears_behavior_gates(&st);
+            if quality > best_any_quality {
+                best_any_quality = quality;
+                best_any_policy = policy.clone();
+                best_any_iter = it;
+            }
+            if gated && best_gated.as_ref().is_none_or(|(_, _, q)| quality > *q) {
+                best_gated = Some((policy.clone(), it, quality));
             }
             println!(
-                "{:>5} | {:>+10.3} | {:>8.3} | {:>6.2} {:>6.2} | sp {:>4.1} | bunch {:>3.0}% | pass {:>4.1} ({:.0}%) | shot {:>3.1}",
-                it, st.goal_diff, st.winrate, st.ga, st.gb, st.spacing, st.bunch * 100.0,
-                st.pass_att, st.pass_completion() * 100.0, st.shots
+                "{:>5} | {:>+10.3} | {:>8.3} | {:>6.2} {:>6.2} | sp {:>4.1} | {:>6} | pass {:>4.1} ({:.0}%) | shot {:>3.1}",
+                it,
+                st.goal_diff,
+                st.winrate,
+                st.ga,
+                st.gb,
+                st.spacing,
+                if gated { "ok" } else { "watch" },
+                st.pass_att,
+                st.pass_completion() * 100.0,
+                st.shots
             );
-            csv.push_str(&csv_row(it, &st, stats.entropy, stats.value_loss));
+            csv.push_str(&csv_row(
+                it,
+                &st,
+                stats.avg_reward,
+                stats.entropy,
+                stats.value_loss,
+            ));
         }
     }
 
-    fs::write("out/learning_curve.csv", &csv).ok();
-    println!("\nwrote out/learning_curve.csv");
-    println!("best policy at iter {} (eval goal_diff {:+.3})", best_iter, best_diff);
+    let curve_path = cfg.out_dir.join("learning_curve.csv");
+    write_atomic(&curve_path, &csv)?;
+    println!("\nwrote {}", curve_path.display());
 
-    // Everything below showcases the BEST snapshot, not the collapsed final.
-    let policy = best_policy;
+    let (policy, best_iter, best_quality, best_cleared_gates) = if let Some((
+        policy,
+        iter,
+        quality,
+    )) = best_gated
+    {
+        (policy, iter, quality, true)
+    } else {
+        eprintln!(
+                "warning: no checkpoint cleared the behavior gates; persisting best observed checkpoint with manifest flag"
+            );
+        (best_any_policy, best_any_iter, best_any_quality, false)
+    };
+    println!(
+        "best policy at iter {} (quality {:+.3}, gates={})",
+        best_iter, best_quality, best_cleared_gates
+    );
+
+    // Everything below showcases the selected snapshot, not the collapsed final.
     // Persist the trained policy so `inspect` can load and trace it.
-    policy.actor.save("out/actor.txt").ok();
-    policy.critic.save("out/critic.txt").ok();
-    println!("saved policy -> out/actor.txt, out/critic.txt");
+    let actor_path = cfg.out_dir.join("actor.txt");
+    let critic_path = cfg.out_dir.join("critic.txt");
+    policy.actor.save(&actor_path)?;
+    policy.critic.save(&critic_path)?;
+    println!(
+        "saved policy -> {}, {}",
+        actor_path.display(),
+        critic_path.display()
+    );
 
     // Final richer evaluation.
-    let f = train::evaluate(&policy, 300, &mut rng);
+    let f = train::evaluate(&policy, cfg.final_games, &mut rng);
     // append the FINAL row so the viz has the trained model's full stat line
-    csv.push_str(&csv_row(best_iter, &f, 0.0, 0.0));
-    fs::write("out/learning_curve.csv", &csv).ok();
+    csv.push_str(&csv_row(best_iter, &f, 0.0, 0.0, 0.0));
+    write_atomic(&curve_path, &csv)?;
     println!(
-        "\nFINAL (300 games): goal_diff={:+.3}  winrate={:.3}  goals {:.2}-{:.2}  passes/game {:.1}  spacing={:.1}  bunch={:.0}%",
-        f.goal_diff, f.winrate, f.ga, f.gb, f.pass_cmp, f.spacing, f.bunch * 100.0
+        "\nFINAL ({} games): goal_diff={:+.3}  winrate={:.3}  goals {:.2}-{:.2}  passes/game {:.1}  spacing={:.1}  bunch={:.0}%",
+        cfg.final_games, f.goal_diff, f.winrate, f.ga, f.gb, f.pass_cmp, f.spacing, f.bunch * 100.0
     );
     println!(
         "  pass: {:.1} att, {:.0}% complete ({:.0}% fwd / {:.0}% lat / {:.0}% back) | shots {:.1}, {:.0}% converted | poss {:.0}% | turnovers {:.1} | balls won {:.1}",
@@ -332,18 +534,18 @@ fn run_training(iters: usize) {
     // stringing passes; the untrained side (same seed) should be clearly worse.
     let mut best_seed = 1u64;
     let mut best_score = f32::NEG_INFINITY;
-    for s in 1..=120u64 {
+    for s in 1..=cfg.display_seed_max {
         let (bga, bgb, ba_poss, _) = game_stats(&untrained, s);
         let (aga, agb, aa_poss, a_pass) = game_stats(&policy, s);
         let before_m = bga as f32 - bgb as f32;
         let after_m = aga as f32 - agb as f32;
         // hard filter: trained wins by 1..=4, untrained doesn't win
-        if before_m > 0.0 || after_m < 1.0 || after_m > 4.0 {
+        if before_m > 0.0 || !(1.0..=4.0).contains(&after_m) {
             continue;
         }
         // reward possession dominance + completed passes + possession swing
-        let score = aa_poss as f32 * 0.02 + a_pass as f32 * 0.4
-            + (aa_poss as f32 - ba_poss as f32) * 0.01;
+        let score =
+            aa_poss as f32 * 0.02 + a_pass as f32 * 0.4 + (aa_poss as f32 - ba_poss as f32) * 0.01;
         if score > best_score {
             best_score = score;
             best_seed = s;
@@ -355,9 +557,67 @@ fn run_training(iters: usize) {
         "display seed {}: before {}-{} (poss {})  ->  after {}-{} (poss {}, passes {})",
         best_seed, bga, bgb, bposs, aga, agb, aposs, apass
     );
-    record_match(&untrained, &mut Rng::new(best_seed), "out/match_before.json");
-    record_match(&policy, &mut Rng::new(best_seed), "out/match_after.json");
-    println!("wrote out/match_before.json + out/match_after.json (visual demo traces)");
+    let before_path = cfg.out_dir.join("match_before.json");
+    let after_path = cfg.out_dir.join("match_after.json");
+    record_match(&untrained, &mut Rng::new(best_seed), &before_path)?;
+    record_match(&policy, &mut Rng::new(best_seed), &after_path)?;
+    println!(
+        "wrote {} + {} (visual demo traces)",
+        before_path.display(),
+        after_path.display()
+    );
+
+    let manifest_path = cfg.out_dir.join("run_manifest.json");
+    write_run_manifest(
+        &manifest_path,
+        cfg,
+        best_iter,
+        best_quality,
+        best_cleared_gates,
+        best_seed,
+        (svs, sga, sgb),
+        &s0,
+        &f,
+        &[
+            &actor_path,
+            &critic_path,
+            &curve_path,
+            &before_path,
+            &after_path,
+        ],
+    )?;
+    println!("wrote {}", manifest_path.display());
+    Ok(())
+}
+
+fn checkpoint_quality(st: &train::Stats) -> f32 {
+    let mut q = st.goal_diff.min(3.0) + (st.pass_cmp * 0.03).min(0.6) - 1.6 * st.bunch;
+    if st.winrate < 0.55 {
+        q -= 0.8;
+    }
+    if st.shots < 1.0 {
+        q -= 1.2;
+    }
+    if st.pass_cmp < 2.0 {
+        q -= 0.7;
+    }
+    if st.conversion() <= 0.0 {
+        q -= 0.6;
+    }
+    if st.possession < 0.03 {
+        q -= 0.4;
+    }
+    q
+}
+
+fn checkpoint_clears_behavior_gates(st: &train::Stats) -> bool {
+    st.goal_diff > 0.0
+        && st.winrate >= 0.55
+        && st.pass_cmp >= 2.0
+        && st.shots >= 1.0
+        && st.conversion() > 0.0
+        && st.possession >= 0.03
+        && st.bunch <= 0.50
 }
 
 /// Play a greedy game vs scripted at `seed`; return
@@ -388,7 +648,7 @@ fn game_stats(policy: &train::Policy, seed: u64) -> (u32, u32, u32, u32) {
 
 /// Play one greedy game and dump per-tick positions to a compact JSON for the
 /// HTML viewer. Hand-rolled JSON — no serde, keeping the crate dependency-free.
-fn record_match(policy: &train::Policy, rng: &mut Rng, path: &str) {
+fn record_match(policy: &train::Policy, rng: &mut Rng, path: &Path) -> AppResult<()> {
     let mut w = World::new();
     let mut frames = String::new();
     frames.push('[');
@@ -437,5 +697,162 @@ fn record_match(policy: &train::Policy, rng: &mut Rng, path: &str) {
         "{{\"field\":[{},{}],\"goal_half\":{},\"n\":{},\"hz\":{},\"frames\":{}}}",
         FIELD_L, FIELD_W, GOAL_HALF, N, HZ, frames
     );
-    fs::write(path, meta).ok();
+    write_atomic(path, &meta)?;
+    Ok(())
+}
+
+fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("artifact");
+    let tmp = path.with_file_name(format!(".{file_name}.tmp.{}", std::process::id()));
+    fs::write(&tmp, contents)?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_run_manifest(
+    path: &Path,
+    cfg: &RunConfig,
+    best_iter: usize,
+    best_quality: f32,
+    best_cleared_gates: bool,
+    display_seed: u64,
+    scripted: (f32, f32, f32),
+    untrained: &train::Stats,
+    final_stats: &train::Stats,
+    artifacts: &[&PathBuf],
+) -> AppResult<()> {
+    let created = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let mut artifact_json = String::new();
+    artifact_json.push('[');
+    for (i, artifact) in artifacts.iter().enumerate() {
+        if i > 0 {
+            artifact_json.push(',');
+        }
+        let checksum = checksum_file(artifact)?;
+        let bytes = fs::metadata(artifact)?.len();
+        let _ = write!(
+            artifact_json,
+            "{{\"path\":{},\"bytes\":{},\"fnv1a64\":\"{}\"}}",
+            json_string(&artifact.display().to_string()),
+            bytes,
+            checksum
+        );
+    }
+    artifact_json.push(']');
+
+    let spacing_w = std::env::var("SPACING_W").ok();
+    let manifest = format!(
+        concat!(
+            "{{\n",
+            "  \"created_unix_seconds\": {},\n",
+            "  \"git_commit\": {},\n",
+            "  \"config\": {{\"iters\":{},\"seed\":{},\"games_per_iter\":{},\"eval_every\":{},\"eval_games\":{},\"final_games\":{},\"display_seed_max\":{},\"out_dir\":{}}},\n",
+            "  \"env\": {{\"SPACING_W\": {}}},\n",
+            "  \"selection\": {{\"best_iter\":{},\"best_quality\":{:.6},\"best_cleared_hardening_gates\":{},\"display_seed\":{}}},\n",
+            "  \"scripted_vs_scripted\": {{\"goal_diff\":{:.6},\"goals_a\":{:.6},\"goals_b\":{:.6}}},\n",
+            "  \"untrained\": {},\n",
+            "  \"final\": {},\n",
+            "  \"artifacts\": {}\n",
+            "}}\n"
+        ),
+        created,
+        json_string(&git_commit()),
+        cfg.iters,
+        cfg.seed,
+        cfg.games_per_iter,
+        cfg.eval_every,
+        cfg.eval_games,
+        cfg.final_games,
+        cfg.display_seed_max,
+        json_string(&cfg.out_dir.display().to_string()),
+        spacing_w.as_deref().map(json_string).unwrap_or_else(|| "null".to_string()),
+        best_iter,
+        best_quality,
+        best_cleared_gates,
+        display_seed,
+        scripted.0,
+        scripted.1,
+        scripted.2,
+        stats_json(untrained),
+        stats_json(final_stats),
+        artifact_json
+    );
+    write_atomic(path, &manifest)?;
+    Ok(())
+}
+
+fn stats_json(s: &train::Stats) -> String {
+    format!(
+        "{{\"goal_diff\":{:.6},\"winrate\":{:.6},\"goals_a\":{:.6},\"goals_b\":{:.6},\"spacing\":{:.6},\"bunch\":{:.6},\"possession\":{:.6},\"pass_att\":{:.6},\"pass_cmp\":{:.6},\"pass_completion\":{:.6},\"pass_fwd\":{:.6},\"pass_lat\":{:.6},\"pass_back\":{:.6},\"shots\":{:.6},\"shots_scored\":{:.6},\"conversion\":{:.6},\"turnovers\":{:.6},\"balls_won\":{:.6}}}",
+        s.goal_diff,
+        s.winrate,
+        s.ga,
+        s.gb,
+        s.spacing,
+        s.bunch,
+        s.possession,
+        s.pass_att,
+        s.pass_cmp,
+        s.pass_completion(),
+        s.pass_fwd,
+        s.pass_lat,
+        s.pass_back,
+        s.shots,
+        s.shots_scored,
+        s.conversion(),
+        s.turnovers,
+        s.wins_won
+    )
+}
+
+fn checksum_file(path: &Path) -> AppResult<String> {
+    let bytes = fs::read(path)?;
+    let mut hash = 0xcbf29ce484222325u64;
+    for b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Ok(format!("{hash:016x}"))
+}
+
+fn git_commit() -> String {
+    Command::new("git")
+        .args(["rev-parse", "--short=12", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|out| {
+            if out.status.success() {
+                Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+            } else {
+                None
+            }
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn json_string(s: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }

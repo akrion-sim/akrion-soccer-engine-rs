@@ -38,15 +38,32 @@ from the surrounding cargo workspace so it builds in complete isolation.
 ## Run it
 ```bash
 cargo run --release -- sanity        # scripted-vs-scripted symmetry check (~0.0)
-cargo run --release -- train 80      # train; writes out/learning_curve.csv + traces
-./viz/serve.sh                       # assemble the page + serve on localhost:5060
+cargo run --release -- train 80      # writes out/learning_curve.csv, run_manifest.json, model + traces
+./viz/serve.sh                       # assemble the page + serve on localhost:8080
+```
+
+Useful reproducibility knobs:
+```bash
+cargo run --release -- train 80 --seed 20260710 --eval-games 80 --final-games 300
+SPACING_W=0.003 cargo run --release -- train 80
+PORT=5060 ./viz/serve.sh
 ```
 
 ## Result (representative)
-- Untrained policy: loses, never keeps the ball.
-- Trained (best checkpoint, ~iter 40, ~3 min): **goal-diff ≈ +0.85, ~71% win**,
-  ~2 goals/game, **~11 completed passes/game** — it presses to win the ball,
-  passes to teammates in space, carries, and places shots past the keeper.
+- Untrained policy: typically loses and struggles to keep the ball.
+- Trained policy: use `out/run_manifest.json` and the generated page as the
+  source of truth. The selected checkpoint records whether it cleared the
+  behavior hardening gates (positive goal diff, nonzero shots/conversion,
+  completed passes, possession floor, and bunching cap).
+
+## Hardening
+- `cargo test --locked` covers deterministic PRNG replay, masked softmax,
+  model save/load validation, observation/global-state finiteness, legal-action
+  masking, the 2-pass shot gate, goal validity, and evaluation metric bounds.
+- `cargo clippy --locked --all-targets -- -D warnings` is intended to stay clean.
+- Generated model/viz artifacts are tied together by `out/run_manifest.json`
+  with git commit, seed/config/env, selected checkpoint, final holdout stats,
+  and checksums for the saved actor/critic/CSV/traces.
 
 ## The honest frontier
 The emergent style is *direct-ish* — dominant, coordinated multi-pass build-up is

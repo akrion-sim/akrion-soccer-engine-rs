@@ -5,20 +5,22 @@
 //! hand-rolled so every gradient is inspectable — the opposite of a black box.
 
 use crate::rng::Rng;
+use std::io::{Error, ErrorKind};
+use std::path::Path;
 
 #[derive(Clone)]
 pub struct Mlp {
-    sizes: Vec<usize>,     // e.g. [in, 64, 64, out]
-    w: Vec<Vec<f32>>,      // per layer, row-major [out*in]
-    b: Vec<Vec<f32>>,      // per layer [out]
-    gw: Vec<Vec<f32>>,     // grad accumulators
+    sizes: Vec<usize>, // e.g. [in, 64, 64, out]
+    w: Vec<Vec<f32>>,  // per layer, row-major [out*in]
+    b: Vec<Vec<f32>>,  // per layer [out]
+    gw: Vec<Vec<f32>>, // grad accumulators
     gb: Vec<Vec<f32>>,
-    mw: Vec<Vec<f32>>,     // Adam moments
+    mw: Vec<Vec<f32>>, // Adam moments
     vw: Vec<Vec<f32>>,
     mb: Vec<Vec<f32>>,
     vb: Vec<Vec<f32>>,
-    t: f32,                // Adam timestep
-    grad_count: f32,       // samples accumulated since last step
+    t: f32,          // Adam timestep
+    grad_count: f32, // samples accumulated since last step
 }
 
 impl Mlp {
@@ -45,9 +47,22 @@ impl Mlp {
             mb.push(vec![0.0f32; fout]);
             vb.push(vec![0.0f32; fout]);
         }
-        Mlp { sizes: sizes.to_vec(), w, b, gw, gb, mw, vw, mb, vb, t: 0.0, grad_count: 0.0 }
+        Mlp {
+            sizes: sizes.to_vec(),
+            w,
+            b,
+            gw,
+            gb,
+            mw,
+            vw,
+            mb,
+            vb,
+            t: 0.0,
+            grad_count: 0.0,
+        }
     }
 
+    #[allow(dead_code)]
     pub fn out_dim(&self) -> usize {
         *self.sizes.last().unwrap()
     }
@@ -154,39 +169,97 @@ impl Mlp {
 impl Mlp {
     /// Persist weights to a simple text file: line 1 = sizes; then per layer a
     /// weights line and a biases line (space-separated f32). Zero deps.
-    pub fn save(&self, path: &str) -> std::io::Result<()> {
+    pub fn save<P: AsRef<Path>>(&self, path: P) -> std::io::Result<()> {
         let mut s = String::new();
         s.push_str(
-            &self.sizes.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" "),
+            &self
+                .sizes
+                .iter()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>()
+                .join(" "),
         );
         s.push('\n');
         for l in 0..self.w.len() {
-            s.push_str(&self.w[l].iter().map(|x| format!("{}", x)).collect::<Vec<_>>().join(" "));
+            s.push_str(
+                &self.w[l]
+                    .iter()
+                    .map(|x| format!("{}", x))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
             s.push('\n');
-            s.push_str(&self.b[l].iter().map(|x| format!("{}", x)).collect::<Vec<_>>().join(" "));
+            s.push_str(
+                &self.b[l]
+                    .iter()
+                    .map(|x| format!("{}", x))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
             s.push('\n');
         }
         std::fs::write(path, s)
     }
 
     /// Load weights saved by `save` (fresh Mlp; Adam state reset).
-    pub fn load(path: &str) -> std::io::Result<Self> {
+    pub fn load<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
         let txt = std::fs::read_to_string(path)?;
         let mut lines = txt.lines();
-        let sizes: Vec<usize> =
-            lines.next().unwrap().split_whitespace().map(|x| x.parse().unwrap()).collect();
+        let sizes_line = lines
+            .next()
+            .ok_or_else(|| invalid_data("missing layer-size line"))?;
+        let sizes: Vec<usize> = parse_values(sizes_line, "layer size")?;
+        if sizes.len() < 2 || sizes.contains(&0) {
+            return Err(invalid_data(
+                "model must have at least input and output layers",
+            ));
+        }
         let mut seed = Rng::new(0);
         let mut m = Mlp::new(&sizes, &mut seed);
         for l in 0..m.w.len() {
-            let wl: Vec<f32> =
-                lines.next().unwrap().split_whitespace().map(|x| x.parse().unwrap()).collect();
-            let bl: Vec<f32> =
-                lines.next().unwrap().split_whitespace().map(|x| x.parse().unwrap()).collect();
+            let wl_line = lines
+                .next()
+                .ok_or_else(|| invalid_data(format!("missing weights for layer {l}")))?;
+            let bl_line = lines
+                .next()
+                .ok_or_else(|| invalid_data(format!("missing biases for layer {l}")))?;
+            let wl: Vec<f32> = parse_values(wl_line, "weight")?;
+            let bl: Vec<f32> = parse_values(bl_line, "bias")?;
+            if wl.len() != m.w[l].len() {
+                return Err(invalid_data(format!(
+                    "layer {l} has {} weights, expected {}",
+                    wl.len(),
+                    m.w[l].len()
+                )));
+            }
+            if bl.len() != m.b[l].len() {
+                return Err(invalid_data(format!(
+                    "layer {l} has {} biases, expected {}",
+                    bl.len(),
+                    m.b[l].len()
+                )));
+            }
             m.w[l] = wl;
             m.b[l] = bl;
         }
+        if lines.any(|line| !line.trim().is_empty()) {
+            return Err(invalid_data("extra non-empty lines after final layer"));
+        }
         Ok(m)
     }
+}
+
+fn parse_values<T: std::str::FromStr>(line: &str, label: &str) -> std::io::Result<Vec<T>> {
+    line.split_whitespace()
+        .map(|x| {
+            x.parse::<T>()
+                .map_err(|_| invalid_data(format!("invalid {label}: {x}")))
+        })
+        .collect()
+}
+
+fn invalid_data(msg: impl Into<String>) -> Error {
+    Error::new(ErrorKind::InvalidData, msg.into())
 }
 
 /// Numerically stable masked softmax. Masked entries get probability 0.
@@ -212,4 +285,55 @@ pub fn masked_softmax(logits: &[f32], mask: &[bool]) -> Vec<f32> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn masked_softmax_zeroes_illegal_actions_and_normalizes() {
+        let probs = masked_softmax(&[1.0, 5.0, -1.0], &[true, false, true]);
+        assert_eq!(probs[1], 0.0);
+        let sum: f32 = probs.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6);
+        assert!(probs[0] > probs[2]);
+    }
+
+    #[test]
+    fn model_save_load_round_trips_predictions() {
+        let mut rng = Rng::new(42);
+        let model = Mlp::new(&[3, 4, 2], &mut rng);
+        let path = std::env::temp_dir().join(format!(
+            "fiveaside-model-roundtrip-{}-{}.txt",
+            std::process::id(),
+            rng.next_u64()
+        ));
+        model.save(&path).unwrap();
+        let loaded = Mlp::load(&path).unwrap();
+        let x = [0.25, -0.5, 0.75];
+        let a = model.predict(&x);
+        let b = loaded.predict(&x);
+        assert_eq!(model.out_dim(), loaded.out_dim());
+        for (av, bv) in a.iter().zip(b.iter()) {
+            assert!((av - bv).abs() < 1e-6);
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn malformed_model_load_returns_invalid_data() {
+        let path = std::env::temp_dir().join(format!(
+            "fiveaside-bad-model-{}-{}.txt",
+            std::process::id(),
+            99
+        ));
+        std::fs::write(&path, "3 2\n1 2\n").unwrap();
+        let err = match Mlp::load(&path) {
+            Ok(_) => panic!("malformed model loaded successfully"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        let _ = std::fs::remove_file(path);
+    }
 }

@@ -278,10 +278,11 @@ const META   = /*__META__*/ null;
     {k:'Format',v:'<b>5 v 5</b> with keepers, ~7m net, ~40s games'},
     {k:'Teammate spacing',v:`nearest teammate <b>~${META.spacing}</b> units · <b>${META.bunch}%</b> bunched (target 5)`},
     {k:'Finishing',v:'short-horizon <b>aim optimizer</b> places shots past the keeper'},
+    {k:'Hardening gate',v:`selected checkpoint <b>${META.gate}</b> · git <code>${META.git}</code>`},
     {k:'Learner + algo',v:'4 outfielders, <b>PPO</b>+<b>GAE</b>, <b>0</b> deps (own MLP/backprop)'},
   ];
   document.getElementById('facts').innerHTML=facts.map(f=>`<div class="fact"><div class="k">${f.k}</div><div class="v">${f.v}</div></div>`).join('');
-  document.getElementById('foot').innerHTML='Isolated git worktree · <code>cargo run --release -- train</code> · same opening seed for both matches so the contrast is the policy, not the dice. Curve shown to the best checkpoint (early stopping — PPO over-trains past the peak).';
+  document.getElementById('foot').innerHTML='Isolated git worktree · <code>cargo run --release -- train</code> · run metadata comes from <code>out/run_manifest.json</code> · display seed '+META.display_seed+' uses the same opening seed for both matches so the contrast is the policy, not the dice.';
 })();
 
 // ---------- match analytics ----------
