@@ -88,8 +88,10 @@ off-policy. Fix all three and dense-reward RL climbs steeply on its own.
 
 The state the net conditions on is the **whole-field moment**: for all 22 players + the ball,
 the actor-relative canonical **(position, velocity, acceleration, jerk)** — 8 numbers/entity,
-23 entities = a 184-dim motion block inside the 610-dim feature vector (`inputDim=610`,
-`FIELD_MOTION_PER_PLAYER=8`). This is the right raw signal. Here is how to use it well.
+23 entities = a 184-dim motion block inside the 620-dim feature vector
+(`SOCCER_NEURAL_FEATURE_DIM=620`, `FIELD_MOTION_PER_PLAYER=8`; the earlier 610 was the subtotal
+before the final 10-dim action-param block was appended). This is the right raw signal. Here is
+how to use it well.
 
 ### Why neural nets are the right tool for it
 
@@ -148,8 +150,9 @@ without a database.)
    the relational-attention block already exists to build on.
 2. **Keep the actor-relative canonical frame + per-channel normalisation** (done) — it's what
    makes "same situation" look the same.
-3. **Grow network capacity if it plateaus** — the local run is already at 64 hidden units on
-   a 610-dim input; 128 is the next lever once on-policy training flattens.
+3. **Grow network capacity if it plateaus** — the local run is now at 128 hidden units
+   (`DEFAULT_SOCCER_NEURAL_HIDDEN_UNITS = 128`, soccer.rs:5423) on a 620-dim input; 256 is the
+   next capacity lever once on-policy training flattens.
 4. **Use the velocity/acceleration/jerk channels, not just position** — they let the value
    head reason about *where play is going*, not just where it is; the block already carries
    them (V2 added jerk over V1).
@@ -166,7 +169,7 @@ the reference (clean 12-game Δ ≈ 0 at 128k), the net is genuinely deciding on
 **not** yet confidently beating the reference/analytic engine — the head-to-head is noisy at
 12 games and needs a bigger sample or a frozen eval pool to state the level precisely. Next
 levers to push past "competitive" toward "clearly better": **relational-attention over the
-entities** (biggest representational upgrade), **more capacity** (24 → 64/128 hidden units),
+entities** (biggest representational upgrade), **more capacity** (now at 128 hidden units; 256 next),
 keep exploiting the velocity/accel/jerk channels, and **embedding-space retrieval** for rare
 states — plus a **lower-variance eval** (frozen diverse pool, more games) so we stop chasing
 noisy single samples.
