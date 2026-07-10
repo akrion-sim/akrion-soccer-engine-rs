@@ -691,10 +691,74 @@ fn rotate(v: V2, ang: f32) -> V2 {
     V2::new(v.x * c - v.y * s, v.x * s + v.y * c)
 }
 
-// A scratch field on World for the intended pass receiver. Declared here via a
-// second impl block that only adds the field would be impossible in Rust, so it
-// lives in the struct — see note. (Added to struct above.)
+// ---------------------------------------------------------------------------
+// Scripted "analytic-lite" baseline. Coherent soccer with simple heuristics —
+// this is BOTH Team B's controller and the benchmark the learner must beat.
+// ---------------------------------------------------------------------------
 impl World {
-    #[allow(dead_code)]
-    fn _touch(&self) {}
+    pub fn scripted_actions(&self, team: Team) -> [usize; N] {
+        let mut acts = [A_STAY; N];
+        let owner = self.owner;
+        let team_owns = matches!(owner, Some(o) if o.team == team);
+        // rank teammates by distance to ball for role assignment
+        let mut order: Vec<(usize, f32)> =
+            (0..N).map(|i| (i, players(team, self)[i].pos.sub(self.ball).len())).collect();
+        order.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+
+        for i in 0..N {
+            let me = players(team, self)[i].pos;
+            let is_owner = matches!(owner, Some(o) if o.team == team && o.idx == i);
+            if is_owner {
+                acts[i] = self.scripted_on_ball(team, i, me);
+            } else if team_owns {
+                // supporters: the closest non-owner pushes up; others spread; deepest holds.
+                let rank = order.iter().position(|&(j, _)| j == i).unwrap();
+                acts[i] = if rank <= 1 { A_SUPPORT } else if rank == N - 1 { A_MARK } else { A_SPREAD };
+            } else {
+                // defend: nearest to ball chases, rest mark.
+                acts[i] = if order[0].0 == i { A_CHASE } else { A_MARK };
+            }
+        }
+        acts
+    }
+
+    fn scripted_on_ball(&self, team: Team, idx: usize, me: V2) -> usize {
+        let sx = team.sx();
+        let goal = team.target_goal();
+        let shot_dist = goal.sub(me).len();
+        let clear = self.shot_clearness(team, me);
+        let (_, opp_d) = self.nearest_opponent(team, me);
+
+        // in range and lane reasonably open -> shoot
+        if shot_dist < 26.0 && clear > 0.4 {
+            return A_SHOOT;
+        }
+        let cands = self.pass_candidates(team, idx);
+        let pressured = opp_d < 4.0;
+        if pressured {
+            // pass to best forward-open option if one is genuinely ahead
+            if let Some((ti, _)) = cands[0] {
+                let tp = players(team, self)[ti].pos;
+                if (tp.x - me.x) * sx > -3.0 {
+                    return A_PASS_A;
+                }
+            }
+            // no outlet & deep in own half -> clear, else try to carry out
+            if (me.x - team.own_goal().x).abs() < FIELD_L * 0.33 {
+                return A_CLEAR;
+            }
+            // dribble away from the nearest opponent laterally
+            let (oi, _) = self.nearest_opponent(team, me);
+            let opp = players(team.other(), self)[oi].pos;
+            return if opp.y > me.y { A_DRIB_LEFT } else { A_DRIB_RIGHT };
+        }
+        // unpressured: is an opponent directly ahead in my forward cone?
+        let (oi, od) = self.nearest_opponent(team, me);
+        let opp = players(team.other(), self)[oi].pos;
+        let ahead = (opp.x - me.x) * sx;
+        if od < 8.0 && ahead > 0.0 && (opp.y - me.y).abs() < 4.0 {
+            return if opp.y > me.y { A_DRIB_LEFT } else { A_DRIB_RIGHT };
+        }
+        A_DRIB_FWD
+    }
 }
