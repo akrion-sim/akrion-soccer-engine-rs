@@ -3,8 +3,8 @@
 //!
 //! It answers one question with statistics: does training with the neural/DP learning stack
 //! *cause* passing to improve — measured primarily by PASS COMPLETION RATE and
-//! completed forward passes, with yards/completed-pass, route-one, shots-on-target,
-//! and dribble success as guardrails — against a FROZEN opponent so there is no
+//! completed forward passes, with yards/completed-pass, route-one, pass-turnovers,
+//! shots-on-target, and dribble success as guardrails — against a FROZEN opponent so there is no
 //! self-play moving-target confound.
 //!
 //! Subcommands:
@@ -323,7 +323,8 @@ struct TeamMetrics {
     assists: f64,
     dribble_beats: f64,
     route_one: f64,
-    interceptions: f64,
+    interceptions_won: f64,
+    pass_turnovers: f64,
 }
 
 fn home_metrics(st: &MatchStats) -> TeamMetrics {
@@ -341,7 +342,8 @@ fn home_metrics(st: &MatchStats) -> TeamMetrics {
         assists: f64::from(st.assists_home),
         dribble_beats: f64::from(st.dribble_beats_home),
         route_one: f64::from(st.route_one_balls_home),
-        interceptions: f64::from(st.interceptions_home),
+        interceptions_won: f64::from(st.interceptions_home),
+        pass_turnovers: f64::from(st.interceptions_away),
     }
 }
 fn away_metrics(st: &MatchStats) -> TeamMetrics {
@@ -359,7 +361,8 @@ fn away_metrics(st: &MatchStats) -> TeamMetrics {
         assists: f64::from(st.assists_away),
         dribble_beats: f64::from(st.dribble_beats_away),
         route_one: f64::from(st.route_one_balls_away),
-        interceptions: f64::from(st.interceptions_away),
+        interceptions_won: f64::from(st.interceptions_away),
+        pass_turnovers: f64::from(st.interceptions_home),
     }
 }
 
@@ -516,6 +519,7 @@ fn eval(cand_spec: &str, base_spec: &str, games: usize, minutes: f64, holdout: u
     let mut d_completion_rate: Vec<f64> = Vec::with_capacity(games);
     let mut d_fwd: Vec<f64> = Vec::with_capacity(games);
     let mut d_yards: Vec<f64> = Vec::with_capacity(games);
+    let mut d_pass_turnover_rate_improvement: Vec<f64> = Vec::with_capacity(games);
     // Totals for rate/guardrail reporting.
     let mut c = TeamMetrics::default();
     let mut b = TeamMetrics::default();
@@ -534,6 +538,8 @@ fn eval(cand_spec: &str, base_spec: &str, games: usize, minutes: f64, holdout: u
         d_completion_rate.push(safe_ratio(cm.comp, cm.att) - safe_ratio(bm.comp, bm.att));
         d_fwd.push(cm.fwd - bm.fwd);
         d_yards.push(cm.gain_yards - bm.gain_yards);
+        d_pass_turnover_rate_improvement
+            .push(safe_ratio(bm.pass_turnovers, bm.att) - safe_ratio(cm.pass_turnovers, cm.att));
         acc!(
             c,
             cm,
@@ -550,7 +556,8 @@ fn eval(cand_spec: &str, base_spec: &str, games: usize, minutes: f64, holdout: u
             assists,
             dribble_beats,
             route_one,
-            interceptions
+            interceptions_won,
+            pass_turnovers
         );
         acc!(
             b,
@@ -568,17 +575,21 @@ fn eval(cand_spec: &str, base_spec: &str, games: usize, minutes: f64, holdout: u
             assists,
             dribble_beats,
             route_one,
-            interceptions
+            interceptions_won,
+            pass_turnovers
         );
         if let Some(w) = jsonl.as_mut() {
             let _ = writeln!(
                 w,
-                "{{\"seed\":{},\"cand_home\":{},\"c_goals\":{},\"b_goals\":{},\"c_shots\":{},\"b_shots\":{},\"c_sot\":{},\"b_sot\":{},\"c_att\":{},\"b_att\":{},\"c_comp\":{},\"b_comp\":{},\"c_fwd\":{},\"b_fwd\":{},\"c_back\":{},\"b_back\":{},\"c_yards\":{:.3},\"b_yards\":{:.3},\"c_chains\":{},\"b_chains\":{},\"c_sap\":{},\"b_sap\":{},\"c_assist\":{},\"b_assist\":{},\"c_drib\":{},\"b_drib\":{},\"c_route1\":{},\"b_route1\":{},\"c_int\":{},\"b_int\":{}}}",
+                "{{\"seed\":{},\"cand_home\":{},\"c_goals\":{},\"b_goals\":{},\"c_shots\":{},\"b_shots\":{},\"c_sot\":{},\"b_sot\":{},\"c_att\":{},\"b_att\":{},\"c_comp\":{},\"b_comp\":{},\"c_fwd\":{},\"b_fwd\":{},\"c_back\":{},\"b_back\":{},\"c_yards\":{:.3},\"b_yards\":{:.3},\"c_chains\":{},\"b_chains\":{},\"c_sap\":{},\"b_sap\":{},\"c_assist\":{},\"b_assist\":{},\"c_drib\":{},\"b_drib\":{},\"c_route1\":{},\"b_route1\":{},\"c_int\":{},\"b_int\":{},\"c_int_won\":{},\"b_int_won\":{},\"c_pto\":{},\"b_pto\":{}}}",
                 seed, cand_home,
                 cm.goals, bm.goals, cm.shots, bm.shots, cm.sot, bm.sot, cm.att, bm.att,
                 cm.comp, bm.comp, cm.fwd, bm.fwd, cm.back, bm.back, cm.gain_yards, bm.gain_yards,
                 cm.chains, bm.chains, cm.shots_after_pass, bm.shots_after_pass, cm.assists, bm.assists,
-                cm.dribble_beats, bm.dribble_beats, cm.route_one, bm.route_one, cm.interceptions, bm.interceptions
+                cm.dribble_beats, bm.dribble_beats, cm.route_one, bm.route_one,
+                cm.interceptions_won, bm.interceptions_won,
+                cm.interceptions_won, bm.interceptions_won,
+                cm.pass_turnovers, bm.pass_turnovers
             );
             let _ = w.flush(); // durable per-game so killed workers keep data & progress is monitorable
         }
@@ -603,14 +614,20 @@ fn eval(cand_spec: &str, base_spec: &str, games: usize, minutes: f64, holdout: u
     let completion_rate_stat = paired_stat(&d_completion_rate);
     let fwd_stat = paired_stat(&d_fwd);
     let yards_stat = paired_stat(&d_yards);
+    let pass_turnover_rate_improvement_stat = paired_stat(&d_pass_turnover_rate_improvement);
     let cand_yards_per_pass = safe_ratio(c.gain_yards, c.comp);
     let base_yards_per_pass = safe_ratio(b.gain_yards, b.comp);
     let yards_per_pass_delta = cand_yards_per_pass - base_yards_per_pass;
     let route_one_delta_pg = (c.route_one - b.route_one) / nf;
+    let cand_pass_turnover_rate = safe_ratio(c.pass_turnovers, c.att);
+    let base_pass_turnover_rate = safe_ratio(b.pass_turnovers, b.att);
+    let pass_turnover_rate_delta = cand_pass_turnover_rate - base_pass_turnover_rate;
     let yards_guard_floor = env_f64("SOCCER_PROOF_MIN_YARDS_PER_PASS_DELTA", -0.25);
     let route_one_guard_max = env_f64("SOCCER_PROOF_MAX_ROUTE_ONE_DELTA_PER_GAME", 0.10);
+    let pass_turnover_rate_guard_max = env_f64("SOCCER_PROOF_MAX_PASS_TURNOVER_RATE_DELTA", 0.0);
     let yards_guard_ok = yards_per_pass_delta >= yards_guard_floor;
     let route_one_guard_ok = route_one_delta_pg <= route_one_guard_max;
+    let pass_turnover_guard_ok = pass_turnover_rate_delta <= pass_turnover_rate_guard_max;
 
     println!("\n===== PASSING PROGRESSION PROOF (candidate − baseline, paired over {n_done} held-out games) =====");
     println!(
@@ -634,22 +651,39 @@ fn eval(cand_spec: &str, base_spec: &str, games: usize, minutes: f64, holdout: u
         "forward YARDS gained/game:     cand {:.1}  base {:.1}  Δ {:+.1}  [95% LB {:+.2}]  [99.99% LB {:+.2}]  n={}",
         c.gain_yards / nf, b.gain_yards / nf, yards_stat.mean, yards_stat.lb95, yards_stat.lb9999, yards_stat.n
     );
+    println!(
+        "pass turnover rate:            cand {:.2}%  base {:.2}%  improvement {:+.2}pp  [95% LB {:+.2}pp]  [99.99% LB {:+.2}pp]  n={}",
+        cand_pass_turnover_rate * 100.0,
+        base_pass_turnover_rate * 100.0,
+        pass_turnover_rate_improvement_stat.mean * 100.0,
+        pass_turnover_rate_improvement_stat.lb95 * 100.0,
+        pass_turnover_rate_improvement_stat.lb9999 * 100.0,
+        pass_turnover_rate_improvement_stat.n
+    );
     let headline = if completion_rate_stat.lb9999 > 0.0
         && fwd_stat.lb9999 > 0.0
         && yards_guard_ok
         && route_one_guard_ok
+        && pass_turnover_guard_ok
     {
-        "PROVEN@99.99% — pass completion rate and completed forward passes have 99.99% lower bounds above zero, with yards/pass and route-one guards intact"
+        "PROVEN@99.99% — pass completion rate and completed forward passes have 99.99% lower bounds above zero, with yards/pass, route-one, and pass-turnover guards intact"
     } else if completion_rate_stat.lb95 > 0.0
         && fwd_stat.lb95 > 0.0
         && yards_guard_ok
         && route_one_guard_ok
+        && pass_turnover_guard_ok
     {
-        "CLIMB@95% — completion rate and completed forward passes are significant at 95%; need more held-out games for 99.99%"
-    } else if completion_rate_stat.mean > 0.0 && fwd_stat.mean > 0.0 && yards_guard_ok {
+        "CLIMB@95% — completion rate and completed forward passes are significant at 95%, with pass-turnover guard intact; need more held-out games for 99.99%"
+    } else if completion_rate_stat.mean > 0.0
+        && fwd_stat.mean > 0.0
+        && yards_guard_ok
+        && pass_turnover_guard_ok
+    {
         "directional — completion rate and forward passing improved on average, not yet significant"
-    } else if fwd_stat.lb95 > 0.0 && yards_guard_ok {
+    } else if fwd_stat.lb95 > 0.0 && yards_guard_ok && pass_turnover_guard_ok {
         "progression-only climb — forward progression is significant, but pass-completion-rate proof is incomplete"
+    } else if !pass_turnover_guard_ok {
+        "anti-gaming guard failed — candidate increased pass turnovers conceded to the opponent"
     } else if fwd_stat.mean > 0.0 || completion_rate_stat.mean > 0.0 {
         "partial directional movement — more held-out games or a better candidate are needed"
     } else {
@@ -677,8 +711,13 @@ fn eval(cand_spec: &str, base_spec: &str, games: usize, minutes: f64, holdout: u
         b.chains / nf
     );
     println!(
-        "guards: yards/pass delta {:+.2} (floor {:+.2}) route-one delta/g {:+.2} (max {:+.2})",
-        yards_per_pass_delta, yards_guard_floor, route_one_delta_pg, route_one_guard_max
+        "guards: yards/pass delta {:+.2} (floor {:+.2}) route-one delta/g {:+.2} (max {:+.2}) pass-turnover rate delta {:+.2}pp (max {:+.2}pp)",
+        yards_per_pass_delta,
+        yards_guard_floor,
+        route_one_delta_pg,
+        route_one_guard_max,
+        pass_turnover_rate_delta * 100.0,
+        pass_turnover_rate_guard_max * 100.0
     );
 
     println!("\n----- guardrails (candidate vs baseline per game) -----");
@@ -711,9 +750,14 @@ fn eval(cand_spec: &str, base_spec: &str, games: usize, minutes: f64, holdout: u
         b.route_one / nf
     );
     println!(
-        "interceptions:{:.2} vs {:.2}",
-        c.interceptions / nf,
-        b.interceptions / nf
+        "pass turnovers:{:.2} vs {:.2}   (lower=better; opponent interceptions)",
+        c.pass_turnovers / nf,
+        b.pass_turnovers / nf
+    );
+    println!(
+        "interceptions won:{:.2} vs {:.2}",
+        c.interceptions_won / nf,
+        b.interceptions_won / nf
     );
     println!("\n[eval] done in {:.0}s", started.elapsed().as_secs_f64());
 }
