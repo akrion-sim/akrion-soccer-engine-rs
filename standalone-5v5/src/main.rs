@@ -226,6 +226,9 @@ fn inspect(seed: u64, out_dir: &Path) -> AppResult<()> {
     };
     let critic = nn::Mlp::load(&critic_path)
         .map_err(|err| format!("failed to load critic at {}: {err}", critic_path.display()))?;
+    let speedor_path = out_dir.join("speedor.txt");
+    let speedor = nn::Mlp::load(&speedor_path)
+        .map_err(|err| format!("failed to load speedor at {}: {err}", speedor_path.display()))?;
     if actor.in_dim() != OBS_DIM || actor.out_dim() != NA {
         return Err(format!(
             "actor shape mismatch in {}: expected input {} / actions {}, got input {} / actions {}; retrain the policy",
