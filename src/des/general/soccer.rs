@@ -15091,7 +15091,7 @@ fn soccer_replay_pitch_value_potential(state: &SoccerMdpState, team: Team) -> f6
         return 0.0;
     };
     let point = soccer_replay_ball_grid_center(state);
-    let threat = expected_threat(
+    let threat = learned_epv_or_expected_threat(
         possession_team,
         point,
         DEFAULT_FIELD_WIDTH_YARDS,

@@ -169,6 +169,8 @@ struct LearnedEpvGrid {
     rows: usize,
     cols: usize,
     grid: Vec<Vec<f64>>,
+    #[serde(default)]
+    counts: Vec<Vec<u64>>,
 }
 
 pub(crate) fn dd_soccer_enable_learned_epv() -> bool {
@@ -185,6 +187,17 @@ pub(crate) fn dd_soccer_enable_learned_epv() -> bool {
     })
 }
 
+fn learned_epv_min_count() -> u64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<u64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_LEARNED_EPV_MIN_COUNT")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    })
+}
+
 fn learned_epv_grid() -> Option<&'static LearnedEpvGrid> {
     use std::sync::OnceLock;
     static GRID: OnceLock<Option<LearnedEpvGrid>> = OnceLock::new();
@@ -192,7 +205,13 @@ fn learned_epv_grid() -> Option<&'static LearnedEpvGrid> {
         let path = std::env::var("DD_SOCCER_LEARNED_EPV_GRID_PATH").ok()?;
         let raw = std::fs::read_to_string(path.trim()).ok()?;
         let g: LearnedEpvGrid = serde_json::from_str(&raw).ok()?;
-        if g.rows == 0 || g.cols == 0 || g.grid.len() != g.rows {
+        if g.rows == 0
+            || g.cols == 0
+            || g.grid.len() != g.rows
+            || g.grid.iter().any(|row| row.len() != g.cols)
+            || (!g.counts.is_empty()
+                && (g.counts.len() != g.rows || g.counts.iter().any(|row| row.len() != g.cols)))
+        {
             return None;
         }
         Some(g)
@@ -215,7 +234,23 @@ pub(crate) fn learned_epv(team: Team, p: Vec2, field_width: f64, field_length: f
     };
     let row = ((fwd * g.rows as f64) as usize).min(g.rows.saturating_sub(1));
     let col = ((lat * g.cols as f64) as usize).min(g.cols.saturating_sub(1));
-    g.grid.get(row).and_then(|r| r.get(col)).copied()
+    let value = g.grid.get(row).and_then(|r| r.get(col)).copied()?;
+    if !value.is_finite() {
+        return None;
+    }
+    let min_count = learned_epv_min_count();
+    if min_count > 0 {
+        let count = g
+            .counts
+            .get(row)
+            .and_then(|r| r.get(col))
+            .copied()
+            .unwrap_or(0);
+        if count < min_count {
+            return None;
+        }
+    }
+    Some(value)
 }
 
 /// ΔEPV of a pass from `origin` to `target` for `team`: how much learned possession value (danger)
@@ -236,6 +271,19 @@ pub(crate) fn learned_epv_pass_delta(
         (Some(t), Some(o)) => t - o,
         _ => 0.0,
     }
+}
+
+/// Outcome-grounded pitch value used by the territorial potential. When a fitted
+/// EPV grid is available this breaks the old hand-coded xT anchor; otherwise it
+/// falls back to the deterministic seed and keeps existing behavior unchanged.
+pub(crate) fn learned_epv_or_expected_threat(
+    team: Team,
+    p: Vec2,
+    field_width: f64,
+    field_length: f64,
+) -> f64 {
+    learned_epv(team, p, field_width, field_length)
+        .unwrap_or_else(|| expected_threat(team, p, field_width, field_length))
 }
 
 /// Modeled top speed (yd/s) for a snapshot player, floored so the arrival-time
@@ -323,9 +371,11 @@ pub fn pitch_control_home(players: &[PlayerSnapshot], cell: Vec2) -> f64 {
     }
 }
 
-/// Integral of `control(team) × expected_threat(team)` over the grid — a single
+/// Integral of `control(team) × pitch_value(team)` over the grid — a single
 /// scalar for how much **dangerous space the team currently controls**. Averaged
-/// over cells, so it is bounded on the same scale as [`expected_threat`].
+/// over cells, so it is bounded on the same scale as the configured pitch-value
+/// surface. The default surface is closed-form xT; `DD_SOCCER_ENABLE_LEARNED_EPV`
+/// plus `DD_SOCCER_LEARNED_EPV_GRID_PATH` swaps in outcome-grounded EPV.
 pub fn team_expected_threat(snapshot: &WorldSnapshot, team: Team) -> f64 {
     let field_width = snapshot.field_width;
     let field_length = snapshot.field_length;
@@ -350,7 +400,7 @@ pub fn team_expected_threat(snapshot: &WorldSnapshot, team: Team) -> f64 {
                 Team::Home => home_control,
                 Team::Away => 1.0 - home_control,
             };
-            let threat = expected_threat(team, cell, field_width, field_length);
+            let threat = learned_epv_or_expected_threat(team, cell, field_width, field_length);
             total += control * threat;
         }
     }
@@ -404,9 +454,9 @@ fn pitch_control_home_points(points: &[XtControlPoint], cell: Vec2) -> f64 {
     }
 }
 
-/// Control-weighted threat **value** of `team` arriving at `p`: the closed-form
-/// [`expected_threat`] gated by the probability `team` actually controls that
-/// point (the time-to-arrive race). This is the cost-to-go surface the xT
+/// Control-weighted threat **value** of `team` arriving at `p`: the configured
+/// pitch-value surface gated by the probability `team` actually controls that
+/// point (the time-to-arrive race). This is the cost-to-go surface the xT/EPV
 /// terminal shaping ascends — a player is only pulled toward valuable space it
 /// can realistically grip, not toward unreachable danger zones.
 fn control_weighted_threat(points: &[XtControlPoint], team: Team, p: Vec2, w: f64, l: f64) -> f64 {
@@ -415,7 +465,7 @@ fn control_weighted_threat(points: &[XtControlPoint], team: Team, p: Vec2, w: f6
         Team::Home => home_control,
         Team::Away => 1.0 - home_control,
     };
-    control * expected_threat(team, p, w, l)
+    control * learned_epv_or_expected_threat(team, p, w, l)
 }
 
 /// xT **terminal-cost** shaping of a per-player MPC reference point (the AV
