@@ -112,8 +112,9 @@ struct Sample {
     obs: [f32; OBS_DIM],       // decentralized actor observation
     gstate: [f32; GLOBAL_DIM], // centralized critic global state
     mask: [bool; NA],
-    action: usize,
-    old_logp: f32,
+    action: usize,          // macro action (0..NA)
+    speed: usize,           // speed gear (0..NS)
+    old_logp: f32,          // joint log-prob = ln p(action) + ln p(speed)
     adv: f32,
     ret: f32,
 }
