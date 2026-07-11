@@ -263,12 +263,13 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
         if w.ev_turnover_a {
             r -= 0.2; // real cost, but not so harsh the required passing is avoided
         }
-        // SHOT ON GOAL from the final third after 2 passes is EARNED and rewarded
-        // (not just goals) — a real base plus a chance-quality bonus. Shoot-spam is
-        // stopped structurally by the cooldown: a rapid-fire repeat shot (fired while
-        // a prior shot is still "hot") pays nothing, so 60-shots/game can't farm this.
+        // SHOT ON GOAL from the opponent's half after 2 passes is EARNED and
+        // rewarded HANDSOMELY (not just goals) — a strong base plus a chance-quality
+        // bonus, to pull the policy out of passive holding and toward shooting.
+        // Shoot-spam is stopped structurally by the cooldown: a rapid-fire repeat
+        // shot (fired while a prior shot is still "hot") pays nothing.
         if w.ev_shot_on_a && !w.shot_was_rapid_a {
-            r += 0.6 + 0.6 * w.last_shot_quality_a;
+            r += 1.5 + 1.0 * w.last_shot_quality_a;
         }
         // reward winning the ball back (pressing / interceptions / tackles)
         if w.ev_win_ball_a {
