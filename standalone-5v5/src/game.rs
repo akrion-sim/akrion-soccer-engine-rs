@@ -951,6 +951,7 @@ impl World {
         team: Team,
         idx: usize,
         a: usize,
+        spd: usize,
         _rng: &mut Rng,
     ) -> Option<(Owner, V2, f32, bool)> {
         let me = players(team, self)[idx].pos;
