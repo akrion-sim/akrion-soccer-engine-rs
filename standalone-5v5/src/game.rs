@@ -1299,6 +1299,8 @@ impl World {
                     A_MARK
                 };
             }
+            // pack a sensible gear for the baseline so it moves at realistic speeds.
+            acts[i] += scripted_gear(acts[i]) * NA;
         }
         acts
     }
