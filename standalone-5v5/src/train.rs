@@ -28,6 +28,17 @@ const MINIBATCH: usize = 1024;
 const MAX_ROLLOUT_THREADS: usize = 4;
 const MIN_REWARD_WEIGHT: f32 = 0.0001;
 const LINGER_RADIUS: f32 = 4.0; // "same radius": teammates within this many yards
+/// Overlap zone: two players THIS close are occupying the same spot — that is
+/// never "running past each other", so the penalty here is ALWAYS-ON (ungated).
+/// Only the soft 1.5-4yd band is linger-gated (where transient crossings happen).
+const SEVERE_RADIUS: f32 = 1.5;
+/// Leaky-integrator decay: when players separate, the linger counter DECAYS by
+/// this many ticks rather than resetting to 0. This kills the reset-hack where a
+/// policy farms the gate by oscillating in/out of the radius (bunch ~1.4s, step
+/// out 1 tick, re-bunch). A genuine one-time crossing separates and stays apart,
+/// so its counter decays cleanly to 0; sustained oscillation still accumulates
+/// (net gain per cycle whenever close-ticks > DECAY × away-ticks).
+const LINGER_DECAY: u32 = 2;
 /// Consecutive ticks two teammates must LINGER within LINGER_RADIUS before the
 /// spacing penalty applies. Brief crossings/convergence pay nothing (real soccer:
 /// players run right past each other). Env `SPACING_LINGER_SECS` (default 1.5 s).
@@ -615,14 +626,20 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
             if nd.is_finite() {
                 // LINGER GATE: brief closeness (crossing runs, converging on the ball)
                 // is fine — only SUSTAINED lingering in the same radius is penalized.
+                // Separation DECAYS the counter (leaky integrator) rather than
+                // resetting it, so the policy can't farm the gate by oscillating in
+                // and out of the radius. A true one-time crossing decays to 0.
                 if nd < LINGER_RADIUS {
                     close_ticks[i] += 1;
                 } else {
-                    close_ticks[i] = 0;
+                    close_ticks[i] = close_ticks[i].saturating_sub(LINGER_DECAY);
                 }
                 let mut sr = spacing_reward(nd);
-                if sr < 0.0 && close_ticks[i] <= linger_gate {
-                    sr = 0.0; // transient — not yet a lingering-bunch penalty
+                // SEVERE overlap (occupying the same spot) is never "running past
+                // each other" — penalize it instantly, ungated. Only the soft
+                // 1.5-4yd band gets the linger grace period.
+                if sr < 0.0 && nd >= SEVERE_RADIUS && close_ticks[i] <= linger_gate {
+                    sr = 0.0; // transient soft-band closeness — not yet a lingering bunch
                 }
                 sp_t[i] = w_spacing_coeff * sr;
             }
