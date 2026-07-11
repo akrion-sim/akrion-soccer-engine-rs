@@ -807,6 +807,12 @@ impl World {
                         self.ev_pass_completed_a = true; // A pass reached an A player
                         self.last_pass_gain_a = self.ball.x - self.pass_kick_x;
                         self.pass_streak_a += 1; // toward the 2-pass rule
+                        // consecutive FORWARD passes (progressive build-up)
+                        if self.last_pass_gain_a > 3.0 {
+                            self.fwd_pass_streak_a += 1;
+                        } else {
+                            self.fwd_pass_streak_a = 0;
+                        }
                                                  // record the passer->receiver of this completed A pass
                         self.lp_from = self.pending_passer;
                         self.lp_to = o.idx as i32;
