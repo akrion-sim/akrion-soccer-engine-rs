@@ -73,6 +73,7 @@ pub struct Rw {
     pub burst_gear: f32,           // off-ball use of run/sprint gears in possession
     pub field_pass: f32,           // field-vector interaction on completed passes
     pub field_turnover: f32,       // field-vector interaction on turnovers
+    pub chance: f32,               // MARL: team reward for creating a scoring chance (potential)
     pub field_goalside_delta: f32, // reward improving team goalside geometry
     pub field_burst_delta: f32,    // reward improving forward outlet geometry
     pub stand_pen: f32,            // anti-passivity: penalize the STAND gear off-ball
@@ -106,6 +107,7 @@ fn rw() -> &'static Rw {
         burst_gear: wenv("W_BURST_GEAR", 0.035, MIN_REWARD_WEIGHT, 0.16),
         field_pass: wenv("W_FIELD_PASS", 0.08, MIN_REWARD_WEIGHT, 0.30),
         field_turnover: wenv("W_FIELD_TURNOVER", 0.16, MIN_REWARD_WEIGHT, 0.50),
+        chance: wenv("W_CHANCE", 0.12, MIN_REWARD_WEIGHT, 0.60),
         field_goalside_delta: wenv("W_FIELD_GOALSIDE_DELTA", 0.10, MIN_REWARD_WEIGHT, 0.35),
         field_burst_delta: wenv("W_FIELD_BURST_DELTA", 0.08, MIN_REWARD_WEIGHT, 0.35),
         stand_pen: wenv("W_STAND_PEN", 0.02, MIN_REWARD_WEIGHT, 0.20),
@@ -164,6 +166,7 @@ struct FieldRewardContext {
     goalside_score: f32,
     burst_score: f32,
     return_stale: f32,
+    chance_value: f32,
 }
 
 impl FieldRewardContext {
@@ -190,6 +193,28 @@ impl FieldRewardContext {
         }
         ctx.safe_outlet_value =
             (0.70 * best_outlet + 0.30 * (outlet_count / 3.0).clamp(0.0, 1.0)).clamp(0.0, 1.0);
+        // MARL chance creation: the best SHOOTING chance the attack has manufactured
+        // — an off-ball attacker in a high-xG spot (close+central to the opp goal, in
+        // their half) with a clear reception lane from the ball. Coordinated,
+        // synchronized runs INTO such a spot raise this; used as a potential.
+        if our_phase {
+            let goal = V2::new(FIELD_L, FIELD_W / 2.0);
+            let mut best_chance = 0.0f32;
+            for i in 1..N {
+                let pos = w.a[i].pos;
+                if pos.x < SHOOT_X {
+                    continue;
+                }
+                let d = goal.sub(pos).len();
+                let lateral = (pos.y - FIELD_W / 2.0).abs();
+                let dist_f = (1.0 - d / 26.0).clamp(0.0, 1.0);
+                let angle_f = (1.0 - lateral / (FIELD_W / 2.0)).clamp(0.0, 1.0);
+                let xg = dist_f * dist_f * (0.4 + 0.6 * angle_f);
+                let lane = w.lane_clearness(Team::A, w.ball, pos);
+                best_chance = best_chance.max(xg * lane);
+            }
+            ctx.chance_value = best_chance;
+        }
 
         if let Some(o) = w.owner {
             let carrier = if o.team == Team::A {
@@ -450,6 +475,12 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
         if w.ev_goal_b {
             r -= rw().concede;
         }
+        // MARL SYNCHRONIZATION: reward the TEAM for collectively moving into a
+        // configuration where a scoring chance becomes available (potential-based on
+        // the best manufactured chance -> telescopes, unfarmable). This is what pulls
+        // attackers to move TOGETHER to create and get off a shot.
+        r += rw().chance
+            * FieldRewardContext::delta(post_field.chance_value, pre_field.chance_value);
         // Only a tiny nudge for a completed pass (prefer it to a loose turnover);
         // forward progress is rewarded by the potential shaping above, and goals
         // dominate — so passing stays INSTRUMENTAL and the policy still attacks.
