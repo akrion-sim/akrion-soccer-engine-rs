@@ -686,6 +686,7 @@ pub fn train_iter(policy: &mut Policy, games: usize, ent_beta: f32, rng: &mut Rn
                 count += 1.0;
             }
             policy.actor.step(LR_ACTOR);
+            policy.speedor.step(LR_ACTOR);
             policy.critic.step(LR_CRITIC);
         }
     }
