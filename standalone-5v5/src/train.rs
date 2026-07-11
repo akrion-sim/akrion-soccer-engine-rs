@@ -179,30 +179,41 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
         // forward progress is rewarded by the potential shaping above, and goals
         // dominate — so passing stays INSTRUMENTAL and the policy still attacks.
         if w.ev_pass_completed_a {
-            // Completing a pass must be clearly worthwhile so the policy is willing
-            // to risk it (a required step to a legal shot): a real base + forward
-            // bonus. The 2-pass rule + final-third gate + ping-pong penalty stop
-            // this from becoming lateral hoarding.
-            r += 0.2 + (w.last_pass_gain_a.max(0.0) * 0.15).min(1.0);
-            // CONSECUTIVE FORWARD passes = progressive build-up through the thirds
-            // (the good-soccer opposite of ping-pong). Escalating so a *chain* of
-            // forward passes pays more than isolated ones: 1st +0.15, 2nd +0.30, …
-            if w.fwd_pass_streak_a > 0 {
-                r += (0.15 * w.fwd_pass_streak_a as f32).min(0.9);
+            let n = w.pass_streak_a; // completed passes so far in THIS possession
+            // (1) Forward PROGRESS is the real value of a pass — and it's naturally
+            // bounded by the field length, so it can't be farmed by recycling.
+            r += (w.last_pass_gain_a.max(0.0) * 0.12).min(0.8);
+            // (2) Flat "useful completion" credit ONLY for the passes that build
+            // toward a legal shot (the gate needs 2). A flat per-pass reward on
+            // EVERY completion was the tiki-taka farm (200 passes × 0.2 dwarfed a
+            // goal), so extra recycling passes get NO flat credit.
+            if n <= 2 {
+                r += 0.2;
             }
-            // MILESTONE: completing the SECOND pass unlocks shooting — a clear
-            // step toward a goal, so reward reaching that state.
-            if w.pass_streak_a == 2 {
-                r += 0.7;
+            // (3) CONSECUTIVE FORWARD passes = progressive build-up — but only while
+            // genuinely building (not endless in one possession).
+            if w.fwd_pass_streak_a > 0 && n <= 4 {
+                r += (0.15 * w.fwd_pass_streak_a as f32).min(0.6);
+            }
+            // (4) MILESTONE: the 2nd completed pass unlocks shooting.
+            if n == 2 {
+                r += 0.5;
+            }
+            // (5) ANTI-RECYCLE: sterile possession — passes beyond 6 in a SINGLE
+            // possession without an end product are punished (escalating), so the
+            // policy must progress or shoot instead of farming completions.
+            if n > 6 {
+                r -= 0.15 * (n - 6) as f32;
             }
         }
         if w.ev_turnover_a {
             r -= 0.2; // real cost, but not so harsh the required passing is avoided
         }
-        // Shot on target from the final third after 2 passes is genuinely EARNED,
-        // so reward it well (not just the goal) — it's the payoff for build-up.
+        // Shot reward = CHANCE QUALITY (xG-like), NOT shot volume. A low-xG pot-shot
+        // pays ~0; a genuine chance pays. The old flat `1.2 + …` was farmed at ~60
+        // shots/game — the end product is the GOAL, so only real chances get credit.
         if w.ev_shot_on_a {
-            r += 1.2 + 0.8 * w.last_shot_quality_a;
+            r += 0.9 * w.last_shot_quality_a;
         }
         // reward winning the ball back (pressing / interceptions / tackles)
         if w.ev_win_ball_a {
