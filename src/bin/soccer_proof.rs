@@ -289,7 +289,9 @@ fn fresh_snapshot(out_path: &str, seed_base: u32) {
     };
     config.neural_blend.actor_critic = true;
     let mut sim = SoccerMatch::default_11v11(config);
-    sim.set_uniform_elite_players();
+    if env_bool("SOCCER_ENGINE_UNIFORM_ELITE_PLAYERS", true) {
+        sim.set_uniform_elite_players();
+    }
     if env_bool("DD_SOCCER_ENABLE_LEARNED_PASS_COMPLETION", false) {
         sim.set_pass_completion_head(SoccerPassCompletionHead::new(seed_base));
     }
@@ -375,7 +377,9 @@ fn train_ckpt(out_prefix: &str, games: usize, minutes: f64, seed_base: u32, ckpt
         config.neural_blend.actor_critic = true;
         let total_ticks = config.total_ticks();
         let mut sim = SoccerMatch::default_11v11(config).with_team_policies((*policies).clone());
-        sim.set_uniform_elite_players();
+        if env_bool("SOCCER_ENGINE_UNIFORM_ELITE_PLAYERS", true) {
+            sim.set_uniform_elite_players();
+        }
         // Escape mirror self-play: train Home's net against an analytic Away side. The standard
         // learner gate (SOCCER_LEARNING_ANALYTIC_OPPONENT) means "always"; the proof-only fraction
         // lets us interleave analytic-opponent games with self-play when doing ceiling probes.
