@@ -5,16 +5,43 @@
 use crate::game::*;
 use crate::nn::{masked_softmax, Mlp};
 use crate::rng::Rng;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+// SPEED WARMUP CURRICULUM: while true, every player uses a fixed run-medium gear
+// (v3 behavior) instead of sampling the speed policy. This lets the ACTION policy
+// learn to attack at full strength on stable pass dynamics BEFORE the speed policy
+// starts introducing gear variability — the pass mechanics are fragile to speed
+// variability, so the two policies would otherwise deadlock.
+static SPEED_FROZEN: AtomicBool = AtomicBool::new(false);
+pub fn set_speed_frozen(frozen: bool) {
+    SPEED_FROZEN.store(frozen, Ordering::Relaxed);
+}
 
 const GAMMA: f32 = 0.995; // per-tick discount retuned for 20 Hz (same per-second horizon)
 const LAMBDA: f32 = 0.95;
 const CLIP: f32 = 0.2;
 const LR_ACTOR: f32 = 3e-4;
 const LR_CRITIC: f32 = 1e-3;
+const LR_BC: f32 = 8e-4;
 const EPOCHS: usize = 4;
 const MINIBATCH: usize = 1024;
-const W_SHAPE: f32 = 1.6; // potential shaping (per-tick): stronger pull toward goal
-const W_SYNC: f32 = 0.03; // possession-synced push-up / drop-back (team coordination)
+const MAX_ROLLOUT_THREADS: usize = 4;
+const W_SHAPE: f32 = 2.2; // potential shaping: strong pull to carry/pass the ball toward goal
+const W_ADVANCE: f32 = 0.04; // OFFENSE: push upfield hard (no offsides — camp high)
+const W_OPEN: f32 = 0.04; // OFFENSE: get into a CLEAR passing lane from the ball
+const W_WIDTH: f32 = 0.045; // OFFENSE: use the width of the pitch (stretch wide)
+const W_FLANK: f32 = 0.025; // OFFENSE: commit to a left/right channel (two-flank spread)
+const W_GOALSIDE: f32 = 0.02; // DEFENSE: get goalside of the ball
+// KEY off-ball run rewards — held at 0 until the base (v3 + learnable speeds) is
+// solid, then layered back on.
+const W_AHEAD: f32 = 0.0; // when a teammate has the ball, be an upfield outlet in a clear lane
+const W_MAKE_RUN: f32 = 0.0; // actively sprint upfield to get open for a forward pass
+const W_STAND_PEN: f32 = 0.02; // ANTI-PASSIVITY: gently discourage the STAND gear for off-ball players
+// The speed policy is a low-variance REFINEMENT on top of the action policy —
+// small entropy + LR so its exploration can't paralyze the game the action policy
+// is trying to learn in.
+const LR_SPEED: f32 = LR_ACTOR * 0.3;
+const SPEED_ENT_SCALE: f32 = 0.15;
 const ENT_BETA0: f32 = 0.02;
 
 // Teammate-spacing reward weight. Overridable via SPACING_W env for tuning.
@@ -33,29 +60,34 @@ fn w_spacing() -> f32 {
 /// team average.
 fn spacing_reward(d: f32) -> f32 {
     // The ball is a major attractor, but only the closest player should chase;
-    // 2 going in to CONTEST is fine, stacking is not. So:
+    // stacking is never OK. We want teammates to hold real cartesian distance and
+    // stretch the pitch, so the optimum sits WIDE at ~8 yds:
     //   < 1.5  : MAJOR penalty (overlap zone — sickening bunching)
-    //   1.5-3  : mild penalty that still holds (2 can contest, but discouraged)
-    //   ~5     : peak reward (optimal spacing)
-    //   > 7    : penalty (too far to be useful)
+    //   1.5-3  : strong penalty (bumped) — being within 3 yds is bad
+    //   3-4    : real penalty (bumped) — 4 yds is still too close
+    //   ~8     : peak reward (optimal spacing — genuine width/separation)
+    //   > 12   : penalty (too far to combine)
     if d < 1.0 {
-        -80.0
+        -100.0
     } else if d < 1.5 {
-        -40.0
+        -50.0
     } else if d < 3.0 {
-        -3.0
-    } else if d < 5.0 {
-        (d - 3.0) * 4.0 // 0 at 3 -> +8 peak at 5
-    } else if d < 7.0 {
-        8.0 - (d - 5.0) * 4.0 // +8 at 5 -> 0 at 7
+        -8.0 // within 3 yds: bumped penalty (was -3)
+    } else if d < 4.0 {
+        -3.0 // within 4 yds: now also penalized
+    } else if d < 8.0 {
+        (d - 4.0) * 2.0 // 0 at 4 -> +8 peak at 8
+    } else if d < 12.0 {
+        8.0 - (d - 8.0) * 2.0 // +8 at 8 -> 0 at 12
     } else {
-        -(d - 7.0) * 5.0 // 7+ : escalating penalty
+        -(d - 12.0) * 4.0 // 12+ : escalating penalty
     }
 }
 
 #[derive(Clone)]
 pub struct Policy {
-    pub actor: Mlp,
+    pub actor: Mlp,   // action policy: OBS_DIM -> 64 -> 64 -> NA (identical to v3)
+    pub speedor: Mlp, // SEPARATE speed policy: OBS_DIM -> 32 -> NS (own network)
     pub critic: Mlp,
 }
 
@@ -63,13 +95,18 @@ impl Policy {
     pub fn new(rng: &mut Rng) -> Self {
         Policy {
             // decentralized actor (per-agent field vector) + CENTRALIZED critic
-            // (global state) = MAPPO / CTDE.
+            // (global state) = MAPPO / CTDE. The speed gear is a SEPARATE small
+            // network so its gradients can't corrupt the action policy's shared
+            // features (a joint output head did exactly that — the action policy
+            // stopped learning to attack).
             actor: Mlp::new(&[OBS_DIM, 64, 64, NA], rng),
+            speedor: Mlp::new(&[OBS_DIM, 32, NS], rng),
             critic: Mlp::new(&[GLOBAL_DIM, 128, 64, 1], rng),
         }
     }
 
-    /// Greedy (argmax over legal actions) — used at evaluation.
+    /// Greedy (argmax action + argmax speed) — used at evaluation. Returns the
+    /// PACKED action `action + speed*NA` ready to hand to `World::step`.
     pub fn act_greedy(&self, obs: &[f32], mask: &[bool; NA]) -> usize {
         let logits = self.actor.predict(obs);
         let probs = masked_softmax(&logits, mask);
@@ -81,7 +118,24 @@ impl Policy {
                 bi = i;
             }
         }
-        bi
+        // During the speed warmup, eval uses the same fixed gear the action policy
+        // was trained on.
+        if SPEED_FROZEN.load(Ordering::Relaxed) {
+            return bi + SPD_RUN_MED * NA;
+        }
+        // greedy speed gear (argmax over the MOVING gears). We skip SPD_STAND (0)
+        // at eval so a near-flat speed policy can't tie-break the team into standing
+        // still — standing is essentially never the right greedy choice.
+        let slogits = self.speedor.predict(obs);
+        let mut bs = SPD_WALK;
+        let mut bsp = f32::NEG_INFINITY;
+        for k in SPD_WALK..NS {
+            if slogits[k] > bsp {
+                bsp = slogits[k];
+                bs = k;
+            }
+        }
+        bi + bs * NA
     }
 }
 
@@ -89,14 +143,29 @@ struct Sample {
     obs: [f32; OBS_DIM],       // decentralized actor observation
     gstate: [f32; GLOBAL_DIM], // centralized critic global state
     mask: [bool; NA],
-    action: usize,
-    old_logp: f32,
+    action: usize,          // macro action (0..NA)
+    speed: usize,           // speed gear (0..NS)
+    old_logp_a: f32,        // ln p(action) at collection time
+    old_logp_s: f32,        // ln p(speed)  at collection time
     adv: f32,
     ret: f32,
 }
 
+struct BcSample {
+    obs: [f32; OBS_DIM],
+    mask: [bool; NA],
+    action: usize, // macro action (0..NA)
+    speed: usize,  // scripted speed gear (0..NS)
+}
+
+pub struct CloneStats {
+    pub samples: usize,
+    pub loss: f32,
+    pub accuracy: f32,
+}
+
 /// Collect one game of Team-A experience (5 players) vs the scripted baseline.
-fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
+fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
     let mut w = World::new();
     let w_spacing_coeff = w_spacing();
     if rng.f01() < 0.5 {
@@ -105,8 +174,10 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
     // per-player trajectory buffers
     let mut obs_buf: Vec<[[f32; OBS_DIM]; N]> = Vec::with_capacity(STEPS);
     let mut mask_buf: Vec<[[bool; NA]; N]> = Vec::with_capacity(STEPS);
-    let mut act_buf: Vec<[usize; N]> = Vec::with_capacity(STEPS);
-    let mut logp_buf: Vec<[f32; N]> = Vec::with_capacity(STEPS);
+    let mut act_buf: Vec<[usize; N]> = Vec::with_capacity(STEPS); // macro action (0..NA)
+    let mut spd_buf: Vec<[usize; N]> = Vec::with_capacity(STEPS); // speed gear (0..NS)
+    let mut logpa_buf: Vec<[f32; N]> = Vec::with_capacity(STEPS); // action log-prob
+    let mut logps_buf: Vec<[f32; N]> = Vec::with_capacity(STEPS); // speed log-prob
     let mut val_buf: Vec<f32> = Vec::with_capacity(STEPS); // CENTRALIZED value (one per tick)
     let mut gstate_buf: Vec<[f32; GLOBAL_DIM]> = Vec::with_capacity(STEPS);
     let mut rew_buf: Vec<f32> = Vec::with_capacity(STEPS);
@@ -117,8 +188,11 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
     for _ in 0..STEPS {
         let mut obs_t = [[0.0f32; OBS_DIM]; N];
         let mut mask_t = [[false; NA]; N];
-        let mut act_a = [A_STAY; N];
-        let mut logp_t = [0.0f32; N];
+        let mut mact_t = [A_STAY; N]; // macro action
+        let mut spd_t = [SPD_STAND; N]; // speed gear
+        let mut packed_a = [A_STAY; N]; // packed (action + speed*NA) for step
+        let mut logpa_t = [0.0f32; N];
+        let mut logps_t = [0.0f32; N];
 
         // CENTRALIZED critic: one value for the whole global state this tick.
         let gstate = w.global_state();
@@ -128,18 +202,31 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
             // policy controls the 4 outfielders; GK (index 0) is rule-based.
             let obs = w.observe(Team::A, i);
             let mask = w.legal_mask(Team::A, i);
+            // action policy (masked) and SEPARATE speed policy (unmasked).
             let logits = policy.actor.predict(&obs);
-            let probs = masked_softmax(&logits, &mask);
-            let a = rng.sample_categorical(&probs);
-            let p = probs[a].max(1e-8);
+            let aprobs = masked_softmax(&logits, &mask);
+            let a = rng.sample_categorical(&aprobs);
+            let pa = aprobs[a].max(1e-8);
+            let slogits = policy.speedor.predict(&obs);
+            let sprobs = masked_softmax(&slogits, &[true; NS]);
+            // Curriculum: fixed gear during warmup, sampled speed policy afterwards.
+            let s = if SPEED_FROZEN.load(Ordering::Relaxed) {
+                SPD_RUN_MED
+            } else {
+                rng.sample_categorical(&sprobs)
+            };
+            let ps = sprobs[s].max(1e-8);
             obs_t[i] = obs;
             mask_t[i] = mask;
-            act_a[i] = a;
-            logp_t[i] = p.ln();
+            mact_t[i] = a;
+            spd_t[i] = s;
+            packed_a[i] = a + s * NA;
+            logpa_t[i] = pa.ln();
+            logps_t[i] = ps.ln();
         }
 
-        let act_b = w.scripted_actions(Team::B);
-        w.step(&act_a, &act_b, rng);
+        let act_b = noisy_scripted_actions(&w, Team::B, opponent_noise, rng);
+        w.step(&packed_a, &act_b, rng);
 
         // team reward (Team A perspective)
         let phi = w.potential_a();
@@ -147,47 +234,87 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
         phi_prev = phi;
         let mut r = W_SHAPE * shaping;
         if w.ev_goal_a {
-            r += 5.0;
+            r += 8.0; // GOALS are the prize — rewarded well above shots
         }
         if w.ev_goal_b {
-            r -= 5.0;
+            r -= 6.0;
         }
         // Only a tiny nudge for a completed pass (prefer it to a loose turnover);
         // forward progress is rewarded by the potential shaping above, and goals
         // dominate — so passing stays INSTRUMENTAL and the policy still attacks.
         if w.ev_pass_completed_a {
-            // The 2-pass RULE already forces passing, so passing needs almost no
-            // reward — a flat base just causes endless hoarding (0 shots). Keep
-            // ONLY a small FORWARD-progress nudge so the forced passes go toward
-            // goal; the goal (+5) and shot rewards are the real prize.
-            r += (w.last_pass_gain_a.max(0.0) * 0.12).min(0.8);
+            let n = w.pass_streak_a; // completed passes so far in THIS possession
+            // Small flat credit (prefer a completed pass to a loose turnover) PLUS a
+            // forward-PROGRESS bonus. Progress is bounded by field length and lateral
+            // recycling gains ~0, so it can't be farmed by tiki-taka.
+            r += 0.06 + (w.last_pass_gain_a.max(0.0) * 0.1).min(0.6);
+            // MILESTONE: the 2nd completed pass unlocks a legal shot. The pinball used
+            // to farm this via pass-pass-shoot-repeat — now the SHOT COOLDOWN breaks
+            // that loop (the rapid follow-up shot pays nothing), so the milestone is
+            // safe to reward again for genuine build-up.
+            if n == 2 {
+                r += 0.3;
+            }
+            // Anti-recycle: escalating penalty for sterile long possessions.
+            if n > 6 {
+                r -= 0.2 * (n - 6) as f32;
+            }
         }
         if w.ev_turnover_a {
-            r -= 0.25;
+            r -= 0.2; // real cost, but not so harsh the required passing is avoided
         }
-        // In-range shot AFTER the 2-pass rule is cleared (ev_shot_on_a can only
-        // fire then, and only within range) is rewarded ABOVE the best pass
-        // (max pass nudge ≈ 0.8) so, once built up and in range, shooting wins.
-        if w.ev_shot_on_a {
-            r += 1.2 + 1.0 * w.last_shot_quality_a;
+        // SHOT ON GOAL from the final third after 2 passes is EARNED and rewarded
+        // (not just goals) — a real base plus a chance-quality bonus. Shoot-spam is
+        // stopped structurally by the cooldown: a rapid-fire repeat shot (fired while
+        // a prior shot is still "hot") pays nothing, so 60-shots/game can't farm this.
+        if w.ev_shot_on_a && !w.shot_was_rapid_a {
+            r += 0.6 + 0.6 * w.last_shot_quality_a;
         }
         // reward winning the ball back (pressing / interceptions / tackles)
         if w.ev_win_ball_a {
             r += 0.3;
         }
-        // PER-PLAYER teammate spacing (all phases): each outfielder is rewarded
-        // for its OWN nearest-teammate distance, so bunching is directly credited.
-        // TEAM SYNC (MARL coordination): each outfielder is also rewarded for being
-        // FORWARD when we have the ball and DROPPED BACK when the opponent does —
-        // all four share the possession signal, so they shift up/down as a unit.
+        // dribbling = possessing the ball (less pinball): forward pays, lateral a
+        // little. SMALL per-tick — it fires every tick you carry, so a big value
+        // accumulates into ball-hoarding that dwarfs goals.
+        if w.ev_dribble_fwd_a {
+            r += 0.015; // forward carrying (also paid by potential shaping) — bounded, unfarmable
+        }
+        // (lateral dribble: no flat reward — potential shaping handles real progress)
+        if w.ev_turnover_a && (w.ev_dribble_fwd_a || w.ev_dribble_lat_a) {
+            r -= 0.4; // dispossessed while dribbling
+        }
+        // Ping-pong: A→B→A (one return, streak 1) is FINE. It only becomes a
+        // problem from the SECOND return (A→B→A→B, streak 2), and worse each time.
+        // 5x heavier than before, and heavier still if the exchange hasn't
+        // advanced the ball 5+ yards upfield (pointless tapping in place).
+        if w.ev_return_pass_a && w.return_streak_a >= 2 {
+            let k = w.return_streak_a;
+            let mut pen = 1.5 * 2f32.powi((k - 2) as i32); // 1.5, 3, 6, 12, ...
+            if w.ball.x - w.return_start_x < 5.0 {
+                pen *= 1.5; // no upfield progress -> heavier
+            }
+            r -= pen.min(24.0);
+        }
+
+        // Possession PHASE (covers ball-in-flight during our build-up, not just
+        // strict ownership): our phase = we own OR loose ball we last touched.
         let a_owns = matches!(w.owner, Some(o) if matches!(o.team, Team::A));
         let b_owns = matches!(w.owner, Some(o) if matches!(o.team, Team::B));
+        let our_phase = a_owns || (w.owner.is_none() && matches!(w.last_touch, Some(Team::A)));
+        let their_phase = b_owns || (w.owner.is_none() && matches!(w.last_touch, Some(Team::B)));
+
+        // PER-PLAYER coordination (MARL): teammate spacing (anti-bunch) PLUS a
+        // possession-conditioned positioning reward —
+        //   OFFENSE: advance UPFIELD and OPEN UP into space to receive a pass.
+        //   DEFENSE: get GOALSIDE of the ball (between the ball and our own goal).
         let mut sp_t = [0.0f32; N];
         for i in 1..N {
+            let pos = w.a[i].pos;
             let mut nd = f32::INFINITY;
             for j in 1..N {
                 if i != j {
-                    let d = w.a[i].pos.sub(w.a[j].pos).len();
+                    let d = w.a[j].pos.sub(pos).len();
                     if d < nd {
                         nd = d;
                     }
@@ -196,22 +323,61 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
             if nd.is_finite() {
                 sp_t[i] = w_spacing_coeff * spacing_reward(nd);
             }
-            // possession-synced vertical position (attack frame: +x = upfield)
-            let x_att = (w.a[i].pos.x / FIELD_L).clamp(0.0, 1.0);
-            let sync = if a_owns {
-                x_att - 0.5 // push up to attack
-            } else if b_owns {
-                0.5 - x_att // drop back to defend
-            } else {
-                0.0
-            };
-            sp_t[i] += W_SYNC * sync;
+            let is_carrier = matches!(w.owner, Some(o) if o.team == Team::A && o.idx == i);
+            // ANTI-PASSIVITY: the STAND gear must not be a free way to farm the
+            // positional shaping. An off-ball player who freezes is penalized, so
+            // players keep moving and (in possession) make their runs.
+            if !is_carrier && spd_t[i] == SPD_STAND {
+                sp_t[i] -= W_STAND_PEN;
+            }
+            if our_phase {
+                // Advance upfield (attack frame +x). No offsides rule, so reward
+                // getting into the ATTACKING HALF and keep rewarding all the way to
+                // the opponent goal — attackers should camp high, not hold at half.
+                let advance = pos.x / FIELD_L - 0.5;
+                // OPEN = a CLEAR passing lane from the ball to me (no defender in
+                // between). NOT merely far from a marker — a player inline behind a
+                // defender is NOT open. This is the MECHANISM for "opening up": the
+                // SOLUTION the policy should learn is to move to a WIDER position,
+                // which clears the lane (hence width is rewarded strongly too).
+                let open = w.lane_clearness(Team::A, w.ball, pos) - 0.5;
+                // WIDTH: how far off the central lane (0 = center, 1 = touchline).
+                let wide = (pos.y - FIELD_W / 2.0).abs() / (FIELD_W / 2.0);
+                let width = wide - 0.4; // penalize the central lane, reward stretching
+                // FLANK affinity: convex bonus for genuinely committing to a
+                // left/right channel. With the 8-yd anti-bunch this splits the
+                // front line across BOTH flanks instead of clustering one side.
+                let flank = if wide > 0.5 { (wide - 0.5) * 2.0 } else { 0.0 };
+                sp_t[i] +=
+                    W_ADVANCE * advance + W_OPEN * open + W_WIDTH * width + W_FLANK * flank;
+
+                // ── THE KEY MARL BEHAVIOUR ─────────────────────────────────────
+                // When a TEAMMATE has the ball, the other attackers must run/sprint
+                // upfield to offer a forward pass. Rewarded for OFF-BALL players:
+                //   (1) be an upfield OUTLET — ahead of the ball, in a clear lane;
+                //   (2) MAKE THE RUN — actual forward velocity (what the sprint
+                //       gears are for). Together this pulls the whole line upfield
+                //       in unison the moment we win possession.
+                if !is_carrier {
+                    let ahead = ((pos.x - w.ball.x) / 12.0).clamp(0.0, 1.0);
+                    let lane = w.lane_clearness(Team::A, w.ball, pos);
+                    let make_run = (w.a[i].vel.x / 8.5).clamp(0.0, 1.0); // fwd speed, ~run_fast = 1.0
+                    sp_t[i] += W_AHEAD * ahead * lane + W_MAKE_RUN * make_run;
+                }
+            } else if their_phase {
+                // goalside of the ball: our goal is at x=0, so reward being at a
+                // LOWER x than the ball (between ball and own goal).
+                let goalside = ((w.ball.x - pos.x) / 8.0).clamp(-1.0, 1.0);
+                sp_t[i] += W_GOALSIDE * goalside;
+            }
         }
 
         obs_buf.push(obs_t);
         mask_buf.push(mask_t);
-        act_buf.push(act_a);
-        logp_buf.push(logp_t);
+        act_buf.push(mact_t);
+        spd_buf.push(spd_t);
+        logpa_buf.push(logpa_t);
+        logps_buf.push(logps_t);
         val_buf.push(v_central);
         gstate_buf.push(gstate);
         rew_buf.push(r);
@@ -238,13 +404,211 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
                 gstate: gstate_buf[s],
                 mask: mask_buf[s][i],
                 action: act_buf[s][i],
-                old_logp: logp_buf[s][i],
+                speed: spd_buf[s][i],
+                old_logp_a: logpa_buf[s][i],
+                old_logp_s: logps_buf[s][i],
                 adv,
                 ret,
             });
         }
     }
     samples
+}
+
+fn collect_rollouts(policy: &Policy, games: usize, rng: &mut Rng) -> Vec<Sample> {
+    let jobs: Vec<(u64, f32)> = (0..games)
+        .map(|_| (rng.next_u64(), opponent_noise(rng)))
+        .collect();
+    let workers = rollout_worker_count(games);
+    if workers <= 1 {
+        return run_rollout_jobs(policy, &jobs);
+    }
+
+    let chunk = jobs.len().div_ceil(workers);
+    let mut handles = Vec::new();
+    for job_chunk in jobs.chunks(chunk) {
+        let local_policy = policy.clone();
+        let local_jobs = job_chunk.to_vec();
+        handles.push(std::thread::spawn(move || {
+            run_rollout_jobs(&local_policy, &local_jobs)
+        }));
+    }
+
+    let mut data = Vec::new();
+    for handle in handles {
+        data.extend(handle.join().expect("rollout worker panicked"));
+    }
+    data
+}
+
+fn run_rollout_jobs(policy: &Policy, jobs: &[(u64, f32)]) -> Vec<Sample> {
+    let mut data = Vec::new();
+    for &(seed, noise) in jobs {
+        let mut local_rng = Rng::new(seed);
+        data.extend(rollout(policy, &mut local_rng, noise));
+    }
+    data
+}
+
+pub fn rollout_worker_count(games: usize) -> usize {
+    if games <= 1 {
+        return 1;
+    }
+    let available = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let env_limit = std::env::var("FIVEASIDE_ROLLOUT_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(MAX_ROLLOUT_THREADS);
+    games.min(available).min(env_limit).max(1)
+}
+
+fn opponent_noise(rng: &mut Rng) -> f32 {
+    let r = rng.f01();
+    if r < 0.15 {
+        0.18
+    } else if r < 0.35 {
+        0.08
+    } else {
+        0.0
+    }
+}
+
+fn noisy_scripted_actions(w: &World, team: Team, noise: f32, rng: &mut Rng) -> [usize; N] {
+    let mut acts = w.scripted_actions(team);
+    if noise <= 0.0 {
+        return acts;
+    }
+    for i in 1..N {
+        if rng.f01() < noise {
+            let mask = w.legal_mask(team, i);
+            let a = sample_legal_action(&mask, rng);
+            acts[i] = a + scripted_gear(a) * NA; // keep the noisy move at a real speed
+        }
+    }
+    acts
+}
+
+fn sample_legal_action(mask: &[bool; NA], rng: &mut Rng) -> usize {
+    let n = mask.iter().filter(|&&ok| ok).count();
+    if n == 0 {
+        return A_STAY;
+    }
+    let pick = (rng.next_u64() % n as u64) as usize;
+    let mut seen = 0usize;
+    for (idx, &ok) in mask.iter().enumerate() {
+        if ok {
+            if seen == pick {
+                return idx;
+            }
+            seen += 1;
+        }
+    }
+    A_STAY
+}
+
+fn legal_or_first(action: usize, mask: &[bool; NA]) -> Option<usize> {
+    if action < NA && mask[action] {
+        Some(action)
+    } else {
+        mask.iter().position(|&ok| ok)
+    }
+}
+
+pub fn behavior_clone_scripted(
+    policy: &mut Policy,
+    games: usize,
+    epochs: usize,
+    rng: &mut Rng,
+) -> CloneStats {
+    if games == 0 || epochs == 0 {
+        return CloneStats {
+            samples: 0,
+            loss: 0.0,
+            accuracy: 0.0,
+        };
+    }
+
+    let mut data = Vec::new();
+    for _ in 0..games {
+        let mut w = World::new();
+        if rng.f01() < 0.5 {
+            w.kickoff(Team::B);
+        }
+        for _ in 0..STEPS {
+            let mut act_a = w.scripted_actions(Team::A);
+            for i in 1..N {
+                let obs = w.observe(Team::A, i);
+                let mask = w.legal_mask(Team::A, i);
+                let gear = act_a[i] / NA; // keep the scripted gear
+                if let Some(action) = legal_or_first(act_a[i] % NA, &mask) {
+                    act_a[i] = action + gear * NA;
+                    data.push(BcSample {
+                        obs,
+                        mask,
+                        action,
+                        speed: gear,
+                    });
+                }
+            }
+            let act_b = w.scripted_actions(Team::B);
+            w.step(&act_a, &act_b, rng);
+        }
+    }
+
+    let mut idx: Vec<usize> = (0..data.len()).collect();
+    let mut loss_accum = 0.0f32;
+    let mut correct = 0.0f32;
+    let mut count = 0.0f32;
+    for _ in 0..epochs {
+        shuffle(&mut idx, rng);
+        for chunk in idx.chunks(MINIBATCH) {
+            for &si in chunk {
+                let s = &data[si];
+                // clone the scripted ACTION into the action network…
+                let acts = policy.actor.forward(&s.obs);
+                let logits = acts.last().unwrap();
+                let probs = masked_softmax(logits, &s.mask);
+                let p = probs[s.action].max(1e-8);
+                loss_accum += -p.ln();
+                if probs
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| s.mask[*i])
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                    .is_some_and(|(i, _)| i == s.action)
+                {
+                    correct += 1.0;
+                }
+                let mut d_logits = vec![0.0f32; NA];
+                for j in 0..NA {
+                    if s.mask[j] {
+                        d_logits[j] = probs[j] - if j == s.action { 1.0 } else { 0.0 };
+                    }
+                }
+                policy.actor.backward(&acts, &d_logits);
+                // …and the scripted GEAR into the separate speed network.
+                let sacts = policy.speedor.forward(&s.obs);
+                let sprobs = masked_softmax(sacts.last().unwrap(), &[true; NS]);
+                let mut d_slogits = vec![0.0f32; NS];
+                for k in 0..NS {
+                    d_slogits[k] = sprobs[k] - if k == s.speed { 1.0 } else { 0.0 };
+                }
+                policy.speedor.backward(&sacts, &d_slogits);
+                count += 1.0;
+            }
+            policy.actor.step(LR_BC);
+            policy.speedor.step(LR_BC);
+        }
+    }
+
+    CloneStats {
+        samples: data.len(),
+        loss: loss_accum / count.max(1.0),
+        accuracy: correct / count.max(1.0),
+    }
 }
 
 pub struct IterStats {
@@ -255,12 +619,8 @@ pub struct IterStats {
 
 /// One PPO iteration: collect `games` rollouts, then EPOCHS of minibatch updates.
 pub fn train_iter(policy: &mut Policy, games: usize, ent_beta: f32, rng: &mut Rng) -> IterStats {
-    let mut data: Vec<Sample> = Vec::new();
+    let mut data = collect_rollouts(policy, games, rng);
     let mut total_r = 0.0f32;
-    for _ in 0..games {
-        let s = rollout(policy, rng);
-        data.extend(s);
-    }
     // returns/advs summed across all player-steps; report mean reward-to-go proxy
     for s in &data {
         total_r += s.ret;
@@ -286,46 +646,65 @@ pub fn train_iter(policy: &mut Policy, games: usize, ent_beta: f32, rng: &mut Rn
         for chunk in idx.chunks(MINIBATCH) {
             for &si in chunk {
                 let s = &data[si];
-                // ---- actor ----
-                let acts = policy.actor.forward(&s.obs);
-                let logits = acts.last().unwrap();
-                let probs = masked_softmax(logits, &s.mask);
-                let p_a = probs[s.action].max(1e-8);
-                let new_logp = p_a.ln();
-                let ratio = (new_logp - s.old_logp).exp();
                 let a = s.adv;
-                // PPO clip: gradient coefficient on log-prob
-                let coeff = if a >= 0.0 {
-                    if ratio <= 1.0 + CLIP {
+                let clip_coeff = |ratio: f32| -> f32 {
+                    if a >= 0.0 {
+                        if ratio <= 1.0 + CLIP {
+                            a * ratio
+                        } else {
+                            0.0
+                        }
+                    } else if ratio >= 1.0 - CLIP {
                         a * ratio
                     } else {
                         0.0
                     }
-                } else if ratio >= 1.0 - CLIP {
-                    a * ratio
-                } else {
-                    0.0
                 };
-                // entropy of the (masked) distribution
+
+                // ---- action policy (its OWN network — identical to v3) ----
+                let acts = policy.actor.forward(&s.obs);
+                let logits = acts.last().unwrap();
+                let aprobs = masked_softmax(logits, &s.mask);
+                let p_a = aprobs[s.action].max(1e-8);
+                let coeff_a = clip_coeff((p_a.ln() - s.old_logp_a).exp());
                 let mut ent = 0.0f32;
                 for i in 0..NA {
-                    if s.mask[i] && probs[i] > 1e-8 {
-                        ent -= probs[i] * probs[i].ln();
+                    if s.mask[i] && aprobs[i] > 1e-8 {
+                        ent -= aprobs[i] * aprobs[i].ln();
                     }
                 }
-                // dLoss/dlogit_j = -coeff*(1_{j=a}-p_j) + beta*p_j*(log p_j + H)
                 let mut d_logits = vec![0.0f32; NA];
                 for j in 0..NA {
                     if !s.mask[j] {
-                        d_logits[j] = 0.0;
                         continue;
                     }
                     let ind = if j == s.action { 1.0 } else { 0.0 };
-                    let pg = -coeff * (ind - probs[j]);
-                    let eg = ent_beta * probs[j] * (probs[j].max(1e-8).ln() + ent);
+                    let pg = -coeff_a * (ind - aprobs[j]);
+                    let eg = ent_beta * aprobs[j] * (aprobs[j].max(1e-8).ln() + ent);
                     d_logits[j] = pg + eg;
                 }
                 policy.actor.backward(&acts, &d_logits);
+
+                // ---- speed policy (SEPARATE network) ----
+                let sacts = policy.speedor.forward(&s.obs);
+                let slogits = sacts.last().unwrap();
+                let sprobs = masked_softmax(slogits, &[true; NS]);
+                let p_s = sprobs[s.speed].max(1e-8);
+                let coeff_s = clip_coeff((p_s.ln() - s.old_logp_s).exp());
+                let mut ent_s = 0.0f32;
+                for k in 0..NS {
+                    if sprobs[k] > 1e-8 {
+                        ent_s -= sprobs[k] * sprobs[k].ln();
+                    }
+                }
+                let mut d_slogits = vec![0.0f32; NS];
+                for k in 0..NS {
+                    let ind = if k == s.speed { 1.0 } else { 0.0 };
+                    let pg = -coeff_s * (ind - sprobs[k]);
+                    let eg = ent_beta * SPEED_ENT_SCALE * sprobs[k] * (sprobs[k].max(1e-8).ln() + ent_s);
+                    d_slogits[k] = pg + eg;
+                }
+                policy.speedor.backward(&sacts, &d_slogits);
 
                 // ---- centralized critic (MSE to GAE return), on GLOBAL state ----
                 let cacts = policy.critic.forward(&s.gstate);
@@ -333,11 +712,12 @@ pub fn train_iter(policy: &mut Policy, games: usize, ent_beta: f32, rng: &mut Rn
                 let dv = v - s.ret; // dL/dv for 0.5*(v-ret)^2
                 policy.critic.backward(&cacts, &[dv]);
 
-                ent_accum += ent;
+                ent_accum += ent + ent_s;
                 vloss_accum += 0.5 * (v - s.ret) * (v - s.ret);
                 count += 1.0;
             }
             policy.actor.step(LR_ACTOR);
+            policy.speedor.step(LR_SPEED);
             policy.critic.step(LR_CRITIC);
         }
     }
@@ -516,9 +896,12 @@ mod tests {
 
     #[test]
     fn spacing_reward_penalizes_overlap_and_prefers_useful_distance() {
-        assert!(spacing_reward(0.8) < spacing_reward(2.0));
-        assert!(spacing_reward(5.0) > spacing_reward(3.0));
-        assert!(spacing_reward(8.0) < spacing_reward(5.0));
+        assert!(spacing_reward(0.8) < spacing_reward(2.0)); // overlap worst
+        assert!(spacing_reward(3.5) < 0.0); // within 4 yds is penalized
+        assert!(spacing_reward(2.5) < spacing_reward(3.5)); // within 3 penalized harder
+        assert!(spacing_reward(8.0) > spacing_reward(5.0)); // optimum moved WIDE to 8
+        assert!(spacing_reward(8.0) > spacing_reward(11.0)); // too far tapers off
+        assert!(spacing_reward(13.0) < 0.0); // beyond 12: penalty
     }
 
     #[test]
@@ -540,5 +923,15 @@ mod tests {
         assert!((0.0..=1.0).contains(&stats.possession));
         assert!(stats.pass_completion().is_finite());
         assert!(stats.conversion().is_finite());
+    }
+
+    #[test]
+    fn behavior_clone_warm_start_collects_finite_teacher_signal() {
+        let mut rng = Rng::new(2026);
+        let mut policy = Policy::new(&mut rng);
+        let stats = behavior_clone_scripted(&mut policy, 1, 1, &mut rng);
+        assert!(stats.samples > 0);
+        assert!(stats.loss.is_finite());
+        assert!((0.0..=1.0).contains(&stats.accuracy));
     }
 }
