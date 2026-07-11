@@ -77,12 +77,12 @@ example `ShotOnTarget` or `BadPassChainPenalty`) together with the canonical 256
 embedding at that event's tick and a second canonical embedding after the
 configured outcome horizon. The capture intentionally omits the event's
 hand-authored magnitude, so the contextual head cannot merely imitate the assumed
-reward it is meant to replace. The fitter first learns a hermetic whole-field
-state-value head from final W/D/L plus capped goal margin. It then trains each
+reward it is meant to replace. The fitter first learns a hermetic `256 -> 32 -> 1`
+neural whole-field state-value head from final W/D/L plus capped goal margin. It then trains each
 event utility from the learned value change between the factual event state and
 its later field state; penalty heads use the sign mirror. Per-kind RMS value
 change supplies a data-derived target scale rather than an assumed reward value.
-Value changes are generated out-of-fold by alternating match partitions, then
+Neural value changes are generated out-of-fold by alternating match partitions, then
 shrunk by the value model's held-out improvement over a zero predictor. A weak or
 non-predictive value model therefore produces a near-neutral `1.0` utility rather
 than amplifying noise. The delta normalizer has a `0.05` lower safety clamp so a

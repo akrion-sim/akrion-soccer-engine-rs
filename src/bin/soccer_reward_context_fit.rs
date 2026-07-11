@@ -25,6 +25,110 @@ struct RewardContextHead {
     weights: Vec<f64>,
 }
 
+const VALUE_HIDDEN_DIM: usize = 32;
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NeuralStateValueHead {
+    hidden_biases: Vec<f64>,
+    hidden_weights: Vec<Vec<f64>>,
+    output_bias: f64,
+    output_weights: Vec<f64>,
+}
+
+impl NeuralStateValueHead {
+    fn deterministic(seed: u64) -> Self {
+        let mut state = seed;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (((state >> 11) as f64 / ((1u64 << 53) as f64)) * 2.0 - 1.0) * 0.08
+        };
+        Self {
+            hidden_biases: vec![0.0; VALUE_HIDDEN_DIM],
+            hidden_weights: (0..VALUE_HIDDEN_DIM)
+                .map(|_| (0..SOCCER_MOMENT_EMBEDDING_DIM).map(|_| next()).collect())
+                .collect(),
+            output_bias: 0.0,
+            output_weights: (0..VALUE_HIDDEN_DIM).map(|_| next()).collect(),
+        }
+    }
+
+    fn valid(&self) -> bool {
+        self.hidden_biases.len() == VALUE_HIDDEN_DIM
+            && self.hidden_weights.len() == VALUE_HIDDEN_DIM
+            && self
+                .hidden_weights
+                .iter()
+                .all(|row| row.len() == SOCCER_MOMENT_EMBEDDING_DIM)
+            && self.output_weights.len() == VALUE_HIDDEN_DIM
+    }
+
+    fn hidden(&self, embedding: &[f64]) -> Vec<f64> {
+        if !self.valid() || embedding.len() != SOCCER_MOMENT_EMBEDDING_DIM {
+            return vec![0.0; VALUE_HIDDEN_DIM];
+        }
+        let norm = (SOCCER_MOMENT_EMBEDDING_DIM as f64).sqrt();
+        self.hidden_weights
+            .iter()
+            .zip(&self.hidden_biases)
+            .map(|(weights, bias)| {
+                (weights
+                    .iter()
+                    .zip(embedding)
+                    .fold(*bias, |sum, (weight, value)| sum + weight * value)
+                    / norm)
+                    .tanh()
+            })
+            .collect()
+    }
+
+    fn predict(&self, embedding: &[f64]) -> f64 {
+        let hidden = self.hidden(embedding);
+        let norm = (VALUE_HIDDEN_DIM as f64).sqrt();
+        (self
+            .output_weights
+            .iter()
+            .zip(hidden)
+            .fold(self.output_bias, |sum, (weight, value)| {
+                sum + weight * value
+            })
+            / norm)
+            .tanh()
+    }
+
+    fn train(&mut self, embedding: &[f64], target: f64, learning_rate: f64) {
+        if !self.valid() || embedding.len() != SOCCER_MOMENT_EMBEDDING_DIM {
+            return;
+        }
+        let hidden = self.hidden(embedding);
+        let prediction = self.predict(embedding);
+        let output_delta =
+            ((prediction - target) * (1.0 - prediction * prediction)).clamp(-2.0, 2.0);
+        let input_norm = (SOCCER_MOMENT_EMBEDDING_DIM as f64).sqrt();
+        let hidden_norm = (VALUE_HIDDEN_DIM as f64).sqrt();
+        let old_output_weights = self.output_weights.clone();
+        self.output_bias =
+            (self.output_bias - learning_rate * output_delta / hidden_norm).clamp(-2.0, 2.0);
+        for hidden_index in 0..VALUE_HIDDEN_DIM {
+            let hidden_value = hidden[hidden_index];
+            self.output_weights[hidden_index] = (self.output_weights[hidden_index]
+                - learning_rate * output_delta * hidden_value / hidden_norm)
+                .clamp(-2.0, 2.0);
+            let hidden_delta = (output_delta * old_output_weights[hidden_index] / hidden_norm)
+                * (1.0 - hidden_value * hidden_value);
+            self.hidden_biases[hidden_index] = (self.hidden_biases[hidden_index]
+                - learning_rate * hidden_delta / input_norm)
+                .clamp(-2.0, 2.0);
+            for (weight, value) in self.hidden_weights[hidden_index].iter_mut().zip(embedding) {
+                *weight =
+                    (*weight - learning_rate * hidden_delta * value / input_norm).clamp(-2.0, 2.0);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RewardContextArtifact {
@@ -42,6 +146,8 @@ struct RewardContextArtifact {
     value_delta_rms_by_kind: HashMap<String, f64>,
     #[serde(default)]
     state_value_head: RewardContextHead,
+    #[serde(default)]
+    neural_state_value_head: NeuralStateValueHead,
     #[serde(default)]
     state_value_reliability: f64,
     by_kind: HashMap<String, RewardContextHead>,
@@ -146,6 +252,29 @@ fn fit_state_value_head(
                         .clamp(-2.0, 2.0);
                 }
             }
+        }
+    }
+    head
+}
+
+fn fit_neural_state_value_head(
+    rows: &[&LabeledMoment],
+    prior: Option<&NeuralStateValueHead>,
+    epochs: usize,
+    learning_rate: f64,
+    seed: u64,
+) -> NeuralStateValueHead {
+    let mut head = prior
+        .filter(|head| head.valid())
+        .cloned()
+        .unwrap_or_else(|| NeuralStateValueHead::deterministic(seed));
+    for _ in 0..epochs.max(1) {
+        for row in rows {
+            head.train(
+                &row.sample.embedding,
+                row.outcome,
+                learning_rate * row.value_weight,
+            );
         }
     }
     head
@@ -313,8 +442,11 @@ fn main() {
         .iter()
         .filter(|row| row.game_index % 2 == 1)
         .collect();
-    let value_for_even = fit_state_value_head(&odd_rows, None, epochs, learning_rate);
-    let value_for_odd = fit_state_value_head(&even_rows, None, epochs, learning_rate);
+    let value_seed = seed_base as u64 ^ 0x5A17_EF1E_1D00_0001;
+    let value_for_even =
+        fit_neural_state_value_head(&odd_rows, None, epochs, learning_rate, value_seed);
+    let value_for_odd =
+        fit_neural_state_value_head(&even_rows, None, epochs, learning_rate, value_seed);
     let mut baseline_error = 0.0;
     let mut model_error = 0.0;
     let mut validation_weight = 0.0;
@@ -326,13 +458,14 @@ fn main() {
             } else {
                 &value_for_odd
             };
-            let prediction = predict_head(head, &row.sample.embedding);
+            let prediction = head.predict(&row.sample.embedding);
             baseline_error += row.value_weight * row.outcome.powi(2);
             model_error += row.value_weight * (prediction - row.outcome).powi(2);
             validation_weight += row.value_weight;
-            row.sample.future_embedding.as_deref().map(|future| {
-                predict_head(head, future) - predict_head(head, &row.sample.embedding)
-            })
+            row.sample
+                .future_embedding
+                .as_deref()
+                .map(|future| head.predict(future) - head.predict(&row.sample.embedding))
         })
         .collect();
     let state_value_reliability = if validation_weight > 0.0 && baseline_error > 1e-9 {
@@ -345,6 +478,15 @@ fn main() {
         prior.as_ref().map(|artifact| &artifact.state_value_head),
         epochs,
         learning_rate,
+    );
+    let neural_state_value_head = fit_neural_state_value_head(
+        &all_rows,
+        prior
+            .as_ref()
+            .map(|artifact| &artifact.neural_state_value_head),
+        epochs,
+        learning_rate,
+        value_seed,
     );
     for (row, delta) in moments.iter_mut().zip(cross_deltas) {
         row.value_delta = delta
@@ -406,6 +548,7 @@ fn main() {
         effective_samples_by_kind,
         value_delta_rms_by_kind,
         state_value_head,
+        neural_state_value_head,
         state_value_reliability,
         by_kind,
     };
