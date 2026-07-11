@@ -122,7 +122,8 @@ struct Sample {
     mask: [bool; NA],
     action: usize,          // macro action (0..NA)
     speed: usize,           // speed gear (0..NS)
-    old_logp: f32,          // joint log-prob = ln p(action) + ln p(speed)
+    old_logp_a: f32,        // ln p(action) at collection time
+    old_logp_s: f32,        // ln p(speed)  at collection time
     adv: f32,
     ret: f32,
 }
