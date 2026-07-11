@@ -74,9 +74,11 @@ metric.
 `soccer_reward_context_fit` is the outcome-grounded fitter. It reuses the existing
 configuration-moment corpus rather than inventing another state recorder: each
 row already contains the canonical 256-d embedding, the action taken, immediate
-reward, and realised n-step return. Reward heads learn higher utility in field
-configurations where the associated action family produced good future return;
-penalty heads learn the sign-mirrored target. A prior schema-v1 artifact can be
+reward, and realised n-step return. The fitter labels those rows from the final
+W/D/L result plus a small capped goal-margin term; it deliberately does not use
+the already-shaped immediate/n-step reward as the target. Reward heads learn
+higher utility in field configurations where the associated action family led
+to good match outcomes; penalty heads learn the sign-mirrored target. A prior schema-v1 artifact can be
 passed as the fifth argument, so accepted weights are the next run's initial
 condition rather than being reset. The generated artifact is frozen during inner
 policy training and must still clear a disjoint promotion evaluation.

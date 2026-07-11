@@ -55,6 +55,11 @@ const KIND_SPECS: &[KindSpec] = &[
     KindSpec { name: "DefensiveDispossession", family: "defend", outcome_sign: 1.0 },
 ];
 
+struct LabeledMoment {
+    moment: SoccerConfigMomentInsert,
+    outcome: f64,
+}
+
 fn normalized_action_family(action: &str) -> &'static str {
     let action = action.to_ascii_lowercase();
     if action.contains("shoot") || action.contains("header") {
@@ -71,7 +76,7 @@ fn normalized_action_family(action: &str) -> &'static str {
 }
 
 fn fit_head(
-    rows: &[&SoccerConfigMomentInsert],
+    rows: &[&LabeledMoment],
     outcome_sign: f64,
     prior: Option<&RewardContextHead>,
     epochs: usize,
@@ -91,21 +96,23 @@ fn fit_head(
     let ridge = 1e-4;
     for _ in 0..epochs.max(1) {
         for row in rows {
-            if row.embedding.len() != SOCCER_MOMENT_EMBEDDING_DIM {
+            if row.moment.embedding.len() != SOCCER_MOMENT_EMBEDDING_DIM {
                 continue;
             }
-            // Bounded outcome target: good future for a reward raises utility;
-            // bad future for a penalty raises its magnitude (outcome_sign=-1).
-            let target = (outcome_sign * row.nstep_return / 20.0).tanh();
+            // Hermetic outcome target: good final match outcome for a reward
+            // raises utility; bad final outcome for a penalty raises its
+            // magnitude. This deliberately does NOT bootstrap from the already
+            // shaped n-step reward that the head is meant to replace.
+            let target = (outcome_sign * row.outcome).clamp(-1.0, 1.0);
             let prediction = head
                 .weights
                 .iter()
-                .zip(&row.embedding)
+                .zip(&row.moment.embedding)
                 .fold(head.bias, |sum, (weight, value)| sum + weight * value)
                 / norm;
             let error = (prediction - target).clamp(-2.0, 2.0);
             head.bias = (head.bias - learning_rate * error / norm).clamp(-2.0, 2.0);
-            for (weight, value) in head.weights.iter_mut().zip(&row.embedding) {
+            for (weight, value) in head.weights.iter_mut().zip(&row.moment.embedding) {
                 if value.is_finite() {
                     *weight = (*weight - learning_rate * (error * value / norm + ridge * *weight))
                         .clamp(-2.0, 2.0);
@@ -161,11 +168,25 @@ fn main() {
         for _ in 0..sim.config.total_ticks() {
             sim.run_time_step();
         }
+        let summary = sim.summary();
+        let home_margin = summary.score_home as i32 - summary.score_away as i32;
         let before = moments.len();
-        moments.extend(sim.config_moments().into_iter().filter(|row| {
-            row.embedding.len() == SOCCER_MOMENT_EMBEDDING_DIM
-                && row.embedding.iter().all(|value| value.is_finite())
-                && row.nstep_return.is_finite()
+        moments.extend(sim.config_moments().into_iter().filter_map(|row| {
+            if row.embedding.len() != SOCCER_MOMENT_EMBEDDING_DIM
+                || row.embedding.iter().any(|value| !value.is_finite())
+            {
+                return None;
+            }
+            let margin = match row.team {
+                soccer_engine::des::general::soccer::Team::Home => home_margin,
+                soccer_engine::des::general::soccer::Team::Away => -home_margin,
+            };
+            let result = margin.signum() as f64;
+            let margin_bonus = (margin as f64 / 3.0).clamp(-1.0, 1.0) * 0.20;
+            Some(LabeledMoment {
+                moment: row,
+                outcome: (result + margin_bonus).clamp(-1.0, 1.0),
+            })
         }));
         eprintln!(
             "context_fit game {}/{} moments_added={} total={}",
@@ -181,7 +202,7 @@ fn main() {
     for spec in KIND_SPECS {
         let rows: Vec<_> = moments
             .iter()
-            .filter(|row| normalized_action_family(&row.action) == spec.family)
+            .filter(|row| normalized_action_family(&row.moment.action) == spec.family)
             .collect();
         samples_by_kind.insert(spec.name.to_string(), rows.len());
         let prior_head = prior.as_ref().and_then(|artifact| artifact.by_kind.get(spec.name));
