@@ -164,6 +164,12 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
             // bonus. The 2-pass rule + final-third gate + ping-pong penalty stop
             // this from becoming lateral hoarding.
             r += 0.2 + (w.last_pass_gain_a.max(0.0) * 0.15).min(1.0);
+            // CONSECUTIVE FORWARD passes = progressive build-up through the thirds
+            // (the good-soccer opposite of ping-pong). Escalating so a *chain* of
+            // forward passes pays more than isolated ones: 1st +0.15, 2nd +0.30, …
+            if w.fwd_pass_streak_a > 0 {
+                r += (0.15 * w.fwd_pass_streak_a as f32).min(0.9);
+            }
             // MILESTONE: completing the SECOND pass unlocks shooting — a clear
             // step toward a goal, so reward reaching that state.
             if w.pass_streak_a == 2 {
