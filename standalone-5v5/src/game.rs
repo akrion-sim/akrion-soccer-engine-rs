@@ -1243,6 +1243,45 @@ impl World {
         best
     }
 
+    /// MPC-lite lane opener (execution of the GET_OPEN decision). Enumerates
+    /// candidate relocations — biased toward the wings — and returns the one that
+    /// best OPENS A PASSING LANE from the ball to that point: a short-horizon
+    /// optimization scoring the resulting lane clearness, plus width, being ahead
+    /// of the ball, and space from the nearest defender. The policy makes the
+    /// decision to get open; this computes where "open" actually is.
+    fn mpc_open_lane_target(&self, team: Team, idx: usize) -> V2 {
+        let me = players(team, self)[idx].pos;
+        let sx = team.sx();
+        let radii = [4.0f32, 8.0, 12.0, 16.0];
+        let ndir = 12usize;
+        let mut best = me;
+        let mut best_score = f32::NEG_INFINITY;
+        for &r in &radii {
+            for k in 0..ndir {
+                let ang = (k as f32) / (ndir as f32) * std::f32::consts::TAU;
+                let cand = V2::new(
+                    (me.x + ang.cos() * r).clamp(3.0, FIELD_L - 3.0),
+                    (me.y + ang.sin() * r).clamp(3.0, FIELD_W - 3.0),
+                );
+                // the payoff: a CLEAR passing lane from the ball to this point.
+                let lane = self.lane_clearness(team, self.ball, cand);
+                // prefer WIDTH (the mechanism for opening a lane is going wider)…
+                let wide = (cand.y - FIELD_W / 2.0).abs() / (FIELD_W / 2.0);
+                // …an upfield outlet ahead of the ball…
+                let ahead = ((cand.x - self.ball.x) * sx).max(0.0) / FIELD_L;
+                // …and real space from the nearest defender (room to receive).
+                let (_, od) = self.nearest_opponent(team, cand);
+                let space = (od / 6.0).min(1.0);
+                let score = lane * 1.6 + wide * 0.7 + ahead * 0.6 + space * 0.5;
+                if score > best_score {
+                    best_score = score;
+                    best = cand;
+                }
+            }
+        }
+        best
+    }
+
     fn set_vel(&mut self, team: Team, idx: usize, v: V2) {
         match team {
             Team::A => self.a[idx].vel = v,
