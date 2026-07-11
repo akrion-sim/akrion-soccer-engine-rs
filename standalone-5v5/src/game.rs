@@ -1315,9 +1315,11 @@ fn rotate(v: V2, ang: f32) -> V2 {
 /// fixed speeds so the benchmark stays comparable): press/support runs fast,
 /// spread/mark at a run, dribble at a skip, set-pieces standing.
 pub fn scripted_gear(a: usize) -> usize {
+    // The scripted baseline moves at run-medium (~= v3's fixed PLAYER_SPEED) so the
+    // benchmark stays as hard as v3's — NOT faster. Over-buffing the defenders to
+    // run_fast crushed the learner's pass completion and blocked all scoring.
     match a {
-        A_CHASE | A_SUPPORT => SPD_RUN_FAST,
-        A_SPREAD | A_MARK => SPD_RUN_MED,
+        A_CHASE | A_SUPPORT | A_SPREAD | A_MARK => SPD_RUN_MED,
         A_DRIB_FWD | A_DRIB_LEFT | A_DRIB_RIGHT => SPD_SKIP,
         _ => SPD_STAND, // shoot/pass/clear/hold/stay: no self-movement
     }
