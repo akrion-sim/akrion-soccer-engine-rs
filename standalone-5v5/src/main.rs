@@ -559,7 +559,9 @@ fn run_training(cfg: &RunConfig) -> AppResult<()> {
     // Persist the trained policy so `inspect` can load and trace it.
     let actor_path = cfg.out_dir.join("actor.txt");
     let critic_path = cfg.out_dir.join("critic.txt");
+    let speedor_path = cfg.out_dir.join("speedor.txt");
     policy.actor.save(&actor_path)?;
+    policy.speedor.save(&speedor_path)?;
     policy.critic.save(&critic_path)?;
     println!(
         "saved policy -> {}, {}",
