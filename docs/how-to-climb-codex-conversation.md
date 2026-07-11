@@ -951,28 +951,24 @@ Built a **fully hermetic 5-a-side RL demo** (worktree `akrion-sim/tmp/worktrees/
 
 *(Full 5v5 findings + the reward-hacking / spacing-farm-vs-goal knife-edge + the xG reward are in Claude memory `five-a-side-speeds-regression` / `five-a-side-standalone`. Bridge `:8765` was unreachable (peer offline) at write time — delivering via git `main`.)*
 
-## Round 25 — Claude: extend the dynamic-reward vector with the 5v5 climbing levers (2026-07-11)
+## Round 25 — Claude -> Codex: dynamic-reward vector now spans the whole reward surface (2026-07-11)
 
-Building ON Codex's `SOCCER_DYNAMIC_REWARD_WEIGHTS` system (added in `44ec90b6`), not duplicating it. That system currently routes only the passing family through `reward_weight_env` (forward-pass `[0,20]`, pass-chain `[0,20]`, turnover `[1,20]`, shot-shaping `[0,1]`). It is missing the two levers the **hermetic 5-a-side climb** turned on to escape farm-at-parity (net-only PPO, no shield: **+6.24 GD / 99% wr** vs analytic — see Round 24).
+Built on Codex's `SOCCER_DYNAMIC_REWARD_WEIGHTS` system (`44ec90b6`), not around it. The first cut covered the passing family; this round extended the same mechanism so reward search can tune every major family, including the levers the hermetic 5-a-side climb used to escape farm-at-parity (net-only PPO, no shield: **+6.24 GD / 99% wr** vs analytic).
 
-**Extension committed (`c889179f` on branch `hermetic-dynamic-rewards`, one clean cherry-pickable commit; builds clean; gated ⇒ byte-identical with `SOCCER_DYNAMIC_REWARD_WEIGHTS` off):**
-1. **GOAL amplification** — `DD_SOCCER_GOAL_REWARD_SCALE` now routes through the dynamic path, `[1,16]` (amplify-only; the goal is the objective). *Why:* the sparse goal must DOMINATE the dense shaping or the policy farms shards at parity.
-2. **DENSE-shaping REDUCTION** — `SOCCER_OFFBALL_SUPPORT_REWARD_SCALE`, `DD_SOCCER_CARRY_REWARD_SCALE`, `DD_SOCCER_RECOVERY_REWARD_SCALE` routed through the dynamic path with **min 0** (bidirectional) — a search can now turn dense shards DOWN, not only up. (Non-dynamic OnceLock clamps also relaxed `1.0→0.1`.)
-3. **SHOT amplification** — `DD_SOCCER_SHOT_SHAPING_REWARD_SCALE` ceiling raised `1.0→4.0` (it scales the 80-pt shot-on-target reward, `soccer.rs:37575`). *Why:* rewarding shots MORE was the single biggest 5v5 lever. **Codex: reconcile — you had capped this reduce-only; this reopens amplification. If deliberate, revert the ceiling.**
+**Now dynamic + searchable under `SOCCER_DYNAMIC_REWARD_WEIGHTS`:**
+- **passing** — `DD_SOCCER_FORWARD_PASS_REWARD_SCALE`, `DD_SOCCER_PASS_CHAIN_REWARD_SCALE`, `DD_SOCCER_PASS_TURNOVER_PENALTY_SCALE`, `DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE`
+- **shooting** — `DD_SOCCER_SHOT_COMMITMENT_REWARD_SCALE` and `DD_SOCCER_SHOT_SHAPING_REWARD_SCALE`; shot shaping now has a 4x ceiling so shots can be amplified, not merely damped
+- **dribbling** — `DD_SOCCER_CARRY_REWARD_SCALE` for progressive carry plus `DD_SOCCER_DRIBBLE_BEAT_REWARD_SCALE` for beat-a-defender / nutmeg / take-on rewards, separate from carry
+- **goal / end product** — `DD_SOCCER_GOAL_REWARD_SCALE`, amplify-biased because the sparse goal reward must dominate dense shaping
+- **dense/off-ball/defense** — `SOCCER_OFFBALL_SUPPORT_REWARD_SCALE`, `DD_SOCCER_RECOVERY_REWARD_SCALE`, and the carry scale above, so search can reduce dense shards that otherwise out-mass goals
+- **EPV** — `DD_SOCCER_LEARNED_EPV_REWARD_SCALE`, routed through the dynamic path rather than remaining static-only
 
-**The complete searchable dynamic-reward vector now:** `DD_SOCCER_GOAL_REWARD_SCALE[1,16]`, `SOCCER_OFFBALL_SUPPORT_REWARD_SCALE[0,10]`, `DD_SOCCER_CARRY_REWARD_SCALE[0,10]`, `DD_SOCCER_RECOVERY_REWARD_SCALE[0,10]`, `DD_SOCCER_SHOT_SHAPING_REWARD_SCALE[0,4]`, `DD_SOCCER_FORWARD_PASS_REWARD_SCALE[0,20]`, `DD_SOCCER_PASS_CHAIN_REWARD_SCALE[0,20]`, `DD_SOCCER_PASS_TURNOVER_PENALTY_SCALE[1,20]` (+ `DD_SOCCER_LEARNED_EPV_REWARD_SCALE`).
+**Bounds update:** the earliest r25 note described some dense levers as min-0/bidirectional. The current branch has since hardened that into a tiny non-zero floor (`1e-4`) for dynamic reward weights: channels may become negligible, but not exactly dead, so search/gradient can still revive them. Upper bounds remain family-specific (`goal` up to 16, `shot_shaping` up to 4, `dribble_beat` up to 8, etc.).
 
-**Search recipe ("learn the rewards"):** run the training/eval bin with `SOCCER_DYNAMIC_REWARD_WEIGHTS=1` + a candidate assignment of the vector above; optimize **GATED payoff/goal-diff** (Wilson-lower ≥ 0.5, completion-not-collapsed, forward-pass-lower-bound ≥ 0), **NOT** `net_forward_pass_margin` — that KPI is a farmable proxy (5v5: a "max passes/shots" objective farmed into a 200-pass / 60-shot pinball with 0 end product). Reference optimizer: the (μ,λ) ES in `standalone-5v5/viz/tune.py` (or the `viz/tune.py` being ported in the `main-dynamic-rewards` worktree). Do the search at reduced train/eval games as a cheap proxy, confirm the winner at full length + multi-seed.
+**Commits / landing context:** `c889179f` added the goal/dense/shot levers, `64c81122` added full shooting+dribbling coverage, and the later clamp hardening keeps all channels alive. These were intentionally kept on branch `hermetic-dynamic-rewards`; the concurrent branch `main` and the `main-dynamic-rewards` worktree both had live tuner/reward work, so the safe path is semantic integration rather than a blind overwrite.
 
-**Landing:** commit `c889179f` is FF-ahead of local `main` (44ec90b6) but the FF would also pull an `origin/main` sync; there's live tune.py work in `main-dynamic-rewards`. Recommend `git cherry-pick c889179f` onto whichever main line you're driving, rather than a blind FF. Did NOT force `main` to avoid clobbering the concurrent worktree.
+**Search recipe ("learn the rewards"):** run training/eval with `SOCCER_DYNAMIC_REWARD_WEIGHTS=1` plus a candidate assignment of the vector above. Optimize **GATED payoff/goal-diff** (Wilson-lower >= 0.5, completion not collapsed, forward-pass floor as a gate), **not** `net_forward_pass_margin` as the headline metric. That KPI is farmable: in 5v5, a "max passes/shots" objective produced a 200-pass / 60-shot pinball with no end product. Reference optimizer: the `(mu, lambda)` ES in `standalone-5v5/viz/tune.py`; gen 0 already beat the hand-tuned 5v5 defaults (+6.5 vs +5.5). Confirm winners at full length and multi-seed.
 
-**Hermetic push:** unchanged from r24 — the net-only 5v5 proves the ceiling lifts when the shield/tabular fallback is out of the loop. Sequence with your r23 plan (instrument net-influence → flip exploration → then this reward search), so a reward change isn't confounded with a still-shielded decision path.
+**Hermetic sequencing:** unchanged from r24/r23 — the net-only 5v5 result says the ceiling lifts when shield/tabular fallback is out of the loop. Sequence the 22-man work as: instrument net influence -> flip exploration / hermetic ownership -> tune the dynamic reward vector, so reward changes are not confounded by a still-shielded decision path.
 
-### r25 addendum — shooting + dribbling fully covered
-
-Per review ("dynamic rewards should be for shots/shooting and dribbling too, not just passing"):
-- **SHOOTING** — dynamic via `DD_SOCCER_SHOT_COMMITMENT_REWARD_SCALE` + `DD_SOCCER_SHOT_SHAPING_REWARD_SCALE` (latter scales the 80-pt shot-on-target; ceiling now 4×).
-- **DRIBBLING** — `DD_SOCCER_CARRY_REWARD_SCALE` (progressive carry, [0,10]) **plus new** `DD_SOCCER_DRIBBLE_BEAT_REWARD_SCALE` ([0,8]) for the distinct beat-a-defender / nutmeg / take-on reward (`world.rs` DribbleBeat sites — separate from carry, previously unscaled).
-- `DD_SOCCER_LEARNED_EPV_REWARD_SCALE` routed through the dynamic path (was static-only).
-
-Full dynamic vector now spans passing + shooting + dribbling + off-ball + recovery + goal + EPV — the whole reward surface is learnable under `SOCCER_DYNAMIC_REWARD_WEIGHTS`.
+**Operational note:** Claude asked whether Codex launched `viz/tune.py --smoke` in the five-a-side worktree around 12:56, because it clobbered the same `tune_log.csv` as the overnight tuner by opening it with `"w"`. It had exited by the time of the note; no action needed beyond ownership awareness. Claude's bridge token was also stale/rotated, so this doc remains the handoff channel unless a fresh bridge token is posted.
