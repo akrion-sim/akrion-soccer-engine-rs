@@ -35,7 +35,10 @@ pub const SPD_SPRINT: usize = 6;
 // Low end kept non-crippling (a slow gear still lets you get around) so the speed
 // policy's exploration can't paralyze the game; STAND is the only truly-still gear.
 const SPEEDS: [f32; NS] = [0.0, 3.0, 4.5, 5.5, 6.5, 8.5, 11.0];
-const BALL_SPEED_CAP: f32 = 9.3; // ~22 mph: you can't dribble at a full open-field sprint
+// Ball-carrying is much slower than open-field running (you can't sprint flat-out
+// with the ball at your feet) — and, critically, keeping it near v3's control
+// speed stops the policy from dribbling forever to evade the 2-pass shot gate.
+const BALL_SPEED_CAP: f32 = 4.8;
 
 /// Map a speed gear to yards/second, capping ball-carrying to ~22 mph.
 fn speed_val(gear: usize, carrying: bool) -> f32 {
