@@ -541,10 +541,10 @@ pub fn behavior_clone_scripted(
         for chunk in idx.chunks(MINIBATCH) {
             for &si in chunk {
                 let s = &data[si];
+                // clone the scripted ACTION into the action network…
                 let acts = policy.actor.forward(&s.obs);
                 let logits = acts.last().unwrap();
-                let probs = masked_softmax(&logits[0..NA], &s.mask);
-                let sprobs = masked_softmax(&logits[NA..NA + NS], &[true; NS]);
+                let probs = masked_softmax(logits, &s.mask);
                 let p = probs[s.action].max(1e-8);
                 loss_accum += -p.ln();
                 if probs
@@ -556,20 +556,25 @@ pub fn behavior_clone_scripted(
                 {
                     correct += 1.0;
                 }
-                // clone BOTH heads: the scripted action and its gear.
-                let mut d_logits = vec![0.0f32; NA + NS];
+                let mut d_logits = vec![0.0f32; NA];
                 for j in 0..NA {
                     if s.mask[j] {
                         d_logits[j] = probs[j] - if j == s.action { 1.0 } else { 0.0 };
                     }
                 }
-                for k in 0..NS {
-                    d_logits[NA + k] = sprobs[k] - if k == s.speed { 1.0 } else { 0.0 };
-                }
                 policy.actor.backward(&acts, &d_logits);
+                // …and the scripted GEAR into the separate speed network.
+                let sacts = policy.speedor.forward(&s.obs);
+                let sprobs = masked_softmax(sacts.last().unwrap(), &[true; NS]);
+                let mut d_slogits = vec![0.0f32; NS];
+                for k in 0..NS {
+                    d_slogits[k] = sprobs[k] - if k == s.speed { 1.0 } else { 0.0 };
+                }
+                policy.speedor.backward(&sacts, &d_slogits);
                 count += 1.0;
             }
             policy.actor.step(LR_BC);
+            policy.speedor.step(LR_BC);
         }
     }
 
