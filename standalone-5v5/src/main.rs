@@ -496,7 +496,10 @@ fn run_training(cfg: &RunConfig) -> AppResult<()> {
 
     // Speed-warmup curriculum: fix the gear (v3 behavior) for the first stretch so
     // the action policy learns to attack before the speed policy adds variability.
-    let speed_warmup = (cfg.iters / 2).clamp(1, 300);
+    let speed_warmup = std::env::var("SPEED_WARMUP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| (cfg.iters / 2).clamp(1, 300));
     for it in 1..=cfg.iters {
         train::set_speed_frozen(it <= speed_warmup);
         let beta = train::ent_beta_at(it, cfg.iters);
