@@ -26,14 +26,25 @@ const LR_BC: f32 = 8e-4;
 const EPOCHS: usize = 4;
 const MINIBATCH: usize = 1024;
 const MAX_ROLLOUT_THREADS: usize = 4;
+const MIN_REWARD_WEIGHT: f32 = 0.0001;
 // ─── Tunable reward weights (env-overridable, read ONCE per process) ─────────
 // Every weight below can be set via an env var of the same name, so an external
-// search harness (viz/tune.py) can optimize the reward vector without recompiling.
-fn wenv(name: &str, default: f32) -> f32 {
-    std::env::var(name)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
+// search harness (viz/tune.py) can optimize the reward vector without
+// recompiling. Bounds keep every reward channel alive while still allowing
+// past-run priors to be overridden by the tuner.
+fn bounded_weight(raw: Option<&str>, default: f32, lo: f32, hi: f32) -> f32 {
+    let lo = lo.max(MIN_REWARD_WEIGHT);
+    let hi = hi.max(lo);
+    let value = raw
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|v| v.is_finite())
+        .unwrap_or(default);
+    value.clamp(lo, hi)
+}
+
+fn wenv(name: &str, default: f32, lo: f32, hi: f32) -> f32 {
+    let raw = std::env::var(name).ok();
+    bounded_weight(raw.as_deref(), default, lo, hi)
 }
 pub struct Rw {
     pub goal: f32,                 // +goal scored
@@ -69,35 +80,35 @@ pub struct Rw {
 fn rw() -> &'static Rw {
     static R: std::sync::OnceLock<Rw> = std::sync::OnceLock::new();
     R.get_or_init(|| Rw {
-        goal: wenv("REW_GOAL", 12.0),
-        concede: wenv("REW_CONCEDE", 8.0),
-        shot_base: wenv("REW_SHOT_BASE", 1.5),
-        shot_q: wenv("REW_SHOT_Q", 1.0),
-        milestone: wenv("REW_MILESTONE", 0.3),
-        pass_credit: wenv("REW_PASS", 0.06),
-        turnover: wenv("REW_TURNOVER", 0.55),
-        bad_pass_turnover: wenv("REW_BAD_PASS_TURNOVER", 0.35),
-        dribble_turnover: wenv("REW_DRIBBLE_TURNOVER", 0.75),
-        recycle: wenv("REW_RECYCLE", 0.18),
-        return_pass: wenv("REW_RETURN_PASS", 0.35),
-        return_stale: wenv("REW_RETURN_STALE", 0.55),
-        win_ball: wenv("REW_WIN_BALL", 0.3),
-        dribble: wenv("REW_DRIBBLE", 0.015),
-        shape: wenv("W_SHAPE", 2.2),
-        advance: wenv("W_ADVANCE", 0.04),
-        open: wenv("W_OPEN", 0.04),
-        width: wenv("W_WIDTH", 0.045),
-        flank: wenv("W_FLANK", 0.025),
-        goalside: wenv("W_GOALSIDE", 0.08),
-        goalside_run: wenv("W_GOALSIDE_RUN", 0.04),
-        ahead: wenv("W_AHEAD", 0.035),
-        make_run: wenv("W_MAKE_RUN", 0.06),
-        burst_gear: wenv("W_BURST_GEAR", 0.035),
-        field_pass: wenv("W_FIELD_PASS", 0.08),
-        field_turnover: wenv("W_FIELD_TURNOVER", 0.16),
-        field_goalside_delta: wenv("W_FIELD_GOALSIDE_DELTA", 0.10),
-        field_burst_delta: wenv("W_FIELD_BURST_DELTA", 0.08),
-        stand_pen: wenv("W_STAND_PEN", 0.02),
+        goal: wenv("REW_GOAL", 12.0, 6.0, 20.0),
+        concede: wenv("REW_CONCEDE", 8.0, 4.0, 16.0),
+        shot_base: wenv("REW_SHOT_BASE", 1.5, 0.3, 3.5),
+        shot_q: wenv("REW_SHOT_Q", 1.0, MIN_REWARD_WEIGHT, 2.5),
+        milestone: wenv("REW_MILESTONE", 0.3, MIN_REWARD_WEIGHT, 1.5),
+        pass_credit: wenv("REW_PASS", 0.06, MIN_REWARD_WEIGHT, 0.4),
+        turnover: wenv("REW_TURNOVER", 0.55, MIN_REWARD_WEIGHT, 1.5),
+        bad_pass_turnover: wenv("REW_BAD_PASS_TURNOVER", 0.35, MIN_REWARD_WEIGHT, 1.5),
+        dribble_turnover: wenv("REW_DRIBBLE_TURNOVER", 0.75, MIN_REWARD_WEIGHT, 2.0),
+        recycle: wenv("REW_RECYCLE", 0.18, MIN_REWARD_WEIGHT, 0.8),
+        return_pass: wenv("REW_RETURN_PASS", 0.35, MIN_REWARD_WEIGHT, 2.0),
+        return_stale: wenv("REW_RETURN_STALE", 0.55, MIN_REWARD_WEIGHT, 2.0),
+        win_ball: wenv("REW_WIN_BALL", 0.3, MIN_REWARD_WEIGHT, 1.2),
+        dribble: wenv("REW_DRIBBLE", 0.015, MIN_REWARD_WEIGHT, 0.12),
+        shape: wenv("W_SHAPE", 2.2, 0.5, 4.0),
+        advance: wenv("W_ADVANCE", 0.04, MIN_REWARD_WEIGHT, 0.12),
+        open: wenv("W_OPEN", 0.04, MIN_REWARD_WEIGHT, 0.12),
+        width: wenv("W_WIDTH", 0.045, MIN_REWARD_WEIGHT, 0.12),
+        flank: wenv("W_FLANK", 0.025, MIN_REWARD_WEIGHT, 0.10),
+        goalside: wenv("W_GOALSIDE", 0.08, MIN_REWARD_WEIGHT, 0.25),
+        goalside_run: wenv("W_GOALSIDE_RUN", 0.04, MIN_REWARD_WEIGHT, 0.16),
+        ahead: wenv("W_AHEAD", 0.035, MIN_REWARD_WEIGHT, 0.16),
+        make_run: wenv("W_MAKE_RUN", 0.06, MIN_REWARD_WEIGHT, 0.20),
+        burst_gear: wenv("W_BURST_GEAR", 0.035, MIN_REWARD_WEIGHT, 0.16),
+        field_pass: wenv("W_FIELD_PASS", 0.08, MIN_REWARD_WEIGHT, 0.30),
+        field_turnover: wenv("W_FIELD_TURNOVER", 0.16, MIN_REWARD_WEIGHT, 0.50),
+        field_goalside_delta: wenv("W_FIELD_GOALSIDE_DELTA", 0.10, MIN_REWARD_WEIGHT, 0.35),
+        field_burst_delta: wenv("W_FIELD_BURST_DELTA", 0.08, MIN_REWARD_WEIGHT, 0.35),
+        stand_pen: wenv("W_STAND_PEN", 0.02, MIN_REWARD_WEIGHT, 0.20),
     })
 }
 // The speed policy is a low-variance REFINEMENT on top of the action policy —
@@ -110,10 +121,7 @@ const ENT_BETA0: f32 = 0.02;
 // Teammate-spacing reward weight. Overridable via SPACING_W env for tuning.
 // Default halved from the 10 Hz value (per-tick reward now fires twice as often).
 fn w_spacing() -> f32 {
-    std::env::var("SPACING_W")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.003)
+    wenv("SPACING_W", 0.003, 0.0005, 0.012)
 }
 
 /// PER-PLAYER spacing reward as a function of a player's nearest-teammate
@@ -1168,6 +1176,35 @@ mod tests {
     }
 
     #[test]
+    fn bounded_reward_weights_stay_positive_and_finite() {
+        assert_eq!(bounded_weight(Some("0"), 1.0, 0.0, 2.0), MIN_REWARD_WEIGHT);
+        assert_eq!(
+            bounded_weight(Some("-5"), 1.0, MIN_REWARD_WEIGHT, 2.0),
+            MIN_REWARD_WEIGHT
+        );
+        assert_eq!(
+            bounded_weight(Some("0.00001"), 0.003, 0.0005, 0.012),
+            0.0005
+        );
+        assert_eq!(
+            bounded_weight(Some("3.5"), 1.0, MIN_REWARD_WEIGHT, 2.0),
+            2.0
+        );
+        assert_eq!(
+            bounded_weight(Some("NaN"), 1.0, MIN_REWARD_WEIGHT, 2.0),
+            1.0
+        );
+        assert_eq!(
+            bounded_weight(Some("inf"), 1.0, MIN_REWARD_WEIGHT, 2.0),
+            1.0
+        );
+        assert_eq!(
+            bounded_weight(None, 0.0, MIN_REWARD_WEIGHT, 2.0),
+            MIN_REWARD_WEIGHT
+        );
+    }
+
+    #[test]
     fn scripted_vs_scripted_is_seed_reproducible() {
         let mut a = Rng::new(1234);
         let mut b = Rng::new(1234);
@@ -1219,7 +1256,7 @@ mod tests {
         blocked.ball = open.ball;
         blocked.a = open.a;
         blocked.b = open.b;
-        blocked.b[1].pos = V2::new(18.0, 14.0);
+        blocked.b[1].pos = V2::new(13.0, 14.0);
         blocked.b[2].pos = V2::new(20.0, 8.0);
         blocked.b[3].pos = V2::new(20.0, 20.0);
 

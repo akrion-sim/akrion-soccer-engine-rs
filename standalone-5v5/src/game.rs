@@ -1755,6 +1755,15 @@ mod tests {
         }
     }
 
+    fn return_pass_action_to_previous_giver(w: &World, from_idx: usize, giver_idx: usize) -> usize {
+        let cands = w.pass_candidates(Team::A, from_idx);
+        let rank = cands
+            .iter()
+            .position(|cand| matches!(cand, Some((idx, _)) if *idx == giver_idx))
+            .expect("previous giver should remain legal but de-ranked");
+        A_PASS_A + rank
+    }
+
     #[test]
     fn observations_and_global_state_are_finite() {
         let w = World::new();
@@ -1799,7 +1808,12 @@ mod tests {
 
         let off_ball = w.legal_mask(Team::A, 2);
         assert!(!off_ball[A_PASS_A]);
-        assert!(off_ball[A_CHASE]);
+        assert!(
+            !off_ball[A_CHASE],
+            "off-ball attackers should not chase their own carrier"
+        );
+        assert!(off_ball[A_SUPPORT]);
+        assert!(off_ball[A_GET_OPEN]);
         assert!(off_ball[A_STAY]);
     }
 
@@ -1920,7 +1934,8 @@ mod tests {
         w.lp_to = 2;
         w.return_streak_a = 1;
 
-        let kick = w.apply_on_ball(Team::A, 2, A_PASS_A, SPD_RUN_MED, &mut Rng::new(3));
+        let action = return_pass_action_to_previous_giver(&w, 2, 1);
+        let kick = w.apply_on_ball(Team::A, 2, action, SPD_RUN_MED, &mut Rng::new(3));
 
         assert!(kick.is_some());
         assert!(matches!(w.intended_receiver, Some(o) if o.team == Team::A && o.idx == 1));
@@ -1989,7 +2004,8 @@ mod tests {
         w.lp_from = 1; // player 1 gave the ball to player 2
         w.lp_to = 2;
         w.return_streak_a = 0;
-        let _ = w.apply_on_ball(Team::A, 2, A_PASS_A, SPD_RUN_MED, &mut Rng::new(3));
+        let action = return_pass_action_to_previous_giver(&w, 2, 1);
+        let _ = w.apply_on_ball(Team::A, 2, action, SPD_RUN_MED, &mut Rng::new(3));
         assert!(w.ev_return_pass_a);
         assert_eq!(w.return_streak_a, 1);
         assert_eq!(w.return_start_x, 20.0); // sequence origin recorded
