@@ -33,7 +33,9 @@ pub const SPD_RUN_MED: usize = 4;
 pub const SPD_RUN_FAST: usize = 5;
 pub const SPD_SPRINT: usize = 6;
 // stand · walk · jog · skip · run_med · run_fast · full_sprint
-const SPEEDS: [f32; NS] = [0.0, 1.3, 2.8, 4.2, 6.0, 8.5, 11.0];
+// Low end kept non-crippling (a slow gear still lets you get around) so the speed
+// policy's exploration can't paralyze the game; STAND is the only truly-still gear.
+const SPEEDS: [f32; NS] = [0.0, 3.0, 4.5, 5.5, 6.5, 8.5, 11.0];
 const BALL_SPEED_CAP: f32 = 9.3; // ~22 mph: you can't dribble at a full open-field sprint
 
 /// Map a speed gear to yards/second, capping ball-carrying to ~22 mph.
