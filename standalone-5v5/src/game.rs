@@ -1507,8 +1507,8 @@ impl World {
         let clear = self.shot_clearness(team, me);
         let (_, opp_d) = self.nearest_opponent(team, me);
         let shot_legal = match team {
-            Team::A => self.pass_streak_a >= 2 && me.x >= FINAL_THIRD_X,
-            Team::B => self.b_pass_streak >= 2 && me.x <= FIELD_L - FINAL_THIRD_X,
+            Team::A => self.pass_streak_a >= 2 && me.x >= SHOOT_X,
+            Team::B => self.b_pass_streak >= 2 && me.x <= FIELD_L - SHOOT_X,
         };
 
         // close in with a reasonably open lane -> shoot (else work it closer)
