@@ -20,6 +20,14 @@ implemented yet.
   tune on disjoint match batches, freeze for a training window, and accept a
   calibration only through the existing held-out WDL/Wilson/goal-difference
   promotion gate.
+- `scripts/optimize_reward_calibration.py` is the persistent outer loop for that
+  seam. It uses cross-entropy-method proposals in bounded log-scale space,
+  freezes each proposal for a complete analytic-opponent training window, and
+  evaluates on a disjoint analytic seed range. Its authoritative objective is
+  the held-out Wilson lower bound, with small goal-difference tie-breaking and
+  a turnover-regression tax. Every proposal, seed, snapshot, log, and verdict is
+  stored under the requested output directory; `--resume` continues the audit
+  trail instead of restarting or silently selecting on training reward.
 
 - The runtime decision stack is hybrid: MDP/POMDP observations and analytic beliefs
   generate legal options, neural policy/value and tabular/retrieval priors score them,
