@@ -479,9 +479,15 @@ pub fn behavior_clone_scripted(
             for i in 1..N {
                 let obs = w.observe(Team::A, i);
                 let mask = w.legal_mask(Team::A, i);
-                if let Some(action) = legal_or_first(act_a[i], &mask) {
-                    act_a[i] = action;
-                    data.push(BcSample { obs, mask, action });
+                let gear = act_a[i] / NA; // keep the scripted gear
+                if let Some(action) = legal_or_first(act_a[i] % NA, &mask) {
+                    act_a[i] = action + gear * NA;
+                    data.push(BcSample {
+                        obs,
+                        mask,
+                        action,
+                        speed: gear,
+                    });
                 }
             }
             let act_b = w.scripted_actions(Team::B);
