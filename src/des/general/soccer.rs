@@ -4234,6 +4234,11 @@ pub(crate) fn carry_reward_scale() -> f64 {
 /// Amplify DEFENSIVE ball-RECOVERY / press rewards (win the ball back after a loss).
 /// Env `DD_SOCCER_RECOVERY_REWARD_SCALE` (default 1.0), clamped [0.1, 10] (can REDUCE or amplify — for reward search).
 pub(crate) fn ball_recovery_reward_scale() -> f64 {
+    // Dynamic-reward mode: bidirectional (min 0) so a search can reduce this dense
+    // recovery shard relative to the sparse goal.
+    if dynamic_reward_weights_enabled() {
+        return reward_weight_env("DD_SOCCER_RECOVERY_REWARD_SCALE", 1.0, 0.0, 10.0);
+    }
     use std::sync::OnceLock;
     static V: OnceLock<f64> = OnceLock::new();
     *V.get_or_init(|| {
