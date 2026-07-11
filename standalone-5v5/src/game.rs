@@ -212,6 +212,7 @@ impl World {
             pass_kick_x: 0.0,
             last_pass_gain_a: 0.0,
             pass_streak_a: 0,
+            fwd_pass_streak_a: 0,
             a_shot_flag: false,
             lp_from: -1,
             lp_to: -1,
