@@ -679,7 +679,7 @@ pub fn train_iter(policy: &mut Policy, games: usize, ent_beta: f32, rng: &mut Rn
                 for k in 0..NS {
                     let ind = if k == s.speed { 1.0 } else { 0.0 };
                     let pg = -coeff_s * (ind - sprobs[k]);
-                    let eg = ent_beta * sprobs[k] * (sprobs[k].max(1e-8).ln() + ent_s);
+                    let eg = ent_beta * SPEED_ENT_SCALE * sprobs[k] * (sprobs[k].max(1e-8).ln() + ent_s);
                     d_slogits[k] = pg + eg;
                 }
                 policy.speedor.backward(&sacts, &d_slogits);
