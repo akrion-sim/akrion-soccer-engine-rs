@@ -82,6 +82,10 @@ neural whole-field state-value head from final W/D/L plus capped goal margin. It
 event utility from the learned value change between the factual event state and
 its later field state; penalty heads use the sign mirror. Per-kind RMS value
 change supplies a data-derived target scale rather than an assumed reward value.
+Before terminal fitting, the neural latent is self-supervised on every factual
+pair to predict a fixed 32-dimensional projection of the future field vector.
+Terminal labels train only the small value output, so scarce W/D/L outcomes do
+not have to discover the 22-player interaction representation from scratch.
 Neural value changes are generated out-of-fold by alternating match partitions, then
 shrunk by the value model's held-out improvement over a zero predictor. A weak or
 non-predictive value model therefore produces a near-neutral `1.0` utility rather
@@ -91,7 +95,9 @@ A team-match contributes at most one unit of fitting weight to each event kind:
 repeated routine occurrences receive inverse-frequency weight, preventing a match
 with hundreds of carries from overwhelming rarer shot, pass, or turnover evidence.
 A prior schema-v1 artifact can be passed as the fifth argument, so accepted weights
-are the next run's initial condition rather than being reset. The generated
+and its self-supervised neural value representation become the next run's initial
+condition rather than being reset. Cross-fit reliability is still measured only
+against the new shard's held-out match partition. The generated
 artifact is frozen during inner policy training and must still clear a disjoint
 promotion evaluation.
 
