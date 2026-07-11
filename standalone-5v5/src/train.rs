@@ -286,6 +286,13 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
             if nd.is_finite() {
                 sp_t[i] = w_spacing_coeff * spacing_reward(nd);
             }
+            let is_carrier = matches!(w.owner, Some(o) if o.team == Team::A && o.idx == i);
+            // ANTI-PASSIVITY: the STAND gear must not be a free way to farm the
+            // positional shaping. An off-ball player who freezes is penalized, so
+            // players keep moving and (in possession) make their runs.
+            if !is_carrier && spd_t[i] == SPD_STAND {
+                sp_t[i] -= W_STAND_PEN;
+            }
             if our_phase {
                 // Advance upfield (attack frame +x). No offsides rule, so reward
                 // getting into the ATTACKING HALF and keep rewarding all the way to
