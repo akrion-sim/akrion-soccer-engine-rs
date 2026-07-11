@@ -17,7 +17,6 @@ pub const HZ: f32 = 1.0 / DT; // ticks per second (for real-time viewer playback
 pub const STEPS: usize = 600; // ticks per game (~30s at 20 Hz)
 
 const PLAYER_SPEED: f32 = 6.5; // legacy reference speed (~= run_medium); kept for keeper reach/util
-const DRIBBLE_SPEED: f32 = 4.6; // legacy dribble speed (diagnostic v3 reproduction)
 
 // ---- Player gears -----------------------------------------------------------
 // Seven discrete speeds the policy can pick for any movement/dribble, from
