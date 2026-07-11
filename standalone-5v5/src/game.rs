@@ -702,7 +702,8 @@ impl World {
                     self.goal_kick(Team::B); // B restarts from its own line
                 }
             } else if self.ball.x <= 0.0 {
-                if self.ball.y > gy0 && self.ball.y < gy1 {
+                if self.ball.y > gy0 && self.ball.y < gy1 && self.b_shot_flag {
+                    // symmetric: B goal only counts from a valid (2-pass, final-third) shot
                     self.goals_b += 1;
                     self.ev_goal_b = true;
                     self.kickoff(Team::A);
