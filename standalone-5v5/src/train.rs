@@ -234,7 +234,7 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
         phi_prev = phi;
         let mut r = W_SHAPE * shaping;
         if w.ev_goal_a {
-            r += 8.0; // GOALS are the prize — rewarded well above shots
+            r += 12.0; // GOALS are the prize — rewarded well above everything else
         }
         if w.ev_goal_b {
             r -= 6.0;
