@@ -4255,6 +4255,13 @@ pub(crate) fn ball_recovery_reward_scale() -> f64 {
 /// get drowned by per-tick shaping). Env `DD_SOCCER_GOAL_REWARD_SCALE` (default 1.0), clamped [1, 16].
 /// Respects the learn-via-rewards method — it reweights the signal, it does not hard-force finishing.
 pub(crate) fn goal_reward_scale() -> f64 {
+    // Dynamic-reward mode: let a reward search AMPLIFY the sparse goal so it can
+    // DOMINATE the dense shaping (the 5-a-side climb turned on exactly this —
+    // goals must out-mass the per-tick shards or the policy farms them at parity).
+    // Amplify-only: the goal is the objective; there is no reason to shrink it.
+    if dynamic_reward_weights_enabled() {
+        return reward_weight_env("DD_SOCCER_GOAL_REWARD_SCALE", 1.0, 1.0, 16.0);
+    }
     use std::sync::OnceLock;
     static V: OnceLock<f64> = OnceLock::new();
     *V.get_or_init(|| {
