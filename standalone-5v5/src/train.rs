@@ -159,14 +159,19 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
         // forward progress is rewarded by the potential shaping above, and goals
         // dominate — so passing stays INSTRUMENTAL and the policy still attacks.
         if w.ev_pass_completed_a {
-            // The 2-pass RULE already forces passing, so passing needs almost no
-            // reward — a flat base just causes endless hoarding (0 shots). Keep
-            // ONLY a small FORWARD-progress nudge so the forced passes go toward
-            // goal; the goal (+5) and shot rewards are the real prize.
-            r += (w.last_pass_gain_a.max(0.0) * 0.12).min(0.8);
+            // Completing a pass must be clearly worthwhile so the policy is willing
+            // to risk it (a required step to a legal shot): a real base + forward
+            // bonus. The 2-pass rule + final-third gate + ping-pong penalty stop
+            // this from becoming lateral hoarding.
+            r += 0.2 + (w.last_pass_gain_a.max(0.0) * 0.15).min(1.0);
+            // MILESTONE: completing the SECOND pass unlocks shooting — a clear
+            // step toward a goal, so reward reaching that state.
+            if w.pass_streak_a == 2 {
+                r += 0.7;
+            }
         }
         if w.ev_turnover_a {
-            r -= 0.35; // harsher than before (was 0.25) but not so harsh passing dies
+            r -= 0.2; // real cost, but not so harsh the required passing is avoided
         }
         // Shot on target from the final third after 2 passes is genuinely EARNED,
         // so reward it well (not just the goal) — it's the payoff for build-up.
