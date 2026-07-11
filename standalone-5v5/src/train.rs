@@ -321,7 +321,6 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
                 //   (2) MAKE THE RUN — actual forward velocity (what the sprint
                 //       gears are for). Together this pulls the whole line upfield
                 //       in unison the moment we win possession.
-                let is_carrier = matches!(w.owner, Some(o) if o.team == Team::A && o.idx == i);
                 if !is_carrier {
                     let ahead = ((pos.x - w.ball.x) / 12.0).clamp(0.0, 1.0);
                     let lane = w.lane_clearness(Team::A, w.ball, pos);
