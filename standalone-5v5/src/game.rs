@@ -826,10 +826,12 @@ impl World {
                 self.ev_turnover_a = true;
                 self.pass_streak_a = 0;
                 self.reset_a_pass_memory();
+                self.b_pass_streak = 1; // B possession begins
             } else if matches!(prev_touch, Some(Team::B)) && o.team == Team::A {
                 self.ev_win_ball_a = true; // won a loose ball off B
                 self.pass_streak_a = 0;
                 self.reset_a_pass_memory();
+                self.b_pass_streak = 0;
             }
             self.last_touch = Some(o.team);
             self.pending_pass = None;
