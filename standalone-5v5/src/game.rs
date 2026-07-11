@@ -9,7 +9,8 @@ use crate::rng::Rng;
 pub const FIELD_L: f32 = 42.0;
 pub const FIELD_W: f32 = 28.0;
 pub const GOAL_HALF: f32 = 3.5; // half goal-mouth width in y (~7m net)
-pub const FINAL_THIRD_X: f32 = FIELD_L * 2.0 / 3.0; // A may only shoot past this x
+pub const FINAL_THIRD_X: f32 = FIELD_L * 2.0 / 3.0; // attacking-third boundary (kept for reference)
+pub const SHOOT_X: f32 = FIELD_L / 2.0; // A may shoot once in the OPPONENT'S HALF (not just the final third)
 pub const N: usize = 5; // players per team (index 0 == goalkeeper)
 pub const GK: usize = 0; // goalkeeper index; controlled by a fixed rule, not the policy
 pub const DT: f32 = 0.05; // seconds per decision tick -> 20 Hz sim (real-time 20 fps)
@@ -187,6 +188,7 @@ pub struct World {
     pub pass_dir_a: i32,              // direction of that pass: 1 forward, 0 lateral, -1 backward
     pub ev_shot_attempt_a: bool,      // Team A took a shot this tick
     pub last_shot_quality_a: f32,     // placement quality of A's last shot, ~[0,1] (MPC finish)
+    pub last_shot_xg_a: f32,          // POSITION quality (xG-like: distance+angle to goal), ~[0,1]
     pending_pass: Option<Owner>,      // intended receiver of an in-flight pass
     intended_receiver: Option<Owner>, // scratch set during apply_on_ball
     pass_kick_x: f32,                 // ball x when Team A last released a pass
@@ -245,6 +247,7 @@ impl World {
             pass_dir_a: 0,
             ev_shot_attempt_a: false,
             last_shot_quality_a: 0.0,
+            last_shot_xg_a: 0.0,
             pending_pass: None,
             intended_receiver: None,
             pass_kick_x: 0.0,
@@ -620,16 +623,16 @@ impl World {
             }
             // 2-PASS RULE (Team A): no shooting until 2 completed passes this
             // possession — forces build-up play, not solo dribble-and-shoot.
-            // FINAL-THIRD RULE (Team A): may only shoot from the attacking third.
+            // OPPONENT-HALF RULE (Team A): may shoot anywhere in the opponent's half.
             if team == Team::A {
                 let x = players(team, self)[idx].pos.x;
-                if self.pass_streak_a < 2 || x < FINAL_THIRD_X {
+                if self.pass_streak_a < 2 || x < SHOOT_X {
                     m[A_SHOOT] = false;
                 }
             } else {
                 // Symmetric shooting gate for the scripted/noisy opponent.
                 let x = players(team, self)[idx].pos.x;
-                if self.b_pass_streak < 2 || x > FIELD_L - FINAL_THIRD_X {
+                if self.b_pass_streak < 2 || x > FIELD_L - SHOOT_X {
                     m[A_SHOOT] = false;
                 }
             }
@@ -988,7 +991,7 @@ impl World {
                 } else {
                     // symmetric: B's goal only counts if B built up (2 passes) and
                     // shoots from B's own final third (B attacks -x -> small x).
-                    self.b_shot_flag = self.b_pass_streak >= 2 && me.x < FIELD_L - FINAL_THIRD_X;
+                    self.b_shot_flag = self.b_pass_streak >= 2 && me.x < FIELD_L - SHOOT_X;
                     self.b_pass_streak = 0;
                 }
                 self.set_vel(team, idx, V2::default());
@@ -1022,7 +1025,16 @@ impl World {
                     // shooting from a position where a good placement exists.
                     let q = (best_score / 12.0).clamp(0.0, 1.0);
                     self.last_shot_quality_a = q;
-                    if goal.sub(me).len() < 24.0 {
+                    // POSITION quality (xG-like), a function of the field vector at the
+                    // shot: close + central is a high-value chance, a long-range or
+                    // wide pot-shot is near-zero. Distance dominates (squared decay),
+                    // shot ANGLE (central vs wide) modulates.
+                    let d = goal.sub(me).len();
+                    let lateral = (me.y - FIELD_W / 2.0).abs();
+                    let dist_f = (1.0 - d / 26.0).clamp(0.0, 1.0);
+                    let angle_f = (1.0 - lateral / (FIELD_W / 2.0)).clamp(0.0, 1.0);
+                    self.last_shot_xg_a = dist_f * dist_f * (0.4 + 0.6 * angle_f);
+                    if d < 24.0 {
                         self.ev_shot_on_a = true;
                     }
                 }
@@ -1506,8 +1518,8 @@ impl World {
         let clear = self.shot_clearness(team, me);
         let (_, opp_d) = self.nearest_opponent(team, me);
         let shot_legal = match team {
-            Team::A => self.pass_streak_a >= 2 && me.x >= FINAL_THIRD_X,
-            Team::B => self.b_pass_streak >= 2 && me.x <= FIELD_L - FINAL_THIRD_X,
+            Team::A => self.pass_streak_a >= 2 && me.x >= SHOOT_X,
+            Team::B => self.b_pass_streak >= 2 && me.x <= FIELD_L - SHOOT_X,
         };
 
         // close in with a reasonably open lane -> shoot (else work it closer)
@@ -1873,22 +1885,22 @@ mod tests {
     }
 
     #[test]
-    fn final_third_rule_masks_shot_outside_attacking_third() {
+    fn opponent_half_rule_masks_shot_in_own_half() {
         let mut w = World::new();
         w.owner = Some(Owner {
             team: Team::A,
             idx: 1,
         });
         w.pass_streak_a = 2; // 2-pass rule satisfied
-        w.a[1].pos = V2::new(FINAL_THIRD_X - 5.0, 14.0); // BEFORE the final third
+        w.a[1].pos = V2::new(SHOOT_X - 3.0, 14.0); // still in our own half
         assert!(
             !w.legal_mask(Team::A, 1)[A_SHOOT],
-            "shot must be masked outside final third"
+            "shot must be masked in our own half"
         );
-        w.a[1].pos = V2::new(FINAL_THIRD_X + 2.0, 14.0); // inside final third
+        w.a[1].pos = V2::new(SHOOT_X + 2.0, 14.0); // in the opponent's half
         assert!(
             w.legal_mask(Team::A, 1)[A_SHOOT],
-            "shot allowed in final third after 2 passes"
+            "shot allowed in the opponent's half after 2 passes"
         );
     }
 
