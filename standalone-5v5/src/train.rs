@@ -260,8 +260,10 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
                 sp_t[i] = w_spacing_coeff * spacing_reward(nd);
             }
             if our_phase {
-                // advance upfield (attack frame +x)
-                let advance = pos.x / FIELD_L - 0.45;
+                // Advance upfield (attack frame +x). No offsides rule, so reward
+                // getting into the ATTACKING HALF and keep rewarding all the way to
+                // the opponent goal — attackers should camp high, not hold at half.
+                let advance = pos.x / FIELD_L - 0.5;
                 // OPEN = a CLEAR passing lane from the ball to me (no defender in
                 // between). NOT merely far from a marker — a player inline behind a
                 // defender is NOT open. This is the MECHANISM for "opening up": the
