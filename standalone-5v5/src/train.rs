@@ -179,16 +179,19 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
         // forward progress is rewarded by the potential shaping above, and goals
         // dominate — so passing stays INSTRUMENTAL and the policy still attacks.
         if w.ev_pass_completed_a {
-            // ONLY a whisper of flat credit — enough to prefer a completed pass to a
-            // loose turnover, nothing more. Forward progress and multi-pass build-up
-            // are already rewarded by the POTENTIAL shaping above (ball.x/FIELD_L),
-            // which TELESCOPES and so CANNOT be farmed by recycling passes. Any large
-            // flat per-pass/milestone term was farmed as pass-pass-shoot-repeat: a
-            // shot resets pass_streak_a, so every mini-possession looked like a fresh
-            // "first 2 passes" build-up and collected the flat credit + milestone.
-            r += 0.03;
-            // Anti-recycle still bites genuinely long sterile possessions.
-            let n = w.pass_streak_a;
+            let n = w.pass_streak_a; // completed passes so far in THIS possession
+            // Small flat credit (prefer a completed pass to a loose turnover) PLUS a
+            // forward-PROGRESS bonus. Progress is bounded by field length and lateral
+            // recycling gains ~0, so it can't be farmed by tiki-taka.
+            r += 0.06 + (w.last_pass_gain_a.max(0.0) * 0.1).min(0.6);
+            // MILESTONE: the 2nd completed pass unlocks a legal shot. The pinball used
+            // to farm this via pass-pass-shoot-repeat — now the SHOT COOLDOWN breaks
+            // that loop (the rapid follow-up shot pays nothing), so the milestone is
+            // safe to reward again for genuine build-up.
+            if n == 2 {
+                r += 0.3;
+            }
+            // Anti-recycle: escalating penalty for sterile long possessions.
             if n > 6 {
                 r -= 0.2 * (n - 6) as f32;
             }
@@ -196,13 +199,12 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
         if w.ev_turnover_a {
             r -= 0.2; // real cost, but not so harsh the required passing is avoided
         }
-        // SHOT: reward chance QUALITY relative to a threshold — a genuine chance pays,
-        // a low-xG pot-shot is PENALIZED. This directly kills shoot-spam farming
-        // (the pinball took ~60 low-quality shots/game) WITHOUT suppressing real
-        // finishing. The end product is the GOAL (+8); shooting only to farm a flat
-        // reward no longer pays.
-        if w.ev_shot_on_a {
-            r += (w.last_shot_quality_a - 0.45) * 0.5;
+        // SHOT ON GOAL from the final third after 2 passes is EARNED and rewarded
+        // (not just goals) — a real base plus a chance-quality bonus. Shoot-spam is
+        // stopped structurally by the cooldown: a rapid-fire repeat shot (fired while
+        // a prior shot is still "hot") pays nothing, so 60-shots/game can't farm this.
+        if w.ev_shot_on_a && !w.shot_was_rapid_a {
+            r += 0.6 + 0.6 * w.last_shot_quality_a;
         }
         // reward winning the ball back (pressing / interceptions / tackles)
         if w.ev_win_ball_a {
