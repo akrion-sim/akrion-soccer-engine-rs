@@ -668,14 +668,17 @@ impl World {
                     }
                     continue;
                 }
-                let a = acts[i];
+                // Actions are packed as `action + speed*NA` so the speed gear rides
+                // along without changing the step signature. Unpack both here.
+                let a = acts[i] % NA;
+                let spd = (acts[i] / NA).min(NS - 1);
                 let is_owner = matches!(self.owner, Some(o) if o.team == team && o.idx == i);
                 if is_owner {
-                    if let Some(k) = self.apply_on_ball(team, i, a, rng) {
+                    if let Some(k) = self.apply_on_ball(team, i, a, spd, rng) {
                         kick = Some(k);
                     }
                 } else {
-                    self.apply_off_ball(team, i, a);
+                    self.apply_off_ball(team, i, a, spd);
                 }
             }
         }
