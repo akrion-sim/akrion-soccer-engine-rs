@@ -494,7 +494,11 @@ fn run_training(cfg: &RunConfig) -> AppResult<()> {
     let mut best_any_iter = 0usize;
     let mut best_gated: Option<(train::Policy, usize, f32)> = None;
 
+    // Speed-warmup curriculum: fix the gear (v3 behavior) for the first stretch so
+    // the action policy learns to attack before the speed policy adds variability.
+    let speed_warmup = (cfg.iters / 2).clamp(1, 300);
     for it in 1..=cfg.iters {
+        train::set_speed_frozen(it <= speed_warmup);
         let beta = train::ent_beta_at(it, cfg.iters);
         let stats = train::train_iter(&mut policy, cfg.games_per_iter, beta, &mut rng);
 
