@@ -626,14 +626,20 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
             if nd.is_finite() {
                 // LINGER GATE: brief closeness (crossing runs, converging on the ball)
                 // is fine — only SUSTAINED lingering in the same radius is penalized.
+                // Separation DECAYS the counter (leaky integrator) rather than
+                // resetting it, so the policy can't farm the gate by oscillating in
+                // and out of the radius. A true one-time crossing decays to 0.
                 if nd < LINGER_RADIUS {
                     close_ticks[i] += 1;
                 } else {
-                    close_ticks[i] = 0;
+                    close_ticks[i] = close_ticks[i].saturating_sub(LINGER_DECAY);
                 }
                 let mut sr = spacing_reward(nd);
-                if sr < 0.0 && close_ticks[i] <= linger_gate {
-                    sr = 0.0; // transient — not yet a lingering-bunch penalty
+                // SEVERE overlap (occupying the same spot) is never "running past
+                // each other" — penalize it instantly, ungated. Only the soft
+                // 1.5-4yd band gets the linger grace period.
+                if sr < 0.0 && nd >= SEVERE_RADIUS && close_ticks[i] <= linger_gate {
+                    sr = 0.0; // transient soft-band closeness — not yet a lingering bunch
                 }
                 sp_t[i] = w_spacing_coeff * sr;
             }
