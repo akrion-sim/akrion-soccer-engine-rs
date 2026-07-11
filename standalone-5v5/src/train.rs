@@ -168,10 +168,10 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
         if w.ev_turnover_a {
             r -= 0.35; // harsher than before (was 0.25) but not so harsh passing dies
         }
-        // Shot on target: modest — the GOAL (+8) is the prize, not the shot — but
-        // enough that once built up + in range, shooting beats another pass.
+        // Shot on target from the final third after 2 passes is genuinely EARNED,
+        // so reward it well (not just the goal) — it's the payoff for build-up.
         if w.ev_shot_on_a {
-            r += 0.5 + 0.4 * w.last_shot_quality_a;
+            r += 1.2 + 0.8 * w.last_shot_quality_a;
         }
         // reward winning the ball back (pressing / interceptions / tackles)
         if w.ev_win_ball_a {
