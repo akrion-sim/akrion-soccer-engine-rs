@@ -179,41 +179,30 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
         // forward progress is rewarded by the potential shaping above, and goals
         // dominate — so passing stays INSTRUMENTAL and the policy still attacks.
         if w.ev_pass_completed_a {
-            let n = w.pass_streak_a; // completed passes so far in THIS possession
-            // (1) Forward PROGRESS is the real value of a pass — and it's naturally
-            // bounded by the field length, so it can't be farmed by recycling.
-            r += (w.last_pass_gain_a.max(0.0) * 0.12).min(0.8);
-            // (2) Flat "useful completion" credit ONLY for the passes that build
-            // toward a legal shot (the gate needs 2). A flat per-pass reward on
-            // EVERY completion was the tiki-taka farm (200 passes × 0.2 dwarfed a
-            // goal), so extra recycling passes get NO flat credit.
-            if n <= 2 {
-                r += 0.2;
-            }
-            // (3) CONSECUTIVE FORWARD passes = progressive build-up — but only while
-            // genuinely building (not endless in one possession).
-            if w.fwd_pass_streak_a > 0 && n <= 4 {
-                r += (0.15 * w.fwd_pass_streak_a as f32).min(0.6);
-            }
-            // (4) MILESTONE: the 2nd completed pass unlocks shooting.
-            if n == 2 {
-                r += 0.5;
-            }
-            // (5) ANTI-RECYCLE: sterile possession — passes beyond 6 in a SINGLE
-            // possession without an end product are punished (escalating), so the
-            // policy must progress or shoot instead of farming completions.
+            // ONLY a whisper of flat credit — enough to prefer a completed pass to a
+            // loose turnover, nothing more. Forward progress and multi-pass build-up
+            // are already rewarded by the POTENTIAL shaping above (ball.x/FIELD_L),
+            // which TELESCOPES and so CANNOT be farmed by recycling passes. Any large
+            // flat per-pass/milestone term was farmed as pass-pass-shoot-repeat: a
+            // shot resets pass_streak_a, so every mini-possession looked like a fresh
+            // "first 2 passes" build-up and collected the flat credit + milestone.
+            r += 0.03;
+            // Anti-recycle still bites genuinely long sterile possessions.
+            let n = w.pass_streak_a;
             if n > 6 {
-                r -= 0.15 * (n - 6) as f32;
+                r -= 0.2 * (n - 6) as f32;
             }
         }
         if w.ev_turnover_a {
             r -= 0.2; // real cost, but not so harsh the required passing is avoided
         }
-        // Shot reward = CHANCE QUALITY (xG-like), NOT shot volume. A low-xG pot-shot
-        // pays ~0; a genuine chance pays. The old flat `1.2 + …` was farmed at ~60
-        // shots/game — the end product is the GOAL, so only real chances get credit.
+        // SHOT: reward chance QUALITY relative to a threshold — a genuine chance pays,
+        // a low-xG pot-shot is PENALIZED. This directly kills shoot-spam farming
+        // (the pinball took ~60 low-quality shots/game) WITHOUT suppressing real
+        // finishing. The end product is the GOAL (+8); shooting only to farm a flat
+        // reward no longer pays.
         if w.ev_shot_on_a {
-            r += 0.9 * w.last_shot_quality_a;
+            r += (w.last_shot_quality_a - 0.45) * 0.5;
         }
         // reward winning the ball back (pressing / interceptions / tackles)
         if w.ev_win_ball_a {
