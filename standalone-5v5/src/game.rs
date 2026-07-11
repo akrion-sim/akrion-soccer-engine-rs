@@ -57,7 +57,7 @@ const KEEPER_REACH: f32 = 1.9; // keeper saves spam; well-placed shots still bea
 const KEEPER_SPEED: f32 = 6.0;
 
 // ---- Action space -----------------------------------------------------------
-pub const NA: usize = 14;
+pub const NA: usize = 15;
 pub const A_SHOOT: usize = 0;
 pub const A_PASS_A: usize = 1;
 pub const A_PASS_B: usize = 2;
@@ -72,6 +72,9 @@ pub const A_SUPPORT: usize = 10;
 pub const A_SPREAD: usize = 11;
 pub const A_MARK: usize = 12;
 pub const A_STAY: usize = 13;
+// GET_OPEN: the POMDP decision to move wide and OPEN A PASSING LANE. The target
+// is computed by a short-horizon MPC search (see mpc_open_lane_target).
+pub const A_GET_OPEN: usize = 14;
 pub const PASS_TARGET_SLOTS: usize = N - 2; // outfield teammates minus the possessor
 
 // Full relational field vector (per-agent actor observation): 9 self/global +
