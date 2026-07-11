@@ -153,7 +153,8 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
     let mut mask_buf: Vec<[[bool; NA]; N]> = Vec::with_capacity(STEPS);
     let mut act_buf: Vec<[usize; N]> = Vec::with_capacity(STEPS); // macro action (0..NA)
     let mut spd_buf: Vec<[usize; N]> = Vec::with_capacity(STEPS); // speed gear (0..NS)
-    let mut logp_buf: Vec<[f32; N]> = Vec::with_capacity(STEPS);
+    let mut logpa_buf: Vec<[f32; N]> = Vec::with_capacity(STEPS); // action log-prob
+    let mut logps_buf: Vec<[f32; N]> = Vec::with_capacity(STEPS); // speed log-prob
     let mut val_buf: Vec<f32> = Vec::with_capacity(STEPS); // CENTRALIZED value (one per tick)
     let mut gstate_buf: Vec<[f32; GLOBAL_DIM]> = Vec::with_capacity(STEPS);
     let mut rew_buf: Vec<f32> = Vec::with_capacity(STEPS);
