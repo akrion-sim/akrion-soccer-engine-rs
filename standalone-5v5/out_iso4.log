@@ -1,0 +1,100 @@
+=== 5-a-side standalone learning demo ===
+scripted-vs-scripted:   goal_diff=-0.05  (A 0.25 / B 0.30)
+untrained-vs-scripted:  goal_diff=-0.08  winrate=0.47  (A 0.00 / B 0.08)  spacing=8.3
+behavior-clone warm start: 28800 samples, loss 1.155, teacher-match 57%
+training for 400 iterations (12 games/iter, 4 rollout workers, seed 20260710)...
+
+ iter |  goal_diff |  winrate |     gA     gB |  space |   gate | entropy |  val_loss
+--------------------------------------------------------------------------------
+    5 |     -0.600 |    0.242 |   0.00   0.60 | sp  2.6 |  watch | pass 104.7 (63%) | shot 0.0
+   10 |     -0.383 |    0.325 |   0.02   0.40 | sp  6.6 |  watch | pass  9.1 (28%) | shot 0.1
+   15 |     -0.450 |    0.292 |   0.00   0.45 | sp  9.3 |  watch | pass  4.8 (30%) | shot 0.0
+   20 |     -1.083 |    0.117 |   0.00   1.08 | sp 13.9 |  watch | pass  2.1 (18%) | shot 0.0
+   25 |     -0.867 |    0.192 |   0.00   0.87 | sp 13.4 |  watch | pass  3.7 (14%) | shot 0.0
+   30 |     -0.417 |    0.308 |   0.00   0.42 | sp 14.9 |  watch | pass  3.0 (27%) | shot 0.0
+   35 |     -0.467 |    0.300 |   0.00   0.47 | sp 12.9 |  watch | pass  2.0 (23%) | shot 0.0
+   40 |     -0.933 |    0.158 |   0.00   0.93 | sp 13.1 |  watch | pass  2.1 (27%) | shot 0.0
+   45 |     -1.283 |    0.133 |   0.00   1.28 | sp 11.9 |  watch | pass 12.4 (14%) | shot 0.0
+   50 |     -1.600 |    0.100 |   0.00   1.60 | sp 12.3 |  watch | pass  8.3 (11%) | shot 0.0
+   55 |     -1.083 |    0.125 |   0.00   1.08 | sp 11.6 |  watch | pass  3.0 (23%) | shot 0.0
+   60 |     -0.667 |    0.242 |   0.00   0.67 | sp 10.5 |  watch | pass  3.0 (39%) | shot 0.0
+   65 |     -0.433 |    0.308 |   0.00   0.43 | sp 10.1 |  watch | pass  2.0 (72%) | shot 0.0
+   70 |     -0.817 |    0.158 |   0.00   0.82 | sp 12.4 |  watch | pass  0.8 (44%) | shot 0.0
+   75 |     -0.317 |    0.350 |   0.00   0.32 | sp 11.2 |  watch | pass  2.7 (28%) | shot 0.0
+   80 |     -0.817 |    0.183 |   0.00   0.82 | sp 11.2 |  watch | pass  3.0 (18%) | shot 0.0
+   85 |     -0.317 |    0.350 |   0.00   0.32 | sp 11.5 |  watch | pass  3.1 (36%) | shot 0.0
+   90 |     -0.433 |    0.325 |   0.00   0.43 | sp 11.6 |  watch | pass  1.1 (52%) | shot 0.0
+   95 |     -0.417 |    0.333 |   0.00   0.42 | sp 10.9 |  watch | pass  2.4 (39%) | shot 0.0
+  100 |     -0.783 |    0.217 |   0.00   0.78 | sp 10.3 |  watch | pass  4.4 (24%) | shot 0.0
+  105 |     -1.167 |    0.117 |   0.00   1.17 | sp 11.0 |  watch | pass  4.4 (23%) | shot 0.0
+  110 |     -0.333 |    0.333 |   0.00   0.33 | sp  9.5 |  watch | pass  1.1 (62%) | shot 0.0
+  115 |     -0.833 |    0.167 |   0.00   0.83 | sp  9.5 |  watch | pass  3.8 (23%) | shot 0.0
+  120 |     -0.567 |    0.258 |   0.00   0.57 | sp  9.3 |  watch | pass 11.3 (19%) | shot 0.0
+  125 |     -0.617 |    0.275 |   0.00   0.62 | sp 10.3 |  watch | pass  5.4 (27%) | shot 0.0
+  130 |     -0.483 |    0.300 |   0.00   0.48 | sp 10.0 |  watch | pass  8.7 (22%) | shot 0.0
+  135 |     -0.333 |    0.358 |   0.00   0.33 | sp  9.5 |  watch | pass 15.1 (18%) | shot 0.0
+  140 |     -0.383 |    0.317 |   0.00   0.38 | sp  9.7 |  watch | pass 16.1 (12%) | shot 0.0
+  145 |     -0.367 |    0.367 |   0.00   0.37 | sp  9.0 |  watch | pass  5.6 (36%) | shot 0.0
+  150 |     -0.550 |    0.275 |   0.00   0.55 | sp  9.4 |  watch | pass 14.3 (25%) | shot 0.0
+  155 |     -0.567 |    0.292 |   0.00   0.57 | sp  9.2 |  watch | pass 17.3 (26%) | shot 0.0
+  160 |     -0.483 |    0.275 |   0.00   0.48 | sp  9.6 |  watch | pass 15.0 (36%) | shot 0.0
+  165 |     -0.467 |    0.300 |   0.00   0.47 | sp  8.7 |  watch | pass 21.5 (23%) | shot 0.0
+  170 |     -0.233 |    0.408 |   0.00   0.23 | sp  8.9 |  watch | pass  5.0 (45%) | shot 0.0
+  175 |     -0.550 |    0.300 |   0.00   0.55 | sp  8.9 |  watch | pass 15.7 (19%) | shot 0.0
+  180 |     -0.233 |    0.383 |   0.00   0.23 | sp  8.9 |  watch | pass  3.0 (37%) | shot 0.0
+  185 |     -0.783 |    0.192 |   0.00   0.78 | sp  8.9 |  watch | pass  6.9 (45%) | shot 0.0
+  190 |     -0.383 |    0.317 |   0.00   0.38 | sp  9.0 |  watch | pass  9.4 (38%) | shot 0.0
+  195 |     -0.717 |    0.217 |   0.00   0.72 | sp  8.9 |  watch | pass  9.1 (44%) | shot 0.0
+  200 |     -0.350 |    0.333 |   0.00   0.35 | sp  7.9 |  watch | pass 13.1 (26%) | shot 0.0
+  205 |     -0.567 |    0.258 |   0.00   0.57 | sp  7.6 |  watch | pass 10.3 (38%) | shot 0.0
+  210 |     -0.550 |    0.242 |   0.00   0.55 | sp  8.0 |  watch | pass 11.9 (41%) | shot 0.0
+  215 |     -0.367 |    0.325 |   0.00   0.37 | sp  7.8 |  watch | pass 14.7 (32%) | shot 0.0
+  220 |     -0.600 |    0.267 |   0.00   0.60 | sp  8.1 |  watch | pass 10.5 (41%) | shot 0.0
+  225 |     -0.450 |    0.325 |   0.00   0.45 | sp  7.6 |  watch | pass 15.0 (23%) | shot 0.0
+  230 |     -0.517 |    0.292 |   0.00   0.52 | sp  8.6 |  watch | pass 13.1 (28%) | shot 0.0
+  235 |     -0.567 |    0.267 |   0.00   0.57 | sp  9.1 |  watch | pass 13.2 (31%) | shot 0.0
+  240 |     -0.583 |    0.258 |   0.00   0.58 | sp  8.1 |  watch | pass 13.2 (36%) | shot 0.0
+  245 |     -0.733 |    0.200 |   0.00   0.73 | sp  8.7 |  watch | pass 12.0 (30%) | shot 0.0
+  250 |     -0.517 |    0.267 |   0.00   0.52 | sp  8.7 |  watch | pass 10.6 (29%) | shot 0.0
+  255 |     -0.117 |    0.442 |   0.00   0.12 | sp  8.3 |  watch | pass 11.3 (34%) | shot 0.0
+  260 |     -0.450 |    0.325 |   0.00   0.45 | sp  8.0 |  watch | pass 11.1 (35%) | shot 0.0
+  265 |     -0.517 |    0.258 |   0.00   0.52 | sp  7.9 |  watch | pass 14.0 (37%) | shot 0.0
+  270 |     -0.550 |    0.283 |   0.00   0.55 | sp  8.0 |  watch | pass 11.6 (39%) | shot 0.0
+  275 |     -0.783 |    0.250 |   0.00   0.78 | sp  8.3 |  watch | pass 11.6 (31%) | shot 0.0
+  280 |     -0.650 |    0.225 |   0.00   0.65 | sp  7.9 |  watch | pass  9.9 (30%) | shot 0.0
+  285 |     -0.583 |    0.250 |   0.00   0.58 | sp  8.1 |  watch | pass 10.3 (41%) | shot 0.0
+  290 |     -0.817 |    0.175 |   0.00   0.82 | sp  8.2 |  watch | pass 11.9 (41%) | shot 0.0
+  295 |     -0.417 |    0.308 |   0.00   0.42 | sp  7.8 |  watch | pass  7.8 (38%) | shot 0.0
+  300 |     -0.617 |    0.225 |   0.00   0.62 | sp  8.2 |  watch | pass  8.9 (33%) | shot 0.0
+  305 |     -0.800 |    0.183 |   0.00   0.80 | sp  8.5 |  watch | pass  8.6 (29%) | shot 0.0
+  310 |     -0.800 |    0.167 |   0.00   0.80 | sp  8.6 |  watch | pass  7.8 (32%) | shot 0.0
+  315 |     -0.583 |    0.258 |   0.00   0.58 | sp  8.8 |  watch | pass  7.7 (37%) | shot 0.0
+  320 |     -0.433 |    0.317 |   0.00   0.43 | sp  8.5 |  watch | pass  5.8 (43%) | shot 0.0
+  325 |     -0.883 |    0.175 |   0.00   0.88 | sp  8.4 |  watch | pass  6.6 (32%) | shot 0.0
+  330 |     -0.467 |    0.275 |   0.00   0.47 | sp  8.6 |  watch | pass  6.3 (36%) | shot 0.0
+  335 |     -0.583 |    0.267 |   0.00   0.58 | sp  8.8 |  watch | pass  5.9 (34%) | shot 0.0
+  340 |     -0.417 |    0.325 |   0.00   0.42 | sp  8.4 |  watch | pass  6.5 (38%) | shot 0.0
+  345 |     -1.067 |    0.142 |   0.00   1.07 | sp  8.8 |  watch | pass  5.0 (39%) | shot 0.0
+  350 |     -0.250 |    0.383 |   0.00   0.25 | sp  8.3 |  watch | pass  7.4 (38%) | shot 0.0
+  355 |     -0.183 |    0.417 |   0.00   0.18 | sp  8.1 |  watch | pass  9.4 (31%) | shot 0.0
+  360 |     -0.183 |    0.408 |   0.00   0.18 | sp  8.1 |  watch | pass  8.4 (33%) | shot 0.0
+  365 |     -0.250 |    0.375 |   0.00   0.25 | sp  8.0 |  watch | pass  7.2 (49%) | shot 0.0
+  370 |     -0.233 |    0.383 |   0.00   0.23 | sp  7.8 |  watch | pass  8.5 (43%) | shot 0.0
+  375 |     -0.917 |    0.158 |   0.00   0.92 | sp  8.2 |  watch | pass  8.8 (34%) | shot 0.0
+  380 |     -0.750 |    0.208 |   0.00   0.75 | sp  8.4 |  watch | pass  7.0 (37%) | shot 0.0
+  385 |     -0.717 |    0.200 |   0.00   0.72 | sp  8.7 |  watch | pass  4.6 (37%) | shot 0.0
+  390 |     -0.383 |    0.325 |   0.00   0.38 | sp  8.4 |  watch | pass  7.7 (24%) | shot 0.0
+  395 |     -0.500 |    0.300 |   0.00   0.50 | sp  8.6 |  watch | pass  6.7 (21%) | shot 0.0
+  400 |     -0.500 |    0.267 |   0.00   0.50 | sp  8.4 |  watch | pass  8.3 (19%) | shot 0.0
+
+wrote out/learning_curve.csv
+warning: no checkpoint cleared the behavior gates; persisting best observed checkpoint with manifest flag
+best policy at iter 255 (quality -2.685, gates=false)
+saved policy -> out/actor.txt, out/critic.txt
+
+FINAL (300 games): goal_diff=-0.263  winrate=0.380  goals 0.00-0.26  passes/game 3.5  spacing=8.5  bunch=3%
+  pass: 9.1 att, 38% complete (50% fwd / 17% lat / 33% back) | shots 0.0, 0% converted | poss 5% | turnovers 25.5 | balls won 25.3
+warning: no display seed matched the showcase filter; using seed 1 as a fallback
+display seed 1 (fallback): before 0-0 (poss 261)  ->  after 0-1 (poss 32, passes 3)
+wrote out/match_before.json + out/match_after.json (visual demo traces)
+wrote out/run_manifest.json

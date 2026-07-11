@@ -186,7 +186,7 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
             let a = rng.sample_categorical(&aprobs);
             let pa = aprobs[a].max(1e-8);
             let sprobs = masked_softmax(&logits[NA..NA + NS], &[true; NS]);
-            let s = rng.sample_categorical(&sprobs);
+            let s = SPD_RUN_MED; // DIAGNOSTIC: deterministic gear (no speed sampling)
             let ps = sprobs[s].max(1e-8);
             obs_t[i] = obs;
             mask_t[i] = mask;
