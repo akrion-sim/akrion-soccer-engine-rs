@@ -154,7 +154,9 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
     for _ in 0..STEPS {
         let mut obs_t = [[0.0f32; OBS_DIM]; N];
         let mut mask_t = [[false; NA]; N];
-        let mut act_a = [A_STAY; N];
+        let mut mact_t = [A_STAY; N]; // macro action
+        let mut spd_t = [SPD_STAND; N]; // speed gear
+        let mut packed_a = [A_STAY; N]; // packed (action + speed*NA) for step
         let mut logp_t = [0.0f32; N];
 
         // CENTRALIZED critic: one value for the whole global state this tick.
@@ -166,17 +168,24 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
             let obs = w.observe(Team::A, i);
             let mask = w.legal_mask(Team::A, i);
             let logits = policy.actor.predict(&obs);
-            let probs = masked_softmax(&logits, &mask);
-            let a = rng.sample_categorical(&probs);
-            let p = probs[a].max(1e-8);
+            // action head (masked) and speed head (unmasked) — sampled independently,
+            // joint log-prob is their sum.
+            let aprobs = masked_softmax(&logits[0..NA], &mask);
+            let a = rng.sample_categorical(&aprobs);
+            let pa = aprobs[a].max(1e-8);
+            let sprobs = masked_softmax(&logits[NA..NA + NS], &[true; NS]);
+            let s = rng.sample_categorical(&sprobs);
+            let ps = sprobs[s].max(1e-8);
             obs_t[i] = obs;
             mask_t[i] = mask;
-            act_a[i] = a;
-            logp_t[i] = p.ln();
+            mact_t[i] = a;
+            spd_t[i] = s;
+            packed_a[i] = a + s * NA;
+            logp_t[i] = pa.ln() + ps.ln();
         }
 
         let act_b = noisy_scripted_actions(&w, Team::B, opponent_noise, rng);
-        w.step(&act_a, &act_b, rng);
+        w.step(&packed_a, &act_b, rng);
 
         // team reward (Team A perspective)
         let phi = w.potential_a();
