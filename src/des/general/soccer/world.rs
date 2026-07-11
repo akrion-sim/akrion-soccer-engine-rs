@@ -24373,7 +24373,28 @@ impl SoccerMatch {
         amount: f64,
         kind: SoccerRewardEventKind,
     ) {
-        let amount = calibrated_reward_event_amount(kind, amount);
+        let whole_field_embedding = if reward_context_calibration_enabled()
+            && player_id < self.players.len()
+        {
+            let snapshot = self.export_world_snapshot();
+            let team = self.players[player_id].team;
+            Some(
+                SoccerConfigVector::from_snapshot_with(
+                    &snapshot,
+                    team,
+                    SoccerConfigComparison::PositionAgnostic,
+                    ConfigWeightOptions::default(),
+                )
+                .embedding(),
+            )
+        } else {
+            None
+        };
+        let amount = calibrated_reward_event_amount(
+            kind,
+            amount,
+            whole_field_embedding.as_deref(),
+        );
         // Drop non-finite amounts: `NaN.abs() <= 1e-9` is false, so without this
         // an upstream NaN/Inf would slip past the magnitude gate and pollute the
         // reward-event sum used in transition shaping.

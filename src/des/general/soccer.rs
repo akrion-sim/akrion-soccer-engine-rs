@@ -20933,12 +20933,13 @@ pub(crate) enum SoccerRewardEventKind {
 /// how strongly the learner values that named outcome. Configure comma-separated
 /// `Kind=scale` pairs through `DD_SOCCER_REWARD_KIND_SCALES` (for example,
 /// `CompletedForwardPass=0.8,BadPassChainPenalty=1.3`). Scales are finite and
-/// clamped to [0, 4], so a learned/tuned calibration cannot flip a reward into a
+/// clamped to [0.0001, 4], so a learned/tuned calibration cannot flip or fully erase a
 /// penalty or manufacture unbounded return. Unknown names are ignored and gate
 /// absence is exactly identity.
 pub(crate) fn calibrated_reward_event_amount(
     kind: SoccerRewardEventKind,
     amount: f64,
+    whole_field_embedding: Option<&[f64]>,
 ) -> f64 {
     use std::collections::HashMap;
     use std::sync::OnceLock;
@@ -20953,7 +20954,71 @@ pub(crate) fn calibrated_reward_event_amount(
         )
     });
     let key = format!("{kind:?}");
-    amount * scales.get(&key).copied().unwrap_or(1.0)
+    let static_scale = scales.get(&key).copied().unwrap_or(1.0);
+    let contextual_scale = reward_context_calibration()
+        .and_then(|model| model.by_kind.get(&key))
+        .and_then(|head| whole_field_embedding.map(|embedding| head.scale(embedding)))
+        .unwrap_or(1.0);
+    amount * (static_scale * contextual_scale).clamp(0.0001, 4.0)
+}
+
+/// One sign-safe learned utility head for a named reward event. Its input is the
+/// canonical 256-d whole-field embedding derived from all players plus the ball.
+/// A linear head is intentionally the first persisted contract: outer-loop or
+/// gradient trainers can learn these weights without changing event detection.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SoccerRewardContextHead {
+    #[serde(default)]
+    bias: f64,
+    weights: Vec<f64>,
+}
+
+impl SoccerRewardContextHead {
+    fn scale(&self, embedding: &[f64]) -> f64 {
+        if self.weights.len() != embedding.len()
+            || self.weights.iter().any(|value| !value.is_finite())
+            || !self.bias.is_finite()
+            || embedding.iter().any(|value| !value.is_finite())
+        {
+            return 1.0;
+        }
+        let norm = (embedding.len() as f64).sqrt().max(1.0);
+        let log_scale = self
+            .weights
+            .iter()
+            .zip(embedding)
+            .fold(self.bias, |sum, (weight, value)| sum + weight * value)
+            / norm;
+        let ln_four = 2.0 * std::f64::consts::LN_2;
+        log_scale.clamp(-ln_four, ln_four).exp()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SoccerRewardContextCalibration {
+    #[serde(default)]
+    schema_version: u32,
+    #[serde(default)]
+    by_kind: std::collections::HashMap<String, SoccerRewardContextHead>,
+}
+
+fn reward_context_calibration() -> Option<&'static SoccerRewardContextCalibration> {
+    use std::sync::OnceLock;
+    static MODEL: OnceLock<Option<SoccerRewardContextCalibration>> = OnceLock::new();
+    MODEL
+        .get_or_init(|| {
+            let path = std::env::var("DD_SOCCER_REWARD_CONTEXT_PATH").ok()?;
+            let raw = std::fs::read_to_string(path.trim()).ok()?;
+            let model: SoccerRewardContextCalibration = serde_json::from_str(&raw).ok()?;
+            (model.schema_version == 1 && !model.by_kind.is_empty()).then_some(model)
+        })
+        .as_ref()
+}
+
+pub(crate) fn reward_context_calibration_enabled() -> bool {
+    reward_context_calibration().is_some()
 }
 
 fn parse_reward_kind_scales(raw: &str) -> std::collections::HashMap<String, f64> {
@@ -20963,7 +21028,7 @@ fn parse_reward_kind_scales(raw: &str) -> std::collections::HashMap<String, f64>
             let scale = value.trim().parse::<f64>().ok()?;
             scale
                 .is_finite()
-                .then(|| (name.trim().to_string(), scale.clamp(0.0, 4.0)))
+                .then(|| (name.trim().to_string(), scale.clamp(0.0001, 4.0)))
         })
         .collect()
 }
@@ -20979,8 +21044,22 @@ mod reward_kind_calibration_tests {
         );
         assert_eq!(scales.get("Goal"), Some(&4.0));
         assert_eq!(scales.get("BadPassChainPenalty"), Some(&1.25));
-        assert_eq!(scales.get("CompletedForwardPass"), Some(&0.0));
+        assert_eq!(scales.get("CompletedForwardPass"), Some(&0.0001));
         assert!(!scales.contains_key("KeeperSave"));
+    }
+
+    #[test]
+    fn reward_context_head_is_a_bounded_function_of_the_field_embedding() {
+        let head = SoccerRewardContextHead {
+            bias: 0.0,
+            weights: vec![2.0, -1.0],
+        };
+        let open_lane = head.scale(&[1.0, 0.0]);
+        let crowded_lane = head.scale(&[0.0, 1.0]);
+        assert!(open_lane > crowded_lane);
+        assert!((0.25..=4.0).contains(&open_lane));
+        assert!((0.25..=4.0).contains(&crowded_lane));
+        assert_eq!(head.scale(&[1.0]), 1.0, "dimension mismatch falls back safely");
     }
 }
 

@@ -63,7 +63,7 @@ def calibration_env(scales: dict[str, float]) -> str:
 
 
 def bounded_scale(log_scale: float) -> float:
-    return min(4.0, max(0.05, math.exp(log_scale)))
+    return min(4.0, max(0.0001, math.exp(log_scale)))
 
 
 def parse_verdict(text: str) -> dict[str, Any]:
