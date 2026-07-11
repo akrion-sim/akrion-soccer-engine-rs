@@ -21,10 +21,11 @@ const W_OPEN: f32 = 0.04; // OFFENSE: get into a CLEAR passing lane from the bal
 const W_WIDTH: f32 = 0.045; // OFFENSE: use the width of the pitch (stretch wide)
 const W_FLANK: f32 = 0.025; // OFFENSE: commit to a left/right channel (two-flank spread)
 const W_GOALSIDE: f32 = 0.02; // DEFENSE: get goalside of the ball
-// KEY off-ball run rewards — kept SMALL so they refine v3's attacking behavior.
-const W_AHEAD: f32 = 0.012; // when a teammate has the ball, be an upfield outlet in a clear lane
-const W_MAKE_RUN: f32 = 0.008; // actively sprint upfield to get open for a forward pass
-const W_STAND_PEN: f32 = 0.03; // ANTI-PASSIVITY: discourage the STAND gear for off-ball players
+// KEY off-ball run rewards — held at 0 until the base (v3 + learnable speeds) is
+// solid, then layered back on.
+const W_AHEAD: f32 = 0.0; // when a teammate has the ball, be an upfield outlet in a clear lane
+const W_MAKE_RUN: f32 = 0.0; // actively sprint upfield to get open for a forward pass
+const W_STAND_PEN: f32 = 0.02; // ANTI-PASSIVITY: gently discourage the STAND gear for off-ball players
 // The speed policy is a low-variance REFINEMENT on top of the action policy —
 // small entropy + LR so its exploration can't paralyze the game the action policy
 // is trying to learn in.
