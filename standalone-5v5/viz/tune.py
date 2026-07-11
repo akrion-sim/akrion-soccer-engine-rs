@@ -24,39 +24,45 @@ import os, re, csv, sys, math, time, random, subprocess
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 BIN = os.path.join(ROOT, "target", "release", "fiveaside")
+MIN_WEIGHT = 0.0001
 
 # ── search space: (ENV_VAR, default, low, high, log_scale) ───────────────────
 # Tune the reward vector that shapes the field-vector-conditioned POMDP rewards.
 # Structural knobs (SHOOT_X, BALL_SPEED_CAP) are held fixed here; the scalar
 # weights below multiply dynamic terms derived from the 10-player field vector.
+# Lower bounds are intentionally positive: channels may get tiny, but never
+# collapse to zero and disappear from the learned objective.
 SPACE = [
     ("REW_GOAL",      12.0,  6.0,  20.0, False),
+    ("REW_CONCEDE",    8.0,  4.0,  16.0, False),
     ("REW_SHOT_BASE",  1.5,  0.3,   3.5, False),
-    ("REW_SHOT_Q",     1.0,  0.0,   2.5, False),
-    ("REW_MILESTONE",  0.3,  0.0,   1.5, False),
-    ("REW_PASS",       0.06, 0.0,   0.4, False),
-    ("REW_TURNOVER",   0.55, 0.0,   1.5, False),
-    ("REW_BAD_PASS_TURNOVER", 0.35, 0.0, 1.5, False),
-    ("REW_DRIBBLE_TURNOVER", 0.75, 0.0, 2.0, False),
-    ("REW_RECYCLE",    0.18, 0.0,   0.8, False),
-    ("REW_RETURN_PASS", 0.35, 0.0,  2.0, False),
-    ("REW_RETURN_STALE", 0.55, 0.0, 2.0, False),
-    ("REW_WIN_BALL",   0.3,  0.0,   1.2, False),
+    ("REW_SHOT_Q",     1.0,  MIN_WEIGHT,   2.5, False),
+    ("REW_MILESTONE",  0.3,  MIN_WEIGHT,   1.5, False),
+    ("REW_PASS",       0.06, MIN_WEIGHT,   0.4, False),
+    ("REW_TURNOVER",   0.55, MIN_WEIGHT,   1.5, False),
+    ("REW_BAD_PASS_TURNOVER", 0.35, MIN_WEIGHT, 1.5, False),
+    ("REW_DRIBBLE_TURNOVER", 0.75, MIN_WEIGHT, 2.0, False),
+    ("REW_RECYCLE",    0.18, MIN_WEIGHT,   0.8, False),
+    ("REW_RETURN_PASS", 0.35, MIN_WEIGHT,  2.0, False),
+    ("REW_RETURN_STALE", 0.55, MIN_WEIGHT, 2.0, False),
+    ("REW_WIN_BALL",   0.3,  MIN_WEIGHT,   1.2, False),
+    ("REW_DRIBBLE",    0.015, MIN_WEIGHT,  0.12, False),
     ("W_SHAPE",        2.2,  0.5,   4.0, False),
     ("SPACING_W",      0.003, 0.0005, 0.012, True),
-    ("W_ADVANCE",      0.04, 0.0,   0.12, False),
-    ("W_OPEN",         0.04, 0.0,   0.12, False),
-    ("W_WIDTH",        0.045, 0.0,  0.12, False),
-    ("W_FLANK",        0.025, 0.0,  0.10, False),
-    ("W_GOALSIDE",     0.08, 0.0,   0.25, False),
-    ("W_GOALSIDE_RUN", 0.04, 0.0,   0.16, False),
-    ("W_AHEAD",        0.035, 0.0,  0.16, False),
-    ("W_MAKE_RUN",     0.06, 0.0,   0.20, False),
-    ("W_BURST_GEAR",   0.035, 0.0,  0.16, False),
-    ("W_FIELD_PASS",   0.08, 0.0,   0.30, False),
-    ("W_FIELD_TURNOVER", 0.16, 0.0, 0.50, False),
-    ("W_FIELD_GOALSIDE_DELTA", 0.10, 0.0, 0.35, False),
-    ("W_FIELD_BURST_DELTA", 0.08, 0.0, 0.35, False),
+    ("W_ADVANCE",      0.04, MIN_WEIGHT,   0.12, False),
+    ("W_OPEN",         0.04, MIN_WEIGHT,   0.12, False),
+    ("W_WIDTH",        0.045, MIN_WEIGHT,  0.12, False),
+    ("W_FLANK",        0.025, MIN_WEIGHT,  0.10, False),
+    ("W_GOALSIDE",     0.08, MIN_WEIGHT,   0.25, False),
+    ("W_GOALSIDE_RUN", 0.04, MIN_WEIGHT,   0.16, False),
+    ("W_AHEAD",        0.035, MIN_WEIGHT,  0.16, False),
+    ("W_MAKE_RUN",     0.06, MIN_WEIGHT,   0.20, False),
+    ("W_BURST_GEAR",   0.035, MIN_WEIGHT,  0.16, False),
+    ("W_FIELD_PASS",   0.08, MIN_WEIGHT,   0.30, False),
+    ("W_FIELD_TURNOVER", 0.16, MIN_WEIGHT, 0.50, False),
+    ("W_FIELD_GOALSIDE_DELTA", 0.10, MIN_WEIGHT, 0.35, False),
+    ("W_FIELD_BURST_DELTA", 0.08, MIN_WEIGHT, 0.35, False),
+    ("W_STAND_PEN",    0.02, MIN_WEIGHT,   0.20, False),
 ]
 
 ITERS   = int(os.environ.get("TUNE_ITERS", "500"))
@@ -88,6 +94,8 @@ def norm(vec):
     """map raw weights -> normalized [0,1] per dim (log-aware)."""
     out = []
     for (name, d, lo, hi, log), v in zip(SPACE, vec):
+        lo, hi = max(MIN_WEIGHT, lo), max(max(MIN_WEIGHT, lo), hi)
+        v = min(hi, max(lo, v))
         if log:
             v, lo, hi = math.log(v), math.log(lo), math.log(hi)
         out.append((v - lo) / (hi - lo))
@@ -98,6 +106,7 @@ def denorm(nvec):
     """map normalized [0,1] -> raw weights (clipped, log-aware)."""
     out = []
     for (name, d, lo, hi, log), n in zip(SPACE, nvec):
+        lo, hi = max(MIN_WEIGHT, lo), max(max(MIN_WEIGHT, lo), hi)
         n = min(1.0, max(0.0, n))
         if log:
             v = math.exp(math.log(lo) + n * (math.log(hi) - math.log(lo)))
