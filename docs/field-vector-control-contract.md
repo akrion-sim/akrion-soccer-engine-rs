@@ -79,7 +79,10 @@ hand-authored magnitude, so the contextual head cannot merely imitate the assume
 reward it is meant to replace. The fitter labels only events that actually
 occurred, using the event team's final W/D/L result plus a small capped goal-margin
 term; reward heads learn the outcome target and penalty heads its sign mirror. A
-prior schema-v1 artifact can be passed as the fifth argument, so accepted weights
+team-match contributes at most one unit of fitting weight to each event kind:
+repeated routine occurrences receive inverse-frequency weight, preventing a match
+with hundreds of carries from overwhelming rarer shot, pass, or turnover evidence.
+A prior schema-v1 artifact can be passed as the fifth argument, so accepted weights
 are the next run's initial condition rather than being reset. The generated
 artifact is frozen during inner policy training and must still clear a disjoint
 promotion evaluation.

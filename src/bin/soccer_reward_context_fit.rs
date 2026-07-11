@@ -33,6 +33,8 @@ struct RewardContextArtifact {
     minutes: f64,
     seed_base: u32,
     samples_by_kind: HashMap<String, usize>,
+    #[serde(default)]
+    effective_samples_by_kind: HashMap<String, f64>,
     by_kind: HashMap<String, RewardContextHead>,
 }
 
@@ -84,6 +86,10 @@ const KIND_SPECS: &[KindSpec] = &[
 struct LabeledMoment {
     sample: SoccerRewardContextSample,
     outcome: f64,
+    /// Inverse occurrence count for this `(match, team, event kind)` group.
+    /// Each team-match therefore contributes at most one unit of evidence to a
+    /// head, rather than repeated carries dominating rare decisive events.
+    sample_weight: f64,
 }
 
 fn fit_head(
@@ -122,10 +128,11 @@ fn fit_head(
                 .fold(head.bias, |sum, (weight, value)| sum + weight * value)
                 / norm;
             let error = (prediction - target).clamp(-2.0, 2.0);
-            head.bias = (head.bias - learning_rate * error / norm).clamp(-2.0, 2.0);
+            let weighted_rate = learning_rate * row.sample_weight;
+            head.bias = (head.bias - weighted_rate * error / norm).clamp(-2.0, 2.0);
             for (weight, value) in head.weights.iter_mut().zip(&row.sample.embedding) {
                 if value.is_finite() {
-                    *weight = (*weight - learning_rate * (error * value / norm + ridge * *weight))
+                    *weight = (*weight - weighted_rate * (error * value / norm + ridge * *weight))
                         .clamp(-2.0, 2.0);
                 }
             }
@@ -188,28 +195,44 @@ fn main() {
         let summary = sim.summary();
         let home_margin = summary.score_home as i32 - summary.score_away as i32;
         let before = moments.len();
-        moments.extend(
-            sim.reward_context_samples()
-                .iter()
-                .cloned()
-                .filter_map(|sample| {
-                    if sample.embedding.len() != SOCCER_MOMENT_EMBEDDING_DIM
-                        || sample.embedding.iter().any(|value| !value.is_finite())
-                    {
-                        return None;
-                    }
-                    let margin = match sample.team {
-                        soccer_engine::des::general::soccer::Team::Home => home_margin,
-                        soccer_engine::des::general::soccer::Team::Away => -home_margin,
-                    };
-                    let result = margin.signum() as f64;
-                    let margin_bonus = (margin as f64 / 3.0).clamp(-1.0, 1.0) * 0.20;
-                    Some(LabeledMoment {
-                        sample,
-                        outcome: (result + margin_bonus).clamp(-1.0, 1.0),
-                    })
-                }),
-        );
+        let valid_samples: Vec<_> = sim
+            .reward_context_samples()
+            .iter()
+            .filter(|sample| {
+                sample.embedding.len() == SOCCER_MOMENT_EMBEDDING_DIM
+                    && sample.embedding.iter().all(|value| value.is_finite())
+            })
+            .cloned()
+            .collect();
+        let mut occurrence_counts = HashMap::<(String, bool), usize>::new();
+        for sample in &valid_samples {
+            let home = matches!(sample.team, soccer_engine::des::general::soccer::Team::Home);
+            *occurrence_counts
+                .entry((sample.kind.clone(), home))
+                .or_default() += 1;
+        }
+        moments.extend(valid_samples.into_iter().filter_map(|sample| {
+            let home = matches!(sample.team, soccer_engine::des::general::soccer::Team::Home);
+            let occurrence_count = *occurrence_counts
+                .get(&(sample.kind.clone(), home))
+                .unwrap_or(&1);
+            if sample.embedding.len() != SOCCER_MOMENT_EMBEDDING_DIM
+                || sample.embedding.iter().any(|value| !value.is_finite())
+            {
+                return None;
+            }
+            let margin = match sample.team {
+                soccer_engine::des::general::soccer::Team::Home => home_margin,
+                soccer_engine::des::general::soccer::Team::Away => -home_margin,
+            };
+            let result = margin.signum() as f64;
+            let margin_bonus = (margin as f64 / 3.0).clamp(-1.0, 1.0) * 0.20;
+            Some(LabeledMoment {
+                sample,
+                outcome: (result + margin_bonus).clamp(-1.0, 1.0),
+                sample_weight: 1.0 / occurrence_count as f64,
+            })
+        }));
         eprintln!(
             "context_fit game {}/{} moments_added={} total={}",
             game + 1,
@@ -221,12 +244,17 @@ fn main() {
 
     let mut by_kind = HashMap::new();
     let mut samples_by_kind = HashMap::new();
+    let mut effective_samples_by_kind = HashMap::new();
     for spec in KIND_SPECS {
         let rows: Vec<_> = moments
             .iter()
             .filter(|row| row.sample.kind == spec.name)
             .collect();
         samples_by_kind.insert(spec.name.to_string(), rows.len());
+        effective_samples_by_kind.insert(
+            spec.name.to_string(),
+            rows.iter().map(|row| row.sample_weight).sum(),
+        );
         let prior_head = prior
             .as_ref()
             .and_then(|artifact| artifact.by_kind.get(spec.name));
@@ -245,6 +273,7 @@ fn main() {
         minutes,
         seed_base,
         samples_by_kind,
+        effective_samples_by_kind,
         by_kind,
     };
     let json = serde_json::to_string_pretty(&artifact).expect("serialize context artifact");
