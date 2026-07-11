@@ -98,10 +98,13 @@ impl Policy {
                 bi = i;
             }
         }
-        // greedy speed gear (argmax over the speed head)
-        let mut bs = 0;
+        // greedy speed gear (argmax over the MOVING gears). We skip SPD_STAND (0)
+        // at eval so a near-flat speed head can't tie-break the whole team into
+        // standing still — standing is essentially never the right greedy choice,
+        // and this removes a degenerate "frozen evaluation" artifact.
+        let mut bs = SPD_WALK;
         let mut bsp = f32::NEG_INFINITY;
-        for k in 0..NS {
+        for k in SPD_WALK..NS {
             if logits[NA + k] > bsp {
                 bsp = logits[NA + k];
                 bs = k;
