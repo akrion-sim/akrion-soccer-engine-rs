@@ -16,8 +16,7 @@ pub const DT: f32 = 0.05; // seconds per decision tick -> 20 Hz sim (real-time 2
 pub const HZ: f32 = 1.0 / DT; // ticks per second (for real-time viewer playback)
 pub const STEPS: usize = 600; // ticks per game (~30s at 20 Hz)
 
-const PLAYER_SPEED: f32 = 6.5; // legacy reference speed (~= run_medium); kept for the keeper/util
-const DRIBBLE_SPEED: f32 = 4.6; // legacy reference dribble speed (kept for reference)
+const PLAYER_SPEED: f32 = 6.5; // legacy reference speed (~= run_medium); kept for keeper reach/util
 
 // ---- Player gears -----------------------------------------------------------
 // Seven discrete speeds the policy can pick for any movement/dribble, from
@@ -1057,26 +1056,26 @@ impl World {
                     Some((owner, lead.sub(me), PASS_SPEED, true))
                 } else {
                     // no valid target: dribble forward instead
-                    self.set_vel(team, idx, V2::new(sx, 0.0).scale(DRIBBLE_SPEED));
+                    self.set_vel(team, idx, V2::new(sx, 0.0).scale(speed_val(spd, true)));
                     None
                 }
             }
             A_DRIB_FWD => {
                 let dir = self.shielded_dribble_dir(team, me, V2::new(sx, 0.0));
                 self.note_dribble(team, dir, sx);
-                self.set_vel(team, idx, dir.scale(DRIBBLE_SPEED));
+                self.set_vel(team, idx, dir.scale(speed_val(spd, true)));
                 None
             }
             A_DRIB_LEFT => {
                 let dir = self.shielded_dribble_dir(team, me, V2::new(0.0, -1.0));
                 self.note_dribble(team, dir, sx);
-                self.set_vel(team, idx, dir.scale(DRIBBLE_SPEED));
+                self.set_vel(team, idx, dir.scale(speed_val(spd, true)));
                 None
             }
             A_DRIB_RIGHT => {
                 let dir = self.shielded_dribble_dir(team, me, V2::new(0.0, 1.0));
                 self.note_dribble(team, dir, sx);
-                self.set_vel(team, idx, dir.scale(DRIBBLE_SPEED));
+                self.set_vel(team, idx, dir.scale(speed_val(spd, true)));
                 None
             }
             A_CLEAR => {
