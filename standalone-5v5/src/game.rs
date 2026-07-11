@@ -631,7 +631,8 @@ impl World {
                 }
             }
         } else {
-            for a in A_CHASE..=A_GET_OPEN {
+            // GET_OPEN held back until the base (v3 + learnable speeds) is solid.
+            for a in A_CHASE..=A_STAY {
                 m[a] = true;
             }
         }
