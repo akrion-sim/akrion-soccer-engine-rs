@@ -859,9 +859,12 @@ impl World {
             };
             if o.team == Team::A {
                 self.ev_turnover_a = true; // A dispossessed
+                self.b_pass_streak = 1; // B possession begins
             } else {
                 self.ev_win_ball_a = true; // A tackled the ball off B
+                self.b_pass_streak = 0;
             }
+            self.b_shot_flag = false;
             self.pass_streak_a = 0; // possession changed hands
             self.reset_a_pass_memory();
             self.owner = Some(stealer);
