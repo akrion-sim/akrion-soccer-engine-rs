@@ -72,6 +72,15 @@ SEEDS = [s.strip() for s in os.environ.get("TUNE_SEEDS", "0x5EED0000").split(","
 SIGMA0 = float(os.environ.get("TUNE_SIGMA", "0.18"))
 RNG = random.Random(int(os.environ.get("TUNE_RNG", "11")))
 
+# Fail fast on misconfiguration instead of dividing by zero deep in the sweep
+# (aggregate_fitness divides by len(SEEDS); the elite update divides by ELITE).
+if not SEEDS:
+    sys.exit("TUNE_SEEDS is empty — provide at least one seed")
+if POP < 1:
+    sys.exit(f"TUNE_POP={POP} must be >= 1")
+if not (1 <= ELITE <= POP):
+    sys.exit(f"TUNE_ELITE={ELITE} must be in [1, TUNE_POP={POP}]")
+
 MIN_WEAK_SIDE = float(os.environ.get("TUNE_MIN_WEAK_SIDE", "0.25"))
 MIN_SHOTS = int(os.environ.get("TUNE_MIN_SHOTS", "1"))
 MIN_SOT = int(os.environ.get("TUNE_MIN_SOT", "1"))
