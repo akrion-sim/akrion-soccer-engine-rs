@@ -1280,10 +1280,30 @@ impl World {
             FIELD_W / 2.0 + GOAL_HALF + 1.5,
         );
         let dir = target.sub(me);
+        // The keeper is rule-based, but its SPEED now uses the 7 gears as a
+        // FIELD-VECTOR function: sprint when the ball threatens our goal or it must
+        // reposition fast, jog at midfield, walk when play is upfield.
+        let own_goal_x = if sx > 0.0 { 0.0 } else { FIELD_L };
+        let ball_threat = 1.0 - ((self.ball.x - own_goal_x).abs() / FIELD_L).clamp(0.0, 1.0);
+        let travel = (dir.len() / 9.0).clamp(0.0, 1.0);
+        let urgency = (0.6 * ball_threat + 0.4 * travel).clamp(0.0, 1.0);
+        let gear = if urgency > 0.80 {
+            SPD_SPRINT
+        } else if urgency > 0.62 {
+            SPD_RUN_FAST
+        } else if urgency > 0.46 {
+            SPD_RUN_SLOW
+        } else if urgency > 0.30 {
+            SPD_SKIP
+        } else if urgency > 0.16 {
+            SPD_JOG
+        } else {
+            SPD_WALK
+        };
         let v = if dir.len() < 0.2 {
             V2::default()
         } else {
-            dir.unit().scale(KEEPER_SPEED)
+            dir.unit().scale(speed_val(gear, false))
         };
         self.set_vel(team, GK, v);
         None
