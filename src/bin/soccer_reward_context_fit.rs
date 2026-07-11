@@ -1,9 +1,11 @@
-//! Fit field-conditioned reward utility heads from realised configuration moments.
+//! Fit field-conditioned reward utility heads from factual event/future pairs.
 //!
-//! The data source is the existing whole-field moment corpus: every row contains
-//! the canonical 256-d all-players-plus-ball embedding, the decision, and its
-//! realised n-step return. Heads are fitted outside the policy learner and then
-//! frozen as a schema-v1 `DD_SOCCER_REWARD_CONTEXT_PATH` artifact.
+//! A hermetic state-value head first learns terminal match outcome from canonical
+//! 256-d all-players-plus-ball embeddings. Each typed reward utility then learns
+//! the value change from its exact event state to a later field state. Authored
+//! reward magnitudes are never training labels. Heads are fitted outside the
+//! policy learner and frozen as a schema-v1 `DD_SOCCER_REWARD_CONTEXT_PATH`
+//! artifact.
 
 use serde::{Deserialize, Serialize};
 use soccer_engine::des::general::soccer::{
@@ -35,6 +37,10 @@ struct RewardContextArtifact {
     samples_by_kind: HashMap<String, usize>,
     #[serde(default)]
     effective_samples_by_kind: HashMap<String, f64>,
+    #[serde(default)]
+    value_delta_rms_by_kind: HashMap<String, f64>,
+    #[serde(default)]
+    state_value_head: RewardContextHead,
     by_kind: HashMap<String, RewardContextHead>,
 }
 
@@ -86,15 +92,65 @@ const KIND_SPECS: &[KindSpec] = &[
 struct LabeledMoment {
     sample: SoccerRewardContextSample,
     outcome: f64,
+    value_delta: Option<f64>,
     /// Inverse occurrence count for this `(match, team, event kind)` group.
     /// Each team-match therefore contributes at most one unit of evidence to a
     /// head, rather than repeated carries dominating rare decisive events.
     sample_weight: f64,
+    /// Inverse number of factual events for this team-match. This prevents the
+    /// state-value learner from treating a high-event match as many independent
+    /// terminal outcomes.
+    value_weight: f64,
+}
+
+fn predict_head(head: &RewardContextHead, embedding: &[f64]) -> f64 {
+    if embedding.len() != SOCCER_MOMENT_EMBEDDING_DIM {
+        return 0.0;
+    }
+    let norm = (SOCCER_MOMENT_EMBEDDING_DIM as f64).sqrt();
+    head.weights
+        .iter()
+        .zip(embedding)
+        .fold(head.bias, |sum, (weight, value)| sum + weight * value)
+        / norm
+}
+
+fn fit_state_value_head(
+    rows: &[LabeledMoment],
+    prior: Option<&RewardContextHead>,
+    epochs: usize,
+    learning_rate: f64,
+) -> RewardContextHead {
+    let mut head = prior
+        .filter(|head| head.weights.len() == SOCCER_MOMENT_EMBEDDING_DIM)
+        .cloned()
+        .unwrap_or_else(|| RewardContextHead {
+            bias: 0.0,
+            weights: vec![0.0; SOCCER_MOMENT_EMBEDDING_DIM],
+        });
+    let norm = (SOCCER_MOMENT_EMBEDDING_DIM as f64).sqrt();
+    let ridge = 1e-4;
+    for _ in 0..epochs.max(1) {
+        for row in rows {
+            let prediction = predict_head(&head, &row.sample.embedding);
+            let error = (prediction - row.outcome).clamp(-2.0, 2.0);
+            let weighted_rate = learning_rate * row.value_weight;
+            head.bias = (head.bias - weighted_rate * error / norm).clamp(-2.0, 2.0);
+            for (weight, value) in head.weights.iter_mut().zip(&row.sample.embedding) {
+                if value.is_finite() {
+                    *weight = (*weight - weighted_rate * (error * value / norm + ridge * *weight))
+                        .clamp(-2.0, 2.0);
+                }
+            }
+        }
+    }
+    head
 }
 
 fn fit_head(
     rows: &[&LabeledMoment],
     outcome_sign: f64,
+    delta_rms: f64,
     prior: Option<&RewardContextHead>,
     epochs: usize,
     learning_rate: f64,
@@ -116,17 +172,13 @@ fn fit_head(
             if row.sample.embedding.len() != SOCCER_MOMENT_EMBEDDING_DIM {
                 continue;
             }
-            // Hermetic outcome target: good final match outcome for a reward
-            // raises utility; bad final outcome for a penalty raises its
-            // magnitude. This deliberately does NOT bootstrap from the already
-            // shaped n-step reward that the head is meant to replace.
-            let target = (outcome_sign * row.outcome).clamp(-1.0, 1.0);
-            let prediction = head
-                .weights
-                .iter()
-                .zip(&row.sample.embedding)
-                .fold(head.bias, |sum, (weight, value)| sum + weight * value)
-                / norm;
+            // Hermetic TD target: utility follows the learned whole-field value
+            // change after the factual event, never its hand-authored magnitude.
+            let Some(value_delta) = row.value_delta else {
+                continue;
+            };
+            let target = (outcome_sign * value_delta / delta_rms.max(1e-6)).clamp(-1.0, 1.0);
+            let prediction = predict_head(&head, &row.sample.embedding);
             let error = (prediction - target).clamp(-2.0, 2.0);
             let weighted_rate = learning_rate * row.sample_weight;
             head.bias = (head.bias - weighted_rate * error / norm).clamp(-2.0, 2.0);
@@ -205,17 +257,20 @@ fn main() {
             .cloned()
             .collect();
         let mut occurrence_counts = HashMap::<(String, bool), usize>::new();
+        let mut team_event_counts = HashMap::<bool, usize>::new();
         for sample in &valid_samples {
             let home = matches!(sample.team, soccer_engine::des::general::soccer::Team::Home);
             *occurrence_counts
                 .entry((sample.kind.clone(), home))
                 .or_default() += 1;
+            *team_event_counts.entry(home).or_default() += 1;
         }
         moments.extend(valid_samples.into_iter().filter_map(|sample| {
             let home = matches!(sample.team, soccer_engine::des::general::soccer::Team::Home);
             let occurrence_count = *occurrence_counts
                 .get(&(sample.kind.clone(), home))
                 .unwrap_or(&1);
+            let team_event_count = *team_event_counts.get(&home).unwrap_or(&1);
             if sample.embedding.len() != SOCCER_MOMENT_EMBEDDING_DIM
                 || sample.embedding.iter().any(|value| !value.is_finite())
             {
@@ -230,7 +285,9 @@ fn main() {
             Some(LabeledMoment {
                 sample,
                 outcome: (result + margin_bonus).clamp(-1.0, 1.0),
+                value_delta: None,
                 sample_weight: 1.0 / occurrence_count as f64,
+                value_weight: 1.0 / team_event_count as f64,
             })
         }));
         eprintln!(
@@ -242,25 +299,63 @@ fn main() {
         );
     }
 
+    let state_value_head = fit_state_value_head(
+        &moments,
+        prior.as_ref().map(|artifact| &artifact.state_value_head),
+        epochs,
+        learning_rate,
+    );
+    for row in &mut moments {
+        row.value_delta = row
+            .sample
+            .future_embedding
+            .as_deref()
+            .map(|future| {
+                predict_head(&state_value_head, future)
+                    - predict_head(&state_value_head, &row.sample.embedding)
+            })
+            .filter(|delta| delta.is_finite());
+    }
+
     let mut by_kind = HashMap::new();
     let mut samples_by_kind = HashMap::new();
     let mut effective_samples_by_kind = HashMap::new();
+    let mut value_delta_rms_by_kind = HashMap::new();
     for spec in KIND_SPECS {
         let rows: Vec<_> = moments
             .iter()
-            .filter(|row| row.sample.kind == spec.name)
+            .filter(|row| row.sample.kind == spec.name && row.value_delta.is_some())
             .collect();
         samples_by_kind.insert(spec.name.to_string(), rows.len());
         effective_samples_by_kind.insert(
             spec.name.to_string(),
             rows.iter().map(|row| row.sample_weight).sum(),
         );
+        let weight_sum = rows.iter().map(|row| row.sample_weight).sum::<f64>();
+        let delta_rms = if weight_sum > 0.0 {
+            (rows
+                .iter()
+                .map(|row| row.sample_weight * row.value_delta.unwrap_or(0.0).powi(2))
+                .sum::<f64>()
+                / weight_sum)
+                .sqrt()
+        } else {
+            1.0
+        };
+        value_delta_rms_by_kind.insert(spec.name.to_string(), delta_rms);
         let prior_head = prior
             .as_ref()
             .and_then(|artifact| artifact.by_kind.get(spec.name));
         by_kind.insert(
             spec.name.to_string(),
-            fit_head(&rows, spec.outcome_sign, prior_head, epochs, learning_rate),
+            fit_head(
+                &rows,
+                spec.outcome_sign,
+                delta_rms,
+                prior_head,
+                epochs,
+                learning_rate,
+            ),
         );
     }
 
@@ -274,6 +369,8 @@ fn main() {
         seed_base,
         samples_by_kind,
         effective_samples_by_kind,
+        value_delta_rms_by_kind,
+        state_value_head,
         by_kind,
     };
     let json = serde_json::to_string_pretty(&artifact).expect("serialize context artifact");

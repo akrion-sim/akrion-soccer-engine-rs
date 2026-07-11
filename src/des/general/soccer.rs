@@ -20817,6 +20817,11 @@ pub struct SoccerRewardContextSample {
     pub team: Team,
     pub kind: String,
     pub embedding: Vec<f64>,
+    /// Canonical whole-field embedding for the same team after the configured
+    /// retrieval outcome horizon. `None` only when the match ends before the
+    /// factual event has enough future ticks.
+    pub future_tick: Option<u64>,
+    pub future_embedding: Option<Vec<f64>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -74,12 +74,15 @@ metric.
 `soccer_reward_context_fit` is the outcome-grounded fitter. When retrieval capture
 is enabled, the event recorder retains each exact factual typed occurrence (for
 example `ShotOnTarget` or `BadPassChainPenalty`) together with the canonical 256-d
-embedding at that event's tick. The capture intentionally omits the event's
+embedding at that event's tick and a second canonical embedding after the
+configured outcome horizon. The capture intentionally omits the event's
 hand-authored magnitude, so the contextual head cannot merely imitate the assumed
-reward it is meant to replace. The fitter labels only events that actually
-occurred, using the event team's final W/D/L result plus a small capped goal-margin
-term; reward heads learn the outcome target and penalty heads its sign mirror. A
-team-match contributes at most one unit of fitting weight to each event kind:
+reward it is meant to replace. The fitter first learns a hermetic whole-field
+state-value head from final W/D/L plus capped goal margin. It then trains each
+event utility from the learned value change between the factual event state and
+its later field state; penalty heads use the sign mirror. Per-kind RMS value
+change supplies a data-derived target scale rather than an assumed reward value.
+A team-match contributes at most one unit of fitting weight to each event kind:
 repeated routine occurrences receive inverse-frequency weight, preventing a match
 with hundreds of carries from overwhelming rarer shot, pass, or turnover evidence.
 A prior schema-v1 artifact can be passed as the fifth argument, so accepted weights

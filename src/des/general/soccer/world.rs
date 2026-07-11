@@ -1632,6 +1632,10 @@ pub struct SoccerMatch {
     /// fitting. Populated only when retrieval capture is enabled; unlike the
     /// per-tick reward buffer, this survives until the match ends.
     pub(crate) reward_context_samples: Vec<SoccerRewardContextSample>,
+    /// `(due_tick, sample_index, team)` queue for attaching a genuinely later
+    /// whole-field state to each factual reward event without rescanning the
+    /// complete sample corpus every tick.
+    pub(crate) pending_reward_context_futures: VecDeque<(u64, usize, Team)>,
     /// Cross-tick DEFERRED credit: `(decision_tick, player_id, amount)` for delayed OUTCOME rewards
     /// (a completed pass resolves ~30 ticks AFTER the pass decision). The per-tick `reward_events`
     /// buffer is cleared each tick, so a delayed reward recorded at the RESOLUTION tick lands on the
@@ -13210,6 +13214,7 @@ impl SoccerMatch {
             coach_set_play_hints: HashMap::new(),
             reward_events: Vec::new(),
             reward_context_samples: Vec::new(),
+            pending_reward_context_futures: VecDeque::new(),
             deferred_reward_credits: Vec::new(),
             episode_learning_transitions: Vec::new(),
             episode_config_captures: Vec::new(),
@@ -13542,6 +13547,7 @@ impl SoccerMatch {
             deferred_reward_credits: Vec::new(),
             reward_events: Vec::new(),
             reward_context_samples: Vec::new(),
+            pending_reward_context_futures: VecDeque::new(),
             turnover_penalty_history: VecDeque::new(),
             last_turnover_penalty_tick: None,
             pending_turnover_outcome: None,
@@ -21036,6 +21042,39 @@ impl SoccerMatch {
         &self.reward_context_samples
     }
 
+    fn resolve_reward_context_futures(&mut self, snapshot: &WorldSnapshot) {
+        if !self.config.retrieval.capture_enabled {
+            return;
+        }
+        while self
+            .pending_reward_context_futures
+            .front()
+            .is_some_and(|(due_tick, _, _)| *due_tick <= self.tick)
+        {
+            let Some((_due_tick, sample_index, team)) =
+                self.pending_reward_context_futures.pop_front()
+            else {
+                break;
+            };
+            let Some(sample) = self.reward_context_samples.get_mut(sample_index) else {
+                continue;
+            };
+            let embedding = SoccerConfigVector::from_snapshot_with(
+                snapshot,
+                team,
+                SoccerConfigComparison::PositionAgnostic,
+                ConfigWeightOptions::default(),
+            )
+            .embedding();
+            if embedding.len() == SOCCER_MOMENT_EMBEDDING_DIM
+                && embedding.iter().all(|value| value.is_finite())
+            {
+                sample.future_tick = Some(self.tick);
+                sample.future_embedding = Some(embedding);
+            }
+        }
+    }
+
     /// State-only feature vector for the actor: the transition's critic features
     /// built with a **null action**, then extended with an explicit role one-hot
     /// so the shared policy can specialize by position without changing the
@@ -23522,6 +23561,7 @@ impl SoccerMatch {
             }
         }
         let next_snapshot = WorldSnapshot::from_match_for_learning(self);
+        self.resolve_reward_context_futures(&next_snapshot);
         // Gap 5: collect line-depth RL samples off the per-tick snapshot (no-op +
         // byte-identical unless a line-depth model is enabled).
         self.collect_line_depth_rl_samples(&next_snapshot);
@@ -24422,7 +24462,19 @@ impl SoccerMatch {
                     team: player.team,
                     kind: format!("{kind:?}"),
                     embedding: embedding.clone(),
+                    future_tick: None,
+                    future_embedding: None,
                 });
+                let sample_index = self.reward_context_samples.len() - 1;
+                let horizon = self.config.retrieval.outcome_horizon.max(1) as u64;
+                let pending = (tick.saturating_add(horizon), sample_index, player.team);
+                let insertion = self
+                    .pending_reward_context_futures
+                    .iter()
+                    .position(|(due_tick, _, _)| *due_tick > pending.0)
+                    .unwrap_or(self.pending_reward_context_futures.len());
+                self.pending_reward_context_futures
+                    .insert(insertion, pending);
             }
         }
         let amount = calibrated_reward_event_amount(kind, amount, whole_field_embedding.as_deref());
