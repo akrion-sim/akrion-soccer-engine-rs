@@ -73,17 +73,20 @@ impl Policy {
     pub fn new(rng: &mut Rng) -> Self {
         Policy {
             // decentralized actor (per-agent field vector) + CENTRALIZED critic
-            // (global state) = MAPPO / CTDE.
-            actor: Mlp::new(&[OBS_DIM, 64, 64, NA], rng),
+            // (global state) = MAPPO / CTDE. The actor has TWO heads packed into one
+            // output vector: the first NA are the macro-action logits (masked), the
+            // last NS are the speed-gear logits (unmasked).
+            actor: Mlp::new(&[OBS_DIM, 64, 64, NA + NS], rng),
             critic: Mlp::new(&[GLOBAL_DIM, 128, 64, 1], rng),
         }
     }
 
-    /// Greedy (argmax over legal actions) — used at evaluation.
+    /// Greedy (argmax action + argmax speed) — used at evaluation. Returns the
+    /// PACKED action `action + speed*NA` ready to hand to `World::step`.
     pub fn act_greedy(&self, obs: &[f32], mask: &[bool; NA]) -> usize {
         let logits = self.actor.predict(obs);
-        debug_assert_eq!(logits.len(), NA);
-        let probs = masked_softmax(&logits, mask);
+        debug_assert_eq!(logits.len(), NA + NS);
+        let probs = masked_softmax(&logits[0..NA], mask);
         let mut bi = 0;
         let mut bp = -1.0;
         for i in 0..NA {
@@ -92,7 +95,16 @@ impl Policy {
                 bi = i;
             }
         }
-        bi
+        // greedy speed gear (argmax over the speed head)
+        let mut bs = 0;
+        let mut bsp = f32::NEG_INFINITY;
+        for k in 0..NS {
+            if logits[NA + k] > bsp {
+                bsp = logits[NA + k];
+                bs = k;
+            }
+        }
+        bi + bs * NA
     }
 }
 
