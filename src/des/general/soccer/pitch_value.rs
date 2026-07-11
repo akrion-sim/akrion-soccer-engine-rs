@@ -289,17 +289,30 @@ pub(crate) fn learned_epv(team: Team, p: Vec2, field_width: f64, field_length: f
 /// fix for territory-without-conversion — can be A/B'd in isolation. Default-off ⇒ the
 /// process is byte-identical to the closed-form seed.
 pub(crate) fn dd_soccer_enable_learned_epv_potential() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        matches!(
+    #[cfg(test)]
+    {
+        return matches!(
             std::env::var("DD_SOCCER_ENABLE_LEARNED_EPV_POTENTIAL")
                 .ok()
                 .as_deref()
                 .map(str::trim),
             Some("1") | Some("true") | Some("yes") | Some("on")
-        )
-    })
+        );
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| {
+            matches!(
+                std::env::var("DD_SOCCER_ENABLE_LEARNED_EPV_POTENTIAL")
+                    .ok()
+                    .as_deref()
+                    .map(str::trim),
+                Some("1") | Some("true") | Some("yes") | Some("on")
+            )
+        })
+    }
 }
 
 /// Grid floor for own-half/high-turnover cells. Shifting by this value keeps the
@@ -813,7 +826,7 @@ mod tests {
         let deep = make(L * 0.30);
         let high = make(L * 0.85);
 
-        std::env::remove_var("DD_SOCCER_ENABLE_LEARNED_EPV");
+        std::env::remove_var("DD_SOCCER_ENABLE_LEARNED_EPV_POTENTIAL");
         std::env::remove_var("DD_SOCCER_LEARNED_EPV_GRID_PATH");
         let seed_deep = team_expected_threat(&deep, Team::Home);
         let seed_high = team_expected_threat(&high, Team::Home);
@@ -836,11 +849,11 @@ mod tests {
         ));
         std::fs::write(&grid_path, raw.to_string()).expect("write test EPV grid");
 
-        std::env::set_var("DD_SOCCER_ENABLE_LEARNED_EPV", "1");
+        std::env::set_var("DD_SOCCER_ENABLE_LEARNED_EPV_POTENTIAL", "1");
         std::env::set_var("DD_SOCCER_LEARNED_EPV_GRID_PATH", &grid_path);
         let learned_deep = team_expected_threat(&deep, Team::Home);
         let learned_high = team_expected_threat(&high, Team::Home);
-        std::env::remove_var("DD_SOCCER_ENABLE_LEARNED_EPV");
+        std::env::remove_var("DD_SOCCER_ENABLE_LEARNED_EPV_POTENTIAL");
         std::env::remove_var("DD_SOCCER_LEARNED_EPV_GRID_PATH");
 
         assert!(
