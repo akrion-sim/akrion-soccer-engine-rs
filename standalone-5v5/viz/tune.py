@@ -75,13 +75,22 @@ POP     = int(os.environ.get("TUNE_POP", "8"))
 ELITE   = int(os.environ.get("TUNE_ELITE", "3"))
 GENS    = int(os.environ.get("TUNE_GENS", "10"))
 MAXPAR  = int(os.environ.get("TUNE_MAXPAR", "2"))
-SEEDS   = [int(s) for s in os.environ.get("TUNE_SEEDS", "20260710").split(",")]
+SEEDS   = [int(s) for s in os.environ.get("TUNE_SEEDS", "20260710").split(",") if s.strip()]
 SIGMA0  = float(os.environ.get("TUNE_SIGMA", "0.25"))   # initial step, in normalized [0,1] units
+TIMEOUT = int(os.environ.get("TUNE_TIMEOUT", "3600"))   # per-candidate hard deadline (s)
 RNG     = random.Random(int(os.environ.get("TUNE_RNG", "1")))
 # Fixed env every candidate inherits. Frozen speed = the config that actually
 # attacks; we optimize the action-policy reward first.
 FIXED   = {"SPEED_WARMUP": os.environ.get("TUNE_SPEED_WARMUP", "250")}
 LOG     = os.path.join(HERE, "tune_log.csv")
+
+# Fail fast on misconfiguration instead of dividing by zero deep in the sweep.
+if not SEEDS:
+    sys.exit("TUNE_SEEDS is empty — provide at least one integer seed")
+if POP < 1:
+    sys.exit(f"TUNE_POP={POP} must be >= 1")
+if not (1 <= ELITE <= POP):
+    sys.exit(f"TUNE_ELITE={ELITE} must be in [1, TUNE_POP={POP}]")
 
 # hardening gates on the FINAL line (in addition to the trainer's own gates=)
 def gates_ok(m):
