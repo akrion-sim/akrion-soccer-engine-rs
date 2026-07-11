@@ -181,14 +181,14 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
             // policy controls the 4 outfielders; GK (index 0) is rule-based.
             let obs = w.observe(Team::A, i);
             let mask = w.legal_mask(Team::A, i);
+            // action policy (masked) and SEPARATE speed policy (unmasked).
             let logits = policy.actor.predict(&obs);
-            // action head (masked) and speed head (unmasked) — sampled independently,
-            // joint log-prob is their sum.
-            let aprobs = masked_softmax(&logits[0..NA], &mask);
+            let aprobs = masked_softmax(&logits, &mask);
             let a = rng.sample_categorical(&aprobs);
             let pa = aprobs[a].max(1e-8);
-            let sprobs = masked_softmax(&logits[NA..NA + NS], &[true; NS]);
-            let s = SPD_RUN_MED; // DIAGNOSTIC: deterministic gear (no speed sampling)
+            let slogits = policy.speedor.predict(&obs);
+            let sprobs = masked_softmax(&slogits, &[true; NS]);
+            let s = rng.sample_categorical(&sprobs);
             let ps = sprobs[s].max(1e-8);
             obs_t[i] = obs;
             mask_t[i] = mask;
