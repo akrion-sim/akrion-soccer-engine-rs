@@ -989,7 +989,7 @@ impl World {
                 } else {
                     // symmetric: B's goal only counts if B built up (2 passes) and
                     // shoots from B's own final third (B attacks -x -> small x).
-                    self.b_shot_flag = self.b_pass_streak >= 2 && me.x < FIELD_L - FINAL_THIRD_X;
+                    self.b_shot_flag = self.b_pass_streak >= 2 && me.x < FIELD_L - SHOOT_X;
                     self.b_pass_streak = 0;
                 }
                 self.set_vel(team, idx, V2::default());
