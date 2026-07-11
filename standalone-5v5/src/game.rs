@@ -1183,6 +1183,9 @@ impl World {
                 let own_goal = team.own_goal();
                 opp.add(own_goal.sub(opp).unit().scale(2.5))
             }
+            // GET_OPEN: MPC-lite lane opener — move to the relocation that best
+            // opens a passing lane from the ball (the POMDP picks it, MPC aims it).
+            A_GET_OPEN => self.mpc_open_lane_target(team, idx),
             _ => me, // STAY
         };
         let dir = target.sub(me);
