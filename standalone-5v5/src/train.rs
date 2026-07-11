@@ -768,9 +768,12 @@ mod tests {
 
     #[test]
     fn spacing_reward_penalizes_overlap_and_prefers_useful_distance() {
-        assert!(spacing_reward(0.8) < spacing_reward(2.0));
-        assert!(spacing_reward(5.0) > spacing_reward(3.0));
-        assert!(spacing_reward(8.0) < spacing_reward(5.0));
+        assert!(spacing_reward(0.8) < spacing_reward(2.0)); // overlap worst
+        assert!(spacing_reward(3.5) < 0.0); // within 4 yds is penalized
+        assert!(spacing_reward(2.5) < spacing_reward(3.5)); // within 3 penalized harder
+        assert!(spacing_reward(8.0) > spacing_reward(5.0)); // optimum moved WIDE to 8
+        assert!(spacing_reward(8.0) > spacing_reward(11.0)); // too far tapers off
+        assert!(spacing_reward(13.0) < 0.0); // beyond 12: penalty
     }
 
     #[test]
