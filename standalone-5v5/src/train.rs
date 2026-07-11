@@ -122,7 +122,8 @@ struct Sample {
 struct BcSample {
     obs: [f32; OBS_DIM],
     mask: [bool; NA],
-    action: usize,
+    action: usize, // macro action (0..NA)
+    speed: usize,  // scripted speed gear (0..NS)
 }
 
 pub struct CloneStats {
