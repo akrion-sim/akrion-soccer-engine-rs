@@ -1025,7 +1025,16 @@ impl World {
                     // shooting from a position where a good placement exists.
                     let q = (best_score / 12.0).clamp(0.0, 1.0);
                     self.last_shot_quality_a = q;
-                    if goal.sub(me).len() < 24.0 {
+                    // POSITION quality (xG-like), a function of the field vector at the
+                    // shot: close + central is a high-value chance, a long-range or
+                    // wide pot-shot is near-zero. Distance dominates (squared decay),
+                    // shot ANGLE (central vs wide) modulates.
+                    let d = goal.sub(me).len();
+                    let lateral = (me.y - FIELD_W / 2.0).abs();
+                    let dist_f = (1.0 - d / 26.0).clamp(0.0, 1.0);
+                    let angle_f = (1.0 - lateral / (FIELD_W / 2.0)).clamp(0.0, 1.0);
+                    self.last_shot_xg_a = dist_f * dist_f * (0.4 + 0.6 * angle_f);
+                    if d < 24.0 {
                         self.ev_shot_on_a = true;
                     }
                 }
