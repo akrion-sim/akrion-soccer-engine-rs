@@ -28,29 +28,36 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 BIN = os.path.join(ROOT, "target", "release", "soccer_climb_ratchet")
 LOG = os.path.join(HERE, "tune_log.csv")
+try:
+    MIN_REWARD_WEIGHT = float(os.environ.get("TUNE_MIN_REWARD_WEIGHT", "0.0001"))
+except ValueError:
+    MIN_REWARD_WEIGHT = 0.0001
+if not math.isfinite(MIN_REWARD_WEIGHT) or MIN_REWARD_WEIGHT <= 0.0:
+    MIN_REWARD_WEIGHT = 0.0001
 
 # (ENV_VAR, default, low, high, log_scale). Defaults mirror the current
 # ratchet/hardening path rather than bare engine defaults.
 SPACE = [
-    ("DD_SOCCER_GOAL_REWARD_SCALE", 1.0, 0.5, 4.0, False),
-    ("DD_SOCCER_FORWARD_PASS_REWARD_SCALE", 6.25, 0.0, 12.0, False),
-    ("DD_SOCCER_PASS_CHAIN_REWARD_SCALE", 4.25, 0.0, 10.0, False),
-    ("DD_SOCCER_PASS_TURNOVER_PENALTY_SCALE", 5.0, 1.0, 12.0, False),
-    ("DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE", 1.25, 0.0, 2.0, False),
-    ("DD_SOCCER_SHOT_SHAPING_REWARD_SCALE", 0.85, 0.0, 1.0, False),
-    ("DD_SOCCER_SHOT_COMMITMENT_REWARD_SCALE", 0.0, 0.0, 2.0, False),
-    ("DD_SOCCER_LEARNED_EPV_REWARD_SCALE", 1.0, 0.0, 4.0, False),
+    ("DD_SOCCER_GOAL_REWARD_SCALE", 1.0, 1.0, 16.0, False),
+    ("DD_SOCCER_FORWARD_PASS_REWARD_SCALE", 6.25, MIN_REWARD_WEIGHT, 20.0, False),
+    ("DD_SOCCER_PASS_CHAIN_REWARD_SCALE", 4.25, MIN_REWARD_WEIGHT, 20.0, False),
+    ("DD_SOCCER_PASS_TURNOVER_PENALTY_SCALE", 5.0, 1.0, 20.0, False),
+    ("DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE", 1.25, MIN_REWARD_WEIGHT, 2.0, False),
+    ("DD_SOCCER_SHOT_SHAPING_REWARD_SCALE", 0.85, MIN_REWARD_WEIGHT, 4.0, False),
+    ("DD_SOCCER_SHOT_COMMITMENT_REWARD_SCALE", MIN_REWARD_WEIGHT, MIN_REWARD_WEIGHT, 10.0, False),
+    ("DD_SOCCER_DRIBBLE_BEAT_REWARD_SCALE", 1.0, MIN_REWARD_WEIGHT, 8.0, False),
+    ("DD_SOCCER_LEARNED_EPV_REWARD_SCALE", 1.0, MIN_REWARD_WEIGHT, 200.0, True),
     ("SOCCER_OFFBALL_SUPPORT_REWARD_SCALE", 1.0, 0.5, 6.0, False),
     ("DD_SOCCER_CARRY_REWARD_SCALE", 1.0, 0.5, 6.0, False),
     ("DD_SOCCER_RECOVERY_REWARD_SCALE", 1.0, 0.5, 6.0, False),
-    ("DD_SOCCER_OVERLOAD_PROGRESSION_REWARD_PER_YARD", 0.0, 0.0, 0.12, False),
-    ("SOCCER_ANALYTIC_DIFFERENCE_REWARD_NEGATIVE_DENSE_FLOOR", 0.15, 0.0, 0.6, False),
-    ("SOCCER_ANALYTIC_DIFFERENCE_REWARD_NEGATIVE_DENSE_SCALE", 1.0, 0.0, 3.0, False),
-    ("SOCCER_MAPPO_TEAM_REWARD_SHARE", 0.50, 0.0, 1.0, False),
-    ("SOCCER_MARL_TEAM_REWARD_WEIGHT", 0.35, 0.0, 1.5, False),
+    ("DD_SOCCER_OVERLOAD_PROGRESSION_REWARD_PER_YARD", 0.10, MIN_REWARD_WEIGHT, 0.5, False),
+    ("SOCCER_ANALYTIC_DIFFERENCE_REWARD_NEGATIVE_DENSE_FLOOR", 0.15, MIN_REWARD_WEIGHT, 1.0, False),
+    ("SOCCER_ANALYTIC_DIFFERENCE_REWARD_NEGATIVE_DENSE_SCALE", 1.0, MIN_REWARD_WEIGHT, 25.0, True),
+    ("SOCCER_MAPPO_TEAM_REWARD_SHARE", 0.50, MIN_REWARD_WEIGHT, 1.0, False),
+    ("SOCCER_MARL_TEAM_REWARD_WEIGHT", 0.35, MIN_REWARD_WEIGHT, 1.5, False),
     ("SOCCER_MARL_INTERMEDIATE_REWARD_WEIGHT", 1.0, 0.2, 3.0, False),
-    ("SOCCER_PLANNER_TEACHER_WEIGHT", 1.8, 0.0, 4.0, False),
-    ("SOCCER_NEURAL_FINISHING_SELECT_BONUS_WEIGHT", 0.70, 0.0, 2.5, False),
+    ("SOCCER_PLANNER_TEACHER_WEIGHT", 1.8, MIN_REWARD_WEIGHT, 4.0, False),
+    ("SOCCER_NEURAL_FINISHING_SELECT_BONUS_WEIGHT", 0.70, MIN_REWARD_WEIGHT, 2.5, False),
 ]
 
 ITERS_GAMES = int(os.environ.get("TUNE_INCREMENT_GAMES", "1"))
@@ -106,6 +113,10 @@ def env_bool(name, default=False):
 def norm(vec):
     out = []
     for (_, _, lo, hi, log), value in zip(SPACE, vec):
+        value = float(value)
+        if not math.isfinite(value):
+            value = lo
+        value = min(hi, max(lo, value))
         if log:
             value, lo, hi = math.log(value), math.log(lo), math.log(hi)
         out.append((value - lo) / (hi - lo))
@@ -115,6 +126,9 @@ def norm(vec):
 def denorm(nvec):
     out = []
     for (_, _, lo, hi, log), value in zip(SPACE, nvec):
+        value = float(value)
+        if not math.isfinite(value):
+            value = 0.0
         value = min(1.0, max(0.0, value))
         if log:
             out.append(math.exp(math.log(lo) + value * (math.log(hi) - math.log(lo))))
@@ -131,7 +145,9 @@ def vec_with(overrides):
     vec = default_vec()
     for index, (name, _, lo, hi, _) in enumerate(SPACE):
         if name in overrides:
-            vec[index] = min(hi, max(lo, overrides[name]))
+            value = float(overrides[name])
+            if math.isfinite(value):
+                vec[index] = min(hi, max(lo, value))
     return vec
 
 
@@ -183,14 +199,19 @@ def parse(stdout):
 
 
 def gates_ok(metrics):
+    return gate_deficit(metrics) <= 1e-12
+
+
+def gate_deficit(metrics):
     if metrics is None:
-        return False
+        return 10.0
     weak_side = min(metrics["home"], metrics["away"])
     return (
-        weak_side >= MIN_WEAK_SIDE
-        and metrics["shots_for"] >= MIN_SHOTS
-        and metrics["sot_for"] >= MIN_SOT
-        and metrics["shots_after_pass"] >= MIN_SHOTS_AFTER_PASS
+        max(0.0, MIN_WEAK_SIDE - weak_side) / max(MIN_WEAK_SIDE, 1e-9)
+        + max(0.0, MIN_SHOTS - metrics["shots_for"]) / max(MIN_SHOTS, 1)
+        + max(0.0, MIN_SOT - metrics["sot_for"]) / max(MIN_SOT, 1)
+        + max(0.0, MIN_SHOTS_AFTER_PASS - metrics["shots_after_pass"])
+        / max(MIN_SHOTS_AFTER_PASS, 1)
     )
 
 
@@ -205,8 +226,7 @@ def fitness_from_metrics(metrics):
         + metrics["shots_after_pass"] * 0.10
         + metrics["net_fwd_margin"] * 0.03
     )
-    if not gates_ok(metrics):
-        score -= GATE_PENALTY
+    score -= GATE_PENALTY * gate_deficit(metrics)
     return score
 
 
@@ -298,15 +318,23 @@ def eval_pool(vectors):
 def smoke_bad_mutation():
     return vec_with(
         {
-            "DD_SOCCER_GOAL_REWARD_SCALE": 0.5,
-            "DD_SOCCER_FORWARD_PASS_REWARD_SCALE": 12.0,
-            "DD_SOCCER_PASS_CHAIN_REWARD_SCALE": 10.0,
-            "DD_SOCCER_PASS_TURNOVER_PENALTY_SCALE": 1.0,
+            "DD_SOCCER_GOAL_REWARD_SCALE": 1.0,
+            "DD_SOCCER_FORWARD_PASS_REWARD_SCALE": 0.0,
+            "DD_SOCCER_PASS_CHAIN_REWARD_SCALE": 0.0,
+            "DD_SOCCER_PASS_TURNOVER_PENALTY_SCALE": 20.0,
             "DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE": 0.0,
             "DD_SOCCER_SHOT_SHAPING_REWARD_SCALE": 0.0,
             "DD_SOCCER_SHOT_COMMITMENT_REWARD_SCALE": 0.0,
+            "DD_SOCCER_DRIBBLE_BEAT_REWARD_SCALE": 0.0,
             "DD_SOCCER_LEARNED_EPV_REWARD_SCALE": 0.0,
-            "SOCCER_MARL_INTERMEDIATE_REWARD_WEIGHT": 3.0,
+            "SOCCER_OFFBALL_SUPPORT_REWARD_SCALE": 0.0,
+            "DD_SOCCER_CARRY_REWARD_SCALE": 0.0,
+            "DD_SOCCER_RECOVERY_REWARD_SCALE": 0.0,
+            "DD_SOCCER_OVERLOAD_PROGRESSION_REWARD_PER_YARD": 0.0,
+            "SOCCER_MAPPO_TEAM_REWARD_SHARE": 0.0,
+            "SOCCER_MARL_TEAM_REWARD_WEIGHT": 0.0,
+            "SOCCER_MARL_INTERMEDIATE_REWARD_WEIGHT": 0.2,
+            "SOCCER_PLANNER_TEACHER_WEIGHT": 0.0,
             "SOCCER_NEURAL_FINISHING_SELECT_BONUS_WEIGHT": 0.0,
         }
     )

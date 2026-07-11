@@ -25933,28 +25933,23 @@ impl SoccerMatch {
         amount: f64,
         kind: SoccerRewardEventKind,
     ) {
-        let whole_field_embedding = if reward_context_calibration_enabled()
-            && player_id < self.players.len()
-        {
-            let snapshot = self.export_world_snapshot();
-            let team = self.players[player_id].team;
-            Some(
-                SoccerConfigVector::from_snapshot_with(
-                    &snapshot,
-                    team,
-                    SoccerConfigComparison::PositionAgnostic,
-                    ConfigWeightOptions::default(),
+        let whole_field_embedding =
+            if reward_context_calibration_enabled() && player_id < self.players.len() {
+                let snapshot = self.export_world_snapshot();
+                let team = self.players[player_id].team;
+                Some(
+                    SoccerConfigVector::from_snapshot_with(
+                        &snapshot,
+                        team,
+                        SoccerConfigComparison::PositionAgnostic,
+                        ConfigWeightOptions::default(),
+                    )
+                    .embedding(),
                 )
-                .embedding(),
-            )
-        } else {
-            None
-        };
-        let amount = calibrated_reward_event_amount(
-            kind,
-            amount,
-            whole_field_embedding.as_deref(),
-        );
+            } else {
+                None
+            };
+        let amount = calibrated_reward_event_amount(kind, amount, whole_field_embedding.as_deref());
         // Drop non-finite amounts: `NaN.abs() <= 1e-9` is false, so without this
         // an upstream NaN/Inf would slip past the magnitude gate and pollute the
         // reward-event sum used in transition shaping.
@@ -27645,7 +27640,85 @@ impl SoccerMatch {
     /// Distance/angle scale for a shot-on-target's CHAIN reward: it backprops credit to the
     /// build-up chain only for a genuine chance from a good field-vector. With the field-vector
     /// gate on, close central chances keep full credit, while the same distance from a tight angle
-    /// is discounted and hopeful long shots go to zero.
+    /// is discounted and hopeful long shots go to zero. The field-vector path also prices defensive
+    /// pressure, shot-lane blockers, and an advanced keeper, so the reward is about the live 22-player
+    /// state rather than shooter location alone.
+    fn shot_lane_projection_factor(origin: Vec2, goal: Vec2, point: Vec2) -> f64 {
+        let lane = goal - origin;
+        let denom = lane.dot(lane);
+        if !denom.is_finite() || denom <= 1e-12 {
+            return 0.0;
+        }
+        let projection = (point - origin).dot(lane) / denom;
+        if projection.is_finite() {
+            projection.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+
+    fn field_vector_shot_xg_scale(
+        &self,
+        shooting_team: Team,
+        shooter_position: Vec2,
+        goal: Vec2,
+        distance_scale: f64,
+    ) -> f64 {
+        if distance_scale <= 0.0 {
+            return 0.0;
+        }
+        let lateral = (shooter_position.x - goal.x).abs();
+        let depth = (shooter_position.y - goal.y).abs().max(1.0);
+        let angle_scale = (depth / (depth + lateral)).clamp(0.0, 1.0);
+        let defending_team = shooting_team.other();
+        let keeper_id = self.goalkeeper_for(defending_team);
+        let mut nearest_pressure = f64::INFINITY;
+        let mut min_lane_gap = f64::INFINITY;
+        let mut lane_blockers: i32 = 0;
+        let mut keeper_smothers = 0.0_f64;
+
+        for player in self
+            .players
+            .iter()
+            .filter(|player| player.team == defending_team)
+        {
+            let lane_t = Self::shot_lane_projection_factor(shooter_position, goal, player.position);
+            let lane_gap = segment_distance_to_point(shooter_position, goal, player.position);
+            if Some(player.id) == keeper_id {
+                if lane_t > 0.05 && lane_t < 0.92 {
+                    let advance_fit = ((0.92 - lane_t) / 0.55).clamp(0.0, 1.0);
+                    let gap_fit = (1.0 - lane_gap / 4.0).clamp(0.0, 1.0);
+                    keeper_smothers = keeper_smothers.max(advance_fit * gap_fit);
+                }
+                continue;
+            }
+            nearest_pressure = nearest_pressure.min(shooter_position.distance(player.position));
+            if lane_t > 0.06 && lane_t < 0.96 {
+                min_lane_gap = min_lane_gap.min(lane_gap);
+                if lane_gap <= 3.2 {
+                    lane_blockers += 1;
+                }
+            }
+        }
+
+        let lane_clear = if min_lane_gap.is_finite() {
+            (min_lane_gap / 6.0).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let lane_scale = (0.40 + 0.60 * lane_clear) * 0.90_f64.powi(lane_blockers.clamp(0, 4));
+        let pressure_clear = if nearest_pressure.is_finite() {
+            ((nearest_pressure - 1.5) / 8.0).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let pressure_scale = 0.55 + 0.45 * pressure_clear;
+        let keeper_scale = 1.0 - 0.35 * keeper_smothers.clamp(0.0, 1.0);
+
+        (distance_scale * distance_scale * angle_scale * lane_scale * pressure_scale * keeper_scale)
+            .clamp(0.0, 1.0)
+    }
+
     pub(crate) fn shot_reward_distance_scale(&self, shooting_team: Team, shooter: usize) -> f64 {
         self.players
             .iter()
@@ -27667,12 +27740,7 @@ impl SoccerMatch {
                 if !gate_default_on("DD_SOCCER_ENABLE_FIELD_VECTOR_SHOT_REWARD") {
                     return distance_scale;
                 }
-                let lateral = (p.position.x - goal.x).abs();
-                let depth = (p.position.y - goal_y).abs().max(1.0);
-                // Field-vector/xG proxy: distance dominates with squared decay; the angle term
-                // rewards central goal-facing shots and discounts tight-angle efforts.
-                let angle_scale = (depth / (depth + lateral)).clamp(0.0, 1.0);
-                distance_scale * distance_scale * angle_scale
+                self.field_vector_shot_xg_scale(shooting_team, p.position, goal, distance_scale)
             })
             .unwrap_or(1.0)
     }

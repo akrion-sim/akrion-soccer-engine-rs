@@ -1196,6 +1196,7 @@ const SHOT_DISTANCE_REWARD_PIVOT_YARDS: f64 = 20.0;
 const SHOT_CLOSE_REWARD_PER_YARD: f64 = 0.9;
 const SHOT_FAR_PENALTY_PER_YARD: f64 = 1.6;
 const SHOT_DISTANCE_REWARD_MAX_POINTS: f64 = 14.0;
+pub(crate) const MIN_SOCCER_REWARD_WEIGHT: f64 = 0.0001;
 const SHOT_COMMITMENT_REWARD_SCALE: f64 = 0.0;
 // FLANK / WING usage reward (#8): credit the on-ball player for working the ball in a WIDE channel
 // (toward a touchline), scaled UP when the team is in its OWN half — get it out of the congested
@@ -21433,7 +21434,11 @@ mod reward_kind_calibration_tests {
         assert!(open_lane > crowded_lane);
         assert!((0.25..=4.0).contains(&open_lane));
         assert!((0.25..=4.0).contains(&crowded_lane));
-        assert_eq!(head.scale(&[1.0]), 1.0, "dimension mismatch falls back safely");
+        assert_eq!(
+            head.scale(&[1.0]),
+            1.0,
+            "dimension mismatch falls back safely"
+        );
     }
 }
 
@@ -23179,7 +23184,7 @@ pub(crate) fn dd_soccer_enable_overload_weighted_progression() -> bool {
 
 /// Per-yard reward for forward progress carried into a numbers advantage, scaled by the attacking
 /// overload score. Learner/operator override via `DD_SOCCER_OVERLOAD_PROGRESSION_REWARD_PER_YARD`
-/// (clamped to a sane 0.0-0.5 window).
+/// (clamped to a sane tiny-positive-to-0.5 window).
 pub(crate) fn overload_forward_pass_progression_reward_per_yard() -> f64 {
     use std::sync::OnceLock;
     static V: OnceLock<f64> = OnceLock::new();
@@ -23188,13 +23193,13 @@ pub(crate) fn overload_forward_pass_progression_reward_per_yard() -> f64 {
             .ok()
             .and_then(|raw| raw.trim().parse::<f64>().ok())
             .filter(|v| v.is_finite())
-            .map(|v| v.clamp(0.0, 0.5))
+            .map(|v| v.clamp(MIN_SOCCER_REWARD_WEIGHT, 0.5))
             .unwrap_or(OVERLOAD_FORWARD_PASS_PROGRESSION_REWARD_PER_YARD_DEFAULT)
     })
 }
 
 /// Fraction by which a forward pass-chain event reward is uplifted at full attacking overload.
-/// Learner/operator override via `DD_SOCCER_OVERLOAD_CHAIN_BONUS_FRACTION` (clamped 0.0-2.0).
+/// Learner/operator override via `DD_SOCCER_OVERLOAD_CHAIN_BONUS_FRACTION` (clamped tiny-positive-2.0).
 pub(crate) fn overload_pass_chain_event_bonus_fraction() -> f64 {
     use std::sync::OnceLock;
     static V: OnceLock<f64> = OnceLock::new();
@@ -23203,7 +23208,7 @@ pub(crate) fn overload_pass_chain_event_bonus_fraction() -> f64 {
             .ok()
             .and_then(|raw| raw.trim().parse::<f64>().ok())
             .filter(|v| v.is_finite())
-            .map(|v| v.clamp(0.0, 2.0))
+            .map(|v| v.clamp(MIN_SOCCER_REWARD_WEIGHT, 2.0))
             .unwrap_or(OVERLOAD_PASS_CHAIN_EVENT_BONUS_FRACTION_DEFAULT)
     })
 }
@@ -24281,12 +24286,15 @@ fn dynamic_reward_weights_enabled() -> bool {
 }
 
 fn reward_weight_env(name: &str, default: f64, min: f64, max: f64) -> f64 {
+    let min = min.max(MIN_SOCCER_REWARD_WEIGHT);
+    let max = max.max(min);
+    let default = if default.is_finite() { default } else { min };
     std::env::var(name)
         .ok()
         .and_then(|raw| raw.trim().parse::<f64>().ok())
         .filter(|v| v.is_finite())
         .map(|v| v.clamp(min, max))
-        .unwrap_or(default)
+        .unwrap_or(default.clamp(min, max))
 }
 
 pub(crate) fn forward_pass_reward_scale() -> f64 {
@@ -24352,8 +24360,8 @@ pub(crate) fn shot_commitment_reward_scale() -> f64 {
             .ok()
             .and_then(|raw| raw.trim().parse::<f64>().ok())
             .filter(|v| v.is_finite())
-            .map(|v| v.clamp(0.0, 10.0))
-            .unwrap_or(SHOT_COMMITMENT_REWARD_SCALE)
+            .map(|v| v.clamp(MIN_SOCCER_REWARD_WEIGHT, 10.0))
+            .unwrap_or(SHOT_COMMITMENT_REWARD_SCALE.max(MIN_SOCCER_REWARD_WEIGHT))
     }
     #[cfg(not(test))]
     {
@@ -24409,7 +24417,7 @@ pub(crate) fn learned_epv_reward_scale() -> f64 {
             .and_then(|raw| raw.trim().parse::<f64>().ok())
             .filter(|v| v.is_finite())
             .unwrap_or(20.0)
-            .clamp(0.0, 200.0)
+            .clamp(MIN_SOCCER_REWARD_WEIGHT, 200.0)
     })
 }
 
@@ -24925,7 +24933,7 @@ pub(crate) fn quick_forward_release_reward_scale() -> f64 {
         return reward_weight_env(
             "DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE",
             0.0,
-            0.0,
+            MIN_SOCCER_REWARD_WEIGHT,
             2.0,
         );
     }
@@ -24935,7 +24943,7 @@ pub(crate) fn quick_forward_release_reward_scale() -> f64 {
         reward_weight_env(
             "DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE",
             0.0,
-            0.0,
+            MIN_SOCCER_REWARD_WEIGHT,
             2.0,
         )
     })
@@ -27594,7 +27602,7 @@ fn soccer_analytic_difference_reward_negative_dense_floor() -> f64 {
             .ok()
             .and_then(|raw| raw.trim().parse::<f64>().ok())
             .unwrap_or(SOCCER_ANALYTIC_DIFFERENCE_REWARD_NEGATIVE_DENSE_FLOOR)
-            .clamp(0.0, 1.0)
+            .clamp(MIN_SOCCER_REWARD_WEIGHT, 1.0)
     })
 }
 

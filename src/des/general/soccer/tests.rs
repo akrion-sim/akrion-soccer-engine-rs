@@ -5248,6 +5248,15 @@ fn field_vector_shot_reward_prefers_central_angles_at_same_distance() {
     let idx = sim.players.iter().position(|p| p.id == shooter).unwrap();
     let goal_x = sim.config.field_width_yards * 0.5;
     let goal_y = Team::Home.goal_y(sim.config.field_length_yards);
+    let attack_dir = Team::Home.attack_dir();
+
+    for player in sim.players.iter_mut().filter(|p| p.team == Team::Away) {
+        player.position = if player.role == PlayerRole::Goalkeeper {
+            Vec2::new(goal_x, goal_y - attack_dir * 0.5)
+        } else {
+            Vec2::new(4.0, goal_y - attack_dir * 45.0)
+        };
+    }
 
     sim.players[idx].position = Vec2::new(goal_x, goal_y - 12.0);
     let central = sim.shot_reward_distance_scale(Team::Home, shooter);
@@ -5267,6 +5276,81 @@ fn field_vector_shot_reward_prefers_central_angles_at_same_distance() {
     assert!(
         wide < central * 0.75,
         "field-vector angle discount should be material: central={central} wide={wide}"
+    );
+}
+
+#[test]
+fn field_vector_shot_reward_uses_defenders_and_keeper_not_only_location() {
+    let _gate = TestEnvVarGuard::set("DD_SOCCER_ENABLE_FIELD_VECTOR_SHOT_REWARD", "1");
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let shooter = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role == PlayerRole::Forward)
+        .map(|p| p.id)
+        .unwrap();
+    let shooter_idx = sim.players.iter().position(|p| p.id == shooter).unwrap();
+    let blocker = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .unwrap();
+    let blocker_idx = sim.players.iter().position(|p| p.id == blocker).unwrap();
+    let keeper = sim.goalkeeper_for(Team::Away).unwrap();
+    let keeper_idx = sim.players.iter().position(|p| p.id == keeper).unwrap();
+    let goal_x = sim.config.field_width_yards * 0.5;
+    let goal_y = Team::Home.goal_y(sim.config.field_length_yards);
+    let attack_dir = Team::Home.attack_dir();
+
+    for player in sim.players.iter_mut().filter(|p| p.team == Team::Away) {
+        player.position = if player.role == PlayerRole::Goalkeeper {
+            Vec2::new(goal_x, goal_y - attack_dir * 0.5)
+        } else {
+            Vec2::new(4.0, goal_y - attack_dir * 45.0)
+        };
+    }
+    sim.players[shooter_idx].position = Vec2::new(goal_x, goal_y - attack_dir * 12.0);
+    let open = sim.shot_reward_distance_scale(Team::Home, shooter);
+
+    sim.players[blocker_idx].position = Vec2::new(goal_x, goal_y - attack_dir * 6.0);
+    let blocked = sim.shot_reward_distance_scale(Team::Home, shooter);
+
+    sim.players[blocker_idx].position = Vec2::new(4.0, goal_y - attack_dir * 45.0);
+    sim.players[keeper_idx].position = Vec2::new(goal_x, goal_y - attack_dir * 7.0);
+    let smothered = sim.shot_reward_distance_scale(Team::Home, shooter);
+
+    assert!(
+        open > 0.95,
+        "open central chance should stay high, got {open}"
+    );
+    assert!(
+        blocked < open * 0.60,
+        "lane blocker should materially discount identical shot location: open={open} blocked={blocked}"
+    );
+    assert!(
+        smothered < open * 0.80,
+        "advanced keeper should discount identical shot location: open={open} smothered={smothered}"
+    );
+}
+
+#[test]
+fn reward_weight_env_clamps_to_positive_finite_bounds() {
+    let _zero = TestEnvVarGuard::set("DD_SOCCER_TEST_REWARD_WEIGHT_ZERO", "0");
+    let _huge = TestEnvVarGuard::set("DD_SOCCER_TEST_REWARD_WEIGHT_HUGE", "999");
+    let _nan = TestEnvVarGuard::set("DD_SOCCER_TEST_REWARD_WEIGHT_NAN", "NaN");
+
+    assert_eq!(
+        reward_weight_env("DD_SOCCER_TEST_REWARD_WEIGHT_ZERO", 1.0, 0.0, 2.0),
+        MIN_SOCCER_REWARD_WEIGHT
+    );
+    assert_eq!(
+        reward_weight_env("DD_SOCCER_TEST_REWARD_WEIGHT_HUGE", 1.0, 0.0, 2.0),
+        2.0
+    );
+    assert_eq!(
+        reward_weight_env("DD_SOCCER_TEST_REWARD_WEIGHT_NAN", 0.0, 0.0, 2.0),
+        MIN_SOCCER_REWARD_WEIGHT
     );
 }
 
