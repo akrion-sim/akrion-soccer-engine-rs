@@ -16,6 +16,7 @@ use std::collections::HashMap;
 
 const MIN_UTILITY_SCALE: f64 = 0.0001;
 const MAX_UTILITY_SCALE: f64 = 4.0;
+const VALUE_DELTA_SCALE_FLOOR: f64 = 0.05;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -41,6 +42,8 @@ struct RewardContextArtifact {
     value_delta_rms_by_kind: HashMap<String, f64>,
     #[serde(default)]
     state_value_head: RewardContextHead,
+    #[serde(default)]
+    state_value_reliability: f64,
     by_kind: HashMap<String, RewardContextHead>,
 }
 
@@ -90,6 +93,7 @@ const KIND_SPECS: &[KindSpec] = &[
 ];
 
 struct LabeledMoment {
+    game_index: usize,
     sample: SoccerRewardContextSample,
     outcome: f64,
     value_delta: Option<f64>,
@@ -116,7 +120,7 @@ fn predict_head(head: &RewardContextHead, embedding: &[f64]) -> f64 {
 }
 
 fn fit_state_value_head(
-    rows: &[LabeledMoment],
+    rows: &[&LabeledMoment],
     prior: Option<&RewardContextHead>,
     epochs: usize,
     learning_rate: f64,
@@ -283,6 +287,7 @@ fn main() {
             let result = margin.signum() as f64;
             let margin_bonus = (margin as f64 / 3.0).clamp(-1.0, 1.0) * 0.20;
             Some(LabeledMoment {
+                game_index: game,
                 sample,
                 outcome: (result + margin_bonus).clamp(-1.0, 1.0),
                 value_delta: None,
@@ -299,22 +304,52 @@ fn main() {
         );
     }
 
+    let all_rows: Vec<_> = moments.iter().collect();
+    let even_rows: Vec<_> = moments
+        .iter()
+        .filter(|row| row.game_index % 2 == 0)
+        .collect();
+    let odd_rows: Vec<_> = moments
+        .iter()
+        .filter(|row| row.game_index % 2 == 1)
+        .collect();
+    let value_for_even = fit_state_value_head(&odd_rows, None, epochs, learning_rate);
+    let value_for_odd = fit_state_value_head(&even_rows, None, epochs, learning_rate);
+    let mut baseline_error = 0.0;
+    let mut model_error = 0.0;
+    let mut validation_weight = 0.0;
+    let cross_deltas: Vec<_> = moments
+        .iter()
+        .map(|row| {
+            let head = if row.game_index % 2 == 0 {
+                &value_for_even
+            } else {
+                &value_for_odd
+            };
+            let prediction = predict_head(head, &row.sample.embedding);
+            baseline_error += row.value_weight * row.outcome.powi(2);
+            model_error += row.value_weight * (prediction - row.outcome).powi(2);
+            validation_weight += row.value_weight;
+            row.sample.future_embedding.as_deref().map(|future| {
+                predict_head(head, future) - predict_head(head, &row.sample.embedding)
+            })
+        })
+        .collect();
+    let state_value_reliability = if validation_weight > 0.0 && baseline_error > 1e-9 {
+        ((baseline_error - model_error) / baseline_error).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     let state_value_head = fit_state_value_head(
-        &moments,
+        &all_rows,
         prior.as_ref().map(|artifact| &artifact.state_value_head),
         epochs,
         learning_rate,
     );
-    for row in &mut moments {
-        row.value_delta = row
-            .sample
-            .future_embedding
-            .as_deref()
-            .map(|future| {
-                predict_head(&state_value_head, future)
-                    - predict_head(&state_value_head, &row.sample.embedding)
-            })
-            .filter(|delta| delta.is_finite());
+    for (row, delta) in moments.iter_mut().zip(cross_deltas) {
+        row.value_delta = delta
+            .map(|value| value * state_value_reliability)
+            .filter(|value| value.is_finite());
     }
 
     let mut by_kind = HashMap::new();
@@ -351,7 +386,7 @@ fn main() {
             fit_head(
                 &rows,
                 spec.outcome_sign,
-                delta_rms,
+                delta_rms.max(VALUE_DELTA_SCALE_FLOOR),
                 prior_head,
                 epochs,
                 learning_rate,
@@ -371,6 +406,7 @@ fn main() {
         effective_samples_by_kind,
         value_delta_rms_by_kind,
         state_value_head,
+        state_value_reliability,
         by_kind,
     };
     let json = serde_json::to_string_pretty(&artifact).expect("serialize context artifact");

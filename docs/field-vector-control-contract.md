@@ -82,6 +82,11 @@ state-value head from final W/D/L plus capped goal margin. It then trains each
 event utility from the learned value change between the factual event state and
 its later field state; penalty heads use the sign mirror. Per-kind RMS value
 change supplies a data-derived target scale rather than an assumed reward value.
+Value changes are generated out-of-fold by alternating match partitions, then
+shrunk by the value model's held-out improvement over a zero predictor. A weak or
+non-predictive value model therefore produces a near-neutral `1.0` utility rather
+than amplifying noise. The delta normalizer has a `0.05` lower safety clamp so a
+tiny empirical RMS cannot turn numerical noise into a saturated target.
 A team-match contributes at most one unit of fitting weight to each event kind:
 repeated routine occurrences receive inverse-frequency weight, preventing a match
 with hundreds of carries from overwhelming rarer shot, pass, or turnover evidence.
