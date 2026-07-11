@@ -60,3 +60,14 @@ GATED goal-diff.
 - Dynamic-reward vector now spans shooting/dribbling/goal/dense (r25). Next: make the *shot* and
   *pass* scales **field-vector-modulated**, not just scalar multipliers.
 - 5-a-side reference impl pushed: `origin/wip-player-speeds`, `origin/five-a-side-standalone`.
+
+## Baseline + clamps (learnable-reward hygiene)
+- **Baseline = sane defaults** = the current tuned constants (initial conditions; a training run
+  can also warm-start weights from a past run's best vector).
+- **Every weight has an upper and lower clamp**, and the **lower clamp is a tiny NON-ZERO** value
+  (e.g., `1e-4`), never `0`. Rationale: a channel clamped to exactly 0 is dead — it contributes no
+  signal and a search/gradient can't revive it. A `1e-4` floor keeps every reward/penalty *alive*
+  and adjustable while still letting a search effectively switch it off. (Applied to the dynamic
+  reward-scale vector in `soccer.rs`; goal scale stays amplify-only `[1,16]`.)
+- Same rule for the 5-a-side `Rw`/`wenv` vector and the ES search bounds in
+  `standalone-5v5/viz/tune.py` (use `low = max(low, 1e-4)`).
