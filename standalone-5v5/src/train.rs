@@ -237,7 +237,7 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
             r += 12.0; // GOALS are the prize — rewarded well above everything else
         }
         if w.ev_goal_b {
-            r -= 6.0;
+            r -= 8.0;
         }
         // Only a tiny nudge for a completed pass (prefer it to a loose turnover);
         // forward progress is rewarded by the potential shaping above, and goals
