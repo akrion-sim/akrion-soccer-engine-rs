@@ -1686,12 +1686,16 @@ impl TournamentMatchRunner for EngineMatchRunner {
         let summary = sim.summary();
         let home_training_steps = sim.neural_training_steps_for(Team::Home);
         let away_training_steps = sim.neural_training_steps_for(Team::Away);
-        let learned_target_entries = sim.team_policies().map(|policies| {
-            (
-                policies.home.target_entries(),
-                policies.away.target_entries(),
-            )
-        });
+        let learned_target_entries = (self.config.base.policy_train_max_transitions_per_tick > 0)
+            .then(|| {
+                sim.team_policies().map(|policies| {
+                    (
+                        policies.home.target_entries(),
+                        policies.away.target_entries(),
+                    )
+                })
+            })
+            .flatten();
         eprintln!(
             "tournament_match_finish home={} away={} score={}-{} wall_secs={:.1} ticks={} home_training_steps={} away_training_steps={}",
             ctx.home_id,

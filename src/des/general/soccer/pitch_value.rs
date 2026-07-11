@@ -178,6 +178,8 @@ struct LearnedEpvGrid {
     rows: usize,
     cols: usize,
     grid: Vec<Vec<f64>>,
+    #[serde(default)]
+    counts: Vec<Vec<u64>>,
 }
 
 pub(crate) fn dd_soccer_enable_learned_epv() -> bool {
@@ -207,6 +209,17 @@ pub(crate) fn dd_soccer_enable_learned_epv() -> bool {
     }
 }
 
+fn learned_epv_min_count() -> u64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<u64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_LEARNED_EPV_MIN_COUNT")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    })
+}
+
 fn learned_epv_grid() -> Option<&'static LearnedEpvGrid> {
     use std::sync::OnceLock;
     static GRID: OnceLock<Option<LearnedEpvGrid>> = OnceLock::new();
@@ -214,7 +227,13 @@ fn learned_epv_grid() -> Option<&'static LearnedEpvGrid> {
         let path = std::env::var("DD_SOCCER_LEARNED_EPV_GRID_PATH").ok()?;
         let raw = std::fs::read_to_string(path.trim()).ok()?;
         let g: LearnedEpvGrid = serde_json::from_str(&raw).ok()?;
-        if g.rows == 0 || g.cols == 0 || g.grid.len() != g.rows {
+        if g.rows == 0
+            || g.cols == 0
+            || g.grid.len() != g.rows
+            || g.grid.iter().any(|row| row.len() != g.cols)
+            || (!g.counts.is_empty()
+                && (g.counts.len() != g.rows || g.counts.iter().any(|row| row.len() != g.cols)))
+        {
             return None;
         }
         Some(g)
@@ -235,7 +254,23 @@ fn learned_epv_lookup(team: Team, p: Vec2, field_width: f64, field_length: f64) 
     };
     let row = ((fwd * g.rows as f64) as usize).min(g.rows.saturating_sub(1));
     let col = ((lat * g.cols as f64) as usize).min(g.cols.saturating_sub(1));
-    g.grid.get(row).and_then(|r| r.get(col)).copied()
+    let value = g.grid.get(row).and_then(|r| r.get(col)).copied()?;
+    if !value.is_finite() {
+        return None;
+    }
+    let min_count = learned_epv_min_count();
+    if min_count > 0 {
+        let count = g
+            .counts
+            .get(row)
+            .and_then(|r| r.get(col))
+            .copied()
+            .unwrap_or(0);
+        if count < min_count {
+            return None;
+        }
+    }
+    Some(value)
 }
 
 /// Learned expected-possession-value of holding the ball at `p` for `team`, from the fitted grid.
@@ -254,17 +289,30 @@ pub(crate) fn learned_epv(team: Team, p: Vec2, field_width: f64, field_length: f
 /// fix for territory-without-conversion — can be A/B'd in isolation. Default-off ⇒ the
 /// process is byte-identical to the closed-form seed.
 pub(crate) fn dd_soccer_enable_learned_epv_potential() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| {
-        matches!(
+    #[cfg(test)]
+    {
+        return matches!(
             std::env::var("DD_SOCCER_ENABLE_LEARNED_EPV_POTENTIAL")
                 .ok()
                 .as_deref()
                 .map(str::trim),
             Some("1") | Some("true") | Some("yes") | Some("on")
-        )
-    })
+        );
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| {
+            matches!(
+                std::env::var("DD_SOCCER_ENABLE_LEARNED_EPV_POTENTIAL")
+                    .ok()
+                    .as_deref()
+                    .map(str::trim),
+                Some("1") | Some("true") | Some("yes") | Some("on")
+            )
+        })
+    }
 }
 
 /// Grid floor for own-half/high-turnover cells. Shifting by this value keeps the
@@ -325,6 +373,9 @@ pub(crate) fn learned_epv_pass_delta(
     }
 }
 
+/// Outcome-grounded pitch value used by the territorial potential. When a fitted
+/// EPV grid is available this breaks the old hand-coded xT anchor; otherwise it
+/// falls back to the deterministic seed and keeps existing behavior unchanged.
 /// Modeled top speed (yd/s) for a snapshot player, floored so the arrival-time
 /// race can never divide by ~0.
 fn player_top_speed(player: &PlayerSnapshot) -> f64 {
@@ -412,9 +463,9 @@ pub fn pitch_control_home(players: &[PlayerSnapshot], cell: Vec2) -> f64 {
 
 /// Integral of `control(team) × value(team)` over the grid — a single scalar for
 /// how much **dangerous space the team currently controls**. The value surface is
-/// learned EPV when `DD_SOCCER_ENABLE_LEARNED_EPV` has a grid, otherwise the
-/// deterministic closed-form [`expected_threat`] seed. Averaged over cells, so it
-/// is bounded on the same scale as the active value surface.
+/// outcome-grounded EPV when `DD_SOCCER_ENABLE_LEARNED_EPV_POTENTIAL` has a
+/// valid grid, otherwise the deterministic closed-form [`expected_threat`] seed.
+/// Averaged over cells, so it is bounded on the same scale as the active surface.
 pub fn team_expected_threat(snapshot: &WorldSnapshot, team: Team) -> f64 {
     let field_width = snapshot.field_width;
     let field_length = snapshot.field_length;
@@ -775,7 +826,7 @@ mod tests {
         let deep = make(L * 0.30);
         let high = make(L * 0.85);
 
-        std::env::remove_var("DD_SOCCER_ENABLE_LEARNED_EPV");
+        std::env::remove_var("DD_SOCCER_ENABLE_LEARNED_EPV_POTENTIAL");
         std::env::remove_var("DD_SOCCER_LEARNED_EPV_GRID_PATH");
         let seed_deep = team_expected_threat(&deep, Team::Home);
         let seed_high = team_expected_threat(&high, Team::Home);
@@ -798,11 +849,11 @@ mod tests {
         ));
         std::fs::write(&grid_path, raw.to_string()).expect("write test EPV grid");
 
-        std::env::set_var("DD_SOCCER_ENABLE_LEARNED_EPV", "1");
+        std::env::set_var("DD_SOCCER_ENABLE_LEARNED_EPV_POTENTIAL", "1");
         std::env::set_var("DD_SOCCER_LEARNED_EPV_GRID_PATH", &grid_path);
         let learned_deep = team_expected_threat(&deep, Team::Home);
         let learned_high = team_expected_threat(&high, Team::Home);
-        std::env::remove_var("DD_SOCCER_ENABLE_LEARNED_EPV");
+        std::env::remove_var("DD_SOCCER_ENABLE_LEARNED_EPV_POTENTIAL");
         std::env::remove_var("DD_SOCCER_LEARNED_EPV_GRID_PATH");
 
         assert!(
