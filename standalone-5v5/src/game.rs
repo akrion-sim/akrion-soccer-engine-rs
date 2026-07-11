@@ -9,6 +9,7 @@ use crate::rng::Rng;
 pub const FIELD_L: f32 = 42.0;
 pub const FIELD_W: f32 = 28.0;
 pub const GOAL_HALF: f32 = 3.5; // half goal-mouth width in y (~7m net)
+#[allow(dead_code)]
 pub const FINAL_THIRD_X: f32 = FIELD_L * 2.0 / 3.0; // attacking-third boundary (kept for reference)
 pub const SHOOT_X: f32 = FIELD_L / 2.0; // A may shoot once in the OPPONENT'S HALF (not just the final third)
 pub const N: usize = 5; // players per team (index 0 == goalkeeper)
@@ -27,6 +28,7 @@ const PLAYER_SPEED: f32 = 6.5; // legacy reference speed (~= run_medium); kept f
 pub const NS: usize = 7; // number of speed gears (the speed action head)
 pub const SPD_STAND: usize = 0;
 pub const SPD_WALK: usize = 1;
+#[allow(dead_code)]
 pub const SPD_JOG: usize = 2;
 pub const SPD_SKIP: usize = 3;
 pub const SPD_RUN_SLOW: usize = 4;
@@ -338,6 +340,10 @@ impl World {
         self.nearest_player(team.other(), p)
     }
 
+    pub fn nearest_opponent_distance(&self, team: Team, p: V2) -> (usize, f32) {
+        self.nearest_opponent(team, p)
+    }
+
     // -- pass-target ranking: pick every outfield teammate for the possessor ---
     // Score favors forward progress (toward attacked goal) and openness.
     fn pass_candidates(
@@ -625,7 +631,8 @@ impl World {
         let team_owns = matches!(self.owner, Some(o) if o.team == team);
         let opp_owns = matches!(self.owner, Some(o) if o.team != team);
         let our_phase = team_owns || (self.owner.is_none() && self.last_touch == Some(team));
-        let their_phase = opp_owns || (self.owner.is_none() && self.last_touch == Some(team.other()));
+        let their_phase =
+            opp_owns || (self.owner.is_none() && self.last_touch == Some(team.other()));
         let mut m = [false; NA];
         if has_ball {
             for a in A_SHOOT..=A_HOLD {
@@ -705,9 +712,13 @@ impl World {
         let team_owns = matches!(self.owner, Some(o) if o.team == team);
         let opp_owns = matches!(self.owner, Some(o) if o.team != team);
         let our_phase = team_owns || (self.owner.is_none() && self.last_touch == Some(team));
-        let their_phase = opp_owns || (self.owner.is_none() && self.last_touch == Some(team.other()));
+        let their_phase =
+            opp_owns || (self.owner.is_none() && self.last_touch == Some(team.other()));
 
-        if matches!(action, A_SHOOT | A_PASS_A | A_PASS_B | A_PASS_C | A_CLEAR | A_HOLD | A_STAY) {
+        if matches!(
+            action,
+            A_SHOOT | A_PASS_A | A_PASS_B | A_PASS_C | A_CLEAR | A_HOLD | A_STAY
+        ) {
             only(&mut mask, SPD_STAND);
         } else if is_owner && matches!(action, A_DRIB_FWD | A_DRIB_LEFT | A_DRIB_RIGHT) {
             min_gear(&mut mask, SPD_WALK);
@@ -717,7 +728,9 @@ impl World {
             min_gear(&mut mask, SPD_RUN_SLOW);
         } else if !is_owner && their_phase && matches!(action, A_CHASE | A_MARK) {
             min_gear(&mut mask, SPD_RUN_FAST);
-        } else if !is_owner && matches!(action, A_CHASE | A_SUPPORT | A_SPREAD | A_MARK | A_GET_OPEN) {
+        } else if !is_owner
+            && matches!(action, A_CHASE | A_SUPPORT | A_SPREAD | A_MARK | A_GET_OPEN)
+        {
             min_gear(&mut mask, SPD_RUN_SLOW);
         }
         mask
@@ -1378,15 +1391,54 @@ impl World {
         best
     }
 
-    /// MPC-lite lane opener (execution of the GET_OPEN decision). Enumerates
-    /// candidate relocations — biased toward the wings — and returns the one that
-    /// best OPENS A PASSING LANE from the ball to that point: a short-horizon
-    /// optimization scoring the resulting lane clearness, plus width, being ahead
-    /// of the ball, and space from the nearest defender. The policy makes the
-    /// decision to get open; this computes where "open" actually is.
-    fn mpc_open_lane_target(&self, team: Team, idx: usize) -> V2 {
+    fn mpc_field_vector_score(&self, team: Team, idx: usize, cand: V2) -> f32 {
         let me = players(team, self)[idx].pos;
         let sx = team.sx();
+        let lane = self.lane_clearness(team, self.ball, cand);
+        let route = self.lane_clearness(team, me, cand);
+        let wide = (cand.y - FIELD_W / 2.0).abs() / (FIELD_W / 2.0);
+        let ahead = ((cand.x - self.ball.x) * sx).max(0.0) / FIELD_L;
+        let (_, defender_d) = self.nearest_opponent(team, cand);
+        let defender_space = (defender_d / 7.0).min(1.0);
+        let mut teammate_gap = f32::INFINITY;
+        for j in 1..N {
+            if j == idx {
+                continue;
+            }
+            teammate_gap = teammate_gap.min(players(team, self)[j].pos.sub(cand).len());
+        }
+        let teammate_space = (teammate_gap / 7.0).min(1.0);
+        let carrier_pressure = if let Some(o) = self.owner {
+            if o.team == team {
+                let carrier = players(team, self)[o.idx].pos;
+                let (_, pressure_d) = self.nearest_opponent(team, carrier);
+                (1.0 - pressure_d / 7.0).clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        } else {
+            0.25
+        };
+        let goal = team.target_goal();
+        let shot_channel = self.lane_clearness(team, cand, goal);
+        lane * 1.35
+            + route * 0.35
+            + wide * 0.55
+            + ahead * (0.55 + 0.35 * carrier_pressure)
+            + defender_space * 0.45
+            + teammate_space * 0.25
+            + shot_channel * 0.20
+    }
+
+    /// MPC-lite lane opener (execution of the GET_OPEN decision). Enumerates
+    /// candidate relocations and scores each candidate as a function of the
+    /// current 10-player field vector: ball lane, route lane, width, aheadness,
+    /// defender pressure, teammate spacing, carrier pressure, and shot channel.
+    /// The POMDP picks GET_OPEN; this field-vector objective computes where
+    /// "open" actually is. A QP/neural MPC can replace the enumerator, but it
+    /// should optimize this same state-conditioned objective shape.
+    fn mpc_open_lane_target(&self, team: Team, idx: usize) -> V2 {
+        let me = players(team, self)[idx].pos;
         let radii = [4.0f32, 8.0, 12.0, 16.0];
         let ndir = 12usize;
         let mut best = me;
@@ -1398,16 +1450,7 @@ impl World {
                     (me.x + ang.cos() * r).clamp(3.0, FIELD_L - 3.0),
                     (me.y + ang.sin() * r).clamp(3.0, FIELD_W - 3.0),
                 );
-                // the payoff: a CLEAR passing lane from the ball to this point.
-                let lane = self.lane_clearness(team, self.ball, cand);
-                // prefer WIDTH (the mechanism for opening a lane is going wider)…
-                let wide = (cand.y - FIELD_W / 2.0).abs() / (FIELD_W / 2.0);
-                // …an upfield outlet ahead of the ball…
-                let ahead = ((cand.x - self.ball.x) * sx).max(0.0) / FIELD_L;
-                // …and real space from the nearest defender (room to receive).
-                let (_, od) = self.nearest_opponent(team, cand);
-                let space = (od / 6.0).min(1.0);
-                let score = lane * 1.6 + wide * 0.7 + ahead * 0.6 + space * 0.5;
+                let score = self.mpc_field_vector_score(team, idx, cand);
                 if score > best_score {
                     best_score = score;
                     best = cand;
@@ -2050,5 +2093,78 @@ mod tests {
         }
         let _ = w.apply_on_ball(Team::A, 1, A_DRIB_FWD, SPD_RUN_MED, &mut Rng::new(1));
         assert!(w.ev_dribble_fwd_a);
+    }
+
+    #[test]
+    fn support_speed_mask_requires_run_fast_or_sprint_in_possession() {
+        let mut w = World::new();
+        w.owner = Some(Owner {
+            team: Team::A,
+            idx: 1,
+        });
+        let mask = w.speed_mask(Team::A, 2, A_SUPPORT);
+
+        assert!(!mask[SPD_STAND]);
+        assert!(!mask[SPD_RUN_SLOW]);
+        assert!(mask[SPD_RUN_FAST]);
+        assert!(mask[SPD_SPRINT]);
+        assert_eq!(
+            w.coerce_speed_gear(Team::A, 2, A_SUPPORT, SPD_WALK),
+            SPD_RUN_FAST
+        );
+    }
+
+    #[test]
+    fn goalside_recovery_target_moves_wrong_side_defender_toward_own_goal() {
+        let mut w = World::new();
+        w.owner = Some(Owner {
+            team: Team::B,
+            idx: 1,
+        });
+        w.ball = V2::new(28.0, 14.0);
+        w.a[2].pos = V2::new(34.0, 16.0);
+        w.b[2].pos = V2::new(32.0, 18.0);
+
+        let target = w.goalside_recovery_target(Team::A, 2);
+
+        assert!(
+            target.x < w.a[2].pos.x,
+            "wrong-side defender should recover toward own goal: target={target:?}"
+        );
+        assert!(
+            target.x < w.ball.x,
+            "target should get goalside of the ball: target={target:?}, ball={:?}",
+            w.ball
+        );
+        let mask = w.speed_mask(Team::A, 2, A_MARK);
+        assert!(mask[SPD_RUN_FAST] && mask[SPD_SPRINT]);
+        assert!(!mask[SPD_SKIP]);
+    }
+
+    #[test]
+    fn mpc_field_vector_score_prefers_open_wide_lane_over_blocked_centre() {
+        let mut w = World::new();
+        w.owner = Some(Owner {
+            team: Team::A,
+            idx: 1,
+        });
+        w.ball = V2::new(12.0, 14.0);
+        w.a[1].pos = w.ball;
+        w.a[2].pos = V2::new(14.0, 14.0);
+        w.a[3].pos = V2::new(10.0, 5.0);
+        w.a[4].pos = V2::new(10.0, 23.0);
+        w.b[1].pos = V2::new(18.0, 14.0);
+        w.b[2].pos = V2::new(22.0, 14.0);
+        w.b[3].pos = V2::new(34.0, 6.0);
+        w.b[4].pos = V2::new(34.0, 22.0);
+
+        let blocked_centre = V2::new(25.0, 14.0);
+        let wide_lane = V2::new(25.0, 24.0);
+
+        assert!(
+            w.mpc_field_vector_score(Team::A, 2, wide_lane)
+                > w.mpc_field_vector_score(Team::A, 2, blocked_centre),
+            "field-vector MPC should prefer the unblocked wide outlet"
+        );
     }
 }

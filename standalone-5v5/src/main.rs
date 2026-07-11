@@ -281,9 +281,7 @@ fn inspect(seed: u64, out_dir: &Path) -> AppResult<()> {
         // choose actions (record them for the trace)
         let mut act_a = [A_STAY; N];
         for i in 1..N {
-            let obs = w.observe(Team::A, i);
-            let mask = w.legal_mask(Team::A, i);
-            act_a[i] = policy.act_greedy(&obs, &mask);
+            act_a[i] = policy.act_greedy_world(&w, Team::A, i);
         }
         let act_b = w.scripted_actions(Team::B);
         w.step(&act_a, &act_b, &mut rng);
@@ -722,9 +720,7 @@ fn game_stats(policy: &train::Policy, seed: u64) -> (u32, u32, u32, u32) {
     for _ in 0..STEPS {
         let mut act_a = [A_STAY; N];
         for i in 1..N {
-            let obs = w.observe(Team::A, i);
-            let mask = w.legal_mask(Team::A, i);
-            act_a[i] = policy.act_greedy(&obs, &mask);
+            act_a[i] = policy.act_greedy_world(&w, Team::A, i);
         }
         let act_b = w.scripted_actions(Team::B);
         w.step(&act_a, &act_b, &mut rng);
@@ -750,9 +746,7 @@ fn record_match(policy: &train::Policy, rng: &mut Rng, path: &Path) -> AppResult
         }
         let mut act_a = [A_STAY; N];
         for i in 1..N {
-            let obs = w.observe(Team::A, i);
-            let mask = w.legal_mask(Team::A, i);
-            act_a[i] = policy.act_greedy(&obs, &mask);
+            act_a[i] = policy.act_greedy_world(&w, Team::A, i);
         }
         let act_b = w.scripted_actions(Team::B);
         w.step(&act_a, &act_b, rng);
