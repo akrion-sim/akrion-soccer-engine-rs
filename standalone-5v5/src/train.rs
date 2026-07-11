@@ -663,13 +663,13 @@ pub fn train_iter(policy: &mut Policy, games: usize, ent_beta: f32, rng: &mut Rn
                         continue;
                     }
                     let ind = if j == s.action { 1.0 } else { 0.0 };
-                    let pg = -coeff * (ind - aprobs[j]);
+                    let pg = -coeff_a * (ind - aprobs[j]);
                     let eg = ent_beta * aprobs[j] * (aprobs[j].max(1e-8).ln() + ent);
                     d_logits[j] = pg + eg;
                 }
                 for k in 0..NS {
                     let ind = if k == s.speed { 1.0 } else { 0.0 };
-                    let pg = -coeff * (ind - sprobs[k]);
+                    let pg = -coeff_s * (ind - sprobs[k]);
                     let eg = ent_beta * sprobs[k] * (sprobs[k].max(1e-8).ln() + ent_s);
                     d_logits[NA + k] = pg + eg;
                 }
