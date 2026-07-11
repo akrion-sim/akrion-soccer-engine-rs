@@ -1643,6 +1643,32 @@ mod tests {
     }
 
     #[test]
+    fn final_third_rule_masks_shot_outside_attacking_third() {
+        let mut w = World::new();
+        w.owner = Some(Owner { team: Team::A, idx: 1 });
+        w.pass_streak_a = 2; // 2-pass rule satisfied
+        w.a[1].pos = V2::new(FINAL_THIRD_X - 5.0, 14.0); // BEFORE the final third
+        assert!(!w.legal_mask(Team::A, 1)[A_SHOOT], "shot must be masked outside final third");
+        w.a[1].pos = V2::new(FINAL_THIRD_X + 2.0, 14.0); // inside final third
+        assert!(w.legal_mask(Team::A, 1)[A_SHOOT], "shot allowed in final third after 2 passes");
+    }
+
+    #[test]
+    fn b_goal_requires_valid_buildup() {
+        // A free ball crossing B's target line (x<=0) does NOT count for B unless
+        // b_shot_flag is set (B built up 2 passes + shot from its final third).
+        let mut w = World::new();
+        w.owner = None;
+        w.b_shot_flag = false;
+        w.ball = V2::new(0.4, FIELD_W / 2.0);
+        w.ball_vel = V2::new(-20.0, 0.0);
+        let g0 = w.goals_b;
+        let empty = [A_STAY; N];
+        w.step(&empty, &empty, &mut Rng::new(1));
+        assert_eq!(w.goals_b, g0, "B goal without valid buildup must not count");
+    }
+
+    #[test]
     fn dribble_forward_action_sets_forward_event_in_the_clear() {
         // With no defender near, A_DRIB_FWD keeps forward intent -> forward event.
         let mut w = World::new();
