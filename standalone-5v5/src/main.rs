@@ -33,6 +33,8 @@ struct RunConfig {
     iters: usize,
     seed: u64,
     games_per_iter: usize,
+    bc_games: usize,
+    bc_epochs: usize,
     eval_every: usize,
     eval_games: usize,
     final_games: usize,
@@ -45,7 +47,9 @@ impl Default for RunConfig {
         Self {
             iters: 100,
             seed: 20260710,
-            games_per_iter: 8,
+            games_per_iter: 12,
+            bc_games: 12,
+            bc_epochs: 2,
             eval_every: 5,
             eval_games: 60,
             final_games: 300,
@@ -66,6 +70,10 @@ fn run() -> AppResult<()> {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("train");
     match cmd {
+        "train" => {
+            let cfg = parse_run_config(&args)?;
+            run_training(&cfg)?;
+        }
         "sanity" => sanity(),
         "inspect" => {
             let seed: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(7);
@@ -73,17 +81,14 @@ fn run() -> AppResult<()> {
             inspect(seed, &out_dir)?;
         }
         "help" | "--help" | "-h" => print_usage(),
-        _ => {
-            let cfg = parse_run_config(&args)?;
-            run_training(&cfg)?;
-        }
+        other => return Err(format!("unknown command: {other}; run with --help for usage").into()),
     }
     Ok(())
 }
 
 fn print_usage() {
     println!("usage:");
-    println!("  cargo run --release -- train [iters] [--seed N] [--games-per-iter N] [--eval-every N] [--eval-games N] [--final-games N] [--display-seed-max N] [--out-dir DIR]");
+    println!("  cargo run --release -- train [iters] [--seed N] [--games-per-iter N] [--bc-games N] [--bc-epochs N] [--eval-every N] [--eval-games N] [--final-games N] [--display-seed-max N] [--out-dir DIR]");
     println!("  cargo run --release -- inspect [seed] [--out-dir DIR]");
     println!("  cargo run --release -- sanity");
 }
@@ -114,6 +119,16 @@ fn parse_run_config(args: &[String]) -> AppResult<RunConfig> {
                 cfg.games_per_iter = value
                     .parse()
                     .map_err(|_| format!("invalid games-per-iter: {value}"))?
+            }
+            "--bc-games" => {
+                cfg.bc_games = value
+                    .parse()
+                    .map_err(|_| format!("invalid bc-games: {value}"))?
+            }
+            "--bc-epochs" => {
+                cfg.bc_epochs = value
+                    .parse()
+                    .map_err(|_| format!("invalid bc-epochs: {value}"))?
             }
             "--eval-every" => {
                 cfg.eval_every = value
@@ -147,6 +162,9 @@ fn parse_run_config(args: &[String]) -> AppResult<RunConfig> {
     {
         return Err("games/eval counts must be > 0".into());
     }
+    if cfg.bc_games > 0 && cfg.bc_epochs == 0 {
+        return Err("bc-epochs must be > 0 when bc-games is enabled".into());
+    }
     if cfg.display_seed_max == 0 {
         return Err("display-seed-max must be > 0".into());
     }
@@ -175,6 +193,7 @@ fn action_name(a: usize) -> &'static str {
         A_SHOOT => "shoot",
         A_PASS_A => "pass_a",
         A_PASS_B => "pass_b",
+        A_PASS_C => "pass_c",
         A_DRIB_FWD => "dribble_fwd",
         A_DRIB_LEFT => "dribble_left",
         A_DRIB_RIGHT => "dribble_right",
@@ -205,10 +224,40 @@ fn inspect(seed: u64, out_dir: &Path) -> AppResult<()> {
             return Err(format!("no trained policy found at {}", actor_path.display()).into());
         }
     };
+    let critic = nn::Mlp::load(&critic_path)
+        .map_err(|err| format!("failed to load critic at {}: {err}", critic_path.display()))?;
+    let speedor_path = out_dir.join("speedor.txt");
+    let speedor = nn::Mlp::load(&speedor_path).map_err(|err| {
+        format!(
+            "failed to load speedor at {}: {err}",
+            speedor_path.display()
+        )
+    })?;
+    if actor.in_dim() != OBS_DIM || actor.out_dim() != NA {
+        return Err(format!(
+            "actor shape mismatch in {}: expected input {} / actions {}, got input {} / actions {}; retrain the policy",
+            actor_path.display(),
+            OBS_DIM,
+            NA,
+            actor.in_dim(),
+            actor.out_dim()
+        )
+        .into());
+    }
+    if critic.in_dim() != GLOBAL_DIM || critic.out_dim() != 1 {
+        return Err(format!(
+            "critic shape mismatch in {}: expected input {} / output 1, got input {} / output {}; retrain the policy",
+            critic_path.display(),
+            GLOBAL_DIM,
+            critic.in_dim(),
+            critic.out_dim()
+        )
+        .into());
+    }
     let policy = train::Policy {
         actor,
-        critic: nn::Mlp::load(&critic_path)
-            .unwrap_or_else(|_| nn::Mlp::new(&[GLOBAL_DIM, 128, 64, 1], &mut Rng::new(0))),
+        speedor,
+        critic,
     };
     let mut rng = Rng::new(seed);
     let mut w = World::new();
@@ -394,15 +443,29 @@ fn run_training(cfg: &RunConfig) -> AppResult<()> {
         "untrained-vs-scripted:  goal_diff={:+.2}  winrate={:.2}  (A {:.2} / B {:.2})  spacing={:.1}",
         s0.goal_diff, s0.winrate, s0.ga, s0.gb, s0.spacing
     );
-    println!(
-        "training for {} iterations ({} games/iter, seed {})...\n",
-        cfg.iters, cfg.games_per_iter, cfg.seed
-    );
 
     // Keep the untrained policy so we can later pick a display game where the
     // before/after contrast is representative (before loses, after wins) under
     // the SAME seed — the contrast is then the policy, not the dice.
     let untrained = policy.clone();
+
+    if cfg.bc_games > 0 {
+        let bc = train::behavior_clone_scripted(&mut policy, cfg.bc_games, cfg.bc_epochs, &mut rng);
+        println!(
+            "behavior-clone warm start: {} samples, loss {:.3}, teacher-match {:.0}%",
+            bc.samples,
+            bc.loss,
+            bc.accuracy * 100.0
+        );
+    }
+
+    println!(
+        "training for {} iterations ({} games/iter, {} rollout workers, seed {})...\n",
+        cfg.iters,
+        cfg.games_per_iter,
+        train::rollout_worker_count(cfg.games_per_iter),
+        cfg.seed
+    );
 
     let mut csv = String::new();
     csv.push_str("iter,avg_goal_diff,winrate,goals_a,goals_b,spacing,bunch,possession,pass_att,pass_cmp,pass_completion,pass_fwd,pass_lat,pass_back,shots,shots_scored,conversion,turnovers,balls_won,avg_reward,entropy,value_loss\n");
@@ -435,7 +498,14 @@ fn run_training(cfg: &RunConfig) -> AppResult<()> {
     let mut best_any_iter = 0usize;
     let mut best_gated: Option<(train::Policy, usize, f32)> = None;
 
+    // Speed-warmup curriculum: fix the gear (v3 behavior) for the first stretch so
+    // the action policy learns to attack before the speed policy adds variability.
+    let speed_warmup = std::env::var("SPEED_WARMUP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| (cfg.iters / 2).clamp(1, 300));
     for it in 1..=cfg.iters {
+        train::set_speed_frozen(it <= speed_warmup);
         let beta = train::ent_beta_at(it, cfg.iters);
         let stats = train::train_iter(&mut policy, cfg.games_per_iter, beta, &mut rng);
 
@@ -500,7 +570,9 @@ fn run_training(cfg: &RunConfig) -> AppResult<()> {
     // Persist the trained policy so `inspect` can load and trace it.
     let actor_path = cfg.out_dir.join("actor.txt");
     let critic_path = cfg.out_dir.join("critic.txt");
+    let speedor_path = cfg.out_dir.join("speedor.txt");
     policy.actor.save(&actor_path)?;
+    policy.speedor.save(&speedor_path)?;
     policy.critic.save(&critic_path)?;
     println!(
         "saved policy -> {}, {}",
@@ -532,7 +604,7 @@ fn run_training(cfg: &RunConfig) -> AppResult<()> {
     // Pick a display seed that showcases GOOD PLAY, not a blowout: the trained
     // side should win by a sensible margin while dominating possession and
     // stringing passes; the untrained side (same seed) should be clearly worse.
-    let mut best_seed = 1u64;
+    let mut best_seed = None;
     let mut best_score = f32::NEG_INFINITY;
     for s in 1..=cfg.display_seed_max {
         let (bga, bgb, ba_poss, _) = game_stats(&untrained, s);
@@ -548,14 +620,33 @@ fn run_training(cfg: &RunConfig) -> AppResult<()> {
             aa_poss as f32 * 0.02 + a_pass as f32 * 0.4 + (aa_poss as f32 - ba_poss as f32) * 0.01;
         if score > best_score {
             best_score = score;
-            best_seed = s;
+            best_seed = Some(s);
         }
     }
+    let display_seed_matched_filter = best_seed.is_some();
+    let best_seed = best_seed.unwrap_or_else(|| {
+        eprintln!(
+            "warning: no display seed matched the showcase filter; using seed 1 as a fallback"
+        );
+        1
+    });
     let (bga, bgb, bposs, _) = game_stats(&untrained, best_seed);
     let (aga, agb, aposs, apass) = game_stats(&policy, best_seed);
     println!(
-        "display seed {}: before {}-{} (poss {})  ->  after {}-{} (poss {}, passes {})",
-        best_seed, bga, bgb, bposs, aga, agb, aposs, apass
+        "display seed {}{}: before {}-{} (poss {})  ->  after {}-{} (poss {}, passes {})",
+        best_seed,
+        if display_seed_matched_filter {
+            ""
+        } else {
+            " (fallback)"
+        },
+        bga,
+        bgb,
+        bposs,
+        aga,
+        agb,
+        aposs,
+        apass
     );
     let before_path = cfg.out_dir.join("match_before.json");
     let after_path = cfg.out_dir.join("match_after.json");
@@ -575,6 +666,7 @@ fn run_training(cfg: &RunConfig) -> AppResult<()> {
         best_quality,
         best_cleared_gates,
         best_seed,
+        display_seed_matched_filter,
         (svs, sga, sgb),
         &s0,
         &f,
@@ -723,6 +815,7 @@ fn write_run_manifest(
     best_quality: f32,
     best_cleared_gates: bool,
     display_seed: u64,
+    display_seed_matched_filter: bool,
     scripted: (f32, f32, f32),
     untrained: &train::Stats,
     final_stats: &train::Stats,
@@ -753,9 +846,9 @@ fn write_run_manifest(
             "{{\n",
             "  \"created_unix_seconds\": {},\n",
             "  \"git_commit\": {},\n",
-            "  \"config\": {{\"iters\":{},\"seed\":{},\"games_per_iter\":{},\"eval_every\":{},\"eval_games\":{},\"final_games\":{},\"display_seed_max\":{},\"out_dir\":{}}},\n",
+            "  \"config\": {{\"iters\":{},\"seed\":{},\"games_per_iter\":{},\"bc_games\":{},\"bc_epochs\":{},\"eval_every\":{},\"eval_games\":{},\"final_games\":{},\"display_seed_max\":{},\"out_dir\":{}}},\n",
             "  \"env\": {{\"SPACING_W\": {}}},\n",
-            "  \"selection\": {{\"best_iter\":{},\"best_quality\":{:.6},\"best_cleared_hardening_gates\":{},\"display_seed\":{}}},\n",
+            "  \"selection\": {{\"best_iter\":{},\"best_quality\":{:.6},\"best_cleared_hardening_gates\":{},\"display_seed\":{},\"display_seed_matched_filter\":{}}},\n",
             "  \"scripted_vs_scripted\": {{\"goal_diff\":{:.6},\"goals_a\":{:.6},\"goals_b\":{:.6}}},\n",
             "  \"untrained\": {},\n",
             "  \"final\": {},\n",
@@ -767,6 +860,8 @@ fn write_run_manifest(
         cfg.iters,
         cfg.seed,
         cfg.games_per_iter,
+        cfg.bc_games,
+        cfg.bc_epochs,
         cfg.eval_every,
         cfg.eval_games,
         cfg.final_games,
@@ -777,6 +872,7 @@ fn write_run_manifest(
         best_quality,
         best_cleared_gates,
         display_seed,
+        display_seed_matched_filter,
         scripted.0,
         scripted.1,
         scripted.2,
