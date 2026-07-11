@@ -188,6 +188,7 @@ pub struct World {
     pub pass_dir_a: i32,              // direction of that pass: 1 forward, 0 lateral, -1 backward
     pub ev_shot_attempt_a: bool,      // Team A took a shot this tick
     pub last_shot_quality_a: f32,     // placement quality of A's last shot, ~[0,1] (MPC finish)
+    pub last_shot_xg_a: f32,          // POSITION quality (xG-like: distance+angle to goal), ~[0,1]
     pending_pass: Option<Owner>,      // intended receiver of an in-flight pass
     intended_receiver: Option<Owner>, // scratch set during apply_on_ball
     pass_kick_x: f32,                 // ball x when Team A last released a pass
