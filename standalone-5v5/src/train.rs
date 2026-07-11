@@ -17,8 +17,9 @@ const MINIBATCH: usize = 1024;
 const MAX_ROLLOUT_THREADS: usize = 4;
 const W_SHAPE: f32 = 2.2; // potential shaping: strong pull to carry/pass the ball toward goal
 const W_ADVANCE: f32 = 0.02; // OFFENSE: off-ball teammates advance upfield
-const W_OPEN: f32 = 0.025; // OFFENSE: get into a CLEAR passing lane from the ball
-const W_WIDTH: f32 = 0.022; // OFFENSE: use the width of the pitch (stretch wide)
+const W_OPEN: f32 = 0.04; // OFFENSE: get into a CLEAR passing lane from the ball
+const W_WIDTH: f32 = 0.045; // OFFENSE: use the width of the pitch (stretch wide)
+const W_FLANK: f32 = 0.025; // OFFENSE: commit to a left/right channel (two-flank spread)
 const W_GOALSIDE: f32 = 0.02; // DEFENSE: get goalside of the ball
 const ENT_BETA0: f32 = 0.02;
 
