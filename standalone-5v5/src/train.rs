@@ -305,6 +305,21 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
                 let flank = if wide > 0.5 { (wide - 0.5) * 2.0 } else { 0.0 };
                 sp_t[i] +=
                     W_ADVANCE * advance + W_OPEN * open + W_WIDTH * width + W_FLANK * flank;
+
+                // ── THE KEY MARL BEHAVIOUR ─────────────────────────────────────
+                // When a TEAMMATE has the ball, the other attackers must run/sprint
+                // upfield to offer a forward pass. Rewarded for OFF-BALL players:
+                //   (1) be an upfield OUTLET — ahead of the ball, in a clear lane;
+                //   (2) MAKE THE RUN — actual forward velocity (what the sprint
+                //       gears are for). Together this pulls the whole line upfield
+                //       in unison the moment we win possession.
+                let is_carrier = matches!(w.owner, Some(o) if o.team == Team::A && o.idx == i);
+                if !is_carrier {
+                    let ahead = ((pos.x - w.ball.x) / 12.0).clamp(0.0, 1.0);
+                    let lane = w.lane_clearness(Team::A, w.ball, pos);
+                    let make_run = (w.a[i].vel.x / 8.5).clamp(0.0, 1.0); // fwd speed, ~run_fast = 1.0
+                    sp_t[i] += W_AHEAD * ahead * lane + W_MAKE_RUN * make_run;
+                }
             } else if their_phase {
                 // goalside of the ball: our goal is at x=0, so reward being at a
                 // LOWER x than the ball (between ball and own goal).
