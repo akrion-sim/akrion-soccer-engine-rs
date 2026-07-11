@@ -204,7 +204,12 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
             let pa = aprobs[a].max(1e-8);
             let slogits = policy.speedor.predict(&obs);
             let sprobs = masked_softmax(&slogits, &[true; NS]);
-            let s = rng.sample_categorical(&sprobs);
+            // Curriculum: fixed gear during warmup, sampled speed policy afterwards.
+            let s = if SPEED_FROZEN.load(Ordering::Relaxed) {
+                SPD_RUN_MED
+            } else {
+                rng.sample_categorical(&sprobs)
+            };
             let ps = sprobs[s].max(1e-8);
             obs_t[i] = obs;
             mask_t[i] = mask;
