@@ -250,7 +250,11 @@ fn inspect(seed: u64, out_dir: &Path) -> AppResult<()> {
         )
         .into());
     }
-    let policy = train::Policy { actor, critic };
+    let policy = train::Policy {
+        actor,
+        speedor,
+        critic,
+    };
     let mut rng = Rng::new(seed);
     let mut w = World::new();
     fs::create_dir_all(out_dir)?;
