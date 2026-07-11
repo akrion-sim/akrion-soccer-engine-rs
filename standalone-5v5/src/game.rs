@@ -629,7 +629,7 @@ impl World {
                 }
             }
         } else {
-            for a in A_CHASE..=A_STAY {
+            for a in A_CHASE..=A_GET_OPEN {
                 m[a] = true;
             }
         }
