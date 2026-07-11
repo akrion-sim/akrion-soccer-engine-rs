@@ -182,10 +182,10 @@ struct Sample {
     obs: [f32; OBS_DIM],       // decentralized actor observation
     gstate: [f32; GLOBAL_DIM], // centralized critic global state
     mask: [bool; NA],
-    action: usize,          // macro action (0..NA)
-    speed: usize,           // speed gear (0..NS)
-    old_logp_a: f32,        // ln p(action) at collection time
-    old_logp_s: f32,        // ln p(speed)  at collection time
+    action: usize,   // macro action (0..NA)
+    speed: usize,    // speed gear (0..NS)
+    old_logp_a: f32, // ln p(action) at collection time
+    old_logp_s: f32, // ln p(speed)  at collection time
     adv: f32,
     ret: f32,
 }
@@ -283,9 +283,9 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
         // dominate — so passing stays INSTRUMENTAL and the policy still attacks.
         if w.ev_pass_completed_a {
             let n = w.pass_streak_a; // completed passes so far in THIS possession
-            // Small flat credit (prefer a completed pass to a loose turnover) PLUS a
-            // forward-PROGRESS bonus. Progress is bounded by field length and lateral
-            // recycling gains ~0, so it can't be farmed by tiki-taka.
+                                     // Small flat credit (prefer a completed pass to a loose turnover) PLUS a
+                                     // forward-PROGRESS bonus. Progress is bounded by field length and lateral
+                                     // recycling gains ~0, so it can't be farmed by tiki-taka.
             r += rw().pass_credit + (w.last_pass_gain_a.max(0.0) * 0.1).min(0.6);
             // MILESTONE: the 2nd completed pass unlocks a legal shot. The pinball used
             // to farm this via pass-pass-shoot-repeat — now the SHOT COOLDOWN breaks
@@ -389,12 +389,14 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
                 // WIDTH: how far off the central lane (0 = center, 1 = touchline).
                 let wide = (pos.y - FIELD_W / 2.0).abs() / (FIELD_W / 2.0);
                 let width = wide - 0.4; // penalize the central lane, reward stretching
-                // FLANK affinity: convex bonus for genuinely committing to a
-                // left/right channel. With the 8-yd anti-bunch this splits the
-                // front line across BOTH flanks instead of clustering one side.
+                                        // FLANK affinity: convex bonus for genuinely committing to a
+                                        // left/right channel. With the 8-yd anti-bunch this splits the
+                                        // front line across BOTH flanks instead of clustering one side.
                 let flank = if wide > 0.5 { (wide - 0.5) * 2.0 } else { 0.0 };
-                sp_t[i] +=
-                    rw().advance * advance + rw().open * open + rw().width * width + rw().flank * flank;
+                sp_t[i] += rw().advance * advance
+                    + rw().open * open
+                    + rw().width * width
+                    + rw().flank * flank;
 
                 // ── THE KEY MARL BEHAVIOUR ─────────────────────────────────────
                 // When a TEAMMATE has the ball, the other attackers must run/sprint
@@ -746,7 +748,8 @@ pub fn train_iter(policy: &mut Policy, games: usize, ent_beta: f32, rng: &mut Rn
                 for k in 0..NS {
                     let ind = if k == s.speed { 1.0 } else { 0.0 };
                     let pg = -coeff_s * (ind - sprobs[k]);
-                    let eg = ent_beta * SPEED_ENT_SCALE * sprobs[k] * (sprobs[k].max(1e-8).ln() + ent_s);
+                    let eg =
+                        ent_beta * SPEED_ENT_SCALE * sprobs[k] * (sprobs[k].max(1e-8).ln() + ent_s);
                     d_slogits[k] = pg + eg;
                 }
                 policy.speedor.backward(&sacts, &d_slogits);

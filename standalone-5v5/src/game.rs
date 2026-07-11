@@ -29,10 +29,11 @@ pub const SPD_STAND: usize = 0;
 pub const SPD_WALK: usize = 1;
 pub const SPD_JOG: usize = 2;
 pub const SPD_SKIP: usize = 3;
-pub const SPD_RUN_MED: usize = 4;
+pub const SPD_RUN_SLOW: usize = 4;
+pub const SPD_RUN_MED: usize = SPD_RUN_SLOW;
 pub const SPD_RUN_FAST: usize = 5;
 pub const SPD_SPRINT: usize = 6;
-// stand · walk · jog · skip · run_med · run_fast · full_sprint
+// still · walk · jog · skip · run_slow · run_fast · sprint
 // Low end kept non-crippling (a slow gear still lets you get around) so the speed
 // policy's exploration can't paralyze the game; STAND is the only truly-still gear.
 const SPEEDS: [f32; NS] = [0.0, 3.0, 4.5, 5.5, 6.5, 8.5, 11.0];
@@ -182,6 +183,8 @@ pub struct World {
     pub ev_goal_b: bool,
     pub ev_pass_completed_a: bool,
     pub ev_turnover_a: bool,          // Team A lost possession to B
+    pub ev_bad_pass_turnover_a: bool, // Team A pass was intercepted or captured by B
+    pub ev_dribble_turnover_a: bool,  // Team A carrier was tackled while dribbling/carrying
     pub ev_shot_on_a: bool,           // Team A took a shot on target
     pub ev_win_ball_a: bool,          // Team A won possession off Team B (interception/tackle)
     pub ev_pass_attempt_a: bool,      // Team A attempted a pass this tick
@@ -241,6 +244,8 @@ impl World {
             ev_goal_b: false,
             ev_pass_completed_a: false,
             ev_turnover_a: false,
+            ev_bad_pass_turnover_a: false,
+            ev_dribble_turnover_a: false,
             ev_shot_on_a: false,
             ev_win_ball_a: false,
             ev_pass_attempt_a: false,
@@ -356,7 +361,16 @@ impl World {
                 continue;
             }
             // reward forward + open, penalize very long/backward balls
-            let score = fwd * 0.6 + opp_d.min(15.0) * 0.8 - (dist * 0.05).max(0.0);
+            let mut score = fwd * 0.6 + opp_d.min(15.0) * 0.8 - (dist * 0.05).max(0.0);
+            if from_idx as i32 == self.lp_to && i as i32 == self.lp_from {
+                // Structural anti-ping-pong: keep the return ball legal, but make
+                // the ranker prefer a third-player outlet unless the return is
+                // genuinely the only safe option.
+                score -= 8.0;
+                if fwd < 3.0 {
+                    score -= 6.0;
+                }
+            }
             scored.push((i, score));
         }
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
@@ -608,6 +622,10 @@ impl World {
     /// Legal-action mask for one player (on-ball vs off-ball families).
     pub fn legal_mask(&self, team: Team, idx: usize) -> [bool; NA] {
         let has_ball = matches!(self.owner, Some(o) if o.team == team && o.idx == idx);
+        let team_owns = matches!(self.owner, Some(o) if o.team == team);
+        let opp_owns = matches!(self.owner, Some(o) if o.team != team);
+        let our_phase = team_owns || (self.owner.is_none() && self.last_touch == Some(team));
+        let their_phase = opp_owns || (self.owner.is_none() && self.last_touch == Some(team.other()));
         let mut m = [false; NA];
         if has_ball {
             for a in A_SHOOT..=A_HOLD {
@@ -637,12 +655,86 @@ impl World {
                 }
             }
         } else {
-            // GET_OPEN held back until the base (v3 + learnable speeds) is solid.
-            for a in A_CHASE..=A_STAY {
-                m[a] = true;
+            if our_phase {
+                // In possession, off-ball players should either burst into support
+                // lanes/get-open targets or hold rest-defense shape. Chasing the
+                // ball carrier is not a useful attacking decision.
+                m[A_SUPPORT] = true;
+                m[A_SPREAD] = true;
+                m[A_MARK] = true;
+                m[A_STAY] = true;
+                m[A_GET_OPEN] = true;
+                if self.owner.is_none() {
+                    m[A_CHASE] = true;
+                }
+            } else if their_phase {
+                // In dispossession, remove attacking-support actions from the
+                // legal set; defenders choose between pressing and recovering
+                // goalside.
+                m[A_CHASE] = true;
+                m[A_MARK] = true;
+                m[A_STAY] = true;
+            } else {
+                for a in A_CHASE..=A_STAY {
+                    m[a] = true;
+                }
             }
         }
         m
+    }
+
+    pub fn speed_mask(&self, team: Team, idx: usize, action: usize) -> [bool; NS] {
+        let mut mask = [true; NS];
+        let only = |mask: &mut [bool; NS], gear: usize| {
+            for (idx, ok) in mask.iter_mut().enumerate() {
+                *ok = idx == gear;
+            }
+        };
+        let min_gear = |mask: &mut [bool; NS], gear: usize| {
+            for (idx, ok) in mask.iter_mut().enumerate() {
+                *ok = idx >= gear;
+            }
+        };
+
+        if idx == GK {
+            only(&mut mask, SPD_STAND);
+            return mask;
+        }
+
+        let is_owner = matches!(self.owner, Some(o) if o.team == team && o.idx == idx);
+        let team_owns = matches!(self.owner, Some(o) if o.team == team);
+        let opp_owns = matches!(self.owner, Some(o) if o.team != team);
+        let our_phase = team_owns || (self.owner.is_none() && self.last_touch == Some(team));
+        let their_phase = opp_owns || (self.owner.is_none() && self.last_touch == Some(team.other()));
+
+        if matches!(action, A_SHOOT | A_PASS_A | A_PASS_B | A_PASS_C | A_CLEAR | A_HOLD | A_STAY) {
+            only(&mut mask, SPD_STAND);
+        } else if is_owner && matches!(action, A_DRIB_FWD | A_DRIB_LEFT | A_DRIB_RIGHT) {
+            min_gear(&mut mask, SPD_WALK);
+        } else if !is_owner && our_phase && matches!(action, A_SUPPORT | A_GET_OPEN) {
+            min_gear(&mut mask, SPD_RUN_FAST);
+        } else if !is_owner && our_phase && action == A_SPREAD {
+            min_gear(&mut mask, SPD_RUN_SLOW);
+        } else if !is_owner && their_phase && matches!(action, A_CHASE | A_MARK) {
+            min_gear(&mut mask, SPD_RUN_FAST);
+        } else if !is_owner && matches!(action, A_CHASE | A_SUPPORT | A_SPREAD | A_MARK | A_GET_OPEN) {
+            min_gear(&mut mask, SPD_RUN_SLOW);
+        }
+        mask
+    }
+
+    pub fn coerce_speed_gear(&self, team: Team, idx: usize, action: usize, gear: usize) -> usize {
+        let mask = self.speed_mask(team, idx, action);
+        let gear = gear.min(NS - 1);
+        if mask[gear] {
+            return gear;
+        }
+        mask.iter()
+            .enumerate()
+            .skip(gear)
+            .find_map(|(idx, ok)| ok.then_some(idx))
+            .or_else(|| mask.iter().position(|&ok| ok))
+            .unwrap_or(SPD_STAND)
     }
 
     // ---------------------------------------------------------------------
@@ -654,6 +746,8 @@ impl World {
         self.ev_goal_b = false;
         self.ev_pass_completed_a = false;
         self.ev_turnover_a = false;
+        self.ev_bad_pass_turnover_a = false;
+        self.ev_dribble_turnover_a = false;
         self.ev_shot_on_a = false;
         self.ev_win_ball_a = false;
         self.ev_pass_attempt_a = false;
@@ -682,7 +776,7 @@ impl World {
                 // Actions are packed as `action + speed*NA` so the speed gear rides
                 // along without changing the step signature. Unpack both here.
                 let a = acts[i] % NA;
-                let spd = (acts[i] / NA).min(NS - 1);
+                let spd = self.coerce_speed_gear(team, i, a, (acts[i] / NA).min(NS - 1));
                 let is_owner = matches!(self.owner, Some(o) if o.team == team && o.idx == i);
                 if is_owner {
                     if let Some(k) = self.apply_on_ball(team, i, a, spd, rng) {
@@ -884,6 +978,7 @@ impl World {
                         self.pending_passer = -1;
                     } else {
                         self.ev_turnover_a = true; // A pass intercepted by B
+                        self.ev_bad_pass_turnover_a = true;
                         self.pass_streak_a = 0;
                         self.reset_a_pass_memory();
                         self.b_pass_streak = 1; // B started a possession by intercepting
@@ -902,6 +997,7 @@ impl World {
                 }
             } else if matches!(prev_touch, Some(Team::A)) && o.team == Team::B {
                 self.ev_turnover_a = true;
+                self.ev_bad_pass_turnover_a = self.pending_pass.is_some();
                 self.pass_streak_a = 0;
                 self.reset_a_pass_memory();
                 self.b_pass_streak = 1; // B possession begins
@@ -937,6 +1033,7 @@ impl World {
             };
             if o.team == Team::A {
                 self.ev_turnover_a = true; // A dispossessed
+                self.ev_dribble_turnover_a = true;
                 self.b_pass_streak = 1; // B possession begins
             } else {
                 self.ev_win_ball_a = true; // A tackled the ball off B
@@ -1182,6 +1279,7 @@ impl World {
     fn apply_off_ball(&mut self, team: Team, idx: usize, a: usize, spd: usize) {
         let me = players(team, self)[idx].pos;
         let team_owns = matches!(self.owner, Some(o) if o.team == team);
+        let spd = self.coerce_speed_gear(team, idx, a, spd);
         let target = match a {
             // CHASE: anticipate. If the ball is moving (a pass/loose ball), aim at
             // the INTERCEPT point on its trajectory — where the defender can meet
@@ -1196,10 +1294,14 @@ impl World {
             }
             // MARK: drop DOWNFIELD, goal-side of the nearest opponent (defend).
             A_MARK => {
-                let (oi, _) = self.nearest_opponent(team, me);
-                let opp = players(team.other(), self)[oi].pos;
-                let own_goal = team.own_goal();
-                opp.add(own_goal.sub(opp).unit().scale(2.5))
+                if team_owns {
+                    let (oi, _) = self.nearest_opponent(team, me);
+                    let opp = players(team.other(), self)[oi].pos;
+                    let own_goal = team.own_goal();
+                    opp.add(own_goal.sub(opp).unit().scale(2.5))
+                } else {
+                    self.goalside_recovery_target(team, idx)
+                }
             }
             // GET_OPEN: MPC-lite lane opener — move to the relocation that best
             // opens a passing lane from the ball (the POMDP picks it, MPC aims it).
@@ -1214,6 +1316,21 @@ impl World {
             dir.unit().scale(speed_val(spd, false))
         };
         self.set_vel(team, idx, v);
+    }
+
+    fn goalside_recovery_target(&self, team: Team, idx: usize) -> V2 {
+        let me = players(team, self)[idx].pos;
+        let own_goal = team.own_goal();
+        let ball_goal_side = self.ball.add(own_goal.sub(self.ball).unit().scale(4.0));
+        let (oi, _) = self.nearest_opponent(team, me);
+        let opp = players(team.other(), self)[oi].pos;
+        let opp_goal_side = opp.add(own_goal.sub(opp).unit().scale(3.0));
+        let urgency = ((self.ball.x - me.x) * team.sx()).max(0.0) / FIELD_L;
+        let blend = urgency.clamp(0.25, 0.75);
+        V2::new(
+            (ball_goal_side.x * blend + opp_goal_side.x * (1.0 - blend)).clamp(2.0, FIELD_L - 2.0),
+            (ball_goal_side.y * blend + opp_goal_side.y * (1.0 - blend)).clamp(2.0, FIELD_W - 2.0),
+        )
     }
 
     /// "Move where there is space." Samples a ring of candidate points around
@@ -1377,7 +1494,7 @@ impl World {
                 };
             }
             // pack a sensible gear for the baseline so it moves at realistic speeds.
-            acts[i] += scripted_gear(acts[i]) * NA;
+            acts[i] += self.coerce_speed_gear(team, i, acts[i], scripted_gear(acts[i])) * NA;
         }
         acts
     }
