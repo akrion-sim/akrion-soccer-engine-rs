@@ -70,7 +70,8 @@ fn spacing_reward(d: f32) -> f32 {
 
 #[derive(Clone)]
 pub struct Policy {
-    pub actor: Mlp,
+    pub actor: Mlp,   // action policy: OBS_DIM -> 64 -> 64 -> NA (identical to v3)
+    pub speedor: Mlp, // SEPARATE speed policy: OBS_DIM -> 32 -> NS (own network)
     pub critic: Mlp,
 }
 
@@ -78,10 +79,12 @@ impl Policy {
     pub fn new(rng: &mut Rng) -> Self {
         Policy {
             // decentralized actor (per-agent field vector) + CENTRALIZED critic
-            // (global state) = MAPPO / CTDE. The actor has TWO heads packed into one
-            // output vector: the first NA are the macro-action logits (masked), the
-            // last NS are the speed-gear logits (unmasked).
-            actor: Mlp::new(&[OBS_DIM, 64, 64, NA + NS], rng),
+            // (global state) = MAPPO / CTDE. The speed gear is a SEPARATE small
+            // network so its gradients can't corrupt the action policy's shared
+            // features (a joint output head did exactly that — the action policy
+            // stopped learning to attack).
+            actor: Mlp::new(&[OBS_DIM, 64, 64, NA], rng),
+            speedor: Mlp::new(&[OBS_DIM, 32, NS], rng),
             critic: Mlp::new(&[GLOBAL_DIM, 128, 64, 1], rng),
         }
     }
@@ -90,8 +93,7 @@ impl Policy {
     /// PACKED action `action + speed*NA` ready to hand to `World::step`.
     pub fn act_greedy(&self, obs: &[f32], mask: &[bool; NA]) -> usize {
         let logits = self.actor.predict(obs);
-        debug_assert_eq!(logits.len(), NA + NS);
-        let probs = masked_softmax(&logits[0..NA], mask);
+        let probs = masked_softmax(&logits, mask);
         let mut bi = 0;
         let mut bp = -1.0;
         for i in 0..NA {
@@ -101,14 +103,14 @@ impl Policy {
             }
         }
         // greedy speed gear (argmax over the MOVING gears). We skip SPD_STAND (0)
-        // at eval so a near-flat speed head can't tie-break the whole team into
-        // standing still — standing is essentially never the right greedy choice,
-        // and this removes a degenerate "frozen evaluation" artifact.
+        // at eval so a near-flat speed policy can't tie-break the team into standing
+        // still — standing is essentially never the right greedy choice.
+        let slogits = self.speedor.predict(obs);
         let mut bs = SPD_WALK;
         let mut bsp = f32::NEG_INFINITY;
         for k in SPD_WALK..NS {
-            if logits[NA + k] > bsp {
-                bsp = logits[NA + k];
+            if slogits[k] > bsp {
+                bsp = slogits[k];
                 bs = k;
             }
         }
