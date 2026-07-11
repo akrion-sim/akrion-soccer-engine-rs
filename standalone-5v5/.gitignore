@@ -2,5 +2,3 @@ target/
 out/
 out_train.log
 viz/index.html
-out_*.log
-out/

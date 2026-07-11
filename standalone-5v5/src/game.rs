@@ -9,47 +9,14 @@ use crate::rng::Rng;
 pub const FIELD_L: f32 = 42.0;
 pub const FIELD_W: f32 = 28.0;
 pub const GOAL_HALF: f32 = 3.5; // half goal-mouth width in y (~7m net)
-pub const FINAL_THIRD_X: f32 = FIELD_L * 2.0 / 3.0; // attacking-third boundary (kept for reference)
-pub const SHOOT_X: f32 = FIELD_L / 2.0; // A may shoot once in the OPPONENT'S HALF (not just the final third)
 pub const N: usize = 5; // players per team (index 0 == goalkeeper)
 pub const GK: usize = 0; // goalkeeper index; controlled by a fixed rule, not the policy
 pub const DT: f32 = 0.05; // seconds per decision tick -> 20 Hz sim (real-time 20 fps)
 pub const HZ: f32 = 1.0 / DT; // ticks per second (for real-time viewer playback)
 pub const STEPS: usize = 600; // ticks per game (~30s at 20 Hz)
 
-const PLAYER_SPEED: f32 = 6.5; // legacy reference speed (~= run_medium); kept for keeper reach/util
-
-// ---- Player gears -----------------------------------------------------------
-// Seven discrete speeds the policy can pick for any movement/dribble, from
-// standing still to a full sprint. Sim units are yards/second; the top gear is
-// scaled so a full sprint ~= 26 mph (the human ceiling) and, while carrying the
-// ball, gears are capped at BALL_SPEED_CAP ~= 22 mph.
-pub const NS: usize = 7; // number of speed gears (the speed action head)
-pub const SPD_STAND: usize = 0;
-pub const SPD_WALK: usize = 1;
-pub const SPD_JOG: usize = 2;
-pub const SPD_SKIP: usize = 3;
-pub const SPD_RUN_MED: usize = 4;
-pub const SPD_RUN_FAST: usize = 5;
-pub const SPD_SPRINT: usize = 6;
-// stand · walk · jog · skip · run_med · run_fast · full_sprint
-// Low end kept non-crippling (a slow gear still lets you get around) so the speed
-// policy's exploration can't paralyze the game; STAND is the only truly-still gear.
-const SPEEDS: [f32; NS] = [0.0, 3.0, 4.5, 5.5, 6.5, 8.5, 11.0];
-// Ball-carrying is much slower than open-field running (you can't sprint flat-out
-// with the ball at your feet) — and, critically, keeping it near v3's control
-// speed stops the policy from dribbling forever to evade the 2-pass shot gate.
-const BALL_SPEED_CAP: f32 = 4.8;
-
-/// Map a speed gear to yards/second, capping ball-carrying to ~22 mph.
-fn speed_val(gear: usize, carrying: bool) -> f32 {
-    let s = SPEEDS[gear.min(NS - 1)];
-    if carrying {
-        s.min(BALL_SPEED_CAP)
-    } else {
-        s
-    }
-}
+const PLAYER_SPEED: f32 = 6.5;
+const DRIBBLE_SPEED: f32 = 4.6; // carrying the ball is slower than a pass or a run
 const CONTROL_RADIUS: f32 = 1.5; // secure a received ball -> possessions can develop
 const RECEIVE_RADIUS: f32 = 2.8; // intended pass receiver collects from further out
 const TACKLE_RADIUS: f32 = 1.6;
@@ -63,36 +30,31 @@ const KEEPER_REACH: f32 = 1.9; // keeper saves spam; well-placed shots still bea
 const KEEPER_SPEED: f32 = 6.0;
 
 // ---- Action space -----------------------------------------------------------
-pub const NA: usize = 15;
+pub const NA: usize = 13;
 pub const A_SHOOT: usize = 0;
 pub const A_PASS_A: usize = 1;
 pub const A_PASS_B: usize = 2;
-pub const A_PASS_C: usize = 3;
-pub const A_DRIB_FWD: usize = 4;
-pub const A_DRIB_LEFT: usize = 5;
-pub const A_DRIB_RIGHT: usize = 6;
-pub const A_CLEAR: usize = 7;
-pub const A_HOLD: usize = 8;
-pub const A_CHASE: usize = 9;
-pub const A_SUPPORT: usize = 10;
-pub const A_SPREAD: usize = 11;
-pub const A_MARK: usize = 12;
-pub const A_STAY: usize = 13;
-// GET_OPEN: the POMDP decision to move wide and OPEN A PASSING LANE. The target
-// is computed by a short-horizon MPC search (see mpc_open_lane_target).
-pub const A_GET_OPEN: usize = 14;
-pub const PASS_TARGET_SLOTS: usize = N - 2; // outfield teammates minus the possessor
+pub const A_DRIB_FWD: usize = 3;
+pub const A_DRIB_LEFT: usize = 4;
+pub const A_DRIB_RIGHT: usize = 5;
+pub const A_CLEAR: usize = 6;
+pub const A_HOLD: usize = 7;
+pub const A_CHASE: usize = 8;
+pub const A_SUPPORT: usize = 9;
+pub const A_SPREAD: usize = 10;
+pub const A_MARK: usize = 11;
+pub const A_STAY: usize = 12;
 
 // Full relational field vector (per-agent actor observation): 9 self/global +
-// 5 ball + 5 goals + 6 role/cues + (N-1)*5 teammates + N*5 opponents + 1 bias.
-pub const OBS_DIM: usize = 71;
+// 5 ball + 5 goals + 5 role/cues + (N-1)*5 teammates + N*5 opponents + 1 bias.
+pub const OBS_DIM: usize = 70;
 
 // Centralized-critic GLOBAL state (MAPPO / CTDE): the whole field in a single
 // canonical (Team-A attack) frame — every player's pos+vel + ball pos+vel +
 // possession, shared by all agents. 2N*4 players + 4 ball + 3 possession + 1 bias.
 pub const GLOBAL_DIM: usize = 2 * N * 4 + 4 + 3 + 1; // = 40 + 4 + 3 + 1 = 48
 
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Default)]
 pub struct V2 {
     pub x: f32,
     pub y: f32,
@@ -188,27 +150,12 @@ pub struct World {
     pub pass_dir_a: i32,              // direction of that pass: 1 forward, 0 lateral, -1 backward
     pub ev_shot_attempt_a: bool,      // Team A took a shot this tick
     pub last_shot_quality_a: f32,     // placement quality of A's last shot, ~[0,1] (MPC finish)
-    pub last_shot_xg_a: f32,          // POSITION quality (xG-like: distance+angle to goal), ~[0,1]
     pending_pass: Option<Owner>,      // intended receiver of an in-flight pass
     intended_receiver: Option<Owner>, // scratch set during apply_on_ball
     pass_kick_x: f32,                 // ball x when Team A last released a pass
     pub last_pass_gain_a: f32,        // forward metres gained by the last completed A pass
     pub pass_streak_a: u32,           // completed A passes in the current possession (2-pass rule)
-    pub fwd_pass_streak_a: u32, // consecutive completed FORWARD A passes (progressive build-up)
-    pub shoot_cooldown_a: u32,  // ticks until an A shot counts as a "fresh" chance again
-    pub shot_was_rapid_a: bool, // this tick's A shot came while the cooldown was still active
-    a_shot_flag: bool,          // the current free ball came from a Team-A shot (gates goals)
-    lp_from: i32,               // passer index of the last completed A pass
-    lp_to: i32,                 // receiver index of the last completed A pass
-    pending_passer: i32,        // passer index of the in-flight A pass
-    pub return_streak_a: u32,   // consecutive "pass back to the giver" (ping-pong) count
-    pub ev_return_pass_a: bool, // this tick's A pass went back to the giver (ping-pong)
-    pub return_start_x: f32,    // ball x when the current return sequence began
-    pub ev_dribble_fwd_a: bool, // A carrier dribbled forward this tick
-    pub ev_dribble_lat_a: bool, // A carrier dribbled laterally this tick
-    // Symmetric goal rules for Team B (so the opponent must build up too):
-    b_pass_streak: u32, // completed B passes in the current possession
-    b_shot_flag: bool,  // free ball came from a VALID B shot (2 passes + final third)
+    a_shot_flag: bool,                // the current free ball came from a Team-A shot (gates goals)
 }
 
 fn players(team: Team, w: &World) -> &[Player; N] {
@@ -247,26 +194,12 @@ impl World {
             pass_dir_a: 0,
             ev_shot_attempt_a: false,
             last_shot_quality_a: 0.0,
-            last_shot_xg_a: 0.0,
             pending_pass: None,
             intended_receiver: None,
             pass_kick_x: 0.0,
             last_pass_gain_a: 0.0,
             pass_streak_a: 0,
-            fwd_pass_streak_a: 0,
-            shoot_cooldown_a: 0,
-            shot_was_rapid_a: false,
             a_shot_flag: false,
-            lp_from: -1,
-            lp_to: -1,
-            pending_passer: -1,
-            return_streak_a: 0,
-            ev_return_pass_a: false,
-            return_start_x: 0.0,
-            ev_dribble_fwd_a: false,
-            ev_dribble_lat_a: false,
-            b_pass_streak: 0,
-            b_shot_flag: false,
         };
         w.kickoff(Team::A);
         w
@@ -295,18 +228,6 @@ impl World {
         self.pending_pass = None;
         self.pass_streak_a = 0;
         self.a_shot_flag = false;
-        self.b_pass_streak = 0;
-        self.b_shot_flag = false;
-        self.reset_a_pass_memory();
-    }
-
-    fn reset_a_pass_memory(&mut self) {
-        self.lp_from = -1;
-        self.lp_to = -1;
-        self.pending_passer = -1;
-        self.return_streak_a = 0;
-        self.return_start_x = 0.0;
-        self.fwd_pass_streak_a = 0;
     }
 
     fn player(&self, o: Owner) -> Player {
@@ -333,13 +254,9 @@ impl World {
         self.nearest_player(team.other(), p)
     }
 
-    // -- pass-target ranking: pick every outfield teammate for the possessor ---
+    // -- pass-target ranking: pick two candidate teammates for the possessor ---
     // Score favors forward progress (toward attacked goal) and openness.
-    fn pass_candidates(
-        &self,
-        team: Team,
-        from_idx: usize,
-    ) -> [Option<(usize, f32)>; PASS_TARGET_SLOTS] {
+    fn pass_candidates(&self, team: Team, from_idx: usize) -> [Option<(usize, f32)>; 2] {
         let ps = players(team, self);
         let from = ps[from_idx].pos;
         let sx = team.sx();
@@ -360,69 +277,19 @@ impl World {
             scored.push((i, score));
         }
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        let mut out = [None; PASS_TARGET_SLOTS];
-        for (slot, cand) in scored.into_iter().take(PASS_TARGET_SLOTS).enumerate() {
-            out[slot] = Some(cand);
+        let mut out = [None, None];
+        if !scored.is_empty() {
+            out[0] = Some(scored[0]);
+        }
+        if scored.len() > 1 {
+            out[1] = Some(scored[1]);
         }
         out
     }
 
-    /// Where a defender at `from` should move to INTERCEPT the ball: simulate the
-    /// ball's future trajectory (with friction) and return the earliest point the
-    /// defender can physically reach — anticipation, so passes get cut out. For a
-    /// slow/owned ball it just returns the ball (go challenge the carrier).
-    pub fn intercept_point(&self, from: V2) -> V2 {
-        if self.ball_vel.len() < 3.0 {
-            return self.ball;
-        }
-        let mut bpos = self.ball;
-        let mut bvel = self.ball_vel;
-        for step in 1..40 {
-            bpos = bpos.add(bvel.scale(DT));
-            bvel = bvel.scale(BALL_FRICTION);
-            let reach = PLAYER_SPEED * (step as f32 * DT) + CONTROL_RADIUS;
-            if from.sub(bpos).len() <= reach {
-                return bpos; // can meet the ball here
-            }
-        }
-        bpos // uncatchable — head to where it ends up
-    }
-
-    /// Classify a Team-A dribble by the FINAL (post-shielding) direction, so the
-    /// forward-dribble reward reflects actual movement — a shield that bends the
-    /// carry sideways/backward is NOT credited as forward. Forward = x·sx > 0.3,
-    /// lateral = within ±0.3, backward = < −0.3 (no event → no reward).
-    fn note_dribble(&mut self, team: Team, dir: V2, sx: f32) {
-        if team != Team::A {
-            return;
-        }
-        let fwd = dir.x * sx;
-        if fwd > 0.3 {
-            self.ev_dribble_fwd_a = true;
-        } else if fwd > -0.3 {
-            self.ev_dribble_lat_a = true;
-        }
-    }
-
-    /// Dribble direction that veers AWAY from a close defender (shielding) while
-    /// keeping the intended direction when there's space.
-    fn shielded_dribble_dir(&self, team: Team, me: V2, intended: V2) -> V2 {
-        let intended = intended.unit();
-        let (oi, od) = self.nearest_opponent(team, me);
-        if od < 4.0 {
-            let away = me.sub(players(team.other(), self)[oi].pos).unit();
-            let blend = ((4.0 - od) / 4.0).clamp(0.0, 1.0); // 1 when defender is on top
-            let d = intended.scale(1.0 - 0.7 * blend).add(away.scale(blend));
-            d.unit()
-        } else {
-            intended
-        }
-    }
-
     /// Fraction of the lane from `from` to `to` clear of outfield opponents
-    /// (0..1, 1 = fully clear). The keeper is excluded — it is scored separately
-    /// in finishing. Used to define a truly OPEN receiver (clear passing lane).
-    pub fn lane_clearness(&self, team: Team, from: V2, to: V2) -> f32 {
+    /// (0..1). The keeper is excluded — it is scored separately in finishing.
+    fn lane_clearness(&self, team: Team, from: V2, to: V2) -> f32 {
         let dir = to.sub(from);
         let dist = dir.len();
         if dist < 1e-3 {
@@ -513,7 +380,7 @@ impl World {
         let cands = self.pass_candidates(team, idx);
         let open_of =
             |c: Option<(usize, f32)>| c.map(|(_, s)| (s / 15.0).clamp(-1.0, 1.0)).unwrap_or(-1.0);
-        let (aopen, bopen, copen) = (open_of(cands[0]), open_of(cands[1]), open_of(cands[2]));
+        let (aopen, bopen) = (open_of(cands[0]), open_of(cands[1]));
 
         // role: is this the closest outfielder to the ball, and its ball-distance rank
         let my_ball_d = me.pos.sub(self.ball).len();
@@ -571,13 +438,12 @@ impl World {
         f.push(goal.sub(mp).len() / nx);
         f.push((own.x - mp.x) / nx);
         f.push((own.y - mp.y) / ny);
-        // role + action cues (6)
+        // role + action cues (5)
         f.push(is_closest);
         f.push(ball_rank);
         f.push(shot_clear);
         f.push(aopen);
         f.push(bopen);
-        f.push(copen);
         // ALL teammates, nearest-first (N-1 = 4 × 5 = 20)
         for &k in &tm {
             let p = players(team, self)[k];
@@ -613,31 +479,16 @@ impl World {
             for a in A_SHOOT..=A_HOLD {
                 m[a] = true;
             }
-            let cands = self.pass_candidates(team, idx);
-            // Later pass-target actions are only legal when those ranked outlets exist.
-            if cands[1].is_none() {
+            // PASS_B only legal if a 2nd candidate exists.
+            if self.pass_candidates(team, idx)[1].is_none() {
                 m[A_PASS_B] = false;
-            }
-            if cands[2].is_none() {
-                m[A_PASS_C] = false;
             }
             // 2-PASS RULE (Team A): no shooting until 2 completed passes this
             // possession — forces build-up play, not solo dribble-and-shoot.
-            // OPPONENT-HALF RULE (Team A): may shoot anywhere in the opponent's half.
-            if team == Team::A {
-                let x = players(team, self)[idx].pos.x;
-                if self.pass_streak_a < 2 || x < SHOOT_X {
-                    m[A_SHOOT] = false;
-                }
-            } else {
-                // Symmetric shooting gate for the scripted/noisy opponent.
-                let x = players(team, self)[idx].pos.x;
-                if self.b_pass_streak < 2 || x > FIELD_L - SHOOT_X {
-                    m[A_SHOOT] = false;
-                }
+            if team == Team::A && self.pass_streak_a < 2 {
+                m[A_SHOOT] = false;
             }
         } else {
-            // GET_OPEN held back until the base (v3 + learnable speeds) is solid.
             for a in A_CHASE..=A_STAY {
                 m[a] = true;
             }
@@ -658,11 +509,6 @@ impl World {
         self.ev_win_ball_a = false;
         self.ev_pass_attempt_a = false;
         self.ev_shot_attempt_a = false;
-        self.ev_return_pass_a = false;
-        self.ev_dribble_fwd_a = false;
-        self.ev_dribble_lat_a = false;
-        self.shot_was_rapid_a = false;
-        self.shoot_cooldown_a = self.shoot_cooldown_a.saturating_sub(1);
 
         let ball_x_before = self.ball.x;
 
@@ -679,17 +525,14 @@ impl World {
                     }
                     continue;
                 }
-                // Actions are packed as `action + speed*NA` so the speed gear rides
-                // along without changing the step signature. Unpack both here.
-                let a = acts[i] % NA;
-                let spd = (acts[i] / NA).min(NS - 1);
+                let a = acts[i];
                 let is_owner = matches!(self.owner, Some(o) if o.team == team && o.idx == i);
                 if is_owner {
-                    if let Some(k) = self.apply_on_ball(team, i, a, spd, rng) {
+                    if let Some(k) = self.apply_on_ball(team, i, a, rng) {
                         kick = Some(k);
                     }
                 } else {
-                    self.apply_off_ball(team, i, a, spd);
+                    self.apply_off_ball(team, i, a);
                 }
             }
         }
@@ -721,27 +564,15 @@ impl World {
                 // applies symmetrically. pending_pass.team == the passing team.
                 self.pending_pass = self.intended_receiver;
                 if kicker.team == Team::A {
-                    self.pending_passer = kicker.idx as i32;
                     // A attacks +x, so ball.x IS attack-frame forward progress.
                     self.pass_kick_x = self.player(kicker).pos.x;
                 }
-            } else if kicker.team == Team::A {
-                self.reset_a_pass_memory();
             }
         } else if let Some(o) = self.owner {
-            // carry: normally glued just ahead; but if a defender is close, SHIELD
-            // the ball — hold it on the far side of the body from the defender.
+            // carry: ball glued just ahead of the owner in their attack direction.
             let p = self.player(o);
-            let (oi, od) = self.nearest_opponent(o.team, p.pos);
-            let offset = if od < 3.0 {
-                p.pos
-                    .sub(players(o.team.other(), self)[oi].pos)
-                    .unit()
-                    .scale(0.8)
-            } else {
-                V2::new(o.team.sx(), 0.0).scale(0.8)
-            };
-            self.ball = p.pos.add(offset);
+            let ahead = V2::new(o.team.sx(), 0.0).scale(0.8);
+            self.ball = p.pos.add(ahead);
             self.ball_vel = p.vel;
         }
 
@@ -771,8 +602,7 @@ impl World {
                     self.goal_kick(Team::B); // B restarts from its own line
                 }
             } else if self.ball.x <= 0.0 {
-                if self.ball.y > gy0 && self.ball.y < gy1 && self.b_shot_flag {
-                    // symmetric: B goal only counts from a valid (2-pass, final-third) shot
+                if self.ball.y > gy0 && self.ball.y < gy1 {
                     self.goals_b += 1;
                     self.ev_goal_b = true;
                     self.kickoff(Team::A);
@@ -801,9 +631,6 @@ impl World {
         self.kick_timer = 0;
         self.pass_streak_a = 0;
         self.a_shot_flag = false;
-        self.b_pass_streak = 0;
-        self.b_shot_flag = false;
-        self.reset_a_pass_memory();
     }
 
     fn try_capture(&mut self) {
@@ -864,52 +691,29 @@ impl World {
             let prev_touch = self.last_touch;
             self.owner = Some(o);
             self.a_shot_flag = false; // shot resolved into possession
-            self.b_shot_flag = false;
-            // Team-A reward events. pending_pass.team is the PASSING team.
+                                      // Team-A reward events. pending_pass.team is the PASSING team.
             if let Some(pp) = self.pending_pass {
                 if pp.team == Team::A {
                     if o.team == Team::A {
                         self.ev_pass_completed_a = true; // A pass reached an A player
                         self.last_pass_gain_a = self.ball.x - self.pass_kick_x;
                         self.pass_streak_a += 1; // toward the 2-pass rule
-                                                 // consecutive FORWARD passes (progressive build-up)
-                        if self.last_pass_gain_a > 3.0 {
-                            self.fwd_pass_streak_a += 1;
-                        } else {
-                            self.fwd_pass_streak_a = 0;
-                        }
-                        // record the passer->receiver of this completed A pass
-                        self.lp_from = self.pending_passer;
-                        self.lp_to = o.idx as i32;
-                        self.pending_passer = -1;
                     } else {
                         self.ev_turnover_a = true; // A pass intercepted by B
                         self.pass_streak_a = 0;
-                        self.reset_a_pass_memory();
-                        self.b_pass_streak = 1; // B started a possession by intercepting
                     }
                 }
-                if pp.team == Team::B {
-                    if o.team == Team::B {
-                        self.b_pass_streak += 1; // B built up (symmetric 2-pass rule)
-                    } else {
-                        // a B pass intercepted by A is a good steal
-                        self.ev_win_ball_a = true;
-                        self.pass_streak_a = 0; // fresh possession
-                        self.reset_a_pass_memory();
-                        self.b_pass_streak = 0;
-                    }
+                // a B pass intercepted by A is a good steal
+                if pp.team == Team::B && o.team == Team::A {
+                    self.ev_win_ball_a = true;
+                    self.pass_streak_a = 0; // fresh possession
                 }
             } else if matches!(prev_touch, Some(Team::A)) && o.team == Team::B {
                 self.ev_turnover_a = true;
                 self.pass_streak_a = 0;
-                self.reset_a_pass_memory();
-                self.b_pass_streak = 1; // B possession begins
             } else if matches!(prev_touch, Some(Team::B)) && o.team == Team::A {
                 self.ev_win_ball_a = true; // won a loose ball off B
                 self.pass_streak_a = 0;
-                self.reset_a_pass_memory();
-                self.b_pass_streak = 0;
             }
             self.last_touch = Some(o.team);
             self.pending_pass = None;
@@ -918,12 +722,6 @@ impl World {
     }
 
     fn try_tackle(&mut self, rng: &mut Rng) {
-        // Immunity window right after possession changed hands, so the ball can't
-        // instantly ping back and forth (the tackle/dispossession "black hole").
-        if self.kick_timer > 0 {
-            self.kick_timer -= 1;
-            return;
-        }
         let o = match self.owner {
             Some(o) => o,
             None => return,
@@ -937,14 +735,10 @@ impl World {
             };
             if o.team == Team::A {
                 self.ev_turnover_a = true; // A dispossessed
-                self.b_pass_streak = 1; // B possession begins
             } else {
                 self.ev_win_ball_a = true; // A tackled the ball off B
-                self.b_pass_streak = 0;
             }
-            self.b_shot_flag = false;
             self.pass_streak_a = 0; // possession changed hands
-            self.reset_a_pass_memory();
             self.owner = Some(stealer);
             self.last_touch = Some(stealer.team);
             self.kick_timer = 4;
@@ -962,7 +756,6 @@ impl World {
         team: Team,
         idx: usize,
         a: usize,
-        spd: usize,
         _rng: &mut Rng,
     ) -> Option<(Owner, V2, f32, bool)> {
         let me = players(team, self)[idx].pos;
@@ -970,29 +763,16 @@ impl World {
         let goal = team.target_goal();
         let owner = Owner { team, idx };
         self.intended_receiver = None;
-        // any on-ball action clears that team's shot flag; only A_SHOOT re-sets it.
+        // any A on-ball action clears the shot flag; only A_SHOOT re-sets it.
         if team == Team::A {
             self.a_shot_flag = false;
-        } else {
-            self.b_shot_flag = false;
         }
         match a {
             A_SHOOT => {
                 if team == Team::A {
                     self.ev_shot_attempt_a = true;
-                    // Rapid-fire repeat? (a shot while a prior shot's cooldown is still
-                    // active = shoot-spam farming, not a fresh chance). The genuine
-                    // first shot of a buildup is NOT rapid and earns full reward.
-                    self.shot_was_rapid_a = self.shoot_cooldown_a > 0;
-                    self.shoot_cooldown_a = 45; // ~2.25 s at 20 Hz before a shot is "fresh" again
                     self.pass_streak_a = 0; // buildup consumed by the shot
                     self.a_shot_flag = true; // this free ball is a valid (2-pass) shot
-                    self.reset_a_pass_memory();
-                } else {
-                    // symmetric: B's goal only counts if B built up (2 passes) and
-                    // shoots from B's own final third (B attacks -x -> small x).
-                    self.b_shot_flag = self.b_pass_streak >= 2 && me.x < FIELD_L - SHOOT_X;
-                    self.b_pass_streak = 0;
                 }
                 self.set_vel(team, idx, V2::default());
                 // MPC-lite finishing: enumerate aim points across the mouth and
@@ -1025,24 +805,15 @@ impl World {
                     // shooting from a position where a good placement exists.
                     let q = (best_score / 12.0).clamp(0.0, 1.0);
                     self.last_shot_quality_a = q;
-                    // POSITION quality (xG-like), a function of the field vector at the
-                    // shot: close + central is a high-value chance, a long-range or
-                    // wide pot-shot is near-zero. Distance dominates (squared decay),
-                    // shot ANGLE (central vs wide) modulates.
-                    let d = goal.sub(me).len();
-                    let lateral = (me.y - FIELD_W / 2.0).abs();
-                    let dist_f = (1.0 - d / 26.0).clamp(0.0, 1.0);
-                    let angle_f = (1.0 - lateral / (FIELD_W / 2.0)).clamp(0.0, 1.0);
-                    self.last_shot_xg_a = dist_f * dist_f * (0.4 + 0.6 * angle_f);
-                    if d < 24.0 {
+                    if goal.sub(me).len() < 24.0 {
                         self.ev_shot_on_a = true;
                     }
                 }
                 Some((owner, aim.sub(me), SHOT_SPEED, false))
             }
-            A_PASS_A | A_PASS_B | A_PASS_C => {
+            A_PASS_A | A_PASS_B => {
                 let cands = self.pass_candidates(team, idx);
-                let pick = cands[a - A_PASS_A];
+                let pick = if a == A_PASS_A { cands[0] } else { cands[1] };
                 if let Some((ti, _)) = pick {
                     // lead the pass slightly ahead of the receiver's forward run
                     let tp = players(team, self)[ti].pos;
@@ -1060,49 +831,29 @@ impl World {
                         } else {
                             0
                         };
-                        // ping-pong detection: passing back to the teammate who
-                        // just gave me the ball (I am lp_to, target is lp_from).
-                        self.pending_passer = idx as i32;
-                        let is_return = idx as i32 == self.lp_to && ti as i32 == self.lp_from;
-                        if is_return {
-                            if self.return_streak_a == 0 {
-                                self.return_start_x = self.ball.x; // sequence begins here
-                            }
-                            self.return_streak_a += 1;
-                        } else {
-                            self.return_streak_a = 0;
-                        }
-                        self.ev_return_pass_a = is_return;
                     }
                     Some((owner, lead.sub(me), PASS_SPEED, true))
                 } else {
                     // no valid target: dribble forward instead
-                    self.set_vel(team, idx, V2::new(sx, 0.0).scale(speed_val(spd, true)));
+                    self.set_vel(team, idx, V2::new(sx, 0.0).scale(DRIBBLE_SPEED));
                     None
                 }
             }
             A_DRIB_FWD => {
-                let dir = self.shielded_dribble_dir(team, me, V2::new(sx, 0.0));
-                self.note_dribble(team, dir, sx);
-                self.set_vel(team, idx, dir.scale(speed_val(spd, true)));
+                self.set_vel(team, idx, V2::new(sx, 0.0).scale(DRIBBLE_SPEED));
                 None
             }
             A_DRIB_LEFT => {
-                let dir = self.shielded_dribble_dir(team, me, V2::new(0.0, -1.0));
-                self.note_dribble(team, dir, sx);
-                self.set_vel(team, idx, dir.scale(speed_val(spd, true)));
+                self.set_vel(team, idx, V2::new(0.0, -1.0).scale(DRIBBLE_SPEED));
                 None
             }
             A_DRIB_RIGHT => {
-                let dir = self.shielded_dribble_dir(team, me, V2::new(0.0, 1.0));
-                self.note_dribble(team, dir, sx);
-                self.set_vel(team, idx, dir.scale(speed_val(spd, true)));
+                self.set_vel(team, idx, V2::new(0.0, 1.0).scale(DRIBBLE_SPEED));
                 None
             }
             A_CLEAR => {
                 if team == Team::A {
                     self.pass_streak_a = 0; // clearing gives up the buildup
-                    self.reset_a_pass_memory();
                 }
                 self.set_vel(team, idx, V2::default());
                 // hoof toward attacked goal with lateral scatter
@@ -1134,17 +885,6 @@ impl World {
                 let lead = tp.add(V2::new(sx * 2.0, 0.0));
                 self.intended_receiver = Some(Owner { team, idx: ti });
                 self.set_vel(team, GK, V2::default());
-                if team == Team::A {
-                    self.ev_pass_attempt_a = true;
-                    let fwd = (tp.x - me.x) * sx;
-                    self.pass_dir_a = if fwd > 2.0 {
-                        1
-                    } else if fwd < -2.0 {
-                        -1
-                    } else {
-                        0
-                    };
-                }
                 return Some((Owner { team, idx: GK }, lead.sub(me), PASS_SPEED, true));
             }
             self.set_vel(team, GK, V2::default());
@@ -1179,14 +919,11 @@ impl World {
         None
     }
 
-    fn apply_off_ball(&mut self, team: Team, idx: usize, a: usize, spd: usize) {
+    fn apply_off_ball(&mut self, team: Team, idx: usize, a: usize) {
         let me = players(team, self)[idx].pos;
         let team_owns = matches!(self.owner, Some(o) if o.team == team);
         let target = match a {
-            // CHASE: anticipate. If the ball is moving (a pass/loose ball), aim at
-            // the INTERCEPT point on its trajectory — where the defender can meet
-            // it — rather than its current spot; otherwise go to the carrier.
-            A_CHASE => self.intercept_point(me),
+            A_CHASE => self.ball,
             // SUPPORT: push UPFIELD into open space (attacking run).
             A_SUPPORT => self.open_space_target(team, idx, 1.2),
             // SPREAD: find open space; drift up/down field per possession.
@@ -1201,17 +938,13 @@ impl World {
                 let own_goal = team.own_goal();
                 opp.add(own_goal.sub(opp).unit().scale(2.5))
             }
-            // GET_OPEN: MPC-lite lane opener — move to the relocation that best
-            // opens a passing lane from the ball (the POMDP picks it, MPC aims it).
-            A_GET_OPEN => self.mpc_open_lane_target(team, idx),
             _ => me, // STAY
         };
         let dir = target.sub(me);
-        // STAY means stand still; otherwise move toward the target at the chosen gear.
-        let v = if a == A_STAY || dir.len() < 0.3 || spd == SPD_STAND {
+        let v = if dir.len() < 0.3 {
             V2::default()
         } else {
-            dir.unit().scale(speed_val(spd, false))
+            dir.unit().scale(PLAYER_SPEED)
         };
         self.set_vel(team, idx, v);
     }
@@ -1261,45 +994,6 @@ impl World {
         best
     }
 
-    /// MPC-lite lane opener (execution of the GET_OPEN decision). Enumerates
-    /// candidate relocations — biased toward the wings — and returns the one that
-    /// best OPENS A PASSING LANE from the ball to that point: a short-horizon
-    /// optimization scoring the resulting lane clearness, plus width, being ahead
-    /// of the ball, and space from the nearest defender. The policy makes the
-    /// decision to get open; this computes where "open" actually is.
-    fn mpc_open_lane_target(&self, team: Team, idx: usize) -> V2 {
-        let me = players(team, self)[idx].pos;
-        let sx = team.sx();
-        let radii = [4.0f32, 8.0, 12.0, 16.0];
-        let ndir = 12usize;
-        let mut best = me;
-        let mut best_score = f32::NEG_INFINITY;
-        for &r in &radii {
-            for k in 0..ndir {
-                let ang = (k as f32) / (ndir as f32) * std::f32::consts::TAU;
-                let cand = V2::new(
-                    (me.x + ang.cos() * r).clamp(3.0, FIELD_L - 3.0),
-                    (me.y + ang.sin() * r).clamp(3.0, FIELD_W - 3.0),
-                );
-                // the payoff: a CLEAR passing lane from the ball to this point.
-                let lane = self.lane_clearness(team, self.ball, cand);
-                // prefer WIDTH (the mechanism for opening a lane is going wider)…
-                let wide = (cand.y - FIELD_W / 2.0).abs() / (FIELD_W / 2.0);
-                // …an upfield outlet ahead of the ball…
-                let ahead = ((cand.x - self.ball.x) * sx).max(0.0) / FIELD_L;
-                // …and real space from the nearest defender (room to receive).
-                let (_, od) = self.nearest_opponent(team, cand);
-                let space = (od / 6.0).min(1.0);
-                let score = lane * 1.6 + wide * 0.7 + ahead * 0.6 + space * 0.5;
-                if score > best_score {
-                    best_score = score;
-                    best = cand;
-                }
-            }
-        }
-        best
-    }
-
     fn set_vel(&mut self, team: Team, idx: usize, v: V2) {
         match team {
             Team::A => self.a[idx].vel = v,
@@ -1321,20 +1015,6 @@ fn clamp_pos(p: &mut Player) {
 fn rotate(v: V2, ang: f32) -> V2 {
     let (s, c) = ang.sin_cos();
     V2::new(v.x * c - v.y * s, v.x * s + v.y * c)
-}
-
-/// The gear the scripted baseline uses for a given action (kept near the old
-/// fixed speeds so the benchmark stays comparable): press/support runs fast,
-/// spread/mark at a run, dribble at a skip, set-pieces standing.
-pub fn scripted_gear(a: usize) -> usize {
-    // The scripted baseline moves at run-medium (~= v3's fixed PLAYER_SPEED) so the
-    // benchmark stays as hard as v3's — NOT faster. Over-buffing the defenders to
-    // run_fast crushed the learner's pass completion and blocked all scoring.
-    match a {
-        A_CHASE | A_SUPPORT | A_SPREAD | A_MARK => SPD_RUN_MED,
-        A_DRIB_FWD | A_DRIB_LEFT | A_DRIB_RIGHT => SPD_SKIP,
-        _ => SPD_STAND, // shoot/pass/clear/hold/stay: no self-movement
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1376,8 +1056,6 @@ impl World {
                     A_MARK
                 };
             }
-            // pack a sensible gear for the baseline so it moves at realistic speeds.
-            acts[i] += scripted_gear(acts[i]) * NA;
         }
         acts
     }
@@ -1517,25 +1195,19 @@ impl World {
         let shot_dist = goal.sub(me).len();
         let clear = self.shot_clearness(team, me);
         let (_, opp_d) = self.nearest_opponent(team, me);
-        let shot_legal = match team {
-            Team::A => self.pass_streak_a >= 2 && me.x >= SHOOT_X,
-            Team::B => self.b_pass_streak >= 2 && me.x <= FIELD_L - SHOOT_X,
-        };
 
         // close in with a reasonably open lane -> shoot (else work it closer)
-        if shot_legal && shot_dist < 18.0 && clear > 0.3 {
+        if shot_dist < 18.0 && clear > 0.3 {
             return A_SHOOT;
         }
         let cands = self.pass_candidates(team, idx);
         let pressured = opp_d < 4.0;
         if pressured {
             // pass to best forward-open option if one is genuinely ahead
-            for (rank, cand) in cands.iter().enumerate() {
-                if let Some((ti, _)) = cand {
-                    let tp = players(team, self)[*ti].pos;
-                    if (tp.x - me.x) * sx > -3.0 {
-                        return A_PASS_A + rank;
-                    }
+            if let Some((ti, _)) = cands[0] {
+                let tp = players(team, self)[ti].pos;
+                if (tp.x - me.x) * sx > -3.0 {
+                    return A_PASS_A;
                 }
             }
             // no outlet & deep in own half -> clear, else try to carry out
@@ -1550,17 +1222,6 @@ impl World {
             } else {
                 A_DRIB_RIGHT
             };
-        }
-        // If a forward lane is plainly available, use it as a build-up pass.
-        // This makes the scripted teacher useful for behavior cloning instead of
-        // teaching mostly solo dribbles until pressure arrives.
-        for (rank, cand) in cands.iter().enumerate() {
-            if let Some((ti, _)) = cand {
-                let tp = players(team, self)[*ti].pos;
-                if (tp.x - me.x) * sx > 5.0 && self.lane_clearness(team, me, tp) > 0.45 {
-                    return A_PASS_A + rank;
-                }
-            }
         }
         // unpressured: is an opponent directly ahead in my forward cone?
         let (oi, od) = self.nearest_opponent(team, me);
@@ -1583,16 +1244,6 @@ mod tests {
 
     fn stays() -> [usize; N] {
         [A_STAY; N]
-    }
-
-    fn arrange_return_pass_candidates(w: &mut World) {
-        w.a[1].pos = V2::new(24.0, 14.0);
-        w.a[2].pos = V2::new(30.0, 14.0);
-        w.a[3].pos = V2::new(6.0, 4.0);
-        w.a[4].pos = V2::new(7.0, 24.0);
-        for i in 0..N {
-            w.b[i].pos = V2::new(40.0, if i % 2 == 0 { 1.0 } else { 27.0 });
-        }
     }
 
     #[test]
@@ -1624,76 +1275,20 @@ mod tests {
             "A cannot shoot before two completed passes"
         );
         assert!(on_ball[A_PASS_A]);
-        assert!(on_ball[A_PASS_B]);
-        assert!(on_ball[A_PASS_C]);
         assert!(on_ball[A_HOLD]);
         assert!(!on_ball[A_CHASE]);
 
         w.pass_streak_a = 2;
-        w.a[1].pos = V2::new(FINAL_THIRD_X + 2.0, 14.0); // and be in the final third
         let after_buildup = w.legal_mask(Team::A, 1);
         assert!(
             after_buildup[A_SHOOT],
-            "two completed passes + final third unlock shooting"
+            "two completed passes unlock shooting"
         );
 
         let off_ball = w.legal_mask(Team::A, 2);
         assert!(!off_ball[A_PASS_A]);
         assert!(off_ball[A_CHASE]);
         assert!(off_ball[A_STAY]);
-    }
-
-    #[test]
-    fn pass_actions_cover_all_three_outfield_targets() {
-        let mut w = World::new();
-        w.owner = Some(Owner {
-            team: Team::A,
-            idx: 1,
-        });
-        w.a[1].pos = V2::new(12.0, 14.0);
-        w.a[2].pos = V2::new(20.0, 8.0);
-        w.a[3].pos = V2::new(22.0, 14.0);
-        w.a[4].pos = V2::new(18.0, 22.0);
-        for i in 0..N {
-            w.b[i].pos = V2::new(40.0, if i % 2 == 0 { 2.0 } else { 26.0 });
-        }
-
-        let mask = w.legal_mask(Team::A, 1);
-        assert!(mask[A_PASS_A]);
-        assert!(mask[A_PASS_B]);
-        assert!(mask[A_PASS_C]);
-        let cands = w.pass_candidates(Team::A, 1);
-        let mut ids = cands
-            .iter()
-            .flatten()
-            .map(|(idx, _)| *idx)
-            .collect::<Vec<_>>();
-        ids.sort_unstable();
-        assert_eq!(ids, vec![2, 3, 4]);
-
-        w.a[4].pos = V2::new(12.5, 14.0); // too close to count as a real pass outlet
-        let limited = w.legal_mask(Team::A, 1);
-        assert!(limited[A_PASS_A]);
-        assert!(limited[A_PASS_B]);
-        assert!(!limited[A_PASS_C]);
-    }
-
-    #[test]
-    fn keeper_distribution_counts_as_a_pass_attempt() {
-        let mut w = World::new();
-        w.owner = Some(Owner {
-            team: Team::A,
-            idx: GK,
-        });
-
-        let kick = w.apply_keeper(Team::A);
-
-        assert!(kick.is_some_and(|(_, _, _, is_pass)| is_pass));
-        assert!(w.ev_pass_attempt_a);
-        assert!(matches!(
-            w.intended_receiver,
-            Some(o) if o.team == Team::A && o.idx != GK
-        ));
     }
 
     #[test]
@@ -1734,204 +1329,13 @@ mod tests {
             idx: 2,
         });
         w.pass_kick_x = 10.0;
-        w.pending_passer = 1;
         w.ball = w.a[2].pos;
         w.ball_vel = V2::default();
         w.kick_timer = -1;
         w.try_capture();
         assert!(w.ev_pass_completed_a);
         assert_eq!(w.pass_streak_a, 1);
-        assert_eq!(w.lp_from, 1);
-        assert_eq!(w.lp_to, 2);
-        assert_eq!(w.pending_passer, -1);
         assert!(w.last_pass_gain_a.is_finite());
         assert!(matches!(w.owner, Some(o) if o.team == Team::A && o.idx == 2));
-    }
-
-    #[test]
-    fn return_pass_to_previous_giver_sets_event_and_streak() {
-        let mut w = World::new();
-        arrange_return_pass_candidates(&mut w);
-        w.owner = Some(Owner {
-            team: Team::A,
-            idx: 2,
-        });
-        w.lp_from = 1;
-        w.lp_to = 2;
-        w.return_streak_a = 1;
-
-        let kick = w.apply_on_ball(Team::A, 2, A_PASS_A, SPD_RUN_MED, &mut Rng::new(3));
-
-        assert!(kick.is_some());
-        assert!(matches!(w.intended_receiver, Some(o) if o.team == Team::A && o.idx == 1));
-        assert!(w.ev_return_pass_a);
-        assert_eq!(w.return_streak_a, 2);
-        assert_eq!(w.pending_passer, 2);
-    }
-
-    #[test]
-    fn non_return_pass_resets_return_streak() {
-        let mut w = World::new();
-        arrange_return_pass_candidates(&mut w);
-        w.owner = Some(Owner {
-            team: Team::A,
-            idx: 2,
-        });
-        w.lp_from = 3;
-        w.lp_to = 2;
-        w.return_streak_a = 2;
-
-        let kick = w.apply_on_ball(Team::A, 2, A_PASS_A, SPD_RUN_MED, &mut Rng::new(4));
-
-        assert!(kick.is_some());
-        assert!(matches!(w.intended_receiver, Some(o) if o.team == Team::A && o.idx == 1));
-        assert!(!w.ev_return_pass_a);
-        assert_eq!(w.return_streak_a, 0);
-    }
-
-    #[test]
-    fn kickoff_clears_return_pass_memory() {
-        let mut w = World::new();
-        w.lp_from = 1;
-        w.lp_to = 2;
-        w.pending_passer = 2;
-        w.return_streak_a = 3;
-
-        w.kickoff(Team::B);
-
-        assert_eq!(w.lp_from, -1);
-        assert_eq!(w.lp_to, -1);
-        assert_eq!(w.pending_passer, -1);
-        assert_eq!(w.return_streak_a, 0);
-    }
-
-    #[test]
-    fn reset_a_pass_memory_clears_return_start_x() {
-        let mut w = World::new();
-        w.return_start_x = 17.5;
-        w.return_streak_a = 3;
-        w.reset_a_pass_memory();
-        assert_eq!(w.return_start_x, 0.0);
-        assert_eq!(w.return_streak_a, 0);
-    }
-
-    #[test]
-    fn first_return_records_start_x_and_streak_one() {
-        // A→B→A: the FIRST return (streak 0→1) must be recorded but is "fine"
-        // (the reward only penalises from streak >= 2).
-        let mut w = World::new();
-        arrange_return_pass_candidates(&mut w);
-        w.owner = Some(Owner {
-            team: Team::A,
-            idx: 2,
-        });
-        w.ball = V2::new(20.0, 14.0);
-        w.lp_from = 1; // player 1 gave the ball to player 2
-        w.lp_to = 2;
-        w.return_streak_a = 0;
-        let _ = w.apply_on_ball(Team::A, 2, A_PASS_A, SPD_RUN_MED, &mut Rng::new(3));
-        assert!(w.ev_return_pass_a);
-        assert_eq!(w.return_streak_a, 1);
-        assert_eq!(w.return_start_x, 20.0); // sequence origin recorded
-    }
-
-    #[test]
-    fn shielded_dribble_veers_away_from_close_defender() {
-        // Defender directly ahead: forward intent must bend AWAY (−x here).
-        let mut w = World::new();
-        let me = V2::new(20.0, 14.0);
-        w.a[1].pos = me;
-        w.b[0].pos = V2::new(50.0, 14.0); // keep GK far
-        w.b[1].pos = V2::new(21.0, 14.0); // 1 unit ahead of the carrier
-        let dir = w.shielded_dribble_dir(Team::A, me, V2::new(1.0, 0.0));
-        assert!(
-            dir.x < 0.0,
-            "should steer away from the defender, got {:?}",
-            dir
-        );
-    }
-
-    #[test]
-    fn note_dribble_classifies_by_final_direction() {
-        // A shielded direction that is actually backward must NOT be credited as a
-        // forward dribble (the P2 fix: reward reflects real movement).
-        let mut w = World::new();
-        w.note_dribble(Team::A, V2::new(-1.0, 0.0), 1.0); // backward (x·sx < −0.3)
-        assert!(!w.ev_dribble_fwd_a && !w.ev_dribble_lat_a);
-        w.note_dribble(Team::A, V2::new(1.0, 0.0), 1.0); // forward
-        assert!(w.ev_dribble_fwd_a);
-        let mut w2 = World::new();
-        w2.note_dribble(Team::A, V2::new(0.0, 1.0), 1.0); // lateral
-        assert!(w2.ev_dribble_lat_a && !w2.ev_dribble_fwd_a);
-    }
-
-    #[test]
-    fn intercept_point_leads_a_moving_ball() {
-        // For a ball moving in +x, a defender ahead should be sent to a point on
-        // the trajectory (>= current ball x), not the current spot.
-        let mut w = World::new();
-        w.owner = None;
-        w.ball = V2::new(10.0, 14.0);
-        w.ball_vel = V2::new(18.0, 0.0);
-        let p = w.intercept_point(V2::new(25.0, 14.0));
-        assert!(
-            p.x >= w.ball.x,
-            "intercept should lead the ball, got {:?}",
-            p
-        );
-        // a stationary ball just returns the ball itself
-        w.ball_vel = V2::default();
-        assert_eq!(w.intercept_point(V2::new(25.0, 14.0)).x, w.ball.x);
-    }
-
-    #[test]
-    fn opponent_half_rule_masks_shot_in_own_half() {
-        let mut w = World::new();
-        w.owner = Some(Owner {
-            team: Team::A,
-            idx: 1,
-        });
-        w.pass_streak_a = 2; // 2-pass rule satisfied
-        w.a[1].pos = V2::new(SHOOT_X - 3.0, 14.0); // still in our own half
-        assert!(
-            !w.legal_mask(Team::A, 1)[A_SHOOT],
-            "shot must be masked in our own half"
-        );
-        w.a[1].pos = V2::new(SHOOT_X + 2.0, 14.0); // in the opponent's half
-        assert!(
-            w.legal_mask(Team::A, 1)[A_SHOOT],
-            "shot allowed in the opponent's half after 2 passes"
-        );
-    }
-
-    #[test]
-    fn b_goal_requires_valid_buildup() {
-        // A free ball crossing B's target line (x<=0) does NOT count for B unless
-        // b_shot_flag is set (B built up 2 passes + shot from its final third).
-        let mut w = World::new();
-        w.owner = None;
-        w.b_shot_flag = false;
-        w.ball = V2::new(0.4, FIELD_W / 2.0);
-        w.ball_vel = V2::new(-20.0, 0.0);
-        let g0 = w.goals_b;
-        let empty = [A_STAY; N];
-        w.step(&empty, &empty, &mut Rng::new(1));
-        assert_eq!(w.goals_b, g0, "B goal without valid buildup must not count");
-    }
-
-    #[test]
-    fn dribble_forward_action_sets_forward_event_in_the_clear() {
-        // With no defender near, A_DRIB_FWD keeps forward intent -> forward event.
-        let mut w = World::new();
-        w.a[1].pos = V2::new(20.0, 14.0);
-        w.owner = Some(Owner {
-            team: Team::A,
-            idx: 1,
-        });
-        for i in 0..N {
-            w.b[i].pos = V2::new(41.0, 14.0); // all defenders far away
-        }
-        let _ = w.apply_on_ball(Team::A, 1, A_DRIB_FWD, SPD_RUN_MED, &mut Rng::new(1));
-        assert!(w.ev_dribble_fwd_a);
     }
 }
