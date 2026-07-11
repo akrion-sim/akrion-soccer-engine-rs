@@ -16,8 +16,35 @@ pub const DT: f32 = 0.05; // seconds per decision tick -> 20 Hz sim (real-time 2
 pub const HZ: f32 = 1.0 / DT; // ticks per second (for real-time viewer playback)
 pub const STEPS: usize = 600; // ticks per game (~30s at 20 Hz)
 
-const PLAYER_SPEED: f32 = 6.5;
-const DRIBBLE_SPEED: f32 = 4.6; // carrying the ball is slower than a pass or a run
+const PLAYER_SPEED: f32 = 6.5; // legacy reference speed (~= run_medium); kept for the keeper/util
+const DRIBBLE_SPEED: f32 = 4.6; // legacy reference dribble speed (kept for reference)
+
+// ---- Player gears -----------------------------------------------------------
+// Seven discrete speeds the policy can pick for any movement/dribble, from
+// standing still to a full sprint. Sim units are yards/second; the top gear is
+// scaled so a full sprint ~= 26 mph (the human ceiling) and, while carrying the
+// ball, gears are capped at BALL_SPEED_CAP ~= 22 mph.
+pub const NS: usize = 7; // number of speed gears (the speed action head)
+pub const SPD_STAND: usize = 0;
+pub const SPD_WALK: usize = 1;
+pub const SPD_JOG: usize = 2;
+pub const SPD_SKIP: usize = 3;
+pub const SPD_RUN_MED: usize = 4;
+pub const SPD_RUN_FAST: usize = 5;
+pub const SPD_SPRINT: usize = 6;
+// stand · walk · jog · skip · run_med · run_fast · full_sprint
+const SPEEDS: [f32; NS] = [0.0, 1.3, 2.8, 4.2, 6.0, 8.5, 11.0];
+const BALL_SPEED_CAP: f32 = 9.3; // ~22 mph: you can't dribble at a full open-field sprint
+
+/// Map a speed gear to yards/second, capping ball-carrying to ~22 mph.
+fn speed_val(gear: usize, carrying: bool) -> f32 {
+    let s = SPEEDS[gear.min(NS - 1)];
+    if carrying {
+        s.min(BALL_SPEED_CAP)
+    } else {
+        s
+    }
+}
 const CONTROL_RADIUS: f32 = 1.5; // secure a received ball -> possessions can develop
 const RECEIVE_RADIUS: f32 = 2.8; // intended pass receiver collects from further out
 const TACKLE_RADIUS: f32 = 1.6;
