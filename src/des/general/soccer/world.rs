@@ -30002,13 +30002,13 @@ impl SoccerMatch {
         self.pending_shot = None;
         self.record_reward_event_with_kind(
             attacker_id,
-            kind.beat_reward_points(),
+            kind.beat_reward_points() * dribble_beat_reward_scale(),
             SoccerRewardEventKind::DribbleBeat,
         );
         self.queue_recent_outcome_learning_credit(
             attacker_id,
             attacker_team,
-            kind.beat_reward_points(),
+            kind.beat_reward_points() * dribble_beat_reward_scale(),
             SoccerRewardEventKind::DribbleBeat,
             DRIBBLE_BEAT_LEARNING_CREDIT_MAX_AGE_TICKS,
             is_dribble_action_label,

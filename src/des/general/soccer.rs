@@ -24234,7 +24234,26 @@ pub(crate) fn shot_commitment_reward_scale() -> f64 {
 /// Scale on the learned-EPV conversion bonus for completed passes (DD_SOCCER_LEARNED_EPV_REWARD_SCALE).
 /// Default 20: the fitted Φ_epv spans ~[-0.15, 0.20], so a strong danger-creating pass (ΔΦ ≈ 0.3) earns
 /// ~6 — comparable to the base forward-pass reward — while a square/backward ball earns ~0 or negative.
+/// Scale the DRIBBLE-BEAT / take-on / nutmeg reward (beating a defender ON THE
+/// DRIBBLE) — distinct from the progressive-carry reward (`carry_reward_scale`).
+/// Env `DD_SOCCER_DRIBBLE_BEAT_REWARD_SCALE`; dynamic-mode bidirectional [0, 8]
+/// so a reward search can tune the take-on incentive up or down. Default 1.0 =
+/// byte-identical.
+pub(crate) fn dribble_beat_reward_scale() -> f64 {
+    if dynamic_reward_weights_enabled() {
+        return reward_weight_env("DD_SOCCER_DRIBBLE_BEAT_REWARD_SCALE", 1.0, 0.0, 8.0);
+    }
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| reward_weight_env("DD_SOCCER_DRIBBLE_BEAT_REWARD_SCALE", 1.0, 0.0, 8.0))
+}
+
 pub(crate) fn learned_epv_reward_scale() -> f64 {
+    // Dynamic-reward mode: the learned-EPV (expected-possession-value) shaping is a
+    // reward weight too — let a search tune it alongside the rest of the vector.
+    if dynamic_reward_weights_enabled() {
+        return reward_weight_env("DD_SOCCER_LEARNED_EPV_REWARD_SCALE", 20.0, 0.0, 200.0);
+    }
     use std::sync::OnceLock;
     static V: OnceLock<f64> = OnceLock::new();
     *V.get_or_init(|| {
