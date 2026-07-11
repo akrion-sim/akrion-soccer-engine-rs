@@ -118,6 +118,11 @@ impl Policy {
                 bi = i;
             }
         }
+        // During the speed warmup, eval uses the same fixed gear the action policy
+        // was trained on.
+        if SPEED_FROZEN.load(Ordering::Relaxed) {
+            return bi + SPD_RUN_MED * NA;
+        }
         // greedy speed gear (argmax over the MOVING gears). We skip SPD_STAND (0)
         // at eval so a near-flat speed policy can't tie-break the team into standing
         // still — standing is essentially never the right greedy choice.
