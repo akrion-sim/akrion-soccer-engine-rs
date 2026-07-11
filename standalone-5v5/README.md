@@ -13,7 +13,7 @@ from the surrounding cargo workspace so it builds in complete isolation.
   *possession + open-space*: run upfield to attack, drop to defend, drift to the
   most open point on the pitch. Possession is tracked (`World.owner`).
 - **No DB, no server, and none of the engine's ~129-dim POMDP feature stack.**
-  It *is* still a POMDP — each outfielder acts on a **partial, egocentric ~34-dim
+  It *is* still a POMDP — each outfielder acts on a **partial, egocentric 71-dim
   observation** in its own attack frame (ball/goal/teammate/opponent relatives,
   pass-candidate openness, shot-lane clearness, pressure), hidden from it are
   opponent intent and teammates' exact future runs. The policy is **reactive /
@@ -23,15 +23,17 @@ from the surrounding cargo workspace so it builds in complete isolation.
 ## What IS here
 - **5 v 5 with goalkeepers** and a realistic ~7 m net on a small (42×28) pitch.
 - Macro actions mirroring the real engine's vocabulary: on-ball
-  `shoot · pass_a · pass_b · dribble{fwd,left,right} · clear · hold`; off-ball
+  `shoot · pass_a · pass_b · pass_c · dribble{fwd,left,right} · clear · hold`; off-ball
   `chase · support · spread · mark · stay` — with legality masking.
 - **MPC-lite finishing.** `shoot` runs a short-horizon aim optimizer that
   enumerates aim points across the mouth and places the ball at the corner
   farthest from the keeper (no MPC in the *decision*, only in the *finish*).
-- The **4 outfielders** are a shared-weight policy trained with **PPO (clipped)
-  + GAE**; the keeper is a fixed rule. Opponent = a scripted "analytic-lite"
-  baseline (also the benchmark to beat). Reward = goals + **potential-based
-  shaping** (forward progress) + small progressive-pass credit.
+- The **4 outfielders** are a shared-weight policy warm-started by scripted
+  behavior cloning, then trained with **PPO (clipped) + GAE** over threaded
+  rollout batches. The keeper is a fixed rule. Opponent = a scripted
+  "analytic-lite" baseline plus light noisy-scripted variants during training;
+  clean evaluation is still against the scripted benchmark. Reward = goals +
+  **potential-based shaping** (forward progress) + small progressive-pass credit.
 - **keep-best** snapshotting: PPO over-trains and collapses past its peak, so we
   evaluate each checkpoint and showcase the best (winning + passing) one.
 
@@ -44,7 +46,8 @@ cargo run --release -- train 80      # writes out/learning_curve.csv, run_manife
 
 Useful reproducibility knobs:
 ```bash
-cargo run --release -- train 80 --seed 20260710 --eval-games 80 --final-games 300
+cargo run --release -- train 80 --seed 20260710 --games-per-iter 12 --bc-games 12 --bc-epochs 2 --eval-games 80 --final-games 300
+FIVEASIDE_ROLLOUT_THREADS=2 cargo run --release -- train 80
 SPACING_W=0.003 cargo run --release -- train 80
 PORT=5060 ./viz/serve.sh
 ```
@@ -59,7 +62,8 @@ PORT=5060 ./viz/serve.sh
 ## Hardening
 - `cargo test --locked` covers deterministic PRNG replay, masked softmax,
   model save/load validation, observation/global-state finiteness, legal-action
-  masking, the 2-pass shot gate, goal validity, and evaluation metric bounds.
+  masking, full pass-target action coverage, behavior-cloning warm start, the
+  2-pass shot gate, goal validity, and evaluation metric bounds.
 - `cargo clippy --locked --all-targets -- -D warnings` is intended to stay clean.
 - Generated model/viz artifacts are tied together by `out/run_manifest.json`
   with git commit, seed/config/env, selected checkpoint, final holdout stats,

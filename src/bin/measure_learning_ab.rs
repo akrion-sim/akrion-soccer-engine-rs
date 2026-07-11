@@ -58,12 +58,6 @@ struct GameKpis {
     crosses_completed: f64,
     dribble_beats: f64,
     dribble_decisions: f64,
-    planner_teacher_candidates: f64,
-    planner_teacher_samples: f64,
-    planner_teacher_shot_samples: f64,
-    planner_teacher_forward_samples: f64,
-    planner_teacher_weight_sum: f64,
-    planner_teacher_advantage_sum: f64,
 }
 
 impl GameKpis {
@@ -90,12 +84,6 @@ impl GameKpis {
         self.crosses_completed += other.crosses_completed;
         self.dribble_beats += other.dribble_beats;
         self.dribble_decisions += other.dribble_decisions;
-        self.planner_teacher_candidates += other.planner_teacher_candidates;
-        self.planner_teacher_samples += other.planner_teacher_samples;
-        self.planner_teacher_shot_samples += other.planner_teacher_shot_samples;
-        self.planner_teacher_forward_samples += other.planner_teacher_forward_samples;
-        self.planner_teacher_weight_sum += other.planner_teacher_weight_sum;
-        self.planner_teacher_advantage_sum += other.planner_teacher_advantage_sum;
     }
 
     fn scaled(&self, inv: f64) -> GameKpis {
@@ -122,12 +110,6 @@ impl GameKpis {
             crosses_completed: self.crosses_completed * inv,
             dribble_beats: self.dribble_beats * inv,
             dribble_decisions: self.dribble_decisions * inv,
-            planner_teacher_candidates: self.planner_teacher_candidates * inv,
-            planner_teacher_samples: self.planner_teacher_samples * inv,
-            planner_teacher_shot_samples: self.planner_teacher_shot_samples * inv,
-            planner_teacher_forward_samples: self.planner_teacher_forward_samples * inv,
-            planner_teacher_weight_sum: self.planner_teacher_weight_sum * inv,
-            planner_teacher_advantage_sum: self.planner_teacher_advantage_sum * inv,
         }
     }
 
@@ -153,14 +135,6 @@ impl GameKpis {
             self.intentional_passes_completed,
         );
         let dribble_beat_per_100 = ratio(self.dribble_beats * 100.0, self.dribble_decisions);
-        let planner_teacher_mean_weight = ratio(
-            self.planner_teacher_weight_sum,
-            self.planner_teacher_samples,
-        );
-        let planner_teacher_mean_advantage = ratio(
-            self.planner_teacher_advantage_sum,
-            self.planner_teacher_samples,
-        );
         println!(
             "{label:<14} pass_completion={:.3} passes={:.0}/{:.0} fwd_passes={:.0} \
              back_passes={:.0} lat_passes={:.0} completed_gain_yds={:.1} gain_per_pass={:.2} \
@@ -170,10 +144,7 @@ impl GameKpis {
              pass_turnovers={:.1} net_forward={:.1} goals={:.2} shots={:.1} \
              on_target={:.1} shot_acc={:.3} shot_after_pass={:.1} dribble_beats={:.1} \
              dribble_decisions={:.0} dribble_beats_per_100_decisions={:.2} chains={:.1} \
-             chain_gain_yds={:.1} chain_net_loss={:.2} crosses={:.1} \
-             planner_teacher={:.1}/{:.1} planner_teacher_shot={:.1} \
-             planner_teacher_forward={:.1} planner_teacher_mean_weight={:.2} \
-             planner_teacher_mean_advantage={:.3}",
+             chain_gain_yds={:.1} chain_net_loss={:.2} crosses={:.1}",
             pass_completion,
             self.passes_completed,
             self.passes_attempted,
@@ -206,12 +177,6 @@ impl GameKpis {
             self.pass_chain_gain_yards,
             self.pass_chains_net_loss,
             self.crosses_completed,
-            self.planner_teacher_samples,
-            self.planner_teacher_candidates,
-            self.planner_teacher_shot_samples,
-            self.planner_teacher_forward_samples,
-            planner_teacher_mean_weight,
-            planner_teacher_mean_advantage,
         );
     }
 }
@@ -223,15 +188,6 @@ fn env_on(name: &str) -> bool {
             v == "1" || v.eq_ignore_ascii_case("true")
         })
         .unwrap_or(false)
-}
-
-fn env_bool_or(name: &str, default: bool) -> bool {
-    std::env::var(name)
-        .map(|v| {
-            let v = v.trim();
-            v == "1" || v.eq_ignore_ascii_case("true")
-        })
-        .unwrap_or(default)
 }
 
 fn env_f64(name: &str) -> f64 {
@@ -347,23 +303,10 @@ fn main() {
     println!(
         "knobs: learned_receiver_min_net_forward_quality={:.2} \
          learned_mpc_pass_impossible_probability={:.2} \
-         pass_completion_primary_score_weight={:.2} planner_teacher={} \
-         planner_teacher_weight={:.2} planner_teacher_advantage_floor={:.2} \
-         planner_teacher_min_score_share={:.3} planner_teacher_max_samples_per_decision={} \
-         planner_teacher_include_same_pass_family={} planner_teacher_same_pass_min_margin_share={:.3} \
-         forward_select_logit={} forward_select_logit_weight={:.2}",
+         pass_completion_primary_score_weight={:.2}",
         env_f64_or("SOCCER_LEARNED_PASS_RECEIVER_MIN_NET_FORWARD_QUALITY", 0.26),
         env_f64_or("SOCCER_LEARNED_MPC_PASS_IMPOSSIBLE_PROBABILITY", 0.18),
         env_f64_or("DD_SOCCER_PASS_COMPLETION_SCORE_WEIGHT", 0.0),
-        env_on("DD_SOCCER_ENABLE_PLANNER_TEACHER_MISSED_OPPORTUNITY"),
-        env_f64_or("SOCCER_PLANNER_TEACHER_WEIGHT", 1.6),
-        env_f64_or("SOCCER_PLANNER_TEACHER_ADVANTAGE_FLOOR", 0.06),
-        env_f64_or("SOCCER_PLANNER_TEACHER_MIN_SCORE_SHARE", 0.015),
-        env_usize("SOCCER_PLANNER_TEACHER_MAX_SAMPLES_PER_DECISION", 2),
-        env_bool_or("DD_SOCCER_PLANNER_TEACHER_INCLUDE_SAME_PASS_FAMILY", true),
-        env_f64_or("SOCCER_PLANNER_TEACHER_SAME_PASS_MIN_MARGIN_SHARE", 0.015),
-        env_on("DD_SOCCER_ENABLE_FORWARD_SELECT_LOGIT"),
-        env_f64_or("DD_SOCCER_FORWARD_SELECT_LOGIT_WEIGHT", 0.0),
     );
 
     // Carried across games within this process (the real learner's per-process pattern).
@@ -399,9 +342,7 @@ fn main() {
         let total_ticks = config.total_ticks();
 
         let mut sim = SoccerMatch::default_11v11(config).with_team_policies((*policies).clone());
-        if env_bool_or("SOCCER_ENGINE_UNIFORM_ELITE_PLAYERS", true) {
-            sim.set_uniform_elite_players();
-        }
+        sim.set_uniform_elite_players();
         if let Some(s) = snapshot.as_ref() {
             if let Err(e) = sim.set_neural_network_snapshot(s.clone()) {
                 eprintln!("game {g}: failed to install snapshot: {e}");
@@ -562,16 +503,6 @@ fn main() {
             crosses_completed: f64::from(st.crosses_completed_home + st.crosses_completed_away),
             dribble_beats: f64::from(st.dribble_beats_home + st.dribble_beats_away),
             dribble_decisions: game_dribble_decision_ticks as f64,
-            planner_teacher_candidates: f64::from(st.planner_teacher_missed_opportunity_candidates),
-            planner_teacher_samples: f64::from(st.planner_teacher_missed_opportunity_samples),
-            planner_teacher_shot_samples: f64::from(
-                st.planner_teacher_missed_opportunity_shot_samples,
-            ),
-            planner_teacher_forward_samples: f64::from(
-                st.planner_teacher_missed_opportunity_forward_samples,
-            ),
-            planner_teacher_weight_sum: st.planner_teacher_missed_opportunity_weight_sum,
-            planner_teacher_advantage_sum: st.planner_teacher_missed_opportunity_advantage_sum,
         };
         let measured_game = g >= warmup_games;
         if measured_game {
@@ -587,7 +518,7 @@ fn main() {
         }
 
         eprintln!(
-            "game {:>2}/{total_games} phase={} measured={}/{} seed=0x{:08X} score {}-{} chains={} chain_gain_yds={:.1} planner_teacher={}/{} shot={} forward={}",
+            "game {:>2}/{total_games} phase={} measured={}/{} seed=0x{:08X} score {}-{} chains={} chain_gain_yds={:.1}",
             g + 1,
             if measured_game { "eval" } else { "warmup" },
             per_game.len(),
@@ -597,10 +528,6 @@ fn main() {
             summary.score_away,
             st.pass_chains_home + st.pass_chains_away,
             st.pass_chain_gain_yards_home + st.pass_chain_gain_yards_away,
-            st.planner_teacher_missed_opportunity_samples,
-            st.planner_teacher_missed_opportunity_candidates,
-            st.planner_teacher_missed_opportunity_shot_samples,
-            st.planner_teacher_missed_opportunity_forward_samples,
         );
     }
 

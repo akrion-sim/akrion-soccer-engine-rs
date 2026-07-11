@@ -5236,41 +5236,6 @@ fn far_shots_earn_much_less_on_target_reward() {
 }
 
 #[test]
-fn field_vector_shot_reward_prefers_central_angles_at_same_distance() {
-    let _gate = TestEnvVarGuard::set("DD_SOCCER_ENABLE_FIELD_VECTOR_SHOT_REWARD", "1");
-    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
-    let shooter = sim
-        .players
-        .iter()
-        .find(|p| p.team == Team::Home && p.role == PlayerRole::Forward)
-        .map(|p| p.id)
-        .unwrap();
-    let idx = sim.players.iter().position(|p| p.id == shooter).unwrap();
-    let goal_x = sim.config.field_width_yards * 0.5;
-    let goal_y = Team::Home.goal_y(sim.config.field_length_yards);
-
-    sim.players[idx].position = Vec2::new(goal_x, goal_y - 12.0);
-    let central = sim.shot_reward_distance_scale(Team::Home, shooter);
-    let lateral = 8.0_f64;
-    let depth = (12.0_f64 * 12.0 - lateral * lateral).sqrt();
-    sim.players[idx].position = Vec2::new(goal_x - lateral, goal_y - depth);
-    let wide = sim.shot_reward_distance_scale(Team::Home, shooter);
-
-    assert!(
-        (central - 1.0).abs() < 1e-9,
-        "central close shot keeps full chain credit, got {central}"
-    );
-    assert!(
-        wide < central && wide > 0.0,
-        "wide shot at same depth should be discounted but not zeroed: central={central} wide={wide}"
-    );
-    assert!(
-        wide < central * 0.75,
-        "field-vector angle discount should be material: central={central} wide={wide}"
-    );
-}
-
-#[test]
 fn wide_misses_draw_an_accuracy_penalty_but_near_misses_do_not() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let shooter = sim
@@ -42706,13 +42671,12 @@ fn per_team_neural_brains_train_both_sides_independently() {
 }
 
 #[test]
-fn frozen_netless_away_brain_is_analytic_and_never_trains() {
+fn frozen_away_brain_serves_predictions_but_never_trains() {
     let mut sim = per_team_brain_match(20260);
-    // A frozen side without a snapshot is the pure analytic baseline, not a
-    // freshly-random neural opponent that would pollute parity measurement.
+    // Freeze the away brain (frozen-opponent eval): it plays but never updates.
     sim.set_team_neural_brain(Team::Away, None, true)
-        .expect("install analytic away baseline");
-    assert!(!sim.has_per_team_neural_learners());
+        .expect("install frozen away brain");
+    assert!(sim.has_per_team_neural_learners());
 
     for _ in 0..12 {
         sim.run_time_step();
@@ -86588,57 +86552,6 @@ fn not_shooting_inside_twenty_five_records_learning_penalty() {
             "non-shot should receive only the near-goal no-shot penalty: got {penalty_total}, expected {}",
             -penalty
         );
-}
-
-#[test]
-fn shot_commitment_learning_reward_rewards_shot_and_penalizes_recycle() {
-    let _env = forward_pass_climb_curriculum_env_lock();
-    let _scale = TestEnvVarGuard::set("DD_SOCCER_SHOT_COMMITMENT_REWARD_SCALE", "2.25");
-    let mut sim = SoccerMatch::default_11v11(MatchConfig {
-        duration_seconds: 0.1,
-        seed: 22_728,
-        ..Default::default()
-    });
-    let attacker = 8;
-    let keeper = 11;
-    park_players_except(&mut sim, &[attacker, keeper]);
-    sim.players[attacker].role = PlayerRole::Midfielder;
-    sim.players[attacker].position = Vec2::new(40.0, 98.0);
-    sim.players[attacker].skills.shooting = 8.0;
-    sim.players[keeper].position = Vec2::new(40.0, 116.0);
-    sim.players[keeper].skills.goalkeeping = 4.5;
-    sim.ball.holder = Some(attacker);
-    sim.ball.position = sim.players[attacker].position;
-    sim.ball.velocity = Vec2::zero();
-    sim.ball.last_touch_team = Some(Team::Home);
-
-    let snapshot = WorldSnapshot::from_match(&sim);
-    let observation = snapshot.observation_for(attacker);
-    assert!(goal_attack_shot_blocks_alternatives(
-        &observation,
-        sim.players[attacker].role
-    ));
-    let shooting_skill = ability01(sim.players[attacker].skills.shooting);
-    let shot_reward = shot_commitment_learning_reward(
-        "shoot",
-        &observation,
-        sim.players[attacker].role,
-        shooting_skill,
-    );
-    let recycle_reward = shot_commitment_learning_reward(
-        "xavi-turn",
-        &observation,
-        sim.players[attacker].role,
-        shooting_skill,
-    );
-    assert!(
-        shot_reward > 0.0,
-        "qualified shot should earn commitment reward, got {shot_reward}"
-    );
-    assert!(
-        recycle_reward < 0.0,
-        "recycling a blocked-alternatives shot window should be penalized, got {recycle_reward}"
-    );
 }
 
 fn forward_pass_climb_curriculum_env_lock() -> std::sync::MutexGuard<'static, ()> {

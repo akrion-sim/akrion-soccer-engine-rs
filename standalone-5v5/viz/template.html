@@ -1,3 +1,4 @@
+<meta charset="utf-8">
 <title>5-a-side RL — before / after learning</title>
 <style>
   :root{
@@ -132,6 +133,10 @@
   .stat .sub{font-size:11px;color:var(--ink-dim);margin-top:2px}
   .analytics2{display:grid;grid-template-columns:1fr 1fr;gap:18px}
   @media (max-width:760px){ .analytics2{grid-template-columns:1fr} }
+  .trendgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+  @media (max-width:900px){ .trendgrid{grid-template-columns:1fr 1fr} }
+  @media (max-width:600px){ .trendgrid{grid-template-columns:1fr} }
+  .trendgrid .curvecard{padding:14px;gap:8px}
   .mini-h{font-family:system-ui,sans-serif;font-weight:700;font-size:14px;margin-bottom:12px}
   .passbar{display:flex;height:26px;border-radius:8px;overflow:hidden;border:1px solid var(--line)}
   .passbar .seg{display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;
@@ -187,6 +192,12 @@
       <button class="ctl" id="play">Pause</button>
       <button class="ctl ghost" id="restart">Restart</button>
       <span class="clock" id="clock">00.0s</span>
+      <select class="ctl ghost" id="speed" aria-label="playback speed" style="padding:8px 10px">
+        <option value="0.25">0.25×</option>
+        <option value="0.5" selected>0.5×</option>
+        <option value="1">1× real-time</option>
+        <option value="2">2×</option>
+      </select>
       <input type="range" id="scrub" min="0" max="100" value="0" aria-label="scrub match">
       <div class="legend">
         <span class="sw"><i style="background:var(--teamA)"></i>learner</span>
@@ -216,25 +227,32 @@
 
   <section>
     <div class="section-head">
+      <h2>Tracked over training</h2>
+      <span class="note">every metric, per training iteration (to the best checkpoint)</span>
+    </div>
+    <div class="trendgrid">
+      <div class="curvecard"><div class="mini-h">Passes / game</div><canvas id="t_pass"></canvas><div class="legend" id="t_pass_lg"></div></div>
+      <div class="curvecard"><div class="mini-h">Pass completion %</div><canvas id="t_comp"></canvas></div>
+      <div class="curvecard"><div class="mini-h">Pass direction / game</div><canvas id="t_dir"></canvas><div class="legend" id="t_dir_lg"></div></div>
+      <div class="curvecard"><div class="mini-h">Shots / game</div><canvas id="t_shots"></canvas><div class="legend" id="t_shots_lg"></div></div>
+      <div class="curvecard"><div class="mini-h">Shot conversion %</div><canvas id="t_conv"></canvas></div>
+      <div class="curvecard"><div class="mini-h">Possession % & bunch %</div><canvas id="t_poss"></canvas><div class="legend" id="t_poss_lg"></div></div>
+      <div class="curvecard"><div class="mini-h">Winrate %</div><canvas id="t_wr"></canvas></div>
+      <div class="curvecard"><div class="mini-h">Turnovers & balls won / game</div><canvas id="t_tovwon"></canvas><div class="legend" id="t_tovwon_lg"></div></div>
+      <div class="curvecard"><div class="mini-h">Teammate spacing (units)</div><canvas id="t_spacing"></canvas></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
       <h2>Match analytics</h2>
       <span class="note">trained model, 300-game average</span>
     </div>
     <div class="statgrid" id="statgrid"></div>
-    <div class="analytics2">
-      <div class="curvecard">
-        <div class="mini-h">Pass mix</div>
-        <div class="passbar" id="passbar"></div>
-        <div class="legend" id="passbar-legend"></div>
-      </div>
-      <div class="curvecard">
-        <div class="mini-h">Rates over training</div>
-        <canvas id="rates"></canvas>
-        <div class="legend">
-          <span class="sw"><i style="background:var(--accent)"></i>pass completion %</span>
-          <span class="sw"><i style="background:var(--good)"></i>shot conversion %</span>
-          <span class="sw"><i style="background:var(--ink-dim)"></i>possession %</span>
-        </div>
-      </div>
+    <div class="curvecard">
+      <div class="mini-h">Pass mix (trained model)</div>
+      <div class="passbar" id="passbar"></div>
+      <div class="legend" id="passbar-legend"></div>
     </div>
   </section>
 
@@ -282,7 +300,8 @@ const META   = /*__META__*/ null;
     {k:'Learner + algo',v:'4 outfielders, <b>PPO</b>+<b>GAE</b>, <b>0</b> deps (own MLP/backprop)'},
   ];
   document.getElementById('facts').innerHTML=facts.map(f=>`<div class="fact"><div class="k">${f.k}</div><div class="v">${f.v}</div></div>`).join('');
-  document.getElementById('foot').innerHTML='Isolated git worktree · <code>cargo run --release -- train</code> · run metadata comes from <code>out/run_manifest.json</code> · display seed '+META.display_seed+' uses the same opening seed for both matches so the contrast is the policy, not the dice.';
+  document.getElementById('foot').innerHTML='Isolated git worktree · <code>cargo run --release -- train</code> · run metadata comes from <code>out/run_manifest.json</code> · display seed '+META.display_seed+' uses the same opening seed for both matches so the contrast is the policy, not the dice.'
+    + (META.display_matched===false ? ' <b>Note:</b> no seed matched the showcase filter (win-by-1..4 with a losing/level untrained side), so this is a <b>fallback</b> game — it may not be representative of the average result; trust the 300-game stats above, not this single match.' : '');
 })();
 
 // ---------- match analytics ----------
@@ -309,28 +328,61 @@ const META   = /*__META__*/ null;
   document.getElementById('passbar-legend').innerHTML=mix.map(m=>
     `<span class="sw"><i style="background:${m.col}"></i>${m.label} ${m.pct}%</span>`).join('');
 
-  // rates over training (pass completion %, shot conversion %, possession %)
-  const cv=document.getElementById('rates');const ctx=cv.getContext('2d');
-  function resize(){const w=cv.clientWidth||420;const dpr=Math.min(2,window.devicePixelRatio||1);
-    cv.width=w*dpr;cv.height=Math.round(w*0.5)*dpr;cv.style.height=Math.round(w*0.5)+'px';ctx.setTransform(dpr,0,0,dpr,0,0);draw(w,Math.round(w*0.5));}
+  // ---- generic training-trend mini charts (every metric, over iterations) ----
   function css(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim();}
-  function draw(w,h){
-    ctx.clearRect(0,0,w,h);const padL=34,padR=12,padT=12,padB=22;
-    const xs=CURVE.map(p=>p.iter),maxI=Math.max(...xs,1);
-    const X=i=>padL+(i/maxI)*(w-padL-padR), Y=v=>padT+(1-v/100)*(h-padT-padB);
-    ctx.strokeStyle=css('--grid');ctx.fillStyle=css('--ink-dim');ctx.font='10px ui-monospace,monospace';
-    ctx.textAlign='right';ctx.textBaseline='middle';
-    for(let g=0;g<=100;g+=25){const y=Y(g);ctx.beginPath();ctx.moveTo(padL,y);ctx.lineTo(w-padR,y);ctx.stroke();ctx.fillText(g,padL-6,y);}
-    const line=(key,mul,color)=>{ctx.strokeStyle=color;ctx.lineWidth=2;ctx.lineJoin='round';ctx.beginPath();
-      CURVE.forEach((p,i)=>{const y=Y((p[key]||0)*mul);i?ctx.lineTo(X(p.iter),y):ctx.moveTo(X(p.iter),y);});ctx.stroke();};
-    line('passcomp',100,css('--accent'));   // pass completion (0..1 -> %)
-    line('conv',100,css('--good'));          // shot conversion
-    line('poss',100,css('--ink-dim'));       // possession
-    ctx.textAlign='center';ctx.textBaseline='top';
-    [0,Math.round(maxI/2),maxI].forEach(i=>ctx.fillText(i,X(i),h-padB+6));
+  const charts=[];
+  function trend(id, series, opts){
+    opts=opts||{};
+    const cv=document.getElementById(id); if(!cv) return;
+    charts.push({cv, ctx:cv.getContext('2d'), series, opts});
+    if(opts.legendId){
+      const lg=document.getElementById(opts.legendId);
+      if(lg) lg.innerHTML=series.map(s=>`<span class="sw"><i style="background:var(${s.cvar})"></i>${s.label}</span>`).join('');
+    }
   }
-  resize();window.addEventListener('resize',resize);
-  new MutationObserver(resize).observe(document.documentElement,{attributes:true,attributeFilter:['data-theme']});
+  function drawChart(c){
+    const {cv,ctx,series,opts}=c;
+    const w=cv.clientWidth||300, h=Math.round((cv.clientWidth||300)*0.62);
+    const dpr=Math.min(2,window.devicePixelRatio||1);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+'px'; ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,w,h);
+    if(!Array.isArray(CURVE)||CURVE.length===0){
+      ctx.fillStyle=css('--ink-dim');ctx.font='11px ui-monospace,monospace';ctx.textAlign='center';ctx.textBaseline='middle';
+      ctx.fillText('no data',w/2,h/2);
+      return;
+    }
+    const padL=30,padR=10,padT=10,padB=18;
+    const maxI=Math.max(...CURVE.map(p=>p.iter),1);
+    let lo=0,hi=1;
+    if(opts.pct){lo=0;hi=100;}
+    else{ hi=-1e9; lo=0; series.forEach(s=>CURVE.forEach(p=>{const v=s.get(p)||0; if(v>hi)hi=v; if(v<lo)lo=v;}));
+      hi = hi>0 ? hi*1.12 : 1; if(lo<0) lo*=1.12; }
+    const X=i=>padL+(i/maxI)*(w-padL-padR), Y=v=>padT+(1-(v-lo)/((hi-lo)||1))*(h-padT-padB);
+    ctx.strokeStyle=css('--grid');ctx.fillStyle=css('--ink-dim');ctx.font='9px ui-monospace,monospace';
+    ctx.textAlign='right';ctx.textBaseline='middle';ctx.lineWidth=1;
+    const ticks= opts.pct?[0,50,100]:[lo,(lo+hi)/2,hi];
+    ticks.forEach(g=>{const y=Y(g);ctx.beginPath();ctx.moveTo(padL,y);ctx.lineTo(w-padR,y);ctx.stroke();
+      ctx.fillText(opts.pct?g:(Math.round(g*10)/10),padL-4,y);});
+    series.forEach(s=>{ctx.strokeStyle=css(s.cvar);ctx.lineWidth=1.8;ctx.lineJoin='round';ctx.beginPath();
+      CURVE.forEach((p,i)=>{const y=Y(s.get(p)||0);i?ctx.lineTo(X(p.iter),y):ctx.moveTo(X(p.iter),y);});ctx.stroke();
+      const last=CURVE[CURVE.length-1]; ctx.fillStyle=css(s.cvar);
+      ctx.beginPath();ctx.arc(X(last.iter),Y(s.get(last)||0),2.4,0,7);ctx.fill();});
+    ctx.textAlign='center';ctx.textBaseline='top';ctx.fillStyle=css('--ink-dim');
+    [0,maxI].forEach(i=>ctx.fillText(i,X(i),h-padB+5));
+  }
+  trend('t_pass',[{label:'attempts',cvar:'--accent',get:p=>(p.fwd||0)+(p.lat||0)+(p.back||0)},{label:'completed',cvar:'--good',get:p=>p.passcmp}],{legendId:'t_pass_lg'});
+  trend('t_comp',[{label:'completion',cvar:'--accent',get:p=>p.passcomp*100}],{pct:true});
+  trend('t_dir',[{label:'forward',cvar:'--teamA',get:p=>p.fwd},{label:'lateral',cvar:'--ink-dim',get:p=>p.lat},{label:'backward',cvar:'--teamB',get:p=>p.back}],{legendId:'t_dir_lg'});
+  trend('t_shots',[{label:'taken',cvar:'--accent',get:p=>p.shots},{label:'scored',cvar:'--good',get:p=>(p.shots||0)*(p.conv||0)}],{legendId:'t_shots_lg'});
+  trend('t_conv',[{label:'conversion',cvar:'--good',get:p=>p.conv*100}],{pct:true});
+  trend('t_poss',[{label:'possession',cvar:'--accent',get:p=>p.poss*100},{label:'bunch',cvar:'--bad',get:p=>p.bunch*100}],{legendId:'t_poss_lg',pct:true});
+  trend('t_wr',[{label:'winrate',cvar:'--accent',get:p=>p.wr*100}],{pct:true});
+  trend('t_tovwon',[{label:'turnovers',cvar:'--teamB',get:p=>p.turnovers},{label:'balls won',cvar:'--teamA',get:p=>p.won}],{legendId:'t_tovwon_lg'});
+  trend('t_spacing',[{label:'spacing',cvar:'--accent',get:p=>p.spacing}],{});
+  function drawAll(){charts.forEach(drawChart);}
+  drawAll();
+  window.addEventListener('resize',drawAll);
+  new MutationObserver(drawAll).observe(document.documentElement,{attributes:true,attributeFilter:['data-theme']});
 })();
 
 // ---------- pitch renderer ----------
@@ -433,9 +485,13 @@ const NF=Math.min(BEFORE.frames.length,AFTER.frames.length);
 
 // ---------- playback ----------
 let fi=0, playing=!reduce, last=0;
-const FPS=(AFTER.hz||BEFORE.hz||10); // REAL-TIME: advance sim frames at the sim's own Hz (1x)
+const HZ=(AFTER.hz||BEFORE.hz||10);       // sim ticks/sec (1x = real-time)
+let speed=0.5;                            // default half-speed so it's watchable
 const playBtn=document.getElementById('play');
+const speedSel=document.getElementById('speed');
+if(speedSel){ speedSel.value='0.5'; speedSel.onchange=()=>{speed=parseFloat(speedSel.value);}; }
 const scrub=document.getElementById('scrub'); scrub.max=NF-1;
+const FPS=HZ; // kept for the clock (fi/HZ = real seconds regardless of playback speed)
 function updateScores(){
   const b=BEFORE.frames[fi|0], a=AFTER.frames[fi|0];
   document.getElementById('sa0').textContent=b.ga; document.getElementById('sb0').textContent=b.gb;
@@ -447,7 +503,7 @@ function render(){P0.draw(fi);P1.draw(fi);updateScores();}
 function loop(t){
   if(playing){
     if(!last)last=t;
-    fi += (t-last)/1000*FPS; last=t;
+    fi += (t-last)/1000*HZ*speed; last=t;
     if(fi>=NF-1){fi=NF-1; render(); playing=false; playBtn.textContent='Replay'; requestAnimationFrame(loop); return;}
     render();
   } else last=0;

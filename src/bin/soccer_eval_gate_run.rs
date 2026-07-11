@@ -66,9 +66,7 @@ fn train_candidate_brain(games: usize, minutes: f64, seed_base: u32) -> Option<T
         config.neural_blend.actor_critic = true;
         let total_ticks = config.total_ticks();
         let mut sim = SoccerMatch::default_11v11(config).with_team_policies((*policies).clone());
-        if env_bool("SOCCER_ENGINE_UNIFORM_ELITE_PLAYERS", true) {
-            sim.set_uniform_elite_players();
-        }
+        sim.set_uniform_elite_players();
         if let Some(s) = snapshot.as_ref() {
             if let Err(e) = sim.set_neural_network_snapshot(s.clone()) {
                 eprintln!("train game {g}: snapshot install failed: {e}");
