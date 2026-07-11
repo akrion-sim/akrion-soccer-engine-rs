@@ -76,7 +76,7 @@ SIGMA0  = float(os.environ.get("TUNE_SIGMA", "0.25"))   # initial step, in norma
 RNG     = random.Random(int(os.environ.get("TUNE_RNG", "1")))
 # Fixed env every candidate inherits. Frozen speed = the config that actually
 # attacks; we optimize the action-policy reward first.
-FIXED   = {"SPEED_WARMUP": "999999"}
+FIXED   = {"SPEED_WARMUP": os.environ.get("TUNE_SPEED_WARMUP", "250")}
 LOG     = os.path.join(HERE, "tune_log.csv")
 
 # hardening gates on the FINAL line (in addition to the trainer's own gates=)
@@ -258,7 +258,7 @@ def main():
         print(f"  {s[0]}={v:.5g}")
     print("\nConfirm at full length + multi-seed before shipping, e.g.:")
     print("  " + " ".join(f"{s[0]}={v:.5g}" for s, v in zip(SPACE, best[1]))
-          + f" SPEED_WARMUP=999999 ./target/release/fiveaside train 1000")
+          + f" SPEED_WARMUP={FIXED['SPEED_WARMUP']} ./target/release/fiveaside train 1000")
 
 
 if __name__ == "__main__":
