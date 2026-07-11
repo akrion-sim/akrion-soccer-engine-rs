@@ -620,22 +620,29 @@ pub fn train_iter(policy: &mut Policy, games: usize, ent_beta: f32, rng: &mut Rn
                 let sprobs = masked_softmax(&logits[NA..NA + NS], &[true; NS]);
                 let p_a = aprobs[s.action].max(1e-8);
                 let p_s = sprobs[s.speed].max(1e-8);
-                let new_logp = p_a.ln() + p_s.ln(); // JOINT log-prob of (action, speed)
-                let ratio = (new_logp - s.old_logp).exp();
                 let a = s.adv;
-                // PPO clip: one gradient coefficient shared by both heads (single
-                // joint ratio + advantage).
-                let coeff = if a >= 0.0 {
-                    if ratio <= 1.0 + CLIP {
+                // DECOUPLED PPO: each head gets its OWN clipped importance ratio,
+                // sharing the same advantage. A single JOINT ratio let the (7-way,
+                // high-variance) speed head push the ratio into the clip region and
+                // STARVE the action head of gradient — which prevented the attack
+                // from ever being learned. Independent ratios fix that.
+                let ratio_a = (p_a.ln() - s.old_logp_a).exp();
+                let ratio_s = (p_s.ln() - s.old_logp_s).exp();
+                let clip_coeff = |ratio: f32| -> f32 {
+                    if a >= 0.0 {
+                        if ratio <= 1.0 + CLIP {
+                            a * ratio
+                        } else {
+                            0.0
+                        }
+                    } else if ratio >= 1.0 - CLIP {
                         a * ratio
                     } else {
                         0.0
                     }
-                } else if ratio >= 1.0 - CLIP {
-                    a * ratio
-                } else {
-                    0.0
                 };
+                let coeff_a = clip_coeff(ratio_a);
+                let coeff_s = clip_coeff(ratio_s);
                 // entropy of each head
                 let mut ent = 0.0f32;
                 for i in 0..NA {
