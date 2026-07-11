@@ -631,8 +631,7 @@ impl World {
                 }
             }
         } else {
-            // DIAGNOSTIC: GET_OPEN temporarily excluded to isolate its effect.
-            for a in A_CHASE..=A_STAY {
+            for a in A_CHASE..=A_GET_OPEN {
                 m[a] = true;
             }
         }
