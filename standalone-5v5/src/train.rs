@@ -395,7 +395,8 @@ fn noisy_scripted_actions(w: &World, team: Team, noise: f32, rng: &mut Rng) -> [
     for i in 1..N {
         if rng.f01() < noise {
             let mask = w.legal_mask(team, i);
-            acts[i] = sample_legal_action(&mask, rng);
+            let a = sample_legal_action(&mask, rng);
+            acts[i] = a + scripted_gear(a) * NA; // keep the noisy move at a real speed
         }
     }
     acts
