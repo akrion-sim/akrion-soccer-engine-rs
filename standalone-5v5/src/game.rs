@@ -247,6 +247,7 @@ impl World {
             pass_dir_a: 0,
             ev_shot_attempt_a: false,
             last_shot_quality_a: 0.0,
+            last_shot_xg_a: 0.0,
             pending_pass: None,
             intended_receiver: None,
             pass_kick_x: 0.0,
