@@ -27,6 +27,18 @@ const EPOCHS: usize = 4;
 const MINIBATCH: usize = 1024;
 const MAX_ROLLOUT_THREADS: usize = 4;
 const MIN_REWARD_WEIGHT: f32 = 0.0001;
+const LINGER_RADIUS: f32 = 4.0; // "same radius": teammates within this many yards
+/// Consecutive ticks two teammates must LINGER within LINGER_RADIUS before the
+/// spacing penalty applies. Brief crossings/convergence pay nothing (real soccer:
+/// players run right past each other). Env `SPACING_LINGER_SECS` (default 1.5 s).
+fn linger_ticks() -> u32 {
+    let secs = std::env::var("SPACING_LINGER_SECS")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(1.5);
+    ((secs / DT).round() as u32).max(1)
+}
 // ─── Tunable reward weights (env-overridable, read ONCE per process) ─────────
 // Every weight below can be set via an env var of the same name, so an external
 // search harness (viz/tune.py) can optimize the reward vector without
@@ -145,7 +157,7 @@ fn spacing_reward(d: f32) -> f32 {
     } else if d < 1.5 {
         -50.0
     } else if d < 3.0 {
-        -8.0 // within 3 yds: bumped penalty (was -3)
+        -18.0 // within 3 yds: STEEP (lingering this close is bad)
     } else if d < 4.0 {
         -3.0 // within 4 yds: now also penalized
     } else if d < 8.0 {
@@ -415,6 +427,10 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
     let mut space_buf: Vec<[f32; N]> = Vec::with_capacity(STEPS); // per-player spacing reward
 
     let mut phi_prev = w.potential_a();
+    // per-outfielder linger counters: consecutive ticks a teammate has been within
+    // LINGER_RADIUS. Only SUSTAINED lingering triggers the spacing penalty.
+    let mut close_ticks = [0u32; N];
+    let linger_gate = linger_ticks();
 
     for _ in 0..STEPS {
         let mut obs_t = [[0.0f32; OBS_DIM]; N];
@@ -597,7 +613,18 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
                 }
             }
             if nd.is_finite() {
-                sp_t[i] = w_spacing_coeff * spacing_reward(nd);
+                // LINGER GATE: brief closeness (crossing runs, converging on the ball)
+                // is fine — only SUSTAINED lingering in the same radius is penalized.
+                if nd < LINGER_RADIUS {
+                    close_ticks[i] += 1;
+                } else {
+                    close_ticks[i] = 0;
+                }
+                let mut sr = spacing_reward(nd);
+                if sr < 0.0 && close_ticks[i] <= linger_gate {
+                    sr = 0.0; // transient — not yet a lingering-bunch penalty
+                }
+                sp_t[i] = w_spacing_coeff * sr;
             }
             let is_carrier = matches!(w.owner, Some(o) if o.team == Team::A && o.idx == i);
             // ANTI-PASSIVITY: the STAND gear must not be a free way to farm the
