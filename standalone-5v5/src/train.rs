@@ -264,11 +264,19 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
                 let advance = pos.x / FIELD_L - 0.45;
                 // OPEN = a CLEAR passing lane from the ball to me (no defender in
                 // between). NOT merely far from a marker — a player inline behind a
-                // defender is NOT open.
+                // defender is NOT open. This is the MECHANISM for "opening up": the
+                // SOLUTION the policy should learn is to move to a WIDER position,
+                // which clears the lane (hence width is rewarded strongly too).
                 let open = w.lane_clearness(Team::A, w.ball, pos) - 0.5;
-                // WIDTH: stretch the pitch (get away from the central lane)
-                let width = (pos.y - FIELD_W / 2.0).abs() / (FIELD_W / 2.0) - 0.4;
-                sp_t[i] += W_ADVANCE * advance + W_OPEN * open + W_WIDTH * width;
+                // WIDTH: how far off the central lane (0 = center, 1 = touchline).
+                let wide = (pos.y - FIELD_W / 2.0).abs() / (FIELD_W / 2.0);
+                let width = wide - 0.4; // penalize the central lane, reward stretching
+                // FLANK affinity: convex bonus for genuinely committing to a
+                // left/right channel. With the 8-yd anti-bunch this splits the
+                // front line across BOTH flanks instead of clustering one side.
+                let flank = if wide > 0.5 { (wide - 0.5) * 2.0 } else { 0.0 };
+                sp_t[i] +=
+                    W_ADVANCE * advance + W_OPEN * open + W_WIDTH * width + W_FLANK * flank;
             } else if their_phase {
                 // goalside of the ball: our goal is at x=0, so reward being at a
                 // LOWER x than the ball (between ball and own goal).
