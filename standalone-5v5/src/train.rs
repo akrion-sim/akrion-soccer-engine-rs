@@ -186,10 +186,10 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
         // little. SMALL per-tick — it fires every tick you carry, so a big value
         // accumulates into ball-hoarding that dwarfs goals.
         if w.ev_dribble_fwd_a {
-            r += 0.03;
+            r += 0.015; // small — must NOT out-compete the passing the goal needs
         }
         if w.ev_dribble_lat_a {
-            r += 0.01;
+            r += 0.005;
         }
         if w.ev_turnover_a && (w.ev_dribble_fwd_a || w.ev_dribble_lat_a) {
             r -= 0.4; // dispossessed while dribbling
