@@ -55,6 +55,9 @@ fn speed_val(gear: usize, carrying: bool) -> f32 {
 }
 const CONTROL_RADIUS: f32 = 1.5; // secure a received ball -> possessions can develop
 const RECEIVE_RADIUS: f32 = 2.8; // intended pass receiver collects from further out
+const AERIAL_CONTROL_SPACE: f32 = 3.6; // a SCOOPED (aerial) pass needs the receiver this open to control
+const CURL_MIN_DIST: f32 = 20.0; // passes/shots longer than this can be given curl (spin)
+const CURL_ACCEL: f32 = 6.0; // lateral curl acceleration on a long ball (bends around a defender)
 const TACKLE_RADIUS: f32 = 1.6;
 const TACKLE_PROB: f32 = 0.12; // per-tick; retuned for 20 Hz to keep same per-second rate
 const BALL_FRICTION: f32 = 0.965; // per-tick decay retuned for 20 Hz (same per-second decay)
@@ -174,6 +177,12 @@ pub struct World {
     pub b: [Player; N],
     pub ball: V2,
     pub ball_vel: V2,
+    pub ball_aerial: bool,  // in-flight ball is a lofted/scooped pass (over ground defenders)
+    pub air_ticks: u32,     // ticks the scooped ball stays airborne before it lands
+    pub ball_curl: V2,      // lateral curl (spin) accel on a long (>20yd) pass/shot
+    pending_curl: V2,       // scratch: curl for the kick launching this tick
+    pending_aerial: bool,   // scratch: the pass launched this tick is a scoop
+    pending_air_ticks: u32, // scratch: airborne duration for the launching scoop
     pub owner: Option<Owner>,
     pub last_touch: Option<Team>,
     last_kicker: Option<Owner>,
@@ -236,6 +245,12 @@ impl World {
             }; N],
             ball: V2::new(FIELD_L / 2.0, FIELD_W / 2.0),
             ball_vel: V2::default(),
+            ball_aerial: false,
+            air_ticks: 0,
+            ball_curl: V2::default(),
+            pending_curl: V2::default(),
+            pending_aerial: false,
+            pending_air_ticks: 0,
             owner: None,
             last_touch: None,
             last_kicker: None,
@@ -346,6 +361,26 @@ impl World {
 
     // -- pass-target ranking: pick every outfield teammate for the possessor ---
     // Score favors forward progress (toward attacked goal) and openness.
+    /// Curl (lateral accel) for a LONG (>20yd) pass/shot — bends the ball around a
+    /// defender in the lane. Field-vector driven: curls AWAY from the nearest
+    /// opponent to the lane midpoint. Zero for short balls; more on longer ones.
+    fn kick_curl(&self, team: Team, from: V2, to: V2) -> V2 {
+        let seg = to.sub(from);
+        let dist = seg.len();
+        if dist < CURL_MIN_DIST {
+            return V2::default();
+        }
+        let dir = seg.unit();
+        let perp = V2::new(-dir.y, dir.x);
+        let mid = from.add(seg.scale(0.5));
+        let (oi, _) = self.nearest_opponent(team, mid);
+        let opp = players(team.other(), self)[oi].pos;
+        let rel = opp.sub(mid);
+        let side = if rel.x * perp.x + rel.y * perp.y > 0.0 { -1.0 } else { 1.0 };
+        let strength = CURL_ACCEL * ((dist - CURL_MIN_DIST) / 20.0).clamp(0.0, 1.0);
+        perp.scale(side * strength)
+    }
+
     fn pass_candidates(
         &self,
         team: Team,
@@ -822,6 +857,11 @@ impl World {
             self.last_touch = Some(kicker.team);
             self.last_kicker = Some(kicker);
             self.kick_timer = 6;
+            self.ball_aerial = is_pass && self.pending_aerial;
+            self.air_ticks = if self.ball_aerial { self.pending_air_ticks } else { 0 };
+            self.pending_aerial = false;
+            self.ball_curl = self.pending_curl;
+            self.pending_curl = V2::default();
             self.pending_pass = None;
             if is_pass {
                 // remember intended receiver (BOTH teams) so the reception radius
@@ -855,7 +895,16 @@ impl World {
         // 4. Advance a free ball + friction, walls, goals, capture.
         if self.owner.is_none() {
             self.ball = self.ball.add(self.ball_vel.scale(DT));
+            if self.ball_vel.len() > 4.0 {
+                self.ball_vel = self.ball_vel.add(self.ball_curl.scale(DT));
+            }
             self.ball_vel = self.ball_vel.scale(BALL_FRICTION);
+            if self.ball_aerial {
+                self.air_ticks = self.air_ticks.saturating_sub(1);
+                if self.air_ticks == 0 {
+                    self.ball_aerial = false; // the scoop lands -> a normal ground ball
+                }
+            }
 
             // reflect off side-lines (y walls) to keep play flowing
             if self.ball.y < 0.0 {
@@ -935,6 +984,10 @@ impl World {
         // anticipation edge, so passes actually CONNECT instead of going loose —
         // unless an opponent is genuinely closer and intercepts.
         if best.is_none() && !ball_fast {
+            // A SCOOPED ball in the air is over ground players: only the intended
+            // receiver can bring it down, and only if they are open enough to
+            // control it (aerial touch needs space). Otherwise it flies on / lands.
+            let aerial = self.ball_aerial && self.air_ticks > 0;
             let mut best_eff = f32::INFINITY;
             for team in [Team::A, Team::B] {
                 for i in 0..N {
@@ -950,6 +1003,16 @@ impl World {
                     }
                     let is_recv =
                         matches!(self.pending_pass, Some(r) if r.team == team && r.idx == i);
+                    if aerial {
+                        if !is_recv {
+                            continue; // ground players can't reach an airborne ball
+                        }
+                        let (_, recv_open) =
+                            self.nearest_opponent(team, players(team, self)[i].pos);
+                        if recv_open < AERIAL_CONTROL_SPACE {
+                            continue; // receiver not open enough to control the scoop yet
+                        }
+                    }
                     let radius = if is_recv {
                         RECEIVE_RADIUS
                     } else {
@@ -970,6 +1033,9 @@ impl World {
         if let Some((o, _)) = best {
             let prev_touch = self.last_touch;
             self.owner = Some(o);
+            self.ball_aerial = false; // controlled -> no longer airborne
+            self.air_ticks = 0;
+            self.ball_curl = V2::default();
             self.a_shot_flag = false; // shot resolved into possession
             self.b_shot_flag = false;
             // Team-A reward events. pending_pass.team is the PASSING team.
@@ -1148,6 +1214,7 @@ impl World {
                         self.ev_shot_on_a = true;
                     }
                 }
+                self.pending_curl = self.kick_curl(team, me, aim);
                 Some((owner, aim.sub(me), SHOT_SPEED, false))
             }
             A_PASS_A | A_PASS_B | A_PASS_C => {
@@ -1158,6 +1225,16 @@ impl World {
                     let tp = players(team, self)[ti].pos;
                     let lead = tp.add(V2::new(sx * 2.0, 0.0));
                     self.intended_receiver = Some(Owner { team, idx: ti });
+                    // SCOOP / lofted pass: if a defender blocks the GROUND lane to the
+                    // target, lift the ball OVER them (aerial) so the pass can still be
+                    // made. Aerial control takes time, so it only completes if the
+                    // receiver is open (checked at reception) — else it lands loose.
+                    let ground_lane = self.lane_clearness(team, me, tp);
+                    if ground_lane < 0.55 {
+                        self.pending_aerial = true;
+                        let flight = (tp.sub(me).len() / (PASS_SPEED * DT)).round() as u32;
+                        self.pending_air_ticks = flight.clamp(3, 30);
+                    }
                     self.set_vel(team, idx, V2::default());
                     if team == Team::A {
                         self.ev_pass_attempt_a = true;
@@ -1184,7 +1261,11 @@ impl World {
                         }
                         self.ev_return_pass_a = is_return;
                     }
-                    Some((owner, lead.sub(me), PASS_SPEED, true))
+                    self.pending_curl = self.kick_curl(team, me, tp);
+                    let pass_dist = tp.sub(me).len();
+                    let pspeed =
+                        PASS_SPEED * (0.85 + 0.35 * (pass_dist / FIELD_L).clamp(0.0, 1.0));
+                    Some((owner, lead.sub(me), pspeed, true))
                 } else {
                     // no valid target: dribble forward instead
                     self.set_vel(team, idx, V2::new(sx, 0.0).scale(speed_val(spd, true)));

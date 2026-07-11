@@ -27,6 +27,29 @@ const EPOCHS: usize = 4;
 const MINIBATCH: usize = 1024;
 const MAX_ROLLOUT_THREADS: usize = 4;
 const MIN_REWARD_WEIGHT: f32 = 0.0001;
+const LINGER_RADIUS: f32 = 4.0; // "same radius": teammates within this many yards
+/// Overlap zone: two players THIS close are occupying the same spot — that is
+/// never "running past each other", so the penalty here is ALWAYS-ON (ungated).
+/// Only the soft 1.5-4yd band is linger-gated (where transient crossings happen).
+const SEVERE_RADIUS: f32 = 1.5;
+/// Leaky-integrator decay: when players separate, the linger counter DECAYS by
+/// this many ticks rather than resetting to 0. This kills the reset-hack where a
+/// policy farms the gate by oscillating in/out of the radius (bunch ~1.4s, step
+/// out 1 tick, re-bunch). A genuine one-time crossing separates and stays apart,
+/// so its counter decays cleanly to 0; sustained oscillation still accumulates
+/// (net gain per cycle whenever close-ticks > DECAY × away-ticks).
+const LINGER_DECAY: u32 = 2;
+/// Consecutive ticks two teammates must LINGER within LINGER_RADIUS before the
+/// spacing penalty applies. Brief crossings/convergence pay nothing (real soccer:
+/// players run right past each other). Env `SPACING_LINGER_SECS` (default 1.5 s).
+fn linger_ticks() -> u32 {
+    let secs = std::env::var("SPACING_LINGER_SECS")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(1.5);
+    ((secs / DT).round() as u32).max(1)
+}
 // ─── Tunable reward weights (env-overridable, read ONCE per process) ─────────
 // Every weight below can be set via an env var of the same name, so an external
 // search harness (viz/tune.py) can optimize the reward vector without
@@ -73,6 +96,7 @@ pub struct Rw {
     pub burst_gear: f32,           // off-ball use of run/sprint gears in possession
     pub field_pass: f32,           // field-vector interaction on completed passes
     pub field_turnover: f32,       // field-vector interaction on turnovers
+    pub chance: f32,               // MARL: team reward for creating a scoring chance (potential)
     pub field_goalside_delta: f32, // reward improving team goalside geometry
     pub field_burst_delta: f32,    // reward improving forward outlet geometry
     pub stand_pen: f32,            // anti-passivity: penalize the STAND gear off-ball
@@ -106,6 +130,7 @@ fn rw() -> &'static Rw {
         burst_gear: wenv("W_BURST_GEAR", 0.035, MIN_REWARD_WEIGHT, 0.16),
         field_pass: wenv("W_FIELD_PASS", 0.08, MIN_REWARD_WEIGHT, 0.30),
         field_turnover: wenv("W_FIELD_TURNOVER", 0.16, MIN_REWARD_WEIGHT, 0.50),
+        chance: wenv("W_CHANCE", 0.12, MIN_REWARD_WEIGHT, 0.60),
         field_goalside_delta: wenv("W_FIELD_GOALSIDE_DELTA", 0.10, MIN_REWARD_WEIGHT, 0.35),
         field_burst_delta: wenv("W_FIELD_BURST_DELTA", 0.08, MIN_REWARD_WEIGHT, 0.35),
         stand_pen: wenv("W_STAND_PEN", 0.02, MIN_REWARD_WEIGHT, 0.20),
@@ -143,7 +168,7 @@ fn spacing_reward(d: f32) -> f32 {
     } else if d < 1.5 {
         -50.0
     } else if d < 3.0 {
-        -8.0 // within 3 yds: bumped penalty (was -3)
+        -18.0 // within 3 yds: STEEP (lingering this close is bad)
     } else if d < 4.0 {
         -3.0 // within 4 yds: now also penalized
     } else if d < 8.0 {
@@ -164,6 +189,7 @@ struct FieldRewardContext {
     goalside_score: f32,
     burst_score: f32,
     return_stale: f32,
+    chance_value: f32,
 }
 
 impl FieldRewardContext {
@@ -190,6 +216,28 @@ impl FieldRewardContext {
         }
         ctx.safe_outlet_value =
             (0.70 * best_outlet + 0.30 * (outlet_count / 3.0).clamp(0.0, 1.0)).clamp(0.0, 1.0);
+        // MARL chance creation: the best SHOOTING chance the attack has manufactured
+        // — an off-ball attacker in a high-xG spot (close+central to the opp goal, in
+        // their half) with a clear reception lane from the ball. Coordinated,
+        // synchronized runs INTO such a spot raise this; used as a potential.
+        if our_phase {
+            let goal = V2::new(FIELD_L, FIELD_W / 2.0);
+            let mut best_chance = 0.0f32;
+            for i in 1..N {
+                let pos = w.a[i].pos;
+                if pos.x < SHOOT_X {
+                    continue;
+                }
+                let d = goal.sub(pos).len();
+                let lateral = (pos.y - FIELD_W / 2.0).abs();
+                let dist_f = (1.0 - d / 26.0).clamp(0.0, 1.0);
+                let angle_f = (1.0 - lateral / (FIELD_W / 2.0)).clamp(0.0, 1.0);
+                let xg = dist_f * dist_f * (0.4 + 0.6 * angle_f);
+                let lane = w.lane_clearness(Team::A, w.ball, pos);
+                best_chance = best_chance.max(xg * lane);
+            }
+            ctx.chance_value = best_chance;
+        }
 
         if let Some(o) = w.owner {
             let carrier = if o.team == Team::A {
@@ -390,6 +438,10 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
     let mut space_buf: Vec<[f32; N]> = Vec::with_capacity(STEPS); // per-player spacing reward
 
     let mut phi_prev = w.potential_a();
+    // per-outfielder linger counters: consecutive ticks a teammate has been within
+    // LINGER_RADIUS. Only SUSTAINED lingering triggers the spacing penalty.
+    let mut close_ticks = [0u32; N];
+    let linger_gate = linger_ticks();
 
     for _ in 0..STEPS {
         let mut obs_t = [[0.0f32; OBS_DIM]; N];
@@ -450,6 +502,12 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
         if w.ev_goal_b {
             r -= rw().concede;
         }
+        // MARL SYNCHRONIZATION: reward the TEAM for collectively moving into a
+        // configuration where a scoring chance becomes available (potential-based on
+        // the best manufactured chance -> telescopes, unfarmable). This is what pulls
+        // attackers to move TOGETHER to create and get off a shot.
+        r += rw().chance
+            * FieldRewardContext::delta(post_field.chance_value, pre_field.chance_value);
         // Only a tiny nudge for a completed pass (prefer it to a loose turnover);
         // forward progress is rewarded by the potential shaping above, and goals
         // dominate — so passing stays INSTRUMENTAL and the policy still attacks.
@@ -566,7 +624,18 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
                 }
             }
             if nd.is_finite() {
-                sp_t[i] = w_spacing_coeff * spacing_reward(nd);
+                // LINGER GATE: brief closeness (crossing runs, converging on the ball)
+                // is fine — only SUSTAINED lingering in the same radius is penalized.
+                if nd < LINGER_RADIUS {
+                    close_ticks[i] += 1;
+                } else {
+                    close_ticks[i] = 0;
+                }
+                let mut sr = spacing_reward(nd);
+                if sr < 0.0 && close_ticks[i] <= linger_gate {
+                    sr = 0.0; // transient — not yet a lingering-bunch penalty
+                }
+                sp_t[i] = w_spacing_coeff * sr;
             }
             let is_carrier = matches!(w.owner, Some(o) if o.team == Team::A && o.idx == i);
             // ANTI-PASSIVITY: the STAND gear must not be a free way to farm the
