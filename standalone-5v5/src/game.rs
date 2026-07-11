@@ -563,8 +563,12 @@ impl World {
             }
             // 2-PASS RULE (Team A): no shooting until 2 completed passes this
             // possession — forces build-up play, not solo dribble-and-shoot.
-            if team == Team::A && self.pass_streak_a < 2 {
-                m[A_SHOOT] = false;
+            // FINAL-THIRD RULE (Team A): may only shoot from the attacking third.
+            if team == Team::A {
+                let x = players(team, self)[idx].pos.x;
+                if self.pass_streak_a < 2 || x < FINAL_THIRD_X {
+                    m[A_SHOOT] = false;
+                }
             }
         } else {
             for a in A_CHASE..=A_STAY {
