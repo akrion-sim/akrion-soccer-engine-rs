@@ -623,6 +623,8 @@ impl World {
         self.ev_return_pass_a = false;
         self.ev_dribble_fwd_a = false;
         self.ev_dribble_lat_a = false;
+        self.shot_was_rapid_a = false;
+        self.shoot_cooldown_a = self.shoot_cooldown_a.saturating_sub(1);
 
         let ball_x_before = self.ball.x;
 
