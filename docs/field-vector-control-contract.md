@@ -71,17 +71,18 @@ trained or searched on one seed partition, frozen for the inner learner, and
 selected on a disjoint held-out partition. Training reward is never the promotion
 metric.
 
-`soccer_reward_context_fit` is the outcome-grounded fitter. It reuses the existing
-configuration-moment corpus rather than inventing another state recorder: each
-row already contains the canonical 256-d embedding, the action taken, immediate
-reward, and realised n-step return. The fitter labels those rows from the final
-W/D/L result plus a small capped goal-margin term; it deliberately does not use
-the already-shaped immediate/n-step reward as the target. Reward heads learn
-higher utility in field configurations where the associated action family led
-to good match outcomes; penalty heads learn the sign-mirrored target. A prior schema-v1 artifact can be
-passed as the fifth argument, so accepted weights are the next run's initial
-condition rather than being reset. The generated artifact is frozen during inner
-policy training and must still clear a disjoint promotion evaluation.
+`soccer_reward_context_fit` is the outcome-grounded fitter. When retrieval capture
+is enabled, the event recorder retains each exact factual typed occurrence (for
+example `ShotOnTarget` or `BadPassChainPenalty`) together with the canonical 256-d
+embedding at that event's tick. The capture intentionally omits the event's
+hand-authored magnitude, so the contextual head cannot merely imitate the assumed
+reward it is meant to replace. The fitter labels only events that actually
+occurred, using the event team's final W/D/L result plus a small capped goal-margin
+term; reward heads learn the outcome target and penalty heads its sign mirror. A
+prior schema-v1 artifact can be passed as the fifth argument, so accepted weights
+are the next run's initial condition rather than being reset. The generated
+artifact is frozen during inner policy training and must still clear a disjoint
+promotion evaluation.
 
 ## Per-player MPC
 

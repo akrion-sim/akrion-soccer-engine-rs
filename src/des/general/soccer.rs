@@ -20806,6 +20806,19 @@ pub(crate) struct SoccerRewardEvent {
     kind: SoccerRewardEventKind,
 }
 
+/// Factual typed reward occurrence captured before any scalar/contextual utility
+/// multiplier is applied. This is the causal training row for reward-context
+/// fitting: what happened, for which team, and the complete field embedding at
+/// that exact tick. Magnitude is intentionally omitted so the fitter cannot
+/// imitate the hand-assumed reward value it is replacing.
+#[derive(Clone, Debug)]
+pub struct SoccerRewardContextSample {
+    pub tick: u64,
+    pub team: Team,
+    pub kind: String,
+    pub embedding: Vec<f64>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SoccerRewardEventKind {
     Routine,

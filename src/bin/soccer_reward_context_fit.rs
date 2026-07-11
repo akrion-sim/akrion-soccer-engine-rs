@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 use soccer_engine::des::general::soccer::{
-    enable_deterministic_formation_lp, MatchConfig, SoccerConfigMomentInsert, SoccerMatch,
+    enable_deterministic_formation_lp, MatchConfig, SoccerMatch, SoccerRewardContextSample,
     SOCCER_MOMENT_EMBEDDING_DIM,
 };
 use std::collections::HashMap;
@@ -39,40 +39,51 @@ struct RewardContextArtifact {
 #[derive(Clone, Copy)]
 struct KindSpec {
     name: &'static str,
-    family: &'static str,
     outcome_sign: f64,
 }
 
 const KIND_SPECS: &[KindSpec] = &[
-    KindSpec { name: "ShotAttempt", family: "shot", outcome_sign: 1.0 },
-    KindSpec { name: "ShotOnTarget", family: "shot", outcome_sign: 1.0 },
-    KindSpec { name: "ShotOffTargetPenalty", family: "shot", outcome_sign: -1.0 },
-    KindSpec { name: "CompletedForwardPass", family: "pass", outcome_sign: 1.0 },
-    KindSpec { name: "BadPassChainPenalty", family: "pass", outcome_sign: -1.0 },
-    KindSpec { name: "TurnoverChainBlame", family: "pass", outcome_sign: -1.0 },
-    KindSpec { name: "ProgressiveCarryContinuation", family: "dribble", outcome_sign: 1.0 },
-    KindSpec { name: "OverdribbleDispossession", family: "dribble", outcome_sign: -1.0 },
-    KindSpec { name: "DefensiveDispossession", family: "defend", outcome_sign: 1.0 },
+    KindSpec {
+        name: "ShotAttempt",
+        outcome_sign: 1.0,
+    },
+    KindSpec {
+        name: "ShotOnTarget",
+        outcome_sign: 1.0,
+    },
+    KindSpec {
+        name: "ShotOffTargetPenalty",
+        outcome_sign: -1.0,
+    },
+    KindSpec {
+        name: "CompletedForwardPass",
+        outcome_sign: 1.0,
+    },
+    KindSpec {
+        name: "BadPassChainPenalty",
+        outcome_sign: -1.0,
+    },
+    KindSpec {
+        name: "TurnoverChainBlame",
+        outcome_sign: -1.0,
+    },
+    KindSpec {
+        name: "ProgressiveCarryContinuation",
+        outcome_sign: 1.0,
+    },
+    KindSpec {
+        name: "OverdribbleDispossession",
+        outcome_sign: -1.0,
+    },
+    KindSpec {
+        name: "DefensiveDispossession",
+        outcome_sign: 1.0,
+    },
 ];
 
 struct LabeledMoment {
-    moment: SoccerConfigMomentInsert,
+    sample: SoccerRewardContextSample,
     outcome: f64,
-}
-
-fn normalized_action_family(action: &str) -> &'static str {
-    let action = action.to_ascii_lowercase();
-    if action.contains("shoot") || action.contains("header") {
-        "shot"
-    } else if action.contains("pass") || action.contains("cross") || action.contains("through") {
-        "pass"
-    } else if action.contains("dribble") || action.contains("carry") || action.contains("nutmeg") {
-        "dribble"
-    } else if action.contains("defend") || action.contains("tackle") || action.contains("press") {
-        "defend"
-    } else {
-        "other"
-    }
 }
 
 fn fit_head(
@@ -96,7 +107,7 @@ fn fit_head(
     let ridge = 1e-4;
     for _ in 0..epochs.max(1) {
         for row in rows {
-            if row.moment.embedding.len() != SOCCER_MOMENT_EMBEDDING_DIM {
+            if row.sample.embedding.len() != SOCCER_MOMENT_EMBEDDING_DIM {
                 continue;
             }
             // Hermetic outcome target: good final match outcome for a reward
@@ -107,12 +118,12 @@ fn fit_head(
             let prediction = head
                 .weights
                 .iter()
-                .zip(&row.moment.embedding)
+                .zip(&row.sample.embedding)
                 .fold(head.bias, |sum, (weight, value)| sum + weight * value)
                 / norm;
             let error = (prediction - target).clamp(-2.0, 2.0);
             head.bias = (head.bias - learning_rate * error / norm).clamp(-2.0, 2.0);
-            for (weight, value) in head.weights.iter_mut().zip(&row.moment.embedding) {
+            for (weight, value) in head.weights.iter_mut().zip(&row.sample.embedding) {
                 if value.is_finite() {
                     *weight = (*weight - learning_rate * (error * value / norm + ridge * *weight))
                         .clamp(-2.0, 2.0);
@@ -134,8 +145,14 @@ fn main() {
     let out = args.get(1).expect(
         "usage: soccer_reward_context_fit <out.json> [games=40] [minutes=1] [seed_hex] [prior.json]",
     );
-    let games = args.get(2).and_then(|value| value.parse().ok()).unwrap_or(40usize);
-    let minutes = args.get(3).and_then(|value| value.parse().ok()).unwrap_or(1.0f64);
+    let games = args
+        .get(2)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(40usize);
+    let minutes = args
+        .get(3)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1.0f64);
     let seed_base = parse_hex(args.get(4), 0xC07E_0000);
     let prior: Option<RewardContextArtifact> = args.get(5).and_then(|path| {
         std::fs::read_to_string(path)
@@ -171,23 +188,28 @@ fn main() {
         let summary = sim.summary();
         let home_margin = summary.score_home as i32 - summary.score_away as i32;
         let before = moments.len();
-        moments.extend(sim.config_moments().into_iter().filter_map(|row| {
-            if row.embedding.len() != SOCCER_MOMENT_EMBEDDING_DIM
-                || row.embedding.iter().any(|value| !value.is_finite())
-            {
-                return None;
-            }
-            let margin = match row.team {
-                soccer_engine::des::general::soccer::Team::Home => home_margin,
-                soccer_engine::des::general::soccer::Team::Away => -home_margin,
-            };
-            let result = margin.signum() as f64;
-            let margin_bonus = (margin as f64 / 3.0).clamp(-1.0, 1.0) * 0.20;
-            Some(LabeledMoment {
-                moment: row,
-                outcome: (result + margin_bonus).clamp(-1.0, 1.0),
-            })
-        }));
+        moments.extend(
+            sim.reward_context_samples()
+                .iter()
+                .cloned()
+                .filter_map(|sample| {
+                    if sample.embedding.len() != SOCCER_MOMENT_EMBEDDING_DIM
+                        || sample.embedding.iter().any(|value| !value.is_finite())
+                    {
+                        return None;
+                    }
+                    let margin = match sample.team {
+                        soccer_engine::des::general::soccer::Team::Home => home_margin,
+                        soccer_engine::des::general::soccer::Team::Away => -home_margin,
+                    };
+                    let result = margin.signum() as f64;
+                    let margin_bonus = (margin as f64 / 3.0).clamp(-1.0, 1.0) * 0.20;
+                    Some(LabeledMoment {
+                        sample,
+                        outcome: (result + margin_bonus).clamp(-1.0, 1.0),
+                    })
+                }),
+        );
         eprintln!(
             "context_fit game {}/{} moments_added={} total={}",
             game + 1,
@@ -202,10 +224,12 @@ fn main() {
     for spec in KIND_SPECS {
         let rows: Vec<_> = moments
             .iter()
-            .filter(|row| normalized_action_family(&row.moment.action) == spec.family)
+            .filter(|row| row.sample.kind == spec.name)
             .collect();
         samples_by_kind.insert(spec.name.to_string(), rows.len());
-        let prior_head = prior.as_ref().and_then(|artifact| artifact.by_kind.get(spec.name));
+        let prior_head = prior
+            .as_ref()
+            .and_then(|artifact| artifact.by_kind.get(spec.name));
         by_kind.insert(
             spec.name.to_string(),
             fit_head(&rows, spec.outcome_sign, prior_head, epochs, learning_rate),

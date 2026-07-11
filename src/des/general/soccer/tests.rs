@@ -47085,6 +47085,28 @@ fn goal_reward_contextualizes_recent_attacking_decisions() {
 }
 
 #[test]
+fn factual_reward_context_capture_uses_exact_event_and_whole_field_embedding() {
+    let mut config = MatchConfig {
+        duration_seconds: 0.1,
+        seed: 158,
+        ..Default::default()
+    };
+    config.retrieval.capture_enabled = true;
+    let mut sim = SoccerMatch::default_11v11(config);
+    sim.tick = 17;
+
+    sim.test_record_reward_event_with_kind(9, 123.0, SoccerRewardEventKind::ShotOnTarget);
+
+    let samples = sim.reward_context_samples();
+    assert_eq!(samples.len(), 1);
+    assert_eq!(samples[0].tick, 17);
+    assert_eq!(samples[0].team, sim.players[9].team);
+    assert_eq!(samples[0].kind, "ShotOnTarget");
+    assert_eq!(samples[0].embedding.len(), SOCCER_MOMENT_EMBEDDING_DIM);
+    assert!(samples[0].embedding.iter().all(|value| value.is_finite()));
+}
+
+#[test]
 fn shot_on_target_contextualizes_recent_attacking_decisions_inside_twenty() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,

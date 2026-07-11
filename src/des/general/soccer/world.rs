@@ -1628,6 +1628,10 @@ pub struct SoccerMatch {
     pub(crate) pending_aerial_finish: Option<(usize, u64)>,
     pub(crate) coach_set_play_hints: HashMap<Team, SoccerSetPlayVectorHint>,
     pub(crate) reward_events: Vec<SoccerRewardEvent>,
+    /// Persistent factual event-context rows for offline contextual-utility
+    /// fitting. Populated only when retrieval capture is enabled; unlike the
+    /// per-tick reward buffer, this survives until the match ends.
+    pub(crate) reward_context_samples: Vec<SoccerRewardContextSample>,
     /// Cross-tick DEFERRED credit: `(decision_tick, player_id, amount)` for delayed OUTCOME rewards
     /// (a completed pass resolves ~30 ticks AFTER the pass decision). The per-tick `reward_events`
     /// buffer is cleared each tick, so a delayed reward recorded at the RESOLUTION tick lands on the
@@ -13205,6 +13209,7 @@ impl SoccerMatch {
             pending_aerial_finish: None,
             coach_set_play_hints: HashMap::new(),
             reward_events: Vec::new(),
+            reward_context_samples: Vec::new(),
             deferred_reward_credits: Vec::new(),
             episode_learning_transitions: Vec::new(),
             episode_config_captures: Vec::new(),
@@ -13536,6 +13541,7 @@ impl SoccerMatch {
             deferred_reward_transitions: Vec::new(),
             deferred_reward_credits: Vec::new(),
             reward_events: Vec::new(),
+            reward_context_samples: Vec::new(),
             turnover_penalty_history: VecDeque::new(),
             last_turnover_penalty_tick: None,
             pending_turnover_outcome: None,
@@ -21024,6 +21030,12 @@ impl SoccerMatch {
             .collect()
     }
 
+    /// Factual typed reward occurrences with their exact whole-field context,
+    /// retained for the offline reward-context fitter when capture is enabled.
+    pub fn reward_context_samples(&self) -> &[SoccerRewardContextSample] {
+        &self.reward_context_samples
+    }
+
     /// State-only feature vector for the actor: the transition's critic features
     /// built with a **null action**, then extended with an explicit role one-hot
     /// so the shared policy can specialize by position without changing the
@@ -24366,6 +24378,16 @@ impl SoccerMatch {
         self.record_reward_event_at_with_kind(self.tick, player_id, amount, kind);
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_record_reward_event_with_kind(
+        &mut self,
+        player_id: usize,
+        amount: f64,
+        kind: SoccerRewardEventKind,
+    ) {
+        self.record_reward_event_with_kind(player_id, amount, kind);
+    }
+
     fn record_reward_event_at_with_kind(
         &mut self,
         tick: u64,
@@ -24373,7 +24395,8 @@ impl SoccerMatch {
         amount: f64,
         kind: SoccerRewardEventKind,
     ) {
-        let whole_field_embedding = if reward_context_calibration_enabled()
+        let capture_context = self.config.retrieval.capture_enabled;
+        let whole_field_embedding = if (reward_context_calibration_enabled() || capture_context)
             && player_id < self.players.len()
         {
             let snapshot = self.export_world_snapshot();
@@ -24390,11 +24413,19 @@ impl SoccerMatch {
         } else {
             None
         };
-        let amount = calibrated_reward_event_amount(
-            kind,
-            amount,
-            whole_field_embedding.as_deref(),
-        );
+        if capture_context {
+            if let (Some(embedding), Some(player)) =
+                (whole_field_embedding.as_ref(), self.players.get(player_id))
+            {
+                self.reward_context_samples.push(SoccerRewardContextSample {
+                    tick,
+                    team: player.team,
+                    kind: format!("{kind:?}"),
+                    embedding: embedding.clone(),
+                });
+            }
+        }
+        let amount = calibrated_reward_event_amount(kind, amount, whole_field_embedding.as_deref());
         // Drop non-finite amounts: `NaN.abs() <= 1e-9` is false, so without this
         // an upstream NaN/Inf would slip past the magnitude gate and pollute the
         // reward-event sum used in transition shaping.
