@@ -176,10 +176,17 @@ def fitness(vec):
 
 
 def eval_pool(vectors):
-    """evaluate a generation with a small process pool over (candidate, seed)."""
+    """evaluate a generation with a small process pool over (candidate, seed).
+
+    Each child's stdout+stderr is redirected to a FILE, not a PIPE: a training
+    run prints far more than the ~64KB OS pipe buffer, and the old code only
+    drained the pipe *after* poll() reported exit — so a child could block on
+    write() forever and wedge the whole sweep. A file sink can't deadlock. Each
+    child also gets a hard deadline (TIMEOUT) and is killed + scored as a failure
+    if it overruns, so one hung run can't stall a multi-hour search."""
     jobs = [(ci, si, vectors[ci], s) for ci in range(len(vectors)) for si, s in enumerate(SEEDS)]
     results = {}  # (ci, si) -> metrics
-    running = {}  # proc -> (ci, si)
+    running = {}  # proc -> (ci, si, logpath, logfile, deadline)
     qi = 0
     tmp = os.path.join(ROOT, "out_tune")
     while qi < len(jobs) or running:
@@ -189,17 +196,33 @@ def eval_pool(vectors):
             for (name, *_), v in zip(SPACE, vec):
                 env[name] = f"{v:.6g}"
             outdir = f"{tmp}_{ci}_{si}"
+            os.makedirs(outdir, exist_ok=True)
+            logpath = os.path.join(outdir, "stdout.log")
+            logf = open(logpath, "w")
             cmd = [BIN, "train", str(ITERS), "--seed", str(seed),
                    "--final-games", str(FINALG), "--out-dir", outdir]
             proc = subprocess.Popen(cmd, env=env, cwd=ROOT,
-                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-            running[proc] = (ci, si)
+                                    stdout=logf, stderr=subprocess.STDOUT, text=True)
+            running[proc] = (ci, si, logpath, logf, time.time() + TIMEOUT)
         time.sleep(1.0)
         for proc in list(running):
-            if proc.poll() is not None:
-                ci, si = running.pop(proc)
-                out, _ = proc.communicate()
+            ci, si, logpath, logf, deadline = running[proc]
+            done = proc.poll() is not None
+            if not done and time.time() > deadline:
+                proc.kill(); proc.wait(); done = True  # overran -> parse() of partial log likely None
+            if done:
+                running.pop(proc)
+                logf.close()
+                try:
+                    with open(logpath) as fh:
+                        out = fh.read()
+                except OSError:
+                    out = ""
                 results[(ci, si)] = parse(out)
+    if not any(v is not None for v in results.values()):
+        sys.exit("NO candidate produced a parseable FINAL line this generation — "
+                 "the trainer output format likely changed (check FINAL_RE) or every "
+                 "run crashed/timed out. Aborting rather than ranking pure noise.")
     # reduce per-candidate over seeds
     fits = []
     for ci in range(len(vectors)):
