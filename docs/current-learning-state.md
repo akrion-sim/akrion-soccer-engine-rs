@@ -6,29 +6,6 @@ implemented yet.
 
 ## Implemented Now
 
-- `DD_SOCCER_ENABLE_HERMETIC_NEURAL_CRITIC` removes the aliased tabular Q from
-  neural critic targets. It implies a full-weight neural successor bootstrap and
-  uses zero only for cold start or terminal states; the tabular policy remains
-  available for separately gated behavior/fallback paths, but cannot leak into
-  this critic target.
-- Reward events now cross one typed calibration seam before entering learning.
-  `DD_SOCCER_REWARD_KIND_SCALES` accepts bounded, sign-safe per-kind utility
-  multipliers such as `CompletedForwardPass=0.8,BadPassChainPenalty=1.3`.
-  Event facts and attribution stay unchanged; only learner utility changes.
-  This is the deployment seam for an outer held-out optimizer to publish tuned
-  weights. Do not update these weights from the same trajectories they score:
-  tune on disjoint match batches, freeze for a training window, and accept a
-  calibration only through the existing held-out WDL/Wilson/goal-difference
-  promotion gate.
-- `scripts/optimize_reward_calibration.py` is the persistent outer loop for that
-  seam. It uses cross-entropy-method proposals in bounded log-scale space,
-  freezes each proposal for a complete analytic-opponent training window, and
-  evaluates on a disjoint analytic seed range. Its authoritative objective is
-  the held-out Wilson lower bound, with small goal-difference tie-breaking and
-  a turnover-regression tax. Every proposal, seed, snapshot, log, and verdict is
-  stored under the requested output directory; `--resume` continues the audit
-  trail instead of restarting or silently selecting on training reward.
-
 - The runtime decision stack is hybrid: MDP/POMDP observations and analytic beliefs
   generate legal options, neural policy/value and tabular/retrieval priors score them,
   bounded MCTS/PUCT may rerank a capped candidate set, and per-player MPC executes or

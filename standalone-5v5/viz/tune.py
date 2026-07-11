@@ -63,6 +63,10 @@ SPACE = [
     ("W_FIELD_GOALSIDE_DELTA", 0.10, MIN_WEIGHT, 0.35, False),
     ("W_FIELD_BURST_DELTA", 0.08, MIN_WEIGHT, 0.35, False),
     ("W_STAND_PEN",    0.02, MIN_WEIGHT,   0.20, False),
+    # MARL chance-creation weight — the binary reads this (train.rs wenv("W_CHANCE",..));
+    # it was previously frozen at its default and excluded from the search, silently
+    # under-covering the 31-weight reward vector. Now tuned like the rest.
+    ("W_CHANCE",       0.12, MIN_WEIGHT,   0.60, False),
 ]
 
 ITERS   = int(os.environ.get("TUNE_ITERS", "500"))

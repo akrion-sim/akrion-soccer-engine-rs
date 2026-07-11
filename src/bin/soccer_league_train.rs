@@ -10,9 +10,7 @@
 //! kills gradients — likely a direct cause of the plateau), snapshots temporal checkpoints into
 //! the league for growing diversity, and publishes the compact learned-params.json that the
 //! local stack (:5055, champion-gate, eval) reads only after the checkpoint gate accepts it.
-//! NO genetic algorithm, NO RDS. By default this is the anti-parity climb lane: neural-authoritative
-//! ranking, stronger critic targets, actor-critic exploration, and analytic-opponent fixtures so the
-//! gradient is "beat the engine" rather than "mirror self-play".
+//! NO genetic algorithm, NO RDS.
 //!
 //! Env: SOCCER_LEAGUE_FRONTIER (path, default /tmp/neural-climb-local/learned-params.json)
 //!      SOCCER_LEAGUE_ARCHIVE  (dir,  default /tmp/neural-climb-local/champions)
@@ -29,17 +27,13 @@ use std::path::Path;
 use std::time::Instant;
 
 use soccer_engine::des::general::soccer::{
-    average_soccer_neural_network_snapshots, learned_mpc_objective_enabled, FacingBucket,
-    MatchSummary, SoccerNeuralBlendMode, SoccerNeuralNetworkSnapshot, SoccerQStateKey,
-    SoccerQTargetEntry, TacticalPhase, Team,
+    learned_mpc_objective_enabled, FacingBucket, MatchSummary, SoccerNeuralNetworkSnapshot,
+    SoccerQStateKey, SoccerQTargetEntry, TacticalPhase, Team,
 };
 use soccer_engine::des::general::tournament::{
     EngineMatchRunner, EngineMatchRunnerConfig, TeamBrain, TournamentMatchContext,
     TournamentMatchRunner, TournamentStage,
 };
-
-const MIN_REWARD_WEIGHT: f64 = 0.0001;
-
 fn env_str(k: &str, d: &str) -> String {
     std::env::var(k).unwrap_or_else(|_| d.to_string())
 }
@@ -70,11 +64,6 @@ fn env_f64(k: &str, d: f64) -> f64 {
         .and_then(|v| v.parse().ok())
         .unwrap_or(d)
 }
-fn env_f64_any(keys: &[&str], default: f64) -> f64 {
-    keys.iter()
-        .find_map(|key| std::env::var(key).ok().and_then(|v| v.parse().ok()))
-        .unwrap_or(default)
-}
 fn env_bool(k: &str, d: bool) -> bool {
     std::env::var(k)
         .ok()
@@ -96,51 +85,6 @@ fn env_default_usize(k: &str, d: usize) -> usize {
         std::env::set_var(k, value.to_string());
     }
     value
-}
-
-fn env_default_f64(k: &str, d: f64) -> f64 {
-    let value = env_f64(k, d);
-    if std::env::var(k).is_err() {
-        std::env::set_var(k, value.to_string());
-    }
-    value
-}
-
-fn env_reward_f64(k: &str, d: f64, min: f64, max: f64) -> f64 {
-    let min = min.max(MIN_REWARD_WEIGHT);
-    let max = max.max(min);
-    let default = if d.is_finite() { d } else { min }.clamp(min, max);
-    let value = std::env::var(k)
-        .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .filter(|v| v.is_finite())
-        .unwrap_or(default)
-        .clamp(min, max);
-    if std::env::var(k).is_err() {
-        std::env::set_var(k, value.to_string());
-    }
-    value
-}
-
-fn env_neural_blend_mode(k: &str, default: SoccerNeuralBlendMode) -> SoccerNeuralBlendMode {
-    let Some(raw) = std::env::var(k).ok() else {
-        return default;
-    };
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "off" | "disabled" | "none" => SoccerNeuralBlendMode::Off,
-        "additive" | "add" => SoccerNeuralBlendMode::Additive,
-        "tiebreak" | "tie" | "tie-break" | "tie_break" => SoccerNeuralBlendMode::TieBreak,
-        "confidence" | "confidencegated" | "confidence-gated" | "gated" => {
-            SoccerNeuralBlendMode::ConfidenceGated
-        }
-        "authoritative" | "neural" | "neural-authoritative" | "neural_authoritative" => {
-            SoccerNeuralBlendMode::Authoritative
-        }
-        _ => {
-            eprintln!("[league] invalid {k}={raw:?}; using {:?}", default);
-            default
-        }
-    }
 }
 
 fn apply_league_neural_mcts_config(config: &mut EngineMatchRunnerConfig) -> bool {
@@ -757,6 +701,46 @@ fn load_brain(path: &str) -> Option<TeamBrain> {
     ))
 }
 
+/// Federated / data-parallel averaging: each worker trained a CLONE of the same frontier on a
+/// disjoint slice of the round's games; averaging their weights recombines the parallel work
+/// into one net (all share identical architecture). training_steps accumulates total gradient
+/// work across workers so warmth/step-count keep climbing.
+fn average_snapshots(
+    base_steps: usize,
+    snaps: Vec<SoccerNeuralNetworkSnapshot>,
+) -> Option<SoccerNeuralNetworkSnapshot> {
+    if snaps.len() <= 1 {
+        return snaps.into_iter().next();
+    }
+    let n = snaps.len() as f64;
+    let mut out = snaps[0].clone();
+    for (li, layer) in out.layers.iter_mut().enumerate() {
+        for (ri, row) in layer.weights.iter_mut().enumerate() {
+            for (wi, w) in row.iter_mut().enumerate() {
+                *w = snaps
+                    .iter()
+                    .map(|s| s.layers[li].weights[ri][wi])
+                    .sum::<f64>()
+                    / n;
+            }
+        }
+        for (bi, b) in layer.biases.iter_mut().enumerate() {
+            *b = snaps.iter().map(|s| s.layers[li].biases[bi]).sum::<f64>() / n;
+        }
+    }
+    let new_total: usize = snaps
+        .iter()
+        .map(|s| s.training_steps.saturating_sub(base_steps))
+        .sum();
+    out.training_steps = base_steps + new_total;
+    let losses: Vec<f64> = snaps.iter().filter_map(|s| s.average_loss).collect();
+    if !losses.is_empty() {
+        out.average_loss = Some(losses.iter().sum::<f64>() / losses.len() as f64);
+    }
+    recompute_norm(&mut out);
+    Some(out)
+}
+
 /// Write the frontier brain into a COMPACT learned-params.json. Action-Q stays empty because it
 /// bloats; target-Q is compact enough and is required for learned concrete receiver/space choices.
 fn write_frontier(path: &str, brain: &TeamBrain) -> std::io::Result<()> {
@@ -842,12 +826,6 @@ fn load_league(dir: &str) -> Vec<TeamBrain> {
         }
     }
     out
-}
-
-fn without_target_q(mut brain: TeamBrain) -> TeamBrain {
-    brain.home_target_entries.clear();
-    brain.away_target_entries.clear();
-    brain
 }
 
 fn play_and_carry(
@@ -973,14 +951,10 @@ fn checkpoint_validation_passes(
 ) -> bool {
     match validation {
         Some(validation) => {
-            if validation.games != expected_games {
-                return false;
-            }
-            let advancement_passes = validation.mean_forward_pass_margin()
-                > min_forward_pass_margin
-                && validation.mean_net_forward_pass_margin() > min_net_forward_pass_margin;
-            let outcome_passes = validation.mean_goal_diff() > min_goal_diff_margin.max(0.0);
-            (advancement_passes && validation.mean_goal_diff() >= 0.0) || outcome_passes
+            validation.games == expected_games
+                && validation.mean_forward_pass_margin() > min_forward_pass_margin
+                && validation.mean_net_forward_pass_margin() > min_net_forward_pass_margin
+                && validation.mean_goal_diff() >= min_goal_diff_margin
         }
         None => true,
     }
@@ -1030,138 +1004,9 @@ fn main() {
     let step_archive_buckets = env_usize_list("SOCCER_LEAGUE_STEP_ARCHIVE_BUCKETS");
     let step_archive_dir_default = format!("{}/step-buckets", archive_dir.trim_end_matches('/'));
     let step_archive_dir = env_str("SOCCER_LEAGUE_STEP_ARCHIVE_DIR", &step_archive_dir_default);
-    let uniform_elite_players = env_default_bool("SOCCER_ENGINE_UNIFORM_ELITE_PLAYERS", true);
-    let seed_varied_skills = env_default_bool("SOCCER_SEED_VARIED_SKILLS", !uniform_elite_players);
-    let authoritative_lambda = env_default_f64("DD_SOCCER_NEURAL_AUTHORITATIVE_LAMBDA", 8.0);
-    let policy_entropy_coeff = env_default_f64("SOCCER_POLICY_ENTROPY_COEFF", 0.04);
-    let attack_canonical_features =
-        env_default_bool("DD_SOCCER_ENABLE_ATTACK_CANONICAL_NEURAL_FEATURES", true);
-    let ball_zone_tactical_scale =
-        env_default_bool("DD_SOCCER_ENABLE_BALL_ZONE_TACTICAL_SCALE", true);
-    let player_grid_xy_features =
-        env_default_bool("DD_SOCCER_ENABLE_PLAYER_GRID_XY_FEATURES", true);
-    env_default_bool("DD_SOCCER_ENABLE_FORWARD_RELEASE_ROOT_CANDIDATE", true);
-    env_default_f64("DD_SOCCER_FORWARD_RELEASE_MIN_QUALITY", 0.35);
-    env_default_f64("DD_SOCCER_FORWARD_RELEASE_MIN_COMPLETION", 0.35);
-    env_default_bool("DD_SOCCER_ENABLE_FORWARD_SELECT_LOGIT", true);
-    let forward_select_logit_weight = env_default_f64("DD_SOCCER_FORWARD_SELECT_LOGIT_WEIGHT", 2.0);
-    let finishing_select_bonus_weight = env_reward_f64(
-        "SOCCER_NEURAL_FINISHING_SELECT_BONUS_WEIGHT",
-        0.70,
-        0.0,
-        2.5,
-    );
-    let finishing_selection_floor =
-        env_default_f64("SOCCER_NEURAL_FINISHING_SELECTION_FLOOR", 0.30);
-    let finishing_selection_max_regression = env_default_f64(
-        "SOCCER_NEURAL_FINISHING_SELECTION_MAX_SCORE_REGRESSION",
-        12.0,
-    );
-    let finishing_selection_shot_drought_boost =
-        env_default_f64("SOCCER_NEURAL_FINISHING_SELECTION_SHOT_DROUGHT_BOOST", 0.0);
-    let finishing_selection_max_effective_floor = env_default_f64(
-        "SOCCER_NEURAL_FINISHING_SELECTION_MAX_EFFECTIVE_FLOOR",
-        0.52,
-    );
-    let forward_creation_selection_floor =
-        env_default_f64("SOCCER_NEURAL_FORWARD_CREATION_SELECTION_FLOOR", 0.22);
-    let forward_creation_selection_max_regression = env_default_f64(
-        "SOCCER_NEURAL_FORWARD_CREATION_SELECTION_MAX_SCORE_REGRESSION",
-        18.0,
-    );
-    let forward_creation_min_quality =
-        env_default_f64("SOCCER_NEURAL_FORWARD_CREATION_MIN_QUALITY", 0.50);
-    let forward_creation_min_completion =
-        env_default_f64("SOCCER_NEURAL_FORWARD_CREATION_MIN_COMPLETION", 0.45);
-    let forward_creation_min_forward_yards =
-        env_default_f64("SOCCER_NEURAL_FORWARD_CREATION_MIN_FORWARD_YARDS", 4.0);
-    let forward_creation_bypass_min_quality =
-        env_default_f64("SOCCER_NEURAL_FORWARD_CREATION_BYPASS_MIN_QUALITY", 0.70);
-    let forward_creation_bypass_min_completion =
-        env_default_f64("SOCCER_NEURAL_FORWARD_CREATION_BYPASS_MIN_COMPLETION", 0.48);
-    let planner_teacher_missed_opportunity =
-        env_default_bool("DD_SOCCER_ENABLE_PLANNER_TEACHER_MISSED_OPPORTUNITY", true);
-    let planner_teacher_advantage_floor =
-        env_default_f64("SOCCER_PLANNER_TEACHER_ADVANTAGE_FLOOR", 0.045);
-    let planner_teacher_advantage_max =
-        env_default_f64("SOCCER_PLANNER_TEACHER_ADVANTAGE_MAX", 0.30);
-    let planner_teacher_weight = env_reward_f64("SOCCER_PLANNER_TEACHER_WEIGHT", 1.8, 0.0, 4.0);
-    let planner_teacher_min_score_share =
-        env_default_f64("SOCCER_PLANNER_TEACHER_MIN_SCORE_SHARE", 0.006);
-    let planner_teacher_min_shot_quality =
-        env_default_f64("SOCCER_PLANNER_TEACHER_MIN_SHOT_QUALITY", 0.52);
-    let planner_teacher_min_forward_quality =
-        env_default_f64("SOCCER_PLANNER_TEACHER_MIN_FORWARD_QUALITY", 0.50);
-    let planner_teacher_min_forward_completion =
-        env_default_f64("SOCCER_PLANNER_TEACHER_MIN_FORWARD_COMPLETION", 0.38);
-    let planner_teacher_max_samples_per_decision =
-        env_default_usize("SOCCER_PLANNER_TEACHER_MAX_SAMPLES_PER_DECISION", 2);
-    let planner_teacher_include_same_pass_family =
-        env_default_bool("DD_SOCCER_PLANNER_TEACHER_INCLUDE_SAME_PASS_FAMILY", true);
-    let planner_teacher_same_pass_min_margin_share =
-        env_default_f64("SOCCER_PLANNER_TEACHER_SAME_PASS_MIN_MARGIN_SHARE", 0.015);
-    env_default_usize("SOCCER_NEURAL_MCTS_PASS_TARGET_CANDIDATES", 6);
-    env_default_bool("SOCCER_DYNAMIC_REWARD_WEIGHTS", true);
-    env_default_bool("DD_SOCCER_ENABLE_FIELD_VECTOR_SHOT_REWARD", true);
-    env_default_bool("DD_SOCCER_ENABLE_OVERLOAD_WEIGHTED_PROGRESSION", true);
-    let goal_reward_scale = env_reward_f64("DD_SOCCER_GOAL_REWARD_SCALE", 1.0, 1.0, 16.0);
-    let forward_pass_reward_scale =
-        env_reward_f64("DD_SOCCER_FORWARD_PASS_REWARD_SCALE", 6.25, 0.0, 20.0);
-    let pass_chain_reward_scale =
-        env_reward_f64("DD_SOCCER_PASS_CHAIN_REWARD_SCALE", 4.25, 0.0, 20.0);
-    let pass_turnover_penalty_scale =
-        env_reward_f64("DD_SOCCER_PASS_TURNOVER_PENALTY_SCALE", 5.0, 1.0, 20.0);
-    let quick_forward_release_reward_scale = env_reward_f64(
-        "DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE",
-        1.25,
-        0.0,
-        2.0,
-    );
-    let shot_shaping_reward_scale =
-        env_reward_f64("DD_SOCCER_SHOT_SHAPING_REWARD_SCALE", 0.85, 0.0, 4.0);
-    let shot_commitment_reward_scale =
-        env_reward_f64("DD_SOCCER_SHOT_COMMITMENT_REWARD_SCALE", 0.0, 0.0, 10.0);
-    let dribble_beat_reward_scale =
-        env_reward_f64("DD_SOCCER_DRIBBLE_BEAT_REWARD_SCALE", 1.0, 0.0, 8.0);
-    let learned_epv_reward_scale =
-        env_reward_f64("DD_SOCCER_LEARNED_EPV_REWARD_SCALE", 1.0, 0.0, 200.0);
-    let offball_support_reward_scale =
-        env_reward_f64("SOCCER_OFFBALL_SUPPORT_REWARD_SCALE", 1.0, 0.0, 10.0);
-    let carry_reward_scale = env_reward_f64("DD_SOCCER_CARRY_REWARD_SCALE", 1.0, 0.0, 10.0);
-    let recovery_reward_scale = env_reward_f64("DD_SOCCER_RECOVERY_REWARD_SCALE", 1.0, 0.0, 10.0);
-    let overload_progression_reward_per_yard = env_reward_f64(
-        "DD_SOCCER_OVERLOAD_PROGRESSION_REWARD_PER_YARD",
-        0.10,
-        0.0,
-        0.5,
-    );
-    let analytic_difference_reward_negative_dense_floor = env_reward_f64(
-        "SOCCER_ANALYTIC_DIFFERENCE_REWARD_NEGATIVE_DENSE_FLOOR",
-        0.15,
-        0.0,
-        1.0,
-    );
-    let analytic_difference_reward_negative_dense_scale = env_reward_f64(
-        "SOCCER_ANALYTIC_DIFFERENCE_REWARD_NEGATIVE_DENSE_SCALE",
-        1.0,
-        0.0,
-        25.0,
-    );
-    let mappo_team_reward_share = env_reward_f64("SOCCER_MAPPO_TEAM_REWARD_SHARE", 0.50, 0.0, 1.0);
-    let marl_team_reward_weight = env_reward_f64("SOCCER_MARL_TEAM_REWARD_WEIGHT", 0.35, 0.0, 1.0);
-    let marl_intermediate_reward_weight =
-        env_reward_f64("SOCCER_MARL_INTERMEDIATE_REWARD_WEIGHT", 1.0, 0.2, 2.0);
-    let chance_quality_reward = env_default_bool("DD_SOCCER_ENABLE_CHANCE_QUALITY_REWARD", true);
-    let chance_quality_composite =
-        env_default_bool("DD_SOCCER_ENABLE_CHANCE_QUALITY_COMPOSITE", true);
-    let chance_quality_k = env_default_f64("DD_SOCCER_CHANCE_QUALITY_K", 22.0);
-    let chance_quality_cap = env_default_f64("DD_SOCCER_CHANCE_QUALITY_CAP", 5.0);
-    let analytic_opponents = env_bool("SOCCER_LEAGUE_ANALYTIC_OPPONENTS", true);
 
     let mut runner_config = EngineMatchRunnerConfig::default();
     runner_config.base.duration_seconds = minutes * 60.0;
-    let period_count = env_default_usize("SOCCER_LEAGUE_PERIOD_COUNT", 1).clamp(1, 4);
-    runner_config.base.period_count = period_count;
     // The runner's Inline backend is step-STARVED by default (~10 gradient steps/game),
     // so the value net is hopelessly undertrained (net-negative vs the base engine even
     // after many rounds). Crank the per-game training volume — replay + train-every-tick —
@@ -1176,28 +1021,24 @@ fn main() {
         env_usize("SOCCER_LEAGUE_REPLAY_SAMPLES_PER_TICK", 128).max(1);
     runner_config.base.neural_learning.batch_size =
         env_usize("SOCCER_LEAGUE_BATCH_SIZE", 64).max(1);
-    // Keep the league default conservative; the ratchet harness can sweep LR candidates per seed
-    // family, but a long league run has only one active learner unless the operator overrides it.
-    runner_config.base.neural_learning.learning_rate = env_f64_any(
-        &["SOCCER_LEAGUE_LEARNING_RATE", "SOCCER_NEURAL_LEARNING_RATE"],
-        0.015,
-    );
-    runner_config.base.neural_learning.optimizer_momentum = env_f64(
-        "SOCCER_NEURAL_OPTIMIZER_MOMENTUM",
-        runner_config.base.neural_learning.optimizer_momentum,
-    );
     // Network capacity: bigger hidden layer for more expressive value function over the
     // 610-dim field vector (the 24-unit net plateaued at parity with the analytic engine).
     // Only takes effect on a FRESH net — a resumed snapshot keeps its own architecture.
-    runner_config.base.neural_learning.hidden_units =
-        env_usize("SOCCER_LEAGUE_HIDDEN_UNITS", 96).max(1);
+    runner_config.base.neural_learning.hidden_units = env_usize(
+        "SOCCER_LEAGUE_HIDDEN_UNITS",
+        runner_config.base.neural_learning.hidden_units,
+    )
+    .max(1);
     // Critic-target window (un-crush A/B). The critic target is `(reward + gamma*max_next) /
     // target_scale` clamped to +/-target_clip. With the defaults (30/3) the +/-200 win and +160
     // goal terminal rewards BOTH saturate the +3 rail, so the value head cannot rank win vs goal
     // vs a big win — the advantage baseline is blind above the rail. Raising `target_scale` (e.g.
     // 120) drops those labels below the clip so terminal outcomes separate again; `target_clip`
     // is exposed too for completeness. Unset ⇒ the config default (byte-identical).
-    runner_config.base.neural_learning.target_scale = env_f64("SOCCER_NEURAL_TARGET_SCALE", 120.0);
+    runner_config.base.neural_learning.target_scale = env_f64(
+        "SOCCER_NEURAL_TARGET_SCALE",
+        runner_config.base.neural_learning.target_scale,
+    );
     runner_config.base.neural_learning.target_clip = env_f64(
         "SOCCER_NEURAL_TARGET_CLIP",
         runner_config.base.neural_learning.target_clip,
@@ -1205,20 +1046,21 @@ fn main() {
     // Team-reward share (MAPPO): the individual forward-pass reward is blended with the
     // team-averaged reward at this weight — the learnable rest-defense / coordination lever.
     // League training previously left this at the config default; expose it for A/Bs.
-    runner_config.base.neural_learning.mappo_team_reward_share = mappo_team_reward_share;
-    runner_config.base.neural_learning.marl_team_reward_weight = marl_team_reward_weight;
-    runner_config
-        .base
-        .neural_learning
-        .marl_intermediate_reward_weight = marl_intermediate_reward_weight;
-    eprintln!(
-        "[league] mappo_team_reward_share={} marl_team_reward_weight={} marl_intermediate_reward_weight={}",
+    runner_config.base.neural_learning.mappo_team_reward_share = env_f64(
+        "SOCCER_MAPPO_TEAM_REWARD_SHARE",
         runner_config.base.neural_learning.mappo_team_reward_share,
-        runner_config.base.neural_learning.marl_team_reward_weight,
-        runner_config
-            .base
-            .neural_learning
-            .marl_intermediate_reward_weight
+    );
+    eprintln!(
+        "[league] mappo_team_reward_share={}",
+        runner_config.base.neural_learning.mappo_team_reward_share
+    );
+    eprintln!(
+        "[league] critic-target window: target_scale={} target_clip={} (raw-reward window +/-{}) popart={}",
+        runner_config.base.neural_learning.target_scale,
+        runner_config.base.neural_learning.target_clip,
+        runner_config.base.neural_learning.target_scale
+            * runner_config.base.neural_learning.target_clip,
+        runner_config.base.neural_learning.target_popart_enabled,
     );
     // Un-collapse the value head on fresh nets: honour SOCCER_NEURAL_TARGET_POPART here (the
     // league bin otherwise leaves target-PopArt at the config default = off, unlike the
@@ -1228,15 +1070,7 @@ fn main() {
         std::env::var("SOCCER_NEURAL_TARGET_POPART")
             .ok()
             .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
-            .unwrap_or(true);
-    eprintln!(
-        "[league] critic-target window: target_scale={} target_clip={} (raw-reward window +/-{}) popart={}",
-        runner_config.base.neural_learning.target_scale,
-        runner_config.base.neural_learning.target_clip,
-        runner_config.base.neural_learning.target_scale
-            * runner_config.base.neural_learning.target_clip,
-        runner_config.base.neural_learning.target_popart_enabled,
-    );
+            .unwrap_or(runner_config.base.neural_learning.target_popart_enabled);
     let target_standardization_enabled =
         env_default_bool("DD_SOCCER_ENABLE_TARGET_STANDARDIZATION", true);
     let mc_critic_target_enabled = env_default_bool("DD_SOCCER_ENABLE_MC_CRITIC_TARGET", true);
@@ -1246,10 +1080,6 @@ fn main() {
     let novelty_bonus_enabled = env_default_bool("DD_SOCCER_ENABLE_NOVELTY_BONUS", true);
     let forward_pass_climb_curriculum_enabled =
         env_default_bool("DD_SOCCER_FORWARD_PASS_CLIMB_CURRICULUM", true);
-    let fast_actor_reward_fallback_enabled =
-        env_default_bool("DD_SOCCER_ENABLE_FAST_ACTOR_REWARD_FALLBACK", true);
-    let pass_outcome_priority_learning_enabled =
-        env_default_bool("DD_SOCCER_ENABLE_PASS_OUTCOME_PRIORITY_LEARNING", true);
     let dp_bootstrap_enabled = env_default_bool(
         "DD_SOCCER_ENABLE_DP_BOOTSTRAP",
         forward_pass_climb_curriculum_enabled,
@@ -1262,19 +1092,6 @@ fn main() {
         "DD_SOCCER_DP_BOOTSTRAP_SWEEPS",
         if dp_bootstrap_enabled { 200 } else { 40 },
     );
-    let hermetic_neural = env_default_bool("SOCCER_LEAGUE_HERMETIC_NEURAL", true);
-    let policy_train_max_transitions_per_tick = env_usize(
-        "SOCCER_LEAGUE_POLICY_TRAIN_MAX_TRANSITIONS_PER_TICK",
-        if hermetic_neural {
-            0
-        } else {
-            runner_config.base.policy_train_max_transitions_per_tick
-        },
-    );
-    runner_config.base.policy_train_max_transitions_per_tick =
-        policy_train_max_transitions_per_tick;
-    runner_config.base.full_game_learning_enabled =
-        env_bool("SOCCER_LEAGUE_FULL_GAME_LEARNING", true);
     runner_config.base.neural_learning.lp_coupling_enabled =
         env_bool("SOCCER_NEURAL_LP_COUPLING_ENABLED", true);
     // POLICY-IMPROVEMENT LEVER: opt the fresh net into the actor-critic path. When on, the neural
@@ -1284,16 +1101,6 @@ fn main() {
     // DD_SOCCER_NEURAL_AUTHORITATIVE_LAMBDA (more actor influence) + SOCCER_POLICY_ENTROPY_COEFF
     // (keep exploring) so the actor can actually leave the analytic mode. Off ⇒ current behaviour.
     runner_config.base.neural_blend.actor_critic = env_bool("SOCCER_NEURAL_ACTOR_CRITIC", true);
-    runner_config.base.neural_blend.mode = env_neural_blend_mode(
-        "SOCCER_NEURAL_BLEND_MODE",
-        SoccerNeuralBlendMode::Authoritative,
-    );
-    runner_config.base.neural_blend.lambda =
-        env_f64("SOCCER_NEURAL_BLEND_LAMBDA", authoritative_lambda.max(0.5));
-    runner_config.base.neural_blend.warmup_steps =
-        env_usize("SOCCER_NEURAL_BLEND_WARMUP_STEPS", 1).max(1);
-    runner_config.base.neural_blend.candidates =
-        env_usize("SOCCER_NEURAL_BLEND_CANDIDATES", 8).clamp(2, 16);
     let league_neural_mcts_enabled = apply_league_neural_mcts_config(&mut runner_config);
     let mpc_tier2_enabled = runner_config.base.mpc.tier2_player_enabled;
     let mpc_reconcile_enabled = runner_config.base.mpc.reconcile_enabled;
@@ -1302,13 +1109,6 @@ fn main() {
     let local_mpc_enabled = runner_config.base.local_mpc_enabled;
     let actor_critic_enabled = runner_config.base.neural_blend.actor_critic;
     let lp_coupling_enabled = runner_config.base.neural_learning.lp_coupling_enabled;
-    let neural_blend_mode = runner_config.base.neural_blend.mode;
-    let neural_blend_lambda = runner_config.base.neural_blend.lambda;
-    let neural_blend_candidates = runner_config.base.neural_blend.candidates;
-    let neural_blend_warmup_steps = runner_config.base.neural_blend.warmup_steps;
-    let full_game_learning_enabled = runner_config.base.full_game_learning_enabled;
-    let neural_learning_rate = runner_config.base.neural_learning.learning_rate;
-    let neural_optimizer_momentum = runner_config.base.neural_learning.optimizer_momentum;
     // Keep the engine's designed independent-brain mode (per-team critic drives each side).
     let mut runner = EngineMatchRunner::new(runner_config);
 
@@ -1332,9 +1132,6 @@ fn main() {
             TeamBrain::fresh_with_seed(0xC0FFEE, 0)
         }
     };
-    if hermetic_neural {
-        frontier = without_target_q(frontier);
-    }
 
     // Seed base env-overridable for independent-seed-family replication (default byte-identical).
     let train_seed_base: u32 = std::env::var("SOCCER_LEAGUE_SEED")
@@ -1345,42 +1142,16 @@ fn main() {
     let mut best_checkpoint_net_forward_pass_margin = f64::NEG_INFINITY;
     let mut archived_step_buckets: BTreeSet<usize> = BTreeSet::new();
     println!(
-        "league_train_started_at_utc={} games/opp={} minutes={} period_count={} weight_decay={} fresh_opp={} checkpoint_every={} max_rounds={} max_training_steps={} max_target_entries_per_side={} advancement_metric=completed_forward_passes net_metric=completed_forward_passes_minus_turnovers analytic_opponents={} uniform_elite_players={} seed_varied_skills={} hermetic_neural={} attack_canonical_features={} ball_zone_tactical_scale={} player_grid_xy_features={} policy_train_max_transitions_per_tick={} full_game_learning_enabled={} neural_learning_rate={} neural_optimizer_momentum={} neural_blend_mode={:?} neural_blend_lambda={} neural_authoritative_lambda={} neural_blend_candidates={} neural_blend_warmup_steps={} policy_entropy_coeff={} forward_select_logit_weight={} finishing_select_bonus_weight={} finishing_selection_floor={} finishing_selection_max_regression={} finishing_selection_shot_drought_boost={finishing_selection_shot_drought_boost} finishing_selection_max_effective_floor={finishing_selection_max_effective_floor} forward_creation_selection_floor={forward_creation_selection_floor} forward_creation_selection_max_regression={forward_creation_selection_max_regression} forward_creation_min_quality={forward_creation_min_quality} forward_creation_min_completion={forward_creation_min_completion} forward_creation_min_forward_yards={forward_creation_min_forward_yards} forward_creation_bypass_min_quality={forward_creation_bypass_min_quality} forward_creation_bypass_min_completion={forward_creation_bypass_min_completion} planner_teacher_missed_opportunity={planner_teacher_missed_opportunity} planner_teacher_advantage_floor={planner_teacher_advantage_floor:.3} planner_teacher_advantage_max={planner_teacher_advantage_max:.3} planner_teacher_weight={planner_teacher_weight:.2} planner_teacher_min_score_share={planner_teacher_min_score_share:.3} planner_teacher_min_shot_quality={planner_teacher_min_shot_quality:.2} planner_teacher_min_forward_quality={planner_teacher_min_forward_quality:.2} planner_teacher_min_forward_completion={planner_teacher_min_forward_completion:.2} planner_teacher_max_samples_per_decision={planner_teacher_max_samples_per_decision} planner_teacher_include_same_pass_family={planner_teacher_include_same_pass_family} planner_teacher_same_pass_min_margin_share={planner_teacher_same_pass_min_margin_share:.3} chance_quality_reward={} chance_quality_composite={} chance_quality_k={} chance_quality_cap={} league_neural_mcts_enabled={} actor_critic_enabled={} lp_coupling_enabled={} target_standardization_enabled={} mc_critic_target_enabled={} neural_self_bootstrap_enabled={} maxa_bootstrap_enabled={} novelty_bonus_enabled={} fast_actor_reward_fallback_enabled={} pass_outcome_priority_learning_enabled={} forward_pass_climb_curriculum_enabled={} dp_bootstrap_enabled={} dp_bootstrap_horizon={} dp_bootstrap_sweeps={} mpc_tier2_enabled={} mpc_reconcile_enabled={} mpc_field_aware_enabled={} mpc_latent_objective_enabled={} local_mpc_enabled={} checkpoint_require_forward_pass_climb={} checkpoint_max_forward_pass_regression={} checkpoint_min_forward_pass_margin={} checkpoint_validate_games={} checkpoint_validate_min_forward_pass_margin={} checkpoint_validate_min_net_forward_pass_margin={} checkpoint_validate_min_goal_diff_margin={} frontier={} candidate_frontier={} archive={} step_archive_dir={} step_archive_buckets={:?}",
+        "league_train_started_at_utc={} games/opp={} minutes={} weight_decay={} fresh_opp={} checkpoint_every={} max_rounds={} max_training_steps={} max_target_entries_per_side={} advancement_metric=completed_forward_passes net_metric=completed_forward_passes_minus_turnovers league_neural_mcts_enabled={} actor_critic_enabled={} lp_coupling_enabled={} target_standardization_enabled={} mc_critic_target_enabled={} neural_self_bootstrap_enabled={} maxa_bootstrap_enabled={} novelty_bonus_enabled={} forward_pass_climb_curriculum_enabled={} dp_bootstrap_enabled={} dp_bootstrap_horizon={} dp_bootstrap_sweeps={} mpc_tier2_enabled={} mpc_reconcile_enabled={} mpc_field_aware_enabled={} mpc_latent_objective_enabled={} local_mpc_enabled={} checkpoint_require_forward_pass_climb={} checkpoint_max_forward_pass_regression={} checkpoint_min_forward_pass_margin={} checkpoint_validate_games={} checkpoint_validate_min_forward_pass_margin={} checkpoint_validate_min_net_forward_pass_margin={} checkpoint_validate_min_goal_diff_margin={} frontier={} candidate_frontier={} archive={} step_archive_dir={} step_archive_buckets={:?}",
         chrono_now(),
         games_per_opp,
         minutes,
-        period_count,
         weight_decay,
         fresh_opponents,
         checkpoint_every,
         max_rounds,
         max_training_steps,
         max_target_entries_per_side,
-        analytic_opponents,
-        uniform_elite_players,
-        seed_varied_skills,
-        hermetic_neural,
-        attack_canonical_features,
-        ball_zone_tactical_scale,
-        player_grid_xy_features,
-        policy_train_max_transitions_per_tick,
-        full_game_learning_enabled,
-        neural_learning_rate,
-        neural_optimizer_momentum,
-        neural_blend_mode,
-        neural_blend_lambda,
-        authoritative_lambda,
-        neural_blend_candidates,
-        neural_blend_warmup_steps,
-        policy_entropy_coeff,
-        forward_select_logit_weight,
-        finishing_select_bonus_weight,
-        finishing_selection_floor,
-        finishing_selection_max_regression,
-        chance_quality_reward,
-        chance_quality_composite,
-        chance_quality_k,
-        chance_quality_cap,
         league_neural_mcts_enabled,
         actor_critic_enabled,
         lp_coupling_enabled,
@@ -1389,8 +1160,6 @@ fn main() {
         neural_self_bootstrap_enabled,
         maxa_bootstrap_enabled,
         novelty_bonus_enabled,
-        fast_actor_reward_fallback_enabled,
-        pass_outcome_priority_learning_enabled,
         forward_pass_climb_curriculum_enabled,
         dp_bootstrap_enabled,
         dp_bootstrap_horizon,
@@ -1413,18 +1182,6 @@ fn main() {
         step_archive_dir,
         step_archive_buckets,
     );
-    println!(
-        "league_reward_profile goal={goal_reward_scale:.2} forward_pass={forward_pass_reward_scale:.2} \
-         pass_chain={pass_chain_reward_scale:.2} pass_turnover_penalty={pass_turnover_penalty_scale:.2} \
-         quick_forward_release={quick_forward_release_reward_scale:.4} shot_shaping={shot_shaping_reward_scale:.2} \
-         shot_commitment={shot_commitment_reward_scale:.4} dribble_beat={dribble_beat_reward_scale:.2} \
-         learned_epv={learned_epv_reward_scale:.2} offball={offball_support_reward_scale:.2} carry={carry_reward_scale:.2} \
-         recovery={recovery_reward_scale:.2} overload_progression_per_yard={overload_progression_reward_per_yard:.4} \
-         analytic_dense_floor={analytic_difference_reward_negative_dense_floor:.4} \
-         analytic_dense_scale={analytic_difference_reward_negative_dense_scale:.2} mappo_share={mappo_team_reward_share:.4} \
-         marl_team_weight={marl_team_reward_weight:.4} marl_intermediate_weight={marl_intermediate_reward_weight:.2} \
-         planner_teacher={planner_teacher_weight:.2} finishing_select={finishing_select_bonus_weight:.2}"
-    );
 
     loop {
         round += 1;
@@ -1433,9 +1190,6 @@ fn main() {
 
         // Build this round's opponent league: frozen champions + fresh (exploration).
         let mut opponents: Vec<TeamBrain> = load_league(&archive_dir);
-        if hermetic_neural {
-            opponents = opponents.into_iter().map(without_target_q).collect();
-        }
         for i in 0..fresh_opponents {
             opponents.push(TeamBrain::fresh_with_seed(
                 0xF0_0000u32
@@ -1453,7 +1207,10 @@ fn main() {
         // decides). The frontier (authoritative neural) must then learn to BEAT the analytic
         // engine to win — that IS the gradient to break past parity. (Genome variation still
         // gives the analytic opponents slightly different styles.)
-        if analytic_opponents {
+        if std::env::var("SOCCER_LEAGUE_ANALYTIC_OPPONENTS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+        {
             for opp in opponents.iter_mut() {
                 opp.neural = None;
             }
@@ -1484,7 +1241,7 @@ fn main() {
                     .wrapping_add(round.wrapping_mul(1_000_003))
                     .wrapping_add(fixture.wrapping_mul(2_246_822_519))
                     .wrapping_add(g as u32);
-                let home = frontier_always_home || ((round as usize + fixture as usize) % 2 == 0);
+                let home = frontier_always_home || g % 2 == 0;
                 fixtures.push(Fx {
                     opp_idx: idx,
                     opp_id: idx + 1,
@@ -1504,6 +1261,11 @@ fn main() {
                 fixtures.len()
             );
         }
+        let base_steps = frontier
+            .neural
+            .as_ref()
+            .map(|s| s.training_steps)
+            .unwrap_or(0);
         let mut round_kpis = LeagueRoundKpis::default();
         let (wins, losses, trained_brains) = if workers == 1 {
             let mut wins = 0i32;
@@ -1587,15 +1349,10 @@ fn main() {
             .iter()
             .filter_map(|brain| brain.neural.clone())
             .collect::<Vec<_>>();
-        if let Some(avg) =
-            average_soccer_neural_network_snapshots(frontier.neural.as_ref(), &trained_snapshots)
-        {
+        if let Some(avg) = average_snapshots(base_steps, trained_snapshots) {
             frontier.neural = Some(avg);
         }
-        if hermetic_neural {
-            frontier.home_target_entries.clear();
-            frontier.away_target_entries.clear();
-        } else if !trained_brains.is_empty() {
+        if !trained_brains.is_empty() {
             frontier.home_target_entries = merge_target_entries(
                 trained_brains
                     .iter()
@@ -1788,12 +1545,6 @@ fn main() {
                     gate_forward_pass_margin > checkpoint_min_forward_pass_margin;
                 let passes_net_forward_pass_floor =
                     gate_net_forward_pass_margin > checkpoint_validate_min_net_forward_pass_margin;
-                let gate_goal_diff_margin = validation
-                    .as_ref()
-                    .map(|v| v.mean_goal_diff())
-                    .unwrap_or_else(|| round_kpis.goal_diff as f64 / kpi_games);
-                let passes_goal_diff_floor =
-                    gate_goal_diff_margin > checkpoint_validate_min_goal_diff_margin;
                 let passes_validation = checkpoint_validation_passes(
                     validation.as_ref(),
                     checkpoint_validate_games,
@@ -1802,8 +1553,8 @@ fn main() {
                     checkpoint_validate_min_goal_diff_margin,
                 );
                 if passes_forward_pass_climb
-                    && ((passes_forward_pass_floor && passes_net_forward_pass_floor)
-                        || passes_goal_diff_floor)
+                    && passes_forward_pass_floor
+                    && passes_net_forward_pass_floor
                     && passes_validation
                 {
                     let cp = format!(
@@ -1825,7 +1576,7 @@ fn main() {
                     );
                 } else {
                     println!(
-                        "league_checkpoint_held round={round} metric=completed_forward_passes net_metric=completed_forward_passes_minus_turnovers gate_forward_pass_margin_per_game={gate_forward_pass_margin:.3} gate_net_forward_pass_margin_per_game={gate_net_forward_pass_margin:.3} gate_goal_diff_margin_per_game={gate_goal_diff_margin:.3} train_forward_pass_margin_per_game={mean_forward_pass_margin:.3} train_net_forward_pass_margin_per_game={mean_net_forward_pass_margin:.3} best_net_forward_pass_margin_per_game={prior_best:.3} require_climb={} raw_min_margin={checkpoint_min_forward_pass_margin:.3} net_min_margin={checkpoint_validate_min_net_forward_pass_margin:.3} validation_min_goal_diff_margin={checkpoint_validate_min_goal_diff_margin:.3} validation_passed={passes_validation} validation_games={}/{}",
+                        "league_checkpoint_held round={round} metric=completed_forward_passes net_metric=completed_forward_passes_minus_turnovers gate_forward_pass_margin_per_game={gate_forward_pass_margin:.3} gate_net_forward_pass_margin_per_game={gate_net_forward_pass_margin:.3} train_forward_pass_margin_per_game={mean_forward_pass_margin:.3} train_net_forward_pass_margin_per_game={mean_net_forward_pass_margin:.3} best_net_forward_pass_margin_per_game={prior_best:.3} require_climb={} raw_min_margin={checkpoint_min_forward_pass_margin:.3} net_min_margin={checkpoint_validate_min_net_forward_pass_margin:.3} validation_min_goal_diff_margin={checkpoint_validate_min_goal_diff_margin:.3} validation_passed={passes_validation} validation_games={}/{}",
                         checkpoint_require_forward_pass_climb,
                         validation.as_ref().map(|validation| validation.games).unwrap_or(0),
                         checkpoint_validate_games,

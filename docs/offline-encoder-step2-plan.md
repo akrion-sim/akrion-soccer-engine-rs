@@ -34,11 +34,8 @@ value head** distilled into the engine's `FeedForwardNetwork`, with **identical 
 **Tooling:** prototype training in Python/numpy for fast iteration, then a small Rust
 `soccer_offline_distill` bin that loads the trained dense weights into a
 `FeedForwardNetwork` and writes the engine snapshot — OR train directly in the Rust FFN
-(`train_sample_clipped`) to guarantee format match. `scripts/train_offline_head.py`
-now exports the canonical layout, held-out report, and row-major one-hidden-layer MLP
-weights with `--layout-out`, `--report-out`, and `--weights-out`; the next Rust step is
-to consume those artifacts behind the default-OFF gate or replace the weight bridge with
-a Rust-native trainer.
+(`train_sample_clipped`) to guarantee format match. Recommend the Rust-native trainer bin
+to avoid a Python↔Rust weight-format bridge.
 
 ### Step 2b — learned relational encoder over the RAW player graph (later)
 Only after 2a proves value. Replace hand-crafted relational bins with a tiny GNN/attention
@@ -47,9 +44,8 @@ shape** (still one forward pass at runtime). This is the audit's #1 done within 
 budget. Larger effort; gated and eval-gated identically.
 
 ## Build order
-1. `soccer_offline_distill` bin scaffold: read JSONL → flatten using the canonical
-   Python/Rust-compatible `feature_layout.json` → train or load the weighted FFN value
-   head → write engine snapshot + held-out metrics.
+1. `soccer_offline_distill` bin scaffold: read JSONL → flatten (emit `feature_layout.json`)
+   → train weighted FFN value head → write engine snapshot + held-out metrics.
 2. Wire a default-OFF consume path for the distilled head in the decision layer.
 3. `soccer_eval_gate` A/B; promote on positive verdict.
 
