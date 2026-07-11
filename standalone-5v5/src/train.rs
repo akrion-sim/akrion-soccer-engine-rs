@@ -23,6 +23,7 @@ const W_FLANK: f32 = 0.025; // OFFENSE: commit to a left/right channel (two-flan
 const W_GOALSIDE: f32 = 0.02; // DEFENSE: get goalside of the ball
 const W_AHEAD: f32 = 0.035; // OFFENSE (KEY): when a teammate has the ball, be an upfield outlet in a clear lane
 const W_MAKE_RUN: f32 = 0.02; // OFFENSE (KEY): actively sprint upfield to get open for a forward pass
+const W_STAND_PEN: f32 = 0.07; // ANTI-PASSIVITY: an off-ball player must not freeze to farm positional shaping
 const ENT_BETA0: f32 = 0.02;
 
 // Teammate-spacing reward weight. Overridable via SPACING_W env for tuning.
