@@ -734,6 +734,8 @@ impl World {
         self.kick_timer = 0;
         self.pass_streak_a = 0;
         self.a_shot_flag = false;
+        self.b_pass_streak = 0;
+        self.b_shot_flag = false;
         self.reset_a_pass_memory();
     }
 
