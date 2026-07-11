@@ -220,6 +220,8 @@ impl World {
             return_start_x: 0.0,
             ev_dribble_fwd_a: false,
             ev_dribble_lat_a: false,
+            b_pass_streak: 0,
+            b_shot_flag: false,
         };
         w.kickoff(Team::A);
         w
