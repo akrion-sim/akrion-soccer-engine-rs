@@ -212,11 +212,9 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
         // little. SMALL per-tick — it fires every tick you carry, so a big value
         // accumulates into ball-hoarding that dwarfs goals.
         if w.ev_dribble_fwd_a {
-            r += 0.025; // forward dribbling pays more (still < a completed fwd pass)
+            r += 0.008; // whisper — forward carrying is already paid by potential shaping
         }
-        if w.ev_dribble_lat_a {
-            r += 0.005; // lateral: barely — forward progress is what we want
-        }
+        // (lateral dribble: no flat reward — potential shaping handles real progress)
         if w.ev_turnover_a && (w.ev_dribble_fwd_a || w.ev_dribble_lat_a) {
             r -= 0.4; // dispossessed while dribbling
         }
