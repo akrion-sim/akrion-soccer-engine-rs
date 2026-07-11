@@ -193,7 +193,8 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
             mact_t[i] = a;
             spd_t[i] = s;
             packed_a[i] = a + s * NA;
-            logp_t[i] = pa.ln() + ps.ln();
+            logpa_t[i] = pa.ln();
+            logps_t[i] = ps.ln();
         }
 
         let act_b = noisy_scripted_actions(&w, Team::B, opponent_noise, rng);
