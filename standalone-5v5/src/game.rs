@@ -37,11 +37,13 @@ const BALL_SPEED_CAP: f32 = 9.3; // ~22 mph: you can't dribble at a full open-fi
 
 /// Map a speed gear to yards/second, capping ball-carrying to ~22 mph.
 fn speed_val(gear: usize, carrying: bool) -> f32 {
-    let s = SPEEDS[gear.min(NS - 1)];
+    // DIAGNOSTIC: reproduce v3's EXACT legacy speeds (ignore gear) to test whether
+    // the gear VALUES (faster dribble / faster scripted chase) are the regression.
+    let _ = gear;
     if carrying {
-        s.min(BALL_SPEED_CAP)
+        DRIBBLE_SPEED
     } else {
-        s
+        PLAYER_SPEED
     }
 }
 const CONTROL_RADIUS: f32 = 1.5; // secure a received ball -> possessions can develop
