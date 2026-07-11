@@ -168,7 +168,8 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
         let mut mact_t = [A_STAY; N]; // macro action
         let mut spd_t = [SPD_STAND; N]; // speed gear
         let mut packed_a = [A_STAY; N]; // packed (action + speed*NA) for step
-        let mut logp_t = [0.0f32; N];
+        let mut logpa_t = [0.0f32; N];
+        let mut logps_t = [0.0f32; N];
 
         // CENTRALIZED critic: one value for the whole global state this tick.
         let gstate = w.global_state();
