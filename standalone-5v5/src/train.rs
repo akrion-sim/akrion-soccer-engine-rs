@@ -5,6 +5,17 @@
 use crate::game::*;
 use crate::nn::{masked_softmax, Mlp};
 use crate::rng::Rng;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+// SPEED WARMUP CURRICULUM: while true, every player uses a fixed run-medium gear
+// (v3 behavior) instead of sampling the speed policy. This lets the ACTION policy
+// learn to attack at full strength on stable pass dynamics BEFORE the speed policy
+// starts introducing gear variability — the pass mechanics are fragile to speed
+// variability, so the two policies would otherwise deadlock.
+static SPEED_FROZEN: AtomicBool = AtomicBool::new(false);
+pub fn set_speed_frozen(frozen: bool) {
+    SPEED_FROZEN.store(frozen, Ordering::Relaxed);
+}
 
 const GAMMA: f32 = 0.995; // per-tick discount retuned for 20 Hz (same per-second horizon)
 const LAMBDA: f32 = 0.95;
