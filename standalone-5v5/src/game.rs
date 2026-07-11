@@ -1158,7 +1158,7 @@ impl World {
         None
     }
 
-    fn apply_off_ball(&mut self, team: Team, idx: usize, a: usize) {
+    fn apply_off_ball(&mut self, team: Team, idx: usize, a: usize, spd: usize) {
         let me = players(team, self)[idx].pos;
         let team_owns = matches!(self.owner, Some(o) if o.team == team);
         let target = match a {
