@@ -22098,7 +22098,9 @@ impl SoccerMatch {
                     adjusted_reward += novelty_coef / ((1 + count) as f64).sqrt();
                 }
                 let next_state = SoccerQStateKey::from_next_transition(transition);
-                let (gamma, tabular_max_next) = if dd_soccer_enable_dp_critic_target()
+                let hermetic_critic = dd_soccer_enable_hermetic_neural_critic();
+                let (gamma, tabular_max_next) = if !hermetic_critic
+                    && dd_soccer_enable_dp_critic_target()
                     && !transition.done
                     && self.dp_value_table.is_some()
                 {
@@ -22113,6 +22115,12 @@ impl SoccerMatch {
                         soccer_dp_state_bucket(&transition.next_state, transition.team, *bx, *by);
                     let dp_v = dp_table.get(&next_bucket).copied().unwrap_or(0.0);
                     (SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK, dp_v)
+                } else if hermetic_critic {
+                    // A hermetic critic must not inherit a value from the aliased
+                    // tabular policy. Zero is the cold-start/absent-network anchor;
+                    // once a prediction network exists, the neural branch below
+                    // replaces it with V_net(s') at full weight.
+                    (SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK, 0.0)
                 } else {
                     self.team_policies
                         .as_ref()
@@ -22147,7 +22155,9 @@ impl SoccerMatch {
                 // max_next: neural self-bootstrap (session concept) takes precedence when enabled —
                 // blend the net's OWN predicted (maxA or observed) successor value toward true neural
                 // TD/Q-learning; otherwise main's blended successor-bootstrap; otherwise tabular.
-                let max_next = if !transition.done && dd_soccer_enable_neural_self_bootstrap() {
+                let max_next = if !transition.done
+                    && (hermetic_critic || dd_soccer_enable_neural_self_bootstrap())
+                {
                     let neural_raw = self
                         .neural_learner_for(transition.team)
                         .filter(|learner| learner.has_prediction_network())
@@ -22181,10 +22191,20 @@ impl SoccerMatch {
                         .filter(|value| value.is_finite());
                     match neural_raw {
                         Some(neural) => {
-                            let w = dd_soccer_self_bootstrap_weight();
+                            let w = if hermetic_critic {
+                                1.0
+                            } else {
+                                dd_soccer_self_bootstrap_weight()
+                            };
                             w * neural + (1.0 - w) * tabular_max_next
                         }
-                        None => tabular_max_next,
+                        None => {
+                            if hermetic_critic {
+                                0.0
+                            } else {
+                                tabular_max_next
+                            }
+                        }
                     }
                 } else {
                     self.blended_successor_bootstrap_value(
@@ -25913,6 +25933,28 @@ impl SoccerMatch {
         amount: f64,
         kind: SoccerRewardEventKind,
     ) {
+        let whole_field_embedding = if reward_context_calibration_enabled()
+            && player_id < self.players.len()
+        {
+            let snapshot = self.export_world_snapshot();
+            let team = self.players[player_id].team;
+            Some(
+                SoccerConfigVector::from_snapshot_with(
+                    &snapshot,
+                    team,
+                    SoccerConfigComparison::PositionAgnostic,
+                    ConfigWeightOptions::default(),
+                )
+                .embedding(),
+            )
+        } else {
+            None
+        };
+        let amount = calibrated_reward_event_amount(
+            kind,
+            amount,
+            whole_field_embedding.as_deref(),
+        );
         // Drop non-finite amounts: `NaN.abs() <= 1e-9` is false, so without this
         // an upstream NaN/Inf would slip past the magnitude gate and pollute the
         // reward-event sum used in transition shaping.
