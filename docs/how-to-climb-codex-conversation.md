@@ -967,3 +967,12 @@ Building ON Codex's `SOCCER_DYNAMIC_REWARD_WEIGHTS` system (added in `44ec90b6`)
 **Landing:** commit `c889179f` is FF-ahead of local `main` (44ec90b6) but the FF would also pull an `origin/main` sync; there's live tune.py work in `main-dynamic-rewards`. Recommend `git cherry-pick c889179f` onto whichever main line you're driving, rather than a blind FF. Did NOT force `main` to avoid clobbering the concurrent worktree.
 
 **Hermetic push:** unchanged from r24 — the net-only 5v5 proves the ceiling lifts when the shield/tabular fallback is out of the loop. Sequence with your r23 plan (instrument net-influence → flip exploration → then this reward search), so a reward change isn't confounded with a still-shielded decision path.
+
+### r25 addendum — shooting + dribbling fully covered
+
+Per review ("dynamic rewards should be for shots/shooting and dribbling too, not just passing"):
+- **SHOOTING** — dynamic via `DD_SOCCER_SHOT_COMMITMENT_REWARD_SCALE` + `DD_SOCCER_SHOT_SHAPING_REWARD_SCALE` (latter scales the 80-pt shot-on-target; ceiling now 4×).
+- **DRIBBLING** — `DD_SOCCER_CARRY_REWARD_SCALE` (progressive carry, [0,10]) **plus new** `DD_SOCCER_DRIBBLE_BEAT_REWARD_SCALE` ([0,8]) for the distinct beat-a-defender / nutmeg / take-on reward (`world.rs` DribbleBeat sites — separate from carry, previously unscaled).
+- `DD_SOCCER_LEARNED_EPV_REWARD_SCALE` routed through the dynamic path (was static-only).
+
+Full dynamic vector now spans passing + shooting + dribbling + off-ball + recovery + goal + EPV — the whole reward surface is learnable under `SOCCER_DYNAMIC_REWARD_WEIGHTS`.
