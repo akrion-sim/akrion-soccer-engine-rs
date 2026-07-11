@@ -506,7 +506,8 @@ pub fn behavior_clone_scripted(
                 let s = &data[si];
                 let acts = policy.actor.forward(&s.obs);
                 let logits = acts.last().unwrap();
-                let probs = masked_softmax(logits, &s.mask);
+                let probs = masked_softmax(&logits[0..NA], &s.mask);
+                let sprobs = masked_softmax(&logits[NA..NA + NS], &[true; NS]);
                 let p = probs[s.action].max(1e-8);
                 loss_accum += -p.ln();
                 if probs
@@ -518,11 +519,15 @@ pub fn behavior_clone_scripted(
                 {
                     correct += 1.0;
                 }
-                let mut d_logits = vec![0.0f32; NA];
+                // clone BOTH heads: the scripted action and its gear.
+                let mut d_logits = vec![0.0f32; NA + NS];
                 for j in 0..NA {
                     if s.mask[j] {
                         d_logits[j] = probs[j] - if j == s.action { 1.0 } else { 0.0 };
                     }
+                }
+                for k in 0..NS {
+                    d_logits[NA + k] = sprobs[k] - if k == s.speed { 1.0 } else { 0.0 };
                 }
                 policy.actor.backward(&acts, &d_logits);
                 count += 1.0;
