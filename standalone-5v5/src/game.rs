@@ -165,6 +165,9 @@ pub struct World {
     pub return_start_x: f32,          // ball x when the current return sequence began
     pub ev_dribble_fwd_a: bool,       // A carrier dribbled forward this tick
     pub ev_dribble_lat_a: bool,       // A carrier dribbled laterally this tick
+    // Symmetric goal rules for Team B (so the opponent must build up too):
+    b_pass_streak: u32,               // completed B passes in the current possession
+    b_shot_flag: bool,                // free ball came from a VALID B shot (2 passes + final third)
 }
 
 fn players(team: Team, w: &World) -> &[Player; N] {
