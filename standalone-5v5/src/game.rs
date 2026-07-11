@@ -792,7 +792,8 @@ impl World {
             let prev_touch = self.last_touch;
             self.owner = Some(o);
             self.a_shot_flag = false; // shot resolved into possession
-                                      // Team-A reward events. pending_pass.team is the PASSING team.
+            self.b_shot_flag = false;
+            // Team-A reward events. pending_pass.team is the PASSING team.
             if let Some(pp) = self.pending_pass {
                 if pp.team == Team::A {
                     if o.team == Team::A {
@@ -807,13 +808,19 @@ impl World {
                         self.ev_turnover_a = true; // A pass intercepted by B
                         self.pass_streak_a = 0;
                         self.reset_a_pass_memory();
+                        self.b_pass_streak = 1; // B started a possession by intercepting
                     }
                 }
-                // a B pass intercepted by A is a good steal
-                if pp.team == Team::B && o.team == Team::A {
-                    self.ev_win_ball_a = true;
-                    self.pass_streak_a = 0; // fresh possession
-                    self.reset_a_pass_memory();
+                if pp.team == Team::B {
+                    if o.team == Team::B {
+                        self.b_pass_streak += 1; // B built up (symmetric 2-pass rule)
+                    } else {
+                        // a B pass intercepted by A is a good steal
+                        self.ev_win_ball_a = true;
+                        self.pass_streak_a = 0; // fresh possession
+                        self.reset_a_pass_memory();
+                        self.b_pass_streak = 0;
+                    }
                 }
             } else if matches!(prev_touch, Some(Team::A)) && o.team == Team::B {
                 self.ev_turnover_a = true;
