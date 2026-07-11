@@ -26,17 +26,56 @@ const LR_BC: f32 = 8e-4;
 const EPOCHS: usize = 4;
 const MINIBATCH: usize = 1024;
 const MAX_ROLLOUT_THREADS: usize = 4;
-const W_SHAPE: f32 = 2.2; // potential shaping: strong pull to carry/pass the ball toward goal
-const W_ADVANCE: f32 = 0.04; // OFFENSE: push upfield hard (no offsides — camp high)
-const W_OPEN: f32 = 0.04; // OFFENSE: get into a CLEAR passing lane from the ball
-const W_WIDTH: f32 = 0.045; // OFFENSE: use the width of the pitch (stretch wide)
-const W_FLANK: f32 = 0.025; // OFFENSE: commit to a left/right channel (two-flank spread)
-const W_GOALSIDE: f32 = 0.02; // DEFENSE: get goalside of the ball
-// KEY off-ball run rewards — held at 0 until the base (v3 + learnable speeds) is
-// solid, then layered back on.
-const W_AHEAD: f32 = 0.0; // when a teammate has the ball, be an upfield outlet in a clear lane
-const W_MAKE_RUN: f32 = 0.0; // actively sprint upfield to get open for a forward pass
-const W_STAND_PEN: f32 = 0.02; // ANTI-PASSIVITY: gently discourage the STAND gear for off-ball players
+// ─── Tunable reward weights (env-overridable, read ONCE per process) ─────────
+// Every weight below can be set via an env var of the same name, so an external
+// search harness (viz/tune.py) can optimize the reward vector without recompiling.
+fn wenv(name: &str, default: f32) -> f32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+pub struct Rw {
+    pub goal: f32,        // +goal scored
+    pub concede: f32,     // -goal conceded (stored positive, subtracted)
+    pub shot_base: f32,   // shot-on-goal base (earned, from opponent half after 2 passes)
+    pub shot_q: f32,      // shot-on-goal chance-quality bonus
+    pub milestone: f32,   // completing the 2nd pass (unlocks the shot)
+    pub pass_credit: f32, // flat credit for a completed pass
+    pub turnover: f32,    // -turnover (stored positive, subtracted)
+    pub dribble: f32,     // forward dribble carry
+    pub shape: f32,       // potential shaping (forward progress)
+    pub advance: f32,     // OFFENSE: push upfield
+    pub open: f32,        // OFFENSE: clear passing lane from the ball
+    pub width: f32,       // OFFENSE: use pitch width
+    pub flank: f32,       // OFFENSE: commit to a left/right channel
+    pub goalside: f32,    // DEFENSE: goalside of the ball
+    pub ahead: f32,       // off-ball outlet ahead of the ball in a clear lane
+    pub make_run: f32,    // off-ball forward run (velocity)
+    pub stand_pen: f32,   // anti-passivity: penalize the STAND gear off-ball
+}
+fn rw() -> &'static Rw {
+    static R: std::sync::OnceLock<Rw> = std::sync::OnceLock::new();
+    R.get_or_init(|| Rw {
+        goal: wenv("REW_GOAL", 12.0),
+        concede: wenv("REW_CONCEDE", 8.0),
+        shot_base: wenv("REW_SHOT_BASE", 1.5),
+        shot_q: wenv("REW_SHOT_Q", 1.0),
+        milestone: wenv("REW_MILESTONE", 0.3),
+        pass_credit: wenv("REW_PASS", 0.06),
+        turnover: wenv("REW_TURNOVER", 0.2),
+        dribble: wenv("REW_DRIBBLE", 0.015),
+        shape: wenv("W_SHAPE", 2.2),
+        advance: wenv("W_ADVANCE", 0.04),
+        open: wenv("W_OPEN", 0.04),
+        width: wenv("W_WIDTH", 0.045),
+        flank: wenv("W_FLANK", 0.025),
+        goalside: wenv("W_GOALSIDE", 0.02),
+        ahead: wenv("W_AHEAD", 0.0),
+        make_run: wenv("W_MAKE_RUN", 0.0),
+        stand_pen: wenv("W_STAND_PEN", 0.02),
+    })
+}
 // The speed policy is a low-variance REFINEMENT on top of the action policy —
 // small entropy + LR so its exploration can't paralyze the game the action policy
 // is trying to learn in.
