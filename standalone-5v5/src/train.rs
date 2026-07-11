@@ -341,6 +341,7 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
                 gstate: gstate_buf[s],
                 mask: mask_buf[s][i],
                 action: act_buf[s][i],
+                speed: spd_buf[s][i],
                 old_logp: logp_buf[s][i],
                 adv,
                 ret,
