@@ -1695,7 +1695,7 @@ mod tests {
         w.lp_to = 2;
         w.return_streak_a = 1;
 
-        let kick = w.apply_on_ball(Team::A, 2, A_PASS_A, &mut Rng::new(3));
+        let kick = w.apply_on_ball(Team::A, 2, A_PASS_A, SPD_RUN_MED, &mut Rng::new(3));
 
         assert!(kick.is_some());
         assert!(matches!(w.intended_receiver, Some(o) if o.team == Team::A && o.idx == 1));
@@ -1716,7 +1716,7 @@ mod tests {
         w.lp_to = 2;
         w.return_streak_a = 2;
 
-        let kick = w.apply_on_ball(Team::A, 2, A_PASS_A, &mut Rng::new(4));
+        let kick = w.apply_on_ball(Team::A, 2, A_PASS_A, SPD_RUN_MED, &mut Rng::new(4));
 
         assert!(kick.is_some());
         assert!(matches!(w.intended_receiver, Some(o) if o.team == Team::A && o.idx == 1));
@@ -1764,7 +1764,7 @@ mod tests {
         w.lp_from = 1; // player 1 gave the ball to player 2
         w.lp_to = 2;
         w.return_streak_a = 0;
-        let _ = w.apply_on_ball(Team::A, 2, A_PASS_A, &mut Rng::new(3));
+        let _ = w.apply_on_ball(Team::A, 2, A_PASS_A, SPD_RUN_MED, &mut Rng::new(3));
         assert!(w.ev_return_pass_a);
         assert_eq!(w.return_streak_a, 1);
         assert_eq!(w.return_start_x, 20.0); // sequence origin recorded
@@ -1866,7 +1866,7 @@ mod tests {
         for i in 0..N {
             w.b[i].pos = V2::new(41.0, 14.0); // all defenders far away
         }
-        let _ = w.apply_on_ball(Team::A, 1, A_DRIB_FWD, &mut Rng::new(1));
+        let _ = w.apply_on_ball(Team::A, 1, A_DRIB_FWD, SPD_RUN_MED, &mut Rng::new(1));
         assert!(w.ev_dribble_fwd_a);
     }
 }

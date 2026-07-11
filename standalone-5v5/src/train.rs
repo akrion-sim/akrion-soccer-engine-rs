@@ -21,6 +21,8 @@ const W_OPEN: f32 = 0.04; // OFFENSE: get into a CLEAR passing lane from the bal
 const W_WIDTH: f32 = 0.045; // OFFENSE: use the width of the pitch (stretch wide)
 const W_FLANK: f32 = 0.025; // OFFENSE: commit to a left/right channel (two-flank spread)
 const W_GOALSIDE: f32 = 0.02; // DEFENSE: get goalside of the ball
+const W_AHEAD: f32 = 0.035; // OFFENSE (KEY): when a teammate has the ball, be an upfield outlet in a clear lane
+const W_MAKE_RUN: f32 = 0.02; // OFFENSE (KEY): actively sprint upfield to get open for a forward pass
 const ENT_BETA0: f32 = 0.02;
 
 // Teammate-spacing reward weight. Overridable via SPACING_W env for tuning.
@@ -639,7 +641,7 @@ pub fn train_iter(policy: &mut Policy, games: usize, ent_beta: f32, rng: &mut Rn
                 let dv = v - s.ret; // dL/dv for 0.5*(v-ret)^2
                 policy.critic.backward(&cacts, &[dv]);
 
-                ent_accum += ent;
+                ent_accum += ent + ent_s;
                 vloss_accum += 0.5 * (v - s.ret) * (v - s.ret);
                 count += 1.0;
             }
