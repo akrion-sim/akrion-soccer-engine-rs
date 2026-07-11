@@ -24344,7 +24344,7 @@ pub(crate) fn forward_pass_turnover_penalty_scale() -> f64 {
 /// Companion dampener for the shot-TAKEN shaping proxy (on-/off-target reward, NOT the goal or
 /// terminal-outcome reward, which stay intact — the net must still finish). Lets a forward-pass-
 /// primacy A/B stop the net shooting early instead of building up. Env
-/// `DD_SOCCER_SHOT_SHAPING_REWARD_SCALE` (clamped 0-1), default 1.0 ⇒ unchanged.
+/// `DD_SOCCER_SHOT_SHAPING_REWARD_SCALE` (clamped [1e-4,4.0]), default 1.0 ⇒ unchanged.
 pub(crate) fn shot_shaping_reward_scale() -> f64 {
     if dynamic_reward_weights_enabled() {
         return reward_weight_env("DD_SOCCER_SHOT_SHAPING_REWARD_SCALE", 1.0, 1e-4, 4.0);
