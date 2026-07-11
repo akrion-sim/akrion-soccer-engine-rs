@@ -159,6 +159,8 @@ pub struct World {
     pub last_pass_gain_a: f32,        // forward metres gained by the last completed A pass
     pub pass_streak_a: u32,           // completed A passes in the current possession (2-pass rule)
     pub fwd_pass_streak_a: u32, // consecutive completed FORWARD A passes (progressive build-up)
+    pub shoot_cooldown_a: u32,  // ticks until an A shot counts as a "fresh" chance again
+    pub shot_was_rapid_a: bool, // this tick's A shot came while the cooldown was still active
     a_shot_flag: bool,          // the current free ball came from a Team-A shot (gates goals)
     lp_from: i32,               // passer index of the last completed A pass
     lp_to: i32,                 // receiver index of the last completed A pass
