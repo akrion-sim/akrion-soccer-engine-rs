@@ -71,6 +71,16 @@ trained or searched on one seed partition, frozen for the inner learner, and
 selected on a disjoint held-out partition. Training reward is never the promotion
 metric.
 
+`soccer_reward_context_fit` is the outcome-grounded fitter. It reuses the existing
+configuration-moment corpus rather than inventing another state recorder: each
+row already contains the canonical 256-d embedding, the action taken, immediate
+reward, and realised n-step return. Reward heads learn higher utility in field
+configurations where the associated action family produced good future return;
+penalty heads learn the sign-mirrored target. A prior schema-v1 artifact can be
+passed as the fifth argument, so accepted weights are the next run's initial
+condition rather than being reset. The generated artifact is frozen during inner
+policy training and must still clear a disjoint promotion evaluation.
+
 ## Per-player MPC
 
 MPC remains strictly single-actor. The controlled state is one player's point
