@@ -1874,22 +1874,22 @@ mod tests {
     }
 
     #[test]
-    fn final_third_rule_masks_shot_outside_attacking_third() {
+    fn opponent_half_rule_masks_shot_in_own_half() {
         let mut w = World::new();
         w.owner = Some(Owner {
             team: Team::A,
             idx: 1,
         });
         w.pass_streak_a = 2; // 2-pass rule satisfied
-        w.a[1].pos = V2::new(FINAL_THIRD_X - 5.0, 14.0); // BEFORE the final third
+        w.a[1].pos = V2::new(SHOOT_X - 3.0, 14.0); // still in our own half
         assert!(
             !w.legal_mask(Team::A, 1)[A_SHOOT],
-            "shot must be masked outside final third"
+            "shot must be masked in our own half"
         );
-        w.a[1].pos = V2::new(FINAL_THIRD_X + 2.0, 14.0); // inside final third
+        w.a[1].pos = V2::new(SHOOT_X + 2.0, 14.0); // in the opponent's half
         assert!(
             w.legal_mask(Team::A, 1)[A_SHOOT],
-            "shot allowed in final third after 2 passes"
+            "shot allowed in the opponent's half after 2 passes"
         );
     }
 
