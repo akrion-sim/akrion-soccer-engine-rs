@@ -9,6 +9,7 @@ use crate::rng::Rng;
 pub const FIELD_L: f32 = 42.0;
 pub const FIELD_W: f32 = 28.0;
 pub const GOAL_HALF: f32 = 3.5; // half goal-mouth width in y (~7m net)
+#[allow(dead_code)]
 pub const FINAL_THIRD_X: f32 = FIELD_L * 2.0 / 3.0; // attacking-third boundary (kept for reference)
 pub const SHOOT_X: f32 = FIELD_L / 2.0; // A may shoot once in the OPPONENT'S HALF (not just the final third)
 pub const N: usize = 5; // players per team (index 0 == goalkeeper)
@@ -43,6 +44,7 @@ fn mpc_spacing_weight() -> f32 {
 pub const NS: usize = 7; // number of speed gears (the speed action head)
 pub const SPD_STAND: usize = 0;
 pub const SPD_WALK: usize = 1;
+#[allow(dead_code)]
 pub const SPD_JOG: usize = 2;
 pub const SPD_SKIP: usize = 3;
 pub const SPD_RUN_SLOW: usize = 4;
@@ -69,6 +71,9 @@ fn speed_val(gear: usize, carrying: bool) -> f32 {
 }
 const CONTROL_RADIUS: f32 = 1.5; // secure a received ball -> possessions can develop
 const RECEIVE_RADIUS: f32 = 2.8; // intended pass receiver collects from further out
+const AERIAL_CONTROL_SPACE: f32 = 3.6; // a SCOOPED (aerial) pass needs the receiver this open to control
+const CURL_MIN_DIST: f32 = 20.0; // passes/shots longer than this can be given curl (spin)
+const CURL_ACCEL: f32 = 6.0; // lateral curl acceleration on a long ball (bends around a defender)
 const TACKLE_RADIUS: f32 = 1.6;
 const TACKLE_PROB: f32 = 0.12; // per-tick; retuned for 20 Hz to keep same per-second rate
 const BALL_FRICTION: f32 = 0.965; // per-tick decay retuned for 20 Hz (same per-second decay)
@@ -188,6 +193,12 @@ pub struct World {
     pub b: [Player; N],
     pub ball: V2,
     pub ball_vel: V2,
+    pub ball_aerial: bool,  // in-flight ball is a lofted/scooped pass (over ground defenders)
+    pub air_ticks: u32,     // ticks the scooped ball stays airborne before it lands
+    pub ball_curl: V2,      // lateral curl (spin) accel on a long (>20yd) pass/shot
+    pending_curl: V2,       // scratch: curl for the kick launching this tick
+    pending_aerial: bool,   // scratch: the pass launched this tick is a scoop
+    pending_air_ticks: u32, // scratch: airborne duration for the launching scoop
     pub owner: Option<Owner>,
     pub last_touch: Option<Team>,
     last_kicker: Option<Owner>,
@@ -250,6 +261,12 @@ impl World {
             }; N],
             ball: V2::new(FIELD_L / 2.0, FIELD_W / 2.0),
             ball_vel: V2::default(),
+            ball_aerial: false,
+            air_ticks: 0,
+            ball_curl: V2::default(),
+            pending_curl: V2::default(),
+            pending_aerial: false,
+            pending_air_ticks: 0,
             owner: None,
             last_touch: None,
             last_kicker: None,
@@ -354,8 +371,32 @@ impl World {
         self.nearest_player(team.other(), p)
     }
 
+    pub fn nearest_opponent_distance(&self, team: Team, p: V2) -> (usize, f32) {
+        self.nearest_opponent(team, p)
+    }
+
     // -- pass-target ranking: pick every outfield teammate for the possessor ---
     // Score favors forward progress (toward attacked goal) and openness.
+    /// Curl (lateral accel) for a LONG (>20yd) pass/shot — bends the ball around a
+    /// defender in the lane. Field-vector driven: curls AWAY from the nearest
+    /// opponent to the lane midpoint. Zero for short balls; more on longer ones.
+    fn kick_curl(&self, team: Team, from: V2, to: V2) -> V2 {
+        let seg = to.sub(from);
+        let dist = seg.len();
+        if dist < CURL_MIN_DIST {
+            return V2::default();
+        }
+        let dir = seg.unit();
+        let perp = V2::new(-dir.y, dir.x);
+        let mid = from.add(seg.scale(0.5));
+        let (oi, _) = self.nearest_opponent(team, mid);
+        let opp = players(team.other(), self)[oi].pos;
+        let rel = opp.sub(mid);
+        let side = if rel.x * perp.x + rel.y * perp.y > 0.0 { -1.0 } else { 1.0 };
+        let strength = CURL_ACCEL * ((dist - CURL_MIN_DIST) / 20.0).clamp(0.0, 1.0);
+        perp.scale(side * strength)
+    }
+
     fn pass_candidates(
         &self,
         team: Team,
@@ -833,6 +874,11 @@ impl World {
             self.last_touch = Some(kicker.team);
             self.last_kicker = Some(kicker);
             self.kick_timer = 6;
+            self.ball_aerial = is_pass && self.pending_aerial;
+            self.air_ticks = if self.ball_aerial { self.pending_air_ticks } else { 0 };
+            self.pending_aerial = false;
+            self.ball_curl = self.pending_curl;
+            self.pending_curl = V2::default();
             self.pending_pass = None;
             if is_pass {
                 // remember intended receiver (BOTH teams) so the reception radius
@@ -866,7 +912,16 @@ impl World {
         // 4. Advance a free ball + friction, walls, goals, capture.
         if self.owner.is_none() {
             self.ball = self.ball.add(self.ball_vel.scale(DT));
+            if self.ball_vel.len() > 4.0 {
+                self.ball_vel = self.ball_vel.add(self.ball_curl.scale(DT));
+            }
             self.ball_vel = self.ball_vel.scale(BALL_FRICTION);
+            if self.ball_aerial {
+                self.air_ticks = self.air_ticks.saturating_sub(1);
+                if self.air_ticks == 0 {
+                    self.ball_aerial = false; // the scoop lands -> a normal ground ball
+                }
+            }
 
             // reflect off side-lines (y walls) to keep play flowing
             if self.ball.y < 0.0 {
@@ -946,6 +1001,10 @@ impl World {
         // anticipation edge, so passes actually CONNECT instead of going loose —
         // unless an opponent is genuinely closer and intercepts.
         if best.is_none() && !ball_fast {
+            // A SCOOPED ball in the air is over ground players: only the intended
+            // receiver can bring it down, and only if they are open enough to
+            // control it (aerial touch needs space). Otherwise it flies on / lands.
+            let aerial = self.ball_aerial && self.air_ticks > 0;
             let mut best_eff = f32::INFINITY;
             for team in [Team::A, Team::B] {
                 for i in 0..N {
@@ -961,6 +1020,16 @@ impl World {
                     }
                     let is_recv =
                         matches!(self.pending_pass, Some(r) if r.team == team && r.idx == i);
+                    if aerial {
+                        if !is_recv {
+                            continue; // ground players can't reach an airborne ball
+                        }
+                        let (_, recv_open) =
+                            self.nearest_opponent(team, players(team, self)[i].pos);
+                        if recv_open < AERIAL_CONTROL_SPACE {
+                            continue; // receiver not open enough to control the scoop yet
+                        }
+                    }
                     let radius = if is_recv {
                         RECEIVE_RADIUS
                     } else {
@@ -981,6 +1050,9 @@ impl World {
         if let Some((o, _)) = best {
             let prev_touch = self.last_touch;
             self.owner = Some(o);
+            self.ball_aerial = false; // controlled -> no longer airborne
+            self.air_ticks = 0;
+            self.ball_curl = V2::default();
             self.a_shot_flag = false; // shot resolved into possession
             self.b_shot_flag = false;
             // Team-A reward events. pending_pass.team is the PASSING team.
@@ -1159,6 +1231,7 @@ impl World {
                         self.ev_shot_on_a = true;
                     }
                 }
+                self.pending_curl = self.kick_curl(team, me, aim);
                 Some((owner, aim.sub(me), SHOT_SPEED, false))
             }
             A_PASS_A | A_PASS_B | A_PASS_C => {
@@ -1169,6 +1242,16 @@ impl World {
                     let tp = players(team, self)[ti].pos;
                     let lead = tp.add(V2::new(sx * 2.0, 0.0));
                     self.intended_receiver = Some(Owner { team, idx: ti });
+                    // SCOOP / lofted pass: if a defender blocks the GROUND lane to the
+                    // target, lift the ball OVER them (aerial) so the pass can still be
+                    // made. Aerial control takes time, so it only completes if the
+                    // receiver is open (checked at reception) — else it lands loose.
+                    let ground_lane = self.lane_clearness(team, me, tp);
+                    if ground_lane < 0.55 {
+                        self.pending_aerial = true;
+                        let flight = (tp.sub(me).len() / (PASS_SPEED * DT)).round() as u32;
+                        self.pending_air_ticks = flight.clamp(3, 30);
+                    }
                     self.set_vel(team, idx, V2::default());
                     if team == Team::A {
                         self.ev_pass_attempt_a = true;
@@ -1195,7 +1278,11 @@ impl World {
                         }
                         self.ev_return_pass_a = is_return;
                     }
-                    Some((owner, lead.sub(me), PASS_SPEED, true))
+                    self.pending_curl = self.kick_curl(team, me, tp);
+                    let pass_dist = tp.sub(me).len();
+                    let pspeed =
+                        PASS_SPEED * (0.85 + 0.35 * (pass_dist / FIELD_L).clamp(0.0, 1.0));
+                    Some((owner, lead.sub(me), pspeed, true))
                 } else {
                     // no valid target: dribble forward instead
                     self.set_vel(team, idx, V2::new(sx, 0.0).scale(speed_val(spd, true)));
@@ -1291,10 +1378,30 @@ impl World {
             FIELD_W / 2.0 + GOAL_HALF + 1.5,
         );
         let dir = target.sub(me);
+        // The keeper is rule-based, but its SPEED now uses the 7 gears as a
+        // FIELD-VECTOR function: sprint when the ball threatens our goal or it must
+        // reposition fast, jog at midfield, walk when play is upfield.
+        let own_goal_x = if sx > 0.0 { 0.0 } else { FIELD_L };
+        let ball_threat = 1.0 - ((self.ball.x - own_goal_x).abs() / FIELD_L).clamp(0.0, 1.0);
+        let travel = (dir.len() / 9.0).clamp(0.0, 1.0);
+        let urgency = (0.6 * ball_threat + 0.4 * travel).clamp(0.0, 1.0);
+        let gear = if urgency > 0.80 {
+            SPD_SPRINT
+        } else if urgency > 0.62 {
+            SPD_RUN_FAST
+        } else if urgency > 0.46 {
+            SPD_RUN_SLOW
+        } else if urgency > 0.30 {
+            SPD_SKIP
+        } else if urgency > 0.16 {
+            SPD_JOG
+        } else {
+            SPD_WALK
+        };
         let v = if dir.len() < 0.2 {
             V2::default()
         } else {
-            dir.unit().scale(KEEPER_SPEED)
+            dir.unit().scale(speed_val(gear, false))
         };
         self.set_vel(team, GK, v);
         None
@@ -1490,15 +1597,54 @@ impl World {
         best
     }
 
-    /// MPC-lite lane opener (execution of the GET_OPEN decision). Enumerates
-    /// candidate relocations — biased toward the wings — and returns the one that
-    /// best OPENS A PASSING LANE from the ball to that point: a short-horizon
-    /// optimization scoring the resulting lane clearness, plus width, being ahead
-    /// of the ball, and space from the nearest defender. The policy makes the
-    /// decision to get open; this computes where "open" actually is.
-    fn mpc_open_lane_target(&self, team: Team, idx: usize) -> V2 {
+    fn mpc_field_vector_score(&self, team: Team, idx: usize, cand: V2) -> f32 {
         let me = players(team, self)[idx].pos;
         let sx = team.sx();
+        let lane = self.lane_clearness(team, self.ball, cand);
+        let route = self.lane_clearness(team, me, cand);
+        let wide = (cand.y - FIELD_W / 2.0).abs() / (FIELD_W / 2.0);
+        let ahead = ((cand.x - self.ball.x) * sx).max(0.0) / FIELD_L;
+        let (_, defender_d) = self.nearest_opponent(team, cand);
+        let defender_space = (defender_d / 7.0).min(1.0);
+        let mut teammate_gap = f32::INFINITY;
+        for j in 1..N {
+            if j == idx {
+                continue;
+            }
+            teammate_gap = teammate_gap.min(players(team, self)[j].pos.sub(cand).len());
+        }
+        let teammate_space = (teammate_gap / 7.0).min(1.0);
+        let carrier_pressure = if let Some(o) = self.owner {
+            if o.team == team {
+                let carrier = players(team, self)[o.idx].pos;
+                let (_, pressure_d) = self.nearest_opponent(team, carrier);
+                (1.0 - pressure_d / 7.0).clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        } else {
+            0.25
+        };
+        let goal = team.target_goal();
+        let shot_channel = self.lane_clearness(team, cand, goal);
+        lane * 1.35
+            + route * 0.35
+            + wide * 0.55
+            + ahead * (0.55 + 0.35 * carrier_pressure)
+            + defender_space * 0.45
+            + teammate_space * 0.25
+            + shot_channel * 0.20
+    }
+
+    /// MPC-lite lane opener (execution of the GET_OPEN decision). Enumerates
+    /// candidate relocations and scores each candidate as a function of the
+    /// current 10-player field vector: ball lane, route lane, width, aheadness,
+    /// defender pressure, teammate spacing, carrier pressure, and shot channel.
+    /// The POMDP picks GET_OPEN; this field-vector objective computes where
+    /// "open" actually is. A QP/neural MPC can replace the enumerator, but it
+    /// should optimize this same state-conditioned objective shape.
+    fn mpc_open_lane_target(&self, team: Team, idx: usize) -> V2 {
+        let me = players(team, self)[idx].pos;
         let radii = [4.0f32, 8.0, 12.0, 16.0];
         let ndir = 12usize;
         let mut best = me;
@@ -1510,16 +1656,7 @@ impl World {
                     (me.x + ang.cos() * r).clamp(3.0, FIELD_L - 3.0),
                     (me.y + ang.sin() * r).clamp(3.0, FIELD_W - 3.0),
                 );
-                // the payoff: a CLEAR passing lane from the ball to this point.
-                let lane = self.lane_clearness(team, self.ball, cand);
-                // prefer WIDTH (the mechanism for opening a lane is going wider)…
-                let wide = (cand.y - FIELD_W / 2.0).abs() / (FIELD_W / 2.0);
-                // …an upfield outlet ahead of the ball…
-                let ahead = ((cand.x - self.ball.x) * sx).max(0.0) / FIELD_L;
-                // …and real space from the nearest defender (room to receive).
-                let (_, od) = self.nearest_opponent(team, cand);
-                let space = (od / 6.0).min(1.0);
-                let score = lane * 1.6 + wide * 0.7 + ahead * 0.6 + space * 0.5;
+                let score = self.mpc_field_vector_score(team, idx, cand);
                 if score > best_score {
                     best_score = score;
                     best = cand;
@@ -1824,6 +1961,15 @@ mod tests {
         }
     }
 
+    fn return_pass_action_to_previous_giver(w: &World, from_idx: usize, giver_idx: usize) -> usize {
+        let cands = w.pass_candidates(Team::A, from_idx);
+        let rank = cands
+            .iter()
+            .position(|cand| matches!(cand, Some((idx, _)) if *idx == giver_idx))
+            .expect("previous giver should remain legal but de-ranked");
+        A_PASS_A + rank
+    }
+
     #[test]
     fn observations_and_global_state_are_finite() {
         let w = World::new();
@@ -1910,7 +2056,12 @@ mod tests {
 
         let off_ball = w.legal_mask(Team::A, 2);
         assert!(!off_ball[A_PASS_A]);
-        assert!(off_ball[A_CHASE]);
+        assert!(
+            !off_ball[A_CHASE],
+            "off-ball attackers should not chase their own carrier"
+        );
+        assert!(off_ball[A_SUPPORT]);
+        assert!(off_ball[A_GET_OPEN]);
         assert!(off_ball[A_STAY]);
     }
 
@@ -2031,7 +2182,8 @@ mod tests {
         w.lp_to = 2;
         w.return_streak_a = 1;
 
-        let kick = w.apply_on_ball(Team::A, 2, A_PASS_A, SPD_RUN_MED, &mut Rng::new(3));
+        let action = return_pass_action_to_previous_giver(&w, 2, 1);
+        let kick = w.apply_on_ball(Team::A, 2, action, SPD_RUN_MED, &mut Rng::new(3));
 
         assert!(kick.is_some());
         assert!(matches!(w.intended_receiver, Some(o) if o.team == Team::A && o.idx == 1));
@@ -2100,7 +2252,8 @@ mod tests {
         w.lp_from = 1; // player 1 gave the ball to player 2
         w.lp_to = 2;
         w.return_streak_a = 0;
-        let _ = w.apply_on_ball(Team::A, 2, A_PASS_A, SPD_RUN_MED, &mut Rng::new(3));
+        let action = return_pass_action_to_previous_giver(&w, 2, 1);
+        let _ = w.apply_on_ball(Team::A, 2, action, SPD_RUN_MED, &mut Rng::new(3));
         assert!(w.ev_return_pass_a);
         assert_eq!(w.return_streak_a, 1);
         assert_eq!(w.return_start_x, 20.0); // sequence origin recorded
@@ -2204,5 +2357,78 @@ mod tests {
         }
         let _ = w.apply_on_ball(Team::A, 1, A_DRIB_FWD, SPD_RUN_MED, &mut Rng::new(1));
         assert!(w.ev_dribble_fwd_a);
+    }
+
+    #[test]
+    fn support_speed_mask_requires_run_fast_or_sprint_in_possession() {
+        let mut w = World::new();
+        w.owner = Some(Owner {
+            team: Team::A,
+            idx: 1,
+        });
+        let mask = w.speed_mask(Team::A, 2, A_SUPPORT);
+
+        assert!(!mask[SPD_STAND]);
+        assert!(!mask[SPD_RUN_SLOW]);
+        assert!(mask[SPD_RUN_FAST]);
+        assert!(mask[SPD_SPRINT]);
+        assert_eq!(
+            w.coerce_speed_gear(Team::A, 2, A_SUPPORT, SPD_WALK),
+            SPD_RUN_FAST
+        );
+    }
+
+    #[test]
+    fn goalside_recovery_target_moves_wrong_side_defender_toward_own_goal() {
+        let mut w = World::new();
+        w.owner = Some(Owner {
+            team: Team::B,
+            idx: 1,
+        });
+        w.ball = V2::new(28.0, 14.0);
+        w.a[2].pos = V2::new(34.0, 16.0);
+        w.b[2].pos = V2::new(32.0, 18.0);
+
+        let target = w.goalside_recovery_target(Team::A, 2);
+
+        assert!(
+            target.x < w.a[2].pos.x,
+            "wrong-side defender should recover toward own goal: target={target:?}"
+        );
+        assert!(
+            target.x < w.ball.x,
+            "target should get goalside of the ball: target={target:?}, ball={:?}",
+            w.ball
+        );
+        let mask = w.speed_mask(Team::A, 2, A_MARK);
+        assert!(mask[SPD_RUN_FAST] && mask[SPD_SPRINT]);
+        assert!(!mask[SPD_SKIP]);
+    }
+
+    #[test]
+    fn mpc_field_vector_score_prefers_open_wide_lane_over_blocked_centre() {
+        let mut w = World::new();
+        w.owner = Some(Owner {
+            team: Team::A,
+            idx: 1,
+        });
+        w.ball = V2::new(12.0, 14.0);
+        w.a[1].pos = w.ball;
+        w.a[2].pos = V2::new(14.0, 14.0);
+        w.a[3].pos = V2::new(10.0, 5.0);
+        w.a[4].pos = V2::new(10.0, 23.0);
+        w.b[1].pos = V2::new(18.0, 14.0);
+        w.b[2].pos = V2::new(22.0, 14.0);
+        w.b[3].pos = V2::new(34.0, 6.0);
+        w.b[4].pos = V2::new(34.0, 22.0);
+
+        let blocked_centre = V2::new(25.0, 14.0);
+        let wide_lane = V2::new(25.0, 24.0);
+
+        assert!(
+            w.mpc_field_vector_score(Team::A, 2, wide_lane)
+                > w.mpc_field_vector_score(Team::A, 2, blocked_centre),
+            "field-vector MPC should prefer the unblocked wide outlet"
+        );
     }
 }

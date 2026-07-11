@@ -26,54 +26,103 @@ const LR_BC: f32 = 8e-4;
 const EPOCHS: usize = 4;
 const MINIBATCH: usize = 1024;
 const MAX_ROLLOUT_THREADS: usize = 4;
+const MIN_REWARD_WEIGHT: f32 = 0.0001;
+const LINGER_RADIUS: f32 = 4.0; // "same radius": teammates within this many yards
+/// Consecutive ticks two teammates must LINGER within LINGER_RADIUS before the
+/// spacing penalty applies. Brief crossings/convergence pay nothing (real soccer:
+/// players run right past each other). Env `SPACING_LINGER_SECS` (default 1.5 s).
+fn linger_ticks() -> u32 {
+    let secs = std::env::var("SPACING_LINGER_SECS")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(1.5);
+    ((secs / DT).round() as u32).max(1)
+}
 // ─── Tunable reward weights (env-overridable, read ONCE per process) ─────────
 // Every weight below can be set via an env var of the same name, so an external
-// search harness (viz/tune.py) can optimize the reward vector without recompiling.
-fn wenv(name: &str, default: f32) -> f32 {
-    std::env::var(name)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
+// search harness (viz/tune.py) can optimize the reward vector without
+// recompiling. Bounds keep every reward channel alive while still allowing
+// past-run priors to be overridden by the tuner.
+fn bounded_weight(raw: Option<&str>, default: f32, lo: f32, hi: f32) -> f32 {
+    let lo = lo.max(MIN_REWARD_WEIGHT);
+    let hi = hi.max(lo);
+    let value = raw
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|v| v.is_finite())
+        .unwrap_or(default);
+    value.clamp(lo, hi)
+}
+
+fn wenv(name: &str, default: f32, lo: f32, hi: f32) -> f32 {
+    let raw = std::env::var(name).ok();
+    bounded_weight(raw.as_deref(), default, lo, hi)
 }
 pub struct Rw {
-    pub goal: f32,        // +goal scored
-    pub concede: f32,     // -goal conceded (stored positive, subtracted)
-    pub shot_base: f32,   // shot-on-goal base (earned, from opponent half after 2 passes)
-    pub shot_q: f32,      // shot-on-goal chance-quality bonus
-    pub milestone: f32,   // completing the 2nd pass (unlocks the shot)
-    pub pass_credit: f32, // flat credit for a completed pass
-    pub turnover: f32,    // -turnover (stored positive, subtracted)
-    pub dribble: f32,     // forward dribble carry
-    pub shape: f32,       // potential shaping (forward progress)
-    pub advance: f32,     // OFFENSE: push upfield
-    pub open: f32,        // OFFENSE: clear passing lane from the ball
-    pub width: f32,       // OFFENSE: use pitch width
-    pub flank: f32,       // OFFENSE: commit to a left/right channel
-    pub goalside: f32,    // DEFENSE: goalside of the ball
-    pub ahead: f32,       // off-ball outlet ahead of the ball in a clear lane
-    pub make_run: f32,    // off-ball forward run (velocity)
-    pub stand_pen: f32,   // anti-passivity: penalize the STAND gear off-ball
+    pub goal: f32,                 // +goal scored
+    pub concede: f32,              // -goal conceded (stored positive, subtracted)
+    pub shot_base: f32,            // shot-on-goal base (earned, from opponent half after 2 passes)
+    pub shot_q: f32,               // shot-on-goal chance-quality bonus
+    pub milestone: f32,            // completing the 2nd pass (unlocks the shot)
+    pub pass_credit: f32,          // flat credit for a completed pass
+    pub turnover: f32,             // -turnover (stored positive, subtracted)
+    pub bad_pass_turnover: f32,    // extra -pass interception / bad pass capture
+    pub dribble_turnover: f32,     // extra -dribble/carry dispossession
+    pub recycle: f32,              // -sterile long possession recycling
+    pub return_pass: f32,          // -same two-player return loop
+    pub return_stale: f32,         // extra -return loop with no upfield progress
+    pub win_ball: f32,             // +ball recovery
+    pub dribble: f32,              // forward dribble carry
+    pub shape: f32,                // potential shaping (forward progress)
+    pub advance: f32,              // OFFENSE: push upfield
+    pub open: f32,                 // OFFENSE: clear passing lane from the ball
+    pub width: f32,                // OFFENSE: use pitch width
+    pub flank: f32,                // OFFENSE: commit to a left/right channel
+    pub goalside: f32,             // DEFENSE: goalside of the ball
+    pub goalside_run: f32,         // DEFENSE: sprint back while wrong-side
+    pub ahead: f32,                // off-ball outlet ahead of the ball in a clear lane
+    pub make_run: f32,             // off-ball forward run (velocity)
+    pub burst_gear: f32,           // off-ball use of run/sprint gears in possession
+    pub field_pass: f32,           // field-vector interaction on completed passes
+    pub field_turnover: f32,       // field-vector interaction on turnovers
+    pub chance: f32,               // MARL: team reward for creating a scoring chance (potential)
+    pub field_goalside_delta: f32, // reward improving team goalside geometry
+    pub field_burst_delta: f32,    // reward improving forward outlet geometry
+    pub stand_pen: f32,            // anti-passivity: penalize the STAND gear off-ball
 }
 fn rw() -> &'static Rw {
     static R: std::sync::OnceLock<Rw> = std::sync::OnceLock::new();
     R.get_or_init(|| Rw {
-        goal: wenv("REW_GOAL", 12.0),
-        concede: wenv("REW_CONCEDE", 8.0),
-        shot_base: wenv("REW_SHOT_BASE", 1.5),
-        shot_q: wenv("REW_SHOT_Q", 1.0),
-        milestone: wenv("REW_MILESTONE", 0.3),
-        pass_credit: wenv("REW_PASS", 0.06),
-        turnover: wenv("REW_TURNOVER", 0.2),
-        dribble: wenv("REW_DRIBBLE", 0.015),
-        shape: wenv("W_SHAPE", 2.2),
-        advance: wenv("W_ADVANCE", 0.04),
-        open: wenv("W_OPEN", 0.04),
-        width: wenv("W_WIDTH", 0.045),
-        flank: wenv("W_FLANK", 0.025),
-        goalside: wenv("W_GOALSIDE", 0.02),
-        ahead: wenv("W_AHEAD", 0.0),
-        make_run: wenv("W_MAKE_RUN", 0.0),
-        stand_pen: wenv("W_STAND_PEN", 0.02),
+        goal: wenv("REW_GOAL", 12.0, 6.0, 20.0),
+        concede: wenv("REW_CONCEDE", 8.0, 4.0, 16.0),
+        shot_base: wenv("REW_SHOT_BASE", 1.5, 0.3, 3.5),
+        shot_q: wenv("REW_SHOT_Q", 1.0, MIN_REWARD_WEIGHT, 2.5),
+        milestone: wenv("REW_MILESTONE", 0.3, MIN_REWARD_WEIGHT, 1.5),
+        pass_credit: wenv("REW_PASS", 0.06, MIN_REWARD_WEIGHT, 0.4),
+        turnover: wenv("REW_TURNOVER", 0.55, MIN_REWARD_WEIGHT, 1.5),
+        bad_pass_turnover: wenv("REW_BAD_PASS_TURNOVER", 0.35, MIN_REWARD_WEIGHT, 1.5),
+        dribble_turnover: wenv("REW_DRIBBLE_TURNOVER", 0.75, MIN_REWARD_WEIGHT, 2.0),
+        recycle: wenv("REW_RECYCLE", 0.18, MIN_REWARD_WEIGHT, 0.8),
+        return_pass: wenv("REW_RETURN_PASS", 0.35, MIN_REWARD_WEIGHT, 2.0),
+        return_stale: wenv("REW_RETURN_STALE", 0.55, MIN_REWARD_WEIGHT, 2.0),
+        win_ball: wenv("REW_WIN_BALL", 0.3, MIN_REWARD_WEIGHT, 1.2),
+        dribble: wenv("REW_DRIBBLE", 0.015, MIN_REWARD_WEIGHT, 0.12),
+        shape: wenv("W_SHAPE", 2.2, 0.5, 4.0),
+        advance: wenv("W_ADVANCE", 0.04, MIN_REWARD_WEIGHT, 0.12),
+        open: wenv("W_OPEN", 0.04, MIN_REWARD_WEIGHT, 0.12),
+        width: wenv("W_WIDTH", 0.045, MIN_REWARD_WEIGHT, 0.12),
+        flank: wenv("W_FLANK", 0.025, MIN_REWARD_WEIGHT, 0.10),
+        goalside: wenv("W_GOALSIDE", 0.08, MIN_REWARD_WEIGHT, 0.25),
+        goalside_run: wenv("W_GOALSIDE_RUN", 0.04, MIN_REWARD_WEIGHT, 0.16),
+        ahead: wenv("W_AHEAD", 0.035, MIN_REWARD_WEIGHT, 0.16),
+        make_run: wenv("W_MAKE_RUN", 0.06, MIN_REWARD_WEIGHT, 0.20),
+        burst_gear: wenv("W_BURST_GEAR", 0.035, MIN_REWARD_WEIGHT, 0.16),
+        field_pass: wenv("W_FIELD_PASS", 0.08, MIN_REWARD_WEIGHT, 0.30),
+        field_turnover: wenv("W_FIELD_TURNOVER", 0.16, MIN_REWARD_WEIGHT, 0.50),
+        chance: wenv("W_CHANCE", 0.12, MIN_REWARD_WEIGHT, 0.60),
+        field_goalside_delta: wenv("W_FIELD_GOALSIDE_DELTA", 0.10, MIN_REWARD_WEIGHT, 0.35),
+        field_burst_delta: wenv("W_FIELD_BURST_DELTA", 0.08, MIN_REWARD_WEIGHT, 0.35),
+        stand_pen: wenv("W_STAND_PEN", 0.02, MIN_REWARD_WEIGHT, 0.20),
     })
 }
 // The speed policy is a low-variance REFINEMENT on top of the action policy —
@@ -88,12 +137,7 @@ const ENT_BETA0: f32 = 0.02;
 // sane cold-start baseline; strictly-positive clamps prevent disabling or
 // exploding the reward through a malformed artifact/environment value.
 fn w_spacing() -> f32 {
-    std::env::var("SPACING_W")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|value: &f32| value.is_finite())
-        .unwrap_or(0.003)
-        .clamp(0.0001, 4.0)
+    wenv("SPACING_W", 0.003, 0.0001, 4.0)
 }
 
 /// PER-PLAYER spacing reward as a function of a player's nearest-teammate
@@ -115,7 +159,7 @@ fn spacing_reward(d: f32) -> f32 {
     } else if d < 1.5 {
         -50.0
     } else if d < 3.0 {
-        -8.0 // within 3 yds: bumped penalty (was -3)
+        -18.0 // within 3 yds: STEEP (lingering this close is bad)
     } else if d < 4.0 {
         -3.0 // within 4 yds: now also penalized
     } else if d < 8.0 {
@@ -124,6 +168,131 @@ fn spacing_reward(d: f32) -> f32 {
         8.0 - (d - 8.0) * 2.0 // +8 at 8 -> 0 at 12
     } else {
         -(d - 12.0) * 4.0 // 12+ : escalating penalty
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct FieldRewardContext {
+    pass_value: f32,
+    safe_outlet_value: f32,
+    turnover_risk: f32,
+    dribble_pressure: f32,
+    goalside_score: f32,
+    burst_score: f32,
+    return_stale: f32,
+    chance_value: f32,
+}
+
+impl FieldRewardContext {
+    fn from_world(w: &World) -> Self {
+        let mut ctx = Self::default();
+        let a_owns = matches!(w.owner, Some(o) if matches!(o.team, Team::A));
+        let b_owns = matches!(w.owner, Some(o) if matches!(o.team, Team::B));
+        let our_phase = a_owns || (w.owner.is_none() && matches!(w.last_touch, Some(Team::A)));
+        let their_phase = b_owns || (w.owner.is_none() && matches!(w.last_touch, Some(Team::B)));
+
+        let mut best_outlet = 0.0f32;
+        let mut outlet_count = 0.0f32;
+        for i in 1..N {
+            let pos = w.a[i].pos;
+            let ahead = ((pos.x - w.ball.x) / 12.0).clamp(0.0, 1.0);
+            let lane = w.lane_clearness(Team::A, w.ball, pos);
+            let (_, opp_d) = w.nearest_opponent_distance(Team::A, pos);
+            let space = (opp_d / 8.0).clamp(0.0, 1.0);
+            let outlet = ahead * (0.55 * lane + 0.45 * space);
+            best_outlet = best_outlet.max(outlet);
+            if outlet > 0.25 {
+                outlet_count += 1.0;
+            }
+        }
+        ctx.safe_outlet_value =
+            (0.70 * best_outlet + 0.30 * (outlet_count / 3.0).clamp(0.0, 1.0)).clamp(0.0, 1.0);
+        // MARL chance creation: the best SHOOTING chance the attack has manufactured
+        // — an off-ball attacker in a high-xG spot (close+central to the opp goal, in
+        // their half) with a clear reception lane from the ball. Coordinated,
+        // synchronized runs INTO such a spot raise this; used as a potential.
+        if our_phase {
+            let goal = V2::new(FIELD_L, FIELD_W / 2.0);
+            let mut best_chance = 0.0f32;
+            for i in 1..N {
+                let pos = w.a[i].pos;
+                if pos.x < SHOOT_X {
+                    continue;
+                }
+                let d = goal.sub(pos).len();
+                let lateral = (pos.y - FIELD_W / 2.0).abs();
+                let dist_f = (1.0 - d / 26.0).clamp(0.0, 1.0);
+                let angle_f = (1.0 - lateral / (FIELD_W / 2.0)).clamp(0.0, 1.0);
+                let xg = dist_f * dist_f * (0.4 + 0.6 * angle_f);
+                let lane = w.lane_clearness(Team::A, w.ball, pos);
+                best_chance = best_chance.max(xg * lane);
+            }
+            ctx.chance_value = best_chance;
+        }
+
+        if let Some(o) = w.owner {
+            let carrier = if o.team == Team::A {
+                w.a[o.idx].pos
+            } else {
+                w.b[o.idx].pos
+            };
+            let (_, pressure_d) = w.nearest_opponent_distance(o.team, carrier);
+            let pressure = (1.0 - pressure_d / 7.0).clamp(0.0, 1.0);
+            if o.team == Team::A {
+                let forward = (carrier.x / FIELD_L).clamp(0.0, 1.0);
+                ctx.dribble_pressure = pressure;
+                ctx.pass_value = (0.45 * ctx.safe_outlet_value + 0.35 * forward + 0.20 * pressure)
+                    .clamp(0.0, 1.0);
+                ctx.turnover_risk =
+                    (0.40 * pressure + 0.35 * ctx.safe_outlet_value + 0.25 * forward)
+                        .clamp(0.0, 1.0);
+            }
+        } else if matches!(w.last_touch, Some(Team::A)) {
+            ctx.pass_value = ctx.safe_outlet_value * 0.75;
+            ctx.turnover_risk = ctx.safe_outlet_value * 0.65;
+        }
+
+        let mut goalside_sum = 0.0f32;
+        let mut recovery_need = 0.0f32;
+        for i in 1..N {
+            let pos = w.a[i].pos;
+            let goalside = ((w.ball.x - pos.x) / 8.0).clamp(-1.0, 1.0);
+            goalside_sum += (goalside + 1.0) * 0.5;
+            if their_phase && pos.x > w.ball.x {
+                recovery_need += ((pos.x - w.ball.x) / FIELD_L).clamp(0.0, 1.0);
+            }
+        }
+        ctx.goalside_score = if their_phase {
+            (goalside_sum / (N - 1) as f32 - 0.25 * recovery_need).clamp(0.0, 1.0)
+        } else {
+            (goalside_sum / (N - 1) as f32).clamp(0.0, 1.0)
+        };
+
+        if our_phase {
+            let mut burst_sum = 0.0f32;
+            for i in 1..N {
+                let pos = w.a[i].pos;
+                if matches!(w.owner, Some(o) if o.team == Team::A && o.idx == i) {
+                    continue;
+                }
+                let ahead = ((pos.x - w.ball.x) / 12.0).clamp(0.0, 1.0);
+                let lane = w.lane_clearness(Team::A, w.ball, pos);
+                let fwd_speed = (w.a[i].vel.x / 8.5).clamp(0.0, 1.0);
+                burst_sum += ahead * lane * (0.35 + 0.65 * fwd_speed);
+            }
+            ctx.burst_score = (burst_sum / (N - 1) as f32).clamp(0.0, 1.0);
+        }
+
+        ctx.return_stale = if w.return_streak_a > 0 && w.ball.x - w.return_start_x < 5.0 {
+            (1.0 - (w.ball.x - w.return_start_x).max(0.0) / 5.0).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        ctx
+    }
+
+    fn delta(next: f32, prev: f32) -> f32 {
+        (next - prev).clamp(-1.0, 1.0)
     }
 }
 
@@ -148,9 +317,7 @@ impl Policy {
         }
     }
 
-    /// Greedy (argmax action + argmax speed) — used at evaluation. Returns the
-    /// PACKED action `action + speed*NA` ready to hand to `World::step`.
-    pub fn act_greedy(&self, obs: &[f32], mask: &[bool; NA]) -> usize {
+    pub fn greedy_action(&self, obs: &[f32], mask: &[bool; NA]) -> usize {
         let logits = self.actor.predict(obs);
         let probs = masked_softmax(&logits, mask);
         let mut bi = 0;
@@ -161,24 +328,56 @@ impl Policy {
                 bi = i;
             }
         }
+        bi
+    }
+
+    pub fn greedy_speed(&self, obs: &[f32], speed_mask: &[bool; NS]) -> usize {
         // During the speed warmup, eval uses the same fixed gear the action policy
-        // was trained on.
+        // was trained on, coerced onto the phase-aware legal speed support.
         if SPEED_FROZEN.load(Ordering::Relaxed) {
-            return bi + SPD_RUN_MED * NA;
+            return speed_mask
+                .iter()
+                .enumerate()
+                .skip(SPD_RUN_MED)
+                .find_map(|(idx, ok)| ok.then_some(idx))
+                .or_else(|| speed_mask.iter().position(|&ok| ok))
+                .unwrap_or(SPD_STAND);
         }
-        // greedy speed gear (argmax over the MOVING gears). We skip SPD_STAND (0)
-        // at eval so a near-flat speed policy can't tie-break the team into standing
-        // still — standing is essentially never the right greedy choice.
+        // Greedy speed gear over the legal phase-aware gears. We prefer moving
+        // gears when legal so a near-flat speed policy cannot tie-break attacking
+        // and recovery runs into standing still.
         let slogits = self.speedor.predict(obs);
-        let mut bs = SPD_WALK;
+        let mut bs = speed_mask
+            .iter()
+            .enumerate()
+            .skip(SPD_WALK)
+            .find_map(|(idx, ok)| ok.then_some(idx))
+            .or_else(|| speed_mask.iter().position(|&ok| ok))
+            .unwrap_or(SPD_STAND);
         let mut bsp = f32::NEG_INFINITY;
-        for k in SPD_WALK..NS {
-            if slogits[k] > bsp {
+        for k in 0..NS {
+            if speed_mask[k] && slogits[k] > bsp {
                 bsp = slogits[k];
                 bs = k;
             }
         }
+        bs
+    }
+
+    /// Greedy (argmax action + argmax legal speed) — used at evaluation. Returns
+    /// the PACKED action `action + speed*NA` ready to hand to `World::step`.
+    pub fn act_greedy(&self, obs: &[f32], mask: &[bool; NA], speed_mask: &[bool; NS]) -> usize {
+        let bi = self.greedy_action(obs, mask);
+        let bs = self.greedy_speed(obs, speed_mask);
         bi + bs * NA
+    }
+
+    pub fn act_greedy_world(&self, world: &World, team: Team, idx: usize) -> usize {
+        let obs = world.observe(team, idx);
+        let mask = world.legal_mask(team, idx);
+        let action = self.greedy_action(&obs, &mask);
+        let speed_mask = world.speed_mask(team, idx, action);
+        self.act_greedy(&obs, &mask, &speed_mask)
     }
 }
 
@@ -186,6 +385,7 @@ struct Sample {
     obs: [f32; OBS_DIM],       // decentralized actor observation
     gstate: [f32; GLOBAL_DIM], // centralized critic global state
     mask: [bool; NA],
+    speed_mask: [bool; NS],
     action: usize,   // macro action (0..NA)
     speed: usize,    // speed gear (0..NS)
     old_logp_a: f32, // ln p(action) at collection time
@@ -197,6 +397,7 @@ struct Sample {
 struct BcSample {
     obs: [f32; OBS_DIM],
     mask: [bool; NA],
+    speed_mask: [bool; NS],
     action: usize, // macro action (0..NA)
     speed: usize,  // scripted speed gear (0..NS)
 }
@@ -217,6 +418,7 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
     // per-player trajectory buffers
     let mut obs_buf: Vec<[[f32; OBS_DIM]; N]> = Vec::with_capacity(STEPS);
     let mut mask_buf: Vec<[[bool; NA]; N]> = Vec::with_capacity(STEPS);
+    let mut speed_mask_buf: Vec<[[bool; NS]; N]> = Vec::with_capacity(STEPS);
     let mut act_buf: Vec<[usize; N]> = Vec::with_capacity(STEPS); // macro action (0..NA)
     let mut spd_buf: Vec<[usize; N]> = Vec::with_capacity(STEPS); // speed gear (0..NS)
     let mut logpa_buf: Vec<[f32; N]> = Vec::with_capacity(STEPS); // action log-prob
@@ -227,10 +429,15 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
     let mut space_buf: Vec<[f32; N]> = Vec::with_capacity(STEPS); // per-player spacing reward
 
     let mut phi_prev = w.potential_a();
+    // per-outfielder linger counters: consecutive ticks a teammate has been within
+    // LINGER_RADIUS. Only SUSTAINED lingering triggers the spacing penalty.
+    let mut close_ticks = [0u32; N];
+    let linger_gate = linger_ticks();
 
     for _ in 0..STEPS {
         let mut obs_t = [[0.0f32; OBS_DIM]; N];
         let mut mask_t = [[false; NA]; N];
+        let mut speed_mask_t = [[false; NS]; N];
         let mut mact_t = [A_STAY; N]; // macro action
         let mut spd_t = [SPD_STAND; N]; // speed gear
         let mut packed_a = [A_STAY; N]; // packed (action + speed*NA) for step
@@ -245,22 +452,24 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
             // policy controls the 4 outfielders; GK (index 0) is rule-based.
             let obs = w.observe(Team::A, i);
             let mask = w.legal_mask(Team::A, i);
-            // action policy (masked) and SEPARATE speed policy (unmasked).
+            // action policy (masked) and SEPARATE speed policy (phase-masked).
             let logits = policy.actor.predict(&obs);
             let aprobs = masked_softmax(&logits, &mask);
             let a = rng.sample_categorical(&aprobs);
             let pa = aprobs[a].max(1e-8);
+            let speed_mask = w.speed_mask(Team::A, i, a);
             let slogits = policy.speedor.predict(&obs);
-            let sprobs = masked_softmax(&slogits, &[true; NS]);
+            let sprobs = masked_softmax(&slogits, &speed_mask);
             // Curriculum: fixed gear during warmup, sampled speed policy afterwards.
             let s = if SPEED_FROZEN.load(Ordering::Relaxed) {
-                SPD_RUN_MED
+                w.coerce_speed_gear(Team::A, i, a, SPD_RUN_MED)
             } else {
                 rng.sample_categorical(&sprobs)
             };
             let ps = sprobs[s].max(1e-8);
             obs_t[i] = obs;
             mask_t[i] = mask;
+            speed_mask_t[i] = speed_mask;
             mact_t[i] = a;
             spd_t[i] = s;
             packed_a[i] = a + s * NA;
@@ -268,8 +477,10 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
             logps_t[i] = ps.ln();
         }
 
+        let pre_field = FieldRewardContext::from_world(&w);
         let act_b = noisy_scripted_actions(&w, Team::B, opponent_noise, rng);
         w.step(&packed_a, &act_b, rng);
+        let post_field = FieldRewardContext::from_world(&w);
 
         // team reward (Team A perspective)
         let phi = w.potential_a();
@@ -282,6 +493,12 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
         if w.ev_goal_b {
             r -= rw().concede;
         }
+        // MARL SYNCHRONIZATION: reward the TEAM for collectively moving into a
+        // configuration where a scoring chance becomes available (potential-based on
+        // the best manufactured chance -> telescopes, unfarmable). This is what pulls
+        // attackers to move TOGETHER to create and get off a shot.
+        r += rw().chance
+            * FieldRewardContext::delta(post_field.chance_value, pre_field.chance_value);
         // Only a tiny nudge for a completed pass (prefer it to a loose turnover);
         // forward progress is rewarded by the potential shaping above, and goals
         // dominate — so passing stays INSTRUMENTAL and the policy still attacks.
@@ -290,7 +507,17 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
                                      // Small flat credit (prefer a completed pass to a loose turnover) PLUS a
                                      // forward-PROGRESS bonus. Progress is bounded by field length and lateral
                                      // recycling gains ~0, so it can't be farmed by tiki-taka.
-            r += rw().pass_credit + (w.last_pass_gain_a.max(0.0) * 0.1).min(0.6);
+            let field_pass = (0.50 + 0.75 * pre_field.pass_value).clamp(0.35, 1.25);
+            let field_progress =
+                (0.50 + 0.50 * post_field.safe_outlet_value + 0.25 * post_field.burst_score)
+                    .clamp(0.35, 1.25);
+            r += rw().pass_credit * field_pass
+                + (w.last_pass_gain_a.max(0.0) * 0.1 * field_progress).min(0.8);
+            r += rw().field_pass
+                * FieldRewardContext::delta(
+                    post_field.safe_outlet_value,
+                    pre_field.safe_outlet_value,
+                );
             // MILESTONE: the 2nd completed pass unlocks a legal shot. The pinball used
             // to farm this via pass-pass-shoot-repeat — now the SHOT COOLDOWN breaks
             // that loop (the rapid follow-up shot pays nothing), so the milestone is
@@ -300,11 +527,20 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
             }
             // Anti-recycle: escalating penalty for sterile long possessions.
             if n > 6 {
-                r -= 0.2 * (n - 6) as f32;
+                r -= rw().recycle * (n - 6) as f32;
             }
         }
         if w.ev_turnover_a {
-            r -= rw().turnover; // real cost, but not so harsh the required passing is avoided
+            let field_risk = (0.75 + pre_field.turnover_risk).clamp(0.75, 1.75);
+            r -= rw().turnover * field_risk;
+            if w.ev_bad_pass_turnover_a {
+                r -= rw().bad_pass_turnover * (0.75 + pre_field.safe_outlet_value);
+            }
+            if w.ev_dribble_turnover_a {
+                r -= rw().dribble_turnover * (0.75 + pre_field.dribble_pressure);
+            }
+            r -= rw().field_turnover
+                * (post_field.turnover_risk + pre_field.safe_outlet_value).clamp(0.0, 1.5);
         }
         // SHOT ON GOAL from the opponent's half after 2 passes is EARNED and
         // rewarded HANDSOMELY (not just goals) — a strong base plus a chance-quality
@@ -321,7 +557,7 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
         }
         // reward winning the ball back (pressing / interceptions / tackles)
         if w.ev_win_ball_a {
-            r += 0.3;
+            r += rw().win_ball * (0.75 + 0.25 * post_field.goalside_score);
         }
         // dribbling = possessing the ball (less pinball): forward pays, lateral a
         // little. SMALL per-tick — it fires every tick you carry, so a big value
@@ -330,21 +566,30 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
             r += rw().dribble; // forward carrying (also paid by potential shaping) — bounded, unfarmable
         }
         // (lateral dribble: no flat reward — potential shaping handles real progress)
-        if w.ev_turnover_a && (w.ev_dribble_fwd_a || w.ev_dribble_lat_a) {
-            r -= 0.4; // dispossessed while dribbling
-        }
+        // Dispossessed while carrying is handled by ev_dribble_turnover_a above,
+        // so the magnitude is tunable and visible to the search harness.
         // Ping-pong: A→B→A (one return, streak 1) is FINE. It only becomes a
         // problem from the SECOND return (A→B→A→B, streak 2), and worse each time.
         // 5x heavier than before, and heavier still if the exchange hasn't
         // advanced the ball 5+ yards upfield (pointless tapping in place).
-        if w.ev_return_pass_a && w.return_streak_a >= 2 {
+        if w.ev_return_pass_a {
             let k = w.return_streak_a;
-            let mut pen = 1.5 * 2f32.powi((k - 2) as i32); // 1.5, 3, 6, 12, ...
+            let mut pen = if k <= 1 {
+                rw().return_pass
+            } else {
+                rw().return_pass * 2f32.powi((k - 1) as i32)
+            };
             if w.ball.x - w.return_start_x < 5.0 {
-                pen *= 1.5; // no upfield progress -> heavier
+                pen += rw().return_stale; // no upfield progress -> heavier
             }
+            pen *= 1.0 + 0.50 * pre_field.safe_outlet_value + 0.50 * pre_field.return_stale;
             r -= pen.min(24.0);
         }
+
+        r += rw().field_goalside_delta
+            * FieldRewardContext::delta(post_field.goalside_score, pre_field.goalside_score);
+        r += rw().field_burst_delta
+            * FieldRewardContext::delta(post_field.burst_score, pre_field.burst_score);
 
         // Possession PHASE (covers ball-in-flight during our build-up, not just
         // strict ownership): our phase = we own OR loose ball we last touched.
@@ -370,7 +615,18 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
                 }
             }
             if nd.is_finite() {
-                sp_t[i] = w_spacing_coeff * spacing_reward(nd);
+                // LINGER GATE: brief closeness (crossing runs, converging on the ball)
+                // is fine — only SUSTAINED lingering in the same radius is penalized.
+                if nd < LINGER_RADIUS {
+                    close_ticks[i] += 1;
+                } else {
+                    close_ticks[i] = 0;
+                }
+                let mut sr = spacing_reward(nd);
+                if sr < 0.0 && close_ticks[i] <= linger_gate {
+                    sr = 0.0; // transient — not yet a lingering-bunch penalty
+                }
+                sp_t[i] = w_spacing_coeff * sr;
             }
             let is_carrier = matches!(w.owner, Some(o) if o.team == Team::A && o.idx == i);
             // ANTI-PASSIVITY: the STAND gear must not be a free way to farm the
@@ -413,18 +669,34 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
                     let ahead = ((pos.x - w.ball.x) / 12.0).clamp(0.0, 1.0);
                     let lane = w.lane_clearness(Team::A, w.ball, pos);
                     let make_run = (w.a[i].vel.x / 8.5).clamp(0.0, 1.0); // fwd speed, ~run_fast = 1.0
-                    sp_t[i] += rw().ahead * ahead * lane + rw().make_run * make_run;
+                    let burst = if spd_t[i] >= SPD_SPRINT {
+                        1.0
+                    } else if spd_t[i] >= SPD_RUN_FAST {
+                        0.75
+                    } else if spd_t[i] >= SPD_RUN_SLOW {
+                        0.35
+                    } else {
+                        -0.5
+                    };
+                    sp_t[i] += rw().ahead * ahead * lane
+                        + rw().make_run * make_run
+                        + rw().burst_gear * burst * lane * (0.5 + ahead);
                 }
             } else if their_phase {
                 // goalside of the ball: our goal is at x=0, so reward being at a
                 // LOWER x than the ball (between ball and own goal).
                 let goalside = ((w.ball.x - pos.x) / 8.0).clamp(-1.0, 1.0);
                 sp_t[i] += rw().goalside * goalside;
+                if pos.x > w.ball.x {
+                    let recovery_run = (-w.a[i].vel.x / 8.5).clamp(0.0, 1.0);
+                    sp_t[i] += rw().goalside_run * recovery_run;
+                }
             }
         }
 
         obs_buf.push(obs_t);
         mask_buf.push(mask_t);
+        speed_mask_buf.push(speed_mask_t);
         act_buf.push(mact_t);
         spd_buf.push(spd_t);
         logpa_buf.push(logpa_t);
@@ -454,6 +726,7 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
                 obs: obs_buf[s][i],
                 gstate: gstate_buf[s],
                 mask: mask_buf[s][i],
+                speed_mask: speed_mask_buf[s][i],
                 action: act_buf[s][i],
                 speed: spd_buf[s][i],
                 old_logp_a: logpa_buf[s][i],
@@ -536,7 +809,8 @@ fn noisy_scripted_actions(w: &World, team: Team, noise: f32, rng: &mut Rng) -> [
         if rng.f01() < noise {
             let mask = w.legal_mask(team, i);
             let a = sample_legal_action(&mask, rng);
-            acts[i] = a + scripted_gear(a) * NA; // keep the noisy move at a real speed
+            let gear = w.coerce_speed_gear(team, i, a, scripted_gear(a));
+            acts[i] = a + gear * NA; // keep the noisy move at a real speed
         }
     }
     acts
@@ -593,12 +867,14 @@ pub fn behavior_clone_scripted(
             for i in 1..N {
                 let obs = w.observe(Team::A, i);
                 let mask = w.legal_mask(Team::A, i);
-                let gear = act_a[i] / NA; // keep the scripted gear
                 if let Some(action) = legal_or_first(act_a[i] % NA, &mask) {
+                    let speed_mask = w.speed_mask(Team::A, i, action);
+                    let gear = w.coerce_speed_gear(Team::A, i, action, act_a[i] / NA);
                     act_a[i] = action + gear * NA;
                     data.push(BcSample {
                         obs,
                         mask,
+                        speed_mask,
                         action,
                         speed: gear,
                     });
@@ -642,10 +918,12 @@ pub fn behavior_clone_scripted(
                 policy.actor.backward(&acts, &d_logits);
                 // …and the scripted GEAR into the separate speed network.
                 let sacts = policy.speedor.forward(&s.obs);
-                let sprobs = masked_softmax(sacts.last().unwrap(), &[true; NS]);
+                let sprobs = masked_softmax(sacts.last().unwrap(), &s.speed_mask);
                 let mut d_slogits = vec![0.0f32; NS];
                 for k in 0..NS {
-                    d_slogits[k] = sprobs[k] - if k == s.speed { 1.0 } else { 0.0 };
+                    if s.speed_mask[k] {
+                        d_slogits[k] = sprobs[k] - if k == s.speed { 1.0 } else { 0.0 };
+                    }
                 }
                 policy.speedor.backward(&sacts, &d_slogits);
                 count += 1.0;
@@ -739,17 +1017,20 @@ pub fn train_iter(policy: &mut Policy, games: usize, ent_beta: f32, rng: &mut Rn
                 // ---- speed policy (SEPARATE network) ----
                 let sacts = policy.speedor.forward(&s.obs);
                 let slogits = sacts.last().unwrap();
-                let sprobs = masked_softmax(slogits, &[true; NS]);
+                let sprobs = masked_softmax(slogits, &s.speed_mask);
                 let p_s = sprobs[s.speed].max(1e-8);
                 let coeff_s = clip_coeff((p_s.ln() - s.old_logp_s).exp());
                 let mut ent_s = 0.0f32;
                 for k in 0..NS {
-                    if sprobs[k] > 1e-8 {
+                    if s.speed_mask[k] && sprobs[k] > 1e-8 {
                         ent_s -= sprobs[k] * sprobs[k].ln();
                     }
                 }
                 let mut d_slogits = vec![0.0f32; NS];
                 for k in 0..NS {
+                    if !s.speed_mask[k] {
+                        continue;
+                    }
                     let ind = if k == s.speed { 1.0 } else { 0.0 };
                     let pg = -coeff_s * (ind - sprobs[k]);
                     let eg =
@@ -839,9 +1120,7 @@ pub fn evaluate(policy: &Policy, games: usize, rng: &mut Rng) -> Stats {
         for _ in 0..STEPS {
             let mut act_a = [A_STAY; N];
             for i in 1..N {
-                let obs = w.observe(Team::A, i);
-                let mask = w.legal_mask(Team::A, i);
-                act_a[i] = policy.act_greedy(&obs, &mask);
+                act_a[i] = policy.act_greedy_world(&w, Team::A, i);
             }
             let act_b = w.scripted_actions(Team::B);
             w.step(&act_a, &act_b, rng);
@@ -957,6 +1236,35 @@ mod tests {
     }
 
     #[test]
+    fn bounded_reward_weights_stay_positive_and_finite() {
+        assert_eq!(bounded_weight(Some("0"), 1.0, 0.0, 2.0), MIN_REWARD_WEIGHT);
+        assert_eq!(
+            bounded_weight(Some("-5"), 1.0, MIN_REWARD_WEIGHT, 2.0),
+            MIN_REWARD_WEIGHT
+        );
+        assert_eq!(
+            bounded_weight(Some("0.00001"), 0.003, 0.0005, 0.012),
+            0.0005
+        );
+        assert_eq!(
+            bounded_weight(Some("3.5"), 1.0, MIN_REWARD_WEIGHT, 2.0),
+            2.0
+        );
+        assert_eq!(
+            bounded_weight(Some("NaN"), 1.0, MIN_REWARD_WEIGHT, 2.0),
+            1.0
+        );
+        assert_eq!(
+            bounded_weight(Some("inf"), 1.0, MIN_REWARD_WEIGHT, 2.0),
+            1.0
+        );
+        assert_eq!(
+            bounded_weight(None, 0.0, MIN_REWARD_WEIGHT, 2.0),
+            MIN_REWARD_WEIGHT
+        );
+    }
+
+    #[test]
     fn scripted_vs_scripted_is_seed_reproducible() {
         let mut a = Rng::new(1234);
         let mut b = Rng::new(1234);
@@ -985,5 +1293,43 @@ mod tests {
         assert!(stats.samples > 0);
         assert!(stats.loss.is_finite());
         assert!((0.0..=1.0).contains(&stats.accuracy));
+    }
+
+    #[test]
+    fn field_reward_context_changes_with_ten_player_geometry() {
+        let mut open = World::new();
+        open.owner = Some(Owner {
+            team: Team::A,
+            idx: 1,
+        });
+        open.ball = V2::new(12.0, 14.0);
+        open.a[1].pos = open.ball;
+        open.a[2].pos = V2::new(24.0, 7.0);
+        open.a[3].pos = V2::new(24.0, 21.0);
+        open.a[4].pos = V2::new(18.0, 14.0);
+        for i in 1..N {
+            open.b[i].pos = V2::new(38.0, 4.0 + i as f32 * 5.0);
+        }
+
+        let mut blocked = World::new();
+        blocked.owner = open.owner;
+        blocked.ball = open.ball;
+        blocked.a = open.a;
+        blocked.b = open.b;
+        blocked.b[1].pos = V2::new(13.0, 14.0);
+        blocked.b[2].pos = V2::new(20.0, 8.0);
+        blocked.b[3].pos = V2::new(20.0, 20.0);
+
+        let open_ctx = FieldRewardContext::from_world(&open);
+        let blocked_ctx = FieldRewardContext::from_world(&blocked);
+
+        assert!(
+            open_ctx.safe_outlet_value > blocked_ctx.safe_outlet_value,
+            "open field vector should create better outlet value"
+        );
+        assert!(
+            blocked_ctx.turnover_risk > open_ctx.turnover_risk,
+            "blocked/pressured field vector should increase turnover risk"
+        );
     }
 }
