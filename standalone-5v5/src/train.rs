@@ -11,8 +11,10 @@ const LAMBDA: f32 = 0.95;
 const CLIP: f32 = 0.2;
 const LR_ACTOR: f32 = 3e-4;
 const LR_CRITIC: f32 = 1e-3;
+const LR_BC: f32 = 8e-4;
 const EPOCHS: usize = 4;
 const MINIBATCH: usize = 1024;
+const MAX_ROLLOUT_THREADS: usize = 4;
 const W_SHAPE: f32 = 2.2; // potential shaping: strong pull to carry/pass the ball toward goal
 const W_ADVANCE: f32 = 0.02; // OFFENSE: off-ball teammates advance upfield
 const W_OPEN: f32 = 0.025; // OFFENSE: get into a CLEAR passing lane from the ball
@@ -36,23 +38,27 @@ fn w_spacing() -> f32 {
 /// team average.
 fn spacing_reward(d: f32) -> f32 {
     // The ball is a major attractor, but only the closest player should chase;
-    // 2 going in to CONTEST is fine, stacking is not. So:
+    // stacking is never OK. We want teammates to hold real cartesian distance and
+    // stretch the pitch, so the optimum sits WIDE at ~8 yds:
     //   < 1.5  : MAJOR penalty (overlap zone — sickening bunching)
-    //   1.5-3  : mild penalty that still holds (2 can contest, but discouraged)
-    //   ~5     : peak reward (optimal spacing)
-    //   > 7    : penalty (too far to be useful)
+    //   1.5-3  : strong penalty (bumped) — being within 3 yds is bad
+    //   3-4    : real penalty (bumped) — 4 yds is still too close
+    //   ~8     : peak reward (optimal spacing — genuine width/separation)
+    //   > 12   : penalty (too far to combine)
     if d < 1.0 {
-        -80.0
+        -100.0
     } else if d < 1.5 {
-        -40.0
+        -50.0
     } else if d < 3.0 {
-        -3.0
-    } else if d < 5.0 {
-        (d - 3.0) * 4.0 // 0 at 3 -> +8 peak at 5
-    } else if d < 7.0 {
-        8.0 - (d - 5.0) * 4.0 // +8 at 5 -> 0 at 7
+        -8.0 // within 3 yds: bumped penalty (was -3)
+    } else if d < 4.0 {
+        -3.0 // within 4 yds: now also penalized
+    } else if d < 8.0 {
+        (d - 4.0) * 2.0 // 0 at 4 -> +8 peak at 8
+    } else if d < 12.0 {
+        8.0 - (d - 8.0) * 2.0 // +8 at 8 -> 0 at 12
     } else {
-        -(d - 7.0) * 5.0 // 7+ : escalating penalty
+        -(d - 12.0) * 4.0 // 12+ : escalating penalty
     }
 }
 
@@ -75,6 +81,7 @@ impl Policy {
     /// Greedy (argmax over legal actions) — used at evaluation.
     pub fn act_greedy(&self, obs: &[f32], mask: &[bool; NA]) -> usize {
         let logits = self.actor.predict(obs);
+        debug_assert_eq!(logits.len(), NA);
         let probs = masked_softmax(&logits, mask);
         let mut bi = 0;
         let mut bp = -1.0;
@@ -98,8 +105,20 @@ struct Sample {
     ret: f32,
 }
 
+struct BcSample {
+    obs: [f32; OBS_DIM],
+    mask: [bool; NA],
+    action: usize,
+}
+
+pub struct CloneStats {
+    pub samples: usize,
+    pub loss: f32,
+    pub accuracy: f32,
+}
+
 /// Collect one game of Team-A experience (5 players) vs the scripted baseline.
-fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
+fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
     let mut w = World::new();
     let w_spacing_coeff = w_spacing();
     if rng.f01() < 0.5 {
@@ -141,7 +160,7 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
             logp_t[i] = p.ln();
         }
 
-        let act_b = w.scripted_actions(Team::B);
+        let act_b = noisy_scripted_actions(&w, Team::B, opponent_noise, rng);
         w.step(&act_a, &act_b, rng);
 
         // team reward (Team A perspective)
@@ -296,6 +315,185 @@ fn rollout(policy: &Policy, rng: &mut Rng) -> Vec<Sample> {
     samples
 }
 
+fn collect_rollouts(policy: &Policy, games: usize, rng: &mut Rng) -> Vec<Sample> {
+    let jobs: Vec<(u64, f32)> = (0..games)
+        .map(|_| (rng.next_u64(), opponent_noise(rng)))
+        .collect();
+    let workers = rollout_worker_count(games);
+    if workers <= 1 {
+        return run_rollout_jobs(policy, &jobs);
+    }
+
+    let chunk = jobs.len().div_ceil(workers);
+    let mut handles = Vec::new();
+    for job_chunk in jobs.chunks(chunk) {
+        let local_policy = policy.clone();
+        let local_jobs = job_chunk.to_vec();
+        handles.push(std::thread::spawn(move || {
+            run_rollout_jobs(&local_policy, &local_jobs)
+        }));
+    }
+
+    let mut data = Vec::new();
+    for handle in handles {
+        data.extend(handle.join().expect("rollout worker panicked"));
+    }
+    data
+}
+
+fn run_rollout_jobs(policy: &Policy, jobs: &[(u64, f32)]) -> Vec<Sample> {
+    let mut data = Vec::new();
+    for &(seed, noise) in jobs {
+        let mut local_rng = Rng::new(seed);
+        data.extend(rollout(policy, &mut local_rng, noise));
+    }
+    data
+}
+
+pub fn rollout_worker_count(games: usize) -> usize {
+    if games <= 1 {
+        return 1;
+    }
+    let available = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let env_limit = std::env::var("FIVEASIDE_ROLLOUT_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(MAX_ROLLOUT_THREADS);
+    games.min(available).min(env_limit).max(1)
+}
+
+fn opponent_noise(rng: &mut Rng) -> f32 {
+    let r = rng.f01();
+    if r < 0.15 {
+        0.18
+    } else if r < 0.35 {
+        0.08
+    } else {
+        0.0
+    }
+}
+
+fn noisy_scripted_actions(w: &World, team: Team, noise: f32, rng: &mut Rng) -> [usize; N] {
+    let mut acts = w.scripted_actions(team);
+    if noise <= 0.0 {
+        return acts;
+    }
+    for i in 1..N {
+        if rng.f01() < noise {
+            let mask = w.legal_mask(team, i);
+            acts[i] = sample_legal_action(&mask, rng);
+        }
+    }
+    acts
+}
+
+fn sample_legal_action(mask: &[bool; NA], rng: &mut Rng) -> usize {
+    let n = mask.iter().filter(|&&ok| ok).count();
+    if n == 0 {
+        return A_STAY;
+    }
+    let pick = (rng.next_u64() % n as u64) as usize;
+    let mut seen = 0usize;
+    for (idx, &ok) in mask.iter().enumerate() {
+        if ok {
+            if seen == pick {
+                return idx;
+            }
+            seen += 1;
+        }
+    }
+    A_STAY
+}
+
+fn legal_or_first(action: usize, mask: &[bool; NA]) -> Option<usize> {
+    if action < NA && mask[action] {
+        Some(action)
+    } else {
+        mask.iter().position(|&ok| ok)
+    }
+}
+
+pub fn behavior_clone_scripted(
+    policy: &mut Policy,
+    games: usize,
+    epochs: usize,
+    rng: &mut Rng,
+) -> CloneStats {
+    if games == 0 || epochs == 0 {
+        return CloneStats {
+            samples: 0,
+            loss: 0.0,
+            accuracy: 0.0,
+        };
+    }
+
+    let mut data = Vec::new();
+    for _ in 0..games {
+        let mut w = World::new();
+        if rng.f01() < 0.5 {
+            w.kickoff(Team::B);
+        }
+        for _ in 0..STEPS {
+            let mut act_a = w.scripted_actions(Team::A);
+            for i in 1..N {
+                let obs = w.observe(Team::A, i);
+                let mask = w.legal_mask(Team::A, i);
+                if let Some(action) = legal_or_first(act_a[i], &mask) {
+                    act_a[i] = action;
+                    data.push(BcSample { obs, mask, action });
+                }
+            }
+            let act_b = w.scripted_actions(Team::B);
+            w.step(&act_a, &act_b, rng);
+        }
+    }
+
+    let mut idx: Vec<usize> = (0..data.len()).collect();
+    let mut loss_accum = 0.0f32;
+    let mut correct = 0.0f32;
+    let mut count = 0.0f32;
+    for _ in 0..epochs {
+        shuffle(&mut idx, rng);
+        for chunk in idx.chunks(MINIBATCH) {
+            for &si in chunk {
+                let s = &data[si];
+                let acts = policy.actor.forward(&s.obs);
+                let logits = acts.last().unwrap();
+                let probs = masked_softmax(logits, &s.mask);
+                let p = probs[s.action].max(1e-8);
+                loss_accum += -p.ln();
+                if probs
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| s.mask[*i])
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                    .is_some_and(|(i, _)| i == s.action)
+                {
+                    correct += 1.0;
+                }
+                let mut d_logits = vec![0.0f32; NA];
+                for j in 0..NA {
+                    if s.mask[j] {
+                        d_logits[j] = probs[j] - if j == s.action { 1.0 } else { 0.0 };
+                    }
+                }
+                policy.actor.backward(&acts, &d_logits);
+                count += 1.0;
+            }
+            policy.actor.step(LR_BC);
+        }
+    }
+
+    CloneStats {
+        samples: data.len(),
+        loss: loss_accum / count.max(1.0),
+        accuracy: correct / count.max(1.0),
+    }
+}
+
 pub struct IterStats {
     pub avg_reward: f32,
     pub entropy: f32,
@@ -304,12 +502,8 @@ pub struct IterStats {
 
 /// One PPO iteration: collect `games` rollouts, then EPOCHS of minibatch updates.
 pub fn train_iter(policy: &mut Policy, games: usize, ent_beta: f32, rng: &mut Rng) -> IterStats {
-    let mut data: Vec<Sample> = Vec::new();
+    let mut data = collect_rollouts(policy, games, rng);
     let mut total_r = 0.0f32;
-    for _ in 0..games {
-        let s = rollout(policy, rng);
-        data.extend(s);
-    }
     // returns/advs summed across all player-steps; report mean reward-to-go proxy
     for s in &data {
         total_r += s.ret;
@@ -589,5 +783,15 @@ mod tests {
         assert!((0.0..=1.0).contains(&stats.possession));
         assert!(stats.pass_completion().is_finite());
         assert!(stats.conversion().is_finite());
+    }
+
+    #[test]
+    fn behavior_clone_warm_start_collects_finite_teacher_signal() {
+        let mut rng = Rng::new(2026);
+        let mut policy = Policy::new(&mut rng);
+        let stats = behavior_clone_scripted(&mut policy, 1, 1, &mut rng);
+        assert!(stats.samples > 0);
+        assert!(stats.loss.is_finite());
+        assert!((0.0..=1.0).contains(&stats.accuracy));
     }
 }

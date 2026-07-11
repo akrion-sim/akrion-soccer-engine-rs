@@ -67,6 +67,10 @@ impl Mlp {
         *self.sizes.last().unwrap()
     }
 
+    pub fn in_dim(&self) -> usize {
+        self.sizes[0]
+    }
+
     /// Forward pass, returning per-layer post-activations (acts[0] == input).
     pub fn forward(&self, x: &[f32]) -> Vec<Vec<f32>> {
         let n = self.w.len();
