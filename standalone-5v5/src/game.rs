@@ -1263,7 +1263,7 @@ fn rotate(v: V2, ang: f32) -> V2 {
 /// The gear the scripted baseline uses for a given action (kept near the old
 /// fixed speeds so the benchmark stays comparable): press/support runs fast,
 /// spread/mark at a run, dribble at a skip, set-pieces standing.
-fn scripted_gear(a: usize) -> usize {
+pub fn scripted_gear(a: usize) -> usize {
     match a {
         A_CHASE | A_SUPPORT => SPD_RUN_FAST,
         A_SPREAD | A_MARK => SPD_RUN_MED,
