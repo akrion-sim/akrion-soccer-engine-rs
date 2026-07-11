@@ -24310,7 +24310,8 @@ pub(crate) fn forward_pass_reward_scale() -> f64 {
 /// (`PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS` / `..THREE_NET_FORWARD..`). These fire only for
 /// strings of forward passes, so amplifying them rewards sustained progression (build-up) rather
 /// than single hopeful forward balls — a quality signal complementary to deferred credit. Env
-/// `DD_SOCCER_PASS_CHAIN_REWARD_SCALE`, clamped [0,20], default 1.0 => byte-identical.
+/// `DD_SOCCER_PASS_CHAIN_REWARD_SCALE`, clamped [1e-4,20] (reward_weight_env floors the min at the
+/// 1e-4 non-zero weight floor so the channel never fully dies), default 1.0 => byte-identical.
 pub(crate) fn pass_chain_reward_scale() -> f64 {
     if dynamic_reward_weights_enabled() {
         return reward_weight_env("DD_SOCCER_PASS_CHAIN_REWARD_SCALE", 1.0, 0.0, 20.0);
