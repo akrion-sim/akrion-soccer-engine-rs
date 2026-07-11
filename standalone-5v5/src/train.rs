@@ -141,7 +141,8 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
     // per-player trajectory buffers
     let mut obs_buf: Vec<[[f32; OBS_DIM]; N]> = Vec::with_capacity(STEPS);
     let mut mask_buf: Vec<[[bool; NA]; N]> = Vec::with_capacity(STEPS);
-    let mut act_buf: Vec<[usize; N]> = Vec::with_capacity(STEPS);
+    let mut act_buf: Vec<[usize; N]> = Vec::with_capacity(STEPS); // macro action (0..NA)
+    let mut spd_buf: Vec<[usize; N]> = Vec::with_capacity(STEPS); // speed gear (0..NS)
     let mut logp_buf: Vec<[f32; N]> = Vec::with_capacity(STEPS);
     let mut val_buf: Vec<f32> = Vec::with_capacity(STEPS); // CENTRALIZED value (one per tick)
     let mut gstate_buf: Vec<[f32; GLOBAL_DIM]> = Vec::with_capacity(STEPS);
