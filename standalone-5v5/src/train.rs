@@ -615,21 +615,7 @@ pub fn train_iter(policy: &mut Policy, games: usize, ent_beta: f32, rng: &mut Rn
         for chunk in idx.chunks(MINIBATCH) {
             for &si in chunk {
                 let s = &data[si];
-                // ---- actor: action head (masked) + speed head (unmasked) ----
-                let acts = policy.actor.forward(&s.obs);
-                let logits = acts.last().unwrap();
-                let aprobs = masked_softmax(&logits[0..NA], &s.mask);
-                let sprobs = masked_softmax(&logits[NA..NA + NS], &[true; NS]);
-                let p_a = aprobs[s.action].max(1e-8);
-                let p_s = sprobs[s.speed].max(1e-8);
                 let a = s.adv;
-                // DECOUPLED PPO: each head gets its OWN clipped importance ratio,
-                // sharing the same advantage. A single JOINT ratio let the (7-way,
-                // high-variance) speed head push the ratio into the clip region and
-                // STARVE the action head of gradient — which prevented the attack
-                // from ever being learned. Independent ratios fix that.
-                let ratio_a = (p_a.ln() - s.old_logp_a).exp();
-                let ratio_s = (p_s.ln() - s.old_logp_s).exp();
                 let clip_coeff = |ratio: f32| -> f32 {
                     if a >= 0.0 {
                         if ratio <= 1.0 + CLIP {
@@ -643,23 +629,20 @@ pub fn train_iter(policy: &mut Policy, games: usize, ent_beta: f32, rng: &mut Rn
                         0.0
                     }
                 };
-                let coeff_a = clip_coeff(ratio_a);
-                let coeff_s = clip_coeff(ratio_s);
-                // entropy of each head
+
+                // ---- action policy (its OWN network — identical to v3) ----
+                let acts = policy.actor.forward(&s.obs);
+                let logits = acts.last().unwrap();
+                let aprobs = masked_softmax(logits, &s.mask);
+                let p_a = aprobs[s.action].max(1e-8);
+                let coeff_a = clip_coeff((p_a.ln() - s.old_logp_a).exp());
                 let mut ent = 0.0f32;
                 for i in 0..NA {
                     if s.mask[i] && aprobs[i] > 1e-8 {
                         ent -= aprobs[i] * aprobs[i].ln();
                     }
                 }
-                let mut ent_s = 0.0f32;
-                for k in 0..NS {
-                    if sprobs[k] > 1e-8 {
-                        ent_s -= sprobs[k] * sprobs[k].ln();
-                    }
-                }
-                // dLoss/dlogit = -coeff*(1_{chosen}-p) + beta*p*(log p + H), per head.
-                let mut d_logits = vec![0.0f32; NA + NS];
+                let mut d_logits = vec![0.0f32; NA];
                 for j in 0..NA {
                     if !s.mask[j] {
                         continue;
@@ -669,13 +652,28 @@ pub fn train_iter(policy: &mut Policy, games: usize, ent_beta: f32, rng: &mut Rn
                     let eg = ent_beta * aprobs[j] * (aprobs[j].max(1e-8).ln() + ent);
                     d_logits[j] = pg + eg;
                 }
+                policy.actor.backward(&acts, &d_logits);
+
+                // ---- speed policy (SEPARATE network) ----
+                let sacts = policy.speedor.forward(&s.obs);
+                let slogits = sacts.last().unwrap();
+                let sprobs = masked_softmax(slogits, &[true; NS]);
+                let p_s = sprobs[s.speed].max(1e-8);
+                let coeff_s = clip_coeff((p_s.ln() - s.old_logp_s).exp());
+                let mut ent_s = 0.0f32;
+                for k in 0..NS {
+                    if sprobs[k] > 1e-8 {
+                        ent_s -= sprobs[k] * sprobs[k].ln();
+                    }
+                }
+                let mut d_slogits = vec![0.0f32; NS];
                 for k in 0..NS {
                     let ind = if k == s.speed { 1.0 } else { 0.0 };
                     let pg = -coeff_s * (ind - sprobs[k]);
                     let eg = ent_beta * sprobs[k] * (sprobs[k].max(1e-8).ln() + ent_s);
-                    d_logits[NA + k] = pg + eg;
+                    d_slogits[k] = pg + eg;
                 }
-                policy.actor.backward(&acts, &d_logits);
+                policy.speedor.backward(&sacts, &d_slogits);
 
                 // ---- centralized critic (MSE to GAE return), on GLOBAL state ----
                 let cacts = policy.critic.forward(&s.gstate);
