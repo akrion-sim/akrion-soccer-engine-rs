@@ -1260,6 +1260,18 @@ fn rotate(v: V2, ang: f32) -> V2 {
     V2::new(v.x * c - v.y * s, v.x * s + v.y * c)
 }
 
+/// The gear the scripted baseline uses for a given action (kept near the old
+/// fixed speeds so the benchmark stays comparable): press/support runs fast,
+/// spread/mark at a run, dribble at a skip, set-pieces standing.
+fn scripted_gear(a: usize) -> usize {
+    match a {
+        A_CHASE | A_SUPPORT => SPD_RUN_FAST,
+        A_SPREAD | A_MARK => SPD_RUN_MED,
+        A_DRIB_FWD | A_DRIB_LEFT | A_DRIB_RIGHT => SPD_SKIP,
+        _ => SPD_STAND, // shoot/pass/clear/hold/stay: no self-movement
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Scripted "analytic-lite" baseline. Coherent soccer with simple heuristics —
 // this is BOTH Team B's controller and the benchmark the learner must beat.
