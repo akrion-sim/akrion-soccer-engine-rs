@@ -20928,6 +20928,62 @@ pub(crate) enum SoccerRewardEventKind {
     MatchResult,
 }
 
+/// Applies a sign-safe utility calibration to a factual reward event. The event
+/// amount remains the engine's measured football outcome; this layer only tunes
+/// how strongly the learner values that named outcome. Configure comma-separated
+/// `Kind=scale` pairs through `DD_SOCCER_REWARD_KIND_SCALES` (for example,
+/// `CompletedForwardPass=0.8,BadPassChainPenalty=1.3`). Scales are finite and
+/// clamped to [0, 4], so a learned/tuned calibration cannot flip a reward into a
+/// penalty or manufacture unbounded return. Unknown names are ignored and gate
+/// absence is exactly identity.
+pub(crate) fn calibrated_reward_event_amount(
+    kind: SoccerRewardEventKind,
+    amount: f64,
+) -> f64 {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+
+    static SCALES: OnceLock<HashMap<String, f64>> = OnceLock::new();
+    let scales = SCALES.get_or_init(|| {
+        parse_reward_kind_scales(
+            std::env::var("DD_SOCCER_REWARD_KIND_SCALES")
+                .ok()
+                .as_deref()
+                .unwrap_or(""),
+        )
+    });
+    let key = format!("{kind:?}");
+    amount * scales.get(&key).copied().unwrap_or(1.0)
+}
+
+fn parse_reward_kind_scales(raw: &str) -> std::collections::HashMap<String, f64> {
+    raw.split(',')
+        .filter_map(|entry| {
+            let (name, value) = entry.split_once('=')?;
+            let scale = value.trim().parse::<f64>().ok()?;
+            scale
+                .is_finite()
+                .then(|| (name.trim().to_string(), scale.clamp(0.0, 4.0)))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod reward_kind_calibration_tests {
+    use super::*;
+
+    #[test]
+    fn reward_kind_scales_are_sign_safe_bounded_and_ignore_invalid_entries() {
+        let scales = parse_reward_kind_scales(
+            "Goal=9,BadPassChainPenalty=1.25,CompletedForwardPass=-2,bad,KeeperSave=NaN",
+        );
+        assert_eq!(scales.get("Goal"), Some(&4.0));
+        assert_eq!(scales.get("BadPassChainPenalty"), Some(&1.25));
+        assert_eq!(scales.get("CompletedForwardPass"), Some(&0.0));
+        assert!(!scales.contains_key("KeeperSave"));
+    }
+}
+
 impl SoccerRewardEventKind {
     fn triggers_learning(self) -> bool {
         matches!(
@@ -22586,6 +22642,18 @@ pub(crate) fn dd_soccer_enable_neural_self_bootstrap() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_NEURAL_SELF_BOOTSTRAP"))
+}
+
+/// Removes the tabular Q from the neural critic target entirely. This is the
+/// hermetic critic path: successor targets come only from the persisted neural
+/// prediction network (or zero at cold start/terminal), so tabular aliases can
+/// neither cap nor leak into the learned value. It implies neural self-bootstrap
+/// with weight 1.0; keep it separately gated because this is less stable than the
+/// blended migration path and must earn promotion through held-out evaluation.
+pub(crate) fn dd_soccer_enable_hermetic_neural_critic() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_HERMETIC_NEURAL_CRITIC"))
 }
 
 /// Blend weight for the neural self-bootstrap: `max_next = w·V_net(s') + (1-w)·tabular`. Default 0.7

@@ -6,6 +6,21 @@ implemented yet.
 
 ## Implemented Now
 
+- `DD_SOCCER_ENABLE_HERMETIC_NEURAL_CRITIC` removes the aliased tabular Q from
+  neural critic targets. It implies a full-weight neural successor bootstrap and
+  uses zero only for cold start or terminal states; the tabular policy remains
+  available for separately gated behavior/fallback paths, but cannot leak into
+  this critic target.
+- Reward events now cross one typed calibration seam before entering learning.
+  `DD_SOCCER_REWARD_KIND_SCALES` accepts bounded, sign-safe per-kind utility
+  multipliers such as `CompletedForwardPass=0.8,BadPassChainPenalty=1.3`.
+  Event facts and attribution stay unchanged; only learner utility changes.
+  This is the deployment seam for an outer held-out optimizer to publish tuned
+  weights. Do not update these weights from the same trajectories they score:
+  tune on disjoint match batches, freeze for a training window, and accept a
+  calibration only through the existing held-out WDL/Wilson/goal-difference
+  promotion gate.
+
 - The runtime decision stack is hybrid: MDP/POMDP observations and analytic beliefs
   generate legal options, neural policy/value and tabular/retrieval priors score them,
   bounded MCTS/PUCT may rerank a capped candidate set, and per-player MPC executes or
