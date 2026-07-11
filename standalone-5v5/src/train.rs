@@ -83,13 +83,17 @@ const LR_SPEED: f32 = LR_ACTOR * 0.3;
 const SPEED_ENT_SCALE: f32 = 0.15;
 const ENT_BETA0: f32 = 0.02;
 
-// Teammate-spacing reward weight. Overridable via SPACING_W env for tuning.
-// Default halved from the 10 Hz value (per-tick reward now fires twice as often).
+// Teammate-spacing reward weight. Overridable via SPACING_W so a promoted run's
+// learned/tuned value can warm-start the next run. The historical 0.003 is the
+// sane cold-start baseline; strictly-positive clamps prevent disabling or
+// exploding the reward through a malformed artifact/environment value.
 fn w_spacing() -> f32 {
     std::env::var("SPACING_W")
         .ok()
         .and_then(|s| s.parse().ok())
+        .filter(|value: &f32| value.is_finite())
         .unwrap_or(0.003)
+        .clamp(0.0001, 4.0)
 }
 
 /// PER-PLAYER spacing reward as a function of a player's nearest-teammate
