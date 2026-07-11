@@ -938,6 +938,11 @@ impl World {
             A_SHOOT => {
                 if team == Team::A {
                     self.ev_shot_attempt_a = true;
+                    // Rapid-fire repeat? (a shot while a prior shot's cooldown is still
+                    // active = shoot-spam farming, not a fresh chance). The genuine
+                    // first shot of a buildup is NOT rapid and earns full reward.
+                    self.shot_was_rapid_a = self.shoot_cooldown_a > 0;
+                    self.shoot_cooldown_a = 45; // ~2.25 s at 20 Hz before a shot is "fresh" again
                     self.pass_streak_a = 0; // buildup consumed by the shot
                     self.a_shot_flag = true; // this free ball is a valid (2-pass) shot
                     self.reset_a_pass_memory();
