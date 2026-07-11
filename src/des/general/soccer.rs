@@ -4197,7 +4197,7 @@ pub(crate) fn offball_support_reward_scale() -> f64 {
     // dense off-ball shard DOWN, not only up — the 5-a-side climb showed dense
     // shaping that out-masses the goal is a farm-at-parity attractor.
     if dynamic_reward_weights_enabled() {
-        return reward_weight_env("SOCCER_OFFBALL_SUPPORT_REWARD_SCALE", 1.0, 0.0, 10.0);
+        return reward_weight_env("SOCCER_OFFBALL_SUPPORT_REWARD_SCALE", 1.0, 1e-4, 10.0);
     }
     use std::sync::OnceLock;
     static V: OnceLock<f64> = OnceLock::new();
@@ -4217,7 +4217,7 @@ pub(crate) fn carry_reward_scale() -> f64 {
     // Dynamic-reward mode: bidirectional (min 0) so a search can reduce this dense
     // carry shard relative to the sparse goal.
     if dynamic_reward_weights_enabled() {
-        return reward_weight_env("DD_SOCCER_CARRY_REWARD_SCALE", 1.0, 0.0, 10.0);
+        return reward_weight_env("DD_SOCCER_CARRY_REWARD_SCALE", 1.0, 1e-4, 10.0);
     }
     use std::sync::OnceLock;
     static V: OnceLock<f64> = OnceLock::new();
@@ -4237,7 +4237,7 @@ pub(crate) fn ball_recovery_reward_scale() -> f64 {
     // Dynamic-reward mode: bidirectional (min 0) so a search can reduce this dense
     // recovery shard relative to the sparse goal.
     if dynamic_reward_weights_enabled() {
-        return reward_weight_env("DD_SOCCER_RECOVERY_REWARD_SCALE", 1.0, 0.0, 10.0);
+        return reward_weight_env("DD_SOCCER_RECOVERY_REWARD_SCALE", 1.0, 1e-4, 10.0);
     }
     use std::sync::OnceLock;
     static V: OnceLock<f64> = OnceLock::new();
@@ -24191,11 +24191,11 @@ pub(crate) fn forward_pass_turnover_penalty_scale() -> f64 {
 /// `DD_SOCCER_SHOT_SHAPING_REWARD_SCALE` (clamped 0-1), default 1.0 ⇒ unchanged.
 pub(crate) fn shot_shaping_reward_scale() -> f64 {
     if dynamic_reward_weights_enabled() {
-        return reward_weight_env("DD_SOCCER_SHOT_SHAPING_REWARD_SCALE", 1.0, 0.0, 4.0);
+        return reward_weight_env("DD_SOCCER_SHOT_SHAPING_REWARD_SCALE", 1.0, 1e-4, 4.0);
     }
     use std::sync::OnceLock;
     static V: OnceLock<f64> = OnceLock::new();
-    *V.get_or_init(|| reward_weight_env("DD_SOCCER_SHOT_SHAPING_REWARD_SCALE", 1.0, 0.0, 4.0))
+    *V.get_or_init(|| reward_weight_env("DD_SOCCER_SHOT_SHAPING_REWARD_SCALE", 1.0, 1e-4, 4.0))
 }
 
 pub(crate) fn shot_commitment_reward_scale() -> f64 {
@@ -24241,18 +24241,18 @@ pub(crate) fn shot_commitment_reward_scale() -> f64 {
 /// byte-identical.
 pub(crate) fn dribble_beat_reward_scale() -> f64 {
     if dynamic_reward_weights_enabled() {
-        return reward_weight_env("DD_SOCCER_DRIBBLE_BEAT_REWARD_SCALE", 1.0, 0.0, 8.0);
+        return reward_weight_env("DD_SOCCER_DRIBBLE_BEAT_REWARD_SCALE", 1.0, 1e-4, 8.0);
     }
     use std::sync::OnceLock;
     static V: OnceLock<f64> = OnceLock::new();
-    *V.get_or_init(|| reward_weight_env("DD_SOCCER_DRIBBLE_BEAT_REWARD_SCALE", 1.0, 0.0, 8.0))
+    *V.get_or_init(|| reward_weight_env("DD_SOCCER_DRIBBLE_BEAT_REWARD_SCALE", 1.0, 1e-4, 8.0))
 }
 
 pub(crate) fn learned_epv_reward_scale() -> f64 {
     // Dynamic-reward mode: the learned-EPV (expected-possession-value) shaping is a
     // reward weight too — let a search tune it alongside the rest of the vector.
     if dynamic_reward_weights_enabled() {
-        return reward_weight_env("DD_SOCCER_LEARNED_EPV_REWARD_SCALE", 20.0, 0.0, 200.0);
+        return reward_weight_env("DD_SOCCER_LEARNED_EPV_REWARD_SCALE", 20.0, 1e-4, 200.0);
     }
     use std::sync::OnceLock;
     static V: OnceLock<f64> = OnceLock::new();
