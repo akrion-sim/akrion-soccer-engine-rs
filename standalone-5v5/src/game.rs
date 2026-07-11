@@ -1183,10 +1183,11 @@ impl World {
             _ => me, // STAY
         };
         let dir = target.sub(me);
-        let v = if dir.len() < 0.3 {
+        // STAY means stand still; otherwise move toward the target at the chosen gear.
+        let v = if a == A_STAY || dir.len() < 0.3 || spd == SPD_STAND {
             V2::default()
         } else {
-            dir.unit().scale(PLAYER_SPEED)
+            dir.unit().scale(speed_val(spd, false))
         };
         self.set_vel(team, idx, v);
     }
