@@ -621,16 +621,16 @@ impl World {
             }
             // 2-PASS RULE (Team A): no shooting until 2 completed passes this
             // possession — forces build-up play, not solo dribble-and-shoot.
-            // FINAL-THIRD RULE (Team A): may only shoot from the attacking third.
+            // OPPONENT-HALF RULE (Team A): may shoot anywhere in the opponent's half.
             if team == Team::A {
                 let x = players(team, self)[idx].pos.x;
-                if self.pass_streak_a < 2 || x < FINAL_THIRD_X {
+                if self.pass_streak_a < 2 || x < SHOOT_X {
                     m[A_SHOOT] = false;
                 }
             } else {
                 // Symmetric shooting gate for the scripted/noisy opponent.
                 let x = players(team, self)[idx].pos.x;
-                if self.b_pass_streak < 2 || x > FIELD_L - FINAL_THIRD_X {
+                if self.b_pass_streak < 2 || x > FIELD_L - SHOOT_X {
                     m[A_SHOOT] = false;
                 }
             }
