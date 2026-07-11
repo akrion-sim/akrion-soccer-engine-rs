@@ -29,14 +29,15 @@ const MAX_ROLLOUT_THREADS: usize = 4;
 const MIN_REWARD_WEIGHT: f32 = 0.0001;
 const LINGER_RADIUS: f32 = 4.0; // "same radius": teammates within this many yards
 /// Consecutive ticks two teammates must LINGER within LINGER_RADIUS before the
-/// spacing penalty applies. Brief crossings/convergence pay nothing (real soccer:
-/// players run right past each other). Env `SPACING_LINGER_SECS` (default 1.5 s).
+/// mild 3-4yd spacing penalty applies. Sub-3yd bunching is always penalized
+/// immediately; brief crossings only get grace in the 3-4yd gray zone.
+/// Env `SPACING_LINGER_SECS` (default 0.4 s).
 fn linger_ticks() -> u32 {
     let secs = std::env::var("SPACING_LINGER_SECS")
         .ok()
         .and_then(|s| s.parse::<f32>().ok())
         .filter(|v| v.is_finite() && *v >= 0.0)
-        .unwrap_or(1.5);
+        .unwrap_or(0.4);
     ((secs / DT).round() as u32).max(1)
 }
 // ─── Tunable reward weights (env-overridable, read ONCE per process) ─────────
@@ -133,9 +134,9 @@ const SPEED_ENT_SCALE: f32 = 0.15;
 const ENT_BETA0: f32 = 0.02;
 
 // Teammate-spacing reward weight. Overridable via SPACING_W env for tuning.
-// Default halved from the 10 Hz value (per-tick reward now fires twice as often).
+// Strong enough that sub-3yd bunching competes with ordinary possession rewards.
 fn w_spacing() -> f32 {
-    wenv("SPACING_W", 0.003, 0.0005, 0.012)
+    wenv("SPACING_W", 0.008, 0.001, 0.04)
 }
 
 /// PER-PLAYER spacing reward as a function of a player's nearest-teammate
@@ -613,15 +614,15 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
                 }
             }
             if nd.is_finite() {
-                // LINGER GATE: brief closeness (crossing runs, converging on the ball)
-                // is fine — only SUSTAINED lingering in the same radius is penalized.
+                // LINGER GATE: <3yd bunching is always bad. Brief closeness only
+                // gets grace in the 3-4yd gray zone for crossing runs.
                 if nd < LINGER_RADIUS {
                     close_ticks[i] += 1;
                 } else {
                     close_ticks[i] = 0;
                 }
                 let mut sr = spacing_reward(nd);
-                if sr < 0.0 && close_ticks[i] <= linger_gate {
+                if sr < 0.0 && nd >= 3.0 && close_ticks[i] <= linger_gate {
                     sr = 0.0; // transient — not yet a lingering-bunch penalty
                 }
                 sp_t[i] = w_spacing_coeff * sr;
