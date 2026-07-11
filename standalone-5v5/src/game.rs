@@ -1453,10 +1453,11 @@ mod tests {
         assert!(!on_ball[A_CHASE]);
 
         w.pass_streak_a = 2;
+        w.a[1].pos = V2::new(FINAL_THIRD_X + 2.0, 14.0); // and be in the final third
         let after_buildup = w.legal_mask(Team::A, 1);
         assert!(
             after_buildup[A_SHOOT],
-            "two completed passes unlock shooting"
+            "two completed passes + final third unlock shooting"
         );
 
         let off_ball = w.legal_mask(Team::A, 2);
