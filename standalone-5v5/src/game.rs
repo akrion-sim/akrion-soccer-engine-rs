@@ -9,7 +9,8 @@ use crate::rng::Rng;
 pub const FIELD_L: f32 = 42.0;
 pub const FIELD_W: f32 = 28.0;
 pub const GOAL_HALF: f32 = 3.5; // half goal-mouth width in y (~7m net)
-pub const FINAL_THIRD_X: f32 = FIELD_L * 2.0 / 3.0; // A may only shoot past this x
+pub const FINAL_THIRD_X: f32 = FIELD_L * 2.0 / 3.0; // attacking-third boundary (kept for reference)
+pub const SHOOT_X: f32 = FIELD_L / 2.0; // A may shoot once in the OPPONENT'S HALF (not just the final third)
 pub const N: usize = 5; // players per team (index 0 == goalkeeper)
 pub const GK: usize = 0; // goalkeeper index; controlled by a fixed rule, not the policy
 pub const DT: f32 = 0.05; // seconds per decision tick -> 20 Hz sim (real-time 20 fps)
