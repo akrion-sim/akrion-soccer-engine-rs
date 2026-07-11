@@ -566,15 +566,18 @@ pub fn train_iter(policy: &mut Policy, games: usize, ent_beta: f32, rng: &mut Rn
         for chunk in idx.chunks(MINIBATCH) {
             for &si in chunk {
                 let s = &data[si];
-                // ---- actor ----
+                // ---- actor: action head (masked) + speed head (unmasked) ----
                 let acts = policy.actor.forward(&s.obs);
                 let logits = acts.last().unwrap();
-                let probs = masked_softmax(logits, &s.mask);
-                let p_a = probs[s.action].max(1e-8);
-                let new_logp = p_a.ln();
+                let aprobs = masked_softmax(&logits[0..NA], &s.mask);
+                let sprobs = masked_softmax(&logits[NA..NA + NS], &[true; NS]);
+                let p_a = aprobs[s.action].max(1e-8);
+                let p_s = sprobs[s.speed].max(1e-8);
+                let new_logp = p_a.ln() + p_s.ln(); // JOINT log-prob of (action, speed)
                 let ratio = (new_logp - s.old_logp).exp();
                 let a = s.adv;
-                // PPO clip: gradient coefficient on log-prob
+                // PPO clip: one gradient coefficient shared by both heads (single
+                // joint ratio + advantage).
                 let coeff = if a >= 0.0 {
                     if ratio <= 1.0 + CLIP {
                         a * ratio
@@ -586,24 +589,35 @@ pub fn train_iter(policy: &mut Policy, games: usize, ent_beta: f32, rng: &mut Rn
                 } else {
                     0.0
                 };
-                // entropy of the (masked) distribution
+                // entropy of each head
                 let mut ent = 0.0f32;
                 for i in 0..NA {
-                    if s.mask[i] && probs[i] > 1e-8 {
-                        ent -= probs[i] * probs[i].ln();
+                    if s.mask[i] && aprobs[i] > 1e-8 {
+                        ent -= aprobs[i] * aprobs[i].ln();
                     }
                 }
-                // dLoss/dlogit_j = -coeff*(1_{j=a}-p_j) + beta*p_j*(log p_j + H)
-                let mut d_logits = vec![0.0f32; NA];
+                let mut ent_s = 0.0f32;
+                for k in 0..NS {
+                    if sprobs[k] > 1e-8 {
+                        ent_s -= sprobs[k] * sprobs[k].ln();
+                    }
+                }
+                // dLoss/dlogit = -coeff*(1_{chosen}-p) + beta*p*(log p + H), per head.
+                let mut d_logits = vec![0.0f32; NA + NS];
                 for j in 0..NA {
                     if !s.mask[j] {
-                        d_logits[j] = 0.0;
                         continue;
                     }
                     let ind = if j == s.action { 1.0 } else { 0.0 };
-                    let pg = -coeff * (ind - probs[j]);
-                    let eg = ent_beta * probs[j] * (probs[j].max(1e-8).ln() + ent);
+                    let pg = -coeff * (ind - aprobs[j]);
+                    let eg = ent_beta * aprobs[j] * (aprobs[j].max(1e-8).ln() + ent);
                     d_logits[j] = pg + eg;
+                }
+                for k in 0..NS {
+                    let ind = if k == s.speed { 1.0 } else { 0.0 };
+                    let pg = -coeff * (ind - sprobs[k]);
+                    let eg = ent_beta * sprobs[k] * (sprobs[k].max(1e-8).ln() + ent_s);
+                    d_logits[NA + k] = pg + eg;
                 }
                 policy.actor.backward(&acts, &d_logits);
 
