@@ -271,12 +271,12 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
         let phi = w.potential_a();
         let shaping = GAMMA * phi - phi_prev;
         phi_prev = phi;
-        let mut r = W_SHAPE * shaping;
+        let mut r = rw().shape * shaping;
         if w.ev_goal_a {
-            r += 12.0; // GOALS are the prize — rewarded well above everything else
+            r += rw().goal; // GOALS are the prize
         }
         if w.ev_goal_b {
-            r -= 8.0;
+            r -= rw().concede;
         }
         // Only a tiny nudge for a completed pass (prefer it to a loose turnover);
         // forward progress is rewarded by the potential shaping above, and goals
@@ -286,13 +286,13 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
             // Small flat credit (prefer a completed pass to a loose turnover) PLUS a
             // forward-PROGRESS bonus. Progress is bounded by field length and lateral
             // recycling gains ~0, so it can't be farmed by tiki-taka.
-            r += 0.06 + (w.last_pass_gain_a.max(0.0) * 0.1).min(0.6);
+            r += rw().pass_credit + (w.last_pass_gain_a.max(0.0) * 0.1).min(0.6);
             // MILESTONE: the 2nd completed pass unlocks a legal shot. The pinball used
             // to farm this via pass-pass-shoot-repeat — now the SHOT COOLDOWN breaks
             // that loop (the rapid follow-up shot pays nothing), so the milestone is
             // safe to reward again for genuine build-up.
             if n == 2 {
-                r += 0.3;
+                r += rw().milestone;
             }
             // Anti-recycle: escalating penalty for sterile long possessions.
             if n > 6 {
@@ -300,7 +300,7 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
             }
         }
         if w.ev_turnover_a {
-            r -= 0.2; // real cost, but not so harsh the required passing is avoided
+            r -= rw().turnover; // real cost, but not so harsh the required passing is avoided
         }
         // SHOT ON GOAL from the opponent's half after 2 passes is EARNED and
         // rewarded HANDSOMELY (not just goals) — a strong base plus a chance-quality
@@ -308,7 +308,7 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
         // Shoot-spam is stopped structurally by the cooldown: a rapid-fire repeat
         // shot (fired while a prior shot is still "hot") pays nothing.
         if w.ev_shot_on_a && !w.shot_was_rapid_a {
-            r += 1.5 + 1.0 * w.last_shot_quality_a;
+            r += rw().shot_base + rw().shot_q * w.last_shot_quality_a;
         }
         // reward winning the ball back (pressing / interceptions / tackles)
         if w.ev_win_ball_a {
@@ -318,7 +318,7 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
         // little. SMALL per-tick — it fires every tick you carry, so a big value
         // accumulates into ball-hoarding that dwarfs goals.
         if w.ev_dribble_fwd_a {
-            r += 0.015; // forward carrying (also paid by potential shaping) — bounded, unfarmable
+            r += rw().dribble; // forward carrying (also paid by potential shaping) — bounded, unfarmable
         }
         // (lateral dribble: no flat reward — potential shaping handles real progress)
         if w.ev_turnover_a && (w.ev_dribble_fwd_a || w.ev_dribble_lat_a) {
@@ -368,7 +368,7 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
             // positional shaping. An off-ball player who freezes is penalized, so
             // players keep moving and (in possession) make their runs.
             if !is_carrier && spd_t[i] == SPD_STAND {
-                sp_t[i] -= W_STAND_PEN;
+                sp_t[i] -= rw().stand_pen;
             }
             if our_phase {
                 // Advance upfield (attack frame +x). No offsides rule, so reward
@@ -389,7 +389,7 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
                 // front line across BOTH flanks instead of clustering one side.
                 let flank = if wide > 0.5 { (wide - 0.5) * 2.0 } else { 0.0 };
                 sp_t[i] +=
-                    W_ADVANCE * advance + W_OPEN * open + W_WIDTH * width + W_FLANK * flank;
+                    rw().advance * advance + rw().open * open + rw().width * width + rw().flank * flank;
 
                 // ── THE KEY MARL BEHAVIOUR ─────────────────────────────────────
                 // When a TEAMMATE has the ball, the other attackers must run/sprint
@@ -402,13 +402,13 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
                     let ahead = ((pos.x - w.ball.x) / 12.0).clamp(0.0, 1.0);
                     let lane = w.lane_clearness(Team::A, w.ball, pos);
                     let make_run = (w.a[i].vel.x / 8.5).clamp(0.0, 1.0); // fwd speed, ~run_fast = 1.0
-                    sp_t[i] += W_AHEAD * ahead * lane + W_MAKE_RUN * make_run;
+                    sp_t[i] += rw().ahead * ahead * lane + rw().make_run * make_run;
                 }
             } else if their_phase {
                 // goalside of the ball: our goal is at x=0, so reward being at a
                 // LOWER x than the ball (between ball and own goal).
                 let goalside = ((w.ball.x - pos.x) / 8.0).clamp(-1.0, 1.0);
-                sp_t[i] += W_GOALSIDE * goalside;
+                sp_t[i] += rw().goalside * goalside;
             }
         }
 
