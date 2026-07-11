@@ -348,7 +348,8 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
         mask_buf.push(mask_t);
         act_buf.push(mact_t);
         spd_buf.push(spd_t);
-        logp_buf.push(logp_t);
+        logpa_buf.push(logpa_t);
+        logps_buf.push(logps_t);
         val_buf.push(v_central);
         gstate_buf.push(gstate);
         rew_buf.push(r);
