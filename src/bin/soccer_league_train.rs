@@ -1157,6 +1157,12 @@ fn main() {
     let chance_quality_k = env_default_f64("DD_SOCCER_CHANCE_QUALITY_K", 22.0);
     let chance_quality_cap = env_default_f64("DD_SOCCER_CHANCE_QUALITY_CAP", 5.0);
     let analytic_opponents = env_bool("SOCCER_LEAGUE_ANALYTIC_OPPONENTS", true);
+    // SELF-PLAY LADDER (mirrors the standalone 5v5 champion ladder): train the frontier against the
+    // CURRENT published champion (a neural net that strengthens as the ladder climbs) plus an analytic
+    // baseline, and promote it to the new champion only when it beats that champion by a goal-diff
+    // margin over the held-out head-to-head eval. The co-evolution the plain league lacks.
+    let self_play_ladder = env_bool("SOCCER_LEAGUE_SELF_PLAY_LADDER", false);
+    let self_play_promote_margin = env_f64("SOCCER_LEAGUE_PROMOTE_MARGIN", 0.25);
 
     let mut runner_config = EngineMatchRunnerConfig::default();
     runner_config.base.duration_seconds = minutes * 60.0;
