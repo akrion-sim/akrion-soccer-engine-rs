@@ -15922,6 +15922,10 @@ pub enum SoccerAction {
     },
     Shoot {
         power: f64,
+        /// Actor-chosen goal-mouth aim point. `None` (default) ⇒ analytic aim runs unchanged
+        /// (byte-identical). Populated only when `dd_soccer_enable_actor_shot_placement()` is on.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_point: Option<Vec2>,
     },
     Tackle {
         target_player: usize,
