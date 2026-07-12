@@ -1780,8 +1780,19 @@ fn main() {
             if frontier.neural.is_some() {
                 let prior_best = best_checkpoint_net_forward_pass_margin;
                 let validation = if checkpoint_validate_games > 0 {
-                    let checkpoint_incumbent =
-                        load_brain(&frontier_path).unwrap_or_else(|| checkpoint_baseline.clone());
+                    let checkpoint_incumbent = match load_brain(&frontier_path) {
+                        Some(champ) => champ,
+                        // Ladder gen-0 (no champion published yet): gate vs the ANALYTIC baseline (net
+                        // stripped) so the FIRST promotion requires beating the engine — the north
+                        // star — mirroring the 5v5 ladder's scripted gen-0. Without this the gate
+                        // compares the frontier to its own round-start self (gd ~0) and never advances.
+                        None if self_play_ladder => {
+                            let mut analytic = TeamBrain::fresh_with_seed(0xA5A5_0007, 100);
+                            analytic.neural = None;
+                            analytic
+                        }
+                        None => checkpoint_baseline.clone(),
+                    };
                     let validation = play_checkpoint_validation(
                         &runner,
                         &frontier,
