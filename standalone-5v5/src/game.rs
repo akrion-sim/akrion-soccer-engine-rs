@@ -477,6 +477,30 @@ impl World {
         bpos // uncatchable — head to where it ends up
     }
 
+    /// POMDP belief that THIS player wins a LOOSE ball: a race between my time to
+    /// my earliest intercept point (on the ball's decelerating trajectory) and the
+    /// nearest opponent's time to theirs. ~[0,1], and 0 whenever the ball is owned.
+    /// Feeds loose-ball pursuit shaping so the FAVORITE commits to the ball while
+    /// teammates hold shape — real pressing, not everyone crashing the ball.
+    pub fn loose_ball_belief(&self, team: Team, idx: usize) -> f32 {
+        if self.owner.is_some() {
+            return 0.0;
+        }
+        let me = players(team, self)[idx].pos;
+        let my_eta = me.sub(self.intercept_point(me)).len() / PLAYER_SPEED.max(1e-3);
+        let opp = players(team.other(), self);
+        let mut opp_eta = f32::INFINITY;
+        for k in 0..N {
+            let op = opp[k].pos;
+            let eta = op.sub(self.intercept_point(op)).len() / PLAYER_SPEED.max(1e-3);
+            if eta < opp_eta {
+                opp_eta = eta;
+            }
+        }
+        // favorite when I arrive clearly sooner; smooth ~0.6s window around parity.
+        (0.5 + 0.5 * ((opp_eta - my_eta) / 0.6).clamp(-1.0, 1.0)).clamp(0.0, 1.0)
+    }
+
     /// Classify a Team-A dribble by the FINAL (post-shielding) direction, so the
     /// forward-dribble reward reflects actual movement — a shield that bends the
     /// carry sideways/backward is NOT credited as forward. Forward = x·sx > 0.3,
