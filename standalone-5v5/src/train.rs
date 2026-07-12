@@ -101,6 +101,7 @@ pub struct Rw {
     pub field_goalside_delta: f32, // reward improving team goalside geometry
     pub field_burst_delta: f32,    // reward improving forward outlet geometry
     pub stand_pen: f32,            // anti-passivity: penalize the STAND gear off-ball
+    pub pursuit: f32,              // LOOSE-BALL: favorite commits to winning a free ball
 }
 fn rw() -> &'static Rw {
     static R: std::sync::OnceLock<Rw> = std::sync::OnceLock::new();
