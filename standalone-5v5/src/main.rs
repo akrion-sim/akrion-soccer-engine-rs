@@ -113,6 +113,9 @@ fn run() -> AppResult<()> {
 fn print_usage() {
     println!("usage:");
     println!("  cargo run --release -- train [iters] [--seed N] [--games-per-iter N] [--bc-games N] [--bc-epochs N] [--eval-every N] [--eval-games N] [--final-games N] [--display-seed-max N] [--out-dir DIR]");
+    println!("  cargo run --release -- selfplay [iters-per-gen] [--seed N] [--games-per-iter N] [--bc-games N] [--bc-epochs N] [--eval-games N] [--out-dir DIR]");
+    println!("      # adversarial self-play ladder — both teams learned; new winner must beat the frozen");
+    println!("      # champion by PROMOTE_MARGIN (goal-diff) to advance. env: GENERATIONS, PROMOTE_MARGIN, SPEED_WARMUP");
     println!("  cargo run --release -- inspect [seed] [--out-dir DIR]");
     println!("  cargo run --release -- play [seed] [--out-dir DIR] [--out PATH]  # record one match (live New Game)");
     println!("  cargo run --release -- sanity");
