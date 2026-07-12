@@ -6,17 +6,40 @@
 <title>Live Soccer Simulation</title>
 <style>
   :root {
-    --bg: #eef1f4;
-    --ink: #172026;
-    --muted: #65727c;
-    --line: #cbd4da;
-    --panel: #ffffff;
-    --home: #1f6feb;
-    --away: #d64545;
-    --official: #111827;
-    --field: #238547;
-    --field2: #2f9b57;
-    --gold: #c58a13;
+    /* design-system tokens (shared with the 5-a-side viz) — dark default, theme-aware */
+    --bg: #0b140e; --panel: #101c14; --panel-2: #0d1710;
+    --ink: #e8f0e9; --muted: #93a89a; --ink-dim: #93a89a;
+    --line: #22362a; --accent: #2fe0b6; --good: #57d979; --bad: #ff6b5e;
+    --shadow: 0 1px 0 rgba(255,255,255,.03), 0 18px 40px -24px rgba(0,0,0,.8);
+    /* pitch / team colors (used by the canvas renderer in both themes) */
+    --home: #3b93ff; --away: #ff6b5e; --official: #c7d3cb;
+    --field: #12351f; --field2: #1c5233; --gold: #e0b64a;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #eef2ec; --panel: #ffffff; --panel-2: #f4f7f2;
+      --ink: #0d1a12; --muted: #59705f; --ink-dim: #59705f;
+      --line: #dbe4dc; --accent: #0f9d78; --good: #1c9d4b; --bad: #d33a2c;
+      --shadow: 0 1px 0 rgba(255,255,255,.6), 0 20px 44px -28px rgba(20,40,28,.4);
+      --home: #1f6feb; --away: #d64545; --official: #111827;
+      --field: #1e5233; --field2: #2f9b57; --gold: #c58a13;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0b140e; --panel: #101c14; --panel-2: #0d1710;
+    --ink: #e8f0e9; --muted: #93a89a; --ink-dim: #93a89a;
+    --line: #22362a; --accent: #2fe0b6; --good: #57d979; --bad: #ff6b5e;
+    --shadow: 0 1px 0 rgba(255,255,255,.03), 0 18px 40px -24px rgba(0,0,0,.8);
+    --home: #3b93ff; --away: #ff6b5e; --official: #c7d3cb;
+    --field: #12351f; --field2: #1c5233; --gold: #e0b64a;
+  }
+  :root[data-theme="light"] {
+    --bg: #eef2ec; --panel: #ffffff; --panel-2: #f4f7f2;
+    --ink: #0d1a12; --muted: #59705f; --ink-dim: #59705f;
+    --line: #dbe4dc; --accent: #0f9d78; --good: #1c9d4b; --bad: #d33a2c;
+    --shadow: 0 1px 0 rgba(255,255,255,.6), 0 20px 44px -28px rgba(20,40,28,.4);
+    --home: #1f6feb; --away: #d64545; --official: #111827;
+    --field: #1e5233; --field2: #2f9b57; --gold: #c58a13;
   }
   * { box-sizing: border-box; }
   html { height: 100%; }
