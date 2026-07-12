@@ -1193,8 +1193,8 @@ function drawLadder(){
   // champion staircase (gold, right axis)
   ctx.strokeStyle=css('--gold');ctx.lineWidth=1.8;ctx.beginPath();
   L.forEach((r,i)=>{const x=X(r.gen),y=Yc(r.champ);i?ctx.lineTo(x,y):ctx.moveTo(x,y);});ctx.stroke();
-  ctx.fillStyle=css('--gold');ctx.textAlign='left';ctx.textBaseline='middle';
-  ctx.fillText('champ '+champMax,w-padR+4,Yc(champMax));
+  ctx.fillStyle=css('--gold');ctx.textAlign='right';ctx.textBaseline='middle';
+  ctx.fillText('champ '+champMax,w-4,Yc(champMax)-8);
   // cs line (vs scripted, dim)
   ctx.strokeStyle=css('--ink-dim');ctx.lineWidth=1.4;ctx.globalAlpha=.8;ctx.beginPath();
   L.forEach((r,i)=>{const x=X(r.gen),y=Y(r.cs_gd);i?ctx.lineTo(x,y):ctx.moveTo(x,y);});ctx.stroke();ctx.globalAlpha=1;
