@@ -39,6 +39,16 @@ pub const SPD_SPRINT: usize = 6;
 // Low end kept non-crippling (a slow gear still lets you get around) so the speed
 // policy's exploration can't paralyze the game; STAND is the only truly-still gear.
 const SPEEDS: [f32; NS] = [0.0, 3.0, 4.5, 5.5, 6.5, 8.5, 11.0];
+// Players can't snap between the 7 gears instantly — actual velocity ramps toward
+// the chosen gear's velocity at a bounded rate. Accelerating (building speed) is
+// slower than decelerating / cutting (shedding speed or changing direction), as
+// with real players. Units yd/s^2. Env-overridable so the tuner can shape them.
+fn player_accel() -> f32 {
+    std::env::var("PLAYER_ACCEL").ok().and_then(|s| s.parse().ok()).filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(6.0)
+}
+fn player_decel() -> f32 {
+    std::env::var("PLAYER_DECEL").ok().and_then(|s| s.parse().ok()).filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(11.0)
+}
 // Ball-carrying is much slower than open-field running (you can't sprint flat-out
 // with the ball at your feet) — and, critically, keeping it near v3's control
 // speed stops the policy from dribbling forever to evade the 2-pass shot gate.
