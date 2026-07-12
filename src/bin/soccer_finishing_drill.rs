@@ -193,39 +193,157 @@ fn setup_scenario(sim: &mut SoccerMatch, rng: &mut Rng, num_defenders: usize) ->
     shooter
 }
 
-/// Play one finishing episode: reset the scenario, step until the shot resolves (goal / keeper
-/// save / ball out of the attacking third) or the tick cap, then flush any post-goal celebration
-/// so it cannot clobber the next reset. Returns whether the shot was converted. Does NOT drain the
-/// learner — the caller decides, so the SAME routine serves both training and frozen held-out eval.
-fn play_one_episode(
+/// CREATION scenario: reset a realistic open-play attack in the final third — a Home CARRIER on
+/// the ball 22-40yd from the Away goal (NOT in the box), up to 3 advanced Home support attackers
+/// for passing/movement options, and `num_defenders` analytic Away defenders forming a block
+/// between the ball and goal plus the keeper on its line. Everyone else is parked deep. The net
+/// must PENETRATE and manufacture a high-xG shot, not just tap in. Returns the carrier's id.
+fn setup_scenario_creation(sim: &mut SoccerMatch, rng: &mut Rng, num_defenders: usize) -> usize {
+    let width = sim.config.field_width_yards;
+    let length = sim.config.field_length_yards;
+    let goal_y = Team::Home.goal_y(length); // == length; HOME attacks +y
+
+    let away_keeper = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && p.role == PlayerRole::Goalkeeper)
+        .map(|p| p.id);
+    let home_outfielders: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Home && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .collect();
+    let away_outfielders: Vec<usize> = sim
+        .players
+        .iter()
+        .filter(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .collect();
+
+    let cx = rng.range(width * 0.32, width * 0.68);
+    let cy = rng.range(goal_y - 40.0, goal_y - 22.0);
+    let carrier = home_outfielders[rng.below(home_outfielders.len())];
+    let carrier_pos = Vec2::new(cx, cy);
+
+    let supports: Vec<usize> = home_outfielders
+        .iter()
+        .copied()
+        .filter(|&id| id != carrier)
+        .take(3)
+        .collect();
+    let defenders: Vec<usize> = away_outfielders.iter().copied().take(num_defenders).collect();
+
+    for p in sim.players.iter_mut() {
+        if p.id == carrier {
+            p.position = carrier_pos;
+            p.velocity = Vec2::zero();
+        } else if Some(p.id) == away_keeper {
+            p.position = Vec2::new(width * 0.5, goal_y - 2.0);
+            p.velocity = Vec2::zero();
+        } else if let Some(k) = supports.iter().position(|&s| s == p.id) {
+            // Advanced support spread across the width, level-to-ahead of the carrier.
+            let sx = (width * (0.22 + 0.28 * k as f64) + rng.range(-4.0, 4.0)).clamp(3.0, width - 3.0);
+            let sy = (cy + rng.range(2.0, 12.0)).clamp(0.0, goal_y - 8.0);
+            p.position = Vec2::new(sx, sy);
+            p.velocity = Vec2::zero();
+        } else if let Some(k) = defenders.iter().position(|&d| d == p.id) {
+            // Defensive block staggered between the ball and the goal.
+            let frac = (k as f64 + 1.0) / (num_defenders as f64 + 1.0);
+            let dx = (width * (0.30 + 0.40 * frac) + rng.range(-5.0, 5.0)).clamp(3.0, width - 3.0);
+            let dy = (cy + (goal_y - cy) * (0.35 + 0.45 * frac) + rng.range(-3.0, 3.0))
+                .clamp(cy + 3.0, goal_y - 4.0);
+            p.position = Vec2::new(dx, dy);
+            p.velocity = Vec2::zero();
+        } else {
+            p.position = Vec2::new(rng.range(4.0, width - 4.0), rng.range(6.0, 40.0));
+            p.velocity = Vec2::zero();
+        }
+    }
+
+    sim.ball.position = carrier_pos;
+    sim.ball.velocity = Vec2::zero();
+    sim.ball.altitude_yards = 0.0;
+    sim.ball.holder = Some(carrier);
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.tick = sim.tick.max(1000);
+    carrier
+}
+
+/// Play one episode (either mode) and return its measured outcome. FINISHING resets a 1-v-keeper
+/// chance and ends when the shot resolves; CREATION resets a final-third attack and runs the
+/// possession until a turnover / the ball is cleared / the tick cap, accumulating every Home shot
+/// and the best geometric xG produced. Post-goal celebration is flushed so it can't clobber the
+/// next reset. Does NOT drain the learner — the caller decides, so the SAME routine serves both
+/// training and frozen held-out eval.
+fn play_episode(
     sim: &mut SoccerMatch,
     rng: &mut Rng,
+    creation: bool,
     num_defenders: usize,
     max_ticks: usize,
-    field_length: f64,
-) -> bool {
-    setup_scenario(sim, rng, num_defenders);
+    width: f64,
+    length: f64,
+) -> EpMetrics {
+    if creation {
+        setup_scenario_creation(sim, rng, num_defenders);
+    } else {
+        setup_scenario(sim, rng, num_defenders);
+    }
+    let goal_y = length;
+    let shots0 = sim.stats.shots_home;
+    let sot0 = sim.stats.shots_on_target_home;
     let score_before = sim.score_home;
-    let mut scored = false;
+    let mut last_shots = shots0;
+    let mut best_xg = 0.0f64;
+
     for _ in 0..max_ticks {
+        let pre_ball = sim.ball.position; // shot-origin candidate for this tick
         sim.run_time_step();
+        if sim.stats.shots_home > last_shots {
+            last_shots = sim.stats.shots_home;
+            let xg = shot_xg(pre_ball, width, goal_y);
+            if xg > best_xg {
+                best_xg = xg;
+            }
+        }
         if sim.score_home > score_before {
-            scored = true;
-            break;
+            break; // goal (both modes)
         }
-        // Shot resolved against us (keeper save / defender block / interception) …
-        if sim.ball.last_touch_team == Some(Team::Away) {
-            break;
-        }
-        // … or the ball left the attacking third.
-        if sim.ball.position.y < field_length * 0.60 {
-            break;
+        if creation {
+            // Turnover: an Away player is now in possession.
+            if let Some(h) = sim.ball.holder {
+                if sim.players.iter().find(|p| p.id == h).map(|p| p.team) == Some(Team::Away) {
+                    break;
+                }
+            }
+            // Attack broken up / cleared out of the attacking half.
+            if sim.ball.position.y < length * 0.5 {
+                break;
+            }
+        } else {
+            // Shot resolved against us (keeper save / defender block / interception) …
+            if sim.ball.last_touch_team == Some(Team::Away) {
+                break;
+            }
+            // … or the ball left the attacking third.
+            if sim.ball.position.y < length * 0.60 {
+                break;
+            }
         }
         if sim.is_done() {
             break;
         }
     }
-    if scored {
+
+    let goal = sim.score_home > score_before;
+    let metrics = EpMetrics {
+        goal,
+        shots: sim.stats.shots_home - shots0,
+        sot: sim.stats.shots_on_target_home - sot0,
+        best_xg,
+    };
+    if goal {
         // Flush the ~25-tick goal celebration + kickoff reset (the counter is pub(crate)).
         for _ in 0..30 {
             if sim.is_done() {
@@ -234,7 +352,26 @@ fn play_one_episode(
             sim.run_time_step();
         }
     }
-    scored
+    metrics
+}
+
+/// Run `n` held-out episodes on `sim` (net already installed & frozen) and collect their metrics.
+fn eval_arm(
+    sim: &mut SoccerMatch,
+    eval_base: u64,
+    n: usize,
+    creation: bool,
+    num_defenders: usize,
+    max_ticks: usize,
+    width: f64,
+    length: f64,
+) -> Vec<EpMetrics> {
+    (0..n)
+        .map(|i| {
+            let mut rng = Rng::new(eval_base.wrapping_add(i as u64));
+            play_episode(sim, &mut rng, creation, num_defenders, max_ticks, width, length)
+        })
+        .collect()
 }
 
 fn main() {
