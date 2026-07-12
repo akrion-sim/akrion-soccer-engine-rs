@@ -1603,9 +1603,12 @@ impl World {
     }
 
     fn set_vel(&mut self, team: Team, idx: usize, v: V2) {
+        // Sets the DESIRED velocity (the chosen gear/direction). The actual velocity
+        // ramps toward it in integrate() at a bounded accel/decel rate — no instant
+        // jumps between the 7 gears.
         match team {
-            Team::A => self.a[idx].vel = v,
-            Team::B => self.b[idx].vel = v,
+            Team::A => self.a[idx].des_vel = v,
+            Team::B => self.b[idx].des_vel = v,
         }
     }
 
