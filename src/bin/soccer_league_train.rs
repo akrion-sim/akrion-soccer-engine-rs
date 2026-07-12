@@ -1472,6 +1472,26 @@ fn main() {
             }
         }
 
+        // SELF-PLAY LADDER: replace the league with just the CURRENT published champion (neural, so it
+        // drives Team B through the same inference path and strengthens as the ladder climbs) plus one
+        // ANALYTIC baseline — the challenger co-evolves against a tougher self AND stays grounded
+        // against the engine (the north-star metric it is scored on). Gen-0 (nothing published yet) =
+        // analytic only, mirroring the 5v5 ladder's scripted gen-0 baseline.
+        if self_play_ladder {
+            let mut pool: Vec<TeamBrain> = Vec::new();
+            if let Some(champ) = load_brain(&frontier_path) {
+                pool.push(if hermetic_neural {
+                    without_target_q(champ)
+                } else {
+                    champ
+                });
+            }
+            let mut analytic_base = TeamBrain::fresh_with_seed(0xA5A5_0007, 100);
+            analytic_base.neural = None; // stripped net -> pure analytic engine (grounding opponent)
+            pool.push(analytic_base);
+            opponents = pool;
+        }
+
         // Build this round's fixtures, then run them DATA-PARALLEL across N workers: each worker
         // clones the current frontier + runner, plays a disjoint slice (carry-forward within the
         // slice), and returns its trained net; we then AVERAGE the workers' nets. ~N× faster per
