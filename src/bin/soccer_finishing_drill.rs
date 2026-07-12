@@ -421,6 +421,103 @@ fn main() {
     };
     let brain = TeamBrain::from_snapshot_with_targets(snap.clone(), home_targets_out, Vec::new());
 
+    // ---- Eval at power: PAIRED held-out comparison, trained-frozen vs fresh-frozen ----
+    // The within-run per-block rate is a high-variance, non-paired signal. This is the definitive
+    // learning test: run a held-out scenario set (distinct seeds) twice — once with the TRAINED net
+    // frozen, once with a brand-new FRESH net frozen — under identical serving machinery and the
+    // SAME scenarios, so the only difference is learned weights. A McNemar test on the discordant
+    // pairs (scenarios exactly one net converts) says whether training moved finishing beyond noise.
+    let eval_n: usize = std::env::var("DRILL_EVAL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200);
+    if eval_n > 0 && !frozen {
+        let eval_base = base_seed ^ 0xE7A1_0000_0000_0000;
+        // (a) trained-frozen: freeze the just-trained net in the existing sim (save data already captured).
+        sim.set_team_neural_brain(Team::Home, Some(snap.clone()), true)
+            .expect("freeze trained net for eval");
+        let trained: Vec<bool> = (0..eval_n)
+            .map(|i| {
+                let mut rng = Rng::new(eval_base.wrapping_add(i as u64));
+                play_one_episode(&mut sim, &mut rng, num_defenders, max_ticks, field_length)
+            })
+            .collect();
+        // (b) fresh-frozen: a brand-new sim with an UNTRAINED net, identical serving machinery.
+        let mut fresh_config = MatchConfig {
+            seed,
+            learning_enabled: true,
+            full_game_learning_enabled: true,
+            duration_seconds: 1e9,
+            ..MatchConfig::default()
+        };
+        fresh_config.neural_learning.enabled = true;
+        let fresh_policies = SoccerTeamQPolicies {
+            home: SoccerQPolicy::from_entries_with_targets(SoccerQPolicyOptions::default(), &[], &[])
+                .expect("fresh home policy"),
+            away: SoccerQPolicy::from_entries_with_targets(SoccerQPolicyOptions::default(), &[], &[])
+                .expect("fresh away policy"),
+        };
+        let mut fresh_sim = SoccerMatch::default_11v11(fresh_config).with_team_policies(fresh_policies);
+        fresh_sim
+            .set_team_neural_brain(Team::Home, None, false)
+            .expect("fresh home learner");
+        let fresh_snap = fresh_sim.neural_network_snapshot_for(Team::Home);
+        fresh_sim
+            .set_team_neural_brain(Team::Home, fresh_snap, true)
+            .expect("freeze fresh net");
+        fresh_sim
+            .set_team_neural_brain(Team::Away, None, true)
+            .expect("fresh away analytic");
+        let fresh: Vec<bool> = (0..eval_n)
+            .map(|i| {
+                let mut rng = Rng::new(eval_base.wrapping_add(i as u64));
+                play_one_episode(&mut fresh_sim, &mut rng, num_defenders, max_ticks, field_length)
+            })
+            .collect();
+
+        let t_goals = trained.iter().filter(|&&x| x).count();
+        let f_goals = fresh.iter().filter(|&&x| x).count();
+        let up = trained // trained scored where fresh missed
+            .iter()
+            .zip(&fresh)
+            .filter(|(&t, &f)| t && !f)
+            .count();
+        let down = trained // fresh scored where trained missed
+            .iter()
+            .zip(&fresh)
+            .filter(|(&t, &f)| !t && f)
+            .count();
+        let z = if up + down > 0 {
+            (up as f64 - down as f64) / ((up + down) as f64).sqrt()
+        } else {
+            0.0
+        };
+        println!(
+            "\nEVAL@POWER  held-out={eval_n} (paired, both frozen, identical scenarios)"
+        );
+        println!(
+            "  trained_net conversion = {:.3} ({}/{})   fresh_net conversion = {:.3} ({}/{})",
+            t_goals as f64 / eval_n as f64,
+            t_goals,
+            eval_n,
+            f_goals as f64 / eval_n as f64,
+            f_goals,
+            eval_n
+        );
+        println!(
+            "  paired flips: trained-only-goals={up}  fresh-only-goals={down}  McNemar z={z:+.2}   {}",
+            if z > 1.96 {
+                "=> trained SIGNIFICANTLY beats fresh (net learned to finish)"
+            } else if z < -1.96 {
+                "=> trained significantly WORSE than fresh (regression)"
+            } else if t_goals > f_goals {
+                "=> trained edges fresh (within noise)"
+            } else {
+                "=> no finishing gain over fresh (analytic near-parity ceiling)"
+            }
+        );
+    }
+
     if let Some(parent) = Path::new(&out_path)
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
