@@ -143,14 +143,14 @@
   button, select, input, .control-link {
     min-height: 32px;
     border: 1px solid var(--line);
-    background: #fff;
+    background: var(--panel-2);
     color: var(--ink);
     border-radius: 6px;
     font-size: 13px;
   }
-  button { min-width: 38px; padding: 0 10px; cursor: pointer; }
-  button:hover { background: #f0f4f7; }
-  button.active { background: #172026; color: #fff; }
+  button { min-width: 38px; padding: 0 10px; cursor: pointer; transition: background .12s, border-color .12s; }
+  button:hover { background: color-mix(in srgb, var(--accent) 14%, var(--panel-2)); border-color: color-mix(in srgb, var(--accent) 42%, var(--line)); }
+  button.active { background: var(--accent); color: var(--bg); border-color: var(--accent); font-weight: 600; }
   .control-link {
     display: inline-flex;
     align-items: center;
