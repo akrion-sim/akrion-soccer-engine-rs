@@ -759,9 +759,11 @@ fn main() {
         if creation {
             let (ts, tso, txg, thi) = summarize(&tuned);
             let (bs, bso, bxg, bhi) = summarize(&baseline);
-            let hi = |m: &EpMetrics| m.best_xg > HIGH_XG_THRESHOLD;
-            let up = tuned.iter().zip(&baseline).filter(|(t, b)| hi(t) && !hi(b)).count();
-            let down = tuned.iter().zip(&baseline).filter(|(t, b)| !hi(t) && hi(b)).count();
+            // Paired significance on the engine-grounded chance metric: did the episode produce a
+            // shot ON TARGET. (hiXG is reported too but is sparser / lower-powered.)
+            let got = |m: &EpMetrics| m.sot >= 1;
+            let up = tuned.iter().zip(&baseline).filter(|(t, b)| got(t) && !got(b)).count();
+            let down = tuned.iter().zip(&baseline).filter(|(t, b)| !got(t) && got(b)).count();
             let z = if up + down > 0 {
                 (up as f64 - down as f64) / ((up + down) as f64).sqrt()
             } else {
@@ -770,12 +772,12 @@ fn main() {
             println!("  creation-tuned:  shots/ep={ts:.3}  sot/ep={tso:.3}  meanXG={txg:.3}  hiXG-frac={thi:.3}");
             println!("  warm-baseline:   shots/ep={bs:.3}  sot/ep={bso:.3}  meanXG={bxg:.3}  hiXG-frac={bhi:.3}");
             println!(
-                "  hiXG paired flips: tuned-only={up}  baseline-only={down}  McNemar z={z:+.2}   {}",
+                "  SOT-episode paired flips: tuned-only={up}  baseline-only={down}  McNemar z={z:+.2}   {}",
                 if z > 1.96 {
-                    "=> tuned SIGNIFICANTLY creates more high-xG chances (creation headroom!)"
+                    "=> tuned SIGNIFICANTLY creates more on-target chances (creation headroom!)"
                 } else if z < -1.96 {
                     "=> tuned significantly WORSE (narrowed the full-game net)"
-                } else if thi > bhi {
+                } else if tso > bso {
                     "=> tuned edges baseline (within noise)"
                 } else {
                     "=> no chance-creation gain over the warm-start baseline"
