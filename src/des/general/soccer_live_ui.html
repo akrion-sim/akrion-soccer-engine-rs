@@ -3905,6 +3905,7 @@ function render() {
   gkPhysics.textContent = goalkeeperPhysicsLabel();
   gkPhysics.title = goalkeeperPhysicsTitle();
   passes.textContent = `${s.passesCompletedHome + s.passesCompletedAway} / ${s.passesAttemptedHome + s.passesAttemptedAway}`;
+  updateSnapshotTiles(s, f);
   dribbleBeats.textContent = `${s.dribbleBeatsHome ?? 0} - ${s.dribbleBeatsAway ?? 0}`;
   clearances.textContent = `${s.clearancesHome ?? 0} - ${s.clearancesAway ?? 0}`;
   routeOne.textContent = `${s.routeOneBallsHome ?? 0} - ${s.routeOneBallsAway ?? 0}`;
