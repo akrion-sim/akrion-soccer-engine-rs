@@ -6522,7 +6522,7 @@ bootLivePage().catch(e => statusEl.textContent = e.message);
   const btn = document.getElementById("themeToggle");
   const KEY = "soccerLiveTheme";
   const root = document.documentElement;
-  function apply(t) { if (t) root.setAttribute("data-theme", t); else root.removeAttribute("data-theme"); }
+  function apply(t) { if (t) root.setAttribute("data-theme", t); else root.removeAttribute("data-theme"); if (typeof window.drawAllClimb === "function") window.drawAllClimb(); }
   let cur = null;
   try { cur = localStorage.getItem(KEY); } catch (_) {}
   if (cur) apply(cur);
