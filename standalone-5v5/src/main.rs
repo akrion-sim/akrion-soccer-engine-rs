@@ -110,6 +110,7 @@ fn print_usage() {
     println!("usage:");
     println!("  cargo run --release -- train [iters] [--seed N] [--games-per-iter N] [--bc-games N] [--bc-epochs N] [--eval-every N] [--eval-games N] [--final-games N] [--display-seed-max N] [--out-dir DIR]");
     println!("  cargo run --release -- inspect [seed] [--out-dir DIR]");
+    println!("  cargo run --release -- play [seed] [--out-dir DIR] [--out PATH]  # record one match (live New Game)");
     println!("  cargo run --release -- sanity");
 }
 
