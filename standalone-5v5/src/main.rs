@@ -233,22 +233,30 @@ fn env_f32_clamped(name: &str, default: f32, min: f32, max: f32) -> f32 {
 /// with the given seed to `out_path` — powers the live "New Game" button, which
 /// the live server (viz/serve_live.py) invokes per click with a random seed.
 ///   cargo run --release -- play [seed] [--out-dir DIR] [--out PATH]
-fn play(seed: u64, out_dir: &Path, out_path: &Path) -> AppResult<()> {
-    let actor = nn::Mlp::load(&out_dir.join("actor.txt"))
-        .map_err(|e| format!("no trained policy in {}: {e}", out_dir.display()))?;
-    let critic = nn::Mlp::load(&out_dir.join("critic.txt"))
-        .map_err(|e| format!("failed to load critic: {e}"))?;
-    let speedor = nn::Mlp::load(&out_dir.join("speedor.txt"))
-        .map_err(|e| format!("failed to load speedor: {e}"))?;
+fn load_policy(dir: &Path) -> AppResult<train::Policy> {
+    let actor = nn::Mlp::load(&dir.join("actor.txt"))
+        .map_err(|e| format!("no policy (actor.txt) in {}: {e}", dir.display()))?;
+    let critic = nn::Mlp::load(&dir.join("critic.txt"))
+        .map_err(|e| format!("failed to load critic in {}: {e}", dir.display()))?;
+    let speedor = nn::Mlp::load(&dir.join("speedor.txt"))
+        .map_err(|e| format!("failed to load speedor in {}: {e}", dir.display()))?;
     if actor.in_dim() != OBS_DIM || actor.out_dim() != NA {
         return Err("actor shape mismatch; retrain the policy".into());
     }
-    let policy = train::Policy {
+    Ok(train::Policy {
         actor,
         speedor,
         critic,
+    })
+}
+
+fn play(seed: u64, out_dir: &Path, out_path: &Path, opponent_dir: Option<&Path>) -> AppResult<()> {
+    let policy = load_policy(out_dir)?;
+    let opponent = match opponent_dir {
+        Some(d) => Some(load_policy(d)?), // champion-vs-champion self-play match
+        None => None,                     // vs scripted baseline
     };
-    record_match(&policy, &mut Rng::new(seed), out_path)?;
+    record_match_vs(&policy, opponent.as_ref(), &mut Rng::new(seed), out_path)?;
     println!("wrote {}", out_path.display());
     Ok(())
 }
