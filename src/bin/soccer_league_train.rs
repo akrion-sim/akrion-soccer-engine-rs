@@ -1157,6 +1157,12 @@ fn main() {
     let chance_quality_k = env_default_f64("DD_SOCCER_CHANCE_QUALITY_K", 22.0);
     let chance_quality_cap = env_default_f64("DD_SOCCER_CHANCE_QUALITY_CAP", 5.0);
     let analytic_opponents = env_bool("SOCCER_LEAGUE_ANALYTIC_OPPONENTS", true);
+    // SELF-PLAY LADDER (mirrors the standalone 5v5 champion ladder): train the frontier against the
+    // CURRENT published champion (a neural net that strengthens as the ladder climbs) plus an analytic
+    // baseline, and promote it to the new champion only when it beats that champion by a goal-diff
+    // margin over the held-out head-to-head eval. The co-evolution the plain league lacks.
+    let self_play_ladder = env_bool("SOCCER_LEAGUE_SELF_PLAY_LADDER", false);
+    let self_play_promote_margin = env_f64("SOCCER_LEAGUE_PROMOTE_MARGIN", 0.25);
 
     let mut runner_config = EngineMatchRunnerConfig::default();
     runner_config.base.duration_seconds = minutes * 60.0;
@@ -1284,6 +1290,13 @@ fn main() {
     // DD_SOCCER_NEURAL_AUTHORITATIVE_LAMBDA (more actor influence) + SOCCER_POLICY_ENTROPY_COEFF
     // (keep exploring) so the actor can actually leave the analytic mode. Off ⇒ current behaviour.
     runner_config.base.neural_blend.actor_critic = env_bool("SOCCER_NEURAL_ACTOR_CRITIC", true);
+    // The self-play ladder installs a neural net on BOTH teams, but the actor's `policy_head` is a
+    // single shared field — the away champion's actor would overwrite (and then drive) both sides.
+    // Force critic-only ranking in ladder mode so each side selects with its OWN per-team critic
+    // (the exact mode play_checkpoint_validation + the default tournament config already use).
+    if self_play_ladder {
+        runner_config.base.neural_blend.actor_critic = false;
+    }
     runner_config.base.neural_blend.mode = env_neural_blend_mode(
         "SOCCER_NEURAL_BLEND_MODE",
         SoccerNeuralBlendMode::Authoritative,
@@ -1457,6 +1470,26 @@ fn main() {
             for opp in opponents.iter_mut() {
                 opp.neural = None;
             }
+        }
+
+        // SELF-PLAY LADDER: replace the league with just the CURRENT published champion (neural, so it
+        // drives Team B through the same inference path and strengthens as the ladder climbs) plus one
+        // ANALYTIC baseline — the challenger co-evolves against a tougher self AND stays grounded
+        // against the engine (the north-star metric it is scored on). Gen-0 (nothing published yet) =
+        // analytic only, mirroring the 5v5 ladder's scripted gen-0 baseline.
+        if self_play_ladder {
+            let mut pool: Vec<TeamBrain> = Vec::new();
+            if let Some(champ) = load_brain(&frontier_path) {
+                pool.push(if hermetic_neural {
+                    without_target_q(champ)
+                } else {
+                    champ
+                });
+            }
+            let mut analytic_base = TeamBrain::fresh_with_seed(0xA5A5_0007, 100);
+            analytic_base.neural = None; // stripped net -> pure analytic engine (grounding opponent)
+            pool.push(analytic_base);
+            opponents = pool;
         }
 
         // Build this round's fixtures, then run them DATA-PARALLEL across N workers: each worker
@@ -1747,8 +1780,19 @@ fn main() {
             if frontier.neural.is_some() {
                 let prior_best = best_checkpoint_net_forward_pass_margin;
                 let validation = if checkpoint_validate_games > 0 {
-                    let checkpoint_incumbent =
-                        load_brain(&frontier_path).unwrap_or_else(|| checkpoint_baseline.clone());
+                    let checkpoint_incumbent = match load_brain(&frontier_path) {
+                        Some(champ) => champ,
+                        // Ladder gen-0 (no champion published yet): gate vs the ANALYTIC baseline (net
+                        // stripped) so the FIRST promotion requires beating the engine — the north
+                        // star — mirroring the 5v5 ladder's scripted gen-0. Without this the gate
+                        // compares the frontier to its own round-start self (gd ~0) and never advances.
+                        None if self_play_ladder => {
+                            let mut analytic = TeamBrain::fresh_with_seed(0xA5A5_0007, 100);
+                            analytic.neural = None;
+                            analytic
+                        }
+                        None => checkpoint_baseline.clone(),
+                    };
                     let validation = play_checkpoint_validation(
                         &runner,
                         &frontier,
@@ -1801,10 +1845,26 @@ fn main() {
                     checkpoint_validate_min_net_forward_pass_margin,
                     checkpoint_validate_min_goal_diff_margin,
                 );
-                if passes_forward_pass_climb
-                    && ((passes_forward_pass_floor && passes_net_forward_pass_floor)
-                        || passes_goal_diff_floor)
-                    && passes_validation
+                let promotes = if self_play_ladder {
+                    // 5v5-style ladder gate: promote iff the challenger beat the CURRENT champion by
+                    // the goal-diff margin over the held-out head-to-head eval (checkpoint_incumbent =
+                    // the current published champion). Republishing the frontier below advances the
+                    // champion, so next round's opponent is this stronger net — the ladder climbs.
+                    let ladder_promotes = gate_goal_diff_margin >= self_play_promote_margin;
+                    println!(
+                        "league_self_play_ladder round={round} gd_vs_champion={:.3} promote_margin={:.3} verdict={}",
+                        gate_goal_diff_margin,
+                        self_play_promote_margin,
+                        if ladder_promotes { "PROMOTED" } else { "held" }
+                    );
+                    ladder_promotes
+                } else {
+                    passes_forward_pass_climb
+                        && ((passes_forward_pass_floor && passes_net_forward_pass_floor)
+                            || passes_goal_diff_floor)
+                        && passes_validation
+                };
+                if promotes
                 {
                     let cp = format!(
                         "{}/league-r{:04}-{}.json",
