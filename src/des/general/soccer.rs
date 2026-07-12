@@ -24340,6 +24340,23 @@ fn optional_reward_weight_env(name: &str, default: f64, max: f64) -> f64 {
         .unwrap_or(default)
 }
 
+/// Tunable ceiling for a non-conversion reward as a FRACTION of the conversion (goal) reward, clamped
+/// to (0.05, 0.95). Env `DD_SOCCER_REWARD_NON_CONVERSION_MAX_FRACTION`, default
+/// `DEFAULT_REWARD_NON_CONVERSION_MAX_FRACTION` (0.40).
+fn reward_non_conversion_max_fraction() -> f64 {
+    reward_weight_env(
+        "DD_SOCCER_REWARD_NON_CONVERSION_MAX_FRACTION",
+        DEFAULT_REWARD_NON_CONVERSION_MAX_FRACTION,
+        0.05,
+        0.95,
+    )
+}
+
+/// Clamp a non-conversion reward's scale so its maximum points stay a PROPORTIONAL margin below the
+/// conversion (goal) reward: `non_conversion_points * scale <= conversion_points * fraction`. Unlike a
+/// fixed-point margin (which becomes meaningless once the goal reward is scaled up — 155 vs 160 is
+/// still "worth a goal"), the proportional cap keeps "a missed on-target shot is worth much less than
+/// a goal" true at any magnitude. Returns 0 for degenerate inputs.
 fn grounded_non_conversion_reward_scale(
     raw_scale: f64,
     non_conversion_points: f64,
@@ -24351,11 +24368,11 @@ fn grounded_non_conversion_reward_scale(
     if !non_conversion_points.is_finite()
         || !conversion_points.is_finite()
         || non_conversion_points <= 0.0
+        || conversion_points <= 0.0
     {
         return 0.0;
     }
-    let max_non_conversion_points =
-        (conversion_points - REWARD_CONVERSION_DOMINANCE_MARGIN_POINTS).max(0.0);
+    let max_non_conversion_points = conversion_points * reward_non_conversion_max_fraction();
     let max_scale = (max_non_conversion_points / non_conversion_points).max(0.0);
     raw_scale.min(max_scale)
 }
