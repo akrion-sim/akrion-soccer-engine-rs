@@ -478,6 +478,25 @@
         <select id="targetPick"></select>
       </div>
       <div class="status" id="status">connecting</div>
+      <div class="section" style="margin-top:10px">Snapshot</div>
+      <div class="kpigrid" id="kpigrid">
+        <div class="kpi"><div class="v accent" id="kpiPoss">–</div><div class="k">Possession</div><div class="sub" id="kpiPossSub">home share</div></div>
+        <div class="kpi"><div class="v" id="kpiPassComp">–</div><div class="k">Pass completion</div><div class="sub" id="kpiPassCompSub">– att</div></div>
+        <div class="kpi"><div class="v" id="kpiConv">–</div><div class="k">Shot conversion</div><div class="sub" id="kpiConvSub">– shots</div></div>
+        <div class="kpi"><div class="v" id="kpiFwd">–</div><div class="k">Forward-pass share</div><div class="sub" id="kpiFwdSub">of completed</div></div>
+      </div>
+      <div class="passmix">
+        <div class="passbar" id="passbar">
+          <div class="seg" id="segFwd" style="flex-grow:1;background:var(--accent)"></div>
+          <div class="seg" id="segLat" style="flex-grow:1;background:var(--muted)"></div>
+          <div class="seg" id="segBack" style="flex-grow:1;background:var(--away)"></div>
+        </div>
+        <div class="passlegend">
+          <span class="sw"><i style="background:var(--accent)"></i>forward <b id="pmFwd">0%</b></span>
+          <span class="sw"><i style="background:var(--muted)"></i>lateral <b id="pmLat">0%</b></span>
+          <span class="sw"><i style="background:var(--away)"></i>backward <b id="pmBack">0%</b></span>
+        </div>
+      </div>
       <div id="controlPad">
         <span style="font-size:11px;color:#9fb3c8">Controlled player:</span>
         <button class="padbtn" id="padUp" title="ArrowUp">↑</button>
