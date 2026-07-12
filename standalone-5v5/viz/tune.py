@@ -67,6 +67,8 @@ SPACE = [
     # it was previously frozen at its default and excluded from the search, silently
     # under-covering the 31-weight reward vector. Now tuned like the rest.
     ("W_CHANCE",       0.12, MIN_WEIGHT,   0.60, False),
+    # loose-ball pursuit — how hard the favorite commits to winning a free ball.
+    ("W_PURSUIT",      0.05, MIN_WEIGHT,   0.25, False),
 ]
 
 ITERS   = int(os.environ.get("TUNE_ITERS", "500"))
