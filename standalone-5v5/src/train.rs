@@ -60,6 +60,9 @@ const EPOCHS: usize = 4;
 const MINIBATCH: usize = 1024;
 const MAX_ROLLOUT_THREADS: usize = 4;
 const MIN_REWARD_WEIGHT: f32 = 0.0001;
+const REWARD_CONVERSION_MARGIN: f32 = 5.0;
+const REW_GOAL_MIN: f32 = 6.0;
+const REW_GOAL_MAX: f32 = 20.0;
 const LINGER_RADIUS: f32 = 4.0; // "same radius": teammates within this many yards
 /// Overlap zone: two players THIS close are occupying the same spot — that is
 /// never "running past each other", so the penalty here is ALWAYS-ON (ungated).
@@ -103,6 +106,27 @@ fn wenv(name: &str, default: f32, lo: f32, hi: f32) -> f32 {
     let raw = std::env::var(name).ok();
     bounded_weight(raw.as_deref(), default, lo, hi)
 }
+
+fn grounded_conversion_ladder(goal: f32, shot_base: f32, shot_q: f32) -> (f32, f32, f32) {
+    let mut goal = goal.clamp(REW_GOAL_MIN, REW_GOAL_MAX);
+    let mut shot_base = shot_base.max(MIN_REWARD_WEIGHT);
+    let mut shot_q = shot_q.max(MIN_REWARD_WEIGHT);
+    let required_goal = shot_base + shot_q + REWARD_CONVERSION_MARGIN;
+
+    if goal < required_goal {
+        goal = required_goal.min(REW_GOAL_MAX);
+    }
+    if goal < shot_base + shot_q + REWARD_CONVERSION_MARGIN {
+        let budget = (goal - REWARD_CONVERSION_MARGIN).max(MIN_REWARD_WEIGHT);
+        let total = (shot_base + shot_q).max(MIN_REWARD_WEIGHT);
+        let scale = (budget / total).clamp(0.0, 1.0);
+        shot_base = (shot_base * scale).max(MIN_REWARD_WEIGHT);
+        shot_q = (shot_q * scale).max(MIN_REWARD_WEIGHT);
+    }
+
+    (goal, shot_base, shot_q)
+}
+
 pub struct Rw {
     pub goal: f32,                 // +goal scored
     pub concede: f32,              // -goal conceded (stored positive, subtracted)
@@ -138,38 +162,45 @@ pub struct Rw {
 }
 fn rw() -> &'static Rw {
     static R: std::sync::OnceLock<Rw> = std::sync::OnceLock::new();
-    R.get_or_init(|| Rw {
-        goal: wenv("REW_GOAL", 12.0, 6.0, 20.0),
-        concede: wenv("REW_CONCEDE", 8.0, 4.0, 16.0),
-        shot_base: wenv("REW_SHOT_BASE", 1.5, 0.3, 3.5),
-        shot_q: wenv("REW_SHOT_Q", 1.0, MIN_REWARD_WEIGHT, 2.5),
-        milestone: wenv("REW_MILESTONE", 0.3, MIN_REWARD_WEIGHT, 1.5),
-        pass_credit: wenv("REW_PASS", 0.06, MIN_REWARD_WEIGHT, 0.4),
-        turnover: wenv("REW_TURNOVER", 0.55, MIN_REWARD_WEIGHT, 1.5),
-        bad_pass_turnover: wenv("REW_BAD_PASS_TURNOVER", 0.35, MIN_REWARD_WEIGHT, 1.5),
-        dribble_turnover: wenv("REW_DRIBBLE_TURNOVER", 0.75, MIN_REWARD_WEIGHT, 2.0),
-        recycle: wenv("REW_RECYCLE", 0.18, MIN_REWARD_WEIGHT, 0.8),
-        return_pass: wenv("REW_RETURN_PASS", 0.35, MIN_REWARD_WEIGHT, 2.0),
-        return_stale: wenv("REW_RETURN_STALE", 0.55, MIN_REWARD_WEIGHT, 2.0),
-        win_ball: wenv("REW_WIN_BALL", 0.3, MIN_REWARD_WEIGHT, 1.2),
-        dribble: wenv("REW_DRIBBLE", 0.015, MIN_REWARD_WEIGHT, 0.12),
-        shape: wenv("W_SHAPE", 2.2, 0.5, 4.0),
-        advance: wenv("W_ADVANCE", 0.04, MIN_REWARD_WEIGHT, 0.12),
-        open: wenv("W_OPEN", 0.04, MIN_REWARD_WEIGHT, 0.12),
-        width: wenv("W_WIDTH", 0.045, MIN_REWARD_WEIGHT, 0.12),
-        flank: wenv("W_FLANK", 0.025, MIN_REWARD_WEIGHT, 0.10),
-        goalside: wenv("W_GOALSIDE", 0.08, MIN_REWARD_WEIGHT, 0.25),
-        goalside_run: wenv("W_GOALSIDE_RUN", 0.04, MIN_REWARD_WEIGHT, 0.16),
-        ahead: wenv("W_AHEAD", 0.035, MIN_REWARD_WEIGHT, 0.16),
-        make_run: wenv("W_MAKE_RUN", 0.06, MIN_REWARD_WEIGHT, 0.20),
-        burst_gear: wenv("W_BURST_GEAR", 0.035, MIN_REWARD_WEIGHT, 0.16),
-        field_pass: wenv("W_FIELD_PASS", 0.08, MIN_REWARD_WEIGHT, 0.30),
-        field_turnover: wenv("W_FIELD_TURNOVER", 0.16, MIN_REWARD_WEIGHT, 0.50),
-        chance: wenv("W_CHANCE", 0.12, MIN_REWARD_WEIGHT, 0.60),
-        field_goalside_delta: wenv("W_FIELD_GOALSIDE_DELTA", 0.10, MIN_REWARD_WEIGHT, 0.35),
-        field_burst_delta: wenv("W_FIELD_BURST_DELTA", 0.08, MIN_REWARD_WEIGHT, 0.35),
-        stand_pen: wenv("W_STAND_PEN", 0.02, MIN_REWARD_WEIGHT, 0.20),
-        pursuit: wenv("W_PURSUIT", 0.05, MIN_REWARD_WEIGHT, 0.25),
+    R.get_or_init(|| {
+        let (goal, shot_base, shot_q) = grounded_conversion_ladder(
+            wenv("REW_GOAL", 12.0, REW_GOAL_MIN, REW_GOAL_MAX),
+            wenv("REW_SHOT_BASE", 1.5, 0.3, 3.5),
+            wenv("REW_SHOT_Q", 1.0, MIN_REWARD_WEIGHT, 2.5),
+        );
+        Rw {
+            goal,
+            concede: wenv("REW_CONCEDE", 8.0, 4.0, 16.0),
+            shot_base,
+            shot_q,
+            milestone: wenv("REW_MILESTONE", 0.3, MIN_REWARD_WEIGHT, 1.5),
+            pass_credit: wenv("REW_PASS", 0.06, MIN_REWARD_WEIGHT, 0.4),
+            turnover: wenv("REW_TURNOVER", 0.55, MIN_REWARD_WEIGHT, 1.5),
+            bad_pass_turnover: wenv("REW_BAD_PASS_TURNOVER", 0.35, MIN_REWARD_WEIGHT, 1.5),
+            dribble_turnover: wenv("REW_DRIBBLE_TURNOVER", 0.75, MIN_REWARD_WEIGHT, 2.0),
+            recycle: wenv("REW_RECYCLE", 0.18, MIN_REWARD_WEIGHT, 0.8),
+            return_pass: wenv("REW_RETURN_PASS", 0.35, MIN_REWARD_WEIGHT, 2.0),
+            return_stale: wenv("REW_RETURN_STALE", 0.55, MIN_REWARD_WEIGHT, 2.0),
+            win_ball: wenv("REW_WIN_BALL", 0.3, MIN_REWARD_WEIGHT, 1.2),
+            dribble: wenv("REW_DRIBBLE", 0.015, MIN_REWARD_WEIGHT, 0.12),
+            shape: wenv("W_SHAPE", 2.2, 0.5, 4.0),
+            advance: wenv("W_ADVANCE", 0.04, MIN_REWARD_WEIGHT, 0.12),
+            open: wenv("W_OPEN", 0.04, MIN_REWARD_WEIGHT, 0.12),
+            width: wenv("W_WIDTH", 0.045, MIN_REWARD_WEIGHT, 0.12),
+            flank: wenv("W_FLANK", 0.025, MIN_REWARD_WEIGHT, 0.10),
+            goalside: wenv("W_GOALSIDE", 0.08, MIN_REWARD_WEIGHT, 0.25),
+            goalside_run: wenv("W_GOALSIDE_RUN", 0.04, MIN_REWARD_WEIGHT, 0.16),
+            ahead: wenv("W_AHEAD", 0.035, MIN_REWARD_WEIGHT, 0.16),
+            make_run: wenv("W_MAKE_RUN", 0.06, MIN_REWARD_WEIGHT, 0.20),
+            burst_gear: wenv("W_BURST_GEAR", 0.035, MIN_REWARD_WEIGHT, 0.16),
+            field_pass: wenv("W_FIELD_PASS", 0.08, MIN_REWARD_WEIGHT, 0.30),
+            field_turnover: wenv("W_FIELD_TURNOVER", 0.16, MIN_REWARD_WEIGHT, 0.50),
+            chance: wenv("W_CHANCE", 0.12, MIN_REWARD_WEIGHT, 0.60),
+            field_goalside_delta: wenv("W_FIELD_GOALSIDE_DELTA", 0.10, MIN_REWARD_WEIGHT, 0.35),
+            field_burst_delta: wenv("W_FIELD_BURST_DELTA", 0.08, MIN_REWARD_WEIGHT, 0.35),
+            stand_pen: wenv("W_STAND_PEN", 0.02, MIN_REWARD_WEIGHT, 0.20),
+            pursuit: wenv("W_PURSUIT", 0.05, MIN_REWARD_WEIGHT, 0.25),
+        }
     })
 }
 // The speed policy is a low-variance REFINEMENT on top of the action policy —
@@ -1402,6 +1433,23 @@ mod tests {
             bounded_weight(None, 0.0, MIN_REWARD_WEIGHT, 2.0),
             MIN_REWARD_WEIGHT
         );
+    }
+
+    #[test]
+    fn conversion_reward_ladder_dominates_non_goal_shots() {
+        let (goal, shot_base, shot_q) = grounded_conversion_ladder(6.0, 3.5, 2.5);
+        assert!(
+            goal + 1e-6 >= shot_base + shot_q + REWARD_CONVERSION_MARGIN,
+            "goal={goal} shot_base={shot_base} shot_q={shot_q}"
+        );
+        assert_eq!(goal, 11.0);
+
+        let (goal, shot_base, shot_q) = grounded_conversion_ladder(6.0, 18.0, 4.0);
+        assert!(
+            goal + 1e-5 >= shot_base + shot_q + REWARD_CONVERSION_MARGIN,
+            "goal={goal} shot_base={shot_base} shot_q={shot_q}"
+        );
+        assert!(goal <= REW_GOAL_MAX);
     }
 
     #[test]

@@ -21,15 +21,14 @@ vector + 48-dim centralized global state (`standalone-5v5/src/game.rs`).
 
 ## Concrete instances (what to make field-vector functions)
 
-1. **Shot reward = xG(field vector).** A field-vector shot value ALREADY EXISTS:
-   `analytic_shot_trigger_value(&ShotTriggerInputs)` (`shot_decision.rs:297`) scores a shot by
-   distance + angle + lane coverage + keeper (tests at `:785–835` confirm close>far, open>covered,
-   clear>blocked). **It is used to DECIDE shots but NOT to scale the shot REWARD.** Wire it:
-   `SHOT_ON_TARGET_REWARD_POINTS * shot_xg(field_vector)` where `shot_xg` = normalized
-   `analytic_shot_trigger_value` (or a learned xG head over the 192-dim vector). This mirrors the
+1. **Shot reward = xG(field vector).** A field-vector shot value now scales the shot-chain reward:
+   `shot_reward_distance_scale` routes through `field_vector_shot_xg_scale` when
+   `DD_SOCCER_ENABLE_FIELD_VECTOR_SHOT_REWARD` is on, pricing distance, angle, lane blockers,
+   pressure, and keeper position from the live 22-player field vector. This mirrors the
    5-a-side win: reward `= (base + q·placement) · xg`, `xg = dist_f²·(0.4+0.6·angle_f)` — a
    long/wide/covered pot-shot pays ~0, a real chance pays full. It also guards a widened shot
-   zone from long-shot farming.
+   zone from long-shot farming. The tunable shot scales are additionally grounded so a
+   non-converting shot must remain at least 5 reward points below the relevant conversion reward.
 
 2. **Pass reward = f(field vector).** Receiver openness, lane-interception risk, anticipated
    reception point, forward EPV delta — all functions of the field vector. Partly present
@@ -55,10 +54,10 @@ Same recipe here: field-vector reward functions + `SOCCER_DYNAMIC_REWARD_WEIGHTS
 GATED goal-diff.
 
 ## Status / next
-- Field-vector shot value exists (`analytic_shot_trigger_value`); **TODO: scale the shot reward by
-  it** (small, gated change — mirror the 5-a-side xG).
-- Dynamic-reward vector now spans shooting/dribbling/goal/dense (r25). Next: make the *shot* and
-  *pass* scales **field-vector-modulated**, not just scalar multipliers.
+- Field-vector shot reward is live in the 11-a-side chain credit path and default-on in the league
+  trainer (`DD_SOCCER_ENABLE_FIELD_VECTOR_SHOT_REWARD=1`).
+- Dynamic-reward vector now spans shooting/dribbling/goal/dense (r25). Next: keep moving the
+  remaining *pass/support* scales from scalar multipliers toward field-vector modulation.
 - 5-a-side reference impl pushed: `origin/wip-player-speeds`, `origin/five-a-side-standalone`.
 
 ## Baseline + clamps (learnable-reward hygiene)

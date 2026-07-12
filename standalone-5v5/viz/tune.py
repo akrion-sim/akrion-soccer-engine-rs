@@ -25,6 +25,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 BIN = os.path.join(ROOT, "target", "release", "fiveaside")
 MIN_WEIGHT = 0.0001
+CONVERSION_REWARD_MARGIN = 5.0
 
 
 def env_int(name, default, lo=None, hi=None):
@@ -165,6 +166,55 @@ def denorm(nvec):
     return out
 
 
+def clamp_space_value(index, value):
+    _, _, lo, hi, _ = SPACE[index]
+    lo, hi = max(MIN_WEIGHT, lo), max(max(MIN_WEIGHT, lo), hi)
+    return min(hi, max(lo, value))
+
+
+def ground_reward_vector(vec):
+    """Project a candidate onto the same reward ladder enforced by the binary.
+
+    The optimizer may tune shot and goal weights, but it may not discover a local
+    optimum where a non-converting shot is worth as much as scoring.
+    """
+    out = list(vec)
+    idx = {name: i for i, (name, *_rest) in enumerate(SPACE)}
+    goal_i = idx["REW_GOAL"]
+    shot_base_i = idx["REW_SHOT_BASE"]
+    shot_q_i = idx["REW_SHOT_Q"]
+
+    for i in (goal_i, shot_base_i, shot_q_i):
+        out[i] = clamp_space_value(i, out[i])
+
+    required_goal = out[shot_base_i] + out[shot_q_i] + CONVERSION_REWARD_MARGIN
+    out[goal_i] = clamp_space_value(goal_i, max(out[goal_i], required_goal))
+    if out[goal_i] + 1e-12 >= required_goal:
+        return out
+
+    budget = max(
+        MIN_WEIGHT,
+        out[goal_i] - CONVERSION_REWARD_MARGIN,
+    )
+    base_min = max(MIN_WEIGHT, SPACE[shot_base_i][2])
+    q_min = max(MIN_WEIGHT, SPACE[shot_q_i][2])
+    variable_budget = max(0.0, budget - base_min - q_min)
+    base_extra = max(0.0, out[shot_base_i] - base_min)
+    q_extra = max(0.0, out[shot_q_i] - q_min)
+    extra_total = base_extra + q_extra
+    if extra_total > 0.0:
+        scale = min(1.0, variable_budget / extra_total)
+        out[shot_base_i] = base_min + base_extra * scale
+        out[shot_q_i] = q_min + q_extra * scale
+    else:
+        out[shot_base_i] = base_min
+        out[shot_q_i] = q_min
+
+    out[shot_base_i] = clamp_space_value(shot_base_i, out[shot_base_i])
+    out[shot_q_i] = clamp_space_value(shot_q_i, out[shot_q_i])
+    return out
+
+
 def parse(stdout):
     fm = FINAL_RE.search(stdout)
     gm = None
@@ -183,6 +233,7 @@ def parse(stdout):
 
 
 def run_one(vec, seed):
+    vec = ground_reward_vector(vec)
     env = dict(os.environ)
     env.update(FIXED)
     for (name, *_), v in zip(SPACE, vec):
@@ -228,6 +279,7 @@ def eval_pool(vectors):
     write() forever and wedge the whole sweep. A file sink can't deadlock. Each
     child also gets a hard deadline (TIMEOUT) and is killed + scored as a failure
     if it overruns, so one hung run can't stall a multi-hour search."""
+    vectors = [ground_reward_vector(vec) for vec in vectors]
     jobs = [(ci, si, vectors[ci], s) for ci in range(len(vectors)) for si, s in enumerate(SEEDS)]
     results = {}  # (ci, si) -> metrics
     running = {}  # proc -> (ci, si, logpath, logfile, deadline)
@@ -317,7 +369,8 @@ def main():
         for _ in range(POP - 1):
             cands_n.append([min(1.0, max(0.0, mean[i] + sigma[i] * RNG.gauss(0, 1)))
                             for i in range(len(SPACE))])
-        cands = [denorm(n) for n in cands_n]
+        cands = [ground_reward_vector(denorm(n)) for n in cands_n]
+        cands_n = [norm(c) for c in cands]
         fits = eval_pool(cands)
         ranked = sorted(range(len(cands)), key=lambda i: fits[i][0], reverse=True)
         with open(LOG, "a", newline="") as f:
