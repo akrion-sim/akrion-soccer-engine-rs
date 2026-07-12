@@ -43214,26 +43214,36 @@ mod soccer_policy_actor_capacity_tests {
 
     #[test]
     fn non_conversion_reward_scales_stay_below_conversion_reward() {
+        let _lock = env_lock();
+        let _frac = set_test_env_var("DD_SOCCER_REWARD_NON_CONVERSION_MAX_FRACTION", "0.40");
+        let frac = 0.40_f64;
+
+        // A missed on-target shot is capped at a PROPORTIONAL fraction of a goal (here 40%), by a
+        // wide margin -- not a token fixed few points that vanishes once the goal reward is scaled up.
         let terminal_shot_scale =
             grounded_non_conversion_reward_scale(8.0, SHOT_ON_TARGET_REWARD_POINTS, 100.0);
         assert!(
-            terminal_shot_scale * SHOT_ON_TARGET_REWARD_POINTS
-                + REWARD_CONVERSION_DOMINANCE_MARGIN_POINTS
-                <= 100.0 + 1e-9
+            terminal_shot_scale * SHOT_ON_TARGET_REWARD_POINTS <= frac * 100.0 + 1e-9,
+            "non-conversion points must stay <= fraction * conversion reward"
         );
-        assert!((terminal_shot_scale - 1.1875).abs() < 1e-9);
+        assert!(
+            (terminal_shot_scale - frac * 100.0 / SHOT_ON_TARGET_REWARD_POINTS).abs() < 1e-9
+        );
 
+        // Proportional: raising the goal reward raises the allowed non-conversion ceiling in step,
+        // so "shot < goal by a meaningful margin" holds at any magnitude (not just near 100).
         let chain_shot_scale = grounded_non_conversion_reward_scale(
             8.0,
             SHOT_ON_TARGET_REWARD_POINTS,
             GOAL_REWARD_POINTS,
         );
         assert!(
-            chain_shot_scale * SHOT_ON_TARGET_REWARD_POINTS
-                + REWARD_CONVERSION_DOMINANCE_MARGIN_POINTS
-                <= GOAL_REWARD_POINTS + 1e-9
+            chain_shot_scale * SHOT_ON_TARGET_REWARD_POINTS <= frac * GOAL_REWARD_POINTS + 1e-9
         );
-        assert!((chain_shot_scale - 1.9375).abs() < 1e-9);
+        assert!(
+            (chain_shot_scale - frac * GOAL_REWARD_POINTS / SHOT_ON_TARGET_REWARD_POINTS).abs()
+                < 1e-9
+        );
         assert_eq!(
             grounded_non_conversion_reward_scale(0.0, SHOT_ON_TARGET_REWARD_POINTS, 100.0),
             0.0
