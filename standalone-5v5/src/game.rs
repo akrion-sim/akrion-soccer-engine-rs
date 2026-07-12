@@ -330,9 +330,11 @@ impl World {
         for i in 0..N {
             self.a[i].pos = V2::new(xs[i] * FIELD_L, ys[i] * FIELD_W);
             self.a[i].vel = V2::default();
+            self.a[i].des_vel = V2::default();
             // Mirror for B (attacks -x): x' = L - x.
             self.b[i].pos = V2::new(FIELD_L - xs[i] * FIELD_L, ys[i] * FIELD_W);
             self.b[i].vel = V2::default();
+            self.b[i].des_vel = V2::default();
         }
         self.ball = V2::new(FIELD_L / 2.0, FIELD_W / 2.0);
         self.ball_vel = V2::default();
