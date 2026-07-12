@@ -27437,6 +27437,17 @@ fn soccer_transition_reward_with_tactics(
         reward -= concede_penalty * goal_reward_scale();
     }
 
+    // FINISHING ANCHOR (operator 2026-07-12): a high, hardcoded reward for putting a shot ON GOAL
+    // (on-frame), paid HERE in the sparse/terminal layer (outside the +/-4 dense clamp) so it pulls
+    // toward finishing with terminal-scale force — the counterpart to the goal reward that was
+    // effectively MISSING (live on-frame-shot signal ~1-3 pts vs a ~800 goal; the 80-pt "shot on
+    // target" was telemetry-inert). Gated (default 0 = byte-identical off).
+    let on_frame_shot_w = on_frame_shot_reward_scale();
+    if on_frame_shot_w > MIN_SOCCER_REWARD_WEIGHT && soccer_label_is_shot(action) {
+        let on_frame = decision.observation.shot_on_frame_probability.clamp(0.0, 1.0);
+        reward += on_frame_shot_w * SHOT_ON_TARGET_REWARD_POINTS * on_frame;
+    }
+
     if is_pass_like_action(action) {
         if let Some(receiver_player) = completed_same_team_pass_receiver(player, after) {
             let target = after
