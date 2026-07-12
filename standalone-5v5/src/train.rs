@@ -879,6 +879,24 @@ fn noisy_scripted_actions(w: &World, team: Team, noise: f32, rng: &mut Rng) -> [
     acts
 }
 
+/// Team-B actions from a frozen self-play champion (keeper held, like the
+/// challenger's keeper). A small epsilon of legal exploration keeps the opposition
+/// varied so the challenger doesn't overfit one deterministic champion line.
+fn champion_actions(champ: &Policy, w: &World, noise: f32, rng: &mut Rng) -> [usize; N] {
+    let mut acts = [A_STAY; N];
+    for i in 1..N {
+        if noise > 0.0 && rng.f01() < noise {
+            let mask = w.legal_mask(Team::B, i);
+            let a = sample_legal_action(&mask, rng);
+            let gear = w.coerce_speed_gear(Team::B, i, a, scripted_gear(a));
+            acts[i] = a + gear * NA;
+        } else {
+            acts[i] = champ.act_greedy_world(w, Team::B, i);
+        }
+    }
+    acts
+}
+
 fn sample_legal_action(mask: &[bool; NA], rng: &mut Rng) -> usize {
     let n = mask.iter().filter(|&&ok| ok).count();
     if n == 0 {
