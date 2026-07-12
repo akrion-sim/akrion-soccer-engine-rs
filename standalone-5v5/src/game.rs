@@ -517,19 +517,34 @@ impl World {
         if self.owner.is_some() {
             return 0.0;
         }
-        let me = players(team, self)[idx].pos;
+        let mine = players(team, self);
+        let me = mine[idx].pos;
         let my_eta = me.sub(self.intercept_point(me)).len() / PLAYER_SPEED.max(1e-3);
+        // The player only WINS the ball if it beats every OTHER pursuer to it — so
+        // race against the fastest other player, TEAMMATES included, not just
+        // opponents. That way only the genuine favourite (quickest overall) believes
+        // it wins, and slower teammates hold shape instead of all crashing the ball;
+        // it also correctly deflates when an opponent is quicker (P someone else wins).
+        let mut best_other_eta = f32::INFINITY;
+        for k in 0..N {
+            if k != idx {
+                let tp = mine[k].pos;
+                let eta = tp.sub(self.intercept_point(tp)).len() / PLAYER_SPEED.max(1e-3);
+                if eta < best_other_eta {
+                    best_other_eta = eta;
+                }
+            }
+        }
         let opp = players(team.other(), self);
-        let mut opp_eta = f32::INFINITY;
         for k in 0..N {
             let op = opp[k].pos;
             let eta = op.sub(self.intercept_point(op)).len() / PLAYER_SPEED.max(1e-3);
-            if eta < opp_eta {
-                opp_eta = eta;
+            if eta < best_other_eta {
+                best_other_eta = eta;
             }
         }
-        // favorite when I arrive clearly sooner; smooth ~0.6s window around parity.
-        (0.5 + 0.5 * ((opp_eta - my_eta) / 0.6).clamp(-1.0, 1.0)).clamp(0.0, 1.0)
+        // favorite when I arrive clearly sooner than the fastest other; smooth ~0.6s window.
+        (0.5 + 0.5 * ((best_other_eta - my_eta) / 0.6).clamp(-1.0, 1.0)).clamp(0.0, 1.0)
     }
 
     /// Classify a Team-A dribble by the FINAL (post-shielding) direction, so the

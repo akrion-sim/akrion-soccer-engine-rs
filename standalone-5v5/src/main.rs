@@ -99,6 +99,7 @@ fn run() -> AppResult<()> {
             let seed: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(7);
             let mut out_dir = PathBuf::from("out");
             let mut out_path: Option<PathBuf> = None;
+            let mut opponent: Option<PathBuf> = None;
             let mut i = 3;
             while i < args.len() {
                 let flag = args[i].as_str();
@@ -108,12 +109,13 @@ fn run() -> AppResult<()> {
                 match flag {
                     "--out-dir" => out_dir = PathBuf::from(val),
                     "--out" => out_path = Some(PathBuf::from(val)),
+                    "--opponent" => opponent = Some(PathBuf::from(val)), // Team B = this champion dir
                     other => return Err(format!("unknown option for play: {other}").into()),
                 }
                 i += 2;
             }
             let out_path = out_path.unwrap_or_else(|| out_dir.join("match_live.json"));
-            play(seed, &out_dir, &out_path)?;
+            play(seed, &out_dir, &out_path, opponent.as_deref())?;
         }
         "help" | "--help" | "-h" => print_usage(),
         other => return Err(format!("unknown command: {other}; run with --help for usage").into()),
@@ -233,22 +235,59 @@ fn env_f32_clamped(name: &str, default: f32, min: f32, max: f32) -> f32 {
 /// with the given seed to `out_path` — powers the live "New Game" button, which
 /// the live server (viz/serve_live.py) invokes per click with a random seed.
 ///   cargo run --release -- play [seed] [--out-dir DIR] [--out PATH]
-fn play(seed: u64, out_dir: &Path, out_path: &Path) -> AppResult<()> {
-    let actor = nn::Mlp::load(&out_dir.join("actor.txt"))
-        .map_err(|e| format!("no trained policy in {}: {e}", out_dir.display()))?;
-    let critic = nn::Mlp::load(&out_dir.join("critic.txt"))
-        .map_err(|e| format!("failed to load critic: {e}"))?;
-    let speedor = nn::Mlp::load(&out_dir.join("speedor.txt"))
-        .map_err(|e| format!("failed to load speedor: {e}"))?;
+fn load_policy(dir: &Path) -> AppResult<train::Policy> {
+    let actor = nn::Mlp::load(&dir.join("actor.txt"))
+        .map_err(|e| format!("no policy (actor.txt) in {}: {e}", dir.display()))?;
+    let critic = nn::Mlp::load(&dir.join("critic.txt"))
+        .map_err(|e| format!("failed to load critic in {}: {e}", dir.display()))?;
+    let speedor = nn::Mlp::load(&dir.join("speedor.txt"))
+        .map_err(|e| format!("failed to load speedor in {}: {e}", dir.display()))?;
     if actor.in_dim() != OBS_DIM || actor.out_dim() != NA {
-        return Err("actor shape mismatch; retrain the policy".into());
+        return Err(format!(
+            "actor shape mismatch in {}: expected input {} / actions {}, got input {} / actions {}; retrain the policy",
+            dir.display(),
+            OBS_DIM,
+            NA,
+            actor.in_dim(),
+            actor.out_dim()
+        )
+        .into());
     }
-    let policy = train::Policy {
+    if speedor.in_dim() != OBS_DIM || speedor.out_dim() != NS {
+        return Err(format!(
+            "speedor shape mismatch in {}: expected input {} / speeds {}, got input {} / speeds {}; retrain the policy",
+            dir.display(),
+            OBS_DIM,
+            NS,
+            speedor.in_dim(),
+            speedor.out_dim()
+        )
+        .into());
+    }
+    if critic.in_dim() != GLOBAL_DIM || critic.out_dim() != 1 {
+        return Err(format!(
+            "critic shape mismatch in {}: expected input {} / output 1, got input {} / output {}; retrain the policy",
+            dir.display(),
+            GLOBAL_DIM,
+            critic.in_dim(),
+            critic.out_dim()
+        )
+        .into());
+    }
+    Ok(train::Policy {
         actor,
         speedor,
         critic,
+    })
+}
+
+fn play(seed: u64, out_dir: &Path, out_path: &Path, opponent_dir: Option<&Path>) -> AppResult<()> {
+    let policy = load_policy(out_dir)?;
+    let opponent = match opponent_dir {
+        Some(d) => Some(load_policy(d)?), // champion-vs-champion self-play match
+        None => None,                     // vs scripted baseline
     };
-    record_match(&policy, &mut Rng::new(seed), out_path)?;
+    record_match_vs(&policy, opponent.as_ref(), &mut Rng::new(seed), out_path)?;
     println!("wrote {}", out_path.display());
     Ok(())
 }
@@ -947,6 +986,17 @@ fn game_stats(policy: &train::Policy, seed: u64) -> (u32, u32, u32, u32) {
 /// Play one greedy game and dump per-tick positions to a compact JSON for the
 /// HTML viewer. Hand-rolled JSON — no serde, keeping the crate dependency-free.
 fn record_match(policy: &train::Policy, rng: &mut Rng, path: &Path) -> AppResult<()> {
+    record_match_vs(policy, None, rng, path)
+}
+
+/// As [`record_match`], but Team B is driven by `opponent` (a learned champion) when
+/// provided, else the scripted baseline — powers champion-vs-champion self-play viz.
+fn record_match_vs(
+    policy: &train::Policy,
+    opponent: Option<&train::Policy>,
+    rng: &mut Rng,
+    path: &Path,
+) -> AppResult<()> {
     let mut w = World::new();
     let mut frames = String::new();
     frames.push('[');
@@ -958,7 +1008,16 @@ fn record_match(policy: &train::Policy, rng: &mut Rng, path: &Path) -> AppResult
         for i in 1..N {
             act_a[i] = policy.act_greedy_world(&w, Team::A, i);
         }
-        let act_b = w.scripted_actions(Team::B);
+        let act_b = match opponent {
+            Some(opp) => {
+                let mut b = [A_STAY; N];
+                for i in 1..N {
+                    b[i] = opp.act_greedy_world(&w, Team::B, i);
+                }
+                b
+            }
+            None => w.scripted_actions(Team::B),
+        };
         w.step(&act_a, &act_b, rng);
 
         let (owner_code, owner_team, owner_idx) = match w.owner {
