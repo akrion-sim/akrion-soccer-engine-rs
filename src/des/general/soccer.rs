@@ -28975,7 +28975,8 @@ fn loose_ball_contest_pressure_reward(
         let secured = if won_as_holder { 1.0 } else { 0.4 };
         reward += reward_cfg.loose_ball_win_points * urgency_bonus * secured;
     }
-    reward
+    // Amplify pursuit so the favourite commits to a winnable loose ball and none sits loose too long.
+    reward * loose_ball_pursuit_scale()
 }
 
 #[cfg(test)]
