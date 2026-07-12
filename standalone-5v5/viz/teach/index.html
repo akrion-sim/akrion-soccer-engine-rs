@@ -429,14 +429,29 @@
 
   <!-- ═══════════════ 6. MPC / QP ═══════════════ -->
   <section id="mpc">
-    <div class="eyebrow"><span class="n">06</span> execution · model-predictive control &amp; the quadratic program</div>
+    <div class="eyebrow"><span class="n">06</span> execution · model-predictive control — enumerate, QP, <span class="hlV">or neural</span></div>
     <h2>Aim the finish: a tiny optimizer at the last moment.</h2>
     <p class="p">Learning chooses <i>to shoot</i>; a small <b>model-predictive controller</b> chooses <i>where</i>.
       It predicts the near future — the keeper's reach, defenders in the lane — and optimizes one objective over
       the goal mouth: <span class="hl">keeper_gap + 3·lane_clear</span>, i.e. "shoot to the open corner farthest
-      from the keeper." It scores <b>7 aim points</b> and takes the best. That objective is a smooth curve in the
-      aim coordinate — exactly the shape a <span class="hlV">quadratic program</span> solves continuously.
-      Drag the keeper and watch the optimal corner flip.</p>
+      from the keeper." <b>MPC is just "optimize an objective over a short horizon" — and there's more than one
+      way to solve it.</b> This demo <b>enumerates 7 aim points</b>; a <span class="hlV">quadratic program</span>
+      would solve the smooth part continuously; and a <span class="hlV">neural net</span> can be <i>trained</i> to
+      predict the optimum directly (<b>neural MPC</b> — the same idea the value critic uses, applied to control).
+      All three chase the same curve below. Drag the keeper and watch the optimal corner flip.</p>
+    <div class="grid3" style="margin:6px 0 16px">
+      <div class="card" style="padding:13px"><span class="tag" style="border-color:var(--gold);color:var(--gold)">this demo</span>
+        <h3 style="margin:8px 0 4px">Enumerate</h3><p class="note">Score a handful of candidates and take the max.
+        Dead simple, robust to a bumpy objective, no solver needed. What the finisher actually does.</p></div>
+      <div class="card" style="padding:13px"><span class="tag" style="border-color:var(--violet);color:var(--violet)">classical</span>
+        <h3 style="margin:8px 0 4px">Quadratic program</h3><p class="note">If the objective is a convex quadratic
+        with linear limits (stay inside the posts), a QP finds the exact optimum in one continuous solve. The
+        11-a-side engine's multi-player MPC <i>is</i> a real QP.</p></div>
+      <div class="card" style="padding:13px"><span class="tag" style="border-color:var(--accent);color:var(--accent)">learned</span>
+        <h3 style="margin:8px 0 4px">Neural MPC</h3><p class="note">Train a network to <i>output</i> the optimizer's
+        answer from the state — amortizing the solve into a single fast forward pass. The comment in the code:
+        "a QP/<b>neural</b> MPC can replace the enumerator" as long as it optimizes this same shape.</p></div>
+    </div>
     <div class="grid2">
       <div class="card pad0">
         <div class="rowtop"><h3 style="margin:0">The shot</h3><span class="note">7 candidate aim points on the mouth</span></div>
