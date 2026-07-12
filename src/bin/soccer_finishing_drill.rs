@@ -1,19 +1,26 @@
-//! Finishing training ground.
+//! Attacking training ground — two modes densify a signal that is <1% of match actions and feed
+//! it to the HOME neural learner. The per-action reward stack (goal / on-target / shot-objective)
+//! fires automatically inside `run_time_step`; this harness writes NO reward code. Output is a
+//! `learned-params.json` in the league trainer's `write_frontier` schema, loadable as a warm start.
 //!
-//! Spawns the HOME neural learner into short, dense 1‑v‑keeper shooting scenarios
-//! and trains it to CONVERT. In a full match, shots/goals are <1% of actions, so the
-//! finishing gradient is starved; here every episode is a shooting chance, densifying
-//! that signal. The per‑shot reward stack (goal + on‑target + shot‑objective grades)
-//! fires automatically inside `run_time_step` and feeds the learner — this harness
-//! writes NO reward code. Output is a `learned-params.json` in the exact schema the
-//! league trainer's `write_frontier` uses, so it loads directly as a warm start.
+//!   DRILL_MODE=finishing (default): dense 1-v-keeper box chances; trains CONVERSION. Empirically
+//!     this sits at a near-parity ceiling — the net's shot EXECUTION is ≤ analytic (a paired
+//!     McNemar eval shows trained ≈/< a fresh net). Finishing is capped; hence:
+//!   DRILL_MODE=creation: a realistic final-third attack (ball 22-40yd out, defensive block +
+//!     keeper, support runners). The value is whether the possession MANUFACTURES a high-xG shot
+//!     from open play. Execution levers stay at engine default (analytic shoots); the net learns
+//!     MOVEMENT + PASSING. Warm-starts from a real full-game league frontier by default (fine-tune,
+//!     never scratch-train a narrow distribution — that is what narrowed the finishing net).
 //!
 //! Run:   soccer_finishing_drill [episodes=300]
-//! Env:   DRILL_WARMSTART  path to a learned-params.json to resume from (optional)
-//!        DRILL_OUT        output path (default /tmp/finishing-drill/learned-params.json)
+//! Env:   DRILL_MODE       finishing (default) | creation
+//!        DRILL_WARMSTART  learned-params.json to resume from (creation defaults to a league net)
+//!        DRILL_OUT        output path (default /tmp/{finishing,creation}-drill/learned-params.json)
 //!        DRILL_SEED       u32 base seed (default 0xF111D000)
-//!        DRILL_DEFENDERS  extra Away outfield defenders between shooter and goal (0-2, default 0)
-//!        DRILL_MAX_TICKS  max ticks per episode (default 80 = 8s at dt=0.1)
+//!        DRILL_DEFENDERS  Away defenders between ball and goal (finishing default 0, creation 3)
+//!        DRILL_MAX_TICKS  max ticks per episode (finishing 80, creation 130)
+//!        DRILL_EVAL       held-out paired-eval episodes (default 200; 0 disables)
+//!        DRILL_FREEZE     control arm: serve the net but take no gradient steps
 //!        DRILL_LAMBDA / DRILL_WARMUP / DRILL_ACTOR_CRITIC  optional neural-blend overrides
 //!
 //! IMPORTANT geometry note: in this engine `Team::goal_y()` returns the goal a team
