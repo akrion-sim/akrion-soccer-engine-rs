@@ -347,9 +347,9 @@ fn main() {
                 block_goals,
                 BLOCK,
                 cum,
+                steps,
                 loss.map(|l| format!("{l:.4}")).unwrap_or_else(|| "n/a".into()),
             );
-            let _ = steps;
             block_goals = 0;
         }
     }
