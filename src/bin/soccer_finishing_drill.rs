@@ -641,10 +641,17 @@ fn main() {
         let late = mean(&primary_blocks[half..]);
         let delta = late - early;
         let half_eps = (half.max(1) * BLOCK) as f64;
-        let p = ((early + late) / 2.0).clamp(1e-3, 1.0 - 1e-3);
-        let se_delta = (p * (1.0 - p) / half_eps).sqrt() * std::f64::consts::SQRT_2;
+        let m = (early + late) / 2.0;
+        // Finishing goal-rate is a binomial fraction; creation SOT/ep is a per-episode count (≈Poisson,
+        // var≈mean). Use the appropriate per-half variance, then combine the two halves.
+        let se_half = if creation {
+            (m.max(1e-3) / half_eps).sqrt()
+        } else {
+            (m.clamp(1e-3, 1.0 - 1e-3) * (1.0 - m.clamp(1e-3, 1.0 - 1e-3)) / half_eps).sqrt()
+        };
+        let se_delta = se_half * std::f64::consts::SQRT_2;
         let (label, metric) = if creation {
-            ("CREATION", "hiXG-frac")
+            ("CREATION", "sot/ep")
         } else {
             ("CONVERSION", "goal-rate")
         };
