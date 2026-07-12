@@ -6383,6 +6383,24 @@ if (playbackSpeedSelect) {
 }
 initializeAuthTokenFromLocation();
 bootLivePage().catch(e => statusEl.textContent = e.message);
+
+// ---- theme toggle (light / dark, persisted) ----
+(function () {
+  const btn = document.getElementById("themeToggle");
+  const KEY = "soccerLiveTheme";
+  const root = document.documentElement;
+  function apply(t) { if (t) root.setAttribute("data-theme", t); else root.removeAttribute("data-theme"); }
+  let cur = null;
+  try { cur = localStorage.getItem(KEY); } catch (_) {}
+  if (cur) apply(cur);
+  if (btn) btn.addEventListener("click", () => {
+    const isDark = cur ? cur === "dark"
+      : !window.matchMedia("(prefers-color-scheme: light)").matches;   // default :root is dark
+    cur = isDark ? "light" : "dark";
+    apply(cur);
+    try { localStorage.setItem(KEY, cur); } catch (_) {}
+  });
+})();
 </script>
 </body>
 </html>
