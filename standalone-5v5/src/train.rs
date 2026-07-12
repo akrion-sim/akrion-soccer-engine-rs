@@ -1440,18 +1440,25 @@ mod tests {
 
     #[test]
     fn conversion_reward_ladder_dominates_non_goal_shots() {
-        let (goal, shot_base, shot_q) = grounded_conversion_ladder(6.0, 3.5, 2.5);
-        assert!(
-            goal + 1e-6 >= shot_base + shot_q + REWARD_CONVERSION_MARGIN,
-            "goal={goal} shot_base={shot_base} shot_q={shot_q}"
-        );
-        assert_eq!(goal, 11.0);
+        let frac = REWARD_NON_CONVERSION_MAX_FRACTION;
 
+        // Shots already under fraction*goal pass through untouched and stay well below the goal.
+        let (goal, shot_base, shot_q) = grounded_conversion_ladder(12.0, 1.5, 1.0);
+        assert!(
+            shot_base + shot_q <= goal * frac + 1e-5,
+            "goal={goal} shots={}",
+            shot_base + shot_q
+        );
+        assert_eq!((goal, shot_base, shot_q), (12.0, 1.5, 1.0));
+
+        // Oversized shot shaping is scaled DOWN to fit under fraction*goal; the goal stays the reference.
         let (goal, shot_base, shot_q) = grounded_conversion_ladder(6.0, 18.0, 4.0);
         assert!(
-            goal + 1e-5 >= shot_base + shot_q + REWARD_CONVERSION_MARGIN,
-            "goal={goal} shot_base={shot_base} shot_q={shot_q}"
+            shot_base + shot_q <= goal * frac + 1e-5,
+            "goal={goal} shots={}",
+            shot_base + shot_q
         );
+        assert_eq!(goal, 6.0);
         assert!(goal <= REW_GOAL_MAX);
     }
 
