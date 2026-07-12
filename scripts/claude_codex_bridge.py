@@ -31,6 +31,8 @@ from urllib.parse import parse_qs, urlparse
 DEFAULT_INBOX = Path("/tmp/codex_claude_inbox.jsonl")
 DEFAULT_OUTBOX = Path("/tmp/codex_claude_outbox.jsonl")
 DEFAULT_TOKEN_FILE = Path("/tmp/codex_claude_bridge_token")
+DEFAULT_MAX_BODY_BYTES = 1_048_576
+DEFAULT_MAX_MESSAGES = 1_000
 
 
 @dataclass(frozen=True)
@@ -42,10 +44,19 @@ class BridgeConfig:
     outbox: Path
     token: str
     token_source: str
+    max_body_bytes: int
+    max_messages: int
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
 
 
 def load_or_create_token(token_file: Path) -> tuple[str, str]:
@@ -74,9 +85,17 @@ def json_response(handler: BaseHTTPRequestHandler, status: HTTPStatus, payload: 
     handler.wfile.write(body)
 
 
-def read_jsonl(path: Path, since: int) -> tuple[list[dict[str, Any]], int]:
+def safe_record_id(record: dict[str, Any]) -> int:
+    try:
+        return max(0, int(record.get("id", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def read_jsonl(path: Path, since: int, limit: int) -> tuple[list[dict[str, Any]], int]:
     messages: list[dict[str, Any]] = []
     max_id = 0
+    next_id = since
     if not path.exists():
         return messages, max_id
 
@@ -91,13 +110,18 @@ def read_jsonl(path: Path, since: int) -> tuple[list[dict[str, Any]], int]:
                     record = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                record_id = int(record.get("id", 0) or 0)
+                if not isinstance(record, dict):
+                    continue
+                record_id = safe_record_id(record)
                 max_id = max(max_id, record_id)
                 if record_id > since:
                     messages.append(record)
+                    next_id = record_id
+                    if len(messages) >= limit:
+                        break
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-    return messages, max_id
+    return messages, next_id if messages else max_id
 
 
 def append_jsonl(path: Path, payload: dict[str, Any], route: str, role: str) -> dict[str, Any]:
@@ -115,7 +139,9 @@ def append_jsonl(path: Path, payload: dict[str, Any], route: str, role: str) -> 
                     record = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                max_id = max(max_id, int(record.get("id", 0) or 0))
+                if not isinstance(record, dict):
+                    continue
+                max_id = max(max_id, safe_record_id(record))
 
             record = dict(payload)
             record["id"] = max_id + 1
@@ -157,14 +183,20 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
         query = parse_qs(parsed.query)
         since_raw = query.get("since", ["0"])[0]
+        limit_raw = query.get("limit", [str(self.config.max_messages)])[0]
         try:
             since = max(0, int(since_raw))
         except ValueError:
             json_response(self, HTTPStatus.BAD_REQUEST, {"error": "since must be an integer"})
             return
+        try:
+            limit = max(1, min(self.config.max_messages, int(limit_raw)))
+        except ValueError:
+            json_response(self, HTTPStatus.BAD_REQUEST, {"error": "limit must be an integer"})
+            return
 
         path = self.path_for_route(route)
-        messages, next_id = read_jsonl(path, since)
+        messages, next_id = read_jsonl(path, since, limit)
         json_response(
             self,
             HTTPStatus.OK,
@@ -173,6 +205,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 "next_id": next_id,
                 "path": str(path),
                 "route": route,
+                "limit": limit,
             },
         )
 
@@ -187,7 +220,21 @@ class BridgeHandler(BaseHTTPRequestHandler):
         if not self.authorized():
             return
 
-        length = int(self.headers.get("Content-Length", "0") or 0)
+        try:
+            length = int(self.headers.get("Content-Length", "0") or 0)
+        except ValueError:
+            json_response(self, HTTPStatus.BAD_REQUEST, {"error": "Content-Length must be an integer"})
+            return
+        if length < 0:
+            json_response(self, HTTPStatus.BAD_REQUEST, {"error": "Content-Length must be non-negative"})
+            return
+        if length > self.config.max_body_bytes:
+            json_response(
+                self,
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                {"error": "request body too large", "max_body_bytes": self.config.max_body_bytes},
+            )
+            return
         body = self.rfile.read(length)
         try:
             payload = json.loads(body.decode("utf-8") if body else "{}")
@@ -216,6 +263,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 "routes": ["/health", "/messages", "/outbox", "/codex", "/claude"],
                 "inbox": str(self.config.inbox),
                 "outbox": str(self.config.outbox),
+                "max_body_bytes": self.config.max_body_bytes,
+                "max_messages": self.config.max_messages,
             },
         )
 
@@ -242,7 +291,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the Claude/Codex JSONL LAN bridge.")
     parser.add_argument("--host", default=os.environ.get("CODEX_CLAUDE_BRIDGE_HOST", "0.0.0.0"))
-    parser.add_argument("--port", type=int, default=int(os.environ.get("CODEX_CLAUDE_BRIDGE_PORT", "8765")))
+    parser.add_argument("--port", type=int, default=env_int("CODEX_CLAUDE_BRIDGE_PORT", 8765))
     parser.add_argument("--role", default=os.environ.get("CODEX_CLAUDE_BRIDGE_ROLE", "codex"))
     parser.add_argument("--inbox", type=Path, default=Path(os.environ.get("CODEX_CLAUDE_INBOX", DEFAULT_INBOX)))
     parser.add_argument("--outbox", type=Path, default=Path(os.environ.get("CODEX_CLAUDE_OUTBOX", DEFAULT_OUTBOX)))
@@ -251,8 +300,22 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path(os.environ.get("CODEX_CLAUDE_BRIDGE_TOKEN_FILE", DEFAULT_TOKEN_FILE)),
     )
+    parser.add_argument(
+        "--max-body-bytes",
+        type=int,
+        default=env_int("CODEX_CLAUDE_BRIDGE_MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES),
+    )
+    parser.add_argument(
+        "--max-messages",
+        type=int,
+        default=env_int("CODEX_CLAUDE_BRIDGE_MAX_MESSAGES", DEFAULT_MAX_MESSAGES),
+    )
     parser.add_argument("--check", action="store_true", help="Validate config and print non-secret status without binding a socket.")
     return parser.parse_args()
+
+
+class BridgeServer(ThreadingHTTPServer):
+    daemon_threads = True
 
 
 def main() -> int:
@@ -266,6 +329,8 @@ def main() -> int:
         outbox=args.outbox,
         token=token,
         token_source=token_source,
+        max_body_bytes=max(1, args.max_body_bytes),
+        max_messages=max(1, args.max_messages),
     )
 
     if args.check:
@@ -280,13 +345,15 @@ def main() -> int:
                     "outbox": str(config.outbox),
                     "token_source": config.token_source,
                     "routes": ["/health", "/messages", "/outbox", "/codex", "/claude"],
+                    "max_body_bytes": config.max_body_bytes,
+                    "max_messages": config.max_messages,
                 },
                 sort_keys=True,
             )
         )
         return 0
 
-    server = ThreadingHTTPServer((config.host, config.port), BridgeHandler)
+    server = BridgeServer((config.host, config.port), BridgeHandler)
     server.bridge_config = config  # type: ignore[attr-defined]
     print(
         json.dumps(
