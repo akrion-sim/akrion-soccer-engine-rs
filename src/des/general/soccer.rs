@@ -1177,6 +1177,12 @@ const GOAL_CONTEXT_CREDIT_SCAN_ACTIONS: usize = 48;
 const GOAL_CONTEXT_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(60.0);
 const GOAL_CONTEXT_CREDIT_MIN_SCORE: f64 = 0.05;
 const SHOT_ON_TARGET_REWARD_POINTS: f64 = 80.0;
+/// A non-conversion outcome (an on-target shot that MISSES, chain / shot-on-frame credit, ...) is
+/// capped at this FRACTION of the conversion (goal) reward, so scoring dominates a missed chance by a
+/// meaningful, magnitude-scaling margin instead of a token fixed few points — the ordering stays
+/// meaningful whether a goal is worth 100 or 1600. Tunable in (0.05, 0.95) via
+/// `DD_SOCCER_REWARD_NON_CONVERSION_MAX_FRACTION`; weights stay learnable *within* this grounded ordering.
+const DEFAULT_REWARD_NON_CONVERSION_MAX_FRACTION: f64 = 0.40;
 /// Direct keeper credit for stopping a shot, scaled upward for close-range danger.
 /// This trains the goalkeeper's preceding positioning/claim decision instead of only
 /// rewarding the shooter and penalising the keeper later when a goal is conceded.
@@ -1885,6 +1891,10 @@ const TURNOVER_CHAIN_BLAME_MIN_POINTS: f64 = 0.05;
 const INTERCEPTED_PASS_BASE_PENALTY_MIN_POINTS: f64 = 6.0;
 const INTERCEPTED_PASS_BASE_PENALTY_MAX_POINTS: f64 = 20.0;
 const BACKWARD_INTERCEPTED_PASS_PENALTY_MULTIPLIER: f64 = 2.0;
+/// Cap for the field-vector turnover-position multiplier: an own-third giveaway can cost
+/// up to this many × the base turnover penalty, but no more (so a dangerous giveaway is
+/// punished hard without dwarfing the sparse goal reward).
+const TURNOVER_POSITION_MAX_MULT: f64 = 5.0;
 // Bad-pass turnover blame is not a normalized pool: the passer gets the full
 // chain penalty, then the prior two teammates get discounted echoes.
 const BAD_PASS_CHAIN_PENALTY_MULTIPLIERS: [f64; 3] = [1.0, 0.20, 0.05];
@@ -24317,6 +24327,58 @@ fn reward_weight_env(name: &str, default: f64, min: f64, max: f64) -> f64 {
         .unwrap_or(default.clamp(min, max))
 }
 
+fn optional_reward_weight_env(name: &str, default: f64, max: f64) -> f64 {
+    let max = max.max(MIN_SOCCER_REWARD_WEIGHT);
+    let default = if default.is_finite() && default > 0.0 {
+        default.clamp(MIN_SOCCER_REWARD_WEIGHT, max)
+    } else {
+        0.0
+    };
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+        .map(|v| v.clamp(MIN_SOCCER_REWARD_WEIGHT, max))
+        .unwrap_or(default)
+}
+
+/// Tunable ceiling for a non-conversion reward as a FRACTION of the conversion (goal) reward, clamped
+/// to (0.05, 0.95). Env `DD_SOCCER_REWARD_NON_CONVERSION_MAX_FRACTION`, default
+/// `DEFAULT_REWARD_NON_CONVERSION_MAX_FRACTION` (0.40).
+fn reward_non_conversion_max_fraction() -> f64 {
+    reward_weight_env(
+        "DD_SOCCER_REWARD_NON_CONVERSION_MAX_FRACTION",
+        DEFAULT_REWARD_NON_CONVERSION_MAX_FRACTION,
+        0.05,
+        0.95,
+    )
+}
+
+/// Clamp a non-conversion reward's scale so its maximum points stay a PROPORTIONAL margin below the
+/// conversion (goal) reward: `non_conversion_points * scale <= conversion_points * fraction`. Unlike a
+/// fixed-point margin (which becomes meaningless once the goal reward is scaled up — 155 vs 160 is
+/// still "worth a goal"), the proportional cap keeps "a missed on-target shot is worth much less than
+/// a goal" true at any magnitude. Returns 0 for degenerate inputs.
+fn grounded_non_conversion_reward_scale(
+    raw_scale: f64,
+    non_conversion_points: f64,
+    conversion_points: f64,
+) -> f64 {
+    if !raw_scale.is_finite() || raw_scale <= 0.0 {
+        return 0.0;
+    }
+    if !non_conversion_points.is_finite()
+        || !conversion_points.is_finite()
+        || non_conversion_points <= 0.0
+        || conversion_points <= 0.0
+    {
+        return 0.0;
+    }
+    let max_non_conversion_points = conversion_points * reward_non_conversion_max_fraction();
+    let max_scale = (max_non_conversion_points / non_conversion_points).max(0.0);
+    raw_scale.min(max_scale)
+}
+
 pub(crate) fn forward_pass_reward_scale() -> f64 {
     if dynamic_reward_weights_enabled() {
         return reward_weight_env("DD_SOCCER_FORWARD_PASS_REWARD_SCALE", 1.0, 0.0, 20.0);
@@ -24364,14 +24426,39 @@ pub(crate) fn forward_pass_turnover_penalty_scale() -> f64 {
 /// Companion dampener for the shot-TAKEN shaping proxy (on-/off-target reward, NOT the goal or
 /// terminal-outcome reward, which stay intact — the net must still finish). Lets a forward-pass-
 /// primacy A/B stop the net shooting early instead of building up. Env
-/// `DD_SOCCER_SHOT_SHAPING_REWARD_SCALE` (clamped [1e-4,4.0]), default 1.0 ⇒ unchanged.
+/// `DD_SOCCER_SHOT_SHAPING_REWARD_SCALE` (input clamped [1e-4,4.0]), default 1.0 ⇒
+/// unchanged; the effective scale is then grounded below goal-chain conversion.
 pub(crate) fn shot_shaping_reward_scale() -> f64 {
-    if dynamic_reward_weights_enabled() {
-        return reward_weight_env("DD_SOCCER_SHOT_SHAPING_REWARD_SCALE", 1.0, 1e-4, 4.0);
-    }
-    use std::sync::OnceLock;
-    static V: OnceLock<f64> = OnceLock::new();
-    *V.get_or_init(|| reward_weight_env("DD_SOCCER_SHOT_SHAPING_REWARD_SCALE", 1.0, 1e-4, 4.0))
+    let raw = if dynamic_reward_weights_enabled() {
+        reward_weight_env("DD_SOCCER_SHOT_SHAPING_REWARD_SCALE", 1.0, 1e-4, 4.0)
+    } else {
+        use std::sync::OnceLock;
+        static V: OnceLock<f64> = OnceLock::new();
+        *V.get_or_init(|| reward_weight_env("DD_SOCCER_SHOT_SHAPING_REWARD_SCALE", 1.0, 1e-4, 4.0))
+    };
+    grounded_non_conversion_reward_scale(raw, SHOT_ON_TARGET_REWARD_POINTS, GOAL_REWARD_POINTS)
+}
+
+/// Weight for the FINISHING ANCHOR: a high, hardcoded reward for putting a shot ON GOAL
+/// (on-frame). Paid in the sparse/terminal layer (OUTSIDE the +/-4 dense clamp), so it is a
+/// real terminal-scale pull toward finishing — the missing counterpart to the goal reward.
+/// Bonus = w * SHOT_ON_TARGET_REWARD_POINTS(80) * shot_on_frame_probability, on a shot action.
+/// (The engine's 80-pt "shot on target" was telemetry-only/inert; the live on-frame signal was
+/// ~1-3 pts vs a ~800 goal — no anchor.) Env `DD_SOCCER_ON_FRAME_SHOT_REWARD_SCALE`, clamped
+/// [0, 8], default **0.0** => byte-identical off. The effective scale is grounded so the
+/// maximum non-converting on-frame bonus remains at least 5 points below the live goal reward.
+pub(crate) fn on_frame_shot_reward_scale() -> f64 {
+    let raw = if dynamic_reward_weights_enabled() {
+        optional_reward_weight_env("DD_SOCCER_ON_FRAME_SHOT_REWARD_SCALE", 0.0, 8.0)
+    } else {
+        use std::sync::OnceLock;
+        static V: OnceLock<f64> = OnceLock::new();
+        *V.get_or_init(|| {
+            optional_reward_weight_env("DD_SOCCER_ON_FRAME_SHOT_REWARD_SCALE", 0.0, 8.0)
+        })
+    };
+    let conversion_points = tunables().reward.goal_scored_points * goal_reward_scale();
+    grounded_non_conversion_reward_scale(raw, SHOT_ON_TARGET_REWARD_POINTS, conversion_points)
 }
 
 fn hierarchy_bounded_shot_on_target_points(shot_scale: f64, goal_scale: f64) -> f64 {
@@ -24995,23 +25082,87 @@ fn quick_release_forward_pass_reward(
 /// (the whole term is a no-op unless explicitly enabled). Pre-registered A/B arms: 0.75, 1.0, 1.5.
 pub(crate) fn quick_forward_release_reward_scale() -> f64 {
     if dynamic_reward_weights_enabled() {
-        return reward_weight_env(
+        return optional_reward_weight_env(
             "DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE",
             0.0,
-            MIN_SOCCER_REWARD_WEIGHT,
             2.0,
         );
     }
     use std::sync::OnceLock;
     static V: OnceLock<f64> = OnceLock::new();
     *V.get_or_init(|| {
-        reward_weight_env(
-            "DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE",
-            0.0,
-            MIN_SOCCER_REWARD_WEIGHT,
-            2.0,
-        )
+        optional_reward_weight_env("DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE", 0.0, 2.0)
     })
+}
+
+/// Weight w1 for the HOLD-TOO-LONG-UNDER-PRESSURE penalty on the ball carrier:
+/// `−w1 · time_on_ball_seconds · perceived_pressure` per tick. The longer the carrier
+/// holds AND the more it is pressed, the larger the charge — pushing a quicker release
+/// or a move onto the ball. Env `DD_SOCCER_HOLD_UNDER_PRESSURE_PENALTY_SCALE`, clamped
+/// [0, 2], default **0.0** ⇒ byte-identical no-op unless enabled.
+pub(crate) fn hold_under_pressure_penalty_scale() -> f64 {
+    if dynamic_reward_weights_enabled() {
+        return optional_reward_weight_env("DD_SOCCER_HOLD_UNDER_PRESSURE_PENALTY_SCALE", 0.0, 2.0);
+    }
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        optional_reward_weight_env("DD_SOCCER_HOLD_UNDER_PRESSURE_PENALTY_SCALE", 0.0, 2.0)
+    })
+}
+
+/// Weight w2 for the DRIBBLE-TOO-SLOW penalty: while a carrier is dribbling,
+/// `−w2 · max(0, jog_speed − forward_speed)` (jog = [`STATIONARY_HOLD_FORWARD_JOG_YPS`]).
+/// Zero at/above a jog; grows as the carrier drops to a walk/standstill. Balances the
+/// energy cost of moving (which rises with speed) so the learned optimum is to dribble
+/// AT a jog rather than stand, walk, or needlessly sprint. Env
+/// `DD_SOCCER_DRIBBLE_MIN_GAIT_PENALTY_SCALE`, clamped [0, 2], default **0.0** ⇒ off.
+pub(crate) fn dribble_min_gait_penalty_scale() -> f64 {
+    if dynamic_reward_weights_enabled() {
+        return optional_reward_weight_env("DD_SOCCER_DRIBBLE_MIN_GAIT_PENALTY_SCALE", 0.0, 2.0);
+    }
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        optional_reward_weight_env("DD_SOCCER_DRIBBLE_MIN_GAIT_PENALTY_SCALE", 0.0, 2.0)
+    })
+}
+
+/// Weight w3 that makes the turnover penalty a continuous function of WHERE the ball is
+/// lost (the field vector): the penalty is multiplied by `1 + w3 · opponent_expected_threat(loss)`
+/// (capped at [`TURNOVER_POSITION_MAX_MULT`]). A giveaway in your own third — where the
+/// opponent's threat from that spot is high — is punished hard; an ambitious loss in the
+/// attacking third stays cheap. This is the field-vector fix for the flat-penalty
+/// risk-aversion trap. Env `DD_SOCCER_TURNOVER_POSITION_WEIGHT_SCALE`, clamped [0, 8],
+/// default **0.0** ⇒ byte-identical (multiplier = 1.0, current flat behavior).
+pub(crate) fn turnover_position_weight_scale() -> f64 {
+    if dynamic_reward_weights_enabled() {
+        return optional_reward_weight_env("DD_SOCCER_TURNOVER_POSITION_WEIGHT_SCALE", 0.0, 8.0);
+    }
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        optional_reward_weight_env("DD_SOCCER_TURNOVER_POSITION_WEIGHT_SCALE", 0.0, 8.0)
+    })
+}
+
+/// Position multiplier for a turnover at `loss_pos` by `losing_team`, weighting the base
+/// turnover penalty by the opponent's expected threat from that location (via the pitch-value
+/// field function `threat_at`). Returns 1.0 when the weight knob is off (byte-identical), and
+/// only ever amplifies (>= 1.0), capped at [`TURNOVER_POSITION_MAX_MULT`].
+fn turnover_position_multiplier(
+    losing_team: Team,
+    loss_pos: Vec2,
+    field_width: f64,
+    field_length: f64,
+) -> f64 {
+    let w3 = turnover_position_weight_scale();
+    if w3 <= 0.0 {
+        return 1.0;
+    }
+    let opponent_threat =
+        threat_at(losing_team.other(), loss_pos, field_width, field_length).max(0.0);
+    (1.0 + w3 * opponent_threat).clamp(1.0, TURNOVER_POSITION_MAX_MULT)
 }
 
 /// Codex r19 carrot: bounded, opportunity-conditioned reward for a completed forward pass that was
@@ -27348,17 +27499,18 @@ fn soccer_transition_reward_with_tactics(
         // scoring — a full-parity hit for the back line, a role-graded share for outfielders —
         // rather than a token cost. OFF ⇒ the original 8/2 values, byte-identical baseline / A/B.
         let symmetric = dd_soccer_enable_concede_symmetry();
-        let concede_penalty = if matches!(player.role, PlayerRole::Goalkeeper | PlayerRole::Defender) {
-            if symmetric {
-                reward_cfg.concede_keeper_defender_penalty_symmetric
+        let concede_penalty =
+            if matches!(player.role, PlayerRole::Goalkeeper | PlayerRole::Defender) {
+                if symmetric {
+                    reward_cfg.concede_keeper_defender_penalty_symmetric
+                } else {
+                    reward_cfg.concede_keeper_defender_penalty
+                }
+            } else if symmetric {
+                reward_cfg.concede_outfield_penalty_symmetric
             } else {
-                reward_cfg.concede_keeper_defender_penalty
-            }
-        } else if symmetric {
-            reward_cfg.concede_outfield_penalty_symmetric
-        } else {
-            reward_cfg.concede_outfield_penalty
-        };
+                reward_cfg.concede_outfield_penalty
+            };
         // Keep the concede STICK on the SAME multiplier as the goal CARROT above
         // (goal_reward_scale). Otherwise cranking the sparse-terminal lever (e.g.
         // DD_SOCCER_GOAL_REWARD_SCALE=8, the goal-dom regime) amplifies scoring but
@@ -27369,6 +27521,20 @@ fn soccer_transition_reward_with_tactics(
         // 1.0 this is byte-identical to the prior baseline — it only bites once the
         // goal scale is raised above 1.
         reward -= concede_penalty * goal_reward_scale();
+    }
+
+    // FINISHING ANCHOR (operator 2026-07-12): a high, hardcoded reward for putting a shot ON GOAL
+    // (on-frame), paid HERE in the sparse/terminal layer (outside the +/-4 dense clamp) so it pulls
+    // toward finishing with terminal-scale force — the counterpart to the goal reward that was
+    // effectively MISSING (live on-frame-shot signal ~1-3 pts vs a ~800 goal; the 80-pt "shot on
+    // target" was telemetry-inert). Gated (default 0 = byte-identical off).
+    let on_frame_shot_w = on_frame_shot_reward_scale();
+    if on_frame_shot_w > 0.0 && soccer_label_is_shot(action) {
+        let on_frame = decision
+            .observation
+            .shot_on_frame_probability
+            .clamp(0.0, 1.0);
+        reward += on_frame_shot_w * SHOT_ON_TARGET_REWARD_POINTS * on_frame;
     }
 
     if is_pass_like_action(action) {
@@ -27530,12 +27696,20 @@ fn soccer_transition_reward_with_tactics(
                     } else {
                         decision.observation.best_pass_receiver_openness
                     };
+                    // Turnover penalty, weighted by WHERE the ball was lost (the field
+                    // vector): amplified when the opponent wins it in a high-threat spot
+                    // (our third), left cheap for ambitious losses up the pitch.
                     reward -= resolved_pass_turnover_penalty(
                         player.team,
                         origin,
                         target,
                         flight,
                         receiver_openness,
+                        before.field_length,
+                    ) * turnover_position_multiplier(
+                        player.team,
+                        origin,
+                        before.field_width,
                         before.field_length,
                     );
                 }
@@ -28296,6 +28470,17 @@ fn dense_soccer_transition_reward(
     if before.ball.holder == Some(player.id) {
         let own_half_holder =
             pass_origin_in_own_half(player.team, before.ball.position, before.field_length);
+        // Hold-too-long-under-pressure penalty: −w1 · time_on_ball · pressure. Grows with
+        // BOTH how long the carrier has held the ball and how hard it is pressed, so
+        // dawdling on the ball when a defender is closing costs increasingly more each
+        // tick — pushing a quick release/move. Gated (w1 = 0 ⇒ byte-identical off), and
+        // balanced against the energy cost of moving so the optimum is to move it on.
+        let hold_w1 = hold_under_pressure_penalty_scale();
+        if hold_w1 > 0.0 {
+            let held = before_obs.actual_time_on_ball_seconds.max(0.0);
+            let press = before_obs.perceived_pressure.clamp(0.0, 1.0);
+            reward -= hold_w1 * held * press;
+        }
         let own_goal_relief =
             ball_distance_from_own_goal(player.team, after.ball.position, after.field_length)
                 - ball_distance_from_own_goal(
@@ -28307,7 +28492,7 @@ fn dense_soccer_transition_reward(
             reward += 0.09;
         } else if after_possession == Some(player.team.other()) {
             let reward_cfg = &tunables().reward;
-            reward -= intentional_long_ball_loss_penalty(
+            let giveaway = intentional_long_ball_loss_penalty(
                 action,
                 own_half_holder,
                 ball_forward,
@@ -28319,6 +28504,15 @@ fn dense_soccer_transition_reward(
             } else {
                 reward_cfg.giveaway_to_opponent_opp_half_penalty
             });
+            // Same field-vector weighting as intercepted passes: conceding possession to the
+            // opponent hurts most where it hands them a high-threat position (our own third).
+            reward -= giveaway
+                * turnover_position_multiplier(
+                    player.team,
+                    before.ball.position,
+                    before.field_width,
+                    before.field_length,
+                );
         } else {
             let reward_cfg = &tunables().reward;
             reward -= intentional_long_ball_loss_penalty(
@@ -28464,6 +28658,21 @@ fn dense_soccer_transition_reward(
                 }
             }
             reward -= hold_penalty;
+            // Dribble-at-a-jog incentive: −w2 · max(0, jog − forward_speed). A carrier that
+            // is dribbling but crawling (standing still / walking, below the jog gait) is
+            // charged in proportion to how far below a jog its forward drive is; at/above a
+            // jog it is zero. Together with the (speed-increasing) energy cost this makes a
+            // jog the learned optimum — not a standstill, not a needless sprint. Gated off by default.
+            let dribble_w2 = dribble_min_gait_penalty_scale();
+            if dribble_w2 > 0.0 {
+                let fwd = after
+                    .player_velocity(player.id)
+                    .map(|v| v.y * attack_dir)
+                    .unwrap_or(0.0);
+                let deficit = (STATIONARY_HOLD_FORWARD_JOG_YPS - fwd)
+                    .clamp(0.0, STATIONARY_HOLD_FORWARD_JOG_YPS);
+                reward -= dribble_w2 * deficit;
+            }
             let carry_progress = ball_forward.max(player_forward).clamp(-4.0, 18.0);
             if carry_progress > 0.0 {
                 let role_multiplier = match player.role {
@@ -28809,6 +29018,19 @@ pub(crate) fn loose_ball_contest_pressure_enabled() -> bool {
     }
 }
 
+/// Amplifier for the LOOSE-BALL PURSUIT signal — scales BOTH the uncontested-time penalty
+/// (the cost of letting an unpossessed ball sit loose) and the win reward, so players commit
+/// to going for a loose ball their POMDP says they can win, and none is left loose too long.
+/// Env `DD_SOCCER_LOOSE_BALL_PURSUIT_SCALE`, clamped [1, 20], default 1.0 (byte-identical).
+pub(crate) fn loose_ball_pursuit_scale() -> f64 {
+    if dynamic_reward_weights_enabled() {
+        return reward_weight_env("DD_SOCCER_LOOSE_BALL_PURSUIT_SCALE", 1.0, 1.0, 20.0);
+    }
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| reward_weight_env("DD_SOCCER_LOOSE_BALL_PURSUIT_SCALE", 1.0, 1.0, 20.0))
+}
+
 /// Both-teams loose-ball **contest pressure**: a symmetric, time-escalating penalty
 /// charged to every outfield player on BOTH teams for each tick an unpossessed ball
 /// is left uncontested beyond the grace (so standing off a loose ball is never free
@@ -28851,7 +29073,8 @@ fn loose_ball_contest_pressure_reward(
         let secured = if won_as_holder { 1.0 } else { 0.4 };
         reward += reward_cfg.loose_ball_win_points * urgency_bonus * secured;
     }
-    reward
+    // Amplify pursuit so the favourite commits to a winnable loose ball and none sits loose too long.
+    reward * loose_ball_pursuit_scale()
 }
 
 #[cfg(test)]
@@ -43003,9 +43226,74 @@ mod soccer_policy_actor_capacity_tests {
         TestEnvVarGuard { key, previous }
     }
 
+    fn clear_test_env_var(key: &'static str) -> TestEnvVarGuard {
+        let previous = std::env::var_os(key);
+        std::env::remove_var(key);
+        TestEnvVarGuard { key, previous }
+    }
+
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().expect("test poison soccer policy env lock")
+    }
+
+    #[test]
+    fn optional_reward_weight_env_stays_off_until_configured() {
+        let _lock = env_lock();
+        const KEY: &str = "DD_SOCCER_TEST_OPTIONAL_REWARD_WEIGHT";
+        let _guard = clear_test_env_var(KEY);
+
+        assert_eq!(optional_reward_weight_env(KEY, 0.0, 2.0), 0.0);
+
+        std::env::set_var(KEY, "0");
+        assert_eq!(
+            optional_reward_weight_env(KEY, 0.0, 2.0),
+            MIN_SOCCER_REWARD_WEIGHT
+        );
+
+        std::env::set_var(KEY, "nan");
+        assert_eq!(optional_reward_weight_env(KEY, 0.0, 2.0), 0.0);
+
+        std::env::set_var(KEY, "99");
+        assert_eq!(optional_reward_weight_env(KEY, 0.0, 2.0), 2.0);
+    }
+
+    #[test]
+    fn non_conversion_reward_scales_stay_below_conversion_reward() {
+        let _lock = env_lock();
+        let _frac = set_test_env_var("DD_SOCCER_REWARD_NON_CONVERSION_MAX_FRACTION", "0.40");
+        let frac = 0.40_f64;
+
+        // A missed on-target shot is capped at a PROPORTIONAL fraction of a goal (here 40%), by a
+        // wide margin -- not a token fixed few points that vanishes once the goal reward is scaled up.
+        let terminal_shot_scale =
+            grounded_non_conversion_reward_scale(8.0, SHOT_ON_TARGET_REWARD_POINTS, 100.0);
+        assert!(
+            terminal_shot_scale * SHOT_ON_TARGET_REWARD_POINTS <= frac * 100.0 + 1e-9,
+            "non-conversion points must stay <= fraction * conversion reward"
+        );
+        assert!(
+            (terminal_shot_scale - frac * 100.0 / SHOT_ON_TARGET_REWARD_POINTS).abs() < 1e-9
+        );
+
+        // Proportional: raising the goal reward raises the allowed non-conversion ceiling in step,
+        // so "shot < goal by a meaningful margin" holds at any magnitude (not just near 100).
+        let chain_shot_scale = grounded_non_conversion_reward_scale(
+            8.0,
+            SHOT_ON_TARGET_REWARD_POINTS,
+            GOAL_REWARD_POINTS,
+        );
+        assert!(
+            chain_shot_scale * SHOT_ON_TARGET_REWARD_POINTS <= frac * GOAL_REWARD_POINTS + 1e-9
+        );
+        assert!(
+            (chain_shot_scale - frac * GOAL_REWARD_POINTS / SHOT_ON_TARGET_REWARD_POINTS).abs()
+                < 1e-9
+        );
+        assert_eq!(
+            grounded_non_conversion_reward_scale(0.0, SHOT_ON_TARGET_REWARD_POINTS, 100.0),
+            0.0
+        );
     }
 
     #[test]

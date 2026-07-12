@@ -6,6 +6,7 @@ use crate::game::*;
 use crate::nn::{masked_softmax, Mlp};
 use crate::rng::Rng;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 // SPEED WARMUP CURRICULUM: while true, every player uses a fixed run-medium gear
 // (v3 behavior) instead of sampling the speed policy. This lets the ACTION policy
@@ -15,6 +16,38 @@ use std::sync::atomic::{AtomicBool, Ordering};
 static SPEED_FROZEN: AtomicBool = AtomicBool::new(false);
 pub fn set_speed_frozen(frozen: bool) {
     SPEED_FROZEN.store(frozen, Ordering::Relaxed);
+}
+
+// ── SELF-PLAY CHAMPION LADDER ───────────────────────────────────────────────
+// When a champion is installed, Team B (the opponent) is driven by that FROZEN
+// learned policy instead of the scripted baseline — so BOTH teams are learned
+// policies. The challenger (Team A) keeps training; when it beats the champion by
+// a margin it is promoted to the new champion ("new winner beats old winner to
+// advance"). Every action still flows through World::step, which executes only
+// legal, physics-bounded moves — self-play cannot invent unphysical behavior.
+static SELFPLAY_CHAMPION: RwLock<Option<Arc<Policy>>> = RwLock::new(None);
+
+fn selfplay_champion_write() -> RwLockWriteGuard<'static, Option<Arc<Policy>>> {
+    SELFPLAY_CHAMPION
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn selfplay_champion_read() -> RwLockReadGuard<'static, Option<Arc<Policy>>> {
+    SELFPLAY_CHAMPION
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+pub fn set_selfplay_champion(champion: Option<Policy>) {
+    *selfplay_champion_write() = champion.map(Arc::new);
+}
+
+pub fn clear_selfplay_champion() {
+    *selfplay_champion_write() = None;
+}
+fn selfplay_champion() -> Option<Arc<Policy>> {
+    selfplay_champion_read().clone()
 }
 
 const GAMMA: f32 = 0.995; // per-tick discount retuned for 20 Hz (same per-second horizon)
@@ -29,6 +62,14 @@ const MAX_ROLLOUT_THREADS: usize = 4;
 const MIN_REWARD_WEIGHT: f32 = 0.0001;
 const CONVERSION_OVER_SHOT_MARGIN: f32 = 5.0;
 const WIN_OVER_CONVERSION_MARGIN: f32 = 20.0;
+/// A converted goal must dominate the summed non-converting shot reward by a PROPORTIONAL margin:
+/// `shot_base + shot_q <= goal * REWARD_NON_CONVERSION_MAX_FRACTION`. Scales with the goal weight
+/// rather than a fixed point gap (which loses meaning once weights move), matching the 11v11 engine's
+/// `grounded_non_conversion_reward_scale`. Default 0.40 = an on-target shot that misses is worth at
+/// most ~40% of a goal.
+const REWARD_NON_CONVERSION_MAX_FRACTION: f32 = 0.40;
+const REW_GOAL_MIN: f32 = 6.0;
+const REW_GOAL_MAX: f32 = 20.0;
 const LINGER_RADIUS: f32 = 4.0; // "same radius": teammates within this many yards
 /// Overlap zone: two players THIS close are occupying the same spot — that is
 /// never "running past each other", so the penalty here is ALWAYS-ON (ungated).
@@ -72,6 +113,27 @@ fn wenv(name: &str, default: f32, lo: f32, hi: f32) -> f32 {
     let raw = std::env::var(name).ok();
     bounded_weight(raw.as_deref(), default, lo, hi)
 }
+
+fn grounded_conversion_ladder(goal: f32, shot_base: f32, shot_q: f32) -> (f32, f32, f32) {
+    // The goal stays the reference (clamped to its own range); shot shaping is scaled DOWN to fit a
+    // proportional fraction below it, never the reverse — so tuning big shot rewards can't quietly
+    // inflate what "scoring" is worth.
+    let goal = goal.clamp(REW_GOAL_MIN, REW_GOAL_MAX);
+    let mut shot_base = shot_base.max(MIN_REWARD_WEIGHT);
+    let mut shot_q = shot_q.max(MIN_REWARD_WEIGHT);
+    let max_non_conversion = (goal * REWARD_NON_CONVERSION_MAX_FRACTION)
+        .min(goal - CONVERSION_OVER_SHOT_MARGIN)
+        .max(MIN_REWARD_WEIGHT);
+    let total = shot_base + shot_q;
+    if total > max_non_conversion {
+        let scale = (max_non_conversion / total).clamp(0.0, 1.0);
+        shot_base = (shot_base * scale).max(MIN_REWARD_WEIGHT);
+        shot_q = (shot_q * scale).max(MIN_REWARD_WEIGHT);
+    }
+
+    (goal, shot_base, shot_q)
+}
+
 pub struct Rw {
     pub goal: f32,                 // +goal scored
     pub concede: f32,              // -goal conceded (stored positive, subtracted)
@@ -110,13 +172,18 @@ pub struct Rw {
 fn rw() -> &'static Rw {
     static R: std::sync::OnceLock<Rw> = std::sync::OnceLock::new();
     R.get_or_init(|| {
+        let (goal, shot_base, shot_q) = grounded_conversion_ladder(
+            wenv("REW_GOAL", 12.0, REW_GOAL_MIN, REW_GOAL_MAX),
+            wenv("REW_SHOT_BASE", 1.5, 0.3, 3.5),
+            wenv("REW_SHOT_Q", 1.0, MIN_REWARD_WEIGHT, 2.5),
+        );
         enforce_reward_hierarchy(Rw {
-            goal: wenv("REW_GOAL", 12.0, 6.0, 20.0),
+            goal,
             concede: wenv("REW_CONCEDE", 8.0, 4.0, 16.0),
             match_win: wenv("REW_MATCH_WIN", 32.0, 8.0, 64.0),
             match_loss: wenv("REW_MATCH_LOSS", 12.0, 6.0, 24.0),
-            shot_base: wenv("REW_SHOT_BASE", 1.5, 0.3, 3.5),
-            shot_q: wenv("REW_SHOT_Q", 1.0, MIN_REWARD_WEIGHT, 2.5),
+            shot_base,
+            shot_q,
             milestone: wenv("REW_MILESTONE", 0.3, MIN_REWARD_WEIGHT, 1.5),
             pass_credit: wenv("REW_PASS", 0.06, MIN_REWARD_WEIGHT, 0.4),
             turnover: wenv("REW_TURNOVER", 0.55, MIN_REWARD_WEIGHT, 1.5),
@@ -148,14 +215,17 @@ fn rw() -> &'static Rw {
     })
 }
 
+#[cfg(test)]
 fn max_nonconverting_shot_reward(weights: &Rw) -> f32 {
     weights.shot_base + weights.shot_q
 }
 
 fn enforce_reward_hierarchy(mut weights: Rw) -> Rw {
-    let shot_ceiling = max_nonconverting_shot_reward(&weights);
-    let outcome_floor = shot_ceiling + CONVERSION_OVER_SHOT_MARGIN;
-    weights.goal = weights.goal.max(outcome_floor);
+    let (goal, shot_base, shot_q) =
+        grounded_conversion_ladder(weights.goal, weights.shot_base, weights.shot_q);
+    weights.goal = goal;
+    weights.shot_base = shot_base;
+    weights.shot_q = shot_q;
     weights.match_win = weights
         .match_win
         .max(weights.goal + WIN_OVER_CONVERSION_MARGIN);
@@ -516,7 +586,12 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
         }
 
         let pre_field = FieldRewardContext::from_world(&w);
-        let act_b = noisy_scripted_actions(&w, Team::B, opponent_noise, rng);
+        // Team B = the frozen self-play champion when one is installed, else the
+        // scripted baseline. Both flow through World::step (physics-bounded).
+        let act_b = match selfplay_champion() {
+            Some(champ) => champion_actions(&champ, &w, opponent_noise, rng),
+            None => noisy_scripted_actions(&w, Team::B, opponent_noise, rng),
+        };
         w.step(&packed_a, &act_b, rng);
         let post_field = FieldRewardContext::from_world(&w);
 
@@ -831,8 +906,16 @@ fn collect_rollouts(policy: &Policy, games: usize, rng: &mut Rng) -> Vec<Sample>
     }
 
     let mut data = Vec::new();
+    let mut worker_failed = false;
     for handle in handles {
-        data.extend(handle.join().expect("rollout worker panicked"));
+        match handle.join() {
+            Ok(samples) => data.extend(samples),
+            Err(_) => worker_failed = true,
+        }
+    }
+    if worker_failed {
+        eprintln!("warning: 5v5 rollout worker panicked; retrying rollout batch serially");
+        return run_rollout_jobs(policy, &jobs);
     }
     data
 }
@@ -883,6 +966,24 @@ fn noisy_scripted_actions(w: &World, team: Team, noise: f32, rng: &mut Rng) -> [
             let a = sample_legal_action(&mask, rng);
             let gear = w.coerce_speed_gear(team, i, a, scripted_gear(a));
             acts[i] = a + gear * NA; // keep the noisy move at a real speed
+        }
+    }
+    acts
+}
+
+/// Team-B actions from a frozen self-play champion (keeper held, like the
+/// challenger's keeper). A small epsilon of legal exploration keeps the opposition
+/// varied so the challenger doesn't overfit one deterministic champion line.
+fn champion_actions(champ: &Policy, w: &World, noise: f32, rng: &mut Rng) -> [usize; N] {
+    let mut acts = [A_STAY; N];
+    for i in 1..N {
+        if noise > 0.0 && rng.f01() < noise {
+            let mask = w.legal_mask(Team::B, i);
+            let a = sample_legal_action(&mask, rng);
+            let gear = w.coerce_speed_gear(Team::B, i, a, scripted_gear(a));
+            acts[i] = a + gear * NA;
+        } else {
+            acts[i] = champ.act_greedy_world(w, Team::B, i);
         }
     }
     acts
@@ -1264,6 +1365,39 @@ pub fn evaluate(policy: &Policy, games: usize, rng: &mut Rng) -> Stats {
     s
 }
 
+/// Head-to-head between two learned policies: `cand` plays Team A, `opp` plays
+/// Team B (keepers held, as in `evaluate`). Returns (mean goal_diff for `cand`,
+/// `cand` winrate with draws counting 0.5). This is the champion-ladder gate:
+/// the challenger advances only when it beats the frozen champion by a margin.
+pub fn evaluate_vs_policy(cand: &Policy, opp: &Policy, games: usize, rng: &mut Rng) -> (f32, f32) {
+    let mut gd = 0.0f32;
+    let mut wr = 0.0f32;
+    for _ in 0..games {
+        let mut w = World::new();
+        if rng.f01() < 0.5 {
+            w.kickoff(Team::B);
+        }
+        for _ in 0..STEPS {
+            let mut act_a = [A_STAY; N];
+            let mut act_b = [A_STAY; N];
+            for i in 1..N {
+                act_a[i] = cand.act_greedy_world(&w, Team::A, i);
+                act_b[i] = opp.act_greedy_world(&w, Team::B, i);
+            }
+            w.step(&act_a, &act_b, rng);
+        }
+        let d = w.goals_a as f32 - w.goals_b as f32;
+        gd += d;
+        if d > 0.0 {
+            wr += 1.0;
+        } else if d == 0.0 {
+            wr += 0.5;
+        }
+    }
+    let g = games.max(1) as f32;
+    (gd / g, wr / g)
+}
+
 /// Baseline sanity check: scripted-vs-scripted goal difference (should be ~0).
 pub fn evaluate_scripted_vs_scripted(games: usize, rng: &mut Rng) -> (f32, f32, f32) {
     let mut diff = 0.0f32;
@@ -1338,13 +1472,14 @@ mod tests {
 
     #[test]
     fn football_outcomes_always_dominate_a_nonconverting_shot() {
+        let (goal, shot_base, shot_q) = grounded_conversion_ladder(6.0, 18.0, 4.0);
         let weights = enforce_reward_hierarchy(Rw {
-            goal: 6.0,
+            goal,
             concede: 4.0,
             match_win: 8.0,
             match_loss: 6.0,
-            shot_base: 3.5,
-            shot_q: 2.5,
+            shot_base,
+            shot_q,
             milestone: MIN_REWARD_WEIGHT,
             pass_credit: MIN_REWARD_WEIGHT,
             turnover: MIN_REWARD_WEIGHT,
@@ -1375,6 +1510,7 @@ mod tests {
         });
         let miss_ceiling = max_nonconverting_shot_reward(&weights);
         assert!(weights.goal >= miss_ceiling + CONVERSION_OVER_SHOT_MARGIN);
+        assert!(miss_ceiling <= weights.goal * REWARD_NON_CONVERSION_MAX_FRACTION + 1e-5);
         assert!(weights.match_win >= weights.goal + WIN_OVER_CONVERSION_MARGIN);
     }
 
@@ -1385,6 +1521,15 @@ mod tests {
         let left = evaluate_scripted_vs_scripted(8, &mut a);
         let right = evaluate_scripted_vs_scripted(8, &mut b);
         assert_eq!(left, right);
+    }
+
+    #[test]
+    fn selfplay_champion_lock_round_trips_and_clears() {
+        let mut rng = Rng::new(123);
+        set_selfplay_champion(Some(Policy::new(&mut rng)));
+        assert!(selfplay_champion().is_some());
+        clear_selfplay_champion();
+        assert!(selfplay_champion().is_none());
     }
 
     #[test]

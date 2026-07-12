@@ -17,6 +17,7 @@ pub const GK: usize = 0; // goalkeeper index; controlled by a fixed rule, not th
 pub const DT: f32 = 0.05; // seconds per decision tick -> 20 Hz sim (real-time 20 fps)
 pub const HZ: f32 = 1.0 / DT; // ticks per second (for real-time viewer playback)
 pub const STEPS: usize = 600; // ticks per TRAINING episode (~30s at 20 Hz)
+
 // The RECORDED viz match (match_before/after.json) runs longer than a training
 // episode so the before/after playback shows more football (incl. kickoffs after
 // goals). Training dynamics are unaffected — rollouts still use STEPS.
@@ -64,10 +65,20 @@ const SPEEDS: [f32; NS] = [0.0, 3.0, 4.5, 5.5, 6.5, 8.5, 11.0];
 // slower than decelerating / cutting (shedding speed or changing direction), as
 // with real players. Units yd/s^2. Env-overridable so the tuner can shape them.
 fn player_accel() -> f32 {
-    std::env::var("PLAYER_ACCEL").ok().and_then(|s| s.parse().ok()).filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(6.0)
+    std::env::var("PLAYER_ACCEL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|v: &f32| v.is_finite() && *v > 0.0)
+        .map(|v: f32| v.clamp(0.1, 50.0))
+        .unwrap_or(6.0)
 }
 fn player_decel() -> f32 {
-    std::env::var("PLAYER_DECEL").ok().and_then(|s| s.parse().ok()).filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(11.0)
+    std::env::var("PLAYER_DECEL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|v: &f32| v.is_finite() && *v > 0.0)
+        .map(|v: f32| v.clamp(0.1, 80.0))
+        .unwrap_or(11.0)
 }
 // Ball-carrying is much slower than open-field running (you can't sprint flat-out
 // with the ball at your feet) — and, critically, keeping it near v3's control
@@ -177,8 +188,8 @@ fn teammate_spacing_score(distance: f32) -> f32 {
 #[derive(Clone, Copy)]
 pub struct Player {
     pub pos: V2,
-    pub vel: V2,        // actual velocity — ramps toward des_vel at a bounded rate
-    pub des_vel: V2,    // desired velocity (the chosen gear/direction this tick)
+    pub vel: V2,     // actual velocity — ramps toward des_vel at a bounded rate
+    pub des_vel: V2, // desired velocity (the chosen gear/direction this tick)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -506,19 +517,34 @@ impl World {
         if self.owner.is_some() {
             return 0.0;
         }
-        let me = players(team, self)[idx].pos;
+        let mine = players(team, self);
+        let me = mine[idx].pos;
         let my_eta = me.sub(self.intercept_point(me)).len() / PLAYER_SPEED.max(1e-3);
+        // The player only WINS the ball if it beats every OTHER pursuer to it — so
+        // race against the fastest other player, TEAMMATES included, not just
+        // opponents. That way only the genuine favourite (quickest overall) believes
+        // it wins, and slower teammates hold shape instead of all crashing the ball;
+        // it also correctly deflates when an opponent is quicker (P someone else wins).
+        let mut best_other_eta = f32::INFINITY;
+        for k in 0..N {
+            if k != idx {
+                let tp = mine[k].pos;
+                let eta = tp.sub(self.intercept_point(tp)).len() / PLAYER_SPEED.max(1e-3);
+                if eta < best_other_eta {
+                    best_other_eta = eta;
+                }
+            }
+        }
         let opp = players(team.other(), self);
-        let mut opp_eta = f32::INFINITY;
         for k in 0..N {
             let op = opp[k].pos;
             let eta = op.sub(self.intercept_point(op)).len() / PLAYER_SPEED.max(1e-3);
-            if eta < opp_eta {
-                opp_eta = eta;
+            if eta < best_other_eta {
+                best_other_eta = eta;
             }
         }
-        // favorite when I arrive clearly sooner; smooth ~0.6s window around parity.
-        (0.5 + 0.5 * ((opp_eta - my_eta) / 0.6).clamp(-1.0, 1.0)).clamp(0.0, 1.0)
+        // favorite when I arrive clearly sooner than the fastest other; smooth ~0.6s window.
+        (0.5 + 0.5 * ((best_other_eta - my_eta) / 0.6).clamp(-1.0, 1.0)).clamp(0.0, 1.0)
     }
 
     /// Classify a Team-A dribble by the FINAL (post-shielding) direction, so the

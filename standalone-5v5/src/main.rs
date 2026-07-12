@@ -27,6 +27,17 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 type AppResult<T> = Result<T, Box<dyn Error>>;
+const SELFPLAY_MAX_GENERATIONS: usize = 200;
+const SELFPLAY_MAX_SPEED_WARMUP: usize = 10_000;
+
+struct SelfplayCleanup;
+
+impl Drop for SelfplayCleanup {
+    fn drop(&mut self) {
+        train::clear_selfplay_champion();
+        train::set_speed_frozen(false);
+    }
+}
 
 #[derive(Clone)]
 struct RunConfig {
@@ -74,6 +85,10 @@ fn run() -> AppResult<()> {
             let cfg = parse_run_config(&args)?;
             run_training(&cfg)?;
         }
+        "selfplay" => {
+            let cfg = parse_run_config(&args)?;
+            run_selfplay(&cfg)?;
+        }
         "sanity" => sanity(),
         "inspect" => {
             let seed: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(7);
@@ -84,6 +99,7 @@ fn run() -> AppResult<()> {
             let seed: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(7);
             let mut out_dir = PathBuf::from("out");
             let mut out_path: Option<PathBuf> = None;
+            let mut opponent: Option<PathBuf> = None;
             let mut i = 3;
             while i < args.len() {
                 let flag = args[i].as_str();
@@ -93,12 +109,13 @@ fn run() -> AppResult<()> {
                 match flag {
                     "--out-dir" => out_dir = PathBuf::from(val),
                     "--out" => out_path = Some(PathBuf::from(val)),
+                    "--opponent" => opponent = Some(PathBuf::from(val)), // Team B = this champion dir
                     other => return Err(format!("unknown option for play: {other}").into()),
                 }
                 i += 2;
             }
             let out_path = out_path.unwrap_or_else(|| out_dir.join("match_live.json"));
-            play(seed, &out_dir, &out_path)?;
+            play(seed, &out_dir, &out_path, opponent.as_deref())?;
         }
         "help" | "--help" | "-h" => print_usage(),
         other => return Err(format!("unknown command: {other}; run with --help for usage").into()),
@@ -109,6 +126,9 @@ fn run() -> AppResult<()> {
 fn print_usage() {
     println!("usage:");
     println!("  cargo run --release -- train [iters] [--seed N] [--games-per-iter N] [--bc-games N] [--bc-epochs N] [--eval-every N] [--eval-games N] [--final-games N] [--display-seed-max N] [--out-dir DIR]");
+    println!("  cargo run --release -- selfplay [iters-per-gen] [--seed N] [--games-per-iter N] [--bc-games N] [--bc-epochs N] [--eval-games N] [--out-dir DIR]");
+    println!("      # adversarial self-play ladder — both teams learned; new winner must beat the frozen");
+    println!("      # champion by PROMOTE_MARGIN (goal-diff) to advance. env: GENERATIONS, PROMOTE_MARGIN, SPEED_WARMUP");
     println!("  cargo run --release -- inspect [seed] [--out-dir DIR]");
     println!("  cargo run --release -- play [seed] [--out-dir DIR] [--out PATH]  # record one match (live New Game)");
     println!("  cargo run --release -- sanity");
@@ -192,26 +212,82 @@ fn parse_run_config(args: &[String]) -> AppResult<RunConfig> {
     Ok(cfg)
 }
 
+fn env_usize_clamped(name: &str, default: usize, min: usize, max: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|value| value.clamp(min, max))
+        .unwrap_or(default.clamp(min, max))
+}
+
+fn env_f32_clamped(name: &str, default: f32, min: f32, max: f32) -> f32 {
+    let lo = min.min(max);
+    let hi = min.max(max);
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|value| value.is_finite())
+        .map(|value| value.clamp(lo, hi))
+        .unwrap_or(default.clamp(lo, hi))
+}
+
 /// Load the trained policy from `out_dir` and record ONE fresh match (viz JSON)
 /// with the given seed to `out_path` — powers the live "New Game" button, which
 /// the live server (viz/serve_live.py) invokes per click with a random seed.
 ///   cargo run --release -- play [seed] [--out-dir DIR] [--out PATH]
-fn play(seed: u64, out_dir: &Path, out_path: &Path) -> AppResult<()> {
-    let actor = nn::Mlp::load(&out_dir.join("actor.txt"))
-        .map_err(|e| format!("no trained policy in {}: {e}", out_dir.display()))?;
-    let critic = nn::Mlp::load(&out_dir.join("critic.txt"))
-        .map_err(|e| format!("failed to load critic: {e}"))?;
-    let speedor = nn::Mlp::load(&out_dir.join("speedor.txt"))
-        .map_err(|e| format!("failed to load speedor: {e}"))?;
+fn load_policy(dir: &Path) -> AppResult<train::Policy> {
+    let actor = nn::Mlp::load(&dir.join("actor.txt"))
+        .map_err(|e| format!("no policy (actor.txt) in {}: {e}", dir.display()))?;
+    let critic = nn::Mlp::load(&dir.join("critic.txt"))
+        .map_err(|e| format!("failed to load critic in {}: {e}", dir.display()))?;
+    let speedor = nn::Mlp::load(&dir.join("speedor.txt"))
+        .map_err(|e| format!("failed to load speedor in {}: {e}", dir.display()))?;
     if actor.in_dim() != OBS_DIM || actor.out_dim() != NA {
-        return Err("actor shape mismatch; retrain the policy".into());
+        return Err(format!(
+            "actor shape mismatch in {}: expected input {} / actions {}, got input {} / actions {}; retrain the policy",
+            dir.display(),
+            OBS_DIM,
+            NA,
+            actor.in_dim(),
+            actor.out_dim()
+        )
+        .into());
     }
-    let policy = train::Policy {
+    if speedor.in_dim() != OBS_DIM || speedor.out_dim() != NS {
+        return Err(format!(
+            "speedor shape mismatch in {}: expected input {} / speeds {}, got input {} / speeds {}; retrain the policy",
+            dir.display(),
+            OBS_DIM,
+            NS,
+            speedor.in_dim(),
+            speedor.out_dim()
+        )
+        .into());
+    }
+    if critic.in_dim() != GLOBAL_DIM || critic.out_dim() != 1 {
+        return Err(format!(
+            "critic shape mismatch in {}: expected input {} / output 1, got input {} / output {}; retrain the policy",
+            dir.display(),
+            GLOBAL_DIM,
+            critic.in_dim(),
+            critic.out_dim()
+        )
+        .into());
+    }
+    Ok(train::Policy {
         actor,
         speedor,
         critic,
+    })
+}
+
+fn play(seed: u64, out_dir: &Path, out_path: &Path, opponent_dir: Option<&Path>) -> AppResult<()> {
+    let policy = load_policy(out_dir)?;
+    let opponent = match opponent_dir {
+        Some(d) => Some(load_policy(d)?), // champion-vs-champion self-play match
+        None => None,                     // vs scripted baseline
     };
-    record_match(&policy, &mut Rng::new(seed), out_path)?;
+    record_match_vs(&policy, opponent.as_ref(), &mut Rng::new(seed), out_path)?;
     println!("wrote {}", out_path.display());
     Ok(())
 }
@@ -465,6 +541,134 @@ fn sanity() {
         diff
     );
     println!("  avg goals A = {:.3}, avg goals B = {:.3}", ga, gb);
+}
+
+/// Persist a policy's three networks (actor/critic/speedor) into `dir` in the same
+/// layout `run_training` uses, so `inspect`/`play`/the viz can load it.
+fn save_policy(policy: &train::Policy, dir: &Path) -> AppResult<()> {
+    fs::create_dir_all(dir)?;
+    policy.actor.save(&dir.join("actor.txt"))?;
+    policy.speedor.save(&dir.join("speedor.txt"))?;
+    policy.critic.save(&dir.join("critic.txt"))?;
+    Ok(())
+}
+
+/// Adversarial SELF-PLAY ladder. Both teams are learned policies: a frozen champion
+/// plays Team B while a challenger trains (Team A) against it. Each generation the
+/// challenger is scored head-to-head vs the champion; if it wins by `PROMOTE_MARGIN`
+/// (goal-diff) it becomes the new champion ("new winner beats old winner to advance").
+/// All moves execute through `World::step`, so play stays within the physics bounds.
+fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
+    let _selfplay_cleanup = SelfplayCleanup;
+    let mut rng = Rng::new(cfg.seed);
+    fs::create_dir_all(&cfg.out_dir)?;
+    let champ_dir = cfg.out_dir.join("champions");
+    fs::create_dir_all(&champ_dir)?;
+
+    let generations = env_usize_clamped("GENERATIONS", 12, 1, SELFPLAY_MAX_GENERATIONS);
+    let promote_margin = env_f32_clamped("PROMOTE_MARGIN", 0.25, -20.0, 20.0);
+    let speed_warmup = env_usize_clamped(
+        "SPEED_WARMUP",
+        (cfg.iters / 2).max(1),
+        0,
+        SELFPLAY_MAX_SPEED_WARMUP,
+    );
+
+    // Challenger: warm-start by behavior-cloning the scripted baseline so gen-0 play
+    // is coherent (not random flailing); it then improves purely via self-play.
+    let mut challenger = train::Policy::new(&mut rng);
+    if cfg.bc_games > 0 {
+        let bc =
+            train::behavior_clone_scripted(&mut challenger, cfg.bc_games, cfg.bc_epochs, &mut rng);
+        println!(
+            "warm start (behavior-clone scripted): {} samples, teacher-match {:.0}%",
+            bc.samples,
+            bc.accuracy * 100.0
+        );
+    }
+    // Generation-0 champion = the scripted baseline itself (Team B scripted). The
+    // first learned policy to beat it by the margin becomes gen-1 champion; the
+    // ladder climbs from there ("new winner beats old winner to advance").
+    let mut champion: Option<train::Policy> = None;
+    let mut champion_gen = 0usize;
+
+    let (svs, _, _) = train::evaluate_scripted_vs_scripted(60, &mut rng);
+    println!("=== 5-a-side ADVERSARIAL SELF-PLAY ladder — both teams learned, physics-bounded ===");
+    println!("scripted-vs-scripted goal_diff={svs:+.2} (sanity ~0)");
+    println!(
+        "generations={generations}  iters/gen={}  games/iter={}  promote_margin={promote_margin:+.2}  eval_games={}  speed_warmup={speed_warmup}",
+        cfg.iters, cfg.games_per_iter, cfg.eval_games
+    );
+    println!("{}", "-".repeat(92));
+    println!(
+        "{:>4} | {:>18} | {:>18} | {:>9} | champion",
+        "gen", "vs champion", "vs scripted", "result"
+    );
+
+    let mut ladder = String::from(
+        "generation,iters_per_gen,cand_vs_champ_gd,cand_vs_champ_wr,cand_vs_scripted_gd,cand_vs_scripted_wr,promoted,champion_gen\n",
+    );
+
+    for round in 1..=generations {
+        // Install the current champion (None => scripted baseline) as Team B, then
+        // train the challenger against it.
+        train::set_selfplay_champion(champion.clone());
+        for it in 1..=cfg.iters {
+            train::set_speed_frozen(it <= speed_warmup);
+            let beta = train::ent_beta_at(it, cfg.iters);
+            let _ = train::train_iter(&mut challenger, cfg.games_per_iter, beta, &mut rng);
+        }
+        train::set_selfplay_champion(None); // detach so evals are clean
+
+        // Champion-ladder gate: beat the current champion (scripted at gen 0) by the margin.
+        let (gd_champ, wr_champ) = match &champion {
+            Some(c) => train::evaluate_vs_policy(&challenger, c, cfg.eval_games, &mut rng),
+            None => {
+                let s = train::evaluate(&challenger, cfg.eval_games, &mut rng);
+                (s.goal_diff, s.winrate)
+            }
+        };
+        // Absolute progress reference: challenger vs the scripted baseline.
+        let s = train::evaluate(&challenger, cfg.eval_games, &mut rng);
+        let promoted = gd_champ >= promote_margin;
+        if promoted {
+            champion = Some(challenger.clone());
+            champion_gen += 1;
+            save_policy(&challenger, &champ_dir.join(format!("gen{champion_gen}")))?;
+        }
+        let champ_label = if champion_gen == 0 {
+            "scripted".to_string()
+        } else {
+            format!("gen{champion_gen}")
+        };
+        println!(
+            "{round:>4} | gd {gd_champ:>+6.2} wr {wr_champ:>4.2} | gd {:>+6.2} wr {:>4.2} | {:>9} | {champ_label}",
+            s.goal_diff,
+            s.winrate,
+            if promoted { "PROMOTED" } else { "hold" }
+        );
+        ladder.push_str(&format!(
+            "{round},{},{gd_champ:.4},{wr_champ:.4},{:.4},{:.4},{},{champion_gen}\n",
+            cfg.iters, s.goal_diff, s.winrate, promoted
+        ));
+    }
+
+    // Persist the final champion (or the challenger if none was ever promoted) in the
+    // standard layout so inspect/play/viz can load it.
+    let final_policy = champion.as_ref().unwrap_or(&challenger);
+    save_policy(final_policy, &cfg.out_dir)?;
+    write_atomic(&cfg.out_dir.join("selfplay_ladder.csv"), &ladder)?;
+    let sfinal = train::evaluate(final_policy, cfg.final_games.max(cfg.eval_games), &mut rng);
+    println!("{}", "-".repeat(92));
+    println!(
+        "final champion = gen{champion_gen} after {generations} generations | vs scripted: goal_diff={:+.2} winrate={:.2} goals {:.2}-{:.2}",
+        sfinal.goal_diff, sfinal.winrate, sfinal.ga, sfinal.gb
+    );
+    println!(
+        "saved champion -> {} (+ champions/gen*/ snapshots, selfplay_ladder.csv)",
+        cfg.out_dir.display()
+    );
+    Ok(())
 }
 
 fn run_training(cfg: &RunConfig) -> AppResult<()> {
@@ -782,6 +986,17 @@ fn game_stats(policy: &train::Policy, seed: u64) -> (u32, u32, u32, u32) {
 /// Play one greedy game and dump per-tick positions to a compact JSON for the
 /// HTML viewer. Hand-rolled JSON — no serde, keeping the crate dependency-free.
 fn record_match(policy: &train::Policy, rng: &mut Rng, path: &Path) -> AppResult<()> {
+    record_match_vs(policy, None, rng, path)
+}
+
+/// As [`record_match`], but Team B is driven by `opponent` (a learned champion) when
+/// provided, else the scripted baseline — powers champion-vs-champion self-play viz.
+fn record_match_vs(
+    policy: &train::Policy,
+    opponent: Option<&train::Policy>,
+    rng: &mut Rng,
+    path: &Path,
+) -> AppResult<()> {
     let mut w = World::new();
     let mut frames = String::new();
     frames.push('[');
@@ -793,7 +1008,16 @@ fn record_match(policy: &train::Policy, rng: &mut Rng, path: &Path) -> AppResult
         for i in 1..N {
             act_a[i] = policy.act_greedy_world(&w, Team::A, i);
         }
-        let act_b = w.scripted_actions(Team::B);
+        let act_b = match opponent {
+            Some(opp) => {
+                let mut b = [A_STAY; N];
+                for i in 1..N {
+                    b[i] = opp.act_greedy_world(&w, Team::B, i);
+                }
+                b
+            }
+            None => w.scripted_actions(Team::B),
+        };
         w.step(&act_a, &act_b, rng);
 
         let (owner_code, owner_team, owner_idx) = match w.owner {
