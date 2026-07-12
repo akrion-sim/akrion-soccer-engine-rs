@@ -24391,6 +24391,22 @@ pub(crate) fn shot_shaping_reward_scale() -> f64 {
     *V.get_or_init(|| reward_weight_env("DD_SOCCER_SHOT_SHAPING_REWARD_SCALE", 1.0, 1e-4, 4.0))
 }
 
+/// Weight for the FINISHING ANCHOR: a high, hardcoded reward for putting a shot ON GOAL
+/// (on-frame). Paid in the sparse/terminal layer (OUTSIDE the +/-4 dense clamp), so it is a
+/// real terminal-scale pull toward finishing — the missing counterpart to the goal reward.
+/// Bonus = w * SHOT_ON_TARGET_REWARD_POINTS(80) * shot_on_frame_probability, on a shot action.
+/// (The engine's 80-pt "shot on target" was telemetry-only/inert; the live on-frame signal was
+/// ~1-3 pts vs a ~800 goal — no anchor.) Env `DD_SOCCER_ON_FRAME_SHOT_REWARD_SCALE`, clamped
+/// [0, 8], default **0.0** => byte-identical off.
+pub(crate) fn on_frame_shot_reward_scale() -> f64 {
+    if dynamic_reward_weights_enabled() {
+        return optional_reward_weight_env("DD_SOCCER_ON_FRAME_SHOT_REWARD_SCALE", 0.0, 8.0);
+    }
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| optional_reward_weight_env("DD_SOCCER_ON_FRAME_SHOT_REWARD_SCALE", 0.0, 8.0))
+}
+
 pub(crate) fn shot_commitment_reward_scale() -> f64 {
     #[cfg(test)]
     {
@@ -27409,6 +27425,20 @@ fn soccer_transition_reward_with_tactics(
         reward -= concede_penalty * goal_reward_scale();
     }
 
+    // FINISHING ANCHOR (operator 2026-07-12): a high, hardcoded reward for putting a shot ON GOAL
+    // (on-frame), paid HERE in the sparse/terminal layer (outside the +/-4 dense clamp) so it pulls
+    // toward finishing with terminal-scale force — the counterpart to the goal reward that was
+    // effectively MISSING (live on-frame-shot signal ~1-3 pts vs a ~800 goal; the 80-pt "shot on
+    // target" was telemetry-inert). Gated (default 0 = byte-identical off).
+    let on_frame_shot_w = on_frame_shot_reward_scale();
+    if on_frame_shot_w > 0.0 && soccer_label_is_shot(action) {
+        let on_frame = decision
+            .observation
+            .shot_on_frame_probability
+            .clamp(0.0, 1.0);
+        reward += on_frame_shot_w * SHOT_ON_TARGET_REWARD_POINTS * on_frame;
+    }
+
     if is_pass_like_action(action) {
         if let Some(receiver_player) = completed_same_team_pass_receiver(player, after) {
             let target = after
@@ -28890,6 +28920,19 @@ pub(crate) fn loose_ball_contest_pressure_enabled() -> bool {
     }
 }
 
+/// Amplifier for the LOOSE-BALL PURSUIT signal — scales BOTH the uncontested-time penalty
+/// (the cost of letting an unpossessed ball sit loose) and the win reward, so players commit
+/// to going for a loose ball their POMDP says they can win, and none is left loose too long.
+/// Env `DD_SOCCER_LOOSE_BALL_PURSUIT_SCALE`, clamped [1, 20], default 1.0 (byte-identical).
+pub(crate) fn loose_ball_pursuit_scale() -> f64 {
+    if dynamic_reward_weights_enabled() {
+        return reward_weight_env("DD_SOCCER_LOOSE_BALL_PURSUIT_SCALE", 1.0, 1.0, 20.0);
+    }
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| reward_weight_env("DD_SOCCER_LOOSE_BALL_PURSUIT_SCALE", 1.0, 1.0, 20.0))
+}
+
 /// Both-teams loose-ball **contest pressure**: a symmetric, time-escalating penalty
 /// charged to every outfield player on BOTH teams for each tick an unpossessed ball
 /// is left uncontested beyond the grace (so standing off a loose ball is never free
@@ -28932,7 +28975,8 @@ fn loose_ball_contest_pressure_reward(
         let secured = if won_as_holder { 1.0 } else { 0.4 };
         reward += reward_cfg.loose_ball_win_points * urgency_bonus * secured;
     }
-    reward
+    // Amplify pursuit so the favourite commits to a winnable loose ball and none sits loose too long.
+    reward * loose_ball_pursuit_scale()
 }
 
 #[cfg(test)]
