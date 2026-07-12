@@ -3820,6 +3820,55 @@ function animateField() {
 }
 requestAnimationFrame(animateField);
 
+// ---- design-system snapshot tiles + pass-mix bar (driven by live MatchStats) ----
+let possAccum = { home: 0, away: 0, tick: -1 };
+function setTile(id, val, cls) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = val;
+  el.className = "v" + (cls ? " " + cls : "");
+}
+function updateSnapshotTiles(s, f) {
+  if (!s || !f) return;
+  const cf = (s.passesCompletedForwardHome || 0) + (s.passesCompletedForwardAway || 0);
+  const cb = (s.passesCompletedBackwardHome || 0) + (s.passesCompletedBackwardAway || 0);
+  const cc = (s.passesCompletedHome || 0) + (s.passesCompletedAway || 0);
+  const cl = Math.max(0, cc - cf - cb);                         // lateral = completed − fwd − back
+  const att = (s.passesAttemptedHome || 0) + (s.passesAttemptedAway || 0);
+  const shotsT = (s.shotsHome || 0) + (s.shotsAway || 0);
+  const goalsT = (f.scoreHome || 0) + (f.scoreAway || 0);
+  const pct = (n, d) => d > 0 ? Math.round(100 * n / d) : 0;
+  // possession share — accumulate per tick so re-renders of the same frame don't double-count
+  const curTick = (state && state.summary && state.summary.ticks) | 0;
+  if (curTick < possAccum.tick) { possAccum.home = 0; possAccum.away = 0; }  // new match / rewind
+  if (curTick !== possAccum.tick) {
+    possAccum.tick = curTick;
+    const pt = String(livePossessionTeam(f) || "").toLowerCase();
+    if (pt.startsWith("home")) possAccum.home++;
+    else if (pt.startsWith("away")) possAccum.away++;
+  }
+  const possTot = possAccum.home + possAccum.away;
+  setTile("kpiPoss", (possTot > 0 ? Math.round(100 * possAccum.home / possTot) : 50) + "%", "accent");
+  const comp = pct(cc, att);
+  setTile("kpiPassComp", comp + "%", comp >= 80 ? "good" : "");
+  document.getElementById("kpiPassCompSub").textContent = att + " att";
+  const conv = pct(goalsT, shotsT);
+  setTile("kpiConv", conv + "%", goalsT > 0 ? "good" : "");
+  document.getElementById("kpiConvSub").textContent = shotsT + " shots · " + goalsT + " gl";
+  const total = cf + cl + cb;
+  setTile("kpiFwd", pct(cf, total) + "%", "");
+  document.getElementById("kpiFwdSub").textContent = cf + " fwd / " + cc;
+  const setSeg = (id, n) => {
+    const el = document.getElementById(id); if (!el) return;
+    const share = total > 0 ? n / total : 1 / 3;
+    el.style.flexGrow = String(Math.max(0.0001, share));
+    el.textContent = (total > 0 && share >= 0.10) ? Math.round(share * 100) + "%" : "";
+  };
+  setSeg("segFwd", cf); setSeg("segLat", cl); setSeg("segBack", cb);
+  document.getElementById("pmFwd").textContent = pct(cf, total) + "%";
+  document.getElementById("pmLat").textContent = pct(cl, total) + "%";
+  document.getElementById("pmBack").textContent = pct(cb, total) + "%";
+}
 function render() {
   maybeAutoAssignFirstController();
   if (!state) return;
