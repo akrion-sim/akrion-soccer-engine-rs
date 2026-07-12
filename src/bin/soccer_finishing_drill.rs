@@ -595,7 +595,9 @@ fn main() {
                 let sot_pe = b_sot as f64 / BLOCK as f64;
                 let mean_xg = b_xg / BLOCK as f64;
                 let hi_frac = b_hi as f64 / BLOCK as f64;
-                primary_blocks.push(hi_frac);
+                // SOT/ep is the engine's own chance-quality proxy and the most sensitive creation
+                // signal (hiXG-frac is sparse) — use it as the trend metric.
+                primary_blocks.push(sot_pe);
                 println!(
                     "{:>4}-{:<4}  {:>8.3}   {:>6.3}   {:>6.3}    {:>7.3}     steps={:>6}   loss={loss_s}",
                     ep + 2 - BLOCK,
