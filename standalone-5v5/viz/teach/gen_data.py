@@ -142,6 +142,44 @@ WEIGHT_META = {
 }
 NDIM = len(SPACE)
 
+# The reward anatomy for the teaching "what is being optimized" panel. Each term is
+# a field-vector delta scaled by a learnable weight (formulas cited to train.rs).
+REWARD_TERMS = [
+    {"name": "Goal", "sign": "+", "w": "REW_GOAL", "wv": 12.0, "group": "outcome",
+     "formula": "+goal when the ball crosses their line", "note": "the prize"},
+    {"name": "Concede", "sign": "−", "w": "REW_CONCEDE", "wv": 8.0, "group": "outcome",
+     "formula": "−concede when they score", "note": "the punishment"},
+    {"name": "Forward-progress shaping", "sign": "+", "w": "W_SHAPE", "wv": 2.2, "group": "potential",
+     "formula": "shape·(γ·Φ' − Φ),  Φ = ball.x / field length", "note": "telescopes → un-farmable"},
+    {"name": "Shot on goal", "sign": "+", "w": "REW_SHOT_BASE·+·REW_SHOT_Q", "wv": 1.5, "group": "finish",
+     "formula": "(shot_base + shot_q·placement)·xG", "note": "a missed on-target shot ≤ 40% of a goal"},
+    {"name": "Pass completed", "sign": "+", "w": "REW_PASS·+·W_FIELD_PASS", "wv": 0.06, "group": "passing",
+     "formula": "pass_credit·field_pass + Δ(safe-outlet value)", "note": "instrumental, not the prize"},
+    {"name": "Turnover", "sign": "−", "w": "REW_TURNOVER", "wv": 0.55, "group": "possession",
+     "formula": "−turnover·(0.75 + turnover_risk)", "note": "scaled by how risky the loss was"},
+    {"name": "Dribble turnover", "sign": "−", "w": "REW_DRIBBLE_TURNOVER", "wv": 0.75, "group": "possession",
+     "formula": "−dribble_turnover·(0.75 + dribble_pressure)", "note": "punish forcing it under pressure"},
+    {"name": "Win the ball back", "sign": "+", "w": "REW_WIN_BALL", "wv": 0.3, "group": "pressing",
+     "formula": "+win_ball·(0.75 + 0.25·goalside_score)", "note": "reward the press paying off"},
+    {"name": "Chance created", "sign": "+", "w": "W_CHANCE", "wv": 0.12, "group": "finish",
+     "formula": "+chance·Δ(best team xG in a clear lane)", "note": "MARL: move into a scoring shape"},
+    {"name": "Teammate spacing", "sign": "±", "w": "SPACING_W", "wv": 0.008, "group": "spacing",
+     "formula": "peaks +8 at 8 yds, steep −100 under 1 yd", "note": "optimum sits WIDE"},
+    {"name": "Goalside geometry", "sign": "+", "w": "W_GOALSIDE", "wv": 0.08, "group": "defense",
+     "formula": "+goalside·(goalside value)", "note": "stay between attacker and goal"},
+    {"name": "Ping-pong / stall", "sign": "−", "w": "REW_RETURN_PASS", "wv": 0.35, "group": "passing",
+     "formula": "−return_pass·2^(k−1) for repeated square passes", "note": "no cowardly recycling"},
+]
+
+# Real PPO / training hyperparameters (train.rs), surfaced in a config panel.
+HYPERPARAMS = {
+    "gamma": 0.995, "lambda": 0.95, "clip": 0.2,
+    "lr_actor": 3e-4, "lr_critic": 1e-3, "lr_speed": 9e-5,
+    "epochs": 4, "minibatch": 1024, "ent_beta0": 0.02,
+    "games_per_iter": 12, "ticks_per_episode": 600, "hz": 20,
+    "field": [42, 28], "goal_half": 3.5, "players_per_team": 5,
+}
+
 
 def norm_of(raw):
     """raw weight vector -> normalized [0,1] per dim (log-aware), matching tune.py."""
