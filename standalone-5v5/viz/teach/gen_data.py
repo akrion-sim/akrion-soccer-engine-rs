@@ -154,23 +154,29 @@ def value_iteration():
         for y in range(GH):
             d = abs(y - GH / 2) / (GH / 2)
             loss[x, y] = 0.02 + 0.10 * (x / GW) * (1 - d)   # deep+central = more contested
+    mouth_set = set((goal_x, y) for y in mouth)
     V = np.zeros((GW, GH))
+    for (mx, my) in mouth_set:
+        V[mx, my] = 1.0                        # absorbing goal cells
     frames = []
     for sweep in range(28):
         Vn = V.copy()
         delta = 0.0
         for x in range(GW):
             for y in range(GH):
-                if x == goal_x and y in mouth:
-                    Vn[x, y] = 1.0
+                if (x, y) in mouth_set:
+                    Vn[x, y] = 1.0             # terminal: stay pinned at goal value
                     continue
                 # actions: advance (x+1), diagonal up/down, hold, square pass (y±2)
                 cand = []
                 moves = [(1, 0), (1, 1), (1, -1), (0, 1), (0, -1), (0, 0), (0, 2), (0, -2)]
                 for dx, dy in moves:
                     nx, ny = min(GW - 1, max(0, x + dx)), min(GH - 1, max(0, y + dy))
-                    keep = 1.0 - loss[nx, ny]
-                    cand.append(Rw[nx, ny] + gamma * keep * V[nx, ny])
+                    if (nx, ny) in mouth_set:
+                        cand.append(1.0)       # scoring is terminal, value 1.0 (no continuation)
+                    else:
+                        keep = 1.0 - loss[nx, ny]
+                        cand.append(Rw[nx, ny] + gamma * keep * V[nx, ny])
                 Vn[x, y] = max(cand)
                 delta = max(delta, abs(Vn[x, y] - V[x, y]))
         V = Vn
