@@ -512,62 +512,112 @@ fn main() {
             .expect("freeze home net");
     }
 
+    // Snapshot the net BEFORE training — the paired-eval baseline (a fresh net for finishing-from-
+    // scratch, or the warm-start league net for creation). Eval then isolates what TRAINING added.
+    let baseline_snap = sim.neural_network_snapshot_for(Team::Home);
+
     let field_length = sim.config.field_length_yards;
+    let field_width = sim.config.field_width_yards;
     let base_seed = seed as u64;
+    let mode_label = if creation { "creation" } else { "finishing" };
 
     println!(
-        "finishing-drill: episodes={episodes} seed={seed:#x} defenders={num_defenders} \
+        "soccer-drill mode={mode_label} episodes={episodes} seed={seed:#x} defenders={num_defenders} \
          max_ticks={max_ticks} warmstart={} frozen={frozen}",
         warmstart.as_deref().unwrap_or("none"),
     );
-    println!(
-        "  coupling: authoritative_lambda={} discretized_kick={} min_kick_candidates={}",
-        std::env::var("DD_SOCCER_NEURAL_AUTHORITATIVE_LAMBDA").unwrap_or_default(),
-        std::env::var("DD_SOCCER_ENABLE_DISCRETIZED_KICK").unwrap_or_default(),
-        std::env::var("SOCCER_NEURAL_MCTS_MIN_DISCRETIZED_KICK_CANDIDATES").unwrap_or_default(),
-    );
-    println!("  eps      scoring_rate  (goals/50)     cumulative    train_steps    critic_loss");
+    if creation {
+        println!(
+            "  serving: engine-default blend (analytic executes the shot; net learns MOVEMENT+PASSING).  high_xG>{HIGH_XG_THRESHOLD}"
+        );
+        println!("  eps       shots/ep   sot/ep    meanXG   hiXG-frac    train_steps   critic_loss");
+    } else {
+        println!(
+            "  coupling: authoritative_lambda={} discretized_kick={} min_kick_candidates={}",
+            std::env::var("DD_SOCCER_NEURAL_AUTHORITATIVE_LAMBDA").unwrap_or_default(),
+            std::env::var("DD_SOCCER_ENABLE_DISCRETIZED_KICK").unwrap_or_default(),
+            std::env::var("SOCCER_NEURAL_MCTS_MIN_DISCRETIZED_KICK_CANDIDATES").unwrap_or_default(),
+        );
+        println!("  eps      scoring_rate  (goals/50)     cumulative    train_steps    critic_loss");
+    }
 
     const BLOCK: usize = 50;
-    let mut block_goals = 0usize;
+    let mut b_goals = 0usize;
+    let mut b_shots = 0u32;
+    let mut b_sot = 0u32;
+    let mut b_xg = 0.0f64;
+    let mut b_hi = 0usize;
     let mut total_goals = 0usize;
-    let mut block_rates: Vec<f64> = Vec::new();
+    // Primary metric per block for the trend verdict: finishing → goal rate; creation → hiXG frac.
+    let mut primary_blocks: Vec<f64> = Vec::new();
 
     for ep in 0..episodes {
         let mut rng = Rng::new(base_seed.wrapping_add(ep as u64));
-        let scored = play_one_episode(&mut sim, &mut rng, num_defenders, max_ticks, field_length);
-        if scored {
-            block_goals += 1;
+        let m = play_episode(
+            &mut sim,
+            &mut rng,
+            creation,
+            num_defenders,
+            max_ticks,
+            field_width,
+            field_length,
+        );
+        if m.goal {
+            b_goals += 1;
             total_goals += 1;
+        }
+        b_shots += m.shots;
+        b_sot += m.sot;
+        b_xg += m.best_xg;
+        if m.best_xg > HIGH_XG_THRESHOLD {
+            b_hi += 1;
         }
 
         // Train: flush the learner at every episode boundary.
         sim.drain_neural_learning(Duration::from_millis(200));
 
         if (ep + 1) % BLOCK == 0 {
-            let rate = block_goals as f64 / BLOCK as f64;
-            block_rates.push(rate);
-            let cum = total_goals as f64 / (ep + 1) as f64;
-            // Direct learner-progress readout: the critic's training-step count and running
-            // loss. This is the robust "the net is learning" signal — the per-block CONVERSION
-            // is a high-variance downstream proxy, but steps↑ / loss-evolving proves the finishing
-            // reward is training the critic every block, independent of shot-outcome noise.
             let (steps, loss) = sim
                 .neural_network_snapshot_for(Team::Home)
                 .map(|s| (s.training_steps, s.average_loss))
                 .unwrap_or((0, None));
-            println!(
-                "{:>4}-{:<4}  {:>9.3}   ({:>3}/{:<3})   cum={:>5.3}   steps={:>6}   loss={}",
-                ep + 2 - BLOCK,
-                ep + 1,
-                rate,
-                block_goals,
-                BLOCK,
-                cum,
-                steps,
-                loss.map(|l| format!("{l:.4}")).unwrap_or_else(|| "n/a".into()),
-            );
-            block_goals = 0;
+            let loss_s = loss.map(|l| format!("{l:.4}")).unwrap_or_else(|| "n/a".into());
+            if creation {
+                let shots_pe = b_shots as f64 / BLOCK as f64;
+                let sot_pe = b_sot as f64 / BLOCK as f64;
+                let mean_xg = b_xg / BLOCK as f64;
+                let hi_frac = b_hi as f64 / BLOCK as f64;
+                primary_blocks.push(hi_frac);
+                println!(
+                    "{:>4}-{:<4}  {:>8.3}   {:>6.3}   {:>6.3}    {:>7.3}     steps={:>6}   loss={loss_s}",
+                    ep + 2 - BLOCK,
+                    ep + 1,
+                    shots_pe,
+                    sot_pe,
+                    mean_xg,
+                    hi_frac,
+                    steps,
+                );
+            } else {
+                let rate = b_goals as f64 / BLOCK as f64;
+                primary_blocks.push(rate);
+                let cum = total_goals as f64 / (ep + 1) as f64;
+                println!(
+                    "{:>4}-{:<4}  {:>9.3}   ({:>3}/{:<3})   cum={:>5.3}   steps={:>6}   loss={loss_s}",
+                    ep + 2 - BLOCK,
+                    ep + 1,
+                    rate,
+                    b_goals,
+                    BLOCK,
+                    cum,
+                    steps,
+                );
+            }
+            b_goals = 0;
+            b_shots = 0;
+            b_sot = 0;
+            b_xg = 0.0;
+            b_hi = 0;
         }
     }
 
