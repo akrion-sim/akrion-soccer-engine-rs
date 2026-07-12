@@ -482,50 +482,72 @@ def decision_examples():
 #    objective in the aim coordinate). Pick the constrained optimum. That's MPC.
 # ─────────────────────────────────────────────────────────────────────────────
 def mpc_example():
+    """The real shot-aim optimizer (game.rs:1289-1333). The finish enumerates 7 aim
+    points across the mouth and maximizes  keeper_gap + 3·lane_clear  — "shoot to the
+    open corner farthest from the keeper." That objective is a smooth (near-quadratic)
+    function of the aim coordinate; the 7-point enumeration is a discretized line
+    search over exactly the surface a QP/neural MPC would solve continuously (the code
+    even says so). We return BOTH the 7 real posts and a fine sweep of the surface."""
     L, W = 42.0, 28.0
-    goal_x = L; center = W / 2; goal_half = 3.4
-    shooter = [34.0, 12.5]
-    keeper = [40.6, 13.6]
-    defenders = [[37.0, 12.0], [36.0, 15.4]]
-    y0, y1 = center - goal_half, center + goal_half
-    aims = []
-    N = 61
-    for k in range(N):
-        y = y0 + (y1 - y0) * k / (N - 1)
-        aim = [goal_x, y]
-        # geometry
-        dx, dy = aim[0]-shooter[0], aim[1]-shooter[1]
-        dist = math.hypot(dx, dy)
-        # keeper gap: how far the aim is from where the keeper can cover (its y), normalized
-        keeper_gap = abs(y - keeper[1])
-        # lane coverage: defenders sitting on the shot line reduce the score (quadratic falloff)
-        lane = 0.0
+    goal_x = L; cy = W / 2; goal_half = 3.5
+    margin = goal_half - 0.35                       # 3.15  (game.rs:1298)
+    shooter = [34.0, 12.6]
+    keeper = [40.4, 12.0]                            # keeper cheats to the near side
+    defenders = [[37.4, 13.6], [38.5, 15.2]]
+
+    def lane_clear(y):
+        # clearness of the shooter->aim lane: 1.0 clear, falls off as a defender nears it
+        ax, ay = goal_x, y
+        dx, dy = ax - shooter[0], ay - shooter[1]
+        seg2 = dx*dx + dy*dy + 1e-9
+        worst = 0.0
         for d in defenders:
-            # perpendicular distance of defender to the shooter->aim segment
-            t = ((d[0]-shooter[0])*dx + (d[1]-shooter[1])*dy) / (dist*dist + 1e-9)
-            t = max(0.0, min(1.0, t))
+            t = max(0.0, min(1.0, ((d[0]-shooter[0])*dx + (d[1]-shooter[1])*dy) / seg2))
             px, py = shooter[0]+t*dx, shooter[1]+t*dy
             perp = math.hypot(d[0]-px, d[1]-py)
-            lane += math.exp(-(perp*perp) / (2*1.1**2))
-        # near-post/far-post feasibility: keep aim inside the posts (constraint)
-        score = 1.4*keeper_gap - 2.6*lane - 0.15*abs(y-center)
-        aims.append({"y": round(y, 3), "keeper_gap": round(keeper_gap, 3),
-                     "lane": round(lane, 4), "score": round(score, 4)})
-    best = max(range(N), key=lambda k: aims[k]["score"])
-    ay = aims[best]["y"]
-    dist = math.hypot(goal_x-shooter[0], ay-shooter[1])
-    angle = math.degrees(math.atan2(goal_half*2, dist))
-    xg = round(1/(1+math.exp((dist-10)/3.2)) * (0.35+0.65*min(1,angle/40)), 3)
-    smax = max(a["score"] for a in aims); smin = min(a["score"] for a in aims)
-    placement = round((aims[best]["score"]-smin)/(smax-smin+1e-9), 3)
+            worst = max(worst, math.exp(-(perp*perp) / (2*1.0**2)))
+        return 1.0 - worst
+
+    def score_at(y):
+        keeper_gap = math.hypot(goal_x-keeper[0], y-keeper[1])   # gk.sub(aim).len()
+        lc = lane_clear(y)
+        return keeper_gap + 3.0*lc, keeper_gap, lc
+
+    # (a) the 7 real enumerated posts
+    posts = []
+    for k in range(7):
+        y = cy - margin + 2.0*margin*(k/6.0)
+        s, kg, lc = score_at(y)
+        posts.append({"y": round(y, 3), "score": round(s, 4),
+                      "keeper_gap": round(kg, 3), "lane": round(lc, 4)})
+    best = max(range(7), key=lambda k: posts[k]["score"])
+    by = posts[best]["y"]
+
+    # (b) a fine sweep of the SAME objective surface (for the smooth QP curve)
+    sweep = []
+    NS = 81
+    for k in range(NS):
+        y = cy - margin + 2.0*margin*(k/(NS-1))
+        s, kg, lc = score_at(y)
+        sweep.append({"y": round(y, 3), "score": round(s, 4), "lane": round(lc, 4),
+                      "keeper_gap": round(kg, 3)})
+
+    # placement quality q = (best_score/12).clamp(0,1)   (game.rs:1317)
+    placement = round(min(1.0, max(0.0, posts[best]["score"]/12.0)), 3)
+    # xG (game.rs:1323): dist_f² · (0.4 + 0.6·angle_f)
+    d = math.hypot(goal_x-shooter[0], cy-shooter[1])
+    lateral = abs(shooter[1] - cy)
+    dist_f = max(0.0, min(1.0, 1.0 - d/26.0))
+    angle_f = max(0.0, min(1.0, 1.0 - lateral/(W/2)))
+    xg = round(dist_f*dist_f*(0.4 + 0.6*angle_f), 3)
+    shot_base, shot_q = 1.5, 1.0
     return {
         "field": [L, W], "goal_half": goal_half, "shooter": shooter, "keeper": keeper,
-        "defenders": defenders, "mouth": [round(y0,2), round(y1,2)],
-        "aims": aims, "best": best, "best_y": round(ay, 3),
-        "xg": xg, "placement": placement,
-        "shot_base": 1.5, "shot_q": 1.0,
-        "reward": round((1.5 + 1.0*placement) * xg, 3),
-        "dist": round(dist, 2), "angle": round(angle, 1),
+        "defenders": defenders, "mouth": [round(cy-margin, 2), round(cy+margin, 2)],
+        "posts": posts, "sweep": sweep, "best": best, "best_y": round(by, 3),
+        "xg": xg, "placement": placement, "shot_base": shot_base, "shot_q": shot_q,
+        "reward": round((shot_base + shot_q*placement) * xg, 3),
+        "dist": round(d, 2), "objective": "keeper_gap + 3·lane_clear",
     }
 
 
