@@ -74,6 +74,10 @@ fn run() -> AppResult<()> {
             let cfg = parse_run_config(&args)?;
             run_training(&cfg)?;
         }
+        "selfplay" => {
+            let cfg = parse_run_config(&args)?;
+            run_selfplay(&cfg)?;
+        }
         "sanity" => sanity(),
         "inspect" => {
             let seed: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(7);
