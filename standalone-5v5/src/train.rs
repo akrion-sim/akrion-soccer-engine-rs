@@ -6,6 +6,7 @@ use crate::game::*;
 use crate::nn::{masked_softmax, Mlp};
 use crate::rng::Rng;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 
 // SPEED WARMUP CURRICULUM: while true, every player uses a fixed run-medium gear
 // (v3 behavior) instead of sampling the speed policy. This lets the ACTION policy
