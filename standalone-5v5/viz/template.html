@@ -515,6 +515,26 @@ playBtn.onclick=()=>{
   playing=!playing; playBtn.textContent=playing?'Pause':'Play'; last=0;
 };
 document.getElementById('restart').onclick=()=>{fi=0;playing=true;playBtn.textContent='Pause';last=0;render();};
+// LIVE "New Game": ask the server to record a fresh match with the trained model
+// (a new random seed), swap it into the AFTER panel, and play it. Needs the live
+// server (viz/serve_live.py); on the static server the fetch fails and we say so.
+const newGameBtn=document.getElementById('newgame');
+if(newGameBtn){newGameBtn.onclick=async()=>{
+  const old=newGameBtn.textContent; newGameBtn.disabled=true; newGameBtn.textContent='…generating';
+  try{
+    const seed=Math.floor(Math.random()*1e9);
+    const r=await fetch('/newgame?seed='+seed);
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const m=await r.json();
+    if(!m || !m.frames || !m.frames.length) throw new Error('empty match');
+    AFTER=m; NF=Math.min(BEFORE.frames.length,AFTER.frames.length); scrub.max=NF-1;
+    fi=0; playing=true; playBtn.textContent='Pause'; last=0; render();
+    newGameBtn.textContent=old;
+  }catch(e){
+    newGameBtn.textContent='needs live server';
+    setTimeout(()=>{newGameBtn.textContent=old;},1800);
+  }finally{ newGameBtn.disabled=false; }
+};}
 scrub.oninput=()=>{fi=+scrub.value;playing=false;playBtn.textContent='Play';render();};
 playBtn.textContent=playing?'Pause':'Play';
 window.addEventListener('resize',()=>{P0.resize();P1.resize();render();});
