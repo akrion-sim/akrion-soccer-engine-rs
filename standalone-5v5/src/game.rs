@@ -920,17 +920,16 @@ impl World {
             integrate(&mut self.b[i]);
         }
 
-<<<<<<< HEAD
-        // There is intentionally no post-integration collision shove. Teammate
-        // separation belongs in the per-player MPC objective below, so players
-        // choose non-convergent velocities from the field vector instead of
-        // being teleported apart after making a bad movement decision.
-=======
-        // Hard same-team keep-out: the reward still teaches spacing, but visible
-        // <3yd stacks are never a good 5-a-side state. This is the formation-free
-        // analogue of the 11v11 same-team separation floor.
+        // Same-team separation is primarily LEARNED: the field-aware MPC spacing
+        // objective pushes players to choose non-convergent velocities from the
+        // field vector, so they don't converge in the first place — that is where
+        // the actual teaching happens. The hard resolver below is only a last-resort
+        // BACKSTOP (kept as an explicit safety net per product decision): after the
+        // soft objective has had its say, a residual <3yd stack from a bad movement
+        // decision is nudged apart so it's never a *visible* 5-a-side state. Soft
+        // MPC/reward do the teaching; this only catches what slips through.
+        // (Formation-free analogue of the 11v11 same-team separation floor.)
         self.resolve_same_team_spacing();
->>>>>>> 7651dddfc431b3f7dcb433062d80cb062f03a1dc
 
         // 3. Resolve a kick (frees the ball) or carry it with the owner.
         if let Some((kicker, dir, speed, is_pass)) = kick {
