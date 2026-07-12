@@ -969,7 +969,16 @@ fn record_match_vs(
         for i in 1..N {
             act_a[i] = policy.act_greedy_world(&w, Team::A, i);
         }
-        let act_b = w.scripted_actions(Team::B);
+        let act_b = match opponent {
+            Some(opp) => {
+                let mut b = [A_STAY; N];
+                for i in 1..N {
+                    b[i] = opp.act_greedy_world(&w, Team::B, i);
+                }
+                b
+            }
+            None => w.scripted_actions(Team::B),
+        };
         w.step(&act_a, &act_b, rng);
 
         let (owner_code, owner_team, owner_idx) = match w.owner {
