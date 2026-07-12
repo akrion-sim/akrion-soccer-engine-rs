@@ -1834,10 +1834,26 @@ fn main() {
                     checkpoint_validate_min_net_forward_pass_margin,
                     checkpoint_validate_min_goal_diff_margin,
                 );
-                if passes_forward_pass_climb
-                    && ((passes_forward_pass_floor && passes_net_forward_pass_floor)
-                        || passes_goal_diff_floor)
-                    && passes_validation
+                let promotes = if self_play_ladder {
+                    // 5v5-style ladder gate: promote iff the challenger beat the CURRENT champion by
+                    // the goal-diff margin over the held-out head-to-head eval (checkpoint_incumbent =
+                    // the current published champion). Republishing the frontier below advances the
+                    // champion, so next round's opponent is this stronger net — the ladder climbs.
+                    let ladder_promotes = gate_goal_diff_margin >= self_play_promote_margin;
+                    println!(
+                        "league_self_play_ladder round={round} gd_vs_champion={:.3} promote_margin={:.3} verdict={}",
+                        gate_goal_diff_margin,
+                        self_play_promote_margin,
+                        if ladder_promotes { "PROMOTED" } else { "held" }
+                    );
+                    ladder_promotes
+                } else {
+                    passes_forward_pass_climb
+                        && ((passes_forward_pass_floor && passes_net_forward_pass_floor)
+                            || passes_goal_diff_floor)
+                        && passes_validation
+                };
+                if promotes
                 {
                     let cp = format!(
                         "{}/league-r{:04}-{}.json",
