@@ -332,38 +332,8 @@ fn main() {
 
     for ep in 0..episodes {
         let mut rng = Rng::new(base_seed.wrapping_add(ep as u64));
-        setup_scenario(&mut sim, &mut rng, num_defenders);
-
-        let score_before = sim.score_home;
-        let mut scored = false;
-        for _ in 0..max_ticks {
-            sim.run_time_step();
-            if sim.score_home > score_before {
-                scored = true;
-                break;
-            }
-            // Shot resolved against us (keeper save / defender block / interception) …
-            if sim.ball.last_touch_team == Some(Team::Away) {
-                break;
-            }
-            // … or the ball left the attacking third.
-            if sim.ball.position.y < field_length * 0.60 {
-                break;
-            }
-            if sim.is_done() {
-                break;
-            }
-        }
-
+        let scored = play_one_episode(&mut sim, &mut rng, num_defenders, max_ticks, field_length);
         if scored {
-            // Flush the ~25-tick goal celebration + kickoff reset so it can't clobber the
-            // next scenario (the celebration counter is pub(crate), unreachable from a bin).
-            for _ in 0..30 {
-                if sim.is_done() {
-                    break;
-                }
-                sim.run_time_step();
-            }
             block_goals += 1;
             total_goals += 1;
         }
