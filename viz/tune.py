@@ -109,7 +109,6 @@ SIGMA0 = env_float("TUNE_SIGMA", 0.18, lo=0.001, hi=1.0)
 RNG = random.Random(env_int("TUNE_RNG", 11))
 HALTON_BASES = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71]
 
-<<<<<<< HEAD
 # Fail fast on misconfiguration instead of dividing by zero deep in the sweep
 # (aggregate_fitness divides by len(SEEDS); the elite update divides by ELITE).
 if not SEEDS:
@@ -119,18 +118,11 @@ if POP < 1:
 if not (1 <= ELITE <= POP):
     sys.exit(f"TUNE_ELITE={ELITE} must be in [1, TUNE_POP={POP}]")
 
-MIN_WEAK_SIDE = float(os.environ.get("TUNE_MIN_WEAK_SIDE", "0.25"))
-MIN_SHOTS = int(os.environ.get("TUNE_MIN_SHOTS", "1"))
-MIN_SOT = int(os.environ.get("TUNE_MIN_SOT", "1"))
-MIN_SHOTS_AFTER_PASS = int(os.environ.get("TUNE_MIN_SHOTS_AFTER_PASS", "1"))
-GATE_PENALTY = float(os.environ.get("TUNE_GATE_PENALTY", "6.0"))
-=======
 MIN_WEAK_SIDE = env_float("TUNE_MIN_WEAK_SIDE", 0.25, lo=0.0, hi=1.0)
 MIN_SHOTS = env_int("TUNE_MIN_SHOTS", 1, lo=0)
 MIN_SOT = env_int("TUNE_MIN_SOT", 1, lo=0)
 MIN_SHOTS_AFTER_PASS = env_int("TUNE_MIN_SHOTS_AFTER_PASS", 1, lo=0)
 GATE_PENALTY = env_float("TUNE_GATE_PENALTY", 6.0, lo=0.0)
->>>>>>> dynamic-rewards-wip
 
 FIXED_ENV = {
     "SOCCER_DYNAMIC_REWARD_WEIGHTS": "1",
