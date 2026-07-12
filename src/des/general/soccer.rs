@@ -24328,7 +24328,8 @@ pub(crate) fn forward_pass_reward_scale() -> f64 {
 /// (`PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS` / `..THREE_NET_FORWARD..`). These fire only for
 /// strings of forward passes, so amplifying them rewards sustained progression (build-up) rather
 /// than single hopeful forward balls — a quality signal complementary to deferred credit. Env
-/// `DD_SOCCER_PASS_CHAIN_REWARD_SCALE`, clamped [0,20], default 1.0 => byte-identical.
+/// `DD_SOCCER_PASS_CHAIN_REWARD_SCALE`, clamped [1e-4,20] (reward_weight_env floors the min at the
+/// 1e-4 non-zero weight floor so the channel never fully dies), default 1.0 => byte-identical.
 pub(crate) fn pass_chain_reward_scale() -> f64 {
     if dynamic_reward_weights_enabled() {
         return reward_weight_env("DD_SOCCER_PASS_CHAIN_REWARD_SCALE", 1.0, 0.0, 20.0);
@@ -24361,7 +24362,7 @@ pub(crate) fn forward_pass_turnover_penalty_scale() -> f64 {
 /// Companion dampener for the shot-TAKEN shaping proxy (on-/off-target reward, NOT the goal or
 /// terminal-outcome reward, which stay intact — the net must still finish). Lets a forward-pass-
 /// primacy A/B stop the net shooting early instead of building up. Env
-/// `DD_SOCCER_SHOT_SHAPING_REWARD_SCALE` (clamped 0-1), default 1.0 ⇒ unchanged.
+/// `DD_SOCCER_SHOT_SHAPING_REWARD_SCALE` (clamped [1e-4,4.0]), default 1.0 ⇒ unchanged.
 pub(crate) fn shot_shaping_reward_scale() -> f64 {
     if dynamic_reward_weights_enabled() {
         return reward_weight_env("DD_SOCCER_SHOT_SHAPING_REWARD_SCALE", 1.0, 1e-4, 4.0);
@@ -27301,7 +27302,7 @@ fn soccer_transition_reward_with_tactics(
         // scoring — a full-parity hit for the back line, a role-graded share for outfielders —
         // rather than a token cost. OFF ⇒ the original 8/2 values, byte-identical baseline / A/B.
         let symmetric = dd_soccer_enable_concede_symmetry();
-        reward -= if matches!(player.role, PlayerRole::Goalkeeper | PlayerRole::Defender) {
+        let concede_penalty = if matches!(player.role, PlayerRole::Goalkeeper | PlayerRole::Defender) {
             if symmetric {
                 reward_cfg.concede_keeper_defender_penalty_symmetric
             } else {
@@ -27312,6 +27313,16 @@ fn soccer_transition_reward_with_tactics(
         } else {
             reward_cfg.concede_outfield_penalty
         };
+        // Keep the concede STICK on the SAME multiplier as the goal CARROT above
+        // (goal_reward_scale). Otherwise cranking the sparse-terminal lever (e.g.
+        // DD_SOCCER_GOAL_REWARD_SCALE=8, the goal-dom regime) amplifies scoring but
+        // leaves conceding at the light baseline, blowing the carrot:stick ratio to
+        // ~200:1 and erasing the defensive signal (both self-play teams go all-out
+        // attack and leak at the back). Scaling both together preserves the ratio as
+        // the terminal signal rises above the dense floor. At the default scale of
+        // 1.0 this is byte-identical to the prior baseline — it only bites once the
+        // goal scale is raised above 1.
+        reward -= concede_penalty * goal_reward_scale();
     }
 
     if is_pass_like_action(action) {

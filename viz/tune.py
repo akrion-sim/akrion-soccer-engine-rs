@@ -72,6 +72,15 @@ SEEDS = [s.strip() for s in os.environ.get("TUNE_SEEDS", "0x5EED0000").split(","
 SIGMA0 = float(os.environ.get("TUNE_SIGMA", "0.18"))
 RNG = random.Random(int(os.environ.get("TUNE_RNG", "11")))
 
+# Fail fast on misconfiguration instead of dividing by zero deep in the sweep
+# (aggregate_fitness divides by len(SEEDS); the elite update divides by ELITE).
+if not SEEDS:
+    sys.exit("TUNE_SEEDS is empty — provide at least one seed")
+if POP < 1:
+    sys.exit(f"TUNE_POP={POP} must be >= 1")
+if not (1 <= ELITE <= POP):
+    sys.exit(f"TUNE_ELITE={ELITE} must be in [1, TUNE_POP={POP}]")
+
 MIN_WEAK_SIDE = float(os.environ.get("TUNE_MIN_WEAK_SIDE", "0.25"))
 MIN_SHOTS = int(os.environ.get("TUNE_MIN_SHOTS", "1"))
 MIN_SOT = int(os.environ.get("TUNE_MIN_SOT", "1"))
@@ -272,8 +281,15 @@ def run_one(vec, seed, cand_index, seed_index):
 
 
 def eval_pool(vectors):
+    # Each child's stdout+stderr goes to a FILE, not a PIPE. A ratchet run prints
+    # far more than the ~64KB OS pipe buffer, and the old code only drained the
+    # pipe *after* poll() reported exit — so a child could block on write()
+    # forever and wedge the whole (multi-hour) sweep. A file sink can't deadlock.
+    # Each child also gets a hard deadline and is killed + scored as a failure if
+    # it overruns (the safe run_one() already did this; eval_pool now matches).
+    timeout_s = int(os.environ.get("TUNE_TIMEOUT_SECONDS", "3600"))
     jobs = [(ci, si, vec, seed) for ci, vec in enumerate(vectors) for si, seed in enumerate(SEEDS)]
-    running = {}
+    running = {}  # proc -> (ci, si, logpath, logfile, deadline)
     results = {}
     next_job = 0
     while next_job < len(jobs) or running:
@@ -284,6 +300,10 @@ def eval_pool(vectors):
             env.update(FIXED_ENV)
             for (name, *_), value in zip(SPACE, vec):
                 env[name] = f"{value:.8g}"
+            outdir = os.path.join(ROOT, "out_tune_11v11", f"cand_{ci}_seed_{si}")
+            os.makedirs(outdir, exist_ok=True)
+            logpath = os.path.join(outdir, "stdout.log")
+            logf = open(logpath, "w")
             cmd = [
                 BIN,
                 str(ITERS_GAMES),
@@ -296,18 +316,30 @@ def eval_pool(vectors):
                 cmd,
                 env=env,
                 cwd=ROOT,
-                stdout=subprocess.PIPE,
+                stdout=logf,
                 stderr=subprocess.STDOUT,
                 text=True,
             )
-            running[proc] = (ci, si)
+            running[proc] = (ci, si, logpath, logf, time.time() + timeout_s)
         time.sleep(1.0)
         for proc in list(running):
-            if proc.poll() is None:
-                continue
-            ci, si = running.pop(proc)
-            out, _ = proc.communicate()
-            results[(ci, si)] = parse(out)
+            ci, si, logpath, logf, deadline = running[proc]
+            done = proc.poll() is not None
+            if not done and time.time() > deadline:
+                proc.kill(); proc.wait(); done = True
+            if done:
+                running.pop(proc)
+                logf.close()
+                try:
+                    with open(logpath) as fh:
+                        out = fh.read()
+                except OSError:
+                    out = ""
+                results[(ci, si)] = parse(out)
+    if not any(v is not None for v in results.values()):
+        sys.exit("NO candidate produced a parseable summary this generation — the "
+                 "ratchet output format likely changed (check CAND_RE) or every run "
+                 "crashed/timed out. Aborting rather than ranking pure noise.")
     fits = []
     for ci in range(len(vectors)):
         seed_metrics = [results.get((ci, si)) for si in range(len(SEEDS))]

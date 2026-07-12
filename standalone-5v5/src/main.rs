@@ -80,6 +80,26 @@ fn run() -> AppResult<()> {
             let out_dir = parse_out_dir(&args, 3)?;
             inspect(seed, &out_dir)?;
         }
+        "play" => {
+            let seed: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(7);
+            let mut out_dir = PathBuf::from("out");
+            let mut out_path: Option<PathBuf> = None;
+            let mut i = 3;
+            while i < args.len() {
+                let flag = args[i].as_str();
+                let val = args
+                    .get(i + 1)
+                    .ok_or_else(|| format!("missing value for {flag}"))?;
+                match flag {
+                    "--out-dir" => out_dir = PathBuf::from(val),
+                    "--out" => out_path = Some(PathBuf::from(val)),
+                    other => return Err(format!("unknown option for play: {other}").into()),
+                }
+                i += 2;
+            }
+            let out_path = out_path.unwrap_or_else(|| out_dir.join("match_live.json"));
+            play(seed, &out_dir, &out_path)?;
+        }
         "help" | "--help" | "-h" => print_usage(),
         other => return Err(format!("unknown command: {other}; run with --help for usage").into()),
     }
@@ -90,6 +110,7 @@ fn print_usage() {
     println!("usage:");
     println!("  cargo run --release -- train [iters] [--seed N] [--games-per-iter N] [--bc-games N] [--bc-epochs N] [--eval-every N] [--eval-games N] [--final-games N] [--display-seed-max N] [--out-dir DIR]");
     println!("  cargo run --release -- inspect [seed] [--out-dir DIR]");
+    println!("  cargo run --release -- play [seed] [--out-dir DIR] [--out PATH]  # record one match (live New Game)");
     println!("  cargo run --release -- sanity");
 }
 
@@ -169,6 +190,30 @@ fn parse_run_config(args: &[String]) -> AppResult<RunConfig> {
         return Err("display-seed-max must be > 0".into());
     }
     Ok(cfg)
+}
+
+/// Load the trained policy from `out_dir` and record ONE fresh match (viz JSON)
+/// with the given seed to `out_path` — powers the live "New Game" button, which
+/// the live server (viz/serve_live.py) invokes per click with a random seed.
+///   cargo run --release -- play [seed] [--out-dir DIR] [--out PATH]
+fn play(seed: u64, out_dir: &Path, out_path: &Path) -> AppResult<()> {
+    let actor = nn::Mlp::load(&out_dir.join("actor.txt"))
+        .map_err(|e| format!("no trained policy in {}: {e}", out_dir.display()))?;
+    let critic = nn::Mlp::load(&out_dir.join("critic.txt"))
+        .map_err(|e| format!("failed to load critic: {e}"))?;
+    let speedor = nn::Mlp::load(&out_dir.join("speedor.txt"))
+        .map_err(|e| format!("failed to load speedor: {e}"))?;
+    if actor.in_dim() != OBS_DIM || actor.out_dim() != NA {
+        return Err("actor shape mismatch; retrain the policy".into());
+    }
+    let policy = train::Policy {
+        actor,
+        speedor,
+        critic,
+    };
+    record_match(&policy, &mut Rng::new(seed), out_path)?;
+    println!("wrote {}", out_path.display());
+    Ok(())
 }
 
 fn parse_out_dir(args: &[String], start: usize) -> AppResult<PathBuf> {
@@ -740,7 +785,7 @@ fn record_match(policy: &train::Policy, rng: &mut Rng, path: &Path) -> AppResult
     let mut w = World::new();
     let mut frames = String::new();
     frames.push('[');
-    for t in 0..STEPS {
+    for t in 0..RECORD_STEPS {
         if t > 0 {
             frames.push(',');
         }

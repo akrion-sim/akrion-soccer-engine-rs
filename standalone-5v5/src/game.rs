@@ -16,7 +16,11 @@ pub const N: usize = 5; // players per team (index 0 == goalkeeper)
 pub const GK: usize = 0; // goalkeeper index; controlled by a fixed rule, not the policy
 pub const DT: f32 = 0.05; // seconds per decision tick -> 20 Hz sim (real-time 20 fps)
 pub const HZ: f32 = 1.0 / DT; // ticks per second (for real-time viewer playback)
-pub const STEPS: usize = 600; // ticks per game (~30s at 20 Hz)
+pub const STEPS: usize = 600; // ticks per TRAINING episode (~30s at 20 Hz)
+// The RECORDED viz match (match_before/after.json) runs longer than a training
+// episode so the before/after playback shows more football (incl. kickoffs after
+// goals). Training dynamics are unaffected — rollouts still use STEPS.
+pub const RECORD_STEPS: usize = 1800; // ~90s at 20 Hz
 
 const PLAYER_SPEED: f32 = 6.5; // legacy reference speed (~= run_medium); kept for keeper reach/util
 
@@ -55,6 +59,16 @@ pub const SPD_SPRINT: usize = 6;
 // Low end kept non-crippling (a slow gear still lets you get around) so the speed
 // policy's exploration can't paralyze the game; STAND is the only truly-still gear.
 const SPEEDS: [f32; NS] = [0.0, 3.0, 4.5, 5.5, 6.5, 8.5, 11.0];
+// Players can't snap between the 7 gears instantly — actual velocity ramps toward
+// the chosen gear's velocity at a bounded rate. Accelerating (building speed) is
+// slower than decelerating / cutting (shedding speed or changing direction), as
+// with real players. Units yd/s^2. Env-overridable so the tuner can shape them.
+fn player_accel() -> f32 {
+    std::env::var("PLAYER_ACCEL").ok().and_then(|s| s.parse().ok()).filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(6.0)
+}
+fn player_decel() -> f32 {
+    std::env::var("PLAYER_DECEL").ok().and_then(|s| s.parse().ok()).filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(11.0)
+}
 // Ball-carrying is much slower than open-field running (you can't sprint flat-out
 // with the ball at your feet) — and, critically, keeping it near v3's control
 // speed stops the policy from dribbling forever to evade the 2-pass shot gate.
@@ -82,7 +96,10 @@ const SHOT_SPEED: f32 = 24.0;
 const CLEAR_SPEED: f32 = 20.0;
 const CAPTURE_MAX_BALL_SPEED: f32 = 26.0;
 const KEEPER_REACH: f32 = 1.9; // keeper saves spam; well-placed shots still beat it
+#[allow(dead_code)]
 const KEEPER_SPEED: f32 = 6.0;
+const TEAMMATE_HARD_MIN_SPACE: f32 = 3.0;
+const TEAMMATE_GOOD_SPACE: f32 = 8.0;
 
 // ---- Action space -----------------------------------------------------------
 pub const NA: usize = 15;
@@ -145,10 +162,23 @@ impl V2 {
     }
 }
 
+fn teammate_spacing_score(distance: f32) -> f32 {
+    if !distance.is_finite() {
+        return 0.0;
+    }
+    if distance < TEAMMATE_HARD_MIN_SPACE {
+        -((TEAMMATE_HARD_MIN_SPACE - distance) / TEAMMATE_HARD_MIN_SPACE).clamp(0.0, 1.0)
+    } else {
+        ((distance - TEAMMATE_HARD_MIN_SPACE) / (TEAMMATE_GOOD_SPACE - TEAMMATE_HARD_MIN_SPACE))
+            .clamp(0.0, 1.0)
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Player {
     pub pos: V2,
-    pub vel: V2,
+    pub vel: V2,        // actual velocity — ramps toward des_vel at a bounded rate
+    pub des_vel: V2,    // desired velocity (the chosen gear/direction this tick)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -193,11 +223,11 @@ pub struct World {
     pub b: [Player; N],
     pub ball: V2,
     pub ball_vel: V2,
-    pub ball_aerial: bool,  // in-flight ball is a lofted/scooped pass (over ground defenders)
-    pub air_ticks: u32,     // ticks the scooped ball stays airborne before it lands
-    pub ball_curl: V2,      // lateral curl (spin) accel on a long (>20yd) pass/shot
-    pending_curl: V2,       // scratch: curl for the kick launching this tick
-    pending_aerial: bool,   // scratch: the pass launched this tick is a scoop
+    pub ball_aerial: bool, // in-flight ball is a lofted/scooped pass (over ground defenders)
+    pub air_ticks: u32,    // ticks the scooped ball stays airborne before it lands
+    pub ball_curl: V2,     // lateral curl (spin) accel on a long (>20yd) pass/shot
+    pending_curl: V2,      // scratch: curl for the kick launching this tick
+    pending_aerial: bool,  // scratch: the pass launched this tick is a scoop
     pending_air_ticks: u32, // scratch: airborne duration for the launching scoop
     pub owner: Option<Owner>,
     pub last_touch: Option<Team>,
@@ -254,10 +284,12 @@ impl World {
             a: [Player {
                 pos: V2::default(),
                 vel: V2::default(),
+                des_vel: V2::default(),
             }; N],
             b: [Player {
                 pos: V2::default(),
                 vel: V2::default(),
+                des_vel: V2::default(),
             }; N],
             ball: V2::new(FIELD_L / 2.0, FIELD_W / 2.0),
             ball_vel: V2::default(),
@@ -318,9 +350,11 @@ impl World {
         for i in 0..N {
             self.a[i].pos = V2::new(xs[i] * FIELD_L, ys[i] * FIELD_W);
             self.a[i].vel = V2::default();
+            self.a[i].des_vel = V2::default();
             // Mirror for B (attacks -x): x' = L - x.
             self.b[i].pos = V2::new(FIELD_L - xs[i] * FIELD_L, ys[i] * FIELD_W);
             self.b[i].vel = V2::default();
+            self.b[i].des_vel = V2::default();
         }
         self.ball = V2::new(FIELD_L / 2.0, FIELD_W / 2.0);
         self.ball_vel = V2::default();
@@ -392,7 +426,11 @@ impl World {
         let (oi, _) = self.nearest_opponent(team, mid);
         let opp = players(team.other(), self)[oi].pos;
         let rel = opp.sub(mid);
-        let side = if rel.x * perp.x + rel.y * perp.y > 0.0 { -1.0 } else { 1.0 };
+        let side = if rel.x * perp.x + rel.y * perp.y > 0.0 {
+            -1.0
+        } else {
+            1.0
+        };
         let strength = CURL_ACCEL * ((dist - CURL_MIN_DIST) / 20.0).clamp(0.0, 1.0);
         perp.scale(side * strength)
     }
@@ -457,6 +495,30 @@ impl World {
             }
         }
         bpos // uncatchable — head to where it ends up
+    }
+
+    /// POMDP belief that THIS player wins a LOOSE ball: a race between my time to
+    /// my earliest intercept point (on the ball's decelerating trajectory) and the
+    /// nearest opponent's time to theirs. ~[0,1], and 0 whenever the ball is owned.
+    /// Feeds loose-ball pursuit shaping so the FAVORITE commits to the ball while
+    /// teammates hold shape — real pressing, not everyone crashing the ball.
+    pub fn loose_ball_belief(&self, team: Team, idx: usize) -> f32 {
+        if self.owner.is_some() {
+            return 0.0;
+        }
+        let me = players(team, self)[idx].pos;
+        let my_eta = me.sub(self.intercept_point(me)).len() / PLAYER_SPEED.max(1e-3);
+        let opp = players(team.other(), self);
+        let mut opp_eta = f32::INFINITY;
+        for k in 0..N {
+            let op = opp[k].pos;
+            let eta = op.sub(self.intercept_point(op)).len() / PLAYER_SPEED.max(1e-3);
+            if eta < opp_eta {
+                opp_eta = eta;
+            }
+        }
+        // favorite when I arrive clearly sooner; smooth ~0.6s window around parity.
+        (0.5 + 0.5 * ((opp_eta - my_eta) / 0.6).clamp(-1.0, 1.0)).clamp(0.0, 1.0)
     }
 
     /// Classify a Team-A dribble by the FINAL (post-shielding) direction, so the
@@ -858,10 +920,17 @@ impl World {
             integrate(&mut self.b[i]);
         }
 
+<<<<<<< HEAD
         // There is intentionally no post-integration collision shove. Teammate
         // separation belongs in the per-player MPC objective below, so players
         // choose non-convergent velocities from the field vector instead of
         // being teleported apart after making a bad movement decision.
+=======
+        // Hard same-team keep-out: the reward still teaches spacing, but visible
+        // <3yd stacks are never a good 5-a-side state. This is the formation-free
+        // analogue of the 11v11 same-team separation floor.
+        self.resolve_same_team_spacing();
+>>>>>>> 7651dddfc431b3f7dcb433062d80cb062f03a1dc
 
         // 3. Resolve a kick (frees the ball) or carry it with the owner.
         if let Some((kicker, dir, speed, is_pass)) = kick {
@@ -875,7 +944,11 @@ impl World {
             self.last_kicker = Some(kicker);
             self.kick_timer = 6;
             self.ball_aerial = is_pass && self.pending_aerial;
-            self.air_ticks = if self.ball_aerial { self.pending_air_ticks } else { 0 };
+            self.air_ticks = if self.ball_aerial {
+                self.pending_air_ticks
+            } else {
+                0
+            };
             self.pending_aerial = false;
             self.ball_curl = self.pending_curl;
             self.pending_curl = V2::default();
@@ -1280,8 +1353,7 @@ impl World {
                     }
                     self.pending_curl = self.kick_curl(team, me, tp);
                     let pass_dist = tp.sub(me).len();
-                    let pspeed =
-                        PASS_SPEED * (0.85 + 0.35 * (pass_dist / FIELD_L).clamp(0.0, 1.0));
+                    let pspeed = PASS_SPEED * (0.85 + 0.35 * (pass_dist / FIELD_L).clamp(0.0, 1.0));
                     Some((owner, lead.sub(me), pspeed, true))
                 } else {
                     // no valid target: dribble forward instead
@@ -1573,6 +1645,7 @@ impl World {
                 );
                 // openness = distance to nearest OTHER player (either team)
                 let mut min_d = f32::INFINITY;
+                let mut teammate_gap = f32::INFINITY;
                 for t in [Team::A, Team::B] {
                     for j in 0..N {
                         if t == team && j == idx {
@@ -1582,12 +1655,16 @@ impl World {
                         if d < min_d {
                             min_d = d;
                         }
+                        if t == team {
+                            teammate_gap = teammate_gap.min(d);
+                        }
                     }
                 }
                 let fwd = (cand.x - me.x) * sx; // upfield progress in attack frame
                                                 // stay loosely connected to the ball's vertical lane
                 let lane = -(cand.y - self.ball.y).abs() * 0.08;
-                let score = min_d + field_bias * fwd + lane;
+                let score =
+                    min_d + teammate_spacing_score(teammate_gap) * 6.0 + field_bias * fwd + lane;
                 if score > best_score {
                     best_score = score;
                     best = cand;
@@ -1613,7 +1690,7 @@ impl World {
             }
             teammate_gap = teammate_gap.min(players(team, self)[j].pos.sub(cand).len());
         }
-        let teammate_space = (teammate_gap / 7.0).min(1.0);
+        let teammate_space = teammate_spacing_score(teammate_gap);
         let carrier_pressure = if let Some(o) = self.owner {
             if o.team == team {
                 let carrier = players(team, self)[o.idx].pos;
@@ -1632,7 +1709,7 @@ impl World {
             + wide * 0.55
             + ahead * (0.55 + 0.35 * carrier_pressure)
             + defender_space * 0.45
-            + teammate_space * 0.25
+            + teammate_space * 1.10
             + shot_channel * 0.20
     }
 
@@ -1667,14 +1744,95 @@ impl World {
     }
 
     fn set_vel(&mut self, team: Team, idx: usize, v: V2) {
+        // Sets the DESIRED velocity (the chosen gear/direction). The actual velocity
+        // ramps toward it in integrate() at a bounded accel/decel rate — no instant
+        // jumps between the 7 gears.
         match team {
-            Team::A => self.a[idx].vel = v,
-            Team::B => self.b[idx].vel = v,
+            Team::A => self.a[idx].des_vel = v,
+            Team::B => self.b[idx].des_vel = v,
+        }
+    }
+
+    fn resolve_same_team_spacing(&mut self) {
+        Self::resolve_team_spacing(&mut self.a);
+        Self::resolve_team_spacing(&mut self.b);
+    }
+
+    fn resolve_team_spacing(team: &mut [Player; N]) {
+        for _ in 0..2 {
+            for i in 1..N {
+                for j in (i + 1)..N {
+                    let delta = team[i].pos.sub(team[j].pos);
+                    let distance = delta.len();
+                    if !distance.is_finite() || distance >= TEAMMATE_HARD_MIN_SPACE {
+                        continue;
+                    }
+                    let dir = if distance > 1e-4 {
+                        delta.unit()
+                    } else {
+                        deterministic_teammate_axis(i, j)
+                    };
+                    let push = (TEAMMATE_HARD_MIN_SPACE - distance) * 0.53;
+                    team[i].pos = team[i].pos.add(dir.scale(push));
+                    team[j].pos = team[j].pos.add(dir.scale(-push));
+                    let vi = team[i].vel;
+                    let vj = team[j].vel;
+                    let closing = vi.sub(vj).x * dir.x + vi.sub(vj).y * dir.y;
+                    if closing < 0.0 {
+                        let correction = dir.scale(closing * 0.5);
+                        team[i].vel = team[i].vel.sub(correction);
+                        team[j].vel = team[j].vel.add(correction);
+                    }
+                    clamp_pos(&mut team[i]);
+                    clamp_pos(&mut team[j]);
+                }
+            }
         }
     }
 }
 
+fn deterministic_teammate_axis(i: usize, j: usize) -> V2 {
+    const AXES: [V2; 8] = [
+        V2 { x: 1.0, y: 0.0 },
+        V2 { x: -1.0, y: 0.0 },
+        V2 { x: 0.0, y: 1.0 },
+        V2 { x: 0.0, y: -1.0 },
+        V2 { x: 0.707, y: 0.707 },
+        V2 {
+            x: -0.707,
+            y: 0.707,
+        },
+        V2 {
+            x: 0.707,
+            y: -0.707,
+        },
+        V2 {
+            x: -0.707,
+            y: -0.707,
+        },
+    ];
+    AXES[(i * 7 + j * 11) % AXES.len()].unit()
+}
+
 fn integrate(p: &mut Player) {
+    // Ramp actual velocity toward the desired (gear-target) velocity at a bounded
+    // rate — players build and shed speed, they don't teleport between gears.
+    // Cutting / slowing (desired speed <= current) is allowed faster than accel.
+    let dv = p.des_vel.sub(p.vel);
+    let dvlen = dv.len();
+    if dvlen > 1e-6 {
+        let rate = if p.des_vel.len() >= p.vel.len() {
+            player_accel()
+        } else {
+            player_decel()
+        };
+        let max_step = rate * DT;
+        p.vel = if dvlen <= max_step {
+            p.des_vel
+        } else {
+            p.vel.add(dv.scale(max_step / dvlen))
+        };
+    }
     p.pos = p.pos.add(p.vel.scale(DT));
     clamp_pos(p);
 }
@@ -2429,6 +2587,65 @@ mod tests {
             w.mpc_field_vector_score(Team::A, 2, wide_lane)
                 > w.mpc_field_vector_score(Team::A, 2, blocked_centre),
             "field-vector MPC should prefer the unblocked wide outlet"
+        );
+    }
+
+    #[test]
+    fn hard_same_team_spacing_separates_stacked_outfielders() {
+        let mut w = World::new();
+        w.a[1].pos = V2::new(18.0, 14.0);
+        w.a[2].pos = V2::new(18.2, 14.0);
+        w.a[3].pos = V2::new(8.0, 4.0);
+        w.a[4].pos = V2::new(8.0, 24.0);
+        w.b[1].pos = V2::new(24.0, 14.0);
+        w.b[2].pos = V2::new(24.1, 14.0);
+        w.b[3].pos = V2::new(34.0, 4.0);
+        w.b[4].pos = V2::new(34.0, 24.0);
+
+        w.resolve_same_team_spacing();
+
+        assert!(
+            w.closest_pair_a() >= TEAMMATE_HARD_MIN_SPACE - 0.05,
+            "Team A outfielders should be pushed outside the hard spacing floor, closest={}",
+            w.closest_pair_a()
+        );
+        let mut closest_b = f32::INFINITY;
+        for i in 1..N {
+            for j in (i + 1)..N {
+                closest_b = closest_b.min(w.b[i].pos.sub(w.b[j].pos).len());
+            }
+        }
+        assert!(
+            closest_b >= TEAMMATE_HARD_MIN_SPACE - 0.05,
+            "Team B outfielders should be pushed outside the hard spacing floor, closest={closest_b}"
+        );
+    }
+
+    #[test]
+    fn mpc_field_vector_score_penalizes_teammate_bubble() {
+        let mut w = World::new();
+        w.owner = Some(Owner {
+            team: Team::A,
+            idx: 1,
+        });
+        w.ball = V2::new(12.0, 14.0);
+        w.a[1].pos = w.ball;
+        w.a[2].pos = V2::new(18.0, 14.0);
+        w.a[3].pos = V2::new(25.0, 14.0);
+        w.a[4].pos = V2::new(10.0, 23.0);
+        for i in 1..N {
+            w.b[i].pos = V2::new(36.0, 3.0 + i as f32 * 5.0);
+        }
+
+        let stacked = V2::new(25.5, 14.0);
+        let spaced = V2::new(25.0, 22.0);
+
+        assert!(
+            w.mpc_field_vector_score(Team::A, 2, spaced)
+                > w.mpc_field_vector_score(Team::A, 2, stacked) + 0.75,
+            "MPC field-vector target should reject teammate bubble: stacked={} spaced={}",
+            w.mpc_field_vector_score(Team::A, 2, stacked),
+            w.mpc_field_vector_score(Team::A, 2, spaced)
         );
     }
 }

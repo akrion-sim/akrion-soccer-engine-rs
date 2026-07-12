@@ -28,15 +28,27 @@ const MINIBATCH: usize = 1024;
 const MAX_ROLLOUT_THREADS: usize = 4;
 const MIN_REWARD_WEIGHT: f32 = 0.0001;
 const LINGER_RADIUS: f32 = 4.0; // "same radius": teammates within this many yards
+/// Overlap zone: two players THIS close are occupying the same spot — that is
+/// never "running past each other", so the penalty here is ALWAYS-ON (ungated).
+/// Only the soft 1.5-4yd band is linger-gated (where transient crossings happen).
+const SEVERE_RADIUS: f32 = 1.5;
+/// Leaky-integrator decay: when players separate, the linger counter DECAYS by
+/// this many ticks rather than resetting to 0. This kills the reset-hack where a
+/// policy farms the gate by oscillating in/out of the radius (bunch ~1.4s, step
+/// out 1 tick, re-bunch). A genuine one-time crossing separates and stays apart,
+/// so its counter decays cleanly to 0; sustained oscillation still accumulates
+/// (net gain per cycle whenever close-ticks > DECAY × away-ticks).
+const LINGER_DECAY: u32 = 2;
 /// Consecutive ticks two teammates must LINGER within LINGER_RADIUS before the
-/// spacing penalty applies. Brief crossings/convergence pay nothing (real soccer:
-/// players run right past each other). Env `SPACING_LINGER_SECS` (default 1.5 s).
+/// mild 3-4yd spacing penalty applies. Sub-3yd bunching is always penalized
+/// immediately; brief crossings only get grace in the 3-4yd gray zone.
+/// Env `SPACING_LINGER_SECS` (default 0.4 s).
 fn linger_ticks() -> u32 {
     let secs = std::env::var("SPACING_LINGER_SECS")
         .ok()
         .and_then(|s| s.parse::<f32>().ok())
         .filter(|v| v.is_finite() && *v >= 0.0)
-        .unwrap_or(1.5);
+        .unwrap_or(0.4);
     ((secs / DT).round() as u32).max(1)
 }
 // ─── Tunable reward weights (env-overridable, read ONCE per process) ─────────
@@ -89,6 +101,7 @@ pub struct Rw {
     pub field_goalside_delta: f32, // reward improving team goalside geometry
     pub field_burst_delta: f32,    // reward improving forward outlet geometry
     pub stand_pen: f32,            // anti-passivity: penalize the STAND gear off-ball
+    pub pursuit: f32,              // LOOSE-BALL: favorite commits to winning a free ball
 }
 fn rw() -> &'static Rw {
     static R: std::sync::OnceLock<Rw> = std::sync::OnceLock::new();
@@ -123,6 +136,7 @@ fn rw() -> &'static Rw {
         field_goalside_delta: wenv("W_FIELD_GOALSIDE_DELTA", 0.10, MIN_REWARD_WEIGHT, 0.35),
         field_burst_delta: wenv("W_FIELD_BURST_DELTA", 0.08, MIN_REWARD_WEIGHT, 0.35),
         stand_pen: wenv("W_STAND_PEN", 0.02, MIN_REWARD_WEIGHT, 0.20),
+        pursuit: wenv("W_PURSUIT", 0.05, MIN_REWARD_WEIGHT, 0.25),
     })
 }
 // The speed policy is a low-variance REFINEMENT on top of the action policy —
@@ -132,12 +146,19 @@ const LR_SPEED: f32 = LR_ACTOR * 0.3;
 const SPEED_ENT_SCALE: f32 = 0.15;
 const ENT_BETA0: f32 = 0.02;
 
+<<<<<<< HEAD
 // Teammate-spacing reward weight. Overridable via SPACING_W so a promoted run's
 // learned/tuned value can warm-start the next run. The historical 0.003 is the
 // sane cold-start baseline; strictly-positive clamps prevent disabling or
 // exploding the reward through a malformed artifact/environment value.
 fn w_spacing() -> f32 {
     wenv("SPACING_W", 0.003, 0.0001, 4.0)
+=======
+// Teammate-spacing reward weight. Overridable via SPACING_W env for tuning.
+// Strong enough that sub-3yd bunching competes with ordinary possession rewards.
+fn w_spacing() -> f32 {
+    wenv("SPACING_W", 0.008, 0.001, 0.04)
+>>>>>>> 7651dddfc431b3f7dcb433062d80cb062f03a1dc
 }
 
 /// PER-PLAYER spacing reward as a function of a player's nearest-teammate
@@ -616,15 +637,22 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
             }
             if nd.is_finite() {
                 // LINGER GATE: brief closeness (crossing runs, converging on the ball)
-                // is fine — only SUSTAINED lingering in the same radius is penalized.
+                // is fine — real players run right past each other — so only SUSTAINED
+                // lingering in the same radius is soft-penalized. Separation DECAYS the
+                // counter (leaky integrator) rather than resetting it, so the policy
+                // can't farm the gate by oscillating in and out of the radius; a true
+                // one-time crossing decays to 0. SEVERE overlap (< SEVERE_RADIUS) is
+                // never "running past" and is penalized ungated. Sustained 1.5-3yd
+                // bunching is caught by the hard resolve_same_team_spacing() backstop
+                // (game.rs), so the soft reward can stay lenient in that transient zone.
                 if nd < LINGER_RADIUS {
                     close_ticks[i] += 1;
                 } else {
-                    close_ticks[i] = 0;
+                    close_ticks[i] = close_ticks[i].saturating_sub(LINGER_DECAY);
                 }
                 let mut sr = spacing_reward(nd);
-                if sr < 0.0 && close_ticks[i] <= linger_gate {
-                    sr = 0.0; // transient — not yet a lingering-bunch penalty
+                if sr < 0.0 && nd >= SEVERE_RADIUS && close_ticks[i] <= linger_gate {
+                    sr = 0.0; // transient soft-band closeness — not yet a lingering bunch
                 }
                 sp_t[i] = w_spacing_coeff * sr;
             }
@@ -634,6 +662,25 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
             // players keep moving and (in possession) make their runs.
             if !is_carrier && spd_t[i] == SPD_STAND {
                 sp_t[i] -= rw().stand_pen;
+            }
+            // LOOSE-BALL PURSUIT (POMDP): when the ball is FREE, the FAVORITE — high
+            // belief it wins the race to the ball's decelerating trajectory — is
+            // rewarded for actually closing on its intercept point. Belief-gated so
+            // only the favorite commits and teammates hold shape (no crashing the
+            // ball / bunching). Defenders (idx 1,2) press a bit harder so they track
+            // back and contest a loose ball instead of ball-watching.
+            if w.owner.is_none() {
+                let belief = w.loose_ball_belief(Team::A, i);
+                if belief > 0.05 {
+                    let ip = w.intercept_point(w.a[i].pos);
+                    let to_ip = ip.sub(w.a[i].pos);
+                    let d = to_ip.len();
+                    if d > 0.5 {
+                        let closing = (w.a[i].vel.x * to_ip.x + w.a[i].vel.y * to_ip.y) / d;
+                        let def_bonus = if i <= 2 { 1.3 } else { 1.0 };
+                        sp_t[i] += rw().pursuit * belief * def_bonus * (closing / 8.5).clamp(0.0, 1.0);
+                    }
+                }
             }
             if our_phase {
                 // Advance upfield (attack frame +x). No offsides rule, so reward
