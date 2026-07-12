@@ -5,7 +5,7 @@ use std::error::Error;
 use std::fs::{self, OpenOptions};
 use std::io::{BufWriter, Error as IoError, ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -2916,7 +2916,7 @@ struct LocalNeuralPromotionTrialBest {
 }
 
 fn current_carried_world_model_snapshot() -> Option<SoccerWorldModel> {
-    CARRIED_WORLD_MODEL.lock().unwrap().clone()
+    carried_lock(&CARRIED_WORLD_MODEL, "CARRIED_WORLD_MODEL").clone()
 }
 
 fn install_carried_world_model_snapshot(snapshot: Option<SoccerWorldModel>) -> usize {
@@ -2924,7 +2924,7 @@ fn install_carried_world_model_snapshot(snapshot: Option<SoccerWorldModel>) -> u
         .as_ref()
         .map(SoccerWorldModel::training_steps)
         .unwrap_or(0);
-    *CARRIED_WORLD_MODEL.lock().unwrap() = snapshot;
+    *carried_lock(&CARRIED_WORLD_MODEL, "CARRIED_WORLD_MODEL") = snapshot;
     training_steps
 }
 
@@ -6226,7 +6226,9 @@ fn apply_anchor_promotion_gate_with_decision(
         EngineMatchRunner::new(runner_config)
     });
     let carried_mpc_head = if learned_mpc_objective_enabled() {
-        CARRIED_MPC_OBJECTIVE_HEAD.lock().unwrap().as_ref().cloned()
+        carried_lock(&CARRIED_MPC_OBJECTIVE_HEAD, "CARRIED_MPC_OBJECTIVE_HEAD")
+            .as_ref()
+            .cloned()
     } else {
         None
     };
@@ -6467,6 +6469,16 @@ static CARRIED_SHOT_TRIGGER_HEAD: std::sync::Mutex<Option<ShotTriggerHead>> =
 static CARRIED_WORLD_MODEL: std::sync::Mutex<Option<SoccerWorldModel>> =
     std::sync::Mutex::new(None);
 
+fn carried_lock<'a, T>(
+    lock: &'a Mutex<Option<T>>,
+    name: &'static str,
+) -> MutexGuard<'a, Option<T>> {
+    lock.lock().unwrap_or_else(|poisoned| {
+        eprintln!("warning: recovered poisoned 11v11 carried learning state mutex: {name}");
+        poisoned.into_inner()
+    })
+}
+
 fn run_game(
     episode: usize,
     config: MatchConfig,
@@ -6509,7 +6521,8 @@ fn run_game(
                     match BackFourLineHead::from_snapshot(line_depth_snapshot) {
                         Ok(restored_head) => {
                             let restored_steps = restored_head.training_steps();
-                            let mut guard = CARRIED_LINE_DEPTH_HEAD.lock().unwrap();
+                            let mut guard =
+                                carried_lock(&CARRIED_LINE_DEPTH_HEAD, "CARRIED_LINE_DEPTH_HEAD");
                             let should_replace = guard
                                 .as_ref()
                                 .map(|head| head.training_steps() < restored_steps)
@@ -6532,7 +6545,10 @@ fn run_game(
                     match SoccerPassCompletionHead::from_snapshot(pass_completion_snapshot) {
                         Ok(restored_head) => {
                             let restored_steps = restored_head.training_steps();
-                            let mut guard = CARRIED_PASS_COMPLETION_HEAD.lock().unwrap();
+                            let mut guard = carried_lock(
+                                &CARRIED_PASS_COMPLETION_HEAD,
+                                "CARRIED_PASS_COMPLETION_HEAD",
+                            );
                             let should_replace = guard
                                 .as_ref()
                                 .map(|head| head.training_steps() < restored_steps)
@@ -6555,7 +6571,10 @@ fn run_game(
                     match SoccerMpcObjectiveHead::from_snapshot(mpc_objective_snapshot) {
                         Ok(restored_head) => {
                             let restored_steps = restored_head.training_steps();
-                            let mut guard = CARRIED_MPC_OBJECTIVE_HEAD.lock().unwrap();
+                            let mut guard = carried_lock(
+                                &CARRIED_MPC_OBJECTIVE_HEAD,
+                                "CARRIED_MPC_OBJECTIVE_HEAD",
+                            );
                             let should_replace = guard
                                 .as_ref()
                                 .map(|head| head.training_steps() < restored_steps)
@@ -6578,7 +6597,10 @@ fn run_game(
                     match AttackSpacingHead::from_snapshot(attack_spacing_snapshot) {
                         Ok(restored_head) => {
                             let restored_steps = restored_head.training_steps();
-                            let mut guard = CARRIED_ATTACK_SPACING_HEAD.lock().unwrap();
+                            let mut guard = carried_lock(
+                                &CARRIED_ATTACK_SPACING_HEAD,
+                                "CARRIED_ATTACK_SPACING_HEAD",
+                            );
                             let should_replace = guard
                                 .as_ref()
                                 .map(|head| head.training_steps() < restored_steps)
@@ -6601,7 +6623,10 @@ fn run_game(
                     match SupportScorerHead::from_snapshot(support_scorer_snapshot) {
                         Ok(restored_head) => {
                             let restored_steps = restored_head.training_steps();
-                            let mut guard = CARRIED_SUPPORT_SCORER_HEAD.lock().unwrap();
+                            let mut guard = carried_lock(
+                                &CARRIED_SUPPORT_SCORER_HEAD,
+                                "CARRIED_SUPPORT_SCORER_HEAD",
+                            );
                             let should_replace = guard
                                 .as_ref()
                                 .map(|head| head.training_steps() < restored_steps)
@@ -6639,7 +6664,7 @@ fn run_game(
         sim.remember_adversarial_moment_window(window.clone());
     }
     if sim.config.neural_blend.world_model {
-        if let Some(model) = CARRIED_WORLD_MODEL.lock().unwrap().as_ref() {
+        if let Some(model) = carried_lock(&CARRIED_WORLD_MODEL, "CARRIED_WORLD_MODEL").as_ref() {
             let training_steps = model.training_steps();
             sim.set_world_model(model.clone());
             eprintln!(
@@ -6654,107 +6679,156 @@ fn run_game(
     // Gap 5 step 3b: install the carried line-depth head so the back-four line
     // consumes it live once trained. No-op unless a line-depth model is enabled (the
     // head only accumulates while collection is on).
-    if let Some(head) = CARRIED_LINE_DEPTH_HEAD.lock().unwrap().as_ref() {
+    if let Some(head) = carried_lock(&CARRIED_LINE_DEPTH_HEAD, "CARRIED_LINE_DEPTH_HEAD").as_ref() {
         sim.set_line_depth_head(head.clone());
     }
     // Install the carried per-defender individual line head so the per-defender push/drop
     // seam consumes it live once trained. No-op unless the individual model is enabled.
-    if let Some(head) = CARRIED_DEFENDER_LINE_HEAD.lock().unwrap().as_ref() {
+    if let Some(head) =
+        carried_lock(&CARRIED_DEFENDER_LINE_HEAD, "CARRIED_DEFENDER_LINE_HEAD").as_ref()
+    {
         sim.set_defender_line_head(head.clone());
     }
     // Install the carried loose-ball commit head so the retriever election consumes it
     // live once trained. No-op unless the commit model is enabled.
-    if let Some(head) = CARRIED_LOOSE_BALL_COMMIT_HEAD.lock().unwrap().as_ref() {
+    if let Some(head) = carried_lock(
+        &CARRIED_LOOSE_BALL_COMMIT_HEAD,
+        "CARRIED_LOOSE_BALL_COMMIT_HEAD",
+    )
+    .as_ref()
+    {
         sim.set_loose_ball_commit_head(head.clone());
     }
     // Install the carried receive-approach head so `receive_approach_adjusted_target`
     // consumes it live once trained. No-op unless DD_SOCCER_ENABLE_RECEIVE_APPROACH_MODEL
     // is set.
-    if let Some(head) = CARRIED_RECEIVE_APPROACH_HEAD.lock().unwrap().as_ref() {
+    if let Some(head) = carried_lock(
+        &CARRIED_RECEIVE_APPROACH_HEAD,
+        "CARRIED_RECEIVE_APPROACH_HEAD",
+    )
+    .as_ref()
+    {
         sim.set_receive_approach_head(head.clone());
     }
     // Install the carried lane-affinity head so the lane clamp seam consumes it live once
     // trained. No-op unless the lane-affinity model is enabled (on by default in prod).
-    if let Some(head) = CARRIED_LANE_AFFINITY_HEAD.lock().unwrap().as_ref() {
+    if let Some(head) =
+        carried_lock(&CARRIED_LANE_AFFINITY_HEAD, "CARRIED_LANE_AFFINITY_HEAD").as_ref()
+    {
         sim.set_lane_affinity_head(head.clone());
     }
     // Install the carried goal-side recovery head so the goal-side lateral-pull seam consumes it
     // live once trained. No-op unless the model is enabled (on by default in prod).
-    if let Some(head) = CARRIED_GOAL_SIDE_RECOVERY_HEAD.lock().unwrap().as_ref() {
+    if let Some(head) = carried_lock(
+        &CARRIED_GOAL_SIDE_RECOVERY_HEAD,
+        "CARRIED_GOAL_SIDE_RECOVERY_HEAD",
+    )
+    .as_ref()
+    {
         sim.set_goal_side_recovery_head(head.clone());
     }
     // Install the carried winger pinch-appetite head so the bucket scoring consumes it live once
     // trained. No-op unless the model is enabled (on by default in prod).
-    if let Some(head) = CARRIED_WINGER_PINCH_HEAD.lock().unwrap().as_ref() {
+    if let Some(head) =
+        carried_lock(&CARRIED_WINGER_PINCH_HEAD, "CARRIED_WINGER_PINCH_HEAD").as_ref()
+    {
         sim.set_winger_pinch_head(head.clone());
     }
     // Install the carried same-team separation head so the MPC keep-out consumes it live once
     // trained. No-op unless the model is enabled (on by default in prod).
-    if let Some(head) = CARRIED_SEPARATION_FLOOR_HEAD.lock().unwrap().as_ref() {
+    if let Some(head) = carried_lock(
+        &CARRIED_SEPARATION_FLOOR_HEAD,
+        "CARRIED_SEPARATION_FLOOR_HEAD",
+    )
+    .as_ref()
+    {
         sim.set_separation_floor_head(head.clone());
     }
     // Install the carried pass-lane yield head so the yield seam consumes it live once trained.
-    if let Some(head) = CARRIED_PASS_LANE_YIELD_HEAD.lock().unwrap().as_ref() {
+    if let Some(head) = carried_lock(
+        &CARRIED_PASS_LANE_YIELD_HEAD,
+        "CARRIED_PASS_LANE_YIELD_HEAD",
+    )
+    .as_ref()
+    {
         sim.set_pass_lane_yield_head(head.clone());
     }
     // Install the carried head-scan effort head so the head-scan visibility seam consumes it live.
-    if let Some(head) = CARRIED_HEAD_SCAN_HEAD.lock().unwrap().as_ref() {
+    if let Some(head) = carried_lock(&CARRIED_HEAD_SCAN_HEAD, "CARRIED_HEAD_SCAN_HEAD").as_ref() {
         sim.set_head_scan_head(head.clone());
     }
     // Install the carried crash-the-box commit head so the box-flood seam consumes it live.
-    if let Some(head) = CARRIED_CRASH_BOX_HEAD.lock().unwrap().as_ref() {
+    if let Some(head) = carried_lock(&CARRIED_CRASH_BOX_HEAD, "CARRIED_CRASH_BOX_HEAD").as_ref() {
         sim.set_crash_box_head(head.clone());
     }
     // Install the carried off-ball run-selection head so the open-space run seam consumes it live.
-    if let Some(head) = CARRIED_RUN_PREDICTION_HEAD.lock().unwrap().as_ref() {
+    if let Some(head) =
+        carried_lock(&CARRIED_RUN_PREDICTION_HEAD, "CARRIED_RUN_PREDICTION_HEAD").as_ref()
+    {
         sim.set_run_prediction_head(head.clone());
     }
     // Install the carried slip-break commit head so the slip-break opportunity seam consumes it live.
-    if let Some(head) = CARRIED_SLIP_BREAK_HEAD.lock().unwrap().as_ref() {
+    if let Some(head) = carried_lock(&CARRIED_SLIP_BREAK_HEAD, "CARRIED_SLIP_BREAK_HEAD").as_ref() {
         sim.set_slip_break_head(head.clone());
     }
     // Install the carried onside-support push head so the onside-support clamp consumes it live.
-    if let Some(head) = CARRIED_ONSIDE_SUPPORT_HEAD.lock().unwrap().as_ref() {
+    if let Some(head) =
+        carried_lock(&CARRIED_ONSIDE_SUPPORT_HEAD, "CARRIED_ONSIDE_SUPPORT_HEAD").as_ref()
+    {
         sim.set_onside_support_head(head.clone());
     }
     // Install the carried long-pass run head so `backfield_long_pass_run_invite_for` consumes
     // it live once trained. No-op unless DD_SOCCER_ENABLE_LEARNED_LONG_PASS_RUN is set.
-    if let Some(head) = CARRIED_LONG_PASS_RUN_HEAD.lock().unwrap().as_ref() {
+    if let Some(head) =
+        carried_lock(&CARRIED_LONG_PASS_RUN_HEAD, "CARRIED_LONG_PASS_RUN_HEAD").as_ref()
+    {
         sim.set_long_pass_run_head(head.clone());
     }
     // Install the carried give-and-go head so the carrier's wall-pass appetite consumes it live
     // once trained. No-op unless DD_SOCCER_ENABLE_LEARNED_GIVE_AND_GO is set.
-    if let Some(head) = CARRIED_GIVE_AND_GO_HEAD.lock().unwrap().as_ref() {
+    if let Some(head) = carried_lock(&CARRIED_GIVE_AND_GO_HEAD, "CARRIED_GIVE_AND_GO_HEAD").as_ref()
+    {
         sim.set_give_and_go_head(head.clone());
     }
     // Install the carried pass-completion head so the pass-quality assessor consumes it live
     // once trained. No-op on completion scoring unless DD_SOCCER_ENABLE_LEARNED_PASS_COMPLETION
     // is on; the head still trains regardless so it is warm when the gate is flipped.
-    if let Some(head) = CARRIED_PASS_COMPLETION_HEAD.lock().unwrap().as_ref() {
+    if let Some(head) = carried_lock(
+        &CARRIED_PASS_COMPLETION_HEAD,
+        "CARRIED_PASS_COMPLETION_HEAD",
+    )
+    .as_ref()
+    {
         sim.set_pass_completion_head(head.clone());
     }
     // Install the carried executor head so this game's on-ball execution gets the learned aim/lead
     // residual. Seed-on-first-install when the gate is on (the residual must be applied for a sample
     // to be captured — otherwise the head could never bootstrap); falsey env disables seeding.
     if learned_mpc_objective_enabled() {
-        let mut guard = CARRIED_MPC_OBJECTIVE_HEAD.lock().unwrap();
+        let mut guard = carried_lock(&CARRIED_MPC_OBJECTIVE_HEAD, "CARRIED_MPC_OBJECTIVE_HEAD");
         let head = guard.get_or_insert_with(|| SoccerMpcObjectiveHead::new(episode_seed as u32));
         sim.set_mpc_objective_head(head.clone());
     }
     // Install the carried attacking-spacing target head so off-ball support and the
     // formation LP consume the learned spacing band once trained.
-    if let Some(head) = CARRIED_ATTACK_SPACING_HEAD.lock().unwrap().as_ref() {
+    if let Some(head) =
+        carried_lock(&CARRIED_ATTACK_SPACING_HEAD, "CARRIED_ATTACK_SPACING_HEAD").as_ref()
+    {
         sim.set_attack_spacing_head(head.clone());
     }
     // Install the carried support scorer so open-space support destination ranking can
     // consume learned candidate values once warm.
-    if let Some(head) = CARRIED_SUPPORT_SCORER_HEAD.lock().unwrap().as_ref() {
+    if let Some(head) =
+        carried_lock(&CARRIED_SUPPORT_SCORER_HEAD, "CARRIED_SUPPORT_SCORER_HEAD").as_ref()
+    {
         sim.set_support_scorer_head(head.clone());
     }
     // Install the carried shot-trigger head so the shot decision consumes it live once
     // trained. Default-ON model; no-op unless DD_SOCCER_DISABLE_SHOT_TRIGGER_MDP is unset
     // (the head still trains regardless so it stays warm).
-    if let Some(head) = CARRIED_SHOT_TRIGGER_HEAD.lock().unwrap().as_ref() {
+    if let Some(head) =
+        carried_lock(&CARRIED_SHOT_TRIGGER_HEAD, "CARRIED_SHOT_TRIGGER_HEAD").as_ref()
+    {
         sim.set_shot_trigger_head(head.clone());
     }
 
@@ -6790,7 +6864,7 @@ fn run_game(
     // Postgres persistence is the remaining durability step.
     let line_depth_samples = sim.drain_line_depth_samples();
     if !line_depth_samples.is_empty() {
-        let mut guard = CARRIED_LINE_DEPTH_HEAD.lock().unwrap();
+        let mut guard = carried_lock(&CARRIED_LINE_DEPTH_HEAD, "CARRIED_LINE_DEPTH_HEAD");
         let head = guard.get_or_insert_with(|| BackFourLineHead::new(episode_seed as u32));
         let mut final_loss = 0.0;
         for _ in 0..4 {
@@ -6813,7 +6887,7 @@ fn run_game(
     // remaining durability step, mirroring the group line-depth head.
     let defender_line_samples = sim.drain_defender_line_samples();
     if !defender_line_samples.is_empty() {
-        let mut guard = CARRIED_DEFENDER_LINE_HEAD.lock().unwrap();
+        let mut guard = carried_lock(&CARRIED_DEFENDER_LINE_HEAD, "CARRIED_DEFENDER_LINE_HEAD");
         let head = guard.get_or_insert_with(|| DefenderLinePolicyHead::new(episode_seed as u32));
         let mut final_loss = 0.0;
         for _ in 0..4 {
@@ -6833,7 +6907,10 @@ fn run_game(
     // breaking shape). Empty + skipped unless the commit model is enabled.
     let loose_ball_commit_samples = sim.drain_loose_ball_commit_samples();
     if !loose_ball_commit_samples.is_empty() {
-        let mut guard = CARRIED_LOOSE_BALL_COMMIT_HEAD.lock().unwrap();
+        let mut guard = carried_lock(
+            &CARRIED_LOOSE_BALL_COMMIT_HEAD,
+            "CARRIED_LOOSE_BALL_COMMIT_HEAD",
+        );
         let head = guard.get_or_insert_with(|| LooseBallCommitHead::new(episode_seed as u32));
         let mut final_loss = 0.0;
         for _ in 0..4 {
@@ -6852,7 +6929,10 @@ fn run_game(
     // Empty + skipped unless DD_SOCCER_ENABLE_RECEIVE_APPROACH_MODEL is set.
     let receive_approach_samples = sim.drain_receive_approach_samples();
     if !receive_approach_samples.is_empty() {
-        let mut guard = CARRIED_RECEIVE_APPROACH_HEAD.lock().unwrap();
+        let mut guard = carried_lock(
+            &CARRIED_RECEIVE_APPROACH_HEAD,
+            "CARRIED_RECEIVE_APPROACH_HEAD",
+        );
         let head = guard.get_or_insert_with(|| ReceiveApproachHead::new(episode_seed as u32));
         let mut final_loss = 0.0;
         for _ in 0..4 {
@@ -6871,7 +6951,7 @@ fn run_game(
     // skipped unless the lane-affinity model is enabled (on by default in prod).
     let lane_affinity_samples = sim.drain_lane_affinity_samples();
     if !lane_affinity_samples.is_empty() {
-        let mut guard = CARRIED_LANE_AFFINITY_HEAD.lock().unwrap();
+        let mut guard = carried_lock(&CARRIED_LANE_AFFINITY_HEAD, "CARRIED_LANE_AFFINITY_HEAD");
         let head = guard.get_or_insert_with(|| LaneAffinityHead::new(episode_seed as u32));
         let mut final_loss = 0.0;
         for _ in 0..4 {
@@ -6890,7 +6970,10 @@ fn run_game(
     // skipped unless the model is enabled (on by default in prod).
     let goal_side_recovery_samples = sim.drain_goal_side_recovery_samples();
     if !goal_side_recovery_samples.is_empty() {
-        let mut guard = CARRIED_GOAL_SIDE_RECOVERY_HEAD.lock().unwrap();
+        let mut guard = carried_lock(
+            &CARRIED_GOAL_SIDE_RECOVERY_HEAD,
+            "CARRIED_GOAL_SIDE_RECOVERY_HEAD",
+        );
         let head = guard.get_or_insert_with(|| GoalSideRecoveryHead::new(episode_seed as u32));
         let mut final_loss = 0.0;
         for _ in 0..4 {
@@ -6909,7 +6992,7 @@ fn run_game(
     // the model is enabled (on by default in prod).
     let winger_pinch_samples = sim.drain_winger_pinch_samples();
     if !winger_pinch_samples.is_empty() {
-        let mut guard = CARRIED_WINGER_PINCH_HEAD.lock().unwrap();
+        let mut guard = carried_lock(&CARRIED_WINGER_PINCH_HEAD, "CARRIED_WINGER_PINCH_HEAD");
         let head = guard.get_or_insert_with(|| WingerPinchHead::new(episode_seed as u32));
         let mut final_loss = 0.0;
         for _ in 0..4 {
@@ -6928,7 +7011,10 @@ fn run_game(
     // enabled (on by default in prod).
     let separation_floor_samples = sim.drain_separation_floor_samples();
     if !separation_floor_samples.is_empty() {
-        let mut guard = CARRIED_SEPARATION_FLOOR_HEAD.lock().unwrap();
+        let mut guard = carried_lock(
+            &CARRIED_SEPARATION_FLOOR_HEAD,
+            "CARRIED_SEPARATION_FLOOR_HEAD",
+        );
         let head = guard.get_or_insert_with(|| SeparationFloorHead::new(episode_seed as u32));
         let mut final_loss = 0.0;
         for _ in 0..4 {
@@ -6945,7 +7031,10 @@ fn run_game(
     // Train the CARRIED pass-lane yield head on this game's reward-weighted RL corpus.
     let pass_lane_yield_samples = sim.drain_pass_lane_yield_samples();
     if !pass_lane_yield_samples.is_empty() {
-        let mut guard = CARRIED_PASS_LANE_YIELD_HEAD.lock().unwrap();
+        let mut guard = carried_lock(
+            &CARRIED_PASS_LANE_YIELD_HEAD,
+            "CARRIED_PASS_LANE_YIELD_HEAD",
+        );
         let head = guard.get_or_insert_with(|| PassLaneYieldHead::new(episode_seed as u32));
         let mut final_loss = 0.0;
         for _ in 0..4 {
@@ -6962,7 +7051,7 @@ fn run_game(
     // Train the CARRIED head-scan effort head on this game's reward-weighted RL corpus.
     let head_scan_samples = sim.drain_head_scan_samples();
     if !head_scan_samples.is_empty() {
-        let mut guard = CARRIED_HEAD_SCAN_HEAD.lock().unwrap();
+        let mut guard = carried_lock(&CARRIED_HEAD_SCAN_HEAD, "CARRIED_HEAD_SCAN_HEAD");
         let head = guard.get_or_insert_with(|| HeadScanHead::new(episode_seed as u32));
         let mut final_loss = 0.0;
         for _ in 0..4 {
@@ -6979,7 +7068,7 @@ fn run_game(
     // Train the CARRIED crash-the-box commit head on this game's reward-weighted RL corpus.
     let crash_box_samples = sim.drain_crash_box_samples();
     if !crash_box_samples.is_empty() {
-        let mut guard = CARRIED_CRASH_BOX_HEAD.lock().unwrap();
+        let mut guard = carried_lock(&CARRIED_CRASH_BOX_HEAD, "CARRIED_CRASH_BOX_HEAD");
         let head = guard.get_or_insert_with(|| CrashBoxHead::new(episode_seed as u32));
         let mut final_loss = 0.0;
         for _ in 0..4 {
@@ -6996,7 +7085,7 @@ fn run_game(
     // Train the CARRIED off-ball run-selection head on this game's reward-weighted RL corpus.
     let run_prediction_samples = sim.drain_run_prediction_samples();
     if !run_prediction_samples.is_empty() {
-        let mut guard = CARRIED_RUN_PREDICTION_HEAD.lock().unwrap();
+        let mut guard = carried_lock(&CARRIED_RUN_PREDICTION_HEAD, "CARRIED_RUN_PREDICTION_HEAD");
         let head = guard.get_or_insert_with(|| RunPredictionHead::new(episode_seed as u32));
         let mut final_loss = 0.0;
         for _ in 0..4 {
@@ -7013,7 +7102,7 @@ fn run_game(
     // Train the CARRIED slip-break commit head on this game's reward-weighted RL corpus.
     let slip_break_samples = sim.drain_slip_break_samples();
     if !slip_break_samples.is_empty() {
-        let mut guard = CARRIED_SLIP_BREAK_HEAD.lock().unwrap();
+        let mut guard = carried_lock(&CARRIED_SLIP_BREAK_HEAD, "CARRIED_SLIP_BREAK_HEAD");
         let head = guard.get_or_insert_with(|| SlipBreakHead::new(episode_seed as u32));
         let mut final_loss = 0.0;
         for _ in 0..4 {
@@ -7030,7 +7119,7 @@ fn run_game(
     // Train the CARRIED onside-support push head on this game's reward-weighted RL corpus.
     let onside_support_samples = sim.drain_onside_support_samples();
     if !onside_support_samples.is_empty() {
-        let mut guard = CARRIED_ONSIDE_SUPPORT_HEAD.lock().unwrap();
+        let mut guard = carried_lock(&CARRIED_ONSIDE_SUPPORT_HEAD, "CARRIED_ONSIDE_SUPPORT_HEAD");
         let head = guard.get_or_insert_with(|| OnsideSupportHead::new(episode_seed as u32));
         let mut final_loss = 0.0;
         for _ in 0..4 {
@@ -7049,7 +7138,7 @@ fn run_game(
     // DD_SOCCER_ENABLE_LEARNED_LONG_PASS_RUN is set.
     let long_pass_run_samples = sim.drain_long_pass_run_samples();
     if !long_pass_run_samples.is_empty() {
-        let mut guard = CARRIED_LONG_PASS_RUN_HEAD.lock().unwrap();
+        let mut guard = carried_lock(&CARRIED_LONG_PASS_RUN_HEAD, "CARRIED_LONG_PASS_RUN_HEAD");
         let head = guard.get_or_insert_with(|| LongPassRunHead::new(episode_seed as u32));
         let mut final_loss = 0.0;
         for _ in 0..4 {
@@ -7069,7 +7158,7 @@ fn run_game(
     // is set.
     let give_and_go_samples = sim.drain_give_and_go_samples();
     if !give_and_go_samples.is_empty() {
-        let mut guard = CARRIED_GIVE_AND_GO_HEAD.lock().unwrap();
+        let mut guard = carried_lock(&CARRIED_GIVE_AND_GO_HEAD, "CARRIED_GIVE_AND_GO_HEAD");
         let head = guard.get_or_insert_with(|| GiveAndGoHead::new(episode_seed as u32));
         let mut final_loss = 0.0;
         for _ in 0..4 {
@@ -7089,7 +7178,7 @@ fn run_game(
     // DD_SOCCER_ENABLE_LEARNED_SPACING_TARGET is set.
     let attack_spacing_samples = sim.drain_attack_spacing_samples();
     if !attack_spacing_samples.is_empty() {
-        let mut guard = CARRIED_ATTACK_SPACING_HEAD.lock().unwrap();
+        let mut guard = carried_lock(&CARRIED_ATTACK_SPACING_HEAD, "CARRIED_ATTACK_SPACING_HEAD");
         let head = guard.get_or_insert_with(|| AttackSpacingHead::new(episode_seed as u32));
         let mut final_loss = 0.0;
         for _ in 0..4 {
@@ -7108,7 +7197,7 @@ fn run_game(
     // predilections remain biases but the candidate choice becomes learnable once warm.
     let support_move_samples = sim.drain_support_move_samples();
     if !support_move_samples.is_empty() {
-        let mut guard = CARRIED_SUPPORT_SCORER_HEAD.lock().unwrap();
+        let mut guard = carried_lock(&CARRIED_SUPPORT_SCORER_HEAD, "CARRIED_SUPPORT_SCORER_HEAD");
         let head = guard.get_or_insert_with(|| SupportScorerHead::new(episode_seed as u32));
         let mut final_loss = 0.0;
         for _ in 0..4 {
@@ -7128,7 +7217,7 @@ fn run_game(
     // unless the model is enabled (default-ON; off under DD_SOCCER_DISABLE_SHOT_TRIGGER_MDP).
     let shot_trigger_samples = sim.drain_shot_trigger_samples();
     if !shot_trigger_samples.is_empty() {
-        let mut guard = CARRIED_SHOT_TRIGGER_HEAD.lock().unwrap();
+        let mut guard = carried_lock(&CARRIED_SHOT_TRIGGER_HEAD, "CARRIED_SHOT_TRIGGER_HEAD");
         let head = guard.get_or_insert_with(|| ShotTriggerHead::new(episode_seed as u32));
         let mut final_loss = 0.0;
         for _ in 0..4 {
@@ -7147,7 +7236,10 @@ fn run_game(
     // consumes it live once trained. Always trains when samples accrue (so the head warms
     // independent of the consumption gate); consumption is gated separately.
     if !pass_outcome_samples.is_empty() {
-        let mut guard = CARRIED_PASS_COMPLETION_HEAD.lock().unwrap();
+        let mut guard = carried_lock(
+            &CARRIED_PASS_COMPLETION_HEAD,
+            "CARRIED_PASS_COMPLETION_HEAD",
+        );
         let head = guard.get_or_insert_with(|| SoccerPassCompletionHead::new(episode_seed as u32));
         let mut final_loss = 0.0;
         for _ in 0..4 {
@@ -7165,7 +7257,7 @@ fn run_game(
     // corpus so the aim/lead residual improves across games. Only accrues when the gate is on (the
     // head is seeded + installed above), so this is a no-op when the env kill switch disables it.
     if !mpc_objective_samples.is_empty() {
-        let mut guard = CARRIED_MPC_OBJECTIVE_HEAD.lock().unwrap();
+        let mut guard = carried_lock(&CARRIED_MPC_OBJECTIVE_HEAD, "CARRIED_MPC_OBJECTIVE_HEAD");
         let head = guard.get_or_insert_with(|| SoccerMpcObjectiveHead::new(episode_seed as u32));
         for _ in 0..4 {
             head.train_rwr(&mpc_objective_samples, 0.05);
@@ -7189,7 +7281,7 @@ fn run_game(
         let planning_stats = sim.planning_validation_stats();
         if let Some(model) = completed_world_model.clone() {
             let model_steps = model.training_steps();
-            let mut guard = CARRIED_WORLD_MODEL.lock().unwrap();
+            let mut guard = carried_lock(&CARRIED_WORLD_MODEL, "CARRIED_WORLD_MODEL");
             let should_replace = guard
                 .as_ref()
                 .map(|current| current.training_steps() <= model_steps)
@@ -8928,7 +9020,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                                 report.final_loss,
                                 report.accuracy
                             );
-                            *CARRIED_PASS_COMPLETION_HEAD.lock().unwrap() = Some(head);
+                            *carried_lock(&CARRIED_PASS_COMPLETION_HEAD, "CARRIED_PASS_COMPLETION_HEAD") = Some(head);
                         }
                         None => println!(
                             "postgres_pass_completion_training experiment={} loaded={} (no usable samples to train)",
@@ -12267,6 +12359,21 @@ mod tests {
     static SOCCER_RUN_PG_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
+    fn carried_lock_recovers_poisoned_state() {
+        let lock = Mutex::new(Some(1_u32));
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut guard = lock.lock().expect("initial test lock");
+            *guard = Some(2);
+            panic!("poison carried lock for recovery test");
+        }));
+        assert!(poisoned.is_err());
+        assert!(lock.is_poisoned());
+
+        let guard = carried_lock(&lock, "TEST_CARRIED_LOCK");
+        assert_eq!(*guard, Some(2));
+    }
+
+    #[test]
     fn neural_sidecar_path_matches_live_policy_autoload_contract() {
         assert_eq!(
             neural_sidecar_path_for_policy_artifact(Path::new(
@@ -14568,7 +14675,10 @@ mod tests {
             skill_policy_heads: None,
             keeper_policy_head: None,
             line_depth_head: None,
+            pass_completion_head: None,
             mpc_objective_head: None,
+            attack_spacing_head: None,
+            support_scorer_head: None,
         }
     }
 
@@ -15461,7 +15571,10 @@ mod tests {
             skill_policy_heads: None,
             keeper_policy_head: None,
             line_depth_head: None,
+            pass_completion_head: None,
             mpc_objective_head: None,
+            attack_spacing_head: None,
+            support_scorer_head: None,
         };
 
         assert_eq!(policies.home.entries()[0].visits, 1);

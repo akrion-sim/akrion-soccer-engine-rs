@@ -7,58 +7,112 @@ promote-to-advance). Records a fresh match each build via the `fiveaside` binary
   python3 viz/selfplay_viz.py            # record champ-vs-champ + write out/index.html
 Serve it with: PORT=8081 python3 viz/serve_selfplay.py
 """
-import csv, json, os, subprocess, sys
+import csv
+import json
+import math
+import os
+import subprocess
+import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 OUT = os.path.join(ROOT, "out")
 BIN = os.path.join(ROOT, "target", "release", "fiveaside")
+MAX_SEED = 2 ** 63 - 1
+
+
+def env_int(name, default, lo=None, hi=None):
+    try:
+        value = int(os.environ.get(name, str(default)), 0)
+    except ValueError:
+        value = default
+    if lo is not None:
+        value = max(lo, value)
+    if hi is not None:
+        value = min(hi, value)
+    return value
+
+
+def policy_complete(path):
+    return all(os.path.exists(os.path.join(path, name)) for name in ("actor.txt", "critic.txt", "speedor.txt"))
 
 
 def latest_champion():
-    champs = OUT if os.path.exists(os.path.join(OUT, "actor.txt")) else None
+    champs = OUT if policy_complete(OUT) else None
     gens = []
     cdir = os.path.join(OUT, "champions")
     if os.path.isdir(cdir):
         for d in os.listdir(cdir):
-            if d.startswith("gen") and d[3:].isdigit():
-                gens.append((int(d[3:]), os.path.join(cdir, d)))
+            path = os.path.join(cdir, d)
+            if d.startswith("gen") and d[3:].isdigit() and policy_complete(path):
+                gens.append((int(d[3:]), path))
     gens.sort()
+    if not champs and not gens:
+        raise SystemExit(f"no complete champion policy found under {OUT}; run selfplay first")
     return champs or (gens[-1][1] if gens else OUT), (gens[-1][0] if gens else 0)
 
 
 def record(seed, a_dir, opp_dir, out_json):
-    r = subprocess.run(
-        [BIN, "play", str(seed), "--out-dir", a_dir, "--opponent", opp_dir, "--out", out_json],
-        capture_output=True, text=True, timeout=120,
-    )
+    timeout = env_int("NEWGAME_TIMEOUT", 120, lo=1, hi=3600)
+    try:
+        r = subprocess.run(
+            [BIN, "play", str(seed), "--out-dir", a_dir, "--opponent", opp_dir, "--out", out_json],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise SystemExit(f"record timed out after {timeout}s") from exc
+    except OSError as exc:
+        raise SystemExit(f"record failed to start: {exc}") from exc
     if r.returncode != 0:
-        raise SystemExit(f"record failed: {r.stderr}")
-    return json.load(open(out_json))
+        raise SystemExit(f"record failed: {(r.stderr or r.stdout)[-800:]}")
+    with open(out_json) as fh:
+        match = json.load(fh)
+    if not isinstance(match.get("frames"), list) or not match["frames"]:
+        raise SystemExit(f"record wrote invalid match JSON at {out_json}")
+    return match
 
 
 def read_ladder():
     p = os.path.join(OUT, "selfplay_ladder.csv")
     rows = []
     if os.path.exists(p):
-        for r in csv.DictReader(open(p)):
-            rows.append(r)
+        with open(p, newline="") as fh:
+            for r in csv.DictReader(fh):
+                rows.append(r)
     return rows
 
 
 def main():
     champ, gen = latest_champion()
     # a fair, symmetric champion-vs-champion match (both teams the current champion)
-    match = record(int(os.environ.get("SEED", "20260712")), champ, champ, "/tmp/selfplay_match.json")
+    fd, match_path = tempfile.mkstemp(suffix=".json", prefix="selfplay_match_")
+    os.close(fd)
+    try:
+        match = record(env_int("SEED", 20260712, lo=0, hi=MAX_SEED), champ, champ, match_path)
+    finally:
+        try:
+            os.unlink(match_path)
+        except OSError:
+            pass
     ladder = read_ladder()
     # ladder curve: vs-champion + vs-scripted goal-diff per generation
-    curve = [{
-        "gen": int(r["generation"]),
-        "vs_champ": float(r["cand_vs_champ_gd"]),
-        "vs_scripted": float(r["cand_vs_scripted_gd"]),
-        "champ_gen": int(r["champion_gen"]),
-        "promoted": r["promoted"].strip().lower() == "true",
-    } for r in ladder]
+    curve = []
+    for r in ladder:
+        try:
+            row = {
+                "gen": int(r["generation"]),
+                "vs_champ": float(r["cand_vs_champ_gd"]),
+                "vs_scripted": float(r["cand_vs_scripted_gd"]),
+                "champ_gen": int(r["champion_gen"]),
+                "promoted": r["promoted"].strip().lower() == "true",
+            }
+        except (KeyError, ValueError):
+            continue
+        if math.isfinite(row["vs_champ"]) and math.isfinite(row["vs_scripted"]):
+            curve.append(row)
     promotions = sum(1 for r in ladder if r["promoted"].strip().lower() == "true")
     final_champ_gen = curve[-1]["champ_gen"] if curve else gen
     last_scripted = curve[-1]["vs_scripted"] if curve else 0.0
@@ -73,7 +127,8 @@ def main():
                    .replace("/*__CURVE__*/null", json.dumps(curve)) \
                    .replace("/*__META__*/null", json.dumps(meta))
     dst = os.path.join(OUT, "index.html")
-    open(dst, "w").write(html)
+    with open(dst, "w") as fh:
+        fh.write(html)
     print("wrote", dst, "| champion gen", final_champ_gen, "| promotions", promotions,
           "| vs-scripted gd", round(last_scripted, 2), "| match", meta["match_score"])
 

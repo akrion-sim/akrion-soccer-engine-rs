@@ -243,7 +243,36 @@ fn load_policy(dir: &Path) -> AppResult<train::Policy> {
     let speedor = nn::Mlp::load(&dir.join("speedor.txt"))
         .map_err(|e| format!("failed to load speedor in {}: {e}", dir.display()))?;
     if actor.in_dim() != OBS_DIM || actor.out_dim() != NA {
-        return Err("actor shape mismatch; retrain the policy".into());
+        return Err(format!(
+            "actor shape mismatch in {}: expected input {} / actions {}, got input {} / actions {}; retrain the policy",
+            dir.display(),
+            OBS_DIM,
+            NA,
+            actor.in_dim(),
+            actor.out_dim()
+        )
+        .into());
+    }
+    if speedor.in_dim() != OBS_DIM || speedor.out_dim() != NS {
+        return Err(format!(
+            "speedor shape mismatch in {}: expected input {} / speeds {}, got input {} / speeds {}; retrain the policy",
+            dir.display(),
+            OBS_DIM,
+            NS,
+            speedor.in_dim(),
+            speedor.out_dim()
+        )
+        .into());
+    }
+    if critic.in_dim() != GLOBAL_DIM || critic.out_dim() != 1 {
+        return Err(format!(
+            "critic shape mismatch in {}: expected input {} / output 1, got input {} / output {}; retrain the policy",
+            dir.display(),
+            GLOBAL_DIM,
+            critic.in_dim(),
+            critic.out_dim()
+        )
+        .into());
     }
     Ok(train::Policy {
         actor,

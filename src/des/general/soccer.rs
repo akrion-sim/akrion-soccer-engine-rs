@@ -24400,23 +24400,11 @@ pub(crate) fn shot_shaping_reward_scale() -> f64 {
 /// [0, 8], default **0.0** => byte-identical off.
 pub(crate) fn on_frame_shot_reward_scale() -> f64 {
     if dynamic_reward_weights_enabled() {
-        return reward_weight_env(
-            "DD_SOCCER_ON_FRAME_SHOT_REWARD_SCALE",
-            0.0,
-            MIN_SOCCER_REWARD_WEIGHT,
-            8.0,
-        );
+        return optional_reward_weight_env("DD_SOCCER_ON_FRAME_SHOT_REWARD_SCALE", 0.0, 8.0);
     }
     use std::sync::OnceLock;
     static V: OnceLock<f64> = OnceLock::new();
-    *V.get_or_init(|| {
-        reward_weight_env(
-            "DD_SOCCER_ON_FRAME_SHOT_REWARD_SCALE",
-            0.0,
-            MIN_SOCCER_REWARD_WEIGHT,
-            8.0,
-        )
-    })
+    *V.get_or_init(|| optional_reward_weight_env("DD_SOCCER_ON_FRAME_SHOT_REWARD_SCALE", 0.0, 8.0))
 }
 
 pub(crate) fn shot_commitment_reward_scale() -> f64 {
@@ -27443,8 +27431,11 @@ fn soccer_transition_reward_with_tactics(
     // effectively MISSING (live on-frame-shot signal ~1-3 pts vs a ~800 goal; the 80-pt "shot on
     // target" was telemetry-inert). Gated (default 0 = byte-identical off).
     let on_frame_shot_w = on_frame_shot_reward_scale();
-    if on_frame_shot_w > MIN_SOCCER_REWARD_WEIGHT && soccer_label_is_shot(action) {
-        let on_frame = decision.observation.shot_on_frame_probability.clamp(0.0, 1.0);
+    if on_frame_shot_w > 0.0 && soccer_label_is_shot(action) {
+        let on_frame = decision
+            .observation
+            .shot_on_frame_probability
+            .clamp(0.0, 1.0);
         reward += on_frame_shot_w * SHOT_ON_TARGET_REWARD_POINTS * on_frame;
     }
 
