@@ -150,6 +150,50 @@ fn setup_scenario(sim: &mut SoccerMatch, rng: &mut Rng, num_defenders: usize) ->
     shooter
 }
 
+/// Play one finishing episode: reset the scenario, step until the shot resolves (goal / keeper
+/// save / ball out of the attacking third) or the tick cap, then flush any post-goal celebration
+/// so it cannot clobber the next reset. Returns whether the shot was converted. Does NOT drain the
+/// learner — the caller decides, so the SAME routine serves both training and frozen held-out eval.
+fn play_one_episode(
+    sim: &mut SoccerMatch,
+    rng: &mut Rng,
+    num_defenders: usize,
+    max_ticks: usize,
+    field_length: f64,
+) -> bool {
+    setup_scenario(sim, rng, num_defenders);
+    let score_before = sim.score_home;
+    let mut scored = false;
+    for _ in 0..max_ticks {
+        sim.run_time_step();
+        if sim.score_home > score_before {
+            scored = true;
+            break;
+        }
+        // Shot resolved against us (keeper save / defender block / interception) …
+        if sim.ball.last_touch_team == Some(Team::Away) {
+            break;
+        }
+        // … or the ball left the attacking third.
+        if sim.ball.position.y < field_length * 0.60 {
+            break;
+        }
+        if sim.is_done() {
+            break;
+        }
+    }
+    if scored {
+        // Flush the ~25-tick goal celebration + kickoff reset (the counter is pub(crate)).
+        for _ in 0..30 {
+            if sim.is_done() {
+                break;
+            }
+            sim.run_time_step();
+        }
+    }
+    scored
+}
+
 fn main() {
     // FINISHING COUPLING (the fix that makes this drill actually train finishing).
     // Under the engine's default serving, a clear chance yields a single dominant analytic
