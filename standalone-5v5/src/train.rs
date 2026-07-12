@@ -640,16 +640,8 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
                     close_ticks[i] = close_ticks[i].saturating_sub(LINGER_DECAY);
                 }
                 let mut sr = spacing_reward(nd);
-<<<<<<< HEAD
-                if sr < 0.0 && nd >= 3.0 && close_ticks[i] <= linger_gate {
-                    sr = 0.0; // transient — not yet a lingering-bunch penalty
-=======
-                // SEVERE overlap (occupying the same spot) is never "running past
-                // each other" — penalize it instantly, ungated. Only the soft
-                // 1.5-4yd band gets the linger grace period.
                 if sr < 0.0 && nd >= SEVERE_RADIUS && close_ticks[i] <= linger_gate {
                     sr = 0.0; // transient soft-band closeness — not yet a lingering bunch
->>>>>>> wip-player-speeds
                 }
                 sp_t[i] = w_spacing_coeff * sr;
             }
