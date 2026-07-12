@@ -29,12 +29,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 BIN = os.path.join(ROOT, "target", "release", "soccer_climb_ratchet")
 LOG = os.path.join(HERE, "tune_log.csv")
-try:
-    MIN_REWARD_WEIGHT = float(os.environ.get("TUNE_MIN_REWARD_WEIGHT", "0.0001"))
-except ValueError:
-    MIN_REWARD_WEIGHT = 0.0001
-if not math.isfinite(MIN_REWARD_WEIGHT) or MIN_REWARD_WEIGHT <= 0.0:
-    MIN_REWARD_WEIGHT = 0.0001
+MIN_REWARD_WEIGHT = 0.0001
 
 
 def env_int(name, default, lo=None, hi=None):
@@ -70,25 +65,21 @@ def env_float(name, default, lo=None, hi=None):
 # known-weak legacy vector. Lower bounds are deliberately positive: a channel
 # may become tiny, but never exactly zero and invisible to the learner.
 SPACE = [
-    # Merge note: the default (anchor) column follows the dynamic-rewards
-    # re-anchoring; the low/high bounds and log-scale flags follow the hardening
-    # branch (wider search with robust positive floors). The previous anchor is
-    # preserved as legacy_default_vec() / the "legacy_default" preset.
-    ("DD_SOCCER_GOAL_REWARD_SCALE", 1.2, 1.0, 16.0, False),
-    ("DD_SOCCER_FORWARD_PASS_REWARD_SCALE", 8.2, MIN_REWARD_WEIGHT, 20.0, False),
-    ("DD_SOCCER_PASS_CHAIN_REWARD_SCALE", 6.6, MIN_REWARD_WEIGHT, 20.0, False),
-    ("DD_SOCCER_PASS_TURNOVER_PENALTY_SCALE", 2.8, 1.0, 20.0, False),
+    ("DD_SOCCER_GOAL_REWARD_SCALE", 1.2, 0.5, 4.0, False),
+    ("DD_SOCCER_FORWARD_PASS_REWARD_SCALE", 8.2, MIN_REWARD_WEIGHT, 12.0, False),
+    ("DD_SOCCER_PASS_CHAIN_REWARD_SCALE", 6.6, MIN_REWARD_WEIGHT, 10.0, False),
+    ("DD_SOCCER_PASS_TURNOVER_PENALTY_SCALE", 2.8, 1.0, 12.0, False),
     ("DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE", 0.75, MIN_REWARD_WEIGHT, 2.0, False),
-    ("DD_SOCCER_SHOT_SHAPING_REWARD_SCALE", 0.42, MIN_REWARD_WEIGHT, 4.0, False),
-    ("DD_SOCCER_SHOT_COMMITMENT_REWARD_SCALE", 0.18, MIN_REWARD_WEIGHT, 10.0, False),
+    ("DD_SOCCER_SHOT_SHAPING_REWARD_SCALE", 0.42, MIN_REWARD_WEIGHT, 1.0, False),
+    ("DD_SOCCER_SHOT_COMMITMENT_REWARD_SCALE", 0.18, MIN_REWARD_WEIGHT, 2.0, False),
     ("DD_SOCCER_DRIBBLE_BEAT_REWARD_SCALE", 0.9, MIN_REWARD_WEIGHT, 8.0, False),
-    ("DD_SOCCER_LEARNED_EPV_REWARD_SCALE", 0.30, MIN_REWARD_WEIGHT, 200.0, True),
+    ("DD_SOCCER_LEARNED_EPV_REWARD_SCALE", 0.30, MIN_REWARD_WEIGHT, 4.0, False),
     ("SOCCER_OFFBALL_SUPPORT_REWARD_SCALE", 3.0, 0.5, 6.0, False),
     ("DD_SOCCER_CARRY_REWARD_SCALE", 1.1, 0.5, 6.0, False),
     ("DD_SOCCER_RECOVERY_REWARD_SCALE", 1.0, 0.5, 6.0, False),
-    ("DD_SOCCER_OVERLOAD_PROGRESSION_REWARD_PER_YARD", 0.05, MIN_REWARD_WEIGHT, 0.5, False),
-    ("SOCCER_ANALYTIC_DIFFERENCE_REWARD_NEGATIVE_DENSE_FLOOR", 0.10, MIN_REWARD_WEIGHT, 1.0, False),
-    ("SOCCER_ANALYTIC_DIFFERENCE_REWARD_NEGATIVE_DENSE_SCALE", 1.0, MIN_REWARD_WEIGHT, 25.0, True),
+    ("DD_SOCCER_OVERLOAD_PROGRESSION_REWARD_PER_YARD", 0.05, MIN_REWARD_WEIGHT, 0.12, False),
+    ("SOCCER_ANALYTIC_DIFFERENCE_REWARD_NEGATIVE_DENSE_FLOOR", 0.10, MIN_REWARD_WEIGHT, 0.6, False),
+    ("SOCCER_ANALYTIC_DIFFERENCE_REWARD_NEGATIVE_DENSE_SCALE", 1.0, MIN_REWARD_WEIGHT, 3.0, False),
     ("SOCCER_MAPPO_TEAM_REWARD_SHARE", 0.08, MIN_REWARD_WEIGHT, 1.0, False),
     ("SOCCER_MARL_TEAM_REWARD_WEIGHT", 0.08, MIN_REWARD_WEIGHT, 1.5, False),
     ("SOCCER_MARL_INTERMEDIATE_REWARD_WEIGHT", 2.0, 0.2, 3.0, False),
@@ -108,15 +99,6 @@ SEEDS = [s.strip() for s in os.environ.get("TUNE_SEEDS", "0x5EED0000").split(","
 SIGMA0 = env_float("TUNE_SIGMA", 0.18, lo=0.001, hi=1.0)
 RNG = random.Random(env_int("TUNE_RNG", 11))
 HALTON_BASES = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71]
-
-# Fail fast on misconfiguration instead of dividing by zero deep in the sweep
-# (aggregate_fitness divides by len(SEEDS); the elite update divides by ELITE).
-if not SEEDS:
-    sys.exit("TUNE_SEEDS is empty — provide at least one seed")
-if POP < 1:
-    sys.exit(f"TUNE_POP={POP} must be >= 1")
-if not (1 <= ELITE <= POP):
-    sys.exit(f"TUNE_ELITE={ELITE} must be in [1, TUNE_POP={POP}]")
 
 MIN_WEAK_SIDE = env_float("TUNE_MIN_WEAK_SIDE", 0.25, lo=0.0, hi=1.0)
 MIN_SHOTS = env_int("TUNE_MIN_SHOTS", 1, lo=0)
@@ -161,9 +143,7 @@ def norm(vec):
     for (_, _, lo, hi, log), value in zip(SPACE, vec):
         lo = max(MIN_REWARD_WEIGHT, lo)
         hi = max(lo, hi)
-        value = float(value)
-        if not math.isfinite(value):
-            value = lo
+        value = value if math.isfinite(value) else lo
         value = min(hi, max(lo, value))
         if log:
             value, lo, hi = math.log(value), math.log(lo), math.log(hi)
@@ -174,15 +154,9 @@ def norm(vec):
 def denorm(nvec):
     out = []
     for (_, _, lo, hi, log), value in zip(SPACE, nvec):
-<<<<<<< HEAD
-        value = float(value)
-        if not math.isfinite(value):
-            value = 0.0
-=======
         lo = max(MIN_REWARD_WEIGHT, lo)
         hi = max(lo, hi)
         value = value if math.isfinite(value) else 0.0
->>>>>>> dynamic-rewards-wip
         value = min(1.0, max(0.0, value))
         if log:
             out.append(math.exp(math.log(lo) + value * (math.log(hi) - math.log(lo))))
@@ -203,15 +177,9 @@ def vec_with(overrides):
     vec = default_vec()
     for index, (name, _, lo, hi, _) in enumerate(SPACE):
         if name in overrides:
-<<<<<<< HEAD
-            value = float(overrides[name])
-            if math.isfinite(value):
-                vec[index] = min(hi, max(lo, value))
-=======
             lo = max(MIN_REWARD_WEIGHT, lo)
             hi = max(lo, hi)
             vec[index] = min(hi, max(lo, overrides[name]))
->>>>>>> dynamic-rewards-wip
     return vec
 
 
@@ -275,25 +243,9 @@ def gate_deficit(metrics):
 
 
 def gates_ok(metrics):
-    return gate_deficit(metrics) <= 1e-12
-
-
-def gate_deficit(metrics):
     if metrics is None:
-<<<<<<< HEAD
-        return 10.0
-    weak_side = min(metrics["home"], metrics["away"])
-    return (
-        max(0.0, MIN_WEAK_SIDE - weak_side) / max(MIN_WEAK_SIDE, 1e-9)
-        + max(0.0, MIN_SHOTS - metrics["shots_for"]) / max(MIN_SHOTS, 1)
-        + max(0.0, MIN_SOT - metrics["sot_for"]) / max(MIN_SOT, 1)
-        + max(0.0, MIN_SHOTS_AFTER_PASS - metrics["shots_after_pass"])
-        / max(MIN_SHOTS_AFTER_PASS, 1)
-    )
-=======
         return False
     return gate_deficit(metrics) <= 1e-12
->>>>>>> dynamic-rewards-wip
 
 
 def fitness_from_metrics(metrics):
@@ -393,16 +345,6 @@ def run_one(vec, seed, cand_index, seed_index):
     return parse(out)
 
 
-<<<<<<< HEAD
-def eval_pool(vectors):
-    # Each child's stdout+stderr goes to a FILE, not a PIPE. A ratchet run prints
-    # far more than the ~64KB OS pipe buffer, and the old code only drained the
-    # pipe *after* poll() reported exit — so a child could block on write()
-    # forever and wedge the whole (multi-hour) sweep. A file sink can't deadlock.
-    # Each child also gets a hard deadline and is killed + scored as a failure if
-    # it overruns (the safe run_one() already did this; eval_pool now matches).
-    timeout_s = int(os.environ.get("TUNE_TIMEOUT_SECONDS", "3600"))
-=======
 def candidate_fit(results, candidate_index):
     seed_metrics = [results.get((candidate_index, si)) for si in range(len(SEEDS))]
     return aggregate_fitness(seed_metrics), seed_metrics
@@ -440,9 +382,8 @@ def append_candidate_row(gen, cand, label, vec, fit, seed_metrics):
 def eval_pool(vectors, gen=None, labels=None):
     if labels is None:
         labels = [f"cand{index}" for index in range(len(vectors))]
->>>>>>> dynamic-rewards-wip
     jobs = [(ci, si, vec, seed) for ci, vec in enumerate(vectors) for si, seed in enumerate(SEEDS)]
-    running = {}  # proc -> (ci, si, logpath, logfile, deadline)
+    running = {}
     results = {}
     written = set()
     next_job = 0
@@ -455,10 +396,6 @@ def eval_pool(vectors, gen=None, labels=None):
             env.update(FIXED_ENV)
             for (name, *_), value in zip(SPACE, vec):
                 env[name] = f"{value:.8g}"
-            outdir = os.path.join(ROOT, "out_tune_11v11", f"cand_{ci}_seed_{si}")
-            os.makedirs(outdir, exist_ok=True)
-            logpath = os.path.join(outdir, "stdout.log")
-            logf = open(logpath, "w")
             cmd = [
                 BIN,
                 str(ITERS_GAMES),
@@ -467,36 +404,6 @@ def eval_pool(vectors, gen=None, labels=None):
                 str(INCREMENTS),
                 seed,
             ]
-<<<<<<< HEAD
-            proc = subprocess.Popen(
-                cmd,
-                env=env,
-                cwd=ROOT,
-                stdout=logf,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
-            running[proc] = (ci, si, logpath, logf, time.time() + timeout_s)
-        time.sleep(1.0)
-        for proc in list(running):
-            ci, si, logpath, logf, deadline = running[proc]
-            done = proc.poll() is not None
-            if not done and time.time() > deadline:
-                proc.kill(); proc.wait(); done = True
-            if done:
-                running.pop(proc)
-                logf.close()
-                try:
-                    with open(logpath) as fh:
-                        out = fh.read()
-                except OSError:
-                    out = ""
-                results[(ci, si)] = parse(out)
-    if not any(v is not None for v in results.values()):
-        sys.exit("NO candidate produced a parseable summary this generation — the "
-                 "ratchet output format likely changed (check CAND_RE) or every run "
-                 "crashed/timed out. Aborting rather than ranking pure noise.")
-=======
             try:
                 proc = subprocess.Popen(
                     cmd,
@@ -545,38 +452,12 @@ def eval_pool(vectors, gen=None, labels=None):
                     )
                     sys.stdout.flush()
                     written.add(ci)
->>>>>>> dynamic-rewards-wip
     fits = []
     for ci in range(len(vectors)):
         fits.append(candidate_fit(results, ci))
     return fits
 
 
-<<<<<<< HEAD
-def smoke_bad_mutation():
-    return vec_with(
-        {
-            "DD_SOCCER_GOAL_REWARD_SCALE": 1.0,
-            "DD_SOCCER_FORWARD_PASS_REWARD_SCALE": 0.0,
-            "DD_SOCCER_PASS_CHAIN_REWARD_SCALE": 0.0,
-            "DD_SOCCER_PASS_TURNOVER_PENALTY_SCALE": 20.0,
-            "DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE": 0.0,
-            "DD_SOCCER_SHOT_SHAPING_REWARD_SCALE": 0.0,
-            "DD_SOCCER_SHOT_COMMITMENT_REWARD_SCALE": 0.0,
-            "DD_SOCCER_DRIBBLE_BEAT_REWARD_SCALE": 0.0,
-            "DD_SOCCER_LEARNED_EPV_REWARD_SCALE": 0.0,
-            "SOCCER_OFFBALL_SUPPORT_REWARD_SCALE": 0.0,
-            "DD_SOCCER_CARRY_REWARD_SCALE": 0.0,
-            "DD_SOCCER_RECOVERY_REWARD_SCALE": 0.0,
-            "DD_SOCCER_OVERLOAD_PROGRESSION_REWARD_PER_YARD": 0.0,
-            "SOCCER_MAPPO_TEAM_REWARD_SHARE": 0.0,
-            "SOCCER_MARL_TEAM_REWARD_WEIGHT": 0.0,
-            "SOCCER_MARL_INTERMEDIATE_REWARD_WEIGHT": 0.2,
-            "SOCCER_PLANNER_TEACHER_WEIGHT": 0.0,
-            "SOCCER_NEURAL_FINISHING_SELECT_BONUS_WEIGHT": 0.0,
-        }
-    )
-=======
 def legacy_default_vec():
     return vec_with({
         "DD_SOCCER_GOAL_REWARD_SCALE": 1.0,
@@ -865,7 +746,6 @@ def generation_candidates(mean, sigma, gen, best_vec):
     candidates_n = [nvec for _, nvec, _ in candidates[:POP]]
     vectors = [vec for _, _, vec in candidates[:POP]]
     return labels, candidates_n, vectors
->>>>>>> dynamic-rewards-wip
 
 
 def smoke_test():

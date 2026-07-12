@@ -947,6 +947,17 @@ fn game_stats(policy: &train::Policy, seed: u64) -> (u32, u32, u32, u32) {
 /// Play one greedy game and dump per-tick positions to a compact JSON for the
 /// HTML viewer. Hand-rolled JSON — no serde, keeping the crate dependency-free.
 fn record_match(policy: &train::Policy, rng: &mut Rng, path: &Path) -> AppResult<()> {
+    record_match_vs(policy, None, rng, path)
+}
+
+/// As [`record_match`], but Team B is driven by `opponent` (a learned champion) when
+/// provided, else the scripted baseline — powers champion-vs-champion self-play viz.
+fn record_match_vs(
+    policy: &train::Policy,
+    opponent: Option<&train::Policy>,
+    rng: &mut Rng,
+    path: &Path,
+) -> AppResult<()> {
     let mut w = World::new();
     let mut frames = String::new();
     frames.push('[');
