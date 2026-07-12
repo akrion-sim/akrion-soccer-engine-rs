@@ -510,7 +510,12 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
         }
 
         let pre_field = FieldRewardContext::from_world(&w);
-        let act_b = noisy_scripted_actions(&w, Team::B, opponent_noise, rng);
+        // Team B = the frozen self-play champion when one is installed, else the
+        // scripted baseline. Both flow through World::step (physics-bounded).
+        let act_b = match selfplay_champion() {
+            Some(champ) => champion_actions(&champ, &w, opponent_noise, rng),
+            None => noisy_scripted_actions(&w, Team::B, opponent_noise, rng),
+        };
         w.step(&packed_a, &act_b, rng);
         let post_field = FieldRewardContext::from_world(&w);
 
