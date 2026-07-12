@@ -286,68 +286,70 @@ def nn_value_frames(dp):
 #    centerpiece: the optimization points moving across ALL 32 dimensions.
 # ─────────────────────────────────────────────────────────────────────────────
 def evolution_strategy():
-    POP, ELITE, GENS = 16, 5, 100
-    sigma0 = 0.30
-    # a plausible tuned optimum in normalized space (shifted from the defaults):
-    # reward finishing/possession/goalside more, spacing mid, trim some off-ball noise.
-    defaults_norm = norm_of([d for (_, d, *_ ) in SPACE])
-    shift = RNG.uniform(-0.28, 0.34, NDIM)
-    # bias a few meaningful dims so convergence "means" something on the axes
+    """A real (mu, lambda) evolution strategy over the 32-weight reward vector —
+    the same loop as viz/tune.py, tuned to read cleanly across 100 generations:
+    the population starts wide (explore) and tightens onto the optimum (exploit)."""
+    POP, ELITE, GENS = 18, 6, 100
     keymap = {n: i for i, (n, *_ ) in enumerate(SPACE)}
-    for n, s in [("REW_SHOT_Q", 0.42), ("W_GOALSIDE", 0.34), ("REW_TURNOVER", 0.30),
-                 ("W_FIELD_PASS", 0.28), ("REW_DRIBBLE_TURNOVER", 0.26), ("W_STAND_PEN", 0.30),
-                 ("SPACING_W", -0.18), ("REW_DRIBBLE", -0.22), ("W_FLANK", -0.20),
-                 ("REW_MILESTONE", 0.24)]:
-        shift[keymap[n]] = s
-    optimum = np.clip(defaults_norm + shift, 0.02, 0.98)
+    defaults_norm = norm_of([d for (_, d, *_ ) in SPACE])
 
-    # fitness ~ gated goal-diff in [-6, +3]; peak near optimum, rugged (noise + a gate cliff)
-    weights = RNG.uniform(0.6, 1.4, NDIM)
+    # A plausible tuned optimum in normalized space, shifted from the defaults so
+    # convergence is meaningful on the named axes (reward finishing / protecting the
+    # ball / goalside more; trim some off-ball noise; nudge spacing wider).
+    shift = RNG.uniform(-0.22, 0.22, NDIM)
+    for n, s in [("REW_SHOT_Q", 0.40), ("W_GOALSIDE", 0.36), ("REW_TURNOVER", 0.30),
+                 ("W_FIELD_PASS", 0.30), ("REW_DRIBBLE_TURNOVER", 0.28), ("W_STAND_PEN", 0.34),
+                 ("SPACING_W", 0.22), ("REW_DRIBBLE", -0.30), ("W_FLANK", -0.26),
+                 ("REW_MILESTONE", 0.26), ("W_CHANCE", 0.30), ("REW_RECYCLE", -0.24)]:
+        shift[keymap[n]] = s
+    optimum = np.clip(defaults_norm + shift, 0.05, 0.95)
+
+    # Fitness ≈ gated goal-diff. A smooth bowl peaking at the optimum, MINUS a
+    # "hardening gate" cliff (the rugged, cliffy landscape tune.py describes: one
+    # gate can swing goal-diff from ~0 to +6). Weighted so a few dims matter more.
+    dw = RNG.uniform(0.7, 1.3, NDIM)
     def fitness(x):
-        d2 = float(np.sum(weights * (x - optimum) ** 2)) / NDIM
-        base = 3.0 - 7.5 * d2                       # smooth bowl
-        # a "hardening gate" cliff: too-low spacing or too-high dribble tanks it
+        msd = float(np.mean(dw * (x - optimum) ** 2))
+        base = 3.4 - 13.0 * msd                       # ~+3.3 at optimum, sinks when far
         sp = x[keymap["SPACING_W"]]; dr = x[keymap["REW_DRIBBLE"]]
-        if sp < 0.12 or dr > 0.82:
-            base -= 4.0
+        if sp < 0.10 or dr > 0.85:                     # reward-hacked / collapsed spacing
+            base -= 4.2
         return base
 
     mean = defaults_norm.copy()
-    sigma = np.full(NDIM, sigma0)
-    gens = []
-    best_ever = -1e9
-    all_pts = []                                    # collect for a fixed 2-D projection
-    raw_gens = []
+    sigma = np.full(NDIM, 0.34)
+    all_pts, raw_gens = [], []
     for g in range(GENS):
-        pop = [mean.copy()]                         # elitism: keep the mean
+        pop = [mean.copy()]                            # elitism: carry the current mean
         for _ in range(POP - 1):
             pop.append(np.clip(mean + sigma * RNG.normal(0, 1, NDIM), 0, 1))
         pop = np.array(pop)
-        fits = np.array([fitness(x) + RNG.normal(0, 0.18) for x in pop])
-        order = np.argsort(-fits)
-        elite = order[:ELITE]
-        new_mean = pop[elite].mean(axis=0)
-        new_sigma = np.clip(pop[elite].std(axis=0) * 1.3, 0.03, 0.4)
-        best_ever = max(best_ever, float(fits.max()))
+        fits = np.array([fitness(x) + RNG.normal(0, 0.10) for x in pop])
+        elite = np.argsort(-fits)[:ELITE]
         raw_gens.append((pop.copy(), fits.copy(), mean.copy(), sigma.copy()))
         all_pts.append(pop)
-        mean, sigma = new_mean, new_sigma
+        # update mean from the elite; step size follows a smooth decay schedule
+        # (blended with the elite spread) so exploration fades across all 100 gens.
+        mean = pop[elite].mean(axis=0)
+        sched = 0.30 * (1 - g / GENS) ** 0.9 + 0.03
+        sigma = np.clip(np.maximum(pop[elite].std(axis=0) * 1.25, sched), 0.02, 0.4)
 
     # fixed 2-D PCA projection over every point ever sampled (stable across gens)
     allp = np.vstack(all_pts)
     mu = allp.mean(axis=0)
     _, _, Vt = np.linalg.svd(allp - mu, full_matrices=False)
-    basis = Vt[:2]                                  # 2 x NDIM
-    def proj(x):
-        p = (np.atleast_2d(x) - mu) @ basis.T
-        return p
+    basis = Vt[:2]
+    proj = lambda x: (np.atleast_2d(x) - mu) @ basis.T
 
+    gens = []
     for g, (pop, fits, m, sg) in enumerate(raw_gens):
         pp = proj(pop)
+        dist = float(np.sqrt(np.mean((m - optimum) ** 2)))   # normalized RMS to optimum
         gens.append({
             "gen": g,
             "fit_best": round(float(fits.max()), 3),
             "fit_mean": round(float(fits.mean()), 3),
+            "dist_opt": round(dist, 4),
             "sigma_mean": round(float(sg.mean()), 4),
             "mean_norm": [round(float(v), 4) for v in m],
             "sigma_norm": [round(float(v), 4) for v in sg],
@@ -358,6 +360,7 @@ def evolution_strategy():
             "mean_xy": [round(float(proj(m)[0, 0]), 3), round(float(proj(m)[0, 1]), 3)],
         })
     opt_xy = proj(optimum)[0]
+    pr = proj(allp)
     return {
         "ndim": NDIM, "pop": POP, "elite": ELITE, "gens_n": GENS,
         "dims": [{"key": n, "label": WEIGHT_META[n][0], "group": WEIGHT_META[n][1],
@@ -367,8 +370,8 @@ def evolution_strategy():
         "optimum_raw": [round(float(v), 5) for v in denorm(optimum)],
         "optimum_xy": [round(float(opt_xy[0]), 3), round(float(opt_xy[1]), 3)],
         "proj_range": {
-            "x": [round(float(proj(allp)[:, 0].min()), 3), round(float(proj(allp)[:, 0].max()), 3)],
-            "y": [round(float(proj(allp)[:, 1].min()), 3), round(float(proj(allp)[:, 1].max()), 3)],
+            "x": [round(float(pr[:, 0].min()), 3), round(float(pr[:, 0].max()), 3)],
+            "y": [round(float(pr[:, 1].min()), 3), round(float(pr[:, 1].max()), 3)],
         },
         "gens": gens,
     }
