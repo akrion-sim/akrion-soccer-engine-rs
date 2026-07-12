@@ -147,7 +147,8 @@ fn teammate_spacing_score(distance: f32) -> f32 {
 #[derive(Clone, Copy)]
 pub struct Player {
     pub pos: V2,
-    pub vel: V2,
+    pub vel: V2,        // actual velocity — ramps toward des_vel at a bounded rate
+    pub des_vel: V2,    // desired velocity (the chosen gear/direction this tick)
 }
 
 #[derive(Clone, Copy, PartialEq)]
