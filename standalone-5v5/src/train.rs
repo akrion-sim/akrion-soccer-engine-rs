@@ -60,7 +60,12 @@ const EPOCHS: usize = 4;
 const MINIBATCH: usize = 1024;
 const MAX_ROLLOUT_THREADS: usize = 4;
 const MIN_REWARD_WEIGHT: f32 = 0.0001;
-const REWARD_CONVERSION_MARGIN: f32 = 5.0;
+/// A converted goal must dominate the summed non-converting shot reward by a PROPORTIONAL margin:
+/// `shot_base + shot_q <= goal * REWARD_NON_CONVERSION_MAX_FRACTION`. Scales with the goal weight
+/// rather than a fixed point gap (which loses meaning once weights move), matching the 11v11 engine's
+/// `grounded_non_conversion_reward_scale`. Default 0.40 = an on-target shot that misses is worth at
+/// most ~40% of a goal.
+const REWARD_NON_CONVERSION_MAX_FRACTION: f32 = 0.40;
 const REW_GOAL_MIN: f32 = 6.0;
 const REW_GOAL_MAX: f32 = 20.0;
 const LINGER_RADIUS: f32 = 4.0; // "same radius": teammates within this many yards
@@ -108,18 +113,16 @@ fn wenv(name: &str, default: f32, lo: f32, hi: f32) -> f32 {
 }
 
 fn grounded_conversion_ladder(goal: f32, shot_base: f32, shot_q: f32) -> (f32, f32, f32) {
-    let mut goal = goal.clamp(REW_GOAL_MIN, REW_GOAL_MAX);
+    // The goal stays the reference (clamped to its own range); shot shaping is scaled DOWN to fit a
+    // proportional fraction below it, never the reverse — so tuning big shot rewards can't quietly
+    // inflate what "scoring" is worth.
+    let goal = goal.clamp(REW_GOAL_MIN, REW_GOAL_MAX);
     let mut shot_base = shot_base.max(MIN_REWARD_WEIGHT);
     let mut shot_q = shot_q.max(MIN_REWARD_WEIGHT);
-    let required_goal = shot_base + shot_q + REWARD_CONVERSION_MARGIN;
-
-    if goal < required_goal {
-        goal = required_goal.min(REW_GOAL_MAX);
-    }
-    if goal < shot_base + shot_q + REWARD_CONVERSION_MARGIN {
-        let budget = (goal - REWARD_CONVERSION_MARGIN).max(MIN_REWARD_WEIGHT);
-        let total = (shot_base + shot_q).max(MIN_REWARD_WEIGHT);
-        let scale = (budget / total).clamp(0.0, 1.0);
+    let max_non_conversion = (goal * REWARD_NON_CONVERSION_MAX_FRACTION).max(MIN_REWARD_WEIGHT);
+    let total = shot_base + shot_q;
+    if total > max_non_conversion {
+        let scale = (max_non_conversion / total).clamp(0.0, 1.0);
         shot_base = (shot_base * scale).max(MIN_REWARD_WEIGHT);
         shot_q = (shot_q * scale).max(MIN_REWARD_WEIGHT);
     }
@@ -1437,18 +1440,25 @@ mod tests {
 
     #[test]
     fn conversion_reward_ladder_dominates_non_goal_shots() {
-        let (goal, shot_base, shot_q) = grounded_conversion_ladder(6.0, 3.5, 2.5);
-        assert!(
-            goal + 1e-6 >= shot_base + shot_q + REWARD_CONVERSION_MARGIN,
-            "goal={goal} shot_base={shot_base} shot_q={shot_q}"
-        );
-        assert_eq!(goal, 11.0);
+        let frac = REWARD_NON_CONVERSION_MAX_FRACTION;
 
+        // Shots already under fraction*goal pass through untouched and stay well below the goal.
+        let (goal, shot_base, shot_q) = grounded_conversion_ladder(12.0, 1.5, 1.0);
+        assert!(
+            shot_base + shot_q <= goal * frac + 1e-5,
+            "goal={goal} shots={}",
+            shot_base + shot_q
+        );
+        assert_eq!((goal, shot_base, shot_q), (12.0, 1.5, 1.0));
+
+        // Oversized shot shaping is scaled DOWN to fit under fraction*goal; the goal stays the reference.
         let (goal, shot_base, shot_q) = grounded_conversion_ladder(6.0, 18.0, 4.0);
         assert!(
-            goal + 1e-5 >= shot_base + shot_q + REWARD_CONVERSION_MARGIN,
-            "goal={goal} shot_base={shot_base} shot_q={shot_q}"
+            shot_base + shot_q <= goal * frac + 1e-5,
+            "goal={goal} shots={}",
+            shot_base + shot_q
         );
+        assert_eq!(goal, 6.0);
         assert!(goal <= REW_GOAL_MAX);
     }
 

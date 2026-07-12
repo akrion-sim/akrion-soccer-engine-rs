@@ -1177,7 +1177,12 @@ const GOAL_CONTEXT_CREDIT_SCAN_ACTIONS: usize = 48;
 const GOAL_CONTEXT_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(60.0);
 const GOAL_CONTEXT_CREDIT_MIN_SCORE: f64 = 0.05;
 const SHOT_ON_TARGET_REWARD_POINTS: f64 = 80.0;
-const REWARD_CONVERSION_DOMINANCE_MARGIN_POINTS: f64 = 5.0;
+/// A non-conversion outcome (an on-target shot that MISSES, chain / shot-on-frame credit, ...) is
+/// capped at this FRACTION of the conversion (goal) reward, so scoring dominates a missed chance by a
+/// meaningful, magnitude-scaling margin instead of a token fixed few points — the ordering stays
+/// meaningful whether a goal is worth 100 or 1600. Tunable in (0.05, 0.95) via
+/// `DD_SOCCER_REWARD_NON_CONVERSION_MAX_FRACTION`; weights stay learnable *within* this grounded ordering.
+const DEFAULT_REWARD_NON_CONVERSION_MAX_FRACTION: f64 = 0.40;
 /// Direct keeper credit for stopping a shot, scaled upward for close-range danger.
 /// This trains the goalkeeper's preceding positioning/claim decision instead of only
 /// rewarding the shooter and penalising the keeper later when a goal is conceded.
@@ -24335,6 +24340,23 @@ fn optional_reward_weight_env(name: &str, default: f64, max: f64) -> f64 {
         .unwrap_or(default)
 }
 
+/// Tunable ceiling for a non-conversion reward as a FRACTION of the conversion (goal) reward, clamped
+/// to (0.05, 0.95). Env `DD_SOCCER_REWARD_NON_CONVERSION_MAX_FRACTION`, default
+/// `DEFAULT_REWARD_NON_CONVERSION_MAX_FRACTION` (0.40).
+fn reward_non_conversion_max_fraction() -> f64 {
+    reward_weight_env(
+        "DD_SOCCER_REWARD_NON_CONVERSION_MAX_FRACTION",
+        DEFAULT_REWARD_NON_CONVERSION_MAX_FRACTION,
+        0.05,
+        0.95,
+    )
+}
+
+/// Clamp a non-conversion reward's scale so its maximum points stay a PROPORTIONAL margin below the
+/// conversion (goal) reward: `non_conversion_points * scale <= conversion_points * fraction`. Unlike a
+/// fixed-point margin (which becomes meaningless once the goal reward is scaled up — 155 vs 160 is
+/// still "worth a goal"), the proportional cap keeps "a missed on-target shot is worth much less than
+/// a goal" true at any magnitude. Returns 0 for degenerate inputs.
 fn grounded_non_conversion_reward_scale(
     raw_scale: f64,
     non_conversion_points: f64,
@@ -24346,11 +24368,11 @@ fn grounded_non_conversion_reward_scale(
     if !non_conversion_points.is_finite()
         || !conversion_points.is_finite()
         || non_conversion_points <= 0.0
+        || conversion_points <= 0.0
     {
         return 0.0;
     }
-    let max_non_conversion_points =
-        (conversion_points - REWARD_CONVERSION_DOMINANCE_MARGIN_POINTS).max(0.0);
+    let max_non_conversion_points = conversion_points * reward_non_conversion_max_fraction();
     let max_scale = (max_non_conversion_points / non_conversion_points).max(0.0);
     raw_scale.min(max_scale)
 }
@@ -43192,26 +43214,36 @@ mod soccer_policy_actor_capacity_tests {
 
     #[test]
     fn non_conversion_reward_scales_stay_below_conversion_reward() {
+        let _lock = env_lock();
+        let _frac = set_test_env_var("DD_SOCCER_REWARD_NON_CONVERSION_MAX_FRACTION", "0.40");
+        let frac = 0.40_f64;
+
+        // A missed on-target shot is capped at a PROPORTIONAL fraction of a goal (here 40%), by a
+        // wide margin -- not a token fixed few points that vanishes once the goal reward is scaled up.
         let terminal_shot_scale =
             grounded_non_conversion_reward_scale(8.0, SHOT_ON_TARGET_REWARD_POINTS, 100.0);
         assert!(
-            terminal_shot_scale * SHOT_ON_TARGET_REWARD_POINTS
-                + REWARD_CONVERSION_DOMINANCE_MARGIN_POINTS
-                <= 100.0 + 1e-9
+            terminal_shot_scale * SHOT_ON_TARGET_REWARD_POINTS <= frac * 100.0 + 1e-9,
+            "non-conversion points must stay <= fraction * conversion reward"
         );
-        assert!((terminal_shot_scale - 1.1875).abs() < 1e-9);
+        assert!(
+            (terminal_shot_scale - frac * 100.0 / SHOT_ON_TARGET_REWARD_POINTS).abs() < 1e-9
+        );
 
+        // Proportional: raising the goal reward raises the allowed non-conversion ceiling in step,
+        // so "shot < goal by a meaningful margin" holds at any magnitude (not just near 100).
         let chain_shot_scale = grounded_non_conversion_reward_scale(
             8.0,
             SHOT_ON_TARGET_REWARD_POINTS,
             GOAL_REWARD_POINTS,
         );
         assert!(
-            chain_shot_scale * SHOT_ON_TARGET_REWARD_POINTS
-                + REWARD_CONVERSION_DOMINANCE_MARGIN_POINTS
-                <= GOAL_REWARD_POINTS + 1e-9
+            chain_shot_scale * SHOT_ON_TARGET_REWARD_POINTS <= frac * GOAL_REWARD_POINTS + 1e-9
         );
-        assert!((chain_shot_scale - 1.9375).abs() < 1e-9);
+        assert!(
+            (chain_shot_scale - frac * GOAL_REWARD_POINTS / SHOT_ON_TARGET_REWARD_POINTS).abs()
+                < 1e-9
+        );
         assert_eq!(
             grounded_non_conversion_reward_scale(0.0, SHOT_ON_TARGET_REWARD_POINTS, 100.0),
             0.0
