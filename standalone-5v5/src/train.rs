@@ -60,7 +60,12 @@ const EPOCHS: usize = 4;
 const MINIBATCH: usize = 1024;
 const MAX_ROLLOUT_THREADS: usize = 4;
 const MIN_REWARD_WEIGHT: f32 = 0.0001;
-const REWARD_CONVERSION_MARGIN: f32 = 5.0;
+/// A converted goal must dominate the summed non-converting shot reward by a PROPORTIONAL margin:
+/// `shot_base + shot_q <= goal * REWARD_NON_CONVERSION_MAX_FRACTION`. Scales with the goal weight
+/// rather than a fixed point gap (which loses meaning once weights move), matching the 11v11 engine's
+/// `grounded_non_conversion_reward_scale`. Default 0.40 = an on-target shot that misses is worth at
+/// most ~40% of a goal.
+const REWARD_NON_CONVERSION_MAX_FRACTION: f32 = 0.40;
 const REW_GOAL_MIN: f32 = 6.0;
 const REW_GOAL_MAX: f32 = 20.0;
 const LINGER_RADIUS: f32 = 4.0; // "same radius": teammates within this many yards
