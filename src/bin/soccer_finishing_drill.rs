@@ -151,6 +151,22 @@ fn setup_scenario(sim: &mut SoccerMatch, rng: &mut Rng, num_defenders: usize) ->
 }
 
 fn main() {
+    // FINISHING COUPLING (the fix that makes this drill actually train finishing).
+    // Under the engine's default serving, a clear chance yields a single dominant analytic
+    // SHOT candidate, so value/actor learning cannot change conversion (verified: byte-identical
+    // rates across lambda/actor settings). Two engine levers, set here as overridable defaults,
+    // route shot EXECUTION through the learner:
+    //   * DD_SOCCER_ENABLE_DISCRETIZED_KICK expands a shot into several power/placement bucket
+    //     candidates the value net can choose among (learned placement).
+    //   * DD_SOCCER_NEURAL_AUTHORITATIVE_LAMBDA makes the trained value head OWN that choice
+    //     (the coarse tabular Q becomes a tie-break floor), so as the critic learns which
+    //     buckets score, the served shot improves. This is still soft-reward-driven learning —
+    //     the reward trains the value; the value only serves.
+    // Both are `OnceLock`-cached in the engine, so they must be set before the first step.
+    set_env_default("DD_SOCCER_ENABLE_DISCRETIZED_KICK", "1");
+    set_env_default("SOCCER_NEURAL_MCTS_MIN_DISCRETIZED_KICK_CANDIDATES", "3");
+    set_env_default("DD_SOCCER_NEURAL_AUTHORITATIVE_LAMBDA", "30");
+
     // Deterministic formation LP so a given seed is reproducible.
     enable_deterministic_formation_lp();
 
