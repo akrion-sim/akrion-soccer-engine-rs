@@ -711,7 +711,8 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
                     if d > 0.5 {
                         let closing = (w.a[i].vel.x * to_ip.x + w.a[i].vel.y * to_ip.y) / d;
                         let def_bonus = if i <= 2 { 1.3 } else { 1.0 };
-                        sp_t[i] += rw().pursuit * belief * def_bonus * (closing / 8.5).clamp(0.0, 1.0);
+                        sp_t[i] +=
+                            rw().pursuit * belief * def_bonus * (closing / 8.5).clamp(0.0, 1.0);
                     }
                 }
             }

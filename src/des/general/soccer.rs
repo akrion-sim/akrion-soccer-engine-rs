@@ -24972,6 +24972,105 @@ pub(crate) fn quick_forward_release_reward_scale() -> f64 {
     })
 }
 
+/// Weight w1 for the HOLD-TOO-LONG-UNDER-PRESSURE penalty on the ball carrier:
+/// `−w1 · time_on_ball_seconds · perceived_pressure` per tick. The longer the carrier
+/// holds AND the more it is pressed, the larger the charge — pushing a quicker release
+/// or a move onto the ball. Env `DD_SOCCER_HOLD_UNDER_PRESSURE_PENALTY_SCALE`, clamped
+/// [0, 2], default **0.0** ⇒ byte-identical no-op unless enabled.
+pub(crate) fn hold_under_pressure_penalty_scale() -> f64 {
+    if dynamic_reward_weights_enabled() {
+        return reward_weight_env(
+            "DD_SOCCER_HOLD_UNDER_PRESSURE_PENALTY_SCALE",
+            0.0,
+            MIN_SOCCER_REWARD_WEIGHT,
+            2.0,
+        );
+    }
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        reward_weight_env(
+            "DD_SOCCER_HOLD_UNDER_PRESSURE_PENALTY_SCALE",
+            0.0,
+            MIN_SOCCER_REWARD_WEIGHT,
+            2.0,
+        )
+    })
+}
+
+/// Weight w2 for the DRIBBLE-TOO-SLOW penalty: while a carrier is dribbling,
+/// `−w2 · max(0, jog_speed − forward_speed)` (jog = [`STATIONARY_HOLD_FORWARD_JOG_YPS`]).
+/// Zero at/above a jog; grows as the carrier drops to a walk/standstill. Balances the
+/// energy cost of moving (which rises with speed) so the learned optimum is to dribble
+/// AT a jog rather than stand, walk, or needlessly sprint. Env
+/// `DD_SOCCER_DRIBBLE_MIN_GAIT_PENALTY_SCALE`, clamped [0, 2], default **0.0** ⇒ off.
+pub(crate) fn dribble_min_gait_penalty_scale() -> f64 {
+    if dynamic_reward_weights_enabled() {
+        return reward_weight_env(
+            "DD_SOCCER_DRIBBLE_MIN_GAIT_PENALTY_SCALE",
+            0.0,
+            MIN_SOCCER_REWARD_WEIGHT,
+            2.0,
+        );
+    }
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        reward_weight_env(
+            "DD_SOCCER_DRIBBLE_MIN_GAIT_PENALTY_SCALE",
+            0.0,
+            MIN_SOCCER_REWARD_WEIGHT,
+            2.0,
+        )
+    })
+}
+
+/// Weight w3 that makes the turnover penalty a continuous function of WHERE the ball is
+/// lost (the field vector): the penalty is multiplied by `1 + w3 · opponent_expected_threat(loss)`
+/// (capped at [`TURNOVER_POSITION_MAX_MULT`]). A giveaway in your own third — where the
+/// opponent's threat from that spot is high — is punished hard; an ambitious loss in the
+/// attacking third stays cheap. This is the field-vector fix for the flat-penalty
+/// risk-aversion trap. Env `DD_SOCCER_TURNOVER_POSITION_WEIGHT_SCALE`, clamped [0, 8],
+/// default **0.0** ⇒ byte-identical (multiplier = 1.0, current flat behavior).
+pub(crate) fn turnover_position_weight_scale() -> f64 {
+    if dynamic_reward_weights_enabled() {
+        return reward_weight_env(
+            "DD_SOCCER_TURNOVER_POSITION_WEIGHT_SCALE",
+            0.0,
+            MIN_SOCCER_REWARD_WEIGHT,
+            8.0,
+        );
+    }
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        reward_weight_env(
+            "DD_SOCCER_TURNOVER_POSITION_WEIGHT_SCALE",
+            0.0,
+            MIN_SOCCER_REWARD_WEIGHT,
+            8.0,
+        )
+    })
+}
+
+/// Position multiplier for a turnover at `loss_pos` by `losing_team`, weighting the base
+/// turnover penalty by the opponent's expected threat from that location (via the pitch-value
+/// field function `threat_at`). Returns 1.0 when the weight knob is off (byte-identical), and
+/// only ever amplifies (>= 1.0), capped at [`TURNOVER_POSITION_MAX_MULT`].
+fn turnover_position_multiplier(
+    losing_team: Team,
+    loss_pos: Vec2,
+    field_width: f64,
+    field_length: f64,
+) -> f64 {
+    let w3 = turnover_position_weight_scale();
+    if w3 <= MIN_SOCCER_REWARD_WEIGHT {
+        return 1.0;
+    }
+    let opponent_threat = threat_at(losing_team.other(), loss_pos, field_width, field_length).max(0.0);
+    (1.0 + w3 * opponent_threat).clamp(1.0, TURNOVER_POSITION_MAX_MULT)
+}
+
 /// Codex r19 carrot: bounded, opportunity-conditioned reward for a completed forward pass that was
 /// released quickly INTO a real forward opportunity. Only fires on the completed-pass path (so
 /// loose-ball / interception / immediate-opponent-control implicitly pay zero), and returns 0 unless
