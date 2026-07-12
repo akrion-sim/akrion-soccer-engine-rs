@@ -113,18 +113,16 @@ fn wenv(name: &str, default: f32, lo: f32, hi: f32) -> f32 {
 }
 
 fn grounded_conversion_ladder(goal: f32, shot_base: f32, shot_q: f32) -> (f32, f32, f32) {
-    let mut goal = goal.clamp(REW_GOAL_MIN, REW_GOAL_MAX);
+    // The goal stays the reference (clamped to its own range); shot shaping is scaled DOWN to fit a
+    // proportional fraction below it, never the reverse — so tuning big shot rewards can't quietly
+    // inflate what "scoring" is worth.
+    let goal = goal.clamp(REW_GOAL_MIN, REW_GOAL_MAX);
     let mut shot_base = shot_base.max(MIN_REWARD_WEIGHT);
     let mut shot_q = shot_q.max(MIN_REWARD_WEIGHT);
-    let required_goal = shot_base + shot_q + REWARD_CONVERSION_MARGIN;
-
-    if goal < required_goal {
-        goal = required_goal.min(REW_GOAL_MAX);
-    }
-    if goal < shot_base + shot_q + REWARD_CONVERSION_MARGIN {
-        let budget = (goal - REWARD_CONVERSION_MARGIN).max(MIN_REWARD_WEIGHT);
-        let total = (shot_base + shot_q).max(MIN_REWARD_WEIGHT);
-        let scale = (budget / total).clamp(0.0, 1.0);
+    let max_non_conversion = (goal * REWARD_NON_CONVERSION_MAX_FRACTION).max(MIN_REWARD_WEIGHT);
+    let total = shot_base + shot_q;
+    if total > max_non_conversion {
+        let scale = (max_non_conversion / total).clamp(0.0, 1.0);
         shot_base = (shot_base * scale).max(MIN_REWARD_WEIGHT);
         shot_q = (shot_q * scale).max(MIN_REWARD_WEIGHT);
     }
