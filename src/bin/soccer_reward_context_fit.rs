@@ -173,6 +173,18 @@ struct RewardContextArtifact {
     neural_state_value_head: NeuralStateValueHead,
     #[serde(default)]
     state_value_reliability: f64,
+    #[serde(default)]
+    counterfactual_rollouts: bool,
+    #[serde(default)]
+    rollout_seconds: f64,
+    #[serde(default)]
+    rollout_replicas: usize,
+    #[serde(default)]
+    rollout_target_count: usize,
+    #[serde(default)]
+    rollout_nonzero_target_count: usize,
+    #[serde(default)]
+    rollout_mean_absolute_target: f64,
     by_kind: HashMap<String, RewardContextHead>,
 }
 
@@ -365,6 +377,43 @@ fn parse_hex(raw: Option<&String>, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
+fn env_flag(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|raw| {
+            matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(default)
+}
+
+fn counterfactual_goal_value(
+    sim: &SoccerMatch,
+    team: soccer_engine::des::general::soccer::Team,
+    horizon_ticks: usize,
+    replicas: usize,
+    seed: u64,
+) -> f64 {
+    let mut value = 0.0;
+    for replica in 0..replicas.max(1) {
+        let mut rollout = sim.fork_for_rollout(seed.wrapping_add(replica as u64));
+        let before = rollout.summary();
+        for _ in 0..horizon_ticks {
+            rollout.run_time_step();
+        }
+        let after = rollout.summary();
+        let home_delta = (after.score_home as i32 - before.score_home as i32)
+            - (after.score_away as i32 - before.score_away as i32);
+        value += match team {
+            soccer_engine::des::general::soccer::Team::Home => home_delta as f64,
+            soccer_engine::des::general::soccer::Team::Away => -home_delta as f64,
+        };
+    }
+    (value / replicas.max(1) as f64).clamp(-1.0, 1.0)
+}
+
 fn main() {
     enable_deterministic_formation_lp();
     let args: Vec<String> = std::env::args().collect();
@@ -394,8 +443,27 @@ fn main() {
         .and_then(|value| value.parse().ok())
         .filter(|value: &f64| value.is_finite() && *value > 0.0)
         .unwrap_or(0.02);
+    let counterfactual_rollouts = env_flag("SOCCER_REWARD_CONTEXT_COUNTERFACTUAL_ROLLOUTS", false);
+    let rollout_seconds = std::env::var("SOCCER_REWARD_CONTEXT_ROLLOUT_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(60.0);
+    let rollout_replicas = std::env::var("SOCCER_REWARD_CONTEXT_ROLLOUT_REPLICAS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(2)
+        .clamp(1, 16);
+    let rollout_states_per_team = std::env::var("SOCCER_REWARD_CONTEXT_ROLLOUT_STATES_PER_TEAM")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(2)
+        .clamp(1, 32);
 
     let mut moments = Vec::new();
+    let mut rollout_target_count = 0usize;
+    let mut rollout_nonzero_target_count = 0usize;
+    let mut rollout_absolute_target_sum = 0.0;
     for game in 0..games {
         let mut config = MatchConfig {
             duration_seconds: minutes * 60.0,
@@ -408,8 +476,51 @@ fn main() {
         config.retrieval.outcome_horizon = 45;
         let mut sim = SoccerMatch::default_11v11(config);
         sim.set_uniform_elite_players();
+        let ticks_per_second =
+            sim.config.total_ticks() as f64 / sim.config.duration_seconds.max(1.0);
+        let rollout_horizon_ticks = (rollout_seconds * ticks_per_second).round().max(1.0) as usize;
+        let mut rollout_targets = HashMap::<(u64, bool), f64>::new();
+        let mut rollout_counts = HashMap::<bool, usize>::new();
+        let mut seen_samples = 0usize;
         for _ in 0..sim.config.total_ticks() {
             sim.run_time_step();
+            if counterfactual_rollouts && sim.reward_context_samples().len() > seen_samples {
+                let new_states = sim.reward_context_samples()[seen_samples..]
+                    .iter()
+                    .map(|sample| {
+                        (
+                            sample.tick,
+                            sample.team,
+                            matches!(sample.team, soccer_engine::des::general::soccer::Team::Home),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                seen_samples = sim.reward_context_samples().len();
+                for (tick, team, home) in new_states {
+                    if rollout_targets.contains_key(&(tick, home))
+                        || rollout_counts.get(&home).copied().unwrap_or(0)
+                            >= rollout_states_per_team
+                    {
+                        continue;
+                    }
+                    let rollout_seed = (seed_base as u64) << 32
+                        ^ (game as u64) << 16
+                        ^ tick
+                        ^ if home { 0x484f_4d45 } else { 0x4157_4159 };
+                    let target = counterfactual_goal_value(
+                        &sim,
+                        team,
+                        rollout_horizon_ticks,
+                        rollout_replicas,
+                        rollout_seed,
+                    );
+                    rollout_targets.insert((tick, home), target);
+                    rollout_target_count += 1;
+                    rollout_nonzero_target_count += usize::from(target.abs() > 1e-12);
+                    rollout_absolute_target_sum += target.abs();
+                    *rollout_counts.entry(home).or_default() += 1;
+                }
+            }
         }
         let summary = sim.summary();
         let home_margin = summary.score_home as i32 - summary.score_away as i32;
@@ -449,21 +560,27 @@ fn main() {
             };
             let result = margin.signum() as f64;
             let margin_bonus = (margin as f64 / 3.0).clamp(-1.0, 1.0) * 0.20;
+            let rollout_target = rollout_targets.get(&(sample.tick, home)).copied();
             Some(LabeledMoment {
                 game_index: game,
                 sample,
-                outcome: (result + margin_bonus).clamp(-1.0, 1.0),
+                outcome: rollout_target.unwrap_or_else(|| (result + margin_bonus).clamp(-1.0, 1.0)),
                 value_delta: None,
                 sample_weight: 1.0 / occurrence_count as f64,
-                value_weight: 1.0 / team_event_count as f64,
+                value_weight: if counterfactual_rollouts {
+                    f64::from(rollout_target.is_some())
+                } else {
+                    1.0 / team_event_count as f64
+                },
             })
         }));
         eprintln!(
-            "context_fit game {}/{} moments_added={} total={}",
+            "context_fit game {}/{} moments_added={} total={} rollout_targets={}",
             game + 1,
             games,
             moments.len() - before,
-            moments.len()
+            moments.len(),
+            rollout_targets.len(),
         );
     }
 
@@ -598,15 +715,36 @@ fn main() {
         state_value_head,
         neural_state_value_head,
         state_value_reliability,
+        counterfactual_rollouts,
+        rollout_seconds: if counterfactual_rollouts {
+            rollout_seconds
+        } else {
+            0.0
+        },
+        rollout_replicas: if counterfactual_rollouts {
+            rollout_replicas
+        } else {
+            0
+        },
+        rollout_target_count,
+        rollout_nonzero_target_count,
+        rollout_mean_absolute_target: if rollout_target_count > 0 {
+            rollout_absolute_target_sum / rollout_target_count as f64
+        } else {
+            0.0
+        },
         by_kind,
     };
     let json = serde_json::to_string_pretty(&artifact).expect("serialize context artifact");
     std::fs::write(out, format!("{json}\n")).expect("write context artifact");
     println!(
-        "wrote {out} moments={} heads={} baseline=1 clamp=[{},{}]",
+        "wrote {out} moments={} heads={} baseline=1 clamp=[{},{}] rollout_targets={} nonzero={} mean_abs={:.6}",
         moments.len(),
         artifact.by_kind.len(),
         MIN_UTILITY_SCALE,
-        MAX_UTILITY_SCALE
+        MAX_UTILITY_SCALE,
+        artifact.rollout_target_count,
+        artifact.rollout_nonzero_target_count,
+        artifact.rollout_mean_absolute_target,
     );
 }
