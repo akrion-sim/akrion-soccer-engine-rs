@@ -28920,6 +28920,19 @@ pub(crate) fn loose_ball_contest_pressure_enabled() -> bool {
     }
 }
 
+/// Amplifier for the LOOSE-BALL PURSUIT signal — scales BOTH the uncontested-time penalty
+/// (the cost of letting an unpossessed ball sit loose) and the win reward, so players commit
+/// to going for a loose ball their POMDP says they can win, and none is left loose too long.
+/// Env `DD_SOCCER_LOOSE_BALL_PURSUIT_SCALE`, clamped [1, 20], default 1.0 (byte-identical).
+pub(crate) fn loose_ball_pursuit_scale() -> f64 {
+    if dynamic_reward_weights_enabled() {
+        return reward_weight_env("DD_SOCCER_LOOSE_BALL_PURSUIT_SCALE", 1.0, 1.0, 20.0);
+    }
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| reward_weight_env("DD_SOCCER_LOOSE_BALL_PURSUIT_SCALE", 1.0, 1.0, 20.0))
+}
+
 /// Both-teams loose-ball **contest pressure**: a symmetric, time-escalating penalty
 /// charged to every outfield player on BOTH teams for each tick an unpossessed ball
 /// is left uncontested beyond the grace (so standing off a loose ball is never free
