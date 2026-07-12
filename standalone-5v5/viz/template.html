@@ -191,6 +191,7 @@
     <div class="controls" style="margin-top:14px">
       <button class="ctl" id="play">Pause</button>
       <button class="ctl ghost" id="restart">Restart</button>
+      <button class="ctl ghost" id="newgame" title="Play a fresh game with the trained model (needs the live server)">New Game ▸</button>
       <span class="clock" id="clock">00.0s</span>
       <select class="ctl ghost" id="speed" aria-label="playback speed" style="padding:8px 10px">
         <option value="0.25">0.25×</option>
@@ -267,7 +268,7 @@
 
 <script>
 const BEFORE = /*__BEFORE__*/ null;
-const AFTER  = /*__AFTER__*/ null;
+let   AFTER  = /*__AFTER__*/ null; // mutable: the "New Game" button swaps in a fresh trained match
 const CURVE  = /*__CURVE__*/ null;
 const META   = /*__META__*/ null;
 
@@ -481,7 +482,7 @@ function strokeRoundRect(ctx,x,y,w,h,r){roundRect(ctx,x,y,w,h,r);ctx.stroke();}
 
 const P0=makePitch('cv0',BEFORE);
 const P1=makePitch('cv1',AFTER);
-const NF=Math.min(BEFORE.frames.length,AFTER.frames.length);
+let NF=Math.min(BEFORE.frames.length,AFTER.frames.length);
 
 // ---------- playback ----------
 let fi=0, playing=!reduce, last=0;
@@ -514,6 +515,26 @@ playBtn.onclick=()=>{
   playing=!playing; playBtn.textContent=playing?'Pause':'Play'; last=0;
 };
 document.getElementById('restart').onclick=()=>{fi=0;playing=true;playBtn.textContent='Pause';last=0;render();};
+// LIVE "New Game": ask the server to record a fresh match with the trained model
+// (a new random seed), swap it into the AFTER panel, and play it. Needs the live
+// server (viz/serve_live.py); on the static server the fetch fails and we say so.
+const newGameBtn=document.getElementById('newgame');
+if(newGameBtn){newGameBtn.onclick=async()=>{
+  const old=newGameBtn.textContent; newGameBtn.disabled=true; newGameBtn.textContent='…generating';
+  try{
+    const seed=Math.floor(Math.random()*1e9);
+    const r=await fetch('/newgame?seed='+seed);
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const m=await r.json();
+    if(!m || !m.frames || !m.frames.length) throw new Error('empty match');
+    AFTER=m; NF=Math.min(BEFORE.frames.length,AFTER.frames.length); scrub.max=NF-1;
+    fi=0; playing=true; playBtn.textContent='Pause'; last=0; render();
+    newGameBtn.textContent=old;
+  }catch(e){
+    newGameBtn.textContent='needs live server';
+    setTimeout(()=>{newGameBtn.textContent=old;},1800);
+  }finally{ newGameBtn.disabled=false; }
+};}
 scrub.oninput=()=>{fi=+scrub.value;playing=false;playBtn.textContent='Play';render();};
 playBtn.textContent=playing?'Pause':'Play';
 window.addEventListener('resize',()=>{P0.resize();P1.resize();render();});
