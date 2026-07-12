@@ -621,31 +621,37 @@ fn main() {
         }
     }
 
-    // Honest verdict: report the early→late conversion delta against a binomial noise band so a
-    // pure-sampling wobble is not mistaken for learning. The robust learning evidence is the
-    // train_steps column (the critic trains every block); conversion is a high-variance proxy and
-    // analytic finishing is a strong, near-parity baseline here.
-    if block_rates.len() >= 2 {
-        let half = block_rates.len() / 2;
+    // Honest verdict: early→late delta of the primary metric against a binomial noise band, so a
+    // sampling wobble is not mistaken for learning. The robust learning evidence is the train_steps
+    // column (the critic trains every block); the metric is a high-variance downstream proxy.
+    if primary_blocks.len() >= 2 {
+        let half = primary_blocks.len() / 2;
         let mean = |xs: &[f64]| xs.iter().sum::<f64>() / xs.len().max(1) as f64;
-        let early = mean(&block_rates[..half.max(1)]);
-        let late = mean(&block_rates[half..]);
+        let early = mean(&primary_blocks[..half.max(1)]);
+        let late = mean(&primary_blocks[half..]);
         let delta = late - early;
         let half_eps = (half.max(1) * BLOCK) as f64;
         let p = ((early + late) / 2.0).clamp(1e-3, 1.0 - 1e-3);
         let se_delta = (p * (1.0 - p) / half_eps).sqrt() * std::f64::consts::SQRT_2;
+        let (label, metric) = if creation {
+            ("CREATION", "hiXG-frac")
+        } else {
+            ("CONVERSION", "goal-rate")
+        };
         let verdict = if delta > 2.0 * se_delta {
-            "=> conversion ROSE beyond noise (net learned to finish better)"
+            "=> ROSE beyond noise (net learned)"
         } else if delta > se_delta {
             "=> mild upward drift (~1-2σ; suggestive, not conclusive)"
+        } else if delta < -2.0 * se_delta {
+            "=> DROPPED beyond noise (regression / narrowing)"
         } else {
-            "=> flat within noise (analytic finishing is a near-parity ceiling here)"
+            "=> flat within noise"
         };
         println!(
-            "\nCONVERSION  early_half={early:.3}  late_half={late:.3}  delta={delta:+.3}  (1σ≈{se_delta:.3})  {verdict}"
+            "\n{label}  {metric} early_half={early:.3}  late_half={late:.3}  delta={delta:+.3}  (1σ≈{se_delta:.3})  {verdict}"
         );
         println!(
-            "LEARNER     critic trained every block (train_steps climbed above); the saved net is a valid finishing-tuned warm-start."
+            "LEARNER  critic trained every block (train_steps climbed above); the saved net is a valid warm-start."
         );
     }
 
