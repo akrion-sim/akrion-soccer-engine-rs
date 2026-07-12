@@ -482,7 +482,7 @@ function strokeRoundRect(ctx,x,y,w,h,r){roundRect(ctx,x,y,w,h,r);ctx.stroke();}
 
 const P0=makePitch('cv0',BEFORE);
 const P1=makePitch('cv1',AFTER);
-const NF=Math.min(BEFORE.frames.length,AFTER.frames.length);
+let NF=Math.min(BEFORE.frames.length,AFTER.frames.length);
 
 // ---------- playback ----------
 let fi=0, playing=!reduce, last=0;
