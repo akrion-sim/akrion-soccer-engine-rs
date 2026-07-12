@@ -329,10 +329,24 @@ fn main() {
     let snap = sim
         .neural_network_snapshot_for(Team::Home)
         .expect("home learner network snapshot");
-    let home_targets_out = sim
-        .team_policies()
-        .map(|p| p.home.target_entries())
-        .unwrap_or_default();
+    // Bound the target-Q we carry. Each entry embeds an ~8.5KB binned state key, and full-game
+    // learning accumulates tens of thousands of them — so an unpruned dump is ~100MB. The neural
+    // net is the real transferable learner (canonical league frontiers carry 0 target entries);
+    // keep only the most-visited targets so the frontier stays a few MB. DRILL_MAX_TARGETS=0 → none.
+    let max_targets: usize = std::env::var("DRILL_MAX_TARGETS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1000);
+    let home_targets_out = if max_targets == 0 {
+        Vec::new()
+    } else {
+        if let Some(policies) = sim.team_policies_mut() {
+            policies.home.prune(0, max_targets, 0);
+        }
+        sim.team_policies()
+            .map(|p| p.home.target_entries())
+            .unwrap_or_default()
+    };
     let brain = TeamBrain::from_snapshot_with_targets(snap.clone(), home_targets_out, Vec::new());
 
     if let Some(parent) = Path::new(&out_path)
