@@ -574,13 +574,21 @@ def main():
         "meta": {
             "title": "How a 5-a-side policy learns to solve a POMDP",
             "generated_for": "localhost:6012",
-            "note": "DP is a real Bellman sweep; the 100-gen search is a real evolution "
-                    "strategy over the 32-weight reward vector; the ladder is real data.",
+            "note": "The value-iteration is a real Bellman sweep; the 100-generation search "
+                    "is a real evolution strategy over the exact 32-weight reward vector from "
+                    "viz/tune.py; the self-play ladder is real out/selfplay_ladder.csv.",
+            "honesty": "This standalone has NO tabular DP — it learns V(s) with a neural critic "
+                       "trained by TD/GAE, which is approximate (sampled) dynamic programming. "
+                       "The value-iteration panel is the textbook 'optimal' the critic chases.",
         },
         "arch": ARCH,
         "actions": ACTIONS,
         "obs_groups": OBS_GROUPS,
         "obs_dim": 71,
+        "critic_groups": CRITIC_GROUPS,
+        "critic_dim": 48,
+        "reward_terms": REWARD_TERMS,
+        "hyper": HYPERPARAMS,
         "learning": learning_curve(),
         "dp": dp,
         "nn_value": nn_value_frames(dp),
