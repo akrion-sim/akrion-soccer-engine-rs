@@ -1177,6 +1177,12 @@ const GOAL_CONTEXT_CREDIT_SCAN_ACTIONS: usize = 48;
 const GOAL_CONTEXT_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(60.0);
 const GOAL_CONTEXT_CREDIT_MIN_SCORE: f64 = 0.05;
 const SHOT_ON_TARGET_REWARD_POINTS: f64 = 80.0;
+/// A non-conversion outcome (an on-target shot that MISSES, chain / shot-on-frame credit, ...) is
+/// capped at this FRACTION of the conversion (goal) reward, so scoring dominates a missed chance by a
+/// meaningful, magnitude-scaling margin instead of a token fixed few points — the ordering stays
+/// meaningful whether a goal is worth 100 or 1600. Tunable in (0.05, 0.95) via
+/// `DD_SOCCER_REWARD_NON_CONVERSION_MAX_FRACTION`; weights stay learnable *within* this grounded ordering.
+const DEFAULT_REWARD_NON_CONVERSION_MAX_FRACTION: f64 = 0.40;
 /// Direct keeper credit for stopping a shot, scaled upward for close-range danger.
 /// This trains the goalkeeper's preceding positioning/claim decision instead of only
 /// rewarding the shooter and penalising the keeper later when a goal is conceded.
@@ -24334,6 +24340,26 @@ fn optional_reward_weight_env(name: &str, default: f64, max: f64) -> f64 {
         .unwrap_or(default)
 }
 
+fn grounded_non_conversion_reward_scale(
+    raw_scale: f64,
+    non_conversion_points: f64,
+    conversion_points: f64,
+) -> f64 {
+    if !raw_scale.is_finite() || raw_scale <= 0.0 {
+        return 0.0;
+    }
+    if !non_conversion_points.is_finite()
+        || !conversion_points.is_finite()
+        || non_conversion_points <= 0.0
+    {
+        return 0.0;
+    }
+    let max_non_conversion_points =
+        (conversion_points - REWARD_CONVERSION_DOMINANCE_MARGIN_POINTS).max(0.0);
+    let max_scale = (max_non_conversion_points / non_conversion_points).max(0.0);
+    raw_scale.min(max_scale)
+}
+
 pub(crate) fn forward_pass_reward_scale() -> f64 {
     if dynamic_reward_weights_enabled() {
         return reward_weight_env("DD_SOCCER_FORWARD_PASS_REWARD_SCALE", 1.0, 0.0, 20.0);
@@ -24381,14 +24407,17 @@ pub(crate) fn forward_pass_turnover_penalty_scale() -> f64 {
 /// Companion dampener for the shot-TAKEN shaping proxy (on-/off-target reward, NOT the goal or
 /// terminal-outcome reward, which stay intact — the net must still finish). Lets a forward-pass-
 /// primacy A/B stop the net shooting early instead of building up. Env
-/// `DD_SOCCER_SHOT_SHAPING_REWARD_SCALE` (clamped [1e-4,4.0]), default 1.0 ⇒ unchanged.
+/// `DD_SOCCER_SHOT_SHAPING_REWARD_SCALE` (input clamped [1e-4,4.0]), default 1.0 ⇒
+/// unchanged; the effective scale is then grounded below goal-chain conversion.
 pub(crate) fn shot_shaping_reward_scale() -> f64 {
-    if dynamic_reward_weights_enabled() {
-        return reward_weight_env("DD_SOCCER_SHOT_SHAPING_REWARD_SCALE", 1.0, 1e-4, 4.0);
-    }
-    use std::sync::OnceLock;
-    static V: OnceLock<f64> = OnceLock::new();
-    *V.get_or_init(|| reward_weight_env("DD_SOCCER_SHOT_SHAPING_REWARD_SCALE", 1.0, 1e-4, 4.0))
+    let raw = if dynamic_reward_weights_enabled() {
+        reward_weight_env("DD_SOCCER_SHOT_SHAPING_REWARD_SCALE", 1.0, 1e-4, 4.0)
+    } else {
+        use std::sync::OnceLock;
+        static V: OnceLock<f64> = OnceLock::new();
+        *V.get_or_init(|| reward_weight_env("DD_SOCCER_SHOT_SHAPING_REWARD_SCALE", 1.0, 1e-4, 4.0))
+    };
+    grounded_non_conversion_reward_scale(raw, SHOT_ON_TARGET_REWARD_POINTS, GOAL_REWARD_POINTS)
 }
 
 /// Weight for the FINISHING ANCHOR: a high, hardcoded reward for putting a shot ON GOAL
@@ -24397,14 +24426,20 @@ pub(crate) fn shot_shaping_reward_scale() -> f64 {
 /// Bonus = w * SHOT_ON_TARGET_REWARD_POINTS(80) * shot_on_frame_probability, on a shot action.
 /// (The engine's 80-pt "shot on target" was telemetry-only/inert; the live on-frame signal was
 /// ~1-3 pts vs a ~800 goal — no anchor.) Env `DD_SOCCER_ON_FRAME_SHOT_REWARD_SCALE`, clamped
-/// [0, 8], default **0.0** => byte-identical off.
+/// [0, 8], default **0.0** => byte-identical off. The effective scale is grounded so the
+/// maximum non-converting on-frame bonus remains at least 5 points below the live goal reward.
 pub(crate) fn on_frame_shot_reward_scale() -> f64 {
-    if dynamic_reward_weights_enabled() {
-        return optional_reward_weight_env("DD_SOCCER_ON_FRAME_SHOT_REWARD_SCALE", 0.0, 8.0);
-    }
-    use std::sync::OnceLock;
-    static V: OnceLock<f64> = OnceLock::new();
-    *V.get_or_init(|| optional_reward_weight_env("DD_SOCCER_ON_FRAME_SHOT_REWARD_SCALE", 0.0, 8.0))
+    let raw = if dynamic_reward_weights_enabled() {
+        optional_reward_weight_env("DD_SOCCER_ON_FRAME_SHOT_REWARD_SCALE", 0.0, 8.0)
+    } else {
+        use std::sync::OnceLock;
+        static V: OnceLock<f64> = OnceLock::new();
+        *V.get_or_init(|| {
+            optional_reward_weight_env("DD_SOCCER_ON_FRAME_SHOT_REWARD_SCALE", 0.0, 8.0)
+        })
+    };
+    let conversion_points = tunables().reward.goal_scored_points * goal_reward_scale();
+    grounded_non_conversion_reward_scale(raw, SHOT_ON_TARGET_REWARD_POINTS, conversion_points)
 }
 
 pub(crate) fn shot_commitment_reward_scale() -> f64 {
@@ -43158,6 +43193,34 @@ mod soccer_policy_actor_capacity_tests {
 
         std::env::set_var(KEY, "99");
         assert_eq!(optional_reward_weight_env(KEY, 0.0, 2.0), 2.0);
+    }
+
+    #[test]
+    fn non_conversion_reward_scales_stay_below_conversion_reward() {
+        let terminal_shot_scale =
+            grounded_non_conversion_reward_scale(8.0, SHOT_ON_TARGET_REWARD_POINTS, 100.0);
+        assert!(
+            terminal_shot_scale * SHOT_ON_TARGET_REWARD_POINTS
+                + REWARD_CONVERSION_DOMINANCE_MARGIN_POINTS
+                <= 100.0 + 1e-9
+        );
+        assert!((terminal_shot_scale - 1.1875).abs() < 1e-9);
+
+        let chain_shot_scale = grounded_non_conversion_reward_scale(
+            8.0,
+            SHOT_ON_TARGET_REWARD_POINTS,
+            GOAL_REWARD_POINTS,
+        );
+        assert!(
+            chain_shot_scale * SHOT_ON_TARGET_REWARD_POINTS
+                + REWARD_CONVERSION_DOMINANCE_MARGIN_POINTS
+                <= GOAL_REWARD_POINTS + 1e-9
+        );
+        assert!((chain_shot_scale - 1.9375).abs() < 1e-9);
+        assert_eq!(
+            grounded_non_conversion_reward_scale(0.0, SHOT_ON_TARGET_REWARD_POINTS, 100.0),
+            0.0
+        );
     }
 
     #[test]

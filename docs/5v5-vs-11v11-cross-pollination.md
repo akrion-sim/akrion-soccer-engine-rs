@@ -33,7 +33,8 @@ So the learning architecture SHOULD converge: **hermetic PPO/actor-critic + fiel
    moving into a configuration where a real shot becomes available — drives synchronized attacking runs.
 5. **Learnable rewards with non-zero clamps** (done: `SOCCER_DYNAMIC_REWARD_WEIGHTS` extended to
    goal/dense/shoot/dribble; `1e-4` floors so no channel dies), searched on **gated goal-diff**, not the
-   farmable forward-pass KPI.
+   farmable forward-pass KPI. Reward ladders stay grounded: a non-converting shot candidate must
+   remain below the relevant conversion reward by at least 5 points.
 6. **New learnable mechanics** proven at 5v5: 7 speed gears (incl. the GK as a field-vector gear),
    scooped/aerial passes over a blocked lane (receiver must be more open).
 
