@@ -654,6 +654,25 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
             if !is_carrier && spd_t[i] == SPD_STAND {
                 sp_t[i] -= rw().stand_pen;
             }
+            // LOOSE-BALL PURSUIT (POMDP): when the ball is FREE, the FAVORITE — high
+            // belief it wins the race to the ball's decelerating trajectory — is
+            // rewarded for actually closing on its intercept point. Belief-gated so
+            // only the favorite commits and teammates hold shape (no crashing the
+            // ball / bunching). Defenders (idx 1,2) press a bit harder so they track
+            // back and contest a loose ball instead of ball-watching.
+            if w.owner.is_none() {
+                let belief = w.loose_ball_belief(Team::A, i);
+                if belief > 0.05 {
+                    let ip = w.intercept_point(w.a[i].pos);
+                    let to_ip = ip.sub(w.a[i].pos);
+                    let d = to_ip.len();
+                    if d > 0.5 {
+                        let closing = (w.a[i].vel.x * to_ip.x + w.a[i].vel.y * to_ip.y) / d;
+                        let def_bonus = if i <= 2 { 1.3 } else { 1.0 };
+                        sp_t[i] += rw().pursuit * belief * def_bonus * (closing / 8.5).clamp(0.0, 1.0);
+                    }
+                }
+            }
             if our_phase {
                 // Advance upfield (attack frame +x). No offsides rule, so reward
                 // getting into the ATTACKING HALF and keep rewarding all the way to
