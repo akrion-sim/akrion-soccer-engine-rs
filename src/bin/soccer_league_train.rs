@@ -1835,18 +1835,30 @@ fn main() {
                     checkpoint_validate_min_goal_diff_margin,
                 );
                 let promotes = if self_play_ladder {
-                    // 5v5-style ladder gate: promote iff the challenger beat the CURRENT champion by
-                    // the goal-diff margin over the held-out head-to-head eval (checkpoint_incumbent =
-                    // the current published champion). Republishing the frontier below advances the
-                    // champion, so next round's opponent is this stronger net — the ladder climbs.
-                    let ladder_promotes = gate_goal_diff_margin >= self_play_promote_margin;
-                    println!(
-                        "league_self_play_ladder round={round} gd_vs_champion={:.3} promote_margin={:.3} verdict={}",
-                        gate_goal_diff_margin,
-                        self_play_promote_margin,
-                        if ladder_promotes { "PROMOTED" } else { "held" }
-                    );
-                    ladder_promotes
+                    if !std::path::Path::new(&frontier_path).exists() {
+                        // Bootstrap gen-0: no champion published yet -> promote the current frontier as
+                        // the FIRST champion so co-evolution can start. The 5v5 installs gen-0 = the
+                        // scripted baseline (a beatable floor); analytic is too strong to be that floor
+                        // here (it IS the plateau), so the floor is the starting net itself. Analytic
+                        // stays in the training pool for grounding; the arms race begins next round.
+                        println!(
+                            "league_self_play_ladder round={round} verdict=PROMOTED bootstrap_gen0=true"
+                        );
+                        true
+                    } else {
+                        // Ladder gate: promote iff the challenger beat the CURRENT champion by the
+                        // goal-diff margin over the held-out head-to-head eval. Republishing the
+                        // frontier advances the champion, so next round's opponent is this stronger net
+                        // — the ladder climbs.
+                        let ladder_promotes = gate_goal_diff_margin >= self_play_promote_margin;
+                        println!(
+                            "league_self_play_ladder round={round} gd_vs_champion={:.3} promote_margin={:.3} verdict={}",
+                            gate_goal_diff_margin,
+                            self_play_promote_margin,
+                            if ladder_promotes { "PROMOTED" } else { "held" }
+                        );
+                        ladder_promotes
+                    }
                 } else {
                     passes_forward_pass_climb
                         && ((passes_forward_pass_floor && passes_net_forward_pass_floor)
