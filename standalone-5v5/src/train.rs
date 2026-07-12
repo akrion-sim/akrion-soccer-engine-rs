@@ -136,6 +136,7 @@ fn rw() -> &'static Rw {
         field_goalside_delta: wenv("W_FIELD_GOALSIDE_DELTA", 0.10, MIN_REWARD_WEIGHT, 0.35),
         field_burst_delta: wenv("W_FIELD_BURST_DELTA", 0.08, MIN_REWARD_WEIGHT, 0.35),
         stand_pen: wenv("W_STAND_PEN", 0.02, MIN_REWARD_WEIGHT, 0.20),
+        pursuit: wenv("W_PURSUIT", 0.05, MIN_REWARD_WEIGHT, 0.25),
     })
 }
 // The speed policy is a low-variance REFINEMENT on top of the action policy —
