@@ -27615,7 +27615,7 @@ impl SoccerMatch {
         );
         let scale = self.shot_reward_distance_scale(shooting_team, shooter);
         self.record_recent_defensive_shot_on_target_penalties(shooting_team.other(), scale);
-        let contextual_pool = SHOT_ON_TARGET_REWARD_POINTS * scale;
+        let contextual_pool = bounded_shot_on_target_reward_points() * scale;
         self.record_weighted_possession_chain_reward_at_with_kind(
             self.tick,
             shooting_team,
