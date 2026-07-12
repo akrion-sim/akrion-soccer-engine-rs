@@ -65,6 +65,15 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Set an engine env var only if the operator has not already set it, so the drill ships a
+/// sane default coupling while staying fully overridable. Must run BEFORE the engine reads
+/// these (several are `OnceLock`-cached on first read), i.e. before any `run_time_step`.
+fn set_env_default(name: &str, value: &str) {
+    if std::env::var_os(name).is_none() {
+        std::env::set_var(name, value);
+    }
+}
+
 /// Reset the shooting situation by DIRECT field assignment (all touched fields are `pub`).
 /// Leaves a clean chance: shooter on the ball 4-18yd out, Away keeper on its line, optional
 /// 0-2 defenders goal-side, and every other player relocated deep into Home's half so they
