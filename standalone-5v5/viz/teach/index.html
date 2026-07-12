@@ -1176,7 +1176,7 @@ function buildLadder(){
 function drawLadder(){
   const cv=$('#ladderChart');const L=D.ladder;const xs=L.map(r=>r.gen);
   const {w,h,ctx}=fit(cv,0.36);
-  const padL=40,padR=44,padT=14,padB=26;
+  const padL=40,padR=62,padT=14,padB=26;
   const champMax=Math.max(...L.map(r=>r.champ));
   let lo=Math.min(...L.map(r=>Math.min(r.cc_gd,r.cs_gd)))-0.3;
   let hi=Math.max(...L.map(r=>Math.max(r.cc_gd,r.cs_gd)))+0.3;
