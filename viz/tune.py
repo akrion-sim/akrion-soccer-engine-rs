@@ -159,15 +159,11 @@ def env_bool(name, default=False):
 def norm(vec):
     out = []
     for (_, _, lo, hi, log), value in zip(SPACE, vec):
-<<<<<<< HEAD
+        lo = max(MIN_REWARD_WEIGHT, lo)
+        hi = max(lo, hi)
         value = float(value)
         if not math.isfinite(value):
             value = lo
-=======
-        lo = max(MIN_REWARD_WEIGHT, lo)
-        hi = max(lo, hi)
-        value = value if math.isfinite(value) else lo
->>>>>>> dynamic-rewards-wip
         value = min(hi, max(lo, value))
         if log:
             value, lo, hi = math.log(value), math.log(lo), math.log(hi)
