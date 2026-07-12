@@ -16,7 +16,11 @@ pub const N: usize = 5; // players per team (index 0 == goalkeeper)
 pub const GK: usize = 0; // goalkeeper index; controlled by a fixed rule, not the policy
 pub const DT: f32 = 0.05; // seconds per decision tick -> 20 Hz sim (real-time 20 fps)
 pub const HZ: f32 = 1.0 / DT; // ticks per second (for real-time viewer playback)
-pub const STEPS: usize = 600; // ticks per game (~30s at 20 Hz)
+pub const STEPS: usize = 600; // ticks per TRAINING episode (~30s at 20 Hz)
+// The RECORDED viz match (match_before/after.json) runs longer than a training
+// episode so the before/after playback shows more football (incl. kickoffs after
+// goals). Training dynamics are unaffected — rollouts still use STEPS.
+pub const RECORD_STEPS: usize = 1800; // ~90s at 20 Hz
 
 const PLAYER_SPEED: f32 = 6.5; // legacy reference speed (~= run_medium); kept for keeper reach/util
 
@@ -39,6 +43,16 @@ pub const SPD_SPRINT: usize = 6;
 // Low end kept non-crippling (a slow gear still lets you get around) so the speed
 // policy's exploration can't paralyze the game; STAND is the only truly-still gear.
 const SPEEDS: [f32; NS] = [0.0, 3.0, 4.5, 5.5, 6.5, 8.5, 11.0];
+// Players can't snap between the 7 gears instantly — actual velocity ramps toward
+// the chosen gear's velocity at a bounded rate. Accelerating (building speed) is
+// slower than decelerating / cutting (shedding speed or changing direction), as
+// with real players. Units yd/s^2. Env-overridable so the tuner can shape them.
+fn player_accel() -> f32 {
+    std::env::var("PLAYER_ACCEL").ok().and_then(|s| s.parse().ok()).filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(6.0)
+}
+fn player_decel() -> f32 {
+    std::env::var("PLAYER_DECEL").ok().and_then(|s| s.parse().ok()).filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(11.0)
+}
 // Ball-carrying is much slower than open-field running (you can't sprint flat-out
 // with the ball at your feet) — and, critically, keeping it near v3's control
 // speed stops the policy from dribbling forever to evade the 2-pass shot gate.
@@ -147,7 +161,8 @@ fn teammate_spacing_score(distance: f32) -> f32 {
 #[derive(Clone, Copy)]
 pub struct Player {
     pub pos: V2,
-    pub vel: V2,
+    pub vel: V2,        // actual velocity — ramps toward des_vel at a bounded rate
+    pub des_vel: V2,    // desired velocity (the chosen gear/direction this tick)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -253,10 +268,12 @@ impl World {
             a: [Player {
                 pos: V2::default(),
                 vel: V2::default(),
+                des_vel: V2::default(),
             }; N],
             b: [Player {
                 pos: V2::default(),
                 vel: V2::default(),
+                des_vel: V2::default(),
             }; N],
             ball: V2::new(FIELD_L / 2.0, FIELD_W / 2.0),
             ball_vel: V2::default(),
@@ -317,9 +334,11 @@ impl World {
         for i in 0..N {
             self.a[i].pos = V2::new(xs[i] * FIELD_L, ys[i] * FIELD_W);
             self.a[i].vel = V2::default();
+            self.a[i].des_vel = V2::default();
             // Mirror for B (attacks -x): x' = L - x.
             self.b[i].pos = V2::new(FIELD_L - xs[i] * FIELD_L, ys[i] * FIELD_W);
             self.b[i].vel = V2::default();
+            self.b[i].des_vel = V2::default();
         }
         self.ball = V2::new(FIELD_L / 2.0, FIELD_W / 2.0);
         self.ball_vel = V2::default();
@@ -460,6 +479,30 @@ impl World {
             }
         }
         bpos // uncatchable — head to where it ends up
+    }
+
+    /// POMDP belief that THIS player wins a LOOSE ball: a race between my time to
+    /// my earliest intercept point (on the ball's decelerating trajectory) and the
+    /// nearest opponent's time to theirs. ~[0,1], and 0 whenever the ball is owned.
+    /// Feeds loose-ball pursuit shaping so the FAVORITE commits to the ball while
+    /// teammates hold shape — real pressing, not everyone crashing the ball.
+    pub fn loose_ball_belief(&self, team: Team, idx: usize) -> f32 {
+        if self.owner.is_some() {
+            return 0.0;
+        }
+        let me = players(team, self)[idx].pos;
+        let my_eta = me.sub(self.intercept_point(me)).len() / PLAYER_SPEED.max(1e-3);
+        let opp = players(team.other(), self);
+        let mut opp_eta = f32::INFINITY;
+        for k in 0..N {
+            let op = opp[k].pos;
+            let eta = op.sub(self.intercept_point(op)).len() / PLAYER_SPEED.max(1e-3);
+            if eta < opp_eta {
+                opp_eta = eta;
+            }
+        }
+        // favorite when I arrive clearly sooner; smooth ~0.6s window around parity.
+        (0.5 + 0.5 * ((opp_eta - my_eta) / 0.6).clamp(-1.0, 1.0)).clamp(0.0, 1.0)
     }
 
     /// Classify a Team-A dribble by the FINAL (post-shielding) direction, so the
@@ -1590,9 +1633,12 @@ impl World {
     }
 
     fn set_vel(&mut self, team: Team, idx: usize, v: V2) {
+        // Sets the DESIRED velocity (the chosen gear/direction). The actual velocity
+        // ramps toward it in integrate() at a bounded accel/decel rate — no instant
+        // jumps between the 7 gears.
         match team {
-            Team::A => self.a[idx].vel = v,
-            Team::B => self.b[idx].vel = v,
+            Team::A => self.a[idx].des_vel = v,
+            Team::B => self.b[idx].des_vel = v,
         }
     }
 
@@ -1658,6 +1704,24 @@ fn deterministic_teammate_axis(i: usize, j: usize) -> V2 {
 }
 
 fn integrate(p: &mut Player) {
+    // Ramp actual velocity toward the desired (gear-target) velocity at a bounded
+    // rate — players build and shed speed, they don't teleport between gears.
+    // Cutting / slowing (desired speed <= current) is allowed faster than accel.
+    let dv = p.des_vel.sub(p.vel);
+    let dvlen = dv.len();
+    if dvlen > 1e-6 {
+        let rate = if p.des_vel.len() >= p.vel.len() {
+            player_accel()
+        } else {
+            player_decel()
+        };
+        let max_step = rate * DT;
+        p.vel = if dvlen <= max_step {
+            p.des_vel
+        } else {
+            p.vel.add(dv.scale(max_step / dvlen))
+        };
+    }
     p.pos = p.pos.add(p.vel.scale(DT));
     clamp_pos(p);
 }

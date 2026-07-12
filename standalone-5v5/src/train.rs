@@ -101,6 +101,7 @@ pub struct Rw {
     pub field_goalside_delta: f32, // reward improving team goalside geometry
     pub field_burst_delta: f32,    // reward improving forward outlet geometry
     pub stand_pen: f32,            // anti-passivity: penalize the STAND gear off-ball
+    pub pursuit: f32,              // LOOSE-BALL: favorite commits to winning a free ball
 }
 fn rw() -> &'static Rw {
     static R: std::sync::OnceLock<Rw> = std::sync::OnceLock::new();
@@ -135,6 +136,7 @@ fn rw() -> &'static Rw {
         field_goalside_delta: wenv("W_FIELD_GOALSIDE_DELTA", 0.10, MIN_REWARD_WEIGHT, 0.35),
         field_burst_delta: wenv("W_FIELD_BURST_DELTA", 0.08, MIN_REWARD_WEIGHT, 0.35),
         stand_pen: wenv("W_STAND_PEN", 0.02, MIN_REWARD_WEIGHT, 0.20),
+        pursuit: wenv("W_PURSUIT", 0.05, MIN_REWARD_WEIGHT, 0.25),
     })
 }
 // The speed policy is a low-variance REFINEMENT on top of the action policy —
@@ -651,6 +653,25 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
             // players keep moving and (in possession) make their runs.
             if !is_carrier && spd_t[i] == SPD_STAND {
                 sp_t[i] -= rw().stand_pen;
+            }
+            // LOOSE-BALL PURSUIT (POMDP): when the ball is FREE, the FAVORITE — high
+            // belief it wins the race to the ball's decelerating trajectory — is
+            // rewarded for actually closing on its intercept point. Belief-gated so
+            // only the favorite commits and teammates hold shape (no crashing the
+            // ball / bunching). Defenders (idx 1,2) press a bit harder so they track
+            // back and contest a loose ball instead of ball-watching.
+            if w.owner.is_none() {
+                let belief = w.loose_ball_belief(Team::A, i);
+                if belief > 0.05 {
+                    let ip = w.intercept_point(w.a[i].pos);
+                    let to_ip = ip.sub(w.a[i].pos);
+                    let d = to_ip.len();
+                    if d > 0.5 {
+                        let closing = (w.a[i].vel.x * to_ip.x + w.a[i].vel.y * to_ip.y) / d;
+                        let def_bonus = if i <= 2 { 1.3 } else { 1.0 };
+                        sp_t[i] += rw().pursuit * belief * def_bonus * (closing / 8.5).clamp(0.0, 1.0);
+                    }
+                }
             }
             if our_phase {
                 // Advance upfield (attack frame +x). No offsides rule, so reward

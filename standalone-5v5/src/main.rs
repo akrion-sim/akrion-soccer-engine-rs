@@ -740,7 +740,7 @@ fn record_match(policy: &train::Policy, rng: &mut Rng, path: &Path) -> AppResult
     let mut w = World::new();
     let mut frames = String::new();
     frames.push('[');
-    for t in 0..STEPS {
+    for t in 0..RECORD_STEPS {
         if t > 0 {
             frames.push(',');
         }
