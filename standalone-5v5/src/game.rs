@@ -1674,6 +1674,24 @@ fn deterministic_teammate_axis(i: usize, j: usize) -> V2 {
 }
 
 fn integrate(p: &mut Player) {
+    // Ramp actual velocity toward the desired (gear-target) velocity at a bounded
+    // rate — players build and shed speed, they don't teleport between gears.
+    // Cutting / slowing (desired speed <= current) is allowed faster than accel.
+    let dv = p.des_vel.sub(p.vel);
+    let dvlen = dv.len();
+    if dvlen > 1e-6 {
+        let rate = if p.des_vel.len() >= p.vel.len() {
+            player_accel()
+        } else {
+            player_decel()
+        };
+        let max_step = rate * DT;
+        p.vel = if dvlen <= max_step {
+            p.des_vel
+        } else {
+            p.vel.add(dv.scale(max_step / dvlen))
+        };
+    }
     p.pos = p.pos.add(p.vel.scale(DT));
     clamp_pos(p);
 }
