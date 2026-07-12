@@ -6417,6 +6417,106 @@ if (playbackSpeedSelect) {
 initializeAuthTokenFromLocation();
 bootLivePage().catch(e => statusEl.textContent = e.message);
 
+// ---- learning-climb charts: 11v11 training history (goals for/against, pass completion,
+//      turnovers, shots) per league round, polled live from the climb sidecar (:5056). ----
+(function () {
+  const CLIMB_URL = `${location.protocol}//${location.hostname || "localhost"}:5056/climb.json`;
+  const ARM_VARS = { control: "--accent", grounded: "--gold" };   // arm -> css color var
+  const SPECS = [
+    { field: "gd_per_game",       label: "Goal diff / game",         fmt: v => (v >= 0 ? "+" : "") + v.toFixed(2), zero: true },
+    { field: "goals_for",         label: "Goals for",                fmt: v => String(Math.round(v)) },
+    { field: "goals_against",     label: "Goals against",            fmt: v => String(Math.round(v)) },
+    { field: "pass_completion",   label: "Pass completion",          fmt: v => (v * 100).toFixed(1) + "%" },
+    { field: "chain_net_losses",  label: "Turnovers (chain losses)", fmt: v => String(Math.round(v)) },
+    { field: "sot_for",           label: "Shots on target for",      fmt: v => String(Math.round(v)) },
+  ];
+  const cards = {};        // field -> { canvas, valEl, spec }
+  let data = null;
+  const cssVar = n => (getComputedStyle(document.documentElement).getPropertyValue(n).trim() || "#888");
+
+  function build() {
+    const grid = document.getElementById("climbgrid");
+    if (!grid) return;
+    grid.innerHTML = "";
+    for (const spec of SPECS) {
+      const card = document.createElement("div"); card.className = "climbcard";
+      const ct = document.createElement("div"); ct.className = "ct";
+      const l = document.createElement("span"); l.className = "ctl"; l.textContent = spec.label;
+      const val = document.createElement("span"); val.className = "cval"; val.textContent = "–";
+      ct.appendChild(l); ct.appendChild(val);
+      const cv = document.createElement("canvas");
+      card.appendChild(ct); card.appendChild(cv); grid.appendChild(card);
+      cards[spec.field] = { canvas: cv, valEl: val, spec };
+    }
+  }
+
+  function drawOne(field) {
+    const entry = cards[field]; if (!entry || !data) return;
+    const { canvas, valEl, spec } = entry;
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    const w = canvas.clientWidth || 280, h = canvas.clientHeight || 72;
+    canvas.width = w * dpr; canvas.height = h * dpr;
+    const ctx = canvas.getContext("2d"); ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    const pad = { l: 5, r: 6, t: 7, b: 10 };
+    const order = data.arm_order || Object.keys(ARM_VARS);
+    const series = [];
+    let ymin = Infinity, ymax = -Infinity, xmax = 1;
+    for (const arm of order) {
+      const rows = (data.arms || {})[arm] || [];
+      const pts = rows.filter(r => r[field] != null && isFinite(r[field])).map(r => ({ x: r.round, y: r[field] }));
+      if (pts.length) {
+        series.push({ arm, color: cssVar(ARM_VARS[arm] || "--muted"), pts });
+        for (const p of pts) { ymin = Math.min(ymin, p.y); ymax = Math.max(ymax, p.y); xmax = Math.max(xmax, p.x); }
+      }
+    }
+    if (!series.length) { valEl.textContent = "–"; return; }
+    if (spec.zero) { ymin = Math.min(ymin, 0); ymax = Math.max(ymax, 0); }
+    if (ymin === ymax) { ymin -= 1; ymax += 1; }
+    const span = (ymax - ymin) || 1;
+    const X = x => pad.l + (x / Math.max(1, xmax)) * (w - pad.l - pad.r);
+    const Y = y => pad.t + (1 - (y - ymin) / span) * (h - pad.t - pad.b);
+    // zero baseline (dashed) where meaningful
+    if (spec.zero && ymin <= 0 && ymax >= 0) {
+      const yz = Y(0);
+      ctx.strokeStyle = cssVar("--line"); ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
+      ctx.beginPath(); ctx.moveTo(pad.l, yz); ctx.lineTo(w - pad.r, yz); ctx.stroke(); ctx.setLineDash([]);
+    }
+    for (const s of series) {
+      ctx.strokeStyle = s.color; ctx.lineWidth = 1.6; ctx.lineJoin = "round"; ctx.beginPath();
+      s.pts.forEach((p, i) => { const x = X(p.x), y = Y(p.y); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+      ctx.stroke();
+      const last = s.pts[s.pts.length - 1];
+      ctx.fillStyle = s.color; ctx.beginPath(); ctx.arc(X(last.x), Y(last.y), 2.3, 0, 6.2832); ctx.fill();
+    }
+    const prim = series[0], lv = prim.pts[prim.pts.length - 1].y;
+    valEl.textContent = spec.fmt(lv);
+  }
+
+  function drawAll() { for (const f in cards) drawOne(f); }
+  window.drawAllClimb = drawAll;   // let the theme toggle redraw with fresh colors
+
+  async function update() {
+    const st = document.getElementById("climbStatus");
+    try {
+      const r = await fetch(CLIMB_URL, { cache: "no-store" });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      data = await r.json();
+      const c = ((data.arms || {}).control || []).length, g = ((data.arms || {}).grounded || []).length;
+      if (st) st.textContent = `control r${c} · grounded r${g}`;
+      drawAll();
+    } catch (e) {
+      if (st) st.textContent = "climb sidecar offline";
+    }
+  }
+
+  build();
+  update();
+  setInterval(update, 15000);
+  let raf = 0;
+  window.addEventListener("resize", () => { if (raf) cancelAnimationFrame(raf); raf = requestAnimationFrame(drawAll); });
+})();
+
 // ---- theme toggle (light / dark, persisted) ----
 (function () {
   const btn = document.getElementById("themeToggle");
