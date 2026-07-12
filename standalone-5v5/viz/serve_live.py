@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -20,8 +21,25 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 BIN = os.path.join(ROOT, "target", "release", "fiveaside")
 OUT_DIR = os.path.join(ROOT, "out")
-PORT = int(os.environ.get("PORT", "8080"))
-TIMEOUT = int(os.environ.get("NEWGAME_TIMEOUT", "120"))
+MAX_SEED = 2 ** 63 - 1
+
+
+def env_int(name, default, lo=None, hi=None):
+    try:
+        value = int(os.environ.get(name, str(default)), 0)
+    except ValueError:
+        value = default
+    if lo is not None:
+        value = max(lo, value)
+    if hi is not None:
+        value = min(hi, value)
+    return value
+
+
+PORT = env_int("PORT", 8080, lo=1, hi=65535)
+TIMEOUT = env_int("NEWGAME_TIMEOUT", 120, lo=1, hi=3600)
+MAX_NEWGAME_CONCURRENCY = env_int("NEWGAME_MAX_CONCURRENCY", 2, lo=1, hi=16)
+NEWGAME_SEMAPHORE = threading.BoundedSemaphore(MAX_NEWGAME_CONCURRENCY)
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -36,9 +54,11 @@ class Handler(SimpleHTTPRequestHandler):
 
     def _new_game(self, query):
         try:
-            seed = int(query.get("seed", ["7"])[0]) % (2 ** 63)
+            seed = max(0, min(MAX_SEED, int(query.get("seed", ["7"])[0], 0)))
         except (ValueError, IndexError):
             seed = 7
+        if not NEWGAME_SEMAPHORE.acquire(blocking=False):
+            return self._json(429, {"error": "too many match generations in flight"})
         # unique output path so concurrent clicks don't collide
         fd, out_path = tempfile.mkstemp(suffix=".json", prefix="match_live_")
         os.close(fd)
@@ -63,6 +83,7 @@ class Handler(SimpleHTTPRequestHandler):
                 os.unlink(out_path)
             except OSError:
                 pass
+            NEWGAME_SEMAPHORE.release()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -80,5 +101,10 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"live viz on http://localhost:{PORT}  (New Game -> {BIN} play <seed>)")
-    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+    print(
+        f"live viz on http://127.0.0.1:{PORT}  "
+        f"(New Game -> {BIN} play <seed>, max {MAX_NEWGAME_CONCURRENCY} in flight)"
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    server.daemon_threads = True
+    server.serve_forever()

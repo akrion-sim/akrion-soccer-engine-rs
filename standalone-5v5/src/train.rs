@@ -6,6 +6,7 @@ use crate::game::*;
 use crate::nn::{masked_softmax, Mlp};
 use crate::rng::Rng;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 // SPEED WARMUP CURRICULUM: while true, every player uses a fixed run-medium gear
 // (v3 behavior) instead of sampling the speed policy. This lets the ACTION policy
@@ -15,6 +16,38 @@ use std::sync::atomic::{AtomicBool, Ordering};
 static SPEED_FROZEN: AtomicBool = AtomicBool::new(false);
 pub fn set_speed_frozen(frozen: bool) {
     SPEED_FROZEN.store(frozen, Ordering::Relaxed);
+}
+
+// ── SELF-PLAY CHAMPION LADDER ───────────────────────────────────────────────
+// When a champion is installed, Team B (the opponent) is driven by that FROZEN
+// learned policy instead of the scripted baseline — so BOTH teams are learned
+// policies. The challenger (Team A) keeps training; when it beats the champion by
+// a margin it is promoted to the new champion ("new winner beats old winner to
+// advance"). Every action still flows through World::step, which executes only
+// legal, physics-bounded moves — self-play cannot invent unphysical behavior.
+static SELFPLAY_CHAMPION: RwLock<Option<Arc<Policy>>> = RwLock::new(None);
+
+fn selfplay_champion_write() -> RwLockWriteGuard<'static, Option<Arc<Policy>>> {
+    SELFPLAY_CHAMPION
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn selfplay_champion_read() -> RwLockReadGuard<'static, Option<Arc<Policy>>> {
+    SELFPLAY_CHAMPION
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+pub fn set_selfplay_champion(champion: Option<Policy>) {
+    *selfplay_champion_write() = champion.map(Arc::new);
+}
+
+pub fn clear_selfplay_champion() {
+    *selfplay_champion_write() = None;
+}
+fn selfplay_champion() -> Option<Arc<Policy>> {
+    selfplay_champion_read().clone()
 }
 
 const GAMMA: f32 = 0.995; // per-tick discount retuned for 20 Hz (same per-second horizon)
@@ -494,7 +527,12 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
         }
 
         let pre_field = FieldRewardContext::from_world(&w);
-        let act_b = noisy_scripted_actions(&w, Team::B, opponent_noise, rng);
+        // Team B = the frozen self-play champion when one is installed, else the
+        // scripted baseline. Both flow through World::step (physics-bounded).
+        let act_b = match selfplay_champion() {
+            Some(champ) => champion_actions(&champ, &w, opponent_noise, rng),
+            None => noisy_scripted_actions(&w, Team::B, opponent_noise, rng),
+        };
         w.step(&packed_a, &act_b, rng);
         let post_field = FieldRewardContext::from_world(&w);
 
@@ -673,7 +711,8 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
                     if d > 0.5 {
                         let closing = (w.a[i].vel.x * to_ip.x + w.a[i].vel.y * to_ip.y) / d;
                         let def_bonus = if i <= 2 { 1.3 } else { 1.0 };
-                        sp_t[i] += rw().pursuit * belief * def_bonus * (closing / 8.5).clamp(0.0, 1.0);
+                        sp_t[i] +=
+                            rw().pursuit * belief * def_bonus * (closing / 8.5).clamp(0.0, 1.0);
                     }
                 }
             }
@@ -801,8 +840,16 @@ fn collect_rollouts(policy: &Policy, games: usize, rng: &mut Rng) -> Vec<Sample>
     }
 
     let mut data = Vec::new();
+    let mut worker_failed = false;
     for handle in handles {
-        data.extend(handle.join().expect("rollout worker panicked"));
+        match handle.join() {
+            Ok(samples) => data.extend(samples),
+            Err(_) => worker_failed = true,
+        }
+    }
+    if worker_failed {
+        eprintln!("warning: 5v5 rollout worker panicked; retrying rollout batch serially");
+        return run_rollout_jobs(policy, &jobs);
     }
     data
 }
@@ -853,6 +900,24 @@ fn noisy_scripted_actions(w: &World, team: Team, noise: f32, rng: &mut Rng) -> [
             let a = sample_legal_action(&mask, rng);
             let gear = w.coerce_speed_gear(team, i, a, scripted_gear(a));
             acts[i] = a + gear * NA; // keep the noisy move at a real speed
+        }
+    }
+    acts
+}
+
+/// Team-B actions from a frozen self-play champion (keeper held, like the
+/// challenger's keeper). A small epsilon of legal exploration keeps the opposition
+/// varied so the challenger doesn't overfit one deterministic champion line.
+fn champion_actions(champ: &Policy, w: &World, noise: f32, rng: &mut Rng) -> [usize; N] {
+    let mut acts = [A_STAY; N];
+    for i in 1..N {
+        if noise > 0.0 && rng.f01() < noise {
+            let mask = w.legal_mask(Team::B, i);
+            let a = sample_legal_action(&mask, rng);
+            let gear = w.coerce_speed_gear(Team::B, i, a, scripted_gear(a));
+            acts[i] = a + gear * NA;
+        } else {
+            acts[i] = champ.act_greedy_world(w, Team::B, i);
         }
     }
     acts
@@ -1234,6 +1299,39 @@ pub fn evaluate(policy: &Policy, games: usize, rng: &mut Rng) -> Stats {
     s
 }
 
+/// Head-to-head between two learned policies: `cand` plays Team A, `opp` plays
+/// Team B (keepers held, as in `evaluate`). Returns (mean goal_diff for `cand`,
+/// `cand` winrate with draws counting 0.5). This is the champion-ladder gate:
+/// the challenger advances only when it beats the frozen champion by a margin.
+pub fn evaluate_vs_policy(cand: &Policy, opp: &Policy, games: usize, rng: &mut Rng) -> (f32, f32) {
+    let mut gd = 0.0f32;
+    let mut wr = 0.0f32;
+    for _ in 0..games {
+        let mut w = World::new();
+        if rng.f01() < 0.5 {
+            w.kickoff(Team::B);
+        }
+        for _ in 0..STEPS {
+            let mut act_a = [A_STAY; N];
+            let mut act_b = [A_STAY; N];
+            for i in 1..N {
+                act_a[i] = cand.act_greedy_world(&w, Team::A, i);
+                act_b[i] = opp.act_greedy_world(&w, Team::B, i);
+            }
+            w.step(&act_a, &act_b, rng);
+        }
+        let d = w.goals_a as f32 - w.goals_b as f32;
+        gd += d;
+        if d > 0.0 {
+            wr += 1.0;
+        } else if d == 0.0 {
+            wr += 0.5;
+        }
+    }
+    let g = games.max(1) as f32;
+    (gd / g, wr / g)
+}
+
 /// Baseline sanity check: scripted-vs-scripted goal difference (should be ~0).
 pub fn evaluate_scripted_vs_scripted(games: usize, rng: &mut Rng) -> (f32, f32, f32) {
     let mut diff = 0.0f32;
@@ -1313,6 +1411,15 @@ mod tests {
         let left = evaluate_scripted_vs_scripted(8, &mut a);
         let right = evaluate_scripted_vs_scripted(8, &mut b);
         assert_eq!(left, right);
+    }
+
+    #[test]
+    fn selfplay_champion_lock_round_trips_and_clears() {
+        let mut rng = Rng::new(123);
+        set_selfplay_champion(Some(Policy::new(&mut rng)));
+        assert!(selfplay_champion().is_some());
+        clear_selfplay_champion();
+        assert!(selfplay_champion().is_none());
     }
 
     #[test]

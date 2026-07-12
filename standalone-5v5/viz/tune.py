@@ -26,6 +26,32 @@ ROOT = os.path.dirname(HERE)
 BIN = os.path.join(ROOT, "target", "release", "fiveaside")
 MIN_WEIGHT = 0.0001
 
+
+def env_int(name, default, lo=None, hi=None):
+    try:
+        value = int(os.environ.get(name, str(default)), 0)
+    except ValueError:
+        value = default
+    if lo is not None:
+        value = max(lo, value)
+    if hi is not None:
+        value = min(hi, value)
+    return value
+
+
+def env_float(name, default, lo=None, hi=None):
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except ValueError:
+        value = default
+    if not math.isfinite(value):
+        value = default
+    if lo is not None:
+        value = max(lo, value)
+    if hi is not None:
+        value = min(hi, value)
+    return value
+
 # ── search space: (ENV_VAR, default, low, high, log_scale) ───────────────────
 # Tune the reward vector that shapes the field-vector-conditioned POMDP rewards.
 # Structural knobs (SHOOT_X, BALL_SPEED_CAP) are held fixed here; the scalar
@@ -71,16 +97,24 @@ SPACE = [
     ("W_PURSUIT",      0.05, MIN_WEIGHT,   0.25, False),
 ]
 
-ITERS   = int(os.environ.get("TUNE_ITERS", "500"))
-FINALG  = int(os.environ.get("TUNE_FINAL_GAMES", "200"))
-POP     = int(os.environ.get("TUNE_POP", "8"))
-ELITE   = int(os.environ.get("TUNE_ELITE", "3"))
-GENS    = int(os.environ.get("TUNE_GENS", "10"))
-MAXPAR  = int(os.environ.get("TUNE_MAXPAR", "2"))
-SEEDS   = [int(s) for s in os.environ.get("TUNE_SEEDS", "20260710").split(",") if s.strip()]
-SIGMA0  = float(os.environ.get("TUNE_SIGMA", "0.25"))   # initial step, in normalized [0,1] units
-TIMEOUT = int(os.environ.get("TUNE_TIMEOUT", "3600"))   # per-candidate hard deadline (s)
-RNG     = random.Random(int(os.environ.get("TUNE_RNG", "1")))
+ITERS   = env_int("TUNE_ITERS", 500, lo=1)
+FINALG  = env_int("TUNE_FINAL_GAMES", 200, lo=1)
+POP     = env_int("TUNE_POP", 8, lo=1)
+ELITE   = env_int("TUNE_ELITE", 3, lo=1)
+GENS    = env_int("TUNE_GENS", 10, lo=1)
+MAXPAR  = env_int("TUNE_MAXPAR", 2, lo=1)
+SEEDS   = []
+for raw_seed in os.environ.get("TUNE_SEEDS", "20260710").split(","):
+    raw_seed = raw_seed.strip()
+    if not raw_seed:
+        continue
+    try:
+        SEEDS.append(int(raw_seed, 0))
+    except ValueError:
+        print(f"warning: ignoring invalid TUNE_SEEDS entry {raw_seed!r}", file=sys.stderr)
+SIGMA0  = env_float("TUNE_SIGMA", 0.25, lo=0.001, hi=1.0)   # initial step, in normalized [0,1] units
+TIMEOUT = env_int("TUNE_TIMEOUT", 3600, lo=1)   # per-candidate hard deadline (s)
+RNG     = random.Random(env_int("TUNE_RNG", 1))
 # Fixed env every candidate inherits. Frozen speed = the config that actually
 # attacks; we optimize the action-policy reward first.
 FIXED   = {"SPEED_WARMUP": os.environ.get("TUNE_SPEED_WARMUP", "250")}
@@ -156,8 +190,16 @@ def run_one(vec, seed):
     cmd = [BIN, "train", str(ITERS), "--seed", str(seed),
            "--final-games", str(FINALG), "--out-dir", os.path.join(ROOT, "out_tune")]
     try:
-        p = subprocess.run(cmd, env=env, cwd=ROOT, capture_output=True, text=True, timeout=3600)
+        p = subprocess.run(cmd, env=env, cwd=ROOT, capture_output=True, text=True, timeout=TIMEOUT)
     except subprocess.TimeoutExpired:
+        print(f"warning: candidate seed={seed} timed out after {TIMEOUT}s", file=sys.stderr)
+        return None
+    except OSError as exc:
+        print(f"warning: candidate seed={seed} failed to start: {exc}", file=sys.stderr)
+        return None
+    if p.returncode != 0:
+        tail = (p.stderr or p.stdout)[-800:]
+        print(f"warning: candidate seed={seed} exited {p.returncode}: {tail}", file=sys.stderr)
         return None
     return parse(p.stdout)
 
@@ -203,8 +245,14 @@ def eval_pool(vectors):
             logf = open(logpath, "w")
             cmd = [BIN, "train", str(ITERS), "--seed", str(seed),
                    "--final-games", str(FINALG), "--out-dir", outdir]
-            proc = subprocess.Popen(cmd, env=env, cwd=ROOT,
-                                    stdout=logf, stderr=subprocess.STDOUT, text=True)
+            try:
+                proc = subprocess.Popen(cmd, env=env, cwd=ROOT,
+                                        stdout=logf, stderr=subprocess.STDOUT, text=True)
+            except OSError as exc:
+                logf.close()
+                print(f"warning: candidate {ci}/{si} failed to start: {exc}", file=sys.stderr)
+                results[(ci, si)] = None
+                continue
             running[proc] = (ci, si, logpath, logf, time.time() + TIMEOUT)
         time.sleep(1.0)
         for proc in list(running):
@@ -212,6 +260,7 @@ def eval_pool(vectors):
             done = proc.poll() is not None
             if not done and time.time() > deadline:
                 proc.kill(); proc.wait(); done = True  # overran -> parse() of partial log likely None
+                print(f"warning: candidate {ci}/{si} timed out after {TIMEOUT}s", file=sys.stderr)
             if done:
                 running.pop(proc)
                 logf.close()
@@ -220,7 +269,15 @@ def eval_pool(vectors):
                         out = fh.read()
                 except OSError:
                     out = ""
-                results[(ci, si)] = parse(out)
+                if proc.returncode != 0:
+                    tail = "\n".join(out.splitlines()[-20:])
+                    print(
+                        f"warning: candidate {ci}/{si} exited {proc.returncode}: {tail}",
+                        file=sys.stderr,
+                    )
+                    results[(ci, si)] = None
+                else:
+                    results[(ci, si)] = parse(out)
     if not any(v is not None for v in results.values()):
         sys.exit("NO candidate produced a parseable FINAL line this generation — "
                  "the trainer output format likely changed (check FINAL_RE) or every "
