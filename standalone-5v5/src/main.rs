@@ -520,10 +520,11 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
             bc.accuracy * 100.0
         );
     }
-    // Generation-0 champion = the warm-started challenger snapshot.
-    let mut champion = challenger.clone();
+    // Generation-0 champion = the scripted baseline itself (Team B scripted). The
+    // first learned policy to beat it by the margin becomes gen-1 champion; the
+    // ladder climbs from there ("new winner beats old winner to advance").
+    let mut champion: Option<train::Policy> = None;
     let mut champion_gen = 0usize;
-    save_policy(&champion, &champ_dir.join(format!("gen{champion_gen}")))?;
 
     let (svs, _, _) = train::evaluate_scripted_vs_scripted(60, &mut rng);
     println!("=== 5-a-side ADVERSARIAL SELF-PLAY ladder — both teams learned, physics-bounded ===");
