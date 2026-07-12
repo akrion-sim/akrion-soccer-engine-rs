@@ -375,21 +375,38 @@ fn eval_arm(
 }
 
 fn main() {
-    // FINISHING COUPLING (the fix that makes this drill actually train finishing).
-    // Under the engine's default serving, a clear chance yields a single dominant analytic
-    // SHOT candidate, so value/actor learning cannot change conversion (verified: byte-identical
-    // rates across lambda/actor settings). Two engine levers, set here as overridable defaults,
-    // route shot EXECUTION through the learner:
-    //   * DD_SOCCER_ENABLE_DISCRETIZED_KICK expands a shot into several power/placement bucket
-    //     candidates the value net can choose among (learned placement).
-    //   * DD_SOCCER_NEURAL_AUTHORITATIVE_LAMBDA makes the trained value head OWN that choice
-    //     (the coarse tabular Q becomes a tie-break floor), so as the critic learns which
-    //     buckets score, the served shot improves. This is still soft-reward-driven learning —
-    //     the reward trains the value; the value only serves.
-    // Both are `OnceLock`-cached in the engine, so they must be set before the first step.
-    set_env_default("DD_SOCCER_ENABLE_DISCRETIZED_KICK", "1");
-    set_env_default("SOCCER_NEURAL_MCTS_MIN_DISCRETIZED_KICK_CANDIDATES", "3");
-    set_env_default("DD_SOCCER_NEURAL_AUTHORITATIVE_LAMBDA", "30");
+    // Mode: `finishing` (default) trains 1-v-keeper conversion; `creation` trains manufacturing
+    // high-xG chances from open play in the final third. They differ in scenario, metrics, serving
+    // levers, and the eval baseline — everything else (spawn/step/train/eval infra) is shared.
+    let creation = std::env::var("DRILL_MODE")
+        .map(|m| m.trim().eq_ignore_ascii_case("creation"))
+        .unwrap_or(false);
+
+    if !creation {
+        // FINISHING COUPLING (finishing mode only): route shot EXECUTION through the learner so
+        // value learning can move conversion. DD_SOCCER_ENABLE_DISCRETIZED_KICK expands a shot into
+        // power/placement bucket candidates and DD_SOCCER_NEURAL_AUTHORITATIVE_LAMBDA makes the
+        // trained value head own that choice. (Empirically finishing sits at a near-parity ceiling
+        // regardless — the net's shot EXECUTION is ≤ analytic; this is why CREATION mode exists.)
+        // In CREATION mode we DELIBERATELY leave these at engine default: analytic executes the
+        // shot; the net learns MOVEMENT + PASSING (where its value lives) via the value blend.
+        // Both env vars are `OnceLock`-cached in the engine, so they must be set before step 1.
+        set_env_default("DD_SOCCER_ENABLE_DISCRETIZED_KICK", "1");
+        set_env_default("SOCCER_NEURAL_MCTS_MIN_DISCRETIZED_KICK_CANDIDATES", "3");
+        set_env_default("DD_SOCCER_NEURAL_AUTHORITATIVE_LAMBDA", "30");
+    }
+
+    // CREATION default: fine-tune from a REAL full-game league frontier rather than training from
+    // scratch on a narrow distribution (scratch-training on the box scenario is exactly what caused
+    // the finishing net to narrow to trained<fresh). Warm-start is opt-out via DRILL_WARMSTART.
+    if creation && std::env::var_os("DRILL_WARMSTART").is_none() {
+        const DEFAULT_WS: &str = "/tmp/conv-climb-11v11/learned-params.json";
+        if Path::new(DEFAULT_WS).exists() {
+            std::env::set_var("DRILL_WARMSTART", DEFAULT_WS);
+        } else {
+            eprintln!("creation mode: no DRILL_WARMSTART and {DEFAULT_WS} missing — training from scratch (not recommended).");
+        }
+    }
 
     // Deterministic formation LP so a given seed is reproducible.
     enable_deterministic_formation_lp();
@@ -400,17 +417,23 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0xF111_D000);
+    // Creation faces a defensive block (2-4 defenders); finishing is a clean 1-v-keeper by default.
     let num_defenders: usize = std::env::var("DRILL_DEFENDERS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(0)
-        .min(2);
+        .unwrap_or(if creation { 3 } else { 0 });
+    // Creation needs time to work the ball into a chance; finishing resolves fast.
     let max_ticks: usize = std::env::var("DRILL_MAX_TICKS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(80);
-    let out_path = std::env::var("DRILL_OUT")
-        .unwrap_or_else(|_| "/tmp/finishing-drill/learned-params.json".to_string());
+        .unwrap_or(if creation { 130 } else { 80 });
+    let out_path = std::env::var("DRILL_OUT").unwrap_or_else(|_| {
+        if creation {
+            "/tmp/creation-drill/learned-params.json".to_string()
+        } else {
+            "/tmp/finishing-drill/learned-params.json".to_string()
+        }
+    });
     let warmstart = std::env::var("DRILL_WARMSTART").ok().filter(|s| !s.is_empty());
 
     // Optional warm start: pull the learner net + home target-Q out of an existing frontier.
