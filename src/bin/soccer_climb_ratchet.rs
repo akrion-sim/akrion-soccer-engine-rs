@@ -1189,7 +1189,10 @@ fn eval_vs_analytic_game(
         period_count,
         learning_enabled: false,
         neural_learning: climb_neural_config(0.015),
-        seed: seed_base.wrapping_add(game_index as u32),
+        // Pair each scenario across both orientations. Using `game_index` directly
+        // makes every Home candidate consume an even seed and every Away candidate
+        // an odd seed, confounding side strength with seed parity.
+        seed: eval_scenario_seed(seed_base, game_index),
         ..MatchConfig::default()
     };
     configure_authoritative_blend(&mut config, authoritative_lambda);
@@ -1326,6 +1329,10 @@ fn eval_vs_analytic_game(
     stats.forward_pass_margin += forward_for as i32 - forward_against as i32;
     stats.net_forward_pass_margin += net_forward_margin;
     stats
+}
+
+fn eval_scenario_seed(seed_base: u32, game_index: usize) -> u32 {
+    seed_base.wrapping_add((game_index / 2) as u32)
 }
 
 fn eval_vs_analytic(
@@ -1929,6 +1936,14 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn analytic_eval_pairs_home_and_away_on_the_same_scenario_seed() {
+        let base = 0xd31a_0001;
+        assert_eq!(eval_scenario_seed(base, 0), eval_scenario_seed(base, 1));
+        assert_eq!(eval_scenario_seed(base, 2), eval_scenario_seed(base, 3));
+        assert_eq!(eval_scenario_seed(base, 2), base.wrapping_add(1));
+    }
 
     fn eval(wins: u32, draws: u32, losses: u32, goal_diff: i32, net_forward: i32) -> EvalStats {
         let games = wins + draws + losses;

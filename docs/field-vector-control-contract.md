@@ -71,17 +71,35 @@ trained or searched on one seed partition, frozen for the inner learner, and
 selected on a disjoint held-out partition. Training reward is never the promotion
 metric.
 
-`soccer_reward_context_fit` is the outcome-grounded fitter. It reuses the existing
-configuration-moment corpus rather than inventing another state recorder: each
-row already contains the canonical 256-d embedding, the action taken, immediate
-reward, and realised n-step return. The fitter labels those rows from the final
-W/D/L result plus a small capped goal-margin term; it deliberately does not use
-the already-shaped immediate/n-step reward as the target. Reward heads learn
-higher utility in field configurations where the associated action family led
-to good match outcomes; penalty heads learn the sign-mirrored target. A prior schema-v1 artifact can be
-passed as the fifth argument, so accepted weights are the next run's initial
-condition rather than being reset. The generated artifact is frozen during inner
-policy training and must still clear a disjoint promotion evaluation.
+`soccer_reward_context_fit` is the outcome-grounded fitter. When retrieval capture
+is enabled, the event recorder retains each exact factual typed occurrence (for
+example `ShotOnTarget` or `BadPassChainPenalty`) together with the canonical 256-d
+embedding at that event's tick and a second canonical embedding after the
+configured outcome horizon. The capture intentionally omits the event's
+hand-authored magnitude, so the contextual head cannot merely imitate the assumed
+reward it is meant to replace. The fitter first learns a hermetic `256 -> 32 -> 1`
+neural whole-field state-value head from final W/D/L plus capped goal margin. It then trains each
+event utility from the learned value change between the factual event state and
+its later field state; penalty heads use the sign mirror. Per-kind RMS value
+change supplies a data-derived target scale rather than an assumed reward value.
+Before terminal fitting, the neural latent is self-supervised on every factual
+pair to predict a fixed 32-dimensional projection of the future field vector.
+Terminal labels train only the small value output, so scarce W/D/L outcomes do
+not have to discover the 22-player interaction representation from scratch.
+Neural value changes are generated out-of-fold by alternating match partitions, then
+shrunk by the value model's held-out improvement over a zero predictor. A weak or
+non-predictive value model therefore produces a near-neutral `1.0` utility rather
+than amplifying noise. The delta normalizer has a `0.05` lower safety clamp so a
+tiny empirical RMS cannot turn numerical noise into a saturated target.
+A team-match contributes at most one unit of fitting weight to each event kind:
+repeated routine occurrences receive inverse-frequency weight, preventing a match
+with hundreds of carries from overwhelming rarer shot, pass, or turnover evidence.
+A prior schema-v1 artifact can be passed as the fifth argument, so accepted weights
+and its self-supervised neural value representation become the next run's initial
+condition rather than being reset. Cross-fit reliability is still measured only
+against the new shard's held-out match partition. The generated
+artifact is frozen during inner policy training and must still clear a disjoint
+promotion evaluation.
 
 ## Per-player MPC
 

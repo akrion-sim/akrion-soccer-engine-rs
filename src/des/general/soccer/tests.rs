@@ -47205,6 +47205,37 @@ fn goal_reward_contextualizes_recent_attacking_decisions() {
 }
 
 #[test]
+fn factual_reward_context_capture_uses_exact_event_and_whole_field_embedding() {
+    let mut config = MatchConfig {
+        duration_seconds: 10.0,
+        seed: 158,
+        ..Default::default()
+    };
+    config.retrieval.capture_enabled = true;
+    config.retrieval.outcome_horizon = 1;
+    let mut sim = SoccerMatch::default_11v11(config);
+    sim.tick = 17;
+
+    sim.test_record_reward_event_with_kind(9, 123.0, SoccerRewardEventKind::ShotOnTarget);
+
+    let samples = sim.reward_context_samples();
+    assert_eq!(samples.len(), 1);
+    assert_eq!(samples[0].tick, 17);
+    assert_eq!(samples[0].team, sim.players[9].team);
+    assert_eq!(samples[0].kind, "ShotOnTarget");
+    assert_eq!(samples[0].embedding.len(), SOCCER_MOMENT_EMBEDDING_DIM);
+    assert!(samples[0].embedding.iter().all(|value| value.is_finite()));
+
+    sim.run_time_step();
+    let sample = &sim.reward_context_samples()[0];
+    assert_eq!(sample.future_tick, Some(18));
+    let future = sample.future_embedding.as_ref().expect("future field state");
+    assert_eq!(future.len(), SOCCER_MOMENT_EMBEDDING_DIM);
+    assert!(future.iter().all(|value| value.is_finite()));
+    assert_ne!(future, &sample.embedding, "future state must not be same-tick copy");
+}
+
+#[test]
 fn shot_on_target_contextualizes_recent_attacking_decisions_inside_twenty() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,

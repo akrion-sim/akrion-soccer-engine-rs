@@ -49,8 +49,22 @@ Useful reproducibility knobs:
 cargo run --release -- train 80 --seed 20260710 --games-per-iter 12 --bc-games 12 --bc-epochs 2 --eval-games 80 --final-games 300
 FIVEASIDE_ROLLOUT_THREADS=2 cargo run --release -- train 80
 SPACING_W=0.003 cargo run --release -- train 80
+MPC_SPACING_W=4.0 cargo run --release -- train 80
 PORT=5060 ./viz/serve.sh
 ```
+
+`SPACING_W` is the learnable/tunable per-player reward utility and
+`MPC_SPACING_W` is the execution-time separation objective. Both inherit sane
+defaults (`0.003` and `4.0`) and clamp loaded values to the strictly positive
+`[0.0001, 4.0]` interval. The reward and MPC objective read the current ten-player
+field state; below three yards the smooth separation pressure is maximal and it
+tapers to zero at seven yards.
+
+This mirrors the 11-a-side engine's POMDP/MPC spacing contract. The deliberate
+difference is formation allocation: 11-a-side may use whole-team LP/IPM before
+per-player MPC execution, while 5-a-side has no formation LP/IPM and derives
+support/marking targets directly from possession and open space. Both still use
+per-player, whole-field-aware MPC to prevent convergent teammate paths.
 
 ## Result (representative)
 - Untrained policy: typically loses and struggles to keep the ball.

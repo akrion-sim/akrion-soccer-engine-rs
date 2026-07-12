@@ -1759,6 +1759,14 @@ pub struct SoccerMatch {
     pub(crate) pending_aerial_finish: Option<(usize, u64)>,
     pub(crate) coach_set_play_hints: HashMap<Team, SoccerSetPlayVectorHint>,
     pub(crate) reward_events: Vec<SoccerRewardEvent>,
+    /// Persistent factual event-context rows for offline contextual-utility
+    /// fitting. Populated only when retrieval capture is enabled; unlike the
+    /// per-tick reward buffer, this survives until the match ends.
+    pub(crate) reward_context_samples: Vec<SoccerRewardContextSample>,
+    /// `(due_tick, sample_index, team)` queue for attaching a genuinely later
+    /// whole-field state to each factual reward event without rescanning the
+    /// complete sample corpus every tick.
+    pub(crate) pending_reward_context_futures: VecDeque<(u64, usize, Team)>,
     /// Cross-tick DEFERRED credit: `(decision_tick, player_id, amount)` for delayed OUTCOME rewards
     /// (a completed pass resolves ~30 ticks AFTER the pass decision). The per-tick `reward_events`
     /// buffer is cleared each tick, so a delayed reward recorded at the RESOLUTION tick lands on the
@@ -14003,6 +14011,8 @@ impl SoccerMatch {
             pending_aerial_finish: None,
             coach_set_play_hints: HashMap::new(),
             reward_events: Vec::new(),
+            reward_context_samples: Vec::new(),
+            pending_reward_context_futures: VecDeque::new(),
             deferred_reward_credits: Vec::new(),
             episode_learning_transitions: Vec::new(),
             episode_config_captures: Vec::new(),
@@ -14334,6 +14344,8 @@ impl SoccerMatch {
             deferred_reward_transitions: Vec::new(),
             deferred_reward_credits: Vec::new(),
             reward_events: Vec::new(),
+            reward_context_samples: Vec::new(),
+            pending_reward_context_futures: VecDeque::new(),
             turnover_penalty_history: VecDeque::new(),
             last_turnover_penalty_tick: None,
             pending_turnover_outcome: None,
@@ -22458,6 +22470,45 @@ impl SoccerMatch {
             .collect()
     }
 
+    /// Factual typed reward occurrences with their exact whole-field context,
+    /// retained for the offline reward-context fitter when capture is enabled.
+    pub fn reward_context_samples(&self) -> &[SoccerRewardContextSample] {
+        &self.reward_context_samples
+    }
+
+    fn resolve_reward_context_futures(&mut self, snapshot: &WorldSnapshot) {
+        if !self.config.retrieval.capture_enabled {
+            return;
+        }
+        while self
+            .pending_reward_context_futures
+            .front()
+            .is_some_and(|(due_tick, _, _)| *due_tick <= self.tick)
+        {
+            let Some((_due_tick, sample_index, team)) =
+                self.pending_reward_context_futures.pop_front()
+            else {
+                break;
+            };
+            let Some(sample) = self.reward_context_samples.get_mut(sample_index) else {
+                continue;
+            };
+            let embedding = SoccerConfigVector::from_snapshot_with(
+                snapshot,
+                team,
+                SoccerConfigComparison::PositionAgnostic,
+                ConfigWeightOptions::default(),
+            )
+            .embedding();
+            if embedding.len() == SOCCER_MOMENT_EMBEDDING_DIM
+                && embedding.iter().all(|value| value.is_finite())
+            {
+                sample.future_tick = Some(self.tick);
+                sample.future_embedding = Some(embedding);
+            }
+        }
+    }
+
     /// State-only feature vector for the actor: the transition's critic features
     /// built with a **null action**, then extended with an explicit role one-hot
     /// so the shared policy can specialize by position without changing the
@@ -23887,13 +23938,25 @@ impl SoccerMatch {
             };
 
             // The 18-yard-box relaxation only applies when both teammates are in the box.
-            let box_cut = if self.teammate_spacing_box_exemption_for_pair(pos, partner_pos) {
+            let in_box = self.teammate_spacing_box_exemption_for_pair(pos, partner_pos);
+            let box_cut = if in_box {
                 params.box_radius_reduction_yards
             } else {
                 0.0
             };
-            let near_radius = (params.near_radius_yards - box_cut).max(0.0);
-            let far_radius = (params.far_radius_yards - box_cut).max(0.0);
+            // The explicit both-players-in-the-box contract is a 3-yard floor.
+            // Learned open-play near/far radii must not re-expand that exception
+            // through the far-clock or axis-clump path.
+            let near_radius = if in_box {
+                TEAMMATE_MIN_SPACING_BOX_YARDS
+            } else {
+                (params.near_radius_yards - box_cut).max(0.0)
+            };
+            let far_radius = if in_box {
+                TEAMMATE_MIN_SPACING_BOX_YARDS
+            } else {
+                (params.far_radius_yards - box_cut).max(0.0)
+            };
             let axis_pressure =
                 teammate_axis_clump_pressure_from_delta_with_radius(partner_pos - pos, far_radius);
 
@@ -25070,6 +25133,7 @@ impl SoccerMatch {
             }
         }
         let next_snapshot = WorldSnapshot::from_match_for_learning(self);
+        self.resolve_reward_context_futures(&next_snapshot);
         // Gap 5: collect line-depth RL samples off the per-tick snapshot (no-op +
         // byte-identical unless a line-depth model is enabled).
         self.collect_line_depth_rl_samples(&next_snapshot);
@@ -25926,6 +25990,16 @@ impl SoccerMatch {
         self.record_reward_event_at_with_kind(self.tick, player_id, amount, kind);
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_record_reward_event_with_kind(
+        &mut self,
+        player_id: usize,
+        amount: f64,
+        kind: SoccerRewardEventKind,
+    ) {
+        self.record_reward_event_with_kind(player_id, amount, kind);
+    }
+
     fn record_reward_event_at_with_kind(
         &mut self,
         tick: u64,
@@ -25933,22 +26007,48 @@ impl SoccerMatch {
         amount: f64,
         kind: SoccerRewardEventKind,
     ) {
-        let whole_field_embedding =
-            if reward_context_calibration_enabled() && player_id < self.players.len() {
-                let snapshot = self.export_world_snapshot();
-                let team = self.players[player_id].team;
-                Some(
-                    SoccerConfigVector::from_snapshot_with(
-                        &snapshot,
-                        team,
-                        SoccerConfigComparison::PositionAgnostic,
-                        ConfigWeightOptions::default(),
-                    )
-                    .embedding(),
+        let capture_context = self.config.retrieval.capture_enabled;
+        let whole_field_embedding = if (reward_context_calibration_enabled() || capture_context)
+            && player_id < self.players.len()
+        {
+            let snapshot = self.export_world_snapshot();
+            let team = self.players[player_id].team;
+            Some(
+                SoccerConfigVector::from_snapshot_with(
+                    &snapshot,
+                    team,
+                    SoccerConfigComparison::PositionAgnostic,
+                    ConfigWeightOptions::default(),
                 )
-            } else {
-                None
-            };
+                .embedding(),
+            )
+        } else {
+            None
+        };
+        if capture_context {
+            if let (Some(embedding), Some(player)) =
+                (whole_field_embedding.as_ref(), self.players.get(player_id))
+            {
+                self.reward_context_samples.push(SoccerRewardContextSample {
+                    tick,
+                    team: player.team,
+                    kind: format!("{kind:?}"),
+                    embedding: embedding.clone(),
+                    future_tick: None,
+                    future_embedding: None,
+                });
+                let sample_index = self.reward_context_samples.len() - 1;
+                let horizon = self.config.retrieval.outcome_horizon.max(1) as u64;
+                let pending = (tick.saturating_add(horizon), sample_index, player.team);
+                let insertion = self
+                    .pending_reward_context_futures
+                    .iter()
+                    .position(|(due_tick, _, _)| *due_tick > pending.0)
+                    .unwrap_or(self.pending_reward_context_futures.len());
+                self.pending_reward_context_futures
+                    .insert(insertion, pending);
+            }
+        }
         let amount = calibrated_reward_event_amount(kind, amount, whole_field_embedding.as_deref());
         // Drop non-finite amounts: `NaN.abs() <= 1e-9` is false, so without this
         // an upstream NaN/Inf would slip past the magnitude gate and pollute the

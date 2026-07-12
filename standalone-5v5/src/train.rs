@@ -146,10 +146,14 @@ const LR_SPEED: f32 = LR_ACTOR * 0.3;
 const SPEED_ENT_SCALE: f32 = 0.15;
 const ENT_BETA0: f32 = 0.02;
 
-// Teammate-spacing reward weight. Overridable via SPACING_W env for tuning.
-// Strong enough that sub-3yd bunching competes with ordinary possession rewards.
+// Teammate-spacing reward weight. Overridable via SPACING_W. Default 0.008 is the
+// VALIDATED anti-bunch value (reaches ~0% bunching with the leaky linger gate + the
+// hard-resolver backstop) — strong enough that sub-3yd bunching competes with
+// ordinary possession rewards. Clamps are strictly-positive and WIDE ([1e-4, 4.0])
+// so a malformed value can neither disable nor explode the channel, yet a promoted
+// run's learned/tuned value can still warm-start the next run without being clamped.
 fn w_spacing() -> f32 {
-    wenv("SPACING_W", 0.008, 0.001, 0.04)
+    wenv("SPACING_W", 0.008, 0.0001, 4.0)
 }
 
 /// PER-PLAYER spacing reward as a function of a player's nearest-teammate

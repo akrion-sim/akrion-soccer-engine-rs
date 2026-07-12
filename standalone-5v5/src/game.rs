@@ -24,6 +24,22 @@ pub const RECORD_STEPS: usize = 1800; // ~90s at 20 Hz
 
 const PLAYER_SPEED: f32 = 6.5; // legacy reference speed (~= run_medium); kept for keeper reach/util
 
+/// Warm-startable MPC teammate-separation utility. A promoted run may persist
+/// `MPC_SPACING_W`; cold starts use the steep 4.0 baseline. The same positive
+/// clamps as reward calibration prevent an accidental zero/negative disable or
+/// an unbounded controller correction.
+fn mpc_spacing_weight() -> f32 {
+    static VALUE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("MPC_SPACING_W")
+            .ok()
+            .and_then(|raw| raw.parse::<f32>().ok())
+            .filter(|value| value.is_finite())
+            .unwrap_or(4.0)
+            .clamp(0.0001, 4.0)
+    })
+}
+
 // ---- Player gears -----------------------------------------------------------
 // Seven discrete speeds the policy can pick for any movement/dribble, from
 // standing still to a full sprint. Sim units are yards/second; the top gear is
@@ -904,10 +920,17 @@ impl World {
             integrate(&mut self.b[i]);
         }
 
+<<<<<<< HEAD
+        // There is intentionally no post-integration collision shove. Teammate
+        // separation belongs in the per-player MPC objective below, so players
+        // choose non-convergent velocities from the field vector instead of
+        // being teleported apart after making a bad movement decision.
+=======
         // Hard same-team keep-out: the reward still teaches spacing, but visible
         // <3yd stacks are never a good 5-a-side state. This is the formation-free
         // analogue of the 11v11 same-team separation floor.
         self.resolve_same_team_spacing();
+>>>>>>> 7651dddfc431b3f7dcb433062d80cb062f03a1dc
 
         // 3. Resolve a kick (frees the ball) or carry it with the owner.
         if let Some((kicker, dir, speed, is_pass)) = kick {
@@ -1490,12 +1513,100 @@ impl World {
         };
         let dir = target.sub(me);
         // STAY means stand still; otherwise move toward the target at the chosen gear.
-        let v = if a == A_STAY || dir.len() < 0.3 || spd == SPD_STAND {
+        let proposed = if a == A_STAY || dir.len() < 0.3 || spd == SPD_STAND {
             V2::default()
         } else {
             dir.unit().scale(speed_val(spd, false))
         };
+        let v = self.mpc_teammate_separated_velocity(team, idx, proposed);
         self.set_vel(team, idx, v);
+    }
+
+    /// Smooth whole-field teammate-spacing pressure shared by the 5-a-side
+    /// MPC executor and its tests. Below three yards pressure is maximal; it
+    /// tapers continuously to zero at seven yards, matching the 11-a-side
+    /// warning band without importing formation LP/IPM.
+    fn teammate_spacing_pressure(distance: f32) -> f32 {
+        if !distance.is_finite() {
+            return 1.0;
+        }
+        if distance <= 3.0 {
+            return 1.0;
+        }
+        if distance >= 7.0 {
+            return 0.0;
+        }
+        let t = ((7.0 - distance) / 4.0).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    }
+
+    /// Receding-horizon separation objective for every off-ball action. The
+    /// proposed velocity still expresses the neural POMDP decision; this MPC
+    /// layer adds a bounded repulsive objective derived from every outfield
+    /// teammate's current position and velocity. It changes direction, never
+    /// invents extra speed, and therefore remains an execution constraint rather
+    /// than a tabular tactical override.
+    fn mpc_teammate_separated_velocity(&self, team: Team, idx: usize, proposed: V2) -> V2 {
+        if idx == GK || proposed.len() <= 1e-6 {
+            return proposed;
+        }
+        let me = players(team, self)[idx];
+        let horizon = 0.75;
+        let own_future = me.pos.add(proposed.scale(horizon));
+        let mut correction = V2::default();
+        let mut max_pressure = 0.0f32;
+        for j in 1..N {
+            if j == idx {
+                continue;
+            }
+            let mate = players(team, self)[j];
+            let mate_future = mate.pos.add(mate.vel.scale(horizon));
+            let future_delta = own_future.sub(mate_future);
+            let future_gap = future_delta.len();
+            let current_delta = me.pos.sub(mate.pos);
+            let current_gap = current_delta.len();
+            let relative_velocity = proposed.sub(mate.vel);
+            let relative_speed_sq = relative_velocity.x * relative_velocity.x
+                + relative_velocity.y * relative_velocity.y;
+            let closest_t = if relative_speed_sq > 1e-6 {
+                (-(current_delta.x * relative_velocity.x + current_delta.y * relative_velocity.y)
+                    / relative_speed_sq)
+                    .clamp(0.0, horizon)
+            } else {
+                0.0
+            };
+            let closest_delta = current_delta.add(relative_velocity.scale(closest_t));
+            let closest_gap = closest_delta.len();
+            let pressure = Self::teammate_spacing_pressure(current_gap)
+                .max(Self::teammate_spacing_pressure(future_gap))
+                .max(Self::teammate_spacing_pressure(closest_gap));
+            if pressure <= 0.0 {
+                continue;
+            }
+            max_pressure = max_pressure.max(pressure);
+            let away = if closest_gap > 1e-4 {
+                closest_delta.unit()
+            } else if current_gap > 1e-4 {
+                current_delta.unit()
+            } else if future_gap > 1e-4 {
+                future_delta.unit()
+            } else {
+                // Stable opposite directions for a true overlap; no RNG and no
+                // ordering dependence in the geometric fallback.
+                let sign = if idx < j { -1.0 } else { 1.0 };
+                V2::new(0.0, sign)
+            };
+            correction = correction.add(away.scale(pressure));
+        }
+        if max_pressure <= 0.0 || correction.len() <= 1e-6 {
+            return proposed;
+        }
+        let speed = proposed.len();
+        let separation_weight = (mpc_spacing_weight() * max_pressure).clamp(0.0001, 4.0);
+        proposed
+            .add(correction.unit().scale(speed * separation_weight))
+            .unit()
+            .scale(speed)
     }
 
     fn goalside_recovery_target(&self, team: Team, idx: usize) -> V2 {
@@ -2030,6 +2141,48 @@ mod tests {
         let global = w.global_state();
         assert_eq!(global.len(), GLOBAL_DIM);
         assert!(global.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn teammate_spacing_pressure_is_steep_below_three_and_smooth_to_seven() {
+        assert_eq!(World::teammate_spacing_pressure(2.99), 1.0);
+        let p4 = World::teammate_spacing_pressure(4.0);
+        let p5 = World::teammate_spacing_pressure(5.0);
+        let p6 = World::teammate_spacing_pressure(6.0);
+        assert!(1.0 > p4 && p4 > p5 && p5 > p6 && p6 > 0.0);
+        assert_eq!(World::teammate_spacing_pressure(7.0), 0.0);
+        assert_eq!(World::teammate_spacing_pressure(f32::NAN), 1.0);
+    }
+
+    #[test]
+    fn mpc_spacing_objective_turns_a_convergent_run_away_without_extra_speed() {
+        let mut w = World::new();
+        w.a[1].pos = V2::new(20.0, 14.0);
+        w.a[2].pos = V2::new(22.0, 14.0);
+        w.a[2].vel = V2::default();
+        w.a[3].pos = V2::new(5.0, 3.0);
+        w.a[4].pos = V2::new(5.0, 25.0);
+        let proposed = V2::new(4.0, 0.0);
+
+        let adjusted = w.mpc_teammate_separated_velocity(Team::A, 1, proposed);
+
+        assert!(adjusted.x < 0.0, "close teammate must reverse convergence");
+        assert!((adjusted.len() - proposed.len()).abs() < 1e-5);
+    }
+
+    #[test]
+    fn mpc_spacing_objective_preserves_a_safe_run() {
+        let mut w = World::new();
+        w.a[1].pos = V2::new(20.0, 14.0);
+        w.a[2].pos = V2::new(30.0, 14.0);
+        w.a[3].pos = V2::new(5.0, 3.0);
+        w.a[4].pos = V2::new(5.0, 25.0);
+        let proposed = V2::new(4.0, 0.0);
+
+        let adjusted = w.mpc_teammate_separated_velocity(Team::A, 1, proposed);
+
+        assert!((adjusted.x - proposed.x).abs() < 1e-6);
+        assert!((adjusted.y - proposed.y).abs() < 1e-6);
     }
 
     #[test]

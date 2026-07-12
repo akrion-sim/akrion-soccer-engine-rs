@@ -5319,6 +5319,11 @@ impl PlayerAgent {
                 .neural_extended
                 .nearest_opponent_closing_rate_yps,
         );
+        let moving_away_spacing_relief = dribble_moving_away_relief_from_closing_rate(
+            observation
+                .neural_extended
+                .nearest_opponent_closing_rate_yps,
+        );
         let crowded_dribble_damp =
             (1.0 - defender_crowding * DRIBBLE_CROWDED_SPACE_DAMP).clamp(0.30, 1.0);
         // The flip side: when a defender closes the spacing gap AND a receiver is open,
@@ -5437,7 +5442,11 @@ impl PlayerAgent {
             * rolling_space_carry_lift
             * hold_penalty_multiplier
             * keeper_carry_under_pressure_damp
-            * (1.0 - observation.side_glance_control_cost * 0.74).clamp(0.90, 1.0))
+            * (1.0 - observation.side_glance_control_cost * 0.74).clamp(0.90, 1.0)
+            // Preserve the shared spacing contract at the final option seam:
+            // an opponent retreating quickly is materially less dangerous than
+            // a static marker at the same instantaneous distance.
+            * (1.0 + moving_away_spacing_relief * 0.08))
         .clamp(0.02, 1.75);
         let patient_carry_score_base = (dribble_score * patient_carry_multiplier).clamp(0.02, 1.58);
         // Central defenders must stay back: they do NOT dribble the ball forward when
@@ -5550,7 +5559,10 @@ impl PlayerAgent {
         } else {
             1.0
         };
-        let carry_forward_score = (carry_forward_score * byline_drive_boost).clamp(0.01, 1.85);
+        let carry_forward_score = (carry_forward_score
+            * byline_drive_boost
+            * (1.0 + moving_away_spacing_relief * 0.08))
+            .clamp(0.01, 1.85);
         let carry_out_score = (carry_out_score * byline_drive_boost).clamp(0.01, 1.30);
         let field_width = if field_width_yards.is_finite() && field_width_yards > 0.0 {
             field_width_yards
