@@ -28353,6 +28353,17 @@ fn dense_soccer_transition_reward(
     if before.ball.holder == Some(player.id) {
         let own_half_holder =
             pass_origin_in_own_half(player.team, before.ball.position, before.field_length);
+        // Hold-too-long-under-pressure penalty: −w1 · time_on_ball · pressure. Grows with
+        // BOTH how long the carrier has held the ball and how hard it is pressed, so
+        // dawdling on the ball when a defender is closing costs increasingly more each
+        // tick — pushing a quick release/move. Gated (w1 = 0 ⇒ byte-identical off), and
+        // balanced against the energy cost of moving so the optimum is to move it on.
+        let hold_w1 = hold_under_pressure_penalty_scale();
+        if hold_w1 > MIN_SOCCER_REWARD_WEIGHT {
+            let held = before_obs.actual_time_on_ball_seconds.max(0.0);
+            let press = before_obs.perceived_pressure.clamp(0.0, 1.0);
+            reward -= hold_w1 * held * press;
+        }
         let own_goal_relief =
             ball_distance_from_own_goal(player.team, after.ball.position, after.field_length)
                 - ball_distance_from_own_goal(
