@@ -1883,6 +1883,10 @@ const TURNOVER_CHAIN_BLAME_MIN_POINTS: f64 = 0.05;
 const INTERCEPTED_PASS_BASE_PENALTY_MIN_POINTS: f64 = 6.0;
 const INTERCEPTED_PASS_BASE_PENALTY_MAX_POINTS: f64 = 20.0;
 const BACKWARD_INTERCEPTED_PASS_PENALTY_MULTIPLIER: f64 = 2.0;
+/// Cap for the field-vector turnover-position multiplier: an own-third giveaway can cost
+/// up to this many × the base turnover penalty, but no more (so a dangerous giveaway is
+/// punished hard without dwarfing the sparse goal reward).
+const TURNOVER_POSITION_MAX_MULT: f64 = 5.0;
 // Bad-pass turnover blame is not a normalized pool: the passer gets the full
 // chain penalty, then the prior two teammates get discounted echoes.
 const BAD_PASS_CHAIN_PENALTY_MULTIPLIERS: [f64; 3] = [1.0, 0.20, 0.05];
@@ -24315,6 +24319,21 @@ fn reward_weight_env(name: &str, default: f64, min: f64, max: f64) -> f64 {
         .unwrap_or(default.clamp(min, max))
 }
 
+fn optional_reward_weight_env(name: &str, default: f64, max: f64) -> f64 {
+    let max = max.max(MIN_SOCCER_REWARD_WEIGHT);
+    let default = if default.is_finite() && default > 0.0 {
+        default.clamp(MIN_SOCCER_REWARD_WEIGHT, max)
+    } else {
+        0.0
+    };
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+        .map(|v| v.clamp(MIN_SOCCER_REWARD_WEIGHT, max))
+        .unwrap_or(default)
+}
+
 pub(crate) fn forward_pass_reward_scale() -> f64 {
     if dynamic_reward_weights_enabled() {
         return reward_weight_env("DD_SOCCER_FORWARD_PASS_REWARD_SCALE", 1.0, 0.0, 20.0);
@@ -24949,23 +24968,87 @@ fn quick_release_forward_pass_reward(
 /// (the whole term is a no-op unless explicitly enabled). Pre-registered A/B arms: 0.75, 1.0, 1.5.
 pub(crate) fn quick_forward_release_reward_scale() -> f64 {
     if dynamic_reward_weights_enabled() {
-        return reward_weight_env(
+        return optional_reward_weight_env(
             "DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE",
             0.0,
-            MIN_SOCCER_REWARD_WEIGHT,
             2.0,
         );
     }
     use std::sync::OnceLock;
     static V: OnceLock<f64> = OnceLock::new();
     *V.get_or_init(|| {
-        reward_weight_env(
-            "DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE",
-            0.0,
-            MIN_SOCCER_REWARD_WEIGHT,
-            2.0,
-        )
+        optional_reward_weight_env("DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE", 0.0, 2.0)
     })
+}
+
+/// Weight w1 for the HOLD-TOO-LONG-UNDER-PRESSURE penalty on the ball carrier:
+/// `−w1 · time_on_ball_seconds · perceived_pressure` per tick. The longer the carrier
+/// holds AND the more it is pressed, the larger the charge — pushing a quicker release
+/// or a move onto the ball. Env `DD_SOCCER_HOLD_UNDER_PRESSURE_PENALTY_SCALE`, clamped
+/// [0, 2], default **0.0** ⇒ byte-identical no-op unless enabled.
+pub(crate) fn hold_under_pressure_penalty_scale() -> f64 {
+    if dynamic_reward_weights_enabled() {
+        return optional_reward_weight_env("DD_SOCCER_HOLD_UNDER_PRESSURE_PENALTY_SCALE", 0.0, 2.0);
+    }
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        optional_reward_weight_env("DD_SOCCER_HOLD_UNDER_PRESSURE_PENALTY_SCALE", 0.0, 2.0)
+    })
+}
+
+/// Weight w2 for the DRIBBLE-TOO-SLOW penalty: while a carrier is dribbling,
+/// `−w2 · max(0, jog_speed − forward_speed)` (jog = [`STATIONARY_HOLD_FORWARD_JOG_YPS`]).
+/// Zero at/above a jog; grows as the carrier drops to a walk/standstill. Balances the
+/// energy cost of moving (which rises with speed) so the learned optimum is to dribble
+/// AT a jog rather than stand, walk, or needlessly sprint. Env
+/// `DD_SOCCER_DRIBBLE_MIN_GAIT_PENALTY_SCALE`, clamped [0, 2], default **0.0** ⇒ off.
+pub(crate) fn dribble_min_gait_penalty_scale() -> f64 {
+    if dynamic_reward_weights_enabled() {
+        return optional_reward_weight_env("DD_SOCCER_DRIBBLE_MIN_GAIT_PENALTY_SCALE", 0.0, 2.0);
+    }
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        optional_reward_weight_env("DD_SOCCER_DRIBBLE_MIN_GAIT_PENALTY_SCALE", 0.0, 2.0)
+    })
+}
+
+/// Weight w3 that makes the turnover penalty a continuous function of WHERE the ball is
+/// lost (the field vector): the penalty is multiplied by `1 + w3 · opponent_expected_threat(loss)`
+/// (capped at [`TURNOVER_POSITION_MAX_MULT`]). A giveaway in your own third — where the
+/// opponent's threat from that spot is high — is punished hard; an ambitious loss in the
+/// attacking third stays cheap. This is the field-vector fix for the flat-penalty
+/// risk-aversion trap. Env `DD_SOCCER_TURNOVER_POSITION_WEIGHT_SCALE`, clamped [0, 8],
+/// default **0.0** ⇒ byte-identical (multiplier = 1.0, current flat behavior).
+pub(crate) fn turnover_position_weight_scale() -> f64 {
+    if dynamic_reward_weights_enabled() {
+        return optional_reward_weight_env("DD_SOCCER_TURNOVER_POSITION_WEIGHT_SCALE", 0.0, 8.0);
+    }
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        optional_reward_weight_env("DD_SOCCER_TURNOVER_POSITION_WEIGHT_SCALE", 0.0, 8.0)
+    })
+}
+
+/// Position multiplier for a turnover at `loss_pos` by `losing_team`, weighting the base
+/// turnover penalty by the opponent's expected threat from that location (via the pitch-value
+/// field function `threat_at`). Returns 1.0 when the weight knob is off (byte-identical), and
+/// only ever amplifies (>= 1.0), capped at [`TURNOVER_POSITION_MAX_MULT`].
+fn turnover_position_multiplier(
+    losing_team: Team,
+    loss_pos: Vec2,
+    field_width: f64,
+    field_length: f64,
+) -> f64 {
+    let w3 = turnover_position_weight_scale();
+    if w3 <= 0.0 {
+        return 1.0;
+    }
+    let opponent_threat =
+        threat_at(losing_team.other(), loss_pos, field_width, field_length).max(0.0);
+    (1.0 + w3 * opponent_threat).clamp(1.0, TURNOVER_POSITION_MAX_MULT)
 }
 
 /// Codex r19 carrot: bounded, opportunity-conditioned reward for a completed forward pass that was
@@ -27302,17 +27385,18 @@ fn soccer_transition_reward_with_tactics(
         // scoring — a full-parity hit for the back line, a role-graded share for outfielders —
         // rather than a token cost. OFF ⇒ the original 8/2 values, byte-identical baseline / A/B.
         let symmetric = dd_soccer_enable_concede_symmetry();
-        let concede_penalty = if matches!(player.role, PlayerRole::Goalkeeper | PlayerRole::Defender) {
-            if symmetric {
-                reward_cfg.concede_keeper_defender_penalty_symmetric
+        let concede_penalty =
+            if matches!(player.role, PlayerRole::Goalkeeper | PlayerRole::Defender) {
+                if symmetric {
+                    reward_cfg.concede_keeper_defender_penalty_symmetric
+                } else {
+                    reward_cfg.concede_keeper_defender_penalty
+                }
+            } else if symmetric {
+                reward_cfg.concede_outfield_penalty_symmetric
             } else {
-                reward_cfg.concede_keeper_defender_penalty
-            }
-        } else if symmetric {
-            reward_cfg.concede_outfield_penalty_symmetric
-        } else {
-            reward_cfg.concede_outfield_penalty
-        };
+                reward_cfg.concede_outfield_penalty
+            };
         // Keep the concede STICK on the SAME multiplier as the goal CARROT above
         // (goal_reward_scale). Otherwise cranking the sparse-terminal lever (e.g.
         // DD_SOCCER_GOAL_REWARD_SCALE=8, the goal-dom regime) amplifies scoring but
@@ -27484,12 +27568,20 @@ fn soccer_transition_reward_with_tactics(
                     } else {
                         decision.observation.best_pass_receiver_openness
                     };
+                    // Turnover penalty, weighted by WHERE the ball was lost (the field
+                    // vector): amplified when the opponent wins it in a high-threat spot
+                    // (our third), left cheap for ambitious losses up the pitch.
                     reward -= resolved_pass_turnover_penalty(
                         player.team,
                         origin,
                         target,
                         flight,
                         receiver_openness,
+                        before.field_length,
+                    ) * turnover_position_multiplier(
+                        player.team,
+                        origin,
+                        before.field_width,
                         before.field_length,
                     );
                 }
@@ -28250,6 +28342,17 @@ fn dense_soccer_transition_reward(
     if before.ball.holder == Some(player.id) {
         let own_half_holder =
             pass_origin_in_own_half(player.team, before.ball.position, before.field_length);
+        // Hold-too-long-under-pressure penalty: −w1 · time_on_ball · pressure. Grows with
+        // BOTH how long the carrier has held the ball and how hard it is pressed, so
+        // dawdling on the ball when a defender is closing costs increasingly more each
+        // tick — pushing a quick release/move. Gated (w1 = 0 ⇒ byte-identical off), and
+        // balanced against the energy cost of moving so the optimum is to move it on.
+        let hold_w1 = hold_under_pressure_penalty_scale();
+        if hold_w1 > 0.0 {
+            let held = before_obs.actual_time_on_ball_seconds.max(0.0);
+            let press = before_obs.perceived_pressure.clamp(0.0, 1.0);
+            reward -= hold_w1 * held * press;
+        }
         let own_goal_relief =
             ball_distance_from_own_goal(player.team, after.ball.position, after.field_length)
                 - ball_distance_from_own_goal(
@@ -28261,7 +28364,7 @@ fn dense_soccer_transition_reward(
             reward += 0.09;
         } else if after_possession == Some(player.team.other()) {
             let reward_cfg = &tunables().reward;
-            reward -= intentional_long_ball_loss_penalty(
+            let giveaway = intentional_long_ball_loss_penalty(
                 action,
                 own_half_holder,
                 ball_forward,
@@ -28273,6 +28376,15 @@ fn dense_soccer_transition_reward(
             } else {
                 reward_cfg.giveaway_to_opponent_opp_half_penalty
             });
+            // Same field-vector weighting as intercepted passes: conceding possession to the
+            // opponent hurts most where it hands them a high-threat position (our own third).
+            reward -= giveaway
+                * turnover_position_multiplier(
+                    player.team,
+                    before.ball.position,
+                    before.field_width,
+                    before.field_length,
+                );
         } else {
             let reward_cfg = &tunables().reward;
             reward -= intentional_long_ball_loss_penalty(
@@ -28418,6 +28530,21 @@ fn dense_soccer_transition_reward(
                 }
             }
             reward -= hold_penalty;
+            // Dribble-at-a-jog incentive: −w2 · max(0, jog − forward_speed). A carrier that
+            // is dribbling but crawling (standing still / walking, below the jog gait) is
+            // charged in proportion to how far below a jog its forward drive is; at/above a
+            // jog it is zero. Together with the (speed-increasing) energy cost this makes a
+            // jog the learned optimum — not a standstill, not a needless sprint. Gated off by default.
+            let dribble_w2 = dribble_min_gait_penalty_scale();
+            if dribble_w2 > 0.0 {
+                let fwd = after
+                    .player_velocity(player.id)
+                    .map(|v| v.y * attack_dir)
+                    .unwrap_or(0.0);
+                let deficit = (STATIONARY_HOLD_FORWARD_JOG_YPS - fwd)
+                    .clamp(0.0, STATIONARY_HOLD_FORWARD_JOG_YPS);
+                reward -= dribble_w2 * deficit;
+            }
             let carry_progress = ball_forward.max(player_forward).clamp(-4.0, 18.0);
             if carry_progress > 0.0 {
                 let role_multiplier = match player.role {
@@ -42957,9 +43084,36 @@ mod soccer_policy_actor_capacity_tests {
         TestEnvVarGuard { key, previous }
     }
 
+    fn clear_test_env_var(key: &'static str) -> TestEnvVarGuard {
+        let previous = std::env::var_os(key);
+        std::env::remove_var(key);
+        TestEnvVarGuard { key, previous }
+    }
+
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().expect("test poison soccer policy env lock")
+    }
+
+    #[test]
+    fn optional_reward_weight_env_stays_off_until_configured() {
+        let _lock = env_lock();
+        const KEY: &str = "DD_SOCCER_TEST_OPTIONAL_REWARD_WEIGHT";
+        let _guard = clear_test_env_var(KEY);
+
+        assert_eq!(optional_reward_weight_env(KEY, 0.0, 2.0), 0.0);
+
+        std::env::set_var(KEY, "0");
+        assert_eq!(
+            optional_reward_weight_env(KEY, 0.0, 2.0),
+            MIN_SOCCER_REWARD_WEIGHT
+        );
+
+        std::env::set_var(KEY, "nan");
+        assert_eq!(optional_reward_weight_env(KEY, 0.0, 2.0), 0.0);
+
+        std::env::set_var(KEY, "99");
+        assert_eq!(optional_reward_weight_env(KEY, 0.0, 2.0), 2.0);
     }
 
     #[test]
