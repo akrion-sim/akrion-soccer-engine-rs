@@ -111,8 +111,9 @@ fn shot_xg(origin: Vec2, width: f64, goal_y: f64) -> f64 {
     1.0 / (1.0 + (-z).exp())
 }
 
-/// xG proxy above which an episode is scored as having produced a genuine "high-quality chance".
-const HIGH_XG_THRESHOLD: f64 = 0.12;
+/// xG proxy above which an episode is scored as having produced a genuine "high-quality chance"
+/// (≈ working the ball to a ~14yd central shot or better from a 22-40yd start against a block).
+const HIGH_XG_THRESHOLD: f64 = 0.08;
 
 /// Mean (shots/ep, sot/ep, meanXG/ep, high-xG-episode fraction) over a set of episodes.
 fn summarize(ms: &[EpMetrics]) -> (f64, f64, f64, f64) {
