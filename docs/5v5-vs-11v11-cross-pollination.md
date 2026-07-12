@@ -55,3 +55,42 @@ So the learning architecture SHOULD converge: **hermetic PPO/actor-critic + fiel
 Converge both onto **hermetic net + field-vector learnable rewards**. Keep the 5-a-side's simplicity as
 the fast experimentation loop; keep the 11-a-side's formation-as-field-vector and league curriculum.
 Everything else in the 11-a-side stack (tabular/shield/MCTS damping) is the thing to shed, not share.
+
+## Capability parity contract
+
+The engines should have the same *football-learning capabilities*, but do not need identical
+solvers. This is the code-backed parity target after the semantic branch merge:
+
+| Capability | 5v5 implementation | 11v11 implementation | Required convergence |
+|---|---|---|---|
+| Hermetic policy ownership | Shared-weight PPO actor/critic; scripted opponent only | Neural-authoritative climb mode with Q policy retained only as a legal candidate shell | Evaluation and promotion must use net-owned actions; tabular scores cannot be the learned frontier |
+| Whole-field observation | Relational vector for all 10 players plus ball, goals, roles, and cues | Canonical vector for all 22 players plus ball in POMDP/neural inputs | Preserve team-relative mirroring and include every player and the ball |
+| POMDP decisions | Compact action masks, loose-ball belief, shot/pass/space cues | Named belief state, option control, assigned-position decisions | Port useful belief/history cues to 5v5 without importing the tabular Q table |
+| MPC execution | Field-vector lane opening, finishing, goalkeeper and path-aware spacing | Player MPC, QP/neural objectives, field-vector kinematics | Every MPC target/objective must remain a function of the current field vector |
+| Team shape | Learned possession-conditioned targets and spacing; no LP/IPM | Field-dependent LP/IPM formation nudging plus learned objectives | Same capability, intentionally different solver complexity |
+| Reward context | Pre/post `FieldRewardContext`, potential differences, tunable positive clamps | Exact typed events, 256-d contextual heads, counterfactual rollout value fitter | Prefer potential/value differences over hand-assigned per-event multipliers |
+| Opponent robustness | Scripted baseline | Analytic fixtures and frozen league champions | Add frozen champion curriculum to 5v5 |
+| Credit assignment | Immediate pre/post field deltas | Deferred pass/action credit and factual future embeddings | Add launch-tick deferred credit to 5v5 where action latency matters |
+| Promotion evidence | Goal difference, win rate, spacing and behavior gates | Paired Home/Away payoff, goal difference and Wilson bound | Same-seed paired fixtures; no side/seed confounding |
+
+## Non-negotiable reward hierarchy
+
+All configured or learned weights are projected onto this football ordering *after* loading tuner
+values:
+
+```text
+non-converting shot reward + 5 <= goal conversion reward
+goal conversion reward + 20 <= completed-match win reward
+```
+
+This is enforced in both runtimes, not merely documented:
+
+- 5v5 projects `REW_GOAL` and `REW_MATCH_WIN` after loading all bounded shot weights and emits the
+  terminal win/loss reward on the final rollout tick.
+- 11v11 bounds the effective on-target pool beneath the tuned goal reward and projects
+  `DD_SOCCER_MATCH_WIN_REWARD_POINTS` above the effective tuned goal reward.
+- Positive lower clamps remain in force, so tuning cannot silently delete a football outcome.
+
+The margins are deliberately absolute reward points. A learner may discover *where* a shot, pass,
+or movement matters from the field vector, but it may not learn that repeatedly missing is worth
+more than scoring or winning.
