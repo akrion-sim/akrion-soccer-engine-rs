@@ -28532,6 +28532,21 @@ fn dense_soccer_transition_reward(
                 }
             }
             reward -= hold_penalty;
+            // Dribble-at-a-jog incentive: −w2 · max(0, jog − forward_speed). A carrier that
+            // is dribbling but crawling (standing still / walking, below the jog gait) is
+            // charged in proportion to how far below a jog its forward drive is; at/above a
+            // jog it is zero. Together with the (speed-increasing) energy cost this makes a
+            // jog the learned optimum — not a standstill, not a needless sprint. Gated off by default.
+            let dribble_w2 = dribble_min_gait_penalty_scale();
+            if dribble_w2 > MIN_SOCCER_REWARD_WEIGHT {
+                let fwd = after
+                    .player_velocity(player.id)
+                    .map(|v| v.y * attack_dir)
+                    .unwrap_or(0.0);
+                let deficit = (STATIONARY_HOLD_FORWARD_JOG_YPS - fwd)
+                    .clamp(0.0, STATIONARY_HOLD_FORWARD_JOG_YPS);
+                reward -= dribble_w2 * deficit;
+            }
             let carry_progress = ball_forward.max(player_forward).clamp(-4.0, 18.0);
             if carry_progress > 0.0 {
                 let role_multiplier = match player.role {
