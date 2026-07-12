@@ -24391,6 +24391,34 @@ pub(crate) fn shot_shaping_reward_scale() -> f64 {
     *V.get_or_init(|| reward_weight_env("DD_SOCCER_SHOT_SHAPING_REWARD_SCALE", 1.0, 1e-4, 4.0))
 }
 
+/// Weight for the FINISHING ANCHOR: a high, hardcoded reward for putting a shot ON GOAL
+/// (on-frame). Paid in the sparse/terminal layer (OUTSIDE the +/-4 dense clamp), so it is a
+/// real terminal-scale pull toward finishing — the missing counterpart to the goal reward.
+/// Bonus = w * SHOT_ON_TARGET_REWARD_POINTS(80) * shot_on_frame_probability, on a shot action.
+/// (The engine's 80-pt "shot on target" was telemetry-only/inert; the live on-frame signal was
+/// ~1-3 pts vs a ~800 goal — no anchor.) Env `DD_SOCCER_ON_FRAME_SHOT_REWARD_SCALE`, clamped
+/// [0, 8], default **0.0** => byte-identical off.
+pub(crate) fn on_frame_shot_reward_scale() -> f64 {
+    if dynamic_reward_weights_enabled() {
+        return reward_weight_env(
+            "DD_SOCCER_ON_FRAME_SHOT_REWARD_SCALE",
+            0.0,
+            MIN_SOCCER_REWARD_WEIGHT,
+            8.0,
+        );
+    }
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        reward_weight_env(
+            "DD_SOCCER_ON_FRAME_SHOT_REWARD_SCALE",
+            0.0,
+            MIN_SOCCER_REWARD_WEIGHT,
+            8.0,
+        )
+    })
+}
+
 pub(crate) fn shot_commitment_reward_scale() -> f64 {
     #[cfg(test)]
     {
