@@ -1273,6 +1273,39 @@ pub fn evaluate(policy: &Policy, games: usize, rng: &mut Rng) -> Stats {
     s
 }
 
+/// Head-to-head between two learned policies: `cand` plays Team A, `opp` plays
+/// Team B (keepers held, as in `evaluate`). Returns (mean goal_diff for `cand`,
+/// `cand` winrate with draws counting 0.5). This is the champion-ladder gate:
+/// the challenger advances only when it beats the frozen champion by a margin.
+pub fn evaluate_vs_policy(cand: &Policy, opp: &Policy, games: usize, rng: &mut Rng) -> (f32, f32) {
+    let mut gd = 0.0f32;
+    let mut wr = 0.0f32;
+    for _ in 0..games {
+        let mut w = World::new();
+        if rng.f01() < 0.5 {
+            w.kickoff(Team::B);
+        }
+        for _ in 0..STEPS {
+            let mut act_a = [A_STAY; N];
+            let mut act_b = [A_STAY; N];
+            for i in 1..N {
+                act_a[i] = cand.act_greedy_world(&w, Team::A, i);
+                act_b[i] = opp.act_greedy_world(&w, Team::B, i);
+            }
+            w.step(&act_a, &act_b, rng);
+        }
+        let d = w.goals_a as f32 - w.goals_b as f32;
+        gd += d;
+        if d > 0.0 {
+            wr += 1.0;
+        } else if d == 0.0 {
+            wr += 0.5;
+        }
+    }
+    let g = games.max(1) as f32;
+    (gd / g, wr / g)
+}
+
 /// Baseline sanity check: scripted-vs-scripted goal difference (should be ~0).
 pub fn evaluate_scripted_vs_scripted(games: usize, rng: &mut Rng) -> (f32, f32, f32) {
     let mut diff = 0.0f32;
