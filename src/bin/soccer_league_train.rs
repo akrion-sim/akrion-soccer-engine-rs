@@ -1290,6 +1290,13 @@ fn main() {
     // DD_SOCCER_NEURAL_AUTHORITATIVE_LAMBDA (more actor influence) + SOCCER_POLICY_ENTROPY_COEFF
     // (keep exploring) so the actor can actually leave the analytic mode. Off ⇒ current behaviour.
     runner_config.base.neural_blend.actor_critic = env_bool("SOCCER_NEURAL_ACTOR_CRITIC", true);
+    // The self-play ladder installs a neural net on BOTH teams, but the actor's `policy_head` is a
+    // single shared field — the away champion's actor would overwrite (and then drive) both sides.
+    // Force critic-only ranking in ladder mode so each side selects with its OWN per-team critic
+    // (the exact mode play_checkpoint_validation + the default tournament config already use).
+    if self_play_ladder {
+        runner_config.base.neural_blend.actor_critic = false;
+    }
     runner_config.base.neural_blend.mode = env_neural_blend_mode(
         "SOCCER_NEURAL_BLEND_MODE",
         SoccerNeuralBlendMode::Authoritative,
