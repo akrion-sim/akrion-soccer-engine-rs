@@ -254,6 +254,17 @@ fn main() {
         "home learner must exist after install"
     );
 
+    // Control arm (A/B baseline): DRILL_FREEZE re-installs the Home net FROZEN — it still SERVES
+    // (identical bucket-selection machinery) but takes no gradient steps. Run with the same seed
+    // as a learning run and its per-block rate stays flat, isolating any learning-run uptrend as
+    // the net actually learning to finish (rather than scenario-sampling noise).
+    let frozen = env_flag("DRILL_FREEZE");
+    if frozen {
+        let snap = sim.neural_network_snapshot_for(Team::Home);
+        sim.set_team_neural_brain(Team::Home, snap, true)
+            .expect("freeze home net");
+    }
+
     let field_length = sim.config.field_length_yards;
     let base_seed = seed as u64;
 
