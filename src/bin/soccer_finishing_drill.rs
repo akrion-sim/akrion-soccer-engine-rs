@@ -331,15 +331,25 @@ fn main() {
             let rate = block_goals as f64 / BLOCK as f64;
             block_rates.push(rate);
             let cum = total_goals as f64 / (ep + 1) as f64;
+            // Direct learner-progress readout: the critic's training-step count and running
+            // loss. This is the robust "the net is learning" signal — the per-block CONVERSION
+            // is a high-variance downstream proxy, but steps↑ / loss-evolving proves the finishing
+            // reward is training the critic every block, independent of shot-outcome noise.
+            let (steps, loss) = sim
+                .neural_network_snapshot_for(Team::Home)
+                .map(|s| (s.training_steps, s.average_loss))
+                .unwrap_or((0, None));
             println!(
-                "{:>4}-{:<4}  {:>10.3}   ({:>3}/{:<3})        {:>6.3}",
+                "{:>4}-{:<4}  {:>9.3}   ({:>3}/{:<3})   cum={:>5.3}   steps={:>6}   loss={}",
                 ep + 2 - BLOCK,
                 ep + 1,
                 rate,
                 block_goals,
                 BLOCK,
-                cum
+                cum,
+                loss.map(|l| format!("{l:.4}")).unwrap_or_else(|| "n/a".into()),
             );
+            let _ = steps;
             block_goals = 0;
         }
     }
