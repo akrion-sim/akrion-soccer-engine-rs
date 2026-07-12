@@ -28383,7 +28383,7 @@ fn dense_soccer_transition_reward(
             reward += 0.09;
         } else if after_possession == Some(player.team.other()) {
             let reward_cfg = &tunables().reward;
-            reward -= intentional_long_ball_loss_penalty(
+            let giveaway = intentional_long_ball_loss_penalty(
                 action,
                 own_half_holder,
                 ball_forward,
@@ -28395,6 +28395,15 @@ fn dense_soccer_transition_reward(
             } else {
                 reward_cfg.giveaway_to_opponent_opp_half_penalty
             });
+            // Same field-vector weighting as intercepted passes: conceding possession to the
+            // opponent hurts most where it hands them a high-threat position (our own third).
+            reward -= giveaway
+                * turnover_position_multiplier(
+                    player.team,
+                    before.ball.position,
+                    before.field_width,
+                    before.field_length,
+                );
         } else {
             let reward_cfg = &tunables().reward;
             reward -= intentional_long_ball_loss_penalty(
