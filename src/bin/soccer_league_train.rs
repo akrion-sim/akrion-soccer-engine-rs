@@ -37,6 +37,9 @@ use soccer_engine::des::general::tournament::{
     EngineMatchRunner, EngineMatchRunnerConfig, TeamBrain, TournamentMatchContext,
     TournamentMatchRunner, TournamentStage,
 };
+
+const MIN_REWARD_WEIGHT: f64 = 0.0001;
+
 fn env_str(k: &str, d: &str) -> String {
     std::env::var(k).unwrap_or_else(|_| d.to_string())
 }
@@ -62,14 +65,20 @@ fn env_usize_list(k: &str) -> Vec<usize> {
     values
 }
 fn env_f64(k: &str, d: f64) -> f64 {
-    std::env::var(k)
+    let value = std::env::var(k)
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(d)
+        .unwrap_or(d);
+    if value.is_finite() {
+        value
+    } else {
+        d
+    }
 }
 fn env_f64_any(keys: &[&str], default: f64) -> f64 {
     keys.iter()
         .find_map(|key| std::env::var(key).ok().and_then(|v| v.parse().ok()))
+        .filter(|value: &f64| value.is_finite())
         .unwrap_or(default)
 }
 fn env_bool(k: &str, d: bool) -> bool {
@@ -98,6 +107,19 @@ fn env_default_usize(k: &str, d: usize) -> usize {
 fn env_default_f64(k: &str, d: f64) -> f64 {
     let value = env_f64(k, d);
     if std::env::var(k).is_err() {
+        std::env::set_var(k, value.to_string());
+    }
+    value
+}
+
+fn env_reward_f64(k: &str, d: f64, lo: f64, hi: f64) -> f64 {
+    let lo = lo.max(MIN_REWARD_WEIGHT);
+    let hi = hi.max(lo);
+    let raw = env_f64(k, d);
+    let value = if raw.is_finite() { raw } else { d };
+    let value = if value.is_finite() { value } else { lo };
+    let value = value.clamp(lo, hi);
+    if std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok()) != Some(value) {
         std::env::set_var(k, value.to_string());
     }
     value
@@ -1026,8 +1048,12 @@ fn main() {
     env_default_f64("DD_SOCCER_FORWARD_RELEASE_MIN_COMPLETION", 0.35);
     env_default_bool("DD_SOCCER_ENABLE_FORWARD_SELECT_LOGIT", true);
     let forward_select_logit_weight = env_default_f64("DD_SOCCER_FORWARD_SELECT_LOGIT_WEIGHT", 2.0);
-    let finishing_select_bonus_weight =
-        env_default_f64("SOCCER_NEURAL_FINISHING_SELECT_BONUS_WEIGHT", 0.70);
+    let finishing_select_bonus_weight = env_reward_f64(
+        "SOCCER_NEURAL_FINISHING_SELECT_BONUS_WEIGHT",
+        0.45,
+        0.0,
+        2.5,
+    );
     let finishing_selection_floor =
         env_default_f64("SOCCER_NEURAL_FINISHING_SELECTION_FLOOR", 0.30);
     let finishing_selection_max_regression = env_default_f64(
@@ -1062,7 +1088,7 @@ fn main() {
         env_default_f64("SOCCER_PLANNER_TEACHER_ADVANTAGE_FLOOR", 0.045);
     let planner_teacher_advantage_max =
         env_default_f64("SOCCER_PLANNER_TEACHER_ADVANTAGE_MAX", 0.30);
-    let planner_teacher_weight = env_default_f64("SOCCER_PLANNER_TEACHER_WEIGHT", 1.8);
+    let planner_teacher_weight = env_reward_f64("SOCCER_PLANNER_TEACHER_WEIGHT", 0.55, 0.0, 4.0);
     let planner_teacher_min_score_share =
         env_default_f64("SOCCER_PLANNER_TEACHER_MIN_SCORE_SHARE", 0.006);
     let planner_teacher_min_shot_quality =
@@ -1079,14 +1105,49 @@ fn main() {
         env_default_f64("SOCCER_PLANNER_TEACHER_SAME_PASS_MIN_MARGIN_SHARE", 0.015);
     env_default_usize("SOCCER_NEURAL_MCTS_PASS_TARGET_CANDIDATES", 6);
     env_default_bool("DD_SOCCER_ENABLE_OVERLOAD_WEIGHTED_PROGRESSION", true);
-    let forward_pass_reward_scale = env_default_f64("DD_SOCCER_FORWARD_PASS_REWARD_SCALE", 6.25);
-    let pass_chain_reward_scale = env_default_f64("DD_SOCCER_PASS_CHAIN_REWARD_SCALE", 4.25);
-    let pass_turnover_penalty_scale = env_default_f64("DD_SOCCER_PASS_TURNOVER_PENALTY_SCALE", 5.0);
-    let quick_forward_release_reward_scale =
-        env_default_f64("DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE", 1.25);
-    let shot_shaping_reward_scale = env_default_f64("DD_SOCCER_SHOT_SHAPING_REWARD_SCALE", 0.85);
+    let goal_reward_scale = env_reward_f64("DD_SOCCER_GOAL_REWARD_SCALE", 1.2, 0.5, 4.0);
+    let forward_pass_reward_scale =
+        env_reward_f64("DD_SOCCER_FORWARD_PASS_REWARD_SCALE", 8.2, 0.0, 12.0);
+    let pass_chain_reward_scale =
+        env_reward_f64("DD_SOCCER_PASS_CHAIN_REWARD_SCALE", 6.6, 0.0, 10.0);
+    let pass_turnover_penalty_scale =
+        env_reward_f64("DD_SOCCER_PASS_TURNOVER_PENALTY_SCALE", 2.8, 1.0, 12.0);
+    let quick_forward_release_reward_scale = env_reward_f64(
+        "DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE",
+        0.75,
+        0.0,
+        2.0,
+    );
+    let shot_shaping_reward_scale =
+        env_reward_f64("DD_SOCCER_SHOT_SHAPING_REWARD_SCALE", 0.42, 0.0, 1.0);
     let shot_commitment_reward_scale =
-        env_default_f64("DD_SOCCER_SHOT_COMMITMENT_REWARD_SCALE", 0.0);
+        env_reward_f64("DD_SOCCER_SHOT_COMMITMENT_REWARD_SCALE", 0.18, 0.0, 2.0);
+    let dribble_beat_reward_scale =
+        env_reward_f64("DD_SOCCER_DRIBBLE_BEAT_REWARD_SCALE", 0.9, 0.0, 8.0);
+    let learned_epv_reward_scale =
+        env_reward_f64("DD_SOCCER_LEARNED_EPV_REWARD_SCALE", 0.30, 0.0, 4.0);
+    let offball_support_reward_scale =
+        env_reward_f64("SOCCER_OFFBALL_SUPPORT_REWARD_SCALE", 3.0, 0.5, 6.0);
+    let carry_reward_scale = env_reward_f64("DD_SOCCER_CARRY_REWARD_SCALE", 1.1, 0.5, 6.0);
+    let recovery_reward_scale = env_reward_f64("DD_SOCCER_RECOVERY_REWARD_SCALE", 1.0, 0.5, 6.0);
+    let overload_progression_reward_per_yard = env_reward_f64(
+        "DD_SOCCER_OVERLOAD_PROGRESSION_REWARD_PER_YARD",
+        0.05,
+        0.0,
+        0.12,
+    );
+    let analytic_difference_negative_dense_floor = env_reward_f64(
+        "SOCCER_ANALYTIC_DIFFERENCE_REWARD_NEGATIVE_DENSE_FLOOR",
+        0.10,
+        0.0,
+        0.6,
+    );
+    let analytic_difference_negative_dense_scale = env_reward_f64(
+        "SOCCER_ANALYTIC_DIFFERENCE_REWARD_NEGATIVE_DENSE_SCALE",
+        1.0,
+        0.0,
+        3.0,
+    );
     let chance_quality_reward = env_default_bool("DD_SOCCER_ENABLE_CHANCE_QUALITY_REWARD", true);
     let chance_quality_composite =
         env_default_bool("DD_SOCCER_ENABLE_CHANCE_QUALITY_COMPOSITE", true);
@@ -1142,10 +1203,22 @@ fn main() {
     // team-averaged reward at this weight — the learnable rest-defense / coordination lever.
     // League training previously left this at the config default; expose it for A/Bs.
     runner_config.base.neural_learning.mappo_team_reward_share =
-        env_f64("SOCCER_MAPPO_TEAM_REWARD_SHARE", 0.50);
+        env_reward_f64("SOCCER_MAPPO_TEAM_REWARD_SHARE", 0.08, 0.0, 1.0);
+    runner_config.base.neural_learning.marl_team_reward_weight =
+        env_reward_f64("SOCCER_MARL_TEAM_REWARD_WEIGHT", 0.08, 0.0, 1.5);
+    runner_config
+        .base
+        .neural_learning
+        .marl_intermediate_reward_weight =
+        env_reward_f64("SOCCER_MARL_INTERMEDIATE_REWARD_WEIGHT", 2.0, 0.2, 3.0);
     eprintln!(
-        "[league] mappo_team_reward_share={}",
-        runner_config.base.neural_learning.mappo_team_reward_share
+        "[league] mappo_team_reward_share={} marl_team_reward_weight={} marl_intermediate_reward_weight={}",
+        runner_config.base.neural_learning.mappo_team_reward_share,
+        runner_config.base.neural_learning.marl_team_reward_weight,
+        runner_config
+            .base
+            .neural_learning
+            .marl_intermediate_reward_weight
     );
     // Un-collapse the value head on fresh nets: honour SOCCER_NEURAL_TARGET_POPART here (the
     // league bin otherwise leaves target-PopArt at the config default = off, unlike the
@@ -1341,9 +1414,12 @@ fn main() {
         step_archive_buckets,
     );
     println!(
-        "league_reward_profile forward_pass={forward_pass_reward_scale:.2} pass_chain={pass_chain_reward_scale:.2} \
+        "league_reward_profile goal={goal_reward_scale:.2} forward_pass={forward_pass_reward_scale:.2} pass_chain={pass_chain_reward_scale:.2} \
          pass_turnover_penalty={pass_turnover_penalty_scale:.2} quick_forward_release={quick_forward_release_reward_scale:.2} \
-         shot_shaping={shot_shaping_reward_scale:.2} shot_commitment={shot_commitment_reward_scale:.2}"
+         shot_shaping={shot_shaping_reward_scale:.2} shot_commitment={shot_commitment_reward_scale:.4} dribble_beat={dribble_beat_reward_scale:.2} learned_epv={learned_epv_reward_scale:.2} \
+         offball_support={offball_support_reward_scale:.2} carry={carry_reward_scale:.2} recovery={recovery_reward_scale:.2} \
+         overload_per_yard={overload_progression_reward_per_yard:.4} analytic_dense_floor={analytic_difference_negative_dense_floor:.3} \
+         analytic_dense_scale={analytic_difference_negative_dense_scale:.2}"
     );
 
     loop {
@@ -2117,6 +2193,26 @@ mod tests {
         assert_eq!(
             env_usize_list("SOCCER_LEAGUE_STEP_ARCHIVE_BUCKETS"),
             vec![25000, 50000, 100000]
+        );
+    }
+
+    #[test]
+    fn float_env_helpers_reject_non_finite_values() {
+        let _lock = env_lock().lock().unwrap();
+        let _nan = EnvVarGuard::set("SOCCER_LEAGUE_TEST_FLOAT_NAN", "NaN");
+        let _inf = EnvVarGuard::set("SOCCER_LEAGUE_TEST_FLOAT_INF", "inf");
+
+        assert_eq!(env_f64("SOCCER_LEAGUE_TEST_FLOAT_NAN", 1.25), 1.25);
+        assert_eq!(env_f64("SOCCER_LEAGUE_TEST_FLOAT_INF", 2.5), 2.5);
+        assert_eq!(
+            env_f64_any(
+                &[
+                    "SOCCER_LEAGUE_TEST_FLOAT_NAN",
+                    "SOCCER_LEAGUE_TEST_FLOAT_INF"
+                ],
+                3.75,
+            ),
+            3.75
         );
     }
 

@@ -1197,6 +1197,7 @@ const SHOT_CLOSE_REWARD_PER_YARD: f64 = 0.9;
 const SHOT_FAR_PENALTY_PER_YARD: f64 = 1.6;
 const SHOT_DISTANCE_REWARD_MAX_POINTS: f64 = 14.0;
 const SHOT_COMMITMENT_REWARD_SCALE: f64 = 0.0;
+const MIN_SOCCER_REWARD_WEIGHT: f64 = 0.0001;
 // FLANK / WING usage reward (#8): credit the on-ball player for working the ball in a WIDE channel
 // (toward a touchline), scaled UP when the team is in its OWN half — get it out of the congested
 // central area in front of our own goal and down the wings. Wideness 0 = central spine, 1 =
@@ -2141,7 +2142,7 @@ const TEAM_ADVANCE_SUPPORT_RUN_REWARD: f64 = 0.45;
 const QUICK_RELEASE_MAX_HOLD_SECONDS: f64 = 1.2;
 const QUICK_RELEASE_FORWARD_REFERENCE_YARDS: f64 = 12.0;
 const QUICK_RELEASE_FORWARD_PASS_BONUS_POINTS: f64 = 5.0;
-// Codex r19 opportunity-conditioned quick-forward-release carrot (gated, default-off). Targets the
+// Codex r19 opportunity-conditioned quick-forward-release carrot. Targets the
 // pass-CHOICE leak: pay a bounded bonus only when a real forward opportunity existed and the actor
 // released a quickly-completed forward ball, so a timid policy is pulled toward choosing the pass.
 const QUICK_FORWARD_RELEASE_REWARD_BASE: f64 = 4.0;
@@ -4191,64 +4192,36 @@ pub(crate) const OUTSIDE_MID_TAKEON_COVER_CLEAR_YARDS: f64 = 10.0;
 
 /// Amplify the dense OFF-BALL "make a supporting run / move to space" rewards so teammates learn
 /// to get open — creating safe passing options and cutting the hoof-and-give-away turnovers.
-/// Env `SOCCER_OFFBALL_SUPPORT_REWARD_SCALE` (default 1.0 = byte-identical), clamped [1, 10].
+/// Env `SOCCER_OFFBALL_SUPPORT_REWARD_SCALE` (default 1.0), clamped [0.5, 10].
 pub(crate) fn offball_support_reward_scale() -> f64 {
     use std::sync::OnceLock;
     static V: OnceLock<f64> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("SOCCER_OFFBALL_SUPPORT_REWARD_SCALE")
-            .ok()
-            .and_then(|raw| raw.trim().parse::<f64>().ok())
-            .filter(|v| v.is_finite())
-            .map(|v| v.clamp(1.0, 10.0))
-            .unwrap_or(1.0)
-    })
+    *V.get_or_init(|| reward_weight_env("SOCCER_OFFBALL_SUPPORT_REWARD_SCALE", 1.0, 0.5, 10.0))
 }
 
 /// Amplify DRIBBLING / progressive ball-CARRYING rewards (beat defenders, drive into space).
-/// Env `DD_SOCCER_CARRY_REWARD_SCALE` (default 1.0), clamped [1, 10].
+/// Env `DD_SOCCER_CARRY_REWARD_SCALE` (default 1.0), clamped [0.5, 10].
 pub(crate) fn carry_reward_scale() -> f64 {
     use std::sync::OnceLock;
     static V: OnceLock<f64> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("DD_SOCCER_CARRY_REWARD_SCALE")
-            .ok()
-            .and_then(|raw| raw.trim().parse::<f64>().ok())
-            .filter(|v| v.is_finite())
-            .map(|v| v.clamp(1.0, 10.0))
-            .unwrap_or(1.0)
-    })
+    *V.get_or_init(|| reward_weight_env("DD_SOCCER_CARRY_REWARD_SCALE", 1.0, 0.5, 10.0))
 }
 
 /// Amplify DEFENSIVE ball-RECOVERY / press rewards (win the ball back after a loss).
-/// Env `DD_SOCCER_RECOVERY_REWARD_SCALE` (default 1.0), clamped [1, 10].
+/// Env `DD_SOCCER_RECOVERY_REWARD_SCALE` (default 1.0), clamped [0.5, 10].
 pub(crate) fn ball_recovery_reward_scale() -> f64 {
     use std::sync::OnceLock;
     static V: OnceLock<f64> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("DD_SOCCER_RECOVERY_REWARD_SCALE")
-            .ok()
-            .and_then(|raw| raw.trim().parse::<f64>().ok())
-            .filter(|v| v.is_finite())
-            .map(|v| v.clamp(1.0, 10.0))
-            .unwrap_or(1.0)
-    })
+    *V.get_or_init(|| reward_weight_env("DD_SOCCER_RECOVERY_REWARD_SCALE", 1.0, 0.5, 10.0))
 }
 /// Amplify the terminal GOAL / finishing reward family so sparse scoring can DOMINATE the dense
 /// possession/completion shaping (root cause of the possession-safe collapse: goals ~1/game at 160pts
-/// get drowned by per-tick shaping). Env `DD_SOCCER_GOAL_REWARD_SCALE` (default 1.0), clamped [1, 16].
+/// get drowned by per-tick shaping). Env `DD_SOCCER_GOAL_REWARD_SCALE` (default 1.0), clamped [0.5, 16].
 /// Respects the learn-via-rewards method — it reweights the signal, it does not hard-force finishing.
 pub(crate) fn goal_reward_scale() -> f64 {
     use std::sync::OnceLock;
     static V: OnceLock<f64> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("DD_SOCCER_GOAL_REWARD_SCALE")
-            .ok()
-            .and_then(|raw| raw.trim().parse::<f64>().ok())
-            .filter(|v| v.is_finite())
-            .map(|v| v.clamp(1.0, 16.0))
-            .unwrap_or(1.0)
-    })
+    *V.get_or_init(|| reward_weight_env("DD_SOCCER_GOAL_REWARD_SCALE", 1.0, 0.5, 16.0))
 }
 const OUTSIDE_MID_TAKEON_ISOLATION_REWARD: f64 = 0.14;
 // Defensive recovery: a contestable ball within this many yards of our back line
@@ -19110,7 +19083,7 @@ pub struct SoccerNeuralLearningConfig {
     /// player begins optimising the shared team return (the centralized-critic
     /// advantage in `neural_policy_training_samples` then credits a teammate's
     /// later goal back to the off-ball work that set it up). `1.0` is a fully
-    /// shared team reward (classic cooperative MARL). Clamped to `[0, 1]`.
+    /// shared team reward (classic cooperative MARL). Clamped to a tiny positive floor through `1`.
     ///
     /// Complements the `marl_*` fields below: this share folds the team mean into
     /// the per-transition reward at capture time, while the `marl_*` weights shape
@@ -19201,19 +19174,21 @@ impl SoccerNeuralLearningConfig {
         }
     }
 
-    /// MAPPO team-reward share, clamped to `[0, 1]`; a non-finite value falls
-    /// back to the individual-reward objective (`0.0`).
+    /// MAPPO team-reward share, clamped to `[MIN_SOCCER_REWARD_WEIGHT, 1]`; a
+    /// non-finite value falls back to the tiny floor so the team component stays learnable.
     fn sanitized_mappo_team_reward_share(&self) -> f64 {
         if self.mappo_team_reward_share.is_finite() {
-            self.mappo_team_reward_share.clamp(0.0, 1.0)
+            self.mappo_team_reward_share
+                .clamp(MIN_SOCCER_REWARD_WEIGHT, 1.0)
         } else {
-            0.0
+            MIN_SOCCER_REWARD_WEIGHT
         }
     }
 
     fn sanitized_marl_team_reward_weight(&self) -> f64 {
         if self.marl_team_reward_weight.is_finite() {
-            self.marl_team_reward_weight.clamp(0.0, 1.0)
+            self.marl_team_reward_weight
+                .clamp(MIN_SOCCER_REWARD_WEIGHT, 1.5)
         } else {
             DEFAULT_SOCCER_MARL_TEAM_REWARD_WEIGHT
         }
@@ -19221,7 +19196,8 @@ impl SoccerNeuralLearningConfig {
 
     fn sanitized_marl_intermediate_reward_weight(&self) -> f64 {
         if self.marl_intermediate_reward_weight.is_finite() {
-            self.marl_intermediate_reward_weight.clamp(0.0, 2.0)
+            self.marl_intermediate_reward_weight
+                .clamp(MIN_SOCCER_REWARD_WEIGHT, 3.0)
         } else {
             DEFAULT_SOCCER_MARL_INTERMEDIATE_REWARD_WEIGHT
         }
@@ -23018,8 +22994,8 @@ pub(crate) fn overload_forward_pass_progression_reward_per_yard() -> f64 {
             .ok()
             .and_then(|raw| raw.trim().parse::<f64>().ok())
             .filter(|v| v.is_finite())
-            .map(|v| v.clamp(0.0, 0.5))
             .unwrap_or(OVERLOAD_FORWARD_PASS_PROGRESSION_REWARD_PER_YARD_DEFAULT)
+            .clamp(MIN_SOCCER_REWARD_WEIGHT, 0.5)
     })
 }
 
@@ -24111,12 +24087,15 @@ fn dynamic_reward_weights_enabled() -> bool {
 }
 
 fn reward_weight_env(name: &str, default: f64, min: f64, max: f64) -> f64 {
-    std::env::var(name)
+    let min = min.max(MIN_SOCCER_REWARD_WEIGHT);
+    let max = max.max(min);
+    let value = std::env::var(name)
         .ok()
         .and_then(|raw| raw.trim().parse::<f64>().ok())
         .filter(|v| v.is_finite())
-        .map(|v| v.clamp(min, max))
-        .unwrap_or(default)
+        .unwrap_or(default);
+    let value = if value.is_finite() { value } else { min };
+    value.clamp(min, max)
 }
 
 pub(crate) fn forward_pass_reward_scale() -> f64 {
@@ -24184,6 +24163,7 @@ pub(crate) fn shot_commitment_reward_scale() -> f64 {
             .filter(|v| v.is_finite())
             .map(|v| v.clamp(0.0, 10.0))
             .unwrap_or(SHOT_COMMITMENT_REWARD_SCALE)
+            .clamp(MIN_SOCCER_REWARD_WEIGHT, 10.0)
     }
     #[cfg(not(test))]
     {
@@ -24208,6 +24188,22 @@ pub(crate) fn shot_commitment_reward_scale() -> f64 {
     }
 }
 
+pub(crate) fn dribble_beat_reward_scale() -> f64 {
+    #[cfg(test)]
+    {
+        reward_weight_env("DD_SOCCER_DRIBBLE_BEAT_REWARD_SCALE", 1.0, 0.0, 8.0)
+    }
+    #[cfg(not(test))]
+    {
+        if dynamic_reward_weights_enabled() {
+            return reward_weight_env("DD_SOCCER_DRIBBLE_BEAT_REWARD_SCALE", 1.0, 0.0, 8.0);
+        }
+        use std::sync::OnceLock;
+        static V: OnceLock<f64> = OnceLock::new();
+        *V.get_or_init(|| reward_weight_env("DD_SOCCER_DRIBBLE_BEAT_REWARD_SCALE", 1.0, 0.0, 8.0))
+    }
+}
+
 /// Scale on the learned-EPV conversion bonus for completed passes (DD_SOCCER_LEARNED_EPV_REWARD_SCALE).
 /// Default 20: the fitted Φ_epv spans ~[-0.15, 0.20], so a strong danger-creating pass (ΔΦ ≈ 0.3) earns
 /// ~6 — comparable to the base forward-pass reward — while a square/backward ball earns ~0 or negative.
@@ -24220,7 +24216,7 @@ pub(crate) fn learned_epv_reward_scale() -> f64 {
             .and_then(|raw| raw.trim().parse::<f64>().ok())
             .filter(|v| v.is_finite())
             .unwrap_or(20.0)
-            .clamp(0.0, 200.0)
+            .clamp(MIN_SOCCER_REWARD_WEIGHT, 200.0)
     })
 }
 
@@ -24729,8 +24725,8 @@ fn quick_release_forward_pass_reward(
 }
 
 /// Scale for the opportunity-conditioned quick-forward-release carrot (Codex r19). Env
-/// `DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE` (clamped 0..2), default **0.0** ⇒ byte-identical
-/// (the whole term is a no-op unless explicitly enabled). Pre-registered A/B arms: 0.75, 1.0, 1.5.
+/// `DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE` is clamped to a tiny positive floor through 2.0.
+/// Pre-registered A/B arms: 0.75, 1.0, 1.5.
 pub(crate) fn quick_forward_release_reward_scale() -> f64 {
     if dynamic_reward_weights_enabled() {
         return reward_weight_env(
@@ -27405,7 +27401,7 @@ fn soccer_analytic_difference_reward_negative_dense_floor() -> f64 {
             .ok()
             .and_then(|raw| raw.trim().parse::<f64>().ok())
             .unwrap_or(SOCCER_ANALYTIC_DIFFERENCE_REWARD_NEGATIVE_DENSE_FLOOR)
-            .clamp(0.0, 1.0)
+            .clamp(MIN_SOCCER_REWARD_WEIGHT, 1.0)
     })
 }
 
@@ -27417,7 +27413,7 @@ fn soccer_analytic_difference_reward_negative_dense_scale() -> f64 {
             .ok()
             .and_then(|raw| raw.trim().parse::<f64>().ok())
             .unwrap_or(SOCCER_ANALYTIC_DIFFERENCE_REWARD_NEGATIVE_DENSE_SCALE)
-            .clamp(1e-6, 25.0)
+            .clamp(MIN_SOCCER_REWARD_WEIGHT, 25.0)
     })
 }
 

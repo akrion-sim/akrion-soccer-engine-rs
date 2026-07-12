@@ -5248,6 +5248,9 @@ fn field_vector_shot_reward_prefers_central_angles_at_same_distance() {
     let idx = sim.players.iter().position(|p| p.id == shooter).unwrap();
     let goal_x = sim.config.field_width_yards * 0.5;
     let goal_y = Team::Home.goal_y(sim.config.field_length_yards);
+    let keeper = sim.goalkeeper_for(Team::Away).unwrap();
+    park_players_except(&mut sim, &[shooter, keeper]);
+    sim.players[keeper].position = Vec2::new(goal_x, goal_y);
 
     sim.players[idx].position = Vec2::new(goal_x, goal_y - 12.0);
     let central = sim.shot_reward_distance_scale(Team::Home, shooter);
@@ -5267,6 +5270,53 @@ fn field_vector_shot_reward_prefers_central_angles_at_same_distance() {
     assert!(
         wide < central * 0.75,
         "field-vector angle discount should be material: central={central} wide={wide}"
+    );
+}
+
+#[test]
+fn field_vector_shot_reward_uses_defenders_and_keeper_not_only_location() {
+    let _gate = TestEnvVarGuard::set("DD_SOCCER_ENABLE_FIELD_VECTOR_SHOT_REWARD", "1");
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let shooter = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Home && p.role == PlayerRole::Forward)
+        .map(|p| p.id)
+        .unwrap();
+    let blocker = sim
+        .players
+        .iter()
+        .find(|p| p.team == Team::Away && p.role != PlayerRole::Goalkeeper)
+        .map(|p| p.id)
+        .unwrap();
+    let keeper = sim.goalkeeper_for(Team::Away).unwrap();
+    park_players_except(&mut sim, &[shooter, blocker, keeper]);
+
+    let goal_x = sim.config.field_width_yards * 0.5;
+    let goal_y = Team::Home.goal_y(sim.config.field_length_yards);
+    sim.players[shooter].position = Vec2::new(goal_x, goal_y - 12.0);
+    sim.players[keeper].position = Vec2::new(goal_x, goal_y);
+    sim.players[blocker].position = Vec2::new(goal_x + 20.0, goal_y - 6.0);
+    let clean = sim.shot_reward_distance_scale(Team::Home, shooter);
+
+    sim.players[blocker].position = Vec2::new(goal_x, goal_y - 6.0);
+    let blocked = sim.shot_reward_distance_scale(Team::Home, shooter);
+
+    sim.players[blocker].position = Vec2::new(goal_x + 20.0, goal_y - 6.0);
+    sim.players[keeper].position = Vec2::new(goal_x, goal_y - 6.0);
+    let smothered = sim.shot_reward_distance_scale(Team::Home, shooter);
+
+    assert!(
+        clean > 0.95,
+        "clean close central chance should keep almost full xG reward, got {clean}"
+    );
+    assert!(
+        blocked < clean * 0.55,
+        "outfield blocker in the shot lane should sharply discount xG reward: clean={clean} blocked={blocked}"
+    );
+    assert!(
+        smothered < clean * 0.80,
+        "keeper advanced into the shot path should discount xG reward: clean={clean} smothered={smothered}"
     );
 }
 
@@ -8945,6 +8995,35 @@ fn action_option_tick_probabilities_are_event_gates_not_normalized_shares() {
     for option in options {
         assert!((0.0..=1.0).contains(&option.tick_probability));
     }
+}
+
+#[test]
+fn reward_weight_env_clamps_to_positive_finite_bounds() {
+    let _zero = TestEnvVarGuard::set("SOCCER_TEST_REWARD_ZERO", "0");
+    let _negative = TestEnvVarGuard::set("SOCCER_TEST_REWARD_NEGATIVE", "-3");
+    let _large = TestEnvVarGuard::set("SOCCER_TEST_REWARD_LARGE", "99");
+    let _nan = TestEnvVarGuard::set("SOCCER_TEST_REWARD_NAN", "NaN");
+
+    assert_eq!(
+        reward_weight_env("SOCCER_TEST_REWARD_ZERO", 1.0, 0.0, 2.0),
+        MIN_SOCCER_REWARD_WEIGHT
+    );
+    assert_eq!(
+        reward_weight_env("SOCCER_TEST_REWARD_NEGATIVE", 1.0, 0.0, 2.0),
+        MIN_SOCCER_REWARD_WEIGHT
+    );
+    assert_eq!(
+        reward_weight_env("SOCCER_TEST_REWARD_LARGE", 1.0, 0.0, 2.0),
+        2.0
+    );
+    assert_eq!(
+        reward_weight_env("SOCCER_TEST_REWARD_NAN", 0.0, 0.0, 2.0),
+        MIN_SOCCER_REWARD_WEIGHT
+    );
+    assert_eq!(
+        reward_weight_env("SOCCER_TEST_REWARD_MISSING", f64::INFINITY, 0.0, 2.0),
+        MIN_SOCCER_REWARD_WEIGHT
+    );
 }
 
 fn analytic_difference_reward_alignment_env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -69329,6 +69408,7 @@ fn defensive_beat_tracker_requires_same_dribbler_to_keep_ball() {
 
 #[test]
 fn dribble_beat_event_uses_move_reward_and_rejects_invalid_contests() {
+    let _env = dribble_beat_reward_scale_env_lock();
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let attacker = 9;
     let defender = 13;
@@ -69368,7 +69448,69 @@ fn dribble_beat_event_uses_move_reward_and_rejects_invalid_contests() {
 }
 
 #[test]
+fn dribble_beat_reward_scale_applies_to_attacker_and_defender_rewards() {
+    let _env = dribble_beat_reward_scale_env_lock();
+    let _scale = TestEnvVarGuard::set("DD_SOCCER_DRIBBLE_BEAT_REWARD_SCALE", "2.0");
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let attacker = 9;
+    let defender = 13;
+    sim.players[defender].position = Vec2::new(40.0, 60.0);
+    sim.players[defender].position_history = VecDeque::from([sim.players[defender].position]);
+    sim.players[attacker].position = Vec2::new(40.5, 59.0);
+    sim.players[attacker].position_history = VecDeque::from([sim.players[attacker].position]);
+    sim.ball.holder = Some(attacker);
+    sim.ball.position = sim.players[attacker].position;
+    sim.ball.last_touch_team = Some(Team::Home);
+    let before = WorldSnapshot::from_match(&sim);
+    sim.players[attacker].last_decision = Some(test_decision_trace(&before, attacker, "nutmeg"));
+    sim.players[defender].last_decision = Some(test_decision_trace(&before, defender, "defend"));
+
+    sim.players[attacker].position = Vec2::new(40.5, 61.2);
+    sim.ball.position = sim.players[attacker].position;
+    let event_start = sim.reward_events.len();
+    sim.record_dribble_beat_event(attacker, defender, DribbleMoveKind::Nutmeg);
+
+    let tick_events = &sim.reward_events[event_start..];
+    let attacker_reward = tick_events
+        .iter()
+        .filter(|event| {
+            event.player_id == attacker && event.kind == SoccerRewardEventKind::DribbleBeat
+        })
+        .map(|event| event.amount)
+        .sum::<f64>();
+    let defender_reward = tick_events
+        .iter()
+        .filter(|event| {
+            event.player_id == defender && event.kind == SoccerRewardEventKind::DribbleBeat
+        })
+        .map(|event| event.amount)
+        .sum::<f64>();
+    assert!((attacker_reward - NUTMEG_BEAT_REWARD_POINTS * 2.0).abs() < 1e-9);
+    assert!((defender_reward + BEATEN_BY_DRIBBLE_PENALTY_POINTS * 2.0).abs() < 1e-9);
+
+    let after = WorldSnapshot::from_match(&sim);
+    let transitions = sim.learning_transitions_for(&before, &after, 0, 0, tick_events);
+    let attacker_transition = transitions
+        .iter()
+        .find(|transition| transition.player_id == attacker)
+        .expect("attacker dribble transition");
+    assert!(
+        attacker_transition.reward >= NUTMEG_BEAT_REWARD_POINTS * 2.0,
+        "scaled dribble-beat reward should land on the attacker's MDP/POMDP transition"
+    );
+    let defender_transition = transitions
+        .iter()
+        .find(|transition| transition.player_id == defender)
+        .expect("defender beat transition");
+    assert!(
+        defender_transition.reward <= -BEATEN_BY_DRIBBLE_PENALTY_POINTS * 2.0,
+        "scaled beaten-defender penalty should land on the defender's MDP/POMDP transition"
+    );
+}
+
+#[test]
 fn dribble_beat_event_triggers_learning_with_whole_field_context() {
+    let _env = dribble_beat_reward_scale_env_lock();
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let attacker = 9;
     let defender = 13;
@@ -98381,6 +98523,11 @@ fn pass_risk_gate_env_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 fn support_outlet_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn dribble_beat_reward_scale_env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }

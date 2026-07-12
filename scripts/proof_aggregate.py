@@ -23,6 +23,7 @@ Z_95 = 1.959_964
 Z_9999 = 3.719_016
 ALPHA_95 = 0.05
 ALPHA_9999 = 0.0001
+MAX_BOOTSTRAP_REPLICATES = 200_000
 
 
 def f(row: Dict[str, object], key: str) -> float:
@@ -49,7 +50,7 @@ def pct(numerator: float, denominator: float) -> float:
 def bootstrap_replicates() -> int:
     raw = os.environ.get("PROOF_BOOTSTRAP_REPLICATES", "20000")
     try:
-        return max(1000, int(raw))
+        return min(MAX_BOOTSTRAP_REPLICATES, max(1000, int(raw)))
     except ValueError:
         return 20000
 
