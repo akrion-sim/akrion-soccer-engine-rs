@@ -99,6 +99,7 @@ fn run() -> AppResult<()> {
             let seed: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(7);
             let mut out_dir = PathBuf::from("out");
             let mut out_path: Option<PathBuf> = None;
+            let mut opponent: Option<PathBuf> = None;
             let mut i = 3;
             while i < args.len() {
                 let flag = args[i].as_str();
@@ -108,12 +109,13 @@ fn run() -> AppResult<()> {
                 match flag {
                     "--out-dir" => out_dir = PathBuf::from(val),
                     "--out" => out_path = Some(PathBuf::from(val)),
+                    "--opponent" => opponent = Some(PathBuf::from(val)), // Team B = this champion dir
                     other => return Err(format!("unknown option for play: {other}").into()),
                 }
                 i += 2;
             }
             let out_path = out_path.unwrap_or_else(|| out_dir.join("match_live.json"));
-            play(seed, &out_dir, &out_path)?;
+            play(seed, &out_dir, &out_path, opponent.as_deref())?;
         }
         "help" | "--help" | "-h" => print_usage(),
         other => return Err(format!("unknown command: {other}; run with --help for usage").into()),
