@@ -18,6 +18,21 @@ pub fn set_speed_frozen(frozen: bool) {
     SPEED_FROZEN.store(frozen, Ordering::Relaxed);
 }
 
+// ── SELF-PLAY CHAMPION LADDER ───────────────────────────────────────────────
+// When a champion is installed, Team B (the opponent) is driven by that FROZEN
+// learned policy instead of the scripted baseline — so BOTH teams are learned
+// policies. The challenger (Team A) keeps training; when it beats the champion by
+// a margin it is promoted to the new champion ("new winner beats old winner to
+// advance"). Every action still flows through World::step, which executes only
+// legal, physics-bounded moves — self-play cannot invent unphysical behavior.
+static SELFPLAY_CHAMPION: RwLock<Option<Arc<Policy>>> = RwLock::new(None);
+pub fn set_selfplay_champion(champion: Option<Policy>) {
+    *SELFPLAY_CHAMPION.write().unwrap() = champion.map(Arc::new);
+}
+fn selfplay_champion() -> Option<Arc<Policy>> {
+    SELFPLAY_CHAMPION.read().unwrap().clone()
+}
+
 const GAMMA: f32 = 0.995; // per-tick discount retuned for 20 Hz (same per-second horizon)
 const LAMBDA: f32 = 0.95;
 const CLIP: f32 = 0.2;
