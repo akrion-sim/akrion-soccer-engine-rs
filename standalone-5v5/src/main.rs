@@ -474,6 +474,123 @@ fn sanity() {
     println!("  avg goals A = {:.3}, avg goals B = {:.3}", ga, gb);
 }
 
+/// Persist a policy's three networks (actor/critic/speedor) into `dir` in the same
+/// layout `run_training` uses, so `inspect`/`play`/the viz can load it.
+fn save_policy(policy: &train::Policy, dir: &Path) -> AppResult<()> {
+    fs::create_dir_all(dir)?;
+    policy.actor.save(&dir.join("actor.txt"))?;
+    policy.speedor.save(&dir.join("speedor.txt"))?;
+    policy.critic.save(&dir.join("critic.txt"))?;
+    Ok(())
+}
+
+/// Adversarial SELF-PLAY ladder. Both teams are learned policies: a frozen champion
+/// plays Team B while a challenger trains (Team A) against it. Each generation the
+/// challenger is scored head-to-head vs the champion; if it wins by `PROMOTE_MARGIN`
+/// (goal-diff) it becomes the new champion ("new winner beats old winner to advance").
+/// All moves execute through `World::step`, so play stays within the physics bounds.
+fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
+    let mut rng = Rng::new(cfg.seed);
+    fs::create_dir_all(&cfg.out_dir)?;
+    let champ_dir = cfg.out_dir.join("champions");
+    fs::create_dir_all(&champ_dir)?;
+
+    let generations: usize = std::env::var("GENERATIONS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(12);
+    let promote_margin: f32 = std::env::var("PROMOTE_MARGIN")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.25);
+    let speed_warmup: usize = std::env::var("SPEED_WARMUP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or((cfg.iters / 2).max(1));
+
+    // Challenger: warm-start by behavior-cloning the scripted baseline so gen-0 play
+    // is coherent (not random flailing); it then improves purely via self-play.
+    let mut challenger = train::Policy::new(&mut rng);
+    if cfg.bc_games > 0 {
+        let bc =
+            train::behavior_clone_scripted(&mut challenger, cfg.bc_games, cfg.bc_epochs, &mut rng);
+        println!(
+            "warm start (behavior-clone scripted): {} samples, teacher-match {:.0}%",
+            bc.samples,
+            bc.accuracy * 100.0
+        );
+    }
+    // Generation-0 champion = the warm-started challenger snapshot.
+    let mut champion = challenger.clone();
+    let mut champion_gen = 0usize;
+    save_policy(&champion, &champ_dir.join(format!("gen{champion_gen}")))?;
+
+    let (svs, _, _) = train::evaluate_scripted_vs_scripted(60, &mut rng);
+    println!("=== 5-a-side ADVERSARIAL SELF-PLAY ladder — both teams learned, physics-bounded ===");
+    println!("scripted-vs-scripted goal_diff={svs:+.2} (sanity ~0)");
+    println!(
+        "generations={generations}  iters/gen={}  games/iter={}  promote_margin={promote_margin:+.2}  eval_games={}  speed_warmup={speed_warmup}",
+        cfg.iters, cfg.games_per_iter, cfg.eval_games
+    );
+    println!("{}", "-".repeat(92));
+    println!(
+        "{:>4} | {:>18} | {:>18} | {:>9} | champion",
+        "gen", "vs champion", "vs scripted", "result"
+    );
+
+    let mut ladder = String::from(
+        "generation,iters_per_gen,cand_vs_champ_gd,cand_vs_champ_wr,cand_vs_scripted_gd,cand_vs_scripted_wr,promoted,champion_gen\n",
+    );
+
+    for round in 1..=generations {
+        // Install the frozen champion as Team B, then train the challenger against it.
+        train::set_selfplay_champion(Some(champion.clone()));
+        for it in 1..=cfg.iters {
+            train::set_speed_frozen(it <= speed_warmup);
+            let beta = train::ent_beta_at(it, cfg.iters);
+            let _ = train::train_iter(&mut challenger, cfg.games_per_iter, beta, &mut rng);
+        }
+        train::set_selfplay_champion(None); // detach so the scripted-baseline eval is clean
+
+        // Champion-ladder gate: the challenger must beat the frozen champion by the margin.
+        let (gd_champ, wr_champ) =
+            train::evaluate_vs_policy(&challenger, &champion, cfg.eval_games, &mut rng);
+        // Absolute progress reference: challenger vs the scripted baseline.
+        let s = train::evaluate(&challenger, cfg.eval_games, &mut rng);
+        let promoted = gd_champ >= promote_margin;
+        if promoted {
+            champion = challenger.clone();
+            champion_gen += 1;
+            save_policy(&champion, &champ_dir.join(format!("gen{champion_gen}")))?;
+        }
+        println!(
+            "{round:>4} | gd {gd_champ:>+6.2} wr {wr_champ:>4.2} | gd {:>+6.2} wr {:>4.2} | {:>9} | gen{champion_gen}",
+            s.goal_diff,
+            s.winrate,
+            if promoted { "PROMOTED" } else { "hold" }
+        );
+        ladder.push_str(&format!(
+            "{round},{},{gd_champ:.4},{wr_champ:.4},{:.4},{:.4},{},{champion_gen}\n",
+            cfg.iters, s.goal_diff, s.winrate, promoted
+        ));
+    }
+
+    // Persist the final champion in the standard layout so inspect/play/viz can load it.
+    save_policy(&champion, &cfg.out_dir)?;
+    write_atomic(&cfg.out_dir.join("selfplay_ladder.csv"), &ladder)?;
+    let sfinal = train::evaluate(&champion, cfg.final_games.max(cfg.eval_games), &mut rng);
+    println!("{}", "-".repeat(92));
+    println!(
+        "final champion = gen{champion_gen} after {generations} generations | vs scripted: goal_diff={:+.2} winrate={:.2} goals {:.2}-{:.2}",
+        sfinal.goal_diff, sfinal.winrate, sfinal.ga, sfinal.gb
+    );
+    println!(
+        "saved champion -> {} (+ champions/gen*/ snapshots, selfplay_ladder.csv)",
+        cfg.out_dir.display()
+    );
+    Ok(())
+}
+
 fn run_training(cfg: &RunConfig) -> AppResult<()> {
     let mut rng = Rng::new(cfg.seed);
     let mut policy = train::Policy::new(&mut rng);
