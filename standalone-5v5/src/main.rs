@@ -544,28 +544,39 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
     );
 
     for round in 1..=generations {
-        // Install the frozen champion as Team B, then train the challenger against it.
-        train::set_selfplay_champion(Some(champion.clone()));
+        // Install the current champion (None => scripted baseline) as Team B, then
+        // train the challenger against it.
+        train::set_selfplay_champion(champion.clone());
         for it in 1..=cfg.iters {
             train::set_speed_frozen(it <= speed_warmup);
             let beta = train::ent_beta_at(it, cfg.iters);
             let _ = train::train_iter(&mut challenger, cfg.games_per_iter, beta, &mut rng);
         }
-        train::set_selfplay_champion(None); // detach so the scripted-baseline eval is clean
+        train::set_selfplay_champion(None); // detach so evals are clean
 
-        // Champion-ladder gate: the challenger must beat the frozen champion by the margin.
-        let (gd_champ, wr_champ) =
-            train::evaluate_vs_policy(&challenger, &champion, cfg.eval_games, &mut rng);
+        // Champion-ladder gate: beat the current champion (scripted at gen 0) by the margin.
+        let (gd_champ, wr_champ) = match &champion {
+            Some(c) => train::evaluate_vs_policy(&challenger, c, cfg.eval_games, &mut rng),
+            None => {
+                let s = train::evaluate(&challenger, cfg.eval_games, &mut rng);
+                (s.goal_diff, s.winrate)
+            }
+        };
         // Absolute progress reference: challenger vs the scripted baseline.
         let s = train::evaluate(&challenger, cfg.eval_games, &mut rng);
         let promoted = gd_champ >= promote_margin;
         if promoted {
-            champion = challenger.clone();
+            champion = Some(challenger.clone());
             champion_gen += 1;
-            save_policy(&champion, &champ_dir.join(format!("gen{champion_gen}")))?;
+            save_policy(&challenger, &champ_dir.join(format!("gen{champion_gen}")))?;
         }
+        let champ_label = if champion_gen == 0 {
+            "scripted".to_string()
+        } else {
+            format!("gen{champion_gen}")
+        };
         println!(
-            "{round:>4} | gd {gd_champ:>+6.2} wr {wr_champ:>4.2} | gd {:>+6.2} wr {:>4.2} | {:>9} | gen{champion_gen}",
+            "{round:>4} | gd {gd_champ:>+6.2} wr {wr_champ:>4.2} | gd {:>+6.2} wr {:>4.2} | {:>9} | {champ_label}",
             s.goal_diff,
             s.winrate,
             if promoted { "PROMOTED" } else { "hold" }
