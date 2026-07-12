@@ -191,6 +191,30 @@ fn parse_run_config(args: &[String]) -> AppResult<RunConfig> {
     Ok(cfg)
 }
 
+/// Load the trained policy from `out_dir` and record ONE fresh match (viz JSON)
+/// with the given seed to `out_path` — powers the live "New Game" button, which
+/// the live server (viz/serve_live.py) invokes per click with a random seed.
+///   cargo run --release -- play [seed] [--out-dir DIR] [--out PATH]
+fn play(seed: u64, out_dir: &Path, out_path: &Path) -> AppResult<()> {
+    let actor = nn::Mlp::load(&out_dir.join("actor.txt"))
+        .map_err(|e| format!("no trained policy in {}: {e}", out_dir.display()))?;
+    let critic = nn::Mlp::load(&out_dir.join("critic.txt"))
+        .map_err(|e| format!("failed to load critic: {e}"))?;
+    let speedor = nn::Mlp::load(&out_dir.join("speedor.txt"))
+        .map_err(|e| format!("failed to load speedor: {e}"))?;
+    if actor.in_dim() != OBS_DIM || actor.out_dim() != NA {
+        return Err("actor shape mismatch; retrain the policy".into());
+    }
+    let policy = train::Policy {
+        actor,
+        speedor,
+        critic,
+    };
+    record_match(&policy, &mut Rng::new(seed), out_path)?;
+    println!("wrote {}", out_path.display());
+    Ok(())
+}
+
 fn parse_out_dir(args: &[String], start: usize) -> AppResult<PathBuf> {
     let mut out_dir = PathBuf::from("out");
     let mut i = start;
