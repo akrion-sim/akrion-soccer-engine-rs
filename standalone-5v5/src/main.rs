@@ -587,10 +587,12 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
         ));
     }
 
-    // Persist the final champion in the standard layout so inspect/play/viz can load it.
-    save_policy(&champion, &cfg.out_dir)?;
+    // Persist the final champion (or the challenger if none was ever promoted) in the
+    // standard layout so inspect/play/viz can load it.
+    let final_policy = champion.as_ref().unwrap_or(&challenger);
+    save_policy(final_policy, &cfg.out_dir)?;
     write_atomic(&cfg.out_dir.join("selfplay_ladder.csv"), &ladder)?;
-    let sfinal = train::evaluate(&champion, cfg.final_games.max(cfg.eval_games), &mut rng);
+    let sfinal = train::evaluate(final_policy, cfg.final_games.max(cfg.eval_games), &mut rng);
     println!("{}", "-".repeat(92));
     println!(
         "final champion = gen{champion_gen} after {generations} generations | vs scripted: goal_diff={:+.2} winrate={:.2} goals {:.2}-{:.2}",
