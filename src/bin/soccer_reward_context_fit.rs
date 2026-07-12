@@ -16,7 +16,6 @@ use std::collections::HashMap;
 
 const MIN_UTILITY_SCALE: f64 = 0.0001;
 const MAX_UTILITY_SCALE: f64 = 4.0;
-const VALUE_DELTA_SCALE_FLOOR: f64 = 0.05;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -330,6 +329,7 @@ fn fit_head(
     rows: &[&LabeledMoment],
     outcome_sign: f64,
     delta_rms: f64,
+    reliability: f64,
     prior: Option<&RewardContextHead>,
     epochs: usize,
     learning_rate: f64,
@@ -356,7 +356,8 @@ fn fit_head(
             let Some(value_delta) = row.value_delta else {
                 continue;
             };
-            let target = (outcome_sign * value_delta / delta_rms.max(1e-6)).clamp(-1.0, 1.0);
+            let target =
+                contextual_utility_target(outcome_sign, value_delta, delta_rms, reliability);
             let prediction = predict_head(&head, &row.sample.embedding);
             let error = (prediction - target).clamp(-2.0, 2.0);
             let weighted_rate = learning_rate * row.sample_weight;
@@ -370,6 +371,16 @@ fn fit_head(
         }
     }
     head
+}
+
+fn contextual_utility_target(
+    outcome_sign: f64,
+    value_delta: f64,
+    delta_rms: f64,
+    reliability: f64,
+) -> f64 {
+    let confidence = reliability.clamp(0.0, 1.0);
+    (outcome_sign * value_delta / delta_rms.max(1e-12) * confidence).clamp(-1.0, 1.0)
 }
 
 fn parse_hex(raw: Option<&String>, default: u32) -> u32 {
@@ -693,7 +704,8 @@ fn main() {
             fit_head(
                 &rows,
                 spec.outcome_sign,
-                delta_rms.max(VALUE_DELTA_SCALE_FLOOR),
+                delta_rms,
+                state_value_reliability,
                 prior_head,
                 epochs,
                 learning_rate,
@@ -747,4 +759,17 @@ fn main() {
         artifact.rollout_nonzero_target_count,
         artifact.rollout_mean_absolute_target,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contextual_utility_target_is_normalized_but_reliability_shrunk() {
+        let target = contextual_utility_target(1.0, 0.0002, 0.0001, 0.08);
+        assert!((target - 0.16).abs() < 1e-12);
+        assert_eq!(contextual_utility_target(-1.0, 0.0002, 0.0001, 0.0), 0.0);
+        assert_eq!(contextual_utility_target(1.0, 2.0, 0.1, 1.0), 1.0);
+    }
 }
