@@ -27587,12 +27587,20 @@ fn soccer_transition_reward_with_tactics(
                     } else {
                         decision.observation.best_pass_receiver_openness
                     };
+                    // Turnover penalty, weighted by WHERE the ball was lost (the field
+                    // vector): amplified when the opponent wins it in a high-threat spot
+                    // (our third), left cheap for ambitious losses up the pitch.
                     reward -= resolved_pass_turnover_penalty(
                         player.team,
                         origin,
                         target,
                         flight,
                         receiver_openness,
+                        before.field_length,
+                    ) * turnover_position_multiplier(
+                        player.team,
+                        origin,
+                        before.field_width,
                         before.field_length,
                     );
                 }
