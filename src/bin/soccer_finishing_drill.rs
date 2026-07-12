@@ -279,7 +279,7 @@ fn main() {
         std::env::var("DD_SOCCER_ENABLE_DISCRETIZED_KICK").unwrap_or_default(),
         std::env::var("SOCCER_NEURAL_MCTS_MIN_DISCRETIZED_KICK_CANDIDATES").unwrap_or_default(),
     );
-    println!("block(50)  scoring_rate  (goals/episodes)   cumulative");
+    println!("  eps      scoring_rate  (goals/50)     cumulative    train_steps    critic_loss");
 
     const BLOCK: usize = 50;
     let mut block_goals = 0usize;
