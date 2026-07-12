@@ -27,6 +27,17 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 type AppResult<T> = Result<T, Box<dyn Error>>;
+const SELFPLAY_MAX_GENERATIONS: usize = 200;
+const SELFPLAY_MAX_SPEED_WARMUP: usize = 10_000;
+
+struct SelfplayCleanup;
+
+impl Drop for SelfplayCleanup {
+    fn drop(&mut self) {
+        train::clear_selfplay_champion();
+        train::set_speed_frozen(false);
+    }
+}
 
 #[derive(Clone)]
 struct RunConfig {
@@ -197,6 +208,25 @@ fn parse_run_config(args: &[String]) -> AppResult<RunConfig> {
         return Err("display-seed-max must be > 0".into());
     }
     Ok(cfg)
+}
+
+fn env_usize_clamped(name: &str, default: usize, min: usize, max: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|value| value.clamp(min, max))
+        .unwrap_or(default.clamp(min, max))
+}
+
+fn env_f32_clamped(name: &str, default: f32, min: f32, max: f32) -> f32 {
+    let lo = min.min(max);
+    let hi = min.max(max);
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|value| value.is_finite())
+        .map(|value| value.clamp(lo, hi))
+        .unwrap_or(default.clamp(lo, hi))
 }
 
 /// Load the trained policy from `out_dir` and record ONE fresh match (viz JSON)
@@ -490,23 +520,20 @@ fn save_policy(policy: &train::Policy, dir: &Path) -> AppResult<()> {
 /// (goal-diff) it becomes the new champion ("new winner beats old winner to advance").
 /// All moves execute through `World::step`, so play stays within the physics bounds.
 fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
+    let _selfplay_cleanup = SelfplayCleanup;
     let mut rng = Rng::new(cfg.seed);
     fs::create_dir_all(&cfg.out_dir)?;
     let champ_dir = cfg.out_dir.join("champions");
     fs::create_dir_all(&champ_dir)?;
 
-    let generations: usize = std::env::var("GENERATIONS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(12);
-    let promote_margin: f32 = std::env::var("PROMOTE_MARGIN")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.25);
-    let speed_warmup: usize = std::env::var("SPEED_WARMUP")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or((cfg.iters / 2).max(1));
+    let generations = env_usize_clamped("GENERATIONS", 12, 1, SELFPLAY_MAX_GENERATIONS);
+    let promote_margin = env_f32_clamped("PROMOTE_MARGIN", 0.25, -20.0, 20.0);
+    let speed_warmup = env_usize_clamped(
+        "SPEED_WARMUP",
+        (cfg.iters / 2).max(1),
+        0,
+        SELFPLAY_MAX_SPEED_WARMUP,
+    );
 
     // Challenger: warm-start by behavior-cloning the scripted baseline so gen-0 play
     // is coherent (not random flailing); it then improves purely via self-play.

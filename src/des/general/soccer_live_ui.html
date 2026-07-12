@@ -3830,6 +3830,10 @@ function setTile(id, val, cls) {
 }
 function updateSnapshotTiles(s, f) {
   if (!s || !f) return;
+  const setText = (id, text) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = text;
+  };
   const cf = (s.passesCompletedForwardHome || 0) + (s.passesCompletedForwardAway || 0);
   const cb = (s.passesCompletedBackwardHome || 0) + (s.passesCompletedBackwardAway || 0);
   const cc = (s.passesCompletedHome || 0) + (s.passesCompletedAway || 0);
@@ -3851,13 +3855,13 @@ function updateSnapshotTiles(s, f) {
   setTile("kpiPoss", (possTot > 0 ? Math.round(100 * possAccum.home / possTot) : 50) + "%", "accent");
   const comp = pct(cc, att);
   setTile("kpiPassComp", comp + "%", comp >= 80 ? "good" : "");
-  document.getElementById("kpiPassCompSub").textContent = att + " att";
+  setText("kpiPassCompSub", att + " att");
   const conv = pct(goalsT, shotsT);
   setTile("kpiConv", conv + "%", goalsT > 0 ? "good" : "");
-  document.getElementById("kpiConvSub").textContent = shotsT + " shots · " + goalsT + " gl";
+  setText("kpiConvSub", shotsT + " shots · " + goalsT + " gl");
   const total = cf + cl + cb;
   setTile("kpiFwd", pct(cf, total) + "%", "");
-  document.getElementById("kpiFwdSub").textContent = cf + " fwd / " + cc;
+  setText("kpiFwdSub", cf + " fwd / " + cc);
   const setSeg = (id, n) => {
     const el = document.getElementById(id); if (!el) return;
     const share = total > 0 ? n / total : 1 / 3;
@@ -3865,9 +3869,9 @@ function updateSnapshotTiles(s, f) {
     el.textContent = (total > 0 && share >= 0.10) ? Math.round(share * 100) + "%" : "";
   };
   setSeg("segFwd", cf); setSeg("segLat", cl); setSeg("segBack", cb);
-  document.getElementById("pmFwd").textContent = pct(cf, total) + "%";
-  document.getElementById("pmLat").textContent = pct(cl, total) + "%";
-  document.getElementById("pmBack").textContent = pct(cb, total) + "%";
+  setText("pmFwd", pct(cf, total) + "%");
+  setText("pmLat", pct(cl, total) + "%");
+  setText("pmBack", pct(cb, total) + "%");
 }
 function render() {
   maybeAutoAssignFirstController();
@@ -3967,7 +3971,9 @@ function render() {
   updateRunButton();
   episodes.innerHTML = episodeHistoryHtml();
   policyHistory.innerHTML = policyHistoryHtml();
-  events.innerHTML = eventLog.slice(-12).reverse().map(e => `<li>${fmtClock(e.clockSeconds)} ${e.description}</li>`).join("");
+  events.innerHTML = eventLog.slice(-12).reverse()
+    .map(e => `<li>${escapeHtml(fmtClock(e.clockSeconds))} ${escapeHtml(e.description)}</li>`)
+    .join("");
 }
 function humanSlotCount() {
   if (!state) return 0;

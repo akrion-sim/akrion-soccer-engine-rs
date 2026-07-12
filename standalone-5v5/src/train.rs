@@ -6,7 +6,7 @@ use crate::game::*;
 use crate::nn::{masked_softmax, Mlp};
 use crate::rng::Rng;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 // SPEED WARMUP CURRICULUM: while true, every player uses a fixed run-medium gear
 // (v3 behavior) instead of sampling the speed policy. This lets the ACTION policy
@@ -26,11 +26,28 @@ pub fn set_speed_frozen(frozen: bool) {
 // advance"). Every action still flows through World::step, which executes only
 // legal, physics-bounded moves — self-play cannot invent unphysical behavior.
 static SELFPLAY_CHAMPION: RwLock<Option<Arc<Policy>>> = RwLock::new(None);
+
+fn selfplay_champion_write() -> RwLockWriteGuard<'static, Option<Arc<Policy>>> {
+    SELFPLAY_CHAMPION
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn selfplay_champion_read() -> RwLockReadGuard<'static, Option<Arc<Policy>>> {
+    SELFPLAY_CHAMPION
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 pub fn set_selfplay_champion(champion: Option<Policy>) {
-    *SELFPLAY_CHAMPION.write().unwrap() = champion.map(Arc::new);
+    *selfplay_champion_write() = champion.map(Arc::new);
+}
+
+pub fn clear_selfplay_champion() {
+    *selfplay_champion_write() = None;
 }
 fn selfplay_champion() -> Option<Arc<Policy>> {
-    SELFPLAY_CHAMPION.read().unwrap().clone()
+    selfplay_champion_read().clone()
 }
 
 const GAMMA: f32 = 0.995; // per-tick discount retuned for 20 Hz (same per-second horizon)
@@ -822,8 +839,16 @@ fn collect_rollouts(policy: &Policy, games: usize, rng: &mut Rng) -> Vec<Sample>
     }
 
     let mut data = Vec::new();
+    let mut worker_failed = false;
     for handle in handles {
-        data.extend(handle.join().expect("rollout worker panicked"));
+        match handle.join() {
+            Ok(samples) => data.extend(samples),
+            Err(_) => worker_failed = true,
+        }
+    }
+    if worker_failed {
+        eprintln!("warning: 5v5 rollout worker panicked; retrying rollout batch serially");
+        return run_rollout_jobs(policy, &jobs);
     }
     data
 }
@@ -1385,6 +1410,15 @@ mod tests {
         let left = evaluate_scripted_vs_scripted(8, &mut a);
         let right = evaluate_scripted_vs_scripted(8, &mut b);
         assert_eq!(left, right);
+    }
+
+    #[test]
+    fn selfplay_champion_lock_round_trips_and_clears() {
+        let mut rng = Rng::new(123);
+        set_selfplay_champion(Some(Policy::new(&mut rng)));
+        assert!(selfplay_champion().is_some());
+        clear_selfplay_champion();
+        assert!(selfplay_champion().is_none());
     }
 
     #[test]

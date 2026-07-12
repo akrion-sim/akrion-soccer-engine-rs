@@ -1883,6 +1883,10 @@ const TURNOVER_CHAIN_BLAME_MIN_POINTS: f64 = 0.05;
 const INTERCEPTED_PASS_BASE_PENALTY_MIN_POINTS: f64 = 6.0;
 const INTERCEPTED_PASS_BASE_PENALTY_MAX_POINTS: f64 = 20.0;
 const BACKWARD_INTERCEPTED_PASS_PENALTY_MULTIPLIER: f64 = 2.0;
+/// Cap for the field-vector turnover-position multiplier: an own-third giveaway can cost
+/// up to this many × the base turnover penalty, but no more (so a dangerous giveaway is
+/// punished hard without dwarfing the sparse goal reward).
+const TURNOVER_POSITION_MAX_MULT: f64 = 5.0;
 // Bad-pass turnover blame is not a normalized pool: the passer gets the full
 // chain penalty, then the prior two teammates get discounted echoes.
 const BAD_PASS_CHAIN_PENALTY_MULTIPLIERS: [f64; 3] = [1.0, 0.20, 0.05];
