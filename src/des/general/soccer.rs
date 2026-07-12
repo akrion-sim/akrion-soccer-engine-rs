@@ -24319,6 +24319,21 @@ fn reward_weight_env(name: &str, default: f64, min: f64, max: f64) -> f64 {
         .unwrap_or(default.clamp(min, max))
 }
 
+fn optional_reward_weight_env(name: &str, default: f64, max: f64) -> f64 {
+    let max = max.max(MIN_SOCCER_REWARD_WEIGHT);
+    let default = if default.is_finite() && default > 0.0 {
+        default.clamp(MIN_SOCCER_REWARD_WEIGHT, max)
+    } else {
+        0.0
+    };
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+        .map(|v| v.clamp(MIN_SOCCER_REWARD_WEIGHT, max))
+        .unwrap_or(default)
+}
+
 pub(crate) fn forward_pass_reward_scale() -> f64 {
     if dynamic_reward_weights_enabled() {
         return reward_weight_env("DD_SOCCER_FORWARD_PASS_REWARD_SCALE", 1.0, 0.0, 20.0);
@@ -24953,22 +24968,16 @@ fn quick_release_forward_pass_reward(
 /// (the whole term is a no-op unless explicitly enabled). Pre-registered A/B arms: 0.75, 1.0, 1.5.
 pub(crate) fn quick_forward_release_reward_scale() -> f64 {
     if dynamic_reward_weights_enabled() {
-        return reward_weight_env(
+        return optional_reward_weight_env(
             "DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE",
             0.0,
-            MIN_SOCCER_REWARD_WEIGHT,
             2.0,
         );
     }
     use std::sync::OnceLock;
     static V: OnceLock<f64> = OnceLock::new();
     *V.get_or_init(|| {
-        reward_weight_env(
-            "DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE",
-            0.0,
-            MIN_SOCCER_REWARD_WEIGHT,
-            2.0,
-        )
+        optional_reward_weight_env("DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE", 0.0, 2.0)
     })
 }
 
@@ -24979,22 +24988,12 @@ pub(crate) fn quick_forward_release_reward_scale() -> f64 {
 /// [0, 2], default **0.0** ⇒ byte-identical no-op unless enabled.
 pub(crate) fn hold_under_pressure_penalty_scale() -> f64 {
     if dynamic_reward_weights_enabled() {
-        return reward_weight_env(
-            "DD_SOCCER_HOLD_UNDER_PRESSURE_PENALTY_SCALE",
-            0.0,
-            MIN_SOCCER_REWARD_WEIGHT,
-            2.0,
-        );
+        return optional_reward_weight_env("DD_SOCCER_HOLD_UNDER_PRESSURE_PENALTY_SCALE", 0.0, 2.0);
     }
     use std::sync::OnceLock;
     static V: OnceLock<f64> = OnceLock::new();
     *V.get_or_init(|| {
-        reward_weight_env(
-            "DD_SOCCER_HOLD_UNDER_PRESSURE_PENALTY_SCALE",
-            0.0,
-            MIN_SOCCER_REWARD_WEIGHT,
-            2.0,
-        )
+        optional_reward_weight_env("DD_SOCCER_HOLD_UNDER_PRESSURE_PENALTY_SCALE", 0.0, 2.0)
     })
 }
 
@@ -25006,22 +25005,12 @@ pub(crate) fn hold_under_pressure_penalty_scale() -> f64 {
 /// `DD_SOCCER_DRIBBLE_MIN_GAIT_PENALTY_SCALE`, clamped [0, 2], default **0.0** ⇒ off.
 pub(crate) fn dribble_min_gait_penalty_scale() -> f64 {
     if dynamic_reward_weights_enabled() {
-        return reward_weight_env(
-            "DD_SOCCER_DRIBBLE_MIN_GAIT_PENALTY_SCALE",
-            0.0,
-            MIN_SOCCER_REWARD_WEIGHT,
-            2.0,
-        );
+        return optional_reward_weight_env("DD_SOCCER_DRIBBLE_MIN_GAIT_PENALTY_SCALE", 0.0, 2.0);
     }
     use std::sync::OnceLock;
     static V: OnceLock<f64> = OnceLock::new();
     *V.get_or_init(|| {
-        reward_weight_env(
-            "DD_SOCCER_DRIBBLE_MIN_GAIT_PENALTY_SCALE",
-            0.0,
-            MIN_SOCCER_REWARD_WEIGHT,
-            2.0,
-        )
+        optional_reward_weight_env("DD_SOCCER_DRIBBLE_MIN_GAIT_PENALTY_SCALE", 0.0, 2.0)
     })
 }
 
@@ -25034,22 +25023,12 @@ pub(crate) fn dribble_min_gait_penalty_scale() -> f64 {
 /// default **0.0** ⇒ byte-identical (multiplier = 1.0, current flat behavior).
 pub(crate) fn turnover_position_weight_scale() -> f64 {
     if dynamic_reward_weights_enabled() {
-        return reward_weight_env(
-            "DD_SOCCER_TURNOVER_POSITION_WEIGHT_SCALE",
-            0.0,
-            MIN_SOCCER_REWARD_WEIGHT,
-            8.0,
-        );
+        return optional_reward_weight_env("DD_SOCCER_TURNOVER_POSITION_WEIGHT_SCALE", 0.0, 8.0);
     }
     use std::sync::OnceLock;
     static V: OnceLock<f64> = OnceLock::new();
     *V.get_or_init(|| {
-        reward_weight_env(
-            "DD_SOCCER_TURNOVER_POSITION_WEIGHT_SCALE",
-            0.0,
-            MIN_SOCCER_REWARD_WEIGHT,
-            8.0,
-        )
+        optional_reward_weight_env("DD_SOCCER_TURNOVER_POSITION_WEIGHT_SCALE", 0.0, 8.0)
     })
 }
 
@@ -25064,10 +25043,11 @@ fn turnover_position_multiplier(
     field_length: f64,
 ) -> f64 {
     let w3 = turnover_position_weight_scale();
-    if w3 <= MIN_SOCCER_REWARD_WEIGHT {
+    if w3 <= 0.0 {
         return 1.0;
     }
-    let opponent_threat = threat_at(losing_team.other(), loss_pos, field_width, field_length).max(0.0);
+    let opponent_threat =
+        threat_at(losing_team.other(), loss_pos, field_width, field_length).max(0.0);
     (1.0 + w3 * opponent_threat).clamp(1.0, TURNOVER_POSITION_MAX_MULT)
 }
 
@@ -27405,17 +27385,18 @@ fn soccer_transition_reward_with_tactics(
         // scoring — a full-parity hit for the back line, a role-graded share for outfielders —
         // rather than a token cost. OFF ⇒ the original 8/2 values, byte-identical baseline / A/B.
         let symmetric = dd_soccer_enable_concede_symmetry();
-        let concede_penalty = if matches!(player.role, PlayerRole::Goalkeeper | PlayerRole::Defender) {
-            if symmetric {
-                reward_cfg.concede_keeper_defender_penalty_symmetric
+        let concede_penalty =
+            if matches!(player.role, PlayerRole::Goalkeeper | PlayerRole::Defender) {
+                if symmetric {
+                    reward_cfg.concede_keeper_defender_penalty_symmetric
+                } else {
+                    reward_cfg.concede_keeper_defender_penalty
+                }
+            } else if symmetric {
+                reward_cfg.concede_outfield_penalty_symmetric
             } else {
-                reward_cfg.concede_keeper_defender_penalty
-            }
-        } else if symmetric {
-            reward_cfg.concede_outfield_penalty_symmetric
-        } else {
-            reward_cfg.concede_outfield_penalty
-        };
+                reward_cfg.concede_outfield_penalty
+            };
         // Keep the concede STICK on the SAME multiplier as the goal CARROT above
         // (goal_reward_scale). Otherwise cranking the sparse-terminal lever (e.g.
         // DD_SOCCER_GOAL_REWARD_SCALE=8, the goal-dom regime) amplifies scoring but
@@ -28367,7 +28348,7 @@ fn dense_soccer_transition_reward(
         // tick — pushing a quick release/move. Gated (w1 = 0 ⇒ byte-identical off), and
         // balanced against the energy cost of moving so the optimum is to move it on.
         let hold_w1 = hold_under_pressure_penalty_scale();
-        if hold_w1 > MIN_SOCCER_REWARD_WEIGHT {
+        if hold_w1 > 0.0 {
             let held = before_obs.actual_time_on_ball_seconds.max(0.0);
             let press = before_obs.perceived_pressure.clamp(0.0, 1.0);
             reward -= hold_w1 * held * press;
@@ -28555,7 +28536,7 @@ fn dense_soccer_transition_reward(
             // jog it is zero. Together with the (speed-increasing) energy cost this makes a
             // jog the learned optimum — not a standstill, not a needless sprint. Gated off by default.
             let dribble_w2 = dribble_min_gait_penalty_scale();
-            if dribble_w2 > MIN_SOCCER_REWARD_WEIGHT {
+            if dribble_w2 > 0.0 {
                 let fwd = after
                     .player_velocity(player.id)
                     .map(|v| v.y * attack_dir)
@@ -43103,9 +43084,36 @@ mod soccer_policy_actor_capacity_tests {
         TestEnvVarGuard { key, previous }
     }
 
+    fn clear_test_env_var(key: &'static str) -> TestEnvVarGuard {
+        let previous = std::env::var_os(key);
+        std::env::remove_var(key);
+        TestEnvVarGuard { key, previous }
+    }
+
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().expect("test poison soccer policy env lock")
+    }
+
+    #[test]
+    fn optional_reward_weight_env_stays_off_until_configured() {
+        let _lock = env_lock();
+        const KEY: &str = "DD_SOCCER_TEST_OPTIONAL_REWARD_WEIGHT";
+        let _guard = clear_test_env_var(KEY);
+
+        assert_eq!(optional_reward_weight_env(KEY, 0.0, 2.0), 0.0);
+
+        std::env::set_var(KEY, "0");
+        assert_eq!(
+            optional_reward_weight_env(KEY, 0.0, 2.0),
+            MIN_SOCCER_REWARD_WEIGHT
+        );
+
+        std::env::set_var(KEY, "nan");
+        assert_eq!(optional_reward_weight_env(KEY, 0.0, 2.0), 0.0);
+
+        std::env::set_var(KEY, "99");
+        assert_eq!(optional_reward_weight_env(KEY, 0.0, 2.0), 2.0);
     }
 
     #[test]

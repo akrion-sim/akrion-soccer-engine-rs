@@ -17,9 +17,10 @@ pub const GK: usize = 0; // goalkeeper index; controlled by a fixed rule, not th
 pub const DT: f32 = 0.05; // seconds per decision tick -> 20 Hz sim (real-time 20 fps)
 pub const HZ: f32 = 1.0 / DT; // ticks per second (for real-time viewer playback)
 pub const STEPS: usize = 600; // ticks per TRAINING episode (~30s at 20 Hz)
-                              // The RECORDED viz match (match_before/after.json) runs longer than a training
-                              // episode so the before/after playback shows more football (incl. kickoffs after
-                              // goals). Training dynamics are unaffected — rollouts still use STEPS.
+
+// The RECORDED viz match (match_before/after.json) runs longer than a training
+// episode so the before/after playback shows more football (incl. kickoffs after
+// goals). Training dynamics are unaffected — rollouts still use STEPS.
 pub const RECORD_STEPS: usize = 1800; // ~90s at 20 Hz
 
 const PLAYER_SPEED: f32 = 6.5; // legacy reference speed (~= run_medium); kept for keeper reach/util
