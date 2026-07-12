@@ -48,28 +48,57 @@ ACTIONS = [
     {"i": 11, "name": "spread",      "kind": "offball", "desc": "Drift to the most open space — stretch the pitch."},
     {"i": 12, "name": "mark",        "kind": "offball", "desc": "Pick up the most dangerous opponent (goalside)."},
     {"i": 13, "name": "stay",        "kind": "offball", "desc": "Hold position / recover shape."},
-    {"i": 14, "name": "recover",     "kind": "offball", "desc": "Sprint back goalside to defend."},
+    {"i": 14, "name": "get_open",    "kind": "offball", "desc": "Move wide and OPEN A PASSING LANE (MPC-aimed relocation)."},
 ]
 
-# 71-dim egocentric observation layout (grouped, from observe() in game.rs).
-# Each group: dims [start,end) it occupies + what field-vector quantity it reads.
+# 71-dim egocentric observation layout — the exact push order from observe()
+# (game.rs:709-762). Everything is in the player's own attack frame (x mirrored
+# for Team B) so ONE shared policy is side-symmetric. Comment (game.rs:642-647):
+# "the 5-a-side analogue of the 22-man engine's field vector — reason about overall
+#  shape (spacing, support, pressure), not just nearest neighbours."
 OBS_GROUPS = [
-    {"name": "self kinematics",   "start": 0,  "end": 6,   "color": "--accent",
-     "desc": "own position, velocity, speed & stamina in the attack frame"},
-    {"name": "ball relative",     "start": 6,  "end": 12,  "color": "--ball",
-     "desc": "ball offset, distance, closing velocity, possession flags"},
-    {"name": "target goal",       "start": 12, "end": 18,  "color": "--good",
-     "desc": "vector & angle to the mouth we attack, shot distance, cone"},
-    {"name": "own goal",          "start": 18, "end": 22,  "color": "--bad",
-     "desc": "vector to the goal we defend (recovery / danger sense)"},
-    {"name": "teammates ×3",      "start": 22, "end": 40,  "color": "--teamA",
-     "desc": "each teammate: relative pos, openness, whether goalside"},
-    {"name": "opponents ×4",      "start": 40, "end": 60,  "color": "--teamB",
-     "desc": "each opponent: relative pos, closing speed, marking pressure"},
-    {"name": "pass lanes",        "start": 60, "end": 66,  "color": "--accent",
-     "desc": "openness / lane-clearness score of each pass candidate"},
-    {"name": "shot lane + press", "start": 66, "end": 71,  "color": "--good",
-     "desc": "clearness of the shot lane, nearest-defender pressure, tick phase"},
+    {"name": "possession flags",  "start": 0,  "end": 4,   "color": "--ball",
+     "desc": "has_ball · my team owns · opponent owns · ball is free"},
+    {"name": "my position",       "start": 4,  "end": 6,   "color": "--accent",
+     "desc": "my x,y on the pitch (scaled to ±1)"},
+    {"name": "my velocity",       "start": 6,  "end": 8,   "color": "--accent",
+     "desc": "my velocity vector (÷10)"},
+    {"name": "2-pass gate",       "start": 8,  "end": 9,   "color": "--good",
+     "desc": "pass-streak state — must complete 2 passes before a shot unlocks"},
+    {"name": "ball offset",       "start": 9,  "end": 11,  "color": "--ball",
+     "desc": "vector from me to the ball"},
+    {"name": "ball distance",     "start": 11, "end": 12,  "color": "--ball",
+     "desc": "how far the ball is"},
+    {"name": "ball velocity",     "start": 12, "end": 14,  "color": "--ball",
+     "desc": "where the ball is moving (÷10)"},
+    {"name": "attack goal",       "start": 14, "end": 17,  "color": "--good",
+     "desc": "offset + distance to the mouth we attack"},
+    {"name": "own goal",          "start": 17, "end": 19,  "color": "--bad",
+     "desc": "offset to the goal we defend (danger / recovery sense)"},
+    {"name": "role cues",         "start": 19, "end": 22,  "color": "--accent",
+     "desc": "am I closest to the ball · my ball-distance rank · shot-lane clearness"},
+    {"name": "pass openness ×3",  "start": 22, "end": 25,  "color": "--accent",
+     "desc": "openness of the 3 ranked pass candidates (−1 if none)"},
+    {"name": "teammates ×4",      "start": 25, "end": 45,  "color": "--teamA",
+     "desc": "4 teammates (incl. keeper), nearest-first: rel pos, rel vel, distance"},
+    {"name": "opponents ×5",      "start": 45, "end": 70,  "color": "--teamB",
+     "desc": "5 opponents (incl. keeper), nearest-first: rel pos, rel vel, distance"},
+    {"name": "bias",              "start": 70, "end": 71,  "color": "--ink-dim",
+     "desc": "constant 1.0"},
+]
+
+# 48-dim centralized critic state — global_state() (game.rs:1980-2003). One
+# canonical Team-A-attack frame shared by ALL agents at a tick (CTDE / MAPPO).
+CRITIC_GROUPS = [
+    {"name": "Team A ×5", "start": 0,  "end": 20, "color": "--teamA",
+     "desc": "all 5 A players (keeper first): x, y, vx, vy"},
+    {"name": "Team B ×5", "start": 20, "end": 40, "color": "--teamB",
+     "desc": "all 5 B players: x, y, vx, vy"},
+    {"name": "ball",      "start": 40, "end": 44, "color": "--ball",
+     "desc": "ball x, y, vx, vy"},
+    {"name": "possession","start": 44, "end": 47, "color": "--good",
+     "desc": "one-hot: A owns · B owns · free"},
+    {"name": "bias",      "start": 47, "end": 48, "color": "--ink-dim", "desc": "constant 1.0"},
 ]
 
 # The exact 32-weight reward search space (viz/tune.py SPACE): name,default,lo,hi,log.
