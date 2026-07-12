@@ -270,10 +270,14 @@ fn main() {
 
     println!(
         "finishing-drill: episodes={episodes} seed={seed:#x} defenders={num_defenders} \
-         max_ticks={max_ticks} warmstart={} lambda={} actor_critic={}",
+         max_ticks={max_ticks} warmstart={} frozen={frozen}",
         warmstart.as_deref().unwrap_or("none"),
-        sim.config.neural_blend.lambda,
-        sim.config.neural_blend.actor_critic
+    );
+    println!(
+        "  coupling: authoritative_lambda={} discretized_kick={} min_kick_candidates={}",
+        std::env::var("DD_SOCCER_NEURAL_AUTHORITATIVE_LAMBDA").unwrap_or_default(),
+        std::env::var("DD_SOCCER_ENABLE_DISCRETIZED_KICK").unwrap_or_default(),
+        std::env::var("SOCCER_NEURAL_MCTS_MIN_DISCRETIZED_KICK_CANDIDATES").unwrap_or_default(),
     );
     println!("block(50)  scoring_rate  (goals/episodes)   cumulative");
 
