@@ -60,6 +60,8 @@ const EPOCHS: usize = 4;
 const MINIBATCH: usize = 1024;
 const MAX_ROLLOUT_THREADS: usize = 4;
 const MIN_REWARD_WEIGHT: f32 = 0.0001;
+const CONVERSION_OVER_SHOT_MARGIN: f32 = 5.0;
+const WIN_OVER_CONVERSION_MARGIN: f32 = 20.0;
 /// A converted goal must dominate the summed non-converting shot reward by a PROPORTIONAL margin:
 /// `shot_base + shot_q <= goal * REWARD_NON_CONVERSION_MAX_FRACTION`. Scales with the goal weight
 /// rather than a fixed point gap (which loses meaning once weights move), matching the 11v11 engine's
@@ -119,7 +121,9 @@ fn grounded_conversion_ladder(goal: f32, shot_base: f32, shot_q: f32) -> (f32, f
     let goal = goal.clamp(REW_GOAL_MIN, REW_GOAL_MAX);
     let mut shot_base = shot_base.max(MIN_REWARD_WEIGHT);
     let mut shot_q = shot_q.max(MIN_REWARD_WEIGHT);
-    let max_non_conversion = (goal * REWARD_NON_CONVERSION_MAX_FRACTION).max(MIN_REWARD_WEIGHT);
+    let max_non_conversion = (goal * REWARD_NON_CONVERSION_MAX_FRACTION)
+        .min(goal - CONVERSION_OVER_SHOT_MARGIN)
+        .max(MIN_REWARD_WEIGHT);
     let total = shot_base + shot_q;
     if total > max_non_conversion {
         let scale = (max_non_conversion / total).clamp(0.0, 1.0);
@@ -133,6 +137,8 @@ fn grounded_conversion_ladder(goal: f32, shot_base: f32, shot_q: f32) -> (f32, f
 pub struct Rw {
     pub goal: f32,                 // +goal scored
     pub concede: f32,              // -goal conceded (stored positive, subtracted)
+    pub match_win: f32,            // terminal reward for winning the completed episode
+    pub match_loss: f32,           // terminal penalty magnitude for losing the episode
     pub shot_base: f32,            // shot-on-goal base (earned, from opponent half after 2 passes)
     pub shot_q: f32,               // shot-on-goal chance-quality bonus
     pub milestone: f32,            // completing the 2nd pass (unlocks the shot)
@@ -171,9 +177,11 @@ fn rw() -> &'static Rw {
             wenv("REW_SHOT_BASE", 1.5, 0.3, 3.5),
             wenv("REW_SHOT_Q", 1.0, MIN_REWARD_WEIGHT, 2.5),
         );
-        Rw {
+        enforce_reward_hierarchy(Rw {
             goal,
             concede: wenv("REW_CONCEDE", 8.0, 4.0, 16.0),
+            match_win: wenv("REW_MATCH_WIN", 32.0, 8.0, 64.0),
+            match_loss: wenv("REW_MATCH_LOSS", 12.0, 6.0, 24.0),
             shot_base,
             shot_q,
             milestone: wenv("REW_MILESTONE", 0.3, MIN_REWARD_WEIGHT, 1.5),
@@ -203,8 +211,25 @@ fn rw() -> &'static Rw {
             field_burst_delta: wenv("W_FIELD_BURST_DELTA", 0.08, MIN_REWARD_WEIGHT, 0.35),
             stand_pen: wenv("W_STAND_PEN", 0.02, MIN_REWARD_WEIGHT, 0.20),
             pursuit: wenv("W_PURSUIT", 0.05, MIN_REWARD_WEIGHT, 0.25),
-        }
+        })
     })
+}
+
+#[cfg(test)]
+fn max_nonconverting_shot_reward(weights: &Rw) -> f32 {
+    weights.shot_base + weights.shot_q
+}
+
+fn enforce_reward_hierarchy(mut weights: Rw) -> Rw {
+    let (goal, shot_base, shot_q) =
+        grounded_conversion_ladder(weights.goal, weights.shot_base, weights.shot_q);
+    weights.goal = goal;
+    weights.shot_base = shot_base;
+    weights.shot_q = shot_q;
+    weights.match_win = weights
+        .match_win
+        .max(weights.goal + WIN_OVER_CONVERSION_MARGIN);
+    weights
 }
 // The speed policy is a low-variance REFINEMENT on top of the action policy —
 // small entropy + LR so its exploration can't paralyze the game the action policy
@@ -517,7 +542,7 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
     let mut close_ticks = [0u32; N];
     let linger_gate = linger_ticks();
 
-    for _ in 0..STEPS {
+    for step in 0..STEPS {
         let mut obs_t = [[0.0f32; OBS_DIM]; N];
         let mut mask_t = [[false; NA]; N];
         let mut speed_mask_t = [[false; NS]; N];
@@ -580,6 +605,13 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
         }
         if w.ev_goal_b {
             r -= rw().concede;
+        }
+        if step + 1 == STEPS {
+            if w.goals_a > w.goals_b {
+                r += rw().match_win;
+            } else if w.goals_a < w.goals_b {
+                r -= rw().match_loss;
+            }
         }
         // MARL SYNCHRONIZATION: reward the TEAM for collectively moving into a
         // configuration where a scoring chance becomes available (potential-based on
@@ -1439,27 +1471,47 @@ mod tests {
     }
 
     #[test]
-    fn conversion_reward_ladder_dominates_non_goal_shots() {
-        let frac = REWARD_NON_CONVERSION_MAX_FRACTION;
-
-        // Shots already under fraction*goal pass through untouched and stay well below the goal.
-        let (goal, shot_base, shot_q) = grounded_conversion_ladder(12.0, 1.5, 1.0);
-        assert!(
-            shot_base + shot_q <= goal * frac + 1e-5,
-            "goal={goal} shots={}",
-            shot_base + shot_q
-        );
-        assert_eq!((goal, shot_base, shot_q), (12.0, 1.5, 1.0));
-
-        // Oversized shot shaping is scaled DOWN to fit under fraction*goal; the goal stays the reference.
+    fn football_outcomes_always_dominate_a_nonconverting_shot() {
         let (goal, shot_base, shot_q) = grounded_conversion_ladder(6.0, 18.0, 4.0);
-        assert!(
-            shot_base + shot_q <= goal * frac + 1e-5,
-            "goal={goal} shots={}",
-            shot_base + shot_q
-        );
-        assert_eq!(goal, 6.0);
-        assert!(goal <= REW_GOAL_MAX);
+        let weights = enforce_reward_hierarchy(Rw {
+            goal,
+            concede: 4.0,
+            match_win: 8.0,
+            match_loss: 6.0,
+            shot_base,
+            shot_q,
+            milestone: MIN_REWARD_WEIGHT,
+            pass_credit: MIN_REWARD_WEIGHT,
+            turnover: MIN_REWARD_WEIGHT,
+            bad_pass_turnover: MIN_REWARD_WEIGHT,
+            dribble_turnover: MIN_REWARD_WEIGHT,
+            recycle: MIN_REWARD_WEIGHT,
+            return_pass: MIN_REWARD_WEIGHT,
+            return_stale: MIN_REWARD_WEIGHT,
+            win_ball: MIN_REWARD_WEIGHT,
+            dribble: MIN_REWARD_WEIGHT,
+            shape: 0.5,
+            advance: MIN_REWARD_WEIGHT,
+            open: MIN_REWARD_WEIGHT,
+            width: MIN_REWARD_WEIGHT,
+            flank: MIN_REWARD_WEIGHT,
+            goalside: MIN_REWARD_WEIGHT,
+            goalside_run: MIN_REWARD_WEIGHT,
+            ahead: MIN_REWARD_WEIGHT,
+            make_run: MIN_REWARD_WEIGHT,
+            burst_gear: MIN_REWARD_WEIGHT,
+            field_pass: MIN_REWARD_WEIGHT,
+            field_turnover: MIN_REWARD_WEIGHT,
+            chance: MIN_REWARD_WEIGHT,
+            field_goalside_delta: MIN_REWARD_WEIGHT,
+            field_burst_delta: MIN_REWARD_WEIGHT,
+            stand_pen: MIN_REWARD_WEIGHT,
+            pursuit: MIN_REWARD_WEIGHT,
+        });
+        let miss_ceiling = max_nonconverting_shot_reward(&weights);
+        assert!(weights.goal >= miss_ceiling + CONVERSION_OVER_SHOT_MARGIN);
+        assert!(miss_ceiling <= weights.goal * REWARD_NON_CONVERSION_MAX_FRACTION + 1e-5);
+        assert!(weights.match_win >= weights.goal + WIN_OVER_CONVERSION_MARGIN);
     }
 
     #[test]

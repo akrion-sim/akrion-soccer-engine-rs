@@ -1203,6 +1203,8 @@ const SHOT_CLOSE_REWARD_PER_YARD: f64 = 0.9;
 const SHOT_FAR_PENALTY_PER_YARD: f64 = 1.6;
 const SHOT_DISTANCE_REWARD_MAX_POINTS: f64 = 14.0;
 pub(crate) const MIN_SOCCER_REWARD_WEIGHT: f64 = 0.0001;
+const CONVERSION_OVER_SHOT_REWARD_MARGIN: f64 = 5.0;
+const WIN_OVER_CONVERSION_REWARD_MARGIN: f64 = 20.0;
 const SHOT_COMMITMENT_REWARD_SCALE: f64 = 0.0;
 // FLANK / WING usage reward (#8): credit the on-ball player for working the ball in a WIDE channel
 // (toward a touchline), scaled UP when the team is in its OWN half — get it out of the congested
@@ -14996,7 +14998,7 @@ impl MatchOutcomeReward {
         let margin = score_diff_home.abs() as f64;
         let margin_bonus = MATCH_OUTCOME_PER_GOAL_MARGIN_POINTS
             * (margin - 1.0).clamp(0.0, MATCH_OUTCOME_MARGIN_CAP_GOALS - 1.0);
-        let magnitude = MATCH_OUTCOME_WIN_REWARD_POINTS + margin_bonus;
+        let magnitude = match_outcome_win_reward_points() + margin_bonus;
         let (home, away) = match score_diff_home.cmp(&0) {
             std::cmp::Ordering::Greater => (magnitude, -magnitude),
             std::cmp::Ordering::Less => (-magnitude, magnitude),
@@ -24457,6 +24459,50 @@ pub(crate) fn on_frame_shot_reward_scale() -> f64 {
     };
     let conversion_points = tunables().reward.goal_scored_points * goal_reward_scale();
     grounded_non_conversion_reward_scale(raw, SHOT_ON_TARGET_REWARD_POINTS, conversion_points)
+}
+
+fn hierarchy_bounded_shot_on_target_points(shot_scale: f64, goal_scale: f64) -> f64 {
+    let raw = SHOT_ON_TARGET_REWARD_POINTS * shot_scale.max(MIN_SOCCER_REWARD_WEIGHT);
+    let outcome_ceiling = GOAL_REWARD_POINTS * goal_scale.max(1.0)
+        - CONVERSION_OVER_SHOT_REWARD_MARGIN;
+    raw.min(outcome_ceiling.max(MIN_SOCCER_REWARD_WEIGHT))
+}
+
+fn hierarchy_projected_match_win_points(requested: f64, goal_scale: f64) -> f64 {
+    requested.max(
+        GOAL_REWARD_POINTS * goal_scale.max(1.0) + WIN_OVER_CONVERSION_REWARD_MARGIN,
+    )
+}
+
+pub(crate) fn match_outcome_win_reward_points() -> f64 {
+    let requested = if dynamic_reward_weights_enabled() {
+        reward_weight_env(
+            "DD_SOCCER_MATCH_WIN_REWARD_POINTS",
+            MATCH_OUTCOME_WIN_REWARD_POINTS,
+            MIN_SOCCER_REWARD_WEIGHT,
+            5_000.0,
+        )
+    } else {
+        use std::sync::OnceLock;
+        static V: OnceLock<f64> = OnceLock::new();
+        *V.get_or_init(|| {
+            reward_weight_env(
+                "DD_SOCCER_MATCH_WIN_REWARD_POINTS",
+                MATCH_OUTCOME_WIN_REWARD_POINTS,
+                MIN_SOCCER_REWARD_WEIGHT,
+                5_000.0,
+            )
+        })
+    };
+    hierarchy_projected_match_win_points(requested, goal_reward_scale())
+}
+
+pub(crate) fn bounded_shot_on_target_reward_points() -> f64 {
+    hierarchy_bounded_shot_on_target_points(shot_shaping_reward_scale(), goal_reward_scale())
+}
+
+pub(crate) fn bounded_shot_on_target_reward_scale() -> f64 {
+    bounded_shot_on_target_reward_points() / SHOT_ON_TARGET_REWARD_POINTS
 }
 
 pub(crate) fn shot_commitment_reward_scale() -> f64 {
@@ -38021,10 +38067,10 @@ fn soccer_learning_reward_contract() -> SoccerLearningRewardContract {
         goal_chain_pattern: GOAL_CHAIN_REWARD_PATTERN.to_vec(),
         // Shot-taken SHAPING dampener (forward-pass-primacy A/B). Scales only the on-target shot
         // PROXY reward — `goal_points` above is left intact so finishing still pays. Default 1.0.
-        shot_on_target_points: SHOT_ON_TARGET_REWARD_POINTS * shot_shaping_reward_scale(),
+        shot_on_target_points: bounded_shot_on_target_reward_points(),
         shot_on_target_pattern: SHOT_ON_TARGET_REWARD_PATTERN
             .iter()
-            .map(|points| points * shot_shaping_reward_scale())
+            .map(|points| points * bounded_shot_on_target_reward_scale())
             .collect(),
         possession_progress_milestone_yards: POSSESSION_PROGRESS_MILESTONE_YARDS,
         possession_progress_points: POSSESSION_PROGRESS_REWARD_POINTS,
@@ -72040,6 +72086,21 @@ mod reward_priority_tests {
                     + BUILDUP_CHAIN_CREDIT_SHOT_BASE_POINTS,
             "goal buildup credit should dominate non-goal shot buildup credit"
         );
+    }
+
+    #[test]
+    fn dynamic_shot_tuning_cannot_outvalue_a_goal_or_match_win() {
+        let shot = hierarchy_bounded_shot_on_target_points(4.0, 1.0);
+        let goal = GOAL_REWARD_POINTS;
+        let win = hierarchy_projected_match_win_points(MATCH_OUTCOME_WIN_REWARD_POINTS, 1.0);
+        assert!(shot + CONVERSION_OVER_SHOT_REWARD_MARGIN <= goal);
+        assert!(goal + WIN_OVER_CONVERSION_REWARD_MARGIN <= win);
+
+        let scaled_goal = hierarchy_bounded_shot_on_target_points(4.0, 3.0);
+        let goal = GOAL_REWARD_POINTS * 3.0;
+        let win = hierarchy_projected_match_win_points(MATCH_OUTCOME_WIN_REWARD_POINTS, 3.0);
+        assert!(scaled_goal + CONVERSION_OVER_SHOT_REWARD_MARGIN <= goal);
+        assert!(goal + WIN_OVER_CONVERSION_REWARD_MARGIN <= win);
     }
 
     #[test]
