@@ -100094,3 +100094,38 @@ fn mpc_reject_threshold_pipeline_collects_and_trains_end_to_end() {
     }
     std::env::remove_var("DD_SOCCER_ENABLE_MPC_REJECT_THRESHOLD_MODEL");
 }
+
+#[test]
+fn anchored_reward_currency_invariants() {
+    // One test fn so the env-flag transitions are ordered (parallel-safe):
+    // OFF ⇒ byte-identical legacy currency.
+    std::env::remove_var("DD_SOCCER_ENABLE_ANCHORED_REWARDS");
+    assert!(!anchored_rewards_enabled());
+    assert!((live_goal_reward_points() - GOAL_REWARD_POINTS).abs() < 1e-9);
+    assert!((anchored_currency_scale() - 1.0).abs() < 1e-9);
+
+    // ON ⇒ the anchors, exactly.
+    std::env::set_var("DD_SOCCER_ENABLE_ANCHORED_REWARDS", "true");
+    assert!((live_goal_reward_points() - ANCHOR_GOAL_POINTS).abs() < 1e-9);
+    assert!((match_outcome_win_reward_points() - ANCHOR_WIN_POINTS).abs() < 1e-9);
+    assert!(
+        (anchored_currency_scale() - ANCHOR_GOAL_POINTS / GOAL_REWARD_POINTS).abs() < 1e-9
+    );
+
+    // On-frame shot anchor: floor 50 everywhere (an on-frame 80-yarder pays
+    // exactly the floor), cap 200 = 0.40·goal at the best field-vector
+    // context, monotone between, clamped outside [0,1].
+    assert!((anchored_on_frame_shot_points(0.0) - ANCHOR_ON_FRAME_SHOT_FLOOR).abs() < 1e-9);
+    let best = anchored_on_frame_shot_points(1.0);
+    assert!((best - 200.0).abs() < 1e-9);
+    assert!(best <= ANCHOR_GOAL_POINTS * 0.40 + 1e-9);
+    assert!(anchored_on_frame_shot_points(0.8) > anchored_on_frame_shot_points(0.3));
+    assert!((anchored_on_frame_shot_points(7.0) - 200.0).abs() < 1e-9);
+
+    // Currency ordering: shot cap < goal < win, win = 2·goal, goal = 10·floor.
+    assert!(best < ANCHOR_GOAL_POINTS && ANCHOR_GOAL_POINTS < ANCHOR_WIN_POINTS);
+    assert!((ANCHOR_WIN_POINTS - 2.0 * ANCHOR_GOAL_POINTS).abs() < 1e-9);
+    assert!((ANCHOR_GOAL_POINTS - 10.0 * ANCHOR_ON_FRAME_SHOT_FLOOR).abs() < 1e-9);
+
+    std::env::remove_var("DD_SOCCER_ENABLE_ANCHORED_REWARDS");
+}
