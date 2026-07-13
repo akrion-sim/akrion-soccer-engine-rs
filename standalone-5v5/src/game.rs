@@ -142,7 +142,7 @@ pub const OBS_DIM: usize = 76; // 73 + possession/duel tri-state (contested, fav
 // Centralized-critic GLOBAL state (MAPPO / CTDE): the whole field in a single
 // canonical (Team-A attack) frame — every player's pos+vel + ball pos+vel +
 // energy + possession, shared by all agents. 2N*6 players + 4 ball + 3 possession + 1 bias.
-pub const GLOBAL_DIM: usize = 2 * N * 6 + 4 + 3 + 1; // = 60 + 4 + 3 + 1 = 68
+pub const GLOBAL_DIM: usize = 2 * N * 6 + 4 + 3 + 2 + 1; // = 60 + 4 + 3 + duel(2) + 1 = 70
 
 #[derive(Clone, Copy, Default, Debug)]
 pub struct V2 {
