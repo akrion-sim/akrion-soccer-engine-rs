@@ -567,6 +567,15 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
 
     let generations = env_usize_clamped("GENERATIONS", 12, 1, SELFPLAY_MAX_GENERATIONS);
     let promote_margin = env_f32_clamped("PROMOTE_MARGIN", 0.25, -20.0, 20.0);
+    // ANTI-DRIFT (mirrors the 11v11 league+analytic anchor). Pure latest-champion
+    // self-play drifts into rock-paper-scissors cycles: the challenger beats the
+    // champion while its ABSOLUTE skill (vs the fixed scripted baseline) collapses.
+    // Two guards: (1) train a fraction of iterations against the scripted baseline
+    // (every Nth iter) so absolute skill stays anchored; (2) require a promoted
+    // policy to ALSO not regress vs scripted (>= floor), so a champion never scores
+    // worse than the baseline it is supposed to have surpassed.
+    let anchor_every = env_usize_clamped("SCRIPTED_ANCHOR_EVERY", 3, 1, 100_000);
+    let scripted_floor = env_f32_clamped("SCRIPTED_FLOOR", 0.0, -20.0, 20.0);
     let speed_warmup = env_usize_clamped(
         "SPEED_WARMUP",
         (cfg.iters / 2).max(1),
@@ -610,10 +619,13 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
     );
 
     for round in 1..=generations {
-        // Install the current champion (None => scripted baseline) as Team B, then
-        // train the challenger against it.
-        train::set_selfplay_champion(champion.clone());
+        // MIXED OPPONENT: most iterations train against the current champion
+        // (self-play), but every `anchor_every`-th iteration trains against the
+        // scripted baseline (champion = None) so the challenger keeps practising
+        // how to beat the absolute reference and can't quietly forget it.
         for it in 1..=cfg.iters {
+            let vs_scripted = it % anchor_every == 0;
+            train::set_selfplay_champion(if vs_scripted { None } else { champion.clone() });
             train::set_speed_frozen(it <= speed_warmup);
             let beta = train::ent_beta_at(it, cfg.iters);
             let _ = train::train_iter(&mut challenger, cfg.games_per_iter, beta, &mut rng);
@@ -630,7 +642,10 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
         };
         // Absolute progress reference: challenger vs the scripted baseline.
         let s = train::evaluate(&challenger, cfg.eval_games, &mut rng);
-        let promoted = gd_champ >= promote_margin;
+        // Promote only if the challenger BEATS the champion head-to-head AND does not
+        // regress below the fixed scripted anchor — this refuses the cyclic-drift
+        // promotions where a policy wins the ladder but loses to the baseline.
+        let promoted = gd_champ >= promote_margin && s.goal_diff >= scripted_floor;
         if promoted {
             champion = Some(challenger.clone());
             champion_gen += 1;
