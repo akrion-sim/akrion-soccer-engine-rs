@@ -750,6 +750,7 @@ impl World {
         }
         self.ball = V2::new(FIELD_L / 2.0, FIELD_W / 2.0);
         self.ball_vel = V2::default();
+        self.reset_ball_flight();
         // Nearest attacker of `to` takes the ball at center.
         let idx = self.nearest_player(to, self.ball).0;
         self.owner = Some(Owner { team: to, idx });
