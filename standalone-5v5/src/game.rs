@@ -103,7 +103,136 @@ const CURL_MIN_DIST: f32 = 20.0; // passes/shots longer than this can be given c
 const CURL_ACCEL: f32 = 6.0; // lateral curl acceleration on a long ball (bends around a defender)
 const TACKLE_RADIUS: f32 = 1.6;
 const TACKLE_PROB: f32 = 0.16; // per-tick; retuned for 15 Hz to keep same per-second rate (~2.4/s)
-const BALL_FRICTION: f32 = 0.965; // per-tick decay retuned for 20 Hz (same per-second decay)
+#[allow(dead_code)]
+const BALL_FRICTION: f32 = 0.965; // legacy single-term decay (superseded by ball_resistance_after)
+// ---- 11v11-parity ball flight (soccer.rs constants) ----
+const BALL_DRAG_PER_TICK: f32 = 0.028; // DEFAULT_BALL_DRAG_PER_TICK (linear, half-life vs ref dt=1/15)
+const BALL_AIR_RESISTANCE: f32 = 0.0085; // DEFAULT_BALL_AIR_RESISTANCE (quadratic)
+const BALL_GRASS_RESISTANCE: f32 = 0.96; // DEFAULT_BALL_GRASS_RESISTANCE_YPS2 (ground contact only)
+const BALL_STOP_SPEED: f32 = 0.55; // DEFAULT_BALL_STOP_SPEED_YPS (snap to rest below this)
+const AERIAL_FLIGHT_DRAG_RELIEF: f32 = 0.88; // airborne linear+air relief
+const BALL_ROLLING_ALT: f32 = 0.06; // BALL_ROLLING_ALTITUDE_YARDS (at/below = grounded)
+// Standing reach + jump for an airborne interception (CONTROL_* reach constants).
+const CONTROL_STANDING_REACH: f32 = 1.6;
+const CONTROL_AERIAL_JUMP_REACH: f32 = 2.2;
+const LOW_BALL_INTERCEPT_FLOOR: f32 = 2.0;
+const KEEPER_AERIAL_REACH: f32 = 2.6; // keeper jump+arms: claims lofted balls only up to this altitude
+const AERIAL_LAND_AT_TARGET_DRAG_COMP: f32 = 1.08; // closed-form ignores drag: strike a touch firmer
+
+/// Peak height (yd) of a lofted pass over horizontal distance `d` (lofted_pass_apex_yards).
+fn lofted_apex_yds(d: f32) -> f32 {
+    (3.05 + (d - 15.0) * 0.11).clamp(1.6, 9.0)
+}
+/// Hang time (s) of a projectile that reaches `apex`: T = 2·√(2·apex/g).
+fn hang_time(apex: f32) -> f32 {
+    2.0 * (2.0 * apex / GRAVITY_YPS2).sqrt()
+}
+/// Closed-form altitude (yd) at `t` seconds into a loft with peak `apex`:
+/// z(t) = ½·g·t·(T−t), clamped to [0, hang]. No z-velocity, no bounce (soccer.rs).
+fn altitude_at(apex: f32, t: f32) -> f32 {
+    let hang = hang_time(apex);
+    let t = t.clamp(0.0, hang);
+    (0.5 * GRAVITY_YPS2 * t * (hang - t)).max(0.0)
+}
+/// Three-term ball drag (soccer.rs `ball_resistance_after`): linear + quadratic air + grass
+/// (ground only), with airborne relief and a low-speed stop-snap. Returns the new speed (yd/s).
+fn ball_resistance_after(speed: f32, altitude: f32) -> f32 {
+    let rolling = if altitude <= BALL_ROLLING_ALT {
+        1.0
+    } else {
+        (1.0 - (altitude - BALL_ROLLING_ALT) / 0.18).clamp(0.0, 1.0)
+    };
+    let relief = 1.0 - (1.0 - rolling) * AERIAL_FLIGHT_DRAG_RELIEF;
+    // linear: geometric per-tick decay, half-life-corrected to ref dt = 1/15 (== DT here)
+    let lin_ret = (1.0 - BALL_DRAG_PER_TICK).powf(DT / (1.0 / 15.0));
+    let lin_loss = speed * (1.0 - lin_ret) * relief;
+    let air_loss = BALL_AIR_RESISTANCE.min(0.10) * speed * speed * DT * relief;
+    let low = (1.0 - (speed / 12.0).min(1.0)) * 0.62;
+    let shear = ((speed - 12.0) / 24.0).clamp(0.0, 1.0).powi(2) * 0.42;
+    let skid = ((speed - 28.0) / 24.0).clamp(0.0, 1.0) * 0.22;
+    let grass = BALL_GRASS_RESISTANCE.min(5.0) * (1.0 + low + shear + skid) * rolling;
+    let s = (speed - (lin_loss + air_loss + grass * DT)).max(0.0);
+    if s > 0.0 && s < BALL_STOP_SPEED {
+        0.0
+    } else {
+        s
+    }
+}
+
+// ---- Pass-targeting solve (the coupling 4b084d26 omitted — its absence broke
+// training: drag constants landed without re-pacing pass power/lead, passes
+// arrived short/long, receivers missed, completion collapsed 76%→44%). Port of
+// the two 11v11 functions that keep flight physics and passing CONSISTENT:
+// `modulated_pass_speed_yps` (arrive in a receiver-timed window) and
+// `led_pass_target_for_receiver` (aim ahead of a moving receiver). ----------
+
+/// Horizontal carry (yd) of a GROUND ball launched at `v0`, integrated for
+/// `ticks` ticks with the same order step() uses (move, then decay).
+fn ground_carry_after_ticks(v0: f32, ticks: u32) -> f32 {
+    let mut v = v0;
+    let mut d = 0.0f32;
+    for _ in 0..ticks {
+        d += v * DT;
+        v = ball_resistance_after(v, 0.0);
+        if v <= 0.0 {
+            break;
+        }
+    }
+    d
+}
+
+/// GROUND-pass launch-speed SOLVE (11v11 `modulated_pass_speed_yps`, ground arm):
+/// the pass should ARRIVE at `distance` in `timed_time = clamp(0.46 + d/48,
+/// 0.60, 2.0)` seconds, scaled slightly by receiver openness (a pressured ball
+/// is zipped, an open receiver gets a softer weighted ball). The closed form
+/// `d / timed_time` ignores drag, so the ACTUAL per-tick 3-term drag is
+/// inverted numerically: bisect the launch speed whose simulated carry covers
+/// `distance` within the timed window (≤ 60 ticks). Clamped to a real kicking
+/// range; at the cap a long ball arrives a touch late but still arrives.
+fn ground_pass_launch_speed(distance: f32, openness01: f32) -> f32 {
+    let d = distance.max(0.1);
+    let openness = openness01.clamp(0.0, 1.0);
+    let pressure = 1.0 - openness;
+    let base_time = (0.46 + d / 48.0).clamp(0.60, 2.0);
+    let timed_time = (base_time * (1.0 + openness * 0.08 - pressure * 0.22)).max(0.35);
+    let ticks = ((timed_time / DT).ceil() as u32).clamp(1, 60);
+    let (mut lo, mut hi) = (mph_to_yps(7.0), 30.0f32); // soft floor .. ~61 mph driven cap
+    if ground_carry_after_ticks(hi, ticks) <= d {
+        return hi; // out of leg range: hit it flat out, arrives late but arrives
+    }
+    for _ in 0..24 {
+        let mid = 0.5 * (lo + hi);
+        if ground_carry_after_ticks(mid, ticks) < d {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    0.5 * (lo + hi)
+}
+
+/// Distance from `origin` along unit `dir` to the inset pitch boundary — the
+/// 11v11 aerial OOB landing-safety analogue: a lofted launch is capped so its
+/// gravity-fixed carry cannot land out of bounds.
+fn carry_to_boundary(origin: V2, dir: V2) -> f32 {
+    let m = 0.8f32;
+    let mut t = f32::INFINITY;
+    if dir.x > 1e-6 {
+        t = t.min((FIELD_L - m - origin.x) / dir.x);
+    } else if dir.x < -1e-6 {
+        t = t.min((m - origin.x) / dir.x);
+    }
+    if dir.y > 1e-6 {
+        t = t.min((FIELD_W - m - origin.y) / dir.y);
+    } else if dir.y < -1e-6 {
+        t = t.min((m - origin.y) / dir.y);
+    }
+    if t.is_finite() {
+        t.max(0.0)
+    } else {
+        0.0
+    }
+}
 const PASS_SPEED: f32 = 18.0;
 const SHOT_SPEED: f32 = 24.0;
 const CLEAR_SPEED: f32 = 20.0;
