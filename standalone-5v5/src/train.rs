@@ -659,12 +659,15 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
         // Shoot-spam is stopped structurally by the cooldown: a rapid-fire repeat
         // shot (fired while a prior shot is still "hot") pays nothing.
         if w.ev_shot_on_a && !w.shot_was_rapid_a {
-            // DYNAMIC, position-dependent shot reward: scaled by the xG of WHERE the
-            // shot was taken (distance + angle to goal). A close central chance pays
-            // full; a hopeful long-range/wide pot-shot (now legal from the whole
-            // opponent half) pays almost nothing — so the policy must work the ball
-            // into a good position, not just fling it goalward.
-            r += (rw().shot_base + rw().shot_q * w.last_shot_quality_a) * w.last_shot_xg_a;
+            // Anchored on-frame shot (docs/reward-anchoring.md §2): the floor is
+            // 50 points no matter where from — a genuinely on-frame shot always
+            // tested the keeper. Position (xg of WHERE it was taken) controls the
+            // CAP, not the floor: a hopeful long-range pot-shot caps at the floor,
+            // a close central chance can reach 200 (= 0.40·goal). MPC placement
+            // quality interpolates inside the band. Spam is blocked structurally:
+            // ev_shot_on requires a legal, earned shot and the cooldown zeroes
+            // rapid-fire repeats.
+            r += anchored_shot_points(w.last_shot_quality_a, w.last_shot_xg_a, rw().shot_span);
         }
         // reward winning the ball back (pressing / interceptions / tackles)
         if w.ev_win_ball_a {
