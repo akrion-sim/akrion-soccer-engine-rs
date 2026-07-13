@@ -554,7 +554,6 @@ pub struct World {
     pub ball_curl: V2, // lateral curl (spin) accel on a long (>20yd) pass/shot
     pending_curl: V2, // scratch: curl for the kick launching this tick
     pending_aerial: bool, // scratch: the pass launched this tick is a loft
-    pending_air_ticks: u32, // scratch: legacy airborne-duration (unused by the z model)
     pending_apex: f32, // scratch: apex of the loft launching this tick
     pending_aerial_speed: f32, // scratch: land-on-target horizontal launch speed for the loft
     pub owner: Option<Owner>,
