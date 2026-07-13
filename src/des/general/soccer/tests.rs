@@ -38045,7 +38045,10 @@ fn pass_and_shot_preserve_release_facing_after_recovery_movement() {
 
     shot_sim.apply_player_intent(PlayerIntent {
         player_id: shooter,
-        action: SoccerAction::Shoot { power: 1.0 },
+        action: SoccerAction::Shoot {
+            power: 1.0,
+            target_point: None,
+        },
         sprint: false,
     });
 
