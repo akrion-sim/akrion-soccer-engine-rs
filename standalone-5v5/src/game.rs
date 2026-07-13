@@ -1690,8 +1690,12 @@ impl World {
                         self.ev_return_pass_a = is_return;
                     }
                     self.pending_curl = self.kick_curl(team, me, tp);
-                    let pass_dist = tp.sub(me).len();
-                    let pspeed = PASS_SPEED * (0.85 + 0.35 * (pass_dist / FIELD_L).clamp(0.0, 1.0));
+                    // Lead the pass to where the receiver is running, and solve the launch speed
+                    // against the actual 3-term drag so the ball ARRIVES at that lead point with
+                    // collectable pace (the physics-parity grass drag makes the old fixed formula
+                    // fall short — the root cause of the pass-completion regression).
+                    let pass_dist = lead.sub(me).len();
+                    let pspeed = pass_launch_speed(pass_dist);
                     Some((owner, lead.sub(me), pspeed, true))
                 } else {
                     // no valid target: dribble forward instead
