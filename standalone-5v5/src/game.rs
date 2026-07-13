@@ -451,6 +451,7 @@ pub struct World {
     pub shoot_cooldown_a: u32,  // ticks until an A shot counts as a "fresh" chance again
     pub shot_was_rapid_a: bool, // this tick's A shot came while the cooldown was still active
     a_shot_flag: bool,          // the current free ball came from a Team-A shot (gates goals)
+    a_shot_origin: V2,          // where that A shot was struck from (save-model lane + distance)
     lp_from: i32,               // passer index of the last completed A pass
     lp_to: i32,                 // receiver index of the last completed A pass
     pending_passer: i32,        // passer index of the in-flight A pass
