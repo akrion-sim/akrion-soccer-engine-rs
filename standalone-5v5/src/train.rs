@@ -604,15 +604,17 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
             r += REW_GOAL_POINTS; // GOALS are the prize (anchor: 500)
         }
         if w.ev_goal_b {
-            r -= REW_GOAL_POINTS; // conceding mirrors the goal anchor
+            // Conceding stings a discoverable fraction of the goal anchor —
+            // the risk-appetite knob (full symmetry trains passive).
+            r -= REW_GOAL_POINTS * rw().concede_frac;
         }
         if step + 1 == STEPS {
-            // Match outcome anchor: win +1000 / loss −1000 / draw 0 — the top
-            // of the currency, symmetric, terminal.
+            // Match outcome anchor: win +1000 (fixed); losing costs a
+            // discoverable fraction of it; draw 0.
             if w.goals_a > w.goals_b {
                 r += REW_WIN_POINTS;
             } else if w.goals_a < w.goals_b {
-                r -= REW_WIN_POINTS;
+                r -= REW_WIN_POINTS * rw().loss_frac;
             }
         }
         // MARL SYNCHRONIZATION: reward the TEAM for collectively moving into a
