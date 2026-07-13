@@ -1457,4 +1457,68 @@ mod tests {
 
         assert_eq!(strip, BrainStripOptions::all_aux());
     }
+
+    #[test]
+    fn keepbest_score_orders_goal_diff_first_then_sot() {
+        let strong_gd = KeepBestScore {
+            goal_diff_per_game: 1.0,
+            sot_per_game: 0.0,
+        };
+        let weak_gd_high_sot = KeepBestScore {
+            goal_diff_per_game: 0.5,
+            sot_per_game: 9.0,
+        };
+        // Goal diff is primary: a big SOT count never outranks a better goal diff.
+        assert!(strong_gd.better_than(&weak_gd_high_sot));
+        assert!(!weak_gd_high_sot.better_than(&strong_gd));
+
+        // SOT breaks exact goal-diff ties (anti-passivity).
+        let tie_more_sot = KeepBestScore {
+            goal_diff_per_game: 1.0,
+            sot_per_game: 2.0,
+        };
+        assert!(tie_more_sot.better_than(&strong_gd));
+        assert!(!strong_gd.better_than(&tie_more_sot));
+
+        // Strict: an equal score holds (does not rewrite .best.json).
+        assert!(!strong_gd.better_than(&strong_gd));
+
+        // Negative goal diffs order correctly too.
+        let less_bad = KeepBestScore {
+            goal_diff_per_game: -0.5,
+            sot_per_game: 0.0,
+        };
+        let more_bad = KeepBestScore {
+            goal_diff_per_game: -2.0,
+            sot_per_game: 5.0,
+        };
+        assert!(less_bad.better_than(&more_bad));
+        assert!(!more_bad.better_than(&less_bad));
+    }
+
+    #[test]
+    fn keepbest_config_is_off_unless_every_positive() {
+        // every=0 (the unset default) disables keep-best entirely — train-ckpt stays
+        // byte-identical without the env vars.
+        assert_eq!(KeepBestConfig::from_parts(0, 12, 0xE7A1_BEEF), None);
+
+        let kb = KeepBestConfig::from_parts(5, 12, 0xE7A1_BEEF).expect("enabled");
+        assert_eq!(kb.every, 5);
+        assert_eq!(kb.games, 12);
+        assert_eq!(kb.holdout, 0xE7A1_BEEF);
+
+        // games floor: a zero proxy-eval budget is clamped to 1 rather than dividing by zero.
+        let kb = KeepBestConfig::from_parts(2, 0, 1).expect("enabled");
+        assert_eq!(kb.games, 1);
+    }
+
+    #[test]
+    fn keepbest_cadence_hits_every_n_and_final_game() {
+        let due: Vec<usize> = (1..=10).filter(|&done| keepbest_due(done, 10, 4)).collect();
+        assert_eq!(due, vec![4, 8, 10]);
+        // Disabled cadence never fires.
+        assert!((1..=10).all(|done| !keepbest_due(done, 10, 0)));
+        // A final game that also lands on the cadence fires once (single check site).
+        assert!(keepbest_due(10, 10, 5));
+    }
 }
