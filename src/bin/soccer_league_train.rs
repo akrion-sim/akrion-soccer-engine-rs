@@ -199,6 +199,12 @@ struct LeagueMatchKpis {
     learned_mpc_replans_mpc: u32,
     learned_mpc_replans_option_score_safety: u32,
     learned_mpc_replans_neural_mcts: u32,
+    policy_priority_samples: u32,
+    planner_teacher_candidates: u32,
+    planner_teacher_samples: u32,
+    planner_teacher_forward_samples: u32,
+    planner_teacher_weight_sum: f64,
+    planner_teacher_advantage_sum: f64,
     objective_fitness: f64,
     objective_fitness_margin: f64,
 }
@@ -245,6 +251,14 @@ impl LeagueMatchKpis {
                 learned_mpc_replans_option_score_safety: stats
                     .learned_mpc_replans_option_score_safety,
                 learned_mpc_replans_neural_mcts: stats.learned_mpc_replans_neural_mcts,
+                policy_priority_samples: stats.policy_priority_samples,
+                planner_teacher_candidates: stats.planner_teacher_missed_opportunity_candidates,
+                planner_teacher_samples: stats.planner_teacher_missed_opportunity_samples,
+                planner_teacher_forward_samples: stats
+                    .planner_teacher_missed_opportunity_forward_samples,
+                planner_teacher_weight_sum: stats.planner_teacher_missed_opportunity_weight_sum,
+                planner_teacher_advantage_sum: stats
+                    .planner_teacher_missed_opportunity_advantage_sum,
                 objective_fitness: home_net_forward as f64,
                 objective_fitness_margin: (home_net_forward - away_net_forward) as f64,
             },
@@ -282,6 +296,14 @@ impl LeagueMatchKpis {
                 learned_mpc_replans_option_score_safety: stats
                     .learned_mpc_replans_option_score_safety,
                 learned_mpc_replans_neural_mcts: stats.learned_mpc_replans_neural_mcts,
+                policy_priority_samples: stats.policy_priority_samples,
+                planner_teacher_candidates: stats.planner_teacher_missed_opportunity_candidates,
+                planner_teacher_samples: stats.planner_teacher_missed_opportunity_samples,
+                planner_teacher_forward_samples: stats
+                    .planner_teacher_missed_opportunity_forward_samples,
+                planner_teacher_weight_sum: stats.planner_teacher_missed_opportunity_weight_sum,
+                planner_teacher_advantage_sum: stats
+                    .planner_teacher_missed_opportunity_advantage_sum,
                 objective_fitness: away_net_forward as f64,
                 objective_fitness_margin: (away_net_forward - home_net_forward) as f64,
             },
@@ -323,6 +345,12 @@ struct LeagueRoundKpis {
     learned_mpc_replans_mpc: u32,
     learned_mpc_replans_option_score_safety: u32,
     learned_mpc_replans_neural_mcts: u32,
+    policy_priority_samples: u32,
+    planner_teacher_candidates: u32,
+    planner_teacher_samples: u32,
+    planner_teacher_forward_samples: u32,
+    planner_teacher_weight_sum: f64,
+    planner_teacher_advantage_sum: f64,
     objective_fitness_sum: f64,
     objective_fitness_margin_sum: f64,
 }
@@ -401,6 +429,20 @@ impl LeagueRoundKpis {
         self.learned_mpc_replans_neural_mcts = self
             .learned_mpc_replans_neural_mcts
             .saturating_add(kpis.learned_mpc_replans_neural_mcts);
+        self.policy_priority_samples = self
+            .policy_priority_samples
+            .saturating_add(kpis.policy_priority_samples);
+        self.planner_teacher_candidates = self
+            .planner_teacher_candidates
+            .saturating_add(kpis.planner_teacher_candidates);
+        self.planner_teacher_samples = self
+            .planner_teacher_samples
+            .saturating_add(kpis.planner_teacher_samples);
+        self.planner_teacher_forward_samples = self
+            .planner_teacher_forward_samples
+            .saturating_add(kpis.planner_teacher_forward_samples);
+        self.planner_teacher_weight_sum += kpis.planner_teacher_weight_sum;
+        self.planner_teacher_advantage_sum += kpis.planner_teacher_advantage_sum;
         self.objective_fitness_sum += kpis.objective_fitness;
         self.objective_fitness_margin_sum += kpis.objective_fitness_margin;
     }
@@ -1094,6 +1136,10 @@ fn main() {
     env_default_f64("DD_SOCCER_FORWARD_RELEASE_MIN_COMPLETION", 0.35);
     env_default_bool("DD_SOCCER_ENABLE_FORWARD_SELECT_LOGIT", true);
     let forward_select_logit_weight = env_default_f64("DD_SOCCER_FORWARD_SELECT_LOGIT_WEIGHT", 2.0);
+    let forward_select_restore_override = env_default_bool(
+        "DD_SOCCER_FORWARD_SELECT_LOGIT_WEIGHT_OVERRIDE_ON_RESTORE",
+        false,
+    );
     let finishing_select_bonus_weight = env_reward_f64(
         "SOCCER_NEURAL_FINISHING_SELECT_BONUS_WEIGHT",
         0.70,
@@ -1402,7 +1448,7 @@ fn main() {
     let mut best_checkpoint_net_forward_pass_margin = f64::NEG_INFINITY;
     let mut archived_step_buckets: BTreeSet<usize> = BTreeSet::new();
     println!(
-        "league_train_started_at_utc={} games/opp={} minutes={} period_count={} weight_decay={} fresh_opp={} checkpoint_every={} max_rounds={} max_training_steps={} max_target_entries_per_side={} advancement_metric=completed_forward_passes net_metric=completed_forward_passes_minus_turnovers analytic_opponents={} uniform_elite_players={} seed_varied_skills={} hermetic_neural={} attack_canonical_features={} ball_zone_tactical_scale={} player_grid_xy_features={} policy_train_max_transitions_per_tick={} full_game_learning_enabled={} neural_learning_rate={} neural_optimizer_momentum={} neural_blend_mode={:?} neural_blend_lambda={} neural_authoritative_lambda={} neural_blend_candidates={} neural_blend_warmup_steps={} policy_entropy_coeff={} forward_select_logit_weight={} finishing_select_bonus_weight={} finishing_selection_floor={} finishing_selection_max_regression={} finishing_selection_shot_drought_boost={finishing_selection_shot_drought_boost} finishing_selection_max_effective_floor={finishing_selection_max_effective_floor} forward_creation_selection_floor={forward_creation_selection_floor} forward_creation_selection_max_regression={forward_creation_selection_max_regression} forward_creation_min_quality={forward_creation_min_quality} forward_creation_min_completion={forward_creation_min_completion} forward_creation_min_forward_yards={forward_creation_min_forward_yards} forward_creation_bypass_min_quality={forward_creation_bypass_min_quality} forward_creation_bypass_min_completion={forward_creation_bypass_min_completion} planner_teacher_missed_opportunity={planner_teacher_missed_opportunity} planner_teacher_advantage_floor={planner_teacher_advantage_floor:.3} planner_teacher_advantage_max={planner_teacher_advantage_max:.3} planner_teacher_weight={planner_teacher_weight:.2} planner_teacher_min_score_share={planner_teacher_min_score_share:.3} planner_teacher_min_shot_quality={planner_teacher_min_shot_quality:.2} planner_teacher_min_forward_quality={planner_teacher_min_forward_quality:.2} planner_teacher_min_forward_completion={planner_teacher_min_forward_completion:.2} planner_teacher_max_samples_per_decision={planner_teacher_max_samples_per_decision} planner_teacher_include_same_pass_family={planner_teacher_include_same_pass_family} planner_teacher_same_pass_min_margin_share={planner_teacher_same_pass_min_margin_share:.3} chance_quality_reward={} chance_quality_composite={} chance_quality_k={} chance_quality_cap={} league_neural_mcts_enabled={} actor_critic_enabled={} lp_coupling_enabled={} target_standardization_enabled={} mc_critic_target_enabled={} neural_self_bootstrap_enabled={} maxa_bootstrap_enabled={} novelty_bonus_enabled={} fast_actor_reward_fallback_enabled={} pass_outcome_priority_learning_enabled={} forward_pass_climb_curriculum_enabled={} dp_bootstrap_enabled={} dp_bootstrap_horizon={} dp_bootstrap_sweeps={} mpc_tier2_enabled={} mpc_reconcile_enabled={} mpc_field_aware_enabled={} mpc_latent_objective_enabled={} local_mpc_enabled={} checkpoint_require_forward_pass_climb={} checkpoint_max_forward_pass_regression={} checkpoint_min_forward_pass_margin={} checkpoint_validate_games={} checkpoint_validate_min_forward_pass_margin={} checkpoint_validate_min_net_forward_pass_margin={} checkpoint_validate_min_goal_diff_margin={} frontier={} candidate_frontier={} archive={} step_archive_dir={} step_archive_buckets={:?}",
+        "league_train_started_at_utc={} games/opp={} minutes={} period_count={} weight_decay={} fresh_opp={} checkpoint_every={} max_rounds={} max_training_steps={} max_target_entries_per_side={} advancement_metric=completed_forward_passes net_metric=completed_forward_passes_minus_turnovers analytic_opponents={} uniform_elite_players={} seed_varied_skills={} hermetic_neural={} attack_canonical_features={} ball_zone_tactical_scale={} player_grid_xy_features={} policy_train_max_transitions_per_tick={} full_game_learning_enabled={} neural_learning_rate={} neural_optimizer_momentum={} neural_blend_mode={:?} neural_blend_lambda={} neural_authoritative_lambda={} neural_blend_candidates={} neural_blend_warmup_steps={} policy_entropy_coeff={} forward_select_logit_weight={} forward_select_restore_override={forward_select_restore_override} finishing_select_bonus_weight={} finishing_selection_floor={} finishing_selection_max_regression={} finishing_selection_shot_drought_boost={finishing_selection_shot_drought_boost} finishing_selection_max_effective_floor={finishing_selection_max_effective_floor} forward_creation_selection_floor={forward_creation_selection_floor} forward_creation_selection_max_regression={forward_creation_selection_max_regression} forward_creation_min_quality={forward_creation_min_quality} forward_creation_min_completion={forward_creation_min_completion} forward_creation_min_forward_yards={forward_creation_min_forward_yards} forward_creation_bypass_min_quality={forward_creation_bypass_min_quality} forward_creation_bypass_min_completion={forward_creation_bypass_min_completion} planner_teacher_missed_opportunity={planner_teacher_missed_opportunity} planner_teacher_advantage_floor={planner_teacher_advantage_floor:.3} planner_teacher_advantage_max={planner_teacher_advantage_max:.3} planner_teacher_weight={planner_teacher_weight:.2} planner_teacher_min_score_share={planner_teacher_min_score_share:.3} planner_teacher_min_shot_quality={planner_teacher_min_shot_quality:.2} planner_teacher_min_forward_quality={planner_teacher_min_forward_quality:.2} planner_teacher_min_forward_completion={planner_teacher_min_forward_completion:.2} planner_teacher_max_samples_per_decision={planner_teacher_max_samples_per_decision} planner_teacher_include_same_pass_family={planner_teacher_include_same_pass_family} planner_teacher_same_pass_min_margin_share={planner_teacher_same_pass_min_margin_share:.3} chance_quality_reward={} chance_quality_composite={} chance_quality_k={} chance_quality_cap={} league_neural_mcts_enabled={} actor_critic_enabled={} lp_coupling_enabled={} target_standardization_enabled={} mc_critic_target_enabled={} neural_self_bootstrap_enabled={} maxa_bootstrap_enabled={} novelty_bonus_enabled={} fast_actor_reward_fallback_enabled={} pass_outcome_priority_learning_enabled={} forward_pass_climb_curriculum_enabled={} dp_bootstrap_enabled={} dp_bootstrap_horizon={} dp_bootstrap_sweeps={} mpc_tier2_enabled={} mpc_reconcile_enabled={} mpc_field_aware_enabled={} mpc_latent_objective_enabled={} local_mpc_enabled={} checkpoint_require_forward_pass_climb={} checkpoint_max_forward_pass_regression={} checkpoint_min_forward_pass_margin={} checkpoint_validate_games={} checkpoint_validate_min_forward_pass_margin={} checkpoint_validate_min_net_forward_pass_margin={} checkpoint_validate_min_goal_diff_margin={} frontier={} candidate_frontier={} archive={} step_archive_dir={} step_archive_buckets={:?}",
         chrono_now(),
         games_per_opp,
         minutes,
@@ -1797,7 +1843,7 @@ fn main() {
             mean_net_forward_pass_margin,
         );
         println!(
-            "league_kpi round={round} games={} advancement_metric=completed_forward_passes net_metric=completed_forward_passes_minus_turnovers forward_pass_margin_per_game={:.3} net_forward_pass_margin_per_game={:.3} objective_net_forward_passes={:.3} objective_net_forward_pass_margin={:.3} gd_total={} gd_per_game={:.2} goals_for={} goals_against={} shots_for={} shots_against={} sot_for={} sot_against={} shots_after_pass={} pass_completion={:.3} completed_passes={} forward_passes={} backward_passes={} dribble_beats={} assists={} crosses={} chain_gain_yards={:.1} chain_net_losses={} learned_policy_option_decisions={} learned_policy_multi_option_decisions={} learned_policy_legal_action_options={} learned_mpc_replans={} learned_mpc_replans_mpc={} learned_mpc_replans_option_score_safety={} learned_mpc_replans_neural_mcts={} learned_mpc_replan_rate={:.3}",
+            "league_kpi round={round} games={} advancement_metric=completed_forward_passes net_metric=completed_forward_passes_minus_turnovers forward_pass_margin_per_game={:.3} net_forward_pass_margin_per_game={:.3} objective_net_forward_passes={:.3} objective_net_forward_pass_margin={:.3} gd_total={} gd_per_game={:.2} goals_for={} goals_against={} shots_for={} shots_against={} sot_for={} sot_against={} shots_after_pass={} pass_completion={:.3} completed_passes={} forward_passes={} backward_passes={} dribble_beats={} assists={} crosses={} chain_gain_yards={:.1} chain_net_losses={} learned_policy_option_decisions={} learned_policy_multi_option_decisions={} learned_policy_legal_action_options={} learned_mpc_replans={} learned_mpc_replans_mpc={} learned_mpc_replans_option_score_safety={} learned_mpc_replans_neural_mcts={} learned_mpc_replan_rate={:.3} actor_last_batch_priority_samples={} actor_last_batch_teacher_candidates={} actor_last_batch_teacher_samples={} actor_last_batch_teacher_forward_samples={} actor_last_batch_teacher_weight_sum={:.3} actor_last_batch_teacher_advantage_sum={:.3}",
             round_kpis.games,
             mean_forward_pass_margin,
             mean_net_forward_pass_margin,
@@ -1829,6 +1875,12 @@ fn main() {
             round_kpis.learned_mpc_replans_option_score_safety,
             round_kpis.learned_mpc_replans_neural_mcts,
             learned_mpc_replan_rate,
+            round_kpis.policy_priority_samples,
+            round_kpis.planner_teacher_candidates,
+            round_kpis.planner_teacher_samples,
+            round_kpis.planner_teacher_forward_samples,
+            round_kpis.planner_teacher_weight_sum,
+            round_kpis.planner_teacher_advantage_sum,
         );
 
         // Temporal checkpoint into the league (growing diversity of past selves).

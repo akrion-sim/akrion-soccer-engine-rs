@@ -9313,6 +9313,64 @@ fn soccer_planner_teacher_candidate_min_quality(family: &str) -> f64 {
     }
 }
 
+/// Optional POMDP-observation teacher for the explicit forward-release action. This does not need
+/// neural MCTS or a forward option to survive the scored-candidate cap: when the field vector says
+/// a qualified forward receiver exists but another action was executed, it supplies one bounded
+/// counterfactual actor sample. Default OFF keeps the established teacher path byte-identical.
+fn soccer_planner_teacher_observation_forward_fallback(
+    decision: &AgentDecisionTrace,
+    role: PlayerRole,
+) -> Option<SoccerPlannerTeacherActionSample> {
+    if !soccer_planner_teacher_env_bool(
+        "DD_SOCCER_PLANNER_TEACHER_OBSERVATION_FORWARD_FALLBACK",
+        false,
+    ) || role == PlayerRole::Goalkeeper
+        || !forward_release_opportunity_present(&decision.observation)
+        || soccer_planner_teacher_action_family(&decision.action) == Some("forward-release-pass")
+    {
+        return None;
+    }
+    let family = "forward-release-pass";
+    let quality = soccer_planner_teacher_forward_quality(&decision.observation);
+    let min_quality = soccer_planner_teacher_candidate_min_quality(family);
+    if quality < min_quality
+        || decision.observation.expected_pass_completion
+            < soccer_planner_teacher_env_f64(
+                "SOCCER_PLANNER_TEACHER_MIN_FORWARD_COMPLETION",
+                SOCCER_PLANNER_TEACHER_MIN_FORWARD_COMPLETION,
+                0.0,
+                1.0,
+            )
+    {
+        return None;
+    }
+    let floor = soccer_planner_teacher_env_f64(
+        "SOCCER_PLANNER_TEACHER_ADVANTAGE_FLOOR",
+        SOCCER_PLANNER_TEACHER_MISSED_OPPORTUNITY_ADVANTAGE_FLOOR,
+        0.0,
+        2.0,
+    );
+    let advantage_max = soccer_planner_teacher_env_f64(
+        "SOCCER_PLANNER_TEACHER_ADVANTAGE_MAX",
+        SOCCER_PLANNER_TEACHER_MISSED_OPPORTUNITY_ADVANTAGE_MAX,
+        floor,
+        5.0,
+    );
+    let advantage = (floor + (quality - min_quality).max(0.0) * 0.22).clamp(floor, advantage_max);
+    Some(SoccerPlannerTeacherActionSample {
+        action: family.to_string(),
+        advantage,
+        weight: soccer_planner_teacher_env_f64(
+            "SOCCER_PLANNER_TEACHER_WEIGHT",
+            SOCCER_PLANNER_TEACHER_MISSED_OPPORTUNITY_WEIGHT,
+            1.0,
+            SOCCER_POLICY_PRIORITY_WEIGHT_MAX,
+        ),
+        quality,
+        score_margin: 0.0,
+    })
+}
+
 fn soccer_planner_teacher_missed_opportunities(
     decision: &AgentDecisionTrace,
     role: PlayerRole,
@@ -9320,13 +9378,18 @@ fn soccer_planner_teacher_missed_opportunities(
     if !soccer_planner_teacher_missed_opportunity_enabled()
         || role == PlayerRole::Goalkeeper
         || !decision.observation.has_ball
-        || decision.action_options.is_empty()
     {
         return Vec::new();
     }
 
+    let observation_forward_fallback =
+        soccer_planner_teacher_observation_forward_fallback(decision, role);
+    if decision.action_options.is_empty() {
+        return observation_forward_fallback.into_iter().collect();
+    }
+
     let Some(chosen_family) = soccer_planner_teacher_action_family(&decision.action) else {
-        return Vec::new();
+        return observation_forward_fallback.into_iter().collect();
     };
     let best_legal_score = decision
         .action_options
@@ -9335,7 +9398,7 @@ fn soccer_planner_teacher_missed_opportunities(
         .map(|option| soccer_finite_option_score(option))
         .fold(0.0, f64::max);
     if best_legal_score <= 1e-9 {
-        return Vec::new();
+        return observation_forward_fallback.into_iter().collect();
     }
     let chosen_score = decision
         .action_options
@@ -9436,6 +9499,14 @@ fn soccer_planner_teacher_missed_opportunities(
             }
         } else {
             candidates.push(candidate);
+        }
+    }
+    if let Some(fallback) = observation_forward_fallback {
+        if !candidates
+            .iter()
+            .any(|candidate| candidate.action == fallback.action)
+        {
+            candidates.push(fallback);
         }
     }
     candidates.sort_by(|a, b| {
@@ -43368,6 +43439,13 @@ fn soccer_forward_select_logit_weight_env_override() -> Option<f64> {
         .map(|value| value.clamp(0.0, SOCCER_FORWARD_SELECT_LOGIT_WEIGHT_MAX))
 }
 
+fn soccer_forward_select_logit_weight_override_on_restore() -> bool {
+    soccer_planner_teacher_env_bool(
+        "DD_SOCCER_FORWARD_SELECT_LOGIT_WEIGHT_OVERRIDE_ON_RESTORE",
+        true,
+    )
+}
+
 #[cfg(test)]
 mod soccer_policy_actor_capacity_tests {
     use super::*;
@@ -43523,6 +43601,24 @@ mod soccer_policy_actor_capacity_tests {
         let restored_corrupt =
             soccer_policy_head_from_snapshot(&corrupt, 21).expect("restore corrupt policy");
         assert_eq!(restored_corrupt.forward_select_logit_weight, 0.0);
+    }
+
+    #[test]
+    fn forward_select_restore_override_can_preserve_learned_checkpoint_weight() {
+        let _lock = env_lock();
+        let _gate = set_test_env_var("DD_SOCCER_ENABLE_FORWARD_SELECT_LOGIT", "1");
+        let _weight = set_test_env_var("DD_SOCCER_FORWARD_SELECT_LOGIT_WEIGHT", "2.0");
+        let _restore = set_test_env_var(
+            "DD_SOCCER_FORWARD_SELECT_LOGIT_WEIGHT_OVERRIDE_ON_RESTORE",
+            "0",
+        );
+        let mut head = SoccerPolicyHead::new(22);
+        head.forward_select_logit_weight = 3.25;
+        let snapshot = soccer_policy_head_snapshot(&head);
+
+        let restored = soccer_policy_head_from_snapshot(&snapshot, 22).expect("restore policy");
+
+        assert_eq!(restored.forward_select_logit_weight, 3.25);
     }
 
     #[test]
@@ -45680,8 +45776,10 @@ fn soccer_policy_head_from_snapshot(
     // Diagnostic/climb-lane override: with the gate on, allow a fixed
     // forward-select weight for smoke/A-B runs. It is baked into the per-net
     // field once here and obeys the same nonnegative clamp as training.
-    if let Some(weight) = soccer_forward_select_logit_weight_env_override() {
-        head.forward_select_logit_weight = weight;
+    if soccer_forward_select_logit_weight_override_on_restore() {
+        if let Some(weight) = soccer_forward_select_logit_weight_env_override() {
+            head.forward_select_logit_weight = weight;
+        }
     }
     Ok(head)
 }

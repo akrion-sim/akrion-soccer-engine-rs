@@ -86828,6 +86828,35 @@ fn forward_pass_climb_curriculum_env_lock() -> std::sync::MutexGuard<'static, ()
 }
 
 #[test]
+fn observation_forward_teacher_supplies_sample_without_planner_options() {
+    let _env = forward_pass_climb_curriculum_env_lock();
+    let _teacher = TestEnvVarGuard::set("DD_SOCCER_ENABLE_PLANNER_TEACHER_MISSED_OPPORTUNITY", "1");
+    let _fallback = TestEnvVarGuard::set(
+        "DD_SOCCER_PLANNER_TEACHER_OBSERVATION_FORWARD_FALLBACK",
+        "1",
+    );
+    let sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let mut decision = test_decision_trace(&snapshot, 8, "protect-ball");
+    decision.action_options.clear();
+    decision.observation.has_ball = true;
+    decision.observation.visible_forward_pass_options = 1;
+    decision.observation.best_forward_pass_option_quality = 0.90;
+    decision.observation.best_forward_pass_receiver_openness = 0.85;
+    decision.observation.quick_forward_pass_value = 0.88;
+    decision.observation.expected_pass_completion = 0.84;
+    decision.observation.floor_pass_lane_score = 0.80;
+
+    let teachers = soccer_planner_teacher_missed_opportunities(&decision, PlayerRole::Midfielder);
+
+    assert_eq!(teachers.len(), 1);
+    assert_eq!(teachers[0].action, "forward-release-pass");
+    assert!(teachers[0].quality >= 0.80);
+    assert!(teachers[0].advantage > 0.0);
+    assert!(teachers[0].weight >= 1.0);
+}
+
+#[test]
 fn forward_pass_climb_curriculum_can_relax_forced_shot_for_support_pass() {
     let _env = forward_pass_climb_curriculum_env_lock();
     let mut sim = SoccerMatch::default_11v11(MatchConfig {

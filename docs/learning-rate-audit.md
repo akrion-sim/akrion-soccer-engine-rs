@@ -328,3 +328,45 @@ with a `-0.19` lower bound. The isolated actor is now learning and materially ch
 but this seed mostly converts its extra policy capacity into lateral circulation and does not climb.
 No actor dose or checkpoint is promoted from this screen; the next comparison must equalize training
 fixtures and target actor direction/credit rather than merely enabling more actor updates.
+
+The first equalized comparison started both arms from the same actor-less 588-step critic and gave
+each arm two rounds of four fixtures. In `E16010`, actor-on finished with 1,723 critic steps and
+14,996 actor updates, versus critic-only's 1,769 critic steps. Its two independent 32-game frozen
+fields were positive but inconclusive: `F590` was `7W-22D-3L` (payoff `0.563`, Wilson lower bound
+`0.393`, goal difference `+5`) and `F5A0` was `7W-20D-5L` (payoff `0.531`, Wilson lower bound
+`0.364`, goal difference `+2`). The independent `E16020/F5B0` replication reversed the apparent
+gain: actor-on went `2W-26D-4L`, payoff `0.469`, Wilson lower bound `0.309`, goal difference `-2`,
+and completed `0.44` fewer forward passes/game. Across those first three equalized fields actor-on
+was `16W-68D-12L` (payoff `0.521`) with roughly `-0.04` forward completions/game. This is not a
+stable climb.
+
+Instrumentation then exposed why the learned forward-selection scalar was not a valid cross-fixture
+treatment. The league supplied `DD_SOCCER_FORWARD_SELECT_LOGIT_WEIGHT=2`, and every checkpoint
+restore reapplied that value after loading the actor, silently discarding the learned scalar at each
+fixture boundary. The league now defaults
+`DD_SOCCER_FORWARD_SELECT_LOGIT_WEIGHT_OVERRIDE_ON_RESTORE=false`; fixed-dose evaluation scripts
+retain the backwards-compatible default override. An integration round proved persistence by ending
+at `1.8753` after 10,191 actor updates instead of resetting to `2.0`. League KPI output also reports
+the last training batch's priority and planner-teacher candidate/sample counts so a zero-credit seam
+cannot masquerade as an ineffective reward.
+
+A default-off observation fallback can now supply a bounded `forward-release-pass` teacher sample
+directly from the POMDP field vector when the scored planner options contain no eligible forward
+action. A mechanism round recorded 20 candidates, 9 accepted teacher samples, and 4 forward samples;
+the learned scalar reached its capped `8.0`. Its 32-game screen against the untouched bootstrap was
+only `4W-25D-3L` (payoff `0.516`, Wilson lower bound `0.350`), despite `+8` forward and `+6` net-forward
+completions. More importantly, the matched `E16040` fallback-on versus fallback-off comparison used
+the same bootstrap, seed, and three fixtures per arm and again finished `4W-25D-3L`, payoff `0.516`,
+Wilson lower bound `0.350`, with forward completions tied `10-10`. The fallback therefore remains
+off: it is trainable and changes the actor, but it is not a repeatable climb lever.
+
+Finally, the repaired production stack was rerun without that fallback. `E16050` retained the scalar
+from `2.0` to `7.1396` across eight fixtures and reached 18,295 actor updates; its 32-game head-to-head
+against the matched critic-only arm was `6W-22D-4L`, payoff `0.531`, Wilson lower bound `0.364`, with
+forward/net-forward margins of `+3/+5`. Independent `E16060` retained `2.8611` after 9,828 actor
+updates and went `6W-23D-3L`, payoff `0.547`, Wilson lower bound `0.379`, with margins `+9/+9`.
+Although the two small fields combine to `12W-45D-7L` (payoff `0.539`), a larger 64-game fresh field
+on the second frozen pair fell to `13W-39D-12L`, payoff `0.508`, Wilson lower bound `0.388`, forward
+margin `+1`, net-forward margin `-1`, and more turnovers. The apparent gain again disappeared with
+more evidence. The restore fix and observability remain production hardening; no actor checkpoint,
+fallback, reward dose, or new default is promoted from these runs.
