@@ -499,6 +499,8 @@ impl World {
             ev_bad_pass_turnover_a: false,
             ev_dribble_turnover_a: false,
             ev_shot_on_a: false,
+            ev_save_a: false,
+            ev_save_b: false,
             ev_win_ball_a: false,
             ev_pass_attempt_a: false,
             pass_dir_a: 0,
