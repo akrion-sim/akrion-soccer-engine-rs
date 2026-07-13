@@ -23,7 +23,7 @@ pub const STEPS: usize = 450; // ticks per TRAINING episode (~30s at 15 Hz)
 // The RECORDED viz match (match_before/after.json) runs longer than a training
 // episode so the before/after playback shows more football (incl. kickoffs after
 // goals). Training dynamics are unaffected — rollouts still use STEPS.
-pub const RECORD_STEPS: usize = 1800; // ~90s at 20 Hz
+pub const RECORD_STEPS: usize = 1350; // ~90s at 15 Hz
 
 const PLAYER_SPEED: f32 = 6.5; // legacy reference speed (~= run_medium); kept for keeper reach/util
 
