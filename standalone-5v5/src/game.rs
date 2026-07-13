@@ -1568,9 +1568,13 @@ impl World {
                     // receiver is open (checked at reception) — else it lands loose.
                     let ground_lane = self.lane_clearness(team, me, tp);
                     if ground_lane < 0.55 {
+                        // Loft OVER the blocked ground lane: a closed-form projectile whose apex
+                        // grows with distance, launched at the land-on-target horizontal speed so
+                        // it comes down at the receiver as the arc completes (soccer.rs parity).
+                        let d = tp.sub(me).len();
                         self.pending_aerial = true;
-                        let flight = (tp.sub(me).len() / (PASS_SPEED * DT)).round() as u32;
-                        self.pending_air_ticks = flight.clamp(3, 30);
+                        self.pending_apex = lofted_apex_yds(d);
+                        self.pending_aerial_speed = (d / hang_time(self.pending_apex).max(0.35)) * 1.08;
                     }
                     self.set_vel(team, idx, V2::default());
                     if team == Team::A {
