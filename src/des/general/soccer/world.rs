@@ -25335,6 +25335,9 @@ impl SoccerMatch {
             tick_start_snapshot.tick,
         );
         self.collect_loose_ball_commit_rl_samples(&next_snapshot);
+        // Learnable per-context MPC reject-threshold RL samples (no-op + byte-identical
+        // unless `DD_SOCCER_ENABLE_MPC_REJECT_THRESHOLD_MODEL` is set).
+        self.collect_mpc_reject_threshold_rl_samples(&next_snapshot);
         // Learnable receive-approach RL samples (no-op + byte-identical unless
         // `DD_SOCCER_ENABLE_RECEIVE_APPROACH_MODEL` is set).
         self.collect_receive_approach_rl_samples(&next_snapshot);
