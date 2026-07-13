@@ -278,6 +278,23 @@ pub struct Player {
     pub pos: V2,
     pub vel: V2,     // actual velocity — ramps toward des_vel at a bounded rate
     pub des_vel: V2, // desired velocity (the chosen gear/direction this tick)
+    pub skills: Skills, // per-player physical attributes (default = homogeneous mid pro)
+    // Two-channel energy (11v11 parity; populated in Phase 4). fatigue = slow aerobic
+    // reservoir [0,1] (0 fresh); anaerobic_load = W'-battery depletion [0,1] (0 full).
+    pub fatigue: f32,
+    pub anaerobic_load: f32,
+}
+impl Default for Player {
+    fn default() -> Self {
+        Player {
+            pos: V2::default(),
+            vel: V2::default(),
+            des_vel: V2::default(),
+            skills: Skills::default(),
+            fatigue: 0.0,
+            anaerobic_load: 0.0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
