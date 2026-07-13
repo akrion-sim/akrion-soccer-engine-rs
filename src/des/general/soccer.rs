@@ -70,6 +70,8 @@ pub use back_four_line::*;
 pub use lane_affinity_decision::*;
 mod loose_ball_commit;
 pub use loose_ball_commit::*;
+mod mpc_reject_threshold;
+pub use mpc_reject_threshold::*;
 mod receive_approach;
 pub use receive_approach::*;
 mod long_pass_run;
