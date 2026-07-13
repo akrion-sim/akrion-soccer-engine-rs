@@ -262,3 +262,12 @@ the fixed-checkpoint MCTS exposure traces remain valid, but actor-specific held-
 not promotion evidence: the evaluator did not consult the trained actor. In particular, the first
 forward-select learning comparison must be rerun under the aligned stack. The interrupted
 exposure-learning run is discarded and restarted from its original seed after this correction.
+
+The first aligned run trained 60 games per arm and evaluated 32 held-out fixtures. All three
+arms tied on primary payoff at `0.422`, with Wilson lower bound `0.268`; none passed promotion.
+Control completed `0.2` forward passes/game at a `-0.22/game` paired margin. Root exposure
+completed `0.3` at `+0.03/game`; exposure plus planner teacher completed `0.3` at `+0.06/game`.
+The teacher raised candidate forward share from control's `5%` to `9%`, but total pass completion
+fell from `92%` to `85%`. This is directional evidence that aligned exposure plus credit changes
+the intended action preference, not evidence of winning climb. Both gates remain off pending an
+independent training-seed replication.
