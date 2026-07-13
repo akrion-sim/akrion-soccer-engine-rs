@@ -3500,13 +3500,14 @@ mod tests {
         }
     }
 
-    /// (b)(iii) Same-seed determinism of a FULL scripted episode under the new
-    /// flight model: identical tick-by-tick world fingerprints, goals included.
+    /// (b)(iii) Same-seed determinism of a FULL scripted episode under BOTH
+    /// flight models: identical tick-by-tick world fingerprints, goals incl.
     #[test]
     fn scripted_episode_is_seed_deterministic_tick_by_tick() {
-        let episode_fingerprint = |seed: u64| -> u64 {
+        let episode_fingerprint = |seed: u64, parity: bool| -> u64 {
             let mut rng = Rng::new(seed);
             let mut w = World::new();
+            w.parity_flight = parity;
             let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a over exact f32 bits
             let mut mix = |v: u32| {
                 h ^= v as u64;
@@ -3532,15 +3533,22 @@ mod tests {
             }
             h
         };
-        assert_eq!(
-            episode_fingerprint(20260713),
-            episode_fingerprint(20260713),
-            "same seed => bit-identical episode"
-        );
+        for parity in [false, true] {
+            assert_eq!(
+                episode_fingerprint(20260713, parity),
+                episode_fingerprint(20260713, parity),
+                "same seed => bit-identical episode (parity={parity})"
+            );
+            assert_ne!(
+                episode_fingerprint(20260713, parity),
+                episode_fingerprint(20260714, parity),
+                "different seed => different episode (parity={parity})"
+            );
+        }
         assert_ne!(
-            episode_fingerprint(20260713),
-            episode_fingerprint(20260714),
-            "different seed => different episode (the fingerprint is not degenerate)"
+            episode_fingerprint(20260713, false),
+            episode_fingerprint(20260713, true),
+            "the two flight models actually take different trajectories"
         );
     }
 
