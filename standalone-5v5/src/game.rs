@@ -1291,7 +1291,11 @@ impl World {
 
             let gy0 = FIELD_W / 2.0 - GOAL_HALF;
             let gy1 = FIELD_W / 2.0 + GOAL_HALF;
-            if self.ball.x >= FIELD_L {
+            if self.resolve_keeper_shot_save(prev_ball) {
+                // Shot-in-flight save (11v11 model): the ball was caught (keeper
+                // owns it) or parried (live rebound away from goal). A shot that
+                // was NOT saved falls through to the goal-line checks below.
+            } else if self.ball.x >= FIELD_L {
                 if self.ball.y > gy0 && self.ball.y < gy1 && self.a_shot_flag {
                     // valid goal: came from an A shot, which required 2 passes
                     self.goals_a += 1;
