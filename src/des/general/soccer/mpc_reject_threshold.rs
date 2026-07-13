@@ -593,7 +593,7 @@ impl SoccerMatch {
                 i += 1;
             }
         }
-        // Sample a fresh carrier decision on cadence while a field player holds the ball.
+        // Sample fresh carrier decisions on cadence while a field player holds the ball.
         if tick % MPC_REJECT_THRESHOLD_SAMPLE_INTERVAL_TICKS != 0 {
             return;
         }
@@ -606,40 +606,72 @@ impl SoccerMatch {
         if holder.role == PlayerRole::Goalkeeper {
             return;
         }
-        // The carrier's most-advanced teammate is the canonical forward-pass target;
-        // its pass-execution probability is the `p` the carrier would commit at.
+        let territorial = territorial_advantage(snapshot, holder.team);
+        if !territorial.is_finite() {
+            return;
+        }
+        // Which way this carrier attacks, so the canonical forward-pass target is the
+        // team's most-advanced teammate. Dribble and shot resolve their own targets
+        // inside the MPC estimators, so no goal geometry is guessed here.
         let attack_dir = if holder.team == Team::Home { 1.0 } else { -1.0 };
-        let target = snapshot
+        let forward_teammate = snapshot
             .players
             .iter()
-            .filter(|p| p.team == holder.team && p.id != holder_id && p.role != PlayerRole::Goalkeeper)
+            .filter(|p| {
+                p.team == holder.team && p.id != holder_id && p.role != PlayerRole::Goalkeeper
+            })
             .max_by(|a, b| {
                 let ax = snapshot.player_snapshot_position(a).x * attack_dir;
                 let bx = snapshot.player_snapshot_position(b).x * attack_dir;
                 ax.partial_cmp(&bx).unwrap_or(std::cmp::Ordering::Equal)
             });
-        let Some(target) = target else {
-            return;
-        };
-        let plan = SoccerLearnedPlan {
-            action: "pass".to_string(),
-            target_player: Some(target.id),
-            target_point: snapshot.player_position(target.id),
-            mpc_replan: None,
-        };
-        let Some(committed_probability) =
-            Self::learned_plan_mpc_execution_probability(snapshot, holder_id, &plan)
-        else {
-            return;
-        };
-        let base_threshold = mpc_reject_pass_base_threshold();
-        let Some(inputs) =
-            snapshot.build_mpc_reject_threshold_inputs(holder, MpcRejectFamily::Pass, base_threshold)
-        else {
-            return;
-        };
-        let territorial = territorial_advantage(snapshot, holder.team);
-        if territorial.is_finite() {
+
+        // One representative plan per family the carrier could commit. Each is scored by
+        // the SAME MPC execution-probability functions the live reject gate uses, tagged
+        // with the family so the head learns a per-family, per-context bar.
+        let mut candidates: Vec<(MpcRejectFamily, SoccerLearnedPlan)> = Vec::new();
+        if let Some(target) = forward_teammate {
+            candidates.push((
+                MpcRejectFamily::Pass,
+                SoccerLearnedPlan {
+                    action: "pass".to_string(),
+                    target_player: Some(target.id),
+                    target_point: snapshot.player_position(target.id),
+                    mpc_replan: None,
+                },
+            ));
+        }
+        candidates.push((
+            MpcRejectFamily::Dribble,
+            SoccerLearnedPlan {
+                action: "dribble".to_string(),
+                target_player: None,
+                target_point: None,
+                mpc_replan: None,
+            },
+        ));
+        candidates.push((
+            MpcRejectFamily::Shot,
+            SoccerLearnedPlan {
+                action: "shoot".to_string(),
+                target_player: None,
+                target_point: None,
+                mpc_replan: None,
+            },
+        ));
+
+        for (family, plan) in &candidates {
+            let Some(committed_probability) =
+                Self::learned_plan_mpc_execution_probability(snapshot, holder_id, plan)
+            else {
+                continue;
+            };
+            let base_threshold = mpc_reject_base_threshold(*family);
+            let Some(inputs) =
+                snapshot.build_mpc_reject_threshold_inputs(holder, *family, base_threshold)
+            else {
+                continue;
+            };
             self.pending_mpc_reject_threshold
                 .push(PendingMpcRejectThresholdDecision {
                     team: holder.team,
