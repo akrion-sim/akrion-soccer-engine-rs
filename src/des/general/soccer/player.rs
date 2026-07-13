@@ -14399,62 +14399,6 @@ impl PlayerAgent {
                     learned_label,
                 ))
             }
-            "forward-release-pass"
-                if forward_release_action_enabled() && observation.has_ball =>
-            {
-                let visible = snapshot.ranked_visible_pass_targets(self.id, 11);
-                // Codex r24/r25: COMMIT forward, to the highest-QUALITY forward receiver. Prefer the
-                // quick-forward teammate; else the FIRST (best-ranked) visible receiver that is
-                // forward. `ranked_visible_pass_targets` is already ordered best-first, so this picks
-                // a high-quality forward option rather than the most-DISTANT one (v1's distance-max
-                // fallback chose far/covered receivers → worse pass-gain, the observed v1 failure).
-                // Never fall back to a lateral/backward target or a generic analytic lead.
-                let attack_dir = self.team.attack_dir();
-                let my_pos = snapshot.player_position(self.id).unwrap_or(self.position);
-                let is_forward = |id: &usize| {
-                    snapshot
-                        .player_position(*id)
-                        .map(|p| (p.y - my_pos.y) * attack_dir > 0.0)
-                        .unwrap_or(false)
-                };
-                // Codex r26: quick-forward teammate, else best-ranked forward receiver, but only if
-                // the best forward option clears the 0.50 quality floor; otherwise DECLINE so the
-                // actor picks another action rather than forcing a poor forward pass (the v1 failure).
-                let quick = observation
-                    .quick_forward_pass_target
-                    .filter(|id| visible.contains(id));
-                let (target, fwdrel_src) = if let Some(q) = quick {
-                    (Some(q), "quick")
-                } else if observation.best_forward_pass_option_quality >= 0.50 {
-                    (visible.iter().copied().find(is_forward), "fallback")
-                } else {
-                    (None, "decline")
-                };
-                // Target-health telemetry (Codex r25/r26 bet #1), env-gated so default behavior is
-                // byte-identical. Reveals quick-hit vs fallback vs decline rate + forward yards.
-                if std::env::var("DD_SOCCER_FWDREL_DIAG").is_ok() {
-                    let fy = target
-                        .and_then(|t| snapshot.player_position(t))
-                        .map(|p| (p.y - my_pos.y) * attack_dir)
-                        .unwrap_or(-1.0);
-                    eprintln!(
-                        "FWDREL src={fwdrel_src} fy={fy:.1} q={:.2} exp={:.2}",
-                        observation.best_forward_pass_option_quality,
-                        observation.expected_pass_completion
-                    );
-                }
-                target.map(|target| {
-                    (
-                        SoccerAction::Pass {
-                            target_player: Some(target),
-                            target_point: None,
-                            power: 0.54 + 0.30 * ability01(self.skills.passing_completion_rate),
-                            flight: PassFlight::Floor,
-                        },
-                        "forward-release-pass".to_string(),
-                    )
-                })
-            }
             "first-time-pass" if observation.has_ball && observation.first_touch_available => {
                 let visible = snapshot.ranked_visible_pass_targets(self.id, 11);
                 // Prefer the quick forward (5-15 yd, open, advanced) teammate when one is on —
