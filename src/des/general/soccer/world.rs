@@ -21340,7 +21340,7 @@ impl SoccerMatch {
             && candidate_probability - original_probability >= thresholds.soft_min_improvement
     }
 
-    fn learned_plan_mpc_execution_probability(
+    pub(crate) fn learned_plan_mpc_execution_probability(
         snapshot: &WorldSnapshot,
         player_id: usize,
         plan: &SoccerLearnedPlan,
