@@ -527,6 +527,7 @@ impl World {
             ev_dribble_lat_a: false,
             b_pass_streak: 0,
             b_shot_flag: false,
+            b_shot_origin: V2::default(),
         };
         w.kickoff(Team::A);
         w
