@@ -38045,10 +38045,7 @@ fn pass_and_shot_preserve_release_facing_after_recovery_movement() {
 
     shot_sim.apply_player_intent(PlayerIntent {
         player_id: shooter,
-        action: SoccerAction::Shoot {
-            power: 1.0,
-            target_point: None,
-        },
+        action: SoccerAction::Shoot { power: 1.0 },
         sprint: false,
     });
 
@@ -38791,10 +38788,7 @@ fn struck_shot_releases_the_ball_in_the_fifty_to_seventytwo_band() {
     let power = shot_power_for_skill(ability01(sim.players[shooter].skills.shooting));
     sim.apply_player_intent(PlayerIntent {
         player_id: shooter,
-        action: SoccerAction::Shoot {
-            power,
-            target_point: None,
-        },
+        action: SoccerAction::Shoot { power },
         sprint: false,
     });
 
@@ -38836,10 +38830,7 @@ fn shoot_action_launches_at_least_forty_mph_even_off_balance() {
 
     sim.apply_player_intent(PlayerIntent {
         player_id: shooter,
-        action: SoccerAction::Shoot {
-            power: 0.0,
-            target_point: None,
-        },
+        action: SoccerAction::Shoot { power: 0.0 },
         sprint: false,
     });
 
