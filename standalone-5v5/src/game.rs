@@ -3282,6 +3282,7 @@ mod tests {
         let receiver = 2usize;
         w.a[receiver].pos = V2::new(25.0, 14.0); // 12 yd along a 15 yd flight
         // Launch a 15-yd loft by hand (the same state apply_on_ball+step set up).
+        w.parity_flight = true; // this is a PARITY-flight behavior test
         let dist = 15.0f32;
         w.owner = None;
         w.pending_pass = Some(Owner {
