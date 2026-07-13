@@ -58035,6 +58035,7 @@ fn shot_mpc_qp_target_fit_rewards_clean_execution() {
         clean_speed,
         false,
         0.05,
+        None,
     );
     let rushed = shot_mpc_accuracy_estimate_for_snapshot(
         &snapshot,
@@ -58047,6 +58048,7 @@ fn shot_mpc_qp_target_fit_rewards_clean_execution() {
         rushed_speed,
         false,
         0.96,
+        None,
     );
 
     assert!(
