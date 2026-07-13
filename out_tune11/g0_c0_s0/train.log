@@ -1,0 +1,10 @@
+[train-ckpt] prefix=/Users/maca5/codes/akrion-sim/akrion-soccer-engine.rs/out_tune11/g0_c0_s0/cand games=2 minutes=2 seed=0x71A17001 ckpt_every=2 lr=0.015 batch=16 train_every=6 max_batches=2 replay_samples=16 target_scale=30 target_clip=3 popart=false hidden=24
+[train-ckpt] pass-completion game=1 samples=89 training_steps=356 consumed=true final_loss=0.04812
+[train-ckpt] support-scorer game=1 samples=1075 training_steps=4300 consumed=true final_loss=0.00081
+[train-ckpt] game   1/2 score 1-0 (72s)
+[train-ckpt] pass-completion game=2 samples=78 training_steps=668 consumed=true final_loss=0.03413
+[train-ckpt] support-scorer game=2 samples=1010 training_steps=8340 consumed=true final_loss=0.00067
+[train-ckpt] game   2/2 score 0-4 (133s)
+[train-ckpt] wrote checkpoint /Users/maca5/codes/akrion-sim/akrion-soccer-engine.rs/out_tune11/g0_c0_s0/cand.gen2.json
+[train-ckpt] wrote checkpoint /Users/maca5/codes/akrion-sim/akrion-soccer-engine.rs/out_tune11/g0_c0_s0/cand.genFINAL.json
+[train-ckpt] done 2 games (133s)

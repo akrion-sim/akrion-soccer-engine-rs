@@ -1436,6 +1436,35 @@ pub fn evaluate_scripted_vs_scripted(games: usize, rng: &mut Rng) -> (f32, f32, 
     (diff / g, ga / g, gb / g)
 }
 
+/// Scripted-vs-scripted PASS telemetry (the ball-flight physics A/B probe):
+/// Team-A pass attempts + completions per game over `games` seeded scripted
+/// games. Both teams run the identical scripted controller; the `ev_pass_*`
+/// events track Team A, which is representative because play is symmetric.
+/// Returns (attempts/game, completions/game, completion fraction).
+pub fn scripted_pass_stats(games: usize, rng: &mut Rng) -> (f32, f32, f32) {
+    let (mut att, mut cmp) = (0.0f32, 0.0f32);
+    for _ in 0..games {
+        let mut w = World::new();
+        if rng.f01() < 0.5 {
+            w.kickoff(Team::B);
+        }
+        for _ in 0..STEPS {
+            let act_a = w.scripted_actions(Team::A);
+            let act_b = w.scripted_actions(Team::B);
+            w.step(&act_a, &act_b, rng);
+            if w.ev_pass_attempt_a {
+                att += 1.0;
+            }
+            if w.ev_pass_completed_a {
+                cmp += 1.0;
+            }
+        }
+    }
+    let g = games.max(1) as f32;
+    let frac = if att > 0.0 { cmp / att } else { 0.0 };
+    (att / g, cmp / g, frac)
+}
+
 fn shuffle(v: &mut [usize], rng: &mut Rng) {
     for i in (1..v.len()).rev() {
         let j = (rng.next_u64() % (i as u64 + 1)) as usize;
