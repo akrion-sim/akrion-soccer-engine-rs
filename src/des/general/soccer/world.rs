@@ -18,6 +18,8 @@ const LEARNED_MPC_SOFT_REPLAN_MAX_ORIGINAL_PROBABILITY: f64 = 0.55;
 const LEARNED_MPC_SOFT_REPLAN_MIN_REPLACEMENT_PROBABILITY: f64 = 0.68;
 const LEARNED_MPC_SOFT_REPLAN_MIN_IMPROVEMENT: f64 = 0.22;
 const LEARNED_MPC_SAFE_FALLBACK_MIN_PROBABILITY: f64 = 0.42;
+const LEARNED_MPC_CONTEXT_THRESHOLD_BLEND: f64 = 0.65;
+const LEARNED_MPC_CONTEXT_THRESHOLD_MAX_DELTA: f64 = 0.16;
 const LEARNED_MPC_SAFE_FALLBACK_ACTIONS: &[&str] = &[
     "carry-forward",
     "runaround-dribble",
@@ -1264,6 +1266,47 @@ fn learned_mpc_replan_thresholds() -> LearnedMpcReplanThresholds {
             ),
         }
     })
+}
+
+/// Contextual execute-vs-kickback boundary for a POMDP-ranked action.
+///
+/// The analytic MPC probability remains the evidence being gated, but the boundary is no longer
+/// one global magic number. The learned policy's probabilities are conditioned on the complete
+/// [`SoccerQStateKey`] (MDP state + POMDP whole-field observation), so their relative confidence in
+/// the requested action versus the best legal alternative supplies a trainable context signal. A
+/// decisive learned preference lowers the boundary (give the preferred idea more execution
+/// latitude); a competitive second/third choice raises it. Policy learning therefore moves the
+/// rejection boundary from match outcomes, while the env knobs keep the calibration A/B-tunable.
+fn learned_mpc_contextual_rejection_threshold(
+    base_threshold: f64,
+    original_action: &str,
+    ranked: &[SoccerLearnedActionTrace],
+) -> f64 {
+    let base = finite_unit_interval(base_threshold);
+    let original = ranked
+        .iter()
+        .find(|entry| entry.legal && learned_mpc_action_labels_match(&entry.label, original_action))
+        .map(|entry| finite_unit_interval(entry.probability));
+    let alternative = ranked
+        .iter()
+        .filter(|entry| {
+            entry.legal && !learned_mpc_action_labels_match(&entry.label, original_action)
+        })
+        .map(|entry| finite_unit_interval(entry.probability))
+        .max_by(f64::total_cmp);
+    let (Some(original), Some(alternative)) = (original, alternative) else {
+        return base;
+    };
+    let blend = learned_mpc_probability_env(
+        "SOCCER_LEARNED_MPC_CONTEXT_THRESHOLD_BLEND",
+        LEARNED_MPC_CONTEXT_THRESHOLD_BLEND,
+    );
+    let max_delta = learned_mpc_probability_env(
+        "SOCCER_LEARNED_MPC_CONTEXT_THRESHOLD_MAX_DELTA",
+        LEARNED_MPC_CONTEXT_THRESHOLD_MAX_DELTA,
+    );
+    let learned_competition = (alternative - original).clamp(-1.0, 1.0);
+    (base + learned_competition * blend * max_delta).clamp(0.0, 1.0)
 }
 
 fn defensive_shot_on_target_penalty_points() -> (f64, f64) {
@@ -5874,6 +5917,29 @@ mod tests {
         assert_eq!(replan.source, SoccerLearnedMpcReplanSource::Mpc);
         assert_eq!(replan.candidate_count, 1);
         assert!((replan.rejected_execution_probability - bad_probability).abs() < 1e-12);
+    }
+
+    #[test]
+    fn learned_mpc_rejection_threshold_tracks_contextual_policy_competition() {
+        let action = |label: &str, probability: f64| SoccerLearnedActionTrace {
+            label: label.to_string(),
+            value: probability,
+            visits: 10,
+            probability,
+            legal: true,
+            level: PitchGridLevel::Fine,
+        };
+        let decisive = vec![action("pass1", 0.82), action("pass2", 0.10)];
+        let competitive = vec![action("pass1", 0.42), action("pass2", 0.40)];
+        let base = 0.18;
+        let decisive_threshold =
+            learned_mpc_contextual_rejection_threshold(base, "pass1", &decisive);
+        let competitive_threshold =
+            learned_mpc_contextual_rejection_threshold(base, "pass1", &competitive);
+
+        assert!(decisive_threshold < base);
+        assert!(competitive_threshold > decisive_threshold);
+        assert!((0.0..=1.0).contains(&competitive_threshold));
     }
 
     #[test]
@@ -21003,8 +21069,33 @@ impl SoccerMatch {
             Self::learned_plan_mpc_execution_probability(snapshot, player_id, &plan)
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0);
-        let hard_replan = Self::learned_plan_needs_mpc_replan(snapshot, player_id, &plan);
         let thresholds = learned_mpc_replan_thresholds();
+        let ranked = policy
+            .ranked_action_values_for_snapshot(
+                snapshot,
+                player_id,
+                LEARNED_MPC_REPLAN_CANDIDATES,
+            )
+            .map(|(_, ranked)| ranked);
+        let base_hard_threshold = if pass_like_action_flight(original_family).is_some() {
+            Some(thresholds.pass_impossible_probability)
+        } else if is_dribble_action_label(original_family) {
+            Some(thresholds.dribble_impossible_probability)
+        } else if matches!(
+            original_family,
+            "shoot" | "first-time-shot" | "first-time-header"
+        ) {
+            Some(thresholds.shot_impossible_probability)
+        } else {
+            None
+        };
+        let contextual_hard_threshold = base_hard_threshold.map(|base| {
+            ranked.as_deref().map_or(base, |actions| {
+                learned_mpc_contextual_rejection_threshold(base, &original_action, actions)
+            })
+        });
+        let hard_replan = contextual_hard_threshold
+            .is_some_and(|threshold| original_execution_probability < threshold);
         let soft_replan_eligible = !hard_replan
             && !matches!(
                 original_family,
@@ -21015,11 +21106,7 @@ impl SoccerMatch {
         if !hard_replan && !soft_replan_eligible {
             return plan;
         }
-        let Some((_, ranked)) = policy.ranked_action_values_for_snapshot(
-            snapshot,
-            player_id,
-            LEARNED_MPC_REPLAN_CANDIDATES,
-        ) else {
+        let Some(ranked) = ranked else {
             if hard_replan {
                 return Self::mpc_safe_fallback_learned_plan(
                     policy,
@@ -21041,12 +21128,31 @@ impl SoccerMatch {
             candidate_count += 1;
             let mut candidate_plan =
                 Self::learned_plan_for_policy(policy, snapshot, player_id, candidate.label.clone());
-            let candidate_hard_replan =
-                Self::learned_plan_needs_mpc_replan(snapshot, player_id, &candidate_plan);
             let candidate_execution_probability =
                 Self::learned_plan_mpc_execution_probability(snapshot, player_id, &candidate_plan)
                     .unwrap_or(0.0)
                     .clamp(0.0, 1.0);
+            let candidate_family = normalize_soccer_action_label(&candidate_plan.action);
+            let candidate_base_threshold = if pass_like_action_flight(candidate_family).is_some() {
+                Some(thresholds.pass_impossible_probability)
+            } else if is_dribble_action_label(candidate_family) {
+                Some(thresholds.dribble_impossible_probability)
+            } else if matches!(
+                candidate_family,
+                "shoot" | "first-time-shot" | "first-time-header"
+            ) {
+                Some(thresholds.shot_impossible_probability)
+            } else {
+                None
+            };
+            let candidate_hard_replan = candidate_base_threshold.is_some_and(|base| {
+                let contextual = learned_mpc_contextual_rejection_threshold(
+                    base,
+                    &candidate_plan.action,
+                    &ranked,
+                );
+                candidate_execution_probability < contextual
+            });
             let candidate_is_replacement = if hard_replan {
                 !candidate_hard_replan
             } else {
