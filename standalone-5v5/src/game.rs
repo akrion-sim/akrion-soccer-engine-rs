@@ -684,7 +684,6 @@ impl World {
             ball_curl: V2::default(),
             pending_curl: V2::default(),
             pending_aerial: false,
-            pending_air_ticks: 0,
             pending_apex: 0.0,
             pending_aerial_speed: 0.0,
             owner: None,
