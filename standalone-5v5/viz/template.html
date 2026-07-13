@@ -156,8 +156,8 @@
     <div class="eyebrow"><span class="dot"></span> standalone 5-a-side · reinforcement learning · zero deps</div>
     <h1>Watch a policy learn to <span class="em">pass, carry, and finish.</span></h1>
     <p class="lede">A hermetic 5-a-side sim — <b>goalkeepers</b>, a <b>~7m net</b>, no formation LP/IPM.
-      It's still a <b>POMDP</b> — each outfielder acts on a lean <b>~34-dim partial, egocentric
-      observation</b> (not the engine's ~129-dim feature stack) with a reactive, memoryless policy.
+      It's still a <b>POMDP</b> — each outfielder acts on a lean <b>71-dim partial, egocentric
+      observation</b> (not the 11v11 engine's 620-dim feature stack) with a reactive, memoryless policy.
       The four outfielders learn only the macro families
       <b>pass · dribble · shoot · clear · hold</b> and <b>chase · support · spread · mark</b>;
       off-ball players run into <b>open space</b> and the ball-carrier <b>passes to the teammate in space</b>,
@@ -247,7 +247,7 @@
   <section>
     <div class="section-head">
       <h2>Match analytics</h2>
-      <span class="note">trained model, 300-game average</span>
+      <span class="note">trained model, held-out evaluation</span>
     </div>
     <div class="statgrid" id="statgrid"></div>
     <div class="curvecard">
@@ -301,7 +301,7 @@ const META   = /*__META__*/ null;
     {k:'Learner + algo',v:'4 outfielders, <b>PPO</b>+<b>GAE</b>, <b>0</b> deps (own MLP/backprop)'},
   ];
   document.getElementById('facts').innerHTML=facts.map(f=>`<div class="fact"><div class="k">${f.k}</div><div class="v">${f.v}</div></div>`).join('');
-  document.getElementById('foot').innerHTML='Isolated git worktree · <code>cargo run --release -- train</code> · run metadata comes from <code>out/run_manifest.json</code> · display seed '+META.display_seed+' uses the same opening seed for both matches so the contrast is the policy, not the dice.'
+  document.getElementById('foot').innerHTML='Canonical main checkout · <code>cargo run --release -- train</code> · run metadata comes from <code>run_manifest.json</code> · display seed '+META.display_seed+' uses the same opening seed for both matches so the contrast is the policy, not the dice.'
     + (META.display_matched===false ? ' <b>Note:</b> no seed matched the showcase filter (win-by-1..4 with a losing/level untrained side), so this is a <b>fallback</b> game — it may not be representative of the average result; trust the 300-game stats above, not this single match.' : '');
 })();
 

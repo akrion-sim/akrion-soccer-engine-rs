@@ -485,7 +485,9 @@ impl Default for FlankCrossTunables {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RewardTunables {
-    /// Reward added per goal the actor's team scores this transition. Was `100.0`.
+    /// Compatibility/reporting copy of the fixed 500-point goal anchor. Loaded
+    /// legacy values are projected back to 500 during sanitization; subordinate
+    /// contextual rewards remain tunable.
     pub goal_scored_points: f64,
     /// Penalty when conceding, for a goalkeeper or defender (heavier — it's their
     /// job to prevent it). Was `8.0`.
@@ -493,11 +495,10 @@ pub struct RewardTunables {
     /// Penalty when conceding, for an outfield non-defender. Was `2.0`.
     pub concede_outfield_penalty: f64,
     /// Concede penalty for a goalkeeper/defender when the **concede-symmetry rebalance** is
-    /// active (`DD_SOCCER_ENABLE_CONCEDE_SYMMETRY`). Moves the concede *stick* up toward the
-    /// `goal_scored_points` *carrot* so conceding is a genuine counterweight to scoring rather
-    /// than a token cost (default 8.0 is ~12× lighter than a +100 goal). Unused unless the gate
-    /// is on. Default `100.0` — full parity with a goal for the back line most responsible for
-    /// preventing one.
+    /// active (`DD_SOCCER_ENABLE_CONCEDE_SYMMETRY`). Moves the concede *stick* toward the
+    /// fixed goal *carrot* so conceding is a genuine counterweight rather than a token cost.
+    /// Unused unless the gate is on. Default `100.0` assigns the back line one fifth of the
+    /// fixed goal anchor while preserving role-sensitive blame.
     pub concede_keeper_defender_penalty_symmetric: f64,
     /// Concede penalty for an outfield non-defender under the concede-symmetry rebalance:
     /// meaningful but below the back line's share (an outfielder is less responsible for a
@@ -573,7 +574,7 @@ pub struct RewardTunables {
 impl Default for RewardTunables {
     fn default() -> Self {
         RewardTunables {
-            goal_scored_points: 100.0,
+            goal_scored_points: 500.0,
             concede_keeper_defender_penalty: 8.0,
             concede_outfield_penalty: 2.0,
             concede_keeper_defender_penalty_symmetric: 100.0,
@@ -2958,10 +2959,10 @@ impl RewardTunables {
             "reward.goal_scored_points",
             &mut self.goal_scored_points,
             default.goal_scored_points,
-            -1000.0,
-            1000.0,
-            0.0,
-            250.0,
+            500.0,
+            500.0,
+            500.0,
+            500.0,
         );
         sanitize_f64(
             "reward.concede_keeper_defender_penalty",
@@ -3132,8 +3133,8 @@ impl RewardTunables {
             prefix,
             "goal_scored_points",
             self.goal_scored_points,
-            -1000.0,
-            1000.0,
+            500.0,
+            500.0,
             errors,
         );
         validate_f64(
@@ -4565,6 +4566,7 @@ mod tests {
     #[test]
     fn overlays_are_sanitized_to_hard_bounds() {
         let t = Tunables::from_overlays([json!({
+            "reward": { "goal_scored_points": 42.0 },
             "decision_mpc": { "reselect_min_execution_confidence": -1.0 },
             "shooting": { "shot_block_bailout_max_probability": 4.0 },
             "defensive_shape": {
@@ -4617,6 +4619,7 @@ mod tests {
                 "kalman_visible_max_confidence": 3.0
             }
         })]);
+        assert_eq!(t.reward.goal_scored_points, 500.0);
         assert_eq!(t.decision_mpc.reselect_min_execution_confidence, 0.0);
         assert_eq!(t.shooting.shot_block_bailout_max_probability, 1.0);
         assert_eq!(t.defensive_shape.back_four_horizontal_min_gap_yards, 4.0);

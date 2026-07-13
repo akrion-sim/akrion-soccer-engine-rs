@@ -14719,13 +14719,17 @@ impl SoccerMatch {
             &self.config.neural_learning,
             self.config.seed,
         );
+        // Decode the complete serving bundle before mutating the match.  A sidecar
+        // is one atomic policy generation: accepting its critic while rejecting a
+        // specialist head leaves live play on an unrepeatable mixture of old and
+        // new weights.
         let network = build_soccer_neural_network_from_snapshot(&snapshot)?;
-        self.neural_learner = Some(SoccerNeuralLearner::from_pretrained_snapshot(
+        let neural_learner = Some(SoccerNeuralLearner::from_pretrained_snapshot(
             &self.config,
             network,
             &snapshot,
         ));
-        self.policy_head = if let Some(policy_head) = snapshot.policy_head.as_deref() {
+        let policy_head = if let Some(policy_head) = snapshot.policy_head.as_deref() {
             Some(soccer_policy_head_from_snapshot(
                 policy_head,
                 self.config.seed,
@@ -14735,8 +14739,7 @@ impl SoccerMatch {
         } else {
             None
         };
-        self.away_policy_head = None;
-        self.skill_policy_heads =
+        let skill_policy_heads =
             if let Some(skill_policy_heads) = snapshot.skill_policy_heads.as_deref() {
                 Some(soccer_skill_policy_heads_from_snapshot(
                     skill_policy_heads,
@@ -14745,7 +14748,7 @@ impl SoccerMatch {
             } else {
                 None
             };
-        self.keeper_policy_head =
+        let keeper_policy_head =
             if let Some(keeper_policy_head) = snapshot.keeper_policy_head.as_deref() {
                 Some(soccer_keeper_policy_head_from_snapshot(
                     keeper_policy_head,
@@ -14754,15 +14757,14 @@ impl SoccerMatch {
             } else {
                 None
             };
-        self.away_skill_policy_heads = None;
-        self.line_depth_head = if let Some(line_depth_head) = snapshot.line_depth_head.as_deref() {
+        let line_depth_head = if let Some(line_depth_head) = snapshot.line_depth_head.as_deref() {
             Some(std::sync::Arc::new(BackFourLineHead::from_snapshot(
                 line_depth_head,
             )?))
         } else {
             None
         };
-        self.pass_completion_head =
+        let pass_completion_head =
             if let Some(pass_completion_head) = snapshot.pass_completion_head.as_deref() {
                 Some(std::sync::Arc::new(
                     SoccerPassCompletionHead::from_snapshot(pass_completion_head)?,
@@ -14770,7 +14772,7 @@ impl SoccerMatch {
             } else {
                 None
             };
-        self.mpc_objective_head =
+        let mpc_objective_head =
             if let Some(mpc_objective_head) = snapshot.mpc_objective_head.as_deref() {
                 Some(std::sync::Arc::new(SoccerMpcObjectiveHead::from_snapshot(
                     mpc_objective_head,
@@ -14778,7 +14780,7 @@ impl SoccerMatch {
             } else {
                 None
             };
-        self.attack_spacing_head =
+        let attack_spacing_head =
             if let Some(attack_spacing_head) = snapshot.attack_spacing_head.as_deref() {
                 Some(std::sync::Arc::new(AttackSpacingHead::from_snapshot(
                     attack_spacing_head,
@@ -14786,7 +14788,7 @@ impl SoccerMatch {
             } else {
                 None
             };
-        self.support_scorer_head =
+        let support_scorer_head =
             if let Some(support_scorer_head) = snapshot.support_scorer_head.as_deref() {
                 Some(std::sync::Arc::new(SupportScorerHead::from_snapshot(
                     support_scorer_head,
@@ -14794,6 +14796,18 @@ impl SoccerMatch {
             } else {
                 None
             };
+
+        self.neural_learner = neural_learner;
+        self.policy_head = policy_head;
+        self.away_policy_head = None;
+        self.skill_policy_heads = skill_policy_heads;
+        self.keeper_policy_head = keeper_policy_head;
+        self.away_skill_policy_heads = None;
+        self.line_depth_head = line_depth_head;
+        self.pass_completion_head = pass_completion_head;
+        self.mpc_objective_head = mpc_objective_head;
+        self.attack_spacing_head = attack_spacing_head;
+        self.support_scorer_head = support_scorer_head;
         self.away_pass_completion_head = None;
         self.away_mpc_objective_head = None;
         self.away_attack_spacing_head = None;
@@ -28058,7 +28072,11 @@ impl SoccerMatch {
         );
         let scale = self.shot_reward_distance_scale(shooting_team, shooter);
         self.record_recent_defensive_shot_on_target_penalties(shooting_team.other(), scale);
-        let contextual_pool = bounded_shot_on_target_reward_points() * scale;
+        // The field vector (shot origin/distance/angle/keeper context) selects
+        // the value inside the grounded band. A speculative 80-yard effort falls
+        // to the 50-point floor even if it reaches frame; a high-quality close
+        // chance may rise, but never approaches the 500-point conversion anchor.
+        let contextual_pool = contextual_on_frame_shot_reward_points(scale);
         self.record_weighted_possession_chain_reward_at_with_kind(
             self.tick,
             shooting_team,
@@ -30653,15 +30671,34 @@ impl SoccerMatch {
         self.ball.reset_carry_orbit();
         self.pending_pass = None;
         self.pending_shot = None;
+        let nearest_pressure = self
+            .players
+            .iter()
+            .filter(|player| player.team == attacker_team.other())
+            .map(|player| attacker_position.distance(player.position))
+            .fold(f64::INFINITY, f64::min);
+        let pressure = if nearest_pressure.is_finite() {
+            (1.0 - nearest_pressure / 8.0).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let beat_reward = kind.beat_reward_points()
+            * dribble_beat_reward_scale()
+            * field_vector_carry_zone_multiplier(
+                attacker_team,
+                attacker_position,
+                self.config.field_length_yards,
+                pressure,
+            );
         self.record_reward_event_with_kind(
             attacker_id,
-            kind.beat_reward_points() * dribble_beat_reward_scale(),
+            beat_reward,
             SoccerRewardEventKind::DribbleBeat,
         );
         self.queue_recent_outcome_learning_credit(
             attacker_id,
             attacker_team,
-            kind.beat_reward_points() * dribble_beat_reward_scale(),
+            beat_reward,
             SoccerRewardEventKind::DribbleBeat,
             DRIBBLE_BEAT_LEARNING_CREDIT_MAX_AGE_TICKS,
             is_dribble_action_label,

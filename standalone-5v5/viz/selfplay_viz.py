@@ -85,6 +85,22 @@ def read_ladder():
     return rows
 
 
+def read_train_manifest():
+    path = os.path.join(OUT, "run_manifest.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as fh:
+            manifest = json.load(fh)
+        return {
+            "best_iter": int(manifest["selection"]["best_iter"]),
+            "goal_diff": float(manifest["final"]["goal_diff"]),
+            "cleared": bool(manifest["selection"]["best_cleared_hardening_gates"]),
+        }
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
 def main():
     champ, gen = latest_champion()
     # a fair, symmetric champion-vs-champion match (both teams the current champion)
@@ -98,6 +114,7 @@ def main():
         except OSError:
             pass
     ladder = read_ladder()
+    train_manifest = read_train_manifest()
     # ladder curve: vs-champion + vs-scripted goal-diff per generation
     curve = []
     for r in ladder:
@@ -115,9 +132,14 @@ def main():
             curve.append(row)
     promotions = sum(1 for r in ladder if r["promoted"].strip().lower() == "true")
     final_champ_gen = curve[-1]["champ_gen"] if curve else gen
-    last_scripted = curve[-1]["vs_scripted"] if curve else 0.0
+    last_scripted = curve[-1]["vs_scripted"] if curve else (
+        train_manifest["goal_diff"] if train_manifest and train_manifest["cleared"] else 0.0
+    )
     meta = {
-        "champ_gen": final_champ_gen,
+        "champ_gen": final_champ_gen if curve else (
+            train_manifest["best_iter"] if train_manifest else final_champ_gen
+        ),
+        "primary_label": "Champion gen" if curve else "Accepted iter",
         "promotions": promotions,
         "generations": len(curve),
         "vs_scripted_gd": round(last_scripted, 2),
@@ -178,7 +200,7 @@ champion in a <b>champion-vs-champion</b> match, and the ladder's climb across g
 <script>
 const MATCH=/*__MATCH__*/null, CURVE=/*__CURVE__*/null, META=/*__META__*/null;
 document.getElementById('kpis').innerHTML=[
- ['v accent',META.champ_gen,'Champion gen'],['v',META.promotions,'Promotions'],
+ ['v accent',META.champ_gen,META.primary_label],['v',META.promotions,'Promotions'],
  ['v',META.generations,'Generations'],[(META.vs_scripted_gd>0?'v good':'v'),(META.vs_scripted_gd>0?'+':'')+META.vs_scripted_gd,'GD vs scripted']
 ].map(([c,v,k])=>`<div class=kpi><div class="${c}">${v}</div><div class=k>${k}</div></div>`).join('');
 document.getElementById('foot').textContent='champion-vs-champion match '+META.match_score+' · hermetic zero-dep PPO self-play · New Game records a fresh match with the live server';

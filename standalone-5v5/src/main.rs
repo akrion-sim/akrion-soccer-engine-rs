@@ -704,6 +704,11 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
 fn run_training(cfg: &RunConfig) -> AppResult<()> {
     let mut rng = Rng::new(cfg.seed);
     let mut policy = train::Policy::new(&mut rng);
+    let dagger_every = env_usize_clamped("BC_DAGGER_EVERY", 5, 1, 10_000)?;
+    let dagger_games = env_usize_clamped("BC_DAGGER_GAMES", 2, 1, 32)?;
+    let dagger_rounds = env_usize_clamped("BC_DAGGER_WARM_ROUNDS", 4, 0, 32)?;
+    let dagger_teacher_rollin =
+        env_f32_clamped("BC_DAGGER_TEACHER_ROLLIN", 0.25, 0.0, 0.75)?;
 
     fs::create_dir_all(&cfg.out_dir)?;
 
@@ -729,10 +734,37 @@ fn run_training(cfg: &RunConfig) -> AppResult<()> {
     if cfg.bc_games > 0 {
         let bc = train::behavior_clone_scripted(&mut policy, cfg.bc_games, cfg.bc_epochs, &mut rng);
         println!(
-            "behavior-clone warm start: {} samples, loss {:.3}, teacher-match {:.0}%",
+            "behavior-clone warm start: {} samples ({} finishing), loss {:.3}, teacher-match {:.0}%",
             bc.samples,
+            bc.shot_samples,
             bc.loss,
             bc.accuracy * 100.0
+        );
+        for round in 1..=dagger_rounds {
+            let corrected = train::behavior_clone_dagger(
+                &mut policy,
+                dagger_games,
+                1,
+                dagger_teacher_rollin,
+                &mut rng,
+            );
+            println!(
+                "DAgger warm round {round}: {} learner-state labels ({} finishing), loss {:.3}, teacher-match {:.0}%",
+                corrected.samples,
+                corrected.shot_samples,
+                corrected.loss,
+                corrected.accuracy * 100.0
+            );
+        }
+        let warm = train::evaluate(&policy, 100, &mut rng);
+        println!(
+            "warm-start-vs-scripted: goal_diff={:+.2} winrate={:.2} goals {:.2}-{:.2} passes {:.1} shots {:.2}",
+            warm.goal_diff,
+            warm.winrate,
+            warm.ga,
+            warm.gb,
+            warm.pass_att,
+            warm.shots
         );
     }
 
@@ -787,6 +819,20 @@ fn run_training(cfg: &RunConfig) -> AppResult<()> {
         train::set_speed_frozen(it <= speed_warmup);
         let beta = train::ent_beta_at(it, cfg.iters);
         let stats = train::train_iter(&mut policy, cfg.games_per_iter, beta, &mut rng);
+        // Correct compounding policy errors on states the neural controller
+        // actually visits. Analytic labels supervise those states, while the
+        // bounded teacher roll-in preserves access to rare finishing examples.
+        let correction = if it % dagger_every == 0 {
+            Some(train::behavior_clone_dagger(
+                &mut policy,
+                dagger_games,
+                1,
+                dagger_teacher_rollin,
+                &mut rng,
+            ))
+        } else {
+            None
+        };
 
         if it % cfg.eval_every == 0 || it == cfg.iters {
             let st = train::evaluate(&policy, cfg.eval_games, &mut rng);
@@ -813,6 +859,12 @@ fn run_training(cfg: &RunConfig) -> AppResult<()> {
                 st.pass_completion() * 100.0,
                 st.shots
             );
+            if let Some(correction) = correction {
+                println!(
+                    "      DAgger correction: {} labels, {} finishing examples",
+                    correction.samples, correction.shot_samples
+                );
+            }
             csv.push_str(&csv_row(
                 it,
                 &st,
@@ -966,14 +1018,18 @@ fn checkpoint_quality(st: &train::Stats) -> f32 {
     if st.winrate < 0.55 {
         q -= 0.8;
     }
-    if st.shots < 1.0 {
-        q -= 1.2;
+    if st.shots <= 0.0 {
+        // A no-shot checkpoint cannot climb regardless of possession or passing.
+        // Make it ineligible to outrank any policy that has discovered finishing.
+        q -= 20.0;
+    } else if st.shots < 1.0 {
+        q -= 2.0;
     }
     if st.pass_cmp < 2.0 {
         q -= 0.7;
     }
     if st.conversion() <= 0.0 {
-        q -= 0.6;
+        q -= 5.0;
     }
     if st.possession < 0.03 {
         q -= 0.4;

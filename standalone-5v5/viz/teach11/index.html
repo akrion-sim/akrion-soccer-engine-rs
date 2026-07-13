@@ -177,7 +177,7 @@
     <h1>The real engine: <span class="em">DP, neural nets, LP &amp; QP</span> in one loop.</h1>
     <p class="lede">The <a class="inline" href="http://localhost:6012">5-a-side page</a> is the stripped-down
       cousin — no tabular DP, no formation solver. <b>This is the real thing.</b> Twenty-two players on a full
-      120×80 pitch, a <b>~476-number</b> egocentric observation per decision, and a learning loop that actually
+      120×80 pitch, a <b>620-number</b> egocentric observation per decision, and a learning loop that actually
       runs <b>approximate dynamic programming</b> (an EPV value function + DP-cleaned critic targets + backward
       credit replay), a neural actor/critic over the full field, a <b>Clarabel interior-point linear program</b>
       for formation, and a <b>quadratic-program</b> model-predictive controller. Here is the whole pipeline, one
@@ -186,26 +186,26 @@
       <span class="flowbox">measure outcomes <b>across ticks</b></span><span class="arrow">→</span>
       <span class="flowbox"><b>approx-DP</b> credit replay</span><span class="arrow">→</span>
       <span class="flowbox"><b>neural</b> actor + critic</span><span class="arrow">→</span>
-      <span class="flowbox">world-model + <b>MCTS</b> lookahead</span><span class="arrow">→</span>
-      <span class="flowbox"><b>QP-MPC</b> execution guard</span><span class="arrow">→</span>
+      <span class="flowbox">learned <b>world model</b> · MCTS off</span><span class="arrow">→</span>
+      <span class="flowbox">field-aware per-player <b>QP-MPC</b></span><span class="arrow">→</span>
       <span class="flowbox">held-out <b>promotion</b></span>
     </div></div>
     <div class="chips">
-      <a class="chip" href="#field"><span class="k">state</span><span class="b">476-dim observation</span><span class="s">22 players · pos·vel·accel·jerk · hidden beliefs</span></a>
+      <a class="chip" href="#field"><span class="k">state</span><span class="b">620-dim observation</span><span class="s">22 players · pos·vel·accel·jerk · hidden beliefs</span></a>
       <a class="chip" href="#decision"><span class="k">policy</span><span class="b">Neural + DP prior</span><span class="s">the prior corrects the myopic pick</span></a>
       <a class="chip" href="#dp"><span class="k">real DP</span><span class="b">EPV + credit replay</span><span class="s">a value fit from 58,555 possessions</span></a>
       <a class="chip" href="#formation"><span class="k">LP</span><span class="b">Formation solver</span><span class="s">Clarabel interior-point, every tick</span></a>
       <a class="chip" href="#optimize"><span class="k">tune</span><span class="b">Escape the plateau</span><span class="s">optimize 24 knobs · then break out ▸</span></a>
-      <a class="chip" href="#mpc"><span class="k">QP</span><span class="b">MPC executor</span><span class="s">closest feasible team motion</span></a>
+      <a class="chip" href="#mpc"><span class="k">QP</span><span class="b">MPC executor</span><span class="s">one field-aware trajectory per player</span></a>
     </div>
   </section>
 
   <!-- ═══════════════ 1. FIELD VECTOR ═══════════════ -->
   <section id="field">
-    <div class="eyebrow"><span class="n">01</span> the state · a ~476-dim partially-observed field</div>
-    <h2>Twenty-two players become ~476 numbers.</h2>
+    <div class="eyebrow"><span class="n">01</span> the state · a 620-dim partially-observed field</div>
+    <h2>Twenty-two players become 620 numbers.</h2>
     <p class="p">The full engine sees far more than the 5-a-side's lean 71. Each decision reads a
-      <span class="hl">~476-dimensional egocentric observation</span>: a self-centred base, a full
+      <span class="hl">620-dimensional egocentric observation</span>: a self-centred base, a full
       <b>whole-field motion snapshot</b> of all 22 players and the ball as <b>position, velocity, acceleration
       and jerk</b>, plus tactical-structure blocks (back-four line, midfield band, spacing) and
       <span class="hlG">hidden belief states</span> — Kalman perception confidence, an opponent-press belief,
@@ -222,7 +222,7 @@
         </div>
       </div>
       <div class="card">
-        <h3>The ~476-dim egocentric observation <span class="pill acc">actor-relative</span></h3>
+        <h3>The 620-dim egocentric observation <span class="pill acc">actor-relative</span></h3>
         <canvas id="obsStrip" style="margin-bottom:6px"></canvas>
         <div id="obsLegend" style="display:flex;flex-direction:column;gap:3px"></div>
       </div>
@@ -322,10 +322,10 @@
 
   <!-- ═══════════════ 4. NEURAL ═══════════════ -->
   <section id="nn">
-    <div class="eyebrow"><span class="n">04</span> generalization · the neural net over ~476 dims</div>
+    <div class="eyebrow"><span class="n">04</span> generalization · the neural net over 620 dims</div>
     <h2>The net generalizes what DP cleaned up.</h2>
     <p class="p">DP fixes the <i>labels</i>; the neural net makes them <i>usable</i>. A 128-wide MAPPO
-      actor/critic consumes the full ~476-vector and estimates value for field states it has never seen exactly,
+      actor/critic consumes the full 620-vector and estimates value for field states it has never seen exactly,
       trained on the DP-improved targets. Below: the critic homing in on the EPV target, and the actor climbing
       on the real game — including the <span class="hlG">plateau</span> that motivates everything in §5–7.</p>
     <div class="grid3">
@@ -337,7 +337,7 @@
           <button class="ctl ghost" id="nnPlay">Play</button>
           <input type="range" id="nnScrub" min="0" value="0" style="min-width:70px"></div></div>
       <div class="card"><h3>Approximation error → 0</h3><canvas id="nnErr"></canvas>
-        <p class="note" style="margin-top:8px">The net never matches DP exactly — but it works in ~476 dims where
+        <p class="note" style="margin-top:8px">The net never matches DP exactly — but it works in 620 dims where
           a table can't exist, and it generalizes between similar states.</p></div>
     </div>
     <div class="card" style="margin-top:16px">
@@ -357,9 +357,9 @@
     <div class="eyebrow"><span class="n">05</span> team shape · a linear program (interior-point)</div>
     <h2>Formation is an assignment problem.</h2>
     <p class="p">The 5-a-side deliberately had <i>no</i> formation machinery. The full engine solves a real
-      <span class="hlV">interior-point linear program</span> every tick (Clarabel, ~550 variables, &lt;5 ms) that
-      picks each player's <b>target position, velocity and acceleration</b> to optimize a weighted tactical
-      objective — <i>"the LP decides the shape, the MPC executes."</i> The clearest way to <i>feel</i> why a
+      <span class="hlV">interior-point linear program</span> every tick (Clarabel) that assigns each player to
+      a static role slot and field-vector-conditioned anchor — <i>"the LP decides the shape, the MPC executes."</i>
+      The clearest way to <i>feel</i> why a
       global solve beats greedy is its simplest cousin, the <b>role assignment</b> below (a real Hungarian LP,
       also used inside the rotation planner): send each player to its nearest slot and two of them chase the
       same spot. Toggle greedy vs optimal:</p>
@@ -385,9 +385,9 @@
           third slot goes unfilled and someone sprints across the pitch to cover. The LP sees the whole board and
           swaps assignments so the <i>team</i> moves least.</p>
         <div class="divider"></div>
-        <p class="note">The in-play version is bigger — a Clarabel interior-point solve over pos/vel/accel
-          targets with double-integrator dynamics constraints, to optimality in under 5 ms a tick (a
-          deterministic simplex is available for headless training). It's <b>optimization as team
+        <p class="note">The in-play version is a Clarabel interior-point solve over continuous player-to-slot
+          allocation and field-vector-conditioned formation anchors (a deterministic simplex is the fallback).
+          It is static allocation and geometry, not a time-dynamics controller. It's <b>optimization as team
           coordination</b>, the counterpart to the per-player QP-MPC that executes each move.</p>
       </div>
     </div>
@@ -439,11 +439,11 @@
   <!-- ═══════════════ 7. MPC / QP ═══════════════ -->
   <section id="mpc">
     <div class="eyebrow"><span class="n">07</span> execution · model-predictive control as a real QP</div>
-    <h2>MPC keeps the team's motion feasible — a quadratic program.</h2>
+    <h2>MPC keeps each player's motion feasible — a quadratic program.</h2>
     <p class="p">Every player wants to sprint straight at the ball — and collide. The engine's per-player MPC
-      (<code>PlanarPointMassMpc</code>, a horizon-12 double-integrator over ~0.8 s) finds the <b>closest
+      (<code>PlanarPointMassMpc</code>, a 30-step double-integrator on the accepted frontier) finds the <b>closest
       feasible</b> motion to that intent: <span class="hl">minimize the quadratic ½·Σ‖p−p<sub>ref</sub>‖² +
-      ‖v−v<sub>ref</sub>‖² + ‖a‖² with soft keep-outs around where opponents <i>will be</i></span>, subject to a
+      ‖v−v<sub>ref</sub>‖² + ‖a‖² with soft keep-outs from the other players and the ball</span>, subject to a
       circular acceleration limit ‖a‖ ≤ a<sub>max</sub>. A genuine <span class="hlV">quadratic program</span>,
       solved by warm-started projected gradient every tick. (A learned <b>neural-MPC objective head</b> also
       nudges the target — the same amortization the value critic uses.) Play the solve:</p>
@@ -466,9 +466,9 @@
           penalty), projected steps trade a little intent for separation until no constraint is violated and the
           deviation is as small as possible — the QP optimum.</p>
         <div class="divider"></div>
-        <p class="note">In the trainer, a learned <b>world model</b> + shallow <b>neural MCTS</b> score short
-          candidate futures; this QP-MPC then <b>rejects or repairs</b> any that aren't physically feasible.
-          Planning proposes, MPC disposes.</p>
+        <p class="note">The accepted frontier uses a learned <b>world model</b> with neural MCTS disabled.
+          Each QP-MPC solve controls one player's own trajectory over a 30-step horizon; the other 21 players
+          and the ball enter through the field vector as moving context and soft keep-outs.</p>
       </div>
     </div>
   </section>
@@ -510,9 +510,9 @@
           <li><b>Measure</b> pass/dribble/shot/turnover/conceded-danger outcomes <i>across ticks</i> — reward truth.</li>
           <li><b>Approximate DP</b> replays the trajectory and propagates delayed credit backward (§3).</li>
           <li><b>Neural actor + critic</b> (MAPPO, 128-wide, set-encoded) generalize the cleaned-up value over
-            the ~476-dim field, with a bounded DP/Q prior at decision time (§2, §4).</li>
-          <li><b>Formation LP</b> assigns roles; <b>world-model + neural MCTS</b> score short futures (§5).</li>
-          <li><b>QP-MPC</b> makes the chosen motion feasible (§7); <b>promotion</b> is strict held-out vs
+            the 620-dim field, with a bounded DP/Q prior at decision time (§2, §4).</li>
+          <li><b>Formation LP/IPM</b> assigns the team shape; the learned world model scores short futures (§5).</li>
+          <li><b>Per-player QP-MPC</b> makes each chosen motion feasible (§7); <b>promotion</b> is strict held-out vs
             analytic + protected best (§8).</li>
         </ul>
         <p class="note" style="margin-top:8px"><b>Population perturbation</b> is only the plateau escape hatch —
@@ -524,7 +524,7 @@
           learning <b>signal</b>; the neural net generalizes it across continuous soccer. Exact DP can't:
           soccer has no small finite state table — 22 players, motion, shape, pressure, fatigue, geometry.</p>
         <div class="grid2">
-          <div class="stat"><div class="v acc">476</div><div class="k">obs features</div><div class="sub">vs 71 in 5-a-side</div></div>
+          <div class="stat"><div class="v acc">620</div><div class="k">obs features</div><div class="sub">vs 71 in 5-a-side</div></div>
           <div class="stat"><div class="v acc">58,555</div><div class="k">possessions</div><div class="sub">fit the EPV value</div></div>
           <div class="stat"><div class="v good" id="tSot">–</div><div class="k">SOT gain</div><div class="sub">after the escape</div></div>
           <div class="stat"><div class="v acc" id="tElo">–</div><div class="k">ELO gained</div><div class="sub">tournament rating</div></div>
@@ -697,6 +697,12 @@ fetch('data.json').then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.
       '(<code>python3 viz/teach11/serve.py</code> → localhost:6013).';});
 
 function build(){
+  const p=D.meta.served_policy||{};const b=$('#banner');
+  if(p.loaded){b.style.display='block';b.style.borderColor='var(--good)';
+    b.style.background='color-mix(in srgb,var(--good) 12%,var(--panel))';
+    b.innerHTML='<b>Accepted live frontier loaded:</b> '+p.input_dim+' input features · '+
+      Number(p.parameter_count||0).toLocaleString()+' parameters · '+
+      Number(p.training_steps||0).toLocaleString()+' neural training steps · MCTS disabled · per-player MPC horizon 30.';}
   const S={field:buildField,decision:buildDecision,dp:buildDP,nn:buildNN,formation:buildFormation,
            optimize:buildOptimize,mpc:buildMPC,league:buildLeague,together:buildTogether};
   for(const k in S){ try{S[k]();}catch(e){console.error(k,e);} }
@@ -1067,7 +1073,7 @@ function buildTogether(){
   $('#tElo').textContent='+'+Math.round(D.league[D.league.length-1].elo_best-1500);
   $('#foot').innerHTML='The EPV value function is the real fitted grid (16×10, 58,555 possessions, '+
     '<code>scripts/epv_grid.json</code>). Value-iteration, the formation assignment LP, the spacing QP, the '+
-    '36-weight evolution strategy and the league ELO are all really computed in <code>viz/teach11/gen_data.py</code>. '+
+    '24-weight evolution strategy and the league ELO are all really computed in <code>viz/teach11/gen_data.py</code>. '+
     D.meta.vs_5v5;
 }
 

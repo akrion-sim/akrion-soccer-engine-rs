@@ -213,13 +213,22 @@ impl V2 {
     // The vector ops are component-wise on the STORED fields (correct regardless of which
     // axis each field denotes), so they use struct literals to bypass the swapping `new`.
     pub fn add(self, o: V2) -> V2 {
-        V2 { x: self.x + o.x, y: self.y + o.y }
+        V2 {
+            x: self.x + o.x,
+            y: self.y + o.y,
+        }
     }
     pub fn sub(self, o: V2) -> V2 {
-        V2 { x: self.x - o.x, y: self.y - o.y }
+        V2 {
+            x: self.x - o.x,
+            y: self.y - o.y,
+        }
     }
     pub fn scale(self, s: f32) -> V2 {
-        V2 { x: self.x * s, y: self.y * s }
+        V2 {
+            x: self.x * s,
+            y: self.y * s,
+        }
     }
     pub fn len(self) -> f32 {
         (self.x * self.x + self.y * self.y).sqrt()
@@ -229,7 +238,10 @@ impl V2 {
         if l < 1e-6 {
             V2 { x: 0.0, y: 0.0 }
         } else {
-            V2 { x: self.x / l, y: self.y / l }
+            V2 {
+                x: self.x / l,
+                y: self.y / l,
+            }
         }
     }
 }
@@ -407,10 +419,22 @@ impl Player {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Team {
     A,
     B,
+}
+
+/// Controlled-possession phase exposed to both the decentralized POMDP actor
+/// and the centralized MAPPO critic. A free ball is always a real duel: the
+/// previous touch is history, not current possession. Keeping this as a named
+/// state prevents action masks and reward shaping from silently treating an
+/// in-flight/loose ball as settled attack or defence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PossessionPhase {
+    Possession,
+    Dispossession,
+    FiftyFifty,
 }
 impl Team {
     fn other(self) -> Team {
@@ -615,6 +639,14 @@ impl World {
         match o.team {
             Team::A => self.a[o.idx],
             Team::B => self.b[o.idx],
+        }
+    }
+
+    pub fn possession_phase_for(&self, team: Team) -> PossessionPhase {
+        match self.owner {
+            Some(owner) if owner.team == team => PossessionPhase::Possession,
+            Some(_) => PossessionPhase::Dispossession,
+            None => PossessionPhase::FiftyFifty,
         }
     }
     fn nearest_player(&self, team: Team, p: V2) -> (usize, f32) {
@@ -882,9 +914,10 @@ impl World {
         let ball_rel = bp.sub(mp);
 
         let has_ball = matches!(self.owner, Some(o) if o.team == team && o.idx == idx);
-        let team_ball = matches!(self.owner, Some(o) if o.team == team);
-        let opp_ball = matches!(self.owner, Some(o) if o.team != team);
-        let free_ball = self.owner.is_none();
+        let phase = self.possession_phase_for(team);
+        let team_ball = phase == PossessionPhase::Possession;
+        let opp_ball = phase == PossessionPhase::Dispossession;
+        let free_ball = phase == PossessionPhase::FiftyFifty;
 
         // derived cues kept for action semantics: shot lane + best-pass openness
         let shot_clear = self.shot_clearness(team, me.pos);
@@ -988,11 +1021,7 @@ impl World {
     /// Legal-action mask for one player (on-ball vs off-ball families).
     pub fn legal_mask(&self, team: Team, idx: usize) -> [bool; NA] {
         let has_ball = matches!(self.owner, Some(o) if o.team == team && o.idx == idx);
-        let team_owns = matches!(self.owner, Some(o) if o.team == team);
-        let opp_owns = matches!(self.owner, Some(o) if o.team != team);
-        let our_phase = team_owns || (self.owner.is_none() && self.last_touch == Some(team));
-        let their_phase =
-            opp_owns || (self.owner.is_none() && self.last_touch == Some(team.other()));
+        let phase = self.possession_phase_for(team);
         let mut m = [false; NA];
         if has_ball {
             for a in A_SHOOT..=A_HOLD {
@@ -1022,7 +1051,7 @@ impl World {
                 }
             }
         } else {
-            if our_phase {
+            if phase == PossessionPhase::Possession {
                 // In possession, off-ball players should either burst into support
                 // lanes/get-open targets or hold rest-defense shape. Chasing the
                 // ball carrier is not a useful attacking decision.
@@ -1031,10 +1060,7 @@ impl World {
                 m[A_MARK] = true;
                 m[A_STAY] = true;
                 m[A_GET_OPEN] = true;
-                if self.owner.is_none() {
-                    m[A_CHASE] = true;
-                }
-            } else if their_phase {
+            } else if phase == PossessionPhase::Dispossession {
                 // In dispossession, remove attacking-support actions from the
                 // legal set; defenders choose between pressing and recovering
                 // goalside.
@@ -1042,9 +1068,12 @@ impl World {
                 m[A_MARK] = true;
                 m[A_STAY] = true;
             } else {
-                for a in A_CHASE..=A_STAY {
-                    m[a] = true;
-                }
+                // A genuine 50:50 exposes contest/recovery/shape choices, but not
+                // attacking support or get-open actions that assume we own the ball.
+                m[A_CHASE] = true;
+                m[A_SPREAD] = true;
+                m[A_MARK] = true;
+                m[A_STAY] = true;
             }
         }
         m
@@ -1069,11 +1098,7 @@ impl World {
         }
 
         let is_owner = matches!(self.owner, Some(o) if o.team == team && o.idx == idx);
-        let team_owns = matches!(self.owner, Some(o) if o.team == team);
-        let opp_owns = matches!(self.owner, Some(o) if o.team != team);
-        let our_phase = team_owns || (self.owner.is_none() && self.last_touch == Some(team));
-        let their_phase =
-            opp_owns || (self.owner.is_none() && self.last_touch == Some(team.other()));
+        let phase = self.possession_phase_for(team);
 
         if matches!(
             action,
@@ -1082,11 +1107,22 @@ impl World {
             only(&mut mask, SPD_STAND);
         } else if is_owner && matches!(action, A_DRIB_FWD | A_DRIB_LEFT | A_DRIB_RIGHT) {
             min_gear(&mut mask, SPD_WALK);
-        } else if !is_owner && our_phase && matches!(action, A_SUPPORT | A_GET_OPEN) {
+        } else if !is_owner
+            && phase == PossessionPhase::Possession
+            && matches!(action, A_SUPPORT | A_GET_OPEN)
+        {
             min_gear(&mut mask, SPD_RUN_FAST);
-        } else if !is_owner && our_phase && action == A_SPREAD {
+        } else if !is_owner && phase == PossessionPhase::Possession && action == A_SPREAD {
             min_gear(&mut mask, SPD_RUN_SLOW);
-        } else if !is_owner && their_phase && matches!(action, A_CHASE | A_MARK) {
+        } else if !is_owner
+            && phase == PossessionPhase::Dispossession
+            && matches!(action, A_CHASE | A_MARK)
+        {
+            min_gear(&mut mask, SPD_RUN_FAST);
+        } else if !is_owner
+            && phase == PossessionPhase::FiftyFifty
+            && matches!(action, A_CHASE | A_MARK)
+        {
             min_gear(&mut mask, SPD_RUN_FAST);
         } else if !is_owner
             && matches!(action, A_CHASE | A_SUPPORT | A_SPREAD | A_MARK | A_GET_OPEN)
@@ -1315,7 +1351,11 @@ impl World {
     /// Corner kick: the attacking team `to` restarts from the corner of the goal line at
     /// `goal_x`, on whichever side (y=0 / y=FIELD_W) the ball went dead near `out_y`.
     fn corner_kick(&mut self, to: Team, goal_x: f32, out_y: f32) {
-        let corner_y = if out_y < FIELD_W / 2.0 { 0.5 } else { FIELD_W - 0.5 };
+        let corner_y = if out_y < FIELD_W / 2.0 {
+            0.5
+        } else {
+            FIELD_W - 0.5
+        };
         self.restart_possession(to, V2::new(goal_x, corner_y));
     }
 
@@ -1343,7 +1383,10 @@ impl World {
     fn try_capture(&mut self) {
         let ball_fast = self.ball_vel.len() > CAPTURE_MAX_BALL_SPEED;
         let mut best: Option<(Owner, f32)> = None;
-        // Keepers first: they can smother/save even fast shots within reach.
+        let mut best_parry: Option<(Owner, f32)> = None;
+        // Keepers first. Slow/close balls can be caught; harder or less-visible
+        // shots near the edge of reach are parried into a live 50:50 instead of
+        // being caught automatically. This mirrors the 11v11 catch/parry split.
         for team in [Team::A, Team::B] {
             if self.kick_timer > 0 {
                 if let Some(lk) = self.last_kicker {
@@ -1352,9 +1395,22 @@ impl World {
                     }
                 }
             }
-            let d = players(team, self)[GK].pos.sub(self.ball).len();
-            if d < KEEPER_REACH && best.is_none_or(|(_, bd)| d < bd) {
+            let keeper = players(team, self)[GK];
+            let d = keeper.pos.sub(self.ball).len();
+            let speed = self.ball_vel.len();
+            let control = (0.55 * ability01(keeper.skills.first_touch)
+                + 0.45 * ability01(keeper.skills.aerial_duel))
+            .clamp(0.0, 1.0);
+            let speed_control = (1.0 - speed / 34.0).clamp(0.0, 1.0);
+            let altitude_control = (1.0 - self.ball_z / 3.8).clamp(0.0, 1.0);
+            let catch_radius = KEEPER_REACH
+                * (0.48 + 0.34 * control + 0.18 * speed_control)
+                * (0.75 + 0.25 * altitude_control);
+            let parry_radius = KEEPER_REACH * (0.88 + 0.12 * control);
+            if d < catch_radius && best.is_none_or(|(_, bd)| d < bd) {
                 best = Some((Owner { team, idx: GK }, d));
+            } else if d < parry_radius && best_parry.is_none_or(|(_, bd)| d < bd) {
+                best_parry = Some((Owner { team, idx: GK }, d));
             }
         }
         // Outfield players only control a ball that isn't screaming past them.
@@ -1417,6 +1473,26 @@ impl World {
                         best = Some((Owner { team, idx: i }, d));
                     }
                 }
+            }
+        }
+        if best.is_none() {
+            if let Some((keeper, _)) = best_parry {
+                let goal = keeper.team.own_goal();
+                let away = self.ball.sub(goal).unit();
+                let lateral = if self.ball.x >= FIELD_W / 2.0 {
+                    1.0
+                } else {
+                    -1.0
+                };
+                let rebound_dir = away.add(V2::new(0.0, lateral * 0.45)).unit();
+                let rebound_speed = self.ball_vel.len().clamp(7.0, 22.0) * 0.42;
+                self.ball_vel = rebound_dir.scale(rebound_speed);
+                self.owner = None;
+                self.last_touch = Some(keeper.team);
+                self.pending_pass = None;
+                self.a_shot_flag = false;
+                self.b_shot_flag = false;
+                return;
             }
         }
         if let Some((o, _)) = best {
@@ -1718,6 +1794,16 @@ impl World {
         let owns = matches!(self.owner, Some(o) if o.team == team && o.idx == GK);
         if owns {
             self.intended_receiver = None;
+            let (_, pressure) = self.nearest_opponent(team, me);
+            if pressure < 3.0 {
+                self.set_vel(team, GK, V2::default());
+                return Some((
+                    Owner { team, idx: GK },
+                    team.target_goal().sub(me),
+                    CLEAR_SPEED,
+                    false,
+                ));
+            }
             let cands = self.pass_candidates(team, GK);
             if let Some((ti, _)) = cands[0] {
                 let tp = players(team, self)[ti].pos;
@@ -2457,10 +2543,21 @@ mod tests {
         // The 11v11 convention: x = field WIDTH [0,FIELD_W], y = field LENGTH [0,FIELD_L].
         // Goals sit at the length ends (y=0 / y=FIELD_L), centered on the width (x=FIELD_W/2).
         let ga = Team::A.target_goal();
-        assert!((ga.x - FIELD_W / 2.0).abs() < 1e-6, "goal centered on width: x={}", ga.x);
-        assert!((ga.y - FIELD_L).abs() < 1e-6, "A attacks the far length line: y={}", ga.y);
+        assert!(
+            (ga.x - FIELD_W / 2.0).abs() < 1e-6,
+            "goal centered on width: x={}",
+            ga.x
+        );
+        assert!(
+            (ga.y - FIELD_L).abs() < 1e-6,
+            "A attacks the far length line: y={}",
+            ga.y
+        );
         let gb = Team::B.target_goal();
-        assert!((gb.x - FIELD_W / 2.0).abs() < 1e-6 && gb.y.abs() < 1e-6, "B attacks y=0");
+        assert!(
+            (gb.x - FIELD_W / 2.0).abs() < 1e-6 && gb.y.abs() < 1e-6,
+            "B attacks y=0"
+        );
         // Field is longer than it is wide, and length lives on y.
         assert!(FIELD_L > FIELD_W);
         // Attack sign drives the length (y) axis: A forward = +y.
@@ -2921,6 +3018,57 @@ mod tests {
             w.legal_mask(Team::A, 1)[A_SHOOT],
             "shot allowed in the opponent's half after 2 passes"
         );
+    }
+
+    #[test]
+    fn possession_phase_uses_control_not_last_touch() {
+        let mut w = World::new();
+        w.owner = Some(Owner {
+            team: Team::A,
+            idx: 1,
+        });
+        assert_eq!(w.possession_phase_for(Team::A), PossessionPhase::Possession);
+        assert_eq!(
+            w.possession_phase_for(Team::B),
+            PossessionPhase::Dispossession
+        );
+
+        w.owner = None;
+        w.last_touch = Some(Team::A);
+        assert_eq!(w.possession_phase_for(Team::A), PossessionPhase::FiftyFifty);
+        assert_eq!(w.possession_phase_for(Team::B), PossessionPhase::FiftyFifty);
+        let duel_mask = w.legal_mask(Team::A, 2);
+        assert!(duel_mask[A_CHASE] && duel_mask[A_MARK] && duel_mask[A_SPREAD]);
+        assert!(!duel_mask[A_SUPPORT] && !duel_mask[A_GET_OPEN]);
+    }
+
+    #[test]
+    fn keeper_catches_slow_close_ball_but_parries_fast_edge_ball() {
+        let mut w = World::new();
+        let keeper_pos = w.a[GK].pos;
+        w.owner = None;
+        w.kick_timer = -1;
+        w.ball = V2 {
+            x: keeper_pos.x + 0.8,
+            y: keeper_pos.y,
+        };
+        w.ball_vel = V2::default();
+        w.try_capture();
+        assert!(matches!(w.owner, Some(o) if o.team == Team::A && o.idx == GK));
+
+        w.owner = None;
+        w.ball = V2 {
+            x: keeper_pos.x + 1.6,
+            y: keeper_pos.y,
+        };
+        w.ball_vel = V2 { x: 0.0, y: -30.0 };
+        w.try_capture();
+        assert!(
+            w.owner.is_none(),
+            "fast edge-of-reach shot should stay live"
+        );
+        assert_eq!(w.last_touch, Some(Team::A));
+        assert!(w.ball_vel.len() < 30.0, "parry should absorb shot energy");
     }
 
     #[test]
