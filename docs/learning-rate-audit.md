@@ -370,3 +370,12 @@ on the second frozen pair fell to `13W-39D-12L`, payoff `0.508`, Wilson lower bo
 margin `+1`, net-forward margin `-1`, and more turnovers. The apparent gain again disappeared with
 more evidence. The restore fix and observability remain production hardening; no actor checkpoint,
 fallback, reward dose, or new default is promoted from these runs.
+
+Because the persistent scalar sometimes approached its cap within eight fixtures, its step size is
+now independently tunable through `DD_SOCCER_FORWARD_SELECT_LOGIT_LEARNING_RATE` (default `0.05`,
+preserving the prior update). A matched `E16060` rerun at `0.005` kept training exposure essentially
+equal to the default arm (9,893 versus 9,828 actor updates; 1,645 versus 1,641 critic steps) and held
+the scalar at `1.9631` instead of `2.8611`. Direct 32-game frozen comparison against the default-rate
+actor was `5W-23D-4L`, payoff `0.516`, Wilson lower bound `0.350`, but regressed both forward and
+net-forward completions by `4`. The lower step therefore produced safer lateral circulation rather
+than a climb. It is rejected as a default; the independent knob remains for bounded future searches.

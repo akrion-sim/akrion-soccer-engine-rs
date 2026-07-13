@@ -5612,6 +5612,10 @@ const SOCCER_POLICY_LEARNING_RATE: f64 = 0.05;
 /// bounded separately by [`SOCCER_FORWARD_SELECT_BONUS_ABS_MAX`], so a large learned weight can keep
 /// pushing the gradient without letting the bonus swamp candidate scoring.
 const SOCCER_FORWARD_SELECT_LOGIT_WEIGHT_MAX: f64 = 8.0;
+/// Independent step size for the forward-selection scalar. Keeping this separate from the joint
+/// actor learning rate lets plateau experiments slow the scalar without weakening every role and
+/// specialist head. The default preserves the established update exactly.
+const SOCCER_FORWARD_SELECT_LOGIT_LEARNING_RATE_MAX: f64 = 0.20;
 /// Absolute cap on the *applied* forward-select bonus term (`weight * forward_option_quality`). Held
 /// comparable in magnitude to the centered actor bonus (~±0.25, cf. `SOCCER_CENTERED_POLICY_BONUS_CLIP`)
 /// so it NUDGES — rather than dominates — the candidate sort against `value_score` / `actor_bonus`.
@@ -43420,7 +43424,8 @@ impl SoccerPolicyHead {
         if gradient == 0.0 || !gradient.is_finite() {
             return;
         }
-        let updated = self.forward_select_logit_weight + SOCCER_POLICY_LEARNING_RATE * gradient;
+        let updated = self.forward_select_logit_weight
+            + soccer_forward_select_logit_learning_rate() * gradient;
         if updated.is_finite() {
             self.forward_select_logit_weight =
                 updated.clamp(0.0, SOCCER_FORWARD_SELECT_LOGIT_WEIGHT_MAX);
@@ -43437,6 +43442,15 @@ fn soccer_forward_select_logit_weight_env_override() -> Option<f64> {
         .and_then(|raw| raw.trim().parse::<f64>().ok())
         .filter(|value| value.is_finite())
         .map(|value| value.clamp(0.0, SOCCER_FORWARD_SELECT_LOGIT_WEIGHT_MAX))
+}
+
+fn soccer_forward_select_logit_learning_rate() -> f64 {
+    soccer_planner_teacher_env_f64(
+        "DD_SOCCER_FORWARD_SELECT_LOGIT_LEARNING_RATE",
+        SOCCER_POLICY_LEARNING_RATE,
+        0.0,
+        SOCCER_FORWARD_SELECT_LOGIT_LEARNING_RATE_MAX,
+    )
 }
 
 fn soccer_forward_select_logit_weight_override_on_restore() -> bool {
@@ -43619,6 +43633,14 @@ mod soccer_policy_actor_capacity_tests {
         let restored = soccer_policy_head_from_snapshot(&snapshot, 22).expect("restore policy");
 
         assert_eq!(restored.forward_select_logit_weight, 3.25);
+    }
+
+    #[test]
+    fn forward_select_scalar_learning_rate_is_independently_tunable() {
+        let _lock = env_lock();
+        let _rate = set_test_env_var("DD_SOCCER_FORWARD_SELECT_LOGIT_LEARNING_RATE", "0.0075");
+
+        assert_eq!(soccer_forward_select_logit_learning_rate(), 0.0075);
     }
 
     #[test]
