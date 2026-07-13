@@ -24468,6 +24468,68 @@ pub(crate) fn on_frame_shot_reward_scale() -> f64 {
     grounded_non_conversion_reward_scale(raw, SHOT_ON_TARGET_REWARD_POINTS, conversion_points)
 }
 
+// ═══ ANCHORED REWARD CURRENCY (docs/reward-anchoring.md) ════════════════════
+// Env `DD_SOCCER_ENABLE_ANCHORED_REWARDS` — default OFF ⇒ byte-identical.
+// When ON, the LIVE self-play currency is fixed: a goal pays 500 (replacing the
+// hardcoded 160-pt chain total), a match win pays 1000 (bypassing the
+// goal-scale floor logic, which floored wins against a goal magnitude that the
+// live path never actually scaled), and an on-frame shot is paid DIRECTLY to
+// the shooter with floor 50 and field-vector cap 50+150·xg_scale. This exists
+// because the audit showed the previous levers never reached live training:
+// `DD_SOCCER_ON_FRAME_SHOT_REWARD_SCALE` is consumed only below the
+// `infer_discrete_events` early-return (tracking-only), and
+// `DD_SOCCER_GOAL_REWARD_SCALE` never touches `record_goal_rewards`.
+// Secondary live events (duels, saves, recoveries, defensive-goal history
+// penalties, direct-turnover goals) scale uniformly by ANCHOR_GOAL/160 so
+// their RELATIVE weight is preserved in the new currency.
+pub(crate) const ANCHOR_WIN_POINTS: f64 = 1000.0;
+pub(crate) const ANCHOR_GOAL_POINTS: f64 = 500.0;
+pub(crate) const ANCHOR_ON_FRAME_SHOT_FLOOR: f64 = 50.0;
+pub(crate) const ANCHOR_ON_FRAME_SHOT_CAP_SPAN: f64 = 150.0;
+
+pub(crate) fn anchored_rewards_enabled() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_ANCHORED_REWARDS")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_ANCHORED_REWARDS"))
+    }
+}
+
+/// The live goal event total: the anchor (500) when anchored, else the
+/// historical hardcoded chain total (160).
+pub(crate) fn live_goal_reward_points() -> f64 {
+    if anchored_rewards_enabled() {
+        ANCHOR_GOAL_POINTS
+    } else {
+        GOAL_REWARD_POINTS
+    }
+}
+
+/// Uniform scale for secondary LIVE reward events under the anchored currency
+/// (keeps duel/save/recovery/defensive magnitudes at the same fraction of a
+/// goal as before). 1.0 when anchoring is off.
+pub(crate) fn anchored_currency_scale() -> f64 {
+    if anchored_rewards_enabled() {
+        ANCHOR_GOAL_POINTS / GOAL_REWARD_POINTS
+    } else {
+        1.0
+    }
+}
+
+/// Anchored on-frame shot points for the SHOOTER: floor 50 anywhere on the
+/// pitch, cap 50+150·xg_scale where `xg_scale` ∈ [0,1] is the field-vector
+/// shot context (`shot_reward_distance_scale`: distance taper × xG). An
+/// on-frame 80-yarder caps at exactly the floor; a close central chance can
+/// reach 200 = 0.40 · goal.
+pub(crate) fn anchored_on_frame_shot_points(xg_scale: f64) -> f64 {
+    ANCHOR_ON_FRAME_SHOT_FLOOR + ANCHOR_ON_FRAME_SHOT_CAP_SPAN * xg_scale.clamp(0.0, 1.0)
+}
+
 fn hierarchy_bounded_shot_on_target_points(shot_scale: f64, goal_scale: f64) -> f64 {
     let raw = SHOT_ON_TARGET_REWARD_POINTS * shot_scale.max(MIN_SOCCER_REWARD_WEIGHT);
     let outcome_ceiling =
