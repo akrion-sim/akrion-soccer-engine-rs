@@ -118,6 +118,13 @@ const CONTROL_AERIAL_JUMP_REACH: f32 = 2.2;
 const LOW_BALL_INTERCEPT_FLOOR: f32 = 2.0;
 const KEEPER_AERIAL_REACH: f32 = 2.6; // keeper jump+arms: claims lofted balls only up to this altitude
 const AERIAL_LAND_AT_TARGET_DRAG_COMP: f32 = 1.08; // closed-form ignores drag: strike a touch firmer
+// A deliberate chip over a blocked lane needs the room to rise OVER reach and
+// come back down — under this distance the arc never protects the ball and a
+// firm ground pass through/around traffic is strictly better (the speed solve
+// already zips pressured balls). Apex floor = the 11v11 raised-scoop minimum
+// (SCOOP_LOFT_APEX_HIGH_MIN_YARDS ~10ft): clears an upright/jumping defender.
+const LOFT_MIN_DISTANCE: f32 = 11.0;
+const LOFT_APEX_CLEAR_FLOOR: f32 = 3.05;
 
 /// Peak height (yd) of a lofted pass over horizontal distance `d` (lofted_pass_apex_yards).
 fn lofted_apex_yds(d: f32) -> f32 {
