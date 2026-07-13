@@ -268,8 +268,7 @@ fn carry_to_boundary(origin: V2, dir: V2) -> f32 {
         0.0
     }
 }
-#[allow(dead_code)]
-const PASS_SPEED: f32 = 18.0; // legacy fixed pass pace (superseded by ground_pass_launch_speed)
+const PASS_SPEED: f32 = 18.0; // LEGACY fixed pass pace (parity mode solves the pace instead)
 const SHOT_SPEED: f32 = 24.0;
 const CLEAR_SPEED: f32 = 20.0;
 const CAPTURE_MAX_BALL_SPEED: f32 = 26.0;
