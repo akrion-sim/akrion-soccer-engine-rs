@@ -27963,8 +27963,9 @@ impl SoccerMatch {
         let danger = (1.0
             - shot.origin.distance(attacked_goal) / GOALKEEPER_SAVE_DANGER_REFERENCE_YARDS)
             .clamp(0.0, 1.0);
-        let amount =
-            GOALKEEPER_SAVE_BASE_REWARD_POINTS + GOALKEEPER_SAVE_DANGER_REWARD_POINTS * danger;
+        let amount = (GOALKEEPER_SAVE_BASE_REWARD_POINTS
+            + GOALKEEPER_SAVE_DANGER_REWARD_POINTS * danger)
+            * anchored_currency_scale();
         self.record_reward_event_with_kind(
             keeper_id,
             amount,
