@@ -977,6 +977,12 @@ impl World {
             f.push(rv.y / nv);
             f.push(rp.len() / nx);
         }
+        // possession/duel tri-state (3): MARL acting depends on possession vs
+        // dispossession vs 50-50 — given to the net as an explicit input.
+        let (contested, favor, i_contend) = self.duel_state(team, idx);
+        f.push(contested);
+        f.push(favor);
+        f.push(i_contend);
         f.push(1.0); // bias
         debug_assert_eq!(f.len(), OBS_DIM);
         f.try_into().unwrap()
