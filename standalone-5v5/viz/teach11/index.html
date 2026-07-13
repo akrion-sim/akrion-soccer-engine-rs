@@ -784,8 +784,15 @@ function curProbs(){const e=D.decisions[curScen];const T=+$('#temp').value;retur
 function drawDecision(){
   const e=D.decisions[curScen];const T=+$('#temp').value;
   $('#scenStory').textContent=e.story;$('#tempRead').textContent='T = '+T.toFixed(2);
-  const p=curProbs();$('#entRead').textContent=entropy(p).toFixed(2);
-  probBarsPair($('#probBars'),softmax(e.neural,e.mask,T),p,e.mask);
+  const pn=softmax(e.neural,e.mask,T), p=curProbs();
+  $('#entRead').textContent=entropy(p).toFixed(2);
+  probBarsPair($('#probBars'),pn,p,e.mask);
+  const fn=$('#flipNote'); const acts=D.actions;
+  const nt=pn.indexOf(Math.max(...pn)), bt=p.indexOf(Math.max(...p));
+  fn.innerHTML = nt!==bt
+    ? `neural's top pick <b style="color:var(--ink-dim)">${acts[nt].name}</b> → after the DP prior, `+
+      `<b class="hl">${acts[bt].name}</b> — <span class="hlV">the prior flipped the choice</span>.`
+    : `the DP prior reinforces <b class="hl">${acts[bt].name}</b> (already the neural top pick).`;
 }
 function probBarsPair(cv,pn,pb,mask){
   const {w,h,ctx}=fit(cv,0.66);const acts=D.actions;
