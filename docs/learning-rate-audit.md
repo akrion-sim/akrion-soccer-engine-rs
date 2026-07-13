@@ -417,3 +417,8 @@ was `5W-24D-3L`, payoff `0.531`, Wilson lower bound `0.364`, with forward/net-fo
 Wilson lower bound `0.323`, goal difference `-8`. A small forward margin survived (`+4`, net `+1`),
 but pass completion fell by 11.4 percentage points and turnovers increased. Higher exploration is
 therefore rejected without another training seed; the league entropy default remains `0.04`.
+
+The opposite half-step, entropy `0.02`, also failed its stop gate. It saturated the forward scalar
+at `8.0` and finished `7W-18D-7L` versus the `0.04` actor: payoff `0.500`, Wilson lower bound
+`0.336`, goal difference `0`, forward/net-forward margins `+3/+1`, and two extra turnovers. Because
+it did not beat the default on payoff or the turnover guard, it was not expanded to 64 games.
