@@ -143,6 +143,9 @@ spec:
               require_value SOCCER_LEARNING_ANALYTIC_OPPONENT true
               require_value SOCCER_LEAGUE_ANALYTIC_OPPONENTS true
               require_value SOCCER_ANCHOR_PROMOTION_GATE_ENABLED true
+              require_value SOCCER_ANCHOR_PROMOTION_GATE_ANALYTIC_NON_REGRESSION true
+              require_value SOCCER_ANCHOR_PROMOTION_GATE_ANALYTIC_GAMES 4
+              require_value SOCCER_ANCHOR_PROMOTION_GATE_ANALYTIC_MAX_GOAL_DIFF_REGRESSION 0.0
               require_value DD_SOCCER_ENABLE_LEARNED_EPV true
 
               echo "continuous_started_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -201,6 +204,9 @@ spec:
               echo "learning_analytic_opponent=${SOCCER_LEARNING_ANALYTIC_OPPONENT}"
               echo "league_analytic_opponents=${SOCCER_LEAGUE_ANALYTIC_OPPONENTS}"
               echo "anchor_promotion_gate=${SOCCER_ANCHOR_PROMOTION_GATE_ENABLED}"
+              echo "anchor_analytic_non_regression=${SOCCER_ANCHOR_PROMOTION_GATE_ANALYTIC_NON_REGRESSION}"
+              echo "anchor_analytic_games=${SOCCER_ANCHOR_PROMOTION_GATE_ANALYTIC_GAMES}"
+              echo "anchor_analytic_max_goal_diff_regression=${SOCCER_ANCHOR_PROMOTION_GATE_ANALYTIC_MAX_GOAL_DIFF_REGRESSION}"
               echo "learned_epv=${DD_SOCCER_ENABLE_LEARNED_EPV}"
               echo "learned_epv_grid_path=${DD_SOCCER_LEARNED_EPV_GRID_PATH:-unset}"
               echo "source_ref=${source_ref}"
@@ -543,6 +549,12 @@ spec:
               value: "true"
             - name: SOCCER_ANCHOR_PROMOTION_GATE_ENABLED
               value: "true"
+            - name: SOCCER_ANCHOR_PROMOTION_GATE_ANALYTIC_NON_REGRESSION
+              value: "true"
+            - name: SOCCER_ANCHOR_PROMOTION_GATE_ANALYTIC_GAMES
+              value: "4"
+            - name: SOCCER_ANCHOR_PROMOTION_GATE_ANALYTIC_MAX_GOAL_DIFF_REGRESSION
+              value: "0.0"
             - name: DD_SOCCER_ENABLE_LEARNED_EPV
               value: "true"
             - name: SOCCER_PG_PASS_COMPLETION_SAMPLE_LIMIT

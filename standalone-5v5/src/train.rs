@@ -303,7 +303,7 @@ impl FieldRewardContext {
         let mut outlet_count = 0.0f32;
         for i in 1..N {
             let pos = w.a[i].pos;
-            let ahead = ((pos.x - w.ball.x) / 12.0).clamp(0.0, 1.0);
+            let ahead = ((pos.y - w.ball.y) / 12.0).clamp(0.0, 1.0);
             let lane = w.lane_clearness(Team::A, w.ball, pos);
             let (_, opp_d) = w.nearest_opponent_distance(Team::A, pos);
             let space = (opp_d / 8.0).clamp(0.0, 1.0);
@@ -324,11 +324,11 @@ impl FieldRewardContext {
             let mut best_chance = 0.0f32;
             for i in 1..N {
                 let pos = w.a[i].pos;
-                if pos.x < SHOOT_X {
+                if pos.y < SHOOT_X {
                     continue;
                 }
                 let d = goal.sub(pos).len();
-                let lateral = (pos.y - FIELD_W / 2.0).abs();
+                let lateral = (pos.x - FIELD_W / 2.0).abs();
                 let dist_f = (1.0 - d / 26.0).clamp(0.0, 1.0);
                 let angle_f = (1.0 - lateral / (FIELD_W / 2.0)).clamp(0.0, 1.0);
                 let xg = dist_f * dist_f * (0.4 + 0.6 * angle_f);
@@ -347,7 +347,7 @@ impl FieldRewardContext {
             let (_, pressure_d) = w.nearest_opponent_distance(o.team, carrier);
             let pressure = (1.0 - pressure_d / 7.0).clamp(0.0, 1.0);
             if o.team == Team::A {
-                let forward = (carrier.x / FIELD_L).clamp(0.0, 1.0);
+                let forward = (carrier.y / FIELD_L).clamp(0.0, 1.0);
                 ctx.dribble_pressure = pressure;
                 ctx.pass_value = (0.45 * ctx.safe_outlet_value + 0.35 * forward + 0.20 * pressure)
                     .clamp(0.0, 1.0);
@@ -364,10 +364,10 @@ impl FieldRewardContext {
         let mut recovery_need = 0.0f32;
         for i in 1..N {
             let pos = w.a[i].pos;
-            let goalside = ((w.ball.x - pos.x) / 8.0).clamp(-1.0, 1.0);
+            let goalside = ((w.ball.y - pos.y) / 8.0).clamp(-1.0, 1.0);
             goalside_sum += (goalside + 1.0) * 0.5;
-            if their_phase && pos.x > w.ball.x {
-                recovery_need += ((pos.x - w.ball.x) / FIELD_L).clamp(0.0, 1.0);
+            if their_phase && pos.y > w.ball.y {
+                recovery_need += ((pos.y - w.ball.y) / FIELD_L).clamp(0.0, 1.0);
             }
         }
         ctx.goalside_score = if their_phase {
@@ -383,16 +383,16 @@ impl FieldRewardContext {
                 if matches!(w.owner, Some(o) if o.team == Team::A && o.idx == i) {
                     continue;
                 }
-                let ahead = ((pos.x - w.ball.x) / 12.0).clamp(0.0, 1.0);
+                let ahead = ((pos.y - w.ball.y) / 12.0).clamp(0.0, 1.0);
                 let lane = w.lane_clearness(Team::A, w.ball, pos);
-                let fwd_speed = (w.a[i].vel.x / 8.5).clamp(0.0, 1.0);
+                let fwd_speed = (w.a[i].vel.y / 8.5).clamp(0.0, 1.0);
                 burst_sum += ahead * lane * (0.35 + 0.65 * fwd_speed);
             }
             ctx.burst_score = (burst_sum / (N - 1) as f32).clamp(0.0, 1.0);
         }
 
-        ctx.return_stale = if w.return_streak_a > 0 && w.ball.x - w.return_start_x < 5.0 {
-            (1.0 - (w.ball.x - w.return_start_x).max(0.0) / 5.0).clamp(0.0, 1.0)
+        ctx.return_stale = if w.return_streak_a > 0 && w.ball.y - w.return_start_x < 5.0 {
+            (1.0 - (w.ball.y - w.return_start_x).max(0.0) / 5.0).clamp(0.0, 1.0)
         } else {
             0.0
         };
@@ -699,7 +699,7 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
             } else {
                 rw().return_pass * 2f32.powi((k - 1) as i32)
             };
-            if w.ball.x - w.return_start_x < 5.0 {
+            if w.ball.y - w.return_start_x < 5.0 {
                 pen += rw().return_stale; // no upfield progress -> heavier
             }
             pen *= 1.0 + 0.50 * pre_field.safe_outlet_value + 0.50 * pre_field.return_stale;
@@ -775,7 +775,7 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
                     let to_ip = ip.sub(w.a[i].pos);
                     let d = to_ip.len();
                     if d > 0.5 {
-                        let closing = (w.a[i].vel.x * to_ip.x + w.a[i].vel.y * to_ip.y) / d;
+                        let closing = (w.a[i].vel.y * to_ip.y + w.a[i].vel.x * to_ip.x) / d;
                         let def_bonus = if i <= 2 { 1.3 } else { 1.0 };
                         sp_t[i] +=
                             rw().pursuit * belief * def_bonus * (closing / 8.5).clamp(0.0, 1.0);
@@ -786,7 +786,7 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
                 // Advance upfield (attack frame +x). No offsides rule, so reward
                 // getting into the ATTACKING HALF and keep rewarding all the way to
                 // the opponent goal — attackers should camp high, not hold at half.
-                let advance = pos.x / FIELD_L - 0.5;
+                let advance = pos.y / FIELD_L - 0.5;
                 // OPEN = a CLEAR passing lane from the ball to me (no defender in
                 // between). NOT merely far from a marker — a player inline behind a
                 // defender is NOT open. This is the MECHANISM for "opening up": the
@@ -794,7 +794,7 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
                 // which clears the lane (hence width is rewarded strongly too).
                 let open = w.lane_clearness(Team::A, w.ball, pos) - 0.5;
                 // WIDTH: how far off the central lane (0 = center, 1 = touchline).
-                let wide = (pos.y - FIELD_W / 2.0).abs() / (FIELD_W / 2.0);
+                let wide = (pos.x - FIELD_W / 2.0).abs() / (FIELD_W / 2.0);
                 let width = wide - 0.4; // penalize the central lane, reward stretching
                                         // FLANK affinity: convex bonus for genuinely committing to a
                                         // left/right channel. With the 8-yd anti-bunch this splits the
@@ -813,9 +813,9 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
                 //       gears are for). Together this pulls the whole line upfield
                 //       in unison the moment we win possession.
                 if !is_carrier {
-                    let ahead = ((pos.x - w.ball.x) / 12.0).clamp(0.0, 1.0);
+                    let ahead = ((pos.y - w.ball.y) / 12.0).clamp(0.0, 1.0);
                     let lane = w.lane_clearness(Team::A, w.ball, pos);
-                    let make_run = (w.a[i].vel.x / 8.5).clamp(0.0, 1.0); // fwd speed, ~run_fast = 1.0
+                    let make_run = (w.a[i].vel.y / 8.5).clamp(0.0, 1.0); // fwd speed, ~run_fast = 1.0
                     let burst = if spd_t[i] >= SPD_SPRINT {
                         1.0
                     } else if spd_t[i] >= SPD_RUN_FAST {
@@ -832,10 +832,10 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
             } else if their_phase {
                 // goalside of the ball: our goal is at x=0, so reward being at a
                 // LOWER x than the ball (between ball and own goal).
-                let goalside = ((w.ball.x - pos.x) / 8.0).clamp(-1.0, 1.0);
+                let goalside = ((w.ball.y - pos.y) / 8.0).clamp(-1.0, 1.0);
                 sp_t[i] += rw().goalside * goalside;
-                if pos.x > w.ball.x {
-                    let recovery_run = (-w.a[i].vel.x / 8.5).clamp(0.0, 1.0);
+                if pos.y > w.ball.y {
+                    let recovery_run = (-w.a[i].vel.y / 8.5).clamp(0.0, 1.0);
                     sp_t[i] += rw().goalside_run * recovery_run;
                 }
             }

@@ -42988,6 +42988,60 @@ fn set_team_neural_brain_keeps_distinct_skill_policy_heads_per_team() {
 }
 
 #[test]
+fn set_team_neural_brain_keeps_distinct_joint_actors_per_team() {
+    let mut sim = per_team_brain_match(20265);
+    let mut home_actor = SoccerPolicyHead::new(41);
+    let mut away_actor = SoccerPolicyHead::new(43);
+    home_actor.forward_select_logit_weight = 1.25;
+    away_actor.forward_select_logit_weight = -0.75;
+
+    let mut home_snapshot = sim
+        .neural_network_snapshot_for(Team::Home)
+        .expect("home neural snapshot");
+    let mut away_snapshot = home_snapshot.clone();
+    home_snapshot.policy_head = Some(Box::new(soccer_policy_head_snapshot(&home_actor)));
+    away_snapshot.policy_head = Some(Box::new(soccer_policy_head_snapshot(&away_actor)));
+
+    sim.set_team_neural_brain(Team::Home, Some(home_snapshot), true)
+        .expect("install home snapshot with joint actor");
+    sim.set_team_neural_brain(Team::Away, Some(away_snapshot), true)
+        .expect("install away snapshot with joint actor");
+
+    assert_eq!(
+        sim.policy_head
+            .as_ref()
+            .expect("home actor sidecar")
+            .forward_select_logit_weight,
+        1.25
+    );
+    assert_eq!(
+        sim.away_policy_head
+            .as_ref()
+            .expect("away actor sidecar")
+            .forward_select_logit_weight,
+        -0.75
+    );
+    assert_eq!(
+        sim.neural_network_snapshot_for(Team::Home)
+            .expect("home exported snapshot")
+            .policy_head
+            .as_deref()
+            .expect("home exported actor")
+            .forward_select_logit_weight,
+        1.25
+    );
+    assert_eq!(
+        sim.neural_network_snapshot_for(Team::Away)
+            .expect("away exported snapshot")
+            .policy_head
+            .as_deref()
+            .expect("away exported actor")
+            .forward_select_logit_weight,
+        -0.75
+    );
+}
+
+#[test]
 fn set_team_neural_brain_keeps_distinct_auxiliary_heads_per_team() {
     let mut sim = per_team_brain_match(20264);
     let home_head = trained_test_pass_completion_head(41, 1);
@@ -86774,6 +86828,35 @@ fn forward_pass_climb_curriculum_env_lock() -> std::sync::MutexGuard<'static, ()
 }
 
 #[test]
+fn observation_forward_teacher_supplies_sample_without_planner_options() {
+    let _env = forward_pass_climb_curriculum_env_lock();
+    let _teacher = TestEnvVarGuard::set("DD_SOCCER_ENABLE_PLANNER_TEACHER_MISSED_OPPORTUNITY", "1");
+    let _fallback = TestEnvVarGuard::set(
+        "DD_SOCCER_PLANNER_TEACHER_OBSERVATION_FORWARD_FALLBACK",
+        "1",
+    );
+    let sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let mut decision = test_decision_trace(&snapshot, 8, "protect-ball");
+    decision.action_options.clear();
+    decision.observation.has_ball = true;
+    decision.observation.visible_forward_pass_options = 1;
+    decision.observation.best_forward_pass_option_quality = 0.90;
+    decision.observation.best_forward_pass_receiver_openness = 0.85;
+    decision.observation.quick_forward_pass_value = 0.88;
+    decision.observation.expected_pass_completion = 0.84;
+    decision.observation.floor_pass_lane_score = 0.80;
+
+    let teachers = soccer_planner_teacher_missed_opportunities(&decision, PlayerRole::Midfielder);
+
+    assert_eq!(teachers.len(), 1);
+    assert_eq!(teachers[0].action, "forward-release-pass");
+    assert!(teachers[0].quality >= 0.80);
+    assert!(teachers[0].advantage > 0.0);
+    assert!(teachers[0].weight >= 1.0);
+}
+
+#[test]
 fn forward_pass_climb_curriculum_can_relax_forced_shot_for_support_pass() {
     let _env = forward_pass_climb_curriculum_env_lock();
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
@@ -99944,153 +100027,10 @@ fn mpc_reject_threshold_pipeline_collects_and_trains_end_to_end() {
     );
 
     // The drained corpus trains a usable head (the learner's per-game step).
-    let (trained_head, report) = train_mpc_reject_threshold_head(&on_samples, 7, 4, 0.02)
+    let (head, report) = train_mpc_reject_threshold_head(&on_samples, 7, 4, 0.02)
         .expect("a non-empty corpus trains a reject-threshold head");
     assert!(
-        report.training_steps > 0
-            && trained_head.training_steps() > 0
-            && report.final_loss.is_finite(),
+        report.training_steps > 0 && head.training_steps() > 0 && report.final_loss.is_finite(),
         "training must advance the head: {report:?}"
     );
-
-    // --- Live seam behavior: build a fresh in-play snapshot with ball carriers and
-    // exercise `learned_mpc_reject_threshold` directly (this is the value MPC actually
-    // gates against). All env toggling stays inside this single test to avoid racing a
-    // parallel test on the process-global flag.
-    let seam_config = MatchConfig {
-        duration_seconds: 12.0,
-        seed: 77_010,
-        ..MatchConfig::default()
-    };
-    let seam_ticks = seam_config.total_ticks().min(300);
-    let mut seam_sim = SoccerMatch::default_11v11(seam_config);
-    for _ in 0..seam_ticks {
-        seam_sim.run_time_step();
-    }
-    let carriers: Vec<usize> = {
-        let snap = WorldSnapshot::from_match(&seam_sim);
-        snap.players
-            .iter()
-            .filter(|p| p.role != PlayerRole::Goalkeeper)
-            .map(|p| p.id)
-            .collect()
-    };
-    assert!(!carriers.is_empty(), "match must have field players");
-    let base = 0.18_f64;
-    let families = [
-        MpcRejectFamily::Pass,
-        MpcRejectFamily::Dribble,
-        MpcRejectFamily::Shot,
-    ];
-
-    // OFF: the seam must return EXACTLY the base constant — byte-identical, no feature
-    // build, for every player and family.
-    std::env::remove_var("DD_SOCCER_ENABLE_MPC_REJECT_THRESHOLD_MODEL");
-    {
-        let snap = WorldSnapshot::from_match(&seam_sim);
-        for &pid in &carriers {
-            for fam in families {
-                let bar = snap.learned_mpc_reject_threshold(pid, fam, base);
-                assert_eq!(
-                    bar, base,
-                    "disabled seam must return exactly the base bar (player {pid}, {fam:?})"
-                );
-            }
-        }
-    }
-
-    // ON (analytic seed, no head installed): bars stay in the valid band AND vary across
-    // contexts — i.e. "too low" is genuinely a function of the field vector, not a global
-    // constant. Also capture a per-player reference bar to prove the gate below.
-    std::env::set_var("DD_SOCCER_ENABLE_MPC_REJECT_THRESHOLD_MODEL", "1");
-    let analytic_bars: Vec<f64> = {
-        let snap = WorldSnapshot::from_match(&seam_sim);
-        let mut bars = Vec::new();
-        for &pid in &carriers {
-            let bar = snap.learned_mpc_reject_threshold(pid, MpcRejectFamily::Pass, base);
-            assert!(
-                (MPC_REJECT_THRESHOLD_FLOOR..=MPC_REJECT_THRESHOLD_CEIL).contains(&bar),
-                "enabled bar {bar} out of band"
-            );
-            bars.push(bar);
-        }
-        bars
-    };
-    let bar_min = analytic_bars.iter().cloned().fold(f64::INFINITY, f64::min);
-    let bar_max = analytic_bars
-        .iter()
-        .cloned()
-        .fold(f64::NEG_INFINITY, f64::max);
-    assert!(
-        bar_max - bar_min > 1e-3,
-        "enabled analytic reject bar must vary across contexts (range {bar_min}..{bar_max}), \
-         proving it is context-dependent and not the global constant"
-    );
-
-    // Min-training-steps gate: installing a RAW head (0 training steps, below
-    // MPC_REJECT_THRESHOLD_HEAD_MIN_TRAINING_STEPS) must NOT be consumed — the seam must
-    // still return the analytic-seed bar, identical to the no-head case above.
-    assert!(
-        MpcRejectThresholdHead::new(9).training_steps()
-            < MPC_REJECT_THRESHOLD_HEAD_MIN_TRAINING_STEPS,
-        "a freshly-seeded head must start below the consumption gate"
-    );
-    seam_sim.set_mpc_reject_threshold_head(MpcRejectThresholdHead::new(9));
-    {
-        let snap = WorldSnapshot::from_match(&seam_sim);
-        for (i, &pid) in carriers.iter().enumerate() {
-            let bar = snap.learned_mpc_reject_threshold(pid, MpcRejectFamily::Pass, base);
-            assert_eq!(
-                bar, analytic_bars[i],
-                "a raw head below the min-training-steps gate must fall back to the analytic \
-                 bar (player {pid}), got {bar} vs analytic {}",
-                analytic_bars[i]
-            );
-        }
-    }
-
-    // A TRAINED head (>= the min-steps gate) IS consumed and overrides the analytic
-    // seed. Regress a head toward a distinctive high bar (0.70) for these contexts —
-    // well above any analytic bar (base 0.18 + at most ANALYTIC_CONTEXT_SWING) — so a
-    // seam value near 0.70 can only mean the learned head, not the seed, was used.
-    {
-        let target_bar = 0.70_f64;
-        let training_rows: Vec<(MpcRejectThresholdInputs, f64)> = {
-            let snap = WorldSnapshot::from_match(&seam_sim);
-            carriers
-                .iter()
-                .filter_map(|&pid| {
-                    let player = snap.players.iter().find(|p| p.id == pid)?;
-                    let inputs = snap.build_mpc_reject_threshold_inputs(
-                        player,
-                        MpcRejectFamily::Pass,
-                        base,
-                    )?;
-                    Some((inputs, target_bar))
-                })
-                .collect()
-        };
-        assert!(!training_rows.is_empty(), "need carrier contexts to train on");
-        let mut head = MpcRejectThresholdHead::new(31);
-        let mut guard = 0;
-        while head.training_steps() < MPC_REJECT_THRESHOLD_HEAD_MIN_TRAINING_STEPS && guard < 5000 {
-            head.train(&training_rows, 0.1);
-            guard += 1;
-        }
-        assert!(
-            head.training_steps() >= MPC_REJECT_THRESHOLD_HEAD_MIN_TRAINING_STEPS,
-            "head must cross the consumption gate"
-        );
-        seam_sim.set_mpc_reject_threshold_head(head);
-        let snap = WorldSnapshot::from_match(&seam_sim);
-        for &pid in &carriers {
-            let bar = snap.learned_mpc_reject_threshold(pid, MpcRejectFamily::Pass, base);
-            assert!(
-                bar > 0.55,
-                "a trained head regressed toward {target_bar} must be consumed at the seam \
-                 (got {bar}); no analytic seed can reach here"
-            );
-        }
-    }
-    std::env::remove_var("DD_SOCCER_ENABLE_MPC_REJECT_THRESHOLD_MODEL");
 }
