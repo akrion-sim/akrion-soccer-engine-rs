@@ -32460,6 +32460,18 @@ impl SoccerMatch {
                     } else {
                         goal_center_x
                     };
+                    // ACTOR-OWNED SHOT PLACEMENT (default-OFF, byte-identical when off): if the
+                    // learned policy chose an explicit goal-mouth aim point, honor its lateral (x)
+                    // component — overriding the analytic `base_goal_x` — clamped inside the posts.
+                    // The downstream `noisy_shot_target_x` + goal-mouth clamp still apply, and the
+                    // optional MPC residual below composes on top. Off ⇒ `target_point` is `None` ⇒
+                    // this is a no-op ⇒ identical to baseline.
+                    if dd_soccer_enable_actor_shot_placement() {
+                        if let Some(actor_aim) = actor_shot_target {
+                            base_goal_x =
+                                actor_aim.x.clamp(goal_center_x - half_goal, goal_center_x + half_goal);
+                        }
+                    }
                     // Learned MPC execution-objective residual for SHOT PLACEMENT — the shot analogue
                     // of the pass-lead nudge in the pass launch path (see the `led_target` residual
                     // above). Gated on the SEPARATE, default-OFF
