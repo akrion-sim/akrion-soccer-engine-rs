@@ -63,6 +63,9 @@ def env_float(name, default, lo=None, hi=None):
 # optimizer discovers everything else, in points, inside these sane bounds
 # (the binary clamps identically, so the search space == the legal space).
 SPACE = [
+    # Negative anchor mirrors: fractions of goal/win — the risk-appetite knobs.
+    ("REW_CONCEDE_FRAC", 0.67, 0.25,       1.0, False),
+    ("REW_LOSS_FRAC",  0.5,  0.4,          1.0, False),
     ("REW_SHOT_SPAN",  1.0,  MIN_WEIGHT,   1.5, False),
     ("REW_MILESTONE", 12.0,  MIN_WEIGHT,  40.0, False),
     ("REW_PASS",       2.5,  MIN_WEIGHT,  25.0, False),
