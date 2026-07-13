@@ -124,7 +124,13 @@ measures policy drift instead of fixture drift.
 The reproducible reward experiment is `scripts/run_reward_anchor_ab.sh`. It trains three
 same-seed arms against an alternating analytic pool: no outcome label, the existing `200`
 label, and the maximum effective `400` label, then evaluates every snapshot on the same
-held-out analytic field. A 12-game smoke run produced payoffs `0.438` (`200`) and `0.469`
-(`400`) over 16 held-out games; both failed the confidence gate, so this is evidence that
-the treatment executes—not evidence of a breakthrough. Larger repeated-seed results must
-drive any reward-default change.
+held-out analytic field. `WIN_REWARD_A` and `WIN_REWARD_B` select the two nonzero arms.
+
+The first powered run trained each arm for 60 same-seed games and evaluated it over 32
+held-out games. Outcome-off was nominally best (payoff `0.500`, Elo delta `+15.5`, forward
+pass margin `+0.00/game`); `200` reached payoff `0.438`, Elo delta `+4.3`, forward margin
+`+0.16/game`; `400` reached payoff `0.453`, Elo delta `-40.3`, forward margin `-0.06/game`.
+Every Wilson lower bound remained below the promotion floor (`0.282` to `0.336`). This
+rejects “make the broadcast win label huge” as the next default, but does not yet prove
+that the outcome label should be removed. The next independent-seed arm tests a smaller
+`30` nudge against `200`; repeated-seed held-out results must drive any default change.

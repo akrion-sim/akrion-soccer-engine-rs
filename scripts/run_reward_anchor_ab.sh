@@ -12,6 +12,20 @@ ANALYTIC_POOL_SIZE="${ANALYTIC_POOL_SIZE:-5}"
 TRAIN_ANALYTIC_POOL_SIZE="${TRAIN_ANALYTIC_POOL_SIZE:-4}"
 TRAIN_SEED="${TRAIN_SEED:-A1200000}"
 EVAL_SEED="${EVAL_SEED:-E1200000}"
+WIN_REWARD_A="${WIN_REWARD_A:-200}"
+WIN_REWARD_B="${WIN_REWARD_B:-400}"
+
+if [[ ! "$WIN_REWARD_A" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+  || [[ ! "$WIN_REWARD_B" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  printf 'WIN_REWARD_A and WIN_REWARD_B must be non-negative numbers\n' >&2
+  exit 2
+fi
+arm_a="win${WIN_REWARD_A//./p}"
+arm_b="win${WIN_REWARD_B//./p}"
+if [[ "$arm_a" == "$arm_b" ]]; then
+  printf 'WIN_REWARD_A and WIN_REWARD_B must differ\n' >&2
+  exit 2
+fi
 
 if [[ ! -x "$BIN" ]]; then
   cargo build --release --manifest-path "$ROOT/Cargo.toml" --bin soccer_outcome_ab_run
@@ -35,26 +49,26 @@ common_train_env=(
   "$BIN" train-analytic "$OUT_DIR/outcome-off.json" "$TRAIN_GAMES" "$TRAIN_MINUTES" "$TRAIN_SEED" \
   >"$OUT_DIR/outcome-off-train.log" 2>&1 &
 pid_off=$!
-"${common_train_env[@]}" DD_SOCCER_ENABLE_MATCH_OUTCOME_REWARD=1 DD_SOCCER_MATCH_WIN_REWARD_POINTS=200 \
-  "$BIN" train-analytic "$OUT_DIR/win200.json" "$TRAIN_GAMES" "$TRAIN_MINUTES" "$TRAIN_SEED" \
-  >"$OUT_DIR/win200-train.log" 2>&1 &
-pid_200=$!
-"${common_train_env[@]}" DD_SOCCER_ENABLE_MATCH_OUTCOME_REWARD=1 DD_SOCCER_MATCH_WIN_REWARD_POINTS=400 \
-  "$BIN" train-analytic "$OUT_DIR/win400.json" "$TRAIN_GAMES" "$TRAIN_MINUTES" "$TRAIN_SEED" \
-  >"$OUT_DIR/win400-train.log" 2>&1 &
-pid_400=$!
+"${common_train_env[@]}" DD_SOCCER_ENABLE_MATCH_OUTCOME_REWARD=1 DD_SOCCER_MATCH_WIN_REWARD_POINTS="$WIN_REWARD_A" \
+  "$BIN" train-analytic "$OUT_DIR/$arm_a.json" "$TRAIN_GAMES" "$TRAIN_MINUTES" "$TRAIN_SEED" \
+  >"$OUT_DIR/$arm_a-train.log" 2>&1 &
+pid_a=$!
+"${common_train_env[@]}" DD_SOCCER_ENABLE_MATCH_OUTCOME_REWARD=1 DD_SOCCER_MATCH_WIN_REWARD_POINTS="$WIN_REWARD_B" \
+  "$BIN" train-analytic "$OUT_DIR/$arm_b.json" "$TRAIN_GAMES" "$TRAIN_MINUTES" "$TRAIN_SEED" \
+  >"$OUT_DIR/$arm_b-train.log" 2>&1 &
+pid_b=$!
 
 wait "$pid_off"
-wait "$pid_200"
-wait "$pid_400"
+wait "$pid_a"
+wait "$pid_b"
 
-for arm in outcome-off win200 win400; do
+for arm in outcome-off "$arm_a" "$arm_b"; do
   "$BIN" eval-analytic "$OUT_DIR/$arm.json" "$EVAL_GAMES_PER_OPPONENT" "$EVAL_MINUTES" \
     "$ANALYTIC_POOL_SIZE" "$EVAL_SEED" >"$OUT_DIR/$arm-eval.log" 2>&1 &
 done
 wait
 
-for arm in outcome-off win200 win400; do
+for arm in outcome-off "$arm_a" "$arm_b"; do
   printf '\n[%s]\n' "$arm"
   grep -E 'held-out Elo:|payoff vs analytic field|completed forward passes/game:|candidate:|analytic:' \
     "$OUT_DIR/$arm-eval.log" || true
