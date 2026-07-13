@@ -191,6 +191,52 @@
     </div>
   </section>
 
+  <!-- ═══════════════ 0. CONCEPTS / VOCABULARY ═══════════════ -->
+  <section id="concepts">
+    <div class="eyebrow"><span class="n">✦</span> vocabulary · four words this page leans on</div>
+    <h2>Four words worth pinning down.</h2>
+    <p class="p">Before the four ideas, four terms — because <span class="hl">hermetic</span>, <span class="hlV">tabular</span>,
+      the <span class="hlG">analytic engine</span> and its <span class="hlB">ceiling</span> are the frame the whole demo
+      hangs on: what this sim <i>is</i>, what it is measured <i>against</i>, and why clearing that bar is hard.</p>
+    <div class="grid4" style="margin-top:16px">
+      <div class="card">
+        <div class="rowtop"><h3 style="margin:0">Hermetic</h3><span class="tag" style="border-color:var(--accent);color:var(--accent)">this sim</span></div>
+        <p class="note"><b>Sealed shut.</b> This demo shares <i>no code</i> with the production 22-player engine — its own
+          PRNG, its own neural net &amp; backprop, its own PPO, <b>zero external crates</b>. Nothing from the big system
+          can leak in.</p>
+        <p class="note"><b>Why it matters:</b> it is a <span class="hl">positive control</span>. If a from-scratch
+          policy learns to play <i>here</i>, then learning genuinely works — the result can't be an artifact of the
+          production engine's Postgres, cluster or plumbing.</p>
+      </div>
+      <div class="card">
+        <div class="rowtop"><h3 style="margin:0">Tabular</h3><span class="tag" style="border-color:var(--violet);color:var(--violet)">exact</span></div>
+        <p class="note"><b>A lookup table.</b> Keep one value for every discrete state (or bucket) and read it back
+          exactly. Perfect memory, <b>zero generalization</b> — it knows nothing about a position it never visited, and
+          a continuous pitch has infinitely many.</p>
+        <p class="note"><b>Why it matters:</b> that is the job of the <span class="hl">neural net</span> — it
+          <i>approximates</i> the table with a smooth function that generalizes to unseen states. On this page the DP
+          optimum is (near-)tabular; the network is what chases it.</p>
+      </div>
+      <div class="card">
+        <div class="rowtop"><h3 style="margin:0">The analytic engine</h3><span class="tag" style="border-color:var(--gold);color:var(--gold)">baseline</span></div>
+        <p class="note"><b>A hand-written, closed-form controller.</b> It decides by geometry and rules — who is open, the
+          angle to goal, the expected value of a pass — computed <i>directly</i>, with no learning at all.</p>
+        <p class="note"><b>Why it matters:</b> it is a strong, sensible opponent and the
+          <span class="hlG">sparring partner</span> the learner is scored against. "Beat analytic" is the bar.</p>
+      </div>
+      <div class="card">
+        <div class="rowtop"><h3 style="margin:0">The analytic ceiling</h3><span class="tag" style="border-color:var(--teamB);color:var(--teamB)">the trap</span></div>
+        <p class="note"><b>The plateau you hit</b> when the design can only <i>imitate or re-rank</i> the analytic engine:
+          it picks among analytic's own options and its value head regresses onto analytic's table, so its best possible
+          outcome is a <b>tie</b> — "parity." The ceiling is baked into the architecture, not a score being lost.</p>
+        <p class="note"><b>Breaking it</b> needs the learner to actually <i>play</i> analytic, judge positions by
+          <i>real outcomes</i>, and take actions analytic never offered. Strip those crutches away — pure net, no
+          tabular-Q blend, no analytic shield — and this hermetic demo climbed <span class="hlB">past</span> analytic:
+          <b>+6.24 goal difference, ~99% win rate</b>.</p>
+      </div>
+    </div>
+  </section>
+
   <!-- ═══════════════ 1. FIELD VECTOR ═══════════════ -->
   <section id="field">
     <div class="eyebrow"><span class="n">01</span> the state · a partially-observed markov decision process</div>
