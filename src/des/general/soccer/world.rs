@@ -28646,10 +28646,15 @@ impl SoccerMatch {
             (Team::Away, self.score_away - self.score_home)
         };
         let margin = f64::from(margin.saturating_sub(1));
-        let win_amount =
-            MATCH_RESULT_WIN_PLAYER_REWARD + margin * MATCH_RESULT_MARGIN_REWARD_PER_GOAL;
-        let loss_amount =
-            -(MATCH_RESULT_LOSS_PLAYER_PENALTY + margin * MATCH_RESULT_MARGIN_PENALTY_PER_GOAL);
+        // Under the anchored currency the WIN anchor itself (±1000) travels on
+        // the match-outcome broadcast label; this terminal per-player event
+        // scales uniformly and stays the small margin-flavored component.
+        let win_amount = (MATCH_RESULT_WIN_PLAYER_REWARD
+            + margin * MATCH_RESULT_MARGIN_REWARD_PER_GOAL)
+            * anchored_currency_scale();
+        let loss_amount = -(MATCH_RESULT_LOSS_PLAYER_PENALTY
+            + margin * MATCH_RESULT_MARGIN_PENALTY_PER_GOAL)
+            * anchored_currency_scale();
         let events = self
             .players
             .iter()
