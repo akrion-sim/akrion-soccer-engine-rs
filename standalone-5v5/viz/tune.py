@@ -174,46 +174,13 @@ def clamp_space_value(index, value):
 
 
 def ground_reward_vector(vec):
-    """Project a candidate onto the same reward ladder enforced by the binary.
+    """Project a candidate onto the legal space.
 
-    The optimizer may tune shot and goal weights, but it may not discover a local
-    optimum where a non-converting shot is worth as much as scoring.
+    The anchors (win/goal/shot floor+cap) are compile-time constants in the
+    binary, so the ladder shot<goal<win holds by construction — grounding here
+    reduces to per-dimension bound clamping (the binary clamps identically).
     """
-    out = list(vec)
-    idx = {name: i for i, (name, *_rest) in enumerate(SPACE)}
-    goal_i = idx["REW_GOAL"]
-    shot_base_i = idx["REW_SHOT_BASE"]
-    shot_q_i = idx["REW_SHOT_Q"]
-
-    for i in (goal_i, shot_base_i, shot_q_i):
-        out[i] = clamp_space_value(i, out[i])
-
-    required_goal = out[shot_base_i] + out[shot_q_i] + CONVERSION_REWARD_MARGIN
-    out[goal_i] = clamp_space_value(goal_i, max(out[goal_i], required_goal))
-    if out[goal_i] + 1e-12 >= required_goal:
-        return out
-
-    budget = max(
-        MIN_WEIGHT,
-        out[goal_i] - CONVERSION_REWARD_MARGIN,
-    )
-    base_min = max(MIN_WEIGHT, SPACE[shot_base_i][2])
-    q_min = max(MIN_WEIGHT, SPACE[shot_q_i][2])
-    variable_budget = max(0.0, budget - base_min - q_min)
-    base_extra = max(0.0, out[shot_base_i] - base_min)
-    q_extra = max(0.0, out[shot_q_i] - q_min)
-    extra_total = base_extra + q_extra
-    if extra_total > 0.0:
-        scale = min(1.0, variable_budget / extra_total)
-        out[shot_base_i] = base_min + base_extra * scale
-        out[shot_q_i] = q_min + q_extra * scale
-    else:
-        out[shot_base_i] = base_min
-        out[shot_q_i] = q_min
-
-    out[shot_base_i] = clamp_space_value(shot_base_i, out[shot_base_i])
-    out[shot_q_i] = clamp_space_value(shot_q_i, out[shot_q_i])
-    return out
+    return [clamp_space_value(i, v) for i, v in enumerate(vec)]
 
 
 def parse(stdout):
