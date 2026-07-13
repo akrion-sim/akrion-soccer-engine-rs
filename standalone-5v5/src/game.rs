@@ -2136,9 +2136,12 @@ impl World {
                         }
                         self.ev_return_pass_a = is_return;
                     }
-                    self.pending_curl = self.kick_curl(team, me, tp);
-                    let pass_dist = tp.sub(me).len();
-                    let pspeed = PASS_SPEED * (0.85 + 0.35 * (pass_dist / FIELD_L).clamp(0.0, 1.0));
+                    self.pending_curl = self.kick_curl(team, me, lead);
+                    // GROUND-SPEED SOLVE: launch pace whose drag-integrated carry
+                    // arrives at the led target in the receiver-timed window.
+                    // (A lofted launch overrides this speed in step() with the
+                    // land-at-target pace computed above.)
+                    let pspeed = ground_pass_launch_speed(pass_dist, openness);
                     Some((owner, lead.sub(me), pspeed, true))
                 } else {
                     // no valid target: dribble forward instead
