@@ -1250,32 +1250,35 @@ impl World {
                 self.ball_z = 0.0;
             }
 
-            // reflect off side-lines (y walls) to keep play flowing
-            if self.ball.y < 0.0 {
-                self.ball.y = -self.ball.y;
-                self.ball_vel.y = -self.ball_vel.y;
-            } else if self.ball.y > FIELD_W {
-                self.ball.y = 2.0 * FIELD_W - self.ball.y;
-                self.ball_vel.y = -self.ball_vel.y;
-            }
-
+            // Out of bounds is a DEAD-BALL RESTART (11v11 parity), not a reflecting wall:
+            // touchline -> throw-in to the team that didn't put it out; goal-line (not a
+            // goal) -> corner if a DEFENDER put it out, else a goal-kick.
             let gy0 = FIELD_W / 2.0 - GOAL_HALF;
             let gy1 = FIELD_W / 2.0 + GOAL_HALF;
-            if self.ball.x >= FIELD_L {
+            let last = self.last_touch;
+            if self.ball.y < 0.0 || self.ball.y > FIELD_W {
+                // touchline: award to the other team at the crossing point.
+                let edge_y = if self.ball.y < 0.0 { 0.0 } else { FIELD_W };
+                let to = last.map(Team::other).unwrap_or(Team::A);
+                let at = V2::new(self.ball.x.clamp(1.0, FIELD_L - 1.0), edge_y);
+                self.throw_in(to, at);
+            } else if self.ball.x >= FIELD_L {
                 if self.ball.y > gy0 && self.ball.y < gy1 && self.a_shot_flag {
-                    // valid goal: came from an A shot, which required 2 passes
                     self.goals_a += 1;
                     self.ev_goal_a = true;
                     self.kickoff(Team::B);
+                } else if last == Some(Team::B) {
+                    self.corner_kick(Team::A, FIELD_L, self.ball.y); // defender B conceded a corner
                 } else {
-                    self.goal_kick(Team::B); // B restarts from its own line
+                    self.goal_kick(Team::B); // A put it out -> B goal-kick
                 }
             } else if self.ball.x <= 0.0 {
                 if self.ball.y > gy0 && self.ball.y < gy1 && self.b_shot_flag {
-                    // symmetric: B goal only counts from a valid (2-pass, final-third) shot
                     self.goals_b += 1;
                     self.ev_goal_b = true;
                     self.kickoff(Team::A);
+                } else if last == Some(Team::A) {
+                    self.corner_kick(Team::B, 0.0, self.ball.y); // defender A conceded a corner
                 } else {
                     self.goal_kick(Team::A);
                 }
@@ -1292,8 +1295,30 @@ impl World {
 
     fn goal_kick(&mut self, to: Team) {
         let gx = if to == Team::A { 6.0 } else { FIELD_L - 6.0 };
-        self.ball = V2::new(gx, FIELD_W / 2.0);
+        self.restart_possession(to, V2::new(gx, FIELD_W / 2.0));
+    }
+
+    /// Touchline throw-in: `to` restarts with the ball at the crossing point `at`.
+    fn throw_in(&mut self, to: Team, at: V2) {
+        self.restart_possession(to, at);
+    }
+
+    /// Corner kick: the attacking team `to` restarts from the corner of the goal line at
+    /// `goal_x`, on whichever side (y=0 / y=FIELD_W) the ball went dead near `out_y`.
+    fn corner_kick(&mut self, to: Team, goal_x: f32, out_y: f32) {
+        let corner_y = if out_y < FIELD_W / 2.0 { 0.5 } else { FIELD_W - 0.5 };
+        self.restart_possession(to, V2::new(goal_x, corner_y));
+    }
+
+    /// Shared dead-ball restart: park the ball at `at`, hand possession to `to`'s nearest
+    /// player, reset the ball's flight/streak state. (Goal-kick / throw-in / corner all funnel here.)
+    fn restart_possession(&mut self, to: Team, at: V2) {
+        self.ball = at;
         self.ball_vel = V2::default();
+        self.ball_curl = V2::default();
+        self.ball_aerial = false;
+        self.ball_z = 0.0;
+        self.ball_taloft = 0.0;
         let idx = self.nearest_player(to, self.ball).0;
         self.owner = Some(Owner { team: to, idx });
         self.last_touch = Some(to);
@@ -2416,6 +2441,24 @@ mod tests {
         assert!(altitude_at(apex, hang * 0.25) < altitude_at(apex, hang * 0.5));
         // longer passes loft higher (until the 9.0 cap).
         assert!(lofted_apex_yds(30.0) > lofted_apex_yds(12.0));
+    }
+
+    #[test]
+    fn dead_ball_restarts_assign_the_right_team() {
+        // Throw-in goes to the team that did NOT put it out; the ball is parked (no velocity).
+        let mut w = World::new();
+        w.ball_vel = V2::new(3.0, 9.0);
+        w.throw_in(Team::B, V2::new(20.0, FIELD_W));
+        assert!(matches!(w.owner, Some(o) if o.team == Team::B));
+        assert!(w.ball_vel.len() < 1e-6 && w.ball_z == 0.0 && !w.ball_aerial);
+        // Corner: attacker restarts from the goal-line corner on the ball's side.
+        w.corner_kick(Team::A, FIELD_L, 2.0);
+        assert!(matches!(w.owner, Some(o) if o.team == Team::A));
+        assert!((w.ball.x - FIELD_L).abs() < 1e-6 && w.ball.y < FIELD_W / 2.0);
+        // Goal-kick funnels through the same restart and clears shot flags.
+        w.a_shot_flag = true;
+        w.goal_kick(Team::B);
+        assert!(matches!(w.owner, Some(o) if o.team == Team::B) && !w.a_shot_flag);
     }
 
     #[test]
