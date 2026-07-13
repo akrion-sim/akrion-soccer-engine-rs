@@ -8706,6 +8706,7 @@ impl PlayerAgent {
             return Some((
                 SoccerAction::Shoot {
                     power: shot_power_for_skill(ability01(self.skills.shooting)),
+                    target_point: None,
                 },
                 restart_label.to_string(),
             ));
@@ -8982,7 +8983,13 @@ impl PlayerAgent {
         observation: &SoccerPomdpObservation,
     ) -> (SoccerAction, String) {
         if shot_decision_is_qualified_for_role(observation, self.role) {
-            return (SoccerAction::Shoot { power: 1.0 }, "shoot".to_string());
+            return (
+                SoccerAction::Shoot {
+                    power: 1.0,
+                    target_point: None,
+                },
+                "shoot".to_string(),
+            );
         }
 
         self.human_carry_or_protect_action(snapshot, observation)
@@ -10099,6 +10106,7 @@ impl PlayerAgent {
                 };
                 let action = SoccerAction::Shoot {
                     power: shot_power_for_finish_skill(finish_skill),
+                    target_point: None,
                 };
                 let action_label = if is_aerial {
                     "first-time-header"
@@ -10183,6 +10191,7 @@ impl PlayerAgent {
                         let candidate_label = normalize_soccer_action_label(&op).to_string();
                         let candidate_action = SoccerAction::Shoot {
                             power: shot_power_for_finish_skill(finish_skill),
+                            target_point: None,
                         };
                         if mpc_reselects_candidate(
                             snapshot,
@@ -10370,6 +10379,7 @@ impl PlayerAgent {
         {
             let action = SoccerAction::Shoot {
                 power: shot_power_for_skill(shooting_skill),
+                target_point: None,
             };
             let action_label = action.label();
             self.last_decision = Some(self.decision_trace(
@@ -10403,6 +10413,7 @@ impl PlayerAgent {
             ) {
                 let action = SoccerAction::Shoot {
                     power: shot_power_for_skill(shooting_skill),
+                    target_point: None,
                 };
                 let action_label = action.label();
                 self.last_decision = Some(self.decision_trace(
@@ -10462,6 +10473,7 @@ impl PlayerAgent {
             ) {
                 let action = SoccerAction::Shoot {
                     power: shot_power_for_skill(shooting_skill),
+                    target_point: None,
                 };
                 let action_label = action.label();
                 self.last_decision = Some(self.decision_trace(
@@ -11625,6 +11637,7 @@ impl PlayerAgent {
                             chosen = Some((
                                 SoccerAction::Shoot {
                                     power: shot_power_for_skill(shooting_skill),
+                                    target_point: None,
                                 },
                                 "shoot".to_string(),
                             ));
@@ -12505,6 +12518,7 @@ impl PlayerAgent {
                     (
                         SoccerAction::Shoot {
                             power: shot_power_for_skill(shooting_skill),
+                            target_point: None,
                         },
                         "shoot".to_string(),
                     )
@@ -12648,6 +12662,7 @@ impl PlayerAgent {
                                 Some((
                                     SoccerAction::Shoot {
                                         power: shot_power_for_skill(shooting_skill),
+                                        target_point: None,
                                     },
                                     "shoot".to_string(),
                                 ))
@@ -13918,7 +13933,20 @@ impl PlayerAgent {
                 let learned_label = learned_mpc_action_label_key(&plan.action);
                 let power = learned_discretized_kick_power_for_action_label(&plan.action)
                     .unwrap_or_else(|| shot_power_for_skill(ability01(self.skills.shooting)));
-                Some((SoccerAction::Shoot { power }, learned_label))
+                Some((
+                    SoccerAction::Shoot {
+                        power,
+                        // ACTOR-OWNED SHOT PLACEMENT (default-OFF): carry the plan's chosen
+                        // goal-mouth aim into the action so execution honors it instead of
+                        // discarding it and re-defaulting to goal-centre. Off ⇒ None ⇒ identical.
+                        target_point: if dd_soccer_enable_actor_shot_placement() {
+                            plan.target_point
+                        } else {
+                            None
+                        },
+                    },
+                    learned_label,
+                ))
             }
             "wall-pass" if observation.has_ball => {
                 snapshot.wall_pass_option_for(self.id).map(|plan| {
@@ -14356,7 +14384,20 @@ impl PlayerAgent {
                 } else {
                     label.to_string()
                 };
-                Some((SoccerAction::Shoot { power }, learned_label))
+                Some((
+                    SoccerAction::Shoot {
+                        power,
+                        // ACTOR-OWNED SHOT PLACEMENT (default-OFF): carry the plan's chosen
+                        // goal-mouth aim into the action so execution honors it instead of
+                        // discarding it and re-defaulting to goal-centre. Off ⇒ None ⇒ identical.
+                        target_point: if dd_soccer_enable_actor_shot_placement() {
+                            plan.target_point
+                        } else {
+                            None
+                        },
+                    },
+                    learned_label,
+                ))
             }
             "first-time-pass" if observation.has_ball && observation.first_touch_available => {
                 let visible = snapshot.ranked_visible_pass_targets(self.id, 11);
@@ -15355,6 +15396,7 @@ impl PlayerAgent {
                 Some((
                     SoccerAction::Shoot {
                         power: shot_power_for_skill(ability01(self.skills.shooting)),
+                        target_point: None,
                     },
                     "shoot".to_string(),
                 ))
@@ -15794,6 +15836,7 @@ impl PlayerAgent {
             return Some((
                 SoccerAction::Shoot {
                     power: shot_power_for_skill(ability01(self.skills.shooting)),
+                    target_point: None,
                 },
                 "shoot".to_string(),
             ));
@@ -15905,6 +15948,10 @@ pub enum SoccerAction {
     },
     Shoot {
         power: f64,
+        /// Actor-chosen goal-mouth aim point. `None` (default) ⇒ analytic aim runs unchanged
+        /// (byte-identical). Populated only when `dd_soccer_enable_actor_shot_placement()` is on.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_point: Option<Vec2>,
     },
     Tackle {
         target_player: usize,

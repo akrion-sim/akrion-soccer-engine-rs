@@ -9763,7 +9763,7 @@ mod tests {
                 .action_from_learned_plan(&plan, &snapshot, &observation)
                 .expect("learned shot bucket should execute");
             assert_eq!(executed_label, label);
-            let SoccerAction::Shoot { power } = action else {
+            let SoccerAction::Shoot { power, .. } = action else {
                 panic!("learned shot bucket should execute as a shot");
             };
             let expected_power =
@@ -18050,6 +18050,28 @@ impl SoccerMatch {
                         })
                     }),
             );
+        }
+        // ACTOR-OWNED SHOT PLACEMENT (default-OFF, byte-identical when off): fan the shot into one
+        // sibling plan per goal-mouth spot so the learned critic SCORES each aim independently and the
+        // actor selects the placement it values most (honored at execution). Off ⇒ no extra plans ⇒
+        // identical candidate set. Siblings share the "shoot" label (the scorer ranks per-plan, not
+        // per-label) and differ only by `target_point`.
+        if dd_soccer_enable_actor_shot_placement() {
+            let goalmouth = shot_goalmouth_target_points(
+                snapshot.field_width,
+                snapshot.field_length,
+                snapshot.goal_width,
+                team,
+            );
+            plans.reserve(goalmouth.len());
+            for aim in goalmouth {
+                plans.push(SoccerLearnedPlan {
+                    action: label.to_string(),
+                    target_player: None,
+                    target_point: Some(aim),
+                    mpc_replan: None,
+                });
+            }
         }
         plans
     }
@@ -32397,7 +32419,10 @@ impl SoccerMatch {
                     self.players[player_id].action_facing = action_facing;
                 }
             }
-            SoccerAction::Shoot { power } => {
+            SoccerAction::Shoot {
+                power,
+                target_point: actor_shot_target,
+            } => {
                 let mut release_facing = action_facing;
                 if self.ball.holder == Some(player_id) {
                     // (Productive carry-into-shot is rewarded by `record_progressive_carry_outcome_reward`
@@ -32457,6 +32482,18 @@ impl SoccerMatch {
                     } else {
                         goal_center_x
                     };
+                    // ACTOR-OWNED SHOT PLACEMENT (default-OFF, byte-identical when off): if the
+                    // learned policy chose an explicit goal-mouth aim point, honor its lateral (x)
+                    // component — overriding the analytic `base_goal_x` — clamped inside the posts.
+                    // The downstream `noisy_shot_target_x` + goal-mouth clamp still apply, and the
+                    // optional MPC residual below composes on top. Off ⇒ `target_point` is `None` ⇒
+                    // this is a no-op ⇒ identical to baseline.
+                    if dd_soccer_enable_actor_shot_placement() {
+                        if let Some(actor_aim) = actor_shot_target {
+                            base_goal_x =
+                                actor_aim.x.clamp(goal_center_x - half_goal, goal_center_x + half_goal);
+                        }
+                    }
                     // Learned MPC execution-objective residual for SHOT PLACEMENT — the shot analogue
                     // of the pass-lead nudge in the pass launch path (see the `led_target` residual
                     // above). Gated on the SEPARATE, default-OFF
@@ -45022,6 +45059,7 @@ impl WorldSnapshot {
             },
             SoccerSetPlayReleaseKind::Shoot => SoccerAction::Shoot {
                 power: release_power,
+                target_point: None,
             },
         };
         Some((action, restart_label.to_string()))

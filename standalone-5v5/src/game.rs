@@ -14,16 +14,14 @@ pub const FINAL_THIRD_X: f32 = FIELD_L * 2.0 / 3.0; // attacking-third boundary 
 pub const SHOOT_X: f32 = FIELD_L / 2.0; // A may shoot once in the OPPONENT'S HALF (not just the final third)
 pub const N: usize = 5; // players per team (index 0 == goalkeeper)
 pub const GK: usize = 0; // goalkeeper index; controlled by a fixed rule, not the policy
-// Tick rate matches the 11v11 engine exactly (DEFAULT_DT_SECONDS = 1/15) so every
-// dt-derived physics constant ported from it transfers 1:1 with no re-derivation.
-pub const DT: f32 = 1.0 / 15.0; // seconds per decision tick -> 15 Hz sim (11v11 parity)
+pub const DT: f32 = 0.05; // seconds per decision tick -> 20 Hz sim (real-time 20 fps)
 pub const HZ: f32 = 1.0 / DT; // ticks per second (for real-time viewer playback)
-pub const STEPS: usize = 450; // ticks per TRAINING episode (~30s at 15 Hz)
+pub const STEPS: usize = 600; // ticks per TRAINING episode (~30s at 20 Hz)
 
 // The RECORDED viz match (match_before/after.json) runs longer than a training
 // episode so the before/after playback shows more football (incl. kickoffs after
 // goals). Training dynamics are unaffected — rollouts still use STEPS.
-pub const RECORD_STEPS: usize = 1350; // ~90s at 15 Hz
+pub const RECORD_STEPS: usize = 1800; // ~90s at 20 Hz
 
 const PLAYER_SPEED: f32 = 6.5; // legacy reference speed (~= run_medium); kept for keeper reach/util
 
@@ -102,7 +100,7 @@ const AERIAL_CONTROL_SPACE: f32 = 3.6; // a SCOOPED (aerial) pass needs the rece
 const CURL_MIN_DIST: f32 = 20.0; // passes/shots longer than this can be given curl (spin)
 const CURL_ACCEL: f32 = 6.0; // lateral curl acceleration on a long ball (bends around a defender)
 const TACKLE_RADIUS: f32 = 1.6;
-const TACKLE_PROB: f32 = 0.16; // per-tick; retuned for 15 Hz to keep same per-second rate (~2.4/s)
+const TACKLE_PROB: f32 = 0.12; // per-tick; retuned for 20 Hz to keep same per-second rate
 const BALL_FRICTION: f32 = 0.965; // per-tick decay retuned for 20 Hz (same per-second decay)
 const PASS_SPEED: f32 = 18.0;
 const SHOT_SPEED: f32 = 24.0;
@@ -175,92 +173,6 @@ impl V2 {
     }
 }
 
-// ---- 11v11-parity physics helpers ------------------------------------------
-// All constants mirror src/des/general/soccer.rs so the small-sided sim uses the
-// SAME physical models as the full engine (only the pitch stays 5-a-side sized).
-pub const METERS_PER_YARD: f32 = 0.9144;
-pub const KG_PER_POUND: f32 = 0.453_592_37;
-pub const GRAVITY_YPS2: f32 = 9.81 / METERS_PER_YARD; // 10.7284 yd/s^2
-pub const PLAYER_MAX_SPEED_YPS: f32 = 12.45; // SOCCER_PHYSICS_PLAYER_MAX_SPEED_YPS
-pub const PLAYER_MAX_ACCEL_YPS2: f32 = 28.0; // SOCCER_PHYSICS_PLAYER_MAX_ACCEL_YPS2
-
-/// mph -> yards/second (YARDS_PER_MILE=1760, SECONDS_PER_HOUR=3600).
-pub fn mph_to_yps(mph: f32) -> f32 {
-    mph * 1760.0 / 3600.0
-}
-/// Map a 1..10 skill score to [0,1] (soccer.rs ability01). A value already in
-/// [0,1) is treated as 1+9x. Clamped to the 1..10 band first.
-pub fn ability01(score: f32) -> f32 {
-    let s = if score < 1.0 { 1.0 + 9.0 * score.clamp(0.0, 1.0) } else { score };
-    ((s.clamp(1.0, 10.0)) - 1.0) / 9.0
-}
-
-/// Per-player physical attributes. Homogeneous by default (every field = 5.5 ->
-/// ability01 = 0.5) so learning balance is unchanged until we choose to vary them.
-#[derive(Clone, Copy, Debug)]
-pub struct Skills {
-    pub top_speed: f32,
-    pub acceleration: f32,
-    pub stamina: f32,
-    pub first_touch: f32,
-    pub aerial_duel: f32,
-    pub strength: f32,
-    pub weight_lbs: f32,
-}
-impl Default for Skills {
-    fn default() -> Self {
-        // Mid outfield pro: all skills 5.5 (ability01 0.5), ~165 lb (~74.8 kg).
-        Skills {
-            top_speed: 5.5,
-            acceleration: 5.5,
-            stamina: 5.5,
-            first_touch: 5.5,
-            aerial_duel: 5.5,
-            strength: 5.5,
-            weight_lbs: 165.0,
-        }
-    }
-}
-impl Skills {
-    pub fn mass_kg(&self) -> f32 {
-        self.weight_lbs * KG_PER_POUND
-    }
-    /// Aerobic capacity proxy shared by the energy model (soccer.rs `cardio`).
-    pub fn cardio(&self) -> f32 {
-        ability01(self.stamina)
-    }
-    /// 1.0-gait REFERENCE top speed (yd/s). Actual flat-out ground speed = this ×
-    /// the Sprint gait multiplier (1.12). Mirrors player_top_speed_yps.
-    pub fn top_speed_ref_yps(&self) -> f32 {
-        let per = (mph_to_yps(22.0) + ability01(self.top_speed) * (mph_to_yps(25.0) - mph_to_yps(22.0)))
-            / 1.12;
-        let cap = mph_to_yps(25.0) / 1.12; // 10.913
-        per.min(cap)
-    }
-    /// Max acceleration (yd/s^2) from the acceleration skill (soccer.rs 5.2..9.3).
-    pub fn accel_yps2(&self) -> f32 {
-        5.2 + ability01(self.acceleration) * 4.1
-    }
-    /// Critical Power (W) — the aerobic sustainable ceiling (13..19 W/kg).
-    pub fn critical_power_w(&self) -> f32 {
-        (13.0 + self.cardio() * 6.0) * self.mass_kg()
-    }
-    /// Anaerobic work capacity W'max (J) — the sprint battery (280..600 J/kg).
-    pub fn anaerobic_capacity_j(&self) -> f32 {
-        ((280.0 + self.cardio() * 320.0) * self.mass_kg()).max(1.0)
-    }
-}
-
-/// di Prampero metabolic power demand (W) for locomotion at `speed_yps` with a
-/// forward acceleration `accel_fwd_yps2`. Mirrors metabolic_power_demand_w.
-pub fn metabolic_power_demand_w(mass_kg: f32, speed_yps: f32, accel_fwd_yps2: f32) -> f32 {
-    let v_mps = speed_yps.clamp(0.0, PLAYER_MAX_SPEED_YPS) * METERS_PER_YARD;
-    let a_mps2 = (accel_fwd_yps2.abs() * METERS_PER_YARD).min(3.5); // ACCEL_MAGNITUDE_CAP_MPS2
-    let run_power = mass_kg * 3.6 * v_mps; // RUN_ENERGY_COST_J_PER_KG_M = 3.6
-    let accel_power = mass_kg * a_mps2 * v_mps * 0.3; // ACCEL_POWER_COEFF = 0.3
-    run_power + accel_power
-}
-
 fn teammate_spacing_score(distance: f32) -> f32 {
     if !distance.is_finite() {
         return 0.0;
@@ -278,23 +190,6 @@ pub struct Player {
     pub pos: V2,
     pub vel: V2,     // actual velocity — ramps toward des_vel at a bounded rate
     pub des_vel: V2, // desired velocity (the chosen gear/direction this tick)
-    pub skills: Skills, // per-player physical attributes (default = homogeneous mid pro)
-    // Two-channel energy (11v11 parity; populated in Phase 4). fatigue = slow aerobic
-    // reservoir [0,1] (0 fresh); anaerobic_load = W'-battery depletion [0,1] (0 full).
-    pub fatigue: f32,
-    pub anaerobic_load: f32,
-}
-impl Default for Player {
-    fn default() -> Self {
-        Player {
-            pos: V2::default(),
-            vel: V2::default(),
-            des_vel: V2::default(),
-            skills: Skills::default(),
-            fatigue: 0.0,
-            anaerobic_load: 0.0,
-        }
-    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -397,8 +292,16 @@ fn players(team: Team, w: &World) -> &[Player; N] {
 impl World {
     pub fn new() -> Self {
         let mut w = World {
-            a: [Player::default(); N],
-            b: [Player::default(); N],
+            a: [Player {
+                pos: V2::default(),
+                vel: V2::default(),
+                des_vel: V2::default(),
+            }; N],
+            b: [Player {
+                pos: V2::default(),
+                vel: V2::default(),
+                des_vel: V2::default(),
+            }; N],
             ball: V2::new(FIELD_L / 2.0, FIELD_W / 2.0),
             ball_vel: V2::default(),
             ball_aerial: false,

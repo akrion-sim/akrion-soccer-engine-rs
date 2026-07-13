@@ -2587,6 +2587,7 @@ fn mpc_reselects_normal_shot_when_execution_is_poor() {
     let player = sim.players[shooter].clone();
     let action = SoccerAction::Shoot {
         power: shot_power_for_skill(ability01(player.skills.shooting)),
+        target_point: None,
     };
     let target = player.action_target_trace(&action, &snapshot);
     let trace = player_mdp_mpc_comparison_trace(&snapshot, &player, &target, "shoot")
@@ -38045,7 +38046,10 @@ fn pass_and_shot_preserve_release_facing_after_recovery_movement() {
 
     shot_sim.apply_player_intent(PlayerIntent {
         player_id: shooter,
-        action: SoccerAction::Shoot { power: 1.0 },
+        action: SoccerAction::Shoot {
+            power: 1.0,
+            target_point: None,
+        },
         sprint: false,
     });
 
@@ -38788,7 +38792,10 @@ fn struck_shot_releases_the_ball_in_the_fifty_to_seventytwo_band() {
     let power = shot_power_for_skill(ability01(sim.players[shooter].skills.shooting));
     sim.apply_player_intent(PlayerIntent {
         player_id: shooter,
-        action: SoccerAction::Shoot { power },
+        action: SoccerAction::Shoot {
+            power,
+            target_point: None,
+        },
         sprint: false,
     });
 
@@ -38830,7 +38837,10 @@ fn shoot_action_launches_at_least_forty_mph_even_off_balance() {
 
     sim.apply_player_intent(PlayerIntent {
         player_id: shooter,
-        action: SoccerAction::Shoot { power: 0.0 },
+        action: SoccerAction::Shoot {
+            power: 0.0,
+            target_point: None,
+        },
         sprint: false,
     });
 
