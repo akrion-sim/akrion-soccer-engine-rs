@@ -473,6 +473,66 @@ fn players(team: Team, w: &World) -> &[Player; N] {
     }
 }
 
+/// Perpendicular distance from `p` to the segment a→b, plus the clamped
+/// projection factor t ∈ [0,1] of `p` along it. Port of the 11v11
+/// `segment_distance_to_point` / `segment_projection_factor`: the keeper's
+/// reach is measured against the SHOT LANE, not against the crossing point.
+fn seg_distance_and_t(a: V2, b: V2, p: V2) -> (f32, f32) {
+    let ab = b.sub(a);
+    let denom = ab.x * ab.x + ab.y * ab.y;
+    if !denom.is_finite() || denom <= 1e-12 {
+        return (p.sub(a).len(), 0.0);
+    }
+    let ap = p.sub(a);
+    let t = ((ap.x * ab.x + ap.y * ab.y) / denom).clamp(0.0, 1.0);
+    let proj = a.add(ab.scale(t));
+    (p.sub(proj).len().max(0.0), t)
+}
+
+/// 11v11 `goalkeeper_distance_save_baseline`: save probability for a SET,
+/// well-positioned keeper by shot distance — the PRIMARY save driver. Knots
+/// kept verbatim (yards are yards); 5v5 shots come from < 24 yd so only the
+/// first knots matter. Closer = lower (less reaction time beats the keeper).
+fn gk_distance_save_baseline(shot_distance_yards: f32) -> f32 {
+    const POINTS: [(f32, f32); 8] = [
+        (5.0, 0.05),
+        (10.0, 0.18),
+        (15.0, 0.34),
+        (20.0, 0.53),
+        (25.0, 0.67),
+        (30.0, 0.77),
+        (40.0, 0.89),
+        (55.0, 0.97),
+    ];
+    let d = shot_distance_yards.max(0.0);
+    let (x0, y0) = POINTS[0];
+    if d <= x0 {
+        return (y0 * d / x0).clamp(0.0, y0);
+    }
+    let (xl, yl) = POINTS[POINTS.len() - 1];
+    if d >= xl {
+        return yl;
+    }
+    for pair in POINTS.windows(2) {
+        let (ax, ay) = pair[0];
+        let (bx, by) = pair[1];
+        if d <= bx {
+            return ay + (by - ay) * (d - ax) / (bx - ax);
+        }
+    }
+    yl
+}
+
+/// 11v11 `goalkeeper_catch_probability_after_save`, simplified for uniform 5v5
+/// skills: handling fit minus a hot-arrival penalty and a close-range penalty.
+/// Point-blank rockets are usually PARRIED; soft/long efforts are HELD.
+fn keeper_catch_probability(origin: V2, crossing: V2, shot_speed: f32) -> f32 {
+    let shot_distance = crossing.sub(origin).len();
+    let speed_excess = (shot_speed - mph_to_yps(30.0)).max(0.0);
+    let closeness = ((14.0 - shot_distance) / 14.0).clamp(0.0, 1.0);
+    (0.85 - speed_excess * 0.06 - closeness * 0.35).clamp(0.08, 0.96)
+}
+
 impl World {
     pub fn new() -> Self {
         let mut w = World {
