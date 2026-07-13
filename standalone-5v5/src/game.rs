@@ -1330,10 +1330,11 @@ impl World {
         // anticipation edge, so passes actually CONNECT instead of going loose —
         // unless an opponent is genuinely closer and intercepts.
         if best.is_none() && !ball_fast {
-            // A SCOOPED ball in the air is over ground players: only the intended
-            // receiver can bring it down, and only if they are open enough to
-            // control it (aerial touch needs space). Otherwise it flies on / lands.
-            let aerial = self.ball_aerial && self.air_ticks > 0;
+            // An airborne ball flies OVER ground players: a non-receiver can only touch it if
+            // its altitude is within their standing/jump reach (soccer.rs height gate). The
+            // intended receiver brings it down at the landing, and only if open enough to
+            // control a still-high ball (aerial touch needs space); otherwise it lands loose.
+            let airborne = self.ball_z > BALL_ROLLING_ALT;
             let mut best_eff = f32::INFINITY;
             for team in [Team::A, Team::B] {
                 for i in 0..N {
@@ -1351,14 +1352,18 @@ impl World {
                         matches!(self.pending_pass, Some(r) if r.team == team && r.idx == i);
                     let receiver = players(team, self)[i];
                     let touch = ability01(receiver.skills.first_touch);
-                    if aerial {
-                        if !is_recv {
-                            continue; // ground players can't reach an airborne ball
+                    let aerial_skill = ability01(receiver.skills.aerial_duel);
+                    if airborne {
+                        // Reach test: standing 1.6yd + jump (aerial skill) up to 3.8yd, floor 2.0yd.
+                        let reach = (CONTROL_STANDING_REACH + aerial_skill * CONTROL_AERIAL_JUMP_REACH)
+                            .max(LOW_BALL_INTERCEPT_FLOOR);
+                        if self.ball_z > reach {
+                            continue; // ball is above this player's reach — flies over
                         }
-                        let (_, recv_open) = self.nearest_opponent(team, receiver.pos);
-                        let aerial_skill = ability01(receiver.skills.aerial_duel);
-                        let space_needed = AERIAL_CONTROL_SPACE * (1.08 - 0.20 * aerial_skill);
-                        if recv_open < space_needed {
+                        if is_recv {
+                            let (_, recv_open) = self.nearest_opponent(team, receiver.pos);
+                            let space_needed = AERIAL_CONTROL_SPACE * (1.08 - 0.20 * aerial_skill);
+                            if recv_open < space_needed {
                             continue; // receiver not open enough to control the scoop yet
                         }
                     }
