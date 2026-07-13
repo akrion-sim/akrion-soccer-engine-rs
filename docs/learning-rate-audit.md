@@ -402,3 +402,11 @@ but added four turnovers. On 64 fresh games the same frozen pair reversed to `8W
 `0.469`, Wilson lower bound `0.352`, goal difference `-4`, forward margin `-8`, and net-forward margin
 `-7`. Cap `256` is rejected and the production batch remains unlimited; the explicit cap remains a
 default-off stability instrument rather than overloading the unrelated per-tick setting.
+
+Reducing `SOCCER_MAPPO_EPOCHS` from `4` to `2` was the cleaner repeated-batch test because it kept
+the complete trajectory. On the matched `E16060` fixtures, two epochs finished at 1,625 critic steps
+and 9,034 actor updates versus 1,641/9,828 for four epochs, while the forward scalar stayed at
+`1.9999` instead of `2.8611`. Its 32-game frozen result was `1W-28D-3L`, payoff `0.469`, Wilson lower
+bound `0.309`, goal difference `-2`, forward margin `+1`, and net-forward margin `-1`, with worse pass
+completion and turnovers. Two epochs is rejected; the league startup contract now prints the
+effective epoch count and the production default remains `4`.
