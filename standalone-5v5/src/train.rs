@@ -1475,47 +1475,65 @@ mod tests {
     }
 
     #[test]
-    fn football_outcomes_always_dominate_a_nonconverting_shot() {
-        let (goal, shot_base, shot_q) = grounded_conversion_ladder(6.0, 18.0, 4.0);
-        let weights = enforce_reward_hierarchy(Rw {
-            goal,
-            concede: 4.0,
-            match_win: 8.0,
-            match_loss: 6.0,
-            shot_base,
-            shot_q,
-            milestone: MIN_REWARD_WEIGHT,
-            pass_credit: MIN_REWARD_WEIGHT,
-            turnover: MIN_REWARD_WEIGHT,
-            bad_pass_turnover: MIN_REWARD_WEIGHT,
-            dribble_turnover: MIN_REWARD_WEIGHT,
-            recycle: MIN_REWARD_WEIGHT,
-            return_pass: MIN_REWARD_WEIGHT,
-            return_stale: MIN_REWARD_WEIGHT,
-            win_ball: MIN_REWARD_WEIGHT,
-            dribble: MIN_REWARD_WEIGHT,
-            shape: 0.5,
-            advance: MIN_REWARD_WEIGHT,
-            open: MIN_REWARD_WEIGHT,
-            width: MIN_REWARD_WEIGHT,
-            flank: MIN_REWARD_WEIGHT,
-            goalside: MIN_REWARD_WEIGHT,
-            goalside_run: MIN_REWARD_WEIGHT,
-            ahead: MIN_REWARD_WEIGHT,
-            make_run: MIN_REWARD_WEIGHT,
-            burst_gear: MIN_REWARD_WEIGHT,
-            field_pass: MIN_REWARD_WEIGHT,
-            field_turnover: MIN_REWARD_WEIGHT,
-            chance: MIN_REWARD_WEIGHT,
-            field_goalside_delta: MIN_REWARD_WEIGHT,
-            field_burst_delta: MIN_REWARD_WEIGHT,
-            stand_pen: MIN_REWARD_WEIGHT,
-            pursuit: MIN_REWARD_WEIGHT,
-        });
-        let miss_ceiling = max_nonconverting_shot_reward(&weights);
-        assert!(weights.goal >= miss_ceiling + CONVERSION_OVER_SHOT_MARGIN);
-        assert!(miss_ceiling <= weights.goal * REWARD_NON_CONVERSION_MAX_FRACTION + 1e-5);
-        assert!(weights.match_win >= weights.goal + WIN_OVER_CONVERSION_MARGIN);
+    fn anchored_shot_points_respect_floor_and_position_cap() {
+        // The floor pays everywhere — worst placement, worst position.
+        assert!((anchored_shot_points(0.0, 0.0, 1.0) - ON_FRAME_SHOT_FLOOR).abs() < 1e-4);
+        // Hopeless position (xg = 0): the cap IS the floor, no placement or
+        // span setting can push an on-frame long-ranger above 50.
+        assert!((anchored_shot_points(1.0, 0.0, 1.5) - ON_FRAME_SHOT_FLOOR).abs() < 1e-4);
+        // Best case reaches exactly the non-conversion ceiling (0.40 · goal)
+        // and never above it.
+        let best = anchored_shot_points(1.0, 1.0, 1.5);
+        assert!(best <= REW_GOAL_POINTS * REWARD_NON_CONVERSION_MAX_FRACTION + 1e-4);
+        assert!(best >= REW_GOAL_POINTS * REWARD_NON_CONVERSION_MAX_FRACTION - 1e-4);
+        // The currency ordering is compile-time: shot < goal < win.
+        assert!(best < REW_GOAL_POINTS && REW_GOAL_POINTS < REW_WIN_POINTS);
+        // Monotone in position quality: better spots raise the ceiling.
+        assert!(anchored_shot_points(0.8, 0.9, 1.0) > anchored_shot_points(0.8, 0.2, 1.0));
+        // Placement can only move points WITHIN the band, never below floor.
+        assert!(anchored_shot_points(0.3, 0.5, 1.0) >= ON_FRAME_SHOT_FLOOR);
+    }
+
+    #[test]
+    fn field_context_orders_dribble_vs_shot_by_position() {
+        // Own half: carry context is full value…
+        assert!((dribble_field_context(FIELD_L * 0.25) - 1.0).abs() < 1e-5);
+        // …and tapers monotonically through the final third.
+        assert!(dribble_field_context(FIELD_L * 0.7) > dribble_field_context(FIELD_L * 0.95));
+        assert!(dribble_field_context(FIELD_L) >= 0.39);
+        // Even the maximum per-tick carry reward stays far under the on-frame
+        // shot floor: in the final third shooting outranks dribbling…
+        assert!(5.0 * dribble_field_context(FIELD_L * 0.9) < ON_FRAME_SHOT_FLOOR);
+        // …while in our own half a shot cannot even register on-frame (the
+        // d<24 gate in game.rs), so the carry dominates there by construction.
+    }
+
+    #[test]
+    fn anchored_terminal_rewards_keep_the_currency_ordering() {
+        // win(1000) = 2 × goal(500); goal = 10 × shot floor(50). If someone
+        // edits an anchor, this is the tripwire that forces a conscious choice.
+        assert!((REW_WIN_POINTS - 2.0 * REW_GOAL_POINTS).abs() < 1e-6);
+        assert!((REW_GOAL_POINTS - 10.0 * ON_FRAME_SHOT_FLOOR).abs() < 1e-6);
+        assert!(
+            ON_FRAME_SHOT_FLOOR + ON_FRAME_SHOT_CAP_SPAN
+                <= REW_GOAL_POINTS * REWARD_NON_CONVERSION_MAX_FRACTION + 1e-6
+        );
+        // Every discoverable event weight's hi-bound stays under the
+        // non-conversion ceiling — no tuned weight can rival a goal.
+        let w = rw();
+        for hi in [
+            w.milestone,
+            w.pass_credit,
+            w.turnover,
+            w.bad_pass_turnover,
+            w.dribble_turnover,
+            w.recycle,
+            w.return_pass,
+            w.return_stale,
+            w.win_ball,
+        ] {
+            assert!(hi < REW_GOAL_POINTS * REWARD_NON_CONVERSION_MAX_FRACTION);
+        }
     }
 
     #[test]
