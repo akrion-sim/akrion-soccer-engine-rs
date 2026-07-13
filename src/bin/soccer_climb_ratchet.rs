@@ -1227,8 +1227,8 @@ fn eval_vs_analytic_game(
     } else {
         (Team::Away, Team::Home)
     };
-    // Disable the analytic side explicitly, then install the candidate's complete frozen brain.
-    // Per-team actor sidecars keep either orientation isolated and equivalent.
+    // Disable the analytic side first. The actor head is shared, so disabling Home after
+    // installing an Away candidate would clear the candidate actor and under-measure it.
     sim.disable_team_neural_brain(opp_team);
     if let Err(e) = sim.set_team_neural_brain(cand_team, Some(snapshot.clone()), true) {
         eprintln!("eval game {game_index}: candidate brain install failed: {e}");

@@ -1,9 +1,0 @@
-version: 2
-updates:
-  # github-actions only, deliberately: Cargo dependency versions are pinned
-  # experiment state in this research repo — bumping them under a live A/B
-  # would confound results, so cargo updates stay manual.
-  - package-ecosystem: github-actions
-    directory: "/"
-    schedule:
-      interval: weekly

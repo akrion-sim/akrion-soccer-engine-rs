@@ -5612,10 +5612,6 @@ const SOCCER_POLICY_LEARNING_RATE: f64 = 0.05;
 /// bounded separately by [`SOCCER_FORWARD_SELECT_BONUS_ABS_MAX`], so a large learned weight can keep
 /// pushing the gradient without letting the bonus swamp candidate scoring.
 const SOCCER_FORWARD_SELECT_LOGIT_WEIGHT_MAX: f64 = 8.0;
-/// Independent step size for the forward-selection scalar. Keeping this separate from the joint
-/// actor learning rate lets plateau experiments slow the scalar without weakening every role and
-/// specialist head. The default preserves the established update exactly.
-const SOCCER_FORWARD_SELECT_LOGIT_LEARNING_RATE_MAX: f64 = 0.20;
 /// Absolute cap on the *applied* forward-select bonus term (`weight * forward_option_quality`). Held
 /// comparable in magnitude to the centered actor bonus (~±0.25, cf. `SOCCER_CENTERED_POLICY_BONUS_CLIP`)
 /// so it NUDGES — rather than dominates — the candidate sort against `value_score` / `actor_bonus`.
@@ -5741,8 +5737,6 @@ const SOCCER_FULL_GAME_RETURN_BLEND: f64 = 0.35;
 const SOCCER_FULL_GAME_RETURN_CLIP: f64 = 400.0;
 const DD_SOCCER_OUTCOME_CREDIT_ENV: &str = "DD_SOCCER_OUTCOME_CREDIT";
 const DD_SOCCER_MATCH_OUTCOME_REWARD_ENV: &str = "DD_SOCCER_ENABLE_MATCH_OUTCOME_REWARD";
-const DD_SOCCER_DP_TERMINAL_OUTCOME_CREDIT_ENV: &str =
-    "DD_SOCCER_ENABLE_DP_TERMINAL_OUTCOME_CREDIT";
 const SOCCER_OUTCOME_CREDIT_MILESTONE_REWARD_CAP: f64 = GOAL_REWARD_POINTS;
 
 // --- Terminal won-game reward (the "long" rung of the quasi-win ladder) ---------
@@ -9317,64 +9311,6 @@ fn soccer_planner_teacher_candidate_min_quality(family: &str) -> f64 {
     }
 }
 
-/// Optional POMDP-observation teacher for the explicit forward-release action. This does not need
-/// neural MCTS or a forward option to survive the scored-candidate cap: when the field vector says
-/// a qualified forward receiver exists but another action was executed, it supplies one bounded
-/// counterfactual actor sample. Default OFF keeps the established teacher path byte-identical.
-fn soccer_planner_teacher_observation_forward_fallback(
-    decision: &AgentDecisionTrace,
-    role: PlayerRole,
-) -> Option<SoccerPlannerTeacherActionSample> {
-    if !soccer_planner_teacher_env_bool(
-        "DD_SOCCER_PLANNER_TEACHER_OBSERVATION_FORWARD_FALLBACK",
-        false,
-    ) || role == PlayerRole::Goalkeeper
-        || !forward_release_opportunity_present(&decision.observation)
-        || soccer_planner_teacher_action_family(&decision.action) == Some("forward-release-pass")
-    {
-        return None;
-    }
-    let family = "forward-release-pass";
-    let quality = soccer_planner_teacher_forward_quality(&decision.observation);
-    let min_quality = soccer_planner_teacher_candidate_min_quality(family);
-    if quality < min_quality
-        || decision.observation.expected_pass_completion
-            < soccer_planner_teacher_env_f64(
-                "SOCCER_PLANNER_TEACHER_MIN_FORWARD_COMPLETION",
-                SOCCER_PLANNER_TEACHER_MIN_FORWARD_COMPLETION,
-                0.0,
-                1.0,
-            )
-    {
-        return None;
-    }
-    let floor = soccer_planner_teacher_env_f64(
-        "SOCCER_PLANNER_TEACHER_ADVANTAGE_FLOOR",
-        SOCCER_PLANNER_TEACHER_MISSED_OPPORTUNITY_ADVANTAGE_FLOOR,
-        0.0,
-        2.0,
-    );
-    let advantage_max = soccer_planner_teacher_env_f64(
-        "SOCCER_PLANNER_TEACHER_ADVANTAGE_MAX",
-        SOCCER_PLANNER_TEACHER_MISSED_OPPORTUNITY_ADVANTAGE_MAX,
-        floor,
-        5.0,
-    );
-    let advantage = (floor + (quality - min_quality).max(0.0) * 0.22).clamp(floor, advantage_max);
-    Some(SoccerPlannerTeacherActionSample {
-        action: family.to_string(),
-        advantage,
-        weight: soccer_planner_teacher_env_f64(
-            "SOCCER_PLANNER_TEACHER_WEIGHT",
-            SOCCER_PLANNER_TEACHER_MISSED_OPPORTUNITY_WEIGHT,
-            1.0,
-            SOCCER_POLICY_PRIORITY_WEIGHT_MAX,
-        ),
-        quality,
-        score_margin: 0.0,
-    })
-}
-
 fn soccer_planner_teacher_missed_opportunities(
     decision: &AgentDecisionTrace,
     role: PlayerRole,
@@ -9382,18 +9318,13 @@ fn soccer_planner_teacher_missed_opportunities(
     if !soccer_planner_teacher_missed_opportunity_enabled()
         || role == PlayerRole::Goalkeeper
         || !decision.observation.has_ball
+        || decision.action_options.is_empty()
     {
         return Vec::new();
     }
 
-    let observation_forward_fallback =
-        soccer_planner_teacher_observation_forward_fallback(decision, role);
-    if decision.action_options.is_empty() {
-        return observation_forward_fallback.into_iter().collect();
-    }
-
     let Some(chosen_family) = soccer_planner_teacher_action_family(&decision.action) else {
-        return observation_forward_fallback.into_iter().collect();
+        return Vec::new();
     };
     let best_legal_score = decision
         .action_options
@@ -9402,7 +9333,7 @@ fn soccer_planner_teacher_missed_opportunities(
         .map(|option| soccer_finite_option_score(option))
         .fold(0.0, f64::max);
     if best_legal_score <= 1e-9 {
-        return observation_forward_fallback.into_iter().collect();
+        return Vec::new();
     }
     let chosen_score = decision
         .action_options
@@ -9503,14 +9434,6 @@ fn soccer_planner_teacher_missed_opportunities(
             }
         } else {
             candidates.push(candidate);
-        }
-    }
-    if let Some(fallback) = observation_forward_fallback {
-        if !candidates
-            .iter()
-            .any(|candidate| candidate.action == fallback.action)
-        {
-            candidates.push(fallback);
         }
     }
     candidates.sort_by(|a, b| {
@@ -15350,26 +15273,6 @@ fn soccer_dp_nstep_return(
     ret.clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP)
 }
 
-/// Build the outcome-only sequence used by DP terminal credit. Exactly one sample carries the
-/// realized result; fitted value iteration and n-step bootstrap must earn its earlier-state
-/// propagation instead of broadcasting the same label onto every decision.
-fn soccer_dp_terminal_outcome_sequence(
-    seq: &[(u64, f64, u32)],
-    terminal_reward: f64,
-) -> Vec<(u64, f64, u32)> {
-    seq.iter()
-        .enumerate()
-        .map(|(idx, (tick, _, bucket))| {
-            let reward = if idx + 1 == seq.len() {
-                finite_metric(terminal_reward)
-            } else {
-                0.0
-            };
-            (*tick, reward, *bucket)
-        })
-        .collect()
-}
-
 /// Compact, team-relative abstraction of the symbolic MDP state for the DP value table. From the
 /// acting team's perspective: attacking-third of the ball (x), lateral third (y), possession
 /// (us/them/loose), score sign (winning/level/losing), and a team-relative phase (our-build /
@@ -15422,11 +15325,9 @@ fn soccer_dp_state_bucket(
 
 /// Fitted-value-iteration replay (approximate dynamic programming). Replaces the pure Monte-Carlo
 /// correlated team return of `soccer_correlated_full_game_replay_transitions` with an **n-step
-/// return bootstrapped by a value-iterated abstract-state table**. By default the
-/// individual-reward blend, flat outcome label, clamps, and `done` flag are byte-identical to the
-/// MC path. `DD_SOCCER_ENABLE_DP_TERMINAL_OUTCOME_CREDIT=1` is an experimental alternative: the
-/// result appears only on the terminal DP sample and is propagated through fitted value iteration,
-/// rather than being copied onto every transition.
+/// return bootstrapped by a value-iterated abstract-state table**. The individual-reward blend,
+/// flat outcome label, clamps, and `done` flag are byte-identical to the MC path, so the gate is a
+/// clean A/B that changes ONLY the correlated-return quantity from full-MC to DP-bootstrapped.
 fn soccer_dp_bootstrapped_replay_transitions(
     transitions: &[SoccerLearningTransition],
     match_outcome: Option<MatchOutcomeReward>,
@@ -15437,7 +15338,6 @@ fn soccer_dp_bootstrapped_replay_transitions(
     let gamma = SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK;
     let horizon = dd_soccer_dp_bootstrap_horizon();
     let sweeps = dd_soccer_dp_bootstrap_sweeps();
-    let terminal_outcome_credit = dd_soccer_enable_dp_terminal_outcome_credit();
     let team_index = |team: Team| -> usize {
         match team {
             Team::Home => 0,
@@ -15481,38 +15381,6 @@ fn soccer_dp_bootstrapped_replay_transitions(
     }
     let value = soccer_dp_value_iteration(&samples, gamma, sweeps);
 
-    // A separate outcome-only fitted value keeps the fixed match anchor out of dense reward and
-    // preserves its full scale when it is added below. Team-relative score buckets distinguish
-    // winning from losing states while pooling equivalent home/away field situations.
-    let mut outcome_correlated: BTreeMap<(usize, u64), f64> = BTreeMap::new();
-    if terminal_outcome_credit {
-        let mut outcome_seq: [Vec<(u64, f64, u32)>; 2] = [Vec::new(), Vec::new()];
-        let mut outcome_samples: Vec<(u32, f64, Option<u32>)> = Vec::new();
-        for (ti, s) in seq.iter().enumerate() {
-            let team = if ti == 0 { Team::Home } else { Team::Away };
-            let terminal_reward = match_outcome
-                .map(|outcome| outcome.for_team(team))
-                .unwrap_or(0.0);
-            outcome_seq[ti] = soccer_dp_terminal_outcome_sequence(s, terminal_reward);
-            for i in 0..outcome_seq[ti].len() {
-                outcome_samples.push((
-                    outcome_seq[ti][i].2,
-                    outcome_seq[ti][i].1,
-                    outcome_seq[ti].get(i + 1).map(|next| next.2),
-                ));
-            }
-        }
-        let outcome_value = soccer_dp_value_iteration(&outcome_samples, gamma, sweeps);
-        for (ti, s) in outcome_seq.iter().enumerate() {
-            for i in 0..s.len() {
-                outcome_correlated.insert(
-                    (ti, s[i].0),
-                    soccer_dp_nstep_return(s, i, horizon, gamma, &outcome_value),
-                );
-            }
-        }
-    }
-
     // n-step bootstrapped correlated return per (team, tick).
     let mut correlated: BTreeMap<(usize, u64), f64> = BTreeMap::new();
     for (ti, s) in seq.iter().enumerate() {
@@ -15524,8 +15392,7 @@ fn soccer_dp_bootstrapped_replay_transitions(
         }
     }
 
-    // Assemble replay. Gate off remains identical to the prior flat-outcome DP path; gate on adds
-    // the propagated terminal value instead of the flat label.
+    // Assemble replay: identical blend / outcome / clamp / done to the MC correlated path.
     let mut replay = Vec::with_capacity(transitions.len());
     for t in transitions {
         let mut transition = t.clone();
@@ -15535,17 +15402,10 @@ fn soccer_dp_bootstrapped_replay_transitions(
             .unwrap_or(0.0);
         let blended = (1.0 - SOCCER_FULL_GAME_RETURN_BLEND) * finite_metric(transition.reward)
             + SOCCER_FULL_GAME_RETURN_BLEND * corr;
-        let outcome_component = if terminal_outcome_credit {
-            outcome_correlated
-                .get(&(team_index(transition.team), transition.tick))
-                .copied()
-                .unwrap_or(0.0)
-        } else {
-            match_outcome
-                .map(|outcome| outcome.for_team(transition.team))
-                .unwrap_or(0.0)
+        let with_outcome = match match_outcome {
+            Some(outcome) => blended + outcome.for_team(transition.team),
+            None => blended,
         };
-        let with_outcome = blended + outcome_component;
         transition.reward =
             with_outcome.clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP);
         transition.done = true;
@@ -15624,40 +15484,6 @@ mod soccer_dp_bootstrap_tests {
         let r = soccer_dp_nstep_return(&seq, 0, 2, 0.5, &empty);
         // 2 + 0.5·2 + 0.25·V(7=absent→0) = 3.0.
         assert!((r - 3.0).abs() < 1e-9, "got {r}");
-    }
-
-    #[test]
-    fn terminal_outcome_credit_is_sparse_then_propagated_by_dp() {
-        let dense_seq = vec![(0u64, 9.0, 0u32), (1, -4.0, 1), (2, 3.0, 2)];
-        let outcome_seq = soccer_dp_terminal_outcome_sequence(&dense_seq, 200.0);
-        assert_eq!(
-            outcome_seq
-                .iter()
-                .map(|sample| sample.1)
-                .collect::<Vec<_>>(),
-            vec![0.0, 0.0, 200.0],
-            "the fixed match anchor must exist on the terminal sample only"
-        );
-
-        let samples = outcome_seq
-            .iter()
-            .enumerate()
-            .map(|(idx, sample)| {
-                (
-                    sample.2,
-                    sample.1,
-                    outcome_seq.get(idx + 1).map(|next| next.2),
-                )
-            })
-            .collect::<Vec<_>>();
-        let value = soccer_dp_value_iteration(&samples, 0.9, 80);
-        let early = soccer_dp_nstep_return(&outcome_seq, 0, 1, 0.9, &value);
-        let terminal = soccer_dp_nstep_return(&outcome_seq, 2, 1, 0.9, &value);
-        assert!(
-            early > 0.0 && early < terminal,
-            "early={early} terminal={terminal}"
-        );
-        assert!((terminal - 200.0).abs() < 1e-6, "terminal={terminal}");
     }
 }
 
@@ -23186,15 +23012,6 @@ pub(crate) fn dd_soccer_enable_dp_bootstrap() -> bool {
     *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_DP_BOOTSTRAP"))
 }
 
-/// Experimental DP-compatible match-result anchor. ON places the result on the terminal fitted-DP
-/// sample and propagates it through the abstract value model; OFF preserves the existing flat
-/// per-transition outcome label exactly. Meaningful only when DP bootstrap is enabled.
-fn dd_soccer_enable_dp_terminal_outcome_credit() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| soccer_env_flag_enabled(DD_SOCCER_DP_TERMINAL_OUTCOME_CREDIT_ENV))
-}
-
 /// n-step horizon (in decision ticks) for the DP-bootstrapped return. After this many ticks the
 /// return bootstraps off the value-iterated abstract table instead of continuing the Monte-Carlo
 /// sum. Small ⇒ low variance but leans hard on the DP value; large ⇒ closer to full MC. Default 16.
@@ -24662,10 +24479,7 @@ fn hierarchy_projected_match_win_points(requested: f64, goal_scale: f64) -> f64 
     requested.max(GOAL_REWARD_POINTS * goal_scale.max(1.0) + WIN_OVER_CONVERSION_REWARD_MARGIN)
 }
 
-/// Effective win-reward anchor after applying the configured goal-over-shot and
-/// win-over-goal hierarchy. Public so experiment binaries can report the treatment
-/// that actually executed instead of only the requested environment value.
-pub fn match_outcome_win_reward_points() -> f64 {
+pub(crate) fn match_outcome_win_reward_points() -> f64 {
     let requested = if dynamic_reward_weights_enabled() {
         reward_weight_env(
             "DD_SOCCER_MATCH_WIN_REWARD_POINTS",
@@ -43218,7 +43032,6 @@ impl SoccerPolicyRoleHead {
         samples: &[SoccerPolicySample],
         mappo_clip_epsilon: Option<f64>,
     ) -> (usize, f64) {
-        let policy_learning_rate = soccer_policy_learning_rate();
         let role = self.role_group.as_player_role();
         let prepared: Vec<(&SoccerPolicySample, f64)> = samples
             .iter()
@@ -43244,7 +43057,7 @@ impl SoccerPolicyRoleHead {
                 sample.action_index,
                 weighted_advantage,
                 soccer_policy_entropy_coeff(),
-                policy_learning_rate,
+                SOCCER_POLICY_LEARNING_RATE,
                 SOCCER_POLICY_GRAD_CLIP_NORM,
             );
             if result.applied && result.loss.is_finite() {
@@ -43273,7 +43086,7 @@ impl SoccerPolicyRoleHead {
                     local_action_index,
                     weighted_advantage,
                     soccer_policy_entropy_coeff(),
-                    policy_learning_rate,
+                    SOCCER_POLICY_LEARNING_RATE,
                     SOCCER_POLICY_GRAD_CLIP_NORM,
                 );
                 if result.applied && result.loss.is_finite() {
@@ -43425,8 +43238,7 @@ impl SoccerPolicyHead {
         if gradient == 0.0 || !gradient.is_finite() {
             return;
         }
-        let updated = self.forward_select_logit_weight
-            + soccer_forward_select_logit_learning_rate() * gradient;
+        let updated = self.forward_select_logit_weight + SOCCER_POLICY_LEARNING_RATE * gradient;
         if updated.is_finite() {
             self.forward_select_logit_weight =
                 updated.clamp(0.0, SOCCER_FORWARD_SELECT_LOGIT_WEIGHT_MAX);
@@ -43443,31 +43255,6 @@ fn soccer_forward_select_logit_weight_env_override() -> Option<f64> {
         .and_then(|raw| raw.trim().parse::<f64>().ok())
         .filter(|value| value.is_finite())
         .map(|value| value.clamp(0.0, SOCCER_FORWARD_SELECT_LOGIT_WEIGHT_MAX))
-}
-
-fn soccer_forward_select_logit_learning_rate() -> f64 {
-    soccer_planner_teacher_env_f64(
-        "DD_SOCCER_FORWARD_SELECT_LOGIT_LEARNING_RATE",
-        SOCCER_POLICY_LEARNING_RATE,
-        0.0,
-        SOCCER_FORWARD_SELECT_LOGIT_LEARNING_RATE_MAX,
-    )
-}
-
-fn soccer_policy_learning_rate() -> f64 {
-    soccer_planner_teacher_env_f64(
-        "DD_SOCCER_POLICY_LEARNING_RATE",
-        SOCCER_POLICY_LEARNING_RATE,
-        0.0,
-        MAX_SOCCER_NEURAL_LEARNING_RATE,
-    )
-}
-
-fn soccer_forward_select_logit_weight_override_on_restore() -> bool {
-    soccer_planner_teacher_env_bool(
-        "DD_SOCCER_FORWARD_SELECT_LOGIT_WEIGHT_OVERRIDE_ON_RESTORE",
-        true,
-    )
 }
 
 #[cfg(test)]
@@ -43625,42 +43412,6 @@ mod soccer_policy_actor_capacity_tests {
         let restored_corrupt =
             soccer_policy_head_from_snapshot(&corrupt, 21).expect("restore corrupt policy");
         assert_eq!(restored_corrupt.forward_select_logit_weight, 0.0);
-    }
-
-    #[test]
-    fn forward_select_restore_override_can_preserve_learned_checkpoint_weight() {
-        let _lock = env_lock();
-        let _gate = set_test_env_var("DD_SOCCER_ENABLE_FORWARD_SELECT_LOGIT", "1");
-        let _weight = set_test_env_var("DD_SOCCER_FORWARD_SELECT_LOGIT_WEIGHT", "2.0");
-        let _restore = set_test_env_var(
-            "DD_SOCCER_FORWARD_SELECT_LOGIT_WEIGHT_OVERRIDE_ON_RESTORE",
-            "0",
-        );
-        let mut head = SoccerPolicyHead::new(22);
-        head.forward_select_logit_weight = 3.25;
-        let snapshot = soccer_policy_head_snapshot(&head);
-
-        let restored = soccer_policy_head_from_snapshot(&snapshot, 22).expect("restore policy");
-
-        assert_eq!(restored.forward_select_logit_weight, 3.25);
-    }
-
-    #[test]
-    fn forward_select_scalar_learning_rate_is_independently_tunable() {
-        let _lock = env_lock();
-        let _rate = set_test_env_var("DD_SOCCER_FORWARD_SELECT_LOGIT_LEARNING_RATE", "0.0075");
-
-        assert_eq!(soccer_forward_select_logit_learning_rate(), 0.0075);
-    }
-
-    #[test]
-    fn joint_actor_learning_rate_is_tunable_without_changing_the_default() {
-        let _lock = env_lock();
-        let _default = clear_test_env_var("DD_SOCCER_POLICY_LEARNING_RATE");
-        assert_eq!(soccer_policy_learning_rate(), SOCCER_POLICY_LEARNING_RATE);
-
-        std::env::set_var("DD_SOCCER_POLICY_LEARNING_RATE", "0.0125");
-        assert_eq!(soccer_policy_learning_rate(), 0.0125);
     }
 
     #[test]
@@ -44084,7 +43835,6 @@ impl SoccerSkillPolicyHead {
         // Stride a balanced subsample of `balanced_n` across the bucket so every head trains on an
         // equal number of samples (no skill dominates the others' separate losses).
         let stride = (bucket.len() / balanced_n).max(1);
-        let policy_learning_rate = soccer_policy_learning_rate();
         let mut loss_sum = 0.0;
         let mut applied = 0usize;
         let mut taken = 0usize;
@@ -44098,7 +43848,7 @@ impl SoccerSkillPolicyHead {
                     local,
                     weighted_advantage,
                     soccer_policy_entropy_coeff(),
-                    policy_learning_rate,
+                    SOCCER_POLICY_LEARNING_RATE,
                     SOCCER_POLICY_GRAD_CLIP_NORM,
                 );
                 if result.applied && result.loss.is_finite() {
@@ -44381,7 +44131,6 @@ impl SoccerKeeperPolicyHead {
     /// the keeper-vocabulary action index and the transition reward (which now includes the keeper
     /// save reward and concede penalty) as the advantage.
     fn train(&mut self, samples: &[SoccerKeeperPolicySample]) {
-        let policy_learning_rate = soccer_policy_learning_rate();
         let mut loss_sum = 0.0;
         let mut applied = 0usize;
         for sample in samples {
@@ -44393,7 +44142,7 @@ impl SoccerKeeperPolicyHead {
                 sample.action_index,
                 sample.advantage,
                 soccer_policy_entropy_coeff(),
-                policy_learning_rate,
+                SOCCER_POLICY_LEARNING_RATE,
                 SOCCER_POLICY_GRAD_CLIP_NORM,
             );
             if result.applied && result.loss.is_finite() {
@@ -45820,10 +45569,8 @@ fn soccer_policy_head_from_snapshot(
     // Diagnostic/climb-lane override: with the gate on, allow a fixed
     // forward-select weight for smoke/A-B runs. It is baked into the per-net
     // field once here and obeys the same nonnegative clamp as training.
-    if soccer_forward_select_logit_weight_override_on_restore() {
-        if let Some(weight) = soccer_forward_select_logit_weight_env_override() {
-            head.forward_select_logit_weight = weight;
-        }
+    if let Some(weight) = soccer_forward_select_logit_weight_env_override() {
+        head.forward_select_logit_weight = weight;
     }
     Ok(head)
 }

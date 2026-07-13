@@ -21,15 +21,13 @@
 //! Everything is seeded and deterministic: the same teams + seed + runner
 //! always produce the same bracket and champion.
 
-#[cfg(test)]
-use crate::des::general::soccer::{MatchStats, MpcRejectFamily, MpcRejectThresholdInputs};
 use crate::des::general::soccer::{
-    learned_mpc_objective_enabled, mpc_reject_threshold_model_enabled, MatchConfig, MatchSummary,
-    MpcObjectiveSample, MpcRejectThresholdHead, MpcRejectThresholdSample, SoccerMatch,
-    SoccerMpcObjectiveHead, SoccerNeuralLearningBackend, SoccerNeuralNetworkSnapshot,
+    learned_mpc_objective_enabled, MatchConfig, MatchSummary, MpcObjectiveSample,
+    SoccerMatch, SoccerMpcObjectiveHead, SoccerNeuralLearningBackend, SoccerNeuralNetworkSnapshot,
     SoccerQPolicy, SoccerQPolicyOptions, SoccerQTargetEntry, SoccerTeamQPolicies, Team,
-    MPC_REJECT_THRESHOLD_HEAD_MIN_TRAINING_STEPS,
 };
+#[cfg(test)]
+use crate::des::general::soccer::MatchStats;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -1463,10 +1461,11 @@ impl Default for EngineMatchRunnerConfig {
         // Inline keeps each tournament match fully deterministic and reproducible
         // (no background training thread racing the step loop).
         base.neural_learning.backend = SoccerNeuralLearningBackend::Inline;
-        // Compare each complete learned policy. Joint actor sidecars, like critics and skill
-        // actors, are isolated per team; checkpoints without an actor still fall back to their
-        // own critic without injecting a fresh random actor at evaluation time.
-        base.neural_blend.actor_critic = true;
+        // Critic-only blend: each side is driven purely by its OWN per-team critic.
+        // The actor (`policy_head`) is shared across teams, so leaving actor-critic
+        // on would let one shared net influence both brains and blur "who is best";
+        // disable it so the tournament compares genuinely independent brains.
+        base.neural_blend.actor_critic = false;
         EngineMatchRunnerConfig {
             base,
             match_wall_time_limit: None,
@@ -1482,10 +1481,6 @@ impl Default for EngineMatchRunnerConfig {
 #[derive(Clone)]
 pub struct EngineMatchRunner {
     config: EngineMatchRunnerConfig,
-    /// Global execution-controller head carried between fixtures. Unlike the team
-    /// actor/critic, this estimates whether an action is physically worth attempting
-    /// from field context and therefore learns from both sides' committed executions.
-    mpc_reject_threshold_head: Option<MpcRejectThresholdHead>,
 }
 
 fn engine_match_uniform_elite_players_enabled() -> bool {
@@ -1499,8 +1494,6 @@ fn engine_match_uniform_elite_players_enabled() -> bool {
 
 const ENGINE_MATCH_MPC_OBJECTIVE_TRAIN_PASSES: usize = 4;
 const ENGINE_MATCH_MPC_OBJECTIVE_BASE_LR: f64 = 0.05;
-const ENGINE_MATCH_MPC_REJECT_THRESHOLD_TRAIN_PASSES: usize = 4;
-const ENGINE_MATCH_MPC_REJECT_THRESHOLD_BASE_LR: f64 = 0.02;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct EngineMpcObjectiveTrainingReport {
@@ -1538,72 +1531,9 @@ fn train_engine_match_mpc_objective_head(
     })
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct EngineMpcRejectThresholdTrainingReport {
-    samples: usize,
-    trained_steps: usize,
-    training_steps: usize,
-    epochs: usize,
-    learning_rate: f64,
-    warm: bool,
-    final_loss: f64,
-}
-
-fn engine_match_trains_mpc_reject_threshold(ctx: &TournamentMatchContext) -> bool {
-    mpc_reject_threshold_model_enabled() && (ctx.home_learns || ctx.away_learns)
-}
-
-fn engine_match_mpc_reject_threshold_train_passes() -> usize {
-    std::env::var("DD_SOCCER_MPC_REJECT_THRESHOLD_EPOCHS")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .unwrap_or(ENGINE_MATCH_MPC_REJECT_THRESHOLD_TRAIN_PASSES)
-        .clamp(1, 64)
-}
-
-fn engine_match_mpc_reject_threshold_learning_rate() -> f64 {
-    std::env::var("DD_SOCCER_MPC_REJECT_THRESHOLD_LEARNING_RATE")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<f64>().ok())
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .unwrap_or(ENGINE_MATCH_MPC_REJECT_THRESHOLD_BASE_LR)
-        .clamp(1e-6, 1.0)
-}
-
-fn train_engine_match_mpc_reject_threshold_head(
-    carried_head: &mut Option<MpcRejectThresholdHead>,
-    samples: &[MpcRejectThresholdSample],
-    seed: u32,
-) -> Option<EngineMpcRejectThresholdTrainingReport> {
-    if !mpc_reject_threshold_model_enabled() || samples.is_empty() {
-        return None;
-    }
-    let epochs = engine_match_mpc_reject_threshold_train_passes();
-    let learning_rate = engine_match_mpc_reject_threshold_learning_rate();
-    let head = carried_head.get_or_insert_with(|| MpcRejectThresholdHead::new(seed));
-    let steps_before = head.training_steps();
-    let mut final_loss = 0.0;
-    for _ in 0..epochs {
-        final_loss = head.train_reward_weighted(samples, learning_rate);
-    }
-    let training_steps = head.training_steps();
-    Some(EngineMpcRejectThresholdTrainingReport {
-        samples: samples.len(),
-        trained_steps: training_steps.saturating_sub(steps_before),
-        training_steps,
-        epochs,
-        learning_rate,
-        warm: training_steps >= MPC_REJECT_THRESHOLD_HEAD_MIN_TRAINING_STEPS,
-        final_loss,
-    })
-}
-
 impl EngineMatchRunner {
     pub fn new(config: EngineMatchRunnerConfig) -> Self {
-        EngineMatchRunner {
-            config,
-            mpc_reject_threshold_head: None,
-        }
+        EngineMatchRunner { config }
     }
 
     pub fn with_defaults() -> Self {
@@ -1612,10 +1542,6 @@ impl EngineMatchRunner {
 
     pub fn set_mpc_objective_head(&mut self, head: Option<SoccerMpcObjectiveHead>) {
         self.config.mpc_objective_head = head;
-    }
-
-    pub fn set_mpc_reject_threshold_head(&mut self, head: Option<MpcRejectThresholdHead>) {
-        self.mpc_reject_threshold_head = head;
     }
 }
 
@@ -1656,9 +1582,6 @@ impl TournamentMatchRunner for EngineMatchRunner {
         }
         if let Some(head) = self.config.mpc_objective_head.clone() {
             sim.set_mpc_objective_head(head);
-        }
-        if let Some(head) = self.mpc_reject_threshold_head.clone() {
-            sim.set_mpc_reject_threshold_head(head);
         }
 
         // Install each side's brain. `frozen = !learns` so a non-learning side
@@ -1764,16 +1687,6 @@ impl TournamentMatchRunner for EngineMatchRunner {
             &mpc_objective_samples,
             ctx.seed,
         );
-        let mpc_reject_threshold_samples = if engine_match_trains_mpc_reject_threshold(ctx) {
-            sim.drain_mpc_reject_threshold_samples()
-        } else {
-            Vec::new()
-        };
-        let mpc_reject_threshold_training = train_engine_match_mpc_reject_threshold_head(
-            &mut self.mpc_reject_threshold_head,
-            &mpc_reject_threshold_samples,
-            ctx.seed,
-        );
 
         let home_goals = sim.score_home;
         let away_goals = sim.score_away;
@@ -1810,20 +1723,6 @@ impl TournamentMatchRunner for EngineMatchRunner {
                 report.trained_steps,
                 report.training_steps,
                 report.warm
-            );
-        }
-        if let Some(report) = mpc_reject_threshold_training {
-            eprintln!(
-                "tournament_mpc_reject_threshold_training home={} away={} samples={} trained_steps={} training_steps={} epochs={} learning_rate={:.6} warm={} final_loss={:.6}",
-                ctx.home_id,
-                ctx.away_id,
-                report.samples,
-                report.trained_steps,
-                report.training_steps,
-                report.epochs,
-                report.learning_rate,
-                report.warm,
-                report.final_loss
             );
         }
 
@@ -1951,10 +1850,6 @@ mod tests {
             crate::des::general::soccer::DEFAULT_DT_SECONDS
         );
         assert_eq!(config.base.total_ticks(), 18_000);
-        assert!(
-            config.base.neural_blend.actor_critic,
-            "independent tournament brains should serve their complete actor-critic policies"
-        );
     }
 
     #[test]
@@ -1982,52 +1877,6 @@ mod tests {
             report.training_steps,
             ENGINE_MATCH_MPC_OBJECTIVE_TRAIN_PASSES
         );
-    }
-
-    #[test]
-    fn engine_runner_trains_and_carries_contextual_mpc_reject_threshold_head() {
-        let _lock = env_lock().lock().unwrap();
-        let _gate = EnvVarGuard::set("DD_SOCCER_ENABLE_MPC_REJECT_THRESHOLD_MODEL", "1");
-        let _epochs = EnvVarGuard::set("DD_SOCCER_MPC_REJECT_THRESHOLD_EPOCHS", "2");
-        let inputs = MpcRejectThresholdInputs {
-            family: MpcRejectFamily::Pass,
-            actor_threat: 0.55,
-            nearest_opponent_pressure: 0.35,
-            team_control_at_actor: 0.62,
-            ball_speed: 8.0,
-            ball_altitude: 0.0,
-            role_defender: 0.0,
-            role_midfielder: 1.0,
-            role_forward: 0.0,
-            base_threshold: 0.18,
-        };
-        let samples = [
-            MpcRejectThresholdSample {
-                inputs: inputs.clone(),
-                committed_probability: 0.24,
-                reward: 1.0,
-            },
-            MpcRejectThresholdSample {
-                inputs: MpcRejectThresholdInputs {
-                    nearest_opponent_pressure: 0.9,
-                    team_control_at_actor: 0.2,
-                    ..inputs
-                },
-                committed_probability: 0.52,
-                reward: -1.0,
-            },
-        ];
-        let mut carried = None;
-
-        let report = train_engine_match_mpc_reject_threshold_head(&mut carried, &samples, 92)
-            .expect("enabled committed-action samples should train the carried head");
-
-        assert!(carried.is_some());
-        assert_eq!(report.samples, 2);
-        assert_eq!(report.epochs, 2);
-        assert_eq!(report.trained_steps, 4);
-        assert_eq!(report.training_steps, 4);
-        assert!(report.final_loss.is_finite());
     }
 
     fn small_format() -> TournamentFormat {

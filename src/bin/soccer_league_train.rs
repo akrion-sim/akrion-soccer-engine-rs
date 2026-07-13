@@ -29,9 +29,9 @@ use std::path::Path;
 use std::time::Instant;
 
 use soccer_engine::des::general::soccer::{
-    average_soccer_neural_network_snapshots, learned_mpc_objective_enabled,
-    mpc_reject_threshold_model_enabled, FacingBucket, MatchSummary, SoccerNeuralBlendMode,
-    SoccerNeuralNetworkSnapshot, SoccerQStateKey, SoccerQTargetEntry, TacticalPhase, Team,
+    average_soccer_neural_network_snapshots, learned_mpc_objective_enabled, FacingBucket,
+    MatchSummary, SoccerNeuralBlendMode, SoccerNeuralNetworkSnapshot, SoccerQStateKey,
+    SoccerQTargetEntry, TacticalPhase, Team,
 };
 use soccer_engine::des::general::tournament::{
     EngineMatchRunner, EngineMatchRunnerConfig, TeamBrain, TournamentMatchContext,
@@ -149,20 +149,11 @@ fn apply_league_neural_mcts_config(config: &mut EngineMatchRunnerConfig) -> bool
     enabled
 }
 
-fn apply_league_actor_config(config: &mut EngineMatchRunnerConfig) -> bool {
-    let enabled = env_bool("SOCCER_NEURAL_ACTOR_CRITIC", true);
-    config.base.neural_blend.actor_critic = enabled;
-    enabled
-}
-
 fn league_worker_count(requested_workers: usize, fixture_count: usize) -> usize {
     let capped = requested_workers.clamp(1, fixture_count.max(1));
-    let carries_mpc_head = learned_mpc_objective_enabled() || mpc_reject_threshold_model_enabled();
-    let serial_carried_mpc = std::env::var("SOCCER_LEAGUE_CARRIED_MPC_SERIAL")
-        .ok()
-        .map(|_| env_bool("SOCCER_LEAGUE_CARRIED_MPC_SERIAL", true))
-        .unwrap_or_else(|| env_bool("SOCCER_LEAGUE_MPC_OBJECTIVE_SERIAL", true));
-    if carries_mpc_head && serial_carried_mpc {
+    let serial_for_mpc_objective =
+        learned_mpc_objective_enabled() && env_bool("SOCCER_LEAGUE_MPC_OBJECTIVE_SERIAL", true);
+    if serial_for_mpc_objective {
         1
     } else {
         capped
@@ -202,12 +193,6 @@ struct LeagueMatchKpis {
     learned_mpc_replans_mpc: u32,
     learned_mpc_replans_option_score_safety: u32,
     learned_mpc_replans_neural_mcts: u32,
-    policy_priority_samples: u32,
-    planner_teacher_candidates: u32,
-    planner_teacher_samples: u32,
-    planner_teacher_forward_samples: u32,
-    planner_teacher_weight_sum: f64,
-    planner_teacher_advantage_sum: f64,
     objective_fitness: f64,
     objective_fitness_margin: f64,
 }
@@ -254,14 +239,6 @@ impl LeagueMatchKpis {
                 learned_mpc_replans_option_score_safety: stats
                     .learned_mpc_replans_option_score_safety,
                 learned_mpc_replans_neural_mcts: stats.learned_mpc_replans_neural_mcts,
-                policy_priority_samples: stats.policy_priority_samples,
-                planner_teacher_candidates: stats.planner_teacher_missed_opportunity_candidates,
-                planner_teacher_samples: stats.planner_teacher_missed_opportunity_samples,
-                planner_teacher_forward_samples: stats
-                    .planner_teacher_missed_opportunity_forward_samples,
-                planner_teacher_weight_sum: stats.planner_teacher_missed_opportunity_weight_sum,
-                planner_teacher_advantage_sum: stats
-                    .planner_teacher_missed_opportunity_advantage_sum,
                 objective_fitness: home_net_forward as f64,
                 objective_fitness_margin: (home_net_forward - away_net_forward) as f64,
             },
@@ -299,14 +276,6 @@ impl LeagueMatchKpis {
                 learned_mpc_replans_option_score_safety: stats
                     .learned_mpc_replans_option_score_safety,
                 learned_mpc_replans_neural_mcts: stats.learned_mpc_replans_neural_mcts,
-                policy_priority_samples: stats.policy_priority_samples,
-                planner_teacher_candidates: stats.planner_teacher_missed_opportunity_candidates,
-                planner_teacher_samples: stats.planner_teacher_missed_opportunity_samples,
-                planner_teacher_forward_samples: stats
-                    .planner_teacher_missed_opportunity_forward_samples,
-                planner_teacher_weight_sum: stats.planner_teacher_missed_opportunity_weight_sum,
-                planner_teacher_advantage_sum: stats
-                    .planner_teacher_missed_opportunity_advantage_sum,
                 objective_fitness: away_net_forward as f64,
                 objective_fitness_margin: (away_net_forward - home_net_forward) as f64,
             },
@@ -348,12 +317,6 @@ struct LeagueRoundKpis {
     learned_mpc_replans_mpc: u32,
     learned_mpc_replans_option_score_safety: u32,
     learned_mpc_replans_neural_mcts: u32,
-    policy_priority_samples: u32,
-    planner_teacher_candidates: u32,
-    planner_teacher_samples: u32,
-    planner_teacher_forward_samples: u32,
-    planner_teacher_weight_sum: f64,
-    planner_teacher_advantage_sum: f64,
     objective_fitness_sum: f64,
     objective_fitness_margin_sum: f64,
 }
@@ -432,20 +395,6 @@ impl LeagueRoundKpis {
         self.learned_mpc_replans_neural_mcts = self
             .learned_mpc_replans_neural_mcts
             .saturating_add(kpis.learned_mpc_replans_neural_mcts);
-        self.policy_priority_samples = self
-            .policy_priority_samples
-            .saturating_add(kpis.policy_priority_samples);
-        self.planner_teacher_candidates = self
-            .planner_teacher_candidates
-            .saturating_add(kpis.planner_teacher_candidates);
-        self.planner_teacher_samples = self
-            .planner_teacher_samples
-            .saturating_add(kpis.planner_teacher_samples);
-        self.planner_teacher_forward_samples = self
-            .planner_teacher_forward_samples
-            .saturating_add(kpis.planner_teacher_forward_samples);
-        self.planner_teacher_weight_sum += kpis.planner_teacher_weight_sum;
-        self.planner_teacher_advantage_sum += kpis.planner_teacher_advantage_sum;
         self.objective_fitness_sum += kpis.objective_fitness;
         self.objective_fitness_margin_sum += kpis.objective_fitness_margin;
     }
@@ -901,12 +850,6 @@ fn without_target_q(mut brain: TeamBrain) -> TeamBrain {
     brain
 }
 
-fn fixed_analytic_anchor() -> TeamBrain {
-    let mut brain = without_target_q(TeamBrain::fresh_with_seed(0xA5A5_0007, 100));
-    brain.neural = None;
-    brain
-}
-
 fn play_and_carry(
     runner: &mut EngineMatchRunner,
     frontier: TeamBrain,
@@ -968,13 +911,12 @@ fn play_checkpoint_validation(
     runner: &EngineMatchRunner,
     candidate: &TeamBrain,
     baseline: &TeamBrain,
-    label: &str,
     round: u32,
     games: usize,
 ) -> LeagueRoundKpis {
     let mut validation = LeagueRoundKpis::default();
     let mut runner = runner.clone();
-    println!("league_checkpoint_validation_start label={label} round={round} games={games}");
+    println!("league_checkpoint_validation_start round={round} games={games}");
     for g in 0..games {
         let candidate_home = g % 2 == 0;
         let seed = 0xC1A0_0000u32
@@ -1001,7 +943,7 @@ fn play_checkpoint_validation(
             Ok(Ok(outcome)) => {
                 let kpis = LeagueMatchKpis::from_summary(&outcome.summary, candidate_team);
                 println!(
-                    "league_checkpoint_validation_game label={label} round={round} game={} candidate_home={} score={}-{} forward_pass_margin={} net_forward_pass_margin={}",
+                    "league_checkpoint_validation_game round={round} game={} candidate_home={} score={}-{} forward_pass_margin={} net_forward_pass_margin={}",
                     g,
                     candidate_home,
                     outcome.home_goals,
@@ -1012,34 +954,14 @@ fn play_checkpoint_validation(
                 validation.add(kpis);
             }
             Ok(Err(err)) => {
-                eprintln!("league_checkpoint_validation_error label={label} round={round} game={g}: {err}");
+                eprintln!("league_checkpoint_validation_error round={round} game={g}: {err}");
             }
             Err(_) => {
-                eprintln!(
-                    "league_checkpoint_validation_panic label={label} round={round} game={g}"
-                );
+                eprintln!("league_checkpoint_validation_panic round={round} game={g}");
             }
         }
     }
     validation
-}
-
-fn analytic_anchor_non_regression_passes(
-    candidate: Option<&LeagueRoundKpis>,
-    incumbent: Option<&LeagueRoundKpis>,
-    expected_games: usize,
-    max_goal_diff_regression: f64,
-) -> bool {
-    match (candidate, incumbent) {
-        (Some(candidate), Some(incumbent)) => {
-            candidate.games == expected_games
-                && incumbent.games == expected_games
-                && candidate.mean_goal_diff() + max_goal_diff_regression
-                    >= incumbent.mean_goal_diff()
-        }
-        (None, None) => true,
-        _ => false,
-    }
 }
 
 fn checkpoint_validation_passes(
@@ -1103,22 +1025,6 @@ fn main() {
         "SOCCER_LEAGUE_CHECKPOINT_VALIDATE_MIN_GOAL_DIFF_MARGIN",
         0.0,
     );
-    let fixed_analytic_training_anchor =
-        env_bool("SOCCER_LEAGUE_FIXED_ANALYTIC_TRAINING_ANCHOR", true);
-    let analytic_anchor_gate = env_bool("SOCCER_LEAGUE_ANALYTIC_ANCHOR_GATE", true);
-    let analytic_anchor_validate_games = if analytic_anchor_gate {
-        env_usize(
-            "SOCCER_LEAGUE_ANALYTIC_ANCHOR_VALIDATE_GAMES",
-            checkpoint_validate_games.max(4),
-        )
-    } else {
-        0
-    };
-    let analytic_anchor_max_goal_diff_regression = env_f64(
-        "SOCCER_LEAGUE_ANALYTIC_ANCHOR_MAX_GOAL_DIFF_REGRESSION",
-        0.0,
-    )
-    .max(0.0);
     let max_rounds = env_usize("SOCCER_LEAGUE_MAX_ROUNDS", 0);
     let max_training_steps = env_usize("SOCCER_LEAGUE_MAX_TRAINING_STEPS", 0);
     let step_archive_buckets = env_usize_list("SOCCER_LEAGUE_STEP_ARCHIVE_BUCKETS");
@@ -1128,16 +1034,6 @@ fn main() {
     let seed_varied_skills = env_default_bool("SOCCER_SEED_VARIED_SKILLS", !uniform_elite_players);
     let authoritative_lambda = env_default_f64("DD_SOCCER_NEURAL_AUTHORITATIVE_LAMBDA", 8.0);
     let policy_entropy_coeff = env_default_f64("SOCCER_POLICY_ENTROPY_COEFF", 0.04);
-    let policy_learning_rate = env_default_f64("DD_SOCCER_POLICY_LEARNING_RATE", 0.05);
-    let mappo_epochs = env_default_usize("SOCCER_MAPPO_EPOCHS", 4);
-    let full_game_policy_max_samples =
-        env_default_usize("DD_SOCCER_FULL_GAME_POLICY_MAX_SAMPLES", 0);
-    let mpc_reject_threshold_model =
-        env_default_bool("DD_SOCCER_ENABLE_MPC_REJECT_THRESHOLD_MODEL", true);
-    let mpc_reject_threshold_epochs =
-        env_default_usize("DD_SOCCER_MPC_REJECT_THRESHOLD_EPOCHS", 4).clamp(1, 64);
-    let mpc_reject_threshold_learning_rate =
-        env_default_f64("DD_SOCCER_MPC_REJECT_THRESHOLD_LEARNING_RATE", 0.02).clamp(1e-6, 1.0);
     let attack_canonical_features =
         env_default_bool("DD_SOCCER_ENABLE_ATTACK_CANONICAL_NEURAL_FEATURES", true);
     let ball_zone_tactical_scale =
@@ -1149,12 +1045,6 @@ fn main() {
     env_default_f64("DD_SOCCER_FORWARD_RELEASE_MIN_COMPLETION", 0.35);
     env_default_bool("DD_SOCCER_ENABLE_FORWARD_SELECT_LOGIT", true);
     let forward_select_logit_weight = env_default_f64("DD_SOCCER_FORWARD_SELECT_LOGIT_WEIGHT", 2.0);
-    let forward_select_logit_learning_rate =
-        env_default_f64("DD_SOCCER_FORWARD_SELECT_LOGIT_LEARNING_RATE", 0.05);
-    let forward_select_restore_override = env_default_bool(
-        "DD_SOCCER_FORWARD_SELECT_LOGIT_WEIGHT_OVERRIDE_ON_RESTORE",
-        false,
-    );
     let finishing_select_bonus_weight = env_reward_f64(
         "SOCCER_NEURAL_FINISHING_SELECT_BONUS_WEIGHT",
         0.70,
@@ -1399,9 +1289,14 @@ fn main() {
     // parity (policy gradient optimizes RETURN directly, not tabular-matching). Pair with a lower
     // DD_SOCCER_NEURAL_AUTHORITATIVE_LAMBDA (more actor influence) + SOCCER_POLICY_ENTROPY_COEFF
     // (keep exploring) so the actor can actually leave the analytic mode. Off ⇒ current behaviour.
-    // Per-team joint-actor sidecars now isolate the frontier and frozen champion, so ladder mode
-    // can train and serve the actor instead of silently falling back to critic-only ranking.
-    apply_league_actor_config(&mut runner_config);
+    runner_config.base.neural_blend.actor_critic = env_bool("SOCCER_NEURAL_ACTOR_CRITIC", true);
+    // The self-play ladder installs a neural net on BOTH teams, but the actor's `policy_head` is a
+    // single shared field — the away champion's actor would overwrite (and then drive) both sides.
+    // Force critic-only ranking in ladder mode so each side selects with its OWN per-team critic
+    // (the exact mode play_checkpoint_validation + the default tournament config already use).
+    if self_play_ladder {
+        runner_config.base.neural_blend.actor_critic = false;
+    }
     runner_config.base.neural_blend.mode = env_neural_blend_mode(
         "SOCCER_NEURAL_BLEND_MODE",
         SoccerNeuralBlendMode::Authoritative,
@@ -1427,7 +1322,7 @@ fn main() {
     let full_game_learning_enabled = runner_config.base.full_game_learning_enabled;
     let neural_learning_rate = runner_config.base.neural_learning.learning_rate;
     let neural_optimizer_momentum = runner_config.base.neural_learning.optimizer_momentum;
-    // Keep the engine's designed independent-brain mode (per-team critic and actor drive each side).
+    // Keep the engine's designed independent-brain mode (per-team critic drives each side).
     let mut runner = EngineMatchRunner::new(runner_config);
 
     let mut frontier = match load_brain(&frontier_path) {
@@ -1463,7 +1358,7 @@ fn main() {
     let mut best_checkpoint_net_forward_pass_margin = f64::NEG_INFINITY;
     let mut archived_step_buckets: BTreeSet<usize> = BTreeSet::new();
     println!(
-        "league_train_started_at_utc={} games/opp={} minutes={} period_count={} weight_decay={} fresh_opp={} checkpoint_every={} max_rounds={} max_training_steps={} max_target_entries_per_side={} advancement_metric=completed_forward_passes net_metric=completed_forward_passes_minus_turnovers analytic_opponents={} uniform_elite_players={} seed_varied_skills={} hermetic_neural={} attack_canonical_features={} ball_zone_tactical_scale={} player_grid_xy_features={} policy_train_max_transitions_per_tick={} full_game_policy_max_samples={} full_game_learning_enabled={} neural_learning_rate={} neural_optimizer_momentum={} neural_blend_mode={:?} neural_blend_lambda={} neural_authoritative_lambda={} neural_blend_candidates={} neural_blend_warmup_steps={} policy_learning_rate={} mappo_epochs={} policy_entropy_coeff={} mpc_reject_threshold_model={mpc_reject_threshold_model} mpc_reject_threshold_epochs={mpc_reject_threshold_epochs} mpc_reject_threshold_learning_rate={mpc_reject_threshold_learning_rate} forward_select_logit_weight={} forward_select_logit_learning_rate={} forward_select_restore_override={forward_select_restore_override} finishing_select_bonus_weight={} finishing_selection_floor={} finishing_selection_max_regression={} finishing_selection_shot_drought_boost={finishing_selection_shot_drought_boost} finishing_selection_max_effective_floor={finishing_selection_max_effective_floor} forward_creation_selection_floor={forward_creation_selection_floor} forward_creation_selection_max_regression={forward_creation_selection_max_regression} forward_creation_min_quality={forward_creation_min_quality} forward_creation_min_completion={forward_creation_min_completion} forward_creation_min_forward_yards={forward_creation_min_forward_yards} forward_creation_bypass_min_quality={forward_creation_bypass_min_quality} forward_creation_bypass_min_completion={forward_creation_bypass_min_completion} planner_teacher_missed_opportunity={planner_teacher_missed_opportunity} planner_teacher_advantage_floor={planner_teacher_advantage_floor:.3} planner_teacher_advantage_max={planner_teacher_advantage_max:.3} planner_teacher_weight={planner_teacher_weight:.2} planner_teacher_min_score_share={planner_teacher_min_score_share:.3} planner_teacher_min_shot_quality={planner_teacher_min_shot_quality:.2} planner_teacher_min_forward_quality={planner_teacher_min_forward_quality:.2} planner_teacher_min_forward_completion={planner_teacher_min_forward_completion:.2} planner_teacher_max_samples_per_decision={planner_teacher_max_samples_per_decision} planner_teacher_include_same_pass_family={planner_teacher_include_same_pass_family} planner_teacher_same_pass_min_margin_share={planner_teacher_same_pass_min_margin_share:.3} chance_quality_reward={} chance_quality_composite={} chance_quality_k={} chance_quality_cap={} league_neural_mcts_enabled={} actor_critic_enabled={} lp_coupling_enabled={} target_standardization_enabled={} mc_critic_target_enabled={} neural_self_bootstrap_enabled={} maxa_bootstrap_enabled={} novelty_bonus_enabled={} fast_actor_reward_fallback_enabled={} pass_outcome_priority_learning_enabled={} forward_pass_climb_curriculum_enabled={} dp_bootstrap_enabled={} dp_bootstrap_horizon={} dp_bootstrap_sweeps={} mpc_tier2_enabled={} mpc_reconcile_enabled={} mpc_field_aware_enabled={} mpc_latent_objective_enabled={} local_mpc_enabled={} checkpoint_require_forward_pass_climb={} checkpoint_max_forward_pass_regression={} checkpoint_min_forward_pass_margin={} checkpoint_validate_games={} checkpoint_validate_min_forward_pass_margin={} checkpoint_validate_min_net_forward_pass_margin={} checkpoint_validate_min_goal_diff_margin={} frontier={} candidate_frontier={} archive={} step_archive_dir={} step_archive_buckets={:?}",
+        "league_train_started_at_utc={} games/opp={} minutes={} period_count={} weight_decay={} fresh_opp={} checkpoint_every={} max_rounds={} max_training_steps={} max_target_entries_per_side={} advancement_metric=completed_forward_passes net_metric=completed_forward_passes_minus_turnovers analytic_opponents={} uniform_elite_players={} seed_varied_skills={} hermetic_neural={} attack_canonical_features={} ball_zone_tactical_scale={} player_grid_xy_features={} policy_train_max_transitions_per_tick={} full_game_learning_enabled={} neural_learning_rate={} neural_optimizer_momentum={} neural_blend_mode={:?} neural_blend_lambda={} neural_authoritative_lambda={} neural_blend_candidates={} neural_blend_warmup_steps={} policy_entropy_coeff={} forward_select_logit_weight={} finishing_select_bonus_weight={} finishing_selection_floor={} finishing_selection_max_regression={} finishing_selection_shot_drought_boost={finishing_selection_shot_drought_boost} finishing_selection_max_effective_floor={finishing_selection_max_effective_floor} forward_creation_selection_floor={forward_creation_selection_floor} forward_creation_selection_max_regression={forward_creation_selection_max_regression} forward_creation_min_quality={forward_creation_min_quality} forward_creation_min_completion={forward_creation_min_completion} forward_creation_min_forward_yards={forward_creation_min_forward_yards} forward_creation_bypass_min_quality={forward_creation_bypass_min_quality} forward_creation_bypass_min_completion={forward_creation_bypass_min_completion} planner_teacher_missed_opportunity={planner_teacher_missed_opportunity} planner_teacher_advantage_floor={planner_teacher_advantage_floor:.3} planner_teacher_advantage_max={planner_teacher_advantage_max:.3} planner_teacher_weight={planner_teacher_weight:.2} planner_teacher_min_score_share={planner_teacher_min_score_share:.3} planner_teacher_min_shot_quality={planner_teacher_min_shot_quality:.2} planner_teacher_min_forward_quality={planner_teacher_min_forward_quality:.2} planner_teacher_min_forward_completion={planner_teacher_min_forward_completion:.2} planner_teacher_max_samples_per_decision={planner_teacher_max_samples_per_decision} planner_teacher_include_same_pass_family={planner_teacher_include_same_pass_family} planner_teacher_same_pass_min_margin_share={planner_teacher_same_pass_min_margin_share:.3} chance_quality_reward={} chance_quality_composite={} chance_quality_k={} chance_quality_cap={} league_neural_mcts_enabled={} actor_critic_enabled={} lp_coupling_enabled={} target_standardization_enabled={} mc_critic_target_enabled={} neural_self_bootstrap_enabled={} maxa_bootstrap_enabled={} novelty_bonus_enabled={} fast_actor_reward_fallback_enabled={} pass_outcome_priority_learning_enabled={} forward_pass_climb_curriculum_enabled={} dp_bootstrap_enabled={} dp_bootstrap_horizon={} dp_bootstrap_sweeps={} mpc_tier2_enabled={} mpc_reconcile_enabled={} mpc_field_aware_enabled={} mpc_latent_objective_enabled={} local_mpc_enabled={} checkpoint_require_forward_pass_climb={} checkpoint_max_forward_pass_regression={} checkpoint_min_forward_pass_margin={} checkpoint_validate_games={} checkpoint_validate_min_forward_pass_margin={} checkpoint_validate_min_net_forward_pass_margin={} checkpoint_validate_min_goal_diff_margin={} frontier={} candidate_frontier={} archive={} step_archive_dir={} step_archive_buckets={:?}",
         chrono_now(),
         games_per_opp,
         minutes,
@@ -1482,7 +1377,6 @@ fn main() {
         ball_zone_tactical_scale,
         player_grid_xy_features,
         policy_train_max_transitions_per_tick,
-        full_game_policy_max_samples,
         full_game_learning_enabled,
         neural_learning_rate,
         neural_optimizer_momentum,
@@ -1491,11 +1385,8 @@ fn main() {
         authoritative_lambda,
         neural_blend_candidates,
         neural_blend_warmup_steps,
-        policy_learning_rate,
-        mappo_epochs,
         policy_entropy_coeff,
         forward_select_logit_weight,
-        forward_select_logit_learning_rate,
         finishing_select_bonus_weight,
         finishing_selection_floor,
         finishing_selection_max_regression,
@@ -1547,13 +1438,6 @@ fn main() {
          marl_team_weight={marl_team_reward_weight:.4} marl_intermediate_weight={marl_intermediate_reward_weight:.2} \
          planner_teacher={planner_teacher_weight:.2} finishing_select={finishing_select_bonus_weight:.2}"
     );
-    println!(
-        "league_stability_anchors fixed_analytic_training_anchor={} analytic_anchor_gate={} analytic_anchor_validate_games={} analytic_anchor_max_goal_diff_regression={:.3}",
-        fixed_analytic_training_anchor,
-        analytic_anchor_gate,
-        analytic_anchor_validate_games,
-        analytic_anchor_max_goal_diff_regression,
-    );
 
     loop {
         round += 1;
@@ -1588,13 +1472,6 @@ fn main() {
             }
         }
 
-        // Keep one opponent distribution point stationary across every round. Fresh analytic
-        // genomes and archived champions provide diversity, but this deterministic engine anchor
-        // prevents the learner's ruler from moving along with the rest of the population.
-        if fixed_analytic_training_anchor && !self_play_ladder {
-            opponents.push(fixed_analytic_anchor());
-        }
-
         // SELF-PLAY LADDER: replace the league with just the CURRENT published champion (neural, so it
         // drives Team B through the same inference path and strengthens as the ladder climbs) plus one
         // ANALYTIC baseline — the challenger co-evolves against a tougher self AND stays grounded
@@ -1609,7 +1486,9 @@ fn main() {
                     champ
                 });
             }
-            pool.push(fixed_analytic_anchor());
+            let mut analytic_base = TeamBrain::fresh_with_seed(0xA5A5_0007, 100);
+            analytic_base.neural = None; // stripped net -> pure analytic engine (grounding opponent)
+            pool.push(analytic_base);
             opponents = pool;
         }
 
@@ -1652,7 +1531,7 @@ fn main() {
         let workers = league_worker_count(requested_workers, fixtures.len());
         if workers < requested_workers.clamp(1, fixtures.len().max(1)) {
             println!(
-                "league_parallelism_serialized_for_carried_mpc requested_workers={} active_workers={} fixtures={} opt_out_env=SOCCER_LEAGUE_CARRIED_MPC_SERIAL=0",
+                "league_parallelism_serialized_for_mpc_objective requested_workers={} active_workers={} fixtures={} opt_out_env=SOCCER_LEAGUE_MPC_OBJECTIVE_SERIAL=0",
                 requested_workers,
                 workers,
                 fixtures.len()
@@ -1862,7 +1741,7 @@ fn main() {
             mean_net_forward_pass_margin,
         );
         println!(
-            "league_kpi round={round} games={} advancement_metric=completed_forward_passes net_metric=completed_forward_passes_minus_turnovers forward_pass_margin_per_game={:.3} net_forward_pass_margin_per_game={:.3} objective_net_forward_passes={:.3} objective_net_forward_pass_margin={:.3} gd_total={} gd_per_game={:.2} goals_for={} goals_against={} shots_for={} shots_against={} sot_for={} sot_against={} shots_after_pass={} pass_completion={:.3} completed_passes={} forward_passes={} backward_passes={} dribble_beats={} assists={} crosses={} chain_gain_yards={:.1} chain_net_losses={} learned_policy_option_decisions={} learned_policy_multi_option_decisions={} learned_policy_legal_action_options={} learned_mpc_replans={} learned_mpc_replans_mpc={} learned_mpc_replans_option_score_safety={} learned_mpc_replans_neural_mcts={} learned_mpc_replan_rate={:.3} actor_last_batch_priority_samples={} actor_last_batch_teacher_candidates={} actor_last_batch_teacher_samples={} actor_last_batch_teacher_forward_samples={} actor_last_batch_teacher_weight_sum={:.3} actor_last_batch_teacher_advantage_sum={:.3}",
+            "league_kpi round={round} games={} advancement_metric=completed_forward_passes net_metric=completed_forward_passes_minus_turnovers forward_pass_margin_per_game={:.3} net_forward_pass_margin_per_game={:.3} objective_net_forward_passes={:.3} objective_net_forward_pass_margin={:.3} gd_total={} gd_per_game={:.2} goals_for={} goals_against={} shots_for={} shots_against={} sot_for={} sot_against={} shots_after_pass={} pass_completion={:.3} completed_passes={} forward_passes={} backward_passes={} dribble_beats={} assists={} crosses={} chain_gain_yards={:.1} chain_net_losses={} learned_policy_option_decisions={} learned_policy_multi_option_decisions={} learned_policy_legal_action_options={} learned_mpc_replans={} learned_mpc_replans_mpc={} learned_mpc_replans_option_score_safety={} learned_mpc_replans_neural_mcts={} learned_mpc_replan_rate={:.3}",
             round_kpis.games,
             mean_forward_pass_margin,
             mean_net_forward_pass_margin,
@@ -1894,26 +1773,19 @@ fn main() {
             round_kpis.learned_mpc_replans_option_score_safety,
             round_kpis.learned_mpc_replans_neural_mcts,
             learned_mpc_replan_rate,
-            round_kpis.policy_priority_samples,
-            round_kpis.planner_teacher_candidates,
-            round_kpis.planner_teacher_samples,
-            round_kpis.planner_teacher_forward_samples,
-            round_kpis.planner_teacher_weight_sum,
-            round_kpis.planner_teacher_advantage_sum,
         );
 
         // Temporal checkpoint into the league (growing diversity of past selves).
         if round % (checkpoint_every as u32) == 0 {
             if frontier.neural.is_some() {
                 let prior_best = best_checkpoint_net_forward_pass_margin;
-                let checkpoint_incumbent =
-                    load_brain(&frontier_path).unwrap_or_else(|| checkpoint_baseline.clone());
                 let validation = if checkpoint_validate_games > 0 {
+                    let checkpoint_incumbent =
+                        load_brain(&frontier_path).unwrap_or_else(|| checkpoint_baseline.clone());
                     let validation = play_checkpoint_validation(
                         &runner,
                         &frontier,
                         &checkpoint_incumbent,
-                        "incumbent",
                         round,
                         checkpoint_validate_games,
                     );
@@ -1932,42 +1804,6 @@ fn main() {
                 } else {
                     None
                 };
-                let (candidate_anchor_validation, incumbent_anchor_validation) =
-                    if analytic_anchor_validate_games > 0 {
-                        let anchor = fixed_analytic_anchor();
-                        let candidate = play_checkpoint_validation(
-                            &runner,
-                            &frontier,
-                            &anchor,
-                            "candidate_vs_analytic_anchor",
-                            round,
-                            analytic_anchor_validate_games,
-                        );
-                        let incumbent = play_checkpoint_validation(
-                            &runner,
-                            &checkpoint_incumbent,
-                            &anchor,
-                            "incumbent_vs_analytic_anchor",
-                            round,
-                            analytic_anchor_validate_games,
-                        );
-                        println!(
-                            "league_analytic_anchor_validation round={round} games={} candidate_gd_per_game={:.3} incumbent_gd_per_game={:.3} delta_gd_per_game={:.3}",
-                            analytic_anchor_validate_games,
-                            candidate.mean_goal_diff(),
-                            incumbent.mean_goal_diff(),
-                            candidate.mean_goal_diff() - incumbent.mean_goal_diff(),
-                        );
-                        (Some(candidate), Some(incumbent))
-                    } else {
-                        (None, None)
-                    };
-                let passes_analytic_anchor = analytic_anchor_non_regression_passes(
-                    candidate_anchor_validation.as_ref(),
-                    incumbent_anchor_validation.as_ref(),
-                    analytic_anchor_validate_games,
-                    analytic_anchor_max_goal_diff_regression,
-                );
                 let validation_forward_pass_margin =
                     validation.as_ref().map(|v| v.mean_forward_pass_margin());
                 let validation_net_forward_pass_margin = validation
@@ -2008,7 +1844,7 @@ fn main() {
                         println!(
                             "league_self_play_ladder round={round} verdict=PROMOTED bootstrap_gen0=true"
                         );
-                        passes_analytic_anchor
+                        true
                     } else {
                         // Ladder gate: promote iff the challenger beat the CURRENT champion by the
                         // goal-diff margin over the held-out head-to-head eval. Republishing the
@@ -2021,16 +1857,16 @@ fn main() {
                             self_play_promote_margin,
                             if ladder_promotes { "PROMOTED" } else { "held" }
                         );
-                        ladder_promotes && passes_analytic_anchor
+                        ladder_promotes
                     }
                 } else {
                     passes_forward_pass_climb
                         && ((passes_forward_pass_floor && passes_net_forward_pass_floor)
                             || passes_goal_diff_floor)
                         && passes_validation
-                        && passes_analytic_anchor
                 };
-                if promotes {
+                if promotes
+                {
                     let cp = format!(
                         "{}/league-r{:04}-{}.json",
                         archive_dir.trim_end_matches('/'),
@@ -2050,11 +1886,10 @@ fn main() {
                     );
                 } else {
                     println!(
-                        "league_checkpoint_held round={round} metric=completed_forward_passes net_metric=completed_forward_passes_minus_turnovers gate_forward_pass_margin_per_game={gate_forward_pass_margin:.3} gate_net_forward_pass_margin_per_game={gate_net_forward_pass_margin:.3} gate_goal_diff_margin_per_game={gate_goal_diff_margin:.3} train_forward_pass_margin_per_game={mean_forward_pass_margin:.3} train_net_forward_pass_margin_per_game={mean_net_forward_pass_margin:.3} best_net_forward_pass_margin_per_game={prior_best:.3} require_climb={} raw_min_margin={checkpoint_min_forward_pass_margin:.3} net_min_margin={checkpoint_validate_min_net_forward_pass_margin:.3} validation_min_goal_diff_margin={checkpoint_validate_min_goal_diff_margin:.3} validation_passed={passes_validation} validation_games={}/{} analytic_anchor_passed={passes_analytic_anchor} analytic_anchor_games={}",
+                        "league_checkpoint_held round={round} metric=completed_forward_passes net_metric=completed_forward_passes_minus_turnovers gate_forward_pass_margin_per_game={gate_forward_pass_margin:.3} gate_net_forward_pass_margin_per_game={gate_net_forward_pass_margin:.3} gate_goal_diff_margin_per_game={gate_goal_diff_margin:.3} train_forward_pass_margin_per_game={mean_forward_pass_margin:.3} train_net_forward_pass_margin_per_game={mean_net_forward_pass_margin:.3} best_net_forward_pass_margin_per_game={prior_best:.3} require_climb={} raw_min_margin={checkpoint_min_forward_pass_margin:.3} net_min_margin={checkpoint_validate_min_net_forward_pass_margin:.3} validation_min_goal_diff_margin={checkpoint_validate_min_goal_diff_margin:.3} validation_passed={passes_validation} validation_games={}/{}",
                         checkpoint_require_forward_pass_climb,
                         validation.as_ref().map(|validation| validation.games).unwrap_or(0),
                         checkpoint_validate_games,
-                        analytic_anchor_validate_games,
                     );
                 }
             }
@@ -2256,41 +2091,6 @@ mod tests {
     }
 
     #[test]
-    fn analytic_anchor_gate_rejects_absolute_goal_diff_regression() {
-        let mut candidate = LeagueRoundKpis::default();
-        candidate.add(LeagueMatchKpis {
-            goal_diff: 0,
-            ..LeagueMatchKpis::default()
-        });
-        let mut incumbent = LeagueRoundKpis::default();
-        incumbent.add(LeagueMatchKpis {
-            goal_diff: 1,
-            ..LeagueMatchKpis::default()
-        });
-
-        assert!(!analytic_anchor_non_regression_passes(
-            Some(&candidate),
-            Some(&incumbent),
-            1,
-            0.0,
-        ));
-        assert!(analytic_anchor_non_regression_passes(
-            Some(&candidate),
-            Some(&incumbent),
-            1,
-            1.0,
-        ));
-
-        candidate.goal_diff = 2;
-        assert!(analytic_anchor_non_regression_passes(
-            Some(&candidate),
-            Some(&incumbent),
-            1,
-            0.0,
-        ));
-    }
-
-    #[test]
     fn target_entry_rotation_flips_pitch_axes_and_home_away_phases() {
         assert_eq!(
             rotate_tactical_phase_180(TacticalPhase::HomeAttack),
@@ -2402,32 +2202,6 @@ mod tests {
     }
 
     #[test]
-    fn league_self_play_ladder_keeps_joint_actor_enabled_by_default() {
-        let _lock = env_lock().lock().unwrap();
-        let _guard = EnvVarGuard::clear("SOCCER_NEURAL_ACTOR_CRITIC");
-        let mut config = EngineMatchRunnerConfig::default();
-        config.base.neural_blend.actor_critic = false;
-
-        let enabled = apply_league_actor_config(&mut config);
-
-        assert!(enabled);
-        assert!(config.base.neural_blend.actor_critic);
-    }
-
-    #[test]
-    fn league_joint_actor_can_still_be_explicitly_disabled() {
-        let _lock = env_lock().lock().unwrap();
-        let _guard = EnvVarGuard::set("SOCCER_NEURAL_ACTOR_CRITIC", "0");
-        let mut config = EngineMatchRunnerConfig::default();
-        config.base.neural_blend.actor_critic = true;
-
-        let enabled = apply_league_actor_config(&mut config);
-
-        assert!(!enabled);
-        assert!(!config.base.neural_blend.actor_critic);
-    }
-
-    #[test]
     fn league_trainer_keeps_mpc_execution_stack_enabled() {
         let _lock = env_lock().lock().unwrap();
         let _guard = EnvVarGuard::clear("SOCCER_LEAGUE_NEURAL_MCTS_ENABLED");
@@ -2447,20 +2221,7 @@ mod tests {
     fn league_trainer_serializes_parallelism_for_carried_mpc_objective() {
         let _lock = env_lock().lock().unwrap();
         let _mpc_guard = EnvVarGuard::set("DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE", "1");
-        let _reject_guard = EnvVarGuard::set("DD_SOCCER_ENABLE_MPC_REJECT_THRESHOLD_MODEL", "0");
-        let _carried_guard = EnvVarGuard::clear("SOCCER_LEAGUE_CARRIED_MPC_SERIAL");
         let _serial_guard = EnvVarGuard::clear("SOCCER_LEAGUE_MPC_OBJECTIVE_SERIAL");
-
-        assert_eq!(league_worker_count(4, 8), 1);
-    }
-
-    #[test]
-    fn league_trainer_serializes_parallelism_for_carried_mpc_reject_threshold() {
-        let _lock = env_lock().lock().unwrap();
-        let _objective_guard = EnvVarGuard::set("DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE", "0");
-        let _reject_guard = EnvVarGuard::set("DD_SOCCER_ENABLE_MPC_REJECT_THRESHOLD_MODEL", "1");
-        let _carried_guard = EnvVarGuard::clear("SOCCER_LEAGUE_CARRIED_MPC_SERIAL");
-        let _legacy_guard = EnvVarGuard::clear("SOCCER_LEAGUE_MPC_OBJECTIVE_SERIAL");
 
         assert_eq!(league_worker_count(4, 8), 1);
     }
@@ -2469,8 +2230,6 @@ mod tests {
     fn league_trainer_allows_parallel_mpc_objective_opt_out() {
         let _lock = env_lock().lock().unwrap();
         let _mpc_guard = EnvVarGuard::set("DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE", "1");
-        let _reject_guard = EnvVarGuard::set("DD_SOCCER_ENABLE_MPC_REJECT_THRESHOLD_MODEL", "0");
-        let _carried_guard = EnvVarGuard::clear("SOCCER_LEAGUE_CARRIED_MPC_SERIAL");
         let _serial_guard = EnvVarGuard::set("SOCCER_LEAGUE_MPC_OBJECTIVE_SERIAL", "0");
 
         assert_eq!(league_worker_count(4, 8), 4);
