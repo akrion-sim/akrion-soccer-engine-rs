@@ -159,6 +159,43 @@ fn ball_resistance_after(speed: f32, altitude: f32) -> f32 {
 const PASS_SPEED: f32 = 18.0;
 const SHOT_SPEED: f32 = 24.0;
 const CLEAR_SPEED: f32 = 20.0;
+
+/// Drag-aware GROUND-pass launch speed (yd/s): the minimal speed so a ball launched along the
+/// ground covers horizontal `dist` under the 3-term `ball_resistance_after` drag and still arrives
+/// with collectable pace (does not decelerate to a stop short of the receiver's control radius).
+/// The physics-parity ball flight (grass resistance) decelerates a ground ball far faster than the
+/// legacy single-term friction the old fixed `PASS_SPEED` formula was tuned for, so we invert the
+/// drag numerically instead of using a fixed multiplier — keeping the realistic physics while
+/// restoring pass completion.
+fn pass_launch_speed(dist: f32) -> f32 {
+    let target = dist.clamp(1.5, FIELD_L);
+    // Arrive still rolling into the receiver's control radius (not dribble-slow, not a bullet).
+    let arrive_speed = 4.0f32;
+    let (mut lo, mut hi) = (6.0f32, 34.0f32);
+    for _ in 0..18 {
+        let v0 = 0.5 * (lo + hi);
+        let mut s = v0;
+        let mut x = 0.0f32;
+        let mut reached = false;
+        for _ in 0..240 {
+            x += s * DT;
+            if x >= target {
+                reached = true;
+                break;
+            }
+            s = ball_resistance_after(s, 0.0);
+            if s <= arrive_speed {
+                break; // decelerated to a crawl before covering the distance
+            }
+        }
+        if reached {
+            hi = v0; // enough pace — try a gentler launch
+        } else {
+            lo = v0; // stalled short — need more
+        }
+    }
+    0.5 * (lo + hi)
+}
 const CAPTURE_MAX_BALL_SPEED: f32 = 26.0;
 const KEEPER_REACH: f32 = 1.9; // keeper saves spam; well-placed shots still beat it
 #[allow(dead_code)]
