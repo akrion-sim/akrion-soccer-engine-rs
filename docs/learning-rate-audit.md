@@ -410,3 +410,10 @@ and 9,034 actor updates versus 1,641/9,828 for four epochs, while the forward sc
 bound `0.309`, goal difference `-2`, forward margin `+1`, and net-forward margin `-1`, with worse pass
 completion and turnovers. Two epochs is rejected; the league startup contract now prints the
 effective epoch count and the production default remains `4`.
+
+Raising league actor entropy from `0.04` to `0.08` initially looked directional: the 32-game field
+was `5W-24D-3L`, payoff `0.531`, Wilson lower bound `0.364`, with forward/net-forward margins
+`+6/+5`. The mandatory 64-game expansion reversed the win signal to `7W-42D-15L`, payoff `0.438`,
+Wilson lower bound `0.323`, goal difference `-8`. A small forward margin survived (`+4`, net `+1`),
+but pass completion fell by 11.4 percentage points and turnovers increased. Higher exploration is
+therefore rejected without another training seed; the league entropy default remains `0.04`.
