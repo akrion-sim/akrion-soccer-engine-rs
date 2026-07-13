@@ -818,7 +818,7 @@ function doRoll(nn){const p=curProbs();for(let k=0;k<nn;k++){let r=Math.random()
   drawTally();$('#tallyN').textContent=tally.reduce((a,b)=>a+b,0)+' samples';}
 function drawTally(){const e=D.decisions[curScen];const tot=(tally||[]).reduce((a,b)=>a+b,0);
   const emp=tally?tally.map(v=>tot?v/tot:0):D.actions.map(()=>0);
-  probBarsPair($('#tallyBars'),emp,emp,e.mask);}
+  probBarsPair($('#tallyBars'),emp,emp,e.mask,true);}
 
 /* ---------------- 3. DP (REAL) ---------------- */
 let dpN=0,dpTimer=null;
