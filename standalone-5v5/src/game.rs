@@ -2979,44 +2979,65 @@ mod tests {
         }
     }
 
-    /// MEASUREMENT probe: flavor-split (ground vs lofted) scripted pass completion.
+    /// MEASUREMENT probe: flavor-split (clear-lane ground / blocked-lane
+    /// ground / lofted) scripted pass completion.
     #[test]
     #[ignore]
     fn pass_flavor_probe() {
         let mut rng = Rng::new(4242);
-        let (mut g_att, mut g_cmp, mut a_att, mut a_cmp) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
-        let mut last_aerial = false;
+        let mut att = [0.0f32; 3]; // [clear ground, blocked ground, loft]
+        let mut cmp = [0.0f32; 3];
+        let mut last = 0usize;
         for _ in 0..100 {
             let mut w = World::new();
             if rng.f01() < 0.5 {
                 w.kickoff(Team::B);
             }
             for _ in 0..STEPS {
+                // classify the launch lane BEFORE the tick executes it
+                let lane_blocked = match w.owner {
+                    Some(o) if o.idx != GK => {
+                        let acts = w.scripted_actions(o.team);
+                        let a = acts[o.idx] % NA;
+                        if (A_PASS_A..=A_PASS_C).contains(&a) {
+                            let cands = w.pass_candidates(o.team, o.idx);
+                            cands[a - A_PASS_A].map(|(ti, _)| {
+                                let me = players(o.team, &w)[o.idx].pos;
+                                let tp = players(o.team, &w)[ti].pos;
+                                w.lane_clearness(o.team, me, tp) < 0.55
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
                 let act_a = w.scripted_actions(Team::A);
                 let act_b = w.scripted_actions(Team::B);
                 w.step(&act_a, &act_b, &mut rng);
                 if w.ev_pass_attempt_a {
-                    last_aerial = w.ball_aerial;
-                    if last_aerial {
-                        a_att += 1.0;
+                    last = if w.ball_aerial {
+                        2
+                    } else if lane_blocked == Some(true) {
+                        1
                     } else {
-                        g_att += 1.0;
-                    }
+                        0
+                    };
+                    att[last] += 1.0;
                 }
                 if w.ev_pass_completed_a {
-                    if last_aerial {
-                        a_cmp += 1.0;
-                    } else {
-                        g_cmp += 1.0;
-                    }
+                    cmp[last] += 1.0;
                 }
             }
         }
-        println!(
-            "ground: att={g_att} cmp={g_cmp} ({:.1}%)  lofted: att={a_att} cmp={a_cmp} ({:.1}%)",
-            100.0 * g_cmp / g_att.max(1.0),
-            100.0 * a_cmp / a_att.max(1.0)
-        );
+        for (k, name) in ["clear ground", "blocked ground", "loft"].iter().enumerate() {
+            println!(
+                "{name:>14}: att={:5.0} cmp={:5.0} ({:.1}%)",
+                att[k],
+                cmp[k],
+                100.0 * cmp[k] / att[k].max(1.0)
+            );
+        }
     }
 
     fn stays() -> [usize; N] {
