@@ -43218,6 +43218,7 @@ impl SoccerPolicyRoleHead {
         samples: &[SoccerPolicySample],
         mappo_clip_epsilon: Option<f64>,
     ) -> (usize, f64) {
+        let policy_learning_rate = soccer_policy_learning_rate();
         let role = self.role_group.as_player_role();
         let prepared: Vec<(&SoccerPolicySample, f64)> = samples
             .iter()
@@ -43243,7 +43244,7 @@ impl SoccerPolicyRoleHead {
                 sample.action_index,
                 weighted_advantage,
                 soccer_policy_entropy_coeff(),
-                SOCCER_POLICY_LEARNING_RATE,
+                policy_learning_rate,
                 SOCCER_POLICY_GRAD_CLIP_NORM,
             );
             if result.applied && result.loss.is_finite() {
@@ -43272,7 +43273,7 @@ impl SoccerPolicyRoleHead {
                     local_action_index,
                     weighted_advantage,
                     soccer_policy_entropy_coeff(),
-                    SOCCER_POLICY_LEARNING_RATE,
+                    policy_learning_rate,
                     SOCCER_POLICY_GRAD_CLIP_NORM,
                 );
                 if result.applied && result.loss.is_finite() {
@@ -43450,6 +43451,15 @@ fn soccer_forward_select_logit_learning_rate() -> f64 {
         SOCCER_POLICY_LEARNING_RATE,
         0.0,
         SOCCER_FORWARD_SELECT_LOGIT_LEARNING_RATE_MAX,
+    )
+}
+
+fn soccer_policy_learning_rate() -> f64 {
+    soccer_planner_teacher_env_f64(
+        "DD_SOCCER_POLICY_LEARNING_RATE",
+        SOCCER_POLICY_LEARNING_RATE,
+        0.0,
+        MAX_SOCCER_NEURAL_LEARNING_RATE,
     )
 }
 
@@ -43641,6 +43651,16 @@ mod soccer_policy_actor_capacity_tests {
         let _rate = set_test_env_var("DD_SOCCER_FORWARD_SELECT_LOGIT_LEARNING_RATE", "0.0075");
 
         assert_eq!(soccer_forward_select_logit_learning_rate(), 0.0075);
+    }
+
+    #[test]
+    fn joint_actor_learning_rate_is_tunable_without_changing_the_default() {
+        let _lock = env_lock();
+        let _default = clear_test_env_var("DD_SOCCER_POLICY_LEARNING_RATE");
+        assert_eq!(soccer_policy_learning_rate(), SOCCER_POLICY_LEARNING_RATE);
+
+        std::env::set_var("DD_SOCCER_POLICY_LEARNING_RATE", "0.0125");
+        assert_eq!(soccer_policy_learning_rate(), 0.0125);
     }
 
     #[test]
@@ -44064,6 +44084,7 @@ impl SoccerSkillPolicyHead {
         // Stride a balanced subsample of `balanced_n` across the bucket so every head trains on an
         // equal number of samples (no skill dominates the others' separate losses).
         let stride = (bucket.len() / balanced_n).max(1);
+        let policy_learning_rate = soccer_policy_learning_rate();
         let mut loss_sum = 0.0;
         let mut applied = 0usize;
         let mut taken = 0usize;
@@ -44077,7 +44098,7 @@ impl SoccerSkillPolicyHead {
                     local,
                     weighted_advantage,
                     soccer_policy_entropy_coeff(),
-                    SOCCER_POLICY_LEARNING_RATE,
+                    policy_learning_rate,
                     SOCCER_POLICY_GRAD_CLIP_NORM,
                 );
                 if result.applied && result.loss.is_finite() {
@@ -44360,6 +44381,7 @@ impl SoccerKeeperPolicyHead {
     /// the keeper-vocabulary action index and the transition reward (which now includes the keeper
     /// save reward and concede penalty) as the advantage.
     fn train(&mut self, samples: &[SoccerKeeperPolicySample]) {
+        let policy_learning_rate = soccer_policy_learning_rate();
         let mut loss_sum = 0.0;
         let mut applied = 0usize;
         for sample in samples {
@@ -44371,7 +44393,7 @@ impl SoccerKeeperPolicyHead {
                 sample.action_index,
                 sample.advantage,
                 soccer_policy_entropy_coeff(),
-                SOCCER_POLICY_LEARNING_RATE,
+                policy_learning_rate,
                 SOCCER_POLICY_GRAD_CLIP_NORM,
             );
             if result.applied && result.loss.is_finite() {

@@ -379,3 +379,14 @@ the scalar at `1.9631` instead of `2.8611`. Direct 32-game frozen comparison aga
 actor was `5W-23D-4L`, payoff `0.516`, Wilson lower bound `0.350`, but regressed both forward and
 net-forward completions by `4`. The lower step therefore produced safer lateral circulation rather
 than a climb. It is rejected as a default; the independent knob remains for bounded future searches.
+
+The role, skill-specialist, and goalkeeper policy heads now likewise share a tunable
+`DD_SOCCER_POLICY_LEARNING_RATE` (default `0.05`), so actor stability can be varied without changing
+critic or world-model rates. On the same `E16060` fixtures, `0.01` was not merely a slower version of
+the default: it retained far more samples and reached 46,252 actor updates, versus 9,828 at `0.05`,
+while the forward scalar saturated at `8.0`. Its frozen comparison against the default actor was
+`4W-23D-5L`, payoff `0.484`, Wilson lower bound `0.322`, and forward margin `-1`. Pairing the `0.01`
+actor rate with the `0.005` scalar rate still produced 48,474 updates and ended at scalar `4.2985`;
+its 32-game result was `3W-26D-3L`, payoff `0.500`, Wilson lower bound `0.336`, forward margin `+1`,
+but net-forward margin `-3`. Both treatments are rejected. More update applications and completed
+passes again meant lateral circulation, not climb; the production actor rate remains `0.05`.
