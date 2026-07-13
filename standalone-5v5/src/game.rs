@@ -3421,7 +3421,7 @@ mod tests {
             goals_b += w.goals_b;
         }
         println!(
-            "scripted tally: goals A {goals_a} / B {goals_b}, saves on A-shots {saves_a} / on B-shots {saves_b}"
+            "scripted tally: goals A {goals_a} / B {goals_b}, saves on A-shots {saves_a} / on B-shots {saves_b}, shot attempts A {shots_a} / B {shots_b}"
         );
         assert!(goals_a + goals_b > 0, "keeper must not be unbeatable");
         assert!(saves_a + saves_b > 0, "keeper must make some saves");
