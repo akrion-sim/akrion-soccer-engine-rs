@@ -159,43 +159,6 @@ fn ball_resistance_after(speed: f32, altitude: f32) -> f32 {
 const PASS_SPEED: f32 = 18.0;
 const SHOT_SPEED: f32 = 24.0;
 const CLEAR_SPEED: f32 = 20.0;
-
-/// Drag-aware GROUND-pass launch speed (yd/s): the minimal speed so a ball launched along the
-/// ground covers horizontal `dist` under the 3-term `ball_resistance_after` drag and still arrives
-/// with collectable pace (does not decelerate to a stop short of the receiver's control radius).
-/// The physics-parity ball flight (grass resistance) decelerates a ground ball far faster than the
-/// legacy single-term friction the old fixed `PASS_SPEED` formula was tuned for, so we invert the
-/// drag numerically instead of using a fixed multiplier — keeping the realistic physics while
-/// restoring pass completion.
-fn pass_launch_speed(dist: f32) -> f32 {
-    let target = dist.clamp(1.5, FIELD_L);
-    // Arrive still rolling into the receiver's control radius (not dribble-slow, not a bullet).
-    let arrive_speed = 4.0f32;
-    let (mut lo, mut hi) = (6.0f32, 34.0f32);
-    for _ in 0..18 {
-        let v0 = 0.5 * (lo + hi);
-        let mut s = v0;
-        let mut x = 0.0f32;
-        let mut reached = false;
-        for _ in 0..240 {
-            x += s * DT;
-            if x >= target {
-                reached = true;
-                break;
-            }
-            s = ball_resistance_after(s, 0.0);
-            if s <= arrive_speed {
-                break; // decelerated to a crawl before covering the distance
-            }
-        }
-        if reached {
-            hi = v0; // enough pace — try a gentler launch
-        } else {
-            lo = v0; // stalled short — need more
-        }
-    }
-    0.5 * (lo + hi)
-}
 const CAPTURE_MAX_BALL_SPEED: f32 = 26.0;
 const KEEPER_REACH: f32 = 1.9; // keeper saves spam; well-placed shots still beat it
 #[allow(dead_code)]
@@ -238,18 +201,26 @@ pub struct V2 {
     pub x: f32,
     pub y: f32,
 }
+// AXIS_FLIP_SKIP_START — this block is hand-written for the x=width/y=length convention;
+// the .x/.y access-swap script must NOT touch it.
 impl V2 {
-    pub fn new(x: f32, y: f32) -> Self {
-        V2 { x, y }
+    // Callers construct as new(<length>, <width>) by the historical convention. Under the
+    // x=width / y=length axis flip we store width in field `x` and length in field `y`, so
+    // `new` swaps: first arg -> field y (length), second arg -> field x (width). Every call
+    // site is thus flipped in one place, with no edits to the ~100 construction sites.
+    pub fn new(a: f32, b: f32) -> Self {
+        V2 { x: b, y: a }
     }
+    // The vector ops are component-wise on the STORED fields (correct regardless of which
+    // axis each field denotes), so they use struct literals to bypass the swapping `new`.
     pub fn add(self, o: V2) -> V2 {
-        V2::new(self.x + o.x, self.y + o.y)
+        V2 { x: self.x + o.x, y: self.y + o.y }
     }
     pub fn sub(self, o: V2) -> V2 {
-        V2::new(self.x - o.x, self.y - o.y)
+        V2 { x: self.x - o.x, y: self.y - o.y }
     }
     pub fn scale(self, s: f32) -> V2 {
-        V2::new(self.x * s, self.y * s)
+        V2 { x: self.x * s, y: self.y * s }
     }
     pub fn len(self) -> f32 {
         (self.x * self.x + self.y * self.y).sqrt()
@@ -257,12 +228,13 @@ impl V2 {
     pub fn unit(self) -> V2 {
         let l = self.len();
         if l < 1e-6 {
-            V2::new(0.0, 0.0)
+            V2 { x: 0.0, y: 0.0 }
         } else {
-            V2::new(self.x / l, self.y / l)
+            V2 { x: self.x / l, y: self.y / l }
         }
     }
 }
+// AXIS_FLIP_SKIP_END
 
 // ---- 11v11-parity physics helpers ------------------------------------------
 // All constants mirror src/des/general/soccer.rs so the small-sided sim uses the
@@ -1690,12 +1662,8 @@ impl World {
                         self.ev_return_pass_a = is_return;
                     }
                     self.pending_curl = self.kick_curl(team, me, tp);
-                    // Lead the pass to where the receiver is running, and solve the launch speed
-                    // against the actual 3-term drag so the ball ARRIVES at that lead point with
-                    // collectable pace (the physics-parity grass drag makes the old fixed formula
-                    // fall short — the root cause of the pass-completion regression).
-                    let pass_dist = lead.sub(me).len();
-                    let pspeed = pass_launch_speed(pass_dist);
+                    let pass_dist = tp.sub(me).len();
+                    let pspeed = PASS_SPEED * (0.85 + 0.35 * (pass_dist / FIELD_L).clamp(0.0, 1.0));
                     Some((owner, lead.sub(me), pspeed, true))
                 } else {
                     // no valid target: dribble forward instead
