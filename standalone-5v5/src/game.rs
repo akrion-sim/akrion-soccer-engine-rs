@@ -1295,8 +1295,30 @@ impl World {
 
     fn goal_kick(&mut self, to: Team) {
         let gx = if to == Team::A { 6.0 } else { FIELD_L - 6.0 };
-        self.ball = V2::new(gx, FIELD_W / 2.0);
+        self.restart_possession(to, V2::new(gx, FIELD_W / 2.0));
+    }
+
+    /// Touchline throw-in: `to` restarts with the ball at the crossing point `at`.
+    fn throw_in(&mut self, to: Team, at: V2) {
+        self.restart_possession(to, at);
+    }
+
+    /// Corner kick: the attacking team `to` restarts from the corner of the goal line at
+    /// `goal_x`, on whichever side (y=0 / y=FIELD_W) the ball went dead near `out_y`.
+    fn corner_kick(&mut self, to: Team, goal_x: f32, out_y: f32) {
+        let corner_y = if out_y < FIELD_W / 2.0 { 0.5 } else { FIELD_W - 0.5 };
+        self.restart_possession(to, V2::new(goal_x, corner_y));
+    }
+
+    /// Shared dead-ball restart: park the ball at `at`, hand possession to `to`'s nearest
+    /// player, reset the ball's flight/streak state. (Goal-kick / throw-in / corner all funnel here.)
+    fn restart_possession(&mut self, to: Team, at: V2) {
+        self.ball = at;
         self.ball_vel = V2::default();
+        self.ball_curl = V2::default();
+        self.ball_aerial = false;
+        self.ball_z = 0.0;
+        self.ball_taloft = 0.0;
         let idx = self.nearest_player(to, self.ball).0;
         self.owner = Some(Owner { team: to, idx });
         self.last_touch = Some(to);
