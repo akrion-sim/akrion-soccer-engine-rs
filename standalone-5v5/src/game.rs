@@ -463,6 +463,7 @@ pub struct World {
     // Symmetric goal rules for Team B (so the opponent must build up too):
     b_pass_streak: u32, // completed B passes in the current possession
     b_shot_flag: bool,  // free ball came from a VALID B shot (2 passes + final third)
+    b_shot_origin: V2,  // where that B shot was struck from (save-model lane + distance)
 }
 
 fn players(team: Team, w: &World) -> &[Player; N] {
