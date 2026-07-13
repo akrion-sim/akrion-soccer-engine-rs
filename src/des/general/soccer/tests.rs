@@ -100048,5 +100048,49 @@ fn mpc_reject_threshold_pipeline_collects_and_trains_end_to_end() {
             );
         }
     }
+
+    // A TRAINED head (>= the min-steps gate) IS consumed and overrides the analytic
+    // seed. Regress a head toward a distinctive high bar (0.70) for these contexts —
+    // well above any analytic bar (base 0.18 + at most ANALYTIC_CONTEXT_SWING) — so a
+    // seam value near 0.70 can only mean the learned head, not the seed, was used.
+    {
+        let target_bar = 0.70_f64;
+        let training_rows: Vec<(MpcRejectThresholdInputs, f64)> = {
+            let snap = WorldSnapshot::from_match(&seam_sim);
+            carriers
+                .iter()
+                .filter_map(|&pid| {
+                    let player = snap.players.iter().find(|p| p.id == pid)?;
+                    let inputs = snap.build_mpc_reject_threshold_inputs(
+                        player,
+                        MpcRejectFamily::Pass,
+                        base,
+                    )?;
+                    Some((inputs, target_bar))
+                })
+                .collect()
+        };
+        assert!(!training_rows.is_empty(), "need carrier contexts to train on");
+        let mut head = MpcRejectThresholdHead::new(31);
+        let mut guard = 0;
+        while head.training_steps() < MPC_REJECT_THRESHOLD_HEAD_MIN_TRAINING_STEPS && guard < 5000 {
+            head.train(&training_rows, 0.1);
+            guard += 1;
+        }
+        assert!(
+            head.training_steps() >= MPC_REJECT_THRESHOLD_HEAD_MIN_TRAINING_STEPS,
+            "head must cross the consumption gate"
+        );
+        seam_sim.set_mpc_reject_threshold_head(head);
+        let snap = WorldSnapshot::from_match(&seam_sim);
+        for &pid in &carriers {
+            let bar = snap.learned_mpc_reject_threshold(pid, MpcRejectFamily::Pass, base);
+            assert!(
+                bar > 0.55,
+                "a trained head regressed toward {target_bar} must be consumed at the seam \
+                 (got {bar}); no analytic seed can reach here"
+            );
+        }
+    }
     std::env::remove_var("DD_SOCCER_ENABLE_MPC_REJECT_THRESHOLD_MODEL");
 }
