@@ -1501,7 +1501,16 @@ impl World {
             let d = rotate(dir.unit(), ang);
             self.ball_vel = d.scale(speed);
             let kp = self.player(kicker).pos;
-            self.ball = kp.add(d.scale(1.0));
+            // First touch of the kick puts the ball ~1 yd off the boot — but
+            // never TELEPORTS it over a line: a kick from the byline used to
+            // spawn the ball already out of play (instant dead-ball turnover,
+            // ~0.6/game), which poisoned corner-trapped passes. Clamp the
+            // spawn on the pitch; the FLIGHT may still legitimately carry out.
+            let spawn = kp.add(d.scale(1.0));
+            self.ball = V2::new(
+                spawn.x.clamp(0.2, FIELD_L - 0.2),
+                spawn.y.clamp(0.2, FIELD_W - 0.2),
+            );
             self.owner = None;
             self.last_touch = Some(kicker.team);
             self.last_kicker = Some(kicker);
