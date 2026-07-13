@@ -890,9 +890,26 @@ impl World {
         }
         let mut bpos = self.ball;
         let mut bvel = self.ball_vel;
+        // Predict with the REAL flight model (3-term drag + the live loft arc)
+        // so anticipation stays consistent with where the ball actually goes.
+        let mut taloft = self.ball_taloft;
+        let hang = hang_time(self.ball_apex);
         for step in 1..40 {
             bpos = bpos.add(bvel.scale(DT));
-            bvel = bvel.scale(BALL_FRICTION);
+            let z = if self.ball_aerial {
+                taloft += DT;
+                if taloft >= hang {
+                    0.0
+                } else {
+                    altitude_at(self.ball_apex, taloft)
+                }
+            } else {
+                0.0
+            };
+            let sp = bvel.len();
+            if sp > 1e-6 {
+                bvel = bvel.scale(ball_resistance_after(sp, z) / sp);
+            }
             let reach = PLAYER_SPEED * (step as f32 * DT) + CONTROL_RADIUS;
             if from.sub(bpos).len() <= reach {
                 return bpos; // can meet the ball here
