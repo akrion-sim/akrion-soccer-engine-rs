@@ -1441,6 +1441,9 @@ pub fn evaluate_scripted_vs_scripted(games: usize, rng: &mut Rng) -> (f32, f32, 
 /// games. Both teams run the identical scripted controller; the `ev_pass_*`
 /// events track Team A, which is representative because play is symmetric.
 /// Returns (attempts/game, completions/game, completion fraction).
+/// Consumed by the (ignored) `scripted_pass_probe` test — a measurement
+/// harness, not part of the training loop.
+#[allow(dead_code)]
 pub fn scripted_pass_stats(games: usize, rng: &mut Rng) -> (f32, f32, f32) {
     let (mut att, mut cmp) = (0.0f32, 0.0f32);
     for _ in 0..games {
