@@ -14,14 +14,16 @@ pub const FINAL_THIRD_X: f32 = FIELD_L * 2.0 / 3.0; // attacking-third boundary 
 pub const SHOOT_X: f32 = FIELD_L / 2.0; // A may shoot once in the OPPONENT'S HALF (not just the final third)
 pub const N: usize = 5; // players per team (index 0 == goalkeeper)
 pub const GK: usize = 0; // goalkeeper index; controlled by a fixed rule, not the policy
-pub const DT: f32 = 0.05; // seconds per decision tick -> 20 Hz sim (real-time 20 fps)
+                         // Tick rate matches the 11v11 engine exactly (DEFAULT_DT_SECONDS = 1/15) so every
+                         // dt-derived physics constant ported from it transfers 1:1 with no re-derivation.
+pub const DT: f32 = 1.0 / 15.0; // seconds per decision tick -> 15 Hz sim (11v11 parity)
 pub const HZ: f32 = 1.0 / DT; // ticks per second (for real-time viewer playback)
-pub const STEPS: usize = 600; // ticks per TRAINING episode (~30s at 20 Hz)
+pub const STEPS: usize = 450; // ticks per TRAINING episode (~30s at 15 Hz)
 
 // The RECORDED viz match (match_before/after.json) runs longer than a training
 // episode so the before/after playback shows more football (incl. kickoffs after
 // goals). Training dynamics are unaffected — rollouts still use STEPS.
-pub const RECORD_STEPS: usize = 1800; // ~90s at 20 Hz
+pub const RECORD_STEPS: usize = 1350; // ~90s at 15 Hz
 
 const PLAYER_SPEED: f32 = 6.5; // legacy reference speed (~= run_medium); kept for keeper reach/util
 
@@ -100,8 +102,60 @@ const AERIAL_CONTROL_SPACE: f32 = 3.6; // a SCOOPED (aerial) pass needs the rece
 const CURL_MIN_DIST: f32 = 20.0; // passes/shots longer than this can be given curl (spin)
 const CURL_ACCEL: f32 = 6.0; // lateral curl acceleration on a long ball (bends around a defender)
 const TACKLE_RADIUS: f32 = 1.6;
-const TACKLE_PROB: f32 = 0.12; // per-tick; retuned for 20 Hz to keep same per-second rate
-const BALL_FRICTION: f32 = 0.965; // per-tick decay retuned for 20 Hz (same per-second decay)
+const TACKLE_PROB: f32 = 0.16; // per-tick; retuned for 15 Hz to keep same per-second rate (~2.4/s)
+#[allow(dead_code)]
+const BALL_FRICTION: f32 = 0.965; // legacy single-term decay (superseded by ball_resistance_after)
+                                  // ---- 11v11-parity ball flight (soccer.rs constants) ----
+const BALL_DRAG_PER_TICK: f32 = 0.028; // DEFAULT_BALL_DRAG_PER_TICK (linear, half-life vs ref dt=1/15)
+const BALL_AIR_RESISTANCE: f32 = 0.0085; // DEFAULT_BALL_AIR_RESISTANCE (quadratic)
+const BALL_GRASS_RESISTANCE: f32 = 0.96; // DEFAULT_BALL_GRASS_RESISTANCE_YPS2 (ground contact only)
+const BALL_STOP_SPEED: f32 = 0.55; // DEFAULT_BALL_STOP_SPEED_YPS (snap to rest below this)
+const AERIAL_FLIGHT_DRAG_RELIEF: f32 = 0.88; // airborne linear+air relief
+const BALL_ROLLING_ALT: f32 = 0.06; // BALL_ROLLING_ALTITUDE_YARDS (at/below = grounded)
+                                    // Standing reach + jump for an airborne interception (CONTROL_* reach constants).
+const CONTROL_STANDING_REACH: f32 = 1.6;
+const CONTROL_AERIAL_JUMP_REACH: f32 = 2.2;
+const LOW_BALL_INTERCEPT_FLOOR: f32 = 2.0;
+
+/// Peak height (yd) of a lofted pass over horizontal distance `d` (lofted_pass_apex_yards).
+fn lofted_apex_yds(d: f32) -> f32 {
+    (3.05 + (d - 15.0) * 0.11).clamp(1.6, 9.0)
+}
+/// Hang time (s) of a projectile that reaches `apex`: T = 2·√(2·apex/g).
+fn hang_time(apex: f32) -> f32 {
+    2.0 * (2.0 * apex / GRAVITY_YPS2).sqrt()
+}
+/// Closed-form altitude (yd) at `t` seconds into a loft with peak `apex`:
+/// z(t) = ½·g·t·(T−t), clamped to [0, hang]. No z-velocity, no bounce (soccer.rs).
+fn altitude_at(apex: f32, t: f32) -> f32 {
+    let hang = hang_time(apex);
+    let t = t.clamp(0.0, hang);
+    (0.5 * GRAVITY_YPS2 * t * (hang - t)).max(0.0)
+}
+/// Three-term ball drag (soccer.rs `ball_resistance_after`): linear + quadratic air + grass
+/// (ground only), with airborne relief and a low-speed stop-snap. Returns the new speed (yd/s).
+fn ball_resistance_after(speed: f32, altitude: f32) -> f32 {
+    let rolling = if altitude <= BALL_ROLLING_ALT {
+        1.0
+    } else {
+        (1.0 - (altitude - BALL_ROLLING_ALT) / 0.18).clamp(0.0, 1.0)
+    };
+    let relief = 1.0 - (1.0 - rolling) * AERIAL_FLIGHT_DRAG_RELIEF;
+    // linear: geometric per-tick decay, half-life-corrected to ref dt = 1/15 (== DT here)
+    let lin_ret = (1.0 - BALL_DRAG_PER_TICK).powf(DT / (1.0 / 15.0));
+    let lin_loss = speed * (1.0 - lin_ret) * relief;
+    let air_loss = BALL_AIR_RESISTANCE.min(0.10) * speed * speed * DT * relief;
+    let low = (1.0 - (speed / 12.0).min(1.0)) * 0.62;
+    let shear = ((speed - 12.0) / 24.0).clamp(0.0, 1.0).powi(2) * 0.42;
+    let skid = ((speed - 28.0) / 24.0).clamp(0.0, 1.0) * 0.22;
+    let grass = BALL_GRASS_RESISTANCE.min(5.0) * (1.0 + low + shear + skid) * rolling;
+    let s = (speed - (lin_loss + air_loss + grass * DT)).max(0.0);
+    if s > 0.0 && s < BALL_STOP_SPEED {
+        0.0
+    } else {
+        s
+    }
+}
 const PASS_SPEED: f32 = 18.0;
 const SHOT_SPEED: f32 = 24.0;
 const CLEAR_SPEED: f32 = 20.0;
@@ -133,32 +187,39 @@ pub const A_STAY: usize = 13;
 pub const A_GET_OPEN: usize = 14;
 pub const PASS_TARGET_SLOTS: usize = N - 2; // outfield teammates minus the possessor
 
-// Full relational field vector (per-agent actor observation): 9 self/global +
+// Full relational field vector (per-agent actor observation): 11 self/global +
 // 5 ball + 5 goals + 6 role/cues + (N-1)*5 teammates + N*5 opponents + 1 bias.
-pub const OBS_DIM: usize = 71;
+pub const OBS_DIM: usize = 73;
 
 // Centralized-critic GLOBAL state (MAPPO / CTDE): the whole field in a single
 // canonical (Team-A attack) frame — every player's pos+vel + ball pos+vel +
-// possession, shared by all agents. 2N*4 players + 4 ball + 3 possession + 1 bias.
-pub const GLOBAL_DIM: usize = 2 * N * 4 + 4 + 3 + 1; // = 40 + 4 + 3 + 1 = 48
+// energy + possession, shared by all agents. 2N*6 players + 4 ball + 3 possession + 1 bias.
+pub const GLOBAL_DIM: usize = 2 * N * 6 + 4 + 3 + 1; // = 60 + 4 + 3 + 1 = 68
 
 #[derive(Clone, Copy, Default, Debug)]
 pub struct V2 {
     pub x: f32,
     pub y: f32,
 }
+// the .x/.y access-swap script must NOT touch it.
 impl V2 {
-    pub fn new(x: f32, y: f32) -> Self {
-        V2 { x, y }
+    // Callers construct as new(<length>, <width>) by the historical convention. Under the
+    // x=width / y=length axis flip we store width in field `x` and length in field `y`, so
+    // `new` swaps: first arg -> field y (length), second arg -> field x (width). Every call
+    // site is thus flipped in one place, with no edits to the ~100 construction sites.
+    pub fn new(a: f32, b: f32) -> Self {
+        V2 { x: b, y: a }
     }
+    // The vector ops are component-wise on the STORED fields (correct regardless of which
+    // axis each field denotes), so they use struct literals to bypass the swapping `new`.
     pub fn add(self, o: V2) -> V2 {
-        V2::new(self.x + o.x, self.y + o.y)
+        V2 { x: self.x + o.x, y: self.y + o.y }
     }
     pub fn sub(self, o: V2) -> V2 {
-        V2::new(self.x - o.x, self.y - o.y)
+        V2 { x: self.x - o.x, y: self.y - o.y }
     }
     pub fn scale(self, s: f32) -> V2 {
-        V2::new(self.x * s, self.y * s)
+        V2 { x: self.x * s, y: self.y * s }
     }
     pub fn len(self) -> f32 {
         (self.x * self.x + self.y * self.y).sqrt()
@@ -166,11 +227,103 @@ impl V2 {
     pub fn unit(self) -> V2 {
         let l = self.len();
         if l < 1e-6 {
-            V2::new(0.0, 0.0)
+            V2 { x: 0.0, y: 0.0 }
         } else {
-            V2::new(self.x / l, self.y / l)
+            V2 { x: self.x / l, y: self.y / l }
         }
     }
+}
+
+// ---- 11v11-parity physics helpers ------------------------------------------
+// All constants mirror src/des/general/soccer.rs so the small-sided sim uses the
+// SAME physical models as the full engine (only the pitch stays 5-a-side sized).
+pub const METERS_PER_YARD: f32 = 0.9144;
+pub const KG_PER_POUND: f32 = 0.453_592_37;
+#[allow(dead_code)]
+pub const GRAVITY_YPS2: f32 = 9.81 / METERS_PER_YARD; // 10.7284 yd/s^2
+pub const PLAYER_MAX_SPEED_YPS: f32 = 12.45; // SOCCER_PHYSICS_PLAYER_MAX_SPEED_YPS
+pub const PLAYER_MAX_ACCEL_YPS2: f32 = 28.0; // SOCCER_PHYSICS_PLAYER_MAX_ACCEL_YPS2
+
+/// mph -> yards/second (YARDS_PER_MILE=1760, SECONDS_PER_HOUR=3600).
+pub fn mph_to_yps(mph: f32) -> f32 {
+    mph * 1760.0 / 3600.0
+}
+/// Map a 1..10 skill score to [0,1] (soccer.rs ability01). A value already in
+/// [0,1) is treated as 1+9x. Clamped to the 1..10 band first.
+pub fn ability01(score: f32) -> f32 {
+    let s = if score < 1.0 {
+        1.0 + 9.0 * score.clamp(0.0, 1.0)
+    } else {
+        score
+    };
+    ((s.clamp(1.0, 10.0)) - 1.0) / 9.0
+}
+
+/// Per-player physical attributes. Homogeneous by default (every field = 5.5 ->
+/// ability01 = 0.5) so learning balance is unchanged until we choose to vary them.
+#[derive(Clone, Copy, Debug)]
+pub struct Skills {
+    pub top_speed: f32,
+    pub acceleration: f32,
+    pub stamina: f32,
+    pub first_touch: f32,
+    pub aerial_duel: f32,
+    pub strength: f32,
+    pub weight_lbs: f32,
+}
+impl Default for Skills {
+    fn default() -> Self {
+        // Mid outfield pro: all skills 5.5 (ability01 0.5), ~165 lb (~74.8 kg).
+        Skills {
+            top_speed: 5.5,
+            acceleration: 5.5,
+            stamina: 5.5,
+            first_touch: 5.5,
+            aerial_duel: 5.5,
+            strength: 5.5,
+            weight_lbs: 165.0,
+        }
+    }
+}
+impl Skills {
+    pub fn mass_kg(&self) -> f32 {
+        self.weight_lbs * KG_PER_POUND
+    }
+    /// Aerobic capacity proxy shared by the energy model (soccer.rs `cardio`).
+    pub fn cardio(&self) -> f32 {
+        ability01(self.stamina)
+    }
+    /// 1.0-gait REFERENCE top speed (yd/s). Actual flat-out ground speed = this ×
+    /// the Sprint gait multiplier (1.12). Mirrors player_top_speed_yps.
+    pub fn top_speed_ref_yps(&self) -> f32 {
+        let per = (mph_to_yps(22.0)
+            + ability01(self.top_speed) * (mph_to_yps(25.0) - mph_to_yps(22.0)))
+            / 1.12;
+        let cap = mph_to_yps(25.0) / 1.12; // 10.913
+        per.min(cap)
+    }
+    /// Max acceleration (yd/s^2) from the acceleration skill (soccer.rs 5.2..9.3).
+    pub fn accel_yps2(&self) -> f32 {
+        5.2 + ability01(self.acceleration) * 4.1
+    }
+    /// Critical Power (W) — the aerobic sustainable ceiling (13..19 W/kg).
+    pub fn critical_power_w(&self) -> f32 {
+        (13.0 + self.cardio() * 6.0) * self.mass_kg()
+    }
+    /// Anaerobic work capacity W'max (J) — the sprint battery (280..600 J/kg).
+    pub fn anaerobic_capacity_j(&self) -> f32 {
+        ((280.0 + self.cardio() * 320.0) * self.mass_kg()).max(1.0)
+    }
+}
+
+/// di Prampero metabolic power demand (W) for locomotion at `speed_yps` with a
+/// forward acceleration `accel_fwd_yps2`. Mirrors metabolic_power_demand_w.
+pub fn metabolic_power_demand_w(mass_kg: f32, speed_yps: f32, accel_fwd_yps2: f32) -> f32 {
+    let v_mps = speed_yps.clamp(0.0, PLAYER_MAX_SPEED_YPS) * METERS_PER_YARD;
+    let a_mps2 = (accel_fwd_yps2.abs() * METERS_PER_YARD).min(3.5); // ACCEL_MAGNITUDE_CAP_MPS2
+    let run_power = mass_kg * 3.6 * v_mps; // RUN_ENERGY_COST_J_PER_KG_M = 3.6
+    let accel_power = mass_kg * a_mps2 * v_mps * 0.3; // ACCEL_POWER_COEFF = 0.3
+    run_power + accel_power
 }
 
 fn teammate_spacing_score(distance: f32) -> f32 {
@@ -188,8 +341,70 @@ fn teammate_spacing_score(distance: f32) -> f32 {
 #[derive(Clone, Copy)]
 pub struct Player {
     pub pos: V2,
-    pub vel: V2,     // actual velocity — ramps toward des_vel at a bounded rate
-    pub des_vel: V2, // desired velocity (the chosen gear/direction this tick)
+    pub vel: V2,        // actual velocity — ramps toward des_vel at a bounded rate
+    pub des_vel: V2,    // desired velocity (the chosen gear/direction this tick)
+    pub skills: Skills, // per-player physical attributes (default = homogeneous mid pro)
+    // Two-channel energy (11v11 parity): fatigue = slow aerobic residue [0,1]
+    // (0 fresh); anaerobic_load = W'-battery depletion [0,1] (0 full).
+    pub fatigue: f32,
+    pub anaerobic_load: f32,
+}
+impl Default for Player {
+    fn default() -> Self {
+        Player {
+            pos: V2::default(),
+            vel: V2::default(),
+            des_vel: V2::default(),
+            skills: Skills::default(),
+            fatigue: 0.0,
+            anaerobic_load: 0.0,
+        }
+    }
+}
+impl Player {
+    pub fn energy_output_factor(&self) -> f32 {
+        (1.0 - 0.22 * self.fatigue.clamp(0.0, 1.0) - 0.18 * self.anaerobic_load.clamp(0.0, 1.0))
+            .clamp(0.62, 1.0)
+    }
+
+    fn effective_speed_cap_yps(&self) -> f32 {
+        (self.skills.top_speed_ref_yps() * 1.12 * self.energy_output_factor())
+            .clamp(0.5, PLAYER_MAX_SPEED_YPS)
+    }
+
+    fn effective_accel_yps2(&self) -> f32 {
+        player_accel()
+            .min(self.skills.accel_yps2())
+            .min(PLAYER_MAX_ACCEL_YPS2)
+            .max(0.1)
+            * self.energy_output_factor()
+    }
+
+    fn update_energy(&mut self, previous_velocity: V2) {
+        let speed = self.vel.len().clamp(0.0, PLAYER_MAX_SPEED_YPS);
+        let accel = self.vel.sub(previous_velocity).len() / DT.max(1e-6);
+        let mass = self.skills.mass_kg().max(1.0);
+        let critical_power = self.skills.critical_power_w().max(1.0);
+        let anaerobic_capacity = self.skills.anaerobic_capacity_j().max(1.0);
+        let power = metabolic_power_demand_w(mass, speed, accel);
+
+        if power > critical_power {
+            let excess = power - critical_power;
+            let anaerobic_delta = (excess * DT / anaerobic_capacity).max(0.0);
+            self.anaerobic_load = (self.anaerobic_load + anaerobic_delta).clamp(0.0, 1.0);
+            self.fatigue = (self.fatigue
+                + (excess / critical_power).max(0.0) * DT / 180.0
+                + anaerobic_delta * 0.02)
+                .clamp(0.0, 1.0);
+        } else {
+            let aerobic_surplus = (critical_power - power).max(0.0);
+            let recovery = aerobic_surplus * DT / anaerobic_capacity * 0.55;
+            self.anaerobic_load = (self.anaerobic_load - recovery).clamp(0.0, 1.0);
+            if power < critical_power * 0.65 {
+                self.fatigue = (self.fatigue - DT / 420.0).clamp(0.0, 1.0);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -204,7 +419,9 @@ impl Team {
             Team::B => Team::A,
         }
     }
-    /// Attack direction on the x-axis: A attacks +x (goal at FIELD_L), B attacks -x.
+    /// Attack direction sign on the LENGTH (y) axis: A attacks +y (goal at y=FIELD_L),
+    /// B attacks -y (goal at y=0). Matches the 11v11 `attack_dir()` convention: x=width,
+    /// y=length. (Name kept as `sx` for churn reasons; it is the length-axis attack sign.)
     fn sx(self) -> f32 {
         match self {
             Team::A => 1.0,
@@ -234,12 +451,18 @@ pub struct World {
     pub b: [Player; N],
     pub ball: V2,
     pub ball_vel: V2,
-    pub ball_aerial: bool, // in-flight ball is a lofted/scooped pass (over ground defenders)
-    pub air_ticks: u32,    // ticks the scooped ball stays airborne before it lands
-    pub ball_curl: V2,     // lateral curl (spin) accel on a long (>20yd) pass/shot
-    pending_curl: V2,      // scratch: curl for the kick launching this tick
-    pending_aerial: bool,  // scratch: the pass launched this tick is a scoop
-    pending_air_ticks: u32, // scratch: airborne duration for the launching scoop
+    pub ball_aerial: bool, // in-flight ball is airborne (altitude above the rolling threshold)
+    pub air_ticks: u32, // legacy scoop-duration counter (kept for compat; flight now driven by z)
+    // 11v11-parity z-axis: altitude is a scalar (the ball's Vec2 stays horizontal), driven by a
+    // closed-form projectile parabola in time — no z-velocity, no bounce (matches soccer.rs).
+    pub ball_z: f32,           // altitude (yards) above the pitch
+    ball_apex: f32,            // peak height of the current loft
+    ball_taloft: f32,          // seconds since the current loft was launched
+    pub ball_curl: V2,         // lateral curl (spin) accel on a long (>20yd) pass/shot
+    pending_curl: V2,          // scratch: curl for the kick launching this tick
+    pending_aerial: bool,      // scratch: the pass launched this tick is a loft
+    pending_apex: f32,         // scratch: apex of the loft launching this tick
+    pending_aerial_speed: f32, // scratch: land-on-target horizontal launch speed for the loft
     pub owner: Option<Owner>,
     pub last_touch: Option<Team>,
     last_kicker: Option<Owner>,
@@ -292,24 +515,20 @@ fn players(team: Team, w: &World) -> &[Player; N] {
 impl World {
     pub fn new() -> Self {
         let mut w = World {
-            a: [Player {
-                pos: V2::default(),
-                vel: V2::default(),
-                des_vel: V2::default(),
-            }; N],
-            b: [Player {
-                pos: V2::default(),
-                vel: V2::default(),
-                des_vel: V2::default(),
-            }; N],
+            a: [Player::default(); N],
+            b: [Player::default(); N],
             ball: V2::new(FIELD_L / 2.0, FIELD_W / 2.0),
             ball_vel: V2::default(),
             ball_aerial: false,
             air_ticks: 0,
+            ball_z: 0.0,
+            ball_apex: 0.0,
+            ball_taloft: 0.0,
             ball_curl: V2::default(),
             pending_curl: V2::default(),
             pending_aerial: false,
-            pending_air_ticks: 0,
+            pending_apex: 0.0,
+            pending_aerial_speed: 0.0,
             owner: None,
             last_touch: None,
             last_kicker: None,
@@ -432,12 +651,12 @@ impl World {
             return V2::default();
         }
         let dir = seg.unit();
-        let perp = V2::new(-dir.y, dir.x);
+        let perp = V2::new(-dir.x, dir.y);
         let mid = from.add(seg.scale(0.5));
         let (oi, _) = self.nearest_opponent(team, mid);
         let opp = players(team.other(), self)[oi].pos;
         let rel = opp.sub(mid);
-        let side = if rel.x * perp.x + rel.y * perp.y > 0.0 {
+        let side = if rel.y * perp.y + rel.x * perp.x > 0.0 {
             -1.0
         } else {
             1.0
@@ -460,7 +679,7 @@ impl World {
                 continue; // don't pass to self or (as an outlet) the keeper
             }
             let tp = ps[i].pos;
-            let fwd = (tp.x - from.x) * sx; // positive = ahead
+            let fwd = (tp.y - from.y) * sx; // positive = ahead
             let (_, opp_d) = self.nearest_opponent(team, tp); // openness
             let dist = tp.sub(from).len();
             if dist < 2.0 {
@@ -555,7 +774,7 @@ impl World {
         if team != Team::A {
             return;
         }
-        let fwd = dir.x * sx;
+        let fwd = dir.y * sx;
         if fwd > 0.3 {
             self.ev_dribble_fwd_a = true;
         } else if fwd > -0.3 {
@@ -595,11 +814,11 @@ impl World {
                 continue;
             }
             let rel = opp[i].pos.sub(from);
-            let t = rel.x * u.x + rel.y * u.y;
+            let t = rel.y * u.y + rel.x * u.x;
             if t <= 0.5 || t >= dist {
                 continue;
             }
-            let perp = (rel.x * (-u.y) + rel.y * u.x).abs();
+            let perp = (rel.y * (-u.x) + rel.x * u.y).abs();
             let clear = (perp / 3.0).min(1.0);
             if clear < min_clear {
                 min_clear = clear;
@@ -621,12 +840,12 @@ impl World {
         let mut min_clear = 1.0f32;
         for i in 0..N {
             let rel = opp[i].pos.sub(from);
-            let t = rel.x * u.x + rel.y * u.y; // projection along shot
+            let t = rel.y * u.y + rel.x * u.x; // projection along shot
             if t <= 0.5 || t >= dist {
                 continue;
             }
             // perpendicular distance from lane
-            let perp = (rel.x * (-u.y) + rel.y * u.x).abs();
+            let perp = (rel.y * (-u.x) + rel.x * u.y).abs();
             let clear = (perp / 3.0).min(1.0); // within 3m blocks the lane
             if clear < min_clear {
                 min_clear = clear;
@@ -648,8 +867,8 @@ impl World {
     pub fn observe(&self, team: Team, idx: usize) -> [f32; OBS_DIM] {
         let sx = team.sx();
         let me = players(team, self)[idx];
-        let mir = |p: V2| -> V2 { V2::new(if sx > 0.0 { p.x } else { FIELD_L - p.x }, p.y) };
-        let mirv = |v: V2| -> V2 { V2::new(v.x * sx, v.y) };
+        let mir = |p: V2| -> V2 { V2::new(if sx > 0.0 { p.y } else { FIELD_L - p.y }, p.x) };
+        let mirv = |v: V2| -> V2 { V2::new(v.y * sx, v.x) };
         let nx = FIELD_L;
         let ny = FIELD_W;
         let nv = 10.0;
@@ -707,29 +926,31 @@ impl World {
         });
 
         let mut f: Vec<f32> = Vec::with_capacity(OBS_DIM);
-        // self / global (9)
+        // self / global (11)
         f.push(has_ball as u8 as f32);
         f.push(team_ball as u8 as f32);
         f.push(opp_ball as u8 as f32);
         f.push(free_ball as u8 as f32);
-        f.push(mp.x / nx * 2.0 - 1.0);
-        f.push(mp.y / ny * 2.0 - 1.0);
-        f.push(mvel.x / nv);
+        f.push(mp.y / nx * 2.0 - 1.0);
+        f.push(mp.x / ny * 2.0 - 1.0);
         f.push(mvel.y / nv);
+        f.push(mvel.x / nv);
+        f.push(me.fatigue.clamp(0.0, 1.0));
+        f.push(me.anaerobic_load.clamp(0.0, 1.0));
         // 2-pass rule state: how many passes made (0, 0.5, 1.0 = can shoot)
         f.push((self.pass_streak_a.min(2) as f32) / 2.0);
         // ball (5)
-        f.push(ball_rel.x / nx);
-        f.push(ball_rel.y / ny);
+        f.push(ball_rel.y / nx);
+        f.push(ball_rel.x / ny);
         f.push(ball_rel.len() / nx);
-        f.push(bvel.x / nv);
         f.push(bvel.y / nv);
+        f.push(bvel.x / nv);
         // goals (5)
-        f.push((goal.x - mp.x) / nx);
-        f.push((goal.y - mp.y) / ny);
+        f.push((goal.y - mp.y) / nx);
+        f.push((goal.x - mp.x) / ny);
         f.push(goal.sub(mp).len() / nx);
-        f.push((own.x - mp.x) / nx);
-        f.push((own.y - mp.y) / ny);
+        f.push((own.y - mp.y) / nx);
+        f.push((own.x - mp.x) / ny);
         // role + action cues (6)
         f.push(is_closest);
         f.push(ball_rank);
@@ -742,10 +963,10 @@ impl World {
             let p = players(team, self)[k];
             let rp = mir(p.pos).sub(mp);
             let rv = mirv(p.vel);
-            f.push(rp.x / nx);
-            f.push(rp.y / ny);
-            f.push(rv.x / nv);
+            f.push(rp.y / nx);
+            f.push(rp.x / ny);
             f.push(rv.y / nv);
+            f.push(rv.x / nv);
             f.push(rp.len() / nx);
         }
         // ALL opponents, nearest-first (N = 5 × 5 = 25)
@@ -753,10 +974,10 @@ impl World {
             let p = opp[k];
             let rp = mir(p.pos).sub(mp);
             let rv = mirv(p.vel);
-            f.push(rp.x / nx);
-            f.push(rp.y / ny);
-            f.push(rv.x / nv);
+            f.push(rp.y / nx);
+            f.push(rp.x / ny);
             f.push(rv.y / nv);
+            f.push(rv.x / nv);
             f.push(rp.len() / nx);
         }
         f.push(1.0); // bias
@@ -789,13 +1010,13 @@ impl World {
             // possession — forces build-up play, not solo dribble-and-shoot.
             // OPPONENT-HALF RULE (Team A): may shoot anywhere in the opponent's half.
             if team == Team::A {
-                let x = players(team, self)[idx].pos.x;
+                let x = players(team, self)[idx].pos.y;
                 if self.pass_streak_a < 2 || x < SHOOT_X {
                     m[A_SHOOT] = false;
                 }
             } else {
                 // Symmetric shooting gate for the scripted/noisy opponent.
-                let x = players(team, self)[idx].pos.x;
+                let x = players(team, self)[idx].pos.y;
                 if self.b_pass_streak < 2 || x > FIELD_L - SHOOT_X {
                     m[A_SHOOT] = false;
                 }
@@ -910,7 +1131,7 @@ impl World {
         self.shot_was_rapid_a = false;
         self.shoot_cooldown_a = self.shoot_cooldown_a.saturating_sub(1);
 
-        let ball_x_before = self.ball.x;
+        let ball_x_before = self.ball.y;
 
         // 1. Desired velocities + kicks. Kicks are resolved after movement so a
         //    player dribbles then releases within the same tick cleanly.
@@ -969,11 +1190,18 @@ impl World {
             self.last_kicker = Some(kicker);
             self.kick_timer = 6;
             self.ball_aerial = is_pass && self.pending_aerial;
-            self.air_ticks = if self.ball_aerial {
-                self.pending_air_ticks
+            if self.ball_aerial {
+                // Launch the loft: reset the arc and use the land-on-target horizontal speed.
+                self.ball_apex = self.pending_apex;
+                self.ball_taloft = 0.0;
+                self.ball_z = 0.0;
+                self.ball_vel = d.scale(self.pending_aerial_speed);
             } else {
-                0
-            };
+                self.ball_apex = 0.0;
+                self.ball_taloft = 0.0;
+                self.ball_z = 0.0;
+            }
+            self.air_ticks = 0;
             self.pending_aerial = false;
             self.ball_curl = self.pending_curl;
             self.pending_curl = V2::default();
@@ -984,8 +1212,8 @@ impl World {
                 self.pending_pass = self.intended_receiver;
                 if kicker.team == Team::A {
                     self.pending_passer = kicker.idx as i32;
-                    // A attacks +x, so ball.x IS attack-frame forward progress.
-                    self.pass_kick_x = self.player(kicker).pos.x;
+                    // A attacks +x, so ball.y IS attack-frame forward progress.
+                    self.pass_kick_x = self.player(kicker).pos.y;
                 }
             } else if kicker.team == Team::A {
                 self.reset_a_pass_memory();
@@ -1013,40 +1241,53 @@ impl World {
             if self.ball_vel.len() > 4.0 {
                 self.ball_vel = self.ball_vel.add(self.ball_curl.scale(DT));
             }
-            self.ball_vel = self.ball_vel.scale(BALL_FRICTION);
+            // Three-term drag (linear + air + grass), attenuated while airborne.
+            let sp = self.ball_vel.len();
+            if sp > 1e-6 {
+                let ns = ball_resistance_after(sp, self.ball_z);
+                self.ball_vel = self.ball_vel.scale(ns / sp);
+            }
+            // Altitude: closed-form parabola in time; lands (z=0) when the hang time elapses.
             if self.ball_aerial {
-                self.air_ticks = self.air_ticks.saturating_sub(1);
-                if self.air_ticks == 0 {
-                    self.ball_aerial = false; // the scoop lands -> a normal ground ball
+                self.ball_taloft += DT;
+                self.ball_z = altitude_at(self.ball_apex, self.ball_taloft);
+                if self.ball_taloft >= hang_time(self.ball_apex) {
+                    self.ball_aerial = false; // the loft lands -> a normal ground ball
+                    self.ball_z = 0.0;
                 }
+            } else {
+                self.ball_z = 0.0;
             }
 
-            // reflect off side-lines (y walls) to keep play flowing
-            if self.ball.y < 0.0 {
-                self.ball.y = -self.ball.y;
-                self.ball_vel.y = -self.ball_vel.y;
-            } else if self.ball.y > FIELD_W {
-                self.ball.y = 2.0 * FIELD_W - self.ball.y;
-                self.ball_vel.y = -self.ball_vel.y;
-            }
-
+            // Out of bounds is a DEAD-BALL RESTART (11v11 parity), not a reflecting wall:
+            // touchline -> throw-in to the team that didn't put it out; goal-line (not a
+            // goal) -> corner if a DEFENDER put it out, else a goal-kick.
             let gy0 = FIELD_W / 2.0 - GOAL_HALF;
             let gy1 = FIELD_W / 2.0 + GOAL_HALF;
-            if self.ball.x >= FIELD_L {
-                if self.ball.y > gy0 && self.ball.y < gy1 && self.a_shot_flag {
-                    // valid goal: came from an A shot, which required 2 passes
+            let last = self.last_touch;
+            if self.ball.x < 0.0 || self.ball.x > FIELD_W {
+                // touchline: award to the other team at the crossing point.
+                let edge_y = if self.ball.x < 0.0 { 0.0 } else { FIELD_W };
+                let to = last.map(Team::other).unwrap_or(Team::A);
+                let at = V2::new(self.ball.y.clamp(1.0, FIELD_L - 1.0), edge_y);
+                self.throw_in(to, at);
+            } else if self.ball.y >= FIELD_L {
+                if self.ball.x > gy0 && self.ball.x < gy1 && self.a_shot_flag {
                     self.goals_a += 1;
                     self.ev_goal_a = true;
                     self.kickoff(Team::B);
+                } else if last == Some(Team::B) {
+                    self.corner_kick(Team::A, FIELD_L, self.ball.x); // defender B conceded a corner
                 } else {
-                    self.goal_kick(Team::B); // B restarts from its own line
+                    self.goal_kick(Team::B); // A put it out -> B goal-kick
                 }
-            } else if self.ball.x <= 0.0 {
-                if self.ball.y > gy0 && self.ball.y < gy1 && self.b_shot_flag {
-                    // symmetric: B goal only counts from a valid (2-pass, final-third) shot
+            } else if self.ball.y <= 0.0 {
+                if self.ball.x > gy0 && self.ball.x < gy1 && self.b_shot_flag {
                     self.goals_b += 1;
                     self.ev_goal_b = true;
                     self.kickoff(Team::A);
+                } else if last == Some(Team::A) {
+                    self.corner_kick(Team::B, 0.0, self.ball.x); // defender A conceded a corner
                 } else {
                     self.goal_kick(Team::A);
                 }
@@ -1063,8 +1304,30 @@ impl World {
 
     fn goal_kick(&mut self, to: Team) {
         let gx = if to == Team::A { 6.0 } else { FIELD_L - 6.0 };
-        self.ball = V2::new(gx, FIELD_W / 2.0);
+        self.restart_possession(to, V2::new(gx, FIELD_W / 2.0));
+    }
+
+    /// Touchline throw-in: `to` restarts with the ball at the crossing point `at`.
+    fn throw_in(&mut self, to: Team, at: V2) {
+        self.restart_possession(to, at);
+    }
+
+    /// Corner kick: the attacking team `to` restarts from the corner of the goal line at
+    /// `goal_x`, on whichever side (y=0 / y=FIELD_W) the ball went dead near `out_y`.
+    fn corner_kick(&mut self, to: Team, goal_x: f32, out_y: f32) {
+        let corner_y = if out_y < FIELD_W / 2.0 { 0.5 } else { FIELD_W - 0.5 };
+        self.restart_possession(to, V2::new(goal_x, corner_y));
+    }
+
+    /// Shared dead-ball restart: park the ball at `at`, hand possession to `to`'s nearest
+    /// player, reset the ball's flight/streak state. (Goal-kick / throw-in / corner all funnel here.)
+    fn restart_possession(&mut self, to: Team, at: V2) {
+        self.ball = at;
         self.ball_vel = V2::default();
+        self.ball_curl = V2::default();
+        self.ball_aerial = false;
+        self.ball_z = 0.0;
+        self.ball_taloft = 0.0;
         let idx = self.nearest_player(to, self.ball).0;
         self.owner = Some(Owner { team: to, idx });
         self.last_touch = Some(to);
@@ -1099,10 +1362,11 @@ impl World {
         // anticipation edge, so passes actually CONNECT instead of going loose —
         // unless an opponent is genuinely closer and intercepts.
         if best.is_none() && !ball_fast {
-            // A SCOOPED ball in the air is over ground players: only the intended
-            // receiver can bring it down, and only if they are open enough to
-            // control it (aerial touch needs space). Otherwise it flies on / lands.
-            let aerial = self.ball_aerial && self.air_ticks > 0;
+            // An airborne ball flies OVER ground players: a non-receiver can only touch it if
+            // its altitude is within their standing/jump reach (soccer.rs height gate). The
+            // intended receiver brings it down at the landing, and only if open enough to
+            // control a still-high ball (aerial touch needs space); otherwise it lands loose.
+            let airborne = self.ball_z > BALL_ROLLING_ALT;
             let mut best_eff = f32::INFINITY;
             for team in [Team::A, Team::B] {
                 for i in 0..N {
@@ -1118,22 +1382,32 @@ impl World {
                     }
                     let is_recv =
                         matches!(self.pending_pass, Some(r) if r.team == team && r.idx == i);
-                    if aerial {
-                        if !is_recv {
-                            continue; // ground players can't reach an airborne ball
+                    let receiver = players(team, self)[i];
+                    let touch = ability01(receiver.skills.first_touch);
+                    let aerial_skill = ability01(receiver.skills.aerial_duel);
+                    if airborne {
+                        // Reach test: standing 1.6yd + jump (aerial skill) up to 3.8yd, floor 2.0yd.
+                        let reach = (CONTROL_STANDING_REACH
+                            + aerial_skill * CONTROL_AERIAL_JUMP_REACH)
+                            .max(LOW_BALL_INTERCEPT_FLOOR);
+                        if self.ball_z > reach {
+                            continue; // ball is above this player's reach — flies over
                         }
-                        let (_, recv_open) =
-                            self.nearest_opponent(team, players(team, self)[i].pos);
-                        if recv_open < AERIAL_CONTROL_SPACE {
-                            continue; // receiver not open enough to control the scoop yet
+                        if is_recv {
+                            let (_, recv_open) = self.nearest_opponent(team, receiver.pos);
+                            let space_needed = AERIAL_CONTROL_SPACE * (1.08 - 0.20 * aerial_skill);
+                            if recv_open < space_needed {
+                                continue; // receiver not open enough to control the loft yet
+                            }
                         }
                     }
+                    let touch_radius_bonus = (touch - 0.5) * 0.55;
                     let radius = if is_recv {
                         RECEIVE_RADIUS
                     } else {
                         CONTROL_RADIUS
-                    };
-                    let d = players(team, self)[i].pos.sub(self.ball).len();
+                    } + touch_radius_bonus;
+                    let d = receiver.pos.sub(self.ball).len();
                     if d >= radius {
                         continue;
                     }
@@ -1150,6 +1424,8 @@ impl World {
             self.owner = Some(o);
             self.ball_aerial = false; // controlled -> no longer airborne
             self.air_ticks = 0;
+            self.ball_z = 0.0;
+            self.ball_taloft = 0.0;
             self.ball_curl = V2::default();
             self.a_shot_flag = false; // shot resolved into possession
             self.b_shot_flag = false;
@@ -1158,7 +1434,7 @@ impl World {
                 if pp.team == Team::A {
                     if o.team == Team::A {
                         self.ev_pass_completed_a = true; // A pass reached an A player
-                        self.last_pass_gain_a = self.ball.x - self.pass_kick_x;
+                        self.last_pass_gain_a = self.ball.y - self.pass_kick_x;
                         self.pass_streak_a += 1; // toward the 2-pass rule
                                                  // consecutive FORWARD passes (progressive build-up)
                         if self.last_pass_gain_a > 3.0 {
@@ -1220,7 +1496,11 @@ impl World {
         };
         let op = self.player(o).pos;
         let (oi, od) = self.nearest_opponent(o.team, op);
-        if od < TACKLE_RADIUS && rng.f01() < TACKLE_PROB {
+        let tackler = players(o.team.other(), self)[oi];
+        let carrier = self.player(o);
+        let strength_edge = ability01(tackler.skills.strength) - ability01(carrier.skills.strength);
+        let tackle_prob = (TACKLE_PROB * (1.0 + 0.35 * strength_edge)).clamp(0.04, 0.32);
+        if od < TACKLE_RADIUS && rng.f01() < tackle_prob {
             let stealer = Owner {
                 team: o.team.other(),
                 idx: oi,
@@ -1282,14 +1562,14 @@ impl World {
                 } else {
                     // symmetric: B's goal only counts if B built up (2 passes) and
                     // shoots from B's own final third (B attacks -x -> small x).
-                    self.b_shot_flag = self.b_pass_streak >= 2 && me.x < FIELD_L - SHOOT_X;
+                    self.b_shot_flag = self.b_pass_streak >= 2 && me.y < FIELD_L - SHOOT_X;
                     self.b_pass_streak = 0;
                 }
                 self.set_vel(team, idx, V2::default());
                 // MPC-lite finishing: enumerate aim points across the mouth and
                 // pick the one that maximizes clearance from the keeper and any
                 // defender in the shot lane — i.e. shoot to the open corner.
-                let goal_x = goal.x;
+                let goal_x = goal.y;
                 let cy = FIELD_W / 2.0;
                 let gk = players(team.other(), self)[GK].pos;
                 let margin = GOAL_HALF - 0.35;
@@ -1321,7 +1601,7 @@ impl World {
                     // wide pot-shot is near-zero. Distance dominates (squared decay),
                     // shot ANGLE (central vs wide) modulates.
                     let d = goal.sub(me).len();
-                    let lateral = (me.y - FIELD_W / 2.0).abs();
+                    let lateral = (me.x - FIELD_W / 2.0).abs();
                     let dist_f = (1.0 - d / 26.0).clamp(0.0, 1.0);
                     let angle_f = (1.0 - lateral / (FIELD_W / 2.0)).clamp(0.0, 1.0);
                     self.last_shot_xg_a = dist_f * dist_f * (0.4 + 0.6 * angle_f);
@@ -1346,15 +1626,20 @@ impl World {
                     // receiver is open (checked at reception) — else it lands loose.
                     let ground_lane = self.lane_clearness(team, me, tp);
                     if ground_lane < 0.55 {
+                        // Loft OVER the blocked ground lane: a closed-form projectile whose apex
+                        // grows with distance, launched at the land-on-target horizontal speed so
+                        // it comes down at the receiver as the arc completes (soccer.rs parity).
+                        let d = tp.sub(me).len();
                         self.pending_aerial = true;
-                        let flight = (tp.sub(me).len() / (PASS_SPEED * DT)).round() as u32;
-                        self.pending_air_ticks = flight.clamp(3, 30);
+                        self.pending_apex = lofted_apex_yds(d);
+                        self.pending_aerial_speed =
+                            (d / hang_time(self.pending_apex).max(0.35)) * 1.08;
                     }
                     self.set_vel(team, idx, V2::default());
                     if team == Team::A {
                         self.ev_pass_attempt_a = true;
                         // classify by forward progress toward the attacked goal
-                        let fwd = (tp.x - me.x) * sx;
+                        let fwd = (tp.y - me.y) * sx;
                         self.pass_dir_a = if fwd > 2.0 {
                             1
                         } else if fwd < -2.0 {
@@ -1368,7 +1653,7 @@ impl World {
                         let is_return = idx as i32 == self.lp_to && ti as i32 == self.lp_from;
                         if is_return {
                             if self.return_streak_a == 0 {
-                                self.return_start_x = self.ball.x; // sequence begins here
+                                self.return_start_x = self.ball.y; // sequence begins here
                             }
                             self.return_streak_a += 1;
                         } else {
@@ -1441,7 +1726,7 @@ impl World {
                 self.set_vel(team, GK, V2::default());
                 if team == Team::A {
                     self.ev_pass_attempt_a = true;
-                    let fwd = (tp.x - me.x) * sx;
+                    let fwd = (tp.y - me.y) * sx;
                     self.pass_dir_a = if fwd > 2.0 {
                         1
                     } else if fwd < -2.0 {
@@ -1465,12 +1750,12 @@ impl World {
         let to_ball = self.ball.sub(c);
         let out = (to_ball.len() * 0.35).min(6.0);
         let mut target = c.add(to_ball.unit().scale(out));
-        target.x = if sx > 0.0 {
-            target.x.clamp(0.5, 8.0)
+        target.y = if sx > 0.0 {
+            target.y.clamp(0.5, 8.0)
         } else {
-            target.x.clamp(FIELD_L - 8.0, FIELD_L - 0.5)
+            target.y.clamp(FIELD_L - 8.0, FIELD_L - 0.5)
         };
-        target.y = target.y.clamp(
+        target.x = target.x.clamp(
             FIELD_W / 2.0 - GOAL_HALF - 1.5,
             FIELD_W / 2.0 + GOAL_HALF + 1.5,
         );
@@ -1479,7 +1764,7 @@ impl World {
         // FIELD-VECTOR function: sprint when the ball threatens our goal or it must
         // reposition fast, jog at midfield, walk when play is upfield.
         let own_goal_x = if sx > 0.0 { 0.0 } else { FIELD_L };
-        let ball_threat = 1.0 - ((self.ball.x - own_goal_x).abs() / FIELD_L).clamp(0.0, 1.0);
+        let ball_threat = 1.0 - ((self.ball.y - own_goal_x).abs() / FIELD_L).clamp(0.0, 1.0);
         let travel = (dir.len() / 9.0).clamp(0.0, 1.0);
         let urgency = (0.6 * ball_threat + 0.4 * travel).clamp(0.0, 1.0);
         let gear = if urgency > 0.80 {
@@ -1591,10 +1876,10 @@ impl World {
             let current_delta = me.pos.sub(mate.pos);
             let current_gap = current_delta.len();
             let relative_velocity = proposed.sub(mate.vel);
-            let relative_speed_sq = relative_velocity.x * relative_velocity.x
-                + relative_velocity.y * relative_velocity.y;
+            let relative_speed_sq = relative_velocity.y * relative_velocity.y
+                + relative_velocity.x * relative_velocity.x;
             let closest_t = if relative_speed_sq > 1e-6 {
-                (-(current_delta.x * relative_velocity.x + current_delta.y * relative_velocity.y)
+                (-(current_delta.y * relative_velocity.y + current_delta.x * relative_velocity.x)
                     / relative_speed_sq)
                     .clamp(0.0, horizon)
             } else {
@@ -1641,11 +1926,11 @@ impl World {
         let (oi, _) = self.nearest_opponent(team, me);
         let opp = players(team.other(), self)[oi].pos;
         let opp_goal_side = opp.add(own_goal.sub(opp).unit().scale(3.0));
-        let urgency = ((self.ball.x - me.x) * team.sx()).max(0.0) / FIELD_L;
+        let urgency = ((self.ball.y - me.y) * team.sx()).max(0.0) / FIELD_L;
         let blend = urgency.clamp(0.25, 0.75);
         V2::new(
-            (ball_goal_side.x * blend + opp_goal_side.x * (1.0 - blend)).clamp(2.0, FIELD_L - 2.0),
-            (ball_goal_side.y * blend + opp_goal_side.y * (1.0 - blend)).clamp(2.0, FIELD_W - 2.0),
+            (ball_goal_side.y * blend + opp_goal_side.y * (1.0 - blend)).clamp(2.0, FIELD_L - 2.0),
+            (ball_goal_side.x * blend + opp_goal_side.x * (1.0 - blend)).clamp(2.0, FIELD_W - 2.0),
         )
     }
 
@@ -1665,8 +1950,8 @@ impl World {
             for k in 0..ndir {
                 let ang = (k as f32) / (ndir as f32) * std::f32::consts::TAU;
                 let cand = V2::new(
-                    (me.x + ang.cos() * r).clamp(3.0, FIELD_L - 3.0),
-                    (me.y + ang.sin() * r).clamp(3.0, FIELD_W - 3.0),
+                    (me.y + ang.cos() * r).clamp(3.0, FIELD_L - 3.0),
+                    (me.x + ang.sin() * r).clamp(3.0, FIELD_W - 3.0),
                 );
                 // openness = distance to nearest OTHER player (either team)
                 let mut min_d = f32::INFINITY;
@@ -1685,9 +1970,9 @@ impl World {
                         }
                     }
                 }
-                let fwd = (cand.x - me.x) * sx; // upfield progress in attack frame
+                let fwd = (cand.y - me.y) * sx; // upfield progress in attack frame
                                                 // stay loosely connected to the ball's vertical lane
-                let lane = -(cand.y - self.ball.y).abs() * 0.08;
+                let lane = -(cand.x - self.ball.x).abs() * 0.08;
                 let score =
                     min_d + teammate_spacing_score(teammate_gap) * 6.0 + field_bias * fwd + lane;
                 if score > best_score {
@@ -1704,8 +1989,8 @@ impl World {
         let sx = team.sx();
         let lane = self.lane_clearness(team, self.ball, cand);
         let route = self.lane_clearness(team, me, cand);
-        let wide = (cand.y - FIELD_W / 2.0).abs() / (FIELD_W / 2.0);
-        let ahead = ((cand.x - self.ball.x) * sx).max(0.0) / FIELD_L;
+        let wide = (cand.x - FIELD_W / 2.0).abs() / (FIELD_W / 2.0);
+        let ahead = ((cand.y - self.ball.y) * sx).max(0.0) / FIELD_L;
         let (_, defender_d) = self.nearest_opponent(team, cand);
         let defender_space = (defender_d / 7.0).min(1.0);
         let mut teammate_gap = f32::INFINITY;
@@ -1755,8 +2040,8 @@ impl World {
             for k in 0..ndir {
                 let ang = (k as f32) / (ndir as f32) * std::f32::consts::TAU;
                 let cand = V2::new(
-                    (me.x + ang.cos() * r).clamp(3.0, FIELD_L - 3.0),
-                    (me.y + ang.sin() * r).clamp(3.0, FIELD_W - 3.0),
+                    (me.y + ang.cos() * r).clamp(3.0, FIELD_L - 3.0),
+                    (me.x + ang.sin() * r).clamp(3.0, FIELD_W - 3.0),
                 );
                 let score = self.mpc_field_vector_score(team, idx, cand);
                 if score > best_score {
@@ -1802,7 +2087,7 @@ impl World {
                     team[j].pos = team[j].pos.add(dir.scale(-push));
                     let vi = team[i].vel;
                     let vj = team[j].vel;
-                    let closing = vi.sub(vj).x * dir.x + vi.sub(vj).y * dir.y;
+                    let closing = vi.sub(vj).y * dir.y + vi.sub(vj).x * dir.x;
                     if closing < 0.0 {
                         let correction = dir.scale(closing * 0.5);
                         team[i].vel = team[i].vel.sub(correction);
@@ -1843,33 +2128,44 @@ fn integrate(p: &mut Player) {
     // Ramp actual velocity toward the desired (gear-target) velocity at a bounded
     // rate — players build and shed speed, they don't teleport between gears.
     // Cutting / slowing (desired speed <= current) is allowed faster than accel.
-    let dv = p.des_vel.sub(p.vel);
+    let previous_velocity = p.vel;
+    let desired_speed_cap = p.effective_speed_cap_yps();
+    let desired = if p.des_vel.len() > desired_speed_cap {
+        p.des_vel.unit().scale(desired_speed_cap)
+    } else {
+        p.des_vel
+    };
+    let dv = desired.sub(p.vel);
     let dvlen = dv.len();
     if dvlen > 1e-6 {
-        let rate = if p.des_vel.len() >= p.vel.len() {
-            player_accel()
+        let rate = if desired.len() >= p.vel.len() {
+            p.effective_accel_yps2()
         } else {
             player_decel()
         };
         let max_step = rate * DT;
         p.vel = if dvlen <= max_step {
-            p.des_vel
+            desired
         } else {
             p.vel.add(dv.scale(max_step / dvlen))
         };
     }
+    if p.vel.len() > desired_speed_cap {
+        p.vel = p.vel.unit().scale(desired_speed_cap);
+    }
+    p.update_energy(previous_velocity);
     p.pos = p.pos.add(p.vel.scale(DT));
     clamp_pos(p);
 }
 
 fn clamp_pos(p: &mut Player) {
-    p.pos.x = p.pos.x.clamp(-1.0, FIELD_L + 1.0);
-    p.pos.y = p.pos.y.clamp(0.0, FIELD_W);
+    p.pos.y = p.pos.y.clamp(-1.0, FIELD_L + 1.0);
+    p.pos.x = p.pos.x.clamp(0.0, FIELD_W);
 }
 
 fn rotate(v: V2, ang: f32) -> V2 {
     let (s, c) = ang.sin_cos();
-    V2::new(v.x * c - v.y * s, v.x * s + v.y * c)
+    V2::new(v.y * c - v.x * s, v.y * s + v.x * c)
 }
 
 /// The gear the scripted baseline uses for a given action (kept near the old
@@ -1985,16 +2281,18 @@ impl World {
         for team in [Team::A, Team::B] {
             let ps = players(team, self);
             for i in 0..N {
-                f.push(ps[i].pos.x / nx * 2.0 - 1.0);
-                f.push(ps[i].pos.y / ny * 2.0 - 1.0);
-                f.push(ps[i].vel.x / nv);
+                f.push(ps[i].pos.y / nx * 2.0 - 1.0);
+                f.push(ps[i].pos.x / ny * 2.0 - 1.0);
                 f.push(ps[i].vel.y / nv);
+                f.push(ps[i].vel.x / nv);
+                f.push(ps[i].fatigue.clamp(0.0, 1.0));
+                f.push(ps[i].anaerobic_load.clamp(0.0, 1.0));
             }
         }
-        f.push(self.ball.x / nx * 2.0 - 1.0);
-        f.push(self.ball.y / ny * 2.0 - 1.0);
-        f.push(self.ball_vel.x / nv);
+        f.push(self.ball.y / nx * 2.0 - 1.0);
+        f.push(self.ball.x / ny * 2.0 - 1.0);
         f.push(self.ball_vel.y / nv);
+        f.push(self.ball_vel.x / nv);
         // possession one-hot: A / B / free
         f.push(matches!(self.owner, Some(o) if matches!(o.team, Team::A)) as u8 as f32);
         f.push(matches!(self.owner, Some(o) if matches!(o.team, Team::B)) as u8 as f32);
@@ -2054,8 +2352,8 @@ impl World {
     /// policy-invariant potential-based reward shaping (γΦ' − Φ).
     pub fn potential_a(&self) -> f32 {
         match self.owner {
-            Some(o) if o.team == Team::A => self.ball.x / FIELD_L,
-            Some(_) => -((FIELD_L - self.ball.x) / FIELD_L),
+            Some(o) if o.team == Team::A => self.ball.y / FIELD_L,
+            Some(_) => -((FIELD_L - self.ball.y) / FIELD_L),
             None => 0.0,
         }
     }
@@ -2067,8 +2365,8 @@ impl World {
         let clear = self.shot_clearness(team, me);
         let (_, opp_d) = self.nearest_opponent(team, me);
         let shot_legal = match team {
-            Team::A => self.pass_streak_a >= 2 && me.x >= SHOOT_X,
-            Team::B => self.b_pass_streak >= 2 && me.x <= FIELD_L - SHOOT_X,
+            Team::A => self.pass_streak_a >= 2 && me.y >= SHOOT_X,
+            Team::B => self.b_pass_streak >= 2 && me.y <= FIELD_L - SHOOT_X,
         };
 
         // close in with a reasonably open lane -> shoot (else work it closer)
@@ -2082,19 +2380,19 @@ impl World {
             for (rank, cand) in cands.iter().enumerate() {
                 if let Some((ti, _)) = cand {
                     let tp = players(team, self)[*ti].pos;
-                    if (tp.x - me.x) * sx > -3.0 {
+                    if (tp.y - me.y) * sx > -3.0 {
                         return A_PASS_A + rank;
                     }
                 }
             }
             // no outlet & deep in own half -> clear, else try to carry out
-            if (me.x - team.own_goal().x).abs() < FIELD_L * 0.33 {
+            if (me.y - team.own_goal().y).abs() < FIELD_L * 0.33 {
                 return A_CLEAR;
             }
             // dribble away from the nearest opponent laterally
             let (oi, _) = self.nearest_opponent(team, me);
             let opp = players(team.other(), self)[oi].pos;
-            return if opp.y > me.y {
+            return if opp.x > me.x {
                 A_DRIB_LEFT
             } else {
                 A_DRIB_RIGHT
@@ -2106,7 +2404,7 @@ impl World {
         for (rank, cand) in cands.iter().enumerate() {
             if let Some((ti, _)) = cand {
                 let tp = players(team, self)[*ti].pos;
-                if (tp.x - me.x) * sx > 5.0 && self.lane_clearness(team, me, tp) > 0.45 {
+                if (tp.y - me.y) * sx > 5.0 && self.lane_clearness(team, me, tp) > 0.45 {
                     return A_PASS_A + rank;
                 }
             }
@@ -2114,9 +2412,9 @@ impl World {
         // unpressured: is an opponent directly ahead in my forward cone?
         let (oi, od) = self.nearest_opponent(team, me);
         let opp = players(team.other(), self)[oi].pos;
-        let ahead = (opp.x - me.x) * sx;
-        if od < 8.0 && ahead > 0.0 && (opp.y - me.y).abs() < 4.0 {
-            return if opp.y > me.y {
+        let ahead = (opp.y - me.y) * sx;
+        if od < 8.0 && ahead > 0.0 && (opp.x - me.x).abs() < 4.0 {
+            return if opp.x > me.x {
                 A_DRIB_LEFT
             } else {
                 A_DRIB_RIGHT
@@ -2132,6 +2430,77 @@ mod tests {
 
     fn stays() -> [usize; N] {
         [A_STAY; N]
+    }
+
+    #[test]
+    fn loft_altitude_is_a_rise_then_fall_arc() {
+        let apex = lofted_apex_yds(18.0); // mid-range loft
+        assert!(apex >= 1.6 && apex <= 9.0, "apex clamped: {apex}");
+        let hang = hang_time(apex);
+        assert!(hang > 0.5 && hang < 3.0, "hang time sane: {hang}");
+        // z is 0 at launch, peaks near apex mid-flight, back to 0 on landing.
+        assert!(altitude_at(apex, 0.0).abs() < 1e-4);
+        assert!(altitude_at(apex, hang).abs() < 1e-4);
+        let mid = altitude_at(apex, hang / 2.0);
+        assert!(
+            (mid - apex).abs() < 1e-3,
+            "midpoint height == apex: {mid} vs {apex}"
+        );
+        // monotone rise over the first half.
+        assert!(altitude_at(apex, hang * 0.25) < altitude_at(apex, hang * 0.5));
+        // longer passes loft higher (until the 9.0 cap).
+        assert!(lofted_apex_yds(30.0) > lofted_apex_yds(12.0));
+    }
+
+    #[test]
+    fn axis_convention_is_x_width_y_length() {
+        // The 11v11 convention: x = field WIDTH [0,FIELD_W], y = field LENGTH [0,FIELD_L].
+        // Goals sit at the length ends (y=0 / y=FIELD_L), centered on the width (x=FIELD_W/2).
+        let ga = Team::A.target_goal();
+        assert!((ga.x - FIELD_W / 2.0).abs() < 1e-6, "goal centered on width: x={}", ga.x);
+        assert!((ga.y - FIELD_L).abs() < 1e-6, "A attacks the far length line: y={}", ga.y);
+        let gb = Team::B.target_goal();
+        assert!((gb.x - FIELD_W / 2.0).abs() < 1e-6 && gb.y.abs() < 1e-6, "B attacks y=0");
+        // Field is longer than it is wide, and length lives on y.
+        assert!(FIELD_L > FIELD_W);
+        // Attack sign drives the length (y) axis: A forward = +y.
+        assert_eq!(Team::A.sx(), 1.0);
+        assert_eq!(Team::B.sx(), -1.0);
+    }
+
+    #[test]
+    fn dead_ball_restarts_assign_the_right_team() {
+        // Throw-in goes to the team that did NOT put it out; the ball is parked (no velocity).
+        let mut w = World::new();
+        w.ball_vel = V2::new(3.0, 9.0);
+        w.throw_in(Team::B, V2::new(20.0, FIELD_W));
+        assert!(matches!(w.owner, Some(o) if o.team == Team::B));
+        assert!(w.ball_vel.len() < 1e-6 && w.ball_z == 0.0 && !w.ball_aerial);
+        // Corner: attacker restarts from the goal-line corner on the ball's side.
+        w.corner_kick(Team::A, FIELD_L, 2.0);
+        assert!(matches!(w.owner, Some(o) if o.team == Team::A));
+        assert!((w.ball.y - FIELD_L).abs() < 1e-6 && w.ball.x < FIELD_W / 2.0);
+        // Goal-kick funnels through the same restart and clears shot flags.
+        w.a_shot_flag = true;
+        w.goal_kick(Team::B);
+        assert!(matches!(w.owner, Some(o) if o.team == Team::B) && !w.a_shot_flag);
+    }
+
+    #[test]
+    fn three_term_drag_decelerates_and_stops() {
+        // A rolling ball loses speed each tick and eventually snaps to rest.
+        let mut s = 18.0f32;
+        for _ in 0..200 {
+            s = ball_resistance_after(s, 0.0);
+        }
+        assert_eq!(s, 0.0, "a ground ball eventually stops, got {s}");
+        // Airborne relief: an aloft ball keeps more of its pace than a rolling one.
+        let ground = ball_resistance_after(20.0, 0.0);
+        let aloft = ball_resistance_after(20.0, 3.0);
+        assert!(
+            aloft > ground,
+            "airborne ball drags less: aloft {aloft} vs ground {ground}"
+        );
     }
 
     fn arrange_return_pass_candidates(w: &mut World) {
@@ -2169,6 +2538,49 @@ mod tests {
     }
 
     #[test]
+    fn energy_channels_are_observable_field_state() {
+        let mut w = World::new();
+        w.a[1].fatigue = 0.25;
+        w.a[1].anaerobic_load = 0.50;
+
+        let obs = w.observe(Team::A, 1);
+        assert!((obs[8] - 0.25).abs() < 1e-6);
+        assert!((obs[9] - 0.50).abs() < 1e-6);
+
+        let global = w.global_state();
+        // A keeper occupies slots 0..5; A1 starts at slot 6.
+        assert!((global[10] - 0.25).abs() < 1e-6);
+        assert!((global[11] - 0.50).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sprinting_depletes_and_rest_recovers_anaerobic_energy() {
+        let mut p = Player::default();
+        let fresh_output = p.energy_output_factor();
+        p.des_vel = V2::new(SPEEDS[SPD_SPRINT], 0.0);
+
+        for _ in 0..((10.0 / DT).round() as usize) {
+            integrate(&mut p);
+        }
+
+        let loaded = p.anaerobic_load;
+        assert!(loaded > 0.20, "sprint should deplete W' load, got {loaded}");
+        assert!(p.fatigue > 0.0, "sprint should leave some aerobic residue");
+        assert!(p.energy_output_factor() < fresh_output);
+
+        p.des_vel = V2::default();
+        for _ in 0..((8.0 / DT).round() as usize) {
+            integrate(&mut p);
+        }
+
+        assert!(
+            p.anaerobic_load < loaded,
+            "low-intensity/rest ticks should recover W' load: before={loaded} after={}",
+            p.anaerobic_load
+        );
+    }
+
+    #[test]
     fn teammate_spacing_pressure_is_steep_below_three_and_smooth_to_seven() {
         assert_eq!(World::teammate_spacing_pressure(2.99), 1.0);
         let p4 = World::teammate_spacing_pressure(4.0);
@@ -2191,7 +2603,7 @@ mod tests {
 
         let adjusted = w.mpc_teammate_separated_velocity(Team::A, 1, proposed);
 
-        assert!(adjusted.x < 0.0, "close teammate must reverse convergence");
+        assert!(adjusted.y < 0.0, "close teammate must reverse convergence");
         assert!((adjusted.len() - proposed.len()).abs() < 1e-5);
     }
 
@@ -2206,8 +2618,8 @@ mod tests {
 
         let adjusted = w.mpc_teammate_separated_velocity(Team::A, 1, proposed);
 
-        assert!((adjusted.x - proposed.x).abs() < 1e-6);
         assert!((adjusted.y - proposed.y).abs() < 1e-6);
+        assert!((adjusted.x - proposed.x).abs() < 1e-6);
     }
 
     #[test]
@@ -2452,7 +2864,7 @@ mod tests {
         w.b[1].pos = V2::new(21.0, 14.0); // 1 unit ahead of the carrier
         let dir = w.shielded_dribble_dir(Team::A, me, V2::new(1.0, 0.0));
         assert!(
-            dir.x < 0.0,
+            dir.y < 0.0,
             "should steer away from the defender, got {:?}",
             dir
         );
@@ -2482,13 +2894,13 @@ mod tests {
         w.ball_vel = V2::new(18.0, 0.0);
         let p = w.intercept_point(V2::new(25.0, 14.0));
         assert!(
-            p.x >= w.ball.x,
+            p.y >= w.ball.y,
             "intercept should lead the ball, got {:?}",
             p
         );
         // a stationary ball just returns the ball itself
         w.ball_vel = V2::default();
-        assert_eq!(w.intercept_point(V2::new(25.0, 14.0)).x, w.ball.x);
+        assert_eq!(w.intercept_point(V2::new(25.0, 14.0)).y, w.ball.y);
     }
 
     #[test]
@@ -2575,11 +2987,11 @@ mod tests {
         let target = w.goalside_recovery_target(Team::A, 2);
 
         assert!(
-            target.x < w.a[2].pos.x,
+            target.y < w.a[2].pos.y,
             "wrong-side defender should recover toward own goal: target={target:?}"
         );
         assert!(
-            target.x < w.ball.x,
+            target.y < w.ball.y,
             "target should get goalside of the ball: target={target:?}, ball={:?}",
             w.ball
         );

@@ -2587,6 +2587,7 @@ fn mpc_reselects_normal_shot_when_execution_is_poor() {
     let player = sim.players[shooter].clone();
     let action = SoccerAction::Shoot {
         power: shot_power_for_skill(ability01(player.skills.shooting)),
+        target_point: None,
     };
     let target = player.action_target_trace(&action, &snapshot);
     let trace = player_mdp_mpc_comparison_trace(&snapshot, &player, &target, "shoot")
@@ -38045,7 +38046,10 @@ fn pass_and_shot_preserve_release_facing_after_recovery_movement() {
 
     shot_sim.apply_player_intent(PlayerIntent {
         player_id: shooter,
-        action: SoccerAction::Shoot { power: 1.0 },
+        action: SoccerAction::Shoot {
+            power: 1.0,
+            target_point: None,
+        },
         sprint: false,
     });
 
@@ -38788,7 +38792,10 @@ fn struck_shot_releases_the_ball_in_the_fifty_to_seventytwo_band() {
     let power = shot_power_for_skill(ability01(sim.players[shooter].skills.shooting));
     sim.apply_player_intent(PlayerIntent {
         player_id: shooter,
-        action: SoccerAction::Shoot { power },
+        action: SoccerAction::Shoot {
+            power,
+            target_point: None,
+        },
         sprint: false,
     });
 
@@ -38830,7 +38837,10 @@ fn shoot_action_launches_at_least_forty_mph_even_off_balance() {
 
     sim.apply_player_intent(PlayerIntent {
         player_id: shooter,
-        action: SoccerAction::Shoot { power: 0.0 },
+        action: SoccerAction::Shoot {
+            power: 0.0,
+            target_point: None,
+        },
         sprint: false,
     });
 
@@ -58025,6 +58035,7 @@ fn shot_mpc_qp_target_fit_rewards_clean_execution() {
         clean_speed,
         false,
         0.05,
+        None,
     );
     let rushed = shot_mpc_accuracy_estimate_for_snapshot(
         &snapshot,
@@ -58037,6 +58048,7 @@ fn shot_mpc_qp_target_fit_rewards_clean_execution() {
         rushed_speed,
         false,
         0.96,
+        None,
     );
 
     assert!(
@@ -99866,5 +99878,76 @@ fn same_team_proximity_grace_matches_the_worked_example() {
         (b7, b6, b5),
         (0.0, 0.0, 0.0),
         "clearing all bands resets every timer"
+    );
+}
+
+/// End-to-end proof of the learnable per-context MPC reject-threshold pipeline on a
+/// real 11v11 match: with the model gated OFF the RL corpus stays empty (byte-identical
+/// no-op), and with it ON the ball-carrier collector fills the corpus and a head trains
+/// from it. Exercises the same `run_time_step` loop the cluster learner uses — no DB.
+#[test]
+fn mpc_reject_threshold_pipeline_collects_and_trains_end_to_end() {
+    let build_and_run = || {
+        let config = MatchConfig {
+            duration_seconds: 20.0,
+            seed: 44_101,
+            ..MatchConfig::default()
+        };
+        let total = config.total_ticks();
+        let mut sim = SoccerMatch::default_11v11(config);
+        for _ in 0..total {
+            sim.run_time_step();
+        }
+        sim.drain_mpc_reject_threshold_samples()
+    };
+
+    // OFF (default): the collector early-returns, so nothing is ever recorded.
+    std::env::remove_var("DD_SOCCER_ENABLE_MPC_REJECT_THRESHOLD_MODEL");
+    let off_samples = build_and_run();
+    assert!(
+        off_samples.is_empty(),
+        "disabled ⇒ the reject-threshold corpus must stay empty (byte-identical), got {}",
+        off_samples.len()
+    );
+
+    // ON: carrier pass/dribble/shot decisions are sampled, windowed, and resolved.
+    std::env::set_var("DD_SOCCER_ENABLE_MPC_REJECT_THRESHOLD_MODEL", "1");
+    let on_samples = build_and_run();
+    std::env::remove_var("DD_SOCCER_ENABLE_MPC_REJECT_THRESHOLD_MODEL");
+
+    assert!(
+        !on_samples.is_empty(),
+        "enabled ⇒ the ball-carrier collector must record resolved reject-threshold samples"
+    );
+    for s in &on_samples {
+        assert!(
+            (0.0..=1.0).contains(&s.committed_probability),
+            "committed probability {} out of [0,1]",
+            s.committed_probability
+        );
+        assert!(s.reward.is_finite(), "sample reward must be finite");
+    }
+    // All three families should appear over a full match (pass targets the most-advanced
+    // teammate; dribble/shot resolve their own targets in the MPC estimators).
+    let saw_pass = on_samples
+        .iter()
+        .any(|s| s.inputs.family == MpcRejectFamily::Pass);
+    let saw_dribble = on_samples
+        .iter()
+        .any(|s| s.inputs.family == MpcRejectFamily::Dribble);
+    let saw_shot = on_samples
+        .iter()
+        .any(|s| s.inputs.family == MpcRejectFamily::Shot);
+    assert!(
+        saw_pass && saw_dribble && saw_shot,
+        "all three families should be sampled over a full match: pass={saw_pass} dribble={saw_dribble} shot={saw_shot}"
+    );
+
+    // The drained corpus trains a usable head (the learner's per-game step).
+    let (head, report) = train_mpc_reject_threshold_head(&on_samples, 7, 4, 0.02)
+        .expect("a non-empty corpus trains a reject-threshold head");
+    assert!(
+        report.training_steps > 0 && head.training_steps() > 0 && report.final_loss.is_finite(),
+        "training must advance the head: {report:?}"
     );
 }

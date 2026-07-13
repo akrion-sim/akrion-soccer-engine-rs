@@ -70,6 +70,8 @@ pub use back_four_line::*;
 pub use lane_affinity_decision::*;
 mod loose_ball_commit;
 pub use loose_ball_commit::*;
+mod mpc_reject_threshold;
+pub use mpc_reject_threshold::*;
 mod receive_approach;
 pub use receive_approach::*;
 mod long_pass_run;
@@ -15978,6 +15980,11 @@ pub(crate) fn scoop_completion_viability(observation: &SoccerPomdpObservation) -
 
 fn pass_like_action_flight(action: &str) -> Option<PassFlight> {
     use SoccerActionLabel::*;
+    // Codex r24 forward-release action is a floor pass for all flight/reward/MPC classification;
+    // it stays a distinct label only for legality + execution-target routing.
+    if normalize_soccer_action_label(action) == "forward-release-pass" {
+        return Some(PassFlight::Floor);
+    }
     match SoccerActionLabel::classify(normalize_soccer_action_label(action))? {
         Pass | FirstTimePass | FlankLowCross | WallPass | WallReturn | CornerFlagCross
         | SurprisePass | KillerPass | SwitchPlay | RecycleReset => Some(PassFlight::Floor),
@@ -24463,15 +24470,13 @@ pub(crate) fn on_frame_shot_reward_scale() -> f64 {
 
 fn hierarchy_bounded_shot_on_target_points(shot_scale: f64, goal_scale: f64) -> f64 {
     let raw = SHOT_ON_TARGET_REWARD_POINTS * shot_scale.max(MIN_SOCCER_REWARD_WEIGHT);
-    let outcome_ceiling = GOAL_REWARD_POINTS * goal_scale.max(1.0)
-        - CONVERSION_OVER_SHOT_REWARD_MARGIN;
+    let outcome_ceiling =
+        GOAL_REWARD_POINTS * goal_scale.max(1.0) - CONVERSION_OVER_SHOT_REWARD_MARGIN;
     raw.min(outcome_ceiling.max(MIN_SOCCER_REWARD_WEIGHT))
 }
 
 fn hierarchy_projected_match_win_points(requested: f64, goal_scale: f64) -> f64 {
-    requested.max(
-        GOAL_REWARD_POINTS * goal_scale.max(1.0) + WIN_OVER_CONVERSION_REWARD_MARGIN,
-    )
+    requested.max(GOAL_REWARD_POINTS * goal_scale.max(1.0) + WIN_OVER_CONVERSION_REWARD_MARGIN)
 }
 
 pub(crate) fn match_outcome_win_reward_points() -> f64 {
@@ -25080,6 +25085,31 @@ fn quick_release_forward_pass_reward(
 /// Scale for the opportunity-conditioned quick-forward-release carrot (Codex r19). Env
 /// `DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE` (clamped 0..2), default **0.0** ⇒ byte-identical
 /// (the whole term is a no-op unless explicitly enabled). Pre-registered A/B arms: 0.75, 1.0, 1.5.
+/// Codex r24 interface lever: gate for the explicit `forward-release-pass` actor action. Default
+/// OFF ⇒ the action never legalizes and never executes, so behavior is unchanged (the vocab entry
+/// is present but inert). ON ⇒ the actor may choose an explicit "release forward" pass whenever a
+/// real forward option exists, executing to the visible/quick forward receiver.
+pub(crate) fn forward_release_action_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_ENABLE_FORWARD_RELEASE_ACTION")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+/// Shared opportunity gate for the `forward-release-pass` action: a real forward option must exist
+/// in the before-state (mirrors the carrot's opportunity condition, Codex r19/r24).
+fn forward_release_opportunity_present(observation: &SoccerPomdpObservation) -> bool {
+    observation.has_ball
+        && observation.visible_forward_pass_options > 0
+        && observation
+            .best_forward_pass_option_quality
+            .max(observation.quick_forward_pass_value)
+            >= 0.50
+}
+
 pub(crate) fn quick_forward_release_reward_scale() -> f64 {
     if dynamic_reward_weights_enabled() {
         return optional_reward_weight_env(
@@ -26417,6 +26447,13 @@ fn soccer_decision_context_for(
                     shot_speed,
                     first_time,
                     pressure_from_nearest_distance(nearest_opponent_distance),
+                    // Part B: score THIS candidate's chosen aim (from the action target trace),
+                    // gated. Off ⇒ None ⇒ analytic optimum ⇒ byte-identical.
+                    if dd_soccer_enable_actor_shot_placement() {
+                        action_target.and_then(|trace| trace.point)
+                    } else {
+                        None
+                    },
                 )
             })
         } else {
@@ -41092,6 +41129,25 @@ pub(crate) fn dd_soccer_enable_learned_mpc_shot_objective() -> bool {
     }
 }
 
+/// Gate (default-OFF) for **actor-owned shot placement**. When on, a `Shoot` action carries an
+/// explicit `target_point` (which goal-mouth spot to aim at), sourced from the learned policy's
+/// plan instead of being discarded, and execution honors its lateral component. Off ⇒ `target_point`
+/// stays `None` ⇒ the analytic `base_goal_x` pipeline runs unchanged ⇒ byte-identical to baseline.
+/// This is the structural finishing INTERFACE (the POMDP owning placement), distinct from the
+/// learned-MPC aim RESIDUAL above.
+pub(crate) fn dd_soccer_enable_actor_shot_placement() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_ACTOR_SHOT_PLACEMENT")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_ACTOR_SHOT_PLACEMENT"))
+    }
+}
+
 /// Env flag enabling the learned MPC execution-objective head for DRIBBLE CARRY specifically — the
 /// dribble analogue of the pass/shot wiring. When on (and the head is present) a bounded
 /// (≤[`MPC_OBJECTIVE_MAX_RESIDUAL_YARDS`]) FULL 2-D aim residual nudges the analytic dribble carry
@@ -43272,9 +43328,7 @@ mod soccer_policy_actor_capacity_tests {
             terminal_shot_scale * SHOT_ON_TARGET_REWARD_POINTS <= frac * 100.0 + 1e-9,
             "non-conversion points must stay <= fraction * conversion reward"
         );
-        assert!(
-            (terminal_shot_scale - frac * 100.0 / SHOT_ON_TARGET_REWARD_POINTS).abs() < 1e-9
-        );
+        assert!((terminal_shot_scale - frac * 100.0 / SHOT_ON_TARGET_REWARD_POINTS).abs() < 1e-9);
 
         // Proportional: raising the goal reward raises the allowed non-conversion ceiling in step,
         // so "shot < goal by a meaningful margin" holds at any magnitude (not just near 100).
@@ -46212,6 +46266,10 @@ const SOCCER_POLICY_ACTIONS: &[&str] = &[
     "first-time-shot-kp7",
     "first-time-shot-kp8",
     "first-time-shot-kp9",
+    // Codex r24 interface lever (append-only): explicit forward-release pass. Gated + legal ONLY
+    // when a real forward option exists; executes to the visible/quick forward receiver. Puts the
+    // go-forward DECISION in the actor's learnable vocabulary instead of relying on reward shaping.
+    "forward-release-pass",
 ];
 
 const SOCCER_POLICY_PASS_ACTIONS: &[&str] = &[
@@ -59333,6 +59391,7 @@ fn tracking_frame_to_world_snapshot(
         away_pass_completion_head: None,
         away_auxiliary_heads_dedicated: false,
         loose_ball_commit_head: None,
+        mpc_reject_threshold_head: None,
         receive_approach_head: None,
         lane_affinity_head: None,
         goal_side_recovery_head: None,
@@ -68164,6 +68223,11 @@ fn shot_mpc_accuracy_estimate_for_snapshot(
     shot_speed_yps: f64,
     quick_release: bool,
     pressure: f64,
+    // ACTOR-OWNED SHOT PLACEMENT (Part B): when `Some`, evaluate THIS specific goal-mouth aim's
+    // finishing quality (block / on-frame / save / goal probability) instead of the analytic QP
+    // optimum, so each placement candidate's shot-quality features reflect its own aim. `None`
+    // (all non-placement callers) ⇒ the analytic optimum is used ⇒ byte-identical.
+    override_target: Option<Vec2>,
 ) -> ShotMpcAccuracyEstimate {
     let goal_y = attacking_team.goal_y(snapshot.field_length);
     let goal_center_x = snapshot.field_width * 0.5;
@@ -68257,7 +68321,11 @@ fn shot_mpc_accuracy_estimate_for_snapshot(
             max_active_sets: 32,
         },
     );
-    let target_x = if solution.status == QPStatus::Optimal && !solution.x.is_empty() {
+    let target_x = if let Some(aim) = override_target {
+        // Honor the actor-chosen aim; downstream block/on-frame/save/goal metrics are all
+        // computed from `target_x`, so they now reflect THIS placement.
+        aim.x
+    } else if solution.status == QPStatus::Optimal && !solution.x.is_empty() {
         solution.x[0]
     } else {
         unbounded_preference
@@ -70036,6 +70104,12 @@ fn learned_action_label_is_legal_for_observation(
                     ))
         }
         "pass" => observation.has_ball && snapshot.best_visible_pass_target(player_id).is_some(),
+        // Codex r24 interface lever: legal ONLY with the gate on AND a real forward option present.
+        "forward-release-pass" => {
+            forward_release_action_enabled()
+                && forward_release_opportunity_present(&observation)
+                && snapshot.best_visible_pass_target(player_id).is_some()
+        }
         "wall-pass" => observation.has_ball && snapshot.wall_pass_option_for(player_id).is_some(),
         "wall-return" => {
             observation.has_ball && snapshot.wall_return_pass_target_for(player_id).is_some()

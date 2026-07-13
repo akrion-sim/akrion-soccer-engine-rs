@@ -1309,6 +1309,19 @@ fn learned_mpc_contextual_rejection_threshold(
     (base + learned_competition * blend * max_delta).clamp(0.0, 1.0)
 }
 
+/// The analytic per-family base MPC reject bar — the constant the global path uses,
+/// exposed so the learned per-context reject-threshold seam ([`WorldSnapshot::
+/// learned_mpc_reject_threshold`]) can treat it as the group-8 retained determinant it
+/// refines. `None` for families MPC does not gate (returns no bar ⇒ never rejected).
+pub(crate) fn mpc_reject_base_threshold(family: MpcRejectFamily) -> f64 {
+    let thresholds = learned_mpc_replan_thresholds();
+    match family {
+        MpcRejectFamily::Pass => thresholds.pass_impossible_probability,
+        MpcRejectFamily::Dribble => thresholds.dribble_impossible_probability,
+        MpcRejectFamily::Shot => thresholds.shot_impossible_probability,
+    }
+}
+
 fn defensive_shot_on_target_penalty_points() -> (f64, f64) {
     let read = || {
         let max = std::env::var("SOCCER_DEFENSIVE_SOT_MAX_PENALTY")
@@ -1940,6 +1953,19 @@ pub struct SoccerMatch {
     /// present. Carried + trained across games by the learner; `None` ⇒ analytic
     /// seed. Shared into each [`WorldSnapshot`] via an `Arc` clone.
     pub(crate) loose_ball_commit_head: Option<std::sync::Arc<LooseBallCommitHead>>,
+    /// The trained per-context MPC reject-threshold head (how low an action's success
+    /// probability may fall, in this exact context, before MPC refuses it and kicks
+    /// the decision back to the POMDP's next-best). Carried + trained across games by
+    /// the learner; `None` ⇒ context-aware analytic seed. Shared into each
+    /// [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) mpc_reject_threshold_head: Option<std::sync::Arc<MpcRejectThresholdHead>>,
+    /// Rolling RL corpus for the reject-threshold head: per-decision context + the
+    /// execution probability the carrier committed at + the windowed territorial
+    /// reward. Collected only while the reject-threshold model is enabled; empty +
+    /// untouched in the default process.
+    pub(crate) mpc_reject_threshold_samples: Vec<MpcRejectThresholdSample>,
+    /// Open reject-threshold decisions awaiting their windowed reward.
+    pub(crate) pending_mpc_reject_threshold: Vec<PendingMpcRejectThresholdDecision>,
     /// The trained attacking-spacing target head, when present. Carried + trained
     /// across games by the learner; `None` ⇒ analytic 5-8yd seed. Shared into each
     /// [`WorldSnapshot`] via an `Arc` clone so the off-ball ranker and LP floor read
@@ -9829,7 +9855,7 @@ mod tests {
                 .action_from_learned_plan(&plan, &snapshot, &observation)
                 .expect("learned shot bucket should execute");
             assert_eq!(executed_label, label);
-            let SoccerAction::Shoot { power } = action else {
+            let SoccerAction::Shoot { power, .. } = action else {
                 panic!("learned shot bucket should execute as a shot");
             };
             let expected_power =
@@ -9909,6 +9935,7 @@ mod tests {
                 expected_speed,
                 normalize_soccer_action_label(label) == "first-time-shot",
                 pressure_from_nearest_distance(nearest_opponent_distance),
+                None,
             );
             assert!(
                 (scored.decision_context.shot_mpc_goal_probability
@@ -14124,6 +14151,9 @@ impl SoccerMatch {
             pending_defender_line: Vec::new(),
             back_four_line_latch: [None, None],
             loose_ball_commit_head: None,
+            mpc_reject_threshold_head: None,
+            mpc_reject_threshold_samples: Vec::new(),
+            pending_mpc_reject_threshold: Vec::new(),
             attack_spacing_head: None,
             away_attack_spacing_head: None,
             support_scorer_head: None,
@@ -14337,6 +14367,9 @@ impl SoccerMatch {
             line_depth_head: None,
             defender_line_head: None,
             loose_ball_commit_head: None,
+            mpc_reject_threshold_head: None,
+            mpc_reject_threshold_samples: Vec::new(),
+            pending_mpc_reject_threshold: Vec::new(),
             attack_spacing_head: None,
             away_attack_spacing_head: None,
             support_scorer_head: None,
@@ -17409,6 +17442,32 @@ impl SoccerMatch {
                     neural_mcts_dribble_candidate_count,
                     neural_mcts_root_dribble_candidate_count,
                 } = choice;
+                if net_influence_diag_enabled() {
+                    // Net-influence (Codex-corrected baseline): the counterfactual is the ACTUAL
+                    // tabular-only decision path (rank-weighted + replan-safe filter, blend off),
+                    // not raw argmax. `label` is what the net/sidecar/exploration chain selected;
+                    // if it differs from the tabular choice, the neural stack flipped the decision
+                    // the engine would otherwise have committed. `neural_mcts_selected` marks the
+                    // subset where the neural MCTS actually owned the pick.
+                    if let Some(tabular) = self.weighted_policy_action_for_player(
+                        policy,
+                        snapshot,
+                        player_id,
+                        mdp_state,
+                        observation,
+                        retrieval_prior,
+                        SOCCER_POLICY_RANK_SALT_TEAM_TABULAR,
+                    ) {
+                        record_net_influence_diag(
+                            normalize_soccer_action_label(&tabular.label),
+                            normalize_soccer_action_label(&label),
+                            &tabular.label,
+                            &label,
+                            observation.has_ball,
+                            neural_mcts_selected,
+                        );
+                    }
+                }
                 let plan = plan.unwrap_or_else(|| {
                     Self::learned_plan_for_policy(policy, snapshot, player_id, label.clone())
                 });
@@ -18051,6 +18110,7 @@ impl SoccerMatch {
                 shot_speed,
                 first_time,
                 pressure_from_nearest_distance(nearest_opponent_distance),
+                None,
             )
             .target_point
             .clamp_to_pitch(snapshot.field_width, snapshot.field_length),
@@ -18116,6 +18176,35 @@ impl SoccerMatch {
                         })
                     }),
             );
+        }
+        // ACTOR-OWNED SHOT PLACEMENT (default-OFF, byte-identical when off): fan the shot into one
+        // sibling plan per goal-mouth spot so the learned critic SCORES each aim independently and the
+        // actor selects the placement it values most (honored at execution). Off ⇒ no extra plans ⇒
+        // identical candidate set. Siblings share the "shoot" label (the scorer ranks per-plan, not
+        // per-label) and differ only by `target_point`.
+        if dd_soccer_enable_actor_shot_placement() {
+            let goalmouth = shot_goalmouth_target_points(
+                snapshot.field_width,
+                snapshot.field_length,
+                snapshot.goal_width,
+                team,
+            );
+            plans.reserve(goalmouth.len());
+            for aim in goalmouth {
+                plans.push(SoccerLearnedPlan {
+                    action: label.to_string(),
+                    target_player: None,
+                    target_point: Some(aim),
+                    mpc_replan: None,
+                });
+            }
+            if std::env::var("DD_SOCCER_SHOTPLACE_DIAG").is_ok() {
+                eprintln!(
+                    "SHOTPLACE_DIAG label={label} added_placement_variants={} total_plans={}",
+                    goalmouth.len(),
+                    plans.len()
+                );
+            }
         }
         plans
     }
@@ -20290,6 +20379,53 @@ impl SoccerMatch {
         }
     }
 
+    /// The action label the ACTUAL blend-off tabular path would commit for `player_id` — the
+    /// net-influence counterfactual. Mirrors the decision assembler's tabular fallback (same
+    /// policy, retrieval prior, TABULAR salt), so "committed action != this" means the neural
+    /// stack (net/sidecar/exploration + downstream discipline) changed the decision the engine
+    /// would otherwise have made. Pure/read-only; only called when the diag env is set.
+    fn net_influence_tabular_baseline_label(
+        &self,
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        mdp_state: &SoccerMdpState,
+        observation: &SoccerPomdpObservation,
+    ) -> Option<String> {
+        let player = snapshot
+            .players
+            .iter()
+            .find(|candidate| candidate.id == player_id)?;
+        let retrieval_prior = if self.config.retrieval.decision_prior_enabled {
+            self.retrieval_action_prior
+                .get(&player.team)
+                .filter(|map| !map.is_empty())
+                .map(|map| (map, self.config.retrieval.prior_weight))
+        } else {
+            None
+        };
+        let (policy, salt) = if let Some(team_policies) = &self.team_policies {
+            (
+                team_policies.policy(player.team),
+                SOCCER_POLICY_RANK_SALT_TEAM_TABULAR,
+            )
+        } else {
+            (
+                self.learned_policy.as_ref()?,
+                SOCCER_POLICY_RANK_SALT_SHARED_TABULAR,
+            )
+        };
+        self.weighted_policy_action_for_player(
+            policy,
+            snapshot,
+            player_id,
+            mdp_state,
+            observation,
+            retrieval_prior,
+            salt,
+        )
+        .map(|choice| choice.label)
+    }
+
     /// Per-team value-head forward-intent for this tick: for each outfield player,
     /// how much more value the net assigns to advancing (`dribble`) than to
     /// holding shape (`hold`), averaged per team and squashed into opposing
@@ -20808,7 +20944,13 @@ impl SoccerMatch {
             flight,
             candidates,
         );
-        let raw_receipt_threshold = learned_mpc_replan_thresholds().pass_impossible_probability;
+        // The pass reject bar, context-dependent when the reject-threshold model is on,
+        // else the family base constant (byte-identical).
+        let raw_receipt_threshold = snapshot.learned_mpc_reject_threshold(
+            player_id,
+            MpcRejectFamily::Pass,
+            mpc_reject_base_threshold(MpcRejectFamily::Pass),
+        );
         let net_forward_quality_threshold =
             learned_pass_receiver_min_net_forward_quality().max(raw_receipt_threshold);
         let acceptance_probability = |target_player: Option<usize>,
@@ -21071,29 +21213,23 @@ impl SoccerMatch {
                 .clamp(0.0, 1.0);
         let thresholds = learned_mpc_replan_thresholds();
         let ranked = policy
-            .ranked_action_values_for_snapshot(
-                snapshot,
-                player_id,
-                LEARNED_MPC_REPLAN_CANDIDATES,
-            )
+            .ranked_action_values_for_snapshot(snapshot, player_id, LEARNED_MPC_REPLAN_CANDIDATES)
             .map(|(_, ranked)| ranked);
-        let base_hard_threshold = if pass_like_action_flight(original_family).is_some() {
-            Some(thresholds.pass_impossible_probability)
-        } else if is_dribble_action_label(original_family) {
-            Some(thresholds.dribble_impossible_probability)
-        } else if matches!(
-            original_family,
-            "shoot" | "first-time-shot" | "first-time-header"
-        ) {
-            Some(thresholds.shot_impossible_probability)
-        } else {
-            None
-        };
-        let contextual_hard_threshold = base_hard_threshold.map(|base| {
-            ranked.as_deref().map_or(base, |actions| {
-                learned_mpc_contextual_rejection_threshold(base, &original_action, actions)
-            })
-        });
+        let contextual_hard_threshold = Self::learned_mpc_reject_family_for_label(original_family)
+            .map(|family| {
+                let field_vector_threshold = snapshot.learned_mpc_reject_threshold(
+                    player_id,
+                    family,
+                    mpc_reject_base_threshold(family),
+                );
+                ranked.as_deref().map_or(field_vector_threshold, |actions| {
+                    learned_mpc_contextual_rejection_threshold(
+                        field_vector_threshold,
+                        &original_action,
+                        actions,
+                    )
+                })
+            });
         let hard_replan = contextual_hard_threshold
             .is_some_and(|threshold| original_execution_probability < threshold);
         let soft_replan_eligible = !hard_replan
@@ -21133,26 +21269,20 @@ impl SoccerMatch {
                     .unwrap_or(0.0)
                     .clamp(0.0, 1.0);
             let candidate_family = normalize_soccer_action_label(&candidate_plan.action);
-            let candidate_base_threshold = if pass_like_action_flight(candidate_family).is_some() {
-                Some(thresholds.pass_impossible_probability)
-            } else if is_dribble_action_label(candidate_family) {
-                Some(thresholds.dribble_impossible_probability)
-            } else if matches!(
-                candidate_family,
-                "shoot" | "first-time-shot" | "first-time-header"
-            ) {
-                Some(thresholds.shot_impossible_probability)
-            } else {
-                None
-            };
-            let candidate_hard_replan = candidate_base_threshold.is_some_and(|base| {
-                let contextual = learned_mpc_contextual_rejection_threshold(
-                    base,
-                    &candidate_plan.action,
-                    &ranked,
-                );
-                candidate_execution_probability < contextual
-            });
+            let candidate_hard_replan = Self::learned_mpc_reject_family_for_label(candidate_family)
+                .is_some_and(|family| {
+                    let field_vector_threshold = snapshot.learned_mpc_reject_threshold(
+                        player_id,
+                        family,
+                        mpc_reject_base_threshold(family),
+                    );
+                    let contextual = learned_mpc_contextual_rejection_threshold(
+                        field_vector_threshold,
+                        &candidate_plan.action,
+                        &ranked,
+                    );
+                    candidate_execution_probability < contextual
+                });
             let candidate_is_replacement = if hard_replan {
                 !candidate_hard_replan
             } else {
@@ -21186,6 +21316,18 @@ impl SoccerMatch {
             .unwrap_or(plan);
         }
         plan
+    }
+
+    fn learned_mpc_reject_family_for_label(label: &str) -> Option<MpcRejectFamily> {
+        if pass_like_action_flight(label).is_some() {
+            Some(MpcRejectFamily::Pass)
+        } else if is_dribble_action_label(label) {
+            Some(MpcRejectFamily::Dribble)
+        } else if matches!(label, "shoot" | "first-time-shot" | "first-time-header") {
+            Some(MpcRejectFamily::Shot)
+        } else {
+            None
+        }
     }
 
     fn mpc_safe_fallback_learned_plan(
@@ -21259,19 +21401,15 @@ impl SoccerMatch {
         plan: &SoccerLearnedPlan,
     ) -> bool {
         let label = normalize_soccer_action_label(&plan.action);
-        let thresholds = learned_mpc_replan_thresholds();
-        let threshold = if pass_like_action_flight(label).is_some() {
-            Some(thresholds.pass_impossible_probability)
-        } else if is_dribble_action_label(label) {
-            Some(thresholds.dribble_impossible_probability)
-        } else if matches!(label, "shoot" | "first-time-shot" | "first-time-header") {
-            Some(thresholds.shot_impossible_probability)
-        } else {
-            None
-        };
-        let Some(threshold) = threshold else {
+        let family = Self::learned_mpc_reject_family_for_label(label);
+        let Some(family) = family else {
             return false;
         };
+        // Context-dependent reject bar: the learned per-context threshold when the
+        // reject-threshold model is enabled, else exactly the family base constant
+        // (byte-identical). "Too low" is a function of the field vector, not a global.
+        let base_threshold = mpc_reject_base_threshold(family);
+        let threshold = snapshot.learned_mpc_reject_threshold(player_id, family, base_threshold);
         Self::learned_plan_mpc_execution_probability(snapshot, player_id, plan)
             .is_some_and(|probability| probability < threshold)
     }
@@ -21297,7 +21435,7 @@ impl SoccerMatch {
             && candidate_probability - original_probability >= thresholds.soft_min_improvement
     }
 
-    fn learned_plan_mpc_execution_probability(
+    pub(crate) fn learned_plan_mpc_execution_probability(
         snapshot: &WorldSnapshot,
         player_id: usize,
         plan: &SoccerLearnedPlan,
@@ -21722,6 +21860,7 @@ impl SoccerMatch {
             shot_speed,
             first_time,
             pressure_from_nearest_distance(nearest_opponent_distance),
+            None,
         )
         .accuracy_probability
         .clamp(0.0, 1.0)
@@ -25089,6 +25228,21 @@ impl SoccerMatch {
                             }
                             None => None,
                         };
+                    // Net-influence commit-level baseline (Codex): the tabular-only choice for this
+                    // FRESH decision, captured before run_time_step_with_context consumes mdp_state/
+                    // observation. Compared post-discipline against the actually-committed action.
+                    // This block is only reached on fresh-decision ticks (the decision-cadence replay
+                    // path never runs the planning pass), so it excludes the outer replay per Codex.
+                    let net_influence_baseline = if net_influence_diag_enabled() {
+                        self.net_influence_tabular_baseline_label(
+                            &snapshot,
+                            scheduled.id,
+                            &mdp_state,
+                            &observation,
+                        )
+                    } else {
+                        None
+                    };
                     let intent = self.players[actor].run_time_step_with_context(
                         &snapshot,
                         mdp_state,
@@ -25121,6 +25275,29 @@ impl SoccerMatch {
                     }
                     let intent = self.players[actor]
                         .apply_post_decision_movement_discipline(&snapshot, self, intent);
+                    if let Some(baseline) = net_influence_baseline.as_ref() {
+                        // Headline = semantic committed action (last_decision.action, post-refractory)
+                        // vs tabular baseline; concrete = post-discipline intent family (collapses
+                        // off-ball to "move", so a secondary diagnostic per Codex).
+                        let semantic = self.players[actor]
+                            .last_decision
+                            .as_ref()
+                            .map(|decision| decision.action.as_str())
+                            .unwrap_or("");
+                        // The net's FRESH pick this tick (the assembler's chosen label), before the
+                        // refractory/discipline possibly reverted it to the held action.
+                        let net_pick = learned_decision
+                            .as_ref()
+                            .map(|decision| decision.label.as_str())
+                            .unwrap_or("");
+                        let on_ball = self.ball.holder == Some(scheduled.id);
+                        record_net_influence_commit_diag(
+                            normalize_soccer_action_label(baseline),
+                            normalize_soccer_action_label(semantic),
+                            normalize_soccer_action_label(net_pick),
+                            on_ball,
+                        );
+                    }
                     let player_decision_elapsed = phase_started.elapsed();
                     field_player_decision_elapsed += player_decision_elapsed;
                     match decision_context {
@@ -25254,6 +25431,9 @@ impl SoccerMatch {
             tick_start_snapshot.tick,
         );
         self.collect_loose_ball_commit_rl_samples(&next_snapshot);
+        // Learnable per-context MPC reject-threshold RL samples (no-op + byte-identical
+        // unless `DD_SOCCER_ENABLE_MPC_REJECT_THRESHOLD_MODEL` is set).
+        self.collect_mpc_reject_threshold_rl_samples(&next_snapshot);
         // Learnable receive-approach RL samples (no-op + byte-identical unless
         // `DD_SOCCER_ENABLE_RECEIVE_APPROACH_MODEL` is set).
         self.collect_receive_approach_rl_samples(&next_snapshot);
@@ -32503,7 +32683,10 @@ impl SoccerMatch {
                     self.players[player_id].action_facing = action_facing;
                 }
             }
-            SoccerAction::Shoot { power } => {
+            SoccerAction::Shoot {
+                power,
+                target_point: actor_shot_target,
+            } => {
                 let mut release_facing = action_facing;
                 if self.ball.holder == Some(player_id) {
                     // (Productive carry-into-shot is rewarded by `record_progressive_carry_outcome_reward`
@@ -32563,6 +32746,19 @@ impl SoccerMatch {
                     } else {
                         goal_center_x
                     };
+                    // ACTOR-OWNED SHOT PLACEMENT (default-OFF, byte-identical when off): if the
+                    // learned policy chose an explicit goal-mouth aim point, honor its lateral (x)
+                    // component — overriding the analytic `base_goal_x` — clamped inside the posts.
+                    // The downstream `noisy_shot_target_x` + goal-mouth clamp still apply, and the
+                    // optional MPC residual below composes on top. Off ⇒ `target_point` is `None` ⇒
+                    // this is a no-op ⇒ identical to baseline.
+                    if dd_soccer_enable_actor_shot_placement() {
+                        if let Some(actor_aim) = actor_shot_target {
+                            base_goal_x = actor_aim
+                                .x
+                                .clamp(goal_center_x - half_goal, goal_center_x + half_goal);
+                        }
+                    }
                     // Learned MPC execution-objective residual for SHOT PLACEMENT — the shot analogue
                     // of the pass-lead nudge in the pass launch path (see the `led_target` residual
                     // above). Gated on the SEPARATE, default-OFF
@@ -40875,6 +41071,12 @@ pub struct WorldSnapshot {
     /// Skipped by serde (an internal decision aid; Default = None).
     #[serde(skip)]
     pub(crate) loose_ball_commit_head: Option<std::sync::Arc<LooseBallCommitHead>>,
+    /// The trained per-context MPC reject-threshold head, carried from the match for
+    /// live consumption at the MPC feasibility gate ([`Self::learned_mpc_reject_threshold`]).
+    /// `None` ⇒ context-aware analytic seed (and, when the model is gated off, the
+    /// constant base bar — parity). Skipped by serde (an internal decision aid).
+    #[serde(skip)]
+    pub(crate) mpc_reject_threshold_head: Option<std::sync::Arc<MpcRejectThresholdHead>>,
     /// The trained receive-approach head, carried from the match for live consumption in
     /// the reception election (`receive_approach_adjusted_target`). `None` ⇒ analytic seed
     /// (parity). Skipped by serde (an internal decision aid; Default = None).
@@ -43370,6 +43572,208 @@ fn maybe_log_pass_space_diag(sample_count: u64) {
     }
 }
 
+// ===== Net-influence diagnostic (Codex round-23) =====
+// Measures how often the neural blend actually CHANGES the selected action vs the tabular
+// baseline (the argmax-tabular-value legal candidate) at the `neural_blended_action` scorer.
+// This is the headline "does the net own play" number — if it is near zero, no reward or
+// interface lever can matter because the executed action rarely differs from what plain tabular
+// play would have chosen. Default-off (byte-identical) unless `DD_SOCCER_NET_INFLUENCE_DIAG` is
+// set; when unset `record_net_influence_diag` is a no-op and the counters never move.
+fn net_influence_diag_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_NET_INFLUENCE_DIAG").is_ok())
+}
+
+const NET_INFLUENCE_DIAG_DEFAULT_LOG_EVERY: u64 = 1000;
+
+static NET_INFLUENCE_DECISIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NET_INFLUENCE_FAMILY_CHANGED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static NET_INFLUENCE_EXACT_CHANGED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static NET_INFLUENCE_ONBALL_DECISIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static NET_INFLUENCE_ONBALL_CHANGED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+// "neural-active" = the subset where the value blend was live and there were >=2 scored
+// candidates, i.e. the net genuinely had a choice to make. Codex's higher threshold (>25-30%)
+// applies here; the all-decisions number is diluted by ticks where tabular had one option.
+static NET_INFLUENCE_ACTIVE_DECISIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static NET_INFLUENCE_ACTIVE_CHANGED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[allow(clippy::too_many_arguments)]
+fn record_net_influence_diag(
+    baseline_family: &str,
+    selected_family: &str,
+    baseline_label: &str,
+    selected_label: &str,
+    on_ball: bool,
+    neural_active: bool,
+) {
+    if !net_influence_diag_enabled() {
+        return;
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    let family_changed = baseline_family != selected_family;
+    let exact_changed = baseline_label != selected_label;
+    let count = NET_INFLUENCE_DECISIONS.fetch_add(1, Relaxed) + 1;
+    if family_changed {
+        NET_INFLUENCE_FAMILY_CHANGED.fetch_add(1, Relaxed);
+    }
+    if exact_changed {
+        NET_INFLUENCE_EXACT_CHANGED.fetch_add(1, Relaxed);
+    }
+    if on_ball {
+        NET_INFLUENCE_ONBALL_DECISIONS.fetch_add(1, Relaxed);
+        if family_changed {
+            NET_INFLUENCE_ONBALL_CHANGED.fetch_add(1, Relaxed);
+        }
+    }
+    if neural_active {
+        NET_INFLUENCE_ACTIVE_DECISIONS.fetch_add(1, Relaxed);
+        if family_changed {
+            NET_INFLUENCE_ACTIVE_CHANGED.fetch_add(1, Relaxed);
+        }
+    }
+    maybe_log_net_influence_diag(count);
+}
+
+fn maybe_log_net_influence_diag(sample_count: u64) {
+    use std::sync::OnceLock;
+    static LOG_EVERY: OnceLock<u64> = OnceLock::new();
+    let log_every = *LOG_EVERY.get_or_init(|| {
+        std::env::var("DD_SOCCER_NET_INFLUENCE_DIAG_LOG_EVERY")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(NET_INFLUENCE_DIAG_DEFAULT_LOG_EVERY)
+    });
+    if log_every > 0 && sample_count > 0 && sample_count % log_every == 0 {
+        log_net_influence_diag();
+    }
+}
+
+fn log_net_influence_diag() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let decisions = NET_INFLUENCE_DECISIONS.load(Relaxed);
+    if decisions == 0 {
+        return;
+    }
+    let family = NET_INFLUENCE_FAMILY_CHANGED.load(Relaxed);
+    let exact = NET_INFLUENCE_EXACT_CHANGED.load(Relaxed);
+    let on_ball = NET_INFLUENCE_ONBALL_DECISIONS.load(Relaxed);
+    let on_ball_changed = NET_INFLUENCE_ONBALL_CHANGED.load(Relaxed);
+    let active = NET_INFLUENCE_ACTIVE_DECISIONS.load(Relaxed);
+    let active_changed = NET_INFLUENCE_ACTIVE_CHANGED.load(Relaxed);
+    let off_ball = decisions - on_ball;
+    let off_ball_changed = family - on_ball_changed;
+    let pct = |n: u64, total: u64| -> f64 {
+        if total > 0 {
+            100.0 * n as f64 / total as f64
+        } else {
+            0.0
+        }
+    };
+    eprintln!(
+        "net_influence_diag decisions={decisions} \
+         family_changed={family} ({:.1}%) exact_changed={exact} ({:.1}%) \
+         on_ball={on_ball} on_ball_changed={on_ball_changed} ({:.1}%) \
+         off_ball={off_ball} off_ball_changed={off_ball_changed} ({:.1}%) \
+         neural_active_ge2cand={active} neural_active_changed={active_changed} ({:.1}%)",
+        pct(family, decisions),
+        pct(exact, decisions),
+        pct(on_ball_changed, on_ball),
+        pct(off_ball_changed, off_ball),
+        pct(active_changed, active),
+    );
+    log_net_influence_commit_diag();
+}
+
+// Commit-level net-influence (Codex): tabular baseline vs the ACTUALLY-committed action, after
+// run_time_step_with_context + refractory + post-decision movement discipline. Compared to the
+// assembler-level number this isolates downstream suppression: if the committed SEMANTIC action
+// still differs from tabular about as often as the assembler chose to, the net drives EXECUTION
+// (=> the lateral tendency is a value/credit/preference problem, not interface); if it collapses,
+// the shield strips it. CONCRETE (post-discipline intent.label()) below SEMANTIC ⇒ discipline is
+// flattening the label (e.g. off-ball target changed without changing the action family).
+static NET_INFLUENCE_COMMIT_DECISIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static NET_INFLUENCE_COMMIT_SEMANTIC_CHANGED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static NET_INFLUENCE_COMMIT_ONBALL_DECISIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static NET_INFLUENCE_COMMIT_ONBALL_SEMANTIC_CHANGED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+// On-ball pass INTENT: how often the net's FRESH pick was a pass vs how often the COMMITTED action
+// was a pass. NET_PASS >> COMMITTED_PASS ⇒ the refractory/discipline is dropping the net's on-ball
+// PASS intent for a held (hold/dribble) action — the timidity mechanism, measured directly. This is
+// the smoking-gun for "the net wants to pass forward on the ball but the pipeline holds the ball".
+static NET_INFLUENCE_COMMIT_ONBALL_NET_PASS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static NET_INFLUENCE_COMMIT_ONBALL_COMMITTED_PASS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn record_net_influence_commit_diag(
+    baseline_family: &str,
+    committed_semantic_family: &str,
+    net_pick_family: &str,
+    on_ball: bool,
+) {
+    if !net_influence_diag_enabled() {
+        return;
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    let semantic_changed = baseline_family != committed_semantic_family;
+    NET_INFLUENCE_COMMIT_DECISIONS.fetch_add(1, Relaxed);
+    if semantic_changed {
+        NET_INFLUENCE_COMMIT_SEMANTIC_CHANGED.fetch_add(1, Relaxed);
+    }
+    if on_ball {
+        NET_INFLUENCE_COMMIT_ONBALL_DECISIONS.fetch_add(1, Relaxed);
+        if semantic_changed {
+            NET_INFLUENCE_COMMIT_ONBALL_SEMANTIC_CHANGED.fetch_add(1, Relaxed);
+        }
+        if net_pick_family == "pass" {
+            NET_INFLUENCE_COMMIT_ONBALL_NET_PASS.fetch_add(1, Relaxed);
+        }
+        if committed_semantic_family == "pass" {
+            NET_INFLUENCE_COMMIT_ONBALL_COMMITTED_PASS.fetch_add(1, Relaxed);
+        }
+    }
+}
+
+fn log_net_influence_commit_diag() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let decisions = NET_INFLUENCE_COMMIT_DECISIONS.load(Relaxed);
+    if decisions == 0 {
+        return;
+    }
+    let semantic = NET_INFLUENCE_COMMIT_SEMANTIC_CHANGED.load(Relaxed);
+    let on_ball = NET_INFLUENCE_COMMIT_ONBALL_DECISIONS.load(Relaxed);
+    let on_ball_semantic = NET_INFLUENCE_COMMIT_ONBALL_SEMANTIC_CHANGED.load(Relaxed);
+    let net_pass = NET_INFLUENCE_COMMIT_ONBALL_NET_PASS.load(Relaxed);
+    let committed_pass = NET_INFLUENCE_COMMIT_ONBALL_COMMITTED_PASS.load(Relaxed);
+    let pct = |n: u64, total: u64| -> f64 {
+        if total > 0 {
+            100.0 * n as f64 / total as f64
+        } else {
+            0.0
+        }
+    };
+    eprintln!(
+        "net_influence_commit decisions={decisions} \
+         semantic_changed={semantic} ({:.1}%) \
+         on_ball={on_ball} on_ball_semantic_changed={on_ball_semantic} ({:.1}%) \
+         on_ball_NET_pass={net_pass} ({:.1}%) on_ball_COMMITTED_pass={committed_pass} ({:.1}%)",
+        pct(semantic, decisions),
+        pct(on_ball_semantic, on_ball),
+        pct(net_pass, on_ball),
+        pct(committed_pass, on_ball),
+    );
+}
+
 fn record_pass_space_source_diag(estimator_some: bool, distinct: bool) {
     use std::sync::atomic::Ordering::Relaxed;
     let reached = PASS_SPACE_DIAG_SOURCE_REACHED.fetch_add(1, Relaxed) + 1;
@@ -44378,6 +44782,7 @@ impl WorldSnapshot {
             away_pass_completion_head: m.away_pass_completion_head.clone(),
             away_auxiliary_heads_dedicated: m.away_neural_learner.is_some() || m.away_neural_frozen,
             loose_ball_commit_head: m.loose_ball_commit_head.clone(),
+            mpc_reject_threshold_head: m.mpc_reject_threshold_head.clone(),
             receive_approach_head: m.receive_approach_head.clone(),
             lane_affinity_head: m.lane_affinity_head.clone(),
             goal_side_recovery_head: m.goal_side_recovery_head.clone(),
@@ -45128,6 +45533,7 @@ impl WorldSnapshot {
             },
             SoccerSetPlayReleaseKind::Shoot => SoccerAction::Shoot {
                 power: release_power,
+                target_point: None,
             },
         };
         Some((action, restart_label.to_string()))
@@ -50381,6 +50787,7 @@ impl WorldSnapshot {
                 expected_shot_speed_yps,
                 false,
                 perceived_pressure,
+                None,
             ))
         } else {
             None
@@ -68949,6 +69356,7 @@ impl WorldSnapshot {
             shot_speed,
             false,
             pressure,
+            None,
         );
         let on_frame = (on_frame * 0.66 + shot_mpc.accuracy_probability * 0.34).clamp(0.0, 1.0);
         let beat_keeper = (beat_keeper * 0.60 + shot_mpc.goal_probability * 0.40).clamp(0.0, 1.0);
