@@ -303,3 +303,28 @@ critic by default. Focused regressions prove away training does not allocate the
 distinct home/away actor snapshots retain distinct learned weights after install and export. This
 removes a structural learning ceiling; it is not itself held-out evidence of climb, so promotion still
 requires a fresh bounded ladder run followed by the existing independent checkpoint gate.
+
+An optimized two-round ladder smoke then exercised that exact path. The startup contract reported
+`actor_critic_enabled=true`; generation 0 exported 72 critic steps and 3,317 joint-actor updates.
+Round 2 loaded that frozen neural champion opposite the learning challenger, which reached 199
+critic steps and 8,705 actor updates. Champion and challenger actor payloads had different hashes,
+and the `0.000` goal-difference challenger was correctly held below the `0.250` promotion margin.
+This proves isolated train/serve/export behavior, not performance.
+
+The first bounded actor-on versus explicit critic-only ladder screen used seed `16000`, three rounds,
+two games per opponent, 0.2-minute fixtures, and four-game internal gates. Actor-on published its
+generation 0 in round 1 but held rounds 2 and 3 at `-0.250` goal/game versus champion. Critic-only
+failed the analytic-anchor gate in round 1, published generation 0 in round 2, and held round 3 at
+`-0.250`. That differing bootstrap timing left actor-on with ten training fixtures and 1,435 critic
+steps versus critic-only's eight fixtures and 1,158 steps, so internal ladder summaries are not a
+matched performance comparison.
+
+On a common 32-game `F580` frozen head-to-head field, the final actor-on checkpoint went
+`5W-21D-6L` against critic-only: payoff `0.484`, Wilson lower bound `0.322`, Elo delta `-44.4`, and
+promotion verdict `REJECT`. Actor-on doubled pass attempts (`12.8` versus `6.0/game`) at `96%`
+completion, but only `5%` of completions were forward versus critic-only's `6%`. Completed forward
+passes improved directionally from `0.3` to `0.6/game`, but the paired gain was only `+0.25/game`
+with a `-0.19` lower bound. The isolated actor is now learning and materially changing behavior,
+but this seed mostly converts its extra policy capacity into lateral circulation and does not climb.
+No actor dose or checkpoint is promoted from this screen; the next comparison must equalize training
+fixtures and target actor direction/credit rather than merely enabling more actor updates.
