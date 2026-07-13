@@ -59388,6 +59388,7 @@ fn tracking_frame_to_world_snapshot(
         away_pass_completion_head: None,
         away_auxiliary_heads_dedicated: false,
         loose_ball_commit_head: None,
+        mpc_reject_threshold_head: None,
         receive_approach_head: None,
         lane_affinity_head: None,
         goal_side_recovery_head: None,
