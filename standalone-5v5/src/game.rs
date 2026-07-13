@@ -14,9 +14,11 @@ pub const FINAL_THIRD_X: f32 = FIELD_L * 2.0 / 3.0; // attacking-third boundary 
 pub const SHOOT_X: f32 = FIELD_L / 2.0; // A may shoot once in the OPPONENT'S HALF (not just the final third)
 pub const N: usize = 5; // players per team (index 0 == goalkeeper)
 pub const GK: usize = 0; // goalkeeper index; controlled by a fixed rule, not the policy
-pub const DT: f32 = 0.05; // seconds per decision tick -> 20 Hz sim (real-time 20 fps)
+// Tick rate matches the 11v11 engine exactly (DEFAULT_DT_SECONDS = 1/15) so every
+// dt-derived physics constant ported from it transfers 1:1 with no re-derivation.
+pub const DT: f32 = 1.0 / 15.0; // seconds per decision tick -> 15 Hz sim (11v11 parity)
 pub const HZ: f32 = 1.0 / DT; // ticks per second (for real-time viewer playback)
-pub const STEPS: usize = 600; // ticks per TRAINING episode (~30s at 20 Hz)
+pub const STEPS: usize = 450; // ticks per TRAINING episode (~30s at 15 Hz)
 
 // The RECORDED viz match (match_before/after.json) runs longer than a training
 // episode so the before/after playback shows more football (incl. kickoffs after
