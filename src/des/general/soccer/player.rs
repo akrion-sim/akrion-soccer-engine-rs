@@ -9000,7 +9000,13 @@ impl PlayerAgent {
         observation: &SoccerPomdpObservation,
     ) -> (SoccerAction, String) {
         if shot_decision_is_qualified_for_role(observation, self.role) {
-            return (SoccerAction::Shoot { power: 1.0 }, "shoot".to_string());
+            return (
+                SoccerAction::Shoot {
+                    power: 1.0,
+                    target_point: None,
+                },
+                "shoot".to_string(),
+            );
         }
 
         self.human_carry_or_protect_action(snapshot, observation)
