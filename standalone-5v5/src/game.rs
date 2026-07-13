@@ -1391,6 +1391,8 @@ impl World {
             self.owner = Some(o);
             self.ball_aerial = false; // controlled -> no longer airborne
             self.air_ticks = 0;
+            self.ball_z = 0.0;
+            self.ball_taloft = 0.0;
             self.ball_curl = V2::default();
             self.a_shot_flag = false; // shot resolved into possession
             self.b_shot_flag = false;
