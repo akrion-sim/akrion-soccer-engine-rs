@@ -471,6 +471,14 @@ fn train_ckpt(out_prefix: &str, games: usize, minutes: f64, seed_base: u32, ckpt
     let mut attack_spacing_head: Option<AttackSpacingHead> = None;
     let mut support_scorer_head: Option<SupportScorerHead> = None;
     let analytic_opponent_fraction = proof_analytic_opponent_fraction();
+    let keepbest = KeepBestConfig::from_env();
+    if let Some(kb) = keepbest.as_ref() {
+        println!(
+            "[keepbest] enabled: every={} games={} holdout=0x{:08X} (in-process proxy eval vs analytic on held-out seeds; goal-diff/game primary, SOT/game tiebreak)",
+            kb.every, kb.games, kb.holdout
+        );
+    }
+    let mut kb_best: Option<KeepBestScore> = None;
     let started = Instant::now();
 
     let write_ckpt = |snap: &SoccerNeuralNetworkSnapshot, tag: &str| {
