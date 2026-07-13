@@ -3404,6 +3404,7 @@ mod tests {
     #[test]
     fn lofted_launch_speed_is_capped_to_land_in_bounds() {
         let mut w = World::new();
+        w.parity_flight = true; // parity z-flight behavior
         let mut rng = Rng::new(11);
         for i in 0..N {
             w.a[i].pos = V2::new(4.0 + i as f32, 3.0);
