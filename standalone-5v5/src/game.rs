@@ -397,16 +397,8 @@ fn players(team: Team, w: &World) -> &[Player; N] {
 impl World {
     pub fn new() -> Self {
         let mut w = World {
-            a: [Player {
-                pos: V2::default(),
-                vel: V2::default(),
-                des_vel: V2::default(),
-            }; N],
-            b: [Player {
-                pos: V2::default(),
-                vel: V2::default(),
-                des_vel: V2::default(),
-            }; N],
+            a: [Player::default(); N],
+            b: [Player::default(); N],
             ball: V2::new(FIELD_L / 2.0, FIELD_W / 2.0),
             ball_vel: V2::default(),
             ball_aerial: false,
