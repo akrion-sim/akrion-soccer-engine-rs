@@ -1786,6 +1786,9 @@ impl World {
                     }
                 }
             }
+            if self.ball_z > KEEPER_AERIAL_REACH {
+                continue; // a lofted ball sailing OVER the keeper can't be smothered
+            }
             let d = players(team, self)[GK].pos.sub(self.ball).len();
             if d < KEEPER_REACH && best.is_none_or(|(_, bd)| d < bd) {
                 best = Some((Owner { team, idx: GK }, d));
