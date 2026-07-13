@@ -3253,4 +3253,166 @@ mod tests {
             w.mpc_field_vector_score(Team::A, 2, spaced)
         );
     }
+
+    // ---- Goalkeeper save-probability model (11v11 port) ---------------------
+
+    /// Fire a flagged A shot from `from` at (FIELD_L, aim_y) with everyone else
+    /// parked out of the corridor; the B keeper starts set on its line. Returns
+    /// (goal, saved).
+    fn run_flagged_a_shot(from: V2, aim_y: f32, seed: u64) -> (bool, bool) {
+        let mut w = World::new();
+        for i in 0..N {
+            w.a[i].pos = V2::new(4.0 + i as f32 * 2.0, 2.0);
+            w.b[i].pos = V2::new(4.0 + i as f32 * 2.0, 26.0);
+        }
+        w.b[GK].pos = V2::new(FIELD_L - 2.0, FIELD_W / 2.0);
+        w.b[GK].vel = V2::default();
+        w.owner = None;
+        w.ball = from;
+        w.a_shot_flag = true;
+        w.a_shot_origin = from;
+        let aim = V2::new(FIELD_L, aim_y);
+        w.ball_vel = aim.sub(from).unit().scale(SHOT_SPEED);
+        let mut rng = Rng::new(seed);
+        for _ in 0..90 {
+            let g = w.goals_a;
+            w.step(&stays(), &stays(), &mut rng);
+            if w.goals_a > g {
+                return (true, false);
+            }
+            if w.ev_save_a {
+                return (false, true);
+            }
+        }
+        (false, false)
+    }
+
+    #[test]
+    fn close_central_shot_scores_more_than_long_wide_shot_vs_set_keeper() {
+        // Distance is the primary save driver: a close central on-frame shot
+        // beats the keeper (low distance baseline), while a ~20yd effort at a
+        // set keeper is mostly stopped. Sweep aim points across the mouth and
+        // a few seeds.
+        let cy = FIELD_W / 2.0;
+        let aims = [cy - 2.8, cy - 1.4, cy, cy + 1.4, cy + 2.8];
+        let mut close_goals = 0;
+        let mut wide_goals = 0;
+        let mut wide_saves = 0;
+        for (s, aim) in aims.iter().enumerate() {
+            for seed in [3u64, 17, 91] {
+                let (g, _) = run_flagged_a_shot(V2::new(FIELD_L - 8.0, cy), *aim, seed + s as u64);
+                close_goals += g as u32;
+                // 20 yd out, wide angle (12 yd off center)
+                let (g2, sv2) =
+                    run_flagged_a_shot(V2::new(FIELD_L - 16.0, cy + 12.0), *aim, seed + s as u64);
+                wide_goals += g2 as u32;
+                wide_saves += sv2 as u32;
+            }
+        }
+        assert!(
+            close_goals > wide_goals,
+            "close central shots should score more: close={close_goals} wide={wide_goals}"
+        );
+        assert!(
+            wide_saves > 0,
+            "a set keeper should save some 20yd efforts (saves={wide_saves})"
+        );
+    }
+
+    #[test]
+    fn parried_shot_is_a_live_free_ball_moving_away_from_goal() {
+        // A hot arrival (no flight decay) from 15 yd: saved (keeper set in the
+        // lane) but too hot to hold -> PARRY: live ball, owner None, moving
+        // AWAY from goal, and it must never turn into a goal.
+        let mut w = World::new();
+        for i in 0..N {
+            w.a[i].pos = V2::new(4.0 + i as f32 * 2.0, 2.0);
+            w.b[i].pos = V2::new(4.0 + i as f32 * 2.0, 26.0);
+        }
+        let cy = FIELD_W / 2.0;
+        w.b[GK].pos = V2::new(FIELD_L - 2.0, cy);
+        w.b[GK].vel = V2::default();
+        w.owner = None;
+        w.a_shot_flag = true;
+        w.a_shot_origin = V2::new(FIELD_L - 15.0, cy); // struck 15 yd out...
+        w.ball = V2::new(FIELD_L - 3.5, cy); // ...but already near the plane
+        w.ball_vel = V2::new(SHOT_SPEED, 0.0); // at full speed (a rocket)
+        let mut rng = Rng::new(5);
+        let mut parried = false;
+        for _ in 0..45 {
+            w.step(&stays(), &stays(), &mut rng);
+            if w.ev_save_a {
+                parried = true;
+                assert!(w.owner.is_none(), "a parry must leave the ball live");
+                assert!(
+                    w.ball_vel.x < 0.0,
+                    "parry rebound must move AWAY from the goal, vel={:?}",
+                    w.ball_vel
+                );
+                assert!(w.ball.x < FIELD_L - GK_SAVE_DEPTH_MIN);
+                break;
+            }
+            assert_eq!(w.goals_a, 0, "the shot must be saved, not scored");
+        }
+        assert!(parried, "the hot 15yd shot should be saved");
+        // the rebound must never re-trigger a goal (flag cleared + moving away)
+        for _ in 0..45 {
+            w.step(&stays(), &stays(), &mut rng);
+        }
+        assert_eq!(w.goals_a, 0, "a parried ball must not become a goal");
+    }
+
+    #[test]
+    fn keeper_save_resolution_is_deterministic_per_seed() {
+        // Same seed -> identical outcome (the save/catch/parry decision draws
+        // no RNG). Run a full scripted episode twice and compare exactly.
+        let run = || {
+            let mut w = World::new();
+            let mut rng = Rng::new(4242);
+            let mut saves = 0u32;
+            for _ in 0..STEPS {
+                let aa = w.scripted_actions(Team::A);
+                let ab = w.scripted_actions(Team::B);
+                w.step(&aa, &ab, &mut rng);
+                saves += (w.ev_save_a || w.ev_save_b) as u32;
+            }
+            (
+                w.goals_a,
+                w.goals_b,
+                saves,
+                w.ball.x.to_bits(),
+                w.ball.y.to_bits(),
+            )
+        };
+        assert_eq!(run(), run(), "same seed must reproduce the same episode");
+    }
+
+    #[test]
+    fn scripted_play_produces_both_saves_and_goals() {
+        // The keeper must be neither useless nor unbeatable: across scripted
+        // episodes the save model must both stop shots and concede goals.
+        let mut rng = Rng::new(99);
+        let (mut goals_a, mut goals_b) = (0u32, 0u32);
+        let (mut saves_a, mut saves_b) = (0u32, 0u32);
+        for e in 0..30 {
+            let mut w = World::new();
+            if e % 2 == 1 {
+                w.kickoff(Team::B);
+            }
+            for _ in 0..STEPS {
+                let aa = w.scripted_actions(Team::A);
+                let ab = w.scripted_actions(Team::B);
+                w.step(&aa, &ab, &mut rng);
+                saves_a += w.ev_save_a as u32;
+                saves_b += w.ev_save_b as u32;
+            }
+            goals_a += w.goals_a;
+            goals_b += w.goals_b;
+        }
+        println!(
+            "scripted tally: goals A {goals_a} / B {goals_b}, saves on A-shots {saves_a} / on B-shots {saves_b}"
+        );
+        assert!(goals_a + goals_b > 0, "keeper must not be unbeatable");
+        assert!(saves_a + saves_b > 0, "keeper must make some saves");
+    }
 }
