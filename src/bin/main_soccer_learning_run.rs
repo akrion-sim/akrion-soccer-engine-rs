@@ -6707,6 +6707,16 @@ fn run_game(
     {
         sim.set_loose_ball_commit_head(head.clone());
     }
+    // Install the carried MPC reject-threshold head so the feasibility gate consumes it
+    // live once trained. No-op unless the reject-threshold model is enabled.
+    if let Some(head) = carried_lock(
+        &CARRIED_MPC_REJECT_THRESHOLD_HEAD,
+        "CARRIED_MPC_REJECT_THRESHOLD_HEAD",
+    )
+    .as_ref()
+    {
+        sim.set_mpc_reject_threshold_head(head.clone());
+    }
     // Install the carried receive-approach head so `receive_approach_adjusted_target`
     // consumes it live once trained. No-op unless DD_SOCCER_ENABLE_RECEIVE_APPROACH_MODEL
     // is set.
