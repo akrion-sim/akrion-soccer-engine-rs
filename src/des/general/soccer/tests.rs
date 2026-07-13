@@ -99944,10 +99944,188 @@ fn mpc_reject_threshold_pipeline_collects_and_trains_end_to_end() {
     );
 
     // The drained corpus trains a usable head (the learner's per-game step).
-    let (head, report) = train_mpc_reject_threshold_head(&on_samples, 7, 4, 0.02)
+    let (trained_head, report) = train_mpc_reject_threshold_head(&on_samples, 7, 4, 0.02)
         .expect("a non-empty corpus trains a reject-threshold head");
     assert!(
-        report.training_steps > 0 && head.training_steps() > 0 && report.final_loss.is_finite(),
+        report.training_steps > 0
+            && trained_head.training_steps() > 0
+            && report.final_loss.is_finite(),
         "training must advance the head: {report:?}"
     );
+
+    // --- Live seam behavior: build a fresh in-play snapshot with ball carriers and
+    // exercise `learned_mpc_reject_threshold` directly (this is the value MPC actually
+    // gates against). All env toggling stays inside this single test to avoid racing a
+    // parallel test on the process-global flag.
+    let seam_config = MatchConfig {
+        duration_seconds: 12.0,
+        seed: 77_010,
+        ..MatchConfig::default()
+    };
+    let seam_ticks = seam_config.total_ticks().min(300);
+    let mut seam_sim = SoccerMatch::default_11v11(seam_config);
+    for _ in 0..seam_ticks {
+        seam_sim.run_time_step();
+    }
+    let carriers: Vec<usize> = {
+        let snap = WorldSnapshot::from_match(&seam_sim);
+        snap.players
+            .iter()
+            .filter(|p| p.role != PlayerRole::Goalkeeper)
+            .map(|p| p.id)
+            .collect()
+    };
+    assert!(!carriers.is_empty(), "match must have field players");
+    let base = 0.18_f64;
+    let families = [
+        MpcRejectFamily::Pass,
+        MpcRejectFamily::Dribble,
+        MpcRejectFamily::Shot,
+    ];
+
+    // OFF: the seam must return EXACTLY the base constant — byte-identical, no feature
+    // build, for every player and family.
+    std::env::remove_var("DD_SOCCER_ENABLE_MPC_REJECT_THRESHOLD_MODEL");
+    {
+        let snap = WorldSnapshot::from_match(&seam_sim);
+        for &pid in &carriers {
+            for fam in families {
+                let bar = snap.learned_mpc_reject_threshold(pid, fam, base);
+                assert_eq!(
+                    bar, base,
+                    "disabled seam must return exactly the base bar (player {pid}, {fam:?})"
+                );
+            }
+        }
+    }
+
+    // ON (analytic seed, no head installed): bars stay in the valid band AND vary across
+    // contexts — i.e. "too low" is genuinely a function of the field vector, not a global
+    // constant. Also capture a per-player reference bar to prove the gate below.
+    std::env::set_var("DD_SOCCER_ENABLE_MPC_REJECT_THRESHOLD_MODEL", "1");
+    let analytic_bars: Vec<f64> = {
+        let snap = WorldSnapshot::from_match(&seam_sim);
+        let mut bars = Vec::new();
+        for &pid in &carriers {
+            let bar = snap.learned_mpc_reject_threshold(pid, MpcRejectFamily::Pass, base);
+            assert!(
+                (MPC_REJECT_THRESHOLD_FLOOR..=MPC_REJECT_THRESHOLD_CEIL).contains(&bar),
+                "enabled bar {bar} out of band"
+            );
+            bars.push(bar);
+        }
+        bars
+    };
+    let bar_min = analytic_bars.iter().cloned().fold(f64::INFINITY, f64::min);
+    let bar_max = analytic_bars
+        .iter()
+        .cloned()
+        .fold(f64::NEG_INFINITY, f64::max);
+    assert!(
+        bar_max - bar_min > 1e-3,
+        "enabled analytic reject bar must vary across contexts (range {bar_min}..{bar_max}), \
+         proving it is context-dependent and not the global constant"
+    );
+
+    // Min-training-steps gate: installing a RAW head (0 training steps, below
+    // MPC_REJECT_THRESHOLD_HEAD_MIN_TRAINING_STEPS) must NOT be consumed — the seam must
+    // still return the analytic-seed bar, identical to the no-head case above.
+    assert!(
+        MpcRejectThresholdHead::new(9).training_steps()
+            < MPC_REJECT_THRESHOLD_HEAD_MIN_TRAINING_STEPS,
+        "a freshly-seeded head must start below the consumption gate"
+    );
+    seam_sim.set_mpc_reject_threshold_head(MpcRejectThresholdHead::new(9));
+    {
+        let snap = WorldSnapshot::from_match(&seam_sim);
+        for (i, &pid) in carriers.iter().enumerate() {
+            let bar = snap.learned_mpc_reject_threshold(pid, MpcRejectFamily::Pass, base);
+            assert_eq!(
+                bar, analytic_bars[i],
+                "a raw head below the min-training-steps gate must fall back to the analytic \
+                 bar (player {pid}), got {bar} vs analytic {}",
+                analytic_bars[i]
+            );
+        }
+    }
+
+    // A TRAINED head (>= the min-steps gate) IS consumed and overrides the analytic
+    // seed. Regress a head toward a distinctive high bar (0.70) for these contexts —
+    // well above any analytic bar (base 0.18 + at most ANALYTIC_CONTEXT_SWING) — so a
+    // seam value near 0.70 can only mean the learned head, not the seed, was used.
+    {
+        let target_bar = 0.70_f64;
+        let training_rows: Vec<(MpcRejectThresholdInputs, f64)> = {
+            let snap = WorldSnapshot::from_match(&seam_sim);
+            carriers
+                .iter()
+                .filter_map(|&pid| {
+                    let player = snap.players.iter().find(|p| p.id == pid)?;
+                    let inputs = snap.build_mpc_reject_threshold_inputs(
+                        player,
+                        MpcRejectFamily::Pass,
+                        base,
+                    )?;
+                    Some((inputs, target_bar))
+                })
+                .collect()
+        };
+        assert!(!training_rows.is_empty(), "need carrier contexts to train on");
+        let mut head = MpcRejectThresholdHead::new(31);
+        let mut guard = 0;
+        while head.training_steps() < MPC_REJECT_THRESHOLD_HEAD_MIN_TRAINING_STEPS && guard < 5000 {
+            head.train(&training_rows, 0.1);
+            guard += 1;
+        }
+        assert!(
+            head.training_steps() >= MPC_REJECT_THRESHOLD_HEAD_MIN_TRAINING_STEPS,
+            "head must cross the consumption gate"
+        );
+        seam_sim.set_mpc_reject_threshold_head(head);
+        let snap = WorldSnapshot::from_match(&seam_sim);
+        for &pid in &carriers {
+            let bar = snap.learned_mpc_reject_threshold(pid, MpcRejectFamily::Pass, base);
+            assert!(
+                bar > 0.55,
+                "a trained head regressed toward {target_bar} must be consumed at the seam \
+                 (got {bar}); no analytic seed can reach here"
+            );
+        }
+    }
+    std::env::remove_var("DD_SOCCER_ENABLE_MPC_REJECT_THRESHOLD_MODEL");
+}
+
+#[test]
+fn anchored_reward_currency_invariants() {
+    // One test fn so the env-flag transitions are ordered (parallel-safe):
+    // OFF ⇒ byte-identical legacy currency.
+    std::env::remove_var("DD_SOCCER_ENABLE_ANCHORED_REWARDS");
+    assert!(!anchored_rewards_enabled());
+    assert!((live_goal_reward_points() - GOAL_REWARD_POINTS).abs() < 1e-9);
+    assert!((anchored_currency_scale() - 1.0).abs() < 1e-9);
+
+    // ON ⇒ the anchors, exactly.
+    std::env::set_var("DD_SOCCER_ENABLE_ANCHORED_REWARDS", "true");
+    assert!((live_goal_reward_points() - ANCHOR_GOAL_POINTS).abs() < 1e-9);
+    assert!((match_outcome_win_reward_points() - ANCHOR_WIN_POINTS).abs() < 1e-9);
+    assert!(
+        (anchored_currency_scale() - ANCHOR_GOAL_POINTS / GOAL_REWARD_POINTS).abs() < 1e-9
+    );
+
+    // On-frame shot anchor: floor 50 everywhere (an on-frame 80-yarder pays
+    // exactly the floor), cap 200 = 0.40·goal at the best field-vector
+    // context, monotone between, clamped outside [0,1].
+    assert!((anchored_on_frame_shot_points(0.0) - ANCHOR_ON_FRAME_SHOT_FLOOR).abs() < 1e-9);
+    let best = anchored_on_frame_shot_points(1.0);
+    assert!((best - 200.0).abs() < 1e-9);
+    assert!(best <= ANCHOR_GOAL_POINTS * 0.40 + 1e-9);
+    assert!(anchored_on_frame_shot_points(0.8) > anchored_on_frame_shot_points(0.3));
+    assert!((anchored_on_frame_shot_points(7.0) - 200.0).abs() < 1e-9);
+
+    // Currency ordering: shot cap < goal < win, win = 2·goal, goal = 10·floor.
+    assert!(best < ANCHOR_GOAL_POINTS && ANCHOR_GOAL_POINTS < ANCHOR_WIN_POINTS);
+    assert!((ANCHOR_WIN_POINTS - 2.0 * ANCHOR_GOAL_POINTS).abs() < 1e-9);
+    assert!((ANCHOR_GOAL_POINTS - 10.0 * ANCHOR_ON_FRAME_SHOT_FLOOR).abs() < 1e-9);
+
+    std::env::remove_var("DD_SOCCER_ENABLE_ANCHORED_REWARDS");
 }
