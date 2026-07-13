@@ -2444,6 +2444,24 @@ mod tests {
     }
 
     #[test]
+    fn dead_ball_restarts_assign_the_right_team() {
+        // Throw-in goes to the team that did NOT put it out; the ball is parked (no velocity).
+        let mut w = World::new();
+        w.ball_vel = V2::new(3.0, 9.0);
+        w.throw_in(Team::B, V2::new(20.0, FIELD_W));
+        assert!(matches!(w.owner, Some(o) if o.team == Team::B));
+        assert!(w.ball_vel.len() < 1e-6 && w.ball_z == 0.0 && !w.ball_aerial);
+        // Corner: attacker restarts from the goal-line corner on the ball's side.
+        w.corner_kick(Team::A, FIELD_L, 2.0);
+        assert!(matches!(w.owner, Some(o) if o.team == Team::A));
+        assert!((w.ball.x - FIELD_L).abs() < 1e-6 && w.ball.y < FIELD_W / 2.0);
+        // Goal-kick funnels through the same restart and clears shot flags.
+        w.a_shot_flag = true;
+        w.goal_kick(Team::B);
+        assert!(matches!(w.owner, Some(o) if o.team == Team::B) && !w.a_shot_flag);
+    }
+
+    #[test]
     fn three_term_drag_decelerates_and_stops() {
         // A rolling ball loses speed each tick and eventually snaps to rest.
         let mut s = 18.0f32;
