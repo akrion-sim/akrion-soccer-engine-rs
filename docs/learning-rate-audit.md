@@ -91,3 +91,40 @@ advantage/keeper/actor/mappo suites.
    `target_clip` in tandem so the ±6.67 outcome label isn't clipped flat.)
 3. **Track F3**: if high-scoring self-play games become common, lift `target_clip` or
    the return clip together so the critic baseline isn't saturated.
+
+## 11v11 plateau anchor audit (2026-07-13)
+
+The reward scale is not itself moving during one learner process. With
+`SOCCER_DYNAMIC_REWARD_WEIGHTS=1`, reward helpers re-read environment variables rather
+than caching them, but the process does not rewrite its own environment during a game or
+training round. An external search can launch a later process with a different profile;
+inside one run, the numeric ruler is stationary.
+
+A requested match-win reward of `10_000` is also not a distinct treatment in the current
+replay contract. The match outcome is added after dense-return blending and the resulting
+transition is clamped to `SOCCER_FULL_GAME_RETURN_CLIP` (`400`). The largest meaningful
+one-goal win-anchor treatment is therefore `400`; values above it collapse to the same
+target before critic target scaling, target clipping, and advantage normalization.
+
+The moving ruler that remained was the **acceptance opponent**:
+
+- `soccer_league_train` trained on varying analytic genomes but promoted against only the
+  immediately previous neural checkpoint.
+- `main_soccer_learning_run` likewise ratcheted candidate versus previous neural anchor,
+  without proving that either retained absolute performance against the analytic engine.
+
+Both trainers now use a deterministic pure-analytic anchor (`0xA5A5_0007`) in addition to
+the moving neural comparison. League training always includes the fixed opponent and its
+checkpoint gate compares candidate and incumbent against paired analytic fixtures. The
+continuous learner's promotion gate does the same; a candidate is archived when its
+held-out goal difference versus the analytic anchor regresses beyond the configured
+tolerance. Candidate/incumbent seeds and home-away assignments are paired so the comparison
+measures policy drift instead of fixture drift.
+
+The reproducible reward experiment is `scripts/run_reward_anchor_ab.sh`. It trains three
+same-seed arms against an alternating analytic pool: no outcome label, the existing `200`
+label, and the maximum effective `400` label, then evaluates every snapshot on the same
+held-out analytic field. A 12-game smoke run produced payoffs `0.438` (`200`) and `0.469`
+(`400`) over 16 held-out games; both failed the confidence gate, so this is evidence that
+the treatment executes—not evidence of a breakthrough. Larger repeated-seed results must
+drive any reward-default change.

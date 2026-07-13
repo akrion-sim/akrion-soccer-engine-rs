@@ -850,6 +850,12 @@ fn without_target_q(mut brain: TeamBrain) -> TeamBrain {
     brain
 }
 
+fn fixed_analytic_anchor() -> TeamBrain {
+    let mut brain = without_target_q(TeamBrain::fresh_with_seed(0xA5A5_0007, 100));
+    brain.neural = None;
+    brain
+}
+
 fn play_and_carry(
     runner: &mut EngineMatchRunner,
     frontier: TeamBrain,
@@ -911,12 +917,13 @@ fn play_checkpoint_validation(
     runner: &EngineMatchRunner,
     candidate: &TeamBrain,
     baseline: &TeamBrain,
+    label: &str,
     round: u32,
     games: usize,
 ) -> LeagueRoundKpis {
     let mut validation = LeagueRoundKpis::default();
     let mut runner = runner.clone();
-    println!("league_checkpoint_validation_start round={round} games={games}");
+    println!("league_checkpoint_validation_start label={label} round={round} games={games}");
     for g in 0..games {
         let candidate_home = g % 2 == 0;
         let seed = 0xC1A0_0000u32
@@ -943,7 +950,7 @@ fn play_checkpoint_validation(
             Ok(Ok(outcome)) => {
                 let kpis = LeagueMatchKpis::from_summary(&outcome.summary, candidate_team);
                 println!(
-                    "league_checkpoint_validation_game round={round} game={} candidate_home={} score={}-{} forward_pass_margin={} net_forward_pass_margin={}",
+                    "league_checkpoint_validation_game label={label} round={round} game={} candidate_home={} score={}-{} forward_pass_margin={} net_forward_pass_margin={}",
                     g,
                     candidate_home,
                     outcome.home_goals,
@@ -954,14 +961,34 @@ fn play_checkpoint_validation(
                 validation.add(kpis);
             }
             Ok(Err(err)) => {
-                eprintln!("league_checkpoint_validation_error round={round} game={g}: {err}");
+                eprintln!("league_checkpoint_validation_error label={label} round={round} game={g}: {err}");
             }
             Err(_) => {
-                eprintln!("league_checkpoint_validation_panic round={round} game={g}");
+                eprintln!(
+                    "league_checkpoint_validation_panic label={label} round={round} game={g}"
+                );
             }
         }
     }
     validation
+}
+
+fn analytic_anchor_non_regression_passes(
+    candidate: Option<&LeagueRoundKpis>,
+    incumbent: Option<&LeagueRoundKpis>,
+    expected_games: usize,
+    max_goal_diff_regression: f64,
+) -> bool {
+    match (candidate, incumbent) {
+        (Some(candidate), Some(incumbent)) => {
+            candidate.games == expected_games
+                && incumbent.games == expected_games
+                && candidate.mean_goal_diff() + max_goal_diff_regression
+                    >= incumbent.mean_goal_diff()
+        }
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 fn checkpoint_validation_passes(
@@ -1025,6 +1052,22 @@ fn main() {
         "SOCCER_LEAGUE_CHECKPOINT_VALIDATE_MIN_GOAL_DIFF_MARGIN",
         0.0,
     );
+    let fixed_analytic_training_anchor =
+        env_bool("SOCCER_LEAGUE_FIXED_ANALYTIC_TRAINING_ANCHOR", true);
+    let analytic_anchor_gate = env_bool("SOCCER_LEAGUE_ANALYTIC_ANCHOR_GATE", true);
+    let analytic_anchor_validate_games = if analytic_anchor_gate {
+        env_usize(
+            "SOCCER_LEAGUE_ANALYTIC_ANCHOR_VALIDATE_GAMES",
+            checkpoint_validate_games.max(4),
+        )
+    } else {
+        0
+    };
+    let analytic_anchor_max_goal_diff_regression = env_f64(
+        "SOCCER_LEAGUE_ANALYTIC_ANCHOR_MAX_GOAL_DIFF_REGRESSION",
+        0.0,
+    )
+    .max(0.0);
     let max_rounds = env_usize("SOCCER_LEAGUE_MAX_ROUNDS", 0);
     let max_training_steps = env_usize("SOCCER_LEAGUE_MAX_TRAINING_STEPS", 0);
     let step_archive_buckets = env_usize_list("SOCCER_LEAGUE_STEP_ARCHIVE_BUCKETS");
@@ -1438,6 +1481,13 @@ fn main() {
          marl_team_weight={marl_team_reward_weight:.4} marl_intermediate_weight={marl_intermediate_reward_weight:.2} \
          planner_teacher={planner_teacher_weight:.2} finishing_select={finishing_select_bonus_weight:.2}"
     );
+    println!(
+        "league_stability_anchors fixed_analytic_training_anchor={} analytic_anchor_gate={} analytic_anchor_validate_games={} analytic_anchor_max_goal_diff_regression={:.3}",
+        fixed_analytic_training_anchor,
+        analytic_anchor_gate,
+        analytic_anchor_validate_games,
+        analytic_anchor_max_goal_diff_regression,
+    );
 
     loop {
         round += 1;
@@ -1472,6 +1522,13 @@ fn main() {
             }
         }
 
+        // Keep one opponent distribution point stationary across every round. Fresh analytic
+        // genomes and archived champions provide diversity, but this deterministic engine anchor
+        // prevents the learner's ruler from moving along with the rest of the population.
+        if fixed_analytic_training_anchor && !self_play_ladder {
+            opponents.push(fixed_analytic_anchor());
+        }
+
         // SELF-PLAY LADDER: replace the league with just the CURRENT published champion (neural, so it
         // drives Team B through the same inference path and strengthens as the ladder climbs) plus one
         // ANALYTIC baseline — the challenger co-evolves against a tougher self AND stays grounded
@@ -1486,9 +1543,7 @@ fn main() {
                     champ
                 });
             }
-            let mut analytic_base = TeamBrain::fresh_with_seed(0xA5A5_0007, 100);
-            analytic_base.neural = None; // stripped net -> pure analytic engine (grounding opponent)
-            pool.push(analytic_base);
+            pool.push(fixed_analytic_anchor());
             opponents = pool;
         }
 
@@ -1779,13 +1834,14 @@ fn main() {
         if round % (checkpoint_every as u32) == 0 {
             if frontier.neural.is_some() {
                 let prior_best = best_checkpoint_net_forward_pass_margin;
+                let checkpoint_incumbent =
+                    load_brain(&frontier_path).unwrap_or_else(|| checkpoint_baseline.clone());
                 let validation = if checkpoint_validate_games > 0 {
-                    let checkpoint_incumbent =
-                        load_brain(&frontier_path).unwrap_or_else(|| checkpoint_baseline.clone());
                     let validation = play_checkpoint_validation(
                         &runner,
                         &frontier,
                         &checkpoint_incumbent,
+                        "incumbent",
                         round,
                         checkpoint_validate_games,
                     );
@@ -1804,6 +1860,42 @@ fn main() {
                 } else {
                     None
                 };
+                let (candidate_anchor_validation, incumbent_anchor_validation) =
+                    if analytic_anchor_validate_games > 0 {
+                        let anchor = fixed_analytic_anchor();
+                        let candidate = play_checkpoint_validation(
+                            &runner,
+                            &frontier,
+                            &anchor,
+                            "candidate_vs_analytic_anchor",
+                            round,
+                            analytic_anchor_validate_games,
+                        );
+                        let incumbent = play_checkpoint_validation(
+                            &runner,
+                            &checkpoint_incumbent,
+                            &anchor,
+                            "incumbent_vs_analytic_anchor",
+                            round,
+                            analytic_anchor_validate_games,
+                        );
+                        println!(
+                            "league_analytic_anchor_validation round={round} games={} candidate_gd_per_game={:.3} incumbent_gd_per_game={:.3} delta_gd_per_game={:.3}",
+                            analytic_anchor_validate_games,
+                            candidate.mean_goal_diff(),
+                            incumbent.mean_goal_diff(),
+                            candidate.mean_goal_diff() - incumbent.mean_goal_diff(),
+                        );
+                        (Some(candidate), Some(incumbent))
+                    } else {
+                        (None, None)
+                    };
+                let passes_analytic_anchor = analytic_anchor_non_regression_passes(
+                    candidate_anchor_validation.as_ref(),
+                    incumbent_anchor_validation.as_ref(),
+                    analytic_anchor_validate_games,
+                    analytic_anchor_max_goal_diff_regression,
+                );
                 let validation_forward_pass_margin =
                     validation.as_ref().map(|v| v.mean_forward_pass_margin());
                 let validation_net_forward_pass_margin = validation
@@ -1844,7 +1936,7 @@ fn main() {
                         println!(
                             "league_self_play_ladder round={round} verdict=PROMOTED bootstrap_gen0=true"
                         );
-                        true
+                        passes_analytic_anchor
                     } else {
                         // Ladder gate: promote iff the challenger beat the CURRENT champion by the
                         // goal-diff margin over the held-out head-to-head eval. Republishing the
@@ -1857,16 +1949,16 @@ fn main() {
                             self_play_promote_margin,
                             if ladder_promotes { "PROMOTED" } else { "held" }
                         );
-                        ladder_promotes
+                        ladder_promotes && passes_analytic_anchor
                     }
                 } else {
                     passes_forward_pass_climb
                         && ((passes_forward_pass_floor && passes_net_forward_pass_floor)
                             || passes_goal_diff_floor)
                         && passes_validation
+                        && passes_analytic_anchor
                 };
-                if promotes
-                {
+                if promotes {
                     let cp = format!(
                         "{}/league-r{:04}-{}.json",
                         archive_dir.trim_end_matches('/'),
@@ -1886,10 +1978,11 @@ fn main() {
                     );
                 } else {
                     println!(
-                        "league_checkpoint_held round={round} metric=completed_forward_passes net_metric=completed_forward_passes_minus_turnovers gate_forward_pass_margin_per_game={gate_forward_pass_margin:.3} gate_net_forward_pass_margin_per_game={gate_net_forward_pass_margin:.3} gate_goal_diff_margin_per_game={gate_goal_diff_margin:.3} train_forward_pass_margin_per_game={mean_forward_pass_margin:.3} train_net_forward_pass_margin_per_game={mean_net_forward_pass_margin:.3} best_net_forward_pass_margin_per_game={prior_best:.3} require_climb={} raw_min_margin={checkpoint_min_forward_pass_margin:.3} net_min_margin={checkpoint_validate_min_net_forward_pass_margin:.3} validation_min_goal_diff_margin={checkpoint_validate_min_goal_diff_margin:.3} validation_passed={passes_validation} validation_games={}/{}",
+                        "league_checkpoint_held round={round} metric=completed_forward_passes net_metric=completed_forward_passes_minus_turnovers gate_forward_pass_margin_per_game={gate_forward_pass_margin:.3} gate_net_forward_pass_margin_per_game={gate_net_forward_pass_margin:.3} gate_goal_diff_margin_per_game={gate_goal_diff_margin:.3} train_forward_pass_margin_per_game={mean_forward_pass_margin:.3} train_net_forward_pass_margin_per_game={mean_net_forward_pass_margin:.3} best_net_forward_pass_margin_per_game={prior_best:.3} require_climb={} raw_min_margin={checkpoint_min_forward_pass_margin:.3} net_min_margin={checkpoint_validate_min_net_forward_pass_margin:.3} validation_min_goal_diff_margin={checkpoint_validate_min_goal_diff_margin:.3} validation_passed={passes_validation} validation_games={}/{} analytic_anchor_passed={passes_analytic_anchor} analytic_anchor_games={}",
                         checkpoint_require_forward_pass_climb,
                         validation.as_ref().map(|validation| validation.games).unwrap_or(0),
                         checkpoint_validate_games,
+                        analytic_anchor_validate_games,
                     );
                 }
             }
@@ -2086,6 +2179,41 @@ mod tests {
             1,
             0.0,
             0.0,
+            0.0,
+        ));
+    }
+
+    #[test]
+    fn analytic_anchor_gate_rejects_absolute_goal_diff_regression() {
+        let mut candidate = LeagueRoundKpis::default();
+        candidate.add(LeagueMatchKpis {
+            goal_diff: 0,
+            ..LeagueMatchKpis::default()
+        });
+        let mut incumbent = LeagueRoundKpis::default();
+        incumbent.add(LeagueMatchKpis {
+            goal_diff: 1,
+            ..LeagueMatchKpis::default()
+        });
+
+        assert!(!analytic_anchor_non_regression_passes(
+            Some(&candidate),
+            Some(&incumbent),
+            1,
+            0.0,
+        ));
+        assert!(analytic_anchor_non_regression_passes(
+            Some(&candidate),
+            Some(&incumbent),
+            1,
+            1.0,
+        ));
+
+        candidate.goal_diff = 2;
+        assert!(analytic_anchor_non_regression_passes(
+            Some(&candidate),
+            Some(&incumbent),
+            1,
             0.0,
         ));
     }
