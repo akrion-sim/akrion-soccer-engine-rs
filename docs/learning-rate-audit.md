@@ -200,3 +200,18 @@ from the planner teacher. The third arm is specifically a cold-start test: a pol
 chooses a forward pass cannot reliably learn a forward-only scalar from executed actions alone.
 Every arm keeps the existing DP flat result anchor and is judged on the same held-out analytic
 field; no gate is promoted from the diagnostic alone.
+
+The first forward-selection screen trained 60 games and evaluated 32 held-out fixtures per
+arm. Both learned treatments saturated `forwardSelectLogitWeight` at its hard maximum `8.0`.
+The incumbent led primary payoff at `0.469` (Elo delta `-102.4`, forward-pass margin
+`-0.19/game`); executed-sample learning reached payoff `0.453` (Elo delta `+7.6`, forward
+margin `-0.12/game`); planner-teacher learning regressed to payoff `0.391` (Elo delta `-83.2`)
+despite a nominal forward margin of `+0.06/game`. Wilson lower bounds were `0.309`, `0.295`,
+and `0.242`; every arm was rejected. The analytic-baseline Elo estimates varied across arms,
+so the payoff result remains primary. The saturated treatment is not promoted.
+
+The scalar update currently sums eligible gradients across a batch and clamps the learned
+weight even though score-time influence is independently capped at `0.25`; this makes the hard
+maximum a likely scale artifact, not a calibrated preference. `scripts/run_forward_select_dose_ab.sh`
+therefore freezes the incumbent checkpoint and evaluates weights `0`, `0.05`, and `0.20` on one
+paired held-out field. This isolates the useful dose before changing the trainable update rule.
