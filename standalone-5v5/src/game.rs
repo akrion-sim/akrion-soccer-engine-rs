@@ -2915,6 +2915,46 @@ impl World {
 mod tests {
     use super::*;
 
+    /// TEMP diagnostic: flavor-split (ground vs lofted) scripted pass completion.
+    #[test]
+    #[ignore]
+    fn pass_flavor_probe() {
+        let mut rng = Rng::new(4242);
+        let (mut g_att, mut g_cmp, mut a_att, mut a_cmp) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        let mut last_aerial = false;
+        for _ in 0..100 {
+            let mut w = World::new();
+            if rng.f01() < 0.5 {
+                w.kickoff(Team::B);
+            }
+            for _ in 0..STEPS {
+                let act_a = w.scripted_actions(Team::A);
+                let act_b = w.scripted_actions(Team::B);
+                w.step(&act_a, &act_b, &mut rng);
+                if w.ev_pass_attempt_a {
+                    last_aerial = w.ball_aerial;
+                    if last_aerial {
+                        a_att += 1.0;
+                    } else {
+                        g_att += 1.0;
+                    }
+                }
+                if w.ev_pass_completed_a {
+                    if last_aerial {
+                        a_cmp += 1.0;
+                    } else {
+                        g_cmp += 1.0;
+                    }
+                }
+            }
+        }
+        println!(
+            "ground: att={g_att} cmp={g_cmp} ({:.1}%)  lofted: att={a_att} cmp={a_cmp} ({:.1}%)",
+            100.0 * g_cmp / g_att.max(1.0),
+            100.0 * a_cmp / a_att.max(1.0)
+        );
+    }
+
     fn stays() -> [usize; N] {
         [A_STAY; N]
     }
