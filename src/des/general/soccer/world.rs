@@ -18051,6 +18051,28 @@ impl SoccerMatch {
                     }),
             );
         }
+        // ACTOR-OWNED SHOT PLACEMENT (default-OFF, byte-identical when off): fan the shot into one
+        // sibling plan per goal-mouth spot so the learned critic SCORES each aim independently and the
+        // actor selects the placement it values most (honored at execution). Off ⇒ no extra plans ⇒
+        // identical candidate set. Siblings share the "shoot" label (the scorer ranks per-plan, not
+        // per-label) and differ only by `target_point`.
+        if dd_soccer_enable_actor_shot_placement() {
+            let goalmouth = shot_goalmouth_target_points(
+                snapshot.field_width,
+                snapshot.field_length,
+                snapshot.goal_width,
+                team,
+            );
+            plans.reserve(goalmouth.len());
+            for aim in goalmouth {
+                plans.push(SoccerLearnedPlan {
+                    action: label.to_string(),
+                    target_player: None,
+                    target_point: Some(aim),
+                    mpc_replan: None,
+                });
+            }
+        }
         plans
     }
 
