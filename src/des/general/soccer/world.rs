@@ -1266,6 +1266,24 @@ fn learned_mpc_replan_thresholds() -> LearnedMpcReplanThresholds {
     })
 }
 
+/// The analytic per-family base MPC reject bar — the constant the global path uses,
+/// exposed so the learned per-context reject-threshold seam ([`WorldSnapshot::
+/// learned_mpc_reject_threshold`]) can treat it as the group-8 retained determinant it
+/// refines. `None` for families MPC does not gate (returns no bar ⇒ never rejected).
+pub(crate) fn mpc_reject_base_threshold(family: MpcRejectFamily) -> f64 {
+    let thresholds = learned_mpc_replan_thresholds();
+    match family {
+        MpcRejectFamily::Pass => thresholds.pass_impossible_probability,
+        MpcRejectFamily::Dribble => thresholds.dribble_impossible_probability,
+        MpcRejectFamily::Shot => thresholds.shot_impossible_probability,
+    }
+}
+
+/// Convenience accessor for the pass family's base reject bar (used by the RL sampler).
+pub(crate) fn mpc_reject_pass_base_threshold() -> f64 {
+    mpc_reject_base_threshold(MpcRejectFamily::Pass)
+}
+
 fn defensive_shot_on_target_penalty_points() -> (f64, f64) {
     let read = || {
         let max = std::env::var("SOCCER_DEFENSIVE_SOT_MAX_PENALTY")
