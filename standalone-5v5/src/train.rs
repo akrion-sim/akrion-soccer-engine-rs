@@ -1556,8 +1556,10 @@ mod tests {
     }
 
     /// NOT a pass/fail gate — a seeded MEASUREMENT probe for the ball-flight
-    /// physics A/B (run explicitly):
-    ///   cargo test --release scripted_pass_probe -- --ignored --nocapture
+    /// physics A/B. Follows the process env: default = legacy physics (~63%
+    /// completion); FIVEASIDE_PARITY_BALLFLIGHT=1 = parity stack (~71%).
+    ///   [FIVEASIDE_PARITY_BALLFLIGHT=1] cargo test --release \
+    ///       scripted_pass_probe -- --ignored --nocapture
     #[test]
     #[ignore]
     fn scripted_pass_probe() {
