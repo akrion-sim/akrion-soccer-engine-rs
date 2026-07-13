@@ -1479,6 +1479,44 @@ fn shuffle(v: &mut [usize], rng: &mut Rng) {
 mod tests {
     use super::*;
 
+    /// MEASUREMENT probe: the RL BOOTSTRAP chain under exploration noise —
+    /// noisy-scripted vs noisy-scripted approximates the warm-started rollout
+    /// regime (BC clone ~ scripted + sampling noise). Reports the pass ->
+    /// 2-streak -> legal shot -> goal funnel the attacking gradient needs.
+    #[test]
+    #[ignore]
+    fn exploration_bootstrap_probe() {
+        for noise in [0.0f32, 0.25, 0.5] {
+            let mut rng = Rng::new(9001);
+            let (mut att, mut cmp, mut streak2, mut shots, mut goals) =
+                (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32);
+            for _ in 0..100 {
+                let mut w = World::new();
+                if rng.f01() < 0.5 {
+                    w.kickoff(Team::B);
+                }
+                for _ in 0..STEPS {
+                    let act_a = noisy_scripted_actions(&w, Team::A, noise, &mut rng);
+                    let act_b = noisy_scripted_actions(&w, Team::B, noise, &mut rng);
+                    w.step(&act_a, &act_b, &mut rng);
+                    att += w.ev_pass_attempt_a as u8 as f32;
+                    cmp += w.ev_pass_completed_a as u8 as f32;
+                    streak2 += (w.ev_pass_completed_a && w.pass_streak_a == 2) as u8 as f32;
+                    shots += w.ev_shot_attempt_a as u8 as f32;
+                    goals += w.ev_goal_a as u8 as f32;
+                }
+            }
+            println!(
+                "noise {noise:.2}: att/g={:.2} cmp={:.0}% streak2/g={:.2} shots/g={:.2} goalsA/g={:.2}",
+                att / 100.0,
+                100.0 * cmp / att.max(1.0),
+                streak2 / 100.0,
+                shots / 100.0,
+                goals / 100.0
+            );
+        }
+    }
+
     /// NOT a pass/fail gate — a seeded MEASUREMENT probe for the ball-flight
     /// physics A/B (run explicitly):
     ///   cargo test --release scripted_pass_probe -- --ignored --nocapture
