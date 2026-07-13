@@ -26417,6 +26417,13 @@ fn soccer_decision_context_for(
                     shot_speed,
                     first_time,
                     pressure_from_nearest_distance(nearest_opponent_distance),
+                    // Part B: score THIS candidate's chosen aim (from the action target trace),
+                    // gated. Off ⇒ None ⇒ analytic optimum ⇒ byte-identical.
+                    if dd_soccer_enable_actor_shot_placement() {
+                        action_target.and_then(|trace| trace.point)
+                    } else {
+                        None
+                    },
                 )
             })
         } else {
