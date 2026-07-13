@@ -9763,7 +9763,7 @@ mod tests {
                 .action_from_learned_plan(&plan, &snapshot, &observation)
                 .expect("learned shot bucket should execute");
             assert_eq!(executed_label, label);
-            let SoccerAction::Shoot { power } = action else {
+            let SoccerAction::Shoot { power, .. } = action else {
                 panic!("learned shot bucket should execute as a shot");
             };
             let expected_power =
