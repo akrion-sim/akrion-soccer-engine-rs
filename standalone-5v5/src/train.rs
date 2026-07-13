@@ -1530,9 +1530,13 @@ mod tests {
             ON_FRAME_SHOT_FLOOR + ON_FRAME_SHOT_CAP_SPAN
                 <= REW_GOAL_POINTS * REWARD_NON_CONVERSION_MAX_FRACTION + 1e-6
         );
+        // Negative mirrors are bounded fractions: conceding never exceeds the
+        // goal anchor, losing never exceeds the win anchor, neither can vanish.
+        let w = rw();
+        assert!(w.concede_frac >= 0.25 && w.concede_frac <= 1.0);
+        assert!(w.loss_frac >= 0.4 && w.loss_frac <= 1.0);
         // Every discoverable event weight's hi-bound stays under the
         // non-conversion ceiling — no tuned weight can rival a goal.
-        let w = rw();
         for hi in [
             w.milestone,
             w.pass_credit,
