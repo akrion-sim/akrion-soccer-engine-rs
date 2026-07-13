@@ -1183,11 +1183,18 @@ impl World {
             self.last_kicker = Some(kicker);
             self.kick_timer = 6;
             self.ball_aerial = is_pass && self.pending_aerial;
-            self.air_ticks = if self.ball_aerial {
-                self.pending_air_ticks
+            if self.ball_aerial {
+                // Launch the loft: reset the arc and use the land-on-target horizontal speed.
+                self.ball_apex = self.pending_apex;
+                self.ball_taloft = 0.0;
+                self.ball_z = 0.0;
+                self.ball_vel = d.scale(self.pending_aerial_speed);
             } else {
-                0
-            };
+                self.ball_apex = 0.0;
+                self.ball_taloft = 0.0;
+                self.ball_z = 0.0;
+            }
+            self.air_ticks = 0;
             self.pending_aerial = false;
             self.ball_curl = self.pending_curl;
             self.pending_curl = V2::default();
