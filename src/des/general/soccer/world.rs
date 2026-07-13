@@ -20324,7 +20324,6 @@ impl SoccerMatch {
             salt,
         )
         .map(|choice| choice.label)
->>>>>>> wip/netinfluence
     }
 
     /// Per-team value-head forward-intent for this tick: for each outfield player,
