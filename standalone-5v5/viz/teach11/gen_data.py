@@ -390,24 +390,24 @@ def learning_curve():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7. SELF-PLAY LEAGUE — ELO with frozen analytic anchor + held-out promotions.
+# 7. SELF-PLAY LEAGUE — champion-ladder promotion is MARGIN-gated on goal-diff vs
+#    the current champion (SOCCER_LEAGUE_PROMOTE_MARGIN=0.25); a separate ELO
+#    (soccer_elo.rs, base 1500) tracks tournament strength. Plateau then escape.
 # ─────────────────────────────────────────────────────────────────────────────
 def league():
-    N=100; rng=np.random.default_rng(11)
-    elo_home=1200.0; elo_best=1200.0; anchor=1200.0
-    rows=[]; champ=0
+    N=100; rng=np.random.default_rng(11); MARGIN=0.25
+    elo_home=1500.0; elo_best=1500.0; champ=0
+    rows=[]
     for g in range(1,N+1):
-        # HOME candidate vs frozen analytic anchor (held-out): the real objective
         prog = 0.0 if g<30 else (0.0 if g<62 else (g-62)/38)   # plateau then climb
-        gd_anchor = (-0.1 + 0.5*min(1,g/30) + 0.9*prog) + rng.normal(0,0.28)
-        wr = 1/(1+10**(-(gd_anchor)/1.2))
-        elo_home += 6*(gd_anchor) + rng.normal(0,4)
-        # promotion: beat protected local-best on held-out by a margin
-        promoted = gd_anchor > 0.30 and elo_home > elo_best+8 and rng.random()>0.35
+        gd_champ = (-0.05 + 0.45*min(1,g/30) + 0.9*prog) + rng.normal(0,0.28)  # vs current champion
+        wr = 1/(1+10**(-(gd_champ)/1.2))
+        elo_home += 7*gd_champ + rng.normal(0,4)
+        promoted = gd_champ >= MARGIN and rng.random() > 0.35   # margin-gated (not ELO)
         if promoted: elo_best = max(elo_best, elo_home); champ += 1
-        rows.append({"gen": g, "gd_anchor": round(gd_anchor,3), "wr": round(wr,3),
+        rows.append({"gen": g, "gd_anchor": round(gd_champ,3), "wr": round(wr,3),
             "elo_home": round(elo_home,1), "elo_best": round(elo_best,1),
-            "promoted": bool(promoted), "champ": champ,
+            "promoted": bool(promoted), "champ": champ, "margin": MARGIN,
             "escape": bool(60<=g<=66)})
     return rows
 
