@@ -1541,6 +1541,7 @@ impl World {
         let gx = if to == Team::A { 6.0 } else { FIELD_L - 6.0 };
         self.ball = V2::new(gx, FIELD_W / 2.0);
         self.ball_vel = V2::default();
+        self.reset_ball_flight();
         let idx = self.nearest_player(to, self.ball).0;
         self.owner = Some(Owner { team: to, idx });
         self.last_touch = Some(to);
