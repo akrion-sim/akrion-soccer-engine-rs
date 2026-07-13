@@ -27900,6 +27900,21 @@ impl SoccerMatch {
                 < 1e-9
         );
         let scale = self.shot_reward_distance_scale(shooting_team, shooter);
+        if anchored_rewards_enabled() {
+            // ANCHORED FINISHING (docs/reward-anchoring.md §2): the shooter's
+            // on-frame shot pays ≥ 50 points DIRECTLY — not chain-diluted — with
+            // the cap set by the field-vector context (distance taper × xG). An
+            // on-frame 80-yarder caps at the floor. This replaces the inert
+            // DD_SOCCER_ON_FRAME_SHOT_REWARD_SCALE, which lived below the
+            // `infer_discrete_events` early-return and never fired in self-play.
+            // The legacy chain pool below still pays the build-up (passers) at
+            // its small historical magnitude, keeping shooter total ≤ 0.45·goal.
+            self.record_reward_event_with_kind(
+                shooter,
+                anchored_on_frame_shot_points(scale),
+                SoccerRewardEventKind::ShotOnTarget,
+            );
+        }
         self.record_recent_defensive_shot_on_target_penalties(shooting_team.other(), scale);
         let contextual_pool = bounded_shot_on_target_reward_points() * scale;
         self.record_weighted_possession_chain_reward_at_with_kind(
