@@ -3394,6 +3394,7 @@ mod tests {
         let mut rng = Rng::new(99);
         let (mut goals_a, mut goals_b) = (0u32, 0u32);
         let (mut saves_a, mut saves_b) = (0u32, 0u32);
+        let (mut shots_a, mut shots_b) = (0u32, 0u32);
         for e in 0..30 {
             let mut w = World::new();
             if e % 2 == 1 {
