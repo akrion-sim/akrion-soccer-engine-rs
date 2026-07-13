@@ -131,6 +131,22 @@ held-out games. Outcome-off was nominally best (payoff `0.500`, Elo delta `+15.5
 pass margin `+0.00/game`); `200` reached payoff `0.438`, Elo delta `+4.3`, forward margin
 `+0.16/game`; `400` reached payoff `0.453`, Elo delta `-40.3`, forward margin `-0.06/game`.
 Every Wilson lower bound remained below the promotion floor (`0.282` to `0.336`). This
-rejects “make the broadcast win label huge” as the next default, but does not yet prove
-that the outcome label should be removed. The next independent-seed arm tests a smaller
-`30` nudge against `200`; repeated-seed held-out results must drive any default change.
+rejects “make the broadcast win label huge” as the next default, but does not by itself
+prove that the outcome label should be removed.
+
+The independent-seed replication used the same 60-game training and 32-game held-out
+protocol. Outcome-off again led (payoff `0.516`, Elo delta `+11.5`, forward-pass margin
+`+0.09/game`); the `30` nudge reached payoff `0.422`, Elo delta `-35.9`, forward margin
+`+0.03/game`; `200` reached payoff `0.484`, Elo delta `+2.2`, forward margin
+`-0.19/game`. No arm passed its Wilson promotion floor. Across both seeds, every flat
+per-transition outcome-label arm underperformed outcome-off on payoff, so neither `30`,
+`200`, nor `400` is promoted from this experiment.
+
+That result narrows the next test to credit-assignment structure, not another magnitude.
+`scripts/run_outcome_credit_ab.sh` holds the seed, opponent pools, target transform, and
+`200` win value constant while comparing outcome-off, the flat outcome broadcast, and
+the production `DD_SOCCER_OUTCOME_CREDIT=1` replay. The latter still broadcasts the result
+but replaces the correlated dense return with bounded positive milestones plus pitch-value
+shaping. This isolates whether dense negative/correlated replay conflicts with the fixed
+winning anchor. It must clear the same held-out gate on repeated seeds before any default
+change; one nominal win is not evidence of a durable climb.
