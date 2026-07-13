@@ -1691,6 +1691,137 @@ pub fn evaluate_vs_policy(cand: &Policy, opp: &Policy, games: usize, rng: &mut R
     (gd / g, wr / g)
 }
 
+/// Side-balanced evaluation used by the promotion gate. Every seed is played
+/// twice, with the candidate on each side, so a favourable Team A geometry or
+/// kickoff sequence cannot manufacture a ladder promotion.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PairedEvaluation {
+    pub games: usize,
+    pub goal_diff: f32,
+    pub payoff: f32,
+    pub goal_diff_lower_95: f32,
+    pub payoff_lower_95: f32,
+}
+
+fn summarize_paired_outcomes(goal_diffs: &[f32]) -> PairedEvaluation {
+    let games = goal_diffs.len();
+    if games == 0 {
+        return PairedEvaluation::default();
+    }
+    let n = games as f32;
+    let goal_diff = goal_diffs.iter().sum::<f32>() / n;
+    let payoffs: Vec<f32> = goal_diffs
+        .iter()
+        .map(|diff| {
+            if *diff > 0.0 {
+                1.0
+            } else if *diff < 0.0 {
+                0.0
+            } else {
+                0.5
+            }
+        })
+        .collect();
+    let payoff = payoffs.iter().sum::<f32>() / n;
+    let lower_95 = |samples: &[f32], mean: f32| {
+        if samples.len() < 2 {
+            return f32::NEG_INFINITY;
+        }
+        let variance = samples
+            .iter()
+            .map(|sample| {
+                let delta = *sample - mean;
+                delta * delta
+            })
+            .sum::<f32>()
+            / (samples.len() - 1) as f32;
+        mean - 1.96 * (variance / samples.len() as f32).sqrt()
+    };
+    PairedEvaluation {
+        games,
+        goal_diff,
+        payoff,
+        goal_diff_lower_95: lower_95(goal_diffs, goal_diff),
+        payoff_lower_95: lower_95(&payoffs, payoff),
+    }
+}
+
+fn evaluate_policy_match(
+    candidate: &Policy,
+    opponent: Option<&Policy>,
+    candidate_team: Team,
+    seed: u64,
+) -> f32 {
+    let mut rng = Rng::new(seed);
+    let mut world = World::new();
+    if rng.f01() < 0.5 {
+        world.kickoff(Team::B);
+    }
+    for _ in 0..STEPS {
+        let learned_actions = |policy: &Policy, team: Team, world: &World| {
+            let mut actions = [A_STAY; N];
+            for i in 1..N {
+                actions[i] = policy.act_greedy_world(world, team, i);
+            }
+            actions
+        };
+        let (actions_a, actions_b) = match candidate_team {
+            Team::A => (
+                learned_actions(candidate, Team::A, &world),
+                opponent.map_or_else(
+                    || world.scripted_actions(Team::B),
+                    |policy| learned_actions(policy, Team::B, &world),
+                ),
+            ),
+            Team::B => (
+                opponent.map_or_else(
+                    || world.scripted_actions(Team::A),
+                    |policy| learned_actions(policy, Team::A, &world),
+                ),
+                learned_actions(candidate, Team::B, &world),
+            ),
+        };
+        world.step(&actions_a, &actions_b, &mut rng);
+    }
+    match candidate_team {
+        Team::A => world.goals_a as f32 - world.goals_b as f32,
+        Team::B => world.goals_b as f32 - world.goals_a as f32,
+    }
+}
+
+fn evaluate_paired(
+    candidate: &Policy,
+    opponent: Option<&Policy>,
+    games: usize,
+    rng: &mut Rng,
+) -> PairedEvaluation {
+    let pairs = games.max(2).div_ceil(2);
+    let mut goal_diffs = Vec::with_capacity(pairs * 2);
+    for _ in 0..pairs {
+        let seed = rng.next_u64();
+        goal_diffs.push(evaluate_policy_match(candidate, opponent, Team::A, seed));
+        goal_diffs.push(evaluate_policy_match(candidate, opponent, Team::B, seed));
+    }
+    summarize_paired_outcomes(&goal_diffs)
+}
+
+pub fn evaluate_vs_policy_paired(
+    candidate: &Policy,
+    opponent: &Policy,
+    games: usize,
+    rng: &mut Rng,
+) -> PairedEvaluation {
+    evaluate_paired(candidate, Some(opponent), games, rng)
+}
+
+pub fn evaluate_vs_scripted_paired(
+    candidate: &Policy,
+    games: usize,
+    rng: &mut Rng,
+) -> PairedEvaluation {
+    evaluate_paired(candidate, None, games, rng)
+}
+
 /// Baseline sanity check: scripted-vs-scripted goal difference (should be ~0).
 pub fn evaluate_scripted_vs_scripted(games: usize, rng: &mut Rng) -> (f32, f32, f32) {
     let mut diff = 0.0f32;
