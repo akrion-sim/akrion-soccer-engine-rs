@@ -941,32 +941,25 @@ impl World {
     /// ball's future trajectory (with friction) and return the earliest point the
     /// defender can physically reach — anticipation, so passes get cut out. For a
     /// slow/owned ball it just returns the ball (go challenge the carrier).
+    ///
+    /// DELIBERATELY predicts with the LEGACY single-term friction, not the live
+    /// 3-term drag: this is the players' mental model, and it is kept at its
+    /// pre-ball-flight-parity calibration so the physics change does not
+    /// silently upgrade every defender's anticipation. Under the real drag the
+    /// ball dies earlier than this read expects — a paced pass "holds up" and
+    /// beats the perfectly-camped cut that a true-model predictor would make
+    /// (chasers still converge on the ball line, then the radius capture in
+    /// try_capture decides). The 11v11's interceptors are likewise heuristic
+    /// readers of the flight, not oracle integrators.
     pub fn intercept_point(&self, from: V2) -> V2 {
         if self.ball_vel.len() < 3.0 {
             return self.ball;
         }
         let mut bpos = self.ball;
         let mut bvel = self.ball_vel;
-        // Predict with the REAL flight model (3-term drag + the live loft arc)
-        // so anticipation stays consistent with where the ball actually goes.
-        let mut taloft = self.ball_taloft;
-        let hang = hang_time(self.ball_apex);
         for step in 1..40 {
             bpos = bpos.add(bvel.scale(DT));
-            let z = if self.ball_aerial {
-                taloft += DT;
-                if taloft >= hang {
-                    0.0
-                } else {
-                    altitude_at(self.ball_apex, taloft)
-                }
-            } else {
-                0.0
-            };
-            let sp = bvel.len();
-            if sp > 1e-6 {
-                bvel = bvel.scale(ball_resistance_after(sp, z) / sp);
-            }
+            bvel = bvel.scale(BALL_FRICTION);
             let reach = PLAYER_SPEED * (step as f32 * DT) + CONTROL_RADIUS;
             if from.sub(bpos).len() <= reach {
                 return bpos; // can meet the ball here
