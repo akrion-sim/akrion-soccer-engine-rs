@@ -599,6 +599,10 @@ function lineChart(cv, cfg){
     const sp=(hi-lo)||1; ymin=cfg.ymin??lo-sp*0.08; ymax=cfg.ymax??hi+sp*0.08;}
   const X=x=>padL+((x-xmin)/((xmax-xmin)||1))*(w-padL-padR);
   const Y=v=>padT+(1-(v-ymin)/((ymax-ymin)||1))*(h-padT-padB);
+  // shaded band (e.g. plateau / escape region)
+  if(cfg.band){const bc=cfg.bandColor?css(cfg.bandColor):css('--ink-dim');
+    ctx.fillStyle=bc;ctx.globalAlpha=.10;
+    ctx.fillRect(X(cfg.band[0]),padT,X(cfg.band[1])-X(cfg.band[0]),h-padT-padB);ctx.globalAlpha=1;}
   // grid + y ticks
   ctx.strokeStyle=css('--grid');ctx.fillStyle=css('--ink-dim');ctx.lineWidth=1;
   ctx.font='10px ui-monospace,monospace';ctx.textAlign='right';ctx.textBaseline='middle';
