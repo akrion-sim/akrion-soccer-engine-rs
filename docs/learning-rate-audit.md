@@ -271,3 +271,12 @@ The teacher raised candidate forward share from control's `5%` to `9%`, but tota
 fell from `92%` to `85%`. This is directional evidence that aligned exposure plus credit changes
 the intended action preference, not evidence of winning climb. Both gates remain off pending an
 independent training-seed replication.
+
+The independent `E140/F560` replication reversed that pattern. Control reached payoff `0.453`,
+Elo delta `-1.6`, forward margin `-0.06/game`, and Wilson lower bound `0.295`. Both exposure arms
+reached payoff `0.516`, Elo delta `+49.6`, worst-case payoff `0.500`, and Wilson lower bound
+`0.350`, but their forward margin regressed to `-0.28/game`. Exposure and teacher were
+behaviorally identical on this held-out field. Across the two aligned seeds, one treatment result
+improved forward play without winning payoff and the other improved winning payoff while worsening
+forward play. This is not a stable climb, so the gates remain off. A larger fresh held-out field on
+the second seed is the next bounded check of its nominal payoff gain.
