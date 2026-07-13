@@ -32397,7 +32397,10 @@ impl SoccerMatch {
                     self.players[player_id].action_facing = action_facing;
                 }
             }
-            SoccerAction::Shoot { power } => {
+            SoccerAction::Shoot {
+                power,
+                target_point: actor_shot_target,
+            } => {
                 let mut release_facing = action_facing;
                 if self.ball.holder == Some(player_id) {
                     // (Productive carry-into-shot is rewarded by `record_progressive_carry_outcome_reward`
@@ -45022,6 +45025,7 @@ impl WorldSnapshot {
             },
             SoccerSetPlayReleaseKind::Shoot => SoccerAction::Shoot {
                 power: release_power,
+                target_point: None,
             },
         };
         Some((action, restart_label.to_string()))
