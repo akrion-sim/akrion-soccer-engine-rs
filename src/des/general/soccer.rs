@@ -45626,6 +45626,7 @@ fn widen_soccer_policy_snapshot_for_config(
         return snapshot;
     }
 
+    let effective_hidden = target_hidden.max(current_hidden);
     if target_hidden > current_hidden {
         let mut rng = mulberry32(
             (snapshot.parameter_count as u32)
@@ -45648,7 +45649,7 @@ fn widen_soccer_policy_snapshot_for_config(
     if snapshot.output_dim < expected_output_dim {
         output_layer
             .weights
-            .extend((snapshot.output_dim..expected_output_dim).map(|_| vec![0.0; target_hidden]));
+            .extend((snapshot.output_dim..expected_output_dim).map(|_| vec![0.0; effective_hidden]));
         output_layer.biases.resize(expected_output_dim, 0.0);
         snapshot.output_dim = expected_output_dim;
     }

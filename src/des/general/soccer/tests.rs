@@ -305,6 +305,45 @@ fn policy_head_snapshot_round_trips_role_heads_and_specialists() {
 }
 
 #[test]
+fn legacy_policy_output_expansion_preserves_wider_hidden_layer() {
+    let expected_output_dim = SOCCER_POLICY_ACTIONS.len();
+    let legacy_output_dim = expected_output_dim - 1;
+    let legacy_hidden = soccer_policy_hidden_units().max(128) + 1;
+    let snapshot = SoccerNeuralNetworkSnapshot {
+        input_dim: SOCCER_POLICY_FEATURE_DIM,
+        output_dim: legacy_output_dim,
+        parameter_count: 0,
+        l2_norm: 0.0,
+        layers: vec![
+            SoccerNeuralLayerSnapshot {
+                activation: "relu".to_string(),
+                weights: vec![vec![0.0; SOCCER_POLICY_FEATURE_DIM]; legacy_hidden],
+                biases: vec![0.0; legacy_hidden],
+            },
+            SoccerNeuralLayerSnapshot {
+                activation: "linear".to_string(),
+                weights: vec![vec![0.0; legacy_hidden]; legacy_output_dim],
+                biases: vec![0.0; legacy_output_dim],
+            },
+        ],
+        ..SoccerNeuralNetworkSnapshot::default()
+    };
+
+    let widened = widen_soccer_policy_snapshot_for_config(snapshot, expected_output_dim);
+    assert_eq!(widened.output_dim, expected_output_dim);
+    assert_eq!(widened.layers[0].biases.len(), legacy_hidden);
+    assert!(
+        widened.layers[1]
+            .weights
+            .iter()
+            .all(|row| row.len() == legacy_hidden),
+        "new action rows must retain the legacy actor's actual hidden width"
+    );
+    build_soccer_policy_network_from_snapshot(&widened, expected_output_dim, "legacy-policy")
+        .expect("widened legacy actor should be loadable");
+}
+
+#[test]
 fn legacy_skill_and_keeper_policy_heads_snapshot_round_trip() {
     let sample = |role: PlayerRole, action: &str| -> SoccerPolicySample {
         let state_features: [f64; SOCCER_POLICY_FEATURE_DIM] =
