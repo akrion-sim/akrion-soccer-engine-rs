@@ -323,6 +323,127 @@ fn fresh_snapshot(out_path: &str, seed_base: u32) {
     );
 }
 
+/// Optional keep-best selection for `train-ckpt` (all default-off; behavior is byte-identical
+/// when the env vars are unset). Ported PRINCIPLE from the standalone 5v5 `best_gated` /
+/// `checkpoint_quality` loop: held-out EVAL stats decide which checkpoint is "best" — the
+/// training reward never does — so a late reward-hacked collapse cannot overwrite a good net.
+///   SOCCER_PROOF_KEEPBEST_EVERY    games between proxy evals (0/unset = disabled)
+///   SOCCER_PROOF_KEEPBEST_GAMES    proxy eval games per check (default 12)
+///   SOCCER_PROOF_KEEPBEST_HOLDOUT  hex seed base for the held-out fixtures (default E7A1BEEF)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KeepBestConfig {
+    every: usize,
+    games: usize,
+    holdout: u32,
+}
+
+impl KeepBestConfig {
+    fn from_parts(every: usize, games: usize, holdout: u32) -> Option<Self> {
+        if every == 0 {
+            return None;
+        }
+        Some(Self {
+            every,
+            games: games.max(1),
+            holdout,
+        })
+    }
+
+    fn from_env() -> Option<Self> {
+        Self::from_parts(
+            env_usize("SOCCER_PROOF_KEEPBEST_EVERY", 0),
+            env_usize("SOCCER_PROOF_KEEPBEST_GAMES", 12),
+            parse_hex(
+                std::env::var("SOCCER_PROOF_KEEPBEST_HOLDOUT").ok().as_ref(),
+                0xE7A1_BEEF,
+            ),
+        )
+    }
+}
+
+/// True when the keep-best proxy eval should run after `done` of `total_games` training games.
+/// Cadence is every `every` games, plus the final game (5v5 reference evaluates the last iter too)
+/// so the terminal net always gets a chance to claim `.best.json`.
+fn keepbest_due(done: usize, total_games: usize, every: usize) -> bool {
+    every > 0 && (done % every == 0 || done == total_games)
+}
+
+/// Proxy-eval quality of one checkpoint: goal difference per game is primary, shots on target
+/// per game breaks ties (anti-passivity: between two equal-GD nets prefer the one creating
+/// chances). Higher is better on both axes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct KeepBestScore {
+    goal_diff_per_game: f64,
+    sot_per_game: f64,
+}
+
+impl KeepBestScore {
+    /// Strict improvement: primary metric first, tiebreak second. Equal scores do NOT improve,
+    /// so the earliest checkpoint at a given quality is kept (fewer rewrites, stable artifact).
+    fn better_than(&self, other: &Self) -> bool {
+        if self.goal_diff_per_game != other.goal_diff_per_game {
+            return self.goal_diff_per_game > other.goal_diff_per_game;
+        }
+        self.sot_per_game > other.sot_per_game
+    }
+}
+
+impl std::fmt::Display for KeepBestScore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "gd{:+.3}/sot{:.2}",
+            self.goal_diff_per_game, self.sot_per_game
+        )
+    }
+}
+
+/// In-process proxy eval of a training snapshot vs the pure-ANALYTIC baseline over held-out
+/// seeds — the same machinery the `eval` subcommand uses (frozen `TeamBrain`s + a fresh
+/// `EngineMatchRunner`, learning disabled on both sides, alternating home/away, seeds spread by
+/// `SEED_STRIDE` from a holdout base disjoint from the training seed stream). Training state is
+/// untouched: the candidate brain is built from a CLONE of the snapshot, and no training RNG is
+/// consumed (every fixture is seeded from the holdout base). Returns `None` when no fixture
+/// completed.
+fn keepbest_proxy_score(
+    snapshot: &SoccerNeuralNetworkSnapshot,
+    games: usize,
+    minutes: f64,
+    holdout: u32,
+) -> Option<KeepBestScore> {
+    let cand = TeamBrain::from_snapshot(snapshot.clone());
+    let base = TeamBrain::fresh();
+    let mut cfg = EngineMatchRunnerConfig::default();
+    cfg.base.duration_seconds = minutes * 60.0;
+    // Mirror the eval subcommand's opt-in so proxy scores stay comparable with later
+    // `soccer_proof eval` runs launched under the same env.
+    if env_bool("SOCCER_PROOF_EVAL_ACTOR_CRITIC", false) {
+        cfg.base.neural_blend.actor_critic = true;
+    }
+    let mut runner = EngineMatchRunner::new(cfg);
+    let mut goal_diff = 0.0;
+    let mut sot = 0.0;
+    let mut n = 0usize;
+    for g in 0..games {
+        let seed = holdout.wrapping_add((g as u32).wrapping_mul(SEED_STRIDE));
+        let cand_home = g % 2 == 0;
+        let Some((cm, bm)) = play_fixture(&mut runner, &cand, &base, seed, cand_home) else {
+            continue;
+        };
+        goal_diff += cm.goals - bm.goals;
+        sot += cm.sot;
+        n += 1;
+    }
+    if n == 0 {
+        return None;
+    }
+    let nf = n as f64;
+    Some(KeepBestScore {
+        goal_diff_per_game: goal_diff / nf,
+        sot_per_game: sot / nf,
+    })
+}
+
 /// Train a candidate by inline self-play carry-forward, honoring whatever env gates this process
 /// was launched with, writing a checkpoint snapshot every `ckpt_every` games.
 fn train_ckpt(out_prefix: &str, games: usize, minutes: f64, seed_base: u32, ckpt_every: usize) {
@@ -350,6 +471,14 @@ fn train_ckpt(out_prefix: &str, games: usize, minutes: f64, seed_base: u32, ckpt
     let mut attack_spacing_head: Option<AttackSpacingHead> = None;
     let mut support_scorer_head: Option<SupportScorerHead> = None;
     let analytic_opponent_fraction = proof_analytic_opponent_fraction();
+    let keepbest = KeepBestConfig::from_env();
+    if let Some(kb) = keepbest.as_ref() {
+        println!(
+            "[keepbest] enabled: every={} games={} holdout=0x{:08X} (in-process proxy eval vs analytic on held-out seeds; goal-diff/game primary, SOT/game tiebreak)",
+            kb.every, kb.games, kb.holdout
+        );
+    }
+    let mut kb_best: Option<KeepBestScore> = None;
     let started = Instant::now();
 
     let write_ckpt = |snap: &SoccerNeuralNetworkSnapshot, tag: &str| {
@@ -487,6 +616,41 @@ fn train_ckpt(out_prefix: &str, games: usize, minutes: f64, seed_base: u32, ckpt
         if ckpt_every > 0 && done % ckpt_every == 0 {
             if let Some(s) = snapshot.as_ref() {
                 write_ckpt(s, &done.to_string());
+            }
+        }
+        if let Some(kb) = keepbest.as_ref() {
+            if keepbest_due(done, games, kb.every) {
+                if let Some(snap) = snapshot.as_ref() {
+                    match keepbest_proxy_score(snap, kb.games, minutes, kb.holdout) {
+                        Some(score) => {
+                            let improved = kb_best.map_or(true, |best| score.better_than(&best));
+                            if improved {
+                                kb_best = Some(score);
+                                let best_path = format!("{out_prefix}.best.json");
+                                match serde_json::to_string(snap) {
+                                    Ok(json) => match std::fs::write(&best_path, json) {
+                                        Ok(()) => println!(
+                                            "[keepbest] game={done} score={score} best={score} -> wrote {best_path}"
+                                        ),
+                                        Err(e) => eprintln!(
+                                            "[keepbest] game={done} score={score} improved but write {best_path} failed: {e}"
+                                        ),
+                                    },
+                                    Err(e) => {
+                                        eprintln!("[keepbest] game={done} serialize failed: {e}")
+                                    }
+                                }
+                            } else {
+                                // kb_best is always Some here: improved is true when it is None.
+                                let best = kb_best.unwrap_or(score);
+                                println!("[keepbest] game={done} score={score} best={best} held");
+                            }
+                        }
+                        None => eprintln!(
+                            "[keepbest] game={done} proxy eval produced no completed fixtures; held"
+                        ),
+                    }
+                }
             }
         }
     }
@@ -1292,5 +1456,69 @@ mod tests {
         let (_path, strip) = parse_brain_spec("full.genFINAL.json#strip=all");
 
         assert_eq!(strip, BrainStripOptions::all_aux());
+    }
+
+    #[test]
+    fn keepbest_score_orders_goal_diff_first_then_sot() {
+        let strong_gd = KeepBestScore {
+            goal_diff_per_game: 1.0,
+            sot_per_game: 0.0,
+        };
+        let weak_gd_high_sot = KeepBestScore {
+            goal_diff_per_game: 0.5,
+            sot_per_game: 9.0,
+        };
+        // Goal diff is primary: a big SOT count never outranks a better goal diff.
+        assert!(strong_gd.better_than(&weak_gd_high_sot));
+        assert!(!weak_gd_high_sot.better_than(&strong_gd));
+
+        // SOT breaks exact goal-diff ties (anti-passivity).
+        let tie_more_sot = KeepBestScore {
+            goal_diff_per_game: 1.0,
+            sot_per_game: 2.0,
+        };
+        assert!(tie_more_sot.better_than(&strong_gd));
+        assert!(!strong_gd.better_than(&tie_more_sot));
+
+        // Strict: an equal score holds (does not rewrite .best.json).
+        assert!(!strong_gd.better_than(&strong_gd));
+
+        // Negative goal diffs order correctly too.
+        let less_bad = KeepBestScore {
+            goal_diff_per_game: -0.5,
+            sot_per_game: 0.0,
+        };
+        let more_bad = KeepBestScore {
+            goal_diff_per_game: -2.0,
+            sot_per_game: 5.0,
+        };
+        assert!(less_bad.better_than(&more_bad));
+        assert!(!more_bad.better_than(&less_bad));
+    }
+
+    #[test]
+    fn keepbest_config_is_off_unless_every_positive() {
+        // every=0 (the unset default) disables keep-best entirely — train-ckpt stays
+        // byte-identical without the env vars.
+        assert_eq!(KeepBestConfig::from_parts(0, 12, 0xE7A1_BEEF), None);
+
+        let kb = KeepBestConfig::from_parts(5, 12, 0xE7A1_BEEF).expect("enabled");
+        assert_eq!(kb.every, 5);
+        assert_eq!(kb.games, 12);
+        assert_eq!(kb.holdout, 0xE7A1_BEEF);
+
+        // games floor: a zero proxy-eval budget is clamped to 1 rather than dividing by zero.
+        let kb = KeepBestConfig::from_parts(2, 0, 1).expect("enabled");
+        assert_eq!(kb.games, 1);
+    }
+
+    #[test]
+    fn keepbest_cadence_hits_every_n_and_final_game() {
+        let due: Vec<usize> = (1..=10).filter(|&done| keepbest_due(done, 10, 4)).collect();
+        assert_eq!(due, vec![4, 8, 10]);
+        // Disabled cadence never fires.
+        assert!((1..=10).all(|done| !keepbest_due(done, 10, 0)));
+        // A final game that also lands on the cadence fires once (single check site).
+        assert!(keepbest_due(10, 10, 5));
     }
 }

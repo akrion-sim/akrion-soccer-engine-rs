@@ -5735,6 +5735,17 @@ const MAX_SOCCER_NEURAL_SNAPSHOT_EVERY_BATCHES: usize = 4096;
 const SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK: f64 = 0.98;
 const SOCCER_FULL_GAME_RETURN_BLEND: f64 = 0.35;
 const SOCCER_FULL_GAME_RETURN_CLIP: f64 = 400.0;
+/// Return clip must clear the anchor magnitudes: a ±1000 win label plus a few
+/// ±500 goals would be silently flattened by the historical ±400 rail —
+/// exactly the class of "knob never reaches training" bug the anchored mode
+/// exists to fix. Anchored ⇒ ±4000 (2·WIN + 4·GOAL of headroom).
+fn soccer_full_game_return_clip() -> f64 {
+    if anchored_rewards_enabled() {
+        4_000.0
+    } else {
+        SOCCER_FULL_GAME_RETURN_CLIP
+    }
+}
 const DD_SOCCER_OUTCOME_CREDIT_ENV: &str = "DD_SOCCER_OUTCOME_CREDIT";
 const DD_SOCCER_MATCH_OUTCOME_REWARD_ENV: &str = "DD_SOCCER_ENABLE_MATCH_OUTCOME_REWARD";
 const SOCCER_OUTCOME_CREDIT_MILESTONE_REWARD_CAP: f64 = GOAL_REWARD_POINTS;
@@ -15180,9 +15191,9 @@ fn soccer_correlated_full_game_replay_transitions(
             away_sum / away_count as f64
         };
         home_return = (home_mean + SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK * home_return)
-            .clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP);
+            .clamp(-soccer_full_game_return_clip(), soccer_full_game_return_clip());
         away_return = (away_mean + SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK * away_return)
-            .clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP);
+            .clamp(-soccer_full_game_return_clip(), soccer_full_game_return_clip());
 
         for idx in indices {
             let mut transition = transitions[*idx].clone();
@@ -15200,7 +15211,7 @@ fn soccer_correlated_full_game_replay_transitions(
                 None => blended,
             };
             transition.reward =
-                with_outcome.clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP);
+                with_outcome.clamp(-soccer_full_game_return_clip(), soccer_full_game_return_clip());
             transition.done = true;
             replay.push(transition);
         }
@@ -15236,7 +15247,7 @@ fn soccer_dp_value_iteration(
                 value.insert(
                     b,
                     (sum / count as f64)
-                        .clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP),
+                        .clamp(-soccer_full_game_return_clip(), soccer_full_game_return_clip()),
                 );
             }
         }
@@ -15270,7 +15281,7 @@ fn soccer_dp_nstep_return(
             }
         }
     }
-    ret.clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP)
+    ret.clamp(-soccer_full_game_return_clip(), soccer_full_game_return_clip())
 }
 
 /// Compact, team-relative abstraction of the symbolic MDP state for the DP value table. From the
@@ -15407,7 +15418,7 @@ fn soccer_dp_bootstrapped_replay_transitions(
             None => blended,
         };
         transition.reward =
-            with_outcome.clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP);
+            with_outcome.clamp(-soccer_full_game_return_clip(), soccer_full_game_return_clip());
         transition.done = true;
         replay.push(transition);
     }
@@ -15507,7 +15518,7 @@ fn soccer_outcome_credit_replay_transitions(
         let milestone_reward = soccer_outcome_credit_milestone_reward(&transition);
         let pitch_shaping = soccer_outcome_credit_pitch_value_shaping(&transition);
         transition.reward = finite_metric(outcome_reward + milestone_reward + pitch_shaping)
-            .clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP);
+            .clamp(-soccer_full_game_return_clip(), soccer_full_game_return_clip());
         transition.done = true;
         replay.push(transition);
     }
@@ -24468,6 +24479,68 @@ pub(crate) fn on_frame_shot_reward_scale() -> f64 {
     grounded_non_conversion_reward_scale(raw, SHOT_ON_TARGET_REWARD_POINTS, conversion_points)
 }
 
+// ═══ ANCHORED REWARD CURRENCY (docs/reward-anchoring.md) ════════════════════
+// Env `DD_SOCCER_ENABLE_ANCHORED_REWARDS` — default OFF ⇒ byte-identical.
+// When ON, the LIVE self-play currency is fixed: a goal pays 500 (replacing the
+// hardcoded 160-pt chain total), a match win pays 1000 (bypassing the
+// goal-scale floor logic, which floored wins against a goal magnitude that the
+// live path never actually scaled), and an on-frame shot is paid DIRECTLY to
+// the shooter with floor 50 and field-vector cap 50+150·xg_scale. This exists
+// because the audit showed the previous levers never reached live training:
+// `DD_SOCCER_ON_FRAME_SHOT_REWARD_SCALE` is consumed only below the
+// `infer_discrete_events` early-return (tracking-only), and
+// `DD_SOCCER_GOAL_REWARD_SCALE` never touches `record_goal_rewards`.
+// Secondary live events (duels, saves, recoveries, defensive-goal history
+// penalties, direct-turnover goals) scale uniformly by ANCHOR_GOAL/160 so
+// their RELATIVE weight is preserved in the new currency.
+pub(crate) const ANCHOR_WIN_POINTS: f64 = 1000.0;
+pub(crate) const ANCHOR_GOAL_POINTS: f64 = 500.0;
+pub(crate) const ANCHOR_ON_FRAME_SHOT_FLOOR: f64 = 50.0;
+pub(crate) const ANCHOR_ON_FRAME_SHOT_CAP_SPAN: f64 = 150.0;
+
+pub(crate) fn anchored_rewards_enabled() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_ANCHORED_REWARDS")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_ANCHORED_REWARDS"))
+    }
+}
+
+/// The live goal event total: the anchor (500) when anchored, else the
+/// historical hardcoded chain total (160).
+pub(crate) fn live_goal_reward_points() -> f64 {
+    if anchored_rewards_enabled() {
+        ANCHOR_GOAL_POINTS
+    } else {
+        GOAL_REWARD_POINTS
+    }
+}
+
+/// Uniform scale for secondary LIVE reward events under the anchored currency
+/// (keeps duel/save/recovery/defensive magnitudes at the same fraction of a
+/// goal as before). 1.0 when anchoring is off.
+pub(crate) fn anchored_currency_scale() -> f64 {
+    if anchored_rewards_enabled() {
+        ANCHOR_GOAL_POINTS / GOAL_REWARD_POINTS
+    } else {
+        1.0
+    }
+}
+
+/// Anchored on-frame shot points for the SHOOTER: floor 50 anywhere on the
+/// pitch, cap 50+150·xg_scale where `xg_scale` ∈ [0,1] is the field-vector
+/// shot context (`shot_reward_distance_scale`: distance taper × xG). An
+/// on-frame 80-yarder caps at exactly the floor; a close central chance can
+/// reach 200 = 0.40 · goal.
+pub(crate) fn anchored_on_frame_shot_points(xg_scale: f64) -> f64 {
+    ANCHOR_ON_FRAME_SHOT_FLOOR + ANCHOR_ON_FRAME_SHOT_CAP_SPAN * xg_scale.clamp(0.0, 1.0)
+}
+
 fn hierarchy_bounded_shot_on_target_points(shot_scale: f64, goal_scale: f64) -> f64 {
     let raw = SHOT_ON_TARGET_REWARD_POINTS * shot_scale.max(MIN_SOCCER_REWARD_WEIGHT);
     let outcome_ceiling =
@@ -24480,6 +24553,12 @@ fn hierarchy_projected_match_win_points(requested: f64, goal_scale: f64) -> f64 
 }
 
 pub(crate) fn match_outcome_win_reward_points() -> f64 {
+    if anchored_rewards_enabled() {
+        // Anchored currency: winning the match IS the 1000-point anchor. The
+        // env knob and the goal-scale floor are bypassed — the floor logic
+        // scaled against a goal magnitude the live path never actually paid.
+        return ANCHOR_WIN_POINTS;
+    }
     let requested = if dynamic_reward_weights_enabled() {
         reward_weight_env(
             "DD_SOCCER_MATCH_WIN_REWARD_POINTS",
