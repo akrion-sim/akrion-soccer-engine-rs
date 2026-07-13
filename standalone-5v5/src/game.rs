@@ -579,18 +579,23 @@ pub struct World {
     pub b: [Player; N],
     pub ball: V2,
     pub ball_vel: V2,
-    pub ball_aerial: bool, // in-flight ball is airborne (altitude above the rolling threshold)
-    pub air_ticks: u32,    // legacy scoop-duration counter (kept for compat; flight now driven by z)
+    // Flight model selector, snapshotted from FIVEASIDE_PARITY_BALLFLIGHT at
+    // construction: false = LEGACY (single-term friction + tick-counted scoop),
+    // true = 11v11-parity (3-term drag + gravity-timed loft + z capture gates).
+    parity_flight: bool,
+    pub ball_aerial: bool, // in-flight ball is airborne (loft/scoop, per the active model)
+    pub air_ticks: u32,    // LEGACY: ticks the scooped ball stays airborne before it lands
     // 11v11-parity z-axis: altitude is a scalar (the ball's Vec2 stays horizontal), driven by a
     // closed-form projectile parabola in time — no z-velocity, no bounce (matches soccer.rs).
-    pub ball_z: f32, // altitude (yards) above the pitch
+    pub ball_z: f32, // altitude (yards) above the pitch (parity model; 0 under legacy)
     ball_apex: f32,  // peak height of the current loft
     ball_taloft: f32, // seconds since the current loft was launched
     pub ball_curl: V2, // lateral curl (spin) accel on a long (>20yd) pass/shot
     pending_curl: V2, // scratch: curl for the kick launching this tick
-    pending_aerial: bool, // scratch: the pass launched this tick is a loft
-    pending_apex: f32, // scratch: apex of the loft launching this tick
-    pending_aerial_speed: f32, // scratch: land-on-target horizontal launch speed for the loft
+    pending_aerial: bool, // scratch: the pass launched this tick is a loft/scoop
+    pending_air_ticks: u32, // scratch (LEGACY): airborne duration for the launching scoop
+    pending_apex: f32, // scratch (parity): apex of the loft launching this tick
+    pending_aerial_speed: f32, // scratch (parity): land-on-target horizontal launch speed
     pub owner: Option<Owner>,
     pub last_touch: Option<Team>,
     last_kicker: Option<Owner>,
