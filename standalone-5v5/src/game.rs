@@ -1530,33 +1530,46 @@ impl World {
             let d = rotate(dir.unit(), ang);
             self.ball_vel = d.scale(speed);
             let kp = self.player(kicker).pos;
-            // First touch of the kick puts the ball ~1 yd off the boot — but
-            // never TELEPORTS it over a line: a kick from the byline used to
-            // spawn the ball already out of play (instant dead-ball turnover,
-            // ~0.6/game), which poisoned corner-trapped passes. Clamp the
-            // spawn on the pitch; the FLIGHT may still legitimately carry out.
             let spawn = kp.add(d.scale(1.0));
-            self.ball = V2::new(
-                spawn.x.clamp(0.2, FIELD_L - 0.2),
-                spawn.y.clamp(0.2, FIELD_W - 0.2),
-            );
+            self.ball = if self.parity_flight {
+                // Parity: the first touch puts the ball ~1 yd off the boot but
+                // never TELEPORTS it over a line — a kick from the byline used
+                // to spawn the ball already out of play (instant dead-ball
+                // turnover, ~0.6/game), which poisoned corner-trapped passes.
+                // The FLIGHT may still legitimately carry out.
+                V2::new(
+                    spawn.x.clamp(0.2, FIELD_L - 0.2),
+                    spawn.y.clamp(0.2, FIELD_W - 0.2),
+                )
+            } else {
+                spawn // legacy: unclamped (validated behavior, kept exactly)
+            };
             self.owner = None;
             self.last_touch = Some(kicker.team);
             self.last_kicker = Some(kicker);
             self.kick_timer = 6;
             self.ball_aerial = is_pass && self.pending_aerial;
-            if self.ball_aerial {
-                // Launch the loft: reset the arc and use the land-on-target horizontal speed.
-                self.ball_apex = self.pending_apex;
-                self.ball_taloft = 0.0;
-                self.ball_z = 0.0;
-                self.ball_vel = d.scale(self.pending_aerial_speed);
+            if self.parity_flight {
+                if self.ball_aerial {
+                    // Launch the loft: reset the arc, use the land-on-target speed.
+                    self.ball_apex = self.pending_apex;
+                    self.ball_taloft = 0.0;
+                    self.ball_z = 0.0;
+                    self.ball_vel = d.scale(self.pending_aerial_speed);
+                } else {
+                    self.ball_apex = 0.0;
+                    self.ball_taloft = 0.0;
+                    self.ball_z = 0.0;
+                }
+                self.air_ticks = 0;
             } else {
-                self.ball_apex = 0.0;
-                self.ball_taloft = 0.0;
-                self.ball_z = 0.0;
+                // Legacy scoop: a fixed airborne tick budget, no altitude state.
+                self.air_ticks = if self.ball_aerial {
+                    self.pending_air_ticks
+                } else {
+                    0
+                };
             }
-            self.air_ticks = 0;
             self.pending_aerial = false;
             self.ball_curl = self.pending_curl;
             self.pending_curl = V2::default();
