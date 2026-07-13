@@ -38836,7 +38836,10 @@ fn shoot_action_launches_at_least_forty_mph_even_off_balance() {
 
     sim.apply_player_intent(PlayerIntent {
         player_id: shooter,
-        action: SoccerAction::Shoot { power: 0.0 },
+        action: SoccerAction::Shoot {
+            power: 0.0,
+            target_point: None,
+        },
         sprint: false,
     });
 
