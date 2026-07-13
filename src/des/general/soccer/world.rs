@@ -44682,6 +44682,7 @@ impl WorldSnapshot {
             away_pass_completion_head: m.away_pass_completion_head.clone(),
             away_auxiliary_heads_dedicated: m.away_neural_learner.is_some() || m.away_neural_frozen,
             loose_ball_commit_head: m.loose_ball_commit_head.clone(),
+            mpc_reject_threshold_head: m.mpc_reject_threshold_head.clone(),
             receive_approach_head: m.receive_approach_head.clone(),
             lane_affinity_head: m.lane_affinity_head.clone(),
             goal_side_recovery_head: m.goal_side_recovery_head.clone(),
