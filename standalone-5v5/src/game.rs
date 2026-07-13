@@ -2398,6 +2398,37 @@ mod tests {
         [A_STAY; N]
     }
 
+    #[test]
+    fn loft_altitude_is_a_rise_then_fall_arc() {
+        let apex = lofted_apex_yds(18.0); // mid-range loft
+        assert!(apex >= 1.6 && apex <= 9.0, "apex clamped: {apex}");
+        let hang = hang_time(apex);
+        assert!(hang > 0.5 && hang < 3.0, "hang time sane: {hang}");
+        // z is 0 at launch, peaks near apex mid-flight, back to 0 on landing.
+        assert!(altitude_at(apex, 0.0).abs() < 1e-4);
+        assert!(altitude_at(apex, hang).abs() < 1e-4);
+        let mid = altitude_at(apex, hang / 2.0);
+        assert!((mid - apex).abs() < 1e-3, "midpoint height == apex: {mid} vs {apex}");
+        // monotone rise over the first half.
+        assert!(altitude_at(apex, hang * 0.25) < altitude_at(apex, hang * 0.5));
+        // longer passes loft higher (until the 9.0 cap).
+        assert!(lofted_apex_yds(30.0) > lofted_apex_yds(12.0));
+    }
+
+    #[test]
+    fn three_term_drag_decelerates_and_stops() {
+        // A rolling ball loses speed each tick and eventually snaps to rest.
+        let mut s = 18.0f32;
+        for _ in 0..200 {
+            s = ball_resistance_after(s, 0.0);
+        }
+        assert_eq!(s, 0.0, "a ground ball eventually stops, got {s}");
+        // Airborne relief: an aloft ball keeps more of its pace than a rolling one.
+        let ground = ball_resistance_after(20.0, 0.0);
+        let aloft = ball_resistance_after(20.0, 3.0);
+        assert!(aloft > ground, "airborne ball drags less: aloft {aloft} vs ground {ground}");
+    }
+
     fn arrange_return_pass_candidates(w: &mut World) {
         w.a[1].pos = V2::new(24.0, 14.0);
         w.a[2].pos = V2::new(30.0, 14.0);
