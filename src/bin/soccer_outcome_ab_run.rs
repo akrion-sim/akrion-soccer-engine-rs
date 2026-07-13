@@ -98,6 +98,16 @@ fn env_neural_blend(mut blend: SoccerNeuralBlendConfig) -> SoccerNeuralBlendConf
     blend
 }
 
+/// The analytic-opponent experiment has exactly one learned team, so the shared actor sidecar is
+/// unambiguous and safe to enable. Train and held-out evaluation must also exercise the same MCTS
+/// decision seam; otherwise actor/planner-teacher changes are trained but silently absent at the
+/// gate. Explicit env overrides remain available for deliberate ablations.
+fn analytic_experiment_neural_blend(mut blend: SoccerNeuralBlendConfig) -> SoccerNeuralBlendConfig {
+    blend.actor_critic = true;
+    blend.mcts_enabled = true;
+    env_neural_blend(blend)
+}
+
 fn print_neural_blend(label: &str, blend: SoccerNeuralBlendConfig) {
     println!(
         "[{label}] neural_blend: mode={:?} lambda={} warmup_steps={} candidates={} \
@@ -256,8 +266,7 @@ fn train_analytic(out_path: &str, games: usize, minutes: f64, seed_base: u32) {
             seed: seed_base.wrapping_add(g as u32),
             ..MatchConfig::default()
         };
-        config.neural_blend.actor_critic = true;
-        config.neural_blend = env_neural_blend(config.neural_blend);
+        config.neural_blend = analytic_experiment_neural_blend(config.neural_blend);
         if g == 0 {
             print_neural_blend("train-analytic", config.neural_blend);
         }
@@ -628,7 +637,8 @@ fn eval_analytic(
 
     let mut runner_config = EngineMatchRunnerConfig::default();
     runner_config.base.duration_seconds = minutes * 60.0;
-    runner_config.base.neural_blend = env_neural_blend(runner_config.base.neural_blend);
+    runner_config.base.neural_blend =
+        analytic_experiment_neural_blend(runner_config.base.neural_blend);
     print_neural_blend("eval-analytic", runner_config.base.neural_blend);
     let mut runner = EngineMatchRunner::new(runner_config);
 

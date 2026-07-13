@@ -247,3 +247,18 @@ completions, with a weaker `-0.22/game` margin. Wilson lower bounds were `0.255`
 `0.268`. Neither gate is promoted. The floor is nevertheless active and improves the frozen actor's
 primary mean, so the next experiment tests whether training with that bounded exposure supplies
 useful actor samples; the saturated scalar is excluded.
+
+An experiment-stack audit then found a blocking train/eval mismatch in
+`soccer_outcome_ab_run`: analytic training ran actor-critic on with MCTS off, while analytic
+held-out evaluation inherited the tournament's actor-off/MCTS-on defaults. The tournament default
+is correct for two learned teams because its actor sidecar is shared, but an analytic fixture has
+exactly one learned team and can safely evaluate that actor. The runner now defaults both
+`train-analytic` and `eval-analytic` to actor-critic plus MCTS, while retaining explicit env
+overrides for ablations. An optimized end-to-end smoke proved both phases report
+`actor_critic=true` and `mcts_enabled=true`.
+
+This mismatch means earlier critic/reward screens remain diagnostics of their executed stacks, and
+the fixed-checkpoint MCTS exposure traces remain valid, but actor-specific held-out conclusions are
+not promotion evidence: the evaluator did not consult the trained actor. In particular, the first
+forward-select learning comparison must be rerun under the aligned stack. The interrupted
+exposure-learning run is discarded and restarted from its original seed after this correction.
