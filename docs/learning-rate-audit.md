@@ -173,3 +173,14 @@ bootstrap to propagate that signal through the field-state abstraction. It compa
 DP-without-outcome, the existing DP flat broadcast, and DP terminal propagation at the
 production target scale. This tests a fixed winning anchor without assigning identical
 credit to every action; it remains experimental until held-out and repeated-seed gates pass.
+
+The first powered DP screen trained 60 games and evaluated 32 held-out fixtures per arm.
+DP-without-outcome reached payoff `0.422`, Elo delta `-17.6`, and forward margin
+`-0.12/game`; existing DP flat `200` reached payoff `0.469`, Elo delta `+1.5`, and forward
+margin `+0.19/game`; DP terminal propagation reached payoff `0.453`, Elo delta `+25.9`,
+and forward margin `+0.00/game`. Wilson lower bounds (`0.268`, `0.309`, `0.295`) all failed
+promotion. The terminal treatment therefore stays off. Within this matched DP seed, the
+existing flat anchor led both alternatives on primary payoff and forward-pass margin, so
+the evidence supports retaining it while the plateau investigation moves to a different
+factor. The Elo ordering alone is not used to overturn the payoff result because the
+analytic-baseline estimates varied across arms.
