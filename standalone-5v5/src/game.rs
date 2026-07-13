@@ -118,12 +118,14 @@ const CONTROL_AERIAL_JUMP_REACH: f32 = 2.2;
 const LOW_BALL_INTERCEPT_FLOOR: f32 = 2.0;
 const KEEPER_AERIAL_REACH: f32 = 2.6; // keeper jump+arms: claims lofted balls only up to this altitude
 const AERIAL_LAND_AT_TARGET_DRAG_COMP: f32 = 1.08; // closed-form ignores drag: strike a touch firmer
-// A deliberate chip over a blocked lane needs the room to rise OVER reach and
-// come back down — under this distance the arc never protects the ball and a
-// firm ground pass through/around traffic is strictly better (the speed solve
-// already zips pressured balls). Apex floor = the 11v11 raised-scoop minimum
-// (SCOOP_LOFT_APEX_HIGH_MIN_YARDS ~10ft): clears an upright/jumping defender.
-const LOFT_MIN_DISTANCE: f32 = 11.0;
+// A blocked ground lane turns the pass into a CHIP (the 11v11 scoop): the apex
+// floor is the 11v11 raised-scoop minimum (SCOOP_LOFT_APEX_HIGH_MIN_YARDS,
+// ~10ft — "clears an upright/jumping defender"), and below the 11v11 scoop's
+// distance anchor (its distance_fit starts at 4yd) a chip is degenerate — the
+// solve zips those rare 2-4yd balls along the floor instead. Blocked-lane
+// GROUND passes complete at ~18% here (measured), so the chip outlet is what
+// keeps pressured possession — and early RL exploration — alive.
+const LOFT_MIN_DISTANCE: f32 = 4.0;
 const LOFT_APEX_CLEAR_FLOOR: f32 = 3.05;
 
 /// Peak height (yd) of a lofted pass over horizontal distance `d` (lofted_pass_apex_yards).
