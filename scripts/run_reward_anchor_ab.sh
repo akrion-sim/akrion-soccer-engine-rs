@@ -20,15 +20,19 @@ if [[ ! "$WIN_REWARD_A" =~ ^[0-9]+([.][0-9]+)?$ ]] \
   printf 'WIN_REWARD_A and WIN_REWARD_B must be non-negative numbers\n' >&2
   exit 2
 fi
-arm_a="win${WIN_REWARD_A//./p}"
-arm_b="win${WIN_REWARD_B//./p}"
-if [[ "$arm_a" == "$arm_b" ]]; then
-  printf 'WIN_REWARD_A and WIN_REWARD_B must differ\n' >&2
-  exit 2
-fi
+cargo build --release --manifest-path "$ROOT/Cargo.toml" --bin soccer_outcome_ab_run
 
-if [[ ! -x "$BIN" ]]; then
-  cargo build --release --manifest-path "$ROOT/Cargo.toml" --bin soccer_outcome_ab_run
+effective_a="$(env SOCCER_DYNAMIC_REWARD_WEIGHTS=1 DD_SOCCER_MATCH_WIN_REWARD_POINTS="$WIN_REWARD_A" \
+  "$BIN" effective-win-reward)"
+effective_b="$(env SOCCER_DYNAMIC_REWARD_WEIGHTS=1 DD_SOCCER_MATCH_WIN_REWARD_POINTS="$WIN_REWARD_B" \
+  "$BIN" effective-win-reward)"
+arm_a="win${effective_a//./p}"
+arm_b="win${effective_b//./p}"
+printf 'requested/effective win rewards: A=%s/%s B=%s/%s\n' \
+  "$WIN_REWARD_A" "$effective_a" "$WIN_REWARD_B" "$effective_b"
+if [[ "$arm_a" == "$arm_b" ]]; then
+  printf 'WIN_REWARD_A and WIN_REWARD_B resolve to the same effective reward (%s)\n' "$effective_a" >&2
+  exit 2
 fi
 
 mkdir -p "$OUT_DIR"

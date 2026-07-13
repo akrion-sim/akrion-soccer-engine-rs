@@ -24479,7 +24479,10 @@ fn hierarchy_projected_match_win_points(requested: f64, goal_scale: f64) -> f64 
     requested.max(GOAL_REWARD_POINTS * goal_scale.max(1.0) + WIN_OVER_CONVERSION_REWARD_MARGIN)
 }
 
-pub(crate) fn match_outcome_win_reward_points() -> f64 {
+/// Effective win-reward anchor after applying the configured goal-over-shot and
+/// win-over-goal hierarchy. Public so experiment binaries can report the treatment
+/// that actually executed instead of only the requested environment value.
+pub fn match_outcome_win_reward_points() -> f64 {
     let requested = if dynamic_reward_weights_enabled() {
         reward_weight_env(
             "DD_SOCCER_MATCH_WIN_REWARD_POINTS",

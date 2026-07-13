@@ -126,8 +126,9 @@ same-seed arms against an alternating analytic pool: no outcome label, the exist
 label, and the maximum effective `400` label, then evaluates every snapshot on the same
 held-out analytic field. `WIN_REWARD_A` and `WIN_REWARD_B` select the two nonzero arms.
 
-The first powered run trained each arm for 60 same-seed games and evaluated it over 32
-held-out games. Outcome-off was nominally best (payoff `0.500`, Elo delta `+15.5`, forward
+The first powered run trained each arm for 60 same-seed, `0.35`-minute games and evaluated
+it over 32 held-out games of the same duration. These short fixtures are a fast screening
+gate, not proof of full-match climb. Outcome-off was nominally best (payoff `0.500`, Elo delta `+15.5`, forward
 pass margin `+0.00/game`); `200` reached payoff `0.438`, Elo delta `+4.3`, forward margin
 `+0.16/game`; `400` reached payoff `0.453`, Elo delta `-40.3`, forward margin `-0.06/game`.
 Every Wilson lower bound remained below the promotion floor (`0.282` to `0.336`). This
@@ -136,17 +137,23 @@ prove that the outcome label should be removed.
 
 The independent-seed replication used the same 60-game training and 32-game held-out
 protocol. Outcome-off again led (payoff `0.516`, Elo delta `+11.5`, forward-pass margin
-`+0.09/game`); the `30` nudge reached payoff `0.422`, Elo delta `-35.9`, forward margin
-`+0.03/game`; `200` reached payoff `0.484`, Elo delta `+2.2`, forward margin
-`-0.19/game`. No arm passed its Wilson promotion floor. Across both seeds, every flat
-per-transition outcome-label arm underperformed outcome-off on payoff, so neither `30`,
-`200`, nor `400` is promoted from this experiment.
+`+0.09/game`); the arm requested as `30` reached payoff `0.422`, Elo delta `-35.9`,
+forward margin `+0.03/game`; `200` reached payoff `0.484`, Elo delta `+2.2`, forward
+margin `-0.19/game`. Audit of the executed treatment found that the reward hierarchy
+floors the win value at goal reward `160 + 20`, so the requested `30` arm actually ran
+at `180`. The experiment binary now prints the effective post-hierarchy win reward to
+prevent another mislabeled treatment. No arm passed its Wilson promotion floor. Across
+both seeds, every executed flat per-transition outcome-label arm (`180`, `200`, and
+`400`) underperformed outcome-off on payoff, so none is promoted from this experiment.
 
 That result narrows the next test to credit-assignment structure, not another magnitude.
 `scripts/run_outcome_credit_ab.sh` holds the seed, opponent pools, target transform, and
 `200` win value constant while comparing outcome-off, the flat outcome broadcast, and
-the production `DD_SOCCER_OUTCOME_CREDIT=1` replay. The latter still broadcasts the result
-but replaces the correlated dense return with bounded positive milestones plus pitch-value
-shaping. This isolates whether dense negative/correlated replay conflicts with the fixed
-winning anchor. It must clear the same held-out gate on repeated seeds before any default
-change; one nominal win is not evidence of a durable climb.
+the experimental `DD_SOCCER_OUTCOME_CREDIT=1` replay. The latter still broadcasts the
+result but replaces the correlated dense return with bounded positive milestones plus
+pitch-value shaping. It is not the effective DP-bootstrap production path: when both
+flags are on, DP replay takes precedence and bypasses outcome-credit replay. The experiment
+therefore disables DP deliberately to isolate whether dense negative/correlated replay
+conflicts with the fixed winning anchor. It must clear the same held-out gate on repeated
+seeds and then survive a DP-compatible test before any default change; one nominal win is
+not evidence of a durable climb.

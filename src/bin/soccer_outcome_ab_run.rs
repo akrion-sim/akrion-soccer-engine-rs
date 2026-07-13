@@ -21,8 +21,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use soccer_engine::des::general::soccer::{
-    enable_deterministic_formation_lp, learned_mpc_objective_enabled, match_outcome_reward_enabled,
-    MatchConfig, SoccerMarlAlgorithm, SoccerMatch, SoccerMpcObjectiveHead, SoccerNeuralBlendConfig,
+    enable_deterministic_formation_lp, learned_mpc_objective_enabled,
+    match_outcome_reward_enabled, match_outcome_win_reward_points, MatchConfig,
+    SoccerMarlAlgorithm, SoccerMatch, SoccerMpcObjectiveHead, SoccerNeuralBlendConfig,
     SoccerNeuralBlendMode, SoccerNeuralLearningBackend, SoccerNeuralLearningConfig,
     SoccerNeuralNetworkSnapshot, SoccerQPolicyOptions, SoccerTeamQPolicies, Team,
     DEFAULT_SOCCER_MAPPO_TEAM_REWARD_SHARE,
@@ -123,8 +124,9 @@ fn train(out_path: &str, games: usize, minutes: f64, seed_base: u32) {
     enable_deterministic_formation_lp();
     println!(
         "[train] out={out_path} games={games} minutes={minutes} seed_base=0x{seed_base:08X} \
-         match_outcome_reward={}",
-        match_outcome_reward_enabled()
+         match_outcome_reward={} effective_match_win_reward={}",
+        match_outcome_reward_enabled(),
+        match_outcome_win_reward_points()
     );
     let mut neural = SoccerNeuralLearningConfig {
         enabled: true,
@@ -223,8 +225,9 @@ fn train_analytic(out_path: &str, games: usize, minutes: f64, seed_base: u32) {
     println!(
         "[train-analytic] out={out_path} games={games} minutes={minutes} seed_base=0x{seed_base:08X} \
          analytic_pool_size={analytic_pool_size} alternate_sides={alternate_sides} \
-         match_outcome_reward={}",
-        match_outcome_reward_enabled()
+         match_outcome_reward={} effective_match_win_reward={}",
+        match_outcome_reward_enabled(),
+        match_outcome_win_reward_points()
     );
     let mut neural = SoccerNeuralLearningConfig {
         enabled: true,
@@ -803,6 +806,9 @@ fn eval_analytic(
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        Some("effective-win-reward") => {
+            println!("{}", match_outcome_win_reward_points());
+        }
         Some("train") => {
             let out = args
                 .get(2)
@@ -845,7 +851,8 @@ fn main() {
         }
         _ => {
             eprintln!(
-                "usage:\n  soccer_outcome_ab_run train <out.json> [games=40] [minutes=3] [seed_hex]\n  \
+                "usage:\n  soccer_outcome_ab_run effective-win-reward\n  \
+                 soccer_outcome_ab_run train <out.json> [games=40] [minutes=3] [seed_hex]\n  \
                  soccer_outcome_ab_run train-analytic <out.json> [games=40] [minutes=3] [seed_hex]\n  \
                  soccer_outcome_ab_run eval <candidate.json> <baseline.json> [games=30] [minutes=3] [holdout_hex]\n  \
                  soccer_outcome_ab_run eval-analytic <candidate.json> [games_per_opp=6] [minutes=3] [pool_size=4] [holdout_hex]"

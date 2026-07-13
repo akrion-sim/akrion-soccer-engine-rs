@@ -19,9 +19,10 @@ if [[ ! "$WIN_REWARD" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
   exit 2
 fi
 
-if [[ ! -x "$BIN" ]]; then
-  cargo build --release --manifest-path "$ROOT/Cargo.toml" --bin soccer_outcome_ab_run
-fi
+cargo build --release --manifest-path "$ROOT/Cargo.toml" --bin soccer_outcome_ab_run
+effective_win_reward="$(env SOCCER_DYNAMIC_REWARD_WEIGHTS=1 DD_SOCCER_MATCH_WIN_REWARD_POINTS="$WIN_REWARD" \
+  "$BIN" effective-win-reward)"
+printf 'requested/effective win reward: %s/%s\n' "$WIN_REWARD" "$effective_win_reward"
 
 mkdir -p "$OUT_DIR"
 
