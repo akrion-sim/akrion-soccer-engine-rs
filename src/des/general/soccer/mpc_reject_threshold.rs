@@ -624,7 +624,7 @@ impl SoccerMatch {
         let plan = SoccerLearnedPlan {
             action: "pass".to_string(),
             target_player: Some(target.id),
-            target_point: snapshot.player_snapshot_position_opt(target.id),
+            target_point: snapshot.player_position(target.id),
             mpc_replan: None,
         };
         let Some(committed_probability) =
@@ -632,7 +632,7 @@ impl SoccerMatch {
         else {
             return;
         };
-        let base_threshold = learned_mpc_replan_thresholds().pass_impossible_probability;
+        let base_threshold = mpc_reject_pass_base_threshold();
         let Some(inputs) =
             snapshot.build_mpc_reject_threshold_inputs(holder, MpcRejectFamily::Pass, base_threshold)
         else {
