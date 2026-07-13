@@ -3095,7 +3095,12 @@ mod tests {
                     z_next <= reach,
                     "captured at altitude {z_next:.2} above reach {reach:.2}"
                 );
-                assert_eq!((o.team, o.idx), (Team::A, receiver), "receiver takes it");
+                assert!(
+                    o.team == Team::A && o.idx == receiver,
+                    "the intended receiver takes it (got team B? {} idx {})",
+                    o.team == Team::B,
+                    o.idx
+                );
                 captured_airborne = airborne_before;
                 break;
             }
