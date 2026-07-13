@@ -1157,6 +1157,8 @@ impl World {
         self.ev_bad_pass_turnover_a = false;
         self.ev_dribble_turnover_a = false;
         self.ev_shot_on_a = false;
+        self.ev_save_a = false;
+        self.ev_save_b = false;
         self.ev_win_ball_a = false;
         self.ev_pass_attempt_a = false;
         self.ev_shot_attempt_a = false;
