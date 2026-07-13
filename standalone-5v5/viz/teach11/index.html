@@ -257,6 +257,7 @@
           <select class="ctl ghost" id="scen" style="padding:6px 9px"></select></div>
         <p class="note" id="scenStory" style="min-height:3.2em"></p>
         <canvas id="probBars"></canvas>
+        <div class="cap" id="flipNote" style="min-height:1.4em"></div>
         <div class="legend">
           <span class="sw"><i style="background:var(--ink-dim)"></i>neural only</span>
           <span class="sw"><i style="background:var(--accent)"></i>neural + DP prior (sampled)</span>
@@ -321,10 +322,10 @@
 
   <!-- ═══════════════ 4. NEURAL ═══════════════ -->
   <section id="nn">
-    <div class="eyebrow"><span class="n">04</span> generalization · the neural net over 210 dims</div>
+    <div class="eyebrow"><span class="n">04</span> generalization · the neural net over ~476 dims</div>
     <h2>The net generalizes what DP cleaned up.</h2>
     <p class="p">DP fixes the <i>labels</i>; the neural net makes them <i>usable</i>. A 128-wide MAPPO
-      actor/critic consumes the full 210-vector and estimates value for field states it has never seen exactly,
+      actor/critic consumes the full ~476-vector and estimates value for field states it has never seen exactly,
       trained on the DP-improved targets. Below: the critic homing in on the EPV target, and the actor climbing
       on the real game — including the <span class="hlG">plateau</span> that motivates everything in §5–7.</p>
     <div class="grid3">
@@ -336,7 +337,7 @@
           <button class="ctl ghost" id="nnPlay">Play</button>
           <input type="range" id="nnScrub" min="0" value="0" style="min-width:70px"></div></div>
       <div class="card"><h3>Approximation error → 0</h3><canvas id="nnErr"></canvas>
-        <p class="note" style="margin-top:8px">The net never matches DP exactly — but it works in 210 dims where
+        <p class="note" style="margin-top:8px">The net never matches DP exactly — but it works in ~476 dims where
           a table can't exist, and it generalizes between similar states.</p></div>
     </div>
     <div class="card" style="margin-top:16px">
@@ -783,25 +784,33 @@ function curProbs(){const e=D.decisions[curScen];const T=+$('#temp').value;retur
 function drawDecision(){
   const e=D.decisions[curScen];const T=+$('#temp').value;
   $('#scenStory').textContent=e.story;$('#tempRead').textContent='T = '+T.toFixed(2);
-  const p=curProbs();$('#entRead').textContent=entropy(p).toFixed(2);
-  probBarsPair($('#probBars'),softmax(e.neural,e.mask,T),p,e.mask);
+  const pn=softmax(e.neural,e.mask,T), p=curProbs();
+  $('#entRead').textContent=entropy(p).toFixed(2);
+  probBarsPair($('#probBars'),pn,p,e.mask);
+  const fn=$('#flipNote'); const acts=D.actions;
+  const nt=pn.indexOf(Math.max(...pn)), bt=p.indexOf(Math.max(...p));
+  fn.innerHTML = nt!==bt
+    ? `neural's top pick <b style="color:var(--ink-dim)">${acts[nt].name}</b> → after the DP prior, `+
+      `<b class="hl">${acts[bt].name}</b> — <span class="hlV">the prior flipped the choice</span>.`
+    : `the DP prior reinforces <b class="hl">${acts[bt].name}</b> (already the neural top pick).`;
 }
-function probBarsPair(cv,pn,pb,mask){
+function probBarsPair(cv,pn,pb,mask,single){
   const {w,h,ctx}=fit(cv,0.66);const acts=D.actions;
   const idxs=acts.map((a,i)=>i).filter(i=>mask[i]);
   const order=idxs.slice().sort((a,b)=>pb[b]-pb[a]);
   const n=order.length;const padL=92,padR=48,padT=6,padB=6;const rh=(h-padT-padB)/n;
   order.forEach((i,rank)=>{const y=padT+rank*rh;
-    // neural-only (dim, thin) behind
-    ctx.fillStyle=css('--ink-dim');ctx.globalAlpha=.45;
-    roundRect(ctx,padL,y+rh*0.14,Math.max(2,(w-padL-padR)*pn[i]),rh*0.30,3);ctx.fill();ctx.globalAlpha=1;
-    // blended (bold)
+    if(!single){ // neural-only (dim, thin) behind
+      ctx.fillStyle=css('--ink-dim');ctx.globalAlpha=.45;
+      roundRect(ctx,padL,y+rh*0.14,Math.max(2,(w-padL-padR)*pn[i]),rh*0.30,3);ctx.fill();ctx.globalAlpha=1;}
+    // blended (bold) — full height when single
     ctx.fillStyle=rank===0?css('--accent'):rank===1?mix(css('--accent'),css('--teamB'),.35):css('--ink-dim');
-    roundRect(ctx,padL,y+rh*0.46,Math.max(2,(w-padL-padR)*pb[i]),rh*0.34,3);ctx.fill();
+    const by=single?y+rh*0.18:y+rh*0.46, bhh=single?rh*0.60:rh*0.34;
+    roundRect(ctx,padL,by,Math.max(2,(w-padL-padR)*pb[i]),bhh,3);ctx.fill();
     ctx.fillStyle=css('--ink');ctx.font='11px ui-monospace,monospace';ctx.textAlign='right';ctx.textBaseline='middle';
     ctx.fillText(acts[i].name,padL-8,y+rh/2);
     ctx.textAlign='left';ctx.fillStyle=rank<3?css('--ink'):css('--ink-dim');
-    ctx.fillText((pb[i]*100).toFixed(pb[i]*100<10?1:0)+'%',padL+Math.max(2,(w-padL-padR)*pb[i])+6,y+rh*0.63);});
+    ctx.fillText((pb[i]*100).toFixed(pb[i]*100<10?1:0)+'%',padL+Math.max(2,(w-padL-padR)*pb[i])+6,y+rh/2);});
 }
 function resetTally(){tally=D.actions.map(()=>0);drawDecision();drawTally();$('#tallyN').textContent='0 samples';}
 function doRoll(nn){const p=curProbs();for(let k=0;k<nn;k++){let r=Math.random(),c=0,pick=0;
@@ -809,7 +818,7 @@ function doRoll(nn){const p=curProbs();for(let k=0;k<nn;k++){let r=Math.random()
   drawTally();$('#tallyN').textContent=tally.reduce((a,b)=>a+b,0)+' samples';}
 function drawTally(){const e=D.decisions[curScen];const tot=(tally||[]).reduce((a,b)=>a+b,0);
   const emp=tally?tally.map(v=>tot?v/tot:0):D.actions.map(()=>0);
-  probBarsPair($('#tallyBars'),emp,emp,e.mask);}
+  probBarsPair($('#tallyBars'),emp,emp,e.mask,true);}
 
 /* ---------------- 3. DP (REAL) ---------------- */
 let dpN=0,dpTimer=null;

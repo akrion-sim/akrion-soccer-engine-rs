@@ -1309,6 +1309,19 @@ fn learned_mpc_contextual_rejection_threshold(
     (base + learned_competition * blend * max_delta).clamp(0.0, 1.0)
 }
 
+/// The analytic per-family base MPC reject bar — the constant the global path uses,
+/// exposed so the learned per-context reject-threshold seam ([`WorldSnapshot::
+/// learned_mpc_reject_threshold`]) can treat it as the group-8 retained determinant it
+/// refines. `None` for families MPC does not gate (returns no bar ⇒ never rejected).
+pub(crate) fn mpc_reject_base_threshold(family: MpcRejectFamily) -> f64 {
+    let thresholds = learned_mpc_replan_thresholds();
+    match family {
+        MpcRejectFamily::Pass => thresholds.pass_impossible_probability,
+        MpcRejectFamily::Dribble => thresholds.dribble_impossible_probability,
+        MpcRejectFamily::Shot => thresholds.shot_impossible_probability,
+    }
+}
+
 fn defensive_shot_on_target_penalty_points() -> (f64, f64) {
     let read = || {
         let max = std::env::var("SOCCER_DEFENSIVE_SOT_MAX_PENALTY")
@@ -1940,6 +1953,19 @@ pub struct SoccerMatch {
     /// present. Carried + trained across games by the learner; `None` ⇒ analytic
     /// seed. Shared into each [`WorldSnapshot`] via an `Arc` clone.
     pub(crate) loose_ball_commit_head: Option<std::sync::Arc<LooseBallCommitHead>>,
+    /// The trained per-context MPC reject-threshold head (how low an action's success
+    /// probability may fall, in this exact context, before MPC refuses it and kicks
+    /// the decision back to the POMDP's next-best). Carried + trained across games by
+    /// the learner; `None` ⇒ context-aware analytic seed. Shared into each
+    /// [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) mpc_reject_threshold_head: Option<std::sync::Arc<MpcRejectThresholdHead>>,
+    /// Rolling RL corpus for the reject-threshold head: per-decision context + the
+    /// execution probability the carrier committed at + the windowed territorial
+    /// reward. Collected only while the reject-threshold model is enabled; empty +
+    /// untouched in the default process.
+    pub(crate) mpc_reject_threshold_samples: Vec<MpcRejectThresholdSample>,
+    /// Open reject-threshold decisions awaiting their windowed reward.
+    pub(crate) pending_mpc_reject_threshold: Vec<PendingMpcRejectThresholdDecision>,
     /// The trained attacking-spacing target head, when present. Carried + trained
     /// across games by the learner; `None` ⇒ analytic 5-8yd seed. Shared into each
     /// [`WorldSnapshot`] via an `Arc` clone so the off-ball ranker and LP floor read
@@ -14124,6 +14150,9 @@ impl SoccerMatch {
             pending_defender_line: Vec::new(),
             back_four_line_latch: [None, None],
             loose_ball_commit_head: None,
+            mpc_reject_threshold_head: None,
+            mpc_reject_threshold_samples: Vec::new(),
+            pending_mpc_reject_threshold: Vec::new(),
             attack_spacing_head: None,
             away_attack_spacing_head: None,
             support_scorer_head: None,
@@ -14337,6 +14366,9 @@ impl SoccerMatch {
             line_depth_head: None,
             defender_line_head: None,
             loose_ball_commit_head: None,
+            mpc_reject_threshold_head: None,
+            mpc_reject_threshold_samples: Vec::new(),
+            pending_mpc_reject_threshold: Vec::new(),
             attack_spacing_head: None,
             away_attack_spacing_head: None,
             support_scorer_head: None,
@@ -20910,7 +20942,13 @@ impl SoccerMatch {
             flight,
             candidates,
         );
-        let raw_receipt_threshold = learned_mpc_replan_thresholds().pass_impossible_probability;
+        // The pass reject bar, context-dependent when the reject-threshold model is on,
+        // else the family base constant (byte-identical).
+        let raw_receipt_threshold = snapshot.learned_mpc_reject_threshold(
+            player_id,
+            MpcRejectFamily::Pass,
+            mpc_reject_base_threshold(MpcRejectFamily::Pass),
+        );
         let net_forward_quality_threshold =
             learned_pass_receiver_min_net_forward_quality().max(raw_receipt_threshold);
         let acceptance_probability = |target_player: Option<usize>,
@@ -21173,29 +21211,23 @@ impl SoccerMatch {
                 .clamp(0.0, 1.0);
         let thresholds = learned_mpc_replan_thresholds();
         let ranked = policy
-            .ranked_action_values_for_snapshot(
-                snapshot,
-                player_id,
-                LEARNED_MPC_REPLAN_CANDIDATES,
-            )
+            .ranked_action_values_for_snapshot(snapshot, player_id, LEARNED_MPC_REPLAN_CANDIDATES)
             .map(|(_, ranked)| ranked);
-        let base_hard_threshold = if pass_like_action_flight(original_family).is_some() {
-            Some(thresholds.pass_impossible_probability)
-        } else if is_dribble_action_label(original_family) {
-            Some(thresholds.dribble_impossible_probability)
-        } else if matches!(
-            original_family,
-            "shoot" | "first-time-shot" | "first-time-header"
-        ) {
-            Some(thresholds.shot_impossible_probability)
-        } else {
-            None
-        };
-        let contextual_hard_threshold = base_hard_threshold.map(|base| {
-            ranked.as_deref().map_or(base, |actions| {
-                learned_mpc_contextual_rejection_threshold(base, &original_action, actions)
-            })
-        });
+        let contextual_hard_threshold = Self::learned_mpc_reject_family_for_label(original_family)
+            .map(|family| {
+                let field_vector_threshold = snapshot.learned_mpc_reject_threshold(
+                    player_id,
+                    family,
+                    mpc_reject_base_threshold(family),
+                );
+                ranked.as_deref().map_or(field_vector_threshold, |actions| {
+                    learned_mpc_contextual_rejection_threshold(
+                        field_vector_threshold,
+                        &original_action,
+                        actions,
+                    )
+                })
+            });
         let hard_replan = contextual_hard_threshold
             .is_some_and(|threshold| original_execution_probability < threshold);
         let soft_replan_eligible = !hard_replan
@@ -21235,26 +21267,20 @@ impl SoccerMatch {
                     .unwrap_or(0.0)
                     .clamp(0.0, 1.0);
             let candidate_family = normalize_soccer_action_label(&candidate_plan.action);
-            let candidate_base_threshold = if pass_like_action_flight(candidate_family).is_some() {
-                Some(thresholds.pass_impossible_probability)
-            } else if is_dribble_action_label(candidate_family) {
-                Some(thresholds.dribble_impossible_probability)
-            } else if matches!(
-                candidate_family,
-                "shoot" | "first-time-shot" | "first-time-header"
-            ) {
-                Some(thresholds.shot_impossible_probability)
-            } else {
-                None
-            };
-            let candidate_hard_replan = candidate_base_threshold.is_some_and(|base| {
-                let contextual = learned_mpc_contextual_rejection_threshold(
-                    base,
-                    &candidate_plan.action,
-                    &ranked,
-                );
-                candidate_execution_probability < contextual
-            });
+            let candidate_hard_replan = Self::learned_mpc_reject_family_for_label(candidate_family)
+                .is_some_and(|family| {
+                    let field_vector_threshold = snapshot.learned_mpc_reject_threshold(
+                        player_id,
+                        family,
+                        mpc_reject_base_threshold(family),
+                    );
+                    let contextual = learned_mpc_contextual_rejection_threshold(
+                        field_vector_threshold,
+                        &candidate_plan.action,
+                        &ranked,
+                    );
+                    candidate_execution_probability < contextual
+                });
             let candidate_is_replacement = if hard_replan {
                 !candidate_hard_replan
             } else {
@@ -21288,6 +21314,18 @@ impl SoccerMatch {
             .unwrap_or(plan);
         }
         plan
+    }
+
+    fn learned_mpc_reject_family_for_label(label: &str) -> Option<MpcRejectFamily> {
+        if pass_like_action_flight(label).is_some() {
+            Some(MpcRejectFamily::Pass)
+        } else if is_dribble_action_label(label) {
+            Some(MpcRejectFamily::Dribble)
+        } else if matches!(label, "shoot" | "first-time-shot" | "first-time-header") {
+            Some(MpcRejectFamily::Shot)
+        } else {
+            None
+        }
     }
 
     fn mpc_safe_fallback_learned_plan(
@@ -21361,19 +21399,15 @@ impl SoccerMatch {
         plan: &SoccerLearnedPlan,
     ) -> bool {
         let label = normalize_soccer_action_label(&plan.action);
-        let thresholds = learned_mpc_replan_thresholds();
-        let threshold = if pass_like_action_flight(label).is_some() {
-            Some(thresholds.pass_impossible_probability)
-        } else if is_dribble_action_label(label) {
-            Some(thresholds.dribble_impossible_probability)
-        } else if matches!(label, "shoot" | "first-time-shot" | "first-time-header") {
-            Some(thresholds.shot_impossible_probability)
-        } else {
-            None
-        };
-        let Some(threshold) = threshold else {
+        let family = Self::learned_mpc_reject_family_for_label(label);
+        let Some(family) = family else {
             return false;
         };
+        // Context-dependent reject bar: the learned per-context threshold when the
+        // reject-threshold model is enabled, else exactly the family base constant
+        // (byte-identical). "Too low" is a function of the field vector, not a global.
+        let base_threshold = mpc_reject_base_threshold(family);
+        let threshold = snapshot.learned_mpc_reject_threshold(player_id, family, base_threshold);
         Self::learned_plan_mpc_execution_probability(snapshot, player_id, plan)
             .is_some_and(|probability| probability < threshold)
     }
@@ -21399,7 +21433,7 @@ impl SoccerMatch {
             && candidate_probability - original_probability >= thresholds.soft_min_improvement
     }
 
-    fn learned_plan_mpc_execution_probability(
+    pub(crate) fn learned_plan_mpc_execution_probability(
         snapshot: &WorldSnapshot,
         player_id: usize,
         plan: &SoccerLearnedPlan,
@@ -25394,6 +25428,9 @@ impl SoccerMatch {
             tick_start_snapshot.tick,
         );
         self.collect_loose_ball_commit_rl_samples(&next_snapshot);
+        // Learnable per-context MPC reject-threshold RL samples (no-op + byte-identical
+        // unless `DD_SOCCER_ENABLE_MPC_REJECT_THRESHOLD_MODEL` is set).
+        self.collect_mpc_reject_threshold_rl_samples(&next_snapshot);
         // Learnable receive-approach RL samples (no-op + byte-identical unless
         // `DD_SOCCER_ENABLE_RECEIVE_APPROACH_MODEL` is set).
         self.collect_receive_approach_rl_samples(&next_snapshot);
@@ -32714,8 +32751,9 @@ impl SoccerMatch {
                     // this is a no-op ⇒ identical to baseline.
                     if dd_soccer_enable_actor_shot_placement() {
                         if let Some(actor_aim) = actor_shot_target {
-                            base_goal_x =
-                                actor_aim.x.clamp(goal_center_x - half_goal, goal_center_x + half_goal);
+                            base_goal_x = actor_aim
+                                .x
+                                .clamp(goal_center_x - half_goal, goal_center_x + half_goal);
                         }
                     }
                     // Learned MPC execution-objective residual for SHOT PLACEMENT — the shot analogue
@@ -41030,6 +41068,12 @@ pub struct WorldSnapshot {
     /// Skipped by serde (an internal decision aid; Default = None).
     #[serde(skip)]
     pub(crate) loose_ball_commit_head: Option<std::sync::Arc<LooseBallCommitHead>>,
+    /// The trained per-context MPC reject-threshold head, carried from the match for
+    /// live consumption at the MPC feasibility gate ([`Self::learned_mpc_reject_threshold`]).
+    /// `None` ⇒ context-aware analytic seed (and, when the model is gated off, the
+    /// constant base bar — parity). Skipped by serde (an internal decision aid).
+    #[serde(skip)]
+    pub(crate) mpc_reject_threshold_head: Option<std::sync::Arc<MpcRejectThresholdHead>>,
     /// The trained receive-approach head, carried from the match for live consumption in
     /// the reception election (`receive_approach_adjusted_target`). `None` ⇒ analytic seed
     /// (parity). Skipped by serde (an internal decision aid; Default = None).
@@ -44735,6 +44779,7 @@ impl WorldSnapshot {
             away_pass_completion_head: m.away_pass_completion_head.clone(),
             away_auxiliary_heads_dedicated: m.away_neural_learner.is_some() || m.away_neural_frozen,
             loose_ball_commit_head: m.loose_ball_commit_head.clone(),
+            mpc_reject_threshold_head: m.mpc_reject_threshold_head.clone(),
             receive_approach_head: m.receive_approach_head.clone(),
             lane_affinity_head: m.lane_affinity_head.clone(),
             goal_side_recovery_head: m.goal_side_recovery_head.clone(),

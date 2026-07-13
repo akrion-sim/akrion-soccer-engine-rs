@@ -70,6 +70,8 @@ pub use back_four_line::*;
 pub use lane_affinity_decision::*;
 mod loose_ball_commit;
 pub use loose_ball_commit::*;
+mod mpc_reject_threshold;
+pub use mpc_reject_threshold::*;
 mod receive_approach;
 pub use receive_approach::*;
 mod long_pass_run;
@@ -24468,15 +24470,13 @@ pub(crate) fn on_frame_shot_reward_scale() -> f64 {
 
 fn hierarchy_bounded_shot_on_target_points(shot_scale: f64, goal_scale: f64) -> f64 {
     let raw = SHOT_ON_TARGET_REWARD_POINTS * shot_scale.max(MIN_SOCCER_REWARD_WEIGHT);
-    let outcome_ceiling = GOAL_REWARD_POINTS * goal_scale.max(1.0)
-        - CONVERSION_OVER_SHOT_REWARD_MARGIN;
+    let outcome_ceiling =
+        GOAL_REWARD_POINTS * goal_scale.max(1.0) - CONVERSION_OVER_SHOT_REWARD_MARGIN;
     raw.min(outcome_ceiling.max(MIN_SOCCER_REWARD_WEIGHT))
 }
 
 fn hierarchy_projected_match_win_points(requested: f64, goal_scale: f64) -> f64 {
-    requested.max(
-        GOAL_REWARD_POINTS * goal_scale.max(1.0) + WIN_OVER_CONVERSION_REWARD_MARGIN,
-    )
+    requested.max(GOAL_REWARD_POINTS * goal_scale.max(1.0) + WIN_OVER_CONVERSION_REWARD_MARGIN)
 }
 
 pub(crate) fn match_outcome_win_reward_points() -> f64 {
@@ -43321,9 +43321,7 @@ mod soccer_policy_actor_capacity_tests {
             terminal_shot_scale * SHOT_ON_TARGET_REWARD_POINTS <= frac * 100.0 + 1e-9,
             "non-conversion points must stay <= fraction * conversion reward"
         );
-        assert!(
-            (terminal_shot_scale - frac * 100.0 / SHOT_ON_TARGET_REWARD_POINTS).abs() < 1e-9
-        );
+        assert!((terminal_shot_scale - frac * 100.0 / SHOT_ON_TARGET_REWARD_POINTS).abs() < 1e-9);
 
         // Proportional: raising the goal reward raises the allowed non-conversion ceiling in step,
         // so "shot < goal by a meaningful margin" holds at any magnitude (not just near 100).
@@ -59386,6 +59384,7 @@ fn tracking_frame_to_world_snapshot(
         away_pass_completion_head: None,
         away_auxiliary_heads_dedicated: false,
         loose_ball_commit_head: None,
+        mpc_reject_threshold_head: None,
         receive_approach_head: None,
         lane_affinity_head: None,
         goal_side_recovery_head: None,

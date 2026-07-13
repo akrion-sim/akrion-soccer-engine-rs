@@ -15,8 +15,8 @@ use soccer_engine::des::general::soccer::{
     soccer_moment_records_to_learning_dataset, train_soccer_pass_completion_head,
     AttackSpacingHead, BackFourLineHead, CrashBoxHead, DefenderLinePolicyHead, GiveAndGoHead,
     GoalSideRecoveryHead, HeadScanHead, LaneAffinityHead, LongPassRunHead, LooseBallCommitHead,
-    MatchConfig, MatchSummary, OnsideSupportHead, PassLaneYieldHead, ReceiveApproachHead,
-    RunPredictionHead, SeparationFloorHead, ShotTriggerHead, SlipBreakHead,
+    MatchConfig, MatchSummary, MpcRejectThresholdHead, OnsideSupportHead, PassLaneYieldHead,
+    ReceiveApproachHead, RunPredictionHead, SeparationFloorHead, ShotTriggerHead, SlipBreakHead,
     SoccerAuxiliaryHeadSnapshot, SoccerConfigMomentInsert, SoccerLearningTransition,
     SoccerMarlAlgorithm, SoccerMatch, SoccerMomentWindow, SoccerMpcObjectiveHead,
     SoccerNeuralBlendMode, SoccerNeuralLayerSnapshot, SoccerNeuralLearningBackend,
@@ -32,11 +32,12 @@ use soccer_engine::des::general::soccer::{
     GIVE_AND_GO_HEAD_MIN_TRAINING_STEPS, GOAL_SIDE_RECOVERY_HEAD_MIN_TRAINING_STEPS,
     HEAD_SCAN_HEAD_MIN_TRAINING_STEPS, LANE_AFFINITY_HEAD_MIN_TRAINING_STEPS,
     LONG_PASS_RUN_HEAD_MIN_TRAINING_STEPS, LOOSE_BALL_COMMIT_HEAD_MIN_TRAINING_STEPS,
-    ONSIDE_SUPPORT_HEAD_MIN_TRAINING_STEPS, PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS,
-    PASS_LANE_YIELD_HEAD_MIN_TRAINING_STEPS, RECEIVE_APPROACH_HEAD_MIN_TRAINING_STEPS,
-    RUN_PREDICTION_HEAD_MIN_TRAINING_STEPS, SEPARATION_FLOOR_HEAD_MIN_TRAINING_STEPS,
-    SHOT_TRIGGER_HEAD_MIN_TRAINING_STEPS, SLIP_BREAK_HEAD_MIN_TRAINING_STEPS,
-    SUPPORT_SCORER_HEAD_MIN_TRAINING_STEPS, WINGER_PINCH_HEAD_MIN_TRAINING_STEPS,
+    MPC_REJECT_THRESHOLD_HEAD_MIN_TRAINING_STEPS, ONSIDE_SUPPORT_HEAD_MIN_TRAINING_STEPS,
+    PASS_COMPLETION_HEAD_MIN_TRAINING_STEPS, PASS_LANE_YIELD_HEAD_MIN_TRAINING_STEPS,
+    RECEIVE_APPROACH_HEAD_MIN_TRAINING_STEPS, RUN_PREDICTION_HEAD_MIN_TRAINING_STEPS,
+    SEPARATION_FLOOR_HEAD_MIN_TRAINING_STEPS, SHOT_TRIGGER_HEAD_MIN_TRAINING_STEPS,
+    SLIP_BREAK_HEAD_MIN_TRAINING_STEPS, SUPPORT_SCORER_HEAD_MIN_TRAINING_STEPS,
+    WINGER_PINCH_HEAD_MIN_TRAINING_STEPS,
 };
 use soccer_engine::des::general::soccer_eval_gate::{
     evaluate_promotion, PromotionThresholds, PromotionVerdict,
@@ -6357,6 +6358,14 @@ static CARRIED_DEFENDER_LINE_HEAD: std::sync::Mutex<Option<DefenderLinePolicyHea
 static CARRIED_LOOSE_BALL_COMMIT_HEAD: std::sync::Mutex<Option<LooseBallCommitHead>> =
     std::sync::Mutex::new(None);
 
+/// In-memory per-context MPC reject-threshold head (how low an action's success
+/// probability may fall in a given context before MPC refuses it and kicks the
+/// decision back to the POMDP's next-best), carried + trained across games WITHIN a
+/// learner process, mirroring `CARRIED_LOOSE_BALL_COMMIT_HEAD`. Resets on pod restart;
+/// untouched unless the model is enabled (DD_SOCCER_ENABLE_MPC_REJECT_THRESHOLD_MODEL).
+static CARRIED_MPC_REJECT_THRESHOLD_HEAD: std::sync::Mutex<Option<MpcRejectThresholdHead>> =
+    std::sync::Mutex::new(None);
+
 /// In-memory long-pass run head (which attacker should break forward so a deep carrier can
 /// pick them out), carried + trained across games WITHIN a learner process, mirroring
 /// `CARRIED_LOOSE_BALL_COMMIT_HEAD`. Resets on pod restart; untouched unless the model is
@@ -6699,6 +6708,16 @@ fn run_game(
     {
         sim.set_loose_ball_commit_head(head.clone());
     }
+    // Install the carried MPC reject-threshold head so the feasibility gate consumes it
+    // live once trained. No-op unless the reject-threshold model is enabled.
+    if let Some(head) = carried_lock(
+        &CARRIED_MPC_REJECT_THRESHOLD_HEAD,
+        "CARRIED_MPC_REJECT_THRESHOLD_HEAD",
+    )
+    .as_ref()
+    {
+        sim.set_mpc_reject_threshold_head(head.clone());
+    }
     // Install the carried receive-approach head so `receive_approach_adjusted_target`
     // consumes it live once trained. No-op unless DD_SOCCER_ENABLE_RECEIVE_APPROACH_MODEL
     // is set.
@@ -6921,6 +6940,30 @@ fn run_game(
             loose_ball_commit_samples.len(),
             head.training_steps(),
             head.training_steps() >= LOOSE_BALL_COMMIT_HEAD_MIN_TRAINING_STEPS,
+            final_loss
+        );
+    }
+    // Train the CARRIED per-context MPC reject-threshold head on this game's
+    // reward-weighted RL corpus (whether committing the carrier's pass at its computed
+    // execution probability, in that context, won/kept territory). This is what makes
+    // "too low to attempt" a learned function of the field vector rather than a
+    // constant. Empty + skipped unless the reject-threshold model is enabled.
+    let mpc_reject_threshold_samples = sim.drain_mpc_reject_threshold_samples();
+    if !mpc_reject_threshold_samples.is_empty() {
+        let mut guard = carried_lock(
+            &CARRIED_MPC_REJECT_THRESHOLD_HEAD,
+            "CARRIED_MPC_REJECT_THRESHOLD_HEAD",
+        );
+        let head = guard.get_or_insert_with(|| MpcRejectThresholdHead::new(episode_seed as u32));
+        let mut final_loss = 0.0;
+        for _ in 0..4 {
+            final_loss = head.train_reward_weighted(&mpc_reject_threshold_samples, 0.02);
+        }
+        eprintln!(
+            "mpc_reject_threshold_training samples={} training_steps={} consumed={} final_loss={:.5}",
+            mpc_reject_threshold_samples.len(),
+            head.training_steps(),
+            head.training_steps() >= MPC_REJECT_THRESHOLD_HEAD_MIN_TRAINING_STEPS,
             final_loss
         );
     }
