@@ -1400,6 +1400,180 @@ impl World {
         self.reset_a_pass_memory();
     }
 
+    /// 11v11 `goalkeeper_save_probability_from_traits`, specialized for the 5v5:
+    /// uniform skills (reaction score 0.5, height_reach 0), no sightline-screen
+    /// model, live keeper fatigue. The distance baseline is the primary driver;
+    /// the keeper's COVERAGE (lane-perpendicular reach vs its CURRENT position,
+    /// angle cut, shot speed, point-blank reaction deficit) modulates it.
+    fn keeper_save_probability(
+        &self,
+        def_team: Team,
+        origin: V2,
+        crossing: V2,
+        shot_speed: f32,
+    ) -> f32 {
+        let k = players(def_team, self)[GK];
+        let goal_width = 2.0 * GOAL_HALF;
+        let reaction_time = (GK_REACTION_BASE_S
+            + k.fatigue.clamp(0.0, 1.0) * GK_REACTION_FATIGUE_S)
+            .clamp(0.16, 0.52);
+        let shot_distance = crossing.sub(origin).len().max(0.0);
+        let shot_travel_time = shot_distance / shot_speed.max(1.0);
+        let move_time = (shot_travel_time - reaction_time).max(0.0);
+        // Reachable radius: in-place base + dive (1.05 + reaction·0.85) plus
+        // BOUNDED movement — a keeper cannot relocate faster than its top speed.
+        let accel_reach = 0.5 * k.skills.accel_yps2() * move_time * move_time;
+        let velocity_reach = k.vel.len() * move_time * 0.34;
+        let top_speed = (k.skills.top_speed_ref_yps() * 1.12).max(1.0);
+        let movement_reach = (accel_reach + velocity_reach).min(top_speed * move_time);
+        let reachable_radius = 1.05 + GK_REACTION_SCORE * 0.85 + movement_reach;
+        let (lateral_to_lane, line_t) = seg_distance_and_t(origin, crossing, k.pos);
+        let reach_gap = (lateral_to_lane - reachable_radius).max(0.0);
+        let reach_penalty = (reach_gap / (goal_width * 0.72)).clamp(0.0, 1.5);
+        let speed_penalty = (shot_speed / mph_to_yps(60.0)).clamp(0.0, 1.0) * 0.12;
+        // A shot arriving within the reaction time (point-blank) is extra hard.
+        let reaction_penalty = if shot_travel_time <= reaction_time {
+            ((reaction_time - shot_travel_time) / reaction_time.max(1e-6)).clamp(0.0, 1.0) * 0.22
+        } else {
+            0.0
+        };
+        // Standing IN the lane between shooter and goal cuts the shooting angle.
+        let angle_cut = if (0.05..=0.92).contains(&line_t) {
+            (1.0 - lateral_to_lane / (goal_width * 0.62)).clamp(0.0, 1.0)
+                * (1.0 - line_t * 0.72).clamp(0.20, 1.0)
+        } else {
+            0.0
+        };
+        let distance_baseline = gk_distance_save_baseline(shot_distance);
+        let coverage = (0.55 + GK_REACTION_SCORE * 0.35 + angle_cut * 0.12
+            - reach_penalty * 0.45
+            - speed_penalty
+            - reaction_penalty)
+            .clamp(0.15, 1.0);
+        (distance_baseline * coverage).clamp(0.0, 0.995)
+    }
+
+    /// Deterministic shot-save resolution (port of the 11v11 world.rs flow):
+    /// fires on the single tick a FLAGGED shot-in-flight crosses the defending
+    /// keeper's save plane (the keeper's own depth off the goal line — a ball
+    /// already past the keeper runs on to goal). Returns true iff the shot was
+    /// SAVED: either CAUGHT (keeper holds, becomes owner) or PARRIED (live
+    /// rebound pushed away from goal). No RNG draws: same seed → same outcome.
+    fn resolve_keeper_shot_save(&mut self, prev_ball: V2) -> bool {
+        let dx = self.ball.x - prev_ball.x;
+        if dx == 0.0 {
+            return false;
+        }
+        // Which goal is this shot heading for? (both teams symmetric)
+        let (def_team, goal_line_x, dir, origin) = if self.a_shot_flag && dx > 0.0 {
+            (Team::B, FIELD_L, 1.0f32, self.a_shot_origin)
+        } else if self.b_shot_flag && dx < 0.0 {
+            (Team::A, 0.0f32, -1.0f32, self.b_shot_origin)
+        } else {
+            return false;
+        };
+        let keeper = players(def_team, self)[GK];
+        // Save plane = the keeper's actual depth off its goal line (min 1.6 yd):
+        // the keeper cannot teleport back to its line to stop a ball behind it.
+        let keeper_depth = (keeper.pos.x - goal_line_x)
+            .abs()
+            .clamp(GK_SAVE_DEPTH_MIN, GK_SAVE_DEPTH_MAX);
+        let save_plane_x = goal_line_x - keeper_depth * dir;
+        // Only the single tick the ball crosses the keeper's plane heading at goal.
+        let crossed = (prev_ball.x - save_plane_x) * dir < 0.0
+            && (self.ball.x - save_plane_x) * dir >= 0.0;
+        if !crossed {
+            return false;
+        }
+        // Extrapolate the flight to the goal line: on-target test + save geometry.
+        let f = (goal_line_x - prev_ball.x) / dx;
+        let crossing_y = prev_ball.y + (self.ball.y - prev_ball.y) * f;
+        let cy = FIELD_W / 2.0;
+        if (crossing_y - cy).abs() > GOAL_HALF {
+            return false; // off target at the line: not the keeper's to claim here
+        }
+        let crossing = V2::new(goal_line_x, crossing_y);
+        let shot_speed = self.ball_vel.len();
+        let save_p = self.keeper_save_probability(def_team, origin, crossing, shot_speed);
+        if save_p < GK_SAVE_DECISION_BAR {
+            return false; // beaten: the shot runs on to the goal line
+        }
+        // SAVED. The keeper reaches the ball at the save plane (bounded dive).
+        let save_pos = V2::new(
+            save_plane_x,
+            crossing_y.clamp(cy - GOAL_HALF * 1.1, cy + GOAL_HALF * 1.1),
+        );
+        let dive = save_pos.sub(keeper.pos);
+        let keeper_pos = if dive.len() <= GK_DIVE_REACH {
+            save_pos
+        } else {
+            keeper.pos.add(dive.unit().scale(GK_DIVE_REACH))
+        };
+        match def_team {
+            Team::A => self.a[GK].pos = keeper_pos,
+            Team::B => self.b[GK].pos = keeper_pos,
+        }
+        // Shot resolved: clear flight state + shot flags, credit the save event.
+        self.a_shot_flag = false;
+        self.b_shot_flag = false;
+        self.ball_aerial = false;
+        self.air_ticks = 0;
+        self.ball_curl = V2::default();
+        self.pending_pass = None;
+        if def_team == Team::B {
+            self.ev_save_a = true; // A's shot was saved
+        } else {
+            self.ev_save_b = true;
+        }
+        let catch_p = keeper_catch_probability(origin, crossing, shot_speed);
+        if catch_p >= GK_CATCH_BAR {
+            // CAUGHT: the keeper holds and becomes the owner (same possession
+            // bookkeeping the old keeper reach-capture produced in try_capture).
+            self.owner = Some(Owner {
+                team: def_team,
+                idx: GK,
+            });
+            self.ball = keeper_pos;
+            self.ball_vel = V2::default();
+            if def_team == Team::B {
+                self.ev_turnover_a = true; // A's shot swallowed by B's keeper
+                self.pass_streak_a = 0;
+                self.reset_a_pass_memory();
+                self.b_pass_streak = 1;
+            } else {
+                self.ev_win_ball_a = true; // A's keeper won the ball off B
+                self.pass_streak_a = 0;
+                self.reset_a_pass_memory();
+                self.b_pass_streak = 0;
+            }
+            self.last_touch = Some(def_team);
+            self.last_kicker = None;
+        } else {
+            // PARRY: live rebound pushed away-from-goal (0.78) + lateral (0.22),
+            // distance 2.0 + (1 − catch)·3.0 yards — it moves AWAY from goal and
+            // the shot flag is already cleared, so it cannot re-trigger a goal.
+            let lat_sign = if crossing_y >= keeper.pos.y { 1.0 } else { -1.0 };
+            let parry_dir = V2::new(-dir * 0.78, lat_sign * 0.22).unit();
+            let parry_dist = GK_PARRY_MIN_YDS
+                + (1.0 - catch_p.clamp(0.0, 1.0)) * (GK_PARRY_MAX_YDS - GK_PARRY_MIN_YDS);
+            let mut parry_pos = save_pos.add(parry_dir.scale(parry_dist));
+            parry_pos.x = parry_pos.x.clamp(0.5, FIELD_L - 0.5);
+            parry_pos.y = parry_pos.y.clamp(0.5, FIELD_W - 0.5);
+            self.owner = None;
+            self.ball = parry_pos;
+            self.ball_vel = parry_dir.scale(4.8 + shot_speed.clamp(0.0, 20.0) * 0.18);
+            self.last_touch = Some(def_team);
+            // The keeper can't instantly re-smother its own parry: the rebound
+            // is a LIVE ball either side can pounce on.
+            self.last_kicker = Some(Owner {
+                team: def_team,
+                idx: GK,
+            });
+            self.kick_timer = 6;
+        }
+        true
+    }
+
     fn try_capture(&mut self) {
         let ball_fast = self.ball_vel.len() > CAPTURE_MAX_BALL_SPEED;
         let mut best: Option<(Owner, f32)> = None;
