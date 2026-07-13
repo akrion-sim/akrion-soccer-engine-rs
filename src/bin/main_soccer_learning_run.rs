@@ -6942,6 +6942,30 @@ fn run_game(
             final_loss
         );
     }
+    // Train the CARRIED per-context MPC reject-threshold head on this game's
+    // reward-weighted RL corpus (whether committing the carrier's pass at its computed
+    // execution probability, in that context, won/kept territory). This is what makes
+    // "too low to attempt" a learned function of the field vector rather than a
+    // constant. Empty + skipped unless the reject-threshold model is enabled.
+    let mpc_reject_threshold_samples = sim.drain_mpc_reject_threshold_samples();
+    if !mpc_reject_threshold_samples.is_empty() {
+        let mut guard = carried_lock(
+            &CARRIED_MPC_REJECT_THRESHOLD_HEAD,
+            "CARRIED_MPC_REJECT_THRESHOLD_HEAD",
+        );
+        let head = guard.get_or_insert_with(|| MpcRejectThresholdHead::new(episode_seed as u32));
+        let mut final_loss = 0.0;
+        for _ in 0..4 {
+            final_loss = head.train_reward_weighted(&mpc_reject_threshold_samples, 0.02);
+        }
+        eprintln!(
+            "mpc_reject_threshold_training samples={} training_steps={} consumed={} final_loss={:.5}",
+            mpc_reject_threshold_samples.len(),
+            head.training_steps(),
+            head.training_steps() >= MPC_REJECT_THRESHOLD_HEAD_MIN_TRAINING_STEPS,
+            final_loss
+        );
+    }
     // Train the CARRIED receive-approach head on this game's reward-weighted RL corpus (how
     // far a receiver stepping toward/away from an incoming ball led to securing possession).
     // Empty + skipped unless DD_SOCCER_ENABLE_RECEIVE_APPROACH_MODEL is set.
