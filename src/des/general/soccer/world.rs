@@ -18,6 +18,8 @@ const LEARNED_MPC_SOFT_REPLAN_MAX_ORIGINAL_PROBABILITY: f64 = 0.55;
 const LEARNED_MPC_SOFT_REPLAN_MIN_REPLACEMENT_PROBABILITY: f64 = 0.68;
 const LEARNED_MPC_SOFT_REPLAN_MIN_IMPROVEMENT: f64 = 0.22;
 const LEARNED_MPC_SAFE_FALLBACK_MIN_PROBABILITY: f64 = 0.42;
+const LEARNED_MPC_CONTEXT_THRESHOLD_BLEND: f64 = 0.65;
+const LEARNED_MPC_CONTEXT_THRESHOLD_MAX_DELTA: f64 = 0.16;
 const LEARNED_MPC_SAFE_FALLBACK_ACTIONS: &[&str] = &[
     "carry-forward",
     "runaround-dribble",
@@ -1264,6 +1266,47 @@ fn learned_mpc_replan_thresholds() -> LearnedMpcReplanThresholds {
             ),
         }
     })
+}
+
+/// Contextual execute-vs-kickback boundary for a POMDP-ranked action.
+///
+/// The analytic MPC probability remains the evidence being gated, but the boundary is no longer
+/// one global magic number. The learned policy's probabilities are conditioned on the complete
+/// [`SoccerQStateKey`] (MDP state + POMDP whole-field observation), so their relative confidence in
+/// the requested action versus the best legal alternative supplies a trainable context signal. A
+/// decisive learned preference lowers the boundary (give the preferred idea more execution
+/// latitude); a competitive second/third choice raises it. Policy learning therefore moves the
+/// rejection boundary from match outcomes, while the env knobs keep the calibration A/B-tunable.
+fn learned_mpc_contextual_rejection_threshold(
+    base_threshold: f64,
+    original_action: &str,
+    ranked: &[SoccerLearnedActionTrace],
+) -> f64 {
+    let base = finite_unit_interval(base_threshold);
+    let original = ranked
+        .iter()
+        .find(|entry| entry.legal && learned_mpc_action_labels_match(&entry.label, original_action))
+        .map(|entry| finite_unit_interval(entry.probability));
+    let alternative = ranked
+        .iter()
+        .filter(|entry| {
+            entry.legal && !learned_mpc_action_labels_match(&entry.label, original_action)
+        })
+        .map(|entry| finite_unit_interval(entry.probability))
+        .max_by(f64::total_cmp);
+    let (Some(original), Some(alternative)) = (original, alternative) else {
+        return base;
+    };
+    let blend = learned_mpc_probability_env(
+        "SOCCER_LEARNED_MPC_CONTEXT_THRESHOLD_BLEND",
+        LEARNED_MPC_CONTEXT_THRESHOLD_BLEND,
+    );
+    let max_delta = learned_mpc_probability_env(
+        "SOCCER_LEARNED_MPC_CONTEXT_THRESHOLD_MAX_DELTA",
+        LEARNED_MPC_CONTEXT_THRESHOLD_MAX_DELTA,
+    );
+    let learned_competition = (alternative - original).clamp(-1.0, 1.0);
+    (base + learned_competition * blend * max_delta).clamp(0.0, 1.0)
 }
 
 /// The analytic per-family base MPC reject bar — the constant the global path uses,
@@ -5903,6 +5946,29 @@ mod tests {
     }
 
     #[test]
+    fn learned_mpc_rejection_threshold_tracks_contextual_policy_competition() {
+        let action = |label: &str, probability: f64| SoccerLearnedActionTrace {
+            label: label.to_string(),
+            value: probability,
+            visits: 10,
+            probability,
+            legal: true,
+            level: PitchGridLevel::Fine,
+        };
+        let decisive = vec![action("pass1", 0.82), action("pass2", 0.10)];
+        let competitive = vec![action("pass1", 0.42), action("pass2", 0.40)];
+        let base = 0.18;
+        let decisive_threshold =
+            learned_mpc_contextual_rejection_threshold(base, "pass1", &decisive);
+        let competitive_threshold =
+            learned_mpc_contextual_rejection_threshold(base, "pass1", &competitive);
+
+        assert!(decisive_threshold < base);
+        assert!(competitive_threshold > decisive_threshold);
+        assert!((0.0..=1.0).contains(&competitive_threshold));
+    }
+
+    #[test]
     fn learned_receiver_all_mpc_infeasible_traces_fallback_counterexample() {
         let _env_lock = soccer_world_env_lock();
         let _receiver_gate = set_test_env_var("DD_SOCCER_ENABLE_LEARNED_PASS_RECEIVER", "1");
@@ -9869,6 +9935,7 @@ mod tests {
                 expected_speed,
                 normalize_soccer_action_label(label) == "first-time-shot",
                 pressure_from_nearest_distance(nearest_opponent_distance),
+                None,
             );
             assert!(
                 (scored.decision_context.shot_mpc_goal_probability
@@ -18043,6 +18110,7 @@ impl SoccerMatch {
                 shot_speed,
                 first_time,
                 pressure_from_nearest_distance(nearest_opponent_distance),
+                None,
             )
             .target_point
             .clamp_to_pitch(snapshot.field_width, snapshot.field_length),
@@ -21143,8 +21211,27 @@ impl SoccerMatch {
             Self::learned_plan_mpc_execution_probability(snapshot, player_id, &plan)
                 .unwrap_or(0.0)
                 .clamp(0.0, 1.0);
-        let hard_replan = Self::learned_plan_needs_mpc_replan(snapshot, player_id, &plan);
         let thresholds = learned_mpc_replan_thresholds();
+        let ranked = policy
+            .ranked_action_values_for_snapshot(snapshot, player_id, LEARNED_MPC_REPLAN_CANDIDATES)
+            .map(|(_, ranked)| ranked);
+        let contextual_hard_threshold = Self::learned_mpc_reject_family_for_label(original_family)
+            .map(|family| {
+                let field_vector_threshold = snapshot.learned_mpc_reject_threshold(
+                    player_id,
+                    family,
+                    mpc_reject_base_threshold(family),
+                );
+                ranked.as_deref().map_or(field_vector_threshold, |actions| {
+                    learned_mpc_contextual_rejection_threshold(
+                        field_vector_threshold,
+                        &original_action,
+                        actions,
+                    )
+                })
+            });
+        let hard_replan = contextual_hard_threshold
+            .is_some_and(|threshold| original_execution_probability < threshold);
         let soft_replan_eligible = !hard_replan
             && !matches!(
                 original_family,
@@ -21155,11 +21242,7 @@ impl SoccerMatch {
         if !hard_replan && !soft_replan_eligible {
             return plan;
         }
-        let Some((_, ranked)) = policy.ranked_action_values_for_snapshot(
-            snapshot,
-            player_id,
-            LEARNED_MPC_REPLAN_CANDIDATES,
-        ) else {
+        let Some(ranked) = ranked else {
             if hard_replan {
                 return Self::mpc_safe_fallback_learned_plan(
                     policy,
@@ -21181,12 +21264,25 @@ impl SoccerMatch {
             candidate_count += 1;
             let mut candidate_plan =
                 Self::learned_plan_for_policy(policy, snapshot, player_id, candidate.label.clone());
-            let candidate_hard_replan =
-                Self::learned_plan_needs_mpc_replan(snapshot, player_id, &candidate_plan);
             let candidate_execution_probability =
                 Self::learned_plan_mpc_execution_probability(snapshot, player_id, &candidate_plan)
                     .unwrap_or(0.0)
                     .clamp(0.0, 1.0);
+            let candidate_family = normalize_soccer_action_label(&candidate_plan.action);
+            let candidate_hard_replan = Self::learned_mpc_reject_family_for_label(candidate_family)
+                .is_some_and(|family| {
+                    let field_vector_threshold = snapshot.learned_mpc_reject_threshold(
+                        player_id,
+                        family,
+                        mpc_reject_base_threshold(family),
+                    );
+                    let contextual = learned_mpc_contextual_rejection_threshold(
+                        field_vector_threshold,
+                        &candidate_plan.action,
+                        &ranked,
+                    );
+                    candidate_execution_probability < contextual
+                });
             let candidate_is_replacement = if hard_replan {
                 !candidate_hard_replan
             } else {
@@ -21220,6 +21316,18 @@ impl SoccerMatch {
             .unwrap_or(plan);
         }
         plan
+    }
+
+    fn learned_mpc_reject_family_for_label(label: &str) -> Option<MpcRejectFamily> {
+        if pass_like_action_flight(label).is_some() {
+            Some(MpcRejectFamily::Pass)
+        } else if is_dribble_action_label(label) {
+            Some(MpcRejectFamily::Dribble)
+        } else if matches!(label, "shoot" | "first-time-shot" | "first-time-header") {
+            Some(MpcRejectFamily::Shot)
+        } else {
+            None
+        }
     }
 
     fn mpc_safe_fallback_learned_plan(
@@ -21293,15 +21401,7 @@ impl SoccerMatch {
         plan: &SoccerLearnedPlan,
     ) -> bool {
         let label = normalize_soccer_action_label(&plan.action);
-        let family = if pass_like_action_flight(label).is_some() {
-            Some(MpcRejectFamily::Pass)
-        } else if is_dribble_action_label(label) {
-            Some(MpcRejectFamily::Dribble)
-        } else if matches!(label, "shoot" | "first-time-shot" | "first-time-header") {
-            Some(MpcRejectFamily::Shot)
-        } else {
-            None
-        };
+        let family = Self::learned_mpc_reject_family_for_label(label);
         let Some(family) = family else {
             return false;
         };
@@ -21760,6 +21860,7 @@ impl SoccerMatch {
             shot_speed,
             first_time,
             pressure_from_nearest_distance(nearest_opponent_distance),
+            None,
         )
         .accuracy_probability
         .clamp(0.0, 1.0)
@@ -32653,8 +32754,9 @@ impl SoccerMatch {
                     // this is a no-op ⇒ identical to baseline.
                     if dd_soccer_enable_actor_shot_placement() {
                         if let Some(actor_aim) = actor_shot_target {
-                            base_goal_x =
-                                actor_aim.x.clamp(goal_center_x - half_goal, goal_center_x + half_goal);
+                            base_goal_x = actor_aim
+                                .x
+                                .clamp(goal_center_x - half_goal, goal_center_x + half_goal);
                         }
                     }
                     // Learned MPC execution-objective residual for SHOT PLACEMENT — the shot analogue
@@ -50685,6 +50787,7 @@ impl WorldSnapshot {
                 expected_shot_speed_yps,
                 false,
                 perceived_pressure,
+                None,
             ))
         } else {
             None
@@ -69253,6 +69356,7 @@ impl WorldSnapshot {
             shot_speed,
             false,
             pressure,
+            None,
         );
         let on_frame = (on_frame * 0.66 + shot_mpc.accuracy_probability * 0.34).clamp(0.0, 1.0);
         let beat_keeper = (beat_keeper * 0.60 + shot_mpc.goal_probability * 0.40).clamp(0.0, 1.0);

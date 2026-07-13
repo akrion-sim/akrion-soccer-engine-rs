@@ -313,7 +313,11 @@ impl MpcRejectThresholdHead {
 
     /// One SGD epoch regressing the head toward `(context, target_bar)` pairs
     /// (supervised bootstrap toward the analytic seed). Returns the mean step loss.
-    pub fn train(&mut self, samples: &[(MpcRejectThresholdInputs, f64)], learning_rate: f64) -> f64 {
+    pub fn train(
+        &mut self,
+        samples: &[(MpcRejectThresholdInputs, f64)],
+        learning_rate: f64,
+    ) -> f64 {
         let mut total = 0.0;
         let mut applied = 0usize;
         for (inputs, target_bar) in samples {
@@ -488,7 +492,9 @@ impl WorldSnapshot {
             nearest_opponent = nearest_opponent.min(d);
         }
         let nearest_opponent_pressure = if nearest_opponent.is_finite() {
-            (-nearest_opponent / PRESSURE_REF_YARDS).exp().clamp(0.0, 1.0)
+            (-nearest_opponent / PRESSURE_REF_YARDS)
+                .exp()
+                .clamp(0.0, 1.0)
         } else {
             0.0
         };
@@ -543,9 +549,7 @@ impl WorldSnapshot {
         let bar = self
             .mpc_reject_threshold_head
             .as_ref()
-            .filter(|head| {
-                head.training_steps() >= MPC_REJECT_THRESHOLD_HEAD_MIN_TRAINING_STEPS
-            })
+            .filter(|head| head.training_steps() >= MPC_REJECT_THRESHOLD_HEAD_MIN_TRAINING_STEPS)
             .and_then(|head| head.predict(&inputs))
             .unwrap_or_else(|| analytic_mpc_reject_threshold(&inputs));
         if bar.is_finite() {
@@ -831,8 +835,8 @@ mod mpc_reject_threshold_tests {
                 reward: if i % 2 == 0 { 1.0 } else { -1.0 },
             })
             .collect();
-        let (_, report) = train_mpc_reject_threshold_head(&samples, 1, 4, 0.02)
-            .expect("trains a usable corpus");
+        let (_, report) =
+            train_mpc_reject_threshold_head(&samples, 1, 4, 0.02).expect("trains a usable corpus");
         assert_eq!(report.samples, 16);
         assert_eq!(report.epochs, 4);
         assert!(report.training_steps > 0 && report.final_loss.is_finite());

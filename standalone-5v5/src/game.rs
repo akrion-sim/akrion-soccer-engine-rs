@@ -105,14 +105,14 @@ const TACKLE_RADIUS: f32 = 1.6;
 const TACKLE_PROB: f32 = 0.16; // per-tick; retuned for 15 Hz to keep same per-second rate (~2.4/s)
 #[allow(dead_code)]
 const BALL_FRICTION: f32 = 0.965; // legacy single-term decay (superseded by ball_resistance_after)
-// ---- 11v11-parity ball flight (soccer.rs constants) ----
+                                  // ---- 11v11-parity ball flight (soccer.rs constants) ----
 const BALL_DRAG_PER_TICK: f32 = 0.028; // DEFAULT_BALL_DRAG_PER_TICK (linear, half-life vs ref dt=1/15)
 const BALL_AIR_RESISTANCE: f32 = 0.0085; // DEFAULT_BALL_AIR_RESISTANCE (quadratic)
 const BALL_GRASS_RESISTANCE: f32 = 0.96; // DEFAULT_BALL_GRASS_RESISTANCE_YPS2 (ground contact only)
 const BALL_STOP_SPEED: f32 = 0.55; // DEFAULT_BALL_STOP_SPEED_YPS (snap to rest below this)
 const AERIAL_FLIGHT_DRAG_RELIEF: f32 = 0.88; // airborne linear+air relief
 const BALL_ROLLING_ALT: f32 = 0.06; // BALL_ROLLING_ALTITUDE_YARDS (at/below = grounded)
-// Standing reach + jump for an airborne interception (CONTROL_* reach constants).
+                                    // Standing reach + jump for an airborne interception (CONTROL_* reach constants).
 const CONTROL_STANDING_REACH: f32 = 1.6;
 const CONTROL_AERIAL_JUMP_REACH: f32 = 2.2;
 const LOW_BALL_INTERCEPT_FLOOR: f32 = 2.0;
@@ -443,17 +443,16 @@ pub struct World {
     pub ball: V2,
     pub ball_vel: V2,
     pub ball_aerial: bool, // in-flight ball is airborne (altitude above the rolling threshold)
-    pub air_ticks: u32,    // legacy scoop-duration counter (kept for compat; flight now driven by z)
+    pub air_ticks: u32, // legacy scoop-duration counter (kept for compat; flight now driven by z)
     // 11v11-parity z-axis: altitude is a scalar (the ball's Vec2 stays horizontal), driven by a
     // closed-form projectile parabola in time — no z-velocity, no bounce (matches soccer.rs).
-    pub ball_z: f32,       // altitude (yards) above the pitch
-    ball_apex: f32,        // peak height of the current loft
-    ball_taloft: f32,      // seconds since the current loft was launched
-    pub ball_curl: V2,     // lateral curl (spin) accel on a long (>20yd) pass/shot
-    pending_curl: V2,      // scratch: curl for the kick launching this tick
-    pending_aerial: bool,  // scratch: the pass launched this tick is a loft
-    pending_air_ticks: u32, // scratch: legacy airborne-duration (unused by the z model)
-    pending_apex: f32,     // scratch: apex of the loft launching this tick
+    pub ball_z: f32,           // altitude (yards) above the pitch
+    ball_apex: f32,            // peak height of the current loft
+    ball_taloft: f32,          // seconds since the current loft was launched
+    pub ball_curl: V2,         // lateral curl (spin) accel on a long (>20yd) pass/shot
+    pending_curl: V2,          // scratch: curl for the kick launching this tick
+    pending_aerial: bool,      // scratch: the pass launched this tick is a loft
+    pending_apex: f32,         // scratch: apex of the loft launching this tick
     pending_aerial_speed: f32, // scratch: land-on-target horizontal launch speed for the loft
     pub owner: Option<Owner>,
     pub last_touch: Option<Team>,
@@ -519,7 +518,6 @@ impl World {
             ball_curl: V2::default(),
             pending_curl: V2::default(),
             pending_aerial: false,
-            pending_air_ticks: 0,
             pending_apex: 0.0,
             pending_aerial_speed: 0.0,
             owner: None,
@@ -1355,7 +1353,8 @@ impl World {
                     let aerial_skill = ability01(receiver.skills.aerial_duel);
                     if airborne {
                         // Reach test: standing 1.6yd + jump (aerial skill) up to 3.8yd, floor 2.0yd.
-                        let reach = (CONTROL_STANDING_REACH + aerial_skill * CONTROL_AERIAL_JUMP_REACH)
+                        let reach = (CONTROL_STANDING_REACH
+                            + aerial_skill * CONTROL_AERIAL_JUMP_REACH)
                             .max(LOW_BALL_INTERCEPT_FLOOR);
                         if self.ball_z > reach {
                             continue; // ball is above this player's reach — flies over
@@ -1599,7 +1598,8 @@ impl World {
                         let d = tp.sub(me).len();
                         self.pending_aerial = true;
                         self.pending_apex = lofted_apex_yds(d);
-                        self.pending_aerial_speed = (d / hang_time(self.pending_apex).max(0.35)) * 1.08;
+                        self.pending_aerial_speed =
+                            (d / hang_time(self.pending_apex).max(0.35)) * 1.08;
                     }
                     self.set_vel(team, idx, V2::default());
                     if team == Team::A {
@@ -2408,7 +2408,10 @@ mod tests {
         assert!(altitude_at(apex, 0.0).abs() < 1e-4);
         assert!(altitude_at(apex, hang).abs() < 1e-4);
         let mid = altitude_at(apex, hang / 2.0);
-        assert!((mid - apex).abs() < 1e-3, "midpoint height == apex: {mid} vs {apex}");
+        assert!(
+            (mid - apex).abs() < 1e-3,
+            "midpoint height == apex: {mid} vs {apex}"
+        );
         // monotone rise over the first half.
         assert!(altitude_at(apex, hang * 0.25) < altitude_at(apex, hang * 0.5));
         // longer passes loft higher (until the 9.0 cap).
@@ -2426,7 +2429,10 @@ mod tests {
         // Airborne relief: an aloft ball keeps more of its pace than a rolling one.
         let ground = ball_resistance_after(20.0, 0.0);
         let aloft = ball_resistance_after(20.0, 3.0);
-        assert!(aloft > ground, "airborne ball drags less: aloft {aloft} vs ground {ground}");
+        assert!(
+            aloft > ground,
+            "airborne ball drags less: aloft {aloft} vs ground {ground}"
+        );
     }
 
     fn arrange_return_pass_candidates(w: &mut World) {

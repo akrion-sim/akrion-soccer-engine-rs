@@ -24470,15 +24470,13 @@ pub(crate) fn on_frame_shot_reward_scale() -> f64 {
 
 fn hierarchy_bounded_shot_on_target_points(shot_scale: f64, goal_scale: f64) -> f64 {
     let raw = SHOT_ON_TARGET_REWARD_POINTS * shot_scale.max(MIN_SOCCER_REWARD_WEIGHT);
-    let outcome_ceiling = GOAL_REWARD_POINTS * goal_scale.max(1.0)
-        - CONVERSION_OVER_SHOT_REWARD_MARGIN;
+    let outcome_ceiling =
+        GOAL_REWARD_POINTS * goal_scale.max(1.0) - CONVERSION_OVER_SHOT_REWARD_MARGIN;
     raw.min(outcome_ceiling.max(MIN_SOCCER_REWARD_WEIGHT))
 }
 
 fn hierarchy_projected_match_win_points(requested: f64, goal_scale: f64) -> f64 {
-    requested.max(
-        GOAL_REWARD_POINTS * goal_scale.max(1.0) + WIN_OVER_CONVERSION_REWARD_MARGIN,
-    )
+    requested.max(GOAL_REWARD_POINTS * goal_scale.max(1.0) + WIN_OVER_CONVERSION_REWARD_MARGIN)
 }
 
 pub(crate) fn match_outcome_win_reward_points() -> f64 {
@@ -26449,6 +26447,13 @@ fn soccer_decision_context_for(
                     shot_speed,
                     first_time,
                     pressure_from_nearest_distance(nearest_opponent_distance),
+                    // Part B: score THIS candidate's chosen aim (from the action target trace),
+                    // gated. Off ⇒ None ⇒ analytic optimum ⇒ byte-identical.
+                    if dd_soccer_enable_actor_shot_placement() {
+                        action_target.and_then(|trace| trace.point)
+                    } else {
+                        None
+                    },
                 )
             })
         } else {
@@ -43323,9 +43328,7 @@ mod soccer_policy_actor_capacity_tests {
             terminal_shot_scale * SHOT_ON_TARGET_REWARD_POINTS <= frac * 100.0 + 1e-9,
             "non-conversion points must stay <= fraction * conversion reward"
         );
-        assert!(
-            (terminal_shot_scale - frac * 100.0 / SHOT_ON_TARGET_REWARD_POINTS).abs() < 1e-9
-        );
+        assert!((terminal_shot_scale - frac * 100.0 / SHOT_ON_TARGET_REWARD_POINTS).abs() < 1e-9);
 
         // Proportional: raising the goal reward raises the allowed non-conversion ceiling in step,
         // so "shot < goal by a meaningful margin" holds at any magnitude (not just near 100).
@@ -68220,6 +68223,11 @@ fn shot_mpc_accuracy_estimate_for_snapshot(
     shot_speed_yps: f64,
     quick_release: bool,
     pressure: f64,
+    // ACTOR-OWNED SHOT PLACEMENT (Part B): when `Some`, evaluate THIS specific goal-mouth aim's
+    // finishing quality (block / on-frame / save / goal probability) instead of the analytic QP
+    // optimum, so each placement candidate's shot-quality features reflect its own aim. `None`
+    // (all non-placement callers) ⇒ the analytic optimum is used ⇒ byte-identical.
+    override_target: Option<Vec2>,
 ) -> ShotMpcAccuracyEstimate {
     let goal_y = attacking_team.goal_y(snapshot.field_length);
     let goal_center_x = snapshot.field_width * 0.5;
@@ -68313,7 +68321,11 @@ fn shot_mpc_accuracy_estimate_for_snapshot(
             max_active_sets: 32,
         },
     );
-    let target_x = if solution.status == QPStatus::Optimal && !solution.x.is_empty() {
+    let target_x = if let Some(aim) = override_target {
+        // Honor the actor-chosen aim; downstream block/on-frame/save/goal metrics are all
+        // computed from `target_x`, so they now reflect THIS placement.
+        aim.x
+    } else if solution.status == QPStatus::Optimal && !solution.x.is_empty() {
         solution.x[0]
     } else {
         unbounded_preference

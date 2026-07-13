@@ -105,8 +105,11 @@ flowchart TD
   not by increasing continuous `SOCCER_PARALLEL_GAMES`.
 - The canonical AWS continuous learner pulls `soccer-sim-game-engine.rs` from the
   `learning` branch and `discrete-event-system.rs` from `main`.
-- Formation shape is LP/IPM. MPC is only an individual-player execution tool:
-  other players and the ball are obstacles/context, never co-optimized team state.
+- Formation shape is LP/IPM. MPC is an individual-player execution tool for the
+  full technical vocabulary—not only finishing. It executes and feasibility-checks
+  shooting, passing, dribbling/carrying, receiving, keeper distribution, and
+  off-ball movement. Other players and the ball are predicted obstacles/context,
+  never co-optimized team state.
 - The actor is not a single undifferentiated model anymore. `SoccerPolicyHead`
   has per-role heads for goalkeeper, defender, midfielder, and forward, and those
   role heads carry independent passing, dribbling, shooting, and goalkeeping
@@ -119,6 +122,12 @@ flowchart TD
 - POMDP behavior must remain explicit: decisions carry a belief summary, learned
   samples preserve `behavior_policy_probability` for PPO/MAPPO ratios, and MPC
   is an executor/reconciler rather than the tactical solver.
+- Execution uses a learned kickback loop: the POMDP ranks legal actions; MPC
+  estimates the top action's success probability from the whole-field context;
+  a context-conditioned rejection boundary executes it or returns control to the
+  POMDP to try its second/third-ranked legal choice. That boundary is driven by
+  the learned policy's field-conditioned relative confidence and is bounded by
+  tunable base/blend/delta controls, rather than being one universal cutoff.
 - MAPPO-style team learning should keep decentralized actors at runtime while
   using centralized team reward and advantage shaping during training. Do not
   regress to 11 unrelated policies with no shared credit signal.
@@ -170,9 +179,10 @@ The current engine already covers much of the audit:
 - Planning is not a full match clone: the bounded neural-guided MCTS path reranks
   already-legal action candidates and may use the learned feature-space world
   model for shallow lookahead.
-- MPC remains the movement layer: it makes the chosen intent physically
-  executable and may veto/reconcile impossible actions, but it does not own
-  tactical choice.
+- MPC remains the individual execution layer for shots, passes, dribbles,
+  receptions, keeper actions, and movement. It makes the chosen intent physically
+  executable and may veto/reconcile a contextually low-probability execution, but
+  it does not own tactical choice: a veto returns to the POMDP ranking.
 
 The important remaining upgrade is the representation layer. The present model is
 still a feedforward stack over hand-built whole-field and belief features. A
