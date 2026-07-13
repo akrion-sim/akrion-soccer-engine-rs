@@ -24542,6 +24542,12 @@ fn hierarchy_projected_match_win_points(requested: f64, goal_scale: f64) -> f64 
 }
 
 pub(crate) fn match_outcome_win_reward_points() -> f64 {
+    if anchored_rewards_enabled() {
+        // Anchored currency: winning the match IS the 1000-point anchor. The
+        // env knob and the goal-scale floor are bypassed — the floor logic
+        // scaled against a goal magnitude the live path never actually paid.
+        return ANCHOR_WIN_POINTS;
+    }
     let requested = if dynamic_reward_weights_enabled() {
         reward_weight_env(
             "DD_SOCCER_MATCH_WIN_REWARD_POINTS",
