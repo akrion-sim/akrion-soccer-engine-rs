@@ -18072,6 +18072,13 @@ impl SoccerMatch {
                     mpc_replan: None,
                 });
             }
+            if std::env::var("DD_SOCCER_SHOTPLACE_DIAG").is_ok() {
+                eprintln!(
+                    "SHOTPLACE_DIAG label={label} added_placement_variants={} total_plans={}",
+                    goalmouth.len(),
+                    plans.len()
+                );
+            }
         }
         plans
     }
