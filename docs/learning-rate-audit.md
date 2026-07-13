@@ -184,3 +184,19 @@ existing flat anchor led both alternatives on primary payoff and forward-pass ma
 the evidence supports retaining it while the plateau investigation moves to a different
 factor. The Elo ordering alone is not used to overturn the payoff result because the
 analytic-baseline estimates varied across arms.
+
+Reward placement is therefore no longer the next lever. A held-out net-influence probe on
+the DP-flat checkpoint showed `76.6%` family changes on the neural-active, two-plus-candidate
+subset, well above the documented `25-30%` high-influence threshold. Final commit influence
+was lower, but the on-ball direction was decisive: fresh neural pass intent was `7.8%`, while
+committed pass actions were `12.5%`. The downstream pipeline was adding rather than suppressing
+passes; the actor itself rarely proposed them. This falsifies the shield-ownership explanation
+for this checkpoint and points to action preference/credit.
+
+`scripts/run_forward_select_learning_ab.sh` tests that diagnosis with the existing default-off,
+per-checkpoint `forwardSelectLogitWeight`. It compares the incumbent, learning the scalar only
+from executed forward-pass samples, and learning it with qualified missed forward opportunities
+from the planner teacher. The third arm is specifically a cold-start test: a policy that rarely
+chooses a forward pass cannot reliably learn a forward-only scalar from executed actions alone.
+Every arm keeps the existing DP flat result anchor and is judged on the same held-out analytic
+field; no gate is promoted from the diagnostic alone.
