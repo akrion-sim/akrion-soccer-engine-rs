@@ -111,6 +111,30 @@ const CAPTURE_MAX_BALL_SPEED: f32 = 26.0;
 const KEEPER_REACH: f32 = 1.9; // keeper saves spam; well-placed shots still beat it
 #[allow(dead_code)]
 const KEEPER_SPEED: f32 = 6.0;
+
+// ---- Goalkeeper save-probability model (ported from the 11v11 engine) --------
+// Port of `goalkeeper_save_probability_from_traits` (des/general/soccer.rs) +
+// the deterministic save/catch/parry resolution (soccer/world.rs). Uniform 5v5
+// skills bake the 11v11 skill blends into constants; height_reach = 0. The
+// distance-baseline knots are kept verbatim (yards are yards).
+const GK_REACTION_BASE_S: f32 = 0.26; // 11v11: 0.36 − quickness·0.16 with quickness ≈ 0.625
+const GK_REACTION_FATIGUE_S: f32 = 0.11; // + fatigue·0.11 (uses the keeper's live fatigue)
+const GK_REACTION_SCORE: f32 = 0.5; // uniform mid keeper (11v11 ability blend at 5.5 skills)
+// 11v11 resolves SAVED iff save_probability >= 0.50 — deterministic, no RNG.
+// The 5v5 keeps the deterministic-threshold semantics but recalibrates the bar:
+// 5v5 shots are MPC-aimed on frame from < 24 yd, where the (unchanged) distance
+// baseline tops out near 0.6 and coverage near 0.7, so the 11v11 bar of 0.50
+// would make the keeper a statue (zero saves). 0.20 splits the same gradient at
+// 5v5 range: point-blank (< ~13 yd) beats the keeper, mid-range (14+ yd) is
+// saved only when the keeper is set in the shot lane, and corner placement or a
+// displaced keeper (reach_penalty) still concedes.
+const GK_SAVE_DECISION_BAR: f32 = 0.20;
+const GK_CATCH_BAR: f32 = 0.58; // 11v11: CAUGHT iff catch_probability >= 0.58, else PARRY
+const GK_SAVE_DEPTH_MIN: f32 = 1.6; // 11v11 SHOT_SAVE_DEPTH_YARDS (save resolves at keeper depth)
+const GK_SAVE_DEPTH_MAX: f32 = 8.0; // 5v5 keeper box depth (11v11 uses 18)
+const GK_DIVE_REACH: f32 = 2.6; // 11v11 GOALKEEPER_SAVE_DIVE_REACH_YARDS (bounds the save move)
+const GK_PARRY_MIN_YDS: f32 = 2.0; // rebound distance = 2.0 + (1 − catch)·3.0 yards (11v11)
+const GK_PARRY_MAX_YDS: f32 = 5.0;
 const TEAMMATE_HARD_MIN_SPACE: f32 = 3.0;
 const TEAMMATE_GOOD_SPACE: f32 = 8.0;
 
