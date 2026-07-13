@@ -47,12 +47,11 @@
 //!
 //! ## Scope
 //!
-//! The live seam applies to **all three families** (pass / dribble / shot): each gets
-//! the context-aware analytic bar when the model is on, and the head refines it. The
-//! automated RL corpus currently samples the ball carrier's **pass** feasibility
-//! (the dominant, always-well-defined carrier decision); dribble/shot bars ride the
-//! context-aware analytic seed until their collectors are added. The head itself is
-//! family-agnostic (family is a feature), so extending collection is additive.
+//! The live seam and automated RL corpus both cover **all three families** (pass /
+//! dribble / shot): on each sampling tick, the carrier's representative plan for every
+//! available family is scored by the same MPC execution-probability function used at
+//! the live reject gate, then resolved against the same windowed outcome. Family is an
+//! explicit feature, so the learned bar can differ by action as well as field context.
 
 use super::*;
 use crate::des::general::neural_network::{ActivationName, FeedForwardNetwork, RandomNetworkSpec};
@@ -564,11 +563,11 @@ impl SoccerMatch {
     /// Gated per-tick RL sample collection for the reject-threshold head. A **no-op**
     /// (zero cost, byte-identical) unless the model is enabled. When on: resolves
     /// decisions whose reward window has elapsed (reward = the carrier team's
-    /// territorial-advantage change over the window), and samples a fresh ball-carrier
-    /// pass-feasibility decision on cadence — the execution probability the carrier
-    /// would commit a pass at, in the current context, tagged with the windowed
-    /// outcome. That is exactly the `(context, committed p, did it work out)` signal
-    /// the reject bar is learned from.
+    /// territorial-advantage change over the window), and samples representative pass,
+    /// dribble, and shot feasibility decisions on cadence. Each execution probability
+    /// is tagged with its family, field context, and the later windowed outcome. That is
+    /// exactly the `(context, action family, committed p, did it work out)` signal the
+    /// reject bar is learned from.
     pub(crate) fn collect_mpc_reject_threshold_rl_samples(&mut self, snapshot: &WorldSnapshot) {
         if !mpc_reject_threshold_model_enabled() {
             return;
