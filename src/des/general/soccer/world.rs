@@ -28700,7 +28700,7 @@ impl SoccerMatch {
             let base = DEFENSIVE_GOAL_HISTORY_MIN_PENALTY
                 + (DEFENSIVE_GOAL_HISTORY_MAX_PENALTY - DEFENSIVE_GOAL_HISTORY_MIN_PENALTY)
                     * recency.clamp(0.0, 1.0);
-            transition.reward = -(base * role_multiplier);
+            transition.reward = -(base * role_multiplier * anchored_currency_scale());
             transition.done = false;
             self.deferred_reward_transitions.push(transition);
             actions += 1;
