@@ -794,22 +794,23 @@ function drawDecision(){
       `<b class="hl">${acts[bt].name}</b> — <span class="hlV">the prior flipped the choice</span>.`
     : `the DP prior reinforces <b class="hl">${acts[bt].name}</b> (already the neural top pick).`;
 }
-function probBarsPair(cv,pn,pb,mask){
+function probBarsPair(cv,pn,pb,mask,single){
   const {w,h,ctx}=fit(cv,0.66);const acts=D.actions;
   const idxs=acts.map((a,i)=>i).filter(i=>mask[i]);
   const order=idxs.slice().sort((a,b)=>pb[b]-pb[a]);
   const n=order.length;const padL=92,padR=48,padT=6,padB=6;const rh=(h-padT-padB)/n;
   order.forEach((i,rank)=>{const y=padT+rank*rh;
-    // neural-only (dim, thin) behind
-    ctx.fillStyle=css('--ink-dim');ctx.globalAlpha=.45;
-    roundRect(ctx,padL,y+rh*0.14,Math.max(2,(w-padL-padR)*pn[i]),rh*0.30,3);ctx.fill();ctx.globalAlpha=1;
-    // blended (bold)
+    if(!single){ // neural-only (dim, thin) behind
+      ctx.fillStyle=css('--ink-dim');ctx.globalAlpha=.45;
+      roundRect(ctx,padL,y+rh*0.14,Math.max(2,(w-padL-padR)*pn[i]),rh*0.30,3);ctx.fill();ctx.globalAlpha=1;}
+    // blended (bold) — full height when single
     ctx.fillStyle=rank===0?css('--accent'):rank===1?mix(css('--accent'),css('--teamB'),.35):css('--ink-dim');
-    roundRect(ctx,padL,y+rh*0.46,Math.max(2,(w-padL-padR)*pb[i]),rh*0.34,3);ctx.fill();
+    const by=single?y+rh*0.18:y+rh*0.46, bhh=single?rh*0.60:rh*0.34;
+    roundRect(ctx,padL,by,Math.max(2,(w-padL-padR)*pb[i]),bhh,3);ctx.fill();
     ctx.fillStyle=css('--ink');ctx.font='11px ui-monospace,monospace';ctx.textAlign='right';ctx.textBaseline='middle';
     ctx.fillText(acts[i].name,padL-8,y+rh/2);
     ctx.textAlign='left';ctx.fillStyle=rank<3?css('--ink'):css('--ink-dim');
-    ctx.fillText((pb[i]*100).toFixed(pb[i]*100<10?1:0)+'%',padL+Math.max(2,(w-padL-padR)*pb[i])+6,y+rh*0.63);});
+    ctx.fillText((pb[i]*100).toFixed(pb[i]*100<10?1:0)+'%',padL+Math.max(2,(w-padL-padR)*pb[i])+6,y+rh/2);});
 }
 function resetTally(){tally=D.actions.map(()=>0);drawDecision();drawTally();$('#tallyN').textContent='0 samples';}
 function doRoll(nn){const p=curProbs();for(let k=0;k<nn;k++){let r=Math.random(),c=0,pick=0;
