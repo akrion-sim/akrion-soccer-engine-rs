@@ -130,24 +130,24 @@ fn wenv(name: &str, default: f32, lo: f32, hi: f32) -> f32 {
     bounded_weight(raw.as_deref(), default, lo, hi)
 }
 
-fn grounded_conversion_ladder(goal: f32, shot_base: f32, shot_q: f32) -> (f32, f32, f32) {
-    // The goal stays the reference (clamped to its own range); shot shaping is scaled DOWN to fit a
-    // proportional fraction below it, never the reverse — so tuning big shot rewards can't quietly
-    // inflate what "scoring" is worth.
-    let goal = goal.clamp(REW_GOAL_MIN, REW_GOAL_MAX);
-    let mut shot_base = shot_base.max(MIN_REWARD_WEIGHT);
-    let mut shot_q = shot_q.max(MIN_REWARD_WEIGHT);
-    let max_non_conversion = (goal * REWARD_NON_CONVERSION_MAX_FRACTION)
-        .min(goal - CONVERSION_OVER_SHOT_MARGIN)
-        .max(MIN_REWARD_WEIGHT);
-    let total = shot_base + shot_q;
-    if total > max_non_conversion {
-        let scale = (max_non_conversion / total).clamp(0.0, 1.0);
-        shot_base = (shot_base * scale).max(MIN_REWARD_WEIGHT);
-        shot_q = (shot_q * scale).max(MIN_REWARD_WEIGHT);
-    }
+/// Anchored on-frame shot points (docs/reward-anchoring.md §2): floor 50 no
+/// matter where from; the field-vector context (position xg) sets the CEILING,
+/// and MPC placement quality interpolates inside the [floor, cap(x)] band. The
+/// tunable `span_w` is the only discoverable part; floor and cap are anchors.
+fn anchored_shot_points(placement: f32, xg: f32, span_w: f32) -> f32 {
+    let cap = ON_FRAME_SHOT_FLOOR + ON_FRAME_SHOT_CAP_SPAN * xg.clamp(0.0, 1.0);
+    let t = (span_w * placement.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+    ON_FRAME_SHOT_FLOOR + (cap - ON_FRAME_SHOT_FLOOR) * t
+}
 
-    (goal, shot_base, shot_q)
+/// Field-vector context for a forward carry: full value in our own half
+/// (progression/escape is the carry's job there), tapering through the
+/// opponent's half where shooting and box passing take over — so at any point
+/// of the field the action-class ordering the rewards imply matches football
+/// (dribble > shoot in our half; shoot/pass > dribble in the final third).
+fn dribble_field_context(ball_x: f32) -> f32 {
+    let t = ((ball_x - FIELD_L * 0.5) / (FIELD_L * 0.5)).clamp(0.0, 1.0);
+    1.0 - 0.6 * t
 }
 
 pub struct Rw {
