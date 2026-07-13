@@ -1476,6 +1476,20 @@ fn shuffle(v: &mut [usize], rng: &mut Rng) {
 mod tests {
     use super::*;
 
+    /// NOT a pass/fail gate — a seeded MEASUREMENT probe for the ball-flight
+    /// physics A/B (run explicitly):
+    ///   cargo test --release scripted_pass_probe -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn scripted_pass_probe() {
+        let mut rng = Rng::new(4242);
+        let (att, cmp, frac) = scripted_pass_stats(100, &mut rng);
+        println!(
+            "scripted-vs-scripted over 100 games: pass_att/game={att:.2} pass_cmp/game={cmp:.2} completion={:.1}%",
+            frac * 100.0
+        );
+    }
+
     #[test]
     fn spacing_reward_penalizes_overlap_and_prefers_useful_distance() {
         assert!(spacing_reward(0.8) < spacing_reward(2.0)); // overlap worst
