@@ -28595,11 +28595,15 @@ impl SoccerMatch {
             debug_assert!(
                 (GOAL_CHAIN_REWARD_PATTERN.iter().sum::<f64>() - GOAL_REWARD_POINTS).abs() < 1e-9
             );
+            // The chain recorder normalizes the pattern, so the anchored goal
+            // total (500) distributes over the same chain shape (docs/
+            // reward-anchoring.md — the live goal was previously the hardcoded
+            // 160 regardless of DD_SOCCER_GOAL_REWARD_SCALE).
             self.record_weighted_possession_chain_reward_at_with_kind(
                 self.tick,
                 scoring_team,
                 shooter,
-                GOAL_REWARD_POINTS,
+                live_goal_reward_points(),
                 &GOAL_CHAIN_REWARD_PATTERN,
                 SoccerRewardEventKind::Goal,
             );
@@ -28607,11 +28611,11 @@ impl SoccerMatch {
                 self.queue_direct_shot_outcome_learning_credit(
                     shooter,
                     scoring_team,
-                    GOAL_REWARD_POINTS,
+                    live_goal_reward_points(),
                     SoccerRewardEventKind::Goal,
                 );
             }
-            self.record_contextual_goal_rewards(scoring_team, shooter, GOAL_REWARD_POINTS);
+            self.record_contextual_goal_rewards(scoring_team, shooter, live_goal_reward_points());
         }
         self.update_mpc_latent_objective(scoring_team, None, Some(1.0), Some(1.0));
         self.record_recent_defensive_goal_penalties(scoring_team.other());
