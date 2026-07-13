@@ -1915,6 +1915,19 @@ pub struct SoccerMatch {
     /// present. Carried + trained across games by the learner; `None` ⇒ analytic
     /// seed. Shared into each [`WorldSnapshot`] via an `Arc` clone.
     pub(crate) loose_ball_commit_head: Option<std::sync::Arc<LooseBallCommitHead>>,
+    /// The trained per-context MPC reject-threshold head (how low an action's success
+    /// probability may fall, in this exact context, before MPC refuses it and kicks
+    /// the decision back to the POMDP's next-best). Carried + trained across games by
+    /// the learner; `None` ⇒ context-aware analytic seed. Shared into each
+    /// [`WorldSnapshot`] via an `Arc` clone.
+    pub(crate) mpc_reject_threshold_head: Option<std::sync::Arc<MpcRejectThresholdHead>>,
+    /// Rolling RL corpus for the reject-threshold head: per-decision context + the
+    /// execution probability the carrier committed at + the windowed territorial
+    /// reward. Collected only while the reject-threshold model is enabled; empty +
+    /// untouched in the default process.
+    pub(crate) mpc_reject_threshold_samples: Vec<MpcRejectThresholdSample>,
+    /// Open reject-threshold decisions awaiting their windowed reward.
+    pub(crate) pending_mpc_reject_threshold: Vec<PendingMpcRejectThresholdDecision>,
     /// The trained attacking-spacing target head, when present. Carried + trained
     /// across games by the learner; `None` ⇒ analytic 5-8yd seed. Shared into each
     /// [`WorldSnapshot`] via an `Arc` clone so the off-ball ranker and LP floor read
