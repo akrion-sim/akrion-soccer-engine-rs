@@ -1364,7 +1364,8 @@ impl World {
                             let (_, recv_open) = self.nearest_opponent(team, receiver.pos);
                             let space_needed = AERIAL_CONTROL_SPACE * (1.08 - 0.20 * aerial_skill);
                             if recv_open < space_needed {
-                            continue; // receiver not open enough to control the scoop yet
+                                continue; // receiver not open enough to control the loft yet
+                            }
                         }
                     }
                     let touch_radius_bonus = (touch - 0.5) * 0.55;
