@@ -21273,19 +21273,23 @@ impl SoccerMatch {
         plan: &SoccerLearnedPlan,
     ) -> bool {
         let label = normalize_soccer_action_label(&plan.action);
-        let thresholds = learned_mpc_replan_thresholds();
-        let threshold = if pass_like_action_flight(label).is_some() {
-            Some(thresholds.pass_impossible_probability)
+        let family = if pass_like_action_flight(label).is_some() {
+            Some(MpcRejectFamily::Pass)
         } else if is_dribble_action_label(label) {
-            Some(thresholds.dribble_impossible_probability)
+            Some(MpcRejectFamily::Dribble)
         } else if matches!(label, "shoot" | "first-time-shot" | "first-time-header") {
-            Some(thresholds.shot_impossible_probability)
+            Some(MpcRejectFamily::Shot)
         } else {
             None
         };
-        let Some(threshold) = threshold else {
+        let Some(family) = family else {
             return false;
         };
+        // Context-dependent reject bar: the learned per-context threshold when the
+        // reject-threshold model is enabled, else exactly the family base constant
+        // (byte-identical). "Too low" is a function of the field vector, not a global.
+        let base_threshold = mpc_reject_base_threshold(family);
+        let threshold = snapshot.learned_mpc_reject_threshold(player_id, family, base_threshold);
         Self::learned_plan_mpc_execution_probability(snapshot, player_id, plan)
             .is_some_and(|probability| probability < threshold)
     }
