@@ -98,10 +98,9 @@ fn env_neural_blend(mut blend: SoccerNeuralBlendConfig) -> SoccerNeuralBlendConf
     blend
 }
 
-/// The analytic-opponent experiment has exactly one learned team, so the shared actor sidecar is
-/// unambiguous and safe to enable. Train and held-out evaluation must also exercise the same MCTS
-/// decision seam; otherwise actor/planner-teacher changes are trained but silently absent at the
-/// gate. Explicit env overrides remain available for deliberate ablations.
+/// Train and held-out evaluation exercise the learned team's complete isolated actor plus the same
+/// MCTS decision seam; otherwise actor/planner-teacher changes are trained but silently absent at
+/// the gate. Explicit env overrides remain available for deliberate ablations.
 fn analytic_experiment_neural_blend(mut blend: SoccerNeuralBlendConfig) -> SoccerNeuralBlendConfig {
     blend.actor_critic = true;
     blend.mcts_enabled = true;

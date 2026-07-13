@@ -250,10 +250,10 @@ useful actor samples; the saturated scalar is excluded.
 
 An experiment-stack audit then found a blocking train/eval mismatch in
 `soccer_outcome_ab_run`: analytic training ran actor-critic on with MCTS off, while analytic
-held-out evaluation inherited the tournament's actor-off/MCTS-on defaults. The tournament default
-is correct for two learned teams because its actor sidecar is shared, but an analytic fixture has
-exactly one learned team and can safely evaluate that actor. The runner now defaults both
-`train-analytic` and `eval-analytic` to actor-critic plus MCTS, while retaining explicit env
+held-out evaluation inherited the tournament's then actor-off/MCTS-on defaults. At that point the
+tournament disabled its actor because both learned teams shared one joint-actor sidecar. The
+analytic experiment has exactly one learned team, so its immediate correction made both
+`train-analytic` and `eval-analytic` default to actor-critic plus MCTS, while retaining explicit env
 overrides for ablations. An optimized end-to-end smoke proved both phases report
 `actor_critic=true` and `mcts_enabled=true`.
 
@@ -280,3 +280,26 @@ behaviorally identical on this held-out field. Across the two aligned seeds, one
 improved forward play without winning payoff and the other improved winning payoff while worsening
 forward play. This is not a stable climb, so the gates remain off. A larger fresh held-out field on
 the second seed is the next bounded check of its nominal payoff gain.
+
+That larger `F570` field doubled evaluation to 64 fresh games on the frozen `E140` checkpoints.
+Control reached payoff `0.453`, Elo delta `-70.4`, Wilson lower bound `0.337`, and forward margin
+`-0.05/game`. Root exposure reached payoff `0.461`, Elo delta `-4.0`, Wilson lower bound `0.345`,
+and forward margin `-0.17/game`. The 32-game nominal exposure gain therefore disappeared with more
+held-out evidence and its forward-play regression remained. Root exposure stays off and is rejected
+as the next production lever.
+
+A production-path audit then found a deeper actor ceiling: `soccer_league_train` normally requested
+actor-critic, but `SOCCER_LEAGUE_SELF_PLAY_LADDER=1` forcibly changed it to critic-only. This guard
+was necessary when `SoccerMatch` had one shared `policy_head`; installing the away champion could
+overwrite and drive both teams. It also meant the actual self-play ladder could never train or serve
+joint actor policy improvement, regardless of the actor-learning settings used in analytic screens.
+
+`SoccerMatch` now owns a dedicated away joint-actor sidecar, selects the actor by deciding team,
+computes old-policy probabilities from that same team's actor, trains the learning team's actor, and
+exports each actor with its own checkpoint. Reinstalling an actor-less checkpoint clears only that
+team's stale sidecar. The league no longer forces actor-critic off in ladder mode, and the generic
+tournament/proof path now evaluates independent checkpoints with their complete per-team actor and
+critic by default. Focused regressions prove away training does not allocate the home actor and that
+distinct home/away actor snapshots retain distinct learned weights after install and export. This
+removes a structural learning ceiling; it is not itself held-out evidence of climb, so promotion still
+requires a fresh bounded ladder run followed by the existing independent checkpoint gate.

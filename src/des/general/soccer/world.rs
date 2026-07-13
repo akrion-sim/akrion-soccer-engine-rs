@@ -1761,6 +1761,9 @@ pub struct SoccerMatch {
     /// advantage policy-gradient from the critic (the value head). Present only when
     /// the run opts into actor-critic (`neural_blend.actor_critic` + neural learning enabled).
     pub(crate) policy_head: Option<SoccerPolicyHead>,
+    /// Dedicated AWAY-team joint actor. `None` preserves the historical shared-home fallback for
+    /// single-net matches; per-team tournament/self-play installs keep each brain's actor isolated.
+    pub(crate) away_policy_head: Option<SoccerPolicyHead>,
     /// HOME/shared independent pass/dribble/shot specialist actors over the shared actor features.
     /// Present only when the actor is active AND `DD_SOCCER_ENABLE_SKILL_POLICY_HEADS` is set; their
     /// log-probabilities refine technical action selection on top of the joint actor. Away uses this
@@ -3537,7 +3540,7 @@ mod tests {
     }
 
     #[test]
-    fn away_learning_specialist_training_uses_dedicated_away_sidecar() {
+    fn away_learning_actor_training_uses_dedicated_away_sidecars() {
         let mut config = MatchConfig::default();
         config.learning_enabled = true;
         config.neural_learning.enabled = true;
@@ -3551,7 +3554,23 @@ mod tests {
             .expect("install learning away brain");
 
         assert_eq!(sim.skill_policy_training_team(), Team::Away);
+        sim.ensure_policy_head_for_training(sim.skill_policy_training_team());
         sim.ensure_skill_policy_heads_for_training(sim.skill_policy_training_team());
+        assert!(
+            sim.policy_head.is_none(),
+            "away-learning matches must not allocate or train the home/shared joint actor"
+        );
+        assert!(
+            sim.away_policy_head.is_some(),
+            "away-learning matches need a dedicated joint actor to serve and export"
+        );
+        assert!(sim.policy_head_for(Team::Home).is_none());
+        assert!(sim.policy_head_for(Team::Away).is_some());
+        assert!(sim
+            .neural_network_snapshot_for(Team::Away)
+            .expect("away learner snapshot")
+            .policy_head
+            .is_some());
         assert!(
             sim.skill_policy_heads.is_none(),
             "away-learning matches must not train the home/shared skill sidecar"
@@ -14084,6 +14103,7 @@ impl SoccerMatch {
             goal_celebration_kickoff_team: None,
             neural_blend: config.neural_blend,
             policy_head: None,
+            away_policy_head: None,
             skill_policy_heads: None,
             away_skill_policy_heads: None,
             keeper_policy_head: None,
@@ -14347,6 +14367,7 @@ impl SoccerMatch {
             away_neural_frozen: false,
             neural_blend: SoccerNeuralBlendConfig::default(),
             policy_head: None,
+            away_policy_head: None,
             skill_policy_heads: None,
             away_skill_policy_heads: None,
             keeper_policy_head: None,
@@ -14687,6 +14708,7 @@ impl SoccerMatch {
         } else {
             None
         };
+        self.away_policy_head = None;
         self.skill_policy_heads =
             if let Some(skill_policy_heads) = snapshot.skill_policy_heads.as_deref() {
                 Some(soccer_skill_policy_heads_from_snapshot(
@@ -14955,6 +14977,8 @@ impl SoccerMatch {
     fn clear_all_neural_learners(&mut self) {
         self.neural_learner = None;
         self.away_neural_learner = None;
+        self.policy_head = None;
+        self.away_policy_head = None;
         self.home_neural_frozen = false;
         self.away_neural_frozen = false;
         self.skill_policy_heads = None;
@@ -14988,7 +15012,7 @@ impl SoccerMatch {
                 // blend, keeping serve consistent with train.
                 snapshot.training_steps = learner.training_steps();
                 snapshot.average_loss = learner.average_loss();
-                if let Some(policy_head) = &self.policy_head {
+                if let Some(policy_head) = self.policy_head_for(team) {
                     snapshot.policy_head = Some(Box::new(soccer_policy_head_snapshot(policy_head)));
                 }
                 if let Some(skill_policy_heads) = self.skill_policy_heads_for(team) {
@@ -15186,25 +15210,34 @@ impl SoccerMatch {
                 Team::Away => self.away_neural_learner = None,
             }
             match team {
+                Team::Home => self.policy_head = None,
+                Team::Away => self.away_policy_head = None,
+            }
+            match team {
                 Team::Home => self.skill_policy_heads = None,
                 Team::Away => self.away_skill_policy_heads = None,
             }
             return Ok(());
         }
         let mut restored_skill_policy_heads = None;
+        // Reinstalling a team brain is replacement, not overlay: a checkpoint without an actor
+        // must not silently inherit that team's previously installed actor.
+        match team {
+            Team::Home => self.policy_head = None,
+            Team::Away => self.away_policy_head = None,
+        }
         let learner = match snapshot {
             Some(snapshot) => {
                 let network = build_soccer_neural_network_from_snapshot(&snapshot)?;
-                // Symmetric with `set_neural_network_snapshot`: also restore the actor policy-head
-                // sidecar (including the learned `forward_select_logit_weight`) so eval paths that
-                // install nets via THIS setter (tournaments / other eval) aren't left with an
-                // inert/absent actor. Only overwrites when the snapshot actually carries a policy
-                // head — it never clears a previously-installed one.
+                // Restore the actor into the deciding TEAM's sidecar. This prevents an away
+                // champion from overwriting and then driving the home actor in self-play.
                 if let Some(policy_head_snapshot) = snapshot.policy_head.as_deref() {
-                    self.policy_head = Some(soccer_policy_head_from_snapshot(
-                        policy_head_snapshot,
-                        self.config.seed,
-                    )?);
+                    let restored =
+                        soccer_policy_head_from_snapshot(policy_head_snapshot, self.config.seed)?;
+                    match team {
+                        Team::Home => self.policy_head = Some(restored),
+                        Team::Away => self.away_policy_head = Some(restored),
+                    }
                 }
                 if let Some(keeper_policy_head_snapshot) = snapshot.keeper_policy_head.as_deref() {
                     self.keeper_policy_head = Some(soccer_keeper_policy_head_from_snapshot(
@@ -15259,11 +15292,13 @@ impl SoccerMatch {
                 match team {
                     Team::Home => {
                         self.neural_learner = None;
+                        self.policy_head = None;
                         self.skill_policy_heads = None;
                         self.clear_auxiliary_heads_for(Team::Home);
                     }
                     Team::Away => {
                         self.away_neural_learner = None;
+                        self.away_policy_head = None;
                         self.away_skill_policy_heads = None;
                         self.clear_auxiliary_heads_for(Team::Away);
                     }
@@ -15296,12 +15331,14 @@ impl SoccerMatch {
             Team::Home => {
                 self.neural_learner = None;
                 self.home_neural_frozen = true;
+                self.policy_head = None;
                 self.skill_policy_heads = None;
                 self.clear_auxiliary_heads_for(Team::Home);
             }
             Team::Away => {
                 self.away_neural_learner = None;
                 self.away_neural_frozen = true;
+                self.away_policy_head = None;
                 self.away_skill_policy_heads = None;
                 self.clear_auxiliary_heads_for(Team::Away);
             }
@@ -19357,7 +19394,7 @@ impl SoccerMatch {
     ) -> Option<SoccerPolicyActionChoice> {
         let blend = self.neural_blend;
         let value_active = blend.mode != SoccerNeuralBlendMode::Off;
-        let actor_requested = blend.actor_critic && self.policy_head.is_some();
+        let actor_requested = blend.actor_critic && self.policy_head_for(team).is_some();
         let retrieval_priors = self.retrieved_action_priors_for_team(team);
         let retrieval_active = retrieval_priors
             .as_ref()
@@ -19422,8 +19459,7 @@ impl SoccerMatch {
                 base.action = String::new();
                 let state_features = self.policy_state_features(&base);
                 let joint = self
-                    .policy_head
-                    .as_ref()
+                    .policy_head_for(team)
                     .and_then(|head| head.action_distribution(&state_features))
                     .map(|dist| dist.iter().map(|&p| p.max(1e-8).ln()).collect());
                 // Specialist skill log-probs (pass/dribble/shot) over the same shared features.
@@ -19564,11 +19600,10 @@ impl SoccerMatch {
         // Learned per-net FORWARD action-selection bias. Precomputed once (state-constant across
         // candidates): the weight is 0.0 unless the gate is on AND a policy head exists, and the
         // feature is the visible forward-option quality. Captured as plain f64 copies so the
-        // closure does not additionally borrow `self.policy_head`. When the weight is 0.0 the
+        // closure does not additionally borrow the selected team actor. When the weight is 0.0 the
         // per-candidate bonus below is 0 ⇒ the scored-candidate path is byte-identical.
         let forward_select_weight = if dd_soccer_enable_forward_select_logit() {
-            self.policy_head
-                .as_ref()
+            self.policy_head_for(team)
                 .map(|head| head.forward_select_logit_weight)
                 .unwrap_or(0.0)
         } else {
@@ -22849,8 +22884,7 @@ impl SoccerMatch {
                 }
                 let state_features = self.policy_state_features(transition);
                 let actor_probability = self
-                    .policy_head
-                    .as_ref()
+                    .policy_head_for(transition.team)
                     .and_then(|head| head.action_distribution(&state_features))
                     .and_then(|probs| probs.get(action_index).copied())
                     .filter(|probability| probability.is_finite() && *probability > 0.0)
@@ -23135,8 +23169,7 @@ impl SoccerMatch {
                 }
                 let state_features = self.policy_state_features(transition);
                 let actor_probability = self
-                    .policy_head
-                    .as_ref()
+                    .policy_head_for(transition.team)
                     .and_then(|head| head.action_distribution(&state_features))
                     .and_then(|probs| probs.get(action_index).copied());
                 // Stochastic top-k selection records the true behavior policy;
@@ -23354,13 +23387,14 @@ impl SoccerMatch {
             mcts_distillation_samples.min(u32::MAX as usize) as u32;
         self.stats.neural_mcts_distillation_weight_sum = mcts_distillation_weight_sum;
 
-        self.ensure_policy_head();
+        let policy_training_team = self.skill_policy_training_team();
+        self.ensure_policy_head_for_training(policy_training_team);
         let mappo_clip_epsilon = self
             .config
             .neural_learning
             .mappo_enabled()
             .then(|| self.config.neural_learning.sanitized_mappo_clip_epsilon());
-        if let Some(policy_head) = &mut self.policy_head {
+        if let Some(policy_head) = self.policy_head_for_training_mut(policy_training_team) {
             let epochs = if mappo_clip_epsilon.is_some() {
                 soccer_mappo_epochs()
             } else {
@@ -23381,9 +23415,41 @@ impl SoccerMatch {
         true
     }
 
-    fn ensure_policy_head(&mut self) {
-        if self.policy_head.is_none() {
-            self.policy_head = Some(SoccerPolicyHead::new(self.config.seed));
+    fn policy_head_for(&self, team: Team) -> Option<&SoccerPolicyHead> {
+        match team {
+            Team::Home => self.policy_head.as_ref(),
+            Team::Away if self.away_neural_learner.is_some() => self.away_policy_head.as_ref(),
+            Team::Away => self.policy_head.as_ref(),
+        }
+    }
+
+    fn policy_head_for_training_mut(&mut self, team: Team) -> Option<&mut SoccerPolicyHead> {
+        match team {
+            Team::Home => self.policy_head.as_mut(),
+            Team::Away if self.away_neural_learner.is_some() => self.away_policy_head.as_mut(),
+            Team::Away => self.policy_head.as_mut(),
+        }
+    }
+
+    fn ensure_policy_head_for_training(&mut self, team: Team) {
+        match team {
+            Team::Home => {
+                if self.policy_head.is_none() {
+                    self.policy_head = Some(SoccerPolicyHead::new(self.config.seed));
+                }
+            }
+            Team::Away if self.away_neural_learner.is_some() => {
+                if self.away_policy_head.is_none() {
+                    self.away_policy_head = Some(SoccerPolicyHead::new(
+                        self.config.seed.wrapping_add(0xA11CE),
+                    ));
+                }
+            }
+            Team::Away => {
+                if self.policy_head.is_none() {
+                    self.policy_head = Some(SoccerPolicyHead::new(self.config.seed));
+                }
+            }
         }
     }
 

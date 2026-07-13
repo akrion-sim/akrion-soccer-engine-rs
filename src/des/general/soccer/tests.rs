@@ -42988,6 +42988,60 @@ fn set_team_neural_brain_keeps_distinct_skill_policy_heads_per_team() {
 }
 
 #[test]
+fn set_team_neural_brain_keeps_distinct_joint_actors_per_team() {
+    let mut sim = per_team_brain_match(20265);
+    let mut home_actor = SoccerPolicyHead::new(41);
+    let mut away_actor = SoccerPolicyHead::new(43);
+    home_actor.forward_select_logit_weight = 1.25;
+    away_actor.forward_select_logit_weight = -0.75;
+
+    let mut home_snapshot = sim
+        .neural_network_snapshot_for(Team::Home)
+        .expect("home neural snapshot");
+    let mut away_snapshot = home_snapshot.clone();
+    home_snapshot.policy_head = Some(Box::new(soccer_policy_head_snapshot(&home_actor)));
+    away_snapshot.policy_head = Some(Box::new(soccer_policy_head_snapshot(&away_actor)));
+
+    sim.set_team_neural_brain(Team::Home, Some(home_snapshot), true)
+        .expect("install home snapshot with joint actor");
+    sim.set_team_neural_brain(Team::Away, Some(away_snapshot), true)
+        .expect("install away snapshot with joint actor");
+
+    assert_eq!(
+        sim.policy_head
+            .as_ref()
+            .expect("home actor sidecar")
+            .forward_select_logit_weight,
+        1.25
+    );
+    assert_eq!(
+        sim.away_policy_head
+            .as_ref()
+            .expect("away actor sidecar")
+            .forward_select_logit_weight,
+        -0.75
+    );
+    assert_eq!(
+        sim.neural_network_snapshot_for(Team::Home)
+            .expect("home exported snapshot")
+            .policy_head
+            .as_deref()
+            .expect("home exported actor")
+            .forward_select_logit_weight,
+        1.25
+    );
+    assert_eq!(
+        sim.neural_network_snapshot_for(Team::Away)
+            .expect("away exported snapshot")
+            .policy_head
+            .as_deref()
+            .expect("away exported actor")
+            .forward_select_logit_weight,
+        -0.75
+    );
+}
+
+#[test]
 fn set_team_neural_brain_keeps_distinct_auxiliary_heads_per_team() {
     let mut sim = per_team_brain_match(20264);
     let home_head = trained_test_pass_completion_head(41, 1);

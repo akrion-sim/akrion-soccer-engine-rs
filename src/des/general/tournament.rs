@@ -1461,11 +1461,10 @@ impl Default for EngineMatchRunnerConfig {
         // Inline keeps each tournament match fully deterministic and reproducible
         // (no background training thread racing the step loop).
         base.neural_learning.backend = SoccerNeuralLearningBackend::Inline;
-        // Critic-only blend: each side is driven purely by its OWN per-team critic.
-        // The actor (`policy_head`) is shared across teams, so leaving actor-critic
-        // on would let one shared net influence both brains and blur "who is best";
-        // disable it so the tournament compares genuinely independent brains.
-        base.neural_blend.actor_critic = false;
+        // Compare each complete learned policy. Joint actor sidecars, like critics and skill
+        // actors, are isolated per team; checkpoints without an actor still fall back to their
+        // own critic without injecting a fresh random actor at evaluation time.
+        base.neural_blend.actor_critic = true;
         EngineMatchRunnerConfig {
             base,
             match_wall_time_limit: None,
@@ -1850,6 +1849,10 @@ mod tests {
             crate::des::general::soccer::DEFAULT_DT_SECONDS
         );
         assert_eq!(config.base.total_ticks(), 18_000);
+        assert!(
+            config.base.neural_blend.actor_critic,
+            "independent tournament brains should serve their complete actor-critic policies"
+        );
     }
 
     #[test]

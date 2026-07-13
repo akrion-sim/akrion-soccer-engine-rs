@@ -149,6 +149,12 @@ fn apply_league_neural_mcts_config(config: &mut EngineMatchRunnerConfig) -> bool
     enabled
 }
 
+fn apply_league_actor_config(config: &mut EngineMatchRunnerConfig) -> bool {
+    let enabled = env_bool("SOCCER_NEURAL_ACTOR_CRITIC", true);
+    config.base.neural_blend.actor_critic = enabled;
+    enabled
+}
+
 fn league_worker_count(requested_workers: usize, fixture_count: usize) -> usize {
     let capped = requested_workers.clamp(1, fixture_count.max(1));
     let serial_for_mpc_objective =
@@ -1332,14 +1338,9 @@ fn main() {
     // parity (policy gradient optimizes RETURN directly, not tabular-matching). Pair with a lower
     // DD_SOCCER_NEURAL_AUTHORITATIVE_LAMBDA (more actor influence) + SOCCER_POLICY_ENTROPY_COEFF
     // (keep exploring) so the actor can actually leave the analytic mode. Off ⇒ current behaviour.
-    runner_config.base.neural_blend.actor_critic = env_bool("SOCCER_NEURAL_ACTOR_CRITIC", true);
-    // The self-play ladder installs a neural net on BOTH teams, but the actor's `policy_head` is a
-    // single shared field — the away champion's actor would overwrite (and then drive) both sides.
-    // Force critic-only ranking in ladder mode so each side selects with its OWN per-team critic
-    // (the exact mode play_checkpoint_validation + the default tournament config already use).
-    if self_play_ladder {
-        runner_config.base.neural_blend.actor_critic = false;
-    }
+    // Per-team joint-actor sidecars now isolate the frontier and frozen champion, so ladder mode
+    // can train and serve the actor instead of silently falling back to critic-only ranking.
+    apply_league_actor_config(&mut runner_config);
     runner_config.base.neural_blend.mode = env_neural_blend_mode(
         "SOCCER_NEURAL_BLEND_MODE",
         SoccerNeuralBlendMode::Authoritative,
@@ -1365,7 +1366,7 @@ fn main() {
     let full_game_learning_enabled = runner_config.base.full_game_learning_enabled;
     let neural_learning_rate = runner_config.base.neural_learning.learning_rate;
     let neural_optimizer_momentum = runner_config.base.neural_learning.optimizer_momentum;
-    // Keep the engine's designed independent-brain mode (per-team critic drives each side).
+    // Keep the engine's designed independent-brain mode (per-team critic and actor drive each side).
     let mut runner = EngineMatchRunner::new(runner_config);
 
     let mut frontier = match load_brain(&frontier_path) {
@@ -2327,6 +2328,32 @@ mod tests {
 
         assert!(!enabled);
         assert!(!config.base.neural_blend.mcts_enabled);
+    }
+
+    #[test]
+    fn league_self_play_ladder_keeps_joint_actor_enabled_by_default() {
+        let _lock = env_lock().lock().unwrap();
+        let _guard = EnvVarGuard::clear("SOCCER_NEURAL_ACTOR_CRITIC");
+        let mut config = EngineMatchRunnerConfig::default();
+        config.base.neural_blend.actor_critic = false;
+
+        let enabled = apply_league_actor_config(&mut config);
+
+        assert!(enabled);
+        assert!(config.base.neural_blend.actor_critic);
+    }
+
+    #[test]
+    fn league_joint_actor_can_still_be_explicitly_disabled() {
+        let _lock = env_lock().lock().unwrap();
+        let _guard = EnvVarGuard::set("SOCCER_NEURAL_ACTOR_CRITIC", "0");
+        let mut config = EngineMatchRunnerConfig::default();
+        config.base.neural_blend.actor_critic = true;
+
+        let enabled = apply_league_actor_config(&mut config);
+
+        assert!(!enabled);
+        assert!(!config.base.neural_blend.actor_critic);
     }
 
     #[test]
