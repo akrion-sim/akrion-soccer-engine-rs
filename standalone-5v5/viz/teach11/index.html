@@ -509,7 +509,7 @@
           <li><b>Measure</b> pass/dribble/shot/turnover/conceded-danger outcomes <i>across ticks</i> — reward truth.</li>
           <li><b>Approximate DP</b> replays the trajectory and propagates delayed credit backward (§3).</li>
           <li><b>Neural actor + critic</b> (MAPPO, 128-wide, set-encoded) generalize the cleaned-up value over
-            the 210-dim field, with a bounded DP/Q prior at decision time (§2, §4).</li>
+            the ~476-dim field, with a bounded DP/Q prior at decision time (§2, §4).</li>
           <li><b>Formation LP</b> assigns roles; <b>world-model + neural MCTS</b> score short futures (§5).</li>
           <li><b>QP-MPC</b> makes the chosen motion feasible (§7); <b>promotion</b> is strict held-out vs
             analytic + protected best (§8).</li>
