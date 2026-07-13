@@ -390,12 +390,19 @@ pub struct World {
     pub b: [Player; N],
     pub ball: V2,
     pub ball_vel: V2,
-    pub ball_aerial: bool, // in-flight ball is a lofted/scooped pass (over ground defenders)
-    pub air_ticks: u32,    // ticks the scooped ball stays airborne before it lands
+    pub ball_aerial: bool, // in-flight ball is airborne (altitude above the rolling threshold)
+    pub air_ticks: u32,    // legacy scoop-duration counter (kept for compat; flight now driven by z)
+    // 11v11-parity z-axis: altitude is a scalar (the ball's Vec2 stays horizontal), driven by a
+    // closed-form projectile parabola in time — no z-velocity, no bounce (matches soccer.rs).
+    pub ball_z: f32,       // altitude (yards) above the pitch
+    ball_apex: f32,        // peak height of the current loft
+    ball_taloft: f32,      // seconds since the current loft was launched
     pub ball_curl: V2,     // lateral curl (spin) accel on a long (>20yd) pass/shot
     pending_curl: V2,      // scratch: curl for the kick launching this tick
-    pending_aerial: bool,  // scratch: the pass launched this tick is a scoop
-    pending_air_ticks: u32, // scratch: airborne duration for the launching scoop
+    pending_aerial: bool,  // scratch: the pass launched this tick is a loft
+    pending_air_ticks: u32, // scratch: legacy airborne-duration (unused by the z model)
+    pending_apex: f32,     // scratch: apex of the loft launching this tick
+    pending_aerial_speed: f32, // scratch: land-on-target horizontal launch speed for the loft
     pub owner: Option<Owner>,
     pub last_touch: Option<Team>,
     last_kicker: Option<Owner>,
