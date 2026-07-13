@@ -68281,7 +68281,11 @@ fn shot_mpc_accuracy_estimate_for_snapshot(
             max_active_sets: 32,
         },
     );
-    let target_x = if solution.status == QPStatus::Optimal && !solution.x.is_empty() {
+    let target_x = if let Some(aim) = override_target {
+        // Honor the actor-chosen aim; downstream block/on-frame/save/goal metrics are all
+        // computed from `target_x`, so they now reflect THIS placement.
+        aim.x
+    } else if solution.status == QPStatus::Optimal && !solution.x.is_empty() {
         solution.x[0]
     } else {
         unbounded_preference
