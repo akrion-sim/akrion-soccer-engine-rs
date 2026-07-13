@@ -137,7 +137,7 @@ pub const PASS_TARGET_SLOTS: usize = N - 2; // outfield teammates minus the poss
 
 // Full relational field vector (per-agent actor observation): 11 self/global +
 // 5 ball + 5 goals + 6 role/cues + (N-1)*5 teammates + N*5 opponents + 1 bias.
-pub const OBS_DIM: usize = 73;
+pub const OBS_DIM: usize = 76; // 73 + possession/duel tri-state (contested, favor, i_contend)
 
 // Centralized-critic GLOBAL state (MAPPO / CTDE): the whole field in a single
 // canonical (Team-A attack) frame — every player's pos+vel + ball pos+vel +
