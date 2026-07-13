@@ -765,6 +765,17 @@ impl World {
         self.reset_a_pass_memory();
     }
 
+    /// Ball is dead / re-spotted / secured: clear the whole in-flight state
+    /// (aerial z-arc + curl) so no stale arc leaks into the next free ball.
+    fn reset_ball_flight(&mut self) {
+        self.ball_aerial = false;
+        self.air_ticks = 0;
+        self.ball_z = 0.0;
+        self.ball_apex = 0.0;
+        self.ball_taloft = 0.0;
+        self.ball_curl = V2::default();
+    }
+
     fn reset_a_pass_memory(&mut self) {
         self.lp_from = -1;
         self.lp_to = -1;
