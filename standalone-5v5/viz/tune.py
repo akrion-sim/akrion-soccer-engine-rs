@@ -25,7 +25,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 BIN = os.path.join(ROOT, "target", "release", "fiveaside")
 MIN_WEIGHT = 0.0001
-CONVERSION_REWARD_MARGIN = 5.0
 
 
 def env_int(name, default, lo=None, hi=None):

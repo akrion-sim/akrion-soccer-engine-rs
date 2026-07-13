@@ -154,6 +154,14 @@ pub struct Rw {
     // Anchors (win/goal/shot-floor) are consts above, not fields — see
     // docs/reward-anchoring.md. Everything here is a discoverable weight with
     // sane bounds, in POINTS (currency: goal = 500).
+    //
+    // The NEGATIVE mirrors are fractions of the positive anchors, discoverable
+    // within bounds: how much conceding/losing stings is a risk-appetite knob,
+    // not an anchor. Symmetric (−500/−1000) was tried and collapses training
+    // into passivity — every config that ever trained well here had
+    // concede ≈ 0.25–0.67·goal and loss ≈ 0.5·win.
+    pub concede_frac: f32,         // conceding costs concede_frac · GOAL
+    pub loss_frac: f32,            // losing costs loss_frac · WIN
     pub shot_span: f32,            // on-frame shot placement span inside [floor, cap(x)]
     pub milestone: f32,            // completing the 2nd pass (unlocks the shot)
     pub pass_credit: f32,          // flat credit for a completed pass
