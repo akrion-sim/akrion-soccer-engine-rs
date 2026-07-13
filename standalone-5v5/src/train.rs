@@ -700,7 +700,9 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
                 pen += rw().return_stale; // no upfield progress -> heavier
             }
             pen *= 1.0 + 0.50 * pre_field.safe_outlet_value + 0.50 * pre_field.return_stale;
-            r -= pen.min(24.0);
+            // Cap at the non-conversion ceiling (0.40·goal): the escalation must
+            // sting, but no single shaping event may rival scoring.
+            r -= pen.min(REW_GOAL_POINTS * REWARD_NON_CONVERSION_MAX_FRACTION);
         }
 
         r += rw().field_goalside_delta
