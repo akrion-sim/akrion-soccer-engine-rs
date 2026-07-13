@@ -2100,17 +2100,20 @@ impl World {
                     let pass_dist = lead.sub(me).len().max(0.1);
                     let (_, recv_open) = self.nearest_opponent(team, tp);
                     let openness = (recv_open / TEAMMATE_GOOD_SPACE).clamp(0.0, 1.0);
-                    // LOFTED pass: if a defender blocks the GROUND lane to the
-                    // target, lift the ball OVER them on a gravity-timed arc that
-                    // comes down AT the receiver — land-at-target pacing
-                    // `d / hang_time × 1.08` (drag compensation), capped so the
-                    // gravity-fixed carry cannot land out of bounds. Aerial
-                    // control takes time, so it only completes if the receiver is
-                    // open (checked at reception) — else it lands loose.
+                    // LOFTED pass — LONG balls only: if a defender blocks the
+                    // GROUND lane to a far target, lift the ball OVER them on a
+                    // gravity-timed arc that comes down AT the receiver —
+                    // land-at-target pacing `d / hang_time × 1.08` (drag
+                    // compensation), capped so the gravity-fixed carry cannot
+                    // land out of bounds. Short blocked lanes stay on the floor:
+                    // a low arc never rises over anyone's reach, so the solve
+                    // zips those through traffic instead. Aerial control takes
+                    // time, so the loft only completes if the receiver is open
+                    // (checked at reception) — else it lands loose.
                     let ground_lane = self.lane_clearness(team, me, tp);
-                    if ground_lane < 0.55 {
+                    if ground_lane < 0.55 && pass_dist >= LOFT_MIN_DISTANCE {
                         self.pending_aerial = true;
-                        self.pending_apex = lofted_apex_yds(pass_dist);
+                        self.pending_apex = lofted_apex_yds(pass_dist).max(LOFT_APEX_CLEAR_FLOOR);
                         let hang = hang_time(self.pending_apex).max(0.35);
                         let land_speed = (pass_dist / hang) * AERIAL_LAND_AT_TARGET_DRAG_COMP;
                         let max_carry = carry_to_boundary(me, lead.sub(me).unit());
