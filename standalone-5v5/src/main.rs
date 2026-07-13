@@ -642,7 +642,10 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
         };
         // Absolute progress reference: challenger vs the scripted baseline.
         let s = train::evaluate(&challenger, cfg.eval_games, &mut rng);
-        let promoted = gd_champ >= promote_margin;
+        // Promote only if the challenger BEATS the champion head-to-head AND does not
+        // regress below the fixed scripted anchor — this refuses the cyclic-drift
+        // promotions where a policy wins the ladder but loses to the baseline.
+        let promoted = gd_champ >= promote_margin && s.goal_diff >= scripted_floor;
         if promoted {
             champion = Some(challenger.clone());
             champion_gen += 1;
