@@ -1214,13 +1214,16 @@ pub fn train_iter(policy: &mut Policy, games: usize, ent_beta: f32, rng: &mut Rn
                 policy.speedor.backward(&sacts, &d_slogits);
 
                 // ---- centralized critic (MSE to GAE return), on GLOBAL state ----
+                // Targets normalized to GOAL units so the fixed LR fits the
+                // anchored point scale (predictions are denormalized in rollout).
                 let cacts = policy.critic.forward(&s.gstate);
                 let v = cacts.last().unwrap()[0];
-                let dv = v - s.ret; // dL/dv for 0.5*(v-ret)^2
+                let ret_n = s.ret / RETURN_NORM;
+                let dv = v - ret_n; // dL/dv for 0.5*(v-ret_n)^2
                 policy.critic.backward(&cacts, &[dv]);
 
                 ent_accum += ent + ent_s;
-                vloss_accum += 0.5 * (v - s.ret) * (v - s.ret);
+                vloss_accum += 0.5 * (v - ret_n) * (v - ret_n);
                 count += 1.0;
             }
             policy.actor.step(LR_ACTOR);
