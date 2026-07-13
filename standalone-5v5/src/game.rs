@@ -695,6 +695,74 @@ impl World {
         (0.5 + 0.5 * ((best_other_eta - my_eta) / 0.6).clamp(-1.0, 1.0)).clamp(0.0, 1.0)
     }
 
+    /// Time for a player at `p` to reach its intercept point on the ball's
+    /// decelerating trajectory (the same race metric `loose_ball_belief` uses).
+    fn eta_to_intercept(&self, p: V2) -> f32 {
+        p.sub(self.intercept_point(p)).len() / PLAYER_SPEED.max(1e-3)
+    }
+
+    /// Possession/duel TRI-STATE (11v11 parity: `loose_ball_fifty_fifty_duel`).
+    /// MAPPO/IPPO acting depends on whether the world is in possession /
+    /// dispossession / 50-50, so the state is exposed to the nets as an
+    /// explicit input rather than left implicit in raw geometry:
+    ///   contested ∈ [0,1] — 1.0 = a live duel. Free ball: both teams' best
+    ///     arrival times near-even (soft window, full at equal ETAs, 0 beyond
+    ///     0.45 s — the 11v11 fifty-fifty threshold). Owned ball: an opponent
+    ///     inside TACKLE_RADIUS of the carrier (an active dispossession
+    ///     contest).
+    ///   favor ∈ [−1,1] — which team the state favors from `team`'s view:
+    ///     ownership when owned, the ETA edge when free.
+    ///   i_contend ∈ {0,1} — whether THIS player is its team's live contender
+    ///     (the pressured carrier / the closing tackler / the fastest racer).
+    pub fn duel_state(&self, team: Team, idx: usize) -> (f32, f32, f32) {
+        match self.owner {
+            Some(o) => {
+                let carrier_pos = players(o.team, self)[o.idx].pos;
+                let defenders = players(o.team.other(), self);
+                let mut best_d = f32::INFINITY;
+                let mut best_k = usize::MAX;
+                for k in 0..N {
+                    let d = defenders[k].pos.sub(carrier_pos).len();
+                    if d < best_d {
+                        best_d = d;
+                        best_k = k;
+                    }
+                }
+                let contested = (best_d < TACKLE_RADIUS) as u8 as f32;
+                let favor = if o.team == team { 1.0 } else { -1.0 };
+                let i_contend = if o.team == team {
+                    (o.idx == idx) as u8 as f32 * contested
+                } else {
+                    (best_k == idx) as u8 as f32 * contested
+                };
+                (contested, favor, i_contend)
+            }
+            None => {
+                let mine = players(team, self);
+                let theirs = players(team.other(), self);
+                let mut my_best = f32::INFINITY;
+                let mut my_best_k = 0usize;
+                let mut their_best = f32::INFINITY;
+                for k in 0..N {
+                    let e = self.eta_to_intercept(mine[k].pos);
+                    if e < my_best {
+                        my_best = e;
+                        my_best_k = k;
+                    }
+                    let e2 = self.eta_to_intercept(theirs[k].pos);
+                    if e2 < their_best {
+                        their_best = e2;
+                    }
+                }
+                let gap = their_best - my_best; // >0 ⇒ we win the race
+                let contested = ((0.45 - gap.abs()) / 0.45).clamp(0.0, 1.0);
+                let favor = (gap / 0.6).clamp(-1.0, 1.0);
+                let i_contend = (my_best_k == idx) as u8 as f32;
+                (contested, favor, i_contend)
+            }
+        }
+    }
+
     /// Classify a Team-A dribble by the FINAL (post-shielding) direction, so the
     /// forward-dribble reward reflects actual movement — a shield that bends the
     /// carry sideways/backward is NOT credited as forward. Forward = x·sx > 0.3,
