@@ -839,6 +839,44 @@ impl World {
         perp.scale(side * strength)
     }
 
+    /// RECEIVER-LEAD SOLVE (11v11 `led_pass_target_for_receiver`, 5v5-scaled):
+    /// aim AHEAD of a moving receiver — lead = clamp(travel_time·(0.20 +
+    /// skill·0.55), 0, 1.35) applied to the receiver's velocity — plus a modest
+    /// upfield into-space lead for genuinely forward passes (~0.3–3 yd, scaled
+    /// by openness; the 11v11 aims up to 8.5 yd on a 114-yd pitch), clamped
+    /// inside the pitch. `travel_time` is the same receiver-timed arrival
+    /// window `ground_pass_launch_speed` paces the ball for (self-consistent).
+    fn led_pass_target(&self, team: Team, passer_idx: usize, ti: usize) -> V2 {
+        let ps = players(team, self);
+        let from = ps[passer_idx].pos;
+        let tp = ps[ti].pos;
+        let tv = ps[ti].vel;
+        let sx = team.sx();
+        let dist = tp.sub(from).len();
+        let travel_time = (0.46 + dist / 48.0).clamp(0.60, 2.0);
+        let skill = ability01(ps[passer_idx].skills.first_touch);
+        let lead = (travel_time * (0.20 + skill * 0.55)).clamp(0.0, 1.35);
+        let velocity_led = tp.add(tv.scale(lead));
+        // Into-space upfield lead, only for passes that actually go forward.
+        let fwd = (tp.x - from.x) * sx;
+        let forward_pass_weight = if fwd > 6.0 {
+            1.0
+        } else if fwd > 1.25 {
+            0.64
+        } else if fwd > -1.25 {
+            0.28
+        } else {
+            0.0
+        };
+        let (_, opp_d) = self.nearest_opponent(team, tp);
+        let openness = (opp_d / TEAMMATE_GOOD_SPACE).clamp(0.0, 1.0);
+        let moving_upfield = (tv.x * sx).max(0.0);
+        let upfield_lead = forward_pass_weight
+            * (1.0 + openness * 1.6 + moving_upfield * 0.12).clamp(0.0, 3.0);
+        let led = velocity_led.add(V2::new(sx * upfield_lead, 0.0));
+        V2::new(led.x.clamp(0.8, FIELD_L - 0.8), led.y.clamp(0.8, FIELD_W - 0.8))
+    }
+
     fn pass_candidates(
         &self,
         team: Team,
