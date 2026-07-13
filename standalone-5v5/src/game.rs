@@ -1858,9 +1858,7 @@ impl World {
         if let Some((o, _)) = best {
             let prev_touch = self.last_touch;
             self.owner = Some(o);
-            self.ball_aerial = false; // controlled -> no longer airborne
-            self.air_ticks = 0;
-            self.ball_curl = V2::default();
+            self.reset_ball_flight(); // controlled -> no longer airborne, arc + curl cleared
             self.a_shot_flag = false; // shot resolved into possession
             self.b_shot_flag = false;
             // Team-A reward events. pending_pass.team is the PASSING team.
