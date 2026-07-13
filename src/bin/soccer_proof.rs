@@ -323,6 +323,127 @@ fn fresh_snapshot(out_path: &str, seed_base: u32) {
     );
 }
 
+/// Optional keep-best selection for `train-ckpt` (all default-off; behavior is byte-identical
+/// when the env vars are unset). Ported PRINCIPLE from the standalone 5v5 `best_gated` /
+/// `checkpoint_quality` loop: held-out EVAL stats decide which checkpoint is "best" — the
+/// training reward never does — so a late reward-hacked collapse cannot overwrite a good net.
+///   SOCCER_PROOF_KEEPBEST_EVERY    games between proxy evals (0/unset = disabled)
+///   SOCCER_PROOF_KEEPBEST_GAMES    proxy eval games per check (default 12)
+///   SOCCER_PROOF_KEEPBEST_HOLDOUT  hex seed base for the held-out fixtures (default E7A1BEEF)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KeepBestConfig {
+    every: usize,
+    games: usize,
+    holdout: u32,
+}
+
+impl KeepBestConfig {
+    fn from_parts(every: usize, games: usize, holdout: u32) -> Option<Self> {
+        if every == 0 {
+            return None;
+        }
+        Some(Self {
+            every,
+            games: games.max(1),
+            holdout,
+        })
+    }
+
+    fn from_env() -> Option<Self> {
+        Self::from_parts(
+            env_usize("SOCCER_PROOF_KEEPBEST_EVERY", 0),
+            env_usize("SOCCER_PROOF_KEEPBEST_GAMES", 12),
+            parse_hex(
+                std::env::var("SOCCER_PROOF_KEEPBEST_HOLDOUT").ok().as_ref(),
+                0xE7A1_BEEF,
+            ),
+        )
+    }
+}
+
+/// True when the keep-best proxy eval should run after `done` of `total_games` training games.
+/// Cadence is every `every` games, plus the final game (5v5 reference evaluates the last iter too)
+/// so the terminal net always gets a chance to claim `.best.json`.
+fn keepbest_due(done: usize, total_games: usize, every: usize) -> bool {
+    every > 0 && (done % every == 0 || done == total_games)
+}
+
+/// Proxy-eval quality of one checkpoint: goal difference per game is primary, shots on target
+/// per game breaks ties (anti-passivity: between two equal-GD nets prefer the one creating
+/// chances). Higher is better on both axes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct KeepBestScore {
+    goal_diff_per_game: f64,
+    sot_per_game: f64,
+}
+
+impl KeepBestScore {
+    /// Strict improvement: primary metric first, tiebreak second. Equal scores do NOT improve,
+    /// so the earliest checkpoint at a given quality is kept (fewer rewrites, stable artifact).
+    fn better_than(&self, other: &Self) -> bool {
+        if self.goal_diff_per_game != other.goal_diff_per_game {
+            return self.goal_diff_per_game > other.goal_diff_per_game;
+        }
+        self.sot_per_game > other.sot_per_game
+    }
+}
+
+impl std::fmt::Display for KeepBestScore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "gd{:+.3}/sot{:.2}",
+            self.goal_diff_per_game, self.sot_per_game
+        )
+    }
+}
+
+/// In-process proxy eval of a training snapshot vs the pure-ANALYTIC baseline over held-out
+/// seeds — the same machinery the `eval` subcommand uses (frozen `TeamBrain`s + a fresh
+/// `EngineMatchRunner`, learning disabled on both sides, alternating home/away, seeds spread by
+/// `SEED_STRIDE` from a holdout base disjoint from the training seed stream). Training state is
+/// untouched: the candidate brain is built from a CLONE of the snapshot, and no training RNG is
+/// consumed (every fixture is seeded from the holdout base). Returns `None` when no fixture
+/// completed.
+fn keepbest_proxy_score(
+    snapshot: &SoccerNeuralNetworkSnapshot,
+    games: usize,
+    minutes: f64,
+    holdout: u32,
+) -> Option<KeepBestScore> {
+    let cand = TeamBrain::from_snapshot(snapshot.clone());
+    let base = TeamBrain::fresh();
+    let mut cfg = EngineMatchRunnerConfig::default();
+    cfg.base.duration_seconds = minutes * 60.0;
+    // Mirror the eval subcommand's opt-in so proxy scores stay comparable with later
+    // `soccer_proof eval` runs launched under the same env.
+    if env_bool("SOCCER_PROOF_EVAL_ACTOR_CRITIC", false) {
+        cfg.base.neural_blend.actor_critic = true;
+    }
+    let mut runner = EngineMatchRunner::new(cfg);
+    let mut goal_diff = 0.0;
+    let mut sot = 0.0;
+    let mut n = 0usize;
+    for g in 0..games {
+        let seed = holdout.wrapping_add((g as u32).wrapping_mul(SEED_STRIDE));
+        let cand_home = g % 2 == 0;
+        let Some((cm, bm)) = play_fixture(&mut runner, &cand, &base, seed, cand_home) else {
+            continue;
+        };
+        goal_diff += cm.goals - bm.goals;
+        sot += cm.sot;
+        n += 1;
+    }
+    if n == 0 {
+        return None;
+    }
+    let nf = n as f64;
+    Some(KeepBestScore {
+        goal_diff_per_game: goal_diff / nf,
+        sot_per_game: sot / nf,
+    })
+}
+
 /// Train a candidate by inline self-play carry-forward, honoring whatever env gates this process
 /// was launched with, writing a checkpoint snapshot every `ckpt_every` games.
 fn train_ckpt(out_prefix: &str, games: usize, minutes: f64, seed_base: u32, ckpt_every: usize) {

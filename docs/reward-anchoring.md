@@ -102,3 +102,42 @@ The 5v5 needs the contested/50-50 state ported from the 11v11 duel logic.
   off), individual knobs still overridable.
 - 5v5: becomes the default (it is our sandbox), old scale removed; tuner searches `w_i` within
   the declared bounds.
+
+---
+
+## Appendix: 2026-07-13 audit findings (verified at source) and hardenings
+
+1. **Inert finishing anchor (FIXED).** `DD_SOCCER_ON_FRAME_SHOT_REWARD_SCALE` was only
+   consumed below the `infer_discrete_events` early-return in
+   `soccer_transition_reward_with_tactics` (soccer.rs:27508). The live path always passes
+   `false` (world.rs `learning_transitions_for`), so the "finishing anchor" **never fired in
+   self-play** — the goalfinish overnight run trained without its headline lever. Anchored
+   mode pays the shooter directly in `record_shot_on_target_rewards` (the live event path).
+2. **Live goal never scaled (FIXED by anchors).** The live goal is the hardcoded
+   `GOAL_REWARD_POINTS = 160` chain; `DD_SOCCER_GOAL_REWARD_SCALE` only affects the
+   tracking-imitation dataset builder — every "goal-dominance" run (scale 8 ⇒ intended 800)
+   actually trained at goal=160. Worse, the match-win floor
+   (`hierarchy_projected_match_win_points`) scales with `goal_scale`, so those runs got
+   win≈1300 vs goal=160 — the intended carrot ratio, inverted. Anchored mode: goal=500,
+   win=1000, by construction.
+3. **`shot_shaping` is diluted, not inert.** The 80-pt pool IS recorded live but grounded to
+   ≤64 and chain-distributed (shooter share ≈ 31% × distance scale ⇒ the observed ~1-3 pts).
+   The code comment calling it telemetry-only overstates.
+4. **MPC objective mismatch (OPEN).** The MPC reject-threshold head trains on
+   *territorial-advantage delta*, and the actor pays a dense penalty for disagreeing with the
+   learned MPC (`soccer_decision_option_control_reward`) — a soft pull toward a planner that
+   optimizes something the reward doesn't pay. Future work: price MPC heads in the anchored
+   currency.
+5. **Deferred pass credit timing (MITIGATED).** `DD_SOCCER_ENABLE_DEFERRED_PASS_CREDIT`
+   default-off ⇒ pass credit lands on the RECEPTION tick, not the pass decision. Anchored
+   runs enable it (both A/B arms).
+6. **`done` is overloaded.** Full-game replay sets `done=true` on every row; GAE terminals
+   come from decision-gap ticks. Never trust `transition.done` for episode boundaries.
+7. **Return clip vs anchors (FIXED).** The ±400 full-game return clip would have silently
+   flattened a ±1000 win label — `soccer_full_game_return_clip()` is ±4000 under anchoring.
+   Launchers must also raise `SOCCER_NEURAL_TARGET_SCALE` (30 → 120).
+8. **5v5 scale hazards (FIXED).** No return normalization existed → critic targets now
+   normalized by `RETURN_NORM = 500` (goal units). Symmetric negative anchors (−500/−1000)
+   collapse training into passivity — negatives are **bounded discoverable fractions**
+   (`REW_CONCEDE_FRAC` default 0.67 of goal, `REW_LOSS_FRAC` default 0.5 of win); validated
+   by smoke (+0.367 GD @ 40 iters vs −0.47 symmetric).
