@@ -103,9 +103,31 @@ const CURL_MIN_DIST: f32 = 20.0; // passes/shots longer than this can be given c
 const CURL_ACCEL: f32 = 6.0; // lateral curl acceleration on a long ball (bends around a defender)
 const TACKLE_RADIUS: f32 = 1.6;
 const TACKLE_PROB: f32 = 0.16; // per-tick; retuned for 15 Hz to keep same per-second rate (~2.4/s)
-#[allow(dead_code)]
-const BALL_FRICTION: f32 = 0.965; // legacy single-term decay (superseded by ball_resistance_after)
+const BALL_FRICTION: f32 = 0.965; // LEGACY per-tick decay (the default flight model; see flag below)
+
+/// Runtime toggle for the 11v11-parity ball-flight stack (3-term drag,
+/// gravity-timed lofts, altitude capture gates, pass-speed/lead solves):
+///   FIVEASIDE_PARITY_BALLFLIGHT unset/"0"/"false" -> LEGACY physics — the
+///     validated GK-era stack, the pre-parity behavior reproduced exactly;
+///   FIVEASIDE_PARITY_BALLFLIGHT=1 -> the full parity flight + targeting solve.
+/// Default OFF: the parity stack measures BETTER scripted completion (71% vs
+/// 63%) but the 40-iter RL smoke trains into passivity under it, so the tree's
+/// DEFAULT behavior stays the validated one. Read once per process; every
+/// World snapshots it at construction (tests flip the World field directly).
+fn parity_ballflight_default() -> bool {
+    static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("FIVEASIDE_PARITY_BALLFLIGHT")
+            .map(|raw| {
+                let v = raw.trim();
+                !(v.is_empty() || v == "0" || v.eq_ignore_ascii_case("false"))
+            })
+            .unwrap_or(false)
+    })
+}
+
 // ---- 11v11-parity ball flight (soccer.rs constants) ----
+// Active ONLY when FIVEASIDE_PARITY_BALLFLIGHT=1 (parity_ballflight_default).
 const BALL_DRAG_PER_TICK: f32 = 0.028; // DEFAULT_BALL_DRAG_PER_TICK (linear, half-life vs ref dt=1/15)
 const BALL_AIR_RESISTANCE: f32 = 0.0085; // DEFAULT_BALL_AIR_RESISTANCE (quadratic)
 const BALL_GRASS_RESISTANCE: f32 = 0.96; // DEFAULT_BALL_GRASS_RESISTANCE_YPS2 (ground contact only)
