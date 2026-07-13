@@ -2972,6 +2972,290 @@ mod tests {
         [A_STAY; N]
     }
 
+    #[test]
+    fn loft_altitude_is_a_rise_then_fall_arc() {
+        let apex = lofted_apex_yds(18.0); // mid-range loft
+        assert!((1.6..=9.0).contains(&apex), "apex clamped: {apex}");
+        let hang = hang_time(apex);
+        assert!(hang > 0.5 && hang < 3.0, "hang time sane: {hang}");
+        // z is 0 at launch, peaks near apex mid-flight, back to 0 on landing.
+        assert!(altitude_at(apex, 0.0).abs() < 1e-4);
+        assert!(altitude_at(apex, hang).abs() < 1e-4);
+        let mid = altitude_at(apex, hang / 2.0);
+        assert!((mid - apex).abs() < 1e-3, "midpoint height == apex: {mid} vs {apex}");
+        // monotone rise over the first half.
+        assert!(altitude_at(apex, hang * 0.25) < altitude_at(apex, hang * 0.5));
+        // longer passes loft higher (until the 9.0 cap).
+        assert!(lofted_apex_yds(30.0) > lofted_apex_yds(12.0));
+    }
+
+    #[test]
+    fn three_term_drag_decelerates_and_stops() {
+        // A rolling ball loses speed each tick and eventually snaps to rest.
+        let mut s = 18.0f32;
+        for _ in 0..200 {
+            s = ball_resistance_after(s, 0.0);
+        }
+        assert_eq!(s, 0.0, "a ground ball eventually stops, got {s}");
+        // Airborne relief: an aloft ball keeps more of its pace than a rolling one.
+        let ground = ball_resistance_after(20.0, 0.0);
+        let aloft = ball_resistance_after(20.0, 3.0);
+        assert!(aloft > ground, "airborne ball drags less: aloft {aloft} vs ground {ground}");
+    }
+
+    /// (b)(i) PASS-ARRIVAL CALIBRATION: for open-field targets 8/15/25 yd out,
+    /// the SOLVED launch speed, decayed by the ACTUAL per-tick 3-term drag,
+    /// brings the ball within ±2 yd of the target still capturable (< 26 yd/s)
+    /// — and inside a crisp multiple of the receiver-timed arrival window
+    /// (arriving ~2x late = the drag-vs-power mismatch that broke 4b084d26).
+    #[test]
+    fn ground_pass_solve_arrives_capturable_at_target() {
+        for &d in &[8.0f32, 15.0, 25.0] {
+            let v0 = ground_pass_launch_speed(d, 1.0); // open receiver
+            assert!(v0 > 3.0 && v0 <= 30.0, "d={d}: launch speed sane, got {v0}");
+            // Integrate exactly like step(): move, then decay (ground ball).
+            let mut v = v0;
+            let mut x = 0.0f32;
+            let mut arrived_at = None;
+            for tick in 1..=90 {
+                x += v * DT;
+                v = ball_resistance_after(v, 0.0);
+                if (x - d).abs() <= 2.0 && v < CAPTURE_MAX_BALL_SPEED {
+                    arrived_at = Some(tick as f32 * DT);
+                    break;
+                }
+                if v <= 0.0 {
+                    break;
+                }
+            }
+            let t =
+                arrived_at.unwrap_or_else(|| panic!("d={d}: ball never got capturable near target"));
+            let timed = (0.46 + d / 48.0).clamp(0.60, 2.0) * 1.08; // openness-1.0 window
+            assert!(
+                t <= timed * 1.5,
+                "d={d}: arrived at {t:.2}s vs receiver-timed {timed:.2}s (too late = under-hit)"
+            );
+        }
+    }
+
+    /// (b)(ii) A LOFTED ball is uncapturable at altitude by a standing
+    /// outfielder — even one teleported directly underneath it every tick —
+    /// and the intended receiver takes it on the DESCENT once the arc drops
+    /// back within reach.
+    #[test]
+    fn lofted_ball_overflies_reach_then_receiver_takes_descent() {
+        let mut w = World::new();
+        let mut rng = Rng::new(7);
+        // Park everyone away from the flight corridor (y=14, x in 13..29).
+        for i in 0..N {
+            w.a[i].pos = V2::new(4.0 + i as f32, 3.0);
+            w.a[i].vel = V2::default();
+            w.b[i].pos = V2::new(37.0 - i as f32, 25.0);
+            w.b[i].vel = V2::default();
+        }
+        let receiver = 2usize;
+        w.a[receiver].pos = V2::new(25.0, 14.0); // 12 yd along a 15 yd flight
+        // Launch a 15-yd loft by hand (the same state apply_on_ball+step set up).
+        let dist = 15.0f32;
+        w.owner = None;
+        w.pending_pass = Some(Owner {
+            team: Team::A,
+            idx: receiver,
+        });
+        w.last_touch = Some(Team::A);
+        w.last_kicker = None;
+        w.kick_timer = -1;
+        w.ball = V2::new(13.0, 14.0);
+        w.ball_aerial = true;
+        w.ball_apex = lofted_apex_yds(dist).max(LOFT_APEX_CLEAR_FLOOR);
+        w.ball_taloft = 0.0;
+        w.ball_z = 0.0;
+        let hang = hang_time(w.ball_apex);
+        w.ball_vel = V2::new(dist / hang * AERIAL_LAND_AT_TARGET_DRAG_COMP, 0.0);
+        let reach = (CONTROL_STANDING_REACH + 0.5 * CONTROL_AERIAL_JUMP_REACH)
+            .max(LOW_BALL_INTERCEPT_FLOOR); // uniform-skill outfielder = 2.7 yd
+        assert!(w.ball_apex > reach, "the arc must rise over a standing outfielder");
+        let mut overflew_defender = false;
+        let mut captured_airborne = false;
+        for _ in 0..(hang / DT) as usize + 8 {
+            let airborne_before = w.ball_aerial;
+            let z_next = altitude_at(w.ball_apex, w.ball_taloft + DT); // z the capture check will see
+            if airborne_before && z_next > reach {
+                // A standing outfielder DIRECTLY under the ball: still can't touch it.
+                w.b[1].pos = V2::new(w.ball.x, w.ball.y);
+                w.b[1].vel = V2::default();
+                overflew_defender = true;
+            } else if w.b[1].pos.y != 25.0 {
+                w.b[1].pos = V2::new(36.0, 25.0); // descent begins: defender walks away
+                w.b[1].vel = V2::default();
+            }
+            w.step(&stays(), &stays(), &mut rng);
+            if let Some(o) = w.owner {
+                assert!(
+                    z_next <= reach,
+                    "captured at altitude {z_next:.2} above reach {reach:.2}"
+                );
+                assert_eq!((o.team, o.idx), (Team::A, receiver), "receiver takes it");
+                captured_airborne = airborne_before;
+                break;
+            }
+        }
+        assert!(overflew_defender, "the arc actually overflew a defender");
+        assert!(
+            matches!(w.owner, Some(o) if o.team == Team::A && o.idx == receiver),
+            "the intended receiver ends up with the loft"
+        );
+        assert!(
+            captured_airborne,
+            "the receiver took the ball on the DESCENT (while still airborne), not after a roll-out"
+        );
+        assert!(w.ev_pass_completed_a, "the loft counts as a completed pass");
+    }
+
+    /// (b)(ii-guard) Requirement 6: a loft launched TOWARD the end line is
+    /// speed-capped so its gravity-fixed carry lands in bounds (never sails
+    /// over the goal line for a cheap goal-kick turnover).
+    #[test]
+    fn lofted_launch_speed_is_capped_to_land_in_bounds() {
+        let mut w = World::new();
+        let mut rng = Rng::new(11);
+        for i in 0..N {
+            w.a[i].pos = V2::new(4.0 + i as f32, 3.0);
+            w.a[i].vel = V2::default();
+            w.b[i].pos = V2::new(20.0 + i as f32, 26.0);
+            w.b[i].vel = V2::default();
+        }
+        // A loft from deep in the attacking half aimed at the end line: the
+        // uncapped land-at-target pace for a 15-yd target would carry to ~x=49
+        // out of a 42-yd pitch; the boundary cap must keep it on the field.
+        let origin = V2::new(34.0, 14.0);
+        let dir = V2::new(1.0, 0.0);
+        let apex = lofted_apex_yds(15.0).max(LOFT_APEX_CLEAR_FLOOR);
+        let hang = hang_time(apex);
+        let land_speed = (15.0 / hang) * AERIAL_LAND_AT_TARGET_DRAG_COMP;
+        let max_carry = carry_to_boundary(origin, dir);
+        let capped = land_speed.min(max_carry.max(2.0) / hang);
+        assert!(capped < land_speed, "the cap actually binds here");
+        w.owner = None;
+        w.pending_pass = None;
+        w.last_touch = Some(Team::A);
+        w.last_kicker = None;
+        w.kick_timer = -1;
+        w.ball = origin;
+        w.ball_aerial = true;
+        w.ball_apex = apex;
+        w.ball_taloft = 0.0;
+        w.ball_z = 0.0;
+        w.ball_vel = dir.scale(capped);
+        for _ in 0..(hang / DT) as usize + 6 {
+            w.step(&stays(), &stays(), &mut rng);
+            assert!(
+                w.ball.x < FIELD_L,
+                "capped loft must never cross the end line, got x={}",
+                w.ball.x
+            );
+            if !w.ball_aerial {
+                break;
+            }
+        }
+        assert!(!w.ball_aerial, "the loft landed in bounds");
+    }
+
+    /// Requirement 5: the probabilistic keeper save model fires ONLY on
+    /// shot-flagged balls — a lofted PASS crossing right in front of the goal
+    /// is not spuriously "saved" (no save event, no keeper catch).
+    #[test]
+    fn lofted_pass_near_goal_does_not_trigger_shot_save_model() {
+        let mut w = World::new();
+        let mut rng = Rng::new(13);
+        for i in 0..N {
+            w.a[i].pos = V2::new(6.0 + i as f32, 3.0);
+            w.a[i].vel = V2::default();
+            w.b[i].pos = V2::new(20.0 + i as f32, 26.0);
+            w.b[i].vel = V2::default();
+        }
+        let receiver = 3usize;
+        w.a[receiver].pos = V2::new(38.0, 23.0); // far-post runner, off the keeper
+        // A cross-ish loft that passes through the box in front of B's goal.
+        let origin = V2::new(26.0, 8.0);
+        let target = w.a[receiver].pos;
+        let dist = target.sub(origin).len();
+        w.owner = None;
+        w.pending_pass = Some(Owner {
+            team: Team::A,
+            idx: receiver,
+        });
+        w.last_touch = Some(Team::A);
+        w.last_kicker = None;
+        w.kick_timer = -1;
+        w.ball = origin;
+        w.ball_aerial = true;
+        w.ball_apex = lofted_apex_yds(dist).max(LOFT_APEX_CLEAR_FLOOR);
+        w.ball_taloft = 0.0;
+        w.ball_z = 0.0;
+        let hang = hang_time(w.ball_apex);
+        w.ball_vel = target.sub(origin).unit().scale(dist / hang * AERIAL_LAND_AT_TARGET_DRAG_COMP);
+        assert!(!w.a_shot_flag && !w.b_shot_flag, "a pass is never shot-flagged");
+        for _ in 0..(hang / DT) as usize + 10 {
+            w.step(&stays(), &stays(), &mut rng);
+            assert!(!w.ev_save_a && !w.ev_save_b, "no spurious keeper save on a pass");
+            if w.owner.is_some() {
+                break;
+            }
+        }
+        // And the keeper did not swallow the cross mid-box either.
+        if let Some(o) = w.owner {
+            assert!(
+                !(o.team == Team::B && o.idx == GK),
+                "B keeper must not claim a pass resolved by the save model"
+            );
+        }
+    }
+
+    /// (b)(iii) Same-seed determinism of a FULL scripted episode under the new
+    /// flight model: identical tick-by-tick world fingerprints, goals included.
+    #[test]
+    fn scripted_episode_is_seed_deterministic_tick_by_tick() {
+        let episode_fingerprint = |seed: u64| -> u64 {
+            let mut rng = Rng::new(seed);
+            let mut w = World::new();
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a over exact f32 bits
+            let mut mix = |v: u32| {
+                h ^= v as u64;
+                h = h.wrapping_mul(0x1000_0000_01b3);
+            };
+            for _ in 0..STEPS {
+                let aa = w.scripted_actions(Team::A);
+                let ab = w.scripted_actions(Team::B);
+                w.step(&aa, &ab, &mut rng);
+                mix(w.ball.x.to_bits());
+                mix(w.ball.y.to_bits());
+                mix(w.ball_z.to_bits());
+                mix(w.ball_vel.x.to_bits());
+                mix(w.ball_vel.y.to_bits());
+                mix(w.goals_a ^ (w.goals_b << 8));
+                mix(w.ball_aerial as u32);
+                for i in 0..N {
+                    mix(w.a[i].pos.x.to_bits());
+                    mix(w.a[i].pos.y.to_bits());
+                    mix(w.b[i].pos.x.to_bits());
+                    mix(w.b[i].pos.y.to_bits());
+                }
+            }
+            h
+        };
+        assert_eq!(
+            episode_fingerprint(20260713),
+            episode_fingerprint(20260713),
+            "same seed => bit-identical episode"
+        );
+        assert_ne!(
+            episode_fingerprint(20260713),
+            episode_fingerprint(20260714),
+            "different seed => different episode (the fingerprint is not degenerate)"
+        );
+    }
+
     fn arrange_return_pass_candidates(w: &mut World) {
         w.a[1].pos = V2::new(24.0, 14.0);
         w.a[2].pos = V2::new(30.0, 14.0);
