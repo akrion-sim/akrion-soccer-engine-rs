@@ -215,3 +215,10 @@ weight even though score-time influence is independently capped at `0.25`; this 
 maximum a likely scale artifact, not a calibrated preference. `scripts/run_forward_select_dose_ab.sh`
 therefore freezes the incumbent checkpoint and evaluates weights `0`, `0.05`, and `0.20` on one
 paired held-out field. This isolates the useful dose before changing the trainable update rule.
+
+The first fixed-dose field used weights `0`, `0.05`, and `0.20`. All three produced exactly
+the same 32 paired fixtures and diagnostics: payoff `0.406`, Elo delta `-48.5`, forward-pass
+margin `-0.50/game`, and Wilson lower bound `0.255`. Thus weights through `0.20` did not cross
+an action-ranking boundary on this checkpoint. The runner accepts `FORWARD_SELECT_WEIGHT_A`
+and `FORWARD_SELECT_WEIGHT_B` so the next bounded probe can test the range between this inert
+region and the saturated treatment without changing code or retraining the actor.
