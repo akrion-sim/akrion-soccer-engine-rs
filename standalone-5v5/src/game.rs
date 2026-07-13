@@ -1871,12 +1871,15 @@ impl World {
                         if self.ball_z > reach {
                             continue; // ball is above this player's reach — flies over
                         }
-                        if is_recv {
-                            let (_, recv_open) = self.nearest_opponent(team, receiver.pos);
-                            let space_needed = AERIAL_CONTROL_SPACE * (1.08 - 0.20 * aerial_skill);
-                            if recv_open < space_needed {
-                                continue; // receiver not open enough to control the loft yet
-                            }
+                        // Aerial touch needs SPACE — for ANY toucher, intended
+                        // receiver and interceptor alike (a contested dropping
+                        // ball is controlled by nobody midair; it lands at the
+                        // aim point and becomes a normal ground scramble, where
+                        // the intended receiver keeps its anticipation edge).
+                        let (_, open) = self.nearest_opponent(team, receiver.pos);
+                        let space_needed = AERIAL_CONTROL_SPACE * (1.08 - 0.20 * aerial_skill);
+                        if open < space_needed {
+                            continue; // not open enough to control the loft midair
                         }
                     }
                     let touch_radius_bonus = (touch - 0.5) * 0.55;
