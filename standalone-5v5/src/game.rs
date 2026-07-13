@@ -1267,6 +1267,7 @@ impl World {
 
         // 4. Advance a free ball + friction, walls, goals, capture.
         if self.owner.is_none() {
+            let prev_ball = self.ball;
             self.ball = self.ball.add(self.ball_vel.scale(DT));
             if self.ball_vel.len() > 4.0 {
                 self.ball_vel = self.ball_vel.add(self.ball_curl.scale(DT));
