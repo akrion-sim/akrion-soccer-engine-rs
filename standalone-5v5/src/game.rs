@@ -3243,6 +3243,59 @@ mod tests {
         assert!(w.ev_pass_completed_a, "the loft counts as a completed pass");
     }
 
+    /// A STATIONARY receiver (a learning policy cannot be assumed to chase the
+    /// ball down the way the scripted baseline does) must still receive a
+    /// forward led pass despite the execution dither — the into-space lead may
+    /// only run ahead of receivers who are actually moving. This exact
+    /// coupling (lead at the receive-radius edge + dither) starved the RL
+    /// smoke of completed forward passes when it regressed.
+    #[test]
+    fn led_forward_pass_connects_with_a_stationary_receiver() {
+        for seed in 1..=20u64 {
+            let mut w = World::new();
+            let mut rng = Rng::new(seed);
+            for i in 0..N {
+                w.a[i].pos = V2::new(6.0, 3.0 + 2.0 * i as f32); // parked deep
+                w.a[i].vel = V2::default();
+                w.b[i].pos = V2::new(38.0, 3.0 + 2.0 * i as f32); // parked far, off the lane
+                w.b[i].vel = V2::default();
+            }
+            let passer = 1usize;
+            let receiver = 2usize;
+            w.a[passer].pos = V2::new(10.0, 14.0);
+            w.a[receiver].pos = V2::new(24.0, 14.0); // 14 yd straight ahead, wide open, STILL
+            w.owner = Some(Owner {
+                team: Team::A,
+                idx: passer,
+            });
+            w.ball = w.a[passer].pos;
+            let cands = w.pass_candidates(Team::A, passer);
+            let slot = cands
+                .iter()
+                .position(|c| matches!(c, Some((ti, _)) if *ti == receiver))
+                .expect("stationary receiver must be rankable");
+            let mut first = [A_STAY; N];
+            first[passer] = A_PASS_A + slot;
+            let mut captured = false;
+            for t in 0..60 {
+                let aa = if t == 0 { first } else { [A_STAY; N] };
+                w.step(&aa, &stays(), &mut rng);
+                if let Some(o) = w.owner {
+                    assert!(
+                        o.team == Team::A && o.idx == receiver,
+                        "seed {seed}: wrong catcher (team A? {} idx {})",
+                        o.team == Team::A,
+                        o.idx
+                    );
+                    captured = true;
+                    break;
+                }
+            }
+            assert!(captured, "seed {seed}: pass to a stationary receiver never arrived");
+            assert!(w.ev_pass_completed_a, "seed {seed}: completion event fires");
+        }
+    }
+
     /// (b)(ii-guard) Requirement 6: a loft launched TOWARD the end line is
     /// speed-capped so its gravity-fixed carry lands in bounds (never sails
     /// over the goal line for a cheap goal-kick turnover).
