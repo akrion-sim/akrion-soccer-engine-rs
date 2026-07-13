@@ -5735,6 +5735,17 @@ const MAX_SOCCER_NEURAL_SNAPSHOT_EVERY_BATCHES: usize = 4096;
 const SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK: f64 = 0.98;
 const SOCCER_FULL_GAME_RETURN_BLEND: f64 = 0.35;
 const SOCCER_FULL_GAME_RETURN_CLIP: f64 = 400.0;
+/// Return clip must clear the anchor magnitudes: a ±1000 win label plus a few
+/// ±500 goals would be silently flattened by the historical ±400 rail —
+/// exactly the class of "knob never reaches training" bug the anchored mode
+/// exists to fix. Anchored ⇒ ±4000 (2·WIN + 4·GOAL of headroom).
+fn soccer_full_game_return_clip() -> f64 {
+    if anchored_rewards_enabled() {
+        4_000.0
+    } else {
+        SOCCER_FULL_GAME_RETURN_CLIP
+    }
+}
 const DD_SOCCER_OUTCOME_CREDIT_ENV: &str = "DD_SOCCER_OUTCOME_CREDIT";
 const DD_SOCCER_MATCH_OUTCOME_REWARD_ENV: &str = "DD_SOCCER_ENABLE_MATCH_OUTCOME_REWARD";
 const SOCCER_OUTCOME_CREDIT_MILESTONE_REWARD_CAP: f64 = GOAL_REWARD_POINTS;
