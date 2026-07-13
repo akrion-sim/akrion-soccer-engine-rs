@@ -1343,8 +1343,20 @@ impl World {
     fn try_capture(&mut self) {
         let ball_fast = self.ball_vel.len() > CAPTURE_MAX_BALL_SPEED;
         let mut best: Option<(Owner, f32)> = None;
-        // Keepers first: they can smother/save even fast shots within reach.
+        // Keepers first: they can smother/save even fast shots within reach —
+        // EXCEPT a flagged shot still flying at their own goal: that ball is
+        // resolved by the probabilistic save model (resolve_keeper_shot_save),
+        // not by geometric reach. Once the shot dies down (or is parried) it is
+        // an ordinary loose ball again and reach capture applies as before.
         for team in [Team::A, Team::B] {
+            let incoming_shot = self.ball_vel.len() > 2.0
+                && match team {
+                    Team::B => self.a_shot_flag && self.ball_vel.x > 0.0,
+                    Team::A => self.b_shot_flag && self.ball_vel.x < 0.0,
+                };
+            if incoming_shot {
+                continue;
+            }
             if self.kick_timer > 0 {
                 if let Some(lk) = self.last_kicker {
                     if lk.team == team && lk.idx == GK {
