@@ -3402,6 +3402,16 @@ mod tests {
             for _ in 0..STEPS {
                 let aa = w.scripted_actions(Team::A);
                 let ab = w.scripted_actions(Team::B);
+                if let Some(o) = w.owner {
+                    let acts = if o.team == Team::A { &aa } else { &ab };
+                    if o.idx != GK && acts[o.idx] % NA == A_SHOOT {
+                        if o.team == Team::A {
+                            shots_a += 1;
+                        } else {
+                            shots_b += 1;
+                        }
+                    }
+                }
                 w.step(&aa, &ab, &mut rng);
                 saves_a += w.ev_save_a as u32;
                 saves_b += w.ev_save_b as u32;
