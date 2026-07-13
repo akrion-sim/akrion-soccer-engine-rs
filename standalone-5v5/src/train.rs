@@ -622,7 +622,8 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
                 (0.50 + 0.50 * post_field.safe_outlet_value + 0.25 * post_field.burst_score)
                     .clamp(0.35, 1.25);
             r += rw().pass_credit * field_pass
-                + (w.last_pass_gain_a.max(0.0) * 0.1 * field_progress).min(0.8);
+                + (w.last_pass_gain_a.max(0.0) * PASS_PROGRESS_PER_YARD * field_progress)
+                    .min(PASS_PROGRESS_CAP);
             r += rw().field_pass
                 * FieldRewardContext::delta(
                     post_field.safe_outlet_value,
