@@ -16,17 +16,18 @@
 //! [`TournamentMatchRunner`]), ranks with FIFA-style tiebreakers, folds the
 //! knockout bracket, and reports the champion. The real runner that drives the
 //! 2D [`SoccerMatch`] with genuine per-team neural brains lives at the bottom
-//! ([`EngineMatchRunner`]); a deterministic [`StrengthMatchRunner`] backs the
-//! tests and quick what-ifs.
+//! ([`EngineMatchRunner`]); a deterministic test-only runner backs unit tests.
 //!
 //! Everything is seeded and deterministic: the same teams + seed + runner
 //! always produce the same bracket and champion.
 
 use crate::des::general::soccer::{
-    learned_mpc_objective_enabled, MatchConfig, MatchStats, MatchSummary, MpcObjectiveSample,
+    learned_mpc_objective_enabled, MatchConfig, MatchSummary, MpcObjectiveSample,
     SoccerMatch, SoccerMpcObjectiveHead, SoccerNeuralLearningBackend, SoccerNeuralNetworkSnapshot,
     SoccerQPolicy, SoccerQPolicyOptions, SoccerQTargetEntry, SoccerTeamQPolicies, Team,
 };
+#[cfg(test)]
+use crate::des::general::soccer::MatchStats;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -355,6 +356,7 @@ impl MatchOutcome {
     }
 }
 
+#[cfg(test)]
 fn score_only_summary(home_goals: u32, away_goals: u32) -> MatchSummary {
     MatchSummary {
         score_home: home_goals,
@@ -365,8 +367,8 @@ fn score_only_summary(home_goals: u32, away_goals: u32) -> MatchSummary {
     }
 }
 
-/// Plays a single match. Implementations range from the deterministic
-/// [`StrengthMatchRunner`] (tests) to the full [`EngineMatchRunner`] (real sim).
+/// Plays a single match. Production callers use [`EngineMatchRunner`]; tests may
+/// supply deterministic runners to isolate orchestration behavior.
 pub trait TournamentMatchRunner {
     fn play(
         &mut self,
@@ -1338,18 +1340,21 @@ fn head_to_head_goals_for(
 }
 
 // ---------------------------------------------------------------------------
-// Deterministic stub runner (tests + quick what-ifs)
+// Deterministic test runner
 // ---------------------------------------------------------------------------
 
 /// A runner that decides matches from a fixed per-team "strength" derived from
 /// the team seed, with a seeded jitter so upsets happen. It performs no real
-/// simulation and returns brains unchanged — ideal for exercising the bracket,
-/// standings, tiebreakers, and champion logic deterministically.
+/// simulation and is therefore deliberately unavailable in production builds.
+/// Runtime callers must use [`EngineMatchRunner`], while unit tests can exercise
+/// bracket, standings, tiebreaker, and champion logic deterministically here.
+#[cfg(test)]
 #[derive(Clone)]
 pub struct StrengthMatchRunner {
     strengths: HashMap<usize, f64>,
 }
 
+#[cfg(test)]
 impl StrengthMatchRunner {
     /// Strength in `[0,1]` from each team's seed (stable, well-spread).
     pub fn from_teams(teams: &[TournamentTeam]) -> Self {
@@ -1368,6 +1373,7 @@ impl StrengthMatchRunner {
     }
 }
 
+#[cfg(test)]
 impl TournamentMatchRunner for StrengthMatchRunner {
     fn play(
         &mut self,
@@ -1407,6 +1413,7 @@ impl TournamentMatchRunner for StrengthMatchRunner {
     }
 }
 
+#[cfg(test)]
 fn advanced_brain(brain: &TeamBrain, learned: bool) -> TeamBrain {
     let mut next = brain.clone();
     if learned {

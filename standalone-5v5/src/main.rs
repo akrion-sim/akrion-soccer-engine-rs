@@ -212,23 +212,36 @@ fn parse_run_config(args: &[String]) -> AppResult<RunConfig> {
     Ok(cfg)
 }
 
-fn env_usize_clamped(name: &str, default: usize, min: usize, max: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .map(|value| value.clamp(min, max))
-        .unwrap_or(default.clamp(min, max))
+fn env_usize_clamped(name: &str, default: usize, min: usize, max: usize) -> AppResult<usize> {
+    let fallback = default.clamp(min, max);
+    let Some(raw) = std::env::var_os(name) else {
+        return Ok(fallback);
+    };
+    let raw = raw
+        .into_string()
+        .map_err(|_| format!("{name} must contain valid UTF-8"))?;
+    let value = raw
+        .parse::<usize>()
+        .map_err(|_| format!("invalid {name}={raw:?}: expected an integer in {min}..={max}"))?;
+    Ok(value.clamp(min, max))
 }
 
-fn env_f32_clamped(name: &str, default: f32, min: f32, max: f32) -> f32 {
+fn env_f32_clamped(name: &str, default: f32, min: f32, max: f32) -> AppResult<f32> {
     let lo = min.min(max);
     let hi = min.max(max);
-    std::env::var(name)
-        .ok()
-        .and_then(|s| s.parse::<f32>().ok())
-        .filter(|value| value.is_finite())
-        .map(|value| value.clamp(lo, hi))
-        .unwrap_or(default.clamp(lo, hi))
+    let Some(raw) = std::env::var_os(name) else {
+        return Ok(default.clamp(lo, hi));
+    };
+    let raw = raw
+        .into_string()
+        .map_err(|_| format!("{name} must contain valid UTF-8"))?;
+    let value = raw
+        .parse::<f32>()
+        .map_err(|_| format!("invalid {name}={raw:?}: expected a number in {lo}..={hi}"))?;
+    if !value.is_finite() {
+        return Err(format!("invalid {name}={raw:?}: value must be finite").into());
+    }
+    Ok(value.clamp(lo, hi))
 }
 
 /// Load the trained policy from `out_dir` and record ONE fresh match (viz JSON)
@@ -565,8 +578,10 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
     let champ_dir = cfg.out_dir.join("champions");
     fs::create_dir_all(&champ_dir)?;
 
-    let generations = env_usize_clamped("GENERATIONS", 12, 1, SELFPLAY_MAX_GENERATIONS);
-    let promote_margin = env_f32_clamped("PROMOTE_MARGIN", 0.25, -20.0, 20.0);
+    // Merge: keep main's hardened Result-returning parse (propagated with `?`)
+    // AND the 5v5 anti-drift knobs — the new knobs adopt the `?` signature too.
+    let generations = env_usize_clamped("GENERATIONS", 12, 1, SELFPLAY_MAX_GENERATIONS)?;
+    let promote_margin = env_f32_clamped("PROMOTE_MARGIN", 0.25, -20.0, 20.0)?;
     // ANTI-DRIFT (mirrors the 11v11 league+analytic anchor). Pure latest-champion
     // self-play drifts into rock-paper-scissors cycles: the challenger beats the
     // champion while its ABSOLUTE skill (vs the fixed scripted baseline) collapses.
@@ -574,14 +589,14 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
     // (every Nth iter) so absolute skill stays anchored; (2) require a promoted
     // policy to ALSO not regress vs scripted (>= floor), so a champion never scores
     // worse than the baseline it is supposed to have surpassed.
-    let anchor_every = env_usize_clamped("SCRIPTED_ANCHOR_EVERY", 3, 1, 100_000);
-    let scripted_floor = env_f32_clamped("SCRIPTED_FLOOR", 0.0, -20.0, 20.0);
+    let anchor_every = env_usize_clamped("SCRIPTED_ANCHOR_EVERY", 3, 1, 100_000)?;
+    let scripted_floor = env_f32_clamped("SCRIPTED_FLOOR", 0.0, -20.0, 20.0)?;
     let speed_warmup = env_usize_clamped(
         "SPEED_WARMUP",
         (cfg.iters / 2).max(1),
         0,
         SELFPLAY_MAX_SPEED_WARMUP,
-    );
+    )?;
 
     // Challenger: warm-start by behavior-cloning the scripted baseline so gen-0 play
     // is coherent (not random flailing); it then improves purely via self-play.
@@ -762,10 +777,12 @@ fn run_training(cfg: &RunConfig) -> AppResult<()> {
 
     // Speed-warmup curriculum: fix the gear (v3 behavior) for the first stretch so
     // the action policy learns to attack before the speed policy adds variability.
-    let speed_warmup = std::env::var("SPEED_WARMUP")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| (cfg.iters / 2).clamp(1, 300));
+    let speed_warmup = env_usize_clamped(
+        "SPEED_WARMUP",
+        (cfg.iters / 2).clamp(1, 300),
+        0,
+        SELFPLAY_MAX_SPEED_WARMUP,
+    )?;
     for it in 1..=cfg.iters {
         train::set_speed_frozen(it <= speed_warmup);
         let beta = train::ent_beta_at(it, cfg.iters);

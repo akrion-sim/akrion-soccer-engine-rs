@@ -30,46 +30,65 @@ use soccer_engine::des::general::soccer::{
 use soccer_engine::des::general::soccer_eval_gate::wilson_lower_bound;
 
 fn env_bool(name: &str, default: bool) -> bool {
-    std::env::var(name)
-        .ok()
-        .map(|raw| matches!(raw.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
-        .unwrap_or(default)
+    let Ok(raw) = std::env::var(name) else {
+        return default;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
+        _ => {
+            eprintln!("warning: invalid {name}={raw:?}; using default {default}");
+            default
+        }
+    }
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|raw| raw.trim().parse().ok())
-        .unwrap_or(default)
+    let Ok(raw) = std::env::var(name) else {
+        return default;
+    };
+    raw.trim().parse().unwrap_or_else(|_| {
+        eprintln!("warning: invalid {name}={raw:?}; using default {default}");
+        default
+    })
 }
 
 fn env_usize_any(names: &[&str], default: usize) -> usize {
     names
         .iter()
-        .find_map(|name| {
-            std::env::var(name)
-                .ok()
-                .and_then(|raw| raw.trim().parse().ok())
+        .find_map(|name| std::env::var(name).ok().map(|raw| (name, raw)))
+        .map(|(name, raw)| {
+            raw.trim().parse().unwrap_or_else(|_| {
+                eprintln!("warning: invalid {name}={raw:?}; using default {default}");
+                default
+            })
         })
         .unwrap_or(default)
 }
 
 fn env_f64(name: &str, default: f64) -> f64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<f64>().ok())
-        .filter(|value| value.is_finite())
-        .unwrap_or(default)
+    let Ok(raw) = std::env::var(name) else {
+        return default;
+    };
+    match raw.trim().parse::<f64>() {
+        Ok(value) if value.is_finite() => value,
+        _ => {
+            eprintln!("warning: invalid {name}={raw:?}; using default {default}");
+            default
+        }
+    }
 }
 
 fn env_f64_any(names: &[&str], default: f64) -> f64 {
     names
         .iter()
-        .find_map(|name| {
-            std::env::var(name)
-                .ok()
-                .and_then(|raw| raw.trim().parse::<f64>().ok())
-                .filter(|value| value.is_finite())
+        .find_map(|name| std::env::var(name).ok().map(|raw| (name, raw)))
+        .map(|(name, raw)| match raw.trim().parse::<f64>() {
+            Ok(value) if value.is_finite() => value,
+            _ => {
+                eprintln!("warning: invalid {name}={raw:?}; using default {default}");
+                default
+            }
         })
         .unwrap_or(default)
 }
