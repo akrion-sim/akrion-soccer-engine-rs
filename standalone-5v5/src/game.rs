@@ -2453,6 +2453,22 @@ mod tests {
     }
 
     #[test]
+    fn axis_convention_is_x_width_y_length() {
+        // The 11v11 convention: x = field WIDTH [0,FIELD_W], y = field LENGTH [0,FIELD_L].
+        // Goals sit at the length ends (y=0 / y=FIELD_L), centered on the width (x=FIELD_W/2).
+        let ga = Team::A.target_goal();
+        assert!((ga.x - FIELD_W / 2.0).abs() < 1e-6, "goal centered on width: x={}", ga.x);
+        assert!((ga.y - FIELD_L).abs() < 1e-6, "A attacks the far length line: y={}", ga.y);
+        let gb = Team::B.target_goal();
+        assert!((gb.x - FIELD_W / 2.0).abs() < 1e-6 && gb.y.abs() < 1e-6, "B attacks y=0");
+        // Field is longer than it is wide, and length lives on y.
+        assert!(FIELD_L > FIELD_W);
+        // Attack sign drives the length (y) axis: A forward = +y.
+        assert_eq!(Team::A.sx(), 1.0);
+        assert_eq!(Team::B.sx(), -1.0);
+    }
+
+    #[test]
     fn dead_ball_restarts_assign_the_right_team() {
         // Throw-in goes to the team that did NOT put it out; the ball is parked (no velocity).
         let mut w = World::new();
