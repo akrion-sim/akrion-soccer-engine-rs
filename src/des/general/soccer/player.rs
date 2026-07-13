@@ -13944,7 +13944,20 @@ impl PlayerAgent {
                 let learned_label = learned_mpc_action_label_key(&plan.action);
                 let power = learned_discretized_kick_power_for_action_label(&plan.action)
                     .unwrap_or_else(|| shot_power_for_skill(ability01(self.skills.shooting)));
-                Some((SoccerAction::Shoot { power }, learned_label))
+                Some((
+                    SoccerAction::Shoot {
+                        power,
+                        // ACTOR-OWNED SHOT PLACEMENT (default-OFF): carry the plan's chosen
+                        // goal-mouth aim into the action so execution honors it instead of
+                        // discarding it and re-defaulting to goal-centre. Off ⇒ None ⇒ identical.
+                        target_point: if dd_soccer_enable_actor_shot_placement() {
+                            plan.target_point
+                        } else {
+                            None
+                        },
+                    },
+                    learned_label,
+                ))
             }
             "wall-pass" if observation.has_ball => {
                 snapshot.wall_pass_option_for(self.id).map(|plan| {
@@ -14382,7 +14395,20 @@ impl PlayerAgent {
                 } else {
                     label.to_string()
                 };
-                Some((SoccerAction::Shoot { power }, learned_label))
+                Some((
+                    SoccerAction::Shoot {
+                        power,
+                        // ACTOR-OWNED SHOT PLACEMENT (default-OFF): carry the plan's chosen
+                        // goal-mouth aim into the action so execution honors it instead of
+                        // discarding it and re-defaulting to goal-centre. Off ⇒ None ⇒ identical.
+                        target_point: if dd_soccer_enable_actor_shot_placement() {
+                            plan.target_point
+                        } else {
+                            None
+                        },
+                    },
+                    learned_label,
+                ))
             }
             "first-time-pass" if observation.has_ball && observation.first_touch_available => {
                 let visible = snapshot.ranked_visible_pass_targets(self.id, 11);
