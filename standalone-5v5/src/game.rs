@@ -2178,32 +2178,44 @@ impl World {
                 let cands = self.pass_candidates(team, idx);
                 let pick = cands[a - A_PASS_A];
                 if let Some((ti, _)) = pick {
-                    // PASS-TARGETING SOLVE (11v11 parity): aim ahead of the
-                    // receiver's run, then pace the ball so it ARRIVES there.
                     let tp = players(team, self)[ti].pos;
-                    let lead = self.led_pass_target(team, idx, ti);
+                    // Aim. PARITY: the receiver-lead solve (velocity lead +
+                    // motion-earned into-space lead). LEGACY: a fixed +2 yd
+                    // upfield nudge (validated behavior, kept exactly).
+                    let lead = if self.parity_flight {
+                        self.led_pass_target(team, idx, ti)
+                    } else {
+                        tp.add(V2::new(sx * 2.0, 0.0))
+                    };
                     self.intended_receiver = Some(Owner { team, idx: ti });
-                    let pass_dist = lead.sub(me).len().max(0.1);
-                    let (_, recv_open) = self.nearest_opponent(team, tp);
-                    let openness = (recv_open / TEAMMATE_GOOD_SPACE).clamp(0.0, 1.0);
-                    // LOFTED pass — LONG balls only: if a defender blocks the
-                    // GROUND lane to a far target, lift the ball OVER them on a
-                    // gravity-timed arc that comes down AT the receiver —
-                    // land-at-target pacing `d / hang_time × 1.08` (drag
-                    // compensation), capped so the gravity-fixed carry cannot
-                    // land out of bounds. Short blocked lanes stay on the floor:
-                    // a low arc never rises over anyone's reach, so the solve
-                    // zips those through traffic instead. Aerial control takes
-                    // time, so the loft only completes if the receiver is open
-                    // (checked at reception) — else it lands loose.
                     let ground_lane = self.lane_clearness(team, me, tp);
-                    if ground_lane < 0.55 && pass_dist >= LOFT_MIN_DISTANCE {
+                    if self.parity_flight {
+                        // CHIP over a blocked ground lane: a gravity-timed arc
+                        // that comes down AT the receiver — land-at-target
+                        // pacing `d / hang_time × 1.08` (drag compensation),
+                        // apex floored to clear an upright defender, capped so
+                        // the gravity-fixed carry cannot land out of bounds.
+                        // Aerial control takes time, so the chip only completes
+                        // if the receiver is open at reception — else it lands
+                        // loose at the aim point and becomes a ground scramble.
+                        let pass_dist = lead.sub(me).len().max(0.1);
+                        if ground_lane < 0.55 && pass_dist >= LOFT_MIN_DISTANCE {
+                            self.pending_aerial = true;
+                            self.pending_apex =
+                                lofted_apex_yds(pass_dist).max(LOFT_APEX_CLEAR_FLOOR);
+                            let hang = hang_time(self.pending_apex).max(0.35);
+                            let land_speed =
+                                (pass_dist / hang) * AERIAL_LAND_AT_TARGET_DRAG_COMP;
+                            let max_carry = carry_to_boundary(me, lead.sub(me).unit());
+                            self.pending_aerial_speed =
+                                land_speed.min(max_carry.max(2.0) / hang);
+                        }
+                    } else if ground_lane < 0.55 {
+                        // Legacy SCOOP: lift over the blocked ground lane for a
+                        // fixed tick budget; only the receiver can bring it down.
                         self.pending_aerial = true;
-                        self.pending_apex = lofted_apex_yds(pass_dist).max(LOFT_APEX_CLEAR_FLOOR);
-                        let hang = hang_time(self.pending_apex).max(0.35);
-                        let land_speed = (pass_dist / hang) * AERIAL_LAND_AT_TARGET_DRAG_COMP;
-                        let max_carry = carry_to_boundary(me, lead.sub(me).unit());
-                        self.pending_aerial_speed = land_speed.min(max_carry.max(2.0) / hang);
+                        let flight = (tp.sub(me).len() / (PASS_SPEED * DT)).round() as u32;
+                        self.pending_air_ticks = flight.clamp(3, 30);
                     }
                     self.set_vel(team, idx, V2::default());
                     if team == Team::A {
