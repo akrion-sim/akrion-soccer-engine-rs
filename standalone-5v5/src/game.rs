@@ -434,6 +434,8 @@ pub struct World {
     pub ev_bad_pass_turnover_a: bool, // Team A pass was intercepted or captured by B
     pub ev_dribble_turnover_a: bool,  // Team A carrier was tackled while dribbling/carrying
     pub ev_shot_on_a: bool,           // Team A took a shot on target
+    pub ev_save_a: bool,              // Team A's shot was SAVED by B's keeper (caught or parried)
+    pub ev_save_b: bool,              // Team B's shot was SAVED by A's keeper
     pub ev_win_ball_a: bool,          // Team A won possession off Team B (interception/tackle)
     pub ev_pass_attempt_a: bool,      // Team A attempted a pass this tick
     pub pass_dir_a: i32,              // direction of that pass: 1 forward, 0 lateral, -1 backward
