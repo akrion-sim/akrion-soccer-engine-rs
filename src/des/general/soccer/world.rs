@@ -20862,7 +20862,13 @@ impl SoccerMatch {
             flight,
             candidates,
         );
-        let raw_receipt_threshold = learned_mpc_replan_thresholds().pass_impossible_probability;
+        // The pass reject bar, context-dependent when the reject-threshold model is on,
+        // else the family base constant (byte-identical).
+        let raw_receipt_threshold = snapshot.learned_mpc_reject_threshold(
+            player_id,
+            MpcRejectFamily::Pass,
+            mpc_reject_base_threshold(MpcRejectFamily::Pass),
+        );
         let net_forward_quality_threshold =
             learned_pass_receiver_min_net_forward_quality().max(raw_receipt_threshold);
         let acceptance_probability = |target_player: Option<usize>,
