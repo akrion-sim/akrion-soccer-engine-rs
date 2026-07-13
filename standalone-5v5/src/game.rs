@@ -2928,7 +2928,55 @@ impl World {
 mod tests {
     use super::*;
 
-    /// TEMP diagnostic: flavor-split (ground vs lofted) scripted pass completion.
+    /// MEASUREMENT probe (run explicitly with --ignored --nocapture): per-tick
+    /// arrival calibration of the two pass solves against the live drag —
+    /// distance covered at the receiver-timed window (ground) and landing
+    /// carry vs target (loft). The empirical check behind the ±10%/±15% gates.
+    #[test]
+    #[ignore]
+    fn arrival_calibration_probe() {
+        for &d in &[8.0f32, 15.0, 25.0] {
+            let v0 = ground_pass_launch_speed(d, 1.0);
+            let timed = (0.46 + d / 48.0).clamp(0.60, 2.0) * 1.08;
+            let ticks = ((timed / DT).ceil() as u32).clamp(1, 60);
+            let covered = ground_carry_after_ticks(v0, ticks);
+            // first tick the ball is within the receiver's 2.8yd radius of target
+            let (mut v, mut x, mut t_arrive) = (v0, 0.0f32, f32::NAN);
+            for tick in 1..=90 {
+                x += v * DT;
+                v = ball_resistance_after(v, 0.0);
+                if (x - d).abs() <= 2.8 && t_arrive.is_nan() {
+                    t_arrive = tick as f32 * DT;
+                }
+                if v <= 0.0 {
+                    break;
+                }
+            }
+            println!(
+                "ground d={d:>4.1}: v0={v0:5.2} covered@T={covered:5.2} ({:+5.1}%)  t_in_recv_radius={t_arrive:.2}s (T={timed:.2}s)  total_carry={x:5.2}",
+                100.0 * (covered - d) / d
+            );
+        }
+        for &d in &[12.0f32, 15.0, 25.0] {
+            let apex = lofted_apex_yds(d).max(LOFT_APEX_CLEAR_FLOOR);
+            let hang = hang_time(apex).max(0.35);
+            let v0 = d / hang * AERIAL_LAND_AT_TARGET_DRAG_COMP;
+            // integrate the aerial flight (relief drag + parabola) to landing
+            let (mut v, mut x, mut taloft) = (v0, 0.0f32, 0.0f32);
+            while taloft < hang {
+                x += v * DT;
+                taloft += DT;
+                let z = altitude_at(apex, taloft);
+                v = ball_resistance_after(v, z);
+            }
+            println!(
+                "loft   d={d:>4.1}: apex={apex:4.2} hang={hang:4.2}s v0={v0:5.2} landing_carry={x:5.2} ({:+5.1}%)",
+                100.0 * (x - d) / d
+            );
+        }
+    }
+
+    /// MEASUREMENT probe: flavor-split (ground vs lofted) scripted pass completion.
     #[test]
     #[ignore]
     fn pass_flavor_probe() {
