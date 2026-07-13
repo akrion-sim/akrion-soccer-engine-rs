@@ -2244,6 +2244,11 @@ impl World {
         f.push(matches!(self.owner, Some(o) if matches!(o.team, Team::A)) as u8 as f32);
         f.push(matches!(self.owner, Some(o) if matches!(o.team, Team::B)) as u8 as f32);
         f.push(self.owner.is_none() as u8 as f32);
+        // duel tri-state (A's perspective): contested + favor — the critic
+        // sees the same possession/dispossession/50-50 state the actors do.
+        let (contested, favor, _) = self.duel_state(Team::A, 0);
+        f.push(contested);
+        f.push(favor);
         f.push(1.0); // bias
         f.try_into().unwrap()
     }
