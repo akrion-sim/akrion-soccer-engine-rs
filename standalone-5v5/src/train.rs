@@ -151,12 +151,10 @@ fn dribble_field_context(ball_x: f32) -> f32 {
 }
 
 pub struct Rw {
-    pub goal: f32,                 // +goal scored
-    pub concede: f32,              // -goal conceded (stored positive, subtracted)
-    pub match_win: f32,            // terminal reward for winning the completed episode
-    pub match_loss: f32,           // terminal penalty magnitude for losing the episode
-    pub shot_base: f32,            // shot-on-goal base (earned, from opponent half after 2 passes)
-    pub shot_q: f32,               // shot-on-goal chance-quality bonus
+    // Anchors (win/goal/shot-floor) are consts above, not fields — see
+    // docs/reward-anchoring.md. Everything here is a discoverable weight with
+    // sane bounds, in POINTS (currency: goal = 500).
+    pub shot_span: f32,            // on-frame shot placement span inside [floor, cap(x)]
     pub milestone: f32,            // completing the 2nd pass (unlocks the shot)
     pub pass_credit: f32,          // flat credit for a completed pass
     pub turnover: f32,             // -turnover (stored positive, subtracted)
