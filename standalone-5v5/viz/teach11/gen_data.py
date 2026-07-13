@@ -33,36 +33,40 @@ RNG = np.random.default_rng(20260712)
 # Architecture + scale (the 11-a-side engine)
 # ─────────────────────────────────────────────────────────────────────────────
 ARCH = {
-    "feature_dim": 210,            # CONFIG_FEATURE_DIM (V1=142, V2=164, now 210)
+    "feature_dim": 476,            # SOCCER_NEURAL_FEATURE_DIM — the actual egocentric policy obs
+    "config_dim": 210,             # CONFIG_FEATURE_DIM — the mirror/permutation-invariant retrieval vector
+    "embedding_dim": 256,          # SOCCER_MOMENT_EMBEDDING_DIM — pgvector width for moment kNN
     "hidden": [128, 128],          # local baseline hidden width (fix-plateau.md)
     "players_per_team": 11,
-    "field": [105, 68],            # full pitch (yards-ish)
-    "hz": 20, "ticks_per_episode": 600,
-    "moment_embedding_dim": 16,    # SOCCER_MOMENT_EMBEDDING_DIM (approx; refined from source)
+    "field": [120, 80],            # DEFAULT_FIELD_LENGTH/WIDTH_YARDS
+    "goal_width": 8, "hz": 15, "half_seconds": 120,
 }
 
-# 210-dim feature layout (grouped). Actor-relative canonical coords; keeps
-# position/velocity/ACCELERATION/JERK; relational set-encoding over 22 players.
-# (Groups refined against src/des/general/soccer/config_vector.rs.)
+# ~476-dim EGOCENTRIC neural policy observation (soccer.rs:4472-4762). Actor-relative;
+# an append-only stack of blocks, each grouped here into readable clusters.
 FEATURE_GROUPS = [
-    {"name": "self kinematics",   "n": 12, "color": "--accent",
-     "desc": "own pos, velocity, acceleration & jerk in actor-relative frame"},
-    {"name": "ball state",        "n": 10, "color": "--ball",
-     "desc": "ball pos, velocity, acceleration, height, possession distance"},
-    {"name": "teammates ×10",     "n": 70, "color": "--teamA",
-     "desc": "10 teammates, set-encoded: rel pos/vel/accel, role, openness"},
-    {"name": "opponents ×11",     "n": 66, "color": "--teamB",
-     "desc": "11 opponents, set-encoded: rel pos/vel, pressure, marking"},
-    {"name": "team shape / role", "n": 18, "color": "--violet",
-     "desc": "formation slot, line height, compactness, phase, territory"},
-    {"name": "possession context","n": 12, "color": "--good",
-     "desc": "who owns it, pass-streak, danger, xT/EPV of the current cell"},
-    {"name": "fatigue belief",    "n": 8,  "color": "--gold",
-     "desc": "HIDDEN state — a belief over each teammate's stamina (POMDP)"},
-    {"name": "pass-completion",   "n": 12, "color": "--accent",
-     "desc": "learned pass-completion features for the ranked outlets"},
-    {"name": "moment embedding",  "n": 2,  "color": "--ink-dim",
-     "desc": "retrieved tactical-moment embedding (cosine kNN) + bias"},
+    {"name": "egocentric base",   "n": 192, "color": "--accent",
+     "desc": "self + relational teammates/opponents/ball in the actor's own frame"},
+    {"name": "whole-field motion","n": 184, "color": "--teamA",
+     "desc": "all 22 players + ball × (pos·vel·accel·jerk) — the full field vector"},
+    {"name": "belief blocks",     "n": 12,  "color": "--gold",
+     "desc": "HIDDEN: Kalman perception-confidence + opponent-press + human-intent beliefs (POMDP)"},
+    {"name": "tactical structure","n": 42,  "color": "--violet",
+     "desc": "back-four line model, midfield band, off-ball spacing, carrier line-break"},
+    {"name": "control & options", "n": 36,  "color": "--good",
+     "desc": "learned-MPC replan, option control, decision cadence, first-touch, pass-and-move…"},
+    {"name": "action parameters", "n": 10,  "color": "--ink-dim",
+     "desc": "the chosen action's continuous parameters"},
+]
+
+# The separate 210-dim CONFIG vector — global, canonicalized to be identical under
+# board-flip / left-right mirror / player relabelling — used for moment retrieval.
+CONFIG_GROUPS = [
+    {"name": "own 11 × 9",  "n": 99, "color": "--teamA",
+     "desc": "each: pos, vel, accel, jerk, possession (ball-proximity weighted, τ=14yd)"},
+    {"name": "opp 11 × 9",  "n": 99, "color": "--teamB", "desc": "same, opponents"},
+    {"name": "ball × 9",    "n": 9,  "color": "--ball",  "desc": "pos, altitude, vel, accel, jerk"},
+    {"name": "scalars",     "n": 3,  "color": "--good",  "desc": "possession · phase · score-diff"},
 ]
 
 # Macro decision vocabulary (on-ball + off-ball). Refined from the engine.
