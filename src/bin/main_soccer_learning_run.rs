@@ -6357,6 +6357,14 @@ static CARRIED_DEFENDER_LINE_HEAD: std::sync::Mutex<Option<DefenderLinePolicyHea
 static CARRIED_LOOSE_BALL_COMMIT_HEAD: std::sync::Mutex<Option<LooseBallCommitHead>> =
     std::sync::Mutex::new(None);
 
+/// In-memory per-context MPC reject-threshold head (how low an action's success
+/// probability may fall in a given context before MPC refuses it and kicks the
+/// decision back to the POMDP's next-best), carried + trained across games WITHIN a
+/// learner process, mirroring `CARRIED_LOOSE_BALL_COMMIT_HEAD`. Resets on pod restart;
+/// untouched unless the model is enabled (DD_SOCCER_ENABLE_MPC_REJECT_THRESHOLD_MODEL).
+static CARRIED_MPC_REJECT_THRESHOLD_HEAD: std::sync::Mutex<Option<MpcRejectThresholdHead>> =
+    std::sync::Mutex::new(None);
+
 /// In-memory long-pass run head (which attacker should break forward so a deep carrier can
 /// pick them out), carried + trained across games WITHIN a learner process, mirroring
 /// `CARRIED_LOOSE_BALL_COMMIT_HEAD`. Resets on pod restart; untouched unless the model is
