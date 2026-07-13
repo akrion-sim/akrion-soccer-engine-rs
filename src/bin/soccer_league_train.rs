@@ -2019,35 +2019,26 @@ fn main() {
                     checkpoint_validate_min_goal_diff_margin,
                 );
                 let promotes = if self_play_ladder {
-                    if !std::path::Path::new(&frontier_path).exists() {
-                        // Bootstrap gen-0: no champion published yet -> promote the current frontier as
-                        // the FIRST champion so co-evolution can start. The 5v5 installs gen-0 = the
-                        // scripted baseline (a beatable floor); analytic is too strong to be that floor
-                        // here (it IS the plateau), so the floor is the starting net itself. Analytic
-                        // stays in the training pool for grounding; the arms race begins next round.
-                        println!(
-                            "league_self_play_ladder round={round} verdict=PROMOTED bootstrap_gen0=true"
-                        );
-                        passes_analytic_anchor
-                    } else {
-                        // Ladder gate: promote iff the challenger beat the CURRENT champion by the
-                        // goal-diff margin over the held-out head-to-head eval. Republishing the
-                        // frontier advances the champion, so next round's opponent is this stronger net
-                        // — the ladder climbs.
-                        let gate_goal_diff_lower_95 = validation
-                            .as_ref()
-                            .map(LeagueRoundKpis::goal_diff_lower_95)
-                            .unwrap_or(f64::NEG_INFINITY);
-                        let ladder_promotes = gate_goal_diff_lower_95 >= self_play_promote_margin;
-                        println!(
-                            "league_self_play_ladder round={round} gd_vs_champion={:.3} gd_lcb95={:.3} promote_margin={:.3} verdict={}",
-                            gate_goal_diff_margin,
-                            gate_goal_diff_lower_95,
-                            self_play_promote_margin,
-                            if ladder_promotes { "PROMOTED" } else { "held" }
-                        );
-                        ladder_promotes && passes_analytic_anchor
-                    }
+                    // Gen-0 is a challenger to the frozen starting brain, not an
+                    // automatic champion. Every generation must clear the same
+                    // side-balanced lower-confidence-bound and analytic anchor.
+                    let bootstrap_gen0 = !std::path::Path::new(&frontier_path).exists();
+                    let gate_goal_diff_lower_95 = validation
+                        .as_ref()
+                        .map(LeagueRoundKpis::goal_diff_lower_95)
+                        .unwrap_or(f64::NEG_INFINITY);
+                    let ladder_promotes = gate_goal_diff_lower_95 >= self_play_promote_margin
+                        && passes_analytic_anchor;
+                    println!(
+                        "league_self_play_ladder round={round} bootstrap_gen0={} gd_vs_champion={:.3} gd_lcb95={:.3} promote_margin={:.3} analytic_anchor_passed={} verdict={}",
+                        bootstrap_gen0,
+                        gate_goal_diff_margin,
+                        gate_goal_diff_lower_95,
+                        self_play_promote_margin,
+                        passes_analytic_anchor,
+                        if ladder_promotes { "PROMOTED" } else { "held" }
+                    );
+                    ladder_promotes
                 } else {
                     passes_forward_pass_climb
                         && ((passes_forward_pass_floor && passes_net_forward_pass_floor)
