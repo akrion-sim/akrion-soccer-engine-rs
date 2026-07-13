@@ -390,3 +390,15 @@ actor rate with the `0.005` scalar rate still produced 48,474 updates and ended 
 its 32-game result was `3W-26D-3L`, payoff `0.500`, Wilson lower bound `0.336`, forward margin `+1`,
 but net-forward margin `-3`. Both treatments are rejected. More update applications and completed
 passes again meant lateral circulation, not climb; the production actor rate remains `0.05`.
+
+The existing `SOCCER_LEAGUE_POLICY_TRAIN_MAX_TRANSITIONS_PER_TICK` setting was then audited and
+found not to bound this full-game MAPPO batch; it controls the online/tabular transition drain.
+`DD_SOCCER_FULL_GAME_POLICY_MAX_SAMPLES` now provides the missing actor-specific cap, default `0`
+(unlimited). A bounded batch retains weighted teacher/counterexample rows first, fills the remaining
+budget with deterministic evenly spaced ordinary rows, and restores chronological order. The first
+`256`-sample screen kept critic exposure near matched (1,618 versus 1,641 steps). Its 32-game field
+was nominally positive (`8W-18D-6L`, payoff `0.531`, Wilson lower bound `0.364`, forward margin `+4`)
+but added four turnovers. On 64 fresh games the same frozen pair reversed to `8W-44D-12L`, payoff
+`0.469`, Wilson lower bound `0.352`, goal difference `-4`, forward margin `-8`, and net-forward margin
+`-7`. Cap `256` is rejected and the production batch remains unlimited; the explicit cap remains a
+default-off stability instrument rather than overloading the unrelated per-tick setting.

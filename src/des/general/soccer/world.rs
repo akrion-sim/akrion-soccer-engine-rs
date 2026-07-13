@@ -3540,6 +3540,33 @@ mod tests {
     }
 
     #[test]
+    fn full_game_actor_cap_preserves_priority_and_spreads_ordinary_samples() {
+        let samples: Vec<SoccerPolicySample> = (0..10)
+            .map(|index| {
+                let mut state_features = [0.0; SOCCER_POLICY_FEATURE_DIM];
+                state_features[0] = index as f64;
+                SoccerPolicySample {
+                    state_features,
+                    action_index: 0,
+                    advantage: 1.0,
+                    old_action_probability: None,
+                    sample_weight: if index >= 8 { 2.0 } else { 1.0 },
+                    mcts_distillation: false,
+                    forward_select_eligible: false,
+                }
+            })
+            .collect();
+
+        let capped = SoccerMatch::capped_full_game_policy_samples_for_training(samples, 4);
+        let retained: Vec<usize> = capped
+            .iter()
+            .map(|sample| sample.state_features[0] as usize)
+            .collect();
+
+        assert_eq!(retained, vec![2, 6, 8, 9]);
+    }
+
+    #[test]
     fn away_learning_actor_training_uses_dedicated_away_sidecars() {
         let mut config = MatchConfig::default();
         config.learning_enabled = true;
@@ -23354,7 +23381,7 @@ impl SoccerMatch {
         self.stats.planner_teacher_missed_opportunity_advantage_sum =
             policy_training_batch.planner_teacher_missed_opportunity_advantage_sum;
 
-        let policy_samples = policy_training_batch.samples;
+        let policy_samples = soccer_capped_full_game_policy_samples(policy_training_batch.samples);
         if policy_samples.is_empty() {
             return false;
         }
@@ -23413,6 +23440,46 @@ impl SoccerMatch {
             }
         }
         true
+    }
+
+    /// Bound one full-game MAPPO batch without throwing away the sparse rows that carry explicit
+    /// teacher, turnover, or planner-counterexample weight. The established path is unchanged at
+    /// the default cap of zero. When bounded, all priority rows are retained first (or sampled
+    /// evenly if they alone exceed the cap), then the remaining budget is filled evenly across the
+    /// chronological ordinary rows so neither kickoff nor final-whistle phases dominate.
+    fn capped_full_game_policy_samples_for_training(
+        samples: Vec<SoccerPolicySample>,
+        max_samples: usize,
+    ) -> Vec<SoccerPolicySample> {
+        if max_samples == 0 || samples.len() <= max_samples {
+            return samples;
+        }
+        let priority_indices: Vec<usize> = samples
+            .iter()
+            .enumerate()
+            .filter_map(|(index, sample)| (sample.sanitized_weight() > 1.0 + 1e-9).then_some(index))
+            .collect();
+        let ordinary_indices: Vec<usize> = samples
+            .iter()
+            .enumerate()
+            .filter_map(|(index, sample)| {
+                (sample.sanitized_weight() <= 1.0 + 1e-9).then_some(index)
+            })
+            .collect();
+        let mut selected = evenly_spaced_policy_sample_indices(
+            &priority_indices,
+            priority_indices.len().min(max_samples),
+        );
+        let ordinary_budget = max_samples.saturating_sub(selected.len());
+        selected.extend(evenly_spaced_policy_sample_indices(
+            &ordinary_indices,
+            ordinary_indices.len().min(ordinary_budget),
+        ));
+        selected.sort_unstable();
+        selected
+            .into_iter()
+            .filter_map(|index| samples.get(index).cloned())
+            .collect()
     }
 
     fn policy_head_for(&self, team: Team) -> Option<&SoccerPolicyHead> {
@@ -39676,6 +39743,40 @@ impl SoccerMatch {
         soccer_trajectory_export_write(&transitions);
         transitions
     }
+}
+
+fn evenly_spaced_policy_sample_indices(indices: &[usize], take: usize) -> Vec<usize> {
+    if take == 0 || indices.is_empty() {
+        return Vec::new();
+    }
+    if take >= indices.len() {
+        return indices.to_vec();
+    }
+    let len = indices.len() as u128;
+    let denominator = (2 * take) as u128;
+    (0..take)
+        .map(|slot| {
+            let position = (((2 * slot + 1) as u128 * len) / denominator) as usize;
+            indices[position.min(indices.len() - 1)]
+        })
+        .collect()
+}
+
+fn soccer_full_game_policy_sample_cap() -> usize {
+    std::env::var("DD_SOCCER_FULL_GAME_POLICY_MAX_SAMPLES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(65_536)
+}
+
+fn soccer_capped_full_game_policy_samples(
+    samples: Vec<SoccerPolicySample>,
+) -> Vec<SoccerPolicySample> {
+    SoccerMatch::capped_full_game_policy_samples_for_training(
+        samples,
+        soccer_full_game_policy_sample_cap(),
+    )
 }
 
 // ---- Ball: state + the ball agent (physics/possession sub-agent) ----
