@@ -2972,6 +2972,7 @@ fn mpc_execution_estimate_for_action(
             shot_speed,
             first_time,
             observation.perceived_pressure,
+            None,
         );
         let frame_fit = (observation.shot_on_frame_probability.clamp(0.0, 1.0) * 0.64
             + shot_mpc.accuracy_probability * 0.36)

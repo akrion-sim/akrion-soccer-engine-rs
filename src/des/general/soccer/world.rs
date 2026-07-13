@@ -9843,6 +9843,7 @@ mod tests {
                 expected_speed,
                 normalize_soccer_action_label(label) == "first-time-shot",
                 pressure_from_nearest_distance(nearest_opponent_distance),
+                None,
             );
             assert!(
                 (scored.decision_context.shot_mpc_goal_probability
@@ -17985,6 +17986,7 @@ impl SoccerMatch {
                 shot_speed,
                 first_time,
                 pressure_from_nearest_distance(nearest_opponent_distance),
+                None,
             )
             .target_point
             .clamp_to_pitch(snapshot.field_width, snapshot.field_length),
@@ -21645,6 +21647,7 @@ impl SoccerMatch {
             shot_speed,
             first_time,
             pressure_from_nearest_distance(nearest_opponent_distance),
+            None,
         )
         .accuracy_probability
         .clamp(0.0, 1.0)
@@ -50320,6 +50323,7 @@ impl WorldSnapshot {
                 expected_shot_speed_yps,
                 false,
                 perceived_pressure,
+                None,
             ))
         } else {
             None
@@ -68888,6 +68892,7 @@ impl WorldSnapshot {
             shot_speed,
             false,
             pressure,
+            None,
         );
         let on_frame = (on_frame * 0.66 + shot_mpc.accuracy_probability * 0.34).clamp(0.0, 1.0);
         let beat_keeper = (beat_keeper * 0.60 + shot_mpc.goal_probability * 0.40).clamp(0.0, 1.0);

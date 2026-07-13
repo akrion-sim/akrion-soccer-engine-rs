@@ -26417,6 +26417,13 @@ fn soccer_decision_context_for(
                     shot_speed,
                     first_time,
                     pressure_from_nearest_distance(nearest_opponent_distance),
+                    // Part B: score THIS candidate's chosen aim (from the action target trace),
+                    // gated. Off ⇒ None ⇒ analytic optimum ⇒ byte-identical.
+                    if dd_soccer_enable_actor_shot_placement() {
+                        action_target.and_then(|trace| trace.point)
+                    } else {
+                        None
+                    },
                 )
             })
         } else {
@@ -68183,6 +68190,11 @@ fn shot_mpc_accuracy_estimate_for_snapshot(
     shot_speed_yps: f64,
     quick_release: bool,
     pressure: f64,
+    // ACTOR-OWNED SHOT PLACEMENT (Part B): when `Some`, evaluate THIS specific goal-mouth aim's
+    // finishing quality (block / on-frame / save / goal probability) instead of the analytic QP
+    // optimum, so each placement candidate's shot-quality features reflect its own aim. `None`
+    // (all non-placement callers) ⇒ the analytic optimum is used ⇒ byte-identical.
+    override_target: Option<Vec2>,
 ) -> ShotMpcAccuracyEstimate {
     let goal_y = attacking_team.goal_y(snapshot.field_length);
     let goal_center_x = snapshot.field_width * 0.5;
@@ -68276,7 +68288,11 @@ fn shot_mpc_accuracy_estimate_for_snapshot(
             max_active_sets: 32,
         },
     );
-    let target_x = if solution.status == QPStatus::Optimal && !solution.x.is_empty() {
+    let target_x = if let Some(aim) = override_target {
+        // Honor the actor-chosen aim; downstream block/on-frame/save/goal metrics are all
+        // computed from `target_x`, so they now reflect THIS placement.
+        aim.x
+    } else if solution.status == QPStatus::Optimal && !solution.x.is_empty() {
         solution.x[0]
     } else {
         unbounded_preference
