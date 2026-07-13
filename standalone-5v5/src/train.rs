@@ -542,7 +542,9 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
 
         // CENTRALIZED critic: one value for the whole global state this tick.
         let gstate = w.global_state();
-        let v_central = policy.critic.predict(&gstate)[0];
+        // Critic learns in GOAL units (ret / RETURN_NORM); denormalize here so
+        // GAE runs in the same point currency as the rewards.
+        let v_central = policy.critic.predict(&gstate)[0] * RETURN_NORM;
 
         for i in 1..N {
             // policy controls the 4 outfielders; GK (index 0) is rule-based.
