@@ -150,8 +150,11 @@ fn ball_resistance_after(speed: f32, altitude: f32) -> f32 {
         (1.0 - (altitude - BALL_ROLLING_ALT) / 0.18).clamp(0.0, 1.0)
     };
     let relief = 1.0 - (1.0 - rolling) * AERIAL_FLIGHT_DRAG_RELIEF;
-    // linear: geometric per-tick decay, half-life-corrected to ref dt = 1/15 (== DT here)
-    let lin_ret = (1.0 - BALL_DRAG_PER_TICK).powf(DT / (1.0 / 15.0));
+    // linear: geometric per-tick decay, half-life-corrected to the 11v11 ref dt:
+    // lin_ret = (1 − drag)^(DT/(1/15)). DT here IS 1/15 (11v11 parity), so the
+    // exponent is exactly 1 — constant-folded because this runs 40× per
+    // intercept_point call inside observation building (a hot path).
+    let lin_ret = 1.0 - BALL_DRAG_PER_TICK;
     let lin_loss = speed * (1.0 - lin_ret) * relief;
     let air_loss = BALL_AIR_RESISTANCE.min(0.10) * speed * speed * DT * relief;
     let low = (1.0 - (speed / 12.0).min(1.0)) * 0.62;
