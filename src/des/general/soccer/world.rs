@@ -27670,11 +27670,15 @@ impl SoccerMatch {
             return;
         }
         let duel_reward = self
-            .steal_reward_scaled_for_box(WON_FIFTY_FIFTY_DUEL_REWARD_POINTS, self.ball.position);
+            .steal_reward_scaled_for_box(WON_FIFTY_FIFTY_DUEL_REWARD_POINTS, self.ball.position)
+            * anchored_currency_scale();
         self.record_reward_event(winner, duel_reward);
         for (player_id, team) in contenders {
             if team != winner_team {
-                self.record_reward_event(player_id, -LOST_FIFTY_FIFTY_DUEL_PENALTY_POINTS);
+                self.record_reward_event(
+                    player_id,
+                    -LOST_FIFTY_FIFTY_DUEL_PENALTY_POINTS * anchored_currency_scale(),
+                );
             }
         }
     }
