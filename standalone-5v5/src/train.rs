@@ -677,7 +677,10 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
         // little. SMALL per-tick — it fires every tick you carry, so a big value
         // accumulates into ball-hoarding that dwarfs goals.
         if w.ev_dribble_fwd_a {
-            r += rw().dribble; // forward carrying (also paid by potential shaping) — bounded, unfarmable
+            // Forward carrying, scaled by the field-vector context: worth most in
+            // our own half (progression is the carry's job there), tapering in
+            // the final third where shooting/box-passing outrank it.
+            r += rw().dribble * dribble_field_context(w.ball.x);
         }
         // (lateral dribble: no flat reward — potential shaping handles real progress)
         // Dispossessed while carrying is handled by ev_dribble_turnover_a above,
