@@ -619,10 +619,13 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
     );
 
     for round in 1..=generations {
-        // Install the current champion (None => scripted baseline) as Team B, then
-        // train the challenger against it.
-        train::set_selfplay_champion(champion.clone());
+        // MIXED OPPONENT: most iterations train against the current champion
+        // (self-play), but every `anchor_every`-th iteration trains against the
+        // scripted baseline (champion = None) so the challenger keeps practising
+        // how to beat the absolute reference and can't quietly forget it.
         for it in 1..=cfg.iters {
+            let vs_scripted = it % anchor_every == 0;
+            train::set_selfplay_champion(if vs_scripted { None } else { champion.clone() });
             train::set_speed_frozen(it <= speed_warmup);
             let beta = train::ent_beta_at(it, cfg.iters);
             let _ = train::train_iter(&mut challenger, cfg.games_per_iter, beta, &mut rng);
