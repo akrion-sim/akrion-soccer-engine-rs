@@ -1234,12 +1234,22 @@ impl World {
             if self.ball_vel.len() > 4.0 {
                 self.ball_vel = self.ball_vel.add(self.ball_curl.scale(DT));
             }
-            self.ball_vel = self.ball_vel.scale(BALL_FRICTION);
+            // Three-term drag (linear + air + grass), attenuated while airborne.
+            let sp = self.ball_vel.len();
+            if sp > 1e-6 {
+                let ns = ball_resistance_after(sp, self.ball_z);
+                self.ball_vel = self.ball_vel.scale(ns / sp);
+            }
+            // Altitude: closed-form parabola in time; lands (z=0) when the hang time elapses.
             if self.ball_aerial {
-                self.air_ticks = self.air_ticks.saturating_sub(1);
-                if self.air_ticks == 0 {
-                    self.ball_aerial = false; // the scoop lands -> a normal ground ball
+                self.ball_taloft += DT;
+                self.ball_z = altitude_at(self.ball_apex, self.ball_taloft);
+                if self.ball_taloft >= hang_time(self.ball_apex) {
+                    self.ball_aerial = false; // the loft lands -> a normal ground ball
+                    self.ball_z = 0.0;
                 }
+            } else {
+                self.ball_z = 0.0;
             }
 
             // reflect off side-lines (y walls) to keep play flowing
