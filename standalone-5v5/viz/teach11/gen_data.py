@@ -304,10 +304,10 @@ def evolution_strategy():
     keymap = {n:i for i,(n,*_) in enumerate(REWARD_WEIGHTS)}
     defaults = norm_of([d for (_,_,d,*_ ) in REWARD_WEIGHTS])
     shift = RNG.uniform(-0.20,0.20, NDIM)
-    for n,s in [("shot_on_target",0.34),("epv_progress",0.32),("killer_pass",0.30),
-                ("xg_entry",0.30),("bad_backpass",0.28),("conceded_sot",0.26),
-                ("route_one_pen",0.26),("pass_completed",-0.28),("spacing",0.18),
-                ("epv_potential",0.28),("dp_prior_weight",0.20),("in_behind_run",0.26)]:
+    for n,s in [("shot_on_target",0.32),("learned_epv",0.34),("pitch_value_threat",0.30),
+                ("forward_pass",0.28),("giveaway_opp_half",0.26),("loose_ball_win",0.26),
+                ("planner_teacher",0.24),("field_vector_shot",0.28),("overdribble",-0.26),
+                ("low_pressure_pass",-0.24),("boltzmann_temp",-0.18),("turnover_chain_blame",0.26)]:
         shift[keymap[n]] = s
     optimum = np.clip(defaults+shift, 0.05, 0.95)
     dw = RNG.uniform(0.7,1.3, NDIM)
@@ -320,8 +320,8 @@ def evolution_strategy():
         pmsd = float(np.mean((x-plateau)**2))
         if not allow_top and base > 2.6 and pmsd > 0.02:
             base = 2.6 + 0.05*(base-2.6)
-        if x[keymap["spacing"]] < 0.08 or x[keymap["pass_completed"]] > 0.85:
-            base -= 4.0
+        if x[keymap["giveaway_own_half"]] < 0.10 or x[keymap["boltzmann_temp"]] > 0.92:
+            base -= 4.0                      # reward-hacked possession / policy collapse
         return base
     mean = defaults.copy(); sigma = np.full(NDIM, 0.30)
     all_pts, raw = [], []
