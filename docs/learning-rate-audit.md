@@ -222,3 +222,28 @@ margin `-0.50/game`, and Wilson lower bound `0.255`. Thus weights through `0.20`
 an action-ranking boundary on this checkpoint. The runner accepts `FORWARD_SELECT_WEIGHT_A`
 and `FORWARD_SELECT_WEIGHT_B` so the next bounded probe can test the range between this inert
 region and the saturated treatment without changing code or retraining the actor.
+
+The follow-up used weights `0`, `0.50`, and `8.0`; all 32 paired fixtures were again exactly
+identical to the control (`0.406` payoff, `-0.50/game` forward margin). A direct JSONL trace
+explained why: one paired game produced 32 on-ball neural decisions and zero forward-pass
+candidates in the scored set for both `0` and `8.0`. Across a broader four-game trace, 34 of
+138 on-ball states qualified for a forward option; root injection created three to four forward
+candidates, but the post-injection pass-like margin gate pruned every one. The learned scalar
+was saturating on candidates it could never influence.
+
+The existing bounded pass-family root floor fixes that exposure seam without forcing a pass.
+In a four-game mechanism trace, control exposed two forward candidates and selected one;
+`SOCCER_NEURAL_MCTS_MIN_PASS_LIKE_ROOT_CANDIDATES=1` exposed 22 and selected seven; adding
+the fixed `8.0` scalar exposed 26 and selected 12. These are mechanism counts, not promotion
+evidence. `scripts/run_forward_exposure_ab.sh` therefore holds the checkpoint fixed and compares
+control, root exposure, and root exposure plus scalar on a full held-out analytic field before
+the floor is allowed into a training treatment.
+
+The 32-game frozen-checkpoint exposure screen did not pass promotion. Control reached payoff
+`0.406`, candidate forward completions `0.2/game`, and forward margin `-0.16/game`. Root exposure
+improved payoff to `0.422` and candidate forward completions to `0.3/game`, but its forward margin
+was still `-0.19/game`. Exposure plus scalar also reached payoff `0.422` and `0.3` candidate forward
+completions, with a weaker `-0.22/game` margin. Wilson lower bounds were `0.255`, `0.268`, and
+`0.268`. Neither gate is promoted. The floor is nevertheless active and improves the frozen actor's
+primary mean, so the next experiment tests whether training with that bounded exposure supplies
+useful actor samples; the saturated scalar is excluded.
