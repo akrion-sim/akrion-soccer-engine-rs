@@ -2315,10 +2315,15 @@ impl World {
             self.intended_receiver = None;
             let cands = self.pass_candidates(team, GK);
             if let Some((ti, _)) = cands[0] {
-                // Distribution is a PASS: same receiver-lead + arrival-timed
-                // speed solve as an outfield ground pass (keeper never lofts).
+                // Distribution is a PASS (keeper never lofts). PARITY: the same
+                // receiver-lead + arrival-timed speed solve as an outfield
+                // ground pass. LEGACY: fixed +2 yd lead at PASS_SPEED.
                 let tp = players(team, self)[ti].pos;
-                let lead = self.led_pass_target(team, GK, ti);
+                let lead = if self.parity_flight {
+                    self.led_pass_target(team, GK, ti)
+                } else {
+                    tp.add(V2::new(sx * 2.0, 0.0))
+                };
                 self.intended_receiver = Some(Owner { team, idx: ti });
                 self.set_vel(team, GK, V2::default());
                 if team == Team::A {
@@ -2332,9 +2337,13 @@ impl World {
                         0
                     };
                 }
-                let (_, recv_open) = self.nearest_opponent(team, tp);
-                let openness = (recv_open / TEAMMATE_GOOD_SPACE).clamp(0.0, 1.0);
-                let pspeed = ground_pass_launch_speed(lead.sub(me).len().max(0.1), openness);
+                let pspeed = if self.parity_flight {
+                    let (_, recv_open) = self.nearest_opponent(team, tp);
+                    let openness = (recv_open / TEAMMATE_GOOD_SPACE).clamp(0.0, 1.0);
+                    ground_pass_launch_speed(lead.sub(me).len().max(0.1), openness)
+                } else {
+                    PASS_SPEED
+                };
                 return Some((Owner { team, idx: GK }, lead.sub(me), pspeed, true));
             }
             self.set_vel(team, GK, V2::default());
