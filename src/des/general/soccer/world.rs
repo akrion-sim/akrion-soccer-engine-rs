@@ -27734,7 +27734,7 @@ impl SoccerMatch {
                 * freshness
                 * action_scale
         };
-        self.record_reward_event(long_ball.launcher_id, amount);
+        self.record_reward_event(long_ball.launcher_id, amount * anchored_currency_scale());
     }
 
     fn recent_possession_reward_sequence(
