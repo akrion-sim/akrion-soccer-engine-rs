@@ -60,16 +60,32 @@ const EPOCHS: usize = 4;
 const MINIBATCH: usize = 1024;
 const MAX_ROLLOUT_THREADS: usize = 4;
 const MIN_REWARD_WEIGHT: f32 = 0.0001;
-const CONVERSION_OVER_SHOT_MARGIN: f32 = 5.0;
-const WIN_OVER_CONVERSION_MARGIN: f32 = 20.0;
-/// A converted goal must dominate the summed non-converting shot reward by a PROPORTIONAL margin:
-/// `shot_base + shot_q <= goal * REWARD_NON_CONVERSION_MAX_FRACTION`. Scales with the goal weight
-/// rather than a fixed point gap (which loses meaning once weights move), matching the 11v11 engine's
-/// `grounded_non_conversion_reward_scale`. Default 0.40 = an on-target shot that misses is worth at
-/// most ~40% of a goal.
+// ─── Anchored reward currency (docs/reward-anchoring.md) ─────────────────────
+// Fixed anchors — the currency every other term is priced in. NOT env-tunable:
+// the weights below are searched, the anchors are what they are searched
+// against. Win/loss is symmetric (draw = 0), concede mirrors the goal.
+const REW_WIN_POINTS: f32 = 1000.0;
+const REW_GOAL_POINTS: f32 = 500.0;
+/// Any genuinely on-frame shot (the keeper may still save it) pays at least
+/// this — testing the keeper from a real position is anchored as valuable.
+const ON_FRAME_SHOT_FLOOR: f32 = 50.0;
+/// Position controls the CAP, not the floor: cap(x) = FLOOR + SPAN·xg(x).
+/// An on-frame shot from a hopeless position (xg→0) is worth exactly the
+/// floor; a close central chance can reach FLOOR+SPAN = 0.40·goal.
+const ON_FRAME_SHOT_CAP_SPAN: f32 = 150.0;
+/// No single non-converting event may rival a goal: ≤ 40% of one (the shot cap
+/// FLOOR+SPAN = 200 equals this fraction by construction; other event caps sit
+/// below it via their wenv hi-bounds).
 const REWARD_NON_CONVERSION_MAX_FRACTION: f32 = 0.40;
-const REW_GOAL_MIN: f32 = 6.0;
-const REW_GOAL_MAX: f32 = 20.0;
+/// Critic target normalizer: the critic learns returns in units of GOALS
+/// (ret / 500) so the fixed LR_CRITIC fits the anchored point scale. The actor
+/// is already scale-invariant via batch advantage normalization.
+const RETURN_NORM: f32 = REW_GOAL_POINTS;
+/// Completed-pass forward-progress: points per yard gained, and the per-event
+/// cap (≈ 2/3 of the shot floor — progression can approach but not rival
+/// testing the keeper).
+const PASS_PROGRESS_PER_YARD: f32 = 4.2;
+const PASS_PROGRESS_CAP: f32 = 33.0;
 const LINGER_RADIUS: f32 = 4.0; // "same radius": teammates within this many yards
 /// Overlap zone: two players THIS close are occupying the same spot — that is
 /// never "running past each other", so the penalty here is ALWAYS-ON (ungated).
@@ -114,33 +130,39 @@ fn wenv(name: &str, default: f32, lo: f32, hi: f32) -> f32 {
     bounded_weight(raw.as_deref(), default, lo, hi)
 }
 
-fn grounded_conversion_ladder(goal: f32, shot_base: f32, shot_q: f32) -> (f32, f32, f32) {
-    // The goal stays the reference (clamped to its own range); shot shaping is scaled DOWN to fit a
-    // proportional fraction below it, never the reverse — so tuning big shot rewards can't quietly
-    // inflate what "scoring" is worth.
-    let goal = goal.clamp(REW_GOAL_MIN, REW_GOAL_MAX);
-    let mut shot_base = shot_base.max(MIN_REWARD_WEIGHT);
-    let mut shot_q = shot_q.max(MIN_REWARD_WEIGHT);
-    let max_non_conversion = (goal * REWARD_NON_CONVERSION_MAX_FRACTION)
-        .min(goal - CONVERSION_OVER_SHOT_MARGIN)
-        .max(MIN_REWARD_WEIGHT);
-    let total = shot_base + shot_q;
-    if total > max_non_conversion {
-        let scale = (max_non_conversion / total).clamp(0.0, 1.0);
-        shot_base = (shot_base * scale).max(MIN_REWARD_WEIGHT);
-        shot_q = (shot_q * scale).max(MIN_REWARD_WEIGHT);
-    }
+/// Anchored on-frame shot points (docs/reward-anchoring.md §2): floor 50 no
+/// matter where from; the field-vector context (position xg) sets the CEILING,
+/// and MPC placement quality interpolates inside the [floor, cap(x)] band. The
+/// tunable `span_w` is the only discoverable part; floor and cap are anchors.
+fn anchored_shot_points(placement: f32, xg: f32, span_w: f32) -> f32 {
+    let cap = ON_FRAME_SHOT_FLOOR + ON_FRAME_SHOT_CAP_SPAN * xg.clamp(0.0, 1.0);
+    let t = (span_w * placement.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+    ON_FRAME_SHOT_FLOOR + (cap - ON_FRAME_SHOT_FLOOR) * t
+}
 
-    (goal, shot_base, shot_q)
+/// Field-vector context for a forward carry: full value in our own half
+/// (progression/escape is the carry's job there), tapering through the
+/// opponent's half where shooting and box passing take over — so at any point
+/// of the field the action-class ordering the rewards imply matches football
+/// (dribble > shoot in our half; shoot/pass > dribble in the final third).
+fn dribble_field_context(ball_x: f32) -> f32 {
+    let t = ((ball_x - FIELD_L * 0.5) / (FIELD_L * 0.5)).clamp(0.0, 1.0);
+    1.0 - 0.6 * t
 }
 
 pub struct Rw {
-    pub goal: f32,                 // +goal scored
-    pub concede: f32,              // -goal conceded (stored positive, subtracted)
-    pub match_win: f32,            // terminal reward for winning the completed episode
-    pub match_loss: f32,           // terminal penalty magnitude for losing the episode
-    pub shot_base: f32,            // shot-on-goal base (earned, from opponent half after 2 passes)
-    pub shot_q: f32,               // shot-on-goal chance-quality bonus
+    // Anchors (win/goal/shot-floor) are consts above, not fields — see
+    // docs/reward-anchoring.md. Everything here is a discoverable weight with
+    // sane bounds, in POINTS (currency: goal = 500).
+    //
+    // The NEGATIVE mirrors are fractions of the positive anchors, discoverable
+    // within bounds: how much conceding/losing stings is a risk-appetite knob,
+    // not an anchor. Symmetric (−500/−1000) was tried and collapses training
+    // into passivity — every config that ever trained well here had
+    // concede ≈ 0.25–0.67·goal and loss ≈ 0.5·win.
+    pub concede_frac: f32,         // conceding costs concede_frac · GOAL
+    pub loss_frac: f32,            // losing costs loss_frac · WIN
+    pub shot_span: f32,            // on-frame shot placement span inside [floor, cap(x)]
     pub milestone: f32,            // completing the 2nd pass (unlocks the shot)
     pub pass_credit: f32,          // flat credit for a completed pass
     pub turnover: f32,             // -turnover (stored positive, subtracted)
@@ -170,66 +192,42 @@ pub struct Rw {
     pub pursuit: f32,              // LOOSE-BALL: favorite commits to winning a free ball
 }
 fn rw() -> &'static Rw {
+    // Defaults are the validated pre-anchor ratios rescaled into the 500-point
+    // goal currency (×500/12 ≈ 41.7), bounds likewise — so the tuner searches
+    // the same RELATIVE region that trained well, now expressed in points.
     static R: std::sync::OnceLock<Rw> = std::sync::OnceLock::new();
-    R.get_or_init(|| {
-        let (goal, shot_base, shot_q) = grounded_conversion_ladder(
-            wenv("REW_GOAL", 12.0, REW_GOAL_MIN, REW_GOAL_MAX),
-            wenv("REW_SHOT_BASE", 1.5, 0.3, 3.5),
-            wenv("REW_SHOT_Q", 1.0, MIN_REWARD_WEIGHT, 2.5),
-        );
-        enforce_reward_hierarchy(Rw {
-            goal,
-            concede: wenv("REW_CONCEDE", 8.0, 4.0, 16.0),
-            match_win: wenv("REW_MATCH_WIN", 32.0, 8.0, 64.0),
-            match_loss: wenv("REW_MATCH_LOSS", 12.0, 6.0, 24.0),
-            shot_base,
-            shot_q,
-            milestone: wenv("REW_MILESTONE", 0.3, MIN_REWARD_WEIGHT, 1.5),
-            pass_credit: wenv("REW_PASS", 0.06, MIN_REWARD_WEIGHT, 0.4),
-            turnover: wenv("REW_TURNOVER", 0.55, MIN_REWARD_WEIGHT, 1.5),
-            bad_pass_turnover: wenv("REW_BAD_PASS_TURNOVER", 0.35, MIN_REWARD_WEIGHT, 1.5),
-            dribble_turnover: wenv("REW_DRIBBLE_TURNOVER", 0.75, MIN_REWARD_WEIGHT, 2.0),
-            recycle: wenv("REW_RECYCLE", 0.18, MIN_REWARD_WEIGHT, 0.8),
-            return_pass: wenv("REW_RETURN_PASS", 0.35, MIN_REWARD_WEIGHT, 2.0),
-            return_stale: wenv("REW_RETURN_STALE", 0.55, MIN_REWARD_WEIGHT, 2.0),
-            win_ball: wenv("REW_WIN_BALL", 0.3, MIN_REWARD_WEIGHT, 1.2),
-            dribble: wenv("REW_DRIBBLE", 0.015, MIN_REWARD_WEIGHT, 0.12),
-            shape: wenv("W_SHAPE", 2.2, 0.5, 4.0),
-            advance: wenv("W_ADVANCE", 0.04, MIN_REWARD_WEIGHT, 0.12),
-            open: wenv("W_OPEN", 0.04, MIN_REWARD_WEIGHT, 0.12),
-            width: wenv("W_WIDTH", 0.045, MIN_REWARD_WEIGHT, 0.12),
-            flank: wenv("W_FLANK", 0.025, MIN_REWARD_WEIGHT, 0.10),
-            goalside: wenv("W_GOALSIDE", 0.08, MIN_REWARD_WEIGHT, 0.25),
-            goalside_run: wenv("W_GOALSIDE_RUN", 0.04, MIN_REWARD_WEIGHT, 0.16),
-            ahead: wenv("W_AHEAD", 0.035, MIN_REWARD_WEIGHT, 0.16),
-            make_run: wenv("W_MAKE_RUN", 0.06, MIN_REWARD_WEIGHT, 0.20),
-            burst_gear: wenv("W_BURST_GEAR", 0.035, MIN_REWARD_WEIGHT, 0.16),
-            field_pass: wenv("W_FIELD_PASS", 0.08, MIN_REWARD_WEIGHT, 0.30),
-            field_turnover: wenv("W_FIELD_TURNOVER", 0.16, MIN_REWARD_WEIGHT, 0.50),
-            chance: wenv("W_CHANCE", 0.12, MIN_REWARD_WEIGHT, 0.60),
-            field_goalside_delta: wenv("W_FIELD_GOALSIDE_DELTA", 0.10, MIN_REWARD_WEIGHT, 0.35),
-            field_burst_delta: wenv("W_FIELD_BURST_DELTA", 0.08, MIN_REWARD_WEIGHT, 0.35),
-            stand_pen: wenv("W_STAND_PEN", 0.02, MIN_REWARD_WEIGHT, 0.20),
-            pursuit: wenv("W_PURSUIT", 0.05, MIN_REWARD_WEIGHT, 0.25),
-        })
+    R.get_or_init(|| Rw {
+        concede_frac: wenv("REW_CONCEDE_FRAC", 0.67, 0.25, 1.0),
+        loss_frac: wenv("REW_LOSS_FRAC", 0.5, 0.4, 1.0),
+        shot_span: wenv("REW_SHOT_SPAN", 1.0, MIN_REWARD_WEIGHT, 1.5),
+        milestone: wenv("REW_MILESTONE", 12.0, MIN_REWARD_WEIGHT, 40.0),
+        pass_credit: wenv("REW_PASS", 2.5, MIN_REWARD_WEIGHT, 25.0),
+        turnover: wenv("REW_TURNOVER", 23.0, MIN_REWARD_WEIGHT, 60.0),
+        bad_pass_turnover: wenv("REW_BAD_PASS_TURNOVER", 15.0, MIN_REWARD_WEIGHT, 30.0),
+        dribble_turnover: wenv("REW_DRIBBLE_TURNOVER", 25.0, MIN_REWARD_WEIGHT, 30.0),
+        recycle: wenv("REW_RECYCLE", 7.5, MIN_REWARD_WEIGHT, 30.0),
+        return_pass: wenv("REW_RETURN_PASS", 15.0, MIN_REWARD_WEIGHT, 40.0),
+        return_stale: wenv("REW_RETURN_STALE", 23.0, MIN_REWARD_WEIGHT, 40.0),
+        win_ball: wenv("REW_WIN_BALL", 12.5, MIN_REWARD_WEIGHT, 40.0),
+        dribble: wenv("REW_DRIBBLE", 0.6, MIN_REWARD_WEIGHT, 5.0),
+        shape: wenv("W_SHAPE", 90.0, 20.0, 160.0),
+        advance: wenv("W_ADVANCE", 1.7, MIN_REWARD_WEIGHT, 5.0),
+        open: wenv("W_OPEN", 1.7, MIN_REWARD_WEIGHT, 5.0),
+        width: wenv("W_WIDTH", 1.9, MIN_REWARD_WEIGHT, 5.0),
+        flank: wenv("W_FLANK", 1.0, MIN_REWARD_WEIGHT, 4.0),
+        goalside: wenv("W_GOALSIDE", 3.3, MIN_REWARD_WEIGHT, 10.0),
+        goalside_run: wenv("W_GOALSIDE_RUN", 1.7, MIN_REWARD_WEIGHT, 6.5),
+        ahead: wenv("W_AHEAD", 1.5, MIN_REWARD_WEIGHT, 6.5),
+        make_run: wenv("W_MAKE_RUN", 2.5, MIN_REWARD_WEIGHT, 8.0),
+        burst_gear: wenv("W_BURST_GEAR", 1.5, MIN_REWARD_WEIGHT, 6.5),
+        field_pass: wenv("W_FIELD_PASS", 3.3, MIN_REWARD_WEIGHT, 12.5),
+        field_turnover: wenv("W_FIELD_TURNOVER", 6.7, MIN_REWARD_WEIGHT, 20.0),
+        chance: wenv("W_CHANCE", 5.0, MIN_REWARD_WEIGHT, 25.0),
+        field_goalside_delta: wenv("W_FIELD_GOALSIDE_DELTA", 4.2, MIN_REWARD_WEIGHT, 15.0),
+        field_burst_delta: wenv("W_FIELD_BURST_DELTA", 3.3, MIN_REWARD_WEIGHT, 15.0),
+        stand_pen: wenv("W_STAND_PEN", 0.8, MIN_REWARD_WEIGHT, 8.0),
+        pursuit: wenv("W_PURSUIT", 2.1, MIN_REWARD_WEIGHT, 10.0),
     })
-}
-
-#[cfg(test)]
-fn max_nonconverting_shot_reward(weights: &Rw) -> f32 {
-    weights.shot_base + weights.shot_q
-}
-
-fn enforce_reward_hierarchy(mut weights: Rw) -> Rw {
-    let (goal, shot_base, shot_q) =
-        grounded_conversion_ladder(weights.goal, weights.shot_base, weights.shot_q);
-    weights.goal = goal;
-    weights.shot_base = shot_base;
-    weights.shot_q = shot_q;
-    weights.match_win = weights
-        .match_win
-        .max(weights.goal + WIN_OVER_CONVERSION_MARGIN);
-    weights
 }
 // The speed policy is a low-variance REFINEMENT on top of the action policy —
 // small entropy + LR so its exploration can't paralyze the game the action policy
@@ -238,14 +236,14 @@ const LR_SPEED: f32 = LR_ACTOR * 0.3;
 const SPEED_ENT_SCALE: f32 = 0.15;
 const ENT_BETA0: f32 = 0.02;
 
-// Teammate-spacing reward weight. Overridable via SPACING_W. Default 0.008 is the
-// VALIDATED anti-bunch value (reaches ~0% bunching with the leaky linger gate + the
-// hard-resolver backstop) — strong enough that sub-3yd bunching competes with
-// ordinary possession rewards. Clamps are strictly-positive and WIDE ([1e-4, 4.0])
-// so a malformed value can neither disable nor explode the channel, yet a promoted
-// run's learned/tuned value can still warm-start the next run without being clamped.
+// Teammate-spacing reward weight. Overridable via SPACING_W. Default 0.33 is the
+// VALIDATED anti-bunch value (0.008 in the old 12-point currency) rescaled into
+// the 500-point goal currency — the severe-overlap tick penalty stays the same
+// fraction of a goal (~6.6%). Clamps are strictly-positive and WIDE so a
+// malformed value can neither disable nor explode the channel, yet a promoted
+// run's learned/tuned value can still warm-start the next run without clamping.
 fn w_spacing() -> f32 {
-    wenv("SPACING_W", 0.008, 0.0001, 4.0)
+    wenv("SPACING_W", 0.33, 0.0001, 15.0)
 }
 
 /// PER-PLAYER spacing reward as a function of a player's nearest-teammate
@@ -554,7 +552,9 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
 
         // CENTRALIZED critic: one value for the whole global state this tick.
         let gstate = w.global_state();
-        let v_central = policy.critic.predict(&gstate)[0];
+        // Critic learns in GOAL units (ret / RETURN_NORM); denormalize here so
+        // GAE runs in the same point currency as the rewards.
+        let v_central = policy.critic.predict(&gstate)[0] * RETURN_NORM;
 
         for i in 1..N {
             // policy controls the 4 outfielders; GK (index 0) is rule-based.
@@ -601,16 +601,20 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
         phi_prev = phi;
         let mut r = rw().shape * shaping;
         if w.ev_goal_a {
-            r += rw().goal; // GOALS are the prize
+            r += REW_GOAL_POINTS; // GOALS are the prize (anchor: 500)
         }
         if w.ev_goal_b {
-            r -= rw().concede;
+            // Conceding stings a discoverable fraction of the goal anchor —
+            // the risk-appetite knob (full symmetry trains passive).
+            r -= REW_GOAL_POINTS * rw().concede_frac;
         }
         if step + 1 == STEPS {
+            // Match outcome anchor: win +1000 (fixed); losing costs a
+            // discoverable fraction of it; draw 0.
             if w.goals_a > w.goals_b {
-                r += rw().match_win;
+                r += REW_WIN_POINTS;
             } else if w.goals_a < w.goals_b {
-                r -= rw().match_loss;
+                r -= REW_WIN_POINTS * rw().loss_frac;
             }
         }
         // MARL SYNCHRONIZATION: reward the TEAM for collectively moving into a
@@ -632,7 +636,8 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
                 (0.50 + 0.50 * post_field.safe_outlet_value + 0.25 * post_field.burst_score)
                     .clamp(0.35, 1.25);
             r += rw().pass_credit * field_pass
-                + (w.last_pass_gain_a.max(0.0) * 0.1 * field_progress).min(0.8);
+                + (w.last_pass_gain_a.max(0.0) * PASS_PROGRESS_PER_YARD * field_progress)
+                    .min(PASS_PROGRESS_CAP);
             r += rw().field_pass
                 * FieldRewardContext::delta(
                     post_field.safe_outlet_value,
@@ -668,12 +673,15 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
         // Shoot-spam is stopped structurally by the cooldown: a rapid-fire repeat
         // shot (fired while a prior shot is still "hot") pays nothing.
         if w.ev_shot_on_a && !w.shot_was_rapid_a {
-            // DYNAMIC, position-dependent shot reward: scaled by the xG of WHERE the
-            // shot was taken (distance + angle to goal). A close central chance pays
-            // full; a hopeful long-range/wide pot-shot (now legal from the whole
-            // opponent half) pays almost nothing — so the policy must work the ball
-            // into a good position, not just fling it goalward.
-            r += (rw().shot_base + rw().shot_q * w.last_shot_quality_a) * w.last_shot_xg_a;
+            // Anchored on-frame shot (docs/reward-anchoring.md §2): the floor is
+            // 50 points no matter where from — a genuinely on-frame shot always
+            // tested the keeper. Position (xg of WHERE it was taken) controls the
+            // CAP, not the floor: a hopeful long-range pot-shot caps at the floor,
+            // a close central chance can reach 200 (= 0.40·goal). MPC placement
+            // quality interpolates inside the band. Spam is blocked structurally:
+            // ev_shot_on requires a legal, earned shot and the cooldown zeroes
+            // rapid-fire repeats.
+            r += anchored_shot_points(w.last_shot_quality_a, w.last_shot_xg_a, rw().shot_span);
         }
         // reward winning the ball back (pressing / interceptions / tackles)
         if w.ev_win_ball_a {
@@ -683,7 +691,10 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
         // little. SMALL per-tick — it fires every tick you carry, so a big value
         // accumulates into ball-hoarding that dwarfs goals.
         if w.ev_dribble_fwd_a {
-            r += rw().dribble; // forward carrying (also paid by potential shaping) — bounded, unfarmable
+            // Forward carrying, scaled by the field-vector context: worth most in
+            // our own half (progression is the carry's job there), tapering in
+            // the final third where shooting/box-passing outrank it.
+            r += rw().dribble * dribble_field_context(w.ball.x);
         }
         // (lateral dribble: no flat reward — potential shaping handles real progress)
         // Dispossessed while carrying is handled by ev_dribble_turnover_a above,
@@ -703,7 +714,9 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
                 pen += rw().return_stale; // no upfield progress -> heavier
             }
             pen *= 1.0 + 0.50 * pre_field.safe_outlet_value + 0.50 * pre_field.return_stale;
-            r -= pen.min(24.0);
+            // Cap at the non-conversion ceiling (0.40·goal): the escalation must
+            // sting, but no single shaping event may rival scoring.
+            r -= pen.min(REW_GOAL_POINTS * REWARD_NON_CONVERSION_MAX_FRACTION);
         }
 
         r += rw().field_goalside_delta
@@ -1213,13 +1226,16 @@ pub fn train_iter(policy: &mut Policy, games: usize, ent_beta: f32, rng: &mut Rn
                 policy.speedor.backward(&sacts, &d_slogits);
 
                 // ---- centralized critic (MSE to GAE return), on GLOBAL state ----
+                // Targets normalized to GOAL units so the fixed LR fits the
+                // anchored point scale (predictions are denormalized in rollout).
                 let cacts = policy.critic.forward(&s.gstate);
                 let v = cacts.last().unwrap()[0];
-                let dv = v - s.ret; // dL/dv for 0.5*(v-ret)^2
+                let ret_n = s.ret / RETURN_NORM;
+                let dv = v - ret_n; // dL/dv for 0.5*(v-ret_n)^2
                 policy.critic.backward(&cacts, &[dv]);
 
                 ent_accum += ent + ent_s;
-                vloss_accum += 0.5 * (v - s.ret) * (v - s.ret);
+                vloss_accum += 0.5 * (v - ret_n) * (v - ret_n);
                 count += 1.0;
             }
             policy.actor.step(LR_ACTOR);
@@ -1420,6 +1436,38 @@ pub fn evaluate_scripted_vs_scripted(games: usize, rng: &mut Rng) -> (f32, f32, 
     (diff / g, ga / g, gb / g)
 }
 
+/// Scripted-vs-scripted PASS telemetry (the ball-flight physics A/B probe):
+/// Team-A pass attempts + completions per game over `games` seeded scripted
+/// games. Both teams run the identical scripted controller; the `ev_pass_*`
+/// events track Team A, which is representative because play is symmetric.
+/// Returns (attempts/game, completions/game, completion fraction).
+/// Consumed by the (ignored) `scripted_pass_probe` test — a measurement
+/// harness, not part of the training loop.
+#[allow(dead_code)]
+pub fn scripted_pass_stats(games: usize, rng: &mut Rng) -> (f32, f32, f32) {
+    let (mut att, mut cmp) = (0.0f32, 0.0f32);
+    for _ in 0..games {
+        let mut w = World::new();
+        if rng.f01() < 0.5 {
+            w.kickoff(Team::B);
+        }
+        for _ in 0..STEPS {
+            let act_a = w.scripted_actions(Team::A);
+            let act_b = w.scripted_actions(Team::B);
+            w.step(&act_a, &act_b, rng);
+            if w.ev_pass_attempt_a {
+                att += 1.0;
+            }
+            if w.ev_pass_completed_a {
+                cmp += 1.0;
+            }
+        }
+    }
+    let g = games.max(1) as f32;
+    let frac = if att > 0.0 { cmp / att } else { 0.0 };
+    (att / g, cmp / g, frac)
+}
+
 fn shuffle(v: &mut [usize], rng: &mut Rng) {
     for i in (1..v.len()).rev() {
         let j = (rng.next_u64() % (i as u64 + 1)) as usize;
@@ -1430,6 +1478,98 @@ fn shuffle(v: &mut [usize], rng: &mut Rng) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MEASUREMENT probe: the RL BOOTSTRAP chain under exploration noise —
+    /// noisy-scripted vs noisy-scripted approximates the warm-started rollout
+    /// regime (BC clone ~ scripted + sampling noise). Reports the pass ->
+    /// 2-streak -> legal shot -> goal funnel the attacking gradient needs.
+    #[test]
+    #[ignore]
+    fn exploration_bootstrap_probe() {
+        for noise in [0.0f32, 0.25, 0.5] {
+            let mut rng = Rng::new(9001);
+            let (mut att, mut cmp, mut streak2, mut shots, mut goals) =
+                (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32);
+            for _ in 0..100 {
+                let mut w = World::new();
+                if rng.f01() < 0.5 {
+                    w.kickoff(Team::B);
+                }
+                for _ in 0..STEPS {
+                    let act_a = noisy_scripted_actions(&w, Team::A, noise, &mut rng);
+                    let act_b = noisy_scripted_actions(&w, Team::B, noise, &mut rng);
+                    w.step(&act_a, &act_b, &mut rng);
+                    att += w.ev_pass_attempt_a as u8 as f32;
+                    cmp += w.ev_pass_completed_a as u8 as f32;
+                    streak2 += (w.ev_pass_completed_a && w.pass_streak_a == 2) as u8 as f32;
+                    shots += w.ev_shot_attempt_a as u8 as f32;
+                    goals += w.ev_goal_a as u8 as f32;
+                }
+            }
+            println!(
+                "noise {noise:.2}: att/g={:.2} cmp={:.0}% streak2/g={:.2} shots/g={:.2} goalsA/g={:.2}",
+                att / 100.0,
+                100.0 * cmp / att.max(1.0),
+                streak2 / 100.0,
+                shots / 100.0,
+                goals / 100.0
+            );
+        }
+    }
+
+    /// MEASUREMENT probe: pass completion when Team A's SPEED GEARS are
+    /// scrambled (uniform legal gear per player per tick) — the post-warmup
+    /// rollout regime where the untrained speed head jitters receiver
+    /// velocities. A velocity-extrapolating pass lead must stay robust here.
+    #[test]
+    #[ignore]
+    fn gear_scramble_pass_probe() {
+        let mut rng = Rng::new(31337);
+        let (mut att, mut cmp, mut shots, mut goals) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        for _ in 0..100 {
+            let mut w = World::new();
+            if rng.f01() < 0.5 {
+                w.kickoff(Team::B);
+            }
+            for _ in 0..STEPS {
+                let mut act_a = w.scripted_actions(Team::A);
+                for i in 1..N {
+                    let a = act_a[i] % NA;
+                    let gear = (rng.next_u64() % NS as u64) as usize;
+                    act_a[i] = a + w.coerce_speed_gear(Team::A, i, a, gear) * NA;
+                }
+                let act_b = w.scripted_actions(Team::B);
+                w.step(&act_a, &act_b, &mut rng);
+                att += w.ev_pass_attempt_a as u8 as f32;
+                cmp += w.ev_pass_completed_a as u8 as f32;
+                shots += w.ev_shot_attempt_a as u8 as f32;
+                goals += w.ev_goal_a as u8 as f32;
+            }
+        }
+        println!(
+            "gear-scramble A: att/g={:.2} cmp={:.0}% shots/g={:.2} goalsA/g={:.2}",
+            att / 100.0,
+            100.0 * cmp / att.max(1.0),
+            shots / 100.0,
+            goals / 100.0
+        );
+    }
+
+    /// NOT a pass/fail gate — a seeded MEASUREMENT probe for the ball-flight
+    /// physics A/B. Follows the process env: default = legacy physics (~63%
+    /// completion); FIVEASIDE_PARITY_BALLFLIGHT=1 = parity stack (~71%).
+    ///   [FIVEASIDE_PARITY_BALLFLIGHT=1] cargo test --release \
+    ///       scripted_pass_probe -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn scripted_pass_probe() {
+        let mut rng = Rng::new(4242);
+        let (att, cmp, frac) = scripted_pass_stats(100, &mut rng);
+        println!(
+            "scripted-vs-scripted over 100 games: pass_att/game={att:.2} pass_cmp/game={cmp:.2} completion={:.1}%",
+            frac * 100.0
+        );
+    }
 
     #[test]
     fn spacing_reward_penalizes_overlap_and_prefers_useful_distance() {
@@ -1471,47 +1611,69 @@ mod tests {
     }
 
     #[test]
-    fn football_outcomes_always_dominate_a_nonconverting_shot() {
-        let (goal, shot_base, shot_q) = grounded_conversion_ladder(6.0, 18.0, 4.0);
-        let weights = enforce_reward_hierarchy(Rw {
-            goal,
-            concede: 4.0,
-            match_win: 8.0,
-            match_loss: 6.0,
-            shot_base,
-            shot_q,
-            milestone: MIN_REWARD_WEIGHT,
-            pass_credit: MIN_REWARD_WEIGHT,
-            turnover: MIN_REWARD_WEIGHT,
-            bad_pass_turnover: MIN_REWARD_WEIGHT,
-            dribble_turnover: MIN_REWARD_WEIGHT,
-            recycle: MIN_REWARD_WEIGHT,
-            return_pass: MIN_REWARD_WEIGHT,
-            return_stale: MIN_REWARD_WEIGHT,
-            win_ball: MIN_REWARD_WEIGHT,
-            dribble: MIN_REWARD_WEIGHT,
-            shape: 0.5,
-            advance: MIN_REWARD_WEIGHT,
-            open: MIN_REWARD_WEIGHT,
-            width: MIN_REWARD_WEIGHT,
-            flank: MIN_REWARD_WEIGHT,
-            goalside: MIN_REWARD_WEIGHT,
-            goalside_run: MIN_REWARD_WEIGHT,
-            ahead: MIN_REWARD_WEIGHT,
-            make_run: MIN_REWARD_WEIGHT,
-            burst_gear: MIN_REWARD_WEIGHT,
-            field_pass: MIN_REWARD_WEIGHT,
-            field_turnover: MIN_REWARD_WEIGHT,
-            chance: MIN_REWARD_WEIGHT,
-            field_goalside_delta: MIN_REWARD_WEIGHT,
-            field_burst_delta: MIN_REWARD_WEIGHT,
-            stand_pen: MIN_REWARD_WEIGHT,
-            pursuit: MIN_REWARD_WEIGHT,
-        });
-        let miss_ceiling = max_nonconverting_shot_reward(&weights);
-        assert!(weights.goal >= miss_ceiling + CONVERSION_OVER_SHOT_MARGIN);
-        assert!(miss_ceiling <= weights.goal * REWARD_NON_CONVERSION_MAX_FRACTION + 1e-5);
-        assert!(weights.match_win >= weights.goal + WIN_OVER_CONVERSION_MARGIN);
+    fn anchored_shot_points_respect_floor_and_position_cap() {
+        // The floor pays everywhere — worst placement, worst position.
+        assert!((anchored_shot_points(0.0, 0.0, 1.0) - ON_FRAME_SHOT_FLOOR).abs() < 1e-4);
+        // Hopeless position (xg = 0): the cap IS the floor, no placement or
+        // span setting can push an on-frame long-ranger above 50.
+        assert!((anchored_shot_points(1.0, 0.0, 1.5) - ON_FRAME_SHOT_FLOOR).abs() < 1e-4);
+        // Best case reaches exactly the non-conversion ceiling (0.40 · goal)
+        // and never above it.
+        let best = anchored_shot_points(1.0, 1.0, 1.5);
+        assert!(best <= REW_GOAL_POINTS * REWARD_NON_CONVERSION_MAX_FRACTION + 1e-4);
+        assert!(best >= REW_GOAL_POINTS * REWARD_NON_CONVERSION_MAX_FRACTION - 1e-4);
+        // The currency ordering is compile-time: shot < goal < win.
+        assert!(best < REW_GOAL_POINTS && REW_GOAL_POINTS < REW_WIN_POINTS);
+        // Monotone in position quality: better spots raise the ceiling.
+        assert!(anchored_shot_points(0.8, 0.9, 1.0) > anchored_shot_points(0.8, 0.2, 1.0));
+        // Placement can only move points WITHIN the band, never below floor.
+        assert!(anchored_shot_points(0.3, 0.5, 1.0) >= ON_FRAME_SHOT_FLOOR);
+    }
+
+    #[test]
+    fn field_context_orders_dribble_vs_shot_by_position() {
+        // Own half: carry context is full value…
+        assert!((dribble_field_context(FIELD_L * 0.25) - 1.0).abs() < 1e-5);
+        // …and tapers monotonically through the final third.
+        assert!(dribble_field_context(FIELD_L * 0.7) > dribble_field_context(FIELD_L * 0.95));
+        assert!(dribble_field_context(FIELD_L) >= 0.39);
+        // Even the maximum per-tick carry reward stays far under the on-frame
+        // shot floor: in the final third shooting outranks dribbling…
+        assert!(5.0 * dribble_field_context(FIELD_L * 0.9) < ON_FRAME_SHOT_FLOOR);
+        // …while in our own half a shot cannot even register on-frame (the
+        // d<24 gate in game.rs), so the carry dominates there by construction.
+    }
+
+    #[test]
+    fn anchored_terminal_rewards_keep_the_currency_ordering() {
+        // win(1000) = 2 × goal(500); goal = 10 × shot floor(50). If someone
+        // edits an anchor, this is the tripwire that forces a conscious choice.
+        assert!((REW_WIN_POINTS - 2.0 * REW_GOAL_POINTS).abs() < 1e-6);
+        assert!((REW_GOAL_POINTS - 10.0 * ON_FRAME_SHOT_FLOOR).abs() < 1e-6);
+        assert!(
+            ON_FRAME_SHOT_FLOOR + ON_FRAME_SHOT_CAP_SPAN
+                <= REW_GOAL_POINTS * REWARD_NON_CONVERSION_MAX_FRACTION + 1e-6
+        );
+        // Negative mirrors are bounded fractions: conceding never exceeds the
+        // goal anchor, losing never exceeds the win anchor, neither can vanish.
+        let w = rw();
+        assert!(w.concede_frac >= 0.25 && w.concede_frac <= 1.0);
+        assert!(w.loss_frac >= 0.4 && w.loss_frac <= 1.0);
+        // Every discoverable event weight's hi-bound stays under the
+        // non-conversion ceiling — no tuned weight can rival a goal.
+        for hi in [
+            w.milestone,
+            w.pass_credit,
+            w.turnover,
+            w.bad_pass_turnover,
+            w.dribble_turnover,
+            w.recycle,
+            w.return_pass,
+            w.return_stale,
+            w.win_ball,
+        ] {
+            assert!(hi < REW_GOAL_POINTS * REWARD_NON_CONVERSION_MAX_FRACTION);
+        }
     }
 
     #[test]

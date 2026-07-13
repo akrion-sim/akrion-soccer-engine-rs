@@ -25,7 +25,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 BIN = os.path.join(ROOT, "target", "release", "fiveaside")
 MIN_WEIGHT = 0.0001
-CONVERSION_REWARD_MARGIN = 5.0
 
 
 def env_int(name, default, lo=None, hi=None):
@@ -59,43 +58,47 @@ def env_float(name, default, lo=None, hi=None):
 # weights below multiply dynamic terms derived from the 10-player field vector.
 # Lower bounds are intentionally positive: channels may get tiny, but never
 # collapse to zero and disappear from the learned objective.
+# ANCHORED CURRENCY (docs/reward-anchoring.md): win=1000 / goal=500 / on-frame
+# shot floor=50 are FIXED anchors inside the binary and are NOT searched — the
+# optimizer discovers everything else, in points, inside these sane bounds
+# (the binary clamps identically, so the search space == the legal space).
 SPACE = [
-    ("REW_GOAL",      12.0,  6.0,  20.0, False),
-    ("REW_CONCEDE",    8.0,  4.0,  16.0, False),
-    ("REW_SHOT_BASE",  1.5,  0.3,   3.5, False),
-    ("REW_SHOT_Q",     1.0,  MIN_WEIGHT,   2.5, False),
-    ("REW_MILESTONE",  0.3,  MIN_WEIGHT,   1.5, False),
-    ("REW_PASS",       0.06, MIN_WEIGHT,   0.4, False),
-    ("REW_TURNOVER",   0.55, MIN_WEIGHT,   1.5, False),
-    ("REW_BAD_PASS_TURNOVER", 0.35, MIN_WEIGHT, 1.5, False),
-    ("REW_DRIBBLE_TURNOVER", 0.75, MIN_WEIGHT, 2.0, False),
-    ("REW_RECYCLE",    0.18, MIN_WEIGHT,   0.8, False),
-    ("REW_RETURN_PASS", 0.35, MIN_WEIGHT,  2.0, False),
-    ("REW_RETURN_STALE", 0.55, MIN_WEIGHT, 2.0, False),
-    ("REW_WIN_BALL",   0.3,  MIN_WEIGHT,   1.2, False),
-    ("REW_DRIBBLE",    0.015, MIN_WEIGHT,  0.12, False),
-    ("W_SHAPE",        2.2,  0.5,   4.0, False),
-    ("SPACING_W",      0.003, 0.0005, 0.012, True),
-    ("W_ADVANCE",      0.04, MIN_WEIGHT,   0.12, False),
-    ("W_OPEN",         0.04, MIN_WEIGHT,   0.12, False),
-    ("W_WIDTH",        0.045, MIN_WEIGHT,  0.12, False),
-    ("W_FLANK",        0.025, MIN_WEIGHT,  0.10, False),
-    ("W_GOALSIDE",     0.08, MIN_WEIGHT,   0.25, False),
-    ("W_GOALSIDE_RUN", 0.04, MIN_WEIGHT,   0.16, False),
-    ("W_AHEAD",        0.035, MIN_WEIGHT,  0.16, False),
-    ("W_MAKE_RUN",     0.06, MIN_WEIGHT,   0.20, False),
-    ("W_BURST_GEAR",   0.035, MIN_WEIGHT,  0.16, False),
-    ("W_FIELD_PASS",   0.08, MIN_WEIGHT,   0.30, False),
-    ("W_FIELD_TURNOVER", 0.16, MIN_WEIGHT, 0.50, False),
-    ("W_FIELD_GOALSIDE_DELTA", 0.10, MIN_WEIGHT, 0.35, False),
-    ("W_FIELD_BURST_DELTA", 0.08, MIN_WEIGHT, 0.35, False),
-    ("W_STAND_PEN",    0.02, MIN_WEIGHT,   0.20, False),
+    # Negative anchor mirrors: fractions of goal/win — the risk-appetite knobs.
+    ("REW_CONCEDE_FRAC", 0.67, 0.25,       1.0, False),
+    ("REW_LOSS_FRAC",  0.5,  0.4,          1.0, False),
+    ("REW_SHOT_SPAN",  1.0,  MIN_WEIGHT,   1.5, False),
+    ("REW_MILESTONE", 12.0,  MIN_WEIGHT,  40.0, False),
+    ("REW_PASS",       2.5,  MIN_WEIGHT,  25.0, False),
+    ("REW_TURNOVER",  23.0,  MIN_WEIGHT,  60.0, False),
+    ("REW_BAD_PASS_TURNOVER", 15.0, MIN_WEIGHT, 30.0, False),
+    ("REW_DRIBBLE_TURNOVER", 25.0, MIN_WEIGHT, 30.0, False),
+    ("REW_RECYCLE",    7.5,  MIN_WEIGHT,  30.0, False),
+    ("REW_RETURN_PASS", 15.0, MIN_WEIGHT, 40.0, False),
+    ("REW_RETURN_STALE", 23.0, MIN_WEIGHT, 40.0, False),
+    ("REW_WIN_BALL",  12.5,  MIN_WEIGHT,  40.0, False),
+    ("REW_DRIBBLE",    0.6,  MIN_WEIGHT,   5.0, False),
+    ("W_SHAPE",       90.0,  20.0,       160.0, False),
+    ("SPACING_W",      0.33, 0.02,         0.9, True),
+    ("W_ADVANCE",      1.7,  MIN_WEIGHT,   5.0, False),
+    ("W_OPEN",         1.7,  MIN_WEIGHT,   5.0, False),
+    ("W_WIDTH",        1.9,  MIN_WEIGHT,   5.0, False),
+    ("W_FLANK",        1.0,  MIN_WEIGHT,   4.0, False),
+    ("W_GOALSIDE",     3.3,  MIN_WEIGHT,  10.0, False),
+    ("W_GOALSIDE_RUN", 1.7,  MIN_WEIGHT,   6.5, False),
+    ("W_AHEAD",        1.5,  MIN_WEIGHT,   6.5, False),
+    ("W_MAKE_RUN",     2.5,  MIN_WEIGHT,   8.0, False),
+    ("W_BURST_GEAR",   1.5,  MIN_WEIGHT,   6.5, False),
+    ("W_FIELD_PASS",   3.3,  MIN_WEIGHT,  12.5, False),
+    ("W_FIELD_TURNOVER", 6.7, MIN_WEIGHT, 20.0, False),
+    ("W_FIELD_GOALSIDE_DELTA", 4.2, MIN_WEIGHT, 15.0, False),
+    ("W_FIELD_BURST_DELTA", 3.3, MIN_WEIGHT, 15.0, False),
+    ("W_STAND_PEN",    0.8,  MIN_WEIGHT,   8.0, False),
     # MARL chance-creation weight — the binary reads this (train.rs wenv("W_CHANCE",..));
     # it was previously frozen at its default and excluded from the search, silently
-    # under-covering the 31-weight reward vector. Now tuned like the rest.
-    ("W_CHANCE",       0.12, MIN_WEIGHT,   0.60, False),
+    # under-covering the reward vector. Now tuned like the rest.
+    ("W_CHANCE",       5.0,  MIN_WEIGHT,  25.0, False),
     # loose-ball pursuit — how hard the favorite commits to winning a free ball.
-    ("W_PURSUIT",      0.05, MIN_WEIGHT,   0.25, False),
+    ("W_PURSUIT",      2.1,  MIN_WEIGHT,  10.0, False),
 ]
 
 ITERS   = env_int("TUNE_ITERS", 500, lo=1)
@@ -173,46 +176,13 @@ def clamp_space_value(index, value):
 
 
 def ground_reward_vector(vec):
-    """Project a candidate onto the same reward ladder enforced by the binary.
+    """Project a candidate onto the legal space.
 
-    The optimizer may tune shot and goal weights, but it may not discover a local
-    optimum where a non-converting shot is worth as much as scoring.
+    The anchors (win/goal/shot floor+cap) are compile-time constants in the
+    binary, so the ladder shot<goal<win holds by construction — grounding here
+    reduces to per-dimension bound clamping (the binary clamps identically).
     """
-    out = list(vec)
-    idx = {name: i for i, (name, *_rest) in enumerate(SPACE)}
-    goal_i = idx["REW_GOAL"]
-    shot_base_i = idx["REW_SHOT_BASE"]
-    shot_q_i = idx["REW_SHOT_Q"]
-
-    for i in (goal_i, shot_base_i, shot_q_i):
-        out[i] = clamp_space_value(i, out[i])
-
-    required_goal = out[shot_base_i] + out[shot_q_i] + CONVERSION_REWARD_MARGIN
-    out[goal_i] = clamp_space_value(goal_i, max(out[goal_i], required_goal))
-    if out[goal_i] + 1e-12 >= required_goal:
-        return out
-
-    budget = max(
-        MIN_WEIGHT,
-        out[goal_i] - CONVERSION_REWARD_MARGIN,
-    )
-    base_min = max(MIN_WEIGHT, SPACE[shot_base_i][2])
-    q_min = max(MIN_WEIGHT, SPACE[shot_q_i][2])
-    variable_budget = max(0.0, budget - base_min - q_min)
-    base_extra = max(0.0, out[shot_base_i] - base_min)
-    q_extra = max(0.0, out[shot_q_i] - q_min)
-    extra_total = base_extra + q_extra
-    if extra_total > 0.0:
-        scale = min(1.0, variable_budget / extra_total)
-        out[shot_base_i] = base_min + base_extra * scale
-        out[shot_q_i] = q_min + q_extra * scale
-    else:
-        out[shot_base_i] = base_min
-        out[shot_q_i] = q_min
-
-    out[shot_base_i] = clamp_space_value(shot_base_i, out[shot_base_i])
-    out[shot_q_i] = clamp_space_value(shot_q_i, out[shot_q_i])
-    return out
+    return [clamp_space_value(i, v) for i, v in enumerate(vec)]
 
 
 def parse(stdout):
