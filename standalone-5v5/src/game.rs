@@ -516,6 +516,7 @@ impl World {
             shoot_cooldown_a: 0,
             shot_was_rapid_a: false,
             a_shot_flag: false,
+            a_shot_origin: V2::default(),
             lp_from: -1,
             lp_to: -1,
             pending_passer: -1,
