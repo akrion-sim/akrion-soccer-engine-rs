@@ -475,6 +475,7 @@ def main():
                          "held-out promotion vs frozen analytic"],
         },
         "arch": ARCH, "feature_groups": FEATURE_GROUPS, "actions": ACTIONS,
+        "decisions": decision_examples(),
         "dp": dp, "credit": credit_chain(), "nn_value": nn_value(dp),
         "formation": formation_lp(), "mpc": mpc_qp(),
         "optimize": evolution_strategy(), "learning": learning_curve(), "league": league(),
