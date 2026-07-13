@@ -618,6 +618,41 @@ fn train_ckpt(out_prefix: &str, games: usize, minutes: f64, seed_base: u32, ckpt
                 write_ckpt(s, &done.to_string());
             }
         }
+        if let Some(kb) = keepbest.as_ref() {
+            if keepbest_due(done, games, kb.every) {
+                if let Some(snap) = snapshot.as_ref() {
+                    match keepbest_proxy_score(snap, kb.games, minutes, kb.holdout) {
+                        Some(score) => {
+                            let improved = kb_best.map_or(true, |best| score.better_than(&best));
+                            if improved {
+                                kb_best = Some(score);
+                                let best_path = format!("{out_prefix}.best.json");
+                                match serde_json::to_string(snap) {
+                                    Ok(json) => match std::fs::write(&best_path, json) {
+                                        Ok(()) => println!(
+                                            "[keepbest] game={done} score={score} best={score} -> wrote {best_path}"
+                                        ),
+                                        Err(e) => eprintln!(
+                                            "[keepbest] game={done} score={score} improved but write {best_path} failed: {e}"
+                                        ),
+                                    },
+                                    Err(e) => {
+                                        eprintln!("[keepbest] game={done} serialize failed: {e}")
+                                    }
+                                }
+                            } else {
+                                // kb_best is always Some here: improved is true when it is None.
+                                let best = kb_best.unwrap_or(score);
+                                println!("[keepbest] game={done} score={score} best={best} held");
+                            }
+                        }
+                        None => eprintln!(
+                            "[keepbest] game={done} proxy eval produced no completed fixtures; held"
+                        ),
+                    }
+                }
+            }
+        }
     }
     if let Some(s) = snapshot.as_ref() {
         write_ckpt(s, "FINAL");
