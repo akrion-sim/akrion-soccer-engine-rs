@@ -197,6 +197,8 @@ fn rw() -> &'static Rw {
     // the same RELATIVE region that trained well, now expressed in points.
     static R: std::sync::OnceLock<Rw> = std::sync::OnceLock::new();
     R.get_or_init(|| Rw {
+        concede_frac: wenv("REW_CONCEDE_FRAC", 0.67, 0.25, 1.0),
+        loss_frac: wenv("REW_LOSS_FRAC", 0.5, 0.4, 1.0),
         shot_span: wenv("REW_SHOT_SPAN", 1.0, MIN_REWARD_WEIGHT, 1.5),
         milestone: wenv("REW_MILESTONE", 12.0, MIN_REWARD_WEIGHT, 40.0),
         pass_credit: wenv("REW_PASS", 2.5, MIN_REWARD_WEIGHT, 25.0),
