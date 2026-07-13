@@ -20277,27 +20277,7 @@ impl SoccerMatch {
         {
             let _ = writeln!(file, "{}", line);
         }
-=======
-        // Resolve the winner once (behavior-preserving refactor of the previous early-return
-        // chain: mcts -> {authoritative: dp-safe -> technical-floor -> top} | weighted) so the
-        // net-influence diagnostic can compare it against the tabular baseline before returning.
-        let choice = if let Some(mcts_label) =
-            Self::neural_mcts_action_from_candidates(blend, &scored_candidates, rank_draw)
-        {
-            Some(mcts_label)
-        } else if blend.mode == SoccerNeuralBlendMode::Authoritative {
-            Self::neural_authoritative_dp_safety_choice(&scored_candidates, &legal)
-                .or_else(|| {
-                    Self::technical_scored_candidate_floor_choice(&scored_candidates, rank_draw)
-                })
-                .or_else(|| Self::top_scored_candidate_choice(&scored_candidates))
-        } else {
-            Self::weighted_scored_candidate_choice(&scored_candidates, rank_draw)
-        };
-        // Net-influence is measured at the decision assembler (learned_action_for_player_with_context)
-        // against the real tabular-only counterfactual, per Codex; see record_net_influence_diag there.
-        choice
-    }
+        }
 
     /// The action label the ACTUAL blend-off tabular path would commit for `player_id` — the
     /// net-influence counterfactual. Mirrors the decision assembler's tabular fallback (same
