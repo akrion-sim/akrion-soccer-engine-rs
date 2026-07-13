@@ -1704,9 +1704,7 @@ impl World {
         // Shot resolved: clear flight state + shot flags, credit the save event.
         self.a_shot_flag = false;
         self.b_shot_flag = false;
-        self.ball_aerial = false;
-        self.air_ticks = 0;
-        self.ball_curl = V2::default();
+        self.reset_ball_flight();
         self.pending_pass = None;
         if def_team == Team::B {
             self.ev_save_a = true; // A's shot was saved
