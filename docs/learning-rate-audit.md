@@ -157,3 +157,19 @@ therefore disables DP deliberately to isolate whether dense negative/correlated 
 conflicts with the fixed winning anchor. It must clear the same held-out gate on repeated
 seeds and then survive a DP-compatible test before any default change; one nominal win is
 not evidence of a durable climb.
+
+The first 60-game outcome-credit screen produced 32 held-out fixtures per arm. Outcome-off
+and flat `200` tied on the primary payoff at `0.547`; their Elo deltas were `+12.4` and
+`+44.9`, and forward-pass margins were `-0.22/game` and `+0.00/game`, respectively. The
+experimental outcome-credit replay regressed to payoff `0.422`, Elo delta `-49.8`, and
+forward margin `-0.38/game`. Wilson lower bounds were `0.379`, `0.379`, and `0.268`, all
+below promotion. Outcome-credit is rejected on this seed; the flat/off tie is not evidence
+to change the existing outcome default.
+
+The next DP-compatible test is `scripts/run_dp_terminal_outcome_ab.sh`. Its default-off
+`DD_SOCCER_ENABLE_DP_TERMINAL_OUTCOME_CREDIT` treatment puts the fixed result on exactly
+one terminal sample per team, then uses the existing fitted value iteration and n-step
+bootstrap to propagate that signal through the field-state abstraction. It compares
+DP-without-outcome, the existing DP flat broadcast, and DP terminal propagation at the
+production target scale. This tests a fixed winning anchor without assigning identical
+credit to every action; it remains experimental until held-out and repeated-seed gates pass.
