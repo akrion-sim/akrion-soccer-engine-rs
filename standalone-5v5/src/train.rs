@@ -1517,6 +1517,44 @@ mod tests {
         }
     }
 
+    /// MEASUREMENT probe: pass completion when Team A's SPEED GEARS are
+    /// scrambled (uniform legal gear per player per tick) — the post-warmup
+    /// rollout regime where the untrained speed head jitters receiver
+    /// velocities. A velocity-extrapolating pass lead must stay robust here.
+    #[test]
+    #[ignore]
+    fn gear_scramble_pass_probe() {
+        let mut rng = Rng::new(31337);
+        let (mut att, mut cmp, mut shots, mut goals) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        for _ in 0..100 {
+            let mut w = World::new();
+            if rng.f01() < 0.5 {
+                w.kickoff(Team::B);
+            }
+            for _ in 0..STEPS {
+                let mut act_a = w.scripted_actions(Team::A);
+                for i in 1..N {
+                    let a = act_a[i] % NA;
+                    let gear = (rng.next_u64() % NS as u64) as usize;
+                    act_a[i] = a + w.coerce_speed_gear(Team::A, i, a, gear) * NA;
+                }
+                let act_b = w.scripted_actions(Team::B);
+                w.step(&act_a, &act_b, &mut rng);
+                att += w.ev_pass_attempt_a as u8 as f32;
+                cmp += w.ev_pass_completed_a as u8 as f32;
+                shots += w.ev_shot_attempt_a as u8 as f32;
+                goals += w.ev_goal_a as u8 as f32;
+            }
+        }
+        println!(
+            "gear-scramble A: att/g={:.2} cmp={:.0}% shots/g={:.2} goalsA/g={:.2}",
+            att / 100.0,
+            100.0 * cmp / att.max(1.0),
+            shots / 100.0,
+            goals / 100.0
+        );
+    }
+
     /// NOT a pass/fail gate — a seeded MEASUREMENT probe for the ball-flight
     /// physics A/B (run explicitly):
     ///   cargo test --release scripted_pass_probe -- --ignored --nocapture
