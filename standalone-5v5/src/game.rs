@@ -3354,6 +3354,7 @@ mod tests {
     fn led_forward_pass_connects_with_a_stationary_receiver() {
         for seed in 1..=20u64 {
             let mut w = World::new();
+            w.parity_flight = true; // exercises the PARITY lead + speed solve
             let mut rng = Rng::new(seed);
             for i in 0..N {
                 w.a[i].pos = V2::new(6.0, 3.0 + 2.0 * i as f32); // parked deep
