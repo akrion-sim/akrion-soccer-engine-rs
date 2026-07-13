@@ -40971,6 +40971,12 @@ pub struct WorldSnapshot {
     /// Skipped by serde (an internal decision aid; Default = None).
     #[serde(skip)]
     pub(crate) loose_ball_commit_head: Option<std::sync::Arc<LooseBallCommitHead>>,
+    /// The trained per-context MPC reject-threshold head, carried from the match for
+    /// live consumption at the MPC feasibility gate ([`Self::learned_mpc_reject_threshold`]).
+    /// `None` ⇒ context-aware analytic seed (and, when the model is gated off, the
+    /// constant base bar — parity). Skipped by serde (an internal decision aid).
+    #[serde(skip)]
+    pub(crate) mpc_reject_threshold_head: Option<std::sync::Arc<MpcRejectThresholdHead>>,
     /// The trained receive-approach head, carried from the match for live consumption in
     /// the reception election (`receive_approach_adjusted_target`). `None` ⇒ analytic seed
     /// (parity). Skipped by serde (an internal decision aid; Default = None).
