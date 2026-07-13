@@ -38791,7 +38791,10 @@ fn struck_shot_releases_the_ball_in_the_fifty_to_seventytwo_band() {
     let power = shot_power_for_skill(ability01(sim.players[shooter].skills.shooting));
     sim.apply_player_intent(PlayerIntent {
         player_id: shooter,
-        action: SoccerAction::Shoot { power },
+        action: SoccerAction::Shoot {
+            power,
+            target_point: None,
+        },
         sprint: false,
     });
 
