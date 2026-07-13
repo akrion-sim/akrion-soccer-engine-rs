@@ -29,9 +29,9 @@ use std::path::Path;
 use std::time::Instant;
 
 use soccer_engine::des::general::soccer::{
-    average_soccer_neural_network_snapshots, learned_mpc_objective_enabled, FacingBucket,
-    MatchSummary, SoccerNeuralBlendMode, SoccerNeuralNetworkSnapshot, SoccerQStateKey,
-    SoccerQTargetEntry, TacticalPhase, Team,
+    average_soccer_neural_network_snapshots, learned_mpc_objective_enabled,
+    mpc_reject_threshold_model_enabled, FacingBucket, MatchSummary, SoccerNeuralBlendMode,
+    SoccerNeuralNetworkSnapshot, SoccerQStateKey, SoccerQTargetEntry, TacticalPhase, Team,
 };
 use soccer_engine::des::general::tournament::{
     EngineMatchRunner, EngineMatchRunnerConfig, TeamBrain, TournamentMatchContext,
@@ -157,9 +157,12 @@ fn apply_league_actor_config(config: &mut EngineMatchRunnerConfig) -> bool {
 
 fn league_worker_count(requested_workers: usize, fixture_count: usize) -> usize {
     let capped = requested_workers.clamp(1, fixture_count.max(1));
-    let serial_for_mpc_objective =
-        learned_mpc_objective_enabled() && env_bool("SOCCER_LEAGUE_MPC_OBJECTIVE_SERIAL", true);
-    if serial_for_mpc_objective {
+    let carries_mpc_head = learned_mpc_objective_enabled() || mpc_reject_threshold_model_enabled();
+    let serial_carried_mpc = std::env::var("SOCCER_LEAGUE_CARRIED_MPC_SERIAL")
+        .ok()
+        .map(|_| env_bool("SOCCER_LEAGUE_CARRIED_MPC_SERIAL", true))
+        .unwrap_or_else(|| env_bool("SOCCER_LEAGUE_MPC_OBJECTIVE_SERIAL", true));
+    if carries_mpc_head && serial_carried_mpc {
         1
     } else {
         capped
@@ -1129,6 +1132,12 @@ fn main() {
     let mappo_epochs = env_default_usize("SOCCER_MAPPO_EPOCHS", 4);
     let full_game_policy_max_samples =
         env_default_usize("DD_SOCCER_FULL_GAME_POLICY_MAX_SAMPLES", 0);
+    let mpc_reject_threshold_model =
+        env_default_bool("DD_SOCCER_ENABLE_MPC_REJECT_THRESHOLD_MODEL", true);
+    let mpc_reject_threshold_epochs =
+        env_default_usize("DD_SOCCER_MPC_REJECT_THRESHOLD_EPOCHS", 4).clamp(1, 64);
+    let mpc_reject_threshold_learning_rate =
+        env_default_f64("DD_SOCCER_MPC_REJECT_THRESHOLD_LEARNING_RATE", 0.02).clamp(1e-6, 1.0);
     let attack_canonical_features =
         env_default_bool("DD_SOCCER_ENABLE_ATTACK_CANONICAL_NEURAL_FEATURES", true);
     let ball_zone_tactical_scale =
@@ -1454,7 +1463,7 @@ fn main() {
     let mut best_checkpoint_net_forward_pass_margin = f64::NEG_INFINITY;
     let mut archived_step_buckets: BTreeSet<usize> = BTreeSet::new();
     println!(
-        "league_train_started_at_utc={} games/opp={} minutes={} period_count={} weight_decay={} fresh_opp={} checkpoint_every={} max_rounds={} max_training_steps={} max_target_entries_per_side={} advancement_metric=completed_forward_passes net_metric=completed_forward_passes_minus_turnovers analytic_opponents={} uniform_elite_players={} seed_varied_skills={} hermetic_neural={} attack_canonical_features={} ball_zone_tactical_scale={} player_grid_xy_features={} policy_train_max_transitions_per_tick={} full_game_policy_max_samples={} full_game_learning_enabled={} neural_learning_rate={} neural_optimizer_momentum={} neural_blend_mode={:?} neural_blend_lambda={} neural_authoritative_lambda={} neural_blend_candidates={} neural_blend_warmup_steps={} policy_learning_rate={} mappo_epochs={} policy_entropy_coeff={} forward_select_logit_weight={} forward_select_logit_learning_rate={} forward_select_restore_override={forward_select_restore_override} finishing_select_bonus_weight={} finishing_selection_floor={} finishing_selection_max_regression={} finishing_selection_shot_drought_boost={finishing_selection_shot_drought_boost} finishing_selection_max_effective_floor={finishing_selection_max_effective_floor} forward_creation_selection_floor={forward_creation_selection_floor} forward_creation_selection_max_regression={forward_creation_selection_max_regression} forward_creation_min_quality={forward_creation_min_quality} forward_creation_min_completion={forward_creation_min_completion} forward_creation_min_forward_yards={forward_creation_min_forward_yards} forward_creation_bypass_min_quality={forward_creation_bypass_min_quality} forward_creation_bypass_min_completion={forward_creation_bypass_min_completion} planner_teacher_missed_opportunity={planner_teacher_missed_opportunity} planner_teacher_advantage_floor={planner_teacher_advantage_floor:.3} planner_teacher_advantage_max={planner_teacher_advantage_max:.3} planner_teacher_weight={planner_teacher_weight:.2} planner_teacher_min_score_share={planner_teacher_min_score_share:.3} planner_teacher_min_shot_quality={planner_teacher_min_shot_quality:.2} planner_teacher_min_forward_quality={planner_teacher_min_forward_quality:.2} planner_teacher_min_forward_completion={planner_teacher_min_forward_completion:.2} planner_teacher_max_samples_per_decision={planner_teacher_max_samples_per_decision} planner_teacher_include_same_pass_family={planner_teacher_include_same_pass_family} planner_teacher_same_pass_min_margin_share={planner_teacher_same_pass_min_margin_share:.3} chance_quality_reward={} chance_quality_composite={} chance_quality_k={} chance_quality_cap={} league_neural_mcts_enabled={} actor_critic_enabled={} lp_coupling_enabled={} target_standardization_enabled={} mc_critic_target_enabled={} neural_self_bootstrap_enabled={} maxa_bootstrap_enabled={} novelty_bonus_enabled={} fast_actor_reward_fallback_enabled={} pass_outcome_priority_learning_enabled={} forward_pass_climb_curriculum_enabled={} dp_bootstrap_enabled={} dp_bootstrap_horizon={} dp_bootstrap_sweeps={} mpc_tier2_enabled={} mpc_reconcile_enabled={} mpc_field_aware_enabled={} mpc_latent_objective_enabled={} local_mpc_enabled={} checkpoint_require_forward_pass_climb={} checkpoint_max_forward_pass_regression={} checkpoint_min_forward_pass_margin={} checkpoint_validate_games={} checkpoint_validate_min_forward_pass_margin={} checkpoint_validate_min_net_forward_pass_margin={} checkpoint_validate_min_goal_diff_margin={} frontier={} candidate_frontier={} archive={} step_archive_dir={} step_archive_buckets={:?}",
+        "league_train_started_at_utc={} games/opp={} minutes={} period_count={} weight_decay={} fresh_opp={} checkpoint_every={} max_rounds={} max_training_steps={} max_target_entries_per_side={} advancement_metric=completed_forward_passes net_metric=completed_forward_passes_minus_turnovers analytic_opponents={} uniform_elite_players={} seed_varied_skills={} hermetic_neural={} attack_canonical_features={} ball_zone_tactical_scale={} player_grid_xy_features={} policy_train_max_transitions_per_tick={} full_game_policy_max_samples={} full_game_learning_enabled={} neural_learning_rate={} neural_optimizer_momentum={} neural_blend_mode={:?} neural_blend_lambda={} neural_authoritative_lambda={} neural_blend_candidates={} neural_blend_warmup_steps={} policy_learning_rate={} mappo_epochs={} policy_entropy_coeff={} mpc_reject_threshold_model={mpc_reject_threshold_model} mpc_reject_threshold_epochs={mpc_reject_threshold_epochs} mpc_reject_threshold_learning_rate={mpc_reject_threshold_learning_rate} forward_select_logit_weight={} forward_select_logit_learning_rate={} forward_select_restore_override={forward_select_restore_override} finishing_select_bonus_weight={} finishing_selection_floor={} finishing_selection_max_regression={} finishing_selection_shot_drought_boost={finishing_selection_shot_drought_boost} finishing_selection_max_effective_floor={finishing_selection_max_effective_floor} forward_creation_selection_floor={forward_creation_selection_floor} forward_creation_selection_max_regression={forward_creation_selection_max_regression} forward_creation_min_quality={forward_creation_min_quality} forward_creation_min_completion={forward_creation_min_completion} forward_creation_min_forward_yards={forward_creation_min_forward_yards} forward_creation_bypass_min_quality={forward_creation_bypass_min_quality} forward_creation_bypass_min_completion={forward_creation_bypass_min_completion} planner_teacher_missed_opportunity={planner_teacher_missed_opportunity} planner_teacher_advantage_floor={planner_teacher_advantage_floor:.3} planner_teacher_advantage_max={planner_teacher_advantage_max:.3} planner_teacher_weight={planner_teacher_weight:.2} planner_teacher_min_score_share={planner_teacher_min_score_share:.3} planner_teacher_min_shot_quality={planner_teacher_min_shot_quality:.2} planner_teacher_min_forward_quality={planner_teacher_min_forward_quality:.2} planner_teacher_min_forward_completion={planner_teacher_min_forward_completion:.2} planner_teacher_max_samples_per_decision={planner_teacher_max_samples_per_decision} planner_teacher_include_same_pass_family={planner_teacher_include_same_pass_family} planner_teacher_same_pass_min_margin_share={planner_teacher_same_pass_min_margin_share:.3} chance_quality_reward={} chance_quality_composite={} chance_quality_k={} chance_quality_cap={} league_neural_mcts_enabled={} actor_critic_enabled={} lp_coupling_enabled={} target_standardization_enabled={} mc_critic_target_enabled={} neural_self_bootstrap_enabled={} maxa_bootstrap_enabled={} novelty_bonus_enabled={} fast_actor_reward_fallback_enabled={} pass_outcome_priority_learning_enabled={} forward_pass_climb_curriculum_enabled={} dp_bootstrap_enabled={} dp_bootstrap_horizon={} dp_bootstrap_sweeps={} mpc_tier2_enabled={} mpc_reconcile_enabled={} mpc_field_aware_enabled={} mpc_latent_objective_enabled={} local_mpc_enabled={} checkpoint_require_forward_pass_climb={} checkpoint_max_forward_pass_regression={} checkpoint_min_forward_pass_margin={} checkpoint_validate_games={} checkpoint_validate_min_forward_pass_margin={} checkpoint_validate_min_net_forward_pass_margin={} checkpoint_validate_min_goal_diff_margin={} frontier={} candidate_frontier={} archive={} step_archive_dir={} step_archive_buckets={:?}",
         chrono_now(),
         games_per_opp,
         minutes,
@@ -1643,7 +1652,7 @@ fn main() {
         let workers = league_worker_count(requested_workers, fixtures.len());
         if workers < requested_workers.clamp(1, fixtures.len().max(1)) {
             println!(
-                "league_parallelism_serialized_for_mpc_objective requested_workers={} active_workers={} fixtures={} opt_out_env=SOCCER_LEAGUE_MPC_OBJECTIVE_SERIAL=0",
+                "league_parallelism_serialized_for_carried_mpc requested_workers={} active_workers={} fixtures={} opt_out_env=SOCCER_LEAGUE_CARRIED_MPC_SERIAL=0",
                 requested_workers,
                 workers,
                 fixtures.len()
@@ -2438,7 +2447,20 @@ mod tests {
     fn league_trainer_serializes_parallelism_for_carried_mpc_objective() {
         let _lock = env_lock().lock().unwrap();
         let _mpc_guard = EnvVarGuard::set("DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE", "1");
+        let _reject_guard = EnvVarGuard::set("DD_SOCCER_ENABLE_MPC_REJECT_THRESHOLD_MODEL", "0");
+        let _carried_guard = EnvVarGuard::clear("SOCCER_LEAGUE_CARRIED_MPC_SERIAL");
         let _serial_guard = EnvVarGuard::clear("SOCCER_LEAGUE_MPC_OBJECTIVE_SERIAL");
+
+        assert_eq!(league_worker_count(4, 8), 1);
+    }
+
+    #[test]
+    fn league_trainer_serializes_parallelism_for_carried_mpc_reject_threshold() {
+        let _lock = env_lock().lock().unwrap();
+        let _objective_guard = EnvVarGuard::set("DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE", "0");
+        let _reject_guard = EnvVarGuard::set("DD_SOCCER_ENABLE_MPC_REJECT_THRESHOLD_MODEL", "1");
+        let _carried_guard = EnvVarGuard::clear("SOCCER_LEAGUE_CARRIED_MPC_SERIAL");
+        let _legacy_guard = EnvVarGuard::clear("SOCCER_LEAGUE_MPC_OBJECTIVE_SERIAL");
 
         assert_eq!(league_worker_count(4, 8), 1);
     }
@@ -2447,6 +2469,8 @@ mod tests {
     fn league_trainer_allows_parallel_mpc_objective_opt_out() {
         let _lock = env_lock().lock().unwrap();
         let _mpc_guard = EnvVarGuard::set("DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE", "1");
+        let _reject_guard = EnvVarGuard::set("DD_SOCCER_ENABLE_MPC_REJECT_THRESHOLD_MODEL", "0");
+        let _carried_guard = EnvVarGuard::clear("SOCCER_LEAGUE_CARRIED_MPC_SERIAL");
         let _serial_guard = EnvVarGuard::set("SOCCER_LEAGUE_MPC_OBJECTIVE_SERIAL", "0");
 
         assert_eq!(league_worker_count(4, 8), 4);

@@ -25406,6 +25406,30 @@ impl SoccerMatch {
                             &snapshot,
                         );
                     }
+                    // Train the contextual MPC reject bar only from the learned plan
+                    // that the player's decision cadence actually committed. The
+                    // player may retain a refractory/continuation action instead of a
+                    // fresh neural pick; in that case the unexecuted candidate must
+                    // not inherit the eventual territorial outcome.
+                    let committed_mpc_plan = learned_decision.as_ref().and_then(|decision| {
+                        self.players[actor]
+                            .last_decision
+                            .as_ref()
+                            .filter(|committed| {
+                                learned_mpc_action_labels_match(
+                                    &committed.action,
+                                    &decision.plan.action,
+                                )
+                            })
+                            .map(|_| decision.plan.clone())
+                    });
+                    if let Some(plan) = committed_mpc_plan.as_ref() {
+                        self.enqueue_mpc_reject_threshold_committed_plan(
+                            &snapshot,
+                            scheduled.id,
+                            plan,
+                        );
+                    }
                     let intent = self.players[actor]
                         .apply_post_decision_movement_discipline(&snapshot, self, intent);
                     if let Some(baseline) = net_influence_baseline.as_ref() {
