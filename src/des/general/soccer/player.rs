@@ -77,23 +77,6 @@ fn dd_soccer_enable_neural_pass_space() -> bool {
         *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_NEURAL_PASS_SPACE"))
     }
 }
-/// Gate (default-OFF) for **actor-owned shot placement**. When on, a `Shoot` action may carry an
-/// explicit `target_point` (which part of the goal to aim at), chosen by the learned policy instead
-/// of the analytic aim, and execution honors it. Off ⇒ `target_point` stays `None` ⇒ the analytic
-/// `base_goal_x` pipeline runs unchanged ⇒ byte-identical to baseline. This is the structural
-/// finishing interface (POMDP owns placement), distinct from the MPC aim-residual.
-fn dd_soccer_enable_actor_shot_placement() -> bool {
-    #[cfg(test)]
-    {
-        soccer_env_flag_enabled("DD_SOCCER_ENABLE_ACTOR_SHOT_PLACEMENT")
-    }
-    #[cfg(not(test))]
-    {
-        use std::sync::OnceLock;
-        static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_ACTOR_SHOT_PLACEMENT"))
-    }
-}
 /// Gate (default-ON) for the crowded won-ball escape floor: a player who has just won possession in
 /// traffic gets a probability floor on the break-into-space action family so it accelerates AWAY
 /// from the nearest presser into the open lane instead of settling into a shield/recycle. Set
@@ -15922,10 +15905,6 @@ pub enum SoccerAction {
     },
     Shoot {
         power: f64,
-        /// Actor-chosen goal-mouth aim point. `None` (default) ⇒ analytic aim runs unchanged
-        /// (byte-identical). Populated only when `dd_soccer_enable_actor_shot_placement()` is on.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        target_point: Option<Vec2>,
     },
     Tackle {
         target_player: usize,
