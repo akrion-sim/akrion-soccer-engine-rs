@@ -89,28 +89,23 @@ ACTIONS = [
     {"name": "recover",      "kind": "offball", "desc": "Sprint back into defensive shape."},
 ]
 
-# Tunable reward weights (src/des/general/soccer/tunables.rs). This drives the
-# "optimize N knobs across generations" view. (Set + defaults refined from source;
-# includes the 3 newer carrier terms.) label,group,default,lo,hi,log.
+# The real reward-scale search space — the DD_SOCCER_*_SCALE knobs the engine's own
+# evolution strategy (viz/tune.py SPACE ~20 knobs) tunes, plus a few RewardTunables
+# fields. These are reward-SCALE multipliers over the field-vector-conditioned terms.
+# label(env-ish name), group, default, lo, hi, log.
 REWARD_WEIGHTS = [
-    ("goal", "outcome", 12.0, 6, 20, False), ("concede", "outcome", 9.0, 4, 16, False),
-    ("shot_on_target", "finish", 1.6, 0.3, 4, False), ("shot_quality", "finish", 1.1, 0.05, 3, False),
-    ("xg_entry", "finish", 0.9, 0.05, 2.5, False), ("chance_created", "finish", 0.5, 0.02, 1.5, False),
-    ("epv_progress", "possession", 1.2, 0.2, 3, False), ("killer_pass", "passing", 0.7, 0.02, 2, False),
-    ("progressive_carry", "carry", 0.5, 0.02, 1.5, False), ("pass_completed", "passing", 0.08, 1e-3, 0.4, False),
-    ("switch_play", "passing", 0.25, 1e-3, 1, False), ("in_behind_run", "off-ball", 0.35, 1e-3, 1.2, False),
-    ("turnover", "possession", 0.8, 0.05, 2, False), ("bad_backpass", "possession", 0.9, 0.05, 2.5, False),
-    ("route_one_pen", "possession", 0.4, 1e-3, 1.5, False), ("hold_under_pressure", "carry", 0.3, 1e-3, 1.2, False),
-    ("dribble_too_slow", "carry", 0.25, 1e-3, 1.0, False), ("field_turnover_pos", "possession", 0.5, 1e-3, 1.5, False),
-    ("win_ball", "pressing", 0.35, 1e-3, 1.2, False), ("press_trigger", "pressing", 0.2, 1e-3, 0.8, False),
-    ("conceded_sot", "defense", 0.6, 0.02, 1.8, False), ("goalside", "defense", 0.4, 1e-3, 1.2, False),
-    ("compactness", "shape", 0.3, 1e-3, 1.0, False), ("line_height", "shape", 0.25, 1e-3, 1.0, False),
-    ("spacing", "shape", 0.006, 5e-4, 0.02, True), ("width", "shape", 0.2, 1e-3, 0.8, False),
-    ("support_angle", "off-ball", 0.22, 1e-3, 0.8, False), ("cover_shadow", "defense", 0.3, 1e-3, 1.0, False),
-    ("stamina_pen", "shape", 0.05, 1e-3, 0.3, False), ("shape_potential", "potential", 2.0, 0.5, 4, False),
-    ("epv_potential", "potential", 1.5, 0.3, 3.5, False), ("entropy_bonus", "explore", 0.02, 1e-3, 0.08, True),
-    ("dp_prior_weight", "planning", 0.5, 0.05, 1.0, False), ("mcts_value_mix", "planning", 0.3, 1e-3, 0.8, False),
-    ("world_model_trust", "planning", 0.4, 1e-3, 1.0, False), ("mpc_feasibility", "execute", 0.5, 1e-3, 1.5, False),
+    ("goal", "outcome", 1.2, 0.5, 4, False), ("concede", "outcome", 1.0, 0.4, 3, False),
+    ("forward_pass", "passing", 8.2, 1, 16, False), ("pass_turnover", "possession", 2.8, 0.5, 6, False),
+    ("learned_epv", "potential", 0.30, 0.05, 1.5, False), ("pitch_value_threat", "potential", 1.0, 0.2, 3, False),
+    ("dense_shaping_budget", "potential", 1.0, 0.3, 3, False), ("planner_teacher", "planning", 0.55, 0.05, 1.5, False),
+    ("marl_team", "planning", 0.08, 0.01, 0.4, False), ("shot", "finish", 1.5, 0.3, 4, False),
+    ("shot_on_target", "finish", 1.6, 0.3, 4, False), ("field_vector_shot", "finish", 0.5, 0.02, 1.5, False),
+    ("hold_under_pressure", "carry", 0.6, 0.02, 2, False), ("dribble_min_gait", "carry", 0.4, 0.02, 1.5, False),
+    ("overdribble", "carry", 0.3, 0.02, 1, False), ("giveaway_own_half", "possession", 3.5, 1, 7, False),
+    ("giveaway_opp_half", "possession", 2.2, 0.5, 5, False), ("loose_ball_win", "pressing", 1.5, 0.3, 3, False),
+    ("blocked_lane_pass", "passing", 6.0, 1, 10, False), ("low_pressure_pass", "passing", 1.75, 0.3, 4, False),
+    ("defensive_compactness", "shape", 0.3, 0.02, 1, False), ("teammate_overlap", "shape", 0.06, 5e-3, 0.3, False),
+    ("turnover_chain_blame", "possession", 0.5, 0.02, 1.5, False), ("boltzmann_temp", "explore", 0.4, 0.05, 1.5, True),
 ]
 
 EPV = json.load(open(EPV_PATH))
