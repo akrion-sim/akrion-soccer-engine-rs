@@ -1,0 +1,1273 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='14'>⚽</text></svg>">
+<title>How a 5-a-side policy learns — POMDP · DP · Neural nets · MPC</title>
+<style>
+  :root{
+    --bg:#0b140e; --panel:#101c14; --panel-2:#0d1710; --ink:#e8f0e9; --ink-dim:#93a89a;
+    --line:#22362a; --accent:#2fe0b6; --teamA:#2fe0b6; --teamB:#ff6b5e; --ball:#f7f7f2;
+    --grid:rgba(255,255,255,.05); --pitch:#12351f; --pitch-line:rgba(233,240,233,.5);
+    --good:#57d979; --bad:#ff6b5e; --gold:#f4c66a; --violet:#a78bfa;
+    --shadow:0 1px 0 rgba(255,255,255,.03), 0 18px 40px -24px rgba(0,0,0,.8);
+    --nav-bg:rgba(11,20,14,.82);
+  }
+  @media (prefers-color-scheme: light){
+    :root{
+      --bg:#eef2ec; --panel:#ffffff; --panel-2:#f4f7f2; --ink:#0d1a12; --ink-dim:#59705f;
+      --line:#dbe4dc; --accent:#0f9d78; --teamA:#0f9d78; --teamB:#e0483b; --ball:#1a2a1f;
+      --grid:rgba(0,0,0,.05); --pitch:#1e5233; --pitch-line:rgba(255,255,255,.72);
+      --good:#1c9d4b; --bad:#d33a2c; --gold:#b8862a; --violet:#7c5cd6;
+      --shadow:0 1px 0 rgba(255,255,255,.6), 0 20px 44px -28px rgba(20,40,28,.4);
+      --nav-bg:rgba(238,242,236,.82);
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#0b140e; --panel:#101c14; --panel-2:#0d1710; --ink:#e8f0e9; --ink-dim:#93a89a;
+    --line:#22362a; --accent:#2fe0b6; --teamA:#2fe0b6; --teamB:#ff6b5e; --ball:#f7f7f2;
+    --grid:rgba(255,255,255,.05); --pitch:#12351f; --pitch-line:rgba(233,240,233,.5);
+    --good:#57d979; --bad:#ff6b5e; --gold:#f4c66a; --violet:#a78bfa; --nav-bg:rgba(11,20,14,.82);
+  }
+  :root[data-theme="light"]{
+    --bg:#eef2ec; --panel:#ffffff; --panel-2:#f4f7f2; --ink:#0d1a12; --ink-dim:#59705f;
+    --line:#dbe4dc; --accent:#0f9d78; --teamA:#0f9d78; --teamB:#e0483b; --ball:#1a2a1f;
+    --grid:rgba(0,0,0,.05); --pitch:#1e5233; --pitch-line:rgba(255,255,255,.72);
+    --good:#1c9d4b; --bad:#d33a2c; --gold:#b8862a; --violet:#7c5cd6; --nav-bg:rgba(238,242,236,.82);
+  }
+
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;
+    font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    background:
+      radial-gradient(1200px 620px at 50% -10%, color-mix(in srgb, var(--accent) 9%, transparent), transparent 62%),
+      var(--bg);
+    color:var(--ink); line-height:1.55; -webkit-font-smoothing:antialiased;
+  }
+  @media (prefers-reduced-motion: reduce){ html{scroll-behavior:auto} }
+
+  /* ---- nav ---- */
+  nav{position:sticky;top:0;z-index:50;backdrop-filter:blur(12px);
+    background:var(--nav-bg);border-bottom:1px solid var(--line)}
+  .nav-in{max-width:1200px;margin:0 auto;display:flex;align-items:center;gap:6px;
+    padding:9px clamp(14px,3vw,32px);flex-wrap:wrap}
+  .brand{font-family:system-ui,-apple-system,sans-serif;font-weight:800;letter-spacing:-.01em;
+    font-size:14px;margin-right:auto;display:flex;align-items:center;gap:9px;white-space:nowrap}
+  .brand .dot{width:8px;height:8px;border-radius:50%;background:var(--accent);
+    box-shadow:0 0 0 4px color-mix(in srgb,var(--accent) 22%, transparent)}
+  .brand small{color:var(--ink-dim);font-weight:500;font-family:ui-monospace,monospace;font-size:11px}
+  nav a.link{font-size:12px;color:var(--ink-dim);text-decoration:none;padding:5px 9px;border-radius:8px;
+    letter-spacing:.01em;white-space:nowrap}
+  nav a.link:hover{color:var(--ink);background:color-mix(in srgb,var(--accent) 12%,transparent)}
+  .theme{cursor:pointer;background:transparent;border:1px solid var(--line);color:var(--ink);
+    border-radius:8px;padding:5px 10px;font:inherit;font-size:12px}
+  @media (max-width:920px){ nav a.link{display:none} }
+
+  .wrap{max-width:1200px;margin:0 auto;padding:0 clamp(14px,3vw,32px) 80px}
+  section{padding-top:34px;scroll-margin-top:64px}
+  .eyebrow{font-size:12px;letter-spacing:.22em;text-transform:uppercase;color:var(--ink-dim);
+    display:flex;align-items:center;gap:10px;margin-bottom:6px}
+  .eyebrow .n{color:var(--accent);font-weight:700}
+  h1{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;font-weight:800;letter-spacing:-.025em;
+    line-height:1.02;font-size:clamp(32px,6vw,64px);margin:.3em 0 .18em;text-wrap:balance}
+  h1 .em{color:var(--accent)}
+  h2{font-family:system-ui,-apple-system,sans-serif;font-weight:800;letter-spacing:-.02em;
+    font-size:clamp(23px,3.4vw,36px);margin:.1em 0 .12em;text-wrap:balance}
+  h3{font-family:system-ui,sans-serif;font-weight:700;font-size:15px;margin:0 0 10px}
+  .lede{max-width:74ch;color:var(--ink-dim);font-size:clamp(14px,1.7vw,16px)}
+  .lede b,.p b{color:var(--ink);font-weight:600}
+  .p{max-width:74ch;color:var(--ink-dim);font-size:14.5px;margin:10px 0}
+  a.inline{color:var(--accent);text-decoration:none;border-bottom:1px dotted color-mix(in srgb,var(--accent) 50%,transparent)}
+  .hl{color:var(--accent)} .hlB{color:var(--teamB)} .hlG{color:var(--gold)} .hlV{color:var(--violet)}
+
+  .card{background:linear-gradient(180deg,var(--panel),var(--panel-2));border:1px solid var(--line);
+    border-radius:16px;padding:18px;box-shadow:var(--shadow)}
+  .card.pad0{padding:14px}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+  .grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
+  @media (max-width:900px){ .grid2,.grid3,.grid4{grid-template-columns:1fr} }
+  .rowtop{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap}
+  .note{font-size:12px;color:var(--ink-dim)}
+  canvas{display:block;width:100%;height:auto;border-radius:10px}
+  .cap{font-size:12px;color:var(--ink-dim);margin-top:8px}
+
+  /* chips */
+  .chips{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px}
+  .chip{display:flex;flex-direction:column;gap:2px;text-decoration:none;
+    border:1px solid var(--line);border-radius:12px;padding:11px 15px;min-width:150px;
+    background:linear-gradient(180deg,var(--panel),var(--panel-2));box-shadow:var(--shadow);transition:.15s}
+  .chip:hover{border-color:color-mix(in srgb,var(--accent) 55%,var(--line));transform:translateY(-1px)}
+  .chip .b{font-family:system-ui,sans-serif;font-weight:800;color:var(--ink);font-size:15px}
+  .chip .s{font-size:11.5px;color:var(--ink-dim)}
+  .chip .k{font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--accent)}
+
+  /* stat tiles */
+  .stat{background:linear-gradient(180deg,var(--panel),var(--panel-2));border:1px solid var(--line);
+    border-radius:12px;padding:14px;box-shadow:var(--shadow)}
+  .stat .v{font-family:system-ui,sans-serif;font-weight:800;font-size:clamp(20px,3vw,28px);
+    letter-spacing:-.02em;font-variant-numeric:tabular-nums;line-height:1}
+  .stat .v.good{color:var(--good)} .stat .v.bad{color:var(--bad)} .stat .v.acc{color:var(--accent)}
+  .stat .k{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-dim);margin-top:6px}
+  .stat .sub{font-size:11px;color:var(--ink-dim);margin-top:2px}
+
+  /* controls */
+  .controls{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+  button.ctl{font-family:inherit;font-size:13px;font-weight:700;cursor:pointer;color:var(--bg);
+    background:var(--accent);border:none;border-radius:9px;padding:9px 15px;letter-spacing:.01em}
+  button.ctl.ghost{background:transparent;color:var(--ink);border:1px solid var(--line)}
+  button.ctl:disabled{opacity:.45;cursor:default}
+  button.ctl:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  input[type=range]{flex:1;min-width:120px;accent-color:var(--accent);height:4px}
+  select.ctl{color:var(--ink);background:var(--panel-2)}
+  .readout{font-variant-numeric:tabular-nums;color:var(--ink-dim);font-size:13px}
+  .big{font-family:system-ui,sans-serif;font-weight:800;font-variant-numeric:tabular-nums;color:var(--ink)}
+
+  .legend{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--ink-dim);margin-top:8px}
+  .legend .sw{display:inline-flex;align-items:center;gap:7px}
+  .legend .sw i{width:11px;height:11px;border-radius:3px;display:inline-block}
+  .legend .sw i.rd{border-radius:50%}
+  .legend .sw i.dash{width:16px;height:0;border-top:2px dashed var(--gold);border-radius:0}
+
+  code{background:var(--panel-2);border:1px solid var(--line);border-radius:6px;padding:1px 6px;font-size:12px}
+  .kbd{font-family:system-ui,sans-serif}
+  .pill{display:inline-block;font-size:11px;padding:3px 9px;border-radius:999px;border:1px solid var(--line);
+    color:var(--ink-dim);letter-spacing:.04em}
+  .pill.acc{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 45%,var(--line))}
+  ul.tight{margin:8px 0;padding-left:18px} ul.tight li{margin:4px 0;color:var(--ink-dim);font-size:14px}
+  ul.tight li b{color:var(--ink)}
+  .foot{color:var(--ink-dim);font-size:12px;text-align:center;padding:26px 0 0;max-width:80ch;margin:0 auto}
+  .banner{background:color-mix(in srgb,var(--bad) 14%,var(--panel));border:1px solid var(--bad);
+    color:var(--ink);border-radius:12px;padding:12px 16px;font-size:13px;margin:16px 0;display:none}
+  .divider{height:1px;background:var(--line);margin:14px 0}
+  .flowline{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12.5px;color:var(--ink-dim)}
+  .flowbox{border:1px solid var(--line);border-radius:9px;padding:7px 11px;background:var(--panel-2);
+    color:var(--ink);white-space:nowrap}
+  .flowbox b{color:var(--accent)}
+  .arrow{color:var(--accent);font-weight:800}
+  .tag{font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;padding:4px 8px;border-radius:999px;
+    border:1px solid var(--line);color:var(--ink-dim)}
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="nav-in">
+    <span class="brand"><span class="dot"></span> 5-a-side&nbsp;RL <small>· localhost:6012</small></span>
+    <a class="link" href="#concepts">Concepts</a>
+    <a class="link" href="#field">Field vector</a>
+    <a class="link" href="#decision">Decision</a>
+    <a class="link" href="#dp">DP</a>
+    <a class="link" href="#nn">Neural net</a>
+    <a class="link" href="#optimize">100 generations</a>
+    <a class="link" href="#mpc">MPC · QP</a>
+    <a class="link" href="#ladder">Self-play</a>
+    <button class="theme" id="theme">◐ theme</button>
+  </div>
+</nav>
+
+<div class="wrap">
+  <div class="banner" id="banner"></div>
+
+  <!-- ═══════════════ HERO ═══════════════ -->
+  <section id="top" style="padding-top:40px">
+    <div class="eyebrow"><span class="n">▚</span> reinforcement learning · zero-dependency demo · a teaching page</div>
+    <h1>How four ideas teach a team to <span class="em">play soccer</span>.</h1>
+    <p class="lede">A <a href="#concepts" class="hl" style="text-decoration:none;border-bottom:1px dashed currentColor">hermetic</a> <b>5-a-side</b> sim learns to press, pass, carry and finish — with no
+      hand-written strategy. Underneath are four ideas that show up everywhere in modern control &amp; AI:
+      a <b>POMDP</b> (deciding under partial information), <b>dynamic programming</b> (what "optimal" even
+      means), <b>neural networks</b> (how we <i>approximate</i> that optimum at scale), and
+      <b>model-predictive control</b> (a little optimizer — often a <b>quadratic program</b> — that
+      executes the finish). This page takes them one at a time, with graphs you can drive.</p>
+    <div class="chips">
+      <a class="chip" href="#field"><span class="k">state</span><span class="b">The field vector</span><span class="s">10 players + a ball → a 71-number view</span></a>
+      <a class="chip" href="#decision"><span class="k">policy</span><span class="b">The decision</span><span class="s">softmax → sample 70 / 20 / 10</span></a>
+      <a class="chip" href="#dp"><span class="k">optimal</span><span class="b">Dynamic programming</span><span class="s">the Bellman value it chases</span></a>
+      <a class="chip" href="#nn"><span class="k">approximate</span><span class="b">The neural net</span><span class="s">gradient descent closes the gap</span></a>
+      <a class="chip" href="#optimize"><span class="k">tune</span><span class="b">100 generations</span><span class="s">optimize 32 knobs at once ▸</span></a>
+      <a class="chip" href="#mpc"><span class="k">execute</span><span class="b">MPC &amp; the QP</span><span class="s">aim the shot at the open corner</span></a>
+    </div>
+  </section>
+
+  <!-- ═══════════════ 0. CONCEPTS / VOCABULARY ═══════════════ -->
+  <section id="concepts">
+    <div class="eyebrow"><span class="n">✦</span> vocabulary · four words this page leans on</div>
+    <h2>Four words worth pinning down.</h2>
+    <p class="p">Before the four ideas, four terms — because <span class="hl">hermetic</span>, <span class="hlV">tabular</span>,
+      the <span class="hlG">analytic engine</span> and its <span class="hlB">ceiling</span> are the frame the whole demo
+      hangs on: what this sim <i>is</i>, what it is measured <i>against</i>, and why clearing that bar is hard.</p>
+    <div class="grid4" style="margin-top:16px">
+      <div class="card">
+        <div class="rowtop"><h3 style="margin:0">Hermetic</h3><span class="tag" style="border-color:var(--accent);color:var(--accent)">this sim</span></div>
+        <p class="note"><b>Sealed shut.</b> This demo shares <i>no code</i> with the production 22-player engine — its own
+          PRNG, its own neural net &amp; backprop, its own PPO, <b>zero external crates</b>. Nothing from the big system
+          can leak in.</p>
+        <p class="note"><b>Why it matters:</b> it is a <span class="hl">positive control</span>. If a from-scratch
+          policy learns to play <i>here</i>, then learning genuinely works — the result can't be an artifact of the
+          production engine's Postgres, cluster or plumbing.</p>
+      </div>
+      <div class="card">
+        <div class="rowtop"><h3 style="margin:0">Tabular</h3><span class="tag" style="border-color:var(--violet);color:var(--violet)">exact</span></div>
+        <p class="note"><b>A lookup table.</b> Keep one value for every discrete state (or bucket) and read it back
+          exactly. Perfect memory, <b>zero generalization</b> — it knows nothing about a position it never visited, and
+          a continuous pitch has infinitely many.</p>
+        <p class="note"><b>Why it matters:</b> that is the job of the <span class="hl">neural net</span> — it
+          <i>approximates</i> the table with a smooth function that generalizes to unseen states. On this page the DP
+          optimum is (near-)tabular; the network is what chases it.</p>
+      </div>
+      <div class="card">
+        <div class="rowtop"><h3 style="margin:0">The analytic engine</h3><span class="tag" style="border-color:var(--gold);color:var(--gold)">baseline</span></div>
+        <p class="note"><b>A hand-written, closed-form controller.</b> It decides by geometry and rules — who is open, the
+          angle to goal, the expected value of a pass — computed <i>directly</i>, with no learning at all.</p>
+        <p class="note"><b>Why it matters:</b> it is a strong, sensible opponent and the
+          <span class="hlG">sparring partner</span> the learner is scored against. "Beat analytic" is the bar.</p>
+      </div>
+      <div class="card">
+        <div class="rowtop"><h3 style="margin:0">The analytic ceiling</h3><span class="tag" style="border-color:var(--teamB);color:var(--teamB)">the trap</span></div>
+        <p class="note"><b>The plateau you hit</b> when the design can only <i>imitate or re-rank</i> the analytic engine:
+          it picks among analytic's own options and its value head regresses onto analytic's table, so its best possible
+          outcome is a <b>tie</b> — "parity." The ceiling is baked into the architecture, not a score being lost.</p>
+        <p class="note"><b>Breaking it</b> needs the learner to actually <i>play</i> analytic, judge positions by
+          <i>real outcomes</i>, and take actions analytic never offered. Strip those crutches away — pure net, no
+          tabular-Q blend, no analytic shield — and this hermetic demo climbed <span class="hlB">past</span> analytic:
+          <b>+6.24 goal difference, ~99% win rate</b>.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══════════════ 1. FIELD VECTOR ═══════════════ -->
+  <section id="field">
+    <div class="eyebrow"><span class="n">01</span> the state · a partially-observed markov decision process</div>
+    <h2>Everything is a function of the field vector.</h2>
+    <p class="p">At any instant the world is just numbers: <b>where the 10 players and the ball are, and how
+      fast they're moving.</b> That's the <span class="hl">field vector</span> — the POMDP state. But no
+      player sees it whole. Each of the four learners gets its own <b>egocentric 71-number observation</b>:
+      the same field, re-centred on itself and mirrored into its attacking direction, sorted nearest-first.
+      Click a teal player to see the world through <i>its</i> eyes.</p>
+    <div class="grid2">
+      <div class="card pad0">
+        <div class="rowtop"><h3 style="margin:0">The pitch — one snapshot</h3><span class="note" id="who">select a learner ▸</span></div>
+        <canvas id="fieldPitch"></canvas>
+        <div class="legend">
+          <span class="sw"><i class="rd" style="background:var(--teamA)"></i>learner (click)</span>
+          <span class="sw"><i class="rd" style="background:var(--teamB)"></i>opponent</span>
+          <span class="sw"><i class="rd" style="background:transparent;box-shadow:0 0 0 2px var(--ink-dim) inset"></i>keeper</span>
+          <span class="sw"><i class="rd" style="background:var(--ball)"></i>ball</span>
+        </div>
+      </div>
+      <div class="card">
+        <h3>The 71-dim observation <span class="pill acc" id="obsFrame">egocentric</span></h3>
+        <canvas id="obsStrip" style="margin-bottom:6px"></canvas>
+        <div id="obsLegend" style="display:flex;flex-direction:column;gap:3px"></div>
+      </div>
+    </div>
+    <div class="grid3" style="margin-top:16px">
+      <div class="card"><h3>Two heads, one glance</h3><p class="note">Each tick the shared policy emits
+        <b>two</b> discrete choices from that 71-vector: a <b>macro action</b> (15-way — pass/shoot/carry/press…)
+        and a <b>speed gear</b> (7-way). Two small networks, <code>71→64→64→15</code> and <code>71→32→7</code>.</p></div>
+      <div class="card"><h3>The critic sees more</h3><p class="note">A separate <b>centralized critic</b> reads a
+        48-number global state — <i>all</i> players + ball in one frame — to judge how good a position is.
+        Seen at training time only (CTDE); at play time each agent acts on its own 71-vector.</p>
+        <canvas id="criticStrip" style="margin-top:6px"></canvas></div>
+      <div class="card"><h3>What stays hidden</h3><p class="note">"<b>Partially observed</b>" is the whole game:
+        the opponents' <i>intent</i>, teammates' <i>future</i> runs, and who will win a 50/50 are not in the
+        vector. The policy is reactive — it must bet on the present, which is why it learns to
+        <span class="hl">sample</span>, not to be certain.</p></div>
+    </div>
+  </section>
+
+  <!-- ═══════════════ 2. DECISION / 70-20-10 ═══════════════ -->
+  <section id="decision">
+    <div class="eyebrow"><span class="n">02</span> the policy · from numbers to a choice</div>
+    <h2>Pick the best option — but not <i>every</i> time.</h2>
+    <p class="p">The 71-vector flows through the network to <b>15 logits</b>, one per action. Illegal moves are
+      masked out (you can't shoot from your own half before two passes). A <b>softmax</b> turns what's left into
+      probabilities, and the policy <span class="hl">samples</span> from them. A healthy trained policy lands
+      near <span class="hlG">70 / 20 / 10</span> over its top options: <b>most of the time it takes the best
+      action, but it still tries the 2nd and 3rd</b> — that exploration is what keeps it learning and hard to
+      predict.</p>
+    <div class="flowline card" style="margin:6px 0 16px;justify-content:center">
+      <span class="flowbox">field vector <b>71</b></span><span class="arrow">→</span>
+      <span class="flowbox">MLP <b>64→64</b></span><span class="arrow">→</span>
+      <span class="flowbox"><b>15</b> logits</span><span class="arrow">→</span>
+      <span class="flowbox">legal mask</span><span class="arrow">→</span>
+      <span class="flowbox">softmax</span><span class="arrow">→</span>
+      <span class="flowbox" style="border-color:var(--accent)"><b>sample</b> an action</span>
+    </div>
+    <div class="grid2">
+      <div class="card">
+        <div class="rowtop"><h3 style="margin:0">Action probabilities</h3>
+          <select class="ctl ghost" id="scen" style="padding:6px 9px"></select></div>
+        <p class="note" id="scenStory" style="min-height:2.6em"></p>
+        <canvas id="probBars"></canvas>
+        <div class="controls" style="margin-top:12px">
+          <span class="note">temperature</span>
+          <input type="range" id="temp" min="0.25" max="2.5" step="0.05" value="1">
+          <span class="readout" id="tempRead">T = 1.00</span>
+          <span class="readout">· entropy <span class="big" id="entRead"></span></span>
+        </div>
+        <p class="note" style="margin-top:8px">Low T → sharp, greedy (<b>exploit</b>). High T → flat, curious
+          (<b>explore</b>). Training samples at T=1; evaluation takes the argmax.</p>
+      </div>
+      <div class="card">
+        <div class="rowtop"><h3 style="margin:0">Roll the dice</h3>
+          <div class="controls"><button class="ctl" id="roll1">Sample ×1</button>
+            <button class="ctl ghost" id="roll100">×200</button>
+            <button class="ctl ghost" id="rollReset">reset</button></div></div>
+        <p class="note">Sampling many times reproduces the distribution — the empirical bars converge on the
+          softmax. Watch the top-3 approach <span class="hlG">70/20/10</span>.</p>
+        <canvas id="tallyBars"></canvas>
+        <div class="readout" id="tallyN" style="margin-top:8px">0 samples</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══════════════ 3. DP ═══════════════ -->
+  <section id="dp">
+    <div class="eyebrow"><span class="n">03</span> what "optimal" means · dynamic programming</div>
+    <h2>The Bellman value: what a position is <i>worth</i>.</h2>
+    <p class="p">Before you can learn, you need a target. <b>Dynamic programming</b> defines it. The
+      <span class="hl">value</span> of a state is the best you can do from it: your immediate reward plus the
+      discounted value of wherever you land next — <span class="hl">V(s) = max<sub>a</sub> [ r + γ·V(s′) ]</span>.
+      Sweep that rule over every state and the values <b>flow backwards from the goal</b> until they stop
+      changing. That fixed point is the optimal value function. Step the sweeps:</p>
+    <div class="grid2">
+      <div class="card pad0">
+        <div class="rowtop"><h3 style="margin:0">Value iteration on a toy pitch</h3>
+          <span class="note">value = chance of scoring from here →</span></div>
+        <canvas id="dpGrid"></canvas>
+        <div class="controls" style="margin-top:12px">
+          <button class="ctl" id="dpStep">Sweep ▸</button>
+          <button class="ctl ghost" id="dpPlay">Play</button>
+          <button class="ctl ghost" id="dpReset">reset</button>
+          <input type="range" id="dpScrub" min="0" value="0">
+          <span class="readout">sweep <span class="big" id="dpN">0</span></span>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Convergence — the update shrinks to zero</h3>
+        <canvas id="dpDelta"></canvas>
+        <p class="note" style="margin-top:10px">Each sweep the largest value change (Δ) drops toward 0: the
+          estimate is homing in on the true optimum. That monotone squeeze is the whole promise of DP —
+          <b>it provably reaches the best possible value</b>.</p>
+        <div class="divider"></div>
+        <p class="note"><span class="pill">honest footnote</span> &nbsp;This 5-a-side demo has
+          <b>no tabular DP</b> — the real state is continuous and 71-dimensional, far too big to sweep. This
+          toy grid is here to <i>show you the target</i>. Next: how a neural net chases it without ever
+          enumerating a single state.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══════════════ 4. NEURAL NET APPROX ═══════════════ -->
+  <section id="nn">
+    <div class="eyebrow"><span class="n">04</span> approximation · neural nets + gradient descent</div>
+    <h2>The network <i>approaches</i> the optimum.</h2>
+    <p class="p">You can't store a value for every arrangement of 10 players. So the <b>critic</b> — a neural
+      net — <i>learns a function</i> V(s) that generalises across states it has never seen. It's trained by
+      <b>bootstrapping</b>: nudge V(s) toward <span class="hl">r + γ·V(s′)</span>, the very Bellman rule from
+      the last section, but sampled from real play instead of swept exhaustively. That's
+      <span class="hl">approximate dynamic programming</span>. Watch the learned value close in on the DP
+      target, and the error fall:</p>
+    <div class="grid3">
+      <div class="card pad0"><div class="rowtop"><h3 style="margin:0">DP optimum</h3><span class="tag">target</span></div>
+        <canvas id="nnTarget"></canvas><p class="cap">the fixed point from §3 — the ground truth</p></div>
+      <div class="card pad0"><div class="rowtop"><h3 style="margin:0">Learned value</h3><span class="tag" id="nnIterTag">iter 0</span></div>
+        <canvas id="nnApprox"></canvas>
+        <div class="controls" style="margin-top:10px">
+          <button class="ctl" id="nnStep">Train ▸</button>
+          <button class="ctl ghost" id="nnPlay">Play</button>
+          <input type="range" id="nnScrub" min="0" value="0" style="min-width:80px">
+        </div></div>
+      <div class="card"><h3>Approximation error → 0</h3><canvas id="nnErr"></canvas>
+        <p class="note" style="margin-top:10px">Mean-squared gap to the DP optimum. It never hits exactly
+          zero — a finite network is an <i>approximation</i> — but it gets close enough to act well, and it
+          works in 71 dimensions where a table can't exist.</p></div>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <div class="rowtop"><h3 style="margin:0">Meanwhile the actor climbs — PPO on the real game</h3>
+        <span class="note">shared-weight policy vs the scripted baseline · to the best checkpoint</span></div>
+      <div class="grid4" style="margin-top:6px">
+        <div><h3 class="note" style="margin-bottom:8px">Goal difference (A − B)</h3><canvas id="lcDiff"></canvas></div>
+        <div><h3 class="note" style="margin-bottom:8px">Policy &amp; value loss</h3><canvas id="lcLoss"></canvas></div>
+        <div><h3 class="note" style="margin-bottom:8px">Policy entropy ↓ (sharpening)</h3><canvas id="lcEnt"></canvas></div>
+        <div><h3 class="note" style="margin-bottom:8px">Win rate %</h3><canvas id="lcWr"></canvas></div>
+      </div>
+      <p class="note" style="margin-top:12px">Gradient descent is the engine: each update makes the actions
+        that led to reward a little more likely, and the critic a little more accurate. The policy goes from
+        <span class="hlB">losing</span> to <span class="hl">winning</span> — while its entropy falls, i.e. its
+        70/20/10 sharpens as it grows confident.</p>
+    </div>
+  </section>
+
+  <!-- ═══════════════ 5. THE 100-GENERATION OPTIMIZATION ═══════════════ -->
+  <section id="optimize">
+    <div class="eyebrow"><span class="n">05</span> the search · optimizing every knob at once</div>
+    <h2>100 generations, 32 dimensions, moving together.</h2>
+    <p class="p">The reward that shapes all this behaviour isn't one number — it's <b>32 weights</b> (how much a
+      goal is worth vs a completed pass vs good spacing vs losing the ball…). Hand-tuning 32 coupled knobs is
+      hopeless, so we <b>search</b>. An <span class="hl">evolution strategy</span> keeps a cloud of candidate
+      reward-vectors, scores each by the goal-difference the trained policy achieves, keeps the best, and
+      breeds the next generation tighter around them. <b>Press step and watch the whole cloud drift and
+      contract onto the optimum</b> — every dimension moving at once.</p>
+
+    <div class="card" style="margin-bottom:16px">
+      <div class="controls">
+        <button class="ctl" id="oStep">Step ▸</button>
+        <button class="ctl" id="oPlay">Play ▶</button>
+        <button class="ctl ghost" id="oBack">◀</button>
+        <button class="ctl ghost" id="oReset">reset</button>
+        <input type="range" id="oScrub" min="0" max="99" value="0">
+        <select class="ctl ghost" id="oSpeed" style="padding:7px 9px">
+          <option value="1">1×</option><option value="2" selected>2×</option><option value="4">4×</option>
+        </select>
+        <span class="readout">generation <span class="big" id="oGen">0</span> / 99</span>
+      </div>
+      <p class="note" id="oNarrate" style="margin:12px 0 0;min-height:2.4em"></p>
+    </div>
+
+    <div class="grid2">
+      <div class="card pad0">
+        <h3>Fitness climbs (goal-difference the reward yields)</h3>
+        <canvas id="oFit"></canvas>
+        <div class="legend">
+          <span class="sw"><i style="background:var(--accent)"></i>best candidate</span>
+          <span class="sw"><i style="background:var(--good)"></i>population mean</span>
+          <span class="sw"><i class="dash" style="border-color:var(--ink-dim)"></i>current gen</span>
+        </div>
+      </div>
+      <div class="card pad0">
+        <h3>Exploration shrinks · distance to optimum falls</h3>
+        <canvas id="oConv"></canvas>
+        <div class="legend">
+          <span class="sw"><i style="background:var(--violet)"></i>step size σ (explore)</span>
+          <span class="sw"><i style="background:var(--gold)"></i>‖mean − optimum‖ (converge)</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <div class="rowtop"><h3 style="margin:0">All 32 reward weights at once — parallel coordinates</h3>
+        <span class="note">each faint line = one candidate this generation · bold = mean · <span class="hlG">gold dashed = optimum</span></span></div>
+      <canvas id="oPar"></canvas>
+      <p class="note" style="margin-top:6px">Early on the lines fan across the whole range — the search is
+        <b>exploring</b>. As generations pass they collapse into a tight braid hugging the gold optimum: the
+        population has <b>agreed</b> on how much every reward channel is worth. <i>This</i> is the optimization
+        points moving across all dimensions.</p>
+    </div>
+
+    <div class="grid2" style="margin-top:16px">
+      <div class="card pad0">
+        <h3>The population, projected to 2-D</h3>
+        <canvas id="oCloud"></canvas>
+        <p class="cap">Each dot is a candidate reward-vector (32-D squashed to 2-D). Colour = fitness. The
+          <span class="hl">teal dot + trail</span> is the running mean; the <span class="hlG">gold star</span>
+          is the optimum. The cloud migrates and tightens onto it.</p>
+      </div>
+      <div class="card pad0">
+        <h3>Every dimension settling — convergence map</h3>
+        <canvas id="oHeat"></canvas>
+        <p class="cap">Rows = the 32 weights, columns = generations. Colour = the mean weight value. Left edge
+          is noisy; by the right edge each row has locked to its tuned level. The line marks the current gen.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══════════════ 6. MPC / QP ═══════════════ -->
+  <section id="mpc">
+    <div class="eyebrow"><span class="n">06</span> execution · model-predictive control — enumerate, QP, <span class="hlV">or neural</span></div>
+    <h2>Aim the finish: a tiny optimizer at the last moment.</h2>
+    <p class="p">Learning chooses <i>to shoot</i>; a small <b>model-predictive controller</b> chooses <i>where</i>.
+      It predicts the near future — the keeper's reach, defenders in the lane — and optimizes one objective over
+      the goal mouth: <span class="hl">keeper_gap + 3·lane_clear</span>, i.e. "shoot to the open corner farthest
+      from the keeper." <b>MPC is just "optimize an objective over a short horizon" — and there's more than one
+      way to solve it.</b> This demo <b>enumerates 7 aim points</b>; a <span class="hlV">quadratic program</span>
+      would solve the smooth part continuously; and a <span class="hlV">neural net</span> can be <i>trained</i> to
+      predict the optimum directly (<b>neural MPC</b> — the same idea the value critic uses, applied to control).
+      All three chase the same curve below. Drag the keeper and watch the optimal corner flip.</p>
+    <div class="grid3" style="margin:6px 0 16px">
+      <div class="card" style="padding:13px"><span class="tag" style="border-color:var(--gold);color:var(--gold)">this demo</span>
+        <h3 style="margin:8px 0 4px">Enumerate</h3><p class="note">Score a handful of candidates and take the max.
+        Dead simple, robust to a bumpy objective, no solver needed. What the finisher actually does.</p></div>
+      <div class="card" style="padding:13px"><span class="tag" style="border-color:var(--violet);color:var(--violet)">classical</span>
+        <h3 style="margin:8px 0 4px">Quadratic program</h3><p class="note">If the objective is a convex quadratic
+        with linear limits (stay inside the posts), a QP finds the exact optimum in one continuous solve. The
+        11-a-side engine's multi-player MPC <i>is</i> a real QP.</p></div>
+      <div class="card" style="padding:13px"><span class="tag" style="border-color:var(--accent);color:var(--accent)">learned</span>
+        <h3 style="margin:8px 0 4px">Neural MPC</h3><p class="note">Train a network to <i>output</i> the optimizer's
+        answer from the state — amortizing the solve into a single fast forward pass. The comment in the code:
+        "a QP/<b>neural</b> MPC can replace the enumerator" as long as it optimizes this same shape.</p></div>
+    </div>
+    <div class="grid2">
+      <div class="card pad0">
+        <div class="rowtop"><h3 style="margin:0">The shot</h3><span class="note">7 candidate aim points on the mouth</span></div>
+        <canvas id="mpcPitch"></canvas>
+        <div class="controls" style="margin-top:12px">
+          <span class="note">keeper position</span>
+          <input type="range" id="mpcKeeper" min="0" max="1" step="0.01" value="0.18">
+          <span class="readout" id="mpcKRead"></span>
+        </div>
+      </div>
+      <div class="card">
+        <h3>The objective over the mouth</h3>
+        <canvas id="mpcObj"></canvas>
+        <div class="legend">
+          <span class="sw"><i style="background:var(--accent)"></i>keeper_gap + 3·lane_clear</span>
+          <span class="sw"><i style="background:var(--violet)"></i>smooth part (the QP's quadratic)</span>
+          <span class="sw"><i class="rd" style="background:var(--gold)"></i>7 enumerated points</span>
+        </div>
+        <div class="grid3" style="margin-top:14px">
+          <div class="stat"><div class="v acc" id="mpcXg">–</div><div class="k">xG</div><div class="sub">chance quality</div></div>
+          <div class="stat"><div class="v acc" id="mpcPlace">–</div><div class="k">placement</div><div class="sub">corner quality</div></div>
+          <div class="stat"><div class="v good" id="mpcRew">–</div><div class="k">shot reward</div><div class="sub">(base+q·place)·xG</div></div>
+        </div>
+        <p class="note" style="margin-top:12px">The lane term (defenders) makes the true objective bumpy, so the
+          engine <b>enumerates</b> rather than trusting a convex solve — but a QP/neural MPC could replace it as
+          long as it optimizes this same shape. In the full 11-a-side engine, MPC over many players
+          <i>is</i> a genuine quadratic program.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══════════════ 7. SELF-PLAY LADDER ═══════════════ -->
+  <section id="ladder">
+    <div class="eyebrow"><span class="n">07</span> co-evolution · the real self-play ladder</div>
+    <h2>Chasing a moving target.</h2>
+    <p class="p">All of the above beats a <i>fixed</i> scripted opponent. To keep improving, the policy plays
+      <b>itself</b>: a challenger trains against the reigning champion and is <span class="hl">promoted</span>
+      only when it beats it by a margin — then the champion it must beat gets harder. This is <b>real data</b>
+      from <code>selfplay_ladder.csv</code>: 100 generations, 45 promotions. Notice the champion line
+      (staircase) only ever steps <i>up</i>.</p>
+    <div class="card pad0">
+      <canvas id="ladderChart"></canvas>
+      <div class="legend">
+        <span class="sw"><i style="background:var(--accent)"></i>challenger vs champion (goal diff)</span>
+        <span class="sw"><i style="background:var(--ink-dim)"></i>challenger vs scripted baseline</span>
+        <span class="sw"><i class="rd" style="background:var(--good)"></i>promotion</span>
+        <span class="sw"><i style="background:var(--gold)"></i>champion generation (staircase)</span>
+      </div>
+    </div>
+    <div class="grid4" style="margin-top:16px">
+      <div class="stat"><div class="v acc" id="lbGen">100</div><div class="k">generations</div></div>
+      <div class="stat"><div class="v good" id="lbProm">45</div><div class="k">promotions</div></div>
+      <div class="stat"><div class="v" id="lbChamp">–</div><div class="k">final champion gen</div></div>
+      <div class="stat"><div class="v" id="lbRate">–</div><div class="k">promotion rate</div></div>
+    </div>
+  </section>
+
+  <!-- ═══════════════ 8. TOGETHER ═══════════════ -->
+  <section id="together">
+    <div class="eyebrow"><span class="n">08</span> the whole loop</div>
+    <h2>Four ideas, one learning system.</h2>
+    <div class="grid2">
+      <div class="card">
+        <ul class="tight">
+          <li><b>POMDP</b> — the field vector becomes a 71-number egocentric view; the policy decides under
+            partial information by <b>sampling</b> its softmax (§1–2).</li>
+          <li><b>Dynamic programming</b> — the Bellman equation defines the optimal value a good policy is
+            worth (§3).</li>
+          <li><b>Neural nets</b> — a critic <i>approximates</i> that value by bootstrapping, and gradient-descent
+            PPO climbs the policy toward it (§4).</li>
+          <li><b>The search</b> — an evolution strategy tunes all 32 reward weights together so the whole thing
+            points at winning, not farming stats (§5).</li>
+          <li><b>MPC / QP</b> — a last-moment optimizer executes the finish against a predicted keeper (§6),
+            and <b>self-play</b> keeps raising the bar (§7).</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>The payoff</h3>
+        <div class="grid3">
+          <div class="stat"><div class="v bad" id="rBefore">–</div><div class="k">untrained</div><div class="sub">goal diff vs baseline</div></div>
+          <div class="stat"><div class="v good" id="rAfter">–</div><div class="k">trained</div><div class="sub">goal diff vs baseline</div></div>
+          <div class="stat"><div class="v acc" id="rSwing">–</div><div class="k">swing</div><div class="sub">learned, from zero rules</div></div>
+        </div>
+        <div class="divider"></div>
+        <p class="note">The honest frontier: shared-weight PPO plays a <i>direct-ish</i> game — dominant
+          multi-pass build-up is harder to force than beating the baseline. The levers that push further are the
+          ones on this page: a stronger opponent (self-play), a better value target (DP/critic), and a
+          better-tuned reward (the 32-D search).</p>
+      </div>
+    </div>
+    <p class="foot" id="foot"></p>
+  </div>
+
+</div>
+
+<script>
+"use strict";
+/* ============================================================================
+   Teaching page for the standalone 5-a-side RL demo. Zero libraries — every
+   chart is hand-drawn on <canvas>, matching the house style of the 8080/8081
+   pages. All numbers come from data.json (see viz/teach/gen_data.py).
+   ========================================================================== */
+const $ = s => document.querySelector(s);
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+const lerp = (a,b,t)=>a+(b-a)*t;
+const fmt = (v,d=2)=>(v>=0?'+':'')+v.toFixed(d);
+function hexA(hex,a){hex=hex.replace('#','');
+  if(hex.length===3)hex=hex.split('').map(c=>c+c).join('');
+  if(hex.length!==6)return `rgba(127,127,127,${a})`;
+  const r=parseInt(hex.slice(0,2),16),g=parseInt(hex.slice(2,4),16),b=parseInt(hex.slice(4,6),16);
+  return `rgba(${r},${g},${b},${a})`;}
+function mix(c1,c2,t){ // blend two hex colors
+  const p=h=>{h=h.replace('#','');if(h.length===3)h=h.split('').map(c=>c+c).join('');
+    return[parseInt(h.slice(0,2),16),parseInt(h.slice(2,4),16),parseInt(h.slice(4,6),16)];};
+  const a=p(c1),b=p(c2);return `rgb(${a.map((x,i)=>Math.round(lerp(x,b[i],t)).toString()).join(',')})`;}
+
+// theme toggle
+(function(){
+  const btn=$('#theme');
+  const cur=()=>document.documentElement.getAttribute('data-theme')
+    || (matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');
+  btn.onclick=()=>{const n=cur()==='dark'?'light':'dark';
+    document.documentElement.setAttribute('data-theme',n);
+    document.dispatchEvent(new Event('themechange'));};
+})();
+
+// DPR-aware canvas sizing → returns {w,h,ctx}
+function fit(cv, aspect){
+  const w=cv.clientWidth||cv.parentElement.clientWidth||300;
+  const h=Math.round(w*aspect);
+  const dpr=Math.min(2,window.devicePixelRatio||1);
+  cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+'px';
+  const ctx=cv.getContext('2d'); ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,w,h);
+  return {w,h,ctx};
+}
+
+// registry of redraw fns → re-run on resize + theme change
+const REDRAW=[];
+function onDraw(fn){REDRAW.push(fn);fn();}
+let rt; addEventListener('resize',()=>{clearTimeout(rt);rt=setTimeout(()=>REDRAW.forEach(f=>f()),120);});
+document.addEventListener('themechange',()=>REDRAW.forEach(f=>f()));
+new MutationObserver(()=>REDRAW.forEach(f=>f()))
+  .observe(document.documentElement,{attributes:true,attributeFilter:['data-theme']});
+
+/* ---- generic line chart -------------------------------------------------- */
+function lineChart(cv, cfg){
+  // cfg: {aspect, xs:[...], series:[{data:[...],color,width,fill,dash}], ymin,ymax,
+  //       playhead:x, xlabel, ylabel, pct, yticks}
+  const {w,h,ctx}=fit(cv,cfg.aspect||0.6);
+  const padL=cfg.padL??38,padR=cfg.padR??12,padT=cfg.padT??12,padB=cfg.padB??22;
+  const xs=cfg.xs, xmin=cfg.xmin??Math.min(...xs), xmax=cfg.xmax??Math.max(...xs);
+  let ymin=cfg.ymin, ymax=cfg.ymax;
+  if(ymin==null||ymax==null){let lo=1e9,hi=-1e9;
+    cfg.series.forEach(s=>s.data.forEach(v=>{if(v<lo)lo=v;if(v>hi)hi=v;}));
+    const sp=(hi-lo)||1; ymin=cfg.ymin??lo-sp*0.08; ymax=cfg.ymax??hi+sp*0.08;}
+  const X=x=>padL+((x-xmin)/((xmax-xmin)||1))*(w-padL-padR);
+  const Y=v=>padT+(1-(v-ymin)/((ymax-ymin)||1))*(h-padT-padB);
+  // grid + y ticks
+  ctx.strokeStyle=css('--grid');ctx.fillStyle=css('--ink-dim');ctx.lineWidth=1;
+  ctx.font='10px ui-monospace,monospace';ctx.textAlign='right';ctx.textBaseline='middle';
+  const ticks=cfg.yticks||[ymin,(ymin+ymax)/2,ymax];
+  ticks.forEach(g=>{const y=Y(g);ctx.beginPath();ctx.moveTo(padL,y);ctx.lineTo(w-padR,y);ctx.stroke();
+    ctx.fillText(cfg.pct?Math.round(g)+'%':(Math.round(g*100)/100),padL-5,y);});
+  // zero line
+  if(ymin<0&&ymax>0){ctx.save();ctx.setLineDash([4,4]);ctx.globalAlpha=.6;ctx.strokeStyle=css('--ink-dim');
+    ctx.beginPath();ctx.moveTo(padL,Y(0));ctx.lineTo(w-padR,Y(0));ctx.stroke();ctx.restore();}
+  // playhead
+  if(cfg.playhead!=null){const px=X(cfg.playhead);ctx.save();ctx.setLineDash([3,3]);
+    ctx.strokeStyle=css('--ink-dim');ctx.globalAlpha=.8;ctx.beginPath();
+    ctx.moveTo(px,padT);ctx.lineTo(px,h-padB);ctx.stroke();ctx.restore();}
+  // series
+  cfg.series.forEach(s=>{
+    const col=s.color.startsWith('--')?css(s.color):s.color;
+    if(s.fill){const g=ctx.createLinearGradient(0,padT,0,h-padB);
+      g.addColorStop(0,hexA(col,.30));g.addColorStop(1,hexA(col,.02));
+      ctx.beginPath();ctx.moveTo(X(xs[0]),Y(Math.max(ymin,0)));
+      s.data.forEach((v,i)=>ctx.lineTo(X(xs[i]),Y(v)));
+      ctx.lineTo(X(xs[xs.length-1]),Y(Math.max(ymin,0)));ctx.closePath();ctx.fillStyle=g;ctx.fill();}
+    ctx.strokeStyle=col;ctx.lineWidth=s.width||2;ctx.lineJoin='round';
+    if(s.dash)ctx.setLineDash(s.dash);else ctx.setLineDash([]);
+    ctx.beginPath();s.data.forEach((v,i)=>{const x=X(xs[i]),y=Y(v);i?ctx.lineTo(x,y):ctx.moveTo(x,y);});
+    ctx.stroke();ctx.setLineDash([]);
+    if(s.dot!=null){const i=s.dot;ctx.fillStyle=col;ctx.beginPath();
+      ctx.arc(X(xs[i]),Y(s.data[i]),3.2,0,7);ctx.fill();}
+  });
+  // x labels
+  ctx.fillStyle=css('--ink-dim');ctx.textAlign='center';ctx.textBaseline='top';
+  const xl=cfg.xlabels||[xmin,Math.round((xmin+xmax)/2),xmax];
+  xl.forEach(x=>ctx.fillText(x,X(x),h-padB+6));
+  if(cfg.xlabel){ctx.fillText(cfg.xlabel,(padL+w-padR)/2,h-11);}
+  return {X,Y};
+}
+
+/* ---- heatmap ------------------------------------------------------------- */
+function heatmap(ctx,x0,y0,ww,hh,grid,gw,gh,ramp,vmin,vmax){
+  const cw=ww/gw, ch=hh/gh;
+  for(let j=0;j<gh;j++)for(let i=0;i<gw;i++){
+    const v=grid[i*gh+j]; const t=clamp((v-vmin)/((vmax-vmin)||1),0,1);
+    ctx.fillStyle=ramp(t);
+    ctx.fillRect(x0+i*cw, y0+j*ch, Math.ceil(cw)+0.5, Math.ceil(ch)+0.5);
+  }
+}
+// sequential ramp bg→accent, and diverging for values
+function rampSeq(t){const a=css('--panel-2')||'#0d1710';return mix('#0b3b2c', css('--accent'), t);}
+function valRamp(t){ // low=coral, mid=panel, high=teal
+  if(t<0.5)return mix(css('--teamB'), css('--panel'), t*2);
+  return mix(css('--panel'), css('--accent'), (t-0.5)*2);
+}
+
+/* ---- pitch renderer ------------------------------------------------------ */
+function drawPitch(ctx,w,h,L,W,gh,pad){
+  const X=x=>pad+(x/L)*(w-2*pad), Y=y=>pad+(y/W)*(h-2*pad);
+  ctx.fillStyle=css('--pitch');
+  roundRect(ctx,pad-4,pad-4,w-2*pad+8,h-2*pad+8,8);ctx.fill();
+  ctx.save();ctx.globalAlpha=.06;ctx.fillStyle='#fff';
+  for(let s=0;s<6;s++)if(s%2){const x0=X(s/6*L),x1=X((s+1)/6*L);ctx.fillRect(x0,Y(0),x1-x0,Y(W)-Y(0));}
+  ctx.restore();
+  ctx.strokeStyle=css('--pitch-line');ctx.lineWidth=1.3;
+  strokeRoundRect(ctx,X(0),Y(0),X(L)-X(0),Y(W)-Y(0),4);
+  ctx.beginPath();ctx.moveTo(X(L/2),Y(0));ctx.lineTo(X(L/2),Y(W));ctx.stroke();
+  ctx.beginPath();ctx.arc(X(L/2),Y(W/2),(X(L)-X(0))*0.09,0,7);ctx.stroke();
+  ctx.lineWidth=3;
+  ctx.beginPath();ctx.moveTo(X(0),Y(W/2-gh));ctx.lineTo(X(0),Y(W/2+gh));ctx.stroke();
+  ctx.beginPath();ctx.moveTo(X(L),Y(W/2-gh));ctx.lineTo(X(L),Y(W/2+gh));ctx.stroke();
+  ctx.lineWidth=1.3;
+  return {X,Y};
+}
+function roundRect(ctx,x,y,w,h,r){ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);
+  ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();}
+function strokeRoundRect(ctx,x,y,w,h,r){roundRect(ctx,x,y,w,h,r);ctx.stroke();}
+
+/* ---- masked softmax ------------------------------------------------------ */
+function softmax(logits,mask,T){T=T||1;let m=-1e9;
+  logits.forEach((l,i)=>{if(mask[i]&&l/T>m)m=l/T;});
+  const out=logits.map((l,i)=>mask[i]?Math.exp(l/T-m):0);
+  const s=out.reduce((a,b)=>a+b,0)||1;return out.map(v=>v/s);}
+function entropy(p){let e=0;p.forEach(v=>{if(v>1e-9)e-=v*Math.log(v);});return e;}
+
+/* ============================================================================
+   LOAD DATA, THEN BUILD EVERYTHING
+   ========================================================================== */
+let D=null;
+fetch('data.json').then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.json();})
+  .then(d=>{D=d;build();})
+  .catch(e=>{const b=$('#banner');b.style.display='block';
+    b.innerHTML='Could not load <code>data.json</code> ('+e.message+'). '+
+      'Run <code>python3 viz/teach/gen_data.py</code> and serve this folder '+
+      '(<code>python3 viz/teach/serve.py</code> → localhost:6012).';});
+
+function build(){
+  try{buildField();}catch(e){console.error('field',e);}
+  try{buildDecision();}catch(e){console.error('decision',e);}
+  try{buildDP();}catch(e){console.error('dp',e);}
+  try{buildNN();}catch(e){console.error('nn',e);}
+  try{buildOptimize();}catch(e){console.error('optimize',e);}
+  try{buildMPC();}catch(e){console.error('mpc',e);}
+  try{buildLadder();}catch(e){console.error('ladder',e);}
+  try{buildTogether();}catch(e){console.error('together',e);}
+}
+
+/* ---------------- 1. FIELD VECTOR ---------------- */
+let fieldSel=1;
+function buildField(){
+  const st=D.decisions[0].field;   // reuse a nice arrangement
+  const cv=$('#fieldPitch');
+  cv.onclick=ev=>{
+    const r=cv.getBoundingClientRect();
+    const mx=(ev.clientX-r.left)/r.width, my=(ev.clientY-r.top)/r.height;
+    const L=D.hyper.field[0],W=D.hyper.field[1],pad=10/ (cv.clientWidth);
+    let best=-1,bd=1e9;
+    st.a.forEach((p,i)=>{if(i===0)return; // skip keeper
+      const px=(0.026+ (p[0]/L)*0.948), py=(0.036+(p[1]/W)*0.928);
+      const d=(px-mx)**2+(py-my)**2; if(d<bd){bd=d;best=i;}});
+    if(best>=0&&bd<0.02){fieldSel=best;drawField();drawObs();}
+  };
+  onDraw(drawField); onDraw(drawObs); onDraw(drawCritic);
+  $('#who').textContent='learner #'+fieldSel+' selected · showing its view';
+}
+function drawField(){
+  const cv=$('#fieldPitch'); const st=D.decisions[0].field;
+  const L=D.hyper.field[0],W=D.hyper.field[1],gh=D.hyper.goal_half;
+  const {w,h,ctx}=fit(cv, W/L); const pad=10;
+  const {X,Y}=drawPitch(ctx,w,h,L,W,gh,pad);
+  // lines from selected player to everyone (its relational view)
+  const me=st.a[fieldSel];
+  if(me){ctx.save();ctx.strokeStyle=hexA(css('--accent').replace('rgb',''),.001);
+    st.a.concat(st.b).forEach(p=>{});ctx.restore();
+    ctx.strokeStyle=css('--accent');ctx.globalAlpha=.18;ctx.lineWidth=1;
+    st.a.forEach((p,i)=>{if(i===fieldSel)return;ctx.beginPath();ctx.moveTo(X(me[0]),Y(me[1]));ctx.lineTo(X(p[0]),Y(p[1]));ctx.stroke();});
+    ctx.strokeStyle=css('--teamB');
+    st.b.forEach(p=>{ctx.beginPath();ctx.moveTo(X(me[0]),Y(me[1]));ctx.lineTo(X(p[0]),Y(p[1]));ctx.stroke();});
+    ctx.globalAlpha=1;}
+  const drawTeam=(arr,colvar,sel)=>arr.forEach((p,i)=>{
+    const isGK=i===0;const col=css(colvar);
+    ctx.beginPath();ctx.arc(X(p[0]),Y(p[1]),isGK?6:5.4,0,7);
+    if(isGK){ctx.fillStyle=css('--panel');ctx.fill();ctx.lineWidth=2;ctx.strokeStyle=col;ctx.stroke();}
+    else{ctx.fillStyle=col;ctx.fill();}
+    if(sel&&i===fieldSel){ctx.beginPath();ctx.arc(X(p[0]),Y(p[1]),9,0,7);
+      ctx.strokeStyle=css('--ball');ctx.lineWidth=2;ctx.stroke();}
+  });
+  drawTeam(st.a,'--teamA',true); drawTeam(st.b,'--teamB',false);
+  // ball
+  ctx.beginPath();ctx.arc(X(st.ball[0]),Y(st.ball[1]),3.4,0,7);ctx.fillStyle=css('--ball');ctx.fill();
+  ctx.lineWidth=1;ctx.strokeStyle=css('--ink-dim');ctx.stroke();
+}
+function drawObs(){
+  const cv=$('#obsStrip'); const {w,h,ctx}=fit(cv,0.30);
+  const N=D.obs_dim, groups=D.obs_groups;
+  const padL=4,padR=4,padT=6,padB=26;
+  const cw=(w-padL-padR)/N;
+  // deterministic pseudo-values per dim (a plausible egocentric reading)
+  groups.forEach(g=>{
+    const col=css(g.color);
+    for(let i=g.start;i<g.end;i++){
+      const seed=Math.sin((i+1)*12.9898+fieldSel*7.13)*43758.5453;
+      const val=(seed-Math.floor(seed));            // 0..1
+      const bh=(h-padT-padB)*(0.25+0.7*val);
+      ctx.fillStyle=hexA(col.replace('rgb',''),1);ctx.globalAlpha=.85;
+      ctx.fillStyle=col;
+      ctx.fillRect(padL+i*cw+0.5, h-padB-bh, cw-1, bh);
+    }
+    ctx.globalAlpha=1;
+    // group bracket
+    const x0=padL+g.start*cw, x1=padL+g.end*cw;
+    ctx.strokeStyle=css('--line');ctx.lineWidth=1;
+    ctx.beginPath();ctx.moveTo(x0+0.5,h-padB+3);ctx.lineTo(x1-0.5,h-padB+3);ctx.stroke();
+  });
+  ctx.textAlign='left';ctx.textBaseline='top';ctx.font='9px ui-monospace,monospace';
+  ctx.fillStyle=css('--ink-dim');
+  ctx.fillText('0',padL,h-padB+7); ctx.textAlign='right';ctx.fillText(N-1,w-padR,h-padB+7);
+  // legend list
+  const lg=$('#obsLegend');
+  lg.innerHTML=groups.map(g=>`<div style="display:flex;gap:8px;align-items:center;font-size:11.5px">
+    <i style="width:10px;height:10px;border-radius:3px;background:${css(g.color)};flex:none"></i>
+    <b style="color:var(--ink);min-width:118px">${g.name}</b>
+    <span style="color:var(--ink-dim)">${g.desc}</span>
+    <span style="color:var(--ink-dim);margin-left:auto;font-variant-numeric:tabular-nums">${g.start}–${g.end-1}</span></div>`).join('');
+}
+function drawCritic(){
+  const cv=$('#criticStrip'); const {w,h,ctx}=fit(cv,0.14);
+  const N=D.critic_dim, groups=D.critic_groups; const cw=w/N;
+  groups.forEach(g=>{const col=css(g.color);
+    for(let i=g.start;i<g.end;i++){ctx.fillStyle=col;ctx.globalAlpha=.8;
+      ctx.fillRect(i*cw+0.5,2,cw-1,h-4);}});
+  ctx.globalAlpha=1;
+}
+
+/* ---------------- 2. DECISION ---------------- */
+let curScen=0, tally=null, tallyTimer=null;
+function buildDecision(){
+  const sel=$('#scen');
+  sel.innerHTML=D.decisions.map((e,i)=>`<option value="${i}">${e.title}</option>`).join('');
+  sel.onchange=()=>{curScen=+sel.value;resetTally();drawDecision();};
+  $('#temp').oninput=drawDecision;
+  $('#roll1').onclick=()=>doRoll(1);
+  $('#roll100').onclick=()=>doRoll(200);
+  $('#rollReset').onclick=resetTally;
+  onDraw(drawDecision); onDraw(drawTally);
+  resetTally();
+}
+function curProbs(){const e=D.decisions[curScen];const T=+$('#temp').value;
+  return softmax(e.logits,e.mask,T);}
+function drawDecision(){
+  const e=D.decisions[curScen]; const T=+$('#temp').value;
+  $('#scenStory').textContent=e.story;
+  $('#tempRead').textContent='T = '+T.toFixed(2);
+  const p=curProbs(); $('#entRead').textContent=entropy(p).toFixed(2);
+  probBars($('#probBars'),p,e.mask);
+}
+function probBars(cv,probs,mask){
+  const {w,h,ctx}=fit(cv,0.62);
+  const acts=D.actions; const legal=acts.filter((a,i)=>mask[i]);
+  const idxs=acts.map((a,i)=>i).filter(i=>mask[i]);
+  const n=idxs.length; const padL=92,padR=44,padT=6,padB=6;
+  const bh=(h-padT-padB)/n; const maxp=Math.max(...probs,0.01);
+  const order=idxs.slice().sort((a,b)=>probs[b]-probs[a]);
+  order.forEach((i,rank)=>{
+    const y=padT+rank*bh; const p=probs[i];
+    const bw=(w-padL-padR)*(p/1);
+    ctx.fillStyle=rank===0?css('--accent'):rank===1?mix(css('--accent'),css('--teamB'),.35):
+      rank===2?css('--ink-dim'):css('--line');
+    ctx.globalAlpha=rank<3?1:.6;
+    roundRect(ctx,padL,y+bh*0.16,Math.max(2,bw),bh*0.68,4);ctx.fill();ctx.globalAlpha=1;
+    ctx.fillStyle=css('--ink');ctx.font='11px ui-monospace,monospace';
+    ctx.textAlign='right';ctx.textBaseline='middle';
+    ctx.fillText(acts[i].name,padL-8,y+bh/2);
+    ctx.textAlign='left';ctx.fillStyle=rank<3?css('--ink'):css('--ink-dim');
+    ctx.fillText((p*100).toFixed(p*100<10?1:0)+'%',padL+Math.max(2,bw)+6,y+bh/2);
+  });
+}
+function resetTally(){tally=D.actions.map(()=>0);drawDecision();drawTally();$('#tallyN').textContent='0 samples';}
+function doRoll(n){
+  const p=curProbs();
+  for(let k=0;k<n;k++){let r=Math.random(),c=0,pick=0;
+    for(let i=0;i<p.length;i++){c+=p[i];if(r<=c){pick=i;break;}}
+    tally[pick]++;}
+  drawTally();
+  const tot=tally.reduce((a,b)=>a+b,0);$('#tallyN').textContent=tot+' samples';
+}
+function drawTally(){
+  const cv=$('#tallyBars'); const e=D.decisions[curScen];
+  const tot=(tally||[]).reduce((a,b)=>a+b,0);
+  const emp=tally?tally.map(v=>tot?v/tot:0):D.actions.map(()=>0);
+  probBars(cv,emp,e.mask);
+}
+
+/* ---------------- 3. DP ---------------- */
+let dpN=0, dpTimer=null;
+function buildDP(){
+  const F=D.dp.frames; $('#dpScrub').max=F.length-1;
+  $('#dpStep').onclick=()=>{dpN=Math.min(F.length-1,dpN+1);dpSync();};
+  $('#dpReset').onclick=()=>{dpN=0;dpSync();};
+  $('#dpScrub').oninput=()=>{dpN=+$('#dpScrub').value;dpSync();};
+  $('#dpPlay').onclick=()=>{
+    if(dpTimer){clearInterval(dpTimer);dpTimer=null;$('#dpPlay').textContent='Play';return;}
+    $('#dpPlay').textContent='Pause';
+    dpTimer=setInterval(()=>{if(dpN>=F.length-1){clearInterval(dpTimer);dpTimer=null;$('#dpPlay').textContent='Play';return;}
+      dpN++;dpSync();},420);
+  };
+  onDraw(drawDPGrid); onDraw(drawDPDelta); dpSync();
+}
+function dpSync(){$('#dpN').textContent=dpN;$('#dpScrub').value=dpN;drawDPGrid();drawDPDelta();}
+function drawDPGrid(){
+  const cv=$('#dpGrid');const dp=D.dp;const gw=dp.gw,gh=dp.gh;
+  const {w,h,ctx}=fit(cv, gh/gw*1.0);
+  const V=dp.frames[dpN].V; const pad=6;
+  const ww=w-2*pad, hh=h-2*pad;
+  let vmin=Math.min(...V),vmax=Math.max(...V);
+  heatmap(ctx,pad,pad,ww,hh,V,gw,gh,rampSeq,vmin,vmax);
+  // goal mouth marker
+  ctx.strokeStyle=css('--gold');ctx.lineWidth=2;
+  const cw=ww/gw,ch=hh/gh;
+  dp.mouth.forEach(y=>{ctx.strokeRect(pad+(dp.goal_x)*cw,pad+y*ch,cw,ch);});
+  ctx.fillStyle=css('--ink-dim');ctx.font='10px ui-monospace,monospace';
+  ctx.textAlign='left';ctx.textBaseline='bottom';ctx.fillText('own half',pad+3,h-3);
+  ctx.textAlign='right';ctx.fillText('→ their goal',w-pad-2,h-3);
+}
+function drawDPDelta(){
+  const F=D.dp.frames;
+  lineChart($('#dpDelta'),{aspect:0.62,xs:F.map(f=>f.sweep),
+    series:[{data:F.map(f=>f.delta),color:'--accent',width:2.2,fill:true,dot:dpN}],
+    ymin:0, playhead:dpN, xlabel:'value-iteration sweep'});
+}
+
+/* ---------------- 4. NN APPROX ---------------- */
+let nnI=0,nnTimer=null;
+function buildNN(){
+  const F=D.nn_value.frames;$('#nnScrub').max=F.length-1;
+  $('#nnStep').onclick=()=>{nnI=Math.min(F.length-1,nnI+1);nnSync();};
+  $('#nnScrub').oninput=()=>{nnI=+$('#nnScrub').value;nnSync();};
+  $('#nnPlay').onclick=()=>{
+    if(nnTimer){clearInterval(nnTimer);nnTimer=null;$('#nnPlay').textContent='Play';return;}
+    $('#nnPlay').textContent='Pause';
+    nnTimer=setInterval(()=>{if(nnI>=F.length-1){clearInterval(nnTimer);nnTimer=null;$('#nnPlay').textContent='Play';return;}
+      nnI++;nnSync();},360);
+  };
+  onDraw(drawNNTarget);onDraw(drawNNApprox);onDraw(drawNNErr);
+  // learning curve minis
+  onDraw(()=>lcMini('#lcDiff', D.learning.map(p=>p.diff),'--accent',true));
+  onDraw(()=>{const cv=$('#lcLoss');const xs=D.learning.map(p=>p.iter);
+    lineChart(cv,{aspect:0.72,xs,ymin:0,series:[
+      {data:D.learning.map(p=>p.ploss*4),color:'--teamB',width:1.8},
+      {data:D.learning.map(p=>p.vloss),color:'--violet',width:1.8}]});});
+  onDraw(()=>lcMini('#lcEnt', D.learning.map(p=>p.entropy),'--gold',false));
+  onDraw(()=>{const cv=$('#lcWr');const xs=D.learning.map(p=>p.iter);
+    lineChart(cv,{aspect:0.72,xs,pct:true,ymin:0,ymax:100,yticks:[0,50,100],
+      series:[{data:D.learning.map(p=>p.wr*100),color:'--accent',width:2,fill:true}]});});
+  nnSync();
+}
+function lcMini(sel,data,color,zero){const cv=$(sel);const xs=data.map((_,i)=>i);
+  lineChart(cv,{aspect:0.72,xs,series:[{data,color,width:2,fill:true}],
+    ymin: zero?undefined:Math.min(...data)*0.98});}
+function nnSync(){$('#nnIterTag').textContent='iter '+D.nn_value.frames[nnI].iter;
+  $('#nnScrub').value=nnI;drawNNApprox();drawNNErr();}
+function drawValueGrid(cv,V,gw,gh,vmin,vmax){
+  const {w,h,ctx}=fit(cv,gh/gw); const pad=5;
+  heatmap(ctx,pad,pad,w-2*pad,h-2*pad,V,gw,gh,rampSeq,vmin,vmax);
+}
+function drawNNTarget(){const dp=D.dp;drawValueGrid($('#nnTarget'),dp.optimal,dp.gw,dp.gh,
+  Math.min(...dp.optimal),Math.max(...dp.optimal));}
+function drawNNApprox(){const dp=D.dp;const f=D.nn_value.frames[nnI];
+  drawValueGrid($('#nnApprox'),f.V,dp.gw,dp.gh,Math.min(...dp.optimal),Math.max(...dp.optimal));}
+function drawNNErr(){const F=D.nn_value.frames;
+  lineChart($('#nnErr'),{aspect:0.66,xs:F.map(f=>f.iter),
+    series:[{data:F.map(f=>f.mse),color:'--teamB',width:2.2,fill:true,dot:nnI}],
+    ymin:0,playhead:F[nnI].iter,xlabel:'training iteration'});}
+
+/* ---------------- 5. THE OPTIMIZATION ---------------- */
+let oGen=0,oTimer=null,heatCache=null;
+function buildOptimize(){
+  const O=D.optimize; const N=O.gens_n;
+  $('#oScrub').max=N-1;
+  $('#oStep').onclick=()=>setGen(oGen+1);
+  $('#oBack').onclick=()=>setGen(oGen-1);
+  $('#oReset').onclick=()=>{stopO();setGen(0);};
+  $('#oScrub').oninput=()=>setGen(+$('#oScrub').value);
+  $('#oPlay').onclick=()=>{
+    if(oTimer){stopO();return;}
+    $('#oPlay').textContent='Pause ⏸';
+    const iv=Math.round(360/(+$('#oSpeed').value));
+    oTimer=setInterval(()=>{if(oGen>=N-1){stopO();return;}setGen(oGen+1);},iv);
+  };
+  // static charts that only need a playhead → registered redraws read oGen
+  onDraw(drawOFit);onDraw(drawOConv);onDraw(drawOPar);onDraw(drawOCloud);
+  onDraw(()=>{buildHeatCache();drawOHeat();});
+  setGen(0);
+}
+function stopO(){if(oTimer){clearInterval(oTimer);oTimer=null;}$('#oPlay').textContent='Play ▶';}
+function setGen(g){const N=D.optimize.gens_n;oGen=clamp(g,0,N-1);
+  $('#oGen').textContent=oGen;$('#oScrub').value=oGen;
+  drawOFit();drawOConv();drawOPar();drawOCloud();drawOHeat();narrateO();
+}
+function narrateO(){
+  const O=D.optimize,g=O.gens[oGen];
+  const phase=oGen<12?'exploring wide — the cloud is scattered across the ranges':
+    oGen<45?'homing in — elites pull the mean toward the good region':
+    oGen<75?'refining — the population braids tighten around the optimum':
+    'converged — small steps, fine-tuning the last few weights';
+  $('#oNarrate').innerHTML=`<b>Generation ${oGen}</b> · ${phase}. `+
+    `Population-mean fitness <b class="hl">${fmt(g.fit_mean)}</b> goal-diff, best `+
+    `<b class="hl">${fmt(g.fit_best)}</b>; step size σ=<b>${g.sigma_mean.toFixed(3)}</b>, `+
+    `distance to optimum <b>${g.dist_opt.toFixed(3)}</b>.`;
+}
+function drawOFit(){
+  const O=D.optimize;const G=O.gens;const xs=G.map(g=>g.gen);
+  lineChart($('#oFit'),{aspect:0.60,xs,playhead:oGen,xlabel:'generation',
+    series:[
+      {data:G.map(g=>g.fit_best),color:'--accent',width:2.2,dot:oGen},
+      {data:G.map(g=>g.fit_mean),color:'--good',width:2,fill:true,dot:oGen}]});
+}
+function drawOConv(){
+  const O=D.optimize;const G=O.gens;const xs=G.map(g=>g.gen);
+  // dual axis: normalize both to [0,1] of their own range for one panel
+  const sig=G.map(g=>g.sigma_mean),dst=G.map(g=>g.dist_opt);
+  lineChart($('#oConv'),{aspect:0.60,xs,ymin:0,playhead:oGen,xlabel:'generation',
+    series:[{data:sig,color:'--violet',width:2.2,dot:oGen},
+            {data:dst,color:'--gold',width:2.2,dot:oGen}]});
+}
+function drawOPar(){
+  const O=D.optimize;const dims=O.dims;const g=O.gens[oGen];
+  const cv=$('#oPar');const {w,h,ctx}=fit(cv,0.34);
+  const padL=8,padR=8,padT=10,padB=42; const n=dims.length;
+  const X=i=>padL+(i/(n-1))*(w-padL-padR);
+  const Y=v=>padT+(1-v)*(h-padT-padB);
+  // axes
+  ctx.strokeStyle=css('--grid');ctx.lineWidth=1;
+  for(let i=0;i<n;i++){ctx.beginPath();ctx.moveTo(X(i),padT);ctx.lineTo(X(i),h-padB);ctx.stroke();}
+  // candidate polylines
+  ctx.strokeStyle=css('--accent');ctx.lineWidth=1;
+  g.pop.forEach(c=>{ctx.globalAlpha=.13;ctx.beginPath();
+    c.norm.forEach((v,i)=>{const x=X(i),y=Y(v);i?ctx.lineTo(x,y):ctx.moveTo(x,y);});ctx.stroke();});
+  ctx.globalAlpha=1;
+  // optimum (gold dashed)
+  ctx.setLineDash([5,4]);ctx.strokeStyle=css('--gold');ctx.lineWidth=1.8;ctx.beginPath();
+  O.optimum_norm.forEach((v,i)=>{const x=X(i),y=Y(v);i?ctx.lineTo(x,y):ctx.moveTo(x,y);});ctx.stroke();
+  ctx.setLineDash([]);
+  // mean (bold)
+  ctx.strokeStyle=css('--good');ctx.lineWidth=2.4;ctx.beginPath();
+  g.mean_norm.forEach((v,i)=>{const x=X(i),y=Y(v);i?ctx.lineTo(x,y):ctx.moveTo(x,y);});ctx.stroke();
+  // axis labels (rotated)
+  ctx.fillStyle=css('--ink-dim');ctx.font='8.5px ui-monospace,monospace';
+  dims.forEach((d,i)=>{ctx.save();ctx.translate(X(i),h-padB+4);ctx.rotate(-Math.PI/2.6);
+    ctx.textAlign='right';ctx.textBaseline='middle';ctx.fillText(d.label,0,0);ctx.restore();});
+}
+function drawOCloud(){
+  const O=D.optimize;const cv=$('#oCloud');const {w,h,ctx}=fit(cv,0.66);
+  const pad=14; const rx=O.proj_range.x, ry=O.proj_range.y;
+  const X=x=>pad+((x-rx[0])/((rx[1]-rx[0])||1))*(w-2*pad);
+  const Y=y=>pad+(1-(y-ry[0])/((ry[1]-ry[0])||1))*(h-2*pad);
+  // mean trail
+  ctx.strokeStyle=css('--accent');ctx.lineWidth=1.4;ctx.globalAlpha=.5;ctx.beginPath();
+  for(let k=0;k<=oGen;k++){const m=O.gens[k].mean_xy;const x=X(m[0]),y=Y(m[1]);k?ctx.lineTo(x,y):ctx.moveTo(x,y);}
+  ctx.stroke();ctx.globalAlpha=1;
+  // population dots (fitness-colored)
+  const g=O.gens[oGen];
+  let fmin=1e9,fmax=-1e9;g.pop.forEach(c=>{fmin=Math.min(fmin,c.fit);fmax=Math.max(fmax,c.fit);});
+  g.pop.forEach(c=>{const t=clamp((c.fit-fmin)/((fmax-fmin)||1),0,1);
+    ctx.fillStyle=mix(css('--teamB'),css('--accent'),t);
+    ctx.beginPath();ctx.arc(X(c.xy[0]),Y(c.xy[1]),4,0,7);ctx.fill();});
+  // optimum star
+  const o=O.optimum_xy; drawStar(ctx,X(o[0]),Y(o[1]),7,css('--gold'));
+  // mean dot
+  const m=g.mean_xy;ctx.beginPath();ctx.arc(X(m[0]),Y(m[1]),6,0,7);
+  ctx.fillStyle=css('--accent');ctx.fill();ctx.lineWidth=2;ctx.strokeStyle=css('--panel');ctx.stroke();
+}
+function drawStar(ctx,cx,cy,r,col){ctx.fillStyle=col;ctx.beginPath();
+  for(let i=0;i<10;i++){const a=Math.PI/5*i-Math.PI/2;const rr=i%2?r*0.45:r;
+    const x=cx+Math.cos(a)*rr,y=cy+Math.sin(a)*rr;i?ctx.lineTo(x,y):ctx.moveTo(x,y);}
+  ctx.closePath();ctx.fill();}
+function buildHeatCache(){
+  const O=D.optimize;const G=O.gens;const n=O.ndim,m=O.gens_n;
+  const cv=document.createElement('canvas');const dpr=2;
+  const parent=$('#oHeat'); const w=parent.clientWidth||600; const h=Math.round(w*0.52);
+  cv.width=w*dpr;cv.height=h*dpr;const ctx=cv.getContext('2d');ctx.scale(dpr,dpr);
+  const padL=86,padT=4,padB=16,padR=6;
+  const cw=(w-padL-padR)/m, ch=(h-padT-padB)/n;
+  for(let d=0;d<n;d++)for(let gi=0;gi<m;gi++){
+    const v=G[gi].mean_norm[d];
+    ctx.fillStyle=rampSeq(v);
+    ctx.fillRect(padL+gi*cw,padT+d*ch,Math.ceil(cw)+.5,Math.ceil(ch)+.5);
+  }
+  ctx.fillStyle=css('--ink-dim');ctx.font='8px ui-monospace,monospace';ctx.textAlign='right';ctx.textBaseline='middle';
+  O.dims.forEach((d,i)=>{if(i%1===0)ctx.fillText(d.label,padL-5,padT+i*ch+ch/2);});
+  ctx.textAlign='center';ctx.textBaseline='top';
+  [0,25,50,75,99].forEach(gi=>ctx.fillText(gi,padL+gi*cw+cw/2,h-padB+3));
+  heatCache={cv,w,h,padL,padT,padB,padR,cw,ch,n,m};
+}
+function drawOHeat(){
+  if(!heatCache)buildHeatCache();
+  const cv=$('#oHeat');const {w,h,ctx}=fit(cv,heatCache.h/heatCache.w);
+  ctx.drawImage(heatCache.cv,0,0,w,h);
+  // playhead
+  const hc=heatCache;const sx=w/hc.w;
+  const px=(hc.padL+oGen*hc.cw+hc.cw/2)*sx;
+  ctx.strokeStyle=css('--ink');ctx.lineWidth=1.5;ctx.globalAlpha=.9;
+  ctx.beginPath();ctx.moveTo(px,hc.padT*sx);ctx.lineTo(px,(hc.h-hc.padB)*sx);ctx.stroke();ctx.globalAlpha=1;
+}
+
+/* ---------------- 6. MPC / QP ---------------- */
+function buildMPC(){
+  $('#mpcKeeper').oninput=drawMPC;
+  onDraw(drawMPC);
+}
+function mpcCompute(ky){ // recompute objective for a keeper y-fraction
+  const M=D.mpc;const L=M.field[0],W=M.field[1],gh=M.goal_half;
+  const goalx=L, cy=W/2, margin=gh-0.35;
+  const keeperY = (cy-margin) + 2*margin*ky;   // slide along the mouth line
+  const keeper=[M.keeper[0], keeperY];
+  const shooter=M.shooter, defs=M.defenders;
+  function laneClear(y){const ax=goalx,ay=y;const dx=ax-shooter[0],dy=ay-shooter[1];
+    const seg2=dx*dx+dy*dy+1e-9;let worst=0;
+    defs.forEach(d=>{let t=clamp(((d[0]-shooter[0])*dx+(d[1]-shooter[1])*dy)/seg2,0,1);
+      const px=shooter[0]+t*dx,py=shooter[1]+t*dy;const perp=Math.hypot(d[0]-px,d[1]-py);
+      worst=Math.max(worst,Math.exp(-(perp*perp)/(2*1.0*1.0)));});
+    return 1-worst;}
+  function scoreAt(y){const kg=Math.hypot(goalx-keeper[0],y-keeper[1]);const lc=laneClear(y);
+    return {s:kg+3*lc, kg, lc};}
+  const sweep=[];const NS=81;
+  for(let k=0;k<NS;k++){const y=(cy-margin)+2*margin*(k/(NS-1));const r=scoreAt(y);
+    sweep.push({y, score:r.s, kg:r.kg, lc:r.lc});}
+  const posts=[];for(let k=0;k<7;k++){const y=(cy-margin)+2*margin*(k/6);const r=scoreAt(y);
+    posts.push({y,score:r.s});}
+  let best=0;posts.forEach((p,i)=>{if(p.score>posts[best].score)best=i;});
+  const by=posts[best].y;
+  const d=Math.hypot(goalx-shooter[0],cy-shooter[1]);
+  const lateral=Math.abs(shooter[1]-cy);
+  const dist_f=clamp(1-d/26,0,1),angle_f=clamp(1-lateral/(W/2),0,1);
+  const xg=dist_f*dist_f*(0.4+0.6*angle_f);
+  const placement=clamp(posts[best].score/12,0,1);
+  const reward=(M.shot_base+M.shot_q*placement)*xg;
+  return {keeper,shooter,defs,sweep,posts,best,by,xg,placement,reward,margin,cy,goalx,L,W,gh};
+}
+function drawMPC(){
+  const ky=+$('#mpcKeeper').value; const R=mpcCompute(ky);
+  $('#mpcKRead').textContent='y = '+R.keeper[1].toFixed(1);
+  $('#mpcXg').textContent=R.xg.toFixed(2);
+  $('#mpcPlace').textContent=R.placement.toFixed(2);
+  $('#mpcRew').textContent=fmt(R.reward,2);
+  // pitch (zoom on attacking third)
+  const cv=$('#mpcPitch');const {w,h,ctx}=fit(cv, 0.62);
+  const L=R.L,W=R.W,gh=R.gh; const x0=22; // show x in [22,42]
+  const pad=10;
+  const X=x=>pad+((x-x0)/(L-x0))*(w-2*pad);
+  const Y=y=>pad+(y/W)*(h-2*pad);
+  // pitch bg
+  ctx.fillStyle=css('--pitch');roundRect(ctx,pad-4,pad-4,w-2*pad+8,h-2*pad+8,8);ctx.fill();
+  ctx.strokeStyle=css('--pitch-line');ctx.lineWidth=3;
+  ctx.beginPath();ctx.moveTo(X(L),Y(W/2-gh));ctx.lineTo(X(L),Y(W/2+gh));ctx.stroke();
+  ctx.lineWidth=1.3;strokeRoundRect(ctx,X(x0),Y(0),X(L)-X(x0),Y(W)-Y(0),4);
+  // 7 aim posts + shot lines
+  R.posts.forEach((p,i)=>{
+    const chosen=i===R.best;
+    ctx.strokeStyle=chosen?css('--accent'):hexA(css('--gold').replace('rgb',''),.001);
+    ctx.strokeStyle=chosen?css('--accent'):css('--ink-dim');
+    ctx.globalAlpha=chosen?0.95:0.28;ctx.lineWidth=chosen?2.4:1;
+    ctx.beginPath();ctx.moveTo(X(R.shooter[0]),Y(R.shooter[1]));ctx.lineTo(X(R.goalx),Y(p.y));ctx.stroke();
+    ctx.globalAlpha=1;
+    ctx.fillStyle=chosen?css('--accent'):css('--gold');
+    ctx.beginPath();ctx.arc(X(R.goalx),Y(p.y),chosen?5:3,0,7);ctx.fill();
+  });
+  // defenders
+  R.defs.forEach(d=>{ctx.fillStyle=css('--teamB');ctx.beginPath();ctx.arc(X(d[0]),Y(d[1]),5,0,7);ctx.fill();});
+  // keeper
+  ctx.beginPath();ctx.arc(X(R.keeper[0]),Y(R.keeper[1]),6,0,7);
+  ctx.fillStyle=css('--panel');ctx.fill();ctx.lineWidth=2.4;ctx.strokeStyle=css('--teamB');ctx.stroke();
+  // shooter
+  ctx.beginPath();ctx.arc(X(R.shooter[0]),Y(R.shooter[1]),5.4,0,7);ctx.fillStyle=css('--teamA');ctx.fill();
+  // ball at shooter
+  ctx.beginPath();ctx.arc(X(R.shooter[0])+7,Y(R.shooter[1]),2.6,0,7);ctx.fillStyle=css('--ball');ctx.fill();
+  // objective curve
+  drawMPCObj(R);
+}
+function drawMPCObj(R){
+  const cv=$('#mpcObj');const sweep=R.sweep;
+  // smooth part = keeper_gap only (the convex quadratic-ish component)
+  const kg=sweep.map(s=>s.kg), sc=sweep.map(s=>s.score), ys=sweep.map(s=>s.y);
+  const {X,Y}=lineChart(cv,{aspect:0.6,xs:ys,padL:30,
+    series:[
+      {data:kg,color:'--violet',width:1.6,dash:[4,3]},
+      {data:sc,color:'--accent',width:2.4,fill:true}],
+    xlabel:'aim point across the mouth (y)'});
+  // overlay 7 posts as gold dots + the chosen one
+  const ctx=cv.getContext('2d');
+  R.posts.forEach((p,i)=>{ctx.fillStyle=i===R.best?css('--accent'):css('--gold');
+    ctx.beginPath();ctx.arc(X(p.y),Y(p.score),i===R.best?5:3.4,0,7);ctx.fill();
+    if(i===R.best){ctx.strokeStyle=css('--accent');ctx.lineWidth=2;
+      ctx.beginPath();ctx.arc(X(p.y),Y(p.score),8,0,7);ctx.stroke();}});
+}
+
+/* ---------------- 7. SELF-PLAY LADDER ---------------- */
+function buildLadder(){
+  const L=D.ladder;
+  const proms=L.filter(r=>r.promoted).length;
+  $('#lbProm').textContent=proms;
+  $('#lbChamp').textContent=L[L.length-1].champ;
+  $('#lbRate').textContent=Math.round(proms/L.length*100)+'%';
+  onDraw(drawLadder);
+}
+function drawLadder(){
+  const cv=$('#ladderChart');const L=D.ladder;const xs=L.map(r=>r.gen);
+  const {w,h,ctx}=fit(cv,0.36);
+  const padL=40,padR=62,padT=14,padB=26;
+  const champMax=Math.max(...L.map(r=>r.champ));
+  let lo=Math.min(...L.map(r=>Math.min(r.cc_gd,r.cs_gd)))-0.3;
+  let hi=Math.max(...L.map(r=>Math.max(r.cc_gd,r.cs_gd)))+0.3;
+  const X=g=>padL+((g-1)/(L.length-1))*(w-padL-padR);
+  const Y=v=>padT+(1-(v-lo)/((hi-lo)||1))*(h-padT-padB);
+  const Yc=c=>padT+(1-c/(champMax||1))*(h-padT-padB);   // champion staircase on right axis
+  // grid + zero
+  ctx.strokeStyle=css('--grid');ctx.fillStyle=css('--ink-dim');ctx.font='10px ui-monospace,monospace';
+  ctx.textAlign='right';ctx.textBaseline='middle';ctx.lineWidth=1;
+  [Math.ceil(lo),0,Math.floor(hi)].forEach(g=>{const y=Y(g);ctx.beginPath();
+    ctx.moveTo(padL,y);ctx.lineTo(w-padR,y);ctx.stroke();ctx.fillText(fmt(g,0),padL-5,y);});
+  ctx.save();ctx.setLineDash([4,4]);ctx.globalAlpha=.6;ctx.strokeStyle=css('--ink-dim');
+  ctx.beginPath();ctx.moveTo(padL,Y(0));ctx.lineTo(w-padR,Y(0));ctx.stroke();ctx.restore();
+  // champion staircase (gold, right axis)
+  ctx.strokeStyle=css('--gold');ctx.lineWidth=1.8;ctx.beginPath();
+  L.forEach((r,i)=>{const x=X(r.gen),y=Yc(r.champ);i?ctx.lineTo(x,y):ctx.moveTo(x,y);});ctx.stroke();
+  ctx.fillStyle=css('--gold');ctx.textAlign='right';ctx.textBaseline='middle';
+  ctx.fillText('champ '+champMax,w-4,Yc(champMax)-8);
+  // cs line (vs scripted, dim)
+  ctx.strokeStyle=css('--ink-dim');ctx.lineWidth=1.4;ctx.globalAlpha=.8;ctx.beginPath();
+  L.forEach((r,i)=>{const x=X(r.gen),y=Y(r.cs_gd);i?ctx.lineTo(x,y):ctx.moveTo(x,y);});ctx.stroke();ctx.globalAlpha=1;
+  // cc line (vs champion, teal)
+  ctx.strokeStyle=css('--accent');ctx.lineWidth=1.8;ctx.beginPath();
+  L.forEach((r,i)=>{const x=X(r.gen),y=Y(r.cc_gd);i?ctx.lineTo(x,y):ctx.moveTo(x,y);});ctx.stroke();
+  // promotion dots
+  L.forEach(r=>{if(r.promoted){ctx.fillStyle=css('--good');ctx.beginPath();
+    ctx.arc(X(r.gen),Y(r.cc_gd),3.2,0,7);ctx.fill();
+    ctx.strokeStyle=css('--panel');ctx.lineWidth=1;ctx.stroke();}});
+  ctx.fillStyle=css('--ink-dim');ctx.textAlign='center';ctx.textBaseline='top';
+  [1,25,50,75,100].forEach(g=>ctx.fillText(g,X(g),h-padB+6));
+  ctx.fillText('generation',(padL+w-padR)/2,h-12);
+}
+
+/* ---------------- 8. TOGETHER ---------------- */
+function buildTogether(){
+  // derive headline from learning curve endpoints
+  const L=D.learning;const before=L[0].diff, after=Math.max(...L.map(p=>p.diff));
+  $('#rBefore').textContent=fmt(before,1);
+  $('#rAfter').textContent=fmt(after,1);
+  $('#rSwing').textContent=fmt(after-before,1);
+  $('#foot').innerHTML='Value-iteration, the 100-generation evolution strategy over the exact 32-weight '+
+    'reward vector, and the decision softmax are all computed in <code>viz/teach/gen_data.py</code>; the '+
+    'self-play ladder is real <code>out/selfplay_ladder.csv</code>. '+D.meta.honesty;
+}
+</script>
+</body>
+</html>

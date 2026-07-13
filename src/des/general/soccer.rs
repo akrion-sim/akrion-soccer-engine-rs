@@ -41092,25 +41092,6 @@ pub(crate) fn dd_soccer_enable_learned_mpc_shot_objective() -> bool {
     }
 }
 
-/// Gate (default-OFF) for **actor-owned shot placement**. When on, a `Shoot` action carries an
-/// explicit `target_point` (which goal-mouth spot to aim at), sourced from the learned policy's
-/// plan instead of being discarded, and execution honors its lateral component. Off ⇒ `target_point`
-/// stays `None` ⇒ the analytic `base_goal_x` pipeline runs unchanged ⇒ byte-identical to baseline.
-/// This is the structural finishing INTERFACE (the POMDP owning placement), distinct from the
-/// learned-MPC aim RESIDUAL above.
-pub(crate) fn dd_soccer_enable_actor_shot_placement() -> bool {
-    #[cfg(test)]
-    {
-        soccer_env_flag_enabled("DD_SOCCER_ENABLE_ACTOR_SHOT_PLACEMENT")
-    }
-    #[cfg(not(test))]
-    {
-        use std::sync::OnceLock;
-        static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_ACTOR_SHOT_PLACEMENT"))
-    }
-}
-
 /// Env flag enabling the learned MPC execution-objective head for DRIBBLE CARRY specifically — the
 /// dribble analogue of the pass/shot wiring. When on (and the head is present) a bounded
 /// (≤[`MPC_OBJECTIVE_MAX_RESIDUAL_YARDS`]) FULL 2-D aim residual nudges the analytic dribble carry

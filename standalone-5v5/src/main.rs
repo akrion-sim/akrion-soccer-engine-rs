@@ -567,6 +567,15 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
 
     let generations = env_usize_clamped("GENERATIONS", 12, 1, SELFPLAY_MAX_GENERATIONS);
     let promote_margin = env_f32_clamped("PROMOTE_MARGIN", 0.25, -20.0, 20.0);
+    // ANTI-DRIFT (mirrors the 11v11 league+analytic anchor). Pure latest-champion
+    // self-play drifts into rock-paper-scissors cycles: the challenger beats the
+    // champion while its ABSOLUTE skill (vs the fixed scripted baseline) collapses.
+    // Two guards: (1) train a fraction of iterations against the scripted baseline
+    // (every Nth iter) so absolute skill stays anchored; (2) require a promoted
+    // policy to ALSO not regress vs scripted (>= floor), so a champion never scores
+    // worse than the baseline it is supposed to have surpassed.
+    let anchor_every = env_usize_clamped("SCRIPTED_ANCHOR_EVERY", 3, 1, 100_000);
+    let scripted_floor = env_f32_clamped("SCRIPTED_FLOOR", 0.0, -20.0, 20.0);
     let speed_warmup = env_usize_clamped(
         "SPEED_WARMUP",
         (cfg.iters / 2).max(1),
