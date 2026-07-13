@@ -3454,6 +3454,7 @@ mod tests {
     #[test]
     fn lofted_pass_near_goal_does_not_trigger_shot_save_model() {
         let mut w = World::new();
+        w.parity_flight = true; // parity z-flight behavior
         let mut rng = Rng::new(13);
         for i in 0..N {
             w.a[i].pos = V2::new(6.0 + i as f32, 3.0);
