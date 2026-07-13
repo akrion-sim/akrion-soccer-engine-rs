@@ -438,7 +438,7 @@ fn match_neural_snapshot_exports_and_restores_legacy_specialist_heads() {
         "trained keeper head must ride with the neural sidecar"
     );
 
-    let restored = SoccerMatch::default_11v11(config)
+    let mut restored = SoccerMatch::default_11v11(config)
         .with_neural_network_snapshot(exported)
         .expect("restore neural snapshot with specialist heads");
     let restored_skill_heads = restored
@@ -455,6 +455,45 @@ fn match_neural_snapshot_exports_and_restores_legacy_specialist_heads() {
             .expect("keeper head restored")
             .training_steps,
         1
+    );
+
+    let installed = restored
+        .neural_network_snapshot()
+        .expect("installed serving bundle should export");
+    let mut incompatible = installed.clone();
+    incompatible.training_steps = installed.training_steps.saturating_add(999);
+    incompatible.layers[0].weights[0][0] += 0.25;
+    incompatible
+        .keeper_policy_head
+        .as_mut()
+        .expect("keeper snapshot")
+        .network
+        .layers[0]
+        .weights[0]
+        .pop();
+    let error = restored
+        .set_neural_network_snapshot(incompatible)
+        .expect_err("an incompatible specialist must reject the whole serving bundle");
+    assert!(error.contains("input dim"), "unexpected load error: {error}");
+    let after_rejection = restored
+        .neural_network_snapshot()
+        .expect("previous serving bundle must remain installed");
+    assert_eq!(after_rejection.training_steps, installed.training_steps);
+    assert_eq!(
+        after_rejection.layers[0].weights[0], installed.layers[0].weights[0],
+        "a rejected specialist must not partially install the new critic"
+    );
+    assert_eq!(
+        after_rejection
+            .keeper_policy_head
+            .as_ref()
+            .expect("previous keeper remains installed")
+            .training_steps,
+        installed
+            .keeper_policy_head
+            .as_ref()
+            .expect("installed keeper snapshot")
+            .training_steps
     );
 }
 
@@ -13813,12 +13852,18 @@ fn goal_and_shot_reward_pools_and_buildup_chain_are_locked() {
     // with the reward distributed back through the
     // attacking chain (so an intermediate received pass that leads to a shot/goal
     // earns a share).
-    assert_eq!(GOAL_REWARD_POINTS, 160.0);
-    assert_eq!(DIRECT_TURNOVER_GOAL_REWARD_POINTS, 85.0);
+    assert_eq!(GOAL_REWARD_POINTS, 500.0);
+    assert_eq!(DIRECT_TURNOVER_GOAL_REWARD_POINTS, 250.0);
     assert_eq!(SHOT_ON_TARGET_REWARD_POINTS, 80.0);
     assert!((GOAL_CHAIN_REWARD_PATTERN.iter().sum::<f64>() - 160.0).abs() < 1e-9);
     assert!((SHOT_ON_TARGET_REWARD_PATTERN.iter().sum::<f64>() - 80.0).abs() < 1e-9);
-    assert!(SHOT_ON_TARGET_REWARD_POINTS < DIRECT_TURNOVER_GOAL_REWARD_POINTS);
+    assert!(
+        SHOT_ON_TARGET_REWARD_PATTERN.iter().sum::<f64>()
+            < GOAL_CHAIN_REWARD_PATTERN.iter().sum::<f64>()
+    );
+    assert!(
+        GOAL_CHAIN_REWARD_PATTERN.iter().sum::<f64>() < DIRECT_TURNOVER_GOAL_REWARD_POINTS
+    );
     assert!(DIRECT_TURNOVER_GOAL_REWARD_POINTS < GOAL_REWARD_POINTS);
 
     // A pass that leads to a subsequent received pass is rewarded, more for forward

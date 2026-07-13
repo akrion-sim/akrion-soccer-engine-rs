@@ -318,6 +318,7 @@ impl LeagueMatchKpis {
 struct LeagueRoundKpis {
     games: usize,
     goal_diff: i32,
+    goal_diff_square_sum: f64,
     goals_for: u32,
     goals_against: u32,
     shots_for: u32,
@@ -362,6 +363,7 @@ impl LeagueRoundKpis {
     fn add(&mut self, kpis: LeagueMatchKpis) {
         self.games += 1;
         self.goal_diff += kpis.goal_diff;
+        self.goal_diff_square_sum += (kpis.goal_diff as f64).powi(2);
         self.goals_for = self.goals_for.saturating_add(kpis.goals_for);
         self.goals_against = self.goals_against.saturating_add(kpis.goals_against);
         self.shots_for = self.shots_for.saturating_add(kpis.shots_for);
@@ -488,6 +490,16 @@ impl LeagueRoundKpis {
         } else {
             self.goal_diff as f64 / self.games as f64
         }
+    }
+
+    fn goal_diff_lower_95(&self) -> f64 {
+        if self.games < 2 {
+            return f64::NEG_INFINITY;
+        }
+        let n = self.games as f64;
+        let mean = self.mean_goal_diff();
+        let variance = ((self.goal_diff_square_sum - n * mean * mean) / (n - 1.0)).max(0.0);
+        mean - 1.96 * (variance / n).sqrt()
     }
 }
 
@@ -977,9 +989,13 @@ fn play_checkpoint_validation(
     println!("league_checkpoint_validation_start label={label} round={round} games={games}");
     for g in 0..games {
         let candidate_home = g % 2 == 0;
+        // Consecutive fixtures form one side-swapped pair on the same seed.
+        // This removes home geometry and stochastic schedule luck from the
+        // candidate-vs-incumbent delta.
+        let pair = g / 2;
         let seed = 0xC1A0_0000u32
             .wrapping_add(round.wrapping_mul(1_000_003))
-            .wrapping_add((g as u32).wrapping_mul(2_246_822_519));
+            .wrapping_add((pair as u32).wrapping_mul(2_246_822_519));
         let (home_id, away_id, home, away, candidate_team) = if candidate_home {
             (0usize, 1usize, candidate, baseline, Team::Home)
         } else {
@@ -1087,7 +1103,7 @@ fn main() {
         env_f64("SOCCER_LEAGUE_CHECKPOINT_MAX_FORWARD_PASS_REGRESSION", 0.0).max(0.0);
     let checkpoint_min_forward_pass_margin =
         env_f64("SOCCER_LEAGUE_CHECKPOINT_MIN_FORWARD_PASS_MARGIN", 0.0);
-    let checkpoint_validate_games = env_usize("SOCCER_LEAGUE_CHECKPOINT_VALIDATE_GAMES", 8);
+    let checkpoint_validate_games = env_usize("SOCCER_LEAGUE_CHECKPOINT_VALIDATE_GAMES", 20);
     let checkpoint_validate_min_forward_pass_margin = env_f64(
         "SOCCER_LEAGUE_CHECKPOINT_VALIDATE_MIN_FORWARD_PASS_MARGIN",
         0.0,
@@ -1271,7 +1287,7 @@ fn main() {
     // CURRENT published champion (a neural net that strengthens as the ladder climbs) plus an analytic
     // baseline, and promote it to the new champion only when it beats that champion by a goal-diff
     // margin over the held-out head-to-head eval. The co-evolution the plain league lacks.
-    let self_play_ladder = env_bool("SOCCER_LEAGUE_SELF_PLAY_LADDER", false);
+    let self_play_ladder = env_bool("SOCCER_LEAGUE_SELF_PLAY_LADDER", true);
     let self_play_promote_margin = env_f64("SOCCER_LEAGUE_PROMOTE_MARGIN", 0.25);
 
     let mut runner_config = EngineMatchRunnerConfig::default();
@@ -1296,7 +1312,7 @@ fn main() {
     // family, but a long league run has only one active learner unless the operator overrides it.
     runner_config.base.neural_learning.learning_rate = env_f64_any(
         &["SOCCER_LEAGUE_LEARNING_RATE", "SOCCER_NEURAL_LEARNING_RATE"],
-        0.015,
+        0.0003,
     );
     runner_config.base.neural_learning.optimizer_momentum = env_f64(
         "SOCCER_NEURAL_OPTIMIZER_MOMENTUM",
@@ -1307,13 +1323,10 @@ fn main() {
     // Only takes effect on a FRESH net — a resumed snapshot keeps its own architecture.
     runner_config.base.neural_learning.hidden_units =
         env_usize("SOCCER_LEAGUE_HIDDEN_UNITS", 96).max(1);
-    // Critic-target window (un-crush A/B). The critic target is `(reward + gamma*max_next) /
-    // target_scale` clamped to +/-target_clip. With the defaults (30/3) the +/-200 win and +160
-    // goal terminal rewards BOTH saturate the +3 rail, so the value head cannot rank win vs goal
-    // vs a big win — the advantage baseline is blind above the rail. Raising `target_scale` (e.g.
-    // 120) drops those labels below the clip so terminal outcomes separate again; `target_clip`
-    // is exposed too for completeness. Unset ⇒ the config default (byte-identical).
-    runner_config.base.neural_learning.target_scale = env_f64("SOCCER_NEURAL_TARGET_SCALE", 120.0);
+    // Critic-target window for the fixed 1000-point win and 500-point goal anchors.
+    // At scale 400 with the default +/-3 clip, the two terminal outcomes remain
+    // distinct (2.5 versus 1.25) instead of collapsing onto the same saturation rail.
+    runner_config.base.neural_learning.target_scale = env_f64("SOCCER_NEURAL_TARGET_SCALE", 400.0);
     runner_config.base.neural_learning.target_clip = env_f64(
         "SOCCER_NEURAL_TARGET_CLIP",
         runner_config.base.neural_learning.target_clip,
@@ -1595,13 +1608,20 @@ fn main() {
             opponents.push(fixed_analytic_anchor());
         }
 
-        // SELF-PLAY LADDER: replace the league with just the CURRENT published champion (neural, so it
-        // drives Team B through the same inference path and strengthens as the ladder climbs) plus one
-        // ANALYTIC baseline — the challenger co-evolves against a tougher self AND stays grounded
-        // against the engine (the north-star metric it is scored on). Gen-0 (nothing published yet) =
-        // analytic only, mirroring the 5v5 ladder's scripted gen-0 baseline.
+        // SELF-PLAY LADDER: retain the complete frozen champion history, weight the
+        // current published frontier once more, and keep an analytic anchor. The
+        // challenger must improve without forgetting how to beat older strategies.
         if self_play_ladder {
-            let mut pool: Vec<TeamBrain> = Vec::new();
+            let mut pool: Vec<TeamBrain> = load_league(&archive_dir)
+                .into_iter()
+                .map(|champion| {
+                    if hermetic_neural {
+                        without_target_q(champion)
+                    } else {
+                        champion
+                    }
+                })
+                .collect();
             if let Some(champ) = load_brain(&frontier_path) {
                 pool.push(if hermetic_neural {
                     without_target_q(champ)
@@ -2014,10 +2034,15 @@ fn main() {
                         // goal-diff margin over the held-out head-to-head eval. Republishing the
                         // frontier advances the champion, so next round's opponent is this stronger net
                         // — the ladder climbs.
-                        let ladder_promotes = gate_goal_diff_margin >= self_play_promote_margin;
+                        let gate_goal_diff_lower_95 = validation
+                            .as_ref()
+                            .map(LeagueRoundKpis::goal_diff_lower_95)
+                            .unwrap_or(f64::NEG_INFINITY);
+                        let ladder_promotes = gate_goal_diff_lower_95 >= self_play_promote_margin;
                         println!(
-                            "league_self_play_ladder round={round} gd_vs_champion={:.3} promote_margin={:.3} verdict={}",
+                            "league_self_play_ladder round={round} gd_vs_champion={:.3} gd_lcb95={:.3} promote_margin={:.3} verdict={}",
                             gate_goal_diff_margin,
+                            gate_goal_diff_lower_95,
                             self_play_promote_margin,
                             if ladder_promotes { "PROMOTED" } else { "held" }
                         );
@@ -2486,6 +2511,29 @@ mod tests {
             candidate_frontier_path("/tmp/run/frontier"),
             "/tmp/run/frontier.candidate"
         );
+    }
+
+    #[test]
+    fn ladder_promotion_uses_lower_confidence_bound_not_positive_raw_mean() {
+        let noisy = LeagueRoundKpis {
+            games: 4,
+            goal_diff: 2,
+            goal_diff_square_sum: 10.0,
+            ..LeagueRoundKpis::default()
+        };
+        assert!(noisy.mean_goal_diff() > 0.0);
+        assert!(
+            noisy.goal_diff_lower_95() < 0.0,
+            "a noisy positive mean must not manufacture a promotion"
+        );
+
+        let stable = LeagueRoundKpis {
+            games: 20,
+            goal_diff: 20,
+            goal_diff_square_sum: 20.0,
+            ..LeagueRoundKpis::default()
+        };
+        assert_eq!(stable.goal_diff_lower_95(), 1.0);
     }
 
     #[test]

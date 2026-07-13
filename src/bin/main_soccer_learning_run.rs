@@ -8151,7 +8151,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         "SOCCER_WRITE_LEARNED_PARAMS_ARTIFACTS",
         write_final_artifacts,
     )?;
-    let checkpoint_artifact_best_only = env_bool("SOCCER_CHECKPOINT_ARTIFACT_BEST_ONLY", false)?;
+    // Public artifacts are a protected frontier. Candidates that have not beaten
+    // the incumbent on held-out evidence belong in `*.candidate.json`, never in
+    // the path consumed by live play or the next training run.
+    let checkpoint_artifact_best_only = env_bool("SOCCER_CHECKPOINT_ARTIFACT_BEST_ONLY", true)?;
     let write_episode_log_file = env_bool(
         "SOCCER_WRITE_EPISODE_LOG",
         default_disk_learning_artifacts && DEFAULT_SOCCER_WRITE_EPISODE_LOG,
@@ -8373,14 +8376,14 @@ fn run() -> Result<(), Box<dyn Error>> {
     println!(
         "policy_active_max_fitness_regression value={active_max_fitness_regression_setting:.4} (lower = stricter anti-regression ratchet; 0.0 = newer generation must not regress)"
     );
-    // Frozen-anchor promotion gate (DEFAULT-OFF): a candidate must beat the frozen
+    // Frozen-anchor promotion gate: a candidate must beat the frozen
     // anchor brain over a held-out slate before it is written `active`. See
     // `AnchorPromotionGateConfig` / `anchor_promotion_gate_verdict`.
     let anchor_promotion_gate = {
         let enabled = env_bool_alias(
             "SOCCER_BATCH_ANCHOR_PROMOTION_GATE_ENABLED",
             "SOCCER_ANCHOR_PROMOTION_GATE_ENABLED",
-            false,
+            true,
         )?;
         let games = env_usize("SOCCER_ANCHOR_PROMOTION_GATE_GAMES", 8)?.max(2);
         let minutes = env_f64("SOCCER_ANCHOR_PROMOTION_GATE_MINUTES", 2.0)?;
@@ -8490,7 +8493,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let policy_promotion_compare_incumbent = env_bool_alias(
         "SOCCER_BATCH_POLICY_PROMOTION_COMPARE_INCUMBENT",
         "SOCCER_POLICY_PROMOTION_COMPARE_INCUMBENT",
-        false,
+        true,
     )?;
     let policy_promotion_min_mean_fitness_delta = env_f64_alias(
         "SOCCER_BATCH_POLICY_PROMOTION_MIN_MEAN_FITNESS_DELTA",
@@ -8533,7 +8536,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let policy_evolution_reset_to_incumbent_after_held_trial = env_bool_alias(
         "SOCCER_BATCH_POLICY_EVOLUTION_RESET_TO_INCUMBENT_AFTER_HELD_TRIAL",
         "SOCCER_POLICY_EVOLUTION_RESET_TO_INCUMBENT_AFTER_HELD_TRIAL",
-        policy_evolution_apply_when_promotion_held,
+        true,
     )?;
     let policy_evolution_require_trial_before_write = env_bool_alias(
         "SOCCER_BATCH_POLICY_EVOLUTION_REQUIRE_TRIAL_BEFORE_WRITE",
@@ -8543,7 +8546,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let policy_write_neural_checkpoint_when_promotion_held = env_bool_alias(
         "SOCCER_BATCH_POLICY_WRITE_NEURAL_CHECKPOINT_WHEN_PROMOTION_HELD",
         "SOCCER_POLICY_WRITE_NEURAL_CHECKPOINT_WHEN_PROMOTION_HELD",
-        true,
+        false,
     )?;
     let policy_resume_latest_neural_checkpoint = env_bool_alias(
         "SOCCER_BATCH_RESUME_LATEST_NEURAL_CHECKPOINT",
@@ -8565,7 +8568,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         true,
     )?;
     let policy_promotion_local_best_rollback =
-        env_bool("SOCCER_POLICY_PROMOTION_LOCAL_BEST_ROLLBACK", false)?;
+        env_bool("SOCCER_POLICY_PROMOTION_LOCAL_BEST_ROLLBACK", true)?;
     let policy_promotion_local_best_backoff =
         env_bool("SOCCER_POLICY_PROMOTION_LOCAL_BEST_BACKOFF", false)?;
     let policy_promotion_local_best_backoff_factor =
@@ -8599,7 +8602,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         .into());
     }
     let policy_promotion_local_best_anchor_held =
-        env_bool("SOCCER_POLICY_PROMOTION_LOCAL_BEST_ANCHOR_HELD", false)?;
+        env_bool("SOCCER_POLICY_PROMOTION_LOCAL_BEST_ANCHOR_HELD", true)?;
     let policy_promotion_local_best_restore_min_games =
         env_usize("SOCCER_POLICY_PROMOTION_LOCAL_BEST_RESTORE_MIN_GAMES", 0)?;
     let policy_promotion_local_best_restore_max_mean_fitness_regression = env_f64(
@@ -8633,7 +8636,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         env_batch_neural_snapshot_min_batch_mean_fitness()?;
     let neural_batch_snapshot_rescue_min_fitness = env_batch_neural_snapshot_rescue_min_fitness()?;
     let neural_batch_policy_merge_selected_only =
-        env_bool("SOCCER_NEURAL_BATCH_POLICY_MERGE_SELECTED_ONLY", false)?;
+        env_bool("SOCCER_NEURAL_BATCH_POLICY_MERGE_SELECTED_ONLY", true)?;
     let neural_batch_snapshot_carry_unvalidated =
         env_bool("SOCCER_NEURAL_BATCH_SNAPSHOT_CARRY_UNVALIDATED", false)?;
     let neural_batch_snapshot_carry_no_publishable = env_bool(
@@ -8860,7 +8863,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         "SOCCER_POLICY_TRAIN_MAX_TRANSITIONS_PER_TICK",
         config.policy_train_max_transitions_per_tick,
     )?;
-    config.neural_blend.mode = env_neural_blend_mode(config.neural_blend.mode)?;
+    // Learning runs should exercise the neural actor as the decision authority.
+    // Additive mode can only imitate/rerank the analytic shell and therefore
+    // cannot establish that the learned policy itself escaped the tabular ceiling.
+    config.neural_blend.mode = env_neural_blend_mode(SoccerNeuralBlendMode::Authoritative)?;
     config.neural_blend.lambda = env_f64("SOCCER_NEURAL_BLEND_LAMBDA", config.neural_blend.lambda)?;
     config.neural_blend.tie_epsilon = env_f64(
         "SOCCER_NEURAL_BLEND_TIE_EPSILON",
@@ -12413,12 +12419,29 @@ fn run() -> Result<(), Box<dyn Error>> {
         &policies,
     );
     if write_final_artifacts {
+        let final_policy_write_path = if checkpoint_artifact_best_only {
+            candidate_checkpoint_path(&final_artifact_path)
+        } else {
+            final_artifact_path.clone()
+        };
+        let final_learned_params_write_path = if checkpoint_artifact_best_only {
+            candidate_checkpoint_path(&learned_params_path)
+        } else {
+            learned_params_path.clone()
+        };
+        if checkpoint_artifact_best_only {
+            println!(
+                "final_publication_held reason=requires_held_out_promotion candidate_artifact={} candidate_learned_params={}",
+                final_policy_write_path.display(),
+                final_learned_params_write_path.display()
+            );
+        }
         if write_final_policy_artifact {
             let final_export =
                 compact_training_artifact_for_export(&artifact, artifact_max_entries_per_policy);
-            write_json(&final_artifact_path, &final_export)?;
+            write_json(&final_policy_write_path, &final_export)?;
             if let Some(sidecar_path) = write_neural_sidecar_for_policy_artifact(
-                &final_artifact_path,
+                &final_policy_write_path,
                 latest_neural_network.as_ref(),
             )? {
                 println!("final_neural_sidecar={}", sidecar_path.display());
@@ -12432,7 +12455,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     &artifact,
                     latest_neural_network.clone(),
                 );
-            write_json(&learned_params_path, &learned_params)?;
+            write_json(&final_learned_params_write_path, &learned_params)?;
         } else {
             println!(
                 "learned_params_artifact=disabled path={}",
@@ -13499,7 +13522,7 @@ mod tests {
             &below_mean,
             false
         ));
-        assert!(policy_promotion_evaluation_can_anchor_local_trial(
+        assert!(!policy_promotion_evaluation_can_anchor_local_trial(
             &below_mean,
             true
         ));
