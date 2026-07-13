@@ -25067,7 +25067,6 @@ impl SoccerMatch {
                     } else {
                         None
                     };
-<<<<<<< HEAD
                     // ROLLOUT: on the first tick after a fork, force the flagged player's
                     // action, then self-clear so the remaining horizon follows the base policy.
                     let forced_rollout_plan: Option<SoccerLearnedPlan> =
@@ -25086,7 +25085,6 @@ impl SoccerMatch {
                             }
                             None => None,
                         };
-=======
                     // Net-influence commit-level baseline (Codex): the tabular-only choice for this
                     // FRESH decision, captured before run_time_step_with_context consumes mdp_state/
                     // observation. Compared post-discipline against the actually-committed action.
@@ -25102,7 +25100,6 @@ impl SoccerMatch {
                     } else {
                         None
                     };
->>>>>>> wip/netinfluence
                     let intent = self.players[actor].run_time_step_with_context(
                         &snapshot,
                         mdp_state,
