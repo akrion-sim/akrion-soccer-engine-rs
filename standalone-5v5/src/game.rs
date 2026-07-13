@@ -1561,11 +1561,13 @@ impl World {
                     self.shoot_cooldown_a = 45; // ~2.25 s at 20 Hz before a shot is "fresh" again
                     self.pass_streak_a = 0; // buildup consumed by the shot
                     self.a_shot_flag = true; // this free ball is a valid (2-pass) shot
+                    self.a_shot_origin = me; // save model: shot lane starts here
                     self.reset_a_pass_memory();
                 } else {
                     // symmetric: B's goal only counts if B built up (2 passes) and
                     // shoots from B's own final third (B attacks -x -> small x).
                     self.b_shot_flag = self.b_pass_streak >= 2 && me.x < FIELD_L - SHOOT_X;
+                    self.b_shot_origin = me;
                     self.b_pass_streak = 0;
                 }
                 self.set_vel(team, idx, V2::default());
