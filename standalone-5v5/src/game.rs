@@ -1250,32 +1250,35 @@ impl World {
                 self.ball_z = 0.0;
             }
 
-            // reflect off side-lines (y walls) to keep play flowing
-            if self.ball.y < 0.0 {
-                self.ball.y = -self.ball.y;
-                self.ball_vel.y = -self.ball_vel.y;
-            } else if self.ball.y > FIELD_W {
-                self.ball.y = 2.0 * FIELD_W - self.ball.y;
-                self.ball_vel.y = -self.ball_vel.y;
-            }
-
+            // Out of bounds is a DEAD-BALL RESTART (11v11 parity), not a reflecting wall:
+            // touchline -> throw-in to the team that didn't put it out; goal-line (not a
+            // goal) -> corner if a DEFENDER put it out, else a goal-kick.
             let gy0 = FIELD_W / 2.0 - GOAL_HALF;
             let gy1 = FIELD_W / 2.0 + GOAL_HALF;
-            if self.ball.x >= FIELD_L {
+            let last = self.last_touch;
+            if self.ball.y < 0.0 || self.ball.y > FIELD_W {
+                // touchline: award to the other team at the crossing point.
+                let edge_y = if self.ball.y < 0.0 { 0.0 } else { FIELD_W };
+                let to = last.map(Team::other).unwrap_or(Team::A);
+                let at = V2::new(self.ball.x.clamp(1.0, FIELD_L - 1.0), edge_y);
+                self.throw_in(to, at);
+            } else if self.ball.x >= FIELD_L {
                 if self.ball.y > gy0 && self.ball.y < gy1 && self.a_shot_flag {
-                    // valid goal: came from an A shot, which required 2 passes
                     self.goals_a += 1;
                     self.ev_goal_a = true;
                     self.kickoff(Team::B);
+                } else if last == Some(Team::B) {
+                    self.corner_kick(Team::A, FIELD_L, self.ball.y); // defender B conceded a corner
                 } else {
-                    self.goal_kick(Team::B); // B restarts from its own line
+                    self.goal_kick(Team::B); // A put it out -> B goal-kick
                 }
             } else if self.ball.x <= 0.0 {
                 if self.ball.y > gy0 && self.ball.y < gy1 && self.b_shot_flag {
-                    // symmetric: B goal only counts from a valid (2-pass, final-third) shot
                     self.goals_b += 1;
                     self.ev_goal_b = true;
                     self.kickoff(Team::A);
+                } else if last == Some(Team::A) {
+                    self.corner_kick(Team::B, 0.0, self.ball.y); // defender A conceded a corner
                 } else {
                     self.goal_kick(Team::A);
                 }
