@@ -444,7 +444,7 @@ fn inspect(seed: u64, out_dir: &Path) -> AppResult<()> {
             println!(
                 "{:>4} | {:>7.1} | {}  | {:>12.1} | {:>8.1} | {:>5} | {}-{}",
                 t,
-                w.ball.x,
+                w.ball.y,
                 own,
                 closest,
                 avg,
@@ -502,7 +502,7 @@ fn frame_json(
     let _ = write!(
         s,
         "{{\"t\":{},\"ball\":[{:.2},{:.2}],\"ball_vel\":[{:.2},{:.2}],\"own\":{},\"oi\":{},\"ga\":{},\"gb\":{},\"closest_pair_a\":{:.2},\"avg_near_a\":{:.2},\"bunch\":{},\"players\":[",
-        t, w.ball.x, w.ball.y, w.ball_vel.x, w.ball_vel.y, own, oi, w.goals_a, w.goals_b, closest, avg, bunched
+        t, w.ball.y, w.ball.x, w.ball_vel.y, w.ball_vel.x, own, oi, w.goals_a, w.goals_b, closest, avg, bunched
     );
     let mut first = true;
     for (team, code, acts) in [(Team::A, 0i32, act_a), (Team::B, 1i32, act_b)] {
@@ -537,7 +537,7 @@ fn frame_json(
             let _ = write!(
                 s,
                 "{{\"team\":{},\"idx\":{},\"gk\":{},\"x\":{:.2},\"y\":{:.2},\"vx\":{:.2},\"vy\":{:.2},\"action\":\"{}\",\"near_team\":{:.2},\"near_opp\":{:.2}}}",
-                code, i, i == GK, p.pos.x, p.pos.y, p.vel.x, p.vel.y, action_name(acts[i]), nt, no
+                code, i, i == GK, p.pos.y, p.pos.x, p.vel.y, p.vel.x, action_name(acts[i]), nt, no
             );
         }
     }
@@ -1063,19 +1063,19 @@ fn record_match_vs(
             if i > 0 {
                 frames.push(',');
             }
-            let _ = write!(frames, "[{:.1},{:.1}]", w.a[i].pos.x, w.a[i].pos.y);
+            let _ = write!(frames, "[{:.1},{:.1}]", w.a[i].pos.y, w.a[i].pos.x);
         }
         frames.push_str("],\"b\":[");
         for i in 0..N {
             if i > 0 {
                 frames.push(',');
             }
-            let _ = write!(frames, "[{:.1},{:.1}]", w.b[i].pos.x, w.b[i].pos.y);
+            let _ = write!(frames, "[{:.1},{:.1}]", w.b[i].pos.y, w.b[i].pos.x);
         }
         let _ = write!(
             frames,
             "],\"ball\":[{:.1},{:.1}],\"own\":{},\"oi\":{},\"ga\":{},\"gb\":{}}}",
-            w.ball.x, w.ball.y, owner_code, owner_idx, w.goals_a, w.goals_b
+            w.ball.y, w.ball.x, owner_code, owner_idx, w.goals_a, w.goals_b
         );
     }
     frames.push(']');

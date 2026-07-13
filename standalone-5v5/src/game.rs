@@ -201,7 +201,6 @@ pub struct V2 {
     pub x: f32,
     pub y: f32,
 }
-// AXIS_FLIP_SKIP_START — this block is hand-written for the x=width/y=length convention;
 // the .x/.y access-swap script must NOT touch it.
 impl V2 {
     // Callers construct as new(<length>, <width>) by the historical convention. Under the
@@ -234,7 +233,6 @@ impl V2 {
         }
     }
 }
-// AXIS_FLIP_SKIP_END
 
 // ---- 11v11-parity physics helpers ------------------------------------------
 // All constants mirror src/des/general/soccer.rs so the small-sided sim uses the
@@ -421,7 +419,9 @@ impl Team {
             Team::B => Team::A,
         }
     }
-    /// Attack direction on the x-axis: A attacks +x (goal at FIELD_L), B attacks -x.
+    /// Attack direction sign on the LENGTH (y) axis: A attacks +y (goal at y=FIELD_L),
+    /// B attacks -y (goal at y=0). Matches the 11v11 `attack_dir()` convention: x=width,
+    /// y=length. (Name kept as `sx` for churn reasons; it is the length-axis attack sign.)
     fn sx(self) -> f32 {
         match self {
             Team::A => 1.0,
@@ -651,12 +651,12 @@ impl World {
             return V2::default();
         }
         let dir = seg.unit();
-        let perp = V2::new(-dir.y, dir.x);
+        let perp = V2::new(-dir.x, dir.y);
         let mid = from.add(seg.scale(0.5));
         let (oi, _) = self.nearest_opponent(team, mid);
         let opp = players(team.other(), self)[oi].pos;
         let rel = opp.sub(mid);
-        let side = if rel.x * perp.x + rel.y * perp.y > 0.0 {
+        let side = if rel.y * perp.y + rel.x * perp.x > 0.0 {
             -1.0
         } else {
             1.0
@@ -679,7 +679,7 @@ impl World {
                 continue; // don't pass to self or (as an outlet) the keeper
             }
             let tp = ps[i].pos;
-            let fwd = (tp.x - from.x) * sx; // positive = ahead
+            let fwd = (tp.y - from.y) * sx; // positive = ahead
             let (_, opp_d) = self.nearest_opponent(team, tp); // openness
             let dist = tp.sub(from).len();
             if dist < 2.0 {
@@ -774,7 +774,7 @@ impl World {
         if team != Team::A {
             return;
         }
-        let fwd = dir.x * sx;
+        let fwd = dir.y * sx;
         if fwd > 0.3 {
             self.ev_dribble_fwd_a = true;
         } else if fwd > -0.3 {
@@ -814,11 +814,11 @@ impl World {
                 continue;
             }
             let rel = opp[i].pos.sub(from);
-            let t = rel.x * u.x + rel.y * u.y;
+            let t = rel.y * u.y + rel.x * u.x;
             if t <= 0.5 || t >= dist {
                 continue;
             }
-            let perp = (rel.x * (-u.y) + rel.y * u.x).abs();
+            let perp = (rel.y * (-u.x) + rel.x * u.y).abs();
             let clear = (perp / 3.0).min(1.0);
             if clear < min_clear {
                 min_clear = clear;
@@ -840,12 +840,12 @@ impl World {
         let mut min_clear = 1.0f32;
         for i in 0..N {
             let rel = opp[i].pos.sub(from);
-            let t = rel.x * u.x + rel.y * u.y; // projection along shot
+            let t = rel.y * u.y + rel.x * u.x; // projection along shot
             if t <= 0.5 || t >= dist {
                 continue;
             }
             // perpendicular distance from lane
-            let perp = (rel.x * (-u.y) + rel.y * u.x).abs();
+            let perp = (rel.y * (-u.x) + rel.x * u.y).abs();
             let clear = (perp / 3.0).min(1.0); // within 3m blocks the lane
             if clear < min_clear {
                 min_clear = clear;
@@ -867,8 +867,8 @@ impl World {
     pub fn observe(&self, team: Team, idx: usize) -> [f32; OBS_DIM] {
         let sx = team.sx();
         let me = players(team, self)[idx];
-        let mir = |p: V2| -> V2 { V2::new(if sx > 0.0 { p.x } else { FIELD_L - p.x }, p.y) };
-        let mirv = |v: V2| -> V2 { V2::new(v.x * sx, v.y) };
+        let mir = |p: V2| -> V2 { V2::new(if sx > 0.0 { p.y } else { FIELD_L - p.y }, p.x) };
+        let mirv = |v: V2| -> V2 { V2::new(v.y * sx, v.x) };
         let nx = FIELD_L;
         let ny = FIELD_W;
         let nv = 10.0;
@@ -931,26 +931,26 @@ impl World {
         f.push(team_ball as u8 as f32);
         f.push(opp_ball as u8 as f32);
         f.push(free_ball as u8 as f32);
-        f.push(mp.x / nx * 2.0 - 1.0);
-        f.push(mp.y / ny * 2.0 - 1.0);
-        f.push(mvel.x / nv);
+        f.push(mp.y / nx * 2.0 - 1.0);
+        f.push(mp.x / ny * 2.0 - 1.0);
         f.push(mvel.y / nv);
+        f.push(mvel.x / nv);
         f.push(me.fatigue.clamp(0.0, 1.0));
         f.push(me.anaerobic_load.clamp(0.0, 1.0));
         // 2-pass rule state: how many passes made (0, 0.5, 1.0 = can shoot)
         f.push((self.pass_streak_a.min(2) as f32) / 2.0);
         // ball (5)
-        f.push(ball_rel.x / nx);
-        f.push(ball_rel.y / ny);
+        f.push(ball_rel.y / nx);
+        f.push(ball_rel.x / ny);
         f.push(ball_rel.len() / nx);
-        f.push(bvel.x / nv);
         f.push(bvel.y / nv);
+        f.push(bvel.x / nv);
         // goals (5)
-        f.push((goal.x - mp.x) / nx);
-        f.push((goal.y - mp.y) / ny);
+        f.push((goal.y - mp.y) / nx);
+        f.push((goal.x - mp.x) / ny);
         f.push(goal.sub(mp).len() / nx);
-        f.push((own.x - mp.x) / nx);
-        f.push((own.y - mp.y) / ny);
+        f.push((own.y - mp.y) / nx);
+        f.push((own.x - mp.x) / ny);
         // role + action cues (6)
         f.push(is_closest);
         f.push(ball_rank);
@@ -963,10 +963,10 @@ impl World {
             let p = players(team, self)[k];
             let rp = mir(p.pos).sub(mp);
             let rv = mirv(p.vel);
-            f.push(rp.x / nx);
-            f.push(rp.y / ny);
-            f.push(rv.x / nv);
+            f.push(rp.y / nx);
+            f.push(rp.x / ny);
             f.push(rv.y / nv);
+            f.push(rv.x / nv);
             f.push(rp.len() / nx);
         }
         // ALL opponents, nearest-first (N = 5 × 5 = 25)
@@ -974,10 +974,10 @@ impl World {
             let p = opp[k];
             let rp = mir(p.pos).sub(mp);
             let rv = mirv(p.vel);
-            f.push(rp.x / nx);
-            f.push(rp.y / ny);
-            f.push(rv.x / nv);
+            f.push(rp.y / nx);
+            f.push(rp.x / ny);
             f.push(rv.y / nv);
+            f.push(rv.x / nv);
             f.push(rp.len() / nx);
         }
         f.push(1.0); // bias
@@ -1010,13 +1010,13 @@ impl World {
             // possession — forces build-up play, not solo dribble-and-shoot.
             // OPPONENT-HALF RULE (Team A): may shoot anywhere in the opponent's half.
             if team == Team::A {
-                let x = players(team, self)[idx].pos.x;
+                let x = players(team, self)[idx].pos.y;
                 if self.pass_streak_a < 2 || x < SHOOT_X {
                     m[A_SHOOT] = false;
                 }
             } else {
                 // Symmetric shooting gate for the scripted/noisy opponent.
-                let x = players(team, self)[idx].pos.x;
+                let x = players(team, self)[idx].pos.y;
                 if self.b_pass_streak < 2 || x > FIELD_L - SHOOT_X {
                     m[A_SHOOT] = false;
                 }
@@ -1131,7 +1131,7 @@ impl World {
         self.shot_was_rapid_a = false;
         self.shoot_cooldown_a = self.shoot_cooldown_a.saturating_sub(1);
 
-        let ball_x_before = self.ball.x;
+        let ball_x_before = self.ball.y;
 
         // 1. Desired velocities + kicks. Kicks are resolved after movement so a
         //    player dribbles then releases within the same tick cleanly.
@@ -1212,8 +1212,8 @@ impl World {
                 self.pending_pass = self.intended_receiver;
                 if kicker.team == Team::A {
                     self.pending_passer = kicker.idx as i32;
-                    // A attacks +x, so ball.x IS attack-frame forward progress.
-                    self.pass_kick_x = self.player(kicker).pos.x;
+                    // A attacks +x, so ball.y IS attack-frame forward progress.
+                    self.pass_kick_x = self.player(kicker).pos.y;
                 }
             } else if kicker.team == Team::A {
                 self.reset_a_pass_memory();
@@ -1265,29 +1265,29 @@ impl World {
             let gy0 = FIELD_W / 2.0 - GOAL_HALF;
             let gy1 = FIELD_W / 2.0 + GOAL_HALF;
             let last = self.last_touch;
-            if self.ball.y < 0.0 || self.ball.y > FIELD_W {
+            if self.ball.x < 0.0 || self.ball.x > FIELD_W {
                 // touchline: award to the other team at the crossing point.
-                let edge_y = if self.ball.y < 0.0 { 0.0 } else { FIELD_W };
+                let edge_y = if self.ball.x < 0.0 { 0.0 } else { FIELD_W };
                 let to = last.map(Team::other).unwrap_or(Team::A);
-                let at = V2::new(self.ball.x.clamp(1.0, FIELD_L - 1.0), edge_y);
+                let at = V2::new(self.ball.y.clamp(1.0, FIELD_L - 1.0), edge_y);
                 self.throw_in(to, at);
-            } else if self.ball.x >= FIELD_L {
-                if self.ball.y > gy0 && self.ball.y < gy1 && self.a_shot_flag {
+            } else if self.ball.y >= FIELD_L {
+                if self.ball.x > gy0 && self.ball.x < gy1 && self.a_shot_flag {
                     self.goals_a += 1;
                     self.ev_goal_a = true;
                     self.kickoff(Team::B);
                 } else if last == Some(Team::B) {
-                    self.corner_kick(Team::A, FIELD_L, self.ball.y); // defender B conceded a corner
+                    self.corner_kick(Team::A, FIELD_L, self.ball.x); // defender B conceded a corner
                 } else {
                     self.goal_kick(Team::B); // A put it out -> B goal-kick
                 }
-            } else if self.ball.x <= 0.0 {
-                if self.ball.y > gy0 && self.ball.y < gy1 && self.b_shot_flag {
+            } else if self.ball.y <= 0.0 {
+                if self.ball.x > gy0 && self.ball.x < gy1 && self.b_shot_flag {
                     self.goals_b += 1;
                     self.ev_goal_b = true;
                     self.kickoff(Team::A);
                 } else if last == Some(Team::A) {
-                    self.corner_kick(Team::B, 0.0, self.ball.y); // defender A conceded a corner
+                    self.corner_kick(Team::B, 0.0, self.ball.x); // defender A conceded a corner
                 } else {
                     self.goal_kick(Team::A);
                 }
@@ -1434,7 +1434,7 @@ impl World {
                 if pp.team == Team::A {
                     if o.team == Team::A {
                         self.ev_pass_completed_a = true; // A pass reached an A player
-                        self.last_pass_gain_a = self.ball.x - self.pass_kick_x;
+                        self.last_pass_gain_a = self.ball.y - self.pass_kick_x;
                         self.pass_streak_a += 1; // toward the 2-pass rule
                                                  // consecutive FORWARD passes (progressive build-up)
                         if self.last_pass_gain_a > 3.0 {
@@ -1562,14 +1562,14 @@ impl World {
                 } else {
                     // symmetric: B's goal only counts if B built up (2 passes) and
                     // shoots from B's own final third (B attacks -x -> small x).
-                    self.b_shot_flag = self.b_pass_streak >= 2 && me.x < FIELD_L - SHOOT_X;
+                    self.b_shot_flag = self.b_pass_streak >= 2 && me.y < FIELD_L - SHOOT_X;
                     self.b_pass_streak = 0;
                 }
                 self.set_vel(team, idx, V2::default());
                 // MPC-lite finishing: enumerate aim points across the mouth and
                 // pick the one that maximizes clearance from the keeper and any
                 // defender in the shot lane — i.e. shoot to the open corner.
-                let goal_x = goal.x;
+                let goal_x = goal.y;
                 let cy = FIELD_W / 2.0;
                 let gk = players(team.other(), self)[GK].pos;
                 let margin = GOAL_HALF - 0.35;
@@ -1601,7 +1601,7 @@ impl World {
                     // wide pot-shot is near-zero. Distance dominates (squared decay),
                     // shot ANGLE (central vs wide) modulates.
                     let d = goal.sub(me).len();
-                    let lateral = (me.y - FIELD_W / 2.0).abs();
+                    let lateral = (me.x - FIELD_W / 2.0).abs();
                     let dist_f = (1.0 - d / 26.0).clamp(0.0, 1.0);
                     let angle_f = (1.0 - lateral / (FIELD_W / 2.0)).clamp(0.0, 1.0);
                     self.last_shot_xg_a = dist_f * dist_f * (0.4 + 0.6 * angle_f);
@@ -1639,7 +1639,7 @@ impl World {
                     if team == Team::A {
                         self.ev_pass_attempt_a = true;
                         // classify by forward progress toward the attacked goal
-                        let fwd = (tp.x - me.x) * sx;
+                        let fwd = (tp.y - me.y) * sx;
                         self.pass_dir_a = if fwd > 2.0 {
                             1
                         } else if fwd < -2.0 {
@@ -1653,7 +1653,7 @@ impl World {
                         let is_return = idx as i32 == self.lp_to && ti as i32 == self.lp_from;
                         if is_return {
                             if self.return_streak_a == 0 {
-                                self.return_start_x = self.ball.x; // sequence begins here
+                                self.return_start_x = self.ball.y; // sequence begins here
                             }
                             self.return_streak_a += 1;
                         } else {
@@ -1726,7 +1726,7 @@ impl World {
                 self.set_vel(team, GK, V2::default());
                 if team == Team::A {
                     self.ev_pass_attempt_a = true;
-                    let fwd = (tp.x - me.x) * sx;
+                    let fwd = (tp.y - me.y) * sx;
                     self.pass_dir_a = if fwd > 2.0 {
                         1
                     } else if fwd < -2.0 {
@@ -1750,12 +1750,12 @@ impl World {
         let to_ball = self.ball.sub(c);
         let out = (to_ball.len() * 0.35).min(6.0);
         let mut target = c.add(to_ball.unit().scale(out));
-        target.x = if sx > 0.0 {
-            target.x.clamp(0.5, 8.0)
+        target.y = if sx > 0.0 {
+            target.y.clamp(0.5, 8.0)
         } else {
-            target.x.clamp(FIELD_L - 8.0, FIELD_L - 0.5)
+            target.y.clamp(FIELD_L - 8.0, FIELD_L - 0.5)
         };
-        target.y = target.y.clamp(
+        target.x = target.x.clamp(
             FIELD_W / 2.0 - GOAL_HALF - 1.5,
             FIELD_W / 2.0 + GOAL_HALF + 1.5,
         );
@@ -1764,7 +1764,7 @@ impl World {
         // FIELD-VECTOR function: sprint when the ball threatens our goal or it must
         // reposition fast, jog at midfield, walk when play is upfield.
         let own_goal_x = if sx > 0.0 { 0.0 } else { FIELD_L };
-        let ball_threat = 1.0 - ((self.ball.x - own_goal_x).abs() / FIELD_L).clamp(0.0, 1.0);
+        let ball_threat = 1.0 - ((self.ball.y - own_goal_x).abs() / FIELD_L).clamp(0.0, 1.0);
         let travel = (dir.len() / 9.0).clamp(0.0, 1.0);
         let urgency = (0.6 * ball_threat + 0.4 * travel).clamp(0.0, 1.0);
         let gear = if urgency > 0.80 {
@@ -1876,10 +1876,10 @@ impl World {
             let current_delta = me.pos.sub(mate.pos);
             let current_gap = current_delta.len();
             let relative_velocity = proposed.sub(mate.vel);
-            let relative_speed_sq = relative_velocity.x * relative_velocity.x
-                + relative_velocity.y * relative_velocity.y;
+            let relative_speed_sq = relative_velocity.y * relative_velocity.y
+                + relative_velocity.x * relative_velocity.x;
             let closest_t = if relative_speed_sq > 1e-6 {
-                (-(current_delta.x * relative_velocity.x + current_delta.y * relative_velocity.y)
+                (-(current_delta.y * relative_velocity.y + current_delta.x * relative_velocity.x)
                     / relative_speed_sq)
                     .clamp(0.0, horizon)
             } else {
@@ -1926,11 +1926,11 @@ impl World {
         let (oi, _) = self.nearest_opponent(team, me);
         let opp = players(team.other(), self)[oi].pos;
         let opp_goal_side = opp.add(own_goal.sub(opp).unit().scale(3.0));
-        let urgency = ((self.ball.x - me.x) * team.sx()).max(0.0) / FIELD_L;
+        let urgency = ((self.ball.y - me.y) * team.sx()).max(0.0) / FIELD_L;
         let blend = urgency.clamp(0.25, 0.75);
         V2::new(
-            (ball_goal_side.x * blend + opp_goal_side.x * (1.0 - blend)).clamp(2.0, FIELD_L - 2.0),
-            (ball_goal_side.y * blend + opp_goal_side.y * (1.0 - blend)).clamp(2.0, FIELD_W - 2.0),
+            (ball_goal_side.y * blend + opp_goal_side.y * (1.0 - blend)).clamp(2.0, FIELD_L - 2.0),
+            (ball_goal_side.x * blend + opp_goal_side.x * (1.0 - blend)).clamp(2.0, FIELD_W - 2.0),
         )
     }
 
@@ -1950,8 +1950,8 @@ impl World {
             for k in 0..ndir {
                 let ang = (k as f32) / (ndir as f32) * std::f32::consts::TAU;
                 let cand = V2::new(
-                    (me.x + ang.cos() * r).clamp(3.0, FIELD_L - 3.0),
-                    (me.y + ang.sin() * r).clamp(3.0, FIELD_W - 3.0),
+                    (me.y + ang.cos() * r).clamp(3.0, FIELD_L - 3.0),
+                    (me.x + ang.sin() * r).clamp(3.0, FIELD_W - 3.0),
                 );
                 // openness = distance to nearest OTHER player (either team)
                 let mut min_d = f32::INFINITY;
@@ -1970,9 +1970,9 @@ impl World {
                         }
                     }
                 }
-                let fwd = (cand.x - me.x) * sx; // upfield progress in attack frame
+                let fwd = (cand.y - me.y) * sx; // upfield progress in attack frame
                                                 // stay loosely connected to the ball's vertical lane
-                let lane = -(cand.y - self.ball.y).abs() * 0.08;
+                let lane = -(cand.x - self.ball.x).abs() * 0.08;
                 let score =
                     min_d + teammate_spacing_score(teammate_gap) * 6.0 + field_bias * fwd + lane;
                 if score > best_score {
@@ -1989,8 +1989,8 @@ impl World {
         let sx = team.sx();
         let lane = self.lane_clearness(team, self.ball, cand);
         let route = self.lane_clearness(team, me, cand);
-        let wide = (cand.y - FIELD_W / 2.0).abs() / (FIELD_W / 2.0);
-        let ahead = ((cand.x - self.ball.x) * sx).max(0.0) / FIELD_L;
+        let wide = (cand.x - FIELD_W / 2.0).abs() / (FIELD_W / 2.0);
+        let ahead = ((cand.y - self.ball.y) * sx).max(0.0) / FIELD_L;
         let (_, defender_d) = self.nearest_opponent(team, cand);
         let defender_space = (defender_d / 7.0).min(1.0);
         let mut teammate_gap = f32::INFINITY;
@@ -2040,8 +2040,8 @@ impl World {
             for k in 0..ndir {
                 let ang = (k as f32) / (ndir as f32) * std::f32::consts::TAU;
                 let cand = V2::new(
-                    (me.x + ang.cos() * r).clamp(3.0, FIELD_L - 3.0),
-                    (me.y + ang.sin() * r).clamp(3.0, FIELD_W - 3.0),
+                    (me.y + ang.cos() * r).clamp(3.0, FIELD_L - 3.0),
+                    (me.x + ang.sin() * r).clamp(3.0, FIELD_W - 3.0),
                 );
                 let score = self.mpc_field_vector_score(team, idx, cand);
                 if score > best_score {
@@ -2087,7 +2087,7 @@ impl World {
                     team[j].pos = team[j].pos.add(dir.scale(-push));
                     let vi = team[i].vel;
                     let vj = team[j].vel;
-                    let closing = vi.sub(vj).x * dir.x + vi.sub(vj).y * dir.y;
+                    let closing = vi.sub(vj).y * dir.y + vi.sub(vj).x * dir.x;
                     if closing < 0.0 {
                         let correction = dir.scale(closing * 0.5);
                         team[i].vel = team[i].vel.sub(correction);
@@ -2159,13 +2159,13 @@ fn integrate(p: &mut Player) {
 }
 
 fn clamp_pos(p: &mut Player) {
-    p.pos.x = p.pos.x.clamp(-1.0, FIELD_L + 1.0);
-    p.pos.y = p.pos.y.clamp(0.0, FIELD_W);
+    p.pos.y = p.pos.y.clamp(-1.0, FIELD_L + 1.0);
+    p.pos.x = p.pos.x.clamp(0.0, FIELD_W);
 }
 
 fn rotate(v: V2, ang: f32) -> V2 {
     let (s, c) = ang.sin_cos();
-    V2::new(v.x * c - v.y * s, v.x * s + v.y * c)
+    V2::new(v.y * c - v.x * s, v.y * s + v.x * c)
 }
 
 /// The gear the scripted baseline uses for a given action (kept near the old
@@ -2281,18 +2281,18 @@ impl World {
         for team in [Team::A, Team::B] {
             let ps = players(team, self);
             for i in 0..N {
-                f.push(ps[i].pos.x / nx * 2.0 - 1.0);
-                f.push(ps[i].pos.y / ny * 2.0 - 1.0);
-                f.push(ps[i].vel.x / nv);
+                f.push(ps[i].pos.y / nx * 2.0 - 1.0);
+                f.push(ps[i].pos.x / ny * 2.0 - 1.0);
                 f.push(ps[i].vel.y / nv);
+                f.push(ps[i].vel.x / nv);
                 f.push(ps[i].fatigue.clamp(0.0, 1.0));
                 f.push(ps[i].anaerobic_load.clamp(0.0, 1.0));
             }
         }
-        f.push(self.ball.x / nx * 2.0 - 1.0);
-        f.push(self.ball.y / ny * 2.0 - 1.0);
-        f.push(self.ball_vel.x / nv);
+        f.push(self.ball.y / nx * 2.0 - 1.0);
+        f.push(self.ball.x / ny * 2.0 - 1.0);
         f.push(self.ball_vel.y / nv);
+        f.push(self.ball_vel.x / nv);
         // possession one-hot: A / B / free
         f.push(matches!(self.owner, Some(o) if matches!(o.team, Team::A)) as u8 as f32);
         f.push(matches!(self.owner, Some(o) if matches!(o.team, Team::B)) as u8 as f32);
@@ -2352,8 +2352,8 @@ impl World {
     /// policy-invariant potential-based reward shaping (γΦ' − Φ).
     pub fn potential_a(&self) -> f32 {
         match self.owner {
-            Some(o) if o.team == Team::A => self.ball.x / FIELD_L,
-            Some(_) => -((FIELD_L - self.ball.x) / FIELD_L),
+            Some(o) if o.team == Team::A => self.ball.y / FIELD_L,
+            Some(_) => -((FIELD_L - self.ball.y) / FIELD_L),
             None => 0.0,
         }
     }
@@ -2365,8 +2365,8 @@ impl World {
         let clear = self.shot_clearness(team, me);
         let (_, opp_d) = self.nearest_opponent(team, me);
         let shot_legal = match team {
-            Team::A => self.pass_streak_a >= 2 && me.x >= SHOOT_X,
-            Team::B => self.b_pass_streak >= 2 && me.x <= FIELD_L - SHOOT_X,
+            Team::A => self.pass_streak_a >= 2 && me.y >= SHOOT_X,
+            Team::B => self.b_pass_streak >= 2 && me.y <= FIELD_L - SHOOT_X,
         };
 
         // close in with a reasonably open lane -> shoot (else work it closer)
@@ -2380,19 +2380,19 @@ impl World {
             for (rank, cand) in cands.iter().enumerate() {
                 if let Some((ti, _)) = cand {
                     let tp = players(team, self)[*ti].pos;
-                    if (tp.x - me.x) * sx > -3.0 {
+                    if (tp.y - me.y) * sx > -3.0 {
                         return A_PASS_A + rank;
                     }
                 }
             }
             // no outlet & deep in own half -> clear, else try to carry out
-            if (me.x - team.own_goal().x).abs() < FIELD_L * 0.33 {
+            if (me.y - team.own_goal().y).abs() < FIELD_L * 0.33 {
                 return A_CLEAR;
             }
             // dribble away from the nearest opponent laterally
             let (oi, _) = self.nearest_opponent(team, me);
             let opp = players(team.other(), self)[oi].pos;
-            return if opp.y > me.y {
+            return if opp.x > me.x {
                 A_DRIB_LEFT
             } else {
                 A_DRIB_RIGHT
@@ -2404,7 +2404,7 @@ impl World {
         for (rank, cand) in cands.iter().enumerate() {
             if let Some((ti, _)) = cand {
                 let tp = players(team, self)[*ti].pos;
-                if (tp.x - me.x) * sx > 5.0 && self.lane_clearness(team, me, tp) > 0.45 {
+                if (tp.y - me.y) * sx > 5.0 && self.lane_clearness(team, me, tp) > 0.45 {
                     return A_PASS_A + rank;
                 }
             }
@@ -2412,9 +2412,9 @@ impl World {
         // unpressured: is an opponent directly ahead in my forward cone?
         let (oi, od) = self.nearest_opponent(team, me);
         let opp = players(team.other(), self)[oi].pos;
-        let ahead = (opp.x - me.x) * sx;
-        if od < 8.0 && ahead > 0.0 && (opp.y - me.y).abs() < 4.0 {
-            return if opp.y > me.y {
+        let ahead = (opp.y - me.y) * sx;
+        if od < 8.0 && ahead > 0.0 && (opp.x - me.x).abs() < 4.0 {
+            return if opp.x > me.x {
                 A_DRIB_LEFT
             } else {
                 A_DRIB_RIGHT
@@ -2463,7 +2463,7 @@ mod tests {
         // Corner: attacker restarts from the goal-line corner on the ball's side.
         w.corner_kick(Team::A, FIELD_L, 2.0);
         assert!(matches!(w.owner, Some(o) if o.team == Team::A));
-        assert!((w.ball.x - FIELD_L).abs() < 1e-6 && w.ball.y < FIELD_W / 2.0);
+        assert!((w.ball.y - FIELD_L).abs() < 1e-6 && w.ball.x < FIELD_W / 2.0);
         // Goal-kick funnels through the same restart and clears shot flags.
         w.a_shot_flag = true;
         w.goal_kick(Team::B);
@@ -2587,7 +2587,7 @@ mod tests {
 
         let adjusted = w.mpc_teammate_separated_velocity(Team::A, 1, proposed);
 
-        assert!(adjusted.x < 0.0, "close teammate must reverse convergence");
+        assert!(adjusted.y < 0.0, "close teammate must reverse convergence");
         assert!((adjusted.len() - proposed.len()).abs() < 1e-5);
     }
 
@@ -2602,8 +2602,8 @@ mod tests {
 
         let adjusted = w.mpc_teammate_separated_velocity(Team::A, 1, proposed);
 
-        assert!((adjusted.x - proposed.x).abs() < 1e-6);
         assert!((adjusted.y - proposed.y).abs() < 1e-6);
+        assert!((adjusted.x - proposed.x).abs() < 1e-6);
     }
 
     #[test]
@@ -2848,7 +2848,7 @@ mod tests {
         w.b[1].pos = V2::new(21.0, 14.0); // 1 unit ahead of the carrier
         let dir = w.shielded_dribble_dir(Team::A, me, V2::new(1.0, 0.0));
         assert!(
-            dir.x < 0.0,
+            dir.y < 0.0,
             "should steer away from the defender, got {:?}",
             dir
         );
@@ -2878,13 +2878,13 @@ mod tests {
         w.ball_vel = V2::new(18.0, 0.0);
         let p = w.intercept_point(V2::new(25.0, 14.0));
         assert!(
-            p.x >= w.ball.x,
+            p.y >= w.ball.y,
             "intercept should lead the ball, got {:?}",
             p
         );
         // a stationary ball just returns the ball itself
         w.ball_vel = V2::default();
-        assert_eq!(w.intercept_point(V2::new(25.0, 14.0)).x, w.ball.x);
+        assert_eq!(w.intercept_point(V2::new(25.0, 14.0)).y, w.ball.y);
     }
 
     #[test]
@@ -2971,11 +2971,11 @@ mod tests {
         let target = w.goalside_recovery_target(Team::A, 2);
 
         assert!(
-            target.x < w.a[2].pos.x,
+            target.y < w.a[2].pos.y,
             "wrong-side defender should recover toward own goal: target={target:?}"
         );
         assert!(
-            target.x < w.ball.x,
+            target.y < w.ball.y,
             "target should get goalside of the ball: target={target:?}, ball={:?}",
             w.ball
         );
