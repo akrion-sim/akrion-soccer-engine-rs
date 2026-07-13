@@ -589,16 +589,18 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
         phi_prev = phi;
         let mut r = rw().shape * shaping;
         if w.ev_goal_a {
-            r += rw().goal; // GOALS are the prize
+            r += REW_GOAL_POINTS; // GOALS are the prize (anchor: 500)
         }
         if w.ev_goal_b {
-            r -= rw().concede;
+            r -= REW_GOAL_POINTS; // conceding mirrors the goal anchor
         }
         if step + 1 == STEPS {
+            // Match outcome anchor: win +1000 / loss −1000 / draw 0 — the top
+            // of the currency, symmetric, terminal.
             if w.goals_a > w.goals_b {
-                r += rw().match_win;
+                r += REW_WIN_POINTS;
             } else if w.goals_a < w.goals_b {
-                r -= rw().match_loss;
+                r -= REW_WIN_POINTS;
             }
         }
         // MARL SYNCHRONIZATION: reward the TEAM for collectively moving into a
