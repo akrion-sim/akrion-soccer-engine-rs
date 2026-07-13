@@ -883,8 +883,8 @@ impl World {
         let (_, opp_d) = self.nearest_opponent(team, tp);
         let openness = (opp_d / TEAMMATE_GOOD_SPACE).clamp(0.0, 1.0);
         let moving_upfield = (tv.x * sx).max(0.0);
-        let upfield_lead = forward_pass_weight
-            * (1.0 + openness * 1.6 + moving_upfield * 0.12).clamp(0.0, 3.0);
+        let upfield_lead = if std::env::var("LEAD_OFF").is_ok() { return V2::new((tp.x + sx*2.0).clamp(0.8, FIELD_L-0.8), tp.y.clamp(0.8, FIELD_W-0.8)); } else { forward_pass_weight
+            * (1.0 + openness * 1.6 + moving_upfield * 0.12).clamp(0.0, 3.0) };
         let led = velocity_led.add(V2::new(sx * upfield_lead, 0.0));
         V2::new(led.x.clamp(0.8, FIELD_L - 0.8), led.y.clamp(0.8, FIELD_W - 0.8))
     }
@@ -2933,6 +2933,50 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MEASUREMENT probe: keeper save probability vs shot distance under the
+    /// NEW 3-term drag arrival speed vs the LEGACY 0.965-friction arrival
+    /// speed — how much did the scoring band contract for a set keeper?
+    #[test]
+    #[ignore]
+    fn shot_save_band_probe() {
+        let w = World::new(); // keepers at kickoff spots (B GK near its line, centered)
+        let cy = FIELD_W / 2.0;
+        println!("keeper B at ({:.1},{:.1})", w.b[GK].pos.x, w.b[GK].pos.y);
+        for d in [8.0f32, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0] {
+            let from = V2::new(FIELD_L - d, cy);
+            let crossing = V2::new(FIELD_L, cy - (GOAL_HALF - 0.35)); // corner aim
+            // arrival speed at the save plane under both decay models
+            let plane_dist = (d - 1.6).max(0.0);
+            let mut v_new = SHOT_SPEED;
+            let mut x = 0.0;
+            while x < plane_dist && v_new > 0.0 {
+                x += v_new * DT;
+                v_new = ball_resistance_after(v_new, 0.0);
+            }
+            let mut v_old = SHOT_SPEED;
+            let mut xo = 0.0;
+            while xo < plane_dist && v_old > 0.0 {
+                xo += v_old * DT;
+                v_old *= BALL_FRICTION;
+            }
+            let p_new = w.keeper_save_probability(Team::B, from, crossing, v_new);
+            let p_old = w.keeper_save_probability(Team::B, from, crossing, v_old);
+            println!(
+                "d={d:>4.1}: v_arr new={v_new:5.2} old={v_old:5.2} | save_p new={p_new:.3} old={p_old:.3} (bar {GK_SAVE_DECISION_BAR}) {}{}",
+                if p_new >= GK_SAVE_DECISION_BAR {
+                    "SAVED-new"
+                } else {
+                    "goal-new"
+                },
+                if p_old >= GK_SAVE_DECISION_BAR {
+                    " SAVED-old"
+                } else {
+                    " goal-old"
+                },
+            );
+        }
+    }
 
     /// MEASUREMENT probe (run explicitly with --ignored --nocapture): per-tick
     /// arrival calibration of the two pass solves against the live drag —
