@@ -20277,7 +20277,7 @@ impl SoccerMatch {
         {
             let _ = writeln!(file, "{}", line);
         }
-        }
+    }
 
     /// The action label the ACTUAL blend-off tabular path would commit for `player_id` — the
     /// net-influence counterfactual. Mirrors the decision assembler's tabular fallback (same
