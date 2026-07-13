@@ -15191,9 +15191,9 @@ fn soccer_correlated_full_game_replay_transitions(
             away_sum / away_count as f64
         };
         home_return = (home_mean + SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK * home_return)
-            .clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP);
+            .clamp(-soccer_full_game_return_clip(), soccer_full_game_return_clip());
         away_return = (away_mean + SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK * away_return)
-            .clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP);
+            .clamp(-soccer_full_game_return_clip(), soccer_full_game_return_clip());
 
         for idx in indices {
             let mut transition = transitions[*idx].clone();
@@ -15211,7 +15211,7 @@ fn soccer_correlated_full_game_replay_transitions(
                 None => blended,
             };
             transition.reward =
-                with_outcome.clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP);
+                with_outcome.clamp(-soccer_full_game_return_clip(), soccer_full_game_return_clip());
             transition.done = true;
             replay.push(transition);
         }
@@ -15247,7 +15247,7 @@ fn soccer_dp_value_iteration(
                 value.insert(
                     b,
                     (sum / count as f64)
-                        .clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP),
+                        .clamp(-soccer_full_game_return_clip(), soccer_full_game_return_clip()),
                 );
             }
         }
@@ -15281,7 +15281,7 @@ fn soccer_dp_nstep_return(
             }
         }
     }
-    ret.clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP)
+    ret.clamp(-soccer_full_game_return_clip(), soccer_full_game_return_clip())
 }
 
 /// Compact, team-relative abstraction of the symbolic MDP state for the DP value table. From the
@@ -15418,7 +15418,7 @@ fn soccer_dp_bootstrapped_replay_transitions(
             None => blended,
         };
         transition.reward =
-            with_outcome.clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP);
+            with_outcome.clamp(-soccer_full_game_return_clip(), soccer_full_game_return_clip());
         transition.done = true;
         replay.push(transition);
     }
@@ -15518,7 +15518,7 @@ fn soccer_outcome_credit_replay_transitions(
         let milestone_reward = soccer_outcome_credit_milestone_reward(&transition);
         let pitch_shaping = soccer_outcome_credit_pitch_value_shaping(&transition);
         transition.reward = finite_metric(outcome_reward + milestone_reward + pitch_shaping)
-            .clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP);
+            .clamp(-soccer_full_game_return_clip(), soccer_full_game_return_clip());
         transition.done = true;
         replay.push(transition);
     }
