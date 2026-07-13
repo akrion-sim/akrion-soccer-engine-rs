@@ -883,8 +883,15 @@ impl World {
         let (_, opp_d) = self.nearest_opponent(team, tp);
         let openness = (opp_d / TEAMMATE_GOOD_SPACE).clamp(0.0, 1.0);
         let moving_upfield = (tv.x * sx).max(0.0);
-        let upfield_lead = if std::env::var("LEAD_OFF").is_ok() { return V2::new((tp.x + sx*2.0).clamp(0.8, FIELD_L-0.8), tp.y.clamp(0.8, FIELD_W-0.8)); } else { forward_pass_weight
-            * (1.0 + openness * 1.6 + moving_upfield * 0.12).clamp(0.0, 3.0) };
+        // The into-space lead is EARNED by the receiver's own upfield motion: a
+        // runner gets the ball ahead to attack (up to the 3-yd cap), while a
+        // STATIONARY receiver gets only a small static nudge that stays well
+        // inside the receive radius. Unlike the scripted baseline, a LEARNING
+        // receiver cannot be assumed to chase the ball down — and a ball led to
+        // the radius edge plus the execution dither is a coin-flip miss (that
+        // exact coupling starved the RL smoke of completed forward passes).
+        let upfield_lead = forward_pass_weight
+            * (0.6 + openness * 0.5 + moving_upfield * (0.45 + 0.55 * openness)).clamp(0.0, 3.0);
         let led = velocity_led.add(V2::new(sx * upfield_lead, 0.0));
         V2::new(led.x.clamp(0.8, FIELD_L - 0.8), led.y.clamp(0.8, FIELD_W - 0.8))
     }
