@@ -8548,6 +8548,17 @@ pub struct SoccerDecisionContext {
     /// features), so recording it here changes neither of those.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub behavior_policy_probability: Option<f64>,
+    /// Probability assigned to the executed action by the actor head that will
+    /// be optimized by PPO/MAPPO, captured before any actor update. This is
+    /// intentionally distinct from `behavior_policy_probability`, which can
+    /// describe the surrounding tabular/planner rank mixture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_policy_probability: Option<f64>,
+    /// Legal actor vocabulary at decision time. PPO normalizes both old/current
+    /// policy probabilities over this same set instead of spending probability
+    /// mass and gradient on actions the engine could not execute.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub legal_policy_action_mask: Vec<bool>,
     /// Whether neural MCTS/lookahead selected this action. Kept out of the feature
     /// schema for now and used as a validation/diagnostic metric.
     #[serde(default)]
@@ -8712,6 +8723,11 @@ pub struct AgentDecisionTrace {
     /// the rank mix becomes the behaviour policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub behavior_policy_probability: Option<f64>,
+    /// Old chosen-action probability under the actor head being optimized.
+    /// PPO/MAPPO ratios use this value; the hybrid behavior probability remains
+    /// available separately for trajectory/off-policy diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_policy_probability: Option<f64>,
     /// True when the learned-policy action came from the neural MCTS/lookahead reranker.
     /// This is a trace/metric bit only; the neural feature vector stays unchanged.
     #[serde(default)]
@@ -26922,6 +26938,8 @@ fn soccer_decision_context_for(
         legal_action_option_count: 0,
         chosen_action_probability: 0.0,
         behavior_policy_probability: None,
+        actor_policy_probability: None,
+        legal_policy_action_mask: Vec::new(),
         neural_mcts_selected: false,
         neural_mcts_candidate_count: 0,
         neural_mcts_discretized_kick_candidate_count: 0,
@@ -27005,6 +27023,19 @@ fn soccer_decision_context_with_trace(
     // probability instead of recomputing the actor head's own softmax — `None`
     // (the default) leaves on-policy learning exactly as it was.
     context.behavior_policy_probability = decision.behavior_policy_probability;
+    context.actor_policy_probability = decision.actor_policy_probability;
+    let mut legal_policy_action_mask = vec![false; SOCCER_POLICY_ACTIONS.len()];
+    for option in decision.action_options.iter().filter(|option| option.legal) {
+        if let Some(index) = soccer_policy_action_index(&option.label) {
+            legal_policy_action_mask[index] = true;
+        }
+    }
+    if let Some(index) = soccer_policy_action_index(&decision.action) {
+        legal_policy_action_mask[index] = true;
+    }
+    if legal_policy_action_mask.iter().any(|legal| *legal) {
+        context.legal_policy_action_mask = legal_policy_action_mask;
+    }
     context.neural_mcts_selected = decision.neural_mcts_selected;
     context.neural_mcts_candidate_count = decision.neural_mcts_candidate_count;
     context.neural_mcts_discretized_kick_candidate_count =
@@ -43001,6 +43032,7 @@ struct SoccerPolicySample {
     action_index: usize,
     advantage: f64,
     old_action_probability: Option<f64>,
+    legal_action_mask: Vec<bool>,
     sample_weight: f64,
     mcts_distillation: bool,
     /// In-memory only (not serialized): the sampled action was a FORWARD pass into a good forward
@@ -43029,6 +43061,21 @@ struct SoccerPolicyTrainingBatch {
 }
 
 impl SoccerPolicySample {
+    fn effective_legal_action_mask(&self) -> &[bool] {
+        if self.legal_action_mask.len() == SOCCER_POLICY_ACTIONS.len()
+            && self
+                .legal_action_mask
+                .get(self.action_index)
+                .copied()
+                .unwrap_or(false)
+            && self.legal_action_mask.iter().any(|legal| *legal)
+        {
+            &self.legal_action_mask
+        } else {
+            &SOCCER_POLICY_ALL_ACTIONS_LEGAL
+        }
+    }
+
     fn sanitized_weight(&self) -> f64 {
         if self.sample_weight.is_finite() {
             self.sample_weight
@@ -43212,6 +43259,31 @@ struct SoccerPolicyRoleHead {
     last_loss: Option<f64>,
 }
 
+/// Coefficient multiplying `grad(log pi(a|s))` for PPO's clipped surrogate.
+///
+/// The clipped branch is constant with respect to the current policy, so its
+/// gradient must be exactly zero once a beneficial update crosses the trust
+/// region. Passing `advantage * clipped_ratio` to a plain REINFORCE update is
+/// not equivalent: it continues moving the policy beyond the clip boundary.
+fn soccer_mappo_clipped_policy_gradient_coefficient(
+    advantage: f64,
+    ratio: f64,
+    clip_epsilon: f64,
+) -> f64 {
+    let epsilon = clip_epsilon.clamp(0.01, 1.0);
+    let ratio = ratio.clamp(0.0, 10.0);
+    let clipped_branch_is_active = if advantage >= 0.0 {
+        ratio > 1.0 + epsilon
+    } else {
+        ratio < 1.0 - epsilon
+    };
+    if clipped_branch_is_active {
+        0.0
+    } else {
+        advantage * ratio
+    }
+}
+
 impl SoccerPolicyRoleHead {
     fn new(role_group: SoccerPolicyRoleGroup, seed: u32) -> Self {
         let role_seed = seed ^ role_group.seed_salt();
@@ -43249,6 +43321,14 @@ impl SoccerPolicyRoleHead {
         &self,
         state_features: &[f64; SOCCER_POLICY_FEATURE_DIM],
     ) -> Option<Vec<f64>> {
+        self.action_distribution_with_mask(state_features, None)
+    }
+
+    fn action_distribution_with_mask(
+        &self,
+        state_features: &[f64; SOCCER_POLICY_FEATURE_DIM],
+        legal_action_mask: Option<&[bool]>,
+    ) -> Option<Vec<f64>> {
         if self.network.input_dim != SOCCER_POLICY_FEATURE_DIM
             || self.network.output_dim != SOCCER_POLICY_ACTIONS.len()
         {
@@ -43257,8 +43337,18 @@ impl SoccerPolicyRoleHead {
         if state_features.iter().any(|value| !value.is_finite()) {
             return None;
         }
+        if legal_action_mask.is_some_and(|mask| {
+            mask.len() != SOCCER_POLICY_ACTIONS.len() || !mask.iter().any(|legal| *legal)
+        }) {
+            return None;
+        }
         let role = self.role_group.as_player_role();
-        let mut probs = self.network.action_probabilities(&state_features[..]);
+        let mut probs = match legal_action_mask {
+            Some(mask) => self
+                .network
+                .action_probabilities_masked(&state_features[..], mask),
+            None => self.network.action_probabilities(&state_features[..]),
+        };
         if probs.iter().any(|p| !p.is_finite()) {
             return None;
         }
@@ -43275,7 +43365,33 @@ impl SoccerPolicyRoleHead {
             {
                 return None;
             }
-            let local = specialist.network.action_probabilities(&state_features[..]);
+            let local_mask = legal_action_mask.map(|mask| {
+                specialist
+                    .kind
+                    .actions()
+                    .iter()
+                    .map(|action| {
+                        SOCCER_POLICY_ACTIONS
+                            .iter()
+                            .position(|candidate| candidate == action)
+                            .and_then(|index| mask.get(index))
+                            .copied()
+                            .unwrap_or(false)
+                    })
+                    .collect::<Vec<_>>()
+            });
+            if local_mask
+                .as_ref()
+                .is_some_and(|mask| !mask.iter().any(|legal| *legal))
+            {
+                continue;
+            }
+            let local = match local_mask.as_deref() {
+                Some(mask) => specialist
+                    .network
+                    .action_probabilities_masked(&state_features[..], mask),
+                None => specialist.network.action_probabilities(&state_features[..]),
+            };
             if local.iter().any(|p| !p.is_finite()) {
                 return None;
             }
@@ -43308,20 +43424,20 @@ impl SoccerPolicyRoleHead {
         if !old_prob.is_finite() || old_prob <= 1e-9 {
             return None;
         }
-        let current_probs = self.action_distribution(&sample.state_features)?;
+        let current_probs = self.action_distribution_with_mask(
+            &sample.state_features,
+            Some(sample.effective_legal_action_mask()),
+        )?;
         let current_prob = current_probs.get(sample.action_index).copied()?;
         if !current_prob.is_finite() || current_prob <= 0.0 {
             return None;
         }
-        let epsilon = clip_epsilon.clamp(0.01, 1.0);
         let ratio = (current_prob / old_prob).clamp(0.0, 10.0);
-        let clipped = ratio.clamp(1.0 - epsilon, 1.0 + epsilon);
-        let ppo_ratio = if sample.advantage >= 0.0 {
-            ratio.min(clipped)
-        } else {
-            ratio.max(clipped)
-        };
-        Some(sample.advantage * ppo_ratio)
+        Some(soccer_mappo_clipped_policy_gradient_coefficient(
+            sample.advantage,
+            ratio,
+            clip_epsilon,
+        ))
     }
 
     fn train(
@@ -43350,9 +43466,10 @@ impl SoccerPolicyRoleHead {
         let mut applied = 0usize;
         for (sample, advantage) in &prepared {
             let weighted_advantage = sample.weighted_advantage(*advantage);
-            let result = self.network.train_policy_gradient_sample(
+            let result = self.network.train_policy_gradient_sample_masked(
                 &sample.state_features[..],
                 sample.action_index,
+                sample.effective_legal_action_mask(),
                 weighted_advantage,
                 soccer_policy_entropy_coeff(),
                 policy_learning_rate,
@@ -43379,9 +43496,30 @@ impl SoccerPolicyRoleHead {
                     continue;
                 };
                 let weighted_advantage = sample.weighted_advantage(*advantage);
-                let result = specialist.network.train_policy_gradient_sample(
+                let specialist_mask = specialist
+                    .kind
+                    .actions()
+                    .iter()
+                    .map(|action| {
+                        SOCCER_POLICY_ACTIONS
+                            .iter()
+                            .position(|candidate| candidate == action)
+                            .and_then(|index| sample.effective_legal_action_mask().get(index))
+                            .copied()
+                            .unwrap_or(false)
+                    })
+                    .collect::<Vec<_>>();
+                if !specialist_mask
+                    .get(local_action_index)
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let result = specialist.network.train_policy_gradient_sample_masked(
                     &sample.state_features[..],
                     local_action_index,
+                    &specialist_mask,
                     weighted_advantage,
                     soccer_policy_entropy_coeff(),
                     policy_learning_rate,
@@ -43478,6 +43616,16 @@ impl SoccerPolicyHead {
     ) -> Option<Vec<f64>> {
         self.role_head_for_role(role)?
             .action_distribution(state_features)
+    }
+
+    fn action_distribution_for_role_with_mask(
+        &self,
+        state_features: &[f64; SOCCER_POLICY_FEATURE_DIM],
+        role: PlayerRole,
+        legal_action_mask: &[bool],
+    ) -> Option<Vec<f64>> {
+        self.role_head_for_role(role)?
+            .action_distribution_with_mask(state_features, Some(legal_action_mask))
     }
 
     fn clipped_mappo_advantage(
@@ -43615,6 +43763,56 @@ mod soccer_policy_actor_capacity_tests {
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().expect("test poison soccer policy env lock")
+    }
+
+    #[test]
+    fn mappo_clip_has_zero_gradient_on_saturated_branch() {
+        let epsilon = 0.20;
+
+        assert_eq!(
+            soccer_mappo_clipped_policy_gradient_coefficient(2.0, 1.21, epsilon),
+            0.0,
+            "positive advantage must stop increasing probability above the upper clip"
+        );
+        assert_eq!(
+            soccer_mappo_clipped_policy_gradient_coefficient(-2.0, 0.79, epsilon),
+            0.0,
+            "negative advantage must stop decreasing probability below the lower clip"
+        );
+        assert!(
+            (soccer_mappo_clipped_policy_gradient_coefficient(2.0, 1.10, epsilon) - 2.20).abs()
+                < 1e-12
+        );
+        assert!(
+            (soccer_mappo_clipped_policy_gradient_coefficient(-2.0, 0.90, epsilon) + 1.80).abs()
+                < 1e-12
+        );
+    }
+
+    #[test]
+    fn policy_actor_mask_assigns_zero_probability_to_illegal_actions() {
+        let head = SoccerPolicyHead::new(73);
+        let mut features = [0.0; SOCCER_POLICY_FEATURE_DIM];
+        features[SOCCER_NEURAL_FEATURE_DIM
+            ..SOCCER_NEURAL_FEATURE_DIM + SOCCER_POLICY_ROLE_EMBEDDING_DIM]
+            .copy_from_slice(&soccer_policy_role_embedding(PlayerRole::Midfielder));
+        let pass_index = soccer_policy_action_index("pass").expect("pass index");
+        let dribble_index = soccer_policy_action_index("dribble").expect("dribble index");
+        let mut mask = vec![false; SOCCER_POLICY_ACTIONS.len()];
+        mask[pass_index] = true;
+        mask[dribble_index] = true;
+
+        let probabilities = head
+            .action_distribution_for_role_with_mask(&features, PlayerRole::Midfielder, &mask)
+            .expect("masked actor distribution");
+
+        assert!((probabilities.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+        assert!(probabilities[pass_index] > 0.0);
+        assert!(probabilities[dribble_index] > 0.0);
+        assert!(probabilities
+            .iter()
+            .enumerate()
+            .all(|(index, probability)| mask[index] || *probability == 0.0));
     }
 
     #[test]
@@ -45647,9 +45845,9 @@ fn widen_soccer_policy_snapshot_for_config(
         }
     }
     if snapshot.output_dim < expected_output_dim {
-        output_layer
-            .weights
-            .extend((snapshot.output_dim..expected_output_dim).map(|_| vec![0.0; effective_hidden]));
+        output_layer.weights.extend(
+            (snapshot.output_dim..expected_output_dim).map(|_| vec![0.0; effective_hidden]),
+        );
         output_layer.biases.resize(expected_output_dim, 0.0);
         snapshot.output_dim = expected_output_dim;
     }
@@ -46636,6 +46834,8 @@ const SOCCER_POLICY_ACTIONS: &[&str] = &[
     // go-forward DECISION in the actor's learnable vocabulary instead of relying on reward shaping.
     "forward-release-pass",
 ];
+const SOCCER_POLICY_ALL_ACTIONS_LEGAL: [bool; SOCCER_POLICY_ACTIONS.len()] =
+    [true; SOCCER_POLICY_ACTIONS.len()];
 
 const SOCCER_POLICY_PASS_ACTIONS: &[&str] = &[
     "pass",
@@ -57108,6 +57308,7 @@ pub fn soccer_tracking_dataset_to_learning_dataset(
                 mdp_mpc_comparison: None,
                 learned_mpc_replan: None,
                 behavior_policy_probability: None,
+                actor_policy_probability: None,
                 neural_mcts_selected: false,
                 neural_mcts_candidate_count: 0,
                 neural_mcts_discretized_kick_candidate_count: 0,
@@ -61076,6 +61277,7 @@ fn soccer_moment_replay_transition(
             mdp_mpc_comparison: None,
             learned_mpc_replan: None,
             behavior_policy_probability: None,
+            actor_policy_probability: None,
             neural_mcts_selected: false,
             neural_mcts_candidate_count: 0,
             neural_mcts_discretized_kick_candidate_count: 0,
@@ -72560,28 +72762,16 @@ mod reward_priority_tests {
 
     #[test]
     fn field_vector_makes_carrying_more_valuable_in_own_half_than_final_third() {
-        let own_half = field_vector_carry_zone_multiplier(
-            Team::Home,
-            Vec2::new(40.0, 30.0),
-            120.0,
-            0.8,
-        );
-        let final_third = field_vector_carry_zone_multiplier(
-            Team::Home,
-            Vec2::new(40.0, 100.0),
-            120.0,
-            0.8,
-        );
+        let own_half =
+            field_vector_carry_zone_multiplier(Team::Home, Vec2::new(40.0, 30.0), 120.0, 0.8);
+        let final_third =
+            field_vector_carry_zone_multiplier(Team::Home, Vec2::new(40.0, 100.0), 120.0, 0.8);
         assert!(own_half > final_third);
 
         // The direction-normalized function must give the away team the same
         // semantics when it attacks toward decreasing y.
-        let away_own_half = field_vector_carry_zone_multiplier(
-            Team::Away,
-            Vec2::new(40.0, 90.0),
-            120.0,
-            0.8,
-        );
+        let away_own_half =
+            field_vector_carry_zone_multiplier(Team::Away, Vec2::new(40.0, 90.0), 120.0, 0.8);
         assert!((own_half - away_own_half).abs() < 1e-9);
     }
 

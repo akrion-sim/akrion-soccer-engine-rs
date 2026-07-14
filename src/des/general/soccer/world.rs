@@ -2928,6 +2928,20 @@ fn soccer_behavior_old_action_probability(
         .filter(|probability| *probability > 0.0)
 }
 
+fn soccer_actor_old_action_probability(
+    captured_actor_probability: Option<f64>,
+    current_actor_probability: Option<f64>,
+) -> Option<f64> {
+    captured_actor_probability
+        .map(finite_unit_interval)
+        .filter(|probability| *probability > 0.0)
+        .or_else(|| {
+            current_actor_probability
+                .map(finite_unit_interval)
+                .filter(|probability| *probability > 0.0)
+        })
+}
+
 fn stamp_learned_policy_behavior_probability_on_decision(
     decision: &mut AgentDecisionTrace,
     behavior_probability: f64,
@@ -2957,6 +2971,15 @@ fn stamp_learned_policy_behavior_probability_on_decision(
             legal: true,
         });
     }
+}
+
+fn stamp_learned_actor_policy_probability_on_decision(
+    decision: &mut AgentDecisionTrace,
+    actor_probability: Option<f64>,
+) {
+    decision.actor_policy_probability = actor_probability
+        .map(finite_unit_interval)
+        .filter(|probability| *probability > 0.0);
 }
 
 /// Extra Bellman sweeps over the whole-game replay before neural value training.
@@ -3550,6 +3573,7 @@ mod tests {
                     action_index: 0,
                     advantage: 1.0,
                     old_action_probability: None,
+                    legal_action_mask: Vec::new(),
                     sample_weight: if index >= 8 { 2.0 } else { 1.0 },
                     mcts_distillation: false,
                     forward_select_eligible: false,
@@ -4888,6 +4912,7 @@ mod tests {
             mdp_mpc_comparison: None,
             learned_mpc_replan: None,
             behavior_policy_probability: None,
+            actor_policy_probability: None,
             neural_mcts_selected: false,
             neural_mcts_candidate_count: 0,
             neural_mcts_discretized_kick_candidate_count: 0,
@@ -5243,6 +5268,19 @@ mod tests {
     }
 
     #[test]
+    fn actor_old_action_probability_prefers_captured_actor_over_current_actor() {
+        assert_eq!(
+            soccer_actor_old_action_probability(Some(0.37), Some(0.83)),
+            Some(0.37)
+        );
+        assert_eq!(
+            soccer_actor_old_action_probability(Some(0.0), Some(0.83)),
+            Some(0.83)
+        );
+        assert_eq!(soccer_actor_old_action_probability(None, None), None);
+    }
+
+    #[test]
     fn trajectory_export_decision_records_behavior_policy_probability() {
         let sim = SoccerMatch::default_11v11(MatchConfig::default());
         let snapshot = WorldSnapshot::from_match(&sim);
@@ -5359,6 +5397,7 @@ mod tests {
             mdp_mpc_comparison: None,
             learned_mpc_replan: None,
             behavior_policy_probability: None,
+            actor_policy_probability: None,
             neural_mcts_selected: false,
             neural_mcts_candidate_count: 0,
             neural_mcts_discretized_kick_candidate_count: 0,
@@ -5406,6 +5445,7 @@ mod tests {
             mdp_mpc_comparison: None,
             learned_mpc_replan: None,
             behavior_policy_probability: None,
+            actor_policy_probability: None,
             neural_mcts_selected: false,
             neural_mcts_candidate_count: 0,
             neural_mcts_discretized_kick_candidate_count: 0,
@@ -5520,6 +5560,7 @@ mod tests {
             mdp_mpc_comparison: None,
             learned_mpc_replan: None,
             behavior_policy_probability: None,
+            actor_policy_probability: None,
             neural_mcts_selected: false,
             neural_mcts_candidate_count: 0,
             neural_mcts_discretized_kick_candidate_count: 0,
@@ -5627,6 +5668,7 @@ mod tests {
             mdp_mpc_comparison: None,
             learned_mpc_replan: None,
             behavior_policy_probability: None,
+            actor_policy_probability: None,
             neural_mcts_selected: false,
             neural_mcts_candidate_count: 0,
             neural_mcts_discretized_kick_candidate_count: 0,
@@ -6572,6 +6614,7 @@ mod tests {
             mdp_mpc_comparison: None,
             learned_mpc_replan: None,
             behavior_policy_probability: None,
+            actor_policy_probability: None,
             neural_mcts_selected: false,
             neural_mcts_candidate_count: 0,
             neural_mcts_discretized_kick_candidate_count: 0,
@@ -6615,6 +6658,7 @@ mod tests {
             mdp_mpc_comparison: None,
             learned_mpc_replan: None,
             behavior_policy_probability: None,
+            actor_policy_probability: None,
             neural_mcts_selected: false,
             neural_mcts_candidate_count: 0,
             neural_mcts_discretized_kick_candidate_count: 0,
@@ -7089,6 +7133,7 @@ mod tests {
                 candidate_count: 1,
             }),
             behavior_policy_probability: None,
+            actor_policy_probability: None,
             neural_mcts_selected: false,
             neural_mcts_candidate_count: 0,
             neural_mcts_discretized_kick_candidate_count: 0,
@@ -7173,6 +7218,7 @@ mod tests {
                 candidate_count: 2,
             }),
             behavior_policy_probability: None,
+            actor_policy_probability: None,
             neural_mcts_selected: false,
             neural_mcts_candidate_count: 0,
             neural_mcts_discretized_kick_candidate_count: 0,
@@ -7231,6 +7277,7 @@ mod tests {
                 candidate_count: 1,
             }),
             behavior_policy_probability: None,
+            actor_policy_probability: None,
             neural_mcts_selected: false,
             neural_mcts_candidate_count: 0,
             neural_mcts_discretized_kick_candidate_count: 0,
@@ -11676,6 +11723,7 @@ mod tests {
             action_index: 0,
             advantage: -0.5,
             old_action_probability: None,
+            legal_action_mask: Vec::new(),
             sample_weight: soccer_actor_priority_weight(&transition, -0.5),
             mcts_distillation: false,
             forward_select_eligible: false,
@@ -12155,6 +12203,7 @@ mod tests {
             action_index: 0,
             advantage,
             old_action_probability: None,
+            legal_action_mask: Vec::new(),
             sample_weight,
             mcts_distillation: sample_weight >= NEURAL_MCTS_DISTILLATION_PRIORITY_WEIGHT - 1e-9,
             forward_select_eligible: false,
@@ -17645,6 +17694,42 @@ impl SoccerMatch {
         stamp_learned_policy_behavior_probability_on_decision(decision, behavior_probability);
     }
 
+    fn actor_policy_probability_for_action(
+        &self,
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        mdp_state: &SoccerMdpState,
+        observation: &SoccerPomdpObservation,
+        label: &str,
+    ) -> Option<f64> {
+        let player = snapshot
+            .players
+            .iter()
+            .find(|player| player.id == player_id)?;
+        let mut transition = self.neural_decision_transition(
+            snapshot,
+            player_id,
+            player.team,
+            player.role,
+            mdp_state,
+            observation,
+        );
+        transition.action.clear();
+        let state_features = self.policy_state_features(&transition);
+        let action_index = soccer_policy_action_index(label)?;
+        let legal_action_mask = soccer_policy_legal_action_mask_for_snapshot(snapshot, player_id)?;
+        self.policy_head_for(player.team)?
+            .action_distribution_for_role_with_mask(
+                &state_features,
+                player.role,
+                &legal_action_mask,
+            )?
+            .get(action_index)
+            .copied()
+            .map(finite_unit_interval)
+            .filter(|probability| *probability > 0.0)
+    }
+
     fn stamp_neural_mcts_selection(
         player: &mut PlayerAgent,
         selected: bool,
@@ -19474,6 +19559,7 @@ impl SoccerMatch {
         )?;
         let mut legal: Vec<SoccerLearnedActionTrace> =
             ranked.into_iter().filter(|action| action.legal).collect();
+        let legal_action_mask = soccer_policy_legal_action_mask_for_snapshot(snapshot, player_id);
 
         // The value head trains on `(reward + γ·max_next) / target_scale`; undo the
         // scale so neural value lands in the same Q units as the tabular values.
@@ -19501,7 +19587,11 @@ impl SoccerMatch {
                 let state_features = self.policy_state_features(&base);
                 let joint = self
                     .policy_head_for(team)
-                    .and_then(|head| head.action_distribution(&state_features))
+                    .and_then(|head| {
+                        legal_action_mask.as_deref().and_then(|mask| {
+                            head.action_distribution_for_role_with_mask(&state_features, role, mask)
+                        })
+                    })
                     .map(|dist| dist.iter().map(|&p| p.max(1e-8).ln()).collect());
                 // Specialist skill log-probs (pass/dribble/shot) over the same shared features.
                 let skill = if dd_soccer_enable_skill_policy_heads() {
@@ -22949,6 +23039,7 @@ impl SoccerMatch {
                     action_index,
                     advantage,
                     old_action_probability: Some(actor_probability),
+                    legal_action_mask: transition.decision_context.legal_policy_action_mask.clone(),
                     sample_weight,
                     mcts_distillation: false,
                     forward_select_eligible,
@@ -23216,12 +23307,8 @@ impl SoccerMatch {
                 // Stochastic top-k selection records the true behavior policy;
                 // older/deterministic rows keep their chosen-action probability
                 // before falling back to the actor head.
-                let old_action_probability = soccer_behavior_old_action_probability(
-                    transition
-                        .decision_context
-                        .behavior_policy_probability
-                        .filter(|probability| probability.is_finite() && *probability > 0.0)
-                        .or(Some(transition.decision_context.chosen_action_probability)),
+                let old_action_probability = soccer_actor_old_action_probability(
+                    transition.decision_context.actor_policy_probability,
                     actor_probability,
                 );
                 if !advantage.is_finite() {
@@ -23243,6 +23330,7 @@ impl SoccerMatch {
                     action_index,
                     advantage,
                     old_action_probability,
+                    legal_action_mask: transition.decision_context.legal_policy_action_mask.clone(),
                     sample_weight,
                     mcts_distillation,
                     forward_select_eligible,
@@ -25357,6 +25445,16 @@ impl SoccerMatch {
                     } else {
                         None
                     };
+                    let old_actor_policy_probability =
+                        learned_decision.as_ref().and_then(|decision| {
+                            self.actor_policy_probability_for_action(
+                                &snapshot,
+                                scheduled.id,
+                                &mdp_state,
+                                &observation,
+                                &decision.label,
+                            )
+                        });
                     // ROLLOUT: on the first tick after a fork, force the flagged player's
                     // action, then self-clear so the remaining horizon follows the base policy.
                     let forced_rollout_plan: Option<SoccerLearnedPlan> =
@@ -25405,6 +25503,12 @@ impl SoccerMatch {
                             &mut self.players[actor],
                             learned_decision.behavior_probability,
                         );
+                        if let Some(last_decision) = self.players[actor].last_decision.as_mut() {
+                            stamp_learned_actor_policy_probability_on_decision(
+                                last_decision,
+                                old_actor_policy_probability,
+                            );
+                        }
                         Self::stamp_neural_mcts_selection(
                             &mut self.players[actor],
                             learned_decision.neural_mcts_selected,
