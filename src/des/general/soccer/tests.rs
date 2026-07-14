@@ -60,6 +60,7 @@ fn test_decision_trace(
         mdp_mpc_comparison: None,
         learned_mpc_replan: None,
         behavior_policy_probability: None,
+        actor_policy_probability: None,
         neural_mcts_selected: false,
         neural_mcts_candidate_count: 0,
         neural_mcts_discretized_kick_candidate_count: 0,
@@ -139,6 +140,7 @@ fn policy_head_trains_skill_specialists_independently() {
             action_index: soccer_policy_action_index(action).expect("known policy action"),
             advantage: 1.0,
             old_action_probability: None,
+            legal_action_mask: Vec::new(),
             sample_weight: 1.0,
             mcts_distillation: false,
             forward_select_eligible: false,
@@ -245,6 +247,7 @@ fn policy_head_snapshot_round_trips_role_heads_and_specialists() {
             action_index: soccer_policy_action_index(action).expect("known policy action"),
             advantage: 1.0,
             old_action_probability: None,
+            legal_action_mask: Vec::new(),
             sample_weight: 1.0,
             mcts_distillation: false,
             forward_select_eligible: false,
@@ -355,6 +358,7 @@ fn legacy_skill_and_keeper_policy_heads_snapshot_round_trip() {
             action_index: soccer_policy_action_index(action).expect("known policy action"),
             advantage: 1.0,
             old_action_probability: None,
+            legal_action_mask: Vec::new(),
             sample_weight: 1.0,
             mcts_distillation: false,
             forward_select_eligible: false,
@@ -430,6 +434,7 @@ fn match_neural_snapshot_exports_and_restores_legacy_specialist_heads() {
             action_index: soccer_policy_action_index(action).expect("known policy action"),
             advantage: 1.0,
             old_action_probability: None,
+            legal_action_mask: Vec::new(),
             sample_weight: 1.0,
             mcts_distillation: false,
             forward_select_eligible: false,
@@ -513,7 +518,10 @@ fn match_neural_snapshot_exports_and_restores_legacy_specialist_heads() {
     let error = restored
         .set_neural_network_snapshot(incompatible)
         .expect_err("an incompatible specialist must reject the whole serving bundle");
-    assert!(error.contains("input dim"), "unexpected load error: {error}");
+    assert!(
+        error.contains("input dim"),
+        "unexpected load error: {error}"
+    );
     let after_rejection = restored
         .neural_network_snapshot()
         .expect("previous serving bundle must remain installed");
@@ -9150,6 +9158,7 @@ fn analytic_difference_reward_alignment_damps_bad_realized_dense_outcomes() {
         mdp_mpc_comparison: None,
         learned_mpc_replan: None,
         behavior_policy_probability: None,
+        actor_policy_probability: None,
         neural_mcts_selected: false,
         neural_mcts_candidate_count: 0,
         neural_mcts_discretized_kick_candidate_count: 0,
@@ -13900,9 +13909,7 @@ fn goal_and_shot_reward_pools_and_buildup_chain_are_locked() {
         SHOT_ON_TARGET_REWARD_PATTERN.iter().sum::<f64>()
             < GOAL_CHAIN_REWARD_PATTERN.iter().sum::<f64>()
     );
-    assert!(
-        GOAL_CHAIN_REWARD_PATTERN.iter().sum::<f64>() < DIRECT_TURNOVER_GOAL_REWARD_POINTS
-    );
+    assert!(GOAL_CHAIN_REWARD_PATTERN.iter().sum::<f64>() < DIRECT_TURNOVER_GOAL_REWARD_POINTS);
     assert!(DIRECT_TURNOVER_GOAL_REWARD_POINTS < GOAL_REWARD_POINTS);
 
     // A pass that leads to a subsequent received pass is rewarded, more for forward
@@ -39419,6 +39426,7 @@ fn curriculum_focused_phase_trains_only_its_specialist() {
         action_index: soccer_policy_action_index(label).expect("family"),
         advantage: 1.0,
         old_action_probability: None,
+        legal_action_mask: Vec::new(),
         sample_weight: 1.0,
         mcts_distillation: false,
         forward_select_eligible: false,
@@ -39545,6 +39553,7 @@ fn skill_policy_heads_train_and_score_their_group() {
         action_index: soccer_policy_action_index(label).expect("family"),
         advantage,
         old_action_probability: None,
+        legal_action_mask: Vec::new(),
         sample_weight: 1.0,
         mcts_distillation: false,
         forward_select_eligible: false,
@@ -39586,6 +39595,7 @@ fn skill_policy_heads_snapshot_round_trips_trained_heads() {
         action_index: soccer_policy_action_index(label).expect("family"),
         advantage,
         old_action_probability: None,
+        legal_action_mask: Vec::new(),
         sample_weight: 1.0,
         mcts_distillation: false,
         forward_select_eligible: false,
@@ -39671,6 +39681,7 @@ fn policy_head_advantage_gradient_prefers_the_reinforced_family() {
                     action_index: reinforced,
                     advantage: 1.0,
                     old_action_probability: None,
+                    legal_action_mask: Vec::new(),
                     sample_weight: 1.0,
                     mcts_distillation: false,
                     forward_select_eligible: false,
@@ -39680,6 +39691,7 @@ fn policy_head_advantage_gradient_prefers_the_reinforced_family() {
                     action_index: penalised,
                     advantage: -1.0,
                     old_action_probability: None,
+                    legal_action_mask: Vec::new(),
                     sample_weight: 1.0,
                     mcts_distillation: false,
                     forward_select_eligible: false,
@@ -39707,7 +39719,7 @@ fn policy_head_advantage_gradient_prefers_the_reinforced_family() {
 }
 
 #[test]
-fn policy_head_mappo_clip_bounds_old_policy_ratio() {
+fn policy_head_mappo_clip_zeroes_saturated_old_policy_ratio_gradient() {
     let head = SoccerPolicyHead::new(19);
     let mut critic_state = [0.0f64; SOCCER_NEURAL_FEATURE_DIM];
     critic_state[0] = 0.25;
@@ -39721,6 +39733,7 @@ fn policy_head_mappo_clip_bounds_old_policy_ratio() {
         action_index,
         advantage: 2.0,
         old_action_probability: Some(current_probability / 10.0),
+        legal_action_mask: Vec::new(),
         sample_weight: 1.0,
         mcts_distillation: false,
         forward_select_eligible: false,
@@ -39728,9 +39741,9 @@ fn policy_head_mappo_clip_bounds_old_policy_ratio() {
     let positive = head
         .clipped_mappo_advantage(&positive_sample, 0.2)
         .expect("valid MAPPO old-policy probability");
-    assert!(
-        (positive - 2.4).abs() < 1e-9,
-        "positive MAPPO advantage must clip high ratios: {positive}"
+    assert_eq!(
+        positive, 0.0,
+        "positive MAPPO advantage must stop updating above the upper clip"
     );
 
     let negative_sample = SoccerPolicySample {
@@ -39738,6 +39751,7 @@ fn policy_head_mappo_clip_bounds_old_policy_ratio() {
         action_index,
         advantage: -2.0,
         old_action_probability: Some(current_probability * 10.0),
+        legal_action_mask: Vec::new(),
         sample_weight: 1.0,
         mcts_distillation: false,
         forward_select_eligible: false,
@@ -39745,9 +39759,9 @@ fn policy_head_mappo_clip_bounds_old_policy_ratio() {
     let negative = head
         .clipped_mappo_advantage(&negative_sample, 0.2)
         .expect("valid MAPPO old-policy probability");
-    assert!(
-        (negative + 1.6).abs() < 1e-9,
-        "negative MAPPO advantage must clip low ratios: {negative}"
+    assert_eq!(
+        negative, 0.0,
+        "negative MAPPO advantage must stop updating below the lower clip"
     );
 }
 
@@ -39764,6 +39778,7 @@ fn policy_head_mappo_clip_skips_missing_or_invalid_old_policy_probability() {
         action_index,
         advantage: 2.0,
         old_action_probability,
+        legal_action_mask: Vec::new(),
         sample_weight: 1.0,
         mcts_distillation: false,
         forward_select_eligible: false,
@@ -39823,6 +39838,7 @@ fn per_role_policy_heads_train_without_cross_role_gradient_bleed() {
             action_index: shoot,
             advantage: 1.0,
             old_action_probability: None,
+            legal_action_mask: Vec::new(),
             sample_weight: 1.0,
             mcts_distillation: false,
             forward_select_eligible: false,
@@ -42919,6 +42935,7 @@ fn trained_test_skill_policy_heads(seed: u32, rounds: usize) -> SoccerSkillPolic
         action_index: soccer_policy_action_index(label).expect("policy family"),
         advantage,
         old_action_probability: None,
+        legal_action_mask: Vec::new(),
         sample_weight: 1.0,
         mcts_distillation: false,
         forward_select_eligible: false,
@@ -47377,10 +47394,16 @@ fn factual_reward_context_capture_uses_exact_event_and_whole_field_embedding() {
     sim.run_time_step();
     let sample = &sim.reward_context_samples()[0];
     assert_eq!(sample.future_tick, Some(18));
-    let future = sample.future_embedding.as_ref().expect("future field state");
+    let future = sample
+        .future_embedding
+        .as_ref()
+        .expect("future field state");
     assert_eq!(future.len(), SOCCER_MOMENT_EMBEDDING_DIM);
     assert!(future.iter().all(|value| value.is_finite()));
-    assert_ne!(future, &sample.embedding, "future state must not be same-tick copy");
+    assert_ne!(
+        future, &sample.embedding,
+        "future state must not be same-tick copy"
+    );
 }
 
 #[test]
@@ -62008,6 +62031,7 @@ fn transition_reward_reinforces_completed_pass_into_future_stride() {
             mdp_mpc_comparison: None,
             learned_mpc_replan: None,
             behavior_policy_probability: None,
+            actor_policy_probability: None,
             neural_mcts_selected: false,
             neural_mcts_candidate_count: 0,
             neural_mcts_discretized_kick_candidate_count: 0,
@@ -69624,10 +69648,7 @@ fn dribble_beat_event_uses_move_reward_and_rejects_invalid_contests() {
         .sum::<f64>();
     assert!(attacker_reward.is_finite() && attacker_reward > 0.0);
     assert!(
-        attacker_reward
-            <= NUTMEG_BEAT_REWARD_POINTS
-                * SPARSE_ACTION_REWARD_SCALE_BOUNDS.1
-                * 1.65
+        attacker_reward <= NUTMEG_BEAT_REWARD_POINTS * SPARSE_ACTION_REWARD_SCALE_BOUNDS.1 * 1.65
     );
     assert_eq!(sim.stats.dribble_beats_home, 1);
     assert!(sim.events.iter().any(|event| event.kind == "nutmeg"));
@@ -69678,9 +69699,7 @@ fn dribble_beat_event_triggers_learning_with_whole_field_context() {
     assert!(contextual_beat_reward.is_finite() && contextual_beat_reward > 0.0);
     assert!(
         contextual_beat_reward
-            <= NUTMEG_BEAT_REWARD_POINTS
-                * SPARSE_ACTION_REWARD_SCALE_BOUNDS.1
-                * 1.65
+            <= NUTMEG_BEAT_REWARD_POINTS * SPARSE_ACTION_REWARD_SCALE_BOUNDS.1 * 1.65
     );
     assert!(tick_events.iter().any(|event| {
         event.player_id == defender
