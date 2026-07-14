@@ -15347,10 +15347,14 @@ fn soccer_correlated_full_game_replay_transitions(
         } else {
             away_sum / away_count as f64
         };
-        home_return = (home_mean + SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK * home_return)
-            .clamp(-soccer_full_game_return_clip(), soccer_full_game_return_clip());
-        away_return = (away_mean + SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK * away_return)
-            .clamp(-soccer_full_game_return_clip(), soccer_full_game_return_clip());
+        home_return = (home_mean + SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK * home_return).clamp(
+            -soccer_full_game_return_clip(),
+            soccer_full_game_return_clip(),
+        );
+        away_return = (away_mean + SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK * away_return).clamp(
+            -soccer_full_game_return_clip(),
+            soccer_full_game_return_clip(),
+        );
 
         for idx in indices {
             let mut transition = transitions[*idx].clone();
@@ -15367,8 +15371,10 @@ fn soccer_correlated_full_game_replay_transitions(
                 Some(outcome) => blended + outcome.for_team(transition.team),
                 None => blended,
             };
-            transition.reward =
-                with_outcome.clamp(-soccer_full_game_return_clip(), soccer_full_game_return_clip());
+            transition.reward = with_outcome.clamp(
+                -soccer_full_game_return_clip(),
+                soccer_full_game_return_clip(),
+            );
             transition.done = true;
             replay.push(transition);
         }
@@ -15403,8 +15409,10 @@ fn soccer_dp_value_iteration(
             if count > 0 {
                 value.insert(
                     b,
-                    (sum / count as f64)
-                        .clamp(-soccer_full_game_return_clip(), soccer_full_game_return_clip()),
+                    (sum / count as f64).clamp(
+                        -soccer_full_game_return_clip(),
+                        soccer_full_game_return_clip(),
+                    ),
                 );
             }
         }
@@ -15438,7 +15446,10 @@ fn soccer_dp_nstep_return(
             }
         }
     }
-    ret.clamp(-soccer_full_game_return_clip(), soccer_full_game_return_clip())
+    ret.clamp(
+        -soccer_full_game_return_clip(),
+        soccer_full_game_return_clip(),
+    )
 }
 
 /// Build the outcome-only sequence used by DP terminal credit. Exactly one sample carries the
@@ -15637,8 +15648,10 @@ fn soccer_dp_bootstrapped_replay_transitions(
                 .unwrap_or(0.0)
         };
         let with_outcome = blended + outcome_component;
-        transition.reward =
-            with_outcome.clamp(-soccer_full_game_return_clip(), soccer_full_game_return_clip());
+        transition.reward = with_outcome.clamp(
+            -soccer_full_game_return_clip(),
+            soccer_full_game_return_clip(),
+        );
         transition.done = true;
         replay.push(transition);
     }
@@ -15771,8 +15784,10 @@ fn soccer_outcome_credit_replay_transitions(
             .unwrap_or(0.0);
         let milestone_reward = soccer_outcome_credit_milestone_reward(&transition);
         let pitch_shaping = soccer_outcome_credit_pitch_value_shaping(&transition);
-        transition.reward = finite_metric(outcome_reward + milestone_reward + pitch_shaping)
-            .clamp(-soccer_full_game_return_clip(), soccer_full_game_return_clip());
+        transition.reward = finite_metric(outcome_reward + milestone_reward + pitch_shaping).clamp(
+            -soccer_full_game_return_clip(),
+            soccer_full_game_return_clip(),
+        );
         transition.done = true;
         replay.push(transition);
     }

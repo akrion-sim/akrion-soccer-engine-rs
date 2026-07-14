@@ -100275,7 +100275,10 @@ fn mpc_reject_threshold_pipeline_collects_and_trains_end_to_end() {
                 })
                 .collect()
         };
-        assert!(!training_rows.is_empty(), "need carrier contexts to train on");
+        assert!(
+            !training_rows.is_empty(),
+            "need carrier contexts to train on"
+        );
         let mut head = MpcRejectThresholdHead::new(31);
         let mut guard = 0;
         while head.training_steps() < MPC_REJECT_THRESHOLD_HEAD_MIN_TRAINING_STEPS && guard < 5000 {
@@ -100313,9 +100316,7 @@ fn anchored_reward_currency_invariants() {
     std::env::set_var("DD_SOCCER_ENABLE_ANCHORED_REWARDS", "true");
     assert!((live_goal_reward_points() - ANCHOR_GOAL_POINTS).abs() < 1e-9);
     assert!((match_outcome_win_reward_points() - ANCHOR_WIN_POINTS).abs() < 1e-9);
-    assert!(
-        (anchored_currency_scale() - ANCHOR_GOAL_POINTS / GOAL_REWARD_POINTS).abs() < 1e-9
-    );
+    assert!((anchored_currency_scale() - ANCHOR_GOAL_POINTS / GOAL_REWARD_POINTS).abs() < 1e-9);
 
     // On-frame shot anchor: floor 50 everywhere (an on-frame 80-yarder pays
     // exactly the floor), cap 200 = 0.40·goal at the best field-vector

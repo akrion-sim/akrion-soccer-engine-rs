@@ -68,7 +68,12 @@ impl Rng {
 
 fn env_flag(name: &str) -> bool {
     std::env::var(name)
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -160,7 +165,11 @@ fn setup_scenario(sim: &mut SoccerMatch, rng: &mut Rng, num_defenders: usize) ->
     let sy = rng.range(goal_y - 18.0, goal_y - 4.0);
     let shooter_pos = Vec2::new(sx, sy);
 
-    let defenders: Vec<usize> = away_outfielders.iter().copied().take(num_defenders).collect();
+    let defenders: Vec<usize> = away_outfielders
+        .iter()
+        .copied()
+        .take(num_defenders)
+        .collect();
 
     for p in sim.players.iter_mut() {
         if p.id == shooter {
@@ -240,7 +249,11 @@ fn setup_scenario_creation(sim: &mut SoccerMatch, rng: &mut Rng, num_defenders: 
         .filter(|&id| id != carrier)
         .take(3)
         .collect();
-    let defenders: Vec<usize> = away_outfielders.iter().copied().take(num_defenders).collect();
+    let defenders: Vec<usize> = away_outfielders
+        .iter()
+        .copied()
+        .take(num_defenders)
+        .collect();
 
     for p in sim.players.iter_mut() {
         if p.id == carrier {
@@ -251,7 +264,8 @@ fn setup_scenario_creation(sim: &mut SoccerMatch, rng: &mut Rng, num_defenders: 
             p.velocity = Vec2::zero();
         } else if let Some(k) = supports.iter().position(|&s| s == p.id) {
             // Advanced support spread across the width, level-to-ahead of the carrier.
-            let sx = (width * (0.22 + 0.28 * k as f64) + rng.range(-4.0, 4.0)).clamp(3.0, width - 3.0);
+            let sx =
+                (width * (0.22 + 0.28 * k as f64) + rng.range(-4.0, 4.0)).clamp(3.0, width - 3.0);
             let sy = (cy + rng.range(2.0, 12.0)).clamp(0.0, goal_y - 8.0);
             p.position = Vec2::new(sx, sy);
             p.velocity = Vec2::zero();
@@ -377,7 +391,15 @@ fn eval_arm(
     (0..n)
         .map(|i| {
             let mut rng = Rng::new(eval_base.wrapping_add(i as u64));
-            play_episode(sim, &mut rng, creation, num_defenders, max_ticks, width, length)
+            play_episode(
+                sim,
+                &mut rng,
+                creation,
+                num_defenders,
+                max_ticks,
+                width,
+                length,
+            )
         })
         .collect()
 }
@@ -442,30 +464,32 @@ fn main() {
             "/tmp/finishing-drill/learned-params.json".to_string()
         }
     });
-    let warmstart = std::env::var("DRILL_WARMSTART").ok().filter(|s| !s.is_empty());
+    let warmstart = std::env::var("DRILL_WARMSTART")
+        .ok()
+        .filter(|s| !s.is_empty());
 
     // Optional warm start: pull the learner net + home target-Q out of an existing frontier.
-    let (warm_neural, warm_home_targets): (Option<SoccerNeuralNetworkSnapshot>, Vec<SoccerQTargetEntry>) =
-        if let Some(path) = warmstart.as_ref() {
-            let raw = fs::read_to_string(path).expect("read DRILL_WARMSTART file");
-            let v: serde_json::Value =
-                serde_json::from_str(&raw).expect("parse DRILL_WARMSTART json");
-            let neural = serde_json::from_value::<SoccerNeuralNetworkSnapshot>(
-                v["neuralNetwork"].clone(),
-            )
-            .expect("DRILL_WARMSTART.neuralNetwork");
-            let home_targets =
-                serde_json::from_value::<Vec<SoccerQTargetEntry>>(v["homeTargetEntries"].clone())
-                    .unwrap_or_default();
-            eprintln!(
-                "warmstart: loaded net (training_steps={}) + {} home target entries from {path}",
-                neural.training_steps,
-                home_targets.len()
-            );
-            (Some(neural), home_targets)
-        } else {
-            (None, Vec::new())
-        };
+    let (warm_neural, warm_home_targets): (
+        Option<SoccerNeuralNetworkSnapshot>,
+        Vec<SoccerQTargetEntry>,
+    ) = if let Some(path) = warmstart.as_ref() {
+        let raw = fs::read_to_string(path).expect("read DRILL_WARMSTART file");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("parse DRILL_WARMSTART json");
+        let neural =
+            serde_json::from_value::<SoccerNeuralNetworkSnapshot>(v["neuralNetwork"].clone())
+                .expect("DRILL_WARMSTART.neuralNetwork");
+        let home_targets =
+            serde_json::from_value::<Vec<SoccerQTargetEntry>>(v["homeTargetEntries"].clone())
+                .unwrap_or_default();
+        eprintln!(
+            "warmstart: loaded net (training_steps={}) + {} home target entries from {path}",
+            neural.training_steps,
+            home_targets.len()
+        );
+        (Some(neural), home_targets)
+    } else {
+        (None, Vec::new())
+    };
 
     // Config: learning fully enabled (the learner is only built when learning + neural are on).
     let mut config = MatchConfig {
@@ -478,10 +502,16 @@ fn main() {
     config.neural_learning.enabled = true;
     // Optional neural-blend overrides (default = engine defaults: Additive value blend,
     // lambda 0.5, warmup 200 steps — enough for the warm critic to influence shot selection).
-    if let Some(x) = std::env::var("DRILL_LAMBDA").ok().and_then(|v| v.parse().ok()) {
+    if let Some(x) = std::env::var("DRILL_LAMBDA")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
         config.neural_blend.lambda = x;
     }
-    if let Some(x) = std::env::var("DRILL_WARMUP").ok().and_then(|v| v.parse().ok()) {
+    if let Some(x) = std::env::var("DRILL_WARMUP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
         config.neural_blend.warmup_steps = x;
     }
     if env_flag("DRILL_ACTOR_CRITIC") {
@@ -538,7 +568,9 @@ fn main() {
         println!(
             "  serving: engine-default blend (analytic executes the shot; net learns MOVEMENT+PASSING).  high_xG>{HIGH_XG_THRESHOLD}"
         );
-        println!("  eps       shots/ep   sot/ep    meanXG   hiXG-frac    train_steps   critic_loss");
+        println!(
+            "  eps       shots/ep   sot/ep    meanXG   hiXG-frac    train_steps   critic_loss"
+        );
     } else {
         println!(
             "  coupling: authoritative_lambda={} discretized_kick={} min_kick_candidates={}",
@@ -546,7 +578,9 @@ fn main() {
             std::env::var("DD_SOCCER_ENABLE_DISCRETIZED_KICK").unwrap_or_default(),
             std::env::var("SOCCER_NEURAL_MCTS_MIN_DISCRETIZED_KICK_CANDIDATES").unwrap_or_default(),
         );
-        println!("  eps      scoring_rate  (goals/50)     cumulative    train_steps    critic_loss");
+        println!(
+            "  eps      scoring_rate  (goals/50)     cumulative    train_steps    critic_loss"
+        );
     }
 
     const BLOCK: usize = 50;
@@ -589,7 +623,9 @@ fn main() {
                 .neural_network_snapshot_for(Team::Home)
                 .map(|s| (s.training_steps, s.average_loss))
                 .unwrap_or((0, None));
-            let loss_s = loss.map(|l| format!("{l:.4}")).unwrap_or_else(|| "n/a".into());
+            let loss_s = loss
+                .map(|l| format!("{l:.4}"))
+                .unwrap_or_else(|| "n/a".into());
             if creation {
                 let shots_pe = b_shots as f64 / BLOCK as f64;
                 let sot_pe = b_sot as f64 / BLOCK as f64;
@@ -713,7 +749,14 @@ fn main() {
         sim.set_team_neural_brain(Team::Home, Some(snap.clone()), true)
             .expect("freeze tuned net for eval");
         let tuned = eval_arm(
-            &mut sim, eval_base, eval_n, creation, num_defenders, max_ticks, field_width, field_length,
+            &mut sim,
+            eval_base,
+            eval_n,
+            creation,
+            num_defenders,
+            max_ticks,
+            field_width,
+            field_length,
         );
         // (b) BASELINE arm: a fresh sim serving the PRE-TRAINING net frozen, identical machinery.
         let mut base_config = MatchConfig {
@@ -725,12 +768,21 @@ fn main() {
         };
         base_config.neural_learning.enabled = true;
         let base_policies = SoccerTeamQPolicies {
-            home: SoccerQPolicy::from_entries_with_targets(SoccerQPolicyOptions::default(), &[], &[])
-                .expect("base home policy"),
-            away: SoccerQPolicy::from_entries_with_targets(SoccerQPolicyOptions::default(), &[], &[])
-                .expect("base away policy"),
+            home: SoccerQPolicy::from_entries_with_targets(
+                SoccerQPolicyOptions::default(),
+                &[],
+                &[],
+            )
+            .expect("base home policy"),
+            away: SoccerQPolicy::from_entries_with_targets(
+                SoccerQPolicyOptions::default(),
+                &[],
+                &[],
+            )
+            .expect("base away policy"),
         };
-        let mut base_sim = SoccerMatch::default_11v11(base_config).with_team_policies(base_policies);
+        let mut base_sim =
+            SoccerMatch::default_11v11(base_config).with_team_policies(base_policies);
         match baseline_snap.clone() {
             Some(b) => {
                 base_sim
@@ -751,7 +803,13 @@ fn main() {
             .set_team_neural_brain(Team::Away, None, true)
             .expect("base away analytic");
         let baseline = eval_arm(
-            &mut base_sim, eval_base, eval_n, creation, num_defenders, max_ticks, field_width,
+            &mut base_sim,
+            eval_base,
+            eval_n,
+            creation,
+            num_defenders,
+            max_ticks,
+            field_width,
             field_length,
         );
 
@@ -762,8 +820,16 @@ fn main() {
             // Paired significance on the engine-grounded chance metric: did the episode produce a
             // shot ON TARGET. (hiXG is reported too but is sparser / lower-powered.)
             let got = |m: &EpMetrics| m.sot >= 1;
-            let up = tuned.iter().zip(&baseline).filter(|(t, b)| got(t) && !got(b)).count();
-            let down = tuned.iter().zip(&baseline).filter(|(t, b)| !got(t) && got(b)).count();
+            let up = tuned
+                .iter()
+                .zip(&baseline)
+                .filter(|(t, b)| got(t) && !got(b))
+                .count();
+            let down = tuned
+                .iter()
+                .zip(&baseline)
+                .filter(|(t, b)| !got(t) && got(b))
+                .count();
             let z = if up + down > 0 {
                 (up as f64 - down as f64) / ((up + down) as f64).sqrt()
             } else {
@@ -786,8 +852,16 @@ fn main() {
         } else {
             let t_goals = tuned.iter().filter(|m| m.goal).count();
             let b_goals2 = baseline.iter().filter(|m| m.goal).count();
-            let up = tuned.iter().zip(&baseline).filter(|(t, b)| t.goal && !b.goal).count();
-            let down = tuned.iter().zip(&baseline).filter(|(t, b)| !t.goal && b.goal).count();
+            let up = tuned
+                .iter()
+                .zip(&baseline)
+                .filter(|(t, b)| t.goal && !b.goal)
+                .count();
+            let down = tuned
+                .iter()
+                .zip(&baseline)
+                .filter(|(t, b)| !t.goal && b.goal)
+                .count();
             let z = if up + down > 0 {
                 (up as f64 - down as f64) / ((up + down) as f64).sqrt()
             } else {
@@ -832,8 +906,11 @@ fn main() {
         "episodes": 0,
         "neuralNetwork": serde_json::to_value(&snap).unwrap(),
     });
-    fs::write(&out_path, serde_json::to_string(&value).expect("serialize frontier"))
-        .expect("write frontier");
+    fs::write(
+        &out_path,
+        serde_json::to_string(&value).expect("serialize frontier"),
+    )
+    .expect("write frontier");
     println!(
         "\nsaved learner frontier -> {out_path}  (net training_steps={}, home_target_entries={})",
         snap.training_steps,
