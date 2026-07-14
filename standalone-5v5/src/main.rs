@@ -605,12 +605,8 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
     // AND the 5v5 anti-drift knobs — the new knobs adopt the `?` signature too.
     let generations = env_usize_clamped("GENERATIONS", 12, 1, SELFPLAY_MAX_GENERATIONS)?;
     let promote_margin = env_f32_clamped("PROMOTE_MARGIN", 0.25, -20.0, 20.0)?;
-    let confirmation_games = env_usize_clamped(
-        "PROMOTE_CONFIRM_GAMES",
-        cfg.eval_games.max(120),
-        2,
-        20_000,
-    )?;
+    let confirmation_games =
+        env_usize_clamped("PROMOTE_CONFIRM_GAMES", cfg.eval_games.max(120), 2, 20_000)?;
     // ANTI-DRIFT (mirrors the 11v11 league+analytic anchor). Pure latest-champion
     // self-play drifts into rock-paper-scissors cycles: the challenger beats the
     // champion while its ABSOLUTE skill (vs the fixed scripted baseline) collapses.
@@ -644,12 +640,8 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
     } else {
         let mut policy = train::Policy::new(&mut rng);
         if cfg.bc_games > 0 {
-            let bc = train::behavior_clone_scripted(
-                &mut policy,
-                cfg.bc_games,
-                cfg.bc_epochs,
-                &mut rng,
-            );
+            let bc =
+                train::behavior_clone_scripted(&mut policy, cfg.bc_games, cfg.bc_epochs, &mut rng);
             println!(
                 "warm start (behavior-clone scripted): {} samples, teacher-match {:.0}%",
                 bc.samples,
@@ -706,12 +698,9 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
         // First use a selection set, then a fresh confirmation set. Promotion
         // depends on lower confidence bounds, never the maximum observed mean.
         let selection_champ = match &champion {
-            Some(incumbent) => train::evaluate_vs_policy_paired(
-                &challenger,
-                incumbent,
-                cfg.eval_games,
-                &mut rng,
-            ),
+            Some(incumbent) => {
+                train::evaluate_vs_policy_paired(&challenger, incumbent, cfg.eval_games, &mut rng)
+            }
             None => train::evaluate_vs_scripted_paired(&challenger, cfg.eval_games, &mut rng),
         };
         let selection_anchor =
@@ -725,20 +714,14 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
                 confirmation_games,
                 &mut rng,
             ),
-            None => train::evaluate_vs_scripted_paired(
-                &challenger,
-                confirmation_games,
-                &mut rng,
-            ),
+            None => train::evaluate_vs_scripted_paired(&challenger, confirmation_games, &mut rng),
         });
-        let confirmation_anchor = selection_passed.then(|| {
-            train::evaluate_vs_scripted_paired(&challenger, confirmation_games, &mut rng)
-        });
-        let promoted = confirmation_champ.is_some_and(|evaluation| {
-            evaluation.goal_diff_lower_95 >= promote_margin
-        }) && confirmation_anchor.is_some_and(|evaluation| {
-            evaluation.goal_diff_lower_95 >= scripted_floor
-        });
+        let confirmation_anchor = selection_passed
+            .then(|| train::evaluate_vs_scripted_paired(&challenger, confirmation_games, &mut rng));
+        let promoted = confirmation_champ
+            .is_some_and(|evaluation| evaluation.goal_diff_lower_95 >= promote_margin)
+            && confirmation_anchor
+                .is_some_and(|evaluation| evaluation.goal_diff_lower_95 >= scripted_floor);
         if promoted {
             champion = Some(challenger.clone());
             champion_gen += 1;
@@ -814,8 +797,7 @@ fn run_training(cfg: &RunConfig) -> AppResult<()> {
     let dagger_every = env_usize_clamped("BC_DAGGER_EVERY", 5, 1, 10_000)?;
     let dagger_games = env_usize_clamped("BC_DAGGER_GAMES", 2, 1, 32)?;
     let dagger_rounds = env_usize_clamped("BC_DAGGER_WARM_ROUNDS", 4, 0, 32)?;
-    let dagger_teacher_rollin =
-        env_f32_clamped("BC_DAGGER_TEACHER_ROLLIN", 0.25, 0.0, 0.75)?;
+    let dagger_teacher_rollin = env_f32_clamped("BC_DAGGER_TEACHER_ROLLIN", 0.25, 0.0, 0.75)?;
 
     fs::create_dir_all(&cfg.out_dir)?;
 

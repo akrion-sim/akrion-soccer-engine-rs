@@ -27841,11 +27841,15 @@ impl SoccerMatch {
             return;
         }
         let duel_reward = self
-            .steal_reward_scaled_for_box(WON_FIFTY_FIFTY_DUEL_REWARD_POINTS, self.ball.position);
+            .steal_reward_scaled_for_box(WON_FIFTY_FIFTY_DUEL_REWARD_POINTS, self.ball.position)
+            * anchored_currency_scale();
         self.record_reward_event(winner, duel_reward);
         for (player_id, team) in contenders {
             if team != winner_team {
-                self.record_reward_event(player_id, -LOST_FIFTY_FIFTY_DUEL_PENALTY_POINTS);
+                self.record_reward_event(
+                    player_id,
+                    -LOST_FIFTY_FIFTY_DUEL_PENALTY_POINTS * anchored_currency_scale(),
+                );
             }
         }
     }
@@ -27901,7 +27905,7 @@ impl SoccerMatch {
                 * freshness
                 * action_scale
         };
-        self.record_reward_event(long_ball.launcher_id, amount);
+        self.record_reward_event(long_ball.launcher_id, amount * anchored_currency_scale());
     }
 
     fn recent_possession_reward_sequence(
@@ -28071,6 +28075,21 @@ impl SoccerMatch {
                 < 1e-9
         );
         let scale = self.shot_reward_distance_scale(shooting_team, shooter);
+        if anchored_rewards_enabled() {
+            // ANCHORED FINISHING (docs/reward-anchoring.md §2): the shooter's
+            // on-frame shot pays ≥ 50 points DIRECTLY — not chain-diluted — with
+            // the cap set by the field-vector context (distance taper × xG). An
+            // on-frame 80-yarder caps at the floor. This replaces the inert
+            // DD_SOCCER_ON_FRAME_SHOT_REWARD_SCALE, which lived below the
+            // `infer_discrete_events` early-return and never fired in self-play.
+            // The legacy chain pool below still pays the build-up (passers) at
+            // its small historical magnitude, keeping shooter total ≤ 0.45·goal.
+            self.record_reward_event_with_kind(
+                shooter,
+                anchored_on_frame_shot_points(scale),
+                SoccerRewardEventKind::ShotOnTarget,
+            );
+        }
         self.record_recent_defensive_shot_on_target_penalties(shooting_team.other(), scale);
         // The field vector (shot origin/distance/angle/keeper context) selects
         // the value inside the grounded band. A speculative 80-yard effort falls
@@ -28119,8 +28138,9 @@ impl SoccerMatch {
         let danger = (1.0
             - shot.origin.distance(attacked_goal) / GOALKEEPER_SAVE_DANGER_REFERENCE_YARDS)
             .clamp(0.0, 1.0);
-        let amount =
-            GOALKEEPER_SAVE_BASE_REWARD_POINTS + GOALKEEPER_SAVE_DANGER_REWARD_POINTS * danger;
+        let amount = (GOALKEEPER_SAVE_BASE_REWARD_POINTS
+            + GOALKEEPER_SAVE_DANGER_REWARD_POINTS * danger)
+            * anchored_currency_scale();
         self.record_reward_event_with_kind(
             keeper_id,
             amount,
@@ -28770,11 +28790,15 @@ impl SoccerMatch {
             debug_assert!(
                 (GOAL_CHAIN_REWARD_PATTERN.iter().sum::<f64>() - GOAL_REWARD_POINTS).abs() < 1e-9
             );
+            // The chain recorder normalizes the pattern, so the anchored goal
+            // total (500) distributes over the same chain shape (docs/
+            // reward-anchoring.md — the live goal was previously the hardcoded
+            // 160 regardless of DD_SOCCER_GOAL_REWARD_SCALE).
             self.record_weighted_possession_chain_reward_at_with_kind(
                 self.tick,
                 scoring_team,
                 shooter,
-                GOAL_REWARD_POINTS,
+                live_goal_reward_points(),
                 &GOAL_CHAIN_REWARD_PATTERN,
                 SoccerRewardEventKind::Goal,
             );
@@ -28782,11 +28806,11 @@ impl SoccerMatch {
                 self.queue_direct_shot_outcome_learning_credit(
                     shooter,
                     scoring_team,
-                    GOAL_REWARD_POINTS,
+                    live_goal_reward_points(),
                     SoccerRewardEventKind::Goal,
                 );
             }
-            self.record_contextual_goal_rewards(scoring_team, shooter, GOAL_REWARD_POINTS);
+            self.record_contextual_goal_rewards(scoring_team, shooter, live_goal_reward_points());
         }
         self.update_mpc_latent_objective(scoring_team, None, Some(1.0), Some(1.0));
         self.record_recent_defensive_goal_penalties(scoring_team.other());
@@ -28802,10 +28826,15 @@ impl SoccerMatch {
             (Team::Away, self.score_away - self.score_home)
         };
         let margin = f64::from(margin.saturating_sub(1));
-        let win_amount =
-            MATCH_RESULT_WIN_PLAYER_REWARD + margin * MATCH_RESULT_MARGIN_REWARD_PER_GOAL;
-        let loss_amount =
-            -(MATCH_RESULT_LOSS_PLAYER_PENALTY + margin * MATCH_RESULT_MARGIN_PENALTY_PER_GOAL);
+        // Under the anchored currency the WIN anchor itself (±1000) travels on
+        // the match-outcome broadcast label; this terminal per-player event
+        // scales uniformly and stays the small margin-flavored component.
+        let win_amount = (MATCH_RESULT_WIN_PLAYER_REWARD
+            + margin * MATCH_RESULT_MARGIN_REWARD_PER_GOAL)
+            * anchored_currency_scale();
+        let loss_amount = -(MATCH_RESULT_LOSS_PLAYER_PENALTY
+            + margin * MATCH_RESULT_MARGIN_PENALTY_PER_GOAL)
+            * anchored_currency_scale();
         let events = self
             .players
             .iter()
@@ -28856,7 +28885,7 @@ impl SoccerMatch {
             let base = DEFENSIVE_GOAL_HISTORY_MIN_PENALTY
                 + (DEFENSIVE_GOAL_HISTORY_MAX_PENALTY - DEFENSIVE_GOAL_HISTORY_MIN_PENALTY)
                     * recency.clamp(0.0, 1.0);
-            transition.reward = -(base * role_multiplier);
+            transition.reward = -(base * role_multiplier * anchored_currency_scale());
             transition.done = false;
             self.deferred_reward_transitions.push(transition);
             actions += 1;

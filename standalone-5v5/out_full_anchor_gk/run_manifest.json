@@ -1,0 +1,11 @@
+{
+  "created_unix_seconds": 1783973738,
+  "git_commit": "559d1f02d605",
+  "config": {"iters":300,"seed":20260710,"games_per_iter":12,"bc_games":12,"bc_epochs":2,"eval_every":5,"eval_games":60,"final_games":300,"display_seed_max":120,"out_dir":"out_full_anchor_gk"},
+  "env": {"SPACING_W": null},
+  "selection": {"best_iter":150,"best_quality":0.825833,"best_cleared_hardening_gates":true,"display_seed":87,"display_seed_matched_filter":true},
+  "scripted_vs_scripted": {"goal_diff":-0.200000,"goals_a":0.180000,"goals_b":0.380000},
+  "untrained": {"goal_diff":-1.060000,"winrate":0.185000,"goals_a":0.000000,"goals_b":1.060000,"spacing":9.934304,"bunch":0.000000,"possession":0.055511,"pass_att":3.190000,"pass_cmp":1.870000,"pass_completion":0.586207,"pass_fwd":2.590000,"pass_lat":0.110000,"pass_back":0.490000,"shots":0.000000,"shots_scored":0.000000,"conversion":0.000000,"turnovers":6.450000,"balls_won":3.360000},
+  "final": {"goal_diff":0.193333,"winrate":0.591667,"goals_a":0.676667,"goals_b":0.483333,"spacing":10.352615,"bunch":0.000000,"possession":0.033237,"pass_att":13.343333,"pass_cmp":9.606667,"pass_completion":0.719960,"pass_fwd":7.666667,"pass_lat":1.706667,"pass_back":3.970000,"shots":1.810000,"shots_scored":0.676667,"conversion":0.373849,"turnovers":3.443333,"balls_won":2.776667},
+  "artifacts": [{"path":"out_full_anchor_gk/actor.txt","bytes":118696,"fnv1a64":"4e4dd349946a5172"},{"path":"out_full_anchor_gk/critic.txt","bytes":200590,"fnv1a64":"889578275bfb2575"},{"path":"out_full_anchor_gk/learning_curve.csv","bytes":9199,"fnv1a64":"5cf018a0604e1938"},{"path":"out_full_anchor_gk/match_before.json","bytes":240750,"fnv1a64":"8e35d54e6f7b68fb"},{"path":"out_full_anchor_gk/match_after.json","bytes":239107,"fnv1a64":"29cb7e60b88d7aee"}]
+}
