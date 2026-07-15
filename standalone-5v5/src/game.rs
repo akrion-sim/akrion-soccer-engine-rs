@@ -2263,7 +2263,7 @@ impl World {
                     // active = shoot-spam farming, not a fresh chance). The genuine
                     // first shot of a buildup is NOT rapid and earns full reward.
                     self.shot_was_rapid_a = self.shoot_cooldown_a > 0;
-                    self.shoot_cooldown_a = 45; // ~2.25 s at 20 Hz before a shot is "fresh" again
+                    self.shoot_cooldown_a = 45; // 3.0 s at the 15 Hz tick before a shot is "fresh" again
                     self.pass_streak_a = 0; // buildup consumed by the shot
                     self.a_shot_flag = true; // this free ball is a valid (2-pass) shot
                     self.a_shot_origin = me; // save model: shot lane starts here
