@@ -46,6 +46,10 @@ fn main() {
             as u64;
         back += (sim.stats.passes_completed_backward_home
             + sim.stats.passes_completed_backward_away) as u64;
+        att_fwd += (sim.stats.passes_attempted_forward_home
+            + sim.stats.passes_attempted_forward_away) as u64;
+        att_back += (sim.stats.passes_attempted_backward_home
+            + sim.stats.passes_attempted_backward_away) as u64;
         if a > 0 {
             per_match_rate.push(c as f64 / a as f64);
         }
