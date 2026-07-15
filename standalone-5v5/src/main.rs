@@ -990,9 +990,11 @@ fn run_training(cfg: &RunConfig) -> AppResult<()> {
     };
     csv.push_str(&csv_row(0, &s0, 0.0, 0.0, 0.0));
 
+    // Header must match the eval row printed below (pass volume/completion and
+    // shots); entropy + value_loss live in learning_curve.csv per-iteration.
     println!(
         "{:>5} | {:>10} | {:>8} | {:>6} {:>6} | {:>6} | {:>6} | {:>7} | {:>9}",
-        "iter", "goal_diff", "winrate", "gA", "gB", "space", "gate", "entropy", "val_loss"
+        "iter", "goal_diff", "winrate", "gA", "gB", "space", "gate", "pass", "shot"
     );
     println!("{}", "-".repeat(80));
 
