@@ -29096,7 +29096,10 @@ impl SoccerMatch {
         true
     }
 
-    fn record_contextual_goal_rewards(
+    // pub(crate) so tests can exercise the contextual-distribution mechanism
+    // directly: the default goal path no longer routes through it (see
+    // `record_goal_rewards` — it is legacy-A/B only there).
+    pub(crate) fn record_contextual_goal_rewards(
         &mut self,
         scoring_team: Team,
         shooter: Option<usize>,
