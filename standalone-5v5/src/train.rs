@@ -214,9 +214,18 @@ fn rw() -> &'static Rw {
         loss_frac: wenv("REW_LOSS_FRAC", 0.5, 0.4, 1.0),
         shot_span: wenv("REW_SHOT_SPAN", 1.0, MIN_REWARD_WEIGHT, 1.5),
         milestone: wenv("REW_MILESTONE", 12.0, MIN_REWARD_WEIGHT, 40.0),
-        pass_credit: wenv("REW_PASS", 2.5, MIN_REWARD_WEIGHT, 25.0),
-        turnover: wenv("REW_TURNOVER", 23.0, MIN_REWARD_WEIGHT, 60.0),
-        bad_pass_turnover: wenv("REW_BAD_PASS_TURNOVER", 15.0, MIN_REWARD_WEIGHT, 30.0),
+        // PASS ECONOMICS: a sensible pass must have POSITIVE expected value or
+        // PPO learns pass-avoidance (measured: the old 2.5/23/15 defaults
+        // collapsed passing from 18.8 attempts/game (71%, healthy fwd/lat/back
+        // mix, untrained) to ~3/game, 97% forward, 60% — the passivity trap).
+        // Targets: ~90% completion overall, ~95% on back passes, ~85% forward;
+        // forward passes still earn much more via the progress bonus, but a
+        // safe outlet is never a mistake. At these defaults a 60%-confidence
+        // forward pass roughly breaks even and an 85% one clearly pays, while
+        // a turnover still stings ~2-4x a completed pass.
+        pass_credit: wenv("REW_PASS", 6.0, MIN_REWARD_WEIGHT, 25.0),
+        turnover: wenv("REW_TURNOVER", 14.0, MIN_REWARD_WEIGHT, 60.0),
+        bad_pass_turnover: wenv("REW_BAD_PASS_TURNOVER", 8.0, MIN_REWARD_WEIGHT, 30.0),
         dribble_turnover: wenv("REW_DRIBBLE_TURNOVER", 25.0, MIN_REWARD_WEIGHT, 30.0),
         recycle: wenv("REW_RECYCLE", 7.5, MIN_REWARD_WEIGHT, 30.0),
         return_pass: wenv("REW_RETURN_PASS", 15.0, MIN_REWARD_WEIGHT, 40.0),
