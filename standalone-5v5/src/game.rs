@@ -1054,7 +1054,7 @@ impl World {
         // old model raced everyone at the constant legacy PLAYER_SPEED, so the
         // belief ignored both skill and fatigue.)
         let race_speed =
-            |p: &Player| (p.top_speed_ref_yps() * p.energy_output_factor()).max(1e-3);
+            |p: &Player| (p.skills.top_speed_ref_yps() * p.energy_output_factor()).max(1e-3);
         let mine = players(team, self);
         let me = mine[idx].pos;
         let my_eta = me.sub(self.intercept_point(me)).len() / race_speed(&mine[idx]);
