@@ -46960,9 +46960,13 @@ fn goal_reward_credits_last_ten_teammates_with_recency_discount() {
 
     assert_eq!(goal_events, 10);
     assert!((attacking_total - GOAL_REWARD_POINTS).abs() < 1e-9);
-    assert!((reward_for(shooter) - GOAL_CHAIN_REWARD_PATTERN[0]).abs() < 1e-9);
-    assert!((reward_for(chain[8]) - GOAL_CHAIN_REWARD_PATTERN[1]).abs() < 1e-9);
-    assert!((reward_for(chain[0]) - GOAL_CHAIN_REWARD_PATTERN[9]).abs() < 1e-9);
+    // The pattern is a recency SHAPE; the recorder normalizes it to the anchor
+    // pool, so each share is GOAL_REWARD_POINTS · weight / pattern_total.
+    let pattern_total = GOAL_CHAIN_REWARD_PATTERN.iter().sum::<f64>();
+    let share = |slot: usize| GOAL_REWARD_POINTS * GOAL_CHAIN_REWARD_PATTERN[slot] / pattern_total;
+    assert!((reward_for(shooter) - share(0)).abs() < 1e-9);
+    assert!((reward_for(chain[8]) - share(1)).abs() < 1e-9);
+    assert!((reward_for(chain[0]) - share(9)).abs() < 1e-9);
     assert!(reward_for(shooter) > reward_for(chain[8]));
     assert!(reward_for(chain[8]) > reward_for(chain[0]));
 }
