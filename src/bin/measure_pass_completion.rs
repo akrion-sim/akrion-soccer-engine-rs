@@ -95,19 +95,28 @@ fn main() {
         fwd as f64 / comp.max(1) as f64
     );
     // Per-direction completion RATES against the training targets
-    // (~85% forward / ~95% backward / ~90% overall). Attempt direction is
-    // classified at launch from the intended target, completion direction from
-    // the actual reception, so a deflected ball can cross buckets — treat the
-    // rates as approximate at the margin.
+    // (~85% forward / ~95% backward / ~90% overall). BOTH sides of each rate
+    // use the LAUNCH-intent classifier (intended target vs origin), so the
+    // ratio is a true rate. The realized-direction line below re-buckets the
+    // same completions by actual reception — the gap between "forward intent"
+    // and "realized forward gain" is the under-hit-forward-ball diagnostic
+    // (receivers checking back to collect shrink realized gain to lateral).
     println!(
-        "DIRECTION RATES: forward {}/{} = {:.4} (target 0.85)  backward {}/{} = {:.4} (target 0.95)  overall {:.4} (target 0.90)",
-        fwd,
+        "DIRECTION RATES (launch-intent): forward {}/{} = {:.4} (target 0.85)  backward {}/{} = {:.4} (target 0.95)  overall {:.4} (target 0.90)",
+        comp_fwd_intent,
         att_fwd,
-        fwd as f64 / att_fwd.max(1) as f64,
-        back,
+        comp_fwd_intent as f64 / att_fwd.max(1) as f64,
+        comp_back_intent,
         att_back,
-        back as f64 / att_back.max(1) as f64,
+        comp_back_intent as f64 / att_back.max(1) as f64,
         rate
+    );
+    println!(
+        "REALIZED direction of completions: forward {} backward {} lateral {} (forward-gain share {:.3})",
+        fwd,
+        back,
+        comp.saturating_sub(fwd + back),
+        fwd as f64 / comp.max(1) as f64
     );
     println!("END");
 }
