@@ -21655,6 +21655,20 @@ pub(crate) fn calibrated_reward_event_amount(
     use std::collections::HashMap;
     use std::sync::OnceLock;
 
+    // THE ANCHORS ARE THE CURRENCY (docs/reward-anchoring.md §1): the goal and
+    // match-result rewards define the unit every other weight is priced in, so
+    // neither the static kind-scales nor a learned contextual calibration may
+    // rescale them. Without this carve-out, `DD_SOCCER_REWARD_KIND_SCALES=
+    // "Goal=0.3"` (or a learned Goal head) could silently move the 500-point
+    // conversion — the exact class of inert/mutable-anchor bug the 2026-07-13
+    // audit found throughout the legacy reward stack.
+    if matches!(
+        kind,
+        SoccerRewardEventKind::Goal | SoccerRewardEventKind::MatchResult
+    ) {
+        return amount;
+    }
+
     static SCALES: OnceLock<HashMap<String, f64>> = OnceLock::new();
     let scales = SCALES.get_or_init(|| {
         parse_reward_kind_scales(
