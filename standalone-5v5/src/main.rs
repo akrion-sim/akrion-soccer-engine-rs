@@ -649,6 +649,11 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
     // worse than the baseline it is supposed to have surpassed.
     let anchor_every = env_usize_clamped("SCRIPTED_ANCHOR_EVERY", 3, 1, 100_000)?;
     let scripted_floor = env_f32_clamped("SCRIPTED_FLOOR", 0.0, -20.0, 20.0)?;
+    // POPULATION KNOBS (AlphaStar league pattern at 5v5 scale): a slice of
+    // self-play iterations spars with retained "exploiter" snapshots, and the
+    // frozen-champion opponent is PFSP-sampled instead of uniform.
+    let exploiter_frac = env_f32_clamped("EXPLOITER_FRAC", 0.15, 0.0, 0.5)?;
+    let pfsp_probe_games = env_usize_clamped("PFSP_PROBE_GAMES", 10, 2, 400)?;
     let speed_warmup = env_usize_clamped(
         "SPEED_WARMUP",
         (cfg.iters / 2).max(1),
