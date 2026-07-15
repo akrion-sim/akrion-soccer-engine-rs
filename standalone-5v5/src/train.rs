@@ -97,6 +97,28 @@ const PASS_PROGRESS_CAP: f32 = 33.0;
 const CHECKPOINT_LINES_Y: [f32; 3] = [FIELD_L * 0.5, FIELD_L * (2.0 / 3.0), FIELD_L - 8.0];
 const CHECKPOINT_FRACTIONS: [f32; 3] = [0.4, 0.67, 1.0];
 const CHECKPOINT_REARM_HYSTERESIS_Y: f32 = 6.0;
+
+/// One tick of the progression-checkpoint state machine (pure, unit-tested):
+/// re-arm any zone the ball has regressed HYSTERESIS below, then — only while
+/// WE control the ball — pay each armed zone whose line the ball has crossed,
+/// disarming it. Returns the fraction-of-`REW_CHECKPOINT` earned this tick.
+fn checkpoint_step(armed: &mut [bool; 3], ball_y: f32, controlled: bool) -> f32 {
+    let mut fraction = 0.0f32;
+    for z in 0..CHECKPOINT_LINES_Y.len() {
+        if !armed[z] && ball_y < CHECKPOINT_LINES_Y[z] - CHECKPOINT_REARM_HYSTERESIS_Y {
+            armed[z] = true;
+        }
+    }
+    if controlled {
+        for z in 0..CHECKPOINT_LINES_Y.len() {
+            if armed[z] && ball_y >= CHECKPOINT_LINES_Y[z] {
+                armed[z] = false;
+                fraction += CHECKPOINT_FRACTIONS[z];
+            }
+        }
+    }
+    fraction
+}
 const FULL_GAME_ACTOR_CREDIT_FRACTION_BOUNDS: (f32, f32) = (0.001, 0.10);
 const LINGER_RADIUS: f32 = 4.0; // "same radius": teammates within this many yards
 /// Overlap zone: two players THIS close are occupying the same spot — that is
