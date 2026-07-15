@@ -25130,8 +25130,8 @@ fn completed_pass_reward_for_pitch(
         // A completed lateral ball keeps possession and may switch the attack, but generic
         // recycle completions must not outscore working the ball into shots — and are NOT scaled.
         (PassDirectionBucket::Lateral, _) => 1.2,
-        (PassDirectionBucket::Backward, true) => -COMPLETED_BACK_PASS_PENALTY_OWN_HALF,
-        (PassDirectionBucket::Backward, false) => -COMPLETED_BACK_PASS_PENALTY_OPPONENT_HALF,
+        (PassDirectionBucket::Backward, true) => COMPLETED_BACK_PASS_REWARD_OWN_HALF,
+        (PassDirectionBucket::Backward, false) => COMPLETED_BACK_PASS_REWARD_OPPONENT_HALF,
     };
     // Flank bonus is unscaled (it applies to forward/lateral alike, so scaling it would re-leak the
     // lever into lateral). Forward magnitude is already scaled inside `base`.
