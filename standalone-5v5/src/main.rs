@@ -589,6 +589,38 @@ fn load_champion_history(dir: &Path) -> AppResult<Vec<(usize, train::Policy)>> {
     Ok(generations)
 }
 
+/// In-memory sparring-pool bounds (disk keeps every promoted generation).
+const MAX_CHAMPION_POOL: usize = 32;
+const MAX_EXPLOITER_POOL: usize = 8;
+
+/// AlphaStar-style "challenge" PFSP weights over the frozen champion pool:
+/// w = p·(1−p) + ε with p = the challenger's tracked payoff vs that champion.
+/// Even matchups (p≈0.5) carry the most learning signal; long-beaten champions
+/// fade instead of diluting training; ε keeps every member reachable so a
+/// forgotten style can resurface.
+fn pfsp_sample_index(
+    history: &[(usize, train::Policy)],
+    payoff: &HashMap<usize, f32>,
+    rng: &mut Rng,
+) -> usize {
+    let mut weights = Vec::with_capacity(history.len());
+    let mut total = 0.0f32;
+    for (generation, _) in history {
+        let p = payoff.get(generation).copied().unwrap_or(0.5).clamp(0.0, 1.0);
+        let w = p * (1.0 - p) + 0.10;
+        total += w;
+        weights.push(w);
+    }
+    let mut t = rng.f01() * total;
+    for (index, w) in weights.iter().enumerate() {
+        t -= w;
+        if t <= 0.0 {
+            return index;
+        }
+    }
+    history.len() - 1
+}
+
 /// Adversarial SELF-PLAY ladder. Both teams are learned policies: a frozen champion
 /// plays Team B while a challenger trains (Team A) against it. Each generation the
 /// challenger is scored head-to-head vs the champion on paired, side-swapped seeds.
