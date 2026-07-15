@@ -47174,7 +47174,7 @@ fn direct_turnover_goal_distributes_full_anchor_pool() {
 }
 
 #[test]
-fn direct_turnover_goal_distributes_only_thirty_points() {
+fn direct_turnover_goal_pays_shooter_full_anchor() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
         seed: 155,
