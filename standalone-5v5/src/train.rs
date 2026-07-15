@@ -87,6 +87,16 @@ const RETURN_NORM: f32 = REW_GOAL_POINTS;
 /// testing the keeper).
 const PASS_PROGRESS_PER_YARD: f32 = 4.2;
 const PASS_PROGRESS_CAP: f32 = 33.0;
+/// One-time progression checkpoints (the Google-Research-Football "checkpoint
+/// reward" pattern): the first CONTROLLED entry into each deeper zone pays
+/// `REW_CHECKPOINT · fraction` once. A zone re-arms only after the ball
+/// regresses HYSTERESIS yards below its line, so a lose-and-regain cycle can't
+/// farm it (the turnover penalty also exceeds the checkpoint sum). This gives
+/// the sparse 500-point goal a gradient bridge: advancing the ball toward goal
+/// pays a little even in games that never convert.
+const CHECKPOINT_LINES_Y: [f32; 3] = [FIELD_L * 0.5, FIELD_L * (2.0 / 3.0), FIELD_L - 8.0];
+const CHECKPOINT_FRACTIONS: [f32; 3] = [0.4, 0.67, 1.0];
+const CHECKPOINT_REARM_HYSTERESIS_Y: f32 = 6.0;
 const FULL_GAME_ACTOR_CREDIT_FRACTION_BOUNDS: (f32, f32) = (0.001, 0.10);
 const LINGER_RADIUS: f32 = 4.0; // "same radius": teammates within this many yards
 /// Overlap zone: two players THIS close are occupying the same spot — that is
