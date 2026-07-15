@@ -19498,8 +19498,9 @@ impl Default for SoccerNeuralLearningConfig {
             // bins and the k8s continuous manifest already forced this on —
             // the code default lagging at `false` meant every LOCAL trainer
             // run silently trained without it (the target_popart=false
-            // inconsistency the 2026-07 audit flagged). Live gameplay
-            // (`main_soccer_live`) still opts out explicitly.
+            // inconsistency the 2026-07 audit flagged). Any consumer can
+            // still opt out via SOCCER_NEURAL_TARGET_POPART=0 (live:
+            // SOCCER_LIVE_NEURAL_TARGET_POPART).
             target_popart_enabled: true,
             snapshot_every_batches: DEFAULT_SOCCER_NEURAL_SNAPSHOT_EVERY_BATCHES,
             lp_coupling_enabled: false,
