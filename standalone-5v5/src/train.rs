@@ -202,6 +202,7 @@ pub struct Rw {
     pub field_burst_delta: f32,    // reward improving forward outlet geometry
     pub stand_pen: f32,            // anti-passivity: penalize the STAND gear off-ball
     pub pursuit: f32,              // LOOSE-BALL: favorite commits to winning a free ball
+    pub checkpoint: f32,           // one-time zone-progression checkpoint (GRF pattern)
 }
 fn rw() -> &'static Rw {
     // Defaults are the validated pre-anchor ratios rescaled into the 500-point
