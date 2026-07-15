@@ -845,12 +845,14 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
             format!("gen{champion_gen}")
         };
         println!(
-            "{round:>4} | gd {:>+6.2} lb {:>+6.2} | gd {:>+6.2} lb {:>+6.2} | {:>9} | {champ_label}",
+            "{round:>4} | gd {:>+6.2} lb {:>+6.2} | gd {:>+6.2} lb {:>+6.2} | {:>9} | {champ_label} (pool {}, expl {})",
             selection_champ.goal_diff,
             selection_champ.goal_diff_lower_95,
             selection_anchor.goal_diff,
             selection_anchor.goal_diff_lower_95,
-            if promoted { "PROMOTED" } else { "hold" }
+            if promoted { "PROMOTED" } else { "hold" },
+            champion_history.len(),
+            exploiters.len()
         );
         let confirmation_champ = confirmation_champ.unwrap_or_default();
         let confirmation_anchor = confirmation_anchor.unwrap_or_default();
