@@ -47209,12 +47209,14 @@ fn direct_turnover_goal_pays_shooter_full_anchor() {
         .into_iter()
         .map(|player_id| reward_for(player_id))
         .sum::<f64>();
-    assert_eq!(reward_for(scorer), DIRECT_TURNOVER_GOAL_REWARD_POINTS);
+    // The steal-and-finish chain contains only the scorer, so the whole
+    // 500-point anchor lands there — teammates who never touched the ball in
+    // the chain get nothing, and the total still equals the anchor exactly.
+    assert_eq!(reward_for(scorer), GOAL_REWARD_POINTS);
     assert_eq!(reward_for(support), 0.0);
     assert_eq!(reward_for(deeper_support), 0.0);
     assert_eq!(reward_for(opponent), 0.0);
-    assert!((attacking_total - DIRECT_TURNOVER_GOAL_REWARD_POINTS).abs() < 1e-9);
-    assert!(attacking_total < GOAL_REWARD_POINTS);
+    assert!((attacking_total - GOAL_REWARD_POINTS).abs() < 1e-9);
 }
 
 #[test]
