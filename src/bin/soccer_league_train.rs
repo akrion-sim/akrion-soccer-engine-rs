@@ -1787,6 +1787,8 @@ fn main() {
                     } else if kpis.goal_diff < 0 {
                         losses += 1;
                     }
+                    let entry = pfsp_goal_diff_ema.entry(fx.opp_idx).or_insert(0.0);
+                    *entry = 0.7 * *entry + 0.3 * f64::from(kpis.goal_diff);
                     round_kpis.add(kpis);
                 }
             }
