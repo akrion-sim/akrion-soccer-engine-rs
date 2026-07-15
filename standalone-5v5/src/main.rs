@@ -19,6 +19,7 @@ mod train;
 
 use game::*;
 use rng::Rng;
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::Write as _;
 use std::fs;
