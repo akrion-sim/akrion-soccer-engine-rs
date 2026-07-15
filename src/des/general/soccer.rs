@@ -24855,14 +24855,28 @@ pub(crate) fn anchored_rewards_enabled() -> bool {
     }
 }
 
-/// The live goal event total: the anchor (500) when anchored, else the
-/// historical hardcoded chain total (160).
+/// The live goal event total. Since the 2026-07-13 constant bump both branches
+/// resolve to 500 (`GOAL_REWARD_POINTS` was raised 160→500), so a conversion
+/// pays the anchor whether or not `DD_SOCCER_ENABLE_ANCHORED_REWARDS` is set;
+/// the gate still controls the wider return clip and shot-anchor behavior.
 pub(crate) fn live_goal_reward_points() -> f64 {
     if anchored_rewards_enabled() {
         ANCHOR_GOAL_POINTS
     } else {
         GOAL_REWARD_POINTS
     }
+}
+
+/// Restores the pre-2026-07 goal-credit stack for A/B comparison ONLY: the
+/// same conversion entering learning through THREE stacked mechanisms (chain
+/// events + a cloned direct-shot transition + the contextual-deferred pool —
+/// ~3× the anchor in total), and steal-and-finish goals discounted to
+/// `DIRECT_TURNOVER_GOAL_REWARD_POINTS`. Default OFF: a conversion pays
+/// exactly ONE `live_goal_reward_points()` pool in every case, which is what
+/// makes the 500-point anchor a dependable constant. See
+/// `World::record_goal_rewards`.
+pub(crate) fn legacy_goal_multi_credit_enabled() -> bool {
+    soccer_env_flag_enabled("DD_SOCCER_ENABLE_LEGACY_GOAL_MULTI_CREDIT")
 }
 
 /// Uniform scale for secondary LIVE reward events under the anchored currency
