@@ -47165,11 +47165,11 @@ fn direct_turnover_goal_distributes_full_anchor_pool() {
     let turnover_total = scoring_total(&[9]);
     let buildup_total = scoring_total(&[5, 7, 9]);
 
-    assert!((turnover_total - DIRECT_TURNOVER_GOAL_REWARD_POINTS).abs() < 1e-9);
+    assert!((turnover_total - GOAL_REWARD_POINTS).abs() < 1e-9);
     assert!((buildup_total - GOAL_REWARD_POINTS).abs() < 1e-9);
     assert!(
-        turnover_total < buildup_total,
-        "a direct-turnover goal must distribute less than a built-up goal"
+        (turnover_total - buildup_total).abs() < 1e-9,
+        "a conversion distributes the same dependable pool however it was created"
     );
 }
 
