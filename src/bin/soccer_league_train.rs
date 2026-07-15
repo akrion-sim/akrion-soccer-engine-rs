@@ -1798,7 +1798,7 @@ fn main() {
             let wins_a = std::sync::atomic::AtomicI32::new(0);
             let losses_a = std::sync::atomic::AtomicI32::new(0);
             let trained_brains = std::sync::Mutex::new(Vec::<TeamBrain>::new());
-            let match_kpis = std::sync::Mutex::new(Vec::<LeagueMatchKpis>::new());
+            let match_kpis = std::sync::Mutex::new(Vec::<(usize, LeagueMatchKpis)>::new());
             std::thread::scope(|scope| {
                 for w in 0..workers {
                     let lo = w * chunk;
