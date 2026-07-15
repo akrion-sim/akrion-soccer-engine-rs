@@ -39323,6 +39323,23 @@ impl SoccerMatch {
         }
     }
 
+    /// Completion counted under the LAUNCH-intent classifier (see the
+    /// `passes_completed_*_intent_*` field docs): completed/attempted per
+    /// direction is only a true rate when both sides use the same bucketing.
+    fn stat_pass_completed_intent_direction(&mut self, team: Team, launch_forward_yards: f64) {
+        if launch_forward_yards > 1.25 {
+            match team {
+                Team::Home => self.stats.passes_completed_forward_intent_home += 1,
+                Team::Away => self.stats.passes_completed_forward_intent_away += 1,
+            }
+        } else if launch_forward_yards < -1.25 {
+            match team {
+                Team::Home => self.stats.passes_completed_backward_intent_home += 1,
+                Team::Away => self.stats.passes_completed_backward_intent_away += 1,
+            }
+        }
+    }
+
     fn stat_intentional_pass_attempt(&mut self, team: Team) {
         match team {
             Team::Home => self.stats.intentional_passes_attempted_home += 1,
