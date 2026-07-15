@@ -100345,3 +100345,68 @@ fn anchored_reward_currency_invariants() {
 
     std::env::remove_var("DD_SOCCER_ENABLE_ANCHORED_REWARDS");
 }
+
+#[test]
+fn goal_pool_is_single_injection_and_calibration_immune() {
+    // 1) One conversion ⇒ exactly ONE anchor pool in Goal-kind reward events —
+    //    no direct-shot clone, no contextual duplicate. (The triple-credit
+    //    stack lives only behind DD_SOCCER_ENABLE_LEGACY_GOAL_MULTI_CREDIT.)
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 954,
+        ..Default::default()
+    });
+    sim.tick = 60;
+    sim.possession_chain.clear();
+    sim.record_possession_touch(5);
+    sim.record_possession_touch(7);
+    sim.record_possession_touch(9);
+    sim.reward_events.clear();
+    sim.deferred_reward_transitions.clear();
+
+    sim.record_goal_rewards(Team::Home, Some(9));
+
+    let goal_total = sim
+        .reward_events
+        .iter()
+        .filter(|event| event.kind == SoccerRewardEventKind::Goal)
+        .map(|event| event.amount)
+        .sum::<f64>();
+    assert!(
+        (goal_total - live_goal_reward_points()).abs() < 1e-9,
+        "the conversion pool must sum to exactly one anchor, got {goal_total}"
+    );
+    assert!(
+        !sim.deferred_reward_transitions
+            .iter()
+            .any(|transition| transition.reward >= live_goal_reward_points() * 0.2),
+        "no deferred goal-credit clones may ride along on the default path"
+    );
+
+    // 2) The anchors are calibration-immune: an explicit Goal/MatchResult
+    //    entry in the kind-scales must not move them (the outer fn's
+    //    carve-out), while ordinary kinds still calibrate through the seam.
+    assert_eq!(
+        calibrated_reward_event_amount(SoccerRewardEventKind::Goal, 500.0, None),
+        500.0
+    );
+    assert_eq!(
+        calibrated_reward_event_amount(SoccerRewardEventKind::MatchResult, -1000.0, None),
+        -1000.0
+    );
+    let mut scales = std::collections::HashMap::new();
+    scales.insert("Goal".to_string(), 0.3);
+    scales.insert("CompletedForwardPass".to_string(), 0.5);
+    let ordinary = calibrated_reward_event_amount_with(
+        SoccerRewardEventKind::CompletedForwardPass,
+        10.0,
+        None,
+        &scales,
+    );
+    assert!((ordinary - 5.0).abs() < 1e-9);
+    // The inner (env-free) fn WOULD rescale a Goal if it reached it — proving
+    // the outer carve-out is what protects the anchor.
+    let goal_if_not_exempt =
+        calibrated_reward_event_amount_with(SoccerRewardEventKind::Goal, 500.0, None, &scales);
+    assert!((goal_if_not_exempt - 150.0).abs() < 1e-9);
+}
