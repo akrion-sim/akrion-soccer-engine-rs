@@ -20515,6 +20515,20 @@ pub struct MatchStats {
     pub intentional_passes_completed_backward_home: u32,
     #[serde(default)]
     pub intentional_passes_completed_backward_away: u32,
+    // Attempted passes split by direction AT LAUNCH (intended target vs origin,
+    // same ±1.25yd lateral deadband as the completion split). Together with the
+    // completed-by-direction counters these give per-direction completion
+    // RATES — the training targets are ~85% forward / ~95% backward (~90%
+    // overall). A deflected ball may complete in a different direction than it
+    // was attempted; rates are therefore approximate at the margin.
+    #[serde(default)]
+    pub passes_attempted_forward_home: u32,
+    #[serde(default)]
+    pub passes_attempted_forward_away: u32,
+    #[serde(default)]
+    pub passes_attempted_backward_home: u32,
+    #[serde(default)]
+    pub passes_attempted_backward_away: u32,
     // Learning-progress pass metrics. Sum of per-pass forward yards over COMPLETED passes
     // (can be negative); divide by passes_completed for the average yards gained per pass.
     #[serde(default)]
