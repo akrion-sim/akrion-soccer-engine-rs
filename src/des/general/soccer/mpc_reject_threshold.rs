@@ -625,10 +625,11 @@ impl SoccerMatch {
         player_id: usize,
         plan: &SoccerLearnedPlan,
     ) {
-        if !mpc_reject_threshold_model_enabled()
-            || self.tick % MPC_REJECT_THRESHOLD_SAMPLE_INTERVAL_TICKS != 0
-            || snapshot.ball.holder != Some(player_id)
-        {
+        // Sample every committed technical decision by the ball carrier. This enqueue
+        // is already invoked only on fresh-decision ticks, so no extra tick-cadence
+        // throttle is applied — an earlier `tick % INTERVAL` gate over-filtered the
+        // already-sparse committed-decision stream down to a near-empty corpus.
+        if !mpc_reject_threshold_model_enabled() || snapshot.ball.holder != Some(player_id) {
             return;
         }
         let Some(player) = snapshot.players.iter().find(|p| p.id == player_id) else {
