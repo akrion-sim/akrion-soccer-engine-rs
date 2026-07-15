@@ -727,14 +727,19 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
             let vs_scripted = it % anchor_every == 0 || champion_history.is_empty();
             let training_opponent = if vs_scripted {
                 None
+            } else if !exploiters.is_empty() && rng.f01() < exploiter_frac {
+                // EXPLOITER slice: anchor-qualified held challengers play
+                // different styles than the champion line — sparring against
+                // them keeps the challenger from overfitting one lineage.
+                Some(exploiters[rng.next_u64() as usize % exploiters.len()].clone())
+            } else if it % 2 == 0 {
+                // Half the self-play iterations face the CURRENT frontier
+                // champion so promotion pressure stays on the gate opponent.
+                Some(champion_history[champion_history.len() - 1].1.clone())
             } else {
-                // Half the self-play iterations face the current champion; the
-                // other half sample the full frozen history.
-                let index = if it % 2 == 0 {
-                    champion_history.len() - 1
-                } else {
-                    rng.next_u64() as usize % champion_history.len()
-                };
+                // The other half PFSP-sample the frozen pool (challenge
+                // weighting — see pfsp_sample_index).
+                let index = pfsp_sample_index(&champion_history, &champion_payoff, &mut rng);
                 Some(champion_history[index].1.clone())
             };
             train::set_selfplay_champion(training_opponent);
