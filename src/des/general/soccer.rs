@@ -21678,6 +21678,18 @@ pub(crate) fn calibrated_reward_event_amount(
                 .unwrap_or(""),
         )
     });
+    calibrated_reward_event_amount_with(kind, amount, whole_field_embedding, scales)
+}
+
+/// Inner, env-free calibration used by [`calibrated_reward_event_amount`] and
+/// unit tests (the outer fn's `OnceLock` snapshot of the env cannot be varied
+/// inside one test process). The anchor carve-out lives in the outer fn.
+pub(crate) fn calibrated_reward_event_amount_with(
+    kind: SoccerRewardEventKind,
+    amount: f64,
+    whole_field_embedding: Option<&[f64]>,
+    scales: &std::collections::HashMap<String, f64>,
+) -> f64 {
     let key = format!("{kind:?}");
     let static_scale = scales.get(&key).copied().unwrap_or(1.0);
     let contextual_scale = reward_context_calibration()
