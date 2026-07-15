@@ -20529,6 +20529,21 @@ pub struct MatchStats {
     pub passes_attempted_backward_home: u32,
     #[serde(default)]
     pub passes_attempted_backward_away: u32,
+    // Completed passes bucketed by the SAME launch-intent classifier as the
+    // attempted-by-direction counters, so completed/attempted per direction is
+    // a true rate. The reception-based completed_forward/backward counters
+    // above measure REALIZED direction instead — the two disagree exactly when
+    // a forward-intent ball completes with the receiver checking back to
+    // collect it (measured 2026-07-15: ~90% forward intent at launch, ~8%
+    // realized forward gain — the under-hit forward ball in one number).
+    #[serde(default)]
+    pub passes_completed_forward_intent_home: u32,
+    #[serde(default)]
+    pub passes_completed_forward_intent_away: u32,
+    #[serde(default)]
+    pub passes_completed_backward_intent_home: u32,
+    #[serde(default)]
+    pub passes_completed_backward_intent_away: u32,
     // Learning-progress pass metrics. Sum of per-pass forward yards over COMPLETED passes
     // (can be negative); divide by passes_completed for the average yards gained per pass.
     #[serde(default)]
