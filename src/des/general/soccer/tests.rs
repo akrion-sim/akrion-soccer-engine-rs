@@ -47502,7 +47502,10 @@ fn direct_turnover_goal_ignores_stale_contextual_credit() {
         .map(|event| event.amount)
         .sum::<f64>();
     assert_eq!(stale_context_total, 0.0);
-    assert!((reward_event_total - DIRECT_TURNOVER_GOAL_REWARD_POINTS).abs() < 1e-9);
+    // Full anchor, single injection: the steal-and-finish chain pays the
+    // shooter the whole 500 pool and never routes through the contextual
+    // distributor, so stale history cannot leak into deferred credit.
+    assert!((reward_event_total - GOAL_REWARD_POINTS).abs() < 1e-9);
     assert!(sim
         .deferred_reward_transitions
         .iter()
