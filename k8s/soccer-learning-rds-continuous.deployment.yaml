@@ -492,16 +492,6 @@ spec:
               value: "true"
             - name: DD_SOCCER_ENABLE_MC_CRITIC_TARGET
               value: "true"
-            - name: DD_SOCCER_ENABLE_DP_BOOTSTRAP
-              value: "true"
-            - name: DD_SOCCER_ENABLE_DP_CRITIC_TARGET
-              value: "true"
-            - name: DD_SOCCER_DP_BOOTSTRAP_HORIZON
-              value: "64"
-            - name: DD_SOCCER_DP_BOOTSTRAP_SWEEPS
-              value: "200"
-            - name: SOCCER_APPROX_DP_POLICY_PRIOR_WEIGHT
-              value: "0.5"
             - name: DD_SOCCER_ENABLE_NEURAL_SELF_BOOTSTRAP
               value: "true"
             - name: DD_SOCCER_ENABLE_MAXA_BOOTSTRAP

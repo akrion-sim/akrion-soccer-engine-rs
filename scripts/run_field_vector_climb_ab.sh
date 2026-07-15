@@ -31,6 +31,7 @@ run_arm() {
   train_log="$RUN_DIR/logs/$arm-train.log"
   eval_log="$RUN_DIR/logs/$arm-eval.log"
 
+  eval_status=0
   env \
     DD_SOCCER_ENABLE_FIELD_VECTOR_V2="$field_v2" \
     DD_SOCCER_ENABLE_CENTRAL_CRITIC_V2="$central_v2" \
@@ -68,14 +69,16 @@ run_arm() {
     SOCCER_EVAL_CANDIDATE_PATH="$eval_frontier" \
     SOCCER_EVAL_PARALLELISM=1 \
     "$ROOT/target/release/soccer_eval_gate_run" \
-      "$EVAL_GAMES" "$EVAL_MINUTES" "$EVAL_POOL" 0 >"$eval_log" 2>&1
+      "$EVAL_GAMES" "$EVAL_MINUTES" "$EVAL_POOL" 0 >"$eval_log" 2>&1 \
+      || eval_status="$?"
+  printf 'eval_exit_status=%s\n' "$eval_status" >>"$eval_log"
 }
 
 run_arm legacy 0 0 24
 run_arm v2 1 1 128
 
 summary="$RUN_DIR/summary.tsv"
-printf 'arm\tfield_vector_v2\tcentral_critic_v2\tactor_hidden\tlast_train_kpi\teval_payoff\twilson_lower\n' >"$summary"
+printf 'arm\tfield_vector_v2\tcentral_critic_v2\tactor_hidden\tlast_train_kpi\teval_payoff\twilson_lower\teval_exit_status\n' >"$summary"
 for arm in legacy v2; do
   if [ "$arm" = legacy ]; then
     fv=0; cv=0; hidden=24
@@ -85,8 +88,9 @@ for arm in legacy v2; do
   train_kpi="$(grep 'league_kpi ' "$RUN_DIR/logs/$arm-train.log" | tail -1 | tr '\t' ' ')"
   payoff="$(grep 'cross-play: mean payoff vs field' "$RUN_DIR/logs/$arm-eval.log" | tail -1 | sed -E 's/.*mean payoff vs field ([^ ]+).*/\1/' || true)"
   wilson="$(grep 'Wilson lower bound:' "$RUN_DIR/logs/$arm-eval.log" | tail -1 | awk '{print $4}' || true)"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$arm" "$fv" "$cv" "$hidden" "$train_kpi" "${payoff:-unknown}" "${wilson:-unknown}" >>"$summary"
+  eval_status="$(grep 'eval_exit_status=' "$RUN_DIR/logs/$arm-eval.log" | tail -1 | cut -d= -f2 || true)"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$arm" "$fv" "$cv" "$hidden" "$train_kpi" "${payoff:-unknown}" "${wilson:-unknown}" "${eval_status:-unknown}" >>"$summary"
 done
 
 printf 'field-vector climb A/B complete: %s\n' "$RUN_DIR"
