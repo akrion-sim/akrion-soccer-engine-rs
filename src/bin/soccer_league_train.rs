@@ -2229,6 +2229,30 @@ mod tests {
     use soccer_engine::des::general::soccer::MatchStats;
     use std::sync::{Mutex, OnceLock};
 
+    #[test]
+    fn pfsp_allocation_preserves_budget_anchor_and_floors() {
+        // 4 pool members + anchor (last): one even matchup (ema 0), one
+        // long-beaten (+5), one losing badly (−5), one unknown-but-tracked 0.8.
+        let gd = [0.0, 5.0, -5.0, 0.8, 0.0];
+        let alloc = pfsp_fixture_allocation(&gd, Some(4), 4);
+        assert_eq!(alloc.iter().sum::<usize>(), 5 * 4, "budget is exact");
+        assert_eq!(alloc[4], 4, "the analytic anchor keeps its full share");
+        assert!(alloc.iter().all(|&games| games >= 1), "coverage floor");
+        assert!(
+            alloc[0] > alloc[1] && alloc[0] > alloc[2],
+            "the even matchup out-draws both solved matchups: {alloc:?}"
+        );
+
+        // No anchor: still exact budget + floors, even weights ⇒ even split.
+        let flat = pfsp_fixture_allocation(&[0.0, 0.0, 0.0], None, 2);
+        assert_eq!(flat.iter().sum::<usize>(), 6);
+        assert!(flat.iter().all(|&games| games == 2), "{flat:?}");
+
+        // Two members, one anchor: the lone pool member absorbs the pool budget.
+        let duo = pfsp_fixture_allocation(&[1.0, 0.0], Some(1), 3);
+        assert_eq!(duo, vec![3, 3]);
+    }
+
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
