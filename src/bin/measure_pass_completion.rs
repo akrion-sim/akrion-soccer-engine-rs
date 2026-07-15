@@ -24,6 +24,7 @@ fn main() {
 
     let (mut att, mut comp, mut fwd, mut back) = (0u64, 0u64, 0u64, 0u64);
     let (mut att_fwd, mut att_back) = (0u64, 0u64);
+    let (mut comp_fwd_intent, mut comp_back_intent) = (0u64, 0u64);
     let mut per_match_rate: Vec<f64> = Vec::new();
 
     for s in 0..seeds {
