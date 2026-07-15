@@ -155,6 +155,78 @@ fn apply_league_actor_config(config: &mut EngineMatchRunnerConfig) -> bool {
     enabled
 }
 
+/// PFSP fixture allocation (pure, unit-tested). Budget = len·games_per_opp,
+/// redistributed over the pool by the AlphaStar "challenge" curve
+/// w = p·(1−p)+ε with p = logistic(goal-diff EMA): even matchups get the most
+/// fixtures, long-beaten members fade. Invariants: the analytic anchor (when
+/// present) keeps EXACTLY its full games_per_opp share, every other member
+/// keeps a coverage floor of 1, and the total always equals the budget.
+fn pfsp_fixture_allocation(
+    gd_ema_by_idx: &[f64],
+    anchor_idx: Option<usize>,
+    games_per_opp: usize,
+) -> Vec<usize> {
+    let members = gd_ema_by_idx.len();
+    let weights: Vec<f64> = (0..members)
+        .map(|idx| {
+            if Some(idx) == anchor_idx {
+                0.0
+            } else {
+                let p = 1.0 / (1.0 + (-gd_ema_by_idx[idx]).exp());
+                p * (1.0 - p) + 0.15
+            }
+        })
+        .collect();
+    let anchor_reserved = anchor_idx.map_or(0, |_| games_per_opp);
+    let pool_budget = members * games_per_opp - anchor_reserved;
+    let pool_members = members - usize::from(anchor_idx.is_some());
+    let weight_total: f64 = weights.iter().sum();
+    let mut alloc: Vec<usize> = (0..members)
+        .map(|idx| {
+            if Some(idx) == anchor_idx {
+                anchor_reserved
+            } else if weight_total > 0.0 {
+                // Coverage floor 1, remainder proportional to weight.
+                let spare = pool_budget.saturating_sub(pool_members) as f64;
+                1 + (spare * weights[idx] / weight_total).round() as usize
+            } else {
+                games_per_opp
+            }
+        })
+        .collect();
+    // Rounding drift: trim/pad against the exact budget, never below the
+    // per-opponent floor of 1 and never off the anchor's reserved share.
+    let mut total: usize = alloc.iter().sum();
+    let budget = members * games_per_opp;
+    while total > budget {
+        if let Some((idx, _)) = alloc
+            .iter()
+            .enumerate()
+            .filter(|(idx, games)| Some(*idx) != anchor_idx && **games > 1)
+            .max_by_key(|(_, games)| **games)
+        {
+            alloc[idx] -= 1;
+            total -= 1;
+        } else {
+            break;
+        }
+    }
+    while total < budget {
+        if let Some((idx, _)) = alloc
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| Some(*idx) != anchor_idx)
+            .min_by_key(|(_, games)| **games)
+        {
+            alloc[idx] += 1;
+            total += 1;
+        } else {
+            break;
+        }
+    }
+    alloc
+}
+
 fn league_worker_count(requested_workers: usize, fixture_count: usize) -> usize {
     let capped = requested_workers.clamp(1, fixture_count.max(1));
     let carries_mpc_head = learned_mpc_objective_enabled() || mpc_reject_threshold_model_enabled();
@@ -1667,65 +1739,10 @@ fn main() {
         let anchor_idx = (self_play_ladder || fixed_analytic_training_anchor)
             .then(|| opponents.len().saturating_sub(1));
         let per_opp_games: Vec<usize> = if pfsp_enabled && opponents.len() > 1 {
-            let weights: Vec<f64> = (0..opponents.len())
-                .map(|idx| {
-                    if Some(idx) == anchor_idx {
-                        0.0
-                    } else {
-                        let gd = pfsp_goal_diff_ema.get(&idx).copied().unwrap_or(0.0);
-                        let p = 1.0 / (1.0 + (-gd).exp());
-                        p * (1.0 - p) + 0.15
-                    }
-                })
+            let gd_by_idx: Vec<f64> = (0..opponents.len())
+                .map(|idx| pfsp_goal_diff_ema.get(&idx).copied().unwrap_or(0.0))
                 .collect();
-            let anchor_reserved = anchor_idx.map_or(0, |_| games_per_opp);
-            let pool_budget = opponents.len() * games_per_opp - anchor_reserved;
-            let pool_members = opponents.len() - usize::from(anchor_idx.is_some());
-            let weight_total: f64 = weights.iter().sum();
-            let mut alloc: Vec<usize> = (0..opponents.len())
-                .map(|idx| {
-                    if Some(idx) == anchor_idx {
-                        anchor_reserved
-                    } else if weight_total > 0.0 {
-                        // Coverage floor 1, remainder proportional to weight.
-                        let spare = pool_budget.saturating_sub(pool_members) as f64;
-                        1 + (spare * weights[idx] / weight_total).round() as usize
-                    } else {
-                        games_per_opp
-                    }
-                })
-                .collect();
-            // Rounding drift: trim/pad against the exact budget, never below
-            // the per-opponent floor of 1.
-            let mut total: usize = alloc.iter().sum();
-            let budget = opponents.len() * games_per_opp;
-            while total > budget {
-                if let Some((idx, _)) = alloc
-                    .iter()
-                    .enumerate()
-                    .filter(|(idx, games)| Some(*idx) != anchor_idx && **games > 1)
-                    .max_by_key(|(_, games)| **games)
-                {
-                    alloc[idx] -= 1;
-                    total -= 1;
-                } else {
-                    break;
-                }
-            }
-            while total < budget {
-                if let Some((idx, _)) = alloc
-                    .iter()
-                    .enumerate()
-                    .filter(|(idx, _)| Some(*idx) != anchor_idx)
-                    .min_by_key(|(_, games)| **games)
-                {
-                    alloc[idx] += 1;
-                    total += 1;
-                } else {
-                    break;
-                }
-            }
-            alloc
+            pfsp_fixture_allocation(&gd_by_idx, anchor_idx, games_per_opp)
         } else {
             vec![games_per_opp; opponents.len()]
         };
@@ -2211,6 +2228,30 @@ mod tests {
     use super::*;
     use soccer_engine::des::general::soccer::MatchStats;
     use std::sync::{Mutex, OnceLock};
+
+    #[test]
+    fn pfsp_allocation_preserves_budget_anchor_and_floors() {
+        // 4 pool members + anchor (last): one even matchup (ema 0), one
+        // long-beaten (+5), one losing badly (−5), one unknown-but-tracked 0.8.
+        let gd = [0.0, 5.0, -5.0, 0.8, 0.0];
+        let alloc = pfsp_fixture_allocation(&gd, Some(4), 4);
+        assert_eq!(alloc.iter().sum::<usize>(), 5 * 4, "budget is exact");
+        assert_eq!(alloc[4], 4, "the analytic anchor keeps its full share");
+        assert!(alloc.iter().all(|&games| games >= 1), "coverage floor");
+        assert!(
+            alloc[0] > alloc[1] && alloc[0] > alloc[2],
+            "the even matchup out-draws both solved matchups: {alloc:?}"
+        );
+
+        // No anchor: still exact budget + floors, even weights ⇒ even split.
+        let flat = pfsp_fixture_allocation(&[0.0, 0.0, 0.0], None, 2);
+        assert_eq!(flat.iter().sum::<usize>(), 6);
+        assert!(flat.iter().all(|&games| games == 2), "{flat:?}");
+
+        // Two members, one anchor: the lone pool member absorbs the pool budget.
+        let duo = pfsp_fixture_allocation(&[1.0, 0.0], Some(1), 3);
+        assert_eq!(duo, vec![3, 3]);
+    }
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();

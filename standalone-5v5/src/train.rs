@@ -97,6 +97,28 @@ const PASS_PROGRESS_CAP: f32 = 33.0;
 const CHECKPOINT_LINES_Y: [f32; 3] = [FIELD_L * 0.5, FIELD_L * (2.0 / 3.0), FIELD_L - 8.0];
 const CHECKPOINT_FRACTIONS: [f32; 3] = [0.4, 0.67, 1.0];
 const CHECKPOINT_REARM_HYSTERESIS_Y: f32 = 6.0;
+
+/// One tick of the progression-checkpoint state machine (pure, unit-tested):
+/// re-arm any zone the ball has regressed HYSTERESIS below, then — only while
+/// WE control the ball — pay each armed zone whose line the ball has crossed,
+/// disarming it. Returns the fraction-of-`REW_CHECKPOINT` earned this tick.
+fn checkpoint_step(armed: &mut [bool; 3], ball_y: f32, controlled: bool) -> f32 {
+    let mut fraction = 0.0f32;
+    for z in 0..CHECKPOINT_LINES_Y.len() {
+        if !armed[z] && ball_y < CHECKPOINT_LINES_Y[z] - CHECKPOINT_REARM_HYSTERESIS_Y {
+            armed[z] = true;
+        }
+    }
+    if controlled {
+        for z in 0..CHECKPOINT_LINES_Y.len() {
+            if armed[z] && ball_y >= CHECKPOINT_LINES_Y[z] {
+                armed[z] = false;
+                fraction += CHECKPOINT_FRACTIONS[z];
+            }
+        }
+    }
+    fraction
+}
 const FULL_GAME_ACTOR_CREDIT_FRACTION_BOUNDS: (f32, f32) = (0.001, 0.10);
 const LINGER_RADIUS: f32 = 4.0; // "same radius": teammates within this many yards
 /// Overlap zone: two players THIS close are occupying the same spot — that is
@@ -828,27 +850,14 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
         if w.ev_win_ball_a {
             r += rw().win_ball * (0.75 + 0.25 * post_field.goalside_score);
         }
-        // PROGRESSION CHECKPOINTS (see CHECKPOINT_LINES_Y): pay each zone once
-        // per advance while we CONTROL the ball there; hysteresis re-arm means
-        // deliberately losing and regaining cannot replay a checkpoint without
-        // the opponent first carrying the ball a real distance backward.
-        for z in 0..CHECKPOINT_LINES_Y.len() {
-            if !checkpoint_armed[z]
-                && w.ball.y < CHECKPOINT_LINES_Y[z] - CHECKPOINT_REARM_HYSTERESIS_Y
-            {
-                checkpoint_armed[z] = true;
-            }
-        }
-        if matches!(w.owner, Some(o) if o.team == Team::A)
-            && w.possession_phase_for(Team::A) == PossessionPhase::Possession
-        {
-            for z in 0..CHECKPOINT_LINES_Y.len() {
-                if checkpoint_armed[z] && w.ball.y >= CHECKPOINT_LINES_Y[z] {
-                    checkpoint_armed[z] = false;
-                    r += rw().checkpoint * CHECKPOINT_FRACTIONS[z];
-                }
-            }
-        }
+        // PROGRESSION CHECKPOINTS (see CHECKPOINT_LINES_Y / checkpoint_step):
+        // pay each zone once per advance while we CONTROL the ball there;
+        // hysteresis re-arm means deliberately losing and regaining cannot
+        // replay a checkpoint without the opponent first carrying the ball a
+        // real distance backward.
+        let checkpoint_controlled = matches!(w.owner, Some(o) if o.team == Team::A)
+            && w.possession_phase_for(Team::A) == PossessionPhase::Possession;
+        r += rw().checkpoint * checkpoint_step(&mut checkpoint_armed, w.ball.y, checkpoint_controlled);
         // dribbling = possessing the ball (less pinball): forward pays, lateral a
         // little. SMALL per-tick — it fires every tick you carry, so a big value
         // accumulates into ball-hoarding that dwarfs goals.
@@ -1860,6 +1869,38 @@ fn shuffle(v: &mut [usize], rng: &mut Rng) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpoint_step_pays_once_and_rearms_only_after_regression() {
+        let mut armed = [true; 3];
+        // Controlled midfield crossing pays zone 0 once, then never re-pays
+        // while the ball stays past the line.
+        let first = checkpoint_step(&mut armed, FIELD_L * 0.5 + 0.1, true);
+        assert!((first - CHECKPOINT_FRACTIONS[0]).abs() < 1e-6);
+        assert_eq!(checkpoint_step(&mut armed, FIELD_L * 0.5 + 0.2, true), 0.0);
+        // A controlled surge deep into the box pays the remaining zones together.
+        let deep = checkpoint_step(&mut armed, FIELD_L - 7.9, true);
+        assert!((deep - (CHECKPOINT_FRACTIONS[1] + CHECKPOINT_FRACTIONS[2])).abs() < 1e-6);
+        // Lose-and-regain at the same depth replays NOTHING (no regression).
+        assert_eq!(checkpoint_step(&mut armed, FIELD_L - 8.0, true), 0.0);
+        // Only real regression re-arms: opponent carries it back below the
+        // midfield line minus the hysteresis, then a fresh controlled entry
+        // pays zone 0 again.
+        assert_eq!(
+            checkpoint_step(
+                &mut armed,
+                FIELD_L * 0.5 - CHECKPOINT_REARM_HYSTERESIS_Y - 0.1,
+                false
+            ),
+            0.0
+        );
+        let repay = checkpoint_step(&mut armed, FIELD_L * 0.5, true);
+        assert!((repay - CHECKPOINT_FRACTIONS[0]).abs() < 1e-6);
+        // Uncontrolled ball position never pays, and never disarms.
+        let mut untouched = [true; 3];
+        assert_eq!(checkpoint_step(&mut untouched, FIELD_L, false), 0.0);
+        assert_eq!(untouched, [true; 3]);
+    }
 
     /// MEASUREMENT probe: the RL BOOTSTRAP chain under exploration noise —
     /// noisy-scripted vs noisy-scripted approximates the warm-started rollout
