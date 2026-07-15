@@ -100093,13 +100093,18 @@ fn same_team_proximity_grace_matches_the_worked_example() {
 #[test]
 fn mpc_reject_threshold_pipeline_collects_and_trains_end_to_end() {
     let build_and_run = || {
+        // Learned-policy inference must be active for the carrier to produce the committed
+        // technical decisions the collector samples (production learner games always are;
+        // `learning_enabled` + installed team policies replicates that here).
         let config = MatchConfig {
             duration_seconds: 20.0,
             seed: 44_101,
+            learning_enabled: true,
             ..MatchConfig::default()
         };
         let total = config.total_ticks();
-        let mut sim = SoccerMatch::default_11v11(config);
+        let mut sim = SoccerMatch::default_11v11(config)
+            .with_team_policies(SoccerTeamQPolicies::new(SoccerQPolicyOptions::default()));
         for _ in 0..total {
             sim.run_time_step();
         }
