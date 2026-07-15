@@ -1870,6 +1870,38 @@ fn shuffle(v: &mut [usize], rng: &mut Rng) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn checkpoint_step_pays_once_and_rearms_only_after_regression() {
+        let mut armed = [true; 3];
+        // Controlled midfield crossing pays zone 0 once, then never re-pays
+        // while the ball stays past the line.
+        let first = checkpoint_step(&mut armed, FIELD_L * 0.5 + 0.1, true);
+        assert!((first - CHECKPOINT_FRACTIONS[0]).abs() < 1e-6);
+        assert_eq!(checkpoint_step(&mut armed, FIELD_L * 0.5 + 0.2, true), 0.0);
+        // A controlled surge deep into the box pays the remaining zones together.
+        let deep = checkpoint_step(&mut armed, FIELD_L - 7.9, true);
+        assert!((deep - (CHECKPOINT_FRACTIONS[1] + CHECKPOINT_FRACTIONS[2])).abs() < 1e-6);
+        // Lose-and-regain at the same depth replays NOTHING (no regression).
+        assert_eq!(checkpoint_step(&mut armed, FIELD_L - 8.0, true), 0.0);
+        // Only real regression re-arms: opponent carries it back below the
+        // midfield line minus the hysteresis, then a fresh controlled entry
+        // pays zone 0 again.
+        assert_eq!(
+            checkpoint_step(
+                &mut armed,
+                FIELD_L * 0.5 - CHECKPOINT_REARM_HYSTERESIS_Y - 0.1,
+                false
+            ),
+            0.0
+        );
+        let repay = checkpoint_step(&mut armed, FIELD_L * 0.5, true);
+        assert!((repay - CHECKPOINT_FRACTIONS[0]).abs() < 1e-6);
+        // Uncontrolled ball position never pays, and never disarms.
+        let mut untouched = [true; 3];
+        assert_eq!(checkpoint_step(&mut untouched, FIELD_L, false), 0.0);
+        assert_eq!(untouched, [true; 3]);
+    }
+
     /// MEASUREMENT probe: the RL BOOTSTRAP chain under exploration noise —
     /// noisy-scripted vs noisy-scripted approximates the warm-started rollout
     /// regime (BC clone ~ scripted + sampling noise). Reports the pass ->
