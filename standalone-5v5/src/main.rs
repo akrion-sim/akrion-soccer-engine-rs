@@ -759,6 +759,12 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
         };
         let selection_anchor =
             train::evaluate_vs_scripted_paired(&challenger, cfg.eval_games, &mut rng);
+        // The selection eval doubles as the PFSP payoff observation for the
+        // current champion (the opponent it just measured against).
+        if let Some((generation, _)) = champion_history.last() {
+            let entry = champion_payoff.entry(*generation).or_insert(0.5);
+            *entry = 0.5 * *entry + 0.5 * selection_champ.payoff;
+        }
         let selection_passed = selection_champ.goal_diff_lower_95 >= promote_margin
             && selection_anchor.goal_diff_lower_95 >= scripted_floor;
         let confirmation_champ = selection_passed.then(|| match &champion {
