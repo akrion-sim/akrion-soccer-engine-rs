@@ -871,18 +871,23 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
         // advanced the ball 5+ yards upfield (pointless tapping in place).
         if w.ev_return_pass_a {
             let k = w.return_streak_a;
-            let mut pen = if k <= 1 {
-                rw().return_pass
-            } else {
-                rw().return_pass * 2f32.powi((k - 1) as i32)
-            };
-            if w.ball.y - w.return_start_x < 5.0 {
-                pen += rw().return_stale; // no upfield progress -> heavier
+            // The FIRST return (A→B→A, streak 1) is free — a give-and-go or a
+            // safe outlet back to the giver is legitimate football and the
+            // 95%-completion back-pass target depends on it never being taxed.
+            // (The old code penalized streak 1 despite its own comment saying
+            // one return is fine — that taxed every safe recycle and helped
+            // train pass-avoidance.) From the SECOND consecutive return the
+            // exchange is ping-pong and the penalty escalates.
+            if k >= 2 {
+                let mut pen = rw().return_pass * 2f32.powi((k - 2) as i32);
+                if w.ball.y - w.return_start_x < 5.0 {
+                    pen += rw().return_stale; // no upfield progress -> heavier
+                }
+                pen *= 1.0 + 0.50 * pre_field.safe_outlet_value + 0.50 * pre_field.return_stale;
+                // Cap at the non-conversion ceiling (0.40·goal): the escalation must
+                // sting, but no single shaping event may rival scoring.
+                r -= pen.min(REW_GOAL_POINTS * REWARD_NON_CONVERSION_MAX_FRACTION);
             }
-            pen *= 1.0 + 0.50 * pre_field.safe_outlet_value + 0.50 * pre_field.return_stale;
-            // Cap at the non-conversion ceiling (0.40·goal): the escalation must
-            // sting, but no single shaping event may rival scoring.
-            r -= pen.min(REW_GOAL_POINTS * REWARD_NON_CONVERSION_MAX_FRACTION);
         }
 
         r += rw().field_goalside_delta
