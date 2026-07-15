@@ -787,11 +787,57 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
             champion_gen += 1;
             save_policy(&challenger, &champ_dir.join(format!("gen{champion_gen}")))?;
             champion_history.push((champion_gen, challenger.clone()));
+            champion_payoff.insert(champion_gen, 0.5);
+            if champion_history.len() > MAX_CHAMPION_POOL {
+                // Evict the most-beaten member of the OLDER half (highest
+                // payoff EMA): hard/even sparring partners and the recent
+                // frontier stay; a long-solved style goes. Its snapshot
+                // remains on disk under champions/.
+                let half = (champion_history.len() / 2).max(1);
+                let evict = champion_history[..half]
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, (ga, _)), (_, (gb, _))| {
+                        let pa = champion_payoff.get(ga).copied().unwrap_or(0.5);
+                        let pb = champion_payoff.get(gb).copied().unwrap_or(0.5);
+                        pa.total_cmp(&pb)
+                    })
+                    .map(|(index, _)| index)
+                    .unwrap_or(0);
+                champion_history.remove(evict);
+            }
         } else {
+            if selection_anchor.goal_diff_lower_95 >= scripted_floor {
+                // ANCHOR-QUALIFIED held challenger: it clears the scripted
+                // floor but not the champion gate. Retain it as a sparring
+                // exploiter instead of discarding the style it found — the
+                // population keeps non-transitive answers the champion line
+                // alone would forget.
+                exploiters.push(challenger.clone());
+                if exploiters.len() > MAX_EXPLOITER_POOL {
+                    exploiters.remove(0);
+                }
+            }
             // A held candidate is not the next generation's starting point. Reset
             // to the protected champion (or the coherent gen-0 warm start) so
             // rejected gradient drift cannot accumulate across rounds.
             challenger = champion.clone().unwrap_or(round_start);
+        }
+        // Refresh PFSP estimates with cheap paired probes vs a couple of pool
+        // members, so sampling weights track the CURRENT challenger.
+        if champion_history.len() > 1 {
+            for _ in 0..2 {
+                let index = rng.next_u64() as usize % (champion_history.len() - 1);
+                let (generation, opponent) = &champion_history[index];
+                let probe = train::evaluate_vs_policy_paired(
+                    &challenger,
+                    opponent,
+                    pfsp_probe_games,
+                    &mut rng,
+                );
+                let entry = champion_payoff.entry(*generation).or_insert(0.5);
+                *entry = 0.5 * *entry + 0.5 * probe.payoff;
+            }
         }
         let champ_label = if champion_gen == 0 {
             "scripted".to_string()
