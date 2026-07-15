@@ -850,27 +850,14 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
         if w.ev_win_ball_a {
             r += rw().win_ball * (0.75 + 0.25 * post_field.goalside_score);
         }
-        // PROGRESSION CHECKPOINTS (see CHECKPOINT_LINES_Y): pay each zone once
-        // per advance while we CONTROL the ball there; hysteresis re-arm means
-        // deliberately losing and regaining cannot replay a checkpoint without
-        // the opponent first carrying the ball a real distance backward.
-        for z in 0..CHECKPOINT_LINES_Y.len() {
-            if !checkpoint_armed[z]
-                && w.ball.y < CHECKPOINT_LINES_Y[z] - CHECKPOINT_REARM_HYSTERESIS_Y
-            {
-                checkpoint_armed[z] = true;
-            }
-        }
-        if matches!(w.owner, Some(o) if o.team == Team::A)
-            && w.possession_phase_for(Team::A) == PossessionPhase::Possession
-        {
-            for z in 0..CHECKPOINT_LINES_Y.len() {
-                if checkpoint_armed[z] && w.ball.y >= CHECKPOINT_LINES_Y[z] {
-                    checkpoint_armed[z] = false;
-                    r += rw().checkpoint * CHECKPOINT_FRACTIONS[z];
-                }
-            }
-        }
+        // PROGRESSION CHECKPOINTS (see CHECKPOINT_LINES_Y / checkpoint_step):
+        // pay each zone once per advance while we CONTROL the ball there;
+        // hysteresis re-arm means deliberately losing and regaining cannot
+        // replay a checkpoint without the opponent first carrying the ball a
+        // real distance backward.
+        let checkpoint_controlled = matches!(w.owner, Some(o) if o.team == Team::A)
+            && w.possession_phase_for(Team::A) == PossessionPhase::Possession;
+        r += rw().checkpoint * checkpoint_step(&mut checkpoint_armed, w.ball.y, checkpoint_controlled);
         // dribbling = possessing the ball (less pinball): forward pays, lateral a
         // little. SMALL per-tick — it fires every tick you carry, so a big value
         // accumulates into ball-hoarding that dwarfs goals.
