@@ -1293,12 +1293,18 @@ const FIRST_TIME_SHORT_FORWARD_PASS_MIN_PROGRESS_YARDS: f64 = 1.25;
 const FIRST_TIME_SHORT_FORWARD_PASS_MIN_YARDS: f64 = 5.47;
 const FIRST_TIME_SHORT_FORWARD_PASS_IDEAL_MAX_YARDS: f64 = 8.75;
 const FIRST_TIME_SHORT_FORWARD_PASS_TAPER_YARDS: f64 = 8.0;
-// A completed back pass KEEPS possession, so it must still beat a turnover, but it should
-// no longer look like an attractive default recycle. Penalize it enough that safe lateral
-// and forward options win clearly, with own-half retreats stinging more because they move
-// the ball back toward danger. Pressure-relief escapes are still handled separately.
-const COMPLETED_BACK_PASS_PENALTY_OWN_HALF: f64 = 4.0;
-const COMPLETED_BACK_PASS_PENALTY_OPPONENT_HALF: f64 = 3.4;
+// A completed back pass KEEPS possession — the safest ball in football and the
+// outlet the ~95%-completion backward-pass target depends on. It earns a SMALL
+// positive reward: penalizing a SUCCESSFUL retention pass (the old −4.0/−3.4)
+// taught pass-avoidance — the policy stopped playing backward at all rather
+// than risk the tax, which capped overall completion. The ordering the learner
+// sees is forward ≫ lateral > backward > 0 ≫ turnover; recycle abuse is
+// policed by the dedicated machinery (backward-pass discipline gate, the
+// anti-recycle levers), not by taxing success. Opponent-half recycles earn
+// slightly more than own-half retreats (restarting the attack near the box
+// beats moving the ball back toward danger).
+const COMPLETED_BACK_PASS_REWARD_OWN_HALF: f64 = 0.6;
+const COMPLETED_BACK_PASS_REWARD_OPPONENT_HALF: f64 = 0.9;
 const COMPLETED_DANGEROUS_CROSS_BONUS_POINTS: f64 = 3.8;
 const COMPLETED_CROSS_MAX_BONUS_POINTS: f64 = 5.0;
 // Through-balls (killer passes) are the one user-named penetration pattern that did NOT get a new
