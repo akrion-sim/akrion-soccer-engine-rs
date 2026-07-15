@@ -11920,9 +11920,10 @@ fn completed_pass_reward_values_flank_usage_more_in_own_half() {
 #[test]
 fn reward_shaping_values_retention_over_forcing_a_turnover() {
     // The overnight learners must prefer KEEPING the ball to gambling it forward into a
-    // turnover. This locks in the rebalanced signal: a safe lateral ball is positively
-    // rewarded, a safe backward ball is meaningfully penalized, and either is still
-    // preferable to the turnover cost the learners apply on losing the ball.
+    // turnover. This locks in the rebalanced signal: every SUCCESSFUL retention pass is
+    // positive (backward included — the ~95%-backward-completion target depends on the
+    // safest ball never being taxed for succeeding), ordered backward < lateral, and
+    // either far preferable to the turnover cost the learners apply on losing the ball.
     let field_length = 120.0;
     let lateral = completed_pass_reward(
         Team::Home,
