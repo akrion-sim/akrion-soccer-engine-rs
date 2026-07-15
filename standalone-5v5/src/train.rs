@@ -856,7 +856,11 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
             // Forward carrying, scaled by the field-vector context: worth most in
             // our own half (progression is the carry's job there), tapering in
             // the final third where shooting/box-passing outrank it.
-            r += rw().dribble * dribble_field_context(w.ball.x);
+            // NB: the context is a function of UPFIELD progress — ball.y under
+            // the x=width/y=length convention (ball.x here was the axis-flip
+            // bug: it made the carry reward depend on which sideline the ball
+            // was near instead of distance to goal).
+            r += rw().dribble * dribble_field_context(w.ball.y);
         }
         // (lateral dribble: no flat reward — potential shaping handles real progress)
         // Dispossessed while carrying is handled by ev_dribble_turnover_a above,
