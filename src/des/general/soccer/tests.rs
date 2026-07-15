@@ -47136,10 +47136,11 @@ fn out_of_play_missed_shot_records_attempt_and_accuracy_penalty() {
 }
 
 #[test]
-fn direct_turnover_goal_distributes_reduced_reward_pool() {
-    // A goal where only a single scoring-team player touched the ball since
-    // winning it from the opponent is a direct turnover: it distributes only the
-    // reduced 30-point pool, while a built-up finish keeps the normal chain pool.
+fn direct_turnover_goal_distributes_full_anchor_pool() {
+    // THE CONVERSION ANCHOR IS A CONSTANT: a steal-and-finish goal pays the
+    // same 500-point pool as a built-up finish (docs/reward-anchoring.md §1).
+    // The legacy reduced turnover pool exists only behind
+    // DD_SOCCER_ENABLE_LEGACY_GOAL_MULTI_CREDIT.
     let scoring_total = |scoring_touches: &[usize]| -> f64 {
         let mut sim = SoccerMatch::default_11v11(MatchConfig {
             duration_seconds: 0.1,
