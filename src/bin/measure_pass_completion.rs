@@ -89,5 +89,20 @@ fn main() {
         "forward completed = {fwd}  backward completed = {back}  forward-share = {:.3}",
         fwd as f64 / comp.max(1) as f64
     );
+    // Per-direction completion RATES against the training targets
+    // (~85% forward / ~95% backward / ~90% overall). Attempt direction is
+    // classified at launch from the intended target, completion direction from
+    // the actual reception, so a deflected ball can cross buckets — treat the
+    // rates as approximate at the margin.
+    println!(
+        "DIRECTION RATES: forward {}/{} = {:.4} (target 0.85)  backward {}/{} = {:.4} (target 0.95)  overall {:.4} (target 0.90)",
+        fwd,
+        att_fwd,
+        fwd as f64 / att_fwd.max(1) as f64,
+        back,
+        att_back,
+        back as f64 / att_back.max(1) as f64,
+        rate
+    );
     println!("END");
 }
