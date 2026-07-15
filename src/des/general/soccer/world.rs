@@ -29096,7 +29096,10 @@ impl SoccerMatch {
         true
     }
 
-    fn record_contextual_goal_rewards(
+    // pub(crate) so tests can exercise the contextual-distribution mechanism
+    // directly: the default goal path no longer routes through it (see
+    // `record_goal_rewards` — it is legacy-A/B only there).
+    pub(crate) fn record_contextual_goal_rewards(
         &mut self,
         scoring_team: Team,
         shooter: Option<usize>,
@@ -29325,31 +29328,64 @@ impl SoccerMatch {
             shooter,
             BUILDUP_CHAIN_CREDIT_GOAL_BASE_POINTS,
         );
-        if let Some(reward_points) =
-            self.direct_turnover_goal_reward_points(scoring_team, shooter, previous_touch_team)
-        {
-            self.record_possession_reward_pattern_with_kind(
-                scoring_team,
-                shooter,
-                &[reward_points],
-                SoccerRewardEventKind::Goal,
-            );
-            if let Some(shooter) = shooter {
-                self.queue_direct_shot_outcome_learning_credit(
-                    shooter,
+        if legacy_goal_multi_credit_enabled() {
+            // A/B-ONLY legacy stack (see `legacy_goal_multi_credit_enabled`):
+            // turnover goals pay a reduced pool, and a built-up goal enters
+            // learning through THREE stacked mechanisms — chain events, a
+            // cloned direct-shot transition, and the contextual-deferred pool
+            // — so the same conversion counted ~3× the anchor in total.
+            if let Some(reward_points) =
+                self.direct_turnover_goal_reward_points(scoring_team, shooter, previous_touch_team)
+            {
+                self.record_possession_reward_pattern_with_kind(
                     scoring_team,
-                    reward_points,
+                    shooter,
+                    &[reward_points],
                     SoccerRewardEventKind::Goal,
+                );
+                if let Some(shooter) = shooter {
+                    self.queue_direct_shot_outcome_learning_credit(
+                        shooter,
+                        scoring_team,
+                        reward_points,
+                        SoccerRewardEventKind::Goal,
+                    );
+                }
+            } else {
+                self.record_weighted_possession_chain_reward_at_with_kind(
+                    self.tick,
+                    scoring_team,
+                    shooter,
+                    live_goal_reward_points(),
+                    &GOAL_CHAIN_REWARD_PATTERN,
+                    SoccerRewardEventKind::Goal,
+                );
+                if let Some(shooter) = shooter {
+                    self.queue_direct_shot_outcome_learning_credit(
+                        shooter,
+                        scoring_team,
+                        live_goal_reward_points(),
+                        SoccerRewardEventKind::Goal,
+                    );
+                }
+                self.record_contextual_goal_rewards(
+                    scoring_team,
+                    shooter,
+                    live_goal_reward_points(),
                 );
             }
         } else {
-            debug_assert!(
-                (GOAL_CHAIN_REWARD_PATTERN.iter().sum::<f64>() - GOAL_REWARD_POINTS).abs() < 1e-9
-            );
-            // The chain recorder normalizes the pattern, so the anchored goal
-            // total (500) distributes over the same chain shape (docs/
-            // reward-anchoring.md — the live goal was previously the hardcoded
-            // 160 regardless of DD_SOCCER_GOAL_REWARD_SCALE).
+            // THE CONVERSION ANCHOR (docs/reward-anchoring.md §1): every goal —
+            // steal-and-finish included — pays exactly ONE
+            // `live_goal_reward_points()` (500) pool, distributed over the
+            // scoring possession chain. The recorder normalizes the pattern
+            // weights, so the distributed credit sums to the pool EXACTLY and
+            // "a conversion is worth 500" is a constant the learner can bank
+            // on. A direct-turnover chain contains only the shooter, so the
+            // whole pool lands there — the old 250 discount is gone; the
+            // recency pattern already handles how little the rest of the team
+            // contributed. (`direct_turnover_goal_reward_points` remains for
+            // the legacy A/B branch above.)
             self.record_weighted_possession_chain_reward_at_with_kind(
                 self.tick,
                 scoring_team,
@@ -29358,15 +29394,6 @@ impl SoccerMatch {
                 &GOAL_CHAIN_REWARD_PATTERN,
                 SoccerRewardEventKind::Goal,
             );
-            if let Some(shooter) = shooter {
-                self.queue_direct_shot_outcome_learning_credit(
-                    shooter,
-                    scoring_team,
-                    live_goal_reward_points(),
-                    SoccerRewardEventKind::Goal,
-                );
-            }
-            self.record_contextual_goal_rewards(scoring_team, shooter, live_goal_reward_points());
         }
         self.update_mpc_latent_objective(scoring_team, None, Some(1.0), Some(1.0));
         self.record_recent_defensive_goal_penalties(scoring_team.other());
@@ -33332,6 +33359,9 @@ impl SoccerMatch {
                     self.pending_shot = None;
                     self.record_possession_touch(player_id);
                     self.stat_pass_attempt(player_team);
+                    let attempt_forward_yards =
+                        (release_target.y - player_pos.y) * player_team.attack_dir();
+                    self.stat_pass_attempt_direction(player_team, attempt_forward_yards);
                     if intentional_distinct_target {
                         self.stat_intentional_pass_attempt(player_team);
                     }
@@ -36851,6 +36881,9 @@ impl SoccerMatch {
                                 .unwrap_or(self.ball.position.y);
                             let forward_yards = (reception_y - pass.origin.y) * team.attack_dir();
                             self.stat_pass_completed_direction(team, forward_yards);
+                            let launch_forward_yards =
+                                (pass.intended_target.y - pass.origin.y) * team.attack_dir();
+                            self.stat_pass_completed_intent_direction(team, launch_forward_yards);
                             if pass.target.is_some_and(|target| target != pass.from) {
                                 self.stat_intentional_pass_completed_direction(team, forward_yards);
                                 self.stat_intentional_pass_completed(team);
@@ -39272,6 +39305,41 @@ impl SoccerMatch {
         match team {
             Team::Home => self.stats.passes_attempted_home += 1,
             Team::Away => self.stats.passes_attempted_away += 1,
+        }
+    }
+
+    /// Record the direction of a pass ATTEMPT at launch (intended target vs
+    /// origin, ±1.25yd lateral deadband — mirrors
+    /// `stat_pass_completed_direction`) so per-direction completion RATES are
+    /// measurable, not only the completed-pass direction mix.
+    fn stat_pass_attempt_direction(&mut self, team: Team, forward_yards: f64) {
+        if forward_yards > 1.25 {
+            match team {
+                Team::Home => self.stats.passes_attempted_forward_home += 1,
+                Team::Away => self.stats.passes_attempted_forward_away += 1,
+            }
+        } else if forward_yards < -1.25 {
+            match team {
+                Team::Home => self.stats.passes_attempted_backward_home += 1,
+                Team::Away => self.stats.passes_attempted_backward_away += 1,
+            }
+        }
+    }
+
+    /// Completion counted under the LAUNCH-intent classifier (see the
+    /// `passes_completed_*_intent_*` field docs): completed/attempted per
+    /// direction is only a true rate when both sides use the same bucketing.
+    fn stat_pass_completed_intent_direction(&mut self, team: Team, launch_forward_yards: f64) {
+        if launch_forward_yards > 1.25 {
+            match team {
+                Team::Home => self.stats.passes_completed_forward_intent_home += 1,
+                Team::Away => self.stats.passes_completed_forward_intent_away += 1,
+            }
+        } else if launch_forward_yards < -1.25 {
+            match team {
+                Team::Home => self.stats.passes_completed_backward_intent_home += 1,
+                Team::Away => self.stats.passes_completed_backward_intent_away += 1,
+            }
         }
     }
 

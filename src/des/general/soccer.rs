@@ -1293,12 +1293,18 @@ const FIRST_TIME_SHORT_FORWARD_PASS_MIN_PROGRESS_YARDS: f64 = 1.25;
 const FIRST_TIME_SHORT_FORWARD_PASS_MIN_YARDS: f64 = 5.47;
 const FIRST_TIME_SHORT_FORWARD_PASS_IDEAL_MAX_YARDS: f64 = 8.75;
 const FIRST_TIME_SHORT_FORWARD_PASS_TAPER_YARDS: f64 = 8.0;
-// A completed back pass KEEPS possession, so it must still beat a turnover, but it should
-// no longer look like an attractive default recycle. Penalize it enough that safe lateral
-// and forward options win clearly, with own-half retreats stinging more because they move
-// the ball back toward danger. Pressure-relief escapes are still handled separately.
-const COMPLETED_BACK_PASS_PENALTY_OWN_HALF: f64 = 4.0;
-const COMPLETED_BACK_PASS_PENALTY_OPPONENT_HALF: f64 = 3.4;
+// A completed back pass KEEPS possession — the safest ball in football and the
+// outlet the ~95%-completion backward-pass target depends on. It earns a SMALL
+// positive reward: penalizing a SUCCESSFUL retention pass (the old −4.0/−3.4)
+// taught pass-avoidance — the policy stopped playing backward at all rather
+// than risk the tax, which capped overall completion. The ordering the learner
+// sees is forward ≫ lateral > backward > 0 ≫ turnover; recycle abuse is
+// policed by the dedicated machinery (backward-pass discipline gate, the
+// anti-recycle levers), not by taxing success. Opponent-half recycles earn
+// slightly more than own-half retreats (restarting the attack near the box
+// beats moving the ball back toward danger).
+const COMPLETED_BACK_PASS_REWARD_OWN_HALF: f64 = 0.6;
+const COMPLETED_BACK_PASS_REWARD_OPPONENT_HALF: f64 = 0.9;
 const COMPLETED_DANGEROUS_CROSS_BONUS_POINTS: f64 = 3.8;
 const COMPLETED_CROSS_MAX_BONUS_POINTS: f64 = 5.0;
 // Through-balls (killer passes) are the one user-named penetration pattern that did NOT get a new
@@ -19491,7 +19497,17 @@ impl Default for SoccerNeuralLearningConfig {
             replay_capacity: DEFAULT_SOCCER_NEURAL_REPLAY_CAPACITY,
             replay_samples_per_tick: DEFAULT_SOCCER_NEURAL_REPLAY_SAMPLES_PER_TICK,
             target_clip: DEFAULT_SOCCER_NEURAL_TARGET_CLIP,
-            target_popart_enabled: false,
+            // PopArt ON by default: value-target normalization is one of the
+            // two "always helpful" MAPPO levers (the other is per-batch
+            // advantage normalization), and the 1000-point win / 500-point
+            // goal anchors need an adaptive critic scale. The league/ratchet
+            // bins and the k8s continuous manifest already forced this on —
+            // the code default lagging at `false` meant every LOCAL trainer
+            // run silently trained without it (the target_popart=false
+            // inconsistency the 2026-07 audit flagged). Any consumer can
+            // still opt out via SOCCER_NEURAL_TARGET_POPART=0 (live:
+            // SOCCER_LIVE_NEURAL_TARGET_POPART).
+            target_popart_enabled: true,
             snapshot_every_batches: DEFAULT_SOCCER_NEURAL_SNAPSHOT_EVERY_BATCHES,
             lp_coupling_enabled: false,
             critic_baseline_weight: 0.0,
@@ -20499,6 +20515,35 @@ pub struct MatchStats {
     pub intentional_passes_completed_backward_home: u32,
     #[serde(default)]
     pub intentional_passes_completed_backward_away: u32,
+    // Attempted passes split by direction AT LAUNCH (intended target vs origin,
+    // same ±1.25yd lateral deadband as the completion split). Together with the
+    // completed-by-direction counters these give per-direction completion
+    // RATES — the training targets are ~85% forward / ~95% backward (~90%
+    // overall). A deflected ball may complete in a different direction than it
+    // was attempted; rates are therefore approximate at the margin.
+    #[serde(default)]
+    pub passes_attempted_forward_home: u32,
+    #[serde(default)]
+    pub passes_attempted_forward_away: u32,
+    #[serde(default)]
+    pub passes_attempted_backward_home: u32,
+    #[serde(default)]
+    pub passes_attempted_backward_away: u32,
+    // Completed passes bucketed by the SAME launch-intent classifier as the
+    // attempted-by-direction counters, so completed/attempted per direction is
+    // a true rate. The reception-based completed_forward/backward counters
+    // above measure REALIZED direction instead — the two disagree exactly when
+    // a forward-intent ball completes with the receiver checking back to
+    // collect it (measured 2026-07-15: ~90% forward intent at launch, ~8%
+    // realized forward gain — the under-hit forward ball in one number).
+    #[serde(default)]
+    pub passes_completed_forward_intent_home: u32,
+    #[serde(default)]
+    pub passes_completed_forward_intent_away: u32,
+    #[serde(default)]
+    pub passes_completed_backward_intent_home: u32,
+    #[serde(default)]
+    pub passes_completed_backward_intent_away: u32,
     // Learning-progress pass metrics. Sum of per-pass forward yards over COMPLETED passes
     // (can be negative); divide by passes_completed for the average yards gained per pass.
     #[serde(default)]
@@ -21655,6 +21700,20 @@ pub(crate) fn calibrated_reward_event_amount(
     use std::collections::HashMap;
     use std::sync::OnceLock;
 
+    // THE ANCHORS ARE THE CURRENCY (docs/reward-anchoring.md §1): the goal and
+    // match-result rewards define the unit every other weight is priced in, so
+    // neither the static kind-scales nor a learned contextual calibration may
+    // rescale them. Without this carve-out, `DD_SOCCER_REWARD_KIND_SCALES=
+    // "Goal=0.3"` (or a learned Goal head) could silently move the 500-point
+    // conversion — the exact class of inert/mutable-anchor bug the 2026-07-13
+    // audit found throughout the legacy reward stack.
+    if matches!(
+        kind,
+        SoccerRewardEventKind::Goal | SoccerRewardEventKind::MatchResult
+    ) {
+        return amount;
+    }
+
     static SCALES: OnceLock<HashMap<String, f64>> = OnceLock::new();
     let scales = SCALES.get_or_init(|| {
         parse_reward_kind_scales(
@@ -21664,6 +21723,18 @@ pub(crate) fn calibrated_reward_event_amount(
                 .unwrap_or(""),
         )
     });
+    calibrated_reward_event_amount_with(kind, amount, whole_field_embedding, scales)
+}
+
+/// Inner, env-free calibration used by [`calibrated_reward_event_amount`] and
+/// unit tests (the outer fn's `OnceLock` snapshot of the env cannot be varied
+/// inside one test process). The anchor carve-out lives in the outer fn.
+pub(crate) fn calibrated_reward_event_amount_with(
+    kind: SoccerRewardEventKind,
+    amount: f64,
+    whole_field_embedding: Option<&[f64]>,
+    scales: &std::collections::HashMap<String, f64>,
+) -> f64 {
     let key = format!("{kind:?}");
     let static_scale = scales.get(&key).copied().unwrap_or(1.0);
     let contextual_scale = reward_context_calibration()
@@ -23362,9 +23433,21 @@ pub(crate) fn dd_soccer_dp_bootstrap_sweeps() -> usize {
 /// (default) is byte-identical. Complements the DP bootstrap: DP sharpens the target signal,
 /// standardization makes the net actually use it.
 pub(crate) fn dd_soccer_enable_target_standardization() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_TARGET_STANDARDIZATION"))
+    // Default-ON in production (the value-head-collapse fix; the league bin,
+    // ratchet bin, and the k8s continuous manifest all forced it on already —
+    // this closes the gap for every other trainer). `=0` remains the kill
+    // switch. Tests stay default-OFF and env-driven so the byte-identical
+    // parity suite is unchanged.
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_TARGET_STANDARDIZATION")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_TARGET_STANDARDIZATION"))
+    }
 }
 
 /// Append-only structured action-parameter feature block (priority-1 Part A): fills the
@@ -24841,14 +24924,28 @@ pub(crate) fn anchored_rewards_enabled() -> bool {
     }
 }
 
-/// The live goal event total: the anchor (500) when anchored, else the
-/// historical hardcoded chain total (160).
+/// The live goal event total. Since the 2026-07-13 constant bump both branches
+/// resolve to 500 (`GOAL_REWARD_POINTS` was raised 160→500), so a conversion
+/// pays the anchor whether or not `DD_SOCCER_ENABLE_ANCHORED_REWARDS` is set;
+/// the gate still controls the wider return clip and shot-anchor behavior.
 pub(crate) fn live_goal_reward_points() -> f64 {
     if anchored_rewards_enabled() {
         ANCHOR_GOAL_POINTS
     } else {
         GOAL_REWARD_POINTS
     }
+}
+
+/// Restores the pre-2026-07 goal-credit stack for A/B comparison ONLY: the
+/// same conversion entering learning through THREE stacked mechanisms (chain
+/// events + a cloned direct-shot transition + the contextual-deferred pool —
+/// ~3× the anchor in total), and steal-and-finish goals discounted to
+/// `DIRECT_TURNOVER_GOAL_REWARD_POINTS`. Default OFF: a conversion pays
+/// exactly ONE `live_goal_reward_points()` pool in every case, which is what
+/// makes the 500-point anchor a dependable constant. See
+/// `World::record_goal_rewards`.
+pub(crate) fn legacy_goal_multi_credit_enabled() -> bool {
+    soccer_env_flag_enabled("DD_SOCCER_ENABLE_LEGACY_GOAL_MULTI_CREDIT")
 }
 
 /// Uniform scale for secondary LIVE reward events under the anchored currency
@@ -25062,8 +25159,8 @@ fn completed_pass_reward_for_pitch(
         // A completed lateral ball keeps possession and may switch the attack, but generic
         // recycle completions must not outscore working the ball into shots — and are NOT scaled.
         (PassDirectionBucket::Lateral, _) => 1.2,
-        (PassDirectionBucket::Backward, true) => -COMPLETED_BACK_PASS_PENALTY_OWN_HALF,
-        (PassDirectionBucket::Backward, false) => -COMPLETED_BACK_PASS_PENALTY_OPPONENT_HALF,
+        (PassDirectionBucket::Backward, true) => COMPLETED_BACK_PASS_REWARD_OWN_HALF,
+        (PassDirectionBucket::Backward, false) => COMPLETED_BACK_PASS_REWARD_OPPONENT_HALF,
     };
     // Flank bonus is unscaled (it applies to forward/lateral alike, so scaling it would re-leak the
     // lever into lateral). Forward magnitude is already scaled inside `base`.

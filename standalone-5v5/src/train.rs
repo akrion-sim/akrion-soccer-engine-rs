@@ -87,6 +87,16 @@ const RETURN_NORM: f32 = REW_GOAL_POINTS;
 /// testing the keeper).
 const PASS_PROGRESS_PER_YARD: f32 = 4.2;
 const PASS_PROGRESS_CAP: f32 = 33.0;
+/// One-time progression checkpoints (the Google-Research-Football "checkpoint
+/// reward" pattern): the first CONTROLLED entry into each deeper zone pays
+/// `REW_CHECKPOINT · fraction` once. A zone re-arms only after the ball
+/// regresses HYSTERESIS yards below its line, so a lose-and-regain cycle can't
+/// farm it (the turnover penalty also exceeds the checkpoint sum). This gives
+/// the sparse 500-point goal a gradient bridge: advancing the ball toward goal
+/// pays a little even in games that never convert.
+const CHECKPOINT_LINES_Y: [f32; 3] = [FIELD_L * 0.5, FIELD_L * (2.0 / 3.0), FIELD_L - 8.0];
+const CHECKPOINT_FRACTIONS: [f32; 3] = [0.4, 0.67, 1.0];
+const CHECKPOINT_REARM_HYSTERESIS_Y: f32 = 6.0;
 const FULL_GAME_ACTOR_CREDIT_FRACTION_BOUNDS: (f32, f32) = (0.001, 0.10);
 const LINGER_RADIUS: f32 = 4.0; // "same radius": teammates within this many yards
 /// Overlap zone: two players THIS close are occupying the same spot — that is
@@ -192,6 +202,7 @@ pub struct Rw {
     pub field_burst_delta: f32,    // reward improving forward outlet geometry
     pub stand_pen: f32,            // anti-passivity: penalize the STAND gear off-ball
     pub pursuit: f32,              // LOOSE-BALL: favorite commits to winning a free ball
+    pub checkpoint: f32,           // one-time zone-progression checkpoint (GRF pattern)
 }
 fn rw() -> &'static Rw {
     // Defaults are the validated pre-anchor ratios rescaled into the 500-point
@@ -203,9 +214,18 @@ fn rw() -> &'static Rw {
         loss_frac: wenv("REW_LOSS_FRAC", 0.5, 0.4, 1.0),
         shot_span: wenv("REW_SHOT_SPAN", 1.0, MIN_REWARD_WEIGHT, 1.5),
         milestone: wenv("REW_MILESTONE", 12.0, MIN_REWARD_WEIGHT, 40.0),
-        pass_credit: wenv("REW_PASS", 2.5, MIN_REWARD_WEIGHT, 25.0),
-        turnover: wenv("REW_TURNOVER", 23.0, MIN_REWARD_WEIGHT, 60.0),
-        bad_pass_turnover: wenv("REW_BAD_PASS_TURNOVER", 15.0, MIN_REWARD_WEIGHT, 30.0),
+        // PASS ECONOMICS: a sensible pass must have POSITIVE expected value or
+        // PPO learns pass-avoidance (measured: the old 2.5/23/15 defaults
+        // collapsed passing from 18.8 attempts/game (71%, healthy fwd/lat/back
+        // mix, untrained) to ~3/game, 97% forward, 60% — the passivity trap).
+        // Targets: ~90% completion overall, ~95% on back passes, ~85% forward;
+        // forward passes still earn much more via the progress bonus, but a
+        // safe outlet is never a mistake. At these defaults a 60%-confidence
+        // forward pass roughly breaks even and an 85% one clearly pays, while
+        // a turnover still stings ~2-4x a completed pass.
+        pass_credit: wenv("REW_PASS", 6.0, MIN_REWARD_WEIGHT, 25.0),
+        turnover: wenv("REW_TURNOVER", 14.0, MIN_REWARD_WEIGHT, 60.0),
+        bad_pass_turnover: wenv("REW_BAD_PASS_TURNOVER", 8.0, MIN_REWARD_WEIGHT, 30.0),
         dribble_turnover: wenv("REW_DRIBBLE_TURNOVER", 25.0, MIN_REWARD_WEIGHT, 30.0),
         recycle: wenv("REW_RECYCLE", 7.5, MIN_REWARD_WEIGHT, 30.0),
         return_pass: wenv("REW_RETURN_PASS", 15.0, MIN_REWARD_WEIGHT, 40.0),
@@ -229,6 +249,10 @@ fn rw() -> &'static Rw {
         field_burst_delta: wenv("W_FIELD_BURST_DELTA", 3.3, MIN_REWARD_WEIGHT, 15.0),
         stand_pen: wenv("W_STAND_PEN", 0.8, MIN_REWARD_WEIGHT, 8.0),
         pursuit: wenv("W_PURSUIT", 2.1, MIN_REWARD_WEIGHT, 10.0),
+        // Full-strength final checkpoint (box entry) = 15 = 3% of a goal; the
+        // three zones together pay at most 31 per possession-cycle — a bridge
+        // to the goal anchor, never a rival for it.
+        checkpoint: wenv("REW_CHECKPOINT", 15.0, MIN_REWARD_WEIGHT, 40.0),
     })
 }
 // The speed policy is a low-variance REFINEMENT on top of the action policy —
@@ -627,6 +651,9 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
     let deferred_credit_fraction = deferred_action_credit_fraction();
     let mut pending_pass_launch_step: Option<usize> = None;
     let mut pending_shot_launch_step: Option<usize> = None;
+    // Progression checkpoints: all armed at kickoff; each zone re-arms only
+    // after the ball regresses below its line by the hysteresis margin.
+    let mut checkpoint_armed = [true; 3];
 
     for step in 0..STEPS {
         let mut obs_t = [[0.0f32; OBS_DIM]; N];
@@ -801,6 +828,27 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
         if w.ev_win_ball_a {
             r += rw().win_ball * (0.75 + 0.25 * post_field.goalside_score);
         }
+        // PROGRESSION CHECKPOINTS (see CHECKPOINT_LINES_Y): pay each zone once
+        // per advance while we CONTROL the ball there; hysteresis re-arm means
+        // deliberately losing and regaining cannot replay a checkpoint without
+        // the opponent first carrying the ball a real distance backward.
+        for z in 0..CHECKPOINT_LINES_Y.len() {
+            if !checkpoint_armed[z]
+                && w.ball.y < CHECKPOINT_LINES_Y[z] - CHECKPOINT_REARM_HYSTERESIS_Y
+            {
+                checkpoint_armed[z] = true;
+            }
+        }
+        if matches!(w.owner, Some(o) if o.team == Team::A)
+            && w.possession_phase_for(Team::A) == PossessionPhase::Possession
+        {
+            for z in 0..CHECKPOINT_LINES_Y.len() {
+                if checkpoint_armed[z] && w.ball.y >= CHECKPOINT_LINES_Y[z] {
+                    checkpoint_armed[z] = false;
+                    r += rw().checkpoint * CHECKPOINT_FRACTIONS[z];
+                }
+            }
+        }
         // dribbling = possessing the ball (less pinball): forward pays, lateral a
         // little. SMALL per-tick — it fires every tick you carry, so a big value
         // accumulates into ball-hoarding that dwarfs goals.
@@ -808,7 +856,11 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
             // Forward carrying, scaled by the field-vector context: worth most in
             // our own half (progression is the carry's job there), tapering in
             // the final third where shooting/box-passing outrank it.
-            r += rw().dribble * dribble_field_context(w.ball.x);
+            // NB: the context is a function of UPFIELD progress — ball.y under
+            // the x=width/y=length convention (ball.x here was the axis-flip
+            // bug: it made the carry reward depend on which sideline the ball
+            // was near instead of distance to goal).
+            r += rw().dribble * dribble_field_context(w.ball.y);
         }
         // (lateral dribble: no flat reward — potential shaping handles real progress)
         // Dispossessed while carrying is handled by ev_dribble_turnover_a above,
@@ -819,18 +871,23 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
         // advanced the ball 5+ yards upfield (pointless tapping in place).
         if w.ev_return_pass_a {
             let k = w.return_streak_a;
-            let mut pen = if k <= 1 {
-                rw().return_pass
-            } else {
-                rw().return_pass * 2f32.powi((k - 1) as i32)
-            };
-            if w.ball.y - w.return_start_x < 5.0 {
-                pen += rw().return_stale; // no upfield progress -> heavier
+            // The FIRST return (A→B→A, streak 1) is free — a give-and-go or a
+            // safe outlet back to the giver is legitimate football and the
+            // 95%-completion back-pass target depends on it never being taxed.
+            // (The old code penalized streak 1 despite its own comment saying
+            // one return is fine — that taxed every safe recycle and helped
+            // train pass-avoidance.) From the SECOND consecutive return the
+            // exchange is ping-pong and the penalty escalates.
+            if k >= 2 {
+                let mut pen = rw().return_pass * 2f32.powi((k - 2) as i32);
+                if w.ball.y - w.return_start_x < 5.0 {
+                    pen += rw().return_stale; // no upfield progress -> heavier
+                }
+                pen *= 1.0 + 0.50 * pre_field.safe_outlet_value + 0.50 * pre_field.return_stale;
+                // Cap at the non-conversion ceiling (0.40·goal): the escalation must
+                // sting, but no single shaping event may rival scoring.
+                r -= pen.min(REW_GOAL_POINTS * REWARD_NON_CONVERSION_MAX_FRACTION);
             }
-            pen *= 1.0 + 0.50 * pre_field.safe_outlet_value + 0.50 * pre_field.return_stale;
-            // Cap at the non-conversion ceiling (0.40·goal): the escalation must
-            // sting, but no single shaping event may rival scoring.
-            r -= pen.min(REW_GOAL_POINTS * REWARD_NON_CONVERSION_MAX_FRACTION);
         }
 
         r += rw().field_goalside_delta

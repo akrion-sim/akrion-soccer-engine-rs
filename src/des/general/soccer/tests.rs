@@ -11920,9 +11920,10 @@ fn completed_pass_reward_values_flank_usage_more_in_own_half() {
 #[test]
 fn reward_shaping_values_retention_over_forcing_a_turnover() {
     // The overnight learners must prefer KEEPING the ball to gambling it forward into a
-    // turnover. This locks in the rebalanced signal: a safe lateral ball is positively
-    // rewarded, a safe backward ball is meaningfully penalized, and either is still
-    // preferable to the turnover cost the learners apply on losing the ball.
+    // turnover. This locks in the rebalanced signal: every SUCCESSFUL retention pass is
+    // positive (backward included — the ~95%-backward-completion target depends on the
+    // safest ball never being taxed for succeeding), ordered backward < lateral, and
+    // either far preferable to the turnover cost the learners apply on losing the ball.
     let field_length = 120.0;
     let lateral = completed_pass_reward(
         Team::Home,
@@ -11944,8 +11945,8 @@ fn reward_shaping_values_retention_over_forcing_a_turnover() {
         "a safe lateral retention pass must be rewarded, not near-worthless: {lateral}"
     );
     assert!(
-        backward <= -COMPLETED_BACK_PASS_PENALTY_OPPONENT_HALF && backward > -4.0,
-        "a safe backward pass should be penalized without becoming worse than a turnover: {backward}"
+        backward > 0.0 && backward < lateral,
+        "a safe backward pass keeps possession: small positive, below lateral: backward={backward} lateral={lateral}"
     );
     assert!(
         turnover_cost >= 12.0,
@@ -46960,9 +46961,13 @@ fn goal_reward_credits_last_ten_teammates_with_recency_discount() {
 
     assert_eq!(goal_events, 10);
     assert!((attacking_total - GOAL_REWARD_POINTS).abs() < 1e-9);
-    assert!((reward_for(shooter) - GOAL_CHAIN_REWARD_PATTERN[0]).abs() < 1e-9);
-    assert!((reward_for(chain[8]) - GOAL_CHAIN_REWARD_PATTERN[1]).abs() < 1e-9);
-    assert!((reward_for(chain[0]) - GOAL_CHAIN_REWARD_PATTERN[9]).abs() < 1e-9);
+    // The pattern is a recency SHAPE; the recorder normalizes it to the anchor
+    // pool, so each share is GOAL_REWARD_POINTS · weight / pattern_total.
+    let pattern_total = GOAL_CHAIN_REWARD_PATTERN.iter().sum::<f64>();
+    let share = |slot: usize| GOAL_REWARD_POINTS * GOAL_CHAIN_REWARD_PATTERN[slot] / pattern_total;
+    assert!((reward_for(shooter) - share(0)).abs() < 1e-9);
+    assert!((reward_for(chain[8]) - share(1)).abs() < 1e-9);
+    assert!((reward_for(chain[0]) - share(9)).abs() < 1e-9);
     assert!(reward_for(shooter) > reward_for(chain[8]));
     assert!(reward_for(chain[8]) > reward_for(chain[0]));
 }
@@ -47136,10 +47141,11 @@ fn out_of_play_missed_shot_records_attempt_and_accuracy_penalty() {
 }
 
 #[test]
-fn direct_turnover_goal_distributes_reduced_reward_pool() {
-    // A goal where only a single scoring-team player touched the ball since
-    // winning it from the opponent is a direct turnover: it distributes only the
-    // reduced 30-point pool, while a built-up finish keeps the normal chain pool.
+fn direct_turnover_goal_distributes_full_anchor_pool() {
+    // THE CONVERSION ANCHOR IS A CONSTANT: a steal-and-finish goal pays the
+    // same 500-point pool as a built-up finish (docs/reward-anchoring.md §1).
+    // The legacy reduced turnover pool exists only behind
+    // DD_SOCCER_ENABLE_LEGACY_GOAL_MULTI_CREDIT.
     let scoring_total = |scoring_touches: &[usize]| -> f64 {
         let mut sim = SoccerMatch::default_11v11(MatchConfig {
             duration_seconds: 0.1,
@@ -47164,16 +47170,16 @@ fn direct_turnover_goal_distributes_reduced_reward_pool() {
     let turnover_total = scoring_total(&[9]);
     let buildup_total = scoring_total(&[5, 7, 9]);
 
-    assert!((turnover_total - DIRECT_TURNOVER_GOAL_REWARD_POINTS).abs() < 1e-9);
+    assert!((turnover_total - GOAL_REWARD_POINTS).abs() < 1e-9);
     assert!((buildup_total - GOAL_REWARD_POINTS).abs() < 1e-9);
     assert!(
-        turnover_total < buildup_total,
-        "a direct-turnover goal must distribute less than a built-up goal"
+        (turnover_total - buildup_total).abs() < 1e-9,
+        "a conversion distributes the same dependable pool however it was created"
     );
 }
 
 #[test]
-fn direct_turnover_goal_distributes_only_thirty_points() {
+fn direct_turnover_goal_pays_shooter_full_anchor() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
         seed: 155,
@@ -47208,12 +47214,14 @@ fn direct_turnover_goal_distributes_only_thirty_points() {
         .into_iter()
         .map(|player_id| reward_for(player_id))
         .sum::<f64>();
-    assert_eq!(reward_for(scorer), DIRECT_TURNOVER_GOAL_REWARD_POINTS);
+    // The steal-and-finish chain contains only the scorer, so the whole
+    // 500-point anchor lands there — teammates who never touched the ball in
+    // the chain get nothing, and the total still equals the anchor exactly.
+    assert_eq!(reward_for(scorer), GOAL_REWARD_POINTS);
     assert_eq!(reward_for(support), 0.0);
     assert_eq!(reward_for(deeper_support), 0.0);
     assert_eq!(reward_for(opponent), 0.0);
-    assert!((attacking_total - DIRECT_TURNOVER_GOAL_REWARD_POINTS).abs() < 1e-9);
-    assert!(attacking_total < GOAL_REWARD_POINTS);
+    assert!((attacking_total - GOAL_REWARD_POINTS).abs() < 1e-9);
 }
 
 #[test]
@@ -47338,7 +47346,10 @@ fn goal_reward_contextualizes_recent_attacking_decisions() {
     let before = WorldSnapshot::from_match(&sim);
     push_contextual_goal_credit_history(&mut sim, &before);
 
-    sim.record_goal_rewards(Team::Home, Some(9));
+    // The default goal path is a SINGLE chain injection; the contextual
+    // distributor is exercised directly here (in the live stack it only runs
+    // under DD_SOCCER_ENABLE_LEGACY_GOAL_MULTI_CREDIT).
+    sim.record_contextual_goal_rewards(Team::Home, Some(9), live_goal_reward_points());
 
     let total = sim
         .deferred_reward_transitions
@@ -47492,7 +47503,10 @@ fn direct_turnover_goal_ignores_stale_contextual_credit() {
         .map(|event| event.amount)
         .sum::<f64>();
     assert_eq!(stale_context_total, 0.0);
-    assert!((reward_event_total - DIRECT_TURNOVER_GOAL_REWARD_POINTS).abs() < 1e-9);
+    // Full anchor, single injection: the steal-and-finish chain pays the
+    // shooter the whole 500 pool and never routes through the contextual
+    // distributor, so stale history cannot leak into deferred credit.
+    assert!((reward_event_total - GOAL_REWARD_POINTS).abs() < 1e-9);
     assert!(sim
         .deferred_reward_transitions
         .iter()
@@ -100334,4 +100348,69 @@ fn anchored_reward_currency_invariants() {
     assert!((ANCHOR_GOAL_POINTS - 10.0 * ANCHOR_ON_FRAME_SHOT_FLOOR).abs() < 1e-9);
 
     std::env::remove_var("DD_SOCCER_ENABLE_ANCHORED_REWARDS");
+}
+
+#[test]
+fn goal_pool_is_single_injection_and_calibration_immune() {
+    // 1) One conversion ⇒ exactly ONE anchor pool in Goal-kind reward events —
+    //    no direct-shot clone, no contextual duplicate. (The triple-credit
+    //    stack lives only behind DD_SOCCER_ENABLE_LEGACY_GOAL_MULTI_CREDIT.)
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 954,
+        ..Default::default()
+    });
+    sim.tick = 60;
+    sim.possession_chain.clear();
+    sim.record_possession_touch(5);
+    sim.record_possession_touch(7);
+    sim.record_possession_touch(9);
+    sim.reward_events.clear();
+    sim.deferred_reward_transitions.clear();
+
+    sim.record_goal_rewards(Team::Home, Some(9));
+
+    let goal_total = sim
+        .reward_events
+        .iter()
+        .filter(|event| event.kind == SoccerRewardEventKind::Goal)
+        .map(|event| event.amount)
+        .sum::<f64>();
+    assert!(
+        (goal_total - live_goal_reward_points()).abs() < 1e-9,
+        "the conversion pool must sum to exactly one anchor, got {goal_total}"
+    );
+    assert!(
+        !sim.deferred_reward_transitions
+            .iter()
+            .any(|transition| transition.reward >= live_goal_reward_points() * 0.2),
+        "no deferred goal-credit clones may ride along on the default path"
+    );
+
+    // 2) The anchors are calibration-immune: an explicit Goal/MatchResult
+    //    entry in the kind-scales must not move them (the outer fn's
+    //    carve-out), while ordinary kinds still calibrate through the seam.
+    assert_eq!(
+        calibrated_reward_event_amount(SoccerRewardEventKind::Goal, 500.0, None),
+        500.0
+    );
+    assert_eq!(
+        calibrated_reward_event_amount(SoccerRewardEventKind::MatchResult, -1000.0, None),
+        -1000.0
+    );
+    let mut scales = std::collections::HashMap::new();
+    scales.insert("Goal".to_string(), 0.3);
+    scales.insert("CompletedForwardPass".to_string(), 0.5);
+    let ordinary = calibrated_reward_event_amount_with(
+        SoccerRewardEventKind::CompletedForwardPass,
+        10.0,
+        None,
+        &scales,
+    );
+    assert!((ordinary - 5.0).abs() < 1e-9);
+    // The inner (env-free) fn WOULD rescale a Goal if it reached it — proving
+    // the outer carve-out is what protects the anchor.
+    let goal_if_not_exempt =
+        calibrated_reward_event_amount_with(SoccerRewardEventKind::Goal, 500.0, None, &scales);
+    assert!((goal_if_not_exempt - 150.0).abs() < 1e-9);
 }

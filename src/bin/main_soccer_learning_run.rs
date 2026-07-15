@@ -11237,9 +11237,19 @@ fn run() -> Result<(), Box<dyn Error>> {
             evolution_window_games,
         );
         let completed_after_batch = episode_summaries.len();
+        // EVIDENCE-WINDOW GUARD: evolution may only fire on a FULL sample
+        // window. The bare `completed_after_batch >= games` final-batch bypass
+        // used to let a 1-game run mutate tactical weights from a single
+        // sample whenever the promotion gate was disabled or its floor
+        // lowered (witnessed: attack width 0.680→1.180 after one match). The
+        // promotion gate (min_sample_games) remains the second line of
+        // defense; this makes the trigger itself structurally incapable of
+        // single-sample evolution. Runs shorter than the window never evolve
+        // — by design: less than a window of evidence is not evidence.
+        let evolution_window_full = evolution_search_samples.len() >= evolution_window_games;
         let should_evolve = evolution_enabled
             && !completed_games.is_empty()
-            && !evolution_search_samples.is_empty()
+            && evolution_window_full
             && (completed_after_batch >= games
                 || completed_after_batch % evolution_interval_games == 0);
         if should_evolve {
