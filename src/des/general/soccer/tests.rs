@@ -11945,8 +11945,8 @@ fn reward_shaping_values_retention_over_forcing_a_turnover() {
         "a safe lateral retention pass must be rewarded, not near-worthless: {lateral}"
     );
     assert!(
-        backward <= -COMPLETED_BACK_PASS_PENALTY_OPPONENT_HALF && backward > -4.0,
-        "a safe backward pass should be penalized without becoming worse than a turnover: {backward}"
+        backward > 0.0 && backward < lateral,
+        "a safe backward pass keeps possession: small positive, below lateral: backward={backward} lateral={lateral}"
     );
     assert!(
         turnover_cost >= 12.0,
