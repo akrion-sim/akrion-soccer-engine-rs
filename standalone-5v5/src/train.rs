@@ -651,6 +651,9 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
     let deferred_credit_fraction = deferred_action_credit_fraction();
     let mut pending_pass_launch_step: Option<usize> = None;
     let mut pending_shot_launch_step: Option<usize> = None;
+    // Progression checkpoints: all armed at kickoff; each zone re-arms only
+    // after the ball regresses below its line by the hysteresis margin.
+    let mut checkpoint_armed = [true; 3];
 
     for step in 0..STEPS {
         let mut obs_t = [[0.0f32; OBS_DIM]; N];
