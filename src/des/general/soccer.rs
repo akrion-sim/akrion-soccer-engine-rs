@@ -4548,6 +4548,15 @@ const SOCCER_NEURAL_FIELD_MOTION_DIM_V1: usize = (SOCCER_NEURAL_FIELD_MOTION_PLA
 const SOCCER_NEURAL_FIELD_MOTION_DIM: usize = (SOCCER_NEURAL_FIELD_MOTION_PLAYERS
     + SOCCER_NEURAL_FIELD_MOTION_BALLS)
     * SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER;
+/// Actor-independent, fixed-frame input for the centralized value baseline:
+/// the same 22 players + ball at every decision in a tick, plus eight match-state
+/// channels. This is deliberately separate from the actor/POMDP motion block.
+const SOCCER_CENTRAL_CRITIC_ENTITY_DIM: usize = SOCCER_NEURAL_FIELD_MOTION_DIM;
+const SOCCER_CENTRAL_CRITIC_GLOBAL_DIM: usize = 8;
+const SOCCER_CENTRAL_CRITIC_FEATURE_DIM: usize =
+    SOCCER_CENTRAL_CRITIC_ENTITY_DIM + SOCCER_CENTRAL_CRITIC_GLOBAL_DIM;
+const SOCCER_CENTRAL_CRITIC_HIDDEN_UNITS: usize = 128;
+const SOCCER_CENTRAL_CRITIC_LEARNING_RATE: f64 = 0.015;
 const SOCCER_NEURAL_FIELD_MOTION_TAIL_START_V1: usize =
     SOCCER_NEURAL_BASE_FEATURE_DIM + SOCCER_NEURAL_FIELD_MOTION_DIM_V1;
 const SOCCER_NEURAL_FIELD_MOTION_TAIL_START: usize =
@@ -5662,7 +5671,10 @@ const SOCCER_POLICY_ASSIGNED_POSITION_DIM: usize = SOCCER_ASSIGNED_POSITION_COUN
 const SOCCER_POLICY_FEATURE_DIM: usize = SOCCER_NEURAL_FEATURE_DIM
     + SOCCER_POLICY_ROLE_EMBEDDING_DIM
     + SOCCER_POLICY_ASSIGNED_POSITION_DIM;
-const DEFAULT_SOCCER_POLICY_HIDDEN_UNITS: usize = 24;
+// The 24-unit trunk was narrower than the 635-wide state input by more than 26x
+// and repeatedly plateaued. Existing 24-unit snapshots widen function-preservingly
+// on restore; set SOCCER_POLICY_HIDDEN_UNITS=24 for the controlled legacy arm.
+const DEFAULT_SOCCER_POLICY_HIDDEN_UNITS: usize = 128;
 const MIN_SOCCER_POLICY_HIDDEN_UNITS: usize = 8;
 const MAX_SOCCER_POLICY_HIDDEN_UNITS: usize = 512;
 const SOCCER_POLICY_LEARNING_RATE: f64 = 0.05;
@@ -8419,6 +8431,13 @@ pub struct SoccerDecisionContext {
     /// each decision on every player's grid spot + smooth motion vector.
     #[serde(default)]
     pub field_player_motion: Vec<f32>,
+    /// Actor-independent, Home-canonical whole-pitch state used only by the
+    /// centralized value baseline. Every actor at a tick receives identical bytes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub central_critic_state: Vec<f32>,
+    /// The matching actor-independent state after the action, used for value targets.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub next_central_critic_state: Vec<f32>,
     /// Bayesian opponent-press belief summary (length `SOCCER_NEURAL_OPP_BELIEF_DIM`): nearest /
     /// mean / max centered press tendency of nearby opponents + belief coverage. Lets the neural
     /// value/critic and policy learn to exploit a passive marker or respect a proven aggressor,
@@ -26470,6 +26489,14 @@ fn soccer_field_player_motion_block(
     // +y is always the actor team's attack direction; x is mirrored with it so left/right
     // is consistent for both teams (a 180° rotation for the side defending +y).
     let dir = actor_team.attack_dir();
+    let relative_kinematics = dd_soccer_enable_field_vector_v2();
+    let actor_velocity = snapshot
+        .player_velocity(actor_id)
+        .unwrap_or_else(Vec2::zero);
+    let actor_acceleration = snapshot
+        .player_acceleration(actor_id)
+        .unwrap_or_else(Vec2::zero);
+    let actor_jerk = snapshot.player_jerk(actor_id).unwrap_or_else(Vec2::zero);
     let mut ordered: Vec<(usize, bool)> = snapshot
         .players
         .iter()
@@ -26501,7 +26528,21 @@ fn soccer_field_player_motion_block(
         let vel = snapshot.player_velocity(id).unwrap_or_else(Vec2::zero);
         let acc = snapshot.player_acceleration(id).unwrap_or_else(Vec2::zero);
         let jerk = snapshot.player_jerk(id).unwrap_or_else(Vec2::zero);
-        push_soccer_field_motion_entity(&mut block, pos, vel, acc, jerk, actor_pos, dir);
+        push_soccer_field_motion_entity(
+            &mut block,
+            pos,
+            vel,
+            acc,
+            jerk,
+            actor_pos,
+            actor_velocity,
+            actor_acceleration,
+            actor_jerk,
+            snapshot.field_length,
+            snapshot.field_width,
+            dir,
+            relative_kinematics,
+        );
         player_slots += 1;
     }
     for _ in player_slots..SOCCER_NEURAL_FIELD_MOTION_PLAYERS {
@@ -26514,7 +26555,13 @@ fn soccer_field_player_motion_block(
         snapshot.ball.acceleration,
         snapshot.ball.jerk,
         actor_pos,
+        actor_velocity,
+        actor_acceleration,
+        actor_jerk,
+        snapshot.field_length,
+        snapshot.field_width,
         dir,
+        relative_kinematics,
     );
     debug_assert_eq!(block.len(), SOCCER_NEURAL_FIELD_MOTION_DIM);
     block
@@ -26527,17 +26574,154 @@ fn push_soccer_field_motion_entity(
     acceleration: Vec2,
     jerk: Vec2,
     actor_pos: Vec2,
+    actor_velocity: Vec2,
+    actor_acceleration: Vec2,
+    actor_jerk: Vec2,
+    field_length: f64,
+    field_width: f64,
     attack_dir: f64,
+    relative_kinematics: bool,
 ) {
     let rel = position - actor_pos;
-    block.push(soccer_neural_scaled(rel.y * attack_dir, 60.0) as f32);
-    block.push(soccer_neural_scaled(rel.x * attack_dir, 40.0) as f32);
+    let (position_long_scale, position_lateral_scale) = if relative_kinematics {
+        (field_length.max(1.0), field_width.max(1.0))
+    } else {
+        (60.0, 40.0)
+    };
+    let velocity = if relative_kinematics {
+        velocity - actor_velocity
+    } else {
+        velocity
+    };
+    let acceleration = if relative_kinematics {
+        acceleration - actor_acceleration
+    } else {
+        acceleration
+    };
+    let jerk = if relative_kinematics {
+        jerk - actor_jerk
+    } else {
+        jerk
+    };
+    block.push(soccer_neural_scaled(rel.y * attack_dir, position_long_scale) as f32);
+    block.push(soccer_neural_scaled(rel.x * attack_dir, position_lateral_scale) as f32);
     block.push(soccer_neural_scaled(velocity.y * attack_dir, 10.0) as f32);
     block.push(soccer_neural_scaled(velocity.x * attack_dir, 10.0) as f32);
     block.push(soccer_neural_scaled(acceleration.y * attack_dir, 12.0) as f32);
     block.push(soccer_neural_scaled(acceleration.x * attack_dir, 12.0) as f32);
     block.push(soccer_neural_scaled(jerk.y * attack_dir, 40.0) as f32);
     block.push(soccer_neural_scaled(jerk.x * attack_dir, 40.0) as f32);
+}
+
+/// New 11v11 entity contract. Test builds re-read the environment so invariance
+/// tests can compare both arms in one process; production latches once.
+pub(crate) fn dd_soccer_enable_field_vector_v2() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_FIELD_VECTOR_V2")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_FIELD_VECTOR_V2"))
+    }
+}
+
+pub(crate) fn dd_soccer_enable_central_critic_v2() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_CENTRAL_CRITIC_V2")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_CENTRAL_CRITIC_V2"))
+    }
+}
+
+/// Actor-independent centralized state, ordered Home then Away (stable player id),
+/// in a single fixed Home-attacking pitch frame. Unlike the POMDP block this is
+/// intentionally privileged and must never be appended to actor features.
+fn soccer_central_critic_state(snapshot: &WorldSnapshot) -> Vec<f32> {
+    let mut players = snapshot.players.iter().collect::<Vec<_>>();
+    players.sort_by(|left, right| {
+        let team_key = |team: Team| match team {
+            Team::Home => 0usize,
+            Team::Away => 1usize,
+        };
+        team_key(left.team)
+            .cmp(&team_key(right.team))
+            .then(left.id.cmp(&right.id))
+    });
+    let mut out = Vec::with_capacity(SOCCER_CENTRAL_CRITIC_FEATURE_DIM);
+    let push_entity =
+        |out: &mut Vec<f32>, position: Vec2, velocity: Vec2, acceleration: Vec2, jerk: Vec2| {
+            let x = ((position.x / snapshot.field_width.max(1.0)) * 2.0 - 1.0).clamp(-1.0, 1.0);
+            let y = ((position.y / snapshot.field_length.max(1.0)) * 2.0 - 1.0).clamp(-1.0, 1.0);
+            out.push(x as f32);
+            out.push(y as f32);
+            out.push(soccer_neural_scaled(velocity.x, 10.0) as f32);
+            out.push(soccer_neural_scaled(velocity.y, 10.0) as f32);
+            out.push(soccer_neural_scaled(acceleration.x, 12.0) as f32);
+            out.push(soccer_neural_scaled(acceleration.y, 12.0) as f32);
+            out.push(soccer_neural_scaled(jerk.x, 40.0) as f32);
+            out.push(soccer_neural_scaled(jerk.y, 40.0) as f32);
+        };
+    for player in players.into_iter().take(SOCCER_NEURAL_FIELD_MOTION_PLAYERS) {
+        push_entity(
+            &mut out,
+            snapshot
+                .player_position(player.id)
+                .unwrap_or(player.position),
+            snapshot
+                .player_velocity(player.id)
+                .unwrap_or(player.velocity),
+            snapshot
+                .player_acceleration(player.id)
+                .unwrap_or(player.acceleration),
+            snapshot.player_jerk(player.id).unwrap_or(player.jerk),
+        );
+    }
+    while out.len() < SOCCER_NEURAL_FIELD_MOTION_PLAYERS * SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER {
+        out.extend([0.0; SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER]);
+    }
+    push_entity(
+        &mut out,
+        snapshot.ball.position,
+        snapshot.ball.velocity,
+        snapshot.ball.acceleration,
+        snapshot.ball.jerk,
+    );
+    let possession = snapshot.possession_team();
+    out.extend([
+        f32::from(possession == Some(Team::Home)),
+        f32::from(possession == Some(Team::Away)),
+        f32::from(possession.is_none()),
+        soccer_neural_scaled(snapshot.score_home as f64 - snapshot.score_away as f64, 5.0) as f32,
+        soccer_neural_scaled(snapshot.clock_seconds, 5_400.0) as f32,
+        soccer_neural_scaled(snapshot.ball.altitude_yards.max(0.0), 10.0) as f32,
+        snapshot.ball.holder.map_or(0.0, |holder| {
+            snapshot
+                .players
+                .iter()
+                .find(|player| player.id == holder)
+                .map_or(
+                    0.0,
+                    |player| {
+                        if player.team == Team::Home {
+                            1.0
+                        } else {
+                            -1.0
+                        }
+                    },
+                )
+        }),
+        1.0,
+    ]);
+    debug_assert_eq!(out.len(), SOCCER_CENTRAL_CRITIC_FEATURE_DIM);
+    out
 }
 
 fn soccer_decision_context_for(
@@ -27000,6 +27184,12 @@ fn soccer_decision_context_for(
         actor_velocity,
         actor_acceleration,
         field_player_motion: soccer_field_player_motion_block(before, player_id, team),
+        central_critic_state: dd_soccer_enable_central_critic_v2()
+            .then(|| soccer_central_critic_state(before))
+            .unwrap_or_default(),
+        next_central_critic_state: dd_soccer_enable_central_critic_v2()
+            .then(|| soccer_central_critic_state(after))
+            .unwrap_or_default(),
         opponent_belief: soccer_opponent_belief_block(before, player_id, team),
         ball_position: before.ball.position,
         ball_velocity: before.ball.velocity,
@@ -40636,6 +40826,10 @@ pub struct SoccerNeuralNetworkSnapshot {
     /// trained passing/dribbling/shooting/GK specialists across episodes and persisted runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_head: Option<Box<SoccerPolicyHeadSnapshot>>,
+    /// Separate centralized V(s) baseline for MAPPO/GAE. Its 192-wide input is
+    /// actor-independent and never reused by the action-conditioned Q critic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub central_critic_head: Option<Box<SoccerAuxiliaryHeadSnapshot>>,
     /// Optional independent pass/dribble/shot specialist actors. These are separate
     /// from the role-local specialists embedded in `policy_head`: they directly
     /// refine technical action selection through `SoccerSkillPolicyHeads`, so eval
@@ -40834,6 +41028,11 @@ fn average_soccer_neural_network_snapshot_refs(
         )
     })
     .map(Box::new);
+    out.central_critic_head = average_optional_aux_head(
+        base.and_then(|snapshot| snapshot.central_critic_head.as_deref()),
+        snapshots,
+        |snapshot| snapshot.central_critic_head.as_deref(),
+    );
     out.skill_policy_heads = collect_all_some(
         snapshots
             .iter()
@@ -41273,6 +41472,120 @@ pub struct SoccerPassCompletionHead {
     network: FeedForwardNetwork,
     training_steps: usize,
     last_loss: Option<f64>,
+}
+
+/// Team value baseline over the actor-independent global state. This deliberately
+/// does not score actions; the existing neural learner remains the Q(s,a) critic
+/// used for candidate ranking and Bellman replay.
+#[derive(Clone, Debug)]
+pub(crate) struct SoccerCentralCriticHead {
+    network: FeedForwardNetwork,
+    training_steps: usize,
+    last_loss: Option<f64>,
+}
+
+impl SoccerCentralCriticHead {
+    fn new(seed: u32) -> Self {
+        let mut rng = mulberry32(seed ^ 0xC37A_11C5);
+        let network = FeedForwardNetwork::random(
+            &RandomNetworkSpec {
+                input_dim: SOCCER_CENTRAL_CRITIC_FEATURE_DIM,
+                hidden_layers: vec![SOCCER_CENTRAL_CRITIC_HIDDEN_UNITS, 64],
+                output_dim: 1,
+                hidden_activation: ActivationName::Tanh,
+                output_activation: ActivationName::Linear,
+                weight_scale: None,
+            },
+            &mut rng,
+        );
+        Self {
+            network,
+            training_steps: 0,
+            last_loss: None,
+        }
+    }
+
+    fn predict(&self, state: &[f32], target_scale: f64) -> Option<f64> {
+        if state.len() != SOCCER_CENTRAL_CRITIC_FEATURE_DIM
+            || state.iter().any(|value| !value.is_finite())
+        {
+            return None;
+        }
+        let input = state
+            .iter()
+            .map(|value| f64::from(*value))
+            .collect::<Vec<_>>();
+        self.network
+            .predict(&input)
+            .first()
+            .copied()
+            .filter(|value| value.is_finite())
+            .map(|value| value * target_scale)
+    }
+
+    fn train(&mut self, samples: &[(Vec<f32>, f64)], target_scale: f64, target_clip: f64) {
+        let scale = target_scale.max(1.0e-6);
+        let clip = target_clip.max(0.1);
+        let mut total_loss = 0.0;
+        let mut applied = 0usize;
+        for (state, raw_target) in samples {
+            if state.len() != SOCCER_CENTRAL_CRITIC_FEATURE_DIM
+                || state.iter().any(|value| !value.is_finite())
+                || !raw_target.is_finite()
+            {
+                continue;
+            }
+            let input = state
+                .iter()
+                .map(|value| f64::from(*value))
+                .collect::<Vec<_>>();
+            let target = [(raw_target / scale).clamp(-clip, clip)];
+            let result = self.network.train_sample_clipped(
+                &input,
+                &target,
+                SOCCER_CENTRAL_CRITIC_LEARNING_RATE,
+                SOCCER_NEURAL_GRAD_CLIP_NORM,
+            );
+            if result.applied && result.loss.is_finite() {
+                total_loss += result.loss;
+                applied += 1;
+            }
+        }
+        if applied > 0 {
+            self.training_steps = self.training_steps.saturating_add(applied);
+            self.last_loss = Some(total_loss / applied as f64);
+        }
+    }
+
+    fn ready(&self) -> bool {
+        self.training_steps > 0
+    }
+
+    fn to_snapshot(&self) -> SoccerAuxiliaryHeadSnapshot {
+        let mut network = soccer_neural_network_snapshot(&self.network);
+        network.training_steps = self.training_steps;
+        network.average_loss = self.last_loss;
+        SoccerAuxiliaryHeadSnapshot {
+            network,
+            training_steps: self.training_steps,
+            average_loss: self.last_loss,
+        }
+    }
+
+    fn from_snapshot(snapshot: &SoccerAuxiliaryHeadSnapshot) -> Result<Self, String> {
+        let network = build_soccer_feed_forward_network_from_snapshot(
+            &snapshot.network,
+            SOCCER_CENTRAL_CRITIC_FEATURE_DIM,
+            1,
+            &[],
+            "central critic head",
+        )?;
+        Ok(Self {
+            network,
+            training_steps: snapshot.training_steps.max(snapshot.network.training_steps),
+            last_loss: snapshot.average_loss.or(snapshot.network.average_loss),
+        })
+    }
 }
 
 impl SoccerPassCompletionHead {
@@ -46013,6 +46326,7 @@ fn soccer_neural_network_snapshot(network: &FeedForwardNetwork) -> SoccerNeuralN
         average_loss: None,
         target_popart: None,
         policy_head: None,
+        central_critic_head: None,
         skill_policy_heads: None,
         keeper_policy_head: None,
         line_depth_head: None,

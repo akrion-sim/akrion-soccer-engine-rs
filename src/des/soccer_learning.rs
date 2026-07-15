@@ -1738,6 +1738,17 @@ pub fn soccer_neural_network_snapshot_fingerprint(snapshot: &SoccerNeuralNetwork
             }
         }
     }
+    if let Some(central_critic) = snapshot.central_critic_head.as_ref() {
+        soccer_learning_fingerprint_str(&mut hash, "centralCriticHead");
+        soccer_learning_fingerprint_mix(
+            &mut hash,
+            soccer_neural_network_snapshot_fingerprint(&central_critic.network),
+        );
+        soccer_learning_fingerprint_usize(&mut hash, central_critic.training_steps);
+        if let Some(loss) = central_critic.average_loss {
+            soccer_learning_fingerprint_f64(&mut hash, loss);
+        }
+    }
     if let Some(popart) = snapshot.target_popart {
         soccer_learning_fingerprint_str(&mut hash, "targetPopArt");
         soccer_learning_fingerprint_usize(&mut hash, popart.count);
