@@ -23398,9 +23398,21 @@ pub(crate) fn dd_soccer_dp_bootstrap_sweeps() -> usize {
 /// (default) is byte-identical. Complements the DP bootstrap: DP sharpens the target signal,
 /// standardization makes the net actually use it.
 pub(crate) fn dd_soccer_enable_target_standardization() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_TARGET_STANDARDIZATION"))
+    // Default-ON in production (the value-head-collapse fix; the league bin,
+    // ratchet bin, and the k8s continuous manifest all forced it on already —
+    // this closes the gap for every other trainer). `=0` remains the kill
+    // switch. Tests stay default-OFF and env-driven so the byte-identical
+    // parity suite is unchanged.
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_TARGET_STANDARDIZATION")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_TARGET_STANDARDIZATION"))
+    }
 }
 
 /// Append-only structured action-parameter feature block (priority-1 Part A): fills the
