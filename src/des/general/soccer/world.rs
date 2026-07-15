@@ -33359,6 +33359,9 @@ impl SoccerMatch {
                     self.pending_shot = None;
                     self.record_possession_touch(player_id);
                     self.stat_pass_attempt(player_team);
+                    let attempt_forward_yards =
+                        (release_target.y - player_pos.y) * player_team.attack_dir();
+                    self.stat_pass_attempt_direction(player_team, attempt_forward_yards);
                     if intentional_distinct_target {
                         self.stat_intentional_pass_attempt(player_team);
                     }
