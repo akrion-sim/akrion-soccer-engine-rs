@@ -47345,7 +47345,10 @@ fn goal_reward_contextualizes_recent_attacking_decisions() {
     let before = WorldSnapshot::from_match(&sim);
     push_contextual_goal_credit_history(&mut sim, &before);
 
-    sim.record_goal_rewards(Team::Home, Some(9));
+    // The default goal path is a SINGLE chain injection; the contextual
+    // distributor is exercised directly here (in the live stack it only runs
+    // under DD_SOCCER_ENABLE_LEGACY_GOAL_MULTI_CREDIT).
+    sim.record_contextual_goal_rewards(Team::Home, Some(9), live_goal_reward_points());
 
     let total = sim
         .deferred_reward_transitions
