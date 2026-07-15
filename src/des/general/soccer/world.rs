@@ -39302,6 +39302,24 @@ impl SoccerMatch {
         }
     }
 
+    /// Record the direction of a pass ATTEMPT at launch (intended target vs
+    /// origin, ±1.25yd lateral deadband — mirrors
+    /// `stat_pass_completed_direction`) so per-direction completion RATES are
+    /// measurable, not only the completed-pass direction mix.
+    fn stat_pass_attempt_direction(&mut self, team: Team, forward_yards: f64) {
+        if forward_yards > 1.25 {
+            match team {
+                Team::Home => self.stats.passes_attempted_forward_home += 1,
+                Team::Away => self.stats.passes_attempted_forward_away += 1,
+            }
+        } else if forward_yards < -1.25 {
+            match team {
+                Team::Home => self.stats.passes_attempted_backward_home += 1,
+                Team::Away => self.stats.passes_attempted_backward_away += 1,
+            }
+        }
+    }
+
     fn stat_intentional_pass_attempt(&mut self, team: Team) {
         match team {
             Team::Home => self.stats.intentional_passes_attempted_home += 1,
