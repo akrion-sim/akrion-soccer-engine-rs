@@ -1832,7 +1832,7 @@ fn main() {
                                 } else if kpis.goal_diff < 0 {
                                     losses_a.fetch_add(1, Relaxed);
                                 }
-                                match_kpis.lock().unwrap().push(kpis);
+                                match_kpis.lock().unwrap().push((fx.opp_idx, kpis));
                             }
                         }
                         trained_brains.lock().unwrap().push(wf);
