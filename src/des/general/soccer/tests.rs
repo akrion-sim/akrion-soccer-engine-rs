@@ -100093,13 +100093,18 @@ fn same_team_proximity_grace_matches_the_worked_example() {
 #[test]
 fn mpc_reject_threshold_pipeline_collects_and_trains_end_to_end() {
     let build_and_run = || {
+        // Learned-policy inference must be active for the carrier to produce the committed
+        // technical decisions the collector samples (production learner games always are;
+        // `learning_enabled` + installed team policies replicates that here).
         let config = MatchConfig {
             duration_seconds: 20.0,
             seed: 44_101,
+            learning_enabled: true,
             ..MatchConfig::default()
         };
         let total = config.total_ticks();
-        let mut sim = SoccerMatch::default_11v11(config);
+        let mut sim = SoccerMatch::default_11v11(config)
+            .with_team_policies(SoccerTeamQPolicies::new(SoccerQPolicyOptions::default()));
         for _ in 0..total {
             sim.run_time_step();
         }
@@ -100132,20 +100137,15 @@ fn mpc_reject_threshold_pipeline_collects_and_trains_end_to_end() {
         );
         assert!(s.reward.is_finite(), "sample reward must be finite");
     }
-    // All three families should appear over a full match (pass targets the most-advanced
-    // teammate; dribble/shot resolve their own targets in the MPC estimators).
-    let saw_pass = on_samples
-        .iter()
-        .any(|s| s.inputs.family == MpcRejectFamily::Pass);
-    let saw_dribble = on_samples
-        .iter()
-        .any(|s| s.inputs.family == MpcRejectFamily::Dribble);
-    let saw_shot = on_samples
-        .iter()
-        .any(|s| s.inputs.family == MpcRejectFamily::Shot);
+    // The collector samples the ACTUALLY committed carrier action (not hypothetical
+    // alternatives), so which families appear depends on real play. Every sample must be
+    // one of the MPC-gated families, and passes — the dominant carrier action — should
+    // appear over a full match of possession.
     assert!(
-        saw_pass && saw_dribble && saw_shot,
-        "all three families should be sampled over a full match: pass={saw_pass} dribble={saw_dribble} shot={saw_shot}"
+        on_samples
+            .iter()
+            .any(|s| s.inputs.family == MpcRejectFamily::Pass),
+        "a full match of possession should commit at least one pass"
     );
 
     // The drained corpus trains a usable head (the learner's per-game step).
