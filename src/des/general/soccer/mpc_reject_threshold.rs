@@ -47,12 +47,13 @@
 //!
 //! ## Scope
 //!
-//! The live seam applies to **all three families** (pass / dribble / shot): each gets
-//! the context-aware analytic bar when the model is on, and the head refines it. The
-//! automated RL corpus currently samples the ball carrier's **pass** feasibility
-//! (the dominant, always-well-defined carrier decision); dribble/shot bars ride the
-//! context-aware analytic seed until their collectors are added. The head itself is
-//! family-agnostic (family is a feature), so extending collection is additive.
+//! The live seam and automated RL corpus both cover **all three families** (pass /
+//! dribble / shot): when the POMDP/MPC pipeline actually commits one of those actions,
+//! that exact plan is scored by the same MPC execution-probability function used at
+//! the live reject gate, then resolved against its windowed outcome. Hypothetical
+//! alternatives are deliberately not labelled with the committed action's result.
+//! Family is an explicit feature, so the learned bar can differ by action as well as
+//! field context.
 
 use super::*;
 use crate::des::general::neural_network::{ActivationName, FeedForwardNetwork, RandomNetworkSpec};
@@ -125,6 +126,25 @@ impl MpcRejectFamily {
             MpcRejectFamily::Dribble => (0.0, 1.0, 0.0),
             MpcRejectFamily::Shot => (0.0, 0.0, 1.0),
         }
+    }
+}
+
+/// Classify a concrete soccer action label into the MPC execution family whose
+/// contextual reject bar governs it. Non-technical hold/support/defensive actions do
+/// not pass through this gate.
+pub(crate) fn mpc_reject_family_for_action_label(label: &str) -> Option<MpcRejectFamily> {
+    let normalized = normalize_soccer_action_label(label);
+    if pass_like_action_flight(normalized).is_some() {
+        Some(MpcRejectFamily::Pass)
+    } else if is_dribble_action_label(normalized) {
+        Some(MpcRejectFamily::Dribble)
+    } else if matches!(
+        normalized,
+        "shoot" | "first-time-shot" | "first-time-header"
+    ) {
+        Some(MpcRejectFamily::Shot)
+    } else {
+        None
     }
 }
 
@@ -246,8 +266,6 @@ pub struct PendingMpcRejectThresholdDecision {
     pub due_tick: u64,
 }
 
-/// How often (ticks) reject-threshold RL decisions are sampled while the model is on.
-pub const MPC_REJECT_THRESHOLD_SAMPLE_INTERVAL_TICKS: u64 = 4;
 /// Window (ticks) over which a sampled decision's territorial reward is measured.
 pub const MPC_REJECT_THRESHOLD_REWARD_WINDOW_TICKS: u64 = 30;
 /// Cap on the rolling RL sample buffer (drained by the learner).
@@ -561,14 +579,12 @@ impl WorldSnapshot {
 }
 
 impl SoccerMatch {
-    /// Gated per-tick RL sample collection for the reject-threshold head. A **no-op**
-    /// (zero cost, byte-identical) unless the model is enabled. When on: resolves
-    /// decisions whose reward window has elapsed (reward = the carrier team's
-    /// territorial-advantage change over the window), and samples a fresh ball-carrier
-    /// pass-feasibility decision on cadence — the execution probability the carrier
-    /// would commit a pass at, in the current context, tagged with the windowed
-    /// outcome. That is exactly the `(context, committed p, did it work out)` signal
-    /// the reject bar is learned from.
+    /// Resolve committed actions whose reward window has elapsed. A **no-op** (zero
+    /// cost, byte-identical) unless the model is enabled. New decisions are enqueued by
+    /// [`Self::enqueue_mpc_reject_threshold_committed_plan`] at the point where the
+    /// POMDP/MPC pipeline has selected the action that will actually execute. Keeping
+    /// enqueue and resolve separate prevents a hypothetical pass, dribble, and shot
+    /// from all inheriting the outcome of whichever one was really played.
     pub(crate) fn collect_mpc_reject_threshold_rl_samples(&mut self, snapshot: &WorldSnapshot) {
         if !mpc_reject_threshold_model_enabled() {
             return;
@@ -597,94 +613,56 @@ impl SoccerMatch {
                 i += 1;
             }
         }
-        // Sample fresh carrier decisions on cadence while a field player holds the ball.
-        if tick % MPC_REJECT_THRESHOLD_SAMPLE_INTERVAL_TICKS != 0 {
+    }
+
+    /// Enqueue the exact learned action that survived POMDP ranking and MPC
+    /// feasibility reconciliation. The later reward therefore belongs to the action
+    /// represented by `family`, `inputs`, and `committed_probability`; it is not a
+    /// counterfactual label copied onto unplayed alternatives.
+    pub(crate) fn enqueue_mpc_reject_threshold_committed_plan(
+        &mut self,
+        snapshot: &WorldSnapshot,
+        player_id: usize,
+        plan: &SoccerLearnedPlan,
+    ) {
+        if !mpc_reject_threshold_model_enabled()
+            || self.tick % MPC_REJECT_THRESHOLD_SAMPLE_INTERVAL_TICKS != 0
+            || snapshot.ball.holder != Some(player_id)
+        {
             return;
         }
-        let Some(holder_id) = snapshot.ball.holder else {
+        let Some(player) = snapshot.players.iter().find(|p| p.id == player_id) else {
             return;
         };
-        let Some(holder) = snapshot.players.iter().find(|p| p.id == holder_id) else {
-            return;
-        };
-        if holder.role == PlayerRole::Goalkeeper {
+        if player.role == PlayerRole::Goalkeeper {
             return;
         }
-        let territorial = territorial_advantage(snapshot, holder.team);
+        let Some(family) = mpc_reject_family_for_action_label(&plan.action) else {
+            return;
+        };
+        let Some(committed_probability) =
+            Self::learned_plan_mpc_execution_probability(snapshot, player_id, plan)
+        else {
+            return;
+        };
+        let territorial = territorial_advantage(snapshot, player.team);
         if !territorial.is_finite() {
             return;
         }
-        // Which way this carrier attacks, so the canonical forward-pass target is the
-        // team's most-advanced teammate. Dribble and shot resolve their own targets
-        // inside the MPC estimators, so no goal geometry is guessed here.
-        let attack_dir = if holder.team == Team::Home { 1.0 } else { -1.0 };
-        let forward_teammate = snapshot
-            .players
-            .iter()
-            .filter(|p| {
-                p.team == holder.team && p.id != holder_id && p.role != PlayerRole::Goalkeeper
-            })
-            .max_by(|a, b| {
-                let ax = snapshot.player_snapshot_position(a).x * attack_dir;
-                let bx = snapshot.player_snapshot_position(b).x * attack_dir;
-                ax.partial_cmp(&bx).unwrap_or(std::cmp::Ordering::Equal)
+        let base_threshold = mpc_reject_base_threshold(family);
+        let Some(inputs) =
+            snapshot.build_mpc_reject_threshold_inputs(player, family, base_threshold)
+        else {
+            return;
+        };
+        self.pending_mpc_reject_threshold
+            .push(PendingMpcRejectThresholdDecision {
+                team: player.team,
+                inputs,
+                committed_probability: committed_probability.clamp(0.0, 1.0),
+                decision_territorial: territorial,
+                due_tick: self.tick + MPC_REJECT_THRESHOLD_REWARD_WINDOW_TICKS,
             });
-
-        // One representative plan per family the carrier could commit. Each is scored by
-        // the SAME MPC execution-probability functions the live reject gate uses, tagged
-        // with the family so the head learns a per-family, per-context bar.
-        let mut candidates: Vec<(MpcRejectFamily, SoccerLearnedPlan)> = Vec::new();
-        if let Some(target) = forward_teammate {
-            candidates.push((
-                MpcRejectFamily::Pass,
-                SoccerLearnedPlan {
-                    action: "pass".to_string(),
-                    target_player: Some(target.id),
-                    target_point: snapshot.player_position(target.id),
-                    mpc_replan: None,
-                },
-            ));
-        }
-        candidates.push((
-            MpcRejectFamily::Dribble,
-            SoccerLearnedPlan {
-                action: "dribble".to_string(),
-                target_player: None,
-                target_point: None,
-                mpc_replan: None,
-            },
-        ));
-        candidates.push((
-            MpcRejectFamily::Shot,
-            SoccerLearnedPlan {
-                action: "shoot".to_string(),
-                target_player: None,
-                target_point: None,
-                mpc_replan: None,
-            },
-        ));
-
-        for (family, plan) in &candidates {
-            let Some(committed_probability) =
-                Self::learned_plan_mpc_execution_probability(snapshot, holder_id, plan)
-            else {
-                continue;
-            };
-            let base_threshold = mpc_reject_base_threshold(*family);
-            let Some(inputs) =
-                snapshot.build_mpc_reject_threshold_inputs(holder, *family, base_threshold)
-            else {
-                continue;
-            };
-            self.pending_mpc_reject_threshold
-                .push(PendingMpcRejectThresholdDecision {
-                    team: holder.team,
-                    inputs,
-                    committed_probability: committed_probability.clamp(0.0, 1.0),
-                    decision_territorial: territorial,
-                    due_tick: tick + MPC_REJECT_THRESHOLD_REWARD_WINDOW_TICKS,
-                });
-        }
     }
 
     /// Drain the collected reject-threshold RL samples for the cluster learner (train

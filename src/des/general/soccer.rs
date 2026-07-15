@@ -1166,19 +1166,27 @@ const POSSESSION_CHASE_MIN_CREDIT: f64 = 0.035;
 const TEAMWORK_PROGRESS_NEAR_BALL_PLAYERS: usize = 5;
 const TEAMWORK_PROGRESS_MIN_RELOCATION_YARDS: f64 = 0.08;
 const TEAMWORK_PROGRESS_MIN_CREDIT: f64 = 0.024;
-const GOAL_REWARD_POINTS: f64 = 160.0;
+/// Fixed sparse football anchor shared with the hermetic 5v5 learner. Reward
+/// search may tune contextual pass/shot/movement weights, but a conversion is
+/// always worth exactly 500 base points.
+const GOAL_REWARD_POINTS: f64 = 500.0;
 /// Reduced reward pool for a goal scored directly off a turnover — a single
 /// scoring-team player touched the ball between winning it from the opponent and
 /// finishing. There is no build-up play to credit, only the steal-and-finish, so
 /// the goal distributes less than the full [`GOAL_REWARD_POINTS`] while still
 /// staying above any non-goal outcome.
-const DIRECT_TURNOVER_GOAL_REWARD_POINTS: f64 = 85.0;
+const DIRECT_TURNOVER_GOAL_REWARD_POINTS: f64 = 250.0;
 const GOAL_CONTEXT_CREDIT_MIN_PLAYERS: usize = 3;
 const GOAL_CONTEXT_CREDIT_MAX_PLAYERS: usize = 5;
 const GOAL_CONTEXT_CREDIT_SCAN_ACTIONS: usize = 48;
 const GOAL_CONTEXT_CREDIT_MAX_AGE_TICKS: u64 = secs_to_ticks(60.0);
 const GOAL_CONTEXT_CREDIT_MIN_SCORE: f64 = 0.05;
 const SHOT_ON_TARGET_REWARD_POINTS: f64 = 80.0;
+/// A realised on-frame shot earns this much even when saved. Field-vector
+/// danger/quality may raise the contextual pool, but never erase the event.
+const ON_FRAME_SHOT_MIN_REWARD_POINTS: f64 = 50.0;
+/// A saved/non-converting shot cannot approach the fixed 500-point goal anchor.
+const ON_FRAME_SHOT_MAX_REWARD_POINTS: f64 = 200.0;
 /// A non-conversion outcome (an on-target shot that MISSES, chain / shot-on-frame credit, ...) is
 /// capped at this FRACTION of the conversion (goal) reward, so scoring dominates a missed chance by a
 /// meaningful, magnitude-scaling margin instead of a token fixed few points — the ordering stays
@@ -1205,6 +1213,14 @@ const SHOT_CLOSE_REWARD_PER_YARD: f64 = 0.9;
 const SHOT_FAR_PENALTY_PER_YARD: f64 = 1.6;
 const SHOT_DISTANCE_REWARD_MAX_POINTS: f64 = 14.0;
 pub(crate) const MIN_SOCCER_REWARD_WEIGHT: f64 = 0.0001;
+// Sane, frequency-aware optimizer ranges. Sparse event channels can move more
+// than dense per-tick channels, but neither may approach the fixed 500-point
+// goal or 1000-point match anchors. Contextual field-vector multipliers are
+// applied after these base scales are selected.
+const DENSE_ACTION_REWARD_SCALE_BOUNDS: (f64, f64) = (0.05, 4.0);
+const SPARSE_ACTION_REWARD_SCALE_BOUNDS: (f64, f64) = (0.10, 4.0);
+const TURNOVER_PENALTY_SCALE_BOUNDS: (f64, f64) = (1.0, 8.0);
+const LEARNED_EPV_REWARD_SCALE_BOUNDS: (f64, f64) = (1.0, 60.0);
 const CONVERSION_OVER_SHOT_REWARD_MARGIN: f64 = 5.0;
 const WIN_OVER_CONVERSION_REWARD_MARGIN: f64 = 20.0;
 const SHOT_COMMITMENT_REWARD_SCALE: f64 = 0.0;
@@ -1251,14 +1267,12 @@ const SHOT_OFF_TARGET_PENALTY_PER_YARD: f64 = 1.6;
 const SHOT_OFF_TARGET_MAX_PENALTY_POINTS: f64 = 14.0;
 // Base reward for a completed forward pass. At the DEFAULT scale (forward_pass_reward_scale()==1)
 // deliberately kept WELL BELOW the shot-on-target (SHOT_ON_TARGET_REWARD_POINTS = 80) and goal
-// (GOAL_REWARD_POINTS = 160) rewards so that a string of successive forward passes can never
+// (GOAL_REWARD_POINTS = 500) rewards so that a string of successive forward passes can never
 // out-earn shooting/scoring — otherwise "pass in succession forever" becomes the optimal POMDP
-// policy. NOTE: DD_SOCCER_FORWARD_PASS_REWARD_SCALE (0..20) intentionally breaks that ordering for
-// the forward-pass-primacy A/B — e.g. at scale=6 a max forward/flank pass component reaches ~83.5,
-// exceeding a shot-shaping proxy damped by DD_SOCCER_SHOT_SHAPING_REWARD_SCALE. That is the lever:
-// tilt the DENSE gradient toward build-up. Goal (160) + terminal-outcome reward are NOT scaled and
-// still dominate, so finishing is never un-learned. Passes that actually LEAD to a shot/goal are
-// credited richly via GOAL_CHAIN_REWARD_PATTERN / the shot pattern regardless.
+// policy. DD_SOCCER_FORWARD_PASS_REWARD_SCALE is bounded to 0.10..4.0: enough to tilt the dense
+// gradient toward build-up without letting a single completed pass rival the fixed 500-point goal.
+// Passes that actually LEAD to a shot/goal are credited richly via GOAL_CHAIN_REWARD_PATTERN / the
+// shot pattern regardless.
 const COMPLETED_FORWARD_PASS_BASE_REWARD_OWN_HALF: f64 = 3.0;
 const COMPLETED_FORWARD_PASS_BASE_REWARD_OPPONENT_HALF: f64 = 4.0;
 const COMPLETED_FORWARD_PASS_PROGRESS_REWARD_PER_YARD: f64 = 0.24;
@@ -4206,13 +4220,19 @@ pub(crate) const OUTSIDE_MID_TAKEON_COVER_CLEAR_YARDS: f64 = 10.0;
 
 /// Amplify the dense OFF-BALL "make a supporting run / move to space" rewards so teammates learn
 /// to get open — creating safe passing options and cutting the hoof-and-give-away turnovers.
-/// Env `SOCCER_OFFBALL_SUPPORT_REWARD_SCALE` (default 1.0 = byte-identical), clamped [0.1, 10] (can REDUCE or amplify — for reward search).
+/// Env `SOCCER_OFFBALL_SUPPORT_REWARD_SCALE` (default 1.0 = byte-identical),
+/// clamped to the sane dense-action search band.
 pub(crate) fn offball_support_reward_scale() -> f64 {
     // Dynamic-reward mode: bidirectional (min 0) so a reward search can turn this
     // dense off-ball shard DOWN, not only up — the 5-a-side climb showed dense
     // shaping that out-masses the goal is a farm-at-parity attractor.
     if dynamic_reward_weights_enabled() {
-        return reward_weight_env("SOCCER_OFFBALL_SUPPORT_REWARD_SCALE", 1.0, 1e-4, 10.0);
+        return reward_weight_env(
+            "SOCCER_OFFBALL_SUPPORT_REWARD_SCALE",
+            1.0,
+            DENSE_ACTION_REWARD_SCALE_BOUNDS.0,
+            DENSE_ACTION_REWARD_SCALE_BOUNDS.1,
+        );
     }
     use std::sync::OnceLock;
     static V: OnceLock<f64> = OnceLock::new();
@@ -4221,18 +4241,29 @@ pub(crate) fn offball_support_reward_scale() -> f64 {
             .ok()
             .and_then(|raw| raw.trim().parse::<f64>().ok())
             .filter(|v| v.is_finite())
-            .map(|v| v.clamp(0.1, 10.0))
+            .map(|v| {
+                v.clamp(
+                    DENSE_ACTION_REWARD_SCALE_BOUNDS.0,
+                    DENSE_ACTION_REWARD_SCALE_BOUNDS.1,
+                )
+            })
             .unwrap_or(1.0)
     })
 }
 
 /// Amplify DRIBBLING / progressive ball-CARRYING rewards (beat defenders, drive into space).
-/// Env `DD_SOCCER_CARRY_REWARD_SCALE` (default 1.0), clamped [0.1, 10] (can REDUCE or amplify — for reward search).
+/// Env `DD_SOCCER_CARRY_REWARD_SCALE` (default 1.0), clamped to the sane
+/// dense-action search band.
 pub(crate) fn carry_reward_scale() -> f64 {
     // Dynamic-reward mode: bidirectional (min 0) so a search can reduce this dense
     // carry shard relative to the sparse goal.
     if dynamic_reward_weights_enabled() {
-        return reward_weight_env("DD_SOCCER_CARRY_REWARD_SCALE", 1.0, 1e-4, 10.0);
+        return reward_weight_env(
+            "DD_SOCCER_CARRY_REWARD_SCALE",
+            1.0,
+            DENSE_ACTION_REWARD_SCALE_BOUNDS.0,
+            DENSE_ACTION_REWARD_SCALE_BOUNDS.1,
+        );
     }
     use std::sync::OnceLock;
     static V: OnceLock<f64> = OnceLock::new();
@@ -4241,18 +4272,59 @@ pub(crate) fn carry_reward_scale() -> f64 {
             .ok()
             .and_then(|raw| raw.trim().parse::<f64>().ok())
             .filter(|v| v.is_finite())
-            .map(|v| v.clamp(0.1, 10.0))
+            .map(|v| {
+                v.clamp(
+                    DENSE_ACTION_REWARD_SCALE_BOUNDS.0,
+                    DENSE_ACTION_REWARD_SCALE_BOUNDS.1,
+                )
+            })
             .unwrap_or(1.0)
     })
 }
 
+fn field_vector_carry_zone_multiplier(
+    team: Team,
+    ball_position: Vec2,
+    field_length: f64,
+    perceived_pressure: f64,
+) -> f64 {
+    let progress = if field_length.is_finite() && field_length > 0.0 {
+        if team.attack_dir() > 0.0 {
+            ball_position.y / field_length
+        } else {
+            (field_length - ball_position.y) / field_length
+        }
+    } else {
+        0.5
+    }
+    .clamp(0.0, 1.0);
+    // A progressive carry is most useful while escaping/building from our half.
+    // In the final third, a clear shot or dangerous pass should outrank another
+    // touch. Pressure comes from the 22-player observation and increases the
+    // value of a successful escape without changing the learned base weight.
+    let zone = if progress < 0.5 {
+        1.35
+    } else if progress < 2.0 / 3.0 {
+        1.0
+    } else {
+        0.55
+    };
+    (zone * (0.85 + 0.30 * perceived_pressure.clamp(0.0, 1.0))).clamp(0.45, 1.65)
+}
+
 /// Amplify DEFENSIVE ball-RECOVERY / press rewards (win the ball back after a loss).
-/// Env `DD_SOCCER_RECOVERY_REWARD_SCALE` (default 1.0), clamped [0.1, 10] (can REDUCE or amplify — for reward search).
+/// Env `DD_SOCCER_RECOVERY_REWARD_SCALE` (default 1.0), clamped to the sane
+/// sparse-action search band.
 pub(crate) fn ball_recovery_reward_scale() -> f64 {
     // Dynamic-reward mode: bidirectional (min 0) so a search can reduce this dense
     // recovery shard relative to the sparse goal.
     if dynamic_reward_weights_enabled() {
-        return reward_weight_env("DD_SOCCER_RECOVERY_REWARD_SCALE", 1.0, 1e-4, 10.0);
+        return reward_weight_env(
+            "DD_SOCCER_RECOVERY_REWARD_SCALE",
+            1.0,
+            SPARSE_ACTION_REWARD_SCALE_BOUNDS.0,
+            SPARSE_ACTION_REWARD_SCALE_BOUNDS.1,
+        );
     }
     use std::sync::OnceLock;
     static V: OnceLock<f64> = OnceLock::new();
@@ -4261,32 +4333,20 @@ pub(crate) fn ball_recovery_reward_scale() -> f64 {
             .ok()
             .and_then(|raw| raw.trim().parse::<f64>().ok())
             .filter(|v| v.is_finite())
-            .map(|v| v.clamp(0.1, 10.0))
+            .map(|v| {
+                v.clamp(
+                    SPARSE_ACTION_REWARD_SCALE_BOUNDS.0,
+                    SPARSE_ACTION_REWARD_SCALE_BOUNDS.1,
+                )
+            })
             .unwrap_or(1.0)
     })
 }
-/// Amplify the terminal GOAL / finishing reward family so sparse scoring can DOMINATE the dense
-/// possession/completion shaping (root cause of the possession-safe collapse: goals ~1/game at 160pts
-/// get drowned by per-tick shaping). Env `DD_SOCCER_GOAL_REWARD_SCALE` (default 1.0), clamped [1, 16].
-/// Respects the learn-via-rewards method — it reweights the signal, it does not hard-force finishing.
+/// Compatibility seam retained for callers and old experiment manifests. The
+/// goal is now a fixed semantic anchor, so legacy scale requests cannot change
+/// its value; contextual subordinate rewards remain tunable instead.
 pub(crate) fn goal_reward_scale() -> f64 {
-    // Dynamic-reward mode: let a reward search AMPLIFY the sparse goal so it can
-    // DOMINATE the dense shaping (the 5-a-side climb turned on exactly this —
-    // goals must out-mass the per-tick shards or the policy farms them at parity).
-    // Amplify-only: the goal is the objective; there is no reason to shrink it.
-    if dynamic_reward_weights_enabled() {
-        return reward_weight_env("DD_SOCCER_GOAL_REWARD_SCALE", 1.0, 1.0, 16.0);
-    }
-    use std::sync::OnceLock;
-    static V: OnceLock<f64> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("DD_SOCCER_GOAL_REWARD_SCALE")
-            .ok()
-            .and_then(|raw| raw.trim().parse::<f64>().ok())
-            .filter(|v| v.is_finite())
-            .map(|v| v.clamp(1.0, 16.0))
-            .unwrap_or(1.0)
-    })
+    1.0
 }
 const OUTSIDE_MID_TAKEON_ISOLATION_REWARD: f64 = 0.14;
 // Defensive recovery: a contestable ball within this many yards of our back line
@@ -5612,6 +5672,10 @@ const SOCCER_POLICY_LEARNING_RATE: f64 = 0.05;
 /// bounded separately by [`SOCCER_FORWARD_SELECT_BONUS_ABS_MAX`], so a large learned weight can keep
 /// pushing the gradient without letting the bonus swamp candidate scoring.
 const SOCCER_FORWARD_SELECT_LOGIT_WEIGHT_MAX: f64 = 8.0;
+/// Independent step size for the forward-selection scalar. Keeping this separate from the joint
+/// actor learning rate lets plateau experiments slow the scalar without weakening every role and
+/// specialist head. The default preserves the established update exactly.
+const SOCCER_FORWARD_SELECT_LOGIT_LEARNING_RATE_MAX: f64 = 0.20;
 /// Absolute cap on the *applied* forward-select bonus term (`weight * forward_option_quality`). Held
 /// comparable in magnitude to the centered actor bonus (~±0.25, cf. `SOCCER_CENTERED_POLICY_BONUS_CLIP`)
 /// so it NUDGES — rather than dominates — the candidate sort against `value_score` / `actor_bonus`.
@@ -5734,11 +5798,13 @@ const MAX_SOCCER_NEURAL_SNAPSHOT_EVERY_BATCHES: usize = 4096;
 // fast signals (forward-pass chains, shots) get focused, low-variance, attributable credit.
 const SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK: f64 = 0.98;
 const SOCCER_FULL_GAME_RETURN_BLEND: f64 = 0.35;
-const SOCCER_FULL_GAME_RETURN_CLIP: f64 = 400.0;
+/// Must preserve the fixed +/-1000 match anchor plus bounded goal-margin and
+/// chance-quality context. The old 400 clamp silently erased most outcome
+/// credit before PPO/MAPPO saw it.
+const SOCCER_FULL_GAME_RETURN_CLIP: f64 = 1250.0;
 /// Return clip must clear the anchor magnitudes: a ±1000 win label plus a few
-/// ±500 goals would be silently flattened by the historical ±400 rail —
-/// exactly the class of "knob never reaches training" bug the anchored mode
-/// exists to fix. Anchored ⇒ ±4000 (2·WIN + 4·GOAL of headroom).
+/// ±500 goals would still need more room than the non-anchored clip. Anchored
+/// mode therefore expands to ±4000 (2·WIN + 4·GOAL of headroom).
 fn soccer_full_game_return_clip() -> f64 {
     if anchored_rewards_enabled() {
         4_000.0
@@ -5748,6 +5814,8 @@ fn soccer_full_game_return_clip() -> f64 {
 }
 const DD_SOCCER_OUTCOME_CREDIT_ENV: &str = "DD_SOCCER_OUTCOME_CREDIT";
 const DD_SOCCER_MATCH_OUTCOME_REWARD_ENV: &str = "DD_SOCCER_ENABLE_MATCH_OUTCOME_REWARD";
+const DD_SOCCER_DP_TERMINAL_OUTCOME_CREDIT_ENV: &str =
+    "DD_SOCCER_ENABLE_DP_TERMINAL_OUTCOME_CREDIT";
 const SOCCER_OUTCOME_CREDIT_MILESTONE_REWARD_CAP: f64 = GOAL_REWARD_POINTS;
 
 // --- Terminal won-game reward (the "long" rung of the quasi-win ladder) ---------
@@ -5778,10 +5846,12 @@ const SOCCER_OUTCOME_CREDIT_MILESTONE_REWARD_CAP: f64 = GOAL_REWARD_POINTS;
 // "beat the opponent" — not "play tidy" — is unambiguously what the value is optimizing (TiZero/
 // AlphaStar). Broadcast to every transition (clipped ±SOCCER_FULL_GAME_RETURN_CLIP). MUST still be
 // A/B'd through the promotion eval gate; do not tune on raw reward.
-// (A later "fast-signal" experiment argued the reverse — that ±200 on every transition drowns the
+// (A later "fast-signal" experiment argued the reverse — that a large outcome label on every transition drowns the
 // fast attributable pass-chain/shot signals ~8-30:1 and should be cut to a ~30 nudge; NOT adopted,
 // pending an eval-gate A/B, since it inverts this outcome-dominant design.)
-const MATCH_OUTCOME_WIN_REWARD_POINTS: f64 = 200.0;
+/// Fixed full-game anchor broadcast to every transition by the existing
+/// Monte-Carlo outcome-credit path. Losses receive the symmetric -1000 label.
+const MATCH_OUTCOME_WIN_REWARD_POINTS: f64 = 1000.0;
 const MATCH_OUTCOME_DRAW_REWARD_POINTS: f64 = 0.0;
 const MATCH_OUTCOME_PER_GOAL_MARGIN_POINTS: f64 = 15.0;
 const MATCH_OUTCOME_MARGIN_CAP_GOALS: f64 = 5.0;
@@ -8488,6 +8558,17 @@ pub struct SoccerDecisionContext {
     /// features), so recording it here changes neither of those.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub behavior_policy_probability: Option<f64>,
+    /// Probability assigned to the executed action by the actor head that will
+    /// be optimized by PPO/MAPPO, captured before any actor update. This is
+    /// intentionally distinct from `behavior_policy_probability`, which can
+    /// describe the surrounding tabular/planner rank mixture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_policy_probability: Option<f64>,
+    /// Legal actor vocabulary at decision time. PPO normalizes both old/current
+    /// policy probabilities over this same set instead of spending probability
+    /// mass and gradient on actions the engine could not execute.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub legal_policy_action_mask: Vec<bool>,
     /// Whether neural MCTS/lookahead selected this action. Kept out of the feature
     /// schema for now and used as a validation/diagnostic metric.
     #[serde(default)]
@@ -8652,6 +8733,11 @@ pub struct AgentDecisionTrace {
     /// the rank mix becomes the behaviour policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub behavior_policy_probability: Option<f64>,
+    /// Old chosen-action probability under the actor head being optimized.
+    /// PPO/MAPPO ratios use this value; the hybrid behavior probability remains
+    /// available separately for trajectory/off-policy diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_policy_probability: Option<f64>,
     /// True when the learned-policy action came from the neural MCTS/lookahead reranker.
     /// This is a trace/metric bit only; the neural feature vector stays unchanged.
     #[serde(default)]
@@ -9322,6 +9408,64 @@ fn soccer_planner_teacher_candidate_min_quality(family: &str) -> f64 {
     }
 }
 
+/// Optional POMDP-observation teacher for the explicit forward-release action. This does not need
+/// neural MCTS or a forward option to survive the scored-candidate cap: when the field vector says
+/// a qualified forward receiver exists but another action was executed, it supplies one bounded
+/// counterfactual actor sample. Default OFF keeps the established teacher path byte-identical.
+fn soccer_planner_teacher_observation_forward_fallback(
+    decision: &AgentDecisionTrace,
+    role: PlayerRole,
+) -> Option<SoccerPlannerTeacherActionSample> {
+    if !soccer_planner_teacher_env_bool(
+        "DD_SOCCER_PLANNER_TEACHER_OBSERVATION_FORWARD_FALLBACK",
+        false,
+    ) || role == PlayerRole::Goalkeeper
+        || !forward_release_opportunity_present(&decision.observation)
+        || soccer_planner_teacher_action_family(&decision.action) == Some("forward-release-pass")
+    {
+        return None;
+    }
+    let family = "forward-release-pass";
+    let quality = soccer_planner_teacher_forward_quality(&decision.observation);
+    let min_quality = soccer_planner_teacher_candidate_min_quality(family);
+    if quality < min_quality
+        || decision.observation.expected_pass_completion
+            < soccer_planner_teacher_env_f64(
+                "SOCCER_PLANNER_TEACHER_MIN_FORWARD_COMPLETION",
+                SOCCER_PLANNER_TEACHER_MIN_FORWARD_COMPLETION,
+                0.0,
+                1.0,
+            )
+    {
+        return None;
+    }
+    let floor = soccer_planner_teacher_env_f64(
+        "SOCCER_PLANNER_TEACHER_ADVANTAGE_FLOOR",
+        SOCCER_PLANNER_TEACHER_MISSED_OPPORTUNITY_ADVANTAGE_FLOOR,
+        0.0,
+        2.0,
+    );
+    let advantage_max = soccer_planner_teacher_env_f64(
+        "SOCCER_PLANNER_TEACHER_ADVANTAGE_MAX",
+        SOCCER_PLANNER_TEACHER_MISSED_OPPORTUNITY_ADVANTAGE_MAX,
+        floor,
+        5.0,
+    );
+    let advantage = (floor + (quality - min_quality).max(0.0) * 0.22).clamp(floor, advantage_max);
+    Some(SoccerPlannerTeacherActionSample {
+        action: family.to_string(),
+        advantage,
+        weight: soccer_planner_teacher_env_f64(
+            "SOCCER_PLANNER_TEACHER_WEIGHT",
+            SOCCER_PLANNER_TEACHER_MISSED_OPPORTUNITY_WEIGHT,
+            1.0,
+            SOCCER_POLICY_PRIORITY_WEIGHT_MAX,
+        ),
+        quality,
+        score_margin: 0.0,
+    })
+}
+
 fn soccer_planner_teacher_missed_opportunities(
     decision: &AgentDecisionTrace,
     role: PlayerRole,
@@ -9329,13 +9473,18 @@ fn soccer_planner_teacher_missed_opportunities(
     if !soccer_planner_teacher_missed_opportunity_enabled()
         || role == PlayerRole::Goalkeeper
         || !decision.observation.has_ball
-        || decision.action_options.is_empty()
     {
         return Vec::new();
     }
 
+    let observation_forward_fallback =
+        soccer_planner_teacher_observation_forward_fallback(decision, role);
+    if decision.action_options.is_empty() {
+        return observation_forward_fallback.into_iter().collect();
+    }
+
     let Some(chosen_family) = soccer_planner_teacher_action_family(&decision.action) else {
-        return Vec::new();
+        return observation_forward_fallback.into_iter().collect();
     };
     let best_legal_score = decision
         .action_options
@@ -9344,7 +9493,7 @@ fn soccer_planner_teacher_missed_opportunities(
         .map(|option| soccer_finite_option_score(option))
         .fold(0.0, f64::max);
     if best_legal_score <= 1e-9 {
-        return Vec::new();
+        return observation_forward_fallback.into_iter().collect();
     }
     let chosen_score = decision
         .action_options
@@ -9445,6 +9594,14 @@ fn soccer_planner_teacher_missed_opportunities(
             }
         } else {
             candidates.push(candidate);
+        }
+    }
+    if let Some(fallback) = observation_forward_fallback {
+        if !candidates
+            .iter()
+            .any(|candidate| candidate.action == fallback.action)
+        {
+            candidates.push(fallback);
         }
     }
     candidates.sort_by(|a, b| {
@@ -15190,10 +15347,14 @@ fn soccer_correlated_full_game_replay_transitions(
         } else {
             away_sum / away_count as f64
         };
-        home_return = (home_mean + SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK * home_return)
-            .clamp(-soccer_full_game_return_clip(), soccer_full_game_return_clip());
-        away_return = (away_mean + SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK * away_return)
-            .clamp(-soccer_full_game_return_clip(), soccer_full_game_return_clip());
+        home_return = (home_mean + SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK * home_return).clamp(
+            -soccer_full_game_return_clip(),
+            soccer_full_game_return_clip(),
+        );
+        away_return = (away_mean + SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK * away_return).clamp(
+            -soccer_full_game_return_clip(),
+            soccer_full_game_return_clip(),
+        );
 
         for idx in indices {
             let mut transition = transitions[*idx].clone();
@@ -15210,8 +15371,10 @@ fn soccer_correlated_full_game_replay_transitions(
                 Some(outcome) => blended + outcome.for_team(transition.team),
                 None => blended,
             };
-            transition.reward =
-                with_outcome.clamp(-soccer_full_game_return_clip(), soccer_full_game_return_clip());
+            transition.reward = with_outcome.clamp(
+                -soccer_full_game_return_clip(),
+                soccer_full_game_return_clip(),
+            );
             transition.done = true;
             replay.push(transition);
         }
@@ -15246,8 +15409,10 @@ fn soccer_dp_value_iteration(
             if count > 0 {
                 value.insert(
                     b,
-                    (sum / count as f64)
-                        .clamp(-soccer_full_game_return_clip(), soccer_full_game_return_clip()),
+                    (sum / count as f64).clamp(
+                        -soccer_full_game_return_clip(),
+                        soccer_full_game_return_clip(),
+                    ),
                 );
             }
         }
@@ -15281,7 +15446,30 @@ fn soccer_dp_nstep_return(
             }
         }
     }
-    ret.clamp(-soccer_full_game_return_clip(), soccer_full_game_return_clip())
+    ret.clamp(
+        -soccer_full_game_return_clip(),
+        soccer_full_game_return_clip(),
+    )
+}
+
+/// Build the outcome-only sequence used by DP terminal credit. Exactly one sample carries the
+/// realized result; fitted value iteration and n-step bootstrap must earn its earlier-state
+/// propagation instead of broadcasting the same label onto every decision.
+fn soccer_dp_terminal_outcome_sequence(
+    seq: &[(u64, f64, u32)],
+    terminal_reward: f64,
+) -> Vec<(u64, f64, u32)> {
+    seq.iter()
+        .enumerate()
+        .map(|(idx, (tick, _, bucket))| {
+            let reward = if idx + 1 == seq.len() {
+                finite_metric(terminal_reward)
+            } else {
+                0.0
+            };
+            (*tick, reward, *bucket)
+        })
+        .collect()
 }
 
 /// Compact, team-relative abstraction of the symbolic MDP state for the DP value table. From the
@@ -15336,9 +15524,11 @@ fn soccer_dp_state_bucket(
 
 /// Fitted-value-iteration replay (approximate dynamic programming). Replaces the pure Monte-Carlo
 /// correlated team return of `soccer_correlated_full_game_replay_transitions` with an **n-step
-/// return bootstrapped by a value-iterated abstract-state table**. The individual-reward blend,
-/// flat outcome label, clamps, and `done` flag are byte-identical to the MC path, so the gate is a
-/// clean A/B that changes ONLY the correlated-return quantity from full-MC to DP-bootstrapped.
+/// return bootstrapped by a value-iterated abstract-state table**. By default the
+/// individual-reward blend, flat outcome label, clamps, and `done` flag are byte-identical to the
+/// MC path. `DD_SOCCER_ENABLE_DP_TERMINAL_OUTCOME_CREDIT=1` is an experimental alternative: the
+/// result appears only on the terminal DP sample and is propagated through fitted value iteration,
+/// rather than being copied onto every transition.
 fn soccer_dp_bootstrapped_replay_transitions(
     transitions: &[SoccerLearningTransition],
     match_outcome: Option<MatchOutcomeReward>,
@@ -15349,6 +15539,7 @@ fn soccer_dp_bootstrapped_replay_transitions(
     let gamma = SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK;
     let horizon = dd_soccer_dp_bootstrap_horizon();
     let sweeps = dd_soccer_dp_bootstrap_sweeps();
+    let terminal_outcome_credit = dd_soccer_enable_dp_terminal_outcome_credit();
     let team_index = |team: Team| -> usize {
         match team {
             Team::Home => 0,
@@ -15392,6 +15583,38 @@ fn soccer_dp_bootstrapped_replay_transitions(
     }
     let value = soccer_dp_value_iteration(&samples, gamma, sweeps);
 
+    // A separate outcome-only fitted value keeps the fixed match anchor out of dense reward and
+    // preserves its full scale when it is added below. Team-relative score buckets distinguish
+    // winning from losing states while pooling equivalent home/away field situations.
+    let mut outcome_correlated: BTreeMap<(usize, u64), f64> = BTreeMap::new();
+    if terminal_outcome_credit {
+        let mut outcome_seq: [Vec<(u64, f64, u32)>; 2] = [Vec::new(), Vec::new()];
+        let mut outcome_samples: Vec<(u32, f64, Option<u32>)> = Vec::new();
+        for (ti, s) in seq.iter().enumerate() {
+            let team = if ti == 0 { Team::Home } else { Team::Away };
+            let terminal_reward = match_outcome
+                .map(|outcome| outcome.for_team(team))
+                .unwrap_or(0.0);
+            outcome_seq[ti] = soccer_dp_terminal_outcome_sequence(s, terminal_reward);
+            for i in 0..outcome_seq[ti].len() {
+                outcome_samples.push((
+                    outcome_seq[ti][i].2,
+                    outcome_seq[ti][i].1,
+                    outcome_seq[ti].get(i + 1).map(|next| next.2),
+                ));
+            }
+        }
+        let outcome_value = soccer_dp_value_iteration(&outcome_samples, gamma, sweeps);
+        for (ti, s) in outcome_seq.iter().enumerate() {
+            for i in 0..s.len() {
+                outcome_correlated.insert(
+                    (ti, s[i].0),
+                    soccer_dp_nstep_return(s, i, horizon, gamma, &outcome_value),
+                );
+            }
+        }
+    }
+
     // n-step bootstrapped correlated return per (team, tick).
     let mut correlated: BTreeMap<(usize, u64), f64> = BTreeMap::new();
     for (ti, s) in seq.iter().enumerate() {
@@ -15403,7 +15626,8 @@ fn soccer_dp_bootstrapped_replay_transitions(
         }
     }
 
-    // Assemble replay: identical blend / outcome / clamp / done to the MC correlated path.
+    // Assemble replay. Gate off remains identical to the prior flat-outcome DP path; gate on adds
+    // the propagated terminal value instead of the flat label.
     let mut replay = Vec::with_capacity(transitions.len());
     for t in transitions {
         let mut transition = t.clone();
@@ -15413,12 +15637,21 @@ fn soccer_dp_bootstrapped_replay_transitions(
             .unwrap_or(0.0);
         let blended = (1.0 - SOCCER_FULL_GAME_RETURN_BLEND) * finite_metric(transition.reward)
             + SOCCER_FULL_GAME_RETURN_BLEND * corr;
-        let with_outcome = match match_outcome {
-            Some(outcome) => blended + outcome.for_team(transition.team),
-            None => blended,
+        let outcome_component = if terminal_outcome_credit {
+            outcome_correlated
+                .get(&(team_index(transition.team), transition.tick))
+                .copied()
+                .unwrap_or(0.0)
+        } else {
+            match_outcome
+                .map(|outcome| outcome.for_team(transition.team))
+                .unwrap_or(0.0)
         };
-        transition.reward =
-            with_outcome.clamp(-soccer_full_game_return_clip(), soccer_full_game_return_clip());
+        let with_outcome = blended + outcome_component;
+        transition.reward = with_outcome.clamp(
+            -soccer_full_game_return_clip(),
+            soccer_full_game_return_clip(),
+        );
         transition.done = true;
         replay.push(transition);
     }
@@ -15496,6 +15729,40 @@ mod soccer_dp_bootstrap_tests {
         // 2 + 0.5·2 + 0.25·V(7=absent→0) = 3.0.
         assert!((r - 3.0).abs() < 1e-9, "got {r}");
     }
+
+    #[test]
+    fn terminal_outcome_credit_is_sparse_then_propagated_by_dp() {
+        let dense_seq = vec![(0u64, 9.0, 0u32), (1, -4.0, 1), (2, 3.0, 2)];
+        let outcome_seq = soccer_dp_terminal_outcome_sequence(&dense_seq, 200.0);
+        assert_eq!(
+            outcome_seq
+                .iter()
+                .map(|sample| sample.1)
+                .collect::<Vec<_>>(),
+            vec![0.0, 0.0, 200.0],
+            "the fixed match anchor must exist on the terminal sample only"
+        );
+
+        let samples = outcome_seq
+            .iter()
+            .enumerate()
+            .map(|(idx, sample)| {
+                (
+                    sample.2,
+                    sample.1,
+                    outcome_seq.get(idx + 1).map(|next| next.2),
+                )
+            })
+            .collect::<Vec<_>>();
+        let value = soccer_dp_value_iteration(&samples, 0.9, 80);
+        let early = soccer_dp_nstep_return(&outcome_seq, 0, 1, 0.9, &value);
+        let terminal = soccer_dp_nstep_return(&outcome_seq, 2, 1, 0.9, &value);
+        assert!(
+            early > 0.0 && early < terminal,
+            "early={early} terminal={terminal}"
+        );
+        assert!((terminal - 200.0).abs() < 1e-6, "terminal={terminal}");
+    }
 }
 
 fn soccer_outcome_credit_replay_transitions(
@@ -15517,8 +15784,10 @@ fn soccer_outcome_credit_replay_transitions(
             .unwrap_or(0.0);
         let milestone_reward = soccer_outcome_credit_milestone_reward(&transition);
         let pitch_shaping = soccer_outcome_credit_pitch_value_shaping(&transition);
-        transition.reward = finite_metric(outcome_reward + milestone_reward + pitch_shaping)
-            .clamp(-soccer_full_game_return_clip(), soccer_full_game_return_clip());
+        transition.reward = finite_metric(outcome_reward + milestone_reward + pitch_shaping).clamp(
+            -soccer_full_game_return_clip(),
+            soccer_full_game_return_clip(),
+        );
         transition.done = true;
         replay.push(transition);
     }
@@ -23023,6 +23292,15 @@ pub(crate) fn dd_soccer_enable_dp_bootstrap() -> bool {
     *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_DP_BOOTSTRAP"))
 }
 
+/// Experimental DP-compatible match-result anchor. ON places the result on the terminal fitted-DP
+/// sample and propagates it through the abstract value model; OFF preserves the existing flat
+/// per-transition outcome label exactly. Meaningful only when DP bootstrap is enabled.
+fn dd_soccer_enable_dp_terminal_outcome_credit() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| soccer_env_flag_enabled(DD_SOCCER_DP_TERMINAL_OUTCOME_CREDIT_ENV))
+}
+
 /// n-step horizon (in decision ticks) for the DP-bootstrapped return. After this many ticks the
 /// return bootstraps off the value-iterated abstract table instead of continuing the Monte-Carlo
 /// sum. Small ⇒ low variance but leans hard on the DP value; large ⇒ closer to full MC. Default 16.
@@ -24327,7 +24605,7 @@ fn completed_flank_pass_reward(
 /// Forward-pass-primacy shaping (measure advancement by COMPLETED FORWARD PASSES, not shots taken).
 /// Scales the completed-pass reward so progressive build-up can be made the primary dense signal —
 /// today a completed forward pass is worth ~3-11 pts vs a shot-on-target's 80, so the net is pulled
-/// to shoot rather than progress. Env `DD_SOCCER_FORWARD_PASS_REWARD_SCALE` (clamped 0-20),
+/// to shoot rather than progress. Env `DD_SOCCER_FORWARD_PASS_REWARD_SCALE` (clamped 0.10-4.0),
 /// default 1.0 ⇒ byte-identical.
 fn dynamic_reward_weights_enabled() -> bool {
     soccer_env_flag_enabled("SOCCER_DYNAMIC_REWARD_WEIGHTS")
@@ -24399,26 +24677,50 @@ fn grounded_non_conversion_reward_scale(
 
 pub(crate) fn forward_pass_reward_scale() -> f64 {
     if dynamic_reward_weights_enabled() {
-        return reward_weight_env("DD_SOCCER_FORWARD_PASS_REWARD_SCALE", 1.0, 0.0, 20.0);
+        return reward_weight_env(
+            "DD_SOCCER_FORWARD_PASS_REWARD_SCALE",
+            1.0,
+            SPARSE_ACTION_REWARD_SCALE_BOUNDS.0,
+            SPARSE_ACTION_REWARD_SCALE_BOUNDS.1,
+        );
     }
     use std::sync::OnceLock;
     static V: OnceLock<f64> = OnceLock::new();
-    *V.get_or_init(|| reward_weight_env("DD_SOCCER_FORWARD_PASS_REWARD_SCALE", 1.0, 0.0, 20.0))
+    *V.get_or_init(|| {
+        reward_weight_env(
+            "DD_SOCCER_FORWARD_PASS_REWARD_SCALE",
+            1.0,
+            SPARSE_ACTION_REWARD_SCALE_BOUNDS.0,
+            SPARSE_ACTION_REWARD_SCALE_BOUNDS.1,
+        )
+    })
 }
 
 /// Scale for the CONSECUTIVE-forward-pass (build-up chain) event rewards
 /// (`PASS_CHAIN_TWO_FORWARD_EVENT_REWARD_POINTS` / `..THREE_NET_FORWARD..`). These fire only for
 /// strings of forward passes, so amplifying them rewards sustained progression (build-up) rather
 /// than single hopeful forward balls — a quality signal complementary to deferred credit. Env
-/// `DD_SOCCER_PASS_CHAIN_REWARD_SCALE`, clamped [1e-4,20] (reward_weight_env floors the min at the
-/// 1e-4 non-zero weight floor so the channel never fully dies), default 1.0 => byte-identical.
+/// `DD_SOCCER_PASS_CHAIN_REWARD_SCALE`, clamped to the sane sparse-action band,
+/// default 1.0 => byte-identical.
 pub(crate) fn pass_chain_reward_scale() -> f64 {
     if dynamic_reward_weights_enabled() {
-        return reward_weight_env("DD_SOCCER_PASS_CHAIN_REWARD_SCALE", 1.0, 0.0, 20.0);
+        return reward_weight_env(
+            "DD_SOCCER_PASS_CHAIN_REWARD_SCALE",
+            1.0,
+            SPARSE_ACTION_REWARD_SCALE_BOUNDS.0,
+            SPARSE_ACTION_REWARD_SCALE_BOUNDS.1,
+        );
     }
     use std::sync::OnceLock;
     static V: OnceLock<f64> = OnceLock::new();
-    *V.get_or_init(|| reward_weight_env("DD_SOCCER_PASS_CHAIN_REWARD_SCALE", 1.0, 0.0, 20.0))
+    *V.get_or_init(|| {
+        reward_weight_env(
+            "DD_SOCCER_PASS_CHAIN_REWARD_SCALE",
+            1.0,
+            SPARSE_ACTION_REWARD_SCALE_BOUNDS.0,
+            SPARSE_ACTION_REWARD_SCALE_BOUNDS.1,
+        )
+    })
 }
 
 /// Coupled turnover scaling for the forward-pass-primacy curriculum. If completed
@@ -24428,12 +24730,22 @@ pub(crate) fn pass_chain_reward_scale() -> f64 {
 /// forward-pass reward ablations do not make giveaways cheaper than baseline.
 pub(crate) fn forward_pass_turnover_penalty_scale() -> f64 {
     let completion_primary_scale = if dynamic_reward_weights_enabled() {
-        reward_weight_env("DD_SOCCER_PASS_TURNOVER_PENALTY_SCALE", 1.0, 1.0, 20.0)
+        reward_weight_env(
+            "DD_SOCCER_PASS_TURNOVER_PENALTY_SCALE",
+            1.0,
+            TURNOVER_PENALTY_SCALE_BOUNDS.0,
+            TURNOVER_PENALTY_SCALE_BOUNDS.1,
+        )
     } else {
         use std::sync::OnceLock;
         static COMPLETION_PRIMARY_SCALE: OnceLock<f64> = OnceLock::new();
         *COMPLETION_PRIMARY_SCALE.get_or_init(|| {
-            reward_weight_env("DD_SOCCER_PASS_TURNOVER_PENALTY_SCALE", 1.0, 1.0, 20.0)
+            reward_weight_env(
+                "DD_SOCCER_PASS_TURNOVER_PENALTY_SCALE",
+                1.0,
+                TURNOVER_PENALTY_SCALE_BOUNDS.0,
+                TURNOVER_PENALTY_SCALE_BOUNDS.1,
+            )
         })
     };
     forward_pass_reward_scale()
@@ -24444,15 +24756,15 @@ pub(crate) fn forward_pass_turnover_penalty_scale() -> f64 {
 /// Companion dampener for the shot-TAKEN shaping proxy (on-/off-target reward, NOT the goal or
 /// terminal-outcome reward, which stay intact — the net must still finish). Lets a forward-pass-
 /// primacy A/B stop the net shooting early instead of building up. Env
-/// `DD_SOCCER_SHOT_SHAPING_REWARD_SCALE` (input clamped [1e-4,4.0]), default 1.0 ⇒
+/// `DD_SOCCER_SHOT_SHAPING_REWARD_SCALE` (input clamped [0.05,2.5]), default 1.0 ⇒
 /// unchanged; the effective scale is then grounded below goal-chain conversion.
 pub(crate) fn shot_shaping_reward_scale() -> f64 {
     let raw = if dynamic_reward_weights_enabled() {
-        reward_weight_env("DD_SOCCER_SHOT_SHAPING_REWARD_SCALE", 1.0, 1e-4, 4.0)
+        reward_weight_env("DD_SOCCER_SHOT_SHAPING_REWARD_SCALE", 1.0, 0.05, 2.5)
     } else {
         use std::sync::OnceLock;
         static V: OnceLock<f64> = OnceLock::new();
-        *V.get_or_init(|| reward_weight_env("DD_SOCCER_SHOT_SHAPING_REWARD_SCALE", 1.0, 1e-4, 4.0))
+        *V.get_or_init(|| reward_weight_env("DD_SOCCER_SHOT_SHAPING_REWARD_SCALE", 1.0, 0.05, 2.5))
     };
     grounded_non_conversion_reward_scale(raw, SHOT_ON_TARGET_REWARD_POINTS, GOAL_REWARD_POINTS)
 }
@@ -24461,10 +24773,9 @@ pub(crate) fn shot_shaping_reward_scale() -> f64 {
 /// (on-frame). Paid in the sparse/terminal layer (OUTSIDE the +/-4 dense clamp), so it is a
 /// real terminal-scale pull toward finishing — the missing counterpart to the goal reward.
 /// Bonus = w * SHOT_ON_TARGET_REWARD_POINTS(80) * shot_on_frame_probability, on a shot action.
-/// (The engine's 80-pt "shot on target" was telemetry-only/inert; the live on-frame signal was
-/// ~1-3 pts vs a ~800 goal — no anchor.) Env `DD_SOCCER_ON_FRAME_SHOT_REWARD_SCALE`, clamped
-/// [0, 8], default **0.0** => byte-identical off. The effective scale is grounded so the
-/// maximum non-converting on-frame bonus remains at least 5 points below the live goal reward.
+/// Env `DD_SOCCER_ON_FRAME_SHOT_REWARD_SCALE` accepts [0, 8], default **0.0** => byte-identical
+/// off for this predictive bonus. Its effective scale is grounded to the 50-200 realized-shot
+/// band and remains well below the fixed 500-point goal reward.
 pub(crate) fn on_frame_shot_reward_scale() -> f64 {
     let raw = if dynamic_reward_weights_enabled() {
         optional_reward_weight_env("DD_SOCCER_ON_FRAME_SHOT_REWARD_SCALE", 0.0, 8.0)
@@ -24475,7 +24786,7 @@ pub(crate) fn on_frame_shot_reward_scale() -> f64 {
             optional_reward_weight_env("DD_SOCCER_ON_FRAME_SHOT_REWARD_SCALE", 0.0, 8.0)
         })
     };
-    let conversion_points = tunables().reward.goal_scored_points * goal_reward_scale();
+    let conversion_points = GOAL_REWARD_POINTS;
     grounded_non_conversion_reward_scale(raw, SHOT_ON_TARGET_REWARD_POINTS, conversion_points)
 }
 
@@ -24545,14 +24856,23 @@ fn hierarchy_bounded_shot_on_target_points(shot_scale: f64, goal_scale: f64) -> 
     let raw = SHOT_ON_TARGET_REWARD_POINTS * shot_scale.max(MIN_SOCCER_REWARD_WEIGHT);
     let outcome_ceiling =
         GOAL_REWARD_POINTS * goal_scale.max(1.0) - CONVERSION_OVER_SHOT_REWARD_MARGIN;
-    raw.min(outcome_ceiling.max(MIN_SOCCER_REWARD_WEIGHT))
+    raw.clamp(
+        ON_FRAME_SHOT_MIN_REWARD_POINTS,
+        outcome_ceiling
+            .min(ON_FRAME_SHOT_MAX_REWARD_POINTS)
+            .max(ON_FRAME_SHOT_MIN_REWARD_POINTS),
+    )
 }
 
 fn hierarchy_projected_match_win_points(requested: f64, goal_scale: f64) -> f64 {
-    requested.max(GOAL_REWARD_POINTS * goal_scale.max(1.0) + WIN_OVER_CONVERSION_REWARD_MARGIN)
+    let _legacy_request = (requested, goal_scale);
+    MATCH_OUTCOME_WIN_REWARD_POINTS
 }
 
-pub(crate) fn match_outcome_win_reward_points() -> f64 {
+/// Effective win-reward anchor after applying the configured goal-over-shot and
+/// win-over-goal hierarchy. Public so experiment binaries can report the treatment
+/// that actually executed instead of only the requested environment value.
+pub fn match_outcome_win_reward_points() -> f64 {
     if anchored_rewards_enabled() {
         // Anchored currency: winning the match IS the 1000-point anchor. The
         // env knob and the goal-scale floor are bypassed — the floor logic
@@ -24583,6 +24903,18 @@ pub(crate) fn match_outcome_win_reward_points() -> f64 {
 
 pub(crate) fn bounded_shot_on_target_reward_points() -> f64 {
     hierarchy_bounded_shot_on_target_points(shot_shaping_reward_scale(), goal_reward_scale())
+}
+
+pub(crate) fn contextual_on_frame_shot_reward_points(field_vector_scale: f64) -> f64 {
+    let field_vector_scale = if field_vector_scale.is_finite() {
+        field_vector_scale.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (bounded_shot_on_target_reward_points() * field_vector_scale).clamp(
+        ON_FRAME_SHOT_MIN_REWARD_POINTS,
+        ON_FRAME_SHOT_MAX_REWARD_POINTS,
+    )
 }
 
 pub(crate) fn bounded_shot_on_target_reward_scale() -> f64 {
@@ -24627,23 +24959,41 @@ pub(crate) fn shot_commitment_reward_scale() -> f64 {
 /// ~6 — comparable to the base forward-pass reward — while a square/backward ball earns ~0 or negative.
 /// Scale the DRIBBLE-BEAT / take-on / nutmeg reward (beating a defender ON THE
 /// DRIBBLE) — distinct from the progressive-carry reward (`carry_reward_scale`).
-/// Env `DD_SOCCER_DRIBBLE_BEAT_REWARD_SCALE`; dynamic-mode bidirectional [0, 8]
+/// Env `DD_SOCCER_DRIBBLE_BEAT_REWARD_SCALE`; clamped to the sane sparse-action
+/// band
 /// so a reward search can tune the take-on incentive up or down. Default 1.0 =
 /// byte-identical.
 pub(crate) fn dribble_beat_reward_scale() -> f64 {
     if dynamic_reward_weights_enabled() {
-        return reward_weight_env("DD_SOCCER_DRIBBLE_BEAT_REWARD_SCALE", 1.0, 1e-4, 8.0);
+        return reward_weight_env(
+            "DD_SOCCER_DRIBBLE_BEAT_REWARD_SCALE",
+            1.0,
+            SPARSE_ACTION_REWARD_SCALE_BOUNDS.0,
+            SPARSE_ACTION_REWARD_SCALE_BOUNDS.1,
+        );
     }
     use std::sync::OnceLock;
     static V: OnceLock<f64> = OnceLock::new();
-    *V.get_or_init(|| reward_weight_env("DD_SOCCER_DRIBBLE_BEAT_REWARD_SCALE", 1.0, 1e-4, 8.0))
+    *V.get_or_init(|| {
+        reward_weight_env(
+            "DD_SOCCER_DRIBBLE_BEAT_REWARD_SCALE",
+            1.0,
+            SPARSE_ACTION_REWARD_SCALE_BOUNDS.0,
+            SPARSE_ACTION_REWARD_SCALE_BOUNDS.1,
+        )
+    })
 }
 
 pub(crate) fn learned_epv_reward_scale() -> f64 {
     // Dynamic-reward mode: the learned-EPV (expected-possession-value) shaping is a
     // reward weight too — let a search tune it alongside the rest of the vector.
     if dynamic_reward_weights_enabled() {
-        return reward_weight_env("DD_SOCCER_LEARNED_EPV_REWARD_SCALE", 20.0, 1e-4, 200.0);
+        return reward_weight_env(
+            "DD_SOCCER_LEARNED_EPV_REWARD_SCALE",
+            20.0,
+            LEARNED_EPV_REWARD_SCALE_BOUNDS.0,
+            LEARNED_EPV_REWARD_SCALE_BOUNDS.1,
+        );
     }
     use std::sync::OnceLock;
     static V: OnceLock<f64> = OnceLock::new();
@@ -24653,7 +25003,10 @@ pub(crate) fn learned_epv_reward_scale() -> f64 {
             .and_then(|raw| raw.trim().parse::<f64>().ok())
             .filter(|v| v.is_finite())
             .unwrap_or(20.0)
-            .clamp(MIN_SOCCER_REWARD_WEIGHT, 200.0)
+            .clamp(
+                LEARNED_EPV_REWARD_SCALE_BOUNDS.0,
+                LEARNED_EPV_REWARD_SCALE_BOUNDS.1,
+            )
     })
 }
 
@@ -26697,6 +27050,8 @@ fn soccer_decision_context_for(
         legal_action_option_count: 0,
         chosen_action_probability: 0.0,
         behavior_policy_probability: None,
+        actor_policy_probability: None,
+        legal_policy_action_mask: Vec::new(),
         neural_mcts_selected: false,
         neural_mcts_candidate_count: 0,
         neural_mcts_discretized_kick_candidate_count: 0,
@@ -26780,6 +27135,19 @@ fn soccer_decision_context_with_trace(
     // probability instead of recomputing the actor head's own softmax — `None`
     // (the default) leaves on-policy learning exactly as it was.
     context.behavior_policy_probability = decision.behavior_policy_probability;
+    context.actor_policy_probability = decision.actor_policy_probability;
+    let mut legal_policy_action_mask = vec![false; SOCCER_POLICY_ACTIONS.len()];
+    for option in decision.action_options.iter().filter(|option| option.legal) {
+        if let Some(index) = soccer_policy_action_index(&option.label) {
+            legal_policy_action_mask[index] = true;
+        }
+    }
+    if let Some(index) = soccer_policy_action_index(&decision.action) {
+        legal_policy_action_mask[index] = true;
+    }
+    if legal_policy_action_mask.iter().any(|legal| *legal) {
+        context.legal_policy_action_mask = legal_policy_action_mask;
+    }
     context.neural_mcts_selected = decision.neural_mcts_selected;
     context.neural_mcts_candidate_count = decision.neural_mcts_candidate_count;
     context.neural_mcts_discretized_kick_candidate_count =
@@ -27603,14 +27971,12 @@ fn soccer_transition_reward_with_tactics(
         ),
     };
     let reward_cfg = &tunables().reward;
-    // Amplify the sparse terminal GOAL reward so it dominates the dense possession/completion shaping
-    // (root cause of the possession-safe collapse). Env DD_SOCCER_GOAL_REWARD_SCALE, default 1.0.
-    reward += (after_for as f64 - before_for as f64)
-        * reward_cfg.goal_scored_points
-        * goal_reward_scale();
+    // Fixed conversion anchor. The contextual shot/pass/movement terms around it
+    // remain learnable, but config drift cannot redefine the sport's objective.
+    reward += (after_for as f64 - before_for as f64) * GOAL_REWARD_POINTS;
     if after_against > before_against {
         // The concede STICK, mirror of the goal CARROT above. By default it is deliberately
-        // light (8/2 vs a +100 goal). The concede-symmetry rebalance (gated, default-OFF) swaps
+        // light (8/2 vs a +500 goal). The concede-symmetry rebalance (gated, default-OFF) swaps
         // in the heavier `*_symmetric` values so conceding becomes a real counterweight to
         // scoring — a full-parity hit for the back line, a role-graded share for outfielders —
         // rather than a token cost. OFF ⇒ the original 8/2 values, byte-identical baseline / A/B.
@@ -27627,15 +27993,8 @@ fn soccer_transition_reward_with_tactics(
             } else {
                 reward_cfg.concede_outfield_penalty
             };
-        // Keep the concede STICK on the SAME multiplier as the goal CARROT above
-        // (goal_reward_scale). Otherwise cranking the sparse-terminal lever (e.g.
-        // DD_SOCCER_GOAL_REWARD_SCALE=8, the goal-dom regime) amplifies scoring but
-        // leaves conceding at the light baseline, blowing the carrot:stick ratio to
-        // ~200:1 and erasing the defensive signal (both self-play teams go all-out
-        // attack and leak at the back). Scaling both together preserves the ratio as
-        // the terminal signal rises above the dense floor. At the default scale of
-        // 1.0 this is byte-identical to the prior baseline — it only bites once the
-        // goal scale is raised above 1.
+        // The compatibility scale is fixed at 1.0 now that the 500-point goal is
+        // an invariant. Concede magnitudes remain role-sensitive tunables.
         reward -= concede_penalty * goal_reward_scale();
     }
 
@@ -28799,18 +29158,20 @@ fn dense_soccer_transition_reward(
                 };
                 let pressure_multiplier =
                     (1.0 - before_obs.perceived_pressure.clamp(0.0, 1.0) * 0.22).clamp(0.70, 1.0);
-                // Carrying the ball forward is far more valuable in the attacking
-                // half (beats defenders, creates chances) than knocking it around
-                // our own half, so reward opponent-half dribbling more.
-                let half_multiplier = if own_half_holder { 0.90 } else { 1.40 };
+                let field_context_multiplier = field_vector_carry_zone_multiplier(
+                    player.team,
+                    before.ball.position,
+                    before.field_length,
+                    before_obs.perceived_pressure,
+                );
                 reward += carry_progress
                     * DENSE_FORWARD_CARRY_PROGRESS_REWARD_PER_YARD
                     * role_multiplier
                     * pressure_multiplier
-                    * half_multiplier
+                    * field_context_multiplier
                     * carry_reward_scale();
                 if carry_progress >= 6.0 {
-                    reward += 0.18 * role_multiplier * half_multiplier;
+                    reward += 0.18 * role_multiplier * field_context_multiplier;
                 }
             } else if carry_progress < -1.25 && before_obs.perceived_pressure < 0.30 {
                 reward -= 0.42;
@@ -42783,6 +43144,7 @@ struct SoccerPolicySample {
     action_index: usize,
     advantage: f64,
     old_action_probability: Option<f64>,
+    legal_action_mask: Vec<bool>,
     sample_weight: f64,
     mcts_distillation: bool,
     /// In-memory only (not serialized): the sampled action was a FORWARD pass into a good forward
@@ -42811,6 +43173,21 @@ struct SoccerPolicyTrainingBatch {
 }
 
 impl SoccerPolicySample {
+    fn effective_legal_action_mask(&self) -> &[bool] {
+        if self.legal_action_mask.len() == SOCCER_POLICY_ACTIONS.len()
+            && self
+                .legal_action_mask
+                .get(self.action_index)
+                .copied()
+                .unwrap_or(false)
+            && self.legal_action_mask.iter().any(|legal| *legal)
+        {
+            &self.legal_action_mask
+        } else {
+            &SOCCER_POLICY_ALL_ACTIONS_LEGAL
+        }
+    }
+
     fn sanitized_weight(&self) -> f64 {
         if self.sample_weight.is_finite() {
             self.sample_weight
@@ -42994,6 +43371,31 @@ struct SoccerPolicyRoleHead {
     last_loss: Option<f64>,
 }
 
+/// Coefficient multiplying `grad(log pi(a|s))` for PPO's clipped surrogate.
+///
+/// The clipped branch is constant with respect to the current policy, so its
+/// gradient must be exactly zero once a beneficial update crosses the trust
+/// region. Passing `advantage * clipped_ratio` to a plain REINFORCE update is
+/// not equivalent: it continues moving the policy beyond the clip boundary.
+fn soccer_mappo_clipped_policy_gradient_coefficient(
+    advantage: f64,
+    ratio: f64,
+    clip_epsilon: f64,
+) -> f64 {
+    let epsilon = clip_epsilon.clamp(0.01, 1.0);
+    let ratio = ratio.clamp(0.0, 10.0);
+    let clipped_branch_is_active = if advantage >= 0.0 {
+        ratio > 1.0 + epsilon
+    } else {
+        ratio < 1.0 - epsilon
+    };
+    if clipped_branch_is_active {
+        0.0
+    } else {
+        advantage * ratio
+    }
+}
+
 impl SoccerPolicyRoleHead {
     fn new(role_group: SoccerPolicyRoleGroup, seed: u32) -> Self {
         let role_seed = seed ^ role_group.seed_salt();
@@ -43031,6 +43433,14 @@ impl SoccerPolicyRoleHead {
         &self,
         state_features: &[f64; SOCCER_POLICY_FEATURE_DIM],
     ) -> Option<Vec<f64>> {
+        self.action_distribution_with_mask(state_features, None)
+    }
+
+    fn action_distribution_with_mask(
+        &self,
+        state_features: &[f64; SOCCER_POLICY_FEATURE_DIM],
+        legal_action_mask: Option<&[bool]>,
+    ) -> Option<Vec<f64>> {
         if self.network.input_dim != SOCCER_POLICY_FEATURE_DIM
             || self.network.output_dim != SOCCER_POLICY_ACTIONS.len()
         {
@@ -43039,8 +43449,18 @@ impl SoccerPolicyRoleHead {
         if state_features.iter().any(|value| !value.is_finite()) {
             return None;
         }
+        if legal_action_mask.is_some_and(|mask| {
+            mask.len() != SOCCER_POLICY_ACTIONS.len() || !mask.iter().any(|legal| *legal)
+        }) {
+            return None;
+        }
         let role = self.role_group.as_player_role();
-        let mut probs = self.network.action_probabilities(&state_features[..]);
+        let mut probs = match legal_action_mask {
+            Some(mask) => self
+                .network
+                .action_probabilities_masked(&state_features[..], mask),
+            None => self.network.action_probabilities(&state_features[..]),
+        };
         if probs.iter().any(|p| !p.is_finite()) {
             return None;
         }
@@ -43057,7 +43477,33 @@ impl SoccerPolicyRoleHead {
             {
                 return None;
             }
-            let local = specialist.network.action_probabilities(&state_features[..]);
+            let local_mask = legal_action_mask.map(|mask| {
+                specialist
+                    .kind
+                    .actions()
+                    .iter()
+                    .map(|action| {
+                        SOCCER_POLICY_ACTIONS
+                            .iter()
+                            .position(|candidate| candidate == action)
+                            .and_then(|index| mask.get(index))
+                            .copied()
+                            .unwrap_or(false)
+                    })
+                    .collect::<Vec<_>>()
+            });
+            if local_mask
+                .as_ref()
+                .is_some_and(|mask| !mask.iter().any(|legal| *legal))
+            {
+                continue;
+            }
+            let local = match local_mask.as_deref() {
+                Some(mask) => specialist
+                    .network
+                    .action_probabilities_masked(&state_features[..], mask),
+                None => specialist.network.action_probabilities(&state_features[..]),
+            };
             if local.iter().any(|p| !p.is_finite()) {
                 return None;
             }
@@ -43090,20 +43536,20 @@ impl SoccerPolicyRoleHead {
         if !old_prob.is_finite() || old_prob <= 1e-9 {
             return None;
         }
-        let current_probs = self.action_distribution(&sample.state_features)?;
+        let current_probs = self.action_distribution_with_mask(
+            &sample.state_features,
+            Some(sample.effective_legal_action_mask()),
+        )?;
         let current_prob = current_probs.get(sample.action_index).copied()?;
         if !current_prob.is_finite() || current_prob <= 0.0 {
             return None;
         }
-        let epsilon = clip_epsilon.clamp(0.01, 1.0);
         let ratio = (current_prob / old_prob).clamp(0.0, 10.0);
-        let clipped = ratio.clamp(1.0 - epsilon, 1.0 + epsilon);
-        let ppo_ratio = if sample.advantage >= 0.0 {
-            ratio.min(clipped)
-        } else {
-            ratio.max(clipped)
-        };
-        Some(sample.advantage * ppo_ratio)
+        Some(soccer_mappo_clipped_policy_gradient_coefficient(
+            sample.advantage,
+            ratio,
+            clip_epsilon,
+        ))
     }
 
     fn train(
@@ -43111,6 +43557,7 @@ impl SoccerPolicyRoleHead {
         samples: &[SoccerPolicySample],
         mappo_clip_epsilon: Option<f64>,
     ) -> (usize, f64) {
+        let policy_learning_rate = soccer_policy_learning_rate();
         let role = self.role_group.as_player_role();
         let prepared: Vec<(&SoccerPolicySample, f64)> = samples
             .iter()
@@ -43131,12 +43578,13 @@ impl SoccerPolicyRoleHead {
         let mut applied = 0usize;
         for (sample, advantage) in &prepared {
             let weighted_advantage = sample.weighted_advantage(*advantage);
-            let result = self.network.train_policy_gradient_sample(
+            let result = self.network.train_policy_gradient_sample_masked(
                 &sample.state_features[..],
                 sample.action_index,
+                sample.effective_legal_action_mask(),
                 weighted_advantage,
                 soccer_policy_entropy_coeff(),
-                SOCCER_POLICY_LEARNING_RATE,
+                policy_learning_rate,
                 SOCCER_POLICY_GRAD_CLIP_NORM,
             );
             if result.applied && result.loss.is_finite() {
@@ -43160,12 +43608,33 @@ impl SoccerPolicyRoleHead {
                     continue;
                 };
                 let weighted_advantage = sample.weighted_advantage(*advantage);
-                let result = specialist.network.train_policy_gradient_sample(
+                let specialist_mask = specialist
+                    .kind
+                    .actions()
+                    .iter()
+                    .map(|action| {
+                        SOCCER_POLICY_ACTIONS
+                            .iter()
+                            .position(|candidate| candidate == action)
+                            .and_then(|index| sample.effective_legal_action_mask().get(index))
+                            .copied()
+                            .unwrap_or(false)
+                    })
+                    .collect::<Vec<_>>();
+                if !specialist_mask
+                    .get(local_action_index)
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let result = specialist.network.train_policy_gradient_sample_masked(
                     &sample.state_features[..],
                     local_action_index,
+                    &specialist_mask,
                     weighted_advantage,
                     soccer_policy_entropy_coeff(),
-                    SOCCER_POLICY_LEARNING_RATE,
+                    policy_learning_rate,
                     SOCCER_POLICY_GRAD_CLIP_NORM,
                 );
                 if result.applied && result.loss.is_finite() {
@@ -43261,6 +43730,16 @@ impl SoccerPolicyHead {
             .action_distribution(state_features)
     }
 
+    fn action_distribution_for_role_with_mask(
+        &self,
+        state_features: &[f64; SOCCER_POLICY_FEATURE_DIM],
+        role: PlayerRole,
+        legal_action_mask: &[bool],
+    ) -> Option<Vec<f64>> {
+        self.role_head_for_role(role)?
+            .action_distribution_with_mask(state_features, Some(legal_action_mask))
+    }
+
     fn clipped_mappo_advantage(
         &self,
         sample: &SoccerPolicySample,
@@ -43317,7 +43796,8 @@ impl SoccerPolicyHead {
         if gradient == 0.0 || !gradient.is_finite() {
             return;
         }
-        let updated = self.forward_select_logit_weight + SOCCER_POLICY_LEARNING_RATE * gradient;
+        let updated = self.forward_select_logit_weight
+            + soccer_forward_select_logit_learning_rate() * gradient;
         if updated.is_finite() {
             self.forward_select_logit_weight =
                 updated.clamp(0.0, SOCCER_FORWARD_SELECT_LOGIT_WEIGHT_MAX);
@@ -43334,6 +43814,31 @@ fn soccer_forward_select_logit_weight_env_override() -> Option<f64> {
         .and_then(|raw| raw.trim().parse::<f64>().ok())
         .filter(|value| value.is_finite())
         .map(|value| value.clamp(0.0, SOCCER_FORWARD_SELECT_LOGIT_WEIGHT_MAX))
+}
+
+fn soccer_forward_select_logit_learning_rate() -> f64 {
+    soccer_planner_teacher_env_f64(
+        "DD_SOCCER_FORWARD_SELECT_LOGIT_LEARNING_RATE",
+        SOCCER_POLICY_LEARNING_RATE,
+        0.0,
+        SOCCER_FORWARD_SELECT_LOGIT_LEARNING_RATE_MAX,
+    )
+}
+
+fn soccer_policy_learning_rate() -> f64 {
+    soccer_planner_teacher_env_f64(
+        "DD_SOCCER_POLICY_LEARNING_RATE",
+        SOCCER_POLICY_LEARNING_RATE,
+        0.0,
+        MAX_SOCCER_NEURAL_LEARNING_RATE,
+    )
+}
+
+fn soccer_forward_select_logit_weight_override_on_restore() -> bool {
+    soccer_planner_teacher_env_bool(
+        "DD_SOCCER_FORWARD_SELECT_LOGIT_WEIGHT_OVERRIDE_ON_RESTORE",
+        true,
+    )
 }
 
 #[cfg(test)]
@@ -43370,6 +43875,56 @@ mod soccer_policy_actor_capacity_tests {
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().expect("test poison soccer policy env lock")
+    }
+
+    #[test]
+    fn mappo_clip_has_zero_gradient_on_saturated_branch() {
+        let epsilon = 0.20;
+
+        assert_eq!(
+            soccer_mappo_clipped_policy_gradient_coefficient(2.0, 1.21, epsilon),
+            0.0,
+            "positive advantage must stop increasing probability above the upper clip"
+        );
+        assert_eq!(
+            soccer_mappo_clipped_policy_gradient_coefficient(-2.0, 0.79, epsilon),
+            0.0,
+            "negative advantage must stop decreasing probability below the lower clip"
+        );
+        assert!(
+            (soccer_mappo_clipped_policy_gradient_coefficient(2.0, 1.10, epsilon) - 2.20).abs()
+                < 1e-12
+        );
+        assert!(
+            (soccer_mappo_clipped_policy_gradient_coefficient(-2.0, 0.90, epsilon) + 1.80).abs()
+                < 1e-12
+        );
+    }
+
+    #[test]
+    fn policy_actor_mask_assigns_zero_probability_to_illegal_actions() {
+        let head = SoccerPolicyHead::new(73);
+        let mut features = [0.0; SOCCER_POLICY_FEATURE_DIM];
+        features[SOCCER_NEURAL_FEATURE_DIM
+            ..SOCCER_NEURAL_FEATURE_DIM + SOCCER_POLICY_ROLE_EMBEDDING_DIM]
+            .copy_from_slice(&soccer_policy_role_embedding(PlayerRole::Midfielder));
+        let pass_index = soccer_policy_action_index("pass").expect("pass index");
+        let dribble_index = soccer_policy_action_index("dribble").expect("dribble index");
+        let mut mask = vec![false; SOCCER_POLICY_ACTIONS.len()];
+        mask[pass_index] = true;
+        mask[dribble_index] = true;
+
+        let probabilities = head
+            .action_distribution_for_role_with_mask(&features, PlayerRole::Midfielder, &mask)
+            .expect("masked actor distribution");
+
+        assert!((probabilities.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+        assert!(probabilities[pass_index] > 0.0);
+        assert!(probabilities[dribble_index] > 0.0);
+        assert!(probabilities
+            .iter()
+            .enumerate()
+            .all(|(index, probability)| mask[index] || *probability == 0.0));
     }
 
     #[test]
@@ -43491,6 +44046,42 @@ mod soccer_policy_actor_capacity_tests {
         let restored_corrupt =
             soccer_policy_head_from_snapshot(&corrupt, 21).expect("restore corrupt policy");
         assert_eq!(restored_corrupt.forward_select_logit_weight, 0.0);
+    }
+
+    #[test]
+    fn forward_select_restore_override_can_preserve_learned_checkpoint_weight() {
+        let _lock = env_lock();
+        let _gate = set_test_env_var("DD_SOCCER_ENABLE_FORWARD_SELECT_LOGIT", "1");
+        let _weight = set_test_env_var("DD_SOCCER_FORWARD_SELECT_LOGIT_WEIGHT", "2.0");
+        let _restore = set_test_env_var(
+            "DD_SOCCER_FORWARD_SELECT_LOGIT_WEIGHT_OVERRIDE_ON_RESTORE",
+            "0",
+        );
+        let mut head = SoccerPolicyHead::new(22);
+        head.forward_select_logit_weight = 3.25;
+        let snapshot = soccer_policy_head_snapshot(&head);
+
+        let restored = soccer_policy_head_from_snapshot(&snapshot, 22).expect("restore policy");
+
+        assert_eq!(restored.forward_select_logit_weight, 3.25);
+    }
+
+    #[test]
+    fn forward_select_scalar_learning_rate_is_independently_tunable() {
+        let _lock = env_lock();
+        let _rate = set_test_env_var("DD_SOCCER_FORWARD_SELECT_LOGIT_LEARNING_RATE", "0.0075");
+
+        assert_eq!(soccer_forward_select_logit_learning_rate(), 0.0075);
+    }
+
+    #[test]
+    fn joint_actor_learning_rate_is_tunable_without_changing_the_default() {
+        let _lock = env_lock();
+        let _default = clear_test_env_var("DD_SOCCER_POLICY_LEARNING_RATE");
+        assert_eq!(soccer_policy_learning_rate(), SOCCER_POLICY_LEARNING_RATE);
+
+        std::env::set_var("DD_SOCCER_POLICY_LEARNING_RATE", "0.0125");
+        assert_eq!(soccer_policy_learning_rate(), 0.0125);
     }
 
     #[test]
@@ -43914,6 +44505,7 @@ impl SoccerSkillPolicyHead {
         // Stride a balanced subsample of `balanced_n` across the bucket so every head trains on an
         // equal number of samples (no skill dominates the others' separate losses).
         let stride = (bucket.len() / balanced_n).max(1);
+        let policy_learning_rate = soccer_policy_learning_rate();
         let mut loss_sum = 0.0;
         let mut applied = 0usize;
         let mut taken = 0usize;
@@ -43927,7 +44519,7 @@ impl SoccerSkillPolicyHead {
                     local,
                     weighted_advantage,
                     soccer_policy_entropy_coeff(),
-                    SOCCER_POLICY_LEARNING_RATE,
+                    policy_learning_rate,
                     SOCCER_POLICY_GRAD_CLIP_NORM,
                 );
                 if result.applied && result.loss.is_finite() {
@@ -44210,6 +44802,7 @@ impl SoccerKeeperPolicyHead {
     /// the keeper-vocabulary action index and the transition reward (which now includes the keeper
     /// save reward and concede penalty) as the advantage.
     fn train(&mut self, samples: &[SoccerKeeperPolicySample]) {
+        let policy_learning_rate = soccer_policy_learning_rate();
         let mut loss_sum = 0.0;
         let mut applied = 0usize;
         for sample in samples {
@@ -44221,7 +44814,7 @@ impl SoccerKeeperPolicyHead {
                 sample.action_index,
                 sample.advantage,
                 soccer_policy_entropy_coeff(),
-                SOCCER_POLICY_LEARNING_RATE,
+                policy_learning_rate,
                 SOCCER_POLICY_GRAD_CLIP_NORM,
             );
             if result.applied && result.loss.is_finite() {
@@ -45343,6 +45936,7 @@ fn widen_soccer_policy_snapshot_for_config(
         return snapshot;
     }
 
+    let effective_hidden = target_hidden.max(current_hidden);
     if target_hidden > current_hidden {
         let mut rng = mulberry32(
             (snapshot.parameter_count as u32)
@@ -45363,9 +45957,9 @@ fn widen_soccer_policy_snapshot_for_config(
         }
     }
     if snapshot.output_dim < expected_output_dim {
-        output_layer
-            .weights
-            .extend((snapshot.output_dim..expected_output_dim).map(|_| vec![0.0; target_hidden]));
+        output_layer.weights.extend(
+            (snapshot.output_dim..expected_output_dim).map(|_| vec![0.0; effective_hidden]),
+        );
         output_layer.biases.resize(expected_output_dim, 0.0);
         snapshot.output_dim = expected_output_dim;
     }
@@ -45648,8 +46242,10 @@ fn soccer_policy_head_from_snapshot(
     // Diagnostic/climb-lane override: with the gate on, allow a fixed
     // forward-select weight for smoke/A-B runs. It is baked into the per-net
     // field once here and obeys the same nonnegative clamp as training.
-    if let Some(weight) = soccer_forward_select_logit_weight_env_override() {
-        head.forward_select_logit_weight = weight;
+    if soccer_forward_select_logit_weight_override_on_restore() {
+        if let Some(weight) = soccer_forward_select_logit_weight_env_override() {
+            head.forward_select_logit_weight = weight;
+        }
     }
     Ok(head)
 }
@@ -46350,6 +46946,8 @@ const SOCCER_POLICY_ACTIONS: &[&str] = &[
     // go-forward DECISION in the actor's learnable vocabulary instead of relying on reward shaping.
     "forward-release-pass",
 ];
+const SOCCER_POLICY_ALL_ACTIONS_LEGAL: [bool; SOCCER_POLICY_ACTIONS.len()] =
+    [true; SOCCER_POLICY_ACTIONS.len()];
 
 const SOCCER_POLICY_PASS_ACTIONS: &[&str] = &[
     "pass",
@@ -56822,6 +57420,7 @@ pub fn soccer_tracking_dataset_to_learning_dataset(
                 mdp_mpc_comparison: None,
                 learned_mpc_replan: None,
                 behavior_policy_probability: None,
+                actor_policy_probability: None,
                 neural_mcts_selected: false,
                 neural_mcts_candidate_count: 0,
                 neural_mcts_discretized_kick_candidate_count: 0,
@@ -60790,6 +61389,7 @@ fn soccer_moment_replay_transition(
             mdp_mpc_comparison: None,
             learned_mpc_replan: None,
             behavior_policy_probability: None,
+            actor_policy_probability: None,
             neural_mcts_selected: false,
             neural_mcts_candidate_count: 0,
             neural_mcts_discretized_kick_candidate_count: 0,
@@ -72174,19 +72774,17 @@ mod reward_priority_tests {
         assert!(!gate_default_on_from_raw(Some("OFF")));
     }
 
-    /// Guard the production forward-pass-primacy lever (`DD_SOCCER_FORWARD_PASS_REWARD_SCALE=6`).
-    /// The `outcome_rewards_dominate_pass_only_shaping` test below only checks scale=1; the shipped
-    /// config runs scale=6, which intentionally lets a forward pass out-earn a shot-on-target to tilt
-    /// the DENSE gradient toward build-up. The load-bearing invariant that MUST survive the scale is:
+    /// Guard the maximum forward-pass-primacy scale. The load-bearing invariant
+    /// that MUST survive the scale is:
     /// a SINGLE completed forward pass can never out-earn actually SCORING — else "pass instead of
     /// finish" becomes rational for the final action. Goal + terminal outcome are unscaled, so this
     /// holds; we pin it against silent regressions (scaling the count bonus, raising the clamp, etc).
-    /// NOTE: a multi-pass SEQUENCE can exceed a lone shot-on-target at scale=6 by design — the
+    /// NOTE: a multi-pass SEQUENCE can exceed a lone shot-on-target at the cap by design — the
     /// pass-farming hazard the A/Bs must watch — but the unscaled goal (+ goal-chain credit) keeps
     /// finishing optimal. This guards the single-action bound only.
     #[test]
-    fn forward_pass_scale_six_stays_below_scoring_a_goal() {
-        let scale = 6.0;
+    fn maximum_forward_pass_scale_stays_below_scoring_a_goal() {
+        let scale = SPARSE_ACTION_REWARD_SCALE_BOUNDS.1;
         // Richest single completed forward pass: own-half base + max progress + flank (own-half
         // multiplier), all scaled, plus the UNSCALED count bonus (added separately at world.rs).
         // Forward base + progress are the ONLY terms scaled (forward-only lever); flank + count
@@ -72199,7 +72797,7 @@ mod reward_priority_tests {
             + COMPLETED_FORWARD_PASS_COUNT_BONUS_POINTS;
         assert!(
             max_single_forward_pass < GOAL_REWARD_POINTS,
-            "one forward pass at scale 6 ({max_single_forward_pass}) must stay below a goal \
+            "one forward pass at maximum scale ({max_single_forward_pass}) must stay below a goal \
              ({GOAL_REWARD_POINTS}) — finishing must never be dominated by a single pass"
         );
     }
@@ -72244,16 +72842,49 @@ mod reward_priority_tests {
     #[test]
     fn dynamic_shot_tuning_cannot_outvalue_a_goal_or_match_win() {
         let shot = hierarchy_bounded_shot_on_target_points(4.0, 1.0);
+        let minimum_shot = hierarchy_bounded_shot_on_target_points(0.0, 1.0);
         let goal = GOAL_REWARD_POINTS;
         let win = hierarchy_projected_match_win_points(MATCH_OUTCOME_WIN_REWARD_POINTS, 1.0);
+        assert_eq!(goal, 500.0);
+        assert_eq!(win, 1000.0);
+        assert_eq!(minimum_shot, 50.0);
         assert!(shot + CONVERSION_OVER_SHOT_REWARD_MARGIN <= goal);
         assert!(goal + WIN_OVER_CONVERSION_REWARD_MARGIN <= win);
 
-        let scaled_goal = hierarchy_bounded_shot_on_target_points(4.0, 3.0);
-        let goal = GOAL_REWARD_POINTS * 3.0;
-        let win = hierarchy_projected_match_win_points(MATCH_OUTCOME_WIN_REWARD_POINTS, 3.0);
-        assert!(scaled_goal + CONVERSION_OVER_SHOT_REWARD_MARGIN <= goal);
-        assert!(goal + WIN_OVER_CONVERSION_REWARD_MARGIN <= win);
+        // Legacy scale requests cannot move either sparse anchor.
+        let legacy_scaled_shot = hierarchy_bounded_shot_on_target_points(4.0, 3.0);
+        let legacy_scaled_win = hierarchy_projected_match_win_points(2500.0, 3.0);
+        assert!(
+            legacy_scaled_shot + CONVERSION_OVER_SHOT_REWARD_MARGIN <= GOAL_REWARD_POINTS * 3.0
+        );
+        assert_eq!(legacy_scaled_win, MATCH_OUTCOME_WIN_REWARD_POINTS);
+        assert_eq!(goal_reward_scale(), 1.0);
+        assert_eq!(contextual_on_frame_shot_reward_points(0.01), 50.0);
+        assert!(contextual_on_frame_shot_reward_points(1.0) <= 200.0);
+    }
+
+    #[test]
+    fn action_search_bands_are_nonzero_and_frequency_aware() {
+        assert!(DENSE_ACTION_REWARD_SCALE_BOUNDS.0 >= MIN_SOCCER_REWARD_WEIGHT);
+        assert!(SPARSE_ACTION_REWARD_SCALE_BOUNDS.0 >= MIN_SOCCER_REWARD_WEIGHT);
+        assert!(TURNOVER_PENALTY_SCALE_BOUNDS.0 >= 1.0);
+        assert!(DENSE_ACTION_REWARD_SCALE_BOUNDS.1 <= SPARSE_ACTION_REWARD_SCALE_BOUNDS.1);
+        assert!(LEARNED_EPV_REWARD_SCALE_BOUNDS.1 < 200.0);
+    }
+
+    #[test]
+    fn field_vector_makes_carrying_more_valuable_in_own_half_than_final_third() {
+        let own_half =
+            field_vector_carry_zone_multiplier(Team::Home, Vec2::new(40.0, 30.0), 120.0, 0.8);
+        let final_third =
+            field_vector_carry_zone_multiplier(Team::Home, Vec2::new(40.0, 100.0), 120.0, 0.8);
+        assert!(own_half > final_third);
+
+        // The direction-normalized function must give the away team the same
+        // semantics when it attacks toward decreasing y.
+        let away_own_half =
+            field_vector_carry_zone_multiplier(Team::Away, Vec2::new(40.0, 90.0), 120.0, 0.8);
+        assert!((own_half - away_own_half).abs() < 1e-9);
     }
 
     #[test]

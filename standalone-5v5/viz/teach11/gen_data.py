@@ -3,7 +3,7 @@
 
 The full engine is genuinely richer than the 5-a-side standalone: it runs REAL
 approximate dynamic programming (an EPV value function + DP-bootstrapped critic
-targets + multi-pass credit replay), a neural actor/critic over a 210-dim field
+targets + multi-pass credit replay), a neural actor/critic over a 620-dim field
 vector, an interior-point/LP formation solver, a QP model-predictive-control
 executor, and a self-play league. This page teaches all of that.
 
@@ -26,6 +26,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ENGINE = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))  # akrion-soccer-engine.rs/
 EPV_PATH = os.path.join(ENGINE, "scripts", "epv_grid.json")
 OUT = os.path.join(HERE, "data.json")
+LIVE_POLICY = os.environ.get(
+    "SOCCER_TEACH11_POLICY",
+    os.path.join(ENGINE, "out", "live-5055-accepted", "team-policy.neural.json"),
+)
 RNG = np.random.default_rng(20260712)
 
 
@@ -33,7 +37,7 @@ RNG = np.random.default_rng(20260712)
 # Architecture + scale (the 11-a-side engine)
 # ─────────────────────────────────────────────────────────────────────────────
 ARCH = {
-    "feature_dim": 476,            # SOCCER_NEURAL_FEATURE_DIM — the actual egocentric policy obs
+    "feature_dim": 620,            # accepted sidecar inputDim; code appends contextual tails
     "config_dim": 210,             # CONFIG_FEATURE_DIM — the mirror/permutation-invariant retrieval vector
     "embedding_dim": 256,          # SOCCER_MOMENT_EMBEDDING_DIM — pgvector width for moment kNN
     "hidden": [128, 128],          # local baseline hidden width (fix-plateau.md)
@@ -42,7 +46,7 @@ ARCH = {
     "goal_width": 8, "hz": 15, "half_seconds": 120,
 }
 
-# ~476-dim EGOCENTRIC neural policy observation (soccer.rs:4472-4762). Actor-relative;
+# 620-dim EGOCENTRIC neural policy observation. Actor-relative;
 # an append-only stack of blocks, each grouped here into readable clusters.
 FEATURE_GROUPS = [
     {"name": "egocentric base",   "n": 192, "color": "--accent",
@@ -57,6 +61,8 @@ FEATURE_GROUPS = [
      "desc": "learned-MPC replan, option control, decision cadence, first-touch, pass-and-move…"},
     {"name": "action parameters", "n": 10,  "color": "--ink-dim",
      "desc": "the chosen action's continuous parameters"},
+    {"name": "contextual tails", "n": 144, "color": "--violet",
+     "desc": "append-only field-aware POMDP reward, possession/duel, spacing, and individual-MPC context"},
 ]
 
 # The separate 210-dim CONFIG vector — global, canonicalized to be identical under
@@ -457,6 +463,19 @@ def decision_examples():
 
 
 def main():
+    served_policy = {"path": LIVE_POLICY, "loaded": False}
+    if os.path.exists(LIVE_POLICY):
+        with open(LIVE_POLICY) as f:
+            snapshot = json.load(f)
+        served_policy.update({
+            "loaded": True,
+            "input_dim": snapshot.get("inputDim"),
+            "parameter_count": snapshot.get("parameterCount"),
+            "training_steps": snapshot.get("trainingSteps"),
+            "average_loss": snapshot.get("averageLoss"),
+        })
+        if isinstance(served_policy["input_dim"], int):
+            ARCH["feature_dim"] = served_policy["input_dim"]
     dp = dp_value()
     data = {
         "meta": {
@@ -470,8 +489,10 @@ def main():
                       "replay), an interior-point formation solver, and QP model-predictive control.",
             "pipeline": ["cross-tick outcome measurement", "approximate-DP credit propagation",
                          "neural actor + critic (MAPPO, 128h, set-encoded)",
-                         "world-model + shallow neural-MCTS lookahead", "QP-MPC execution guard",
+                         "learned world model (MCTS disabled on the accepted frontier)",
+                         "field-aware per-player QP-MPC execution guard",
                          "held-out promotion vs frozen analytic"],
+            "served_policy": served_policy,
         },
         "arch": ARCH, "feature_groups": FEATURE_GROUPS, "config_groups": CONFIG_GROUPS,
         "actions": ACTIONS, "decisions": decision_examples(),

@@ -5910,9 +5910,15 @@ struct AnchorPromotionGateConfig {
     min_forward_pass_margin: f64,
     min_net_forward_pass_margin: f64,
     min_forward_pass_rate_margin: f64,
+    /// Require the candidate not to regress against one deterministic pure-analytic
+    /// opponent, measured in paired held-out fixtures for candidate and incumbent.
+    require_analytic_non_regression: bool,
+    analytic_games: usize,
+    analytic_max_goal_diff_regression: f64,
     /// Base seed for held-out fixtures — kept disjoint from the training seed space so
     /// the verdict is on matches the candidate never trained on.
     seed_base: u32,
+    analytic_seed_base: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -5920,6 +5926,16 @@ struct AnchorPromotionGateDecision {
     status: &'static str,
     verdict: Option<PromotionVerdict>,
     forward_pass_verdict: Option<AnchorForwardPassVerdict>,
+    analytic_non_regression_verdict: Option<AnalyticNonRegressionVerdict>,
+}
+
+#[derive(Clone, Debug)]
+struct AnalyticNonRegressionVerdict {
+    games_per_policy: usize,
+    candidate_goal_diff_per_game: f64,
+    anchor_goal_diff_per_game: f64,
+    delta_goal_diff_per_game: f64,
+    promote: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -6005,16 +6021,22 @@ fn anchor_forward_pass_verdict(
 fn anchor_promotion_gate_promotes(
     scoreline: &PromotionVerdict,
     forward_pass_verdict: Option<&AnchorForwardPassVerdict>,
+    analytic_non_regression_verdict: Option<&AnalyticNonRegressionVerdict>,
     cfg: &AnchorPromotionGateConfig,
 ) -> bool {
-    if cfg.require_forward_pass_climb {
+    let scoreline_and_forward_pass = if cfg.require_forward_pass_climb {
         scoreline.promote
             && forward_pass_verdict
                 .map(|verdict| verdict.promote)
                 .unwrap_or(false)
     } else {
         scoreline.promote
-    }
+    };
+    let analytic_non_regression = !cfg.require_analytic_non_regression
+        || analytic_non_regression_verdict
+            .map(|verdict| verdict.promote)
+            .unwrap_or(false);
+    scoreline_and_forward_pass && analytic_non_regression
 }
 
 fn anchor_promotion_verdict_search_metadata(verdict: &PromotionVerdict) -> serde_json::Value {
@@ -6089,7 +6111,17 @@ fn anchor_promotion_gate_search_metadata(
         "forwardPassVerdict": decision
             .forward_pass_verdict
             .as_ref()
-            .map(anchor_forward_pass_verdict_search_metadata)
+            .map(anchor_forward_pass_verdict_search_metadata),
+        "analyticNonRegressionVerdict": decision
+            .analytic_non_regression_verdict
+            .as_ref()
+            .map(|verdict| serde_json::json!({
+                "gamesPerPolicy": verdict.games_per_policy,
+                "candidateGoalDiffPerGame": verdict.candidate_goal_diff_per_game,
+                "anchorGoalDiffPerGame": verdict.anchor_goal_diff_per_game,
+                "deltaGoalDiffPerGame": verdict.delta_goal_diff_per_game,
+                "promote": verdict.promote
+            }))
     })
 }
 
@@ -6175,6 +6207,91 @@ fn anchor_promotion_gate_verdict(
     Some((scoreline, forward_pass))
 }
 
+fn policy_goal_diff_vs_fixed_analytic(
+    runner: &mut EngineMatchRunner,
+    policy_neural: &SoccerNeuralNetworkSnapshot,
+    cfg: &AnchorPromotionGateConfig,
+    seed_salt: u32,
+) -> Option<(usize, i64)> {
+    let policy = TeamBrain::from_snapshot(policy_neural.clone());
+    let mut analytic = TeamBrain::fresh_with_seed(0xA5A5_0007, 100);
+    analytic.neural = None;
+    analytic.home_target_entries.clear();
+    analytic.away_target_entries.clear();
+    let mut games = 0usize;
+    let mut goal_diff = 0i64;
+    for g in 0..cfg.analytic_games {
+        let seed = cfg
+            .analytic_seed_base
+            .wrapping_add(seed_salt.wrapping_mul(2_246_822_519))
+            .wrapping_add(g as u32);
+        let policy_home = g % 2 == 0;
+        let (home_id, away_id, home, away) = if policy_home {
+            (0usize, 1usize, &policy, &analytic)
+        } else {
+            (1usize, 0usize, &analytic, &policy)
+        };
+        let ctx = TournamentMatchContext {
+            stage: TournamentStage::Group,
+            round_index: seed_salt as usize,
+            match_index: g,
+            seed,
+            home_id,
+            away_id,
+            home_name: format!("team{home_id}"),
+            away_name: format!("team{away_id}"),
+            home_learns: false,
+            away_learns: false,
+        };
+        match runner.play(&ctx, home, away) {
+            Ok(outcome) => {
+                let signed_goal_diff = if policy_home {
+                    i64::from(outcome.home_goals) - i64::from(outcome.away_goals)
+                } else {
+                    i64::from(outcome.away_goals) - i64::from(outcome.home_goals)
+                };
+                goal_diff += signed_goal_diff;
+                games += 1;
+            }
+            Err(error) => {
+                eprintln!("anchor_analytic_non_regression fixture error (g {g}): {error}")
+            }
+        }
+    }
+    (games > 0).then_some((games, goal_diff))
+}
+
+fn analytic_non_regression_verdict(
+    runner: &mut EngineMatchRunner,
+    candidate_neural: Option<&SoccerNeuralNetworkSnapshot>,
+    anchor_neural: Option<&SoccerNeuralNetworkSnapshot>,
+    cfg: &AnchorPromotionGateConfig,
+    seed_salt: u32,
+) -> Option<AnalyticNonRegressionVerdict> {
+    if !cfg.require_analytic_non_regression {
+        return None;
+    }
+    let candidate_neural = candidate_neural?;
+    let anchor_neural = anchor_neural?;
+    let (candidate_games, candidate_goal_diff) =
+        policy_goal_diff_vs_fixed_analytic(runner, candidate_neural, cfg, seed_salt)?;
+    let (anchor_games, anchor_goal_diff) =
+        policy_goal_diff_vs_fixed_analytic(runner, anchor_neural, cfg, seed_salt)?;
+    let candidate_goal_diff_per_game = candidate_goal_diff as f64 / candidate_games as f64;
+    let anchor_goal_diff_per_game = anchor_goal_diff as f64 / anchor_games as f64;
+    let delta_goal_diff_per_game = candidate_goal_diff_per_game - anchor_goal_diff_per_game;
+    let promote = candidate_games == cfg.analytic_games
+        && anchor_games == cfg.analytic_games
+        && delta_goal_diff_per_game + cfg.analytic_max_goal_diff_regression >= 0.0;
+    Some(AnalyticNonRegressionVerdict {
+        games_per_policy: candidate_games.min(anchor_games),
+        candidate_goal_diff_per_game,
+        anchor_goal_diff_per_game,
+        delta_goal_diff_per_game,
+        promote,
+    })
+}
+
 /// Apply the frozen-anchor gate to a candidate about to be written with `base_status`.
 /// Returns the status to actually persist: unchanged when the gate is disabled, not a
 /// promotion, not due this write, or cannot compare; downgraded to `archived` when the
@@ -6198,6 +6315,7 @@ fn apply_anchor_promotion_gate_with_decision(
             status: base_status,
             verdict: None,
             forward_pass_verdict: None,
+            analytic_non_regression_verdict: None,
         };
     }
     *write_index = write_index.wrapping_add(1);
@@ -6207,6 +6325,7 @@ fn apply_anchor_promotion_gate_with_decision(
             status: base_status,
             verdict: None,
             forward_pass_verdict: None,
+            analytic_non_regression_verdict: None,
         };
     }
     if anchor_neural.is_none() {
@@ -6219,6 +6338,7 @@ fn apply_anchor_promotion_gate_with_decision(
             status: base_status,
             verdict: None,
             forward_pass_verdict: None,
+            analytic_non_regression_verdict: None,
         };
     }
     let runner = runner.get_or_insert_with(|| {
@@ -6246,12 +6366,27 @@ fn apply_anchor_promotion_gate_with_decision(
                 .as_ref()
                 .map(|verdict| verdict.promote)
                 .unwrap_or(false);
-            let promotes =
-                anchor_promotion_gate_promotes(&verdict, forward_pass_verdict.as_ref(), cfg);
+            let analytic_non_regression_verdict = analytic_non_regression_verdict(
+                runner,
+                candidate_neural,
+                anchor_neural.as_ref(),
+                cfg,
+                seed_salt,
+            );
+            let analytic_promotes = analytic_non_regression_verdict
+                .as_ref()
+                .map(|verdict| verdict.promote)
+                .unwrap_or(false);
+            let promotes = anchor_promotion_gate_promotes(
+                &verdict,
+                forward_pass_verdict.as_ref(),
+                analytic_non_regression_verdict.as_ref(),
+                cfg,
+            );
             if promotes {
                 *anchor_neural = candidate_neural.cloned();
                 println!(
-                    "anchor_gate_promote {context_label} record={}W-{}D-{}L wilson={:.3} elo_delta={:+.1} mean_payoff={:.3} forward_pass_promote={} forward_pass_margin={:+.3} net_forward_pass_margin={:+.3} forward_pass_rate_margin={:+.1}pp",
+                    "anchor_gate_promote {context_label} record={}W-{}D-{}L wilson={:.3} elo_delta={:+.1} mean_payoff={:.3} forward_pass_promote={} forward_pass_margin={:+.3} net_forward_pass_margin={:+.3} forward_pass_rate_margin={:+.1}pp analytic_non_regression_promote={} analytic_delta_gd_per_game={:+.3}",
                     verdict.record.wins,
                     verdict.record.draws,
                     verdict.record.losses,
@@ -6272,11 +6407,17 @@ fn apply_anchor_promotion_gate_with_decision(
                         .map(anchor_forward_pass_rate_margin)
                         .unwrap_or(0.0)
                         * 100.0,
+                    analytic_promotes,
+                    analytic_non_regression_verdict
+                        .as_ref()
+                        .map(|verdict| verdict.delta_goal_diff_per_game)
+                        .unwrap_or(0.0),
                 );
                 AnchorPromotionGateDecision {
                     status: base_status,
                     verdict: Some(verdict),
                     forward_pass_verdict,
+                    analytic_non_regression_verdict,
                 }
             } else {
                 let forward_pass_reasons = forward_pass_verdict
@@ -6284,7 +6425,7 @@ fn apply_anchor_promotion_gate_with_decision(
                     .map(|verdict| verdict.reasons.join("|"))
                     .unwrap_or_default();
                 println!(
-                    "anchor_gate_blocked {context_label} record={}W-{}D-{}L wilson={:.3} elo_delta={:+.1} reasons={} forward_pass_promote={} forward_pass_reasons={}",
+                    "anchor_gate_blocked {context_label} record={}W-{}D-{}L wilson={:.3} elo_delta={:+.1} reasons={} forward_pass_promote={} forward_pass_reasons={} analytic_non_regression_promote={} analytic_delta_gd_per_game={:+.3}",
                     verdict.record.wins,
                     verdict.record.draws,
                     verdict.record.losses,
@@ -6293,11 +6434,17 @@ fn apply_anchor_promotion_gate_with_decision(
                     verdict.reasons.join("|"),
                     forward_pass_promotes,
                     forward_pass_reasons,
+                    analytic_promotes,
+                    analytic_non_regression_verdict
+                        .as_ref()
+                        .map(|verdict| verdict.delta_goal_diff_per_game)
+                        .unwrap_or(0.0),
                 );
                 AnchorPromotionGateDecision {
                     status: SOCCER_POLICY_STATUS_ARCHIVED,
                     verdict: Some(verdict),
                     forward_pass_verdict,
+                    analytic_non_regression_verdict,
                 }
             }
         }
@@ -6306,6 +6453,7 @@ fn apply_anchor_promotion_gate_with_decision(
             status: base_status,
             verdict: None,
             forward_pass_verdict: None,
+            analytic_non_regression_verdict: None,
         },
     }
 }
@@ -8003,7 +8151,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         "SOCCER_WRITE_LEARNED_PARAMS_ARTIFACTS",
         write_final_artifacts,
     )?;
-    let checkpoint_artifact_best_only = env_bool("SOCCER_CHECKPOINT_ARTIFACT_BEST_ONLY", false)?;
+    // Public artifacts are a protected frontier. Candidates that have not beaten
+    // the incumbent on held-out evidence belong in `*.candidate.json`, never in
+    // the path consumed by live play or the next training run.
+    let checkpoint_artifact_best_only = env_bool("SOCCER_CHECKPOINT_ARTIFACT_BEST_ONLY", true)?;
     let write_episode_log_file = env_bool(
         "SOCCER_WRITE_EPISODE_LOG",
         default_disk_learning_artifacts && DEFAULT_SOCCER_WRITE_EPISODE_LOG,
@@ -8225,14 +8376,14 @@ fn run() -> Result<(), Box<dyn Error>> {
     println!(
         "policy_active_max_fitness_regression value={active_max_fitness_regression_setting:.4} (lower = stricter anti-regression ratchet; 0.0 = newer generation must not regress)"
     );
-    // Frozen-anchor promotion gate (DEFAULT-OFF): a candidate must beat the frozen
+    // Frozen-anchor promotion gate: a candidate must beat the frozen
     // anchor brain over a held-out slate before it is written `active`. See
     // `AnchorPromotionGateConfig` / `anchor_promotion_gate_verdict`.
     let anchor_promotion_gate = {
         let enabled = env_bool_alias(
             "SOCCER_BATCH_ANCHOR_PROMOTION_GATE_ENABLED",
             "SOCCER_ANCHOR_PROMOTION_GATE_ENABLED",
-            false,
+            true,
         )?;
         let games = env_usize("SOCCER_ANCHOR_PROMOTION_GATE_GAMES", 8)?.max(2);
         let minutes = env_f64("SOCCER_ANCHOR_PROMOTION_GATE_MINUTES", 2.0)?;
@@ -8287,6 +8438,20 @@ fn run() -> Result<(), Box<dyn Error>> {
             } else {
                 env_f64("SOCCER_EVAL_MIN_FORWARD_PASS_RATE_MARGIN", 0.0)?
             };
+        let require_analytic_non_regression =
+            env_bool("SOCCER_ANCHOR_PROMOTION_GATE_ANALYTIC_NON_REGRESSION", true)?;
+        let analytic_games = env_usize("SOCCER_ANCHOR_PROMOTION_GATE_ANALYTIC_GAMES", 4)?.max(2);
+        let analytic_max_goal_diff_regression = env_f64(
+            "SOCCER_ANCHOR_PROMOTION_GATE_ANALYTIC_MAX_GOAL_DIFF_REGRESSION",
+            0.0,
+        )?;
+        if !analytic_max_goal_diff_regression.is_finite() || analytic_max_goal_diff_regression < 0.0
+        {
+            return Err(invalid_data(
+                "SOCCER_ANCHOR_PROMOTION_GATE_ANALYTIC_MAX_GOAL_DIFF_REGRESSION must be finite and non-negative",
+            )
+            .into());
+        }
         AnchorPromotionGateConfig {
             enabled,
             games,
@@ -8297,12 +8462,16 @@ fn run() -> Result<(), Box<dyn Error>> {
             min_forward_pass_margin,
             min_net_forward_pass_margin,
             min_forward_pass_rate_margin,
+            require_analytic_non_regression,
+            analytic_games,
+            analytic_max_goal_diff_regression,
             // Disjoint from the training seed space (see `effective_seed`).
             seed_base: 0xE7A1_0000,
+            analytic_seed_base: 0xA11C_0000,
         }
     };
     println!(
-        "anchor_promotion_gate enabled={} games={} minutes={:.2} interval_writes={} wilson_floor={:.3} worst_case_floor={:.3} require_forward_pass_climb={} min_forward_pass_margin={:+.3} min_net_forward_pass_margin={:+.3} min_forward_pass_rate_margin={:+.1}pp",
+        "anchor_promotion_gate enabled={} games={} minutes={:.2} interval_writes={} wilson_floor={:.3} worst_case_floor={:.3} require_forward_pass_climb={} min_forward_pass_margin={:+.3} min_net_forward_pass_margin={:+.3} min_forward_pass_rate_margin={:+.1}pp require_analytic_non_regression={} analytic_games={} analytic_max_goal_diff_regression={:.3}",
         anchor_promotion_gate.enabled,
         anchor_promotion_gate.games,
         anchor_promotion_gate.minutes,
@@ -8313,6 +8482,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         anchor_promotion_gate.min_forward_pass_margin,
         anchor_promotion_gate.min_net_forward_pass_margin,
         anchor_promotion_gate.min_forward_pass_rate_margin * 100.0,
+        anchor_promotion_gate.require_analytic_non_regression,
+        anchor_promotion_gate.analytic_games,
+        anchor_promotion_gate.analytic_max_goal_diff_regression,
     );
     let policy_promotion_baseline_lookback_generations = env_usize(
         "SOCCER_POLICY_PROMOTION_BASELINE_LOOKBACK_GENERATIONS",
@@ -8321,7 +8493,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let policy_promotion_compare_incumbent = env_bool_alias(
         "SOCCER_BATCH_POLICY_PROMOTION_COMPARE_INCUMBENT",
         "SOCCER_POLICY_PROMOTION_COMPARE_INCUMBENT",
-        false,
+        true,
     )?;
     let policy_promotion_min_mean_fitness_delta = env_f64_alias(
         "SOCCER_BATCH_POLICY_PROMOTION_MIN_MEAN_FITNESS_DELTA",
@@ -8364,7 +8536,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let policy_evolution_reset_to_incumbent_after_held_trial = env_bool_alias(
         "SOCCER_BATCH_POLICY_EVOLUTION_RESET_TO_INCUMBENT_AFTER_HELD_TRIAL",
         "SOCCER_POLICY_EVOLUTION_RESET_TO_INCUMBENT_AFTER_HELD_TRIAL",
-        policy_evolution_apply_when_promotion_held,
+        true,
     )?;
     let policy_evolution_require_trial_before_write = env_bool_alias(
         "SOCCER_BATCH_POLICY_EVOLUTION_REQUIRE_TRIAL_BEFORE_WRITE",
@@ -8374,7 +8546,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let policy_write_neural_checkpoint_when_promotion_held = env_bool_alias(
         "SOCCER_BATCH_POLICY_WRITE_NEURAL_CHECKPOINT_WHEN_PROMOTION_HELD",
         "SOCCER_POLICY_WRITE_NEURAL_CHECKPOINT_WHEN_PROMOTION_HELD",
-        true,
+        false,
     )?;
     let policy_resume_latest_neural_checkpoint = env_bool_alias(
         "SOCCER_BATCH_RESUME_LATEST_NEURAL_CHECKPOINT",
@@ -8396,7 +8568,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         true,
     )?;
     let policy_promotion_local_best_rollback =
-        env_bool("SOCCER_POLICY_PROMOTION_LOCAL_BEST_ROLLBACK", false)?;
+        env_bool("SOCCER_POLICY_PROMOTION_LOCAL_BEST_ROLLBACK", true)?;
     let policy_promotion_local_best_backoff =
         env_bool("SOCCER_POLICY_PROMOTION_LOCAL_BEST_BACKOFF", false)?;
     let policy_promotion_local_best_backoff_factor =
@@ -8430,7 +8602,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         .into());
     }
     let policy_promotion_local_best_anchor_held =
-        env_bool("SOCCER_POLICY_PROMOTION_LOCAL_BEST_ANCHOR_HELD", false)?;
+        env_bool("SOCCER_POLICY_PROMOTION_LOCAL_BEST_ANCHOR_HELD", true)?;
     let policy_promotion_local_best_restore_min_games =
         env_usize("SOCCER_POLICY_PROMOTION_LOCAL_BEST_RESTORE_MIN_GAMES", 0)?;
     let policy_promotion_local_best_restore_max_mean_fitness_regression = env_f64(
@@ -8464,7 +8636,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         env_batch_neural_snapshot_min_batch_mean_fitness()?;
     let neural_batch_snapshot_rescue_min_fitness = env_batch_neural_snapshot_rescue_min_fitness()?;
     let neural_batch_policy_merge_selected_only =
-        env_bool("SOCCER_NEURAL_BATCH_POLICY_MERGE_SELECTED_ONLY", false)?;
+        env_bool("SOCCER_NEURAL_BATCH_POLICY_MERGE_SELECTED_ONLY", true)?;
     let neural_batch_snapshot_carry_unvalidated =
         env_bool("SOCCER_NEURAL_BATCH_SNAPSHOT_CARRY_UNVALIDATED", false)?;
     let neural_batch_snapshot_carry_no_publishable = env_bool(
@@ -8691,7 +8863,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         "SOCCER_POLICY_TRAIN_MAX_TRANSITIONS_PER_TICK",
         config.policy_train_max_transitions_per_tick,
     )?;
-    config.neural_blend.mode = env_neural_blend_mode(config.neural_blend.mode)?;
+    // Learning runs should exercise the neural actor as the decision authority.
+    // Additive mode can only imitate/rerank the analytic shell and therefore
+    // cannot establish that the learned policy itself escaped the tabular ceiling.
+    config.neural_blend.mode = env_neural_blend_mode(SoccerNeuralBlendMode::Authoritative)?;
     config.neural_blend.lambda = env_f64("SOCCER_NEURAL_BLEND_LAMBDA", config.neural_blend.lambda)?;
     config.neural_blend.tie_epsilon = env_f64(
         "SOCCER_NEURAL_BLEND_TIE_EPSILON",
@@ -12244,12 +12419,29 @@ fn run() -> Result<(), Box<dyn Error>> {
         &policies,
     );
     if write_final_artifacts {
+        let final_policy_write_path = if checkpoint_artifact_best_only {
+            candidate_checkpoint_path(&final_artifact_path)
+        } else {
+            final_artifact_path.clone()
+        };
+        let final_learned_params_write_path = if checkpoint_artifact_best_only {
+            candidate_checkpoint_path(&learned_params_path)
+        } else {
+            learned_params_path.clone()
+        };
+        if checkpoint_artifact_best_only {
+            println!(
+                "final_publication_held reason=requires_held_out_promotion candidate_artifact={} candidate_learned_params={}",
+                final_policy_write_path.display(),
+                final_learned_params_write_path.display()
+            );
+        }
         if write_final_policy_artifact {
             let final_export =
                 compact_training_artifact_for_export(&artifact, artifact_max_entries_per_policy);
-            write_json(&final_artifact_path, &final_export)?;
+            write_json(&final_policy_write_path, &final_export)?;
             if let Some(sidecar_path) = write_neural_sidecar_for_policy_artifact(
-                &final_artifact_path,
+                &final_policy_write_path,
                 latest_neural_network.as_ref(),
             )? {
                 println!("final_neural_sidecar={}", sidecar_path.display());
@@ -12263,7 +12455,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     &artifact,
                     latest_neural_network.clone(),
                 );
-            write_json(&learned_params_path, &learned_params)?;
+            write_json(&final_learned_params_write_path, &learned_params)?;
         } else {
             println!(
                 "learned_params_artifact=disabled path={}",
@@ -13330,7 +13522,7 @@ mod tests {
             &below_mean,
             false
         ));
-        assert!(policy_promotion_evaluation_can_anchor_local_trial(
+        assert!(!policy_promotion_evaluation_can_anchor_local_trial(
             &below_mean,
             true
         ));
@@ -14321,6 +14513,20 @@ mod tests {
             continuous_manifest_env_value("SOCCER_ANCHOR_PROMOTION_GATE_ENABLED"),
             Some("true")
         );
+        assert_eq!(
+            continuous_manifest_env_value("SOCCER_ANCHOR_PROMOTION_GATE_ANALYTIC_NON_REGRESSION"),
+            Some("true")
+        );
+        assert_eq!(
+            continuous_manifest_env_value("SOCCER_ANCHOR_PROMOTION_GATE_ANALYTIC_GAMES"),
+            Some("4")
+        );
+        assert_eq!(
+            continuous_manifest_env_value(
+                "SOCCER_ANCHOR_PROMOTION_GATE_ANALYTIC_MAX_GOAL_DIFF_REGRESSION"
+            ),
+            Some("0.0")
+        );
         assert_continuous_manifest_contains(
             "require_value DD_SOCCER_ENABLE_LOOSE_BALL_COMMIT_MODEL true",
         );
@@ -14421,6 +14627,15 @@ mod tests {
         assert_continuous_manifest_contains("require_value SOCCER_LEAGUE_ANALYTIC_OPPONENTS true");
         assert_continuous_manifest_contains(
             "require_value SOCCER_ANCHOR_PROMOTION_GATE_ENABLED true",
+        );
+        assert_continuous_manifest_contains(
+            "require_value SOCCER_ANCHOR_PROMOTION_GATE_ANALYTIC_NON_REGRESSION true",
+        );
+        assert_continuous_manifest_contains(
+            "require_value SOCCER_ANCHOR_PROMOTION_GATE_ANALYTIC_GAMES 4",
+        );
+        assert_continuous_manifest_contains(
+            "require_value SOCCER_ANCHOR_PROMOTION_GATE_ANALYTIC_MAX_GOAL_DIFF_REGRESSION 0.0",
         );
         assert_eq!(
             continuous_manifest_env_value("SOCCER_GAME_ARTIFACT_MODE"),
@@ -15922,7 +16137,11 @@ mod tests {
             min_forward_pass_margin: 0.0,
             min_net_forward_pass_margin: 0.0,
             min_forward_pass_rate_margin: 0.0,
+            require_analytic_non_regression: false,
+            analytic_games: 4,
+            analytic_max_goal_diff_regression: 0.0,
             seed_base: 0xE7A1_0000,
+            analytic_seed_base: 0xA11C_0000,
         }
     }
 
@@ -15973,6 +16192,7 @@ mod tests {
             !anchor_promotion_gate_promotes(
                 &anchor_promotion_verdict_for_test(false),
                 Some(&forward_pass),
+                None,
                 &cfg
             ),
             "forward-pass climb alone must not advance a losing held-out scoreline"
@@ -15980,7 +16200,39 @@ mod tests {
         assert!(anchor_promotion_gate_promotes(
             &anchor_promotion_verdict_for_test(true),
             Some(&forward_pass),
+            None,
             &cfg
+        ));
+    }
+
+    #[test]
+    fn anchor_gate_requires_absolute_analytic_non_regression_when_enabled() {
+        let mut cfg = anchor_gate_config(true);
+        cfg.require_analytic_non_regression = true;
+        let regressed = AnalyticNonRegressionVerdict {
+            games_per_policy: 4,
+            candidate_goal_diff_per_game: -0.5,
+            anchor_goal_diff_per_game: 0.0,
+            delta_goal_diff_per_game: -0.5,
+            promote: false,
+        };
+        let stable = AnalyticNonRegressionVerdict {
+            delta_goal_diff_per_game: 0.0,
+            promote: true,
+            ..regressed.clone()
+        };
+
+        assert!(!anchor_promotion_gate_promotes(
+            &anchor_promotion_verdict_for_test(true),
+            None,
+            Some(&regressed),
+            &cfg,
+        ));
+        assert!(anchor_promotion_gate_promotes(
+            &anchor_promotion_verdict_for_test(true),
+            None,
+            Some(&stable),
+            &cfg,
         ));
     }
 

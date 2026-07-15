@@ -63,7 +63,8 @@ const MIN_REWARD_WEIGHT: f32 = 0.0001;
 // ─── Anchored reward currency (docs/reward-anchoring.md) ─────────────────────
 // Fixed anchors — the currency every other term is priced in. NOT env-tunable:
 // the weights below are searched, the anchors are what they are searched
-// against. Win/loss is symmetric (draw = 0), concede mirrors the goal.
+// against. Win/loss outcome labels are symmetric (draw = 0); local loss
+// penalties remain a discoverable fraction to keep risk appetite tunable.
 const REW_WIN_POINTS: f32 = 1000.0;
 const REW_GOAL_POINTS: f32 = 500.0;
 /// Any genuinely on-frame shot (the keeper may still save it) pays at least
@@ -86,6 +87,7 @@ const RETURN_NORM: f32 = REW_GOAL_POINTS;
 /// testing the keeper).
 const PASS_PROGRESS_PER_YARD: f32 = 4.2;
 const PASS_PROGRESS_CAP: f32 = 33.0;
+const FULL_GAME_ACTOR_CREDIT_FRACTION_BOUNDS: (f32, f32) = (0.001, 0.10);
 const LINGER_RADIUS: f32 = 4.0; // "same radius": teammates within this many yards
 /// Overlap zone: two players THIS close are occupying the same spot — that is
 /// never "running past each other", so the penalty here is ALWAYS-ON (ungated).
@@ -287,21 +289,21 @@ struct FieldRewardContext {
     burst_score: f32,
     return_stale: f32,
     chance_value: f32,
+    carry_value: f32,
 }
 
 impl FieldRewardContext {
     fn from_world(w: &World) -> Self {
         let mut ctx = Self::default();
-        let a_owns = matches!(w.owner, Some(o) if matches!(o.team, Team::A));
-        let b_owns = matches!(w.owner, Some(o) if matches!(o.team, Team::B));
-        let our_phase = a_owns || (w.owner.is_none() && matches!(w.last_touch, Some(Team::A)));
-        let their_phase = b_owns || (w.owner.is_none() && matches!(w.last_touch, Some(Team::B)));
+        let phase = w.possession_phase_for(Team::A);
+        let our_phase = phase == PossessionPhase::Possession;
+        let their_phase = phase == PossessionPhase::Dispossession;
 
         let mut best_outlet = 0.0f32;
         let mut outlet_count = 0.0f32;
         for i in 1..N {
             let pos = w.a[i].pos;
-            let ahead = ((pos.x - w.ball.x) / 12.0).clamp(0.0, 1.0);
+            let ahead = ((pos.y - w.ball.y) / 12.0).clamp(0.0, 1.0);
             let lane = w.lane_clearness(Team::A, w.ball, pos);
             let (_, opp_d) = w.nearest_opponent_distance(Team::A, pos);
             let space = (opp_d / 8.0).clamp(0.0, 1.0);
@@ -322,11 +324,11 @@ impl FieldRewardContext {
             let mut best_chance = 0.0f32;
             for i in 1..N {
                 let pos = w.a[i].pos;
-                if pos.x < SHOOT_X {
+                if pos.y < SHOOT_X {
                     continue;
                 }
                 let d = goal.sub(pos).len();
-                let lateral = (pos.y - FIELD_W / 2.0).abs();
+                let lateral = (pos.x - FIELD_W / 2.0).abs();
                 let dist_f = (1.0 - d / 26.0).clamp(0.0, 1.0);
                 let angle_f = (1.0 - lateral / (FIELD_W / 2.0)).clamp(0.0, 1.0);
                 let xg = dist_f * dist_f * (0.4 + 0.6 * angle_f);
@@ -345,8 +347,20 @@ impl FieldRewardContext {
             let (_, pressure_d) = w.nearest_opponent_distance(o.team, carrier);
             let pressure = (1.0 - pressure_d / 7.0).clamp(0.0, 1.0);
             if o.team == Team::A {
-                let forward = (carrier.x / FIELD_L).clamp(0.0, 1.0);
+                let forward = (carrier.y / FIELD_L).clamp(0.0, 1.0);
                 ctx.dribble_pressure = pressure;
+                // Carrying out of our half is a useful build-up action; once the
+                // ball reaches the final third, clear shooting/passing chances
+                // should dominate another low-value touch. Pressure adds escape
+                // value, and the complete 10-player field vector determines it.
+                let zone_value = if forward < 0.50 {
+                    1.35
+                } else if forward < 2.0 / 3.0 {
+                    1.00
+                } else {
+                    0.55
+                };
+                ctx.carry_value = (zone_value * (0.85 + 0.30 * pressure)).clamp(0.45, 1.65);
                 ctx.pass_value = (0.45 * ctx.safe_outlet_value + 0.35 * forward + 0.20 * pressure)
                     .clamp(0.0, 1.0);
                 ctx.turnover_risk =
@@ -362,10 +376,10 @@ impl FieldRewardContext {
         let mut recovery_need = 0.0f32;
         for i in 1..N {
             let pos = w.a[i].pos;
-            let goalside = ((w.ball.x - pos.x) / 8.0).clamp(-1.0, 1.0);
+            let goalside = ((w.ball.y - pos.y) / 8.0).clamp(-1.0, 1.0);
             goalside_sum += (goalside + 1.0) * 0.5;
-            if their_phase && pos.x > w.ball.x {
-                recovery_need += ((pos.x - w.ball.x) / FIELD_L).clamp(0.0, 1.0);
+            if their_phase && pos.y > w.ball.y {
+                recovery_need += ((pos.y - w.ball.y) / FIELD_L).clamp(0.0, 1.0);
             }
         }
         ctx.goalside_score = if their_phase {
@@ -381,16 +395,16 @@ impl FieldRewardContext {
                 if matches!(w.owner, Some(o) if o.team == Team::A && o.idx == i) {
                     continue;
                 }
-                let ahead = ((pos.x - w.ball.x) / 12.0).clamp(0.0, 1.0);
+                let ahead = ((pos.y - w.ball.y) / 12.0).clamp(0.0, 1.0);
                 let lane = w.lane_clearness(Team::A, w.ball, pos);
-                let fwd_speed = (w.a[i].vel.x / 8.5).clamp(0.0, 1.0);
+                let fwd_speed = (w.a[i].vel.y / 8.5).clamp(0.0, 1.0);
                 burst_sum += ahead * lane * (0.35 + 0.65 * fwd_speed);
             }
             ctx.burst_score = (burst_sum / (N - 1) as f32).clamp(0.0, 1.0);
         }
 
-        ctx.return_stale = if w.return_streak_a > 0 && w.ball.x - w.return_start_x < 5.0 {
-            (1.0 - (w.ball.x - w.return_start_x).max(0.0) / 5.0).clamp(0.0, 1.0)
+        ctx.return_stale = if w.return_streak_a > 0 && w.ball.y - w.return_start_x < 5.0 {
+            (1.0 - (w.ball.y - w.return_start_x).max(0.0) / 5.0).clamp(0.0, 1.0)
         } else {
             0.0
         };
@@ -500,18 +514,89 @@ struct Sample {
     ret: f32,
 }
 
+fn deferred_action_credit_fraction() -> f32 {
+    wenv(
+        "DEFERRED_ACTION_CREDIT_FRACTION",
+        1.0,
+        MIN_REWARD_WEIGHT,
+        1.0,
+    )
+}
+
+/// Move delayed pass/finish credit onto the POMDP decision tick that launched
+/// the action. GAE still propagates it farther back through the possession, but
+/// this removes avoidable flight-time attribution noise. MPC-executed actions
+/// use the same launch tick, so the actor learns from the action that was
+/// actually committed to physics rather than the later capture frame.
+fn backdate_action_credit(
+    reward_history: &mut [f32],
+    launch_step: Option<usize>,
+    current_step: usize,
+    current_reward: &mut f32,
+    signed_credit: f32,
+    fraction: f32,
+) {
+    let Some(launch_step) = launch_step else {
+        return;
+    };
+    if launch_step >= current_step || launch_step >= reward_history.len() {
+        return;
+    }
+    let moved = signed_credit * fraction.clamp(MIN_REWARD_WEIGHT, 1.0);
+    *current_reward -= moved;
+    reward_history[launch_step] += moved;
+}
+
+fn full_game_outcome_label(goals_for: u32, goals_against: u32) -> f32 {
+    match goals_for.cmp(&goals_against) {
+        std::cmp::Ordering::Greater => REW_WIN_POINTS,
+        std::cmp::Ordering::Less => -REW_WIN_POINTS,
+        std::cmp::Ordering::Equal => 0.0,
+    }
+}
+
+fn full_game_actor_credit(outcome_label: f32) -> f32 {
+    // The critic learns the full +/-1000 terminal value. Broadcasting that raw
+    // magnitude into every actor advantage, however, blames every action by all
+    // four agents equally for an early loss and erases rare successful actions.
+    // Keep a bounded Monte-Carlo policy contribution while local POMDP/MPC
+    // rewards retain enough resolution to assign the result to actual decisions.
+    outcome_label
+        * wenv(
+            "FULL_GAME_ACTOR_CREDIT_FRACTION",
+            0.02,
+            FULL_GAME_ACTOR_CREDIT_FRACTION_BOUNDS.0,
+            FULL_GAME_ACTOR_CREDIT_FRACTION_BOUNDS.1,
+        )
+}
+
 struct BcSample {
     obs: [f32; OBS_DIM],
     mask: [bool; NA],
     speed_mask: [bool; NS],
     action: usize, // macro action (0..NA)
     speed: usize,  // scripted speed gear (0..NS)
+    actor_weight: f32,
 }
 
 pub struct CloneStats {
     pub samples: usize,
+    pub shot_samples: usize,
     pub loss: f32,
     pub accuracy: f32,
+}
+
+fn behavior_clone_actor_weight(action: usize, count: usize, max_count: usize) -> f32 {
+    let frequency_weight =
+        ((max_count.max(1) as f32 / count.max(1) as f32).sqrt()).clamp(1.0, 64.0);
+    if action == A_SHOOT {
+        // A legal finish occurs roughly once among thousands of ordinary
+        // movement frames. Without bounded rare-event replay, cloning and PPO
+        // both forget the only action that can realize the 500-point goal.
+        frequency_weight.max(wenv("BC_SHOT_SAMPLE_WEIGHT", 64.0, 1.0, 128.0))
+    } else {
+        frequency_weight
+    }
 }
 
 /// Collect one game of Team-A experience (5 players) vs the scripted baseline.
@@ -539,6 +624,9 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
     // LINGER_RADIUS. Only SUSTAINED lingering triggers the spacing penalty.
     let mut close_ticks = [0u32; N];
     let linger_gate = linger_ticks();
+    let deferred_credit_fraction = deferred_action_credit_fraction();
+    let mut pending_pass_launch_step: Option<usize> = None;
+    let mut pending_shot_launch_step: Option<usize> = None;
 
     for step in 0..STEPS {
         let mut obs_t = [[0.0f32; OBS_DIM]; N];
@@ -594,14 +682,23 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
         };
         w.step(&packed_a, &act_b, rng);
         let post_field = FieldRewardContext::from_world(&w);
+        if w.ev_pass_attempt_a {
+            pending_pass_launch_step = Some(step);
+        }
+        if w.ev_shot_attempt_a {
+            pending_shot_launch_step = Some(step);
+        }
 
         // team reward (Team A perspective)
         let phi = w.potential_a();
         let shaping = GAMMA * phi - phi_prev;
         phi_prev = phi;
         let mut r = rw().shape * shaping;
+        let mut delayed_pass_credit = 0.0f32;
+        let mut delayed_goal_credit = 0.0f32;
         if w.ev_goal_a {
             r += REW_GOAL_POINTS; // GOALS are the prize (anchor: 500)
+            delayed_goal_credit += REW_GOAL_POINTS;
         }
         if w.ev_goal_b {
             // Conceding stings a discoverable fraction of the goal anchor —
@@ -635,37 +732,51 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
             let field_progress =
                 (0.50 + 0.50 * post_field.safe_outlet_value + 0.25 * post_field.burst_score)
                     .clamp(0.35, 1.25);
-            r += rw().pass_credit * field_pass
+            let completion_credit = rw().pass_credit * field_pass
                 + (w.last_pass_gain_a.max(0.0) * PASS_PROGRESS_PER_YARD * field_progress)
                     .min(PASS_PROGRESS_CAP);
-            r += rw().field_pass
+            r += completion_credit;
+            delayed_pass_credit += completion_credit;
+            let field_credit = rw().field_pass
                 * FieldRewardContext::delta(
                     post_field.safe_outlet_value,
                     pre_field.safe_outlet_value,
                 );
+            r += field_credit;
+            delayed_pass_credit += field_credit;
             // MILESTONE: the 2nd completed pass unlocks a legal shot. The pinball used
             // to farm this via pass-pass-shoot-repeat — now the SHOT COOLDOWN breaks
             // that loop (the rapid follow-up shot pays nothing), so the milestone is
             // safe to reward again for genuine build-up.
             if n == 2 {
                 r += rw().milestone;
+                delayed_pass_credit += rw().milestone;
             }
             // Anti-recycle: escalating penalty for sterile long possessions.
             if n > 6 {
-                r -= rw().recycle * (n - 6) as f32;
+                let recycle_penalty = rw().recycle * (n - 6) as f32;
+                r -= recycle_penalty;
+                delayed_pass_credit -= recycle_penalty;
             }
         }
         if w.ev_turnover_a {
             let field_risk = (0.75 + pre_field.turnover_risk).clamp(0.75, 1.75);
-            r -= rw().turnover * field_risk;
+            let turnover_penalty = rw().turnover * field_risk;
+            r -= turnover_penalty;
+            delayed_pass_credit -= turnover_penalty;
             if w.ev_bad_pass_turnover_a {
-                r -= rw().bad_pass_turnover * (0.75 + pre_field.safe_outlet_value);
+                let bad_pass_penalty =
+                    rw().bad_pass_turnover * (0.75 + pre_field.safe_outlet_value);
+                r -= bad_pass_penalty;
+                delayed_pass_credit -= bad_pass_penalty;
             }
             if w.ev_dribble_turnover_a {
                 r -= rw().dribble_turnover * (0.75 + pre_field.dribble_pressure);
             }
-            r -= rw().field_turnover
+            let field_turnover_penalty = rw().field_turnover
                 * (post_field.turnover_risk + pre_field.safe_outlet_value).clamp(0.0, 1.5);
+            r -= field_turnover_penalty;
+            delayed_pass_credit -= field_turnover_penalty;
         }
         // SHOT ON GOAL from the opponent's half after 2 passes is EARNED and
         // rewarded HANDSOMELY (not just goals) — a strong base plus a chance-quality
@@ -681,7 +792,10 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
             // quality interpolates inside the band. Spam is blocked structurally:
             // ev_shot_on requires a legal, earned shot and the cooldown zeroes
             // rapid-fire repeats.
-            r += anchored_shot_points(w.last_shot_quality_a, w.last_shot_xg_a, rw().shot_span);
+            let shot_credit =
+                anchored_shot_points(w.last_shot_quality_a, w.last_shot_xg_a, rw().shot_span);
+            r += shot_credit;
+            delayed_goal_credit += shot_credit;
         }
         // reward winning the ball back (pressing / interceptions / tackles)
         if w.ev_win_ball_a {
@@ -710,7 +824,7 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
             } else {
                 rw().return_pass * 2f32.powi((k - 1) as i32)
             };
-            if w.ball.x - w.return_start_x < 5.0 {
+            if w.ball.y - w.return_start_x < 5.0 {
                 pen += rw().return_stale; // no upfield progress -> heavier
             }
             pen *= 1.0 + 0.50 * pre_field.safe_outlet_value + 0.50 * pre_field.return_stale;
@@ -724,12 +838,36 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
         r += rw().field_burst_delta
             * FieldRewardContext::delta(post_field.burst_score, pre_field.burst_score);
 
-        // Possession PHASE (covers ball-in-flight during our build-up, not just
-        // strict ownership): our phase = we own OR loose ball we last touched.
-        let a_owns = matches!(w.owner, Some(o) if matches!(o.team, Team::A));
-        let b_owns = matches!(w.owner, Some(o) if matches!(o.team, Team::B));
-        let our_phase = a_owns || (w.owner.is_none() && matches!(w.last_touch, Some(Team::A)));
-        let their_phase = b_owns || (w.owner.is_none() && matches!(w.last_touch, Some(Team::B)));
+        if w.ev_pass_completed_a || w.ev_bad_pass_turnover_a {
+            backdate_action_credit(
+                &mut rew_buf,
+                pending_pass_launch_step,
+                step,
+                &mut r,
+                delayed_pass_credit,
+                deferred_credit_fraction,
+            );
+            pending_pass_launch_step = None;
+        }
+        if delayed_goal_credit.abs() > 0.0 {
+            backdate_action_credit(
+                &mut rew_buf,
+                pending_shot_launch_step,
+                step,
+                &mut r,
+                delayed_goal_credit,
+                deferred_credit_fraction,
+            );
+            pending_shot_launch_step = None;
+        } else if pending_shot_launch_step.is_some() && w.owner.is_some() {
+            pending_shot_launch_step = None;
+        }
+
+        // Controlled possession phase. A free/in-flight ball is a true 50:50,
+        // never attack merely because we touched it last.
+        let phase = w.possession_phase_for(Team::A);
+        let our_phase = phase == PossessionPhase::Possession;
+        let their_phase = phase == PossessionPhase::Dispossession;
 
         // PER-PLAYER coordination (MARL): teammate spacing (anti-bunch) PLUS a
         // possession-conditioned positioning reward —
@@ -788,7 +926,7 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
                     let to_ip = ip.sub(w.a[i].pos);
                     let d = to_ip.len();
                     if d > 0.5 {
-                        let closing = (w.a[i].vel.x * to_ip.x + w.a[i].vel.y * to_ip.y) / d;
+                        let closing = (w.a[i].vel.y * to_ip.y + w.a[i].vel.x * to_ip.x) / d;
                         let def_bonus = if i <= 2 { 1.3 } else { 1.0 };
                         sp_t[i] +=
                             rw().pursuit * belief * def_bonus * (closing / 8.5).clamp(0.0, 1.0);
@@ -799,7 +937,7 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
                 // Advance upfield (attack frame +x). No offsides rule, so reward
                 // getting into the ATTACKING HALF and keep rewarding all the way to
                 // the opponent goal — attackers should camp high, not hold at half.
-                let advance = pos.x / FIELD_L - 0.5;
+                let advance = pos.y / FIELD_L - 0.5;
                 // OPEN = a CLEAR passing lane from the ball to me (no defender in
                 // between). NOT merely far from a marker — a player inline behind a
                 // defender is NOT open. This is the MECHANISM for "opening up": the
@@ -807,7 +945,7 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
                 // which clears the lane (hence width is rewarded strongly too).
                 let open = w.lane_clearness(Team::A, w.ball, pos) - 0.5;
                 // WIDTH: how far off the central lane (0 = center, 1 = touchline).
-                let wide = (pos.y - FIELD_W / 2.0).abs() / (FIELD_W / 2.0);
+                let wide = (pos.x - FIELD_W / 2.0).abs() / (FIELD_W / 2.0);
                 let width = wide - 0.4; // penalize the central lane, reward stretching
                                         // FLANK affinity: convex bonus for genuinely committing to a
                                         // left/right channel. With the 8-yd anti-bunch this splits the
@@ -826,9 +964,9 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
                 //       gears are for). Together this pulls the whole line upfield
                 //       in unison the moment we win possession.
                 if !is_carrier {
-                    let ahead = ((pos.x - w.ball.x) / 12.0).clamp(0.0, 1.0);
+                    let ahead = ((pos.y - w.ball.y) / 12.0).clamp(0.0, 1.0);
                     let lane = w.lane_clearness(Team::A, w.ball, pos);
-                    let make_run = (w.a[i].vel.x / 8.5).clamp(0.0, 1.0); // fwd speed, ~run_fast = 1.0
+                    let make_run = (w.a[i].vel.y / 8.5).clamp(0.0, 1.0); // fwd speed, ~run_fast = 1.0
                     let burst = if spd_t[i] >= SPD_SPRINT {
                         1.0
                     } else if spd_t[i] >= SPD_RUN_FAST {
@@ -845,10 +983,10 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
             } else if their_phase {
                 // goalside of the ball: our goal is at x=0, so reward being at a
                 // LOWER x than the ball (between ball and own goal).
-                let goalside = ((w.ball.x - pos.x) / 8.0).clamp(-1.0, 1.0);
+                let goalside = ((w.ball.y - pos.y) / 8.0).clamp(-1.0, 1.0);
                 sp_t[i] += rw().goalside * goalside;
-                if pos.x > w.ball.x {
-                    let recovery_run = (-w.a[i].vel.x / 8.5).clamp(0.0, 1.0);
+                if pos.y > w.ball.y {
+                    let recovery_run = (-w.a[i].vel.y / 8.5).clamp(0.0, 1.0);
                     sp_t[i] += rw().goalside_run * recovery_run;
                 }
             }
@@ -872,6 +1010,11 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
     // centralized critic is trained (below) to predict these returns from the
     // global state — a valid, lower-variance baseline (MAPPO/CTDE).
     let t = rew_buf.len();
+    // AlphaZero-style full-game label: broadcast win/loss to every transition so
+    // early POMDP/MPC decisions receive outcome credit instead of the terminal
+    // signal decaying to ~zero over a long episode.
+    let outcome_label = full_game_outcome_label(w.goals_a, w.goals_b);
+    let actor_outcome_credit = full_game_actor_credit(outcome_label);
     let mut samples = Vec::with_capacity(t * (N - 1));
     for i in 1..N {
         let mut adv = 0.0f32;
@@ -880,7 +1023,10 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
             let v = val_buf[s]; // shared centralized value
             let delta = rew_buf[s] + space_buf[s][i] + GAMMA * next_v - v;
             adv = delta + GAMMA * LAMBDA * adv;
-            let ret = adv + v;
+            let outcome_adjusted_adv = adv + actor_outcome_credit;
+            // Full-strength terminal backpropagation remains in the centralized
+            // value target; only the noisy actor contribution is scaled.
+            let ret = adv + outcome_label + v;
             next_v = v;
             samples.push(Sample {
                 obs: obs_buf[s][i],
@@ -891,7 +1037,7 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
                 speed: spd_buf[s][i],
                 old_logp_a: logpa_buf[s][i],
                 old_logp_s: logps_buf[s][i],
-                adv,
+                adv: outcome_adjusted_adv,
                 ret,
             });
         }
@@ -1034,9 +1180,34 @@ pub fn behavior_clone_scripted(
     epochs: usize,
     rng: &mut Rng,
 ) -> CloneStats {
+    behavior_clone(policy, games, epochs, 1.0, rng)
+}
+
+/// DAgger correction: collect analytic labels on states induced primarily by
+/// the current neural policy. A bounded teacher roll-in fraction keeps rare
+/// build-up and finishing states reachable while training away compounding
+/// behavior-cloning errors on the learner's own state distribution.
+pub fn behavior_clone_dagger(
+    policy: &mut Policy,
+    games: usize,
+    epochs: usize,
+    teacher_rollin: f32,
+    rng: &mut Rng,
+) -> CloneStats {
+    behavior_clone(policy, games, epochs, teacher_rollin.clamp(0.0, 0.75), rng)
+}
+
+fn behavior_clone(
+    policy: &mut Policy,
+    games: usize,
+    epochs: usize,
+    teacher_rollin: f32,
+    rng: &mut Rng,
+) -> CloneStats {
     if games == 0 || epochs == 0 {
         return CloneStats {
             samples: 0,
+            shot_samples: 0,
             loss: 0.0,
             accuracy: 0.0,
         };
@@ -1049,21 +1220,25 @@ pub fn behavior_clone_scripted(
             w.kickoff(Team::B);
         }
         for _ in 0..STEPS {
-            let mut act_a = w.scripted_actions(Team::A);
+            let teacher_a = w.scripted_actions(Team::A);
+            let mut act_a = teacher_a;
             for i in 1..N {
                 let obs = w.observe(Team::A, i);
                 let mask = w.legal_mask(Team::A, i);
-                if let Some(action) = legal_or_first(act_a[i] % NA, &mask) {
+                if let Some(action) = legal_or_first(teacher_a[i] % NA, &mask) {
                     let speed_mask = w.speed_mask(Team::A, i, action);
-                    let gear = w.coerce_speed_gear(Team::A, i, action, act_a[i] / NA);
-                    act_a[i] = action + gear * NA;
+                    let gear = w.coerce_speed_gear(Team::A, i, action, teacher_a[i] / NA);
                     data.push(BcSample {
                         obs,
                         mask,
                         speed_mask,
                         action,
                         speed: gear,
+                        actor_weight: 1.0,
                     });
+                }
+                if teacher_rollin < 1.0 && rng.f01() >= teacher_rollin {
+                    act_a[i] = policy.act_greedy_world(&w, Team::A, i);
                 }
             }
             let act_b = w.scripted_actions(Team::B);
@@ -1071,10 +1246,27 @@ pub fn behavior_clone_scripted(
         }
     }
 
+    let mut action_counts = [0usize; NA];
+    for sample in &data {
+        action_counts[sample.action] += 1;
+    }
+    let max_action_count = action_counts.iter().copied().max().unwrap_or(1);
+    for sample in &mut data {
+        sample.actor_weight = behavior_clone_actor_weight(
+            sample.action,
+            action_counts[sample.action],
+            max_action_count,
+        );
+    }
+
     let mut idx: Vec<usize> = (0..data.len()).collect();
     let mut loss_accum = 0.0f32;
     let mut correct = 0.0f32;
     let mut count = 0.0f32;
+    let shot_samples = data
+        .iter()
+        .filter(|sample| sample.action == A_SHOOT)
+        .count();
     for _ in 0..epochs {
         shuffle(&mut idx, rng);
         for chunk in idx.chunks(MINIBATCH) {
@@ -1085,7 +1277,7 @@ pub fn behavior_clone_scripted(
                 let logits = acts.last().unwrap();
                 let probs = masked_softmax(logits, &s.mask);
                 let p = probs[s.action].max(1e-8);
-                loss_accum += -p.ln();
+                loss_accum += -p.ln() * s.actor_weight;
                 if probs
                     .iter()
                     .enumerate()
@@ -1093,12 +1285,13 @@ pub fn behavior_clone_scripted(
                     .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
                     .is_some_and(|(i, _)| i == s.action)
                 {
-                    correct += 1.0;
+                    correct += s.actor_weight;
                 }
                 let mut d_logits = vec![0.0f32; NA];
                 for j in 0..NA {
                     if s.mask[j] {
-                        d_logits[j] = probs[j] - if j == s.action { 1.0 } else { 0.0 };
+                        d_logits[j] =
+                            (probs[j] - if j == s.action { 1.0 } else { 0.0 }) * s.actor_weight;
                     }
                 }
                 policy.actor.backward(&acts, &d_logits);
@@ -1112,7 +1305,7 @@ pub fn behavior_clone_scripted(
                     }
                 }
                 policy.speedor.backward(&sacts, &d_slogits);
-                count += 1.0;
+                count += s.actor_weight;
             }
             policy.actor.step(LR_BC);
             policy.speedor.step(LR_BC);
@@ -1121,6 +1314,7 @@ pub fn behavior_clone_scripted(
 
     CloneStats {
         samples: data.len(),
+        shot_samples,
         loss: loss_accum / count.max(1.0),
         accuracy: correct / count.max(1.0),
     }
@@ -1414,6 +1608,137 @@ pub fn evaluate_vs_policy(cand: &Policy, opp: &Policy, games: usize, rng: &mut R
     (gd / g, wr / g)
 }
 
+/// Side-balanced evaluation used by the promotion gate. Every seed is played
+/// twice, with the candidate on each side, so a favourable Team A geometry or
+/// kickoff sequence cannot manufacture a ladder promotion.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PairedEvaluation {
+    pub games: usize,
+    pub goal_diff: f32,
+    pub payoff: f32,
+    pub goal_diff_lower_95: f32,
+    pub payoff_lower_95: f32,
+}
+
+fn summarize_paired_outcomes(goal_diffs: &[f32]) -> PairedEvaluation {
+    let games = goal_diffs.len();
+    if games == 0 {
+        return PairedEvaluation::default();
+    }
+    let n = games as f32;
+    let goal_diff = goal_diffs.iter().sum::<f32>() / n;
+    let payoffs: Vec<f32> = goal_diffs
+        .iter()
+        .map(|diff| {
+            if *diff > 0.0 {
+                1.0
+            } else if *diff < 0.0 {
+                0.0
+            } else {
+                0.5
+            }
+        })
+        .collect();
+    let payoff = payoffs.iter().sum::<f32>() / n;
+    let lower_95 = |samples: &[f32], mean: f32| {
+        if samples.len() < 2 {
+            return f32::NEG_INFINITY;
+        }
+        let variance = samples
+            .iter()
+            .map(|sample| {
+                let delta = *sample - mean;
+                delta * delta
+            })
+            .sum::<f32>()
+            / (samples.len() - 1) as f32;
+        mean - 1.96 * (variance / samples.len() as f32).sqrt()
+    };
+    PairedEvaluation {
+        games,
+        goal_diff,
+        payoff,
+        goal_diff_lower_95: lower_95(goal_diffs, goal_diff),
+        payoff_lower_95: lower_95(&payoffs, payoff),
+    }
+}
+
+fn evaluate_policy_match(
+    candidate: &Policy,
+    opponent: Option<&Policy>,
+    candidate_team: Team,
+    seed: u64,
+) -> f32 {
+    let mut rng = Rng::new(seed);
+    let mut world = World::new();
+    if rng.f01() < 0.5 {
+        world.kickoff(Team::B);
+    }
+    for _ in 0..STEPS {
+        let learned_actions = |policy: &Policy, team: Team, world: &World| {
+            let mut actions = [A_STAY; N];
+            for i in 1..N {
+                actions[i] = policy.act_greedy_world(world, team, i);
+            }
+            actions
+        };
+        let (actions_a, actions_b) = match candidate_team {
+            Team::A => (
+                learned_actions(candidate, Team::A, &world),
+                opponent.map_or_else(
+                    || world.scripted_actions(Team::B),
+                    |policy| learned_actions(policy, Team::B, &world),
+                ),
+            ),
+            Team::B => (
+                opponent.map_or_else(
+                    || world.scripted_actions(Team::A),
+                    |policy| learned_actions(policy, Team::A, &world),
+                ),
+                learned_actions(candidate, Team::B, &world),
+            ),
+        };
+        world.step(&actions_a, &actions_b, &mut rng);
+    }
+    match candidate_team {
+        Team::A => world.goals_a as f32 - world.goals_b as f32,
+        Team::B => world.goals_b as f32 - world.goals_a as f32,
+    }
+}
+
+fn evaluate_paired(
+    candidate: &Policy,
+    opponent: Option<&Policy>,
+    games: usize,
+    rng: &mut Rng,
+) -> PairedEvaluation {
+    let pairs = games.max(2).div_ceil(2);
+    let mut goal_diffs = Vec::with_capacity(pairs * 2);
+    for _ in 0..pairs {
+        let seed = rng.next_u64();
+        goal_diffs.push(evaluate_policy_match(candidate, opponent, Team::A, seed));
+        goal_diffs.push(evaluate_policy_match(candidate, opponent, Team::B, seed));
+    }
+    summarize_paired_outcomes(&goal_diffs)
+}
+
+pub fn evaluate_vs_policy_paired(
+    candidate: &Policy,
+    opponent: &Policy,
+    games: usize,
+    rng: &mut Rng,
+) -> PairedEvaluation {
+    evaluate_paired(candidate, Some(opponent), games, rng)
+}
+
+pub fn evaluate_vs_scripted_paired(
+    candidate: &Policy,
+    games: usize,
+    rng: &mut Rng,
+) -> PairedEvaluation {
+    evaluate_paired(candidate, None, games, rng)
+}
+
 /// Baseline sanity check: scripted-vs-scripted goal difference (should be ~0).
 pub fn evaluate_scripted_vs_scripted(games: usize, rng: &mut Rng) -> (f32, f32, f32) {
     let mut diff = 0.0f32;
@@ -1608,6 +1933,9 @@ mod tests {
             bounded_weight(None, 0.0, MIN_REWARD_WEIGHT, 2.0),
             MIN_REWARD_WEIGHT
         );
+        assert_eq!(ON_FRAME_SHOT_FLOOR + ON_FRAME_SHOT_CAP_SPAN, 200.0);
+        assert!(PASS_PROGRESS_CAP < ON_FRAME_SHOT_FLOOR);
+        assert!(w_spacing() > 0.0);
     }
 
     #[test]
@@ -1677,6 +2005,33 @@ mod tests {
     }
 
     #[test]
+    fn delayed_action_credit_moves_to_the_committed_pomdp_mpc_tick() {
+        let mut history = vec![1.0, 2.0];
+        let mut current = 5.0;
+        backdate_action_credit(&mut history, Some(0), 2, &mut current, 4.0, 0.5);
+        assert_eq!(history, vec![3.0, 2.0]);
+        assert_eq!(current, 3.0);
+
+        let mut penalty_now = -6.0;
+        backdate_action_credit(&mut history, Some(1), 2, &mut penalty_now, -4.0, 1.0);
+        assert_eq!(history[1], -2.0);
+        assert_eq!(penalty_now, -2.0);
+    }
+
+    #[test]
+    fn full_game_outcome_is_broadcast_with_fixed_symmetric_anchor() {
+        assert_eq!(full_game_outcome_label(2, 1), 1000.0);
+        assert_eq!(full_game_outcome_label(1, 2), -1000.0);
+        assert_eq!(full_game_outcome_label(1, 1), 0.0);
+
+        let winning_credit = full_game_actor_credit(full_game_outcome_label(2, 1));
+        let losing_credit = full_game_actor_credit(full_game_outcome_label(1, 2));
+        assert!(winning_credit >= 1.0 && winning_credit <= 100.0);
+        assert_eq!(losing_credit, -winning_credit);
+        assert_eq!(full_game_actor_credit(0.0), 0.0);
+    }
+
+    #[test]
     fn scripted_vs_scripted_is_seed_reproducible() {
         let mut a = Rng::new(1234);
         let mut b = Rng::new(1234);
@@ -1711,6 +2066,16 @@ mod tests {
         let mut rng = Rng::new(2026);
         let mut policy = Policy::new(&mut rng);
         let stats = behavior_clone_scripted(&mut policy, 1, 1, &mut rng);
+        assert!(stats.samples > 0);
+        assert!(stats.loss.is_finite());
+        assert!((0.0..=1.0).contains(&stats.accuracy));
+    }
+
+    #[test]
+    fn dagger_collects_labels_on_neural_rollin_states() {
+        let mut rng = Rng::new(2027);
+        let mut policy = Policy::new(&mut rng);
+        let stats = behavior_clone_dagger(&mut policy, 1, 1, 0.0, &mut rng);
         assert!(stats.samples > 0);
         assert!(stats.loss.is_finite());
         assert!((0.0..=1.0).contains(&stats.accuracy));

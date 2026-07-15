@@ -134,20 +134,20 @@ const BALL_GRASS_RESISTANCE: f32 = 0.96; // DEFAULT_BALL_GRASS_RESISTANCE_YPS2 (
 const BALL_STOP_SPEED: f32 = 0.55; // DEFAULT_BALL_STOP_SPEED_YPS (snap to rest below this)
 const AERIAL_FLIGHT_DRAG_RELIEF: f32 = 0.88; // airborne linear+air relief
 const BALL_ROLLING_ALT: f32 = 0.06; // BALL_ROLLING_ALTITUDE_YARDS (at/below = grounded)
-// Standing reach + jump for an airborne interception (CONTROL_* reach constants).
+                                    // Standing reach + jump for an airborne interception (CONTROL_* reach constants).
 const CONTROL_STANDING_REACH: f32 = 1.6;
 const CONTROL_AERIAL_JUMP_REACH: f32 = 2.2;
 const LOW_BALL_INTERCEPT_FLOOR: f32 = 2.0;
 const KEEPER_AERIAL_REACH: f32 = 2.6; // keeper jump+arms: claims lofted balls only up to this altitude
 const AERIAL_LAND_AT_TARGET_DRAG_COMP: f32 = 1.08; // closed-form ignores drag: strike a touch firmer
-// A blocked ground lane turns the pass into a CHIP (the 11v11 scoop): the apex
-// floor is the 11v11 raised-scoop minimum (SCOOP_LOFT_APEX_HIGH_MIN_YARDS,
-// ~10ft — "clears an upright/jumping defender"). Every rankable target (the
-// pass ranker's minimum is 2 yd) chips when its floor lane is blocked:
-// measured blocked-lane GROUND completion here is ~0-18% (a floor ball through
-// a body is a dead ball), so the chip outlet is what keeps pressured
-// possession — and early RL exploration — alive. Gating chips to >= 11 yd
-// trained into passivity (2 att/game).
+                                                   // A blocked ground lane turns the pass into a CHIP (the 11v11 scoop): the apex
+                                                   // floor is the 11v11 raised-scoop minimum (SCOOP_LOFT_APEX_HIGH_MIN_YARDS,
+                                                   // ~10ft — "clears an upright/jumping defender"). Every rankable target (the
+                                                   // pass ranker's minimum is 2 yd) chips when its floor lane is blocked:
+                                                   // measured blocked-lane GROUND completion here is ~0-18% (a floor ball through
+                                                   // a body is a dead ball), so the chip outlet is what keeps pressured
+                                                   // possession — and early RL exploration — alive. Gating chips to >= 11 yd
+                                                   // trained into passivity (2 att/game).
 const LOFT_MIN_DISTANCE: f32 = 2.0;
 const LOFT_APEX_CLEAR_FLOOR: f32 = 3.05;
 
@@ -284,14 +284,14 @@ const KEEPER_SPEED: f32 = 6.0;
 const GK_REACTION_BASE_S: f32 = 0.26; // 11v11: 0.36 − quickness·0.16 with quickness ≈ 0.625
 const GK_REACTION_FATIGUE_S: f32 = 0.11; // + fatigue·0.11 (uses the keeper's live fatigue)
 const GK_REACTION_SCORE: f32 = 0.5; // uniform mid keeper (11v11 ability blend at 5.5 skills)
-// 11v11 resolves SAVED iff save_probability >= 0.50 — deterministic, no RNG.
-// The 5v5 keeps the deterministic-threshold semantics but recalibrates the bar:
-// 5v5 shots are MPC-aimed on frame from < 24 yd, where the (unchanged) distance
-// baseline tops out near 0.6 and coverage near 0.7, so the 11v11 bar of 0.50
-// would make the keeper a statue (zero saves). 0.20 splits the same gradient at
-// 5v5 range: point-blank (< ~13 yd) beats the keeper, mid-range (14+ yd) is
-// saved only when the keeper is set in the shot lane, and corner placement or a
-// displaced keeper (reach_penalty) still concedes.
+                                    // 11v11 resolves SAVED iff save_probability >= 0.50 — deterministic, no RNG.
+                                    // The 5v5 keeps the deterministic-threshold semantics but recalibrates the bar:
+                                    // 5v5 shots are MPC-aimed on frame from < 24 yd, where the (unchanged) distance
+                                    // baseline tops out near 0.6 and coverage near 0.7, so the 11v11 bar of 0.50
+                                    // would make the keeper a statue (zero saves). 0.20 splits the same gradient at
+                                    // 5v5 range: point-blank (< ~13 yd) beats the keeper, mid-range (14+ yd) is
+                                    // saved only when the keeper is set in the shot lane, and corner placement or a
+                                    // displaced keeper (reach_penalty) still concedes.
 const GK_SAVE_DECISION_BAR: f32 = 0.20;
 const GK_CATCH_BAR: f32 = 0.58; // 11v11: CAUGHT iff catch_probability >= 0.58, else PARRY
 const GK_SAVE_DEPTH_MIN: f32 = 1.6; // 11v11 SHOT_SAVE_DEPTH_YARDS (save resolves at keeper depth)
@@ -337,18 +337,34 @@ pub struct V2 {
     pub x: f32,
     pub y: f32,
 }
+// the .x/.y access-swap script must NOT touch it.
 impl V2 {
-    pub fn new(x: f32, y: f32) -> Self {
-        V2 { x, y }
+    // Callers construct as new(<length>, <width>) by the historical convention. Under the
+    // x=width / y=length axis flip we store width in field `x` and length in field `y`, so
+    // `new` swaps: first arg -> field y (length), second arg -> field x (width). Every call
+    // site is thus flipped in one place, with no edits to the ~100 construction sites.
+    pub fn new(a: f32, b: f32) -> Self {
+        V2 { x: b, y: a }
     }
+    // The vector ops are component-wise on the STORED fields (correct regardless of which
+    // axis each field denotes), so they use struct literals to bypass the swapping `new`.
     pub fn add(self, o: V2) -> V2 {
-        V2::new(self.x + o.x, self.y + o.y)
+        V2 {
+            x: self.x + o.x,
+            y: self.y + o.y,
+        }
     }
     pub fn sub(self, o: V2) -> V2 {
-        V2::new(self.x - o.x, self.y - o.y)
+        V2 {
+            x: self.x - o.x,
+            y: self.y - o.y,
+        }
     }
     pub fn scale(self, s: f32) -> V2 {
-        V2::new(self.x * s, self.y * s)
+        V2 {
+            x: self.x * s,
+            y: self.y * s,
+        }
     }
     pub fn len(self) -> f32 {
         (self.x * self.x + self.y * self.y).sqrt()
@@ -356,9 +372,12 @@ impl V2 {
     pub fn unit(self) -> V2 {
         let l = self.len();
         if l < 1e-6 {
-            V2::new(0.0, 0.0)
+            V2 { x: 0.0, y: 0.0 }
         } else {
-            V2::new(self.x / l, self.y / l)
+            V2 {
+                x: self.x / l,
+                y: self.y / l,
+            }
         }
     }
 }
@@ -536,10 +555,22 @@ impl Player {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Team {
     A,
     B,
+}
+
+/// Controlled-possession phase exposed to both the decentralized POMDP actor
+/// and the centralized MAPPO critic. A free ball is always a real duel: the
+/// previous touch is history, not current possession. Keeping this as a named
+/// state prevents action masks and reward shaping from silently treating an
+/// in-flight/loose ball as settled attack or defence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PossessionPhase {
+    Possession,
+    Dispossession,
+    FiftyFifty,
 }
 impl Team {
     fn other(self) -> Team {
@@ -548,7 +579,9 @@ impl Team {
             Team::B => Team::A,
         }
     }
-    /// Attack direction on the x-axis: A attacks +x (goal at FIELD_L), B attacks -x.
+    /// Attack direction sign on the LENGTH (y) axis: A attacks +y (goal at y=FIELD_L),
+    /// B attacks -y (goal at y=0). Matches the 11v11 `attack_dir()` convention: x=width,
+    /// y=length. (Name kept as `sx` for churn reasons; it is the length-axis attack sign.)
     fn sx(self) -> f32 {
         match self {
             Team::A => 1.0,
@@ -831,6 +864,14 @@ impl World {
             Team::B => self.b[o.idx],
         }
     }
+
+    pub fn possession_phase_for(&self, team: Team) -> PossessionPhase {
+        match self.owner {
+            Some(owner) if owner.team == team => PossessionPhase::Possession,
+            Some(_) => PossessionPhase::Dispossession,
+            None => PossessionPhase::FiftyFifty,
+        }
+    }
     fn nearest_player(&self, team: Team, p: V2) -> (usize, f32) {
         let ps = players(team, self);
         let mut bi = 0;
@@ -865,12 +906,12 @@ impl World {
             return V2::default();
         }
         let dir = seg.unit();
-        let perp = V2::new(-dir.y, dir.x);
+        let perp = V2::new(-dir.x, dir.y);
         let mid = from.add(seg.scale(0.5));
         let (oi, _) = self.nearest_opponent(team, mid);
         let opp = players(team.other(), self)[oi].pos;
         let rel = opp.sub(mid);
-        let side = if rel.x * perp.x + rel.y * perp.y > 0.0 {
+        let side = if rel.y * perp.y + rel.x * perp.x > 0.0 {
             -1.0
         } else {
             1.0
@@ -898,7 +939,7 @@ impl World {
         let lead = (travel_time * (0.20 + skill * 0.55)).clamp(0.0, 1.35);
         let velocity_led = tp.add(tv.scale(lead));
         // Into-space upfield lead, only for passes that actually go forward.
-        let fwd = (tp.x - from.x) * sx;
+        let fwd = (tp.y - from.y) * sx;
         let forward_pass_weight = if fwd > 6.0 {
             1.0
         } else if fwd > 1.25 {
@@ -910,7 +951,7 @@ impl World {
         };
         let (_, opp_d) = self.nearest_opponent(team, tp);
         let openness = (opp_d / TEAMMATE_GOOD_SPACE).clamp(0.0, 1.0);
-        let moving_upfield = (tv.x * sx).max(0.0);
+        let moving_upfield = (tv.y * sx).max(0.0);
         // The into-space lead is EARNED by the receiver's own upfield motion: a
         // runner gets the ball ahead to attack (up to the 3-yd cap), while a
         // STATIONARY receiver gets only a small static nudge that stays well
@@ -921,7 +962,10 @@ impl World {
         let upfield_lead = forward_pass_weight
             * (0.6 + openness * 0.5 + moving_upfield * (0.45 + 0.55 * openness)).clamp(0.0, 3.0);
         let led = velocity_led.add(V2::new(sx * upfield_lead, 0.0));
-        V2::new(led.x.clamp(0.8, FIELD_L - 0.8), led.y.clamp(0.8, FIELD_W - 0.8))
+        V2::new(
+            led.y.clamp(0.8, FIELD_L - 0.8),
+            led.x.clamp(0.8, FIELD_W - 0.8),
+        )
     }
 
     fn pass_candidates(
@@ -938,7 +982,7 @@ impl World {
                 continue; // don't pass to self or (as an outlet) the keeper
             }
             let tp = ps[i].pos;
-            let fwd = (tp.x - from.x) * sx; // positive = ahead
+            let fwd = (tp.y - from.y) * sx; // positive = ahead
             let (_, opp_d) = self.nearest_opponent(team, tp); // openness
             let dist = tp.sub(from).len();
             if dist < 2.0 {
@@ -1111,7 +1155,7 @@ impl World {
         if team != Team::A {
             return;
         }
-        let fwd = dir.x * sx;
+        let fwd = dir.y * sx;
         if fwd > 0.3 {
             self.ev_dribble_fwd_a = true;
         } else if fwd > -0.3 {
@@ -1151,11 +1195,11 @@ impl World {
                 continue;
             }
             let rel = opp[i].pos.sub(from);
-            let t = rel.x * u.x + rel.y * u.y;
+            let t = rel.y * u.y + rel.x * u.x;
             if t <= 0.5 || t >= dist {
                 continue;
             }
-            let perp = (rel.x * (-u.y) + rel.y * u.x).abs();
+            let perp = (rel.y * (-u.x) + rel.x * u.y).abs();
             let clear = (perp / 3.0).min(1.0);
             if clear < min_clear {
                 min_clear = clear;
@@ -1177,12 +1221,12 @@ impl World {
         let mut min_clear = 1.0f32;
         for i in 0..N {
             let rel = opp[i].pos.sub(from);
-            let t = rel.x * u.x + rel.y * u.y; // projection along shot
+            let t = rel.y * u.y + rel.x * u.x; // projection along shot
             if t <= 0.5 || t >= dist {
                 continue;
             }
             // perpendicular distance from lane
-            let perp = (rel.x * (-u.y) + rel.y * u.x).abs();
+            let perp = (rel.y * (-u.x) + rel.x * u.y).abs();
             let clear = (perp / 3.0).min(1.0); // within 3m blocks the lane
             if clear < min_clear {
                 min_clear = clear;
@@ -1204,8 +1248,8 @@ impl World {
     pub fn observe(&self, team: Team, idx: usize) -> [f32; OBS_DIM] {
         let sx = team.sx();
         let me = players(team, self)[idx];
-        let mir = |p: V2| -> V2 { V2::new(if sx > 0.0 { p.x } else { FIELD_L - p.x }, p.y) };
-        let mirv = |v: V2| -> V2 { V2::new(v.x * sx, v.y) };
+        let mir = |p: V2| -> V2 { V2::new(if sx > 0.0 { p.y } else { FIELD_L - p.y }, p.x) };
+        let mirv = |v: V2| -> V2 { V2::new(v.y * sx, v.x) };
         let nx = FIELD_L;
         let ny = FIELD_W;
         let nv = 10.0;
@@ -1219,9 +1263,10 @@ impl World {
         let ball_rel = bp.sub(mp);
 
         let has_ball = matches!(self.owner, Some(o) if o.team == team && o.idx == idx);
-        let team_ball = matches!(self.owner, Some(o) if o.team == team);
-        let opp_ball = matches!(self.owner, Some(o) if o.team != team);
-        let free_ball = self.owner.is_none();
+        let phase = self.possession_phase_for(team);
+        let team_ball = phase == PossessionPhase::Possession;
+        let opp_ball = phase == PossessionPhase::Dispossession;
+        let free_ball = phase == PossessionPhase::FiftyFifty;
 
         // derived cues kept for action semantics: shot lane + best-pass openness
         let shot_clear = self.shot_clearness(team, me.pos);
@@ -1268,26 +1313,26 @@ impl World {
         f.push(team_ball as u8 as f32);
         f.push(opp_ball as u8 as f32);
         f.push(free_ball as u8 as f32);
-        f.push(mp.x / nx * 2.0 - 1.0);
-        f.push(mp.y / ny * 2.0 - 1.0);
-        f.push(mvel.x / nv);
+        f.push(mp.y / nx * 2.0 - 1.0);
+        f.push(mp.x / ny * 2.0 - 1.0);
         f.push(mvel.y / nv);
+        f.push(mvel.x / nv);
         f.push(me.fatigue.clamp(0.0, 1.0));
         f.push(me.anaerobic_load.clamp(0.0, 1.0));
         // 2-pass rule state: how many passes made (0, 0.5, 1.0 = can shoot)
         f.push((self.pass_streak_a.min(2) as f32) / 2.0);
         // ball (5)
-        f.push(ball_rel.x / nx);
-        f.push(ball_rel.y / ny);
+        f.push(ball_rel.y / nx);
+        f.push(ball_rel.x / ny);
         f.push(ball_rel.len() / nx);
-        f.push(bvel.x / nv);
         f.push(bvel.y / nv);
+        f.push(bvel.x / nv);
         // goals (5)
-        f.push((goal.x - mp.x) / nx);
-        f.push((goal.y - mp.y) / ny);
+        f.push((goal.y - mp.y) / nx);
+        f.push((goal.x - mp.x) / ny);
         f.push(goal.sub(mp).len() / nx);
-        f.push((own.x - mp.x) / nx);
-        f.push((own.y - mp.y) / ny);
+        f.push((own.y - mp.y) / nx);
+        f.push((own.x - mp.x) / ny);
         // role + action cues (6)
         f.push(is_closest);
         f.push(ball_rank);
@@ -1300,10 +1345,10 @@ impl World {
             let p = players(team, self)[k];
             let rp = mir(p.pos).sub(mp);
             let rv = mirv(p.vel);
-            f.push(rp.x / nx);
-            f.push(rp.y / ny);
-            f.push(rv.x / nv);
+            f.push(rp.y / nx);
+            f.push(rp.x / ny);
             f.push(rv.y / nv);
+            f.push(rv.x / nv);
             f.push(rp.len() / nx);
         }
         // ALL opponents, nearest-first (N = 5 × 5 = 25)
@@ -1311,10 +1356,10 @@ impl World {
             let p = opp[k];
             let rp = mir(p.pos).sub(mp);
             let rv = mirv(p.vel);
-            f.push(rp.x / nx);
-            f.push(rp.y / ny);
-            f.push(rv.x / nv);
+            f.push(rp.y / nx);
+            f.push(rp.x / ny);
             f.push(rv.y / nv);
+            f.push(rv.x / nv);
             f.push(rp.len() / nx);
         }
         // possession/duel tri-state (3): MARL acting depends on possession vs
@@ -1331,11 +1376,7 @@ impl World {
     /// Legal-action mask for one player (on-ball vs off-ball families).
     pub fn legal_mask(&self, team: Team, idx: usize) -> [bool; NA] {
         let has_ball = matches!(self.owner, Some(o) if o.team == team && o.idx == idx);
-        let team_owns = matches!(self.owner, Some(o) if o.team == team);
-        let opp_owns = matches!(self.owner, Some(o) if o.team != team);
-        let our_phase = team_owns || (self.owner.is_none() && self.last_touch == Some(team));
-        let their_phase =
-            opp_owns || (self.owner.is_none() && self.last_touch == Some(team.other()));
+        let phase = self.possession_phase_for(team);
         let mut m = [false; NA];
         if has_ball {
             for a in A_SHOOT..=A_HOLD {
@@ -1353,19 +1394,19 @@ impl World {
             // possession — forces build-up play, not solo dribble-and-shoot.
             // OPPONENT-HALF RULE (Team A): may shoot anywhere in the opponent's half.
             if team == Team::A {
-                let x = players(team, self)[idx].pos.x;
+                let x = players(team, self)[idx].pos.y;
                 if self.pass_streak_a < 2 || x < SHOOT_X {
                     m[A_SHOOT] = false;
                 }
             } else {
                 // Symmetric shooting gate for the scripted/noisy opponent.
-                let x = players(team, self)[idx].pos.x;
+                let x = players(team, self)[idx].pos.y;
                 if self.b_pass_streak < 2 || x > FIELD_L - SHOOT_X {
                     m[A_SHOOT] = false;
                 }
             }
         } else {
-            if our_phase {
+            if phase == PossessionPhase::Possession {
                 // In possession, off-ball players should either burst into support
                 // lanes/get-open targets or hold rest-defense shape. Chasing the
                 // ball carrier is not a useful attacking decision.
@@ -1374,10 +1415,7 @@ impl World {
                 m[A_MARK] = true;
                 m[A_STAY] = true;
                 m[A_GET_OPEN] = true;
-                if self.owner.is_none() {
-                    m[A_CHASE] = true;
-                }
-            } else if their_phase {
+            } else if phase == PossessionPhase::Dispossession {
                 // In dispossession, remove attacking-support actions from the
                 // legal set; defenders choose between pressing and recovering
                 // goalside.
@@ -1385,9 +1423,12 @@ impl World {
                 m[A_MARK] = true;
                 m[A_STAY] = true;
             } else {
-                for a in A_CHASE..=A_STAY {
-                    m[a] = true;
-                }
+                // A genuine 50:50 exposes contest/recovery/shape choices, but not
+                // attacking support or get-open actions that assume we own the ball.
+                m[A_CHASE] = true;
+                m[A_SPREAD] = true;
+                m[A_MARK] = true;
+                m[A_STAY] = true;
             }
         }
         m
@@ -1412,11 +1453,7 @@ impl World {
         }
 
         let is_owner = matches!(self.owner, Some(o) if o.team == team && o.idx == idx);
-        let team_owns = matches!(self.owner, Some(o) if o.team == team);
-        let opp_owns = matches!(self.owner, Some(o) if o.team != team);
-        let our_phase = team_owns || (self.owner.is_none() && self.last_touch == Some(team));
-        let their_phase =
-            opp_owns || (self.owner.is_none() && self.last_touch == Some(team.other()));
+        let phase = self.possession_phase_for(team);
 
         if matches!(
             action,
@@ -1425,11 +1462,22 @@ impl World {
             only(&mut mask, SPD_STAND);
         } else if is_owner && matches!(action, A_DRIB_FWD | A_DRIB_LEFT | A_DRIB_RIGHT) {
             min_gear(&mut mask, SPD_WALK);
-        } else if !is_owner && our_phase && matches!(action, A_SUPPORT | A_GET_OPEN) {
+        } else if !is_owner
+            && phase == PossessionPhase::Possession
+            && matches!(action, A_SUPPORT | A_GET_OPEN)
+        {
             min_gear(&mut mask, SPD_RUN_FAST);
-        } else if !is_owner && our_phase && action == A_SPREAD {
+        } else if !is_owner && phase == PossessionPhase::Possession && action == A_SPREAD {
             min_gear(&mut mask, SPD_RUN_SLOW);
-        } else if !is_owner && their_phase && matches!(action, A_CHASE | A_MARK) {
+        } else if !is_owner
+            && phase == PossessionPhase::Dispossession
+            && matches!(action, A_CHASE | A_MARK)
+        {
+            min_gear(&mut mask, SPD_RUN_FAST);
+        } else if !is_owner
+            && phase == PossessionPhase::FiftyFifty
+            && matches!(action, A_CHASE | A_MARK)
+        {
             min_gear(&mut mask, SPD_RUN_FAST);
         } else if !is_owner
             && matches!(action, A_CHASE | A_SUPPORT | A_SPREAD | A_MARK | A_GET_OPEN)
@@ -1476,7 +1524,7 @@ impl World {
         self.shot_was_rapid_a = false;
         self.shoot_cooldown_a = self.shoot_cooldown_a.saturating_sub(1);
 
-        let ball_x_before = self.ball.x;
+        let ball_x_before = self.ball.y;
 
         // 1. Desired velocities + kicks. Kicks are resolved after movement so a
         //    player dribbles then releases within the same tick cleanly.
@@ -1537,8 +1585,8 @@ impl World {
                 // turnover, ~0.6/game), which poisoned corner-trapped passes.
                 // The FLIGHT may still legitimately carry out.
                 V2::new(
-                    spawn.x.clamp(0.2, FIELD_L - 0.2),
-                    spawn.y.clamp(0.2, FIELD_W - 0.2),
+                    spawn.y.clamp(0.2, FIELD_L - 0.2),
+                    spawn.x.clamp(0.2, FIELD_W - 0.2),
                 )
             } else {
                 spawn // legacy: unclamped (validated behavior, kept exactly)
@@ -1579,8 +1627,8 @@ impl World {
                 self.pending_pass = self.intended_receiver;
                 if kicker.team == Team::A {
                     self.pending_passer = kicker.idx as i32;
-                    // A attacks +x, so ball.x IS attack-frame forward progress.
-                    self.pass_kick_x = self.player(kicker).pos.x;
+                    // A attacks +x, so ball.y IS attack-frame forward progress.
+                    self.pass_kick_x = self.player(kicker).pos.y;
                 }
             } else if kicker.team == Team::A {
                 self.reset_a_pass_memory();
@@ -1638,36 +1686,38 @@ impl World {
                 }
             }
 
-            // reflect off side-lines (y walls) to keep play flowing
-            if self.ball.y < 0.0 {
-                self.ball.y = -self.ball.y;
-                self.ball_vel.y = -self.ball_vel.y;
-            } else if self.ball.y > FIELD_W {
-                self.ball.y = 2.0 * FIELD_W - self.ball.y;
-                self.ball_vel.y = -self.ball_vel.y;
-            }
+            self.snap_pending_receiver_if_segment_crossed(prev_ball);
 
             let gy0 = FIELD_W / 2.0 - GOAL_HALF;
             let gy1 = FIELD_W / 2.0 + GOAL_HALF;
+            let last = self.last_touch;
             if self.resolve_keeper_shot_save(prev_ball) {
                 // Shot-in-flight save (11v11 model): the ball was caught (keeper
                 // owns it) or parried (live rebound away from goal). A shot that
                 // was NOT saved falls through to the goal-line checks below.
-            } else if self.ball.x >= FIELD_L {
-                if self.ball.y > gy0 && self.ball.y < gy1 && self.a_shot_flag {
-                    // valid goal: came from an A shot, which required 2 passes
+            } else if self.ball.x < 0.0 || self.ball.x > FIELD_W {
+                // touchline: award to the other team at the crossing point.
+                let edge_y = if self.ball.x < 0.0 { 0.0 } else { FIELD_W };
+                let to = last.map(Team::other).unwrap_or(Team::A);
+                let at = V2::new(self.ball.y.clamp(1.0, FIELD_L - 1.0), edge_y);
+                self.throw_in(to, at);
+            } else if self.ball.y >= FIELD_L {
+                if self.ball.x > gy0 && self.ball.x < gy1 && self.a_shot_flag {
                     self.goals_a += 1;
                     self.ev_goal_a = true;
                     self.kickoff(Team::B);
+                } else if last == Some(Team::B) {
+                    self.corner_kick(Team::A, FIELD_L, self.ball.x); // defender B conceded a corner
                 } else {
                     self.goal_kick(Team::B); // B restarts from its own line
                 }
-            } else if self.ball.x <= 0.0 {
-                if self.ball.y > gy0 && self.ball.y < gy1 && self.b_shot_flag {
-                    // symmetric: B goal only counts from a valid (2-pass, final-third) shot
+            } else if self.ball.y <= 0.0 {
+                if self.ball.x > gy0 && self.ball.x < gy1 && self.b_shot_flag {
                     self.goals_b += 1;
                     self.ev_goal_b = true;
                     self.kickoff(Team::A);
+                } else if last == Some(Team::A) {
+                    self.corner_kick(Team::B, 0.0, self.ball.x); // defender A conceded a corner
                 } else {
                     self.goal_kick(Team::A);
                 }
@@ -1684,7 +1734,29 @@ impl World {
 
     fn goal_kick(&mut self, to: Team) {
         let gx = if to == Team::A { 6.0 } else { FIELD_L - 6.0 };
-        self.ball = V2::new(gx, FIELD_W / 2.0);
+        self.restart_possession(to, V2::new(gx, FIELD_W / 2.0));
+    }
+
+    /// Touchline throw-in: `to` restarts with the ball at the crossing point `at`.
+    fn throw_in(&mut self, to: Team, at: V2) {
+        self.restart_possession(to, at);
+    }
+
+    /// Corner kick: the attacking team `to` restarts from the corner of the goal line at
+    /// `goal_x`, on whichever side (y=0 / y=FIELD_W) the ball went dead near `out_y`.
+    fn corner_kick(&mut self, to: Team, goal_x: f32, out_y: f32) {
+        let corner_y = if out_y < FIELD_W / 2.0 {
+            0.5
+        } else {
+            FIELD_W - 0.5
+        };
+        self.restart_possession(to, V2::new(goal_x, corner_y));
+    }
+
+    /// Shared dead-ball restart: park the ball at `at`, hand possession to `to`'s nearest
+    /// player, reset the ball's flight/streak state. (Goal-kick / throw-in / corner all funnel here.)
+    fn restart_possession(&mut self, to: Team, at: V2) {
+        self.ball = at;
         self.ball_vel = V2::default();
         self.reset_ball_flight();
         let idx = self.nearest_player(to, self.ball).0;
@@ -1759,14 +1831,14 @@ impl World {
     /// SAVED: either CAUGHT (keeper holds, becomes owner) or PARRIED (live
     /// rebound pushed away from goal). No RNG draws: same seed → same outcome.
     fn resolve_keeper_shot_save(&mut self, prev_ball: V2) -> bool {
-        let dx = self.ball.x - prev_ball.x;
-        if dx == 0.0 {
+        let dy = self.ball.y - prev_ball.y;
+        if dy == 0.0 {
             return false;
         }
         // Which goal is this shot heading for? (both teams symmetric)
-        let (def_team, goal_line_x, dir, origin) = if self.a_shot_flag && dx > 0.0 {
+        let (def_team, goal_line_y, dir, origin) = if self.a_shot_flag && dy > 0.0 {
             (Team::B, FIELD_L, 1.0f32, self.a_shot_origin)
-        } else if self.b_shot_flag && dx < 0.0 {
+        } else if self.b_shot_flag && dy < 0.0 {
             (Team::A, 0.0f32, -1.0f32, self.b_shot_origin)
         } else {
             return false;
@@ -1774,24 +1846,24 @@ impl World {
         let keeper = players(def_team, self)[GK];
         // Save plane = the keeper's actual depth off its goal line (min 1.6 yd):
         // the keeper cannot teleport back to its line to stop a ball behind it.
-        let keeper_depth = (keeper.pos.x - goal_line_x)
+        let keeper_depth = (keeper.pos.y - goal_line_y)
             .abs()
             .clamp(GK_SAVE_DEPTH_MIN, GK_SAVE_DEPTH_MAX);
-        let save_plane_x = goal_line_x - keeper_depth * dir;
+        let save_plane_y = goal_line_y - keeper_depth * dir;
         // Only the single tick the ball crosses the keeper's plane heading at goal.
-        let crossed = (prev_ball.x - save_plane_x) * dir < 0.0
-            && (self.ball.x - save_plane_x) * dir >= 0.0;
+        let crossed =
+            (prev_ball.y - save_plane_y) * dir < 0.0 && (self.ball.y - save_plane_y) * dir >= 0.0;
         if !crossed {
             return false;
         }
         // Extrapolate the flight to the goal line: on-target test + save geometry.
-        let f = (goal_line_x - prev_ball.x) / dx;
-        let crossing_y = prev_ball.y + (self.ball.y - prev_ball.y) * f;
+        let f = (goal_line_y - prev_ball.y) / dy;
+        let crossing_x = prev_ball.x + (self.ball.x - prev_ball.x) * f;
         let cy = FIELD_W / 2.0;
-        if (crossing_y - cy).abs() > GOAL_HALF {
+        if (crossing_x - cy).abs() > GOAL_HALF {
             return false; // off target at the line: not the keeper's to claim here
         }
-        let crossing = V2::new(goal_line_x, crossing_y);
+        let crossing = V2::new(goal_line_y, crossing_x);
         let shot_speed = self.ball_vel.len();
         let save_p = self.keeper_save_probability(def_team, origin, crossing, shot_speed);
         if save_p < GK_SAVE_DECISION_BAR {
@@ -1799,8 +1871,8 @@ impl World {
         }
         // SAVED. The keeper reaches the ball at the save plane (bounded dive).
         let save_pos = V2::new(
-            save_plane_x,
-            crossing_y.clamp(cy - GOAL_HALF * 1.1, cy + GOAL_HALF * 1.1),
+            save_plane_y,
+            crossing_x.clamp(cy - GOAL_HALF * 1.1, cy + GOAL_HALF * 1.1),
         );
         let dive = save_pos.sub(keeper.pos);
         let keeper_pos = if dive.len() <= GK_DIVE_REACH {
@@ -1849,13 +1921,17 @@ impl World {
             // PARRY: live rebound pushed away-from-goal (0.78) + lateral (0.22),
             // distance 2.0 + (1 − catch)·3.0 yards — it moves AWAY from goal and
             // the shot flag is already cleared, so it cannot re-trigger a goal.
-            let lat_sign = if crossing_y >= keeper.pos.y { 1.0 } else { -1.0 };
+            let lat_sign = if crossing_x >= keeper.pos.x {
+                1.0
+            } else {
+                -1.0
+            };
             let parry_dir = V2::new(-dir * 0.78, lat_sign * 0.22).unit();
             let parry_dist = GK_PARRY_MIN_YDS
                 + (1.0 - catch_p.clamp(0.0, 1.0)) * (GK_PARRY_MAX_YDS - GK_PARRY_MIN_YDS);
             let mut parry_pos = save_pos.add(parry_dir.scale(parry_dist));
-            parry_pos.x = parry_pos.x.clamp(0.5, FIELD_L - 0.5);
-            parry_pos.y = parry_pos.y.clamp(0.5, FIELD_W - 0.5);
+            parry_pos.x = parry_pos.x.clamp(0.5, FIELD_W - 0.5);
+            parry_pos.y = parry_pos.y.clamp(0.5, FIELD_L - 0.5);
             self.owner = None;
             self.ball = parry_pos;
             self.ball_vel = parry_dir.scale(4.8 + shot_speed.clamp(0.0, 20.0) * 0.18);
@@ -1871,9 +1947,45 @@ impl World {
         true
     }
 
+    fn snap_pending_receiver_if_segment_crossed(&mut self, prev_ball: V2) {
+        if self.owner.is_some() {
+            return;
+        }
+        let Some(receiver_owner) = self.pending_pass else {
+            return;
+        };
+        let airborne = if self.parity_flight {
+            self.ball_z > BALL_ROLLING_ALT
+        } else {
+            self.ball_aerial && self.air_ticks > 0
+        };
+        if airborne {
+            return;
+        }
+        let receiver = players(receiver_owner.team, self)[receiver_owner.idx];
+        let path = self.ball.sub(prev_ball);
+        let denom = path.x * path.x + path.y * path.y;
+        if denom < 1e-6 {
+            return;
+        }
+        let rel = receiver.pos.sub(prev_ball);
+        let t = ((rel.x * path.x + rel.y * path.y) / denom).clamp(0.0, 1.0);
+        let closest = prev_ball.add(path.scale(t));
+        let touch = ability01(receiver.skills.first_touch);
+        let radius = RECEIVE_RADIUS + (touch - 0.5) * 0.55;
+        if receiver.pos.sub(closest).len() < radius {
+            // Continuous reception: at 15 Hz a firm ground pass can step across
+            // the receiver's bubble between ticks. Snap to the receiver, then let
+            // the normal capture/event path below assign ownership and rewards.
+            self.ball = receiver.pos;
+            self.ball_vel = V2::default();
+        }
+    }
+
     fn try_capture(&mut self) {
         let ball_fast = self.ball_vel.len() > CAPTURE_MAX_BALL_SPEED;
         let mut best: Option<(Owner, f32)> = None;
+        let mut best_parry: Option<(Owner, f32)> = None;
         // Keepers first: they can smother/save even fast shots within reach —
         // EXCEPT a flagged shot still flying at their own goal: that ball is
         // resolved by the probabilistic save model (resolve_keeper_shot_save),
@@ -1882,8 +1994,8 @@ impl World {
         for team in [Team::A, Team::B] {
             let incoming_shot = self.ball_vel.len() > 2.0
                 && match team {
-                    Team::B => self.a_shot_flag && self.ball_vel.x > 0.0,
-                    Team::A => self.b_shot_flag && self.ball_vel.x < 0.0,
+                    Team::B => self.a_shot_flag && self.ball_vel.y > 0.0,
+                    Team::A => self.b_shot_flag && self.ball_vel.y < 0.0,
                 };
             if incoming_shot {
                 continue;
@@ -1898,9 +2010,22 @@ impl World {
             if self.parity_flight && self.ball_z > KEEPER_AERIAL_REACH {
                 continue; // parity: a lofted ball sailing OVER the keeper can't be smothered
             }
-            let d = players(team, self)[GK].pos.sub(self.ball).len();
-            if d < KEEPER_REACH && best.is_none_or(|(_, bd)| d < bd) {
+            let keeper = players(team, self)[GK];
+            let d = keeper.pos.sub(self.ball).len();
+            let speed = self.ball_vel.len();
+            let control = (0.55 * ability01(keeper.skills.first_touch)
+                + 0.45 * ability01(keeper.skills.aerial_duel))
+            .clamp(0.0, 1.0);
+            let speed_control = (1.0 - speed / 34.0).clamp(0.0, 1.0);
+            let altitude_control = (1.0 - self.ball_z / 3.8).clamp(0.0, 1.0);
+            let catch_radius = KEEPER_REACH
+                * (0.48 + 0.34 * control + 0.18 * speed_control)
+                * (0.75 + 0.25 * altitude_control);
+            let parry_radius = KEEPER_REACH * (0.88 + 0.12 * control);
+            if d < catch_radius && best.is_none_or(|(_, bd)| d < bd) {
                 best = Some((Owner { team, idx: GK }, d));
+            } else if d < parry_radius && best_parry.is_none_or(|(_, bd)| d < bd) {
+                best_parry = Some((Owner { team, idx: GK }, d));
             }
         }
         // Outfield players only control a ball that isn't screaming past them.
@@ -1947,8 +2072,7 @@ impl World {
                             }
                             // Aerial touch needs SPACE — receiver and interceptor alike.
                             let (_, open) = self.nearest_opponent(team, receiver.pos);
-                            let space_needed =
-                                AERIAL_CONTROL_SPACE * (1.08 - 0.20 * aerial_skill);
+                            let space_needed = AERIAL_CONTROL_SPACE * (1.08 - 0.20 * aerial_skill);
                             if open < space_needed {
                                 continue; // not open enough to control the loft midair
                             }
@@ -1957,8 +2081,7 @@ impl World {
                                 continue; // legacy: ground players can't reach an airborne ball
                             }
                             let (_, recv_open) = self.nearest_opponent(team, receiver.pos);
-                            let space_needed =
-                                AERIAL_CONTROL_SPACE * (1.08 - 0.20 * aerial_skill);
+                            let space_needed = AERIAL_CONTROL_SPACE * (1.08 - 0.20 * aerial_skill);
                             if recv_open < space_needed {
                                 continue; // receiver not open enough to control the scoop yet
                             }
@@ -1982,6 +2105,26 @@ impl World {
                 }
             }
         }
+        if best.is_none() {
+            if let Some((keeper, _)) = best_parry {
+                let goal = keeper.team.own_goal();
+                let away = self.ball.sub(goal).unit();
+                let lateral = if self.ball.x >= FIELD_W / 2.0 {
+                    1.0
+                } else {
+                    -1.0
+                };
+                let rebound_dir = away.add(V2::new(0.0, lateral * 0.45)).unit();
+                let rebound_speed = self.ball_vel.len().clamp(7.0, 22.0) * 0.42;
+                self.ball_vel = rebound_dir.scale(rebound_speed);
+                self.owner = None;
+                self.last_touch = Some(keeper.team);
+                self.pending_pass = None;
+                self.a_shot_flag = false;
+                self.b_shot_flag = false;
+                return;
+            }
+        }
         if let Some((o, _)) = best {
             let prev_touch = self.last_touch;
             self.owner = Some(o);
@@ -1993,7 +2136,7 @@ impl World {
                 if pp.team == Team::A {
                     if o.team == Team::A {
                         self.ev_pass_completed_a = true; // A pass reached an A player
-                        self.last_pass_gain_a = self.ball.x - self.pass_kick_x;
+                        self.last_pass_gain_a = self.ball.y - self.pass_kick_x;
                         self.pass_streak_a += 1; // toward the 2-pass rule
                                                  // consecutive FORWARD passes (progressive build-up)
                         if self.last_pass_gain_a > 3.0 {
@@ -2121,8 +2264,8 @@ impl World {
                     self.reset_a_pass_memory();
                 } else {
                     // symmetric: B's goal only counts if B built up (2 passes) and
-                    // shoots from B's own final third (B attacks -x -> small x).
-                    self.b_shot_flag = self.b_pass_streak >= 2 && me.x < FIELD_L - SHOOT_X;
+                    // shoots from B's own final third (B attacks -y/length -> small y).
+                    self.b_shot_flag = self.b_pass_streak >= 2 && me.y < FIELD_L - SHOOT_X;
                     self.b_shot_origin = me;
                     self.b_pass_streak = 0;
                 }
@@ -2130,7 +2273,7 @@ impl World {
                 // MPC-lite finishing: enumerate aim points across the mouth and
                 // pick the one that maximizes clearance from the keeper and any
                 // defender in the shot lane — i.e. shoot to the open corner.
-                let goal_x = goal.x;
+                let goal_x = goal.y;
                 let cy = FIELD_W / 2.0;
                 let gk = players(team.other(), self)[GK].pos;
                 let margin = GOAL_HALF - 0.35;
@@ -2162,7 +2305,7 @@ impl World {
                     // wide pot-shot is near-zero. Distance dominates (squared decay),
                     // shot ANGLE (central vs wide) modulates.
                     let d = goal.sub(me).len();
-                    let lateral = (me.y - FIELD_W / 2.0).abs();
+                    let lateral = (me.x - FIELD_W / 2.0).abs();
                     let dist_f = (1.0 - d / 26.0).clamp(0.0, 1.0);
                     let angle_f = (1.0 - lateral / (FIELD_W / 2.0)).clamp(0.0, 1.0);
                     self.last_shot_xg_a = dist_f * dist_f * (0.4 + 0.6 * angle_f);
@@ -2183,6 +2326,8 @@ impl World {
                     // upfield nudge (validated behavior, kept exactly).
                     let lead = if self.parity_flight {
                         self.led_pass_target(team, idx, ti)
+                    } else if players(team, self)[ti].vel.len() < 0.25 {
+                        tp
                     } else {
                         tp.add(V2::new(sx * 2.0, 0.0))
                     };
@@ -2203,13 +2348,11 @@ impl World {
                             self.pending_apex =
                                 lofted_apex_yds(pass_dist).max(LOFT_APEX_CLEAR_FLOOR);
                             let hang = hang_time(self.pending_apex).max(0.35);
-                            let land_speed =
-                                (pass_dist / hang) * AERIAL_LAND_AT_TARGET_DRAG_COMP;
+                            let land_speed = (pass_dist / hang) * AERIAL_LAND_AT_TARGET_DRAG_COMP;
                             let max_carry = carry_to_boundary(me, lead.sub(me).unit());
-                            self.pending_aerial_speed =
-                                land_speed.min(max_carry.max(2.0) / hang);
+                            self.pending_aerial_speed = land_speed.min(max_carry.max(2.0) / hang);
                         }
-                    } else if ground_lane < 0.55 {
+                    } else if ground_lane < 0.55 && players(team, self)[ti].vel.len() >= 0.25 {
                         // Legacy SCOOP: lift over the blocked ground lane for a
                         // fixed tick budget; only the receiver can bring it down.
                         self.pending_aerial = true;
@@ -2220,7 +2363,7 @@ impl World {
                     if team == Team::A {
                         self.ev_pass_attempt_a = true;
                         // classify by forward progress toward the attacked goal
-                        let fwd = (tp.x - me.x) * sx;
+                        let fwd = (tp.y - me.y) * sx;
                         self.pass_dir_a = if fwd > 2.0 {
                             1
                         } else if fwd < -2.0 {
@@ -2234,7 +2377,7 @@ impl World {
                         let is_return = idx as i32 == self.lp_to && ti as i32 == self.lp_from;
                         if is_return {
                             if self.return_streak_a == 0 {
-                                self.return_start_x = self.ball.x; // sequence begins here
+                                self.return_start_x = self.ball.y; // sequence begins here
                             }
                             self.return_streak_a += 1;
                         } else {
@@ -2312,6 +2455,16 @@ impl World {
         let owns = matches!(self.owner, Some(o) if o.team == team && o.idx == GK);
         if owns {
             self.intended_receiver = None;
+            let (_, pressure) = self.nearest_opponent(team, me);
+            if pressure < 3.0 {
+                self.set_vel(team, GK, V2::default());
+                return Some((
+                    Owner { team, idx: GK },
+                    team.target_goal().sub(me),
+                    CLEAR_SPEED,
+                    false,
+                ));
+            }
             let cands = self.pass_candidates(team, GK);
             if let Some((ti, _)) = cands[0] {
                 // Distribution is a PASS (keeper never lofts). PARITY: the same
@@ -2320,6 +2473,8 @@ impl World {
                 let tp = players(team, self)[ti].pos;
                 let lead = if self.parity_flight {
                     self.led_pass_target(team, GK, ti)
+                } else if players(team, self)[ti].vel.len() < 0.25 {
+                    tp
                 } else {
                     tp.add(V2::new(sx * 2.0, 0.0))
                 };
@@ -2327,7 +2482,7 @@ impl World {
                 self.set_vel(team, GK, V2::default());
                 if team == Team::A {
                     self.ev_pass_attempt_a = true;
-                    let fwd = (tp.x - me.x) * sx;
+                    let fwd = (tp.y - me.y) * sx;
                     self.pass_dir_a = if fwd > 2.0 {
                         1
                     } else if fwd < -2.0 {
@@ -2358,12 +2513,12 @@ impl World {
         let to_ball = self.ball.sub(c);
         let out = (to_ball.len() * 0.35).min(6.0);
         let mut target = c.add(to_ball.unit().scale(out));
-        target.x = if sx > 0.0 {
-            target.x.clamp(0.5, 8.0)
+        target.y = if sx > 0.0 {
+            target.y.clamp(0.5, 8.0)
         } else {
-            target.x.clamp(FIELD_L - 8.0, FIELD_L - 0.5)
+            target.y.clamp(FIELD_L - 8.0, FIELD_L - 0.5)
         };
-        target.y = target.y.clamp(
+        target.x = target.x.clamp(
             FIELD_W / 2.0 - GOAL_HALF - 1.5,
             FIELD_W / 2.0 + GOAL_HALF + 1.5,
         );
@@ -2372,7 +2527,7 @@ impl World {
         // FIELD-VECTOR function: sprint when the ball threatens our goal or it must
         // reposition fast, jog at midfield, walk when play is upfield.
         let own_goal_x = if sx > 0.0 { 0.0 } else { FIELD_L };
-        let ball_threat = 1.0 - ((self.ball.x - own_goal_x).abs() / FIELD_L).clamp(0.0, 1.0);
+        let ball_threat = 1.0 - ((self.ball.y - own_goal_x).abs() / FIELD_L).clamp(0.0, 1.0);
         let travel = (dir.len() / 9.0).clamp(0.0, 1.0);
         let urgency = (0.6 * ball_threat + 0.4 * travel).clamp(0.0, 1.0);
         let gear = if urgency > 0.80 {
@@ -2484,10 +2639,10 @@ impl World {
             let current_delta = me.pos.sub(mate.pos);
             let current_gap = current_delta.len();
             let relative_velocity = proposed.sub(mate.vel);
-            let relative_speed_sq = relative_velocity.x * relative_velocity.x
-                + relative_velocity.y * relative_velocity.y;
+            let relative_speed_sq = relative_velocity.y * relative_velocity.y
+                + relative_velocity.x * relative_velocity.x;
             let closest_t = if relative_speed_sq > 1e-6 {
-                (-(current_delta.x * relative_velocity.x + current_delta.y * relative_velocity.y)
+                (-(current_delta.y * relative_velocity.y + current_delta.x * relative_velocity.x)
                     / relative_speed_sq)
                     .clamp(0.0, horizon)
             } else {
@@ -2534,11 +2689,11 @@ impl World {
         let (oi, _) = self.nearest_opponent(team, me);
         let opp = players(team.other(), self)[oi].pos;
         let opp_goal_side = opp.add(own_goal.sub(opp).unit().scale(3.0));
-        let urgency = ((self.ball.x - me.x) * team.sx()).max(0.0) / FIELD_L;
+        let urgency = ((self.ball.y - me.y) * team.sx()).max(0.0) / FIELD_L;
         let blend = urgency.clamp(0.25, 0.75);
         V2::new(
-            (ball_goal_side.x * blend + opp_goal_side.x * (1.0 - blend)).clamp(2.0, FIELD_L - 2.0),
-            (ball_goal_side.y * blend + opp_goal_side.y * (1.0 - blend)).clamp(2.0, FIELD_W - 2.0),
+            (ball_goal_side.y * blend + opp_goal_side.y * (1.0 - blend)).clamp(2.0, FIELD_L - 2.0),
+            (ball_goal_side.x * blend + opp_goal_side.x * (1.0 - blend)).clamp(2.0, FIELD_W - 2.0),
         )
     }
 
@@ -2558,8 +2713,8 @@ impl World {
             for k in 0..ndir {
                 let ang = (k as f32) / (ndir as f32) * std::f32::consts::TAU;
                 let cand = V2::new(
-                    (me.x + ang.cos() * r).clamp(3.0, FIELD_L - 3.0),
-                    (me.y + ang.sin() * r).clamp(3.0, FIELD_W - 3.0),
+                    (me.y + ang.cos() * r).clamp(3.0, FIELD_L - 3.0),
+                    (me.x + ang.sin() * r).clamp(3.0, FIELD_W - 3.0),
                 );
                 // openness = distance to nearest OTHER player (either team)
                 let mut min_d = f32::INFINITY;
@@ -2578,9 +2733,9 @@ impl World {
                         }
                     }
                 }
-                let fwd = (cand.x - me.x) * sx; // upfield progress in attack frame
+                let fwd = (cand.y - me.y) * sx; // upfield progress in attack frame
                                                 // stay loosely connected to the ball's vertical lane
-                let lane = -(cand.y - self.ball.y).abs() * 0.08;
+                let lane = -(cand.x - self.ball.x).abs() * 0.08;
                 let score =
                     min_d + teammate_spacing_score(teammate_gap) * 6.0 + field_bias * fwd + lane;
                 if score > best_score {
@@ -2597,8 +2752,8 @@ impl World {
         let sx = team.sx();
         let lane = self.lane_clearness(team, self.ball, cand);
         let route = self.lane_clearness(team, me, cand);
-        let wide = (cand.y - FIELD_W / 2.0).abs() / (FIELD_W / 2.0);
-        let ahead = ((cand.x - self.ball.x) * sx).max(0.0) / FIELD_L;
+        let wide = (cand.x - FIELD_W / 2.0).abs() / (FIELD_W / 2.0);
+        let ahead = ((cand.y - self.ball.y) * sx).max(0.0) / FIELD_L;
         let (_, defender_d) = self.nearest_opponent(team, cand);
         let defender_space = (defender_d / 7.0).min(1.0);
         let mut teammate_gap = f32::INFINITY;
@@ -2648,8 +2803,8 @@ impl World {
             for k in 0..ndir {
                 let ang = (k as f32) / (ndir as f32) * std::f32::consts::TAU;
                 let cand = V2::new(
-                    (me.x + ang.cos() * r).clamp(3.0, FIELD_L - 3.0),
-                    (me.y + ang.sin() * r).clamp(3.0, FIELD_W - 3.0),
+                    (me.y + ang.cos() * r).clamp(3.0, FIELD_L - 3.0),
+                    (me.x + ang.sin() * r).clamp(3.0, FIELD_W - 3.0),
                 );
                 let score = self.mpc_field_vector_score(team, idx, cand);
                 if score > best_score {
@@ -2695,7 +2850,7 @@ impl World {
                     team[j].pos = team[j].pos.add(dir.scale(-push));
                     let vi = team[i].vel;
                     let vj = team[j].vel;
-                    let closing = vi.sub(vj).x * dir.x + vi.sub(vj).y * dir.y;
+                    let closing = vi.sub(vj).y * dir.y + vi.sub(vj).x * dir.x;
                     if closing < 0.0 {
                         let correction = dir.scale(closing * 0.5);
                         team[i].vel = team[i].vel.sub(correction);
@@ -2767,13 +2922,13 @@ fn integrate(p: &mut Player) {
 }
 
 fn clamp_pos(p: &mut Player) {
-    p.pos.x = p.pos.x.clamp(-1.0, FIELD_L + 1.0);
-    p.pos.y = p.pos.y.clamp(0.0, FIELD_W);
+    p.pos.y = p.pos.y.clamp(-1.0, FIELD_L + 1.0);
+    p.pos.x = p.pos.x.clamp(0.0, FIELD_W);
 }
 
 fn rotate(v: V2, ang: f32) -> V2 {
     let (s, c) = ang.sin_cos();
-    V2::new(v.x * c - v.y * s, v.x * s + v.y * c)
+    V2::new(v.y * c - v.x * s, v.y * s + v.x * c)
 }
 
 /// The gear the scripted baseline uses for a given action (kept near the old
@@ -2889,18 +3044,18 @@ impl World {
         for team in [Team::A, Team::B] {
             let ps = players(team, self);
             for i in 0..N {
-                f.push(ps[i].pos.x / nx * 2.0 - 1.0);
-                f.push(ps[i].pos.y / ny * 2.0 - 1.0);
-                f.push(ps[i].vel.x / nv);
+                f.push(ps[i].pos.y / nx * 2.0 - 1.0);
+                f.push(ps[i].pos.x / ny * 2.0 - 1.0);
                 f.push(ps[i].vel.y / nv);
+                f.push(ps[i].vel.x / nv);
                 f.push(ps[i].fatigue.clamp(0.0, 1.0));
                 f.push(ps[i].anaerobic_load.clamp(0.0, 1.0));
             }
         }
-        f.push(self.ball.x / nx * 2.0 - 1.0);
-        f.push(self.ball.y / ny * 2.0 - 1.0);
-        f.push(self.ball_vel.x / nv);
+        f.push(self.ball.y / nx * 2.0 - 1.0);
+        f.push(self.ball.x / ny * 2.0 - 1.0);
         f.push(self.ball_vel.y / nv);
+        f.push(self.ball_vel.x / nv);
         // possession one-hot: A / B / free
         f.push(matches!(self.owner, Some(o) if matches!(o.team, Team::A)) as u8 as f32);
         f.push(matches!(self.owner, Some(o) if matches!(o.team, Team::B)) as u8 as f32);
@@ -2965,8 +3120,8 @@ impl World {
     /// policy-invariant potential-based reward shaping (γΦ' − Φ).
     pub fn potential_a(&self) -> f32 {
         match self.owner {
-            Some(o) if o.team == Team::A => self.ball.x / FIELD_L,
-            Some(_) => -((FIELD_L - self.ball.x) / FIELD_L),
+            Some(o) if o.team == Team::A => self.ball.y / FIELD_L,
+            Some(_) => -((FIELD_L - self.ball.y) / FIELD_L),
             None => 0.0,
         }
     }
@@ -2978,8 +3133,8 @@ impl World {
         let clear = self.shot_clearness(team, me);
         let (_, opp_d) = self.nearest_opponent(team, me);
         let shot_legal = match team {
-            Team::A => self.pass_streak_a >= 2 && me.x >= SHOOT_X,
-            Team::B => self.b_pass_streak >= 2 && me.x <= FIELD_L - SHOOT_X,
+            Team::A => self.pass_streak_a >= 2 && me.y >= SHOOT_X,
+            Team::B => self.b_pass_streak >= 2 && me.y <= FIELD_L - SHOOT_X,
         };
 
         // close in with a reasonably open lane -> shoot (else work it closer)
@@ -2993,19 +3148,19 @@ impl World {
             for (rank, cand) in cands.iter().enumerate() {
                 if let Some((ti, _)) = cand {
                     let tp = players(team, self)[*ti].pos;
-                    if (tp.x - me.x) * sx > -3.0 {
+                    if (tp.y - me.y) * sx > -3.0 {
                         return A_PASS_A + rank;
                     }
                 }
             }
             // no outlet & deep in own half -> clear, else try to carry out
-            if (me.x - team.own_goal().x).abs() < FIELD_L * 0.33 {
+            if (me.y - team.own_goal().y).abs() < FIELD_L * 0.33 {
                 return A_CLEAR;
             }
             // dribble away from the nearest opponent laterally
             let (oi, _) = self.nearest_opponent(team, me);
             let opp = players(team.other(), self)[oi].pos;
-            return if opp.y > me.y {
+            return if opp.x > me.x {
                 A_DRIB_LEFT
             } else {
                 A_DRIB_RIGHT
@@ -3017,7 +3172,7 @@ impl World {
         for (rank, cand) in cands.iter().enumerate() {
             if let Some((ti, _)) = cand {
                 let tp = players(team, self)[*ti].pos;
-                if (tp.x - me.x) * sx > 5.0 && self.lane_clearness(team, me, tp) > 0.45 {
+                if (tp.y - me.y) * sx > 5.0 && self.lane_clearness(team, me, tp) > 0.45 {
                     return A_PASS_A + rank;
                 }
             }
@@ -3025,9 +3180,9 @@ impl World {
         // unpressured: is an opponent directly ahead in my forward cone?
         let (oi, od) = self.nearest_opponent(team, me);
         let opp = players(team.other(), self)[oi].pos;
-        let ahead = (opp.x - me.x) * sx;
-        if od < 8.0 && ahead > 0.0 && (opp.y - me.y).abs() < 4.0 {
-            return if opp.y > me.y {
+        let ahead = (opp.y - me.y) * sx;
+        if od < 8.0 && ahead > 0.0 && (opp.x - me.x).abs() < 4.0 {
+            return if opp.x > me.x {
                 A_DRIB_LEFT
             } else {
                 A_DRIB_RIGHT
@@ -3053,7 +3208,7 @@ mod tests {
         for d in [8.0f32, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0] {
             let from = V2::new(FIELD_L - d, cy);
             let crossing = V2::new(FIELD_L, cy - (GOAL_HALF - 0.35)); // corner aim
-            // arrival speed at the save plane under both decay models
+                                                                      // arrival speed at the save plane under both decay models
             let plane_dist = (d - 1.6).max(0.0);
             let mut v_new = SHOT_SPEED;
             let mut x = 0.0;
@@ -3184,7 +3339,10 @@ mod tests {
                 }
             }
         }
-        for (k, name) in ["clear ground", "blocked ground", "loft"].iter().enumerate() {
+        for (k, name) in ["clear ground", "blocked ground", "loft"]
+            .iter()
+            .enumerate()
+        {
             println!(
                 "{name:>14}: att={:5.0} cmp={:5.0} ({:.1}%)",
                 att[k],
@@ -3208,11 +3366,59 @@ mod tests {
         assert!(altitude_at(apex, 0.0).abs() < 1e-4);
         assert!(altitude_at(apex, hang).abs() < 1e-4);
         let mid = altitude_at(apex, hang / 2.0);
-        assert!((mid - apex).abs() < 1e-3, "midpoint height == apex: {mid} vs {apex}");
+        assert!(
+            (mid - apex).abs() < 1e-3,
+            "midpoint height == apex: {mid} vs {apex}"
+        );
         // monotone rise over the first half.
         assert!(altitude_at(apex, hang * 0.25) < altitude_at(apex, hang * 0.5));
         // longer passes loft higher (until the 9.0 cap).
         assert!(lofted_apex_yds(30.0) > lofted_apex_yds(12.0));
+    }
+
+    #[test]
+    fn axis_convention_is_x_width_y_length() {
+        // The 11v11 convention: x = field WIDTH [0,FIELD_W], y = field LENGTH [0,FIELD_L].
+        // Goals sit at the length ends (y=0 / y=FIELD_L), centered on the width (x=FIELD_W/2).
+        let ga = Team::A.target_goal();
+        assert!(
+            (ga.x - FIELD_W / 2.0).abs() < 1e-6,
+            "goal centered on width: x={}",
+            ga.x
+        );
+        assert!(
+            (ga.y - FIELD_L).abs() < 1e-6,
+            "A attacks the far length line: y={}",
+            ga.y
+        );
+        let gb = Team::B.target_goal();
+        assert!(
+            (gb.x - FIELD_W / 2.0).abs() < 1e-6 && gb.y.abs() < 1e-6,
+            "B attacks y=0"
+        );
+        // Field is longer than it is wide, and length lives on y.
+        assert!(FIELD_L > FIELD_W);
+        // Attack sign drives the length (y) axis: A forward = +y.
+        assert_eq!(Team::A.sx(), 1.0);
+        assert_eq!(Team::B.sx(), -1.0);
+    }
+
+    #[test]
+    fn dead_ball_restarts_assign_the_right_team() {
+        // Throw-in goes to the team that did NOT put it out; the ball is parked (no velocity).
+        let mut w = World::new();
+        w.ball_vel = V2::new(3.0, 9.0);
+        w.throw_in(Team::B, V2::new(20.0, FIELD_W));
+        assert!(matches!(w.owner, Some(o) if o.team == Team::B));
+        assert!(w.ball_vel.len() < 1e-6 && w.ball_z == 0.0 && !w.ball_aerial);
+        // Corner: attacker restarts from the goal-line corner on the ball's side.
+        w.corner_kick(Team::A, FIELD_L, 2.0);
+        assert!(matches!(w.owner, Some(o) if o.team == Team::A));
+        assert!((w.ball.y - FIELD_L).abs() < 1e-6 && w.ball.x < FIELD_W / 2.0);
+        // Goal-kick funnels through the same restart and clears shot flags.
+        w.a_shot_flag = true;
+        w.goal_kick(Team::B);
+        assert!(matches!(w.owner, Some(o) if o.team == Team::B) && !w.a_shot_flag);
     }
 
     #[test]
@@ -3226,7 +3432,10 @@ mod tests {
         // Airborne relief: an aloft ball keeps more of its pace than a rolling one.
         let ground = ball_resistance_after(20.0, 0.0);
         let aloft = ball_resistance_after(20.0, 3.0);
-        assert!(aloft > ground, "airborne ball drags less: aloft {aloft} vs ground {ground}");
+        assert!(
+            aloft > ground,
+            "airborne ball drags less: aloft {aloft} vs ground {ground}"
+        );
     }
 
     /// (b)(i) PASS-ARRIVAL CALIBRATION: for open-field targets 8/15/25 yd out,
@@ -3254,8 +3463,8 @@ mod tests {
                     break;
                 }
             }
-            let t =
-                arrived_at.unwrap_or_else(|| panic!("d={d}: ball never got capturable near target"));
+            let t = arrived_at
+                .unwrap_or_else(|| panic!("d={d}: ball never got capturable near target"));
             let timed = (0.46 + d / 48.0).clamp(0.60, 2.0) * 1.08; // openness-1.0 window
             assert!(
                 t <= timed * 1.5,
@@ -3281,7 +3490,7 @@ mod tests {
         }
         let receiver = 2usize;
         w.a[receiver].pos = V2::new(25.0, 14.0); // 12 yd along a 15 yd flight
-        // Launch a 15-yd loft by hand (the same state apply_on_ball+step set up).
+                                                 // Launch a 15-yd loft by hand (the same state apply_on_ball+step set up).
         w.parity_flight = true; // this is a PARITY-flight behavior test
         let dist = 15.0f32;
         w.owner = None;
@@ -3301,7 +3510,10 @@ mod tests {
         w.ball_vel = V2::new(dist / hang * AERIAL_LAND_AT_TARGET_DRAG_COMP, 0.0);
         let reach = (CONTROL_STANDING_REACH + 0.5 * CONTROL_AERIAL_JUMP_REACH)
             .max(LOW_BALL_INTERCEPT_FLOOR); // uniform-skill outfielder = 2.7 yd
-        assert!(w.ball_apex > reach, "the arc must rise over a standing outfielder");
+        assert!(
+            w.ball_apex > reach,
+            "the arc must rise over a standing outfielder"
+        );
         let mut overflew_defender = false;
         let mut captured_airborne = false;
         for _ in 0..(hang / DT) as usize + 8 {
@@ -3393,7 +3605,10 @@ mod tests {
                     break;
                 }
             }
-            assert!(captured, "seed {seed}: pass to a stationary receiver never arrived");
+            assert!(
+                captured,
+                "seed {seed}: pass to a stationary receiver never arrived"
+            );
             assert!(w.ev_pass_completed_a, "seed {seed}: completion event fires");
         }
     }
@@ -3464,7 +3679,7 @@ mod tests {
         }
         let receiver = 3usize;
         w.a[receiver].pos = V2::new(38.0, 23.0); // far-post runner, off the keeper
-        // A cross-ish loft that passes through the box in front of B's goal.
+                                                 // A cross-ish loft that passes through the box in front of B's goal.
         let origin = V2::new(26.0, 8.0);
         let target = w.a[receiver].pos;
         let dist = target.sub(origin).len();
@@ -3482,11 +3697,20 @@ mod tests {
         w.ball_taloft = 0.0;
         w.ball_z = 0.0;
         let hang = hang_time(w.ball_apex);
-        w.ball_vel = target.sub(origin).unit().scale(dist / hang * AERIAL_LAND_AT_TARGET_DRAG_COMP);
-        assert!(!w.a_shot_flag && !w.b_shot_flag, "a pass is never shot-flagged");
+        w.ball_vel = target
+            .sub(origin)
+            .unit()
+            .scale(dist / hang * AERIAL_LAND_AT_TARGET_DRAG_COMP);
+        assert!(
+            !w.a_shot_flag && !w.b_shot_flag,
+            "a pass is never shot-flagged"
+        );
         for _ in 0..(hang / DT) as usize + 10 {
             w.step(&stays(), &stays(), &mut rng);
-            assert!(!w.ev_save_a && !w.ev_save_b, "no spurious keeper save on a pass");
+            assert!(
+                !w.ev_save_a && !w.ev_save_b,
+                "no spurious keeper save on a pass"
+            );
             if w.owner.is_some() {
                 break;
             }
@@ -3652,7 +3876,7 @@ mod tests {
 
         let adjusted = w.mpc_teammate_separated_velocity(Team::A, 1, proposed);
 
-        assert!(adjusted.x < 0.0, "close teammate must reverse convergence");
+        assert!(adjusted.y < 0.0, "close teammate must reverse convergence");
         assert!((adjusted.len() - proposed.len()).abs() < 1e-5);
     }
 
@@ -3667,8 +3891,8 @@ mod tests {
 
         let adjusted = w.mpc_teammate_separated_velocity(Team::A, 1, proposed);
 
-        assert!((adjusted.x - proposed.x).abs() < 1e-6);
         assert!((adjusted.y - proposed.y).abs() < 1e-6);
+        assert!((adjusted.x - proposed.x).abs() < 1e-6);
     }
 
     #[test]
@@ -3913,7 +4137,7 @@ mod tests {
         w.b[1].pos = V2::new(21.0, 14.0); // 1 unit ahead of the carrier
         let dir = w.shielded_dribble_dir(Team::A, me, V2::new(1.0, 0.0));
         assert!(
-            dir.x < 0.0,
+            dir.y < 0.0,
             "should steer away from the defender, got {:?}",
             dir
         );
@@ -3943,13 +4167,13 @@ mod tests {
         w.ball_vel = V2::new(18.0, 0.0);
         let p = w.intercept_point(V2::new(25.0, 14.0));
         assert!(
-            p.x >= w.ball.x,
+            p.y >= w.ball.y,
             "intercept should lead the ball, got {:?}",
             p
         );
         // a stationary ball just returns the ball itself
         w.ball_vel = V2::default();
-        assert_eq!(w.intercept_point(V2::new(25.0, 14.0)).x, w.ball.x);
+        assert_eq!(w.intercept_point(V2::new(25.0, 14.0)).y, w.ball.y);
     }
 
     #[test]
@@ -3970,6 +4194,57 @@ mod tests {
             w.legal_mask(Team::A, 1)[A_SHOOT],
             "shot allowed in the opponent's half after 2 passes"
         );
+    }
+
+    #[test]
+    fn possession_phase_uses_control_not_last_touch() {
+        let mut w = World::new();
+        w.owner = Some(Owner {
+            team: Team::A,
+            idx: 1,
+        });
+        assert_eq!(w.possession_phase_for(Team::A), PossessionPhase::Possession);
+        assert_eq!(
+            w.possession_phase_for(Team::B),
+            PossessionPhase::Dispossession
+        );
+
+        w.owner = None;
+        w.last_touch = Some(Team::A);
+        assert_eq!(w.possession_phase_for(Team::A), PossessionPhase::FiftyFifty);
+        assert_eq!(w.possession_phase_for(Team::B), PossessionPhase::FiftyFifty);
+        let duel_mask = w.legal_mask(Team::A, 2);
+        assert!(duel_mask[A_CHASE] && duel_mask[A_MARK] && duel_mask[A_SPREAD]);
+        assert!(!duel_mask[A_SUPPORT] && !duel_mask[A_GET_OPEN]);
+    }
+
+    #[test]
+    fn keeper_catches_slow_close_ball_but_parries_fast_edge_ball() {
+        let mut w = World::new();
+        let keeper_pos = w.a[GK].pos;
+        w.owner = None;
+        w.kick_timer = -1;
+        w.ball = V2 {
+            x: keeper_pos.x + 0.8,
+            y: keeper_pos.y,
+        };
+        w.ball_vel = V2::default();
+        w.try_capture();
+        assert!(matches!(w.owner, Some(o) if o.team == Team::A && o.idx == GK));
+
+        w.owner = None;
+        w.ball = V2 {
+            x: keeper_pos.x + 1.6,
+            y: keeper_pos.y,
+        };
+        w.ball_vel = V2 { x: 0.0, y: -30.0 };
+        w.try_capture();
+        assert!(
+            w.owner.is_none(),
+            "fast edge-of-reach shot should stay live"
+        );
+        assert_eq!(w.last_touch, Some(Team::A));
+        assert!(w.ball_vel.len() < 30.0, "parry should absorb shot energy");
     }
 
     #[test]
@@ -4036,11 +4311,11 @@ mod tests {
         let target = w.goalside_recovery_target(Team::A, 2);
 
         assert!(
-            target.x < w.a[2].pos.x,
+            target.y < w.a[2].pos.y,
             "wrong-side defender should recover toward own goal: target={target:?}"
         );
         assert!(
-            target.x < w.ball.x,
+            target.y < w.ball.y,
             "target should get goalside of the ball: target={target:?}, ball={:?}",
             w.ball
         );
@@ -4226,11 +4501,11 @@ mod tests {
                 parried = true;
                 assert!(w.owner.is_none(), "a parry must leave the ball live");
                 assert!(
-                    w.ball_vel.x < 0.0,
+                    w.ball_vel.y < 0.0,
                     "parry rebound must move AWAY from the goal, vel={:?}",
                     w.ball_vel
                 );
-                assert!(w.ball.x < FIELD_L - GK_SAVE_DEPTH_MIN);
+                assert!(w.ball.y < FIELD_L - GK_SAVE_DEPTH_MIN);
                 break;
             }
             assert_eq!(w.goals_a, 0, "the shot must be saved, not scored");

@@ -444,7 +444,7 @@ fn inspect(seed: u64, out_dir: &Path) -> AppResult<()> {
             println!(
                 "{:>4} | {:>7.1} | {}  | {:>12.1} | {:>8.1} | {:>5} | {}-{}",
                 t,
-                w.ball.x,
+                w.ball.y,
                 own,
                 closest,
                 avg,
@@ -502,7 +502,7 @@ fn frame_json(
     let _ = write!(
         s,
         "{{\"t\":{},\"ball\":[{:.2},{:.2}],\"ball_vel\":[{:.2},{:.2}],\"own\":{},\"oi\":{},\"ga\":{},\"gb\":{},\"closest_pair_a\":{:.2},\"avg_near_a\":{:.2},\"bunch\":{},\"players\":[",
-        t, w.ball.x, w.ball.y, w.ball_vel.x, w.ball_vel.y, own, oi, w.goals_a, w.goals_b, closest, avg, bunched
+        t, w.ball.y, w.ball.x, w.ball_vel.y, w.ball_vel.x, own, oi, w.goals_a, w.goals_b, closest, avg, bunched
     );
     let mut first = true;
     for (team, code, acts) in [(Team::A, 0i32, act_a), (Team::B, 1i32, act_b)] {
@@ -537,7 +537,7 @@ fn frame_json(
             let _ = write!(
                 s,
                 "{{\"team\":{},\"idx\":{},\"gk\":{},\"x\":{:.2},\"y\":{:.2},\"vx\":{:.2},\"vy\":{:.2},\"action\":\"{}\",\"near_team\":{:.2},\"near_opp\":{:.2}}}",
-                code, i, i == GK, p.pos.x, p.pos.y, p.vel.x, p.vel.y, action_name(acts[i]), nt, no
+                code, i, i == GK, p.pos.y, p.pos.x, p.vel.y, p.vel.x, action_name(acts[i]), nt, no
             );
         }
     }
@@ -566,10 +566,33 @@ fn save_policy(policy: &train::Policy, dir: &Path) -> AppResult<()> {
     Ok(())
 }
 
+fn load_champion_history(dir: &Path) -> AppResult<Vec<(usize, train::Policy)>> {
+    let mut generations = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(raw_generation) = name.strip_prefix("gen") else {
+            continue;
+        };
+        let Ok(generation) = raw_generation.parse::<usize>() else {
+            continue;
+        };
+        generations.push((generation, load_policy(&entry.path())?));
+    }
+    generations.sort_by_key(|(generation, _)| *generation);
+    Ok(generations)
+}
+
 /// Adversarial SELF-PLAY ladder. Both teams are learned policies: a frozen champion
 /// plays Team B while a challenger trains (Team A) against it. Each generation the
-/// challenger is scored head-to-head vs the champion; if it wins by `PROMOTE_MARGIN`
-/// (goal-diff) it becomes the new champion ("new winner beats old winner to advance").
+/// challenger is scored head-to-head vs the champion on paired, side-swapped seeds.
+/// It advances only when both selection and confirmation lower confidence bounds
+/// clear `PROMOTE_MARGIN` ("new winner beats old winner to advance").
 /// All moves execute through `World::step`, so play stays within the physics bounds.
 fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
     let _selfplay_cleanup = SelfplayCleanup;
@@ -582,6 +605,8 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
     // AND the 5v5 anti-drift knobs — the new knobs adopt the `?` signature too.
     let generations = env_usize_clamped("GENERATIONS", 12, 1, SELFPLAY_MAX_GENERATIONS)?;
     let promote_margin = env_f32_clamped("PROMOTE_MARGIN", 0.25, -20.0, 20.0)?;
+    let confirmation_games =
+        env_usize_clamped("PROMOTE_CONFIRM_GAMES", cfg.eval_games.max(120), 2, 20_000)?;
     // ANTI-DRIFT (mirrors the 11v11 league+analytic anchor). Pure latest-champion
     // self-play drifts into rock-paper-scissors cycles: the challenger beats the
     // champion while its ABSOLUTE skill (vs the fixed scripted baseline) collapses.
@@ -598,29 +623,39 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
         SELFPLAY_MAX_SPEED_WARMUP,
     )?;
 
-    // Challenger: warm-start by behavior-cloning the scripted baseline so gen-0 play
-    // is coherent (not random flailing); it then improves purely via self-play.
-    let mut challenger = train::Policy::new(&mut rng);
-    if cfg.bc_games > 0 {
-        let bc =
-            train::behavior_clone_scripted(&mut challenger, cfg.bc_games, cfg.bc_epochs, &mut rng);
+    // Resume every frozen champion rather than silently restarting the ladder.
+    // Historical champions remain in the opponent curriculum so a new frontier
+    // cannot advance by exploiting only the most recent policy.
+    let mut champion_history = load_champion_history(&champ_dir)?;
+    let mut champion_gen = champion_history
+        .last()
+        .map_or(0, |(generation, _)| *generation);
+    let mut champion = champion_history.last().map(|(_, policy)| policy.clone());
+    let mut challenger = if let Some(incumbent) = champion.as_ref() {
         println!(
-            "warm start (behavior-clone scripted): {} samples, teacher-match {:.0}%",
-            bc.samples,
-            bc.accuracy * 100.0
+            "resuming frozen champion gen{champion_gen} with {} historical opponents",
+            champion_history.len()
         );
-    }
-    // Generation-0 champion = the scripted baseline itself (Team B scripted). The
-    // first learned policy to beat it by the margin becomes gen-1 champion; the
-    // ladder climbs from there ("new winner beats old winner to advance").
-    let mut champion: Option<train::Policy> = None;
-    let mut champion_gen = 0usize;
+        incumbent.clone()
+    } else {
+        let mut policy = train::Policy::new(&mut rng);
+        if cfg.bc_games > 0 {
+            let bc =
+                train::behavior_clone_scripted(&mut policy, cfg.bc_games, cfg.bc_epochs, &mut rng);
+            println!(
+                "warm start (behavior-clone scripted): {} samples, teacher-match {:.0}%",
+                bc.samples,
+                bc.accuracy * 100.0
+            );
+        }
+        policy
+    };
 
     let (svs, _, _) = train::evaluate_scripted_vs_scripted(60, &mut rng);
     println!("=== 5-a-side ADVERSARIAL SELF-PLAY ladder — both teams learned, physics-bounded ===");
     println!("scripted-vs-scripted goal_diff={svs:+.2} (sanity ~0)");
     println!(
-        "generations={generations}  iters/gen={}  games/iter={}  promote_margin={promote_margin:+.2}  eval_games={}  speed_warmup={speed_warmup}",
+        "generations={generations}  iters/gen={}  games/iter={}  promote_margin_lcb95={promote_margin:+.2}  selection_games={}  confirmation_games={confirmation_games}  speed_warmup={speed_warmup}",
         cfg.iters, cfg.games_per_iter, cfg.eval_games
     );
     println!("{}", "-".repeat(92));
@@ -630,41 +665,73 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
     );
 
     let mut ladder = String::from(
-        "generation,iters_per_gen,cand_vs_champ_gd,cand_vs_champ_wr,cand_vs_scripted_gd,cand_vs_scripted_wr,promoted,champion_gen\n",
+        "generation,iters_per_gen,selection_champ_gd,selection_champ_gd_lcb95,selection_champ_payoff,selection_champ_payoff_lcb95,selection_anchor_gd,selection_anchor_gd_lcb95,confirmation_champ_gd,confirmation_champ_gd_lcb95,confirmation_anchor_gd,confirmation_anchor_gd_lcb95,promoted,champion_gen\n",
     );
 
     for round in 1..=generations {
+        let round_start = challenger.clone();
         // MIXED OPPONENT: most iterations train against the current champion
         // (self-play), but every `anchor_every`-th iteration trains against the
         // scripted baseline (champion = None) so the challenger keeps practising
         // how to beat the absolute reference and can't quietly forget it.
         for it in 1..=cfg.iters {
-            let vs_scripted = it % anchor_every == 0;
-            train::set_selfplay_champion(if vs_scripted { None } else { champion.clone() });
+            let vs_scripted = it % anchor_every == 0 || champion_history.is_empty();
+            let training_opponent = if vs_scripted {
+                None
+            } else {
+                // Half the self-play iterations face the current champion; the
+                // other half sample the full frozen history.
+                let index = if it % 2 == 0 {
+                    champion_history.len() - 1
+                } else {
+                    rng.next_u64() as usize % champion_history.len()
+                };
+                Some(champion_history[index].1.clone())
+            };
+            train::set_selfplay_champion(training_opponent);
             train::set_speed_frozen(it <= speed_warmup);
             let beta = train::ent_beta_at(it, cfg.iters);
             let _ = train::train_iter(&mut challenger, cfg.games_per_iter, beta, &mut rng);
         }
         train::set_selfplay_champion(None); // detach so evals are clean
 
-        // Champion-ladder gate: beat the current champion (scripted at gen 0) by the margin.
-        let (gd_champ, wr_champ) = match &champion {
-            Some(c) => train::evaluate_vs_policy(&challenger, c, cfg.eval_games, &mut rng),
-            None => {
-                let s = train::evaluate(&challenger, cfg.eval_games, &mut rng);
-                (s.goal_diff, s.winrate)
+        // First use a selection set, then a fresh confirmation set. Promotion
+        // depends on lower confidence bounds, never the maximum observed mean.
+        let selection_champ = match &champion {
+            Some(incumbent) => {
+                train::evaluate_vs_policy_paired(&challenger, incumbent, cfg.eval_games, &mut rng)
             }
+            None => train::evaluate_vs_scripted_paired(&challenger, cfg.eval_games, &mut rng),
         };
-        // Absolute progress reference: challenger vs the scripted baseline.
-        let s = train::evaluate(&challenger, cfg.eval_games, &mut rng);
-        // Promote only if the challenger BEATS the champion head-to-head AND does not
-        // regress below the fixed scripted anchor — this refuses the cyclic-drift
-        // promotions where a policy wins the ladder but loses to the baseline.
-        let promoted = gd_champ >= promote_margin && s.goal_diff >= scripted_floor;
+        let selection_anchor =
+            train::evaluate_vs_scripted_paired(&challenger, cfg.eval_games, &mut rng);
+        let selection_passed = selection_champ.goal_diff_lower_95 >= promote_margin
+            && selection_anchor.goal_diff_lower_95 >= scripted_floor;
+        let confirmation_champ = selection_passed.then(|| match &champion {
+            Some(incumbent) => train::evaluate_vs_policy_paired(
+                &challenger,
+                incumbent,
+                confirmation_games,
+                &mut rng,
+            ),
+            None => train::evaluate_vs_scripted_paired(&challenger, confirmation_games, &mut rng),
+        });
+        let confirmation_anchor = selection_passed
+            .then(|| train::evaluate_vs_scripted_paired(&challenger, confirmation_games, &mut rng));
+        let promoted = confirmation_champ
+            .is_some_and(|evaluation| evaluation.goal_diff_lower_95 >= promote_margin)
+            && confirmation_anchor
+                .is_some_and(|evaluation| evaluation.goal_diff_lower_95 >= scripted_floor);
         if promoted {
             champion = Some(challenger.clone());
             champion_gen += 1;
             save_policy(&challenger, &champ_dir.join(format!("gen{champion_gen}")))?;
+            champion_history.push((champion_gen, challenger.clone()));
+        } else {
+            // A held candidate is not the next generation's starting point. Reset
+            // to the protected champion (or the coherent gen-0 warm start) so
+            // rejected gradient drift cannot accumulate across rounds.
+            challenger = champion.clone().unwrap_or(round_start);
         }
         let champ_label = if champion_gen == 0 {
             "scripted".to_string()
@@ -672,38 +739,65 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
             format!("gen{champion_gen}")
         };
         println!(
-            "{round:>4} | gd {gd_champ:>+6.2} wr {wr_champ:>4.2} | gd {:>+6.2} wr {:>4.2} | {:>9} | {champ_label}",
-            s.goal_diff,
-            s.winrate,
+            "{round:>4} | gd {:>+6.2} lb {:>+6.2} | gd {:>+6.2} lb {:>+6.2} | {:>9} | {champ_label}",
+            selection_champ.goal_diff,
+            selection_champ.goal_diff_lower_95,
+            selection_anchor.goal_diff,
+            selection_anchor.goal_diff_lower_95,
             if promoted { "PROMOTED" } else { "hold" }
         );
+        let confirmation_champ = confirmation_champ.unwrap_or_default();
+        let confirmation_anchor = confirmation_anchor.unwrap_or_default();
         ladder.push_str(&format!(
-            "{round},{},{gd_champ:.4},{wr_champ:.4},{:.4},{:.4},{},{champion_gen}\n",
-            cfg.iters, s.goal_diff, s.winrate, promoted
+            "{round},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{},{champion_gen}\n",
+            cfg.iters,
+            selection_champ.goal_diff,
+            selection_champ.goal_diff_lower_95,
+            selection_champ.payoff,
+            selection_champ.payoff_lower_95,
+            selection_anchor.goal_diff,
+            selection_anchor.goal_diff_lower_95,
+            confirmation_champ.goal_diff,
+            confirmation_champ.goal_diff_lower_95,
+            confirmation_anchor.goal_diff,
+            confirmation_anchor.goal_diff_lower_95,
+            promoted
         ));
     }
 
-    // Persist the final champion (or the challenger if none was ever promoted) in the
-    // standard layout so inspect/play/viz can load it.
-    let final_policy = champion.as_ref().unwrap_or(&challenger);
-    save_policy(final_policy, &cfg.out_dir)?;
     write_atomic(&cfg.out_dir.join("selfplay_ladder.csv"), &ladder)?;
-    let sfinal = train::evaluate(final_policy, cfg.final_games.max(cfg.eval_games), &mut rng);
     println!("{}", "-".repeat(92));
-    println!(
-        "final champion = gen{champion_gen} after {generations} generations | vs scripted: goal_diff={:+.2} winrate={:.2} goals {:.2}-{:.2}",
-        sfinal.goal_diff, sfinal.winrate, sfinal.ga, sfinal.gb
-    );
-    println!(
-        "saved champion -> {} (+ champions/gen*/ snapshots, selfplay_ladder.csv)",
-        cfg.out_dir.display()
-    );
+    if let Some(final_policy) = champion.as_ref() {
+        save_policy(final_policy, &cfg.out_dir)?;
+        let final_eval = train::evaluate_vs_scripted_paired(
+            final_policy,
+            cfg.final_games.max(confirmation_games),
+            &mut rng,
+        );
+        println!(
+            "final champion = gen{champion_gen} after {generations} generations | paired vs scripted: goal_diff={:+.2} lb95={:+.2} payoff={:.3}",
+            final_eval.goal_diff, final_eval.goal_diff_lower_95, final_eval.payoff
+        );
+        println!(
+            "saved accepted champion -> {} (+ champions/gen*/ snapshots, selfplay_ladder.csv)",
+            cfg.out_dir.display()
+        );
+    } else {
+        save_policy(&challenger, &cfg.out_dir.join("held-candidate"))?;
+        println!(
+            "no candidate cleared paired selection+confirmation; scripted remains champion and the held candidate was not published"
+        );
+    }
     Ok(())
 }
 
 fn run_training(cfg: &RunConfig) -> AppResult<()> {
     let mut rng = Rng::new(cfg.seed);
     let mut policy = train::Policy::new(&mut rng);
+    let dagger_every = env_usize_clamped("BC_DAGGER_EVERY", 5, 1, 10_000)?;
+    let dagger_games = env_usize_clamped("BC_DAGGER_GAMES", 2, 1, 32)?;
+    let dagger_rounds = env_usize_clamped("BC_DAGGER_WARM_ROUNDS", 4, 0, 32)?;
+    let dagger_teacher_rollin = env_f32_clamped("BC_DAGGER_TEACHER_ROLLIN", 0.25, 0.0, 0.75)?;
 
     fs::create_dir_all(&cfg.out_dir)?;
 
@@ -729,10 +823,37 @@ fn run_training(cfg: &RunConfig) -> AppResult<()> {
     if cfg.bc_games > 0 {
         let bc = train::behavior_clone_scripted(&mut policy, cfg.bc_games, cfg.bc_epochs, &mut rng);
         println!(
-            "behavior-clone warm start: {} samples, loss {:.3}, teacher-match {:.0}%",
+            "behavior-clone warm start: {} samples ({} finishing), loss {:.3}, teacher-match {:.0}%",
             bc.samples,
+            bc.shot_samples,
             bc.loss,
             bc.accuracy * 100.0
+        );
+        for round in 1..=dagger_rounds {
+            let corrected = train::behavior_clone_dagger(
+                &mut policy,
+                dagger_games,
+                1,
+                dagger_teacher_rollin,
+                &mut rng,
+            );
+            println!(
+                "DAgger warm round {round}: {} learner-state labels ({} finishing), loss {:.3}, teacher-match {:.0}%",
+                corrected.samples,
+                corrected.shot_samples,
+                corrected.loss,
+                corrected.accuracy * 100.0
+            );
+        }
+        let warm = train::evaluate(&policy, 100, &mut rng);
+        println!(
+            "warm-start-vs-scripted: goal_diff={:+.2} winrate={:.2} goals {:.2}-{:.2} passes {:.1} shots {:.2}",
+            warm.goal_diff,
+            warm.winrate,
+            warm.ga,
+            warm.gb,
+            warm.pass_att,
+            warm.shots
         );
     }
 
@@ -787,6 +908,20 @@ fn run_training(cfg: &RunConfig) -> AppResult<()> {
         train::set_speed_frozen(it <= speed_warmup);
         let beta = train::ent_beta_at(it, cfg.iters);
         let stats = train::train_iter(&mut policy, cfg.games_per_iter, beta, &mut rng);
+        // Correct compounding policy errors on states the neural controller
+        // actually visits. Analytic labels supervise those states, while the
+        // bounded teacher roll-in preserves access to rare finishing examples.
+        let correction = if it % dagger_every == 0 {
+            Some(train::behavior_clone_dagger(
+                &mut policy,
+                dagger_games,
+                1,
+                dagger_teacher_rollin,
+                &mut rng,
+            ))
+        } else {
+            None
+        };
 
         if it % cfg.eval_every == 0 || it == cfg.iters {
             let st = train::evaluate(&policy, cfg.eval_games, &mut rng);
@@ -813,6 +948,12 @@ fn run_training(cfg: &RunConfig) -> AppResult<()> {
                 st.pass_completion() * 100.0,
                 st.shots
             );
+            if let Some(correction) = correction {
+                println!(
+                    "      DAgger correction: {} labels, {} finishing examples",
+                    correction.samples, correction.shot_samples
+                );
+            }
             csv.push_str(&csv_row(
                 it,
                 &st,
@@ -966,14 +1107,18 @@ fn checkpoint_quality(st: &train::Stats) -> f32 {
     if st.winrate < 0.55 {
         q -= 0.8;
     }
-    if st.shots < 1.0 {
-        q -= 1.2;
+    if st.shots <= 0.0 {
+        // A no-shot checkpoint cannot climb regardless of possession or passing.
+        // Make it ineligible to outrank any policy that has discovered finishing.
+        q -= 20.0;
+    } else if st.shots < 1.0 {
+        q -= 2.0;
     }
     if st.pass_cmp < 2.0 {
         q -= 0.7;
     }
     if st.conversion() <= 0.0 {
-        q -= 0.6;
+        q -= 5.0;
     }
     if st.possession < 0.03 {
         q -= 0.4;
@@ -1063,19 +1208,19 @@ fn record_match_vs(
             if i > 0 {
                 frames.push(',');
             }
-            let _ = write!(frames, "[{:.1},{:.1}]", w.a[i].pos.x, w.a[i].pos.y);
+            let _ = write!(frames, "[{:.1},{:.1}]", w.a[i].pos.y, w.a[i].pos.x);
         }
         frames.push_str("],\"b\":[");
         for i in 0..N {
             if i > 0 {
                 frames.push(',');
             }
-            let _ = write!(frames, "[{:.1},{:.1}]", w.b[i].pos.x, w.b[i].pos.y);
+            let _ = write!(frames, "[{:.1},{:.1}]", w.b[i].pos.y, w.b[i].pos.x);
         }
         let _ = write!(
             frames,
             "],\"ball\":[{:.1},{:.1}],\"own\":{},\"oi\":{},\"ga\":{},\"gb\":{}}}",
-            w.ball.x, w.ball.y, owner_code, owner_idx, w.goals_a, w.goals_b
+            w.ball.y, w.ball.x, owner_code, owner_idx, w.goals_a, w.goals_b
         );
     }
     frames.push(']');

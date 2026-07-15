@@ -5448,7 +5448,7 @@ impl PlayerAgent {
             // an opponent retreating quickly is materially less dangerous than
             // a static marker at the same instantaneous distance.
             * (1.0 + moving_away_spacing_relief * 0.08))
-        .clamp(0.02, 1.75);
+            .clamp(0.02, 1.75);
         let patient_carry_score_base = (dribble_score * patient_carry_multiplier).clamp(0.02, 1.58);
         // Central defenders must stay back: they do NOT dribble the ball forward when
         // an opponent is within ~5 yds in front of them (little open space ahead).
@@ -5560,10 +5560,9 @@ impl PlayerAgent {
         } else {
             1.0
         };
-        let carry_forward_score = (carry_forward_score
-            * byline_drive_boost
-            * (1.0 + moving_away_spacing_relief * 0.08))
-            .clamp(0.01, 1.85);
+        let carry_forward_score =
+            (carry_forward_score * byline_drive_boost * (1.0 + moving_away_spacing_relief * 0.08))
+                .clamp(0.01, 1.85);
         let carry_out_score = (carry_out_score * byline_drive_boost).clamp(0.01, 1.30);
         let field_width = if field_width_yards.is_finite() && field_width_yards > 0.0 {
             field_width_yards
@@ -8546,6 +8545,7 @@ impl PlayerAgent {
             mdp_mpc_comparison,
             learned_mpc_replan: None,
             behavior_policy_probability: self.pending_policy_behavior_probability,
+            actor_policy_probability: None,
             neural_mcts_selected: false,
             neural_mcts_candidate_count: 0,
             neural_mcts_discretized_kick_candidate_count: 0,
@@ -14400,9 +14400,7 @@ impl PlayerAgent {
                     learned_label,
                 ))
             }
-            "forward-release-pass"
-                if forward_release_action_enabled() && observation.has_ball =>
-            {
+            "forward-release-pass" if forward_release_action_enabled() && observation.has_ball => {
                 let visible = snapshot.ranked_visible_pass_targets(self.id, 11);
                 // Codex r24/r25: COMMIT forward, to the highest-QUALITY forward receiver. Prefer the
                 // quick-forward teammate; else the FIRST (best-ranked) visible receiver that is
