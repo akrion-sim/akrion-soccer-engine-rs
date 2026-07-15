@@ -249,6 +249,10 @@ fn rw() -> &'static Rw {
         field_burst_delta: wenv("W_FIELD_BURST_DELTA", 3.3, MIN_REWARD_WEIGHT, 15.0),
         stand_pen: wenv("W_STAND_PEN", 0.8, MIN_REWARD_WEIGHT, 8.0),
         pursuit: wenv("W_PURSUIT", 2.1, MIN_REWARD_WEIGHT, 10.0),
+        // Full-strength final checkpoint (box entry) = 15 = 3% of a goal; the
+        // three zones together pay at most 31 per possession-cycle — a bridge
+        // to the goal anchor, never a rival for it.
+        checkpoint: wenv("REW_CHECKPOINT", 15.0, MIN_REWARD_WEIGHT, 40.0),
     })
 }
 // The speed policy is a low-variance REFINEMENT on top of the action policy —
