@@ -1049,9 +1049,15 @@ impl World {
         if self.owner.is_some() {
             return 0.0;
         }
+        // Per-player race speed: skill top speed degraded by current energy —
+        // a sprinter and an exhausted defender are DIFFERENT favourites. (The
+        // old model raced everyone at the constant legacy PLAYER_SPEED, so the
+        // belief ignored both skill and fatigue.)
+        let race_speed =
+            |p: &Player| (p.skills.top_speed_ref_yps() * p.energy_output_factor()).max(1e-3);
         let mine = players(team, self);
         let me = mine[idx].pos;
-        let my_eta = me.sub(self.intercept_point(me)).len() / PLAYER_SPEED.max(1e-3);
+        let my_eta = me.sub(self.intercept_point(me)).len() / race_speed(&mine[idx]);
         // The player only WINS the ball if it beats every OTHER pursuer to it — so
         // race against the fastest other player, TEAMMATES included, not just
         // opponents. That way only the genuine favourite (quickest overall) believes
@@ -1061,7 +1067,7 @@ impl World {
         for k in 0..N {
             if k != idx {
                 let tp = mine[k].pos;
-                let eta = tp.sub(self.intercept_point(tp)).len() / PLAYER_SPEED.max(1e-3);
+                let eta = tp.sub(self.intercept_point(tp)).len() / race_speed(&mine[k]);
                 if eta < best_other_eta {
                     best_other_eta = eta;
                 }
@@ -1070,7 +1076,7 @@ impl World {
         let opp = players(team.other(), self);
         for k in 0..N {
             let op = opp[k].pos;
-            let eta = op.sub(self.intercept_point(op)).len() / PLAYER_SPEED.max(1e-3);
+            let eta = op.sub(self.intercept_point(op)).len() / race_speed(&opp[k]);
             if eta < best_other_eta {
                 best_other_eta = eta;
             }
@@ -2257,7 +2263,7 @@ impl World {
                     // active = shoot-spam farming, not a fresh chance). The genuine
                     // first shot of a buildup is NOT rapid and earns full reward.
                     self.shot_was_rapid_a = self.shoot_cooldown_a > 0;
-                    self.shoot_cooldown_a = 45; // ~2.25 s at 20 Hz before a shot is "fresh" again
+                    self.shoot_cooldown_a = 45; // 3.0 s at the 15 Hz tick before a shot is "fresh" again
                     self.pass_streak_a = 0; // buildup consumed by the shot
                     self.a_shot_flag = true; // this free ball is a valid (2-pass) shot
                     self.a_shot_origin = me; // save model: shot lane starts here
