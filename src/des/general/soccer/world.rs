@@ -36881,6 +36881,9 @@ impl SoccerMatch {
                                 .unwrap_or(self.ball.position.y);
                             let forward_yards = (reception_y - pass.origin.y) * team.attack_dir();
                             self.stat_pass_completed_direction(team, forward_yards);
+                            let launch_forward_yards =
+                                (pass.intended_target.y - pass.origin.y) * team.attack_dir();
+                            self.stat_pass_completed_intent_direction(team, launch_forward_yards);
                             if pass.target.is_some_and(|target| target != pass.from) {
                                 self.stat_intentional_pass_completed_direction(team, forward_yards);
                                 self.stat_intentional_pass_completed(team);
