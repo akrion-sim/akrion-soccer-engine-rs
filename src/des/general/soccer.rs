@@ -19491,7 +19491,16 @@ impl Default for SoccerNeuralLearningConfig {
             replay_capacity: DEFAULT_SOCCER_NEURAL_REPLAY_CAPACITY,
             replay_samples_per_tick: DEFAULT_SOCCER_NEURAL_REPLAY_SAMPLES_PER_TICK,
             target_clip: DEFAULT_SOCCER_NEURAL_TARGET_CLIP,
-            target_popart_enabled: false,
+            // PopArt ON by default: value-target normalization is one of the
+            // two "always helpful" MAPPO levers (the other is per-batch
+            // advantage normalization), and the 1000-point win / 500-point
+            // goal anchors need an adaptive critic scale. The league/ratchet
+            // bins and the k8s continuous manifest already forced this on —
+            // the code default lagging at `false` meant every LOCAL trainer
+            // run silently trained without it (the target_popart=false
+            // inconsistency the 2026-07 audit flagged). Live gameplay
+            // (`main_soccer_live`) still opts out explicitly.
+            target_popart_enabled: true,
             snapshot_every_batches: DEFAULT_SOCCER_NEURAL_SNAPSHOT_EVERY_BATCHES,
             lp_coupling_enabled: false,
             critic_baseline_weight: 0.0,
