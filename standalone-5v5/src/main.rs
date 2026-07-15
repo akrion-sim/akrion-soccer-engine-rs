@@ -665,6 +665,17 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
     // Historical champions remain in the opponent curriculum so a new frontier
     // cannot advance by exploiting only the most recent policy.
     let mut champion_history = load_champion_history(&champ_dir)?;
+    // Bound the in-memory sparring pool on resume (disk keeps the full
+    // lineage): newest members carry the most curriculum value.
+    if champion_history.len() > MAX_CHAMPION_POOL {
+        let excess = champion_history.len() - MAX_CHAMPION_POOL;
+        champion_history.drain(..excess);
+    }
+    // PFSP bookkeeping: challenger-vs-champion payoff EMA keyed by generation
+    // (unknown members default to 0.5 = maximum sampling weight), plus the
+    // retained anchor-qualified held challengers ("exploiters").
+    let mut champion_payoff: HashMap<usize, f32> = HashMap::new();
+    let mut exploiters: Vec<train::Policy> = Vec::new();
     let mut champion_gen = champion_history
         .last()
         .map_or(0, |(generation, _)| *generation);
