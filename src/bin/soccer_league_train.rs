@@ -1839,7 +1839,9 @@ fn main() {
                     });
                 }
             });
-            for kpis in match_kpis.into_inner().unwrap() {
+            for (opp_idx, kpis) in match_kpis.into_inner().unwrap() {
+                let entry = pfsp_goal_diff_ema.entry(opp_idx).or_insert(0.0);
+                *entry = 0.7 * *entry + 0.3 * f64::from(kpis.goal_diff);
                 round_kpis.add(kpis);
             }
             (
