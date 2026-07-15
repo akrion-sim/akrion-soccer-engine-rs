@@ -1667,65 +1667,10 @@ fn main() {
         let anchor_idx = (self_play_ladder || fixed_analytic_training_anchor)
             .then(|| opponents.len().saturating_sub(1));
         let per_opp_games: Vec<usize> = if pfsp_enabled && opponents.len() > 1 {
-            let weights: Vec<f64> = (0..opponents.len())
-                .map(|idx| {
-                    if Some(idx) == anchor_idx {
-                        0.0
-                    } else {
-                        let gd = pfsp_goal_diff_ema.get(&idx).copied().unwrap_or(0.0);
-                        let p = 1.0 / (1.0 + (-gd).exp());
-                        p * (1.0 - p) + 0.15
-                    }
-                })
+            let gd_by_idx: Vec<f64> = (0..opponents.len())
+                .map(|idx| pfsp_goal_diff_ema.get(&idx).copied().unwrap_or(0.0))
                 .collect();
-            let anchor_reserved = anchor_idx.map_or(0, |_| games_per_opp);
-            let pool_budget = opponents.len() * games_per_opp - anchor_reserved;
-            let pool_members = opponents.len() - usize::from(anchor_idx.is_some());
-            let weight_total: f64 = weights.iter().sum();
-            let mut alloc: Vec<usize> = (0..opponents.len())
-                .map(|idx| {
-                    if Some(idx) == anchor_idx {
-                        anchor_reserved
-                    } else if weight_total > 0.0 {
-                        // Coverage floor 1, remainder proportional to weight.
-                        let spare = pool_budget.saturating_sub(pool_members) as f64;
-                        1 + (spare * weights[idx] / weight_total).round() as usize
-                    } else {
-                        games_per_opp
-                    }
-                })
-                .collect();
-            // Rounding drift: trim/pad against the exact budget, never below
-            // the per-opponent floor of 1.
-            let mut total: usize = alloc.iter().sum();
-            let budget = opponents.len() * games_per_opp;
-            while total > budget {
-                if let Some((idx, _)) = alloc
-                    .iter()
-                    .enumerate()
-                    .filter(|(idx, games)| Some(*idx) != anchor_idx && **games > 1)
-                    .max_by_key(|(_, games)| **games)
-                {
-                    alloc[idx] -= 1;
-                    total -= 1;
-                } else {
-                    break;
-                }
-            }
-            while total < budget {
-                if let Some((idx, _)) = alloc
-                    .iter()
-                    .enumerate()
-                    .filter(|(idx, _)| Some(*idx) != anchor_idx)
-                    .min_by_key(|(_, games)| **games)
-                {
-                    alloc[idx] += 1;
-                    total += 1;
-                } else {
-                    break;
-                }
-            }
-            alloc
+            pfsp_fixture_allocation(&gd_by_idx, anchor_idx, games_per_opp)
         } else {
             vec![games_per_opp; opponents.len()]
         };
