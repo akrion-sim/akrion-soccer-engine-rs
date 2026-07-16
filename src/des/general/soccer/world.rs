@@ -21912,18 +21912,6 @@ impl SoccerMatch {
         plan
     }
 
-    fn learned_mpc_reject_family_for_label(label: &str) -> Option<MpcRejectFamily> {
-        if pass_like_action_flight(label).is_some() {
-            Some(MpcRejectFamily::Pass)
-        } else if is_dribble_action_label(label) {
-            Some(MpcRejectFamily::Dribble)
-        } else if matches!(label, "shoot" | "first-time-shot" | "first-time-header") {
-            Some(MpcRejectFamily::Shot)
-        } else {
-            None
-        }
-    }
-
     fn mpc_safe_fallback_learned_plan(
         policy: &SoccerQPolicy,
         snapshot: &WorldSnapshot,
