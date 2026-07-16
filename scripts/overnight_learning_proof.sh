@@ -307,7 +307,8 @@ PY
     echo "===== build proof binaries skipped ====="
     post_claude "overnight build proof binaries skipped for ${RUN_ID}; using existing target/debug binaries; out=${OUT_DIR}"
   else
-    run_step "build proof binaries" cargo build --bin soccer_proof --bin soccer_eval_gate_run --bin measure_learning_ab || exit $?
+    run_step "prune local cargo artifacts" bash scripts/prune_local_cargo_artifacts.sh "${CARGO_TARGET_DIR:-target}" || exit $?
+    run_step "build proof binaries" env CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}" cargo build --bin soccer_proof --bin soccer_eval_gate_run --bin measure_learning_ab || exit $?
   fi
   run_step "fresh gen0 snapshot" target/debug/soccer_proof fresh "${OUT_DIR}/fresh.gen0.json" "${FRESH_SEED}" || exit $?
   run_step "train full-stack checkpoint" target/debug/soccer_proof train-ckpt "${OUT_DIR}/full" "${TRAIN_GAMES}" "${TRAIN_MINUTES}" "${TRAIN_SEED}" "${CKPT_EVERY}" || exit $?
