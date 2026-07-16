@@ -287,7 +287,10 @@ fn rw() -> &'static Rw {
         // Full-strength final checkpoint (box entry) = 15 = 3% of a goal; the
         // three zones together pay at most 31 per possession-cycle — a bridge
         // to the goal anchor, never a rival for it.
-        checkpoint: wenv("REW_CHECKPOINT", 15.0, MIN_REWARD_WEIGHT, 40.0),
+        // 22 (winner config) over the original 15: the stronger progression
+        // bridge was part of every probe that beat the defaults; three-zone
+        // sum still ≤ 45.5/possession-cycle ≪ the 500-point goal.
+        checkpoint: wenv("REW_CHECKPOINT", 22.0, MIN_REWARD_WEIGHT, 40.0),
     })
 }
 // The speed policy is a low-variance REFINEMENT on top of the action policy —
