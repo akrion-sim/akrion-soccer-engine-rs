@@ -79,6 +79,8 @@ case "$subcommand" in
     source_fingerprint="$({
       cargo --version
       rustc --version
+      printf 'cargo-args\0'
+      printf '%s\0' "${args[@]}"
       fingerprint_tree "$repo_root"
       fingerprint_tree "$des_root"
     } | shasum -a 256 | awk '{print $1}')"
@@ -92,10 +94,14 @@ case "$subcommand" in
     if [[ -f "$stamp_path" ]]; then
       previous_fingerprint="$(<"$stamp_path")"
     fi
+    write_fingerprint=1
 
     if [[ "$source_fingerprint" != "$previous_fingerprint" ]]; then
       if pgrep -f "$target_dir/$profile_dir/" >/dev/null 2>&1; then
         echo "cargo-fresh: preserving active target profile $target_dir/$profile_dir" >&2
+        # Do not bless the new fingerprint: once the running executable exits, the next matching
+        # invocation must still clean the generations we deliberately preserved here.
+        write_fingerprint=0
       else
         clean_args=(
           clean
@@ -116,7 +122,7 @@ esac
 export CARGO_INCREMENTAL=0
 cd "$repo_root"
 if cargo "$@"; then
-  if [[ -n "${source_fingerprint:-}" ]]; then
+  if [[ -n "${source_fingerprint:-}" && "${write_fingerprint:-0}" == "1" ]]; then
     mkdir -p "$target_dir"
     printf '%s\n' "$source_fingerprint" >"$stamp_path"
   fi
