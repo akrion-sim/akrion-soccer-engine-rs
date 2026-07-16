@@ -718,7 +718,6 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
     );
 
     for round in 1..=generations {
-        let round_start = challenger.clone();
         // MIXED OPPONENT: most iterations train against the current champion
         // (self-play), but every `anchor_every`-th iteration trains against the
         // scripted baseline (champion = None) so the challenger keeps practising
@@ -818,10 +817,20 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
                     exploiters.remove(0);
                 }
             }
-            // A held candidate is not the next generation's starting point. Reset
-            // to the protected champion (or the coherent gen-0 warm start) so
-            // rejected gradient drift cannot accumulate across rounds.
-            challenger = champion.clone().unwrap_or(round_start);
+            // A held candidate is not the next generation's starting point once
+            // a champion exists: reset to the protected champion so rejected
+            // gradient drift cannot accumulate across rounds.
+            //
+            // GEN-0 BOOTSTRAP EXCEPTION (witnessed treadmill, 2026-07-15): with
+            // no champion yet there is no frozen line to drift away from, and
+            // resetting made every round an independent from-warm-start attempt
+            // at the full LCB95 bar — rounds 1..5 all held with no accumulated
+            // progress. Until the first champion is crowned, the challenger
+            // KEEPS its training; the scripted-anchor gate still decides when
+            // it has genuinely cleared the bar.
+            if let Some(incumbent) = champion.as_ref() {
+                challenger = incumbent.clone();
+            }
         }
         // Refresh PFSP estimates with cheap paired probes vs a couple of pool
         // members, so sampling weights track the CURRENT challenger.
