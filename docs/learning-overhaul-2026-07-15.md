@@ -154,3 +154,23 @@ consume samples with finite converging losses, checkpoints written.
    `terminal` field on transitions; delete the 0.3 s heuristic.
 7. 5v5 completion targets: rerun the 32-weight tuner under the new economics
    (`REW_PASS`/`REW_TURNOVER`/`REW_CHECKPOINT` bounds) toward 90/95/85.
+
+## 8. Results addendum (2026-07-15/16, measured)
+
+- **5v5 WAY PAST PARITY**: winner config (concede 0.35 / loss 0.4 / checkpoint 22 —
+  now the defaults) trained 900 iters, keep-best iter 690 (gates cleared):
+  **300-game holdout +1.397 gd / 90.0% winrate** (1.66–0.26 goals). Independent
+  ladder re-eval: **+0.84 gd, LCB95 +0.71, payoff 0.760**. The champion defended
+  12 co-evolution generations (LCB95+0.25 bar; 8 anchor-qualified exploiters
+  banked). Untrained baseline −0.95; pre-overhaul plateau −0.35.
+- **11v11 gen-1 power-eval (192 held-out paired games vs analytic, ~1h league)**:
+  progressive passing SIGNIFICANT @95% — forward yards **+15.0/game (LB +6.5)**,
+  completed forward passes **+0.52/game (LB +0.06)**, completion 91.0% vs 91.3%,
+  1.02 vs 0.76 yds/completed pass. Finishing lags (0.44–0.68 goals/game) = next axis.
+- **Three gate bugs found by RUNNING the ladders** (all fixed): 5v5 gen-0
+  hold-reset treadmill (879278db); 11v11 gen-0 "beat the analytic ceiling to
+  crown the floor" (0daa6b9b); 10-game validation LCB95 made the promotion
+  margin statistically unreachable (launcher now validates 40 games every 3
+  rounds). Lesson: every gate needs a reachability check at its actual sample
+  size.
+- Charts artifact (live): https://claude.ai/code/artifact/e6d8d2e0-5839-4b35-91c9-20ae03b93084

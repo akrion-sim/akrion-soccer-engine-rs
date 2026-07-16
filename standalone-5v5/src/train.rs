@@ -239,8 +239,14 @@ fn rw() -> &'static Rw {
     // the same RELATIVE region that trained well, now expressed in points.
     static R: std::sync::OnceLock<Rw> = std::sync::OnceLock::new();
     R.get_or_init(|| Rw {
-        concede_frac: wenv("REW_CONCEDE_FRAC", 0.67, 0.25, 1.0),
-        loss_frac: wenv("REW_LOSS_FRAC", 0.5, 0.4, 1.0),
+        // Defaults = the PROVEN winner config (2026-07-15 probes + 900-iter
+        // run): lower fear (concede 0.35, loss 0.4) beat the old 0.67/0.5
+        // decisively — 300-game holdout +1.397 gd / 90.0% winrate vs −0.123
+        // under the old defaults, and the champion then defended 12 self-play
+        // ladder generations (independent re-eval +0.84, LCB95 +0.71). Still
+        // discoverable within the same bounds.
+        concede_frac: wenv("REW_CONCEDE_FRAC", 0.35, 0.25, 1.0),
+        loss_frac: wenv("REW_LOSS_FRAC", 0.4, 0.4, 1.0),
         shot_span: wenv("REW_SHOT_SPAN", 1.0, MIN_REWARD_WEIGHT, 1.5),
         milestone: wenv("REW_MILESTONE", 12.0, MIN_REWARD_WEIGHT, 40.0),
         // PASS ECONOMICS: a sensible pass must have POSITIVE expected value or
@@ -281,7 +287,10 @@ fn rw() -> &'static Rw {
         // Full-strength final checkpoint (box entry) = 15 = 3% of a goal; the
         // three zones together pay at most 31 per possession-cycle — a bridge
         // to the goal anchor, never a rival for it.
-        checkpoint: wenv("REW_CHECKPOINT", 15.0, MIN_REWARD_WEIGHT, 40.0),
+        // 22 (winner config) over the original 15: the stronger progression
+        // bridge was part of every probe that beat the defaults; three-zone
+        // sum still ≤ 45.5/possession-cycle ≪ the 500-point goal.
+        checkpoint: wenv("REW_CHECKPOINT", 22.0, MIN_REWARD_WEIGHT, 40.0),
     })
 }
 // The speed policy is a low-variance REFINEMENT on top of the action policy —
