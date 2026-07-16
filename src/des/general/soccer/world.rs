@@ -23958,6 +23958,9 @@ impl SoccerMatch {
             .neural_learning
             .mappo_enabled()
             .then(|| self.config.neural_learning.sanitized_mappo_clip_epsilon());
+        let optimizer_minibatched =
+            mappo_clip_epsilon.is_some() && dd_soccer_enable_minibatched_mappo();
+        let mut optimizer_telemetry = SoccerPolicyOptimizerTelemetry::default();
         if let Some(policy_head) = self.policy_head_for_training_mut(policy_training_team) {
             let epochs = if mappo_clip_epsilon.is_some() {
                 soccer_mappo_epochs()
@@ -23965,9 +23968,11 @@ impl SoccerMatch {
                 1
             };
             for _ in 0..epochs {
-                policy_head.train(&policy_samples, mappo_clip_epsilon);
+                optimizer_telemetry.merge(policy_head.train(&policy_samples, mappo_clip_epsilon));
             }
         }
+        self.stats
+            .record_policy_optimizer_telemetry(optimizer_telemetry, optimizer_minibatched);
         if dd_soccer_enable_skill_policy_heads() {
             let training_team = self.skill_policy_training_team();
             self.ensure_skill_policy_heads_for_training(training_team);
