@@ -818,10 +818,20 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
                     exploiters.remove(0);
                 }
             }
-            // A held candidate is not the next generation's starting point. Reset
-            // to the protected champion (or the coherent gen-0 warm start) so
-            // rejected gradient drift cannot accumulate across rounds.
-            challenger = champion.clone().unwrap_or(round_start);
+            // A held candidate is not the next generation's starting point once
+            // a champion exists: reset to the protected champion so rejected
+            // gradient drift cannot accumulate across rounds.
+            //
+            // GEN-0 BOOTSTRAP EXCEPTION (witnessed treadmill, 2026-07-15): with
+            // no champion yet there is no frozen line to drift away from, and
+            // resetting made every round an independent from-warm-start attempt
+            // at the full LCB95 bar — rounds 1..5 all held with no accumulated
+            // progress. Until the first champion is crowned, the challenger
+            // KEEPS its training; the scripted-anchor gate still decides when
+            // it has genuinely cleared the bar.
+            if let Some(incumbent) = champion.as_ref() {
+                challenger = incumbent.clone();
+            }
         }
         // Refresh PFSP estimates with cheap paired probes vs a couple of pool
         // members, so sampling weights track the CURRENT challenger.
@@ -1501,4 +1511,33 @@ fn json_string(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+#[cfg(test)]
+mod ladder_tests {
+    use super::*;
+
+    #[test]
+    fn pfsp_sampling_prefers_even_matchups() {
+        let mut rng = Rng::new(99);
+        let history: Vec<(usize, train::Policy)> = (1..=3)
+            .map(|generation| (generation, train::Policy::new(&mut rng)))
+            .collect();
+        let mut payoff: HashMap<usize, f32> = HashMap::new();
+        payoff.insert(1, 0.95); // long-beaten champion
+        payoff.insert(2, 0.50); // even matchup — the learning frontier
+        payoff.insert(3, 0.95); // long-beaten champion
+        let mut counts = [0usize; 3];
+        for _ in 0..600 {
+            counts[pfsp_sample_index(&history, &payoff, &mut rng)] += 1;
+        }
+        // Challenge weighting: w(0.5)=0.35 vs w(0.95)=0.0975+0.15≈0.1975 —
+        // the even matchup should draw clearly more sparring than either
+        // solved one, while epsilon keeps the solved ones reachable.
+        assert!(
+            counts[1] > counts[0] && counts[1] > counts[2],
+            "even matchup must dominate: {counts:?}"
+        );
+        assert!(counts[0] > 0 && counts[2] > 0, "epsilon keeps everyone reachable: {counts:?}");
+    }
 }
