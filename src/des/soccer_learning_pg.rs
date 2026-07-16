@@ -4965,7 +4965,8 @@ fn insert_config_moments_in_transaction(
     // Chunked multi-row insert: 11 params per row plus the 2 shared run/experiment
     // ids. CONFIG_MOMENT_INSERT_CHUNK_ROWS keeps the total under Postgres's
     // 65535-parameter ceiling.
-    for chunk in moments.chunks(CONFIG_MOMENT_INSERT_CHUNK_ROWS) {
+    let chunk_count = moments.len().div_ceil(CONFIG_MOMENT_INSERT_CHUNK_ROWS);
+    for (chunk_index, chunk) in moments.chunks(CONFIG_MOMENT_INSERT_CHUNK_ROWS).enumerate() {
         let teams: Vec<&'static str> = chunk.iter().map(|m| soccer_team_label(m.team)).collect();
         let ticks: Vec<i64> = chunk.iter().map(|m| checked_i64(m.tick)).collect();
         let roles: Vec<&'static str> = chunk.iter().map(|m| soccer_role_label(m.role)).collect();
@@ -5016,15 +5017,25 @@ fn insert_config_moments_in_transaction(
             params.push(&embeddings_assigned[i]);
             params.push(&features_assigned[i]);
         }
-        tx.execute(&sql, &params)
-            .map_err(|err| format!("insert soccer config moments: {err}"))?;
+        tx.execute(&sql, &params).map_err(|err| {
+            format!(
+                "insert soccer config moments chunk={}/{} chunk_rows={} total_rows={}: {}",
+                chunk_index + 1,
+                chunk_count,
+                chunk.len(),
+                moments.len(),
+                soccer_learning_pg_error_context(&err)
+            )
+        })?;
     }
     Ok(())
 }
 
-/// Max config moments per multi-row insert. Each row binds 11 params plus the 2
-/// shared run/experiment ids, so 256 rows = 2818 params — well under the ceiling.
-const CONFIG_MOMENT_INSERT_CHUNK_ROWS: usize = 256;
+/// Max config moments per multi-row insert. Each row writes two pgvector values and two feature
+/// arrays while maintaining both HNSW indexes. A 256-row statement exceeded the default 30-second
+/// timeout on the remote learner; 64 rows keeps each indexed statement bounded while still using
+/// only 706 parameters, well under PostgreSQL's protocol ceiling.
+const CONFIG_MOMENT_INSERT_CHUNK_ROWS: usize = 64;
 
 /// Build the `values (...),(...)` clause for a chunked config-moment insert.
 /// `$1`/`$2` are the shared run_id/experiment_id reused by every row; each row's
@@ -6187,6 +6198,13 @@ mod tests {
         // A full chunk must stay under Postgres's 65535 bound-parameter limit.
         let params = 2 + CONFIG_MOMENT_INSERT_CHUNK_ROWS * 11;
         assert!(params < 65535, "chunk uses {params} params");
+    }
+
+    #[test]
+    fn config_moment_insert_batch_bounds_remote_hnsw_index_work() {
+        assert_eq!(CONFIG_MOMENT_INSERT_CHUNK_ROWS, 64);
+        assert_eq!(2 + CONFIG_MOMENT_INSERT_CHUNK_ROWS * 11, 706);
+        assert_eq!(1_166usize.div_ceil(CONFIG_MOMENT_INSERT_CHUNK_ROWS), 19);
     }
 
     #[test]
